@@ -511,6 +511,7 @@ func (r *runtimedRuntime) startRestartWorkerLocked(t *podTrack, cr *containerRes
 func (r *runtimedRuntime) runRestart(ctx context.Context, t *podTrack, cr *containerRestart, gen uint64, podID, name, reason string, delay time.Duration) {
 	defer r.finishAttempt(t, cr, gen)
 	killAnnounced := false
+	var intent uint64 // the held stop intent of this worker's kill, 0 for none
 	for {
 		if delay > 0 {
 			select {
@@ -524,16 +525,27 @@ func (r *runtimedRuntime) runRestart(ctx context.Context, t *podTrack, cr *conta
 		}
 		// A trigger that kills a LIVE container (a liveness failure, a failed
 		// postStart hook) records the kubelet's Killing before the re-exec RPC
-		// that stops it, once per worker, not once per retried RPC.
-		if msg, live := killMessageFor(reason, name); live && !killAnnounced {
-			killAnnounced = true
+		// that stops it, once per worker, not once per retried RPC. Its stop
+		// intent is held across the attempts: recorded before an RPC when none
+		// is held, dropped when runtimed definitively did not act
+		// (restartNotIssued), so a refused restart leaves no intent to consume
+		// the container's next, unrelated, exit 137. An attempt whose outcome
+		// is open keeps it, as the stop paths do.
+		if msg, live := killMessageFor(reason, name); live {
 			pod := r.podByID(podID)
-			r.recordKilling(t, pod, name, msg)
-			if pod != nil {
-				r.recordStopIntent(pod, name)
+			if !killAnnounced {
+				killAnnounced = true
+				r.recordKilling(t, pod, name, msg)
+			}
+			if intent == 0 {
+				intent = r.recordStopIntent(pod, name)
 			}
 		}
 		err := r.respawn(ctx, t, podID, name, reason)
+		if err != nil && restartNotIssued(err) {
+			r.history.dropIntent(intent)
+			intent = 0
+		}
 		if err == nil {
 			r.recordBudgetEvent(r.podByID(podID), budgetv1alpha1.CounterRestart)
 			// The container has been started again, so its postStart hook fires
@@ -581,6 +593,17 @@ func (r *runtimedRuntime) respawn(ctx context.Context, t *podTrack, podID, name,
 	delete(t.diedWhileDown, name)
 	t.restartMu.Unlock()
 	return nil
+}
+
+// restartNotIssued reports whether err, from respawn, proves runtimed did not
+// stop the container: a refusal in the RestartContainer response, or a status
+// stopNotIssued reads as definitive. Any other error leaves the kill possible.
+func restartNotIssued(err error) bool {
+	var f *restartFailure
+	if errors.As(err, &f) && f.refused {
+		return true
+	}
+	return stopNotIssued(err)
 }
 
 // finishAttempt releases the worker slot on the bookkeeping entry the worker was

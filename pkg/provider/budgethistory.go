@@ -102,7 +102,10 @@ import (
 // No provider hot path waits on the disk. Every mutation changes the state in
 // memory under the state lock and signals one writer goroutine (run), started
 // with the provider's run context, which writes a snapshot of the latest state,
-// so a burst of mutations coalesces into one write. Every write replaces the
+// so a burst of mutations coalesces into one write. Writes are also spaced at
+// least budgetHistoryMinWriteInterval apart, so a drain or a crash loop does not
+// rewrite the whole file back to back; only the emergency eviction's flush and
+// the shutdown paths write sooner. Every write replaces the
 // file atomically. A write failure is logged and retried; the in-memory state
 // stays authoritative for this run. The one ordering guarantee is the emergency
 // eviction's: it asks the writer to flush and waits up to budgetIntentWriteBound
@@ -117,7 +120,15 @@ import (
 // budgetHistoryAsideMax are kept) and the history starts empty: the totals then
 // restart at 0, as a counter does after a reset. A history dir that cannot be
 // prepared or written degrades to an in-memory history with a Warn log: the
-// node runs, and its counters restart at 0 on the next provider start.
+// node runs, and its counters restart at 0 on the next provider start. The file
+// carries a format version; a build that does not know the stored version
+// treats the file as unrecognised, so a downgrade to a build with an older
+// format moves the history aside and resets the totals to 0.
+//
+// On read-back each ring, intent and classified-termination entry is checked
+// as the totals are (validHistoryEvent, validKillIntent, validSeenExit); an
+// invalid entry is dropped with a Warn log, never published, and the rest of
+// the file is kept.
 
 // BudgetHistoryStopBound is how long the node teardown's StopBudgetHistory
 // waits: the writer's own final flush (budgetHistoryFinalFlushBound) plus a
@@ -154,6 +165,10 @@ const (
 	// budgetHistoryFinalFlushBound bounds the writer's final flush on shutdown,
 	// and the node teardown's wait for it (StopBudgetHistory).
 	budgetHistoryFinalFlushBound = 2 * time.Second
+	// budgetHistoryMinWriteInterval is the least time between two writes the
+	// writer makes on a change signal. The emergency eviction's flush and the
+	// shutdown paths are not held by it.
+	budgetHistoryMinWriteInterval = time.Second
 	// budgetHistoryRetryInterval is how often the writer retries a failed write.
 	budgetHistoryRetryInterval = 30 * time.Second
 )
@@ -234,6 +249,7 @@ type BudgetHistory struct {
 	log  *slog.Logger
 
 	dirty    chan struct{} // capacity 1: a pending-write signal, coalesced
+	force    chan struct{} // capacity 1: a flush request, written past the rate limit
 	once     sync.Once     // starts run once; stop consumes it, so a later start is a no-op
 	started  atomic.Bool
 	quit     chan struct{} // closed by stop
@@ -266,7 +282,7 @@ func OpenBudgetHistory(dir, fingerprint string, log *slog.Logger) *BudgetHistory
 	}
 	h := &BudgetHistory{
 		log: log, write: atomicfile.Replace,
-		dirty: make(chan struct{}, 1), quit: make(chan struct{}), stopped: make(chan struct{}), wrote: make(chan struct{}),
+		dirty: make(chan struct{}, 1), force: make(chan struct{}, 1), quit: make(chan struct{}), stopped: make(chan struct{}), wrote: make(chan struct{}),
 	}
 	memoryOnly := func(why string, err error) *BudgetHistory {
 		log.Warn("budget history: keeping the history in memory only; its counters restart at 0 on the next start",
@@ -286,6 +302,9 @@ func OpenBudgetHistory(dir, fingerprint string, log *slog.Logger) *BudgetHistory
 		log.Warn("budget history: could not remove an orphaned temp file", "dir", dir, "err", err)
 	}
 	st, err := readHistory(h.path)
+	if err == nil {
+		dropInvalidEntries(&st, log)
+	}
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		st = newHistoryState()
@@ -434,6 +453,55 @@ func readHistory(path string) (historyState, error) {
 	return st, nil
 }
 
+// dropInvalidEntries removes every ring, intent and classified-termination
+// entry of st that this build would not have written, logging how many of each
+// it dropped. An invalid entry is never published (an unknown reason would
+// otherwise reach the windows verbatim), and one bad entry does not cost the
+// rest of the file.
+func dropInvalidEntries(st *historyState, log *slog.Logger) {
+	ring, intents, seen := len(st.Ring), len(st.Intents), len(st.Seen)
+	st.Ring = filterInPlace(st.Ring, validHistoryEvent)
+	st.Intents = filterInPlace(st.Intents, validKillIntent)
+	st.Seen = filterInPlace(st.Seen, validSeenExit)
+	if ring != len(st.Ring) || intents != len(st.Intents) || seen != len(st.Seen) {
+		log.Warn("budget history: dropped invalid entries from the stored history",
+			"ring", ring-len(st.Ring), "intents", intents-len(st.Intents), "seen", seen-len(st.Seen))
+	}
+}
+
+// validHistoryEvent reports whether e is a ring entry this build records: a
+// known band, one of the reasons recordLocked counts, and a positive time.
+func validHistoryEvent(e historyEvent) bool {
+	if !e.Band.Valid() || e.At <= 0 {
+		return false
+	}
+	switch e.Reason {
+	case budgetv1alpha1.CounterEviction, budgetv1alpha1.CounterOOMKill, budgetv1alpha1.CounterKernelKill,
+		budgetv1alpha1.CounterRestart, budgetv1alpha1.CounterMemHigh, budgetv1alpha1.CounterTier1Refused:
+		return true
+	}
+	return false
+}
+
+// validKillIntent reports whether in names a pod, and a container or none (a
+// pod intent); only a pod intent lists covered containers, none of them empty.
+func validKillIntent(in killIntent) bool {
+	if in.Pod == "" {
+		return false
+	}
+	if in.Container != "" && len(in.Covered) > 0 {
+		return false
+	}
+	return !slices.Contains(in.Covered, "")
+}
+
+// validSeenExit reports whether s names a pod and a container and carries a
+// positive classification time. The termination identity is runtimed's and is
+// not range-checked: it is only compared, never published.
+func validSeenExit(s seenExit) bool {
+	return s.Pod != "" && s.Container != "" && s.At > 0
+}
+
 // keepLast returns the last n elements of s.
 func keepLast[T any](s []T, n int) []T {
 	if len(s) > n {
@@ -528,15 +596,34 @@ func (h *BudgetHistory) flushPending(expired <-chan time.Time) bool {
 	}
 }
 
-// run is the writer: one write per coalesced signal, a retry of a failed write
-// every budgetHistoryRetryInterval, and on ctx's end one final flush bounded by
-// budgetHistoryFinalFlushBound. A write in progress when ctx ends finishes
-// first; run's goroutine is nobody's critical path, so a hung write delays
-// only its own exit.
+// run is the writer: one write per coalesced signal, no sooner than
+// budgetHistoryMinWriteInterval after its previous write; a flush request
+// (flush) at once; a retry of a failed write every budgetHistoryRetryInterval;
+// and on ctx's end one final flush bounded by budgetHistoryFinalFlushBound. A
+// write in progress when ctx ends finishes first; run's goroutine is nobody's
+// critical path, so a hung write delays only its own exit.
 func (h *BudgetHistory) run(ctx context.Context) {
 	defer close(h.stopped)
 	retry := time.NewTicker(budgetHistoryRetryInterval)
 	defer retry.Stop()
+	// hold is armed only while a signalled write waits out the interval; held
+	// is its channel then, and nil (never ready) otherwise.
+	var hold *time.Timer
+	var held <-chan time.Time
+	defer func() {
+		if hold != nil {
+			hold.Stop()
+		}
+	}()
+	var last time.Time // when the writer last wrote; zero before its first write
+	write := func() {
+		if hold != nil {
+			hold.Stop()
+			hold, held = nil, nil
+		}
+		h.writeOnce()
+		last = time.Now()
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -545,11 +632,26 @@ func (h *BudgetHistory) run(ctx context.Context) {
 		case <-h.quit:
 			h.finalFlush()
 			return
+		case <-h.force:
+			write()
 		case <-h.dirty:
-			h.writeOnce()
-		case <-retry.C:
+			if hold != nil {
+				continue // the held write snapshots this change too
+			}
+			if wait := budgetHistoryMinWriteInterval - time.Since(last); !last.IsZero() && wait > 0 {
+				hold = time.NewTimer(wait)
+				held = hold.C
+				continue
+			}
+			write()
+		case <-held:
+			hold, held = nil, nil
 			if h.pending() {
-				h.writeOnce()
+				write()
+			}
+		case <-retry.C:
+			if hold == nil && h.pending() {
+				write()
 			}
 		}
 	}
@@ -620,7 +722,10 @@ func (h *BudgetHistory) flush(bound time.Duration) bool {
 	h.mu.Lock()
 	target := h.gen
 	h.mu.Unlock()
-	h.signal()
+	select {
+	case h.force <- struct{}{}:
+	default: // a flush request already pending covers this one
+	}
 	t := time.NewTimer(bound)
 	defer t.Stop()
 	for {
