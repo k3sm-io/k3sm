@@ -1,0 +1,46 @@
+# Install-root path consumers that stay as they are while the install tree moves
+# its binaries under versions/<v>/ behind current and flat compatibility links.
+#
+# hack/acceptance/B1002.sh --check scans the non-test Go of runtimed, darwin-net
+# and k3sm for a "/Library/k3sm" string literal (the root or a path under it)
+# and for a binary path built from the install root (filepath.Join on
+# InstallDir or DefaultInstallDir, or DefaultInstallDir + "/"). Every hit must
+# match one entry below, and every entry must match at least one hit.
+#
+#   allow   <repo>:<path> | <substring of the line> | <reason>
+#   exclude <repo>:<glob> | <reason>       shell files under hack/, not scanned
+#
+# A consumer that compares a path the kernel or a peer reports, or grants a
+# Seatbelt rule on it, must resolve symlinks first and does not belong here.
+
+# The install root itself. A root is not a binary path.
+allow k3sm:pkg/install/install.go | DefaultInstallDir = "/Library/k3sm" | the install root constant; the versioned tree lives under it
+allow k3sm:pkg/updater/layout/layout.go | DefaultRoot = "/Library/k3sm" | the versioned layout's root constant
+allow k3sm:pkg/datavol/guard.go | "/Library/k3sm"} | a refusal guard: the data volume may never be mounted over the install root
+allow k3sm:pkg/install/install.go | DatavolStagingDir = DefaultInstallDir + "/" | a staging directory, not a binary; it stays at the root across layouts
+allow k3sm:pkg/install/install.go | filepath.Join(c.InstallDir, datavolStagingName) | the same staging directory, per config
+
+# Installer copy destinations and launchd program arguments. On the flat layout
+# these are the files themselves; after the migration to versions/ they are the
+# flat compatibility symlinks, which exec, stat and codesign follow. The plists
+# move to <root>/current/<bin> in the migration that creates current, which
+# rewrites them; changing an accessor before current exists would point every
+# plist at a path that is not there.
+allow k3sm:pkg/install/install.go | filepath.Join(c.InstallDir, "k3sm") | installedBinary: copy destination and plist ProgramArguments; moves to current/ with the migration that creates it
+allow k3sm:pkg/install/install.go | filepath.Join(c.InstallDir, "k3sm-execshim") | installedExecShim: copy destination; runtime lookups resolve symlinks beside the running binary
+allow k3sm:pkg/install/install.go | filepath.Join(c.InstallDir, PathShimName) | installedPathShim: copy destination; the node resolves the shim beside its symlink-resolved executable
+allow k3sm:pkg/install/install.go | filepath.Join(c.InstallDir, DNSShimName) | installedDNSShim: copy destination; the node resolves the shim beside its symlink-resolved executable
+allow k3sm:pkg/install/install.go | filepath.Join(c.InstallDir, VMHostName) | installedVMHost: copy destination; the vm helper identity check accepts it, current/ and versions/<v>/ (isInstalledVMHost)
+allow k3sm:pkg/install/manifest.go | filepath.Join(cfg.InstallDir, "bin" | the control-plane payload's manifest entries: copy destinations removed by uninstall, not a peer identity
+allow k3sm:pkg/install/stage.go | filepath.Join(c.InstallDir, "bin", name) | a staging path for the control-plane payload, derived from the destination
+
+# Read-only probes that follow symlinks.
+allow k3sm:cmd/k3sm/status_env.go | filepath.Join(install.DefaultInstallDir, installedBinaryName) | status reports the installed binary through the flat path; stat and exec follow the compatibility link
+allow darwin-net:pkg/netd/update.go | DefaultInstalledK3sm = "/Library/k3sm/k3sm" | netd resolves the installed k3sm through its symlinks before reading its signature or running its version probe
+
+# Shell scripts under k3sm/hack/ invoke the installed CLI by its flat path, the
+# compatibility link the versioned layout keeps for the shell, the app and the
+# docs. They are lab and acceptance drivers, not product code.
+exclude k3sm:hack/acceptance/*.sh | acceptance drivers run the CLI through the flat compatibility link
+exclude k3sm:hack/lab/*.sh | lab drivers run the CLI through the flat compatibility link
+exclude k3sm:hack/lib/*.sh | cluster helpers run the CLI through the flat compatibility link and name the install root
