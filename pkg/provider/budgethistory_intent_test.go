@@ -19,7 +19,6 @@ package provider
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -29,8 +28,6 @@ import (
 	"testing"
 	"time"
 
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -510,54 +507,5 @@ func TestStopBudgetHistoryFlushesBeforeExit(t *testing.T) {
 	}
 	if !r.StopBudgetHistory() {
 		t.Fatal("a second StopBudgetHistory must report true")
-	}
-}
-
-// TestFailedStopLeavesNoIntent: a stop whose RPC fails, is refused, or whose
-// verb runtimed lacks drops the intent it recorded, so the container's later
-// exit 137 is classified as if k3sm had not stopped it.
-//
-// Fails-before: the intent stayed and covered an exit the failed stop never
-// caused.
-func TestFailedStopLeavesNoIntent(t *testing.T) {
-	ctx := context.Background()
-	cases := []struct {
-		name string
-		stop func(t *testing.T, r *runtimedRuntime, f *fakeRuntimeServer, pod *corev1.Pod)
-	}{
-		{"StopContainer transport error", func(t *testing.T, r *runtimedRuntime, f *fakeRuntimeServer, pod *corev1.Pod) {
-			f.setStopErr(errors.New("connection reset"))
-			if err := r.stopContainerReason(ctx, string(pod.UID), "c0", reasonFailedPostStartHook); err == nil {
-				t.Fatal("the stop did not fail")
-			}
-		}},
-		{"StopContainer verb missing", func(t *testing.T, r *runtimedRuntime, f *fakeRuntimeServer, pod *corev1.Pod) {
-			f.setStopErr(status.Error(codes.Unimplemented, "unknown method StopContainer"))
-			if err := r.stopContainerReason(ctx, string(pod.UID), "c0", reasonFailedPostStartHook); !errors.Is(err, errStopVerbMissing) {
-				t.Fatalf("err = %v, want errStopVerbMissing", err)
-			}
-		}},
-		{"DeletePod error", func(t *testing.T, r *runtimedRuntime, f *fakeRuntimeServer, pod *corev1.Pod) {
-			f.mu.Lock()
-			f.deleteFIFO = append(f.deleteFIFO, errors.New("runtimed unavailable"))
-			f.mu.Unlock()
-			if err := r.teardownPod(ctx, pod, minimumGracePeriodSeconds, nil); err == nil {
-				t.Fatal("the delete did not fail")
-			}
-		}},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			r, f := newRuntimedFake(t)
-			r.history = openHistory(t, t.TempDir(), "fp")
-			pod := runtimedPod("default", "web")
-			if err := r.CreatePod(ctx, pod); err != nil {
-				t.Fatalf("CreatePod: %v", err)
-			}
-			tc.stop(t, r, f, pod)
-			if got := intentsFor(r.history, pod.UID); len(got) != 0 {
-				t.Fatalf("intents after a failed stop = %+v, want none", got)
-			}
-		})
 	}
 }

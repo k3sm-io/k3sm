@@ -404,19 +404,34 @@ var (
 // or transport failure is a plain wrapped error.
 //
 // The stop intent is recorded before the RPC, so the container's exit 137 is
-// k3sm's own stop, not a SIGKILL k3sm did not send. Any error (a failed RPC, a
-// refusal, a missing verb) drops it again: no stop happened for it to cover.
+// k3sm's own stop, not a SIGKILL k3sm did not send. A definitive refusal (a
+// missing verb, an unsupported backend, a NotFound or FailedPrecondition, see
+// stopNotIssued) drops it again: no stop happened for it to cover. An error that
+// leaves the outcome open (a deadline, a lost transport) keeps it.
 func (r *runtimedRuntime) stopContainerReason(ctx context.Context, podID, container, reason string) error {
 	var intent uint64
 	if r.history != nil {
 		intent = r.recordStopIntent(r.podByID(podID), container)
 	}
 	err := r.stopContainerRPC(ctx, podID, container, reason)
-	if err != nil {
+	if stopNotIssued(err) {
 		r.history.dropIntent(intent)
 	}
 	return err
 }
+
+// stopRefusal is a refusal runtimed returned inside a StopContainer response.
+// Its text is runtimed's message; its GRPCStatus carries the refusal's code, so
+// stopNotIssued reads it the way it reads a transport status.
+type stopRefusal struct {
+	code codes.Code
+	msg  string
+}
+
+func (e *stopRefusal) Error() string { return e.msg }
+
+// GRPCStatus is the refusal as a gRPC status, for status.Code.
+func (e *stopRefusal) GRPCStatus() *status.Status { return status.New(e.code, e.msg) }
 
 // stopContainerRPC is stopContainerReason's RPC and its error mapping.
 func (r *runtimedRuntime) stopContainerRPC(ctx context.Context, podID, container, reason string) error {
@@ -436,7 +451,7 @@ func (r *runtimedRuntime) stopContainerRPC(ctx context.Context, podID, container
 		return fmt.Errorf("runtimed stop container %s/%s: %w: %s", podID, container, errStopUnsupported, e.GetMessage())
 	}
 	if e != nil && e.GetCode() != 0 {
-		return fmt.Errorf("runtimed stop container %s/%s rejected: %s", podID, container, e.GetMessage())
+		return fmt.Errorf("runtimed stop container %s/%s rejected: %w", podID, container, &stopRefusal{code: codes.Code(e.GetCode()), msg: e.GetMessage()})
 	}
 	return nil
 }

@@ -33,6 +33,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -106,10 +108,12 @@ import (
 // eviction's: it asks the writer to flush and waits up to budgetIntentWriteBound
 // for its intent to reach disk before the kill. On shutdown (the provider's run
 // context ending, or the node's teardown calling StopBudgetHistory) the writer
-// makes one final flush and stops; the node's teardown waits at most
-// budgetHistoryFinalFlushBound for that, so a change made in the last moments
-// before the process exits reaches disk unless the disk is stalled past the
-// bound. An unreadable or unrecognised file is moved aside (the last
+// makes one final flush and stops. The node's context ends BEFORE its teardown
+// runs, so changes keep arriving after the writer has exited (the eviction
+// loop's last count, a teardown's intent, an exit seen while draining); the
+// teardown's stop therefore joins the writer and then writes whatever is still
+// pending itself, all within budgetHistoryStopBound, so every change recorded
+// before stop reaches disk unless the disk is stalled past the bound. An unreadable or unrecognised file is moved aside (the last
 // budgetHistoryAsideMax are kept) and the history starts empty: the totals then
 // restart at 0, as a counter does after a reset. A history dir that cannot be
 // prepared or written degrades to an in-memory history with a Warn log: the
@@ -143,6 +147,10 @@ const (
 	// budgetHistoryFinalFlushBound bounds the writer's final flush on shutdown,
 	// and the node teardown's wait for it (StopBudgetHistory).
 	budgetHistoryFinalFlushBound = 2 * time.Second
+	// budgetHistoryStopBound is how long the node teardown's stop waits: the
+	// writer's own final flush (budgetHistoryFinalFlushBound) plus a margin for
+	// the join and one catch-up write of a change made after that flush.
+	budgetHistoryStopBound = budgetHistoryFinalFlushBound + time.Second
 	// budgetHistoryRetryInterval is how often the writer retries a failed write.
 	budgetHistoryRetryInterval = 30 * time.Second
 )
@@ -223,11 +231,16 @@ type BudgetHistory struct {
 	log  *slog.Logger
 
 	dirty    chan struct{} // capacity 1: a pending-write signal, coalesced
-	once     sync.Once     // starts run once
+	once     sync.Once     // starts run once; stop consumes it, so a later start is a no-op
 	started  atomic.Bool
 	quit     chan struct{} // closed by stop
 	quitOnce sync.Once
 	stopped  chan struct{} // closed when run returns
+
+	// wmu serialises file writes (the writer's, and stop's catch-up write once
+	// the writer has exited), so an older snapshot never lands after a newer
+	// one. It is taken before mu, never while holding it.
+	wmu sync.Mutex
 
 	mu      sync.Mutex
 	st      historyState
@@ -447,7 +460,8 @@ func (h *BudgetHistory) signal() {
 
 // start runs the writer until ctx ends or stop is called. The writer is bound
 // to the FIRST start's ctx: a later call (a second Watch) is a no-op and its
-// ctx is ignored. A nil or in-memory history has no writer.
+// ctx is ignored, and so is a start after stop, which would otherwise launch a
+// writer nobody joins. A nil or in-memory history has no writer.
 func (h *BudgetHistory) start(ctx context.Context) {
 	if h == nil || h.path == "" {
 		return
@@ -458,21 +472,56 @@ func (h *BudgetHistory) start(ctx context.Context) {
 	})
 }
 
-// stop tells the writer to make its final flush and stop, and waits at most
-// bound for it. It reports whether the writer stopped in time; a history with
-// no running writer reports true.
+// stop tells the writer to make its final flush and stop, waits for it, and
+// then writes any change the writer did not (one recorded after the writer
+// already exited on its context's end, or with no writer ever started), all
+// within bound. It reports whether everything recorded before the call reached
+// disk in time. It is idempotent; an in-memory history reports true.
 func (h *BudgetHistory) stop(bound time.Duration) bool {
-	if h == nil || !h.started.Load() {
+	if h == nil || h.path == "" {
 		return true
 	}
-	h.quitOnce.Do(func() { close(h.quit) })
 	t := time.NewTimer(bound)
 	defer t.Stop()
-	select {
-	case <-h.stopped:
-		return true
-	case <-t.C:
-		return false
+	// Consume the start once: a start racing this call either launched its
+	// writer already (started is then set, Do waits for it) or never will.
+	h.once.Do(func() {})
+	h.quitOnce.Do(func() { close(h.quit) })
+	if h.started.Load() {
+		select {
+		case <-h.stopped:
+		case <-t.C:
+			return false
+		}
+	}
+	return h.flushPending(t.C)
+}
+
+// flushPending writes until the file holds every change recorded before the
+// call, or until expired fires. It runs only once the writer has exited (or
+// never ran); a write past the deadline is left to finish on its own goroutine.
+func (h *BudgetHistory) flushPending(expired <-chan time.Time) bool {
+	h.mu.Lock()
+	target := h.gen
+	h.mu.Unlock()
+	for {
+		h.mu.Lock()
+		done := h.written >= target
+		h.mu.Unlock()
+		if done {
+			return true
+		}
+		result := make(chan bool, 1)
+		go func() { result <- h.writeOnce() }()
+		select {
+		case ok := <-result:
+			if !ok {
+				return false
+			}
+		case <-expired:
+			h.log.Warn("budget history: the stop's catch-up write did not finish in time; the latest changes may be lost")
+			return false
+		}
 	}
 }
 
@@ -532,8 +581,11 @@ func (h *BudgetHistory) pending() bool {
 	return h.written < h.gen
 }
 
-// writeOnce writes a snapshot of the current state.
-func (h *BudgetHistory) writeOnce() {
+// writeOnce writes a snapshot of the current state and reports whether the
+// write succeeded.
+func (h *BudgetHistory) writeOnce() bool {
+	h.wmu.Lock()
+	defer h.wmu.Unlock()
 	h.mu.Lock()
 	gen, write := h.gen, h.write
 	data, err := json.Marshal(&h.st)
@@ -543,7 +595,7 @@ func (h *BudgetHistory) writeOnce() {
 	}
 	if err != nil {
 		h.log.Warn("budget history: could not write the history; retrying", "path", h.path, "err", err)
-		return
+		return false
 	}
 	h.mu.Lock()
 	if gen > h.written {
@@ -552,6 +604,7 @@ func (h *BudgetHistory) writeOnce() {
 	close(h.wrote)
 	h.wrote = make(chan struct{})
 	h.mu.Unlock()
+	return true
 }
 
 // flush asks the writer to write the current state and waits at most bound for
@@ -891,14 +944,39 @@ func binaryIdentity(info version.Info) string {
 // this run; the writer persists it shortly after. A provider restart in that
 // window costs a later exit 137 counted as a SIGKILL k3sm did not send.
 //
-// It returns the intent's handle; a caller whose stop RPC fails passes it to
-// r.history.dropIntent, so the exit the failed stop did not cause is
-// classified without it.
+// It returns the intent's handle; a caller whose stop RPC fails definitively
+// (stopNotIssued) passes it to r.history.dropIntent, so the exit the refused
+// stop did not cause is classified without it.
 func (r *runtimedRuntime) recordStopIntent(pod *corev1.Pod, container string) uint64 {
 	if r.history == nil || pod == nil {
 		return 0
 	}
 	return r.history.recordIntent(pod.UID, container)
+}
+
+// stopNotIssued reports whether err, from a stop RPC (DeletePod or
+// StopContainer), proves the stop did not happen, so its intent may be
+// dropped: runtimed answered NotFound, InvalidArgument, FailedPrecondition,
+// Unimplemented or PermissionDenied (in the transport status or as a refusal in
+// the response), or the verb is missing or unsupported. Any other error
+// (DeadlineExceeded, Canceled, Unavailable, Unknown, a reset transport) leaves
+// open whether runtimed carried out the kill, so the intent is kept: an exit 137
+// k3sm caused must not count as a SIGKILL it did not send, and a kept intent
+// that covers nothing is consumed by the pod's next 137 or pruned with the pod.
+// A stop error raised before the RPC is sent returns before any intent is
+// recorded (evictPod's untracked pod), so it never reaches this check.
+func stopNotIssued(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, errStopVerbMissing) || errors.Is(err, errStopUnsupported) {
+		return true
+	}
+	switch status.Code(err) {
+	case codes.NotFound, codes.InvalidArgument, codes.FailedPrecondition, codes.Unimplemented, codes.PermissionDenied:
+		return true
+	}
+	return false
 }
 
 // recordStopIntentWithin is recordStopIntent for the emergency eviction, which
@@ -918,12 +996,14 @@ func (r *runtimedRuntime) recordStopIntentWithin(pod *corev1.Pod, container stri
 	return id
 }
 
-// StopBudgetHistory makes the budget history's writer flush and stop, waiting
-// at most budgetHistoryFinalFlushBound, so a node exiting right after its
-// context ends still persists its last changes. It is the node teardown's
-// seam; it is idempotent and reports whether the writer stopped in time.
+// StopBudgetHistory makes the budget history's writer flush and stop, then
+// writes anything recorded since, waiting at most budgetHistoryStopBound
+// (strictly longer than the writer's own final-flush bound), so a node exiting
+// right after its context ends still persists its last changes. It is the node
+// teardown's seam; it is idempotent and reports whether every change recorded
+// before it reached disk in time.
 func (r *runtimedRuntime) StopBudgetHistory() bool {
-	return r.history.stop(budgetHistoryFinalFlushBound)
+	return r.history.stop(budgetHistoryStopBound)
 }
 
 // pruneBudgetHistory drops the history entries of pods that are gone: in
