@@ -94,6 +94,9 @@ type Store struct {
 	// uploadOpened, when set, runs between an upload session's open and its
 	// flock (a seam for tests that interleave two session operations).
 	uploadOpened func(id string)
+	// indexRemoved, when set, runs in RemoveLayout right after index.json is
+	// removed; an error stops the removal there (a seam for crash tests).
+	indexRemoved func() error
 }
 
 // Open opens the store rooted at root, with server state under state. It
@@ -428,28 +431,37 @@ func (s *Store) Init(ctx context.Context, n ref.Name) error {
 	if err != nil {
 		return err
 	}
-	if isRepoDir(dir) {
-		if err := s.mkdirs(filepath.Join(dir, uploadsDir)); err != nil {
-			return fmt.Errorf("init %s: %w", n, err)
-		}
-		return nil
-	}
 	unlock, err := s.lock(ctx, n)
 	if err != nil {
 		return err
 	}
 	defer unlock()
+	if err := s.initLocked(dir); err != nil {
+		return fmt.Errorf("init %s: %w", n, err)
+	}
+	return nil
+}
+
+// initLocked is Init's body; the caller holds the repository lock. Every
+// write that creates a path inside a repository (a session, a blob link)
+// runs it under the same lock hold, so GC, which removes an empty
+// repository's layout under that lock, never leaves a write in a directory
+// that is no longer a repository.
+func (s *Store) initLocked(dir string) error {
+	if isRepoDir(dir) {
+		return s.mkdirs(filepath.Join(dir, uploadsDir))
+	}
 	for _, d := range []string{dir, filepath.Join(dir, blobsDir), filepath.Join(dir, uploadsDir)} {
 		if err := s.mkdirs(d); err != nil {
-			return fmt.Errorf("init %s: %w", n, err)
+			return err
 		}
 	}
 	if err := s.createFile(filepath.Join(dir, layoutFile), layoutBody); err != nil {
-		return fmt.Errorf("init %s: %w", n, err)
+		return err
 	}
 	if _, err := os.Lstat(filepath.Join(dir, indexFile)); errors.Is(err, os.ErrNotExist) {
 		if err := s.writeIndex(dir, ispec.Index{Versioned: specsVersioned}); err != nil {
-			return fmt.Errorf("init %s: %w", n, err)
+			return err
 		}
 	} else if err != nil {
 		return err
