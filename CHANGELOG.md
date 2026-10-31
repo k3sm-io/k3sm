@@ -32,6 +32,9 @@ pin, its date, and the tarball's sha256.
 
 ### Fixed
 
+- `k3sm stop` and `k3sm uninstall` recognise a vm pod's `k3sm-vmhost` helper when it runs from
+  a versioned install directory or through a symlinked install path, not only from the flat
+  `/Library/k3sm/k3sm-vmhost`, so such a helper is still stopped instead of reported as unknown.
 - `k3sm image tag`, `untag`, `inspect` and `save` now refuse `--socket`, as `ls` and `df` do,
   instead of silently ignoring a flag they never use.
 - An `MLXModel` with a pinned `revision` now starts on a fresh cache volume: the mlx-serve image
