@@ -53,6 +53,10 @@ import (
 //     included, carries a valid Developer ID Application signature of its own
 //     team, judged on its own and not against the installed build.
 //
+// In developer mode (Config.DeveloperMode on, or a valid developer-mode marker
+// on disk) the signing continuity check is skipped and a Warn says so; every
+// other check above, --require-team-signature included, still runs.
+//
 // Any doubt refuses. The copy-out removes its staging directory on every exit
 // path, so a refusal costs one re-run and leaves nothing behind. The two locks
 // and uninstall's staging sweep are in staginglock.go.
@@ -354,7 +358,9 @@ func preflightFromStaging(ctx context.Context, cfg *Config) error {
 			return err
 		}
 	}
-	if err := checkSigningContinuity(ctx, *cfg, entries); err != nil {
+	if cfg.developerModeOn() {
+		cfg.Logger.Warn(developerModeContinuityWarning)
+	} else if err := checkSigningContinuity(ctx, *cfg, entries); err != nil {
 		return err
 	}
 	// Last, because it runs the installed binary: only a tree that passed
@@ -390,6 +396,10 @@ func (c Config) discardToken() {
 		DiscardStagedToken(c.StagingFS, c.stagingRoot(), c.TokenFile)
 	}
 }
+
+// developerModeContinuityWarning is the Warn an install in developer mode logs
+// in place of the signing continuity check.
+const developerModeContinuityWarning = "developer mode: the staged build's signature was not compared with the installed one"
 
 // checkSigningContinuity proves the staged tree may replace what is installed,
 // and the installed build decides the rule:

@@ -837,6 +837,9 @@ type System interface {
 	// The mode is a PARAMETER, as on every other write seam here, so the policy
 	// is visible at the call site and assertable without privilege.
 	WriteRootOnlyFile(path string, contents []byte, mode fs.FileMode) error
+	// HasACL reports whether path carries an extended ACL, never following a
+	// symlink at path. Read-only; the developer-mode marker counts only without.
+	HasACL(path string) (bool, error)
 	// Owner reports who owns the entry at path, what it permits, and what kind
 	// of entry it is — an lstat, so a symlink is described rather than followed.
 	// A missing entry has ReadFile's contract (an error satisfying
@@ -1339,6 +1342,8 @@ type Config struct {
 	LAN *LAN
 	// NetworkRecord is where LAN is recorded; empty is DefaultNetworkRecordPath.
 	NetworkRecord string
+	// DeveloperModeOptions is `k3sm install --developer-mode` (developermode.go).
+	DeveloperModeOptions
 	// ExtraAgentArgs are operator-supplied `k3sm agent` arguments appended to the
 	// fixed set AgentPlist renders (--mesh-port, --dns-vip, …). Install
 	// populates it exactly as it populates ExtraServerArgs: from the agent plist
@@ -1873,6 +1878,9 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	// record, between this instant and its bootout; startedAt is only the
 	// window's fallback there.
 	startedAt := time.Now()
+	if err := resolveDeveloperMode(sys, &cfg); err != nil {
+		return err
+	}
 	if err := preflightFromStaging(ctx, &cfg); err != nil {
 		return err
 	}
@@ -1975,6 +1983,10 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 		return fmt.Errorf("install: %w", err)
 	}
 	defer release()
+	// The developer-mode marker, before the install root is swapped.
+	if err := applyDeveloperMode(ctx, sys, cfg); err != nil {
+		return err
+	}
 
 	if cfg.AdminToken == "" && !cfg.keepAdminToken {
 		tok, err := generateToken()

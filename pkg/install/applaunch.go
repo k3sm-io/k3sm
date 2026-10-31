@@ -102,6 +102,9 @@ type appHost interface {
 	Running(ctx context.Context, uid uint32, name string) (bool, error)
 	// Run runs argv with exactly env and returns its combined output.
 	Run(ctx context.Context, argv, env []string) ([]byte, error)
+	// DeveloperMode reports whether a valid developer-mode marker is on disk
+	// (DeveloperModeMarkerState).
+	DeveloperMode() bool
 }
 
 // hiddenAppLauncher is the AppLauncher k3sm uses: it opens AppBundlePath for
@@ -200,7 +203,11 @@ func (l hiddenAppLauncher) plan(ctx context.Context) (argv, env []string, skip s
 		return warn("the running k3sm's code signature does not verify")
 	}
 	if why := signingMismatch(cli, app); why != "" {
-		return warn(why)
+		if !l.host.DeveloperMode() {
+			return warn(why)
+		}
+		// Developer mode pairs builds signed any way: the mismatch is a note.
+		l.logger.Info("developer mode: opening the k3sm app although its signing does not match: "+why, "app", l.bundle)
 	}
 	name := exe
 	if len(name) > maxProcessNameLen {
@@ -220,6 +227,7 @@ func (l hiddenAppLauncher) plan(ctx context.Context) (argv, env []string, skip s
 // ad-hoc k3sm (a local build) opens only an ad-hoc app, and a team-signed
 // k3sm only an app signed by the same team. Every other pairing is a
 // mismatch. Empty means they match.
+// In developer mode a mismatch is logged at Info and the app still opens.
 func signingMismatch(cli, app binsign.Signature) string {
 	switch {
 	case cli.AdHoc && app.AdHoc:

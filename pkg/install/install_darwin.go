@@ -636,6 +636,10 @@ func refuseSymlinkAt(path string) error {
 // sentinel so callers and tests match it with errors.Is, never by message.
 var errSymlinkRefused = errors.New("is a symlink: refusing to chown/chmod through it")
 
+// HasACL reports whether path carries an extended ACL, never following a
+// symlink at path (pathHasACL).
+func (darwinSystem) HasACL(path string) (bool, error) { return pathHasACL(path) }
+
 // Owner reports the ownership, permission bits and kind of path. See the System
 // interface for the contract.
 //

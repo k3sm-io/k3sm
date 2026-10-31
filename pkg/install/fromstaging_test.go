@@ -537,20 +537,82 @@ func TestReleaseVersionOrder(t *testing.T) {
 	}
 }
 
-// TestFromStagingTeamIDContinuity pins the signing continuity check, which
+// devPosture is the developer-mode column of TestDeveloperModeSigningContinuity:
+// what the flag says and what the marker on disk is.
+type devPosture int
+
+const (
+	// devNone is neither the flag nor a marker: today's install.
+	devNone devPosture = iota
+	// devFlagOn is --developer-mode on.
+	devFlagOn
+	// devMarkerOn is no flag and a valid marker on disk.
+	devMarkerOn
+	// devFlagOffMarkerOn is --developer-mode off over a valid marker: off wins.
+	devFlagOffMarkerOn
+	// devMarkerSymlink is no flag and a symlink at the marker path.
+	devMarkerSymlink
+	// devMarkerWorldWritable is no flag and a 0666 marker.
+	devMarkerWorldWritable
+)
+
+func (d devPosture) String() string {
+	return [...]string{"no developer mode", "--developer-mode on", "a valid marker", "--developer-mode off over a valid marker",
+		"a symlinked marker", "a 0666 marker"}[d]
+}
+
+// on reports whether the posture turns developer mode on.
+func (d devPosture) on() bool { return d == devFlagOn || d == devMarkerOn }
+
+// apply sets the posture on cfg: the flag, and a fake system whose marker is
+// the posture's, read through the production reader (resolveDeveloperMode).
+func (d devPosture) apply(t *testing.T, cfg *Config) {
+	t.Helper()
+	f := &fakeSystem{owners: map[string]OwnedEntry{}}
+	marker := OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: 0o644}
+	switch d {
+	case devFlagOn:
+		cfg.DeveloperMode = DeveloperModeOn
+	case devMarkerOn:
+		f.owners[DeveloperModeMarkerPath] = marker
+	case devFlagOffMarkerOn:
+		cfg.DeveloperMode = DeveloperModeOff
+		f.owners[DeveloperModeMarkerPath] = marker
+	case devMarkerSymlink:
+		marker.Kind, marker.Mode = EntrySymlink, 0o755
+		f.owners[DeveloperModeMarkerPath] = marker
+	case devMarkerWorldWritable:
+		marker.Mode = 0o666
+		f.owners[DeveloperModeMarkerPath] = marker
+	}
+	if err := resolveDeveloperMode(f, cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestDeveloperModeSigningContinuity pins the signing continuity check, which
 // follows the installed build: a first install and a team-signed install take
 // only a tree whose every Mach-O carries one Developer ID team's signature (the
 // installed team on an update), so an ad-hoc tree never replaces a team-signed
 // install; an ad-hoc install takes an ad-hoc tree or a team-signed one, but not
 // a tree mixing the two. A non-Mach-O file needs no signature.
-func TestFromStagingTeamIDContinuity(t *testing.T) {
+//
+// Developer mode (the flag on, or a valid marker with no flag) skips that check
+// and logs a Warn saying so; every other --from-staging check still refuses.
+// Every row without a developer-mode posture keeps today's verdict, and is run
+// again under --developer-mode off over a valid marker and under each invalid
+// marker, which must change nothing.
+func TestDeveloperModeSigningContinuity(t *testing.T) {
 	t.Parallel()
 	installed := Config{}.withDefaults().installedBinary()
 	helper := filepath.Join(testPayloadDir, VMHostName)
 	appExe := testStagedApp + "/Contents/MacOS/k3sm"
+	teamOverAdHocTree := fakeSigner{ids: map[string]string{installed: testTeamID}, errs: adHocTree()}
 	cases := []struct {
 		name   string
 		signer fakeSigner
+		dev    devPosture
+		tweak  func(*fakeStagingFS, *Config)
 		want   error
 	}{
 		{name: "first install", signer: fakeSigner{ids: signedTree(nil)}},
@@ -563,8 +625,7 @@ func TestFromStagingTeamIDContinuity(t *testing.T) {
 			signer: fakeSigner{errs: adHocTree(installed)}},
 		{name: "an ad-hoc install refuses a tree mixing ad-hoc and team signatures", want: ErrTeamIDMismatch,
 			signer: fakeSigner{ids: map[string]string{helper: testTeamID}, errs: without(adHocTree(installed), helper)}},
-		{name: "a team-signed install refuses an ad-hoc tree", want: ErrTeamIDMismatch,
-			signer: fakeSigner{ids: map[string]string{installed: testTeamID}, errs: adHocTree()}},
+		{name: "a team-signed install refuses an ad-hoc tree", want: ErrTeamIDMismatch, signer: teamOverAdHocTree},
 		{name: "installed binary signed Apple Development by the same team refused", want: ErrNotDeveloperID,
 			signer: fakeSigner{ids: signedTree(map[string]string{installed: testTeamID}), notDevID: map[string]bool{installed: true}}},
 		{name: "ad-hoc staged k3sm refused", want: ErrNoTeamID,
@@ -581,28 +642,68 @@ func TestFromStagingTeamIDContinuity(t *testing.T) {
 			signer: fakeSigner{ids: signedTree(nil), errs: map[string]error{appExe: ErrNoTeamID}}},
 		{name: "unreadable installed signature refused", want: errSignatureUnreadable,
 			signer: fakeSigner{ids: signedTree(nil), errs: map[string]error{installed: errSignatureUnreadable}}},
+
+		// Developer mode.
+		{name: "an ad-hoc tree over a team-signed install", dev: devFlagOn, signer: teamOverAdHocTree},
+		{name: "an ad-hoc tree over a team-signed install, by the marker", dev: devMarkerOn, signer: teamOverAdHocTree},
+		{name: "a team-signed tree over an ad-hoc install", dev: devFlagOn,
+			signer: fakeSigner{ids: signedTree(nil), errs: map[string]error{installed: ErrNoTeamID}}},
+		{name: "a tree of another team over a team-signed install", dev: devFlagOn,
+			signer: fakeSigner{ids: signedTree(map[string]string{installed: "ZZZZZ99999"})}},
+		{name: "a first install of an ad-hoc tree", dev: devFlagOn, signer: fakeSigner{errs: adHocTree()}},
+		{name: "--require-team-signature still refuses an ad-hoc tree", dev: devFlagOn, want: ErrNoTeamID,
+			signer: fakeSigner{errs: adHocTree()}, tweak: func(_ *fakeStagingFS, c *Config) { c.RequireTeamSignature = true }},
+		{name: "a downgrade is still refused", dev: devFlagOn, want: ErrDowngrade, signer: teamOverAdHocTree,
+			tweak: func(s *fakeStagingFS, _ *Config) { s.versions[installed] = "v0.5.0" }},
+		{name: "a staging directory not owned by root is still refused", dev: devFlagOn, want: ErrStagingUntrusted,
+			signer: teamOverAdHocTree, tweak: func(s *fakeStagingFS, _ *Config) { s.put(testStagedDir, 501, 0, fs.ModeDir|0o700) }},
+	}
+	type run struct {
+		name string
+		dev  devPosture
 	}
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			sfs, cfg := stagedFixture()
-			cfg.Signer = tc.signer
-			err := preflightFromStaging(context.Background(), &cfg)
-			if tc.want != nil {
-				if !errors.Is(err, tc.want) {
-					t.Fatalf("preflightFromStaging = %v, want %v", err, tc.want)
+		runs := []run{{tc.name, tc.dev}}
+		if tc.dev == devNone {
+			for _, d := range []devPosture{devFlagOffMarkerOn, devMarkerSymlink, devMarkerWorldWritable} {
+				runs = append(runs, run{tc.name + " (" + d.String() + ")", d})
+			}
+		}
+		for _, r := range runs {
+			t.Run(r.name, func(t *testing.T) {
+				t.Parallel()
+				sfs, cfg := stagedFixture()
+				cfg.Signer = tc.signer
+				var logs strings.Builder
+				cfg.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+				r.dev.apply(t, &cfg)
+				if tc.tweak != nil {
+					tc.tweak(sfs, &cfg)
 				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("preflightFromStaging = %v, want accepted", err)
-			}
-			for _, f := range stagedMachOs() {
-				if f != testStagedExe && !slices.Contains(sfs.calls, "MachO:"+f) {
-					t.Errorf("%s was never checked for a Mach-O header", f)
+				err := preflightFromStaging(context.Background(), &cfg)
+				warned := strings.Contains(logs.String(), "level=WARN") && strings.Contains(logs.String(), `"`+developerModeContinuityWarning+`"`)
+				if tc.want != nil {
+					if !errors.Is(err, tc.want) {
+						t.Fatalf("preflightFromStaging = %v, want %v", err, tc.want)
+					}
+					return
 				}
-			}
-		})
+				if err != nil {
+					t.Fatalf("preflightFromStaging = %v, want accepted", err)
+				}
+				if warned != r.dev.on() {
+					t.Errorf("developer-mode Warn logged = %v, want %v; logs:\n%s", warned, r.dev.on(), logs.String())
+				}
+				if r.dev.on() {
+					return
+				}
+				for _, f := range stagedMachOs() {
+					if f != testStagedExe && !slices.Contains(sfs.calls, "MachO:"+f) {
+						t.Errorf("%s was never checked for a Mach-O header", f)
+					}
+				}
+			})
+		}
 	}
 }
 
