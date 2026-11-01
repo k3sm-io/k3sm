@@ -250,8 +250,10 @@ func TestResolveInstalledBinary(t *testing.T) {
 // accepted path comes back fully evaluated, so no later read follows the root
 // link again: a flat file and a versioned link both resolve into the real root.
 // A flat file that does not sit directly in the evaluated root, as when the
-// root link is pointed elsewhere between the two evaluations, fails closed.
-// No install is still the entry point as named.
+// root link is pointed elsewhere between the two evaluations, or an entry
+// point that turns from a file into a link between its lstat and its
+// evaluation, fails closed. No install, a dangling root link included, is
+// still the entry point as named.
 func TestResolveInstalledFlatUnderLinkedRoot(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -262,7 +264,10 @@ func TestResolveInstalledFlatUnderLinkedRoot(t *testing.T) {
 		setup func(t *testing.T, real, other string)
 		// swap retargets the root link at other after the first evaluation.
 		swap bool
-		want string // relative to the real root; "" = refused; "=" = the entry point as named
+		// relink replaces the entry point with a link to the real root's
+		// versioned binary after the first lstat.
+		relink bool
+		want   string // relative to the real root; "" = refused; "=" = the entry point as named
 	}{
 		{name: "a flat binary under a linked root is the evaluated path", want: "k3sm",
 			setup: func(t *testing.T, real, _ string) { putInstalledFile(t, filepath.Join(real, "k3sm")) }},
@@ -273,6 +278,17 @@ func TestResolveInstalledFlatUnderLinkedRoot(t *testing.T) {
 			}},
 		{name: "no install under a linked root is the entry point as named", want: "=",
 			setup: func(*testing.T, string, string) {}},
+		{name: "a dangling root link is the entry point as named", want: "=",
+			setup: func(t *testing.T, real, _ string) {
+				if err := os.Remove(real); err != nil {
+					t.Fatal(err)
+				}
+			}},
+		{name: "a flat binary that turns into a link before its evaluation is refused", relink: true,
+			setup: func(t *testing.T, real, _ string) {
+				putInstalledFile(t, filepath.Join(real, "k3sm"))
+				putInstalledFile(t, filepath.Join(real, "versions", "v0.3.9", "k3sm"))
+			}},
 		{name: "a versioned install resolves into the real root", want: "versions/v0.3.9/k3sm",
 			setup: func(t *testing.T, real, _ string) {
 				putInstalledFile(t, filepath.Join(real, "versions", "v0.3.9", "k3sm"))
@@ -303,6 +319,17 @@ func TestResolveInstalledFlatUnderLinkedRoot(t *testing.T) {
 			}
 			putInstalledLink(t, real, linked)
 			tc.setup(t, real, other)
+			lstats := 0
+			lstat := func(p string) (fs.FileInfo, error) {
+				fi, err := os.Lstat(p)
+				if lstats++; tc.relink && lstats == 1 {
+					if err := os.Remove(filepath.Join(real, "k3sm")); err != nil {
+						t.Fatal(err)
+					}
+					putInstalledLink(t, "versions/v0.3.9/k3sm", filepath.Join(real, "k3sm"))
+				}
+				return fi, err
+			}
 			evals := 0
 			eval := func(p string) (string, error) {
 				got, err := filepath.EvalSymlinks(p)
@@ -315,7 +342,7 @@ func TestResolveInstalledFlatUnderLinkedRoot(t *testing.T) {
 				return got, err
 			}
 			entry := filepath.Join(linked, "k3sm")
-			got, err := resolveInstalledBinary(entry, os.Lstat, eval)
+			got, err := resolveInstalledBinary(entry, lstat, eval)
 			switch tc.want {
 			case "":
 				if !errors.Is(err, errInstalledUnresolvable) || errors.Is(err, fs.ErrNotExist) {

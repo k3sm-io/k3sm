@@ -91,9 +91,10 @@ pin, its date, and the tarball's sha256.
   directory that is gone, or out of `/Library/k3sm`) is still refused, and the refusal now says
   how to repair the install: re-run the install script, `curl -fsSL https://k3sm.io/install.sh | sh`,
   then update again.
-- `k3sm install --from-staging` reads a flat installed `k3sm` through its fully evaluated path, so
-  an install directory that is itself a symlink is followed once, not again by each check, and an
-  installed binary that does not sit in that directory once evaluated is refused.
+- `k3sm install --from-staging` evaluates an existing flat installed `k3sm` once and reads it
+  through that path, so an install directory that is itself a symlink is not followed again by
+  each check, and a binary that does not sit in that directory once evaluated is refused. A
+  missing entry point is still taken as no install, as is one under a dangling directory link.
 - `k3sm uninstall` stops a vm pod helper still running from an older k3sm version whose
   directory is kept for it, as it stops every other helper, instead of reporting it as a
   leftover to kill by hand. Only a helper whose version directory is gone is still reported.

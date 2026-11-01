@@ -127,10 +127,11 @@ type StagingFS interface {
 	// universal-binary magic number, opening it without following a symlink.
 	MachO(path string) (bool, error)
 	// ResolveInstalled returns the file the installed k3sm entry point path
-	// names (resolveInstalledBinary): path itself when it does not exist,
-	// otherwise a fully evaluated path, <dir>/<base> when it is not a symlink
-	// and the regular file <dir>/versions/<v>/<base> it leads to when it is.
-	// Anything else is an error.
+	// names (resolveInstalledBinary): path itself, unevaluated, when it does
+	// not exist (a dangling link above it included, which reads as no
+	// install); otherwise a path evaluated once, <dir>/<base> when it is not
+	// a symlink and the regular file <dir>/versions/<v>/<base> it leads to
+	// when it is. Anything else is an error.
 	ResolveInstalled(path string) (string, error)
 }
 
@@ -418,10 +419,12 @@ const installedUnresolvableRecovery = "repair the install with the install scrip
 // target outside that tree is errInstalledUnresolvable, never fs.ErrNotExist,
 // so a broken link is not mistaken for no install.
 //
-// An existing path is returned fully evaluated (EvalSymlinks), a flat file as
-// much as a link: no component of it is a symlink, so the later reads follow
-// none again, an install root that is itself a link included. Only a missing
-// path is returned unevaluated.
+// An existing entry point is evaluated once (EvalSymlinks) and returned
+// evaluated, a flat file as much as a link: no component of the returned path
+// is a symlink, so the later reads follow none again, an install root that is
+// itself a link included. A missing entry point is returned as named and is
+// not evaluated; when the install root is a dangling link the entry point is
+// missing, so that too reads as no install.
 //
 // The callers read only the returned path. Nothing stops the tree changing
 // after the resolve; that needs a write to the root-owned install directory.
@@ -445,6 +448,7 @@ func resolveInstalledBinary(path string, lstat func(string) (fs.FileInfo, error)
 		// Whole-path equality with root joined to the entry point's name:
 		// both sides are cleaned and fully evaluated, so neither a ".." nor
 		// a root that is only a string prefix of target can pass it.
+		// A byte comparison with no case folding, deliberately.
 		if want := filepath.Join(root, filepath.Base(path)); filepath.Clean(target) != want {
 			return "", fmt.Errorf("%w: %s evaluates to %s, not %s in its install root", errInstalledUnresolvable, path, target, want)
 		}
