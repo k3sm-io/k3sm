@@ -31,7 +31,10 @@ limitations under the License.
 // Behaviour follows the registry this replaces where clients can tell:
 //
 //   - manifest GET and HEAD ignore Accept and answer with the media type the
-//     manifest was pushed with, and Docker-Content-Digest;
+//     manifest was pushed with, and Docker-Content-Digest; a HEAD by digest
+//     restarts the manifest's garbage-collection grace (store.TouchBlob), so
+//     a client that skips pushing an index's child on a HEAD hit finds it at
+//     the index PUT, while a HEAD by tag and every GET write nothing;
 //   - a manifest PUT accepts the OCI manifest and index and the Docker v2
 //     manifest and manifest list (415 otherwise), reads at most 4 MiB (413
 //     above), requires the blobs an image manifest names to be in the

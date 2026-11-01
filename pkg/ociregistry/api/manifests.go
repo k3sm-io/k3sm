@@ -88,6 +88,16 @@ func (s *Server) getManifest(w http.ResponseWriter, r *http.Request, n ref.Name)
 		return
 	}
 	desc, body, err := s.st.Manifest(n, rf)
+	// A HEAD by digest is how a pushing client decides to skip a child
+	// manifest's push before it PUTs the index naming it, so it restarts the
+	// manifest's GC grace, exactly as a blob HEAD does: an untagged child past
+	// the grace is not reaped before the index PUT. If GC reaped it after the
+	// read above, the touch finds it gone and the HEAD answers 404. A HEAD by
+	// tag writes nothing: a tagged row is kept at any age, and the index names
+	// its children by digest. A GET (a pull) writes nothing either.
+	if err == nil && r.Method == http.MethodHead && rf.Digest != "" {
+		err = s.st.TouchBlob(r.Context(), n, desc.Digest)
+	}
 	if errors.Is(err, store.ErrBlobUnknown) {
 		err = fmt.Errorf("%w: %w", store.ErrManifestUnknown, err)
 	}

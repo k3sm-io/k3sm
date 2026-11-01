@@ -83,6 +83,10 @@ pin, its date, and the tarball's sha256.
   the blobs it still used.
 - The launchd `ExitTimeOut` of the server and agent daemons now counts the node's wait for the
   eviction loop to stop, so a worker's shutdown budget no longer undercounts by 10 seconds.
+- A manifest HEAD by digest on the k3sm registry server restarts that manifest's
+  garbage-collection grace, so a client that skips pushing an index's child manifest because it
+  is already there no longer loses the untagged child to a sweep before its index PUT.
+
 - `k3sm stop` and `k3sm uninstall` recognise a vm pod's `k3sm-vmhost` helper when it runs from
   a versioned install directory or through a symlinked install path, not only from the flat
   `/Library/k3sm/k3sm-vmhost`, so such a helper is still stopped instead of reported as unknown.
