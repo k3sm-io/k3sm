@@ -317,6 +317,23 @@ func (a *Access) forgetFull(t time.Time) {
 // client's bucket.
 func source(r *http.Request) string { return r.RemoteAddr }
 
+// NewServer returns the registry API server over cfg with a as its access
+// check: it sets both cfg.Authorize and cfg.ConnClosed, so a server built
+// here never keeps a closed connection's bucket. It refuses a cfg that
+// already names either, so a caller cannot half-wire them. It lives here
+// rather than in package api because this package imports api.
+func NewServer(a *Access, cfg api.Config) (*api.Server, error) {
+	if a == nil {
+		return nil, errors.New("registry auth: no access check")
+	}
+	if cfg.Authorize != nil || cfg.ConnClosed != nil {
+		return nil, errors.New("registry auth: the server config already names an authorizer or a connection hook")
+	}
+	cfg.Authorize = a.Authorize
+	cfg.ConnClosed = a.ConnClosed
+	return api.New(cfg)
+}
+
 // ConnClosed forgets the failure bucket of the connection whose remote
 // address is remoteAddr. It is the api.Config ConnClosed hook: a bucket keyed
 // on a connection ends with it, so a later connection the kernel gives the

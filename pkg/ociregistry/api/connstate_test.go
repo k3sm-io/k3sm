@@ -40,8 +40,8 @@ type fakeConn struct {
 
 func (c fakeConn) RemoteAddr() net.Addr { return c.remote }
 
-// newAuthServer is the registry server with the auth package's Access wired as
-// it is in production: Authorize and ConnClosed. The clock never moves, so a
+// newAuthServer is the registry server built from the auth package's Access
+// through auth.NewServer, which wires Authorize and ConnClosed. The clock never moves, so a
 // spent bucket never refills during the test.
 func newAuthServer(t *testing.T, secret string, maxConns int) *http.Server {
 	t.Helper()
@@ -61,12 +61,10 @@ func newAuthServer(t *testing.T, secret string, maxConns int) *http.Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := api.New(api.Config{
-		Store:      st,
-		Authorize:  a.Authorize,
-		ConnClosed: a.ConnClosed,
-		MaxConns:   maxConns,
-		FreeSpace:  func() (uint64, error) { return 1 << 40, nil },
+	srv, err := auth.NewServer(a, api.Config{
+		Store:     st,
+		MaxConns:  maxConns,
+		FreeSpace: func() (uint64, error) { return 1 << 40, nil },
 	})
 	if err != nil {
 		t.Fatal(err)

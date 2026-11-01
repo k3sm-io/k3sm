@@ -77,7 +77,20 @@ limitations under the License.
 //   - HTTPServer serves at most MaxConns connections at once and closes one
 //     past that before a request is read; it reports each connection's end
 //     (closed or hijacked) to ConnClosed, so an Authorizer that keys state on
-//     a connection can drop it.
+//     a connection can drop it. The cap is global, not per client: every
+//     caller is on loopback, so a source host would be one source for all of
+//     them, and a source port is one connection. Any local client can
+//     therefore hold every slot, an idle connection for up to IdleTimeout (2
+//     minutes) and a silent one for up to ReadHeaderTimeout (30 s), and while
+//     it does the push and gate principals are refused too. That is the
+//     trade for bounding the server's work: a flood becomes a denial of
+//     service to other local clients rather than an unbounded number of
+//     connections. A refused connection counts against the cap from its
+//     accept until the server reports it closed, so a flood of refused
+//     connections can over-count for that moment;
+//   - no handler hijacks a connection. A hijacked socket leaves the cap and
+//     reports its end to ConnClosed at the hijack, so a handler that hijacks
+//     must bound those sockets itself.
 //
 // Every handler recovers from a panic with a 500, and an upload gives back its
 // session entry and slot on every way out.

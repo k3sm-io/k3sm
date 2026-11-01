@@ -67,22 +67,25 @@ limitations under the License.
 // cause; it is not a brute-force defence (a client may open new connections),
 // and need not be, because the secrets carry 256 bits.
 //
-// A bucket ends with its connection: the server is built with ConnClosed as
-// its api.Config ConnClosed hook, which the http.Server's ConnState calls
-// when a connection closes or is hijacked. A bucket that outlived its
-// connection would wait for a later client the kernel gives the same
-// ephemeral port, which would then be answered 429 on a valid secret. While
-// the connection stays open, idle between requests included, its bucket keeps
-// limiting it.
+// A bucket ends with its connection. NewServer builds the registry server
+// with Authorize and ConnClosed both set, and the http.Server's ConnState
+// calls ConnClosed when a connection closes or is hijacked. A bucket that
+// outlived its connection would wait for a later client the kernel gives the
+// same ephemeral port, which would then be answered 429 on a valid secret.
+// While the connection stays open, idle between requests included, its
+// bucket keeps limiting it.
 //
-// Keying per connection leaves no global bound on failed-compare work in this
-// package; the listener carries it. api.Server.HTTPServer serves at most
-// api.Config MaxConns connections at once (api.DefaultMaxConns by default)
-// and closes one past that before a request is read, and it has a header read
-// timeout of api.ReadHeaderTimeout, so a connection that sends nothing holds
-// its slot for at most that long. Together with one bucket per connection,
-// the compares in flight are bounded by MaxConns times the burst, refilled at
-// one per Refill per connection.
+// What this bounds, and what it does not. Keying per connection leaves no
+// global bound in this package; the listener carries the one there is.
+// api.Server.HTTPServer serves at most api.Config MaxConns connections at
+// once (api.DefaultMaxConns by default) and closes one past that before a
+// request is read, with a header read timeout of api.ReadHeaderTimeout. A
+// connection serves one request at a time, so the compares in flight are at
+// most MaxConns, and one connection makes at most the burst of failures, then
+// one per Refill. The rate of guesses is not bounded: a client that closes
+// and reconnects gets a fresh bucket on every connection, as it would with a
+// new port before this change. The defence against guessing is the 256-bit
+// secret, not the bucket or the cap.
 //
 // Limits, all fail-closed: one Authorization header of at most
 // MaxAuthorizationBytes, a user name of at most MaxUserBytes and a secret of
