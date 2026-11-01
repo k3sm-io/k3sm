@@ -44,13 +44,13 @@ var (
 // the same flag, and the default is to refuse. The installed version is what
 // the installed binary reports, so this guards against operator error, not
 // against a tampered install: a tampered binary can lie. It runs only after
-// the signing checks have passed.
-func checkStagedVersion(cfg Config) error {
+// the signing checks have passed. installedPath is the installed k3sm as
+// preflightFromStaging resolved it, the file the signing checks read.
+func checkStagedVersion(cfg Config, installedPath string) error {
 	staged, ok := parseReleaseVersion(cfg.StagedVersion)
 	if !ok {
 		return fmt.Errorf("install: %w: %q is not a release version, and an install from a staging directory takes only a release build", ErrUnversioned, cfg.StagedVersion)
 	}
-	installedPath := cfg.installedBinary()
 	raw, err := cfg.StagingFS.BinaryVersion(installedPath)
 	var reason string
 	switch {

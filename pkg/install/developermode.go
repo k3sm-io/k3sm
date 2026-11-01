@@ -325,13 +325,8 @@ func plainInstallTeam(ctx context.Context, cfg Config) (string, string) {
 // it is team-signed, and the staged k3sm's own team when what is installed is
 // ad-hoc signed or absent. There is no other team pin: the installed build is
 // the record. It returns that team, or "" and why the marker stays.
-func developerModeOff(ctx context.Context, cfg Config, entries []StagedEntry) (string, string) {
-	// The installed k3sm's team is read here, before the install lock, like
-	// every other --from-staging signing check. A concurrent install could
-	// swap the installed binary between this read and the lock; that window
-	// is accepted, because the only thing this verdict can cause is removing
-	// the marker, which turns the signature checks back on and never off.
-	installed := cfg.installedBinary()
+// installed is the installed k3sm as preflightFromStaging resolved it.
+func developerModeOff(ctx context.Context, cfg Config, installed string, entries []StagedEntry) (string, string) {
 	team, err := cfg.Signer.TeamID(ctx, installed)
 	switch {
 	case errors.Is(err, fs.ErrNotExist), errors.Is(err, ErrNoTeamID):

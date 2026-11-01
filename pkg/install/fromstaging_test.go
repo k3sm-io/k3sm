@@ -38,7 +38,13 @@ type fakeStagingFS struct {
 	versions map[string]string
 	verErr   map[string]error
 	macho    map[string]bool
-	calls    []string
+	// links maps an installed entry point that is a symlink to the file it
+	// resolves to, and resolveErr to a refusal; ResolveInstalled answers from
+	// them, any other path resolving to itself. BinaryVersion refuses a path in
+	// links, as the real O_NOFOLLOW open does.
+	links      map[string]string
+	resolveErr map[string]error
+	calls      []string
 }
 
 func (f *fakeStagingFS) put(path string, uid, gid uint32, mode fs.FileMode) {
@@ -103,6 +109,9 @@ func (f *fakeStagingFS) RemoveFile(path string) error {
 
 func (f *fakeStagingFS) BinaryVersion(path string) (string, error) {
 	f.calls = append(f.calls, "BinaryVersion:"+path)
+	if _, ok := f.links[path]; ok {
+		return "", fmt.Errorf("%s is a symbolic link; refusing to run it", path)
+	}
 	if err := f.verErr[path]; err != nil {
 		return "", err
 	}
@@ -110,6 +119,17 @@ func (f *fakeStagingFS) BinaryVersion(path string) (string, error) {
 		return v, nil
 	}
 	return "", fmt.Errorf("open %s: %w", path, fs.ErrNotExist)
+}
+
+func (f *fakeStagingFS) ResolveInstalled(path string) (string, error) {
+	f.calls = append(f.calls, "ResolveInstalled:"+path)
+	if err := f.resolveErr[path]; err != nil {
+		return "", err
+	}
+	if target, ok := f.links[path]; ok {
+		return target, nil
+	}
+	return path, nil
 }
 
 func (f *fakeStagingFS) MachO(path string) (bool, error) {
