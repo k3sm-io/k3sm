@@ -97,14 +97,18 @@ pin, its date, and the tarball's sha256.
   repository's lock, so a sweep no longer holds pushes to that repository for a time that grows
   with its manifest count. Under the lock it re-checks the index and the manifests it read, and
   plans again when either changed. One repository it cannot read no longer keeps the first,
-  report-only sweep from completing for the whole store. The record of that first sweep now
-  names the store root it ran on, so a restored, copied or moved store reports only again before
-  it deletes.
+  report-only sweep from completing for the whole store, while a failure that may pass (an I/O
+  error, a repository removed mid-sweep) leaves the next sweep report-only, and so does a first
+  sweep over an empty store. The record of that first sweep now names a random store id the
+  registry keeps in its root, so a store restored from a backup taken before the id existed,
+  even into the same directory, reports only again before it deletes.
 - A first push to the k3sm registry that was abandoned before its manifest no longer stops every
   garbage-collection sweep of its repository. Once the repository has no tag and nothing in it
   has been written for 24 grace periods, the half-repository brake no longer applies to it and
-  its blobs are reaped as unreferenced. The collector also treats any manifest carrying a Docker
-  schema1 `fsLayers` field as unreadable, as the server already refuses schema1 at push.
+  its blobs are reaped as unreferenced. The collector treats any manifest carrying a Docker
+  schema1 `fsLayers` field as unreadable, and the server now refuses such a manifest at push
+  with `MANIFEST_INVALID`, even at schemaVersion 2, so a client with push access cannot stop
+  garbage collection for a repository with one.
 - The registry's garbage collector stops a repository's sweep, deleting nothing, when a manifest
   there is not an OCI or Docker v2 image manifest, index or manifest list (a Docker schema1
   manifest, for example). It used to read such a manifest as referencing nothing and could reap

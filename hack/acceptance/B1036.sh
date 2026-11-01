@@ -4,11 +4,12 @@
 #
 # The registry's online garbage collector reads manifests without the
 # repository lock, does not let one unreadable repository hold the whole
-# store at its report-only first sweep, and binds its gc-ran marker to the
-# store root. It frees an abandoned first push from the half brake once the
+# store at its report-only first sweep, writes its gc-ran marker only when no
+# repository failed for a reason that may pass and the store is not empty,
+# and binds the marker to a random store id kept in the store root. It frees an abandoned first push from the half brake once the
 # repository has gone unwritten for the abandon horizon, and treats any body
-# with a Docker schema1 fsLayers field as unreadable, which the server never
-# stores.
+# with a Docker schema1 fsLayers field as unreadable, which the server
+# refuses at PUT.
 #
 # --check runs, by name, with the race detector on, in pkg/ociregistry/gc:
 #   TestPushProceedsWhileTheSweepReadsManifests     the sweep pauses at every
@@ -24,9 +25,17 @@
 #                                                   ones is reported, the marker
 #                                                   is written, and the next sweep
 #                                                   reaps only in the good ones
-#   TestRelocatedStoreReportsOnlyAgain              a copy of the store at a new
-#                                                   root sweeps report-only again,
-#                                                   the original deletes
+#   TestTransientFailureLeavesNoMarker              a repository failed for a reason
+#                                                   that may pass leaves no marker,
+#                                                   and the next sweep reports only
+#   TestRestoredRootReportsOnlyAgain                a backup without the store id
+#                                                   restored into the same root
+#                                                   directory sweeps report-only
+#   TestEmptyFirstSweepThenRestoreReportsOnly       a sweep over an empty store
+#                                                   writes no marker, so restored
+#                                                   content sweeps report-only
+#   TestCopiedStoreFollowsItsStoreID                a copy with the store id deletes,
+#                                                   one without it reports only
 #   TestAbandoned                                   the abandoned predicate: no
 #                                                   rows, and nothing written
 #                                                   since the horizon
@@ -41,9 +50,15 @@
 #   TestParseRefsFailsClosed                        every unreadable body, schema1
 #                                                   fsLayers at schemaVersion 2
 #                                                   included, is ErrUnreadable
+# then, in pkg/ociregistry/store:
+#   TestEnsureIDWritesOnceAndKeepsIt                the store id is written once,
+#                                                   atomically, and a malformed one
+#                                                   is an error
 # then, in pkg/ociregistry/api:
 #   TestPutManifestRejectsDockerSchema1             the server stores no schema1
 #                                                   manifest under any media type
+#   TestPutManifestRejectsFSLayersAtSchemaVersion2  nor any body with an fsLayers
+#                                                   field, at schemaVersion 2 too
 # then the gc package, also under -race.
 #
 # Usage: hack/acceptance/B1036.sh --check
@@ -60,15 +75,22 @@ TESTS=(
 	TestPushProceedsWhileTheSweepReadsManifests
 	TestLockedPassAnswersOnlyFromAnUnchangedRead
 	TestOneUnreadableRepositoryStillWritesTheMarker
-	TestRelocatedStoreReportsOnlyAgain
+	TestTransientFailureLeavesNoMarker
+	TestRestoredRootReportsOnlyAgain
+	TestEmptyFirstSweepThenRestoreReportsOnly
+	TestCopiedStoreFollowsItsStoreID
 	TestAbandoned
 	TestAbandonedFirstPushIsFreed
 	TestRecentFirstPushStaysBraked
 	TestAbandonOption
 	TestParseRefsFailsClosed
 )
+STORE_TESTS=(
+	TestEnsureIDWritesOnceAndKeepsIt
+)
 API_TESTS=(
 	TestPutManifestRejectsDockerSchema1
+	TestPutManifestRejectsFSLayersAtSchemaVersion2
 )
 re="^($(IFS='|'; echo "${TESTS[*]}"))\$"
 out="$(go test -race -count=1 -v -run "$re" ./pkg/ociregistry/gc/ 2>&1)" || {
@@ -76,6 +98,13 @@ out="$(go test -race -count=1 -v -run "$re" ./pkg/ociregistry/gc/ 2>&1)" || {
 grep -E '^(--- |ok|PASS)' <<<"$out"
 # A test that does not run is not a pass.
 for t in "${TESTS[@]}"; do
+	grep -q -- "^--- PASS: $t " <<<"$out" || { echo "$LABEL: FAIL: $t did not run"; exit 1; }
+done
+re="^($(IFS='|'; echo "${STORE_TESTS[*]}"))\$"
+out="$(go test -race -count=1 -v -run "$re" ./pkg/ociregistry/store/ 2>&1)" || {
+	printf '%s\n' "$out"; echo "$LABEL: FAIL: named store tests"; exit 1; }
+grep -E '^(--- |ok|PASS)' <<<"$out"
+for t in "${STORE_TESTS[@]}"; do
 	grep -q -- "^--- PASS: $t " <<<"$out" || { echo "$LABEL: FAIL: $t did not run"; exit 1; }
 done
 re="^($(IFS='|'; echo "${API_TESTS[*]}"))\$"

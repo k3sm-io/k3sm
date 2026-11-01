@@ -152,8 +152,23 @@ type checkedManifest struct {
 //     an OCI image config or the empty descriptor, except non-distributable
 //     layers; with any other config type nothing is required;
 //   - an index or manifest list requires nothing: children need not exist.
+//
+// It also refuses any body with a Docker schema1 fsLayers field, whatever its
+// schemaVersion and media type: the garbage collector (pkg/ociregistry/gc)
+// cannot follow fsLayers and treats such a body as unreadable, so a stored
+// one would stop every sweep of the repository. The field is matched as
+// encoding/json matches it, the way the collector reads the body.
 func checkManifest(mt string, body []byte) (checkedManifest, error) {
 	var out checkedManifest
+	var schema1 struct {
+		FSLayers json.RawMessage `json:"fsLayers"`
+	}
+	if err := json.Unmarshal(body, &schema1); err != nil {
+		return out, manifestInvalid("manifest does not parse: %v", err)
+	}
+	if schema1.FSLayers != nil {
+		return out, manifestInvalid("a Docker schema1 fsLayers field")
+	}
 	if isIndexType(mt) {
 		var idx ispec.Index
 		if err := json.Unmarshal(body, &idx); err != nil {

@@ -193,10 +193,18 @@ func New(s *store.Store, o Options) (*Collector, error) {
 
 // Sweep runs one collection over every repository. A repository stopped by
 // a brake or an error is skipped, listed in the report's Stopped or Failed,
-// and named in the returned error; the others are still swept. A report-only
-// first sweep writes the marker once every repository was planned, braked or
-// failed: a repository that cannot be read keeps failing closed in later
-// sweeps, so it does not hold the rest of the store at report-only.
+// and named in the returned error; the others are still swept.
+//
+// A report-only first sweep writes the marker, bound to the store id, only
+// when the store held a repository and every repository was planned, braked
+// (ErrMassDelete) or failed as unreadable (ErrUnreadable). A braked or
+// unreadable repository keeps failing closed in later sweeps, so it does not
+// hold the rest of the store at report-only. Any other failure (an I/O
+// error, too many open files, a repository removed mid-sweep) may pass, and
+// the repository it hit has not been reviewed: the marker stays unwritten and
+// the next sweep only reports again. A store with no repository has nothing
+// to review, so content restored into it later still gets a report-only
+// sweep.
 func (c *Collector) Sweep(ctx context.Context) (Report, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -204,9 +212,9 @@ func (c *Collector) Sweep(ctx context.Context) (Report, error) {
 		return Report{}, fmt.Errorf("%w: started %s, grace %s", ErrTooSoon, c.start.Format(time.RFC3339), c.grace)
 	}
 	marker := filepath.Join(c.s.StateDir(), MarkerName)
-	id, err := storeIdentity(c.s)
+	id, _, err := c.s.ID()
 	if err != nil {
-		return Report{}, err
+		return Report{}, fmt.Errorf("gc: %w", err)
 	}
 	ran, err := c.markerMatches(marker, id)
 	if err != nil {
@@ -218,6 +226,7 @@ func (c *Collector) Sweep(ctx context.Context) (Report, error) {
 		return rep, err
 	}
 	var errs []error
+	var unreviewed []string // repositories a failure that may pass left unreviewed
 	for _, n := range repos {
 		if err := ctx.Err(); err != nil {
 			return rep, err
@@ -230,12 +239,23 @@ func (c *Collector) Sweep(ctx context.Context) (Report, error) {
 			} else {
 				rep.Failed = append(rep.Failed, n.String())
 			}
+			if !errors.Is(err, ErrMassDelete) && !errors.Is(err, ErrUnreadable) {
+				unreviewed = append(unreviewed, n.String())
+			}
 			errs = append(errs, fmt.Errorf("gc %s: %w", n, err))
 		}
 	}
 	if rep.ReportOnly {
-		if err := writeMarker(marker, c.now(), id); err != nil {
-			errs = append(errs, err)
+		switch {
+		case len(repos) == 0:
+			c.log.Info("registry gc: the store holds no repository; the gc-ran marker is not written")
+		case len(unreviewed) > 0:
+			c.log.Warn("registry gc: a repository failed for a reason that may pass; the gc-ran marker is not written and the next sweep only reports",
+				"repositories", unreviewed)
+		default:
+			if err := WriteMarker(c.s, c.now()); err != nil {
+				errs = append(errs, err)
+			}
 		}
 	}
 	return rep, errors.Join(errs...)
@@ -680,8 +700,9 @@ type refs struct {
 	Manifests     []ispec.Descriptor `json:"manifests"`
 	Subject       *ispec.Descriptor  `json:"subject"`
 	// FSLayers is the Docker schema1 layer list (fsLayers[].blobSum). The
-	// server refuses schema1 at PUT, and the collector does not follow it:
-	// a body that carries the field is unreadable, whatever else it says.
+	// server refuses schema1, and any body with this field, at PUT, and the
+	// collector does not follow it: a body that carries the field is
+	// unreadable, whatever else it says.
 	FSLayers json.RawMessage `json:"fsLayers"`
 }
 
@@ -836,47 +857,46 @@ func makePlan(idx ispec.Index, cont store.Contents, cutoff time.Time, refsOf fun
 }
 
 // planError is the error a plan fails with when manifest what cannot be
-// followed: errStale and ErrUnreadable as they are, anything else as
-// ErrUnreadable.
+// followed: errStale and ErrUnreadable as they are; a body that is missing,
+// not a regular file or a symlink, which stays so until someone repairs the
+// store, as ErrUnreadable; anything else (an I/O error, too many open files),
+// which may pass, wrapped as it is.
 func planError(what string, err error) error {
-	if errors.Is(err, errStale) || errors.Is(err, ErrUnreadable) {
+	switch {
+	case errors.Is(err, errStale), errors.Is(err, ErrUnreadable):
 		return err
+	case errors.Is(err, store.ErrBlobUnknown), errors.Is(err, store.ErrNotRegular), errors.Is(err, ref.ErrSymlink):
+		return fmt.Errorf("%w: %s: %w", ErrUnreadable, what, err)
+	default:
+		return fmt.Errorf("gc: read manifest %s: %w", what, err)
 	}
-	return fmt.Errorf("%w: %s: %v", ErrUnreadable, what, err)
 }
 
-// rootIdentity names the store root a marker was written for: the device
-// and inode of the root directory. The store keeps no random store id of its
-// own, so these are the identity. A root restored from a backup, copied, or
-// moved to another volume has a new one.
-type rootIdentity struct {
-	Dev uint64 `json:"dev"`
-	Ino uint64 `json:"ino"`
-}
-
-// markerRecord is the marker's content.
+// markerRecord is the marker's content: when the report-only sweep ran,
+// and the id of the store it ran over (store.IDFile in the root).
+//
+// The id, not the root directory's device and inode, is the binding because
+// a restore by rsync or tar into the existing root keeps the root's inode.
+// The id file is written the first time a marker is, so a backup taken
+// before it existed restores without it, and the next sweep mints a new id
+// and only reports. A backup or copy that carries the id file is the same
+// store, and its sweeps delete when the state directory still holds the
+// marker; deleting there is what they would have done before the backup.
+// Content merged into a live root without removing its id file is not told
+// apart from the store's own content.
 type markerRecord struct {
-	Ran  string       `json:"ran"`
-	Root rootIdentity `json:"root"`
+	Ran   string `json:"ran"`
+	Store string `json:"store"`
 }
 
 // maxMarkerSize bounds the marker read.
 const maxMarkerSize = 4096
 
-// storeIdentity returns s's root identity.
-func storeIdentity(s *store.Store) (rootIdentity, error) {
-	var st unix.Stat_t
-	if err := unix.Lstat(s.Root(), &st); err != nil {
-		return rootIdentity{}, fmt.Errorf("gc: stat store root: %w", err)
-	}
-	return rootIdentity{Dev: uint64(st.Dev), Ino: st.Ino}, nil
-}
-
 // markerMatches reports whether the marker at p records a report-only sweep
-// over the store with root identity id. A missing marker, or one written for
-// another root or in an older form, does not match: the sweep reports only
-// and writes it again.
-func (c *Collector) markerMatches(p string, id rootIdentity) (bool, error) {
+// over the store with id id. A missing marker, one written for another store
+// or in an older form, or an empty id (the root has no id file) does not
+// match: the sweep reports only and writes it again.
+func (c *Collector) markerMatches(p, id string) (bool, error) {
 	fi, err := os.Lstat(p)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
@@ -897,8 +917,8 @@ func (c *Collector) markerMatches(p string, id rootIdentity) (bool, error) {
 		return false, fmt.Errorf("gc marker: %w", err)
 	}
 	var m markerRecord
-	if len(b) > maxMarkerSize || json.Unmarshal(b, &m) != nil || m.Root != id {
-		c.log.Warn("registry gc: the gc-ran marker was not written for this store root; the next sweep only reports",
+	if len(b) > maxMarkerSize || json.Unmarshal(b, &m) != nil || id == "" || m.Store != id {
+		c.log.Warn("registry gc: the gc-ran marker was not written for this store; the next sweep only reports",
 			"marker", p, "root", c.s.Root())
 		return false, nil
 	}
@@ -907,19 +927,20 @@ func (c *Collector) markerMatches(p string, id rootIdentity) (bool, error) {
 
 // WriteMarker records that a report-only sweep ran over s, as the first
 // sweep does, so the next sweep over s deletes. It binds the record to s's
-// root; a copy of the store at another root sweeps report-only again.
+// store id, writing the id first when the root holds none; a store whose
+// root has another id, or none, sweeps report-only again.
 func WriteMarker(s *store.Store, now time.Time) error {
-	id, err := storeIdentity(s)
+	id, err := s.EnsureID()
 	if err != nil {
-		return err
+		return fmt.Errorf("write gc marker: %w", err)
 	}
 	return writeMarker(filepath.Join(s.StateDir(), MarkerName), now, id)
 }
 
 // writeMarker records, durably, that a report-only sweep ran over the store
-// with root identity id.
-func writeMarker(p string, now time.Time, id rootIdentity) error {
-	b, err := json.Marshal(markerRecord{Ran: now.UTC().Format(time.RFC3339), Root: id})
+// with id id.
+func writeMarker(p string, now time.Time, id string) error {
+	b, err := json.Marshal(markerRecord{Ran: now.UTC().Format(time.RFC3339), Store: id})
 	if err != nil {
 		return fmt.Errorf("write gc marker: %w", err)
 	}

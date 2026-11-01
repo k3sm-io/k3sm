@@ -101,7 +101,8 @@ type Store struct {
 
 // Open opens the store rooted at root, with server state under state. It
 // creates both directories (0700) when they are missing and creates nothing
-// else in root. state must not be inside root, and root must not be a symlink.
+// else in root (the store id, IDFile, is written later, by EnsureID). state
+// must not be inside root, and root must not be a symlink.
 func Open(root, state string) (*Store, error) {
 	root, state = filepath.Clean(root), filepath.Clean(state)
 	if !filepath.IsAbs(root) || !filepath.IsAbs(state) {

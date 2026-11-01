@@ -21,9 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -141,53 +139,6 @@ func TestOneUnreadableRepositoryStillWritesTheMarker(t *testing.T) {
 		if !e.has(bad, d) {
 			t.Errorf("bad: %s was reaped", d)
 		}
-	}
-}
-
-// TestRelocatedStoreReportsOnlyAgain copies a store whose first sweep has
-// run, marker included, to a new root. The marker names the root it was
-// written for, so the first sweep over the copy only reports again, while
-// the original store's next sweep deletes.
-func TestRelocatedStoreReportsOnlyAgain(t *testing.T) {
-	e := newEnv(t)
-	n := name(t, "app")
-	e.clk.set(-2 * time.Hour)
-	e.push(t, n, "v1", "app", []byte("l1"), []byte("l2"), []byte("l3"))
-	orphan := e.blob(t, n, []byte("orphan"))
-	c := e.collector(t, -3*time.Hour)
-	e.clk.set(0)
-	if rep := e.sweep(t, c); !rep.ReportOnly {
-		t.Fatalf("first sweep: %+v, want report-only", rep)
-	}
-
-	dst := t.TempDir()
-	root, state := filepath.Join(dst, "registry"), filepath.Join(dst, "registry-state")
-	copyTree(t, e.s.Root(), root)
-	copyTree(t, e.s.StateDir(), state)
-	s2, err := store.Open(root, state)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s2.SetClock(e.clk.now)
-	e.clk.set(-3 * time.Hour)
-	c2, err := New(s2, Options{Grace: grace, Now: e.clk.now, Log: slog.New(slog.NewTextHandler(io.Discard, nil))})
-	if err != nil {
-		t.Fatal(err)
-	}
-	e.clk.set(0)
-	rep, err := c2.Sweep(e.ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !rep.ReportOnly || rep.Count(KindBlob) != 1 {
-		t.Fatalf("sweep over the copy: %+v, want report-only naming the orphan", rep)
-	}
-	if _, err := s2.StatBlob(n, orphan.Digest); err != nil {
-		t.Fatalf("the report-only sweep over the copy deleted the orphan: %v", err)
-	}
-
-	if rep := e.sweep(t, c); rep.ReportOnly || e.has(n, orphan.Digest) {
-		t.Fatalf("second sweep over the original: %+v, want the orphan reaped", rep)
 	}
 }
 

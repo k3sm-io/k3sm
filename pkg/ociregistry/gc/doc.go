@@ -45,10 +45,16 @@ limitations under the License.
 // period of the collector's start, so a write made just before a restart has
 // had its full grace. The first sweep over a store without the
 // registry-state/gc-ran marker only reports what it would reap, then writes
-// the marker, even when some repository failed (that one keeps failing
-// closed). The marker records the device and inode of the store root, and a
-// marker for another root does not count, so a restored, copied or moved
-// store gets a report-only first sweep again. A sweep that would delete more
+// the marker. It writes it even when a repository was braked or is
+// unreadable (that one keeps failing closed), but not when a repository
+// failed for a reason that may pass, such as an I/O error or a repository
+// removed mid-sweep, and not when the store holds no repository: the next
+// sweep then only reports again. The marker records the store id, a random
+// 128-bit id the store keeps in its root (store.IDFile) and writes with the
+// first marker, and a marker for another id does not count. A root restored
+// from a backup taken before the id existed, even into the same directory,
+// gets a new id and so a report-only first sweep again; a backup or copy
+// that carries the id file is the same store. A sweep that would delete more
 // than half of a repository's blobs stops with ErrMassDelete, unless it
 // empties the repository (it leaves no row and every blob it reaps is older
 // than the last change to the rows) or the repository is an abandoned first
