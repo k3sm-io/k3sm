@@ -354,3 +354,44 @@ func TestDeveloperModeClearedByAnyDeveloperIDTeam(t *testing.T) {
 		})
 	}
 }
+
+// TestDeveloperModeKeptWhenDeveloperIDVerificationFails pins the fail-closed
+// direction of the strict Developer ID check: when it cannot run (an error,
+// as for a tampered binary) or says no, a no-flag install keeps the marker.
+func TestDeveloperModeKeptWhenDeveloperIDVerificationFails(t *testing.T) {
+	t.Parallel()
+	const src = "/tmp/k3sm"
+	removeCall := "RemoveEntry:/Library:k3sm.developer-mode"
+	cases := []struct {
+		name   string
+		signer fakeSigner
+	}{
+		{name: "strict verification returns an error",
+			signer: fakeSigner{ids: map[string]string{src: testTeamID}, devIDErrs: map[string]error{src: errors.New("codesign: a sealed resource is missing or invalid")}}},
+		{name: "a readable team whose strict verification returns false",
+			signer: fakeSigner{ids: map[string]string{src: testTeamID}, notDevID: map[string]bool{src: true}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := &fakeSystem{owners: map[string]OwnedEntry{}}
+			f.owners[DeveloperModeMarkerPath] = OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: 0o644}
+			f.putFile(DeveloperModeMarkerPath, []byte("developer mode enabled by k3sm install on 2026-10-31T00:00:00Z\n"))
+			var logs strings.Builder
+			cfg := Config{BinarySource: src, TargetUser: "alice", Logger: slog.New(slog.NewTextHandler(&logs, nil))}
+			cfg.Signer = tc.signer
+			if err := Install(context.Background(), f, cfg); err != nil {
+				t.Fatalf("Install = %v", err)
+			}
+			if slices.Contains(f.calls, removeCall) {
+				t.Errorf("the marker was removed; calls %v", f.calls)
+			}
+			if _, ok := f.files[DeveloperModeMarkerPath]; !ok {
+				t.Error("the marker is gone")
+			}
+			if !strings.Contains(logs.String(), "developer mode stays on") {
+				t.Errorf("no stays-on Warn; logs:\n%s", logs.String())
+			}
+		})
+	}
+}
