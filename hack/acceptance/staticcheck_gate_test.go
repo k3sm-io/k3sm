@@ -47,8 +47,8 @@ import (
 // the go-list guard tests use (see ci_guard_test.go), with a zzpkg fixture so the
 // Go block, and therefore the stage, is actually reached. The environment is
 // replaced wholesale: PATH is a directory of links to only the tools ci.sh needs
-// (plus, per case, a fake staticcheck), GOPATH and GOMODCACHE are empty temp
-// dirs. No network and no real staticcheck are needed, and the result does not
+// (plus, per case, a fake staticcheck), GOPATH and GOMODCACHE are temp dirs that
+// are empty except, per case, a fake $GOPATH/bin/staticcheck-<pin>. No network and no real staticcheck are needed, and the result does not
 // depend on whether the host has one installed.
 //
 //	absent_tool_is_red   no staticcheck anywhere: non-zero exit, install hint
@@ -56,6 +56,13 @@ import (
 //	                     versions named, and the fake never asked to lint
 //	pinned_version_runs  a fake reporting the pin: invoked with -tests=false ./...
 //	                     after the vet/build/test stages
+//	versioned_binary_wins
+//	                     $GOPATH/bin/staticcheck-<pin> and a PATH staticcheck both
+//	                     report the pin: the versioned one lints, so a second pin
+//	                     can be installed beside the plain name during a switch
+//	versioned_wrong_version_falls_back
+//	                     a versioned name reporting another version is skipped by
+//	                     the exact version check and the PATH copy lints
 //
 // Against the ci.sh preceding the pinned stage, pin_equals_go_standards,
 // no_literal_pin_in_ci and wrong_version_is_red are red (it had no constant,
@@ -128,16 +135,18 @@ func TestK3smCIGateRunsPinnedStaticcheck(t *testing.T) {
 	}
 
 	cases := []struct {
-		name        string
-		versionLine string // the fake's `-version` output; "" = no staticcheck at all
-		wantRed     bool   // the script must exit non-zero
-		wantOut     []string
-		wantMarker  bool
+		name          string
+		versionLine   string // the PATH fake's `-version` output; "" = no PATH staticcheck
+		versionedLine string // the $GOPATH/bin/staticcheck-<pin> fake's output; "" = none
+		wantRed       bool   // the script must exit non-zero
+		wantOut       []string
+		wantMarker    bool
+		wantRunBy     string // which fake linted ("path" or "versioned"); "" = not checked
 	}{
 		{
 			name:    "absent_tool_is_red",
 			wantRed: true,
-			wantOut: []string{"not installed", "staticcheck@" + pin},
+			wantOut: []string{"not installed", "staticcheck@" + pin, "staticcheck-" + pin},
 		},
 		{
 			name:        "wrong_version_is_red",
@@ -153,12 +162,29 @@ func TestK3smCIGateRunsPinnedStaticcheck(t *testing.T) {
 			versionLine: "staticcheck " + pin + " (0.8.1)",
 			wantOut:     []string{"] staticcheck"},
 			wantMarker:  true,
+			wantRunBy:   "path",
+		},
+		{
+			name:          "versioned_binary_wins",
+			versionLine:   "staticcheck " + pin + " (0.8.1)",
+			versionedLine: "staticcheck " + pin + " (0.8.1)",
+			wantOut:       []string{"] staticcheck"},
+			wantMarker:    true,
+			wantRunBy:     "versioned",
+		},
+		{
+			name:          "versioned_wrong_version_falls_back",
+			versionLine:   "staticcheck " + pin + " (0.8.1)",
+			versionedLine: "staticcheck 2025.1 (0.6.0)",
+			wantOut:       []string{"] staticcheck"},
+			wantMarker:    true,
+			wantRunBy:     "path",
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			marker := filepath.Join(t.TempDir(), "staticcheck-argv")
-			env := staticcheckSandboxEnv(t, tc.versionLine, marker)
+			env := staticcheckSandboxEnv(t, pin, tc.versionLine, tc.versionedLine, marker)
 			extra := map[string]string{
 				"zzpkg/zz.go": licensed(t, script, "package zzpkg\n\n// Answer is here only so the package is non-empty.\nfunc Answer() int { return 42 }\n"),
 				// The test-sleep lint checks the allowlist against this tree,
@@ -195,6 +221,8 @@ func TestK3smCIGateRunsPinnedStaticcheck(t *testing.T) {
 				t.Errorf("staticcheck ran with %q, want -tests=false ./...", strings.TrimSpace(string(argv)))
 			case !tc.wantMarker && err == nil:
 				t.Errorf("a non-pinned staticcheck was run to lint with %q:\n%s", strings.TrimSpace(string(argv)), out)
+			case tc.wantRunBy != "" && !strings.HasPrefix(string(argv), tc.wantRunBy+" "):
+				t.Errorf("staticcheck linted as %q, want the %s fake", strings.TrimSpace(string(argv)), tc.wantRunBy)
 			}
 		})
 	}
@@ -218,10 +246,11 @@ func parseStaticcheckPin(doc string) (string, error) {
 
 // staticcheckSandboxEnv builds the full environment for a behavioural case.
 // PATH holds links to only the tools ci.sh runs, plus a fake staticcheck when
-// versionLine is set; GOPATH and GOMODCACHE are empty, so no host staticcheck
-// is reachable by either of the stage's lookups. The fake prints versionLine
-// for -version and records any other invocation's argv in marker.
-func staticcheckSandboxEnv(t *testing.T, versionLine, marker string) []string {
+// versionLine is set; GOPATH holds only a fake bin/staticcheck-<pin> when
+// versionedLine is set, so no host staticcheck is reachable by any of the
+// stage's lookups. Each fake prints its line for -version and records any other
+// invocation in marker as its name ("path" or "versioned") followed by argv.
+func staticcheckSandboxEnv(t *testing.T, pin, versionLine, versionedLine, marker string) []string {
 	t.Helper()
 	bin := t.TempDir()
 	tools := []struct {
@@ -254,11 +283,14 @@ func staticcheckSandboxEnv(t *testing.T, versionLine, marker string) []string {
 			t.Fatalf("link %s: %v", tool, err)
 		}
 	}
-	if versionLine != "" {
-		fake := fmt.Sprintf("#!/bin/sh\nif [ \"$1\" = \"-version\" ]; then echo '%s'; exit 0; fi\nprintf '%%s\\n' \"$*\" > '%s'\nexit 0\n", versionLine, marker)
-		if err := os.WriteFile(filepath.Join(bin, "staticcheck"), []byte(fake), 0o755); err != nil {
-			t.Fatalf("write fake staticcheck: %v", err)
+	writeFake := func(path, who, line string) {
+		fake := fmt.Sprintf("#!/bin/sh\nif [ \"$1\" = \"-version\" ]; then echo '%s'; exit 0; fi\nprintf '%s %%s\\n' \"$*\" > '%s'\nexit 0\n", line, who, marker)
+		if err := os.WriteFile(path, []byte(fake), 0o755); err != nil {
+			t.Fatalf("write fake %s staticcheck: %v", who, err)
 		}
+	}
+	if versionLine != "" {
+		writeFake(filepath.Join(bin, "staticcheck"), "path", versionLine)
 	}
 
 	goEnv := func(key string) string {
@@ -269,6 +301,12 @@ func staticcheckSandboxEnv(t *testing.T, versionLine, marker string) []string {
 		return strings.TrimSpace(string(out))
 	}
 	gopath := t.TempDir()
+	if versionedLine != "" {
+		if err := os.MkdirAll(filepath.Join(gopath, "bin"), 0o755); err != nil {
+			t.Fatalf("mkdir GOPATH/bin: %v", err)
+		}
+		writeFake(filepath.Join(gopath, "bin", "staticcheck-"+pin), "versioned", versionedLine)
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		t.Fatalf("home dir: %v", err)

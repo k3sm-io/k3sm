@@ -122,6 +122,11 @@ govulncheck ./...           # clean (pinned version below)
 `go install honnef.co/go/tools/cmd/staticcheck@2026.2.2`. Every repo's `hack/ci.sh` carries the
 same version as its `STATICCHECK_VERSION` constant and goes red when the installed binary is
 missing or reports any other version, because a different staticcheck reports different findings.
+The gate looks for `$(go env GOPATH)/bin/staticcheck-<version>` first, then `staticcheck` on `PATH`,
+then `$(go env GOPATH)/bin/staticcheck`, and uses the first that reports exactly the pin. The
+versioned name lets two pins be installed side by side while the repos move from one to the other:
+`GOBIN=<tmp> go install` the pinned release, then move `<tmp>/staticcheck` to
+`$(go env GOPATH)/bin/staticcheck-<version>`.
 govulncheck is pinned the same way, at `golang.org/x/vuln/cmd/govulncheck@v1.9.0`, in each repo's
 `GOVULNCHECK_VERSION`.
 - **Scope**: `-tests=false` checks non-test code only. Each repo's `hack/ci.sh` says why at the stage.
