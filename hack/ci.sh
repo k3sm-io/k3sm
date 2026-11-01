@@ -5,7 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."   # repo root
 
 CGO=1   # k3sm is CGO_ENABLED=1 — it imports runtimed (cgo syscall shims). kine is a child process, not a dependency.
-STATICCHECK_VERSION=2026.2.1   # keep equal to the install pin in docs/GO-STANDARDS.md §Commit gates
+STATICCHECK_VERSION=2026.2.2   # keep equal to the install pin in docs/GO-STANDARDS.md §Commit gates
 GOVULNCHECK_VERSION=v1.9.0   # the govulncheck the gate requires; keep equal across the k3sm repos (hack/lib/govulncheck.sh reads this line)
 
 echo "==> [k3sm] gofmt"
@@ -146,20 +146,22 @@ if [ -n "$go_pkgs" ]; then
 	# The version is pinned EXACTLY (STATICCHECK_VERSION, top of file): a
 	# different staticcheck reports different findings, so an unpinned stage's
 	# verdict would depend on whichever binary the host happens to have. Each
-	# candidate (PATH first, then $(go env GOPATH)/bin) is probed and the first
-	# reporting exactly the pin is used, so a stale copy on PATH cannot shadow a
-	# correct one. Bump the pin together with the Go toolchain (an older
+	# candidate ($(go env GOPATH)/bin/staticcheck-<pin> first, so two pins can be
+	# installed side by side while the repos switch, then staticcheck on PATH, then
+	# $(go env GOPATH)/bin/staticcheck) is probed and the first reporting exactly
+	# the pin is used, so a stale copy cannot shadow a correct one. Bump the pin together with the Go toolchain (an older
 	# staticcheck cannot read a newer Go's export data) and with
 	# docs/GO-STANDARDS.md, keeping it in step with the other k3sm repos.
 	#
 	# A missing or mismatched tool is a RED, not a SKIP: a gate that can silently
 	# not run and still print green is the failure class the go-list guard above
 	# exists to stop.
-	sc_hint="go install honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION}"
+	sc_gopath="$(go env GOPATH)"
+	sc_hint="go install honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION}; or, beside another pin: GOBIN=<tmp> go install honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION} && mv <tmp>/staticcheck ${sc_gopath}/bin/staticcheck-${STATICCHECK_VERSION}"
 	sc=""
 	sc_seen=""
 	sc_prev=""
-	for c in "$(command -v staticcheck || true)" "$(go env GOPATH)/bin/staticcheck"; do
+	for c in "${sc_gopath}/bin/staticcheck-${STATICCHECK_VERSION}" "$(command -v staticcheck || true)" "${sc_gopath}/bin/staticcheck"; do
 		[ -n "$c" ] && [ -x "$c" ] && [ "$c" != "$sc_prev" ] || continue
 		sc_prev="$c"
 		c_ver=""
