@@ -370,6 +370,9 @@ func preflightFromStaging(ctx context.Context, cfg *Config) error {
 	// point reaches it.
 	installed, err := cfg.StagingFS.ResolveInstalled(cfg.installedBinary())
 	if err != nil {
+		if errors.Is(err, errInstalledUnresolvable) {
+			return fmt.Errorf("install: %w; %s", err, installedUnresolvableRecovery)
+		}
 		return fmt.Errorf("install: %w", err)
 	}
 	if cfg.developerModeOn() {
@@ -391,6 +394,15 @@ func preflightFromStaging(ctx context.Context, cfg *Config) error {
 // errInstalledUnresolvable reports an installed k3sm entry point whose links do
 // not lead to one regular file of its own install tree.
 var errInstalledUnresolvable = errors.New("the installed k3sm does not resolve to a binary of its install tree")
+
+// installedUnresolvableRecovery is the repair the refusal names. The update
+// stays refused: a broken link is never taken for no install. The install
+// script runs its own downloaded k3sm (the installed one cannot run), and a
+// plain install publishes a whole new install tree in place of the old one
+// (SwapInstallRoot), the broken link with it.
+const installedUnresolvableRecovery = "repair the install with the install script, " +
+	"curl -fsSL https://k3sm.io/install.sh | sh " +
+	"(K3SM_INSTALL_VERSION=vX.Y.Z after the pipe pins a release), then update again"
 
 // resolveInstalledBinary is the one resolution of the installed k3sm the
 // --from-staging checks read through. path is the entry point

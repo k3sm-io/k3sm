@@ -368,3 +368,54 @@ func putInstalledLink(t *testing.T, target, link string) {
 		t.Fatal(err)
 	}
 }
+
+// TestStagingChecksDanglingInstallRecovery is the gate for the refusal a
+// k3sm.app update meets when the installed k3sm does not resolve: it stays the
+// same fail-closed refusal (errInstalledUnresolvable, never "no install"), and
+// it names the repair a user can run, the install script, which puts a binary
+// back in place of the broken link. Each case builds the broken link in a real
+// tree and feeds resolveInstalledBinary's own error to the staging checks.
+func TestStagingChecksDanglingInstallRecovery(t *testing.T) {
+	t.Parallel()
+	const recovery = "curl -fsSL https://k3sm.io/install.sh | sh"
+	cases := []struct {
+		name  string
+		setup func(t *testing.T, root string)
+	}{
+		{name: "a dangling current link", setup: func(t *testing.T, root string) {
+			if err := os.MkdirAll(filepath.Join(root, "versions"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			putInstalledLink(t, "versions/v0.3.9", filepath.Join(root, "current"))
+			putInstalledLink(t, "current/k3sm", filepath.Join(root, "k3sm"))
+		}},
+		{name: "a link out of the install tree", setup: func(t *testing.T, root string) {
+			out := filepath.Join(t.TempDir(), "k3sm")
+			putInstalledFile(t, out)
+			putInstalledLink(t, out, filepath.Join(root, "k3sm"))
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			root, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			tc.setup(t, root)
+			_, resolveErr := resolveInstalledBinary(filepath.Join(root, "k3sm"), os.Lstat, filepath.EvalSymlinks)
+			if !errors.Is(resolveErr, errInstalledUnresolvable) {
+				t.Fatalf("resolveInstalledBinary = %v, want errInstalledUnresolvable", resolveErr)
+			}
+			sfs, cfg := stagedFixture()
+			sfs.resolveErr = map[string]error{cfg.installedBinary(): resolveErr}
+			err = preflightFromStaging(context.Background(), &cfg)
+			if !errors.Is(err, errInstalledUnresolvable) || errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("preflightFromStaging = %v, want errInstalledUnresolvable and not fs.ErrNotExist", err)
+			}
+			if !strings.Contains(err.Error(), recovery) {
+				t.Fatalf("preflightFromStaging = %v, want the refusal to name the repair %q", err, recovery)
+			}
+		})
+	}
+}
