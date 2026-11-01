@@ -44,6 +44,10 @@ const (
 	// unused before it stops counting against MaxSessions; it matches the
 	// garbage collector's grace for idle uploads.
 	DefaultSessionIdle = time.Hour
+	// DefaultGCGrace is the garbage collector's grace the server assumes when
+	// Config.GCGrace is zero. The collector (pkg/ociregistry/gc) has no
+	// default of its own: whoever schedules it passes the same value to both.
+	DefaultGCGrace = time.Hour
 	// DefaultBodyIdle is the longest a request body may go without a byte.
 	DefaultBodyIdle = 2 * time.Minute
 	// DefaultBodyWindow and DefaultBodyMinBytes are the minimum progress of a
@@ -164,6 +168,10 @@ type Config struct {
 	// server-wide timeout.
 	ResponseTimeout time.Duration
 	MinWriteRate    int64
+	// GCGrace is the grace of the garbage collector that sweeps Store, the
+	// value it is given as gc.Options.Grace (DefaultGCGrace when zero). A
+	// HEAD restarts an object's grace only when less than half of it is left.
+	GCGrace time.Duration
 	// Now is the clock (time.Now when nil).
 	Now func() time.Time
 }
@@ -184,6 +192,7 @@ type Server struct {
 	respTimeout   time.Duration
 	minWriteRate  int64
 	spaceEvery    int64
+	gcGrace       time.Duration
 	now           func() time.Time
 	sessions      *sessions
 	router        *mux.Router
@@ -223,6 +232,7 @@ func New(cfg Config) (*Server, error) {
 		respTimeout:   positive(cfg.ResponseTimeout, DefaultResponseTimeout),
 		minWriteRate:  positive(cfg.MinWriteRate, DefaultMinWriteRate),
 		spaceEvery:    spaceCheckEvery,
+		gcGrace:       positive(cfg.GCGrace, DefaultGCGrace),
 		setWriteDeadline: func(w http.ResponseWriter, t time.Time) {
 			_ = http.NewResponseController(w).SetWriteDeadline(t) // ErrNotSupported off a real connection
 		},

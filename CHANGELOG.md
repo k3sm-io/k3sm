@@ -98,6 +98,12 @@ pin, its date, and the tarball's sha256.
   signature and its version from that one file, so the two checks cannot judge different binaries
   when the installed `k3sm` is a link into a version directory. A link that leads anywhere else
   refuses the install, in developer mode too.
+- A HEAD on the new registry server bounds the write it makes to restart an object's
+  garbage-collection grace: it touches only an untagged manifest or a blob with less than half
+  the grace left, and otherwise takes no lock and writes nothing, so a looped anonymous HEAD can
+  no longer keep an object alive indefinitely or queue behind pushes and sweeps. A touch that
+  fails on a read-only or degraded store is logged and the HEAD still answers `200`.
+
 - `k3sm stop` and `k3sm uninstall` recognise a vm pod's `k3sm-vmhost` helper when it runs from
   a versioned install directory or through a symlinked install path, not only from the flat
   `/Library/k3sm/k3sm-vmhost`, so such a helper is still stopped instead of reported as unknown.

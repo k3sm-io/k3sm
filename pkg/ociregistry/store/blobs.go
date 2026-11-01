@@ -82,8 +82,7 @@ func (s *Store) TouchBlob(ctx context.Context, n ref.Name, d digest.Digest) erro
 			return err
 		}
 		defer f.Close()
-		now := unix.NsecToTimeval(s.now().UnixNano())
-		if err := unix.Futimes(int(f.Fd()), []unix.Timeval{now, now}); err != nil {
+		if err := s.setTimes(f, s.now()); err != nil {
 			return fmt.Errorf("touch blob %s in %s: %w", d, n, err)
 		}
 		return nil
@@ -93,6 +92,15 @@ func (s *Store) TouchBlob(ctx context.Context, n ref.Name, d digest.Digest) erro
 		return fmt.Errorf("%w: %s in %s", ErrBlobUnknown, d, n)
 	}
 	return err
+}
+
+// setTimes sets f's atime and mtime to t, through the futimes seam when set.
+func (s *Store) setTimes(f *os.File, t time.Time) error {
+	if s.futimes != nil {
+		return s.futimes(f, t)
+	}
+	tv := unix.NsecToTimeval(t.UnixNano())
+	return unix.Futimes(int(f.Fd()), []unix.Timeval{tv, tv})
 }
 
 // OpenBlob opens blob d in n for reading. The caller closes it.

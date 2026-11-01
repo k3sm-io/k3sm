@@ -42,15 +42,6 @@ func (s *Server) getBlob(w http.ResponseWriter, r *http.Request, n ref.Name) {
 	if !s.allow(w, r, VerbRead, n) {
 		return
 	}
-	// A HEAD is how a pushing client decides to skip an upload, so it
-	// restarts the blob's GC grace: the manifest PUT that follows finds the
-	// blob still there. A GET (a pull) writes nothing.
-	if r.Method == http.MethodHead {
-		if err := s.st.TouchBlob(r.Context(), n, d); err != nil {
-			s.fail(w, r, err)
-			return
-		}
-	}
 	f, err := s.st.OpenBlob(n, d)
 	if err != nil {
 		s.fail(w, r, err)
@@ -62,12 +53,59 @@ func (s *Server) getBlob(w http.ResponseWriter, r *http.Request, n ref.Name) {
 		s.fail(w, r, err)
 		return
 	}
+	// A HEAD is how a pushing client decides to skip an upload, so it
+	// restarts the blob's GC grace: the manifest PUT that follows finds the
+	// blob still there. The write is bounded (headTouch): never while half
+	// the grace is left, and a failed touch is logged, not answered. If GC
+	// reaped the blob after the open above, the touch finds it gone and the
+	// HEAD answers 404. A GET (a pull) writes nothing.
+	if r.Method == http.MethodHead && !s.graceFresh(fi.ModTime()) {
+		if err := s.headTouch(r.Context(), n, d); err != nil {
+			s.fail(w, r, err)
+			return
+		}
+	}
 	s.setWriteDeadline(w, s.now().Add(s.writeWindow(fi.Size())))
 	h := w.Header()
 	h.Set("Docker-Content-Digest", d.String())
 	h.Set("Content-Type", "application/octet-stream")
 	h.Set("ETag", `"`+d.String()+`"`)
 	http.ServeContent(w, r, "", time.Time{}, f)
+}
+
+// graceFresh reports whether an object last touched at mtime has more than
+// half the GC grace left, so a HEAD leaves it alone and takes no lock.
+func (s *Server) graceFresh(mtime time.Time) bool {
+	return s.now().Sub(mtime) < s.gcGrace/2
+}
+
+// blobModTime returns the mtime of blob d in n.
+func (s *Server) blobModTime(n ref.Name, d digest.Digest) (time.Time, error) {
+	f, err := s.st.OpenBlob(n, d)
+	if err != nil {
+		return time.Time{}, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return time.Time{}, err
+	}
+	return fi.ModTime(), nil
+}
+
+// headTouch restarts blob d's GC grace in n for a HEAD. A blob GC removed
+// since the HEAD read it is ErrBlobUnknown, which the HEAD answers with 404;
+// any other failure (a read-only or degraded store, a client gone while the
+// lock was held) is logged and the HEAD is answered as if the touch were
+// made: the touch only protects a push that may follow, and the read itself
+// succeeded.
+func (s *Server) headTouch(ctx context.Context, n ref.Name, d digest.Digest) error {
+	err := s.st.TouchBlob(ctx, n, d)
+	if err == nil || errors.Is(err, store.ErrBlobUnknown) {
+		return err
+	}
+	s.log.Warn("registry head: grace touch failed, answering the HEAD", "repository", n.String(), "digest", d.String(), "err", err)
+	return nil
 }
 
 // deleteBlob refuses: blobs leave the store through garbage collection only,

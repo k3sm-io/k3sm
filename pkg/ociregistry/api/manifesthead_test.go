@@ -134,9 +134,10 @@ func TestManifestHeadKeepsTheChildForTheIndexPut(t *testing.T) {
 	}
 }
 
-// TestManifestReadsThatWriteNothing pins the reads that leave a manifest's
-// mtime alone: a HEAD by tag (a tagged row is kept at any age) and a GET by
-// tag or by digest (a pull). Only a HEAD by digest touches.
+// TestManifestReadsThatWriteNothing pins the reads that leave a tagged
+// manifest's mtime alone: a HEAD by tag or by digest (a tagged row is kept at
+// any age) and a GET by tag or by digest (a pull). Only a HEAD by digest of an
+// untagged row touches (TestManifestHeadTouchIsBounded).
 func TestManifestReadsThatWriteNothing(t *testing.T) {
 	old := time.Now().Add(-48 * time.Hour).Truncate(time.Second)
 	for _, tc := range []struct {
@@ -148,7 +149,7 @@ func TestManifestReadsThatWriteNothing(t *testing.T) {
 		{"HEAD by tag", http.MethodHead, true, false},
 		{"GET by tag", http.MethodGet, true, false},
 		{"GET by digest", http.MethodGet, false, false},
-		{"HEAD by digest", http.MethodHead, false, true},
+		{"HEAD by digest", http.MethodHead, false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFixture(t)

@@ -18,6 +18,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -90,13 +91,15 @@ func (s *Server) getManifest(w http.ResponseWriter, r *http.Request, n ref.Name)
 	desc, body, err := s.st.Manifest(n, rf)
 	// A HEAD by digest is how a pushing client decides to skip a child
 	// manifest's push before it PUTs the index naming it, so it restarts the
-	// manifest's GC grace, exactly as a blob HEAD does: an untagged child past
-	// the grace is not reaped before the index PUT. If GC reaped it after the
-	// read above, the touch finds it gone and the HEAD answers 404. A HEAD by
-	// tag writes nothing: a tagged row is kept at any age, and the index names
-	// its children by digest. A GET (a pull) writes nothing either.
+	// grace of an untagged manifest, as a blob HEAD does: the child is not
+	// reaped before the index PUT. The write is bounded (headTouch): only an
+	// untagged row is touched, never while half its grace is left, and a
+	// failed touch is logged, not answered. If GC reaped the manifest after
+	// the read above, the touch finds it gone and the HEAD answers 404. A
+	// HEAD by tag writes nothing: a tagged row is kept at any age, and the
+	// index names its children by digest. A GET (a pull) writes nothing.
 	if err == nil && r.Method == http.MethodHead && rf.Digest != "" {
-		err = s.st.TouchBlob(r.Context(), n, desc.Digest)
+		err = s.headManifestTouch(r.Context(), n, desc.Digest)
 	}
 	if errors.Is(err, store.ErrBlobUnknown) {
 		err = fmt.Errorf("%w: %w", store.ErrManifestUnknown, err)
@@ -114,6 +117,28 @@ func (s *Server) getManifest(w http.ResponseWriter, r *http.Request, n ref.Name)
 	if r.Method != http.MethodHead {
 		_, _ = w.Write(body) // the client went away
 	}
+}
+
+// headManifestTouch restarts the GC grace of the manifest d in n for a HEAD by
+// digest, when its row is untagged and less than half the grace is left.
+func (s *Server) headManifestTouch(ctx context.Context, n ref.Name, d digest.Digest) error {
+	mtime, err := s.blobModTime(n, d)
+	if err != nil {
+		return err
+	}
+	if s.graceFresh(mtime) {
+		return nil
+	}
+	idx, err := s.st.Index(n)
+	if err != nil {
+		return err
+	}
+	for _, row := range idx.Manifests {
+		if _, tagged := row.Annotations[ispec.AnnotationRefName]; tagged && row.Digest == d {
+			return nil
+		}
+	}
+	return s.headTouch(ctx, n, d)
 }
 
 // manifestInvalid is a 400 MANIFEST_INVALID.
