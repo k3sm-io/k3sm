@@ -41,10 +41,15 @@
 #   b1021.5  no release-built binary links the conformance launcher
 #            (k3sm.io/k3sm/hack/ociconformance/...): `go list -deps` of every
 #            main hack/release/stage.sh builds, which must include ./cmd/k3sm,
-#            and of every cmd/ main. It fails closed: the count of `go build`
-#            lines in stage.sh must equal the count of mains read from them.
-#            Self-checks plant the launcher in a dependency list, and an
-#            unparseable go build line in a copy of stage.sh; both must red
+#            and of every cmd/ main. The guarantee: no non-comment line of a
+#            release script (hack/release/*.sh and every file they source)
+#            names the launcher (ociconformance, k3sm.io/k3sm/hack/) or a
+#            package pattern (./..., ./hack/..., k3sm.io/k3sm/...), and a source
+#            line this check cannot resolve reds. As a coarse first layer, the
+#            count of `go build` lines in stage.sh must equal the count of mains
+#            read from them. Self-checks plant the launcher in a dependency
+#            list, an unparseable go build line in a copy of stage.sh, a
+#            launcher build and a ./hack/... pattern; each must red
 #   b1021.6  every EXPECTED_SKIPS entry is the skipped branch of an EITHER_OR
 #            pair, and every pair's skipped branch is in EXPECTED_SKIPS
 #
@@ -124,8 +129,54 @@ release_mains() {
 
 # release_build_count <file>: every non-comment line of <file> that names
 # `go build`, parseable or not, so a build release_mains cannot read is counted.
+# This is a coarse first layer, not a shell parser: it shares release_mains'
+# blind spots (two builds on one line, `go -C <dir> build`, `"$GO" build`, a
+# line continuation, `go install`). The guarantee is carried by
+# release_launcher_lines and release_pattern_lines below, which read every
+# release script for what a launcher build would have to contain.
 release_build_count() {
 	grep -E '(^|[^[:alnum:]_./-])go[[:space:]]+build([[:space:]]|$)' "$1" | grep -cvE '^[[:space:]]*#' || true
+}
+
+# release_scripts: every release build script, one per line: hack/release/*.sh
+# and, transitively, every file they source. A source line whose path is not
+# "$HERE/<path>" or "$REPO_ROOT/<path>" is printed as "UNRESOLVED <file>: <line>",
+# which the caller treats as red.
+release_scripts() {
+	local queue seen f line path
+	queue="$(printf '%s\n' hack/release/*.sh)"
+	seen=""
+	while [ -n "$queue" ]; do
+		f="${queue%%$'\n'*}"
+		[ "$f" = "$queue" ] && queue="" || queue="${queue#*$'\n'}"
+		[ -n "$f" ] || continue
+		! grep -qxF "$f" <<<"$seen" || continue
+		seen="$seen$f"$'\n'
+		[ -f "$f" ] || { echo "UNRESOLVED $f: sourced but missing"; continue; }
+		echo "$f"
+		while IFS= read -r line; do
+			path="$(sed -nE 's/^[[:space:]]*(\.|source)[[:space:]]+"\$(HERE|REPO_ROOT)\/([^"$]+)".*$/\2 \3/p' <<<"$line")"
+			case "$path" in
+			"HERE "*) queue="$queue"$'\n'"hack/release/${path#HERE }" ;;
+			"REPO_ROOT "*) queue="$queue"$'\n'"${path#REPO_ROOT }" ;;
+			*) echo "UNRESOLVED $f: $line" ;;
+			esac
+		done < <(grep -E '^[[:space:]]*(\.|source)[[:space:]]' "$f" || true)
+	done
+}
+
+# release_launcher_lines <file>...: every non-comment line that names the
+# launcher. A build of it has to name its path, unless it uses a package
+# pattern, which release_pattern_lines refuses.
+release_launcher_lines() {
+	grep -HnE 'ociconformance|hack/ociconformance|k3sm\.io/k3sm/hack/' "$@" | grep -vE '^[^:]*:[0-9]+:[[:space:]]*#' || true
+}
+
+# release_pattern_lines <file>...: every non-comment line carrying a package
+# pattern that would reach the launcher (./..., ./hack/..., k3sm.io/k3sm/...),
+# on any command, not only a go build, install or run the parser can see.
+release_pattern_lines() {
+	grep -HnE '(^|[^[:alnum:]_.-])(\./\.\.\.|\./hack/\.\.\.|k3sm\.io/k3sm/\.\.\.)' "$@" | grep -vE '^[^:]*:[0-9]+:[[:space:]]*#' || true
 }
 
 # release_verdict <file>: "ok <mains>" when every go build in <file> is a main
@@ -199,18 +250,41 @@ check() {
 		fi
 	fi
 	# b1021.5
-	local rv cv cmain cdeps cbad tmpd
+	local rv cv cmain cdeps cbad tmpd scripts unres lhits phits plant1 plant2
 	planted="$(printf 'k3sm.io/k3sm/pkg/ociregistry/api\nk3sm.io/k3sm/hack/ociconformance/serve\n' | launcher_deps)"
 	tmpd="$(mktemp -d "${TMPDIR:-/tmp}/b1021.XXXXXX")"
 	{ cat "$RELEASE_BUILDS"; printf '%s\n' '( cd "$REPO_ROOT" && go build -o "$OUT/x" "$PKG" )'; } >"$tmpd/stage.sh"
 	cv="$(release_verdict "$tmpd/stage.sh")"
+	printf '%s\n' '# a comment naming hack/ociconformance is fine' 'X=a; "$GO" -C "$REPO_ROOT" build -o "$OUT/s" ./hack/ociconformance/serve' >"$tmpd/launcher.sh"
+	printf '%s\n' '# go build ./... in a comment is fine' 'go -C "$REPO_ROOT" install \' '  ./hack/...' >"$tmpd/pattern.sh"
+	plant1="$(release_launcher_lines "$tmpd/launcher.sh")"
+	plant2="$(release_pattern_lines "$tmpd/pattern.sh")"
 	rm -rf "$tmpd"
+	scripts="$(release_scripts)"
+	unres="$(grep '^UNRESOLVED ' <<<"$scripts" || true)"
+	scripts="$(grep -v '^UNRESOLVED ' <<<"$scripts" || true)"
+	# shellcheck disable=SC2086 # one path per word; the paths carry no spaces
+	lhits="$(release_launcher_lines $scripts)"
+	# shellcheck disable=SC2086
+	phits="$(release_pattern_lines $scripts)"
 	rv="$(release_verdict "$RELEASE_BUILDS")"
 	cmain="$(go list -f '{{if eq .Name "main"}}{{.ImportPath}}{{end}}' ./cmd/... 2>/dev/null)" || cmain=""
 	if [ -z "$planted" ]; then
 		ladder fail "b1021.5 self-check: the matcher missed a planted launcher package"
 	elif [ "${cv%% *}" != fail ]; then
 		ladder fail "b1021.5 self-check: a stage.sh with an unparseable go build line did not red"
+	elif [ "$(grep -c . <<<"$plant1" || true)" != 1 ]; then
+		ladder fail "b1021.5 self-check: a planted launcher build was not caught exactly once (comment lines must pass)"
+	elif [ "$(grep -c . <<<"$plant2" || true)" != 1 ]; then
+		ladder fail "b1021.5 self-check: a planted ./hack/... pattern was not caught exactly once (comment lines must pass)"
+	elif [ -n "$unres" ]; then
+		ladder fail "b1021.5 a release script sources a file this check cannot resolve: $(paste -sd ';' - <<<"$unres")"
+	elif ! grep -qx 'hack/release/stage.sh' <<<"$scripts" || ! grep -qx 'hack/release/build-cp.sh' <<<"$scripts"; then
+		ladder fail "b1021.5 the release script set lacks stage.sh or build-cp.sh: $(paste -sd ' ' - <<<"$scripts")"
+	elif [ -n "$lhits" ]; then
+		ladder fail "b1021.5 a release script names the launcher: $(paste -sd ';' - <<<"$lhits")"
+	elif [ -n "$phits" ]; then
+		ladder fail "b1021.5 a release script passes a package pattern: $(paste -sd ';' - <<<"$phits")"
 	elif [ "${rv%% *}" != ok ]; then
 		ladder fail "b1021.5 ${rv#fail }"
 	elif [ -z "$cmain" ] || ! cdeps="$(go list -deps $cmain)"; then
@@ -218,7 +292,7 @@ check() {
 	elif cbad="$(launcher_deps <<<"$cdeps")" && [ -n "$cbad" ]; then
 		ladder fail "b1021.5 a cmd/ main links: $(paste -sd ' ' - <<<"$cbad")"
 	else
-		ladder ok "b1021.5 every go build in $RELEASE_BUILDS is read (${rv#ok }), and neither they nor the cmd/ mains link a hack/ociconformance package (both self-checks red)"
+		ladder ok "b1021.5 no release script ($(grep -c . <<<"$scripts")) names the launcher or a package pattern; every go build in $RELEASE_BUILDS is read (${rv#ok }), and neither they nor the cmd/ mains link a hack/ociconformance package (four self-checks red)"
 	fi
 	# b1021.6
 	local lefts
