@@ -594,4 +594,20 @@ func TestDeveloperModeMarkerDroppedAsTheSwapCommits(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("a later failure keeps the removal error beside it", func(t *testing.T) {
+		f := &fakeSystem{owners: map[string]OwnedEntry{}, removeEntryErrs: map[string]error{DeveloperModeMarkerPath: errors.New("EPERM")}, kubeconfigErr: errors.New("home is read-only")}
+		putMarker(f, 0o644)
+		cfg := stageCfg()
+		cfg.DeveloperMode = DeveloperModeOff
+		err := Install(context.Background(), f, cfg)
+		if err == nil {
+			t.Fatal("Install succeeded with the kubeconfig write failing")
+		}
+		for _, want := range []string{"write admin kubeconfig for alice: home is read-only", "k3sm install --developer-mode off"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q does not carry %q", err, want)
+			}
+		}
+	})
 }

@@ -268,6 +268,8 @@ type fakeSystem struct {
 	// removeEntryErrs[path] is the failure RemoveEntry returns for the entry at
 	// path, leaving it in place.
 	removeEntryErrs map[string]error
+	// kubeconfigErr is the failure WriteUserKubeconfig returns.
+	kubeconfigErr error
 	// space is what InstallSpace answers: free bytes, then needed bytes. Nil —
 	// the zero value — is a volume with room for anything, so only a test about
 	// the preflight has to state a number.
@@ -1330,6 +1332,9 @@ func (f *fakeSystem) putWedgedSocket(path string) {
 
 func (f *fakeSystem) WriteUserKubeconfig(targetUser, name string, contents []byte) (string, error) {
 	f.calls = append(f.calls, "WriteUserKubeconfig:"+targetUser)
+	if f.kubeconfigErr != nil {
+		return "", f.kubeconfigErr
+	}
 	f.kubeUser = targetUser
 	f.kubeContent = string(contents)
 	return "/Users/" + targetUser + "/.kube/config", nil
