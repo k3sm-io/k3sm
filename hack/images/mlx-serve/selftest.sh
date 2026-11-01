@@ -401,9 +401,32 @@ else
 fi
 
 cat > "$WORK/shard-driver.py" <<'PY'
-import http.server, json, os, socket, sys, threading
+import base64, http.server, json, os, socket, sys, threading
+from typing import Any, Dict, List
+from urllib.request import urlopen
 sys.path.insert(0, sys.argv[1])
 import k3sm_shard as ks
+
+def _image_url(part):
+    return part.get("image_url")
+
+def _image_parts(messages):
+    for message in messages:
+        yield from message["content"]
+
+# mlx-lm 0.32.2's mlx_lm.server._inline_image_urls, verbatim: the function the
+# remote-image guard replaces. Its normalized body hash is IMAGE_HOOK_SHA256.
+def _inline_image_urls(messages: List[Dict[str, Any]]) -> None:
+    """Replace http(s) image URLs with data URLs: all ranks read the same bytes."""
+    for part in _image_parts(messages):
+        url = _image_url(part)
+        if not url.startswith(("http://", "https://")):
+            continue
+        with urlopen(url, timeout=30) as response:
+            mime = response.headers.get_content_type()
+            data = base64.b64encode(response.read()).decode()
+        part.clear()
+        part.update(type="image_url", image_url={"url": f"data:{mime};base64,{data}"})
 
 here, work = sys.argv[1], sys.argv[2]  # serve() below rewrites sys.argv
 podvol = os.path.join(work, "podvol")
@@ -516,7 +539,7 @@ except ks.ShardError:
 
 import io, types
 def fake_engine(**drop):
-    """A stand-in for mlx_lm.server 0.32.0 with the hooks the alias uses."""
+    """A stand-in for mlx_lm.server 0.32.2 with the hooks the alias uses."""
     m = types.ModuleType("mlx_lm.server")
     rec = m.rec = {"loads": [], "http": None, "joined": False, "rank": 0}
     class ModelProvider:
@@ -551,6 +574,7 @@ def fake_engine(**drop):
     m.ModelProvider, m.APIHandler, m.ResponseGenerator = ModelProvider, APIHandler, ResponseGenerator
     m.LRUPromptCache = lambda size: ("cache", size)
     m.run, m._run_http_server, m.main = run, _run_http_server, main
+    m._inline_image_urls = _inline_image_urls
     for path, value in drop.items():
         owner, _, attr = path.rpartition(".")
         setattr(getattr(m, owner) if owner else m, attr, value)
@@ -600,9 +624,9 @@ def fake_run(host, port, model_provider, server_class=None, handler_class=None):
     return group
 try:
     ks.check_run_shape(types.SimpleNamespace(run=fake_run))
-    check("alias.runshape  a run whose body is not the copied 0.32.0 one is refused with the re-derive instruction", False)
+    check("alias.runshape  a run whose body is not the copied 0.32.2 one is refused with the re-derive instruction", False)
 except ks.ShardError as e:
-    check("alias.runshape  a run whose body is not the copied 0.32.0 one is refused with the re-derive instruction",
+    check("alias.runshape  a run whose body is not the copied 0.32.2 one is refused with the re-derive instruction",
           "re-derive" in str(e) and "ENGINE_RUN_SHA256" in str(e))
 for label, drop, needle in (
         ("alias.failclosed.missing  an engine without _run_http_server ends the rank naming it",
@@ -616,6 +640,77 @@ for label, drop, needle in (
         check(label, False)
     except ks.ShardError as e:
         check(label, needle in str(e) and eng.run is stock_run and eng.ModelProvider is stock_provider)
+
+# the remote-image guard: mlx-lm 0.32.2 fetches any http(s) image URL in a chat
+# request; the entrypoint swaps that for a function that refuses all but data:
+hits = []
+class Probe(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        hits.append(self.path)
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"x")
+    def log_message(self, *a):
+        pass
+probe_srv = http.server.HTTPServer(("127.0.0.1", 0), Probe)
+threading.Thread(target=probe_srv.serve_forever, daemon=True).start()
+remote = f"http://127.0.0.1:{probe_srv.server_address[1]}/internal"
+eng = fake_engine()
+upstream = eng._inline_image_urls
+ks.install_image_guard(eng)
+check("imgguard.replaced  the engine's fetch is replaced by the refusing function",
+      eng._inline_image_urls is ks.refuse_remote_images and eng._inline_image_urls is not upstream)
+def refused(messages):
+    try:
+        eng._inline_image_urls(messages)
+    except ValueError:
+        return True
+    return False
+check("imgguard.http  a remote http URL is refused before any network call",
+      refused([{"role": "user", "content": [{"type": "image_url", "image_url": {"url": remote}}]}]) and hits == [])
+check("imgguard.https  https, a bare string URL, the 'image' key and file: are refused too",
+      all(refused([{"role": "user", "content": [part]}]) for part in (
+          {"type": "image_url", "image_url": {"url": "https://example.invalid/a.png"}},
+          {"type": "input_image", "image_url": "http://example.invalid/a.png"},
+          {"type": "image", "image": "https://example.invalid/a.png"},
+          {"type": "image_url", "image_url": {"url": "file:///etc/passwd"}},
+          {"type": "text", "image": {"url": "http://example.invalid/a.png"}},
+          {"type": "image_url", "image_url": 7}))
+      and hits == [])
+data_msgs = [{"role": "user", "content": [{"type": "text", "text": "hi"},
+                                          {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]},
+             {"role": "assistant", "content": "plain string content"}]
+before = json.dumps(data_msgs)
+check("imgguard.data  a data: URL passes and the messages are left unchanged",
+      not refused(data_msgs) and json.dumps(data_msgs) == before)
+def changed(**kw):
+    e = fake_engine()
+    def tampered(messages: List[Dict[str, Any]]) -> None:
+        for part in messages:
+            urlopen(part, timeout=30)
+    def renamed(msgs, extra):
+        pass
+    e._inline_image_urls = {"body": tampered, "sig": renamed, "gone": None}[kw["how"]]
+    try:
+        ks.install_image_guard(e)
+    except ks.ShardError as err:
+        return "_inline_image_urls" in str(err) and e._inline_image_urls is not ks.refuse_remote_images
+    return False
+check("imgguard.failclosed.body  a changed upstream body makes the hook check fail naming the hook", changed(how="body"))
+check("imgguard.failclosed.signature  another signature fails the check", changed(how="sig"))
+check("imgguard.failclosed.missing  an engine without the function fails the check", changed(how="gone"))
+eng = fake_engine()
+env_saved = dict(os.environ)
+try:
+    ks.serve({"MLX_RANK": "0"}, ["x", "y", "z"], None, importer=lambda name: eng)
+except AssertionError:
+    pass
+finally:
+    os.environ.clear()
+    os.environ.update(env_saved)
+check("imgguard.serve  serve() installs the guard on the stock path (no --served-model-name) too",
+      eng._inline_image_urls is ks.refuse_remote_images)
+probe_srv.shutdown()
 
 # serve: the rendezvous environment is in place before the engine is imported,
 # and the engine sees plan()'s argv (pipeline included) without the alias flag
@@ -639,7 +734,7 @@ check("serve.argv  main() sees the plan's argv, --pipeline kept, --served-model-
 
 # the rank's exit is the engine's: run k3sm_shard as the pod command does,
 # against a fake mlx_lm.server package, and read the process's own status
-import signal, subprocess, time
+import inspect, signal, subprocess, time
 fakepkg = os.path.join(work, "fake-engine")
 os.makedirs(os.path.join(fakepkg, "mlx_lm"))
 open(os.path.join(fakepkg, "mlx_lm", "__init__.py"), "w").close()
@@ -663,7 +758,13 @@ with open(os.path.join(fakepkg, "mlx_lm", "server.py"), "w") as f:
         "        with open(os.environ['FAKE_ENGINE_GOT'], 'w') as g:\n"
         "            g.write(str(e.args[0]))\n"
         "        return 128 + e.args[0]\n"
-        "    return 0\n")
+        "    return 0\n"
+        # serve() installs the remote-image guard first, so the fake carries
+        # the verbatim 0.32.2 function it checks and replaces
+        "import base64\n"
+        "from typing import Any, Dict, List\n"
+        "from urllib.request import urlopen\n"
+        + "".join(inspect.getsource(fn) for fn in (_image_url, _image_parts, _inline_image_urls)))
 def rank_proc(mode):
     e = env(MLX_WORLD_SIZE="1", MLX_RANK="0", K3SM_MLX_RANKS=names[0], K3SM_POD_IP="10.42.0.5")
     e.update(PYTHONPATH=os.pathsep.join([here, fakepkg]), PYTHONDONTWRITEBYTECODE="1", FAKE_ENGINE_MODE=mode,
@@ -725,10 +826,10 @@ while read -r verdict name; do
 	esac
 done <<< "$shard_out"
 # A driver that crashed before its checks would otherwise pass vacuously.
-if [ "$SHARD_CHECKS" -ge 36 ]; then
+if [ "$SHARD_CHECKS" -ge 44 ]; then
 	ladder ok "7.count  all $SHARD_CHECKS entrypoint checks reported"
 else
-	ladder no "7.count  only $SHARD_CHECKS of 36 entrypoint checks reported (the driver crashed?)"
+	ladder no "7.count  only $SHARD_CHECKS of 44 entrypoint checks reported (the driver crashed?)"
 	head -20 "$WORK/shard-driver.err"
 fi
 
@@ -1206,7 +1307,7 @@ else
 fi
 
 # ---- 9s — the attention-sink mask on the REAL mlx-lm cache (staged tree) ----
-# mlx-lm 0.32.0's RotatingKVCache keeps its first `keep` tokens as attention
+# mlx-lm 0.32.2's RotatingKVCache keeps its first `keep` tokens as attention
 # sinks, but its prefill mask is a plain sliding window: once the cache has
 # trimmed, every query row masks the sink columns out (the upstream defect,
 # shown red here first). k3sm_serve patches make_mask; this rung drives the
@@ -1330,7 +1431,7 @@ fi
 # k3sm_shard's alias hooks four mlx_lm.server internals; this rung checks them
 # on the real module the image carries, so an mlx-lm bump that moves one goes
 # red here before a rank refuses to start: every hook's signature, the source
-# of the run the alias copies (pinned to 0.32.0's), and the real models
+# of the run the alias copies (pinned to 0.32.2's), and the real models
 # listing against the aliased one. No model is loaded and no distributed group
 # is formed: the handlers are built without a socket over an empty Hub cache.
 if [ -x "$STAGED/bin/python3.12" ] && [ -d "$STAGED/lib/python3.12/site-packages/mlx_lm" ]; then
@@ -1346,16 +1447,23 @@ server = importlib.import_module(ks.ENGINE_MODULE)
 stock_handler = server.APIHandler
 try:
     ks.check_engine_hooks(server)
-    check("hooks  every hook the alias uses has the 0.32.0 signature", True)
+    check("hooks  every hook the alias uses has the 0.32.2 signature", True)
 except ks.ShardError as e:
     print(f"k3sm-shard: {e}", file=sys.stderr)
-    check("hooks  every hook the alias uses has the 0.32.0 signature", False)
+    check("hooks  every hook the alias uses has the 0.32.2 signature", False)
 try:
     ks.check_run_shape(server)
-    check("runshape  mlx_lm.server.run is the 0.32.0 body the alias's run copies", True)
+    check("runshape  mlx_lm.server.run is the 0.32.2 body the alias's run copies", True)
 except ks.ShardError as e:
     print(f"k3sm-shard: {e}", file=sys.stderr)
-    check("runshape  mlx_lm.server.run is the 0.32.0 body the alias's run copies", False)
+    check("runshape  mlx_lm.server.run is the 0.32.2 body the alias's run copies", False)
+
+try:
+    ks.install_image_guard(server)
+    check("imgguard  mlx_lm.server._inline_image_urls is the 0.32.2 body the guard replaces, and is replaced", server._inline_image_urls is ks.refuse_remote_images)
+except ks.ShardError as e:
+    print(f"k3sm-shard: {e}", file=sys.stderr)
+    check("imgguard  mlx_lm.server._inline_image_urls is the 0.32.2 body the guard replaces, and is replaced", False)
 
 P, H, run = ks.install_alias(server, "org/m")
 check("install  ModelProvider and run are replaced, the handler subclasses the real one",
