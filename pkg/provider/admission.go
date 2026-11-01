@@ -19,6 +19,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -178,51 +179,66 @@ func isBudgetRejectedPod(pod *corev1.Pod) bool {
 
 // setAdmissionSource installs the pressure source CreatePod admits against.
 // Until it is called nothing is refused, as the kubelet admits everything
-// before its eviction manager has observed the node.
+// before its eviction manager has observed the node. A nil *pressureMonitor is
+// stored as no source: as an interface value it would be non-nil, and the
+// first create would call latest on it.
 func (r *runtimedRuntime) setAdmissionSource(src admissionPressure) {
+	if m, ok := src.(*pressureMonitor); ok && m == nil {
+		src = nil
+	}
 	r.mu.Lock()
 	r.admission = src
 	r.mu.Unlock()
 }
 
 // admitOnCreate runs node-side admission for a pod CreatePod is about to start.
-// It returns true when the create must not proceed: either the pod's track
+// refused is true when the create must not proceed: either the pod's track
 // already holds a terminal node status (rejected here before, or evicted), or
 // the pod is refused now. A refused pod is tracked with its terminal rejected
 // status (so every status path reports it, the eviction manager skips it, and
 // DeletePod finishes it the way it finishes an evicted pod), the Warning Event
 // is recorded, the status is written to the apiserver and pushed through the
 // watch callback, and the caller creates nothing.
-func (r *runtimedRuntime) admitOnCreate(ctx context.Context, pod *corev1.Pod) bool {
+//
+// When refused is false the caller must call done when its create returns.
+//
+// Locking: the decision and the publication of its result happen in one r.mu
+// critical section. A refusal is published as the rejected track; an admission
+// is published as an in-flight count in r.admitting, held until done. So of two
+// concurrent creates of one pod, whichever decides second sees the first's
+// result: a create that would refuse yields to an admitted create in flight,
+// and a create that would admit is refused with an installed rejection.
+// CreatePod's track registration refuses to replace a terminal track behind
+// this. The pressure monitor's lock is a leaf, so reading it under r.mu is safe.
+func (r *runtimedRuntime) admitOnCreate(ctx context.Context, pod *corev1.Pod) (refused bool, done func()) {
 	id := string(pod.UID)
 	r.mu.Lock()
-	src := r.admission
-	prior := r.track[id]
-	r.mu.Unlock()
-	if prior != nil {
+	if prior := r.track[id]; prior != nil {
+		r.mu.Unlock()
 		// Admitted (or refused) at its first create; a refused or evicted pod
 		// is terminal and is never created by a repeat call.
-		return prior.evictedStatus() != nil
+		if prior.evictedStatus() != nil {
+			return true, nil
+		}
+		return false, func() {}
 	}
-	if src == nil || pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded {
-		return false
+	res := podAdmitResult{admit: true}
+	if src := r.admission; src != nil && r.admitting[id] == 0 &&
+		pod.Status.Phase != corev1.PodFailed && pod.Status.Phase != corev1.PodSucceeded {
+		s, _, ok := src.latest()
+		res = admitPod(pod, s, ok)
 	}
-	s, _, ok := src.latest()
-	res := admitPod(pod, s, ok)
 	if res.admit {
-		return false
+		if r.admitting == nil {
+			r.admitting = map[string]int{}
+		}
+		r.admitting[id]++
+		r.mu.Unlock()
+		var once sync.Once
+		return false, func() { once.Do(func() { r.admitDone(id) }) }
 	}
 	st := rejectedPodStatus(pod, res, metav1.Now())
-	t := &podTrack{pod: pod.DeepCopy(), startTime: *st.StartTime, evicted: st, rejected: true}
-	r.mu.Lock()
-	if existing := r.track[id]; existing != nil {
-		// A concurrent create of the same pod got there first. If it refused
-		// the pod too, this create is refused with it; otherwise the pod was
-		// admitted and this create proceeds.
-		r.mu.Unlock()
-		return existing.evictedStatus() != nil
-	}
-	r.track[id] = t
+	r.track[id] = &podTrack{pod: pod.DeepCopy(), startTime: *st.StartTime, evicted: st, rejected: true}
 	r.mu.Unlock()
 
 	r.log.Warn("CreatePod: the pod was rejected at admission",
@@ -238,7 +254,18 @@ func (r *runtimedRuntime) admitOnCreate(ctx context.Context, pod *corev1.Pod) bo
 		out.Status = *st.DeepCopy()
 		cb(out)
 	}
-	return true
+	return true, nil
+}
+
+// admitDone ends one admitted create of pod id.
+func (r *runtimedRuntime) admitDone(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.admitting[id] <= 1 {
+		delete(r.admitting, id)
+		return
+	}
+	r.admitting[id]--
 }
 
 // forgetRejected is DeletePod for a pod refused at admission. The runtime never

@@ -100,6 +100,9 @@ pin, its date, and the tarball's sha256.
   applies, so the installer and the app agree on whether developer mode is on. An install
   that turns developer mode off removes the marker only once the new install root is in
   place, so a failed install leaves developer mode as it was.
+- Two creates of one Pod that raced while memory pressure changed between them could run the
+  Pod while the API server reported it Failed and rejected. The admission decision and its
+  result are now recorded together, so the node and the API server always agree.
 - `k3sm uninstall` stops a vm pod helper still running from an older k3sm version whose
   directory is kept for it, as it stops every other helper, instead of reporting it as a
   leftover to kill by hand. Only a helper whose version directory is gone is still reported.
