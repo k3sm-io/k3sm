@@ -93,6 +93,13 @@ pin, its date, and the tarball's sha256.
 - `k3sm uninstall` no longer reports a vm pod helper as running from a version the install no
   longer keeps when its version directory exists but cannot be read (a permission or I/O error).
   It does not signal that helper either; the error names the path that could not be resolved.
+- The registry's garbage collector reads, verifies and parses manifests before it takes a
+  repository's lock, so a sweep no longer holds pushes to that repository for a time that grows
+  with its manifest count. Under the lock it re-checks the index and the manifests it read, and
+  plans again when either changed. One repository it cannot read no longer keeps the first,
+  report-only sweep from completing for the whole store. The record of that first sweep now
+  names the store root it ran on, so a restored, copied or moved store reports only again before
+  it deletes.
 - The registry's garbage collector stops a repository's sweep, deleting nothing, when a manifest
   there is not an OCI or Docker v2 image manifest, index or manifest list (a Docker schema1
   manifest, for example). It used to read such a manifest as referencing nothing and could reap

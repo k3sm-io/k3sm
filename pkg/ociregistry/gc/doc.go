@@ -31,17 +31,24 @@ limitations under the License.
 // Protection is on disk. Every mount, link and upload commit touches the
 // shared blob inode's mtime under the repository's lock, so age is the time
 // since the last write that named the blob, and it survives a restart. A sweep
-// marks each repository from a snapshot without the lock, then takes the
-// repository lock to delete: it re-reads index.json and re-states every
-// candidate, recomputes what is reachable, and deletes only what both passes
-// agree on. Upload sessions are reaped only after taking their own lock
+// marks each repository from a snapshot without the lock, reading, verifying
+// and parsing every manifest body it follows there, then takes the repository
+// lock to delete: it re-reads index.json and re-states the repository,
+// recomputes what is reachable from the bodies the mark read, and deletes only
+// what both passes agree on. The lock is held for no manifest read. When the
+// rows, or a manifest the mark read, changed in between, it deletes nothing
+// and marks the repository again; one that keeps changing is skipped with
+// ErrChanged. Upload sessions are reaped only after taking their own lock
 // without waiting, so a session an upload holds is never touched.
 //
 // Three brakes bound the damage of a mistake. No sweep runs within one grace
 // period of the collector's start, so a write made just before a restart has
 // had its full grace. The first sweep over a store without the
 // registry-state/gc-ran marker only reports what it would reap, then writes
-// the marker. A sweep that would delete more than half of a repository's
+// the marker, even when some repository failed (that one keeps failing
+// closed). The marker records the device and inode of the store root, and a
+// marker for another root does not count, so a restored, copied or moved
+// store gets a report-only first sweep again. A sweep that would delete more than half of a repository's
 // blobs stops with ErrMassDelete, unless it empties the repository: it leaves
 // no row and every blob it reaps is older than the last change to the rows.
 // A first push in progress, whose blobs are newer than its empty index, stays

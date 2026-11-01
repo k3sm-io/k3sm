@@ -62,7 +62,7 @@ func TestSweepStoppedInsideRemoveLayout(t *testing.T) {
 	if err := os.Chtimes(filepath.Join(repo, "index.json"), old, old); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(s.StateDir(), gc.MarkerName), []byte("ran\n"), 0o600); err != nil {
+	if err := gc.WriteMarker(s, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	start := time.Now().Add(-3 * time.Hour)

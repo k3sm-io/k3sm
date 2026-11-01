@@ -92,7 +92,7 @@ func (e *env) collector(t *testing.T, at time.Duration) *Collector {
 // ran writes the first-sweep marker, so sweeps delete.
 func (e *env) ran(t *testing.T) {
 	t.Helper()
-	if err := writeMarker(filepath.Join(e.s.StateDir(), MarkerName), e.clk.now()); err != nil {
+	if err := WriteMarker(e.s, e.clk.now()); err != nil {
 		t.Fatal(err)
 	}
 }

@@ -51,7 +51,18 @@ var (
 	// ErrUnreadable is a repository sweep stopped because a manifest it
 	// must follow is missing or does not parse.
 	ErrUnreadable = errors.New("gc: manifest unreadable")
+	// ErrChanged is a repository sweep skipped because the repository's
+	// index or manifests changed between every read and the lock.
+	ErrChanged = errors.New("gc: repository kept changing during the sweep")
 )
+
+// errStale is a locked pass that found the index or a manifest it read
+// without the lock changed since: the repository is planned again.
+var errStale = errors.New("gc: repository changed since it was read")
+
+// maxPlans is how many times a sweep plans one repository before it skips
+// it with ErrChanged.
+const maxPlans = 3
 
 // Kind is the kind of object a sweep reaps.
 type Kind string
@@ -81,6 +92,9 @@ type Report struct {
 	Objects    []Object
 	// Stopped lists the repositories whose sweep stopped on a brake.
 	Stopped []string
+	// Failed lists the repositories whose sweep failed for another reason,
+	// such as a manifest it could not read. Nothing was reaped in them.
+	Failed []string
 }
 
 // Count returns the number of objects of kind k in the report.
@@ -118,6 +132,9 @@ type Collector struct {
 	// afterMark, when set, runs between a repository's mark and its locked
 	// sweep (a seam for tests that interleave a push).
 	afterMark func(ref.Name)
+	// onRead, when set, runs before each manifest body the collector reads
+	// (a seam for tests that push while a sweep reads).
+	onRead func(ref.Name, digest.Digest)
 	// fault, when set, runs at each faultPoint in apply; an error stops the
 	// sweep there, as a crash would (a seam for crash tests). i counts the
 	// blobs removed so far at faultBlob.
@@ -155,9 +172,11 @@ func New(s *store.Store, o Options) (*Collector, error) {
 }
 
 // Sweep runs one collection over every repository. A repository stopped by
-// a brake or an error is skipped and named in the returned error; the others
-// are still swept. A report-only first sweep writes the marker unless a
-// repository failed for a reason other than a brake.
+// a brake or an error is skipped, listed in the report's Stopped or Failed,
+// and named in the returned error; the others are still swept. A report-only
+// first sweep writes the marker once every repository was planned, braked or
+// failed: a repository that cannot be read keeps failing closed in later
+// sweeps, so it does not hold the rest of the store at report-only.
 func (c *Collector) Sweep(ctx context.Context) (Report, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -165,7 +184,11 @@ func (c *Collector) Sweep(ctx context.Context) (Report, error) {
 		return Report{}, fmt.Errorf("%w: started %s, grace %s", ErrTooSoon, c.start.Format(time.RFC3339), c.grace)
 	}
 	marker := filepath.Join(c.s.StateDir(), MarkerName)
-	ran, err := markerExists(marker)
+	id, err := storeIdentity(c.s)
+	if err != nil {
+		return Report{}, err
+	}
+	ran, err := c.markerMatches(marker, id)
 	if err != nil {
 		return Report{}, err
 	}
@@ -175,7 +198,6 @@ func (c *Collector) Sweep(ctx context.Context) (Report, error) {
 		return rep, err
 	}
 	var errs []error
-	hard := false
 	for _, n := range repos {
 		if err := ctx.Err(); err != nil {
 			return rep, err
@@ -186,13 +208,13 @@ func (c *Collector) Sweep(ctx context.Context) (Report, error) {
 			if errors.Is(err, ErrMassDelete) {
 				rep.Stopped = append(rep.Stopped, n.String())
 			} else {
-				hard = true
+				rep.Failed = append(rep.Failed, n.String())
 			}
 			errs = append(errs, fmt.Errorf("gc %s: %w", n, err))
 		}
 	}
-	if rep.ReportOnly && !hard {
-		if err := writeMarker(marker, c.now()); err != nil {
+	if rep.ReportOnly {
+		if err := writeMarker(marker, c.now(), id); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -200,27 +222,49 @@ func (c *Collector) Sweep(ctx context.Context) (Report, error) {
 }
 
 // sweepRepo marks n without the lock and, unless reportOnly, deletes what a
-// second, locked pass agrees on.
+// second, locked pass agrees on. The manifest bodies are read, verified and
+// parsed only in the unlocked mark; the locked pass re-reads index.json and
+// re-states the repository, and plans again from the mark's parsed bodies.
+// When the rows or a manifest it read changed in between, nothing is deleted
+// and the repository is marked again, up to maxPlans times.
 func (c *Collector) sweepRepo(ctx context.Context, n ref.Name, reportOnly bool) ([]Object, error) {
-	p, idx, cont, err := c.mark(n, c.now().Add(-c.grace))
-	if err != nil {
-		return nil, err
-	}
-	if p.empty() {
-		return nil, nil
-	}
-	if reportOnly {
-		if err := c.brake(n, p, idx, cont); err != nil {
+	for range maxPlans {
+		m, err := c.mark(n, c.now().Add(-c.grace))
+		if err != nil {
 			return nil, err
 		}
-		objs := p.objects(n)
-		for _, o := range objs {
-			c.log.Info("registry gc: would reap", "repository", o.Repository, "kind", o.Kind, "name", o.Name, "reason", o.Reason)
+		if m.p.empty() {
+			return nil, nil
 		}
-		return objs, nil
+		if reportOnly {
+			if err := c.brake(n, m.p, m.idx, m.cont); err != nil {
+				return nil, err
+			}
+			objs := m.p.objects(n)
+			for _, o := range objs {
+				c.log.Info("registry gc: would reap", "repository", o.Repository, "kind", o.Kind, "name", o.Name, "reason", o.Reason)
+			}
+			return objs, nil
+		}
+		if c.afterMark != nil {
+			c.afterMark(n)
+		}
+		objs, err := c.sweepLocked(ctx, n, m)
+		if !errors.Is(err, errStale) {
+			return objs, err
+		}
+		c.log.Debug("registry gc: repository changed since it was read; planning it again", "repository", n.String())
 	}
-	if c.afterMark != nil {
-		c.afterMark(n)
+	return nil, fmt.Errorf("%w: planned %d times", ErrChanged, maxPlans)
+}
+
+// sweepLocked is the locked pass over m. It returns errStale, having deleted
+// nothing, when index.json's rows differ from the mark's or a manifest the
+// plan follows is not the one the mark read.
+func (c *Collector) sweepLocked(ctx context.Context, n ref.Name, m marked) ([]Object, error) {
+	want, err := store.IndexState(m.idx.Manifests)
+	if err != nil {
+		return nil, err
 	}
 	var objs []Object
 	err = c.s.WithLock(ctx, n, func(l *store.Locked) error {
@@ -229,15 +273,22 @@ func (c *Collector) sweepRepo(ctx context.Context, n ref.Name, reportOnly bool) 
 		if err != nil {
 			return err
 		}
+		got, err := store.IndexState(idx.Manifests)
+		if err != nil {
+			return err
+		}
+		if got != want {
+			return errStale
+		}
 		cont, err := l.Contents()
 		if err != nil {
 			return err
 		}
-		q, err := makePlan(idx, cont, cutoff, c.reader(n))
+		q, err := makePlan(idx, cont, cutoff, m.reads.locked(cont))
 		if err != nil {
 			return err
 		}
-		final := p.intersect(q)
+		final := m.p.intersect(q)
 		if err := c.brake(n, final, idx, cont); err != nil {
 			return err
 		}
@@ -247,18 +298,93 @@ func (c *Collector) sweepRepo(ctx context.Context, n ref.Name, reportOnly bool) 
 	return objs, err
 }
 
-// mark plans n's sweep from an unlocked snapshot.
-func (c *Collector) mark(n ref.Name, cutoff time.Time) (plan, ispec.Index, store.Contents, error) {
+// marked is one repository's unlocked mark: the plan, the snapshot it was
+// made from, and every manifest body it read.
+type marked struct {
+	p     plan
+	idx   ispec.Index
+	cont  store.Contents
+	reads reads
+}
+
+// mark plans n's sweep from an unlocked snapshot, reading, verifying and
+// parsing every manifest body the plan follows.
+func (c *Collector) mark(n ref.Name, cutoff time.Time) (marked, error) {
 	idx, err := c.s.Index(n)
 	if err != nil {
-		return plan{}, ispec.Index{}, store.Contents{}, err
+		return marked{}, err
 	}
 	cont, err := c.s.Contents(n)
 	if err != nil {
-		return plan{}, ispec.Index{}, store.Contents{}, err
+		return marked{}, err
 	}
-	p, err := makePlan(idx, cont, cutoff, c.reader(n))
-	return p, idx, cont, err
+	m := marked{idx: idx, cont: cont, reads: reads{}}
+	m.p, err = makePlan(idx, cont, cutoff, m.reads.unlocked(c.reader(n)))
+	return m, err
+}
+
+// manifestRead is what the mark found for one manifest digest: whether the
+// blob was there, its size, and what its body references (or why it could
+// not be read).
+type manifestRead struct {
+	present bool
+	size    int64
+	refs    refs
+	err     error
+}
+
+// reads holds a mark's manifest reads by digest.
+type reads map[digest.Digest]manifestRead
+
+// unlocked returns the mark's refsOf: it reads d with read, which verifies
+// the body against d, parses it, and remembers the result with the body's
+// size.
+func (r reads) unlocked(read func(digest.Digest) ([]byte, error)) func(digest.Digest) (refs, error) {
+	return func(d digest.Digest) (refs, error) {
+		if e, ok := r[d]; ok {
+			return e.refs, e.err
+		}
+		var e manifestRead
+		b, err := read(d)
+		switch {
+		case errors.Is(err, store.ErrBlobUnknown):
+			e.err = err
+		case err != nil:
+			e.present, e.err = true, err
+		default:
+			e.present = true
+			e.size = int64(len(b))
+			e.refs, e.err = parseRefs(d, b)
+		}
+		r[d] = e
+		return e.refs, e.err
+	}
+}
+
+// locked returns the locked pass's refsOf over the re-stated contents cont.
+// It reads nothing: it answers from the mark's read when the blob is still
+// there, or still absent, and has the size the mark read, and otherwise
+// returns errStale. A digest the mark never read is errStale too.
+//
+// A body is the content its digest names (the mark verified it, and the
+// store writes a blob only under the digest of its bytes), so a present blob
+// of the same size is the same body, and its references are the same.
+func (r reads) locked(cont store.Contents) func(digest.Digest) (refs, error) {
+	sizes := make(map[digest.Digest]int64, len(cont.Blobs))
+	for _, b := range cont.Blobs {
+		sizes[b.Digest] = b.Size
+	}
+	return func(d digest.Digest) (refs, error) {
+		e, ok := r[d]
+		if !ok {
+			return refs{}, errStale
+		}
+		size, present := sizes[d]
+		if present != e.present || (present && e.err == nil && size != e.size) {
+			return refs{}, errStale
+		}
+		return e.refs, e.err
+	}
 }
 
 // brake applies the half-repository rule to a plan over idx and cont: a plan
@@ -384,6 +510,9 @@ const (
 // against d and bounded by the manifest size cap.
 func (c *Collector) reader(n ref.Name) func(digest.Digest) ([]byte, error) {
 	return func(d digest.Digest) ([]byte, error) {
+		if c.onRead != nil {
+			c.onRead(n, d)
+		}
 		f, err := c.s.OpenBlob(n, d)
 		if err != nil {
 			return nil, err
@@ -549,8 +678,11 @@ func parseRefs(d digest.Digest, b []byte) (refs, error) {
 //   - the repository is empty when nothing would remain.
 //
 // A kept manifest whose body is missing (other than an index child, which the
-// spec does not require) or does not parse fails the plan.
-func makePlan(idx ispec.Index, cont store.Contents, cutoff time.Time, read func(digest.Digest) ([]byte, error)) (plan, error) {
+// spec does not require) or does not parse fails the plan. refsOf returns what
+// manifest d references: an error wrapping store.ErrBlobUnknown for a missing
+// body, ErrUnreadable for one that does not verify or parse, or errStale,
+// which fails the plan unwrapped.
+func makePlan(idx ispec.Index, cont store.Contents, cutoff time.Time, refsOf func(digest.Digest) (refs, error)) (plan, error) {
 	mtime := make(map[digest.Digest]time.Time, len(cont.Blobs))
 	for _, b := range cont.Blobs {
 		mtime[b.Digest] = b.ModTime
@@ -573,13 +705,9 @@ func makePlan(idx ispec.Index, cont store.Contents, cutoff time.Time, read func(
 			queue = append(queue, item{r.Digest, false})
 			continue
 		}
-		b, err := read(r.Digest)
+		m, err := refsOf(r.Digest)
 		if err != nil {
-			return plan{}, fmt.Errorf("%w: untagged %s: %v", ErrUnreadable, r.Digest, err)
-		}
-		m, err := parseRefs(r.Digest, b)
-		if err != nil {
-			return plan{}, err
+			return plan{}, planError("untagged "+r.Digest.String(), err)
 		}
 		if m.Subject != nil {
 			queue = append(queue, item{r.Digest, true})
@@ -598,16 +726,12 @@ func makePlan(idx ispec.Index, cont store.Contents, cutoff time.Time, read func(
 		}
 		kept[it.d] = true
 		referenced[it.d] = true
-		b, err := read(it.d)
+		m, err := refsOf(it.d)
 		if errors.Is(err, store.ErrBlobUnknown) && !it.required {
 			continue
 		}
 		if err != nil {
-			return plan{}, fmt.Errorf("%w: %s: %v", ErrUnreadable, it.d, err)
-		}
-		m, err := parseRefs(it.d, b)
-		if err != nil {
-			return plan{}, err
+			return plan{}, planError(it.d.String(), err)
 		}
 		if m.Config != nil {
 			referenced[m.Config.Digest] = true
@@ -651,7 +775,48 @@ func makePlan(idx ispec.Index, cont store.Contents, cutoff time.Time, read func(
 	return p, nil
 }
 
-func markerExists(p string) (bool, error) {
+// planError is the error a plan fails with when manifest what cannot be
+// followed: errStale and ErrUnreadable as they are, anything else as
+// ErrUnreadable.
+func planError(what string, err error) error {
+	if errors.Is(err, errStale) || errors.Is(err, ErrUnreadable) {
+		return err
+	}
+	return fmt.Errorf("%w: %s: %v", ErrUnreadable, what, err)
+}
+
+// rootIdentity names the store root a marker was written for: the device
+// and inode of the root directory. The store keeps no random store id of its
+// own, so these are the identity. A root restored from a backup, copied, or
+// moved to another volume has a new one.
+type rootIdentity struct {
+	Dev uint64 `json:"dev"`
+	Ino uint64 `json:"ino"`
+}
+
+// markerRecord is the marker's content.
+type markerRecord struct {
+	Ran  string       `json:"ran"`
+	Root rootIdentity `json:"root"`
+}
+
+// maxMarkerSize bounds the marker read.
+const maxMarkerSize = 4096
+
+// storeIdentity returns s's root identity.
+func storeIdentity(s *store.Store) (rootIdentity, error) {
+	var st unix.Stat_t
+	if err := unix.Lstat(s.Root(), &st); err != nil {
+		return rootIdentity{}, fmt.Errorf("gc: stat store root: %w", err)
+	}
+	return rootIdentity{Dev: uint64(st.Dev), Ino: st.Ino}, nil
+}
+
+// markerMatches reports whether the marker at p records a report-only sweep
+// over the store with root identity id. A missing marker, or one written for
+// another root or in an older form, does not match: the sweep reports only
+// and writes it again.
+func (c *Collector) markerMatches(p string, id rootIdentity) (bool, error) {
 	fi, err := os.Lstat(p)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
@@ -662,16 +827,47 @@ func markerExists(p string) (bool, error) {
 	if !fi.Mode().IsRegular() {
 		return false, fmt.Errorf("gc marker %s is not a regular file", p)
 	}
+	f, err := os.OpenFile(p, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return false, fmt.Errorf("gc marker: %w", err)
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, maxMarkerSize+1))
+	if err != nil {
+		return false, fmt.Errorf("gc marker: %w", err)
+	}
+	var m markerRecord
+	if len(b) > maxMarkerSize || json.Unmarshal(b, &m) != nil || m.Root != id {
+		c.log.Warn("registry gc: the gc-ran marker was not written for this store root; the next sweep only reports",
+			"marker", p, "root", c.s.Root())
+		return false, nil
+	}
 	return true, nil
 }
 
-// writeMarker records that a report-only sweep ran, durably.
-func writeMarker(p string, now time.Time) error {
+// WriteMarker records that a report-only sweep ran over s, as the first
+// sweep does, so the next sweep over s deletes. It binds the record to s's
+// root; a copy of the store at another root sweeps report-only again.
+func WriteMarker(s *store.Store, now time.Time) error {
+	id, err := storeIdentity(s)
+	if err != nil {
+		return err
+	}
+	return writeMarker(filepath.Join(s.StateDir(), MarkerName), now, id)
+}
+
+// writeMarker records, durably, that a report-only sweep ran over the store
+// with root identity id.
+func writeMarker(p string, now time.Time, id rootIdentity) error {
+	b, err := json.Marshal(markerRecord{Ran: now.UTC().Format(time.RFC3339), Root: id})
+	if err != nil {
+		return fmt.Errorf("write gc marker: %w", err)
+	}
 	f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
 	if err != nil {
 		return fmt.Errorf("write gc marker: %w", err)
 	}
-	_, werr := f.WriteString(now.UTC().Format(time.RFC3339) + "\n")
+	_, werr := f.Write(append(b, '\n'))
 	if werr == nil {
 		werr = f.Sync()
 	}
