@@ -319,6 +319,18 @@ func TestDistributionAPI(t *testing.T) {
 			t.Errorf("WWW-Authenticate %q", w.Header().Get("WWW-Authenticate"))
 		}
 	})
+	t.Run("an anonymous manifest read of an invalid tag is 401, not 404", func(t *testing.T) {
+		f := newFixture(t, func(c *Config) {
+			c.Authorize = func(*http.Request, Verb, ref.Name) error { return ErrUnauthenticated }
+		})
+		for _, m := range []string{http.MethodGet, http.MethodHead} {
+			w := f.do(m, "/v2/app/manifests/.INVALID_MANIFEST_NAME", nil)
+			if w.Code != http.StatusUnauthorized {
+				t.Errorf("%s = %d, want 401 (%s)", m, w.Code, w.Body.String())
+			}
+		}
+		want(t, f.do(http.MethodGet, "/v2/app/manifests/-bad", nil), http.StatusUnauthorized, codeUnauthorized)
+	})
 	t.Run("delete/a blob DELETE is left to garbage collection", func(t *testing.T) {
 		f := newFixture(t)
 		d := f.pushBlob(t, "app", []byte("b"))

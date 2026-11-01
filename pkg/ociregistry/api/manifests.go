@@ -83,17 +83,18 @@ func parseReference(r *http.Request) (ref.Reference, error) {
 // stored, so a read of one is answered 404 MANIFEST_UNKNOWN, as the OCI
 // distribution-spec conformance suite requires and the registry this replaces
 // answers. It is still refused before the store is touched, and a malformed
-// digest stays 400 DIGEST_INVALID.
+// digest stays 400 DIGEST_INVALID. Authorization comes first, so a caller
+// who may not read the repository learns nothing about the reference.
 func (s *Server) getManifest(w http.ResponseWriter, r *http.Request, n ref.Name) {
+	if !s.allow(w, r, VerbRead, n) {
+		return
+	}
 	rf, err := parseReference(r)
 	if errors.Is(err, ref.ErrInvalidTag) {
 		err = &apiError{status: http.StatusNotFound, code: codeManifestUnknown, msg: "manifest unknown", cause: err}
 	}
 	if err != nil {
 		s.fail(w, r, err)
-		return
-	}
-	if !s.allow(w, r, VerbRead, n) {
 		return
 	}
 	desc, body, err := s.st.Manifest(n, rf)

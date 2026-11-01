@@ -19,7 +19,8 @@
 #                       run all four areas (pull, push, content discovery,
 #                       content management) against a fresh server and write
 #                       the suite's junit.xml into <report-dir>. No network:
-#                       both processes run under a loopback-only sandbox.
+#                       both processes run under a loopback-only sandbox (see
+#                       confine below for what is proved before they start).
 #   regen               rewrite go.mod.txt and go.sum.txt from PIN with
 #                       `go mod tidy`; then run hack/verify-deps.sh --update.
 #
@@ -29,8 +30,11 @@
 # environment from a python3 execve (never on a command line). The k3sm-gate
 # principal gets a secret the server mints and never writes. Both processes
 # start with an empty environment apart from the variables named below. The
-# run directory (secret and store) is removed on every exit, and the report is
-# refused if it carries the secret.
+# run directory (secret and store) is removed on every exit, and stale run
+# directories older than an hour are swept at the start of a run. Before any
+# log is printed or copied to the report dir it is scanned for the secret, for
+# base64("k3sm:<secret>") (the Basic credential) and for any Authorization
+# header; a hit refuses the run and keeps nothing.
 #
 # Exit status: 0 pass; 1 failure; 2 usage.
 set -euo pipefail
@@ -117,31 +121,109 @@ regen() {
 }
 
 # The sandbox both processes of a run share: everything but the network,
-# which is loopback only.
+# which is loopback only. The mDNSResponder socket is denied too: the resolver
+# would otherwise carry a name lookup, and the data in it, off the host.
 SANDBOX_PROFILE='(version 1)
 (allow default)
 (deny network*)
 (allow network-bind (local ip "localhost:*"))
 (allow network-inbound (local ip "localhost:*"))
 (allow network-outbound (remote ip "localhost:*"))
-(allow network-outbound (remote unix-socket))'
+(allow network-outbound (remote unix-socket))
+(deny network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))'
 
-# confine: print the command prefix that keeps a process off the network. A
-# process already inside a sandbox cannot apply a second one (macOS refuses a
-# nested sandbox-exec); then the enclosing sandbox must deny the network
-# itself. Either way a connect to a public address has to fail first.
-confine() {
-	if sandbox-exec -p '(version 1)(allow default)' /usr/bin/true 2>/dev/null; then
-		# The profile itself is proven: a connect to a public address under it
-		# has to fail.
-		! sandbox-exec -p "$SANDBOX_PROFILE" /usr/bin/nc -z -G 3 -w 3 1.1.1.1 443 >/dev/null 2>&1 ||
-			die "the loopback-only sandbox let a connect to a public address through"
-		echo sandbox
-		return 0
+# probe_tcp <host> <port> [<prefix>...]: connect once under prefix and print
+# the verdict. "denied" is a connect the sandbox refused (EPERM); "reached" is
+# one that got an answer, a refusal from the peer included; "unreachable" is
+# any other failure (no route, a timeout), which proves an offline host, not a
+# confined one.
+probe_tcp() {
+	local host="$1" port="$2" out
+	shift 2
+	if out="$("$@" /usr/bin/nc -v -z -G 3 -w 3 "$host" "$port" 2>&1)"; then
+		echo reached
+	elif grep -q 'Operation not permitted' <<<"$out"; then
+		echo denied
+	elif grep -q 'Connection refused' <<<"$out"; then
+		echo reached
+	else
+		echo unreachable
 	fi
-	! /usr/bin/nc -z -G 3 -w 3 1.1.1.1 443 >/dev/null 2>&1 ||
-		die "cannot apply the loopback-only sandbox, and the network is reachable from here"
-	echo inherited
+}
+
+# probe_dns [<prefix>...]: resolve a public name under prefix through the
+# system resolver, the path a cgo or Python process takes. A resolver failure
+# cannot say whether it was denied or offline, so it reads "failed".
+probe_dns() {
+	if "$@" /usr/bin/python3 -I -c 'import socket; socket.getaddrinfo("example.com", 443)' >/dev/null 2>&1; then
+		echo reached
+	else
+		echo failed
+	fi
+}
+
+# lan_target: the default gateway, the LAN address a host can always route
+# to, or a private address when there is no default route.
+lan_target() {
+	local gw
+	gw="$(route -n get default 2>/dev/null | awk '$1 == "gateway:" {print $2; exit}')"
+	if [[ "$gw" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+		echo "$gw"
+	else
+		echo 192.168.0.1
+	fi
+}
+
+# confine: print the confinement mode, after proving it. With a usable
+# sandbox-exec the mode is "sandbox": the loopback-only profile is applied to
+# both processes, and the probes below run under it. A process already inside
+# a sandbox cannot apply a second one (macOS refuses a nested sandbox-exec);
+# then the mode is "inherited", and the run goes ahead only when the enclosing
+# sandbox is proved to deny the network: every TCP probe (two public addresses
+# and the LAN gateway) must be refused by a sandbox (EPERM), and the DNS lookup
+# must fail. A probe that fails only as unreachable is refused, because an
+# offline host is not a confined one and the network can come back mid-run.
+confine() {
+	local mode prefix=() lan t v dns why=""
+	if sandbox-exec -p '(version 1)(allow default)' /usr/bin/true 2>/dev/null; then
+		mode=sandbox
+		prefix=(sandbox-exec -p "$SANDBOX_PROFILE")
+	else
+		mode=inherited
+	fi
+	lan="$(lan_target)"
+	for t in "1.1.1.1 443" "8.8.8.8 53" "$lan 80"; do
+		# shellcheck disable=SC2086 # t is "<host> <port>"
+		v="$(probe_tcp ${t% *} ${t#* } ${prefix[@]+"${prefix[@]}"})"
+		case "$v" in
+		denied) ;;
+		reached) why="$why ${t/ /:} was reached;" ;;
+		*) why="$why ${t/ /:} was unreachable, not sandbox-denied;" ;;
+		esac
+	done
+	dns="$(probe_dns ${prefix[@]+"${prefix[@]}"})"
+	[ "$dns" = failed ] || why="$why a DNS lookup of example.com resolved;"
+	if [ -n "$why" ]; then
+		if [ "$mode" = sandbox ]; then
+			die "the loopback-only sandbox is not proved network-denied:$why"
+		fi
+		die "cannot apply the loopback-only sandbox (sandbox-exec cannot nest here), and the enclosing sandbox is not proved network-denied:$why run outside the enclosing sandbox, or inside one that denies the network"
+	fi
+	echo "$mode"
+}
+
+# leak_scan <rd> <file>...: refuse when any file carries the run credential,
+# its Basic form, or an Authorization header. The patterns are read from the
+# 0600 files in the run dir, never from a command line.
+leak_scan() {
+	local rd="$1" f
+	shift
+	for f in "$@"; do
+		[ -e "$f" ] || continue
+		if grep -qF -f "$rd/secret" "$f" || grep -qF -f "$rd/basic" "$f" || grep -qiE 'authorization:' "$f"; then
+			die "the run's output carries the run credential or an Authorization header; refusing to keep it"
+		fi
+	done
 }
 
 # launch <mode> <env-json> <secret-env-name|-> <secret-file|-> <cmd...>: exec
@@ -177,6 +259,9 @@ run() {
 	mode="$(confine)"
 	echo "==> [ociconformance] network confinement: $mode"
 	mkdir -p "$OUT_ROOT"
+	# Sweep run directories a killed run left behind (a SIGKILL skips the
+	# trap). An hour is far past a run's length, so a live run is never hit.
+	find "$OUT_ROOT" -mindepth 1 -maxdepth 1 -type d -name 'run.*' -mmin +60 -exec rm -rf {} + 2>/dev/null || true
 	local rd
 	rd="$(mktemp -d "$OUT_ROOT/run.XXXXXX")"
 	chmod 700 "$rd"
@@ -185,13 +270,20 @@ run() {
 	trap "[ -z \"\$SERVE_PID\" ] || kill \"\$SERVE_PID\" 2>/dev/null || true; wait 2>/dev/null || true; rm -rf '$rd'" EXIT
 	(umask 077 && head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' >"$rd/secret")
 	[ "$(wc -c <"$rd/secret" | tr -d ' ')" = 64 ] || die "could not mint the run credential"
+	# The Basic credential the suite sends, for the leak scan.
+	(umask 077 && { printf 'k3sm:'; cat "$rd/secret"; } | base64 | tr -d '\n' >"$rd/basic")
+	[ -s "$rd/basic" ] || die "could not encode the run credential"
 	mkdir -p "$rd/work" "$rd/report"
 	launch "$mode" '{}' - - "$bin/serve" -work-dir "$rd/work" -secret-file "$rd/secret" -addr-file "$rd/addr" 2>"$rd/serve.log" &
 	SERVE_PID=$!
 	local i
 	for i in $(seq 300); do
 		[ ! -s "$rd/addr" ] || break
-		kill -0 "$SERVE_PID" 2>/dev/null || { cat "$rd/serve.log" >&2; die "the registry server exited"; }
+		kill -0 "$SERVE_PID" 2>/dev/null || {
+			leak_scan "$rd" "$rd/serve.log"
+			cat "$rd/serve.log" >&2
+			die "the registry server exited"
+		}
 		sleep 0.1
 	done
 	[ -s "$rd/addr" ] || die "the registry server did not report its address"
@@ -218,10 +310,8 @@ run() {
 	kill "$SERVE_PID" 2>/dev/null || true
 	wait "$SERVE_PID" 2>/dev/null || true
 	SERVE_PID=""
+	leak_scan "$rd" "$rd/report/junit.xml" "$rd/suite.log" "$rd/serve.log"
 	[ -s "$rd/report/junit.xml" ] || { tail -40 "$rd/suite.log" >&2; die "the suite wrote no junit.xml (exit $rc)"; }
-	if grep -qF -f "$rd/secret" "$rd/report/junit.xml" "$rd/suite.log" "$rd/serve.log"; then
-		die "the run's output carries the run credential; refusing to keep it"
-	fi
 	cp "$rd/report/junit.xml" "$report/junit.xml"
 	cp "$rd/suite.log" "$report/suite.log"
 	cp "$rd/serve.log" "$report/serve.log"
