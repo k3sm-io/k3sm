@@ -304,7 +304,7 @@ pushed ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.3
   pin:    ghcr.io/k3sm-io/mlx-serve@sha256:…
 ```
 
-The tag is the engine version, with a `-k3sm.N` suffix when k3sm rebuilds the same engine with changes of its own (the context-length guard is `0.5.0-k3sm.1`; the attention-sink mask fix and the guard on `/v1/messages` and `/v1/responses` are `0.5.0-k3sm.2`; mlx and mlx-metal 0.32.4, staged with uv 0.13.1, and the sharded entrypoint's `--served-model-name` are `0.5.0-k3sm.3`), so a tag never changes what it names.
+The tag is the engine version, with a `-k3sm.N` suffix when k3sm rebuilds the same engine with changes of its own (the context-length guard is `0.5.0-k3sm.1`; the attention-sink mask fix and the guard on `/v1/messages` and `/v1/responses` are `0.5.0-k3sm.2`; mlx and mlx-metal 0.32.4, staged with uv 0.13.1 on the python-build-standalone 20260929 build of CPython 3.12.14 (was 20260825), and the sharded entrypoint's `--served-model-name` are `0.5.0-k3sm.3`), so a tag never changes what it names.
 
 Record that pin. The operator resolves the image **by digest**; the tag is
 display-only and the next push moves it.

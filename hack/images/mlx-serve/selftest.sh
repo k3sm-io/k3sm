@@ -28,6 +28,8 @@
 #     against a fake engine module, and refuses to start when a hook it
 #     relies on is missing or reshaped (and, with a staged tree, finds every
 #     hook on the pinned mlx_lm.server);
+#   * run as the pod command, the entrypoint exits with the status the engine's
+#     main() returns, and SIGTERM reaches the engine, against a fake engine;
 #   * the k3sm-serve context guard refuses a request longer than the engine's
 #     window with vLLM's HTTP 400 and passes one inside it, against fakes and,
 #     when a staged tree is present, against the real vllm-mlx server, on the
@@ -403,7 +405,7 @@ import http.server, json, os, socket, sys, threading
 sys.path.insert(0, sys.argv[1])
 import k3sm_shard as ks
 
-work = sys.argv[2]
+here, work = sys.argv[1], sys.argv[2]  # serve() below rewrites sys.argv
 podvol = os.path.join(work, "podvol")
 os.makedirs(podvol)
 names = ["m-rank-0.m-headless.ns.svc", "m-rank-1.m-headless.ns.svc", "m-rank-2.m-headless.ns.svc"]
@@ -631,6 +633,56 @@ check("serve.env  the engine is imported after MLX_HOSTFILE is set", seen["name"
 check("serve.argv  main() sees the plan's argv, --pipeline kept, --served-model-name gone",
       seen["eng"].rec["argv"] == ["mlx_lm.server", "--host", "0.0.0.0", "--port", "8000", "--pipeline", "--model", "/snap"])
 
+# the rank's exit is the engine's: run k3sm_shard as the pod command does,
+# against a fake mlx_lm.server package, and read the process's own status
+import signal, subprocess, time
+fakepkg = os.path.join(work, "fake-engine")
+os.makedirs(os.path.join(fakepkg, "mlx_lm"))
+open(os.path.join(fakepkg, "mlx_lm", "__init__.py"), "w").close()
+with open(os.path.join(fakepkg, "mlx_lm", "server.py"), "w") as f:
+    f.write(
+        "import os, signal, sys, time\n"
+        "ModelProvider = APIHandler = run = None\n"
+        "class Stop(Exception):\n"
+        "    pass\n"
+        "def _stop(signum, frame):\n"
+        "    raise Stop(signum)\n"
+        "def main():\n"
+        "    mode = os.environ['FAKE_ENGINE_MODE']\n"
+        "    if mode == 'fail':\n"
+        "        return 3\n"
+        "    signal.signal(signal.SIGTERM, _stop)\n"
+        "    open(os.environ['FAKE_ENGINE_READY'], 'w').close()\n"
+        "    try:\n"
+        "        time.sleep(30)\n"
+        "    except Stop as e:\n"
+        "        with open(os.environ['FAKE_ENGINE_GOT'], 'w') as g:\n"
+        "            g.write(str(e.args[0]))\n"
+        "        return 128 + e.args[0]\n"
+        "    return 0\n")
+def rank_proc(mode):
+    e = env(MLX_WORLD_SIZE="1", MLX_RANK="0", K3SM_MLX_RANKS=names[0], K3SM_POD_IP="10.42.0.5")
+    e.update(PYTHONPATH=os.pathsep.join([here, fakepkg]), PYTHONDONTWRITEBYTECODE="1", FAKE_ENGINE_MODE=mode,
+             FAKE_ENGINE_READY=os.path.join(work, "engine-ready"), FAKE_ENGINE_GOT=os.path.join(work, "engine-got"),
+             PATH=os.environ.get("PATH", ""))
+    return subprocess.Popen([sys.executable, "-m", "k3sm_shard", "--model", "/snap"], env=e,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL), e
+p, _ = rank_proc("fail")
+check("exit.status  an engine main() returning 3 makes the rank exit 3", p.wait(timeout=30) == 3)
+p, e = rank_proc("term")
+deadline = time.monotonic() + 30
+while not os.path.exists(e["FAKE_ENGINE_READY"]) and p.poll() is None and time.monotonic() < deadline:
+    time.sleep(0.05)
+p.send_signal(signal.SIGTERM)
+try:
+    rc = p.wait(timeout=30)
+except subprocess.TimeoutExpired:
+    p.kill()
+    rc = p.wait()
+got = open(e["FAKE_ENGINE_GOT"]).read() if os.path.exists(e["FAKE_ENGINE_GOT"]) else ""
+check("exit.sigterm  SIGTERM to the rank reaches the engine, and its shutdown status is the rank's",
+      got == str(int(signal.SIGTERM)) and rc == 128 + signal.SIGTERM)
+
 # the liveness probe against a local server
 class H(http.server.BaseHTTPRequestHandler):
     code = 200
@@ -669,10 +721,10 @@ while read -r verdict name; do
 	esac
 done <<< "$shard_out"
 # A driver that crashed before its checks would otherwise pass vacuously.
-if [ "$SHARD_CHECKS" -ge 34 ]; then
+if [ "$SHARD_CHECKS" -ge 36 ]; then
 	ladder ok "7.count  all $SHARD_CHECKS entrypoint checks reported"
 else
-	ladder no "7.count  only $SHARD_CHECKS of 34 entrypoint checks reported (the driver crashed?)"
+	ladder no "7.count  only $SHARD_CHECKS of 36 entrypoint checks reported (the driver crashed?)"
 	head -20 "$WORK/shard-driver.err"
 fi
 

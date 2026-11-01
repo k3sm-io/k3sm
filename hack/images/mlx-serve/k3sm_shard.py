@@ -30,6 +30,12 @@ It does DNS resolution, then runs the engine in this process:
      --port <serve port>, --pipeline for pipeline parallelism, and its own
      arguments passed through last, minus --served-model-name.
 
+The engine runs in the process the pod started, so it is the pod command as
+an exec would have made it: SIGTERM and SIGINT are delivered to it directly
+(this module installs no handler of its own), a SystemExit or an uncaught
+exception from it ends the process as it would end the engine, and the value
+its main() returns is the process's exit status (None is 0).
+
 mlx_lm.server has no --served-model-name: it names a model by its --model
 value, so a pinned model (whose --model is the snapshot path in the cache
 volume) would list that path on /v1/models, and a request naming the model's
@@ -453,6 +459,16 @@ def serve(child_env, child_argv, served, importer=importlib.import_module):
     return server.main()
 
 
+def exit_status(result):
+    """The process status for what the engine's main() returned, as sys.exit reads it."""
+    if result is None:
+        return 0
+    if isinstance(result, int) and not isinstance(result, bool):
+        return result
+    print(f"k3sm-shard: {ENGINE_MODULE} main() returned {result!r}", file=sys.stderr, flush=True)
+    return 1
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     env = dict(os.environ)
@@ -465,11 +481,15 @@ def main(argv=None):
         print(f"k3sm-shard: rank {child_env['MLX_RANK']} of {child_env['MLX_WORLD_SIZE']}, "
               f"backend {env[ENV_BACKEND]}, {' '.join(child_argv[2:3])} serving as {served or 'its --model'}",
               file=sys.stderr, flush=True)
-        serve(child_env, child_argv, served)
     except ShardError as e:
         print(f"k3sm-shard: {e}", file=sys.stderr, flush=True)
         return 2
-    return 0
+    try:
+        result = serve(child_env, child_argv, served)
+    except ShardError as e:
+        print(f"k3sm-shard: {e}", file=sys.stderr, flush=True)
+        return 2
+    return exit_status(result)
 
 
 if __name__ == "__main__":
