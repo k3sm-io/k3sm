@@ -289,6 +289,25 @@ func (r *runtimedRuntime) shutdown() {
 	r.lifetimeOnce.Do(func() { close(r.lifetime) })
 }
 
+// Close releases the embedded runtime: it ends the provider's lifetime workers,
+// stops the runtime's pod supervision (every pod process keeps running) and
+// lets go of the runtime root's lock, so a later runtime on the same root can
+// start, as a restarted daemon does. Idempotent.
+//
+// The node does not call this: its exit path closes the same runtime through
+// ServableRuntime (cmd/k3sm), after it has stopped the eviction loop and
+// flushed the budget history, because both act through the runtime. Close is
+// for an owner that holds only the provider.
+func (r *runtimedRuntime) Close() error {
+	r.shutdown()
+	if c, ok := r.rt.(interface{ Close() error }); ok {
+		if err := c.Close(); err != nil {
+			return fmt.Errorf("close embedded runtime: %w", err)
+		}
+	}
+	return nil
+}
+
 // podTrack is the provider-side bookkeeping the runtime does not retain: a stable
 // StartTime (set once at CreatePod, never regenerated) and the last Pod object
 // (for namespace/name lookup and status reconstruction by pod id).
