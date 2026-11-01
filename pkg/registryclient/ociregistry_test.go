@@ -20,6 +20,7 @@ import (
 	"context"
 	"slices"
 	"testing"
+	"time"
 
 	"k3sm.io/k3sm/pkg/ociregistry/api"
 	"k3sm.io/k3sm/pkg/ociregistry/store"
@@ -44,7 +45,7 @@ func TestClientAgainstTheRegistryServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := api.New(api.Config{Store: st, Authorize: api.AllowAll, FreeSpace: func() (uint64, error) { return 1 << 40, nil }})
+	srv, err := api.New(api.Config{Store: st, GCGrace: time.Hour, Authorize: api.AllowAll, FreeSpace: func() (uint64, error) { return 1 << 40, nil }})
 	if err != nil {
 		t.Fatal(err)
 	}

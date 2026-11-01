@@ -59,20 +59,29 @@ limitations under the License.
 //     them.
 //
 // A HEAD is a read, anonymous where reads are, so the write it makes is
-// bounded. It touches only an object with less than half of the collector's
-// grace (Config.GCGrace) left; a younger one is answered from a stat, with no
-// repository lock and no write. A looped HEAD therefore keeps an untagged
-// object alive at most as a push would, one touch per half-grace, instead of
-// rewriting its mtime and queueing behind pushes and sweeps on every call. A
-// touch that fails for any reason other than the object being gone (a
-// read-only or degraded store) is logged and the HEAD answers 200: the read
-// succeeded, and the touch only protects a push that may follow. The trade is
+// bounded. It writes at most once per half of the collector's grace
+// (Config.GCGrace) per object, never on a manifest any tagged row names, and
+// takes the repository lock only to make that write; every other HEAD is
+// answered from a stat. This does not stop a caller from keeping an untagged
+// object alive: one HEAD just past every half-grace does it. Knowing the
+// digest is the capability, as it is for the blob HEAD and as a push of the
+// same content would be. A touch that fails for any reason other than the
+// object being gone (a read-only or degraded store, a client that gave up
+// waiting for the lock) is logged and the HEAD answers 200: the read
+// succeeded, and the touch only protects a push that may follow. The object
+// is then not touched again, and its lock not taken, for half the grace, and
+// the failure is logged once for that window; the server remembers at most
+// 4096 such objects, dropping the one whose window ends first. The trade is
 // that a client that HEADs an object and then waits longer than half the
 // grace before the PUT naming it, or HEADs on a store that cannot be written,
 // is not protected by that HEAD and can find the object reaped; a push that
 // fits in half the grace, the case the touch exists for, is protected as
-// before. GCGrace must be the grace the collector runs with: a smaller value
-// touches more often than needed, a larger one leaves that window wider.
+// before.
+//
+// GCGrace is required, as gc.Options.Grace is, and New refuses a server
+// without it. Whoever wires the server and the collector over one store must
+// pass both the same value: a smaller GCGrace touches more often than needed,
+// a larger one widens the window above in which a HEAD protects nothing.
 //
 // Limits, each a Config field with a default:
 //

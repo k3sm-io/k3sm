@@ -14,10 +14,18 @@
 #                                   no lock (the test holds it) and write
 #                                   nothing; a HEAD by digest of a tagged row
 #                                   writes nothing; an untagged row and a blob
-#                                   past the half-grace are touched; a HEAD
-#                                   answers 200 when the store's Futimes seam
-#                                   fails; an untagged child HEADed and then
+#                                   past the half-grace are touched; HEADs on
+#                                   a store whose Futimes seam fails answer
+#                                   200, take the lock once per object and log
+#                                   once; a HEAD that gives up waiting for the
+#                                   lock is suppressed the same way; New
+#                                   refuses a zero or negative grace; a digest
+#                                   with a tagged and an untagged row writes
+#                                   nothing; an untagged child HEADed and then
 #                                   named by an index PUT survives a sweep
+#   TestTouchFailsIsBounded         in pkg/ociregistry/api: the suppression
+#                                   map evicts the entry whose window ends
+#                                   first and forgets a closed window
 #
 # Usage: hack/acceptance/B1124.sh --check
 set -euo pipefail
@@ -29,11 +37,13 @@ K3SM_ROOT="$(cd "$HERE/../.." && pwd)"
 cd "$K3SM_ROOT"
 export CGO_ENABLED=1
 test=TestManifestHeadTouchIsBounded
-out="$(go test -race -count=1 -v -run "^${test}\$" ./pkg/ociregistry/api/ 2>&1)" || {
-	printf '%s\n' "$out"; echo "B1124: FAIL: $test"; exit 1; }
+out="$(go test -race -count=1 -v -run "^(${test}|TestTouchFailsIsBounded)\$" ./pkg/ociregistry/api/ 2>&1)" || {
+	printf '%s\n' "$out"; echo "B1124: FAIL: named tests"; exit 1; }
 printf '%s\n' "$out" | grep -E '^(--- |    --- |ok|PASS)'
 # A test that does not run is not a pass, and every case must run.
-printf '%s\n' "$out" | grep -q -- "^--- PASS: $test " || { echo "B1124: FAIL: $test did not run"; exit 1; }
+for t in "$test" TestTouchFailsIsBounded; do
+	printf '%s\n' "$out" | grep -q -- "^--- PASS: $t " || { echo "B1124: FAIL: $t did not run"; exit 1; }
+done
 n="$(printf '%s\n' "$out" | grep -c -- "^    --- PASS: $test/" || true)"
-[ "$n" -eq 5 ] || { echo "B1124: FAIL: $test ran $n cases, want 5"; exit 1; }
+[ "$n" -eq 8 ] || { echo "B1124: FAIL: $test ran $n cases, want 8"; exit 1; }
 echo "B1124: PASS"

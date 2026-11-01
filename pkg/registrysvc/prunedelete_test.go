@@ -72,7 +72,7 @@ func TestPruneDeleteIsConditionalOnPlannedState(t *testing.T) {
 	}
 	server := func(t *testing.T, st *store.Store) handlerTransport {
 		t.Helper()
-		srv, err := api.New(api.Config{Store: st, Authorize: api.AllowAll, FreeSpace: func() (uint64, error) { return 1 << 40, nil }})
+		srv, err := api.New(api.Config{Store: st, GCGrace: time.Hour, Authorize: api.AllowAll, FreeSpace: func() (uint64, error) { return 1 << 40, nil }})
 		if err != nil {
 			t.Fatal(err)
 		}

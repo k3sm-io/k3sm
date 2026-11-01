@@ -44,10 +44,6 @@ const (
 	// unused before it stops counting against MaxSessions; it matches the
 	// garbage collector's grace for idle uploads.
 	DefaultSessionIdle = time.Hour
-	// DefaultGCGrace is the garbage collector's grace the server assumes when
-	// Config.GCGrace is zero. The collector (pkg/ociregistry/gc) has no
-	// default of its own: whoever schedules it passes the same value to both.
-	DefaultGCGrace = time.Hour
 	// DefaultBodyIdle is the longest a request body may go without a byte.
 	DefaultBodyIdle = 2 * time.Minute
 	// DefaultBodyWindow and DefaultBodyMinBytes are the minimum progress of a
@@ -123,8 +119,8 @@ type Authorizer func(r *http.Request, verb Verb, n ref.Name) error
 // passing it.
 func AllowAll(*http.Request, Verb, ref.Name) error { return nil }
 
-// Config configures a Server. Store and Authorize are required; every other
-// field has a default.
+// Config configures a Server. Store, Authorize and GCGrace are required;
+// every other field has a default.
 type Config struct {
 	// Store is the on-disk store the server serves.
 	Store *store.Store
@@ -169,8 +165,9 @@ type Config struct {
 	ResponseTimeout time.Duration
 	MinWriteRate    int64
 	// GCGrace is the grace of the garbage collector that sweeps Store, the
-	// value it is given as gc.Options.Grace (DefaultGCGrace when zero). A
-	// HEAD restarts an object's grace only when less than half of it is left.
+	// value it is given as gc.Options.Grace. It is required, as that is: New
+	// refuses a zero or negative value rather than guess one. A HEAD restarts
+	// an object's grace only when less than half of it is left.
 	GCGrace time.Duration
 	// Now is the clock (time.Now when nil).
 	Now func() time.Time
@@ -193,6 +190,7 @@ type Server struct {
 	minWriteRate  int64
 	spaceEvery    int64
 	gcGrace       time.Duration
+	touchFails    *touchFails
 	now           func() time.Time
 	sessions      *sessions
 	router        *mux.Router
@@ -218,6 +216,9 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Authorize == nil {
 		return nil, errors.New("registry api: no authorizer (pass AllowAll for an open registry)")
 	}
+	if cfg.GCGrace <= 0 {
+		return nil, fmt.Errorf("registry api: gc grace %s must be positive (the collector's gc.Options.Grace)", cfg.GCGrace)
+	}
 	s := &Server{
 		st:            cfg.Store,
 		log:           logger(cfg.Logger),
@@ -232,7 +233,8 @@ func New(cfg Config) (*Server, error) {
 		respTimeout:   positive(cfg.ResponseTimeout, DefaultResponseTimeout),
 		minWriteRate:  positive(cfg.MinWriteRate, DefaultMinWriteRate),
 		spaceEvery:    spaceCheckEvery,
-		gcGrace:       positive(cfg.GCGrace, DefaultGCGrace),
+		gcGrace:       cfg.GCGrace,
+		touchFails:    newTouchFails(maxTouchFails),
 		setWriteDeadline: func(w http.ResponseWriter, t time.Time) {
 			_ = http.NewResponseController(w).SetWriteDeadline(t) // ErrNotSupported off a real connection
 		},
