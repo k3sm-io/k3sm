@@ -162,6 +162,11 @@ func joinReasons(reasons []KeepReason) string {
 // does. It is the seam PodVersions reads the tree through.
 type EvalSymlinks func(path string) (string, error)
 
+// ListNames returns the names of the entries directly inside dir, as the
+// names of os.ReadDir do. It is the seam PodVersions lists the versions
+// directory through.
+type ListNames func(dir string) ([]string, error)
+
 // PodVersions returns, sorted and without duplicates, the versions the given
 // pod paths name: each path a running pod was started with (a DYLD shim, the
 // shadow directory) that lies inside root/versions/<ver>/ with a valid <ver>
@@ -176,20 +181,34 @@ type EvalSymlinks func(path string) (string, error)
 // spelling names the same directory; on a case-sensitive volume this can only
 // keep more, never less.
 //
+// A version is returned under the name the versions directory holds it by,
+// read with list, never under the pod path's own spelling: Retained.Reasons
+// and PlanPrune compare names exactly, so a pod path spelled 0.3.0-RC1 must
+// keep the directory 0.3.0-rc1. Every valid name that matches without regard
+// to case is returned, so a case-sensitive volume holding both spellings keeps
+// both.
+//
 // A path that cannot be resolved is never silently dropped: the versions of
 // every other path are still returned, and the error joins one
 // ErrUnresolvedPodPath per such path (or one for the versions directory, in
-// which case no path is checked). The caller must not prune when the error is
-// non-nil, since an unresolved path may name any version. The node passes the
-// paths of its running pods and reports the result as Retained.InUse.
-func (l Layout) PodVersions(paths []string, eval EvalSymlinks) ([]string, error) {
+// which case no path is checked). A path whose version has no directory in the
+// listing is unresolved too, and so is every in-use path when the listing
+// fails. The caller must not prune when the error is non-nil, since an
+// unresolved path may name any version. The node passes the paths of its
+// running pods and reports the result as Retained.InUse.
+func (l Layout) PodVersions(paths []string, eval EvalSymlinks, list ListNames) ([]string, error) {
 	dir, err := eval(l.VersionsDir())
 	if err != nil {
 		return nil, fmt.Errorf("resolve %s: %w: %w", l.VersionsDir(), ErrUnresolvedPodPath, err)
 	}
 	prefix := filepath.Clean(dir) + string(filepath.Separator)
-	var out []string
-	var errs []error
+	var (
+		out     []string
+		errs    []error
+		names   []string
+		listed  bool
+		listErr error
+	)
 	for _, p := range paths {
 		if !filepath.IsAbs(p) {
 			continue
@@ -204,8 +223,26 @@ func (l Layout) PodVersions(paths []string, eval EvalSymlinks) ([]string, error)
 			continue
 		}
 		ver, _, _ := strings.Cut(resolved[len(prefix):], string(filepath.Separator))
-		if ValidateVersion(ver) == nil {
-			out = append(out, ver)
+		if ValidateVersion(ver) != nil {
+			continue
+		}
+		if !listed {
+			names, listErr = list(dir)
+			listed = true
+		}
+		if listErr != nil {
+			errs = append(errs, fmt.Errorf("list %s for %s: %w: %w", dir, p, ErrUnresolvedPodPath, listErr))
+			continue
+		}
+		matched := false
+		for _, name := range names {
+			if strings.EqualFold(name, ver) && ValidateVersion(name) == nil {
+				out = append(out, name)
+				matched = true
+			}
+		}
+		if !matched {
+			errs = append(errs, fmt.Errorf("resolve %s: version %s has no directory in %s: %w", p, ver, dir, ErrUnresolvedPodPath))
 		}
 	}
 	slices.Sort(out)

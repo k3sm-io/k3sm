@@ -476,18 +476,24 @@ func dropInvalidEntries(st *historyState, log *slog.Logger) {
 	}
 }
 
+// historyReasons are the reasons recordLocked counts, each into its own
+// historyTotals field: the one list validHistoryEvent accepts a stored ring
+// entry's reason from, so a reason the recorder gains is never dropped as
+// invalid when the history is read back.
+var historyReasons = []budgetv1alpha1.CounterReason{
+	budgetv1alpha1.CounterEviction,
+	budgetv1alpha1.CounterOOMKill,
+	budgetv1alpha1.CounterKernelKill,
+	budgetv1alpha1.CounterRestart,
+	budgetv1alpha1.CounterMemHigh,
+	budgetv1alpha1.CounterTier1Refused,
+}
+
 // validHistoryEvent reports whether e is a ring entry this build records: a
-// known band, one of the reasons recordLocked counts, and a positive time.
+// known band, one of the reasons recordLocked counts (historyReasons), and a
+// positive time.
 func validHistoryEvent(e historyEvent) bool {
-	if !e.Band.Valid() || e.At <= 0 {
-		return false
-	}
-	switch e.Reason {
-	case budgetv1alpha1.CounterEviction, budgetv1alpha1.CounterOOMKill, budgetv1alpha1.CounterKernelKill,
-		budgetv1alpha1.CounterRestart, budgetv1alpha1.CounterMemHigh, budgetv1alpha1.CounterTier1Refused:
-		return true
-	}
-	return false
+	return e.Band.Valid() && e.At > 0 && slices.Contains(historyReasons, e.Reason)
 }
 
 // validKillIntent reports whether in names a pod, and a container or none (a
@@ -752,6 +758,7 @@ func (h *BudgetHistory) flush(bound time.Duration) bool {
 }
 
 // recordLocked counts one event of reason for band: the total and the ring.
+// Every reason it counts is in historyReasons, which a test pins.
 // pod (empty for none) is held to budgetHistoryRingPerPod entries of the last
 // 24 h; the totals count every event.
 func (h *BudgetHistory) recordLocked(pod types.UID, band budgetv1alpha1.Band, reason budgetv1alpha1.CounterReason, now time.Time) {

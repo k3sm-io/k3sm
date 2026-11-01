@@ -85,6 +85,10 @@ pin, its date, and the tarball's sha256.
 
 ### Fixed
 
+- A k3sm version directory a running pod uses is kept even when the pod's path spells the
+  version's pre-release in a different case from the directory (`0.3.0-RC1` against
+  `0.3.0-rc1` on a case-insensitive volume). A pod path whose version has no directory is
+  reported as unresolved, so nothing is pruned on its account.
 - `k3sm uninstall` stops a vm pod helper still running from an older k3sm version whose
   directory is kept for it, as it stops every other helper, instead of reporting it as a
   leftover to kill by hand. Only a helper whose version directory is gone is still reported.

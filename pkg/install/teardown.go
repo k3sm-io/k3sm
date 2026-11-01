@@ -637,18 +637,27 @@ func retainedVersion(sys System, tree layout.Layout, ver string, podPaths []stri
 	)
 	if v, err := tree.ResolveActive(sys.Readlink); err == nil {
 		r.Current = v
-		// Each resolve failure is classified at the seam, where its cause is
-		// still the only error: a path that is gone names no version, any
-		// other failure leaves the version it may name unknown.
+		// Each resolve or listing failure is classified at its seam, where its
+		// cause is still the only error: a path that is gone names no version,
+		// any other failure leaves the version it may name unknown.
 		var unreadable bool
-		eval := func(path string) (string, error) {
-			resolved, err := sys.ResolvePath(path)
+		classify := func(err error) {
 			if err != nil && !errors.Is(err, fs.ErrNotExist) {
 				unreadable = true
 			}
+		}
+		eval := func(path string) (string, error) {
+			resolved, err := sys.ResolvePath(path)
+			classify(err)
 			return resolved, err
 		}
-		inUse, err := tree.PodVersions(podPaths, eval)
+		list := entryNames(sys)
+		names := func(dir string) ([]string, error) {
+			ns, err := list(dir)
+			classify(err)
+			return ns, err
+		}
+		inUse, err := tree.PodVersions(podPaths, eval, names)
 		r.InUse = inUse
 		if unreadable {
 			unknown = err
@@ -661,6 +670,23 @@ func retainedVersion(sys System, tree layout.Layout, ver string, podPaths []stri
 		return true, nil
 	}
 	return false, unknown
+}
+
+// entryNames is the listing seam layout.PodVersions maps a pod path's version
+// to the versions directory's own spelling of it through: the base names of
+// the entries sys.ListOwned reports directly inside dir.
+func entryNames(sys System) layout.ListNames {
+	return func(dir string) ([]string, error) {
+		ents, err := sys.ListOwned(dir)
+		if err != nil {
+			return nil, err
+		}
+		names := make([]string, len(ents))
+		for i, e := range ents {
+			names[i] = filepath.Base(e.Path)
+		}
+		return names, nil
+	}
 }
 
 // vmHelperStop is one helper the teardown sent SIGTERM, and how long it gets.

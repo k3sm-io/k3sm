@@ -29,9 +29,31 @@ import (
 // exist, and holds no symlinks.
 func noLinks(p string) (string, error) { return p, nil }
 
+// tableVersions is the versions directory the table tests list: every version
+// they name, and a temporary name the prune never recognises.
+var tableVersions = []string{"0.2.0", "0.3.0", "0.3.1", "0.3.2", "0.3.2.tmp"}
+
+// listOf returns a listing seam that reports names for every directory.
+func listOf(names ...string) ListNames {
+	return func(string) ([]string, error) { return names, nil }
+}
+
+// readDirNames lists a real directory, for the tests that build a tree.
+func readDirNames(dir string) ([]string, error) {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, len(ents))
+	for i, e := range ents {
+		names[i] = e.Name()
+	}
+	return names, nil
+}
+
 func mustPodVersions(t *testing.T, l Layout, paths []string) []string {
 	t.Helper()
-	got, err := l.PodVersions(paths, noLinks)
+	got, err := l.PodVersions(paths, noLinks, listOf(tableVersions...))
 	if err != nil {
 		t.Fatalf("PodVersions(%v) error: %v", paths, err)
 	}
@@ -184,7 +206,7 @@ func TestPodVersionsResolvesSymlinks(t *testing.T) {
 		filepath.Join(root, CurrentName, "lib.dylib"),
 		filepath.Join(alias, "lib.dylib"),
 		filepath.Join(realRoot, VersionsName, "0.3.2", "lib.dylib"),
-	}, filepath.EvalSymlinks)
+	}, filepath.EvalSymlinks, readDirNames)
 	if err != nil {
 		t.Fatalf("PodVersions error: %v", err)
 	}
@@ -205,7 +227,7 @@ func TestPodVersionsReportsUnresolvedPaths(t *testing.T) {
 	got, err := l.PodVersions([]string{
 		filepath.Join(root, VersionsName, "0.3.0"),
 		filepath.Join(root, VersionsName, "0.2.9", "gone.dylib"),
-	}, filepath.EvalSymlinks)
+	}, filepath.EvalSymlinks, readDirNames)
 	if !errors.Is(err, ErrUnresolvedPodPath) {
 		t.Errorf("PodVersions error = %v, want ErrUnresolvedPodPath", err)
 	}
@@ -213,7 +235,70 @@ func TestPodVersionsReportsUnresolvedPaths(t *testing.T) {
 		t.Errorf("PodVersions = %v, want %v", got, want)
 	}
 
-	if _, err := New(filepath.Join(root, "missing")).PodVersions(nil, filepath.EvalSymlinks); !errors.Is(err, ErrUnresolvedPodPath) {
+	if _, err := New(filepath.Join(root, "missing")).PodVersions(nil, filepath.EvalSymlinks, readDirNames); !errors.Is(err, ErrUnresolvedPodPath) {
 		t.Errorf("PodVersions with no versions dir: error = %v, want ErrUnresolvedPodPath", err)
+	}
+}
+
+// TestPodVersionsMatchesTheOnDiskSpelling pins that an in-use version is
+// returned under the name the versions directory holds it by: the default APFS
+// volume is case-insensitive, so a pod path spelled 0.3.0-RC1 runs from the
+// directory 0.3.0-rc1, and Reasons and PlanPrune compare names exactly. A pod
+// version with no directory at all is an unresolved path, never a kept name
+// nothing matches; a failed listing is unresolved too.
+func TestPodVersionsMatchesTheOnDiskSpelling(t *testing.T) {
+	l := New("/Library/k3sm")
+	for _, tc := range []struct {
+		name    string
+		paths   []string
+		list    ListNames
+		want    []string
+		wantErr bool
+	}{
+		{
+			name:  "a differently cased pre-release",
+			paths: []string{"/Library/k3sm/versions/0.3.0-RC1/libk3sm-dns.dylib"},
+			list:  listOf("0.3.0-rc1", "0.3.1"),
+			want:  []string{"0.3.0-rc1"},
+		},
+		{
+			name:  "both spellings on a case-sensitive volume",
+			paths: []string{"/Library/k3sm/versions/0.3.0-RC1/x"},
+			list:  listOf("0.3.0-rc1", "0.3.0-RC1"),
+			want:  []string{"0.3.0-RC1", "0.3.0-rc1"},
+		},
+		{
+			name:    "a version with no directory",
+			paths:   []string{"/Library/k3sm/versions/0.2.9/x", "/Library/k3sm/versions/0.3.1/x"},
+			list:    listOf("0.3.0-rc1", "0.3.1"),
+			want:    []string{"0.3.1"},
+			wantErr: true,
+		},
+		{
+			name:    "a failed listing",
+			paths:   []string{"/Library/k3sm/versions/0.3.1/x"},
+			list:    func(string) ([]string, error) { return nil, os.ErrPermission },
+			wantErr: true,
+		},
+		{
+			name:  "no in-use path lists nothing",
+			paths: []string{"/Library/k3sm/libk3sm-dns.dylib"},
+			list:  func(string) ([]string, error) { return nil, os.ErrPermission },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := l.PodVersions(tc.paths, noLinks, tc.list)
+			if tc.wantErr != errors.Is(err, ErrUnresolvedPodPath) {
+				t.Errorf("PodVersions error = %v, want ErrUnresolvedPodPath: %v", err, tc.wantErr)
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("PodVersions = %v, want %v", got, tc.want)
+			}
+			for _, ver := range tc.want {
+				if (Retained{InUse: got}).Reasons(ver) == nil {
+					t.Errorf("Reasons(%q) = nil, want in use", ver)
+				}
+			}
+		})
 	}
 }
