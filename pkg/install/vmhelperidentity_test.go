@@ -120,6 +120,7 @@ func TestVerifyVMHelperFollowsVersionedLayout(t *testing.T) {
 			f.purge.resolved = tc.resolved
 			f.purge.gone = tc.gone
 			f.purge.links = tc.links
+			f.owners = versionDirs("0.2.8", "0.2.9", "0.3.0")
 			cfg := Config{Logger: slog.New(slog.NewTextHandler(&logs, nil))}.withDefaults()
 			ok, err := verifyVMHelper(f, cfg, VMHostRecord{PodID: "p", Pgid: pgid, StartUnixNano: 7}, fakeServiceUID)
 			if ok != tc.want {
@@ -190,6 +191,7 @@ func TestTeardownReportsAnUnretainedVMHelper(t *testing.T) {
 				DefaultInstallDir + "/previous": "versions/0.2.9",
 			}
 			f.purge.gone = tc.gone
+			f.owners = versionDirs("0.2.8", "0.2.9", "0.3.0")
 			cfg := Config{Logger: slog.New(slog.NewTextHandler(&logs, nil))}.withDefaults()
 
 			err := stopVMHelpers(context.Background(), f, cfg)
@@ -332,4 +334,16 @@ func TestTeardownTreatsResolveErrorsAsUnknownNotUnretained(t *testing.T) {
 			}
 		})
 	}
+}
+
+// versionDirs is the fake's ownership model of a versions directory holding
+// the named version directories, which the teardown lists to spell an in-use
+// version the way the directory does.
+func versionDirs(vers ...string) map[string]OwnedEntry {
+	dir := DefaultInstallDir + "/versions"
+	out := map[string]OwnedEntry{dir: {Path: dir, Kind: EntryDir}}
+	for _, v := range vers {
+		out[dir+"/"+v] = OwnedEntry{Path: dir + "/" + v, Kind: EntryDir}
+	}
+	return out
 }
