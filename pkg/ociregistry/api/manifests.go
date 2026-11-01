@@ -96,6 +96,9 @@ func (s *Server) getManifest(w http.ResponseWriter, r *http.Request, n ref.Name)
 	// tag writes nothing: a tagged row is kept at any age, and the index names
 	// its children by digest. A GET (a pull) writes nothing either.
 	if err == nil && r.Method == http.MethodHead && rf.Digest != "" {
+		if s.manifestRead != nil {
+			s.manifestRead()
+		}
 		err = s.st.TouchBlob(r.Context(), n, desc.Digest)
 	}
 	if errors.Is(err, store.ErrBlobUnknown) {

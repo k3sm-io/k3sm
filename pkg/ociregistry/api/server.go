@@ -193,6 +193,9 @@ type Server struct {
 	// manifestChecked, when set, runs between a manifest PUT's first blob
 	// check and the index write (a seam for tests that race a sweep).
 	manifestChecked func()
+	// manifestRead, when set, runs between a manifest HEAD's read and its
+	// touch (a seam for tests that reap the manifest in between).
+	manifestRead func()
 	// sessionAdmitted and chunkAppending, when set, run after a new session's
 	// slot is reserved and before a chunk is appended (seams for tests that
 	// make those steps panic).
