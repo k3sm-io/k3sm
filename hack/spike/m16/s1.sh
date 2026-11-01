@@ -109,7 +109,7 @@ else
 fi
 
 # ---- s1.3 the artifact record ----------------------------------------------------
-WHEEL=$(ls -t "$W/wheels"/*.whl 2>/dev/null | head -1)
+WHEEL=$(ls -t "$W/wheels"/*.whl 2>/dev/null | sed -n 1p)
 [ -n "$WHEEL" ] || { verdict FAIL "s1.3 wheel  the build reported success but produced no wheel"; exit 0; }
 SHA=$(shasum -a 256 "$WHEEL" | awk '{print $1}')
 recorded "s1.3 wheel: $(basename "$WHEEL") sha256=$SHA — a REPRODUCIBILITY RECORD, not provenance: no published darwin wheel exists to pin against"
@@ -172,7 +172,7 @@ if [ "$READY" = yes ]; then
     -d '{"model":"mock-model","max_tokens":16,"messages":[{"role":"user","content":"hello"}]}' 2>&1)
   case "$OUT" in
     *choices*) verdict PASS "s1.4 smoke  frontend + mocker with --discovery-backend file served a completion: no etcd, no NATS, no Kubernetes" ;;
-    *) verdict FAIL "s1.4 smoke  /v1/models answered but the completion did not: $(printf '%s' "$OUT" | head -c 200)" ;;
+    *) verdict FAIL "s1.4 smoke  /v1/models answered but the completion did not: $(printf '%s' "${OUT:0:200}")" ;;
   esac
 else
   verdict FAIL "s1.4 smoke  the file-discovery frontend never listed the mocker's model (see $W/frontend.log, $W/mocker.log)"

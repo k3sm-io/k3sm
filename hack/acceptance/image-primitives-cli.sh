@@ -251,7 +251,7 @@ b7=ok
 "${K3SM_IMAGE[@]}" pull "$PULL_REF" --platform "$PULL_PLATFORM" >"$LIVE_OUT" 2>&1 || b7=no
 PULLED_DIGEST=""
 if [ "$b7" = ok ]; then
-	PULLED_DIGEST="$(sed -n 's/^[[:space:]]*digest:[[:space:]]*//p' "$LIVE_OUT" | head -1)"
+	PULLED_DIGEST="$(sed -n 's/^[[:space:]]*digest:[[:space:]]*//p' "$LIVE_OUT" | sed -n 1p)"
 	[ -n "$PULLED_DIGEST" ] || b7=no
 fi
 if [ "$b7" != ok ]; then tail -10 "$LIVE_OUT" || true; fi
@@ -269,7 +269,7 @@ PORT="${K3SM_REGISTRY_PORT:-}"
 if [ -z "$PORT" ]; then
 	PORT="$(kubectl get configmap local-registry-hosting -n kube-public \
 		-o jsonpath='{.data.localRegistryHosting\.v1}' 2>/dev/null |
-		sed -n 's/^host:[[:space:]]*"\{0,1\}localhost:\([0-9]\{1,\}\)"\{0,1\}[[:space:]]*$/\1/p' | head -1)"
+		sed -n 's/^host:[[:space:]]*"\{0,1\}localhost:\([0-9]\{1,\}\)"\{0,1\}[[:space:]]*$/\1/p' | sed -n 1p)"
 fi
 if [ -z "$PORT" ]; then
 	PORT=6450

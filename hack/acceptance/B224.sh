@@ -134,15 +134,15 @@ sup_sites="$(sites 'startBootstrapServer(ctx, deps')"
 [ "$enr_sites" = "serverphases.go:1" ] || o=no
 [ "$sup_sites" = "serverphases.go:1" ] || o=no
 ladder "$o" "b224.2  newMeshEnroller only in enrollServerMesh ($enr_sites), startBootstrapServer only in startJoinSupervisor ($sup_sites)"
-ens_ln="$(printf '%s\n' "$drive_body" | grep -n 'if err = ensureMeshPeerCRD(ctx, opts\.meshIP,' | head -1 | cut -d: -f1 || true)"
+ens_ln="$(printf '%s\n' "$drive_body" | grep -n 'if err = ensureMeshPeerCRD(ctx, opts\.meshIP,' | sed -n 1p | cut -d: -f1 || true)"
 ret_ok=no
 if [ -n "$ens_ln" ]; then
 	# the ensure's error check closes within three lines and returns the error
 	grep -qE '\}, logger\); err != nil \{[[:space:]]+return err' \
 		<<<"$(printf '%s\n' "$drive_body" | sed -n "$ens_ln,$((ens_ln + 4))p" | tr '\n' ' ')" && ret_ok=ok
 fi
-enr_ln="$(printf '%s\n' "$drive_body" | grep -n 'enrollServerMesh(ctx, plan' | head -1 | cut -d: -f1 || true)"
-sup_ln="$(printf '%s\n' "$drive_body" | grep -n 'startJoinSupervisor(ctx, plan' | head -1 | cut -d: -f1 || true)"
+enr_ln="$(printf '%s\n' "$drive_body" | grep -n 'enrollServerMesh(ctx, plan' | sed -n 1p | cut -d: -f1 || true)"
+sup_ln="$(printf '%s\n' "$drive_body" | grep -n 'startJoinSupervisor(ctx, plan' | sed -n 1p | cut -d: -f1 || true)"
 if [ "$ret_ok" = ok ] && [ -n "$enr_ln" ] && [ -n "$sup_ln" ] && [ "$ens_ln" -lt "$enr_ln" ] && [ "$enr_ln" -lt "$sup_ln" ]; then
 	ladder ok "b224.2  runServer: ensureMeshPeerCRD(+$ens_ln, returns on error) precedes enrollServerMesh(+$enr_ln) precedes startJoinSupervisor(+$sup_ln)"
 else

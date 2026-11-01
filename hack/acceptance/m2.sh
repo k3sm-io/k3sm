@@ -190,7 +190,7 @@ ladder "$([ "$kube_owner" = "$INVOKING_USER" ] && echo ok || echo no)" "m2.3  ad
 # netd denies those binds. Informational only (never gates); it pinpoints an empty /
 # missing Service set behind a DNS/API-VIP bind denial in server.log/netd.log.
 echo "==> [diagnostic] cluster Services (the netd authorizer's Service set):"
-"$INSTALL_DIR/k3sm" kubectl get svc -A -o wide 2>&1 | head -20 || true
+"$INSTALL_DIR/k3sm" kubectl get svc -A -o wide 2>&1 | sed -n 1,20p || true
 
 # [diagnostic] In-pod DNS path, reproduced from the shell so a red InPodDNS/InPodKubectl
 # pinpoints the broken LAYER without reading server.log. Three independent probes:
@@ -273,13 +273,13 @@ grep -E 'runtimed provider configured|pod box cluster-DNS wiring' /var/log/k3sm/
 echo "==> [diagnostic] reap leaked pods (:8080) + probe the API VIP path (10.43.0.1:443):"
 reap_test_pods
 echo "--- host :8080 holder after reap (want free — else a leak the reap missed):"
-lsof -nP -iTCP:8080 -sTCP:LISTEN 2>/dev/null | head -3 || true
+lsof -nP -iTCP:8080 -sTCP:LISTEN 2>/dev/null | sed -n 1,3p || true
 echo "--- default/kubernetes EndpointSlice (the API-VIP backend the proxy dials):"
-"$INSTALL_DIR/k3sm" kubectl get endpointslices -n default -l kubernetes.io/service-name=kubernetes -o wide 2>&1 | head -4 || true
+"$INSTALL_DIR/k3sm" kubectl get endpointslices -n default -l kubernetes.io/service-name=kubernetes -o wide 2>&1 | sed -n 1,4p || true
 echo "--- TLS to the apiserver backend 127.0.0.1:6444 (clean 'Verify'/subject = backend OK):"
-echo | openssl s_client -connect 127.0.0.1:6444 -servername kubernetes.default.svc 2>&1 | grep -E 'CONNECTED|Verify return|subject=|errno|no peer|closed' | head -4 || true
+echo | openssl s_client -connect 127.0.0.1:6444 -servername kubernetes.default.svc 2>&1 | grep -E 'CONNECTED|Verify return|subject=|errno|no peer|closed' | sed -n 1,4p || true
 echo "--- TLS to the API VIP 10.43.0.1:443 (the proxy path — EOF/reset HERE, not on 6444, isolates the proxy):"
-echo | openssl s_client -connect 10.43.0.1:443 -servername kubernetes.default.svc 2>&1 | grep -E 'CONNECTED|Verify return|subject=|errno|no peer|closed' | head -4 || true
+echo | openssl s_client -connect 10.43.0.1:443 -servername kubernetes.default.svc 2>&1 | grep -E 'CONNECTED|Verify return|subject=|errno|no peer|closed' | sed -n 1,4p || true
 
 # m2.A — the per-criterion M2 conformance suite (e2e/m2_test.go), each criterion
 # named per its reference-workload feature class. The NON-VACUOUS guard
@@ -387,7 +387,7 @@ fi
 #     A pid != pgid here is a FIXTURE bug (the workload is not the session leader),
 #     not a reaper bug — the leg fails loudly rather than silently testing nothing.
 if [ -z "$reap_why" ]; then
-	REAP_PID="$(pgrep -f "$REAP_ID" 2>/dev/null | head -1 || true)"
+	REAP_PID="$(pgrep -f "$REAP_ID" 2>/dev/null | sed -n 1p || true)"
 	if [ -z "$REAP_PID" ]; then
 		reap_why="could not resolve the fixture leader pid (pgrep -f $REAP_ID matched nothing)"
 	else

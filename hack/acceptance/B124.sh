@@ -170,7 +170,7 @@ max_tick() {
 # pod_pgid <pod name> - the process group of this run's hello-http for the pod.
 pod_pgid() {
 	local pid
-	pid="$(pgrep -f "hello-http --id $1 " | head -n1 || true)"
+	pid="$(pgrep -f "hello-http --id $1 " | sed -n 1p || true)"
 	if [ -n "$pid" ]; then
 		ps -o pgid= -p "$pid" | tr -d ' ' || true
 	fi
@@ -179,7 +179,7 @@ jp() { kc get pod "$1" -n "$NS" -o jsonpath="$2" 2>/dev/null || true; }
 # cs <pod> <container> <field> - one field of a named container's status.
 cs() { jp "$1" "{.status.containerStatuses[?(@.name==\"$2\")].$3}"; }
 # fixture_pid <id> - the pid of this run's hello-http started with --id <id>.
-fixture_pid() { pgrep -f "hello-http --id $1 " | head -n1 || true; }
+fixture_pid() { pgrep -f "hello-http --id $1 " | sed -n 1p || true; }
 
 # 1. The pod runs and listens on its own pod IP.
 logging_pod "$POD" "$PORT"

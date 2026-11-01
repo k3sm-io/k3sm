@@ -51,7 +51,7 @@ export UV_CACHE_DIR="$PREFIX/cache" UV_PYTHON_INSTALL_DIR="$PREFIX/pyinstall" HF
 export PATH="$PREFIX/bin:$PATH"
 V="$PREFIX/venv-s1/bin/python"
 [ -x "$V" ] || { verdict FAIL "s4.0 setup  no build venv at $PREFIX/venv-s1 — run s1.sh first (it builds and installs the darwin runtime wheel)"; exit 0; }
-MP=$(ls -d "$PREFIX"/hf/hub/models--*/snapshots/* 2>/dev/null | head -1)
+MP=$(ls -d "$PREFIX"/hf/hub/models--*/snapshots/* 2>/dev/null | sed -n 1p)
 [ -n "$MP" ] || { verdict FAIL "s4.0 setup  no model snapshot under $PREFIX/hf — run s0.sh first"; exit 0; }
 
 # The worker's engine lives in its own package, exactly as the contract's own
@@ -192,7 +192,7 @@ if [ "$UP" = yes ]; then
     -d '{"model":"mlx-worker","max_tokens":32,"messages":[{"role":"user","content":"Name three primary colors."}]}' 2>&1)
   case "$OUT" in
     *choices*) verdict PASS "s4.3 end-to-end  frontend -> MLX worker -> tokens, through the documented backend contract on the in-process engine" ;;
-    *)         verdict FAIL "s4.3 end-to-end  the worker registered but the completion failed: $(printf '%s' "$OUT" | head -c 200)" ;;
+    *)         verdict FAIL "s4.3 end-to-end  the worker registered but the completion failed: $(printf '%s' "${OUT:0:200}")" ;;
   esac
 else
   verdict FAIL "s4.3 end-to-end  the worker never appeared in the frontend's model list (see $W/frontend.log, $W/worker.log)"
@@ -220,7 +220,7 @@ YAML
   if kc -n "$NS" wait --for=condition=Ready pod/m16-worker --timeout=600s >/dev/null 2>&1; then
     verdict PASS "s4.4 extended resource  a worker Pod requesting mlx.k3sm.io/gpu: 1 was admitted, scheduled and became Ready"
   else
-    verdict FAIL "s4.4 extended resource  the worker Pod requesting mlx.k3sm.io/gpu: 1 never became Ready: $(kc -n "$NS" get pod m16-worker -o jsonpath='{.status.phase}: {.status.conditions[*].message}' 2>/dev/null | head -c 200)"
+    verdict FAIL "s4.4 extended resource  the worker Pod requesting mlx.k3sm.io/gpu: 1 never became Ready: $(kc -n "$NS" get pod m16-worker -o jsonpath='{.status.phase}: {.status.conditions[*].message}' 2>/dev/null | cut -c1-200)"
   fi
   kc -n "$NS" delete pod m16-worker --ignore-not-found --wait=false >/dev/null 2>&1
 else

@@ -140,9 +140,9 @@ ladder "$s" "b213.3  a mesh server mints its OWN cluster-CA serving cert (365d, 
 func_body() { awk -v re="$2" '$0 ~ re {on=1} on {print} on && /^}/ {exit}' "$1"; }
 build_body="$(func_body "$SERVER_GO" '^func serverNodeOptions[(]')"
 drive_body="$(func_body "$SERVER_GO" '^func runServer[(]')"
-lit_ln="$(printf '%s\n' "$build_body" | grep -n 'nodeOpts := nodeOptions{' | head -1 | cut -d: -f1 || true)"
-mint_ln="$(printf '%s\n' "$build_body" | grep -n 'setServerKubeletServing(&nodeOpts, nodeHierarchy' | head -1 | cut -d: -f1 || true)"
-ret_ln="$(printf '%s\n' "$build_body" | grep -n 'return nodeOpts, nil' | head -1 | cut -d: -f1 || true)"
+lit_ln="$(printf '%s\n' "$build_body" | grep -n 'nodeOpts := nodeOptions{' | sed -n 1p | cut -d: -f1 || true)"
+mint_ln="$(printf '%s\n' "$build_body" | grep -n 'setServerKubeletServing(&nodeOpts, nodeHierarchy' | sed -n 1p | cut -d: -f1 || true)"
+ret_ln="$(printf '%s\n' "$build_body" | grep -n 'return nodeOpts, nil' | sed -n 1p | cut -d: -f1 || true)"
 ret_n="$(printf '%s\n' "$build_body" | grep -c 'return nodeOpts' || true)"
 if [ -n "$lit_ln" ] && [ -n "$mint_ln" ] && [ -n "$ret_ln" ] && [ "$ret_n" = 1 ] &&
 	[ "$lit_ln" -lt "$mint_ln" ] && [ "$mint_ln" -lt "$ret_ln" ]; then
@@ -150,8 +150,8 @@ if [ -n "$lit_ln" ] && [ -n "$mint_ln" ] && [ -n "$ret_ln" ] && [ "$ret_n" = 1 ]
 else
 	ladder no "b213.3  serverNodeOptions ordering: literal(+${lit_ln:-none}) < setServerKubeletServing(+${mint_ln:-none}) < sole 'return nodeOpts, nil'(+${ret_ln:-none}, count=${ret_n:-0})"
 fi
-call_ln="$(printf '%s\n' "$drive_body" | grep -n 'nodeOpts, err := serverNodeOptions(' | head -1 | cut -d: -f1 || true)"
-start_ln="$(printf '%s\n' "$drive_body" | grep -n 'return startNode(ctx, nodeOpts)' | head -1 | cut -d: -f1 || true)"
+call_ln="$(printf '%s\n' "$drive_body" | grep -n 'nodeOpts, err := serverNodeOptions(' | sed -n 1p | cut -d: -f1 || true)"
+start_ln="$(printf '%s\n' "$drive_body" | grep -n 'return startNode(ctx, nodeOpts)' | sed -n 1p | cut -d: -f1 || true)"
 reassign="$(printf '%s\n' "$drive_body" | grep -cE '(^|[^.[:alnum:]_])nodeOpts(\.[[:alnum:]_]+)?(, [[:alnum:]_]+)?[[:space:]]*(=[^=]|:=)' || true)"
 if [ -n "$call_ln" ] && [ -n "$start_ln" ] && [ "$call_ln" -lt "$start_ln" ] && [ "$reassign" = 1 ]; then
 	ladder ok "b213.3  runServer: nodeOpts from serverNodeOptions(+$call_ln) reaches startNode(+$start_ln) unreassigned"
@@ -382,7 +382,7 @@ else
 				while [ "$n" -lt 45 ] && [ "$(kcm get pod hello-native -o jsonpath='{.status.phase}' 2>/dev/null)" != Running ]; do
 					sleep 2; n=$((n+1))
 				done
-				logs_out="$(kcm logs hello-native 2>&1 | head -5)"
+				logs_out="$(kcm logs hello-native 2>&1 | sed -n 1,5p)"
 			fi
 			case "$logs_out" in
 			*"hello from a k3sm native pod"*)

@@ -110,7 +110,7 @@ fi
 : > "$PAIRS_FILE"
 while IFS= read -r name; do
 	[ -n "$name" ] || continue
-	file="$(grep -rlE "^func ${name}\(" --include='*_test.go' "${SEARCH_DIRS[@]}" 2>/dev/null | head -1 || true)"
+	file="$(grep -rlE "^func ${name}\(" --include='*_test.go' "${SEARCH_DIRS[@]}" 2>/dev/null | sed -n 1p || true)"
 	if [ -z "$file" ]; then
 		b2=no
 		echo "  cited test not found in source: $name"

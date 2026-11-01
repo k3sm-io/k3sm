@@ -4,7 +4,7 @@
 set -euo pipefail
 case "${1:-} ${2:-}" in
 "env "*)
-	grep -E "^${2}=" stub/goenv | head -1 | cut -d= -f2- || true
+	grep -E "^${2}=" stub/goenv | sed -n 1p | cut -d= -f2- || true
 	;;
 "mod verify")
 	if [ -f stub/modverify-fail ]; then

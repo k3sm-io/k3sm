@@ -117,9 +117,9 @@ cp "$REPO_ROOT/LICENSE" "$REPO_ROOT/NOTICE" "$OUT/"
 # Asking the artifact rather than the variable: an ldflags typo (a misspelled
 # symbol path) is silently ignored by the linker, and the binary would report
 # "dev" while every log line here said otherwise.
-got="$("$OUT/k3sm" version | head -1 | awk '{print $2}')"
+got="$("$OUT/k3sm" version | sed -n 1p | awk '{print $2}')"
 [ "$got" = "$VERSION" ] || die "staged binary reports version '$got', expected '$VERSION' — the -X stamps did not take"
-echo "==> version stamp verified: $("$OUT/k3sm" version | head -1)"
+echo "==> version stamp verified: $("$OUT/k3sm" version | sed -n 1p)"
 
 # ---- INSTALL.txt -------------------------------------------------------------
 cat >"$OUT/INSTALL.txt" <<TXT

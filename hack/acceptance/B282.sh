@@ -346,7 +346,7 @@ else
 		# Wait for the log file to appear, then for the writer to finish.
 		n=0; dir=""
 		while [ $n -lt 180 ]; do
-			dir="$(find "$LOGTREE" -type d -name chatty 2>/dev/null | head -1 || true)"
+			dir="$(find "$LOGTREE" -type d -name chatty 2>/dev/null | sed -n 1p || true)"
 			[ -n "$dir" ] && [ -f "$dir/0.log" ] && break
 			sleep 1; n=$((n+1))
 		done
@@ -361,7 +361,7 @@ else
 		# rotation the current 0.log can be empty and the content sits in the
 		# newest timestamped sibling (upstream keeps that one uncompressed).
 		sample="$dir/0.log"
-		[ -s "$sample" ] || sample="$(ls "$dir"/0.log.[0-9]* 2>/dev/null | grep -v '\.gz$' | head -1)"
+		[ -s "$sample" ] || sample="$(ls "$dir"/0.log.[0-9]* 2>/dev/null | grep -v '\.gz$' | sed -n 1p)"
 		if [ -n "$dir" ] && grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z? (stdout|stderr) [FP] ' <<<"$(head -1 "$sample" 2>/dev/null)"; then
 			ladder ok "b282.L1  the file is in the CRI line format (<timestamp> <stream> <F|P> <content>)"
 		else

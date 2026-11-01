@@ -18,3 +18,9 @@ grep -qE 'a|b' file
 %%
 kc get pods |
 	grep -v Running
+%%
+head -c 100 < big > small
+%%
+head -n 1 file
+%%
+out="$(gen)"; head -n 1 <<<"$out"; grep -m1 pat <<<"$out"; grep -l pat file

@@ -530,10 +530,10 @@ needs_network_modules() {
 		*"dial tcp"* | *"no such host"* | *"i/o timeout"* | *"connection refused"* | *"network is unreachable"* | *"TLS handshake timeout"* | *"connection reset by peer"* | *"proxyconnect"* | *"Client.Timeout exceeded"* | *"server misbehaving"*) ;;
 		*) continue ;;
 		esac
-		m="$(printf '%s\n' "$line" | grep -Eo '[A-Za-z0-9][A-Za-z0-9._~!/-]*\.[A-Za-z0-9._~!/-]*@v[0-9][^:[:space:]"]*' | head -1 || true)"
+		m="$(printf '%s\n' "$line" | grep -Eo '[A-Za-z0-9][A-Za-z0-9._~!/-]*\.[A-Za-z0-9._~!/-]*@v[0-9][^:[:space:]"]*' | sed -n 1p || true)"
 		m="${m%/go.mod}"
 		if [ -z "$m" ]; then
-			m="$(printf '%s\n' "$line" | sed -E -n 's#.*https://[^/]*/([^"[:space:]]+)/@v/(v[^"[:space:]]+)\.(info|mod|zip).*#\1@\2#p' | head -1 || true)"
+			m="$(printf '%s\n' "$line" | sed -E -n 's#.*https://[^/]*/([^"[:space:]]+)/@v/(v[^"[:space:]]+)\.(info|mod|zip).*#\1@\2#p' | sed -n 1p || true)"
 		fi
 		# A module path in a proxy URL is case-encoded ("!x" is "X").
 		m="$(printf '%s\n' "${m:-?}" | unbang)"
@@ -1687,7 +1687,7 @@ FAILCP
 		else
 			echo "  FAIL  read_pins: XNET_FLOOR '$XNET_FLOOR'"; exit 1
 		fi
-		if grep_text "$HELM_COMMIT" -Eq '^[0-9a-f]{40}$' && [ "$(printf '%s\n%s\n' "$HELM_MIN_GO" "$PAYLOAD_GO_VERSION" | sort -V | head -1)" = "$HELM_MIN_GO" ]; then
+		if grep_text "$HELM_COMMIT" -Eq '^[0-9a-f]{40}$' && [ "$(printf '%s\n%s\n' "$HELM_MIN_GO" "$PAYLOAD_GO_VERSION" | sort -V | sed -n 1p)" = "$HELM_MIN_GO" ]; then
 			echo "  ok    read_pins: helm commit $HELM_COMMIT; PAYLOAD_GO_VERSION $PAYLOAD_GO_VERSION is not older than HelmMinGoVersion $HELM_MIN_GO"
 		else
 			echo "  FAIL  read_pins: helm commit '$HELM_COMMIT', HelmMinGoVersion '$HELM_MIN_GO' newer than PAYLOAD_GO_VERSION $PAYLOAD_GO_VERSION?"; exit 1

@@ -300,8 +300,8 @@ no_exec()    { ! grep -qE '^sudo ' "$OUT" && [ ! -s "$KLOG" ]; }
 staging_gone() { ! grep -q . <<<"$(find "$CASE_TMP" -mindepth 1 -maxdepth 1 -name 'k3sm-install.*' 2>/dev/null)"; }
 banner_before_sudo() {
 	local b s
-	b="$(grep -nF 'about to run: sudo' "$OUT" | head -1 | cut -d: -f1)"
-	s="$(grep -nE '^sudo ' "$OUT" | head -1 | cut -d: -f1)"
+	b="$(grep -nF 'about to run: sudo' "$OUT" | sed -n 1p | cut -d: -f1)"
+	s="$(grep -nE '^sudo ' "$OUT" | sed -n 1p | cut -d: -f1)"
 	[ -n "$b" ] && [ -n "$s" ] && [ "$b" -lt "$s" ]
 }
 

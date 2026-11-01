@@ -78,8 +78,8 @@ ladder "$w" "b248.1  io.k3sm.datavol is a labelled daemon with a plistContent ca
 # the server write, so a manifest that put netd first would unmount the volume
 # out from under the daemons still using it.
 o=ok
-dv_line="$(grep -nE 'label: DatavolLabel' "$K3SM_ROOT/pkg/install/manifest.go" | head -1 | cut -d: -f1)"
-nd_line="$(grep -nE 'label: NetdLabel' "$K3SM_ROOT/pkg/install/manifest.go" | head -1 | cut -d: -f1)"
+dv_line="$(grep -nE 'label: DatavolLabel' "$K3SM_ROOT/pkg/install/manifest.go" | sed -n 1p | cut -d: -f1)"
+nd_line="$(grep -nE 'label: NetdLabel' "$K3SM_ROOT/pkg/install/manifest.go" | sed -n 1p | cut -d: -f1)"
 if [ -z "$dv_line" ] || [ -z "$nd_line" ] || [ "$dv_line" -ge "$nd_line" ]; then o=no; fi
 ladder "$o" "b248.1  the datavol artifact precedes the netd artifact in artifactManifest (lines ${dv_line:-?} < ${nd_line:-?})"
 
@@ -265,7 +265,7 @@ else
 		HELPER_OUT="$(cd "$K3SM_ROOT" && sudo env GOWORK="$GOWORK_FILE" GOARCH=arm64 CGO_ENABLED=1 \
 			"$GO_BIN" run ./hack/acceptance/b248helper "$@" 2>&1)" || rc=$?
 		printf '%s\n' "$HELPER_OUT" | sed 's/^/    | /'
-		HELPER_UUID="$(printf '%s\n' "$HELPER_OUT" | sed -n 's/^uuid=//p' | head -1)"
+		HELPER_UUID="$(printf '%s\n' "$HELPER_OUT" | sed -n 's/^uuid=//p' | sed -n 1p)"
 		if [ -n "$HELPER_UUID" ]; then CREATED_UUIDS="$CREATED_UUIDS $HELPER_UUID"; fi
 		return $rc
 	}
@@ -452,7 +452,7 @@ print(d if isinstance(d, int) else 0)' "$1"; }
 	want_sha="$(sudo shasum -a 256 "$SRC/server/db/state.db" | awk '{print $1}')"
 	want_files="$(sudo find "$SRC" -type f | wc -l | tr -d ' ')"
 	helper migrate --name "$VOL_M" --size 2g --from "$SRC" --record "$REC_M" --staging "$STAGING" || l6=no
-	stats_line="$(printf '%s\n' "$HELPER_OUT" | grep -E '^files=' | head -1 || true)"
+	stats_line="$(printf '%s\n' "$HELPER_OUT" | grep -E '^files=' | sed -n 1p || true)"
 	if [ "$l6" = ok ]; then
 		mountedAt "$SRC" || { echo "    $SRC is not a mount point after the migration"; l6=no; }
 		sudo test -d "$SRC.pre-volume" || { echo "    $SRC.pre-volume is missing — the old data root was not preserved"; l6=no; }
@@ -538,7 +538,7 @@ PLIST
 	# first occurrence, as pkg/status's parser takes it).
 	oneshot_key() {
 		sudo launchctl print "system/$ONESHOT_LABEL" 2>/dev/null |
-			sed -n "s/^[[:space:]]*$1 = //p" | head -1 || true
+			sed -n "s/^[[:space:]]*$1 = //p" | sed -n 1p || true
 	}
 
 	# oneshot_wait <want> — poll until the job has run and exited with a code

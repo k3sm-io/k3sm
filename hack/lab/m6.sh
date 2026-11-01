@@ -198,7 +198,7 @@ daemon_start() {
 }
 crash_record_empty() { f="$WD/crashloop.json"; [ ! -s "$f" ] || ! grep -Eq '"component"|"tripped_at"' "$f"; }
 crash_record_tripped() { grep -q '"tripped_at"' "$WD/crashloop.json" 2>/dev/null; }
-etcd_pid() { pgrep -f "^$WD/bin/etcd " | head -n 1; }
+etcd_pid() { pgrep -f "^$WD/bin/etcd " | sed -n 1p; }
 EOF
 )"
 

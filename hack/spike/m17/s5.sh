@@ -236,7 +236,7 @@ elif oom_on_worker; then
 else
 	fail "s5.1 the ring did not form between the pod IPs (inits $inits/2, all_sums $sums/2; see $RUNG_DIR/ring-direct-rank*.jsonl) — halt: no substitution is pre-decided"
 fi
-par="$(sed -n 's/.*"parallelism": "\([a-z]*\)".*/\1/p' "$RUNG_DIR/ring-direct-rank0.jsonl" | head -1)"
+par="$(sed -n 's/.*"parallelism": "\([a-z]*\)".*/\1/p' "$RUNG_DIR/ring-direct-rank0.jsonl" | sed -n 1p)"
 [ -n "$par" ] && record "s5 sharded_load parallelism: $par"
 if grep -q '"event": "gen"' "$RUNG_DIR/ring-direct-rank0.jsonl"; then
 	pass "s5.2 rank 0 generated the fixed prompt from the sharded model over the direct path"

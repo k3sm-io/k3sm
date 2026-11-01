@@ -175,7 +175,7 @@ o=ok
 # number, which the comparisons below read as a failed rung. Without the
 # `|| true` the unmatched grep would take `set -e` out of the script and the
 # remaining rungs would never be reported at all.
-ln() { grep -n "$1" "$2" 2>/dev/null | head -1 | cut -d: -f1 || true; }
+ln() { grep -n "$1" "$2" 2>/dev/null | sed -n 1p | cut -d: -f1 || true; }
 prep_l="$(ln 'prepareStagingDir(sys, cfg)' "$INSTALL_GO")"
 copy_l="$(ln 'sys\.CopyToRootOwned(cfg\.BinarySource, cfg\.stagedBinary())' "$INSTALL_GO")"
 pub_l="$(ln 'publishStagedRoot(sys, cfg)' "$INSTALL_GO")"

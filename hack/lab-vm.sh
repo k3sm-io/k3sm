@@ -789,8 +789,8 @@ FAKE
 	grep -q 'tar -czf' "$log" || fail "red gate skipped collection"
 	grep -q '^tart delete' "$log" || fail "red gate skipped destruction"
 	local ci di
-	ci="$(grep -n 'tar -czf' "$log" | head -1 | cut -d: -f1)"
-	di="$(grep -n '^tart delete' "$log" | head -1 | cut -d: -f1)"
+	ci="$(grep -n 'tar -czf' "$log" | sed -n 1p | cut -d: -f1)"
+	di="$(grep -n '^tart delete' "$log" | sed -n 1p | cut -d: -f1)"
 	[ -n "$ci" ] && [ -n "$di" ] && [ "$ci" -lt "$di" ] \
 		|| fail "collection did not precede destruction"
 	[ -s "$tmp/out4/gate.log" ] || fail "the in-guest gate output was not preserved on the host"

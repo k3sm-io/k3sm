@@ -337,7 +337,7 @@ for a in $(printf '%s\n' "$br" | awk '$1=="inet"{print $2}'); do
 done
 echo "SELF_ADDR=$self"
 echo "RESERVED=$(echo $reserved)"
-echo "MESH_ADDR=$(ifconfig -a inet | awk '$1=="inet"{print $2}' | awk -F. '$1==100 && $2>=64 && $2<=127' | head -1)"
+echo "MESH_ADDR=$(ifconfig -a inet | awk '$1=="inet"{print $2}' | awk -F. '$1==100 && $2>=64 && $2<=127' | sed -n 1p)"
 echo "MODEL=$(sysctl -n hw.model)"
 echo "OS=$(sw_vers -productVersion) ($(sw_vers -buildVersion))"
 for t in iperf3 python3 nc lsof; do

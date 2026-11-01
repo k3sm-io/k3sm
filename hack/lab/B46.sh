@@ -525,7 +525,7 @@ wait_running() {
 # bracket keeps the remote shell from matching itself), and accepted only if
 # that pid's comm really is b46-fill.
 fill_pid() {
-	rsh "p=\$(pgrep -f '$(fill_pattern "$1")' | head -1); [ -n \"\$p\" ] || exit 0; c=\$(ps -o comm= -p \$p); [ \"\${c##*/}\" = b46-fill ] && echo \$p" 2>/dev/null | tr -d '[:space:]'
+	rsh "p=\$(pgrep -f '$(fill_pattern "$1")' | sed -n 1p); [ -n \"\$p\" ] || exit 0; c=\$(ps -o comm= -p \$p); [ \"\${c##*/}\" = b46-fill ] && echo \$p" 2>/dev/null | tr -d '[:space:]'
 }
 kernel_lines() {
 	# kernel_lines <start> <end|""> : the kernel's out-of-swap lines over a window.
@@ -614,7 +614,7 @@ leg1() {
 	if [ "$phase" = Failed ] && [ "$reason" = Evicted ]; then ladder ok "l1.status  pod Failed/Evicted"
 	else ladder no "l1.status  pod phase/reason = $phase/$reason, want Failed/Evicted"; fi
 
-	mpmsg_seen="$(awk -F'\t' '$0 ~ /\tmp=True\t/ { for (i=1;i<=NF;i++) if ($i ~ /^mpmsg=/) print $i }' "$EV/watch.tsv" | grep -E 'compressor|swap|memory.available' | head -1)"
+	mpmsg_seen="$(awk -F'\t' '$0 ~ /\tmp=True\t/ { for (i=1;i<=NF;i++) if ($i ~ /^mpmsg=/) print $i }' "$EV/watch.tsv" | grep -E 'compressor|swap|memory.available' | sed -n 1p)"
 	if [ -n "$mpmsg_seen" ]; then ladder ok "l1.cond  MemoryPressure True naming its signal (${mpmsg_seen#mpmsg=})"
 	else ladder no "l1.cond  MemoryPressure was never observed True with a signal-naming Message"; fi
 

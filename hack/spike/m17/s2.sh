@@ -108,7 +108,7 @@ arp_out="$(arp -n "$PEER_LINK" 2>/dev/null)"
 if [ -n "$arp_out" ] && grep -q "on $IFC" <<<"$arp_out" && grep -qv incomplete <<<"$arp_out"; then
   verdict PASS "s2.2 $SIDE: $PEER_LINK ARP-resolves on $IFC ($(arp -n "$PEER_LINK" | awk '{print $4}'))"
 else
-  verdict FAIL "s2.2 $SIDE: $PEER_LINK does not ARP-resolve on $IFC ($(arp -n "$PEER_LINK" 2>&1 | head -1))"
+  verdict FAIL "s2.2 $SIDE: $PEER_LINK does not ARP-resolve on $IFC ($(arp -n "$PEER_LINK" 2>&1 | sed -n 1p))"
 fi
 on="$(tso_lro_on "$IFC")"
 if [ -z "$on" ]; then verdict PASS "s2.7 $SIDE: TSO4, TSO6 and LRO are off on $IFC"; else verdict FAIL "s2.7 $SIDE: $IFC still has $on after -tso -lro"; fi

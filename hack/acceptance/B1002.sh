@@ -60,7 +60,7 @@ runtest() {
 	local re out t
 	re="^($(IFS='|'; echo "$*"))\$"
 	if ! out="$(go test -race -count=1 -v -run "$re" "$pkg" 2>&1)"; then
-		printf '%s\n' "$out" | grep -E '^(--- FAIL|FAIL|panic|.*_test\.go:[0-9]+:)' | head -40 >&2
+		printf '%s\n' "$out" | grep -E '^(--- FAIL|FAIL|panic|.*_test\.go:[0-9]+:)' | sed -n 1,40p >&2
 		echo no; return
 	fi
 	for t in "$@"; do

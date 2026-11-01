@@ -228,7 +228,7 @@ outside_n="$(printf '%s' "$outside" | grep -c . || true)"
 if [ -n "$outside" ]; then
 	canary=no
 	echo "        host-mutating vocabulary OUTSIDE guest_exec:"
-	printf '%s\n' "$outside" | sed 's/^/          /' | head -20
+	printf '%s\n' "$outside" | sed 's/^/          /' | sed -n 1,20p
 fi
 # POSITIVE CONTROL 1 — the boundary itself still exists and still carries the
 # vocabulary. If guest_exec were renamed or emptied, the extractor above would find
@@ -347,8 +347,8 @@ export B149_GATE_RC=1
 bounded 120 harness run --gate B149GATE --out "$WORK/out-red" \
 	>"$WORK/red.log" 2>&1 || f_rc=$?
 unset B149_GATE_RC
-collect_ln="$(grep -n 'tar -czf' "$LOG" | head -1 | cut -d: -f1 || true)"
-delete_ln="$(grep -n '^tart delete' "$LOG" | head -1 | cut -d: -f1 || true)"
+collect_ln="$(grep -n 'tar -czf' "$LOG" | sed -n 1p | cut -d: -f1 || true)"
+delete_ln="$(grep -n '^tart delete' "$LOG" | sed -n 1p | cut -d: -f1 || true)"
 fp=ok
 [ "$f_rc" -eq 1 ] || { fp=no; echo "        exit was $f_rc, want 1 (the in-guest gate failed, not the harness)"; }
 [ -n "$collect_ln" ] || { fp=no; echo "        collection never ran on the failure path"; }

@@ -29,7 +29,7 @@ tmp="$(mktemp -d "${TMPDIR:-/tmp}/ms-selftest.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 
 pin() { sed -n "s/^$1=\"\\([^\"]*\\)\".*/\\1/p" "$BUILD"; }
-record() { sed -n "s/^[[:space:]]*$1:[[:space:]]*\\([^[:space:]#]*\\).*/\\1/p" "$RECORD" | head -1; }
+record() { sed -n "s/^[[:space:]]*$1:[[:space:]]*\\([^[:space:]#]*\\).*/\\1/p" "$RECORD" | sed -n 1p; }
 MS_VERSION="$(pin MS_VERSION)"
 MS_COMMIT="$(pin MS_COMMIT)"
 MS_H1="$(pin MS_H1)"

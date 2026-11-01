@@ -2,11 +2,12 @@
 # Copyright The k3sm Authors.
 # SPDX-License-Identifier: Apache-2.0
 #
-# No hack/ script pipes a producer into an early-exiting grep -q.
+# No hack/ script pipes a producer into an early-exiting grep -q, head,
+# grep -m or grep -l (the last three only in scripts that set pipefail).
 #
 # Under set -o pipefail, `producer | grep -q pattern` can fail on a run that
 # matched: grep exits at its first match, the producer's next write takes
-# SIGPIPE (exit 141), and pipefail reports the whole pipeline as failed, so a
+# SIGPIPE (exit 141) (head, grep -m and grep -l exit early the same way), and pipefail reports the whole pipeline as failed, so a
 # gate reads a test that passed as one that did not run. A here-string over a
 # captured value (`grep -q -- pat <<<"$out"`) has no writer process to kill.
 #
@@ -47,7 +48,8 @@ ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/pipefail-grep.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 
-# SCAN_AWK prints <file>:<line>: <text> for every pipeline into grep -q. A
+# SCAN_AWK prints <file>:<line>: <text> for every pipeline into grep -q, and,
+# when strict is set (the script sets pipefail), into head, grep -m or grep -l. A
 # command continued over lines (a trailing backslash or a trailing pipe) is
 # joined first. Comment lines, trailing comments and single-quoted text are
 # dropped; double-quoted text is kept, because a command string handed to a
@@ -73,8 +75,16 @@ FNR == 1 { buf = "" }
 		sub(/[;&)].*$/, "", s)
 		sub(/^[ \t!]*/, "", s)
 		sub(/^command[ \t]+/, "", s)
+		if (strict && s ~ /^head([ \t]|$)/) {
+			print FILENAME ":" start ": " full
+			break
+		}
 		if (s !~ /^[ef]?grep([ \t]|$)/) continue
 		if (s ~ /[ \t](-[A-Za-z0-9]*q[A-Za-z0-9]*|--quiet|--silent)([ \t]|$)/) {
+			print FILENAME ":" start ": " full
+			break
+		}
+		if (strict && s ~ /[ \t](-[A-Za-z0-9]*[lm][A-Za-z0-9]*|--max-count|--files-with-matches)([ \t=]|$)/) {
 			print FILENAME ":" start ": " full
 			break
 		}
@@ -102,8 +112,16 @@ list_scripts() {
 # scan <dir> <list>: run SCAN_AWK over the files named in <list>, relative to
 # <dir>. Prints the hits; returns non-zero only when awk fails.
 scan() {
-	local dir="$1" list="$2"
-	( cd "$dir" && tr '\n' '\0' < "$list" | xargs -0 awk "$SCAN_AWK" )
+	local dir="$1" list="$2" f strict
+	(
+		cd "$dir" || exit 1
+		while IFS= read -r f; do
+			[ -n "$f" ] || continue
+			strict=0
+			grep -Eq '^[^#]*pipefail' "$f" && strict=1
+			awk -v strict="$strict" "$SCAN_AWK" "$f" || exit 1
+		done < "$list"
+	)
 }
 
 # blocks <fixture> <prefix>: split a fixture into one planted script per
@@ -134,8 +152,8 @@ nscripts="$(wc -l < "$tmp/scripts" | tr -d ' ')"
 if [ "$s1" = ok ]; then
 	if hits="$(scan "$K3SM_ROOT" "$tmp/scripts")"; then
 		if [ -n "$hits" ]; then
-			printf '%s\n' "$hits" | sed 's/^/    pipe into grep -q: /' >&2
-			echo "    $(printf '%s\n' "$hits" | wc -l | tr -d ' ') pipelines into grep -q; capture the producer and grep a here-string" >&2
+			printf '%s\n' "$hits" | sed 's/^/    early-exit pipe: /' >&2
+			echo "    $(printf '%s\n' "$hits" | wc -l | tr -d ' ') early-exit pipelines; capture the producer and grep a here-string" >&2
 			s1=no
 		fi
 	else
@@ -143,14 +161,14 @@ if [ "$s1" = ok ]; then
 	fi
 fi
 echo "    scanned $nscripts shell scripts"
-ladder "$s1" "no hack/ script pipes into grep -q"
+ladder "$s1" "no hack/ script pipes into grep -q, or under pipefail into head, grep -m or grep -l"
 
 # ---- self-check -----------------------------------------------------------------
 s2=ok
 mkdir -p "$tmp/plant"
 nred="$(blocks "$FIXTURES/offending.txt" "$tmp/plant/red")"
 nclean="$(blocks "$FIXTURES/clean.txt" "$tmp/plant/clean")"
-{ [ "$nred" -ge 10 ] && [ "$nclean" -ge 9 ]; } || { echo "    the fixtures hold $nred offending and $nclean clean shapes, want 10 and 9" >&2; s2=no; }
+{ [ "$nred" -ge 15 ] && [ "$nclean" -ge 12 ]; } || { echo "    the fixtures hold $nred offending and $nclean clean shapes, want 15 and 12" >&2; s2=no; }
 i=1
 while [ "$i" -le "$nred" ]; do
 	echo "red.$i.sh" > "$tmp/plant/list"

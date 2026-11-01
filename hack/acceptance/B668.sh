@@ -414,7 +414,7 @@ self_test() {
 			diff -u "$TESTDATA/$name.want" "$work/$name.got" >"$work/$name.diff"; then
 			ladder ok "b668.$n  $name: $(grep -c ' start=' "$work/$name.got" || true) window(s), equal to its .want"
 		else
-			sed 's/^/        /' "$work/$name.diff" "$work/$name.got" | head -40 || true
+			sed 's/^/        /' "$work/$name.diff" "$work/$name.got" | sed -n 1,40p || true
 			ladder no "b668.$n  $name: windows differ from $name.want"
 		fi
 		n=$((n + 1))
@@ -466,7 +466,7 @@ self_test() {
 			END { for (k in w) if (seen[k] != 1) bad = 1; exit bad }' "$work/live.got"; then
 		ladder ok "b668.7  the sampler over a fake timeline: one window per probe, each within 0.5s"
 	else
-		sed 's/^/        /' "$work/sample.log" "$work/live.got" 2>/dev/null | head -20 || true
+		sed 's/^/        /' "$work/sample.log" "$work/live.got" 2>/dev/null | sed -n 1,20p || true
 		ladder no "b668.7  the sampler over a fake timeline (exit $rc)"
 	fi
 
