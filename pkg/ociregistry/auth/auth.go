@@ -316,3 +316,13 @@ func (a *Access) forgetFull(t time.Time) {
 // the host keeps one loopback client's failures off every other loopback
 // client's bucket.
 func source(r *http.Request) string { return r.RemoteAddr }
+
+// ConnClosed forgets the failure bucket of the connection whose remote
+// address is remoteAddr. It is the api.Config ConnClosed hook: a bucket keyed
+// on a connection ends with it, so a later connection the kernel gives the
+// same ephemeral port does not inherit a bucket another client spent.
+func (a *Access) ConnClosed(remoteAddr string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.sources, remoteAddr)
+}

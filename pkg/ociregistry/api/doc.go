@@ -73,11 +73,14 @@ limitations under the License.
 //   - a header read timeout of 30 s, and a write deadline set per request
 //     (ResponseTimeout, plus UploadTimeout for a request with a body, plus a
 //     blob's size at MinWriteRate for a blob GET) instead of a server-wide
-//     write timeout, so a large blob GET is not cut.
+//     write timeout, so a large blob GET is not cut;
+//   - HTTPServer serves at most MaxConns connections at once and closes one
+//     past that before a request is read; it reports each connection's end
+//     (closed or hijacked) to ConnClosed, so an Authorizer that keys state on
+//     a connection can drop it.
 //
-// The number of connections is not bounded here: that cap belongs to the
-// listener the daemon wires. Every handler recovers from a panic with a 500,
-// and an upload gives back its session entry and slot on every way out.
+// Every handler recovers from a panic with a 500, and an upload gives back its
+// session entry and slot on every way out.
 // Access decisions belong to the Authorizer the caller supplies, which New
 // requires (AllowAll is the explicit open registry); the package classifies
 // each request as a read, a write or a delete (an upload cancel is a delete).

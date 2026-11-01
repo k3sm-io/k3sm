@@ -21,9 +21,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"runtime/debug"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -37,6 +39,8 @@ import (
 const (
 	// DefaultMaxSessions is the most upload sessions in use at once.
 	DefaultMaxSessions = 64
+	// DefaultMaxConns is the most connections HTTPServer serves at once.
+	DefaultMaxConns = 256
 	// DefaultMinFreeSpace is the free space below which new uploads are
 	// refused with 507.
 	DefaultMinFreeSpace = 2 << 30
@@ -164,6 +168,16 @@ type Config struct {
 	// server-wide timeout.
 	ResponseTimeout time.Duration
 	MinWriteRate    int64
+	// MaxConns is the most connections the HTTPServer serves at once; a
+	// connection past it is closed before a request is read
+	// (DefaultMaxConns when zero).
+	MaxConns int
+	// ConnClosed, when set, is called with a connection's remote address
+	// (the request's RemoteAddr) once the HTTPServer stops serving it: when
+	// it closes or is hijacked. The Authorizer drops what it keyed on that
+	// connection, so a later connection the kernel gives the same port starts
+	// clean.
+	ConnClosed func(remoteAddr string)
 	// Now is the clock (time.Now when nil).
 	Now func() time.Time
 }
@@ -184,6 +198,8 @@ type Server struct {
 	respTimeout   time.Duration
 	minWriteRate  int64
 	spaceEvery    int64
+	maxConns      int
+	connClosed    func(remoteAddr string)
 	now           func() time.Time
 	sessions      *sessions
 	router        *mux.Router
@@ -223,6 +239,8 @@ func New(cfg Config) (*Server, error) {
 		respTimeout:   positive(cfg.ResponseTimeout, DefaultResponseTimeout),
 		minWriteRate:  positive(cfg.MinWriteRate, DefaultMinWriteRate),
 		spaceEvery:    spaceCheckEvery,
+		maxConns:      positive(cfg.MaxConns, DefaultMaxConns),
+		connClosed:    cfg.ConnClosed,
 		setWriteDeadline: func(w http.ResponseWriter, t time.Time) {
 			_ = http.NewResponseController(w).SetWriteDeadline(t) // ErrNotSupported off a real connection
 		},
@@ -255,7 +273,7 @@ func New(cfg Config) (*Server, error) {
 }
 
 // positive returns v, or def when v is not positive.
-func positive[T int64 | time.Duration](v, def T) T {
+func positive[T int | int64 | time.Duration](v, def T) T {
 	if v <= 0 {
 		return def
 	}
@@ -275,7 +293,8 @@ func statfsFree(p string) (uint64, error) {
 // HTTPServer returns an http.Server for s on addr: a 30 s header read
 // timeout and no overall read or write timeout (request bodies have the
 // progress bound instead, and each response gets its own write deadline),
-// bounded headers, and errors logged through the server's logger.
+// bounded headers, at most MaxConns connections at once, and errors logged
+// through the server's logger. Each call counts its own connections.
 func (s *Server) HTTPServer(addr string) *http.Server {
 	return &http.Server{
 		Addr:              addr,
@@ -283,7 +302,31 @@ func (s *Server) HTTPServer(addr string) *http.Server {
 		ReadHeaderTimeout: ReadHeaderTimeout,
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    maxHeaderBytes,
+		ConnState:         s.connState(),
 		ErrorLog:          slog.NewLogLogger(s.log.Handler(), slog.LevelWarn),
+	}
+}
+
+// connState returns the http.Server ConnState hook: it counts the open
+// connections, closes a new one past maxConns before a request is read, and
+// reports each connection's end to connClosed. Every connection reaches
+// exactly one of StateClosed and StateHijacked, a refused one included, so
+// the count goes back down for each.
+func (s *Server) connState() func(net.Conn, http.ConnState) {
+	var open atomic.Int64
+	return func(c net.Conn, st http.ConnState) {
+		switch st {
+		case http.StateNew:
+			if open.Add(1) > int64(s.maxConns) {
+				s.log.Warn("registry connection refused", "reason", "connection cap", "source", c.RemoteAddr().String(), "max_conns", s.maxConns)
+				_ = c.Close() // the server's read fails and it reports StateClosed
+			}
+		case http.StateClosed, http.StateHijacked:
+			open.Add(-1)
+			if s.connClosed != nil {
+				s.connClosed(c.RemoteAddr().String())
+			}
+		}
 	}
 }
 
