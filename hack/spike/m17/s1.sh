@@ -250,7 +250,7 @@ EOF
 		fi
 		ready=0
 		for _ in $(seq 1 30); do
-			if kc get node "$WRK_NODE" --no-headers 2>/dev/null | awk '{print $2}' | grep -qx Ready; then
+			if grep -qx Ready <<<"$(kc get node "$WRK_NODE" --no-headers 2>/dev/null | awk '{print $2}')"; then
 				ready=1
 				break
 			fi

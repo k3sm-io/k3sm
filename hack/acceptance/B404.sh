@@ -113,9 +113,9 @@ if [ -w "$RODIR" ]; then
 fi
 rc=0; out="$(conformance_bin_preflight "$RODIR" SIT_PSA_WORKDIR 2>&1)" || rc=$?
 [ "$rc" -eq 1 ] || b3=no
-printf '%s\n' "$out" | grep -qF "$RODIR" || b3=no
-printf '%s\n' "$out" | grep -qF "sudo rm -rf $RODIR" || b3=no
-printf '%s\n' "$out" | grep -qF "SIT_PSA_WORKDIR=" || b3=no
+grep -qF "$RODIR" <<<"$out" || b3=no
+grep -qF "sudo rm -rf $RODIR" <<<"$out" || b3=no
+grep -qF "SIT_PSA_WORKDIR=" <<<"$out" || b3=no
 [ "$b3" = ok ] || printf '%s\n' "$out" | sed 's/^/    /'
 ladder "$b3" "b404.3  preflight on a chmod-555 dir returns 1 and names the path + remedy (rc=$rc)"
 

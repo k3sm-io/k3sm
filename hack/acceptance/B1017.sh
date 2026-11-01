@@ -42,7 +42,7 @@ out="$(go test -race -count=1 -v -run '^(TestStoreReadsZotLayout|TestStoreRoundT
 printf '%s\n' "$out" | grep -E '^(--- |ok|PASS)'
 # A test that does not run is not a pass.
 for t in TestStoreReadsZotLayout TestStoreRoundTripMatchesZot; do
-	printf '%s\n' "$out" | grep -q -- "--- PASS: $t " || { echo "B1017: FAIL: $t did not run"; exit 1; }
+	grep -q -- "--- PASS: $t " <<<"$out" || { echo "B1017: FAIL: $t did not run"; exit 1; }
 done
 go test -race -count=1 ./pkg/ociregistry/ref/ ./pkg/ociregistry/store/ || { echo "B1017: FAIL: package tests"; exit 1; }
 

@@ -74,7 +74,7 @@ run_test() {
 		ladder no "$id  $name ($pkg) passed"
 		return
 	fi
-	if printf '%s\n' "$out" | grep -qE 'no tests to run|no test files'; then
+	if grep -qE 'no tests to run|no test files' <<<"$out"; then
 		ladder no "$id  $name ($pkg) actually RAN — go test reported no tests to run (renamed/typo'd test name?)"
 		return
 	fi
@@ -149,9 +149,9 @@ VZ_HOST_RC=0
 VZ_HOST_LIST="$( (cd "$RUNTIMED_ROOT" && "${GOFLAGS_ENV[@]}" go list -deps ./cmd/k3sm-vmhost) )" || VZ_HOST_RC=$?
 if [ "$VZ_LIST_RC" -ne 0 ] || [ "$VZ_HOST_RC" -ne 0 ]; then
 	ladder no "b103.0c runtimed daemon/vmhost dependency closures enumerable — go list -deps exited $VZ_LIST_RC/$VZ_HOST_RC (see the error above); the vz canary MEASURED NOTHING, so it fails closed"
-elif ! printf '%s\n' "$VZ_LIST" | grep -qx 'k3sm.io/runtimed/pkg/sandbox'; then
+elif ! grep -qx 'k3sm.io/runtimed/pkg/sandbox' <<<"$VZ_LIST"; then
 	ladder no "b103.0c vz canary positive control — the daemon closure must list k3sm.io/runtimed/pkg/sandbox (the probe's own package); an empty/garbage listing must not read as vz-clean"
-elif ! printf '%s\n' "$VZ_HOST_LIST" | grep -q "$VZ_PATTERN"; then
+elif ! grep -q "$VZ_PATTERN" <<<"$VZ_HOST_LIST"; then
 	ladder no "b103.0c vz canary negative control — cmd/k3sm-vmhost's closure must MATCH '$VZ_PATTERN' (it is the binary that links Virtualization); a pattern that matches nothing anywhere cannot prove the daemon clean"
 else
 	VZ_DEPS="$(printf '%s\n' "$VZ_LIST" | grep -c "$VZ_PATTERN" || true)"

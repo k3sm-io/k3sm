@@ -46,11 +46,11 @@ for t in 'TestPruneThroughTheStore' \
 	'TestPruneThroughTheStore/planning_writes_nothing' \
 	'TestPruneThroughTheStore/a_planned_digest_tagged_or_re-pushed_before_its_delete_is_re-checked_out' \
 	'TestPruneThroughTheStore/a_prune_concurrent_with_a_push_does_not_lose_the_pushed_tag'; do
-	printf '%s\n' "$out" | grep -q -- "--- PASS: $t" || { echo "B1023: FAIL: $t did not run"; exit 1; }
+	grep -q -- "--- PASS: $t" <<<"$out" || { echo "B1023: FAIL: $t did not run"; exit 1; }
 done
 out="$(go test -race -count=1 -v -run '^TestImagePruneRechecksEachPlannedDigestBeforeItsDelete$' ./cmd/k3sm/ 2>&1)" || {
 	printf '%s\n' "$out"; echo "B1023: FAIL: prune re-check test"; exit 1; }
-printf '%s\n' "$out" | grep -q -- '--- PASS: TestImagePruneRechecksEachPlannedDigestBeforeItsDelete' || {
+grep -q -- '--- PASS: TestImagePruneRechecksEachPlannedDigestBeforeItsDelete' <<<"$out" || {
 	echo "B1023: FAIL: TestImagePruneRechecksEachPlannedDigestBeforeItsDelete did not run"; exit 1; }
 go test -race -count=1 ./pkg/registrysvc/ ./pkg/ociregistry/store/ || { echo "B1023: FAIL: package tests"; exit 1; }
 echo "B1023: PASS"

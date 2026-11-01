@@ -95,7 +95,7 @@ if [ -z "$WORKER" ]; then
 	cp_node="k3sm-$(hostname -s | tr '[:upper:]' '[:lower:]')"
 	WORKER="$(printf '%s\n' "$ready_nodes" | grep -v -x "$cp_node" | head -n1 || true)"
 fi
-if [ -n "$WORKER" ] && printf '%s\n' "$ready_nodes" | grep -qx "$WORKER"; then
+if [ -n "$WORKER" ] && grep -qx "$WORKER" <<<"$ready_nodes"; then
 	ladder ok "m3.0  joined worker identified: $WORKER (pass K3SM_WORKER to override)"
 else
 	ladder no "m3.0  could not identify a joined worker node (set K3SM_WORKER=<node>)"

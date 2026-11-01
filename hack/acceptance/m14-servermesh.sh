@@ -195,11 +195,11 @@ run_test() {
 		ladder no "$id  $name ($pkg) passed"
 		return
 	fi
-	if printf '%s\n' "$out" | grep -qE 'no tests to run|no test files'; then
+	if grep -qE 'no tests to run|no test files' <<<"$out"; then
 		ladder no "$id  $name ($pkg) actually RAN — go test reported no tests to run (renamed test?)"
 		return
 	fi
-	if ! printf '%s\n' "$out" | grep -qE "^[[:space:]]*--- PASS: ${name}( |\$)"; then
+	if ! grep -qE "^[[:space:]]*--- PASS: ${name}( |\$)" <<<"$out"; then
 		ladder no "$id  $name ($pkg) actually RAN — no top-level --- PASS line"
 		return
 	fi
@@ -452,7 +452,7 @@ case "$got_endpoint" in
 esac
 
 # ---- m14.L2/L3 — the wireguard device artifacts ----------------------------
-if ifconfig lo0 | grep -qE "inet ${SELF_MESH_IP}( |$|/)"; then
+if grep -qE "inet ${SELF_MESH_IP}( |$|/)" <<<"$(ifconfig lo0)"; then
 	ladder ok "m14.L2  the mesh-egress lo0 alias $SELF_MESH_IP is plumbed (the source the proxy binds for foreign pod destinations)"
 else
 	ladder no "m14.L2  the mesh-egress lo0 alias $SELF_MESH_IP is plumbed"
@@ -461,12 +461,12 @@ fi
 # address rather than `ifconfig | grep utun` matters: a Mac with a VPN already has
 # utun interfaces, so a bare utun grep would pass without k3sm having created
 # anything, while only the mesh device carries $SELF_LINK_IP. No pf is involved.
-if ifconfig 2>/dev/null | awk '/^utun[0-9]+:/{u=1;next} /^[^ \t]/{u=0} u && /inet /' | grep -qF "inet ${SELF_LINK_IP} --> ${SELF_LINK_IP} "; then
+if grep -qF "inet ${SELF_LINK_IP} --> ${SELF_LINK_IP} " <<<"$(ifconfig 2>/dev/null | awk '/^utun[0-9]+:/{u=1;next} /^[^ \t]/{u=0} u && /inet /')"; then
 	ladder ok "m14.L2  a utun carries the mesh link address $SELF_LINK_IP (the mesh device is up)"
 else
 	ladder no "m14.L2  a utun carries the mesh link address $SELF_LINK_IP (the mesh device did not come up)"
 fi
-if lsof -nP -iUDP:51820 2>/dev/null | grep -q k3sm; then
+if grep -q k3sm <<<"$(lsof -nP -iUDP:51820 2>/dev/null)"; then
 	ladder ok "m14.L3  wireguard is listening on UDP :51820 — the port the index-0 MeshPeer's endpoint advertises"
 else
 	ladder no "m14.L3  wireguard is listening on UDP :51820"
@@ -559,7 +559,7 @@ else
 fi
 RVIP="$(kc14 get svc m14-remote -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)"
 # Let the proxy's Service/EndpointSlice informers claim the VIP before dialing it.
-n=0; while [ $n -lt 60 ] && ! ifconfig lo0 | grep -qE "inet ${RVIP}( |$|/)"; do sleep 1; n=$((n+1)); done
+n=0; while [ $n -lt 60 ] && ! grep -qE "inet ${RVIP}( |$|/)" <<<"$(ifconfig lo0)"; do sleep 1; n=$((n+1)); done
 
 # Remote dials, in flight for the duration of the local round trips. They are
 # EXPECTED to fail (there is no second Mac behind that address); what matters is

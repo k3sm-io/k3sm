@@ -66,8 +66,8 @@ ladder "$fixed" "b374.2  the corrected sentence names the best-effort pfctl flus
 # enables, disables or configures pf, so pf's state is the Mac owner's.
 deferred=ok
 JOINED="$(tr '\n' ' ' < "$DOC" | tr -s ' ')"
-printf '%s' "$JOINED" | grep -qi 'never enables, disables or configures' || deferred=no
-printf '%s' "$JOINED" | grep -qi 'whatever the Mac.s owner set' || deferred=no
+grep -qi 'never enables, disables or configures' <<<"$JOINED" || deferred=no
+grep -qi 'whatever the Mac.s owner set' <<<"$JOINED" || deferred=no
 ladder "$deferred" "b374.3  the doc states k3sm never enables or configures pf"
 
 # ---- b374.4 — the workspace voice lint, fatal-only --------------------------

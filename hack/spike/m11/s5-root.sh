@@ -146,7 +146,7 @@ done
 # A pre-existing alias is someone else's state (or a previous crashed run's).
 # Refusing is safer than adopting it: the restore path must only ever undo what
 # THIS run did, or it becomes a way to delete configuration nobody asked about.
-if ifconfig lo0 2>/dev/null | grep -q "inet $VIP "; then
+if grep -q "inet $VIP " <<<"$(ifconfig lo0 2>/dev/null)"; then
   echo "REFUSED: $VIP is ALREADY aliased on lo0. This script only removes an alias it created." >&2
   echo "         Inspect it, and if it is a leftover: sudo ifconfig lo0 -alias $VIP" >&2
   exit 1
@@ -178,7 +178,7 @@ restore() {
   echo "=============================== RESTORING ==================================="
   if [ "$DID_ALIAS" -eq 1 ]; then
     ifconfig lo0 -alias "$VIP" 2>/dev/null
-    if ifconfig lo0 2>/dev/null | grep -q "inet $VIP "; then
+    if grep -q "inet $VIP " <<<"$(ifconfig lo0 2>/dev/null)"; then
       echo "S5ROOT_RESTORE_LO0_ALIAS=FAILED — $VIP is STILL on lo0; remove it by hand: sudo ifconfig lo0 -alias $VIP"
     else
       echo "S5ROOT_RESTORE_LO0_ALIAS=removed ($VIP is no longer on lo0, verified)"

@@ -623,7 +623,7 @@ if [ -n "${K3SM_M10_NODES:-}" ]; then
 	read -r NODE_A NODE_B extra <<<"$K3SM_M10_NODES"
 	[ -n "${NODE_B:-}" ] && [ -z "${extra:-}" ] && [ "$NODE_A" != "$NODE_B" ] || refuse "K3SM_M10_NODES must name two distinct nodes (got '$K3SM_M10_NODES')"
 	for n in "$NODE_A" "$NODE_B"; do
-		printf '%s\n' "$ready_nodes" | grep -qx "$n" || refuse "node $n is not a Ready darwin node"
+		grep -qx "$n" <<<"$ready_nodes" || refuse "node $n is not a Ready darwin node"
 	done
 else
 	count="$(printf '%s\n' "$ready_nodes" | grep -c . || true)"

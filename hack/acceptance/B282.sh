@@ -138,11 +138,11 @@ run_test() {
 		ladder no "$id  $name ($pkg) passed"
 		return
 	fi
-	if printf '%s\n' "$out" | grep -qE 'no tests to run|no test files'; then
+	if grep -qE 'no tests to run|no test files' <<<"$out"; then
 		ladder no "$id  $name ($pkg) actually RAN — go test reported no tests to run (renamed test?)"
 		return
 	fi
-	if ! printf '%s\n' "$out" | grep -qE "^[[:space:]]*--- PASS: ${name}( |\$)"; then
+	if ! grep -qE "^[[:space:]]*--- PASS: ${name}( |\$)" <<<"$out"; then
 		ladder no "$id  $name ($pkg) actually RAN — no top-level --- PASS line"
 		return
 	fi
@@ -334,7 +334,7 @@ else
 		# for both, the same readiness gate the release suite applies.
 		ready=0
 		for i in $(seq 1 60); do
-			if bkc get node b282-logs -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null | grep -q True \
+			if grep -q True <<<"$(bkc get node b282-logs -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" \
 				&& bkc get serviceaccount default >/dev/null 2>&1; then ready=1; break; fi
 			sleep 2
 		done
@@ -362,7 +362,7 @@ else
 		# newest timestamped sibling (upstream keeps that one uncompressed).
 		sample="$dir/0.log"
 		[ -s "$sample" ] || sample="$(ls "$dir"/0.log.[0-9]* 2>/dev/null | grep -v '\.gz$' | head -1)"
-		if [ -n "$dir" ] && head -1 "$sample" 2>/dev/null | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z? (stdout|stderr) [FP] '; then
+		if [ -n "$dir" ] && grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z? (stdout|stderr) [FP] ' <<<"$(head -1 "$sample" 2>/dev/null)"; then
 			ladder ok "b282.L1  the file is in the CRI line format (<timestamp> <stream> <F|P> <content>)"
 		else
 			ladder no "b282.L1  the file is in the CRI line format; first line: $(head -1 "$sample" 2>/dev/null | cut -c1-80)"
@@ -398,7 +398,7 @@ else
 		else
 			ladder no "b282.L3  --limit-bytes cuts mid-line (got: $(bkc logs chatty --tail 1 --limit-bytes 4 2>&1 | cut -c1-60))"
 		fi
-		if bkc logs chatty --tail 1 --timestamps 2>/dev/null | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z? LASTLINE$'; then
+		if grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z? LASTLINE$' <<<"$(bkc logs chatty --tail 1 --timestamps 2>/dev/null)"; then
 			ladder ok "b282.L3  --timestamps prefixes the line with its own timestamp"
 		else
 			ladder no "b282.L3  --timestamps prefixes the line (got: $(bkc logs chatty --tail 1 --timestamps 2>&1 | cut -c1-60))"
@@ -455,7 +455,7 @@ else
 		bkc apply -f "$B282_WORK/restarter.yaml" >/dev/null 2>&1 || true
 		n=0; prev=no
 		while [ $n -lt 180 ]; do
-			if bkc logs restarter --previous 2>/dev/null | grep -q INSTANCE-; then prev=ok; break; fi
+			if grep -q INSTANCE- <<<"$(bkc logs restarter --previous 2>/dev/null)"; then prev=ok; break; fi
 			sleep 2; n=$((n+2))
 		done
 		ladder "$prev" "b282.L5  after a restart, \`kubectl logs --previous\` returns the earlier instance's output"

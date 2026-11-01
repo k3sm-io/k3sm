@@ -184,7 +184,7 @@ nohup env MODEL_PATH="$MP" PYTHONPATH="$W" "$V" -m dynamo.worker --discovery-bac
 WK=$!
 UP=no
 for i in $(seq 1 90); do
-  curl -fsS -m 3 http://127.0.0.1:8121/v1/models 2>/dev/null | grep -q mlx && { UP=yes; break; }
+  grep -q mlx <<<"$(curl -fsS -m 3 http://127.0.0.1:8121/v1/models 2>/dev/null)" && { UP=yes; break; }
   sleep 5
 done
 if [ "$UP" = yes ]; then

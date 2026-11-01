@@ -194,28 +194,28 @@ if [ "${1:-}" = "--self-test" ]; then
 	st_fail=0
 	st() { if [ "$1" = ok ]; then echo "ok    $2"; else echo "FAIL  $2"; st_fail=1; fi; }
 	m="$(render_manifest lab-ns)"
-	printf '%s\n' "$m" | grep -qx '  namespace: lab-ns' && ! printf '%s\n' "$m" | grep -q 'namespace: default' &&
+	grep -qx '  namespace: lab-ns' <<<"$m" && ! grep -q 'namespace: default' <<<"$m" &&
 		st ok "namespace rendered into the example copy" || st no "namespace rendered into the example copy"
 	[ "$(printf '%s\n' "$m" | grep -c 'namespace:')" = 1 ] && st ok "exactly one namespace line" || st no "exactly one namespace line"
 	[ "$(render_manifest default)" = "$(cat "$EXAMPLE")" ] && st ok "default namespace leaves the example byte-identical" || st no "default namespace leaves the example byte-identical"
 	m="$(K3SM_MLX_IMAGE=example.invalid/img@sha256:abc render_manifest lab-ns)"
-	printf '%s\n' "$m" | grep -q 'image: example.invalid/img@sha256:abc' && st ok "image override still applies" || st no "image override still applies"
+	grep -q 'image: example.invalid/img@sha256:abc' <<<"$m" && st ok "image override still applies" || st no "image override still applies"
 	j="$(K3SM_LAB_TOLERATE_KEYS='estate.example.com/off' render_seed_job lab-ns node-a img:1 cache-$MODEL_NAME-0)"
 	for want in 'kind: Job' 'namespace: lab-ns' 'nodeName: node-a' 'kubernetes.io/os: darwin' \
 		'claimName: cache-qwen3-06b-0' 'image: img:1' "$MODEL_REPO" "$MODEL_REV" \
 		'value: /var/lib/mlx/cache/huggingface' '{key: estate.example.com/off, operator: Exists}'; do
-		printf '%s\n' "$j" | grep -qF -- "$want" && st ok "seed Job carries $want" || st no "seed Job carries $want"
+		grep -qF -- "$want" <<<"$j" && st ok "seed Job carries $want" || st no "seed Job carries $want"
 	done
 	[ "$(printf '%s\n' "$j" | grep -c 'k3sm.io/provider')" = 1 ] && st ok "seed Job tolerates k3sm.io/provider once" || st no "seed Job tolerates k3sm.io/provider once"
-	[ "$(printf '%s\n' "$j" | grep -c 'tolerations:')" = 1 ] && ! printf '%s\n' "$j" | grep -q 'operator: Exists}, {key: [^e]' &&
+	[ "$(printf '%s\n' "$j" | grep -c 'tolerations:')" = 1 ] && ! grep -q 'operator: Exists}, {key: [^e]' <<<"$j" &&
 		st ok "seed Job tolerates only the provider key and the named extras" || st no "seed Job tolerates only the provider key and the named extras"
-	printf '%s\n' "$j" | grep -qF -- "mountPath: $CACHE_MOUNT" && st ok "seed Job mounts the cache at $CACHE_MOUNT" || st no "seed Job mounts the cache at $CACHE_MOUNT"
+	grep -qF -- "mountPath: $CACHE_MOUNT" <<<"$j" && st ok "seed Job mounts the cache at $CACHE_MOUNT" || st no "seed Job mounts the cache at $CACHE_MOUNT"
 	go_mount="$(sed -nE 's/^[[:space:]]*CacheMountPath = "([^"]+)".*/\1/p' "$REPO_ROOT/pkg/mlx/render.go")"
 	go_home="$(sed -nE 's/^[[:space:]]*hfHomePath = CacheMountPath \+ "([^"]+)".*/\1/p' "$REPO_ROOT/pkg/mlx/render.go")"
 	[ -n "$go_mount" ] && [ "$CACHE_MOUNT" = "$go_mount" ] && st ok "gate cache mount equals the serving pod's ($go_mount)" || st no "gate cache mount equals the serving pod's (${go_mount:-unparsed})"
-	[ -n "$go_home" ] && [ "$HF_HOME_PATH" = "$go_mount$go_home" ] && printf '%s\n' "$j" | grep -qF -- "value: $go_mount$go_home" &&
+	[ -n "$go_home" ] && [ "$HF_HOME_PATH" = "$go_mount$go_home" ] && grep -qF -- "value: $go_mount$go_home" <<<"$j" &&
 		st ok "seed Job HF_HOME equals the serving pod's ($go_mount$go_home)" || st no "seed Job HF_HOME equals the serving pod's"
-	printf '%s\n' "$j" | grep -qF "cache_dir=c" && printf '%s\n' "$j" | grep -qF "c='.'+os.environ['HF_HOME']" &&
+	grep -qF "cache_dir=c" <<<"$j" && grep -qF "c='.'+os.environ['HF_HOME']" <<<"$j" &&
 		st ok "seed download targets a relative cache_dir under the mount" || st no "seed download targets a relative cache_dir under the mount"
 	body="$(cat "$0")"
 	del_line="$(printf '%s\n' "$body" | grep -n '^delete_seed_job$' | head -1 | cut -d: -f1)"
@@ -223,7 +223,7 @@ if [ "${1:-}" = "--self-test" ]; then
 	ready_line="$(printf '%s\n' "$body" | grep -n '^# m8.4 Ready' | head -1 | cut -d: -f1)"
 	[ -n "$del_line" ] && [ -n "$seed_line" ] && [ -n "$ready_line" ] && [ "$seed_line" -lt "$del_line" ] && [ "$del_line" -lt "$ready_line" ] &&
 		st ok "seed Job is deleted after m8.3-b and before m8.4" || st no "seed Job is deleted after m8.3-b and before m8.4"
-	printf '%s\n' "$body" | grep -q 'cascade=foreground' && st ok "seed Job delete is foreground" || st no "seed Job delete is foreground"
+	grep -q 'cascade=foreground' <<<"$body" && st ok "seed Job delete is foreground" || st no "seed Job delete is foreground"
 	[ "$(seed_image lab-ns)" = "$(grep -E '^[[:space:]]*image:' "$EXAMPLE" | head -1 | sed -E 's#^[[:space:]]*image:[[:space:]]*##')" ] &&
 		st ok "seed image is the example's serving image" || st no "seed image is the example's serving image"
 	[ "$("$0" --render-seed-job lab-ns node-a "cache-$MODEL_NAME-0")" = "$(render_seed_job lab-ns node-a "$(seed_image lab-ns)" "cache-$MODEL_NAME-0")" ] &&
@@ -338,7 +338,7 @@ else
 fi
 
 GPU_CAP="$(kubectl get nodes -o jsonpath='{.items[*].status.allocatable.mlx\.k3sm\.io/gpu}' 2>/dev/null || true)"
-if printf '%s' "$GPU_CAP" | grep -qE '[1-9]'; then
+if grep -qE '[1-9]' <<<"$GPU_CAP"; then
 	ladder ok "m8.0-c  a node advertises the mlx.k3sm.io/gpu extended resource (allocatable: $GPU_CAP)"
 else
 	ladder no "m8.0-c  NO node advertises mlx.k3sm.io/gpu — this gate requires apple-gpu (got: '${GPU_CAP:-none}')"

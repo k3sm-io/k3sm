@@ -123,8 +123,8 @@ o=ok
 enr_body="$(func_body "$PHASES_GO" '^func enrollServerMesh[(]')"
 sup_body="$(func_body "$PHASES_GO" '^func startJoinSupervisor[(]')"
 drive_body="$(func_body "$SERVER_GO" '^func runServer[(]')"
-printf '%s\n' "$enr_body" | grep -q 'newMeshEnroller(restCfg' || o=no
-printf '%s\n' "$sup_body" | grep -q 'startBootstrapServer(ctx, deps' || o=no
+grep -q 'newMeshEnroller(restCfg' <<<"$enr_body" || o=no
+grep -q 'startBootstrapServer(ctx, deps' <<<"$sup_body" || o=no
 # The only call sites in the command's non-test source (a second site outside the
 # phase helper would escape the ordering this rung pins).
 nontest_go="$(cd "$K3SM_ROOT/cmd/k3sm" && ls -- *.go | grep -v '_test\.go$')"
@@ -138,8 +138,8 @@ ens_ln="$(printf '%s\n' "$drive_body" | grep -n 'if err = ensureMeshPeerCRD(ctx,
 ret_ok=no
 if [ -n "$ens_ln" ]; then
 	# the ensure's error check closes within three lines and returns the error
-	printf '%s\n' "$drive_body" | sed -n "$ens_ln,$((ens_ln + 4))p" | tr '\n' ' ' |
-		grep -qE '\}, logger\); err != nil \{[[:space:]]+return err' && ret_ok=ok
+	grep -qE '\}, logger\); err != nil \{[[:space:]]+return err' \
+		<<<"$(printf '%s\n' "$drive_body" | sed -n "$ens_ln,$((ens_ln + 4))p" | tr '\n' ' ')" && ret_ok=ok
 fi
 enr_ln="$(printf '%s\n' "$drive_body" | grep -n 'enrollServerMesh(ctx, plan' | head -1 | cut -d: -f1 || true)"
 sup_ln="$(printf '%s\n' "$drive_body" | grep -n 'startJoinSupervisor(ctx, plan' | head -1 | cut -d: -f1 || true)"
@@ -167,11 +167,11 @@ run_test() {
 		ladder no "$id  $name ($pkg) passed"
 		return
 	fi
-	if printf '%s\n' "$out" | grep -qE 'no tests to run|no test files'; then
+	if grep -qE 'no tests to run|no test files' <<<"$out"; then
 		ladder no "$id  $name ($pkg) actually RAN — go test reported no tests to run (renamed test?)"
 		return
 	fi
-	if ! printf '%s\n' "$out" | grep -qE "^[[:space:]]*--- PASS: ${name}( |\$)"; then
+	if ! grep -qE "^[[:space:]]*--- PASS: ${name}( |\$)" <<<"$out"; then
 		ladder no "$id  $name ($pkg) actually RAN — no top-level --- PASS line"
 		return
 	fi

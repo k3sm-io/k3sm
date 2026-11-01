@@ -84,7 +84,7 @@ if [ -z "$dv_line" ] || [ -z "$nd_line" ] || [ "$dv_line" -ge "$nd_line" ]; then
 ladder "$o" "b248.1  the datavol artifact precedes the netd artifact in artifactManifest (lines ${dv_line:-?} < ${nd_line:-?})"
 
 r=ok
-grep -A4 'func Refusal' "$K3SM_ROOT/pkg/dataroot/dataroot.go" | grep -q 'k3sm datavol mount' || r=no
+grep -q 'k3sm datavol mount' <<<"$(grep -A4 'func Refusal' "$K3SM_ROOT/pkg/dataroot/dataroot.go")" || r=no
 grep -q '/Library/Preferences/io\.k3sm\.datavol\.json' "$K3SM_ROOT/pkg/dataroot/record.go" || r=no
 ladder "$r" "b248.1  the shadowed-root refusal names \`sudo k3sm datavol mount\` + the record path literal is pkg/dataroot's"
 
@@ -118,11 +118,11 @@ run_test() {
 		ladder no "$id  $name ($pkg) passed"
 		return
 	fi
-	if printf '%s\n' "$out" | grep -qE 'no tests to run|no test files'; then
+	if grep -qE 'no tests to run|no test files' <<<"$out"; then
 		ladder no "$id  $name ($pkg) actually RAN — go test reported no tests to run (renamed test?)"
 		return
 	fi
-	if ! printf '%s\n' "$out" | grep -qE "^[[:space:]]*--- PASS: ${name}( |\$)"; then
+	if ! grep -qE "^[[:space:]]*--- PASS: ${name}( |\$)" <<<"$out"; then
 		ladder no "$id  $name ($pkg) actually RAN — no top-level --- PASS line"
 		return
 	fi
@@ -343,18 +343,18 @@ print(d if isinstance(d, int) else 0)' "$1"; }
 		[ "$gotquota" = "$QUOTA" ] || { echo "    CapacityQuota=$gotquota want $QUOTA"; l1=no; }
 		mountline="$(mount | grep -F " on $MP " || true)"
 		for opt in nobrowse nosuid nodev; do
-			printf '%s' "$mountline" | grep -q "$opt" || { echo "    mount line lacks $opt: $mountline"; l1=no; }
+			grep -q "$opt" <<<"$mountline" || { echo "    mount line lacks $opt: $mountline"; l1=no; }
 		done
 		# The scratch mount point is root-owned 0700, so both of these answer
 		# [UNKNOWN] / "invalid path" when run unprivileged — they are asked as
 		# root, which is also how the installer asks them.
 		sudo test -f "$MP/.metadata_never_index" || { echo "    no .metadata_never_index marker"; l1=no; }
 		md="$(sudo mdutil -s "$MP" 2>&1 || true)"
-		printf '%s' "$md" | grep -qiE 'indexing disabled|unknown indexing state' || { echo "    mdutil -s: $md"; l1=no; }
+		grep -qiE 'indexing disabled|unknown indexing state' <<<"$md" || { echo "    mdutil -s: $md"; l1=no; }
 		# A nobrowse volume is not tracked by Spotlight at all, so "unknown
 		# indexing state" and "Indexing disabled" both mean not indexed.
 		tm="$(sudo tmutil isexcluded "$MP" 2>&1 || true)"
-		printf '%s' "$tm" | grep -q '\[Excluded\]' || { echo "    tmutil isexcluded: $tm"; l1=no; }
+		grep -q '\[Excluded\]' <<<"$tm" || { echo "    tmutil isexcluded: $tm"; l1=no; }
 	fi
 	ladder "$l1" "b248.L1  $VOL is case-sensitive APFS, quota $QUOTA, mounted nobrowse/nosuid/nodev at $MP, un-indexed and TM-excluded"
 
@@ -385,7 +385,7 @@ print(d if isinstance(d, int) else 0)' "$1"; }
 		echo "    NOTE  df / avail went $boot_avail_before KiB -> $boot_avail_after KiB (shared container free space, expected to follow the write)"
 		# Past the cap: the quota is enforced by the filesystem, not by k3sm.
 		dd_err="$(sudo dd if=/dev/zero of="$MP/overflow" bs=1m count=2048 2>&1 >/dev/null || true)"
-		printf '%s' "$dd_err" | grep -q 'No space left on device' || { echo "    a write past the cap did not report ENOSPC: $dd_err"; l2=no; }
+		grep -q 'No space left on device' <<<"$dd_err" || { echo "    a write past the cap did not report ENOSPC: $dd_err"; l2=no; }
 		sudo rm -f "$MP/fill" "$MP/overflow"
 	fi
 	ladder "$l2" "b248.L2  statfs reports the quota, a 1 GiB write lands on the volume, and a write past the cap fails with ENOSPC"
@@ -464,8 +464,8 @@ print(d if isinstance(d, int) else 0)' "$1"; }
 		[ "$got_files" = "$want_files" ] || { echo "    $got_files files on the volume, $want_files at the source"; l6=no; }
 		got_sha="$(sudo shasum -a 256 "$SRC/server/db/state.db" | awk '{print $1}')"
 		[ "$got_sha" = "$want_sha" ] || { echo "    state.db hashes $got_sha on the volume, $want_sha at the source"; l6=no; }
-		printf '%s' "$stats_line" | grep -q 'copy=' || { echo "    the stats line does not name a copy duration: $stats_line"; l6=no; }
-		printf '%s' "$stats_line" | grep -q 'verify=' || { echo "    the stats line does not name a verify duration: $stats_line"; l6=no; }
+		grep -q 'copy=' <<<"$stats_line" || { echo "    the stats line does not name a copy duration: $stats_line"; l6=no; }
+		grep -q 'verify=' <<<"$stats_line" || { echo "    the stats line does not name a verify duration: $stats_line"; l6=no; }
 	fi
 	ladder "$l6" "b248.L6  $want_files files and the datastore's bytes migrated onto $VOL_M, .pre-volume preserved ($stats_line)"
 
@@ -549,7 +549,7 @@ PLIST
 			code="$(oneshot_key 'last exit code')"
 			state="$(oneshot_key state)"
 			runs="$(oneshot_key runs)"
-			if [ "${runs:-0}" -ge 1 ] 2>/dev/null && [ "$state" != running ] && printf '%s' "$code" | grep -qE '^-?[0-9]+$'; then
+			if [ "${runs:-0}" -ge 1 ] 2>/dev/null && [ "$state" != running ] && grep -qE '^-?[0-9]+$' <<<"$code"; then
 				if [ "$want" = zero ] && [ "$code" = 0 ]; then return 0; fi
 				if [ "$want" = nonzero ] && [ "$code" != 0 ]; then return 0; fi
 			fi
@@ -591,10 +591,10 @@ print(d)' "$1"; }
 	dv_src="$(sed -n '/^func DatavolPlist(/,/^}/p' "$K3SM_ROOT/pkg/install/datavol.go")"
 	for pat in 'Label:[[:space:]]+DatavolLabel' '"datavol", "mount"' 'RunAtLoad:[[:space:]]+true' \
 		'KeepAliveOnFailure:[[:space:]]+true' 'ThrottleInterval:[[:space:]]+datavolThrottleSeconds'; do
-		printf '%s' "$dv_src" | grep -qE "$pat" || { echo "    DatavolPlist no longer carries /$pat/"; l7=no; }
+		grep -qE "$pat" <<<"$dv_src" || { echo "    DatavolPlist no longer carries /$pat/"; l7=no; }
 	done
 	# A field line, not the "// No UserName:" comment the template carries.
-	if printf '%s' "$dv_src" | grep -qE '^[[:space:]]*UserName:'; then echo "    DatavolPlist now names a UserName; the scratch plist runs as root"; l7=no; fi
+	if grep -qE '^[[:space:]]*UserName:' <<<"$dv_src"; then echo "    DatavolPlist now names a UserName; the scratch plist runs as root"; l7=no; fi
 	grep -qE 'datavolThrottleSeconds[[:space:]]*=[[:space:]]*10$' "$K3SM_ROOT/pkg/install/datavol.go" || { echo "    datavolThrottleSeconds is no longer 10"; l7=no; }
 	grep -q '<key>KeepAlive</key>\\n  <dict>\\n    <key>SuccessfulExit</key>\\n    <false/>' "$K3SM_ROOT/pkg/install/plist.go" || { echo "    renderPlist no longer writes the SuccessfulExit dict"; l7=no; }
 	rendered="$(oneshot_plist "$REC_M")"

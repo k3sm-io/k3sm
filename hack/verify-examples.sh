@@ -229,7 +229,7 @@ YAML
 		fi
 		local want
 		for want in "$@"; do
-			if ! printf '%s' "$out" | grep -q -- "$want"; then
+			if ! grep -q -- "$want" <<<"$out"; then
 				echo "  FAIL  $file failed, but no finding matched: $want"
 				echo "$out" | sed 's/^/          /'
 				failures=$((failures + 1))

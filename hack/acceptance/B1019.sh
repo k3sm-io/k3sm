@@ -40,7 +40,7 @@ run() {
 	# A test that does not run is not a pass.
 	local t
 	for t in "$@"; do
-		printf '%s\n' "$out" | grep -q -- "--- PASS: $t " || { echo "B1019: FAIL: $t did not run"; exit 1; }
+		grep -q -- "--- PASS: $t " <<<"$out" || { echo "B1019: FAIL: $t did not run"; exit 1; }
 	done
 }
 
@@ -59,7 +59,8 @@ n="$(printf '%s\n' "$out" | grep -c -- '--- PASS: TestAccessControl/')"
 if grep -rlE 'golang\.org/x/crypto|HTPasswdPath|registrysvc' --include='*.go' pkg/ociregistry | grep -v '_test\.go$'; then
 	echo "B1019: FAIL: pkg/ociregistry imports x/crypto or reads the htpasswd file"; exit 1
 fi
-if go list -deps ./pkg/ociregistry/... | grep -q 'golang.org/x/crypto/bcrypt'; then
+deps=$(go list -deps ./pkg/ociregistry/...)
+if grep -q 'golang.org/x/crypto/bcrypt' <<<"$deps"; then
 	echo "B1019: FAIL: pkg/ociregistry links bcrypt"; exit 1
 fi
 echo "B1019: PASS"

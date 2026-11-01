@@ -85,7 +85,7 @@ for fix in $MS_FIXES; do
 		' "$HERE/go.mod" >"$tmp/graph/go.mod"
 		if out="$("$BUILD" --check-graph "$tmp/graph")"; then
 			bad "a go.mod with $fmod $variant passed"
-		elif printf '%s\n' "$out" | grep -qF "require $fmod $fver"; then
+		elif grep -qF "require $fmod $fver" <<<"$out"; then
 			ok "a go.mod with $fmod $variant is refused, naming it"
 		else
 			bad "$fmod $variant not named: $out"
@@ -107,7 +107,7 @@ for tool in go curl k3sm govulncheck; do
 done
 if out="$(PATH="$tmp/bin:/usr/bin:/bin" "$tmp/tree/hack/images/metrics-server/build.sh" --work "$tmp/w" 2>&1)"; then
 	bad "a placeholder MS_H1 built"
-elif printf '%s\n' "$out" | grep -q "MS_H1 '@PLACEHOLDER@'" && [ ! -e "$tmp/ran" ] && [ ! -e "$tmp/w" ]; then
+elif grep -q "MS_H1 '@PLACEHOLDER@'" <<<"$out" && [ ! -e "$tmp/ran" ] && [ ! -e "$tmp/w" ]; then
 	ok "a placeholder MS_H1 is refused, naming it, before any tool runs or anything is written"
 else
 	bad "placeholder not refused first: $out $(cat "$tmp/ran" 2>/dev/null)"
@@ -116,7 +116,7 @@ fi
 echo "==> the Dockerfile is COPY-only"
 df="$("$BUILD" --print-dockerfile)"
 instr="$(printf '%s\n' "$df" | grep -Ev '^[[:space:]]*(#|$)' | awk '{print toupper($1)}' | sort -u | tr '\n' ' ')"
-if [ "$instr" = "COPY ENTRYPOINT FROM " ] && printf '%s\n' "$df" | grep -qx 'FROM scratch'; then
+if [ "$instr" = "COPY ENTRYPOINT FROM " ] && grep -qx 'FROM scratch' <<<"$df"; then
 	ok "FROM scratch, COPY and ENTRYPOINT only"
 else
 	bad "Dockerfile instructions: $instr"
@@ -129,14 +129,14 @@ cat >"$good" <<EOF
 EOF
 if "$BUILD" --check-download "$good" >/dev/null; then ok "the pinned download passes"; else bad "the pinned download was refused: $("$BUILD" --check-download "$good")"; fi
 sed 's/"Sum":"[^"]*"/"Sum":"h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="/' "$good" >"$tmp/badsum.json"
-if out="$("$BUILD" --check-download "$tmp/badsum.json")"; then bad "a Sum mismatch passed"; elif printf '%s\n' "$out" | grep -q "Sum"; then ok "a Sum mismatch is refused, naming it"; else bad "Sum mismatch not named: $out"; fi
+if out="$("$BUILD" --check-download "$tmp/badsum.json")"; then bad "a Sum mismatch passed"; elif grep -q "Sum" <<<"$out"; then ok "a Sum mismatch is refused, naming it"; else bad "Sum mismatch not named: $out"; fi
 sed "s/\"Version\":\"$MS_VERSION\"/\"Version\":\"v0.0.1\"/" "$good" >"$tmp/badver.json"
 if "$BUILD" --check-download "$tmp/badver.json" >/dev/null; then bad "another version passed"; else ok "another version is refused"; fi
 sed "s/$MS_COMMIT/0000000000000000000000000000000000000000/" "$good" >"$tmp/badcommit.json"
 if "$BUILD" --check-download "$tmp/badcommit.json" >/dev/null; then bad "another commit passed"; else ok "another tag commit is refused"; fi
 
 echo "==> no wall clock in the build"
-if "$BUILD" --print-ldflags | grep -q -- "-X k8s.io/client-go/pkg/version.buildDate=$MS_EPOCH\$"; then ok "buildDate is the pinned MS_EPOCH"; else bad "ldflags: $("$BUILD" --print-ldflags)"; fi
+if grep -q -- "-X k8s.io/client-go/pkg/version.buildDate=$MS_EPOCH\$" <<<"$("$BUILD" --print-ldflags)"; then ok "buildDate is the pinned MS_EPOCH"; else bad "ldflags: $("$BUILD" --print-ldflags)"; fi
 # A command substitution of date, or date at the start of a command.
 if grep -Eq '\$\([[:space:]]*date|`[[:space:]]*date|(^|[;&|][[:space:]]*)date[[:space:]]' "$BUILD"; then bad "build.sh runs date"; else ok "build.sh never runs date"; fi
 
@@ -167,15 +167,15 @@ finding "$vid" example.com/other "$vver" >"$tmp/vuln-module.txt"
 finding "$vid" "$vmod" v99.0.0 >"$tmp/vuln-version.txt"
 check() { VULN_TODAY="${VULN_TODAY:-2026-10-15}" bash "$tmp/vt/hack/images/metrics-server/build.sh" --check-vulns "$@"; }
 if check 3 "$tmp/vuln-known.txt" >/dev/null; then ok "an accepted finding passes"; else bad "an accepted finding was refused: $(check 3 "$tmp/vuln-known.txt")"; fi
-if out="$(check 3 "$tmp/vuln-new.txt")"; then bad "a new finding passed"; elif printf '%s\n' "$out" | grep -q "GO-2099-0001"; then ok "a new finding is refused, naming it"; else bad "new finding not named: $out"; fi
+if out="$(check 3 "$tmp/vuln-new.txt")"; then bad "a new finding passed"; elif grep -q "GO-2099-0001" <<<"$out"; then ok "a new finding is refused, naming it"; else bad "new finding not named: $out"; fi
 if check 3 "$tmp/vuln-module.txt" >/dev/null; then bad "an accepted id in another module passed"; else ok "an accepted id found in another module is refused"; fi
 if check 3 "$tmp/vuln-version.txt" >/dev/null; then bad "an accepted id at another found version passed"; else ok "an accepted id at another found version is refused"; fi
-if out="$(VULN_TODAY=2099-01-01 check 3 "$tmp/vuln-known.txt")"; then bad "an expired acceptance passed"; elif printf '%s\n' "$out" | grep -q "expired"; then ok "an expired acceptance is refused"; else bad "expiry not named: $out"; fi
+if out="$(VULN_TODAY=2099-01-01 check 3 "$tmp/vuln-known.txt")"; then bad "an expired acceptance passed"; elif grep -q "expired" <<<"$out"; then ok "an expired acceptance is refused"; else bad "expiry not named: $out"; fi
 mkdir -p "$tmp/pin/hack/images/metrics-server"
 sed 's/^MS_VERSION=".*"/MS_VERSION="v9.9.9"/' "$BUILD" >"$tmp/pin/hack/images/metrics-server/build.sh"
 cp "$tmp/vt/hack/images/metrics-server/govulncheck.accepted" "$tmp/pin/hack/images/metrics-server/"
 cp -R "$tmp/tree/hack/release" "$tmp/pin/hack/"
-if out="$(VULN_TODAY=2026-10-15 bash "$tmp/pin/hack/images/metrics-server/build.sh" --check-vulns 3 "$tmp/vuln-known.txt")"; then bad "an acceptance for another upstream release passed"; elif printf '%s\n' "$out" | grep -q "was for metrics-server"; then ok "an acceptance for another upstream release is refused"; else bad "pin mismatch not named: $out"; fi
+if out="$(VULN_TODAY=2026-10-15 bash "$tmp/pin/hack/images/metrics-server/build.sh" --check-vulns 3 "$tmp/vuln-known.txt")"; then bad "an acceptance for another upstream release passed"; elif grep -q "was for metrics-server" <<<"$out"; then ok "an acceptance for another upstream release is refused"; else bad "pin mismatch not named: $out"; fi
 if check 1 "$tmp/vuln-known.txt" >/dev/null; then bad "a failed govulncheck run passed"; else ok "a failed govulncheck run (a network error) is refused"; fi
 if check 3 /dev/null >/dev/null; then bad "unreadable findings passed"; else ok "findings the script cannot read are refused"; fi
 

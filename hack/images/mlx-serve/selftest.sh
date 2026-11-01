@@ -146,7 +146,7 @@ done
 
 # ---- 3 — build.sh refuses to run without uv --------------------------------
 out="$(K3SM_MLX_UV=/nonexistent/uv "$BUILD" 2>&1)"; rc=$?
-if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'uv not found'; then
+if [ "$rc" -ne 0 ] && grep -q 'uv not found' <<<"$out"; then
 	ladder ok "3.uv  build.sh stops on a missing uv (exit $rc)"
 else
 	ladder no "3.uv  build.sh stops on a missing uv (exit $rc)"
@@ -160,8 +160,8 @@ fi
 # shellcheck disable=SC2016 # the pattern is the literal text "$K3SM_BIN"
 calls="$(grep -F '"$K3SM_BIN" build ' "$BUILD")"
 if [ -n "$calls" ] &&
-	! printf '%s\n' "$calls" | grep -v -- '--no-record' | grep -q . &&
-	! printf '%s\n' "$calls" | grep -v -- '--output' | grep -q .; then
+	! grep -q . <<<"$(printf '%s\n' "$calls" | grep -v -- '--no-record')" &&
+	! grep -q . <<<"$(printf '%s\n' "$calls" | grep -v -- '--output')"; then
 	ladder ok "3.norecord  build.sh packages with k3sm build --no-record --output (no root, no store)"
 else
 	ladder no "3.norecord  build.sh packages with k3sm build --no-record --output (no root, no store)"
@@ -198,7 +198,7 @@ fi
 # is invisible to every check except this one.
 ep="$(grep -E '^ENTRYPOINT ' "$DF")"
 for token in '"-m"' '"serve"' '"--continuous-batching"' '"0.0.0.0"'; do
-	if printf '%s' "$ep" | grep -qF "$token"; then
+	if grep -qF "$token" <<<"$ep"; then
 		ladder ok "4.argv  ENTRYPOINT carries $token"
 	else
 		ladder no "4.argv  ENTRYPOINT carries $token"
@@ -206,7 +206,7 @@ for token in '"-m"' '"serve"' '"--continuous-batching"' '"0.0.0.0"'; do
 done
 # argv[0] must be the interpreter Mach-O itself — not /bin/python3, which is a
 # symlink, and not a shell wrapper.
-if printf '%s' "$ep" | grep -qE '\["/bin/python3\.[0-9]+"'; then
+if grep -qE '\["/bin/python3\.[0-9]+"' <<<"$ep"; then
 	ladder ok "4.argv0  ENTRYPOINT starts at the interpreter binary, not a symlink or a script"
 else
 	ladder no "4.argv0  ENTRYPOINT starts at the interpreter binary, not a symlink or a script"
@@ -245,7 +245,7 @@ else
 	ladder no "5.green  walk-verify passes a validly signed tree"
 fi
 out="$("$WALK" --tree "$BAD" 2>&1)"; rc=$?
-if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'INVALID'; then
+if [ "$rc" -eq 1 ] && grep -q 'INVALID' <<<"$out"; then
 	ladder ok "5.red  walk-verify fails a tree with an invalid-signature Mach-O (exit $rc)"
 else
 	ladder no "5.red  walk-verify fails a tree with an invalid-signature Mach-O (exit $rc)"
@@ -357,7 +357,7 @@ fi
 
 mklayout "$WORK/layout-mislabelled" "$GOOD" mislabelled /bin/python3.12
 out="$("$WALK" --layout "$WORK/layout-mislabelled" 2>&1)"; rc=$?
-if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'gzip'; then
+if [ "$rc" -ne 0 ] && grep -q 'gzip' <<<"$out"; then
 	ladder ok "6.mislabelled  walk-verify fails a layer whose bytes contradict its media type"
 else
 	ladder no "6.mislabelled  walk-verify fails a layer whose bytes contradict its media type"
@@ -365,7 +365,7 @@ fi
 
 mklayout "$WORK/layout-corrupt" "$GOOD" corrupt /bin/python3.12
 out="$("$WALK" --layout "$WORK/layout-corrupt" 2>&1)"; rc=$?
-if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'digest'; then
+if [ "$rc" -ne 0 ] && grep -q 'digest' <<<"$out"; then
 	ladder ok "6.corrupt  walk-verify fails a blob that does not match its digest"
 else
 	ladder no "6.corrupt  walk-verify fails a blob that does not match its digest"
@@ -376,7 +376,7 @@ cp "$SYSBIN" "$SCRIPTEP/bin/python3.12"
 printf '#!/bin/sh\nexec /bin/python3.12 "$@"\n' > "$SCRIPTEP/bin/serve"
 mklayout "$WORK/layout-script" "$SCRIPTEP" plain /bin/serve
 out="$("$WALK" --layout "$WORK/layout-script" 2>&1)"; rc=$?
-if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'ENTRYPOINT'; then
+if [ "$rc" -ne 0 ] && grep -q 'ENTRYPOINT' <<<"$out"; then
 	ladder ok "6.entrypoint  walk-verify fails a non-Mach-O entrypoint"
 else
 	ladder no "6.entrypoint  walk-verify fails a non-Mach-O entrypoint"
@@ -688,7 +688,7 @@ if [ -f "$SERVE" ] && PYTHONDONTWRITEBYTECODE=1 python3 -c 'import ast, sys; ast
 else
 	ladder no "8.parse  k3sm_serve.py parses"
 fi
-if printf '%s' "$ep" | grep -qF '"k3sm_serve", "serve"' && grep -q '^SERVE_MODULE="k3sm_serve"$' "$BUILD" &&
+if grep -qF '"k3sm_serve", "serve"' <<<"$ep" && grep -q '^SERVE_MODULE="k3sm_serve"$' "$BUILD" &&
 	grep -qE '^	for module in .*SHARD_MODULE.*SERVE_MODULE' "$BUILD"; then
 	ladder ok "8.entrypoint  the ENTRYPOINT runs vllm-mlx's serve through k3sm_serve, and build.sh installs it"
 else
@@ -1542,7 +1542,7 @@ fi
 refused() { # <label> <expected message> <build.sh args...>
 	local label="$1" msg="$2"; shift 2
 	out="$(fromstage "$@")"; rc=$?
-	if [ "$rc" -ne 0 ] && [ ! -f "$WORK/fake-argv" ] && printf '%s' "$out" | grep -q -- "$msg"; then
+	if [ "$rc" -ne 0 ] && [ ! -f "$WORK/fake-argv" ] && grep -q -- "$msg" <<<"$out"; then
 		ladder ok "11.$label  refused before packaging (exit $rc)"
 	else
 		ladder no "11.$label  refused before packaging (exit $rc)"

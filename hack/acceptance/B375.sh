@@ -146,7 +146,7 @@ while IFS= read -r pkgrel; do
 		printf '%s\n' "$out" | tail -40
 		continue
 	}
-	if printf '%s\n' "$out" | grep -qE 'no tests to run|no test files'; then
+	if grep -qE 'no tests to run|no test files' <<<"$out"; then
 		b3=no
 		echo "  $pkgrel matched no tests for filter $filter (renamed test?)"
 		continue

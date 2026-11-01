@@ -169,7 +169,7 @@ verify_lock() {
 	if [ "${reqs:-0}" -eq 0 ]; then
 		die "$lock has no requirements — refusing to build an empty payload"
 	fi
-	if printf '%s\n' "$report" | grep -q '^  REFUSED'; then
+	if grep -q '^  REFUSED' <<<"$report"; then
 		printf '%s\n' "$report" | grep '^  REFUSED' >&2
 		echo "mlx-serve: $lock is not fully hash-pinned." >&2
 		echo "           Regenerate it with 'uv pip compile --generate-hashes' — see README.md." >&2

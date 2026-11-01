@@ -79,7 +79,7 @@ if [ "$mode" = rollback ]; then
 	fi
 	: "${KUBECONFIG:?KUBECONFIG must name the admin kubeconfig}"
 	data="$(kubectl -n kube-system get cm extension-apiserver-authentication -o jsonpath='{.data}')"
-	if printf '%s' "$data" | grep -q 'requestheader-'; then
+	if grep -q 'requestheader-' <<<"$data"; then
 		ladder no "b411.R  extension-apiserver-authentication still carries requestheader- keys after the rollback (delete the ConfigMap once; the old apiserver recreates it)"
 	else
 		ladder ok "b411.R  extension-apiserver-authentication carries no requestheader- key"

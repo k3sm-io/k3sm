@@ -149,7 +149,7 @@ for repo in $REPOS; do
 	cfg="$(sed 's/#.*//' "$yml")"
 
 	# (b) invokes hack/ci.sh
-	if printf '%s\n' "$cfg" | grep -q 'hack/ci.sh'; then
+	if grep -q 'hack/ci.sh' <<<"$cfg"; then
 		ladder ok "$repo: workflow runs hack/ci.sh"
 	else
 		ladder no "$repo: workflow runs hack/ci.sh"
@@ -158,36 +158,36 @@ for repo in $REPOS; do
 	# (c) has a -race step that carries CGO_ENABLED=1 (the race detector needs cgo,
 	# even for the CGO=0 repos apis/darwin-net — a race step without cgo fails in real
 	# CI but would pass a bare 'go test -race' grep).
-	if printf '%s\n' "$cfg" | grep -qE 'CGO_ENABLED=1[[:space:]]+go test -race'; then
+	if grep -qE 'CGO_ENABLED=1[[:space:]]+go test -race' <<<"$cfg"; then
 		ladder ok "$repo: workflow has a 'CGO_ENABLED=1 go test -race' step"
 	else
 		ladder no "$repo: workflow has a 'CGO_ENABLED=1 go test -race' step"
 	fi
 
 	# (d) runs on macos-15, not self-hosted, not pull_request_target
-	if printf '%s\n' "$cfg" | grep -q 'runs-on: macos-15'; then
+	if grep -q 'runs-on: macos-15' <<<"$cfg"; then
 		ladder ok "$repo: runs-on macos-15 (GitHub-hosted)"
 	else
 		ladder no "$repo: runs-on macos-15 (GitHub-hosted)"
 	fi
-	if printf '%s\n' "$cfg" | grep -q 'self-hosted'; then
+	if grep -q 'self-hosted' <<<"$cfg"; then
 		ladder no "$repo: no self-hosted runner"
 	else
 		ladder ok "$repo: no self-hosted runner"
 	fi
-	if printf '%s\n' "$cfg" | grep -q 'pull_request_target'; then
+	if grep -q 'pull_request_target' <<<"$cfg"; then
 		ladder no "$repo: no pull_request_target trigger"
 	else
 		ladder ok "$repo: no pull_request_target trigger"
 	fi
 
 	# (f) least-privilege token: contents: read present, and no write grant.
-	if printf '%s\n' "$cfg" | grep -qE 'contents:[[:space:]]*read'; then
+	if grep -qE 'contents:[[:space:]]*read' <<<"$cfg"; then
 		ladder ok "$repo: permissions contents: read"
 	else
 		ladder no "$repo: permissions contents: read"
 	fi
-	if printf '%s\n' "$cfg" | grep -qE 'contents:[[:space:]]*write|write-all'; then
+	if grep -qE 'contents:[[:space:]]*write|write-all' <<<"$cfg"; then
 		ladder no "$repo: no write token grant"
 	else
 		ladder ok "$repo: no write token grant"
@@ -209,7 +209,7 @@ for repo in $REPOS; do
 		miss=""
 		for sib in apis runtimed darwin-net; do
 			if grep -qE "replace[[:space:]]+k3sm\.io/$sib[[:space:]]*=>[[:space:]]*\.\./$sib" "$gomod"; then
-				printf '%s\n' "$cfg" | grep -qE "repository:[[:space:]]*k3sm-io/$sib" || miss="$miss $sib"
+				grep -qE "repository:[[:space:]]*k3sm-io/$sib" <<<"$cfg" || miss="$miss $sib"
 			fi
 		done
 		if [ -z "$miss" ]; then
@@ -236,14 +236,14 @@ for repo in $REPOS; do
 	# repo-specific extra steps
 	case "$repo" in
 		runtimed)
-			if printf '%s\n' "$cfg" | grep -q 'spicanary'; then
+			if grep -q 'spicanary' <<<"$cfg"; then
 				ladder ok "$repo: workflow has the spicanary step"
 			else
 				ladder no "$repo: workflow has the spicanary step"
 			fi
 			;;
 		apis)
-			if printf '%s\n' "$cfg" | grep -q 'buf'; then
+			if grep -q 'buf' <<<"$cfg"; then
 				ladder ok "$repo: workflow installs buf"
 			else
 				ladder no "$repo: workflow installs buf"
@@ -256,7 +256,7 @@ for repo in $REPOS; do
 				lockstep=ok
 				for var in BUF_VERSION PROTOC_GEN_GO_VERSION PROTOC_GEN_GO_GRPC_VERSION; do
 					ver="$(grep -oE "^${var}=v[0-9.]+" "$gen" | head -n1 | cut -d= -f2 || true)"
-					[ -n "$ver" ] && { printf '%s\n' "$cfg" | grep -q "@$ver" || lockstep=no; }
+					[ -n "$ver" ] && { grep -q "@$ver" <<<"$cfg" || lockstep=no; }
 				done
 				if [ "$lockstep" = ok ]; then
 					ladder ok "$repo: buf/protoc pins in lockstep with hack/gen.sh"

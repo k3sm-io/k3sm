@@ -211,7 +211,7 @@ icp_arp_verdict() {
 	local line="$1" mine=" $2 " theirs=" $3 " mac nm
 	mac="$(printf '%s\n' "$line" | awk '{print $4; exit}')"
 	nm="$(norm_mac "$mac")"
-	if printf '%s\n' "$line" | grep -q permanent; then
+	if grep -q permanent <<<"$line"; then
 		echo "FAIL a permanent ARP entry ($mac): the self-ARP trap"
 		return 1
 	fi
@@ -246,7 +246,7 @@ icp_route_residue() {
 	local base="$1" now="$2" allowed=" $3 " own=" $4 " dest flags netif gw bad=0
 	while read -r dest flags netif gw; do
 		case "$flags" in *L*) continue ;; esac
-		if icp_reserved_routes "$base" | grep -qxF "$dest $flags $netif $gw"; then
+		if grep -qxF "$dest $flags $netif $gw" <<<"$(icp_reserved_routes "$base")"; then
 			continue
 		fi
 		if [[ "$allowed" == *" $dest "* ]]; then

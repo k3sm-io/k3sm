@@ -192,11 +192,11 @@ run_test() {
 		ladder no "$id  $name ($pkg) passed"
 		return
 	fi
-	if printf '%s\n' "$out" | grep -qE 'no tests to run|no test files'; then
+	if grep -qE 'no tests to run|no test files' <<<"$out"; then
 		ladder no "$id  $name ($pkg) actually RAN — go test reported no tests to run (renamed test?)"
 		return
 	fi
-	if ! printf '%s\n' "$out" | grep -qE "^[[:space:]]*--- PASS: ${name}( |\$)"; then
+	if ! grep -qE "^[[:space:]]*--- PASS: ${name}( |\$)" <<<"$out"; then
 		ladder no "$id  $name ($pkg) actually RAN — no top-level --- PASS line"
 		return
 	fi
@@ -359,7 +359,7 @@ else
 			# the same broken logs/exec with a different error string.
 			KC="$MESH_WD/bin/kubectl"
 			internal="$("$KC" --kubeconfig "$MESH_WD/k3sm.kubeconfig" get node b213mesh -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || true)"
-			if [ -n "$internal" ] && openssl x509 -in "$LEAF" -noout -text | tr ',' '\n' | grep -qE "IP Address:${internal}\$"; then
+			if [ -n "$internal" ] && grep -qE "IP Address:${internal}\$" <<<"$(openssl x509 -in "$LEAF" -noout -text | tr ',' '\n')"; then
 				ladder ok "b213.L3  the presented leaf's SANs cover the registered InternalIP $internal"
 			else
 				ladder no "b213.L3  the presented leaf's SANs cover the registered InternalIP ${internal:-<unread>} — SANs: $(openssl x509 -in "$LEAF" -noout -ext subjectAltName 2>/dev/null | tail -1)"

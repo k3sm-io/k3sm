@@ -150,7 +150,7 @@ rsh "sudo -n true" >/dev/null 2>&1 || { echo "ssh + passwordless sudo is require
 LOCAL_NODE=""; LOCAL_NODE_IP=""; PEER_NODE=""; PEER_NODE_IP=""
 while read -r name ip ready; do
 	[ "$ready" = "True" ] || { echo "node $name is not Ready" >&2; exit 1; }
-	if ifconfig lo0 | grep -q "inet $ip "; then
+	if grep -q "inet $ip " <<<"$(ifconfig lo0)"; then
 		LOCAL_NODE="$name"; LOCAL_NODE_IP="$ip"
 	elif [ -z "$PEER_NODE" ]; then
 		PEER_NODE="$name"; PEER_NODE_IP="$ip"
@@ -376,8 +376,8 @@ leg_pf() {
 		echo "### peer ($PEER_NODE)"
 		rsh "sudo -n pfctl -s info 2>&1 | grep -v ALTQ | head -4; echo '## pfctl -sr'; sudo -n pfctl -sr 2>&1 | grep -v ALTQ; echo '## pfctl -a io.k3sm.mesh -sr'; sudo -n pfctl -a io.k3sm.mesh -sr 2>&1 | grep -v ALTQ; echo '## ifconfig $PEER_UTUN'; ifconfig $PEER_UTUN; echo '## route -n get $LOCAL_NODE_IP'; route -n get $LOCAL_NODE_IP"
 	} >"$f" 2>&1
-	if sudo -n pfctl -sr 2>/dev/null | grep -q 'io\.k3sm\.mesh'; then ANCHOR_LOCAL=referenced; else ANCHOR_LOCAL=unreferenced; fi
-	if rsh "sudo -n pfctl -sr 2>/dev/null" | grep -q 'io\.k3sm\.mesh'; then ANCHOR_PEER=referenced; else ANCHOR_PEER=unreferenced; fi
+	if grep -q 'io\.k3sm\.mesh' <<<"$(sudo -n pfctl -sr 2>/dev/null)"; then ANCHOR_LOCAL=referenced; else ANCHOR_LOCAL=unreferenced; fi
+	if grep -q 'io\.k3sm\.mesh' <<<"$(rsh "sudo -n pfctl -sr 2>/dev/null")"; then ANCHOR_PEER=referenced; else ANCHOR_PEER=unreferenced; fi
 	PF_LOCAL="$(sudo -n pfctl -s info 2>/dev/null | awk '/^Status:/{print $2}')"
 	PF_PEER="$(rsh "sudo -n pfctl -s info 2>/dev/null" | awk '/^Status:/{print $2}')"
 	UTUN_MTU_LOCAL="$(ifconfig "$LOCAL_UTUN" | sed -nE 's/.* mtu ([0-9]+).*/\1/p' | head -1)"
@@ -434,8 +434,8 @@ pods_up() {
 	local i p ip
 	for p in "$POD_L:$POD_L_IP" "$POD_P:$POD_P_IP"; do
 		ip="${p#*:}"; p="${p%%:*}"
-		for i in $(seq 1 30); do srv_state "$p" "$ip" | grep -q '"ready": true' && break; sleep 1; done
-		srv_state "$p" "$ip" | grep -q "\"ip\": \"$ip\"" || { log "pod $p server not ready: $(srv_state "$p" "$ip" 2>&1 | tail -3)"; return 1; }
+		for i in $(seq 1 30); do grep -q '"ready": true' <<<"$(srv_state "$p" "$ip")" && break; sleep 1; done
+		grep -q "\"ip\": \"$ip\"" <<<"$(srv_state "$p" "$ip")" || { log "pod $p server not ready: $(srv_state "$p" "$ip" 2>&1 | tail -3)"; return 1; }
 	done
 	log "pods: $POD_L $POD_L_IP on $LOCAL_NODE; $POD_P $POD_P_IP on $PEER_NODE"
 }

@@ -41,7 +41,7 @@ out="$(go test -race -count=1 -v -run "$re" "$pkg" 2>&1)" || {
 printf '%s\n' "$out" | grep -E '^(--- |ok|PASS)'
 # A test that does not run is not a pass.
 for t in "${tests[@]}"; do
-	printf '%s\n' "$out" | grep -q -- "^--- PASS: $t " || { echo "B1053: FAIL: $t did not run"; exit 1; }
+	grep -q -- "^--- PASS: $t " <<<"$out" || { echo "B1053: FAIL: $t did not run"; exit 1; }
 done
 # The fuzz corpus must be the committed one, not only the in-code seed.
 n="$(printf '%s\n' "$out" | grep -c -- '^    --- PASS: FuzzParseRefs/seed-' || true)"

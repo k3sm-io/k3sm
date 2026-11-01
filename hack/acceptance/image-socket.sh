@@ -89,7 +89,7 @@ run_test() {
 		ladder no "$id  $name ($pkg) passed"
 		return
 	fi
-	if printf '%s\n' "$out" | grep -qE 'no tests to run|no test files'; then
+	if grep -qE 'no tests to run|no test files' <<<"$out"; then
 		ladder no "$id  $name ($pkg) actually RAN — go test reported no tests to run (renamed test?)"
 		return
 	fi
@@ -147,7 +147,7 @@ DEFAULT_SOCK="/var/lib/k3sm/run/runtimed.sock"
 # binary's exit status and never the grep's.
 IMAGE_HELP=""
 [ -x "$K3SM_BIN" ] && IMAGE_HELP="$("$K3SM_BIN" image -h 2>&1 || true)"
-if printf '%s\n' "$IMAGE_HELP" | grep -q "default \"$DEFAULT_SOCK\""; then
+if grep -q "default \"$DEFAULT_SOCK\"" <<<"$IMAGE_HELP"; then
 	ladder ok "image-socket.5b \`k3sm image\` defaults --socket to $DEFAULT_SOCK (what a default-rooted node binds)"
 else
 	ladder no "image-socket.5b \`k3sm image\` defaults --socket to $DEFAULT_SOCK (what a default-rooted node binds)"

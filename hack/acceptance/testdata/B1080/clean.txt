@@ -1,0 +1,20 @@
+# Script bodies the pipefail grep -q scanner must pass, one per block; a line
+# holding only %% ends a block.
+grep -q -- "^--- PASS: TestX " <<<"$out"
+%%
+n="$(printf '%s\n' "$out" | grep -c PASS)"
+%%
+check || grep -q x file
+%%
+# a comment naming cmd | grep -q x
+%%
+echo 'quoted | grep -q x'
+%%
+grep -q x <<<"$(cmd | sort)"
+%%
+cmd | grep -v x | wc -l
+%%
+grep -qE 'a|b' file
+%%
+kc get pods |
+	grep -v Running

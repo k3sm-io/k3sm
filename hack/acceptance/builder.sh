@@ -92,7 +92,7 @@ run_test() {
 		ladder no "$id  $name ($pkg) passed"
 		return
 	fi
-	if printf '%s\n' "$out" | grep -qE 'no tests to run|no test files'; then
+	if grep -qE 'no tests to run|no test files' <<<"$out"; then
 		ladder no "$id  $name ($pkg) actually RAN — go test reported no tests to run (renamed test?)"
 		return
 	fi
@@ -232,7 +232,7 @@ grep -q 'if err := warm(ctx, ref); err != nil' "$C/buildstore.go" || b9d=no
 grep -q 'imagePull(ctx, runtimev1.NewImagesClient(cc), o, io.Discard)' "$C/buildstore.go" || b9d=no
 grep -q 'policy: runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS, cacheOnly: true' "$C/buildstore.go" || b9d=no
 grep -q 'recordInto(ctx, ref, b, o.workDir, push, warm)' "$C/imageload.go" || b9d=no
-if grep -lE '\.LoadImage\(' "$C"/*.go 2>/dev/null | grep -v '_test\.go$' | grep -q .; then b9d=no; fi
+if grep -q . <<<"$(grep -lE '\.LoadImage\(' "$C"/*.go 2>/dev/null | grep -v '_test\.go$')"; then b9d=no; fi
 ladder "$b9d" "builder.9d the recording goes to the cluster registry and the node cache is written only by the daemon's pull"
 
 # ---- builder.10 — `k3sm build --push` (the build→push one-liner) ----------

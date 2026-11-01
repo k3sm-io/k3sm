@@ -184,7 +184,7 @@ require_pinned_base() {
 
 # base_present — is the base image already pulled locally?
 base_present() {
-	tart_cli list 2>/dev/null | grep -qF "$BASE_IMAGE"
+	grep -qF "$BASE_IMAGE" <<<"$(tart_cli list 2>/dev/null)"
 }
 
 # valid_user <name> — the guest account name must be a plain account name.
@@ -824,7 +824,7 @@ FAKE
 	( cmd_dispatch ) 2>"$tmp/usage.txt" >/dev/null || true
 	documented="$(awk '/^  [a-z]/{print $1}' "$tmp/usage.txt" | sort -u)"
 	for w in $implemented; do
-		printf '%s\n' "$documented" | grep -qx "$w" || fail "subcommand '$w' is implemented but absent from the usage text"
+		grep -qx "$w" <<<"$documented" || fail "subcommand '$w' is implemented but absent from the usage text"
 	done
 
 	unset LABVM_TEST_LOG LABVM_TEST_CLONES

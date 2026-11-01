@@ -58,7 +58,7 @@ trap 'rm -rf "$WORKDIR"' EXIT
 # ---- b391.1 — decision-core table tests ------------------------------------
 b1=ok
 out="$(cd "$K3SM_ROOT" && "${GOENV[@]}" go test -count=1 -v -run '^(TestDecide|TestExitCodesDistinct|TestPinnedTeamIDShape)$' "$PKG" 2>&1)" || b1=no
-if [ "$b1" = ok ] && printf '%s\n' "$out" | grep -qE 'no tests to run|no test files'; then b1=no; fi
+if [ "$b1" = ok ] && grep -qE 'no tests to run|no test files' <<<"$out"; then b1=no; fi
 ran="$(printf '%s\n' "$out" | grep -cE '^--- PASS: Test' || true)"
 [ "$ran" -eq 3 ] || b1=no
 [ "$b1" = ok ] || printf '%s\n' "$out" | tail -40

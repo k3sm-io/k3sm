@@ -266,7 +266,7 @@ run_timeout() {
 
 link_state() {   # active | inactive | gone
   if ! ifconfig "$1" >/dev/null 2>&1; then echo gone; return; fi
-  if ifconfig "$1" | grep -q 'status: active'; then echo active; else echo inactive; fi
+  if grep -q 'status: active' <<<"$(ifconfig "$1")"; then echo active; else echo inactive; fi
 }
 
 # wait_link <iface> <active|inactive|gone|down> <seconds> — block until the state is
@@ -281,7 +281,7 @@ wait_link() {
   echo timeout; return 1
 }
 
-is_member() { ifconfig bridge0 2>/dev/null | awk '$1=="member:"{print $2}' | grep -qx "$1"; }
+is_member() { grep -qx "$1" <<<"$(ifconfig bridge0 2>/dev/null | awk '$1=="member:"{print $2}')"; }
 
 tso_lro_on() {   # prints the offload flags still on, empty when all are off
   ifconfig "$1" | sed -n 's/.*options=[0-9a-f]*<\(.*\)>.*/\1/p' | tr ',' '\n' | grep -E '^(TSO4|TSO6|LRO)$' | tr '\n' ' '
@@ -313,11 +313,11 @@ spike_deletem() {         # spike_deletem <iface>
 spike_alias() {           # spike_alias <iface> <reserved-half ip>
   not_lan "$1" || return 1
   in_reserved "$2" || { refuse "$2 is outside the reserved direct-link halves"; return 1; }
-  ifconfig "$1" | grep -q "inet $2 " && return 0
+  grep -q "inet $2 " <<<"$(ifconfig "$1")" && return 0
   ifconfig "$1" inet "$2" "$2" netmask 255.255.255.255 alias && ledger "alias $1 $2"
 }
 spike_lo0_alias() {       # spike_lo0_alias <ip>
-  ifconfig lo0 | grep -q "inet $1 " && { refuse "$1 is already a lo0 alias (a pod or the mesh owns it)"; return 1; }
+  grep -q "inet $1 " <<<"$(ifconfig lo0)" && { refuse "$1 is already a lo0 alias (a pod or the mesh owns it)"; return 1; }
   ifconfig lo0 alias "$1/32" && ledger "lo0alias $1"
 }
 spike_route() {           # spike_route -host|-net <dest> <gateway args...>
@@ -571,8 +571,8 @@ spike_end() {
 	local nodes
 	nodes="$(kc get nodes --no-headers 2>/dev/null)"
 	if [ -n "$SRV_NODE" ] && [ -n "$WRK_NODE" ] &&
-		printf '%s\n' "$nodes" | awk -v n="$SRV_NODE" '$1==n && $2=="Ready"' | grep -q . &&
-		printf '%s\n' "$nodes" | awk -v n="$WRK_NODE" '$1==n && $2=="Ready"' | grep -q .; then
+		grep -q . <<<"$(printf '%s\n' "$nodes" | awk -v n="$SRV_NODE" '$1==n && $2=="Ready"')" &&
+		grep -q . <<<"$(printf '%s\n' "$nodes" | awk -v n="$WRK_NODE" '$1==n && $2=="Ready"')"; then
 		pass "rig: both nodes Ready after the rung"
 	else
 		fail "rig: a node is not Ready after the rung (the lab host must be left with both nodes Ready)"
@@ -703,11 +703,11 @@ if [ -n "$foreign" ]; then
 fi
 spike_deletem "$IFC" || { verdict FAIL "link-config/$SIDE: $IFC is still a bridge0 member after deletem"; exit 0; }
 spike_alias "$IFC" "$LINK" || { verdict FAIL "link-config/$SIDE: the /32 alias $LINK on $IFC was refused"; exit 0; }
-spike_route -host "$PEER_LINK" -interface "$IFC" || route -n get "$PEER_LINK" | grep -q "interface: $IFC" || { verdict FAIL "link-config/$SIDE: the on-link host route to $PEER_LINK over $IFC"; exit 0; }
+spike_route -host "$PEER_LINK" -interface "$IFC" || grep -q "interface: $IFC" <<<"$(route -n get "$PEER_LINK")" || { verdict FAIL "link-config/$SIDE: the on-link host route to $PEER_LINK over $IFC"; exit 0; }
 spike_offload_off "$IFC"
 if [ "$WITH_ROUTES" = routes ]; then
   for h in $HALVES; do
-    spike_route -net "$h" "$PEER_LINK" -ifa "$EGRESS" || route -n get "${h%/*}" | grep -q "interface: $IFC" || { verdict FAIL "link-config/$SIDE: the /25 $h via $PEER_LINK (ifa $EGRESS)"; exit 0; }
+    spike_route -net "$h" "$PEER_LINK" -ifa "$EGRESS" || grep -q "interface: $IFC" <<<"$(route -n get "${h%/*}")" || { verdict FAIL "link-config/$SIDE: the /25 $h via $PEER_LINK (ifa $EGRESS)"; exit 0; }
   done
 fi
 echo "configured $IFC: alias $LINK, host route $PEER_LINK${WITH_ROUTES:+, /25s $HALVES via $PEER_LINK ifa $EGRESS}"

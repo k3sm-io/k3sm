@@ -171,7 +171,7 @@ PY
 # from the operator image (/opt/dynamo-operator/crds/), so they exist only once that
 # Pod has been scheduled and its init has run. Give it a minute.
 for i in $(seq 1 30); do
-  kc get crd -o json | python3 "$W/crds.py" | grep -q '"group"' && break
+  grep -q '"group"' <<<"$(kc get crd -o json | python3 "$W/crds.py")" && break
   sleep 2
 done
 CRDS=$(kc get crd -o json | python3 "$W/crds.py")

@@ -46,7 +46,7 @@ run() {
 	# A test that does not run is not a pass.
 	local t
 	for t in "$@"; do
-		printf '%s\n' "$out" | grep -q -- "--- PASS: $t " || { echo "B1018: FAIL: $t did not run"; exit 1; }
+		grep -q -- "--- PASS: $t " <<<"$out" || { echo "B1018: FAIL: $t did not run"; exit 1; }
 	done
 }
 
@@ -58,7 +58,7 @@ n="$(printf '%s\n' "$out" | grep -c -- '--- PASS: TestDistributionAPI/')"
 for sub in 'delete/a_tag_DELETE' 'delete/a_digest_DELETE_removes' 'delete/a_digest_DELETE_is_refused' 'delete/upload_cancel_needs' \
 	'client/the_mount_fallback' 'client/a_Docker_v2_manifest_missing' 'client/the_4_MiB' 'client/ggcr_push_and_pull' \
 	'limits/the_session_cap' 'limits/under_2_GiB' 'limits/a_panicking_handler' 'manifest/a_blob_deleted_after'; do
-	printf '%s\n' "$out" | grep -q -- "--- PASS: TestDistributionAPI/$sub" || { echo "B1018: FAIL: subtest $sub did not pass"; exit 1; }
+	grep -q -- "--- PASS: TestDistributionAPI/$sub" <<<"$out" || { echo "B1018: FAIL: subtest $sub did not pass"; exit 1; }
 done
 run ./pkg/ociregistry/store/ '^(TestLinkedSessionCanFinish|TestHashedCommitFallsBackToRehash|TestDeleteDigestChecked|TestLateChunkNeverReachesPublishedBlob|TestAppendUploadLimit)$' \
 	TestLinkedSessionCanFinish TestHashedCommitFallsBackToRehash TestDeleteDigestChecked TestLateChunkNeverReachesPublishedBlob TestAppendUploadLimit

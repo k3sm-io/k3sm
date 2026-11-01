@@ -127,7 +127,7 @@ codesign -s - -f "$DNSSHIM" >/dev/null 2>&1 || true
 VMHOST_ENTS="$REPO_ROOT/../runtimed/cmd/k3sm-vmhost/vmhost.entitlements"
 [ -f "$VMHOST_ENTS" ] || { echo "M2: vmhost entitlements plist missing at $VMHOST_ENTS" >&2; exit 1; }
 codesign -s - -f --entitlements "$VMHOST_ENTS" "$VMHOST" >/dev/null 2>&1
-codesign -d --entitlements - "$VMHOST" 2>/dev/null | grep -q "com.apple.security.virtualization" || {
+grep -q "com.apple.security.virtualization" <<<"$(codesign -d --entitlements - "$VMHOST" 2>/dev/null)" || {
 	echo "M2: k3sm-vmhost carries no virtualization entitlement after signing" >&2; exit 1; }
 
 # Stage the control-plane payload BESIDE it (cp-payload/: kube-apiserver etc. +
@@ -431,7 +431,7 @@ fi
 if [ -z "$reap_why" ]; then
 	reap_logged=no
 	for _ in $(seq 1 180); do
-		if tail -c "+$((REAP_OFFSET + 1))" "$SERVER_LOG" 2>/dev/null | grep -q 'reaping orphaned pod process group'; then
+		if grep -q 'reaping orphaned pod process group' <<<"$(tail -c "+$((REAP_OFFSET + 1))" "$SERVER_LOG" 2>/dev/null)"; then
 			reap_logged=yes; break
 		fi
 		sleep 1
@@ -460,7 +460,7 @@ ladder "$([ -z "$reap_why" ] && echo ok || echo no)" "m2.R  daemon startup pod r
 #     kill branch? A PRESENT line here means the leg's evidence is about the wrong
 #     branch even if it passed.
 echo "--- [diagnostic] m2.R keep-and-warn (the pod-survival gate's deferred leader-dead/grandchild-alive path):"
-if tail -c "+$((REAP_OFFSET + 1))" "$SERVER_LOG" 2>/dev/null | grep -q 'orphaned pod process group leaked'; then
+if grep -q 'orphaned pod process group leaked' <<<"$(tail -c "+$((REAP_OFFSET + 1))" "$SERVER_LOG" 2>/dev/null)"; then
 	echo "    PRESENT — a recorded group hit keep-and-warn; re-read the fixture before trusting m2.R"
 else
 	echo "    none (expected: the fixture's live leader takes the kill branch)"
@@ -496,7 +496,7 @@ for _ in $(seq 1 15); do
 	[ -e "$INSTALL_DIR" ] && ok=no
 	[ -S "$NETD_SOCK" ] && ok=no
 	# No 100.64.* (pod/node) or service-VIP aliases should remain on lo0 after teardown.
-	ifconfig lo0 2>/dev/null | grep -qE 'inet (100\.64\.|10\.43\.)' && ok=no
+	grep -qE 'inet (100\.64\.|10\.43\.)' <<<"$(ifconfig lo0 2>/dev/null)" && ok=no
 	[ "$ok" = yes ] && clean=yes && break
 	sleep 1
 done

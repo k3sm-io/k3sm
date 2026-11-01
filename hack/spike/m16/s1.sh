@@ -163,7 +163,7 @@ nohup "$V" -m dynamo.mocker --discovery-backend file \
 MK=$!
 READY=no
 for i in $(seq 1 60); do
-  curl -fsS -m 3 http://127.0.0.1:8111/v1/models 2>/dev/null | grep -q mock && { READY=yes; break; }
+  grep -q mock <<<"$(curl -fsS -m 3 http://127.0.0.1:8111/v1/models 2>/dev/null)" && { READY=yes; break; }
   sleep 2
 done
 if [ "$READY" = yes ]; then

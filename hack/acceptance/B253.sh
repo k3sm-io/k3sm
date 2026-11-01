@@ -92,7 +92,7 @@ fi
 # the runtime), so the pin is that stopRuntime's body calls it.
 w=ok
 grep -qF 'closeRuntime := stopEmbeddedRuntime(prov, slog.Default())' "$NODE_GO" || w=no
-sed -n '/^[[:space:]]*stopRuntime := func() {$/,/^[[:space:]]*}$/p' "$NODE_GO" | grep -qE '^[[:space:]]*closeRuntime\(\)$' || w=no
+grep -qE '^[[:space:]]*closeRuntime\(\)$' <<<"$(sed -n '/^[[:space:]]*stopRuntime := func() {$/,/^[[:space:]]*}$/p' "$NODE_GO")" || w=no
 grep -qE '^\s*defer stopRuntime\(\)$' "$NODE_GO" || w=no
 grep -qF 'return awaitNodeExit(ctx, errc, stopRuntime)' "$NODE_GO" || w=no
 ladder "$w" "b253.1  startNode builds the embedded-runtime teardown, defers it, and runs it on both exit paths"
@@ -116,8 +116,8 @@ ladder "$c" "b253.1  stopEmbeddedRuntime takes no context (the close bound is Cl
 # next start: NewRuntimed runs adoptNodePods, which re-attaches surviving pods
 # (vm pods included) and then reaps whatever was not re-attached.
 r=ok
-sed -n '/^func NewRuntimed(/,/^}/p' "$PROVIDER_GO" | grep -qE '^[[:space:]]*r\.adoptNodePods\(ctx, rt\)$' || r=no
-sed -n '/^func (r \*runtimedRuntime) adoptNodePods(/,/^}/p' "$ATTACH_GO" | grep -qF 'if err := a.ReapOrphanedPods(); err != nil {' || r=no
+grep -qE '^[[:space:]]*r\.adoptNodePods\(ctx, rt\)$' <<<"$(sed -n '/^func NewRuntimed(/,/^}/p' "$PROVIDER_GO")" || r=no
+grep -qF 'if err := a.ReapOrphanedPods(); err != nil {' <<<"$(sed -n '/^func (r \*runtimedRuntime) adoptNodePods(/,/^}/p' "$ATTACH_GO")" || r=no
 ladder "$r" "b253.1  the startup re-attach and pod reap are still wired into provider.NewRuntimed"
 
 # ---- b253.1 — the BUDGET, and the two copies that must not drift -----------
@@ -176,11 +176,11 @@ run_test() {
 		ladder no "$id  $name ($pkg) passed"
 		return
 	fi
-	if printf '%s\n' "$out" | grep -qE 'no tests to run|no test files'; then
+	if grep -qE 'no tests to run|no test files' <<<"$out"; then
 		ladder no "$id  $name ($pkg) actually RAN — go test reported no tests to run (renamed test?)"
 		return
 	fi
-	if ! printf '%s\n' "$out" | grep -qE "^[[:space:]]*--- PASS: ${name}( |\$)"; then
+	if ! grep -qE "^[[:space:]]*--- PASS: ${name}( |\$)" <<<"$out"; then
 		ladder no "$id  $name ($pkg) actually RAN — no top-level --- PASS line"
 		return
 	fi
@@ -313,12 +313,12 @@ else
 			# dissenter (the server's own pid), or a busy root with no named pid,
 			# fails.
 			if mounted; then
-				if printf '%s' "$unmount_out" | grep -qE 'dissented by PID [0-9]+ \(((/private)?'"$DATA_ROOT"'/pods/|[^)]*k3sm-vmhost)'; then
+				if grep -qE 'dissented by PID [0-9]+ \(((/private)?'"$DATA_ROOT"'/pods/|[^)]*k3sm-vmhost)' <<<"$unmount_out"; then
 					ladder ok "b253.L2  no server pid held $DATA_ROOT once the server was out; the one dissenter is a pod process, which survives the stop by design: $unmount_out"
 				else
 					ladder no "b253.L2  $DATA_ROOT did not unmount after the server was booted out: $unmount_out"
 				fi
-			elif printf '%s' "$unmount_out" | grep -qi 'dissent'; then
+			elif grep -qi 'dissent' <<<"$unmount_out"; then
 				ladder no "b253.L2  the unmount was dissented: $unmount_out"
 			else
 				ladder ok "b253.L2  $DATA_ROOT unmounted with no dissent once the server was out"
