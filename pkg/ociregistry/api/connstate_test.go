@@ -23,6 +23,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -132,6 +133,53 @@ func TestClosedConnectionBucketIsDropped(t *testing.T) {
 	}
 }
 
+// pipeListener is an in-memory net.Listener: each dial hands the server one end
+// of a net.Pipe, so http.Server.Serve runs its real accept loop and ConnState
+// transitions with no kernel socket.
+type pipeListener struct {
+	conns chan net.Conn
+	done  chan struct{}
+	once  sync.Once
+}
+
+func newPipeListener() *pipeListener {
+	return &pipeListener{conns: make(chan net.Conn), done: make(chan struct{})}
+}
+
+func (l *pipeListener) Accept() (net.Conn, error) {
+	select {
+	case c := <-l.conns:
+		return c, nil
+	case <-l.done:
+		return nil, net.ErrClosed
+	}
+}
+
+func (l *pipeListener) Close() error {
+	l.once.Do(func() { close(l.done) })
+	return nil
+}
+
+func (l *pipeListener) Addr() net.Addr { return pipeAddr{} }
+
+// dial returns the client end of a new connection once the server has it.
+func (l *pipeListener) dial() (net.Conn, error) {
+	client, server := net.Pipe()
+	select {
+	case l.conns <- server:
+		return client, nil
+	case <-l.done:
+		_ = client.Close()
+		_ = server.Close()
+		return nil, net.ErrClosed
+	}
+}
+
+type pipeAddr struct{}
+
+func (pipeAddr) Network() string { return "pipe" }
+func (pipeAddr) String() string  { return "pipe" }
+
 // TestConnectionCap pins the listener bounds: the header read timeout, and a
 // connection past MaxConns is closed before a request is read, until an open
 // connection ends.
@@ -140,13 +188,9 @@ func TestConnectionCap(t *testing.T) {
 	if hs.ReadHeaderTimeout != api.ReadHeaderTimeout || hs.ReadHeaderTimeout <= 0 {
 		t.Fatalf("ReadHeaderTimeout %v, want %v", hs.ReadHeaderTimeout, api.ReadHeaderTimeout)
 	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	ln := newPipeListener()
 	go func() { _ = hs.Serve(ln) }()
 	t.Cleanup(func() { _ = hs.Close() })
-	addr := ln.Addr().String()
 
 	get := func(c net.Conn) error {
 		_ = c.SetDeadline(time.Now().Add(10 * time.Second))
@@ -164,7 +208,7 @@ func TestConnectionCap(t *testing.T) {
 		return nil
 	}
 	dial := func() net.Conn {
-		c, err := net.Dial("tcp", addr)
+		c, err := ln.dial()
 		if err != nil {
 			t.Fatal(err)
 		}
