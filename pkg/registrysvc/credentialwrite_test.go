@@ -116,6 +116,61 @@ func TestWriteCredentialRefusesStaleWideTemp(t *testing.T) {
 			}
 		})
 	}
+	t.Run("a directory swapped for a symlink after the check is not followed", func(t *testing.T) {
+		work := t.TempDir()
+		dir := StateDir(work)
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		d, err := openStateDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer d.Close()
+		// After the check: the checked directory moves aside and a symlink to
+		// a directory of the attacker's choosing takes its name.
+		moved := filepath.Join(work, "registry.checked")
+		if err := os.Rename(dir, moved); err != nil {
+			t.Fatal(err)
+		}
+		target := t.TempDir()
+		if err := os.Symlink(target, dir); err != nil {
+			t.Fatal(err)
+		}
+		werr := writeFileInDir(d, CredentialPath(work), []byte("secret\n"))
+		for _, name := range []string{"push-credential.json", "push-credential.json.tmp"} {
+			if _, err := os.Lstat(filepath.Join(target, name)); !os.IsNotExist(err) {
+				t.Errorf("%s landed in the symlink target: %v", name, err)
+			}
+		}
+		if werr != nil {
+			return
+		}
+		b, err := os.ReadFile(filepath.Join(moved, "push-credential.json"))
+		if err != nil {
+			t.Fatalf("the write did not land in the checked directory: %v", err)
+		}
+		if string(b) != "secret\n" {
+			t.Errorf("the checked directory holds %q, want the new content", b)
+		}
+	})
+	t.Run("a path outside the open directory is refused", func(t *testing.T) {
+		work := t.TempDir()
+		d, err := openStateDir(StateDir(work))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer d.Close()
+		if err := os.Mkdir(ServeStateDir(work), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeFileInDir(d, ServeConfigPath(work), []byte("x")); err == nil {
+			t.Fatal("writeFileInDir wrote a path outside the directory it holds")
+		}
+		if _, err := os.Lstat(ServeConfigPath(work)); !os.IsNotExist(err) {
+			t.Errorf("a file landed outside the open directory: %v", err)
+		}
+	})
 	t.Run("provision narrows a wider registry dir", func(t *testing.T) {
 		work := t.TempDir()
 		if err := os.Mkdir(StateDir(work), 0o755); err != nil {
