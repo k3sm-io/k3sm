@@ -41,6 +41,11 @@ const tempPrefix = ".tmp-"
 // callers that inject a clock (GC tests); call it before the store is in use.
 func (s *Store) SetClock(now func() time.Time) { s.now = now }
 
+// SetFutimes replaces the call TouchBlob sets a blob's times with. It exists
+// for callers that fake a failing touch (server tests); call it before the
+// store is in use.
+func (s *Store) SetFutimes(fn func(f *os.File, t time.Time) error) { s.futimes = fn }
+
 // StateDir returns the server state directory.
 func (s *Store) StateDir() string { return s.state }
 
