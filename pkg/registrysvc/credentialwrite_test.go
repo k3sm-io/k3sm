@@ -134,24 +134,39 @@ func TestWriteCredentialRefusesStaleWideTemp(t *testing.T) {
 			t.Fatal(err)
 		}
 		target := t.TempDir()
+		// A stale temp name in the symlink target: a removal that went by path
+		// instead of through the checked descriptor would delete it.
+		sentinel := filepath.Join(target, "push-credential.json.tmp")
+		if err := os.WriteFile(sentinel, []byte("sentinel"), 0o600); err != nil {
+			t.Fatal(err)
+		}
 		if err := os.Symlink(target, dir); err != nil {
 			t.Fatal(err)
 		}
-		werr := writeFileInDir(d, CredentialPath(work), []byte("secret\n"))
-		for _, name := range []string{"push-credential.json", "push-credential.json.tmp"} {
-			if _, err := os.Lstat(filepath.Join(target, name)); !os.IsNotExist(err) {
-				t.Errorf("%s landed in the symlink target: %v", name, err)
-			}
+		// The write is bound to the checked descriptor, so it succeeds into the
+		// directory that was checked, wherever its name now points.
+		if err := writeFileInDir(d, CredentialPath(work), []byte("secret\n")); err != nil {
+			t.Fatalf("the write through the checked directory failed: %v", err)
 		}
-		if werr != nil {
-			return
+		b, err := os.ReadFile(sentinel)
+		if err != nil {
+			t.Fatalf("the stale temp name in the symlink target was removed: %v", err)
 		}
-		b, err := os.ReadFile(filepath.Join(moved, "push-credential.json"))
+		if string(b) != "sentinel" {
+			t.Errorf("the stale temp name in the symlink target now holds %q", b)
+		}
+		if _, err := os.Lstat(filepath.Join(target, "push-credential.json")); !os.IsNotExist(err) {
+			t.Errorf("push-credential.json landed in the symlink target: %v", err)
+		}
+		b, err = os.ReadFile(filepath.Join(moved, "push-credential.json"))
 		if err != nil {
 			t.Fatalf("the write did not land in the checked directory: %v", err)
 		}
 		if string(b) != "secret\n" {
 			t.Errorf("the checked directory holds %q, want the new content", b)
+		}
+		if _, err := os.Lstat(filepath.Join(moved, "push-credential.json.tmp")); !os.IsNotExist(err) {
+			t.Errorf("the temp file survived in the checked directory: %v", err)
 		}
 	})
 	t.Run("a path outside the open directory is refused", func(t *testing.T) {
