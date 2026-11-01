@@ -127,9 +127,10 @@ type StagingFS interface {
 	// universal-binary magic number, opening it without following a symlink.
 	MachO(path string) (bool, error)
 	// ResolveInstalled returns the file the installed k3sm entry point path
-	// names (resolveInstalledBinary): path itself when it is not a symlink or
-	// does not exist, otherwise the regular file <dir>/versions/<v>/<base> it
-	// leads to. Anything else is an error.
+	// names (resolveInstalledBinary): path itself when it does not exist,
+	// otherwise a fully evaluated path, <dir>/<base> when it is not a symlink
+	// and the regular file <dir>/versions/<v>/<base> it leads to when it is.
+	// Anything else is an error.
 	ResolveInstalled(path string) (string, error)
 }
 
@@ -406,19 +407,21 @@ const installedUnresolvableRecovery = "repair the install with the install scrip
 
 // resolveInstalledBinary is the one resolution of the installed k3sm the
 // --from-staging checks read through. path is the entry point
-// (installedBinary). A missing path, or one that is not a symlink, is returned
-// as it is, and the checks judge it there. A symlink must lead, with every
+// (installedBinary). A missing path is returned as it is, and the checks judge
+// it there. A path that is not a symlink must evaluate to the file named like
+// path directly inside path's own (resolved) directory, <dir>/<base>; one that
+// does not (the install root link pointed elsewhere between the two
+// evaluations) is errInstalledUnresolvable. A symlink must lead, with every
 // link followed, to a regular file named like path directly inside a version
 // directory of path's own (resolved) directory, <dir>/versions/<v>/<base>
 // with a valid <v>; a dangling link, a loop, a directory, another name or a
 // target outside that tree is errInstalledUnresolvable, never fs.ErrNotExist,
 // so a broken link is not mistaken for no install.
 //
-// A path resolved from a link is returned fully evaluated (EvalSymlinks): no
-// component of it is a symlink, so the later reads follow none again. A path
-// returned as it is (not a link, or missing) is not evaluated: a symlinked
-// component above it, an install root that is itself a link, is followed
-// again by each later read.
+// An existing path is returned fully evaluated (EvalSymlinks), a flat file as
+// much as a link: no component of it is a symlink, so the later reads follow
+// none again, an install root that is itself a link included. Only a missing
+// path is returned unevaluated.
 //
 // The callers read only the returned path. Nothing stops the tree changing
 // after the resolve; that needs a write to the root-owned install directory.
@@ -429,12 +432,23 @@ func resolveInstalledBinary(path string, lstat func(string) (fs.FileInfo, error)
 		return path, nil
 	case err != nil:
 		return "", fmt.Errorf("%w: inspect %s: %v", errInstalledUnresolvable, path, err)
-	case fi.Mode()&fs.ModeSymlink == 0:
-		return path, nil
 	}
 	target, err := evalSymlinks(path)
 	if err != nil {
 		return "", fmt.Errorf("%w: %s: %v", errInstalledUnresolvable, path, err)
+	}
+	if fi.Mode()&fs.ModeSymlink == 0 {
+		root, err := evalSymlinks(filepath.Dir(path))
+		if err != nil {
+			return "", fmt.Errorf("%w: resolve the install root of %s: %v", errInstalledUnresolvable, path, err)
+		}
+		// Whole-path equality with root joined to the entry point's name:
+		// both sides are cleaned and fully evaluated, so neither a ".." nor
+		// a root that is only a string prefix of target can pass it.
+		if want := filepath.Join(root, filepath.Base(path)); filepath.Clean(target) != want {
+			return "", fmt.Errorf("%w: %s evaluates to %s, not %s in its install root", errInstalledUnresolvable, path, target, want)
+		}
+		return filepath.Clean(target), nil
 	}
 	tfi, err := lstat(target)
 	if err != nil {
