@@ -334,7 +334,7 @@ on, so automation that needs to know reads this row. See [Developer mode](instal
 | `state` | meaning |
 |---|---|
 | `on` | a valid marker is there: the signature of the k3sm that runs as root is not checked. `remedy` is `sudo k3sm install --developer-mode off`; installing a Developer ID signed k3sm also turns developer mode off, and reinstalling an ad-hoc signed build from source does not |
-| `invalid` | something is at the path that is not a root-owned file nobody else can write, with no ACL. It is ignored and the signature checks stay on. `remedy` is `sudo rm /Library/k3sm.developer-mode` |
+| `invalid` | something is at the path that is not a root-owned file nobody else can write, with no ACL, or `/` or `/Library` is not a root-owned real directory that neither group nor others can write, with no ACL. It is ignored and the signature checks stay on. `remedy` is `sudo rm /Library/k3sm.developer-mode` |
 
 `wide.signing` names how the installed k3sm is signed, `ad-hoc` or `team <ID>`; it is omitted when
 that cannot be read. `detail` and `remedy` are sentences for a person; do not parse them.
