@@ -45,6 +45,7 @@ type expectedTeardownStep struct {
 // for a goroutine that returns on it is listed at 0, so the day it can block is a
 // row that has to change.
 var expectedServerTeardown = []expectedTeardownStep{
+	{"eviction loop stop (provider.EvictionStopTimeout)", 10, expectNodeLane},
 	{"budget history stop (provider.BudgetHistoryStopBound)", 3, expectNodeLane},
 	{"runtimed close (defaultCloseGrace)", 2, expectNodeLane},
 	{"node update watcher stop (nodeUpdateStopGrace)", 2, expectNodeLane},
@@ -79,6 +80,7 @@ var expectedServerTeardown = []expectedTeardownStep{
 // then its mesh teardown. A worker runs no control plane, no ingest registry and
 // no server operators.
 var expectedAgentTeardown = []expectedTeardownStep{
+	{"eviction loop stop (provider.EvictionStopTimeout)", 10, expectNodeLane},
 	{"budget history stop (provider.BudgetHistoryStopBound)", 3, expectNodeLane},
 	{"runtimed close (defaultCloseGrace)", 2, expectNodeLane},
 	{"node update watcher stop (nodeUpdateStopGrace)", 2, expectNodeLane},

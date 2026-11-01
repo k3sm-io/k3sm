@@ -137,6 +137,13 @@ import (
 // teardown-step literal a test binds to it.
 const BudgetHistoryStopBound = budgetHistoryFinalFlushBound + time.Second
 
+// EvictionStopTimeout bounds how long node teardown waits for the eviction loop
+// to return after cancelling it. An eviction in flight is cut short by the
+// cancelled context; the bound only keeps a wedged runtime call from holding the
+// whole shutdown. It is exported for cmd/k3sm's teardown and for pkg/install's
+// ExitTimeOut budget, whose teardown-step literal a test binds to it.
+const EvictionStopTimeout = 10 * time.Second
+
 // The history file and its bounds.
 const (
 	budgetHistoryFile    = "history.json"

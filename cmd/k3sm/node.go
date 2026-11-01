@@ -999,7 +999,7 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	closeRuntime := stopEmbeddedRuntime(prov, slog.Default())
 	flushBudgetHistory := stopBudgetHistory(prov, slog.Default())
 	stopRuntime := func() {
-		eviction.stop(evictionStopTimeout)
+		eviction.stop(provider.EvictionStopTimeout)
 		// After the eviction loop, so its last count is in the final flush.
 		flushBudgetHistory()
 		closeRuntime()
@@ -2456,12 +2456,6 @@ func nodeNameFromHostname(hostname string) string {
 	}
 	return name
 }
-
-// evictionStopTimeout bounds how long node teardown waits for the eviction loop
-// to return after cancelling it. An eviction in flight is cut short by the
-// cancelled context; the bound only keeps a wedged runtime call from holding the
-// whole shutdown.
-const evictionStopTimeout = 10 * time.Second
 
 // gatedLoop is a node loop that is counted in the node's WaitGroup from the
 // start, runs only once opened, and can be stopped and waited for

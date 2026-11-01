@@ -72,6 +72,8 @@ pin, its date, and the tarball's sha256.
   there is not an OCI or Docker v2 image manifest, index or manifest list (a Docker schema1
   manifest, for example). It used to read such a manifest as referencing nothing and could reap
   the blobs it still used.
+- The launchd `ExitTimeOut` of the server and agent daemons now counts the node's wait for the
+  eviction loop to stop, so a worker's shutdown budget no longer undercounts by 10 seconds.
 - `k3sm stop` and `k3sm uninstall` recognise a vm pod's `k3sm-vmhost` helper when it runs from
   a versioned install directory or through a symlinked install path, not only from the flat
   `/Library/k3sm/k3sm-vmhost`, so such a helper is still stopped instead of reported as unknown.
