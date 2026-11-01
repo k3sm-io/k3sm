@@ -92,6 +92,7 @@ pin, its date, and the tarball's sha256.
   it runs from cannot be read, the message now says what to check: that the directory and each of its parents are owned by
   root and not writable by group or others (an I/O error means the disk needs checking), and how
   to stop the helper's process group by hand if it is still the helper.
+- The `mlx-serve` image's `mlx-lm` moves from 0.32.0 to 0.32.2. The next image tag carries it; no other package in the closure moves.
 
 ### Fixed
 
