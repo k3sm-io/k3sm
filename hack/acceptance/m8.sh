@@ -126,7 +126,7 @@ render_manifest() {
 # seed_image — the image the seed Job runs: the serving image (its interpreter
 # carries huggingface_hub, a dependency of the engine), as the gate will apply it.
 seed_image() {
-	render_manifest "$1" | grep -E '^[[:space:]]*image:' | head -1 | sed -E 's#^[[:space:]]*image:[[:space:]]*##'
+	render_manifest "$1" | grep -E '^[[:space:]]*image:' | sed -n 1p | sed -E 's#^[[:space:]]*image:[[:space:]]*##'
 }
 
 # render_seed_job <namespace> <node> <image> <pvc> — a Job that downloads the
@@ -218,13 +218,13 @@ if [ "${1:-}" = "--self-test" ]; then
 	grep -qF "cache_dir=c" <<<"$j" && grep -qF "c='.'+os.environ['HF_HOME']" <<<"$j" &&
 		st ok "seed download targets a relative cache_dir under the mount" || st no "seed download targets a relative cache_dir under the mount"
 	body="$(cat "$0")"
-	del_line="$(printf '%s\n' "$body" | grep -n '^delete_seed_job$' | head -1 | cut -d: -f1)"
-	seed_line="$(printf '%s\n' "$body" | grep -n 'render_seed_job "\$NS"' | head -1 | cut -d: -f1)"
-	ready_line="$(printf '%s\n' "$body" | grep -n '^# m8.4 Ready' | head -1 | cut -d: -f1)"
+	del_line="$(printf '%s\n' "$body" | grep -n '^delete_seed_job$' | sed -n 1p | cut -d: -f1)"
+	seed_line="$(printf '%s\n' "$body" | grep -n 'render_seed_job "\$NS"' | sed -n 1p | cut -d: -f1)"
+	ready_line="$(printf '%s\n' "$body" | grep -n '^# m8.4 Ready' | sed -n 1p | cut -d: -f1)"
 	[ -n "$del_line" ] && [ -n "$seed_line" ] && [ -n "$ready_line" ] && [ "$seed_line" -lt "$del_line" ] && [ "$del_line" -lt "$ready_line" ] &&
 		st ok "seed Job is deleted after m8.3-b and before m8.4" || st no "seed Job is deleted after m8.3-b and before m8.4"
 	grep -q 'cascade=foreground' <<<"$body" && st ok "seed Job delete is foreground" || st no "seed Job delete is foreground"
-	[ "$(seed_image lab-ns)" = "$(grep -E '^[[:space:]]*image:' "$EXAMPLE" | head -1 | sed -E 's#^[[:space:]]*image:[[:space:]]*##')" ] &&
+	[ "$(seed_image lab-ns)" = "$(grep -E '^[[:space:]]*image:' "$EXAMPLE" | sed -n 1p | sed -E 's#^[[:space:]]*image:[[:space:]]*##')" ] &&
 		st ok "seed image is the example's serving image" || st no "seed image is the example's serving image"
 	[ "$("$0" --render-seed-job lab-ns node-a "cache-$MODEL_NAME-0")" = "$(render_seed_job lab-ns node-a "$(seed_image lab-ns)" "cache-$MODEL_NAME-0")" ] &&
 		st ok "--render-seed-job prints the m8.3-b seed Job for the example's image" || st no "--render-seed-job prints the m8.3-b seed Job for the example's image"
@@ -301,7 +301,7 @@ kubectl --request-timeout=10s get --raw /healthz >/dev/null || {
 	echo "cluster at \$KUBECONFIG is not serving" >&2; exit 1
 }
 
-NS="${K3SM_MLX_NAMESPACE:-$(grep -E '^  namespace:' "$EXAMPLE" | head -1 | awk '{print $2}')}"
+NS="${K3SM_MLX_NAMESPACE:-$(grep -E '^  namespace:' "$EXAMPLE" | sed -n 1p | awk '{print $2}')}"
 NS="${NS:-default}"
 
 MANIFEST=""
@@ -565,7 +565,7 @@ read -r code _ _ <<<"$(completion "$VIP" 64 "$body")"
 text="$(tokens_of "$body")"
 if [ "$code" = "200" ] && [ -n "$text" ]; then
 	ladder ok "m8.6  OpenAI chat completion through the ClusterIP returned tokens"
-	note "reply: $(printf '%s' "$text" | head -c 120)"
+	note "reply: $(printf '%s' "${text:0:120}")"
 else
 	ladder no "m8.6  chat completion through the ClusterIP returned no tokens (http $code)"
 	head -c 400 "$body" | sed 's/^/      /' || true

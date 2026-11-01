@@ -132,7 +132,7 @@ EOF
 # engine_pin echoes the engine requirement exactly as requirements.in pins it,
 # so the image label cannot drift from what is actually installed.
 engine_pin() {
-	grep -E '^[a-zA-Z0-9]' "$HERE/requirements.in" | head -1
+	grep -E '^[a-zA-Z0-9]' "$HERE/requirements.in" | sed -n 1p
 }
 
 # ---- lockfile ---------------------------------------------------------------
@@ -199,7 +199,7 @@ require_uv() {
 	local have
 	have="$("$UV" --version 2>/dev/null | awk '{print $2}')"
 	[ -n "$have" ] || die "cannot read a version from '$UV --version'"
-	if [ "$(printf '%s\n%s\n' "$UV_MIN" "$have" | sort -V | head -1)" != "$UV_MIN" ]; then
+	if [ "$(printf '%s\n%s\n' "$UV_MIN" "$have" | sort -V | sed -n 1p)" != "$UV_MIN" ]; then
 		die "uv $have is older than the pinned minimum $UV_MIN (requirements.lock was generated with $UV_MIN)"
 	fi
 	echo "  uv: $have ($UV)"
@@ -366,7 +366,7 @@ for m in sorted(missing)[:20]:
     print(m)
 PY
 )" || die "cannot run the staged interpreter to check the precompile"
-	read -r total missing <<< "$(printf '%s\n' "$out" | head -1)"
+	read -r total missing <<< "$(printf '%s\n' "$out" | sed -n 1p)"
 	if [ "$missing" -gt 0 ]; then
 		printf '%s\n' "$out" | tail -n +2 | sed 's/^/    no .pyc: /'
 	fi

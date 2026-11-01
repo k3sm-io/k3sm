@@ -204,7 +204,7 @@ echo "S3_KERNEL_SHA256=$PLUCKY_VMLINUZ_SHA256"
 # recorded that as a fact), so the cloud vmlinuz is decompressed host-side.
 gzip -dc vmlinuz.gz > Image
 echo "S3_KERNEL_IMAGE_BYTES=$(stat -f%z Image)"
-echo "S3_KERNEL_VERSION_STRING=$(strings -a Image | grep -m1 -E '^Linux version [0-9]' | cut -c1-120)"
+echo "S3_KERNEL_VERSION_STRING=$(strings -a Image | grep -E '^Linux version [0-9]' | sed -n 1p | cut -c1-120)"
 
 fetch_pinned "$PLUCKY_MODULES_URL" "$PLUCKY_MODULES_SHA256" modules.deb
 echo "S3_MODULES_URL=$PLUCKY_MODULES_URL"
@@ -219,7 +219,7 @@ echo "S3_MODULES_SHA256=$PLUCKY_MODULES_SHA256"
 # rather than silently mis-handled.
 rm -rf debx && mkdir -p debx && cd debx
 ar x ../modules.deb 2>/dev/null || { echo "S3 SETUP FAIL: ar x on the .deb"; exit 1; }
-DATA=$(ls data.tar data.tar.zst data.tar.xz data.tar.gz 2>/dev/null | head -1 || true)
+DATA=$(ls data.tar data.tar.zst data.tar.xz data.tar.gz 2>/dev/null | sed -n 1p || true)
 [ -n "$DATA" ] || { echo "S3 SETUP FAIL: no data member in the .deb"; exit 1; }
 echo "S3_MODULES_DATA_MEMBER=$DATA"
 
@@ -251,8 +251,8 @@ for f in $(cd debx && find lib -name '*.ko*' -type f); do
     *)     cp "debx/$f" "mods/$base" ;;
   esac
   echo "S3_MOD_EXTRACTED=$base bytes=$(stat -f%z "mods/$base")"
-  echo "S3_MOD_DEPENDS_$base=$(strings -a "mods/$base" | grep -m1 '^depends=' || echo 'depends=(none declared)')"
-  echo "S3_MOD_VERMAGIC_$base=$(strings -a "mods/$base" | grep -m1 '^vermagic=' || echo 'vermagic=(absent)')"
+  echo "S3_MOD_DEPENDS_$base=$(strings -a "mods/$base" | grep '^depends=' | sed -n 1p || echo 'depends=(none declared)')"
+  echo "S3_MOD_VERMAGIC_$base=$(strings -a "mods/$base" | grep '^vermagic=' | sed -n 1p || echo 'vermagic=(absent)')"
 done
 LABEOF
 

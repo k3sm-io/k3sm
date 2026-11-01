@@ -23,3 +23,14 @@ BODY
 ! find . -name x | grep -q .
 %%
 out="$(on peer "ifconfig bridge0 | grep -q member && echo up")"
+%%
+{ cat a; cat b; } | head -c 100 > big && mv big a
+%%
+gen | head -n 1
+%%
+gen | grep -m1 pat
+%%
+gen | grep -l pat
+%%
+gen |
+	head -3

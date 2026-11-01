@@ -261,7 +261,7 @@ tree_manifest_problems() {
 	local dir="$1" manifest="$2" problems=0 want got sum rel line extra
 	shift 2
 	[ -f "$manifest" ] || { echo "    no manifest $manifest"; return 1; }
-	if [ -n "$(cd "$dir" && find . -type l | head -1)" ]; then
+	if [ -n "$(cd "$dir" && find . -type l | sed -n 1p)" ]; then
 		echo "    $dir holds a symlink"; problems=1
 	fi
 	want="$(grep -v '^#' "$manifest" | sed '/^$/d' | sed 's/^[0-9a-f]\{64\}  //' | LC_ALL=C sort)"
@@ -753,7 +753,7 @@ image_root_problems() {
 			{ echo "    the app's payload/PAYLOAD-SHA256 differs from the stage tree's manifest"; rc=1; }
 		# tree_manifest_problems tolerates a Finder .DS_Store in a stage tree; the
 		# app's payload is a sealed copy and must hold exactly the manifest's files.
-		[ -z "$(find "$payload" -name .DS_Store | head -1)" ] ||
+		[ -z "$(find "$payload" -name .DS_Store | sed -n 1p)" ] ||
 			{ echo "    k3sm.app's payload holds a .DS_Store"; rc=1; }
 		tree_manifest_problems "$payload" "$manifest" || rc=1
 	fi
@@ -1386,14 +1386,14 @@ index_cases() {
 	fresh; mk_image "$W/img" "$W/tree"; mk_index "$W"
 	ix="$W/idx/$(index_name "$tag")"
 	head -c $((INDEX_MAX_BYTES + 1)) /dev/zero | tr '\0' ' ' >>"$ix.pad"
-	{ cat "$ix"; cat "$ix.pad"; } | head -c $((INDEX_MAX_BYTES + 1)) >"$ix.big" && mv "$ix.big" "$ix"; rm -f "$ix.pad"
+	cat "$ix" "$ix.pad" >"$ix.cat"; head -c $((INDEX_MAX_BYTES + 1)) "$ix.cat" >"$ix.big" && mv "$ix.big" "$ix"; rm -f "$ix.pad" "$ix.cat"
 	run_up "$W/tree" "$W/img/out/$(image_name "$tag")" "$ix"
 	up_refuses "an index over $INDEX_MAX_BYTES bytes refuses" index-size
 	grep -q '^security ' "$log" && bad "an oversize index was extracted"
 	fresh; mk_image "$W/img" "$W/tree"; mk_index "$W"
 	ix="$W/idx/$(index_name "$tag")"
 	head -c "$INDEX_MAX_BYTES" /dev/zero | tr '\0' ' ' >"$ix.pad"
-	{ cat "$ix"; cat "$ix.pad"; } | head -c "$INDEX_MAX_BYTES" >"$ix.big" && mv "$ix.big" "$ix"; rm -f "$ix.pad"
+	cat "$ix" "$ix.pad" >"$ix.cat"; head -c "$INDEX_MAX_BYTES" "$ix.cat" >"$ix.big" && mv "$ix.big" "$ix"; rm -f "$ix.pad" "$ix.cat"
 	run_up "$W/tree" "$W/img/out/$(image_name "$tag")" "$ix"
 	if [ "$rc" -ne 0 ] && grep -q "REFUSE: index-unverified" <<<"$out" && grep -q '^security cms -D' "$log" && ! grep -q '^gh ' "$log"; then
 		ok "an index of exactly $INDEX_MAX_BYTES bytes passes the size bound and reaches the content check"
@@ -2226,8 +2226,8 @@ EOF
 		if bash -n "$s"; then ok "$(basename "$s") parses (bash -n)"; else bad "$(basename "$s") bash -n"; fi
 	done
 	local guard_line parse_line
-	guard_line="$(grep -n 'CLAUDECODE+x' "$sign" | head -1 | cut -d: -f1)"
-	parse_line="$(grep -n '^while \[ \$# -gt 0 \]' "$sign" | head -1 | cut -d: -f1)"
+	guard_line="$(grep -n 'CLAUDECODE+x' "$sign" | sed -n 1p | cut -d: -f1)"
+	parse_line="$(grep -n '^while \[ \$# -gt 0 \]' "$sign" | sed -n 1p | cut -d: -f1)"
 	if [ -n "$guard_line" ] && [ -n "$parse_line" ] && [ "$guard_line" -lt "$parse_line" ]; then
 		ok "sign.sh tests the environment before its argument loop"
 	else
@@ -2366,7 +2366,7 @@ echo "==> 3/6 rewrite the manifest over the signed bytes"
 
 echo "==> 4/6 verify the release signatures"
 verify_release "$STAGE" "$TEAM_ID"
-got_version="$("$STAGE/k3sm" version | head -1 | awk '{print $2}')"
+got_version="$("$STAGE/k3sm" version | sed -n 1p | awk '{print $2}')"
 [ "$got_version" = "${VERSION#v}" ] ||
 	die "the staged k3sm reports version '$got_version', expected '${VERSION#v}'; stamp it through --ldflags"
 

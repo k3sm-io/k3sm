@@ -100,8 +100,8 @@ ladder "$w" "b253.1  startNode builds the embedded-runtime teardown, defers it, 
 # LIFO: the LATER defer runs FIRST, so the runtime's close is registered AFTER
 # the control socket's teardown, and the budget table orders the stages that way.
 o=ok
-sock_line="$(grep -nE '^\s*defer stopControlSocket\(\)$' "$NODE_GO" | head -1 | cut -d: -f1)"
-rt_line="$(grep -nE '^\s*defer stopRuntime\(\)$' "$NODE_GO" | head -1 | cut -d: -f1)"
+sock_line="$(grep -nE '^\s*defer stopControlSocket\(\)$' "$NODE_GO" | sed -n 1p | cut -d: -f1)"
+rt_line="$(grep -nE '^\s*defer stopRuntime\(\)$' "$NODE_GO" | sed -n 1p | cut -d: -f1)"
 if [ -z "$sock_line" ] || [ -z "$rt_line" ] || [ "$sock_line" -ge "$rt_line" ]; then o=no; fi
 ladder "$o" "b253.1  the runtime teardown is deferred AFTER the control socket's, so LIFO closes the runtime first (lines ${sock_line:-?} < ${rt_line:-?})"
 

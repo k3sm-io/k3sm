@@ -53,7 +53,7 @@ ladder "$h" "b365.1  troubleshooting.md has an offline-node/stuck-terminating he
 # Scope every remaining troubleshooting.md rung to the section body, from that
 # heading to the next H2 (or EOF) — never the whole file, or a coincidental hit
 # elsewhere (or the gate's own comment header) would pass a missing section.
-start_line="$(grep -nE '^## .*Node Went Offline.*Stuck Terminating' "$DOC" | head -1 | cut -d: -f1)"
+start_line="$(grep -nE '^## .*Node Went Offline.*Stuck Terminating' "$DOC" | sed -n 1p | cut -d: -f1)"
 if [ -n "$start_line" ]; then
 	end_line="$(awk -v s="$start_line" 'NR>s && /^## /{print NR; exit}' "$DOC")"
 	[ -n "$end_line" ] || end_line=$(( $(wc -l < "$DOC") + 1 ))
@@ -70,8 +70,8 @@ else
 	grep -qi 'asleep' <<<"$SECTION" || a=no
 	grep -qi 'ping its LAN address\|ping.*LAN' <<<"$SECTION" || a=no
 	# It must precede the taint command, or a reader could act before checking.
-	asleep_pos="$(printf '%s\n' "$SECTION" | grep -ni 'asleep' | head -1 | cut -d: -f1)"
-	taint_pos="$(printf '%s\n' "$SECTION" | grep -ni 'kubectl taint node' | head -1 | cut -d: -f1)"
+	asleep_pos="$(printf '%s\n' "$SECTION" | grep -ni 'asleep' | sed -n 1p | cut -d: -f1)"
+	taint_pos="$(printf '%s\n' "$SECTION" | grep -ni 'kubectl taint node' | sed -n 1p | cut -d: -f1)"
 	if [ -z "$asleep_pos" ] || [ -z "$taint_pos" ] || [ "$asleep_pos" -ge "$taint_pos" ]; then
 		a=no
 	fi

@@ -141,7 +141,7 @@ kc -n "$NS" rollout status deploy --timeout=600s > "$W/rollout.log" 2>&1
 READY=$(kc -n "$NS" get deploy -o jsonpath='{range .items[*]}{.metadata.name}={.status.readyReplicas}/{.status.replicas} {end}' | sed 's|=/|=0/|g')
 case "$READY" in
   *"=0/"*|"") verdict FAIL "s2.1 install  a control-plane Deployment is not Ready under runtimeClassName=vm: $READY"
-              kc -n "$NS" get pods -o jsonpath='{range .items[*]}{.metadata.name}: {.status.phase} {.status.reason} {.status.message}{"\n"}{end}' | head -5; exit 0 ;;
+              kc -n "$NS" get pods -o jsonpath='{range .items[*]}{.metadata.name}: {.status.phase} {.status.reason} {.status.message}{"\n"}{end}' | sed -n 1,5p; exit 0 ;;
   *)          verdict PASS "s2.1 install  the control plane is Ready as vm Pods with explicit memory requests: $READY" ;;
 esac
 
@@ -232,7 +232,7 @@ fi
 DGD="${K3SM_M16_DGD_MANIFEST:-}"
 if [ -z "$DGD" ]; then
   # A manifest, not a docs page: the tree's .mdx pages quote the same kind.
-  DGD=$(grep -rl --include='*.yaml' "kind: DynamoGraphDeployment" "$PREFIX/s1/src/examples" 2>/dev/null | grep -i "mocker.*agg\|mocker" | head -1)
+  DGD=$(grep -rl --include='*.yaml' "kind: DynamoGraphDeployment" "$PREFIX/s1/src/examples" 2>/dev/null | grep -i "mocker.*agg\|mocker" | sed -n 1p)
 fi
 if [ -z "$DGD" ] || [ ! -r "$DGD" ]; then
   verdict FAIL "s2.5 serve  no mocker DynamoGraphDeployment manifest found (run s1.sh first, or set K3SM_M16_DGD_MANIFEST) — this rung installs the chart's own example, never a hand-written one"
@@ -326,7 +326,7 @@ if [ -n "$CONV_CRD" ]; then
     OUT=$(kc -n "$NS" get "${CRD_NAME%%.*}.$ALT.${CRD_NAME#*.}" "$FIRST" -o jsonpath='{.apiVersion}' 2>&1)
     case "$OUT" in
       *"$ALT"*) verdict PASS "s2.4 conversion  a $ALT read of $FIRST was answered live by the chart's conversion webhook (apiVersion=$OUT)" ;;
-      *)        verdict FAIL "s2.4 conversion  the $ALT read of $FIRST failed: $(printf '%s' "$OUT" | head -c 200)" ;;
+      *)        verdict FAIL "s2.4 conversion  the $ALT read of $FIRST failed: $(printf '%s' "${OUT:0:200}")" ;;
     esac
   else
     verdict FAIL "s2.4 conversion  the operator derived no $CRD_NAME from the graph within 60 s"
@@ -335,7 +335,7 @@ fi
 
 FE_SVC=""
 for i in $(seq 1 90); do
-  FE_SVC=$(kc -n "$NS" get svc -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}' | tr ' ' '\n' | grep -i frontend | head -1)
+  FE_SVC=$(kc -n "$NS" get svc -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}' | tr ' ' '\n' | grep -i frontend | sed -n 1p)
   [ -n "$FE_SVC" ] && break
   sleep 5
 done
@@ -355,7 +355,7 @@ MODELS=""; MODEL_ID=""; ANSWERED=""
 for i in $(seq 1 90); do
   MODELS=$(curl -fsS -m 5 "http://$FE_IP:$FE_PORT/v1/models" 2>/dev/null)
   if [ -n "$MODELS" ]; then
-    [ -n "$ANSWERED" ] || { ANSWERED=$i; recorded "s2.5 frontend  /v1/models first answered after $((i * 5)) s: $(printf '%s' "$MODELS" | head -c 160)"; }
+    [ -n "$ANSWERED" ] || { ANSWERED=$i; recorded "s2.5 frontend  /v1/models first answered after $((i * 5)) s: $(printf '%s' "${MODELS:0:160}")"; }
     MODEL_ID=$(printf '%s' "$MODELS" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["data"][0]["id"])' 2>/dev/null)
     [ -n "$MODEL_ID" ] && break
   fi
@@ -367,18 +367,18 @@ if [ -z "$MODELS" ]; then
 fi
 if [ -z "$MODEL_ID" ]; then
   verdict FAIL "s2.5 serve  /v1/models answered but listed no model within $((90 * 5)) s — discovery did not deliver the worker; the halt applies"
-  kc -n "$NS" get pods; kc -n "$NS" get dynamoworkermetadata,endpointslices 2>&1 | head -20; exit 0
+  kc -n "$NS" get pods; kc -n "$NS" get dynamoworkermetadata,endpointslices 2>&1 | sed -n 1,20p; exit 0
 fi
 recorded "s2.5 discovery  the frontend listed $MODEL_ID after $((i * 5)) s"
 OUT=$(curl -fsS -m 120 "http://$FE_IP:$FE_PORT/v1/chat/completions" -H 'content-type: application/json' \
   -d "{\"model\":\"$MODEL_ID\",\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}" 2>&1)
 case "$OUT" in
   *choices*) verdict PASS "s2.5 serve  a completion was served through the frontend's ClusterIP $FE_IP:$FE_PORT for model $MODEL_ID" ;;
-  *)         verdict FAIL "s2.5 serve  /v1/models listed $MODEL_ID but the completion failed: $(printf '%s' "$OUT" | head -c 200)" ;;
+  *)         verdict FAIL "s2.5 serve  /v1/models listed $MODEL_ID but the completion failed: $(printf '%s' "${OUT:0:200}")" ;;
 esac
 
 # ---- s2.6 the dial the router depends on -----------------------------------------
-WORKER_POD=$(kc -n "$NS" get pods -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep -viE 'frontend|operator' | head -1)
+WORKER_POD=$(kc -n "$NS" get pods -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep -viE 'frontend|operator' | sed -n 1p)
 if [ -n "$WORKER_POD" ]; then
   WLOG=$(kc -n "$NS" logs "$WORKER_POD" --tail=500 2>/dev/null)
   HITS=$(printf '%s' "$WLOG" | grep -ciE 'connect|accepted|request plane|from [0-9]+\.' || true)

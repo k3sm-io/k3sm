@@ -51,7 +51,7 @@ export UV_CACHE_DIR=$PREFIX/cache UV_PYTHON_INSTALL_DIR=$PREFIX/pyinstall
 UV=$PREFIX/bin/uv
 ENG=$PREFIX/engines
 mkdir -p "$ENG"
-MP=$(ls -d "$PREFIX"/hf/hub/models--*Qwen2.5-0.5B*/snapshots/* | head -1)
+MP=$(ls -d "$PREFIX"/hf/hub/models--*Qwen2.5-0.5B*/snapshots/* | sed -n 1p)
 export HF_HOME=$PREFIX/hf HF_HUB_OFFLINE=1
 
 # The pinned oMLX revision. oMLX is NOT on PyPI, so a spike that said "install
@@ -176,7 +176,7 @@ hashcheck() { # hashcheck <name> <requirement-source...>
   if [ $? -eq 0 ]; then
     printf '  %-8s REQUIRE_HASHES=OK\n' "$e"
   else
-    printf '  %-8s REQUIRE_HASHES=FAIL %s\n' "$e" "$(echo "$out" | grep -i error | head -1)"
+    printf '  %-8s REQUIRE_HASHES=FAIL %s\n' "$e" "$(echo "$out" | grep -i error | sed -n 1p)"
   fi
   rm -rf "$d/venv-rh"
 }
@@ -342,7 +342,7 @@ PY
   done
   wait "$sp" 2>/dev/null
   [ -n "$first" ] && awk -v a="$ts" -v b="$first" 'BEGIN{printf "      TTFB_S=%.2f\n", b-a}'
-  echo "      first SSE lines:"; head -c 400 "$PREFIX/logs/s5-$e-stream.txt" | head -3 | sed 's/^/        /'
+  echo "      first SSE lines:"; head -c 400 "$PREFIX/logs/s5-$e-stream.txt" | sed -n 1,3p | sed 's/^/        /'
   echo "      done marker: $(grep -c 'data: \[DONE\]' "$PREFIX/logs/s5-$e-stream.txt" 2>/dev/null)"
 
   # Concurrency scaling — the axis the working hypothesis actually rests on.

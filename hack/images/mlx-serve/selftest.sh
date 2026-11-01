@@ -84,7 +84,7 @@ if command -v shellcheck >/dev/null 2>&1; then
 		ladder ok "0.shellcheck  clean"
 	else
 		ladder no "0.shellcheck  clean"
-		printf '%s\n' "$out" | head -40
+		printf '%s\n' "$out" | sed -n 1,40p
 	fi
 else
 	ladder skip "0.shellcheck  not installed on this host"
@@ -118,7 +118,7 @@ else
 	ladder no "1.exact  every requirement is an == pin"
 fi
 
-engine="$(grep -E '^[a-zA-Z0-9]' "$HERE/requirements.in" | head -1)"
+engine="$(grep -E '^[a-zA-Z0-9]' "$HERE/requirements.in" | sed -n 1p)"
 if [ -n "$engine" ] && grep -qxF "$engine \\" "$LOCK"; then
 	ladder ok "1.engine  requirements.in pin ($engine) is the lockfile's pin"
 else
@@ -249,7 +249,7 @@ if [ "$rc" -eq 1 ] && grep -q 'INVALID' <<<"$out"; then
 	ladder ok "5.red  walk-verify fails a tree with an invalid-signature Mach-O (exit $rc)"
 else
 	ladder no "5.red  walk-verify fails a tree with an invalid-signature Mach-O (exit $rc)"
-	printf '%s\n' "$out" | head -10
+	printf '%s\n' "$out" | sed -n 1,10p
 fi
 
 # The universal-binary lesson, mechanized: a fat Mach-O whose target slice is
@@ -352,7 +352,7 @@ if "$WALK" --layout "$WORK/layout-ok" >/dev/null 2>&1; then
 	ladder ok "6.layout  walk-verify passes a well-formed layout"
 else
 	ladder no "6.layout  walk-verify passes a well-formed layout"
-	"$WALK" --layout "$WORK/layout-ok" 2>&1 | head -10
+	"$WALK" --layout "$WORK/layout-ok" 2>&1 | sed -n 1,10p
 fi
 
 mklayout "$WORK/layout-mislabelled" "$GOOD" mislabelled /bin/python3.12
@@ -1428,10 +1428,10 @@ done <<< "$cm_out"
 # The entry script checks both digests before it runs anything, then stages
 # with build.sh --stage-only (the same checks as a host build).
 ENTRY="$WORK/entry/stage-entry.sh"
-lock_line="$(grep -n 'LOCK_SHA256.*shasum -a 256 -c' "$ENTRY" | cut -d: -f1 | head -1)"
-uv_line="$(grep -n 'UV_SHA256.*shasum -a 256 -c' "$ENTRY" | cut -d: -f1 | head -1)"
-tar_line="$(grep -n 'tar -xzf' "$ENTRY" | cut -d: -f1 | head -1)"
-build_line="$(grep -n 'build.sh" --stage-only' "$ENTRY" | cut -d: -f1 | head -1)"
+lock_line="$(grep -n 'LOCK_SHA256.*shasum -a 256 -c' "$ENTRY" | cut -d: -f1 | sed -n 1p)"
+uv_line="$(grep -n 'UV_SHA256.*shasum -a 256 -c' "$ENTRY" | cut -d: -f1 | sed -n 1p)"
+tar_line="$(grep -n 'tar -xzf' "$ENTRY" | cut -d: -f1 | sed -n 1p)"
+build_line="$(grep -n 'build.sh" --stage-only' "$ENTRY" | cut -d: -f1 | sed -n 1p)"
 if [ -n "$lock_line" ] && [ -n "$uv_line" ] && [ -n "$tar_line" ] && [ -n "$build_line" ] &&
 	[ "$uv_line" -lt "$tar_line" ] && [ "$lock_line" -lt "$build_line" ] && grep -q '^set -euo pipefail$' "$ENTRY"; then
 	ladder ok "10.entry  the lock and uv digests are checked (set -e) before uv is unpacked and build.sh --stage-only runs"

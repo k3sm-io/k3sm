@@ -48,7 +48,7 @@ while IFS= read -r -d '' f; do
   if grep -q "Signature=adhoc" <<<"$dv"; then
     adhoc=$((adhoc+1)); echo "ADHOC    $f" >> "$OUT"
   else
-    ident=$((ident+1)); echo "SIGNED   $f  [$(echo "$dv" | grep '^Authority=' | head -1)]" >> "$OUT"
+    ident=$((ident+1)); echo "SIGNED   $f  [$(echo "$dv" | grep '^Authority=' | sed -n 1p)]" >> "$OUT"
   fi
 done < <(find "$ROOT" -type f -print0)
 echo "FILES=$tot MACHO=$macho ADHOC_LINKER_SIGNED=$adhoc SIGNED_IDENTITY=$ident UNSIGNED=$unsigned INVALID=$invalid"
@@ -66,7 +66,7 @@ grep '^INVALID' "$PREFIX/logs/s2-venv.txt" "$PREFIX/logs/s2-pyinstall.txt" 2>/de
   /usr/bin/lipo -info "$f" 2>&1 | sed 's/^/    /'
   for a in $(/usr/bin/lipo -archs "$f" 2>/dev/null); do
     if /usr/bin/codesign -v --arch "$a" "$f" >/dev/null 2>&1; then echo "    arch $a: VALID"
-    else echo "    arch $a: $(/usr/bin/codesign -v --arch "$a" "$f" 2>&1 | sed 's|.*: ||' | head -1)"; fi
+    else echo "    arch $a: $(/usr/bin/codesign -v --arch "$a" "$f" 2>&1 | sed 's|.*: ||' | sed -n 1p)"; fi
   done
 done
 
@@ -81,7 +81,7 @@ echo "  clone_seconds=$(/usr/bin/python3 -c "print(round($CE-$CS,3))") tree_KB=$
 echo "### clone — signing tally AFTER clonefile (must match the source)"
 "$W/s2walk.sh" "$W/clone" "$PREFIX/logs/s2-clone.txt"
 
-MP=$(ls -d "$PREFIX"/hf/hub/models--*Qwen2.5-0.5B*/snapshots/* | head -1)
+MP=$(ls -d "$PREFIX"/hf/hub/models--*Qwen2.5-0.5B*/snapshots/* | sed -n 1p)
 echo "### clone — exec from the clone, UNSANDBOXED"
 ( cd "$POD" && env -i HOME="$POD" TMPDIR="$POD/tmp" PATH=/usr/bin:/bin MODEL_PATH="$MP" \
     HF_HUB_OFFLINE=1 HF_HOME="$PREFIX/hf" "$W/clone/bin/python" "$W/gen.py" 2>&1 ) \

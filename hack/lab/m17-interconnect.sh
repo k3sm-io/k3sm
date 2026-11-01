@@ -1004,7 +1004,7 @@ chmod 0755 "$BIN"
 "$BIN" install $ARGS
 rc=$?
 echo "INSTALL-EXIT=$rc"
-/usr/local/bin/k3sm version 2>&1 | head -3
+/usr/local/bin/k3sm version 2>&1 | sed -n 1,3p
 exit "$rc"
 EOF
 	local rc=$?
@@ -1077,7 +1077,7 @@ st() { # st <name> <want 0|1> <command...>
 	if { [ "$want" = 0 ] && [ "$rc" = 0 ]; } || { [ "$want" = 1 ] && [ "$rc" != 0 ]; }; then
 		echo "ok    $name"
 	else
-		echo "MISS  $name (exit $rc, want $([ "$want" = 0 ] && echo 0 || echo non-zero)): $(printf '%s' "$out" | head -c 300)"
+		echo "MISS  $name (exit $rc, want $([ "$want" = 0 ] && echo 0 || echo non-zero)): $(printf '%s' "${out:0:300}")"
 		ST_MISS=$((ST_MISS + 1))
 	fi
 }
@@ -1086,7 +1086,7 @@ st_out() { # st_out <name> <text> <command...> — the output names the text
 	shift 2
 	out="$("$@" 2>&1)"
 	if grep -qF -- "$text" <<<"$out"; then echo "ok    $name"; else
-		echo "MISS  $name: output lacks '$text': $(printf '%s' "$out" | head -c 300)"
+		echo "MISS  $name: output lacks '$text': $(printf '%s' "${out:0:300}")"
 		ST_MISS=$((ST_MISS + 1))
 	fi
 }
@@ -1137,7 +1137,7 @@ runlog_missing_refuses() {
 		return 1
 	}
 	[ "$(printf '%s\n' "$out" | grep -c .)" = 1 ] || {
-		echo "output beyond the refusal (a rung or preflight ran): $(printf '%s' "$out" | head -3)"
+		echo "output beyond the refusal (a rung or preflight ran): $(printf '%s' "$out" | sed -n 1,3p)"
 		return 1
 	}
 	[ ! -e "$d/ev" ] || {
@@ -1202,7 +1202,7 @@ st_driver() {
 	if { [ "$want" = 0 ] && [[ "$out" == *"DRIVER passes=7 fails=0"* ]]; } || { [ "$want" = 1 ] && [[ "$out" == *"DRIVER passes="* ]] && [[ "$out" != *" fails=0"* ]]; }; then
 		echo "ok    rung driver $rung over $prof (want $([ "$want" = 0 ] && echo green || echo red))"
 	else
-		echo "MISS  rung driver $rung over $prof: $(printf '%s' "$out" | grep -E '^(FAIL|DRIVER)' | head -5 | tr '\n' ';')"
+		echo "MISS  rung driver $rung over $prof: $(printf '%s' "$out" | grep -E '^(FAIL|DRIVER)' | sed -n 1,5p | tr '\n' ';')"
 		ST_MISS=$((ST_MISS + 1))
 	fi
 }
@@ -1311,7 +1311,7 @@ self_test_body() {
 	st_out "plan validator red: the unknown prerequisite is named" "unknown prerequisite 'wifi'" icp_validate_rungs "$F/plan-unknown-prereq.tsv" "r0-disarmed" "$PREREQ_SET"
 	{
 		printf '%s\n' "$RUNG_TABLE"
-		printf '%s\n' "$RUNG_TABLE" | head -1
+		printf '%s\n' "$RUNG_TABLE" | sed -n 1p
 	} >"$tmp/plan-dup.tsv"
 	st "plan validator red: a duplicate id" 1 icp_validate_rungs "$tmp/plan-dup.tsv" "$REQUIRED_IDS" "$PREREQ_SET"
 
@@ -1522,7 +1522,7 @@ done
 echo "TB_ACTIVE=$(echo $tba)"
 echo "MACS=$(echo $macs)"
 echo "LAN=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')"
-echo "MESH=$(ifconfig -a inet | awk '$1=="inet"{print $2}' | awk -F. '$1==100 && $2>=64 && $2<=127' | head -1)"
+echo "MESH=$(ifconfig -a inet | awk '$1=="inet"{print $2}' | awk -F. '$1==100 && $2>=64 && $2<=127' | sed -n 1p)"
 bin="$(readlink -f "$K3SM_BIN" 2>/dev/null || echo "$K3SM_BIN")"
 echo "SHA=$(shasum -a 256 "$bin" 2>/dev/null | cut -d' ' -f1)"
 grep -aqF 'k3sm.io/InterconnectAttached' "$bin" && echo HAS_attach=yes || echo HAS_attach=no

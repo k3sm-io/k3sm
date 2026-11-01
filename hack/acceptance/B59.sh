@@ -126,7 +126,7 @@ for repo in $REPOS; do
 		# (e) CGO posture — dormancy-independent (read from THAT repo's hack/ci.sh).
 		want="$(expected_cgo "$repo")"
 		if [ -f "$cish" ]; then
-			got="$(grep -oE '^[[:space:]]*CGO=[0-9]' "$cish" | head -n1 | grep -oE '[0-9]$' || true)"
+			got="$(grep -oE '^[[:space:]]*CGO=[0-9]' "$cish" | sed -n 1p | grep -oE '[0-9]$' || true)"
 			if [ -n "$got" ] && [ "$got" = "$want" ]; then
 				ladder ok "$repo: hack/ci.sh CGO=$got (expected $want)"
 			else
@@ -223,7 +223,7 @@ for repo in $REPOS; do
 	want="$(expected_cgo "$repo")"
 	if [ -f "$cish" ]; then
 		# grep the `CGO=<n>` assignment (tolerate surrounding whitespace/comment).
-		got="$(grep -oE '^[[:space:]]*CGO=[0-9]' "$cish" | head -n1 | grep -oE '[0-9]$' || true)"
+		got="$(grep -oE '^[[:space:]]*CGO=[0-9]' "$cish" | sed -n 1p | grep -oE '[0-9]$' || true)"
 		if [ -n "$got" ] && [ "$got" = "$want" ]; then
 			ladder ok "$repo: hack/ci.sh CGO=$got (expected $want)"
 		else
@@ -255,7 +255,7 @@ for repo in $REPOS; do
 			if [ -f "$gen" ]; then
 				lockstep=ok
 				for var in BUF_VERSION PROTOC_GEN_GO_VERSION PROTOC_GEN_GO_GRPC_VERSION; do
-					ver="$(grep -oE "^${var}=v[0-9.]+" "$gen" | head -n1 | cut -d= -f2 || true)"
+					ver="$(grep -oE "^${var}=v[0-9.]+" "$gen" | sed -n 1p | cut -d= -f2 || true)"
 					[ -n "$ver" ] && { grep -q "@$ver" <<<"$cfg" || lockstep=no; }
 				done
 				if [ "$lockstep" = ok ]; then

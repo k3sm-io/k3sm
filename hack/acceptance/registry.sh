@@ -185,7 +185,7 @@ HOSTING="$(kubectl get configmap local-registry-hosting -n kube-public \
 	-o jsonpath='{.data.localRegistryHosting\.v1}' 2>/dev/null || true)"
 PORT="${K3SM_REGISTRY_PORT:-}"
 if [ -z "$PORT" ]; then
-	PORT="$(printf '%s\n' "$HOSTING" | sed -n 's/^host:[[:space:]]*"\{0,1\}localhost:\([0-9]\{1,\}\)"\{0,1\}[[:space:]]*$/\1/p' | head -1)"
+	PORT="$(printf '%s\n' "$HOSTING" | sed -n 's/^host:[[:space:]]*"\{0,1\}localhost:\([0-9]\{1,\}\)"\{0,1\}[[:space:]]*$/\1/p' | sed -n 1p)"
 fi
 if [ -z "$PORT" ]; then
 	ladder no "registry.5a KEP-1755 local-registry-hosting in kube-public names a port (got: ${HOSTING:-absent})"
@@ -202,8 +202,8 @@ ladder ok "registry.5a KEP-1755 local-registry-hosting in kube-public names loca
 # nothing, and a Service nobody is told about is a name nobody uses.
 SVC_NS=k3sm-registry
 SVC_NAME="$(kubectl get svc -n "$SVC_NS" \
-	-o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | grep '^registry-' | head -1 || true)"
-HFCN="$(printf '%s\n' "$HOSTING" | sed -n 's/^hostFromClusterNetwork:[[:space:]]*"\{0,1\}\([^"[:space:]]*\)"\{0,1\}[[:space:]]*$/\1/p' | head -1)"
+	-o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | grep '^registry-' | sed -n 1p || true)"
+HFCN="$(printf '%s\n' "$HOSTING" | sed -n 's/^hostFromClusterNetwork:[[:space:]]*"\{0,1\}\([^"[:space:]]*\)"\{0,1\}[[:space:]]*$/\1/p' | sed -n 1p)"
 if [ -n "$SVC_NAME" ]; then
 	if [ "$HFCN" = "$SVC_NAME.$SVC_NS.svc.$CLUSTER_DOMAIN:$PORT" ]; then
 		ladder ok "registry.5b KEP-1755 hostFromClusterNetwork names the node's registry Service ($HFCN)"

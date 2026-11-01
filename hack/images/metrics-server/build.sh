@@ -200,7 +200,7 @@ govulncheck_pinned() {
 	[ -n "$want" ] || die "cannot read GOVULNCHECK_VERSION from hack/ci.sh"
 	for c in "$(command -v govulncheck 2>/dev/null || true)" "$("$GO" env GOPATH)/bin/govulncheck"; do
 		[ -n "$c" ] && [ -x "$c" ] || continue
-		ver="$("$c" -version 2>/dev/null | sed -n 's/^Scanner: govulncheck@//p' | head -1)" || ver=""
+		ver="$("$c" -version 2>/dev/null | sed -n 's/^Scanner: govulncheck@//p' | sed -n 1p)" || ver=""
 		[ "$ver" = "$want" ] && { echo "$c"; return 0; }
 	done
 	die "govulncheck $want is required (go install golang.org/x/vuln/cmd/govulncheck@$want)"
@@ -304,7 +304,7 @@ PY
 # all), the proof that the record names a published, public artifact.
 live() {
 	local ref repo digest host name token code
-	ref="$(sed -n 's/^[[:space:]]*ref:[[:space:]]*\([^[:space:]#]*\).*/\1/p' "$HERE/image.yaml" | head -1)"
+	ref="$(sed -n 's/^[[:space:]]*ref:[[:space:]]*\([^[:space:]#]*\).*/\1/p' "$HERE/image.yaml" | sed -n 1p)"
 	repo="${ref%@*}"; digest="${ref#*@}"
 	host="${repo%%/*}"; name="${repo#*/}"
 	[ "$host" = ghcr.io ] || die "--live resolves ghcr.io refs only (image.yaml names $host)"

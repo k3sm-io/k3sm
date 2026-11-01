@@ -196,10 +196,10 @@ done
 ladder "$l4" "b411.L4  k3sm status: request-header row ok with a trusted count of 1"
 
 # b411.L5 — a rotation keeps the request-header CA, and the trust still works.
-pre="$(sudo "$K3SM" certificate rotate --work-dir "$WORK_DIR" 2>&1 | sed -n 's/.*request-header CA *sha256:\([0-9a-f]*\).*/\1/p' | head -1)"
+pre="$(sudo "$K3SM" certificate rotate --work-dir "$WORK_DIR" 2>&1 | sed -n 's/.*request-header CA *sha256:\([0-9a-f]*\).*/\1/p' | sed -n 1p)"
 # shellcheck disable=SC2024 # the evidence file is this user's; only the rotation needs root
 if sudo "$K3SM" certificate rotate --work-dir "$WORK_DIR" --restart >"$EVIDENCE/L5-rotate.log" 2>&1; then
-	post="$(sed -n 's/.*request-header CA *sha256:\([0-9a-f]*\).*/\1/p' "$EVIDENCE/L5-rotate.log" | head -1)"
+	post="$(sed -n 's/.*request-header CA *sha256:\([0-9a-f]*\).*/\1/p' "$EVIDENCE/L5-rotate.log" | sed -n 1p)"
 	if [ -n "$pre" ] && [ "$pre" = "$post" ]; then
 		ladder ok "b411.L5a k3sm certificate rotate --restart kept the request-header CA ($pre)"
 	else

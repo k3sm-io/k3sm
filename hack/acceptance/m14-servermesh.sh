@@ -139,10 +139,10 @@ ladder "$k" "m14.1  the server persists a 0600 wireguard identity and self-enrol
 # proxy construction (mesh.Start plumbs the lo0 alias the proxy sources from) and
 # the join listener (the index-0 claim must be durable before a worker can be
 # assigned an index).
-crd_ln="$(grep -n 'ensureMeshPeerCRD(ctx, opts\.meshIP,' "$SERVER_GO" | head -1 | cut -d: -f1 || true)"
-enr_ln="$(grep -n 'enrollSelfAndBringUpMesh(ctx, enroller' "$SERVER_GO" | head -1 | cut -d: -f1 || true)"
-net_ln="$(grep -n 'netserve\.New(netserve\.Config{' "$SERVER_GO" | head -1 | cut -d: -f1 || true)"
-sup_ln="$(grep -n 'startBootstrapServer(ctx, deps' "$SERVER_GO" | head -1 | cut -d: -f1 || true)"
+crd_ln="$(grep -n 'ensureMeshPeerCRD(ctx, opts\.meshIP,' "$SERVER_GO" | sed -n 1p | cut -d: -f1 || true)"
+enr_ln="$(grep -n 'enrollSelfAndBringUpMesh(ctx, enroller' "$SERVER_GO" | sed -n 1p | cut -d: -f1 || true)"
+net_ln="$(grep -n 'netserve\.New(netserve\.Config{' "$SERVER_GO" | sed -n 1p | cut -d: -f1 || true)"
+sup_ln="$(grep -n 'startBootstrapServer(ctx, deps' "$SERVER_GO" | sed -n 1p | cut -d: -f1 || true)"
 if [ -n "$crd_ln" ] && [ -n "$enr_ln" ] && [ -n "$net_ln" ] && [ -n "$sup_ln" ] &&
 	[ "$crd_ln" -lt "$enr_ln" ] && [ "$enr_ln" -lt "$net_ln" ] && [ "$net_ln" -lt "$sup_ln" ]; then
 	ladder ok "m14.1  ensureMeshPeerCRD(:$crd_ln) < enrollSelfAndBringUpMesh(:$enr_ln) < netserve.New(:$net_ln) < startBootstrapServer(:$sup_ln)"
@@ -161,8 +161,8 @@ ladder "$r" "m14.1  the join supervisor derives its listen address (wildcard wit
 
 a=ok
 grep -qE 'func ensureMeshIPAlias\(' "$K3SM_ROOT/cmd/k3sm/meshalias.go" 2>/dev/null || a=no
-ali_ln="$(grep -n 'ensureMeshIPAlias(ctx, opts\.meshIP,' "$SERVER_GO" | head -1 | cut -d: -f1 || true)"
-sup_start_ln="$(grep -n 'exec\.Start(ctx)' "$SERVER_GO" | head -1 | cut -d: -f1 || true)"
+ali_ln="$(grep -n 'ensureMeshIPAlias(ctx, opts\.meshIP,' "$SERVER_GO" | sed -n 1p | cut -d: -f1 || true)"
+sup_start_ln="$(grep -n 'exec\.Start(ctx)' "$SERVER_GO" | sed -n 1p | cut -d: -f1 || true)"
 if [ "$a" = ok ] && [ -n "$ali_ln" ] && [ -n "$sup_start_ln" ] && [ "$ali_ln" -lt "$sup_start_ln" ]; then
 	ladder ok "m14.1  ensureMeshIPAlias(:$ali_ln) < exec.Start(:$sup_start_ln) — the mesh IP is a host address before the apiserver binds it"
 else
@@ -481,7 +481,7 @@ fi
 #
 # RED BEFORE: the bind was net.JoinHostPort(meshIP, 9345), so the address below
 # reads "100.64.0.1:9345" instead of "*:9345" and the LAN handshake is refused.
-sup_bind="$(lsof -nP -iTCP:9345 -sTCP:LISTEN 2>/dev/null | awk 'NR>1 && $1 ~ /^k3sm/ {print $9}' | head -1)"
+sup_bind="$(lsof -nP -iTCP:9345 -sTCP:LISTEN 2>/dev/null | awk 'NR>1 && $1 ~ /^k3sm/ {print $9}' | sed -n 1p)"
 case "$sup_bind" in
 "*:9345")
 	ladder ok "m14.L3b the join supervisor is bound to the WILDCARD (*:9345), so a pre-mesh worker can reach it over the underlay" ;;
@@ -590,7 +590,7 @@ fi
 # ---- m14.L5 — the -race verdict --------------------------------------------
 if grep -q 'WARNING: DATA RACE' "$M14_WORK/server.log" 2>/dev/null; then
 	ladder no "m14.L5  no DATA RACE in the -race server log — the dial-source state is being mutated across the proxy's per-connection goroutines"
-	grep -A 25 'WARNING: DATA RACE' "$M14_WORK/server.log" | head -60 >&2
+	grep -A 25 'WARNING: DATA RACE' "$M14_WORK/server.log" | sed -n 1,60p >&2
 else
 	ladder ok "m14.L5  the -race build reported no DATA RACE across the concurrent local/remote dials"
 fi

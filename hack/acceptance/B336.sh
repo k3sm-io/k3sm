@@ -58,7 +58,7 @@ ladder "$w" "b336.1  the --node-ip example value names the MESH address, not an 
 # exactly the prose a reader sees directly under the code block — never the
 # --server sentence above it, which legitimately says "underlay" for a
 # DIFFERENT flag.
-start_line="$(grep -n -- '--node-ip <[^>]*mesh[^>]*>' "$DOC" | head -1 | cut -d: -f1)"
+start_line="$(grep -n -- '--node-ip <[^>]*mesh[^>]*>' "$DOC" | sed -n 1p | cut -d: -f1)"
 p=ok
 if [ -z "$start_line" ]; then
 	p=no

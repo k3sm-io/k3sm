@@ -268,7 +268,7 @@ if ! command -v python3 >/dev/null; then
 	echo "    python3 is not on PATH — b330.8 needs it to run load.py and the fake server"
 else
 	LOAD_PY="$SCRATCH/load.py"
-	start_line="$(grep -nF 'cat > "$W/load.py"' "$S0" | head -1 | cut -d: -f1)"
+	start_line="$(grep -nF 'cat > "$W/load.py"' "$S0" | sed -n 1p | cut -d: -f1)"
 	if [ -z "$start_line" ]; then
 		l8=no
 		echo "    could not find the load.py heredoc in $S0"

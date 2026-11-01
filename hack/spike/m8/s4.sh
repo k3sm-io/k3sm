@@ -87,7 +87,7 @@ export UV_CACHE_DIR=$PREFIX/cache UV_PYTHON_INSTALL_DIR=$PREFIX/pyinstall
 UV=$PREFIX/bin/uv
 S=$PREFIX/stage/mlx-serve
 DIST=$(ls -d "$PREFIX"/pyinstall/cpython-3.12.*-macos-aarch64-none | tail -1)
-MP=$(ls -d "$PREFIX"/hf/hub/models--*Qwen2.5-0.5B*/snapshots/* | head -1)
+MP=$(ls -d "$PREFIX"/hf/hub/models--*Qwen2.5-0.5B*/snapshots/* | sed -n 1p)
 
 # SPY — the staged interpreter, run with bytecode writing OFF. Every measurement
 # below reads the stage; an import that drops a __pycache__/*.pyc into it would
@@ -132,11 +132,11 @@ awk -v k="$APPK" -v d="$DISKK" 'BEGIN{printf "  unpacked apparent %d KB (%.2f GB
 echo "  entries: files=$NF symlinks=$NL dirs=$ND"
 awk -v k="$APPK" 'BEGIN{printf "  THRESHOLD >2GB unpacked: %s (%.2f GB)\n", (k>2097152 ? "EXCEEDED" : "PASS"), k/1048576}'
 echo "  subtrees by apparent KB:"
-for d in "$S"/*/ ; do printf '    %10s KB  %s\n' "$(apparentk "$d")" "${d%/}"; done | sed "s#$S/##" | sort -rn | head -12
+for d in "$S"/*/ ; do printf '    %10s KB  %s\n' "$(apparentk "$d")" "${d%/}"; done | sed "s#$S/##" | sort -rn | sed -n 1,12p
 echo "  site-packages by apparent KB:"
-for d in "$S"/lib/python3.12/site-packages/*/ ; do printf '    %10s KB  %s\n' "$(apparentk "$d")" "${d%/}"; done | sed "s#$S/lib/python3.12/site-packages/##" | sort -rn | head -12
+for d in "$S"/lib/python3.12/site-packages/*/ ; do printf '    %10s KB  %s\n' "$(apparentk "$d")" "${d%/}"; done | sed "s#$S/lib/python3.12/site-packages/##" | sort -rn | sed -n 1,12p
 echo "  largest single files:"
-find "$S" -type f -exec stat -f '%z %N' {} + | sort -rn | head -8 | awk -v s="$S/" '{printf "    %8.1f MB  %s\n", $1/1048576, substr($2,length(s)+1)}'
+find "$S" -type f -exec stat -f '%z %N' {} + | sort -rn | sed -n 1,8p | awk -v s="$S/" '{printf "    %8.1f MB  %s\n", $1/1048576, substr($2,length(s)+1)}'
 
 echo
 echo "### machos — the S2 walk, mechanized and re-measured against THIS payload"
@@ -155,7 +155,7 @@ NM=$(wc -l < "$MACHOS" | tr -d ' ')
 awk -v a="$T0" -v b="$T1" -v n="$NM" -v f="$NF" 'BEGIN{printf "  walk: %d files scanned, %d Mach-O found, %.2fs\n", f, n, b-a}'
 echo "  fat (universal) Mach-Os:"
 while IFS= read -r f; do
-  case "$(file -b "$f" | head -1)" in *"universal binary"*|*"fat file"*) echo "    FAT ${f#$S/}" ;; esac
+  case "$(file -b "$f" | sed -n 1p)" in *"universal binary"*|*"fat file"*) echo "    FAT ${f#$S/}" ;; esac
 done < "$MACHOS"
 
 echo

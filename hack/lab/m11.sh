@@ -519,7 +519,7 @@ else
 fi
 
 if [ "$BOOT_OK" -eq 1 ]; then
-	UNAME="$(gexec "$POD_BOOT" 'uname -sm' 2>/dev/null | tr -d '\r' | head -1 || true)"
+	UNAME="$(gexec "$POD_BOOT" 'uname -sm' 2>/dev/null | tr -d '\r' | sed -n 1p || true)"
 	if [ "$UNAME" = "Linux aarch64" ]; then
 		ladder ok "m11.2-b  the guest is really Linux/arm64 (uname -sm = '$UNAME')"
 	else
@@ -539,7 +539,7 @@ fi
 if [ "$BOOT_OK" -eq 1 ]; then
 	SA_DIR=/var/run/secrets/kubernetes.io/serviceaccount
 	SA_SEEN="$(gexec "$POD_BOOT" "cat $SA_DIR/namespace 2>/dev/null | tr -d '\n'" 2>/dev/null | tr -d '\r' || true)"
-	SA_HAS_TOKEN="$(gexec "$POD_BOOT" "[ -s $SA_DIR/token ] && [ -s $SA_DIR/ca.crt ] && echo yes" 2>/dev/null | tr -d '\r' | head -1 || true)"
+	SA_HAS_TOKEN="$(gexec "$POD_BOOT" "[ -s $SA_DIR/token ] && [ -s $SA_DIR/ca.crt ] && echo yes" 2>/dev/null | tr -d '\r' | sed -n 1p || true)"
 	if [ "$SA_SEEN" = "$NS" ] && [ "$SA_HAS_TOKEN" = "yes" ]; then
 		ladder ok "m11.2-c  the ServiceAccount projection is readable at $SA_DIR (namespace=$SA_SEEN, non-empty token and ca.crt)"
 	else
@@ -607,7 +607,7 @@ if [ "$BOOT_OK" -eq 1 ]; then
 
 	ROUTE_OUT="$(gexec "$POD_BOOT" 'ip route show default 2>/dev/null || netstat -rn 2>/dev/null | grep "^0.0.0.0"' 2>/dev/null || true)"
 	if [ -n "$(printf '%s' "$ROUTE_OUT" | tr -d '[:space:]')" ]; then
-		ladder ok "m11.7-b  the guest has a default route ($(printf '%s' "$ROUTE_OUT" | head -1))"
+		ladder ok "m11.7-b  the guest has a default route ($(printf '%s' "$ROUTE_OUT" | sed -n 1p))"
 	else
 		ladder no "m11.7-b  the guest has NO default route"
 	fi
@@ -658,7 +658,7 @@ fi
 # ── m11.9 per-VM host footprint (RECORDED, never thresholded) ─────────────────────
 BOOT_UID="$(kn get pod "$POD_BOOT" -o jsonpath='{.metadata.uid}' 2>/dev/null || true)"
 VMHOST_PID=""
-if [ -n "$BOOT_UID" ]; then VMHOST_PID="$(pgrep -f "k3sm-vmhost.*$BOOT_UID" 2>/dev/null | head -1 || true)"; fi
+if [ -n "$BOOT_UID" ]; then VMHOST_PID="$(pgrep -f "k3sm-vmhost.*$BOOT_UID" 2>/dev/null | sed -n 1p || true)"; fi
 if [ -n "$VMHOST_PID" ]; then
 	FOOTPRINT="$(ps -o rss=,vsz=,etime=,pcpu= -p "$VMHOST_PID" 2>/dev/null | sed 's/^ *//' || true)"
 	RSS_KB="$(printf '%s' "$FOOTPRINT" | awk '{print $1}')"
@@ -735,7 +735,7 @@ fi
 
 if [ "$STORE_OK" -eq 1 ]; then
 	STORE_UID="$(kn get pod "$POD_STORE" -o jsonpath='{.metadata.uid}' 2>/dev/null || true)"
-	KILL_PID="$(pgrep -f "k3sm-vmhost.*$STORE_UID" 2>/dev/null | head -1 || true)"
+	KILL_PID="$(pgrep -f "k3sm-vmhost.*$STORE_UID" 2>/dev/null | sed -n 1p || true)"
 	kill_rc=0
 	if [ -n "${K3SM_M11_VMHOST_KILL:-}" ]; then
 		note "killing the helper via \$K3SM_M11_VMHOST_KILL (pod uid $STORE_UID)"
@@ -810,7 +810,7 @@ if [ "$ran" -eq 1 ]; then
 	ladder no "m11.8  the amd64-only image $IMAGE_AMD64 REACHED $phase under runtimeClassName: vm — this release attaches no guest Rosetta share, so an amd64 payload must be refused, not admitted"
 elif [ "$matched" -eq 1 ]; then
 	ladder ok "m11.8  $IMAGE_AMD64 fails closed and the failure names the platform mismatch ('$AMD64_SUBSTR')"
-	printf '%s\n' "$EVIDENCE" | grep -F "$AMD64_SUBSTR" | head -2 | sed 's/^/      /' || true
+	printf '%s\n' "$EVIDENCE" | grep -F "$AMD64_SUBSTR" | sed -n 1,2p | sed 's/^/      /' || true
 else
 	ladder no "m11.8  $IMAGE_AMD64 did not surface the platform mismatch within ${PULLFAIL_TIMEOUT}s (last phase '${phase:-?}') — a failure that does not name the mismatch is an opaque failure"
 	kn describe pod "$POD_AMD64" 2>&1 | tail -n 20 | sed 's/^/      /' || true

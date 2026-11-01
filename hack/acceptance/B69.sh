@@ -90,7 +90,7 @@ if grep -rqE 'DefaultKineVersionHA' "$REPO_ROOT/pkg" "$REPO_ROOT/cmd"; then
 	lint_ok=false
 fi
 
-KINE_PIN="$(sed -nE 's/^[[:space:]]*DefaultKineVersion[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "$EXEC_PKG/executor.go" | head -1)"
+KINE_PIN="$(sed -nE 's/^[[:space:]]*DefaultKineVersion[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "$EXEC_PKG/executor.go" | sed -n 1p)"
 if [ -z "$KINE_PIN" ]; then
 	echo "  could not read DefaultKineVersion out of pkg/executor/executor.go" >&2
 	lint_ok=false

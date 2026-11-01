@@ -198,7 +198,7 @@ ldflags() {
 TAR=/usr/bin/tar
 
 # is_bsdtar [tar]: zero iff the tar (default TAR) is bsdtar.
-is_bsdtar() { grep -q '^bsdtar ' <<<"$("${1:-$TAR}" --version 2>/dev/null | head -n 1)"; }
+is_bsdtar() { grep -q '^bsdtar ' <<<"$("${1:-$TAR}" --version 2>/dev/null | sed -n 1p)"; }
 
 # go_dir: the directory of the go on the caller's PATH, the toolchain the build
 # runs (assert_toolchain proves it is PAYLOAD_GO_VERSION). Empty if none.
