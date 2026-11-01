@@ -56,6 +56,7 @@ allow k3sm:pkg/install/manifest.go | path: cfg.installedDNSShim() | 1 | the mani
 allow k3sm:pkg/install/manifest.go | path: cfg.installedVMHost() | 1 | the manifest's vm helper entry, covered by the sweep
 allow k3sm:pkg/install/stage.go | c.stagedPath(c.installed | 5 | the staged copy of each binary, derived from its destination; a staging path, never read as a peer identity
 allow k3sm:pkg/install/fromstaging.go | installed := cfg.installedBinary() | 1 | the signing continuity check reads the installed team id; codesign follows the compatibility link
+allow k3sm:pkg/install/developermode.go | installed := cfg.installedBinary() | 1 | the developer-mode off check reads the installed team id; codesign follows the compatibility link
 allow k3sm:pkg/install/releaseversion.go | installedPath := cfg.installedBinary() | 1 | the downgrade check runs the installed binary's version; exec follows the compatibility link
 allow k3sm:pkg/install/teardown.go | want := cfg.installedVMHost() | 1 | the expected path in a refusal message only; the identity decision is isInstalledVMHost
 allow k3sm:pkg/install/teardown.go | installed := cfg.installedVMHost() | 1 | isInstalledVMHost's flat form; current/ and the retained versions/<v>/ are accepted beside it

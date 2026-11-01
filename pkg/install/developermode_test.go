@@ -19,6 +19,7 @@ package install
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"regexp"
 	"slices"
@@ -300,5 +301,56 @@ func TestUninstallRemovesTheDeveloperModeMarker(t *testing.T) {
 	}
 	if !slices.Contains(f.calls, "RemoveAll:"+DeveloperModeMarkerPath) {
 		t.Errorf("uninstall did not remove the marker: %v", f.calls)
+	}
+}
+
+// TestDeveloperModeClearedByAnyDeveloperIDTeam pins which signatures turn
+// developer mode off on a plain install without the flag: a Developer ID
+// Application signature of any team does, including a team other than the
+// one that signs releases, because removing the marker only turns the
+// signature checks back on. An ad-hoc or unsigned k3sm, or one whose
+// signature cannot be read, keeps the marker.
+func TestDeveloperModeClearedByAnyDeveloperIDTeam(t *testing.T) {
+	t.Parallel()
+	const (
+		src       = "/tmp/k3sm"
+		otherTeam = "ZYXWV98765"
+	)
+	removeCall := "RemoveEntry:/Library:k3sm.developer-mode"
+	cases := []struct {
+		name       string
+		signer     fakeSigner
+		wantRemove bool
+		wantTeam   string
+	}{
+		{name: "the release team's Developer ID clears it", signer: fakeSigner{ids: map[string]string{src: testTeamID}}, wantRemove: true, wantTeam: testTeamID},
+		{name: "another team's Developer ID clears it", signer: fakeSigner{ids: map[string]string{src: otherTeam}}, wantRemove: true, wantTeam: otherTeam},
+		{name: "an ad-hoc signature keeps it", signer: fakeSigner{errs: map[string]error{src: ErrNoTeamID}}},
+		{name: "an unsigned binary keeps it", signer: fakeSigner{errs: map[string]error{src: fmt.Errorf("%s: code object is not signed at all: %w", src, ErrNoTeamID)}}},
+		{name: "an unreadable binary keeps it", signer: fakeSigner{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := &fakeSystem{owners: map[string]OwnedEntry{}}
+			f.owners[DeveloperModeMarkerPath] = OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: 0o644}
+			f.putFile(DeveloperModeMarkerPath, []byte("developer mode enabled by k3sm install on 2026-10-31T00:00:00Z\n"))
+			var logs strings.Builder
+			cfg := Config{BinarySource: src, TargetUser: "alice", Logger: slog.New(slog.NewTextHandler(&logs, nil))}
+			cfg.Signer = tc.signer
+			if err := Install(context.Background(), f, cfg); err != nil {
+				t.Fatalf("Install = %v", err)
+			}
+			if removed := slices.Contains(f.calls, removeCall); removed != tc.wantRemove {
+				t.Fatalf("marker removed = %v, want %v; logs:\n%s", removed, tc.wantRemove, logs.String())
+			}
+			_, kept := f.files[DeveloperModeMarkerPath]
+			if kept == tc.wantRemove {
+				t.Errorf("marker still there = %v, want %v", kept, !tc.wantRemove)
+			}
+			if tc.wantRemove && !strings.Contains(logs.String(), "team-id="+tc.wantTeam) {
+				t.Errorf("the turned-off line does not name team %s; logs:\n%s", tc.wantTeam, logs.String())
+			}
+		})
 	}
 }
