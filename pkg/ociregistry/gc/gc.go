@@ -41,6 +41,12 @@ import (
 // writes. Its presence lets later sweeps delete.
 const MarkerName = "gc-ran"
 
+// AbandonFactor is how many grace periods old a repository with no rows must
+// be, in index.json and in every blob and upload session it holds, before the
+// collector treats it as an abandoned first push and lifts the half brake
+// from it. Options.Abandon overrides the product.
+const AbandonFactor = 24
+
 // Sentinel errors.
 var (
 	// ErrTooSoon is a sweep within one grace period of the collector's start.
@@ -113,6 +119,13 @@ type Options struct {
 	// Grace is how old an object must be before it is reaped, and how long
 	// after the collector's start no sweep runs. It must be positive.
 	Grace time.Duration
+	// Abandon is how long a repository with no rows must have gone without a
+	// write (to index.json, to any blob it holds, or to any upload session in
+	// it) before the half brake no longer applies to it: a first push that
+	// was abandoned before any manifest was written. Its unreferenced blobs
+	// then go through the ordinary grace rule. Zero means AbandonFactor times
+	// Grace; otherwise it must be longer than Grace.
+	Abandon time.Duration
 	// Now is the clock (time.Now when nil).
 	Now func() time.Time
 	// Log receives a record per reaped object and per stopped repository
@@ -122,11 +135,12 @@ type Options struct {
 
 // Collector sweeps one store. One Sweep runs at a time.
 type Collector struct {
-	s     *store.Store
-	grace time.Duration
-	now   func() time.Time
-	log   *slog.Logger
-	start time.Time
+	s       *store.Store
+	grace   time.Duration
+	abandon time.Duration
+	now     func() time.Time
+	log     *slog.Logger
+	start   time.Time
 
 	mu sync.Mutex // serialises Sweep
 	// afterMark, when set, runs between a repository's mark and its locked
@@ -162,13 +176,19 @@ func New(s *store.Store, o Options) (*Collector, error) {
 	if o.Grace <= 0 {
 		return nil, fmt.Errorf("gc: grace %s must be positive", o.Grace)
 	}
+	switch {
+	case o.Abandon == 0:
+		o.Abandon = AbandonFactor * o.Grace
+	case o.Abandon <= o.Grace:
+		return nil, fmt.Errorf("gc: abandon horizon %s must be longer than the grace %s", o.Abandon, o.Grace)
+	}
 	if o.Now == nil {
 		o.Now = time.Now
 	}
 	if o.Log == nil {
 		o.Log = slog.Default()
 	}
-	return &Collector{s: s, grace: o.Grace, now: o.Now, log: o.Log, start: o.Now()}, nil
+	return &Collector{s: s, grace: o.Grace, abandon: o.Abandon, now: o.Now, log: o.Log, start: o.Now()}, nil
 }
 
 // Sweep runs one collection over every repository. A repository stopped by
@@ -389,7 +409,7 @@ func (r reads) locked(cont store.Contents) func(digest.Digest) (refs, error) {
 
 // brake applies the half-repository rule to a plan over idx and cont: a plan
 // that would reap more than half of the repository's blobs stops, unless it
-// empties the repository.
+// empties the repository or the repository is an abandoned first push.
 //
 // A plan empties the repository when it leaves no row (every row, if there
 // were any, is one it reaps) and every blob it reaps predates index.json's
@@ -398,11 +418,19 @@ func (r reads) locked(cont store.Contents) func(digest.Digest) (refs, error) {
 // written after every reaped blob means the rows that named those blobs were
 // removed (by a delete, or by this plan, or by an earlier sweep that stopped
 // after its row write), and the blobs are what a removed image left. A first
-// push in progress has an index older than its blobs, so its committed but
-// not yet named blobs stay under the brake however old they are. A blob
-// written at the same instant as index.json counts as newer: the brake holds.
+// push in progress has an index older than its blobs, so this rule does not
+// free its committed but not yet named blobs. That holds only while index.json
+// is unchanged: any later write to the rows (another tag pushed or deleted)
+// advances index.json past those blobs, and once the rows are gone again the
+// rule lets them through. The grace period, not this rule, is what protects a
+// push's blobs. A blob written at the same instant as
+// index.json counts as newer: the brake holds.
+//
+// A first push that was abandoned would stay under the brake for ever, so the
+// brake does not apply to a repository with no rows whose index.json, blobs
+// and upload sessions are all older than the abandon horizon (see abandoned).
 func (c *Collector) brake(n ref.Name, p plan, idx ispec.Index, cont store.Contents) error {
-	if 2*len(p.blobs) <= len(cont.Blobs) || emptyingRule(p, idx, cont) {
+	if 2*len(p.blobs) <= len(cont.Blobs) || emptyingRule(p, idx, cont) || abandoned(idx, cont, c.now().Add(-c.abandon)) {
 		return nil
 	}
 	c.log.Error("registry gc: sweep stopped", "repository", n.String(), "reap", len(p.blobs), "blobs", len(cont.Blobs),
@@ -424,6 +452,29 @@ func emptying(p plan, idx ispec.Index, cont store.Contents) bool {
 	}
 	for _, b := range cont.Blobs {
 		if p.blobs[b.Digest] && !b.ModTime.Before(cont.IndexModTime) {
+			return false
+		}
+	}
+	return true
+}
+
+// abandoned reports whether the repository is a first push nobody has
+// written to since cutoff: index.json has no rows, and neither it nor any
+// blob or upload session in the repository is newer than cutoff. Every write
+// a push makes (a blob upload, mount or HEAD, a session write, a manifest
+// row) moves one of those times past cutoff, so a push that resumes puts the
+// repository back under the brake.
+func abandoned(idx ispec.Index, cont store.Contents, cutoff time.Time) bool {
+	if len(idx.Manifests) != 0 || cont.IndexModTime.After(cutoff) {
+		return false
+	}
+	for _, b := range cont.Blobs {
+		if b.ModTime.After(cutoff) {
+			return false
+		}
+	}
+	for _, u := range cont.Sessions {
+		if u.ModTime.After(cutoff) {
 			return false
 		}
 	}
@@ -628,6 +679,10 @@ type refs struct {
 	Layers        []ispec.Descriptor `json:"layers"`
 	Manifests     []ispec.Descriptor `json:"manifests"`
 	Subject       *ispec.Descriptor  `json:"subject"`
+	// FSLayers is the Docker schema1 layer list (fsLayers[].blobSum). The
+	// server refuses schema1 at PUT, and the collector does not follow it:
+	// a body that carries the field is unreadable, whatever else it says.
+	FSLayers json.RawMessage `json:"fsLayers"`
 }
 
 // parseRefs reads what the manifest body b, stored as d, references. It
@@ -637,11 +692,16 @@ type refs struct {
 // manifest, index and manifest list media types. A body without a mediaType
 // (optional in OCI) is an image manifest when it has a config and an index
 // when it has a manifests array; anything else, Docker schema1 included, is
-// unreadable. An image manifest without a config is unreadable too.
+// unreadable. An image manifest without a config is unreadable too, and so is
+// any body with a Docker schema1 fsLayers field, even at schemaVersion 2, so
+// a schema1-shaped body never reads as one that references nothing.
 func parseRefs(d digest.Digest, b []byte) (refs, error) {
 	var r refs
 	if err := json.Unmarshal(b, &r); err != nil {
 		return refs{}, fmt.Errorf("%w: %s: %v", ErrUnreadable, d, err)
+	}
+	if r.FSLayers != nil {
+		return refs{}, fmt.Errorf("%w: %s: a Docker schema1 fsLayers field", ErrUnreadable, d)
 	}
 	if r.SchemaVersion != 2 {
 		return refs{}, fmt.Errorf("%w: %s: schemaVersion %d, want 2", ErrUnreadable, d, r.SchemaVersion)

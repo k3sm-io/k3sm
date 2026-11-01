@@ -116,7 +116,7 @@ func TestEmptying(t *testing.T) {
 // TestBrakeBoundary: the brake stops a plan over more than half of the
 // blobs, and lets exactly half through.
 func TestBrakeBoundary(t *testing.T) {
-	c := &Collector{log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	c := &Collector{log: slog.New(slog.NewTextHandler(io.Discard, nil)), now: time.Now, abandon: AbandonFactor * grace}
 	at := time.Now()
 	var blobs []store.Blob
 	var ds []digest.Digest

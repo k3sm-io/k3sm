@@ -100,6 +100,11 @@ pin, its date, and the tarball's sha256.
   report-only sweep from completing for the whole store. The record of that first sweep now
   names the store root it ran on, so a restored, copied or moved store reports only again before
   it deletes.
+- A first push to the k3sm registry that was abandoned before its manifest no longer stops every
+  garbage-collection sweep of its repository. Once the repository has no tag and nothing in it
+  has been written for 24 grace periods, the half-repository brake no longer applies to it and
+  its blobs are reaped as unreferenced. The collector also treats any manifest carrying a Docker
+  schema1 `fsLayers` field as unreadable, as the server already refuses schema1 at push.
 - The registry's garbage collector stops a repository's sweep, deleting nothing, when a manifest
   there is not an OCI or Docker v2 image manifest, index or manifest list (a Docker schema1
   manifest, for example). It used to read such a manifest as referencing nothing and could reap

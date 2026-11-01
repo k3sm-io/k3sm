@@ -48,12 +48,21 @@ limitations under the License.
 // the marker, even when some repository failed (that one keeps failing
 // closed). The marker records the device and inode of the store root, and a
 // marker for another root does not count, so a restored, copied or moved
-// store gets a report-only first sweep again. A sweep that would delete more than half of a repository's
-// blobs stops with ErrMassDelete, unless it empties the repository: it leaves
-// no row and every blob it reaps is older than the last change to the rows.
-// A first push in progress, whose blobs are newer than its empty index, stays
-// under the brake. Anything the collector cannot read (a manifest body that
-// is missing, does not parse, or is not an OCI or Docker v2 image manifest,
-// index or manifest list, such as a Docker schema1 manifest) stops that
-// repository's sweep: it never deletes on a guess.
+// store gets a report-only first sweep again. A sweep that would delete more
+// than half of a repository's blobs stops with ErrMassDelete, unless it
+// empties the repository (it leaves no row and every blob it reaps is older
+// than the last change to the rows) or the repository is an abandoned first
+// push. The emptying rule does not free a first push's blobs while they are
+// newer than its index, but any later write to the rows (another tag pushed
+// or deleted in the repository) advances index.json past them, and from then
+// on the brake does not tell them from what a removed image left. The grace
+// period, not the brake, is what guards a push's blobs. A repository with no rows whose index.json,
+// blobs and upload sessions have all gone unwritten for the abandon horizon
+// (AbandonFactor grace periods unless Options.Abandon says otherwise) is an
+// abandoned first push: the brake no longer applies to it, and its blobs are
+// reaped by the grace rule, so it does not stop every sweep for ever.
+// Anything the collector cannot read (a manifest body that is missing, does
+// not parse, or is not an OCI or Docker v2 image manifest, index or manifest
+// list, such as a Docker schema1 manifest or any body with a schema1 fsLayers
+// field) stops that repository's sweep: it never deletes on a guess.
 package gc
