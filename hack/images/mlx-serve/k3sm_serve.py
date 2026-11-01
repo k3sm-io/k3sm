@@ -17,7 +17,7 @@ prompt-length validation: its only per-sequence bound is --max-kv-size, which
 selects mlx-lm's RotatingKVCache. A sequence that outgrows it evicts its early
 tokens and the model answers HTTP 200 with text built on a context it no longer
 has (measured: 0/3 recall of a needle even inside the window, on 0.5.0 with
-mlx-lm 0.32.0). k3sm renders --max-kv-size from the MLXModel's derived
+mlx-lm 0.32.2). k3sm renders --max-kv-size from the MLXModel's derived
 context, so that value IS the model's served context, and a request that would
 outgrow it is a client error, not a request to serve.
 
@@ -75,7 +75,7 @@ ENTRYPOINT always passes it, and this module refuses to serve without it.
 Not covered: image or audio tokens a multimodal processor adds after the
 template, which a text tokenizer does not count.
 
-The attention sinks. mlx-lm 0.32.0's make_prompt_cache(model, max_kv_size)
+The attention sinks. mlx-lm 0.32.2's make_prompt_cache(model, max_kv_size)
 builds RotatingKVCache(max_kv_size, keep=4): the first four tokens stay in the
 cache as attention sinks however far the window rotates. Its make_mask builds
 the multi-token (prefill) mask as a plain sliding window over the cache
@@ -257,14 +257,14 @@ def patch_rotating_kv_cache(cache_classes, mx):
         original = getattr(cls, "make_mask", None)
         if original is None or not callable(original):
             raise GuardError(f"{cls.__module__}.{cls.__name__} has no make_mask; the sink patch was written "
-                             f"against mlx-lm 0.32.0 and this cache moved it")
+                             f"against mlx-lm 0.32.2 and this cache moved it")
         if getattr(original, SINK_PATCHED, False):
             patched.append(cls)
             continue
         params = list(inspect.signature(original).parameters)
         if params != ["self", "N", "window_size", "return_array"]:
             raise GuardError(f"{cls.__module__}.{cls.__name__}.make_mask takes {params}; the sink patch was "
-                             f"written against mlx-lm 0.32.0's (self, N, window_size, return_array)")
+                             f"written against mlx-lm 0.32.2's (self, N, window_size, return_array)")
 
         def make_mask(self, N, window_size=None, return_array=False, _original=original):
             keep = getattr(self, "keep", 0)

@@ -147,13 +147,38 @@ from the Hub cache. With it, `/v1/models` lists `spec.model` alone and a request
 naming `spec.model` is served by the model already loaded. This hooks four
 `mlx_lm.server` internals (`ModelProvider.load`,
 `APIHandler.handle_models_request`, `run` and `_run_http_server`). The rank
-checks each one against the shape mlx-lm 0.32.0 gave it (0.32.2 keeps it) and exits, naming the
+checks each one against the shape mlx-lm 0.32.2 gives it (the same as 0.32.0) and exits, naming the
 hook, if one is missing or has changed. Without `--served-model-name` nothing
 is hooked and the engine runs as stock `mlx_lm.server`. On a staged tree the
 selftest checks the same hooks, checks that the real `run` is the 0.32.0 body (0.32.2's is identical)
 the replacement copies (`ENGINE_RUN_SHA256`; an mlx-lm bump that changes it
 re-derives the copy and the hash), and compares the real `/v1/models` answer
 with the aliased one.
+
+mlx-lm 0.32.2 changed more than these hooks. `ModelProvider._load` now returns
+the model config and sets `self.processor`, `APIHandler._tokenize` returns a
+five-tuple that carries the images of a prompt, and the server accepts image
+parts in chat requests. None of that reaches `k3sm_shard`: its provider
+subclass overrides only `load` and calls `super().load`, whose result is still
+`(model, tokenizer)`, and it never calls or overrides `_load` or `_tokenize`.
+
+**Remote image URLs are refused.** 0.32.2's chat handler calls
+`_inline_image_urls`, which fetches every `http(s)` image URL in a request body
+with `urlopen`, follows redirects, and reads the whole response into memory,
+with no host check and no size limit. Anyone who can reach a rank's port could
+make the pod request an internal address or exhaust its memory. Every rank
+therefore replaces that function, with or without `--served-model-name`, with
+one that refuses any image URL that is not a `data:` URL before a connection is
+made (HTTP 400); inline base64 images still work. Like the other hooks, it is
+fail-closed: the original's signature and normalized body hash
+(`IMAGE_HOOK_SHA256`) are checked first, and the rank exits naming the hook if
+either moved. The selftest drives the guard against a fake engine (a remote URL
+is refused with no request reaching a local listener, a `data:` URL passes, a
+changed body, another signature or a missing function fails the check) and, on
+a staged tree, checks the real function. The single-node entrypoint
+(`k3sm_serve`) runs `vllm_mlx.cli`, which does not import `mlx_lm.server`, so
+this guard does not cover it; whether vllm-mlx or mlx-vlm fetch remote image
+URLs on that path has not been examined here.
 
 `k3sm_shard --probe` is the rank-0 liveness probe: a one-token completion
 against the local server every 60 seconds, to catch a collective that hung

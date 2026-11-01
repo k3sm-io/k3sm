@@ -82,7 +82,7 @@ pin, its date, and the tarball's sha256.
 - `k3sm image prune` reads the cluster registry through the registry's own store code, read-only,
   and checks every manifest it reads against its digest; a repository whose manifests do not match
   is left alone. Deletions still go through the registry's API with the node's push credential.
-- The `mlx-serve` image's `mlx-lm` moves from 0.32.0 to 0.32.2. The next image tag carries it; no other package in the closure moves.
+- The `mlx-serve` image's `mlx-lm` moves from 0.32.0 to 0.32.2. The next image tag carries it; no other package in the closure moves. Sharded ranks refuse chat requests whose images are not inline `data:` URLs, since mlx-lm 0.32.2 would otherwise fetch any `http(s)` image URL a client names.
 
 ### Fixed
 
