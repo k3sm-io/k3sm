@@ -136,9 +136,6 @@ type PowerHost interface {
 	WatchSleep(ctx context.Context) (<-chan PowerNotice, error)
 }
 
-// errPowerUnsupported is returned by the host on a build with no power API.
-var errPowerUnsupported = errors.New("system power management is not available on this build")
-
 // SleepReporterConfig is the input to NewSleepReporter.
 type SleepReporterConfig struct {
 	// NodeName names the Node the Events are recorded on. Required.

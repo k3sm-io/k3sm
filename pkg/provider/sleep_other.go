@@ -18,7 +18,13 @@ limitations under the License.
 
 package provider
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+// errPowerUnsupported is returned by the host on a build with no power API.
+var errPowerUnsupported = errors.New("system power management is not available on this build")
 
 // unsupportedPowerHost is the PowerHost of a build without IOKit (a non-darwin
 // or CGO_ENABLED=0 build): it holds no assertion and delivers no notices.
