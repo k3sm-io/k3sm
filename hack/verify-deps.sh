@@ -37,10 +37,13 @@
 #                            (pkg/registrysvc/zotchild/go.sum.txt,
 #                            hack/deps-zotchild.lock) and the helm wrapper
 #                            (pkg/helmchart/helmchild/go.sum.txt,
-#                            hack/deps-helmchild.lock). k3sm builds zot and
-#                            helm from those go.sums, outside this repo's
-#                            go.mod, so their modules are not in the repo
-#                            graph above (WRAPPERS below)
+#                            hack/deps-helmchild.lock), and the OCI
+#                            distribution-spec conformance suite
+#                            (hack/ociconformance/go.sum.txt,
+#                            hack/deps-ociconformance.lock). Each is built
+#                            from its go.sum, outside this repo's go.mod, so
+#                            its modules are not in the repo graph above
+#                            (WRAPPERS below)
 #   replace discipline       every go.mod replace sits directly under its own
 #                            comment line, and a filesystem replace points
 #                            only at a sibling repo
@@ -100,13 +103,14 @@ LOCK="hack/deps.lock"
 #
 # zotchild: the registry's zot child (pkg/registrysvc).
 # helmchild: the helm binary the daemon builds (pkg/helmchart).
+# ociconformance: the OCI distribution-spec conformance suite
+#   (hack/ociconformance.sh), test tooling that is never shipped; it runs on
+#   the developer's Mac, so its graph is screened like the others.
 # A wrapper graph version that must clear the cooldown early is exempted in
 # hack/deps.cooldown-exempt like any other, with its reason (and expiry) there.
 WRAPPERS="zotchild pkg/registrysvc/zotchild/go.sum.txt hack/deps-zotchild.lock
-helmchild pkg/helmchart/helmchild/go.sum.txt hack/deps-helmchild.lock"
-# The two go.sum paths again, for the self-test's per-case removal markers.
-ZOT_SUM="pkg/registrysvc/zotchild/go.sum.txt"
-HELM_SUM="pkg/helmchart/helmchild/go.sum.txt"
+helmchild pkg/helmchart/helmchild/go.sum.txt hack/deps-helmchild.lock
+ociconformance hack/ociconformance/go.sum.txt hack/deps-ociconformance.lock"
 EXEMPT="hack/deps.cooldown-exempt"
 # The only filesystem paths a go.mod replace may name: the sibling k3sm repos.
 LOCAL_REPLACE_ALLOW="../apis ../runtimed ../darwin-net ../k3sm"
@@ -1189,17 +1193,19 @@ self_test() {
 		[ ! -d "$td/cases/$name" ] || cp -R "$td/cases/$name/." "$dir/"
 		mkdir -p "$dir/hack"
 		cp "$SELF" "$dir/hack/verify-deps.sh"
-		# A case carrying .no-zot is a repo without a zot wrapper module (apis,
-		# runtimed, darwin-net): the zotchild stages must not run there.
-		[ ! -f "$dir/.no-zot" ] || rm -f "$dir/$ZOT_SUM" "$dir/hack/deps-zotchild.lock" "$dir/.no-zot"
-		# .no-zot-sum keeps the lock and removes only the graph: the check must refuse,
-		# never skip, a wrapper that moved out from under its lock.
-		[ ! -f "$dir/.no-zot-sum" ] || rm -f "$dir/$ZOT_SUM" "$dir/.no-zot-sum"
-		# .no-helm and .no-helm-sum do the same for the helm wrapper module.
-		[ ! -f "$dir/.no-helm" ] || rm -f "$dir/$HELM_SUM" "$dir/hack/deps-helmchild.lock" "$dir/.no-helm"
-		[ ! -f "$dir/.no-helm-sum" ] || rm -f "$dir/$HELM_SUM" "$dir/.no-helm-sum"
-		local f
-		for f in "$dir/hack/deps.lock" "$dir/hack/deps-zotchild.lock" "$dir/hack/deps-helmchild.lock" "$dir/stub/info" "$dir/base/hack/deps.lock"; do
+		# Per wrapper, with <m> its name less a trailing "child" (zot, helm,
+		# ociconformance): a case carrying .no-<m> is a repo without that wrapper
+		# module (apis, runtimed, darwin-net), so its stages must not run there;
+		# .no-<m>-sum keeps the lock and removes only the graph, which the check
+		# must refuse, never skip (a wrapper moved out from under its lock).
+		local f wname wsum wlock m locks="$dir/hack/deps.lock"
+		while read -r wname wsum wlock <&3; do
+			m="${wname%child}"
+			[ ! -f "$dir/.no-$m" ] || rm -f "$dir/$wsum" "$dir/$wlock" "$dir/.no-$m"
+			[ ! -f "$dir/.no-$m-sum" ] || rm -f "$dir/$wsum" "$dir/.no-$m-sum"
+			locks="$locks $dir/$wlock"
+		done 3<<<"$WRAPPERS"
+		for f in $locks "$dir/stub/info" "$dir/base/hack/deps.lock"; do
 			[ ! -f "$f" ] || { sed -e "s/@RECENT@/$recent/g" -e "s/@OLD@/$old/g" "$f" >"$f.s" && mv "$f.s" "$f"; }
 		done
 		# A case with base/hack/deps.lock becomes a git repo whose origin/main
@@ -1318,6 +1324,9 @@ self_test() {
 	bg helm-osv-mal - "malicious-package check (helmchild)" "MAL-2026-0006"
 	bg helm-update --update pass "wrote hack/deps-helmchild.lock: 3 modules, 1 new or changed"
 	bg helm-lock-no-sum - "lock (helmchild)" "exists but pkg/helmchart/helmchild/go.sum.txt does not"
+	bg oci-clean - pass "==> [verify-deps] malicious-package check (ociconformance)"
+	bg oci-lock-added - "lock (ociconformance)" "added:   example.com/oextra v1.0.0"
+	bg oci-lock-no-sum - "lock (ociconformance)" "exists but hack/ociconformance/go.sum.txt does not"
 	wait
 	for ((i = 1; i <= seq; i++)); do
 		cat "$WORK/result.$i"

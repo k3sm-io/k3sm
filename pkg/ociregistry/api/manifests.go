@@ -78,8 +78,17 @@ func parseReference(r *http.Request) (ref.Reference, error) {
 
 // getManifest serves a manifest GET or HEAD. Accept is ignored: the answer is
 // the manifest as pushed, with its pushed media type.
+//
+// A reference outside the tag grammar names no manifest a push could have
+// stored, so a read of one is answered 404 MANIFEST_UNKNOWN, as the OCI
+// distribution-spec conformance suite requires and the registry this replaces
+// answers. It is still refused before the store is touched, and a malformed
+// digest stays 400 DIGEST_INVALID.
 func (s *Server) getManifest(w http.ResponseWriter, r *http.Request, n ref.Name) {
 	rf, err := parseReference(r)
+	if errors.Is(err, ref.ErrInvalidTag) {
+		err = &apiError{status: http.StatusNotFound, code: codeManifestUnknown, msg: "manifest unknown", cause: err}
+	}
 	if err != nil {
 		s.fail(w, r, err)
 		return

@@ -1,0 +1,5 @@
+// Package wrapper imports the conformance package so that `go mod tidy` keeps
+// it, and every module its test binary links, in the wrapper's go.sum.
+package wrapper
+
+import _ "github.com/opencontainers/distribution-spec/conformance"
