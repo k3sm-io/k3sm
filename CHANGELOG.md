@@ -88,6 +88,9 @@ pin, its date, and the tarball's sha256.
 - `k3sm uninstall` stops a vm pod helper still running from an older k3sm version whose
   directory is kept for it, as it stops every other helper, instead of reporting it as a
   leftover to kill by hand. Only a helper whose version directory is gone is still reported.
+- `k3sm uninstall` no longer reports a vm pod helper as running from a version the install no
+  longer keeps when its version directory exists but cannot be read (a permission or I/O error).
+  It does not signal that helper either; the error names the path that could not be resolved.
 - The registry's garbage collector stops a repository's sweep, deleting nothing, when a manifest
   there is not an OCI or Docker v2 image manifest, index or manifest list (a Docker schema1
   manifest, for example). It used to read such a manifest as referencing nothing and could reap

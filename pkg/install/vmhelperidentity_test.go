@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -253,6 +254,81 @@ func TestTeardownReportsAnUnretainedVMHelper(t *testing.T) {
 				if !strings.Contains(warn, field) {
 					t.Errorf("the unretained helper's Warn record %q lacks %q", warn, field)
 				}
+			}
+		})
+	}
+}
+
+// TestTeardownTreatsResolveErrorsAsUnknownNotUnretained pins the teardown's
+// answer when the version directory a helper runs from cannot be resolved for
+// a reason other than its being gone (EACCES here; EIO alike): whether the
+// tree retains that version is unknown, so the helper is never signalled, and
+// it is reported by pid, path and version as a path that cannot be resolved,
+// never as a helper this install no longer retains and never as a forged
+// record. A helper of the active version beside it is still stopped.
+func TestTeardownTreatsResolveErrorsAsUnknownNotUnretained(t *testing.T) {
+	const (
+		stale = 821 // runs from 0.2.8, whose directory cannot be read
+		live  = 822 // runs from 0.3.0, the active version
+	)
+	staleExe := DefaultInstallDir + "/versions/0.2.8/" + VMHostName
+	for _, tc := range []struct {
+		name string
+		dir  string // the path ResolvePath refuses with EACCES
+	}{
+		{name: "the helper's version directory", dir: DefaultInstallDir + "/versions/0.2.8"},
+		{name: "the versions directory itself", dir: DefaultInstallDir + "/versions"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			f := &fakeSystem{}
+			f.podLeaders = map[int]int64{stale: 1, live: 2}
+			f.life.vmhosts = []VMHostRecord{
+				{Schema: 1, PodID: "stale-pod", Pgid: stale, StartUnixNano: 1},
+				{Schema: 1, PodID: "live-pod", Pgid: live, StartUnixNano: 2},
+			}
+			f.life.procs = map[int]fakeProc{
+				stale: {exe: staleExe, uid: fakeServiceUID},
+				live:  {exe: DefaultInstallDir + "/versions/0.3.0/" + VMHostName, uid: fakeServiceUID},
+			}
+			f.purge.links = map[string]string{
+				DefaultInstallDir + "/current":  "versions/0.3.0",
+				DefaultInstallDir + "/previous": "versions/0.2.9",
+			}
+			f.purge.resolveErrs = map[string]error{tc.dir: syscall.EACCES}
+			cfg := Config{Logger: slog.New(slog.NewTextHandler(&logs, nil))}.withDefaults()
+
+			err := stopVMHelpers(context.Background(), f, cfg)
+			if idx(f.calls, fmt.Sprintf("Signal:%d:TERM", live)) < 0 {
+				t.Errorf("the active version's helper beside it was not stopped: %q", f.calls)
+			}
+			for _, sig := range []string{"TERM", "KILL"} {
+				if idx(f.calls, fmt.Sprintf("Signal:%d:%s", stale, sig)) >= 0 {
+					t.Errorf("a helper whose retention is unknown was signalled %s: %q", sig, f.calls)
+				}
+			}
+			if err == nil {
+				t.Fatal("stopVMHelpers = nil, want the 0.2.8 helper reported as unresolvable")
+			}
+			msg := err.Error()
+			for _, want := range []string{
+				fmt.Sprintf("pid %d", stale),
+				staleExe,
+				"version 0.2.8",
+				"cannot be resolved",
+				"permission denied",
+			} {
+				if !strings.Contains(msg, want) {
+					t.Errorf("stopVMHelpers = %q, want it to name %q", msg, want)
+				}
+			}
+			for _, wrong := range []string{"no longer retains", "not " + cfg.installedVMHost()} {
+				if strings.Contains(msg, wrong) {
+					t.Errorf("stopVMHelpers = %q, reports an unknown retention as %q", msg, wrong)
+				}
+			}
+			if strings.Contains(logs.String(), "no longer retains") {
+				t.Errorf("an unknown retention was logged as unretained:\n%s", logs.String())
 			}
 		})
 	}
