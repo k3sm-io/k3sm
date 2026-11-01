@@ -17,9 +17,12 @@ limitations under the License.
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
@@ -168,5 +171,60 @@ func TestManifestReadsThatWriteNothing(t *testing.T) {
 				t.Errorf("mtime %s after %s (was %s), touched %v, want %v", fi.ModTime(), tc.name, old, touched, tc.touches)
 			}
 		})
+	}
+}
+
+// TestManifestHeadAfterReapAnswers404 pins the answer of a HEAD by digest
+// whose manifest a sweep reaps after the read and before the touch: the touch
+// finds the manifest gone, and the HEAD answers 404 MANIFEST_UNKNOWN, never a
+// 200 (the client would skip the push of a manifest the registry no longer
+// holds) and never a 500. A HEAD answer carries no body, so the code is read
+// from the server's refusal log record.
+func TestManifestHeadAfterReapAnswers404(t *testing.T) {
+	const grace = time.Hour
+	var logs bytes.Buffer
+	f := newFixture(t, func(c *Config) {
+		c.Logger = slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	})
+	// A tagged image keeps half of the repository referenced, so the sweep's
+	// half-repository brake does not hold.
+	f.image(t, "app", "kept", "kept-layer")
+	child := f.image(t, "app", "", "child-layer")
+	cd := dg(child)
+	f.age(t, "app", time.Now().Add(-2*grace), cd)
+	c := f.deletingCollector(t, grace)
+	reaped := false
+	f.srv.manifestRead = func() {
+		if _, err := c.Sweep(context.Background()); err != nil {
+			t.Error(err)
+		}
+		if _, err := os.Stat(f.blobFile("app", cd)); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("the sweep kept the manifest %s: stat %v", cd, err)
+		}
+		reaped = true
+	}
+	logs.Reset()
+	w := f.do(http.MethodHead, "/v2/app/manifests/"+cd.String(), nil)
+	if !reaped {
+		t.Fatal("the HEAD did not reach the seam between the read and the touch")
+	}
+	want(t, w, http.StatusNotFound, "")
+	var codes []string
+	dec := json.NewDecoder(&logs)
+	for dec.More() {
+		var rec struct {
+			Msg    string `json:"msg"`
+			Method string `json:"method"`
+			Code   string `json:"code"`
+		}
+		if err := dec.Decode(&rec); err != nil {
+			t.Fatal(err)
+		}
+		if rec.Method == http.MethodHead && rec.Code != "" {
+			codes = append(codes, rec.Code)
+		}
+	}
+	if len(codes) != 1 || codes[0] != codeManifestUnknown {
+		t.Fatalf("HEAD answered codes %v, want [%s]", codes, codeManifestUnknown)
 	}
 }
