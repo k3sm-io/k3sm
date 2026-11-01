@@ -12,7 +12,7 @@ concern: `HF_HOME` points at `/models`, which the operator mounts.
 
 | | |
 |---|---|
-| engine | `vllm-mlx==0.5.0` (Apache-2.0), pinned in `requirements.in` |
+| engine | `vllm-mlx==0.5.0` (Apache-2.0), pinned in `requirements.in`; `mlx-lm==0.32.2` in `requirements.lock` |
 | interpreter | CPython 3.12.14, python-build-standalone, macos-aarch64 |
 | entrypoint | `/bin/python3.12 -m k3sm_serve serve --continuous-batching --host 0.0.0.0 --port 8000` (the engine's own CLI, run in-process with the context guard below) |
 | args | the model — a repo id or a path under `/models` — supplied by the pod |
@@ -53,7 +53,7 @@ checks the hooks against a staged tree. Image and audio tokens a multimodal
 processor adds after the template are not counted.
 
 `k3sm_serve` also patches the prefill mask of mlx-lm's `RotatingKVCache`. The
-cache keeps its first four tokens as attention sinks, but mlx-lm 0.32.0 builds
+cache keeps its first four tokens as attention sinks, but mlx-lm (0.32.0 and 0.32.2) builds
 the multi-token mask as a plain sliding window, so after a chunked prefill
 trims the cache the sinks are masked out and recall inside the window drops
 while decode looks fine. The patched mask keeps the sinks attended and the
@@ -147,10 +147,10 @@ from the Hub cache. With it, `/v1/models` lists `spec.model` alone and a request
 naming `spec.model` is served by the model already loaded. This hooks four
 `mlx_lm.server` internals (`ModelProvider.load`,
 `APIHandler.handle_models_request`, `run` and `_run_http_server`). The rank
-checks each one against the shape mlx-lm 0.32.0 gives it and exits, naming the
+checks each one against the shape mlx-lm 0.32.0 gave it (0.32.2 keeps it) and exits, naming the
 hook, if one is missing or has changed. Without `--served-model-name` nothing
 is hooked and the engine runs as stock `mlx_lm.server`. On a staged tree the
-selftest checks the same hooks, checks that the real `run` is the 0.32.0 body
+selftest checks the same hooks, checks that the real `run` is the 0.32.0 body (0.32.2's is identical)
 the replacement copies (`ENGINE_RUN_SHA256`; an mlx-lm bump that changes it
 re-derives the copy and the hash), and compares the real `/v1/models` answer
 with the aliased one.
@@ -353,11 +353,11 @@ uv pip compile --generate-hashes --no-header \
 `--exclude-newer` is the 14-day dependency cooldown: the resolver ignores every
 artifact uploaded after midnight UTC 14 days before the run, so a version
 published inside the cooldown never enters the closure. The current lockfile
-was compiled with `--exclude-newer 2026-10-15T00:00:00Z`.
+was compiled with `--exclude-newer 2026-10-17T00:00:00Z`.
 
 To move only some packages, compile over the existing lockfile (the `-o` file)
 and name them with `--upgrade-package <name>`: uv keeps every other pin it
-finds there. The current lockfile moved only `mlx` and `mlx-metal` that way.
+finds there. The current lockfile moved only `mlx-lm` that way.
 A full re-resolve moves every package to the newest version before the cutoff
 and can add new ones, so it changes the payload and wants a rebuild and a
 size check.
