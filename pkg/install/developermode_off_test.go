@@ -238,7 +238,7 @@ func pinPlainInstallSignature(t *testing.T) {
 
 	t.Run("the user docs say what the code does", func(t *testing.T) {
 		t.Parallel()
-		doc, err := os.ReadFile("../../docs/user/install.md")
+		doc, err := os.ReadFile(filepath.Join("..", "..", "docs", "user", "install.md"))
 		if err != nil {
 			t.Fatal(err)
 		}
