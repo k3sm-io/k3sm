@@ -2,6 +2,13 @@
 #
 # verify-deps.sh — the dependency supply-chain check.
 #
+# Repo-specific facts never live in this file. It is byte-identical in the four
+# Go repos, and a change lands in all four together. A fact
+# that belongs to one repo goes in that repo's own config: a reason line in
+# hack/deps.cooldown-exempt (module, version, reason; the reason carries any
+# expiry), or, for a graph checked outside go.mod, a wrapper entry whose files
+# exist only in that repo (the wrapper stages skip when the files are absent).
+#
 # A Go module graph can be attacked without touching a line of this repo's code:
 # a tampered module zip, a typosquatted module pulled in by a new import, a
 # compromised maintainer account publishing a malicious patch release that a
@@ -92,11 +99,9 @@ LOCK="hack/deps.lock"
 #   <name> <go.sum> <lock>
 #
 # zotchild: the registry's zot child (pkg/registrysvc).
-# helmchild: the helm binary the daemon builds (pkg/helmchart). Its graph
-#   carries golang.org/x/net v0.62.0, the version the control-plane build raises
-#   to under the cooldown exemption in hack/release/build-cp.sh (EXEMPT there,
-#   expiring 2026-11-10). The matching x/net line in hack/deps.cooldown-exempt
-#   rests on that ruling and is to be dropped when that exemption goes.
+# helmchild: the helm binary the daemon builds (pkg/helmchart).
+# A wrapper graph version that must clear the cooldown early is exempted in
+# hack/deps.cooldown-exempt like any other, with its reason (and expiry) there.
 WRAPPERS="zotchild pkg/registrysvc/zotchild/go.sum.txt hack/deps-zotchild.lock
 helmchild pkg/helmchart/helmchild/go.sum.txt hack/deps-helmchild.lock"
 # The two go.sum paths again, for the self-test's per-case removal markers.
