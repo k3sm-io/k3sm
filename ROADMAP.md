@@ -153,6 +153,20 @@ v0.2.3 was released on 2026-10-29.
 - **Operations.** `k3sm status top`, `kubectl top` through the bundled metrics-server, build
   history and cancellation, LoadBalancer Services on every node, and scheduled etcd snapshots on
   HA servers.
+- **The k3sm app.** A Developer ID signed, notarized disk image: drag `k3sm.app` into
+  Applications for a second way to install k3sm beside the command line. While k3sm runs, a
+  menu-bar item shows status and offers stop, restart and logs (and, on a server, a command that
+  copies a join command for a worker). The window handles first-time setup, lists workloads,
+  images, builds and services, offers a newer k3sm release, and uninstalls. The command-line
+  install stays exactly as it is. The app ships from v0.2.2, the first published v0.2 release.
+- **Local-only by default.** A new install answers NodePort, LoadBalancer and ingress traffic on
+  this Mac and the cluster mesh only. `sudo k3sm network lan on` opens those listeners to the
+  networks the Mac is attached to, `k3sm network lan status` reports the setting, and the app has a
+  matching switch. An existing install keeps LAN access on across an upgrade.
+- **Thunderbolt interconnect (alpha).** `k3sm interconnect enable` arms a Thunderbolt cable
+  between Macs as an opt-in network beside the mesh. A Pod opts in with the `k3sm.io/interconnects`
+  annotation, a sharded `MLXModel` places its ranks on it with `spec.distributed.interconnect`, and
+  `k3sm doctor` and `k3sm status` report it. Experimental.
 
 ## v0.3 (planned)
 
@@ -174,7 +188,9 @@ v0.2.3 was released on 2026-10-29.
 
 - **The app finds its own new releases.** The k3sm app checks a release index signed with the
   project's Developer ID for a newer release of itself and of k3sm, says how far behind it is, and
-  points to the download. Installing a release in place comes after it.
+  points to the download. On a server, the app can also roll the cluster to the k3sm release it
+  carries, pinned to the digest in its signed record, once every node is Ready. Installing a
+  release in place comes after it.
 - **Developer mode.** A build from source can be installed and driven from the app: `k3sm install
   --developer-mode on` turns the signature checks off on that Mac, with a warning in `k3sm status`
   and in the app while it is on. A developer build of the app then installs, updates, stops and
@@ -218,12 +234,24 @@ v0.2.3 was released on 2026-10-29.
   sharded across cabled Macs (the reserved `MLXModel.Distributed` seam, one rank per Mac) on MLX's
   `ring` backend. The `jaccl` backend over RDMA follows where macOS exposes it, which today means
   Thunderbolt 5 Macs on macOS 26.2 or later with RDMA enabled once in macOS Recovery.
-- **A macOS app.** On top of `k3sm stop` and `start` (v0.2), k3sm gets a second way to install: a
-  notarized app you drag into Applications. While k3sm runs it shows a menu-bar item with status, stop,
-  restart and logs (and, on the server, a command that joins a worker), and its window handles
-  first-time setup, updates and uninstall. An optional auto-stop takes the node down when the Mac
-  joins a Wi-Fi network you have not marked trusted; it is a convenience, not a security boundary.
-  The command-line install stays exactly as it is.
+- **Auto-stop for the app.** An optional auto-stop takes the node down when the Mac joins a Wi-Fi
+  network you have not marked trusted; it is a convenience, not a security boundary.
+- **A cooperative node budget.** Nodes already report a `SoftPressure` condition (built, not yet
+  released): an early warning graded on a ladder of available memory, the memory compressor, swap
+  growth, free space on the swap and data volumes, and free process IDs, which taints and evicts
+  nothing. Planned on top of it: a cluster-wide `NodeBudget` resource and a node-local page that
+  applications read through C++ and Swift client libraries, so batch work can slow down or be asked
+  to stop gracefully before the node's hard eviction fires.
+- **A registry k3sm owns.** The cluster registry is a bundled third-party server run as a child
+  process. k3sm is writing its own OCI registry server over the same on-disk store, with the same
+  pushes, pulls, tags and cross-repository mounts, garbage collection that runs while pushes
+  continue, and an image prune that leaves alone anything a push changed in the meantime. The
+  pieces are built; the daemon does not run it yet.
+- **A dedicated root updater.** Managed updates are unpacked today by the root network helper. The
+  planned updater is a separate small root program that checks every binary against the project's
+  Developer ID requirement and the cluster's signing certificate before it activates a version,
+  refuses any version older than the newest it has run (rolling back to the previous version stays
+  possible), and keeps the previous version in place.
 - **WebAssembly workloads.** `runtimeClassName: wasm` runs a WASI module or component as a native
   pod inside a small host process that embeds the wasmtime engine. Core modules get WASI preview 1;
   components get WASI 0.2 and can serve HTTP on the pod IP. Such pods schedule only to Macs that
