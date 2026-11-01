@@ -54,6 +54,12 @@ pin, its date, and the tarball's sha256.
   involved, and it answers `401` with a Basic challenge to an anonymous write or a credential that
   does not check out, `403` to a credential without the permission, and `429` to a client address
   that has used up its budget of failed attempts. `push-credential.json` is unchanged.
+- A blob HEAD on the k3sm registry server restarts the blob's garbage-collection grace, so a
+  client that skips an upload because the blob is already there no longer loses it to a sweep
+  before its manifest PUT.
+- A manifest HEAD by digest on the k3sm registry server restarts that manifest's
+  garbage-collection grace, so a client that skips pushing an index's child manifest because it
+  is already there no longer loses the untagged child to a sweep before its index PUT.
 
 - The control-plane node fills each MeshPeer's `status.lastHandshakeTime` from its own
   WireGuard view, so `kubectl get meshpeer -o yaml` shows when the server last completed a
@@ -76,21 +82,12 @@ pin, its date, and the tarball's sha256.
 - `k3sm uninstall` stops a vm pod helper still running from an older k3sm version whose
   directory is kept for it, as it stops every other helper, instead of reporting it as a
   leftover to kill by hand. Only a helper whose version directory is gone is still reported.
-
-- A blob HEAD on the k3sm registry server restarts the blob's garbage-collection grace, so a
-  client that skips an upload because the blob is already there no longer loses it to a sweep
-  before its manifest PUT.
-
 - The registry's garbage collector stops a repository's sweep, deleting nothing, when a manifest
   there is not an OCI or Docker v2 image manifest, index or manifest list (a Docker schema1
   manifest, for example). It used to read such a manifest as referencing nothing and could reap
   the blobs it still used.
 - The launchd `ExitTimeOut` of the server and agent daemons now counts the node's wait for the
   eviction loop to stop, so a worker's shutdown budget no longer undercounts by 10 seconds.
-- A manifest HEAD by digest on the k3sm registry server restarts that manifest's
-  garbage-collection grace, so a client that skips pushing an index's child manifest because it
-  is already there no longer loses the untagged child to a sweep before its index PUT.
-
 - An install from a k3sm.app staging directory resolves the installed `k3sm` once and reads its
   signature and its version from that one file, so the two checks cannot judge different binaries
   when the installed `k3sm` is a link into a version directory. A link that leads anywhere else
