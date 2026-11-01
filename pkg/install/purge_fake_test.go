@@ -46,6 +46,9 @@ type fakePurge struct {
 	// resolveErrs makes ResolvePath fail with its value for a path under any
 	// of its keys: a directory that exists but cannot be read (EACCES, EIO).
 	resolveErrs map[string]error
+	// listErrs makes ListOwned fail with its value for a directory that is one
+	// of its keys: a directory whose entries cannot be read (EACCES, EIO).
+	listErrs map[string]error
 	// links answers Readlink; an absent key is not a symlink that exists.
 	links map[string]string
 	// markers answers ReadDataRootMarker; markerErrs overrides it.

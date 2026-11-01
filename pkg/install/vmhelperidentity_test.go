@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"strings"
 	"syscall"
@@ -328,6 +329,88 @@ func TestTeardownTreatsResolveErrorsAsUnknownNotUnretained(t *testing.T) {
 				if strings.Contains(msg, wrong) {
 					t.Errorf("stopVMHelpers = %q, reports an unknown retention as %q", msg, wrong)
 				}
+			}
+			if strings.Contains(logs.String(), "no longer retains") {
+				t.Errorf("an unknown retention was logged as unretained:\n%s", logs.String())
+			}
+		})
+	}
+}
+
+// TestTeardownTreatsAFailedVersionsListingAsUnknown pins the same answer when
+// it is the versions directory's listing that fails, the seam the teardown
+// reads the directory's own spelling of a version through. A listing refused
+// for any reason but the directory's being gone (EACCES, EIO) leaves the
+// helper's version unknown: it is never signalled and never reported as a
+// version this install no longer retains. A listing that finds the directory
+// gone names no version, so the helper is reported as unretained.
+func TestTeardownTreatsAFailedVersionsListingAsUnknown(t *testing.T) {
+	const (
+		stale = 831 // runs from 0.2.8, which neither link retains
+		live  = 832 // runs from 0.3.0, the active version
+	)
+	staleExe := DefaultInstallDir + "/versions/0.2.8/" + VMHostName
+	for _, tc := range []struct {
+		name       string
+		listErr    error
+		unknown    bool   // the helper's retention is unknown, not unretained
+		errnoInMsg string // how the listing's cause reads in the error
+	}{
+		{name: "EACCES", listErr: syscall.EACCES, unknown: true, errnoInMsg: "permission denied"},
+		{name: "EIO", listErr: syscall.EIO, unknown: true, errnoInMsg: "input/output error"},
+		{name: "gone", listErr: fs.ErrNotExist},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			f := &fakeSystem{}
+			f.podLeaders = map[int]int64{stale: 1, live: 2}
+			f.life.vmhosts = []VMHostRecord{
+				{Schema: 1, PodID: "stale-pod", Pgid: stale, StartUnixNano: 1},
+				{Schema: 1, PodID: "live-pod", Pgid: live, StartUnixNano: 2},
+			}
+			f.life.procs = map[int]fakeProc{
+				stale: {exe: staleExe, uid: fakeServiceUID},
+				live:  {exe: DefaultInstallDir + "/versions/0.3.0/" + VMHostName, uid: fakeServiceUID},
+			}
+			f.purge.links = map[string]string{
+				DefaultInstallDir + "/current":  "versions/0.3.0",
+				DefaultInstallDir + "/previous": "versions/0.2.9",
+			}
+			f.owners = versionDirs("0.2.8", "0.2.9", "0.3.0")
+			f.purge.listErrs = map[string]error{DefaultInstallDir + "/versions": tc.listErr}
+			cfg := Config{Logger: slog.New(slog.NewTextHandler(&logs, nil))}.withDefaults()
+
+			err := stopVMHelpers(context.Background(), f, cfg)
+			if idx(f.calls, fmt.Sprintf("Signal:%d:TERM", live)) < 0 {
+				t.Errorf("the active version's helper beside it was not stopped: %q", f.calls)
+			}
+			for _, sig := range []string{"TERM", "KILL"} {
+				if idx(f.calls, fmt.Sprintf("Signal:%d:%s", stale, sig)) >= 0 {
+					t.Errorf("the 0.2.8 helper was signalled %s: %q", sig, f.calls)
+				}
+			}
+			if err == nil {
+				t.Fatal("stopVMHelpers = nil, want the 0.2.8 helper reported")
+			}
+			msg := err.Error()
+			for _, want := range []string{fmt.Sprintf("pid %d", stale), staleExe, "0.2.8"} {
+				if !strings.Contains(msg, want) {
+					t.Errorf("stopVMHelpers = %q, want it to name %q", msg, want)
+				}
+			}
+			if !tc.unknown {
+				if !strings.Contains(msg, "no longer retains") {
+					t.Errorf("stopVMHelpers = %q, want a gone listing to report the helper as unretained", msg)
+				}
+				return
+			}
+			for _, want := range []string{"cannot be resolved", tc.errnoInMsg} {
+				if !strings.Contains(msg, want) {
+					t.Errorf("stopVMHelpers = %q, want it to name %q", msg, want)
+				}
+			}
+			if strings.Contains(msg, "no longer retains") {
+				t.Errorf("stopVMHelpers = %q, reports an unknown retention as unretained", msg)
 			}
 			if strings.Contains(logs.String(), "no longer retains") {
 				t.Errorf("an unknown retention was logged as unretained:\n%s", logs.String())

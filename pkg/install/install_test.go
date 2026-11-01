@@ -425,6 +425,9 @@ func (f *fakeSystem) Owner(path string) (OwnedEntry, error) {
 // not do.
 func (f *fakeSystem) ListOwned(dir string) ([]OwnedEntry, error) {
 	f.calls = append(f.calls, "ListOwned:"+dir)
+	if err, ok := f.purge.listErrs[dir]; ok {
+		return nil, fmt.Errorf("open %s: %w", dir, err)
+	}
 	self, ok := f.owners[dir]
 	if !ok {
 		return nil, fmt.Errorf("open %s: %w", dir, fs.ErrNotExist)
