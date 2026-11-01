@@ -20,6 +20,7 @@ import (
 	"context"
 	"log/slog"
 	"net/netip"
+	"reflect"
 	"sync"
 	"testing"
 
@@ -32,11 +33,14 @@ import (
 )
 
 // installOptRecordingMeshSeam swaps the mesh seam for one that records how many
-// watcher options each bring-up passed.
-func installOptRecordingMeshSeam(t *testing.T) func() []int {
+// watcher options each bring-up passed, as the code pointer of each option.
+// WatcherOption is a closure over an unexported Watcher field, so the code
+// pointer is the observable identity: every closure built by one function
+// literal shares it, and a different option has a different one.
+func installOptRecordingMeshSeam(t *testing.T) func() [][]uintptr {
 	t.Helper()
 	var mu sync.Mutex
-	var seen []int
+	var seen [][]uintptr
 	prev := activeMeshSeam
 	activeMeshSeam = meshSeam{
 		newMesh: func(netip.Prefix, ...mesh.Option) (meshDatapath, error) {
@@ -44,18 +48,25 @@ func installOptRecordingMeshSeam(t *testing.T) func() []int {
 		},
 		newWatch: func(_ *rest.Config, _ meshDatapath, _ *slog.Logger, opts ...mesh.WatcherOption) (meshWatch, error) {
 			mu.Lock()
-			seen = append(seen, len(opts))
+			ids := []uintptr{}
+			for _, o := range opts {
+				ids = append(ids, reflect.ValueOf(o).Pointer())
+			}
+			seen = append(seen, ids)
 			mu.Unlock()
 			return &fakeMeshWatch{done: make(chan struct{})}, nil
 		},
 	}
 	t.Cleanup(func() { activeMeshSeam = prev })
-	return func() []int {
+	return func() [][]uintptr {
 		mu.Lock()
 		defer mu.Unlock()
-		return append([]int(nil), seen...)
+		return append([][]uintptr(nil), seen...)
 	}
 }
+
+// handshakeStatusID is the identity of mesh.WithHandshakeStatus.
+func handshakeStatusID() uintptr { return reflect.ValueOf(mesh.WithHandshakeStatus()).Pointer() }
 
 // TestServerMeshWritesHandshakeStatus pins who writes MeshPeer
 // status.lastHandshakeTime: the control-plane node's MeshPeer watch is built
@@ -75,8 +86,8 @@ func TestServerMeshWritesHandshakeStatus(t *testing.T) {
 			t.Fatalf("server mesh bring-up: %v", err)
 		}
 		defer func() { _ = down(context.Background()) }()
-		if got := seen(); len(got) != 1 || got[0] != 1 {
-			t.Fatalf("server watch options = %v, want one watch with exactly one option (WithHandshakeStatus)", got)
+		if got := seen(); len(got) != 1 || len(got[0]) != 1 || got[0][0] != handshakeStatusID() {
+			t.Fatalf("server watch options = %v, want one watch with exactly mesh.WithHandshakeStatus (%#x)", got, handshakeStatusID())
 		}
 	})
 
@@ -89,7 +100,7 @@ func TestServerMeshWritesHandshakeStatus(t *testing.T) {
 			t.Fatalf("worker mesh bring-up: %v", err)
 		}
 		defer func() { _ = down(context.Background()) }()
-		if got := seen(); len(got) != 1 || got[0] != 0 {
+		if got := seen(); len(got) != 1 || len(got[0]) != 0 {
 			t.Fatalf("worker watch options = %v, want one watch with no option", got)
 		}
 	})
