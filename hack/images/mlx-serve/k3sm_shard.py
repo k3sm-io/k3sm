@@ -45,8 +45,9 @@ whose model is the name is served by the model already loaded, and
 /v1/models lists the name alone. That needs four hooks in mlx_lm.server
 (ModelProvider.load, APIHandler.handle_models_request, run and
 _run_http_server), none of them a published API. install_alias checks each
-against the shape it was written for, mlx-lm 0.32.0, and the rank exits
-naming the hook that moved instead of serving under the wrong name.
+against the shape it was written for, mlx-lm 0.32.0, and the source of run
+against the 0.32.0 body its replacement copies; the rank exits naming the hook
+that moved instead of serving under the wrong name.
 
 `k3sm_shard --probe` is the rank-0 liveness probe: it POSTs a one-token
 completion to the local server and exits 0 on HTTP 200. A server that is not
@@ -352,14 +353,19 @@ ENGINE_HOOKS = (
 
 # The normalized source of mlx_lm.server.run in mlx-lm 0.32.0, which
 # install_alias's run copies. A bump that changes run's body must re-derive the
-# copy; the selftest's staged-tree rung compares this against the engine the
-# image carries. Not checked at pod start: it needs the engine's .py source.
+# copy. check_engine_hooks compares it against the engine at pod start (the
+# image carries the engine's .py source beside its bytecode), and the
+# selftest's staged-tree rung against the engine the image carries.
 ENGINE_RUN_SHA256 = "fe245246598aa896f0299795f7fc0f12a05d022f36f9a9b9eae4dfa47590e01a"
 
 
 def source_shape(func):
     """sha256 of func's source with comments, blank lines and layout removed."""
-    src = textwrap.dedent(inspect.getsource(func))
+    try:
+        src = textwrap.dedent(inspect.getsource(func))
+    except (OSError, TypeError) as e:
+        raise ShardError(f"cannot read the source of {ENGINE_MODULE}.{getattr(func, '__name__', func)!s} to check it "
+                         f"against the mlx-lm 0.32.0 body the served-name alias copies: {e}") from None
     skip = {tokenize.COMMENT, tokenize.NL, tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT,
             tokenize.ENCODING, tokenize.ENDMARKER}
     toks = [t.string for t in tokenize.generate_tokens(io.StringIO(src).readline) if t.type not in skip]
@@ -376,7 +382,12 @@ def check_run_shape(server):
 
 
 def check_engine_hooks(server):
-    """Raise ShardError naming the first hook the engine module lacks."""
+    """Raise ShardError naming the first hook the engine module lacks.
+
+    Every hook is checked for its 0.32.0 signature, and then run for the 0.32.0
+    body install_alias's run copies: an engine whose run changed underneath
+    matching signatures would otherwise be replaced by a stale copy.
+    """
     for path, params in ENGINE_HOOKS:
         obj = server
         for part in path.split("."):
@@ -393,6 +404,7 @@ def check_engine_hooks(server):
         if got != params:
             raise ShardError(f"{ENGINE_MODULE}.{path} takes {got}; the served-name alias was written against "
                              f"mlx-lm 0.32.0's {params}")
+    check_run_shape(server)
 
 
 def install_alias(server, served):
