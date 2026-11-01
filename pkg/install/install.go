@@ -1984,7 +1984,7 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	}
 	defer release()
 	// The developer-mode marker, before the install root is swapped. A
-	// removal waits for the swap to commit (after the reap at 4c).
+	// removal waits for the swap to commit (2f′).
 	removeMarker, err := applyDeveloperMode(ctx, sys, cfg)
 	if err != nil {
 		return err
@@ -2442,6 +2442,15 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	if err != nil {
 		return err
 	}
+	// 2f′. The developer-mode marker removal applyDeveloperMode decided on,
+	//      the moment the swap commits and before anything is wired or
+	//      restarted on the new tree, so the app's root steps never read
+	//      developer mode as on beside it. A failed swap above leaves the
+	//      marker untouched; a revert below restores it (markerRemoval.restore),
+	//      so a build from source that is rolled back to stays in developer
+	//      mode. A failed removal is reported only once the install has
+	//      finished, at the end of step 5.
+	dropErr := removeMarker.drop(sys, cfg)
 
 	// 3. The launcher link and the plists, in that order, and BOTH after the
 	//    publish: each names a fixed absolute path inside the install root, and
@@ -2454,7 +2463,7 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	//    target mean the new tree the moment it is live.
 	restartOwned = true // step 4 restarts, and on failure reports, every daemon
 	if err := publishedWiring(ctx, sys, cfg, m, startedAt); err != nil {
-		return revertInstallRoot(ctx, sys, cfg, m, previous, err)
+		return revertInstallRoot(ctx, sys, cfg, m, previous, err, func() { removeMarker.restore(sys, cfg) })
 	}
 
 	// 4c. REAP, and not one step earlier. The previous install root is still
@@ -2468,13 +2477,6 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	//     wrong trade.
 	if previous {
 		reapPreviousRoot(sys, cfg)
-	}
-	// 4d. The developer-mode marker removal applyDeveloperMode decided on,
-	//     now that the swap has committed: a failure at any step before this
-	//     line leaves the marker as it was, so a build from source that is
-	//     reverted to, or never replaced, keeps developer mode on.
-	if err := removeMarker.commit(sys, cfg); err != nil {
-		return err
 	}
 
 	// 5. Write the admin kubeconfig to the human's home (owned by them, not root)
@@ -2512,7 +2514,8 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 		}
 	}
 	cfg.Logger.Info("k3sm installed", "install-dir", cfg.InstallDir, "link", cfg.installedLink(), "kubeconfig-owner", cfg.TargetUser)
-	return nil
+	// The marker removal that failed at 2f′, now that the install is done.
+	return dropErr
 }
 
 // publishedWiring is everything an install does once the new tree is live: the

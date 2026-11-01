@@ -88,7 +88,7 @@ type DeveloperModeOptions struct {
 	// (DeveloperModeMarkerPath) before the install root is swapped, leaves it
 	// there if the install then fails, and skips the --from-staging signing
 	// continuity check; DeveloperModeOff removes the marker once the swap has
-	// committed, so a failed install leaves it;
+	// committed, and a revert of the install root puts it back;
 	// DeveloperModeUnset keeps it as it is, except that an install from a
 	// staging directory whose staged k3sm and every other Mach-O carry the
 	// Developer ID signature of the team the continuity check requires
@@ -313,11 +313,12 @@ func resolveDeveloperMode(sys System, cfg *Config) error {
 // applyDeveloperMode records the mode on disk, under the install lock and
 // before the install root is swapped: on writes the marker (and a failed
 // install leaves it). A removal is only decided here and returned, for the
-// install to carry out once the swap has committed (markerRemoval.commit), so
-// a failed install leaves the marker as it was: off removes it, and not passed
+// install to carry out once the swap has committed, so a failed swap leaves
+// the marker as it was: off removes it, and not passed
 // removes it only when the --from-staging predicate found the whole staged
 // tree signed by the k3sm team (developerModeOff) or a plain install's k3sm is
-// team-signed (plainInstallTeam). Not passed, it reads the marker again first
+// team-signed (plainInstallTeam). The removal happens as the swap commits
+// (markerRemoval.drop), and a revert of the install root restores it. Not passed, it reads the marker again first
 // and refuses the install if that read differs from the one the predicate
 // acted on.
 func applyDeveloperMode(ctx context.Context, sys System, cfg Config) (*markerRemoval, error) {
@@ -359,24 +360,40 @@ func applyDeveloperMode(ctx context.Context, sys System, cfg Config) (*markerRem
 
 // markerRemoval is a developer-mode marker removal applyDeveloperMode decided
 // on. team is the signing team that turned developer mode off, empty for
-// --developer-mode off; invalid says the marker was judged invalid.
+// --developer-mode off; invalid says the marker was judged invalid. drop
+// fills saved and savedMode with a valid marker's bytes and mode before it
+// removes it, so restore can put it back if the install root is reverted.
 type markerRemoval struct {
-	path    string
-	team    string
-	invalid bool
+	path      string
+	team      string
+	invalid   bool
+	removed   bool
+	saved     []byte
+	savedMode fs.FileMode
 }
 
-// commit removes the marker. The install calls it once the swap has
-// committed, past the last step that can revert it, so a failed install
-// never leaves a build from source installed with developer mode turned off.
-// A nil removal does nothing.
-func (r *markerRemoval) commit(sys System, cfg Config) error {
+// drop removes the marker. The install calls it the moment the swap has
+// committed and before the daemons are wired and restarted, so the app's root
+// steps never read developer mode as on beside the signed tree. A valid
+// marker is read first, without following a symlink, and kept for restore; a
+// marker that cannot be read is left in place. A failure is returned for the
+// install to report once it has finished; nil does nothing.
+func (r *markerRemoval) drop(sys System, cfg Config) error {
 	if r == nil {
 		return nil
 	}
+	if ReadDeveloperModeState(sys, r.path) == DeveloperModeMarkerOn {
+		content, mode, err := sys.ReadRegularFileWithMode(r.path)
+		if err != nil {
+			return fmt.Errorf("install: k3sm is installed, but the developer-mode marker %s could not be read to keep a copy for a rollback, so it was left in place (%w); run k3sm install --developer-mode off", r.path, err)
+		}
+		r.saved, r.savedMode = content, mode.Perm()
+	}
 	if err := RemoveDeveloperModeMarker(sys, r.path); err != nil {
+		r.saved = nil
 		return fmt.Errorf("install: k3sm is installed, but %w; run k3sm install --developer-mode off", err)
 	}
+	r.removed = true
 	switch {
 	case r.team == "":
 	case r.invalid:
@@ -385,6 +402,26 @@ func (r *markerRemoval) commit(sys System, cfg Config) error {
 		cfg.Logger.Info("developer mode turned off by a signed install", "team-id", r.team, "marker", r.path)
 	}
 	return nil
+}
+
+// restore puts back the valid marker drop removed, with its bytes and mode,
+// through the root-only temp-and-rename write. revertInstallRoot calls it once
+// the previous tree is live again, so a build from source that is rolled back
+// to stays in developer mode. An invalid marker is not restored: it counted as
+// absent. Failures are logged, never returned: the install is already failing.
+func (r *markerRemoval) restore(sys System, cfg Config) {
+	if r == nil || !r.removed || r.saved == nil {
+		return
+	}
+	if err := sys.WriteRootOnlyFile(r.path, r.saved, r.savedMode); err != nil {
+		cfg.Logger.Warn("the developer-mode marker could not be restored with the rolled-back install root; run k3sm install --developer-mode on to turn developer mode on again", "marker", r.path, "err", err)
+		return
+	}
+	if state := ReadDeveloperModeState(sys, r.path); state != DeveloperModeMarkerOn {
+		cfg.Logger.Warn("the restored developer-mode marker reads "+string(state)+"; run k3sm install --developer-mode on to turn developer mode on again", "marker", r.path)
+		return
+	}
+	cfg.Logger.Warn("restored the developer-mode marker with the rolled-back install root", "marker", r.path)
 }
 
 // plainInstallTeam decides whether an install that is not from a staging

@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"regexp"
 	"slices"
@@ -472,6 +473,7 @@ func TestDeveloperModeKeptWhenDeveloperIDVerificationFails(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			f := &fakeSystem{owners: map[string]OwnedEntry{}}
+			seedMarkerAncestors(f)
 			f.owners[DeveloperModeMarkerPath] = OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: 0o644}
 			f.putFile(DeveloperModeMarkerPath, []byte("developer mode enabled by k3sm install on 2026-10-31T00:00:00Z\n"))
 			var logs strings.Builder
@@ -491,4 +493,105 @@ func TestDeveloperModeKeptWhenDeveloperIDVerificationFails(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestDeveloperModeMarkerDroppedAsTheSwapCommits pins when an install that
+// turns developer mode off removes the marker: right after the swap commits
+// and before the daemons are wired and restarted on the new tree, so the
+// app's root steps never read developer mode as on beside a signed tree. A
+// revert puts the marker back as it was, so the rolled-back build stays in
+// developer mode, and a removal that fails still finishes the install before
+// it is reported.
+func TestDeveloperModeMarkerDroppedAsTheSwapCommits(t *testing.T) {
+	shrinkRestartBudgets(t)
+	const content = "developer mode enabled by k3sm install on 2026-10-31T00:00:00Z\n"
+	removeCall := "RemoveEntry:/Library:k3sm.developer-mode"
+	putMarker := func(f *fakeSystem, mode fs.FileMode) {
+		seedMarkerAncestors(f)
+		f.owners[DeveloperModeMarkerPath] = OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: mode}
+		f.putFile(DeveloperModeMarkerPath, []byte(content))
+		if f.modes == nil {
+			f.modes = map[string]fs.FileMode{}
+		}
+		f.modes[DeveloperModeMarkerPath] = mode
+	}
+
+	for _, tc := range []struct {
+		name string
+		mode DeveloperMode
+		sign TeamIDReader
+	}{
+		{name: "off", mode: DeveloperModeOff},
+		{name: "a team-signed install", sign: fakeSigner{ids: map[string]string{"/tmp/k3sm": testTeamID}}},
+	} {
+		t.Run(tc.name+" removes it before the wiring", func(t *testing.T) {
+			f := &fakeSystem{owners: map[string]OwnedEntry{}}
+			putMarker(f, 0o644)
+			cfg := stageCfg()
+			cfg.DeveloperMode, cfg.Signer = tc.mode, tc.sign
+			if err := Install(context.Background(), f, cfg); err != nil {
+				t.Fatal(err)
+			}
+			swap := slices.IndexFunc(f.calls, func(c string) bool { return strings.HasPrefix(c, "SwapInstallRoot:") })
+			removed := slices.Index(f.calls, removeCall)
+			if swap < 0 || removed < swap {
+				t.Fatalf("the marker was removed at call %d, the swap at %d: want it after the swap", removed, swap)
+			}
+			for _, c := range f.calls[swap+1 : removed] {
+				if !strings.Contains(c, "developer-mode") && c != "Owner:/" && c != "Owner:/Library" && c != "HasACL:/" && c != "HasACL:/Library" {
+					t.Errorf("call %q ran between the swap and the marker removal; want the removal first", c)
+				}
+			}
+		})
+	}
+
+	t.Run("a revert restores the marker as it was", func(t *testing.T) {
+		f := &fakeSystem{}
+		if err := Install(context.Background(), f, stageCfg()); err != nil {
+			t.Fatalf("first Install: %v", err)
+		}
+		putMarker(f, 0o600)
+		f.putLoaded(NetdLabel, ServerLabel)
+		f.calls = nil
+		f.putBootstrapAlways(NetdLabel, errors.New("Bootstrap failed: 125: Domain does not support specified action"))
+		cfg := stageCfg()
+		cfg.DeveloperMode = DeveloperModeOff
+		err := Install(context.Background(), f, cfg)
+		if err == nil || !strings.Contains(err.Error(), "rolled back to the previous install root") {
+			t.Fatalf("Install = %v, want the rollback", err)
+		}
+		removed := slices.Index(f.calls, removeCall)
+		restored := slices.Index(f.calls, "WriteRootOnlyFile:"+DeveloperModeMarkerPath+":0600")
+		if removed < 0 || restored < removed {
+			t.Fatalf("removed at call %d, restored at %d: want a removal then a restore; calls %v", removed, restored, f.calls)
+		}
+		if got := string(f.files[DeveloperModeMarkerPath]); got != content {
+			t.Errorf("restored content %q, want %q", got, content)
+		}
+		if got := ReadDeveloperModeState(f, DeveloperModeMarkerPath); got != DeveloperModeMarkerOn {
+			t.Errorf("after the revert the marker reads %s, want %s", got, DeveloperModeMarkerOn)
+		}
+	})
+
+	t.Run("a removal that fails finishes the install, then says so", func(t *testing.T) {
+		f := &fakeSystem{owners: map[string]OwnedEntry{}, removeEntryErrs: map[string]error{DeveloperModeMarkerPath: errors.New("EPERM")}}
+		putMarker(f, 0o644)
+		cfg := stageCfg()
+		cfg.DeveloperMode = DeveloperModeOff
+		err := Install(context.Background(), f, cfg)
+		if err == nil || !strings.Contains(err.Error(), "k3sm install --developer-mode off") {
+			t.Fatalf("Install = %v, want the removal failure naming k3sm install --developer-mode off", err)
+		}
+		removed := slices.Index(f.calls, removeCall)
+		if removed < 0 {
+			t.Fatalf("the removal was not attempted; calls %v", f.calls)
+		}
+		// Step 5, after the removal: the admin kubeconfig, then the server
+		// arguments record that names it.
+		for _, want := range []string{"WriteUserKubeconfig:alice", "WriteServerArgsRecord:"} {
+			if !slices.ContainsFunc(f.calls[removed:], func(c string) bool { return strings.HasPrefix(c, want) }) {
+				t.Errorf("the install stopped before %s; calls after the removal %v", want, f.calls[removed:])
+			}
+		}
+	})
 }
