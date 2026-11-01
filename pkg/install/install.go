@@ -1983,8 +1983,10 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 		return fmt.Errorf("install: %w", err)
 	}
 	defer release()
-	// The developer-mode marker, before the install root is swapped.
-	if err := applyDeveloperMode(ctx, sys, cfg); err != nil {
+	// The developer-mode marker, before the install root is swapped. A
+	// removal waits for the swap to commit (after the reap at 4c).
+	removeMarker, err := applyDeveloperMode(ctx, sys, cfg)
+	if err != nil {
 		return err
 	}
 
@@ -2466,6 +2468,13 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	//     wrong trade.
 	if previous {
 		reapPreviousRoot(sys, cfg)
+	}
+	// 4d. The developer-mode marker removal applyDeveloperMode decided on,
+	//     now that the swap has committed: a failure at any step before this
+	//     line leaves the marker as it was, so a build from source that is
+	//     reverted to, or never replaced, keeps developer mode on.
+	if err := removeMarker.commit(sys, cfg); err != nil {
+		return err
 	}
 
 	// 5. Write the admin kubeconfig to the human's home (owned by them, not root)

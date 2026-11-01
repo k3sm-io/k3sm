@@ -376,6 +376,7 @@ func TestDeveloperModeOffJudgesTheResolvedInstall(t *testing.T) {
 		sfs.versions[versioned] = "v0.3.9"
 		cfg.Signer = linkSigner{fakeSigner: fakeSigner{ids: signedTree(map[string]string{versioned: testTeamID})}, sfs: sfs}
 		f := &fakeSystem{owners: map[string]OwnedEntry{}}
+		seedMarkerAncestors(f)
 		f.owners[DeveloperModeMarkerPath] = OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: 0o644}
 		f.putFile(DeveloperModeMarkerPath, []byte("developer mode enabled by k3sm install on 2026-10-31T00:00:00Z\n"))
 		if err := resolveDeveloperMode(f, &cfg); err != nil {

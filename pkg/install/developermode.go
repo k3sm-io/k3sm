@@ -38,9 +38,11 @@ import (
 // the whole record; the content is never parsed.
 //
 // The marker counts only when it is a root-owned regular file nobody else
-// can write and that carries no ACL (DeveloperModeMarkerState). A marker that
-// fails any of those checks is reported as invalid and counts as absent, so
-// the checks stay on.
+// can write and that carries no ACL, and every directory above it, from /, is
+// a real directory held to the same owner, mode and ACL checks
+// (DeveloperModeMarkerState). It is the predicate k3sm.app applies before a
+// root step. A marker that fails any of those checks is reported as invalid
+// and counts as absent, so the checks stay on.
 
 // DeveloperModeMarkerPath is the developer-mode marker. k3sm.app hardcodes the same path.
 const DeveloperModeMarkerPath = "/Library/k3sm.developer-mode"
@@ -85,7 +87,8 @@ type DeveloperModeOptions struct {
 	// install shape. DeveloperModeOn writes the developer-mode marker
 	// (DeveloperModeMarkerPath) before the install root is swapped, leaves it
 	// there if the install then fails, and skips the --from-staging signing
-	// continuity check; DeveloperModeOff removes the marker;
+	// continuity check; DeveloperModeOff removes the marker once the swap has
+	// committed, so a failed install leaves it;
 	// DeveloperModeUnset keeps it as it is, except that an install from a
 	// staging directory whose staged k3sm and every other Mach-O carry the
 	// Developer ID signature of the team the continuity check requires
@@ -156,35 +159,69 @@ const (
 )
 
 // DeveloperModeFacts is what an lstat and an ACL probe say about the marker
-// path. Exists false means nothing is there; Err is a probe that failed for
-// any other reason.
+// path and the directories above it. Exists false means nothing is there; Err
+// is a probe that failed for any other reason.
 type DeveloperModeFacts struct {
 	Exists bool
+	Entry  OwnedEntry
+	HasACL bool
+	Err    error
+	// Ancestors describes every directory above the marker, from / down. It
+	// is read only for a marker that is a regular file without an ACL, and a
+	// marker with no ancestor described is invalid.
+	Ancestors []DeveloperModeAncestor
+}
+
+// DeveloperModeAncestor is what an lstat and an ACL probe say about one
+// directory above the marker. Err is a probe that failed, including a
+// directory that is not there.
+type DeveloperModeAncestor struct {
 	Entry  OwnedEntry
 	HasACL bool
 	Err    error
 }
 
 // DeveloperModeMarkerState judges the facts: on only for a regular file (not a
-// symlink) owned by uid 0, with no group or other write bit and no ACL.
+// symlink) owned by uid 0, with no group or other write bit and no ACL, under
+// directories that are each a real directory (not a symlink) owned by uid 0,
+// with no group or other write bit and no ACL.
 func DeveloperModeMarkerState(f DeveloperModeFacts) DeveloperModeState {
+	return developerModeState(f, 0)
+}
+
+// developerModeState is DeveloperModeMarkerState with every path owned by
+// owner. Only the on-disk test passes anything but root.
+func developerModeState(f DeveloperModeFacts, owner int) DeveloperModeState {
+	held := func(e OwnedEntry, acl bool) bool {
+		return e.UID == owner && e.Mode.Perm()&0o022 == 0 && !acl
+	}
 	switch {
 	case f.Err != nil:
 		return DeveloperModeInvalid
 	case !f.Exists:
 		return DeveloperModeAbsent
-	case f.Entry.Kind != EntryRegular,
-		f.Entry.UID != 0,
-		f.Entry.Mode.Perm()&0o022 != 0,
-		f.HasACL:
+	case f.Entry.Kind != EntryRegular, !held(f.Entry, f.HasACL), len(f.Ancestors) == 0:
 		return DeveloperModeInvalid
+	}
+	for _, a := range f.Ancestors {
+		if a.Err != nil || a.Entry.Kind != EntryDir || !held(a.Entry, a.HasACL) {
+			return DeveloperModeInvalid
+		}
 	}
 	return DeveloperModeMarkerOn
 }
 
-// ReadDeveloperModeFacts lstats the marker at path through sys and probes it
-// for an ACL. It never follows a symlink.
+// ReadDeveloperModeFacts lstats the marker at path and every directory above
+// it, from /, through sys, and probes each for an ACL. It never follows a
+// symlink.
 func ReadDeveloperModeFacts(sys System, path string) DeveloperModeFacts {
+	return readDeveloperModeFacts(sys, "/", path)
+}
+
+// readDeveloperModeFacts is ReadDeveloperModeFacts with the ancestors read
+// from root down instead of from /. Only the on-disk test passes a root other
+// than /, to judge a tree it can build without privilege.
+func readDeveloperModeFacts(sys System, root, path string) DeveloperModeFacts {
 	e, err := sys.Owner(path)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
@@ -196,8 +233,43 @@ func ReadDeveloperModeFacts(sys System, path string) DeveloperModeFacts {
 	if e.Kind != EntryRegular {
 		return f
 	}
-	f.HasACL, f.Err = sys.HasACL(path)
+	if f.HasACL, f.Err = sys.HasACL(path); f.Err != nil || f.HasACL {
+		return f
+	}
+	dirs, err := markerAncestors(root, path)
+	if err != nil {
+		f.Err = err
+		return f
+	}
+	for _, dir := range dirs {
+		a := DeveloperModeAncestor{}
+		a.Entry, a.Err = sys.Owner(dir)
+		if a.Err == nil && a.Entry.Kind == EntryDir {
+			a.HasACL, a.Err = sys.HasACL(dir)
+		}
+		f.Ancestors = append(f.Ancestors, a)
+	}
 	return f
+}
+
+// markerAncestors lists root and every directory below it down to path's
+// parent, in that order: /, /Library for the real marker.
+func markerAncestors(root, path string) ([]string, error) {
+	root = filepath.Clean(root)
+	rel, err := filepath.Rel(root, filepath.Dir(filepath.Clean(path)))
+	if err != nil || rel == ".." || strings.HasPrefix(rel, "../") || !filepath.IsAbs(root) {
+		return nil, fmt.Errorf("the developer-mode marker %s is not under %s", path, root)
+	}
+	dirs := []string{root}
+	if rel == "." {
+		return dirs, nil
+	}
+	cur := root
+	for _, c := range strings.Split(rel, "/") {
+		cur = filepath.Join(cur, c)
+		dirs = append(dirs, cur)
+	}
+	return dirs, nil
 }
 
 // ReadDeveloperModeState is DeveloperModeMarkerState of the marker at path.
@@ -240,35 +312,35 @@ func resolveDeveloperMode(sys System, cfg *Config) error {
 
 // applyDeveloperMode records the mode on disk, under the install lock and
 // before the install root is swapped: on writes the marker (and a failed
-// install leaves it), off removes it, and not passed keeps it unless the
-// --from-staging predicate found the whole staged tree signed by the k3sm team
-// (developerModeOff), which turns developer mode off. Not passed, it reads the
-// marker again first and refuses the install if that read differs from the
-// one the predicate acted on.
-func applyDeveloperMode(ctx context.Context, sys System, cfg Config) error {
+// install leaves it). A removal is only decided here and returned, for the
+// install to carry out once the swap has committed (markerRemoval.commit), so
+// a failed install leaves the marker as it was: off removes it, and not passed
+// removes it only when the --from-staging predicate found the whole staged
+// tree signed by the k3sm team (developerModeOff) or a plain install's k3sm is
+// team-signed (plainInstallTeam). Not passed, it reads the marker again first
+// and refuses the install if that read differs from the one the predicate
+// acted on.
+func applyDeveloperMode(ctx context.Context, sys System, cfg Config) (*markerRemoval, error) {
 	path := DeveloperModeMarkerPath
 	switch cfg.DeveloperMode {
 	case DeveloperModeOn:
 		if err := WriteDeveloperModeMarker(sys, path, time.Now()); err != nil {
-			return fmt.Errorf("install: %w", err)
+			return nil, fmt.Errorf("install: %w", err)
 		}
 		cfg.Logger.Warn("developer mode is on: the signature of the k3sm that runs as root is not checked", "marker", path)
-		return nil
+		return nil, nil
 	case DeveloperModeOff:
-		if err := RemoveDeveloperModeMarker(sys, path); err != nil {
-			return fmt.Errorf("install: %w", err)
-		}
-		return nil
+		return &markerRemoval{path: path}, nil
 	}
 	if cfg.Signer == nil {
-		return nil
+		return nil, nil
 	}
 	state := ReadDeveloperModeState(sys, path)
 	if cfg.preLockMarker != "" && state != cfg.preLockMarker {
-		return fmt.Errorf("install: %w: it was %s when the signing checks ran and is %s now; run the install again", ErrDeveloperModeChanged, cfg.preLockMarker, state)
+		return nil, fmt.Errorf("install: %w: it was %s when the signing checks ran and is %s now; run the install again", ErrDeveloperModeChanged, cfg.preLockMarker, state)
 	}
 	if state == DeveloperModeAbsent {
-		return nil
+		return nil, nil
 	}
 	team, keepReason := cfg.offTeam, cfg.keepReason
 	if cfg.FromStagingDir == "" {
@@ -277,19 +349,41 @@ func applyDeveloperMode(ctx context.Context, sys System, cfg Config) error {
 	if team == "" {
 		if state == DeveloperModeInvalid {
 			cfg.Logger.Warn("ignored invalid marker: it does not turn developer mode on, and it stays because "+keepReason, "marker", path)
-			return nil
+			return nil, nil
 		}
 		cfg.Logger.Warn("developer mode stays on: "+keepReason+"; run k3sm install --developer-mode off to turn it off", "marker", path)
+		return nil, nil
+	}
+	return &markerRemoval{path: path, team: team, invalid: state == DeveloperModeInvalid}, nil
+}
+
+// markerRemoval is a developer-mode marker removal applyDeveloperMode decided
+// on. team is the signing team that turned developer mode off, empty for
+// --developer-mode off; invalid says the marker was judged invalid.
+type markerRemoval struct {
+	path    string
+	team    string
+	invalid bool
+}
+
+// commit removes the marker. The install calls it once the swap has
+// committed, past the last step that can revert it, so a failed install
+// never leaves a build from source installed with developer mode turned off.
+// A nil removal does nothing.
+func (r *markerRemoval) commit(sys System, cfg Config) error {
+	if r == nil {
 		return nil
 	}
-	if err := RemoveDeveloperModeMarker(sys, path); err != nil {
-		return fmt.Errorf("install: %w", err)
+	if err := RemoveDeveloperModeMarker(sys, r.path); err != nil {
+		return fmt.Errorf("install: k3sm is installed, but %w; run k3sm install --developer-mode off", err)
 	}
-	if state == DeveloperModeInvalid {
-		cfg.Logger.Info("removed an invalid developer-mode marker by a signed install", "team-id", team, "marker", path)
-		return nil
+	switch {
+	case r.team == "":
+	case r.invalid:
+		cfg.Logger.Info("removed an invalid developer-mode marker by a signed install", "team-id", r.team, "marker", r.path)
+	default:
+		cfg.Logger.Info("developer mode turned off by a signed install", "team-id", r.team, "marker", r.path)
 	}
-	cfg.Logger.Info("developer mode turned off by a signed install", "team-id", team, "marker", path)
 	return nil
 }
 

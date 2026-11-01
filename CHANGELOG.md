@@ -95,6 +95,11 @@ pin, its date, and the tarball's sha256.
   through that path, so an install directory that is itself a symlink is not followed again by
   each check, and a binary that does not sit in that directory once evaluated is refused. A
   missing entry point is still taken as no install, as is one under a dangling directory link.
+- The developer-mode marker counts only when `/` and `/Library` are real directories owned by
+  root that neither group nor others can write and that carry no ACL, the same checks k3sm.app
+  applies, so the installer and the app agree on whether developer mode is on. An install
+  that turns developer mode off removes the marker only once the new install root is in
+  place, so a failed install leaves developer mode as it was.
 - `k3sm uninstall` stops a vm pod helper still running from an older k3sm version whose
   directory is kept for it, as it stops every other helper, instead of reporting it as a
   leftover to kill by hand. Only a helper whose version directory is gone is still reported.

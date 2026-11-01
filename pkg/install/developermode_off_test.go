@@ -36,6 +36,7 @@ func devModeStagedInstall(t *testing.T, signer fakeSigner) (*fakeSystem, Config,
 	var logs strings.Builder
 	cfg.Logger = slog.New(slog.NewTextHandler(&logs, nil))
 	f := &fakeSystem{owners: map[string]OwnedEntry{}}
+	seedMarkerAncestors(f)
 	f.owners[DeveloperModeMarkerPath] = OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: 0o644}
 	f.putFile(DeveloperModeMarkerPath, []byte("developer mode enabled by k3sm install on 2026-10-31T00:00:00Z\n"))
 	if err := resolveDeveloperMode(f, &cfg); err != nil {
@@ -89,8 +90,15 @@ func TestDeveloperModeOffNeedsTheWholeTree(t *testing.T) {
 			if err := preflightFromStaging(context.Background(), &cfg); err != nil {
 				t.Fatalf("preflightFromStaging = %v, want accepted in developer mode", err)
 			}
-			if err := applyDeveloperMode(context.Background(), f, cfg); err != nil {
+			removal, err := applyDeveloperMode(context.Background(), f, cfg)
+			if err != nil {
 				t.Fatalf("applyDeveloperMode = %v", err)
+			}
+			if _, ok := f.files[DeveloperModeMarkerPath]; !ok {
+				t.Fatal("applyDeveloperMode removed the marker before the swap committed")
+			}
+			if err := removal.commit(f, cfg); err != nil {
+				t.Fatalf("commit = %v", err)
 			}
 			_, kept := f.files[DeveloperModeMarkerPath]
 			if kept == tc.wantRemove {
@@ -136,7 +144,7 @@ func TestDeveloperModeMarkerChangedUnderTheLock(t *testing.T) {
 			}
 			tc.change(f)
 			f.calls = nil
-			err := applyDeveloperMode(context.Background(), f, cfg)
+			_, err := applyDeveloperMode(context.Background(), f, cfg)
 			if !errors.Is(err, ErrDeveloperModeChanged) {
 				t.Fatalf("applyDeveloperMode = %v, want %v", err, ErrDeveloperModeChanged)
 			}
@@ -153,6 +161,7 @@ func TestDeveloperModeMarkerChangedUnderTheLock(t *testing.T) {
 		_, cfg := stagedFixture()
 		cfg.Signer = fakeSigner{ids: signedTree(map[string]string{installed: testTeamID})}
 		f := &fakeSystem{owners: map[string]OwnedEntry{}}
+		seedMarkerAncestors(f)
 		if err := resolveDeveloperMode(f, &cfg); err != nil {
 			t.Fatal(err)
 		}
@@ -160,7 +169,7 @@ func TestDeveloperModeMarkerChangedUnderTheLock(t *testing.T) {
 			t.Fatal(err)
 		}
 		f.owners[DeveloperModeMarkerPath] = OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: 0o644}
-		if err := applyDeveloperMode(context.Background(), f, cfg); !errors.Is(err, ErrDeveloperModeChanged) {
+		if _, err := applyDeveloperMode(context.Background(), f, cfg); !errors.Is(err, ErrDeveloperModeChanged) {
 			t.Fatalf("applyDeveloperMode = %v, want %v", err, ErrDeveloperModeChanged)
 		}
 	})
@@ -171,7 +180,7 @@ func TestDeveloperModeMarkerChangedUnderTheLock(t *testing.T) {
 		if err := preflightFromStaging(context.Background(), &cfg); err != nil {
 			t.Fatal(err)
 		}
-		if err := applyDeveloperMode(context.Background(), f, cfg); err != nil {
+		if _, err := applyDeveloperMode(context.Background(), f, cfg); err != nil {
 			t.Fatalf("applyDeveloperMode = %v, want accepted", err)
 		}
 	})
