@@ -40,6 +40,9 @@ type fakePurge struct {
 	stats map[string]PathStat
 	// resolved answers ResolvePath; an absent key resolves to itself.
 	resolved map[string]string
+	// gone makes ResolvePath fail with fs.ErrNotExist for a path under any
+	// of its keys: a directory that no longer exists.
+	gone map[string]bool
 	// links answers Readlink; an absent key is not a symlink that exists.
 	links map[string]string
 	// markers answers ReadDataRootMarker; markerErrs overrides it.
@@ -130,6 +133,11 @@ func (f *fakeSystem) putMarker(dir string, facts dataroot.MarkerFacts) {
 
 func (f *fakeSystem) ResolvePath(path string) (string, error) {
 	f.calls = append(f.calls, "ResolvePath:"+path)
+	for dir := range f.purge.gone {
+		if path == dir || strings.HasPrefix(path, dir+"/") {
+			return "", &fs.PathError{Op: "lstat", Path: dir, Err: fs.ErrNotExist}
+		}
+	}
 	if r, ok := f.purge.resolved[path]; ok {
 		return r, nil
 	}

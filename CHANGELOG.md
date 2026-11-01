@@ -73,6 +73,10 @@ pin, its date, and the tarball's sha256.
 
 ### Fixed
 
+- `k3sm uninstall` stops a vm pod helper still running from an older k3sm version whose
+  directory is kept for it, as it stops every other helper, instead of reporting it as a
+  leftover to kill by hand. Only a helper whose version directory is gone is still reported.
+
 - A blob HEAD on the k3sm registry server restarts the blob's garbage-collection grace, so a
   client that skips an upload because the blob is already there no longer loses it to a sweep
   before its manifest PUT.
