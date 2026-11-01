@@ -30,7 +30,7 @@ GV_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # bump is one edit and every caller follows it.
 gv_pin() {
 	local ci="$GV_LIB_DIR/../ci.sh" v
-	v="$(sed -n 's/^GOVULNCHECK_VERSION=\(v[^[:space:]#]*\).*/\1/p' "$ci" 2>/dev/null | head -1)"
+	v="$(sed -n 's/^GOVULNCHECK_VERSION=\(v[^[:space:]#]*\).*/\1/p' "$ci" 2>/dev/null | sed -n 1p)"
 	[ -n "$v" ] || { echo "govulncheck: cannot read the GOVULNCHECK_VERSION pin from $ci" >&2; return 1; }
 	printf '%s\n' "$v"
 }
@@ -44,7 +44,7 @@ gv_find() {
 	for c in "$(command -v govulncheck 2>/dev/null || true)" "$(go env GOPATH 2>/dev/null)/bin/govulncheck"; do
 		[ -n "$c" ] && [ -x "$c" ] && [ "$c" != "$prev" ] || continue
 		prev="$c"
-		v="$("$c" -version 2>/dev/null | sed -n 's/^Scanner: govulncheck@//p' | head -1)" || v=""
+		v="$("$c" -version 2>/dev/null | sed -n 's/^Scanner: govulncheck@//p' | sed -n 1p)" || v=""
 		if [ "$v" = "$pin" ]; then
 			printf '%s\n' "$c"
 			return 0

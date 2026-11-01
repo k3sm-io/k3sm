@@ -3,7 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # No hack/ script pipes a producer into an early-exiting grep -q, head,
-# grep -m or grep -l (the last three only in scripts that set pipefail).
+# grep -m or grep -l (the last three only in scripts that set pipefail, or
+# that a script setting pipefail sources: pipefail is shell-global).
 #
 # Under set -o pipefail, `producer | grep -q pattern` can fail on a run that
 # matched: grep exits at its first match, the producer's next write takes
@@ -24,14 +25,18 @@
 #               continuations, `command grep`, --quiet, a heredoc payload, a
 #               double-quoted remote command) and passes each shape in
 #               testdata/B1080/clean.txt (a here-string, grep -c, grep -v,
-#               `||`, a quoted or commented pipeline)
+#               `||`, a quoted or commented pipeline), reds on the libraries
+#               a strict script sources in testdata/B1080/sourced-strict.txt
+#               (through $HERE, then $REPO_ROOT), and passes the same
+#               libraries in sourced-loose.txt, where no script sets pipefail
 #   transcript  a `go test -v` style transcript over 64 KiB, more than a pipe
 #               buffer holds, is matched through a here-string under pipefail
 #               at its first line and its last, and a name it lacks is not
 #
 # The scanner reads lines, not a parse tree. A pipeline inside single quotes
 # (an awk program, a string handed to eval) or one assembled at run time is
-# not seen.
+# not seen, and neither is a library sourced through a path that is only a
+# variable ("$LIB").
 #
 # Usage: hack/acceptance/B1080.sh --check
 set -euo pipefail
@@ -109,19 +114,88 @@ list_scripts() {
 	done <<<"$files"
 }
 
+# sourced <file>: the repo-relative paths of the files <file> sources (a
+# `source` or `.` line), normalized. A path rooted at $REPO_ROOT, $K3SM_ROOT
+# or $ROOT, or a literal hack/... path, resolves against the repo root; one
+# rooted at any other variable ($HERE, $LIB_DIR, ...) or a bare relative path
+# resolves against <file>'s directory, the way the scripts set those
+# variables. A path that is only a variable ("$LIB", "$1") is not resolved.
+# shellcheck disable=SC2016 # an awk program: awk expands its own $ fields
+SOURCED_AWK='
+function norm(p,   n, a, out, k, i) {
+	n = split(p, a, "/"); k = 0
+	for (i = 1; i <= n; i++) {
+		if (a[i] == "" || a[i] == ".") continue
+		if (a[i] == ".." && k > 0 && out[k] != "..") { k--; continue }
+		out[++k] = a[i]
+	}
+	p = ""
+	for (i = 1; i <= k; i++) p = p (i > 1 ? "/" : "") out[i]
+	return p
+}
+{
+	t = $0
+	sub(/^[ \t]*/, "", t)
+	if (t !~ /^(source|\.)[ \t]+[^ \t]/) next
+	sub(/^(source|\.)[ \t]+/, "", t)
+	sub(/[ \t;].*$/, "", t)
+	gsub(/["\047]/, "", t)
+	if (t ~ /^\$\{?(REPO_ROOT|K3SM_ROOT|ROOT)\}?\//) { sub(/^[^\/]*\//, "", t); base = "" }
+	else if (t ~ /^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?\//) { sub(/^[^\/]*\//, "", t); base = dir }
+	else if (t ~ /^hack\//) base = ""
+	else if (t !~ /[$`]/ && t !~ /^\//) base = dir
+	else next
+	if (t ~ /[$`]/) next
+	print norm(base == "" ? t : base "/" t)
+}'
+
 # scan <dir> <list>: run SCAN_AWK over the files named in <list>, relative to
-# <dir>. Prints the hits; returns non-zero only when awk fails.
+# <dir>. A file is strict when it sets pipefail itself, or when a strict file
+# in <list> sources it: pipefail is shell-global, so a sourced library runs
+# under the options of the script that sourced it. Prints the hits; returns
+# non-zero only when awk fails.
 scan() {
-	local dir="$1" list="$2" f strict
+	local dir="$1" list="$2" f g strict changed
 	(
 		cd "$dir" || exit 1
+		strict_set=" "
+		while IFS= read -r f; do
+			[ -n "$f" ] || continue
+			grep -Eq '^[^#]*pipefail' "$f" && strict_set+="$f "
+		done < "$list"
+		changed=1
+		while [ "$changed" = 1 ]; do
+			changed=0
+			for f in $strict_set; do
+				while IFS= read -r g; do
+					[ -n "$g" ] || continue
+					case "$strict_set" in *" $g "*) continue ;; esac
+					grep -Fxq -- "$g" "$list" || continue
+					strict_set+="$g "; changed=1
+				done <<<"$(awk -v dir="$(dirname "$f")" "$SOURCED_AWK" "$f")"
+			done
+		done
 		while IFS= read -r f; do
 			[ -n "$f" ] || continue
 			strict=0
-			grep -Eq '^[^#]*pipefail' "$f" && strict=1
+			case "$strict_set" in *" $f "*) strict=1 ;; esac
 			awk -v strict="$strict" "$SCAN_AWK" "$f" || exit 1
 		done < "$list"
 	)
+}
+
+# plant_tree <fixture> <root>: write the files a tree fixture holds under <root>.
+# A line `== <path>` starts the file at <path>; lines before the first are
+# comments. Prints the paths, one per line.
+plant_tree() {
+	local fixture="$1" root="$2" line out=""
+	while IFS= read -r line || [ -n "$line" ]; do
+		case "$line" in
+		'== '*) out="${line#== }"; mkdir -p "$root/$(dirname "$out")"; : > "$root/$out"; echo "$out"; continue ;;
+		esac
+		[ -n "$out" ] || continue
+		printf '%s\n' "$line" >> "$root/$out"
+	done < "$fixture"
 }
 
 # blocks <fixture> <prefix>: split a fixture into one planted script per
@@ -189,6 +263,23 @@ printf '#!/bin/sh\nset -o pipefail\nfoo | grep -q x\n' > "$tmp/tree/hack/bin/fak
 printf 'foo | grep -q x\n' > "$tmp/tree/hack/bin/notes.txt"
 list_scripts "$tmp/tree" > "$tmp/tree.list" || s2=no
 [ "$(cat "$tmp/tree.list")" = "hack/bin/fake" ] || { echo "    the lister found '$(tr '\n' ' ' < "$tmp/tree.list")', want hack/bin/fake" >&2; s2=no; }
+# A library a strict script sources inherits pipefail: its early-exit reader
+# reds, though the library never sets pipefail itself. The same library sourced
+# only by a script without pipefail passes.
+for t in sourced-strict sourced-loose; do
+	mkdir -p "$tmp/$t"
+	plant_tree "$FIXTURES/$t.txt" "$tmp/$t" > "$tmp/$t.list" || s2=no
+	hit="$(scan "$tmp/$t" "$tmp/$t.list")" || { echo "    the scanner failed on $t" >&2; s2=no; }
+	case "$t" in
+	sourced-strict)
+		for want in hack/x/lib/reader.sh hack/x/lib/inner.sh; do
+			grep -Fq -- "$want:" <<<"$hit" || { echo "    the scanner passed $want, sourced by a strict script" >&2; s2=no; }
+		done
+		[ "$(grep -c . <<<"$hit")" = 2 ] || { echo "    $t: want 2 hits, got: $hit" >&2; s2=no; } ;;
+	sourced-loose)
+		[ -z "$hit" ] || { echo "    the scanner flagged a library no strict script sources: $hit" >&2; s2=no; } ;;
+	esac
+done
 echo "    $nred offending and $nclean clean shapes"
 ladder "$s2" "the scanner reds on every planted offending shape and passes every clean one"
 

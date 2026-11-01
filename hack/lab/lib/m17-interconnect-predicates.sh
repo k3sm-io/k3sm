@@ -335,8 +335,8 @@ icp_netd_verbs_closed() {
 # error otherwise. Always prints the verdict; non-zero unless minor2.
 icp_helper_verdict() {
 	local major minor
-	major="$(grep -o '"major":[0-9]*' "$1" 2>/dev/null | head -1 | cut -d: -f2)"
-	minor="$(grep -o '"minor":[0-9]*' "$1" 2>/dev/null | head -1 | cut -d: -f2)"
+	major="$(grep -o '"major":[0-9]*' "$1" 2>/dev/null | sed -n 1p | cut -d: -f2)"
+	minor="$(grep -o '"minor":[0-9]*' "$1" 2>/dev/null | sed -n 1p | cut -d: -f2)"
 	if [ "$major" = 1 ] && [ -n "$minor" ]; then
 		if [ "$minor" -ge 2 ]; then
 			echo minor2
