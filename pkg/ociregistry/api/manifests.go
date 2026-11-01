@@ -207,15 +207,15 @@ func subjectOf(sub *ispec.Descriptor, out *checkedManifest) error {
 // putManifest is a manifest PUT by tag or by digest, with ?tag= values for a
 // digest PUT.
 func (s *Server) putManifest(w http.ResponseWriter, r *http.Request, n ref.Name) {
+	if !s.allow(w, r, VerbWrite, n) {
+		return
+	}
 	rf, err := parseReference(r)
 	if err != nil {
 		if errors.Is(err, ref.ErrInvalidTag) {
 			err = manifestInvalid("invalid tag")
 		}
 		s.fail(w, r, err)
-		return
-	}
-	if !s.allow(w, r, VerbWrite, n) {
 		return
 	}
 	tags := r.URL.Query()["tag"]

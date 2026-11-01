@@ -73,11 +73,11 @@ func (s *Server) getBlob(w http.ResponseWriter, r *http.Request, n ref.Name) {
 // deleteBlob refuses: blobs leave the store through garbage collection only,
 // which is the one place that knows whether a manifest still names them.
 func (s *Server) deleteBlob(w http.ResponseWriter, r *http.Request, n ref.Name) {
-	if _, err := ref.ParseDigest(mux.Vars(r)["digest"]); err != nil {
-		s.fail(w, r, err)
+	if !s.allow(w, r, VerbDelete, n) {
 		return
 	}
-	if !s.allow(w, r, VerbDelete, n) {
+	if _, err := ref.ParseDigest(mux.Vars(r)["digest"]); err != nil {
+		s.fail(w, r, err)
 		return
 	}
 	s.writeError(w, r, errorf(http.StatusMethodNotAllowed, codeUnsupported, "blobs are removed by garbage collection"))

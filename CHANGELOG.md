@@ -45,6 +45,13 @@ pin, its date, and the tarball's sha256.
   referrers. It requires an access policy, caps each upload's size and the free space it
   may use, and cuts off request bodies that stall or trickle. It is not yet the server the
   daemon runs.
+- The new registry server has its access policy: reads are anonymous; the local push credential
+  may push, tag and delete; the push gate's credential may push but never delete. It checks a
+  presented secret against the SHA-256 hash the server writes on every start into
+  `<work-dir>/registry-state/serve.json` (mode `0600`), so no htpasswd file and no bcrypt are
+  involved, and it answers `401` with a Basic challenge to an anonymous write or a credential that
+  does not check out, `403` to a credential without the permission, and `429` to a client address
+  that has used up its budget of failed attempts. `push-credential.json` is unchanged.
 
 ### Changed
 
