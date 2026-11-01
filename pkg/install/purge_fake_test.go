@@ -43,6 +43,9 @@ type fakePurge struct {
 	// gone makes ResolvePath fail with fs.ErrNotExist for a path under any
 	// of its keys: a directory that no longer exists.
 	gone map[string]bool
+	// resolveErrs makes ResolvePath fail with its value for a path under any
+	// of its keys: a directory that exists but cannot be read (EACCES, EIO).
+	resolveErrs map[string]error
 	// links answers Readlink; an absent key is not a symlink that exists.
 	links map[string]string
 	// markers answers ReadDataRootMarker; markerErrs overrides it.
@@ -136,6 +139,11 @@ func (f *fakeSystem) ResolvePath(path string) (string, error) {
 	for dir := range f.purge.gone {
 		if path == dir || strings.HasPrefix(path, dir+"/") {
 			return "", &fs.PathError{Op: "lstat", Path: dir, Err: fs.ErrNotExist}
+		}
+	}
+	for dir, err := range f.purge.resolveErrs {
+		if path == dir || strings.HasPrefix(path, dir+"/") {
+			return "", &fs.PathError{Op: "lstat", Path: dir, Err: err}
 		}
 	}
 	if r, ok := f.purge.resolved[path]; ok {
