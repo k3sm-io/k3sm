@@ -95,16 +95,24 @@ func (s *Server) blobModTime(n ref.Name, d digest.Digest) (time.Time, error) {
 
 // headTouch restarts blob d's GC grace in n for a HEAD. A blob GC removed
 // since the HEAD read it is ErrBlobUnknown, which the HEAD answers with 404;
-// any other failure (a read-only or degraded store, a client gone while the
-// lock was held) is logged and the HEAD is answered as if the touch were
-// made: the touch only protects a push that may follow, and the read itself
-// succeeded.
+// any other failure (a read-only or degraded store, a client gone while it
+// waited for the lock) is logged and the HEAD is answered as if the touch
+// were made: the touch only protects a push that may follow, and the read
+// itself succeeded. After such a failure the object is not touched again, and
+// its lock not taken, for half the grace, and the failure is logged once for
+// that window rather than once per HEAD.
 func (s *Server) headTouch(ctx context.Context, n ref.Name, d digest.Digest) error {
+	k := touchKey{repo: n.String(), digest: d}
+	if s.touchFails.suppressed(k, s.now()) {
+		return nil
+	}
 	err := s.st.TouchBlob(ctx, n, d)
 	if err == nil || errors.Is(err, store.ErrBlobUnknown) {
 		return err
 	}
-	s.log.Warn("registry head: grace touch failed, answering the HEAD", "repository", n.String(), "digest", d.String(), "err", err)
+	s.touchFails.add(k, s.now().Add(s.gcGrace/2))
+	s.log.Warn("registry head: grace touch failed, answering the HEAD; no touch of this object for half the grace",
+		"repository", n.String(), "digest", d.String(), "suppress_for", s.gcGrace/2, "err", err)
 	return nil
 }
 

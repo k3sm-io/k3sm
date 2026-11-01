@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 
@@ -71,7 +72,7 @@ func FuzzHandlers(f *testing.F) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		srv, err := New(Config{Store: st, Authorize: AllowAll, FreeSpace: func() (uint64, error) { return 1 << 40, nil }})
+		srv, err := New(Config{Store: st, GCGrace: time.Hour, Authorize: AllowAll, FreeSpace: func() (uint64, error) { return 1 << 40, nil }})
 		if err != nil {
 			t.Fatal(err)
 		}

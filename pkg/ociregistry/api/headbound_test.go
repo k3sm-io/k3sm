@@ -24,6 +24,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -168,7 +171,7 @@ func TestManifestHeadTouchIsBounded(t *testing.T) {
 		}
 	})
 
-	t.Run("a HEAD still answers 200 when Futimes fails", func(t *testing.T) {
+	t.Run("HEADs on a failing store answer 200, take the lock once and log once", func(t *testing.T) {
 		var logs bytes.Buffer
 		var mu sync.Mutex
 		f := newFixture(t, withGrace, func(c *Config) {
@@ -179,20 +182,97 @@ func TestManifestHeadTouchIsBounded(t *testing.T) {
 		f.age(t, "app", old, md, ld)
 		calls := 0
 		f.st.SetFutimes(func(*os.File, time.Time) error { calls++; return syscall.EROFS })
-		w := f.do(http.MethodHead, "/v2/app/manifests/"+md.String(), nil)
-		want(t, w, http.StatusOK, "")
-		if got := w.Header().Get("Docker-Content-Digest"); got != md.String() {
-			t.Errorf("HEAD Docker-Content-Digest %q, want %s", got, md)
+		for range 5 {
+			w := f.do(http.MethodHead, "/v2/app/manifests/"+md.String(), nil)
+			want(t, w, http.StatusOK, "")
+			if got := w.Header().Get("Docker-Content-Digest"); got != md.String() {
+				t.Errorf("HEAD Docker-Content-Digest %q, want %s", got, md)
+			}
+			want(t, f.do(http.MethodHead, "/v2/app/blobs/"+ld.String(), nil), http.StatusOK, "")
 		}
-		want(t, f.do(http.MethodHead, "/v2/app/blobs/"+ld.String(), nil), http.StatusOK, "")
+		// futimes runs under the lock, so one call per object is one lock.
 		if calls != 2 {
-			t.Errorf("futimes called %d times, want 2 (the touch was not attempted)", calls)
+			t.Errorf("futimes called %d times over 5 HEADs of each object, want 2 (one per object)", calls)
 		}
+		// Later HEADs inside the window take no lock at all.
+		release := f.holdLock(t, "app")
+		want(t, f.headNoLock(t, "/v2/app/manifests/"+md.String(), release), http.StatusOK, "")
+		want(t, f.headNoLock(t, "/v2/app/blobs/"+ld.String(), release), http.StatusOK, "")
+		release()
 		mu.Lock()
 		got := logs.String()
 		mu.Unlock()
 		if n := strings.Count(got, "grace touch failed"); n != 2 {
 			t.Errorf("logged %d failed touches, want 2; log:\n%s", n, got)
+		}
+	})
+
+	t.Run("a HEAD that gives up waiting for the lock is suppressed like a failed touch", func(t *testing.T) {
+		var logs bytes.Buffer
+		var mu sync.Mutex
+		f := newFixture(t, withGrace, func(c *Config) {
+			c.Logger = slog.New(slog.NewTextHandler(&lockedWriter{w: &logs, mu: &mu}, nil))
+		})
+		md, _ := untagged(t, f, "wait-layer")
+		f.age(t, "app", time.Now().Add(-2*grace), md)
+		release := f.holdLock(t, "app")
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		defer cancel()
+		want(t, f.serve(req(http.MethodHead, "/v2/app/manifests/"+md.String(), nil).WithContext(ctx)), http.StatusOK, "")
+		for range 3 {
+			want(t, f.headNoLock(t, "/v2/app/manifests/"+md.String(), release), http.StatusOK, "")
+		}
+		release()
+		mu.Lock()
+		got := logs.String()
+		mu.Unlock()
+		if n := strings.Count(got, "grace touch failed"); n != 1 {
+			t.Errorf("logged %d failed touches, want 1; log:\n%s", n, got)
+		}
+	})
+
+	t.Run("a zero or negative grace makes New fail", func(t *testing.T) {
+		st, err := store.OpenWorkDir(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, g := range []time.Duration{0, -time.Second} {
+			if _, err := New(Config{Store: st, Authorize: AllowAll, GCGrace: g}); err == nil {
+				t.Errorf("New allowed a server with GC grace %s", g)
+			}
+		}
+	})
+
+	t.Run("a digest with both a tagged and an untagged row writes nothing", func(t *testing.T) {
+		f := newFixture(t, withGrace)
+		md := dg(f.image(t, "app", "v1", "both-layer"))
+		p := filepath.Join(f.root, "app", "index.json")
+		b, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var idx ispec.Index
+		if err := json.Unmarshal(b, &idx); err != nil {
+			t.Fatal(err)
+		}
+		i := slices.IndexFunc(idx.Manifests, func(d ispec.Descriptor) bool { return d.Digest == md })
+		row := idx.Manifests[i]
+		row.Annotations = nil
+		// The untagged row first, so the HEAD resolves to it.
+		idx.Manifests = append([]ispec.Descriptor{row}, idx.Manifests...)
+		if b, err = json.Marshal(idx); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		old := time.Now().Add(-2 * grace).Truncate(time.Second)
+		f.age(t, "app", old, md)
+		release := f.holdLock(t, "app")
+		want(t, f.headNoLock(t, "/v2/app/manifests/"+md.String(), release), http.StatusOK, "")
+		release()
+		if got := f.mtime(t, "app", md); !got.Equal(old) {
+			t.Errorf("manifest with a tagged row has mtime %s after a HEAD by digest, want %s", got, old)
 		}
 	})
 
@@ -217,6 +297,35 @@ func TestManifestHeadTouchIsBounded(t *testing.T) {
 			want(t, f.do(http.MethodGet, "/v2/app/blobs/"+d.String(), nil), http.StatusOK, "")
 		}
 	})
+}
+
+// TestTouchFailsIsBounded pins the suppression map's bound: past max entries
+// the one whose window ends first is evicted, and a closed window is
+// forgotten.
+func TestTouchFailsIsBounded(t *testing.T) {
+	now := time.Now()
+	tf := newTouchFails(3)
+	key := func(i int) touchKey { return touchKey{repo: "app", digest: digest.FromString(strconv.Itoa(i))} }
+	for i := range 4 {
+		tf.add(key(i), now.Add(time.Duration(i+1)*time.Minute))
+	}
+	if len(tf.until) != 3 {
+		t.Fatalf("map holds %d entries, want 3", len(tf.until))
+	}
+	if tf.suppressed(key(0), now) {
+		t.Error("the entry whose window ends first was not evicted")
+	}
+	for i := 1; i < 4; i++ {
+		if !tf.suppressed(key(i), now) {
+			t.Errorf("entry %d not suppressed inside its window", i)
+		}
+	}
+	if tf.suppressed(key(1), now.Add(2*time.Minute)) {
+		t.Error("entry 1 still suppressed at the end of its window")
+	}
+	if _, ok := tf.until[key(1)]; ok {
+		t.Error("a closed window was not forgotten")
+	}
 }
 
 // lockedWriter serialises writes to w under mu.

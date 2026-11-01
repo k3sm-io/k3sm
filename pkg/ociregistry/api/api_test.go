@@ -31,6 +31,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/opencontainers/go-digest"
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -52,7 +53,7 @@ func newFixture(t testing.TB, opts ...func(*Config)) *fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := Config{Store: st, Authorize: AllowAll, FreeSpace: func() (uint64, error) { return 1 << 40, nil }}
+	cfg := Config{Store: st, Authorize: AllowAll, GCGrace: time.Hour, FreeSpace: func() (uint64, error) { return 1 << 40, nil }}
 	for _, o := range opts {
 		o(&cfg)
 	}
