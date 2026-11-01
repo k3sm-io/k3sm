@@ -372,26 +372,43 @@ type markerRemoval struct {
 	savedMode fs.FileMode
 }
 
+// markerDisownUID is nobody (uid -2 on macOS). A marker that cannot be
+// removed is handed to it, which the predicate reads as invalid.
+const markerDisownUID = 0xFFFFFFFE
+
 // drop removes the marker. The install calls it the moment the swap has
 // committed and before the daemons are wired and restarted, so the app's root
-// steps never read developer mode as on beside the signed tree. A valid
-// marker is read first, without following a symlink, and kept for restore; a
-// marker that cannot be read is left in place. A failure is returned for the
-// install to report once it has finished; nil does nothing.
+// steps never read developer mode as on beside the signed tree. It fails
+// toward developer mode off, never on:
+//   - A valid marker is read first, without following a symlink, and kept for
+//     restore. If it cannot be read it is removed anyway, so a rollback
+//     leaves developer mode off, and the read error is returned.
+//   - A removal that fails is tried once more, then the marker is handed to
+//     nobody (Chown, which never follows a symlink), so it reads invalid. An
+//     error naming the remedy is returned only if it still reads on.
+//
+// The install reports what drop returns once it has finished; nil does nothing.
 func (r *markerRemoval) drop(sys System, cfg Config) error {
 	if r == nil {
 		return nil
 	}
+	var readErr error
 	if ReadDeveloperModeState(sys, r.path) == DeveloperModeMarkerOn {
 		content, mode, err := sys.ReadRegularFileWithMode(r.path)
 		if err != nil {
-			return fmt.Errorf("install: k3sm is installed, but the developer-mode marker %s could not be read to keep a copy for a rollback, so it was left in place (%w); run k3sm install --developer-mode off", r.path, err)
+			readErr = fmt.Errorf("install: the developer-mode marker %s could not be read to keep a copy, so it is removed without one and a rollback leaves developer mode off: %w", r.path, err)
+			cfg.Logger.Warn("the developer-mode marker could not be read to keep a copy; removing it anyway, so a rollback leaves developer mode off", "marker", r.path, "err", err)
+		} else {
+			r.saved, r.savedMode = content, mode.Perm()
 		}
-		r.saved, r.savedMode = content, mode.Perm()
 	}
-	if err := RemoveDeveloperModeMarker(sys, r.path); err != nil {
+	err := RemoveDeveloperModeMarker(sys, r.path)
+	if err != nil {
+		err = RemoveDeveloperModeMarker(sys, r.path)
+	}
+	if err != nil {
 		r.saved = nil
-		return fmt.Errorf("install: k3sm is installed, but %w; run k3sm install --developer-mode off", err)
+		return errors.Join(readErr, r.disown(sys, cfg, err))
 	}
 	r.removed = true
 	switch {
@@ -401,19 +418,37 @@ func (r *markerRemoval) drop(sys System, cfg Config) error {
 	default:
 		cfg.Logger.Info("developer mode turned off by a signed install", "team-id", r.team, "marker", r.path)
 	}
-	return nil
+	return readErr
 }
 
-// restore puts back the valid marker drop removed, with its bytes and mode,
-// through the root-only temp-and-rename write. revertInstallRoot calls it once
-// the previous tree is live again, so a build from source that is rolled back
-// to stays in developer mode. An invalid marker is not restored: it counted as
-// absent. Failures are logged, never returned: the install is already failing.
+// disown is drop's fallback for a marker that could not be removed: it hands
+// a regular file at the path to nobody, then reads the marker again. It
+// returns an error with the remedy only when the marker still reads on.
+func (r *markerRemoval) disown(sys System, cfg Config, removeErr error) error {
+	chownErr := errors.New("it is not a regular file")
+	if e, err := sys.Owner(r.path); err != nil {
+		chownErr = err
+	} else if e.Kind == EntryRegular {
+		chownErr = sys.Chown(r.path, markerDisownUID, e.GID)
+	}
+	if state := ReadDeveloperModeState(sys, r.path); state != DeveloperModeMarkerOn {
+		cfg.Logger.Warn("the developer-mode marker could not be removed; it now reads "+string(state)+" and does not turn developer mode on", "marker", r.path, "err", removeErr)
+		return nil
+	}
+	return fmt.Errorf("install: k3sm is installed, but %w, and handing the marker to nobody failed too (%v), so developer mode is still on; run k3sm install --developer-mode off", removeErr, chownErr)
+}
+
+// restore puts back the valid marker drop removed, with its bytes and its mode
+// without the group and other write bits, through the root-only
+// temp-and-rename write. revertInstallRoot calls it once the previous tree is
+// live again, so a build from source that is rolled back to stays in developer
+// mode. An invalid marker, or one drop could not read, is not restored.
+// Failures are logged, never returned: the install is already failing.
 func (r *markerRemoval) restore(sys System, cfg Config) {
 	if r == nil || !r.removed || r.saved == nil {
 		return
 	}
-	if err := sys.WriteRootOnlyFile(r.path, r.saved, r.savedMode); err != nil {
+	if err := sys.WriteRootOnlyFile(r.path, r.saved, r.savedMode&^0o022); err != nil {
 		cfg.Logger.Warn("the developer-mode marker could not be restored with the rolled-back install root; run k3sm install --developer-mode on to turn developer mode on again", "marker", r.path, "err", err)
 		return
 	}

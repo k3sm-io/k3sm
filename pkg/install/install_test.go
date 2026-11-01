@@ -270,6 +270,10 @@ type fakeSystem struct {
 	removeEntryErrs map[string]error
 	// kubeconfigErr is the failure WriteUserKubeconfig returns.
 	kubeconfigErr error
+	// readModeErrs[path] is the failure ReadRegularFileWithMode returns.
+	readModeErrs map[string]error
+	// chownErrs[path] is the failure Chown returns, leaving the owner as it was.
+	chownErrs map[string]error
 	// space is what InstallSpace answers: free bytes, then needed bytes. Nil —
 	// the zero value — is a volume with room for anything, so only a test about
 	// the preflight has to state a number.
@@ -453,6 +457,9 @@ func (f *fakeSystem) ListOwned(dir string) ([]OwnedEntry, error) {
 // states, and the one thing a caller could quietly get wrong.
 func (f *fakeSystem) Chown(path string, uid, gid int) error {
 	f.calls = append(f.calls, fmt.Sprintf("Chown:%s:%d:%d", path, uid, gid))
+	if err, ok := f.chownErrs[path]; ok {
+		return err
+	}
 	e, ok := f.owners[path]
 	if !ok {
 		return fmt.Errorf("lchown %s: %w", path, fs.ErrNotExist)
@@ -711,6 +718,9 @@ func (f *fakeSystem) ReadRegularFile(path string) ([]byte, error) {
 // call, matching one real open(2).
 func (f *fakeSystem) ReadRegularFileWithMode(path string) ([]byte, fs.FileMode, error) {
 	f.calls = append(f.calls, "ReadRegularFileWithMode:"+path)
+	if err, ok := f.readModeErrs[path]; ok {
+		return nil, 0, err
+	}
 	b, err := f.readRegularFileContent(path)
 	if err != nil {
 		return nil, 0, err

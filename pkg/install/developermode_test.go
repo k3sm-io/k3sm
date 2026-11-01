@@ -573,8 +573,8 @@ func TestDeveloperModeMarkerDroppedAsTheSwapCommits(t *testing.T) {
 		}
 	})
 
-	t.Run("a removal that fails finishes the install, then says so", func(t *testing.T) {
-		f := &fakeSystem{owners: map[string]OwnedEntry{}, removeEntryErrs: map[string]error{DeveloperModeMarkerPath: errors.New("EPERM")}}
+	t.Run("a removal and a disown that fail finish the install, then say so", func(t *testing.T) {
+		f := &fakeSystem{owners: map[string]OwnedEntry{}, removeEntryErrs: map[string]error{DeveloperModeMarkerPath: errors.New("EPERM")}, chownErrs: map[string]error{DeveloperModeMarkerPath: errors.New("EPERM")}}
 		putMarker(f, 0o644)
 		cfg := stageCfg()
 		cfg.DeveloperMode = DeveloperModeOff
@@ -595,8 +595,70 @@ func TestDeveloperModeMarkerDroppedAsTheSwapCommits(t *testing.T) {
 		}
 	})
 
+	t.Run("an unreadable marker is removed and not restored on a revert", func(t *testing.T) {
+		f := &fakeSystem{}
+		if err := Install(context.Background(), f, stageCfg()); err != nil {
+			t.Fatalf("first Install: %v", err)
+		}
+		putMarker(f, 0o644)
+		f.readModeErrs = map[string]error{DeveloperModeMarkerPath: errors.New("EIO")}
+		f.putLoaded(NetdLabel, ServerLabel)
+		f.calls = nil
+		f.putBootstrapAlways(NetdLabel, errors.New("Bootstrap failed: 125: Domain does not support specified action"))
+		var logs strings.Builder
+		cfg := stageCfg()
+		cfg.DeveloperMode = DeveloperModeOff
+		cfg.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+		err := Install(context.Background(), f, cfg)
+		if err == nil || !strings.Contains(err.Error(), "rolled back to the previous install root") {
+			t.Fatalf("Install = %v, want the rollback", err)
+		}
+		if !slices.Contains(f.calls, removeCall) {
+			t.Errorf("the unreadable marker was not removed; calls %v", f.calls)
+		}
+		if slices.ContainsFunc(f.calls, func(c string) bool { return strings.HasPrefix(c, "WriteRootOnlyFile:"+DeveloperModeMarkerPath) }) {
+			t.Error("a marker that could not be read was restored")
+		}
+		if got := ReadDeveloperModeState(f, DeveloperModeMarkerPath); got != DeveloperModeAbsent {
+			t.Errorf("after the revert the marker reads %s, want %s", got, DeveloperModeAbsent)
+		}
+		if !strings.Contains(logs.String(), "level=WARN") || !strings.Contains(logs.String(), "could not be read") {
+			t.Errorf("the lost copy is not logged at Warn; logs:\n%s", logs.String())
+		}
+	})
+
+	t.Run("an unreadable marker on a successful install returns the read error", func(t *testing.T) {
+		f := &fakeSystem{owners: map[string]OwnedEntry{}, readModeErrs: map[string]error{DeveloperModeMarkerPath: errors.New("EIO")}}
+		putMarker(f, 0o644)
+		cfg := stageCfg()
+		cfg.DeveloperMode = DeveloperModeOff
+		err := Install(context.Background(), f, cfg)
+		if err == nil || !strings.Contains(err.Error(), "EIO") {
+			t.Fatalf("Install = %v, want the read error", err)
+		}
+		if got := ReadDeveloperModeState(f, DeveloperModeMarkerPath); got != DeveloperModeAbsent {
+			t.Errorf("the marker reads %s, want %s", got, DeveloperModeAbsent)
+		}
+	})
+
+	t.Run("a removal that fails twice leaves the marker invalid", func(t *testing.T) {
+		f := &fakeSystem{owners: map[string]OwnedEntry{}, removeEntryErrs: map[string]error{DeveloperModeMarkerPath: errors.New("EPERM")}}
+		putMarker(f, 0o644)
+		cfg := stageCfg()
+		cfg.DeveloperMode = DeveloperModeOff
+		if err := Install(context.Background(), f, cfg); err != nil {
+			t.Fatalf("Install = %v, want success with the marker disowned", err)
+		}
+		if n := countCalls(f, removeCall); n != 2 {
+			t.Errorf("the removal was attempted %d times, want 2", n)
+		}
+		if got := ReadDeveloperModeState(f, DeveloperModeMarkerPath); got != DeveloperModeInvalid {
+			t.Errorf("the marker reads %s, want %s", got, DeveloperModeInvalid)
+		}
+	})
+
 	t.Run("a later failure keeps the removal error beside it", func(t *testing.T) {
-		f := &fakeSystem{owners: map[string]OwnedEntry{}, removeEntryErrs: map[string]error{DeveloperModeMarkerPath: errors.New("EPERM")}, kubeconfigErr: errors.New("home is read-only")}
+		f := &fakeSystem{owners: map[string]OwnedEntry{}, removeEntryErrs: map[string]error{DeveloperModeMarkerPath: errors.New("EPERM")}, chownErrs: map[string]error{DeveloperModeMarkerPath: errors.New("EPERM")}, kubeconfigErr: errors.New("home is read-only")}
 		putMarker(f, 0o644)
 		cfg := stageCfg()
 		cfg.DeveloperMode = DeveloperModeOff
@@ -610,4 +672,22 @@ func TestDeveloperModeMarkerDroppedAsTheSwapCommits(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestDeveloperModeMarkerRestoreDropsGroupAndOtherWrite pins the restore's
+// mode: whatever mode was saved, the marker goes back without the group and
+// other write bits, so a restored marker is never one the predicate rejects
+// for its mode.
+func TestDeveloperModeMarkerRestoreDropsGroupAndOtherWrite(t *testing.T) {
+	t.Parallel()
+	f := &fakeSystem{owners: map[string]OwnedEntry{}}
+	seedMarkerAncestors(f)
+	r := &markerRemoval{path: DeveloperModeMarkerPath, removed: true, saved: []byte("x\n"), savedMode: 0o666}
+	r.restore(f, Config{}.withDefaults())
+	if !slices.Contains(f.calls, "WriteRootOnlyFile:"+DeveloperModeMarkerPath+":0644") {
+		t.Errorf("restore wrote %v, want mode 0644", f.calls)
+	}
+	if got := ReadDeveloperModeState(f, DeveloperModeMarkerPath); got != DeveloperModeMarkerOn {
+		t.Errorf("the restored marker reads %s, want %s", got, DeveloperModeMarkerOn)
+	}
 }
