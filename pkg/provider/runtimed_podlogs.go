@@ -215,12 +215,18 @@ func (r *runtimedRuntime) findContainerByID(ctx context.Context, id string) (*ru
 	return nil, "", "", fmt.Errorf("container %q not found", id)
 }
 
-// trackedIDs returns the pod ids the provider is tracking, under r.mu.
+// trackedIDs returns the ids of the pods the provider is tracking and the
+// runtime holds, under r.mu. A pod refused at admission (admission.go) is
+// tracked but was never created, so it has no containers and no logs to rotate,
+// and the runtime is not asked about it.
 func (r *runtimedRuntime) trackedIDs() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	ids := make([]string, 0, len(r.track))
-	for id := range r.track {
+	for id, t := range r.track {
+		if t.rejected {
+			continue
+		}
 		ids = append(ids, id)
 	}
 	return ids

@@ -32,6 +32,12 @@ pin, its date, and the tarball's sha256.
   names the worst signal and its message lists each one with its value and rung. It is advisory:
   nothing taints the node or evicts a Pod on it. The node's pressure sampler now runs once a
   second from the warn rung up, not only past the half-way marks.
+- A node under memory pressure refuses a new BestEffort Pod the way the kubelet does: the Pod
+  is Failed with reason `Evicted` and the message `Pod was rejected: The node had condition:
+  [MemoryPressure].`, and nothing runs for it. Critical Pods and Pods that tolerate
+  `node.kubernetes.io/memory-pressure` are still admitted. A Pod annotated
+  `budget.k3sm.io/band: batch` is also refused, with reason `NodeBudgetCritical`, while the
+  node budget is at its critical level or above.
 - The registry store k3sm is replacing zot with has an online garbage collector that runs
   while pushes continue. A blob's age counts from the last mount, link or upload that named it,
   recorded on disk so a restart keeps it, and a sweep re-reads the index and re-checks each

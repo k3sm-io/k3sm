@@ -250,6 +250,9 @@ type runtimedRuntime struct {
 	retained map[string]*corev1.Pod
 	probers  map[string]*podProber // pod id -> provider-served probe runner
 	notify   func(*corev1.Pod)
+	// admission is the pressure source CreatePod admits a new pod against
+	// (admission.go); nil admits every pod. Guarded by mu.
+	admission admissionPressure
 	// compensating is the set of pod ids with a compensating delete owed and in
 	// flight — a guest a parked pod's retry built after the pod was deleted, which
 	// nothing but this provider knows about (runtimed_pull.go). It is
@@ -361,6 +364,11 @@ type podTrack struct {
 	// runtime reports during or after the teardown can turn an evicted pod back
 	// into a running or restarting one. Guarded by restartMu with deleting.
 	evicted *corev1.PodStatus
+	// rejected marks a track whose pod was refused at admission (admission.go):
+	// evicted holds its rejected status, and the runtime never heard of it, so
+	// DeletePod forgets it without a runtime teardown. Set before the track is
+	// published and never changed.
+	rejected bool
 
 	// hookMu guards postStart — the per-container postStart hook bookkeeping of
 	// the postStart fidelity path (poststart.go): the pending/failed readiness gate the
@@ -1679,9 +1687,15 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	// Failed pod; this is the provider's own fence behind it, so a restarted
 	// node cannot resurrect a restartPolicy: Always pod that was evicted for
 	// filling memory.
-	if isEvictedPod(pod) {
-		r.log.Info("CreatePod: the pod was evicted from this node; not creating it",
+	if isEvictedPod(pod) || isBudgetRejectedPod(pod) {
+		r.log.Info("CreatePod: the pod was evicted from or rejected by this node; not creating it",
 			"namespace", pod.Namespace, "name", pod.Name, "uid", string(pod.UID))
+		return nil
+	}
+	// Node-side admission under pressure (admission.go), before anything is
+	// registered or allocated: a refused pod holds no address, no references and
+	// no sandbox, only its terminal status.
+	if r.admitOnCreate(ctx, pod) {
 		return nil
 	}
 	// Bind the pod's identity (ServiceAccount + name + UID) to the request context
@@ -1962,7 +1976,8 @@ func (r *runtimedRuntime) gpuCeilingBytes(ctx context.Context) int64 {
 func (r *runtimedRuntime) admittedGPUMemoryLocked(excludeID string) int64 {
 	var sum int64
 	for trackedID, t := range r.track {
-		if trackedID == excludeID || t == nil || t.pod == nil {
+		// A pod refused at admission holds no GPU memory.
+		if trackedID == excludeID || t == nil || t.pod == nil || t.rejected {
 			continue
 		}
 		if !podRequestsGPU(t.pod) {
@@ -2138,6 +2153,11 @@ func (r *runtimedRuntime) DeletePod(ctx context.Context, pod *corev1.Pod) error 
 			live.quiesce()
 			t = live
 		}
+	}
+	// A pod refused at admission never reached the runtime: forget it.
+	if t != nil && t.rejected {
+		r.forgetRejected(ctx, pod, t)
+		return nil
 	}
 	// An evicted pod's processes are already gone (evictPod stopped them), so
 	// there is nothing for a preStop hook to run in: finish the teardown it left
