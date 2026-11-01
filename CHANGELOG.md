@@ -152,6 +152,10 @@ pin, its date, and the tarball's sha256.
   schema1 `fsLayers` field as unreadable, and the server now refuses such a manifest at push
   with `MANIFEST_INVALID`, even at schemaVersion 2, so a client with push access cannot stop
   garbage collection for a repository with one.
+- The k3sm registry server forgets a connection's failed-attempt budget when the connection
+  closes, so a client that later gets the same local port is no longer answered `429` on a
+  valid credential because another client used the budget up. The server now serves at most
+  256 connections at once and closes one past that before reading a request.
 - The registry's garbage collector stops a repository's sweep, deleting nothing, when a manifest
   there is not an OCI or Docker v2 image manifest, index or manifest list (a Docker schema1
   manifest, for example). It used to read such a manifest as referencing nothing and could reap
