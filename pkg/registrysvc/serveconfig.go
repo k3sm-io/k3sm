@@ -68,25 +68,34 @@ func renderServeConfig(push, gate Credential) ([]byte, error) {
 }
 
 // writeServeConfig writes the serve config for workDir: the state dir at 0700,
-// the file at 0600 through a fresh temp file and a rename, owned by this
-// process's user (the service user the daemon runs as), and the directory
-// synced after the rename so the new file survives a crash.
+// the file at 0600 through writeFileInDir, owned by this process's user (the
+// service user the daemon runs as).
 func writeServeConfig(workDir string, body []byte) error {
 	d, err := openStateDir(ServeStateDir(workDir))
 	if err != nil {
 		return err
 	}
 	defer d.Close()
-	path := ServeConfigPath(workDir)
-	tmp := path + ".tmp"
-	// A leftover temp file from an interrupted write may have any mode; it is
-	// replaced, never reused.
-	if err := os.Remove(tmp); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := writeFileInDir(d, ServeConfigPath(workDir), body); err != nil {
 		return fmt.Errorf("write the registry serve config: %w", err)
+	}
+	return nil
+}
+
+// writeFileInDir writes body to path at 0600 through a fresh temp file and a
+// rename, then syncs d, the open directory path sits in, so the new file
+// survives a crash. The temp file is created O_EXCL|O_NOFOLLOW: a leftover temp
+// file from an interrupted write may have any mode or be a symlink, so it is
+// removed and replaced, never reused or followed. A reader sees the old whole
+// file or the new one, never a partial write.
+func writeFileInDir(d *os.File, path string, body []byte) error {
+	tmp := path + ".tmp"
+	if err := os.Remove(tmp); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
-		return fmt.Errorf("write the registry serve config: %w", err)
+		return err
 	}
 	_, werr := f.Write(body)
 	if werr == nil {
@@ -100,16 +109,17 @@ func writeServeConfig(workDir string, body []byte) error {
 	}
 	if werr != nil {
 		_ = os.Remove(tmp)
-		return fmt.Errorf("write the registry serve config: %w", werr)
+		return werr
 	}
 	if err := d.Sync(); err != nil {
-		return fmt.Errorf("sync the registry state dir: %w", err)
+		return fmt.Errorf("sync %s: %w", d.Name(), err)
 	}
 	return nil
 }
 
-// openStateDir creates the state dir at 0700 if it is missing and returns it
-// open. It refuses, fail-closed, a path that is a symlink or not a directory,
+// openStateDir creates a registry state dir (the serve state dir, or the
+// registry dir that holds the push credential and the htpasswd file) at 0700
+// if it is missing and returns it open. It refuses, fail-closed, a path that is a symlink or not a directory,
 // and a directory another user owns. A directory of this user's own with a
 // wider mode is corrected to 0700, through the open descriptor, so the chmod
 // never follows a symlink. Only the last component is checked: the work dir
