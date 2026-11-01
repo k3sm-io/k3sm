@@ -140,13 +140,17 @@ func (f *fakeStagingFS) MachO(path string) (bool, error) {
 // fakeSigner answers TeamID from a table (a path with no entry is absent) and
 // DeveloperID true unless the path is in notDevID.
 type fakeSigner struct {
-	ids      map[string]string
-	errs     map[string]error
-	notDevID map[string]bool
-	rec      *fakeStagingFS // when set, TeamID calls are logged in rec.calls
+	ids       map[string]string
+	errs      map[string]error
+	notDevID  map[string]bool
+	devIDErrs map[string]error // DeveloperID returns (false, err) for these paths
+	rec       *fakeStagingFS   // when set, TeamID calls are logged in rec.calls
 }
 
 func (s fakeSigner) DeveloperID(_ context.Context, path, _ string) (bool, error) {
+	if err := s.devIDErrs[path]; err != nil {
+		return false, err
+	}
 	return !s.notDevID[path], nil
 }
 
