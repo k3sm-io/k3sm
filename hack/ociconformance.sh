@@ -33,8 +33,9 @@
 # run directory (secret and store) is removed on every exit, and stale run
 # directories older than an hour are swept at the start of a run. Before any
 # log is printed or copied to the report dir it is scanned for the secret, for
-# base64("k3sm:<secret>") (the Basic credential) and for any Authorization
-# header; a hit refuses the run and keeps nothing.
+# base64("k3sm:<secret>") (the Basic credential) in all three base64
+# alignments, and for any Authorization header; a hit refuses the run and
+# keeps nothing.
 #
 # Exit status: 0 pass; 1 failure; 2 usage.
 set -euo pipefail
@@ -270,9 +271,20 @@ run() {
 	trap "[ -z \"\$SERVE_PID\" ] || kill \"\$SERVE_PID\" 2>/dev/null || true; wait 2>/dev/null || true; rm -rf '$rd'" EXIT
 	(umask 077 && head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' >"$rd/secret")
 	[ "$(wc -c <"$rd/secret" | tr -d ' ')" = 64 ] || die "could not mint the run credential"
-	# The Basic credential the suite sends, for the leak scan.
-	(umask 077 && { printf 'k3sm:'; cat "$rd/secret"; } | base64 | tr -d '\n' >"$rd/basic")
-	[ -s "$rd/basic" ] || die "could not encode the run credential"
+	# The Basic credential the suite sends, for the leak scan, in all three
+	# base64 alignments: as sent (offset 0), and after 1 or 2 bytes of any
+	# prefix, the forms it takes inside a longer encoded blob. For those two the
+	# first group (it mixes in the prefix) and the last, partial group (it mixes
+	# in whatever follows; "k3sm:" plus 64 bytes is 69, a multiple of 3, so a
+	# shift leaves a partial group) are dropped. One line each, never on argv.
+	(
+		umask 077
+		{ printf 'k3sm:'; cat "$rd/secret"; } | base64 | tr -d '\n'
+		printf '\n'
+		{ printf 'x'; printf 'k3sm:'; cat "$rd/secret"; } | base64 | tr -d '\n' | cut -c5- | sed 's/....$//'
+		{ printf 'xx'; printf 'k3sm:'; cat "$rd/secret"; } | base64 | tr -d '\n' | cut -c5- | sed 's/....$//'
+	) >"$rd/basic"
+	[ "$(grep -c '^[A-Za-z0-9+/=]\{80,\}$' "$rd/basic")" = 3 ] || die "could not encode the run credential"
 	mkdir -p "$rd/work" "$rd/report"
 	launch "$mode" '{}' - - "$bin/serve" -work-dir "$rd/work" -secret-file "$rd/secret" -addr-file "$rd/addr" 2>"$rd/serve.log" &
 	SERVE_PID=$!

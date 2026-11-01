@@ -331,6 +331,18 @@ func TestDistributionAPI(t *testing.T) {
 		}
 		want(t, f.do(http.MethodGet, "/v2/app/manifests/-bad", nil), http.StatusUnauthorized, codeUnauthorized)
 	})
+	t.Run("delete/an anonymous DELETE of an invalid tag is 401, not 400", func(t *testing.T) {
+		f := newFixture(t, func(c *Config) {
+			c.Authorize = func(_ *http.Request, v Verb, _ ref.Name) error {
+				if v == VerbDelete {
+					return ErrUnauthenticated
+				}
+				return nil
+			}
+		})
+		want(t, f.do(http.MethodDelete, "/v2/app/manifests/-bad", nil), http.StatusUnauthorized, codeUnauthorized)
+		want(t, f.do(http.MethodDelete, "/v2/app/manifests/.INVALID_MANIFEST_NAME", nil), http.StatusUnauthorized, codeUnauthorized)
+	})
 	t.Run("delete/a blob DELETE is left to garbage collection", func(t *testing.T) {
 		f := newFixture(t)
 		d := f.pushBlob(t, "app", []byte("b"))

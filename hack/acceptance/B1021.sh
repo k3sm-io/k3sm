@@ -40,8 +40,11 @@
 #            Ginkgo package in a dependency list and requires the matcher to red
 #   b1021.5  no release-built binary links the conformance launcher
 #            (k3sm.io/k3sm/hack/ociconformance/...): `go list -deps` of every
-#            main hack/release/stage.sh builds, which must include ./cmd/k3sm;
-#            a self-check plants the launcher and requires the matcher to red
+#            main hack/release/stage.sh builds, which must include ./cmd/k3sm,
+#            and of every cmd/ main. It fails closed: the count of `go build`
+#            lines in stage.sh must equal the count of mains read from them.
+#            Self-checks plant the launcher in a dependency list, and an
+#            unparseable go build line in a copy of stage.sh; both must red
 #   b1021.6  every EXPECTED_SKIPS entry is the skipped branch of an EITHER_OR
 #            pair, and every pair's skipped branch is in EXPECTED_SKIPS
 #
@@ -113,10 +116,37 @@ launcher_deps() {
 	grep -E '^k3sm\.io/k3sm/hack/ociconformance(/|$)' || true
 }
 
-# release_mains: the main packages hack/release/stage.sh passes to go build,
-# one per line, ./cmd/<x> or k3sm.io/<repo>/cmd/<x>.
+# release_mains <file>: the main packages <file> passes to go build, one per
+# line, ./cmd/<x> or k3sm.io/<repo>/cmd/<x>, one line per invocation.
 release_mains() {
-	sed -nE 's/^[[:space:]]*\( cd "[^"]*" && go build .* (\.\/cmd\/[A-Za-z0-9_-]+|k3sm\.io\/[a-z-]+\/cmd\/[A-Za-z0-9_-]+) \)[[:space:]]*$/\1/p' "$RELEASE_BUILDS" | LC_ALL=C sort -u
+	sed -nE 's/^[[:space:]]*\( cd "[^"]*" && go build .* (\.\/cmd\/[A-Za-z0-9_-]+|k3sm\.io\/[a-z-]+\/cmd\/[A-Za-z0-9_-]+) \)[[:space:]]*$/\1/p' "$1"
+}
+
+# release_build_count <file>: every non-comment line of <file> that names
+# `go build`, parseable or not, so a build release_mains cannot read is counted.
+release_build_count() {
+	grep -E '(^|[^[:alnum:]_./-])go[[:space:]]+build([[:space:]]|$)' "$1" | grep -cvE '^[[:space:]]*#' || true
+}
+
+# release_verdict <file>: "ok <mains>" when every go build in <file> is a main
+# release_mains reads, ./cmd/k3sm among them, and none links the launcher;
+# otherwise "fail <why>". It fails closed: a build line it cannot parse reds.
+release_verdict() {
+	local mains n m deps bad
+	mains="$(release_mains "$1")"
+	n="$(release_build_count "$1")"
+	m="$(grep -c . <<<"$mains" || true)"
+	if [ "$n" != "$m" ]; then
+		echo "fail $1 has $n go build invocations, and only $m name a main this check can read"
+	elif ! grep -qx '\./cmd/k3sm' <<<"$mains"; then
+		echo "fail $1 builds no ./cmd/k3sm this check can read (found: $(paste -sd ' ' - <<<"$mains"))"
+	elif ! deps="$(go list -deps $(LC_ALL=C sort -u <<<"$mains"))"; then
+		echo "fail go list -deps of the release mains failed"
+	elif bad="$(launcher_deps <<<"$deps")" && [ -n "$bad" ]; then
+		echo "fail a release main links: $(paste -sd ' ' - <<<"$bad")"
+	else
+		echo "ok $(LC_ALL=C sort -u <<<"$mains" | paste -sd ' ' -)"
+	fi
 }
 
 check() {
@@ -169,22 +199,26 @@ check() {
 		fi
 	fi
 	# b1021.5
-	local rmains rdeps rbad
+	local rv cv cmain cdeps cbad tmpd
 	planted="$(printf 'k3sm.io/k3sm/pkg/ociregistry/api\nk3sm.io/k3sm/hack/ociconformance/serve\n' | launcher_deps)"
-	rmains="$(release_mains)"
+	tmpd="$(mktemp -d "${TMPDIR:-/tmp}/b1021.XXXXXX")"
+	{ cat "$RELEASE_BUILDS"; printf '%s\n' '( cd "$REPO_ROOT" && go build -o "$OUT/x" "$PKG" )'; } >"$tmpd/stage.sh"
+	cv="$(release_verdict "$tmpd/stage.sh")"
+	rm -rf "$tmpd"
+	rv="$(release_verdict "$RELEASE_BUILDS")"
+	cmain="$(go list -f '{{if eq .Name "main"}}{{.ImportPath}}{{end}}' ./cmd/... 2>/dev/null)" || cmain=""
 	if [ -z "$planted" ]; then
 		ladder fail "b1021.5 self-check: the matcher missed a planted launcher package"
-	elif ! grep -qx '\./cmd/k3sm' <<<"$rmains"; then
-		ladder fail "b1021.5 $RELEASE_BUILDS builds no ./cmd/k3sm that this check can read (found: $(paste -sd ' ' - <<<"$rmains"))"
-	elif ! rdeps="$(go list -deps $rmains)"; then
-		ladder fail "b1021.5 go list -deps of the release mains failed"
+	elif [ "${cv%% *}" != fail ]; then
+		ladder fail "b1021.5 self-check: a stage.sh with an unparseable go build line did not red"
+	elif [ "${rv%% *}" != ok ]; then
+		ladder fail "b1021.5 ${rv#fail }"
+	elif [ -z "$cmain" ] || ! cdeps="$(go list -deps $cmain)"; then
+		ladder fail "b1021.5 go list -deps of the cmd/ mains failed"
+	elif cbad="$(launcher_deps <<<"$cdeps")" && [ -n "$cbad" ]; then
+		ladder fail "b1021.5 a cmd/ main links: $(paste -sd ' ' - <<<"$cbad")"
 	else
-		rbad="$(launcher_deps <<<"$rdeps")"
-		if [ -z "$rbad" ]; then
-			ladder ok "b1021.5 the release mains ($(paste -sd ' ' - <<<"$rmains")) link no hack/ociconformance package (self-check reds)"
-		else
-			ladder fail "b1021.5 a release main links: $(paste -sd ' ' - <<<"$rbad")"
-		fi
+		ladder ok "b1021.5 every go build in $RELEASE_BUILDS is read (${rv#ok }), and neither they nor the cmd/ mains link a hack/ociconformance package (both self-checks red)"
 	fi
 	# b1021.6
 	local lefts

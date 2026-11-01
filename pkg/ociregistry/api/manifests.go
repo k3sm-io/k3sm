@@ -349,12 +349,12 @@ var errPreconditionFailed = errorf(http.StatusPreconditionFailed, codeDenied, "t
 // If-Match field line, so a request whose If-Match lines are empty or hold no
 // well-formed tag is a 412, never unconditional (RFC 9110 section 13.1.1).
 func (s *Server) deleteManifest(w http.ResponseWriter, r *http.Request, n ref.Name) {
+	if !s.allow(w, r, VerbDelete, n) {
+		return
+	}
 	rf, err := parseReference(r)
 	if err != nil {
 		s.fail(w, r, err)
-		return
-	}
-	if !s.allow(w, r, VerbDelete, n) {
 		return
 	}
 	ifMatch := r.Header.Values("If-Match")
