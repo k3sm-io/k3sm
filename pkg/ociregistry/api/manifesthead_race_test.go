@@ -57,17 +57,6 @@ func (c *lockWaitCtx) Done() <-chan struct{} {
 	return c.Context.Done()
 }
 
-// await blocks until ch is closed. The timeout only turns a broken sequence
-// into a failure instead of a hang; no step waits on time to win a race.
-func await(t *testing.T, ch <-chan struct{}, what string) {
-	t.Helper()
-	select {
-	case <-ch:
-	case <-time.After(30 * time.Second):
-		t.Fatalf("timed out waiting for %s", what)
-	}
-}
-
 // lockHeld reports whether another holder has repo's lock, by trying it with
 // a cancelled context: a free lock is taken and released at once, a held one
 // fails without waiting.
@@ -134,7 +123,9 @@ func headRequest(ctx context.Context, repo string, d digest.Digest) *http.Reques
 //     left whole: no row names a missing blob, and a re-push succeeds.
 //
 // Each side is known to be blocked on the lock, not assumed to be, before the
-// other proceeds (lockWaitCtx, lockHeld).
+// other proceeds (lockWaitCtx, lockHeld). Every handshake receive is
+// deliberately unbounded: no step waits on time, and a broken sequence hangs
+// until the test binary's own -timeout reports it with every goroutine's stack.
 func TestManifestHeadTouchRacesSweep(t *testing.T) {
 	const grace = time.Hour
 	setup := func(t *testing.T) (*fixture, []byte, ispec.Manifest) {
@@ -167,20 +158,16 @@ func TestManifestHeadTouchRacesSweep(t *testing.T) {
 					_, err := c.Sweep(sweepCtx)
 					swept <- err
 				}()
-				await(t, sweepCtx.waiting, "the sweep to block on the lock")
+				// Wait for the sweep to block on the lock.
+				<-sweepCtx.waiting
 			})
 			return time.Now()
 		})
 		w := f.serve(headRequest(context.Background(), "app", cd))
 		f.st.SetClock(time.Now)
 		want(t, w, http.StatusOK, "")
-		select {
-		case err := <-swept:
-			if err != nil {
-				t.Fatal(err)
-			}
-		case <-time.After(30 * time.Second):
-			t.Fatal("timed out waiting for the sweep")
+		if err := <-swept; err != nil {
+			t.Fatal(err)
 		}
 
 		f.index(t, "app", "v1", child)
@@ -205,19 +192,15 @@ func TestManifestHeadTouchRacesSweep(t *testing.T) {
 			}
 			once.Do(func() {
 				go func() { headed <- f.serve(headRequest(headCtx, "app", cd)).Code }()
-				await(t, headCtx.waiting, "the HEAD to block on the lock")
+				// Wait for the HEAD to block on the lock.
+				<-headCtx.waiting
 			})
 		})
 		if _, err := c.Sweep(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		select {
-		case code := <-headed:
-			if code != http.StatusNotFound {
-				t.Fatalf("HEAD after the sweep reaped the child: status %d, want 404", code)
-			}
-		case <-time.After(30 * time.Second):
-			t.Fatal("timed out waiting for the HEAD (did the sweep never take the lock?)")
+		if code := <-headed; code != http.StatusNotFound {
+			t.Fatalf("HEAD after the sweep reaped the child: status %d, want 404", code)
 		}
 
 		// Nothing half-deleted: the row and every blob of the child are gone
