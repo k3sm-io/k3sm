@@ -45,9 +45,15 @@ whose model is the name is served by the model already loaded, and
 /v1/models lists the name alone. That needs four hooks in mlx_lm.server
 (ModelProvider.load, APIHandler.handle_models_request, run and
 _run_http_server), none of them a published API. install_alias checks each
-against the shape it was written for, mlx-lm 0.32.0, and the source of run
-against the 0.32.0 body its replacement copies; the rank exits naming the hook
+against the shape it was written for, mlx-lm 0.32.2, and the source of run
+against the 0.32.2 body its replacement copies; the rank exits naming the hook
 that moved instead of serving under the wrong name.
+
+Every rank, with or without that option, also replaces mlx-lm 0.32.2's
+_inline_image_urls, which fetches any http(s) image URL in a chat request, with
+a function that refuses every image URL that is not a data: URL (HTTP 400).
+The original's signature and normalized body hash are checked first, and the
+rank exits if either moved.
 
 `k3sm_shard --probe` is the rank-0 liveness probe: it POSTs a one-token
 completion to the local server and exits 0 on HTTP 200. A server that is not
@@ -335,8 +341,8 @@ def split_served_name(argv):
     return name, rest
 
 
-# The hooks install_alias relies on, with the parameters mlx-lm 0.32.0 gives
-# them. A hook that is missing or takes other parameters ends the rank.
+# The hooks install_alias relies on, with the parameters mlx-lm 0.32.2 gives
+# them (unchanged from 0.32.0). A hook that is missing or takes other parameters ends the rank.
 ENGINE_HOOKS = (
     ("main", ()),
     ("run", ("host", "port", "model_provider", "server_class", "handler_class")),
@@ -351,7 +357,7 @@ ENGINE_HOOKS = (
 )
 
 
-# The normalized source of mlx_lm.server.run in mlx-lm 0.32.0, which
+# The normalized source of mlx_lm.server.run in mlx-lm 0.32.0 and 0.32.2, which
 # install_alias's run copies. A bump that changes run's body must re-derive the
 # copy. check_engine_hooks compares it against the engine at pod start (the
 # image carries the engine's .py source beside its bytecode), and the
@@ -365,7 +371,7 @@ def source_shape(func):
         src = textwrap.dedent(inspect.getsource(func))
     except (OSError, TypeError) as e:
         raise ShardError(f"cannot read the source of {ENGINE_MODULE}.{getattr(func, '__name__', func)!s} to check it "
-                         f"against the mlx-lm 0.32.0 body the served-name alias copies: {e}") from None
+                         f"against the mlx-lm 0.32.2 body it was written against: {e}") from None
     skip = {tokenize.COMMENT, tokenize.NL, tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT,
             tokenize.ENCODING, tokenize.ENDMARKER}
     toks = [t.string for t in tokenize.generate_tokens(io.StringIO(src).readline) if t.type not in skip]
@@ -373,10 +379,10 @@ def source_shape(func):
 
 
 def check_run_shape(server):
-    """Raise ShardError unless server.run is the 0.32.0 body install_alias copies."""
+    """Raise ShardError unless server.run is the 0.32.2 body install_alias copies."""
     got = source_shape(server.run)
     if got != ENGINE_RUN_SHA256:
-        raise ShardError(f"{ENGINE_MODULE}.run is not the mlx-lm 0.32.0 body the served-name alias copies "
+        raise ShardError(f"{ENGINE_MODULE}.run is not the mlx-lm 0.32.2 body the served-name alias copies "
                          f"(source sha256 {got}, pinned {ENGINE_RUN_SHA256}): re-derive install_alias's run from "
                          f"the new source, then pin the new hash in ENGINE_RUN_SHA256")
 
@@ -384,7 +390,7 @@ def check_run_shape(server):
 def check_engine_hooks(server):
     """Raise ShardError naming the first hook the engine module lacks.
 
-    Every hook is checked for its 0.32.0 signature, and then run for the 0.32.0
+    Every hook is checked for its 0.32.2 signature, and then run for the 0.32.2
     body install_alias's run copies: an engine whose run changed underneath
     matching signatures would otherwise be replaced by a stale copy.
     """
@@ -394,16 +400,16 @@ def check_engine_hooks(server):
             obj = getattr(obj, part, None)
             if obj is None:
                 raise ShardError(f"{ENGINE_MODULE} has no {path}; the served-name alias was written against "
-                                 f"mlx-lm 0.32.0 and this engine moved it")
+                                 f"mlx-lm 0.32.2 and this engine moved it")
         if not callable(obj):
             raise ShardError(f"{ENGINE_MODULE}.{path} is not callable; the served-name alias was written against "
-                             f"mlx-lm 0.32.0")
+                             f"mlx-lm 0.32.2")
         if params is None:
             continue
         got = tuple(inspect.signature(obj).parameters)
         if got != params:
             raise ShardError(f"{ENGINE_MODULE}.{path} takes {got}; the served-name alias was written against "
-                             f"mlx-lm 0.32.0's {params}")
+                             f"mlx-lm 0.32.2's {params}")
     check_run_shape(server)
 
 
@@ -441,7 +447,7 @@ def install_alias(server, served):
             self.wfile.flush()
 
     def run(host, port, model_provider, server_class=None, handler_class=None):
-        # mlx_lm.server.run as of 0.32.0, except that it hands the HTTP server
+        # mlx_lm.server.run as of 0.32.2, except that it hands the HTTP server
         # the aliased handler: the original takes handler_class and drops it.
         group = server.mx.distributed.init()
         prompt_cache = server.LRUPromptCache(model_provider.cli_args.prompt_cache_size)
@@ -459,13 +465,82 @@ def install_alias(server, served):
     return AliasedModelProvider, AliasedAPIHandler, run
 
 
+# The image-URL fetch in mlx-lm 0.32.2: handle_chat_completions calls
+# _inline_image_urls(messages), which urlopen()s every http(s) image URL in a
+# request body (30 s timeout, redirects followed, no host check, no size cap)
+# and reads the whole response into memory. Anyone who can reach a rank's port
+# could make the pod fetch an internal address (the node's own services, the
+# cloud-style metadata endpoints of a LAN) or exhaust its memory. The image has
+# no use for remote image URLs: a client sends the image inline as a data: URL.
+# The replacement refuses everything else before any network call.
+IMAGE_HOOK = "_inline_image_urls"
+IMAGE_HOOK_PARAMS = ("messages",)
+IMAGE_HOOK_SHA256 = "c1cba319c81a30792fd2f587aa741ad7575c5a6b2d3e6889ec25e85a40e572a1"
+
+
+class RemoteImageRefused(ValueError):
+    """A request carried an image URL that is not an inline data: URL."""
+
+
+def refuse_remote_images(messages):
+    """Raise RemoteImageRefused for any image part whose URL is not a data: URL.
+
+    Takes the place of mlx_lm.server._inline_image_urls. It looks at every
+    content part that names an image under either key mlx-lm reads, whatever
+    its type, so a part mlx-lm would still treat as an image is never skipped.
+    The server answers the ValueError with HTTP 400.
+    """
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            for key in ("image_url", "image"):
+                if key not in part:
+                    continue
+                url = part[key]
+                if isinstance(url, dict):
+                    url = url.get("url")
+                if not isinstance(url, str) or not url.startswith("data:"):
+                    raise RemoteImageRefused("remote image URLs are not fetched by this server; "
+                                             "send the image inline as a data: URL")
+
+
+def install_image_guard(server):
+    """Replace the engine's remote image fetch with refuse_remote_images.
+
+    Fail-closed: the engine's function must still take (messages) and have the
+    0.32.2 body this was written against; otherwise the rank exits rather than
+    serve with a fetch it has not read. Runs for every rank, with or without
+    --served-model-name.
+    """
+    func = getattr(server, IMAGE_HOOK, None)
+    if func is None or not callable(func):
+        raise ShardError(f"{ENGINE_MODULE} has no {IMAGE_HOOK}; the remote-image guard was written against "
+                         f"mlx-lm 0.32.2 and this engine moved it")
+    got = tuple(inspect.signature(func).parameters)
+    if got != IMAGE_HOOK_PARAMS:
+        raise ShardError(f"{ENGINE_MODULE}.{IMAGE_HOOK} takes {got}; the remote-image guard was written "
+                         f"against mlx-lm 0.32.2's {IMAGE_HOOK_PARAMS}")
+    shape = source_shape(func)
+    if shape != IMAGE_HOOK_SHA256:
+        raise ShardError(f"{ENGINE_MODULE}.{IMAGE_HOOK} is not the mlx-lm 0.32.2 body the remote-image guard "
+                         f"replaces (source sha256 {shape}, pinned {IMAGE_HOOK_SHA256}): read the new source, "
+                         f"then pin its hash in IMAGE_HOOK_SHA256")
+    setattr(server, IMAGE_HOOK, refuse_remote_images)
+    return refuse_remote_images
+
+
 def serve(child_env, child_argv, served, importer=importlib.import_module):
-    """Run the engine in this process: the environment, argv, alias, main()."""
+    """Run the engine in this process: the environment, argv, guard, alias, main()."""
     os.environ.clear()
     os.environ.update(child_env)
     # The engine reads the rendezvous environment when it initialises the
     # distributed group, so it is imported only once that environment is set.
     server = importer(ENGINE_MODULE)
+    install_image_guard(server)
     install_alias(server, served)
     sys.argv = [ENGINE_MODULE] + list(child_argv[3:])
     return server.main()
