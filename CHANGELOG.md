@@ -95,6 +95,10 @@ pin, its date, and the tarball's sha256.
   nor hand it to nobody now rolls the install root back to the previous tree, which the marker
   still matches, restarts the daemons on that tree and names the `k3sm install --developer-mode
   off` remedy. A first install with such a marker stops before any daemon is started.
+- An emergency eviction no longer waits 250 ms for each pod it kills when the budget history
+  writer is not running (before it starts, after it stops, or once it has exited): the kill
+  intent is written at once. A symlink or a FIFO at the budget history path in the node's work
+  dir is refused as unreadable and moved aside, never read through or waited on.
 - A k3sm.app update that finds the installed `k3sm` link broken (pointing at a version
   directory that is gone, or out of `/Library/k3sm`) is still refused, and the refusal now says
   how to repair the install: re-run the install script, `curl -fsSL https://k3sm.io/install.sh | sh`,
