@@ -204,23 +204,28 @@ func (r *runtimedRuntime) setAdmissionSource(src admissionPressure) {
 //
 // Locking: the decision and the publication of its result happen in one r.mu
 // critical section. A refusal is published as the rejected track; an admission
-// is published as an in-flight count in r.admitting, held until done. So of two
-// concurrent creates of one pod, whichever decides second sees the first's
-// result: a create that would refuse yields to an admitted create in flight,
-// and a create that would admit is refused with an installed rejection.
+// is published as an in-flight count in r.admitting, held until done, and so is
+// a repeat create of a pod with a live track. So of two concurrent creates of
+// one pod, whichever decides second sees the first's result: a create that
+// would refuse yields to an admitted create in flight, and a create that would
+// admit is refused with an installed rejection.
 // CreatePod's track registration refuses to replace a terminal track behind
 // this. The pressure monitor's lock is a leaf, so reading it under r.mu is safe.
 func (r *runtimedRuntime) admitOnCreate(ctx context.Context, pod *corev1.Pod) (refused bool, done func()) {
 	id := string(pod.UID)
 	r.mu.Lock()
 	if prior := r.track[id]; prior != nil {
-		r.mu.Unlock()
 		// Admitted (or refused) at its first create; a refused or evicted pod
 		// is terminal and is never created by a repeat call.
 		if prior.evictedStatus() != nil {
+			r.mu.Unlock()
 			return true, nil
 		}
-		return false, func() {}
+		// A repeat create of a live pod is not judged again, but it is in
+		// flight like a first create: it allocates the pod's address before
+		// it reaches the fence, and the track it saw can be deleted meanwhile.
+		// Counting it keeps a refusal from landing behind it.
+		return false, r.admitLocked(id)
 	}
 	res := podAdmitResult{admit: true}
 	if src := r.admission; src != nil && r.admitting[id] == 0 &&
@@ -229,13 +234,7 @@ func (r *runtimedRuntime) admitOnCreate(ctx context.Context, pod *corev1.Pod) (r
 		res = admitPod(pod, s, ok)
 	}
 	if res.admit {
-		if r.admitting == nil {
-			r.admitting = map[string]int{}
-		}
-		r.admitting[id]++
-		r.mu.Unlock()
-		var once sync.Once
-		return false, func() { once.Do(func() { r.admitDone(id) }) }
+		return false, r.admitLocked(id)
 	}
 	st := rejectedPodStatus(pod, res, metav1.Now())
 	r.track[id] = &podTrack{pod: pod.DeepCopy(), startTime: *st.StartTime, evicted: st, rejected: true}
@@ -255,6 +254,19 @@ func (r *runtimedRuntime) admitOnCreate(ctx context.Context, pod *corev1.Pod) (r
 		cb(out)
 	}
 	return true, nil
+}
+
+// admitLocked publishes one admitted create of pod id as an in-flight count
+// and returns its done, which ends it once however often it is called. The
+// caller holds r.mu; admitLocked releases it.
+func (r *runtimedRuntime) admitLocked(id string) func() {
+	if r.admitting == nil {
+		r.admitting = map[string]int{}
+	}
+	r.admitting[id]++
+	r.mu.Unlock()
+	var once sync.Once
+	return func() { once.Do(func() { r.admitDone(id) }) }
 }
 
 // admitDone ends one admitted create of pod id.

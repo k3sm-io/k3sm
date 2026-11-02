@@ -1828,6 +1828,15 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 		r.mu.Unlock()
 		r.log.Warn("CreatePod: the pod became terminal on this node while it was being created; not creating it",
 			"namespace", pod.Namespace, "name", pod.Name, "uid", id, "rejected", old.rejected)
+		if old.rejected {
+			// A refused pod holds nothing, and its delete (forgetRejected)
+			// frees nothing, so the /32, the lo0 alias, the interconnect slot
+			// and the references this create acquired go here. An evicted
+			// track keeps them: its DeletePod tears them down. Both calls run
+			// after the unlock and take only their own leaf locks.
+			r.releasePodNetwork(pod)
+			r.refs.UnregisterPod(pod.UID)
+		}
 		return nil
 	}
 	if wantsGPU {
