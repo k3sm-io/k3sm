@@ -6,8 +6,8 @@
 # Go repos, and a change lands in all four together. A fact
 # that belongs to one repo goes in that repo's own config: a reason line in
 # hack/deps.cooldown-exempt (module, version, reason; the reason carries any
-# expiry), or, for a graph checked outside go.mod, a wrapper entry whose files
-# exist only in that repo (the wrapper stages skip when the files are absent).
+# expiry), or, for a graph checked outside go.mod, a line in hack/deps.wrappers
+# (absent in a repo that builds nothing outside its go.mod).
 #
 # A Go module graph can be attacked without touching a line of this repo's code:
 # a tampered module zip, a typosquatted module pulled in by a new import, a
@@ -33,17 +33,13 @@
 #   wrapper graphs           the same lock, cooldown and malicious-package
 #                            stages over each wrapper module's graph (every
 #                            module its go.sum hashes the source of), each in
-#                            its own lock: the zot wrapper
-#                            (pkg/registrysvc/zotchild/go.sum.txt,
-#                            hack/deps-zotchild.lock) and the helm wrapper
-#                            (pkg/helmchart/helmchild/go.sum.txt,
-#                            hack/deps-helmchild.lock), and the OCI
-#                            distribution-spec conformance suite
-#                            (hack/ociconformance/go.sum.txt,
-#                            hack/deps-ociconformance.lock). Each is built
-#                            from its go.sum, outside this repo's go.mod, so
-#                            its modules are not in the repo graph above
-#                            (WRAPPERS below)
+#                            its own lock, for every wrapper hack/deps.wrappers
+#                            names. Each is built from its go.sum, outside
+#                            this repo's go.mod, so its modules are not in the
+#                            repo graph above. A hack/deps-*.lock or a tracked
+#                            *go.sum.txt that no line names is refused, so a
+#                            wrapper cannot drop out of the check by losing
+#                            its line
 #   replace discipline       every go.mod replace sits directly under its own
 #                            comment line, and a filesystem replace points
 #                            only at a sibling repo
@@ -82,7 +78,7 @@
 # Needs bash, python3 and curl. Exit status: 0 pass; 1 failure; 2 usage.
 set -euo pipefail
 
-SELF="$0"
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 CALLER_PWD="$PWD"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -94,23 +90,27 @@ OSV_BATCH_URL="https://api.osv.dev/v1/querybatch"
 OSV_QUERY_URL="https://api.osv.dev/v1/query"
 OSV_BATCH_SIZE=500
 LOCK="hack/deps.lock"
-# The wrapper modules: a binary k3sm builds outside its own go.mod, from a
+# The wrapper modules: a binary the repo builds outside its own go.mod, from a
 # wrapper module's go.sum embedded in the repo (built with -mod=readonly). Each
 # graph gets its own lock, so a module that moves there is a reviewed file
-# change exactly like one in hack/deps.lock. One line per wrapper:
+# change exactly like one in hack/deps.lock. The repo lists them in
+# hack/deps.wrappers, one line per wrapper (blank lines and # comments ignored):
 #
-#   <name> <go.sum> <lock>
+#   <name> <go.sum> hack/deps-<name>.lock
 #
-# zotchild: the registry's zot child (pkg/registrysvc).
-# helmchild: the helm binary the daemon builds (pkg/helmchart).
-# ociconformance: the OCI distribution-spec conformance suite
-#   (hack/ociconformance.sh), test tooling that is never shipped; it runs on
-#   the developer's Mac, so its graph is screened like the others.
-# A wrapper graph version that must clear the cooldown early is exempted in
-# hack/deps.cooldown-exempt like any other, with its reason (and expiry) there.
-WRAPPERS="zotchild pkg/registrysvc/zotchild/go.sum.txt hack/deps-zotchild.lock
-helmchild pkg/helmchart/helmchild/go.sum.txt hack/deps-helmchild.lock
-ociconformance hack/ociconformance/go.sum.txt hack/deps-ociconformance.lock"
+# <name> is lowercase letters, digits and dashes; both paths are relative to the
+# repo root with no . or .. component, no component that starts with -, and
+# neither is a symlink (on disk or in the git index). Any other line fails the
+# check. No file means the repo has no wrapper graph. Every tracked *go.sum.txt
+# outside hack/testdata must be named by a line, and every hack/deps-*.lock too,
+# so a graph cannot leave the check by losing its line; every tracked
+# *go.mod.txt outside hack/testdata needs a listed go.sum in its directory.
+# The list of tracked files is the git index of the repo's own top level, so a
+# source tarball or `git archive` build fails closed at the wrappers stage, by
+# design. A wrapper graph version that must clear
+# the cooldown early is exempted in hack/deps.cooldown-exempt like any other,
+# with its reason (and expiry) there.
+WRAPPERS_FILE="hack/deps.wrappers"
 EXEMPT="hack/deps.cooldown-exempt"
 # The only filesystem paths a go.mod replace may name: the sibling k3sm repos.
 LOCAL_REPLACE_ALLOW="../apis ../runtimed ../darwin-net ../k3sm"
@@ -1052,6 +1052,93 @@ malicious_check() { # malicious_check <lock-format file> [stage]
 }
 
 # ---- wrapper graphs -----------------------------------------------------------
+# load_wrappers: validate $WRAPPERS_FILE into $WORK/wrappers, one
+# "<name> <go.sum> <lock>" per line. Fails closed on a malformed or duplicate
+# line, and on a hack/deps-*.lock that no line names.
+load_wrappers() {
+	stage "wrappers"
+	: >"$WORK/wrappers"
+	command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
+		fail "wrappers" "not a git checkout: the tracked wrapper graphs are read from the git index"
+	# The repo root must be the checkout's top level: a tree extracted inside an
+	# unrelated checkout would otherwise read that checkout's index, which tracks
+	# none of this tree's files.
+	local top
+	top="$(git rev-parse --show-toplevel 2>/dev/null)" || fail "wrappers" "cannot read the git top level"
+	[ "$top" = "$(pwd -P)" ] ||
+		fail "wrappers" "$ROOT is not the top level of its git checkout ($top): the tracked wrapper graphs are read from this repo's own index"
+	local n=0 line name sum lock extra p bad=""
+	if [ ! -e "$WRAPPERS_FILE" ]; then
+		echo "    no $WRAPPERS_FILE: this repo checks no wrapper graph"
+	else
+		[ -f "$WRAPPERS_FILE" ] || fail "wrappers" "$WRAPPERS_FILE is not a regular file"
+		while IFS= read -r line || [ -n "$line" ]; do
+			n=$((n + 1))
+			case "$line" in "#"* | *[[:space:]]"#"*) line="${line%%#*}" ;; esac
+			name="" sum="" lock="" extra=""
+			read -r name sum lock extra <<<"$line" || true
+			[ -n "$name" ] || continue
+			if [ -z "$lock" ] || [ -n "$extra" ]; then
+				bad="${bad}  $WRAPPERS_FILE:$n: want '<name> <go.sum> hack/deps-<name>.lock'"$'\n'
+				continue
+			fi
+			if ! [[ "$name" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+				bad="${bad}  $WRAPPERS_FILE:$n: name '$name' is not lowercase letters, digits and dashes"$'\n'
+				continue
+			fi
+			for p in "$sum" "$lock"; do
+				if ! [[ "$p" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]]; then
+					bad="${bad}  $WRAPPERS_FILE:$n: '$p' is not a relative path under the repo root"$'\n'
+				else
+					case "/$p/" in */./* | */../*) bad="${bad}  $WRAPPERS_FILE:$n: '$p' has a . or .. component"$'\n' ;; esac
+					case "/$p" in */-*) bad="${bad}  $WRAPPERS_FILE:$n: '$p' has a component that starts with -"$'\n' ;; esac
+					if [ -L "$p" ] || git ls-files -s -- "$p" | grep -q '^120000 '; then
+						bad="${bad}  $WRAPPERS_FILE:$n: '$p' is a symlink: a wrapper graph and its lock are regular files"$'\n'
+					fi
+				fi
+			done
+			[ "$lock" = "hack/deps-$name.lock" ] || bad="${bad}  $WRAPPERS_FILE:$n: the $name lock must be hack/deps-$name.lock, not '$lock'"$'\n'
+			if grep -q -e "^$name " "$WORK/wrappers"; then
+				bad="${bad}  $WRAPPERS_FILE:$n: wrapper '$name' is listed twice"$'\n'
+			elif awk -v s="$sum" '$2 == s { f = 1 } END { exit !f }' "$WORK/wrappers"; then
+				bad="${bad}  $WRAPPERS_FILE:$n: $sum is listed twice"$'\n'
+			fi
+			echo "$name $sum $lock" >>"$WORK/wrappers"
+		done <"$WRAPPERS_FILE"
+	fi
+	# Every tracked go.sum.txt outside the fixtures is a wrapper graph some build
+	# reads, so one that no line names is a graph nothing checks. The git index is
+	# the list, so untracked scratch does not count.
+	local tracked="$WORK/tracked-sums"
+	git ls-files -- '*go.sum.txt' >"$tracked" || fail "wrappers" "cannot list the tracked files: run from a git checkout"
+	while IFS= read -r p; do
+		case "$p" in hack/testdata/*) continue ;; esac
+		awk -v s="$p" '$2 == s { f = 1 } END { exit !f }' "$WORK/wrappers" ||
+			bad="${bad}  $p is a tracked wrapper graph that no $WRAPPERS_FILE line names: list it with its lock"$'\n'
+	done <"$tracked"
+	# A wrapper module is a go.mod.txt; its graph is the listed go.sum beside it.
+	# Keying on the go.mod.txt as well means renaming the go.sum (and its embed
+	# directive) does not take the module out of the check.
+	git ls-files -- '*go.mod.txt' >"$tracked" || fail "wrappers" "cannot list the tracked files: run from a git checkout"
+	local d
+	while IFS= read -r p; do
+		case "$p" in hack/testdata/*) continue ;; esac
+		d="$(dirname "$p")"
+		awk -v d="$d" '{ s = $2; sub(/\/[^\/]*$/, "", s); if ($2 !~ /\//) s = "."; if (s == d) f = 1 } END { exit !f }' "$WORK/wrappers" ||
+			bad="${bad}  $p is a tracked wrapper module with no listed go.sum beside it in $d: list its graph with its lock"$'\n'
+	done <"$tracked"
+	for p in hack/deps-*.lock; do
+		[ -e "$p" ] || continue
+		awk -v l="$p" '$3 == l { f = 1 } END { exit !f }' "$WORK/wrappers" ||
+			bad="${bad}  $p is named by no $WRAPPERS_FILE line: list its wrapper, or remove the lock with the wrapper"$'\n'
+	done
+	if [ -n "$bad" ]; then
+		printf '%s' "$bad" >&2
+		fail "wrappers" "fix $WRAPPERS_FILE or the wrapper locks above"
+	fi
+	[ ! -s "$WORK/wrappers" ] || echo "    $(grep -c . "$WORK/wrappers") wrapper graph(s): $(cut -d' ' -f1 "$WORK/wrappers" | paste -sd ' ' -)"
+}
+
 # Each wrapper module's graph gets the repo graph's lock, cooldown and
 # malicious-package stages: the binary is built from that go.sum, so a module
 # moved there runs on the node exactly like one in this repo's go.mod.
@@ -1060,8 +1147,7 @@ wrapper_check() {
 	local name="$1" sum="$2" lock="$3"
 	if [ ! -f "$sum" ]; then
 		[ ! -f "$lock" ] || fail "lock ($name)" "$lock exists but $sum does not: the $name wrapper graph moved or was removed without its lock"
-		echo "    no $name wrapper module ($sum absent): the $name stages do not apply to this repo"
-		return 0
+		fail "lock ($name)" "$WRAPPERS_FILE names $name but $sum does not exist: restore the go.sum, or remove the line with the wrapper"
 	fi
 	stage "lock ($name)"
 	wrapper_graph "lock ($name)" "$name" "$sum" "$WORK/wgraph-$name"
@@ -1074,7 +1160,7 @@ wrapper_check() {
 # rewrites is appended to $WORK/updated.
 wrapper_update() {
 	local name="$1" sum="$2" lock="$3" w="$WORK/w-$1"
-	[ -f "$sum" ] || return 0
+	[ -f "$sum" ] || fail "lock ($name update)" "$WRAPPERS_FILE names $name but $sum does not exist: restore the go.sum, or remove the line with the wrapper"
 	stage "lock ($name update)"
 	mkdir -p "$w"
 	wrapper_graph "lock ($name update)" "$name" "$sum" "$w/graph"
@@ -1117,6 +1203,7 @@ tools_check() {
 # ---- --update ----------------------------------------------------------------
 update() {
 	env_guard
+	load_wrappers
 	mod_verify
 	stage "lock (update)"
 	current_graph "lock (update)"
@@ -1129,7 +1216,7 @@ update() {
 	local name sum lock
 	while read -r name sum lock <&3; do
 		wrapper_update "$name" "$sum" "$lock"
-	done 3<<<"$WRAPPERS"
+	done 3<"$WORK/wrappers"
 	if [ -s "$WORK/updated" ]; then
 		echo "OK: [verify-deps] $LOCK and $(paste -sd ' ' "$WORK/updated" | sed 's/ /, /g') updated; review the diff and commit them"
 	else
@@ -1158,6 +1245,7 @@ modules() {
 
 check() {
 	env_guard
+	load_wrappers
 	mod_verify
 	lock_check
 	cooldown_verify
@@ -1165,7 +1253,7 @@ check() {
 	local name sum lock
 	while read -r name sum lock <&3; do
 		wrapper_check "$name" "$sum" "$lock"
-	done 3<<<"$WRAPPERS"
+	done 3<"$WORK/wrappers"
 	replace_check
 	tools_check
 	echo "OK: [verify-deps] dependency supply-chain check green"
@@ -1193,19 +1281,31 @@ self_test() {
 		[ ! -d "$td/cases/$name" ] || cp -R "$td/cases/$name/." "$dir/"
 		mkdir -p "$dir/hack"
 		cp "$SELF" "$dir/hack/verify-deps.sh"
-		# Per wrapper, with <m> its name less a trailing "child" (zot, helm,
-		# ociconformance): a case carrying .no-<m> is a repo without that wrapper
-		# module (apis, runtimed, darwin-net), so its stages must not run there;
-		# .no-<m>-sum keeps the lock and removes only the graph, which the check
-		# must refuse, never skip (a wrapper moved out from under its lock).
-		local f wname wsum wlock m locks="$dir/hack/deps.lock"
-		while read -r wname wsum wlock <&3; do
-			m="${wname%child}"
-			[ ! -f "$dir/.no-$m" ] || rm -f "$dir/$wsum" "$dir/$wlock" "$dir/.no-$m"
-			[ ! -f "$dir/.no-$m-sum" ] || rm -f "$dir/$wsum" "$dir/.no-$m-sum"
-			locks="$locks $dir/$wlock"
-		done 3<<<"$WRAPPERS"
-		for f in $locks "$dir/stub/info" "$dir/base/hack/deps.lock"; do
+		# A case's .rm lists fixture files (relative to the case repo) to delete
+		# from the copy, so a case can drop a wrapper's go.sum, its lock or
+		# hack/deps.wrappers itself.
+		local f rmpath
+		if [ -f "$dir/.rm" ]; then
+			while IFS= read -r rmpath; do
+				[ -z "$rmpath" ] || rm -f "$dir/$rmpath"
+			done <"$dir/.rm"
+			rm -f "$dir/.rm"
+		fi
+		# A case's .ln holds "<path> <target> [index]" lines: <path> becomes a
+		# symlink to <target>; with "index" the index records the symlink but the
+		# working tree holds a regular copy of the target.
+		local lnpath lntarget lnmode
+		if [ -f "$dir/.ln" ]; then
+			while read -r lnpath lntarget lnmode; do
+				[ -n "$lnpath" ] || continue
+				rm -f "$dir/$lnpath"
+				mkdir -p "$(dirname "$dir/$lnpath")"
+				ln -s "$lntarget" "$dir/$lnpath"
+			done <"$dir/.ln"
+		fi
+		for f in "$dir"/hack/deps.lock "$dir"/hack/deps-*.lock "$dir/stub/info" "$dir/base/hack/deps.lock"; do
+			# A symlinked lock (an .ln case) is substituted in its target, so the link stays.
+			[ ! -L "$f" ] || f="$(dirname "$f")/$(readlink "$f")"
 			[ ! -f "$f" ] || { sed -e "s/@RECENT@/$recent/g" -e "s/@OLD@/$old/g" "$f" >"$f.s" && mv "$f.s" "$f"; }
 		done
 		# A case with base/hack/deps.lock becomes a git repo whose origin/main
@@ -1222,6 +1322,32 @@ self_test() {
 				return 0
 			fi
 			mv "$WORK/worklock-$name" "$dir/hack/deps.lock"
+		fi
+		# A case carrying .nested is extracted, untracked, inside an unrelated
+		# checkout: the case tree moves to <outer>/tree and only <outer> is a repo.
+		if [ -f "$dir/.nested" ]; then
+			rm -f "$dir/.nested"
+			mkdir -p "$dir.outer"
+			mv "$dir" "$dir.outer/tree"
+			(cd "$dir.outer" && git init -q) >/dev/null 2>&1 || { echo "  FAIL $name: could not build the outer git repo"; return 0; }
+			dir="$dir.outer/tree"
+		# Every case repo is a git checkout: the wrappers stage reads the index.
+		elif [ ! -e "$dir/.git" ] && ! (cd "$dir" && git init -q) >/dev/null 2>&1; then
+			echo "  FAIL $name: could not build the case git repo"
+			return 0
+		fi
+		# A case's .exclude becomes .git/info/exclude: files it names stay untracked.
+		[ ! -f "$dir/.exclude" ] || { mkdir -p "$dir/.git/info" && mv "$dir/.exclude" "$dir/.git/info/exclude"; }
+		if [ -e "$dir/.git" ]; then
+			(cd "$dir" && git add -A -- . ':!.ln') >/dev/null 2>&1 || { echo "  FAIL $name: could not stage the case repo"; return 0; }
+		fi
+		if [ -f "$dir/.ln" ]; then
+			while read -r lnpath lntarget lnmode; do
+				[ "$lnmode" = index ] || continue
+				rm -f "$dir/$lnpath"
+				cp "$(dirname "$dir/$lnpath")/$lntarget" "$dir/$lnpath"
+			done <"$dir/.ln"
+			rm -f "$dir/.ln"
 		fi
 		if [ "$args" = "-" ]; then
 			out="$(cd "$dir" && env -u GONOSUMDB -u GONOSUMCHECK -u GOINSECURE -u GOPRIVATE -u GONOPROXY PATH="$td/bin:$PATH" bash hack/verify-deps.sh 2>&1)" || rc=$?
@@ -1309,24 +1435,44 @@ self_test() {
 	bg modules-mal "--modules modules.txt" "malicious-package check" "MAL-2026-0004"
 	bg modules-missing "--modules absent.txt" modules "no module list"
 	bg update-network --update "lock (update)" "network failure"
-	bg zot-lock-added - "lock (zotchild)" "added:   example.com/zextra v1.0.0"
-	bg zot-cooldown-fresh - "cooldown (zotchild)" "example.com/zyoung v0.1.0 has a proxy-recorded commit time"
-	bg zot-osv-mal - "malicious-package check (zotchild)" "MAL-2026-0005"
-	bg zot-sum-empty - "lock (zotchild)" "hashes no module source"
-	bg zot-sum-two-versions - "lock (zotchild)" "example.com/zchild is hashed at two versions"
-	bg zot-update --update pass "wrote hack/deps-zotchild.lock: 3 modules, 1 new or changed"
-	bg no-zot - pass "the zotchild stages do not apply to this repo"
-	bg no-zot-update --update pass "OK: [verify-deps] hack/deps.lock updated; review the diff and commit it"
-	bg zot-lock-no-sum - "lock (zotchild)" "exists but pkg/registrysvc/zotchild/go.sum.txt does not"
-	bg helm-clean - pass "==> [verify-deps] malicious-package check (helmchild)"
-	bg helm-lock-added - "lock (helmchild)" "added:   example.com/hextra v1.0.0"
-	bg helm-cooldown-fresh - "cooldown (helmchild)" "example.com/hyoung v0.1.0 has a proxy-recorded commit time"
-	bg helm-osv-mal - "malicious-package check (helmchild)" "MAL-2026-0006"
-	bg helm-update --update pass "wrote hack/deps-helmchild.lock: 3 modules, 1 new or changed"
-	bg helm-lock-no-sum - "lock (helmchild)" "exists but pkg/helmchart/helmchild/go.sum.txt does not"
-	bg oci-clean - pass "==> [verify-deps] malicious-package check (ociconformance)"
-	bg oci-lock-added - "lock (ociconformance)" "added:   example.com/oextra v1.0.0"
-	bg oci-lock-no-sum - "lock (ociconformance)" "exists but hack/ociconformance/go.sum.txt does not"
+	bg wrappers-listed - pass "1 wrapper graph(s): child"
+	bg wrapper-lock-added - "lock (child)" "added:   example.com/wextra v1.0.0"
+	bg wrapper-cooldown-fresh - "cooldown (child)" "example.com/wyoung v0.1.0 has a proxy-recorded commit time"
+	bg wrapper-osv-mal - "malicious-package check (child)" "MAL-2026-0005"
+	bg wrapper-sum-empty - "lock (child)" "hashes no module source"
+	bg wrapper-sum-two-versions - "lock (child)" "example.com/wchild is hashed at two versions"
+	bg wrapper-update --update pass "wrote hack/deps-child.lock: 3 modules, 1 new or changed"
+	bg wrapper-lock-no-sum - "lock (child)" "exists but pkg/child/go.sum.txt does not"
+	bg wrapper-sum-absent - "lock (child)" "names child but pkg/child/go.sum.txt does not exist"
+	bg wrapper-update-sum-absent --update "lock (child update)" "names child but pkg/child/go.sum.txt does not exist"
+	bg no-wrappers - pass "no hack/deps.wrappers: this repo checks no wrapper graph"
+	bg no-wrappers-update --update pass "OK: [verify-deps] hack/deps.lock updated; review the diff and commit it"
+	bg wrappers-comment-only - pass "==> [verify-deps] replace discipline"
+	bg wrappers-orphan-lock - wrappers "hack/deps-child.lock is named by no hack/deps.wrappers line"
+	bg wrappers-file-gone - wrappers "hack/deps-child.lock is named by no hack/deps.wrappers line"
+	bg wrappers-two-fields - wrappers "hack/deps.wrappers:3: want '<name> <go.sum> hack/deps-<name>.lock'"
+	bg wrappers-four-fields - wrappers "hack/deps.wrappers:3: want '<name> <go.sum> hack/deps-<name>.lock'"
+	bg wrappers-bad-name - wrappers "name 'Child' is not lowercase"
+	bg wrappers-dotdot - wrappers "'../child/go.sum.txt' has a . or .. component"
+	bg wrappers-absolute - wrappers "'/etc/child/go.sum.txt' is not a relative path"
+	bg wrappers-lock-name - wrappers "the child lock must be hack/deps-child.lock, not 'hack/other.lock'"
+	bg wrappers-duplicate - wrappers "wrapper 'child' is listed twice"
+	bg wrappers-duplicate-sum - wrappers "pkg/child/go.sum.txt is listed twice"
+	bg wrappers-update-malformed --update wrappers "hack/deps.wrappers:3: want"
+	bg wrapper-sum-unlisted - wrappers "pkg/extra/go.sum.txt is a tracked wrapper graph that no hack/deps.wrappers line names"
+	bg wrapper-line-lock-gone - wrappers "pkg/child/go.sum.txt is a tracked wrapper graph that no hack/deps.wrappers line names"
+	bg wrapper-file-locks-gone - wrappers "pkg/child/go.sum.txt is a tracked wrapper graph that no hack/deps.wrappers line names"
+	bg wrapper-sum-untracked - pass "1 wrapper graph(s): child"
+	bg wrappers-sum-symlink - wrappers "'pkg/child/go.sum.txt' is a symlink"
+	bg wrappers-lock-symlink - wrappers "'hack/deps-child.lock' is a symlink"
+	bg wrappers-sum-index-symlink - wrappers "'pkg/child/go.sum.txt' is a symlink"
+	bg wrappers-dash - wrappers "'pkg/-child/go.sum.txt' has a component that starts with -"
+	bg wrapper-mod-renamed-sum - wrappers "pkg/extra/go.mod.txt is a tracked wrapper module with no listed go.sum beside it in pkg/extra"
+	bg wrapper-mod-no-sum - wrappers "pkg/extra/go.mod.txt is a tracked wrapper module with no listed go.sum beside it in pkg/extra"
+	bg wrappers-nested-checkout - wrappers "is not the top level of its git checkout"
+	bg wrapper-second-clean - pass "==> [verify-deps] malicious-package check (second)"
+	bg wrapper-second-lock-added - "lock (second)" "added:   example.com/sextra v1.0.0"
+	bg wrapper-second-update --update pass "wrote hack/deps-second.lock: 3 modules, 1 new or changed"
 	wait
 	for ((i = 1; i <= seq; i++)); do
 		cat "$WORK/result.$i"

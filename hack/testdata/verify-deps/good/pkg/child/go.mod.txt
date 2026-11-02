@@ -1,0 +1,3 @@
+module example.com/wchild
+
+go 1.26

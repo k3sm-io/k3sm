@@ -1,0 +1,2 @@
+# Wrapper graphs for hack/verify-deps.sh (fixture: one wrapper).
+child pkg/child/go.sum.txt hack/deps-child.lock
