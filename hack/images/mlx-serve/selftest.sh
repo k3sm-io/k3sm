@@ -49,8 +49,16 @@
 #     drifted entrypoint module, or with a file the packaging user cannot read.
 #
 # Usage: hack/images/mlx-serve/selftest.sh
+#   --staged makes rung 9a (the served-name alias and the engine source on the
+#   pinned mlx-lm) fail instead of skipping when the staged tree or its mlx_lm
+#   is missing. Any other argument is ignored.
 # Exit: 0 all checks pass, 1 otherwise.
 set -uo pipefail
+
+STAGED_REQUIRED=0
+for arg in "$@"; do
+	[ "$arg" = --staged ] && STAGED_REQUIRED=1
+done
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BUILD="$HERE/build.sh"
@@ -1326,14 +1334,151 @@ else
 	ladder skip "9s.real  no staged tree at $STAGED (run build.sh, or set K3SM_MLX_STAGE)"
 fi
 
+# ---- 9e — the engine-source check, on fixture engines (hermetic) -------------
+# A rank reads mlx_lm.server.run's source with inspect.getsource and refuses to
+# start unless it hashes to ENGINE_RUN_SHA256, so the image must carry the
+# engine's .py beside its bytecode. This driver checks exactly that, on any
+# site-packages: no sourceless bytecode in the engine package, the module
+# holding run loaded from its .py with its bytecode beside it, every hook, and
+# run's body against the pin (argv[3] overrides it; "self" pins the loaded
+# run's own). Rung 9e proves it red on a fixture engine with a wrong pin and on
+# one whose .py was dropped beside its bytecode; rung 9a runs it on the
+# staged mlx_lm against the real pin.
+cat > "$WORK/engine-source.py" <<'PY'
+import importlib, importlib.util, os, sys
+sys.path.insert(0, sys.argv[1])
+site = os.path.realpath(sys.argv[2])
+sys.path.insert(1, site)
+import k3sm_shard as ks
+
+def check(name, cond):
+    print(("ok " if cond else "no ") + name, flush=True)
+
+pkg = ks.ENGINE_MODULE.split(".")[0]
+py, pyc, orphans = 0, 0, []
+for d, _, files in os.walk(os.path.join(site, pkg)):
+    for f in files:
+        p = os.path.join(d, f)
+        if f.endswith(".py"):
+            py += 1
+        elif f.endswith(".pyc"):
+            pyc += 1
+            try:
+                src = importlib.util.source_from_cache(p) if os.path.basename(d) == "__pycache__" else p[:-1]
+            except ValueError:
+                src = None
+            if src is None or not os.path.exists(src):
+                orphans.append(os.path.relpath(p, site))
+for o in sorted(orphans)[:10]:
+    print(f"selftest: sourceless bytecode {o}", file=sys.stderr)
+check(f"source.tree  every {pkg} bytecode file has its .py source beside it",
+      py > 0 and pyc > 0 and not orphans)
+
+try:
+    server = importlib.import_module(ks.ENGINE_MODULE)
+except Exception as e:
+    print(f"selftest: cannot import {ks.ENGINE_MODULE}: {e}", file=sys.stderr)
+    server = None
+mod = sys.modules.get(getattr(getattr(server, "run", None), "__module__", None) or "")
+f = getattr(mod, "__file__", None) or ""
+check(f"source.run  the module holding run is loaded from its .py in the site-packages, its bytecode beside it",
+      f.endswith(".py") and os.path.realpath(f).startswith(site + os.sep)
+      and os.path.exists(importlib.util.cache_from_source(f)))
+
+if len(sys.argv) > 3:
+    ks.ENGINE_RUN_SHA256 = sys.argv[3]
+    if sys.argv[3] == "self" and server is not None:
+        try:
+            ks.ENGINE_RUN_SHA256 = ks.source_shape(server.run)
+        except ks.ShardError:
+            pass
+for name, fn in (("hooks  every hook the alias uses has the 0.32.0 signature, and run the pinned body", ks.check_engine_hooks),
+                 ("runshape  mlx_lm.server.run hashes to ENGINE_RUN_SHA256, the body the alias's run copies", ks.check_run_shape)):
+    try:
+        if server is None:
+            raise ks.ShardError(f"no {ks.ENGINE_MODULE} to check")
+        fn(server)
+        check(name, True)
+    except ks.ShardError as e:
+        print(f"k3sm-shard: {e}", file=sys.stderr)
+        check(name, False)
+PY
+
+# engine_source <python> <site-packages> [pin] prints the driver's verdicts,
+# one per check, in order (the verdict word only, space-separated).
+engine_source() {
+	(cd "$WORK" && PYTHONDONTWRITEBYTECODE=1 "$1" -I -B "$WORK/engine-source.py" "$HERE" "$2" "${@:3}" 2>>"$WORK/engine-source.err") |
+		awk '{ printf "%s%s", (NR > 1 ? " " : ""), $1 } END { print "" }'
+}
+
+EFIX="$WORK/engine-fix"
+mkdir -p "$EFIX/good/mlx_lm"
+: > "$EFIX/good/mlx_lm/__init__.py"
+cat > "$EFIX/good/mlx_lm/server.py" <<'PY'
+import types
+mx = types.SimpleNamespace(distributed=types.SimpleNamespace(init=lambda: None))
+def main():
+    pass
+def run(host, port, model_provider, server_class=None, handler_class=None):
+    return _run_http_server(host, port, model_provider, server_class, handler_class)
+def _run_http_server(host, port, response_generator, server_class=None, handler_class=None):
+    pass
+class ModelProvider:
+    def load(self, model_path, adapter_path=None, draft_model_path=None):
+        pass
+class APIHandler:
+    def handle_models_request(self):
+        pass
+    def _set_completion_headers(self, status_code):
+        pass
+class ResponseGenerator:
+    def join(self):
+        pass
+class LRUPromptCache:
+    pass
+PY
+# The good fixture is laid out as build.sh lays out the image: unchecked-hash
+# bytecode under __pycache__ beside every .py. The dropped one is what a build
+# that lost the sources would ship: legacy bytecode in place, no server.py.
+cp -R "$EFIX/good" "$EFIX/dropped"
+python3 -m compileall -q --invalidation-mode unchecked-hash "$EFIX/good" >/dev/null 2>&1
+python3 -m compileall -q -b --invalidation-mode unchecked-hash "$EFIX/dropped" >/dev/null 2>&1
+rm -f "$EFIX/dropped/mlx_lm/server.py"
+for leg in \
+	"good|self|ok ok ok ok|9e.green  a fixture engine with its sources, pinned to its own run, passes every check" \
+	"good|$(printf '0%.0s' $(seq 64))|ok ok no no|9e.pin  the same engine against a wrong ENGINE_RUN_SHA256 fails hooks and runshape, sources still ok" \
+	"dropped|self|no no no no|9e.dropped  an engine whose server.py was dropped beside its bytecode fails the source checks and both hash checks"; do
+	IFS='|' read -r tree pin want label <<< "$leg"
+	got="$(engine_source python3 "$EFIX/$tree" "$pin")"
+	if [ "$got" = "$want" ]; then
+		ladder ok "$label"
+	else
+		ladder no "$label (got '$got', want '$want')"
+		tail -5 "$WORK/engine-source.err"
+	fi
+done
+
 # ---- 9a — the served-name alias against the pinned mlx-lm (staged tree) ------
 # k3sm_shard's alias hooks four mlx_lm.server internals; this rung checks them
 # on the real module the image carries, so an mlx-lm bump that moves one goes
-# red here before a rank refuses to start: every hook's signature, the source
-# of the run the alias copies (pinned to 0.32.0's), and the real models
-# listing against the aliased one. No model is loaded and no distributed group
-# is formed: the handlers are built without a socket over an empty Hub cache.
+# red here before a rank refuses to start: the engine-source driver above
+# (sources beside the bytecode, every hook's signature, the source of the run
+# the alias copies against the real pin), then the real models listing against
+# the aliased one. No model is loaded and no distributed group is formed: the
+# handlers are built without a socket over an empty Hub cache. With --staged a
+# missing tree is a failure, not a skip.
 if [ -x "$STAGED/bin/python3.12" ] && [ -d "$STAGED/lib/python3.12/site-packages/mlx_lm" ]; then
+	ALIAS_CHECKS=0
+	src_out="$(cd "$WORK" && PYTHONDONTWRITEBYTECODE=1 "$STAGED/bin/python3.12" -I -B "$WORK/engine-source.py" "$HERE" "$STAGED/lib/python3.12/site-packages" 2>"$WORK/engine-real.err")"
+	while read -r verdict name; do
+		[ -n "$verdict" ] || continue
+		ALIAS_CHECKS=$((ALIAS_CHECKS + 1))
+		case "$verdict" in
+			ok) ladder ok "9a.$name" ;;
+			no) ladder no "9a.$name"; tail -5 "$WORK/engine-real.err" ;;
+			*)  ladder no "9a.driver  $verdict $name" ;;
+		esac
+	done <<< "$src_out"
 	cat > "$WORK/alias-real.py" <<'PY'
 import email.message, importlib, io, json, os, sys, tempfile, types
 sys.path.insert(0, sys.argv[1])
@@ -1344,18 +1489,6 @@ def check(name, cond):
 
 server = importlib.import_module(ks.ENGINE_MODULE)
 stock_handler = server.APIHandler
-try:
-    ks.check_engine_hooks(server)
-    check("hooks  every hook the alias uses has the 0.32.0 signature", True)
-except ks.ShardError as e:
-    print(f"k3sm-shard: {e}", file=sys.stderr)
-    check("hooks  every hook the alias uses has the 0.32.0 signature", False)
-try:
-    ks.check_run_shape(server)
-    check("runshape  mlx_lm.server.run is the 0.32.0 body the alias's run copies", True)
-except ks.ShardError as e:
-    print(f"k3sm-shard: {e}", file=sys.stderr)
-    check("runshape  mlx_lm.server.run is the 0.32.0 body the alias's run copies", False)
 
 P, H, run = ks.install_alias(server, "org/m")
 check("install  ModelProvider and run are replaced, the handler subclasses the real one",
@@ -1385,7 +1518,6 @@ check("models.same  the aliased listing is the real one with the id renamed: sta
       aliased[:2] == real[:2] and aliased[2] == {"object": real[2]["object"], "data": renamed})
 PY
 	mkdir -p "$WORK/alias-hf" "$WORK/alias-models"
-	ALIAS_CHECKS=0
 	alias_out="$(cd "$WORK" && HF_HUB_CACHE="$WORK/alias-hf" HF_HUB_OFFLINE=1 PYTHONDONTWRITEBYTECODE=1 "$STAGED/bin/python3.12" -I -B "$WORK/alias-real.py" "$HERE" "$WORK/alias-models" 2>"$WORK/alias-real.err")"
 	while read -r verdict name; do
 		[ -n "$verdict" ] || continue
@@ -1396,12 +1528,14 @@ PY
 			*)  ladder no "9a.driver  $verdict $name" ;;
 		esac
 	done <<< "$alias_out"
-	if [ "$ALIAS_CHECKS" -ge 5 ]; then
-		ladder ok "9a.count  all $ALIAS_CHECKS alias checks reported"
+	if [ "$ALIAS_CHECKS" -ge 7 ]; then
+		ladder ok "9a.count  all $ALIAS_CHECKS engine-source and alias checks reported"
 	else
-		ladder no "9a.count  only $ALIAS_CHECKS of 5 alias checks reported (the driver crashed?)"
-		tail -20 "$WORK/alias-real.err"
+		ladder no "9a.count  only $ALIAS_CHECKS of 7 engine-source and alias checks reported (a driver crashed?)"
+		tail -20 "$WORK/engine-real.err" "$WORK/alias-real.err"
 	fi
+elif [ "$STAGED_REQUIRED" = 1 ]; then
+	ladder no "9a.real  --staged, but no staged tree with mlx_lm at $STAGED (run build.sh, or set K3SM_MLX_STAGE)"
 else
 	ladder skip "9a.real  no staged tree at $STAGED (run build.sh, or set K3SM_MLX_STAGE)"
 fi
