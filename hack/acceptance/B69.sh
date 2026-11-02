@@ -188,7 +188,7 @@ build_kine() { # build_kine <version> <cgo 0|1> <gopath> -> prints the binary pa
 # verdict this gate must never get wrong.
 run_test() { # run_test <logfile> <go-test-args...>
 	local log="$1"; shift
-	( cd "$REPO_ROOT" && CGO_ENABLED=1 go test "$@" ) >"$log" 2>&1
+	( cd "$REPO_ROOT" && CGO_ENABLED=1 go test -count=1 "$@" ) >"$log" 2>&1
 }
 
 echo "==> building the superseded pin ($OLD_PIN, CGO_ENABLED=1) — the migration fixture"
