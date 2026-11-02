@@ -128,6 +128,10 @@ func classify(err error) *apiError {
 		return e(http.StatusNotFound, codeBlobUnknown, "blob unknown to registry")
 	case errors.Is(err, store.ErrDigestMismatch):
 		return e(http.StatusBadRequest, codeDigestInvalid, "provided digest did not match uploaded content")
+	case errors.Is(err, store.ErrStoreCorrupt):
+		// The registry's own copy is damaged; the client's digest is not at
+		// fault. The cause, logged at Error, names the digest.
+		return e(http.StatusInternalServerError, codeUnavailable, "the registry's stored copy of the content is corrupt")
 	case errors.Is(err, store.ErrOffsetMismatch):
 		return e(http.StatusRequestedRangeNotSatisfiable, codeBlobUploadInvalid, "chunk does not start at the session offset")
 	case errors.Is(err, ErrUnauthenticated):

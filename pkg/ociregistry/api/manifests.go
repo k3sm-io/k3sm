@@ -475,7 +475,7 @@ func (s *Server) readManifestBlob(n ref.Name, row ispec.Descriptor) ([]byte, err
 		return nil, err
 	}
 	if int64(len(b)) != row.Size || row.Digest.Algorithm().FromBytes(b) != row.Digest {
-		return nil, fmt.Errorf("%w: manifest %s", store.ErrDigestMismatch, row.Digest)
+		return nil, fmt.Errorf("%w: manifest %s", store.ErrStoreCorrupt, row.Digest)
 	}
 	return b, nil
 }
