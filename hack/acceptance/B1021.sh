@@ -41,9 +41,10 @@
 #   b1021.5  no release-built binary links the conformance launcher
 #            (k3sm.io/k3sm/hack/ociconformance/...): `go list -deps` of every
 #            main hack/release/stage.sh builds, which must include ./cmd/k3sm,
-#            and of every cmd/ main. The guarantee: no non-comment line of a
-#            release script (hack/release/*.sh and every file they source)
-#            names the launcher (ociconformance, k3sm.io/k3sm/hack/) or a
+#            and of every cmd/ main. These text rules are an early warning; the
+#            guarantee is stage.sh's build-info check of every staged Mach-O.
+#            No non-comment line of a release script (hack/release/*.sh and
+#            every file they source) names the launcher (ociconformance, k3sm.io/k3sm/hack/) or a
 #            package pattern (./..., ./hack/..., k3sm.io/k3sm/...), and a source
 #            line this check cannot resolve reds. As a coarse first layer, the
 #            count of `go build` lines in stage.sh must equal the count of mains
@@ -131,9 +132,10 @@ release_mains() {
 # `go build`, parseable or not, so a build release_mains cannot read is counted.
 # This is a coarse first layer, not a shell parser: it shares release_mains'
 # blind spots (two builds on one line, `go -C <dir> build`, `"$GO" build`, a
-# line continuation, `go install`). The guarantee is carried by
-# release_launcher_lines and release_pattern_lines below, which read every
-# release script for what a launcher build would have to contain.
+# line continuation, `go install`). release_launcher_lines and
+# release_pattern_lines below read every release script for what a launcher
+# build would have to contain; all of them are an early warning, and the
+# guarantee is hack/release/stage.sh's build-info check of the staged binaries.
 release_build_count() {
 	grep -E '(^|[^[:alnum:]_./-])go[[:space:]]+build([[:space:]]|$)' "$1" | grep -cvE '^[[:space:]]*#' || true
 }
@@ -292,7 +294,7 @@ check() {
 	elif cbad="$(launcher_deps <<<"$cdeps")" && [ -n "$cbad" ]; then
 		ladder fail "b1021.5 a cmd/ main links: $(paste -sd ' ' - <<<"$cbad")"
 	else
-		ladder ok "b1021.5 no release script ($(grep -c . <<<"$scripts")) names the launcher or a package pattern; every go build in $RELEASE_BUILDS is read (${rv#ok }), and neither they nor the cmd/ mains link a hack/ociconformance package (four self-checks red)"
+		ladder ok "b1021.5 early warning (stage.sh checks the staged binaries): no release script ($(grep -c . <<<"$scripts")) names the launcher or a package pattern; every go build in $RELEASE_BUILDS is read (${rv#ok }), and neither they nor the cmd/ mains link a hack/ociconformance package (four self-checks red)"
 	fi
 	# b1021.6
 	local lefts
