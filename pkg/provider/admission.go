@@ -212,8 +212,41 @@ func (r *runtimedRuntime) setAdmissionSource(src admissionPressure) {
 // CreatePod's track registration refuses to replace a terminal track behind
 // this. The pressure monitor's lock is a leaf, so reading it under r.mu is safe.
 func (r *runtimedRuntime) admitOnCreate(ctx context.Context, pod *corev1.Pod) (refused bool, done func()) {
+	refused, t := r.admitOnCreateTicket(ctx, pod)
+	if t == nil {
+		return refused, nil
+	}
+	return refused, t.done
+}
+
+// admitOnCreateTicket is admitOnCreate returning the admitted create's ticket,
+// so CreatePod's fence can end the in-flight count while it holds r.mu.
+//
+// A create of a pod whose refused create is still releasing at the fence waits
+// for that release first (or refuses, if ctx ends meanwhile): every resource
+// the release frees is keyed by the pod's UID, so a create admitted inside the
+// release would lose its own.
+func (r *runtimedRuntime) admitOnCreateTicket(ctx context.Context, pod *corev1.Pod) (refused bool, t *admitTicket) {
 	id := string(pod.UID)
 	r.mu.Lock()
+	for {
+		ch := r.fenceReleasing[id]
+		if ch == nil {
+			break
+		}
+		r.mu.Unlock()
+		if hook := r.fenceWaitHook; hook != nil {
+			hook(id)
+		}
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			r.log.Warn("CreatePod: gave up waiting for a refused create of the pod to release",
+				"namespace", pod.Namespace, "name", pod.Name, "uid", id, "err", ctx.Err())
+			return true, nil
+		}
+		r.mu.Lock()
+	}
 	if prior := r.track[id]; prior != nil {
 		// Admitted (or refused) at its first create; a refused or evicted pod
 		// is terminal and is never created by a repeat call.
@@ -256,23 +289,40 @@ func (r *runtimedRuntime) admitOnCreate(ctx context.Context, pod *corev1.Pod) (r
 	return true, nil
 }
 
+// admitTicket is one admitted create's in-flight count. It ends once, by done
+// or by doneLocked, however often either is called.
+type admitTicket struct {
+	r    *runtimedRuntime
+	id   string
+	once sync.Once
+}
+
+// done ends the count; the caller does not hold r.mu.
+func (t *admitTicket) done() { t.once.Do(func() { t.r.admitDone(t.id) }) }
+
+// doneLocked ends the count; the caller holds r.mu.
+func (t *admitTicket) doneLocked() { t.once.Do(func() { t.r.admitDoneLocked(t.id) }) }
+
 // admitLocked publishes one admitted create of pod id as an in-flight count
-// and returns its done, which ends it once however often it is called. The
-// caller holds r.mu; admitLocked releases it.
-func (r *runtimedRuntime) admitLocked(id string) func() {
+// and returns its ticket. The caller holds r.mu; admitLocked releases it.
+func (r *runtimedRuntime) admitLocked(id string) *admitTicket {
 	if r.admitting == nil {
 		r.admitting = map[string]int{}
 	}
 	r.admitting[id]++
 	r.mu.Unlock()
-	var once sync.Once
-	return func() { once.Do(func() { r.admitDone(id) }) }
+	return &admitTicket{r: r, id: id}
 }
 
 // admitDone ends one admitted create of pod id.
 func (r *runtimedRuntime) admitDone(id string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.admitDoneLocked(id)
+}
+
+// admitDoneLocked is admitDone for a caller holding r.mu.
+func (r *runtimedRuntime) admitDoneLocked(id string) {
 	if r.admitting[id] <= 1 {
 		delete(r.admitting, id)
 		return

@@ -19,6 +19,7 @@ package provider
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -46,13 +47,22 @@ import (
 // references before it reaches the terminal-track fence, and the fence must
 // release all of them, because a rejected track's delete frees nothing. Fails
 // without that release: the lease, the slot and the references stay held.
+//
+// "a create admitted during the release keeps its resources": as above, but in
+// the window after the fence unlocks and before it releases, the rejected
+// track is deleted and a create of the same pod on a calm node starts. That
+// create must not get its /32, alias, slot or references taken by the release,
+// which frees them by the pod's UID. Fails when the release is not decided
+// under r.mu and new creates are not held while it runs.
 func TestCreatePodFencedByRejectionReleasesNetworkAndRefs(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
 		dropInFlight bool
+		successor    bool
 	}{
 		{name: "a re-create's in-flight count keeps the refusal off"},
 		{name: "a refusal that lands anyway is released at the fence", dropInFlight: true},
+		{name: "a create admitted during the release keeps its resources", dropInFlight: true, successor: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -89,6 +99,31 @@ func TestCreatePodFencedByRejectionReleasesNetworkAndRefs(t *testing.T) {
 			}
 
 			entered, release := holdFirstAdmitted(r)
+			// The successor create starts from the fence's release window and
+			// is waited for there until it has either finished or parked
+			// behind the release, so its interleaving is chosen, not raced.
+			successor := make(chan error, 1)
+			if tc.successor {
+				parked := make(chan struct{})
+				var parkOnce, releaseOnce sync.Once
+				r.fenceWaitHook = func(string) { parkOnce.Do(func() { close(parked) }) }
+				r.fenceReleaseHook = func(string) {
+					releaseOnce.Do(func() {
+						if err := r.DeletePod(ctx, pod.DeepCopy()); err != nil {
+							t.Errorf("DeletePod of the refused pod: %v", err)
+						}
+						src.set(compressorAt(10))
+						done := make(chan error, 1)
+						go func() { done <- r.CreatePod(ctx, pod.DeepCopy()) }()
+						select {
+						case err := <-done:
+							successor <- err
+						case <-parked:
+							go func() { successor <- <-done }()
+						}
+					})
+				}
+			}
 			held := make(chan error, 1)
 			go func() { held <- r.CreatePod(ctx, pod.DeepCopy()) }()
 			awaitClosed(t, entered, "the re-create to reach the admission window")
@@ -125,6 +160,30 @@ func TestCreatePodFencedByRejectionReleasesNetworkAndRefs(t *testing.T) {
 				t.Fatalf("re-create: %v", err)
 			}
 
+			if tc.successor {
+				if err := awaitErr(t, successor, "the successor create"); err != nil {
+					t.Fatalf("successor create: %v", err)
+				}
+				if tr := r.trackByID(id); tr == nil || tr.rejected || tr.evictedStatus() != nil {
+					t.Fatalf("the successor create does not run the pod (%s)", trackState(tr))
+				}
+				if _, ok := ipam.allocations()[id]; !ok {
+					t.Error("the fence release took the successor's /32 and its lo0 alias")
+				}
+				if rec := r.interconnect.record(id); rec == nil || !rec.attached {
+					t.Errorf("the fence release took the successor's interconnect attach (%+v)", rec)
+				}
+				if n := attachedSlots(r.interconnect); n != 1 {
+					t.Errorf("interconnect slots held = %d, want the successor's 1", n)
+				}
+				r.refs.mu.Lock()
+				_, registered := r.refs.byPod[pod.UID]
+				r.refs.mu.Unlock()
+				if !registered {
+					t.Error("the fence release took the successor's reference registration")
+				}
+				return
+			}
 			if tr := r.trackByID(id); tr == nil || !tr.rejected {
 				t.Fatalf("the refusal did not stand (%s)", trackState(tr))
 			}
