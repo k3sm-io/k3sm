@@ -258,6 +258,11 @@ type runtimedRuntime struct {
 	// admitted create in flight yields to it, so the decision and its result are
 	// published together. Guarded by mu; created on first use.
 	admitting map[string]int
+	// admittedHook, when set, runs in CreatePod right after admission let the
+	// create through, before anything is registered: the seam a test uses to hold
+	// one create inside the admission window. Nil in production; set before any
+	// create and never changed, so it is read without mu.
+	admittedHook func(podID string)
 	// compensating is the set of pod ids with a compensating delete owed and in
 	// flight — a guest a parked pod's retry built after the pod was deleted, which
 	// nothing but this provider knows about (runtimed_pull.go). It is
@@ -1705,6 +1710,9 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 		return nil
 	}
 	defer admitted()
+	if hook := r.admittedHook; hook != nil {
+		hook(string(pod.UID))
+	}
 	// Bind the pod's identity (ServiceAccount + name + UID) to the request context
 	// so the shared volume Resolver mints the in-pod-API token (projected SA-token
 	// volume) against the RIGHT SA and pins it to THIS Pod object — runtimed

@@ -102,7 +102,9 @@ pin, its date, and the tarball's sha256.
   place, so a failed install leaves developer mode as it was.
 - Two creates of one Pod that raced while memory pressure changed between them could run the
   Pod while the API server reported it Failed and rejected. The admission decision and its
-  result are now recorded together, so the node and the API server always agree.
+  result are now recorded together, so the node and the API server always agree. A create
+  that finds the Pod refused or evicted while it ran now stops instead of starting it, and a
+  node whose memory monitor is not set up admits every Pod instead of crashing the create.
 - `k3sm uninstall` stops a vm pod helper still running from an older k3sm version whose
   directory is kept for it, as it stops every other helper, instead of reporting it as a
   leftover to kill by hand. Only a helper whose version directory is gone is still reported.
