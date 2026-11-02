@@ -39,6 +39,7 @@ func devModeStagedInstall(t *testing.T, signer fakeSigner) (*fakeSystem, Config,
 	seedMarkerAncestors(f)
 	f.owners[DeveloperModeMarkerPath] = OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: 0o644}
 	f.putFile(DeveloperModeMarkerPath, []byte("developer mode enabled by k3sm install on 2026-10-31T00:00:00Z\n"))
+	requireMarkerOn(t, f)
 	if err := resolveDeveloperMode(f, &cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -169,6 +170,7 @@ func TestDeveloperModeMarkerChangedUnderTheLock(t *testing.T) {
 			t.Fatal(err)
 		}
 		f.owners[DeveloperModeMarkerPath] = OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: 0o644}
+		requireMarkerOn(t, f)
 		if _, err := applyDeveloperMode(context.Background(), f, cfg); !errors.Is(err, ErrDeveloperModeChanged) {
 			t.Fatalf("applyDeveloperMode = %v, want %v", err, ErrDeveloperModeChanged)
 		}
@@ -219,9 +221,7 @@ func pinPlainInstallSignature(t *testing.T) {
 			seedMarkerAncestors(f)
 			f.owners[DeveloperModeMarkerPath] = OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: 0o644}
 			f.putFile(DeveloperModeMarkerPath, []byte("developer mode enabled by k3sm install on 2026-10-31T00:00:00Z\n"))
-			if got := ReadDeveloperModeState(f, DeveloperModeMarkerPath); got != DeveloperModeMarkerOn {
-				t.Fatalf("the seeded marker reads %s, want %s", got, DeveloperModeMarkerOn)
-			}
+			requireMarkerOn(t, f)
 			var logs strings.Builder
 			cfg := Config{
 				BinarySource:   exe,

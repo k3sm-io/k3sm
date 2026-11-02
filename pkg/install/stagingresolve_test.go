@@ -252,8 +252,11 @@ func TestResolveInstalledBinary(t *testing.T) {
 // A flat file that does not sit directly in the evaluated root, as when the
 // root link is pointed elsewhere between the two evaluations, or an entry
 // point that turns from a file into a link between its lstat and its
-// evaluation, fails closed. No install, a dangling root link included, is
-// still the entry point as named.
+// evaluation, fails closed, and so does one evaluated through a sibling whose
+// name only starts with the root's (real-evil) or a directory nested under it
+// (real/sub): the match is the whole path, never a prefix. An evaluation that
+// fails is refused, never read as no install. No install, a dangling root
+// link included, is still the entry point as named.
 func TestResolveInstalledFlatUnderLinkedRoot(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -264,6 +267,13 @@ func TestResolveInstalledFlatUnderLinkedRoot(t *testing.T) {
 		setup func(t *testing.T, real, other string)
 		// swap retargets the root link at other after the first evaluation.
 		swap bool
+		// from, when set, is the directory below the temp base the root link
+		// points at until the first evaluation, when it is retargeted at real:
+		// the entry point evaluates through from, its root through real.
+		from string
+		// evalErr, when set, is the evaluation (1 = the entry point, 2 = its
+		// root) that fails with a missing component.
+		evalErr int
 		// relink replaces the entry point with a link to the real root's
 		// versioned binary after the first lstat.
 		relink bool
@@ -288,6 +298,26 @@ func TestResolveInstalledFlatUnderLinkedRoot(t *testing.T) {
 			setup: func(t *testing.T, real, _ string) {
 				putInstalledFile(t, filepath.Join(real, "k3sm"))
 				putInstalledFile(t, filepath.Join(real, "versions", "v0.3.9", "k3sm"))
+			}},
+		{name: "a flat binary in a sibling whose name starts with the root's is refused", from: "real-evil",
+			setup: func(t *testing.T, real, _ string) {
+				putInstalledFile(t, filepath.Join(real, "k3sm"))
+				putInstalledFile(t, filepath.Join(real+"-evil", "k3sm"))
+			}},
+		{name: "a flat binary in a directory nested under the root is refused", from: "real/sub",
+			setup: func(t *testing.T, real, _ string) {
+				putInstalledFile(t, filepath.Join(real, "k3sm"))
+				putInstalledFile(t, filepath.Join(real, "sub", "k3sm"))
+			}},
+		{name: "an entry point whose evaluation fails is refused", evalErr: 1,
+			setup: func(t *testing.T, real, _ string) { putInstalledFile(t, filepath.Join(real, "k3sm")) }},
+		{name: "a flat binary whose root evaluation fails is refused", evalErr: 2,
+			setup: func(t *testing.T, real, _ string) { putInstalledFile(t, filepath.Join(real, "k3sm")) }},
+		{name: "a versioned install whose root evaluation fails is refused", evalErr: 2,
+			setup: func(t *testing.T, real, _ string) {
+				putInstalledFile(t, filepath.Join(real, "versions", "v0.3.9", "k3sm"))
+				putInstalledLink(t, "versions/v0.3.9", filepath.Join(real, "current"))
+				putInstalledLink(t, "current/k3sm", filepath.Join(real, "k3sm"))
 			}},
 		{name: "a versioned install resolves into the real root", want: "versions/v0.3.9/k3sm",
 			setup: func(t *testing.T, real, _ string) {
@@ -317,8 +347,12 @@ func TestResolveInstalledFlatUnderLinkedRoot(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			putInstalledLink(t, real, linked)
 			tc.setup(t, real, other)
+			if tc.from != "" {
+				putInstalledLink(t, filepath.Join(base, tc.from), linked)
+			} else {
+				putInstalledLink(t, real, linked)
+			}
 			lstats := 0
 			lstat := func(p string) (fs.FileInfo, error) {
 				fi, err := os.Lstat(p)
@@ -333,11 +367,21 @@ func TestResolveInstalledFlatUnderLinkedRoot(t *testing.T) {
 			evals := 0
 			eval := func(p string) (string, error) {
 				got, err := filepath.EvalSymlinks(p)
-				if evals++; tc.swap && evals == 1 {
+				if evals++; evals == tc.evalErr {
+					return "", &fs.PathError{Op: "lstat", Path: p, Err: fs.ErrNotExist}
+				}
+				retarget := ""
+				switch {
+				case tc.swap:
+					retarget = other
+				case tc.from != "":
+					retarget = real
+				}
+				if evals == 1 && retarget != "" {
 					if err := os.Remove(linked); err != nil {
 						t.Fatal(err)
 					}
-					putInstalledLink(t, other, linked)
+					putInstalledLink(t, retarget, linked)
 				}
 				return got, err
 			}
@@ -379,6 +423,7 @@ func TestDeveloperModeOffJudgesTheResolvedInstall(t *testing.T) {
 		seedMarkerAncestors(f)
 		f.owners[DeveloperModeMarkerPath] = OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: 0o644}
 		f.putFile(DeveloperModeMarkerPath, []byte("developer mode enabled by k3sm install on 2026-10-31T00:00:00Z\n"))
+		requireMarkerOn(t, f)
 		if err := resolveDeveloperMode(f, &cfg); err != nil {
 			t.Fatal(err)
 		}

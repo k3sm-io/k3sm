@@ -29,8 +29,9 @@ import (
 const unclearableMarkerRemove = "RemoveEntry:/Library:k3sm.developer-mode"
 
 // putUnclearableMarker puts a valid developer-mode marker on the fake, with
-// the directories above it, as kind.
-func putUnclearableMarker(f *fakeSystem, kind EntryKind) {
+// the directories above it, as kind. A regular file must read on.
+func putUnclearableMarker(t *testing.T, f *fakeSystem, kind EntryKind) {
+	t.Helper()
 	seedMarkerAncestors(f)
 	f.owners[DeveloperModeMarkerPath] = OwnedEntry{Path: DeveloperModeMarkerPath, Kind: kind, Mode: 0o644}
 	if kind == EntryRegular {
@@ -39,6 +40,7 @@ func putUnclearableMarker(f *fakeSystem, kind EntryKind) {
 			f.modes = map[string]fs.FileMode{}
 		}
 		f.modes[DeveloperModeMarkerPath] = 0o644
+		requireMarkerOn(t, f)
 	}
 }
 
@@ -92,7 +94,7 @@ func TestDeveloperModeMarkerUnclearableRevertsTheSwap(t *testing.T) {
 		if err := Install(context.Background(), f, stageCfg()); err != nil {
 			t.Fatalf("first Install: %v", err)
 		}
-		putUnclearableMarker(f, EntryRegular)
+		putUnclearableMarker(t, f, EntryRegular)
 		stuck(f)
 		f.putLoaded(NetdLabel, ServerLabel)
 		f.calls = nil
@@ -130,7 +132,7 @@ func TestDeveloperModeMarkerUnclearableRevertsTheSwap(t *testing.T) {
 
 	t.Run("a first install stops before anything is wired or restarted", func(t *testing.T) {
 		f := &fakeSystem{owners: map[string]OwnedEntry{}}
-		putUnclearableMarker(f, EntryRegular)
+		putUnclearableMarker(t, f, EntryRegular)
 		stuck(f)
 		cfg := stageCfg()
 		cfg.DeveloperMode = DeveloperModeOff
@@ -208,7 +210,7 @@ func TestDeveloperModeMarkerUnclearableEdgeCases(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := &fakeSystem{owners: map[string]OwnedEntry{}}
-			putUnclearableMarker(f, tc.kind)
+			putUnclearableMarker(t, f, tc.kind)
 			f.removeEntryErrs = map[string]error{DeveloperModeMarkerPath: errors.New("EPERM")}
 			cfg := stageCfg()
 			cfg.DeveloperMode = DeveloperModeOff
