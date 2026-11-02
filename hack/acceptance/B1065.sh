@@ -20,6 +20,14 @@
 #                                                tag and a GET by tag or digest
 #                                                leave the manifest's mtime alone;
 #                                                only a HEAD by digest touches it
+#   TestManifestHeadTouchRacesSweep              in pkg/ociregistry/api: the two
+#                                                interleavings of that HEAD and a
+#                                                deleting sweep, sequenced through
+#                                                the real repository lock: HEAD
+#                                                wins (the locked re-plan keeps the
+#                                                child, the index PUT finds it) and
+#                                                sweep wins (the HEAD answers 404,
+#                                                nothing is half-deleted)
 # then the api, store and gc packages, also under -race.
 #
 # Usage: hack/acceptance/B1065.sh --check
@@ -52,9 +60,10 @@ cases() {
 	[ "$n" -eq "$2" ] || { echo "B1065: FAIL: $1 ran $n cases, want $2"; exit 1; }
 }
 
-named ./pkg/ociregistry/api/ TestManifestHeadKeepsTheChildForTheIndexPut TestManifestReadsThatWriteNothing
+named ./pkg/ociregistry/api/ TestManifestHeadKeepsTheChildForTheIndexPut TestManifestReadsThatWriteNothing TestManifestHeadTouchRacesSweep
 # Both halves of the contract, and every read, must run.
 cases TestManifestHeadKeepsTheChildForTheIndexPut 2
 cases TestManifestReadsThatWriteNothing 4
+cases TestManifestHeadTouchRacesSweep 2
 go test -race -count=1 ./pkg/ociregistry/api/ ./pkg/ociregistry/store/ ./pkg/ociregistry/gc/ || { echo "B1065: FAIL: package tests"; exit 1; }
 echo "B1065: PASS"
