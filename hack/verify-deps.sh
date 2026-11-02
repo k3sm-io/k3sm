@@ -36,9 +36,10 @@
 #                            its own lock, for every wrapper hack/deps.wrappers
 #                            names. Each is built from its go.sum, outside
 #                            this repo's go.mod, so its modules are not in the
-#                            repo graph above. A hack/deps-*.lock that no line
-#                            names is refused, so a wrapper cannot drop out of
-#                            the check by losing its line
+#                            repo graph above. A hack/deps-*.lock or a tracked
+#                            *go.sum.txt that no line names is refused, so a
+#                            wrapper cannot drop out of the check by losing
+#                            its line
 #   replace discipline       every go.mod replace sits directly under its own
 #                            comment line, and a filesystem replace points
 #                            only at a sibling repo
@@ -98,8 +99,11 @@ LOCK="hack/deps.lock"
 #   <name> <go.sum> hack/deps-<name>.lock
 #
 # <name> is lowercase letters, digits and dashes; both paths are relative to the
-# repo root with no . or .. component. Any other line fails the check. No file
-# means the repo has no wrapper graph. A wrapper graph version that must clear
+# repo root with no . or .. component, no component that starts with -, and
+# neither is a symlink (on disk or in the git index). Any other line fails the
+# check. No file means the repo has no wrapper graph. Every tracked *go.sum.txt
+# outside hack/testdata must be named by a line, and every hack/deps-*.lock too,
+# so a graph cannot leave the check by losing its line. A wrapper graph version that must clear
 # the cooldown early is exempted in hack/deps.cooldown-exempt like any other,
 # with its reason (and expiry) there.
 WRAPPERS_FILE="hack/deps.wrappers"
@@ -1050,6 +1054,8 @@ malicious_check() { # malicious_check <lock-format file> [stage]
 load_wrappers() {
 	stage "wrappers"
 	: >"$WORK/wrappers"
+	command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
+		fail "wrappers" "not a git checkout: the tracked wrapper graphs are read from the git index"
 	local n=0 line name sum lock extra p bad=""
 	if [ ! -e "$WRAPPERS_FILE" ]; then
 		echo "    no $WRAPPERS_FILE: this repo checks no wrapper graph"
@@ -1074,6 +1080,10 @@ load_wrappers() {
 					bad="${bad}  $WRAPPERS_FILE:$n: '$p' is not a relative path under the repo root"$'\n'
 				else
 					case "/$p/" in */./* | */../*) bad="${bad}  $WRAPPERS_FILE:$n: '$p' has a . or .. component"$'\n' ;; esac
+					case "/$p" in */-*) bad="${bad}  $WRAPPERS_FILE:$n: '$p' has a component that starts with -"$'\n' ;; esac
+					if [ -L "$p" ] || git ls-files -s -- "$p" | grep -q '^120000 '; then
+						bad="${bad}  $WRAPPERS_FILE:$n: '$p' is a symlink: a wrapper graph and its lock are regular files"$'\n'
+					fi
 				fi
 			done
 			[ "$lock" = "hack/deps-$name.lock" ] || bad="${bad}  $WRAPPERS_FILE:$n: the $name lock must be hack/deps-$name.lock, not '$lock'"$'\n'
@@ -1085,6 +1095,16 @@ load_wrappers() {
 			echo "$name $sum $lock" >>"$WORK/wrappers"
 		done <"$WRAPPERS_FILE"
 	fi
+	# Every tracked go.sum.txt outside the fixtures is a wrapper graph some build
+	# reads, so one that no line names is a graph nothing checks. The git index is
+	# the list, so untracked scratch does not count.
+	local tracked="$WORK/tracked-sums"
+	git ls-files -- '*go.sum.txt' >"$tracked" || fail "wrappers" "cannot list the tracked files: run from a git checkout"
+	while IFS= read -r p; do
+		case "$p" in hack/testdata/*) continue ;; esac
+		awk -v s="$p" '$2 == s { f = 1 } END { exit !f }' "$WORK/wrappers" ||
+			bad="${bad}  $p is a tracked wrapper graph that no $WRAPPERS_FILE line names: list it with its lock"$'\n'
+	done <"$tracked"
 	for p in hack/deps-*.lock; do
 		[ -e "$p" ] || continue
 		awk -v l="$p" '$3 == l { f = 1 } END { exit !f }' "$WORK/wrappers" ||
@@ -1249,7 +1269,21 @@ self_test() {
 			done <"$dir/.rm"
 			rm -f "$dir/.rm"
 		fi
+		# A case's .ln holds "<path> <target> [index]" lines: <path> becomes a
+		# symlink to <target>; with "index" the index records the symlink but the
+		# working tree holds a regular copy of the target.
+		local lnpath lntarget lnmode
+		if [ -f "$dir/.ln" ]; then
+			while read -r lnpath lntarget lnmode; do
+				[ -n "$lnpath" ] || continue
+				rm -f "$dir/$lnpath"
+				mkdir -p "$(dirname "$dir/$lnpath")"
+				ln -s "$lntarget" "$dir/$lnpath"
+			done <"$dir/.ln"
+		fi
 		for f in "$dir"/hack/deps.lock "$dir"/hack/deps-*.lock "$dir/stub/info" "$dir/base/hack/deps.lock"; do
+			# A symlinked lock (an .ln case) is substituted in its target, so the link stays.
+			[ ! -L "$f" ] || f="$(dirname "$f")/$(readlink "$f")"
 			[ ! -f "$f" ] || { sed -e "s/@RECENT@/$recent/g" -e "s/@OLD@/$old/g" "$f" >"$f.s" && mv "$f.s" "$f"; }
 		done
 		# A case with base/hack/deps.lock becomes a git repo whose origin/main
@@ -1266,6 +1300,22 @@ self_test() {
 				return 0
 			fi
 			mv "$WORK/worklock-$name" "$dir/hack/deps.lock"
+		fi
+		# Every case repo is a git checkout: the wrappers stage reads the index.
+		if [ ! -e "$dir/.git" ] && ! (cd "$dir" && git init -q) >/dev/null 2>&1; then
+			echo "  FAIL $name: could not build the case git repo"
+			return 0
+		fi
+		# A case's .exclude becomes .git/info/exclude: files it names stay untracked.
+		[ ! -f "$dir/.exclude" ] || { mkdir -p "$dir/.git/info" && mv "$dir/.exclude" "$dir/.git/info/exclude"; }
+		(cd "$dir" && git add -A -- . ':!.ln') >/dev/null 2>&1 || { echo "  FAIL $name: could not stage the case repo"; return 0; }
+		if [ -f "$dir/.ln" ]; then
+			while read -r lnpath lntarget lnmode; do
+				[ "$lnmode" = index ] || continue
+				rm -f "$dir/$lnpath"
+				cp "$(dirname "$dir/$lnpath")/$lntarget" "$dir/$lnpath"
+			done <"$dir/.ln"
+			rm -f "$dir/.ln"
 		fi
 		if [ "$args" = "-" ]; then
 			out="$(cd "$dir" && env -u GONOSUMDB -u GONOSUMCHECK -u GOINSECURE -u GOPRIVATE -u GONOPROXY PATH="$td/bin:$PATH" bash hack/verify-deps.sh 2>&1)" || rc=$?
@@ -1377,6 +1427,14 @@ self_test() {
 	bg wrappers-duplicate - wrappers "wrapper 'child' is listed twice"
 	bg wrappers-duplicate-sum - wrappers "pkg/child/go.sum.txt is listed twice"
 	bg wrappers-update-malformed --update wrappers "hack/deps.wrappers:3: want"
+	bg wrapper-sum-unlisted - wrappers "pkg/extra/go.sum.txt is a tracked wrapper graph that no hack/deps.wrappers line names"
+	bg wrapper-line-lock-gone - wrappers "pkg/child/go.sum.txt is a tracked wrapper graph that no hack/deps.wrappers line names"
+	bg wrapper-file-locks-gone - wrappers "pkg/child/go.sum.txt is a tracked wrapper graph that no hack/deps.wrappers line names"
+	bg wrapper-sum-untracked - pass "1 wrapper graph(s): child"
+	bg wrappers-sum-symlink - wrappers "'pkg/child/go.sum.txt' is a symlink"
+	bg wrappers-lock-symlink - wrappers "'hack/deps-child.lock' is a symlink"
+	bg wrappers-sum-index-symlink - wrappers "'pkg/child/go.sum.txt' is a symlink"
+	bg wrappers-dash - wrappers "'pkg/-child/go.sum.txt' has a component that starts with -"
 	bg wrapper-second-clean - pass "==> [verify-deps] malicious-package check (second)"
 	bg wrapper-second-lock-added - "lock (second)" "added:   example.com/sextra v1.0.0"
 	bg wrapper-second-update --update pass "wrote hack/deps-second.lock: 3 modules, 1 new or changed"

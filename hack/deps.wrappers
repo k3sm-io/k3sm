@@ -12,3 +12,6 @@ helmchild pkg/helmchart/helmchild/go.sum.txt hack/deps-helmchild.lock
 # (hack/ociconformance.sh), test tooling that is never shipped; it runs on the
 # developer's Mac, so its graph is screened like the others.
 ociconformance hack/ociconformance/go.sum.txt hack/deps-ociconformance.lock
+# etcdchild: the etcd binary the payload carries, built by hack/etcd-wrapper.sh
+# from pkg/executor/etcdchild.
+etcdchild pkg/executor/etcdchild/go.sum.txt hack/deps-etcdchild.lock
