@@ -28,7 +28,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -329,16 +328,28 @@ var reapedCases = []reapedCase{
 	{"GET by digest, after a sweep reaped the row and the file", http.MethodGet, afterSweep},
 }
 
-// reapedAnswer is what a reaped-manifest read answered, on the wire.
+// reapedAnswer is what a reaped-manifest read answered.
 type reapedAnswer struct {
 	resp  *http.Response
 	body  []byte
 	codes []string // the refusal codes logged for the request's method
 }
 
+// reapedServe serves one request to f's server and returns the response and
+// its body.
+type reapedServe func(t *testing.T, f *fixture, r *http.Request) (*http.Response, []byte)
+
+// serveInProcess serves r through f's handler with a response recorder, so the
+// answer is what the handler wrote, before net/http frames it.
+func serveInProcess(t *testing.T, f *fixture, r *http.Request) (*http.Response, []byte) {
+	t.Helper()
+	w := f.serve(r)
+	return w.Result(), w.Body.Bytes()
+}
+
 // readReaped sets up tc's state in a fresh store, serves one read of the
-// manifest through an HTTP server and returns the answer.
-func readReaped(t *testing.T, tc reapedCase) reapedAnswer {
+// manifest with serve and returns the answer.
+func readReaped(t *testing.T, tc reapedCase, serve reapedServe) reapedAnswer {
 	t.Helper()
 	const grace = time.Hour
 	logs := &lockedBuffer{}
@@ -416,22 +427,8 @@ func readReaped(t *testing.T, tc reapedCase) reapedAnswer {
 		reaped = true
 	}
 
-	hs := httptest.NewServer(f.srv)
-	t.Cleanup(hs.Close)
 	logs.reset()
-	r, err := http.NewRequest(tc.method, hs.URL+"/v2/app/manifests/"+reference, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp, err := hs.Client().Do(r)
-	if err != nil {
-		t.Fatal(err)
-	}
-	body, err := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if err != nil {
-		t.Fatal(err)
-	}
+	resp, body := serve(t, f, httptest.NewRequest(tc.method, "/v2/app/manifests/"+reference, nil))
 	if !reaped {
 		t.Fatal("the manifest was not reaped before the read answered")
 	}
@@ -443,37 +440,33 @@ func readReaped(t *testing.T, tc reapedCase) reapedAnswer {
 // and in every state a reaped manifest can be met in: the row read before a
 // sweep removed the row and the file, a tagged row whose file is missing, and
 // both gone after the sweep. Each read answers 404, a GET with one
-// MANIFEST_UNKNOWN error in its body, and none sends a Docker-Content-Digest.
-// The answer is read on the wire, so the framing is what a client sees: a
-// GET's Content-Length is the error body's length, and a HEAD sends no
-// Content-Length (a HEAD's Content-Length would claim the size of a body the
-// matching GET does not send).
+// MANIFEST_UNKNOWN error in its body, a HEAD with no body, and none sends a
+// Docker-Content-Digest. The handler sets no Content-Length on the refusal,
+// so net/http frames it from what is written: a stale manifest length cannot
+// reach the client. The framing a client sees on the wire is pinned by
+// TestManifestReapedMidReadFramingOnTheWire, behind the integration tag.
 func TestManifestReapedMidReadAnswers404OnEveryPath(t *testing.T) {
 	for _, tc := range reapedCases {
 		t.Run(tc.name, func(t *testing.T) {
-			a := readReaped(t, tc)
+			a := readReaped(t, tc, serveInProcess)
 			if a.resp.StatusCode != http.StatusNotFound {
 				t.Fatalf("status %d, want 404; body %s", a.resp.StatusCode, a.body)
 			}
 			if got := a.resp.Header.Get("Docker-Content-Digest"); got != "" {
 				t.Errorf("Docker-Content-Digest %q on a 404", got)
 			}
-			cl := a.resp.Header.Get("Content-Length")
+			if cl := a.resp.Header.Get("Content-Length"); cl != "" {
+				t.Errorf("the handler set Content-Length %s on a refusal", cl)
+			}
 			switch tc.method {
 			case http.MethodGet:
 				var eb errorBody
 				if err := json.Unmarshal(a.body, &eb); err != nil || len(eb.Errors) != 1 || eb.Errors[0].Code != codeManifestUnknown {
 					t.Errorf("error body %s, want code %s", a.body, codeManifestUnknown)
 				}
-				if cl != strconv.Itoa(len(a.body)) {
-					t.Errorf("Content-Length %q, error body is %d bytes", cl, len(a.body))
-				}
 			case http.MethodHead:
 				if len(a.body) != 0 {
 					t.Errorf("HEAD answered a %d-byte body", len(a.body))
-				}
-				if cl != "" {
-					t.Errorf("Content-Length %s on a bodiless 404", cl)
 				}
 			}
 		})
@@ -493,7 +486,7 @@ func TestManifestHeadReapedAnswersManifestUnknownCode(t *testing.T) {
 			continue
 		}
 		t.Run(tc.name, func(t *testing.T) {
-			a := readReaped(t, tc)
+			a := readReaped(t, tc, serveInProcess)
 			if a.resp.StatusCode != http.StatusNotFound {
 				t.Fatalf("status %d, want 404", a.resp.StatusCode)
 			}
