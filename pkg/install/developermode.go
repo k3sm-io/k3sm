@@ -411,12 +411,19 @@ func (r *markerRemoval) drop(sys System, cfg Config) error {
 		return errors.Join(readErr, r.disown(sys, cfg, err))
 	}
 	r.removed = true
-	switch {
-	case r.team == "":
-	case r.invalid:
-		cfg.Logger.Info("removed an invalid developer-mode marker by an install whose k3sm is signed", "signer-team-id", r.team, "marker", r.path)
-	default:
-		cfg.Logger.Info("developer mode turned off by an install whose k3sm is signed", "signer-team-id", r.team, "marker", r.path)
+	if r.team != "" {
+		// One message per caller, because the team means a different thing in
+		// each: a plain install names the signer of the k3sm doing the install,
+		// a --from-staging install the one team every staged program shares.
+		subject := "the Developer ID team that signed the k3sm doing the install"
+		if cfg.FromStagingDir != "" {
+			subject = "the Developer ID team every staged program shares"
+		}
+		if r.invalid {
+			cfg.Logger.Info("removed an invalid developer-mode marker, by "+subject, "signer-team-id", r.team, "marker", r.path)
+		} else {
+			cfg.Logger.Info("developer mode turned off by "+subject, "signer-team-id", r.team, "marker", r.path)
+		}
 	}
 	return readErr
 }

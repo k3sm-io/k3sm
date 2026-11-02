@@ -301,14 +301,14 @@ func TestDeveloperModeMarkerOnInstall(t *testing.T) {
 					t.Error("the marker was removed")
 				}
 			}
-			info := strings.Contains(logs.String(), "level=INFO") && strings.Contains(logs.String(), `"developer mode turned off by an install whose k3sm is signed"`)
-			if tc.wantInfo && !strings.Contains(logs.String(), "team-id="+testTeamID) {
+			info := strings.Contains(logs.String(), "level=INFO") && strings.Contains(logs.String(), `"developer mode turned off by the Developer ID team that signed the k3sm doing the install"`)
+			if tc.wantInfo && (!strings.Contains(logs.String(), " signer-team-id="+testTeamID) || strings.Contains(logs.String(), " team-id=")) {
 				t.Errorf("the turned-off line does not name the team %s; logs:\n%s", testTeamID, logs.String())
 			}
 			if info != tc.wantInfo {
 				t.Errorf("the turned-off Info line logged = %v, want %v; logs:\n%s", info, tc.wantInfo, logs.String())
 			}
-			invalidInfo := strings.Contains(logs.String(), "level=INFO") && strings.Contains(logs.String(), `"removed an invalid developer-mode marker by an install whose k3sm is signed"`)
+			invalidInfo := strings.Contains(logs.String(), "level=INFO") && strings.Contains(logs.String(), `"removed an invalid developer-mode marker, by the Developer ID team that signed the k3sm doing the install"`)
 			if invalidInfo != tc.wantInvalidInfo {
 				t.Errorf("the removed-invalid Info line logged = %v, want %v; logs:\n%s", invalidInfo, tc.wantInvalidInfo, logs.String())
 			}
@@ -446,8 +446,11 @@ func TestDeveloperModeClearedByAnyDeveloperIDTeam(t *testing.T) {
 			if kept == tc.wantRemove {
 				t.Errorf("marker still there = %v, want %v", kept, !tc.wantRemove)
 			}
-			if tc.wantRemove && !strings.Contains(logs.String(), "team-id="+tc.wantTeam) {
-				t.Errorf("the turned-off line does not name team %s; logs:\n%s", tc.wantTeam, logs.String())
+			if tc.wantRemove && (!strings.Contains(logs.String(), " signer-team-id="+tc.wantTeam) || strings.Contains(logs.String(), " team-id=")) {
+				t.Errorf("the turned-off line does not name team %s under signer-team-id; logs:\n%s", tc.wantTeam, logs.String())
+			}
+			if !tc.wantRemove && (strings.Contains(logs.String(), "developer mode turned off") || strings.Contains(logs.String(), "removed an invalid developer-mode marker")) {
+				t.Errorf("a kept marker logged a turned-off message; logs:\n%s", logs.String())
 			}
 		})
 	}
@@ -689,5 +692,40 @@ func TestDeveloperModeMarkerRestoreDropsGroupAndOtherWrite(t *testing.T) {
 	}
 	if got := ReadDeveloperModeState(f, DeveloperModeMarkerPath); got != DeveloperModeMarkerOn {
 		t.Errorf("the restored marker reads %s, want %s", got, DeveloperModeMarkerOn)
+	}
+}
+
+// TestDeveloperModeOffLogNamesEachCaller pins one log message per caller of
+// markerRemoval.drop: a plain install names the signer of the k3sm doing the
+// install, a --from-staging install the team every staged program shares.
+func TestDeveloperModeOffLogNamesEachCaller(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		staging string
+		invalid bool
+		want    string
+	}{
+		{name: "plain install", want: "developer mode turned off by the Developer ID team that signed the k3sm doing the install"},
+		{name: "plain install, invalid marker", invalid: true, want: "removed an invalid developer-mode marker, by the Developer ID team that signed the k3sm doing the install"},
+		{name: "from staging", staging: "/tmp/stage", want: "developer mode turned off by the Developer ID team every staged program shares"},
+		{name: "from staging, invalid marker", staging: "/tmp/stage", invalid: true, want: "removed an invalid developer-mode marker, by the Developer ID team every staged program shares"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := &fakeSystem{owners: map[string]OwnedEntry{}}
+			var logs strings.Builder
+			cfg := Config{Logger: slog.New(slog.NewTextHandler(&logs, nil))}
+			cfg.FromStagingDir = tc.staging
+			r := &markerRemoval{path: DeveloperModeMarkerPath, team: testTeamID, invalid: tc.invalid}
+			if err := r.drop(f, cfg); err != nil {
+				t.Fatalf("drop = %v", err)
+			}
+			out := logs.String()
+			if !strings.Contains(out, `"`+tc.want+`"`) || !strings.Contains(out, " signer-team-id="+testTeamID) || strings.Contains(out, " team-id=") {
+				t.Errorf("log lacks %q with signer-team-id=%s:\n%s", tc.want, testTeamID, out)
+			}
+		})
 	}
 }
