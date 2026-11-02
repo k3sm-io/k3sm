@@ -204,8 +204,8 @@ update, stop and start it.
     down are not checked. The log line names the Developer ID team that signed the `k3sm` doing
     the install, not a check against the release team. The signature is read from that
     program's path, not from the bytes later copied into the install root, so a swap of the
-    program between the check and the copy is not seen; the only effect of a wrong reading is
-    that developer mode goes off. This check only turns developer mode off, which turns the
+    program between the check and the copy is not seen; a wrong reading can only turn
+    developer mode off, or leave it on with the reason logged. This check only turns developer mode off, which turns the
     signature checks back on. A plain install turns it off only when the marker exists, valid or
     not (an invalid marker is removed too). An ad-hoc signed build from source, or one signed for
     Apple Development, leaves it on, because neither is a Developer ID signature;

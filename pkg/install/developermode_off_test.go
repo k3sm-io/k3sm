@@ -283,7 +283,7 @@ func pinPlainInstallSignature(t *testing.T) {
 			"An ad-hoc signed build from source, or one signed for Apple Development, leaves it on",
 			"The log line names the Developer ID team that signed the `k3sm` doing the install, not a check against the release team",
 			"not from the bytes later copied into the install root",
-			"the only effect of a wrong reading is that developer mode goes off",
+			"a wrong reading can only turn developer mode off, or leave it on with the reason logged",
 			"only when the marker exists, valid or not",
 			"The log line names the Developer ID team every staged program shares",
 			"This check only turns developer mode off",
