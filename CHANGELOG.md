@@ -95,6 +95,10 @@ pin, its date, and the tarball's sha256.
 
 ### Fixed
 
+- The k3sm registry server answers a manifest whose stored bytes no longer match its digest or
+  size with a 500 that sends nothing of the manifest, logged at Error with the digest, instead of
+  a 400 `DIGEST_INVALID` that blamed the client. A blob mount from a corrupt source answers the
+  same way.
 - An install that turns developer mode off but can neither remove the developer-mode marker
   nor hand it to nobody now rolls the install root back to the previous tree, which the marker
   still matches, restarts the daemons on that tree and names the `k3sm install --developer-mode

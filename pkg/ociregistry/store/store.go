@@ -67,8 +67,13 @@ var (
 	ErrBlobUnknown = errors.New("blob unknown")
 	// ErrUploadUnknown is an upload session that does not exist.
 	ErrUploadUnknown = errors.New("upload unknown")
-	// ErrDigestMismatch is content whose digest is not the one claimed.
+	// ErrDigestMismatch is content a client sent whose digest is not the one
+	// claimed.
 	ErrDigestMismatch = errors.New("digest mismatch")
+	// ErrStoreCorrupt is stored content that no longer matches the digest or
+	// size its index row records: a fault of the store, not of the request
+	// that read it.
+	ErrStoreCorrupt = errors.New("stored content is corrupt")
 	// ErrOffsetMismatch is a chunk that does not start at the session's length.
 	ErrOffsetMismatch = errors.New("upload offset mismatch")
 	// ErrUploadTooLarge is a chunk that would take a session past its size
@@ -346,7 +351,7 @@ func (s *Store) Manifest(n ref.Name, r ref.Reference) (ispec.Descriptor, []byte,
 		return ispec.Descriptor{}, nil, err
 	}
 	if int64(len(b)) != d.Size || d.Digest.Algorithm().FromBytes(b) != d.Digest {
-		return ispec.Descriptor{}, nil, fmt.Errorf("%w: manifest %s in %s", ErrDigestMismatch, d.Digest, n)
+		return ispec.Descriptor{}, nil, fmt.Errorf("%w: manifest %s in %s", ErrStoreCorrupt, d.Digest, n)
 	}
 	return d, b, nil
 }

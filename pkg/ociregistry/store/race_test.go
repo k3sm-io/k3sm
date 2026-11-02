@@ -185,8 +185,8 @@ func TestKeepVerifiesExisting(t *testing.T) {
 		src, n, share := name(t, "src"), name(t, "app"), name(t, "share")
 		corruptBlob(t, s, src, name(t, "share2"), d)
 		corruptBlob(t, s, n, share, d)
-		if err := s.MountBlob(ctx, n, src, d); !errors.Is(err, ErrDigestMismatch) {
-			t.Fatalf("MountBlob = %v, want ErrDigestMismatch", err)
+		if err := s.MountBlob(ctx, n, src, d); !errors.Is(err, ErrStoreCorrupt) {
+			t.Fatalf("MountBlob = %v, want ErrStoreCorrupt", err)
 		}
 		noTemps(t, s, n)
 	})

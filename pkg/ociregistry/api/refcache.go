@@ -278,7 +278,7 @@ func (s *Server) referrersOf(r *http.Request, n ref.Name, d digest.Digest) ([]re
 // permanentReadError reports whether a manifest read failed for a reason that
 // will not change while the row names the same digest.
 func permanentReadError(err error) bool {
-	return errors.Is(err, store.ErrBlobUnknown) || errors.Is(err, store.ErrDigestMismatch) ||
+	return errors.Is(err, store.ErrBlobUnknown) || errors.Is(err, store.ErrStoreCorrupt) ||
 		errors.Is(err, store.ErrNotRegular) || errors.Is(err, ref.ErrSymlink) || errors.Is(err, errManifestSize)
 }
 

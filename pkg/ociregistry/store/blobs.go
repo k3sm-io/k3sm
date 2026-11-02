@@ -581,7 +581,7 @@ func (s *Store) replaceBlob(src string, srcFi os.FileInfo, srcVerified bool, dst
 			return err
 		}
 		if !ok {
-			return fmt.Errorf("%w: the source does not hash to %s either", ErrDigestMismatch, d)
+			return fmt.Errorf("%w: the source does not hash to %s either", ErrStoreCorrupt, d)
 		}
 	}
 	return os.Rename(tmp, dst)
