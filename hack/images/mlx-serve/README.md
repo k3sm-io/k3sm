@@ -362,6 +362,10 @@ mask on the real mlx-lm cache. It prints what it does **not** cover; the stage J
 the real payload walk, the push, and a sharded model on two Macs are the lab
 run.
 
+`--staged` makes the staged-tree engine rung fail instead of skip when there is
+no staged tree. `--strict-self-test` checks only that strictness and that the
+rung compares against the real pin, in seconds. Any other argument exits 2.
+
 ## Regenerating the lockfile
 
 Change `requirements.in`, then regenerate in the same commit — on a Mac,
