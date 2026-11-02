@@ -87,6 +87,10 @@ pin, its date, and the tarball's sha256.
 
 ### Fixed
 
+- A k3sm.app update that finds the installed `k3sm` link broken (pointing at a version
+  directory that is gone, or out of `/Library/k3sm`) is still refused, and the refusal now says
+  how to repair the install: re-run the install script, `curl -fsSL https://k3sm.io/install.sh | sh`,
+  then update again.
 - `k3sm uninstall` stops a vm pod helper still running from an older k3sm version whose
   directory is kept for it, as it stops every other helper, instead of reporting it as a
   leftover to kill by hand. Only a helper whose version directory is gone is still reported.
