@@ -533,3 +533,151 @@ func TestRejectedPodLogs(t *testing.T) {
 		t.Errorf("the runtime was asked about the rejected pod: %v", rec.ids)
 	}
 }
+
+// flipSource is an admission source whose snapshot alternates on every read:
+// calm, then pressured, then calm. Two creates of one pod that each read it
+// once get opposite verdicts.
+type flipSource struct {
+	mu        sync.Mutex
+	n         int
+	calm, hot hostStats
+}
+
+func (f *flipSource) latest() (hostStats, uint64, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.n++
+	if f.n%2 == 1 {
+		return f.calm, uint64(f.n), true
+	}
+	return f.hot, uint64(f.n), true
+}
+
+// TestAdmissionMixedConcurrentCreates: two CreatePods racing for one
+// BestEffort pod while the pressure verdict flips between them end with the
+// node and the apiserver agreeing. Either the pod is refused (a rejected track,
+// no runtime create, the apiserver Failed) or it is created (a live track, the
+// apiserver never Failed). A refusal is never overwritten by the admitted
+// create's track, and an admitted create never races a refusal for the pod.
+func TestAdmissionMixedConcurrentCreates(t *testing.T) {
+	h := admissionHarness(t, compressorAt(10))
+	h.r.setAdmissionSource(&flipSource{calm: compressorAt(10), hot: compressorAt(85)})
+	ctx := context.Background()
+	for i := range 50 {
+		pod := evPod("mixed-"+strconv.Itoa(i), nil, "", "")
+		if _, err := h.cs.CoreV1().Pods(pod.Namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("apiserver create: %v", err)
+		}
+		h.f.mu.Lock()
+		before := h.f.createCalls
+		h.f.mu.Unlock()
+		var wg sync.WaitGroup
+		errs := make([]error, 2)
+		for g := range 2 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				errs[g] = h.r.CreatePod(ctx, pod.DeepCopy())
+			}()
+		}
+		wg.Wait()
+		for g, err := range errs {
+			if err != nil {
+				t.Fatalf("pod %s: CreatePod %d: %v", pod.Name, g, err)
+			}
+		}
+		h.f.mu.Lock()
+		created := h.f.createCalls - before
+		h.f.mu.Unlock()
+		tr := h.r.trackByID(string(pod.UID))
+		if tr == nil {
+			t.Fatalf("pod %s: not tracked", pod.Name)
+		}
+		live, err := h.cs.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("apiserver get: %v", err)
+		}
+		apiFailed := live.Status.Phase == corev1.PodFailed
+		if tr.rejected {
+			if !apiFailed || created != 0 {
+				t.Fatalf("pod %s: refused on the node, but the apiserver phase is %q and the runtime was asked to create it %d times",
+					pod.Name, live.Status.Phase, created)
+			}
+			continue
+		}
+		if apiFailed || tr.evictedStatus() != nil {
+			t.Fatalf("pod %s: the node runs it (%d runtime creates) but the apiserver says %s/%q",
+				pod.Name, created, live.Status.Phase, live.Status.Reason)
+		}
+		if created == 0 {
+			t.Fatalf("pod %s: tracked as admitted, but the runtime was never asked to create it", pod.Name)
+		}
+	}
+}
+
+// TestBatchAdmissionAtCriticalBoundaries pins the budget refusal at the exact
+// critical trip and release of the default ladder, on the memory.compressor
+// signal: one permille short of the trip admits, the trip refuses, a value in
+// the band above the release still refuses (the rung is held), and the release
+// itself admits. Each sample is a full level dwell after the last, so the dwell
+// never masks the rung.
+func TestBatchAdmissionAtCriticalBoundaries(t *testing.T) {
+	base := budgetHost(8, 2000)
+	comp := defaultLadder(base.MemCapacityBytes, base.PIDMax).signals[budgetv1alpha1.SignalMemoryCompressor.PageCode()-1]
+	if comp.id != budgetv1alpha1.SignalMemoryCompressor || comp.rungs[rungCritical] == nil || comp.releases[rungCritical] == nil {
+		t.Fatalf("no memory.compressor critical rung and release in the default ladder: %+v", comp)
+	}
+	trip, release := *comp.rungs[rungCritical], *comp.releases[rungCritical]
+	if release >= trip-1 {
+		t.Fatalf("critical release %d leaves no band below trip %d", release, trip)
+	}
+	pod := evPod("b", nil, "64Mi", "")
+	pod.Annotations = map[string]string{budgetv1alpha1.AnnotationBand: "batch"}
+	rig := newBudgetRig(t, base)
+	rig.step(0, base)
+	steps := []struct {
+		name   string
+		v      int64
+		refuse bool
+	}{
+		{"one short of the trip", trip - 1, false},
+		{"at the trip", trip, true},
+		{"one above the release, held", release + 1, true},
+		{"at the release", release, false},
+		{"at the trip again", trip, true},
+	}
+	for _, st := range steps {
+		rig.step(budgetLevelDwell, withSignal(base, budgetv1alpha1.SignalMemoryCompressor, st.v))
+		s, _, ok := rig.m.latest()
+		res := admitPod(pod, s, ok)
+		if res.admit == st.refuse {
+			t.Errorf("%s (%d permille, trip %d, release %d): admitPod = %+v, want refused %v",
+				st.name, st.v, trip, release, res, st.refuse)
+		}
+		if st.refuse && res.reason != reasonNodeBudgetCritical {
+			t.Errorf("%s: reason %q, want %q", st.name, res.reason, reasonNodeBudgetCritical)
+		}
+	}
+}
+
+// TestAdmissionNilMonitorAdmits: a nil *pressureMonitor handed to the
+// admission source is no source, so a create on a pressured-looking pod is
+// admitted instead of calling latest on a nil monitor.
+func TestAdmissionNilMonitorAdmits(t *testing.T) {
+	h := admissionHarness(t, compressorAt(85))
+	var mon *pressureMonitor
+	h.r.setAdmissionSource(mon)
+	h.r.mu.Lock()
+	src := h.r.admission
+	h.r.mu.Unlock()
+	if src != nil {
+		t.Fatalf("admission source = %#v, want nil", src)
+	}
+	pod := evPod("be", nil, "", "")
+	if n := createOn(t, h, pod); n != 1 {
+		t.Fatalf("runtime CreatePod calls = %d, want 1", n)
+	}
+	if tr := h.r.trackByID(string(pod.UID)); tr == nil || tr.rejected {
+		t.Fatal("the pod is not tracked as admitted")
+	}
+}

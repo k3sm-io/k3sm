@@ -253,6 +253,11 @@ type runtimedRuntime struct {
 	// admission is the pressure source CreatePod admits a new pod against
 	// (admission.go); nil admits every pod. Guarded by mu.
 	admission admissionPressure
+	// admitting counts, per pod id, the creates admission let through that have
+	// not yet returned (admission.go, admitOnCreate). A refusal for a pod with an
+	// admitted create in flight yields to it, so the decision and its result are
+	// published together. Guarded by mu; created on first use.
+	admitting map[string]int
 	// compensating is the set of pod ids with a compensating delete owed and in
 	// flight — a guest a parked pod's retry built after the pod was deleted, which
 	// nothing but this provider knows about (runtimed_pull.go). It is
@@ -1695,9 +1700,11 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	// Node-side admission under pressure (admission.go), before anything is
 	// registered or allocated: a refused pod holds no address, no references and
 	// no sandbox, only its terminal status.
-	if r.admitOnCreate(ctx, pod) {
+	refused, admitted := r.admitOnCreate(ctx, pod)
+	if refused {
 		return nil
 	}
+	defer admitted()
 	// Bind the pod's identity (ServiceAccount + name + UID) to the request context
 	// so the shared volume Resolver mints the in-pod-API token (projected SA-token
 	// volume) against the RIGHT SA and pins it to THIS Pod object — runtimed
@@ -1785,6 +1792,17 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 
 	r.mu.Lock()
 	old := r.track[id]
+	if old != nil && old.evictedStatus() != nil {
+		// The pod was refused at admission or evicted while this create ran. Its
+		// terminal status is already the apiserver's; a live track here would run
+		// a pod the apiserver reports Failed. Admission's in-flight count keeps a
+		// refusal from landing between an admitted create's decision and this
+		// point, so this is the fence behind it.
+		r.mu.Unlock()
+		r.log.Warn("CreatePod: the pod became terminal on this node while it was being created; not creating it",
+			"namespace", pod.Namespace, "name", pod.Name, "uid", id, "rejected", old.rejected)
+		return nil
+	}
 	if wantsGPU {
 		// CHECK AND INSERT IN ONE CRITICAL SECTION. Two concurrent GPU creates that
 		// each read the admitted total before either wrote its own track would both
