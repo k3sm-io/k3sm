@@ -81,10 +81,14 @@ func (f *fixture) headNoLock(t *testing.T, path string, release func()) *httptes
 	t.Helper()
 	done := make(chan *httptest.ResponseRecorder, 1)
 	go func() { done <- f.do(http.MethodHead, path, nil) }()
+	// The watchdog only bounds a HEAD that is blocked on the held lock; a HEAD
+	// that takes no lock answers through done long before it fires.
+	watchdog := time.NewTimer(10 * time.Second)
+	defer watchdog.Stop()
 	select {
 	case w := <-done:
 		return w
-	case <-time.After(10 * time.Second):
+	case <-watchdog.C:
 		t.Errorf("HEAD %s waited on the repository lock", path)
 		release()
 		return <-done
