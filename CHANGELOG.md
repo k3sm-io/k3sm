@@ -110,7 +110,9 @@ pin, its date, and the tarball's sha256.
   place, so a failed install leaves developer mode as it was.
 - Two creates of one Pod that raced while memory pressure changed between them could run the
   Pod while the API server reported it Failed and rejected. The admission decision and its
-  result are now recorded together, so the node and the API server always agree.
+  result are now recorded together, so the node and the API server always agree. A create
+  that finds the Pod refused or evicted while it ran now stops instead of starting it, and a
+  node whose memory monitor is not set up admits every Pod instead of crashing the create.
 - A k3sm version directory a running pod uses is kept even when the pod's path spells the
   version's pre-release in a different case from the directory (`0.3.0-RC1` against
   `0.3.0-rc1` on a case-insensitive volume). A pod path whose version has no directory is
