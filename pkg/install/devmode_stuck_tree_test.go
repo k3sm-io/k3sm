@@ -179,7 +179,7 @@ func TestDeveloperModeStuckMarkerWithdrawIsOneWay(t *testing.T) {
 	live, staging := DefaultInstallDir, DefaultInstallDir+installSwapSuffix
 	planted := staging + "/planted"
 	f := &fakeSystem{owners: map[string]OwnedEntry{}}
-	stuckMarker(f)
+	stuckMarker(t, f)
 	f.calls = nil
 	occupy := &occupyAfterPublish{fakeSystem: f, path: planted}
 	cfg := stageCfg()
