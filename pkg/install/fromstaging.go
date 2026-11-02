@@ -536,6 +536,8 @@ func checkSigningContinuity(ctx context.Context, cfg Config, installed string, e
 		if err := requireTreeTeam(ctx, cfg, entries, team); err != nil {
 			return err
 		}
+		// team-id, not signer-team-id: this line reports the team the continuity check
+		// required of the tree, which is not the signer-of-the-installing-k3sm log of the off switch.
 		cfg.Logger.Info("first install from a k3sm.app staging directory", "team-id", team)
 		return nil
 	case errors.Is(err, ErrNoTeamID):
@@ -556,6 +558,8 @@ func checkSigningContinuity(ctx context.Context, cfg Config, installed string, e
 		if err := requireTreeTeam(ctx, cfg, entries, team); err != nil {
 			return err
 		}
+		// team-id, not signer-team-id: this line reports the team the continuity check
+		// required of the tree, which is not the signer-of-the-installing-k3sm log of the off switch.
 		cfg.Logger.Info("updating an ad-hoc signed install with a team-signed build", "team-id", team)
 		return nil
 	case err != nil:

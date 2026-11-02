@@ -26,7 +26,7 @@ pin, its date, and the tarball's sha256.
   `developer-mode` row while it is on. [Developer mode](docs/user/install.md#developer-mode)
   describes what is no longer checked.
 - A plain `k3sm install` turns developer mode off when its `k3sm` carries a Developer ID signature of
-  any team; the other programs it installs are not checked, and the log line names the signer team, which is not a check against the release team.
+  any team; the other programs it installs are not checked, and the log line names the team that signed that `k3sm`, which is not a check against the release team. A k3sm.app update's log line names the team every staged program shares. The signature is read from the program's path, and an ad-hoc signed `k3sm` leaves developer mode on.
 - k3sm.app checks for a newer k3sm.app against a signed release index, and can move the cluster
   to the k3sm release the app carries with `k3sm update apply --version <tag> --pin-sha256
   <digest>`, the digest taken from the app's signed record. [Upgrade](docs/user/upgrade.md) describes

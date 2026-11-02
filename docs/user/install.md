@@ -201,15 +201,18 @@ update, stop and start it.
   - a plain `sudo k3sm install` turns it off when the `k3sm` doing the install carries a
     Developer ID Application signature of any team, not only the team that signs k3sm releases.
     The team is not compared with the installed one, and the other programs the install lays
-    down are not checked. The team in the log line is the signer of the `k3sm` doing the install,
-    not a check against the release team, and the signature is read from that program's path.
-    This check only turns developer mode off, which turns the signature checks back on. A plain
-    install turns it off only when the marker exists. An ad-hoc signed build from source, or one
-    signed for Apple Development, leaves it on;
+    down are not checked. The log line names the Developer ID team that signed the `k3sm` doing
+    the install, not a check against the release team. The signature is read from that
+    program's path, not from the bytes later copied into the install root, so a swap of the
+    program between the check and the copy is not seen; a wrong reading can only turn
+    developer mode off, or leave it on with the reason logged. This check only turns developer mode off, which turns the
+    signature checks back on. A plain install turns it off only when the marker exists, valid or
+    not (an invalid marker is removed too). An ad-hoc signed build from source, or one signed for
+    Apple Development, leaves it on, because neither is a Developer ID signature;
   - an update through k3sm.app turns it off only when every program in the update carries a
     Developer ID Application signature of one team, and that team is the installed k3sm's when
     the installed k3sm has one. That is the same team the signature checks require of an update
-    when the mode is off.
+    when the mode is off. The log line names the Developer ID team every staged program shares.
 
   An install that leaves the mode on says why.
 - **Auditing a Mac.** The record is the marker `/Library/k3sm.developer-mode`: a root-owned file,
