@@ -24,7 +24,6 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"path/filepath"
 	"slices"
 	"sync"
 	"testing"
@@ -98,7 +97,7 @@ func (f *fixture) hookedCollector(t *testing.T, grace time.Duration, hook func()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(f.st.StateDir(), gc.MarkerName), []byte("ran\n"), 0o600); err != nil {
+	if err := gc.WriteMarker(f.st, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	return c
