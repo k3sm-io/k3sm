@@ -1759,56 +1759,6 @@ func stageTokenFile(sys System, uid uint32, token, dst, what string, mode, dirMo
 	return nil
 }
 
-// ensureStateTree applies the ownership table (OwnershipOf) to the data root and
-// every service-user tree under it, in the table's order.
-//
-// The root goes FIRST, and that order is the safety argument for everything
-// after it. Each level is repaired by path, and a by-path chown is only as safe
-// as the directory the path is resolved in: once the root is root:wheel 0755,
-// no unprivileged principal can rename or replace any entry directly inside it,
-// so the service-user trees chowned next are the directories that were there
-// when they were checked (and EnsureOwnedDir refuses one that is a symlink).
-// Healing a root an older build left service-user-owned is this same first
-// step; nothing else in the installer ever hands the root to the service user.
-//
-// The trees are created as root because the service user can no longer create
-// a top-level directory of its own under a root-owned root.
-//
-// Three rows are applied by a later step instead, each through its own seam and
-// with the same row's values:
-//
-//   - the key directory is MeshKeyDir, a fixed path the netd plist names
-//     whatever this Config's data root is, and provisionMeshKey ensures it
-//     (EnsureMeshKeyDir) before it writes a key;
-//   - the two work dirs are handed over by the steps that write into them
-//     (WriteServiceUserFile creates its parent at ServerTokenDirMode or
-//     AgentTokenDirMode), and the agent's is ALSO where adoptLegacyAgentFiles
-//     migrates root-owned credentials files-first, directory-last, so the
-//     service user never owns that directory while a root-owned file in it is
-//     still pending. Chowning it here, before that step, would break the order.
-func ensureStateTree(sys System, cfg Config, uid uint32) error {
-	appliedLater := map[StateLevel]bool{
-		StateKeys:                        true,
-		StateLevel(sandbox.ServerSubdir): true,
-		StateLevel(agentWorkSubdir):      true,
-	}
-	for _, level := range StateLevels() {
-		if appliedLater[level] {
-			continue
-		}
-		own, _ := OwnershipOf(level)
-		dir := level.Path(cfg.DataRoot)
-		if err := sys.EnsureOwnedDir(dir, own.UID(int(uid)), own.GID, own.Mode); err != nil {
-			return fmt.Errorf("install: ensure %s (%d:%d %#o): %w", dir, own.UID(int(uid)), own.GID, own.Mode, err)
-		}
-	}
-	if err := ensureRuntimeRootLock(sys, cfg, uid); err != nil {
-		return err
-	}
-	cfg.Logger.Info("ensured the data root and the service user's trees under it", "root", cfg.DataRoot, "trees", len(ServiceLevels()))
-	return nil
-}
-
 // ErrNotRegularFile is what ReadRegularFile reports for a path that exists but
 // is a symlink, a directory, a device or a fifo. It is a sentinel because the
 // callers must tell it apart from "absent": absence is a posture (nothing has
