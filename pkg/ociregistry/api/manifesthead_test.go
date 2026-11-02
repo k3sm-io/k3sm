@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -226,5 +227,85 @@ func TestManifestHeadAfterReapAnswers404(t *testing.T) {
 	}
 	if len(codes) != 1 || codes[0] != codeManifestUnknown {
 		t.Fatalf("HEAD answered codes %v, want [%s]", codes, codeManifestUnknown)
+	}
+}
+
+// TestManifestReapedMidReadAnswers404OnEveryPath pins the answer for a
+// manifest that is gone when the read reaches its file, on every manifest
+// read path: HEAD and GET, each by digest and by tag. The index row is found
+// and the file is not, the state a sweep leaves between the lookup and the
+// read. Each path answers 404, the GET paths with MANIFEST_UNKNOWN in the
+// body, and none sends a Docker-Content-Digest or a Content-Length that
+// disagrees with the error body. The HEAD by digest reaps through the
+// manifestRead seam; the others remove the file after the row is written,
+// since the store reads the row and the file inside one call with no seam
+// between them.
+func TestManifestReapedMidReadAnswers404OnEveryPath(t *testing.T) {
+	const grace = time.Hour
+	for _, tc := range []struct {
+		name   string
+		method string
+		byTag  bool
+	}{
+		{"HEAD by digest", http.MethodHead, false},
+		{"HEAD by tag", http.MethodHead, true},
+		{"GET by digest", http.MethodGet, false},
+		{"GET by tag", http.MethodGet, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			// A tagged image keeps half of the repository referenced, so the
+			// sweep's half-repository brake does not hold.
+			f.image(t, "app", "kept", "kept-layer")
+			tag := ""
+			if tc.byTag {
+				tag = "v1"
+			}
+			cd := dg(f.image(t, "app", tag, "child-layer"))
+			reference := cd.String()
+			if tc.byTag {
+				reference = tag
+			}
+			reaped := false
+			reap := func() {
+				if err := os.Remove(f.blobFile("app", cd)); err != nil {
+					t.Error(err)
+				}
+				reaped = true
+			}
+			if tc.method == http.MethodHead && !tc.byTag {
+				f.age(t, "app", time.Now().Add(-2*grace), cd)
+				c := f.deletingCollector(t, grace)
+				f.srv.manifestRead = func() {
+					if _, err := c.Sweep(context.Background()); err != nil {
+						t.Error(err)
+					}
+					if _, err := os.Stat(f.blobFile("app", cd)); !errors.Is(err, fs.ErrNotExist) {
+						t.Errorf("the sweep kept the manifest %s: stat %v", cd, err)
+					}
+					reaped = true
+				}
+			} else {
+				reap()
+			}
+			w := f.do(tc.method, "/v2/app/manifests/"+reference, nil)
+			if !reaped {
+				t.Fatal("the manifest was not reaped before the read")
+			}
+			code := codeManifestUnknown
+			if tc.method == http.MethodHead {
+				code = "" // a HEAD answer carries no body
+			}
+			want(t, w, http.StatusNotFound, code)
+			if got := w.Header().Get("Docker-Content-Digest"); got != "" {
+				t.Errorf("Docker-Content-Digest %q on a 404", got)
+			}
+			if cl := w.Header().Get("Content-Length"); cl != "" && tc.method == http.MethodGet && cl != strconv.Itoa(w.Body.Len()) {
+				t.Errorf("Content-Length %s, error body is %d bytes", cl, w.Body.Len())
+			}
+			if cl := w.Header().Get("Content-Length"); cl != "" && tc.method == http.MethodHead && cl != "0" {
+				t.Errorf("Content-Length %s on a bodiless 404", cl)
+			}
+		})
 	}
 }
