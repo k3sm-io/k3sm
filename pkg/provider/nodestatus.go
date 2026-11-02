@@ -70,6 +70,10 @@ type NodeStatusConfig struct {
 	// PIDPressure's per-uid leg. A nil value means the runtime keeps no process
 	// ledger (the host-process runtime), and only the systemwide leg runs.
 	PodProcesses PodProcessCounter
+	// Sleep, when set, adds its Sleeping condition to every publication and
+	// may ask for an immediate one on a sleep or wake notice. nil publishes no
+	// Sleeping condition.
+	Sleep *SleepReporter
 	// Interval overrides the status recompute period; zero uses
 	// defaultNodeStatusInterval.
 	Interval time.Duration
@@ -159,6 +163,12 @@ type NodeStatusProvider struct {
 
 	// monitor owns the host sample (see the type doc).
 	monitor *pressureMonitor
+
+	// sleep is the optional sleep reporter; kicks carries its requests for an
+	// immediate publication into Run, which closes the request's channel once
+	// the publication is handed over.
+	sleep *SleepReporter
+	kicks chan chan struct{}
 }
 
 // Compile-time check that the status provider satisfies the VK node contract.
@@ -208,6 +218,11 @@ func NewNodeStatusProvider(cfg NodeStatusConfig) (*NodeStatusProvider, error) {
 		// documented: a runtime that is broken from boot is reported Ready for
 		// threshold intervals before the flip.
 		ready: newProbeGauge(1, defaultProbeFailureThreshold, outcomeSuccess),
+		sleep: cfg.Sleep,
+		kicks: make(chan chan struct{}),
+	}
+	if p.sleep != nil {
+		p.sleep.publish = p.requestPublish
 	}
 	// The monitor reads p.sample at call time, so a test that swaps the seam
 	// after construction is honoured.
@@ -290,7 +305,27 @@ func (p *NodeStatusProvider) Run(ctx context.Context) error {
 			p.publishLogged(ctx)
 		case <-p.monitor.edges():
 			p.publishLogged(ctx)
+		case done := <-p.kicks:
+			p.publishLogged(ctx)
+			close(done)
 		}
+	}
+}
+
+// requestPublish asks Run for an immediate publication and waits until it has
+// been handed to the node controller, or ctx is done.
+func (p *NodeStatusProvider) requestPublish(ctx context.Context) error {
+	done := make(chan struct{})
+	select {
+	case p.kicks <- done:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -491,6 +526,9 @@ func (p *NodeStatusProvider) recompute(s hostStats, sampled, healthy bool, now m
 		outcome = outcomeFailure
 	}
 	raw = append(raw, readyCondition(p.ready.record(outcome), now))
+	if p.sleep != nil {
+		raw = append(raw, p.sleep.condition(now))
+	}
 
 	next := reconcileTransitions(p.prev, raw, s)
 	p.prev = next
@@ -520,8 +558,8 @@ func (p *NodeStatusProvider) pressureVerdicts(s hostStats, sampled bool, now met
 	}
 	var out []corev1.NodeCondition
 	for _, c := range p.prev {
-		if c.Type == corev1.NodeReady {
-			continue // re-derived from live health every cycle, never carried
+		if c.Type == corev1.NodeReady || c.Type == nodeSleeping {
+			continue // re-derived every cycle, never carried
 		}
 		c.LastHeartbeatTime = now
 		out = append(out, c)
