@@ -301,14 +301,14 @@ func TestDeveloperModeMarkerOnInstall(t *testing.T) {
 					t.Error("the marker was removed")
 				}
 			}
-			info := strings.Contains(logs.String(), "level=INFO") && strings.Contains(logs.String(), `"developer mode turned off by a signed install"`)
+			info := strings.Contains(logs.String(), "level=INFO") && strings.Contains(logs.String(), `"developer mode turned off by an install whose k3sm is signed"`)
 			if tc.wantInfo && !strings.Contains(logs.String(), "team-id="+testTeamID) {
 				t.Errorf("the turned-off line does not name the team %s; logs:\n%s", testTeamID, logs.String())
 			}
 			if info != tc.wantInfo {
 				t.Errorf("the turned-off Info line logged = %v, want %v; logs:\n%s", info, tc.wantInfo, logs.String())
 			}
-			invalidInfo := strings.Contains(logs.String(), "level=INFO") && strings.Contains(logs.String(), `"removed an invalid developer-mode marker by a signed install"`)
+			invalidInfo := strings.Contains(logs.String(), "level=INFO") && strings.Contains(logs.String(), `"removed an invalid developer-mode marker by an install whose k3sm is signed"`)
 			if invalidInfo != tc.wantInvalidInfo {
 				t.Errorf("the removed-invalid Info line logged = %v, want %v; logs:\n%s", invalidInfo, tc.wantInvalidInfo, logs.String())
 			}

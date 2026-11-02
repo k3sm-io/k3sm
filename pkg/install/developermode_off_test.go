@@ -254,9 +254,9 @@ func pinPlainInstallSignature(t *testing.T) {
 				t.Fatalf("marker kept = %v, want %v; logs:\n%s", kept, !tc.wantRemove, logs.String())
 			}
 			if tc.wantRemove {
-				want := "developer mode turned off by a signed install"
-				if !strings.Contains(logs.String(), want) || !strings.Contains(logs.String(), "team-id="+tc.wantTeam) {
-					t.Errorf("log does not say %q with team-id=%s:\n%s", want, tc.wantTeam, logs.String())
+				want := "developer mode turned off by an install whose k3sm is signed"
+				if !strings.Contains(logs.String(), want) || !strings.Contains(logs.String(), "signer-team-id="+tc.wantTeam) {
+					t.Errorf("log does not say %q with signer-team-id=%s:\n%s", want, tc.wantTeam, logs.String())
 				}
 			} else {
 				if !strings.Contains(logs.String(), "developer mode stays on") {
@@ -281,6 +281,9 @@ func pinPlainInstallSignature(t *testing.T) {
 			"The team is not compared with the installed one",
 			"the other programs the install lays down are not checked",
 			"An ad-hoc signed build from source, or one signed for Apple Development, leaves it on",
+			"The team in the log line is the signer of the `k3sm` doing the install, not a check against the release team",
+			"This check only turns developer mode off",
+			"turns it off only when the marker exists",
 		} {
 			if !strings.Contains(text, want) {
 				t.Errorf("docs/user/install.md lacks %q", want)
