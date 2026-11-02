@@ -483,21 +483,29 @@ func (c *Controller) gangFault(ctx context.Context, model *mlxv1alpha1.MLXModel,
 		case pod.Annotations[mlx.AnnotationSpecHash] != hash:
 			return fmt.Sprintf("rank pod %s was rendered from an older spec", pod.Name), nil
 		}
-		ready, ok := nodeReadyCache[pod.Spec.NodeName]
+		// The node the rank was placed for (its hostname affinity), not
+		// spec.nodeName: a rank still waiting on the scheduler has no
+		// spec.nodeName yet, and a rank whose placed node is gone or NotReady is
+		// lost whether or not the scheduler has bound it.
+		placed := placedNode(pod)
+		if placed == "" {
+			return fmt.Sprintf("rank pod %s names no placed node", pod.Name), nil
+		}
+		ready, ok := nodeReadyCache[placed]
 		if !ok {
-			node, err := c.client.CoreV1().Nodes().Get(ctx, pod.Spec.NodeName, metav1.GetOptions{})
+			node, err := c.client.CoreV1().Nodes().Get(ctx, placed, metav1.GetOptions{})
 			switch {
 			case apierrors.IsNotFound(err):
 				ready = false
 			case err != nil:
-				return "", fmt.Errorf("get node %s for rank pod %s: %w", pod.Spec.NodeName, pod.Name, err)
+				return "", fmt.Errorf("get node %s for rank pod %s: %w", placed, pod.Name, err)
 			default:
 				ready = nodeReady(node)
 			}
-			nodeReadyCache[pod.Spec.NodeName] = ready
+			nodeReadyCache[placed] = ready
 		}
 		if !ready {
-			return fmt.Sprintf("rank pod %s is on node %s, which is NotReady or gone", pod.Name, pod.Spec.NodeName), nil
+			return fmt.Sprintf("rank pod %s is placed on node %s, which is NotReady or gone", pod.Name, placed), nil
 		}
 	}
 	for rank, ok := range seen {
@@ -586,7 +594,7 @@ func (c *Controller) placedObservation(model *mlxv1alpha1.MLXModel, pods []corev
 	obs := mlx.ShardObservation{Desired: desired, Placed: true, SpecHash: hash, Pods: states}
 	var nodes []string
 	for i := range pods {
-		nodes = append(nodes, pods[i].Spec.NodeName)
+		nodes = append(nodes, placedNode(&pods[i]))
 	}
 	if len(pods) > 0 {
 		obs.Backend = mlxv1alpha1.MLXDistributedBackend(pods[0].Annotations[mlx.AnnotationBackend])
@@ -610,6 +618,16 @@ func (c *Controller) placedObservation(model *mlxv1alpha1.MLXModel, pods []corev
 	}
 	obs.PlacementMessage = fmt.Sprintf("%d ranks placed on %s (%s over %s)", len(pods), strings.Join(nodes, ", "), obs.Backend, obs.Interconnect)
 	return obs
+}
+
+// placedNode is the node a rank Pod was placed for: its required hostname
+// affinity, or spec.nodeName for a rank Pod rendered before ranks were placed
+// through the scheduler. "" when it names neither.
+func placedNode(pod *corev1.Pod) string {
+	if n := mlx.RankPodNode(pod); n != "" {
+		return n
+	}
+	return pod.Spec.NodeName
 }
 
 // placedNodes lists a placement's nodes in rank order, for a log line.

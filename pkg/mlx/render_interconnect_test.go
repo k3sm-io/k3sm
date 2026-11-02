@@ -94,9 +94,9 @@ func TestShardedHostfileUsesInterconnectAddresses(t *testing.T) {
 			t.Errorf("rank %d %s = %q, want %q", r, envHosts, got, wantHosts)
 		}
 		own := strings.Split(env[envHosts], ",")[r]
-		if host, _, _ := strings.Cut(own, ":"); host != slot1(t, pod.Spec.NodeName).String() {
+		if host, _, _ := strings.Cut(own, ":"); host != slot1(t, RankPodNode(pod)).String() {
 			t.Errorf("rank %d own hostfile entry %q is not %s's slot-1 address %s (its %s)",
-				r, own, pod.Spec.NodeName, slot1(t, pod.Spec.NodeName), podnet.EnvInterconnectIP)
+				r, own, RankPodNode(pod), slot1(t, RankPodNode(pod)), podnet.EnvInterconnectIP)
 		}
 		if got := pod.Annotations[netv1alpha1.AnnotationInterconnects]; got != netv1alpha1.MediumThunderbolt {
 			t.Errorf("rank %d %s = %q, want %q", r, netv1alpha1.AnnotationInterconnects, got, netv1alpha1.MediumThunderbolt)
@@ -158,13 +158,13 @@ func TestShardedHostfileUsesInterconnectAddresses(t *testing.T) {
 		for _, pod := range objs.Pods {
 			env := podEnv(pod)
 			env["TMPDIR"] = t.TempDir()
-			env[podnet.EnvInterconnectIP] = slot1(t, pod.Spec.NodeName).String()
+			env[podnet.EnvInterconnectIP] = slot1(t, RankPodNode(pod)).String()
 			runs = append(runs, rankRun{Env: env})
 		}
 		// Rank 1 handed rank 0's address, and rank 2 with no attached address.
 		mismatch := podEnv(objs.Pods[1])
 		mismatch["TMPDIR"] = t.TempDir()
-		mismatch[podnet.EnvInterconnectIP] = slot1(t, objs.Pods[0].Spec.NodeName).String()
+		mismatch[podnet.EnvInterconnectIP] = slot1(t, RankPodNode(objs.Pods[0])).String()
 		unattached := podEnv(objs.Pods[2])
 		unattached["TMPDIR"] = t.TempDir()
 		runs = append(runs, rankRun{Env: mismatch}, rankRun{Env: unattached})

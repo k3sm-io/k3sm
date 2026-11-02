@@ -300,6 +300,10 @@ pin, its date, and the tarball's sha256.
   writer is not running (before it starts, after it stops, or once it has exited): the kill
   intent is written at once. A symlink or a FIFO at the budget history path in the node's work
   dir is refused as unreadable and moved aside, never read through or waited on.
+- A sharded MLXModel whose ranks mount a cache now starts. Each rank Pod was bound to its node
+  directly, so the scheduler never saw it and its cache claim, which waits for the first consumer,
+  was never bound; the ranks sat in `ContainerCreating`. Ranks are now pinned to their placed node
+  with a required node affinity on `kubernetes.io/hostname`, and the scheduler binds the claim there.
 - A k3sm.app update that finds the installed `k3sm` link broken (pointing at a version
   directory that is gone, or out of `/Library/k3sm`) is still refused, and the refusal now says
   how to repair the install: re-run the install script, `curl -fsSL https://k3sm.io/install.sh | sh`,
