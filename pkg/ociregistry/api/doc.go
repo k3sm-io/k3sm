@@ -32,17 +32,19 @@ limitations under the License.
 //
 //   - manifest GET and HEAD ignore Accept and answer with the media type the
 //     manifest was pushed with, and Docker-Content-Digest; a HEAD by digest
-//     restarts the manifest's garbage-collection grace (store.TouchBlob), so
-//     a client that skips pushing an index's child on a HEAD hit finds it at
-//     the index PUT, while a HEAD by tag and every GET write nothing;
+//     of an untagged row restarts the manifest's garbage-collection grace
+//     (store.TouchBlob, bounded as below), so a client that skips pushing an
+//     index's child on a HEAD hit finds it at the index PUT, while a HEAD by
+//     tag, a HEAD of a tagged row and every GET write nothing;
 //   - a manifest PUT accepts the OCI manifest and index and the Docker v2
 //     manifest and manifest list (415 otherwise), reads at most 4 MiB (413
 //     above), requires the blobs an image manifest names to be in the
 //     repository and never requires an index's children;
 //   - a blob GET goes through http.ServeContent, so Range, 206 and 416 are
 //     the standard library's; a blob HEAD restarts the blob's
-//     garbage-collection grace (store.TouchBlob), so a client that skips an
-//     upload on a HEAD hit finds the blob at its manifest PUT;
+//     garbage-collection grace (store.TouchBlob, bounded as below), so a
+//     client that skips an upload on a HEAD hit finds the blob at its
+//     manifest PUT;
 //   - upload Location headers are path-only, a status GET answers 204 with
 //     Range "0-<n-1>", and both Blob-Upload-UUID and Docker-Upload-UUID are set;
 //   - a mount links the blob from the repository named by from and from no
@@ -55,6 +57,31 @@ limitations under the License.
 //     nothing. The registry this replaces ignores If-Match;
 //   - blobs are never deleted through the API; garbage collection removes
 //     them.
+//
+// A HEAD is a read, anonymous where reads are, so the write it makes is
+// bounded. It writes at most once per half of the collector's grace
+// (Config.GCGrace) per object, never on a manifest any tagged row names, and
+// takes the repository lock only to make that write; every other HEAD is
+// answered from a stat. This does not stop a caller from keeping an untagged
+// object alive: one HEAD just past every half-grace does it. Knowing the
+// digest is the capability, as it is for the blob HEAD and as a push of the
+// same content would be. A touch that fails for any reason other than the
+// object being gone (a read-only or degraded store, a client that gave up
+// waiting for the lock) is logged and the HEAD answers 200: the read
+// succeeded, and the touch only protects a push that may follow. The object
+// is then not touched again, and its lock not taken, for half the grace, and
+// the failure is logged once for that window; the server remembers at most
+// 4096 such objects, dropping the one whose window ends first. The trade is
+// that a client that HEADs an object and then waits longer than half the
+// grace before the PUT naming it, or HEADs on a store that cannot be written,
+// is not protected by that HEAD and can find the object reaped; a push that
+// fits in half the grace, the case the touch exists for, is protected as
+// before.
+//
+// GCGrace is required, as gc.Options.Grace is, and New refuses a server
+// without it. Whoever wires the server and the collector over one store must
+// pass both the same value: a smaller GCGrace touches more often than needed,
+// a larger one widens the window above in which a HEAD protects nothing.
 //
 // Limits, each a Config field with a default:
 //

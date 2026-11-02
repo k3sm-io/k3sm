@@ -19,6 +19,7 @@ package main
 import (
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1/random"
@@ -36,7 +37,7 @@ func newRegistryServer(t *testing.T) http.Handler {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := api.New(api.Config{Store: st, Authorize: api.AllowAll, FreeSpace: func() (uint64, error) { return 1 << 40, nil }})
+	srv, err := api.New(api.Config{Store: st, GCGrace: time.Hour, Authorize: api.AllowAll, FreeSpace: func() (uint64, error) { return 1 << 40, nil }})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -17,9 +17,10 @@
 #                                                sweep reaps the child, so the
 #                                                test is not vacuous
 #   TestManifestReadsThatWriteNothing            in pkg/ociregistry/api: a HEAD by
-#                                                tag and a GET by tag or digest
-#                                                leave the manifest's mtime alone;
-#                                                only a HEAD by digest touches it
+#                                                tag or digest and a GET by tag or
+#                                                digest leave a tagged manifest's
+#                                                mtime alone; only a HEAD by digest
+#                                                of an untagged one touches it
 #   TestManifestHeadTouchRacesSweep              in pkg/ociregistry/api: the two
 #                                                interleavings of that HEAD and a
 #                                                deleting sweep, sequenced through

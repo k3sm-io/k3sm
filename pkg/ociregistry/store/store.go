@@ -91,6 +91,9 @@ type Store struct {
 	state string
 	// now is the clock blob mtimes are touched with (a seam for tests).
 	now func() time.Time
+	// futimes sets an open blob's atime and mtime in TouchBlob (a seam for
+	// tests that make the touch fail; unix.Futimes when nil).
+	futimes func(f *os.File, t time.Time) error
 	// uploadOpened, when set, runs between an upload session's open and its
 	// flock (a seam for tests that interleave two session operations).
 	uploadOpened func(id string)

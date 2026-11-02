@@ -120,8 +120,8 @@ type Authorizer func(r *http.Request, verb Verb, n ref.Name) error
 // passing it.
 func AllowAll(*http.Request, Verb, ref.Name) error { return nil }
 
-// Config configures a Server. Store and Authorize are required; every other
-// field has a default.
+// Config configures a Server. Store, Authorize and GCGrace are required;
+// every other field has a default.
 type Config struct {
 	// Store is the on-disk store the server serves.
 	Store *store.Store
@@ -165,6 +165,11 @@ type Config struct {
 	// server-wide timeout.
 	ResponseTimeout time.Duration
 	MinWriteRate    int64
+	// GCGrace is the grace of the garbage collector that sweeps Store, the
+	// value it is given as gc.Options.Grace. It is required, as that is: New
+	// refuses a zero or negative value rather than guess one. A HEAD restarts
+	// an object's grace only when less than half of it is left.
+	GCGrace time.Duration
 	// Now is the clock (time.Now when nil).
 	Now func() time.Time
 }
@@ -185,6 +190,8 @@ type Server struct {
 	respTimeout   time.Duration
 	minWriteRate  int64
 	spaceEvery    int64
+	gcGrace       time.Duration
+	touchFails    *touchFails
 	now           func() time.Time
 	sessions      *sessions
 	router        *mux.Router
@@ -235,6 +242,9 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Authorize == nil {
 		return nil, errors.New("registry api: no authorizer (pass AllowAll for an open registry)")
 	}
+	if cfg.GCGrace <= 0 {
+		return nil, fmt.Errorf("registry api: gc grace %s must be positive (the collector's gc.Options.Grace)", cfg.GCGrace)
+	}
 	s := &Server{
 		st:            cfg.Store,
 		log:           logger(cfg.Logger),
@@ -259,6 +269,8 @@ func New(cfg Config) (*Server, error) {
 		refScanBytes:  referrersScanBytes,
 		refPage:       referrersPage,
 		refPageBytes:  referrersPageBytes,
+		gcGrace:       cfg.GCGrace,
+		touchFails:    newTouchFails(maxTouchFails),
 		setWriteDeadline: func(w http.ResponseWriter, t time.Time) {
 			_ = http.NewResponseController(w).SetWriteDeadline(t) // ErrNotSupported off a real connection
 		},

@@ -130,7 +130,7 @@ func newRegistry(t *testing.T) *registry {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := api.New(api.Config{Store: st, Authorize: newAccess(t).Authorize, FreeSpace: func() (uint64, error) { return 1 << 40, nil }})
+	srv, err := api.New(api.Config{Store: st, GCGrace: time.Hour, Authorize: newAccess(t).Authorize, FreeSpace: func() (uint64, error) { return 1 << 40, nil }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -321,7 +321,7 @@ func TestAccessControl(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		srv, err := api.New(api.Config{Store: st, FreeSpace: func() (uint64, error) { return 1 << 40, nil },
+		srv, err := api.New(api.Config{Store: st, GCGrace: time.Hour, FreeSpace: func() (uint64, error) { return 1 << 40, nil },
 			Authorize: func(r *http.Request, v api.Verb, n ref.Name) error {
 				mu.Lock()
 				asked = append(asked, v.String()+" "+n.String())
@@ -478,7 +478,7 @@ func TestFailureBucket(t *testing.T) {
 			t.Fatal(err)
 		}
 		b := newAccess(t, func(c *Config) { c.Burst = 1 })
-		srv, err := api.New(api.Config{Store: st, Authorize: b.Authorize, FreeSpace: func() (uint64, error) { return 1 << 40, nil }})
+		srv, err := api.New(api.Config{Store: st, GCGrace: time.Hour, Authorize: b.Authorize, FreeSpace: func() (uint64, error) { return 1 << 40, nil }})
 		if err != nil {
 			t.Fatal(err)
 		}
