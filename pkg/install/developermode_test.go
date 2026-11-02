@@ -151,6 +151,11 @@ func TestDeveloperModeMarkerJudgesAncestors(t *testing.T) {
 			e.UID = 501
 			f.owners["/Library"] = e
 		}, want: DeveloperModeInvalid},
+		{name: "/ owned by a user", mut: func(f *fakeSystem) {
+			e := f.owners["/"]
+			e.UID = 501
+			f.owners["/"] = e
+		}, want: DeveloperModeInvalid},
 		{name: "/Library a symlink", mut: func(f *fakeSystem) {
 			f.owners["/Library"] = OwnedEntry{Path: "/Library", Kind: EntrySymlink, Mode: 0o755}
 		}, want: DeveloperModeInvalid},
@@ -507,8 +512,12 @@ func TestDeveloperModeKeptWhenDeveloperIDVerificationFails(t *testing.T) {
 // revert puts the marker back as it was, so the rolled-back build stays in
 // developer mode, and a removal that fails still finishes the install before
 // it is reported.
+//
+// It runs on the production restart budgets: every launchd read the fake
+// answers settles on the first poll and each revert case fails on its first
+// bootstrap, so no wait costs wall-clock time and a loaded host cannot time
+// one out.
 func TestDeveloperModeMarkerDroppedAsTheSwapCommits(t *testing.T) {
-	shrinkRestartBudgets(t)
 	const content = "developer mode enabled by k3sm install on 2026-10-31T00:00:00Z\n"
 	removeCall := "RemoveEntry:/Library:k3sm.developer-mode"
 	putMarker := func(t *testing.T, f *fakeSystem, mode fs.FileMode) {
