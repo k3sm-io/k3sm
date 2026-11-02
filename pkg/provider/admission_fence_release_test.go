@@ -18,6 +18,7 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"testing"
@@ -29,6 +30,9 @@ import (
 
 	netv1alpha1 "k3sm.io/apis/net/v1alpha1"
 )
+
+// errFenceReleasePanic is the value the panicking release hook panics with.
+var errFenceReleasePanic = errors.New("fence release panicked")
 
 // TestCreatePodFencedByRejectionReleasesNetworkAndRefs: a BestEffort pod with
 // an interconnect runs on a calm node. A repeat create of it is admitted (the
@@ -54,15 +58,21 @@ import (
 // create must not get its /32, alias, slot or references taken by the release,
 // which frees them by the pod's UID. Fails when the release is not decided
 // under r.mu and new creates are not held while it runs.
+//
+// "a panic in the release does not leave later creates waiting": the release
+// panics; the next create of the pod must not wait on it forever. Fails when
+// the wait is ended in straight-line code after the release.
 func TestCreatePodFencedByRejectionReleasesNetworkAndRefs(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
 		dropInFlight bool
 		successor    bool
+		panicRelease bool
 	}{
 		{name: "a re-create's in-flight count keeps the refusal off"},
 		{name: "a refusal that lands anyway is released at the fence", dropInFlight: true},
 		{name: "a create admitted during the release keeps its resources", dropInFlight: true, successor: true},
+		{name: "a panic in the release does not leave later creates waiting", dropInFlight: true, panicRelease: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -124,8 +134,21 @@ func TestCreatePodFencedByRejectionReleasesNetworkAndRefs(t *testing.T) {
 					})
 				}
 			}
+			if tc.panicRelease {
+				r.fenceReleaseHook = func(string) { panic(errFenceReleasePanic) }
+			}
 			held := make(chan error, 1)
-			go func() { held <- r.CreatePod(ctx, pod.DeepCopy()) }()
+			go func() {
+				defer func() {
+					if p := recover(); p != nil {
+						if p != errFenceReleasePanic {
+							panic(p)
+						}
+						held <- errFenceReleasePanic
+					}
+				}()
+				held <- r.CreatePod(ctx, pod.DeepCopy())
+			}()
 			awaitClosed(t, entered, "the re-create to reach the admission window")
 
 			if err := r.DeletePod(ctx, pod.DeepCopy()); err != nil {
@@ -156,6 +179,23 @@ func TestCreatePodFencedByRejectionReleasesNetworkAndRefs(t *testing.T) {
 				t.Fatalf("create 3 under pressure did not refuse the pod (%s)", trackState(tr))
 			}
 			close(release)
+			if tc.panicRelease {
+				if err := awaitErr(t, held, "the re-create"); err != errFenceReleasePanic {
+					t.Fatalf("re-create = %v, want the release's panic", err)
+				}
+				next := make(chan error, 1)
+				go func() { next <- r.CreatePod(ctx, pod.DeepCopy()) }()
+				if err := awaitErr(t, next, "the create after the panicked release"); err != nil {
+					t.Fatalf("create after the panicked release: %v", err)
+				}
+				r.mu.Lock()
+				_, waiting := r.fenceReleasing[id]
+				r.mu.Unlock()
+				if waiting {
+					t.Error("the panicked release left its wait in place")
+				}
+				return
+			}
 			if err := awaitErr(t, held, "the re-create"); err != nil {
 				t.Fatalf("re-create: %v", err)
 			}

@@ -1717,6 +1717,26 @@ func (r *runtimedRuntime) buildBox(ctx context.Context, pod *corev1.Pod, podIP s
 	return box, nil
 }
 
+// fenceRelease frees what a create refused at CreatePod's fence acquired (the
+// /32, the lo0 alias, the interconnect slot and the references), then ends the
+// wait admitOnCreate holds new creates of the pod in. The wait ends in a defer,
+// so a panic in the release cannot leave every later create of the pod waiting;
+// the panic is not recovered.
+func (r *runtimedRuntime) fenceRelease(pod *corev1.Pod, released chan struct{}) {
+	id := string(pod.UID)
+	defer func() {
+		r.mu.Lock()
+		delete(r.fenceReleasing, id)
+		r.mu.Unlock()
+		close(released)
+	}()
+	if hook := r.fenceReleaseHook; hook != nil {
+		hook(id)
+	}
+	r.releasePodNetwork(pod)
+	r.refs.UnregisterPod(pod.UID)
+}
+
 // CreatePod translates the pod to a PodBox and asks the runtime to start it. The
 // runtime returns a typed failure inside the response (the RPC itself returns
 // nil) when the fail-closed gate rejects the pod; CreatePod surfaces that as an
@@ -1852,6 +1872,11 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 		// unlock. The release takes only its own leaf locks.
 		admitted.doneLocked()
 		var released chan struct{}
+		// When the release is skipped because another admitted create is in
+		// flight and that create then fails before its own fence, nothing
+		// releases the rejected pod's resources. That needs a rejected track
+		// beside two in-flight creates, which admitOnCreate makes close to
+		// unreachable.
 		if old.rejected && r.admitting[id] == 0 && r.fenceReleasing[id] == nil {
 			released = make(chan struct{})
 			if r.fenceReleasing == nil {
@@ -1863,15 +1888,7 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 		r.log.Warn("CreatePod: the pod became terminal on this node while it was being created; not creating it",
 			"namespace", pod.Namespace, "name", pod.Name, "uid", id, "rejected", old.rejected, "released", released != nil)
 		if released != nil {
-			if hook := r.fenceReleaseHook; hook != nil {
-				hook(id)
-			}
-			r.releasePodNetwork(pod)
-			r.refs.UnregisterPod(pod.UID)
-			r.mu.Lock()
-			delete(r.fenceReleasing, id)
-			r.mu.Unlock()
-			close(released)
+			r.fenceRelease(pod, released)
 		}
 		return nil
 	}
