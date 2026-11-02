@@ -105,6 +105,8 @@ pin, its date, and the tarball's sha256.
   `MANIFEST_UNKNOWN` (it was 400 `MANIFEST_INVALID`), as the OCI conformance suite expects. PUT
   and DELETE still answer 400, and an anonymous request is answered 401 before the reference
   is parsed.
+- The default mlx-serve image is now `0.5.0-k3sm.4`. A sharded `MLXModel` pod checks at start
+  that the engine's run body matches its pin, and the entrypoint exits with the engine's status.
 
 ### Fixed
 
