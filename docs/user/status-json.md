@@ -213,6 +213,7 @@ four.
 | `network` | object | this node's LAN access setting (see [Network](#network)); omitted when k3sm is not installed, or by a k3sm older than the setting |
 | `workers` | array | on a server, the cluster's other nodes and their versions (see [Workers and join target](#workers-and-join-target)); omitted when unknown |
 | `joinTarget` | string | on a worker, the server endpoint it joined (see [Workers and join target](#workers-and-join-target)); omitted when unknown |
+| `budget` | object | this node's budget: pressure level, admission and headroom (see [Budget](#budget)); omitted when unknown |
 | `version` | object | the build that produced the report; `modules` is omitted when unknown |
 | `host` | string | the macOS version, empty when it could not be read |
 | `timestamp` | string | RFC 3339 |
@@ -541,6 +542,43 @@ that daemon's arguments. The host is reported only when it is an IPv4 address or
 letters, digits, `-` and `.`, at most 253 characters long. `joinTarget` is omitted on a server, on a
 worker whose daemon configuration cannot be read, and when the `--server` value is anything else:
 an IPv6 address, a value that already carries a port, or one with any other character.
+
+## Budget
+
+The full report carries an optional `budget` object: this node's budget as its node daemon last
+sampled it. It is additive: `schemaVersion` stays `1`, and it adds no `verdict` or row `state` word.
+The daemons probe does not carry it.
+
+```json
+"budget": {
+  "observedAt": "2026-09-05T09:29:55Z",
+  "platform": "darwin",
+  "level": "warn",
+  "admit": true,
+  "capacity": { "memAllocatableBytes": 32212254720 },
+  "signals": [
+    { "id": "memory.compressor", "unit": "permille", "value": 620, "warnThreshold": 600, "admitStopThreshold": 700, "criticalThreshold": 800, "limitingResource": "memory" }
+  ],
+  "recommendation": { "safeAdditionalBytes": 3221225472, "basis": "memory.compressor" },
+  "darwin": { "vmPressureLevel": 1 }
+}
+```
+
+The object has the schema of the `status` of a `NodeBudget` (`nodebudgets.v1alpha1.budget.k3sm.io`),
+so one decoder reads both. It holds the node's observation only: `writer` and `conditions` belong
+to the cluster's copy and never appear here. Every field of the observation is optional, as on
+`NodeBudget`.
+
+The node daemon rewrites its record every 10 seconds into the status directory
+(`/var/lib/k3sm/status/budget.json`, readable by any account). The record holds node-level figures
+and no pod or workload names. `budget` is omitted when the budget is unknown: the node daemon is not
+running, its record is missing or does not parse, or its `observedAt` is more than 60 seconds from
+the time of the report. Readers must treat a missing `budget` as unknown, never as calm.
+
+The block is read from that node-local record, which the k3sm service user writes. Nothing
+authenticates it, and any process running as that user could change it, so it is informational. A
+consumer may use it only to refuse or delay an action, never to allow one. The authoritative copy
+is the cluster's `NodeBudget` for this node.
 
 ## Interconnect
 

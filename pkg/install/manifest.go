@@ -206,6 +206,9 @@ func artifactManifest(cfg Config) []artifact {
 	// directory, REMOVED after that daemon is booted out for the reason the
 	// server's records below are: it describes a node that no longer runs.
 	items = append(items, artifact{kind: kindFile, disp: dispRemove, path: filepath.Join(StateStatus.Path(cfg.DataRoot), EndpointsRecordName), assertExists: false})
+	// The budget record either node daemon rewrites there, REMOVED for the
+	// same reason. assertExists is false: a node writes it only once it runs.
+	items = append(items, artifact{kind: kindFile, disp: dispRemove, path: filepath.Join(StateStatus.Path(cfg.DataRoot), BudgetRecordName), assertExists: false})
 	// The update record, REMOVED for the same reason: it compares the nodes of
 	// a cluster this Mac no longer serves. Either role may hold one, because
 	// `sudo k3sm update check` writes it wherever it runs. assertExists is

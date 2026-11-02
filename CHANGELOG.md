@@ -12,6 +12,10 @@ pin, its date, and the tarball's sha256.
 
 ### Added
 
+- `k3sm status -o json` carries this node's budget as an optional `budget` object (pressure level,
+  admission, each signal against its rungs, and the headroom recommendation), in the schema of
+  `NodeBudget.status`. `schemaVersion` stays `1`. [Status JSON](docs/user/status-json.md#budget)
+  describes it.
 - `k3sm install --developer-mode on` installs a build from source, ad-hoc signed, over any
   install: the signature of the k3sm that runs as root is no longer compared with the installed
   one, and a development build of k3sm.app opens beside it. `--developer-mode off` turns it off,

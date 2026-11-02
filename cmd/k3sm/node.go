@@ -66,6 +66,7 @@ import (
 	"k3sm.io/k3sm/pkg/provider/vkadapter"
 	"k3sm.io/k3sm/pkg/runtimeclass"
 	"k3sm.io/k3sm/pkg/shadow"
+	"k3sm.io/k3sm/pkg/status"
 	"k3sm.io/k3sm/pkg/version"
 )
 
@@ -307,6 +308,11 @@ type nodeOptions struct {
 	// one is refused deterministically rather than racing the ingress host.
 	// Nil on a worker, which runs no ingress host.
 	ingressPorts []int32
+	// statusDir is the user-readable status directory (status.Dir of the
+	// role's work dir) the node publishes its budget record into for `k3sm
+	// status`. `k3sm server` and `k3sm agent` set it; empty (the standalone
+	// `k3sm node`) records no budget.
+	statusDir string
 	// updateRoot is the managed update's directory under the data root
 	// (updateRootFor). `k3sm server` and `k3sm agent` set it; empty (the
 	// standalone `k3sm node`) runs no update watcher.
@@ -1189,6 +1195,19 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	hbWatch := &heartbeatWatch{node: opts.nodeName, started: time.Now(), log: slog.Default()}
 	go func() { defer close(watchDone); hbWatch.run(watchCtx, n.Heartbeat) }()
 	defer timedTeardownStep(slog.Default(), "heartbeat-watch", func() { stopWatch(); <-watchDone })
+
+	// The budget record `k3sm status` reports, rewritten from the status
+	// provider's latest sample. Like the watchdog it has its own stop, so every
+	// return path ends it.
+	if opts.statusDir != "" && nodeStatus != nil {
+		budgetCtx, stopBudget := context.WithCancel(ctx)
+		budgetDone := make(chan struct{})
+		go func() {
+			defer close(budgetDone)
+			runBudgetRecorder(budgetCtx, nodeStatus, opts.statusDir, status.BudgetRecordInterval, slog.Default())
+		}()
+		defer timedTeardownStep(slog.Default(), "budget-record", func() { stopBudget(); <-budgetDone })
+	}
 
 	if err := awaitNodeReady(ctx, n.Ready(), errc, nodeStartupTimeout, opts.nodeName, opts.listen); err != nil {
 		return err

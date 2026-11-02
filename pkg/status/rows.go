@@ -223,6 +223,7 @@ func (c Collector) Collect(ctx context.Context) Report {
 		Network:        network,
 		Workers:        c.workers(role, nodesRead, nodes, nodesErr),
 		JoinTarget:     c.joinTarget(role),
+		Budget:         c.budget(now()),
 		ImageMigration: imageMigration,
 		Version:        c.Version,
 		Host:           c.Host,
