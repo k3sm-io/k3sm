@@ -26,7 +26,9 @@
 #                    which goreleaser empties with --clean)
 #   --verify-only    build and sign NOTHING; run only the verification block
 #                    (completeness against the install contract, codesign --verify
-#                    on every Mach-O, the arm64 arch assert, and the k3sm-vmhost
+#                    on every Mach-O, the arm64 arch assert, the build-info check
+#                    (every Go Mach-O a shipped main, none from a k3sm hack
+#                    package: buildinfo_set_problems), and the k3sm-vmhost
 #                    virtualization-entitlement read-back) over a tree that already
 #                    exists. This is the seam a release gate run from the parent
 #                    checkout of all the repos drives so the artifact-quality tier re-uses THESE checks over
@@ -88,7 +90,8 @@
 #                    stamps. Empty (the default) leaves an unstamped dev build,
 #                    which reports its version from the embedded VCS build info.
 #   --self-test      hermetic self-test of the manifest, the signature parser, the
-#                    release refusal, the toolchain pin, the source-built children's
+#                    build-info check (throwaway mains built in its temp dir),
+#                    the release refusal, the toolchain pin, the source-built children's
 #                    build-stamp checks, the needs-network report and the
 #                    children vuln scan, against a planted local vulnerability
 #                    database (no network, no credentials, no keychain)
@@ -1141,6 +1144,65 @@ cp-payload/newchild"
 	unset -f scan expect
 }
 
+# ---- the build-info check ---------------------------------------------------------
+# The closed list of Go mains a staged tree may hold, one import path per line: the
+# three this script builds (the k3sm binary, the exec shim and the VM host), the four
+# control-plane binaries build-cp.sh builds, and the five children `k3sm payload`
+# builds (kine, the etcd wrapper, etcdutl, zot, helm). A main added to staging is
+# added here, or staging refuses the tree.
+SHIPPED_MAINS="k3sm.io/k3sm/cmd/k3sm
+k3sm.io/runtimed/cmd/k3sm-execshim
+k3sm.io/runtimed/cmd/k3sm-vmhost
+k8s.io/kubernetes/cmd/kube-apiserver
+k8s.io/kubernetes/cmd/kube-scheduler
+k8s.io/kubernetes/cmd/kube-controller-manager
+k8s.io/kubernetes/cmd/kubectl
+github.com/k3s-io/kine
+k3sm.io/etcd-child
+go.etcd.io/etcd/etcdutl/v3
+zotregistry.dev/zot/v2/cmd/zot
+helm.sh/helm/v4/cmd/helm"
+
+# The Mach-Os that are not Go binaries, by path relative to the tree: the two clang
+# DYLD interposers. Every other Mach-O must carry Go build info.
+NON_GO_MACHOS="libk3sm_pathrebase_shim.dylib
+libk3sm_getaddrinfo_shim.dylib"
+
+# buildinfo_set_problems <tree>: the artifact check that no staged binary was built
+# from, or links, a k3sm hack/ package (test tooling such as the OCI conformance
+# launcher, which is never shipped). For every Mach-O macho_files finds, `go version
+# -m` (read, never executed) must report exactly one main path, in SHIPPED_MAINS; no
+# path, mod, dep or => line may name k3sm.io/k3sm/hack; and the bytes may not carry
+# a k3sm.io/k3sm/hack/ or k3sm.io/k3sm/hack. name, which is how a hack package linked
+# into a main of the k3sm module shows (build info lists modules, not packages; the
+# function and file names in the pclntab survive -s -w and -trimpath). A Mach-O
+# without readable build info passes only when NON_GO_MACHOS names it. Reads the
+# artifacts rather than the scripts that built them, so no spelling of a build
+# command can get around it. Prints one line per problem; returns 0 only when there
+# are none.
+buildinfo_set_problems() {
+	local tree="$1" f rel text mains bad=0 hits
+	while IFS= read -r f; do
+		rel="${f#"$tree"/}"
+		if ! text="$("$GO" version -m "$f" 2>/dev/null)" || ! grep_text "$text" -Eq '^[[:space:]]+path[[:space:]]'; then
+			grep_text "$NON_GO_MACHOS" -qxF -- "$rel" || { echo "    $rel: a Mach-O with no Go build info that NON_GO_MACHOS does not name"; bad=1; }
+		else
+			mains="$(printf '%s\n' "$text" | awk '$1 == "path" { print $2 }')"
+			if [ "$(grep -c . <<<"$mains")" != 1 ]; then
+				echo "    $rel: build info names $(grep -c . <<<"$mains") main paths, not one"; bad=1
+			elif ! grep_text "$SHIPPED_MAINS" -qxF -- "$mains"; then
+				echo "    $rel: main $mains is not a shipped main (SHIPPED_MAINS)"; bad=1
+			fi
+			hits="$(printf '%s\n' "$text" | awk '($1 == "path" || $1 == "mod" || $1 == "dep" || $1 == "=>") && $2 ~ /^k3sm\.io\/k3sm\/hack(\/|$)/ { print $1 " " $2 }')"
+			[ -z "$hits" ] || { echo "    $rel: build info names a k3sm hack package: $(paste -sd ';' - <<<"$hits")"; bad=1; }
+		fi
+		if LC_ALL=C grep -aqE 'k3sm\.io/k3sm/hack[/.]' "$f"; then
+			echo "    $rel: links a k3sm.io/k3sm/hack package (its name is in the binary)"; bad=1
+		fi
+	done < <(macho_files "$tree")
+	return "$bad"
+}
+
 # ---- self-test --------------------------------------------------------------------
 # Hermetic: no network, no credentials, no keychain, no Developer ID identity.
 #
@@ -1286,6 +1348,55 @@ cat "%s" >&2
 	if out="$(CODESIGN="$tmp/fake-codesign" verify_release_signatures "$tree" "$team")"; then
 		bad "a 3-Mach-O tree passed the floor"
 	elif grep_text "$out" -q "floor"; then ok "Mach-O floor enforced"; else bad "floor failure not named: $out"; fi
+
+	echo "==> build info: a shipped main passes, a hack package is refused"
+	# Every binary is built from a throwaway module in the temp dir (never the
+	# repo), with no dependency to fetch: the hack dependency is a local replace.
+	local bm="$tmp/bi-k3sm" bd="$tmp/bi-dep" br="$tmp/bi-runtimed"
+	# The planted import path, held in one variable so the fixture lines below do
+	# not trip B1021's early-warning text scan of the release scripts.
+	local hp="k3sm.io/k3sm/hack"
+	mkdir -p "$bm/cmd/k3sm" "$bm/cmd/k3sm-extra" "$bm/hack/plant/serve" "$bm/hack/plant/lib" "$bd" "$br/cmd/k3sm-execshim"
+	printf 'module k3sm.io/k3sm\n\ngo 1.26\n' >"$bm/go.mod"
+	printf 'package main\n\nfunc main() { println("k3sm") }\n' >"$bm/cmd/k3sm/main.go"
+	printf '//go:build planthack\n\npackage main\n\nimport _ "%s/plant/lib"\n' "$hp" >"$bm/cmd/k3sm/plant.go"
+	printf 'package main\n\nfunc main() { println("extra") }\n' >"$bm/cmd/k3sm-extra/main.go"
+	printf 'package main\n\nfunc main() { println("serve") }\n' >"$bm/hack/plant/serve/main.go"
+	printf 'package lib\n\nimport "os"\n\nfunc init() {\n\tif os.Getenv("K3SM_PLANT") != "" {\n\t\tprintln("plant")\n\t}\n}\n' >"$bm/hack/plant/lib/lib.go"
+	printf 'module %s/plantdep\n\ngo 1.26\n' "$hp" >"$bd/go.mod"
+	printf 'package plantdep\n\nimport "os"\n\nfunc init() {\n\tif os.Getenv("K3SM_PLANT") != "" {\n\t\tprintln("dep")\n\t}\n}\n' >"$bd/dep.go"
+	printf 'module k3sm.io/runtimed\n\ngo 1.26\n\nrequire %s/plantdep v0.0.0\n\nreplace %s/plantdep => %s\n' "$hp" "$hp" "$bd" >"$br/go.mod"
+	printf 'package main\n\nimport _ "%s/plantdep"\n\nfunc main() { println("shim") }\n' "$hp" >"$br/cmd/k3sm-execshim/main.go"
+	bgo() { (cd "$1" && shift && GOWORK=off GOTOOLCHAIN=local GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 "$GO" build -trimpath "$@") >/dev/null 2>&1; }
+	# bt <name>: a fresh tree holding the two allowed clang dylibs.
+	bt() { rm -rf "$tmp/bi-$1"; mkdir -p "$tmp/bi-$1"; cp "$tree/k3sm" "$tmp/bi-$1/libk3sm_pathrebase_shim.dylib"; cp "$tree/k3sm" "$tmp/bi-$1/libk3sm_getaddrinfo_shim.dylib"; }
+	bt ok
+	if bgo "$bm" -o "$tmp/bi-ok/k3sm" ./cmd/k3sm && bgo "$bm" -o "$tmp/bi-serve" ./hack/plant/serve &&
+		bgo "$bm" -tags planthack -o "$tmp/bi-linked" ./cmd/k3sm && bgo "$bm" -o "$tmp/bi-extra" ./cmd/k3sm-extra &&
+		bgo "$br" -o "$tmp/bi-shim" ./cmd/k3sm-execshim; then
+		if out="$(buildinfo_set_problems "$tmp/bi-ok")"; then ok "a k3sm.io/k3sm/cmd/k3sm build and the two named dylibs pass"; else bad "a shipped main was refused: $out"; fi
+		# bi_expect <case> <file> <rel> <want>...: the file planted in a fresh
+		# tree at <rel> is refused, naming every <want>.
+		bi_expect() {
+			local c="$1" src="$2" rel="$3" w; shift 3
+			bt "$c"; mkdir -p "$(dirname "$tmp/bi-$c/$rel")"; cp "$src" "$tmp/bi-$c/$rel"
+			if out="$(buildinfo_set_problems "$tmp/bi-$c")"; then bad "$c: refused nothing"; return; fi
+			for w in "$@"; do
+				if grep_text "$out" -qF -- "$w"; then ok "$c: refused ($w)"; else bad "$c: '$w' not named: $out"; fi
+			done
+		}
+		bi_expect "hack main" "$tmp/bi-serve" cp-payload/kubectl "main $hp/plant/serve is not a shipped main" "build info names a k3sm hack package: path $hp/plant/serve" "links a k3sm.io/k3sm/hack package"
+		bi_expect "hack package linked into cmd/k3sm" "$tmp/bi-linked" k3sm "links a k3sm.io/k3sm/hack package"
+		bi_expect "hack module as a dependency" "$tmp/bi-shim" k3sm-execshim "build info names a k3sm hack package: dep $hp/plantdep"
+		bi_expect "unshipped main" "$tmp/bi-extra" k3sm-extra "main k3sm.io/k3sm/cmd/k3sm-extra is not a shipped main"
+		bi_expect "unnamed non-Go Mach-O" "$tree/k3sm" cp-payload/tool "cp-payload/tool: a Mach-O with no Go build info"
+		if grep_text "$SHIPPED_MAINS" -q 'k3sm\.io/k3sm/hack'; then bad "SHIPPED_MAINS names a hack package"; else ok "SHIPPED_MAINS names no hack package"; fi
+	else
+		bad "the throwaway build-info fixtures did not build"
+	fi
+	echo "==> verify_tree runs the build-info check"
+	# shellcheck disable=SC2016 # "$OUT" is the literal text the wiring check looks for
+	if awk '/^verify_tree\(\) \{/ { f = 1 } f && /^\}/ { exit } f && !/^[[:space:]]*#/' "$self" | grep -qF 'buildinfo_set_problems "$OUT"'; then ok "verify_tree calls buildinfo_set_problems over the tree"; else bad "verify_tree does not run the build-info check"; fi
 
 	echo "==> payload manifest"
 	local m1="$tmp/m1" m2="$tmp/m2" d
@@ -2009,6 +2120,13 @@ verify_tree() {
 	[ "$bad_sign" = 0 ] || die "a staged Mach-O fails codesign --verify — launchd refuses it with OS_REASON_CODESIGNING"
 	[ "$bad_arch" = 0 ] || die "non-arm64 artifact staged (a Rosetta-defaulted toolchain? every build here pins GOARCH=arm64)"
 	[ "$n_macho" -ge "$MACHO_FLOOR" ] || die "only $n_macho Mach-O(s) found under $OUT — the set cannot be complete"
+
+	echo "==> verify every Mach-O's Go build info: a shipped main, no k3sm hack package"
+	local bi_out
+	if ! bi_out="$(buildinfo_set_problems "$OUT")"; then
+		printf '%s\n' "$bi_out" >&2
+		die "a staged Mach-O is not a shipped main or was built from a k3sm hack package (above)"
+	fi
 
 	# The entitlement, read back off the signed Mach-O. codesign attaches NO
 	# entitlements when AMFI's plist parser balks — while still producing a
