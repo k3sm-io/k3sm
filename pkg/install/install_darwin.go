@@ -1346,6 +1346,20 @@ func (darwinSystem) SwapInstallRoot(staging, live string) (bool, error) {
 	}
 }
 
+// MoveInstallRootAside renames live to aside with renamex_np(2) and
+// RENAME_EXCL, so an existing aside (an empty directory too, which a plain
+// rename(2) would replace) fails with EEXIST in the same call, with no window
+// between a check and the rename. See the System interface.
+func (darwinSystem) MoveInstallRootAside(live, aside string) error {
+	if err := unix.RenamexNp(live, aside, unix.RENAME_EXCL); err != nil {
+		if errors.Is(err, unix.EEXIST) {
+			err = fs.ErrExist
+		}
+		return fmt.Errorf("move the install root %s aside to %s: %w", live, aside, err)
+	}
+	return nil
+}
+
 // InstallSpace reports the free space on dir's filesystem and the size of the
 // sources an install would stage onto it. See the System interface: it takes two
 // stat families and makes no judgement.

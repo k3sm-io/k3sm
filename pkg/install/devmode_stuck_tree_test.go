@@ -23,9 +23,9 @@ import (
 	"testing"
 )
 
-// failingSwap is the fake with every SwapInstallRoot after the first n
-// failing: the publish goes through and the reverse swap (or the move aside)
-// does not.
+// failingSwap is the fake with every SwapInstallRoot or MoveInstallRootAside
+// after the first n failing: the publish goes through and the reverse swap
+// (or the move aside) does not.
 type failingSwap struct {
 	*fakeSystem
 	n int
@@ -38,6 +38,15 @@ func (s *failingSwap) SwapInstallRoot(staging, live string) (bool, error) {
 	}
 	s.n--
 	return s.fakeSystem.SwapInstallRoot(staging, live)
+}
+
+func (s *failingSwap) MoveInstallRootAside(live, aside string) error {
+	if s.n <= 0 {
+		s.calls = append(s.calls, "MoveInstallRootAside:"+live+"->"+aside+":failed")
+		return errors.New("EIO")
+	}
+	s.n--
+	return s.fakeSystem.MoveInstallRootAside(live, aside)
 }
 
 // stuckMarker makes the marker on f impossible to remove or hand to nobody.
@@ -119,6 +128,10 @@ func TestDeveloperModeStuckMarkerLeavesNoSignedTree(t *testing.T) {
 			"the developer-mode marker " + DeveloperModeMarkerPath + " is beside the new tree",
 			"plists name paths inside it",
 			"sudo chflags nouchg " + DeveloperModeMarkerPath,
+			"ls -lO@e " + DeveloperModeMarkerPath,
+			"system-immutable flag",
+			"deny-delete ACL",
+			"sudo launchctl bootout system/<label>",
 		} {
 			if !strings.Contains(err.Error(), want) {
 				t.Errorf("error %q does not carry %q", err, want)
@@ -154,4 +167,56 @@ func TestInstallReportsUnreadableMarkerBesideKubeconfigError(t *testing.T) {
 	if got := ReadDeveloperModeState(f, DeveloperModeMarkerPath); got != DeveloperModeAbsent {
 		t.Errorf("the marker reads %s, want it removed", got)
 	}
+}
+
+// TestDeveloperModeStuckMarkerWithdrawIsOneWay pins that a first install's
+// withdraw never swaps: with the staging path occupied it refuses, the new
+// tree stays at the install root, nothing from the staging path reaches it,
+// and the error says the tree is still beside the marker.
+func TestDeveloperModeStuckMarkerWithdrawIsOneWay(t *testing.T) {
+	shrinkRestartBudgets(t)
+	live, staging := DefaultInstallDir, DefaultInstallDir+installSwapSuffix
+	planted := staging + "/planted"
+	f := &fakeSystem{owners: map[string]OwnedEntry{}}
+	stuckMarker(f)
+	f.calls = nil
+	occupy := &occupyAfterPublish{fakeSystem: f, path: planted}
+	cfg := stageCfg()
+	cfg.DeveloperMode = DeveloperModeOff
+	err := Install(context.Background(), occupy, cfg)
+	if err == nil {
+		t.Fatal("Install succeeded beside a marker that still reads on")
+	}
+	for _, want := range []string{"so it is still there beside the developer-mode marker " + DeveloperModeMarkerPath, "sudo rm -rf " + live} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not carry %q", err, want)
+		}
+	}
+	if !f.dirExists(live) {
+		t.Errorf("the install root %s lost the new tree", live)
+	}
+	if _, ok := f.tree[live+"/planted"]; ok {
+		t.Errorf("what occupied %s was put at the install root", staging)
+	}
+	if _, ok := f.tree[planted]; !ok {
+		t.Errorf("what occupied %s was moved", staging)
+	}
+}
+
+// occupyAfterPublish is the fake with something put at the staging path the
+// moment the publish has renamed the staged tree away from it.
+type occupyAfterPublish struct {
+	*fakeSystem
+	path string
+}
+
+func (s *occupyAfterPublish) SwapInstallRoot(staging, live string) (bool, error) {
+	previous, err := s.fakeSystem.SwapInstallRoot(staging, live)
+	if err == nil && !previous {
+		if s.tree == nil {
+			s.tree = map[string]string{}
+		}
+		s.tree[s.path] = "/elsewhere/planted"
+	}
+	return previous, err
 }

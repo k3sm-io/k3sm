@@ -117,7 +117,8 @@ pin, its date, and the tarball's sha256.
   still matches, restarts the daemons on that tree and names the likely blocker, an immutable
   flag (`sudo chflags nouchg`). If that rollback fails, the error says developer mode is still on
   beside the new tree. A first install with such a marker stops before any daemon is started and
-  moves its new tree out of `/Library/k3sm`.
+  moves its new tree out of `/Library/k3sm` when it can; when it cannot, the error says the tree
+  is still there and how to remove it.
 - An emergency eviction no longer waits 250 ms for each pod it kills when the budget history
   writer is not running (before it starts, after it stops, or once it has exited): the kill
   intent is written at once. A symlink or a FIFO at the budget history path in the node's work
