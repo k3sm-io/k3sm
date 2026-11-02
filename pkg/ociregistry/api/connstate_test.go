@@ -188,6 +188,28 @@ func TestConnectionCap(t *testing.T) {
 	if hs.ReadHeaderTimeout != api.ReadHeaderTimeout || hs.ReadHeaderTimeout <= 0 {
 		t.Fatalf("ReadHeaderTimeout %v, want %v", hs.ReadHeaderTimeout, api.ReadHeaderTimeout)
 	}
+	// Signal each StateClosed after the server's own hook has counted it, so
+	// the test waits on the server seeing a connection end, not on a clock.
+	closed := make(chan struct{}, 16)
+	hook := hs.ConnState
+	hs.ConnState = func(c net.Conn, st http.ConnState) {
+		hook(c, st)
+		if st == http.StateClosed {
+			closed <- struct{}{}
+		}
+	}
+	awaitClosed := func(n int) {
+		t.Helper()
+		timer := time.NewTimer(10 * time.Second)
+		defer timer.Stop()
+		for i := range n {
+			select {
+			case <-closed:
+			case <-timer.C:
+				t.Fatalf("server reported %d of %d connections closed", i, n)
+			}
+		}
+	}
 	ln := newPipeListener()
 	go func() { _ = hs.Serve(ln) }()
 	t.Cleanup(func() { _ = hs.Close() })
@@ -225,15 +247,10 @@ func TestConnectionCap(t *testing.T) {
 		t.Fatal("a third connection over a cap of 2 was served")
 	}
 	_ = held[0].Close()
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		err := get(dial())
-		if err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("no connection served after one of the two ended: %v", err)
-		}
-		time.Sleep(20 * time.Millisecond)
+	// The refused connection and the closed held one each reach StateClosed;
+	// after both, exactly one slot is free and the next connection is served.
+	awaitClosed(2)
+	if err := get(dial()); err != nil {
+		t.Fatalf("no connection served after one of the two ended: %v", err)
 	}
 }
