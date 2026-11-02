@@ -210,6 +210,9 @@ func TestDeveloperModeMarkerOnInstall(t *testing.T) {
 				}
 			}
 			info := strings.Contains(logs.String(), "level=INFO") && strings.Contains(logs.String(), `"developer mode turned off by a signed install"`)
+			if tc.wantInfo && !strings.Contains(logs.String(), "team-id="+testTeamID) {
+				t.Errorf("the turned-off line does not name the team %s; logs:\n%s", testTeamID, logs.String())
+			}
 			if info != tc.wantInfo {
 				t.Errorf("the turned-off Info line logged = %v, want %v; logs:\n%s", info, tc.wantInfo, logs.String())
 			}
@@ -227,6 +230,8 @@ func TestDeveloperModeMarkerOnInstall(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("the signature verdicts and the docs", pinPlainInstallSignature)
 
 	t.Run("a plain install with no flag and no Signer never looks at the marker", func(t *testing.T) {
 		t.Parallel()
