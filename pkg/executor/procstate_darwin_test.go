@@ -18,6 +18,7 @@ package executor
 
 import (
 	"os/exec"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -41,7 +42,7 @@ func TestProcessExitedMonotoneAcrossReap(t *testing.T) {
 				_ = cmd.Wait() // reap before failing; the verdict is the failure
 				t.Fatalf("child %d (pid %d): never reported exited", i, pid)
 			}
-			time.Sleep(100 * time.Microsecond)
+			runtime.Gosched() // a barrier poll, not a budget: the deadline above is the only bound
 		}
 
 		waited := make(chan struct{})
