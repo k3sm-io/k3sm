@@ -312,7 +312,7 @@ func TestDeveloperModeMarkerDropPaths(t *testing.T) {
 		want     []string
 		stuck    bool
 	}{
-		{name: "a read error joined with a disown that failed", chownErr: errors.New("EACCES"), want: []string{"EIO", "EPERM", "EACCES", "--developer-mode off"}, stuck: true},
+		{name: "a read error joined with a disown that failed", chownErr: errors.New("EACCES"), want: []string{"EIO", "EPERM", "EACCES", "sudo chflags nouchg"}, stuck: true},
 		{name: "a read error beside a disown that worked", want: []string{"EIO"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

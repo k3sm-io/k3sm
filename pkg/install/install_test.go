@@ -975,6 +975,17 @@ func (f *fakeSystem) SwapInstallRoot(staging, live string) (bool, error) {
 	return previous, nil
 }
 
+// MoveInstallRootAside moves live to aside in the fake's own model, refusing
+// an aside that exists, as RENAME_EXCL does.
+func (f *fakeSystem) MoveInstallRootAside(live, aside string) error {
+	f.calls = append(f.calls, "MoveInstallRootAside:"+live+"->"+aside)
+	if f.dirExists(aside) {
+		return fmt.Errorf("move %s aside to %s: %w", live, aside, fs.ErrExist)
+	}
+	f.exchangeTrees(live, aside)
+	return nil
+}
+
 // exchangeTrees moves everything under a to b and everything under b to a,
 // including the directory entries the ownership table holds for them — a
 // directory that has content but was never ensured is given the root:wheel 0755

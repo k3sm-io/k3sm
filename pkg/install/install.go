@@ -776,6 +776,9 @@ type System interface {
 	// not a documented property of the swap — rename(2) states atomicity for the
 	// plain form only — so nothing here or in its callers claims it as one.
 	SwapInstallRoot(staging, live string) (previous bool, err error)
+	// MoveInstallRootAside renames live to aside one way only: an existing aside,
+	// even empty, is refused (fs.ErrExist), and nothing is ever put at live.
+	MoveInstallRootAside(live, aside string) error
 	// InstallSpace reports the bytes currently free on the filesystem holding
 	// dir, and the total bytes the named sources occupy — a source that is
 	// absent contributing zero, because the copy that needs it owns that
@@ -2450,17 +2453,20 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	//      so a build from source that is rolled back to stays in developer
 	//      mode. A removal that failed but left the marker reading invalid is
 	//      reported only once the install has finished, at the end of step 5.
+	//      A crash between the publish and the withdraw or revert below can
+	//      still leave the new tree beside a marker that reads on: a window
+	//      that predates this step, held under the install lock, nothing wired.
 	dropErr := removeMarker.drop(sys, cfg)
 	// 2f″. A marker that could be neither removed nor disowned still reads
 	//      on, and the signed tree must not run beside it: the app's root
 	//      steps would skip the signing continuity check. Fail closed. The
 	//      previous tree and its marker are the consistent pair, so the swap
 	//      is reverted and the daemons restart on the previous tree, never on
-	//      this one; on a first install there is nothing to revert to, and the
-	//      install stops here, before anything is wired or restarted.
+	//      this one; a first install moves the new tree out of the install
+	//      root and stops before anything is wired (refuseBesideStuckMarker).
 	if removeMarker.stillOn() {
 		restartOwned = previous // a revert restarts, and reports, every daemon
-		return revertInstallRoot(ctx, sys, cfg, m, previous, dropErr, nil)
+		return refuseBesideStuckMarker(ctx, sys, cfg, m, previous, dropErr)
 	}
 
 	// 3. The launcher link and the plists, in that order, and BOTH after the
@@ -2474,7 +2480,7 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	//    target mean the new tree the moment it is live.
 	restartOwned = true // step 4 restarts, and on failure reports, every daemon
 	if err := publishedWiring(ctx, sys, cfg, m, startedAt); err != nil {
-		return revertInstallRoot(ctx, sys, cfg, m, previous, err, func() { removeMarker.restore(sys, cfg) })
+		return revertInstallRoot(ctx, sys, cfg, m, previous, err, false, func() { removeMarker.restore(sys, cfg) })
 	}
 
 	// 4c. REAP, and not one step earlier. The previous install root is still
@@ -2506,8 +2512,8 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	//    replaces the whole k3sm cluster entry, so a kubeconfig an earlier release
 	//    wrote (a self-signed pin, or skip-verify) is rewritten.
 	if err := writeAdminKubeconfig(ctx, sys, &cfg); err != nil {
-		// A marker removal that failed at 2f′ is reported beside it, so the
-		// --developer-mode off remedy still reaches the operator.
+		// A marker removal or read that failed at 2f′ is reported beside it,
+		// so neither is lost behind the kubeconfig error.
 		return errors.Join(err, dropErr)
 	}
 	cfg.Logger.Info("k3sm installed", "install-dir", cfg.InstallDir, "link", cfg.installedLink(), "kubeconfig-owner", cfg.TargetUser)
