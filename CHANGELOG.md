@@ -88,6 +88,9 @@ pin, its date, and the tarball's sha256.
 - `k3sm image prune` reads the cluster registry through the registry's own store code, read-only,
   and checks every manifest it reads against its digest; a repository whose manifests do not match
   is left alone. Deletions still go through the registry's API with the node's push credential.
+- When `k3sm uninstall` or a full stop leaves a vm pod helper alone because the version directory
+  it runs from cannot be read, the message now says how to clear it: fix the permissions on that
+  path, or stop the helper's process group by hand with the `sudo kill` command it prints.
 
 ### Fixed
 
