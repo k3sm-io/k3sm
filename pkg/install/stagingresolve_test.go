@@ -245,47 +245,120 @@ func TestResolveInstalledBinary(t *testing.T) {
 	}
 }
 
-// TestResolveInstalledBinaryUnderALinkedRoot pins the resolution when the
-// install root itself (the directory holding the entry point) is a symlink. A
-// link entry point resolves into the real root's version directory, every
-// component evaluated. A flat file is not a link and is returned as named,
-// the root link still in it.
-func TestResolveInstalledBinaryUnderALinkedRoot(t *testing.T) {
+// TestResolveInstalledFlatUnderLinkedRoot pins the resolution when the install
+// root itself (the directory holding the entry point) is a symlink. Every
+// accepted path comes back fully evaluated, so no later read follows the root
+// link again: a flat file and a versioned link both resolve into the real root.
+// A flat file that does not sit directly in the evaluated root, as when the
+// root link is pointed elsewhere between the two evaluations, or an entry
+// point that turns from a file into a link between its lstat and its
+// evaluation, fails closed. No install, a dangling root link included, is
+// still the entry point as named.
+func TestResolveInstalledFlatUnderLinkedRoot(t *testing.T) {
 	t.Parallel()
-	linkedRoot := func(t *testing.T) (real, linked string) {
-		t.Helper()
-		base, err := filepath.EvalSymlinks(t.TempDir())
-		if err != nil {
-			t.Fatal(err)
-		}
-		real, linked = filepath.Join(base, "real"), filepath.Join(base, "k3sm-root")
-		if err := os.Mkdir(real, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		putInstalledLink(t, real, linked)
-		return real, linked
+	cases := []struct {
+		name string
+		// setup lays out the tree under real (the root link's target) and
+		// other (a second directory), and returns the paths the entry point
+		// is evaluated through.
+		setup func(t *testing.T, real, other string)
+		// swap retargets the root link at other after the first evaluation.
+		swap bool
+		// relink replaces the entry point with a link to the real root's
+		// versioned binary after the first lstat.
+		relink bool
+		want   string // relative to the real root; "" = refused; "=" = the entry point as named
+	}{
+		{name: "a flat binary under a linked root is the evaluated path", want: "k3sm",
+			setup: func(t *testing.T, real, _ string) { putInstalledFile(t, filepath.Join(real, "k3sm")) }},
+		{name: "a flat binary that leaves the root is refused", swap: true,
+			setup: func(t *testing.T, real, other string) {
+				putInstalledFile(t, filepath.Join(real, "k3sm"))
+				putInstalledFile(t, filepath.Join(other, "k3sm"))
+			}},
+		{name: "no install under a linked root is the entry point as named", want: "=",
+			setup: func(*testing.T, string, string) {}},
+		{name: "a dangling root link is the entry point as named", want: "=",
+			setup: func(t *testing.T, real, _ string) {
+				if err := os.Remove(real); err != nil {
+					t.Fatal(err)
+				}
+			}},
+		{name: "a flat binary that turns into a link before its evaluation is refused", relink: true,
+			setup: func(t *testing.T, real, _ string) {
+				putInstalledFile(t, filepath.Join(real, "k3sm"))
+				putInstalledFile(t, filepath.Join(real, "versions", "v0.3.9", "k3sm"))
+			}},
+		{name: "a versioned install resolves into the real root", want: "versions/v0.3.9/k3sm",
+			setup: func(t *testing.T, real, _ string) {
+				putInstalledFile(t, filepath.Join(real, "versions", "v0.3.9", "k3sm"))
+				putInstalledLink(t, "versions/v0.3.9", filepath.Join(real, "current"))
+				putInstalledLink(t, "current/k3sm", filepath.Join(real, "k3sm"))
+			}},
+		{name: "a versioned install whose root moves is refused", swap: true,
+			setup: func(t *testing.T, real, other string) {
+				for _, r := range []string{real, other} {
+					putInstalledFile(t, filepath.Join(r, "versions", "v0.3.9", "k3sm"))
+					putInstalledLink(t, "versions/v0.3.9", filepath.Join(r, "current"))
+					putInstalledLink(t, "current/k3sm", filepath.Join(r, "k3sm"))
+				}
+			}},
 	}
-	t.Run("a versioned install resolves into the real root", func(t *testing.T) {
-		t.Parallel()
-		real, linked := linkedRoot(t)
-		putInstalledFile(t, filepath.Join(real, "versions", "v0.3.9", "k3sm"))
-		putInstalledLink(t, "versions/v0.3.9", filepath.Join(real, "current"))
-		putInstalledLink(t, "current/k3sm", filepath.Join(real, "k3sm"))
-		got, err := resolveInstalledBinary(filepath.Join(linked, "k3sm"), os.Lstat, filepath.EvalSymlinks)
-		if want := filepath.Join(real, "versions", "v0.3.9", "k3sm"); err != nil || got != want {
-			t.Fatalf("resolveInstalledBinary = %q, %v; want %s", got, err, want)
-		}
-	})
-	t.Run("a flat install is returned as named", func(t *testing.T) {
-		t.Parallel()
-		real, linked := linkedRoot(t)
-		putInstalledFile(t, filepath.Join(real, "k3sm"))
-		entry := filepath.Join(linked, "k3sm")
-		got, err := resolveInstalledBinary(entry, os.Lstat, filepath.EvalSymlinks)
-		if err != nil || got != entry {
-			t.Fatalf("resolveInstalledBinary = %q, %v; want %s", got, err, entry)
-		}
-	})
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			base, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			real, other, linked := filepath.Join(base, "real"), filepath.Join(base, "other"), filepath.Join(base, "k3sm-root")
+			for _, d := range []string{real, other} {
+				if err := os.Mkdir(d, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			putInstalledLink(t, real, linked)
+			tc.setup(t, real, other)
+			lstats := 0
+			lstat := func(p string) (fs.FileInfo, error) {
+				fi, err := os.Lstat(p)
+				if lstats++; tc.relink && lstats == 1 {
+					if err := os.Remove(filepath.Join(real, "k3sm")); err != nil {
+						t.Fatal(err)
+					}
+					putInstalledLink(t, "versions/v0.3.9/k3sm", filepath.Join(real, "k3sm"))
+				}
+				return fi, err
+			}
+			evals := 0
+			eval := func(p string) (string, error) {
+				got, err := filepath.EvalSymlinks(p)
+				if evals++; tc.swap && evals == 1 {
+					if err := os.Remove(linked); err != nil {
+						t.Fatal(err)
+					}
+					putInstalledLink(t, other, linked)
+				}
+				return got, err
+			}
+			entry := filepath.Join(linked, "k3sm")
+			got, err := resolveInstalledBinary(entry, lstat, eval)
+			switch tc.want {
+			case "":
+				if !errors.Is(err, errInstalledUnresolvable) || errors.Is(err, fs.ErrNotExist) {
+					t.Fatalf("resolveInstalledBinary = %q, %v; want errInstalledUnresolvable and not fs.ErrNotExist", got, err)
+				}
+			case "=":
+				if err != nil || got != entry {
+					t.Fatalf("resolveInstalledBinary = %q, %v; want %s", got, err, entry)
+				}
+			default:
+				if want := filepath.Join(real, tc.want); err != nil || got != want {
+					t.Fatalf("resolveInstalledBinary = %q, %v; want %s", got, err, want)
+				}
+			}
+		})
+	}
 }
 
 // TestDeveloperModeOffJudgesTheResolvedInstall pins that the decision to turn
