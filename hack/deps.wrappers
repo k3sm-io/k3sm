@@ -1,0 +1,14 @@
+# Wrapper graphs for hack/verify-deps.sh: binaries this repo builds outside its
+# own go.mod, from a go.sum embedded in the repo (built with -mod=readonly). One
+# line per wrapper:
+#
+#   <name> <go.sum> hack/deps-<name>.lock
+#
+# zotchild: the registry's zot child (pkg/registrysvc).
+zotchild pkg/registrysvc/zotchild/go.sum.txt hack/deps-zotchild.lock
+# helmchild: the helm binary the daemon builds (pkg/helmchart).
+helmchild pkg/helmchart/helmchild/go.sum.txt hack/deps-helmchild.lock
+# ociconformance: the OCI distribution-spec conformance suite
+# (hack/ociconformance.sh), test tooling that is never shipped; it runs on the
+# developer's Mac, so its graph is screened like the others.
+ociconformance hack/ociconformance/go.sum.txt hack/deps-ociconformance.lock
