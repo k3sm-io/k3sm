@@ -267,9 +267,10 @@ type BudgetHistory struct {
 	quitOnce sync.Once
 	stopped  chan struct{} // closed when run returns
 
-	// wmu serialises file writes (the writer's, and stop's catch-up write once
-	// the writer has exited), so an older snapshot never lands after a newer
-	// one. It is taken before mu, never while holding it.
+	// wmu serialises file writes (the writer's, and the inline writes of stop
+	// and flush once the writer has exited or when none runs), so an older
+	// snapshot never lands after a newer one. It is taken before mu, never while
+	// holding it.
 	wmu sync.Mutex
 
 	mu      sync.Mutex
