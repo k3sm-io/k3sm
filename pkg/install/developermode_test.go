@@ -573,28 +573,6 @@ func TestDeveloperModeMarkerDroppedAsTheSwapCommits(t *testing.T) {
 		}
 	})
 
-	t.Run("a removal and a disown that fail finish the install, then say so", func(t *testing.T) {
-		f := &fakeSystem{owners: map[string]OwnedEntry{}, removeEntryErrs: map[string]error{DeveloperModeMarkerPath: errors.New("EPERM")}, chownErrs: map[string]error{DeveloperModeMarkerPath: errors.New("EPERM")}}
-		putMarker(f, 0o644)
-		cfg := stageCfg()
-		cfg.DeveloperMode = DeveloperModeOff
-		err := Install(context.Background(), f, cfg)
-		if err == nil || !strings.Contains(err.Error(), "k3sm install --developer-mode off") {
-			t.Fatalf("Install = %v, want the removal failure naming k3sm install --developer-mode off", err)
-		}
-		removed := slices.Index(f.calls, removeCall)
-		if removed < 0 {
-			t.Fatalf("the removal was not attempted; calls %v", f.calls)
-		}
-		// Step 5, after the removal: the admin kubeconfig, then the server
-		// arguments record that names it.
-		for _, want := range []string{"WriteUserKubeconfig:alice", "WriteServerArgsRecord:"} {
-			if !slices.ContainsFunc(f.calls[removed:], func(c string) bool { return strings.HasPrefix(c, want) }) {
-				t.Errorf("the install stopped before %s; calls after the removal %v", want, f.calls[removed:])
-			}
-		}
-	})
-
 	t.Run("an unreadable marker is removed and not restored on a revert", func(t *testing.T) {
 		f := &fakeSystem{}
 		if err := Install(context.Background(), f, stageCfg()); err != nil {
@@ -654,22 +632,6 @@ func TestDeveloperModeMarkerDroppedAsTheSwapCommits(t *testing.T) {
 		}
 		if got := ReadDeveloperModeState(f, DeveloperModeMarkerPath); got != DeveloperModeInvalid {
 			t.Errorf("the marker reads %s, want %s", got, DeveloperModeInvalid)
-		}
-	})
-
-	t.Run("a later failure keeps the removal error beside it", func(t *testing.T) {
-		f := &fakeSystem{owners: map[string]OwnedEntry{}, removeEntryErrs: map[string]error{DeveloperModeMarkerPath: errors.New("EPERM")}, chownErrs: map[string]error{DeveloperModeMarkerPath: errors.New("EPERM")}, kubeconfigErr: errors.New("home is read-only")}
-		putMarker(f, 0o644)
-		cfg := stageCfg()
-		cfg.DeveloperMode = DeveloperModeOff
-		err := Install(context.Background(), f, cfg)
-		if err == nil {
-			t.Fatal("Install succeeded with the kubeconfig write failing")
-		}
-		for _, want := range []string{"write admin kubeconfig for alice: home is read-only", "k3sm install --developer-mode off"} {
-			if !strings.Contains(err.Error(), want) {
-				t.Errorf("error %q does not carry %q", err, want)
-			}
 		}
 	})
 }

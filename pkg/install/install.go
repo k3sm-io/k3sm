@@ -2448,9 +2448,20 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	//      developer mode as on beside it. A failed swap above leaves the
 	//      marker untouched; a revert below restores it (markerRemoval.restore),
 	//      so a build from source that is rolled back to stays in developer
-	//      mode. A failed removal is reported only once the install has
-	//      finished, at the end of step 5.
+	//      mode. A removal that failed but left the marker reading invalid is
+	//      reported only once the install has finished, at the end of step 5.
 	dropErr := removeMarker.drop(sys, cfg)
+	// 2f″. A marker that could be neither removed nor disowned still reads
+	//      on, and the signed tree must not run beside it: the app's root
+	//      steps would skip the signing continuity check. Fail closed. The
+	//      previous tree and its marker are the consistent pair, so the swap
+	//      is reverted and the daemons restart on the previous tree, never on
+	//      this one; on a first install there is nothing to revert to, and the
+	//      install stops here, before anything is wired or restarted.
+	if removeMarker.stillOn() {
+		restartOwned = previous // a revert restarts, and reports, every daemon
+		return revertInstallRoot(ctx, sys, cfg, m, previous, dropErr, nil)
+	}
 
 	// 3. The launcher link and the plists, in that order, and BOTH after the
 	//    publish: each names a fixed absolute path inside the install root, and
