@@ -112,6 +112,7 @@ pin, its date, and the tarball's sha256.
   lock /var/lib/k3sm/runtimed.lock: permission denied`: the embedded runtime now creates a lock
   file in the data root, which belongs to root. `k3sm install` now creates that one file for the
   service user, mode 0600, and repairs one left owned by root; the data root keeps its mode.
+- The server and agent no longer warn about the mesh key on every start under the service user.
 - The k3sm registry server answers a manifest whose stored bytes no longer match its digest or
   size with a 500 that sends nothing of the manifest, logged at Error with the digest, instead of
   a 400 `DIGEST_INVALID` that blamed the client. A blob mount from a corrupt source answers the
