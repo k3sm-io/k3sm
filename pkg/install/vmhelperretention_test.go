@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 	"syscall"
 	"testing"
@@ -133,16 +134,19 @@ func TestTeardownUnknownRetentionCoversEveryNonENOENTError(t *testing.T) {
 				tc.text,
 				fmt.Sprintf("check that %q and each of its parents are owned by root and not writable by group or others", versions+"/0.2.8"),
 				"an I/O error means the disk needs checking",
-				fmt.Sprintf("if ps -g %d lists only k3sm-vmhost processes (the helper above), stop it with: sudo kill -TERM -%d", stale, stale),
+				fmt.Sprintf("if ps -o pid,command -g %d shows only %q processes, stop it with: sudo kill -TERM -%d", stale, staleExe, stale),
 			} {
 				if !strings.Contains(msg, want) {
 					t.Errorf("stopVMHelpers = %q, want it to name %q", msg, want)
 				}
 			}
-			for _, wrong := range []string{"fix the permissions", fmt.Sprintf("-%d", live), fmt.Sprintf("-g %d", live), fmt.Sprintf("pid %d", live), "no longer retains", "not " + cfg.installedVMHost()} {
+			for _, wrong := range []string{"fix the permissions", "no longer retains", "not " + cfg.installedVMHost()} {
 				if strings.Contains(msg, wrong) {
 					t.Errorf("stopVMHelpers = %q, reports an unknown retention as %q", msg, wrong)
 				}
+			}
+			if regexp.MustCompile(fmt.Sprintf(`\b%d\b`, live)).MatchString(msg) {
+				t.Errorf("stopVMHelpers = %q, names the live group %d", msg, live)
 			}
 			if strings.Contains(logs.String(), "no longer retains") {
 				t.Errorf("an unknown retention was logged as unretained:\n%s", logs.String())
