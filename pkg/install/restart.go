@@ -512,11 +512,14 @@ func awaitRunning(ctx context.Context, sys System, label string, b restartBudget
 // are running right now. An operator reading an upgrade that failed needs those
 // three facts and no others.
 //
+// swappedBack, when not nil, runs right after the reverse swap succeeds and
+// before the restart.
+//
 // previous is the publish's own answer to "was there a tree here before". When it
 // is false the publish was a plain rename onto an absent install root — a first
 // install — so there is nothing to revert TO, and saying so is more useful than
 // swapping the new tree out and leaving the Mac with no install root at all.
-func revertInstallRoot(ctx context.Context, sys System, cfg Config, m []artifact, previous bool, cause error) error {
+func revertInstallRoot(ctx context.Context, sys System, cfg Config, m []artifact, previous bool, cause error, swappedBack func()) error {
 	states := func() string {
 		s, _ := daemonStates(sys, longRunningDaemonLabels(m))
 		return strings.Join(s, ", ")
@@ -529,6 +532,11 @@ func revertInstallRoot(ctx context.Context, sys System, cfg Config, m []artifact
 		return fmt.Errorf("%w; ROLLBACK FAILED, the install root %s still holds the NEW tree and the previous one is at %s: %v; daemon state: %s", cause, cfg.InstallDir, staging, err, states())
 	}
 	cfg.Logger.Warn("rolled the install root back to the previous tree", "live", filepath.Clean(cfg.InstallDir), "failed-tree", staging, "cause", cause)
+	// What the install changed beside the tree for the new one (the
+	// developer-mode marker) goes back before the daemons restart on the old.
+	if swappedBack != nil {
+		swappedBack()
+	}
 	// The daemons are restarted against what is live NOW. Whatever the failure
 	// was, this install may have booted a label out, or bootstrapped it onto the
 	// tree that has just been swapped away; only a restart makes the running

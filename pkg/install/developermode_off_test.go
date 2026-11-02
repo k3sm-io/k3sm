@@ -36,6 +36,7 @@ func devModeStagedInstall(t *testing.T, signer fakeSigner) (*fakeSystem, Config,
 	var logs strings.Builder
 	cfg.Logger = slog.New(slog.NewTextHandler(&logs, nil))
 	f := &fakeSystem{owners: map[string]OwnedEntry{}}
+	seedMarkerAncestors(f)
 	f.owners[DeveloperModeMarkerPath] = OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: 0o644}
 	f.putFile(DeveloperModeMarkerPath, []byte("developer mode enabled by k3sm install on 2026-10-31T00:00:00Z\n"))
 	if err := resolveDeveloperMode(f, &cfg); err != nil {
@@ -89,8 +90,15 @@ func TestDeveloperModeOffNeedsTheWholeTree(t *testing.T) {
 			if err := preflightFromStaging(context.Background(), &cfg); err != nil {
 				t.Fatalf("preflightFromStaging = %v, want accepted in developer mode", err)
 			}
-			if err := applyDeveloperMode(context.Background(), f, cfg); err != nil {
+			removal, err := applyDeveloperMode(context.Background(), f, cfg)
+			if err != nil {
 				t.Fatalf("applyDeveloperMode = %v", err)
+			}
+			if _, ok := f.files[DeveloperModeMarkerPath]; !ok {
+				t.Fatal("applyDeveloperMode removed the marker before the swap committed")
+			}
+			if err := removal.drop(f, cfg); err != nil {
+				t.Fatalf("drop = %v", err)
 			}
 			_, kept := f.files[DeveloperModeMarkerPath]
 			if kept == tc.wantRemove {
@@ -136,7 +144,7 @@ func TestDeveloperModeMarkerChangedUnderTheLock(t *testing.T) {
 			}
 			tc.change(f)
 			f.calls = nil
-			err := applyDeveloperMode(context.Background(), f, cfg)
+			_, err := applyDeveloperMode(context.Background(), f, cfg)
 			if !errors.Is(err, ErrDeveloperModeChanged) {
 				t.Fatalf("applyDeveloperMode = %v, want %v", err, ErrDeveloperModeChanged)
 			}
@@ -153,6 +161,7 @@ func TestDeveloperModeMarkerChangedUnderTheLock(t *testing.T) {
 		_, cfg := stagedFixture()
 		cfg.Signer = fakeSigner{ids: signedTree(map[string]string{installed: testTeamID})}
 		f := &fakeSystem{owners: map[string]OwnedEntry{}}
+		seedMarkerAncestors(f)
 		if err := resolveDeveloperMode(f, &cfg); err != nil {
 			t.Fatal(err)
 		}
@@ -160,7 +169,7 @@ func TestDeveloperModeMarkerChangedUnderTheLock(t *testing.T) {
 			t.Fatal(err)
 		}
 		f.owners[DeveloperModeMarkerPath] = OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: 0o644}
-		if err := applyDeveloperMode(context.Background(), f, cfg); !errors.Is(err, ErrDeveloperModeChanged) {
+		if _, err := applyDeveloperMode(context.Background(), f, cfg); !errors.Is(err, ErrDeveloperModeChanged) {
 			t.Fatalf("applyDeveloperMode = %v, want %v", err, ErrDeveloperModeChanged)
 		}
 	})
@@ -171,7 +180,7 @@ func TestDeveloperModeMarkerChangedUnderTheLock(t *testing.T) {
 		if err := preflightFromStaging(context.Background(), &cfg); err != nil {
 			t.Fatal(err)
 		}
-		if err := applyDeveloperMode(context.Background(), f, cfg); err != nil {
+		if _, err := applyDeveloperMode(context.Background(), f, cfg); err != nil {
 			t.Fatalf("applyDeveloperMode = %v, want accepted", err)
 		}
 	})
@@ -207,8 +216,12 @@ func pinPlainInstallSignature(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			f := &fakeSystem{owners: map[string]OwnedEntry{}}
+			seedMarkerAncestors(f)
 			f.owners[DeveloperModeMarkerPath] = OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: 0o644}
 			f.putFile(DeveloperModeMarkerPath, []byte("developer mode enabled by k3sm install on 2026-10-31T00:00:00Z\n"))
+			if got := ReadDeveloperModeState(f, DeveloperModeMarkerPath); got != DeveloperModeMarkerOn {
+				t.Fatalf("the seeded marker reads %s, want %s", got, DeveloperModeMarkerOn)
+			}
 			var logs strings.Builder
 			cfg := Config{
 				BinarySource:   exe,
@@ -218,8 +231,23 @@ func pinPlainInstallSignature(t *testing.T) {
 			if err := resolveDeveloperMode(f, &cfg); err != nil {
 				t.Fatal(err)
 			}
-			if err := applyDeveloperMode(context.Background(), f, cfg); err != nil {
+			removal, err := applyDeveloperMode(context.Background(), f, cfg)
+			if err != nil {
 				t.Fatalf("applyDeveloperMode = %v", err)
+			}
+			if (removal != nil) != tc.wantRemove {
+				t.Fatalf("applyDeveloperMode decided a removal = %v, want %v; logs:\n%s", removal != nil, tc.wantRemove, logs.String())
+			}
+			// The decision alone touches nothing: the install removes the
+			// marker, and says so, only when the swap commits.
+			if _, ok := f.files[DeveloperModeMarkerPath]; !ok {
+				t.Fatal("applyDeveloperMode removed the marker; want it left for drop")
+			}
+			if strings.Contains(logs.String(), "turned off") {
+				t.Fatalf("the turned-off line was logged before drop:\n%s", logs.String())
+			}
+			if err := removal.drop(f, cfg); err != nil {
+				t.Fatalf("drop = %v", err)
 			}
 			_, kept := f.files[DeveloperModeMarkerPath]
 			if kept == tc.wantRemove {
@@ -230,8 +258,13 @@ func pinPlainInstallSignature(t *testing.T) {
 				if !strings.Contains(logs.String(), want) || !strings.Contains(logs.String(), "team-id="+tc.wantTeam) {
 					t.Errorf("log does not say %q with team-id=%s:\n%s", want, tc.wantTeam, logs.String())
 				}
-			} else if !strings.Contains(logs.String(), "developer mode stays on") {
-				t.Errorf("a kept marker is not explained:\n%s", logs.String())
+			} else {
+				if !strings.Contains(logs.String(), "developer mode stays on") {
+					t.Errorf("a kept marker is not explained:\n%s", logs.String())
+				}
+				if strings.Contains(logs.String(), "ignored invalid marker") {
+					t.Errorf("a valid marker was judged invalid:\n%s", logs.String())
+				}
 			}
 		})
 	}

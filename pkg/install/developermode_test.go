@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"regexp"
 	"slices"
@@ -35,10 +36,14 @@ import (
 func TestDeveloperModeMarkerState(t *testing.T) {
 	t.Parallel()
 	good := OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: 0o644}
+	ancestors := []DeveloperModeAncestor{
+		{Entry: OwnedEntry{Path: "/", Kind: EntryDir, Mode: 0o755}},
+		{Entry: OwnedEntry{Path: "/Library", GID: 80, Kind: EntryDir, Mode: 0o755}},
+	}
 	with := func(mut func(*OwnedEntry)) DeveloperModeFacts {
 		e := good
 		mut(&e)
-		return DeveloperModeFacts{Exists: true, Entry: e}
+		return DeveloperModeFacts{Exists: true, Entry: e, Ancestors: ancestors}
 	}
 	cases := []struct {
 		name  string
@@ -46,7 +51,8 @@ func TestDeveloperModeMarkerState(t *testing.T) {
 		want  DeveloperModeState
 	}{
 		{name: "nothing there", facts: DeveloperModeFacts{}, want: DeveloperModeAbsent},
-		{name: "root:wheel 0644", facts: DeveloperModeFacts{Exists: true, Entry: good}, want: DeveloperModeMarkerOn},
+		{name: "root:wheel 0644", facts: DeveloperModeFacts{Exists: true, Entry: good, Ancestors: ancestors}, want: DeveloperModeMarkerOn},
+		{name: "root:wheel 0644 with no ancestor described", facts: DeveloperModeFacts{Exists: true, Entry: good}, want: DeveloperModeInvalid},
 		{name: "root 0600", facts: with(func(e *OwnedEntry) { e.Mode = 0o600 }), want: DeveloperModeMarkerOn},
 		{name: "a symlink", facts: with(func(e *OwnedEntry) { e.Kind = EntrySymlink }), want: DeveloperModeInvalid},
 		{name: "a directory", facts: with(func(e *OwnedEntry) { e.Kind = EntryDir; e.Mode = 0o755 }), want: DeveloperModeInvalid},
@@ -55,8 +61,8 @@ func TestDeveloperModeMarkerState(t *testing.T) {
 		{name: "0666", facts: with(func(e *OwnedEntry) { e.Mode = 0o666 }), want: DeveloperModeInvalid},
 		{name: "0664", facts: with(func(e *OwnedEntry) { e.Mode = 0o664 }), want: DeveloperModeInvalid},
 		{name: "0646", facts: with(func(e *OwnedEntry) { e.Mode = 0o646 }), want: DeveloperModeInvalid},
-		{name: "an ACL", facts: DeveloperModeFacts{Exists: true, Entry: good, HasACL: true}, want: DeveloperModeInvalid},
-		{name: "a probe that failed", facts: DeveloperModeFacts{Exists: true, Entry: good, Err: errors.New("EIO")}, want: DeveloperModeInvalid},
+		{name: "an ACL", facts: DeveloperModeFacts{Exists: true, Entry: good, HasACL: true, Ancestors: ancestors}, want: DeveloperModeInvalid},
+		{name: "a probe that failed", facts: DeveloperModeFacts{Exists: true, Entry: good, Err: errors.New("EIO"), Ancestors: ancestors}, want: DeveloperModeInvalid},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -83,6 +89,7 @@ func TestDeveloperModeMarkerState(t *testing.T) {
 			{name: "world-writable", entry: &OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: 0o666}, want: DeveloperModeInvalid, wantACL: true},
 		} {
 			f := &fakeSystem{owners: map[string]OwnedEntry{}, acls: map[string]bool{DeveloperModeMarkerPath: tc.acl}}
+			seedMarkerAncestors(f)
 			if tc.entry != nil {
 				f.owners[DeveloperModeMarkerPath] = *tc.entry
 			}
@@ -92,6 +99,84 @@ func TestDeveloperModeMarkerState(t *testing.T) {
 			if probed := slices.Contains(f.calls, "HasACL:"+DeveloperModeMarkerPath); probed != tc.wantACL {
 				t.Errorf("%s: ACL probed = %v, want %v (calls %v)", tc.name, probed, tc.wantACL, f.calls)
 			}
+		}
+	})
+}
+
+// seedMarkerAncestors gives the fake the directories above the marker as a
+// Mac has them: / root:wheel 0755 and /Library root:admin 0755, real
+// directories that neither group nor others can write, with no ACL. A test
+// that puts a marker on the fake seeds them too, or the marker is invalid.
+func seedMarkerAncestors(f *fakeSystem) {
+	if f.owners == nil {
+		f.owners = map[string]OwnedEntry{}
+	}
+	f.owners["/"] = OwnedEntry{Path: "/", Kind: EntryDir, Mode: 0o755}
+	f.owners["/Library"] = OwnedEntry{Path: "/Library", GID: 80, Kind: EntryDir, Mode: 0o755}
+}
+
+// TestDeveloperModeMarkerJudgesAncestors pins that the marker counts only when
+// every directory above it, from /, passes the checks the app applies: a real
+// directory (not a symlink), owned by root, with no group or other write bit
+// and no ACL. A valid marker under a failing ancestor is invalid, so the
+// signature checks stay on.
+func TestDeveloperModeMarkerJudgesAncestors(t *testing.T) {
+	t.Parallel()
+	marker := OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: 0o644}
+	cases := []struct {
+		name string
+		mut  func(*fakeSystem)
+		want DeveloperModeState
+	}{
+		{name: "root-owned / and /Library", mut: func(*fakeSystem) {}, want: DeveloperModeMarkerOn},
+		{name: "/Library writable by group", mut: func(f *fakeSystem) {
+			e := f.owners["/Library"]
+			e.Mode = 0o775
+			f.owners["/Library"] = e
+		}, want: DeveloperModeInvalid},
+		{name: "/Library writable by others", mut: func(f *fakeSystem) {
+			e := f.owners["/Library"]
+			e.Mode = 0o757
+			f.owners["/Library"] = e
+		}, want: DeveloperModeInvalid},
+		{name: "/ writable by group", mut: func(f *fakeSystem) {
+			e := f.owners["/"]
+			e.Mode = 0o775
+			f.owners["/"] = e
+		}, want: DeveloperModeInvalid},
+		{name: "/Library with an ACL", mut: func(f *fakeSystem) { f.acls["/Library"] = true }, want: DeveloperModeInvalid},
+		{name: "/ with an ACL", mut: func(f *fakeSystem) { f.acls["/"] = true }, want: DeveloperModeInvalid},
+		{name: "/Library owned by a user", mut: func(f *fakeSystem) {
+			e := f.owners["/Library"]
+			e.UID = 501
+			f.owners["/Library"] = e
+		}, want: DeveloperModeInvalid},
+		{name: "/Library a symlink", mut: func(f *fakeSystem) {
+			f.owners["/Library"] = OwnedEntry{Path: "/Library", Kind: EntrySymlink, Mode: 0o755}
+		}, want: DeveloperModeInvalid},
+		{name: "/Library not a directory", mut: func(f *fakeSystem) {
+			f.owners["/Library"] = OwnedEntry{Path: "/Library", Kind: EntryRegular, Mode: 0o644}
+		}, want: DeveloperModeInvalid},
+		{name: "/Library that cannot be described", mut: func(f *fakeSystem) { delete(f.owners, "/Library") }, want: DeveloperModeInvalid},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := &fakeSystem{owners: map[string]OwnedEntry{DeveloperModeMarkerPath: marker}, acls: map[string]bool{}}
+			seedMarkerAncestors(f)
+			tc.mut(f)
+			if got := ReadDeveloperModeState(f, DeveloperModeMarkerPath); got != tc.want {
+				t.Errorf("ReadDeveloperModeState = %s, want %s (calls %v)", got, tc.want, f.calls)
+			}
+		})
+	}
+
+	t.Run("an absent marker is absent whatever its ancestors", func(t *testing.T) {
+		t.Parallel()
+		f := &fakeSystem{owners: map[string]OwnedEntry{}, acls: map[string]bool{"/Library": true}}
+		seedMarkerAncestors(f)
+		if got := ReadDeveloperModeState(f, DeveloperModeMarkerPath); got != DeveloperModeAbsent {
+			t.Errorf("ReadDeveloperModeState = %s, want %s", got, DeveloperModeAbsent)
 		}
 	})
 }
@@ -163,12 +248,15 @@ func TestDeveloperModeMarkerOnInstall(t *testing.T) {
 		{name: "an ad-hoc install without the flag keeps an invalid marker and says it is ignored", signer: adHoc,
 			onDisk: &OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: 0o666}, wantIgnoredWarn: true},
 		{name: "a team-signed install with nothing there removes nothing", signer: teamSigned},
+		{name: "off keeps the marker when the swap fails", mode: DeveloperModeOff, onDisk: &marker, swapErr: errors.New("EIO")},
+		{name: "a team-signed install keeps the marker when the swap fails", signer: teamSigned, onDisk: &marker, swapErr: errors.New("EIO")},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			f := &fakeSystem{owners: map[string]OwnedEntry{}, swapErr: tc.swapErr}
 			if tc.onDisk != nil {
+				seedMarkerAncestors(f)
 				f.owners[DeveloperModeMarkerPath] = *tc.onDisk
 				f.putFile(DeveloperModeMarkerPath, []byte("developer mode enabled by k3sm install on 2026-10-31T00:00:00Z\n"))
 			}
@@ -203,6 +291,10 @@ func TestDeveloperModeMarkerOnInstall(t *testing.T) {
 			if tc.wantRemove {
 				if _, ok := f.files[DeveloperModeMarkerPath]; ok {
 					t.Error("the marker is still there")
+				}
+				swap := slices.IndexFunc(f.calls, func(c string) bool { return strings.HasPrefix(c, "SwapInstallRoot:") })
+				if at := slices.Index(f.calls, removeCall); swap < 0 || at < swap {
+					t.Errorf("the marker was removed at call %d, the install root swapped at %d: want it after the swap", at, swap)
 				}
 			} else if tc.onDisk != nil {
 				if _, ok := f.files[DeveloperModeMarkerPath]; !ok {
@@ -338,6 +430,7 @@ func TestDeveloperModeClearedByAnyDeveloperIDTeam(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			f := &fakeSystem{owners: map[string]OwnedEntry{}}
+			seedMarkerAncestors(f)
 			f.owners[DeveloperModeMarkerPath] = OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: 0o644}
 			f.putFile(DeveloperModeMarkerPath, []byte("developer mode enabled by k3sm install on 2026-10-31T00:00:00Z\n"))
 			var logs strings.Builder
@@ -380,6 +473,7 @@ func TestDeveloperModeKeptWhenDeveloperIDVerificationFails(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			f := &fakeSystem{owners: map[string]OwnedEntry{}}
+			seedMarkerAncestors(f)
 			f.owners[DeveloperModeMarkerPath] = OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: 0o644}
 			f.putFile(DeveloperModeMarkerPath, []byte("developer mode enabled by k3sm install on 2026-10-31T00:00:00Z\n"))
 			var logs strings.Builder
@@ -398,5 +492,202 @@ func TestDeveloperModeKeptWhenDeveloperIDVerificationFails(t *testing.T) {
 				t.Errorf("no stays-on Warn; logs:\n%s", logs.String())
 			}
 		})
+	}
+}
+
+// TestDeveloperModeMarkerDroppedAsTheSwapCommits pins when an install that
+// turns developer mode off removes the marker: right after the swap commits
+// and before the daemons are wired and restarted on the new tree, so the
+// app's root steps never read developer mode as on beside a signed tree. A
+// revert puts the marker back as it was, so the rolled-back build stays in
+// developer mode, and a removal that fails still finishes the install before
+// it is reported.
+func TestDeveloperModeMarkerDroppedAsTheSwapCommits(t *testing.T) {
+	shrinkRestartBudgets(t)
+	const content = "developer mode enabled by k3sm install on 2026-10-31T00:00:00Z\n"
+	removeCall := "RemoveEntry:/Library:k3sm.developer-mode"
+	putMarker := func(f *fakeSystem, mode fs.FileMode) {
+		seedMarkerAncestors(f)
+		f.owners[DeveloperModeMarkerPath] = OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: mode}
+		f.putFile(DeveloperModeMarkerPath, []byte(content))
+		if f.modes == nil {
+			f.modes = map[string]fs.FileMode{}
+		}
+		f.modes[DeveloperModeMarkerPath] = mode
+	}
+
+	for _, tc := range []struct {
+		name string
+		mode DeveloperMode
+		sign TeamIDReader
+	}{
+		{name: "off", mode: DeveloperModeOff},
+		{name: "a team-signed install", sign: fakeSigner{ids: map[string]string{"/tmp/k3sm": testTeamID}}},
+	} {
+		t.Run(tc.name+" removes it before the wiring", func(t *testing.T) {
+			f := &fakeSystem{owners: map[string]OwnedEntry{}}
+			putMarker(f, 0o644)
+			cfg := stageCfg()
+			cfg.DeveloperMode, cfg.Signer = tc.mode, tc.sign
+			if err := Install(context.Background(), f, cfg); err != nil {
+				t.Fatal(err)
+			}
+			swap := slices.IndexFunc(f.calls, func(c string) bool { return strings.HasPrefix(c, "SwapInstallRoot:") })
+			removed := slices.Index(f.calls, removeCall)
+			if swap < 0 || removed < swap {
+				t.Fatalf("the marker was removed at call %d, the swap at %d: want it after the swap", removed, swap)
+			}
+			for _, c := range f.calls[swap+1 : removed] {
+				if !strings.Contains(c, "developer-mode") && c != "Owner:/" && c != "Owner:/Library" && c != "HasACL:/" && c != "HasACL:/Library" {
+					t.Errorf("call %q ran between the swap and the marker removal; want the removal first", c)
+				}
+			}
+		})
+	}
+
+	t.Run("a revert restores the marker as it was", func(t *testing.T) {
+		f := &fakeSystem{}
+		if err := Install(context.Background(), f, stageCfg()); err != nil {
+			t.Fatalf("first Install: %v", err)
+		}
+		putMarker(f, 0o600)
+		f.putLoaded(NetdLabel, ServerLabel)
+		f.calls = nil
+		f.putBootstrapAlways(NetdLabel, errors.New("Bootstrap failed: 125: Domain does not support specified action"))
+		cfg := stageCfg()
+		cfg.DeveloperMode = DeveloperModeOff
+		err := Install(context.Background(), f, cfg)
+		if err == nil || !strings.Contains(err.Error(), "rolled back to the previous install root") {
+			t.Fatalf("Install = %v, want the rollback", err)
+		}
+		removed := slices.Index(f.calls, removeCall)
+		restored := slices.Index(f.calls, "WriteRootOnlyFile:"+DeveloperModeMarkerPath+":0600")
+		if removed < 0 || restored < removed {
+			t.Fatalf("removed at call %d, restored at %d: want a removal then a restore; calls %v", removed, restored, f.calls)
+		}
+		if got := string(f.files[DeveloperModeMarkerPath]); got != content {
+			t.Errorf("restored content %q, want %q", got, content)
+		}
+		if got := ReadDeveloperModeState(f, DeveloperModeMarkerPath); got != DeveloperModeMarkerOn {
+			t.Errorf("after the revert the marker reads %s, want %s", got, DeveloperModeMarkerOn)
+		}
+	})
+
+	t.Run("a removal and a disown that fail finish the install, then say so", func(t *testing.T) {
+		f := &fakeSystem{owners: map[string]OwnedEntry{}, removeEntryErrs: map[string]error{DeveloperModeMarkerPath: errors.New("EPERM")}, chownErrs: map[string]error{DeveloperModeMarkerPath: errors.New("EPERM")}}
+		putMarker(f, 0o644)
+		cfg := stageCfg()
+		cfg.DeveloperMode = DeveloperModeOff
+		err := Install(context.Background(), f, cfg)
+		if err == nil || !strings.Contains(err.Error(), "k3sm install --developer-mode off") {
+			t.Fatalf("Install = %v, want the removal failure naming k3sm install --developer-mode off", err)
+		}
+		removed := slices.Index(f.calls, removeCall)
+		if removed < 0 {
+			t.Fatalf("the removal was not attempted; calls %v", f.calls)
+		}
+		// Step 5, after the removal: the admin kubeconfig, then the server
+		// arguments record that names it.
+		for _, want := range []string{"WriteUserKubeconfig:alice", "WriteServerArgsRecord:"} {
+			if !slices.ContainsFunc(f.calls[removed:], func(c string) bool { return strings.HasPrefix(c, want) }) {
+				t.Errorf("the install stopped before %s; calls after the removal %v", want, f.calls[removed:])
+			}
+		}
+	})
+
+	t.Run("an unreadable marker is removed and not restored on a revert", func(t *testing.T) {
+		f := &fakeSystem{}
+		if err := Install(context.Background(), f, stageCfg()); err != nil {
+			t.Fatalf("first Install: %v", err)
+		}
+		putMarker(f, 0o644)
+		f.readModeErrs = map[string]error{DeveloperModeMarkerPath: errors.New("EIO")}
+		f.putLoaded(NetdLabel, ServerLabel)
+		f.calls = nil
+		f.putBootstrapAlways(NetdLabel, errors.New("Bootstrap failed: 125: Domain does not support specified action"))
+		var logs strings.Builder
+		cfg := stageCfg()
+		cfg.DeveloperMode = DeveloperModeOff
+		cfg.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+		err := Install(context.Background(), f, cfg)
+		if err == nil || !strings.Contains(err.Error(), "rolled back to the previous install root") {
+			t.Fatalf("Install = %v, want the rollback", err)
+		}
+		if !slices.Contains(f.calls, removeCall) {
+			t.Errorf("the unreadable marker was not removed; calls %v", f.calls)
+		}
+		if slices.ContainsFunc(f.calls, func(c string) bool { return strings.HasPrefix(c, "WriteRootOnlyFile:"+DeveloperModeMarkerPath) }) {
+			t.Error("a marker that could not be read was restored")
+		}
+		if got := ReadDeveloperModeState(f, DeveloperModeMarkerPath); got != DeveloperModeAbsent {
+			t.Errorf("after the revert the marker reads %s, want %s", got, DeveloperModeAbsent)
+		}
+		if !strings.Contains(logs.String(), "level=WARN") || !strings.Contains(logs.String(), "could not be read") {
+			t.Errorf("the lost copy is not logged at Warn; logs:\n%s", logs.String())
+		}
+	})
+
+	t.Run("an unreadable marker on a successful install returns the read error", func(t *testing.T) {
+		f := &fakeSystem{owners: map[string]OwnedEntry{}, readModeErrs: map[string]error{DeveloperModeMarkerPath: errors.New("EIO")}}
+		putMarker(f, 0o644)
+		cfg := stageCfg()
+		cfg.DeveloperMode = DeveloperModeOff
+		err := Install(context.Background(), f, cfg)
+		if err == nil || !strings.Contains(err.Error(), "EIO") {
+			t.Fatalf("Install = %v, want the read error", err)
+		}
+		if got := ReadDeveloperModeState(f, DeveloperModeMarkerPath); got != DeveloperModeAbsent {
+			t.Errorf("the marker reads %s, want %s", got, DeveloperModeAbsent)
+		}
+	})
+
+	t.Run("a removal that fails twice leaves the marker invalid", func(t *testing.T) {
+		f := &fakeSystem{owners: map[string]OwnedEntry{}, removeEntryErrs: map[string]error{DeveloperModeMarkerPath: errors.New("EPERM")}}
+		putMarker(f, 0o644)
+		cfg := stageCfg()
+		cfg.DeveloperMode = DeveloperModeOff
+		if err := Install(context.Background(), f, cfg); err != nil {
+			t.Fatalf("Install = %v, want success with the marker disowned", err)
+		}
+		if n := countCalls(f, removeCall); n != 2 {
+			t.Errorf("the removal was attempted %d times, want 2", n)
+		}
+		if got := ReadDeveloperModeState(f, DeveloperModeMarkerPath); got != DeveloperModeInvalid {
+			t.Errorf("the marker reads %s, want %s", got, DeveloperModeInvalid)
+		}
+	})
+
+	t.Run("a later failure keeps the removal error beside it", func(t *testing.T) {
+		f := &fakeSystem{owners: map[string]OwnedEntry{}, removeEntryErrs: map[string]error{DeveloperModeMarkerPath: errors.New("EPERM")}, chownErrs: map[string]error{DeveloperModeMarkerPath: errors.New("EPERM")}, kubeconfigErr: errors.New("home is read-only")}
+		putMarker(f, 0o644)
+		cfg := stageCfg()
+		cfg.DeveloperMode = DeveloperModeOff
+		err := Install(context.Background(), f, cfg)
+		if err == nil {
+			t.Fatal("Install succeeded with the kubeconfig write failing")
+		}
+		for _, want := range []string{"write admin kubeconfig for alice: home is read-only", "k3sm install --developer-mode off"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q does not carry %q", err, want)
+			}
+		}
+	})
+}
+
+// TestDeveloperModeMarkerRestoreDropsGroupAndOtherWrite pins the restore's
+// mode: whatever mode was saved, the marker goes back without the group and
+// other write bits, so a restored marker is never one the predicate rejects
+// for its mode.
+func TestDeveloperModeMarkerRestoreDropsGroupAndOtherWrite(t *testing.T) {
+	t.Parallel()
+	f := &fakeSystem{owners: map[string]OwnedEntry{}}
+	seedMarkerAncestors(f)
+	r := &markerRemoval{path: DeveloperModeMarkerPath, removed: true, saved: []byte("x\n"), savedMode: 0o666}
+	r.restore(f, Config{}.withDefaults())
+	if !slices.Contains(f.calls, "WriteRootOnlyFile:"+DeveloperModeMarkerPath+":0644") {
+		t.Errorf("restore wrote %v, want mode 0644", f.calls)
+	}
+	if got := ReadDeveloperModeState(f, DeveloperModeMarkerPath); got != DeveloperModeMarkerOn {
+		t.Errorf("the restored marker reads %s, want %s", got, DeveloperModeMarkerOn)
 	}
 }

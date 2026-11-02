@@ -593,6 +593,7 @@ func (d devPosture) on() bool { return d == devFlagOn || d == devMarkerOn }
 func (d devPosture) apply(t *testing.T, cfg *Config) {
 	t.Helper()
 	f := &fakeSystem{owners: map[string]OwnedEntry{}}
+	seedMarkerAncestors(f)
 	marker := OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: 0o644}
 	switch d {
 	case devFlagOn:

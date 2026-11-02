@@ -1983,8 +1983,10 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 		return fmt.Errorf("install: %w", err)
 	}
 	defer release()
-	// The developer-mode marker, before the install root is swapped.
-	if err := applyDeveloperMode(ctx, sys, cfg); err != nil {
+	// The developer-mode marker, before the install root is swapped. A
+	// removal waits for the swap to commit (2f′).
+	removeMarker, err := applyDeveloperMode(ctx, sys, cfg)
+	if err != nil {
 		return err
 	}
 
@@ -2440,6 +2442,15 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	if err != nil {
 		return err
 	}
+	// 2f′. The developer-mode marker removal applyDeveloperMode decided on,
+	//      the moment the swap commits and before anything is wired or
+	//      restarted on the new tree, so the app's root steps never read
+	//      developer mode as on beside it. A failed swap above leaves the
+	//      marker untouched; a revert below restores it (markerRemoval.restore),
+	//      so a build from source that is rolled back to stays in developer
+	//      mode. A failed removal is reported only once the install has
+	//      finished, at the end of step 5.
+	dropErr := removeMarker.drop(sys, cfg)
 
 	// 3. The launcher link and the plists, in that order, and BOTH after the
 	//    publish: each names a fixed absolute path inside the install root, and
@@ -2452,7 +2463,7 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	//    target mean the new tree the moment it is live.
 	restartOwned = true // step 4 restarts, and on failure reports, every daemon
 	if err := publishedWiring(ctx, sys, cfg, m, startedAt); err != nil {
-		return revertInstallRoot(ctx, sys, cfg, m, previous, err)
+		return revertInstallRoot(ctx, sys, cfg, m, previous, err, func() { removeMarker.restore(sys, cfg) })
 	}
 
 	// 4c. REAP, and not one step earlier. The previous install root is still
@@ -2483,27 +2494,38 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	//    because one that skipped verification would look like success. The merge
 	//    replaces the whole k3sm cluster entry, so a kubeconfig an earlier release
 	//    wrote (a self-signed pin, or skip-verify) is rewritten.
-	if cfg.Role != RoleAgent {
-		if err := awaitClusterCA(ctx, sys, &cfg, clusterCAWaitBudget); err != nil {
-			return err
-		}
-		kubeconfig, err := AdminKubeconfig(cfg)
-		if err != nil {
-			return fmt.Errorf("install: render admin kubeconfig: %w", err)
-		}
-		kubeconfigPath, err := sys.WriteUserKubeconfig(cfg.TargetUser, cfg.kubeconfigName(), kubeconfig)
-		if err != nil {
-			return fmt.Errorf("install: write admin kubeconfig for %s: %w", cfg.TargetUser, err)
-		}
-		// Record the path just written in the server arguments record, so a root
-		// `k3sm status` checks this file's anchor and never guesses a home.
-		cfg.AdminKubeconfigPath = kubeconfigPath
-		if err := writeServerArgsRecord(sys, cfg); err != nil {
-			return err
-		}
+	if err := writeAdminKubeconfig(ctx, sys, &cfg); err != nil {
+		// A marker removal that failed at 2f′ is reported beside it, so the
+		// --developer-mode off remedy still reaches the operator.
+		return errors.Join(err, dropErr)
 	}
 	cfg.Logger.Info("k3sm installed", "install-dir", cfg.InstallDir, "link", cfg.installedLink(), "kubeconfig-owner", cfg.TargetUser)
-	return nil
+	// The marker removal that failed at 2f′, now that the install is done.
+	return dropErr
+}
+
+// writeAdminKubeconfig is Install's step 5 on a control plane: wait for the
+// cluster CA, write the admin kubeconfig pinned to it, and record its path in
+// the server arguments record. An agent writes none.
+func writeAdminKubeconfig(ctx context.Context, sys System, cfg *Config) error {
+	if cfg.Role == RoleAgent {
+		return nil
+	}
+	if err := awaitClusterCA(ctx, sys, cfg, clusterCAWaitBudget); err != nil {
+		return err
+	}
+	kubeconfig, err := AdminKubeconfig(*cfg)
+	if err != nil {
+		return fmt.Errorf("install: render admin kubeconfig: %w", err)
+	}
+	kubeconfigPath, err := sys.WriteUserKubeconfig(cfg.TargetUser, cfg.kubeconfigName(), kubeconfig)
+	if err != nil {
+		return fmt.Errorf("install: write admin kubeconfig for %s: %w", cfg.TargetUser, err)
+	}
+	// Record the path just written in the server arguments record, so a root
+	// `k3sm status` checks this file's anchor and never guesses a home.
+	cfg.AdminKubeconfigPath = kubeconfigPath
+	return writeServerArgsRecord(sys, *cfg)
 }
 
 // publishedWiring is everything an install does once the new tree is live: the

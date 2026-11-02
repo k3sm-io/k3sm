@@ -265,6 +265,15 @@ type fakeSystem struct {
 	// is the one fault that must leave the live root untouched AND must not be
 	// followed by a reverse swap.
 	swapErr error
+	// removeEntryErrs[path] is the failure RemoveEntry returns for the entry at
+	// path, leaving it in place.
+	removeEntryErrs map[string]error
+	// kubeconfigErr is the failure WriteUserKubeconfig returns.
+	kubeconfigErr error
+	// readModeErrs[path] is the failure ReadRegularFileWithMode returns.
+	readModeErrs map[string]error
+	// chownErrs[path] is the failure Chown returns, leaving the owner as it was.
+	chownErrs map[string]error
 	// space is what InstallSpace answers: free bytes, then needed bytes. Nil —
 	// the zero value — is a volume with room for anything, so only a test about
 	// the preflight has to state a number.
@@ -448,6 +457,9 @@ func (f *fakeSystem) ListOwned(dir string) ([]OwnedEntry, error) {
 // states, and the one thing a caller could quietly get wrong.
 func (f *fakeSystem) Chown(path string, uid, gid int) error {
 	f.calls = append(f.calls, fmt.Sprintf("Chown:%s:%d:%d", path, uid, gid))
+	if err, ok := f.chownErrs[path]; ok {
+		return err
+	}
 	e, ok := f.owners[path]
 	if !ok {
 		return fmt.Errorf("lchown %s: %w", path, fs.ErrNotExist)
@@ -706,6 +718,9 @@ func (f *fakeSystem) ReadRegularFile(path string) ([]byte, error) {
 // call, matching one real open(2).
 func (f *fakeSystem) ReadRegularFileWithMode(path string) ([]byte, fs.FileMode, error) {
 	f.calls = append(f.calls, "ReadRegularFileWithMode:"+path)
+	if err, ok := f.readModeErrs[path]; ok {
+		return nil, 0, err
+	}
 	b, err := f.readRegularFileContent(path)
 	if err != nil {
 		return nil, 0, err
@@ -1327,6 +1342,9 @@ func (f *fakeSystem) putWedgedSocket(path string) {
 
 func (f *fakeSystem) WriteUserKubeconfig(targetUser, name string, contents []byte) (string, error) {
 	f.calls = append(f.calls, "WriteUserKubeconfig:"+targetUser)
+	if f.kubeconfigErr != nil {
+		return "", f.kubeconfigErr
+	}
 	f.kubeUser = targetUser
 	f.kubeContent = string(contents)
 	return "/Users/" + targetUser + "/.kube/config", nil
@@ -1516,6 +1534,9 @@ func (f *fakeSystem) EnsureOwnedDir(dir string, uid, gid int, mode fs.FileMode) 
 func (f *fakeSystem) RemoveEntry(dir, name string) error {
 	f.calls = append(f.calls, "RemoveEntry:"+dir+":"+name)
 	p := filepath.Join(dir, name)
+	if err, ok := f.removeEntryErrs[p]; ok {
+		return fmt.Errorf("remove %s in %s: %w", name, dir, err)
+	}
 	// rmdir(2) semantics: a directory that still holds a file is refused.
 	for q := range f.files {
 		if strings.HasPrefix(q, p+"/") {
@@ -1607,6 +1628,12 @@ func (f *fakeSystem) EnsureMeshKeyDir(dir string, mode fs.FileMode) error {
 func (f *fakeSystem) WriteRootOnlyFile(path string, contents []byte, mode fs.FileMode) error {
 	f.calls = append(f.calls, fmt.Sprintf("WriteRootOnlyFile:%s:%#o", path, mode))
 	f.putFile(path, contents)
+	// The temp-and-rename leaves a root-owned regular file at path with mode,
+	// replacing whatever was there; a test that judges the file through Owner
+	// (the developer-mode marker) sees what a Mac would.
+	if f.owners != nil {
+		f.owners[path] = OwnedEntry{Path: path, Kind: EntryRegular, Mode: mode.Perm()}
+	}
 	return nil
 }
 
