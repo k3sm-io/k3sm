@@ -136,6 +136,18 @@ pin, its date, and the tarball's sha256.
   `run` is not the body the name alias copies, rather than serving through a stale copy of it.
   This needs an `mlx-serve` image that carries the updated sharded entrypoint.
 - **A pinned sharded `MLXModel` answers to its `spec.model` name too.** Sharded serving listed the snapshot path on `/v1/models`, and a request naming `spec.model` made every rank load the model again. Each rank now serves the model it loaded under `spec.model`, pinned or not. This needs `ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.3` or later, which carries the updated sharded entrypoint.
+- The registry's catalog answers 1,000 repositories per page when the request names no `n`, caps
+  `n` at 10,000, and stops reading the store once the page is full or, for a caller denied on
+  most repositories, once it has visited `max(4n, 1000)` of them, ending the page at a name the
+  caller can read, with a `Link` header to the next page. A walk that would visit more than 64
+  times that many, or more than 64,000 repositories, answers 503 with no `Link`, and a walk
+  stops when its client goes away. The referrers list comes from a per-repository view rebuilt
+  only when the repository's index changes, reading each manifest once (one whose blob was
+  missing or damaged is read again after the index changes) and at most 4,096 manifests or 64
+  MiB of manifest bytes per request. A repository within that is read by its first request; a
+  larger one is read over several requests the first time, each answering 429 with `Retry-After`
+  until the view is built. It is paged by digest with a `Link` header and takes at most 8
+  `artifactType` filters.
 
 ## v0.2.3 — 2026-10-29
 
