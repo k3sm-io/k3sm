@@ -229,10 +229,10 @@ func TestTeardownReportsAnUnretainedVMHelper(t *testing.T) {
 			}
 			for _, want := range []string{
 				fmt.Sprintf("pid %d", stale),
-				staleExe,
-				"version 0.2.8",
+				fmt.Sprintf("%q", staleExe),
+				`version "0.2.8"`,
 				"no longer retains",
-				fmt.Sprintf("kill -TERM -%d", stale),
+				fmt.Sprintf("if process group %d is still this helper (check with ps -g %d), stop it with: sudo kill -TERM -%d", stale, stale, stale),
 			} {
 				if !strings.Contains(msg, want) {
 					t.Errorf("stopVMHelpers = %q, want it to name %q", msg, want)
@@ -317,7 +317,7 @@ func TestTeardownTreatsResolveErrorsAsUnknownNotUnretained(t *testing.T) {
 			for _, want := range []string{
 				fmt.Sprintf("pid %d", stale),
 				staleExe,
-				"version 0.2.8",
+				`version "0.2.8"`,
 				"cannot be resolved",
 				"permission denied",
 			} {

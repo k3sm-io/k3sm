@@ -77,8 +77,9 @@ pin, its date, and the tarball's sha256.
   WireGuard view, so `kubectl get meshpeer -o yaml` shows when the server last completed a
   handshake with that peer.
 - Uninstall names a vm helper still running from a k3sm version the install no longer keeps. It
-  does not signal that helper, and the error gives its process ID and the command to stop it by
-  hand, `sudo kill -TERM -<pid>`.
+  does not signal that helper, and the error gives its process ID and, if that process group is
+  still the helper (check with `ps -g <pid>`), the command to stop it by hand,
+  `sudo kill -TERM -<pid>`.
 
 ### Changed
 
@@ -89,8 +90,9 @@ pin, its date, and the tarball's sha256.
   and checks every manifest it reads against its digest; a repository whose manifests do not match
   is left alone. Deletions still go through the registry's API with the node's push credential.
 - When `k3sm uninstall` or a full stop leaves a vm pod helper alone because the version directory
-  it runs from cannot be read, the message now says how to clear it: fix the permissions on that
-  path, or stop the helper's process group by hand with the `sudo kill` command it prints.
+  it runs from cannot be read, the message now says what to check: that the directory and each of its parents are owned by
+  root and not writable by group or others (an I/O error means the disk needs checking), and how
+  to stop the helper's process group by hand if it is still the helper.
 
 ### Fixed
 

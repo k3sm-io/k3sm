@@ -115,9 +115,9 @@ func TestTeardownUnknownRetentionCoversEveryNonENOENTError(t *testing.T) {
 				}
 				return
 			}
-			for _, sig := range []string{"TERM", "KILL"} {
-				if idx(f.calls, fmt.Sprintf("Signal:%d:%s", stale, sig)) >= 0 {
-					t.Errorf("a helper whose retention is unknown was signalled %s: %q", sig, f.calls)
+			for _, call := range f.calls {
+				if strings.HasPrefix(call, fmt.Sprintf("Signal:%d:", stale)) {
+					t.Errorf("a helper whose retention is unknown was signalled (%s): %q", call, f.calls)
 				}
 			}
 			if err == nil {
@@ -126,19 +126,20 @@ func TestTeardownUnknownRetentionCoversEveryNonENOENTError(t *testing.T) {
 			msg := err.Error()
 			for _, want := range []string{
 				fmt.Sprintf("pid %d", stale),
-				staleExe,
-				"version 0.2.8",
+				fmt.Sprintf("%q", staleExe),
+				`version "0.2.8"`,
 				"cannot be resolved",
 				"unknown",
 				tc.text,
-				"fix the permissions on the path to " + versions + "/0.2.8",
-				fmt.Sprintf("sudo kill -TERM -%d", stale),
+				fmt.Sprintf("check that %q and each of its parents are owned by root and not writable by group or others", versions+"/0.2.8"),
+				"an I/O error means the disk needs checking",
+				fmt.Sprintf("if process group %d is still this helper (check with ps -g %d), stop it with: sudo kill -TERM -%d", stale, stale, stale),
 			} {
 				if !strings.Contains(msg, want) {
 					t.Errorf("stopVMHelpers = %q, want it to name %q", msg, want)
 				}
 			}
-			for _, wrong := range []string{"no longer retains", "not " + cfg.installedVMHost()} {
+			for _, wrong := range []string{"fix the permissions", fmt.Sprintf("%d", live), "no longer retains", "not " + cfg.installedVMHost()} {
 				if strings.Contains(msg, wrong) {
 					t.Errorf("stopVMHelpers = %q, reports an unknown retention as %q", msg, wrong)
 				}
