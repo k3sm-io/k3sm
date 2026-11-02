@@ -17,9 +17,11 @@ limitations under the License.
 package install
 
 import (
+	"fmt"
 	"io/fs"
 	"path/filepath"
 
+	runtimed "k3sm.io/runtimed/pkg/runtime"
 	"k3sm.io/runtimed/pkg/sandbox"
 )
 
@@ -39,6 +41,12 @@ import (
 //	/var/lib/k3sm/keys     root:wheel 0700  (the mesh keys + the node identity)
 //	/var/lib/k3sm/manifests root:wheel 0755 (the operator's auto-deploy manifests)
 //	/var/lib/k3sm/<tree>   service user     (every tree an unprivileged daemon writes)
+//	/var/lib/k3sm/runtimed.lock service user 0600 (the embedded runtime's root lock)
+//
+// The lock file is the one entry directly in the root that is not a directory:
+// the runtime opens <root>/runtimed.RootLockName O_CREAT as the service user,
+// which the root-owned root does not allow, so the installer creates it and
+// hands it over (ensureRuntimeRootLock), with the root's own terms unchanged.
 //
 // Because the root is root-owned, the service user can no longer create a
 // top-level directory of its own, so every tree it writes is named here and
@@ -338,4 +346,35 @@ func LegacyMeshKeyFiles(dataRoot string) []string {
 		out = append(out, filepath.Join(dir, leaf))
 	}
 	return out
+}
+
+// RuntimeRootLockMode is the mode of the runtime's root lock file: the service
+// user's alone, the mode the runtime itself creates it with.
+const RuntimeRootLockMode fs.FileMode = 0o600
+
+// RuntimeRootLockPath is the runtime's root lock file under dataRoot. The name
+// is runtimed.RootLockName, never a second literal, so the file the installer
+// hands over and the file the runtime opens cannot drift apart.
+func RuntimeRootLockPath(dataRoot string) string {
+	return filepath.Join(dataRoot, runtimed.RootLockName)
+}
+
+// ensureRuntimeRootLock hands the embedded runtime's root lock file to the
+// service user. Both node roles embed the runtime with its root at the data
+// root (executor.RuntimeRoot of the work dir), and runtimed.New opens
+// <root>/runtimed.lock O_CREAT as the service user. The data root is
+// root:wheel 0755, so without this the server and the agent fail every start
+// with "permission denied" on the lock. The root keeps its mode: only this one
+// file, created by root, changes hands.
+//
+// It runs after the root was ensured root:wheel, so no unprivileged principal
+// can rename or replace an entry directly inside it while it is checked, and
+// EnsureOwnedFile refuses a symlink or a non-regular file at the path rather
+// than chowning or removing it.
+func ensureRuntimeRootLock(sys System, cfg Config, uid uint32) error {
+	path := RuntimeRootLockPath(cfg.DataRoot)
+	if err := sys.EnsureOwnedFile(path, int(uid), ServiceTreeGID, RuntimeRootLockMode); err != nil {
+		return fmt.Errorf("install: ensure the runtime root lock %s (%d:%d %#o): %w", path, uid, ServiceTreeGID, RuntimeRootLockMode, err)
+	}
+	return nil
 }
