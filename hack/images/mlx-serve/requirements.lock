@@ -5,18 +5,18 @@
 #
 #     uv python install cpython-3.12.14-macos-aarch64-none
 #     uv pip compile --generate-hashes --no-header \
-#         --exclude-newer 2026-10-15T00:00:00Z \
-#         --upgrade-package mlx --upgrade-package mlx-metal \
+#         --exclude-newer 2026-10-17T00:00:00Z \
+#         --upgrade-package mlx-lm \
 #         --python "$UV_PYTHON_INSTALL_DIR/cpython-3.12.14-macos-aarch64-none/bin/python3.12" \
 #         requirements.in -o requirements.lock
 #
-# Generated 2026-10-29 with uv 0.13.1 against CPython 3.12.14 (macos-aarch64):
+# Generated 2026-10-31 with uv 0.13.1 against CPython 3.12.14 (macos-aarch64):
 # 97 packages, 1956 hashes, 0 direct-URL (git+) requirements.
-# Upload cutoff (--exclude-newer): 2026-10-15T00:00:00Z, 14 days before the
+# Upload cutoff (--exclude-newer): 2026-10-17T00:00:00Z, 14 days before the
 # generation date, so no artifact published inside the 14-day dependency
 # cooldown enters the closure. Move it with the generation date. Compiled
 # over the previous lockfile, so uv keeps every existing pin and moves only
-# the packages named with --upgrade-package (mlx and mlx-metal here).
+# the packages named with --upgrade-package (mlx-lm here).
 #
 # Two constraints, both learned the hard way (hack/spike/m8/findings-s4.md):
 #   * compile NATIVELY. `--python-platform macos` defaults to macOS 13.0, for
@@ -941,9 +941,9 @@ mlx-embeddings==0.1.0 \
     --hash=sha256:3fe1feaa786d3b546ccd8909f6b4c22bd3bcce097616fce83173ededd30e6630 \
     --hash=sha256:f80c1e1be26ff7bd22b15c1fba4cc03afd44c86e00a431b5fa75ffd7500affb1
     # via vllm-mlx
-mlx-lm==0.32.0 \
-    --hash=sha256:035ca44b08c3476630a205d2c9bdea26825a6a8359f974944d4985230e41859f \
-    --hash=sha256:9a0f3843135fd88d36ad791f0d82210cdc4130c5c1cb5416f5f0c4b56a135778
+mlx-lm==0.32.2 \
+    --hash=sha256:1af8a92f6a141c3e2bf5b0369ac4464203a8e2189c47b9e40d3e921e5b3a1fe9 \
+    --hash=sha256:5c0991248cfff5872503d74f466d2532dd8cb7fb3670cb9be7a06d7305dadc04
     # via vllm-mlx
 mlx-metal==0.32.4 \
     --hash=sha256:514df92d41a286895d2564b4b18f4da45096bd7a4a0c47e1042f345ad5a7f936 \

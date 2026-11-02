@@ -8,8 +8,8 @@
 # --check runs hack/images/mlx-serve/k3sm_shard.py as `python3 -m k3sm_shard`,
 # a one-rank ring gang, against a stub mlx_lm.server put first on PYTHONPATH
 # (the module seam: serve() imports the engine by name). The stub has every
-# hook the alias checks, with mlx-lm 0.32.0's signatures, and a run whose body
-# is not 0.32.0's.
+# hook the alias checks, with mlx-lm 0.32.2's signatures, the 0.32.2 image
+# fetch the remote-image guard replaces, and a run whose body is not 0.32.2's.
 #   status.return   main() returning 3 makes the process exit 3
 #   status.exit     main() raising SystemExit(4) makes the process exit 4
 #   status.clean    main() returning None makes the process exit 0
@@ -35,10 +35,13 @@ mkdir -p "$WORK/lib/mlx_lm" "$WORK/podvol"
 cp "$MODULE" "$WORK/lib/k3sm_shard.py"
 : > "$WORK/lib/mlx_lm/__init__.py"
 cat > "$WORK/lib/mlx_lm/server.py" <<'PY'
-"""A stand-in for mlx_lm.server: 0.32.0's hook signatures, not its run body."""
+"""A stand-in for mlx_lm.server: 0.32.2's hook signatures, not its run body."""
+import base64
 import os
 import sys
 import types
+from typing import Any, Dict, List
+from urllib.request import urlopen
 
 
 class ModelProvider:
@@ -67,11 +70,36 @@ mx = types.SimpleNamespace(distributed=types.SimpleNamespace(init=lambda: None))
 
 
 def run(host, port, model_provider, server_class=None, handler_class=None):
-    return "not the mlx-lm 0.32.0 body"
+    return "not the mlx-lm 0.32.2 body"
 
 
 def _run_http_server(host, port, response_generator, server_class=None, handler_class=None):
     pass
+
+
+# serve() installs the remote-image guard on every rank before the alias, so
+# the stand-in carries mlx-lm 0.32.2's _inline_image_urls verbatim: the body
+# the guard checks against IMAGE_HOOK_SHA256 and replaces.
+def _image_url(part):
+    return part.get("image_url")
+
+
+def _image_parts(messages):
+    for message in messages:
+        yield from message["content"]
+
+
+def _inline_image_urls(messages: List[Dict[str, Any]]) -> None:
+    """Replace http(s) image URLs with data URLs: all ranks read the same bytes."""
+    for part in _image_parts(messages):
+        url = _image_url(part)
+        if not url.startswith(("http://", "https://")):
+            continue
+        with urlopen(url, timeout=30) as response:
+            mime = response.headers.get_content_type()
+            data = base64.b64encode(response.read()).decode()
+        part.clear()
+        part.update(type="image_url", image_url={"url": f"data:{mime};base64,{data}"})
 
 
 def main():
