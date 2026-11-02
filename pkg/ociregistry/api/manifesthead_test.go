@@ -63,10 +63,24 @@ func (f *fixture) deletingCollector(t *testing.T, grace time.Duration) *gc.Colle
 		t.Fatal(err)
 	}
 	now = time.Now
-	if err := os.WriteFile(filepath.Join(f.st.StateDir(), gc.MarkerName), []byte("ran\n"), 0o600); err != nil {
+	if err := gc.WriteMarker(f.st, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	return c
+}
+
+// deletingSweep runs one sweep of c and fails the test when the sweep errs
+// or only reports, so a test that expects a reap cannot pass on a sweep that
+// deletes nothing.
+func deletingSweep(t *testing.T, c *gc.Collector) {
+	t.Helper()
+	rep, err := c.Sweep(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.ReportOnly {
+		t.Fatal("the sweep only reported; the gc-ran marker does not bind to the store")
+	}
 }
 
 // TestManifestHeadKeepsTheChildForTheIndexPut pins the server contract between
@@ -110,9 +124,7 @@ func TestManifestHeadKeepsTheChildForTheIndexPut(t *testing.T) {
 					t.Fatalf("HEAD Docker-Content-Digest %q, want %s", got, cd)
 				}
 			}
-			if _, err := c.Sweep(context.Background()); err != nil {
-				t.Fatal(err)
-			}
+			deletingSweep(t, c)
 			if !tc.head {
 				want(t, f.do(http.MethodGet, "/v2/app/manifests/"+cd.String(), nil), http.StatusNotFound, codeManifestUnknown)
 			}
@@ -129,9 +141,7 @@ func TestManifestHeadKeepsTheChildForTheIndexPut(t *testing.T) {
 			// The child is now named by a tagged index, so a later sweep keeps
 			// it at any age.
 			f.age(t, "app", time.Now().Add(-2*grace), cd)
-			if _, err := c.Sweep(context.Background()); err != nil {
-				t.Fatal(err)
-			}
+			deletingSweep(t, c)
 			want(t, f.do(http.MethodGet, "/v2/app/manifests/"+cd.String(), nil), http.StatusOK, "")
 		})
 	}
@@ -195,8 +205,10 @@ func TestManifestHeadAfterReapAnswers404(t *testing.T) {
 	c := f.deletingCollector(t, grace)
 	reaped := false
 	f.srv.manifestRead = func() {
-		if _, err := c.Sweep(context.Background()); err != nil {
+		if rep, err := c.Sweep(context.Background()); err != nil {
 			t.Error(err)
+		} else if rep.ReportOnly {
+			t.Error("the sweep only reported; the gc-ran marker does not bind to the store")
 		}
 		if _, err := os.Stat(f.blobFile("app", cd)); !errors.Is(err, fs.ErrNotExist) {
 			t.Errorf("the sweep kept the manifest %s: stat %v", cd, err)
