@@ -126,6 +126,19 @@ func TestPlaceRefusesHeldGPU(t *testing.T) {
 				}}
 			})},
 			wantReason: mlx.ReasonInsufficientGPU, wantMsg: "(a)"},
+		{name: "bound_pod_with_hostname_affinity_holds_one_slot", nodes: func() []corev1.Node {
+			ns := []corev1.Node{gpuNode("a", "64Gi", false), gpuNode("b", "64Gi", false)}
+			ns[0].Status.Allocatable[corev1.ResourceName(mlxv1alpha1.ResourceGPU)] = resource.MustParse("2")
+			return ns
+		}(),
+			pods: []corev1.Pod{gpuPod("other", "other-rank-0", "a", 1, func(p *corev1.Pod) {
+				p.Spec.Affinity = &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
+					RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+						MatchExpressions: []corev1.NodeSelectorRequirement{{Key: corev1.LabelHostname, Operator: corev1.NodeSelectorOpIn, Values: []string{"a"}}},
+					}}},
+				}}
+			})},
+			wantNodes: []string{"a", "b"}},
 		{name: "second_slot_still_free", nodes: func() []corev1.Node {
 			ns := []corev1.Node{gpuNode("a", "64Gi", false), gpuNode("b", "64Gi", false)}
 			ns[0].Status.Allocatable[corev1.ResourceName(mlxv1alpha1.ResourceGPU)] = resource.MustParse("2")

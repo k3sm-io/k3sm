@@ -602,7 +602,8 @@ func rankPod(m *mlxv1alpha1.MLXModel, p prepared, placement Placement, r RankPla
 			// scheduler bind the claim on the placed node.
 			Affinity: rankNodeAffinity(r.Node),
 			// The same guarded selector and toleration the StatefulSet template
-			// carries; the admission policy checks both.
+			// carries, beside the hostname affinity above; the admission policy
+			// checks the selector and the toleration.
 			NodeSelector: maps.Clone(p.nodeSelector),
 			Tolerations:  providerTolerations(),
 			Hostname:     RankPodName(m.Name, r.Rank),
