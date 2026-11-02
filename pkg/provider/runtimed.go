@@ -1755,7 +1755,7 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	// Node-side admission under pressure (admission.go), before anything is
 	// registered or allocated: a refused pod holds no address, no references and
 	// no sandbox, only its terminal status.
-	refused, admitted := r.admitOnCreateTicket(ctx, pod)
+	refused, admitted := r.admitOnCreate(ctx, pod)
 	if refused {
 		return nil
 	}

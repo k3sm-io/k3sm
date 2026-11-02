@@ -200,7 +200,8 @@ func (r *runtimedRuntime) setAdmissionSource(src admissionPressure) {
 // is recorded, the status is written to the apiserver and pushed through the
 // watch callback, and the caller creates nothing.
 //
-// When refused is false the caller must call done when its create returns.
+// When refused is false the caller must call the ticket's done when its
+// create returns; CreatePod's fence ends it with doneLocked while it holds r.mu.
 //
 // Locking: the decision and the publication of its result happen in one r.mu
 // critical section. A refusal is published as the rejected track; an admission
@@ -211,22 +212,12 @@ func (r *runtimedRuntime) setAdmissionSource(src admissionPressure) {
 // admit is refused with an installed rejection.
 // CreatePod's track registration refuses to replace a terminal track behind
 // this. The pressure monitor's lock is a leaf, so reading it under r.mu is safe.
-func (r *runtimedRuntime) admitOnCreate(ctx context.Context, pod *corev1.Pod) (refused bool, done func()) {
-	refused, t := r.admitOnCreateTicket(ctx, pod)
-	if t == nil {
-		return refused, nil
-	}
-	return refused, t.done
-}
-
-// admitOnCreateTicket is admitOnCreate returning the admitted create's ticket,
-// so CreatePod's fence can end the in-flight count while it holds r.mu.
 //
 // A create of a pod whose refused create is still releasing at the fence waits
 // for that release first (or refuses, if ctx ends meanwhile): every resource
 // the release frees is keyed by the pod's UID, so a create admitted inside the
 // release would lose its own.
-func (r *runtimedRuntime) admitOnCreateTicket(ctx context.Context, pod *corev1.Pod) (refused bool, t *admitTicket) {
+func (r *runtimedRuntime) admitOnCreate(ctx context.Context, pod *corev1.Pod) (refused bool, t *admitTicket) {
 	id := string(pod.UID)
 	r.mu.Lock()
 	for {
