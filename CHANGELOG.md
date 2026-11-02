@@ -87,6 +87,10 @@ pin, its date, and the tarball's sha256.
 
 ### Fixed
 
+- An install that turns developer mode off but can neither remove the developer-mode marker
+  nor hand it to nobody now rolls the install root back to the previous tree, which the marker
+  still matches, restarts the daemons on that tree and names the `k3sm install --developer-mode
+  off` remedy. A first install with such a marker stops before any daemon is started.
 - A k3sm.app update that finds the installed `k3sm` link broken (pointing at a version
   directory that is gone, or out of `/Library/k3sm`) is still refused, and the refusal now says
   how to repair the install: re-run the install script, `curl -fsSL https://k3sm.io/install.sh | sh`,

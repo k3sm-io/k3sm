@@ -370,6 +370,16 @@ type markerRemoval struct {
 	removed   bool
 	saved     []byte
 	savedMode fs.FileMode
+	// stuck says drop could neither remove the marker nor disown it, so it
+	// still reads on. The install then reverts the swap (stillOn).
+	stuck bool
+}
+
+// stillOn reports whether drop left a marker that still reads on: neither
+// removal attempt nor the disown cleared it. The install must not wire or
+// restart the new tree beside it, so it reverts the swap instead.
+func (r *markerRemoval) stillOn() bool {
+	return r != nil && r.stuck
 }
 
 // markerDisownUID is nobody (uid -2 on macOS). A marker that cannot be
@@ -385,7 +395,9 @@ const markerDisownUID = 0xFFFFFFFE
 //     leaves developer mode off, and the read error is returned.
 //   - A removal that fails is tried once more, then the marker is handed to
 //     nobody (Chown, which never follows a symlink), so it reads invalid. An
-//     error naming the remedy is returned only if it still reads on.
+//     error naming the remedy is returned only if it still reads on, and
+//     stillOn then reports true: the install reverts the swap rather than
+//     run the signed tree beside a marker that skips the signing checks.
 //
 // The install reports what drop returns once it has finished; nil does nothing.
 func (r *markerRemoval) drop(sys System, cfg Config) error {
@@ -435,7 +447,8 @@ func (r *markerRemoval) disown(sys System, cfg Config, removeErr error) error {
 		cfg.Logger.Warn("the developer-mode marker could not be removed; it now reads "+string(state)+" and does not turn developer mode on", "marker", r.path, "err", removeErr)
 		return nil
 	}
-	return fmt.Errorf("install: k3sm is installed, but %w, and handing the marker to nobody failed too (%v), so developer mode is still on; run k3sm install --developer-mode off", removeErr, chownErr)
+	r.stuck = true
+	return fmt.Errorf("install: %w, and handing the marker to nobody failed too (%v), so developer mode is still on; run k3sm install --developer-mode off", removeErr, chownErr)
 }
 
 // restore puts back the valid marker drop removed, with its bytes and its mode
