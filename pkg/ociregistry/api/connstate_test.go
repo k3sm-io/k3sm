@@ -64,6 +64,7 @@ func newAuthServer(t *testing.T, secret string, maxConns int) *http.Server {
 	}
 	srv, err := auth.NewServer(a, api.Config{
 		Store:     st,
+		GCGrace:   time.Hour,
 		MaxConns:  maxConns,
 		FreeSpace: func() (uint64, error) { return 1 << 40, nil },
 	})
