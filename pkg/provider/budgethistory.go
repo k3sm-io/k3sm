@@ -33,6 +33,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
@@ -108,8 +109,9 @@ import (
 // the shutdown paths write sooner. Every write replaces the
 // file atomically. A write failure is logged and retried; the in-memory state
 // stays authoritative for this run. The one ordering guarantee is the emergency
-// eviction's: it asks the writer to flush and waits up to budgetIntentWriteBound
-// for its intent to reach disk before the kill. On shutdown (the provider's run
+// eviction's: it asks the writer to flush (or, with no writer running, writes
+// inline) and waits up to budgetIntentWriteBound for its intent to reach disk
+// before the kill. On shutdown (the provider's run
 // context ending, or the node's teardown calling StopBudgetHistory) the writer
 // makes one final flush and stops. The node's context ends BEFORE its teardown
 // runs, so changes keep arriving after the writer has exited (the eviction
@@ -249,8 +251,10 @@ type historyState struct {
 // (a standalone `k3sm node`) runs with.
 //
 // Locking: mu guards every field below it and is held only for in-memory work,
-// never across a file write. Only the writer goroutine (run) writes the file
-// after open; it marshals the state under mu and writes outside it.
+// never across a file write. After open the file is written by the writer
+// goroutine (run), or, when no writer is running, by stop's and flush's
+// catch-up writes; every write goes through writeOnce under wmu, which
+// marshals the state under mu and writes outside it.
 type BudgetHistory struct {
 	path string // "" keeps the history in memory only
 	log  *slog.Logger
@@ -414,18 +418,24 @@ func newHistoryState() historyState {
 // a non-regular file, an oversized file, an unknown version, an unknown band
 // and a negative total.
 func readHistory(path string) (historyState, error) {
-	fi, err := os.Lstat(path)
-	if err != nil {
-		return historyState{}, err
+	// O_NOFOLLOW refuses a symlink at open (ELOOP), O_NONBLOCK keeps a FIFO
+	// from blocking the open, and the Fstat checks the file actually opened, so
+	// nothing swapped in at path is read through.
+	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
+	if errors.Is(err, unix.ELOOP) {
+		return historyState{}, fmt.Errorf("%w: %s is a symlink", errBudgetHistoryFormat, path)
 	}
-	if !fi.Mode().IsRegular() {
-		return historyState{}, fmt.Errorf("%w: %s is not a regular file", errBudgetHistoryFormat, path)
-	}
-	f, err := os.Open(path)
 	if err != nil {
 		return historyState{}, err
 	}
 	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return historyState{}, fmt.Errorf("stat %s: %w", path, err)
+	}
+	if !fi.Mode().IsRegular() {
+		return historyState{}, fmt.Errorf("%w: %s is not a regular file", errBudgetHistoryFormat, path)
+	}
 	data, err := io.ReadAll(io.LimitReader(f, budgetHistoryMaxBytes+1))
 	if err != nil {
 		return historyState{}, fmt.Errorf("read %s: %w", path, err)
@@ -577,7 +587,8 @@ func (h *BudgetHistory) stop(bound time.Duration) bool {
 
 // flushPending writes until the file holds every change recorded before the
 // call, or until expired fires. It runs only once the writer has exited (or
-// never ran); a write past the deadline is left to finish on its own goroutine.
+// never ran), from stop or from flush; wmu keeps its write ordered against any
+// other. A write past the deadline is left to finish on its own goroutine.
 func (h *BudgetHistory) flushPending(expired <-chan time.Time) bool {
 	h.mu.Lock()
 	target := h.gen
@@ -597,7 +608,7 @@ func (h *BudgetHistory) flushPending(expired <-chan time.Time) bool {
 				return false
 			}
 		case <-expired:
-			h.log.Warn("budget history: the stop's catch-up write did not finish in time; the latest changes may be lost")
+			h.log.Warn("budget history: a catch-up write did not finish in time; the latest changes may be lost")
 			return false
 		}
 	}
@@ -719,12 +730,35 @@ func (h *BudgetHistory) writeOnce() bool {
 	return true
 }
 
-// flush asks the writer to write the current state and waits at most bound for
-// it to reach disk. It reports whether it did; an in-memory history has
-// nothing to wait for.
+// writerRunning reports whether a writer goroutine is live: started and not yet
+// returned. It reads only the atomic and the stopped channel, so it needs no
+// lock; a writer that exits right after it reports true is caught by flush's
+// wait on stopped.
+func (h *BudgetHistory) writerRunning() bool {
+	if !h.started.Load() {
+		return false
+	}
+	select {
+	case <-h.stopped:
+		return false
+	default:
+		return true
+	}
+}
+
+// flush writes the current state and waits at most bound for it to reach
+// disk. With a writer running it asks the writer; with none (never started, or
+// stopped, or exited on its context's end) it writes inline, so a caller never
+// waits out the bound for a writer that is not there. It reports whether the
+// state reached disk in time; an in-memory history has nothing to wait for.
 func (h *BudgetHistory) flush(bound time.Duration) bool {
 	if h == nil || h.path == "" {
 		return true
+	}
+	t := time.NewTimer(bound)
+	defer t.Stop()
+	if !h.writerRunning() {
+		return h.flushPending(t.C)
 	}
 	h.mu.Lock()
 	target := h.gen
@@ -733,8 +767,6 @@ func (h *BudgetHistory) flush(bound time.Duration) bool {
 	case h.force <- struct{}{}:
 	default: // a flush request already pending covers this one
 	}
-	t := time.NewTimer(bound)
-	defer t.Stop()
 	for {
 		h.mu.Lock()
 		if h.written >= target {
@@ -745,6 +777,10 @@ func (h *BudgetHistory) flush(bound time.Duration) bool {
 		h.mu.Unlock()
 		select {
 		case <-wrote:
+		case <-h.stopped:
+			// The writer exited before writing target (its final flush may
+			// have run before this change); write it here.
+			return h.flushPending(t.C)
 		case <-t.C:
 			return false
 		}
