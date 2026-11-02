@@ -139,6 +139,7 @@ func TestDesiredHandlerLevelTriggered(t *testing.T) {
 		netd := &fakeNetd{}
 		ann := &fakeAnnotation{synced: true, value: desiredValue}
 		var down atomic.Bool
+		var downProbes atomic.Int32
 		down.Store(true)
 		h := NewDesiredHandler(DesiredConfig{
 			Desired: ann, Client: netd, Log: slog.New(slog.DiscardHandler),
@@ -146,6 +147,7 @@ func TestDesiredHandlerLevelTriggered(t *testing.T) {
 			HealthEvery: 2 * time.Millisecond,
 			Reachable: func(context.Context) error {
 				if down.Load() {
+					downProbes.Add(1)
 					return errors.New("dial: connection refused")
 				}
 				return nil
@@ -158,7 +160,10 @@ func TestDesiredHandlerLevelTriggered(t *testing.T) {
 
 		waitFor(t, func() bool { _, e, _ := netd.state(); return e == 1 }, "the start-up ensure")
 		netd.lose() // the helper restarted and came back empty
-		time.Sleep(20 * time.Millisecond)
+		// The re-ensure fires on the down-to-up edge, so flip only once the
+		// handler has seen the helper down; a fixed sleep raced a loaded host.
+		seen := downProbes.Load()
+		waitFor(t, func() bool { return downProbes.Load() >= seen+2 }, "the handler to see the helper down")
 		if _, e, _ := netd.state(); e != 1 {
 			t.Fatalf("ensures = %d while the helper is down, want no retries", e)
 		}
