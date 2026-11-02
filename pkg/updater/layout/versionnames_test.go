@@ -24,6 +24,10 @@ import (
 	"testing"
 )
 
+// This file is shared byte-for-byte with its sibling repo, apart from the
+// package clause; the entry points each repo checks against the table live in
+// versionrule_test.go beside it.
+
 // versionNameCase is one row of testdata/version-names.txt.
 type versionNameCase struct {
 	line   int
@@ -34,11 +38,11 @@ type versionNameCase struct {
 // readVersionNames parses testdata/version-names.txt, the table of version
 // directory names this repo shares byte-for-byte with its sibling; a malformed
 // row fails the test rather than being skipped.
-func readVersionNames(t *testing.T) []versionNameCase {
-	t.Helper()
+func readVersionNames(tb testing.TB) []versionNameCase {
+	tb.Helper()
 	f, err := os.Open("testdata/version-names.txt")
 	if err != nil {
-		t.Fatalf("open the version-name table: %v", err)
+		tb.Fatalf("open the version-name table: %v", err)
 	}
 	defer f.Close()
 	var cases []versionNameCase
@@ -50,16 +54,16 @@ func readVersionNames(t *testing.T) []versionNameCase {
 		}
 		verdict, quoted, ok := strings.Cut(line, " ")
 		if !ok || (verdict != "accept" && verdict != "refuse") {
-			t.Fatalf("version-names.txt:%d: want \"accept|refuse <quoted name>\", got %q", n, line)
+			tb.Fatalf("version-names.txt:%d: want \"accept|refuse <quoted name>\", got %q", n, line)
 		}
 		name, err := strconv.Unquote(quoted)
 		if err != nil {
-			t.Fatalf("version-names.txt:%d: unquote %s: %v", n, quoted, err)
+			tb.Fatalf("version-names.txt:%d: unquote %s: %v", n, quoted, err)
 		}
 		cases = append(cases, versionNameCase{line: n, accept: verdict == "accept", name: name})
 	}
 	if err := sc.Err(); err != nil {
-		t.Fatalf("read the version-name table: %v", err)
+		tb.Fatalf("read the version-name table: %v", err)
 	}
 	var accepts, refuses int
 	for _, c := range cases {
@@ -70,18 +74,25 @@ func readVersionNames(t *testing.T) []versionNameCase {
 		}
 	}
 	if accepts == 0 || refuses == 0 {
-		t.Fatalf("version-name table holds %d accepts and %d refuses; both must be non-empty", accepts, refuses)
+		tb.Fatalf("version-name table holds %d accepts and %d refuses; both must be non-empty", accepts, refuses)
 	}
 	return cases
 }
 
-// TestValidateVersionNamesMatchTable runs ValidateVersion over the shared table of version directory names, so this
-// repo's rule and its sibling's cannot drift apart unnoticed.
-func TestValidateVersionNamesMatchTable(t *testing.T) {
+// versionSubtest names a row's subtest by its version, quoted, so the empty
+// name and names with spaces or control bytes stay distinct and readable.
+func versionSubtest(name string) string { return strconv.Quote(name) }
+
+// checkVersionNames runs accepts over every row of the table, one subtest per
+// version, and fails each row whose verdict disagrees with the table. fn names
+// the entry point under test in the failure message. accepts may skip a row
+// the entry point cannot express, saying why.
+func checkVersionNames(t *testing.T, fn string, accepts func(t *testing.T, name string) bool) {
+	t.Helper()
 	for _, c := range readVersionNames(t) {
-		t.Run(strconv.Itoa(c.line), func(t *testing.T) {
-			if got := ValidateVersion(c.name) == nil; got != c.accept {
-				t.Errorf("version-names.txt:%d: %s(%q) accepted=%v, the table says %v", c.line, "ValidateVersion", c.name, got, c.accept)
+		t.Run(versionSubtest(c.name), func(t *testing.T) {
+			if got := accepts(t, c.name); got != c.accept {
+				t.Errorf("version-names.txt:%d: %s(%q) accepted=%v, the table says %v", c.line, fn, c.name, got, c.accept)
 			}
 		})
 	}

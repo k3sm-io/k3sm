@@ -78,3 +78,6 @@ refuse "unknown-0123456789ag"
 refuse "UNKNOWN-0123456789ab"
 refuse "v1.2.3unknown-0123456789ab"
 refuse "1.2.3-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+# Exactly 128 bytes, the length bound, in 127 characters: the last is the
+# two-byte e-acute, refused for its non-ASCII bytes, not for the length.
+refuse "1.2.3-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u00e9"
