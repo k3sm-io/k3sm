@@ -110,6 +110,8 @@ type fakeSystem struct {
 	// records into it, so running Install twice against ONE fake reproduces a real
 	// reinstall: the second run reads back the plist the first run wrote.
 	files map[string][]byte
+	// hardlinked marks the paths EnsureOwnedFile sees with a link count above 1.
+	hardlinked map[string]bool
 	// pid is the next pid the fake launchd hands out; a bootstrap or a kickstart
 	// advances it, so a restarted job reports a DIFFERENT pid — the discriminator
 	// `k3sm certificate rotate` uses to tell the new control plane from the old one
@@ -1528,11 +1530,15 @@ func (f *fakeSystem) WriteServiceUserFile(path string, contents []byte, uid uint
 // EnsureOwnedFile records the path, owner, group and mode, and applies the
 // real seam's rules to the fake ownership table: an absent or regular entry
 // becomes a regular file at exactly those terms, and a symlink or any other
-// non-regular entry is refused with ErrNotRegularFile and left as it was.
+// non-regular entry, or a regular file marked hardlinked, is refused with
+// ErrNotRegularFile and left as it was.
 func (f *fakeSystem) EnsureOwnedFile(path string, uid, gid int, mode fs.FileMode) error {
 	f.calls = append(f.calls, fmt.Sprintf("EnsureOwnedFile:%s:%d:%d:%#o", path, uid, gid, mode))
 	if e, ok := f.owners[path]; ok && e.Kind != EntryRegular {
 		return fmt.Errorf("%s: %w", path, ErrNotRegularFile)
+	}
+	if f.hardlinked[path] {
+		return fmt.Errorf("%s has more than one link: %w", path, ErrNotRegularFile)
 	}
 	f.putOwned(path, uid, gid, mode, EntryRegular)
 	return nil

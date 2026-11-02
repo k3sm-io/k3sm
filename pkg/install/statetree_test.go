@@ -596,10 +596,11 @@ func TestEnsureStateTreeHandsRuntimeRootLockToServiceUser(t *testing.T) {
 		t.Fatalf("RuntimeRootLockPath = %s, want %s", lock, want)
 	}
 	cases := []struct {
-		name    string
-		seed    *OwnedEntry
-		wantErr bool
-		want    OwnedEntry
+		name       string
+		seed       *OwnedEntry
+		hardlinked bool
+		wantErr    bool
+		want       OwnedEntry
 	}{
 		{
 			name: "an absent file is created for the service user 0600",
@@ -622,12 +623,22 @@ func TestEnsureStateTreeHandsRuntimeRootLockToServiceUser(t *testing.T) {
 			wantErr: true,
 			want:    OwnedEntry{UID: 0, GID: 0, Mode: 0o755 | fs.ModeDir, Kind: EntryDir},
 		},
+		{
+			name:       "a hard-linked root-owned file is refused and left alone",
+			seed:       &OwnedEntry{UID: 0, GID: 0, Mode: 0o600, Kind: EntryRegular},
+			hardlinked: true,
+			wantErr:    true,
+			want:       OwnedEntry{UID: 0, GID: 0, Mode: 0o600, Kind: EntryRegular},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			f := &fakeSystem{}
 			if tc.seed != nil {
 				f.putOwnedEntry(lock, *tc.seed)
+			}
+			if tc.hardlinked {
+				f.hardlinked = map[string]bool{lock: true}
 			}
 			cfg := serverCfg()
 			cfg.Logger = slog.New(slog.DiscardHandler)

@@ -230,6 +230,13 @@ func (darwinSystem) EnsureOwnedFile(path string, uid, gid int, mode fs.FileMode)
 // and the file is opened read-only and never truncated, so a lock file a
 // previous runtime left keeps its content. Owner and mode go through the
 // descriptor, so they land on the inode that was checked.
+//
+// The fstat also requires a link count of exactly 1. A hard link at path to
+// another file on the same volume passes the lstat, O_NOFOLLOW and the regular
+// file check, and this runs as root, so without it root would hand that other
+// file (a root-owned config or key) to the service user. Earlier releases left
+// the data root writable by the service user, so such a link can be waiting on
+// an upgraded node. A refused file is left exactly as it was.
 func ensureFileOwnedBy(path string, uid, gid int, mode fs.FileMode) error {
 	fi, err := os.Lstat(path)
 	switch {
@@ -254,6 +261,9 @@ func ensureFileOwnedBy(path string, uid, gid int, mode fs.FileMode) error {
 	}
 	if st.Mode&unix.S_IFMT != unix.S_IFREG {
 		return fmt.Errorf("%s: %w", path, ErrNotRegularFile)
+	}
+	if st.Nlink != 1 {
+		return fmt.Errorf("%s has %d links: %w: %w", path, st.Nlink, ErrNotRegularFile, errHardlinkRefused)
 	}
 	if err := unix.Fchown(fd, uid, gid); err != nil {
 		return fmt.Errorf("chown %s to %d:%d: %w", path, uid, gid, err)
@@ -691,6 +701,10 @@ func refuseSymlinkAt(path string) error {
 // errSymlinkRefused is refuseSymlinkAt's (and ensureLogFile's) refusal, a
 // sentinel so callers and tests match it with errors.Is, never by message.
 var errSymlinkRefused = errors.New("is a symlink: refusing to chown/chmod through it")
+
+// errHardlinkRefused is ensureFileOwnedBy's refusal of a file whose link count
+// is not 1: another name shares the inode, so chowning it would chown that too.
+var errHardlinkRefused = errors.New("is hard-linked to another name: refusing to chown/chmod it")
 
 // HasACL reports whether path carries an extended ACL, never following a
 // symlink at path (pathHasACL).

@@ -1746,6 +1746,42 @@ func TestEnsureFileOwnedBy(t *testing.T) {
 		assertMode(t, path, 0o755)
 	})
 
+	t.Run("a hard link to another file is refused and neither name changes", func(t *testing.T) {
+		root := t.TempDir()
+		other := filepath.Join(root, "elsewhere")
+		if err := os.WriteFile(other, []byte("secret\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(other, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(root, "runtimed.lock")
+		if err := os.Link(other, path); err != nil {
+			t.Fatal(err)
+		}
+		before, err := os.Stat(other)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = ensureFileOwnedBy(path, uid, gid, 0o600)
+		if !errors.Is(err, ErrNotRegularFile) || !errors.Is(err, errHardlinkRefused) {
+			t.Fatalf("ensureFileOwnedBy = %v, want the hard link refusal", err)
+		}
+		for _, name := range []string{other, path} {
+			fi, err := os.Lstat(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			st, bst := fi.Sys().(*syscall.Stat_t), before.Sys().(*syscall.Stat_t)
+			if fi.Mode() != before.Mode() || st.Uid != bst.Uid || st.Gid != bst.Gid {
+				t.Errorf("%s = %v %d:%d, want it untouched at %v %d:%d", name, fi.Mode(), st.Uid, st.Gid, before.Mode(), bst.Uid, bst.Gid)
+			}
+			if b, err := os.ReadFile(name); err != nil || string(b) != "secret\n" {
+				t.Errorf("%s content = %q, %v; want it untouched", name, b, err)
+			}
+		}
+	})
+
 	t.Run("a fifo is refused without blocking", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "runtimed.lock")
 		if err := syscall.Mkfifo(path, 0o644); err != nil {
