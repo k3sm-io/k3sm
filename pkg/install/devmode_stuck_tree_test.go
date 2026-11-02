@@ -129,9 +129,10 @@ func TestDeveloperModeStuckMarkerLeavesNoSignedTree(t *testing.T) {
 			"plists name paths inside it",
 			"sudo chflags nouchg " + DeveloperModeMarkerPath,
 			"ls -lO@e " + DeveloperModeMarkerPath,
-			"system-immutable flag",
-			"deny-delete ACL",
-			"sudo launchctl bootout system/<label>",
+			"a system-immutable flag (schg): `sudo chflags noschg " + DeveloperModeMarkerPath + "`, or Recovery if the securelevel is raised",
+			"a deny-delete ACL: `sudo chmod -N " + DeveloperModeMarkerPath + "`",
+			"`sudo launchctl bootout system/<label>` and `sudo launchctl disable system/<label>`",
+			"a stop-gap until the marker is cleared and the install is re-run",
 		} {
 			if !strings.Contains(err.Error(), want) {
 				t.Errorf("error %q does not carry %q", err, want)
