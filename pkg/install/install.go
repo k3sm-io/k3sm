@@ -688,6 +688,9 @@ type System interface {
 	// PARAMETERS so the row a caller applied is visible at the seam and a test
 	// can assert that the root was never handed to the service user.
 	EnsureOwnedDir(dir string, uid, gid int, mode fs.FileMode) error
+	// EnsureOwnedFile creates or repairs the regular file at path at exactly
+	// uid:gid and mode, refusing a non-regular entry; see ensureFileOwnedBy.
+	EnsureOwnedFile(path string, uid, gid int, mode fs.FileMode) error
 	// RemoveEntry removes the entry name DIRECTLY inside dir — a file, or an
 	// EMPTY directory — and nothing else. Absent (dir or entry) is success, so a
 	// re-run is idempotent.
@@ -1798,6 +1801,9 @@ func ensureStateTree(sys System, cfg Config, uid uint32) error {
 		if err := sys.EnsureOwnedDir(dir, own.UID(int(uid)), own.GID, own.Mode); err != nil {
 			return fmt.Errorf("install: ensure %s (%d:%d %#o): %w", dir, own.UID(int(uid)), own.GID, own.Mode, err)
 		}
+	}
+	if err := ensureRuntimeRootLock(sys, cfg, uid); err != nil {
+		return err
 	}
 	cfg.Logger.Info("ensured the data root and the service user's trees under it", "root", cfg.DataRoot, "trees", len(ServiceLevels()))
 	return nil

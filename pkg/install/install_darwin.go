@@ -210,6 +210,72 @@ func (darwinSystem) EnsureOwnedDir(dir string, uid, gid int, mode fs.FileMode) e
 	return ensureDirOwnedBy(dir, uid, gid, mode)
 }
 
+// EnsureOwnedFile creates (or repairs) the regular file at path at exactly
+// uid:gid and mode, re-applying all three on an existing file, and refuses a
+// symlink, a directory or any other non-regular entry with an error wrapping
+// ErrNotRegularFile, leaving it as it is. It never truncates or removes what
+// is there. Its one caller is ensureRuntimeRootLock; the owner, group and mode
+// are parameters so a test can assert the values applied at the seam.
+func (darwinSystem) EnsureOwnedFile(path string, uid, gid int, mode fs.FileMode) error {
+	return ensureFileOwnedBy(path, uid, gid, mode)
+}
+
+// ensureFileOwnedBy is EnsureOwnedFile with no receiver, so an unprivileged test
+// can exercise it with its own uid and gid.
+//
+// The lstat refuses a symlink or a non-regular entry before any open, with no
+// side effect on it. The open then repeats both checks against a swap between
+// the two: O_NOFOLLOW fails a symlink planted since, and the fstat refuses
+// anything but a regular file. O_NONBLOCK keeps a fifo from blocking the open,
+// and the file is opened read-only and never truncated, so a lock file a
+// previous runtime left keeps its content. Owner and mode go through the
+// descriptor, so they land on the inode that was checked.
+//
+// The fstat also requires a link count of exactly 1. A hard link at path to
+// another file on the same volume passes the lstat, O_NOFOLLOW and the regular
+// file check, and this runs as root, so without it root would hand that other
+// file (a root-owned config or key) to the service user. Earlier releases left
+// the data root writable by the service user, so such a link can be waiting on
+// an upgraded node. A refused file is left exactly as it was.
+func ensureFileOwnedBy(path string, uid, gid int, mode fs.FileMode) error {
+	fi, err := os.Lstat(path)
+	switch {
+	case err == nil && fi.Mode()&fs.ModeSymlink != 0:
+		return fmt.Errorf("%s: %w: %w", path, ErrNotRegularFile, errSymlinkRefused)
+	case err == nil && !fi.Mode().IsRegular():
+		return fmt.Errorf("%s is a %s: %w", path, fi.Mode().Type(), ErrNotRegularFile)
+	case err != nil && !errors.Is(err, fs.ErrNotExist):
+		return fmt.Errorf("lstat %s: %w", path, err)
+	}
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CREAT|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, uint32(mode.Perm()))
+	if err != nil {
+		if errors.Is(err, unix.ELOOP) {
+			return fmt.Errorf("%s: %w: %w", path, ErrNotRegularFile, errSymlinkRefused)
+		}
+		return fmt.Errorf("open %s: %w", path, err)
+	}
+	defer func() { _ = unix.Close(fd) }() // read-only descriptor; nothing to flush
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return fmt.Errorf("stat %s: %w", path, err)
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
+		return fmt.Errorf("%s: %w", path, ErrNotRegularFile)
+	}
+	if st.Nlink != 1 {
+		return fmt.Errorf("%s has %d links: %w: %w", path, st.Nlink, ErrNotRegularFile, errHardlinkRefused)
+	}
+	if err := unix.Fchown(fd, uid, gid); err != nil {
+		return fmt.Errorf("chown %s to %d:%d: %w", path, uid, gid, err)
+	}
+	// The create mode is masked by the umask and an existing file keeps its
+	// own, so the fchmod is what makes the mode exact.
+	if err := unix.Fchmod(fd, uint32(mode.Perm())); err != nil {
+		return fmt.Errorf("chmod %s %#o: %w", path, mode, err)
+	}
+	return nil
+}
+
 // EnsureLogDir creates (or repairs) the log dir owned by the service uid, group
 // admin, LogDirMode — so launchd, opening the UserName=_k3sm server job's
 // StandardOut/ErrorPath AS _k3sm, can traverse it and append to server.log (the
@@ -635,6 +701,10 @@ func refuseSymlinkAt(path string) error {
 // errSymlinkRefused is refuseSymlinkAt's (and ensureLogFile's) refusal, a
 // sentinel so callers and tests match it with errors.Is, never by message.
 var errSymlinkRefused = errors.New("is a symlink: refusing to chown/chmod through it")
+
+// errHardlinkRefused is ensureFileOwnedBy's refusal of a file whose link count
+// is not 1: another name shares the inode, so chowning it would chown that too.
+var errHardlinkRefused = errors.New("is hard-linked to another name: refusing to chown/chmod it")
 
 // HasACL reports whether path carries an extended ACL, never following a
 // symlink at path (pathHasACL).
