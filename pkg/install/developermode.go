@@ -414,9 +414,9 @@ func (r *markerRemoval) drop(sys System, cfg Config) error {
 	switch {
 	case r.team == "":
 	case r.invalid:
-		cfg.Logger.Info("removed an invalid developer-mode marker by a signed install", "team-id", r.team, "marker", r.path)
+		cfg.Logger.Info("removed an invalid developer-mode marker by an install whose k3sm is signed", "signer-team-id", r.team, "marker", r.path)
 	default:
-		cfg.Logger.Info("developer mode turned off by a signed install", "team-id", r.team, "marker", r.path)
+		cfg.Logger.Info("developer mode turned off by an install whose k3sm is signed", "signer-team-id", r.team, "marker", r.path)
 	}
 	return readErr
 }
@@ -467,10 +467,15 @@ func (r *markerRemoval) restore(sys System, cfg Config) {
 // toward removal only for a team-signed binary, and removing the marker only
 // turns the signature checks back on. It returns "" and why on any doubt.
 //
+// The team it returns names the signer of that binary. It is not an identity
+// check against the release team, and the log line says so by calling it the
+// signer team.
+//
 // Three limits are accepted, because each fails closed (a wrong verdict can
 // only remove the marker, which re-arms the checks). The signature is read
-// from the running binary's path, not from the bytes later copied into the
-// install root, so a swap in that window goes unseen. Any Developer ID team
+// by path, not by bytes: it is the running binary's path that is checked, not
+// the bytes later copied into the install root, so a swap in that window goes
+// unseen. Any Developer ID team
 // qualifies: no release team is pinned, and the installed build is not
 // consulted. The sibling payloads and helpers are not checked; only the
 // --from-staging path can walk a tree (developerModeOff).

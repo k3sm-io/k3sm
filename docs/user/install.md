@@ -201,8 +201,11 @@ update, stop and start it.
   - a plain `sudo k3sm install` turns it off when the `k3sm` doing the install carries a
     Developer ID Application signature of any team, not only the team that signs k3sm releases.
     The team is not compared with the installed one, and the other programs the install lays
-    down are not checked. Turning the mode off only turns the signature checks back on. An
-    ad-hoc signed build from source, or one signed for Apple Development, leaves it on;
+    down are not checked. The team in the log line is the signer of the `k3sm` doing the install,
+    not a check against the release team, and the signature is read from that program's path.
+    This check only turns developer mode off, which turns the signature checks back on. A plain
+    install turns it off only when the marker exists. An ad-hoc signed build from source, or one
+    signed for Apple Development, leaves it on;
   - an update through k3sm.app turns it off only when every program in the update carries a
     Developer ID Application signature of one team, and that team is the installed k3sm's when
     the installed k3sm has one. That is the same team the signature checks require of an update
