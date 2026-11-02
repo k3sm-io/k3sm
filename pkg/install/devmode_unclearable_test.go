@@ -79,9 +79,10 @@ func startedOnTheNewTree(calls []string) (publish, revert int, started []string)
 // branch: a marker that can be neither removed (twice) nor handed to nobody
 // still reads on, so the signed tree must not run beside it. On an upgrade the
 // swap is reverted, the previous tree and its marker are live again, nothing
-// is wired or restarted on the new tree, and the error names the remedy. On a
-// first install there is nothing to revert to, so the install stops before
-// anything is wired or restarted.
+// is wired or restarted on the new tree, and the error names the likely
+// blocker. On a first install there is nothing to revert to, so the install
+// stops before anything is wired or restarted (and moves the new tree out of
+// the install root: TestDeveloperModeStuckMarkerLeavesNoSignedTree).
 //
 // It runs on the production restart budgets, which the fake answers on the
 // first poll, so a loaded host cannot time it out.
@@ -106,7 +107,7 @@ func TestDeveloperModeMarkerUnclearableRevertsTheSwap(t *testing.T) {
 		if err == nil {
 			t.Fatal("Install succeeded beside a marker that still reads on")
 		}
-		for _, want := range []string{"k3sm install --developer-mode off", "rolled back to the previous install root"} {
+		for _, want := range []string{"sudo chflags nouchg " + DeveloperModeMarkerPath, "rolled back to the previous install root"} {
 			if !strings.Contains(err.Error(), want) {
 				t.Errorf("error %q does not carry %q", err, want)
 			}
@@ -142,17 +143,14 @@ func TestDeveloperModeMarkerUnclearableRevertsTheSwap(t *testing.T) {
 		if err == nil {
 			t.Fatal("Install succeeded beside a marker that still reads on")
 		}
-		for _, want := range []string{"k3sm install --developer-mode off", "first install"} {
+		for _, want := range []string{"sudo chflags nouchg " + DeveloperModeMarkerPath, "first install"} {
 			if !strings.Contains(err.Error(), want) {
 				t.Errorf("error %q does not carry %q", err, want)
 			}
 		}
-		publish, revert, started := startedOnTheNewTree(f.calls)
+		publish, _, started := startedOnTheNewTree(f.calls)
 		if publish < 0 {
 			t.Fatalf("no publish swap; calls %v", f.calls)
-		}
-		if revert >= 0 {
-			t.Errorf("a first install swapped again at call %d (%s); want the new tree left with nothing started", revert, f.calls[revert])
 		}
 		if len(started) > 0 {
 			t.Errorf("wired or started on the new tree: %v", started)

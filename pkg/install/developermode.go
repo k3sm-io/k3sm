@@ -455,7 +455,14 @@ func (r *markerRemoval) disown(sys System, cfg Config, removeErr error) error {
 		return nil
 	}
 	r.stuck = true
-	return fmt.Errorf("install: %w, and handing the marker to nobody failed too (%v), so developer mode is still on; run k3sm install --developer-mode off", removeErr, chownErr)
+	return fmt.Errorf("install: %w, and handing the marker to nobody failed too (%v), so developer mode is still on; %s", removeErr, chownErr, stuckMarkerRemedy(r.path))
+}
+
+// stuckMarkerRemedy names what most likely keeps a marker from being removed
+// or handed to nobody, and how to clear it by hand. It does not name `k3sm
+// install --developer-mode off`: that runs the same removal that just failed.
+func stuckMarkerRemedy(path string) string {
+	return fmt.Sprintf("the likely blocker is an immutable flag on the marker: clear it with `sudo chflags nouchg %s`, then remove it with `sudo rm %s`; a marker that is not a regular file is removed by hand", path, path)
 }
 
 // restore puts back the valid marker drop removed, with its bytes and its mode

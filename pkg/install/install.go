@@ -2456,11 +2456,15 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	//      steps would skip the signing continuity check. Fail closed. The
 	//      previous tree and its marker are the consistent pair, so the swap
 	//      is reverted and the daemons restart on the previous tree, never on
-	//      this one; on a first install there is nothing to revert to, and the
-	//      install stops here, before anything is wired or restarted.
+	//      this one; on a first install there is nothing to revert to, so the
+	//      new tree is moved out of the install root and the install stops
+	//      here, before anything is wired or restarted.
 	if removeMarker.stillOn() {
-		restartOwned = previous // a revert restarts, and reports, every daemon
-		return revertInstallRoot(ctx, sys, cfg, m, previous, dropErr, nil)
+		if !previous {
+			return withdrawFirstInstallTree(sys, cfg, dropErr)
+		}
+		restartOwned = true // a revert restarts, and reports, every daemon
+		return revertInstallRoot(ctx, sys, cfg, m, previous, dropErr, true, nil)
 	}
 
 	// 3. The launcher link and the plists, in that order, and BOTH after the
@@ -2474,7 +2478,7 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	//    target mean the new tree the moment it is live.
 	restartOwned = true // step 4 restarts, and on failure reports, every daemon
 	if err := publishedWiring(ctx, sys, cfg, m, startedAt); err != nil {
-		return revertInstallRoot(ctx, sys, cfg, m, previous, err, func() { removeMarker.restore(sys, cfg) })
+		return revertInstallRoot(ctx, sys, cfg, m, previous, err, false, func() { removeMarker.restore(sys, cfg) })
 	}
 
 	// 4c. REAP, and not one step earlier. The previous install root is still
@@ -2506,8 +2510,8 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	//    replaces the whole k3sm cluster entry, so a kubeconfig an earlier release
 	//    wrote (a self-signed pin, or skip-verify) is rewritten.
 	if err := writeAdminKubeconfig(ctx, sys, &cfg); err != nil {
-		// A marker removal that failed at 2f′ is reported beside it, so the
-		// --developer-mode off remedy still reaches the operator.
+		// A marker removal or read that failed at 2f′ is reported beside it,
+		// so neither is lost behind the kubeconfig error.
 		return errors.Join(err, dropErr)
 	}
 	cfg.Logger.Info("k3sm installed", "install-dir", cfg.InstallDir, "link", cfg.installedLink(), "kubeconfig-owner", cfg.TargetUser)
