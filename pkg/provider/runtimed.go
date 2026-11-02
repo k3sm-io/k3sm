@@ -617,6 +617,11 @@ type RuntimedConfig struct {
 	BudgetDir string
 	// Logger is the structured logger; a discard logger is used if nil.
 	Logger *slog.Logger
+
+	// rootLockWait is runtimed's Deps.RootLockWait: how long New waits for
+	// another runtime to let go of Root. Zero is runtimed's default; it is a
+	// test seam, so a test whose runtime was not closed fails at once.
+	rootLockWait time.Duration
 }
 
 // NewRuntimed builds a runtimedRuntime, constructing the in-process runtime with
@@ -693,6 +698,7 @@ func NewRuntimed(ctx context.Context, cfg RuntimedConfig) (*runtimedRuntime, err
 		)
 	}
 	deps.Resolver = resolver
+	deps.RootLockWait = cfg.rootLockWait
 	deps.Credentials = creds
 	deps.Network = network
 	// The cluster-mirror seam. Threaded as DATA, exactly like the resolver and the
