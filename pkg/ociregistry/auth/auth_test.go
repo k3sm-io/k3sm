@@ -636,3 +636,26 @@ func TestFailureBucketPerConnection(t *testing.T) {
 		}
 	})
 }
+
+// TestNewServerRefusesAHalfWiredConfig pins that NewServer sets the access
+// check and the connection hook itself and refuses a config that already
+// names either, or no Access.
+func TestNewServerRefusesAHalfWiredConfig(t *testing.T) {
+	a := newAccess(t)
+	cases := []struct {
+		name string
+		a    *Access
+		cfg  api.Config
+	}{
+		{name: "no access", cfg: api.Config{}},
+		{name: "an authorizer", a: a, cfg: api.Config{Authorize: api.AllowAll}},
+		{name: "a connection hook", a: a, cfg: api.Config{ConnClosed: func(string) {}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if srv, err := NewServer(tc.a, tc.cfg); err == nil || srv != nil {
+				t.Fatalf("NewServer = %v, %v; want a refusal", srv, err)
+			}
+		})
+	}
+}
