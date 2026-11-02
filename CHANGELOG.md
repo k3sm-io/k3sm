@@ -154,6 +154,10 @@ pin, its date, and the tarball's sha256.
   version's pre-release in a different case from the directory (`0.3.0-RC1` against
   `0.3.0-rc1` on a case-insensitive volume). A pod path whose version has no directory is
   reported as unresolved, so nothing is pruned on its account.
+- The local registry writes its push credential and htpasswd file the way it writes its serve
+  config: through a fresh 0600 temp file that is never a leftover or a symlink, synced and
+  renamed into a registry directory narrowed to 0700. A symlinked registry directory, or one
+  another user owns, is refused.
 - `k3sm uninstall` stops a vm pod helper still running from an older k3sm version whose
   directory is kept for it, as it stops every other helper, instead of reporting it as a
   leftover to kill by hand. Only a helper whose version directory is gone is still reported.

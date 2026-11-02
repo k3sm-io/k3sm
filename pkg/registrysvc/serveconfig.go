@@ -26,6 +26,8 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"golang.org/x/sys/unix"
+
 	"k3sm.io/k3sm/pkg/ociregistry/auth"
 )
 
@@ -68,26 +70,45 @@ func renderServeConfig(push, gate Credential) ([]byte, error) {
 }
 
 // writeServeConfig writes the serve config for workDir: the state dir at 0700,
-// the file at 0600 through a fresh temp file and a rename, owned by this
-// process's user (the service user the daemon runs as), and the directory
-// synced after the rename so the new file survives a crash.
+// the file at 0600 through writeFileInDir, owned by this process's user (the
+// service user the daemon runs as).
 func writeServeConfig(workDir string, body []byte) error {
 	d, err := openStateDir(ServeStateDir(workDir))
 	if err != nil {
 		return err
 	}
 	defer d.Close()
-	path := ServeConfigPath(workDir)
-	tmp := path + ".tmp"
-	// A leftover temp file from an interrupted write may have any mode; it is
-	// replaced, never reused.
-	if err := os.Remove(tmp); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := writeFileInDir(d, ServeConfigPath(workDir), body); err != nil {
 		return fmt.Errorf("write the registry serve config: %w", err)
 	}
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY|syscall.O_NOFOLLOW, 0o600)
+	return nil
+}
+
+// writeFileInDir writes body to path at 0600 through a fresh temp file and a
+// rename, then syncs d, the open directory path sits in, so the new file
+// survives a crash. path must name a file directly inside the directory d was
+// opened at. Every step (removing a leftover temp file, creating the temp
+// file, the rename) is made relative to d's descriptor with base names only,
+// so it lands in the directory openStateDir checked even if that directory's
+// path is swapped for a symlink afterwards. The temp file is created
+// O_EXCL|O_NOFOLLOW: a leftover from an interrupted write may have any mode or
+// be a symlink, so it is removed and replaced, never reused or followed. A
+// reader sees the old whole file or the new one, never a partial write.
+func writeFileInDir(d *os.File, path string, body []byte) error {
+	if filepath.Clean(filepath.Dir(path)) != filepath.Clean(d.Name()) {
+		return fmt.Errorf("%s is not inside the open directory %s", path, d.Name())
+	}
+	dfd := int(d.Fd())
+	name := filepath.Base(path)
+	tmp := name + ".tmp"
+	if err := unix.Unlinkat(dfd, tmp, 0); err != nil && !errors.Is(err, unix.ENOENT) {
+		return fmt.Errorf("remove the stale temp file %s: %w", tmp, err)
+	}
+	fd, err := unix.Openat(dfd, tmp, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
 	if err != nil {
-		return fmt.Errorf("write the registry serve config: %w", err)
+		return fmt.Errorf("create the temp file %s: %w", tmp, err)
 	}
+	f := os.NewFile(uintptr(fd), filepath.Join(d.Name(), tmp))
 	_, werr := f.Write(body)
 	if werr == nil {
 		werr = f.Sync()
@@ -96,20 +117,21 @@ func writeServeConfig(workDir string, body []byte) error {
 		werr = cerr
 	}
 	if werr == nil {
-		werr = os.Rename(tmp, path)
+		werr = unix.Renameat(dfd, tmp, dfd, name)
 	}
 	if werr != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("write the registry serve config: %w", werr)
+		_ = unix.Unlinkat(dfd, tmp, 0) // best effort: the write already failed
+		return werr
 	}
 	if err := d.Sync(); err != nil {
-		return fmt.Errorf("sync the registry state dir: %w", err)
+		return fmt.Errorf("sync %s: %w", d.Name(), err)
 	}
 	return nil
 }
 
-// openStateDir creates the state dir at 0700 if it is missing and returns it
-// open. It refuses, fail-closed, a path that is a symlink or not a directory,
+// openStateDir creates a registry state dir (the serve state dir, or the
+// registry dir that holds the push credential and the htpasswd file) at 0700
+// if it is missing and returns it open. It refuses, fail-closed, a path that is a symlink or not a directory,
 // and a directory another user owns. A directory of this user's own with a
 // wider mode is corrected to 0700, through the open descriptor, so the chmod
 // never follows a symlink. Only the last component is checked: the work dir
