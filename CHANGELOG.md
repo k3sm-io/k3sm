@@ -108,6 +108,8 @@ pin, its date, and the tarball's sha256.
 
 ### Fixed
 
+- A component that crashes during start-up on a busy host is now reported with its exit status
+  instead of as a health timeout.
 - A server or agent installed from a build of main exited at every start with `open runtime root
   lock /var/lib/k3sm/runtimed.lock: permission denied`: the embedded runtime now creates a lock
   file in the data root, which belongs to root. `k3sm install` now creates that one file for the

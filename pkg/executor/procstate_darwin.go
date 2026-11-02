@@ -19,6 +19,7 @@ package executor
 import (
 	"bytes"
 	"errors"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -32,6 +33,12 @@ const pStatZombie = 5
 // zombie awaiting its wait4. It asks the kernel DIRECTLY (kern.proc.pid), on the
 // caller's own goroutine, so the answer does not depend on the reaper goroutine
 // having been scheduled; that independence is the whole point (see awaitHealthy).
+//
+// The verdict comes from ONE kern.proc.pid snapshot. A second read could straddle
+// the reaper's wait4: the first read sees the zombie, the reap empties the slot,
+// and the second read finds nothing, which reads as "running" for a dead child. A
+// single snapshot is either the zombie (exited) or an empty slot (exited), so once
+// this reports true for a child it keeps reporting true across the reap.
 //
 // It fails safe: any inconclusive answer reports false ("still running"), so the
 // health deadline keeps its meaning rather than being defeated by a probe error.
@@ -48,15 +55,20 @@ func processExited(pid int) bool {
 	if err != nil {
 		return errors.Is(err, unix.ESRCH)
 	}
-	if len(raw) == 0 {
+	switch len(raw) {
+	case 0:
 		return true
-	}
-	// The PID is still in the table; only SZOMB means it has actually exited.
-	kp, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
-	if err != nil {
+	case unix.SizeofKinfoProc:
+		// The PID is still in the table; only SZOMB means it has actually exited.
+		// Decode the bytes of this same read rather than asking again (see above).
+		// This is the copy x/sys's own SysctlKinfoProc does in effect: the kernel
+		// wrote a struct kinfo_proc in native layout, which unix.KinfoProc mirrors.
+		var kp unix.KinfoProc
+		copy((*[unix.SizeofKinfoProc]byte)(unsafe.Pointer(&kp))[:], raw)
+		return kp.Proc.P_stat == pStatZombie
+	default:
 		return false
 	}
-	return kp.Proc.P_stat == pStatZombie
 }
 
 // processIsEtcd reports whether pid is a live (not zombie) process whose command name
