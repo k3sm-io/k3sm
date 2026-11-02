@@ -51,8 +51,9 @@ import (
 // are empty except, per case, a fake $GOPATH/bin/staticcheck-<pin>. No network and no real staticcheck are needed, and the result does not
 // depend on whether the host has one installed.
 //
-//	absent_tool_is_red   no staticcheck anywhere: non-zero exit, install hint
-//	wrong_version_is_red a fake reporting another version: non-zero exit, both
+//	no_candidate_is_red  no staticcheck anywhere: non-zero exit, install hint
+//	no_candidate_at_pin_is_red
+//	                     a fake reporting another version: non-zero exit, both
 //	                     versions named, and the fake never asked to lint
 //	pinned_version_runs  a fake reporting the pin: invoked with -tests=false ./...
 //	                     after the vet/build/test stages
@@ -63,9 +64,21 @@ import (
 //	versioned_wrong_version_falls_back
 //	                     a versioned name reporting another version is skipped by
 //	                     the exact version check and the PATH copy lints
+//	path_before_plain_gopath
+//	                     PATH and the plain $GOPATH/bin name both report the pin:
+//	                     the PATH copy lints
+//	plain_gopath_last_resort
+//	                     only the plain $GOPATH/bin name exists: it lints
+//	path_wrong_version_falls_back_to_plain
+//	                     a PATH copy reporting another version is skipped and the
+//	                     plain $GOPATH/bin name lints
+//
+// On both red cases the go mod tidy stage header must not appear: the stages
+// after the Go block fail in the sandbox module anyway, so a non-zero exit alone
+// would not show that the pick's own exit is what stopped ci.sh.
 //
 // Against the ci.sh preceding the pinned stage, pin_equals_go_standards,
-// no_literal_pin_in_ci and wrong_version_is_red are red (it had no constant,
+// no_literal_pin_in_ci and no_candidate_at_pin_is_red are red (it had no constant,
 // carried the version as a literal in its hint, and ran any staticcheck it found).
 func TestK3smCIGateRunsPinnedStaticcheck(t *testing.T) {
 	root := repoRoot(t)
@@ -145,12 +158,12 @@ func TestK3smCIGateRunsPinnedStaticcheck(t *testing.T) {
 		wantRunBy     string // which fake linted ("path" or "versioned"); "" = not checked
 	}{
 		{
-			name:    "absent_tool_is_red",
+			name:    "no_candidate_is_red",
 			wantRed: true,
 			wantOut: []string{"not installed", "staticcheck@" + pin, "staticcheck-" + pin},
 		},
 		{
-			name:        "wrong_version_is_red",
+			name:        "no_candidate_at_pin_is_red",
 			versionLine: "staticcheck 2025.1 (0.6.0)",
 			wantRed:     true,
 			wantOut:     []string{"2025.1", pin},
@@ -196,6 +209,14 @@ func TestK3smCIGateRunsPinnedStaticcheck(t *testing.T) {
 			wantMarker: true,
 			wantRunBy:  "plain",
 		},
+		{
+			name:        "path_wrong_version_falls_back_to_plain",
+			versionLine: "staticcheck 2025.1 (0.6.0)",
+			plainLine:   "staticcheck " + pin + " (0.8.1)",
+			wantOut:     []string{"] staticcheck"},
+			wantMarker:  true,
+			wantRunBy:   "plain",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -211,6 +232,13 @@ func TestK3smCIGateRunsPinnedStaticcheck(t *testing.T) {
 
 			if tc.wantRed && ok {
 				t.Errorf("ci.sh exited zero, want RED:\n%s", out)
+			}
+			// A red pick must stop ci.sh itself. The later stages fail in the
+			// sandbox module on their own, so the exit status cannot tell a pick
+			// that exits from one that printed its error and carried on; the
+			// next stage's header can.
+			if tc.wantRed && strings.Contains(out, tidyStageHeader) {
+				t.Errorf("ci.sh went on to the go mod tidy stage after a red staticcheck pick:\n%s", out)
 			}
 			for _, w := range tc.wantOut {
 				if !strings.Contains(out, w) {
@@ -243,6 +271,10 @@ func TestK3smCIGateRunsPinnedStaticcheck(t *testing.T) {
 		})
 	}
 }
+
+// tidyStageHeader is the header ci.sh prints for the stage that follows the
+// staticcheck stage.
+const tidyStageHeader = "==> [k3sm] go mod tidy (no-diff)"
 
 // staticcheckPinRE matches the documented install pin. One regex, shared by the
 // table cases and the real document, so the rejection the table proves is the
