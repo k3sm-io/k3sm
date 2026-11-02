@@ -78,13 +78,23 @@ func parseReference(r *http.Request) (ref.Reference, error) {
 
 // getManifest serves a manifest GET or HEAD. Accept is ignored: the answer is
 // the manifest as pushed, with its pushed media type.
+//
+// A reference outside the tag grammar names no manifest a push could have
+// stored, so a read of one is answered 404 MANIFEST_UNKNOWN, as the OCI
+// distribution-spec conformance suite requires and the registry this replaces
+// answers. It is still refused before the store is touched, and a malformed
+// digest stays 400 DIGEST_INVALID. Authorization comes first, so a caller
+// who may not read the repository learns nothing about the reference.
 func (s *Server) getManifest(w http.ResponseWriter, r *http.Request, n ref.Name) {
-	rf, err := parseReference(r)
-	if err != nil {
-		s.fail(w, r, err)
+	if !s.allow(w, r, VerbRead, n) {
 		return
 	}
-	if !s.allow(w, r, VerbRead, n) {
+	rf, err := parseReference(r)
+	if errors.Is(err, ref.ErrInvalidTag) {
+		err = &apiError{status: http.StatusNotFound, code: codeManifestUnknown, msg: "manifest unknown", cause: err}
+	}
+	if err != nil {
+		s.fail(w, r, err)
 		return
 	}
 	desc, body, err := s.st.Manifest(n, rf)
@@ -342,12 +352,12 @@ var errPreconditionFailed = errorf(http.StatusPreconditionFailed, codeDenied, "t
 // If-Match field line, so a request whose If-Match lines are empty or hold no
 // well-formed tag is a 412, never unconditional (RFC 9110 section 13.1.1).
 func (s *Server) deleteManifest(w http.ResponseWriter, r *http.Request, n ref.Name) {
+	if !s.allow(w, r, VerbDelete, n) {
+		return
+	}
 	rf, err := parseReference(r)
 	if err != nil {
 		s.fail(w, r, err)
-		return
-	}
-	if !s.allow(w, r, VerbDelete, n) {
 		return
 	}
 	ifMatch := r.Header.Values("If-Match")

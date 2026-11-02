@@ -1,0 +1,4 @@
+example.com/ochild v0.5.0 h1:ochildzip=
+example.com/ochild v0.5.0/go.mod h1:ochildmod=
+example.com/old v1.2.3 h1:oldzip=
+example.com/old v1.2.3/go.mod h1:oldmod=

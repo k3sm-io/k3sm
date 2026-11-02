@@ -211,7 +211,11 @@ func TestDistributionAPI(t *testing.T) {
 			{http.MethodGet, "/v2/app/blobs/x/tags/list", 400, codeNameInvalid},
 			{http.MethodGet, "/v2/.hidden/manifests/v1", 400, codeNameInvalid},
 			{http.MethodGet, "/v2/cache.db/manifests/v1", 400, codeNameInvalid},
-			{http.MethodGet, "/v2/app/manifests/-bad", 400, codeManifestInvalid},
+			{http.MethodGet, "/v2/app/manifests/-bad", 404, codeManifestUnknown},
+			{http.MethodGet, "/v2/app/manifests/.INVALID_MANIFEST_NAME", 404, codeManifestUnknown},
+			{http.MethodHead, "/v2/app/manifests/.INVALID_MANIFEST_NAME", 404, ""},
+			{http.MethodPut, "/v2/app/manifests/-bad", 400, codeManifestInvalid},
+			{http.MethodDelete, "/v2/app/manifests/-bad", 400, codeManifestInvalid},
 			{http.MethodGet, "/v2/app/manifests/sha256:abc", 400, codeDigestInvalid},
 			{http.MethodHead, "/v2/app/blobs/sha256:ABC", 400, ""},
 			{http.MethodGet, "/v2/app/blobs/md5:d41d8cd98f00b204e9800998ecf8427e", 400, codeDigestInvalid},
@@ -314,6 +318,30 @@ func TestDistributionAPI(t *testing.T) {
 		if !strings.HasPrefix(w.Header().Get("WWW-Authenticate"), "Basic ") {
 			t.Errorf("WWW-Authenticate %q", w.Header().Get("WWW-Authenticate"))
 		}
+	})
+	t.Run("an anonymous manifest read of an invalid tag is 401, not 404", func(t *testing.T) {
+		f := newFixture(t, func(c *Config) {
+			c.Authorize = func(*http.Request, Verb, ref.Name) error { return ErrUnauthenticated }
+		})
+		for _, m := range []string{http.MethodGet, http.MethodHead} {
+			w := f.do(m, "/v2/app/manifests/.INVALID_MANIFEST_NAME", nil)
+			if w.Code != http.StatusUnauthorized {
+				t.Errorf("%s = %d, want 401 (%s)", m, w.Code, w.Body.String())
+			}
+		}
+		want(t, f.do(http.MethodGet, "/v2/app/manifests/-bad", nil), http.StatusUnauthorized, codeUnauthorized)
+	})
+	t.Run("delete/an anonymous DELETE of an invalid tag is 401, not 400", func(t *testing.T) {
+		f := newFixture(t, func(c *Config) {
+			c.Authorize = func(_ *http.Request, v Verb, _ ref.Name) error {
+				if v == VerbDelete {
+					return ErrUnauthenticated
+				}
+				return nil
+			}
+		})
+		want(t, f.do(http.MethodDelete, "/v2/app/manifests/-bad", nil), http.StatusUnauthorized, codeUnauthorized)
+		want(t, f.do(http.MethodDelete, "/v2/app/manifests/.INVALID_MANIFEST_NAME", nil), http.StatusUnauthorized, codeUnauthorized)
 	})
 	t.Run("delete/a blob DELETE is left to garbage collection", func(t *testing.T) {
 		f := newFixture(t)
