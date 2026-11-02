@@ -133,13 +133,13 @@ func TestTeardownUnknownRetentionCoversEveryNonENOENTError(t *testing.T) {
 				tc.text,
 				fmt.Sprintf("check that %q and each of its parents are owned by root and not writable by group or others", versions+"/0.2.8"),
 				"an I/O error means the disk needs checking",
-				fmt.Sprintf("if process group %d is still this helper (check with ps -g %d), stop it with: sudo kill -TERM -%d", stale, stale, stale),
+				fmt.Sprintf("if ps -g %d lists only k3sm-vmhost processes (the helper above), stop it with: sudo kill -TERM -%d", stale, stale),
 			} {
 				if !strings.Contains(msg, want) {
 					t.Errorf("stopVMHelpers = %q, want it to name %q", msg, want)
 				}
 			}
-			for _, wrong := range []string{"fix the permissions", fmt.Sprintf("%d", live), "no longer retains", "not " + cfg.installedVMHost()} {
+			for _, wrong := range []string{"fix the permissions", fmt.Sprintf("-%d", live), fmt.Sprintf("-g %d", live), fmt.Sprintf("pid %d", live), "no longer retains", "not " + cfg.installedVMHost()} {
 				if strings.Contains(msg, wrong) {
 					t.Errorf("stopVMHelpers = %q, reports an unknown retention as %q", msg, wrong)
 				}

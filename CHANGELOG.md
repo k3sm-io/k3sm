@@ -77,9 +77,8 @@ pin, its date, and the tarball's sha256.
   WireGuard view, so `kubectl get meshpeer -o yaml` shows when the server last completed a
   handshake with that peer.
 - Uninstall names a vm helper still running from a k3sm version the install no longer keeps. It
-  does not signal that helper, and the error gives its process ID and, if that process group is
-  still the helper (check with `ps -g <pid>`), the command to stop it by hand,
-  `sudo kill -TERM -<pid>`.
+  does not signal that helper, and the error gives its process ID and the command to stop it by
+  hand, `sudo kill -TERM -<pid>`, to run if `ps -g <pid>` lists only `k3sm-vmhost` processes.
 
 ### Changed
 

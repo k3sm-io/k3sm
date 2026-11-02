@@ -232,7 +232,7 @@ func TestTeardownReportsAnUnretainedVMHelper(t *testing.T) {
 				fmt.Sprintf("%q", staleExe),
 				`version "0.2.8"`,
 				"no longer retains",
-				fmt.Sprintf("if process group %d is still this helper (check with ps -g %d), stop it with: sudo kill -TERM -%d", stale, stale, stale),
+				fmt.Sprintf("if ps -g %d lists only k3sm-vmhost processes (the helper above), stop it with: sudo kill -TERM -%d", stale, stale),
 			} {
 				if !strings.Contains(msg, want) {
 					t.Errorf("stopVMHelpers = %q, want it to name %q", msg, want)

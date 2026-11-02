@@ -524,14 +524,14 @@ func verifyVMHelper(sys System, cfg Config, rec VMHostRecord, svcUID uint32) (bo
 		ver, _ := layout.New(cfg.InstallDir).VersionedBinary(filepath.Clean(exe), VMHostName)
 		cfg.Logger.Warn("a vm helper runs from a version directory that cannot be resolved, so whether this install retains it is unknown; not signalled",
 			"pod", rec.PodID, "pid", rec.Pgid, "exe", filepath.Clean(exe), "version", ver, "err", rerr)
-		return false, fmt.Errorf("vm helper pid %d (pod %s) runs %q from version %q, whose path cannot be resolved, so whether this install retains it is unknown; not signalled: %w; check that %q and each of its parents are owned by root and not writable by group or others (an I/O error means the disk needs checking); if process group %d is still this helper (check with ps -g %d), stop it with: sudo kill -TERM -%d",
-			rec.Pgid, rec.PodID, filepath.Clean(exe), ver, rerr, filepath.Dir(filepath.Clean(exe)), rec.Pgid, rec.Pgid, rec.Pgid)
+		return false, fmt.Errorf("vm helper pid %d (pod %s) runs %q from version %q, whose path cannot be resolved, so whether this install retains it is unknown; not signalled: %w; check that %q and each of its parents are owned by root and not writable by group or others (an I/O error means the disk needs checking); if ps -g %d lists only k3sm-vmhost processes (the helper above), stop it with: sudo kill -TERM -%d",
+			rec.Pgid, rec.PodID, filepath.Clean(exe), ver, rerr, filepath.Dir(filepath.Clean(exe)), rec.Pgid, rec.Pgid)
 	case uid != svcUID || !installed:
 		if ver, ok := unretainedVMHost(sys, cfg, exe, []string{exe}); ok && uid == svcUID {
 			cfg.Logger.Warn("a vm helper runs from a version this install no longer retains; not signalled, stop it by hand",
 				"pod", rec.PodID, "pid", rec.Pgid, "exe", filepath.Clean(exe), "version", ver)
-			return false, fmt.Errorf("vm helper pid %d (pod %s) runs %q from version %q, which this install no longer retains; not signalled; if process group %d is still this helper (check with ps -g %d), stop it with: sudo kill -TERM -%d",
-				rec.Pgid, rec.PodID, filepath.Clean(exe), ver, rec.Pgid, rec.Pgid, rec.Pgid)
+			return false, fmt.Errorf("vm helper pid %d (pod %s) runs %q from version %q, which this install no longer retains; not signalled; if ps -g %d lists only k3sm-vmhost processes (the helper above), stop it with: sudo kill -TERM -%d",
+				rec.Pgid, rec.PodID, filepath.Clean(exe), ver, rec.Pgid, rec.Pgid)
 		}
 		want := cfg.installedVMHost()
 		cfg.Logger.Warn("a vm helper record names a process that is not this install's k3sm-vmhost; not signalled", "pod", rec.PodID, "pgid", rec.Pgid, "exe", exe, "uid", uid)
