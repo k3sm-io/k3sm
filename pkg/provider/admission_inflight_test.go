@@ -308,11 +308,11 @@ func TestAdmissionInFlightLeakDoesNotBypassRetry(t *testing.T) {
 	// admit runs admission alone for pod and fails the test if it refused.
 	admit := func(t *testing.T, h *evictionHarness, pod *corev1.Pod) func() {
 		t.Helper()
-		refused, done := h.r.admitOnCreate(ctx, pod.DeepCopy())
-		if refused || done == nil {
-			t.Fatalf("admission refused %s (refused %v, done nil %v)", pod.Name, refused, done == nil)
+		refused, ticket := h.r.admitOnCreate(ctx, pod.DeepCopy())
+		if refused || ticket == nil {
+			t.Fatalf("admission refused %s (refused %v, ticket nil %v)", pod.Name, refused, ticket == nil)
 		}
-		return done
+		return ticket.done
 	}
 
 	t.Run("two in flight, one done: a refusal still yields to the other", func(t *testing.T) {

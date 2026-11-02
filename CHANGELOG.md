@@ -138,6 +138,10 @@ pin, its date, and the tarball's sha256.
   result are now recorded together, so the node and the API server always agree. A create
   that finds the Pod refused or evicted while it ran now stops instead of starting it, and a
   node whose memory monitor is not set up admits every Pod instead of crashing the create.
+- A create that stopped because the Pod was refused at admission while it ran no longer keeps
+  the Pod's address, its loopback alias, its interconnect slot or its Secret and ConfigMap
+  references until the node restarts. A repeat create of a running Pod now also keeps a
+  refusal from landing while it is in flight, as a first create does.
 - A k3sm version directory a running pod uses is kept even when the pod's path spells the
   version's pre-release in a different case from the directory (`0.3.0-RC1` against
   `0.3.0-rc1` on a case-insensitive volume). A pod path whose version has no directory is
