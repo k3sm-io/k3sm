@@ -274,6 +274,12 @@ func TestBudgetHistoryDegradesToMemory(t *testing.T) {
 		t.Fatalf("in-memory evictions = %d, want 1", got)
 	}
 
+	// The same root again, as a restarted node would open it: the first
+	// runtime lets go of the root first, exactly as the node's exit does.
+	if err := r.Close(); err != nil {
+		t.Fatalf("close the first runtime: %v", err)
+	}
+
 	// A corrupt file: the provider starts, the file is moved aside.
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, budgetHistoryFile), []byte("{"), 0o600); err != nil {
@@ -285,6 +291,7 @@ func TestBudgetHistoryDegradesToMemory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRuntimed with a corrupt history: %v", err)
 	}
+	t.Cleanup(func() { _ = r.Close() }) // the test is done with the runtime; a close error proves nothing here
 	if r.history == nil || r.history.path == "" {
 		t.Fatalf("a corrupt history did not reopen on disk: %+v", r.history)
 	}
