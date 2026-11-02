@@ -98,6 +98,13 @@ pin, its date, and the tarball's sha256.
   root and not writable by group or others (an I/O error means the disk needs checking), and how
   to stop the helper's process group by hand if it is still the helper.
 - The `mlx-serve` image's `mlx-lm` moves from 0.32.0 to 0.32.2. The next image tag carries it; no other package in the closure moves. Sharded ranks refuse chat requests whose images are not inline `data:` URLs, since mlx-lm 0.32.2 would otherwise fetch any `http(s)` image URL a client names.
+- The embedded runtime takes an exclusive lock on its root (`runtimed.lock`). A second runtime
+  started on a root already in use waits up to 15 seconds for the lock and is then refused,
+  instead of running beside the first.
+- The built-in registry answers a manifest GET or HEAD with an invalid tag as 404
+  `MANIFEST_UNKNOWN` (it was 400 `MANIFEST_INVALID`), as the OCI conformance suite expects. PUT
+  and DELETE still answer 400, and an anonymous request is answered 401 before the reference
+  is parsed.
 
 ### Fixed
 
