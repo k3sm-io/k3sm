@@ -164,14 +164,17 @@ probe_dns() {
 }
 
 # lan_target: the default gateway, the LAN address a host can always route
-# to, or a private address when there is no default route.
+# to, or a documentation address (RFC 5737 TEST-NET-1) when there is no
+# default route. The probe only needs a non-loopback destination: a sandbox
+# denies the connect (EPERM) before any routing, so the address need not be
+# reachable for the denial to be proved.
 lan_target() {
 	local gw
 	gw="$(route -n get default 2>/dev/null | awk '$1 == "gateway:" {print $2; exit}')"
 	if [[ "$gw" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 		echo "$gw"
 	else
-		echo 192.168.0.1
+		echo 192.0.2.1
 	fi
 }
 
