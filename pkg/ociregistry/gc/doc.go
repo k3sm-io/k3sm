@@ -31,22 +31,44 @@ limitations under the License.
 // Protection is on disk. Every mount, link and upload commit touches the
 // shared blob inode's mtime under the repository's lock, so age is the time
 // since the last write that named the blob, and it survives a restart. A sweep
-// marks each repository from a snapshot without the lock, then takes the
-// repository lock to delete: it re-reads index.json and re-states every
-// candidate, recomputes what is reachable, and deletes only what both passes
-// agree on. Upload sessions are reaped only after taking their own lock
+// marks each repository from a snapshot without the lock, reading, verifying
+// and parsing every manifest body it follows there, then takes the repository
+// lock to delete: it re-reads index.json and re-states the repository,
+// recomputes what is reachable from the bodies the mark read, and deletes only
+// what both passes agree on. The lock is held for no manifest read. When the
+// rows, or a manifest the mark read, changed in between, it deletes nothing
+// and marks the repository again; one that keeps changing is skipped with
+// ErrChanged. Upload sessions are reaped only after taking their own lock
 // without waiting, so a session an upload holds is never touched.
 //
 // Three brakes bound the damage of a mistake. No sweep runs within one grace
 // period of the collector's start, so a write made just before a restart has
 // had its full grace. The first sweep over a store without the
 // registry-state/gc-ran marker only reports what it would reap, then writes
-// the marker. A sweep that would delete more than half of a repository's
-// blobs stops with ErrMassDelete, unless it empties the repository: it leaves
-// no row and every blob it reaps is older than the last change to the rows.
-// A first push in progress, whose blobs are newer than its empty index, stays
-// under the brake. Anything the collector cannot read (a manifest body that
-// is missing, does not parse, or is not an OCI or Docker v2 image manifest,
-// index or manifest list, such as a Docker schema1 manifest) stops that
-// repository's sweep: it never deletes on a guess.
+// the marker. It writes it even when a repository was braked or is
+// unreadable (that one keeps failing closed), but not when a repository
+// failed for a reason that may pass, such as an I/O error or a repository
+// removed mid-sweep, and not when the store holds no repository: the next
+// sweep then only reports again. The marker records the store id, a random
+// 128-bit id the store keeps in its root (store.IDFile) and writes with the
+// first marker, and a marker for another id does not count. A root restored
+// from a backup taken before the id existed, even into the same directory,
+// gets a new id and so a report-only first sweep again; a backup or copy
+// that carries the id file is the same store. A sweep that would delete more
+// than half of a repository's blobs stops with ErrMassDelete, unless it
+// empties the repository (it leaves no row and every blob it reaps is older
+// than the last change to the rows) or the repository is an abandoned first
+// push. The emptying rule does not free a first push's blobs while they are
+// newer than its index, but any later write to the rows (another tag pushed
+// or deleted in the repository) advances index.json past them, and from then
+// on the brake does not tell them from what a removed image left. The grace
+// period, not the brake, is what guards a push's blobs. A repository with no rows whose index.json,
+// blobs and upload sessions have all gone unwritten for the abandon horizon
+// (AbandonFactor grace periods unless Options.Abandon says otherwise) is an
+// abandoned first push: the brake no longer applies to it, and its blobs are
+// reaped by the grace rule, so it does not stop every sweep for ever.
+// Anything the collector cannot read (a manifest body that is missing, does
+// not parse, or is not an OCI or Docker v2 image manifest, index or manifest
+// list, such as a Docker schema1 manifest or any body with a schema1 fsLayers
+// field) stops that repository's sweep: it never deletes on a guess.
 package gc

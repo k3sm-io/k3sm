@@ -85,6 +85,10 @@ func TestParseRefsFailsClosed(t *testing.T) {
 	for _, tc := range []struct{ name, body string }{
 		{"docker schema1", `{"schemaVersion":1,"name":"app","tag":"v1","architecture":"arm64","fsLayers":[{"blobSum":"` + dgB + `"}],"history":[{"v1Compatibility":"{}"}]}`},
 		{"docker schema1 signed", `{"schemaVersion":1,"mediaType":"application/vnd.docker.distribution.manifest.v1+prettyjws","fsLayers":[{"blobSum":"` + dgB + `"}]}`},
+		{"docker schema1 fsLayers at schemaVersion 2", `{"schemaVersion":2,"config":{"digest":"` + dgA + `"},"fsLayers":[{"blobSum":"` + dgB + `"}]}`},
+		{"docker schema1 fsLayers under an oci mediaType", `{"schemaVersion":2,"mediaType":"` + ispec.MediaTypeImageManifest + `","config":{"digest":"` + dgA + `"},"fsLayers":[{"blobSum":"` + dgB + `"}]}`},
+		{"docker schema1 fsLayers beside a manifests array", `{"schemaVersion":2,"manifests":[],"fsLayers":[{"blobSum":"` + dgB + `"}]}`},
+		{"docker schema1 empty fsLayers", `{"schemaVersion":2,"config":{"digest":"` + dgA + `"},"fsLayers":[]}`},
 		{"unknown mediaType", `{"schemaVersion":2,"mediaType":"application/vnd.example.manifest.v1+json","config":{"digest":"` + dgA + `"},"parts":[{"digest":"` + dgB + `"}]}`},
 		{"oci artifact manifest", `{"mediaType":"application/vnd.oci.artifact.manifest.v1+json","blobs":[{"digest":"` + dgB + `"}]}`},
 		{"oci artifact manifest at schemaVersion 2", `{"schemaVersion":2,"mediaType":"application/vnd.oci.artifact.manifest.v1+json","blobs":[{"digest":"` + dgB + `"}]}`},

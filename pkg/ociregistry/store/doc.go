@@ -48,7 +48,9 @@ limitations under the License.
 // it names. index.json is rewritten under a per-repository flock in the state
 // directory (<work-dir>/registry-state/locks), which holds across processes.
 // The state directory is outside the root: nothing the store writes in the root
-// is anything but the layout's own files.
+// is anything but the layout's own files, and the store id (IDFile), a random
+// 128-bit id the garbage collector's first-sweep marker is bound to, which
+// EnsureID writes once, atomically, the first time it is asked for.
 //
 // For garbage collection (pkg/ociregistry/gc), every mount, link and upload
 // commit runs under the same repository lock and touches the blob inode's

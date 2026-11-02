@@ -79,7 +79,7 @@ func TestBlobHeadKeepsTheBlobForTheManifestPut(t *testing.T) {
 				t.Fatal(err)
 			}
 			now = time.Now
-			if err := os.WriteFile(filepath.Join(f.st.StateDir(), gc.MarkerName), []byte("ran\n"), 0o600); err != nil {
+			if err := gc.WriteMarker(f.st, time.Now()); err != nil {
 				t.Fatal(err)
 			}
 

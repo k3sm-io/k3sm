@@ -83,10 +83,11 @@ func (w *world) sweep(t *testing.T, c *Collector, hook func()) error {
 		t.Fatal(err)
 	}
 	for _, n := range repos {
-		p, idx, _, err := c.mark(n, c.now().Add(-c.grace))
+		m, err := c.mark(n, c.now().Add(-c.grace))
 		if err != nil {
 			t.Fatal(err)
 		}
+		p, idx := m.p, m.idx
 		between()
 		err = w.s.WithLock(w.ctx, n, func(l *store.Locked) error {
 			if len(p.rows) > 0 {
