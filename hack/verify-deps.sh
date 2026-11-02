@@ -103,7 +103,11 @@ LOCK="hack/deps.lock"
 # neither is a symlink (on disk or in the git index). Any other line fails the
 # check. No file means the repo has no wrapper graph. Every tracked *go.sum.txt
 # outside hack/testdata must be named by a line, and every hack/deps-*.lock too,
-# so a graph cannot leave the check by losing its line. A wrapper graph version that must clear
+# so a graph cannot leave the check by losing its line; every tracked
+# *go.mod.txt outside hack/testdata needs a listed go.sum in its directory.
+# The list of tracked files is the git index of the repo's own top level, so a
+# source tarball or `git archive` build fails closed at the wrappers stage, by
+# design. A wrapper graph version that must clear
 # the cooldown early is exempted in hack/deps.cooldown-exempt like any other,
 # with its reason (and expiry) there.
 WRAPPERS_FILE="hack/deps.wrappers"
@@ -1056,6 +1060,13 @@ load_wrappers() {
 	: >"$WORK/wrappers"
 	command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
 		fail "wrappers" "not a git checkout: the tracked wrapper graphs are read from the git index"
+	# The repo root must be the checkout's top level: a tree extracted inside an
+	# unrelated checkout would otherwise read that checkout's index, which tracks
+	# none of this tree's files.
+	local top
+	top="$(git rev-parse --show-toplevel 2>/dev/null)" || fail "wrappers" "cannot read the git top level"
+	[ "$top" = "$(pwd -P)" ] ||
+		fail "wrappers" "$ROOT is not the top level of its git checkout ($top): the tracked wrapper graphs are read from this repo's own index"
 	local n=0 line name sum lock extra p bad=""
 	if [ ! -e "$WRAPPERS_FILE" ]; then
 		echo "    no $WRAPPERS_FILE: this repo checks no wrapper graph"
@@ -1104,6 +1115,17 @@ load_wrappers() {
 		case "$p" in hack/testdata/*) continue ;; esac
 		awk -v s="$p" '$2 == s { f = 1 } END { exit !f }' "$WORK/wrappers" ||
 			bad="${bad}  $p is a tracked wrapper graph that no $WRAPPERS_FILE line names: list it with its lock"$'\n'
+	done <"$tracked"
+	# A wrapper module is a go.mod.txt; its graph is the listed go.sum beside it.
+	# Keying on the go.mod.txt as well means renaming the go.sum (and its embed
+	# directive) does not take the module out of the check.
+	git ls-files -- '*go.mod.txt' >"$tracked" || fail "wrappers" "cannot list the tracked files: run from a git checkout"
+	local d
+	while IFS= read -r p; do
+		case "$p" in hack/testdata/*) continue ;; esac
+		d="$(dirname "$p")"
+		awk -v d="$d" '{ s = $2; sub(/\/[^\/]*$/, "", s); if ($2 !~ /\//) s = "."; if (s == d) f = 1 } END { exit !f }' "$WORK/wrappers" ||
+			bad="${bad}  $p is a tracked wrapper module with no listed go.sum beside it in $d: list its graph with its lock"$'\n'
 	done <"$tracked"
 	for p in hack/deps-*.lock; do
 		[ -e "$p" ] || continue
@@ -1301,14 +1323,24 @@ self_test() {
 			fi
 			mv "$WORK/worklock-$name" "$dir/hack/deps.lock"
 		fi
+		# A case carrying .nested is extracted, untracked, inside an unrelated
+		# checkout: the case tree moves to <outer>/tree and only <outer> is a repo.
+		if [ -f "$dir/.nested" ]; then
+			rm -f "$dir/.nested"
+			mkdir -p "$dir.outer"
+			mv "$dir" "$dir.outer/tree"
+			(cd "$dir.outer" && git init -q) >/dev/null 2>&1 || { echo "  FAIL $name: could not build the outer git repo"; return 0; }
+			dir="$dir.outer/tree"
 		# Every case repo is a git checkout: the wrappers stage reads the index.
-		if [ ! -e "$dir/.git" ] && ! (cd "$dir" && git init -q) >/dev/null 2>&1; then
+		elif [ ! -e "$dir/.git" ] && ! (cd "$dir" && git init -q) >/dev/null 2>&1; then
 			echo "  FAIL $name: could not build the case git repo"
 			return 0
 		fi
 		# A case's .exclude becomes .git/info/exclude: files it names stay untracked.
 		[ ! -f "$dir/.exclude" ] || { mkdir -p "$dir/.git/info" && mv "$dir/.exclude" "$dir/.git/info/exclude"; }
-		(cd "$dir" && git add -A -- . ':!.ln') >/dev/null 2>&1 || { echo "  FAIL $name: could not stage the case repo"; return 0; }
+		if [ -e "$dir/.git" ]; then
+			(cd "$dir" && git add -A -- . ':!.ln') >/dev/null 2>&1 || { echo "  FAIL $name: could not stage the case repo"; return 0; }
+		fi
 		if [ -f "$dir/.ln" ]; then
 			while read -r lnpath lntarget lnmode; do
 				[ "$lnmode" = index ] || continue
@@ -1435,6 +1467,9 @@ self_test() {
 	bg wrappers-lock-symlink - wrappers "'hack/deps-child.lock' is a symlink"
 	bg wrappers-sum-index-symlink - wrappers "'pkg/child/go.sum.txt' is a symlink"
 	bg wrappers-dash - wrappers "'pkg/-child/go.sum.txt' has a component that starts with -"
+	bg wrapper-mod-renamed-sum - wrappers "pkg/extra/go.mod.txt is a tracked wrapper module with no listed go.sum beside it in pkg/extra"
+	bg wrapper-mod-no-sum - wrappers "pkg/extra/go.mod.txt is a tracked wrapper module with no listed go.sum beside it in pkg/extra"
+	bg wrappers-nested-checkout - wrappers "is not the top level of its git checkout"
 	bg wrapper-second-clean - pass "==> [verify-deps] malicious-package check (second)"
 	bg wrapper-second-lock-added - "lock (second)" "added:   example.com/sextra v1.0.0"
 	bg wrapper-second-update --update pass "wrote hack/deps-second.lock: 3 modules, 1 new or changed"
