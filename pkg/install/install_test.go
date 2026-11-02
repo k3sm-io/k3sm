@@ -73,6 +73,9 @@ type fakeSystem struct {
 	calls []string
 	// acls marks the paths HasACL reports as carrying an extended ACL.
 	acls map[string]bool
+	// hasACLErrs[path] is the failure HasACL returns for path: an ACL probe
+	// that could not run.
+	hasACLErrs map[string]error
 	// serverBooted is set once the fake launchd starts the server label; from then
 	// on a read of any work dir's tls/cluster-ca.crt answers with fakeBootClusterCA,
 	// modelling the control plane minting its CA on first boot. noBootCA keeps the
@@ -410,9 +413,13 @@ func (f *fakeSystem) putOwned(path string, uid, gid int, mode fs.FileMode, kind 
 	f.owners[path] = OwnedEntry{Path: path, UID: uid, GID: gid, Mode: mode, Kind: kind}
 }
 
-// HasACL answers from acls; a path with no entry carries none.
+// HasACL answers from acls, or fails with hasACLErrs; a path with no entry
+// carries none.
 func (f *fakeSystem) HasACL(path string) (bool, error) {
 	f.calls = append(f.calls, "HasACL:"+path)
+	if err, ok := f.hasACLErrs[path]; ok {
+		return false, err
+	}
 	return f.acls[path], nil
 }
 

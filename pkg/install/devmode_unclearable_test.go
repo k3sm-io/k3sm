@@ -29,8 +29,9 @@ import (
 const unclearableMarkerRemove = "RemoveEntry:/Library:k3sm.developer-mode"
 
 // putUnclearableMarker puts a valid developer-mode marker on the fake, with
-// the directories above it, as kind.
-func putUnclearableMarker(f *fakeSystem, kind EntryKind) {
+// the directories above it, as kind. A regular file must read on.
+func putUnclearableMarker(t *testing.T, f *fakeSystem, kind EntryKind) {
+	t.Helper()
 	seedMarkerAncestors(f)
 	f.owners[DeveloperModeMarkerPath] = OwnedEntry{Path: DeveloperModeMarkerPath, Kind: kind, Mode: 0o644}
 	if kind == EntryRegular {
@@ -39,6 +40,7 @@ func putUnclearableMarker(f *fakeSystem, kind EntryKind) {
 			f.modes = map[string]fs.FileMode{}
 		}
 		f.modes[DeveloperModeMarkerPath] = 0o644
+		requireMarkerOn(t, f)
 	}
 }
 
@@ -80,8 +82,10 @@ func startedOnTheNewTree(calls []string) (publish, revert int, started []string)
 // is wired or restarted on the new tree, and the error names the remedy. On a
 // first install there is nothing to revert to, so the install stops before
 // anything is wired or restarted.
+//
+// It runs on the production restart budgets, which the fake answers on the
+// first poll, so a loaded host cannot time it out.
 func TestDeveloperModeMarkerUnclearableRevertsTheSwap(t *testing.T) {
-	shrinkRestartBudgets(t)
 	stuck := func(f *fakeSystem) {
 		f.removeEntryErrs = map[string]error{DeveloperModeMarkerPath: errors.New("EPERM")}
 		f.chownErrs = map[string]error{DeveloperModeMarkerPath: errors.New("EPERM")}
@@ -92,7 +96,7 @@ func TestDeveloperModeMarkerUnclearableRevertsTheSwap(t *testing.T) {
 		if err := Install(context.Background(), f, stageCfg()); err != nil {
 			t.Fatalf("first Install: %v", err)
 		}
-		putUnclearableMarker(f, EntryRegular)
+		putUnclearableMarker(t, f, EntryRegular)
 		stuck(f)
 		f.putLoaded(NetdLabel, ServerLabel)
 		f.calls = nil
@@ -130,7 +134,7 @@ func TestDeveloperModeMarkerUnclearableRevertsTheSwap(t *testing.T) {
 
 	t.Run("a first install stops before anything is wired or restarted", func(t *testing.T) {
 		f := &fakeSystem{owners: map[string]OwnedEntry{}}
-		putUnclearableMarker(f, EntryRegular)
+		putUnclearableMarker(t, f, EntryRegular)
 		stuck(f)
 		cfg := stageCfg()
 		cfg.DeveloperMode = DeveloperModeOff
@@ -185,8 +189,10 @@ func (s *rereadFailsAfterChown) Owner(path string) (OwnedEntry, error) {
 // reads invalid, which never turns developer mode on), and a marker that is
 // not a regular file whose removal fails (never handed to nobody, and invalid
 // already).
+//
+// It runs on the production restart budgets, which the fake answers on the
+// first poll, so a loaded host cannot time it out.
 func TestDeveloperModeMarkerUnclearableEdgeCases(t *testing.T) {
-	shrinkRestartBudgets(t)
 	for _, tc := range []struct {
 		name string
 		kind EntryKind
@@ -208,7 +214,7 @@ func TestDeveloperModeMarkerUnclearableEdgeCases(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := &fakeSystem{owners: map[string]OwnedEntry{}}
-			putUnclearableMarker(f, tc.kind)
+			putUnclearableMarker(t, f, tc.kind)
 			f.removeEntryErrs = map[string]error{DeveloperModeMarkerPath: errors.New("EPERM")}
 			cfg := stageCfg()
 			cfg.DeveloperMode = DeveloperModeOff

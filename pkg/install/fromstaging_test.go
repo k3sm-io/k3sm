@@ -610,6 +610,9 @@ func (d devPosture) apply(t *testing.T, cfg *Config) {
 		marker.Mode = 0o666
 		f.owners[DeveloperModeMarkerPath] = marker
 	}
+	if d == devMarkerOn || d == devFlagOffMarkerOn {
+		requireMarkerOn(t, f)
+	}
 	if err := resolveDeveloperMode(f, cfg); err != nil {
 		t.Fatal(err)
 	}
