@@ -88,6 +88,8 @@ pin, its date, and the tarball's sha256.
 - `k3sm image prune` reads the cluster registry through the registry's own store code, read-only,
   and checks every manifest it reads against its digest; a repository whose manifests do not match
   is left alone. Deletions still go through the registry's API with the node's push credential.
+- The default mlx-serve image is now `0.5.0-k3sm.4`. A sharded `MLXModel` pod checks at start
+  that the engine's run body matches its pin, and the entrypoint exits with the engine's status.
 
 ### Fixed
 
