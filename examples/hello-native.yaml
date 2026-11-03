@@ -17,7 +17,7 @@
 #   kubectl apply -f examples/hello-native.yaml
 #   kubectl get pods -o wide        # Running on the k3sm darwin node
 #   kubectl logs hello-native
-#   pgrep -fl tail                  # the real native process on your Mac
+#   pgrep -fl hello-native          # the real native process on your Mac
 #   kubectl delete pod hello-native # the provider SIGKILLs the process group
 apiVersion: v1
 kind: Pod
@@ -42,9 +42,9 @@ spec:
     - name: hello
       image: native
       command:
-        - /bin/sh
+        - /bin/bash
         - -c
         - |
           echo 'hello from a k3sm native pod'
           /usr/bin/sw_vers
-          exec /usr/bin/tail -f /dev/null
+          exec -a hello-native /usr/bin/tail -f /dev/null
