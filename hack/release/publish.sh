@@ -784,7 +784,7 @@ image_root_problems() {
 }
 
 # detach_image: detach and remove the private mount point, if any.
-IMAGE_MNT="" IMAGE_ATTACHED=0
+IMAGE_MNT="" IMAGE_WORK="" IMAGE_ATTACHED=0
 detach_image() {
 	[ -n "$IMAGE_MNT" ] || return 0
 	if [ "$IMAGE_ATTACHED" = 1 ]; then
@@ -792,7 +792,8 @@ detach_image() {
 			echo "publish: could not detach $IMAGE_MNT" >&2
 	fi
 	rmdir "$IMAGE_MNT" 2>/dev/null || true
-	IMAGE_MNT="" IMAGE_ATTACHED=0
+	[ -z "$IMAGE_WORK" ] || rmdir "$IMAGE_WORK" 2>/dev/null || true
+	IMAGE_MNT="" IMAGE_WORK="" IMAGE_ATTACHED=0
 }
 
 # disk_image_problems <image> <tag> <team> <manifest>: the image-level checks,
@@ -809,8 +810,12 @@ disk_image_problems() {
 	xcrun stapler validate "$img" >/dev/null 2>&1 || { echo "    stapler validate rejects the image"; rc=1; }
 	spctl -a -t open --context context:primary-signature "$img" >/dev/null 2>&1 ||
 		{ echo "    spctl -a -t open --context context:primary-signature rejects the image"; rc=1; }
-	IMAGE_MNT="$(mktemp -d)"
-	chmod 700 "$IMAGE_MNT"
+	# The mount point is a subdirectory of a private work directory, never a
+	# direct child of the temp root, which Finder would sync as a mounted tree.
+	IMAGE_WORK="$(mktemp -d)"
+	chmod 700 "$IMAGE_WORK"
+	IMAGE_MNT="$IMAGE_WORK/mnt"
+	mkdir "$IMAGE_MNT"
 	trap detach_image EXIT
 	trap 'detach_image; exit 129' HUP
 	trap 'detach_image; exit 130' INT TERM
@@ -2077,10 +2082,16 @@ self_test() {
 	fi
 	mnt="$(sed -n 's/^hdiutil attach -readonly -nobrowse -noautoopen -mountpoint \([^ ]*\) .*/\1/p' "$log")"
 	if [ -n "$mnt" ] && grep -qx "hdiutil attach -readonly -nobrowse -noautoopen -mountpoint $mnt $img" "$log" &&
-		grep -qx "hdiutil detach $mnt" "$log" && [ ! -e "$mnt" ]; then
+		grep -qx "hdiutil detach $mnt" "$log" && [ ! -e "$mnt" ] && [ ! -e "$(dirname "$mnt")" ]; then
 		ok "the image is attached read-only, -nobrowse -noautoopen, at a private mount point, then detached and removed"
 	else
 		bad "hdiutil calls (mnt=$mnt, log: $(tr '\n' ';' <"$log"))"
+	fi
+	if [ -n "$mnt" ] && [ "$(dirname "$(dirname "$mnt")")" = "$(dirname "$(mktemp -u)")" ] &&
+		[ "$(dirname "$mnt")" != "$(dirname "$(mktemp -u)")" ]; then
+		ok "the mount point's parent is a private work directory, not the temp root"
+	else
+		bad "mount point $mnt sits directly in the temp root"
 	fi
 	if grep -qxF "codesign --verify --strict --deep -R=$(developer_id_requirement "$TEAM") $mnt/k3sm.app" "$log" &&
 		grep -qxF "codesign --verify --strict -R=$(developer_id_requirement "$TEAM") $img" "$log" &&
