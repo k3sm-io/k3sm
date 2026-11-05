@@ -296,7 +296,7 @@ func New(cfg Config) (*Server, error) {
 		respTimeout:   positive(cfg.ResponseTimeout, DefaultResponseTimeout),
 		minWriteRate:  positive(cfg.MinWriteRate, DefaultMinWriteRate),
 		spaceEvery:    spaceCheckEvery,
-		catalogPage:   defaultCatalogPage,
+		catalogPage:   defaultPage,
 		catalogMax:    maxPage,
 		catalogCeil:   catalogCeilingFactor,
 		catalogCap:    catalogCeilingMax,

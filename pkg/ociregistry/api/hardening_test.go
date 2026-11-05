@@ -373,7 +373,7 @@ func TestCatalogAsksOncePerVisit(t *testing.T) {
 	if asks.Load() != visits.Load()+1 {
 		t.Fatalf("%d asks for %d visits; want one per visit and one for the catalog", asks.Load(), visits.Load())
 	}
-	if visits.Load() > int64(catalogVisits(defaultCatalogPage)) {
+	if visits.Load() > int64(catalogVisits(defaultPage)) {
 		t.Fatalf("%d visits, over the budget of a default page", visits.Load())
 	}
 }

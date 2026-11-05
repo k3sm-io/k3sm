@@ -135,6 +135,9 @@ pin, its date, and the tarball's sha256.
   `kubectl create token` issued any lifetime under the same grant. A push with a longer token now
   gets a 401: run `k3sm registry login` again, or mint a new token with `k3sm registry token`. Other
   ServiceAccounts' tokens are not affected.
+- The built-in registry pages a tag list that names no `n`: it answers the first 1,000 tags with a
+  `Link` to the next page, as the catalog does, instead of every tag in one response. An explicit
+  `n` is unchanged.
 - `k3sm stop` and `k3sm uninstall` stop a `vm` helper whose path spells its version in a different
   case than the versions directory. It was reported as no longer retained and left running. A
   stray file or symlink named like a version no longer counts as a retained version.
