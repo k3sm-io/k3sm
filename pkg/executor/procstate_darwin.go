@@ -19,6 +19,8 @@ package executor
 import (
 	"bytes"
 	"errors"
+	"log/slog"
+	"sync"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -45,13 +47,33 @@ const pStatZombie = 5
 // A recycled PID likewise reports the live stranger as running, which is the
 // conservative verdict.
 func processExited(pid int) bool {
+	return processExitedVia(procSysctlRaw, pid)
+}
+
+// procSysctlRaw is the kernel read behind processExited, a seam so a test can
+// feed a record of any size or reap between two reads.
+var procSysctlRaw = func(pid int) ([]byte, error) {
+	return unix.SysctlRaw("kern.proc.pid", pid)
+}
+
+// procSizeWarnOnce limits the unexpected-record-size warning to one line per
+// process lifetime; procSizeWarn is the seam that emits it.
+var (
+	procSizeWarnOnce sync.Once
+	procSizeWarn     = func(got, want int) {
+		slog.Warn("kern.proc.pid returned an unexpected record size; process exit cannot be detected directly and children read as running",
+			"length", got, "expected", want)
+	}
+)
+
+func processExitedVia(read func(int) ([]byte, error), pid int) bool {
 	if pid <= 0 {
 		return false
 	}
 	// kern.proc.pid for a PID that has left the process table succeeds with a
 	// ZERO-length read (it is not an error), so the length — not the error — is
 	// what says "gone". ESRCH is the same verdict by a different path.
-	raw, err := unix.SysctlRaw("kern.proc.pid", pid)
+	raw, err := read(pid)
 	if err != nil {
 		return errors.Is(err, unix.ESRCH)
 	}
@@ -67,6 +89,7 @@ func processExited(pid int) bool {
 		copy((*[unix.SizeofKinfoProc]byte)(unsafe.Pointer(&kp))[:], raw)
 		return kp.Proc.P_stat == pStatZombie
 	default:
+		procSizeWarnOnce.Do(func() { procSizeWarn(len(raw), unix.SizeofKinfoProc) })
 		return false
 	}
 }
