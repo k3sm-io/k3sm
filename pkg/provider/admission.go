@@ -329,10 +329,12 @@ func (r *runtimedRuntime) admitDoneLocked(id string) {
 }
 
 // awaitUpdateVerdictLocked holds an UpdatePod until the pod's admission has a
-// verdict the update can read from the track: while a create admission let through
-// has not published a track, and while a fence release frees what the pod's UID
-// holds, it waits. It returns ctx's error if ctx ends first. The caller holds r.mu
-// on entry and on every return; the wait itself runs with r.mu released.
+// verdict the update can read from the track. It waits while a create admission let
+// through has no track yet when the update looks, and while a fence release frees
+// what the pod's UID holds. A waiter is woken only when the last admitted create
+// returns, not when that create publishes its track, so a slow runtime call delays
+// it by the same amount. It returns ctx's error if ctx ends first. The caller holds
+// r.mu on entry and on every return; the wait itself runs with r.mu released.
 func (r *runtimedRuntime) awaitUpdateVerdictLocked(ctx context.Context, pod *corev1.Pod) error {
 	id := string(pod.UID)
 	for {
