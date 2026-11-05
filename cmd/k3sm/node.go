@@ -1259,6 +1259,10 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	// same reason: the controller reads it only from a node that is Ready.
 	stopRotationReport := startAdminTokenRotationReport(ctx, opts, cs, slog.Default())
 	defer timedTeardownStep(slog.Default(), "admin-token-rotation-report", stopRotationReport)
+	// The budget publisher writes this node's own Node annotation too, and reads
+	// the relayed policy from it, so it starts at the same point.
+	stopBudgetPublisher := startBudgetPublisher(ctx, opts, cs, nodeStatus, slog.Default())
+	defer timedTeardownStep(slog.Default(), "budget-publisher", stopBudgetPublisher)
 	slog.Default().Info(fmt.Sprintf("k3sm node %q ready (runtime=%s listen=%s pod-root=%s pod-logs-dir=%s)", opts.nodeName, runtimeLabel, opts.listen, opts.podRoot, opts.logs.dir))
 
 	return awaitNodeExit(ctx, errc, stopRuntime)

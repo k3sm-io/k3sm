@@ -12,6 +12,12 @@ pin, its date, and the tarball's sha256.
 
 ### Added
 
+- A node publishes its budget as the `budget.k3sm.io/status` annotation on its own Node, in a coarse
+  form, only when that form changes and at most once a minute at every level. It reads
+  `budget.k3sm.io/policy` from the same Node, keeps the last valid policy when one is refused and
+  reports that as `rejected`, and reports `clamped` when it clamps a reserve above the measured value
+  or a tier-1 timer past its floor. No RBAC changes. Nothing writes the policy annotation yet, and a
+  policy's values are held but not yet acted on.
 - `k3sm status -o json` carries this node's budget as an optional `budget` object (pressure level,
   admission, each signal against its rungs, and the headroom recommendation), in the schema of
   `NodeBudget.status`. `schemaVersion` stays `1`. [Status JSON](docs/user/status-json.md#budget)
