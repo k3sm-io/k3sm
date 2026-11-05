@@ -2135,6 +2135,9 @@ func (r *runtimedRuntime) completeCreate(pod *corev1.Pod, t *podTrack, rs *runti
 // recreate and are reported by the runtime as a typed precondition failure,
 // surfaced here as an error. A refused ephemeral append is the exception: it is
 // reported on the debug container, never as the pod's failure.
+//
+// A pod refused at admission or evicted is terminal and gets no update, as it
+// gets no create: nothing is registered, allocated or sent to the runtime.
 func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error {
 	// Identity binding kept for the SAME in-process seam CreatePod uses, but
 	// UpdatePod itself never mints a token or re-reads a ConfigMap/Secret
@@ -2151,12 +2154,23 @@ func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error 
 	// ConfigMap/Secret key refs) legitimately re-runs on every box build, and
 	// this seam is kept uniform for CreatePod and UpdatePod rather than split.
 	ctx = withPodIdentity(ctx, pod)
-	// A spec change (an ephemeral container added) can add references; the
-	// registration is replaced, so a removed reference stops being fetchable.
-	r.refs.RegisterPod(pod)
 	id := string(pod.UID)
 	r.mu.Lock()
 	t, tracked := r.track[id]
+	if tracked && t.evictedStatus() != nil {
+		// Virtual Kubelet reaches here when a refused or evicted pod's labels,
+		// annotations, images or tolerations change. A refused pod holds nothing
+		// and its delete (forgetRejected) frees nothing, so anything acquired
+		// below would stay held until the daemon restarts; runtimed has already
+		// forgotten an evicted pod, so the RPC could only fail. The tracked spec
+		// stays too: an eviction whose teardown fails is rolled back, and the
+		// difference brings the update back for the pod that is still running.
+		r.mu.Unlock()
+		return nil
+	}
+	// A spec change (an ephemeral container added) can add references; the
+	// registration is replaced, so a removed reference stops being fetchable.
+	r.refs.RegisterPod(pod)
 	var previous *corev1.Pod
 	if tracked {
 		previous = t.pod
