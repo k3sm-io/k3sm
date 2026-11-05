@@ -111,6 +111,14 @@ pin, its date, and the tarball's sha256.
   `MANIFEST_UNKNOWN` (it was 400 `MANIFEST_INVALID`), as the OCI conformance suite expects. PUT
   and DELETE still answer 400, and an anonymous request is answered 401 before the reference
   is parsed.
+- The node budget's default warn rungs move. Available memory warns at the larger of 1 GiB and 11%
+  of memory (was 12%), the memory compressor at 56% of its limit (was 50%), and swap growth at a
+  512 MiB rise within 60 s, with admit-stop at 1 GiB and critical at 2 GiB (were 256 MiB, 512 MiB
+  and 1 GiB). This does not change when a Pod is evicted: eviction does not read these rungs, and
+  the evict-soft and evict-hard rungs stay where they were. `SoftPressure` goes True later, except
+  on available memory on an 8 GiB Mac, where the 1 GiB floor still sets the rung, and a Pod
+  annotated `budget.k3sm.io/band: batch` is refused for swap growth only from the higher critical
+  rung.
 
 ### Fixed
 
