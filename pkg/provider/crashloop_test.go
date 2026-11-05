@@ -873,6 +873,7 @@ func TestRefusedRestartIsVisible(t *testing.T) {
 
 			// Once runtimed restarts it, the refusal text is gone from the surface.
 			f.setRestartResp(nil)
+			waitRestart(t, "the retry timer re-armed after the second refusal", clk.HasWaiters)
 			clk.Step(60 * time.Second)
 			waitRestart(t, "the successful RestartContainer call", func() bool {
 				tr.restartMu.Lock()

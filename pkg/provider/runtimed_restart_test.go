@@ -54,6 +54,19 @@ func waitRestart(t *testing.T, what string, cond func() bool) {
 	t.Fatalf("timed out waiting for %s", what)
 }
 
+// restartScheduled reports whether the container has a re-exec worker in
+// flight. The decision to schedule one is taken synchronously under restartMu
+// (scheduleRestartLocked sets attempt before it starts the goroutine), so a
+// false here is the positive proof that no worker was launched, unlike
+// clk.HasWaiters, which a goroutine that has not yet reached its timer
+// satisfies vacuously.
+func restartScheduled(tr *podTrack, name string) bool {
+	tr.restartMu.Lock()
+	defer tr.restartMu.Unlock()
+	cr := tr.restarts[name]
+	return cr != nil && cr.attempt
+}
+
 // settleRestartCalls asserts the fake's RestartContainer count stays at want
 // over a short settle window (catches a double-scheduled re-exec whose second
 // timer would fire on the same clock step).
@@ -261,8 +274,8 @@ func TestJobBackoffAndCompletionAccounting(t *testing.T) {
 		if st.ContainerStatuses[0].State.Terminated == nil {
 			t.Errorf("state = %+v, want terminated pass-through (no CrashLoopBackOff overlay)", st.ContainerStatuses[0].State)
 		}
-		if clk.HasWaiters() {
-			t.Error("a re-exec timer was armed for a Never pod")
+		if restartScheduled(tr, "c0") || clk.HasWaiters() {
+			t.Error("a re-exec was scheduled for a Never pod")
 		}
 		settleRestartCalls(t, f, 0)
 	})
@@ -402,7 +415,7 @@ func TestRestartTriggerIdempotent(t *testing.T) {
 
 	// A STALE re-delivery of the already-handled termination stays latched.
 	r.buildStatus(pod.DeepCopy(), tr, exit1, nil)
-	if clk.HasWaiters() {
+	if restartScheduled(tr, "c0") || clk.HasWaiters() {
 		t.Error("a stale re-delivery re-armed the re-exec timer")
 	}
 	settleRestartCalls(t, f, 1)

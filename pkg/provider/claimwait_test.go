@@ -341,11 +341,28 @@ func TestHeldPodDeleteStopsTheWait(t *testing.T) {
 		t.Fatalf("CreatePod: %v", err)
 	}
 	waitFor(t, "the worker to wait", clk.HasWaiters)
+	held := r.trackByID(string(pod.UID))
+	if held == nil {
+		t.Fatal("setup: the held pod is not tracked")
+	}
+	held.restartMu.Lock()
+	worker := held.claims
+	held.restartMu.Unlock()
+	if worker == nil {
+		t.Fatal("setup: the held pod has no claim worker")
+	}
 	if err := r.DeletePod(context.Background(), pod); err != nil {
 		t.Fatalf("DeletePod: %v", err)
 	}
 	if tr := r.trackByID(string(pod.UID)); tr != nil {
 		t.Fatal("a deleted held pod is still tracked")
+	}
+	// The positive barrier: the worker has returned, so the step below has no
+	// goroutine left to wake and the absence of a create needs no window.
+	select {
+	case <-worker.done:
+	default:
+		t.Fatal("the held pod's claim worker is still running after DeletePod")
 	}
 	if _, err := cs.CoreV1().PersistentVolumes().Create(context.Background(), localPV(t, r), metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
@@ -354,7 +371,6 @@ func TestHeldPodDeleteStopsTheWait(t *testing.T) {
 		t.Fatal(err)
 	}
 	clk.Step(time.Minute)
-	time.Sleep(20 * time.Millisecond)
 	if n := f.createCount(); n != 0 {
 		t.Fatalf("runtimed CreatePod called %d times after the held pod was deleted; want 0", n)
 	}
