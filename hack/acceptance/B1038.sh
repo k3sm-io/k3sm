@@ -25,6 +25,12 @@
 #   TestStrayEntries      (pkg/ociregistry/api) that layout check is not vacuous
 #   TestWalkRepositories, TestIndexVersion (pkg/ociregistry/store) the lexical
 #                         walk that stops at the page and the index version
+#   FuzzConditionalDelete (pkg/ociregistry/api) every committed seed: any
+#                         If-Match on a DELETE, by digest above all: no 5xx, no
+#                         panic, nothing outside the store, no tagged or
+#                         index-named row removed
+#   TestSpaceSharePerPrincipal (pkg/ociregistry/api) one principal cannot hold
+#                         the whole shared space reservation
 #   TestCatalogAsksOncePerVisit (pkg/ociregistry/api) the Authorizer hook needs
 #                         no list form: the visit budget bounds its calls
 #   TestSessionShare      (pkg/ociregistry/auth) one principal cannot take the
@@ -58,6 +64,10 @@ corpus=pkg/ociregistry/api/testdata/fuzz/FuzzHandlers
 [ -d "$corpus" ] || { echo "B1038: FAIL: $corpus is missing"; exit 1; }
 seeds="$(find "$corpus" -type f -name 'seed-*' | wc -l | tr -d ' ')"
 [ "$seeds" -ge 30 ] || { echo "B1038: FAIL: only $seeds committed FuzzHandlers seeds"; exit 1; }
+delcorpus=pkg/ociregistry/api/testdata/fuzz/FuzzConditionalDelete
+[ -d "$delcorpus" ] || { echo "B1038: FAIL: $delcorpus is missing"; exit 1; }
+delseeds="$(find "$delcorpus" -type f -name 'seed-*' | wc -l | tr -d ' ')"
+[ "$delseeds" -ge 20 ] || { echo "B1038: FAIL: only $delseeds committed FuzzConditionalDelete seeds"; exit 1; }
 
 # run <package> <regexp> <test>... runs the tests and requires each to pass by name.
 out=""
@@ -87,9 +97,11 @@ done
 ran="$(printf '%s\n' "$out" | grep -c -- '--- PASS: FuzzHandlers/seed-')"
 [ "$ran" -eq "$seeds" ] || { echo "B1038: FAIL: $ran of $seeds FuzzHandlers seeds ran"; exit 1; }
 
-run ./pkg/ociregistry/api/ '^(TestCatalogAsksOncePerVisit|TestBlobFloor|TestFloorWriter|TestBodyFloorWindow|TestUploadSpaceIsHeldInAggregate|TestCommitForgetsTheSessionOnAPanic|TestConditionalDelete)$' \
-	TestCatalogAsksOncePerVisit TestBlobFloor TestFloorWriter TestBodyFloorWindow TestUploadSpaceIsHeldInAggregate TestCommitForgetsTheSessionOnAPanic TestConditionalDelete
+run ./pkg/ociregistry/api/ '^(FuzzConditionalDelete|TestSpaceSharePerPrincipal|TestCatalogAsksOncePerVisit|TestBlobFloor|TestFloorWriter|TestBodyFloorWindow|TestUploadSpaceIsHeldInAggregate|TestCommitForgetsTheSessionOnAPanic|TestConditionalDelete)$' \
+	FuzzConditionalDelete TestSpaceSharePerPrincipal TestCatalogAsksOncePerVisit TestBlobFloor TestFloorWriter TestBodyFloorWindow TestUploadSpaceIsHeldInAggregate TestCommitForgetsTheSessionOnAPanic TestConditionalDelete
 printf '%s\n' "$out" | grep -q -- '--- PASS: TestConditionalDelete/a_conditional_digest_DELETE_refuses_a_digest_a_row_tags' || { echo "B1038: FAIL: the tagged-digest refusal did not pass"; exit 1; }
+ran="$(printf '%s\n' "$out" | grep -c -- '--- PASS: FuzzConditionalDelete/seed-')"
+[ "$ran" -eq "$delseeds" ] || { echo "B1038: FAIL: $ran of $delseeds FuzzConditionalDelete seeds ran"; exit 1; }
 run ./pkg/ociregistry/auth/ '^TestSessionShare$' TestSessionShare
 run ./pkg/registrysvc/ '^TestPruneThroughTheStore$' TestPruneThroughTheStore
 printf '%s\n' "$out" | grep -q -- '--- PASS: TestPruneThroughTheStore/a_prune_concurrent_with_a_push_does_not_lose_the_pushed_tag' || { echo "B1038: FAIL: the concurrent prune did not pass"; exit 1; }
