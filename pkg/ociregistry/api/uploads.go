@@ -190,7 +190,7 @@ func (s *Server) startUpload(w http.ResponseWriter, r *http.Request, n ref.Name)
 	if hasDigest {
 		need = r.ContentLength
 	}
-	if err := s.roomFor(need); err != nil {
+	if err := s.roomFor(s.owner(r), need); err != nil {
 		s.fail(w, r, err)
 		return
 	}
@@ -254,45 +254,74 @@ func (s *Server) mount(w http.ResponseWriter, r *http.Request, n ref.Name, mount
 // would become, shorter of space than MinFreeSpace.
 var errInsufficientSpace = errors.New("insufficient free space")
 
-// roomFor refuses an upload of need bytes (0 or less when the length is not
-// known) unless the store volume keeps MinFreeSpace free after it and after
-// what the bodies in flight have reserved. It reserves nothing: claim does,
-// when a body starts to arrive. The answer never says how much space there is.
-func (s *Server) roomFor(need int64) error {
-	s.spaceMu.Lock()
-	defer s.spaceMu.Unlock()
-	return s.roomLocked(max(need, 0))
+// owner names r's principal for the session and space shares, "" when the
+// server has no Principal hook or the hook names none.
+func (s *Server) owner(r *http.Request) string {
+	if s.principal == nil {
+		return ""
+	}
+	return s.principal(r)
 }
 
-// roomLocked is roomFor with spaceMu held.
-func (s *Server) roomLocked(need int64) error {
+// roomFor refuses an upload of need bytes for principal owner (0 or less when
+// the length is not known) unless the store volume keeps MinFreeSpace free
+// after it and after what the bodies in flight have reserved, and unless a
+// named owner stays within its share of that room. It reserves nothing: claim
+// does, when a body starts to arrive. The answer never says how much space
+// there is.
+func (s *Server) roomFor(owner string, need int64) error {
+	s.spaceMu.Lock()
+	defer s.spaceMu.Unlock()
+	return s.roomLocked(owner, max(need, 0))
+}
+
+// roomLocked is roomFor with spaceMu held. The share applies only to a request
+// for more bytes: a body already holding its share is not refused because free
+// space fell, unless what is reserved no longer fits at all.
+func (s *Server) roomLocked(owner string, need int64) error {
 	free, err := s.freeSpace()
 	if err != nil {
 		return fmt.Errorf("%w: %w", errInsufficientSpace, err)
 	}
-	if free < s.minFree || uint64(s.spaceHeld+need) > free-s.minFree {
+	if free < s.minFree {
+		return fmt.Errorf("%w: %d bytes free, %d kept", errInsufficientSpace, free, s.minFree)
+	}
+	room := free - s.minFree
+	if uint64(s.spaceHeld+need) > room {
 		return fmt.Errorf("%w: %d bytes free, %d kept, %d held, %d asked", errInsufficientSpace, free, s.minFree, s.spaceHeld, need)
+	}
+	if owner != "" && need > 0 && uint64(s.spaceHeldBy[owner]+need) > room-room/4 {
+		return fmt.Errorf("%w: principal %s holds %d of %d bytes of room, %d asked", errInsufficientSpace, owner, s.spaceHeldBy[owner], room, need)
 	}
 	return nil
 }
 
-// claim reserves need bytes for a body in flight, refusing as roomFor does.
-// A claim of 0 only checks that what is already reserved still fits.
-func (s *Server) claim(need int64) error {
+// claim reserves need bytes for a body of principal owner in flight, refusing
+// as roomFor does. A claim of 0 only checks that what is already reserved still
+// fits.
+func (s *Server) claim(owner string, need int64) error {
 	s.spaceMu.Lock()
 	defer s.spaceMu.Unlock()
-	if err := s.roomLocked(need); err != nil {
+	if err := s.roomLocked(owner, need); err != nil {
 		return err
 	}
 	s.spaceHeld += need
+	if owner != "" && need > 0 {
+		s.spaceHeldBy[owner] += need
+	}
 	return nil
 }
 
-// unclaim gives back n reserved bytes.
-func (s *Server) unclaim(n int64) {
+// unclaim gives back n bytes principal owner reserved.
+func (s *Server) unclaim(owner string, n int64) {
 	s.spaceMu.Lock()
+	defer s.spaceMu.Unlock()
 	s.spaceHeld -= n
-	s.spaceMu.Unlock()
+	if owner != "" {
+		if s.spaceHeldBy[owner] -= n; s.spaceHeldBy[owner] <= 0 {
+			delete(s.spaceHeldBy, owner)
+		}
+	}
 }
 
 // tooLarge refuses a body whose known length alone passes MaxUploadSize.
@@ -315,6 +344,7 @@ func (s *Server) tooLarge(r *http.Request) error {
 type spaceReader struct {
 	r     io.Reader
 	s     *Server
+	owner string
 	every int64
 	// left is what a known length has yet to bring; negative when unknown.
 	left    int64
@@ -326,7 +356,7 @@ type spaceReader struct {
 
 func (sr *spaceReader) Read(p []byte) (int, error) {
 	if give := min(sr.last, sr.held); give > 0 {
-		sr.s.unclaim(give)
+		sr.s.unclaim(sr.owner, give)
 		sr.held -= give
 	}
 	sr.last = 0
@@ -346,7 +376,7 @@ func (sr *spaceReader) Read(p []byte) (int, error) {
 		check = true
 	}
 	if check {
-		if err := sr.s.claim(need); err != nil {
+		if err := sr.s.claim(sr.owner, need); err != nil {
 			return 0, err
 		}
 		sr.held += need
@@ -364,7 +394,7 @@ func (sr *spaceReader) Read(p []byte) (int, error) {
 // done gives back whatever is still reserved.
 func (sr *spaceReader) done() {
 	if sr.held > 0 {
-		sr.s.unclaim(sr.held)
+		sr.s.unclaim(sr.owner, sr.held)
 	}
 	sr.held, sr.last = 0, 0
 }
@@ -384,11 +414,7 @@ func (s *Server) newSession(r *http.Request, n ref.Name) (string, error) {
 // before the file exists, so the cap holds while the store creates it; it is
 // given back on every other way out, a panic included.
 func (s *Server) admitSession(r *http.Request, n ref.Name) (string, *session, func(), error) {
-	owner := ""
-	if s.principal != nil {
-		owner = s.principal(r)
-	}
-	e, release, err := s.sessions.admit(owner)
+	e, release, err := s.sessions.admit(s.owner(r))
 	if err != nil {
 		return "", nil, nil, err
 	}
@@ -513,7 +539,7 @@ func (s *Server) appendChunk(r *http.Request, w http.ResponseWriter, n ref.Name,
 	if s.chunkAppending != nil {
 		s.chunkAppending()
 	}
-	body := &spaceReader{r: s.body(w, r), s: s, every: s.spaceEvery, left: r.ContentLength}
+	body := &spaceReader{r: s.body(w, r), s: s, owner: s.owner(r), every: s.spaceEvery, left: r.ContentLength}
 	defer body.done()
 	tee := e.hash.writer()
 	newLen, err := s.st.AppendUploadLimit(r.Context(), n, id, offset, s.maxUpload, io.TeeReader(body, tee))
@@ -566,7 +592,7 @@ func (s *Server) patchUpload(w http.ResponseWriter, r *http.Request, n ref.Name)
 		err = s.tooLarge(r)
 	}
 	if err == nil {
-		err = s.roomFor(r.ContentLength)
+		err = s.roomFor(s.owner(r), r.ContentLength)
 	}
 	if err != nil {
 		s.fail(w, r, err)
@@ -614,7 +640,7 @@ func (s *Server) finishUpload(w http.ResponseWriter, r *http.Request, n ref.Name
 	if err == nil && chunk {
 		err = s.tooLarge(r)
 		if err == nil {
-			err = s.roomFor(r.ContentLength)
+			err = s.roomFor(s.owner(r), r.ContentLength)
 		}
 	}
 	if err != nil {

@@ -160,6 +160,114 @@ func TestUploadSpaceIsHeldInAggregate(t *testing.T) {
 	}
 }
 
+// TestSpaceSharePerPrincipal proves one principal cannot hold the whole shared
+// reservation: a writer that declares a large Content-Length and trickles would
+// otherwise answer every other principal 507 until the body floor cut it. It
+// covers both paths a body takes, a chunk and a monolithic upload, and pins
+// that a mount, which reads no body, needs no room.
+func TestSpaceSharePerPrincipal(t *testing.T) {
+	const kept, spare = 1000, 100
+	const who = "X-Test-Principal"
+	newF := func(t *testing.T) (*fixture, *atomic.Uint64) {
+		free := &atomic.Uint64{}
+		free.Store(kept + spare)
+		f := newFixture(t, func(c *Config) {
+			c.MinFreeSpace = kept
+			c.FreeSpace = func() (uint64, error) { return free.Load(), nil }
+			c.Principal = func(r *http.Request) string { return r.Header.Get(who) }
+		})
+		f.srv.spaceEvery = 60
+		return f, free
+	}
+	// start serves r with body and returns once its first read happened or
+	// its answer is in, whichever comes first.
+	start := func(t *testing.T, f *fixture, r *http.Request, body *parkedBody, length int64, principal string) <-chan *httptest.ResponseRecorder {
+		t.Helper()
+		r.ContentLength = length
+		r.Header.Set(who, principal)
+		answer := make(chan *httptest.ResponseRecorder, 1)
+		t.Cleanup(func() {
+			select {
+			case <-body.release:
+			default:
+				close(body.release)
+			}
+		})
+		go func() { answer <- f.serve(r) }()
+		select {
+		case <-body.parked:
+		case w := <-answer:
+			answer <- w
+		}
+		return answer
+	}
+	patch := func(t *testing.T, f *fixture, n int, principal string) *httptest.ResponseRecorder {
+		t.Helper()
+		return f.do(http.MethodPatch, f.newSessionLoc(t), bytes.Repeat([]byte("k"), n), who, principal)
+	}
+
+	t.Run("a declared length past the share is refused and leaves the others their room", func(t *testing.T) {
+		f, _ := newF(t)
+		body := newParked(1, spare-1)
+		answer := start(t, f, chunked(http.MethodPatch, f.newSessionLoc(t), body), body, spare, "gate")
+		select {
+		case <-body.parked:
+			t.Errorf("a %d-byte declaration holds the whole room of %d", spare, spare)
+		default:
+			want(t, <-answer, http.StatusInsufficientStorage, codeSizeInvalid)
+		}
+		want(t, patch(t, f, 25, "k3sm"), http.StatusAccepted, "")
+	})
+	t.Run("a chunk trickling at its share leaves the others the rest", func(t *testing.T) {
+		f, _ := newF(t)
+		body := newParked(1, 74)
+		answer := start(t, f, chunked(http.MethodPatch, f.newSessionLoc(t), body), body, 75, "gate")
+		<-body.parked
+		// A second body of the same principal shares its share. The parked
+		// body may have given back the one byte it delivered, so ask for two.
+		want(t, patch(t, f, 2, "gate"), http.StatusInsufficientStorage, codeSizeInvalid)
+		want(t, patch(t, f, 25, "k3sm"), http.StatusAccepted, "")
+		close(body.release)
+		want(t, <-answer, http.StatusAccepted, "")
+		want(t, patch(t, f, 75, "gate"), http.StatusAccepted, "")
+	})
+	t.Run("a monolithic upload holds the share through the same reader", func(t *testing.T) {
+		f, _ := newF(t)
+		body := newParked(1, 74)
+		whole := append(bytes.Clone(body.first), body.rest...)
+		answer := start(t, f, chunked(http.MethodPost, "/v2/app/blobs/uploads/?digest="+dg(whole).String(), body), body, 75, "gate")
+		<-body.parked
+		two := []byte("xy")
+		want(t, f.do(http.MethodPost, "/v2/app/blobs/uploads/?digest="+dg(two).String(), two, who, "gate"), http.StatusInsufficientStorage, codeSizeInvalid)
+		want(t, patch(t, f, 25, "k3sm"), http.StatusAccepted, "")
+		close(body.release)
+		want(t, <-answer, http.StatusCreated, "")
+		// Refused past the share, a monolithic upload leaves no session.
+		big := bytes.Repeat([]byte("b"), 76)
+		f2, _ := newF(t)
+		want(t, f2.do(http.MethodPost, "/v2/app/blobs/uploads/?digest="+dg(big).String(), big, who, "gate"), http.StatusInsufficientStorage, codeSizeInvalid)
+		f2.noUploads(t)
+	})
+	t.Run("a mount reads no body and needs no room", func(t *testing.T) {
+		f, free := newF(t)
+		d := f.pushBlob(t, "src", []byte("mount me"))
+		free.Store(kept)
+		w := f.do(http.MethodPost, "/v2/app/blobs/uploads/?mount="+d.String()+"&from=src", nil, who, "gate")
+		want(t, w, http.StatusCreated, "")
+	})
+	t.Run("a share is given back when the body ends", func(t *testing.T) {
+		f, _ := newF(t)
+		for range 3 {
+			want(t, patch(t, f, 75, "gate"), http.StatusAccepted, "")
+		}
+		f.srv.spaceMu.Lock()
+		defer f.srv.spaceMu.Unlock()
+		if f.srv.spaceHeld != 0 || len(f.srv.spaceHeldBy) != 0 {
+			t.Fatalf("held %d, by principal %v", f.srv.spaceHeld, f.srv.spaceHeldBy)
+		}
+	})
+}
+
 // TestBodyFloorWindow pins what the request body floor counts: a wait before
 // the first read (the session's lock) is not the client's, the overall deadline
 // still runs through it, and windows are consecutive, as the doc now says.
@@ -335,6 +443,9 @@ func TestCatalogAsksOncePerVisit(t *testing.T) {
 	}
 	layRepos(t, f.root, names)
 	want(t, f.do(http.MethodGet, "/v2/_catalog", nil), http.StatusOK, "")
+	if visits.Load() == 0 {
+		t.Fatal("the catalog visited nothing, so the count below proves nothing")
+	}
 	if asks.Load() != visits.Load()+1 {
 		t.Fatalf("%d asks for %d visits; want one per visit and one for the catalog", asks.Load(), visits.Load())
 	}

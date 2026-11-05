@@ -55,7 +55,9 @@ limitations under the License.
 //     (store.IndexState of its rows, as a quoted entity tag), compared under
 //     the repository lock; a state that no longer holds is 412 and deletes
 //     nothing, and so is a conditional DELETE by digest of a digest any row
-//     tags. The registry this replaces ignores If-Match;
+//     tags. That refusal protects only a client that sends If-Match: a DELETE
+//     by digest without it removes every row of the digest, tags included, as
+//     above. The registry this replaces ignores If-Match;
 //   - blobs are never deleted through the API; garbage collection removes
 //     them.
 //
@@ -91,9 +93,11 @@ limitations under the License.
 //     client makes up takes no slot. Where Config.Principal is set, one
 //     principal holds at most MaxSessionsPerPrincipal of them, three quarters
 //     by default, so the push gate's relayed writers cannot shut out the local
-//     CLI, or the reverse. A session the server finds on disk rather than
-//     creates has no owner and counts only against the total. The principals
-//     are not told apart further: writers behind the gate share its share;
+//     CLI, or the reverse. Two gaps remain. A session the server finds on disk
+//     rather than creates (one from before a restart) has no owner and counts
+//     only against the total. And the gate is one principal, so the writers
+//     behind it get no isolation from each other: one of them can spend the
+//     whole of the gate's share, of sessions and of reserved space alike;
 //   - an upload session holds at most MaxUploadSize bytes: a known length over
 //     it is refused before a write, and a chunk of unknown length that would
 //     pass it is refused with 413 and cut back, so no byte past the cap stays;
@@ -101,8 +105,15 @@ limitations under the License.
 //     MinFreeSpace free. Bodies in flight are counted together: each reserves
 //     its known length, or 64 MiB at a time, and gives bytes back as the store
 //     writes them, so N sessions cannot undershoot the floor by N times 64 MiB.
-//     Free space itself is read again every 64 MiB. The reservation covers
-//     upload bodies only, this server's only, and is as current as statfs;
+//     Free space itself is read again every 64 MiB. A chunk and a monolithic
+//     upload reserve this way; a mount reads no body and adds no bytes, and a
+//     manifest PUT reads at most 4 MiB and reserves nothing. Other writers on
+//     the volume are seen only through statfs. Where Config.Principal is set,
+//     one principal may hold at most three quarters of the room above
+//     MinFreeSpace, so a writer that declares a large Content-Length and
+//     trickles cannot answer every other principal 507 until the body floor
+//     cuts it. The trade is that a principal's single upload needing more than
+//     that share of the room is refused 507 although it would fit;
 //   - a request body must bring BodyMinBytes in each BodyWindow, may not go
 //     BodyIdle without a byte, and may not run past UploadTimeout (408). The
 //     first window opens at the first read, after any wait for the session's
@@ -114,8 +125,9 @@ limitations under the License.
 //     write timeout, so a large blob GET is not cut while it moves. A blob GET
 //     larger than a ResponseTimeout at MinWriteRate must deliver that much in
 //     each ResponseTimeout, so a reader that stalls gives back its descriptor
-//     within ResponseTimeout rather than after the whole size's time; there is
-//     no cap on concurrent GETs beyond MaxConns;
+//     within ResponseTimeout rather than after the whole size's time. Such a
+//     client finds the connection cut and resumes with a Range request. There
+//     is no cap on concurrent GETs beyond MaxConns;
 //   - HTTPServer serves at most MaxConns connections at once and closes one
 //     past that before a request is read; it reports each connection's end
 //     (closed or hijacked) to ConnClosed, so an Authorizer that keys state on
@@ -139,6 +151,10 @@ limitations under the License.
 // Access decisions belong to the Authorizer the caller supplies, which New
 // requires (AllowAll is the explicit open registry); the package classifies
 // each request as a read, a write or a delete (an upload cancel is a delete).
+// A request Config.Principal names no principal for takes neither share. The
+// registry's own access check allows no write without a verified credential,
+// so every session and reservation it admits is a named principal's; only a
+// server built with an open Authorizer has unnamed writers.
 // The catalog asks it once per repository it visits, and the hook has no list
 // form on purpose: the visit budget and ceiling already bound the calls, and
 // the access model the registry runs with decides by verb and principal, at

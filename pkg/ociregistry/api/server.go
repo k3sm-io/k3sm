@@ -147,7 +147,9 @@ type Config struct {
 	MaxSessions int
 	// Principal, when set, names the principal of a request the Authorizer
 	// has allowed, "" for none. Each named principal then holds at most
-	// MaxSessionsPerPrincipal of the MaxSessions.
+	// MaxSessionsPerPrincipal of the MaxSessions, and at most three quarters
+	// of the room above MinFreeSpace in reserved upload bytes. A request it
+	// names no principal for has neither limit.
 	Principal func(*http.Request) string
 	// MaxSessionsPerPrincipal is one named principal's share of MaxSessions
 	// (three quarters of MaxSessions, at least one, when zero).
@@ -222,10 +224,12 @@ type Server struct {
 	sessions      *sessions
 	principal     func(*http.Request) string
 	// spaceMu guards spaceHeld, the bytes in-flight upload bodies have
-	// reserved and not yet delivered to the store.
-	spaceMu   sync.Mutex
-	spaceHeld int64
-	router    *mux.Router
+	// reserved and not yet delivered to the store, and spaceHeldBy, the part
+	// of it each named principal holds.
+	spaceMu     sync.Mutex
+	spaceHeld   int64
+	spaceHeldBy map[string]int64
+	router      *mux.Router
 	// catalogPage and catalogMax are the catalog's default and largest page.
 	catalogPage, catalogMax int
 	// catalogCeil is the catalog walk's hard ceiling as a multiple of its
@@ -307,6 +311,7 @@ func New(cfg Config) (*Server, error) {
 		maxConns:      positive(cfg.MaxConns, DefaultMaxConns),
 		connClosed:    cfg.ConnClosed,
 		principal:     cfg.Principal,
+		spaceHeldBy:   map[string]int64{},
 		setWriteDeadline: func(w http.ResponseWriter, t time.Time) {
 			_ = http.NewResponseController(w).SetWriteDeadline(t) // ErrNotSupported off a real connection
 		},
