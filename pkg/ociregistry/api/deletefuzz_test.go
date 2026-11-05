@@ -22,7 +22,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"k3sm.io/k3sm/pkg/ociregistry/store"
 )
@@ -38,30 +37,27 @@ import (
 // manifest an index names, whatever the condition says. FuzzHandlers does not
 // reach this: it has no If-Match input.
 func FuzzConditionalDelete(f *testing.F) {
+	// The store every input starts from, pushed once and cloned per input.
+	seeded := newFixture(f)
+	tagged := seeded.image(f, "app", "v1", "tagged")
+	untagged := seeded.image(f, "app", "", "untagged")
+	child := seeded.image(f, "app", "", "child")
+	index := seeded.index(f, "app", "idx", child)
+	rows := seeded.rows(f, "app")
+	state, err := store.IndexState(rows)
+	if err != nil {
+		f.Fatal(err)
+	}
+
 	f.Fuzz(func(t *testing.T, target uint8, ifMatch, rawRef string) {
 		if len(ifMatch) > 4096 || len(rawRef) > 512 {
 			t.Skip("over the input bounds")
 		}
 		base := t.TempDir()
 		work := filepath.Join(base, "work")
-		st, err := store.OpenWorkDir(work)
-		if err != nil {
-			t.Fatal(err)
-		}
-		srv, err := New(Config{Store: st, GCGrace: time.Hour, Authorize: AllowAll, FreeSpace: func() (uint64, error) { return 1 << 40, nil }})
-		if err != nil {
-			t.Fatal(err)
-		}
-		fx := &fixture{srv: srv, st: st, root: st.Root()}
-		tagged := fx.image(t, "app", "v1", "tagged")
-		untagged := fx.image(t, "app", "", "untagged")
-		child := fx.image(t, "app", "", "child")
-		index := fx.index(t, "app", "idx", child)
-		rows := fx.rows(t, "app")
-		state, err := store.IndexState(rows)
-		if err != nil {
-			t.Fatal(err)
-		}
+		cloneWork(t, seeded.workDir(), work)
+		fx := fixtureOver(t, work)
+		srv, st := fx.srv, fx.st
 
 		reference, mustStay := "", false
 		switch target % 7 {
