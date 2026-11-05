@@ -4,7 +4,11 @@ Status: under review. This fills in the sections issue 731 and PR #743 left open
 review on this pull request; the contract sketch in `pkg/keystore/keystore.go` may still
 change as that review runs. The second revision answers the review on this pull request
 (items 1 to 8) and the maintainer's three rulings on the delivery declaration, the master
-directory and the pointer rollback.
+directory and the pointer rollback. The third revision answers the re-review of the second:
+the threat-model sentence and the forged-pointer residual, the byte-exact `--reveal` round
+trip and G21, and the six smaller points (the `master.next` mismatch case, the floor with
+no entry for a name, the floor's own refusal text, the override procedure on an existing
+cluster, the `ReadRegularFile` path, and the pull request description).
 
 One point worth stating up front because it resolves an apparent tension elsewhere: this
 design needs no operator passphrase and no KDF. The master key is a file k3sm mints from
@@ -63,9 +67,12 @@ service user's files, because they share a uid. What keeps a confined native Pod
 `<work dir>/server` is runtimed's Seatbelt profile, which denies it read and write there
 (`DaemonTreeSubdirs` in runtimed's `pkg/sandbox`, rendered after every allow so not even a
 caller-supplied extra path overrides it). That is a profile rule, not a permission, and it
-names the default work dir. So anything whose integrity must hold against a process running
-as the service user outside that profile either carries an authenticated record, or lives
-where only root can write it. Both are used below.
+names the default work dir. So a record's integrity against a writer that cannot read the
+master (a stale restore, a stray file copy) rests on an authenticated record, and the one
+fact that must hold even against a writer that can only touch the service user's files lives
+where only root can write it. Neither is a defence against a process that runs as the
+service user outside that profile and reads the master: that process can already read every
+entry, and what it can additionally forge is stated under "Pointer sequence and floor".
 
 ## Storage format and master key
 
@@ -230,10 +237,31 @@ highest sequence it has committed for each entry, in `keystore-floor.json`:
 {"version": 1, "entries": {"signer-key": {"generation": "<hex>", "seq": 7}}}
 ```
 
-A reader that opens `current` refuses it, as `ErrCorrupt` with a message that says the
-pointer is older than the recorded floor, unless **both** hold: the pointer's generation
-equals the floor's generation for that name, and the pointer's sequence is at least the
-floor's. So an older `current` that still authenticates is refused.
+A reader that opens `current` refuses it, as `ErrCorrupt` with the message below, unless
+**both** hold: the pointer's generation equals the floor's generation for that name, and the
+pointer's sequence is at least the floor's. So an older `current` that still authenticates
+is refused.
+
+**What the reader does when the floor has nothing to compare against.** Two cases, both
+accepted, because there is no recorded fact to refuse against:
+
+- *The floor file is absent.* The check is skipped for every entry, and the next root-run
+  verb writes the file from the authenticated pointers (this is also the restore procedure).
+- *The floor file exists but has no entry for the name.* This is the state an interrupted Put
+  leaves (`current` written, floor not yet), and the state after a Delete. The pointer is
+  accepted if it authenticates, and the next root-run verb records its sequence and
+  generation. The residual is a stale backup of a deleted entry restored under the same
+  name: it is accepted, which is the deliberate-restore case the procedure under "Backup and
+  snapshots" already covers, and it reopens nothing the generation check (G4) does not
+  already refuse for an entry that was re-created.
+
+**The refusal message is its own text, not the `ErrCorrupt` default.** `ErrCorrupt`'s stock
+message tells the operator to restore from backup, which for a stale pointer is the opposite
+of the fix: an older backup is exactly what produced it. A floor refusal wraps `ErrCorrupt`
+(so `errors.Is` still matches) and reads: `keystore entry "NAME": the current pointer
+(sequence S) is older than the recorded floor (sequence F); an older copy of this entry was
+put back. Do not restore from backup. If that was deliberate, follow "Restoring an older
+keystore/" in docs/user/backup-restore.md`.
 
 **Where the floor lives is the load-bearing choice.** A floor kept in the service user's
 tree would be one more file that any process running as the service user can copy back, and
@@ -260,7 +288,18 @@ become a window, **every root-run verb begins by raising each entry's floor to i
 authenticated pointer's sequence**, under the lock. A floor entry for a name with no
 directory (a crash during Delete) is harmless and is overwritten by a later Put.
 
-What this does not do, stated plainly: root can replace the pointer and the floor together,
+**The residual against a process that can read the master.** The pointer's authentication
+is keyed by the master, and the master is a 0600 file owned by the service user. A process
+running as the service user outside runtimed's profile can therefore read it, seal a fresh
+`current` that names an older version at the floor's sequence, and pass both checks. The
+floor is not a defence against that process, and nothing here should be read as one. What
+the floor refuses is a pointer put back by a writer that **cannot** read the master: a stale
+restore, a stray file copy, a script that copies a directory over the live one. That is the
+case the maintainer's ruling asked to close, and it is worth having. The same-user model
+accepts the forging case, in the same class as that process deleting the entries outright,
+or reading every one of them: a process that holds the master has the keystore.
+
+What this does not do either, stated plainly: root can replace the pointer and the floor together,
 and the threat model does not defend against root. A deliberate restore of an older
 `keystore/` from backup is the same act, so it is refused until root removes
 `keystore-floor.json`, which a root-run verb then rebuilds from the restored pointers.
@@ -286,7 +325,7 @@ Rewrap, and the verb says so when it finishes.
 
 `keystore-master/master` is opened `O_RDONLY|O_NOFOLLOW`; owner and mode are read off the
 *same open descriptor* (fstat, not a separate lstat — the same TOCTOU closure
-`pkg/install/install.go`'s `ReadRegularFile` already documents), checked against the
+`ReadRegularFile` in `pkg/install/install_darwin.go` already documents), checked against the
 service uid and mode 0600, and its content's SHA-256 checked against the fingerprint file.
 Any of the three failing is `ErrMasterUntrusted`; the file being entirely absent while
 `keystore/` holds entries is `ErrMasterMissing` — the same two-refusal split
@@ -349,9 +388,13 @@ master files, to move in two phases:
    differently, and an empty argument is `ErrMasterMissing`).
 2. Write `master.next`, fsync, then `master.next.sha256`, fsync, then fsync the directory.
    If a `master.next` already exists and agrees with its fingerprint, **reuse it** so a
-   resumed Rewrap does not mint a second key; if it exists and does not, and no `.new`
-   file exists anywhere (step 3 only starts after step 2 is durable), discard it and mint
-   again.
+   resumed Rewrap does not mint a second key. If it exists and does not agree, the two cases
+   are told apart by whether any `.new` file exists anywhere. With none (step 3 only starts
+   after step 2 is durable), the crash was inside step 2: discard it and mint again. **With
+   any `.new` file present, refuse with `ErrMasterUntrusted`**: step 3 had started, so
+   `master.next` was once good and has since been damaged or replaced, and minting a fresh
+   key would orphan records already re-sealed under it. The operator's recovery is to
+   restore the matched backup pair.
 3. For every entry, every version file and the current pointer, open the **canonical**
    file under the old master, and if that does not authenticate, under the new one. A
    record that opens under the new key was already moved by an interrupted step 4 and is
@@ -400,8 +443,14 @@ list
       the command exits 1 after listing the rest.
 
 show <name> [--version N] [--reveal]
-      Metadata only by default; the value is printed, alone on stdout, only
-      with --reveal.
+      Metadata only by default. With --reveal, stdout carries exactly the
+      stored bytes and nothing else: no trailing newline, no encoding, no
+      label; no metadata is printed in that mode, so a pipe sees only the
+      value. An opaque value comes back at its stored length and an Ed25519
+      value at exactly 32 or 64 bytes, which is what `rotate` accepts, so
+      `show --reveal` into `rotate --in -` is a byte-exact round trip. When
+      stdout is a terminal the verb still writes the raw bytes; it does not
+      add a newline for the operator's prompt.
 
 rotate <name> [--in FILE|-]
       A new version from the same value source as put; flips current. Refuses
@@ -495,6 +544,15 @@ wrong are corrected here:
   arguments, and it is read once, at process start. **Changing it takes a restart of the
   server.** It is not read fresh each sweep.
 
+**The operator's procedure to turn the override on, on an existing cluster:** add
+`--allow-plaintext-secrets-delivery` to the server daemon's arguments (the LaunchDaemon
+plist), restart the server daemon, then run `sudo k3sm install` so the server-args record
+keeps the flag. The install step is what makes it durable: a flag that exists only in the
+plist is lost by an uninstall before the next install, and the next install would then
+render the stock template without it (`docs/user/install.md` § "Server Flags Across A
+Reinstall"). To turn the override off, remove the flag from the plist, restart, and run
+`sudo k3sm install`; if the record still carries the flag, remove it there too.
+
 The override is applied per target at the time of that sweep; a target already delivered
 before the flag was removed is left as it is, since this converge-only reconciler does not
 retroactively delete a Secret an operator may be relying on. A refusal is logged at Warn
@@ -529,7 +587,11 @@ sudo k3sm keys show NAME --version N --reveal | sudo k3sm keys rotate NAME --in 
 ```
 
 A pipe, not a process substitution: `sudo` closes inherited descriptors, so a `<( … )`
-path would not open, and each side of the pipe runs its own `sudo`. This keeps rotation
+path would not open, and each side of the pipe runs its own `sudo`. The round trip is
+byte-exact because `show --reveal` writes the stored bytes with no trailing newline and
+`rotate --in -` reads stdin to EOF without trimming: version N+1 holds exactly the bytes
+version N held, and an Ed25519 value stays at 32 or 64 bytes. The check that proves it is
+G21, which compares the two byte for byte. This keeps rotation
 the one write path to reason about. A direct point-current-backward operation would now
 also have to move the pointer sequence and the floor *backward*, which is the very thing
 the floor exists to refuse, so it is not a Phase A verb.
@@ -604,23 +666,23 @@ last pull request lands and no row is pending.
 | G2 | The AAD is length-prefixed and covers format, kind, name, version, generation; a record moved to another name, version or generation fails to open | unit: swap each field, expect `ErrCorrupt` |
 | G3 | Every seal draws a fresh 96-bit nonce, including Rewrap | unit: two seals of one plaintext differ; Rewrap changes every nonce |
 | G4 | Delete then Put of the same name does not reopen the old `v1` | unit: replay the old file onto the new entry, expect `ErrCorrupt` |
-| G5 | A previously valid `current` copied back over the current one is refused | unit: Rotate, restore the earlier `current`, expect `ErrCorrupt` naming the floor |
+| G5 | A previously valid `current` copied back over the current one is refused, with a message that names the floor and does not tell the operator to restore from backup; a floor file with no entry for the name, or no floor file, accepts an authenticating pointer | unit: Rotate, restore the earlier `current`, expect `ErrCorrupt` whose text names the floor and omits "restore it from backup"; one case each for the missing entry and the missing file |
 | G6 | The floor is root-owned and checked on the opened descriptor; a floor that is group- or other-writable, a symlink, or not root-owned is refused | unit with a fake FS for each case |
 | G7 | The floor is raised by every mutating verb and by the start of every root verb, and a floor one behind the pointer is accepted | unit: crash after the flip, before the floor write |
 | G8 | Rotate flips the pointer last; a crash at each of its steps leaves the old version current | unit: fault injection between each step |
 | G9 | A Rotate retry discards an orphaned next version and seals the value it was given | unit: orphan with value A, retry with value B, expect B |
 | G10 | The master is minted only by the first `put`, never over existing entries, and never by an operator-supplied value | unit: absent master with entries is `ErrMasterMissing`; no verb accepts a key |
 | G11 | The master is opened with O_NOFOLLOW and judged by fstat on the open descriptor; wrong mode, owner or fingerprint is `ErrMasterUntrusted` | unit: one case each |
-| G12 | Rewrap resumes after a crash at every step, trying the old then the new key, and leaves no record readable by neither | unit: fault injection at each of steps 2 to 5, then rerun |
+| G12 | Rewrap resumes after a crash at every step, trying the old then the new key, and leaves no record readable by neither; a `master.next` that disagrees with its fingerprint is discarded only when no `.new` file exists, and refused with `ErrMasterUntrusted` otherwise | unit: fault injection at each of steps 2 to 5, then rerun; a corrupted `master.next` with and without a `.new` file |
 | G13 | A crash between the two master renames leaves a master that passes its trust check, and the next verb completes the swap | unit: stop after the first rename |
 | G14 | One lock serializes Rewrap, Rotate, Put and reads, with a bounded wait | unit: a held lock gives a timeout error within the bound, not a hang |
 | G15 | Files a root-run verb writes under `server/` are owned by the service user at the layout's modes | unit with a fake owner seam |
 | G16 | `list` returns every entry, marks an unreadable one with `Err`, and exits 1 | unit plus a CLI exit-code test |
-| G17 | `show` prints a value only with `--reveal`; no verb takes a value as an argument | CLI test over the usage strings |
+| G17 | `show` prints a value only with `--reveal`, and then writes exactly the stored bytes with no trailing newline; no verb takes a value as an argument | CLI test over the usage strings; a `--reveal` test comparing stdout to the stored bytes for an opaque value and for 32- and 64-byte Ed25519 values |
 | G18 | Delivery is refused while encryption is off unless the override flag was set at server start; a delivered target stays when the override is removed | unit over the reconciler with a fake client |
 | G19 | The delivery declaration is root-owned and not shared-writable, and is refused otherwise | unit, the same cases as the manifest directory |
 | G20 | The reconciler only Gets, creates and updates its labelled `Opaque` Secrets, and leaves an unlabelled or foreign Secret alone | unit over a fake client that records every call |
-| G21 | The rollback recipe in this document runs as written | a script test that pipes `show --reveal` into `rotate --in -` |
+| G21 | The rollback recipe in this document runs as written and is a byte-exact round trip | a script test that pipes `show --reveal` into `rotate --in -`, then compares the new current version's value byte for byte (`cmp`) with version N's, for an opaque entry and an Ed25519 entry |
 | G22 | `hack/ci.sh` is green | the gate runs it |
 
 Phase A is complete when the gate passes with no row pending. A row can be reworded or dropped only by a change
@@ -654,6 +716,12 @@ Settled in this revision:
 - `Entry.Err`: the contract change for per-entry listing, made in this pull request.
 - The `Rewrap` argument check: a plain error, no sentinel.
 - Retention: unbounded in Phase A.
+- The floor does not defend against a process that can read the master; it refuses a
+  pointer put back by a writer that cannot ("Pointer sequence and floor").
+- `show --reveal` writes the stored bytes and nothing else, so the rollback recipe is a
+  byte-exact round trip, checked by G21.
+- A floor refusal has its own message, wrapping `ErrCorrupt`; a floor with no entry for the
+  name accepts an authenticating pointer.
 
 Owed by the implementation: `hack/acceptance/keystore.sh`, specified above. There are no
 open questions.
