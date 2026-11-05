@@ -361,7 +361,7 @@ func TestLinkHasNext(t *testing.T) {
 }
 
 // FuzzLinkHasNext holds the scanner over a header a server chose: it ends, never
-// panics, and an error never comes with an answer.
+// panics, an error never comes with an answer, and a header over the limit errors.
 func FuzzLinkHasNext(f *testing.F) {
 	for _, seed := range []string{
 		"",
@@ -383,6 +383,13 @@ func FuzzLinkHasNext(f *testing.F) {
 		next, err := linkHasNext([]string{header})
 		if err != nil && next {
 			t.Errorf("linkHasNext(%q) answered with an error: %v", header, err)
+		}
+		if len(header) > maxLinkHeaderBytes && err == nil {
+			t.Errorf("linkHasNext accepted a %d byte header over the %d byte limit", len(header), maxLinkHeaderBytes)
+		}
+		over := strings.Repeat(" ", maxLinkHeaderBytes+1) + header
+		if next, err := linkHasNext([]string{over}); err == nil || next {
+			t.Errorf("linkHasNext over the limit = %v, %v; want an error", next, err)
 		}
 	})
 }

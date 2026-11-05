@@ -110,6 +110,10 @@ func checkChannel(ch updatesv1alpha1.UpdateChannel) error {
 // linkHasNext reports whether the Link header values (RFC 8288) carry a link
 // whose relation types include next. A header it cannot read is an error, never
 // "no next page", because that would answer from part of a listing.
+//
+// It is hand-written because no library does this job: the standard library has
+// no RFC 8288 Link parser and hack/deps.lock names none. It is deliberately
+// narrow, answering only whether a next page exists and driving no URL.
 func linkHasNext(values []string) (bool, error) {
 	size := 0
 	for _, v := range values {
