@@ -22,8 +22,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
+
+	mlxv1alpha1 "k3sm.io/apis/mlx/v1alpha1"
 )
 
 // TestRenderSeedsPinnedRevision pins the contract between the render and the
@@ -210,6 +213,260 @@ for i, run in enumerate(json.load(sys.stdin)):
     except ks.SeedError as e:
         res["error"] = str(e)
     res["exists"] = os.path.isdir(relative(run["model"]))
+    out.append(res)
+print(json.dumps(out))
+`
+
+// TestShardedRanksFetchPinnedSnapshotBeforeEngine pins the same contract for a
+// sharded model, whose rank Pods run k3sm_shard instead of the image ENTRYPOINT.
+// mlx_lm.server only loads a pinned snapshot path, so a rank that does not fetch
+// it first dies on an empty cache. Each rank's rendered command arguments and
+// environment go to the real k3sm_shard.main in that rank's own working directory,
+// with only the Hub client, name resolution and the engine faked.
+func TestShardedRanksFetchPinnedSnapshotBeforeEngine(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 is not on PATH; hack/images/mlx-serve/selftest.sh runs the entrypoint checks")
+	}
+	dir, err := filepath.Abs(filepath.Join("..", "..", "hack", "images", "mlx-serve"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type rankRun struct {
+		Args []string          `json:"args"`
+		Env  map[string]string `json:"env"`
+		// Mode is what the faked Hub does; see seedDriver for the meanings.
+		Mode string `json:"mode"`
+	}
+	type rankResult struct {
+		Calls  [][]string `json:"calls"`
+		Events []string   `json:"events"`
+		Status int        `json:"status"`
+		Stderr string     `json:"stderr"`
+		// Loadable is whether the --model path existed when the engine started.
+		Loadable bool `json:"loadable"`
+	}
+
+	const repo = "mlx-community/Qwen3-0.6B-4bit"
+	const revision = "0f1e2d3c4b5a69788796a5b4c3d2e1f001234567"
+	snapshot := hfHomePath + "/" + hubDir + "/models--mlx-community--Qwen3-0.6B-4bit/snapshots/" + revision
+	wantCache := "." + hfHomePath + "/" + hubDir
+
+	render := func(t *testing.T, m *mlxv1alpha1.MLXModel, placement Placement) []rankRun {
+		t.Helper()
+		objs, err := RenderSharded(m, testOptions(), placement)
+		if err != nil {
+			t.Fatalf("RenderSharded() error = %v", err)
+		}
+		var runs []rankRun
+		for i, pod := range objs.Pods {
+			c := pod.Spec.Containers[0]
+			if want := []string{shardInterpreter, "-m", shardModule}; !reflect.DeepEqual(c.Command, want) {
+				t.Fatalf("rank %d command = %v, want %v: the fetch lives in this module", i, c.Command, want)
+			}
+			wantClaim := RankCacheClaimName(m.Name, placement.Ranks[i].Node)
+			var claim string
+			for _, v := range pod.Spec.Volumes {
+				if v.Name == cacheVolumeName && v.PersistentVolumeClaim != nil {
+					claim = v.PersistentVolumeClaim.ClaimName
+				}
+			}
+			if claim != wantClaim {
+				t.Errorf("rank %d cache volume names claim %q, want its own %q", i, claim, wantClaim)
+			}
+			mounted := false
+			for _, vm := range c.VolumeMounts {
+				mounted = mounted || (vm.Name == cacheVolumeName && vm.MountPath == CacheMountPath)
+			}
+			if !mounted {
+				t.Errorf("rank %d does not mount its cache at %s: %+v", i, CacheMountPath, c.VolumeMounts)
+			}
+			env := map[string]string{}
+			for _, e := range c.Env {
+				env[e.Name] = e.Value
+			}
+			if env[hfHomeEnv] != hfHomePath {
+				t.Errorf("rank %d %s = %q, want %q", i, hfHomeEnv, env[hfHomeEnv], hfHomePath)
+			}
+			runs = append(runs, rankRun{Args: c.Args, Env: env})
+		}
+		return runs
+	}
+	run := func(t *testing.T, runs []rankRun, mode string) []rankResult {
+		t.Helper()
+		for i := range runs {
+			runs[i].Mode = mode
+		}
+		in, err := json.Marshal(runs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// -I: no user site, no PYTHON* variables, no script directory on the
+		// path; -B: no bytecode written into the repo tree.
+		cmd := exec.Command(python, "-I", "-B", "-c", shardSeedDriver, dir, t.TempDir())
+		cmd.Stdin = strings.NewReader(string(in))
+		out, err := cmd.Output()
+		if err != nil {
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) {
+				t.Fatalf("shard driver: %v\n%s", err, exitErr.Stderr)
+			}
+			t.Fatalf("shard driver: %v", err)
+		}
+		var results []rankResult
+		if err := json.Unmarshal(out, &results); err != nil {
+			t.Fatalf("decode driver output %q: %v", out, err)
+		}
+		if len(results) != len(runs) {
+			t.Fatalf("%d driver results for %d ranks", len(results), len(runs))
+		}
+		return results
+	}
+	pinned := func() *mlxv1alpha1.MLXModel {
+		m := shardedModel(2, mlxv1alpha1.MLXDistributedBackendRing, mlxv1alpha1.MLXParallelismTensor)
+		m.Spec.Revision = revision
+		return m
+	}
+
+	t.Run("every_rank_fetches_into_its_own_cache_before_the_engine", func(t *testing.T) {
+		for _, tc := range []struct {
+			name      string
+			model     *mlxv1alpha1.MLXModel
+			placement Placement
+		}{
+			{"ring", pinned(), ringPlacement()},
+			{"jaccl", func() *mlxv1alpha1.MLXModel {
+				m := shardedModel(3, mlxv1alpha1.MLXDistributedBackendJACCL, mlxv1alpha1.MLXParallelismTensor)
+				m.Spec.Revision = revision
+				return m
+			}(), jacclPlacement()},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				runs := render(t, tc.model, tc.placement)
+				for i, r := range run(t, runs, "fetch") {
+					if !slices.Contains(runs[i].Args, snapshot) {
+						t.Fatalf("rank %d args %v do not name the snapshot %s", i, runs[i].Args, snapshot)
+					}
+					if want := [][]string{{repo, revision, wantCache}}; !reflect.DeepEqual(r.Calls, want) {
+						t.Errorf("rank %d downloads = %v, want %v", i, r.Calls, want)
+					}
+					if want := []string{"download", "engine"}; !reflect.DeepEqual(r.Events, want) {
+						t.Errorf("rank %d order = %v, want %v", i, r.Events, want)
+					}
+					if !r.Loadable {
+						t.Errorf("rank %d: the engine started without the snapshot in its cache", i)
+					}
+					if r.Status != 0 {
+						t.Errorf("rank %d exit status = %d, stderr %q", i, r.Status, r.Stderr)
+					}
+				}
+			})
+		}
+	})
+
+	t.Run("unpinned_is_left_to_the_engine", func(t *testing.T) {
+		m := pinned()
+		m.Spec.Revision = ""
+		for i, r := range run(t, render(t, m, ringPlacement()), "fail") {
+			if len(r.Calls) != 0 || r.Status != 0 || !reflect.DeepEqual(r.Events, []string{"engine"}) {
+				t.Errorf("rank %d: downloads %v, order %v, status %d, stderr %q; want the engine alone", i, r.Calls, r.Events, r.Status, r.Stderr)
+			}
+		}
+	})
+
+	// A failed fetch must not exit 2: on the thunderbolt path the operator reads
+	// exit 2 as a refusal to start on the interconnect (lostRanks), and a Hub
+	// outage is not an interconnect loss.
+	t.Run("fetch_failure_on_a_fresh_cache_ends_the_rank_without_the_refusal_status", func(t *testing.T) {
+		for i, r := range run(t, render(t, pinned(), ringPlacement()), "fail") {
+			if r.Status != 1 {
+				t.Errorf("rank %d exit status = %d, want 1", i, r.Status)
+			}
+			if slices.Contains(r.Events, "engine") {
+				t.Errorf("rank %d started the engine on an empty cache", i)
+			}
+			if !strings.Contains(r.Stderr, revision) || strings.Contains(r.Stderr, "Traceback") {
+				t.Errorf("rank %d stderr = %q, want a one-line refusal naming the revision", i, r.Stderr)
+			}
+		}
+	})
+
+	t.Run("fetch_failure_with_the_snapshot_present_starts_the_engine", func(t *testing.T) {
+		for i, r := range run(t, render(t, pinned(), ringPlacement()), "present") {
+			if r.Status != 0 || !r.Loadable {
+				t.Errorf("rank %d: status %d, loadable %v, stderr %q; want the engine started on the staged snapshot", i, r.Status, r.Loadable, r.Stderr)
+			}
+		}
+	})
+
+	t.Run("a_moving_reference_is_refused", func(t *testing.T) {
+		m := pinned()
+		m.Spec.Revision = "main"
+		for i, r := range run(t, render(t, m, ringPlacement()), "resolve") {
+			if r.Status != 1 || slices.Contains(r.Events, "engine") || !strings.Contains(r.Stderr, "commit") {
+				t.Errorf("rank %d: status %d, order %v, stderr %q; want a refusal asking for a commit", i, r.Status, r.Events, r.Stderr)
+			}
+		}
+	})
+}
+
+// shardSeedDriver runs k3sm_shard.main (sys.argv[1] is the module's directory)
+// once per rank in stdin's JSON list, each in its own working directory under
+// sys.argv[2] holding the materialized mount point. It replaces the Hub client
+// module, the system resolver and serve, and records their order.
+const shardSeedDriver = `
+import contextlib, io, json, os, socket, sys, types
+sys.path.insert(0, sys.argv[1])
+import k3sm_shard as ks
+
+COMMIT = "1111111111111111111111111111111111111111"
+
+socket.getaddrinfo = lambda name, *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.1", 0))]
+
+def model_of(args):
+    return args[args.index("--model") + 1]
+
+out = []
+for i, run in enumerate(json.load(sys.stdin)):
+    cwd = os.path.join(sys.argv[2], str(i))
+    tmp = os.path.join(cwd, "tmp")
+    os.makedirs(tmp)
+    env = dict(run["env"], TMPDIR=tmp)
+    home = env.get("HF_HOME")
+    if home:
+        os.makedirs(os.path.join(cwd, "." + os.path.dirname(home)))
+    os.chdir(cwd)
+    model = model_of(run["args"])
+    mode = run["mode"]
+    res = {"calls": [], "events": [], "status": None, "stderr": "", "loadable": False}
+
+    def snapshot_download(repo_id, revision=None, cache_dir=None):
+        res["calls"].append([repo_id, revision, cache_dir])
+        res["events"].append("download")
+        if mode in ("fail", "present"):
+            raise OSError("hub unreachable")
+        landed = COMMIT if mode == "resolve" else revision
+        snap = os.path.join(cache_dir, "models--" + repo_id.replace("/", "--"), "snapshots", landed)
+        os.makedirs(snap, exist_ok=True)
+        return snap
+
+    def serve(child_env, child_argv, served):
+        res["events"].append("engine")
+        res["loadable"] = os.path.isdir("." + model)
+
+    hub = types.ModuleType("huggingface_hub")
+    hub.snapshot_download = snapshot_download
+    sys.modules["huggingface_hub"] = hub
+    ks.serve = serve
+    if mode == "present":
+        os.makedirs("." + model)
+    os.environ.clear()
+    os.environ.update(env)
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(stderr):
+        res["status"] = ks.main(list(run["args"]))
+    res["stderr"] = stderr.getvalue()
     out.append(res)
 print(json.dumps(out))
 `

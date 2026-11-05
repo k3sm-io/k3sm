@@ -141,6 +141,7 @@ snapshot if the volume already holds it, and otherwise exits 2 naming the
 revision; a revision the Hub resolves to another commit (a branch or tag name)
 exits 2 too. A model reference that is not such a path is left to the engine.
 `TestRenderSeedsPinnedRevision` in `pkg/mlx` runs the rendered argv through it.
+A rank of a sharded model runs the same fetch from `k3sm_shard` (see below).
 
 ## The serving port
 
@@ -210,6 +211,17 @@ writable path under the pod's sandbox profile):
 It then runs `mlx_lm.server --host 0.0.0.0 --port <serve port>` in the same
 process, adding `--pipeline` for pipeline parallelism, with its own arguments
 last.
+
+A pinned model's `--model` is its snapshot path in the rank's own cache volume,
+and `mlx_lm.server` only loads that path. So once a rank's plan is made,
+`k3sm_shard` calls the same `seed_pinned_revision` as `k3sm_serve`, with the same
+outcomes, except that a refusal exits 1, not 2, because the operator reads exit 2
+on the thunderbolt path as a refusal to start on the interconnect. The fetch runs
+in the rank's own container, so a rank still downloading is a running Pod with
+no listener, which rank 0's liveness probe passes.
+`TestShardedRanksFetchPinnedSnapshotBeforeEngine` in `pkg/mlx` runs each rank's
+rendered command through it. Each rank downloads on its own, so the ranks can
+finish at different times.
 
 `mlx_lm.server` has no `--served-model-name`, so `k3sm_shard` takes that option
 itself and does not pass it on. Without it a pinned model, whose `--model` is

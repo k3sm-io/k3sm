@@ -307,6 +307,11 @@ pin, its date, and the tarball's sha256.
   A sharded model already stuck waiting on its cache before the upgrade is not replaced on its own;
   delete its rank Pods once with `kubectl delete pod -n <namespace> -l app.kubernetes.io/instance=<model>,k3sm.io/mlx-rank`
   (or delete the model) and the operator recreates them through the scheduler.
+- A sharded MLXModel with a pinned `revision` now downloads that revision. Each rank fetches it
+  into its own cache volume before the engine starts, as a single-node model does; before, the
+  ranks started on empty caches and rank 0 exited on the missing snapshot path. The fetch is in
+  the `mlx-serve` image's sharded entrypoint, so it needs an image built from this source: an
+  already published tag does not have it.
 - A k3sm.app update that finds the installed `k3sm` link broken (pointing at a version
   directory that is gone, or out of `/Library/k3sm`) is still refused, and the refusal now says
   how to repair the install: re-run the install script, `curl -fsSL https://k3sm.io/install.sh | sh`,
