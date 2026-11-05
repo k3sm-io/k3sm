@@ -41,48 +41,40 @@ func (s devModeSystem) Owner(path string) (install.OwnedEntry, error) {
 func (devModeSystem) HasACL(string) (bool, error) { return false, nil }
 
 // TestStatusCollectorWiresTheDeveloperModeCause pins that the production
-// collector can name the cause of an invalid marker: without these readers the
-// row silently falls back to a `sudo rm` remedy that does not fix a bad
-// directory and that rm refuses for a directory at the path. The readers
-// themselves take the installer's system, so they run on a fake here.
+// collector reads the marker, and that the snapshot it reads carries what the
+// row needs to name a cause: without the directories above the marker, the row
+// falls back to a removal command aimed through a directory nobody can trust.
+// The reader takes the installer's system, so it runs on a fake here.
 func TestStatusCollectorWiresTheDeveloperModeCause(t *testing.T) {
-	c := newStatusCollector()
-	if c.DeveloperMode == nil {
-		t.Error("the status collector must be wired with the marker reader")
+	if newStatusCollector().DeveloperMode == nil {
+		t.Fatal("the status collector must be wired with the marker reader")
 	}
-	if c.DeveloperModeAncestor == nil {
-		t.Error("the status collector must be wired with the ancestor cause reader")
-	}
-	if c.DeveloperModeMarkerIsDir == nil {
-		t.Error("the status collector must be wired with the directory reader")
-	}
-
 	dir := install.OwnedEntry{Kind: install.EntryDir, Mode: 0o755}
 	file := install.OwnedEntry{Kind: install.EntryRegular, Mode: 0o644}
-	t.Run("a group-writable /Library is named", func(t *testing.T) {
-		sys := devModeSystem{owners: map[string]install.OwnedEntry{
-			"/":                             dir,
-			"/Library":                      {Kind: install.EntryDir, Mode: 0o775},
-			install.DeveloperModeMarkerPath: file,
-		}}
-		if got := statusDeveloperModeAncestor(sys); got != "/Library" {
-			t.Errorf("ancestor = %q, want /Library", got)
-		}
-		if statusDeveloperModeIsDir(sys) {
-			t.Error("a file at the marker path reads as a directory")
-		}
-	})
-	t.Run("a directory at the marker path is seen", func(t *testing.T) {
-		sys := devModeSystem{owners: map[string]install.OwnedEntry{
-			"/":                             dir,
-			"/Library":                      dir,
-			install.DeveloperModeMarkerPath: dir,
-		}}
-		if !statusDeveloperModeIsDir(sys) {
-			t.Error("a directory at the marker path does not read as one")
-		}
-		if got := statusDeveloperModeAncestor(sys); got != "" {
-			t.Errorf("ancestor = %q, want none", got)
-		}
-	})
+	badDir := install.OwnedEntry{Kind: install.EntryDir, Mode: 0o775}
+	for _, tc := range []struct {
+		name          string
+		library       install.OwnedEntry
+		marker        install.OwnedEntry
+		wantAncestor  string
+		wantDirMarker bool
+	}{
+		{name: "a file under a group-writable /Library", library: badDir, marker: file, wantAncestor: "/Library"},
+		{name: "a directory under a sound /Library", library: dir, marker: dir, wantDirMarker: true},
+		{name: "a directory under a group-writable /Library", library: badDir, marker: dir, wantAncestor: "/Library", wantDirMarker: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := statusDeveloperMode(devModeSystem{owners: map[string]install.OwnedEntry{
+				"/":                             dir,
+				"/Library":                      tc.library,
+				install.DeveloperModeMarkerPath: tc.marker,
+			}})
+			if got := install.DeveloperModeAncestorCause(f, install.DeveloperModeMarkerPath); got != tc.wantAncestor {
+				t.Errorf("ancestor = %q, want %q", got, tc.wantAncestor)
+			}
+			if got := install.DeveloperModeMarkerIsDir(f); got != tc.wantDirMarker {
+				t.Errorf("directory at the marker path = %v, want %v", got, tc.wantDirMarker)
+			}
+		})
+	}
 }

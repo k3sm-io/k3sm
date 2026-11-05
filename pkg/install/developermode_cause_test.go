@@ -39,6 +39,9 @@ func TestDeveloperModeAncestorCause(t *testing.T) {
 		{"root acl", DeveloperModeFacts{Exists: true, Entry: file, Ancestors: []DeveloperModeAncestor{{Entry: good, HasACL: true}, {Entry: good}}}, "/"},
 		{"symlink root", DeveloperModeFacts{Exists: true, Entry: file, Ancestors: []DeveloperModeAncestor{{Entry: OwnedEntry{Kind: EntrySymlink, Mode: 0o755}}, {Entry: good}}}, "/"},
 		{"probe error on library", DeveloperModeFacts{Exists: true, Entry: file, Ancestors: []DeveloperModeAncestor{{Entry: good}, {Err: errors.New("lstat failed")}}}, "/Library"},
+		{"a directory marker under a bad directory", DeveloperModeFacts{Exists: true, Entry: good, Ancestors: []DeveloperModeAncestor{{Entry: good}, {Entry: bad}}}, "/Library"},
+		{"a directory marker under sound directories", DeveloperModeFacts{Exists: true, Entry: good, Ancestors: []DeveloperModeAncestor{{Entry: good}, {Entry: good}}}, ""},
+		{"a symlink marker under a bad root", DeveloperModeFacts{Exists: true, Entry: OwnedEntry{Kind: EntrySymlink, Mode: 0o755}, Ancestors: []DeveloperModeAncestor{{Entry: bad}, {Entry: good}}}, "/"},
 		{"marker unread", DeveloperModeFacts{Exists: true, Err: errors.New("lstat failed")}, ""},
 		{"marker is the cause", DeveloperModeFacts{Exists: true, Entry: OwnedEntry{Kind: EntryRegular, UID: 501, Mode: 0o644}, Ancestors: []DeveloperModeAncestor{{Entry: bad}, {Entry: bad}}}, ""},
 	}

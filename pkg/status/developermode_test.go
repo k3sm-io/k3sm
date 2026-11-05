@@ -26,6 +26,35 @@ import (
 	"k3sm.io/k3sm/pkg/install"
 )
 
+// soundMarker is a marker file that passes every check of its own.
+var soundMarker = install.OwnedEntry{Kind: install.EntryRegular, Mode: 0o644}
+
+// markerFactsUnder is marker under / and /Library, with the directory named
+// bad group-writable.
+func markerFactsUnder(marker install.OwnedEntry, bad string) install.DeveloperModeFacts {
+	dir := func(name string) install.DeveloperModeAncestor {
+		e := install.OwnedEntry{Kind: install.EntryDir, Mode: 0o755}
+		if name == bad {
+			e.Mode = 0o775
+		}
+		return install.DeveloperModeAncestor{Entry: e}
+	}
+	return install.DeveloperModeFacts{Exists: true, Entry: marker, Ancestors: []install.DeveloperModeAncestor{dir("/"), dir("/Library")}}
+}
+
+// markerFacts is a read of the marker that judges to state.
+func markerFacts(state install.DeveloperModeState) install.DeveloperModeFacts {
+	switch state {
+	case install.DeveloperModeMarkerOn:
+		return markerFactsUnder(soundMarker, "")
+	case install.DeveloperModeInvalid:
+		return markerFactsUnder(install.OwnedEntry{Kind: install.EntryRegular, Mode: 0o666}, "")
+	case install.DeveloperModeUnknown:
+		return install.DeveloperModeFacts{Exists: true, Err: errors.New("lstat: permission denied")}
+	}
+	return install.DeveloperModeFacts{}
+}
+
 // TestDeveloperModeRow pins the developer-mode row: no row when nothing is at
 // the marker path (or no reader is wired), on and invalid with their fixed
 // sentences, the installed k3sm's signing in the wide map when it can be
@@ -64,7 +93,7 @@ func TestDeveloperModeRow(t *testing.T) {
 			t.Parallel()
 			c := Collector{Paths: Paths{Binary: bin}}
 			if !tc.nilReader {
-				c.DeveloperMode = func() install.DeveloperModeState { return tc.state }
+				c.DeveloperMode = func() install.DeveloperModeFacts { return markerFacts(tc.state) }
 			}
 			if !tc.noSigner {
 				c.SigningTeamID = func(_ context.Context, path string) (string, error) {
@@ -116,8 +145,11 @@ func TestDeveloperModeRow(t *testing.T) {
 func TestDeveloperModeInvalidRowNamesAncestorCause(t *testing.T) {
 	t.Parallel()
 	row := func(dir string) Row {
-		c := Collector{DeveloperMode: func() install.DeveloperModeState { return install.DeveloperModeInvalid }}
-		c.DeveloperModeAncestor = func() string { return dir }
+		f := markerFacts(install.DeveloperModeInvalid)
+		if dir != "" {
+			f = markerFactsUnder(soundMarker, "/Library")
+		}
+		c := Collector{DeveloperMode: func() install.DeveloperModeFacts { return f }}
 		r, ok := c.developerModeRow(context.Background())
 		if !ok {
 			t.Fatal("no developer-mode row")
@@ -151,39 +183,55 @@ func TestDeveloperModeInvalidRowNamesAncestorCause(t *testing.T) {
 }
 
 // TestDeveloperModeInvalidDirectoryRemedy pins that a directory at the marker
-// path gets a removal command rm accepts, in the row and in the alert, that an
-// ancestor cause wins over it, and that a file keeps the plain command.
+// path gets a removal command rm accepts, in the row and in the alert; that a
+// bad directory above it gets the ancestor remedy instead, because rm -r must
+// not be aimed through it; and that a file keeps the plain command.
 func TestDeveloperModeInvalidDirectoryRemedy(t *testing.T) {
 	t.Parallel()
 	const dirRemedy = "sudo rm -r /Library/k3sm.developer-mode"
+	dirMarker := install.OwnedEntry{Kind: install.EntryDir, Mode: 0o755}
 	for _, tc := range []struct {
-		name     string
-		isDir    func() bool
-		ancestor string
-		want     string
+		name string
+		f    install.DeveloperModeFacts
+		want string
+		// wantCmd is the alert's command; a remedy done by hand has none.
+		wantCmd string
 	}{
-		{name: "a directory", isDir: func() bool { return true }, want: dirRemedy},
-		{name: "a file", isDir: func() bool { return false }, want: developerModeInvalidRemedy},
-		{name: "no reader wired", want: developerModeInvalidRemedy},
-		{name: "a directory above is the cause", isDir: func() bool { return true }, ancestor: "/Library", want: fmt.Sprintf(developerModeAncestorRemedyFmt, "/Library")},
+		{name: "a directory", f: markerFactsUnder(dirMarker, ""), want: dirRemedy, wantCmd: dirRemedy},
+		{name: "a file", f: markerFacts(install.DeveloperModeInvalid), want: developerModeInvalidRemedy, wantCmd: developerModeInvalidRemedy},
+		{name: "a directory under a bad /Library", f: markerFactsUnder(dirMarker, "/Library"), want: fmt.Sprintf(developerModeAncestorRemedyFmt, "/Library")},
+		{name: "a directory under a bad /", f: markerFactsUnder(dirMarker, "/"), want: fmt.Sprintf(developerModeAncestorRemedyFmt, "/")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			c := Collector{
-				DeveloperMode:            func() install.DeveloperModeState { return install.DeveloperModeInvalid },
-				DeveloperModeAncestor:    func() string { return tc.ancestor },
-				DeveloperModeMarkerIsDir: tc.isDir,
-			}
+			c := Collector{DeveloperMode: func() install.DeveloperModeFacts { return tc.f }}
 			r, ok := c.developerModeRow(context.Background())
 			if !ok || r.Remedy != tc.want {
 				t.Fatalf("row %+v, ok %v; want remedy %q", r, ok, tc.want)
 			}
 			a := developerModeAlert(r)
-			if a == nil || len(a.Fix) != 1 {
-				t.Fatalf("alert = %+v", a)
+			if a == nil || len(a.Fix) != 1 || a.Fix[0].Command != tc.wantCmd {
+				t.Fatalf("alert = %+v, want command %q", a, tc.wantCmd)
 			}
-			if tc.ancestor == "" && a.Fix[0].Command != tc.want {
-				t.Errorf("alert command = %q, want %q", a.Fix[0].Command, tc.want)
+		})
+	}
+}
+
+// TestDeveloperModeRowReadsOneSnapshot pins that a row takes one read of the
+// marker, whatever it finds, so its state, cause and remedy describe one moment.
+func TestDeveloperModeRowReadsOneSnapshot(t *testing.T) {
+	t.Parallel()
+	for _, state := range []install.DeveloperModeState{install.DeveloperModeAbsent, install.DeveloperModeMarkerOn, install.DeveloperModeInvalid, install.DeveloperModeUnknown} {
+		t.Run(string(state), func(t *testing.T) {
+			t.Parallel()
+			reads := 0
+			c := Collector{DeveloperMode: func() install.DeveloperModeFacts {
+				reads++
+				return markerFacts(state)
+			}}
+			c.developerModeRow(context.Background())
+			if reads != 1 {
+				t.Errorf("the row read the marker %d times, want 1", reads)
 			}
 		})
 	}
@@ -206,7 +254,7 @@ func TestDeveloperModeUnknownRow(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			c := Collector{EUID: tc.euid, DeveloperMode: func() install.DeveloperModeState { return install.DeveloperModeUnknown }}
+			c := Collector{EUID: tc.euid, DeveloperMode: func() install.DeveloperModeFacts { return markerFacts(install.DeveloperModeUnknown) }}
 			r, ok := c.developerModeRow(context.Background())
 			if !ok {
 				t.Fatal("no row: an unread marker must not read as absent")
@@ -214,7 +262,7 @@ func TestDeveloperModeUnknownRow(t *testing.T) {
 			if r.State != StateUnknown || r.Severity != SeverityWarn || r.Remedy != tc.wantRemedy {
 				t.Errorf("row = %+v", r)
 			}
-			for _, claim := range []string{"marker exists", "stay on", "ignored"} {
+			for _, claim := range []string{"marker exists", "stay on", "ignored", "this account"} {
 				if strings.Contains(r.Detail, claim) {
 					t.Errorf("detail %q claims %q", r.Detail, claim)
 				}
@@ -226,7 +274,7 @@ func TestDeveloperModeUnknownRow(t *testing.T) {
 			if a == nil || len(a.Fix) != 1 || a.Fix[0].Command != tc.wantCmd {
 				t.Fatalf("alert = %+v", a)
 			}
-			if !strings.Contains(a.Cause, "cannot say whether developer mode is on") {
+			if !strings.Contains(a.Cause, "cannot say whether developer mode is on") || strings.Contains(a.Cause, "this account") {
 				t.Errorf("alert cause = %q", a.Cause)
 			}
 			if tc.wantCmd == "" && a.Fix[0].Step != tc.wantRemedy {

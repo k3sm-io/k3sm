@@ -29,6 +29,14 @@ import (
 	"testing"
 )
 
+// setMode sets path's mode exactly, past the umask.
+func setMode(t *testing.T, path string, mode os.FileMode) {
+	t.Helper()
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // markerReadDenied is a fake on which one path cannot be read from this
 // account, the way a directory it cannot search hides what is below it.
 type markerReadDenied struct {
@@ -85,20 +93,20 @@ func TestDeveloperModeUnreadableParentIsNotAMarkerFault(t *testing.T) {
 				t.Skip("root searches a directory of mode 000")
 			}
 			root := t.TempDir()
-			chmod(t, root, 0o755)
+			setMode(t, root, 0o755)
 			lib := filepath.Join(root, "Library")
 			if err := os.Mkdir(lib, 0o755); err != nil {
 				t.Fatal(err)
 			}
-			chmod(t, lib, 0o755)
+			setMode(t, lib, 0o755)
 			marker := filepath.Join(lib, "k3sm.developer-mode")
 			if tc.marker {
 				if err := os.WriteFile(marker, []byte("x\n"), 0o644); err != nil {
 					t.Fatal(err)
 				}
-				chmod(t, marker, 0o644)
+				setMode(t, marker, 0o644)
 			}
-			chmod(t, lib, 0)
+			setMode(t, lib, 0)
 			t.Cleanup(func() { _ = os.Chmod(lib, 0o755) })
 
 			sys := NewDarwinSystem()
@@ -112,9 +120,13 @@ func TestDeveloperModeUnreadableParentIsNotAMarkerFault(t *testing.T) {
 
 			// The same tree, once the parent can be searched, is what the denied
 			// read was hiding: the read did not see it either way.
-			chmod(t, lib, 0o755)
-			if got := developerModeState(readDeveloperModeFacts(sys, root, marker), os.Getuid()); got != tc.want {
-				t.Errorf("state with the parent searchable %s, want %s", got, tc.want)
+			setMode(t, lib, 0o755)
+			want := tc.want
+			if _, err := pathHasACL(root); err != nil && tc.marker {
+				want = DeveloperModeUnknown // a build without cgo reads no ACL
+			}
+			if got := developerModeState(readDeveloperModeFacts(sys, root, marker), os.Getuid()); got != want {
+				t.Errorf("state with the parent searchable %s, want %s", got, want)
 			}
 		})
 	}
@@ -125,9 +137,6 @@ func TestDeveloperModeUnreadableParentIsNotAMarkerFault(t *testing.T) {
 		seedMarkerAncestors(f)
 		f.owners["/Library"] = OwnedEntry{Path: "/Library", Kind: EntryDir, Mode: root0700}
 		assertUnknown(t, ReadDeveloperModeFacts(markerReadDenied{f, fs.ErrPermission}, DeveloperModeMarkerPath), DeveloperModeMarkerPath)
-		if got := ReadDeveloperModeAncestorCause(markerReadDenied{f, fs.ErrPermission}, DeveloperModeMarkerPath); got != "" {
-			t.Errorf("read ancestor cause %q, want none", got)
-		}
 
 		// Root, which can search it, reads a marker there as on: the denied
 		// account has no ground to say the checks stay on.
@@ -216,8 +225,13 @@ func TestDeveloperModeUnknownKeepsTheChecksOn(t *testing.T) {
 		if !r.removed || r.saved != nil {
 			t.Errorf("removed %v, saved %q; want removed with no copy", r.removed, r.saved)
 		}
-		if strings.Contains(logs.String(), "developer mode turned off") {
-			t.Errorf("log = %q claims a marker it could not read was on", logs.String())
+		if !strings.Contains(logs.String(), "removed a developer-mode marker that could not be read") {
+			t.Errorf("log = %q, want the removal to say the marker could not be read", logs.String())
+		}
+		for _, claim := range []string{"developer mode turned off", "invalid"} {
+			if strings.Contains(logs.String(), claim) {
+				t.Errorf("log = %q claims %q of a marker it could not read", logs.String(), claim)
+			}
 		}
 		r.restore(sys, cfg)
 		if slices.ContainsFunc(f.calls, func(c string) bool { return strings.HasPrefix(c, "WriteRootOnlyFile:"+DeveloperModeMarkerPath) }) {
@@ -230,7 +244,7 @@ func TestDeveloperModeUnknownKeepsTheChecksOn(t *testing.T) {
 		f := &fakeSystem{owners: map[string]OwnedEntry{}, acls: map[string]bool{}}
 		seedMarkerAncestors(f)
 		f.removeEntryErrs = map[string]error{DeveloperModeMarkerPath: errors.New("EPERM")}
-		r := &markerRemoval{path: DeveloperModeMarkerPath, team: testTeamID, invalid: true}
+		r := &markerRemoval{path: DeveloperModeMarkerPath, team: testTeamID, unread: true}
 		err := r.drop(markerReadDenied{f, errors.New("EIO")}, Config{}.withDefaults())
 		if err == nil || !r.stillOn() {
 			t.Fatalf("drop = %v, stillOn %v; want the install reverted", err, r.stillOn())
@@ -266,7 +280,88 @@ func TestDeveloperModeMarkerIsDir(t *testing.T) {
 	f := &fakeSystem{owners: map[string]OwnedEntry{}, acls: map[string]bool{}}
 	seedMarkerAncestors(f)
 	f.owners[DeveloperModeMarkerPath] = OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryDir, Mode: 0o755}
-	if !ReadDeveloperModeMarkerIsDir(f, DeveloperModeMarkerPath) {
-		t.Error("ReadDeveloperModeMarkerIsDir = false for a directory at the path")
+	if !DeveloperModeMarkerIsDir(ReadDeveloperModeFacts(f, DeveloperModeMarkerPath)) {
+		t.Error("a directory at the path does not read as one")
+	}
+}
+
+// TestDeveloperModeNonRegularMarkerReadsItsAncestors pins that a marker that is
+// not a regular file still has the directories above it read, so a bad one is
+// named, and that a probe of them that fails, which is every ACL probe in a
+// build without cgo, is a read that failed rather than a directory to repair.
+func TestDeveloperModeNonRegularMarkerReadsItsAncestors(t *testing.T) {
+	t.Parallel()
+	for _, kind := range []EntryKind{EntryDir, EntrySymlink, EntryOther} {
+		seed := func() *fakeSystem {
+			f := &fakeSystem{owners: map[string]OwnedEntry{}, acls: map[string]bool{}}
+			seedMarkerAncestors(f)
+			f.owners[DeveloperModeMarkerPath] = OwnedEntry{Path: DeveloperModeMarkerPath, Kind: kind, Mode: 0o755}
+			return f
+		}
+		t.Run(fmt.Sprintf("kind %v under a bad directory", kind), func(t *testing.T) {
+			t.Parallel()
+			f := seed()
+			f.owners["/Library"] = OwnedEntry{Path: "/Library", Kind: EntryDir, Mode: 0o775}
+			facts := ReadDeveloperModeFacts(f, DeveloperModeMarkerPath)
+			if got := DeveloperModeMarkerState(facts); got != DeveloperModeInvalid {
+				t.Errorf("state %s, want %s", got, DeveloperModeInvalid)
+			}
+			if got := DeveloperModeAncestorCause(facts, DeveloperModeMarkerPath); got != "/Library" {
+				t.Errorf("cause %q, want /Library", got)
+			}
+		})
+		t.Run(fmt.Sprintf("kind %v under sound directories", kind), func(t *testing.T) {
+			t.Parallel()
+			facts := ReadDeveloperModeFacts(seed(), DeveloperModeMarkerPath)
+			if got := DeveloperModeMarkerState(facts); got != DeveloperModeInvalid {
+				t.Errorf("state %s, want %s", got, DeveloperModeInvalid)
+			}
+			if got := DeveloperModeAncestorCause(facts, DeveloperModeMarkerPath); got != "" {
+				t.Errorf("cause %q, want none", got)
+			}
+		})
+		t.Run(fmt.Sprintf("kind %v with every ACL probe failing", kind), func(t *testing.T) {
+			t.Parallel()
+			f := seed()
+			noCgo := errors.New("this k3sm was built without cgo")
+			f.hasACLErrs = map[string]error{"/": noCgo, "/Library": noCgo}
+			facts := ReadDeveloperModeFacts(f, DeveloperModeMarkerPath)
+			if got := DeveloperModeMarkerState(facts); got != DeveloperModeUnknown {
+				t.Errorf("state %s, want %s", got, DeveloperModeUnknown)
+			}
+			if got := DeveloperModeAncestorCause(facts, DeveloperModeMarkerPath); got != "" {
+				t.Errorf("cause %q, want none: / was not found at fault", got)
+			}
+			if DeveloperModeMarkerIsDir(facts) {
+				t.Error("a read that failed offers a directory removal")
+			}
+		})
+	}
+}
+
+// TestDeveloperModeDisownReportsWhatItProved pins the log of a marker that was
+// handed to nobody and then could not be read: it says the handover happened
+// and that the rest is inferred, and does not state the outcome as read.
+func TestDeveloperModeDisownReportsWhatItProved(t *testing.T) {
+	t.Parallel()
+	f := &fakeSystem{owners: map[string]OwnedEntry{}}
+	putUnclearableMarker(t, f, EntryRegular)
+	f.removeEntryErrs = map[string]error{DeveloperModeMarkerPath: errors.New("EPERM")}
+	var logs strings.Builder
+	cfg := Config{Logger: slog.New(slog.NewTextHandler(&logs, nil))}.withDefaults()
+	r := &markerRemoval{path: DeveloperModeMarkerPath}
+	if err := r.drop(&rereadFailsAfterChown{fakeSystem: f}, cfg); err != nil {
+		t.Fatalf("drop = %v, want nil", err)
+	}
+	if r.stillOn() {
+		t.Error("a marker handed to nobody counts as still on")
+	}
+	for _, want := range []string{"handed to nobody", "inferred from the handover and not confirmed"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("log = %q, want %q", logs.String(), want)
+		}
+	}
+	if strings.Contains(logs.String(), "reads unknown") {
+		t.Errorf("log = %q states an outcome the read did not show", logs.String())
 	}
 }

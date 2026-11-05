@@ -245,10 +245,8 @@ func newStatusCollector() status.Collector {
 		// The developer-mode marker, judged by the installer's own reader
 		// (lstat, no symlink followed, plus the ACL probe; no privilege
 		// needed), and the installed k3sm's signing for the row's wide key.
-		DeveloperMode:            statusDeveloperMode,
-		DeveloperModeAncestor:    func() string { return statusDeveloperModeAncestor(install.NewDarwinSystem()) },
-		DeveloperModeMarkerIsDir: func() bool { return statusDeveloperModeIsDir(install.NewDarwinSystem()) },
-		SigningTeamID:            install.CodesignTeamID{}.TeamID,
+		DeveloperMode: func() install.DeveloperModeFacts { return statusDeveloperMode(install.NewDarwinSystem()) },
+		SigningTeamID: install.CodesignTeamID{}.TeamID,
 		// The join target of a worker, through the installer's one reader of
 		// the agent plist's --server (the agent arguments record does not carry
 		// it, and the plist is world-readable, so this works without sudo).
@@ -289,21 +287,9 @@ func statusAgentJoinServer() (string, error) {
 }
 
 // statusDeveloperMode reads the developer-mode marker through the installer's
-// own reader.
-func statusDeveloperMode() install.DeveloperModeState {
-	return install.ReadDeveloperModeState(install.NewDarwinSystem(), install.DeveloperModeMarkerPath)
-}
-
-// statusDeveloperModeAncestor names the directory above the developer-mode
-// marker that makes it invalid, through the installer's own reader.
-func statusDeveloperModeAncestor(sys install.System) string {
-	return install.ReadDeveloperModeAncestorCause(sys, install.DeveloperModeMarkerPath)
-}
-
-// statusDeveloperModeIsDir reports whether a directory is at the
-// developer-mode marker path, through the installer's own reader.
-func statusDeveloperModeIsDir(sys install.System) bool {
-	return install.ReadDeveloperModeMarkerIsDir(sys, install.DeveloperModeMarkerPath)
+// own reader: the one snapshot the row judges.
+func statusDeveloperMode(sys install.System) install.DeveloperModeFacts {
+	return install.ReadDeveloperModeFacts(sys, install.DeveloperModeMarkerPath)
 }
 
 // statusStopMarker reads the stop marker through the installer's own reader.

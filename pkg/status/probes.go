@@ -365,18 +365,10 @@ type Collector struct {
 	// cannot read the work dir vouch for what that endpoint answers only when
 	// it passes. OPTIONAL: nil anchors nothing, and those rows stay unknown.
 	ServerAnchor Anchor
-	// DeveloperMode reads the developer-mode marker
-	// (install.ReadDeveloperModeState in production). OPTIONAL: nil leaves
-	// the developer-mode row out.
-	DeveloperMode func() install.DeveloperModeState
-	// DeveloperModeAncestor names the directory above the marker that makes
-	// an invalid marker invalid (install.ReadDeveloperModeAncestorCause in
-	// production), "" when the marker file itself is the cause. OPTIONAL: nil
-	// reads as the marker file.
-	DeveloperModeAncestor func() string
-	// DeveloperModeMarkerIsDir reports whether a directory is at the marker
-	// path, which takes a different removal command. Nil keeps the plain one.
-	DeveloperModeMarkerIsDir func() bool
+	// DeveloperMode reads the developer-mode marker and the directories above
+	// it (install.ReadDeveloperModeFacts in production), once per row. Nil
+	// leaves the developer-mode row out.
+	DeveloperMode func() install.DeveloperModeFacts
 	// SigningTeamID reads the Team ID of a binary's signature
 	// (install.CodesignTeamID in production), for the developer-mode row's
 	// wide signing key. OPTIONAL: nil leaves that key out.

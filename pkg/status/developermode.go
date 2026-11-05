@@ -37,8 +37,8 @@ const (
 	developerModeInvalidDetail = "A developer-mode marker exists but is not a root-owned file, so it is ignored and the signature checks stay on"
 )
 
-// The ancestor cause: the marker is fine and a directory above it is not, so
-// removing the marker clears the row and leaves the directory to fix.
+// The ancestor cause: a directory above the marker is not sound, so removing
+// the marker clears the row and leaves the directory to fix.
 const (
 	developerModeAncestorDetailFmt = "A developer-mode marker exists but %s, a directory above it, is not a root-owned real directory that neither group nor others can write, with no ACL, so the marker is ignored and the signature checks stay on"
 	developerModeAncestorRemedyFmt = "Make %s a root-owned real directory that neither group nor others can write, with no ACL; removing the marker clears this row but leaves that directory as it is"
@@ -54,16 +54,18 @@ const (
 
 // The unknown state: the read could not see the path. It says neither that a
 // marker exists nor that the signature checks stay on, because root may read a
-// valid marker there that this account cannot. As root the report has nothing
-// further to ask, so the remedy looks at the path instead.
+// valid marker there that this account cannot. It does not blame the account,
+// because a build without cgo fails the same read for every account. As root
+// the report has nothing further to ask, so the remedy looks at the path.
 const (
-	developerModeUnknownDetail     = "The developer-mode marker path could not be read from this account, so this report cannot say whether developer mode is on"
+	developerModeUnknownDetail     = "The developer-mode marker path could not be read, so this report cannot say whether developer mode is on"
 	developerModeUnknownRootRemedy = "Check the path and the directories above it with ls -ldO@e " + install.DeveloperModeMarkerPath + " /Library /"
 )
 
 // developerModeRow reports the developer-mode marker: on for a valid one,
 // invalid for anything else at the path, unknown when the read could not see
-// the path, and no row when the path is absent.
+// the path, and no row when the path is absent. One read of the marker decides
+// the state, the cause and the remedy, so they cannot describe different paths.
 // The wide signing key names how the installed k3sm is signed, when
 // SigningTeamID is wired and can tell.
 func (c Collector) developerModeRow(ctx context.Context) (Row, bool) {
@@ -71,18 +73,16 @@ func (c Collector) developerModeRow(ctx context.Context) (Row, bool) {
 		return Row{}, false
 	}
 	row := Row{Name: RowDeveloperMode, Severity: SeverityWarn}
-	switch c.DeveloperMode() {
+	facts := c.DeveloperMode()
+	switch install.DeveloperModeMarkerState(facts) {
 	case install.DeveloperModeMarkerOn:
 		row.State, row.Detail, row.Remedy = StateOn, developerModeOnDetail, developerModeOnRemedy
 	case install.DeveloperModeInvalid:
 		row.State, row.Detail, row.Remedy = StateInvalid, developerModeInvalidDetail, developerModeInvalidRemedy
-		if c.DeveloperModeAncestor != nil {
-			if dir := c.DeveloperModeAncestor(); dir != "" {
-				row.Detail = fmt.Sprintf(developerModeAncestorDetailFmt, dir)
-				row.Remedy = fmt.Sprintf(developerModeAncestorRemedyFmt, dir)
-			}
-		}
-		if row.Remedy == developerModeInvalidRemedy && c.DeveloperModeMarkerIsDir != nil && c.DeveloperModeMarkerIsDir() {
+		if dir := install.DeveloperModeAncestorCause(facts, install.DeveloperModeMarkerPath); dir != "" {
+			row.Detail = fmt.Sprintf(developerModeAncestorDetailFmt, dir)
+			row.Remedy = fmt.Sprintf(developerModeAncestorRemedyFmt, dir)
+		} else if install.DeveloperModeMarkerIsDir(facts) {
 			row.Remedy = developerModeInvalidDirRemedy
 		}
 	case install.DeveloperModeUnknown:
@@ -131,7 +131,7 @@ func developerModeAlert(r Row) *Alert {
 		return alert("Something is at the developer-mode marker path that is not a root-owned file nobody else can write; it is ignored and the signature checks stay on.", docsDeveloperMode,
 			cmd("Remove it", r.Remedy))
 	case StateUnknown:
-		const cause = "The developer-mode marker path could not be read from this account, so this report cannot say whether developer mode is on."
+		const cause = developerModeUnknownDetail + "."
 		if r.Remedy == needsAdminRemedy {
 			return alert(cause, docsDeveloperMode, reportAsAdmin())
 		}

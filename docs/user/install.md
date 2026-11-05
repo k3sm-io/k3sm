@@ -226,8 +226,8 @@ update, stop and start it.
   An invalid marker is ignored and the checks stay on. The row's `detail` says whether the marker
   file or a directory above it is the cause and names the directory. Removing the marker clears the
   row either way, and in the second case leaves that directory as it is. The state is `unknown` when
-  the path cannot be read from the account running `k3sm status`: the report cannot say whether the
-  mode is on, and `sudo k3sm status` reads it. `--developer-mode off` removes the marker once the install root's swap has
+  the path cannot be read: the report cannot say whether the mode is on, and when the account running
+  `k3sm status` is the reason, `sudo k3sm status` reads it. `--developer-mode off` removes the marker once the install root's swap has
   committed, and if the install is then rolled back, a valid marker it removed is put back. The status `verdict` stays `ok`
   while the mode is on, and only the `developer-mode` row warns, so automation that audits a Mac reads
   that row rather than the verdict. A release build of the app never uses the mode.

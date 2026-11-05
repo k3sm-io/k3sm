@@ -654,7 +654,7 @@ func alertCases() []alertCase {
 func developerModeRowFor(state install.DeveloperModeState) func(t *testing.T) Row {
 	return func(t *testing.T) Row {
 		t.Helper()
-		r, ok := Collector{DeveloperMode: func() install.DeveloperModeState { return state }}.developerModeRow(context.Background())
+		r, ok := Collector{DeveloperMode: func() install.DeveloperModeFacts { return markerFacts(state) }}.developerModeRow(context.Background())
 		if !ok {
 			t.Fatalf("no developer-mode row for a marker %s", state)
 		}
