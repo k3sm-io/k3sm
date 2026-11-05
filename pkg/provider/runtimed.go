@@ -20,11 +20,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"math"
 	"net/http"
+	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -455,6 +458,14 @@ type RuntimedConfig struct {
 	// Root is runtimed's on-disk root (image cache + pod dirs); empty uses the
 	// runtimed default (/var/lib/k3sm).
 	Root string
+	// StatusRecordDir is the data root's status directory, where this node
+	// publishes the records `k3sm status` reads. The records are owned by the uid
+	// pods run as, so the Seatbelt deny runtimed renders from this value is their
+	// only write barrier, and the data root is Root only when the pod root is left
+	// at its default. Empty (the standalone `k3sm node`, which publishes nothing)
+	// renders no extra deny. NewRuntimed refuses a value the deny would not match
+	// (ErrStatusRecordDirNotCanonical).
+	StatusRecordDir string
 	// DyldShim, when set, is the getaddrinfo DNS shim dylib injected into each
 	// pod via the PodBox annotation runtimed maps to DYLD_INSERT_LIBRARIES. The
 	// file is also added to every pod's Seatbelt read allow (stampShimReadPaths).
@@ -654,6 +665,13 @@ func NewRuntimed(ctx context.Context, cfg RuntimedConfig) (*runtimedRuntime, err
 	if _, err := normalizeLocalPortDenies(cfg.DeniedLocalPorts); err != nil {
 		return nil, fmt.Errorf("init runtimed: %w", err)
 	}
+	// Also before any real construction, and logged as well as returned: this
+	// refusal stops the node, and what it protects fails silently if ignored.
+	statusRecordDir, err := statusRecordDirOf(cfg)
+	if err != nil {
+		log.Error("refusing to start: pods could write the status records", "err", err)
+		return nil, fmt.Errorf("init runtimed: %w", err)
+	}
 	// The budget history opens before anything runs, so the first exit the
 	// startup attach observes is classified against the persisted intents.
 	var history *BudgetHistory
@@ -741,11 +759,17 @@ func NewRuntimed(ctx context.Context, cfg RuntimedConfig) (*runtimedRuntime, err
 		// reading like protection. Resolved here through the same expression the
 		// provider's own tree uses, so the denied path and the written path are
 		// one value.
-		PodLogsDir:   podLogsDirOf(cfg),
-		PathShimPath: cfg.PathShim,
-		ShadowBinDir: cfg.ShadowBinDir,
+		PodLogsDir: podLogsDirOf(cfg),
+		// The status records' real location, denied beside <Root>/status. On a
+		// default node the two are one path and the profile does not change.
+		StatusRecordDir: statusRecordDir,
+		PathShimPath:    cfg.PathShim,
+		ShadowBinDir:    cfg.ShadowBinDir,
 	}, deps)
 	if err != nil {
+		if errors.Is(err, sandbox.ErrInvalidStatusRecordDir) {
+			log.Error("refusing to start: pods could write the status records", "err", err)
+		}
 		return nil, fmt.Errorf("init runtimed: %w", err)
 	}
 	r := newRuntimedWith(rt, cfg, resolver, log)
@@ -916,6 +940,67 @@ func podLogsDirOf(cfg RuntimedConfig) string {
 		return podlogs.DefaultPodLogsDir
 	}
 	return cfg.PodLogsDir
+}
+
+// ErrStatusRecordDirNotCanonical reports a status record directory that exists
+// under a path other than the one configured, a symlink or a spelling the macOS
+// firmlinks do not explain. libsandbox matches resolved paths, so the Seatbelt
+// deny written from the configured string would match nothing, and pods could
+// forge the records with no error from anything.
+var ErrStatusRecordDirNotCanonical = errors.New("status record dir is not its own resolved path")
+
+// statusRecordDirOf returns the status record directory the Seatbelt deny is
+// written from, or an error when the deny could not match it. A relative value
+// (a relative --work-dir) is made absolute, because that is where the records it
+// names are written, and runtime.New refuses a relative one.
+func statusRecordDirOf(cfg RuntimedConfig) (string, error) {
+	dir := cfg.StatusRecordDir
+	if dir != "" && !filepath.IsAbs(dir) {
+		abs, err := filepath.Abs(dir)
+		if err != nil {
+			return "", fmt.Errorf("%w: %q: %w", ErrStatusRecordDirNotCanonical, dir, err)
+		}
+		dir = abs
+	}
+	if err := checkStatusRecordDir(dir); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+// checkStatusRecordDir refuses a status record directory whose resolved path is
+// not the configured string, the /var, /tmp and /etc firmlinks aside. A directory
+// that does not exist has nothing to mismatch yet (the writers skip it). One that
+// cannot be read fails closed, because the deny could not be shown to match.
+func checkStatusRecordDir(dir string) error {
+	if dir == "" {
+		return nil
+	}
+	if _, err := os.Lstat(dir); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("%w: %q: %w", ErrStatusRecordDirNotCanonical, dir, err)
+	}
+	resolved, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return fmt.Errorf("%w: %q: %w", ErrStatusRecordDirNotCanonical, dir, err)
+	}
+	if withoutFirmlink(resolved) != withoutFirmlink(dir) {
+		return fmt.Errorf("%w: %q resolves to %q", ErrStatusRecordDirNotCanonical, dir, resolved)
+	}
+	return nil
+}
+
+// withoutFirmlink returns path in its /var, /tmp or /etc spelling when it is
+// written under the /private directory those three resolve to.
+func withoutFirmlink(path string) string {
+	for _, target := range []string{"/private/var", "/private/tmp", "/private/etc"} {
+		if path == target || strings.HasPrefix(path, target+"/") {
+			return strings.TrimPrefix(path, "/private")
+		}
+	}
+	return path
 }
 
 // rotationMaxSize returns the configured container-log max size, defaulting to
