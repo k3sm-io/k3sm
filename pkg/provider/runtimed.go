@@ -261,6 +261,15 @@ type runtimedRuntime struct {
 	// admitted create in flight yields to it, so the decision and its result are
 	// published together. Guarded by mu; created on first use.
 	admitting map[string]int
+	// admitSettled holds, per pod id, a channel closed when the pod's last
+	// admitted create returns, for an UpdatePod waiting for the verdict
+	// (admission.go, awaitUpdateVerdictLocked). Guarded by mu; created on first use.
+	admitSettled map[string]chan struct{}
+	// updating counts, per pod id, the UpdatePods past their terminal check that
+	// have not returned. Each may still acquire the pod's /32, so a release cannot
+	// start while it is non-zero (admission.go, claimFenceReleaseLocked). Guarded
+	// by mu; created on first use.
+	updating map[string]int
 	// admittedHook, when set, runs in CreatePod right after admission let the
 	// create through, before anything is registered: the seam a test uses to hold
 	// one create inside the admission window. Nil in production; set before any
@@ -277,6 +286,12 @@ type runtimedRuntime struct {
 	// in production; set before any create and never changed, read without mu.
 	fenceReleaseHook func(podID string)
 	fenceWaitHook    func(podID string)
+	// updateWaitHook and updateCheckedHook, when set, run in UpdatePod before it
+	// waits for an admission verdict and right after it passed its terminal
+	// check: the seams a test uses to choose how an update overlaps a create. Nil
+	// in production; set before any call and never changed, read without mu.
+	updateWaitHook    func(podID string)
+	updateCheckedHook func(podID string)
 	// compensating is the set of pod ids with a compensating delete owed and in
 	// flight — a guest a parked pod's retry built after the pod was deleted, which
 	// nothing but this provider knows about (runtimed_pull.go). It is
@@ -1955,26 +1970,19 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 		// keeps them: its DeletePod tears them down. All of them are keyed by
 		// the pod's UID, so the release is decided under r.mu: this create ends
 		// its own in-flight count first, and releases only when no other
-		// admitted create of the pod is in flight. Otherwise that create owns
-		// the resources (it reaches this fence itself, or runs the pod after a
-		// delete forgot the rejection), and releasing would take them from it.
-		// While the release runs, fenceReleasing makes admitOnCreate hold every
-		// new create of the pod, so none is admitted in the window after the
-		// unlock. The release takes only its own leaf locks.
+		// admitted create or update of the pod is in flight. Otherwise that call
+		// owns the resources (it reaches this decision itself, or runs the pod
+		// after a delete forgot the rejection), and releasing would take them
+		// from it. While the release runs, fenceReleasing holds every new create
+		// and update of the pod, so none acquires in the window after the unlock.
+		// The release takes only its own leaf locks.
 		admitted.doneLocked()
-		var released chan struct{}
 		// When the release is skipped because another admitted create is in
 		// flight and that create then fails before its own fence, nothing
 		// releases the rejected pod's resources. That needs a rejected track
 		// beside two in-flight creates, which admitOnCreate makes close to
 		// unreachable.
-		if old.rejected && r.admitting[id] == 0 && r.fenceReleasing[id] == nil {
-			released = make(chan struct{})
-			if r.fenceReleasing == nil {
-				r.fenceReleasing = map[string]chan struct{}{}
-			}
-			r.fenceReleasing[id] = released
-		}
+		released := r.claimFenceReleaseLocked(id, old)
 		r.mu.Unlock()
 		r.log.Warn("CreatePod: the pod became terminal on this node while it was being created; not creating it",
 			"namespace", pod.Namespace, "name", pod.Name, "uid", id, "rejected", old.rejected, "released", released != nil)
@@ -2226,6 +2234,11 @@ func (r *runtimedRuntime) completeCreate(pod *corev1.Pod, t *podTrack, rs *runti
 // holds for a terminal track and, with no track, for a pod whose apiserver
 // object is terminal (CreatePod's fence), which a restarted node no longer
 // tracks.
+//
+// Virtual Kubelet orders calls per pod, and this does not depend on it. An update
+// overlapping an admission waits for the verdict (awaitUpdateVerdictLocked); a
+// refusal landing behind one past its check is judged again before the runtime
+// call, and what the update took is released when it returns (updateDone).
 func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error {
 	// Identity binding kept for the SAME in-process seam CreatePod uses, but
 	// UpdatePod itself never mints a token or re-reads a ConfigMap/Secret
@@ -2244,6 +2257,10 @@ func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error 
 	ctx = withPodIdentity(ctx, pod)
 	id := string(pod.UID)
 	r.mu.Lock()
+	if err := r.awaitUpdateVerdictLocked(ctx, pod); err != nil {
+		r.mu.Unlock()
+		return fmt.Errorf("update pod %s/%s: wait for the admission verdict: %w", pod.Namespace, pod.Name, err)
+	}
 	t, tracked := r.track[id]
 	terminal := isEvictedPod(pod) || isBudgetRejectedPod(pod)
 	if tracked {
@@ -2268,7 +2285,15 @@ func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error 
 		previous = t.pod
 		t.pod = pod.DeepCopy()
 	}
+	if r.updating == nil {
+		r.updating = map[string]int{}
+	}
+	r.updating[id]++
 	r.mu.Unlock()
+	defer r.updateDone(pod)
+	if hook := r.updateCheckedHook; hook != nil {
+		hook(id)
+	}
 	if tracked {
 		// A container whose image reference changed is a different pull: retire
 		// the old reference's schedule and attempt the new one now. This is the
@@ -2301,6 +2326,12 @@ func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error 
 	box, err := r.buildBox(ctx, pod, podIP)
 	if err != nil {
 		return fmt.Errorf("translate pod %s/%s: %w", pod.Namespace, pod.Name, err)
+	}
+	// A refusal that landed since the check holds: runtimed never heard of the
+	// pod, and updateDone releases what this update took. One landing after this
+	// read costs an RPC runtimed answers NotFound; the release still runs.
+	if r.refusedNow(id) {
+		return nil
 	}
 	resp, err := r.rt.UpdatePod(ctx, &runtimev1.UpdatePodRequest{Pod: box})
 	if err != nil {

@@ -114,6 +114,9 @@ pin, its date, and the tarball's sha256.
 
 ### Fixed
 
+- A refused pod ends holding no address, lo0 alias or reference entry even when an update overlaps its
+  admission: the update waits for the admission verdict, and one already under way when the refusal
+  lands stops before the runtime call and frees what it took.
 - `k3sm stop` and `k3sm uninstall` stop a `vm` helper whose path spells its version in a different
   case than the versions directory. It was reported as no longer retained and left running. A
   stray file or symlink named like a version no longer counts as a retained version.
