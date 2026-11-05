@@ -70,11 +70,13 @@ delseeds="$(find "$delcorpus" -type f -name 'seed-*' | wc -l | tr -d ' ')"
 [ "$delseeds" -ge 20 ] || { echo "B1038: FAIL: only $delseeds committed FuzzConditionalDelete seeds"; exit 1; }
 
 # run <package> <regexp> <test>... runs the tests and requires each to pass by name.
+# run_tags names a build tag for the tests that need a real socket.
 out=""
+run_tags=""
 run() {
 	local pkg="$1" re="$2"
 	shift 2
-	out="$(go test -race -count=1 -v -run "$re" "$pkg" 2>&1)" || {
+	out="$(go test -race -count=1 -v ${run_tags:+-tags "$run_tags"} -run "$re" "$pkg" 2>&1)" || {
 		printf '%s\n' "$out"; echo "B1038: FAIL: $pkg"; exit 1; }
 	printf '%s\n' "$out" | grep -E '^(--- |ok)'
 	# A test that does not run is not a pass.
@@ -97,11 +99,15 @@ done
 ran="$(printf '%s\n' "$out" | grep -c -- '--- PASS: FuzzHandlers/seed-')"
 [ "$ran" -eq "$seeds" ] || { echo "B1038: FAIL: $ran of $seeds FuzzHandlers seeds ran"; exit 1; }
 
-run ./pkg/ociregistry/api/ '^(FuzzConditionalDelete|TestSpaceSharePerPrincipal|TestCatalogAsksOncePerVisit|TestBlobFloor|TestFloorWriter|TestBodyFloorWindow|TestUploadSpaceIsHeldInAggregate|TestCommitForgetsTheSessionOnAPanic|TestConditionalDelete)$' \
-	FuzzConditionalDelete TestSpaceSharePerPrincipal TestCatalogAsksOncePerVisit TestBlobFloor TestFloorWriter TestBodyFloorWindow TestUploadSpaceIsHeldInAggregate TestCommitForgetsTheSessionOnAPanic TestConditionalDelete
+run ./pkg/ociregistry/api/ '^(FuzzConditionalDelete|TestSpaceSharePerPrincipal|TestCatalogAsksOncePerVisit|TestFloorWriter|TestBodyFloorWindow|TestUploadSpaceIsHeldInAggregate|TestCommitForgetsTheSessionOnAPanic|TestConditionalDelete)$' \
+	FuzzConditionalDelete TestSpaceSharePerPrincipal TestCatalogAsksOncePerVisit TestFloorWriter TestBodyFloorWindow TestUploadSpaceIsHeldInAggregate TestCommitForgetsTheSessionOnAPanic TestConditionalDelete
 printf '%s\n' "$out" | grep -q -- '--- PASS: TestConditionalDelete/a_conditional_digest_DELETE_refuses_a_digest_a_row_tags' || { echo "B1038: FAIL: the tagged-digest refusal did not pass"; exit 1; }
 ran="$(printf '%s\n' "$out" | grep -c -- '--- PASS: FuzzConditionalDelete/seed-')"
 [ "$ran" -eq "$delseeds" ] || { echo "B1038: FAIL: $ran of $delseeds FuzzConditionalDelete seeds ran"; exit 1; }
+# TestBlobFloor stalls a reader on a real socket, so it lives in the integration tier.
+run_tags=integration
+run ./pkg/ociregistry/api/ '^TestBlobFloor$' TestBlobFloor
+run_tags=""
 run ./pkg/ociregistry/auth/ '^TestSessionShare$' TestSessionShare
 run ./pkg/registrysvc/ '^TestPruneThroughTheStore$' TestPruneThroughTheStore
 printf '%s\n' "$out" | grep -q -- '--- PASS: TestPruneThroughTheStore/a_prune_concurrent_with_a_push_does_not_lose_the_pushed_tag' || { echo "B1038: FAIL: the concurrent prune did not pass"; exit 1; }
