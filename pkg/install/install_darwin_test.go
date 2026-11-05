@@ -26,6 +26,8 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // The launcher-link half of the production darwin System, exercised against a
@@ -1789,6 +1791,77 @@ func TestEnsureFileOwnedBy(t *testing.T) {
 		}
 		if err := ensureFileOwnedBy(path, uid, gid, 0o600); !errors.Is(err, ErrNotRegularFile) {
 			t.Fatalf("ensureFileOwnedBy = %v, want ErrNotRegularFile", err)
+		}
+	})
+}
+
+// TestEnsureFileOwnedByRefusesHardlinkWithRemedy pins that the hard link refusal
+// names the file to remove and that removing it is safe.
+func TestEnsureFileOwnedByRefusesHardlinkWithRemedy(t *testing.T) {
+	root := t.TempDir()
+	other := filepath.Join(root, "elsewhere")
+	if err := os.WriteFile(other, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "runtimed.lock")
+	if err := os.Link(other, path); err != nil {
+		t.Fatal(err)
+	}
+	err := ensureFileOwnedBy(path, os.Getuid(), os.Getgid(), 0o600)
+	if !errors.Is(err, errHardlinkRefused) || !errors.Is(err, ErrNotRegularFile) {
+		t.Fatalf("ensureFileOwnedBy = %v, want the hard link refusal", err)
+	}
+	for _, want := range []string{"sudo rm " + path, "safe to remove", "no state"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not contain %q", err, want)
+		}
+	}
+}
+
+// TestEnsureFileOwnedByViaSeams proves the ownership is applied through the
+// opened descriptor with the requested owner, and that an entry swapped to a
+// symlink between the lstat and the open is refused.
+func TestEnsureFileOwnedByViaSeams(t *testing.T) {
+	t.Run("fchown is issued on the opened fd with a different owner", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "runtimed.lock")
+		var openedFD, gotFD, gotUID, gotGID int
+		calls := 0
+		ops := fileOps{
+			open: func(p string, m int, perm uint32) (int, error) {
+				fd, err := unix.Open(p, m, perm)
+				openedFD = fd
+				return fd, err
+			},
+			fchown: func(fd, uid, gid int) error {
+				calls++
+				gotFD, gotUID, gotGID = fd, uid, gid
+				return nil
+			},
+		}
+		wantUID, wantGID := os.Getuid()+1, os.Getgid()+1
+		if err := ensureFileOwnedByVia(ops, path, wantUID, wantGID, 0o600); err != nil {
+			t.Fatalf("ensureFileOwnedByVia: %v", err)
+		}
+		if calls != 1 || gotFD != openedFD || gotUID != wantUID || gotGID != wantGID {
+			t.Errorf("fchown calls=%d fd=%d owner=%d:%d, want 1 call on fd %d as %d:%d", calls, gotFD, gotUID, gotGID, openedFD, wantUID, wantGID)
+		}
+		assertMode(t, path, 0o600)
+	})
+
+	t.Run("a symlink swapped in after the lstat is refused", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "runtimed.lock")
+		ops := fileOps{
+			open: func(p string, m int, perm uint32) (int, error) {
+				return -1, unix.ELOOP
+			},
+			fchown: func(fd, uid, gid int) error {
+				t.Error("fchown was called after a refused open")
+				return nil
+			},
+		}
+		err := ensureFileOwnedByVia(ops, path, os.Getuid(), os.Getgid(), 0o600)
+		if !errors.Is(err, ErrNotRegularFile) || !errors.Is(err, errSymlinkRefused) {
+			t.Fatalf("ensureFileOwnedByVia = %v, want the symlink refusal", err)
 		}
 	})
 }

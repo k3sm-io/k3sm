@@ -223,6 +223,19 @@ sudo launchctl kickstart -k system/io.k3sm.netd
 sudo k3sm install                               # the authoritative repair, and idempotent
 ```
 
+### The Install Refuses The Runtime Lock File
+
+If `sudo k3sm install` stops with `has 2 links` (or more) on `/var/lib/k3sm/runtimed.lock`,
+another name was hard-linked to that file, which older releases made possible while the data
+root was writable by the service user. The install refuses to change ownership of a file that
+another name shares. The lock file holds no state, so it is safe to remove. Remove the path the
+error names and re-run the install:
+
+```sh
+sudo rm /var/lib/k3sm/runtimed.lock
+sudo k3sm install
+```
+
 ## Stuck or Crash-Looping Pods
 
 On the **default runtime** (what every installed cluster runs), `restartPolicy` **is** honored. The

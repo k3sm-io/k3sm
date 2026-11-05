@@ -238,6 +238,20 @@ func (darwinSystem) EnsureOwnedFile(path string, uid, gid int, mode fs.FileMode)
 // the data root writable by the service user, so such a link can be waiting on
 // an upgraded node. A refused file is left exactly as it was.
 func ensureFileOwnedBy(path string, uid, gid int, mode fs.FileMode) error {
+	return ensureFileOwnedByVia(fileOps{open: unix.Open, fchown: unix.Fchown}, path, uid, gid, mode)
+}
+
+// fileOps is the two syscalls ensureFileOwnedByVia makes by descriptor, taken as
+// a seam so a test can swap the entry for a symlink between the lstat and the
+// open, and can assert the chown landed on the opened descriptor with an owner
+// an unprivileged process could not really apply.
+type fileOps struct {
+	open   func(path string, mode int, perm uint32) (int, error)
+	fchown func(fd, uid, gid int) error
+}
+
+// ensureFileOwnedByVia is ensureFileOwnedBy over the given syscalls.
+func ensureFileOwnedByVia(ops fileOps, path string, uid, gid int, mode fs.FileMode) error {
 	fi, err := os.Lstat(path)
 	switch {
 	case err == nil && fi.Mode()&fs.ModeSymlink != 0:
@@ -247,7 +261,7 @@ func ensureFileOwnedBy(path string, uid, gid int, mode fs.FileMode) error {
 	case err != nil && !errors.Is(err, fs.ErrNotExist):
 		return fmt.Errorf("lstat %s: %w", path, err)
 	}
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CREAT|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, uint32(mode.Perm()))
+	fd, err := ops.open(path, unix.O_RDONLY|unix.O_CREAT|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, uint32(mode.Perm()))
 	if err != nil {
 		if errors.Is(err, unix.ELOOP) {
 			return fmt.Errorf("%s: %w: %w", path, ErrNotRegularFile, errSymlinkRefused)
@@ -263,9 +277,10 @@ func ensureFileOwnedBy(path string, uid, gid int, mode fs.FileMode) error {
 		return fmt.Errorf("%s: %w", path, ErrNotRegularFile)
 	}
 	if st.Nlink != 1 {
-		return fmt.Errorf("%s has %d links: %w: %w", path, st.Nlink, ErrNotRegularFile, errHardlinkRefused)
+		return fmt.Errorf("%s has %d links: %w: %w; the lock file holds no state, so it is safe to remove: run `sudo rm %s` and re-run the install",
+			path, st.Nlink, ErrNotRegularFile, errHardlinkRefused, path)
 	}
-	if err := unix.Fchown(fd, uid, gid); err != nil {
+	if err := ops.fchown(fd, uid, gid); err != nil {
 		return fmt.Errorf("chown %s to %d:%d: %w", path, uid, gid, err)
 	}
 	// The create mode is masked by the umask and an existing file keeps its
