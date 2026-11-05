@@ -40,6 +40,10 @@ const (
 // errCrossesMount reports a directory in the tree that is on another volume.
 var errCrossesMount = errors.New("it is on another volume; unmount it and run the command again")
 
+// errFlaggedHardLink reports a file whose locking flag is shared with another
+// name, which may be outside the tree, so the flag is not the removal's to clear.
+var errFlaggedHardLink = errors.New("hard-linked file with a locking flag; its other names share the flag, so clear it by hand, remove this name, set it again if they need it, and run the command again")
+
 // removeTreeFlagged deletes path and everything under it, for the staging and
 // swap leftovers os.RemoveAll wedged on: a file or directory carrying a user
 // locking flag answers EPERM until the flag is cleared, and a walk holding one
@@ -62,8 +66,10 @@ var errCrossesMount = errors.New("it is on another volume; unmount it and run th
 //     to clear its flags, because opening a device is an action of its own; it
 //     stays an EPERM if it carries one.
 //   - A hard link shares its flags with every other name of the file, which may
-//     be outside the tree, so a file that still has a link after the unlink gets
-//     its flags back.
+//     be outside the tree, and a kill between a clear and a restore would lose
+//     the flag there. So a flagged file with more than one link is never cleared:
+//     it stays where it is and the removal reports errFlaggedHardLink, on every
+//     re-run, until the operator deals with it.
 //   - At the descriptor limit, the directory that could not be opened is renamed
 //     up to the tree's root and removed from there once the walk has unwound
 //     and released its descriptors, so no ".." is trusted on the way back.
@@ -79,7 +85,9 @@ var errCrossesMount = errors.New("it is on another volume; unmount it and run th
 // tree is what is being deleted. What such an owner can do during the walk is
 // bounded by the rules above: it can swap an entry for a symlink, which is
 // unlinked, mount a volume on its directory, which is refused, or link in a
-// file from elsewhere, which keeps its flags. It can also move its directory
+// flagged file from elsewhere, which is refused with its flags untouched. That
+// refusal fails the sweep, as a system flag does: such an owner can keep the
+// tree from going, and nothing more. It can also move its directory
 // out of the tree mid-walk, which removes that directory's contents at its new
 // place; those are entries that user already controlled.
 func removeTreeFlagged(path string) error {
@@ -166,6 +174,9 @@ func (r *treeRemover) removeNonDir(parentFD int, name string, st *unix.Stat_t, p
 	if !errors.Is(err, unix.EPERM) {
 		return wrapRemove(name, err)
 	}
+	if isFlaggedHardLink(st) {
+		return wrapRemove(name, errFlaggedHardLink)
+	}
 	if parentInTree {
 		if err := r.clearFlagsOf(parentFD); err != nil {
 			return fmt.Errorf("clear the flags of the directory holding %s: %w", name, err)
@@ -175,20 +186,25 @@ func (r *treeRemover) removeNonDir(parentFD int, name string, st *unix.Stat_t, p
 		return flagError(name, st, ignoreGone(unix.Unlinkat(parentFD, name, 0)))
 	}
 	return r.withEntry(parentFD, name, st, unix.O_SYMLINK, func(fd int) error {
-		if err := unix.Fchflags(fd, int(st.Flags&^userLockingFlags)); err != nil {
+		// Asked again on the descriptor: a link made since the look above is a
+		// link all the same. One made after this check is the window left.
+		var now unix.Stat_t
+		if err := r.fstat(fd, &now); err != nil {
+			return fmt.Errorf("stat %s: %w", name, err)
+		}
+		if isFlaggedHardLink(&now) {
+			return wrapRemove(name, errFlaggedHardLink)
+		}
+		if err := unix.Fchflags(fd, int(now.Flags&^userLockingFlags)); err != nil {
 			return fmt.Errorf("clear the flags of %s: %w", name, err)
 		}
-		removeErr := ignoreGone(unix.Unlinkat(parentFD, name, 0))
-		// Still linked, here after a failure or under another name: the flags
-		// are not this removal's to take away.
-		var after unix.Stat_t
-		if err := r.fstat(fd, &after); err == nil && after.Nlink > 0 {
-			if err := unix.Fchflags(fd, int(st.Flags)); err != nil && removeErr == nil {
-				removeErr = fmt.Errorf("restore the flags of a file with another link: %w", err)
-			}
-		}
-		return flagError(name, st, removeErr)
+		return flagError(name, &now, ignoreGone(unix.Unlinkat(parentFD, name, 0)))
 	})
+}
+
+// isFlaggedHardLink reports a file with a user locking flag and another name.
+func isFlaggedHardLink(st *unix.Stat_t) bool {
+	return st.Flags&userLockingFlags != 0 && st.Nlink > 1
 }
 
 // clearableByOpen reports whether a descriptor may be opened on an entry of this

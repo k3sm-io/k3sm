@@ -159,19 +159,69 @@ func TestSweepStagingClearsLockingFlags(t *testing.T) {
 		}
 		setFlags(t, filepath.Join(root, "app/link"), unix.UF_IMMUTABLE)
 		setFlags(t, pointedAt, unix.UF_IMMUTABLE)
-		// A hard link shares its flags with a name outside the tree, so that
-		// name keeps them once this one is gone.
-		linked := filepath.Join(tmp, "linked")
-		mustWriteFile(t, linked)
-		if err := os.Link(linked, filepath.Join(root, "app/hardlink")); err != nil {
+		// A hard link with no flag on it goes, and its other name stays.
+		plain := filepath.Join(tmp, "plain")
+		mustWriteFile(t, plain)
+		if err := os.Link(plain, filepath.Join(root, "app/plain-link")); err != nil {
 			t.Fatal(err)
 		}
-		setFlags(t, linked, unix.UF_IMMUTABLE)
 		sweepOneTree(t, cfg)
-		for _, p := range []string{pointedAt, linked} {
-			if got := flagsOf(t, p); got&unix.UF_IMMUTABLE == 0 {
-				t.Errorf("%s lost its immutable flag (flags %#x)", p, got)
+		if got := flagsOf(t, pointedAt); got&unix.UF_IMMUTABLE == 0 {
+			t.Errorf("%s lost its immutable flag (flags %#x)", pointedAt, got)
+		}
+		if _, err := os.Lstat(plain); err != nil {
+			t.Errorf("the other name of a hard link went: %v", err)
+		}
+	})
+
+	t.Run("a hard-linked file with a locking flag is refused and named", func(t *testing.T) {
+		cfg, tmp := newCfg(t)
+		root := cfg.stagingRoot()
+		// The flag belongs to the file, so it is on the name outside the tree
+		// too. Clearing it here, even for a moment, puts that flag at the mercy
+		// of a kill, so it is never cleared.
+		outside := filepath.Join(tmp, "outside")
+		mustWriteFile(t, outside)
+		inTree := filepath.Join(root, "app/second-name")
+		if err := os.MkdirAll(filepath.Dir(inTree), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Link(outside, inTree); err != nil {
+			t.Fatal(err)
+		}
+		setFlags(t, outside, unix.UF_IMMUTABLE)
+		mustWriteFile(t, filepath.Join(root, "other/file"))
+		var before unix.Stat_t
+		if err := unix.Lstat(outside, &before); err != nil {
+			t.Fatal(err)
+		}
+
+		f := &fakeSystem{}
+		f.putOwned(root, 0, 0, fs.ModeDir|0o755, EntryDir)
+		err := sweepStaging(realRemoveTree{f}, cfg)
+		for _, want := range []string{"hard-linked file with a locking flag", "second-name"} {
+			if err == nil || !strings.Contains(err.Error(), want) {
+				t.Errorf("sweepStaging = %v, want it to name %q", err, want)
 			}
+		}
+
+		var after unix.Stat_t
+		if err := unix.Lstat(outside, &after); err != nil {
+			t.Fatal(err)
+		}
+		if after.Flags&unix.UF_IMMUTABLE == 0 {
+			t.Errorf("the outside name lost its immutable flag (flags %#x)", after.Flags)
+		}
+		// A clear and a restore leave the flag as it was, but not the change
+		// time, which is what shows the flag was never touched.
+		if after.Ctim != before.Ctim {
+			t.Errorf("the file's change time moved from %v to %v: its flags were written", before.Ctim, after.Ctim)
+		}
+		if after.Nlink != 2 {
+			t.Errorf("the file has %d links, want 2: the name in the tree stays for the operator", after.Nlink)
+		}
+		if _, err := os.Lstat(filepath.Join(root, "other")); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("the refusal stopped the rest of the sweep: lstat other = %v", err)
 		}
 	})
 

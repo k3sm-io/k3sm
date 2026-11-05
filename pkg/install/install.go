@@ -731,11 +731,11 @@ type System interface {
 	Rename(old, new string) error
 	// RemoveTree deletes path and everything under it. It is deliberately
 	// separate from RemoveAll, which uninstall drives through its own
-	// unsafe-path guard: this one is reached only by the data-volume paths (the
-	// emptied staging mount point, and the .pre-volume copy under
-	// --remove-old-data-root) and by the install root's staging tree (which
-	// carries its own root-owned-real-directory check, stagingTrustVerdict), so
-	// a future change to any caller's guarding cannot silently widen another's.
+	// unsafe-path guard: this one is reached only by the data-volume path's
+	// emptied staging mount point (the .pre-volume copy under
+	// --remove-old-data-root goes through RemoveAll) and by the install root's
+	// staging tree (which carries its own root-owned-real-directory check,
+	// stagingTrustVerdict), so a future change to any caller's guarding cannot silently widen another's.
 	// It clears user locking flags inside the tree, follows no symlink, stops at
 	// a mount point, and goes on past the descriptor limit (removeTreeFlagged).
 	RemoveTree(path string) error

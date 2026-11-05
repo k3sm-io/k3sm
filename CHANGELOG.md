@@ -119,7 +119,8 @@ pin, its date, and the tarball's sha256.
   when a leftover staging tree holds a file or directory with the `uchg`, `uappnd` or `uunlnk` flag,
   or is deeper than the process's open-file limit. The sweep clears those flags inside the tree and
   moves on past the limit. It follows no symlink, and it reports a volume mounted inside the tree
-  and leaves it alone.
+  and leaves it alone. A file with a system flag, or a hard-linked file with a locking flag, is still
+  refused and named, and uninstall fails until it is dealt with.
 - `k3sm status` names the cause of an invalid developer-mode row: when `/` or `/Library` is the
   problem, the detail and remedy name that directory instead of suggesting `sudo rm` of the marker,
   which does not fix it. [Status JSON](docs/user/status-json.md) describes the row.
