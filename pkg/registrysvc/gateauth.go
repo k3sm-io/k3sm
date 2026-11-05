@@ -92,6 +92,13 @@ const (
 	BuilderNamespace = AdvertisementNamespace
 	// BuilderServiceAccount is the builder ServiceAccount's name.
 	BuilderServiceAccount = "builder"
+	// MaxBuilderTokenLifetime is the longest a builder token may be valid for,
+	// from its iat to its exp. The apiserver runs with no
+	// --service-account-max-token-expiration, because a cluster-wide maximum
+	// would also clamp every projected pod token, so it issues a builder token
+	// of any lifetime. `k3sm registry token` refuses to ask for more than this
+	// and the push gate refuses to accept more than this, however it was minted.
+	MaxBuilderTokenLifetime = 24 * time.Hour
 )
 
 // builderUsername is the username a reviewed builder token carries.
@@ -106,6 +113,13 @@ const (
 	// maxTokenBytes bounds the password a push presents before it is ever sent
 	// for review. A projected token is well under 2 KiB.
 	maxTokenBytes = 8 << 10
+	// maxTokenClaimBytes bounds the encoded claims segment read for a builder
+	// token's lifetime. No token past tokenShapeOK can exceed it; the reader
+	// holds to it on its own.
+	maxTokenClaimBytes = maxTokenBytes
+	// maxTokenClaimUnix is the last second of the year 9999. No token the
+	// apiserver issues claims a later iat or exp.
+	maxTokenClaimUnix = 253402300799
 	// tokenPositiveTTL, tokenNegativeTTL, namespaceTTL and accessTTL are the
 	// cache lifetimes: how long a revocation can take to land, per question.
 	tokenPositiveTTL = 30 * time.Second
@@ -257,6 +271,47 @@ func tokenExpiry(tok string) (time.Time, bool) {
 	return time.Unix(claims.Exp, 0), true
 }
 
+// builderLifetimeRefusal returns why a builder token's lifetime is refused, or
+// "" when it is within MaxBuilderTokenLifetime. Anything it cannot read is
+// refused.
+//
+// It decodes the claims without verifying the signature, and that is sound only
+// because its one caller runs it AFTER a TokenReview authenticated this exact
+// token: the apiserver has checked the signature, so these are the claims it
+// signed. It must never run on a token the apiserver has not authenticated.
+//
+// The fields are *int64 because a JSON string, a fraction or an out-of-range
+// number is then a decode error and an absent or null claim is nil; the
+// apiserver writes both claims as whole seconds. The subtraction cannot overflow
+// and never becomes a time.Duration, so a large value cannot wrap into a short
+// lifetime.
+func builderLifetimeRefusal(tok string) string {
+	const unreadable = "this builder token's lifetime cannot be read: mint a new one with k3sm registry token"
+	segs := strings.Split(tok, ".")
+	if len(segs) != 3 || len(segs[1]) > maxTokenClaimBytes {
+		return unreadable
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(segs[1])
+	if err != nil {
+		return unreadable
+	}
+	var claims struct {
+		Iat *int64 `json:"iat"`
+		Exp *int64 `json:"exp"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil || claims.Iat == nil || claims.Exp == nil {
+		return unreadable
+	}
+	iat, exp := *claims.Iat, *claims.Exp
+	if iat <= 0 || exp <= iat || exp > maxTokenClaimUnix {
+		return unreadable
+	}
+	if exp-iat > int64(MaxBuilderTokenLifetime/time.Second) {
+		return fmt.Sprintf("this builder token is valid for longer than the %s maximum: mint a new one with k3sm registry token", MaxBuilderTokenLifetime)
+	}
+	return ""
+}
+
 // serviceAccountUser parses system:serviceaccount:<namespace>:<name>, the only
 // username a pushing identity may carry.
 var serviceAccountUser = regexp.MustCompile(`^system:serviceaccount:([a-z0-9]([-a-z0-9]*[a-z0-9])?):([a-z0-9]([-a-z0-9.]*[a-z0-9])?)$`)
@@ -286,6 +341,9 @@ func (a *authorizer) reviewToken(ctx context.Context, tok string) (tokenResult, 
 			return tokenResult{}, fmt.Errorf("%w: token review: %v", errUnavailable, err)
 		}
 		r := judgeTokenReview(resp)
+		if r.id.isBuilder() {
+			r.reason = builderLifetimeRefusal(tok)
+		}
 		now := a.now()
 		until := now.Add(tokenNegativeTTL)
 		if r.reason == "" {

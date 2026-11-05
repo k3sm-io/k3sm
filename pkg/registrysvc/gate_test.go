@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -264,6 +265,22 @@ var testEpoch = time.Date(2026, 10, 22, 12, 0, 0, 0, time.UTC)
 func mkToken(name string, exp time.Time) string {
 	enc := base64.RawURLEncoding.EncodeToString
 	payload, _ := json.Marshal(map[string]any{"sub": name, "exp": exp.Unix()})
+	return enc([]byte(`{"alg":"RS256"}`)) + "." + enc(payload) + "." + enc([]byte("sig-"+name))
+}
+
+// mkClaimsToken builds a JWT-shaped token carrying exactly claims.
+func mkClaimsToken(name string, claims map[string]any) string {
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		panic(err)
+	}
+	return mkRawToken(name, payload)
+}
+
+// mkRawToken builds a JWT-shaped token whose claims segment is payload, valid
+// JSON or not.
+func mkRawToken(name string, payload []byte) string {
+	enc := base64.RawURLEncoding.EncodeToString
 	return enc([]byte(`{"alg":"RS256"}`)) + "." + enc(payload) + "." + enc([]byte("sig-"+name))
 }
 
@@ -889,7 +906,7 @@ func TestPushPrefixHeldByOneNamespace(t *testing.T) {
 // is refused when that review says no. A ServiceAccount named builder in any
 // other namespace gets no such path.
 func TestPushAuthorizesBuilderClusterWide(t *testing.T) {
-	tokBuilder := mkToken("cluster-builder", testEpoch.Add(time.Hour))
+	tokBuilder := mkClaimsToken("cluster-builder", map[string]any{"iat": testEpoch.Unix(), "exp": testEpoch.Add(time.Hour).Unix()})
 	tokImpostor := mkToken("impostor-builder", testEpoch.Add(time.Hour))
 	setup := func(t *testing.T, allow bool) *gateFixture {
 		f := newGateFixture(t)
@@ -936,6 +953,167 @@ func TestPushAuthorizesBuilderClusterWide(t *testing.T) {
 			t.Fatalf("status = %d, forwarded %d, reviews %d; want 403, none, none", r.status, len(f.zot.requests()), f.access.count())
 		}
 	})
+}
+
+// TestGateRefusesLongLivedBuilderToken pins the builder token's lifetime bound.
+// The apiserver has no maximum, so a user who may mint for the builder could ask
+// for a push credential of any lifetime; the gate reads iat and exp from the
+// token the TokenReview authenticated and refuses more than
+// MaxBuilderTokenLifetime, or anything it cannot read. Only the builder identity
+// is bound: every other ServiceAccount keeps its token's own lifetime.
+func TestGateRefusesLongLivedBuilderToken(t *testing.T) {
+	iat := testEpoch.Unix()
+	maxSecs := int64(MaxBuilderTokenLifetime / time.Second)
+	lifetime := func(secs int64) []byte {
+		return []byte(fmt.Sprintf(`{"iat":%d,"exp":%d}`, iat, iat+secs))
+	}
+	const (
+		tooLong    = "longer than the 24h0m0s maximum"
+		unreadable = "lifetime cannot be read"
+	)
+	cases := []struct {
+		name    string
+		payload []byte
+		refused string // the 401's message, or "" for an accepted push
+	}{
+		{"one hour is accepted", lifetime(3600), ""},
+		{"exactly the maximum is accepted", lifetime(maxSecs), ""},
+		{"one second over the maximum is refused", lifetime(maxSecs + 1), tooLong},
+		{"a year is refused", lifetime(365 * 24 * 3600), tooLong},
+		{"missing iat", []byte(fmt.Sprintf(`{"exp":%d}`, iat+3600)), unreadable},
+		{"missing exp", []byte(fmt.Sprintf(`{"iat":%d}`, iat)), unreadable},
+		{"no claims", []byte(`{}`), unreadable},
+		{"null iat", []byte(fmt.Sprintf(`{"iat":null,"exp":%d}`, iat+3600)), unreadable},
+		{"null exp", []byte(fmt.Sprintf(`{"iat":%d,"exp":null}`, iat)), unreadable},
+		{"string iat", []byte(fmt.Sprintf(`{"iat":"%d","exp":%d}`, iat, iat+3600)), unreadable},
+		{"string exp", []byte(fmt.Sprintf(`{"iat":%d,"exp":"%d"}`, iat, iat+3600)), unreadable},
+		{"fractional exp", []byte(fmt.Sprintf(`{"iat":%d,"exp":%d.5}`, iat, iat+3600)), unreadable},
+		{"exp equal to iat", lifetime(0), unreadable},
+		{"exp before iat", lifetime(-3600), unreadable},
+		{"zero iat", []byte(`{"iat":0,"exp":3600}`), unreadable},
+		{"negative iat", []byte(`{"iat":-1,"exp":3600}`), unreadable},
+		{"an iat and exp past the year 9999, an hour apart", []byte(fmt.Sprintf(`{"iat":%d,"exp":%d}`, int64(1)<<62, int64(1)<<62+3600)), unreadable},
+		{"an exp too large for an int64", []byte(fmt.Sprintf(`{"iat":%d,"exp":1%030d}`, iat, 0)), unreadable},
+		{"the widest int64 span", []byte(fmt.Sprintf(`{"iat":1,"exp":%d}`, int64(math.MaxInt64))), unreadable},
+		{"claims that are not JSON", []byte(`not json`), unreadable},
+		{"claims that are a JSON array", []byte(`[1,2]`), unreadable},
+		{"claims with trailing data", []byte(fmt.Sprintf(`{"iat":%d,"exp":%d} x`, iat, iat+3600)), unreadable},
+		{"a second exp of the wrong type", []byte(fmt.Sprintf(`{"iat":%d,"exp":%d,"exp":"x"}`, iat, iat+3600)), unreadable},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newGateFixture(t)
+			tok := mkRawToken("builder-lifetime", tc.payload)
+			f.tokens.statuses[tok] = saStatus(BuilderNamespace, BuilderServiceAccount)
+			f.access.allow = func(*authzv1.SubjectAccessReview) bool { return true }
+			r := f.do(t, "PUT", "/v2/app/manifests/v1", basic(tok), "{}", nil)
+			if tc.refused == "" {
+				if r.status != 201 || len(f.zot.requests()) != 1 {
+					t.Fatalf("status = %d (%s), forwarded %d; want 201 and one forward", r.status, r.body, len(f.zot.requests()))
+				}
+				return
+			}
+			if r.status != 401 || !strings.Contains(r.body, tc.refused) || !strings.Contains(r.body, codeUnauthorized) {
+				t.Fatalf("status = %d (%s), want 401 %s naming %q", r.status, r.body, codeUnauthorized, tc.refused)
+			}
+			if got := r.header.Get("WWW-Authenticate"); !strings.Contains(got, "Basic") {
+				t.Errorf("WWW-Authenticate = %q, want the Basic challenge", got)
+			}
+			if !strings.Contains(r.body, "k3sm registry token") {
+				t.Errorf("body = %s, want the remedy", r.body)
+			}
+			if len(f.zot.requests()) != 0 || f.access.count() != 0 {
+				t.Errorf("forwarded %d, access reviews %d; want none: a refused token reaches neither", len(f.zot.requests()), f.access.count())
+			}
+		})
+	}
+
+	// A malformed token never reaches a review, so the gate cannot show these:
+	// the reader refuses them on its own.
+	t.Run("the reader refuses what the shape check would have", func(t *testing.T) {
+		enc := base64.RawURLEncoding.EncodeToString
+		sized := func(segmentLen int) string {
+			pad := segmentLen*3/4 - len(lifetime(3600)) - len(`,"p":""`)
+			claims := fmt.Sprintf(`{"iat":%d,"exp":%d,"p":"%s"}`, iat, iat+3600, strings.Repeat("x", pad))
+			return "h." + enc([]byte(claims)) + ".s"
+		}
+		if got := builderLifetimeRefusal(sized(maxTokenClaimBytes)); got != "" {
+			t.Errorf("a claims segment at the limit: %q, want accepted", got)
+		}
+		for name, tok := range map[string]string{
+			"no segments":   "garbage",
+			"two segments":  "h." + enc(lifetime(3600)),
+			"four segments": "h." + enc(lifetime(3600)) + ".s.x",
+			"not base64url": "h.!!!.s",
+			// 36 bytes of claims end on a base64 quantum, so the decoder has all
+			// of them by the time it reaches the bad character.
+			"good claims, then not base64url": "h." + enc(append(lifetime(3600), ' ')) + "!.s",
+			"an empty segment":                "h..s",
+			"claims over a size":              sized(maxTokenClaimBytes + 4),
+		} {
+			if got := builderLifetimeRefusal(tok); !strings.Contains(got, unreadable) {
+				t.Errorf("%s: %q, want it refused as unreadable", name, got)
+			}
+		}
+	})
+
+	// The reason is a review outcome like any other: it is cached for the
+	// negative lifetime, not the positive one.
+	t.Run("a refusal is cached for the negative lifetime only", func(t *testing.T) {
+		f := newGateFixture(t)
+		tok := mkRawToken("builder-long", lifetime(maxSecs+1))
+		f.tokens.statuses[tok] = saStatus(BuilderNamespace, BuilderServiceAccount)
+		for range 2 {
+			if r := f.do(t, "PUT", "/v2/app/manifests/v1", basic(tok), "{}", nil); r.status != 401 {
+				t.Fatalf("status = %d, want 401", r.status)
+			}
+		}
+		if got := f.tokens.count(); got != 1 {
+			t.Errorf("token reviews inside the negative lifetime = %d, want 1", got)
+		}
+		f.clock.advance(tokenNegativeTTL)
+		if r := f.do(t, "PUT", "/v2/app/manifests/v1", basic(tok), "{}", nil); r.status != 401 {
+			t.Fatalf("status = %d, want 401", r.status)
+		}
+		if got := f.tokens.count(); got != 2 {
+			t.Errorf("token reviews past the negative lifetime = %d, want 2", got)
+		}
+	})
+
+	// The claims of a token the apiserver did not authenticate decide nothing.
+	t.Run("a token the review refuses is refused as invalid, whatever it claims", func(t *testing.T) {
+		f := newGateFixture(t)
+		tok := mkRawToken("forged-builder", lifetime(3600))
+		f.tokens.statuses[tok] = authnv1.TokenReviewStatus{Authenticated: false, Error: "invalid signature"}
+		r := f.do(t, "PUT", "/v2/app/manifests/v1", basic(tok), "{}", nil)
+		if r.status != 401 || !strings.Contains(r.body, "the token is not valid") || len(f.zot.requests()) != 0 {
+			t.Fatalf("status = %d (%s), forwarded %d; want 401 not valid, none", r.status, r.body, len(f.zot.requests()))
+		}
+	})
+
+	// Other identities are not bound: a ServiceAccount named builder in another
+	// namespace, and any other name in the builder's own namespace, push on
+	// their token's own lifetime, with or without the claims.
+	for _, tc := range []struct {
+		name, ns, sa string
+		payload      []byte
+	}{
+		{"a builder in another namespace keeps a long token", "team", BuilderServiceAccount, lifetime(365 * 24 * 3600)},
+		{"a builder in another namespace is not asked for claims", "team", BuilderServiceAccount, []byte(`{}`)},
+		{"another name in the builder's namespace keeps a long token", BuilderNamespace, "pusher", lifetime(365 * 24 * 3600)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newGateFixture(t)
+			tok := mkRawToken("other-identity", tc.payload)
+			f.tokens.statuses[tok] = saStatus(tc.ns, tc.sa)
+			f.namespaces.labels[tc.ns] = map[string]string{PushLabel: tc.ns}
+			f.access.allow = func(*authzv1.SubjectAccessReview) bool { return true }
+			r := f.do(t, "PUT", "/v2/"+tc.ns+"/app/manifests/v1", basic(tok), "{}", nil)
+			if r.status != 201 || len(f.zot.requests()) != 1 {
+				t.Fatalf("status = %d (%s), forwarded %d; want 201 and one forward", r.status, r.body, len(f.zot.requests()))
+			}
+		})
+	}
 }
 
 // TestPushGateAcceptsMountWithOrigin pins the gate's handling of the "origin"

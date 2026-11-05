@@ -359,6 +359,10 @@ rather than adjusted. The command makes the same call as:
 kubectl create token builder -n k3sm-registry --audience k3sm-registry
 ```
 
+The registry holds every `builder` token to the same 24 hours, however it was minted. `kubectl create
+token` will issue a longer one, and pushing with it gets a 401 that says to mint a new one. Other
+ServiceAccounts' tokens keep their own lifetime.
+
 To let docker, buildx, crane and oras push with nothing else in the loop, write the token into your
 docker config:
 
