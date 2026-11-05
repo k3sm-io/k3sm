@@ -47,28 +47,62 @@ func (w *switchSource) latest() (hostStats, uint64, bool) {
 	return w.s, 1, true
 }
 
+// admissionAwaitBound bounds every wait these tests make on another create. A
+// passing test never spends it, so it is sized for a host running several gates
+// at once rather than for how long the wait normally takes.
+const admissionAwaitBound = time.Minute
+
 // holdFirstAdmitted parks the first create admission lets through inside
 // CreatePod's admission window, after the decision and before the track is
 // registered: entered is closed when it gets there, and it stays until release
-// is closed. Every later create passes straight through. Set before any create.
-func holdFirstAdmitted(r *runtimedRuntime) (entered, release chan struct{}) {
-	entered, release = make(chan struct{}), make(chan struct{})
+// is called. release may be called any number of times, and a t.Cleanup calls it,
+// so a test that fails while the create is parked does not leak it. Every later
+// create passes straight through. Set before any create.
+func holdFirstAdmitted(t *testing.T, r *runtimedRuntime) (entered chan struct{}, release func()) {
+	t.Helper()
+	entered = make(chan struct{})
+	gate := make(chan struct{})
+	release = sync.OnceFunc(func() { close(gate) })
+	t.Cleanup(release)
 	var once sync.Once
 	r.admittedHook = func(string) {
 		first := false
 		once.Do(func() { first = true })
 		if first {
 			close(entered)
-			<-release
+			<-gate
 		}
 	}
 	return entered, release
 }
 
-// awaitClosed waits for ch to close, failing the test after a generous bound.
+// TestHoldFirstAdmittedReleasesAtCleanup: a test that ends without releasing
+// the create it parked, as one that fails early does, still lets it go, and
+// releasing twice is harmless.
+func TestHoldFirstAdmittedReleasesAtCleanup(t *testing.T) {
+	r := &runtimedRuntime{}
+	returned := make(chan struct{})
+	t.Run("ends with the create parked", func(t *testing.T) {
+		entered, _ := holdFirstAdmitted(t, r)
+		go func() {
+			defer close(returned)
+			r.admittedHook("parked")
+		}()
+		awaitClosed(t, entered, "the create to park")
+	})
+	awaitClosed(t, returned, "the cleanup to release the parked create")
+
+	t.Run("a hand release and the cleanup's do not collide", func(t *testing.T) {
+		_, release := holdFirstAdmitted(t, r)
+		release()
+		release()
+	})
+}
+
+// awaitClosed waits for ch to close, failing the test after admissionAwaitBound.
 func awaitClosed(t *testing.T, ch <-chan struct{}, what string) {
 	t.Helper()
-	tm := time.NewTimer(10 * time.Second)
+	tm := time.NewTimer(admissionAwaitBound)
 	defer tm.Stop()
 	select {
 	case <-ch:
@@ -77,11 +111,11 @@ func awaitClosed(t *testing.T, ch <-chan struct{}, what string) {
 	}
 }
 
-// awaitErr waits for one create's result, failing the test after a generous
-// bound.
+// awaitErr waits for one create's result, failing the test after
+// admissionAwaitBound.
 func awaitErr(t *testing.T, ch <-chan error, what string) error {
 	t.Helper()
-	tm := time.NewTimer(10 * time.Second)
+	tm := time.NewTimer(admissionAwaitBound)
 	defer tm.Stop()
 	select {
 	case err := <-ch:
@@ -147,7 +181,7 @@ func TestAdmissionRefusalYieldsToAdmittedCreateInFlight(t *testing.T) {
 	ctx := context.Background()
 	pod := evPod("yield", nil, "", "")
 	h, src := raceHarness(t, pod)
-	entered, release := holdFirstAdmitted(h.r)
+	entered, release := holdFirstAdmitted(t, h.r)
 
 	first := make(chan error, 1)
 	go func() { first <- h.r.CreatePod(ctx, pod.DeepCopy()) }()
@@ -160,7 +194,7 @@ func TestAdmissionRefusalYieldsToAdmittedCreateInFlight(t *testing.T) {
 	if tr := h.r.trackByID(string(pod.UID)); tr == nil || tr.rejected || tr.evictedStatus() != nil {
 		t.Fatalf("create 2 refused the pod while an admitted create was in flight (%s)", trackState(tr))
 	}
-	close(release)
+	release()
 	if err := awaitErr(t, first, "create 1"); err != nil {
 		t.Fatalf("create 1: %v", err)
 	}
@@ -183,22 +217,26 @@ func TestAdmissionRefusalYieldsToAdmittedCreateInFlight(t *testing.T) {
 	}
 }
 
-// TestAdmissionFenceStopsAdmittedCreateAfterRefusal: create 1 is admitted and
-// held inside the admission window; its in-flight count is then released, which
-// is the one thing that lets a refusal land there, and create 2 refuses the pod
-// under pressure. When create 1 resumes it must stop at the terminal-track
-// fence: the refusal stands, the runtime is never asked to create the pod, and
-// the apiserver keeps Failed.
+// TestAdmissionFenceStopsCreateOnForgedRefusal is a defense-in-depth check of a
+// forged state. No production path lands a refusal inside an admitted create's
+// window: admitOnCreate is the only writer of a rejected track, it refuses only
+// when the pod's in-flight count is zero, and an admitted create holds its count
+// until it returns (TestAdmissionRefusalYieldsToAdmittedCreateInFlight pins the
+// yield). The test forges the state by ending create 1's count by hand, then
+// create 2 refuses the pod under pressure. When create 1 resumes it must stop at
+// the terminal-track fence: the refusal stands, the runtime is never asked to
+// create the pod, and the apiserver keeps Failed. The fence's reachable path is
+// an eviction inside the window (TestCreatePodFenceOnEvictedDuringCreate).
 //
 // Fails without the evictedStatus() fence in CreatePod: create 1 replaces the
 // rejected track with a live one and creates the pod the apiserver reports
 // Failed.
-func TestAdmissionFenceStopsAdmittedCreateAfterRefusal(t *testing.T) {
+func TestAdmissionFenceStopsCreateOnForgedRefusal(t *testing.T) {
 	ctx := context.Background()
 	pod := evPod("fence", nil, "", "")
 	id := string(pod.UID)
 	h, src := raceHarness(t, pod)
-	entered, release := holdFirstAdmitted(h.r)
+	entered, release := holdFirstAdmitted(t, h.r)
 
 	first := make(chan error, 1)
 	go func() { first <- h.r.CreatePod(ctx, pod.DeepCopy()) }()
@@ -212,7 +250,7 @@ func TestAdmissionFenceStopsAdmittedCreateAfterRefusal(t *testing.T) {
 	if tr := h.r.trackByID(id); tr == nil || !tr.rejected {
 		t.Fatalf("create 2 under pressure did not refuse the pod (%s)", trackState(tr))
 	}
-	close(release)
+	release()
 	if err := awaitErr(t, first, "create 1"); err != nil {
 		t.Fatalf("create 1: %v", err)
 	}
@@ -245,7 +283,7 @@ func TestCreatePodFenceOnEvictedDuringCreate(t *testing.T) {
 	if n := createOn(t, h, pod); n != 1 {
 		t.Fatalf("runtime CreatePod calls = %d, want 1", n)
 	}
-	entered, release := holdFirstAdmitted(h.r)
+	entered, release := holdFirstAdmitted(t, h.r)
 
 	again := make(chan error, 1)
 	go func() { again <- h.r.CreatePod(ctx, pod.DeepCopy()) }()
@@ -254,7 +292,7 @@ func TestCreatePodFenceOnEvictedDuringCreate(t *testing.T) {
 		t.Fatalf("evictPod: %v", err)
 	}
 	before := h.createCount()
-	close(release)
+	release()
 	if err := awaitErr(t, again, "the repeat create"); err != nil {
 		t.Fatalf("repeat create: %v", err)
 	}
