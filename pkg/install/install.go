@@ -736,6 +736,8 @@ type System interface {
 	// --remove-old-data-root) and by the install root's staging tree (which
 	// carries its own root-owned-real-directory check, stagingTrustVerdict), so
 	// a future change to any caller's guarding cannot silently widen another's.
+	// It clears user locking flags inside the tree, follows no symlink, stops at
+	// a mount point, and goes on past the descriptor limit (removeTreeFlagged).
 	RemoveTree(path string) error
 	// LockInstall takes the exclusive, install-wide lock at path and returns the
 	// release. A lock another install already holds is refused IMMEDIATELY with
