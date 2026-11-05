@@ -91,38 +91,57 @@ func TestIndexingMarkers(t *testing.T) {
 
 // TestSpotlightOffBoundsMdutil stands in an mdutil that never answers and
 // proves SpotlightOff gives up at its own deadline, reports success because
-// the marker is already written, and leaves no child behind.
+// the marker is already written, and leaves no child behind. A loaded host
+// can fire a short deadline before the shell records its pid, so the attempt
+// repeats under a longer deadline until the stand-in is known to have run.
 func TestSpotlightOffBoundsMdutil(t *testing.T) {
-	dir := t.TempDir()
-	pidFile := filepath.Join(t.TempDir(), "pid")
-	// The shell records its pid, then becomes a blocking sleep.
-	script := "echo $$ > " + pidFile + "; exec sleep 600"
+	deadlines := []time.Duration{200 * time.Millisecond, time.Second, 5 * time.Second, 25 * time.Second}
+	for i, deadline := range deadlines {
+		dir := t.TempDir()
+		pidFile := filepath.Join(t.TempDir(), "pid")
+		// The shell records its pid, then becomes a blocking sleep.
+		script := "echo $$ > " + pidFile + "; exec sleep 600"
 
-	done := make(chan error, 1)
-	go func() {
-		done <- spotlightOff(context.Background(), dir, 200*time.Millisecond, "sh", "-c", script)
-	}()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("spotlightOff with a hung mdutil: %v", err)
+		done := make(chan error, 1)
+		go func() {
+			done <- spotlightOff(context.Background(), dir, deadline, "sh", "-c", script)
+		}()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("spotlightOff with a hung mdutil: %v", err)
+			}
+		case <-t.Context().Done():
+			t.Fatal("test ended before spotlightOff returned")
 		}
-	case <-t.Context().Done():
-		t.Fatal("test ended before spotlightOff returned")
-	}
 
-	if _, err := os.Stat(filepath.Join(dir, ".metadata_never_index")); err != nil {
-		t.Fatalf("the marker was not written: %v", err)
+		if _, err := os.Stat(filepath.Join(dir, ".metadata_never_index")); err != nil {
+			t.Fatalf("the marker was not written: %v", err)
+		}
+		pid := recordedPID(pidFile)
+		if pid == 0 {
+			if i == len(deadlines)-1 {
+				t.Fatalf("the stand-in never recorded its pid within %v", deadline)
+			}
+			continue
+		}
+		if err := unix.Kill(pid, 0); err == nil {
+			t.Fatalf("child %d is still alive after the deadline", pid)
+		}
+		return
 	}
-	raw, err := os.ReadFile(pidFile)
+}
+
+// recordedPID returns the pid the stand-in wrote, or 0 when it has not
+// written a complete one.
+func recordedPID(path string) int {
+	raw, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("the stand-in never started: %v", err)
+		return 0
 	}
 	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
-	if err != nil {
-		t.Fatalf("pid file: %v", err)
+	if err != nil || pid <= 0 {
+		return 0
 	}
-	if err := unix.Kill(pid, 0); err == nil {
-		t.Fatalf("child %d is still alive after the deadline", pid)
-	}
+	return pid
 }
