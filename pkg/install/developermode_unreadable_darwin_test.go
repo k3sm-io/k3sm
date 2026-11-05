@@ -285,6 +285,34 @@ func TestDeveloperModeMarkerIsDir(t *testing.T) {
 	}
 }
 
+// TestDeveloperModeBadRegularMarkerReadsItsAncestors pins that a regular marker
+// that fails by itself, by owner or by ACL, still has the directories above it
+// read, so its row does not aim a removal through a directory nobody can trust.
+func TestDeveloperModeBadRegularMarkerReadsItsAncestors(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		uid  int
+		acl  bool
+	}{{name: "owned by a user", uid: 501}, {name: "with an ACL", acl: true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := &fakeSystem{owners: map[string]OwnedEntry{}, acls: map[string]bool{}}
+			seedMarkerAncestors(f)
+			f.owners[DeveloperModeMarkerPath] = OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, UID: tc.uid, Mode: 0o644}
+			f.acls[DeveloperModeMarkerPath] = tc.acl
+			f.owners["/Library"] = OwnedEntry{Path: "/Library", Kind: EntryDir, Mode: 0o775}
+			facts := ReadDeveloperModeFacts(f, DeveloperModeMarkerPath)
+			if got := DeveloperModeMarkerState(facts); got != DeveloperModeInvalid {
+				t.Errorf("state %s, want %s", got, DeveloperModeInvalid)
+			}
+			if got := DeveloperModeAncestorCause(facts, DeveloperModeMarkerPath); got != "/Library" {
+				t.Errorf("cause %q, want /Library", got)
+			}
+		})
+	}
+}
+
 // TestDeveloperModeNonRegularMarkerReadsItsAncestors pins that a marker that is
 // not a regular file still has the directories above it read, so a bad one is
 // named, and that a probe of them that fails, which is every ACL probe in a

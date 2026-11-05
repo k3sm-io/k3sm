@@ -200,6 +200,7 @@ func TestDeveloperModeInvalidDirectoryRemedy(t *testing.T) {
 		{name: "a directory", f: markerFactsUnder(dirMarker, ""), want: dirRemedy, wantCmd: dirRemedy},
 		{name: "a file", f: markerFacts(install.DeveloperModeInvalid), want: developerModeInvalidRemedy, wantCmd: developerModeInvalidRemedy},
 		{name: "a directory under a bad /Library", f: markerFactsUnder(dirMarker, "/Library"), want: fmt.Sprintf(developerModeAncestorRemedyFmt, "/Library")},
+		{name: "a file owned by a user under a bad /Library", f: badRegularMarkerUnderBadLibrary(), want: fmt.Sprintf(developerModeAncestorRemedyFmt, "/Library")},
 		{name: "a directory under a bad /", f: markerFactsUnder(dirMarker, "/"), want: fmt.Sprintf(developerModeAncestorRemedyFmt, "/")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -214,6 +215,18 @@ func TestDeveloperModeInvalidDirectoryRemedy(t *testing.T) {
 				t.Fatalf("alert = %+v, want command %q", a, tc.wantCmd)
 			}
 		})
+	}
+}
+
+// badRegularMarkerUnderBadLibrary is a regular file that fails by itself, under
+// a /Library that fails too.
+func badRegularMarkerUnderBadLibrary() install.DeveloperModeFacts {
+	good := install.OwnedEntry{Kind: install.EntryDir, Mode: 0o755}
+	bad := install.OwnedEntry{Kind: install.EntryDir, Mode: 0o775}
+	return install.DeveloperModeFacts{
+		Exists:    true,
+		Entry:     install.OwnedEntry{Kind: install.EntryRegular, UID: 501, Mode: 0o644},
+		Ancestors: []install.DeveloperModeAncestor{{Entry: good}, {Entry: bad}},
 	}
 }
 

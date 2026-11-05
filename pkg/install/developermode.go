@@ -210,11 +210,10 @@ func developerModeState(f DeveloperModeFacts, owner int) DeveloperModeState {
 }
 
 // developerModeJudge is the one validity predicate. It returns the state and,
-// when a directory above the marker failed and the marker is either sound or
-// not a regular file, that directory's index in f.Ancestors; otherwise -1. A
-// non-regular marker is invalid whatever is above it, and the index still
-// matters there: a removal command must not be aimed at a path a directory
-// nobody can trust leads to.
+// when a directory above the marker failed, that directory's index in
+// f.Ancestors; otherwise -1. The directory comes first even for a marker that
+// is invalid by itself: a removal command must not be aimed at a path a
+// directory nobody can trust leads to.
 func developerModeJudge(f DeveloperModeFacts, owner int) (DeveloperModeState, int) {
 	held := func(e OwnedEntry, acl bool) bool {
 		return e.UID == owner && e.Mode.Perm()&0o022 == 0 && !acl
@@ -233,12 +232,10 @@ func developerModeJudge(f DeveloperModeFacts, owner int) (DeveloperModeState, in
 		}
 	}
 	switch {
-	case f.Entry.Kind != EntryRegular:
-		return DeveloperModeInvalid, bad
-	case !held(f.Entry, f.HasACL), len(f.Ancestors) == 0:
-		return DeveloperModeInvalid, -1
 	case bad >= 0:
 		return DeveloperModeInvalid, bad
+	case f.Entry.Kind != EntryRegular, !held(f.Entry, f.HasACL), len(f.Ancestors) == 0:
+		return DeveloperModeInvalid, -1
 	}
 	return DeveloperModeMarkerOn, -1
 }
@@ -286,7 +283,7 @@ func readDeveloperModeFacts(sys System, root, path string) DeveloperModeFacts {
 	}
 	f := DeveloperModeFacts{Exists: true, Entry: e}
 	if e.Kind == EntryRegular {
-		if f.HasACL, f.Err = sys.HasACL(path); f.Err != nil || f.HasACL {
+		if f.HasACL, f.Err = sys.HasACL(path); f.Err != nil {
 			return f
 		}
 	}
