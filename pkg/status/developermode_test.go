@@ -19,6 +19,7 @@ package status
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -127,9 +128,18 @@ func TestDeveloperModeInvalidRowNamesAncestorCause(t *testing.T) {
 	if !strings.Contains(r.Detail, "/Library") || !strings.Contains(r.Remedy, "/Library") || strings.Contains(r.Remedy, "sudo rm") {
 		t.Errorf("ancestor row = %+v", r)
 	}
+	if !strings.Contains(r.Remedy, "removing the marker clears this row but leaves that directory as it is") {
+		t.Errorf("ancestor remedy = %q, want it to say what removing the marker does", r.Remedy)
+	}
 	a := developerModeAlert(r)
-	if a == nil || strings.Contains(a.Cause, "not a root-owned file nobody") {
-		t.Errorf("ancestor alert = %+v", a)
+	if a == nil {
+		t.Fatal("no ancestor alert")
+	}
+	if !strings.Contains(a.Cause, "A directory above the developer-mode marker") || strings.Contains(a.Cause, "not a root-owned file nobody") {
+		t.Errorf("ancestor alert cause = %q", a.Cause)
+	}
+	if len(a.Fix) != 1 || a.Fix[0].Step != r.Remedy || a.Fix[0].Command != "" {
+		t.Errorf("ancestor alert fix = %+v, want the row's remedy as one step by hand", a.Fix)
 	}
 	r = row("")
 	if ma := developerModeAlert(r); ma == nil || len(ma.Fix) != 1 || ma.Fix[0].Command != developerModeInvalidRemedy {
@@ -137,5 +147,91 @@ func TestDeveloperModeInvalidRowNamesAncestorCause(t *testing.T) {
 	}
 	if r.Detail != developerModeInvalidDetail || r.Remedy != developerModeInvalidRemedy {
 		t.Errorf("marker-file row = %+v", r)
+	}
+}
+
+// TestDeveloperModeInvalidDirectoryRemedy pins that a directory at the marker
+// path gets a removal command rm accepts, in the row and in the alert, that an
+// ancestor cause wins over it, and that a file keeps the plain command.
+func TestDeveloperModeInvalidDirectoryRemedy(t *testing.T) {
+	t.Parallel()
+	const dirRemedy = "sudo rm -r /Library/k3sm.developer-mode"
+	for _, tc := range []struct {
+		name     string
+		isDir    func() bool
+		ancestor string
+		want     string
+	}{
+		{name: "a directory", isDir: func() bool { return true }, want: dirRemedy},
+		{name: "a file", isDir: func() bool { return false }, want: developerModeInvalidRemedy},
+		{name: "no reader wired", want: developerModeInvalidRemedy},
+		{name: "a directory above is the cause", isDir: func() bool { return true }, ancestor: "/Library", want: fmt.Sprintf(developerModeAncestorRemedyFmt, "/Library")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := Collector{
+				DeveloperMode:            func() install.DeveloperModeState { return install.DeveloperModeInvalid },
+				DeveloperModeAncestor:    func() string { return tc.ancestor },
+				DeveloperModeMarkerIsDir: tc.isDir,
+			}
+			r, ok := c.developerModeRow(context.Background())
+			if !ok || r.Remedy != tc.want {
+				t.Fatalf("row %+v, ok %v; want remedy %q", r, ok, tc.want)
+			}
+			a := developerModeAlert(r)
+			if a == nil || len(a.Fix) != 1 {
+				t.Fatalf("alert = %+v", a)
+			}
+			if tc.ancestor == "" && a.Fix[0].Command != tc.want {
+				t.Errorf("alert command = %q, want %q", a.Fix[0].Command, tc.want)
+			}
+		})
+	}
+}
+
+// TestDeveloperModeUnknownRow pins the row of a read that could not see the
+// marker path: it is there at warn, it claims neither a marker nor the checks
+// staying on, it names no removal, and its remedy can work from the account it
+// is written for.
+func TestDeveloperModeUnknownRow(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name       string
+		euid       int
+		wantRemedy string
+		wantCmd    string
+	}{
+		{name: "an ordinary account reads it again as root", euid: 501, wantRemedy: "sudo k3sm status", wantCmd: "sudo k3sm status"},
+		{name: "root looks at the path", euid: 0, wantRemedy: "Check the path and the directories above it with ls -ldO@e /Library/k3sm.developer-mode /Library /"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := Collector{EUID: tc.euid, DeveloperMode: func() install.DeveloperModeState { return install.DeveloperModeUnknown }}
+			r, ok := c.developerModeRow(context.Background())
+			if !ok {
+				t.Fatal("no row: an unread marker must not read as absent")
+			}
+			if r.State != StateUnknown || r.Severity != SeverityWarn || r.Remedy != tc.wantRemedy {
+				t.Errorf("row = %+v", r)
+			}
+			for _, claim := range []string{"marker exists", "stay on", "ignored"} {
+				if strings.Contains(r.Detail, claim) {
+					t.Errorf("detail %q claims %q", r.Detail, claim)
+				}
+			}
+			if strings.Contains(r.Remedy, "rm ") {
+				t.Errorf("remedy %q removes what it could not read", r.Remedy)
+			}
+			a := developerModeAlert(r)
+			if a == nil || len(a.Fix) != 1 || a.Fix[0].Command != tc.wantCmd {
+				t.Fatalf("alert = %+v", a)
+			}
+			if !strings.Contains(a.Cause, "cannot say whether developer mode is on") {
+				t.Errorf("alert cause = %q", a.Cause)
+			}
+			if tc.wantCmd == "" && a.Fix[0].Step != tc.wantRemedy {
+				t.Errorf("alert step = %q, want %q", a.Fix[0].Step, tc.wantRemedy)
+			}
+		})
 	}
 }

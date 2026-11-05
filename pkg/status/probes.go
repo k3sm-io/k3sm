@@ -374,6 +374,9 @@ type Collector struct {
 	// production), "" when the marker file itself is the cause. OPTIONAL: nil
 	// reads as the marker file.
 	DeveloperModeAncestor func() string
+	// DeveloperModeMarkerIsDir reports whether a directory is at the marker
+	// path, which takes a different removal command. Nil keeps the plain one.
+	DeveloperModeMarkerIsDir func() bool
 	// SigningTeamID reads the Team ID of a binary's signature
 	// (install.CodesignTeamID in production), for the developer-mode row's
 	// wide signing key. OPTIONAL: nil leaves that key out.

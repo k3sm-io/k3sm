@@ -646,6 +646,7 @@ func alertCases() []alertCase {
 		// the developer-mode marker
 		{"developer mode on", built(developerModeRowFor(install.DeveloperModeMarkerOn))},
 		{"developer-mode marker invalid", built(developerModeRowFor(install.DeveloperModeInvalid))},
+		{"developer-mode marker unread", built(developerModeRowFor(install.DeveloperModeUnknown))},
 	}
 }
 

@@ -328,14 +328,15 @@ the row's `state` when that source is the node daemon's arguments. No value is a
 password: the row names a fixed set of settings, none of which is a credential. `detail` gives the
 same values in one line.
 
-The `developer-mode` row appears only while something is at `/Library/k3sm.developer-mode`, and it
-never changes the `verdict`. Its `severity` is `warn`. The verdict stays `ok` while developer mode is
+The `developer-mode` row appears only while something is at `/Library/k3sm.developer-mode` or that
+path cannot be read, and it never changes the `verdict`. Its `severity` is `warn`. The verdict stays `ok` while developer mode is
 on, so automation that needs to know reads this row. See [Developer mode](install.md#developer-mode).
 
 | `state` | meaning |
 |---|---|
 | `on` | a valid marker is there: the signature of the k3sm that runs as root is not checked. `remedy` is `sudo k3sm install --developer-mode off`; installing a Developer ID signed k3sm also turns developer mode off, and reinstalling an ad-hoc signed build from source does not |
-| `invalid` | something is at the path that is not a root-owned file nobody else can write, with no ACL, or `/` or `/Library` is not a root-owned real directory that neither group nor others can write, with no ACL. It is ignored and the signature checks stay on. When the marker file is the cause, `remedy` is `sudo rm /Library/k3sm.developer-mode`. When a directory above it is the cause, `detail` and `remedy` name that directory (`/` or `/Library`) and the remedy is to make it root-owned, not writable by group or others, with no ACL; removing the marker does not help |
+| `invalid` | something is at the path that is not a root-owned file nobody else can write, with no ACL, or `/` or `/Library` is not a root-owned real directory that neither group nor others can write, with no ACL. It is ignored and the signature checks stay on. When the marker file is the cause, `remedy` is `sudo rm /Library/k3sm.developer-mode`, or `sudo rm -r /Library/k3sm.developer-mode` when a directory is at the path. When a directory above it is the cause, `detail` and `remedy` name that directory (`/` or `/Library`) and the remedy is to make it root-owned, not writable by group or others, with no ACL; removing the marker clears the row and leaves that directory as it is |
+| `unknown` | the path could not be read from this account, for example because the account cannot search a directory above it. The report cannot say whether developer mode is on, so treat the mode as unverified. `remedy` is `sudo k3sm status`; as root, it is to check the path and the directories above it by hand |
 
 `wide.signing` names how the installed k3sm is signed, `ad-hoc` or `team <ID>`; it is omitted when
 that cannot be read. `detail` and `remedy` are sentences for a person; do not parse them.

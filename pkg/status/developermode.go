@@ -25,8 +25,8 @@ import (
 )
 
 // RowDeveloperMode is the developer-mode marker (install.DeveloperModeMarkerPath).
-// The row exists only while something is at the marker path, and it never
-// moves the verdict (advisoryRows).
+// The row exists only while something is at the marker path or the path cannot
+// be read, and it never moves the verdict (advisoryRows).
 const RowDeveloperMode = "developer-mode"
 
 // The developer-mode row's sentences. They are part of what a consumer reads,
@@ -38,17 +38,32 @@ const (
 )
 
 // The ancestor cause: the marker is fine and a directory above it is not, so
-// removing the marker would not help.
+// removing the marker clears the row and leaves the directory to fix.
 const (
 	developerModeAncestorDetailFmt = "A developer-mode marker exists but %s, a directory above it, is not a root-owned real directory that neither group nor others can write, with no ACL, so the marker is ignored and the signature checks stay on"
-	developerModeAncestorRemedyFmt = "Make %s a root-owned real directory that neither group nor others can write, with no ACL; removing the marker does not fix it"
+	developerModeAncestorRemedyFmt = "Make %s a root-owned real directory that neither group nor others can write, with no ACL; removing the marker clears this row but leaves that directory as it is"
 )
 
-// developerModeInvalidRemedy removes a marker that fails the checks.
-const developerModeInvalidRemedy = "sudo rm " + install.DeveloperModeMarkerPath
+// developerModeInvalidRemedy removes a marker that fails the checks, and
+// developerModeInvalidDirRemedy one that is a directory, which rm refuses
+// without -r. rm -r does not follow a symlink inside it.
+const (
+	developerModeInvalidRemedy    = "sudo rm " + install.DeveloperModeMarkerPath
+	developerModeInvalidDirRemedy = "sudo rm -r " + install.DeveloperModeMarkerPath
+)
+
+// The unknown state: the read could not see the path. It says neither that a
+// marker exists nor that the signature checks stay on, because root may read a
+// valid marker there that this account cannot. As root the report has nothing
+// further to ask, so the remedy looks at the path instead.
+const (
+	developerModeUnknownDetail     = "The developer-mode marker path could not be read from this account, so this report cannot say whether developer mode is on"
+	developerModeUnknownRootRemedy = "Check the path and the directories above it with ls -ldO@e " + install.DeveloperModeMarkerPath + " /Library /"
+)
 
 // developerModeRow reports the developer-mode marker: on for a valid one,
-// invalid for anything else at the path, and no row when the path is absent.
+// invalid for anything else at the path, unknown when the read could not see
+// the path, and no row when the path is absent.
 // The wide signing key names how the installed k3sm is signed, when
 // SigningTeamID is wired and can tell.
 func (c Collector) developerModeRow(ctx context.Context) (Row, bool) {
@@ -66,6 +81,14 @@ func (c Collector) developerModeRow(ctx context.Context) (Row, bool) {
 				row.Detail = fmt.Sprintf(developerModeAncestorDetailFmt, dir)
 				row.Remedy = fmt.Sprintf(developerModeAncestorRemedyFmt, dir)
 			}
+		}
+		if row.Remedy == developerModeInvalidRemedy && c.DeveloperModeMarkerIsDir != nil && c.DeveloperModeMarkerIsDir() {
+			row.Remedy = developerModeInvalidDirRemedy
+		}
+	case install.DeveloperModeUnknown:
+		row.State, row.Detail, row.Remedy = StateUnknown, developerModeUnknownDetail, needsAdminRemedy
+		if c.EUID == 0 {
+			row.Remedy = developerModeUnknownRootRemedy
 		}
 	default:
 		return Row{}, false
@@ -93,19 +116,26 @@ func (c Collector) installedSigning(ctx context.Context) (string, bool) {
 }
 
 // developerModeAlert is the developer-mode row's alert: a signed release turns
-// the mode off, and an invalid marker is removed by hand.
+// the mode off, an invalid marker is removed by hand, and an unread one is read
+// again as root.
 func developerModeAlert(r Row) *Alert {
 	switch r.State {
 	case StateOn:
 		return alert("Developer mode is on, so k3sm does not check the signature of the k3sm that runs as root.", docsDeveloperMode,
 			manual(developerModeOnRemedy))
 	case StateInvalid:
-		if r.Remedy != developerModeInvalidRemedy {
+		if r.Remedy != developerModeInvalidRemedy && r.Remedy != developerModeInvalidDirRemedy {
 			return alert("A directory above the developer-mode marker is not a root-owned real directory nobody else can write; the marker is ignored and the signature checks stay on.", docsDeveloperMode,
 				manual(r.Remedy))
 		}
 		return alert("Something is at the developer-mode marker path that is not a root-owned file nobody else can write; it is ignored and the signature checks stay on.", docsDeveloperMode,
-			cmd("Remove it", developerModeInvalidRemedy))
+			cmd("Remove it", r.Remedy))
+	case StateUnknown:
+		const cause = "The developer-mode marker path could not be read from this account, so this report cannot say whether developer mode is on."
+		if r.Remedy == needsAdminRemedy {
+			return alert(cause, docsDeveloperMode, reportAsAdmin())
+		}
+		return alert(cause, docsDeveloperMode, manual(r.Remedy))
 	}
 	return nil
 }

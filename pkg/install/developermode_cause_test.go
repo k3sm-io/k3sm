@@ -39,11 +39,15 @@ func TestDeveloperModeAncestorCause(t *testing.T) {
 		{"root acl", DeveloperModeFacts{Exists: true, Entry: file, Ancestors: []DeveloperModeAncestor{{Entry: good, HasACL: true}, {Entry: good}}}, "/"},
 		{"symlink root", DeveloperModeFacts{Exists: true, Entry: file, Ancestors: []DeveloperModeAncestor{{Entry: OwnedEntry{Kind: EntrySymlink, Mode: 0o755}}, {Entry: good}}}, "/"},
 		{"probe error on library", DeveloperModeFacts{Exists: true, Entry: file, Ancestors: []DeveloperModeAncestor{{Entry: good}, {Err: errors.New("lstat failed")}}}, "/Library"},
+		{"marker unread", DeveloperModeFacts{Exists: true, Err: errors.New("lstat failed")}, ""},
 		{"marker is the cause", DeveloperModeFacts{Exists: true, Entry: OwnedEntry{Kind: EntryRegular, UID: 501, Mode: 0o644}, Ancestors: []DeveloperModeAncestor{{Entry: bad}, {Entry: bad}}}, ""},
 	}
 	for _, tc := range cases {
-		if got := DeveloperModeAncestorCause(tc.f, path); got != tc.want {
-			t.Errorf("%s: cause %q, want %q", tc.name, got, tc.want)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := DeveloperModeAncestorCause(tc.f, path); got != tc.want {
+				t.Errorf("cause %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
