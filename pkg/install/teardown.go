@@ -667,24 +667,34 @@ func retainedVersion(sys System, tree layout.Layout, ver string, podPaths []stri
 	if v, err := tree.ResolvePrevious(sys.Readlink); err == nil {
 		r.Previous = v
 	}
-	if len(r.Reasons(ver)) > 0 {
-		return true, nil
+	// The helper's path may spell ver in another case than the directory the
+	// tree keeps (the default volume is case-insensitive); the retention rule
+	// compares names exactly, so ask it under each spelling the tree holds.
+	spellings := append([]string{ver, r.Current, r.Previous, r.Staged}, r.InUse...)
+	for _, name := range spellings {
+		if strings.EqualFold(name, ver) && len(r.Reasons(name)) > 0 {
+			return true, nil
+		}
 	}
 	return false, unknown
 }
 
 // entryNames is the listing seam layout.PodVersions maps a pod path's version
 // to the versions directory's own spelling of it through: the base names of
-// the entries sys.ListOwned reports directly inside dir.
+// the directories sys.ListOwned reports directly inside dir. An entry of any
+// other kind (a stray file, a symlink) is no version directory and retains
+// nothing, so it is not listed.
 func entryNames(sys System) layout.ListNames {
 	return func(dir string) ([]string, error) {
 		ents, err := sys.ListOwned(dir)
 		if err != nil {
 			return nil, err
 		}
-		names := make([]string, len(ents))
-		for i, e := range ents {
-			names[i] = filepath.Base(e.Path)
+		names := make([]string, 0, len(ents))
+		for _, e := range ents {
+			if e.Kind == EntryDir {
+				names = append(names, filepath.Base(e.Path))
+			}
 		}
 		return names, nil
 	}
