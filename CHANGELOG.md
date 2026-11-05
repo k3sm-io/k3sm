@@ -138,6 +138,11 @@ pin, its date, and the tarball's sha256.
   moves on past the limit. It follows no symlink, and it reports a volume mounted inside the tree
   and leaves it alone. A file with a system flag, or a hard-linked file with a locking flag, is still
   refused and named, and uninstall fails until it is dealt with.
+- A single-node `MLXModel` refuses every image URL that is not a `data:` URL with HTTP 400, before a
+  name is resolved; before, vllm-mlx fetched `http(s)` image URLs from the pod, and a name that
+  resolved differently the second time could reach an internal address. Send images inline as
+  base64 `data:` URLs. The fix is in the `mlx-serve` entrypoint, so it ships with the next image
+  tag: an already published tag does not have it.
 - `k3sm status` names the cause of an invalid developer-mode row: when `/` or `/Library` is the
   problem, the detail and remedy name that directory instead of suggesting `sudo rm` of the marker,
   which does not fix it. [Status JSON](docs/user/status-json.md) describes the row.

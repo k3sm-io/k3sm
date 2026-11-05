@@ -34,6 +34,9 @@
 #     window with vLLM's HTTP 400 and passes one inside it, against fakes and,
 #     when a staged tree is present, against the real vllm-mlx server, on the
 #     completion, chat, Messages and Responses routes, streaming or not;
+#   * k3sm-serve refuses every image URL that is not a data: URL before a name is
+#     resolved, and refuses to start when the function it replaces has moved,
+#     against fakes and, with a staged tree, on the real vllm-mlx routes;
 #   * k3sm-serve lowers --max-kv-size for a model whose config.json geometry
 #     costs more KV bytes per token than k3sm sized it for, and leaves it alone
 #     for a smaller model, a missing config, a missing field and the off switch;
@@ -55,14 +58,17 @@
 #   --strict-self-test runs only the checks on that strictness and on rung 9a's
 #   pin source (hermetic, a few seconds): it re-runs this script's 9a verdict
 #   against an empty stage and a fixture stage and checks the verdicts.
+#   --case serve.image.remote runs only that case: k3sm_serve's refusal of remote
+#   image URLs, on fakes and, when a staged tree is present, on the real engine.
 #   Any other argument is refused with exit 2.
 # Exit: 0 all checks pass, 1 otherwise, 2 on a usage error.
 set -uo pipefail
 
 STAGED_REQUIRED=0
 STRICT_SELF_TEST=0
-for arg in "$@"; do
-	case "$arg" in
+CASE=""
+while [ $# -gt 0 ]; do
+	case "$1" in
 		--staged) STAGED_REQUIRED=1 ;;
 		--strict-self-test)
 			if [ -n "${K3SM_MLX_SELFTEST_ONLY:-}" ]; then
@@ -70,11 +76,25 @@ for arg in "$@"; do
 				exit 2
 			fi
 			STRICT_SELF_TEST=1 ;;
+		--case)
+			if [ $# -lt 2 ]; then
+				echo "selftest: --case needs a case name" >&2
+				exit 2
+			fi
+			CASE="$2"
+			shift ;;
 		*)
-			echo "selftest: unknown argument '$arg' (only --staged and --strict-self-test)" >&2
+			echo "selftest: unknown argument '$1' (only --staged, --strict-self-test and --case)" >&2
 			exit 2 ;;
 	esac
+	shift
 done
+case "$CASE" in
+	""|serve.image.remote) ;;
+	*)
+		echo "selftest: unknown case '$CASE' (only serve.image.remote)" >&2
+		exit 2 ;;
+esac
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BUILD="$HERE/build.sh"
@@ -278,6 +298,468 @@ PY
 	fi
 }
 
+# rung_serve_image_remote is the case serve.image.remote: k3sm_serve refuses
+# every image URL that is not a data: URL, before any name is resolved. First
+# against fakes, whose download_image and _validate_remote_media_urls are
+# vllm-mlx 0.5.0's verbatim, so the pins are checked on any Mac; then, on a
+# staged tree, on the real modules behind the real HTTP app (a fake engine under
+# it: no model, no GPU, and socket.getaddrinfo and requests.request replaced by
+# recorders, so nothing leaves this Mac). The real leg first proves the stock
+# function does resolve and fetch, so the refusals cannot pass vacuously, and
+# then drives the chat, Responses and Anthropic routes, streaming or not. With
+# --staged a missing tree is a failure, not a skip.
+rung_serve_image_remote() {
+	cat > "$WORK/serve-image.py" <<'PY'
+import http.server, sys, threading
+sys.path.insert(0, sys.argv[1])
+import k3sm_serve as ks
+import k3sm_shard as shard
+
+MAX_IMAGE_SIZE = 20 * 1024 * 1024
+
+def check(name, cond):
+    print(("ok " if cond else "no ") + name, flush=True)
+
+class Message:
+    def __init__(self, content):
+        self.content = content
+
+# vllm-mlx 0.5.0's vllm_mlx/models/mllm.py download_image, verbatim (Apache-2.0).
+def download_image(url: str, timeout: int = 30, max_size: int = MAX_IMAGE_SIZE) -> str:
+    """
+    Download image from URL and return local path.
+
+    Args:
+        url: Image URL
+        timeout: Download timeout in seconds
+        max_size: Maximum allowed file size in bytes
+
+    Returns:
+        Local file path to downloaded image
+
+    Raises:
+        FileSizeExceededError: If image exceeds max_size
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+    }
+
+    # First, make a HEAD request to check Content-Length
+    try:
+        head_response = _request_with_safe_redirects(
+            "HEAD", url, timeout=timeout, headers=headers
+        )
+        content_length = head_response.headers.get("content-length")
+        if content_length and int(content_length) > max_size:
+            raise FileSizeExceededError(
+                f"Image at {url} exceeds maximum size: {int(content_length) / 1024 / 1024:.1f} MB > "
+                f"{max_size / 1024 / 1024:.1f} MB limit"
+            )
+    except requests.RequestException:
+        # HEAD request failed, proceed with GET and check during download
+        pass
+
+    response = _request_with_safe_redirects(
+        "GET", url, timeout=timeout, headers=headers, stream=True
+    )
+    response.raise_for_status()
+
+    # Check Content-Length header from GET response
+    content_length = response.headers.get("content-length")
+    if content_length and int(content_length) > max_size:
+        raise FileSizeExceededError(
+            f"Image at {url} exceeds maximum size: {int(content_length) / 1024 / 1024:.1f} MB > "
+            f"{max_size / 1024 / 1024:.1f} MB limit"
+        )
+
+    # Determine extension from content type or URL
+    content_type = response.headers.get("content-type", "")
+    if "jpeg" in content_type or "jpg" in content_type:
+        ext = ".jpg"
+    elif "png" in content_type:
+        ext = ".png"
+    elif "gif" in content_type:
+        ext = ".gif"
+    elif "webp" in content_type:
+        ext = ".webp"
+    else:
+        # Try to get from URL
+        path = urlparse(response.url).path
+        ext = Path(path).suffix or ".jpg"
+
+    # Save to temp file with size checking during download
+    temp_file = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
+    downloaded_size = 0
+    try:
+        for chunk in response.iter_content(chunk_size=8192):
+            downloaded_size += len(chunk)
+            if downloaded_size > max_size:
+                temp_file.close()
+                os.unlink(temp_file.name)
+                raise FileSizeExceededError(
+                    f"Image at {url} exceeds maximum size during download: "
+                    f"{downloaded_size / 1024 / 1024:.1f} MB > {max_size / 1024 / 1024:.1f} MB limit"
+                )
+            temp_file.write(chunk)
+        temp_file.close()
+    except FileSizeExceededError:
+        raise
+    except Exception:
+        temp_file.close()
+        if os.path.exists(temp_file.name):
+            os.unlink(temp_file.name)
+        raise
+
+    return _temp_manager.register(temp_file.name)
+
+# vllm-mlx 0.5.0's vllm_mlx/server.py _validate_remote_media_urls, verbatim.
+def _validate_remote_media_urls(messages: list[Message | dict]) -> None:
+    """Validate remote media URLs during request preparation."""
+    for url in _iter_remote_media_urls(messages):
+        _validate_url_safety(url)
+
+class UnsafeRemoteURLError(ValueError):
+    def __init__(self, message, *, public_message="Remote media URL is not allowed"):
+        super().__init__(message)
+        self.public_message = public_message
+
+class Mllm:
+    pass
+
+def engine():
+    """A fresh (server, mllm) pair, as the guard finds them on the real engine."""
+    mllm, server = Mllm(), Mllm()
+    mllm.download_image = download_image
+    server.UnsafeRemoteURLError = UnsafeRemoteURLError
+    server._validate_remote_media_urls = _validate_remote_media_urls
+    return server, mllm
+
+# Upstream's validator yields nothing here: this records that it still runs.
+SEEN = []
+def _iter_remote_media_urls(messages):
+    SEEN.append(messages)
+    return []
+def _validate_url_safety(url):
+    raise AssertionError("no URL to validate")
+
+hits = []
+class Probe(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        hits.append(self.path)
+        self.send_response(200)
+        self.end_headers()
+    do_HEAD = do_GET
+    def log_message(self, *a):
+        pass
+probe_srv = http.server.HTTPServer(("127.0.0.1", 0), Probe)
+threading.Thread(target=probe_srv.serve_forever, daemon=True).start()
+local = "http://127.0.0.1:%d/internal" % probe_srv.server_address[1]
+
+check("pin.fetch  the fixture's download_image is the body IMAGE_FETCH_SHA256 pins",
+      ks.source_shape(download_image) == ks.IMAGE_FETCH_SHA256)
+check("pin.check  the fixture's _validate_remote_media_urls is the body MEDIA_CHECK_SHA256 pins",
+      ks.source_shape(_validate_remote_media_urls) == ks.MEDIA_CHECK_SHA256)
+check("pin.shape  the hash is the same normalization k3sm_shard pins mlx-lm with",
+      ks.source_shape(download_image) == shard.source_shape(download_image))
+
+server, mllm = engine()
+ks.install_image_guard(server, mllm)
+check("replaced  download_image is replaced and the validator is wrapped",
+      mllm.download_image is not download_image and server._validate_remote_media_urls is not _validate_remote_media_urls)
+
+def refused(part, s=None):
+    s = s or server
+    try:
+        s._validate_remote_media_urls([{"role": "user", "content": [part]}])
+    except UnsafeRemoteURLError as e:
+        return e.public_message == ks.IMAGE_REFUSAL
+    return False
+
+def fetch_refused(url):
+    try:
+        mllm.download_image(url)
+    except UnsafeRemoteURLError:
+        return True
+    return False
+
+def image_url(url):
+    return {"type": "image_url", "image_url": {"url": url}}
+
+check("http  a remote http URL is refused with the public message, nothing reaches a local listener",
+      refused(image_url(local)) and fetch_refused(local) and hits == [])
+check("https  a remote https URL is refused",
+      refused(image_url("https://example.invalid/a.png")) and fetch_refused("https://example.invalid/a.png"))
+check("rebinding  a name built to answer public then private is refused, whatever it resolves to",
+      refused(image_url("http://7f000001.5db8d822.rbndr.invalid/a.png"))
+      and fetch_refused("http://7f000001.5db8d822.rbndr.invalid/a.png"))
+check("shapes  a bare string, the image key, the url key, a nested url, a dict without one and file: are refused",
+      all(refused(p) for p in (
+          {"type": "image_url", "image_url": "http://example.invalid/a.png"},
+          {"type": "image", "image": "https://example.invalid/a.png"},
+          {"type": "image", "image": {"url": "https://example.invalid/a.png"}},
+          {"type": "image", "url": "https://example.invalid/a.png"},
+          {"type": "image_url", "image_url": {"url": {"url": "http://example.invalid/a.png"}}},
+          {"type": "image_url", "image_url": {"image_url": "http://example.invalid/a.png"}},
+          {"type": "text", "image": "http://example.invalid/a.png"},
+          image_url("file:///etc/passwd"),
+          image_url("/etc/passwd"),
+          image_url("HTTP://EXAMPLE.INVALID/A.PNG"),
+          {"type": "image_url", "image_url": 7})) and hits == [])
+class Part:
+    def __init__(self, **kw):
+        self.kw = kw
+    def model_dump(self, exclude_none=False):
+        return self.kw
+try:
+    server._validate_remote_media_urls([Message([Part(type="image_url", image_url={"url": "https://example.invalid/a.png"})])])
+    check("models  a pydantic message and part are read as the server hands them over", False)
+except UnsafeRemoteURLError:
+    check("models  a pydantic message and part are read as the server hands them over", True)
+SEEN.clear()
+data = [{"role": "user", "content": [{"type": "text", "text": "hi"}, image_url("data:image/png;base64,AAAA")]},
+        {"role": "assistant", "content": "plain string content"},
+        Message([Part(type="image_url", image_url={"url": "data:image/png;base64,AAAA"}), Part(type="text", text="x")])]
+server._validate_remote_media_urls(data)
+check("data  a data: URL passes, and upstream's validator still runs for the rest of the media",
+      len(SEEN) == 1 and SEEN[0] is data)
+
+def fetch_moved(url, timeout=30, max_size=MAX_IMAGE_SIZE):
+    return url
+def check_moved(messages):
+    return None
+def renamed(other, *a):
+    pass
+def moved(hook, how):
+    s, m = engine()
+    owner = m if hook == "download_image" else s
+    stock = {"body": fetch_moved if owner is m else check_moved, "sig": renamed, "gone": None}[how]
+    setattr(owner, hook, stock)
+    try:
+        ks.install_image_guard(s, m)
+    except ks.GuardError as e:
+        return (hook in str(e) and getattr(owner, hook) is stock
+                and m.download_image in (download_image, stock)
+                and s._validate_remote_media_urls in (_validate_remote_media_urls, stock))
+    return False
+for hook in ("download_image", "_validate_remote_media_urls"):
+    check("failclosed.body.%s  a changed upstream body ends the process naming the hook" % hook, moved(hook, "body"))
+    check("failclosed.signature.%s  another signature ends the process naming the hook" % hook, moved(hook, "sig"))
+    check("failclosed.missing.%s  an engine without the function ends the process naming the hook" % hook,
+          moved(hook, "gone"))
+s, m = engine()
+del s.UnsafeRemoteURLError
+try:
+    ks.install_image_guard(s, m)
+    check("failclosed.refusal  an engine without the refusal class ends the process", False)
+except ks.GuardError as e:
+    check("failclosed.refusal  an engine without the refusal class ends the process",
+          "UnsafeRemoteURLError" in str(e) and m.download_image is download_image)
+probe_srv.shutdown()
+PY
+	local checks=0 out verdict name
+	out="$(PYTHONDONTWRITEBYTECODE=1 python3 "$WORK/serve-image.py" "$HERE" 2>"$WORK/serve-image.err")"
+	while read -r verdict name; do
+		[ -n "$verdict" ] || continue
+		checks=$((checks + 1))
+		case "$verdict" in
+			ok) ladder ok "serve.image.remote.$name" ;;
+			no) ladder no "serve.image.remote.$name" ;;
+			*)  ladder no "serve.image.remote.driver  $verdict $name" ;;
+		esac
+	done <<< "$out"
+	if [ "$checks" -ge 16 ]; then
+		ladder ok "serve.image.remote.count  all $checks fixture checks reported"
+	else
+		ladder no "serve.image.remote.count  only $checks of 16 fixture checks reported (the driver crashed?)"
+		tail -5 "$WORK/serve-image.err"
+	fi
+
+	if ! { [ -x "$STAGED/bin/python3.12" ] && [ -d "$STAGED/lib/python3.12/site-packages/vllm_mlx" ]; }; then
+		if [ "$STAGED_REQUIRED" = 1 ]; then
+			ladder no "serve.image.remote.real  --staged, but no staged tree with vllm_mlx at $STAGED (run build.sh, or set K3SM_MLX_STAGE)"
+		else
+			ladder skip "serve.image.remote.real  no staged tree at $STAGED (run build.sh, or set K3SM_MLX_STAGE)"
+		fi
+		return
+	fi
+	cat > "$WORK/serve-image-real.py" <<'PY'
+import base64, logging, os, socket, sys, types
+sys.path.insert(0, sys.argv[1])
+logging.disable(logging.WARNING)
+import k3sm_serve as ks
+from fastapi.testclient import TestClient
+from vllm_mlx import server
+from vllm_mlx.engine.batched import BatchedEngine
+from vllm_mlx.models import mllm
+
+def check(name, cond):
+    print(("ok " if cond else "no ") + name, flush=True)
+
+# Nothing leaves this Mac: the first lookup of a name answers a public address
+# and every later one a private address, the shape a rebinding name has.
+LOOKUPS, FETCHES, ANSWERS = [], [], {}
+def lookup(host, port, *a, **kw):
+    LOOKUPS.append(host)
+    ANSWERS[host] = ANSWERS.get(host, 0) + 1
+    addr = "93.184.216.34" if ANSWERS[host] == 1 else "127.0.0.1"
+    return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (addr, port))]
+def fetch(method, url, **kw):
+    FETCHES.append((method, url))
+    raise mllm.requests.ConnectionError("selftest: no network")
+socket.getaddrinfo = lookup
+mllm.requests.request = fetch
+
+HTTP, HTTPS = "http://example.invalid/a.png", "https://example.invalid/a.png"
+REBIND = "http://7f000001.5db8d822.rbndr.invalid/a.png"
+PNG = "data:image/png;base64," + base64.b64encode(
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
+    b"\x00\x00\x00\rIDATx\x9cc\xf8\xcf\xc0\xf0\x1f\x00\x05\x00\x01\xff\x89\x99=\x1d\x00\x00\x00\x00IEND\xaeB`\x82"
+).decode()
+
+def stock_fetches(url):
+    LOOKUPS.clear(), FETCHES.clear(), ANSWERS.clear()
+    try:
+        mllm.process_image_input(url)
+    except Exception:
+        pass
+    return list(LOOKUPS), list(FETCHES)
+looked, fetched = stock_fetches(REBIND)
+check("real.stock  the unguarded engine resolves a rebinding name and then requests it (what the guard removes)",
+      len(looked) >= 2 and fetched[:1] == [("HEAD", REBIND)])
+
+stock_fetch, stock_check = mllm.download_image, server._validate_remote_media_urls
+ks.install_on_engine()
+check("real.install  install_on_engine checks the real pins and installs the guard",
+      mllm.download_image is not stock_fetch and server._validate_remote_media_urls is not stock_check)
+
+def quiet(url):
+    """The fetch path alone: no lookup and no request, and the input is refused."""
+    LOOKUPS.clear(), FETCHES.clear(), ANSWERS.clear()
+    try:
+        mllm.process_image_input(url)
+    except server.UnsafeRemoteURLError:
+        return LOOKUPS == [] and FETCHES == []
+    return False
+check("real.fetch.http  process_image_input refuses http with no lookup and no request", quiet(HTTP))
+check("real.fetch.https  process_image_input refuses https with no lookup and no request", quiet(HTTPS))
+check("real.fetch.rebinding  process_image_input refuses a rebinding name with no lookup and no request", quiet(REBIND))
+LOOKUPS.clear(), FETCHES.clear()
+path = mllm.process_image_input(PNG)
+check("real.fetch.data  process_image_input writes a data: image to a local file, with no lookup and no request",
+      os.path.exists(path) and LOOKUPS == [] and FETCHES == [])
+
+class Tok:
+    def encode(self, text):
+        return text.split()
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, **kw):
+        return " ".join("<%s> %s" % (m["role"], m["content"]) for m in messages) + " <assistant>"
+
+class Out:
+    def __init__(self, prompt):
+        self.output_text = self.new_text = "ok"
+        self.output_token_ids = [1]
+        self.prompt_tokens, self.completion_tokens = len(prompt.split()), 1
+        self.finish_reason, self.finished = "stop", True
+
+RAN = []
+class Core:
+    async def generate(self, prompt, sampling_params):
+        RAN.append(prompt)
+        return Out(prompt)
+    async def add_request(self, prompt, sampling_params, prefix_boundary=0):
+        RAN.append(prompt)
+        self.prompt = prompt
+        return "r"
+    async def stream_outputs(self, request_id):
+        yield Out(self.prompt)
+
+class Engine(BatchedEngine):
+    def __init__(self, window):
+        self._scheduler_config = types.SimpleNamespace(max_kv_size=window)
+        self._tokenizer, self._is_mllm, self._processor = Tok(), False, None
+        self._model_name, self._loaded, self._engine, self._mllm_scheduler = "fake", True, Core(), None
+
+engine = Engine(4096)
+server._engine = engine
+async def acquire(raw_request, **kw):
+    return engine
+async def release(raw_request):
+    return None
+server._acquire_default_engine_for_request = acquire
+server._release_engine_for_request = release
+server._validate_model_name = lambda model: None
+client = TestClient(server.app)
+
+def part(url):
+    return {"type": "image_url", "image_url": {"url": url}}
+def chat(url):
+    return {"messages": [{"role": "user", "content": [{"type": "text", "text": "what is this"}, part(url)]}],
+            "max_tokens": 8}
+def anthropic(url):
+    return {"messages": [{"role": "user", "content": [
+        {"type": "text", "text": "what is this"}, {"type": "image", "source": {"type": "url", "url": url}}]}],
+        "max_tokens": 8}
+def responses(url):
+    # The one Responses input item vllm-mlx 0.5.0 hands over with its parts intact.
+    return {"input": [{"type": "function_call_output", "call_id": "c", "output": [part(url)]}],
+            "max_output_tokens": 8}
+
+def post(path, body, stream):
+    return client.post(path, json=dict(body, model="fake", stream=stream))
+
+def verdict(name, ok, r):
+    print(("ok " if ok else "no ") + "%s (HTTP %d, %d lookups, %d requests)"
+          % (name, r.status_code, len(LOOKUPS), len(FETCHES)), flush=True)
+
+URLS = (("http", HTTP), ("https", HTTPS), ("rebinding", REBIND))
+for rname, path, shape in (("chat", "/v1/chat/completions", chat), ("responses", "/v1/responses", responses)):
+    for stream in (False, True):
+        tag = "%s.%s" % (rname, "stream" if stream else "plain")
+        for uname, url in URLS:
+            LOOKUPS.clear(), FETCHES.clear(), RAN.clear()
+            r = post(path, shape(url), stream)
+            verdict("real.%s.%s  answers 400 before any byte, with no lookup, request or engine call" % (tag, uname),
+                    r.status_code == 400 and ks.IMAGE_REFUSAL in r.text and "event:" not in r.text
+                    and LOOKUPS == [] and FETCHES == [] and RAN == [], r)
+        LOOKUPS.clear(), FETCHES.clear()
+        r = post(path, shape(PNG), stream)
+        verdict("real.%s.data  a data: image answers 200 with no lookup or request" % tag,
+                r.status_code == 200 and LOOKUPS == [] and FETCHES == [], r)
+# vllm-mlx 0.5.0's Anthropic adapter drops an image block, so there is nothing to
+# refuse on /v1/messages: the request is served without it and nothing is fetched.
+for stream in (False, True):
+    tag = "messages.%s" % ("stream" if stream else "plain")
+    for uname, url in URLS + (("data", PNG),):
+        LOOKUPS.clear(), FETCHES.clear()
+        r = post("/v1/messages", anthropic(url), stream)
+        verdict("real.%s.%s  the adapter drops the image block: no lookup and no request" % (tag, uname),
+                r.status_code == 200 and LOOKUPS == [] and FETCHES == [], r)
+
+LOOKUPS.clear(), FETCHES.clear(), RAN.clear()
+r = post("/v1/chat/completions", {"messages": [{"role": "user", "content": [
+    {"type": "video_url", "video_url": {"url": "http://127.0.0.1/a.mp4"}}]}], "max_tokens": 8}, False)
+check("real.wrapped  a private video URL is still refused by upstream's own validator, which the guard wraps",
+      r.status_code == 400 and ks.IMAGE_REFUSAL not in r.text and FETCHES == [])
+PY
+	checks=0
+	out="$(cd "$WORK" && PYTHONDONTWRITEBYTECODE=1 "$STAGED/bin/python3.12" -I -B "$WORK/serve-image-real.py" "$HERE" 2>"$WORK/serve-image-real.err")"
+	while read -r verdict name; do
+		[ -n "$verdict" ] || continue
+		checks=$((checks + 1))
+		case "$verdict" in
+			ok) ladder ok "serve.image.remote.$name" ;;
+			no) ladder no "serve.image.remote.$name" ;;
+			*)  ladder no "serve.image.remote.driver  $verdict $name" ;;
+		esac
+	done <<< "$out"
+	if [ "$checks" -ge 31 ]; then
+		ladder ok "serve.image.remote.real.count  all $checks real-engine checks reported"
+	else
+		ladder no "serve.image.remote.real.count  only $checks of 31 real-engine checks reported (the driver crashed?)"
+		tail -15 "$WORK/serve-image-real.err"
+	fi
+}
+
 # K3SM_MLX_SELFTEST_ONLY=9a is --strict-self-test's child run: the argument
 # parse above, then only the 9a verdict, and the exit code a full run gives it.
 case "${K3SM_MLX_SELFTEST_ONLY:-}" in
@@ -292,6 +774,13 @@ case "${K3SM_MLX_SELFTEST_ONLY:-}" in
 		echo "selftest: unknown K3SM_MLX_SELFTEST_ONLY '${K3SM_MLX_SELFTEST_ONLY}'" >&2
 		exit 2 ;;
 esac
+
+if [ -n "$CASE" ]; then
+	rung_serve_image_remote
+	echo "mlx-serve selftest ($CASE only): $PASS passed, $FAIL failed, $SKIP skipped"
+	[ "$FAIL" -eq 0 ] || exit 1
+	exit 0
+fi
 
 # ---- --strict-self-test — the --staged strictness and 9a's pin source ------
 # Nothing else in this file can go red when the --staged branch is deleted or
@@ -340,6 +829,8 @@ if [ "$STRICT_SELF_TEST" = 1 ]; then
 		2 "$WORK/strict-empty" --stage -- "unknown argument '--stage'"
 	strict_leg "strict.unknown=  an unknown argument (--staged=1) is refused with exit 2" \
 		2 "$WORK/strict-empty" --staged=1 -- "unknown argument '--staged=1'"
+	strict_leg "strict.case  an unknown --case is refused with exit 2" \
+		2 "$WORK/strict-empty" --case serve.nothing -- "unknown case 'serve.nothing'"
 	strict_leg "strict.recursion  --strict-self-test inside its own child run is refused with exit 2" \
 		2 "$WORK/strict-empty" --strict-self-test -- 'recursion refused'
 	echo "----------------------------------------"
@@ -1450,6 +1941,9 @@ else
 	ladder no "8k.count  only $KV_CHECKS of 19 clamp checks reported (the driver crashed?)"
 	head -20 "$WORK/kv-driver.err"
 fi
+
+# ---- serve.image.remote — no image fetch on the single-node path --------------
+rung_serve_image_remote
 
 # ---- 9 — the guard on the REAL engine (needs a staged tree) -----------------
 # The seams above are vllm-mlx 0.5.0's own functions; this rung installs the

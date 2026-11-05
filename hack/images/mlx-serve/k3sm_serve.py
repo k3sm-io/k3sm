@@ -10,7 +10,8 @@ CLI starts it installs one guard on the server module: a request whose prompt
 plus completion would not fit the engine's context window is refused with HTTP
 400, the way vLLM enforces max_model_len, instead of being served. It also
 patches the prefill mask of mlx-lm's rotating cache so the cache's attention
-sinks stay attended (see The attention sinks, below).
+sinks stay attended (see The attention sinks, below). It refuses every image URL
+that is not a data: URL (see Remote image URLs, below).
 
 Why the guard exists. vllm-mlx 0.5.0 has no max-model-len option and does no
 prompt-length validation: its only per-sequence bound is --max-kv-size, which
@@ -109,11 +110,30 @@ cannot read, or a missing field, logs one line and leaves W as given: the clamp
 never fails the pod. K3SM_KV_GEOMETRY_CLAMP=off disables it. It is
 conservative where the cache costs less than fp16 for every layer (a quantized
 KV cache, sliding-window layers).
+
+Remote image URLs. vllm-mlx 0.5.0 fetches an http(s) image URL in a request
+through vllm_mlx.models.mllm.download_image. Its _validate_url_safety rejects a
+name that resolves to a non-global address, but requests resolves the name again
+for the connection, so a name that answers differently the second time (DNS
+rebinding) reaches an internal address, and any global address is still a blind
+GET from the pod. The image has no use for a remote image: a client sends it
+inline as a data: URL. install_image_guard wraps
+server._validate_remote_media_urls, so each route refuses such a request with its
+own HTTP 400 before a response starts, and replaces download_image, the one
+function that fetches, so no other path reaches the network for an image. Both
+originals' signatures and normalized body hashes are checked first, and the
+process exits if either moved. Video and audio URLs stay as vllm-mlx has them,
+behind its own validator.
 """
 
+import hashlib
+import inspect
+import io
 import logging
 import os
 import sys
+import textwrap
+import tokenize
 
 ENGINE_CLI = "vllm_mlx.cli"
 CONTINUOUS_BATCHING = "--continuous-batching"
@@ -406,6 +426,98 @@ def install(server, engine_cls, http_exception, json_response, extract_multimoda
     return ContextRefusal
 
 
+# The two functions install_image_guard takes over, as vllm-mlx 0.5.0 has them. A
+# bump that changes either must read the new source, then pin the new hash.
+IMAGE_FETCH_HOOK = "download_image"
+IMAGE_FETCH_PARAMS = ("url", "timeout", "max_size")
+IMAGE_FETCH_SHA256 = "6c89f98d4f53bd0756e90ea830d49064f4d180fe9d6554d53cc6e932cce7081d"
+MEDIA_CHECK_HOOK = "_validate_remote_media_urls"
+MEDIA_CHECK_PARAMS = ("messages",)
+MEDIA_CHECK_SHA256 = "f437b299963f5cbd461ebe4ea6128f8f4e86a2b43522f1bd331fd709fb6ab6ca"
+IMAGE_REFUSAL = "remote image URLs are not fetched by this server; send the image inline as a data: URL"
+
+
+def source_shape(func):
+    """sha256 of func's source with comments, blank lines and layout removed.
+
+    The normalization k3sm_shard.source_shape pins mlx-lm with.
+    """
+    try:
+        src = textwrap.dedent(inspect.getsource(func))
+        skip = {tokenize.COMMENT, tokenize.NL, tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT,
+                tokenize.ENCODING, tokenize.ENDMARKER}
+        toks = [t.string for t in tokenize.generate_tokens(io.StringIO(src).readline) if t.type not in skip]
+    except (OSError, TypeError, SyntaxError, tokenize.TokenError) as e:
+        raise GuardError(f"cannot read the source of {getattr(func, '__name__', func)!s} to check it against the "
+                         f"vllm-mlx 0.5.0 body the image guard was written against: {e}") from None
+    return hashlib.sha256(" ".join(toks).encode()).hexdigest()
+
+
+def _pinned_hook(owner, name, params, sha256):
+    """The function owner.name, once its signature and body are the pinned ones."""
+    func = _seam(owner, name)
+    got = tuple(inspect.signature(func).parameters)
+    if got != params:
+        raise GuardError(f"{name} takes {got}; the image guard was written against vllm-mlx 0.5.0's {params}")
+    shape = source_shape(func)
+    if shape != sha256:
+        raise GuardError(f"{name} is not the vllm-mlx 0.5.0 body the image guard takes over (source sha256 {shape}, "
+                         f"pinned {sha256}): read the new source, then pin its hash")
+    return func
+
+
+def image_values(messages):
+    """Yield what every content part of messages names as an image.
+
+    Reads a part under each key vllm-mlx reads, whatever its type, so a part the
+    engine would still treat as an image is never skipped.
+    """
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else getattr(message, "content", None)
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if hasattr(part, "model_dump"):
+                part = part.model_dump(exclude_none=True)
+            if not isinstance(part, dict):
+                continue
+            for key in ("image_url", "image"):
+                if part.get(key) is not None:
+                    yield part[key]
+            if part.get("type") == "image" and part.get("url") is not None:
+                yield part["url"]
+
+
+def install_image_guard(server, mllm):
+    """Refuse every image URL that is not a data: URL, on a vllm-mlx engine.
+
+    server is vllm_mlx.server and mllm is vllm_mlx.models.mllm, parameters so the
+    guard can be exercised against fakes. Nothing is replaced unless both
+    functions are the pinned ones. The refusal is the engine's own
+    UnsafeRemoteURLError, which every route answers with HTTP 400 and its
+    public_message.
+    """
+    refusal = getattr(server, "UnsafeRemoteURLError", None)
+    if not isinstance(refusal, type) or not issubclass(refusal, Exception):
+        raise GuardError("vllm_mlx.server has no UnsafeRemoteURLError; the image guard was written against "
+                         "vllm-mlx 0.5.0 and this engine moved it")
+    _pinned_hook(mllm, IMAGE_FETCH_HOOK, IMAGE_FETCH_PARAMS, IMAGE_FETCH_SHA256)
+    check_media = _pinned_hook(server, MEDIA_CHECK_HOOK, MEDIA_CHECK_PARAMS, MEDIA_CHECK_SHA256)
+
+    def refuse_image_fetch(url, timeout=None, max_size=None):
+        raise refusal(IMAGE_REFUSAL, public_message=IMAGE_REFUSAL)
+
+    def check_media_guarded(messages):
+        for value in image_values(messages):
+            url = value.get("url") if isinstance(value, dict) else value
+            if not isinstance(url, str) or not url.startswith("data:"):
+                raise refusal(IMAGE_REFUSAL, public_message=IMAGE_REFUSAL)
+        check_media(messages)
+
+    setattr(mllm, IMAGE_FETCH_HOOK, refuse_image_fetch)
+    setattr(server, MEDIA_CHECK_HOOK, check_media_guarded)
+
+
 KV_CLAMP_ENV = "K3SM_KV_GEOMETRY_CLAMP"
 KV_ASSUMED_ENV = "K3SM_KV_BYTES_PER_TOKEN"
 MODEL_CONFIG_DIR_ENV = "K3SM_MODEL_CONFIG_DIR"
@@ -696,7 +808,7 @@ def rotating_cache_classes():
 
 
 def install_on_engine():
-    """Install the sink patch and the guard on the real engine, before it loads."""
+    """Install the sink patch and the guards on the real engine, before it loads."""
     import mlx.core as mx
 
     patch_rotating_kv_cache(rotating_cache_classes(), mx)
@@ -707,7 +819,9 @@ def install_on_engine():
     from vllm_mlx.api.tool_calling import convert_tools_for_template
     from vllm_mlx.api.utils import extract_multimodal_content
     from vllm_mlx.engine.batched import BatchedEngine
+    from vllm_mlx.models import mllm
 
+    install_image_guard(server, mllm)
     return install(server, BatchedEngine, HTTPException, JSONResponse, extract_multimodal_content,
                    convert_tools_for_template)
 
@@ -731,7 +845,8 @@ def main(argv=None):
             print(f"k3sm-serve: {e}", file=sys.stderr, flush=True)
             return 2
         print("k3sm-serve: context guard on /v1/completions, /v1/chat/completions, /v1/messages and "
-              "/v1/responses (window: the engine's --max-kv-size); RotatingKVCache sink mask patched",
+              "/v1/responses (window: the engine's --max-kv-size); RotatingKVCache sink mask patched; "
+              "remote image URLs refused",
               file=sys.stderr, flush=True)
     from vllm_mlx import cli
 
