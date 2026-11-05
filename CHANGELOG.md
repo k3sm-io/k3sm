@@ -148,7 +148,7 @@ pin, its date, and the tarball's sha256.
   image tag: an already published tag does not have it.
 - The sandbox's explicit denies now follow the CA keys, the datastore and the node password on a node
   started with a non-default `--pod-root`, naming the `server` and `agent` directories at the data
-  root. Such a node recreates its pods once on upgrade. A node refuses to start, naming the path, when
+  root. Such a node recreates its pods once on upgrade, and refuses to start, naming the path, when
   the data root or either directory is reached through a symlink, or when `--pod-root` is inside either
   directory. A node on the default paths is unchanged.
 - `k3sm status` names the cause of an invalid developer-mode row: when `/` or `/Library` is the

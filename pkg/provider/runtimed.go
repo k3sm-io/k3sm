@@ -485,8 +485,9 @@ type RuntimedConfig struct {
 	// keys, the kine database and the node password. It is Root only when the pod
 	// root is left at its default, and the Seatbelt denies runtimed renders from
 	// this value name those directories wherever Root is. Empty (the standalone
-	// `k3sm node`, which keeps no such state) renders no extra deny. NewRuntimed
-	// refuses a value the denies would not match (ErrDataRootNotCanonical).
+	// `k3sm node`, which keeps no such state) renders no extra deny, and so does the
+	// runtime's own root. Otherwise NewRuntimed refuses a value the denies would not
+	// match (ErrDataRootNotCanonical).
 	DataRoot string
 	// DyldShim, when set, is the getaddrinfo DNS shim dylib injected into each
 	// pod via the PodBox annotation runtimed maps to DYLD_INSERT_LIBRARIES. The
@@ -1009,10 +1010,19 @@ var ErrDataRootNotCanonical = errors.New("data root is not its own resolved path
 // error when a deny could not match. A relative value (a relative --work-dir) is
 // made absolute, because that is where the state it names is written, and
 // runtime.New refuses a relative one.
+//
+// A data root that is the runtime's own root returns in the runtime's spelling and
+// is not checked. The profile adds no deny for it, so there is no new deny that could
+// fail to match, and refusing a node that starts today would change a default node
+// for nothing.
 func dataRootOf(cfg RuntimedConfig) (string, error) {
 	dir, err := absDenyDir(cfg.DataRoot, ErrDataRootNotCanonical)
 	if err != nil {
 		return "", err
+	}
+	root := runtimeRoot(cfg.Root)
+	if dir != "" && withoutFirmlink(dir) == withoutFirmlink(root) {
+		return root, nil
 	}
 	if err := checkDataRoot(dir); err != nil {
 		return "", err

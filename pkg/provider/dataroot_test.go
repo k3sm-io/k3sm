@@ -80,6 +80,97 @@ func TestDataRootUnderACustomPodRoot(t *testing.T) {
 	}
 }
 
+// TestDataRootSymlinkCheckFollowsThePodRoot pins that the check runs only where it
+// protects a deny. With the data root as the runtime's own root the profile adds
+// nothing, so a symlinked server directory, or a root behind a symlink, keeps
+// starting as it did. The same symlink under a custom pod root is refused, because
+// there the new deny would match nothing.
+func TestDataRootSymlinkCheckFollowsThePodRoot(t *testing.T) {
+	symlinkedChild := func(t *testing.T, base string) string {
+		t.Helper()
+		root := filepath.Join(base, "data")
+		for _, dir := range []string{root, filepath.Join(base, "elsewhere")} {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.Symlink(filepath.Join(base, "elsewhere"), filepath.Join(root, "server")); err != nil {
+			t.Fatal(err)
+		}
+		return root
+	}
+	start := func(t *testing.T, base, root, dataRoot string) error {
+		t.Helper()
+		stageExecShim(t)
+		_, err := NewRuntimed(context.Background(), RuntimedConfig{
+			NodeName:   "n1",
+			Root:       root,
+			PodLogsDir: filepath.Join(base, "podlogs"),
+			DataRoot:   dataRoot,
+			Logger:     slog.New(slog.DiscardHandler),
+		})
+		return err
+	}
+
+	t.Run("a default node with a symlinked server directory starts", func(t *testing.T) {
+		base := resolvedTempDir(t)
+		root := symlinkedChild(t, base)
+		if err := start(t, base, root, root); err != nil {
+			t.Errorf("NewRuntimed: %v", err)
+		}
+	})
+	t.Run("a default node with a root behind a symlink starts", func(t *testing.T) {
+		base := resolvedTempDir(t)
+		real := filepath.Join(base, "real")
+		if err := os.MkdirAll(real, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		via := filepath.Join(base, "via")
+		if err := os.Symlink(real, via); err != nil {
+			t.Fatal(err)
+		}
+		if err := start(t, base, via, via); err != nil {
+			t.Errorf("NewRuntimed: %v", err)
+		}
+	})
+	t.Run("a custom pod root with the same symlink is refused", func(t *testing.T) {
+		base := resolvedTempDir(t)
+		root := symlinkedChild(t, base)
+		if err := start(t, base, filepath.Join(base, "pods-root"), root); !errors.Is(err, ErrDataRootNotCanonical) {
+			t.Errorf("NewRuntimed err = %v, want ErrDataRootNotCanonical", err)
+		}
+	})
+	t.Run("a firmlink spelling of the runtime root takes the runtime's spelling", func(t *testing.T) {
+		const root, spelled = "/private/var/k3sm-data", "/var/k3sm-data"
+		for _, tc := range []struct{ root, dataRoot string }{{root, spelled}, {spelled, root}} {
+			got, err := dataRootOf(RuntimedConfig{Root: tc.root, DataRoot: tc.dataRoot})
+			if err != nil {
+				t.Fatalf("dataRootOf(%+v): %v", tc, err)
+			}
+			if got != tc.root {
+				t.Errorf("dataRootOf(%+v) = %q, want the runtime's %q", tc, got, tc.root)
+			}
+			if dataRootProfile(t, tc.root, got) != dataRootProfile(t, tc.root, "") {
+				t.Errorf("the spelling %q changed the profile of a node on root %q", tc.dataRoot, tc.root)
+			}
+		}
+	})
+	t.Run("the default root is the runtime's own when Root is empty", func(t *testing.T) {
+		got, err := dataRootOf(RuntimedConfig{DataRoot: install.DefaultDataRoot})
+		if err != nil {
+			t.Fatalf("dataRootOf: %v", err)
+		}
+		if got != runtimeRoot("") {
+			t.Errorf("dataRootOf = %q, want %q", got, runtimeRoot(""))
+		}
+	})
+	t.Run("unset stays unset", func(t *testing.T) {
+		if got, err := dataRootOf(RuntimedConfig{Root: "/opt/k3sm-pods"}); err != nil || got != "" {
+			t.Errorf("dataRootOf = %q, %v; want empty", got, err)
+		}
+	})
+}
+
 func TestDataRootOfMakesARelativeValueAbsolute(t *testing.T) {
 	t.Parallel()
 	got, err := dataRootOf(RuntimedConfig{DataRoot: "relative-data-root"})
