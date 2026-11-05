@@ -138,6 +138,9 @@ pin, its date, and the tarball's sha256.
   moves on past the limit. It follows no symlink, and it reports a volume mounted inside the tree
   and leaves it alone. A file with a system flag, or a hard-linked file with a locking flag, is still
   refused and named, and uninstall fails until it is dealt with.
+- A sharded `MLXModel` answers HTTP 404 to a request naming any model but `spec.model`; before, the
+  name in a request body made every rank download that repository and drop the model it was
+  serving. The fix is in the `mlx-serve` sharded entrypoint, so it ships with the next image tag.
 - A single-node `MLXModel` refuses every image URL that is not a `data:` URL with HTTP 400, before a
   name is resolved; before, vllm-mlx fetched `http(s)` image URLs from the pod, and a name that
   resolved differently the second time could reach an internal address. Send images inline as

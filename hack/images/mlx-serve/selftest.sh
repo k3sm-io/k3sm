@@ -240,6 +240,7 @@ def check(name, cond):
 
 server = importlib.import_module(ks.ENGINE_MODULE)
 stock_handler = server.APIHandler
+stock_provider = server.ModelProvider
 try:
     ks.install_image_guard(server)
     check("imgguard  mlx_lm.server._inline_image_urls is the 0.32.2 body the guard replaces, and is replaced", server._inline_image_urls is ks.refuse_remote_images)
@@ -273,6 +274,45 @@ check("models.real  the real listing names the --model path (what the alias repl
       [d["id"] for d in real[2]["data"]] == [resolved])
 check("models.same  the aliased listing is the real one with the id renamed: status, headers and body",
       aliased[:2] == real[:2] and aliased[2] == {"object": real[2]["object"], "data": renamed})
+
+# A request body's model field reaches ModelProvider.load as model_path. On the
+# real provider, as a rank has it (distributed), with the Hub download recorded
+# and refused, so nothing leaves this Mac. The stock leg shows the fetch is real.
+import mlx_lm.utils
+fetched = []
+def snapshot_download(*a, **kw):
+    fetched.append(a[0] if a else kw.get("repo_id"))
+    raise RuntimeError("selftest: no network")
+mlx_lm.utils.snapshot_download = snapshot_download
+def provider(cls):
+    p = cls(types.SimpleNamespace(model=model_dir, adapter_path=None, draft_model=None, trust_remote_code=False,
+                                  chat_template="", pipeline=True, use_default_chat_template=False))
+    p.is_distributed = True
+    return p
+def attempt(p, *load_args):
+    fetched.clear()
+    try:
+        p.load(*load_args)
+    except Exception as e:
+        return e
+    return None
+attempt(provider(stock_provider), "attacker/repo", None, "default_model")
+check("modelfield.stock  the stock provider fetches the repository a request body names (what the alias closes)",
+      fetched == ["attacker/repo"])
+p = provider(P)
+for name in ("attacker/repo", "/etc", "other"):
+    err = attempt(p, name, None, "default_model")
+    check("modelfield.refused  a request body's model %r fetches nothing and is refused" % name,
+          isinstance(err, ks.ModelRefused) and fetched == [])
+err = attempt(p, "org/m", None, "attacker/draft")
+check("modelfield.draft  a draft_model on a rank fetches nothing (the engine refuses it when distributed)",
+      isinstance(err, ValueError) and fetched == [])
+loaded = []
+p._load = lambda *key: loaded.append(key)
+attempt(p, "org/m", None, "default_model")
+attempt(p, "default_model", None, "default_model")
+check("modelfield.served  the served name and no name load the --model, with no fetch",
+      loaded == [(model_dir, None, None)] * 2 and fetched == [])
 PY
 		mkdir -p "$WORK/alias-hf" "$WORK/alias-models"
 		alias_out="$(cd "$WORK" && HF_HUB_CACHE="$WORK/alias-hf" HF_HUB_OFFLINE=1 PYTHONDONTWRITEBYTECODE=1 "$STAGED/bin/python3.12" -I -B "$WORK/alias-real.py" "$HERE" "$WORK/alias-models" 2>"$WORK/alias-real.err")"
@@ -285,10 +325,10 @@ PY
 				*)  ladder no "9a.driver  $verdict $name" ;;
 			esac
 		done <<< "$alias_out"
-		if [ "$ALIAS_CHECKS" -ge 9 ]; then
+		if [ "$ALIAS_CHECKS" -ge 15 ]; then
 			ladder ok "9a.count  all $ALIAS_CHECKS engine-source and alias checks reported"
 		else
-			ladder no "9a.count  only $ALIAS_CHECKS of 9 engine-source and alias checks reported (a driver crashed?)"
+			ladder no "9a.count  only $ALIAS_CHECKS of 15 engine-source and alias checks reported (a driver crashed?)"
 			tail -20 "$WORK/engine-real.err" "$WORK/alias-real.err"
 		fi
 	elif [ "$STAGED_REQUIRED" = 1 ]; then
@@ -567,10 +607,10 @@ PY
 			*)  ladder no "serve.image.remote.driver  $verdict $name" ;;
 		esac
 	done <<< "$out"
-	if [ "$checks" -ge 16 ]; then
+	if [ "$checks" -ge 17 ]; then
 		ladder ok "serve.image.remote.count  all $checks fixture checks reported"
 	else
-		ladder no "serve.image.remote.count  only $checks of 16 fixture checks reported (the driver crashed?)"
+		ladder no "serve.image.remote.count  only $checks of 17 fixture checks reported (the driver crashed?)"
 		tail -5 "$WORK/serve-image.err"
 	fi
 
@@ -1356,9 +1396,18 @@ eng = fake_engine()
 P, Hd, _ = ks.install_alias(eng, "org/m")
 prov = eng.ModelProvider(types.SimpleNamespace(prompt_cache_size=3))
 prov.load("org/m", None, "default_model")
-prov.load("other/x", None, "default_model")
-check("alias.load  a request naming the served name loads default_model (the loaded snapshot), others pass through",
-      eng.rec["loads"] == [("default_model", None, "default_model"), ("other/x", None, "default_model")])
+prov.load("default_model", None, "default_model")
+check("alias.load  a request naming the served name, or none, loads default_model (the loaded snapshot)",
+      eng.rec["loads"] == [("default_model", None, "default_model")] * 2)
+eng.rec["loads"].clear()
+def load_refused(name):
+    try:
+        prov.load(name, None, "default_model")
+    except ks.ModelRefused as e:
+        return name in str(e) and "org/m" in str(e)
+    return False
+check("alias.refused  a request naming anything else is refused before the engine's load runs",
+      all(load_refused(n) for n in ("other/x", "/snap", "../x", "")) and eng.rec["loads"] == [])
 def models(handler_cls, path):
     h = handler_cls(path)
     h.handle_models_request()
@@ -1594,10 +1643,10 @@ while read -r verdict name; do
 	esac
 done <<< "$shard_out"
 # A driver that crashed before its checks would otherwise pass vacuously.
-if [ "$SHARD_CHECKS" -ge 44 ]; then
+if [ "$SHARD_CHECKS" -ge 45 ]; then
 	ladder ok "7.count  all $SHARD_CHECKS entrypoint checks reported"
 else
-	ladder no "7.count  only $SHARD_CHECKS of 44 entrypoint checks reported (the driver crashed?)"
+	ladder no "7.count  only $SHARD_CHECKS of 45 entrypoint checks reported (the driver crashed?)"
 	head -20 "$WORK/shard-driver.err"
 fi
 
