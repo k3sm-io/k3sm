@@ -1930,3 +1930,120 @@ func TestEnsureFileOwnedRefusalsNeverChown(t *testing.T) {
 		}
 	})
 }
+
+// TestEnsureFileOwnedRefusesNonRegular pins the two checks that keep a root
+// fchown off anything but a regular file. A fifo or a directory swapped in
+// between the lstat and the open opens read-only without error, so the fstat is
+// what refuses it: the only guard for a fifo, whose link count is 1, and the one
+// that names a directory correctly. The lstat refuses one already there before
+// any open, which the fstat alone would hide if only the error were asserted.
+func TestEnsureFileOwnedRefusesNonRegular(t *testing.T) {
+	failChown := func(t *testing.T) func(fd, uid, gid int) error {
+		return func(fd, uid, gid int) error {
+			t.Errorf("fchown(%d, %d, %d) was called on a non-regular entry", fd, uid, gid)
+			return nil
+		}
+	}
+
+	swaps := []struct {
+		name  string
+		plant func(t *testing.T, path string)
+		mode  fs.FileMode
+		kind  fs.FileMode
+	}{
+		{
+			name: "a fifo swapped in after the lstat",
+			plant: func(t *testing.T, path string) {
+				if err := syscall.Mkfifo(path, 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(path, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+			mode: 0o644,
+			kind: fs.ModeNamedPipe,
+		},
+		{
+			name:  "a directory swapped in after the lstat",
+			plant: func(t *testing.T, path string) { mkdir(t, path, 0o755) },
+			mode:  0o755,
+			kind:  fs.ModeDir,
+		},
+	}
+	for _, tc := range swaps {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "runtimed.lock")
+			if err := os.WriteFile(path, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			swapped := false
+			ops := fileOps{
+				open: func(p string, m int, perm uint32) (int, error) {
+					// Without O_NONBLOCK a fifo with no writer blocks this open
+					// forever, so its absence fails here and opens nothing.
+					if m&unix.O_NONBLOCK == 0 {
+						t.Errorf("open flags %#x lack O_NONBLOCK", m)
+						return -1, unix.EINVAL
+					}
+					if err := os.Remove(p); err != nil {
+						t.Fatal(err)
+					}
+					tc.plant(t, p)
+					swapped = true
+					return unix.Open(p, m, perm)
+				},
+				fchown: failChown(t),
+			}
+			err := ensureFileOwnedByVia(ops, path, os.Getuid()+1, os.Getgid()+1, 0o600)
+			if !swapped {
+				t.Fatal("the open seam never ran, so nothing was swapped in")
+			}
+			if !errors.Is(err, ErrNotRegularFile) {
+				t.Errorf("ensureFileOwnedByVia = %v, want ErrNotRegularFile", err)
+			}
+			// A directory has a link count above 1 on APFS, so without the type
+			// check it is still refused, as a hard link with a wrong remedy.
+			if errors.Is(err, errHardlinkRefused) {
+				t.Errorf("ensureFileOwnedByVia = %v, want the type refusal, not the link count one", err)
+			}
+			fi, err := os.Lstat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if fi.Mode().Type() != tc.kind {
+				t.Errorf("entry is now %v, want it left as %v", fi.Mode().Type(), tc.kind)
+			}
+			assertMode(t, path, tc.mode)
+		})
+	}
+
+	t.Run("a fifo already there is refused before any open", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "runtimed.lock")
+		if err := syscall.Mkfifo(path, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		ops := fileOps{
+			open: func(p string, m int, perm uint32) (int, error) {
+				t.Errorf("open(%s) was called on an entry the lstat should refuse", p)
+				return -1, unix.EACCES
+			},
+			fchown: failChown(t),
+		}
+		err := ensureFileOwnedByVia(ops, path, os.Getuid()+1, os.Getgid()+1, 0o600)
+		if !errors.Is(err, ErrNotRegularFile) {
+			t.Errorf("ensureFileOwnedByVia = %v, want ErrNotRegularFile", err)
+		}
+		fi, err := os.Lstat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Mode().Type() != fs.ModeNamedPipe {
+			t.Errorf("entry is now %v, want the fifo left in place", fi.Mode().Type())
+		}
+		assertMode(t, path, 0o644)
+	})
+}
