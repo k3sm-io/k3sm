@@ -24,7 +24,7 @@ import (
 )
 
 // nodeVersionMarker separates the Kubernetes version from the k3sm release in
-// a node's kubeletVersion (pkg/version's NodeVersion: v1.34.1+k3sm.0.2.0).
+// a node's kubeletVersion (pkg/version's NodeVersion: v1.37.1+k3sm.0.2.0).
 const nodeVersionMarker = "+k3sm."
 
 // buildMetadata is the k3sm part pkg/version's NodeVersion writes for tag: the

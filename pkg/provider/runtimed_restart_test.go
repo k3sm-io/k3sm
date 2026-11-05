@@ -38,10 +38,13 @@ func (f *fakeRuntimeServer) restartState() (int, restartRecord) {
 	return f.restartCalls, f.lastRestart
 }
 
-// waitRestart polls until cond holds or the deadline expires.
+// waitRestart polls until cond holds or the deadline expires. The fake clock
+// drives every back-off; the wall-clock bound only waits for the provider's
+// goroutines to be scheduled, which on a heavily loaded host can take longer
+// than a few seconds. A healthy run returns as soon as cond holds.
 func waitRestart(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		if cond() {
 			return
@@ -226,7 +229,7 @@ func TestNativeSidecarStaysRunning(t *testing.T) {
 // restart_count surfaced verbatim); all mains exit 0 → Succeeded; a
 // sidecar-bearing Job pod is terminal on its MAINS. The controller-side
 // composition (a live Job's completions/backoffLimit accounting against the
-// real KCM) is the e2e stub TestM10_JobCompletion (e2e/m10_test.go).
+// real KCM) is the e2e stub TestM10_JobCompletion (e2e/m10_job_test.go).
 func TestJobBackoffAndCompletionAccounting(t *testing.T) {
 	newTracked := func(t *testing.T, pod *corev1.Pod) (*runtimedRuntime, *fakeRuntimeServer, *testclock.FakeClock, *podTrack) {
 		t.Helper()

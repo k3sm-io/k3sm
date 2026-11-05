@@ -302,7 +302,13 @@ func Render(m *mlxv1alpha1.MLXModel, opts Options) (*Objects, error) {
 	// spec whose memory cannot fund a serving context has no StatefulSet worth
 	// applying, and the alternative — rendering an unpinned engine — is the
 	// mid-generation SIGKILL DeriveSizing exists to prevent.
-	sizing, err := DeriveSizing(m.Spec.Memory)
+	//
+	// The geometry is unknown here, so the pins use the fallback constant: the
+	// weights are downloaded by the engine inside the pod, into its cache
+	// volume, after this render, and the controller that calls it has no view
+	// of that volume. A geometry read with ReadKVGeometry needs a snapshot
+	// staged where the renderer can read it, which no path does yet.
+	sizing, err := DeriveSizing(m.Spec.Memory, KVGeometry{})
 	if err != nil {
 		return nil, renderErr(m, err)
 	}
@@ -523,14 +529,15 @@ func podResources(memory resource.Quantity) corev1.ResourceRequirements {
 //
 //   - A pin needs a cache volume (ErrRevisionNeedsCache). Without one this render
 //     sets no HF_HOME, so it does not know the path it would have to name.
-//   - A pin does NOT self-populate. The path is loaded, not fetched: on a cache
-//     that has never held this revision the engine finds no such directory and —
-//     by inference from the reference implementation's resolution order, not from
-//     a measurement — falls back to treating the path as a repository id, which
-//     it is not, and fails loudly at start. Pin the revision AND stage the
-//     weights (hack/acceptance/m8.sh does), or leave the revision empty and let
-//     the engine download. Loud is the deliberate half of this: the alternative
-//     shape, silently serving the default branch, is unnoticeable.
+//   - The engine loads the path; it never fetches it. The serving image's
+//     entrypoint (hack/images/mlx-serve/k3sm_serve.py, seed_pinned_revision)
+//     does: it reads the repository and revision back out of this path and
+//     fetches that revision into the cache before the engine starts, so a pin
+//     populates a fresh volume. It refuses at start, naming the revision, when
+//     the fetch fails on a volume that does not hold the snapshot or when the
+//     revision resolves to a different commit (a branch or tag name). The
+//     path's shape is therefore a contract with that entrypoint, not only with
+//     the engine: TestRenderSeedsPinnedRevision runs the rendered argv through it.
 func modelReference(spec mlxv1alpha1.MLXModelSpec) (string, error) {
 	if spec.Revision == "" {
 		return spec.Model, nil
@@ -549,7 +556,8 @@ func modelReference(spec mlxv1alpha1.MLXModelSpec) (string, error) {
 }
 
 // engineArgs builds the serving container's argument vector in three blocks: the
-// model POSITIONAL and the port to listen on; the memory-derived sizing pins and
+// model POSITIONAL, the port to listen on and the served model name (spec.model,
+// whatever the positional resolves to); the memory-derived sizing pins and
 // the required --continuous-batching flag (see sizing.go); then the caller's own
 // arguments LAST so an operator can override any of it without this package
 // growing a flag per knob.
@@ -570,6 +578,7 @@ func engineArgs(spec mlxv1alpha1.MLXModelSpec, modelRef string, port int32, sizi
 	args := []string{
 		modelRef,
 		argPort, strconv.FormatInt(int64(port), 10),
+		argServedModelName, spec.Model,
 	}
 	args = append(args, sizing.Args()...)
 	return append(args, spec.Runtime.Args...)

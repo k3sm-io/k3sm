@@ -12,7 +12,7 @@ concern: `HF_HOME` points at `/models`, which the operator mounts.
 
 | | |
 |---|---|
-| engine | `vllm-mlx==0.5.0` (Apache-2.0), pinned in `requirements.in` |
+| engine | `vllm-mlx==0.5.0` (Apache-2.0), pinned in `requirements.in`; `mlx-lm==0.32.2` in `requirements.lock` |
 | interpreter | CPython 3.12.14, python-build-standalone, macos-aarch64 |
 | entrypoint | `/bin/python3.12 -m k3sm_serve serve --continuous-batching --host 0.0.0.0 --port 8000` (the engine's own CLI, run in-process with the context guard below) |
 | args | the model — a repo id or a path under `/models` — supplied by the pod |
@@ -33,11 +33,12 @@ derived context and which selects a rotating KV cache: a sequence that outgrows
 it loses its first tokens, and the engine answers HTTP 200 with text built on
 the context it has left. `k3sm_serve` closes that gap the way vLLM enforces
 `max_model_len`. It runs `vllm_mlx.cli` in the same process with the same
-arguments, after hooking the server so that, on `/v1/completions` and
-`/v1/chat/completions` (streaming or not), a request is checked before a
-response starts. With the window W taken from the engine's `--max-kv-size` (the
-last one in argv wins, as it does for the cache) and the prompt counted with
-the model's tokenizer after the chat template:
+arguments, after hooking the server so that, on `/v1/completions`,
+`/v1/chat/completions`, `/v1/messages` and `/v1/responses` (streaming or not),
+a request is checked before a response starts. With the window W taken from
+the engine's `--max-kv-size` (the last one in argv wins, as it does for the
+cache) and the prompt counted with the model's tokenizer after the chat
+template:
 
 - a prompt of W tokens or more is refused;
 - a prompt plus a client `max_tokens` over W is refused;
@@ -48,8 +49,44 @@ A refusal is HTTP 400 with vLLM's error object
 "type": "BadRequestError", "param": null, "code": 400}}`). The guard hooks
 engine functions by name and the process exits at start if one has moved, so
 an engine bump fails loudly rather than serving unguarded; selftest rung 9
-checks the hooks against a staged tree. `/v1/responses`, `/v1/messages` and
-multimodal input tokens are not counted.
+checks the hooks against a staged tree. Image and audio tokens a multimodal
+processor adds after the template are not counted.
+
+`k3sm_serve` also patches the prefill mask of mlx-lm's `RotatingKVCache`. The
+cache keeps its first four tokens as attention sinks, but mlx-lm (0.32.0 and 0.32.2) builds
+the multi-token mask as a plain sliding window, so after a chunked prefill
+trims the cache the sinks are masked out and recall inside the window drops
+while decode looks fine. The patched mask keeps the sinks attended and the
+recent band at the window minus the sinks, as proposed upstream in
+[ml-explore/mlx-lm#1978](https://github.com/ml-explore/mlx-lm/pull/1978). In
+this image the cache with sinks is the one the multimodal scheduler builds; the
+text scheduler's caches have none, and their mask is unchanged.
+
+Before the engine starts, `k3sm_serve` clamps `--max-kv-size` to the model's
+KV geometry. k3sm sizes W from a fixed 157286 bytes of KV cache per token
+(`kvBytesPerToken` in `pkg/mlx/sizing.go`, measured on a 3B model), because the
+model's `config.json` is only on disk inside the pod. The real fp16 cost is
+4 x `num_hidden_layers` x `num_key_value_heads` x `head_dim` bytes per token
+(262144 for Qwen2.5-32B, 327680 for Llama-3.3-70B), so `k3sm_serve` reads
+`config.json` (from a local model directory, or only that file from the Hub
+into the cache the weight download then reuses; a nested `text_config` wins)
+and, when the real cost is higher, lowers W to W x 157286 / cost, never below
+1024, logging one line. A config it cannot read leaves W as given. The assumed
+figure is `K3SM_KV_BYTES_PER_TOKEN`, `K3SM_MODEL_CONFIG_DIR` names a directory
+to read `config.json` from instead, and `K3SM_KV_GEOMETRY_CLAMP=off` disables
+the clamp. Selftest rung 8 checks it against fake configs.
+
+A pinned revision reaches the engine as its snapshot path in the cache volume,
+`<HF_HOME>/hub/models--<org>--<name>/snapshots/<revision>`, because the engine
+has no revision option, and the engine only loads that path. So before the
+clamp, `k3sm_serve` reads the repository and revision back out of the path and
+fetches that revision into the same hub cache with
+`huggingface_hub.snapshot_download`, on every start: a complete snapshot moves
+no weights, and a half-written one is finished. A failed fetch serves the
+snapshot if the volume already holds it, and otherwise exits 2 naming the
+revision; a revision the Hub resolves to another commit (a branch or tag name)
+exits 2 too. A model reference that is not such a path is left to the engine.
+`TestRenderSeedsPinnedRevision` in `pkg/mlx` runs the rendered argv through it.
 
 ## Files
 
@@ -70,7 +107,7 @@ A sharded `MLXModel` (one that sets `spec.distributed`) runs one Pod per rank,
 and every rank runs this same image with a different command:
 
 ```
-/bin/python3.12 -m k3sm_shard --model <ref> [spec.runtime.args...]
+/bin/python3.12 -m k3sm_shard --model <ref> --served-model-name <spec.model> [spec.runtime.args...]
 ```
 
 The sharded engine is **`mlx-lm`'s server** (`mlx_lm.server`), which the
@@ -79,22 +116,69 @@ has no multi-node support, so the image's `ENTRYPOINT` stays the single-node
 server and only the operator's sharded render overrides the command. A sharded
 model is one logical replica; rank 0 alone serves HTTP.
 
-`k3sm_shard` does name resolution and `exec`, nothing else. It reads the
+`k3sm_shard` does name resolution, then runs the engine in its own process. It reads the
 environment the operator renders (`MLX_RANK`, `MLX_WORLD_SIZE`,
 `MLX_METAL_FAST_SYNCH`, `K3SM_MLX_BACKEND`, `K3SM_MLX_PARALLELISM`,
-`K3SM_MLX_RANKS`, `K3SM_MLX_PORT`, `K3SM_MLX_SERVE_PORT`, and for `jaccl`
-`K3SM_MLX_IBV_DEVICES_JSON`), resolves every rank's per-pod name under the
-model's headless Service (retrying, bounded), and writes MLX's rendezvous file
-into the pod data volume (`$TMPDIR`, the one writable path under the pod's
-sandbox profile):
+`K3SM_MLX_RANKS`, `K3SM_MLX_PORT`, `K3SM_MLX_SERVE_PORT`, for `jaccl`
+`K3SM_MLX_IBV_DEVICES_JSON`, and on the Thunderbolt path `K3SM_MLX_HOSTS`). On
+the network path it resolves every rank's per-pod name under the model's
+headless Service (retrying, bounded), taking its own address from
+`K3SM_POD_IP` when the runtime set it. On the Thunderbolt path nothing is
+resolved: `K3SM_MLX_HOSTS` already names every rank's interconnect address and
+port in rank order, and the rank refuses to start unless its own entry is
+`K3SM_INTERCONNECT_IP`, the address the runtime attached to it. Either way it
+writes MLX's rendezvous file into the pod data volume (`$TMPDIR`, the one
+writable path under the pod's sandbox profile):
 
 | backend | file | also set |
 |---|---|---|
 | `ring` | `MLX_HOSTFILE`: `[["<podIP>:<port>"], ...]`, one entry per rank | |
 | `jaccl` | `MLX_IBV_DEVICES`: the per-rank RDMA device matrix, `null` for self | `MLX_JACCL_COORDINATOR=<rank 0 podIP>:<port>` |
 
-It then execs `mlx_lm.server --host 0.0.0.0 --port <serve port>`, adding
-`--pipeline` for pipeline parallelism, with its own arguments last.
+It then runs `mlx_lm.server --host 0.0.0.0 --port <serve port>` in the same
+process, adding `--pipeline` for pipeline parallelism, with its own arguments
+last.
+
+`mlx_lm.server` has no `--served-model-name`, so `k3sm_shard` takes that option
+itself and does not pass it on. Without it a pinned model, whose `--model` is
+the snapshot path in the cache volume, would list that path on `/v1/models`,
+and a request naming `spec.model` would make every rank load the model again
+from the Hub cache. With it, `/v1/models` lists `spec.model` alone and a request
+naming `spec.model` is served by the model already loaded. This hooks four
+`mlx_lm.server` internals (`ModelProvider.load`,
+`APIHandler.handle_models_request`, `run` and `_run_http_server`). The rank
+checks each one against the shape mlx-lm 0.32.2 gives it (the same as 0.32.0) and exits, naming the
+hook, if one is missing or has changed. Without `--served-model-name` nothing
+is hooked and the engine runs as stock `mlx_lm.server`. On a staged tree the
+selftest checks the same hooks, checks that the real `run` is the 0.32.0 body (0.32.2's is identical)
+the replacement copies (`ENGINE_RUN_SHA256`; an mlx-lm bump that changes it
+re-derives the copy and the hash), and compares the real `/v1/models` answer
+with the aliased one.
+
+mlx-lm 0.32.2 changed more than these hooks. `ModelProvider._load` now returns
+the model config and sets `self.processor`, `APIHandler._tokenize` returns a
+five-tuple that carries the images of a prompt, and the server accepts image
+parts in chat requests. None of that reaches `k3sm_shard`: its provider
+subclass overrides only `load` and calls `super().load`, whose result is still
+`(model, tokenizer)`, and it never calls or overrides `_load` or `_tokenize`.
+
+**Remote image URLs are refused.** 0.32.2's chat handler calls
+`_inline_image_urls`, which fetches every `http(s)` image URL in a request body
+with `urlopen`, follows redirects, and reads the whole response into memory,
+with no host check and no size limit. Anyone who can reach a rank's port could
+make the pod request an internal address or exhaust its memory. Every rank
+therefore replaces that function, with or without `--served-model-name`, with
+one that refuses any image URL that is not a `data:` URL before a connection is
+made (HTTP 400); inline base64 images still work. Like the other hooks, it is
+fail-closed: the original's signature and normalized body hash
+(`IMAGE_HOOK_SHA256`) are checked first, and the rank exits naming the hook if
+either moved. The selftest drives the guard against a fake engine (a remote URL
+is refused with no request reaching a local listener, a `data:` URL passes, a
+changed body, another signature or a missing function fails the check) and, on
+a staged tree, checks the real function. The single-node entrypoint
+(`k3sm_serve`) runs `vllm_mlx.cli`, which does not import `mlx_lm.server`, so
+this guard does not cover it; whether vllm-mlx or mlx-vlm fetch remote image
+URLs on that path has not been examined here.
 
 `k3sm_shard --probe` is the rank-0 liveness probe: a one-token completion
 against the local server every 60 seconds, to catch a collective that hung
@@ -233,19 +317,19 @@ Push the layout with the registry token from the environment, as your own user:
 
 ```sh
 K3SM_REGISTRY_TOKEN=<ghcr-token> \
-  k3sm image push ~/.cache/k3sm/mlx-serve/oci ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.1
+  k3sm image push ~/.cache/k3sm/mlx-serve/oci ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.3
 ```
 
 The credential is read from the environment or the docker config chain — never
 from argv — and is not stored. `push` prints the digest and the pin:
 
 ```
-pushed ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.1
+pushed ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.3
   digest: sha256:…
   pin:    ghcr.io/k3sm-io/mlx-serve@sha256:…
 ```
 
-The tag is the engine version, with a `-k3sm.N` suffix when k3sm rebuilds the same engine with changes of its own (the context-length guard is `0.5.0-k3sm.1`), so a tag never changes what it names.
+The tag is the engine version, with a `-k3sm.N` suffix when k3sm rebuilds the same engine with changes of its own (the context-length guard is `0.5.0-k3sm.1`; the attention-sink mask fix and the guard on `/v1/messages` and `/v1/responses` are `0.5.0-k3sm.2`; mlx and mlx-metal 0.32.4, staged with uv 0.13.1 on the python-build-standalone 20260929 build of CPython 3.12.14 (was 20260825), and the sharded entrypoint's `--served-model-name` are `0.5.0-k3sm.3`), so a tag never changes what it names.
 
 Record that pin. The operator resolves the image **by digest**; the tag is
 display-only and the next push moves it.
@@ -272,10 +356,15 @@ refusal. It also drives `k3sm_shard` with fake name resolution
 (no model, no GPU): the ring hostfile and the `jaccl` device matrix land in the
 pod data volume, resolution retries and gives up on time, and the liveness
 probe answers correctly. It drives the `k3sm_serve` context guard against
-fakes, and, when a staged tree exists (`K3SM_MLX_STAGE`, default the build's
-work dir), against the real engine's HTTP app. It prints what it does **not** cover; the stage Job on a cluster, the live build,
+fakes, the `--max-kv-size` clamp against fake `config.json` files, and, when a staged tree exists (`K3SM_MLX_STAGE`, default the build's
+work dir), against the real engine's HTTP app, and checks the attention-sink
+mask on the real mlx-lm cache. It prints what it does **not** cover; the stage Job on a cluster, the live build,
 the real payload walk, the push, and a sharded model on two Macs are the lab
 run.
+
+`--staged` makes the staged-tree engine rung fail instead of skip when there is
+no staged tree. `--strict-self-test` checks only that strictness and that the
+rung compares against the real pin, in seconds. Any other argument exits 2.
 
 ## Regenerating the lockfile
 
@@ -293,7 +382,14 @@ uv pip compile --generate-hashes --no-header \
 `--exclude-newer` is the 14-day dependency cooldown: the resolver ignores every
 artifact uploaded after midnight UTC 14 days before the run, so a version
 published inside the cooldown never enters the closure. The current lockfile
-was compiled with `--exclude-newer 2026-10-04T00:00:00Z`.
+was compiled with `--exclude-newer 2026-10-17T00:00:00Z`.
+
+To move only some packages, compile over the existing lockfile (the `-o` file)
+and name them with `--upgrade-package <name>`: uv keeps every other pin it
+finds there. The current lockfile moved only `mlx-lm` that way.
+A full re-resolve moves every package to the newest version before the cutoff
+and can add new ones, so it changes the payload and wants a rebuild and a
+size check.
 
 Keep the comment header at the top of `requirements.lock` (it records the uv
 version, the interpreter the closure was resolved against, and the upload

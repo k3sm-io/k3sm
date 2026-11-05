@@ -25,7 +25,7 @@
 #        IP on 8080, answer HTTP/1.0 200 with the body, one request per accept,
 #        exit after SERVE_MAX_REQUESTS requests or SERVE_LIFETIME seconds), is
 #        shipped to EACH node and built there with clang into
-#        /private/var/tmp/k3sm-b572/ (the lab host's b476 ship-and-build flow: scp, or
+#        /private/var/tmp/k3sm-b572/ (the ship-and-build flow the other lab gates use: scp, or
 #        cp on the Mac the driver runs on, then a build script). No platform
 #        binary serves, so the pod bind shim question does not arise.
 #        The pod's command is `/bin/sh /cfg/serve.sh`, which re-runs the server

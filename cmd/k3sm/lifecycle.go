@@ -47,8 +47,9 @@ import (
 
 // The lifecycle verbs: `k3sm stop`, `k3sm start`, `k3sm restart`. The
 // sequences live in pkg/install (Stop, Start, Restart); this file owns the
-// flags, the exit codes, and the two cluster-facing calls the sequences make
-// through Config: cordoning the Node, and asking netd to remove the mesh.
+// flags, the exit codes, and the three cluster-facing calls the sequences make
+// through Config: cordoning the Node, asking netd to remove the mesh, and
+// counting the workers joined to a server.
 
 // The lifecycle exit codes. A stop that left something behind exits with
 // install.StopExitLeftoverBase plus one bit per class (see stopUsage).

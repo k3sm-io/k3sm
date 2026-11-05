@@ -171,12 +171,12 @@ now_ms() { perl -MTime::HiRes=time -e 'printf "%d\n", time*1000'; }
 # source_pin prints executor.DefaultKineVersion, the pin k3sm ships.
 source_pin() {
 	sed -nE 's/^[[:space:]]*DefaultKineVersion[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' \
-		"$EXEC_PKG/executor.go" | head -1
+		"$EXEC_PKG/executor.go" | sed -n 1p
 }
 
 source_variant() {
 	sed -nE 's/^[[:space:]]*kineBuildVariant[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' \
-		"$EXEC_PKG/setup.go" | head -1
+		"$EXEC_PKG/setup.go" | sed -n 1p
 }
 
 # marker_pin <file> prints the "<version> <variant>" a marker/stamp records, or "".
@@ -270,7 +270,7 @@ assert_pin() {
 	fi
 
 	if [ -n "$port" ]; then
-		kpid="$(lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | head -1 || true)"
+		kpid="$(lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | sed -n 1p || true)"
 		kcomm=""; kargs=""
 		if [ -n "$kpid" ]; then
 			kcomm="$(ps -o comm= -p "$kpid" 2>/dev/null || true)"
@@ -378,9 +378,9 @@ if ! "$K3SM_BIN" payload --kine-only "$WORK/kine-prewarm" >"$WORK/kine-build.log
 fi
 
 # ── pre-flight: the datastore port must be OURS to take ──────────────────────
-KINE_PORT="$(sed -nE 's/^[[:space:]]*DefaultKinePort[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' "$EXEC_PKG/executor.go" | head -1)"
+KINE_PORT="$(sed -nE 's/^[[:space:]]*DefaultKinePort[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' "$EXEC_PKG/executor.go" | sed -n 1p)"
 [ -n "$KINE_PORT" ] || { echo "soak: could not read executor.DefaultKinePort" >&2; exit 1; }
-holder="$(lsof -nP -iTCP:"$KINE_PORT" -sTCP:LISTEN -t 2>/dev/null | head -1 || true)"
+holder="$(lsof -nP -iTCP:"$KINE_PORT" -sTCP:LISTEN -t 2>/dev/null | sed -n 1p || true)"
 if [ -n "$holder" ]; then
 	echo "soak: REFUSING to boot — :$KINE_PORT (the fixed kine port every k3sm server uses) is already held:" >&2
 	ps -o pid=,args= -p "$holder" 2>/dev/null | cut -c1-200 >&2 || true
@@ -390,7 +390,7 @@ if [ -n "$holder" ]; then
 fi
 # The kubelet API port is not load-bearing for a datastore verdict, so a foreign
 # holder is reported rather than fatal.
-kholder="$(lsof -nP -iTCP:10250 -sTCP:LISTEN -t 2>/dev/null | head -1 || true)"
+kholder="$(lsof -nP -iTCP:10250 -sTCP:LISTEN -t 2>/dev/null | sed -n 1p || true)"
 if [ -n "$kholder" ]; then
 	echo "NOTE: :10250 (the kubelet API port) is already held by pid $kholder — this node's logs/exec endpoint will not bind. The soak does not use it."
 fi
@@ -440,7 +440,7 @@ fi
 # of a path this script re-derives — so a future change to the registry layout moves
 # the soak with it instead of silently pointing it at nothing.
 INSTANCE_JSON="$HOME/.k3sm/dev/$K3SM_SOAK_INSTANCE/instance.json"
-WORKDIR="$(sed -nE 's/.*"workDir"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$INSTANCE_JSON" 2>/dev/null | head -1 || true)"
+WORKDIR="$(sed -nE 's/.*"workDir"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$INSTANCE_JSON" 2>/dev/null | sed -n 1p || true)"
 if [ -z "$WORKDIR" ] || [ ! -d "$WORKDIR" ]; then
 	echo "soak: could not read the instance work dir out of $INSTANCE_JSON" >&2
 	exit 1
@@ -455,7 +455,7 @@ echo "==> s1: kine pin witnesses"
 # port fix (#157), so the datastore listens on the manifest port. The fallback keeps
 # the witness working against a build older than that fix, where the manifest port
 # was allocated but never used and the datastore sat on the executor default.
-MANIFEST_KINE_PORT="$(sed -nE 's/.*"kinePort"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$INSTANCE_JSON" | head -1)"
+MANIFEST_KINE_PORT="$(sed -nE 's/.*"kinePort"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$INSTANCE_JSON" | sed -n 1p)"
 PROBE_KINE_PORT="${MANIFEST_KINE_PORT:-$KINE_PORT}"
 echo "    kine port under witness: ${PROBE_KINE_PORT} (manifest: ${MANIFEST_KINE_PORT:-none}; executor default: ${KINE_PORT})"
 if assert_pin "$WORKDIR" "$PROBE_KINE_PORT"; then
@@ -510,7 +510,7 @@ RV_RE='"resourceVersion"[[:space:]]*:[[:space:]]*"[0-9]+"'
 # pipefail` a no-match grep, or a head that closes the pipe early, would otherwise
 # make the enclosing `x="$(...)"` assignment fail the whole script — turning a body
 # this run needs to REPORT into a silent death.
-obj_rv() { grep -oE "$RV_RE" "$RESP" 2>/dev/null | head -1 | tr -dc '0-9' || true; }
+obj_rv() { grep -oE "$RV_RE" "$RESP" 2>/dev/null | sed -n 1p | tr -dc '0-9' || true; }
 
 # list_rv — the LIST's OWN metadata.resourceVersion, i.e. the store revision the read
 # was served at. It is taken from the body PREFIX that precedes "items", so an item's

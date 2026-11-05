@@ -80,13 +80,17 @@ limitations under the License.
 // wildcard bind needs NO privilege at any port (it is the SPECIFIC-address
 // privileged bind that returns EACCES, inverted from Linux). With LAN access
 // off they bind the node's own address and 127.0.0.1. On a node with the root
-// netd helper every bind of a port the operator listed (--lb-privileged-ports,
-// 80 and 443 by default) is requested from it, the wildcard included, so both
-// shapes of the port have one owner; the helper grants it only when a
-// LoadBalancer Service declares the port and the ingress host does not. A
-// refusal leaves the Service unserved on that node until a reconcile is
-// granted. An unlisted port below 1024 binds in-process: on the wildcard it
-// needs no privilege, and on a specific set it is not served.
+// netd helper every bind of a port below 1024 is requested from it, whatever its
+// address and whether or not the port is listed, so every shape of the port has
+// one owner. The operator's list (--lb-privileged-ports, 80 and 443 by default)
+// decides only what the helper grants on the node's own address and 127.0.0.1
+// while LAN access is off: a listed port is served there, and an unlisted one
+// is refused and its Service is unserved on that node until LAN access is back
+// on. The helper grants a port only when a LoadBalancer Service declares it and
+// the ingress host does not, and a refusal leaves the Service unserved on that
+// node until a reconcile is granted. Ports of 1024 and above bind in-process,
+// as does everything on a node with no helper: on the wildcard a port below
+// 1024 needs no privilege, and on a specific set it is not served.
 //
 // The status publishes SERVER-HELD addresses only: each node's mesh address
 // from its MeshPeer record (written only through the server's guarded enroll

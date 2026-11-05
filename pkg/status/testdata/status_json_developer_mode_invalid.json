@@ -1,0 +1,234 @@
+{
+  "schemaVersion": 1,
+  "capabilities": [
+    "watch-json"
+  ],
+  "verdict": "running",
+  "role": "server",
+  "summary": "1/1 nodes ready",
+  "rows": [
+    {
+      "name": "install",
+      "state": "ok",
+      "severity": "ok",
+      "detail": "/Library/k3sm/k3sm · launcher /usr/local/bin/k3sm · 2 LaunchDaemons in /Library/LaunchDaemons",
+      "wide": {
+        "binary": "/Library/k3sm/k3sm",
+        "link": "/usr/local/bin/k3sm",
+        "plists": "/Library/LaunchDaemons",
+        "role": "server"
+      }
+    },
+    {
+      "name": "netd",
+      "state": "running",
+      "severity": "ok",
+      "detail": "pid 1292 · socket /var/lib/k3sm/run/netd.sock",
+      "wide": {
+        "label": "io.k3sm.netd",
+        "last-exit": "(never exited)",
+        "log-path": "/var/log/k3sm/netd.log",
+        "pid": "1292",
+        "plist": "/Library/LaunchDaemons/io.k3sm.netd.plist",
+        "runs": "1"
+      }
+    },
+    {
+      "name": "server",
+      "state": "running",
+      "severity": "ok",
+      "detail": "pid 1292",
+      "wide": {
+        "cp-binaries": "unknown-staged (no kube.version marker; staged before markers existed), pinned v1.37.1",
+        "label": "io.k3sm.server",
+        "last-exit": "(never exited)",
+        "log-path": "/var/log/k3sm/server.log",
+        "pid": "1292",
+        "plist": "/Library/LaunchDaemons/io.k3sm.server.plist",
+        "runs": "1"
+      }
+    },
+    {
+      "name": "apiserver",
+      "state": "ready",
+      "severity": "ok",
+      "detail": "https://127.0.0.1:6444 readyz ok",
+      "wide": {
+        "readyz": "[+]ping ok\nreadyz check passed",
+        "server": "https://127.0.0.1:6444",
+        "tls": "ca pinned"
+      }
+    },
+    {
+      "name": "node",
+      "state": "ready",
+      "severity": "ok",
+      "detail": "1/1 nodes ready · my-mac kubelet v1.36.2",
+      "wide": {
+        "kubelet": "v1.36.2",
+        "node": "my-mac"
+      }
+    },
+    {
+      "name": "heartbeat",
+      "state": "ok",
+      "severity": "ok",
+      "detail": "my-mac: node status posted 20s ago · lease renewed 5s ago",
+      "wide": {
+        "leaseAgeSeconds": "5",
+        "node": "my-mac",
+        "statusAgeSeconds": "20"
+      }
+    },
+    {
+      "name": "workloads",
+      "state": "ok",
+      "severity": "ok",
+      "detail": "3 running"
+    },
+    {
+      "name": "data-root",
+      "state": "ok",
+      "severity": "ok",
+      "detail": "/var/lib/k3sm (apfs device disk3s7, mounted)",
+      "wide": {
+        "declared": "false",
+        "mounted": "true",
+        "owner": "0"
+      }
+    },
+    {
+      "name": "datastore",
+      "state": "skip",
+      "severity": "skip",
+      "detail": "no state.db yet",
+      "wide": {
+        "path": "/nonexistent/k3sm-status-contract/server/db/state.db"
+      }
+    },
+    {
+      "name": "update",
+      "state": "unknown",
+      "severity": "unknown",
+      "detail": "no update check is recorded yet (the server checks once an hour)",
+      "remedy": "sudo k3sm update check",
+      "wide": {
+        "record": "/nonexistent/k3sm-status-contract/status/update.json"
+      },
+      "alert": {
+        "cause": "No update check is recorded yet, so whether a newer release exists is unknown.",
+        "evidence": [
+          "no update check is recorded yet (the server checks once an hour)",
+          "record: /nonexistent/\u003credacted\u003e"
+        ],
+        "fix": [
+          {
+            "step": "Check for a new release now",
+            "command": "sudo k3sm update check",
+            "needsAdmin": true,
+            "confirm": false
+          }
+        ],
+        "docs": "upgrade.md#checking-for-an-update"
+      }
+    },
+    {
+      "name": "kubeconfig",
+      "state": "ok",
+      "severity": "ok",
+      "detail": "~/.kube/config context \"k3sm\""
+    },
+    {
+      "name": "runtimed",
+      "state": "needs-admin",
+      "severity": "skip",
+      "detail": "needs sudo: the runtime daemon's socket is owner-only",
+      "remedy": "sudo k3sm status",
+      "alert": {
+        "cause": "The runtime daemon's socket is owner-only, so only an administrator can ask it whether it is healthy; nothing is known to be wrong.",
+        "evidence": [
+          "needs sudo: the runtime daemon's socket is owner-only"
+        ],
+        "fix": [
+          {
+            "step": "Run the report as an administrator, which can read what this account cannot",
+            "command": "sudo k3sm status",
+            "needsAdmin": true,
+            "confirm": false
+          }
+        ],
+        "docs": "troubleshooting.md#checks-that-need-sudo"
+      }
+    },
+    {
+      "name": "dns",
+      "state": "ok",
+      "severity": "ok",
+      "detail": "10.43.0.10 answered 10.43.0.1 over UDP for kubernetes.default.svc.cluster.local",
+      "wide": {
+        "answer": "10.43.0.1",
+        "name": "kubernetes.default.svc.cluster.local",
+        "vip": "10.43.0.10"
+      }
+    },
+    {
+      "name": "developer-mode",
+      "state": "invalid",
+      "severity": "warn",
+      "detail": "A developer-mode marker exists but is not a root-owned file, so it is ignored and the signature checks stay on",
+      "remedy": "sudo rm /Library/k3sm.developer-mode",
+      "wide": {
+        "signing": "team ABCDE12345"
+      },
+      "alert": {
+        "cause": "Something is at the developer-mode marker path that is not a root-owned file nobody else can write; it is ignored and the signature checks stay on.",
+        "evidence": [
+          "A developer-mode marker exists but is not a root-owned file, so it is ignored and the signature checks stay on"
+        ],
+        "fix": [
+          {
+            "step": "Remove it",
+            "command": "sudo rm /Library/k3sm.developer-mode",
+            "needsAdmin": true,
+            "confirm": true
+          }
+        ],
+        "docs": "install.md#developer-mode"
+      }
+    }
+  ],
+  "next": [
+    "k3sm kubectl get pods -A"
+  ],
+  "workers": [],
+  "version": {
+    "version": "v0.1.7",
+    "commit": "0123456789abcdef0123456789abcdef01234567",
+    "dirty": false,
+    "date": "2026-10-01T00:00:00Z",
+    "goVersion": "go1.26.1",
+    "platform": "darwin/arm64",
+    "kubeVersion": "v1.36.2",
+    "kineVersion": "v1.14.2",
+    "modules": [
+      {
+        "path": "k3sm.io/apis",
+        "sha": "v0.1.7"
+      },
+      {
+        "path": "k3sm.io/darwin-net",
+        "sha": "v0.1.7"
+      },
+      {
+        "path": "k3sm.io/runtimed",
+        "sha": "v0.1.7"
+      },
+      {
+        "path": "k3sm.io/k3sm",
+        "sha": "v0.1.7"
+      }
+    ]
+  },
+  "host": "26.1",
+  "timestamp": "2026-09-05T09:30:00Z"
+}

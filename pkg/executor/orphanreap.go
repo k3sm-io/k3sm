@@ -82,9 +82,10 @@ const reapPortWait = 2 * time.Second
 // launchdPPID is the parent pid an orphan is re-parented to on macOS.
 const launchdPPID = 1
 
-// reapTiers is the order the leftovers are stopped in, the same order Stop uses
-// (shutdownOrder): the apiserver drains first, then the controllers, then the
-// registry, and the datastore last so nothing loses it mid-shutdown. helm and
+// reapTiers is the order the leftovers are stopped in: the apiserver drains first,
+// then the controllers, as Stop does (shutdownOrder), then the registry's zot (which
+// an ordinary shutdown stops before the control plane, outside Stop), and the
+// datastore last so nothing loses it mid-shutdown. helm and
 // kubectl are deliberately absent: they are not long-running server children
 // (helm runs inside pods, which the node re-attaches).
 var reapTiers = [][]string{

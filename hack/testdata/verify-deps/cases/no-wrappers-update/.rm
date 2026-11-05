@@ -1,0 +1,4 @@
+hack/deps.wrappers
+pkg/child/go.sum.txt
+hack/deps-child.lock
+pkg/child/go.mod.txt

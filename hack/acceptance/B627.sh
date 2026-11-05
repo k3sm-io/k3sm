@@ -36,7 +36,7 @@
 #
 # Run it from the WORKER Mac (so probe 5 is the worker-role answer) with the
 # server as the peer. Exit: 0 every probe ran (whatever it answered), 1 a setup
-# or cleanup failure, 2 K3SM_LAB unset (PENDING: not a pass).
+# or cleanup failure, 3 K3SM_LAB unset (LAB-PENDING: not a pass).
 #
 # Environment:
 #   K3SM_LAB=1          required to touch the cluster
@@ -71,8 +71,8 @@ case "${1:-}" in
 esac
 
 if [ "${K3SM_LAB:-}" != 1 ]; then
-	echo "PENDING  needs K3SM_LAB=1 and a running two-Mac cluster (see --help)"
-	exit 2
+	echo "LAB-PENDING  not a pass: needs K3SM_LAB=1 and a running two-Mac cluster (see --help)"
+	exit 3
 fi
 
 # shellcheck source-path=SCRIPTDIR source=../lab/lib/tolerations.sh

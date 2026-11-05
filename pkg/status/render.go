@@ -52,10 +52,12 @@ const (
 // in order. runtimed is deliberately absent: it is the row an ordinary account
 // can almost never answer, and it would spend a line saying so on every healthy
 // cluster. It is still in the JSON, still in the cluster view, and still in the
-// verdict.
+// verdict. developer-mode closes the list on both roles: the report carries it
+// only while something is at the marker path.
 var serverOverviewRows = []string{
 	RowInstall, RowNetd, RowServer, RowServerArgs, RowSettings, RowAPIServer,
 	RowNode, RowWorkloads, RowInterconnect, RowDataRoot, RowPreVolume, RowDatastore, RowKubeconfig,
+	RowDeveloperMode,
 }
 
 // agentOverviewRows are the same screen on a joining worker: the agent row
@@ -64,6 +66,7 @@ var serverOverviewRows = []string{
 var agentOverviewRows = []string{
 	RowInstall, RowNetd, RowAgent, RowSettings, RowAPIServer,
 	RowNode, RowWorkloads, RowInterconnect, RowDataRoot, RowPreVolume, RowDatastore, RowKubeconfig,
+	RowDeveloperMode,
 }
 
 // serverDaemonViewRows are the rows `k3sm status daemons` expands on a control

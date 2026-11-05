@@ -48,6 +48,9 @@
 # underlying PersistentVolume is Retained by the local-path class, so the weights
 # on disk are reclaimed by hand, deliberately.
 #
+# The first start fetches the pinned revision into the cache volume, so it takes
+# a while on a fresh volume; later starts load it from there.
+#
 #   kubectl apply -f examples/mlxmodel.yaml
 #   kubectl get mlxmodel qwen3-06b -w
 #   kubectl wait --for=condition=Ready mlxmodel/qwen3-06b --timeout=15m
@@ -68,7 +71,7 @@ spec:
   replicas: 1
   port: 8000
   runtime:
-    image: ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.1@sha256:4cff6a04732649f67744654d328c099b1620e6f9d6902a5266462d9293057941
+    image: ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.3@sha256:975989ca2872cf4b763c8a4a1fd18afb31cbd9e6a0f88f9fd36e5db7650357e5
   cache:
     # Must comfortably exceed the model's on-disk size (~351 MB here). A volume
     # too small to hold the weights fails the download rather than degrading to

@@ -99,10 +99,10 @@ die() { echo "metrics-server: $*" >&2; exit 2; }
 # refused here, before anything touches the network.
 pins_problems() {
 	local bad=0
-	printf '%s\n' "$MS_VERSION" | grep -Eqx 'v[0-9]+\.[0-9]+\.[0-9]+' || { echo "MS_VERSION '$MS_VERSION' is not an exact vX.Y.Z"; bad=1; }
-	printf '%s\n' "$MS_COMMIT" | grep -Eqx '[0-9a-f]{40}' || { echo "MS_COMMIT '$MS_COMMIT' is not a 40-hex commit"; bad=1; }
-	printf '%s\n' "$MS_H1" | grep -Eqx 'h1:[A-Za-z0-9+/]{43}=' || { echo "MS_H1 '$MS_H1' is not an h1: checksum database hash"; bad=1; }
-	printf '%s\n' "$MS_EPOCH" | grep -Eqx '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z' || { echo "MS_EPOCH '$MS_EPOCH' is not an RFC 3339 UTC time"; bad=1; }
+	grep -Eqx 'v[0-9]+\.[0-9]+\.[0-9]+' <<<"$MS_VERSION" || { echo "MS_VERSION '$MS_VERSION' is not an exact vX.Y.Z"; bad=1; }
+	grep -Eqx '[0-9a-f]{40}' <<<"$MS_COMMIT" || { echo "MS_COMMIT '$MS_COMMIT' is not a 40-hex commit"; bad=1; }
+	grep -Eqx 'h1:[A-Za-z0-9+/]{43}=' <<<"$MS_H1" || { echo "MS_H1 '$MS_H1' is not an h1: checksum database hash"; bad=1; }
+	grep -Eqx '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z' <<<"$MS_EPOCH" || { echo "MS_EPOCH '$MS_EPOCH' is not an RFC 3339 UTC time"; bad=1; }
 	return "$bad"
 }
 
@@ -200,7 +200,7 @@ govulncheck_pinned() {
 	[ -n "$want" ] || die "cannot read GOVULNCHECK_VERSION from hack/ci.sh"
 	for c in "$(command -v govulncheck 2>/dev/null || true)" "$("$GO" env GOPATH)/bin/govulncheck"; do
 		[ -n "$c" ] && [ -x "$c" ] || continue
-		ver="$("$c" -version 2>/dev/null | sed -n 's/^Scanner: govulncheck@//p' | head -1)" || ver=""
+		ver="$("$c" -version 2>/dev/null | sed -n 's/^Scanner: govulncheck@//p' | sed -n 1p)" || ver=""
 		[ "$ver" = "$want" ] && { echo "$c"; return 0; }
 	done
 	die "govulncheck $want is required (go install golang.org/x/vuln/cmd/govulncheck@$want)"
@@ -304,7 +304,7 @@ PY
 # all), the proof that the record names a published, public artifact.
 live() {
 	local ref repo digest host name token code
-	ref="$(sed -n 's/^[[:space:]]*ref:[[:space:]]*\([^[:space:]#]*\).*/\1/p' "$HERE/image.yaml" | head -1)"
+	ref="$(sed -n 's/^[[:space:]]*ref:[[:space:]]*\([^[:space:]#]*\).*/\1/p' "$HERE/image.yaml" | sed -n 1p)"
 	repo="${ref%@*}"; digest="${ref#*@}"
 	host="${repo%%/*}"; name="${repo#*/}"
 	[ "$host" = ghcr.io ] || die "--live resolves ghcr.io refs only (image.yaml names $host)"

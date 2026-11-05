@@ -149,15 +149,45 @@ func underlayMeshEndpoint(local net.IP, meshIP string, port int) (string, error)
 		local, podnet.ClusterPodCIDR, meshIP)
 }
 
+// unadvertisablePrefixes are the RFC 6890 special-purpose blocks a Mac can hold an
+// address in that no peer can dial: the address is translated, shared, reserved or
+// local to one network path, so publishing it points every peer at nothing.
+//
+//   - 0.0.0.0/8 and 240.0.0.0/4 are "this network" and reserved space.
+//   - 100.64.0.0/10 is carrier-grade NAT: a phone hotspot or a CGNAT ISP hands it
+//     out, and it is reachable only from inside that carrier's network.
+//   - 192.0.0.0/24 holds the IETF protocol assignments, among them the CLAT address
+//     (192.0.0.2) a Mac takes on an IPv6-only network with 464XLAT.
+//   - 198.18.0.0/15 is benchmarking space, which VPN and proxy clients reuse for
+//     fake addresses on their own interfaces.
+//   - 64:ff9b::/96 and 64:ff9b:1::/48 are NAT64 translations, 2001::/23 holds the
+//     IETF protocol assignments including Teredo, and 100::/64 is discard-only.
+//
+// Link-local, loopback and multicast are refused earlier by IsGlobalUnicast. The
+// private blocks (RFC 1918, ULA) stay advertisable: they are what a LAN peer
+// dials. The documentation blocks are left alone, as no interface is assigned one.
+var unadvertisablePrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("64:ff9b::/96"),
+	netip.MustParsePrefix("64:ff9b:1::/48"),
+	netip.MustParsePrefix("2001::/23"),
+	netip.MustParsePrefix("100::/64"),
+}
+
 // usableUnderlayIP returns ip's textual form if it is a legitimate wireguard
 // endpoint host for a node whose mesh address is meshIP, and "" otherwise.
 //
-// Three rejections, in order of how they were reached: a non-globally-unicast
+// Four rejections, in order of how they were reached: a non-globally-unicast
 // address (loopback, unspecified, link-local, multicast) is not dialable by a
-// peer; this node's own mesh IP is the observed defect; and ANY address inside the
-// cluster mesh CIDR is rejected for the same reason one step more generally — a
+// peer; this node's own mesh IP is the observed defect; ANY address inside the
+// cluster mesh CIDR is rejected for the same reason one step more generally (a
 // second utun, or a stale alias, is inside the tunnel a joining peer cannot yet
-// reach.
+// reach); and a special-purpose address (unadvertisablePrefixes) is reachable from
+// no peer at all.
 func usableUnderlayIP(ip net.IP, meshIP string) string {
 	if ip == nil || !ip.IsGlobalUnicast() {
 		return ""
@@ -168,8 +198,18 @@ func usableUnderlayIP(ip net.IP, meshIP string) string {
 	if meshIP != "" && ip.Equal(net.ParseIP(meshIP)) {
 		return ""
 	}
-	if a, ok := netip.AddrFromSlice(ip); ok && podnet.ClusterPodCIDR.Contains(a.Unmap()) {
+	a, ok := netip.AddrFromSlice(ip)
+	if !ok {
 		return ""
+	}
+	a = a.Unmap()
+	if podnet.ClusterPodCIDR.Contains(a) {
+		return ""
+	}
+	for _, p := range unadvertisablePrefixes {
+		if p.Contains(a) {
+			return ""
+		}
 	}
 	return ip.String()
 }

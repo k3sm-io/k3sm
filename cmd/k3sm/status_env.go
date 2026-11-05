@@ -43,6 +43,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
+	budgetv1alpha1 "k3sm.io/apis/budget/v1alpha1"
 	netv1alpha1 "k3sm.io/apis/net/v1alpha1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/darwin-net/pkg/tcpseg"
@@ -240,6 +241,12 @@ func newStatusCollector() status.Collector {
 		StopMarker:     statusStopMarker,
 		Network:        statusNetwork,
 		NetworkApplied: statusNetworkApplied,
+		Budget:         statusBudgetFor(statusDir),
+		// The developer-mode marker, judged by the installer's own reader
+		// (lstat, no symlink followed, plus the ACL probe; no privilege
+		// needed), and the installed k3sm's signing for the row's wide key.
+		DeveloperMode: statusDeveloperMode,
+		SigningTeamID: install.CodesignTeamID{}.TeamID,
 		// The join target of a worker, through the installer's one reader of
 		// the agent plist's --server (the agent arguments record does not carry
 		// it, and the plist is world-readable, so this works without sudo).
@@ -258,9 +265,11 @@ func newStatusCollector() status.Collector {
 		// credential from one that was merely found.
 		ReviewSelf: statusReviewSelf,
 		// What proves, on a server, that the apiserver the report dials is
-		// this Mac's own: loopback or one of its addresses, at the apiserver
-		// port. A server installed with a non-default --api-port fails it, and
-		// those rows then stay unknown as an ordinary account.
+		// this Mac's own: the endpoints record the server published (its hosts
+		// and apiserver port), or, on a node older than the record, loopback or
+		// one of its addresses at the default apiserver port. Without the record,
+		// a server installed with a non-default --api-port fails it, and those
+		// rows then stay unknown as an ordinary account.
 		ServerAnchor: status.NodeAnchor(statusEndpoints(statusDir), status.ServerAnchor(executor.DefaultAPIServerPort, localAddrs())),
 		Paths:        paths,
 		EUID:         euid,
@@ -277,6 +286,12 @@ func statusAgentJoinServer() (string, error) {
 	return install.AgentJoinServer(install.NewDarwinSystem(), install.Config{})
 }
 
+// statusDeveloperMode reads the developer-mode marker through the installer's
+// own reader.
+func statusDeveloperMode() install.DeveloperModeState {
+	return install.ReadDeveloperModeState(install.NewDarwinSystem(), install.DeveloperModeMarkerPath)
+}
+
 // statusStopMarker reads the stop marker through the installer's own reader.
 func statusStopMarker() (install.StopMarker, bool, error) {
 	return install.ReadStopMarker(install.NewDarwinSystem(), install.DefaultStopMarkerPath)
@@ -286,6 +301,32 @@ func statusStopMarker() (install.StopMarker, bool, error) {
 // reader; the record is world-readable, so this works for any user.
 func statusNetwork() (install.NetworkRecord, bool, error) {
 	return install.ReadNetworkRecord(install.ReadNetworkRecordFile, install.DefaultNetworkRecordPath)
+}
+
+// statusBudgetFor reads the node daemon's budget record from statusDir, where
+// any account may read it. The service user writes that directory, so the
+// path is untrusted: it is opened without following a symlink and without
+// blocking on a FIFO, and only a regular file is read. Anything else is an
+// error, which leaves the report's budget block out. The read stops one byte
+// past the record's size bound, so an oversized file is refused by the
+// parser, never read whole.
+func statusBudgetFor(statusDir string) func() ([]byte, error) {
+	return func() ([]byte, error) {
+		path := status.BudgetPath(statusDir)
+		f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = f.Close() }()
+		fi, err := f.Stat()
+		if err != nil {
+			return nil, err
+		}
+		if !fi.Mode().IsRegular() {
+			return nil, fmt.Errorf("budget record %s is not a regular file (%v)", path, fi.Mode().Type())
+		}
+		return io.ReadAll(io.LimitReader(f, budgetv1alpha1.MaxBudgetAnnotationBytes+1))
+	}
 }
 
 // statusNetworkApplied reads the node daemon's applied report; it is in the

@@ -129,9 +129,8 @@ func (c Collector) imageMigrationRow() (Row, bool) {
 // bytes. Pure.
 func imageMigrationSummaryRowFrom(path string, raw []byte) Row {
 	row := Row{Name: ImageMigrationRow, Wide: map[string]string{"summary": path}}
-	var s ImageMigrationSummary
-	if err := json.Unmarshal(raw, &s); err != nil || s.Schema != ImageMigrationSummarySchema ||
-		(s.State != ImageMigrationComplete && s.State != ImageMigrationPending) {
+	s, err := ParseImageMigrationSummary(raw)
+	if err != nil {
 		row.State, row.Severity = StateUnknown, SeverityUnknown
 		row.Detail = "the image migration summary does not parse: " + path
 		row.Remedy = "sudo k3sm image migrate --report"
@@ -139,6 +138,32 @@ func imageMigrationSummaryRowFrom(path string, raw []byte) Row {
 	}
 	renderImageMigration(&row, s.State == ImageMigrationComplete, s.LastError, s.InRegistry, s.CacheEntries, s.Held)
 	return row
+}
+
+// errImageMigrationSummary is why a published summary is not one this
+// reader knows.
+var errImageMigrationSummary = errors.New("the image migration summary does not parse")
+
+// ParseImageMigrationSummary decodes a published summary's bytes, refusing an
+// unknown schema or state. It is the one reader of the summary: the status
+// row and `k3sm image migrate --report` both use it. Pure.
+func ParseImageMigrationSummary(raw []byte) (ImageMigrationSummary, error) {
+	var s ImageMigrationSummary
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return ImageMigrationSummary{}, fmt.Errorf("%w: %w", errImageMigrationSummary, err)
+	}
+	if s.Schema != ImageMigrationSummarySchema || (s.State != ImageMigrationComplete && s.State != ImageMigrationPending) {
+		return ImageMigrationSummary{}, fmt.Errorf("%w: schema %d, state %q", errImageMigrationSummary, s.Schema, s.State)
+	}
+	return s, nil
+}
+
+// Detail is the summary in the words of the status row: "done: ..." or
+// "pending: ...". Pure.
+func (s ImageMigrationSummary) Detail() string {
+	row := Row{Name: ImageMigrationRow, Wide: map[string]string{}}
+	renderImageMigration(&row, s.State == ImageMigrationComplete, s.LastError, s.InRegistry, s.CacheEntries, s.Held)
+	return row.Detail
 }
 
 // imageMigrationRowFrom renders the row from the journal's bytes and the

@@ -94,13 +94,13 @@ func TestMeshEndpointRefresherRepublishesOnChange(t *testing.T) {
 				attempts  int
 			)
 			r := &meshEndpointRefresher{
-				derive: func(context.Context) (string, error) {
+				derive: func(context.Context) (meshEndpointSighting, error) {
 					v := tc.derived[tick]
 					tick++
 					if v == "" {
-						return "", errDerive
+						return meshEndpointSighting{}, errDerive
 					}
-					return v, nil
+					return meshEndpointSighting{endpoint: v}, nil
 				},
 				publish: func(_ context.Context, endpoint string) error {
 					attempts++
@@ -140,7 +140,7 @@ func TestMeshEndpointRefresherRepublishesOnChange(t *testing.T) {
 		done := make(chan struct{})
 		var published []string
 		r := &meshEndpointRefresher{
-			derive:    func(context.Context) (string, error) { return moved, nil },
+			derive:    func(context.Context) (meshEndpointSighting, error) { return meshEndpointSighting{endpoint: moved}, nil },
 			publish:   func(_ context.Context, e string) error { published = append(published, e); return nil },
 			log:       quietLogger(),
 			tick:      ticks,

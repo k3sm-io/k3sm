@@ -24,6 +24,8 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"google.golang.org/grpc"
@@ -48,7 +50,7 @@ Usage: k3sm image pull <reference> [flags]
        k3sm image import <oci-layout.tar> [flags]
        k3sm image push <oci-layout-dir|reference> <registry-reference> [flags]
        k3sm image prune [flags]
-       k3sm image ls [-o json] [flags]
+       k3sm image ls [-o json|ndjson] [flags]
        k3sm image df [-o json] [flags]
        k3sm image migrate [--report] [-o json]   (copy this node's images into the cluster registry once; sudo on a worker)
 
@@ -104,8 +106,14 @@ push    upload an image to a registry reference, and print the digest it now has
         there so callers can pin it. The first argument is normally the OCI
         layout directory ` + "`k3sm build --format oci`" + ` writes; a first argument
         that is no path on disk is taken as a reference in THIS NODE's store,
-        exported with save and then uploaded. The upload itself does NOT talk to
-        the daemon: it reads a directory you own and uploads as you. The
+        exported with save and then uploaded. A reference this node's store does
+        not hold may name an image the cluster registry holds, as image ls and
+        inspect show it (the one ` + "`k3sm build`" + ` recorded): it is copied from
+        there through the push gate, blobs the destination has are skipped and,
+        within the cluster registry, mounted rather than sent again; a
+        destination naming the same repository and tag copies nothing. The
+        layout upload itself does NOT talk to the daemon: it reads a directory
+        you own and uploads as you. The
         credential comes from $K3SM_REGISTRY_TOKEN (with $K3SM_REGISTRY_USER
         as its user, "token" by default), this node's own
         ingest-registry credential (only when the target IS this node's loopback
@@ -129,6 +137,18 @@ ls      list the images in the cluster's one registry (the server's), each
         no root and no daemon socket, only a kubeconfig that can read Nodes,
         Pods and the local-registry-hosting ConfigMap. An unreachable registry
         is reported (reachable: false, with the error) and still exits 0.
+        -o ndjson streams the listing as it runs, one JSON object per line,
+        each with a "type": first {"type":"start","schemaVersion":1,
+        "registry":{"name","reachable"[,"error"]}}; then
+        {"type":"progress","repositories","repositoriesRead","tags",
+        "tagsRead"} after each repository's tag list (tags is the running
+        total, growing until every list is read) and at most every 250ms
+        while tags are read; {"type":"image",...} per tag as it is read,
+        with the fields of an element of -o json's images, in completion
+        order; and last {"type":"end","images","cachedOnIncomplete",
+        "migration"}. An unreachable registry is a start line saying so,
+        then end, exit 0; a failure after the registry answered is
+        {"type":"error","error"} and a non-zero exit, with no end line.
 df      show the registry's size (its distinct blobs) and each node's image
         cache as its status.images reports it. Same reads as ls.
 
@@ -141,7 +161,8 @@ type imageOptions struct {
 	subcommand string
 	socket     string
 	force      bool
-	timeout    time.Duration
+	// timeout is the overall deadline; zero (a streaming verb's default) is none.
+	timeout time.Duration
 	// archive is the positional path load/import ingests; empty for every other
 	// subcommand, which take no positional argument at all.
 	archive   string
@@ -162,7 +183,7 @@ type imageOptions struct {
 	// cacheOnly marks a pull as a cache warm-up rather than an operator pull:
 	// the daemon records no operator root for it, so prune may reclaim the
 	// image once no pod uses it. No flag sets it; only the warm-up after a
-	// build, load or push into the cluster registry does.
+	// build, load or import into the cluster registry does.
 	cacheOnly bool
 	// digest is untag's --digest pin: the removal is refused unless the entry
 	// still resolves to it.
@@ -187,14 +208,12 @@ type imageOptions struct {
 	workDir string
 }
 
-// Ingest streams a whole archive, so it cannot share the deadline sized for a
-// metadata call: a multi-GB tar over a unix socket routinely outlives two
-// minutes, and a deadline that fires mid-stream throws away every byte already
-// sent. Both are still one flag — an explicit --timeout always wins.
-const (
-	metadataTimeout  = 2 * time.Minute
-	streamingTimeout = 30 * time.Minute
-)
+// metadataTimeout is the overall deadline of a verb that moves no image
+// content. The verbs that do (load, import, push, pull, save) have none unless
+// --timeout sets one: each of their requests is bounded by requestIdleTimeout
+// instead (imagebound.go), because a fixed deadline cuts a slow transfer that is
+// still moving and makes a stalled one wait it out.
+const metadataTimeout = 2 * time.Minute
 
 // runImage is the `k3sm image` entry point.
 func runImage(args []string) error {
@@ -207,7 +226,9 @@ func runImage(args []string) error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), opts.timeout)
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	ctx, cancel := imageContext(sigCtx, opts)
 	defer cancel()
 	// ls and df read the cluster's registry, not this node's daemon, so they
 	// dial no socket and need no root.
@@ -221,6 +242,25 @@ func runImage(args []string) error {
 	return imageCommand(ctx, opts, os.Stdout, dialRuntimed)
 }
 
+// imageContext is the context a parsed verb runs under: parent (cancelled by
+// Ctrl-C) with the --timeout deadline when one applies, and, for a verb that
+// moves image content, the per-request idle bound every registry request and
+// the daemon's export stream honour.
+func imageContext(parent context.Context, o imageOptions) (context.Context, context.CancelFunc) {
+	ctx, cancel := parent, context.CancelFunc(func() {})
+	if o.timeout > 0 {
+		ctx, cancel = context.WithTimeout(parent, o.timeout)
+	}
+	if streamingSubcommands[o.subcommand] {
+		ctx = withRequestIdle(ctx, requestIdleTimeout)
+	}
+	return ctx, cancel
+}
+
+// registryOnlyVerbs are the verbs that read or write only the cluster registry
+// and never dial this node's daemon, so --socket means nothing to them.
+var registryOnlyVerbs = map[string]bool{"ls": true, "df": true, "tag": true, "untag": true, "inspect": true, "save": true}
+
 // parseImageArgs parses argv. ContinueOnError so a bad flag is an error the
 // caller reports, never an os.Exit inside a test binary.
 func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
@@ -233,11 +273,13 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 	}
 	fs.StringVar(&o.socket, "socket", runtimed.DefaultSocketPath, "runtimed control socket to dial")
 	// The control-plane state root, consulted by the verbs that talk to the
-	// cluster registry, and only to find this node's ingest-registry credential. A resolve failure is not reported here:
-	// every other subcommand is a client of runtimed and has no use for a work
-	// dir, so an unresolvable one must not make `k3sm image ls` fail.
+	// cluster registry (push, load, import, tag, untag, inspect, save, prune, and
+	// pull's copy into the cluster registry) to find this node's registry
+	// credential and, for prune, its store. A resolve failure is not reported
+	// here: ls and df find the registry through the cluster API and have no use
+	// for a work dir, so an unresolvable one must not make `k3sm image ls` fail.
 	defaultWorkDir, _ := executor.ResolveWorkDir()
-	fs.StringVar(&o.workDir, "work-dir", defaultWorkDir, "control-plane state root to read this node's registry push credential and store from (push, load, import, tag, untag, inspect, save, prune)")
+	fs.StringVar(&o.workDir, "work-dir", defaultWorkDir, "control-plane state root to read this node's registry push credential and store from (push, pull, load, import, tag, untag, inspect, save, prune)")
 	// DRY RUN IS THE DEFAULT and deleting takes an explicit flag, because the
 	// blast radius is asymmetric: a needless dry run costs a statfs, while an
 	// unintended prune on a node that cannot reach its registry costs every image
@@ -258,7 +300,7 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 	// out.tar` fails before anything is dialled.
 	fs.StringVar(&o.output, "o", "", "save: the file to write the archive to; inspect: json, for the registry's documents instead of the table; prune: json, for one document with both halves; ls, df: json")
 	fs.StringVar(&o.output, "output", "", "alias for -o")
-	fs.DurationVar(&o.timeout, "timeout", metadataTimeout, "overall deadline for the call (load, import, push, pull and save default to 30m — they stream image content)")
+	fs.DurationVar(&o.timeout, "timeout", metadataTimeout, "overall deadline for the call; load, import, push, pull and save have none by default, and abandon a request only when it moves no byte for "+requestIdleTimeout.String())
 	if err := fs.Parse(args); err != nil {
 		return o, err
 	}
@@ -303,7 +345,7 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 		o.archive = positional[0]
 	case "push":
 		if len(positional) < 2 {
-			return o, errors.New("push requires a source (an OCI layout directory, or a reference in this node's store) and the registry reference to push it to")
+			return o, errors.New("push requires a source (an OCI layout directory, or a reference in this node's store or the cluster registry) and the registry reference to push it to")
 		}
 		if len(positional) > 2 {
 			// A third word is most often an operator reaching for a credential
@@ -357,7 +399,7 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 	if o.policy, err = parsePullPolicy(policySpec); err != nil {
 		return o, err
 	}
-	if flagWasSet(fs, "socket") && (o.subcommand == "ls" || o.subcommand == "df") {
+	if flagWasSet(fs, "socket") && registryOnlyVerbs[o.subcommand] {
 		return o, fmt.Errorf("%s does not take --socket (it reads the cluster's registry, not this node's daemon)", o.subcommand)
 	}
 	if o.noMirror && o.subcommand != "pull" {
@@ -371,7 +413,11 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 		if o.output == "" {
 			return o, errors.New("save requires -o <file.tar>: the archive is written to a file you name, never to the terminal")
 		}
-	case "inspect", "prune", "ls", "df":
+	case "ls":
+		if o.output != "" && o.output != "json" && o.output != "ndjson" {
+			return o, fmt.Errorf("-o %q: ls renders a table by default, `json` or `ndjson` (one JSON line per image as it is read) on request", o.output)
+		}
+	case "inspect", "prune", "df":
 		if o.output != "" && o.output != "json" {
 			return o, fmt.Errorf("-o %q: %s renders a table by default and `json` on request", o.output, o.subcommand)
 		}
@@ -380,20 +426,15 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 			return o, fmt.Errorf("%s does not take -o (save writes an archive to it; inspect, prune, ls and df choose a rendering with it)", o.subcommand)
 		}
 	}
-	// The streaming default applies only when the operator did not choose. Visit
-	// reports flags actually set across both Parse calls, so it distinguishes
-	// "--timeout 2m" from "left alone".
-	timeoutSet := false
-	fs.Visit(func(fl *flag.Flag) {
-		if fl.Name == "timeout" {
-			timeoutSet = true
-		}
-	})
-	if !timeoutSet && streamingSubcommands[o.subcommand] {
-		o.timeout = streamingTimeout
-	}
-	if o.timeout <= 0 {
+	// The streaming verbs have no overall deadline unless the operator chose
+	// one. Visit reports flags actually set across both Parse calls, so it
+	// distinguishes "--timeout 2m" from "left alone".
+	timeoutSet := flagWasSet(fs, "timeout")
+	if timeoutSet && o.timeout <= 0 {
 		return o, fmt.Errorf("--timeout must be positive, got %v", o.timeout)
+	}
+	if !timeoutSet && streamingSubcommands[o.subcommand] {
+		o.timeout = 0
 	}
 	return o, nil
 }
@@ -403,9 +444,10 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 const imageSubcommands = "pull, tag, untag, inspect, save, load, import, push, prune, ls, df"
 
 // streamingSubcommands are the verbs that move image content rather than
-// metadata, and so inherit the streaming deadline when the operator did not
-// choose one. A deadline sized for a metadata call fires mid-transfer and
-// throws away every byte already moved.
+// metadata: they carry no overall deadline unless the operator chose one, and
+// each of their requests is bounded by its own idle window instead. A deadline
+// sized for a metadata call fires mid-transfer and throws away every byte
+// already moved.
 var streamingSubcommands = map[string]bool{
 	"load": true, "import": true, "push": true, "pull": true, "save": true,
 }
@@ -561,6 +603,8 @@ func imageRPCError(what, socket string, err error) error {
 		return fmt.Errorf("%s: %w", what, err)
 	}
 	switch st.Code() {
+	case codes.NotFound:
+		return notInNodeStore{fmt.Errorf("%s: %s", what, st.Message())}
 	case codes.Unimplemented:
 		return fmt.Errorf("%s: this runtimed does not serve the image service: %s", what, st.Message())
 	case codes.FailedPrecondition:
@@ -576,6 +620,21 @@ func imageRPCError(what, socket string, err error) error {
 	}
 	return fmt.Errorf("%s: %s", what, st.Message())
 }
+
+// errNotInNodeStore matches a daemon answer that this node's store holds no
+// image under the name asked for (gRPC NOT_FOUND). push reads it as the cue to
+// look in the cluster registry.
+var errNotInNodeStore = errors.New("not in this node's store")
+
+// notInNodeStore carries the daemon's own not-found text and matches
+// errNotInNodeStore, so the message an operator reads is unchanged.
+type notInNodeStore struct{ error }
+
+// Is matches errNotInNodeStore.
+func (notInNodeStore) Is(target error) bool { return target == errNotInNodeStore }
+
+// Unwrap returns the daemon's error.
+func (e notInNodeStore) Unwrap() error { return e.error }
 
 // humanBytes renders a byte count in binary units.
 func humanBytes(n uint64) string {

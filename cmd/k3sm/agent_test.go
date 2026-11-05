@@ -27,7 +27,7 @@ import (
 	"k3sm.io/k3sm/pkg/netserve"
 )
 
-// TestM3_3_WorkerNetserveConfig proves a joined worker constructs its node-local
+// TestWorkerNetserveConfig proves a joined worker constructs its node-local
 // datapath (the Service proxy + per-node cluster DNS) with the right join-derived
 // inputs — the worker-bringup wiring. The gap it closes is that the
 // agent path ran NO netserve, so a worker had no proxy and no DNS; this asserts the
@@ -35,7 +35,7 @@ import (
 // node's assigned mesh-egress /32 (so cross-node dials are not blackholed by
 // wireguard), the routing locality is its assigned pod /24, and the privileged ops
 // route through the netd helper when unprivileged. The live join is the m3.sh lab leg.
-func TestM3_3_WorkerNetserveConfig(t *testing.T) {
+func TestWorkerNetserveConfig(t *testing.T) {
 	t.Parallel()
 
 	opts := agentOptions{

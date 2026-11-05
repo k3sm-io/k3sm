@@ -277,6 +277,12 @@ type meshBringUp struct {
 	// kubeconfig authenticates the MeshPeer watch that keeps the peer set
 	// converging after the initial program.
 	kubeconfig string
+	// handshakeStatus makes the MeshPeer watch write each MeshPeer's
+	// status.lastHandshakeTime from this node's own wireguard view
+	// (mesh.WithHandshakeStatus). Only the control-plane node sets it: its
+	// identity already writes MeshPeers, so no node identity gains authority,
+	// and the one status value per MeshPeer records the server's view.
+	handshakeStatus bool
 	// refresher republishes this node's own endpoint when the address it is
 	// reachable at changes. It is a FIELD rather than something bringUpMesh
 	// builds because the two roles publish through different channels (a worker
@@ -287,25 +293,40 @@ type meshBringUp struct {
 	refresher *meshEndpointRefresher
 }
 
+// helperKeyEUID and helperKeyDir are the seams provisionHelperKey reads: the
+// effective uid that decides whether it may write at all, and the root-only
+// directory it writes into. Tests swap both so neither needs real root.
+var (
+	helperKeyEUID = os.Geteuid
+	helperKeyDir  = install.MeshKeyDir
+)
+
 // provisionHelperKey writes the private key to the root-only path the netd
-// MeshKeyResolver reads — best-effort, and no longer the mechanism anything
-// depends on.
+// MeshKeyResolver reads, best-effort and only when this process is root. It is
+// no longer the mechanism anything depends on.
 //
 // `k3sm install` provisions that copy as root (pkg/install's provisionMeshKey),
 // from the very work-dir key this process just loaded, so on an installed node
-// the file is already there with these exact bytes. This write survives for the
-// one case install does not cover: a node run out of a shell, where the process
-// may itself be privileged enough for it to succeed.
+// the file is already there with these exact bytes. Under the installed posture
+// this process is the _k3sm service user and the directory is root:wheel 0700,
+// so a write could only fail with permission denied; it is skipped, and the one
+// Debug line names the installer as the owner of the copy. As root (a node run
+// out of a shell with privilege) the write still happens, for the case install
+// did not cover, and a failure there is unexpected and logged at WARN.
 //
 // It cannot clobber a good copy with a bad one, because there is no other key it
 // could write: the bytes are this node's persisted identity, which is what
-// install copied. And it deliberately does not READ the existing file first — in
-// the _k3sm posture it cannot (the directory is root-only), so a read would add a
-// permission failure on the path that is already handled by the write failing.
+// install copied. And it deliberately does not READ the existing file first: in
+// the _k3sm posture it cannot (the directory is root-only).
 func (in meshBringUp) provisionHelperKey(logger *slog.Logger) {
-	path := filepath.Join(install.MeshKeyDir, in.keyRef)
+	path := filepath.Join(helperKeyDir, in.keyRef)
+	if helperKeyEUID() != 0 {
+		logger.Debug("not root: skipping the mesh private key write; `k3sm install` provisions the root-only copy",
+			"path", path)
+		return
+	}
 	if err := os.WriteFile(path, []byte(in.privateKeyB64), 0o600); err != nil {
-		logger.Warn("could not write the mesh private key to the root-only path; `k3sm install` provisions it as root, so this matters only on a node installed by other means",
+		logger.Warn("could not write the mesh private key to the root-only path as root",
 			"path", path, "err", err)
 	}
 }
@@ -401,6 +422,9 @@ func enrollSelfAndBringUpMesh(ctx context.Context, e *meshEnroller, passwords bo
 		peers:         res.Peers,
 		listenPort:    serverMeshListenPort,
 		kubeconfig:    kubeconfig,
+		// The server, and only the server, records each peer's last handshake
+		// from its own wireguard view.
+		handshakeStatus: true,
 		// The control-plane node's endpoint goes stale the same way a worker's
 		// does — this Mac's LAN address is no more fixed than any other — and a
 		// worker that joined before the move dials the old one on its next full

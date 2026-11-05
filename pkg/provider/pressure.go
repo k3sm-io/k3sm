@@ -163,10 +163,21 @@ type memoryHold struct {
 // sample's swap use (the swap arm's "rising" test). A snapshot that never passed
 // through the monitor carries the zero value: no hold, no previous swap reading,
 // so the swap arm cannot fire on it.
+//
+// It also carries the node budget's state (budget.go): the budget hold, the
+// sample's wall-clock time, the memory.swap growth window of earlier readings,
+// and the ladder the monitor applied. A snapshot with no ladder stamped is read
+// with the default ladder for its host (ladderOf).
 type pressureHistory struct {
 	hold       memoryHold
 	swapPrev   int64
 	swapPrevOK bool
+
+	budget     budgetHold
+	sampledAt  time.Time
+	swapWindow swapWindow
+	ladder     budgetLadder
+	ladderSet  bool
 }
 
 // memoryVerdict is the full evaluation of one snapshot: whether the node is under
@@ -343,6 +354,9 @@ type pressureMonitor struct {
 	// sample takes one host snapshot. Read on every attempt, never cached, so a
 	// test can swap it after construction.
 	sample func() (hostStats, error)
+	// ladder returns the budget ladder for a snapshot's host. Read on every
+	// sample, so a later policy overlay can replace it.
+	ladder func(hostStats) budgetLadder
 	// after is the cadence seam: it returns a channel that fires once after d. A
 	// fixed ticker cannot express the cadence change, so the period is chosen
 	// again before every wait.
@@ -358,8 +372,12 @@ type pressureMonitor struct {
 	attempts uint64 // sample attempts, successful or not
 	lastOK   time.Time
 	hold     memoryHold // the hold the NEXT snapshot carries
-	fast     bool
-	calm     int
+	// budget and swapWindow are the budget hold and the memory.swap readings
+	// the NEXT snapshot carries.
+	budget     budgetHold
+	swapWindow swapWindow
+	fast       bool
+	calm       int
 	// tick is closed and replaced after every sample attempt: the eviction
 	// manager's wake-up.
 	tick chan struct{}
@@ -377,6 +395,7 @@ func newPressureMonitor(sample func() (hostStats, error), log *slog.Logger) *pre
 	}
 	return &pressureMonitor{
 		sample: sample,
+		ladder: func(s hostStats) budgetLadder { return defaultLadder(s.MemCapacityBytes, s.PIDMax) },
 		after:  time.After,
 		now:    time.Now,
 		log:    log,
@@ -415,6 +434,10 @@ func (m *pressureMonitor) interval() time.Duration {
 func (m *pressureMonitor) sampleOnce() {
 	s, err := m.sample()
 	now := m.now()
+	var ladder budgetLadder
+	if err == nil {
+		ladder = m.ladder(s)
+	}
 
 	m.mu.Lock()
 	m.attempts++
@@ -431,18 +454,26 @@ func (m *pressureMonitor) sampleOnce() {
 			"last_successful_sample_age_seconds", int64(age/time.Second))
 		return
 	}
-	s.history = pressureHistory{hold: m.hold, swapPrev: m.snap.SwapUsedBytes, swapPrevOK: m.seq > 0}
+	s.history = pressureHistory{
+		hold: m.hold, swapPrev: m.snap.SwapUsedBytes, swapPrevOK: m.seq > 0,
+		budget: m.budget, sampledAt: now, swapWindow: m.swapWindow, ladder: ladder, ladderSet: true,
+	}
 	wasPressured := false
 	if m.seq > 0 {
 		wasPressured = evaluateMemory(m.snap).pressured
 	}
 	v := evaluateMemory(s)
+	_, nb := budgetOf(s, ladder)
 	m.hold = v.next
+	m.budget = nb
+	m.swapWindow = m.swapWindow.next(now, s.SwapUsedBytes)
 	m.snap = s
 	m.seq++
 	m.lastOK = now
+	// The fast cadence runs from the half-way marks and from any held budget
+	// rung, so the sampler is at 1 s from warn up.
 	switch {
-	case v.pressured || pressureElevated(s):
+	case v.pressured || pressureElevated(s) || nb.anyHeld:
 		m.fast, m.calm = true, 0
 	case m.fast:
 		m.calm++

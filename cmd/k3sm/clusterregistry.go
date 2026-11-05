@@ -292,7 +292,7 @@ func (c gateEndpoint) options(ctx context.Context) ([]remote.Option, error) {
 		ServerName: registrysvc.FlatServiceName,
 	}
 	auth := authn.FromConfig(authn.AuthConfig{Username: builderTokenUser, Password: c.token.value})
-	return []remote.Option{remote.WithContext(ctx), remote.WithTransport(t), remote.WithAuth(auth)}, nil
+	return []remote.Option{remote.WithContext(ctx), remote.WithTransport(boundRequests(t)), remote.WithAuth(auth)}, nil
 }
 
 // String names the endpoint and redacts the token.

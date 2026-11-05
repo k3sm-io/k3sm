@@ -46,6 +46,7 @@ import (
 	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/executor"
+	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/registrysvc"
 	"k3sm.io/k3sm/pkg/shadow"
 )
@@ -642,6 +643,21 @@ func alertCases() []alertCase {
 			return shadowRow(fakeFS{contents: map[string][]byte{manifest: shadowManifest(t)}}, map[string]string{"/bin/bash": "cc"})(t)
 		})},
 		{"shadow set unreadable", built(shadowRow(fakeFS{unreadable: map[string]bool{manifest: true}}, nil))},
+		// the developer-mode marker
+		{"developer mode on", built(developerModeRowFor(install.DeveloperModeMarkerOn))},
+		{"developer-mode marker invalid", built(developerModeRowFor(install.DeveloperModeInvalid))},
+	}
+}
+
+// developerModeRowFor is the developer-mode row of a marker in state.
+func developerModeRowFor(state install.DeveloperModeState) func(t *testing.T) Row {
+	return func(t *testing.T) Row {
+		t.Helper()
+		r, ok := Collector{DeveloperMode: func() install.DeveloperModeState { return state }}.developerModeRow(context.Background())
+		if !ok {
+			t.Fatalf("no developer-mode row for a marker %s", state)
+		}
+		return r
 	}
 }
 

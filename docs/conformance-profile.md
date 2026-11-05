@@ -46,7 +46,7 @@ User-facing tradeoff guidance (what an operator should do about each ceiling) is
 | **Resource model** (QoS, memory→OOMKill) | `proc_pid_rusage` sampler | **criterion** memory / **ceiling** CPU CFS-millicore limits |
 | **Observability** (`/stats/summary`, `/metrics/resource`, lifecycle Events) | runtimed usage samples; provider EventRecorder | **criterion** (summary, `/metrics/resource` joint CPU and memory emission, Pulled/Created/Started/Killing Events) |
 | **Config & storage** (ConfigMap/Secret, emptyDir/projected, PVC/PV local-path) | apiserver-served + runtimed materialization | **criterion** + **🟡 planned** resize/snapshot/generic ephemeral volumes |
-| **Auth & supply chain** (bootstrap triad, apiserver↔node TLS, code-signing) | k3s-style join token pinned to the cluster CA; release binaries are ad-hoc signed and not notarized | **criterion** |
+| **Auth & supply chain** (bootstrap triad, apiserver↔node TLS, code-signing) | k3s-style join token pinned to the cluster CA; release binaries are Developer ID signed and notarized | **criterion** |
 | **Datastore** (kine→SQLite WAL, KCM scoping) | bundled kine (child process); embedded etcd on an experimental two-server control plane | **criterion** |
 
 ## Hard ceilings (documented, never chased)

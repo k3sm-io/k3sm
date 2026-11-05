@@ -43,13 +43,13 @@ for side in server worker; do
 	ifc="$SRV_IF"
 	[ "$side" = worker ] && ifc="$WRK_IF"
 	remote_sudo "$side" "s3-deletem" SPIKE_HOLD=1 IFC="$ifc" R8="$R8_S3" <<'EOF'
-before="$(ifconfig "$IFC" | awk '/inet6 fe80/{print $2}' | head -1)"
+before="$(ifconfig "$IFC" | awk '/inet6 fe80/{print $2}' | sed -n 1p)"
 recorded "s3.1 $SIDE: fe80 on $IFC while a bridge0 member: ${before:-none}; member: $(is_member "$IFC" && echo yes || echo no)"
 t0="$(ms)"
 spike_deletem "$IFC" || { verdict FAIL "s3.1 $SIDE: $IFC is still a bridge0 member after deletem"; exit 0; }
 addr=""
 for _ in $(seq 1 150); do
-  addr="$(ifconfig "$IFC" | awk '/inet6 fe80/ && !/tentative/{print $2}' | head -1)"
+  addr="$(ifconfig "$IFC" | awk '/inet6 fe80/ && !/tentative/{print $2}' | sed -n 1p)"
   [ -n "$addr" ] && break
   sleep 0.2
 done

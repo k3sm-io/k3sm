@@ -25,13 +25,14 @@ target.
 
 ## Why It Exists
 
-`k3sm image load` puts an image straight into the node's store. That is the fastest way to try
-something, but it steps around every image semantic Kubernetes defines: the node already has the
+Putting an image straight into a node's store is the fastest way to try something, but it steps
+around every image semantic Kubernetes defines: the node already has the
 content, so `imagePullPolicy: Always` pulls nothing, a moved tag is never noticed, and a broken
 reference fails at a different place than it would in a real cluster.
 
 A registry puts those semantics back. The image travels the same way it would from a public
-registry. This one happens to live on your server Mac.
+registry. This one happens to live on your server Mac, and `k3sm build`, `k3sm image load` and
+`k3sm image import` record there for that reason.
 
 ## Finding It
 
@@ -351,8 +352,8 @@ k3sm registry token
 k3sm registry token --duration 20m
 ```
 
-The shortest lifetime is 10 minutes. A lifetime above the cluster's maximum is refused rather than
-shortened. The command makes the same call as:
+The lifetime is at least 10 minutes and at most 24 hours; a lifetime outside that range is refused
+rather than adjusted. The command makes the same call as:
 
 ```sh
 kubectl create token builder -n k3sm-registry --audience k3sm-registry

@@ -19,10 +19,10 @@ limitations under the License.
 // helm is built from helm.sh/helm/v4 at the pin rather than taken from the
 // upstream release tarball, so it is compiled with the toolchain k3sm pins for
 // every source-built child and links the dependency versions k3sm chooses. The
-// wrapper requires helm at the pin, raises golang.org/x/crypto and
-// golang.org/x/net past the releases helm's own go.mod names, and declares
-// helm.sh/helm/v4/cmd/helm as a `tool`, so `go build helm.sh/helm/v4/cmd/helm`
-// inside it builds upstream's own main from that one module graph.
+// wrapper requires helm at the pin, raises golang.org/x/net past the release
+// helm's own go.mod names, and declares helm.sh/helm/v4/cmd/helm as a `tool`,
+// so `go build helm.sh/helm/v4/cmd/helm` inside it builds upstream's own main
+// from that one module graph.
 //
 // The files are embedded as text, not as go.mod/go.sum: a directory holding a
 // go.mod is a nested module that //go:embed cannot reach into. go.sum.txt is the

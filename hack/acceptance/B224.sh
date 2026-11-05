@@ -32,20 +32,6 @@
 #   real datastore; without K3SM_LAB the rungs are announced LAB-PENDING and never
 #   silently pass.
 #
-#   KNOWN BLOCKER, recorded 2026-08-30: this tier cannot reach its assertions yet.
-#   `--mesh-ip` bring-up dies inside the executor's Start — kube-controller-manager is
-#   given --root-ca-file <work-dir>/apiserver-certs/apiserver.crt, but the mesh path
-#   writes the apiserver serving cert under <work-dir>/tls/, leaving that dir empty.
-#   That is a SEPARATE defect, upstream of everything added (the CRD ensure runs
-#   after Start returns), and it is being fixed on its own item. The legs below stay
-#   FAILING until it lands — they are never softened into a skip, because "the mesh
-#   path cannot boot" is exactly the kind of thing a gate must keep saying out loud.
-#   The assertions themselves are NOT speculative: with that cert dir hand-seeded, a
-#   2026-08-30 run of exactly this bring-up logged `ensured the MeshPeer CRD` at
-#   .330 and `bootstrap supervisor listening` at .352 (the ordering, live), reported
-#   the CRD Established=True, and accepted the enroll-shaped MeshPeer below with
-#   every field reading back intact.
-#
 # THE MESH-REGRESSION OBLIGATION (what the apis accessor's doc comment owed). Adopting
 # MeshPeer into the applied set had to be shown not to perturb the mesh/enroll path.
 # Discharged by three legs, and honest about their reach:
@@ -137,8 +123,8 @@ o=ok
 enr_body="$(func_body "$PHASES_GO" '^func enrollServerMesh[(]')"
 sup_body="$(func_body "$PHASES_GO" '^func startJoinSupervisor[(]')"
 drive_body="$(func_body "$SERVER_GO" '^func runServer[(]')"
-printf '%s\n' "$enr_body" | grep -q 'newMeshEnroller(restCfg' || o=no
-printf '%s\n' "$sup_body" | grep -q 'startBootstrapServer(ctx, deps' || o=no
+grep -q 'newMeshEnroller(restCfg' <<<"$enr_body" || o=no
+grep -q 'startBootstrapServer(ctx, deps' <<<"$sup_body" || o=no
 # The only call sites in the command's non-test source (a second site outside the
 # phase helper would escape the ordering this rung pins).
 nontest_go="$(cd "$K3SM_ROOT/cmd/k3sm" && ls -- *.go | grep -v '_test\.go$')"
@@ -148,15 +134,15 @@ sup_sites="$(sites 'startBootstrapServer(ctx, deps')"
 [ "$enr_sites" = "serverphases.go:1" ] || o=no
 [ "$sup_sites" = "serverphases.go:1" ] || o=no
 ladder "$o" "b224.2  newMeshEnroller only in enrollServerMesh ($enr_sites), startBootstrapServer only in startJoinSupervisor ($sup_sites)"
-ens_ln="$(printf '%s\n' "$drive_body" | grep -n 'if err = ensureMeshPeerCRD(ctx, opts\.meshIP,' | head -1 | cut -d: -f1 || true)"
+ens_ln="$(printf '%s\n' "$drive_body" | grep -n 'if err = ensureMeshPeerCRD(ctx, opts\.meshIP,' | sed -n 1p | cut -d: -f1 || true)"
 ret_ok=no
 if [ -n "$ens_ln" ]; then
 	# the ensure's error check closes within three lines and returns the error
-	printf '%s\n' "$drive_body" | sed -n "$ens_ln,$((ens_ln + 4))p" | tr '\n' ' ' |
-		grep -qE '\}, logger\); err != nil \{[[:space:]]+return err' && ret_ok=ok
+	grep -qE '\}, logger\); err != nil \{[[:space:]]+return err' \
+		<<<"$(printf '%s\n' "$drive_body" | sed -n "$ens_ln,$((ens_ln + 4))p" | tr '\n' ' ')" && ret_ok=ok
 fi
-enr_ln="$(printf '%s\n' "$drive_body" | grep -n 'enrollServerMesh(ctx, plan' | head -1 | cut -d: -f1 || true)"
-sup_ln="$(printf '%s\n' "$drive_body" | grep -n 'startJoinSupervisor(ctx, plan' | head -1 | cut -d: -f1 || true)"
+enr_ln="$(printf '%s\n' "$drive_body" | grep -n 'enrollServerMesh(ctx, plan' | sed -n 1p | cut -d: -f1 || true)"
+sup_ln="$(printf '%s\n' "$drive_body" | grep -n 'startJoinSupervisor(ctx, plan' | sed -n 1p | cut -d: -f1 || true)"
 if [ "$ret_ok" = ok ] && [ -n "$enr_ln" ] && [ -n "$sup_ln" ] && [ "$ens_ln" -lt "$enr_ln" ] && [ "$enr_ln" -lt "$sup_ln" ]; then
 	ladder ok "b224.2  runServer: ensureMeshPeerCRD(+$ens_ln, returns on error) precedes enrollServerMesh(+$enr_ln) precedes startJoinSupervisor(+$sup_ln)"
 else
@@ -181,11 +167,11 @@ run_test() {
 		ladder no "$id  $name ($pkg) passed"
 		return
 	fi
-	if printf '%s\n' "$out" | grep -qE 'no tests to run|no test files'; then
+	if grep -qE 'no tests to run|no test files' <<<"$out"; then
 		ladder no "$id  $name ($pkg) actually RAN — go test reported no tests to run (renamed test?)"
 		return
 	fi
-	if ! printf '%s\n' "$out" | grep -qE "^[[:space:]]*--- PASS: ${name}( |\$)"; then
+	if ! grep -qE "^[[:space:]]*--- PASS: ${name}( |\$)" <<<"$out"; then
 		ladder no "$id  $name ($pkg) actually RAN — no top-level --- PASS line"
 		return
 	fi

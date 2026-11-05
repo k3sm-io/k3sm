@@ -60,8 +60,10 @@ import (
 //     cadence would turn that into a stream, so it is edge-triggered here.
 //
 // What it does not do: soft thresholds, minimum-reclaim, disk or PID eviction,
-// refusing BestEffort pods at admission, node-allocatable enforcement, and a
-// --eviction-hard override. Thresholds are compiled constants (pressure.go).
+// node-allocatable enforcement, and a --eviction-hard override. Thresholds are
+// compiled constants (pressure.go). Refusing BestEffort pods at admission under
+// MemoryPressure is admission.go, over the same monitor, started with the
+// manager.
 
 // Event reasons the manager emits. Evicted and EvictionThresholdMet are the
 // kubelet's; EvictionCascadeHalted is k3sm's own (the cascade cap has no
@@ -133,6 +135,13 @@ type evictionTarget interface {
 	// evictPod terminates pod as a hard eviction and records it as evicted. It
 	// returns once the runtime teardown has returned.
 	evictPod(ctx context.Context, pod *corev1.Pod, n evictionNotice) error
+}
+
+// admissionSourceSetter is the runtime surface admission is wired through: the
+// runtime admits new pods against the pressure source it is given. Defined
+// here, at the consumer; the runtimed provider implements it.
+type admissionSourceSetter interface {
+	setAdmissionSource(src admissionPressure)
 }
 
 // EvictionConfig is the input to RunEvictionManager.
@@ -541,13 +550,19 @@ func evictionMessage(victim evictionCandidate, v memoryVerdict) string {
 
 // RunEvictionManager runs the node-pressure eviction manager over the backing
 // runtime until ctx ends. A runtime that cannot evict (the hostprocess opt-out)
-// returns at once: there is nothing for the manager to act through.
+// returns at once: there is nothing for the manager to act through. It also
+// starts node-side admission (admission.go) over the same pressure monitor.
 //
 // Start it after the node is Ready, so the provider's pod set is the cluster's.
 func (v *VKProvider) RunEvictionManager(ctx context.Context, cfg EvictionConfig) {
 	target, ok := v.rt.(evictionTarget)
 	if !ok || cfg.Status == nil {
 		return
+	}
+	// Admission starts with the manager, as the kubelet's eviction manager
+	// starts admitting against node conditions once it observes them.
+	if a, ok := v.rt.(admissionSourceSetter); ok {
+		a.setAdmissionSource(cfg.Status.monitor)
 	}
 	newEvictionManager(cfg.Status.monitor, target, cfg.Recorder, cfg.NodeName, cfg.Log).run(ctx)
 }

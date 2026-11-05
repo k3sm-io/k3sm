@@ -110,7 +110,7 @@ fi
 : > "$PAIRS_FILE"
 while IFS= read -r name; do
 	[ -n "$name" ] || continue
-	file="$(grep -rlE "^func ${name}\(" --include='*_test.go' "${SEARCH_DIRS[@]}" 2>/dev/null | head -1 || true)"
+	file="$(grep -rlE "^func ${name}\(" --include='*_test.go' "${SEARCH_DIRS[@]}" 2>/dev/null | sed -n 1p || true)"
 	if [ -z "$file" ]; then
 		b2=no
 		echo "  cited test not found in source: $name"
@@ -146,7 +146,7 @@ while IFS= read -r pkgrel; do
 		printf '%s\n' "$out" | tail -40
 		continue
 	}
-	if printf '%s\n' "$out" | grep -qE 'no tests to run|no test files'; then
+	if grep -qE 'no tests to run|no test files' <<<"$out"; then
 		b3=no
 		echo "  $pkgrel matched no tests for filter $filter (renamed test?)"
 		continue

@@ -41,8 +41,8 @@ var readVerbs = map[string]bool{"get": true, "list": true, "watch": true}
 
 // TestRBACNodeDatapathClusterRole proves the node-datapath ClusterRole grants
 // exactly the services / endpointslices / meshpeers READ verbs and is bound to the
-// system:nodes GROUP — the grant that keeps a joined worker's Service proxy + DNS
-// resolver + mesh watcher (system:node:<name>) alive after the Node,RBAC flip — and
+// system:nodes GROUP, the grant that keeps a joined worker's mesh watcher
+// (system:node:<name>) alive after the Node,RBAC flip, and
 // that the provisioner authors only its own k3sm-named objects, never a system:*
 // default the apiserver reconciles.
 func TestRBACNodeDatapathClusterRole(t *testing.T) {

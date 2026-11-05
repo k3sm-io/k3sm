@@ -190,7 +190,7 @@ func TestLoadValidatesPath(t *testing.T) {
 // `node ... ready` at 12:36:06, while `dev up` had already returned at 12:34. Any
 // caller that listed nodes right after `up` saw ZERO, and every pod it created sat
 // `Unschedulable: no nodes available to schedule pods` — which is what killed the
-// m10.3 ingress gate (`items: []`) and TestM3_PVCPersistsAcrossRestart.
+// ingress acceptance gate (`items: []`) and TestM3_PVCPersistsAcrossRestart.
 //
 // Scope note: `Up` itself is not unit-reachable (it fork/execs a real server), so
 // this pins the WAIT's semantics and the seam Up consults — not end-to-end

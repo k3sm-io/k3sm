@@ -102,7 +102,7 @@ func (n *racingNetwork) Teardown(podID string) error {
 	return err
 }
 
-// TestReleaseRefusesARacingReinstall pins the security-critique condition on
+// TestReleaseRefusesARacingReinstall pins the race condition on
 // releasePodNetwork: a status observation that reports the guest's lease while
 // the pod's network is being released (after the override drop, before or after
 // the alias removal) must not leave an override, and so a relay, behind. Each

@@ -28,8 +28,8 @@ import (
 )
 
 // runServer boots a real control plane, so no unit test can call it — and this
-// repo's recurring defect class is a well-tested helper bring-up never calls
-//, or calls in the wrong order. Its wiring is therefore asserted
+// repo's recurring defect class is a well-tested helper bring-up never calls,
+// or calls in the wrong order. Its wiring is therefore asserted
 // structurally, by reading the source.
 //
 // runServer is an orchestrator over provisioning and phase helpers declared

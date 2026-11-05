@@ -71,6 +71,11 @@ func TestMain(m *testing.M) {
 // the install orchestration without any real privilege.
 type fakeSystem struct {
 	calls []string
+	// acls marks the paths HasACL reports as carrying an extended ACL.
+	acls map[string]bool
+	// hasACLErrs[path] is the failure HasACL returns for path: an ACL probe
+	// that could not run.
+	hasACLErrs map[string]error
 	// serverBooted is set once the fake launchd starts the server label; from then
 	// on a read of any work dir's tls/cluster-ca.crt answers with fakeBootClusterCA,
 	// modelling the control plane minting its CA on first boot. noBootCA keeps the
@@ -105,6 +110,8 @@ type fakeSystem struct {
 	// records into it, so running Install twice against ONE fake reproduces a real
 	// reinstall: the second run reads back the plist the first run wrote.
 	files map[string][]byte
+	// hardlinked marks the paths EnsureOwnedFile sees with a link count above 1.
+	hardlinked map[string]bool
 	// pid is the next pid the fake launchd hands out; a bootstrap or a kickstart
 	// advances it, so a restarted job reports a DIFFERENT pid — the discriminator
 	// `k3sm certificate rotate` uses to tell the new control plane from the old one
@@ -263,6 +270,15 @@ type fakeSystem struct {
 	// is the one fault that must leave the live root untouched AND must not be
 	// followed by a reverse swap.
 	swapErr error
+	// removeEntryErrs[path] is the failure RemoveEntry returns for the entry at
+	// path, leaving it in place.
+	removeEntryErrs map[string]error
+	// kubeconfigErr is the failure WriteUserKubeconfig returns.
+	kubeconfigErr error
+	// readModeErrs[path] is the failure ReadRegularFileWithMode returns.
+	readModeErrs map[string]error
+	// chownErrs[path] is the failure Chown returns, leaving the owner as it was.
+	chownErrs map[string]error
 	// space is what InstallSpace answers: free bytes, then needed bytes. Nil —
 	// the zero value — is a volume with room for anything, so only a test about
 	// the preflight has to state a number.
@@ -399,6 +415,16 @@ func (f *fakeSystem) putOwned(path string, uid, gid int, mode fs.FileMode, kind 
 	f.owners[path] = OwnedEntry{Path: path, UID: uid, GID: gid, Mode: mode, Kind: kind}
 }
 
+// HasACL answers from acls, or fails with hasACLErrs; a path with no entry
+// carries none.
+func (f *fakeSystem) HasACL(path string) (bool, error) {
+	f.calls = append(f.calls, "HasACL:"+path)
+	if err, ok := f.hasACLErrs[path]; ok {
+		return false, err
+	}
+	return f.acls[path], nil
+}
+
 // Owner answers from the ownership table. A path with no entry is ABSENT with
 // ReadFile's contract, which is what makes an unconfigured fake describe a Mac
 // that has never joined.
@@ -417,6 +443,9 @@ func (f *fakeSystem) Owner(path string) (OwnedEntry, error) {
 // not do.
 func (f *fakeSystem) ListOwned(dir string) ([]OwnedEntry, error) {
 	f.calls = append(f.calls, "ListOwned:"+dir)
+	if err, ok := f.purge.listErrs[dir]; ok {
+		return nil, fmt.Errorf("open %s: %w", dir, err)
+	}
 	self, ok := f.owners[dir]
 	if !ok {
 		return nil, fmt.Errorf("open %s: %w", dir, fs.ErrNotExist)
@@ -440,6 +469,9 @@ func (f *fakeSystem) ListOwned(dir string) ([]OwnedEntry, error) {
 // states, and the one thing a caller could quietly get wrong.
 func (f *fakeSystem) Chown(path string, uid, gid int) error {
 	f.calls = append(f.calls, fmt.Sprintf("Chown:%s:%d:%d", path, uid, gid))
+	if err, ok := f.chownErrs[path]; ok {
+		return err
+	}
 	e, ok := f.owners[path]
 	if !ok {
 		return fmt.Errorf("lchown %s: %w", path, fs.ErrNotExist)
@@ -698,6 +730,9 @@ func (f *fakeSystem) ReadRegularFile(path string) ([]byte, error) {
 // call, matching one real open(2).
 func (f *fakeSystem) ReadRegularFileWithMode(path string) ([]byte, fs.FileMode, error) {
 	f.calls = append(f.calls, "ReadRegularFileWithMode:"+path)
+	if err, ok := f.readModeErrs[path]; ok {
+		return nil, 0, err
+	}
 	b, err := f.readRegularFileContent(path)
 	if err != nil {
 		return nil, 0, err
@@ -940,6 +975,17 @@ func (f *fakeSystem) SwapInstallRoot(staging, live string) (bool, error) {
 	}
 	f.exchangeTrees(staging, live)
 	return previous, nil
+}
+
+// MoveInstallRootAside moves live to aside in the fake's own model, refusing
+// an aside that exists, as RENAME_EXCL does.
+func (f *fakeSystem) MoveInstallRootAside(live, aside string) error {
+	f.calls = append(f.calls, "MoveInstallRootAside:"+live+"->"+aside)
+	if f.dirExists(aside) {
+		return fmt.Errorf("move %s aside to %s: %w", live, aside, fs.ErrExist)
+	}
+	f.exchangeTrees(live, aside)
+	return nil
 }
 
 // exchangeTrees moves everything under a to b and everything under b to a,
@@ -1319,6 +1365,9 @@ func (f *fakeSystem) putWedgedSocket(path string) {
 
 func (f *fakeSystem) WriteUserKubeconfig(targetUser, name string, contents []byte) (string, error) {
 	f.calls = append(f.calls, "WriteUserKubeconfig:"+targetUser)
+	if f.kubeconfigErr != nil {
+		return "", f.kubeconfigErr
+	}
 	f.kubeUser = targetUser
 	f.kubeContent = string(contents)
 	return "/Users/" + targetUser + "/.kube/config", nil
@@ -1489,6 +1538,23 @@ func (f *fakeSystem) WriteServiceUserFile(path string, contents []byte, uid uint
 	return nil
 }
 
+// EnsureOwnedFile records the path, owner, group and mode, and applies the
+// real seam's rules to the fake ownership table: an absent or regular entry
+// becomes a regular file at exactly those terms, and a symlink or any other
+// non-regular entry, or a regular file marked hardlinked, is refused with
+// ErrNotRegularFile and left as it was.
+func (f *fakeSystem) EnsureOwnedFile(path string, uid, gid int, mode fs.FileMode) error {
+	f.calls = append(f.calls, fmt.Sprintf("EnsureOwnedFile:%s:%d:%d:%#o", path, uid, gid, mode))
+	if e, ok := f.owners[path]; ok && e.Kind != EntryRegular {
+		return fmt.Errorf("%s: %w", path, ErrNotRegularFile)
+	}
+	if f.hardlinked[path] {
+		return fmt.Errorf("%s has more than one link: %w", path, ErrNotRegularFile)
+	}
+	f.putOwned(path, uid, gid, mode, EntryRegular)
+	return nil
+}
+
 // EnsureOwnedDir records the directory, the owner, the group AND the mode the
 // installer asked for — the row of the ownership table it applied — and
 // registers the directory in the ownership table, so a later Owner sees what the
@@ -1508,6 +1574,9 @@ func (f *fakeSystem) EnsureOwnedDir(dir string, uid, gid int, mode fs.FileMode) 
 func (f *fakeSystem) RemoveEntry(dir, name string) error {
 	f.calls = append(f.calls, "RemoveEntry:"+dir+":"+name)
 	p := filepath.Join(dir, name)
+	if err, ok := f.removeEntryErrs[p]; ok {
+		return fmt.Errorf("remove %s in %s: %w", name, dir, err)
+	}
 	// rmdir(2) semantics: a directory that still holds a file is refused.
 	for q := range f.files {
 		if strings.HasPrefix(q, p+"/") {
@@ -1599,6 +1668,12 @@ func (f *fakeSystem) EnsureMeshKeyDir(dir string, mode fs.FileMode) error {
 func (f *fakeSystem) WriteRootOnlyFile(path string, contents []byte, mode fs.FileMode) error {
 	f.calls = append(f.calls, fmt.Sprintf("WriteRootOnlyFile:%s:%#o", path, mode))
 	f.putFile(path, contents)
+	// The temp-and-rename leaves a root-owned regular file at path with mode,
+	// replacing whatever was there; a test that judges the file through Owner
+	// (the developer-mode marker) sees what a Mac would.
+	if f.owners != nil {
+		f.owners[path] = OwnedEntry{Path: path, Kind: EntryRegular, Mode: mode.Perm()}
+	}
 	return nil
 }
 
@@ -1849,6 +1924,7 @@ func TestInstallOrchestration(t *testing.T) {
 		"EnsureOwnedDir:/var/lib/k3sm/sbpl:271:20:0700",
 		"EnsureOwnedDir:/var/lib/k3sm/podreap:271:20:0700",
 		"EnsureOwnedDir:/var/lib/k3sm/vmreap:271:20:0700",
+		"EnsureOwnedFile:/var/lib/k3sm/runtimed.lock:271:20:0600",
 		"EnsureLogDir:/var/log/k3sm",
 		// The purge markers, once both trees exist: `uninstall --purge` refuses
 		// to delete either tree without the marker naming it.
@@ -2224,6 +2300,9 @@ func TestUninstallIdempotent(t *testing.T) {
 		// --service-cidr before the walk removes it (absent here, so the
 		// uninstall configuration's default stands in at the flush below).
 		"ReadFile:/Library/LaunchDaemons/io.k3sm.netd.plist",
+		// The developer-mode marker, last in the manifest so first removed;
+		// RemoveAll unlinks a symlink there and never follows it.
+		"RemoveAll:/Library/k3sm.developer-mode",
 		"RemoveAll:/var/log/containers",
 		"RemoveAll:/var/log/pods",
 		"Bootout:io.k3sm.server",
@@ -2246,6 +2325,7 @@ func TestUninstallIdempotent(t *testing.T) {
 		// daemon that reads it has been booted out.
 		"RemoveAll:/var/lib/k3sm/server/token",
 		"RemoveAll:/var/lib/k3sm/status/update.json",
+		"RemoveAll:/var/lib/k3sm/status/budget.json",
 		"RemoveAll:/var/lib/k3sm/status/endpoints.json",
 		// The launcher link is judged BEFORE the sweep deletes its target: after
 		// the sweep it is a dangling link whose identity can no longer be read.
@@ -2934,6 +3014,8 @@ func TestUninstallManifestCoversInstall(t *testing.T) {
 			// The update record: the server daemon's hourly check, or a
 			// `sudo k3sm update check` on either role, writes it there.
 			created[filepath.Join(StateStatus.Path(dc.DataRoot), UpdateRecordName)] = true
+			// The budget record: the node daemon rewrites it there.
+			created[filepath.Join(StateStatus.Path(dc.DataRoot), BudgetRecordName)] = true
 		}
 		if dc.Role == RoleServer && toSet(recorded(installCalls, "Bootstrap:"))[ServerLabel] {
 			for _, name := range []string{MeshClaimsRecordName, ServicesRecordName, RegistryStateRecordName} {
@@ -2941,6 +3023,11 @@ func TestUninstallManifestCoversInstall(t *testing.T) {
 				created[filepath.Join(StateStatus.Path(dc.DataRoot), name)] = true
 			}
 		}
+		// The developer-mode marker is written only by an install with
+		// --developer-mode on, which this one is not. Uninstall cannot tell
+		// whether an earlier install wrote it, so it removes that one path on
+		// every role; it is admitted by that exact path.
+		created[DeveloperModeMarkerPath] = true
 		for _, p := range recorded(uninstallCalls, "RemoveAll:") {
 			if !created[p] {
 				t.Errorf("uninstall removed %q, which install never created (over-broad removal)", p)

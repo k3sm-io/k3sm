@@ -161,8 +161,8 @@ func TestImageVerbArgGrammar(t *testing.T) {
 				if o.platform != nil {
 					t.Errorf("platform = %v, want nil (unset must stay unset on the wire)", o.platform)
 				}
-				if o.timeout != streamingTimeout {
-					t.Errorf("timeout = %v, want %v", o.timeout, streamingTimeout)
+				if o.timeout != 0 {
+					t.Errorf("timeout = %v, want none (a streaming verb is idle-bounded per request)", o.timeout)
 				}
 			},
 		},
@@ -229,8 +229,8 @@ func TestImageVerbArgGrammar(t *testing.T) {
 				if o.output != "/tmp/app.tar" {
 					t.Errorf("output = %q", o.output)
 				}
-				if o.timeout != streamingTimeout {
-					t.Errorf("timeout = %v, want %v", o.timeout, streamingTimeout)
+				if o.timeout != 0 {
+					t.Errorf("timeout = %v, want none (a streaming verb is idle-bounded per request)", o.timeout)
 				}
 			},
 		},

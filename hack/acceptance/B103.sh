@@ -63,8 +63,7 @@ GOFLAGS_ENV=(env GOARCH=arm64 CGO_ENABLED=1)
 #
 # Asserts the leg actually RAN its subtests. `go test -run <filter>` with a
 # ZERO-MATCH filter EXITS 0 — so a typo'd or renamed test name would read as PASS
-# forever (and hack/go-selftest.sh's stale-gate-name check does not apply to script
-# gates). Each leg therefore fails unless (a) "no tests to run" / "no test files" are
+# forever (a stale name in a script gate is not caught by any name check). Each leg therefore fails unless (a) "no tests to run" / "no test files" are
 # ABSENT from the -v output and (b) the count of `--- PASS: <TestName>/` subtest lines
 # meets the pinned per-leg minimum.
 run_test() {
@@ -75,7 +74,7 @@ run_test() {
 		ladder no "$id  $name ($pkg) passed"
 		return
 	fi
-	if printf '%s\n' "$out" | grep -qE 'no tests to run|no test files'; then
+	if grep -qE 'no tests to run|no test files' <<<"$out"; then
 		ladder no "$id  $name ($pkg) actually RAN — go test reported no tests to run (renamed/typo'd test name?)"
 		return
 	fi
@@ -96,12 +95,8 @@ else
 fi
 
 # ---- b103.0b — pure-Go stub parity ------------------------------------------
-# SCOPED to those same two packages ON PURPOSE: `CGO_ENABLED=0 go build ./...` is
-# ALREADY RED at runtimed's main for an UNRELATED pre-existing defect
-# (cmd/k3sm-execshim/main.go:128:57 — a supervisor.LaunchSpec/Credential mismatch), so
-# a whole-module pure-Go leg here would report a failure neither caused nor can
-# fix. Do NOT "fix" this scope by widening it to ./... — widen it only once that
-# defect is repaired.
+# SCOPED to those same two packages: they are the ones the Rosetta probe lives in, and
+# the stub-parity question is about them, not about the whole module.
 if (cd "$RUNTIMED_ROOT" && CGO_ENABLED=0 go build ./pkg/sandbox/ ./pkg/runtime/); then
 	ladder ok "b103.0b runtimed pkg/sandbox + pkg/runtime build CGO_ENABLED=0 (pure-Go stub parity)"
 else
@@ -154,9 +149,9 @@ VZ_HOST_RC=0
 VZ_HOST_LIST="$( (cd "$RUNTIMED_ROOT" && "${GOFLAGS_ENV[@]}" go list -deps ./cmd/k3sm-vmhost) )" || VZ_HOST_RC=$?
 if [ "$VZ_LIST_RC" -ne 0 ] || [ "$VZ_HOST_RC" -ne 0 ]; then
 	ladder no "b103.0c runtimed daemon/vmhost dependency closures enumerable — go list -deps exited $VZ_LIST_RC/$VZ_HOST_RC (see the error above); the vz canary MEASURED NOTHING, so it fails closed"
-elif ! printf '%s\n' "$VZ_LIST" | grep -qx 'k3sm.io/runtimed/pkg/sandbox'; then
+elif ! grep -qx 'k3sm.io/runtimed/pkg/sandbox' <<<"$VZ_LIST"; then
 	ladder no "b103.0c vz canary positive control — the daemon closure must list k3sm.io/runtimed/pkg/sandbox (the probe's own package); an empty/garbage listing must not read as vz-clean"
-elif ! printf '%s\n' "$VZ_HOST_LIST" | grep -q "$VZ_PATTERN"; then
+elif ! grep -q "$VZ_PATTERN" <<<"$VZ_HOST_LIST"; then
 	ladder no "b103.0c vz canary negative control — cmd/k3sm-vmhost's closure must MATCH '$VZ_PATTERN' (it is the binary that links Virtualization); a pattern that matches nothing anywhere cannot prove the daemon clean"
 else
 	VZ_DEPS="$(printf '%s\n' "$VZ_LIST" | grep -c "$VZ_PATTERN" || true)"

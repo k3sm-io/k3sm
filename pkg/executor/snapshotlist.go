@@ -39,8 +39,9 @@ const (
 	SnapshotOther SnapshotKind = "other"
 )
 
-// partialSnapshotSuffix ends every partial or staging name a save writes (<name>.tmp,
-// <name>.plain.tmp, <name>.restoring.tmp). Such a file is never a snapshot.
+// partialSnapshotSuffix ends every partial or staging name a save or restore writes
+// (<name>.tmp and <name>.plain.tmp from a save, state.db.restoring.tmp from a
+// restore). Such a file is never a snapshot.
 const partialSnapshotSuffix = ".tmp"
 
 // manualSnapshotPrefixes start the names `k3sm snapshot save` generates.

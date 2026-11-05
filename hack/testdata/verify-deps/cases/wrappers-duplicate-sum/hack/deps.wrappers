@@ -1,0 +1,3 @@
+# fixture
+child pkg/child/go.sum.txt hack/deps-child.lock
+second pkg/child/go.sum.txt hack/deps-second.lock

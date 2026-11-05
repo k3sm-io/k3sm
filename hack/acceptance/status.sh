@@ -155,9 +155,9 @@ else
 		canary="$(launchctl print system/io.k3sm.netd 2>/dev/null || true)"
 		c=ok
 		for key in state pid runs; do
-			printf '%s\n' "$canary" | grep -Eq "^[[:space:]]*${key} = " || c=no
+			grep -Eq "^[[:space:]]*${key} = " <<<"$canary" || c=no
 		done
-		printf '%s\n' "$canary" | grep -Eq '^[[:space:]]*last exit code = ' || c=no
+		grep -Eq '^[[:space:]]*last exit code = ' <<<"$canary" || c=no
 		ladder "$c" "s.L1  launchctl print still emits 'state = ', 'pid = ', 'runs = ' and 'last exit code = '"
 
 		# s.L2/s.L3 — the JSON verdict and the exit code it implies, read together so
@@ -315,7 +315,7 @@ else
 			else
 				ladder no "s.D1b [destructive] netd wrote into the unmounted mountpoint: $(ls -A "$DATA_ROOT" | tr '\n' ' ')"
 			fi
-			if sudo tail -50 /var/log/k3sm/netd.log 2>/dev/null | grep -q 'declared in /etc/fstab but not mounted'; then
+			if grep -q 'declared in /etc/fstab but not mounted' <<<"$(sudo tail -50 /var/log/k3sm/netd.log 2>/dev/null)"; then
 				ladder ok "s.D1c [destructive] netd's log carries the refusal naming the mount"
 			else
 				ladder no "s.D1c [destructive] netd's log does not carry the refusal"

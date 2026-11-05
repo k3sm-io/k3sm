@@ -81,7 +81,7 @@ var errRunLoop = errors.New("virtual kubelet run loop failed")
 // only ever happened because the test itself deferred it would read red. The
 // ordering claim (the vm stop must not queue its own bound behind the socket's
 // shutdown grace inside the plist's single ExitTimeOut, which pkg/install derives
-// from these stages — see TestExitTimeOutCoversTheSerialTeardown) follows from
+// from these stages — see TestExitTimeOutCoversTheDaemonTeardown) follows from
 // that: the wait closes the runtime before it returns, and the control socket
 // comes down later, when startNode returns to its defers. That the defers in
 // production are REGISTERED in the order LIFO needs is the one fact this test
@@ -196,4 +196,29 @@ func TestStopEmbeddedRuntimeWithoutARuntimeIsANoop(t *testing.T) {
 	}
 	stop()
 	stop()
+}
+
+// historyStopSpy is a provider exposing the budget history stop seam.
+type historyStopSpy struct {
+	vkadapter.Provider
+	calls int
+}
+
+func (s *historyStopSpy) StopBudgetHistory() bool {
+	s.calls++
+	return true
+}
+
+// TestStopBudgetHistoryRunsOnceAtNodeExit pins the node teardown's budget
+// history join: the closure reaches the provider's seam exactly once however
+// often teardown runs it, and a provider without the seam gets a no-op.
+func TestStopBudgetHistoryRunsOnceAtNodeExit(t *testing.T) {
+	spy := &historyStopSpy{}
+	stop := stopBudgetHistory(spy, slog.New(slog.DiscardHandler))
+	stop()
+	stop()
+	if spy.calls != 1 {
+		t.Fatalf("StopBudgetHistory calls = %d, want 1", spy.calls)
+	}
+	stopBudgetHistory(&closeSpyProvider{}, slog.New(slog.DiscardHandler))()
 }

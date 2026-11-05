@@ -77,7 +77,7 @@ func (c *capturingEnroller) captured() []netv1.MeshEnrollRequest {
 	return append([]netv1.MeshEnrollRequest(nil), c.reqs...)
 }
 
-// TestJoinAdvertisesTheSuppliedWireguardKey is the wire half of defect B.
+// TestJoinAdvertisesTheSuppliedWireguardKey is the wire half of persisting the node's wireguard key.
 //
 // Persisting the key on the node is worth nothing unless the join USES it: Join
 // minted a keypair unconditionally, so every restart enrolled a new public key and

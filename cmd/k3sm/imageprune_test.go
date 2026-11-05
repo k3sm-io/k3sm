@@ -35,9 +35,12 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/opencontainers/go-digest"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 
+	"k3sm.io/k3sm/pkg/ociregistry/ref"
+	"k3sm.io/k3sm/pkg/ociregistry/store"
 	"k3sm.io/k3sm/pkg/registrysvc"
 )
 
@@ -103,7 +106,13 @@ func (s pruneStore) layout(repo string, entries ...indexEntry) {
 	dir := filepath.Join(registrysvc.StateDir(s.workDir), filepath.FromSlash(repo))
 	var ms []map[string]any
 	for _, e := range entries {
-		d := map[string]any{"mediaType": e.mediaType, "digest": e.digest, "size": 100}
+		// The row carries the blob's real size, as the registry writes it: the
+		// store checks every manifest body against its row.
+		fi, err := os.Stat(filepath.Join(dir, "blobs", "sha256", strings.TrimPrefix(e.digest, "sha256:")))
+		if err != nil {
+			s.t.Fatal(err)
+		}
+		d := map[string]any{"mediaType": e.mediaType, "digest": e.digest, "size": fi.Size()}
 		if e.tag != "" {
 			d["annotations"] = map[string]string{"org.opencontainers.image.ref.name": e.tag}
 		}
@@ -164,7 +173,7 @@ type fakeZot struct {
 	authority []string
 }
 
-func (z *fakeZot) delete(_ context.Context, ref name.Digest, auth authn.Authenticator) error {
+func (z *fakeZot) delete(_ context.Context, ref name.Digest, _ string, auth authn.Authenticator) error {
 	cfg, err := auth.Authorization()
 	if err != nil {
 		return err
@@ -264,7 +273,7 @@ func manifestList(doc pruneJSON) []string {
 	return got
 }
 
-// TestImagePruneDryRunReportsRegistryAndCache is B910's gate: `k3sm image
+// TestImagePruneDryRunReportsRegistryAndCache is the gate for the prune plan: `k3sm image
 // prune` plans the deletion of the registry's untagged manifests AND the
 // eviction of this node's cache, deletes nothing without --force, and reports
 // both halves in one -o json document.
@@ -397,7 +406,7 @@ func TestImagePruneReportsARefusedDeletion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	refuse := func(_ context.Context, ref name.Digest, _ authn.Authenticator) error {
+	refuse := func(_ context.Context, ref name.Digest, _ string, _ authn.Authenticator) error {
 		if ref.DigestStr() == f.oldLeaf {
 			return errors.New("MANIFEST_UNKNOWN")
 		}
@@ -447,5 +456,311 @@ func TestImagePruneOutputFlag(t *testing.T) {
 	o, err := parseImageArgs([]string{"prune", "-o", "json"}, io.Discard)
 	if err != nil || o.output != "json" {
 		t.Errorf("prune -o json: %+v, %v", o, err)
+	}
+}
+
+// TestImagePruneRechecksEachPlannedDigestBeforeItsDelete proves a manifest a
+// push tags after the plan was read is not deleted: a delete by digest drops
+// every row with that digest, so deleting it would lose the new tag. The
+// deleter is the hook between plan and DELETE: its first call tags the second
+// planned manifest, as a push landing mid-prune would, and then deletes
+// through the store the way the registry does.
+func TestImagePruneRechecksEachPlannedDigestBeforeItsDelete(t *testing.T) {
+	workDir := t.TempDir()
+	serveFakeZot(t, workDir)
+	st, err := store.OpenWorkDir(workDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := t.Context()
+	repo, err := ref.ParseName("app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Init(ctx, repo); err != nil {
+		t.Fatal(err)
+	}
+	first := []byte(`{"schemaVersion":2,"mediaType":"` + ociManifestType + `","annotations":{"seed":"first"}}`)
+	second := []byte(`{"schemaVersion":2,"mediaType":"` + ociManifestType + `","annotations":{"seed":"second"}}`)
+	for _, b := range [][]byte{first, second} {
+		if _, err := st.PutManifest(ctx, repo, ref.Reference{Digest: digest.FromBytes(b)}, ociManifestType, b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := time.Now().Add(-2 * time.Hour)
+	for _, b := range [][]byte{first, second} {
+		p := filepath.Join(registrysvc.StateDir(workDir), "app", "blobs", "sha256", digest.FromBytes(b).Encoded())
+		if err := os.Chtimes(p, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	firstDigest, secondDigest := digest.FromBytes(first), digest.FromBytes(second)
+
+	var deleted []string
+	del := func(ctx context.Context, rf name.Digest, _ string, _ authn.Authenticator) error {
+		if len(deleted) == 0 {
+			if _, err := st.PutManifest(ctx, repo, ref.Reference{Tag: "v1"}, ociManifestType, second); err != nil {
+				return err
+			}
+		}
+		deleted = append(deleted, rf.DigestStr())
+		return st.DeleteDigest(ctx, repo, digest.Digest(rf.DigestStr()))
+	}
+	sock := serveFakeImages(t, &fakeImagesDaemon{pruneResp: &runtimev1.PruneImagesResponse{}})
+	opts, err := parseImageArgs([]string{"--socket", sock, "--work-dir", workDir, "prune", "--force", "-o", "json"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := imageCommandWith(ctx, opts, &out, dialRuntimed, del); err != nil {
+		t.Fatalf("image prune --force: %v\n%s", err, out.String())
+	}
+
+	if strings.Join(deleted, ",") != firstDigest.String() {
+		t.Errorf("deleted %v; want only %s, the manifest still untagged at its delete", deleted, firstDigest)
+	}
+	d, err := st.Resolve(repo, ref.Reference{Tag: "v1"})
+	if err != nil {
+		t.Fatalf("the tag pushed between plan and delete is lost: %v", err)
+	}
+	if d.Digest != secondDigest {
+		t.Errorf("v1 names %s; want %s", d.Digest, secondDigest)
+	}
+	if got := manifestList(decodePrune(t, out.String())); strings.Join(got, ",") != "app@"+firstDigest.String() {
+		t.Errorf("report manifests = %v; want only app@%s", got, firstDigest)
+	}
+}
+
+// TestImagePruneRecheckAppliesTheKeepClosure proves the re-check before each
+// DELETE re-derives what is kept from the repository's current state, not
+// from the digest alone. The repository holds an untagged index L with its
+// child LC, an untagged index I with its child C, and a stale manifest S, all
+// old, so the plan deletes all five, L first. The first DELETE (of L) first tags I, as a push landing mid-prune
+// would, and deletes a stale manifest S behind the prune's back. I must then
+// be skipped as tagged, C as named by a kept index, and S reported as already
+// gone without a DELETE or a count.
+func TestImagePruneRecheckAppliesTheKeepClosure(t *testing.T) {
+	workDir := t.TempDir()
+	serveFakeZot(t, workDir)
+	st, err := store.OpenWorkDir(workDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := t.Context()
+	repo, err := ref.ParseName("app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Init(ctx, repo); err != nil {
+		t.Fatal(err)
+	}
+	manifest := func(seed string) []byte {
+		return []byte(`{"schemaVersion":2,"mediaType":"` + ociManifestType + `","annotations":{"seed":"` + seed + `"}}`)
+	}
+	index := func(seed string, children ...[]byte) []byte {
+		var ms []map[string]any
+		for _, c := range children {
+			ms = append(ms, map[string]any{"mediaType": ociManifestType, "digest": digest.FromBytes(c).String(), "size": len(c)})
+		}
+		b, _ := json.Marshal(map[string]any{"schemaVersion": 2, "mediaType": ociIndexType, "manifests": ms, "annotations": map[string]string{"seed": seed}})
+		return b
+	}
+	loneChild := manifest("lone-child")
+	lone := index("lone", loneChild)
+	child := manifest("child")
+	ix := index("ix", child)
+	stale := manifest("stale")
+	puts := []struct {
+		body      []byte
+		mediaType string
+	}{{loneChild, ociManifestType}, {lone, ociIndexType}, {child, ociManifestType}, {ix, ociIndexType}, {stale, ociManifestType}}
+	for _, p := range puts {
+		if _, err := st.PutManifest(ctx, repo, ref.Reference{Digest: digest.FromBytes(p.body)}, p.mediaType, p.body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := time.Now().Add(-2 * time.Hour)
+	for _, p := range puts {
+		path := filepath.Join(registrysvc.StateDir(workDir), "app", "blobs", "sha256", digest.FromBytes(p.body).Encoded())
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	loneChildD := digest.FromBytes(loneChild)
+	loneD, childD, ixD, staleD := digest.FromBytes(lone), digest.FromBytes(child), digest.FromBytes(ix), digest.FromBytes(stale)
+
+	var deleted []string
+	del := func(ctx context.Context, rf name.Digest, _ string, _ authn.Authenticator) error {
+		if len(deleted) == 0 {
+			if _, err := st.PutManifest(ctx, repo, ref.Reference{Tag: "v1"}, ociIndexType, ix); err != nil {
+				return err
+			}
+			if err := st.DeleteDigest(ctx, repo, staleD); err != nil {
+				return err
+			}
+		}
+		deleted = append(deleted, rf.DigestStr())
+		return st.DeleteDigest(ctx, repo, digest.Digest(rf.DigestStr()))
+	}
+	sock := serveFakeImages(t, &fakeImagesDaemon{pruneResp: &runtimev1.PruneImagesResponse{}})
+	opts, err := parseImageArgs([]string{"--socket", sock, "--work-dir", workDir, "prune", "--force", "-o", "json"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := imageCommandWith(ctx, opts, &buf, dialRuntimed, del); err != nil {
+		t.Fatalf("image prune --force: %v\n%s", err, buf.String())
+	}
+	out := buf.String()
+
+	if got, want := strings.Join(deleted, ","), loneD.String()+","+loneChildD.String(); got != want {
+		t.Errorf("deleted %v; want only %s", deleted, want)
+	}
+	d, err := st.Resolve(repo, ref.Reference{Tag: "v1"})
+	if err != nil || d.Digest != ixD {
+		t.Fatalf("v1 = %v, %v; want the index tagged mid-prune, %s", d, err, ixD)
+	}
+	if _, _, err := st.Manifest(repo, ref.Reference{Digest: childD}); err != nil {
+		t.Errorf("the child of the index tagged mid-prune was deleted: %v", err)
+	}
+	doc := decodePrune(t, out)
+	if got, want := strings.Join(manifestList(doc), ","), "app@"+loneD.String()+",app@"+loneChildD.String(); got != want {
+		t.Errorf("report manifests = %v; want only %s (a gone manifest is not a delete)", got, want)
+	}
+	kept := map[string]string{}
+	for _, k := range doc.Registry.Kept {
+		kept[k.Digest] = k.Reason
+	}
+	want := map[string]registrysvc.KeepReason{
+		ixD.String():    registrysvc.KeepTaggedSincePlan,
+		childD.String(): registrysvc.KeepChildOfKept,
+		staleD.String(): registrysvc.GoneSincePlan,
+	}
+	for dg, reason := range want {
+		if kept[dg] != string(reason) {
+			t.Errorf("report kept %s = %q; want %q", dg, kept[dg], reason)
+		}
+	}
+	if len(doc.Registry.Failed) != 0 {
+		t.Errorf("report failed = %+v; want none", doc.Registry.Failed)
+	}
+}
+
+// TestImagePruneReportsRecheckSkips pins how the delete loop reports the
+// planned manifests it does not delete: a repository the re-check cannot read
+// is listed as unreadable once, however many of its manifests were skipped; a
+// repository gone since the plan is reported under kept only, never as
+// unreadable; and a delete the registry refused because the repository
+// changed after the re-check is kept, not failed. The deleter's first call
+// deletes through the store and then breaks the repository as the case needs,
+// so the re-checks of the other two planned manifests meet the broken state.
+// Each case runs once for the JSON report and once, on a fresh fixture, for
+// the table.
+func TestImagePruneReportsRecheckSkips(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		breakRepo      func(t *testing.T, workDir string)
+		refuse         bool
+		wantReason     registrysvc.KeepReason
+		wantKept       int
+		wantUnreadable []string
+	}{
+		{"an index the re-check cannot read", func(t *testing.T, workDir string) {
+			if err := os.WriteFile(filepath.Join(registrysvc.StateDir(workDir), "app", "index.json"), []byte("{"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}, false, registrysvc.KeepUnreadable, 2, []string{"app"}},
+		{"a repository gone since the plan", func(t *testing.T, workDir string) {
+			if err := os.RemoveAll(filepath.Join(registrysvc.StateDir(workDir), "app")); err != nil {
+				t.Fatal(err)
+			}
+		}, false, registrysvc.GoneSincePlan, 2, nil},
+		{"a repository changed at the delete", nil, true, registrysvc.KeepChangedSincePlan, 3, nil},
+	} {
+		for _, output := range []string{"json", "table"} {
+			t.Run(tc.name+"/"+output, func(t *testing.T) {
+				workDir := t.TempDir()
+				serveFakeZot(t, workDir)
+				st, err := store.OpenWorkDir(workDir)
+				if err != nil {
+					t.Fatal(err)
+				}
+				ctx := t.Context()
+				repo, err := ref.ParseName("app")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := st.Init(ctx, repo); err != nil {
+					t.Fatal(err)
+				}
+				old := time.Now().Add(-2 * time.Hour)
+				for _, seed := range []string{"one", "two", "three"} {
+					b := []byte(`{"schemaVersion":2,"mediaType":"` + ociManifestType + `","annotations":{"seed":"` + seed + `"}}`)
+					if _, err := st.PutManifest(ctx, repo, ref.Reference{Digest: digest.FromBytes(b)}, ociManifestType, b); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Chtimes(filepath.Join(registrysvc.StateDir(workDir), "app", "blobs", "sha256", digest.FromBytes(b).Encoded()), old, old); err != nil {
+						t.Fatal(err)
+					}
+				}
+
+				var calls int
+				del := func(ctx context.Context, rf name.Digest, state string, _ authn.Authenticator) error {
+					calls++
+					if state == "" {
+						t.Errorf("the DELETE of %s named no repository state", rf.DigestStr())
+					}
+					if tc.refuse {
+						return fmt.Errorf("delete %s: %w", rf, registrysvc.ErrChangedSincePlan)
+					}
+					if err := st.DeleteDigest(ctx, repo, digest.Digest(rf.DigestStr())); err != nil {
+						return err
+					}
+					if calls == 1 {
+						tc.breakRepo(t, workDir)
+					}
+					return nil
+				}
+				sock := serveFakeImages(t, &fakeImagesDaemon{pruneResp: &runtimev1.PruneImagesResponse{}})
+				args := []string{"--socket", sock, "--work-dir", workDir, "prune", "--force"}
+				if output == "json" {
+					args = append(args, "-o", "json")
+				}
+				opts, err := parseImageArgs(args, io.Discard)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var out bytes.Buffer
+				if err := imageCommandWith(ctx, opts, &out, dialRuntimed, del); err != nil {
+					t.Fatalf("image prune --force: %v\n%s", err, out.String())
+				}
+
+				if output == "table" {
+					if got := strings.Count(out.String(), "  unreadable, left alone: app\n"); got != len(tc.wantUnreadable) {
+						t.Errorf("table carries %d unreadable lines for app; want %d:\n%s", got, len(tc.wantUnreadable), out.String())
+					}
+					want := fmt.Sprintf("    %-28s %d\n", tc.wantReason, tc.wantKept)
+					if !strings.Contains(out.String(), want) {
+						t.Errorf("table lacks the kept line %q:\n%s", want, out.String())
+					}
+					return
+				}
+				doc := decodePrune(t, out.String())
+				if strings.Join(doc.Registry.Unreadable, ",") != strings.Join(tc.wantUnreadable, ",") {
+					t.Errorf("report unreadable = %v; want %v", doc.Registry.Unreadable, tc.wantUnreadable)
+				}
+				if len(doc.Registry.Failed) != 0 {
+					t.Errorf("report failed = %+v; want none", doc.Registry.Failed)
+				}
+				if len(doc.Registry.Kept) != tc.wantKept {
+					t.Errorf("report kept %d; want %d: %+v", len(doc.Registry.Kept), tc.wantKept, doc.Registry.Kept)
+				}
+				for _, k := range doc.Registry.Kept {
+					if k.Reason != string(tc.wantReason) {
+						t.Errorf("report kept %s = %q; want %q", k.Digest, k.Reason, tc.wantReason)
+					}
+				}
+			})
+		}
 	}
 }

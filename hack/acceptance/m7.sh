@@ -15,8 +15,8 @@
 #
 # The REAL M7 proof additionally asserts a goreleaser
 # snapshot build, bidirectional codesign entitlement asserts (server carries exactly
-# the JIT/unsigned-exec-memory/library-validation trio; k3sm-netd carries NONE), a
-# formula render, the four-repo sibling-layout assert, and a kine-nocgo dep-lint.
+# the JIT/unsigned-exec-memory/library-validation trio; k3sm-netd carries NONE), the
+# four-repo sibling-layout assert, and a kine-nocgo dep-lint.
 # NONE of that exists yet.
 #
 # Honesty contract: a manual:false CI-runnable gate skeleton MUST exit

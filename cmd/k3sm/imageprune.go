@@ -22,12 +22,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"sort"
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
-	"github.com/google/go-containerregistry/pkg/v1/remote"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 
@@ -36,7 +36,8 @@ import (
 
 // pruneReport is the `k3sm image prune -o json` document: what the prune
 // deleted, or would delete, from the cluster registry and from this node's
-// cache. The field names are the contract the app reads.
+// cache. The app reads the table renderPrune writes, not this document, so a
+// change to that table's lines is a change to the app's contract.
 type pruneReport struct {
 	DryRun   bool                `json:"dryRun"`
 	Registry registryPruneResult `json:"registry"`
@@ -53,6 +54,12 @@ type registryPruneResult struct {
 	// Manifests are the untagged manifests deleted, or that would be.
 	Manifests []registrysvc.StoredManifest `json:"manifests"`
 	// Kept are the untagged manifests the prune keeps, each with its reason.
+	// Under --force it includes every planned manifest the re-check before its
+	// delete skipped, with the re-check's reason: one tagged, re-pushed or
+	// newly named by a kept manifest since the plan, one the re-check could not
+	// read, or one already gone from its repository; and every one whose
+	// conditional delete the registry refused because the repository changed
+	// after the re-check.
 	Kept []registrysvc.KeptManifest `json:"kept"`
 	// Unreadable are repositories whose index could not be read; nothing in
 	// them is touched.
@@ -74,13 +81,15 @@ type cachePruneResult struct {
 	Kept           map[string]int `json:"kept,omitempty"`
 }
 
-// manifestDeleter deletes one manifest by digest from a registry. It is the
-// seam the force path is proved through without a zot.
-type manifestDeleter func(ctx context.Context, ref name.Digest, auth authn.Authenticator) error
+// manifestDeleter deletes one manifest by digest from a registry, conditional
+// on its repository's index still being in state (registrysvc.Recheck). It is
+// the seam the force path is proved through without a registry.
+type manifestDeleter func(ctx context.Context, ref name.Digest, state string, auth authn.Authenticator) error
 
-// deleteManifest is the production manifestDeleter: a dist-spec DELETE.
-var deleteManifest manifestDeleter = func(ctx context.Context, ref name.Digest, auth authn.Authenticator) error {
-	return remote.Delete(ref, remote.WithAuth(auth), remote.WithContext(ctx))
+// deleteManifest is the production manifestDeleter: a dist-spec DELETE with
+// If-Match, through registrysvc.DeleteManifest.
+var deleteManifest manifestDeleter = func(ctx context.Context, ref name.Digest, state string, auth authn.Authenticator) error {
+	return registrysvc.DeleteManifest(ctx, ref, state, auth, nil)
 }
 
 // errPruneIncomplete reports that some registry deletions failed. Everything
@@ -172,11 +181,19 @@ func pruneCredential(workDir string) (registrysvc.Credential, string, error) {
 // pruneRegistry plans each repository and, under --force, deletes its
 // untagged manifests. It returns how many deletions failed.
 //
-// Each repository is planned IMMEDIATELY before its deletions, not once up
-// front, because zot's delete by digest drops every tag on that digest: a tag
-// pushed onto an untagged manifest between plan and delete must take it out
-// of the plan. The window that remains is the one between the read and the
-// DELETE.
+// The registry's delete by digest drops every row with that digest, tags
+// included, so a tag pushed onto a planned manifest after the plan was read
+// would be lost with it, and an untagged child or referrer deleted after a
+// push tagged its index or subject would leave that image incomplete. Each
+// repository is planned immediately before its deletions, and immediately
+// before each DELETE registrysvc.Recheck re-plans the repository from its
+// current state, keep closure included: a planned manifest the fresh plan no
+// longer deletes is skipped and reported under Kept with the reason. The
+// DELETE then names the repository state the re-check read as If-Match, and
+// the k3sm registry refuses it under its own index lock when a push changed
+// the repository in between; that refusal is a keep too, not a failure. A
+// registry that ignores If-Match (zot) deletes unconditionally, so for it the
+// window of the request round-trip stays open.
 func pruneRegistry(ctx context.Context, o imageOptions, cred registrysvc.Credential, res *registryPruneResult, del manifestDeleter, now time.Time) (int, error) {
 	repos, err := registrysvc.Repositories(o.workDir)
 	if err != nil {
@@ -199,9 +216,23 @@ func pruneRegistry(ctx context.Context, o imageOptions, cred registrysvc.Credent
 				res.Manifests = append(res.Manifests, m)
 				continue
 			}
+			reason, state := registrysvc.Recheck(o.workDir, m, now)
+			if reason != "" {
+				res.Kept = append(res.Kept, registrysvc.KeptManifest{StoredManifest: m, Reason: reason})
+				// Only a repository the re-check could not read is listed as
+				// unreadable; one gone since the plan is reported under Kept only.
+				if reason == registrysvc.KeepUnreadable && !slices.Contains(res.Unreadable, m.Repository) {
+					res.Unreadable = append(res.Unreadable, m.Repository)
+				}
+				continue
+			}
 			ref, err := name.NewDigest(authority + "/" + m.Repository + "@" + m.Digest)
 			if err == nil {
-				err = del(ctx, ref, auth)
+				err = del(ctx, ref, state, auth)
+			}
+			if errors.Is(err, registrysvc.ErrChangedSincePlan) {
+				res.Kept = append(res.Kept, registrysvc.KeptManifest{StoredManifest: m, Reason: registrysvc.KeepChangedSincePlan})
+				continue
 			}
 			if err != nil {
 				res.Failed = append(res.Failed, failedManifest{StoredManifest: m, Error: err.Error()})

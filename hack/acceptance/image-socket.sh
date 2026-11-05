@@ -89,7 +89,7 @@ run_test() {
 		ladder no "$id  $name ($pkg) passed"
 		return
 	fi
-	if printf '%s\n' "$out" | grep -qE 'no tests to run|no test files'; then
+	if grep -qE 'no tests to run|no test files' <<<"$out"; then
 		ladder no "$id  $name ($pkg) actually RAN — go test reported no tests to run (renamed test?)"
 		return
 	fi
@@ -147,24 +147,26 @@ DEFAULT_SOCK="/var/lib/k3sm/run/runtimed.sock"
 # binary's exit status and never the grep's.
 IMAGE_HELP=""
 [ -x "$K3SM_BIN" ] && IMAGE_HELP="$("$K3SM_BIN" image -h 2>&1 || true)"
-if printf '%s\n' "$IMAGE_HELP" | grep -q "default \"$DEFAULT_SOCK\""; then
+if grep -q "default \"$DEFAULT_SOCK\"" <<<"$IMAGE_HELP"; then
 	ladder ok "image-socket.5b \`k3sm image\` defaults --socket to $DEFAULT_SOCK (what a default-rooted node binds)"
 else
 	ladder no "image-socket.5b \`k3sm image\` defaults --socket to $DEFAULT_SOCK (what a default-rooted node binds)"
 fi
 # An absent socket must fail as a DIAL against the named path, not as a parse or
 # a panic: that error is the operator's only clue when the node is not serving.
+# pull is the verb that dials the node socket; tag, untag, inspect and save read
+# the cluster registry and never dial it.
 ABSENT="$(dirname "$K3SM_BIN")/absent.sock"
 LS_OUT="$(dirname "$K3SM_BIN")/ls.err"
-if [ -x "$K3SM_BIN" ] && ! "$K3SM_BIN" image inspect example.test/app:v1 --socket "$ABSENT" --timeout 5s >"$LS_OUT" 2>&1; then
-	if grep -q "$ABSENT" "$LS_OUT"; then
-		ladder ok "image-socket.5c \`k3sm image inspect\` against an unbound socket fails naming the path it dialled"
+if [ -x "$K3SM_BIN" ] && ! "$K3SM_BIN" image pull example.test/app:v1 --socket "$ABSENT" --timeout 5s >"$LS_OUT" 2>&1; then
+	if grep -qF "cannot reach runtimed at $ABSENT" "$LS_OUT"; then
+		ladder ok "image-socket.5c \`k3sm image pull\` against an unbound socket fails naming the path it dialled"
 	else
 		tail -5 "$LS_OUT"
-		ladder no "image-socket.5c \`k3sm image inspect\` against an unbound socket fails naming the path it dialled"
+		ladder no "image-socket.5c \`k3sm image pull\` against an unbound socket fails naming the path it dialled"
 	fi
 else
-	ladder no "image-socket.5c \`k3sm image inspect\` against an unbound socket must fail (it did not)"
+	ladder no "image-socket.5c \`k3sm image pull\` against an unbound socket must fail (it did not)"
 fi
 
 # ls and df read the cluster registry, not a node socket, so --socket on them

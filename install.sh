@@ -43,9 +43,10 @@
 # them via PATH. Do not absolutize them "for hardening"; it breaks the gate.
 #
 # The checksum verify is same-origin INTEGRITY (the tarball matches the
-# checksums file published beside it), not publisher identity. Provenance
-# (Developer-ID + notarization) arrives with the .pkg generation — see
-# https://k3sm.io/install/ for the install-channel ladder.
+# checksums file published beside it), not publisher identity. The binaries
+# inside are Developer ID signed and notarized; `codesign --verify --strict
+# /Library/k3sm/k3sm` checks that after install. The k3sm app is the other
+# install channel, a signed, notarized disk image: https://k3sm.io/download/
 
 set -eu
 
@@ -136,7 +137,7 @@ resolve_version() {
 		esac
 		# The pre-stable channel.
 		[ -n "$TAG" ] || TAG="$(latest_any_tag)"
-		[ -n "$TAG" ] || fatal "no k3sm release found at $BASE_URL — has a k3sm release been published yet?"
+		[ -n "$TAG" ] || fatal "no k3sm release found at $BASE_URL: has a k3sm release been published yet?"
 	fi
 	valid_tag "$TAG" || fatal "refusing an unusable release tag: '$TAG'"
 	# Normalize both directions: goreleaser's {{ .Version }} strips the leading
@@ -156,16 +157,16 @@ resolve_version() {
 download_and_verify() {
 	info "downloading $ARCHIVE ($TAG) from $BASE_URL"
 	curl -fsSL -o "$STAGE/$ARCHIVE" "$BASE_URL/download/$TAG/$ARCHIVE" ||
-		fatal "download failed: $BASE_URL/download/$TAG/$ARCHIVE — has that release been published yet?"
+		fatal "download failed: $BASE_URL/download/$TAG/$ARCHIVE: has that release been published yet?"
 	curl -fsSL -o "$STAGE/$CHECKSUMS" "$BASE_URL/download/$TAG/$CHECKSUMS" ||
-		fatal "checksums download failed: $BASE_URL/download/$TAG/$CHECKSUMS — has that release been published yet?"
+		fatal "checksums download failed: $BASE_URL/download/$TAG/$CHECKSUMS: has that release been published yet?"
 	# Exact-field match (no regex, no substrings): the shasum -c line whose
 	# second field IS the archive name. Hard-fail on a missing entry BEFORE
 	# shasum ever runs — never rely on a tool's empty-input verdict.
 	CHECKLINE="$(awk -v f="$ARCHIVE" '$2 == f' "$STAGE/$CHECKSUMS")"
-	[ -n "$CHECKLINE" ] || fatal "checksums file has no entry for $ARCHIVE — refusing to install"
+	[ -n "$CHECKLINE" ] || fatal "checksums file has no entry for $ARCHIVE; refusing to install"
 	(cd "$STAGE" && printf '%s\n' "$CHECKLINE" | shasum -a 256 -c - >/dev/null 2>&1) ||
-		fatal "sha256 verification FAILED for $ARCHIVE — refusing to install"
+		fatal "sha256 verification FAILED for $ARCHIVE; refusing to install"
 	ARCHIVE_SHA256="${CHECKLINE%% *}"
 	info "sha256 verified: $ARCHIVE_SHA256"
 }
@@ -195,14 +196,14 @@ run_install() {
 	if ! sudo "$STAGE/k3sm" install; then
 		printf '[k3sm-install] ERROR: sudo k3sm install failed.\n' >&2
 		printf '[k3sm-install]   A partial install is safe to retire: sudo %s/k3sm uninstall (idempotent).\n' "$STAGE" >&2
-		printf '[k3sm-install]   Diagnostics: k3sm status, then k3sm doctor — logs: /var/log/k3sm/\n' >&2
+		printf '[k3sm-install]   Diagnostics: k3sm status, then k3sm doctor; logs: /var/log/k3sm/\n' >&2
 		exit 1
 	fi
 	if command -v k3sm >/dev/null 2>&1; then
-		info "installed — try: k3sm status, then k3sm kubectl get nodes"
+		info "installed. Try: k3sm status, then k3sm kubectl get nodes"
 	else
-		info "installed to /Library/k3sm; /usr/local/bin/k3sm is the launcher —"
-		info "  open a new terminal, or add /usr/local/bin to PATH, then: k3sm status"
+		info "installed to /Library/k3sm; /usr/local/bin/k3sm is the launcher."
+		info "  Open a new terminal, or add /usr/local/bin to PATH, then: k3sm status"
 	fi
 }
 

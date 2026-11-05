@@ -7,7 +7,7 @@
 #
 #   M11-core  gate hack/lab/m11.sh, args ["--core"], tier lab, manual: true,
 #             requires dev-mac + vz + network. The LAUNCH row: the vm path
-#             (linux/arm64) must demonstrate this before v0.1 ships.
+#             (linux/arm64) must demonstrate this before a release ships.
 #   M11-lab   gate hack/lab/m11.sh (NO args), tier lab, manual: true,
 #             requires vz + network. The FULL vm-path ledger — every vm-path leg.
 #
@@ -59,9 +59,9 @@
 #                      the pod goes away, rather than hanging.
 #   m11.12 stats       FULL ONLY. The node's /stats/summary reports the vm pod with a
 #                      memory working set (per-container cgroup2 leaves exist in the
-#                      guest). Deliberately NOT `kubectl top`: that needs an
-#                      operator-installed metrics-server, which k3sm does not ship
-#                      (docs/user/limitations.md).
+#                      guest). Deliberately NOT `kubectl top`: that reads
+#                      metrics-server's aggregated API, a separate rung from the
+#                      node's own stats path.
 #
 # Every wait is bounded. A hang is a FAIL against a named rung, never a gate that runs
 # until someone kills it. Every object the gate creates lives in ONE namespace, deleted
@@ -381,7 +381,7 @@ wait_ready() {
 	while [ "$SECONDS" -lt "$deadline" ]; do
 		phase="$(kn get pod "$pod" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
 		ready="$(kn get pod "$pod" -o jsonpath='{.status.containerStatuses[*].ready}' 2>/dev/null || true)"
-		if [ "$phase" = "Running" ] && [ -n "$ready" ] && ! printf '%s' "$ready" | grep -q false; then
+		if [ "$phase" = "Running" ] && [ -n "$ready" ] && ! grep -q false <<<"$ready"; then
 			return 0
 		fi
 		reason="$(kn get pod "$pod" -o jsonpath='{.status.containerStatuses[*].state.waiting.reason}' 2>/dev/null || true)"
@@ -519,7 +519,7 @@ else
 fi
 
 if [ "$BOOT_OK" -eq 1 ]; then
-	UNAME="$(gexec "$POD_BOOT" 'uname -sm' 2>/dev/null | tr -d '\r' | head -1 || true)"
+	UNAME="$(gexec "$POD_BOOT" 'uname -sm' 2>/dev/null | tr -d '\r' | sed -n 1p || true)"
 	if [ "$UNAME" = "Linux aarch64" ]; then
 		ladder ok "m11.2-b  the guest is really Linux/arm64 (uname -sm = '$UNAME')"
 	else
@@ -539,7 +539,7 @@ fi
 if [ "$BOOT_OK" -eq 1 ]; then
 	SA_DIR=/var/run/secrets/kubernetes.io/serviceaccount
 	SA_SEEN="$(gexec "$POD_BOOT" "cat $SA_DIR/namespace 2>/dev/null | tr -d '\n'" 2>/dev/null | tr -d '\r' || true)"
-	SA_HAS_TOKEN="$(gexec "$POD_BOOT" "[ -s $SA_DIR/token ] && [ -s $SA_DIR/ca.crt ] && echo yes" 2>/dev/null | tr -d '\r' | head -1 || true)"
+	SA_HAS_TOKEN="$(gexec "$POD_BOOT" "[ -s $SA_DIR/token ] && [ -s $SA_DIR/ca.crt ] && echo yes" 2>/dev/null | tr -d '\r' | sed -n 1p || true)"
 	if [ "$SA_SEEN" = "$NS" ] && [ "$SA_HAS_TOKEN" = "yes" ]; then
 		ladder ok "m11.2-c  the ServiceAccount projection is readable at $SA_DIR (namespace=$SA_SEEN, non-empty token and ca.crt)"
 	else
@@ -563,7 +563,7 @@ fi
 # ── m11.3 logs ────────────────────────────────────────────────────────────────────
 if [ "$BOOT_OK" -eq 1 ]; then
 	LOGS="$(kn logs "$POD_BOOT" 2>/dev/null || true)"
-	if printf '%s\n' "$LOGS" | grep -q "m11-log-${LOG_LINES} $MARKER"; then
+	if grep -q "m11-log-${LOG_LINES} $MARKER" <<<"$LOGS"; then
 		ladder ok "m11.3-a  kubectl logs returns the marker the container echoed (m11-log-${LOG_LINES} $MARKER)"
 	else
 		ladder no "m11.3-a  kubectl logs does not contain the container's marker (got $(printf '%s\n' "$LOGS" | grep -c . || true) lines)"
@@ -597,7 +597,7 @@ if [ "$BOOT_OK" -eq 1 ]; then
 	ADDR_OUT="$(gexec "$POD_BOOT" 'ip -4 -o addr show eth0 2>/dev/null || ifconfig eth0' 2>/dev/null || true)"
 	GUEST_IP="$(printf '%s\n' "$ADDR_OUT" | awk '{for (i = 1; i <= NF; i++) if ($i == "inet") {split($(i+1), a, "/"); print a[1]; exit}}')"
 	LINK_OUT="$(gexec "$POD_BOOT" 'ip -o link show eth0 2>/dev/null || ifconfig eth0' 2>/dev/null || true)"
-	if [ -n "$GUEST_IP" ] && [ "$(in_cidr "$GUEST_IP" "$VMNET_CIDR")" = "yes" ] && printf '%s' "$LINK_OUT" | grep -q UP; then
+	if [ -n "$GUEST_IP" ] && [ "$(in_cidr "$GUEST_IP" "$VMNET_CIDR")" = "yes" ] && grep -q UP <<<"$LINK_OUT"; then
 		ladder ok "m11.7-a  guest eth0 is UP with $GUEST_IP, inside the node's vmnet segment $VMNET_CIDR"
 	else
 		ladder no "m11.7-a  guest eth0 address '${GUEST_IP:-none}' is not an UP address inside $VMNET_CIDR"
@@ -607,7 +607,7 @@ if [ "$BOOT_OK" -eq 1 ]; then
 
 	ROUTE_OUT="$(gexec "$POD_BOOT" 'ip route show default 2>/dev/null || netstat -rn 2>/dev/null | grep "^0.0.0.0"' 2>/dev/null || true)"
 	if [ -n "$(printf '%s' "$ROUTE_OUT" | tr -d '[:space:]')" ]; then
-		ladder ok "m11.7-b  the guest has a default route ($(printf '%s' "$ROUTE_OUT" | head -1))"
+		ladder ok "m11.7-b  the guest has a default route ($(printf '%s' "$ROUTE_OUT" | sed -n 1p))"
 	else
 		ladder no "m11.7-b  the guest has NO default route"
 	fi
@@ -616,7 +616,7 @@ if [ "$BOOT_OK" -eq 1 ]; then
 	API_CLUSTERIP="$(kubectl get svc kubernetes -n default -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)"
 	if [ -n "$DNS_VIP" ] && [ -n "$API_CLUSTERIP" ]; then
 		NS_OUT="$(gexec "$POD_BOOT" "nslookup kubernetes.default.svc.cluster.local $DNS_VIP" 2>&1 || true)"
-		if printf '%s\n' "$NS_OUT" | grep -q "$API_CLUSTERIP"; then
+		if grep -q "$API_CLUSTERIP" <<<"$NS_OUT"; then
 			ladder ok "m11.7-c  kubernetes.default.svc.cluster.local resolves to $API_CLUSTERIP through the cluster DNS VIP $DNS_VIP"
 		else
 			ladder no "m11.7-c  the FQDN did not resolve to $API_CLUSTERIP through $DNS_VIP"
@@ -658,7 +658,7 @@ fi
 # ── m11.9 per-VM host footprint (RECORDED, never thresholded) ─────────────────────
 BOOT_UID="$(kn get pod "$POD_BOOT" -o jsonpath='{.metadata.uid}' 2>/dev/null || true)"
 VMHOST_PID=""
-if [ -n "$BOOT_UID" ]; then VMHOST_PID="$(pgrep -f "k3sm-vmhost.*$BOOT_UID" 2>/dev/null | head -1 || true)"; fi
+if [ -n "$BOOT_UID" ]; then VMHOST_PID="$(pgrep -f "k3sm-vmhost.*$BOOT_UID" 2>/dev/null | sed -n 1p || true)"; fi
 if [ -n "$VMHOST_PID" ]; then
 	FOOTPRINT="$(ps -o rss=,vsz=,etime=,pcpu= -p "$VMHOST_PID" 2>/dev/null | sed 's/^ *//' || true)"
 	RSS_KB="$(printf '%s' "$FOOTPRINT" | awk '{print $1}')"
@@ -678,7 +678,7 @@ if wait_ready "$POD_WORKLOAD" "$READY_TIMEOUT"; then
 	found=0
 	deadline=$((SECONDS + 120))
 	while [ "$SECONDS" -lt "$deadline" ]; do
-		if kn logs "$POD_WORKLOAD" 2>/dev/null | grep -q "Server is ready"; then found=1; break; fi
+		if grep -q "Server is ready" <<<"$(kn logs "$POD_WORKLOAD" 2>/dev/null)"; then found=1; break; fi
 		sleep 5
 	done
 	if [ "$found" -eq 1 ]; then
@@ -721,7 +721,7 @@ store_pod "$MARKER_A"
 if wait_ready "$POD_STORE" "$READY_TIMEOUT"; then
 	BOUND="$(kn get pvc "$PVC" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
 	MARKERS="$(gexec "$POD_STORE" 'cat /data/markers' 2>/dev/null || true)"
-	if [ "$BOUND" = "Bound" ] && printf '%s\n' "$MARKERS" | grep -q "$MARKER_A"; then
+	if [ "$BOUND" = "Bound" ] && grep -q "$MARKER_A" <<<"$MARKERS"; then
 		STORE_OK=1
 		PVNAME="$(kn get pvc "$PVC" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)"
 		ladder ok "m11.6-a  local-path PVC $PVC is $BOUND (PV ${PVNAME:-?}) and the vm pod wrote $MARKER_A into it"
@@ -735,7 +735,7 @@ fi
 
 if [ "$STORE_OK" -eq 1 ]; then
 	STORE_UID="$(kn get pod "$POD_STORE" -o jsonpath='{.metadata.uid}' 2>/dev/null || true)"
-	KILL_PID="$(pgrep -f "k3sm-vmhost.*$STORE_UID" 2>/dev/null | head -1 || true)"
+	KILL_PID="$(pgrep -f "k3sm-vmhost.*$STORE_UID" 2>/dev/null | sed -n 1p || true)"
 	kill_rc=0
 	if [ -n "${K3SM_M11_VMHOST_KILL:-}" ]; then
 		note "killing the helper via \$K3SM_M11_VMHOST_KILL (pod uid $STORE_UID)"
@@ -755,7 +755,7 @@ if [ "$STORE_OK" -eq 1 ]; then
 			ready="$(kn get pod "$POD_STORE" -o jsonpath='{.status.containerStatuses[*].ready}' 2>/dev/null || true)"
 			reason="$(kn get pod "$POD_STORE" -o jsonpath='{.status.containerStatuses[*].state.waiting.reason}' 2>/dev/null || true)"
 			phase="$(kn get pod "$POD_STORE" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
-			if [ "$reason" = "CrashLoopBackOff" ] || printf '%s' "$ready" | grep -q false || [ "$phase" = "Failed" ]; then
+			if [ "$reason" = "CrashLoopBackOff" ] || grep -q false <<<"$ready" || [ "$phase" = "Failed" ]; then
 				unhealthy=1
 				note "$POD_STORE after the helper SIGKILL: phase=${phase:-?} waiting=${reason:-none} ready=${ready:-?}"
 				break
@@ -778,7 +778,7 @@ if [ "$STORE_OK" -eq 1 ]; then
 		store_pod "$MARKER_B"
 		if wait_ready "$POD_STORE" "$READY_TIMEOUT"; then
 			MARKERS="$(gexec "$POD_STORE" 'cat /data/markers' 2>/dev/null || true)"
-			if printf '%s\n' "$MARKERS" | grep -q "$MARKER_A" && printf '%s\n' "$MARKERS" | grep -q "$MARKER_B"; then
+			if grep -q "$MARKER_A" <<<"$MARKERS" && grep -q "$MARKER_B" <<<"$MARKERS"; then
 				ladder ok "m11.6-c  a fresh vm pod on the SAME claim sees both the pre-kill marker $MARKER_A and the new $MARKER_B — the bytes survived the guest"
 			else
 				ladder no "m11.6-c  the recreated pod does not see both markers (got: ${MARKERS:-none})"
@@ -803,14 +803,14 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 	phase="$(kn get pod "$POD_AMD64" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
 	if [ "$phase" = "Running" ] || [ "$phase" = "Succeeded" ]; then ran=1; break; fi
 	EVIDENCE="$( { kn describe pod "$POD_AMD64"; kn get events --field-selector "involvedObject.name=$POD_AMD64"; } 2>/dev/null || true )"
-	if printf '%s\n' "$EVIDENCE" | grep -qF "$AMD64_SUBSTR"; then matched=1; break; fi
+	if grep -qF "$AMD64_SUBSTR" <<<"$EVIDENCE"; then matched=1; break; fi
 	sleep 5
 done
 if [ "$ran" -eq 1 ]; then
 	ladder no "m11.8  the amd64-only image $IMAGE_AMD64 REACHED $phase under runtimeClassName: vm — this release attaches no guest Rosetta share, so an amd64 payload must be refused, not admitted"
 elif [ "$matched" -eq 1 ]; then
 	ladder ok "m11.8  $IMAGE_AMD64 fails closed and the failure names the platform mismatch ('$AMD64_SUBSTR')"
-	printf '%s\n' "$EVIDENCE" | grep -F "$AMD64_SUBSTR" | head -2 | sed 's/^/      /' || true
+	printf '%s\n' "$EVIDENCE" | grep -F "$AMD64_SUBSTR" | sed -n 1,2p | sed 's/^/      /' || true
 else
 	ladder no "m11.8  $IMAGE_AMD64 did not surface the platform mismatch within ${PULLFAIL_TIMEOUT}s (last phase '${phase:-?}') — a failure that does not name the mismatch is an opaque failure"
 	kn describe pod "$POD_AMD64" 2>&1 | tail -n 20 | sed 's/^/      /' || true
@@ -848,7 +848,7 @@ if [ "$BOOT_OK" -eq 1 ]; then
 		if [ -n "$eps" ]; then break; fi
 		sleep 5
 	done
-	if [ -n "$POD_IP" ] && printf '%s' "$eps" | grep -qF "$POD_IP" && printf '%s' "$epready" | grep -q true; then
+	if [ -n "$POD_IP" ] && grep -qF "$POD_IP" <<<"$eps" && grep -q true <<<"$epready"; then
 		ladder ok "m11.10-a  the EndpointSlice for $SVC_BOOT carries the vm pod's published IP $POD_IP, ready"
 	else
 		ladder no "m11.10-a  the EndpointSlice for $SVC_BOOT does not carry a ready endpoint for pod IP '${POD_IP:-none}' (addresses: '${eps:-none}', ready: '${epready:-none}')"
@@ -858,11 +858,11 @@ if [ "$BOOT_OK" -eq 1 ]; then
 		deadline=$((SECONDS + 60))
 		while [ "$SECONDS" -lt "$deadline" ]; do
 			body="$(curl -sS -m 10 "http://$SVC_IP/" 2>/dev/null || true)"
-			if printf '%s' "$body" | grep -qF "$MARKER"; then break; fi
+			if grep -qF "$MARKER" <<<"$body"; then break; fi
 			sleep 5
 		done
 	fi
-	if printf '%s' "$body" | grep -qF "$MARKER"; then
+	if grep -qF "$MARKER" <<<"$body"; then
 		ladder ok "m11.10-b  a client reaches the vm-hosted workload through the ClusterIP $SVC_IP (marker $MARKER)"
 	else
 		ladder no "m11.10-b  the ClusterIP '${SVC_IP:-none}' did not serve the vm pod's marker (got: '${body:-nothing}')"
@@ -913,9 +913,9 @@ else
 fi
 
 # ── m11.12 stats (FULL) ───────────────────────────────────────────────────────────
-# The node's own /stats/summary, NOT `kubectl top`: top needs an operator-installed
-# metrics-server, which k3sm deliberately does not ship (docs/user/limitations.md), so
-# asserting top would test the operator's cluster rather than k3sm's stats path.
+# The node's own /stats/summary, NOT `kubectl top`: top goes through
+# metrics-server, so asserting it would test that add-on rather than the vm pod's
+# stats path.
 if [ "$BOOT_OK" -eq 1 ]; then
 	SUMMARY="$(kubectl get --raw "/api/v1/nodes/$VM_NODE/proxy/stats/summary" 2>/dev/null || true)"
 	WS="$(printf '%s' "$SUMMARY" | python3 -c '

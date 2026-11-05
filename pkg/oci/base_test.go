@@ -267,13 +267,26 @@ func TestBuildFromBaseSurfacesResolverFailure(t *testing.T) {
 	})
 }
 
-// scratchDigest is the digest FROM scratch produced BEFORE named bases were
-// supported, captured by building this exact Dockerfile and context against
-// origin/main. Reproducible digests are a documented property of this builder
-// (docs/user/images.md), so the scratch path changing at all is a regression
-// even when every other test still passes — the relative reproducibility test
-// (A == B) cannot see a shift that moves both sides equally.
-const scratchDigest = "sha256:1b772d00f8e1de055116f31993acc1745225b88baa19999e9a07cf8c33951ed7"
+// scratchConfigDigest is the image config digest (the image ID) FROM scratch
+// produced before named bases were supported, and before layers were gzipped:
+// the config records only diff_ids, the hashes of the UNCOMPRESSED tars, so it
+// is a function of the content alone and must never move. Reproducible digests
+// are a documented property of this builder (docs/user/images.md), so the
+// scratch path changing at all is a regression even when every other test
+// still passes — the relative reproducibility test (A == B) cannot see a shift
+// that moves both sides equally.
+const scratchConfigDigest = "sha256:fac67aa92d50552a7aece3ae97bb931d039d08d78c43da02afb5c3e5cf2498cb"
+
+// scratchDiffID is the diff_id of the one layer that build emits.
+const scratchDiffID = "sha256:b84ee1f620aedb743b264e3410abb2f659ca42a32049dcf6fda46f409c1ddb1d"
+
+// scratchDigest is the manifest digest of the same build. Unlike the two pins
+// above it also covers the gzip bytes of the layer, which are compress/flate's
+// output and may legitimately change with a Go release (see "# Determinism" in
+// doc.go). When ONLY this pin moves after a Go toolchain bump, with the config
+// and diff_id pins still green, re-capture it; any other move is a regression
+// in the gzip contract.
+const scratchDigest = "sha256:bd7816cf1a4d5ca7056b2a1d63bee4f0f7d21f157f0e7b056395dab47ceb6378"
 
 func TestBuildFromScratchDigestUnchanged(t *testing.T) {
 	t.Parallel()
@@ -281,11 +294,32 @@ func TestBuildFromScratchDigestUnchanged(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
+	cfg, err := img.ConfigName()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.String() != scratchConfigDigest {
+		t.Errorf("FROM scratch config digest = %s, want %s — the image ID is content-only and must not move", cfg, scratchConfigDigest)
+	}
+	layers, err := img.Layers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(layers) != 1 {
+		t.Fatalf("FROM scratch build has %d layers, want 1", len(layers))
+	}
+	diffID, err := layers[0].DiffID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diffID.String() != scratchDiffID {
+		t.Errorf("FROM scratch diff_id = %s, want %s — the tar normalization changed", diffID, scratchDiffID)
+	}
 	d, err := img.Digest()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if d.String() != scratchDigest {
-		t.Fatalf("FROM scratch digest = %s, want %s — the scratch path must stay byte-identical", d, scratchDigest)
+		t.Errorf("FROM scratch manifest digest = %s, want %s — the scratch path must stay byte-identical on this Go toolchain", d, scratchDigest)
 	}
 }

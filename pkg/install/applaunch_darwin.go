@@ -57,6 +57,12 @@ func NewAppLauncher(logger *slog.Logger, executable string) AppLauncher {
 // darwinAppHost is the real appHost.
 type darwinAppHost struct{}
 
+// DeveloperMode reads the developer-mode marker through the installer's own
+// System.
+func (darwinAppHost) DeveloperMode() bool {
+	return ReadDeveloperModeState(NewDarwinSystem(), DeveloperModeMarkerPath) == DeveloperModeMarkerOn
+}
+
 // ConsoleUser reads /dev/console's owner and looks the account up. A console
 // owned by root (the login window, or no GUI session at all) is reported as
 // uid 0, which the caller refuses; a missing device is ErrNoConsoleUser.

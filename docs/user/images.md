@@ -200,7 +200,7 @@ Each of these is a documented difference:
 | `--platform` | Accepts `darwin/arm64` (the default, packaged natively) and Linux targets, which build on the engine; name several at once for a multi-platform index. Neither builder cross-compiles: a `darwin/arm64` image is refused any other value on the native path, and a `RUN` step for an architecture the engine's `arm64` guest cannot execute is refused by name. |
 | Variables (`$VAR`), `ARG` | **Rejected.** No expansion is performed, and a literal `$` in a path would be an invisible divergence. |
 | Build output | Recorded in the cluster registry as `registry-k3sm:6450/<repository>:<tag>`, then pulled into this node's cache. `--output` additionally writes a portable artifact (a docker-save tar, or an OCI layout with `--format oci`) to a path you name. A tag that names another registry is refused unless `--push` uploads it there, and then it is not recorded in the cluster registry. `--no-record` skips the recording, needs no root, and requires `--output` or `--push`. |
-| Timestamps | Fixed, not wall-clock, so rebuilding the same context yields the same image digest. |
+| Timestamps | Fixed, not wall-clock. Rebuilding the same context with the same k3sm release yields the same image digest. Layers are gzip-compressed, and a different Go release can compress the same bytes differently, so a k3sm upgrade can change the digest while the image's content (its config and layer contents) stays the same. |
 | File modes | Normalized to `0755` (if any execute bit is set) or `0644`. A `0600` source becomes world-readable in the image, and setuid/setgid/sticky bits are dropped. Preserving source modes would break reproducibility, since git records only the execute bit. |
 | Ownership & xattrs | Every entry is `uid 0 / gid 0` with no user or group name, and no extended attributes, so the builder's account identity and macOS xattrs (including `com.apple.quarantine`) never reach the image. |
 | Special files | Devices, FIFOs and sockets in the context are **refused**, not skipped. Symlinks are preserved as symlinks, but one whose target would escape the image root is refused. |
@@ -252,17 +252,19 @@ registry reference, and a Pod on this node with `imagePullPolicy: Never` finds i
 | Format detection | None. The verb is the declaration. A layout handed to `load` (or a docker-save tar handed to `import`) is refused with an error naming the other verb, never sniffed. |
 | Signatures & provenance | Loaded images carry no provenance. This path evaluates no signature policy, because it is an operator-only surface, and what it records is exactly what you handed it. |
 | Requires a running node | Yes. The upload needs this server's registry and its push credential, and the cache pull goes through the node's runtime daemon over its local socket, which is readable only by the daemon's own account. |
-| Deadline | `--timeout` defaults to 30m for these two verbs (they stream a whole archive) and 2m for the metadata verbs. |
+| Deadline | None by default for these two verbs, or for `push`, `pull` and `save`: each registry request is abandoned only after 2m without moving a byte, so a slow transfer that keeps moving is never cut, and Ctrl-C cancels. The pull the node's daemon does itself reports no progress, so it is bounded at 30m. An explicit `--timeout` sets an overall deadline. The metadata verbs default to a 2m deadline. |
 
 ### The Daemon Socket
 
-Every subcommand except `push`, `ls` and `df` is a client of the node's runtime daemon, reached over a local unix
-socket. A running `k3sm server` (or `k3sm agent`) serves that socket as part of normal bring-up, so
+`pull`, `load`, `import`, `prune` and `migrate` are clients of the node's runtime daemon (and so is
+`push` when its source is a reference in this node's cache), reached over a local unix socket.
+`tag`, `untag`, `inspect`, `save`, `ls` and `df` read or write the cluster registry and never dial
+it. A running `k3sm server` (or `k3sm agent`) serves that socket as part of normal bring-up, so
 on a standard install the commands work with no extra setup and no flags:
 
 ```sh
-k3sm image inspect myapp:v1
 k3sm image prune
+k3sm image pull ghcr.io/org/app:v1
 ```
 
 The socket lives in the runtime root's `run` directory, which on a standard install is
@@ -400,6 +402,21 @@ through the runtime daemon, verifies the export, and uploads the result.
 k3sm image push myapp:v1 registry.example.com/me/myapp:v1
 ```
 
+A reference this node's cache does not hold may also name an image the cluster registry holds,
+by any name `k3sm image ls` and `k3sm image inspect` accept: a bare `myapp:v1`, or the same under
+`registry-k3sm:6450/`. That is where `k3sm build` records its output, so the image a build just
+recorded is pushed on by its tag. k3sm copies it from the cluster registry through the push gate,
+with the builder token the build used. Blobs the destination already has are skipped; within the
+cluster registry they are mounted from the source repository instead of sent again. A destination
+that names the same repository and tag copies nothing and says the image is already there.
+
+```sh
+k3sm build --tag myapp:v1 .
+k3sm image push myapp:v1 registry-k3sm:6450/team/myapp:v1
+```
+
+If neither the cache nor the cluster registry holds the reference, the error names both.
+
 The credential is read at the moment of the upload and forgotten. It comes from
 `K3SM_REGISTRY_TOKEN` if that is set, otherwise from the docker config chain (`docker login`). k3sm
 writes no credential file and never takes one on the command line, where it would land in shell
@@ -439,6 +456,7 @@ publishes.
 ```sh
 k3sm image ls             # every tag, where it is cached, and how many Pods use it
 k3sm image ls -o json     # the same, as a versioned document
+k3sm image ls -o ndjson   # the same, one JSON line per image as it is read
 k3sm image df             # the registry's size and each node's image cache
 k3sm image df -o json
 ```
@@ -454,6 +472,29 @@ nodes under `cachedOnIncomplete`.
 If the registry does not answer, both commands still exit 0: the table says it is unreachable, and
 the JSON document carries `"reachable": false` with the error. `df` then still reports the node
 caches.
+
+Both commands keep what each image digest describes (its platforms, size and blobs) in a cache
+under your account's cache directory, `~/Library/Caches/k3sm/registry/<registry address>/`, so a
+later run reads only each tag's current digest and describes just the digests it has not seen.
+Which digest a tag names is read afresh every run; deleting the directory is always safe. A run
+as root (under `sudo`) keeps no cache.
+
+### Streaming the list: `-o ndjson`
+
+`k3sm image ls -o ndjson` writes the listing while it runs, one JSON object per line, so a program
+can show progress and fill a list before a large registry has been read. Every line has a `type`:
+
+| `type` | When | Fields |
+|---|---|---|
+| `start` | first | `schemaVersion` (1), `registry` (`name`, `reachable`, and `error` when it is unreachable) |
+| `progress` | after each repository's tag list is read, and at most every 250 ms while tags are read | `repositories`, `repositoriesRead`, `tags`, `tagsRead`; `tags` is the running total and grows until every repository's list is read |
+| `image` | as each tag is read, in the order the reads finish | the fields of one element of `images` in `-o json`: `repository`, `tag`, `reference`, `digest`, `platforms`, `sizeBytes`, `pods`, `cachedOn` |
+| `end` | last | `images` (how many image lines were written), `cachedOnIncomplete`, `migration` |
+| `error` | instead of `end`, when the listing fails after the registry answered | `error` |
+
+An unreachable registry is a `start` line with `"reachable": false`, then `end`, and the command
+exits 0, as with `-o json`. After an `error` line the command exits non-zero. Image lines arrive in
+completion order; sort them yourself.
 
 ## Next
 

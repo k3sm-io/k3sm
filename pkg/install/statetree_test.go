@@ -19,7 +19,9 @@ package install
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -577,4 +579,97 @@ func TestMeshKeyDirLivesOutsideTheServiceUserRunDir(t *testing.T) {
 			t.Errorf("install did not ensure %s root-owned after the root (%s at %d, root at %d)", ManifestDir, call, at, rootAt)
 		}
 	})
+}
+
+// TestEnsureStateTreeHandsRuntimeRootLockToServiceUser pins the fix for a
+// server that exited at every start with "open runtime root lock
+// /var/lib/k3sm/runtimed.lock: permission denied": both node roles embed the
+// runtime as the service user with its root at the data root, the runtime
+// creates <root>/runtimed.lock there, and the data root is root:wheel 0755. So
+// the installer creates (or repairs) that one file for the service user, and
+// refuses, without touching it, anything at the path that is not a regular
+// file.
+func TestEnsureStateTreeHandsRuntimeRootLockToServiceUser(t *testing.T) {
+	const svcUID = 271
+	lock := RuntimeRootLockPath(DefaultDataRoot)
+	if want := DefaultDataRoot + "/runtimed.lock"; lock != want {
+		t.Fatalf("RuntimeRootLockPath = %s, want %s", lock, want)
+	}
+	cases := []struct {
+		name       string
+		seed       *OwnedEntry
+		hardlinked bool
+		wantErr    bool
+		want       OwnedEntry
+	}{
+		{
+			name: "an absent file is created for the service user 0600",
+			want: OwnedEntry{UID: svcUID, GID: ServiceTreeGID, Mode: 0o600, Kind: EntryRegular},
+		},
+		{
+			name: "a root-owned 0644 file is repaired to the service user 0600",
+			seed: &OwnedEntry{UID: 0, GID: 0, Mode: 0o644, Kind: EntryRegular},
+			want: OwnedEntry{UID: svcUID, GID: ServiceTreeGID, Mode: 0o600, Kind: EntryRegular},
+		},
+		{
+			name:    "a symlink is refused and left alone",
+			seed:    &OwnedEntry{UID: svcUID, GID: ServiceTreeGID, Mode: 0o755 | fs.ModeSymlink, Kind: EntrySymlink},
+			wantErr: true,
+			want:    OwnedEntry{UID: svcUID, GID: ServiceTreeGID, Mode: 0o755 | fs.ModeSymlink, Kind: EntrySymlink},
+		},
+		{
+			name:    "a directory is refused and left alone",
+			seed:    &OwnedEntry{UID: 0, GID: 0, Mode: 0o755 | fs.ModeDir, Kind: EntryDir},
+			wantErr: true,
+			want:    OwnedEntry{UID: 0, GID: 0, Mode: 0o755 | fs.ModeDir, Kind: EntryDir},
+		},
+		{
+			name:       "a hard-linked root-owned file is refused and left alone",
+			seed:       &OwnedEntry{UID: 0, GID: 0, Mode: 0o600, Kind: EntryRegular},
+			hardlinked: true,
+			wantErr:    true,
+			want:       OwnedEntry{UID: 0, GID: 0, Mode: 0o600, Kind: EntryRegular},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeSystem{}
+			if tc.seed != nil {
+				f.putOwnedEntry(lock, *tc.seed)
+			}
+			if tc.hardlinked {
+				f.hardlinked = map[string]bool{lock: true}
+			}
+			cfg := serverCfg()
+			cfg.Logger = slog.New(slog.DiscardHandler)
+			cfg.DataRoot = DefaultDataRoot
+			err := ensureStateTree(f, cfg, svcUID)
+			if tc.wantErr {
+				if !errors.Is(err, ErrNotRegularFile) {
+					t.Fatalf("ensureStateTree = %v, want an error wrapping ErrNotRegularFile", err)
+				}
+			} else if err != nil {
+				t.Fatalf("ensureStateTree: %v", err)
+			}
+			wantCall(t, f, fmt.Sprintf("EnsureOwnedFile:%s:%d:%d:%#o", lock, svcUID, ServiceTreeGID, RuntimeRootLockMode))
+			got, ok := f.owners[lock]
+			if !ok {
+				t.Fatalf("%s was never created", lock)
+			}
+			tc.want.Path = lock
+			if got != tc.want {
+				t.Errorf("%s = %+v, want %+v", lock, got, tc.want)
+			}
+			// The data root keeps its own terms, and was ensured before the
+			// file inside it changed hands.
+			rootCall := fmt.Sprintf("EnsureOwnedDir:%s:0:0:%#o", DefaultDataRoot, StateRootMode)
+			lockCall := fmt.Sprintf("EnsureOwnedFile:%s:%d:%d:%#o", lock, svcUID, ServiceTreeGID, RuntimeRootLockMode)
+			if r, l := idx(f.calls, rootCall), idx(f.calls, lockCall); r < 0 || l < r {
+				t.Errorf("the lock was handed over before the data root was root:wheel %#o (root at %d, lock at %d)", StateRootMode, r, l)
+			}
+			if root := f.owners[DefaultDataRoot]; root.UID != 0 || root.GID != StateRootGID || root.Mode != StateRootMode {
+				t.Errorf("the data root is %+v, want root:wheel %#o", root, StateRootMode)
+			}
+		})
+	}
 }

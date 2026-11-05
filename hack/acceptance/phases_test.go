@@ -349,11 +349,10 @@ func runGate(t *testing.T, path, k3smLab string) int {
 // TestM11CoreGateDeclaresCoreMode is the core-mode gate: it pins, STATICALLY and hermetically,
 // the three properties that make the M11-core row honest evidence.
 //
-// Why it must exist as its own test. Today M11-core and M11-lab are both
-// manual+skeleton, so TestLabSkeletonHonesty executes hack/lab/m11.sh — but it
-// deduplicates by gate PATH, so it exercises only the bare (full-ledger) invocation and
-// never --core; and the moment the real script lands, the skeleton flag drops and that
-// test stops covering the file at all. The honesty the flag carries has to survive that
+// Why it must exist as its own test. TestLabSkeletonHonesty executes only the
+// manual+skeleton rows, so once M11-core and M11-lab stopped being skeletons it stopped
+// covering hack/lab/m11.sh at all, and it deduplicates by gate PATH, so it never
+// exercised --core. The honesty the flag carries has to survive that
 // transition, so it is re-expressed here as assertions on the manifest and on the
 // script's own text, neither of which depends on the row still being a skeleton.
 //

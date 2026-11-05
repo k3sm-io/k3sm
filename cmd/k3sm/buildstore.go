@@ -262,10 +262,11 @@ func (e *cacheWarmError) Unwrap() error { return e.err }
 // cache with it. It is the one recording path: build, load and import all
 // reach it. A warm that fails after the upload is a *cacheWarmError.
 //
-// The upload goes to this server's registry on loopback, which is the same
-// registry the flat registry-k3sm:6450 name serves: this Mac does not resolve
-// that name, and does not need to. The warm pull names the flat reference,
-// which the runtime maps to the same registry.
+// The upload goes through the push gate registryPushTarget finds: this server's
+// loopback gate on a server, or the server's cluster address from a worker. Both
+// reach the same registry the flat registry-k3sm:6450 name serves: this Mac does
+// not resolve that name, and does not need to. The warm pull names the flat
+// reference, which the runtime maps to the same registry.
 func recordInto(ctx context.Context, ref name.Tag, b built, workDir string, push imagePusher, warm cacheWarmer) error {
 	target, dest, err := registryPushTarget(ctx, ref, workDir)
 	if err != nil {

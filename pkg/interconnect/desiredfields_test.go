@@ -35,7 +35,7 @@ import (
 	netv1alpha1 "k3sm.io/apis/net/v1alpha1"
 )
 
-// TestResolverDesiredCarriesNamespacesAndModelUIDs covers the two desired
+// TestResolverDesiredCarriesNamespacesAndModels covers the two desired
 // fields the node's pod attach reads instead of the Interconnect and MLXModel:
 // both are filled, a change in either rewrites the value, and a
 // failed MLXModel read writes nothing new and clears nothing.

@@ -348,7 +348,8 @@ func (r *Reconciler) resourceFor(obj *unstructured.Unstructured) (dynamic.Resour
 	return r.dyn.Resource(mapping.Resource), nil
 }
 
-// logSkip records, once per Converge, why a gated add-on was not applied.
+// logSkip records why a gated add-on was not applied: once per Converge, and from
+// Regate whenever the reason changes.
 func (r *Reconciler) logSkip(ctx context.Context, file, reason string, deleted, foreign int) {
 	r.log().InfoContext(ctx, "embedded add-on not applied",
 		"file", file, "reason", reason, "withdrawn", deleted, "leftNotAppliedByK3sm", foreign)

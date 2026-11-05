@@ -10,16 +10,311 @@ pin, its date, and the tarball's sha256.
 
 ## Unreleased
 
+### Added
+
+- `k3sm status -o json` carries this node's budget as an optional `budget` object (pressure level,
+  admission, each signal against its rungs, and the headroom recommendation), in the schema of
+  `NodeBudget.status`. `schemaVersion` stays `1`. [Status JSON](docs/user/status-json.md#budget)
+  describes it.
+- `k3sm install --developer-mode on` installs a build from source, ad-hoc signed, over any
+  install: the signature of the k3sm that runs as root is no longer compared with the installed
+  one, and a development build of k3sm.app opens beside it. `--developer-mode off` turns it off,
+  and so does installing a signed release. A plain `k3sm install` turns it off when the `k3sm`
+  doing the install carries a Developer ID signature, from any team. A k3sm.app update turns it
+  off only when every program in it is signed by one Developer ID team, the installed build's
+  team if it has one. Uninstall removes it. `k3sm status` shows a
+  `developer-mode` row while it is on. [Developer mode](docs/user/install.md#developer-mode)
+  describes what is no longer checked.
+- A plain `k3sm install` turns developer mode off when its `k3sm` carries a Developer ID signature of
+  any team; the other programs it installs are not checked, and the log line names the team that signed that `k3sm`, which is not a check against the release team. A k3sm.app update's log line names the team every staged program shares. The signature is read from the program's path, and an ad-hoc signed `k3sm` leaves developer mode on.
+- A node holds a `PreventSystemSleep` power assertion while it runs, so a Mac on AC power does not
+  idle-sleep under its pods, and releases it when the node leaves or stops. When the Mac sleeps
+  anyway (on battery, or a forced sleep), the node publishes a `Sleeping` condition and a
+  `SystemSleep` Event before it sleeps and a `SystemWake` Event with the sleep length when it wakes,
+  so a node that goes NotReady while asleep says why.
+- k3sm.app checks for a newer k3sm.app against a signed release index, and can move the cluster
+  to the k3sm release the app carries with `k3sm update apply --version <tag> --pin-sha256
+  <digest>`, the digest taken from the app's signed record. [Upgrade](docs/user/upgrade.md) describes
+  the app path beside the command-line one, and the new [Privacy](docs/user/privacy.md) page lists
+  what the check sends and what it still reveals.
+- Nodes report a `SoftPressure` condition: an early warning, graded on the node budget's ladder,
+  that goes True while any signal (available memory, the memory compressor, swap growth, free
+  space on the swap and data volumes, free process IDs) is at its warn rung or above. Its reason
+  names the worst signal and its message lists each one with its value and rung. It is advisory:
+  nothing taints the node or evicts a Pod on it. The node's pressure sampler now runs once a
+  second from the warn rung up, not only past the half-way marks.
+- A node under memory pressure refuses a new BestEffort Pod the way the kubelet does: the Pod
+  is Failed with reason `Evicted` and the message `Pod was rejected: The node had condition:
+  [MemoryPressure].`, and nothing runs for it. Critical Pods and Pods that tolerate
+  `node.kubernetes.io/memory-pressure` are still admitted. A Pod annotated
+  `budget.k3sm.io/band: batch` is also refused, with reason `NodeBudgetCritical`, while the
+  node budget is at its critical level or above.
+- The registry store k3sm is replacing zot with has an online garbage collector that runs
+  while pushes continue. A blob's age counts from the last mount, link or upload that named it,
+  recorded on disk so a restart keeps it, and a sweep re-reads the index and re-checks each
+  candidate under the repository lock before deleting. The first sweep over a store only
+  reports what it would reap, no sweep runs within one grace period of start, and a sweep that
+  would delete more than half of a repository's blobs stops. A first sweep that the brake
+  stops still records that it ran, so the next sweep deletes. It also removes upload sessions
+  and temporary blob links an interrupted write left behind. It is not yet scheduled.
+
+- The registry gains its own OCI distribution API server over the on-disk store, written to
+  replace the zot child in a later release: manifests, blobs, chunked and monolithic uploads,
+  cross-repository mounts that link only from the named source, tag and catalog paging, and
+  referrers. It requires an access policy, caps each upload's size and the free space it
+  may use, and cuts off request bodies that stall or trickle. It is not yet the server the
+  daemon runs.
+- The new registry server has its access policy: reads are anonymous; the local push credential
+  may push, tag and delete; the push gate's credential may push but never delete. It checks a
+  presented secret against the SHA-256 hash the server writes on every start into
+  `<work-dir>/registry-state/serve.json` (mode `0600`), so no htpasswd file and no bcrypt are
+  involved, and it answers `401` with a Basic challenge to an anonymous write or a credential that
+  does not check out, `403` to a credential without the permission, and `429` to a client address
+  that has used up its budget of failed attempts. `push-credential.json` is unchanged.
+- A blob HEAD on the k3sm registry server restarts the blob's garbage-collection grace, so a
+  client that skips an upload because the blob is already there no longer loses it to a sweep
+  before its manifest PUT.
+- A manifest HEAD by digest on the k3sm registry server restarts that manifest's
+  garbage-collection grace, so a client that skips pushing an index's child manifest because it
+  is already there no longer loses the untagged child to a sweep before its index PUT.
+
+- The control-plane node fills each MeshPeer's `status.lastHandshakeTime` from its own
+  WireGuard view, so `kubectl get meshpeer -o yaml` shows when the server last completed a
+  handshake with that peer.
+- Uninstall names a vm helper still running from a k3sm version the install no longer keeps. It
+  does not signal that helper, and the error gives its process ID and the command to stop it by
+  hand, `sudo kill -TERM -<pid>`, to run if `ps -o pid,command -g <pid>` shows only processes of the path the error names.
+
+### Changed
+
+- `k3sm image ls` and `k3sm image df` keep a cache of image descriptions by digest under
+  `~/Library/Caches/k3sm/registry`, so a repeat listing of a large registry reads each tag's
+  digest and describes only new content.
+- `k3sm image prune` reads the cluster registry through the registry's own store code, read-only,
+  and checks every manifest it reads against its digest; a repository whose manifests do not match
+  is left alone. Deletions still go through the registry's API with the node's push credential.
+- When `k3sm uninstall` or a full stop leaves a vm pod helper alone because the version directory
+  it runs from cannot be read, the message now says what to check: that the directory and each of its parents are owned by
+  root and not writable by group or others (an I/O error means the disk needs checking), and how
+  to stop the helper's process group by hand if it is still the helper.
+- The `mlx-serve` image's `mlx-lm` moves from 0.32.0 to 0.32.2. The next image tag carries it; no other package in the closure moves. Sharded ranks refuse chat requests whose images are not inline `data:` URLs, since mlx-lm 0.32.2 would otherwise fetch any `http(s)` image URL a client names.
+- The embedded runtime takes an exclusive lock on its root (`runtimed.lock`). A second runtime
+  started on a root already in use waits up to 15 seconds for the lock and is then refused,
+  instead of running beside the first.
+- The built-in registry answers a manifest GET or HEAD with an invalid tag as 404
+  `MANIFEST_UNKNOWN` (it was 400 `MANIFEST_INVALID`), as the OCI conformance suite expects. PUT
+  and DELETE still answer 400, and an anonymous request is answered 401 before the reference
+  is parsed.
+
+### Fixed
+
+- A component that crashes during start-up on a busy host is now reported with its exit status
+  instead of as a health timeout.
+- A server or agent installed from a build of main exited at every start with `open runtime root
+  lock /var/lib/k3sm/runtimed.lock: permission denied`: the embedded runtime now creates a lock
+  file in the data root, which belongs to root. `k3sm install` now creates that one file for the
+  service user, mode 0600, and repairs one left owned by root; the data root keeps its mode.
+- The server and agent no longer warn about the mesh key on every start under the service user.
+- The k3sm registry server answers a manifest whose stored bytes no longer match its digest or
+  size with a 500 that sends nothing of the manifest, logged at Error with the digest, instead of
+  a 400 `DIGEST_INVALID` that blamed the client. A blob mount from a corrupt source answers the
+  same way.
+- An install that turns developer mode off but can neither remove the developer-mode marker
+  nor hand it to nobody now rolls the install root back to the previous tree, which the marker
+  still matches, restarts the daemons on that tree and names the likely blocker, an immutable
+  flag (`sudo chflags nouchg`). If that rollback fails, the error says developer mode is still on
+  beside the new tree. A first install with such a marker stops before any daemon is started and
+  moves its new tree out of `/Library/k3sm` when it can; when it cannot, the error says the tree
+  is still there and how to remove it.
+- An emergency eviction no longer waits 250 ms for each pod it kills when the budget history
+  writer is not running (before it starts, after it stops, or once it has exited): the kill
+  intent is written at once. A symlink or a FIFO at the budget history path in the node's work
+  dir is refused as unreadable and moved aside, never read through or waited on.
+- A k3sm.app update that finds the installed `k3sm` link broken (pointing at a version
+  directory that is gone, or out of `/Library/k3sm`) is still refused, and the refusal now says
+  how to repair the install: re-run the install script, `curl -fsSL https://k3sm.io/install.sh | sh`,
+  then update again.
+- `k3sm install --from-staging` evaluates an existing flat installed `k3sm` once and reads it
+  through that path, so an install directory that is itself a symlink is not followed again by
+  each check, and a binary that does not sit in that directory once evaluated is refused. A
+  missing entry point is still taken as no install, as is one under a dangling directory link.
+- The developer-mode marker counts only when `/` and `/Library` are real directories owned by
+  root that neither group nor others can write and that carry no ACL, the same checks k3sm.app
+  applies, so the installer and the app agree on whether developer mode is on. An install
+  that turns developer mode off removes the marker only once the new install root is in
+  place, so a failed install leaves developer mode as it was.
+- Two creates of one Pod that raced while memory pressure changed between them could run the
+  Pod while the API server reported it Failed and rejected. The admission decision and its
+  result are now recorded together, so the node and the API server always agree. A create
+  that finds the Pod refused or evicted while it ran now stops instead of starting it, and a
+  node whose memory monitor is not set up admits every Pod instead of crashing the create.
+- A create that stopped because the Pod was refused at admission while it ran no longer keeps
+  the Pod's address, its loopback alias, its interconnect slot or its Secret and ConfigMap
+  references until the node restarts. A repeat create of a running Pod now also keeps a
+  refusal from landing while it is in flight, as a first create does.
+- A k3sm version directory a running pod uses is kept even when the pod's path spells the
+  version's pre-release in a different case from the directory (`0.3.0-RC1` against
+  `0.3.0-rc1` on a case-insensitive volume). A pod path whose version has no directory is
+  reported as unresolved, so nothing is pruned on its account.
+- The local registry writes its push credential and htpasswd file the way it writes its serve
+  config: through a fresh 0600 temp file that is never a leftover or a symlink, synced and
+  renamed into a registry directory narrowed to 0700. A symlinked registry directory, or one
+  another user owns, is refused.
+- `k3sm uninstall` stops a vm pod helper still running from an older k3sm version whose
+  directory is kept for it, as it stops every other helper, instead of reporting it as a
+  leftover to kill by hand. Only a helper whose version directory is gone is still reported.
+- `k3sm uninstall` no longer reports a vm pod helper as running from a version the install no
+  longer keeps when its version directory exists but cannot be read (a permission or I/O error).
+  It does not signal that helper either; the error names the path that could not be resolved.
+- The registry's garbage collector reads, verifies and parses manifests before it takes a
+  repository's lock, so a sweep no longer holds pushes to that repository for a time that grows
+  with its manifest count. Under the lock it re-checks the index and the manifests it read, and
+  plans again when either changed. One repository it cannot read no longer keeps the first,
+  report-only sweep from completing for the whole store, while a failure that may pass (an I/O
+  error, a repository removed mid-sweep) leaves the next sweep report-only, and so does a first
+  sweep over an empty store. The record of that first sweep now names a random store id the
+  registry keeps in its root, so a store restored from a backup taken before the id existed,
+  even into the same directory, reports only again before it deletes.
+- A first push to the k3sm registry that was abandoned before its manifest no longer stops every
+  garbage-collection sweep of its repository. Once the repository has no tag and nothing in it
+  has been written for 24 grace periods, the half-repository brake no longer applies to it and
+  its blobs are reaped as unreferenced. The collector treats any manifest carrying a Docker
+  schema1 `fsLayers` field as unreadable, and the server now refuses such a manifest at push
+  with `MANIFEST_INVALID`, even at schemaVersion 2, so a client with push access cannot stop
+  garbage collection for a repository with one.
+- The k3sm registry server forgets a connection's failed-attempt budget when the connection
+  closes, so a client that later gets the same local port is no longer answered `429` on a
+  valid credential because another client used the budget up. The server now serves at most
+  256 connections at once and closes one past that before reading a request.
+- The registry's garbage collector stops a repository's sweep, deleting nothing, when a manifest
+  there is not an OCI or Docker v2 image manifest, index or manifest list (a Docker schema1
+  manifest, for example). It used to read such a manifest as referencing nothing and could reap
+  the blobs it still used.
+- The launchd `ExitTimeOut` of the server and agent daemons now counts the node's wait for the
+  eviction loop to stop, so a worker's shutdown budget no longer undercounts by 10 seconds.
+- An install from a k3sm.app staging directory resolves the installed `k3sm` once and reads its
+  signature and its version from that one file, so the two checks cannot judge different binaries
+  when the installed `k3sm` is a link into a version directory. A link that leads anywhere else
+  refuses the install, in developer mode too.
+- A HEAD on the new registry server bounds the write it makes to restart an object's
+  garbage-collection grace: it writes at most once per half-grace per object, never on a tagged
+  manifest, and takes the repository lock only for that write, so repeated HEADs no longer queue
+  behind pushes and sweeps. A touch that fails on a read-only or degraded store is logged once
+  and the HEAD still answers `200`; that object is not touched again for half the grace. The
+  server now requires the garbage collector's grace in its configuration.
+
+- `k3sm stop` and `k3sm uninstall` recognise a vm pod's `k3sm-vmhost` helper when it runs from
+  a versioned install directory or through a symlinked install path, not only from the flat
+  `/Library/k3sm/k3sm-vmhost`, so such a helper is still stopped instead of reported as unknown.
+- `k3sm image tag`, `untag`, `inspect` and `save` now refuse `--socket`, as `ls` and `df` do,
+  instead of silently ignoring a flag they never use.
+- An `MLXModel` with a pinned `revision` now starts on a fresh cache volume: the mlx-serve image
+  fetches that revision into the cache before the engine loads it, so the weights no longer have
+  to be staged by hand first. A branch or tag name in `revision` is refused at start.
+- The cluster registry's push gate accepts the `origin` parameter crane, ko and other
+  go-containerregistry clients add to a cross-repository blob mount, which it refused. The
+  parameter grants nothing and is dropped; the mount is authorized on both repositories as
+  before.
+- `k3sm image prune --force` re-plans each repository from its current state immediately before
+  every DELETE, so a manifest a push tagged since the plan is skipped, and so is an untagged
+  child or referrer of an index or manifest that a push tagged since the plan. Each skip is
+  listed under the kept manifests with its reason, and a planned manifest something else
+  already deleted is reported as gone, not as a deletion. A push that lands in the request
+  round-trip between that re-check and the DELETE is still not seen and can lose a tag or a
+  child; closing that window needs a delete the registry makes conditional on the manifest's
+  state.
+- `k3sm image prune --force` makes each DELETE conditional on the repository state its re-check
+  read, sent as `If-Match`. The k3sm registry server compares it under the lock the delete takes
+  and refuses the delete when a push changed the repository in between, so that push keeps its
+  tag, child or referrer; the manifest is listed under the kept manifests as "repository changed
+  at delete", not as a failure. zot, the server the daemon still runs, ignores `If-Match`, so
+  until the k3sm registry replaces it the window described above stays open. A repository
+  deleted since the plan is now reported as gone, no longer as unreadable; one whose directory
+  is still there but damaged stays unreadable. An `If-Match` that is empty or malformed is
+  refused with 412 and deletes nothing.
+- A rank of a sharded `MLXModel` serving under `spec.model` refuses to start when the engine's
+  `run` is not the body the name alias copies, rather than serving through a stale copy of it.
+  This needs an `mlx-serve` image that carries the updated sharded entrypoint.
+- **A pinned sharded `MLXModel` answers to its `spec.model` name too.** Sharded serving listed the snapshot path on `/v1/models`, and a request naming `spec.model` made every rank load the model again. Each rank now serves the model it loaded under `spec.model`, pinned or not. This needs `ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.3` or later, which carries the updated sharded entrypoint.
+- The registry's catalog answers 1,000 repositories per page when the request names no `n`, caps
+  `n` at 10,000, and stops reading the store once the page is full or, for a caller denied on
+  most repositories, once it has visited `max(4n, 1000)` of them, ending the page at a name the
+  caller can read, with a `Link` header to the next page. A walk that would visit more than 64
+  times that many, or more than 64,000 repositories, answers 503 with no `Link`, and a walk
+  stops when its client goes away. The referrers list comes from a per-repository view rebuilt
+  only when the repository's index changes, reading each manifest once (one whose blob was
+  missing or damaged is read again after the index changes) and at most 4,096 manifests or 64
+  MiB of manifest bytes per request. A repository within that is read by its first request; a
+  larger one is read over several requests the first time, each answering 429 with `Retry-After`
+  until the view is built. It is paged by digest with a `Link` header and takes at most 8
+  `artifactType` filters.
+
+## v0.2.3 — 2026-10-29
+
+### Added
+
+- `k3sm image ls -o ndjson` streams the list as it is read: a start line, progress lines, one
+  line per image as it is described, and an end line. The app's Images tab uses it to fill in
+  as the registry is read.
+
+### Changed
+
+- Images `k3sm build` produces store their layers gzip-compressed, so pulls to other nodes move
+  about a third of the bytes. A rebuild of unchanged content gets new layer digests once.
+- The bundled helm is v4.3.1. It waits for a chart's CRDs to be established before going on
+  when the hook-only wait strategy is used.
+
+### Fixed
+
+- Pulling or pushing a large image layer through the cluster registry over a slow link no
+  longer fails after 60 seconds. The registry now lets a transfer take as long as it needs.
+- An MLXModel whose serving container is crash-looping or cannot pull its image now reports `Crashing` or `ImagePullFailed`, naming the replica, the exit code and the error, instead of `Downloading`.
+- `k3sm image push` accepts an image `k3sm build` recorded in the cluster registry.
+- `k3sm image ls` reads a large registry faster. It read each repository's tag list in turn,
+  described four tags at a time and re-read manifests and configs that tags share; it now reads
+  the tag lists and up to 16 tags at once, reuses connections, and reads each shared manifest
+  and config once. On a registry with about 1,150 tags the listing went from about 62 to 37
+  seconds. The output is unchanged.
+- A `vm` pod booting on a loaded host is no longer failed at 30 seconds while the guest is still
+  starting: the wait follows the guest console's output, up to 120 seconds. A boot whose agent
+  never answers is retried once, and the failed boot's console is kept under the work-dir and
+  quoted in the pod's error.
+- A `vm` pod now reports its image ID, also after a daemon restart, so `k3sm image ls` and
+  `k3sm image prune` count the `vm` pods that use an image.
+- `k3sm uninstall --purge --user` refuses a home that is, or contains, the data root on a Mac
+  where the data root does not exist yet. It resolved the data root's symlinks only when the
+  whole path existed.
+- `k3sm image migrate --report` run without `sudo` on a server no longer reports a finished
+  migration as incomplete with zero images. It prints the summary `k3sm status` shows and says
+  the per-image report needs `sudo`; `-o json` asks for `sudo` instead of printing an empty journal.
+
+## v0.2.2 — 2026-10-28
+
+The first published v0.2 release. v0.2.0 and v0.2.1 were tagged but never published: Go
+announced the two advisories below while v0.2.0 was being signed, and release signing could
+not yet ship the control-plane version marker when v0.2.1 was. v0.2.2 is v0.2.0 with both
+fixes, so every change listed under v0.2.0 ships in it.
+
+### Security
+
+- The control-plane binaries and the bundled helm are built against golang.org/x/net v0.62.0,
+  which fixes GO-2026-6860 and GO-2026-6866 in the HTML parser and renderer.
+
 ## v0.2.0 — 2026-10-26
 
 ### Breaking
 
+- **Upgrade the server before the agents.** An agent on this release needs the datapath identity
+  certificate, which only a server on this release issues; an agent upgraded before its server logs
+  that and retries every half minute until the server is upgraded. Later releases roll workers first
+  again, as `k3sm update apply` does.
 - **`k3sm status -o json` is versioned.** The report carries `schemaVersion: 1`, and the keys under `version` are now lowerCamel. `k3sm doctor --json` carries the same field. See [status JSON](https://k3sm.io/docs/status-json/).
 - **HA servers move to a request-header CA for the aggregation layer.** The join bundle a server hands to another server changes shape, so upgrade the server installed with `--cluster-init` first and then each joined server, one at a time. Workers restart in any order. See [high availability](https://k3sm.io/docs/ha/).
 - **`admissionregistration.k8s.io/v1beta1` is no longer served.** The apiserver drops the flags that kept it on, so the whole group returns 404: MutatingAdmissionPolicy, ValidatingAdmissionPolicy and their bindings. kubectl scripts, GitOps manifests and Helm charts that pin `apiVersion: admissionregistration.k8s.io/v1beta1` must move to `v1`, which is served by default; k3sm's own DaemonSet toleration policy already uses `v1`, and stored objects need no migration. The minimum version for this upgrade is this release, the first that writes that policy as `v1`. Upgrade servers one at a time, waiting for each to be Ready with its etcd member healthy before the next, and the control-plane Mac last; when a release also asks for the server installed with `--cluster-init` first, that order wins. Workers restart in any order. Once any server runs this release, rolling a server back to a release before this one is not supported. After the roll, `kubectl get --raw /apis/admissionregistration.k8s.io/v1beta1` returns 404 on every server and `kubectl get mutatingadmissionpolicies` lists the DaemonSet toleration policy. A server rolled back below this release that cannot write the policy logs `provision daemonset-toleration mutating policy` with an error at start and leaves DaemonSet pods Unschedulable on that node; nothing else fails loudly.
 
 ### Added
 
+- **One image store.** The server's registry, `registry-k3sm:6450`, serves HTTPS with a cluster-CA certificate and is the cluster's single image store. `k3sm build`, `k3sm image load` and `import` record there, each node keeps a pull cache, and `k3sm image migrate` moves a node's existing images in once. A Pod can push with its ServiceAccount token from a namespace labelled `k3sm.io/registry-push` with its own name. See [the cluster registry](https://k3sm.io/docs/registry/) and [images](https://k3sm.io/docs/images/).
 - **`k3sm build cancel`, `rm`, `logs` and `prune`.** `cancel <id>` stops a running build: on the build engine it interrupts buildx, which cancels the job in BuildKit, and the build is recorded `cancelled`; a finished build is refused. `rm <id>` removes a finished build and its log from the history. `logs <id>` prints the build's stored output, which every build now keeps beside its record (capped at 16 MiB) as plain text with terminal control sequences removed, and `-f` follows it until the build finishes. In a terminal the engine's interactive progress view still draws: buildx runs on a pseudo-terminal of the terminal's size, resized with the window, and the log records each redraw. `prune` reclaims the engine's cache: a dry run by default, `--force` prunes and prints the bytes reclaimed, `--all` also removes BuildKit's internal, frontend and shared records. See [images](https://k3sm.io/docs/images/) and [building images](https://k3sm.io/docs/builder/).
 - **`cancel`, `rm`, `logs` and `prune` as the first argument of `k3sm build` are subcommands.** As with `ls`, a build names `--tag` before its context, so only the bare spelling changes meaning; `./logs` still builds a directory named `logs`.
 - **`k3sm status top`.** A live, top-like view of the cluster: each node's CPU and memory used against allocatable, with percentages, its pod count and the sample's age, then the pods sorted by CPU and then memory, with their node and restarts. `--sort cpu|memory`, `-n <namespace>` and `--limit N` (default 20) shape the pod table, `-o json` prints the same rows, and `--watch[=2s]` re-renders in place while reading the metrics API at most every 5 seconds. A node without a sample says `no metrics yet`; when the metrics API is unavailable, the first line gives the APIService's reason and message and the tables list nodes and pods without usage. See [troubleshooting](https://k3sm.io/docs/troubleshooting/).
@@ -71,6 +366,7 @@ pin, its date, and the tarball's sha256.
 
 ### Changed
 
+- **`MLXModel` KV sizing can follow the model's own geometry.** `pkg/mlx` reads a staged model snapshot's `config.json` (`num_hidden_layers`, `num_key_value_heads`, `head_dim`, with the usual fallbacks and a multimodal `text_config`) and sizes `--max-kv-size` from the fp16 cost per token, 2 x 2 bytes x layers x KV heads x head dimension, instead of the fixed 0.15 MiB measured on a 3B model. The rendered serving pod still uses the fixed figure, because its weights are downloaded inside the pod after the pin is set; a large model should raise `memory` or set `--max-kv-size` in `runtime.args`. See [MLX quickstart](https://k3sm.io/docs/mlx-quickstart/). Thanks to @robertcprice.
 - **The MLX fleet's staged Dynamo images move to 1.5.1.** The operator, frontend and planner entries are 1.5.1 while the chart stays at 1.5.0, because upstream publishes no 1.5.1 OCI chart. The 1.5.0 chart takes the image tags as values, and its CRDs and operator cluster role are identical to the 1.5.1 chart's.
 - **Larger hosts evict earlier when the swap volume runs short of space.** The swap trigger of `MemoryPressure` (swap in use and growing while the swap volume is short of free space) now uses a floor of a quarter of the Mac's memory, at least 8 GiB, instead of a flat 8 GiB. A Mac with 32 GiB of memory or less is unchanged; a 64 GiB Mac starts evicting at 16 GiB free on the swap volume and a 128 GiB Mac at 32 GiB. The condition's message and the eviction message now name `swapfs.available` and say disk space on the swap volume is the limiting resource, instead of reporting it as memory. When the swap volume is in a different APFS container from the data root, `DiskPressure` also goes True below that floor. See [limitations](https://k3sm.io/docs/limitations/).
 - **`--help` on a `k3sm status` view exits 0.** `k3sm status daemons --help`, `cluster --help`, `logs --help` and `top --help` print the usage to stdout and exit 0, as `k3sm status --help` already did; they used to exit 2. `--help` after an unknown view still exits 2.
@@ -84,6 +380,9 @@ pin, its date, and the tarball's sha256.
 
 ### Security
 
+- **`k3sm registry token` caps `--duration` at 24 hours.** The cluster sets no service-account
+  token maximum, so the command enforces the ceiling itself beside the 10 minute floor, and a
+  longer lifetime is refused before any token is requested.
 - **The release binaries are built with Go 1.27.3**, which distrusts the compromised intermediate certificates that earlier toolchains kept trusting in `crypto/x509` (GO-2026-6809).
 - **Each node's datapath runs as its own identity.** The Service proxy, the cluster DNS resolver and the NetworkPolicy watcher authenticate as `k3sm:netserve:<node>` in the `k3sm:netservers` group, which the `k3sm:netserve` ClusterRole lets get, list and watch Services, EndpointSlices, Namespaces, NetworkPolicies and Pods and nothing else, instead of as the node or, on the server, as the admin. It can read every Pod spec in the cluster, never a Secret or ConfigMap value, and has no write, log or exec access. An agent receives the certificate at join; one already joined fetches it from the server at start with its node certificate, and a running node renews it in place before it expires. As in k3s, an issued certificate is cut off only by rotating the cluster CA. See [multi-node](https://k3sm.io/docs/multi-node/).
 - **The kubelet API binds the node's own address only**, not every interface, so port 10250 is no longer reachable from the LAN. A joined agent under `--network none` holds no mesh address and now refuses to start.
@@ -95,6 +394,7 @@ pin, its date, and the tarball's sha256.
 
 ### Fixed
 
+- **A pinned `MLXModel` answers to its `spec.model` name.** With `spec.revision` set, the engine was started on the snapshot path inside the cache volume and listed that path as the only model, so the request the quickstart shows, naming `spec.model`, was refused as a model that does not exist. The engine is now told to serve the model under `spec.model`, pinned or not.
 - **A build of an untagged commit compares with the latest release.** `k3sm update check` and the `update` row of `k3sm status` called a node or binary built from an untagged commit (a Go pseudo-version such as `v0.1.8-0.20261025152241-96fbff948562`) `unknown`. It now ranks by the release it leads up to, `ahead` of v0.1.7 and `behind` v0.1.8, and is named an untagged build, for example `ahead, untagged build of 0.1.8`. A build from a modified tree and a development build stay `unknown`, and a managed update still moves only to a tagged release. See [upgrade](https://k3sm.io/docs/upgrade/).
 - **The `update` row is right after an in-place upgrade.** The row replayed the verdict the last check recorded, so until the next hourly check it described the binary and nodes from before the upgrade. It now takes only the latest release from the record and compares it with the binary and nodes running when you run `k3sm status`.
 - **`k3sm update check` without `sudo` says why it did not record its result.** It printed the path of a temporary file it could not create; it now says `writing the record needs root; run with sudo to record it`.
@@ -122,6 +422,9 @@ pin, its date, and the tarball's sha256.
 - **A re-attached `vm` Pod keeps its containers' `startedAt`.** After a node daemon restart the time no longer resets to the re-attach time.
 - **A LoadBalancer on a port below 1024 re-binds after `k3sm network lan off` and `on`.** A Service whose port is not in the listed ports failed with `address already in use` after the switch; the bind now goes through the root network helper. The macOS host-service ports 22, 53, 88, 445, 548 and 631 are reserved, so a LoadBalancer cannot take them.
 - **`k3sm build` with `RUN` steps or a Linux target, and `k3sm builder buildx`, work from an ordinary account on a root install.** The build engine's files and credentials belonged to root, so these commands failed for the user who ran them. They now run as that user.
+- **The MLX serving image keeps a rotating KV cache's attention sinks after a long prompt.** mlx-lm's `RotatingKVCache` keeps the first four tokens of a sequence as attention sinks, but once a chunked prefill had trimmed the cache its prefill mask hid them, so a model could lose facts inside its window while still answering normally. `ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.2` patches the mask to keep the sinks attended, as proposed upstream in [ml-explore/mlx-lm#1978](https://github.com/ml-explore/mlx-lm/pull/1978). In this image the cache with sinks is the one multimodal models use (thanks to @robertcprice).
+- **The MLX serving image refuses an over-length request on `/v1/messages` and `/v1/responses`.** The context-window check that answered HTTP 400 on `/v1/completions` and `/v1/chat/completions` now covers the Anthropic Messages and OpenAI Responses endpoints too, streaming or not, and a streaming request is refused before any event is sent. An omitted `max_tokens` runs as the rest of the window, as on the other endpoints (thanks to @robertcprice).
+- **The MLX serving image lowers `--max-kv-size` for a model whose KV cache costs more per token than k3sm sized it for.** k3sm sizes the cache from a fixed 157286 bytes per token measured on a 3B model, while a larger model costs 4 x layers x KV heads x head dimension (262144 for Qwen2.5-32B, 327680 for Llama-3.3-70B), so its serving pod could outgrow its memory and be killed. At start the image reads the model's `config.json` and scales `--max-kv-size` down to fit the memory it was sized for, never below 1024 tokens, logging the change; a config it cannot read leaves the value as given, and `K3SM_KV_GEOMETRY_CLAMP=off` turns it off (thanks to @robertcprice).
 
 ### Upgrade Notes
 

@@ -271,9 +271,13 @@ func (s *Service) startOnce(ctx context.Context) error {
 func (s *Service) provision() error {
 	// 0700: the directory holds the plaintext push credential and the bcrypt file
 	// beside the blob store, and no other user on this Mac has business in it.
-	if err := os.MkdirAll(StateDir(s.cfg.WorkDir), 0o700); err != nil {
-		return fmt.Errorf("create the registry state dir: %w", err)
+	// openStateDir refuses a symlinked or foreign directory and narrows a wider
+	// mode of this user's own, which a bare MkdirAll would leave as it found it.
+	d, err := openStateDir(StateDir(s.cfg.WorkDir))
+	if err != nil {
+		return err
 	}
+	_ = d.Close() // read-only directory handle; the checks are done, nothing to flush
 	addr := net.JoinHostPort(s.cfg.BindAddress, strconv.Itoa(s.cfg.Port))
 	cred, err := generateCredential(addr)
 	if err != nil {
@@ -289,6 +293,16 @@ func (s *Service) provision() error {
 	s.mu.Lock()
 	s.gateCred = gate
 	s.mu.Unlock()
+	// The k3sm registry server authenticates against the serve config, which
+	// carries the two principals' secret hashes; it is rewritten with the
+	// credentials on every attempt so the two never disagree.
+	serve, err := renderServeConfig(cred, gate)
+	if err != nil {
+		return err
+	}
+	if err := writeServeConfig(s.cfg.WorkDir, serve); err != nil {
+		return err
+	}
 	body, err := renderConfig(s.cfg.WorkDir, s.cfg.BindAddress, s.cfg.Port)
 	if err != nil {
 		return err

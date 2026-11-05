@@ -193,7 +193,7 @@ const loopbackAPIServerHost = "127.0.0.1"
 //
 // This is the ONE derivation of that chain — apiServerArgs renders --bind-address
 // from it too. That single-sourcing is the whole point of the helper. A second,
-// independent derivation is exactly the defect this closes (lab D1): the probe and
+// independent derivation is exactly the defect this closes: the probe and
 // the kubeconfigs hardcoded loopback while a --mesh-ip server bound its wireguard IP
 // only, so bring-up wedged at the healthz wait and every in-process client pointed at
 // an address nothing was listening on. Single-node boots — where the chain lands on
@@ -858,8 +858,8 @@ func copyFile(src, dst string, mode os.FileMode) error {
 // stage beside the daemon (the boot path otherwise acquires them with gh/go —
 // dev-shell tools a launchd daemon does not have): the kwok-ci/k8s prebuilt
 // binaries plus kine, etcd and etcdutl (the offline tool `k3sm snapshot restore` runs
-// on an etcd server), and the pinned helm the helm controller's Jobs run (see
-// helm.go). The single source for `k3sm payload`, `k3sm install`, and
+// on an etcd server), the pinned helm the helm controller's Jobs run (see
+// helm.go), and the ingest registry's zot (pkg/registrysvc). The single source for `k3sm payload`, `k3sm install`, and
 // the boot-time seed, so the three can never disagree on the set.
 func PayloadBinaries() []string {
 	return append(append([]string{}, cpBinaries...), kineBinaryName, etcdBinaryName, etcdutlBinaryName, helmchart.HelmBinaryName, registrysvc.ZotBinaryName)
@@ -943,8 +943,8 @@ func StageKine(ctx context.Context, destDir string) error {
 // with no payload at all).
 //
 // The VERSIONED binaries are the exceptions to "never overwrite an existing workdir
-// binary": kine, etcd (at DefaultEtcdVersion, under kine's rule), and the
-// control-plane set (kube-apiserver, kube-controller-manager,
+// binary": kine, etcd (at DefaultEtcdVersion, under kine's rule), helm (on the dev
+// path, under kine's rule), and the control-plane set (kube-apiserver, kube-controller-manager,
 // kube-scheduler, kubectl). Each carries a version marker, and presence alone cannot
 // tell this release's bytes from an earlier release's, so a binary-only upgrade that
 // moved a pin would otherwise keep running the old bytes forever — kine loudly (its
@@ -957,7 +957,9 @@ func StageKine(ctx context.Context, destDir string) error {
 // stamping the new pin onto bytes nothing verified — and a payload OLDER than the
 // control-plane set already staged is refused, as is any re-seed over a
 // present-but-malformed marker (see below). Every other file is
-// unversioned and is only ever filled in when absent. kineVersion and kubeVersion are
+// unversioned and is only ever filled in when absent (etcdutl and zot are never
+// seeded here: `k3sm snapshot restore` and the registry use them from the payload
+// directory itself). kineVersion and kubeVersion are
 // the targets the caller resolved (Config.KineVersion, Config.KubeVersion).
 //
 // withEtcd is the posture: etcd is seeded (and re-seeded under its marker) only in
@@ -1353,7 +1355,8 @@ func writeServiceAccountKeys(ctx context.Context, workDir string) error {
 
 // writeTokenFile writes the static bearer token CSV (token,user,uid,groups) the
 // apiserver loads via --token-auth-file, granting system:masters to the
-// in-process node, the provisioning client and the healthz probe.
+// post-bring-up admin client, the provisioning client and the healthz probe (the
+// in-process node authenticates as its own system:node identity).
 func writeTokenFile(workDir, token string) error {
 	line := fmt.Sprintf("%s,admin,admin-uid,\"system:masters\"\n", token)
 	if err := os.WriteFile(tokenFilePath(workDir), []byte(line), 0o600); err != nil {
@@ -1475,7 +1478,7 @@ func writeAPIServerKubeletClientCert(workDir string, h *certs.Hierarchy) error {
 // issued by the request-header CA through Hierarchy.IssueProxyClient (the only
 // issuance that CA makes). Re-minted every boot like every other component leaf. The
 // key is 0600: it is an impersonation credential at any backend that trusts the
-// request-header CA, protected exactly as the CA keys beside it are.
+// request-header CA, so it gets the same mode as the CA keys in the PKI dir.
 func writeProxyClientCert(workDir string, h *certs.Hierarchy) error {
 	certPEM, keyPEM, err := h.IssueProxyClient(ComponentCertValidity)
 	if err != nil {

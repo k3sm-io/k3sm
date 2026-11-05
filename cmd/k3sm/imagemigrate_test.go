@@ -181,7 +181,7 @@ func (r *migrationRig) registryDigest(t *testing.T, flat string) string {
 	return desc.Digest.String()
 }
 
-// TestStoreMigrationImportsEveryUserImageAndLosesNone is B911's gate: every
+// TestStoreMigrationImportsEveryUserImageAndLosesNone is the gate for the store migration: every
 // user image in the node store reaches the cluster registry at its digest; a
 // public cache entry is left a cache entry; a tag the registry holds at
 // another digest keeps the registry's image while the node's copy lands under
@@ -755,12 +755,12 @@ func TestImageMigrateRefusesUserRunOnAgent(t *testing.T) {
 				socket: runtimed.DefaultSocketPath, workDir: workDir, report: tc.report,
 			}, &out, dial)
 			if !tc.wantRefuse {
-				if err != nil && strings.Contains(err.Error(), "on a worker") {
+				if errors.Is(err, errMigrateNeedsSudo) {
 					t.Fatalf("refused: %v", err)
 				}
 				return
 			}
-			if err == nil || !strings.Contains(err.Error(), "sudo k3sm image migrate") {
+			if !errors.Is(err, errMigrateNeedsSudo) || !strings.Contains(err.Error(), "sudo k3sm image migrate") {
 				t.Fatalf("imageMigrateCommand = %v, want a refusal naming sudo k3sm image migrate", err)
 			}
 			if out.Len() != 0 {

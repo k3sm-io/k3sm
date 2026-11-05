@@ -1,0 +1,7 @@
+go test fuzz v1
+uint8(3)
+string("/v2/other/blobs/uploads/")
+string("mount=sha256:0000000000000000000000000000000000000000000000000000000000000000&from=app")
+string("")
+uint8(0)
+[]byte("")

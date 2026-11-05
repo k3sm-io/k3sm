@@ -64,11 +64,11 @@ want_test() {
 		ladder no "$id  $name passed"
 		return
 	fi
-	if printf '%s\n' "$out" | grep -qE 'no tests to run|no test files'; then
+	if grep -qE 'no tests to run|no test files' <<<"$out"; then
 		ladder no "$id  $name actually RAN (go test matched nothing — renamed or deleted?)"
 		return
 	fi
-	if ! printf '%s\n' "$out" | grep -qE "^--- PASS: ${name}\b"; then
+	if ! grep -qE "^--- PASS: ${name}\b" <<<"$out"; then
 		ladder no "$id  $name reported a PASS line"
 		return
 	fi
@@ -86,12 +86,12 @@ want_test "b122.1i" TestShippedScriptAgainstFixture
 
 # ---- b122.2 — the shipped script is green offline at HEAD -------------------
 if OUT="$(bash "$SCRIPT" 2>&1)"; then
-	if printf '%s\n' "$OUT" | grep -q '^ok  lockstep'; then
+	if grep -q '^ok  lockstep' <<<"$OUT"; then
 		ladder ok "b122.2a offline lockstep green at HEAD"
 	else
 		ladder no "b122.2a offline lockstep green at HEAD (no ok-lockstep line: $OUT)"
 	fi
-	if printf '%s\n' "$OUT" | grep -q 'live'; then
+	if grep -q 'live' <<<"$OUT"; then
 		ladder no "b122.2b default mode does NOT run the live check (found 'live' in the output)"
 	else
 		ladder ok "b122.2b default mode does NOT run the live check — --live is opt-in"
@@ -113,7 +113,7 @@ mutate_leg() {
 		ladder no "$id  $desc rejected (script exited 0 — the check is vacuous)"
 		return
 	fi
-	if [ -n "$needle" ] && ! printf '%s\n' "$out" | grep -q "$needle"; then
+	if [ -n "$needle" ] && ! grep -q "$needle" <<<"$out"; then
 		ladder no "$id  $desc rejected for the RIGHT reason (want /$needle/, got: $out)"
 		return
 	fi
@@ -184,7 +184,7 @@ LIST_RC=0
 LIST="$( (cd "$K3SM_ROOT" && "${GOENV[@]}" go list -deps ./pkg/images/) )" || LIST_RC=$?
 if [ "$LIST_RC" -ne 0 ]; then
 	ladder no "b122.4  pkg/images dependency closure enumerable — go list exited $LIST_RC (measured nothing)"
-elif ! printf '%s\n' "$LIST" | grep -qx 'github.com/google/go-containerregistry/pkg/v1/remote'; then
+elif ! grep -qx 'github.com/google/go-containerregistry/pkg/v1/remote' <<<"$LIST"; then
 	ladder no "b122.4  positive control — the closure must list the remote client (an empty listing must not read as clean)"
 else
 	ladder ok "b122.4  pkg/images non-test closure enumerated ($(printf '%s\n' "$LIST" | grep -c .) packages, remote client present)"

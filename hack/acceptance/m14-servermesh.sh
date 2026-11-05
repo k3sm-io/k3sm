@@ -9,7 +9,7 @@
 # worker had an AllowedIPs route to its /24, and the server's own Service proxy was
 # left with MeshEgressIP deliberately EMPTY — because the proxy bound that source
 # on EVERY dial, and a non-local value there broke all backend dials, including
-# same-node loopback. fixes both halves: the server enrolls itself at index 0
+# same-node loopback. This change fixes both halves: the server enrolls itself at index 0
 # (k3sm, this gate) and the source bind becomes destination-scoped (darwin-net).
 #
 # WHY THIS GATE EXISTS SEPARATELY FROM m3.sh: hack/acceptance/m3.sh boots
@@ -26,7 +26,7 @@
 #   the mesh-IP alias ensure, and — the legs that catch this repo's recurring
 #   defect class of a well-tested helper bring-up never calls — the structural
 #   ORDERING pins read out of cmd/k3sm/server.go. Plus the two-actor race test that
-#   pins the d4 happens-before, run under -race.
+#   pins the server-enroll-before-worker-join happens-before, run under -race.
 #   RED BEFORE: on the unmodified tree EnrollSelf, lowestFreeNodeIndex,
 #   loadOrCreateServerMeshKey and enrollSelfAndBringUpMesh do not exist, so the Go
 #   legs fail to build and every structural pin fails.
@@ -139,10 +139,10 @@ ladder "$k" "m14.1  the server persists a 0600 wireguard identity and self-enrol
 # proxy construction (mesh.Start plumbs the lo0 alias the proxy sources from) and
 # the join listener (the index-0 claim must be durable before a worker can be
 # assigned an index).
-crd_ln="$(grep -n 'ensureMeshPeerCRD(ctx, opts\.meshIP,' "$SERVER_GO" | head -1 | cut -d: -f1 || true)"
-enr_ln="$(grep -n 'enrollSelfAndBringUpMesh(ctx, enroller' "$SERVER_GO" | head -1 | cut -d: -f1 || true)"
-net_ln="$(grep -n 'netserve\.New(netserve\.Config{' "$SERVER_GO" | head -1 | cut -d: -f1 || true)"
-sup_ln="$(grep -n 'startBootstrapServer(ctx, deps' "$SERVER_GO" | head -1 | cut -d: -f1 || true)"
+crd_ln="$(grep -n 'ensureMeshPeerCRD(ctx, opts\.meshIP,' "$SERVER_GO" | sed -n 1p | cut -d: -f1 || true)"
+enr_ln="$(grep -n 'enrollSelfAndBringUpMesh(ctx, enroller' "$SERVER_GO" | sed -n 1p | cut -d: -f1 || true)"
+net_ln="$(grep -n 'netserve\.New(netserve\.Config{' "$SERVER_GO" | sed -n 1p | cut -d: -f1 || true)"
+sup_ln="$(grep -n 'startBootstrapServer(ctx, deps' "$SERVER_GO" | sed -n 1p | cut -d: -f1 || true)"
 if [ -n "$crd_ln" ] && [ -n "$enr_ln" ] && [ -n "$net_ln" ] && [ -n "$sup_ln" ] &&
 	[ "$crd_ln" -lt "$enr_ln" ] && [ "$enr_ln" -lt "$net_ln" ] && [ "$net_ln" -lt "$sup_ln" ]; then
 	ladder ok "m14.1  ensureMeshPeerCRD(:$crd_ln) < enrollSelfAndBringUpMesh(:$enr_ln) < netserve.New(:$net_ln) < startBootstrapServer(:$sup_ln)"
@@ -161,15 +161,15 @@ ladder "$r" "m14.1  the join supervisor derives its listen address (wildcard wit
 
 a=ok
 grep -qE 'func ensureMeshIPAlias\(' "$K3SM_ROOT/cmd/k3sm/meshalias.go" 2>/dev/null || a=no
-ali_ln="$(grep -n 'ensureMeshIPAlias(ctx, opts\.meshIP,' "$SERVER_GO" | head -1 | cut -d: -f1 || true)"
-sup_start_ln="$(grep -n 'exec\.Start(ctx)' "$SERVER_GO" | head -1 | cut -d: -f1 || true)"
+ali_ln="$(grep -n 'ensureMeshIPAlias(ctx, opts\.meshIP,' "$SERVER_GO" | sed -n 1p | cut -d: -f1 || true)"
+sup_start_ln="$(grep -n 'exec\.Start(ctx)' "$SERVER_GO" | sed -n 1p | cut -d: -f1 || true)"
 if [ "$a" = ok ] && [ -n "$ali_ln" ] && [ -n "$sup_start_ln" ] && [ "$ali_ln" -lt "$sup_start_ln" ]; then
 	ladder ok "m14.1  ensureMeshIPAlias(:$ali_ln) < exec.Start(:$sup_start_ln) — the mesh IP is a host address before the apiserver binds it"
 else
 	ladder no "m14.1  ensureMeshIPAlias(:${ali_ln:-none}) < exec.Start(:${sup_start_ln:-none}) — the apiserver would bind a --mesh-ip nothing has plumbed"
 fi
 
-# d8 — the doc deliverable, and the retirement of the claim it replaces.
+# The doc deliverable, and the retirement of the claim it replaces.
 d=ok
 grep -q 'destination-scoped' "$DESIGN_MD" || d=no
 grep -q 'The server is a peer, not only a broker' "$DESIGN_MD" || d=no
@@ -195,11 +195,11 @@ run_test() {
 		ladder no "$id  $name ($pkg) passed"
 		return
 	fi
-	if printf '%s\n' "$out" | grep -qE 'no tests to run|no test files'; then
+	if grep -qE 'no tests to run|no test files' <<<"$out"; then
 		ladder no "$id  $name ($pkg) actually RAN — go test reported no tests to run (renamed test?)"
 		return
 	fi
-	if ! printf '%s\n' "$out" | grep -qE "^[[:space:]]*--- PASS: ${name}( |\$)"; then
+	if ! grep -qE "^[[:space:]]*--- PASS: ${name}( |\$)" <<<"$out"; then
 		ladder no "$id  $name ($pkg) actually RAN — no top-level --- PASS line"
 		return
 	fi
@@ -211,7 +211,7 @@ run_test() {
 	fi
 }
 
-# ---- m14.2 — the index-0 pin and the allocator (d3) -------------------------
+# ---- m14.2 — the index-0 pin and the allocator -------------------------
 run_test "m14.2" 9 TestNodeIndexOf                                  ./cmd/k3sm/
 run_test "m14.2" 10 TestLowestFreeNodeIndex                         ./cmd/k3sm/
 run_test "m14.2" 0 TestLowestFreeNodeIndexExhaustsClosed            ./cmd/k3sm/
@@ -220,21 +220,21 @@ run_test "m14.2" 0 TestEnrollSelfPinsIndexZero                      ./cmd/k3sm/
 run_test "m14.2" 0 TestEnrollSelfFailsClosedOnAForeignIndexZeroClaim ./cmd/k3sm/
 run_test "m14.2" 0 TestEnrollSelfRequiresTheWriteToReadBack         ./cmd/k3sm/
 
-# ---- m14.3 — the d4 happens-before, under -race ----------------------------
+# ---- m14.3 — the server-enroll happens-before, under -race ----------------------------
 # The two-actor race: the server's own enroll against a burst of simulated worker
 # joins through ONE enroller. -race is not decoration here — the property being
 # proven is that two entry points sharing an allocator never hand out one /24, and
 # an unsynchronized read is exactly how that would regress.
 run_test "m14.3" 0 TestSelfEnrollRacesConcurrentJoinsWithoutSharingAnIndex ./cmd/k3sm/ -race
 
-# ---- m14.4 — the persistent identity + the bring-up contract (d2/d6) -------
+# ---- m14.4 — the persistent identity + the bring-up contract -------
 run_test "m14.4" 0 TestServerMeshKeyIsMintedOnceAndReused           ./cmd/k3sm/
 run_test "m14.4" 3 TestServerMeshKeyRefusesAnUnusableFile           ./cmd/k3sm/
 run_test "m14.4" 0 TestServerMeshKeyRefIsNotTheAgentRef             ./cmd/k3sm/
 run_test "m14.4" 0 TestServerMeshEndpointPrefersAnUnderlayAddress   ./cmd/k3sm/
 run_test "m14.4" 0 TestBringUpMeshRefusesAMeshIPTheCIDRDoesNotDerive ./cmd/k3sm/
 
-# ---- m14.5 — the bring-up wiring, structurally (d4/d5/d7) ------------------
+# ---- m14.5 — the bring-up wiring, structurally ------------------
 run_test "m14.5" 0 TestRunServerEnrollsSelfBeforeTheDatapathAndJoinListener ./cmd/k3sm/
 run_test "m14.5" 0 TestRunServerSharesOneMeshEnroller               ./cmd/k3sm/
 run_test "m14.5" 0 TestServerMeshBringUpIsLogAndContinue            ./cmd/k3sm/
@@ -452,7 +452,7 @@ case "$got_endpoint" in
 esac
 
 # ---- m14.L2/L3 — the wireguard device artifacts ----------------------------
-if ifconfig lo0 | grep -qE "inet ${SELF_MESH_IP}( |$|/)"; then
+if grep -qE "inet ${SELF_MESH_IP}( |$|/)" <<<"$(ifconfig lo0)"; then
 	ladder ok "m14.L2  the mesh-egress lo0 alias $SELF_MESH_IP is plumbed (the source the proxy binds for foreign pod destinations)"
 else
 	ladder no "m14.L2  the mesh-egress lo0 alias $SELF_MESH_IP is plumbed"
@@ -461,12 +461,12 @@ fi
 # address rather than `ifconfig | grep utun` matters: a Mac with a VPN already has
 # utun interfaces, so a bare utun grep would pass without k3sm having created
 # anything, while only the mesh device carries $SELF_LINK_IP. No pf is involved.
-if ifconfig 2>/dev/null | awk '/^utun[0-9]+:/{u=1;next} /^[^ \t]/{u=0} u && /inet /' | grep -qF "inet ${SELF_LINK_IP} --> ${SELF_LINK_IP} "; then
+if grep -qF "inet ${SELF_LINK_IP} --> ${SELF_LINK_IP} " <<<"$(ifconfig 2>/dev/null | awk '/^utun[0-9]+:/{u=1;next} /^[^ \t]/{u=0} u && /inet /')"; then
 	ladder ok "m14.L2  a utun carries the mesh link address $SELF_LINK_IP (the mesh device is up)"
 else
 	ladder no "m14.L2  a utun carries the mesh link address $SELF_LINK_IP (the mesh device did not come up)"
 fi
-if lsof -nP -iUDP:51820 2>/dev/null | grep -q k3sm; then
+if grep -q k3sm <<<"$(lsof -nP -iUDP:51820 2>/dev/null)"; then
 	ladder ok "m14.L3  wireguard is listening on UDP :51820 — the port the index-0 MeshPeer's endpoint advertises"
 else
 	ladder no "m14.L3  wireguard is listening on UDP :51820"
@@ -481,7 +481,7 @@ fi
 #
 # RED BEFORE: the bind was net.JoinHostPort(meshIP, 9345), so the address below
 # reads "100.64.0.1:9345" instead of "*:9345" and the LAN handshake is refused.
-sup_bind="$(lsof -nP -iTCP:9345 -sTCP:LISTEN 2>/dev/null | awk 'NR>1 && $1 ~ /^k3sm/ {print $9}' | head -1)"
+sup_bind="$(lsof -nP -iTCP:9345 -sTCP:LISTEN 2>/dev/null | awk 'NR>1 && $1 ~ /^k3sm/ {print $9}' | sed -n 1p)"
 case "$sup_bind" in
 "*:9345")
 	ladder ok "m14.L3b the join supervisor is bound to the WILDCARD (*:9345), so a pre-mesh worker can reach it over the underlay" ;;
@@ -559,7 +559,7 @@ else
 fi
 RVIP="$(kc14 get svc m14-remote -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)"
 # Let the proxy's Service/EndpointSlice informers claim the VIP before dialing it.
-n=0; while [ $n -lt 60 ] && ! ifconfig lo0 | grep -qE "inet ${RVIP}( |$|/)"; do sleep 1; n=$((n+1)); done
+n=0; while [ $n -lt 60 ] && ! grep -qE "inet ${RVIP}( |$|/)" <<<"$(ifconfig lo0)"; do sleep 1; n=$((n+1)); done
 
 # Remote dials, in flight for the duration of the local round trips. They are
 # EXPECTED to fail (there is no second Mac behind that address); what matters is
@@ -590,7 +590,7 @@ fi
 # ---- m14.L5 — the -race verdict --------------------------------------------
 if grep -q 'WARNING: DATA RACE' "$M14_WORK/server.log" 2>/dev/null; then
 	ladder no "m14.L5  no DATA RACE in the -race server log — the dial-source state is being mutated across the proxy's per-connection goroutines"
-	grep -A 25 'WARNING: DATA RACE' "$M14_WORK/server.log" | head -60 >&2
+	grep -A 25 'WARNING: DATA RACE' "$M14_WORK/server.log" | sed -n 1,60p >&2
 else
 	ladder ok "m14.L5  the -race build reported no DATA RACE across the concurrent local/remote dials"
 fi

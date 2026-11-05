@@ -90,7 +90,7 @@ if grep -rqE 'DefaultKineVersionHA' "$REPO_ROOT/pkg" "$REPO_ROOT/cmd"; then
 	lint_ok=false
 fi
 
-KINE_PIN="$(sed -nE 's/^[[:space:]]*DefaultKineVersion[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "$EXEC_PKG/executor.go" | head -1)"
+KINE_PIN="$(sed -nE 's/^[[:space:]]*DefaultKineVersion[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "$EXEC_PKG/executor.go" | sed -n 1p)"
 if [ -z "$KINE_PIN" ]; then
 	echo "  could not read DefaultKineVersion out of pkg/executor/executor.go" >&2
 	lint_ok=false
@@ -188,7 +188,7 @@ build_kine() { # build_kine <version> <cgo 0|1> <gopath> -> prints the binary pa
 # verdict this gate must never get wrong.
 run_test() { # run_test <logfile> <go-test-args...>
 	local log="$1"; shift
-	( cd "$REPO_ROOT" && CGO_ENABLED=1 go test "$@" ) >"$log" 2>&1
+	( cd "$REPO_ROOT" && CGO_ENABLED=1 go test -count=1 "$@" ) >"$log" 2>&1
 }
 
 echo "==> building the superseded pin ($OLD_PIN, CGO_ENABLED=1) — the migration fixture"
@@ -280,16 +280,16 @@ fi
 # every shipped artifact. Read the BUILT binary's module list, not the source.
 mods="$(go version -m "$KINE_NEW" || true)"
 dep_ok=true
-if printf '%s' "$mods" | grep -q 'github.com/mattn/go-sqlite3'; then
+if grep -q 'github.com/mattn/go-sqlite3' <<<"$mods"; then
 	echo "  the shipped kine still links github.com/mattn/go-sqlite3" >&2
 	dep_ok=false
 fi
-if ! printf '%s' "$mods" | grep -q 'modernc.org/sqlite'; then
+if ! grep -q 'modernc.org/sqlite' <<<"$mods"; then
 	echo "  the shipped kine links no modernc.org/sqlite — it has NO SQLite backend" >&2
 	dep_ok=false
 fi
 # ...and it must be gone from k3sm's own module graph too.
-if (cd "$REPO_ROOT" && go list -deps ./... 2>/dev/null | grep -q 'github.com/mattn/go-sqlite3'); then
+if (cd "$REPO_ROOT" && grep -q 'github.com/mattn/go-sqlite3' <<<"$(go list -deps ./... 2>/dev/null)"); then
 	echo "  k3sm itself imports github.com/mattn/go-sqlite3" >&2
 	dep_ok=false
 fi

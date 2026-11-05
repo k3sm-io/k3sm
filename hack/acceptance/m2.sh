@@ -97,7 +97,7 @@ echo "==> k3sm M2 acceptance (user-space: sudo k3sm install once, then fidelity 
 _sha() { local d="$1" s; s="$(git -C "$d" rev-parse --short HEAD 2>/dev/null || echo '?')"; git -C "$d" diff --quiet 2>/dev/null || s="$s+dirty"; printf '%s' "$s"; }
 echo "==> RUN $(date '+%Y-%m-%dT%H:%M:%S%z')  code: k3sm@$(_sha "$REPO_ROOT") runtimed@$(_sha "$REPO_ROOT/../runtimed")"
 
-# Build the single binary CGO_ENABLED=1 (kine sqlite), runtime pinned to runtimed.
+# Build the single binary CGO_ENABLED=1 (runtimed's darwin probes), runtime pinned to runtimed.
 ( cd "$REPO_ROOT" && CGO_ENABLED=1 go build -o "$BIN" ./cmd/k3sm )
 codesign -s - -f "$BIN" >/dev/null 2>&1 || true
 # Build the k3sm-execshim Seatbelt helper BESIDE it — `k3sm install` stages the
@@ -127,7 +127,7 @@ codesign -s - -f "$DNSSHIM" >/dev/null 2>&1 || true
 VMHOST_ENTS="$REPO_ROOT/../runtimed/cmd/k3sm-vmhost/vmhost.entitlements"
 [ -f "$VMHOST_ENTS" ] || { echo "M2: vmhost entitlements plist missing at $VMHOST_ENTS" >&2; exit 1; }
 codesign -s - -f --entitlements "$VMHOST_ENTS" "$VMHOST" >/dev/null 2>&1
-codesign -d --entitlements - "$VMHOST" 2>/dev/null | grep -q "com.apple.security.virtualization" || {
+grep -q "com.apple.security.virtualization" <<<"$(codesign -d --entitlements - "$VMHOST" 2>/dev/null)" || {
 	echo "M2: k3sm-vmhost carries no virtualization entitlement after signing" >&2; exit 1; }
 
 # Stage the control-plane payload BESIDE it (cp-payload/: kube-apiserver etc. +
@@ -190,7 +190,7 @@ ladder "$([ "$kube_owner" = "$INVOKING_USER" ] && echo ok || echo no)" "m2.3  ad
 # netd denies those binds. Informational only (never gates); it pinpoints an empty /
 # missing Service set behind a DNS/API-VIP bind denial in server.log/netd.log.
 echo "==> [diagnostic] cluster Services (the netd authorizer's Service set):"
-"$INSTALL_DIR/k3sm" kubectl get svc -A -o wide 2>&1 | head -20 || true
+"$INSTALL_DIR/k3sm" kubectl get svc -A -o wide 2>&1 | sed -n 1,20p || true
 
 # [diagnostic] In-pod DNS path, reproduced from the shell so a red InPodDNS/InPodKubectl
 # pinpoints the broken LAYER without reading server.log. Three independent probes:
@@ -273,13 +273,13 @@ grep -E 'runtimed provider configured|pod box cluster-DNS wiring' /var/log/k3sm/
 echo "==> [diagnostic] reap leaked pods (:8080) + probe the API VIP path (10.43.0.1:443):"
 reap_test_pods
 echo "--- host :8080 holder after reap (want free — else a leak the reap missed):"
-lsof -nP -iTCP:8080 -sTCP:LISTEN 2>/dev/null | head -3 || true
+lsof -nP -iTCP:8080 -sTCP:LISTEN 2>/dev/null | sed -n 1,3p || true
 echo "--- default/kubernetes EndpointSlice (the API-VIP backend the proxy dials):"
-"$INSTALL_DIR/k3sm" kubectl get endpointslices -n default -l kubernetes.io/service-name=kubernetes -o wide 2>&1 | head -4 || true
+"$INSTALL_DIR/k3sm" kubectl get endpointslices -n default -l kubernetes.io/service-name=kubernetes -o wide 2>&1 | sed -n 1,4p || true
 echo "--- TLS to the apiserver backend 127.0.0.1:6444 (clean 'Verify'/subject = backend OK):"
-echo | openssl s_client -connect 127.0.0.1:6444 -servername kubernetes.default.svc 2>&1 | grep -E 'CONNECTED|Verify return|subject=|errno|no peer|closed' | head -4 || true
+echo | openssl s_client -connect 127.0.0.1:6444 -servername kubernetes.default.svc 2>&1 | grep -E 'CONNECTED|Verify return|subject=|errno|no peer|closed' | sed -n 1,4p || true
 echo "--- TLS to the API VIP 10.43.0.1:443 (the proxy path — EOF/reset HERE, not on 6444, isolates the proxy):"
-echo | openssl s_client -connect 10.43.0.1:443 -servername kubernetes.default.svc 2>&1 | grep -E 'CONNECTED|Verify return|subject=|errno|no peer|closed' | head -4 || true
+echo | openssl s_client -connect 10.43.0.1:443 -servername kubernetes.default.svc 2>&1 | grep -E 'CONNECTED|Verify return|subject=|errno|no peer|closed' | sed -n 1,4p || true
 
 # m2.A — the per-criterion M2 conformance suite (e2e/m2_test.go), each criterion
 # named per its reference-workload feature class. The NON-VACUOUS guard
@@ -387,7 +387,7 @@ fi
 #     A pid != pgid here is a FIXTURE bug (the workload is not the session leader),
 #     not a reaper bug — the leg fails loudly rather than silently testing nothing.
 if [ -z "$reap_why" ]; then
-	REAP_PID="$(pgrep -f "$REAP_ID" 2>/dev/null | head -1 || true)"
+	REAP_PID="$(pgrep -f "$REAP_ID" 2>/dev/null | sed -n 1p || true)"
 	if [ -z "$REAP_PID" ]; then
 		reap_why="could not resolve the fixture leader pid (pgrep -f $REAP_ID matched nothing)"
 	else
@@ -431,7 +431,7 @@ fi
 if [ -z "$reap_why" ]; then
 	reap_logged=no
 	for _ in $(seq 1 180); do
-		if tail -c "+$((REAP_OFFSET + 1))" "$SERVER_LOG" 2>/dev/null | grep -q 'reaping orphaned pod process group'; then
+		if grep -q 'reaping orphaned pod process group' <<<"$(tail -c "+$((REAP_OFFSET + 1))" "$SERVER_LOG" 2>/dev/null)"; then
 			reap_logged=yes; break
 		fi
 		sleep 1
@@ -460,7 +460,7 @@ ladder "$([ -z "$reap_why" ] && echo ok || echo no)" "m2.R  daemon startup pod r
 #     kill branch? A PRESENT line here means the leg's evidence is about the wrong
 #     branch even if it passed.
 echo "--- [diagnostic] m2.R keep-and-warn (the pod-survival gate's deferred leader-dead/grandchild-alive path):"
-if tail -c "+$((REAP_OFFSET + 1))" "$SERVER_LOG" 2>/dev/null | grep -q 'orphaned pod process group leaked'; then
+if grep -q 'orphaned pod process group leaked' <<<"$(tail -c "+$((REAP_OFFSET + 1))" "$SERVER_LOG" 2>/dev/null)"; then
 	echo "    PRESENT — a recorded group hit keep-and-warn; re-read the fixture before trusting m2.R"
 else
 	echo "    none (expected: the fixture's live leader takes the kill branch)"
@@ -496,7 +496,7 @@ for _ in $(seq 1 15); do
 	[ -e "$INSTALL_DIR" ] && ok=no
 	[ -S "$NETD_SOCK" ] && ok=no
 	# No 100.64.* (pod/node) or service-VIP aliases should remain on lo0 after teardown.
-	ifconfig lo0 2>/dev/null | grep -qE 'inet (100\.64\.|10\.43\.)' && ok=no
+	grep -qE 'inet (100\.64\.|10\.43\.)' <<<"$(ifconfig lo0 2>/dev/null)" && ok=no
 	[ "$ok" = yes ] && clean=yes && break
 	sleep 1
 done

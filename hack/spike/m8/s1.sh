@@ -68,7 +68,7 @@ lab <<'EOF'
 set -uo pipefail
 W=$PREFIX/work; POD=$W/pod; V=$PREFIX/venv/bin/python
 mkdir -p "$POD/tmp" "$PREFIX/sbpl" "$PREFIX/logs"
-MP=$(ls -d "$PREFIX"/hf/hub/models--*Qwen2.5-0.5B*/snapshots/* | head -1)
+MP=$(ls -d "$PREFIX"/hf/hub/models--*Qwen2.5-0.5B*/snapshots/* | sed -n 1p)
 
 # --- payloads -------------------------------------------------------------
 cat > "$W/gen.py" <<'PY'

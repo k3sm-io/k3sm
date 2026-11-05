@@ -150,7 +150,7 @@ credential the agent writes, so a token the server rejects fails the install wit
 of leaving a daemon that retries every 30 seconds behind a healthy process.
 
 **Onboarding several Macs at once:** mint a token per Mac. The server bounds how fast one token may
-join, because a join costs it real work (a node-password binding, two signatures, and a mesh address
+join, because a join costs it real work (a node-password binding, three signatures, and a mesh address
 carved out of the cluster's range), and a token that has spent its budget is answered with a wait
 rather than a refusal. An agent waits that out inside its own start, so two or three Macs sharing
 one token still come up; a longer batch runs the install out of patience and says so. Running

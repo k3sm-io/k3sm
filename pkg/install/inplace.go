@@ -222,8 +222,8 @@ func keepAdminTokenInPlace(sys System, cfg *Config, serviceUID uint32) (minted b
 // It exists because the stderr line the install prints for the rotation is
 // read by nobody under a managed roll: that install runs inside the root
 // helper, whose output goes to a root-owned log. The server daemon reads the
-// marker once its node is Ready, publishes the time on its Node for the update
-// controller, and removes it (see AdminTokenRotatedMarkerPath).
+// marker once its node is Ready, publishes its version and time on its Node
+// for the update controller, and removes it (see AdminTokenRotatedMarkerPath).
 const AdminTokenRotatedMarkerName = "admin-token-rotated-at"
 
 // AdminTokenRotatedMarkerPath is the rotation marker inside a control plane's
@@ -238,8 +238,9 @@ func AdminTokenRotatedMarkerPath(serverWorkDir string) string {
 // when this install minted over an installed token. An install that kept the
 // token leaves an existing marker in place: the rotation it reports has not
 // been published yet if the marker is still there, and only the node removes
-// it, once its Node carries the mark (the update controller ignores a mark
-// older than the node's handover). The marker is the service user's (the
+// it, once its Node carries the mark (the update controller counts a mark naming
+// the release the node was moved to, and falls back to the node's handover time
+// only for a mark naming another version). The marker is the service user's (the
 // daemon consumes it), 0600 like the token beside it, and written
 // temp-and-rename by the seam.
 func recordAdminTokenRotation(sys System, cfg Config, uid uint32, rotated bool) error {

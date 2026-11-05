@@ -79,7 +79,7 @@ func TestEngineArgsPinContextFromMemoryFormula(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Render(memory=%s) error = %v, want nil", mem, err)
 			}
-			s, err := DeriveSizing(m.Spec.Memory)
+			s, err := DeriveSizing(m.Spec.Memory, KVGeometry{})
 			if err != nil {
 				t.Fatalf("DeriveSizing(%s) error = %v, want nil", mem, err)
 			}
@@ -119,7 +119,7 @@ func TestEngineArgsPinContextFromMemoryFormula(t *testing.T) {
 		prev := int64(-1)
 		prevMem := ""
 		for _, mem := range mems {
-			s, err := DeriveSizing(resource.MustParse(mem))
+			s, err := DeriveSizing(resource.MustParse(mem), KVGeometry{})
 			if err != nil {
 				t.Fatalf("DeriveSizing(%s) error = %v, want nil", mem, err)
 			}
@@ -170,7 +170,7 @@ func TestEngineArgsPinContextFromMemoryFormula(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Render() error = %v, want nil", err)
 		}
-		s, err := DeriveSizing(m.Spec.Memory)
+		s, err := DeriveSizing(m.Spec.Memory, KVGeometry{})
 		if err != nil {
 			t.Fatalf("DeriveSizing() error = %v, want nil", err)
 		}
@@ -215,7 +215,7 @@ func TestEngineArgsPinContextFromMemoryFormula(t *testing.T) {
 		// render. Returning a tiny context instead would produce a pod that
 		// starts, serves truncated conversations, and looks like an engine bug.
 		for _, mem := range []string{"1Gi", "512Mi", "600Mi"} {
-			if _, err := DeriveSizing(resource.MustParse(mem)); !errors.Is(err, ErrMemoryTooSmall) {
+			if _, err := DeriveSizing(resource.MustParse(mem), KVGeometry{}); !errors.Is(err, ErrMemoryTooSmall) {
 				t.Errorf("DeriveSizing(%s) error = %v, want ErrMemoryTooSmall", mem, err)
 			}
 			m := newModel()
@@ -228,7 +228,7 @@ func TestEngineArgsPinContextFromMemoryFormula(t *testing.T) {
 				t.Errorf("Render(memory=%s) returned objects alongside an error; a half-rendered model looks like progress", mem)
 			}
 		}
-		if _, err := DeriveSizing(resource.MustParse("0")); !errors.Is(err, ErrNoMemory) {
+		if _, err := DeriveSizing(resource.MustParse("0"), KVGeometry{}); !errors.Is(err, ErrNoMemory) {
 			t.Errorf("DeriveSizing(0) error = %v, want ErrNoMemory — an unstated memory is a different operator mistake than an under-stated one", err)
 		}
 		if !errors.Is(fmt.Errorf("wrapped: %w", ErrMemoryTooSmall), ErrMemoryTooSmall) || errors.Is(ErrMemoryTooSmall, ErrNoMemory) {
@@ -242,7 +242,7 @@ func TestEngineArgsPinContextFromMemoryFormula(t *testing.T) {
 		// inside spec.memory. If this fails the pins are decoration.
 		for _, mem := range sizingCases {
 			q := resource.MustParse(mem)
-			s, err := DeriveSizing(q)
+			s, err := DeriveSizing(q, KVGeometry{})
 			if err != nil {
 				t.Fatalf("DeriveSizing(%s) error = %v, want nil", mem, err)
 			}

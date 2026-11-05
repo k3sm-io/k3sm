@@ -57,9 +57,9 @@ const (
 // When the flat registry Service is published, host and hostFromClusterNetwork
 // both name it, registry-k3sm:6450: the one name an image is pushed and pulled
 // by from inside the cluster, by a native Pod and a Linux vm guest alike.
-// hostFromContainerRuntime stays the loopback address the node runtime pulls
-// the server's registry from today; the runtime's mapping of the flat name to
-// this registry replaces it.
+// hostFromContainerRuntime is the loopback address the server's own runtime
+// pulls from; every other node's runtime maps the flat name to the server's
+// relay instead, so the flat name is the one an image reference carries.
 //
 // When there is no such Service (a single Mac with no mesh address and no vm
 // network has no relay, so nothing off loopback answers), host is the loopback

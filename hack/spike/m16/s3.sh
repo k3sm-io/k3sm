@@ -390,7 +390,7 @@ async def run():
 sys.exit(asyncio.run(run()))
 PY
 
-MP=$(ls -d "$PREFIX"/hf/hub/models--*/snapshots/* 2>/dev/null | head -1)
+MP=$(ls -d "$PREFIX"/hf/hub/models--*/snapshots/* 2>/dev/null | sed -n 1p)
 [ -n "$MP" ] || { verdict FAIL "s3.0 setup  no model snapshot under $PREFIX/hf — run s0.sh first"; exit 0; }
 # The scoreboard reads the drive's VERDICT lines. The drive exits 0 whenever it finished,
 # whatever those lines say, so a finished drive never earns a second FAIL from the driver;
@@ -423,7 +423,7 @@ fi
 # would pull an unpinned dependency tree into the control venv.
 SERVER="$PREFIX/venv-metal/bin/vllm-metal"
 [ -x "$SERVER" ] || { recorded "s3.5 control  the alternative engine installed without its vllm-metal console script — recorded, not gating"; exit 0; }
-MP=$(ls -d "$PREFIX"/hf/hub/models--*/snapshots/* 2>/dev/null | head -1)
+MP=$(ls -d "$PREFIX"/hf/hub/models--*/snapshots/* 2>/dev/null | sed -n 1p)
 nohup "$SERVER" --model "$MP" --host 127.0.0.1 --port 8103 > "$W/metal.log" 2>&1 &
 PID=$!
 # the control never outlives the payload, interrupted or not; a server that already

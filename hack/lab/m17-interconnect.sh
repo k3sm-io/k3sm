@@ -7,8 +7,9 @@
 # home of the ladder; hack/lab/m17.sh execs it.
 #
 # Row in hack/acceptance/phases.json:
-#   M17-lab  gate hack/lab/m17.sh, tier lab, requires two-macs + thunderbolt-cable,
-#            manual: true, skeleton: false
+#   M17-lab  gate hack/lab/m17-interconnect.sh, tier lab, requires two-macs +
+#            thunderbolt-cable, manual: true, skeleton: false (hack/lab/m17.sh is a
+#            shim that execs this file)
 #
 # Usage:
 #   hack/lab/m17-interconnect.sh --plan                 # the rung table; no host
@@ -241,7 +242,7 @@ scrape_metrics() {
 	done
 	cat "$RUNG_DIR"/metrics-"$1"-*.txt >"$RUNG_DIR/metrics-$1.txt" 2>/dev/null
 }
-alias_present() { on "$1" "ifconfig bridge0" | awk '$1=="inet"{print $2, $4}' | grep -qx "$2 ${3:-0xffffff00}"; }
+alias_present() { grep -qx "$2 ${3:-0xffffff00}" <<<"$(on "$1" "ifconfig bridge0" | awk '$1=="inet"{print $2, $4}')"; }
 halves_empty_on() {
 	on "$1" "ifconfig bridge0" >"$RUNG_DIR/.he-$1.txt" 2>&1
 	icp_halves_empty "$RUNG_DIR/.he-$1.txt"
@@ -550,7 +551,7 @@ spec:
   $dist
 EOF
 }
-model_ready() { kc get mlxmodel -n "$NS" "$1" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null | grep -qx True; }
+model_ready() { grep -qx True <<<"$(kc get mlxmodel -n "$NS" "$1" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)"; }
 # ring_on <path> — ic-ring is Ready with both rank pods on that path.
 ring_on() { model_ready ic-ring && [ "$(rank_pods ic-ring | awk -v p="$1" '$4==p' | wc -l | tr -d ' ')" = 2 ]; }
 model_cond() { kc get mlxmodel -n "$NS" "$1" -o jsonpath="{.status.conditions[?(@.type==\"$2\")].$3}" 2>/dev/null; }
@@ -558,7 +559,7 @@ rank_pods() { kc get pods -n "$NS" -o json 2>/dev/null | python3 -I -c "import j
 for p in json.load(sys.stdin)['items']:
     if any(o.get('kind')=='MLXModel' and o.get('name')=='$1' for o in p['metadata'].get('ownerReferences') or []):
         print(p['metadata']['name'], p['metadata']['uid'], p['spec'].get('nodeName',''), (p['metadata'].get('annotations') or {}).get('k3sm.io/mlx-interconnect',''))"; }
-image_pull_failed() { kc get pods -n "$NS" -o jsonpath='{range .items[*]}{.status.containerStatuses[*].state.waiting.reason}{"\n"}{end}' 2>/dev/null | grep -Eq 'ErrImagePull|ImagePullBackOff'; }
+image_pull_failed() { grep -Eq 'ErrImagePull|ImagePullBackOff' <<<"$(kc get pods -n "$NS" -o jsonpath='{range .items[*]}{.status.containerStatuses[*].state.waiting.reason}{"\n"}{end}' 2>/dev/null)"; }
 # tokens_per_s <model> <file> — one completion against the endpoint; prints
 # "<tokens/s> <request+response bytes>" or nothing.
 tokens_per_s() {
@@ -1003,7 +1004,7 @@ chmod 0755 "$BIN"
 "$BIN" install $ARGS
 rc=$?
 echo "INSTALL-EXIT=$rc"
-/usr/local/bin/k3sm version 2>&1 | head -3
+/usr/local/bin/k3sm version 2>&1 | sed -n 1,3p
 exit "$rc"
 EOF
 	local rc=$?
@@ -1076,7 +1077,7 @@ st() { # st <name> <want 0|1> <command...>
 	if { [ "$want" = 0 ] && [ "$rc" = 0 ]; } || { [ "$want" = 1 ] && [ "$rc" != 0 ]; }; then
 		echo "ok    $name"
 	else
-		echo "MISS  $name (exit $rc, want $([ "$want" = 0 ] && echo 0 || echo non-zero)): $(printf '%s' "$out" | head -c 300)"
+		echo "MISS  $name (exit $rc, want $([ "$want" = 0 ] && echo 0 || echo non-zero)): $(printf '%s' "${out:0:300}")"
 		ST_MISS=$((ST_MISS + 1))
 	fi
 }
@@ -1084,8 +1085,8 @@ st_out() { # st_out <name> <text> <command...> — the output names the text
 	local name="$1" text="$2" out
 	shift 2
 	out="$("$@" 2>&1)"
-	if printf '%s' "$out" | grep -qF -- "$text"; then echo "ok    $name"; else
-		echo "MISS  $name: output lacks '$text': $(printf '%s' "$out" | head -c 300)"
+	if grep -qF -- "$text" <<<"$out"; then echo "ok    $name"; else
+		echo "MISS  $name: output lacks '$text': $(printf '%s' "${out:0:300}")"
 		ST_MISS=$((ST_MISS + 1))
 	fi
 }
@@ -1110,7 +1111,7 @@ gate_run() {
 		echo "exit $rc, want $want: $(printf '%s' "$out" | tail -3)"
 		return 1
 	}
-	[ "$text" = - ] || printf '%s' "$out" | grep -qF -- "$text" || {
+	[ "$text" = - ] || grep -qF -- "$text" <<<"$out" || {
 		echo "output lacks '$text'"
 		return 1
 	}
@@ -1131,12 +1132,12 @@ runlog_missing_refuses() {
 		echo "exit $rc, want 2: $(printf '%s' "$out" | tail -3)"
 		return 1
 	}
-	printf '%s' "$out" | grep -qxF -- "$want" || {
+	grep -qxF -- "$want" <<<"$out" || {
 		echo "output lacks '$want': $(printf '%s' "$out" | tail -3)"
 		return 1
 	}
 	[ "$(printf '%s\n' "$out" | grep -c .)" = 1 ] || {
-		echo "output beyond the refusal (a rung or preflight ran): $(printf '%s' "$out" | head -3)"
+		echo "output beyond the refusal (a rung or preflight ran): $(printf '%s' "$out" | sed -n 1,3p)"
 		return 1
 	}
 	[ ! -e "$d/ev" ] || {
@@ -1145,10 +1146,6 @@ runlog_missing_refuses() {
 	}
 }
 
-# st_driver <r3|r4> <profile> <want 0|1> — run the real r3 or r4 assertion with the
-# host and cluster helpers stubbed over fixture outputs (driver/<profile>/), so a
-# swapped argument between the rung glue and its predicates reds without a rig.
-# The stubs live only in the subshell.
 # st_driver_run <rung> <profile> — the body st_driver runs in a subshell: the
 # stubs below replace the host and cluster helpers there only.
 st_driver_run() {
@@ -1195,13 +1192,17 @@ st_driver_run() {
 	echo "DRIVER passes=$R_PASS fails=$R_FAIL"
 }
 
+# st_driver <r3|r4> <profile> <want 0|1> — run the real r3 or r4 assertion with the
+# host and cluster helpers stubbed over fixture outputs (driver/<profile>/), so a
+# swapped argument between the rung glue and its predicates reds without a rig.
+# The stubs live only in the subshell.
 st_driver() {
 	local rung="$1" prof="$2" want="$3" out rc=0
 	out="$(st_driver_run "$rung" "$prof")" || rc=$?
 	if { [ "$want" = 0 ] && [[ "$out" == *"DRIVER passes=7 fails=0"* ]]; } || { [ "$want" = 1 ] && [[ "$out" == *"DRIVER passes="* ]] && [[ "$out" != *" fails=0"* ]]; }; then
 		echo "ok    rung driver $rung over $prof (want $([ "$want" = 0 ] && echo green || echo red))"
 	else
-		echo "MISS  rung driver $rung over $prof: $(printf '%s' "$out" | grep -E '^(FAIL|DRIVER)' | head -5 | tr '\n' ';')"
+		echo "MISS  rung driver $rung over $prof: $(printf '%s' "$out" | grep -E '^(FAIL|DRIVER)' | sed -n 1,5p | tr '\n' ';')"
 		ST_MISS=$((ST_MISS + 1))
 	fi
 }
@@ -1310,7 +1311,7 @@ self_test_body() {
 	st_out "plan validator red: the unknown prerequisite is named" "unknown prerequisite 'wifi'" icp_validate_rungs "$F/plan-unknown-prereq.tsv" "r0-disarmed" "$PREREQ_SET"
 	{
 		printf '%s\n' "$RUNG_TABLE"
-		printf '%s\n' "$RUNG_TABLE" | head -1
+		printf '%s\n' "$RUNG_TABLE" | sed -n 1p
 	} >"$tmp/plan-dup.tsv"
 	st "plan validator red: a duplicate id" 1 icp_validate_rungs "$tmp/plan-dup.tsv" "$REQUIRED_IDS" "$PREREQ_SET"
 
@@ -1499,7 +1500,7 @@ trap 'exit 130' INT TERM HUP
 BASE_DIR="$EVIDENCE_DIR/baseline"
 RUNG_DIR="$BASE_DIR"
 mkdir -p "$BASE_DIR"
-need() { echo "$HAVE" | grep -qw "$1"; }
+need() { grep -qw "$1" <<<"$HAVE"; }
 probe_miss() { refuse_run "${2:-probe}" "$(prereq_what "$1")${3:+: $3}"; }
 for t in kubectl ssh scp python3 nc curl; do
 	command -v "$t" >/dev/null 2>&1 || probe_miss tools preflight "the local Mac has no $t on PATH"
@@ -1516,12 +1517,12 @@ tbdevs="$(networksetup -listallhardwareports 2>/dev/null | awk '/^Hardware Port:
 macs="$(printf '%s\n' "$br" | awk '$1=="ether"{print $2; exit}')" tba=""
 for m in $(printf '%s\n' "$br" | awk '$1=="member:"{print $2}'); do
   macs="$macs $(ifconfig "$m" 2>/dev/null | awk '$1=="ether"{print $2; exit}')"
-  printf '%s\n' "$tbdevs" | grep -qx "$m" && ifconfig "$m" | grep -q 'status: active' && tba="$tba $m"
+  grep -qx "$m" <<<"$tbdevs" && grep -q 'status: active' <<<"$(ifconfig "$m")" && tba="$tba $m"
 done
 echo "TB_ACTIVE=$(echo $tba)"
 echo "MACS=$(echo $macs)"
 echo "LAN=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')"
-echo "MESH=$(ifconfig -a inet | awk '$1=="inet"{print $2}' | awk -F. '$1==100 && $2>=64 && $2<=127' | head -1)"
+echo "MESH=$(ifconfig -a inet | awk '$1=="inet"{print $2}' | awk -F. '$1==100 && $2>=64 && $2<=127' | sed -n 1p)"
 bin="$(readlink -f "$K3SM_BIN" 2>/dev/null || echo "$K3SM_BIN")"
 echo "SHA=$(shasum -a 256 "$bin" 2>/dev/null | cut -d' ' -f1)"
 grep -aqF 'k3sm.io/InterconnectAttached' "$bin" && echo HAS_attach=yes || echo HAS_attach=no

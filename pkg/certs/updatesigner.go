@@ -42,8 +42,8 @@ const (
 	// UpdateSignerOrganization is the update signer's Organization.
 	UpdateSignerOrganization = "k3sm:update-signers"
 	// UpdateSignerValidity is the signer certificate's lifetime: a day, so a
-	// signed payload that leaks stops authorising anything a day after it was
-	// signed. The update controller re-mints well before it ends
+	// signed payload that leaks stops authorising anything when its signer
+	// certificate expires, at most a day after it was signed. The update controller re-mints well before it ends
 	// (UpdateSignerRenewBefore).
 	UpdateSignerValidity = 24 * time.Hour
 	// UpdateSignerRenewBefore is how much validity a signer must have left to

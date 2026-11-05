@@ -566,6 +566,7 @@ func (c *Controller) observeRanks(ctx context.Context, model *mlxv1alpha1.MLXMod
 			Ready:       podReady(pod),
 			Revision:    pod.Annotations[mlx.AnnotationSpecHash],
 			Terminating: pod.DeletionTimestamp != nil,
+			Container:   mlx.ServingContainerState(pod),
 		}
 		if pod.Name == rank0 && !state.Ready && state.Phase == corev1.PodRunning && pod.Status.PodIP != "" {
 			state.Probe = c.probe(ctx, model, pod.Status.PodIP)

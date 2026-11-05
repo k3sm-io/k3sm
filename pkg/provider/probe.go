@@ -508,7 +508,7 @@ type podProber struct {
 	onTransition func()
 	// restartFunc performs the actual container process restart on a committed
 	// liveness failure. The restart COUNT bookkeeping is owned by the monitor;
-	// this seam is the side effect (the future runtime RestartContainer RPC). nil
+	// this seam is the side effect (on the runtimed path, the RestartContainer RPC). nil
 	// means bookkeeping only.
 	restartFunc func(ctx context.Context, podID, container string) error
 

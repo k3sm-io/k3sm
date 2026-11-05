@@ -31,7 +31,7 @@
 #     b411.L5  `k3sm certificate rotate --restart` once, then L2's first two tests
 #              again (the request-header CA pin must survive the rotation).
 #
-#   Without K3SM_LAB=1 the lab tier is announced PENDING and the gate exits 2: it
+#   Without K3SM_LAB=1 the lab tier is announced LAB-PENDING and the gate exits 3: it
 #   NEVER passes without the lab host run.
 #
 #   --rollback-check (K3SM_LAB=1): after a rollback to a release without the
@@ -79,7 +79,7 @@ if [ "$mode" = rollback ]; then
 	fi
 	: "${KUBECONFIG:?KUBECONFIG must name the admin kubeconfig}"
 	data="$(kubectl -n kube-system get cm extension-apiserver-authentication -o jsonpath='{.data}')"
-	if printf '%s' "$data" | grep -q 'requestheader-'; then
+	if grep -q 'requestheader-' <<<"$data"; then
 		ladder no "b411.R  extension-apiserver-authentication still carries requestheader- keys after the rollback (delete the ConfigMap once; the old apiserver recreates it)"
 	else
 		ladder ok "b411.R  extension-apiserver-authentication carries no requestheader- key"
@@ -116,11 +116,11 @@ unit ./pkg/rbac '^TestProvisionSubjectsUnchanged$' \
 	"b411.5  pkg/rbac: no grant added or widened"
 
 if [ "${K3SM_LAB:-}" != 1 ]; then
-	echo "PENDING  b411.L0-L5 lab tier: run on the server Mac with K3SM_LAB=1, KUBECONFIG and B411_SERVER_NODE set"
+	echo "LAB-PENDING  b411.L0-L5 lab tier: run on the server Mac with K3SM_LAB=1, KUBECONFIG and B411_SERVER_NODE set"
 	summary
-	echo "request-header CA: the lab tier is PENDING; this gate never passes without it" >&2
 	[ "$FAIL" -eq 0 ] || exit 1
-	exit 2
+	echo "request-header CA: LAB-PENDING: not a pass (the lab tier needs K3SM_LAB=1 on the server Mac)" >&2
+	exit 3
 fi
 
 # ---- lab tier ----------------------------------------------------------------
@@ -196,10 +196,10 @@ done
 ladder "$l4" "b411.L4  k3sm status: request-header row ok with a trusted count of 1"
 
 # b411.L5 — a rotation keeps the request-header CA, and the trust still works.
-pre="$(sudo "$K3SM" certificate rotate --work-dir "$WORK_DIR" 2>&1 | sed -n 's/.*request-header CA *sha256:\([0-9a-f]*\).*/\1/p' | head -1)"
+pre="$(sudo "$K3SM" certificate rotate --work-dir "$WORK_DIR" 2>&1 | sed -n 's/.*request-header CA *sha256:\([0-9a-f]*\).*/\1/p' | sed -n 1p)"
 # shellcheck disable=SC2024 # the evidence file is this user's; only the rotation needs root
 if sudo "$K3SM" certificate rotate --work-dir "$WORK_DIR" --restart >"$EVIDENCE/L5-rotate.log" 2>&1; then
-	post="$(sed -n 's/.*request-header CA *sha256:\([0-9a-f]*\).*/\1/p' "$EVIDENCE/L5-rotate.log" | head -1)"
+	post="$(sed -n 's/.*request-header CA *sha256:\([0-9a-f]*\).*/\1/p' "$EVIDENCE/L5-rotate.log" | sed -n 1p)"
 	if [ -n "$pre" ] && [ "$pre" = "$post" ]; then
 		ladder ok "b411.L5a k3sm certificate rotate --restart kept the request-header CA ($pre)"
 	else

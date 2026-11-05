@@ -57,8 +57,8 @@ func withHostArchFacts(t *testing.T, f hostArchFacts, err error) {
 //     leg fails BY VALUE, not by compile.
 //  2. Because the legs disagree, NO constant can satisfy the table — including
 //     runtime.GOARCH, which is a constant per build. That is the specific defect this
-//     item exists to prevent: this workspace's own Go toolchain is amd64-under-Rosetta
-//     (`go env GOARCH` = amd64 on an arm64 Mac), so an implementation returning
+//     item exists to prevent: a Go toolchain that is itself amd64-under-Rosetta is a real
+//     configuration (`go env GOARCH` = amd64 on an arm64 Mac), so an implementation returning
 //     runtime.GOARCH would label an Apple Silicon node kubernetes.io/arch=amd64 and
 //     attract amd64-only workloads to a node whose native arch is arm64 — invisibly on a
 //     correctly-configured host. Mutating hostNodeArch to `return runtime.GOARCH` turns
@@ -154,8 +154,8 @@ func TestNodeArchLabelTruthful(t *testing.T) {
 	// The property that makes this gate non-vacuous: the reported arch is a function of
 	// the HOST, not of the build. Two host-fact shapes must yield DIFFERENT answers, so
 	// any constant-valued implementation — `return "arm64"` (the retired hardcode) or
-	// `return runtime.GOARCH` (a constant per build, and amd64 under this workspace's
-	// own Rosetta-translated toolchain) — fails at least one leg.
+	// `return runtime.GOARCH` (a constant per build, and amd64 under a
+	// Rosetta-translated toolchain) — fails at least one leg.
 	t.Run("build_arch_independence", func(t *testing.T) {
 		onApple, onIntel := nodeArch(nativeAppleSilicon), nodeArch(genuineIntel)
 		if onApple == onIntel {

@@ -48,6 +48,12 @@ const authFailDelay = 1
 // generic registry. Verified accepted by the pinned minimal build.
 const dockerCompat = "docker2s2"
 
+// noTransferTimeout is zot's spelling of "no timeout" for its HTTP server's
+// readTimeout and writeTimeout: an explicit duration <= 0 (zot's HTTPConfig doc),
+// written as a string because zot decodes durations with mapstructure's
+// string-to-duration hook.
+const noTransferTimeout = "0s"
+
 // zotConfig is the subset of zot's configuration k3sm renders.
 //
 // It is a HAND-WRITTEN subset rather than zot's own config struct because zot is
@@ -71,9 +77,18 @@ type zotStorage struct {
 }
 
 type zotHTTP struct {
-	Address       string           `json:"address"`
-	Port          string           `json:"port"`
-	Compat        []string         `json:"compat"`
+	Address string   `json:"address"`
+	Port    string   `json:"port"`
+	Compat  []string `json:"compat"`
+	// ReadTimeout and WriteTimeout are always written, as noTransferTimeout. When
+	// the keys are absent zot's server command sets both to 60 s, and http.Server
+	// applies them to the WHOLE request and the WHOLE response, so any blob push
+	// or pull slower than a minute is cut mid-transfer whatever its size. Nothing
+	// is lost by disabling them: zot listens only on loopback behind the relay,
+	// which bounds request headers, idle connections, connection counts and
+	// request rates, and zot keeps its own ReadHeaderTimeout and IdleTimeout.
+	ReadTimeout   string           `json:"readTimeout"`
+	WriteTimeout  string           `json:"writeTimeout"`
 	Auth          zotAuth          `json:"auth"`
 	AccessControl zotAccessControl `json:"accessControl"`
 }
@@ -136,8 +151,10 @@ func renderConfig(workDir, bindAddress string, port int) ([]byte, error) {
 			// zot's HTTP port is a STRING in its own schema, and its loader is
 			// strict, so rendering it as a JSON number is a boot failure rather
 			// than a coercion.
-			Port:   strconv.Itoa(port),
-			Compat: []string{dockerCompat},
+			Port:         strconv.Itoa(port),
+			Compat:       []string{dockerCompat},
+			ReadTimeout:  noTransferTimeout,
+			WriteTimeout: noTransferTimeout,
 			Auth: zotAuth{
 				FailDelay: authFailDelay,
 				HTPasswd:  zotHTPasswd{Path: HTPasswdPath(workDir)},

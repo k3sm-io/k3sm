@@ -77,6 +77,16 @@ limitations under the License.
 //     kube-dns Service is created by the server's admin client. Unlike the grants
 //     above it is create-or-update, so a drifted copy is repaired to this shape.
 //
+//   - the registry push graph: the k3sm:registry-gate ClusterRole (create
+//     TokenReviews and SubjectAccessReviews, get namespaces) bound to the
+//     k3sm:registry-gates group the ingest registry's push gate authenticates
+//     as; the k3sm:registry-pusher ClusterRole (the virtual push verb on
+//     registry.k3sm.io repositories), which a namespace binds itself; the
+//     builder ServiceAccount in k3sm-registry with its k3sm:registry-builder
+//     ClusterRoleBinding to k3sm:registry-pusher; and the unbound
+//     k3sm:registry-builder-token Role an admin binds to a user who may push as
+//     builder. All of them are create-or-update like k3sm:netserve.
+//
 // Two bindings an operator may have applied by hand on an earlier cluster to give the
 // system:nodes group what the netserve identity now holds
 // (k3sm:worker-nodes-system-node, k3sm:worker-node-informers) are not
@@ -105,7 +115,8 @@ limitations under the License.
 // reconciler — and two writers fight. It only REFERENCES the system:nodes group (as a
 // binding subject); it never authors a system:* object. Provisioning is
 // Create-tolerate-AlreadyExists (idempotent, no read to decide), except the
-// k3sm:netserve pair, which decides create-or-update by one Get by name; it never LISTs to
+// k3sm:netserve and registry-push roles and bindings, which decide
+// create-or-update by one Get by name; it never LISTs to
 // decide what to provision — a watch-cache LIST under the pinned kine
 // (executor.DefaultKineVersion), where ConsistentListFromCache is GA-locked true, can
 // read stale and double-provision or skip. Any existence check is an authoritative Get-by-name, never a LIST.

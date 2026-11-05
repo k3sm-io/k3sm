@@ -167,8 +167,8 @@ func TestBundleEncodingKeepsTheV2Bytes(t *testing.T) {
 }
 
 // TestImportedHierarchyThenEnsureLoads proves the HA import-then-load primitive:
-// ReconcileImportedHierarchy into an empty work dir lays down the four CA keypairs
-// (keys 0600, the etcd pairs in a 0700 subdirectory), and a SUBSEQUENT EnsureHierarchy
+// ReconcileImportedHierarchy into an empty work dir lays down the CA keypairs
+// (cluster, signing, etcd server, etcd peer, request-header; keys 0600, the etcd pairs in a 0700 subdirectory), and a SUBSEQUENT EnsureHierarchy
 // / EnsureEtcdCAs LOADS them — returning the IDENTICAL pins instead of minting fresh,
 // divergent CAs. It also confirms an import never replaces an existing CA: a different
 // hierarchy is refused as ErrHierarchyDiverged.

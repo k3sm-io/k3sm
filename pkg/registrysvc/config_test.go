@@ -136,3 +136,36 @@ func TestRenderConfigIsDeterministic(t *testing.T) {
 		t.Errorf("two renders of the same inputs differ:\n%s\n---\n%s", a, b)
 	}
 }
+
+// TestRenderConfigDisablesWholeTransferTimeouts pins that the rendered config
+// sets zot's readTimeout and writeTimeout explicitly to "0s". zot defaults both
+// to 60 s when the keys are absent, and http.Server applies them to the WHOLE
+// request and response, so any blob push or pull slower than a minute was cut
+// mid-transfer. An explicit zero is zot's documented "no timeout"; the string
+// form is what zot's duration decode hook reads.
+//
+// It reads the raw document, not zotConfig, so it asserts the exact keys and
+// values the child's strict loader sees.
+func TestRenderConfigDisablesWholeTransferTimeouts(t *testing.T) {
+	body, err := renderConfig("/var/lib/k3sm/server", "127.0.0.1", 6450)
+	if err != nil {
+		t.Fatalf("renderConfig: %v", err)
+	}
+	var doc struct {
+		HTTP map[string]json.RawMessage `json:"http"`
+	}
+	if err := json.Unmarshal(body, &doc); err != nil {
+		t.Fatalf("the rendered config is not valid JSON: %v", err)
+	}
+	for _, key := range []string{"readTimeout", "writeTimeout"} {
+		t.Run(key, func(t *testing.T) {
+			raw, ok := doc.HTTP[key]
+			if !ok {
+				t.Fatalf("http.%s is absent; zot then defaults it to 60s and cuts any slower blob transfer", key)
+			}
+			if got, want := string(raw), `"0s"`; got != want {
+				t.Errorf("http.%s = %s, want %s (an explicit zero duration is zot's no-timeout)", key, got, want)
+			}
+		})
+	}
+}

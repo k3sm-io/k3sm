@@ -18,9 +18,12 @@ package provider
 
 import (
 	"fmt"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	budgetv1alpha1 "k3sm.io/apis/budget/v1alpha1"
 )
 
 // Node-pressure helpers: a pure, side-effect-free reduction of a node-resource
@@ -267,6 +270,13 @@ type hostStats struct {
 	// DiskPressure to the data-root leg.
 	SwapVolumeSeparate bool
 
+	// VMPressureLevel is kern.memorystatus_vm_pressure_level (1 normal, 2
+	// warning, 4 critical) and MemorystatusLevel is kern.memorystatus_level, the
+	// percent of memory macOS counts as free. Both are information only for the
+	// node budget: nil when the read failed, which never fails the sample.
+	VMPressureLevel   *int64
+	MemorystatusLevel *int64
+
 	// history is stamped by the pressure monitor from the samples before this
 	// one: the memory-pressure hysteresis hold and the previous swap reading.
 	// The zero value (a snapshot that never passed through the monitor) means no
@@ -274,8 +284,8 @@ type hostStats struct {
 	history pressureHistory
 }
 
-// computeNodeConditions reduces a hostStats snapshot to the node's four
-// pressure / network NodeConditions at instant now. It is PURE: no syscalls, no
+// computeNodeConditions reduces a hostStats snapshot to the node's five
+// pressure / network / budget NodeConditions at instant now. It is PURE: no syscalls, no
 // time.Now (now is injected by the caller), no I/O — every field of every
 // returned condition is a deterministic function of (s, now).
 //
@@ -371,7 +381,103 @@ func computeNodeConditions(s hostStats, now metav1.Time) []corev1.NodeCondition 
 		LastTransitionTime: now,
 	}
 
-	return []corev1.NodeCondition{mem, disk, pid, network}
+	return []corev1.NodeCondition{mem, disk, pid, network, softPressureCondition(s, now)}
+}
+
+// nodeSoftPressure is the advisory node-budget condition: True while the
+// published budget level is warn or above. Nothing maps it to a taint, and
+// nothing acts on it; it is the condition form of the budget's level.
+const nodeSoftPressure corev1.NodeConditionType = "SoftPressure"
+
+// The SoftPressure Reason/Message for a calm budget. A True condition's Reason
+// is the worst signal's token (softPressureReason).
+const (
+	softPressureOKReason  = "NodeBudgetOK"
+	softPressureOKMessage = "node budget is ok"
+)
+
+// softPressureReasons are the True Reasons, one CamelCase token per signal.
+var softPressureReasons = map[budgetv1alpha1.SignalID]string{
+	budgetv1alpha1.SignalMemoryAvailable:  "MemoryAvailableLow",
+	budgetv1alpha1.SignalMemoryCompressor: "MemoryCompressorHigh",
+	budgetv1alpha1.SignalMemorySwap:       "MemorySwapGrowing",
+	budgetv1alpha1.SignalSwapfsAvailable:  "SwapfsAvailableLow",
+	budgetv1alpha1.SignalNodefsAvailable:  "NodefsAvailableLow",
+	budgetv1alpha1.SignalImagefsAvailable: "ImagefsAvailableLow",
+	budgetv1alpha1.SignalPIDAvailable:     "PidAvailableLow",
+}
+
+// softPressureCondition renders the budget of s as the SoftPressure condition.
+// It is pure over s, like the rest of computeNodeConditions: the budget hold
+// and the level dwell ride in s.history.
+func softPressureCondition(s hostStats, now metav1.Time) corev1.NodeCondition {
+	c := corev1.NodeCondition{
+		Type:               nodeSoftPressure,
+		Status:             corev1.ConditionFalse,
+		Reason:             softPressureOKReason,
+		Message:            softPressureOKMessage,
+		LastHeartbeatTime:  now,
+		LastTransitionTime: now,
+	}
+	obs, next := budgetOf(s, ladderOf(s))
+	if obs.Level == budgetv1alpha1.LevelOK {
+		return c
+	}
+	c.Status = corev1.ConditionTrue
+	c.Reason = "NodeBudgetElevated"
+	if r, ok := softPressureReasons[next.worst]; ok {
+		c.Reason = r
+	}
+	var parts []string
+	for i := range obs.Signals {
+		sig := &obs.Signals[i]
+		if r := heldRung(next, sig.ID); r >= 0 {
+			parts = append(parts, fmt.Sprintf("%s %s (%s %s)", sig.ID, formatSignalValue(sig.Unit, sig.Value),
+				budgetRungNames[r], formatSignalValue(sig.Unit, rungThreshold(sig, r))))
+		}
+	}
+	c.Message = "node budget " + string(obs.Level)
+	if len(parts) == 0 {
+		c.Message += ": held for the level dwell after the last signal released"
+	} else {
+		c.Message += ": " + strings.Join(parts, ", ")
+	}
+	return c
+}
+
+// heldRung returns the highest rung held for signal id in h, or -1.
+func heldRung(h budgetHold, id budgetv1alpha1.SignalID) budgetRung {
+	slot := int(id.PageCode()) - 1
+	if slot < 0 || slot >= numBudgetSlots {
+		return -1
+	}
+	for r := rungEvictHard; r >= rungWarn; r-- {
+		if h.held[slot][r] {
+			return r
+		}
+	}
+	return -1
+}
+
+// rungThreshold returns signal sig's threshold for rung r.
+func rungThreshold(sig *budgetv1alpha1.BudgetSignal, r budgetRung) *int64 {
+	return [numBudgetRungs]*int64{
+		sig.WarnThreshold, sig.AdmitStopThreshold, sig.CriticalThreshold, sig.EvictSoftThreshold, sig.EvictHardThreshold,
+	}[r]
+}
+
+// formatSignalValue renders a budget value in its unit for a condition message.
+func formatSignalValue(u budgetv1alpha1.SignalUnit, v *int64) string {
+	if v == nil {
+		return "unsampled"
+	}
+	switch u {
+	case budgetv1alpha1.UnitBytes:
+		return formatBytes(*v)
+	case budgetv1alpha1.UnitPermille:
+		return fmt.Sprintf("%d permille", *v)
+	}
+	return fmt.Sprintf("%d", *v)
 }
 
 // reconcileTransitions turns the raw verdicts in next into the slice that is

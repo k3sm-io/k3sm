@@ -146,6 +146,7 @@ const (
 	docsRuntimed         = "troubleshooting.md#the-runtime-daemon-is-unhealthy"
 	docsDNS              = "troubleshooting.md#the-node-resolver-does-not-answer"
 	docsShadow           = "troubleshooting.md#host-binaries-changed-after-a-macos-update"
+	docsDeveloperMode    = "install.md#developer-mode"
 )
 
 // alertFor builds the alert of one row that NeedsAlert. Each row has its own
@@ -206,6 +207,8 @@ func alertFor(r Row, ac alertContext) *Alert {
 		a = nodeResolverAlert(r)
 	case RowShadowShells:
 		a = shadowAlert(r)
+	case RowDeveloperMode:
+		a = developerModeAlert(r)
 	}
 	if a == nil {
 		a = genericAlert(r)

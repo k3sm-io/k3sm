@@ -1,0 +1,7 @@
+go test fuzz v1
+uint8(0)
+string("/v2/app/referrers/{s}")
+string("artifactType=a&artifactType=b&artifactType=c&artifactType=d&artifactType=e&artifactType=f&artifactType=g&artifactType=h&artifactType=i")
+string("")
+uint8(0)
+[]byte("")

@@ -184,7 +184,7 @@ require_pinned_base() {
 
 # base_present — is the base image already pulled locally?
 base_present() {
-	tart_cli list 2>/dev/null | grep -qF "$BASE_IMAGE"
+	grep -qF "$BASE_IMAGE" <<<"$(tart_cli list 2>/dev/null)"
 }
 
 # valid_user <name> — the guest account name must be a plain account name.
@@ -194,7 +194,7 @@ base_present() {
 # as an option however it was meant, and -oProxyCommand=<cmd> is executed BY THE
 # LOCAL SHELL, ON THIS HOST, before any guest is contacted. That is a second path
 # from the harness to a real machine — exactly what guest_exec exists to prevent
-# and what b149.4 certifies does not exist. Two independent controls now stand in
+# and what hack/acceptance/B149.sh certifies does not exist. Two independent controls now stand in
 # the way: this charset check (no leading '-', no shell metacharacters), and
 # guest_exec's use of `-l <user> <host>`, which puts the account in an option
 # VALUE position where it can never be re-read as a flag.
@@ -789,8 +789,8 @@ FAKE
 	grep -q 'tar -czf' "$log" || fail "red gate skipped collection"
 	grep -q '^tart delete' "$log" || fail "red gate skipped destruction"
 	local ci di
-	ci="$(grep -n 'tar -czf' "$log" | head -1 | cut -d: -f1)"
-	di="$(grep -n '^tart delete' "$log" | head -1 | cut -d: -f1)"
+	ci="$(grep -n 'tar -czf' "$log" | sed -n 1p | cut -d: -f1)"
+	di="$(grep -n '^tart delete' "$log" | sed -n 1p | cut -d: -f1)"
 	[ -n "$ci" ] && [ -n "$di" ] && [ "$ci" -lt "$di" ] \
 		|| fail "collection did not precede destruction"
 	[ -s "$tmp/out4/gate.log" ] || fail "the in-guest gate output was not preserved on the host"
@@ -824,7 +824,7 @@ FAKE
 	( cmd_dispatch ) 2>"$tmp/usage.txt" >/dev/null || true
 	documented="$(awk '/^  [a-z]/{print $1}' "$tmp/usage.txt" | sort -u)"
 	for w in $implemented; do
-		printf '%s\n' "$documented" | grep -qx "$w" || fail "subcommand '$w' is implemented but absent from the usage text"
+		grep -qx "$w" <<<"$documented" || fail "subcommand '$w' is implemented but absent from the usage text"
 	done
 
 	unset LABVM_TEST_LOG LABVM_TEST_CLONES

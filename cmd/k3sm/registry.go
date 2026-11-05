@@ -71,7 +71,7 @@ const (
 // registry through.
 //
 // It is declared HERE, at the consumer, and not in pkg/registrysvc: what the
-// server needs is three methods, and an interface owned by the caller is what
+// server needs is four methods, and an interface owned by the caller is what
 // lets this file's wiring be tested — start ordering, the never-fatal contract,
 // the KEP-1755 publish, the teardown — without a zot binary, a Go toolchain, or a
 // bound port anywhere in the test.

@@ -192,7 +192,7 @@ four.
   "summary": "1/1 nodes ready",
   "rows": [ { "name": "install", "state": "ok", "severity": "ok", "detail": "..." } ],
   "next": [ "k3sm kubectl get pods -A" ],
-  "version": { "version": "v0.1.7", "commit": "...", "dirty": false, "date": "...", "goVersion": "go1.26.1", "platform": "darwin/arm64", "kubeVersion": "v1.37.1", "kineVersion": "v0.17.2", "modules": [ { "path": "k3sm.io/k3sm", "sha": "..." } ] },
+  "version": { "version": "v0.2.0", "commit": "...", "dirty": false, "date": "...", "goVersion": "go1.26.1", "platform": "darwin/arm64", "kubeVersion": "v1.37.1", "kineVersion": "v0.17.2", "modules": [ { "path": "k3sm.io/k3sm", "sha": "..." } ] },
   "host": "26.1",
   "timestamp": "2026-10-01T09:30:00Z"
 }
@@ -213,6 +213,7 @@ four.
 | `network` | object | this node's LAN access setting (see [Network](#network)); omitted when k3sm is not installed, or by a k3sm older than the setting |
 | `workers` | array | on a server, the cluster's other nodes and their versions (see [Workers and join target](#workers-and-join-target)); omitted when unknown |
 | `joinTarget` | string | on a worker, the server endpoint it joined (see [Workers and join target](#workers-and-join-target)); omitted when unknown |
+| `budget` | object | this node's budget: pressure level, admission and headroom (see [Budget](#budget)); omitted when unknown |
 | `version` | object | the build that produced the report; `modules` is omitted when unknown |
 | `host` | string | the macOS version, empty when it could not be read |
 | `timestamp` | string | RFC 3339 |
@@ -220,9 +221,9 @@ four.
 Row names in the full report include `install`, `netd`, `server` or `agent`, `apiserver`, `node`,
 `workloads`, `data-root`, `datastore`, `kubeconfig`, `runtimed` and `dns`; some rows appear only when the
 thing they describe exists (`datavol`, `server-args`, `settings`, `heartbeat`, `pre-volume`, `etcd`,
-`mesh-claims`, `services`, `update`, `node-resolver`, `shadow-shells`, `request-header`, `interconnect`, `ingest-registry`). Besides the daemon states above, a row's `state` may
+`mesh-claims`, `services`, `update`, `node-resolver`, `shadow-shells`, `request-header`, `interconnect`, `ingest-registry`, `developer-mode`). Besides the daemon states above, a row's `state` may
 be `ok`, `ready`, `down`, `not-ready`, `wrong-owner`, `not-mounted`, `absent`, `partial`, `missing`,
-`skip`, `drift`, `healthy`, `unhealthy`, `stale`, `needs-admin`, `behind`, `ahead`, `rolling` or `refused`.
+`skip`, `drift`, `healthy`, `unhealthy`, `stale`, `needs-admin`, `behind`, `ahead`, `rolling`, `refused`, `on` or `invalid`.
 
 `kubeconfig` names the credentials the report reads the cluster with and where it found them. When
 it has a client, it proves the credential with one authenticated request, a `SelfSubjectReview`
@@ -327,6 +328,18 @@ the row's `state` when that source is the node daemon's arguments. No value is a
 password: the row names a fixed set of settings, none of which is a credential. `detail` gives the
 same values in one line.
 
+The `developer-mode` row appears only while something is at `/Library/k3sm.developer-mode`, and it
+never changes the `verdict`. Its `severity` is `warn`. The verdict stays `ok` while developer mode is
+on, so automation that needs to know reads this row. See [Developer mode](install.md#developer-mode).
+
+| `state` | meaning |
+|---|---|
+| `on` | a valid marker is there: the signature of the k3sm that runs as root is not checked. `remedy` is `sudo k3sm install --developer-mode off`; installing a Developer ID signed k3sm also turns developer mode off, and reinstalling an ad-hoc signed build from source does not |
+| `invalid` | something is at the path that is not a root-owned file nobody else can write, with no ACL, or `/` or `/Library` is not a root-owned real directory that neither group nor others can write, with no ACL. It is ignored and the signature checks stay on. `remedy` is `sudo rm /Library/k3sm.developer-mode` |
+
+`wide.signing` names how the installed k3sm is signed, `ad-hoc` or `team <ID>`; it is omitted when
+that cannot be read. `detail` and `remedy` are sentences for a person; do not parse them.
+
 The `heartbeat` row reports how long ago this Mac's node last posted its status and renewed its
 Lease, as the apiserver holds them. It appears when the apiserver answered and this Mac's node was
 identified. Its `state` is `ok`, or `stale` (severity `warn`) when the Lease renewal is older than 40
@@ -368,7 +381,7 @@ reads the row. The row takes the latest release and the check time from the reco
 release with the versions running when the report is taken: the `k3sm` binary, and every node's
 kubelet version from the node list the report reads (the recorded node versions when it cannot list
 nodes). A build of an untagged commit (a Go pseudo-version) ranks by the release it leads up to, and
-`detail` calls it an untagged build, for example `a (untagged build of 0.1.8)`. Its `state` is:
+`detail` calls it an untagged build, for example `a (untagged build of 0.2.1)`.
 
 On a worker the row is read-only. After each check a server publishes the latest release and when it
 checked on its own Node (the `k3sm.io/release-latest` and `k3sm.io/release-checked` annotations),
@@ -493,8 +506,8 @@ the `node` row reads:
 
 ```json
 "workers": [
-  { "name": "node-a", "role": "server", "version": "v1.37.1+k3sm.0.1.7" },
-  { "name": "node-b", "role": "agent", "version": "v1.37.1+k3sm.0.1.6" }
+  { "name": "node-a", "role": "server", "version": "v1.37.1+k3sm.0.2.0" },
+  { "name": "node-b", "role": "agent", "version": "v1.37.1+k3sm.0.1.7" }
 ]
 ```
 
@@ -529,6 +542,43 @@ that daemon's arguments. The host is reported only when it is an IPv4 address or
 letters, digits, `-` and `.`, at most 253 characters long. `joinTarget` is omitted on a server, on a
 worker whose daemon configuration cannot be read, and when the `--server` value is anything else:
 an IPv6 address, a value that already carries a port, or one with any other character.
+
+## Budget
+
+The full report carries an optional `budget` object: this node's budget as its node daemon last
+sampled it. It is additive: `schemaVersion` stays `1`, and it adds no `verdict` or row `state` word.
+The daemons probe does not carry it.
+
+```json
+"budget": {
+  "observedAt": "2026-09-05T09:29:55Z",
+  "platform": "darwin",
+  "level": "warn",
+  "admit": true,
+  "capacity": { "memAllocatableBytes": 32212254720 },
+  "signals": [
+    { "id": "memory.compressor", "unit": "permille", "value": 620, "warnThreshold": 600, "admitStopThreshold": 700, "criticalThreshold": 800, "limitingResource": "memory" }
+  ],
+  "recommendation": { "safeAdditionalBytes": 3221225472, "basis": "memory.compressor" },
+  "darwin": { "vmPressureLevel": 1 }
+}
+```
+
+The object has the schema of the `status` of a `NodeBudget` (`nodebudgets.v1alpha1.budget.k3sm.io`),
+so one decoder reads both. It holds the node's observation only: `writer` and `conditions` belong
+to the cluster's copy and never appear here. Every field of the observation is optional, as on
+`NodeBudget`.
+
+The node daemon rewrites its record every 10 seconds into the status directory
+(`/var/lib/k3sm/status/budget.json`, readable by any account). The record holds node-level figures
+and no pod or workload names. `budget` is omitted when the budget is unknown: the node daemon is not
+running, its record is missing or does not parse, or its `observedAt` is more than 60 seconds from
+the time of the report. Readers must treat a missing `budget` as unknown, never as calm.
+
+The block is read from that node-local record, which the k3sm service user writes. Nothing
+authenticates it, and any process running as that user could change it, so it is informational. A
+consumer may use it only to refuse or delay an action, never to allow one. The authoritative copy
+is the cluster's `NodeBudget` for this node.
 
 ## Interconnect
 
@@ -635,7 +685,7 @@ and how do I fix it". Its exit code is the verdict, exactly as `k3sm status`'s i
   "summary": "dns: the resolver at 10.43.0.10 did not answer over UDP in 3 s",
   "node": "my-mac",
   "alerts": [ { "name": "dns", "state": "down", "severity": "warn", "detail": "the resolver at 10.43.0.10 did not answer over UDP in 3 s", "remedy": "...", "alert": { "cause": "..." } } ],
-  "version": { "version": "v0.1.7", "kubeVersion": "v1.37.1" },
+  "version": { "version": "v0.2.0", "kubeVersion": "v1.37.1" },
   "timestamp": "2026-10-01T09:30:00Z"
 }
 ```

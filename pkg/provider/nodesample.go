@@ -85,7 +85,11 @@ func sampleHostStats(dataRoot string) (hostStats, error) {
 		return hostStats{}, fmt.Errorf("compare the swap volume with the data root: %w", err)
 	}
 
+	vmLevel, msLevel := sampleMemorystatus()
+
 	return hostStats{
+		VMPressureLevel:          vmLevel,
+		MemorystatusLevel:        msLevel,
 		MemAvailableBytes:        memAvail,
 		MemCapacityBytes:         int64(capacity),
 		DiskAvailableBytes:       int64(fs.Bavail) * blockSize,

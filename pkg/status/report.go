@@ -19,6 +19,7 @@ package status
 import (
 	"time"
 
+	budgetv1alpha1 "k3sm.io/apis/budget/v1alpha1"
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/version"
 )
@@ -92,6 +93,12 @@ const (
 	// StateRolling is the update row's word for a cluster the server's update
 	// controller is rolling to a release (an Update not yet finished).
 	StateRolling RowState = "rolling"
+	// StateOn is the developer-mode row's word for a valid marker: the
+	// signature checks are off.
+	StateOn RowState = "on"
+	// StateInvalid is the developer-mode row's word for something at the
+	// marker path that fails the checks, so it is ignored.
+	StateInvalid RowState = "invalid"
 )
 
 // Row is one subsystem's line in the report.
@@ -172,6 +179,13 @@ type Report struct {
 	// JoinTarget is, on an agent, the bootstrap endpoint (host:port) of the
 	// server this Mac was installed to join. Empty when it cannot be read.
 	JoinTarget string `json:"joinTarget,omitempty"`
+	// Budget is this node's cooperative budget, from the record the node
+	// daemon rewrites every BudgetRecordInterval, embedded as the
+	// NodeBudgetStatus the cluster publishes on NodeBudget (the observation
+	// only: no writer, no conditions). Absent means unknown: no running node
+	// daemon, a record older than BudgetRecordMaxAge, an unusable one, or a
+	// k3sm older than the block. It adds no verdict or state word.
+	Budget *budgetv1alpha1.NodeBudgetStatus `json:"budget,omitempty"`
 	// ImageMigration is the image migration row (ImageMigrationRow), for the
 	// text screen only. It is deliberately not in Rows and not in the JSON
 	// encoding: the -o json contract is unchanged, and the verdict and the

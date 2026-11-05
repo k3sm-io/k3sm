@@ -394,7 +394,7 @@ func TestStartIngestRegistry(t *testing.T) {
 	})
 }
 
-// fakeRegistry is the three-method registryService seam, counted rather than run.
+// fakeRegistry is the four-method registryService seam, counted rather than run.
 type fakeRegistry struct {
 	addr                string
 	startErr            error

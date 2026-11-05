@@ -137,7 +137,7 @@ func (f *relayLimitFixture) do(t *testing.T, src, method, target string, headers
 	return rawOn(t, c, method, target, headers, body)
 }
 
-// TestRelayLimitsArePerSource is B920's gate: one remote address at any of the
+// TestRelayLimitsArePerSource is the gate for the relay's per-source limits: one remote address at any of the
 // relay's limits leaves another address's read and push served. The shared
 // connection cap cannot be filled by one address, the shared TokenReview budget
 // cannot be drained by one address's garbage tokens, and a keep-alive

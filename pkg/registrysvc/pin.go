@@ -68,6 +68,13 @@ const (
 	// larger registry when its extension tags are passed, and links different
 	// dependencies with and without the raises. Changing the raises changes the
 	// "+r" suffix, which is what makes every already-staged zot re-stage.
+	//
+	// The search extension stays out. It would answer a whole listing in one
+	// GraphQL query instead of one manifest lookup per tag, but at this pin the
+	// `search` tag grows the linked graph from 171 modules (1,316 packages) to
+	// 439 (3,376), among them trivy and its databases, containerd, helm and
+	// client-go, and it serves a GraphQL endpoint over every repository to the
+	// same anonymous readers the catalog has.
 	zotBuildVariant = "minimal+r1"
 	// zotModulePath is the main package the wrapper module builds.
 	zotModulePath = "zotregistry.dev/zot/v2/cmd/zot"

@@ -26,8 +26,8 @@
 #                    (cp-payload/<name>), the list stage.sh accepts
 #   --print-cache-key
 #                    print the key a cached build is valid for: the tag, the
-#                    toolchain and the hash of the raise list. stage.sh keys its
-#                    lab cache on it, so a change to any of the three rebuilds
+#                    toolchain and the hash of the raise, removal and held lists.
+#                    stage.sh keys its lab cache on it, so a change to any of them rebuilds
 #   --print-raises   print the raise list as "<module> <version>" lines, the
 #                    versions stage.sh requires the four binaries to link
 #   --print-raise-list-hash
@@ -37,6 +37,7 @@
 #                    shapes, the required build flags, no floating versions, the
 #                    digest refusal over a tiny fixture tarball, the payload
 #                    toolchain assert, the raise list's shapes and cooldown, the
+#                    cooldown exemptions (shape, expiry, staleness), the
 #                    re-vendor diff check, a pin-less build refusing before any
 #                    network, and the output list against stage.sh's list
 #
@@ -53,8 +54,9 @@
 #      unless `go env GOVERSION` equals the pin and the pin is not older than
 #      the source's .go-version;
 #   4. the raise list below is checked (shapes, and every entry at least
-#      COOLDOWN_DAYS old) before any network, and each entry's publish date is
-#      checked against the module proxy before it is applied;
+#      COOLDOWN_DAYS old or named by an unexpired EXEMPT entry) before any
+#      network, and each entry's publish date is checked against the module
+#      proxy before it is applied;
 #   5. the raises are applied the way Kubernetes pins a dependency
 #      (hack/pin-dependency.sh: `go mod edit -require` in the root go.mod and in
 #      every staging go.mod that requires the module), then the source is
@@ -62,19 +64,26 @@
 #      moves versions (`go work sync`, `go work vendor`). The build refuses
 #      unless every raise lands at exactly its listed version, every other
 #      changed module is required, at exactly its new version, by a raised or
-#      already-explained module and is past its cooldown too, every module that
-#      leaves vendor/modules.txt is on REMOVALS, and no replacement (=>) moves;
+#      already-explained module and is past its cooldown (or exempt) too, no
+#      EXEMPT entry names a version the build neither raises nor pulls in,
+#      every module that leaves vendor/modules.txt is on REMOVALS, and no
+#      replacement (=>) moves;
 #   6. each binary is built CGO_ENABLED=0 for darwin/arm64 with -trimpath
 #      -buildvcs=false from the re-vendored source, SOURCE_DATE_EPOCH set to the
 #      tag's commit time, and the version stamped through k8s.io/component-base/version;
 #   7. STAMP_NAME is written beside the binaries: tag, source sha512, toolchain,
-#      cache key, the raise and removal lists, every vendor change, the findings
+#      cache key, the raise, exemption and removal lists, every vendor change, the findings
 #      the raise list leaves open (HELD), and the sha256 of each binary, which
 #      stage.sh rechecks before it uses a cached or handed-in build.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
+
+# grep_text TEXT GREP-ARGS...: grep over a string with no writer process. A
+# `printf ... | grep -q` pipeline lets grep exit on its first match, printf
+# takes EPIPE, and pipefail reports the pipeline failed.
+grep_text() { local text=$1; shift; grep "$@" <<<"$text"; }
 
 # PAYLOAD_GO_VERSION: the toolchain every Go child of the payload is built with.
 # shellcheck source=hack/release/lib/gochild.sh
@@ -111,20 +120,36 @@ STAMP_NAME="BUILD-STAMP"
 #
 # <version> is the version the module LANDS at after the re-vendor: the first
 # version that fixes its findings, or higher where another raise requires more
-# (x/net v0.60.0 requires x/crypto v0.57.0 and x/text v0.42.0, so those two are
-# listed at the versions they land at). The re-vendor refuses any other landing.
+# (x/net v0.62.0 requires x/crypto v0.58.0 and x/text v0.43.0, so those two are
+# listed at the versions they land at; it also requires x/sys v0.49.0 and x/term
+# v0.47.0, which carry no reachable finding and so arrive as pulled-in changes,
+# not raises). The re-vendor refuses any other landing.
 # <published> is the version's `Time` at
 # https://proxy.golang.org/<module>/@v/<version>.info, in full; the build re-reads
-# it and refuses on a mismatch. A version younger than COOLDOWN_DAYS is refused:
-# such a module stays at its vendored version and goes on the HELD list until its
-# fix is old enough. Only a module with a reachable finding is listed.
+# it and refuses on a mismatch. A version younger than COOLDOWN_DAYS is refused
+# unless EXEMPT below names it: such a module stays at its vendored version and
+# goes on the HELD list until its fix is old enough. Only a module with a
+# reachable finding is listed.
 COOLDOWN_DAYS=14
 RAISES="github.com/google/cel-go v0.30.0 2026-07-25T00:08:13Z GO-2026-6094
 go.etcd.io/etcd/client/pkg/v3 v3.7.1 2026-07-23T19:30:42Z GO-2026-6107
-golang.org/x/crypto v0.57.0 2026-09-08T18:05:01Z GO-2026-6303,GO-2026-6354,GO-2026-6355
-golang.org/x/net v0.60.0 2026-10-08T17:22:58Z GO-2026-6603,GO-2026-6610,GO-2026-6611,GO-2026-6612,GO-2026-6617
-golang.org/x/text v0.42.0 2026-09-08T16:29:55Z GO-2026-6629
+golang.org/x/crypto v0.58.0 2026-10-09T16:24:17Z GO-2026-6303,GO-2026-6354,GO-2026-6355
+golang.org/x/net v0.62.0 2026-10-27T19:00:16Z GO-2026-6603,GO-2026-6610,GO-2026-6611,GO-2026-6612,GO-2026-6617,GO-2026-6860,GO-2026-6866
+golang.org/x/text v0.43.0 2026-10-09T15:18:32Z GO-2026-6629
 google.golang.org/grpc v1.83.2 2026-08-25T15:47:16Z GO-2026-6348,GO-2026-6441,GO-2026-6443"
+
+# The cooldown exemptions: a version, raised or pulled in, that may be adopted
+# inside its COOLDOWN_DAYS because a security fix cannot wait. One line each:
+#
+#   <module> <version> <expiry YYYY-MM-DD> <reason, at least 20 characters>
+#
+# An entry exempts exactly that module version, and only through its expiry day
+# (UTC); set the expiry to the day the version's own cooldown clears. An expired
+# entry refuses the build, and so does an entry naming a version the build
+# neither raises nor pulls in (stale): an exemption is removed when it stops
+# being needed, never left to cover a later change. Each entry is reviewed like
+# the code it lets in.
+EXEMPT="golang.org/x/net v0.62.0 2026-11-10 GO-2026-6860 and GO-2026-6866 (golang.org/x/net/html) are reachable through html.Parse and html.Render in kube-apiserver, kube-scheduler, kube-controller-manager and kubectl; operator ruling of 2026-10-27 to ship the fix before its cooldown clears"
 
 # The modules the re-vendor is expected to drop from vendor/modules.txt, one per
 # line: <module> <vendored version> <the raise that drops it>. Any other removal
@@ -138,9 +163,9 @@ HELD="golang.org/x/crypto GO-2026-5932 no fixed version: golang.org/x/crypto/ope
 
 die() { echo "build-cp: $*" >&2; exit 1; }
 
-is_sha512() { printf '%s' "$1" | grep -Eq '^[0-9a-f]{128}$'; }
-is_commit() { printf '%s' "$1" | grep -Eq '^[0-9a-f]{40}$'; }
-is_epoch() { printf '%s' "$1" | grep -Eq '^[1-9][0-9]{8,10}$'; }
+is_sha512() { grep_text "$1" -Eq '^[0-9a-f]{128}$'; }
+is_commit() { grep_text "$1" -Eq '^[0-9a-f]{40}$'; }
+is_epoch() { grep_text "$1" -Eq '^[1-9][0-9]{8,10}$'; }
 
 # require_pins: non-zero, naming each, unless every tag fact is a real value.
 require_pins() {
@@ -173,7 +198,7 @@ ldflags() {
 TAR=/usr/bin/tar
 
 # is_bsdtar [tar]: zero iff the tar (default TAR) is bsdtar.
-is_bsdtar() { "${1:-$TAR}" --version 2>/dev/null | head -n 1 | grep -q '^bsdtar '; }
+is_bsdtar() { grep -q '^bsdtar ' <<<"$("${1:-$TAR}" --version 2>/dev/null | sed -n 1p)"; }
 
 # go_dir: the directory of the go on the caller's PATH, the toolchain the build
 # runs (assert_toolchain proves it is PAYLOAD_GO_VERSION). Empty if none.
@@ -250,6 +275,7 @@ print_plan() {
 	echo "# cache key: $(cache_key)"
 	local line
 	while IFS= read -r line; do echo "# raise: $line"; done <<<"$RAISES"
+	while IFS= read -r line; do [ -n "$line" ] && echo "# exempt: $line"; done <<<"$EXEMPT"
 	while IFS= read -r line; do [ -n "$line" ] && echo "# held: $line"; done <<<"$HELD"
 	for name in "${OUTPUTS[@]}"; do
 		echo "## $name"
@@ -257,9 +283,9 @@ print_plan() {
 	done
 }
 
-# raise_list_hash: the sha256 of the raise, removal and held lists, the part of
-# the cache key that moves when any of them changes.
-raise_list_hash() { printf '%s\n--\n%s\n--\n%s\n' "$RAISES" "$REMOVALS" "$HELD" | shasum -a 256 | awk '{print $1}'; }
+# raise_list_hash: the sha256 of the raise, removal, held and exemption lists,
+# the part of the cache key that moves when any of them changes.
+raise_list_hash() { printf '%s\n--\n%s\n--\n%s\n--\n%s\n' "$RAISES" "$REMOVALS" "$HELD" "$EXEMPT" | shasum -a 256 | awk '{print $1}'; }
 
 # cache_key: <tag>-<toolchain>-<first 16 hex of raise_list_hash>.
 cache_key() { printf '%s-%s-%s\n' "$KUBE_TAG" "$PAYLOAD_GO_VERSION" "$(raise_list_hash | cut -c1-16)"; }
@@ -267,21 +293,67 @@ cache_key() { printf '%s-%s-%s\n' "$KUBE_TAG" "$PAYLOAD_GO_VERSION" "$(raise_lis
 # ts_epoch <YYYY-MM-DDTHH:MM:SSZ>: a UTC timestamp, in seconds. Non-zero on any
 # other form.
 ts_epoch() {
-	printf '%s' "$1" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' || return 1
+	grep_text "$1" -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' || return 1
 	date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$1" '+%s' 2>/dev/null
 }
 
 # now_ts: the current UTC time, in ts_epoch's form.
 now_ts() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
 
-# cooldown_problem <published> <now>: prints the problem and returns non-zero
-# unless <published> is at least COOLDOWN_DAYS days (to the second) before <now>.
+# exempted <module> <version> <now>: zero iff an EXEMPT entry names exactly
+# <module> <version> and its expiry day is not before <now>'s UTC day.
+exempted() {
+	local mod="$1" ver="$2" today="${3%%T*}" m v exp reason
+	while read -r m v exp reason; do
+		[ "$m" = "$mod" ] && [ "$v" = "$ver" ] || continue
+		[[ "$today" > "$exp" ]] || return 0
+	done <<<"$EXEMPT"
+	return 1
+}
+
+# cooldown_problem <module> <version> <published> <now>: prints the problem and
+# returns non-zero unless <published> is at least COOLDOWN_DAYS days (to the
+# second) before <now>, or an unexpired EXEMPT entry names <module> <version>.
 cooldown_problem() {
-	local pub="$1" now="$2" p t
+	local mod="$1" ver="$2" pub="$3" now="$4" p t
 	p="$(ts_epoch "$pub")" || { echo "publish time '$pub' is not YYYY-MM-DDTHH:MM:SSZ"; return 1; }
 	t="$(ts_epoch "$now")" || { echo "now '$now' is not YYYY-MM-DDTHH:MM:SSZ"; return 1; }
-	[ $((t - p)) -ge $((COOLDOWN_DAYS * 86400)) ] ||
-		{ echo "published $pub, inside its $COOLDOWN_DAYS-day cooldown at $now"; return 1; }
+	[ $((t - p)) -ge $((COOLDOWN_DAYS * 86400)) ] && return 0
+	exempted "$mod" "$ver" "$now" && return 0
+	echo "published $pub, inside its $COOLDOWN_DAYS-day cooldown at $now (no unexpired EXEMPT entry names it)"
+	return 1
+}
+
+# exempt_problems <exempt> <raises> <pulled> <now>: non-zero, one line per
+# problem, unless every line of <exempt> is "<module> v<semver> <YYYY-MM-DD>
+# <reason of at least 20 characters>", names its module version once, has not
+# expired at <now>'s UTC day, and names a version <raises> lists or <pulled>
+# ("<module> <version>" per line) holds. <pulled> "-" means the re-vendor has not
+# run yet: an entry outside <raises> is then left for the post-vendor check. No
+# network.
+exempt_problems() {
+	local list="$1" raises="$2" pulled="$3" today="${4%%T*}" mod ver exp reason seen=""
+	local bad=0
+	[ -n "$list" ] || return 0
+	while read -r mod ver exp reason; do
+		[ -n "$mod" ] || continue
+		grep_text "$mod" -Eq '^[a-z0-9.-]+\.[a-z]+(/[A-Za-z0-9._~-]+)+$' || { echo "    exempt '$mod': not a module path"; bad=1; }
+		grep_text "$ver" -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' || { echo "    exempt $mod: '$ver' is not a version"; bad=1; }
+		if ! grep_text "$exp" -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' || ! date -u -j -f '%Y-%m-%d' "$exp" '+%s' >/dev/null 2>&1; then
+			echo "    exempt $mod $ver: expiry '$exp' is not a YYYY-MM-DD date"; bad=1; continue
+		fi
+		[ "${#reason}" -ge 20 ] || { echo "    exempt $mod $ver: the reason '$reason' is shorter than 20 characters"; bad=1; }
+		case " $seen " in *" $mod@$ver "*) echo "    exempt $mod $ver: listed twice"; bad=1 ;; esac
+		seen="$seen $mod@$ver"
+		if [[ "$today" > "$exp" ]]; then echo "    exempt $mod $ver: expired $exp (today is $today); remove the entry"; bad=1; fi
+		if printf '%s\n' "$raises" | awk -v m="$mod" -v v="$ver" '$1 == m && $2 == v { f = 1 } END { exit f ? 0 : 1 }'; then
+			continue
+		fi
+		[ "$pulled" = "-" ] && continue
+		printf '%s\n' "$pulled" | awk -v m="$mod" -v v="$ver" '$1 == m && $2 == v { f = 1 } END { exit f ? 0 : 1 }' ||
+			{ echo "    exempt $mod $ver: stale, the build neither raises nor pulls in $mod $ver; remove the entry"; bad=1; }
+	done <<<"$list"
+	return "$bad"
 }
 
 # raise_problems <raises> <now>: non-zero, one line per problem, unless every
@@ -293,12 +365,12 @@ raise_problems() {
 	while read -r mod ver pub ids extra; do
 		[ -n "$mod" ] || continue
 		if [ -n "$extra" ] || [ -z "$ids" ]; then echo "    raise '$mod': want '<module> <version> <published> <advisories>'"; bad=1; continue; fi
-		printf '%s' "$mod" | grep -Eq '^[a-z0-9.-]+\.[a-z]+(/[A-Za-z0-9._~-]+)+$' || { echo "    raise '$mod': not a module path"; bad=1; }
-		printf '%s' "$ver" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || { echo "    raise $mod: '$ver' is not a release version"; bad=1; }
-		printf '%s' "$ids" | grep -Eq '^GO-[0-9]{4}-[0-9]+(,GO-[0-9]{4}-[0-9]+)*$' || { echo "    raise $mod: '$ids' is not a list of advisory ids"; bad=1; }
+		grep_text "$mod" -Eq '^[a-z0-9.-]+\.[a-z]+(/[A-Za-z0-9._~-]+)+$' || { echo "    raise '$mod': not a module path"; bad=1; }
+		grep_text "$ver" -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || { echo "    raise $mod: '$ver' is not a release version"; bad=1; }
+		grep_text "$ids" -Eq '^GO-[0-9]{4}-[0-9]+(,GO-[0-9]{4}-[0-9]+)*$' || { echo "    raise $mod: '$ids' is not a list of advisory ids"; bad=1; }
 		case " $seen " in *" $mod "*) echo "    raise $mod: listed twice"; bad=1 ;; esac
 		seen="$seen $mod"
-		p="$(cooldown_problem "$pub" "$now")" || { echo "    raise $mod $ver: $p"; bad=1; }
+		p="$(cooldown_problem "$mod" "$ver" "$pub" "$now")" || { echo "    raise $mod $ver: $p"; bad=1; }
 	done <<<"$list"
 	return "$bad"
 }
@@ -524,12 +596,20 @@ apply_raises() {
 	printf '%s\n' "$report" >"$work/revendor.txt"
 	printf '%s\n' "$report" | sed 's/^/    /'
 	[ "$bad" = 0 ] || { echo "build-cp: the re-vendor changed modules the raise list does not explain (PROBLEM lines above)" >&2; return 1; }
+	local pulled=""
 	while read -r kind m _ _ new; do
 		[ "$kind" = pulled ] || continue
+		pulled="$pulled$m $new
+"
 		pub="$(proxy_time "$m" "$new")" || { echo "build-cp: the module proxy did not answer for pulled-in $m $new" >&2; return 1; }
-		p="$(cooldown_problem "$pub" "$(now_ts)")" || { echo "build-cp: pulled-in $m $new: $p" >&2; bad=1; }
+		p="$(cooldown_problem "$m" "$new" "$pub" "$(now_ts)")" || { echo "build-cp: pulled-in $m $new: $p" >&2; bad=1; }
 	done <<<"$report"
 	[ "$bad" = 0 ] || { echo "build-cp: a pulled-in version is inside its cooldown" >&2; return 1; }
+	if ! p="$(exempt_problems "$EXEMPT" "$RAISES" "$pulled" "$(now_ts)")"; then
+		printf '%s\n' "$p" >&2
+		echo "build-cp: an EXEMPT entry is malformed, expired or stale" >&2
+		return 1
+	fi
 }
 
 # write_stamp <out> <src> <work>: the build stamp beside the binaries.
@@ -544,6 +624,7 @@ write_stamp() {
 		echo "cache-key: $(cache_key)"
 		echo "raise-list-sha256: $(raise_list_hash)"
 		while IFS= read -r line; do [ -n "$line" ] && echo "raise-list: $line"; done <<<"$RAISES"
+		while IFS= read -r line; do [ -n "$line" ] && echo "exempt-list: $line"; done <<<"$EXEMPT"
 		while IFS= read -r line; do [ -n "$line" ] && echo "removal-list: $line"; done <<<"$REMOVALS"
 		while IFS= read -r line; do [ -n "$line" ] && echo "vendor: $line"; done <"$work/revendor.txt"
 		while IFS= read -r line; do [ -n "$line" ] && echo "held: $line"; done <<<"$HELD"
@@ -563,6 +644,10 @@ build() {
 	if ! problems="$(raise_problems "$RAISES" "$(now_ts)")"; then
 		printf '%s\n' "$problems" >&2
 		die "refusing to build: the raise list is malformed or an entry is inside its cooldown (move such a module to HELD until its fix is old enough)"
+	fi
+	if ! problems="$(exempt_problems "$EXEMPT" "$RAISES" - "$(now_ts)")"; then
+		printf '%s\n' "$problems" >&2
+		die "refusing to build: an EXEMPT entry is malformed or expired"
 	fi
 	if [ -e "$out" ]; then
 		[ -d "$out" ] && [ -z "$(ls -A "$out")" ] || die "$out exists and is not an empty directory"
@@ -646,13 +731,13 @@ self_test() {
 	echo "==> the plan runs every build under env -i with the required flags"
 	plan="$(print_plan)"
 	for name in "${OUTPUTS[@]}"; do
-		printf '%s\n' "$plan" | grep -q "^## $name\$" || bad "plan has no entry for $name"
+		grep_text "$plan" -q "^## $name\$" || bad "plan has no entry for $name"
 	done
 	local n
 	n="$(printf '%s\n' "$plan" | grep -c '^env -i ' || true)"
 	if [ "$n" -eq "${#OUTPUTS[@]}" ]; then ok "every build line starts with env -i"; else bad "$n build lines start with env -i, want ${#OUTPUTS[@]}"; fi
-	if printf '%s\n' "$plan" | grep -q 'GOFLAGS'; then bad "the plan names GOFLAGS"; else ok "no GOFLAGS in the plan"; fi
-	if printf '%s\n' "$plan" | grep -q 'GOROOT'; then bad "the plan sets GOROOT"; else ok "no GOROOT in the plan (go finds its own)"; fi
+	if grep_text "$plan" -q 'GOFLAGS'; then bad "the plan names GOFLAGS"; else ok "no GOFLAGS in the plan"; fi
+	if grep_text "$plan" -q 'GOROOT'; then bad "the plan sets GOROOT"; else ok "no GOROOT in the plan (go finds its own)"; fi
 	local flag
 	for flag in " PATH=" " HOME=" " GOCACHE=" " GOPATH=" " GOMODCACHE=" " TMPDIR=" " GOENV=off " \
 		" GOTOOLCHAIN=local " " CGO_ENABLED=0 " " GOOS=darwin " " GOARCH=arm64 " " GOWORK=" " SOURCE_DATE_EPOCH=$KUBE_TAG_EPOCH " \
@@ -662,14 +747,14 @@ self_test() {
 		n="$(printf '%s\n' "$plan" | grep '^env -i ' | grep -cF -- "$flag" || true)"
 		if [ "$n" -eq "${#OUTPUTS[@]}" ]; then ok "every build carries '$flag'"; else bad "'$flag' appears in $n build lines, want ${#OUTPUTS[@]}"; fi
 	done
-	if build_env "<src>" "<work>" "<go-dir>" | grep -qx "GOWORK=off"; then ok "a source without go.work builds with workspace mode off"; else bad "the plan does not isolate GOWORK"; fi
+	if grep -qx "GOWORK=off" <<<"$(build_env "<src>" "<work>" "<go-dir>")"; then ok "a source without go.work builds with workspace mode off"; else bad "the plan does not isolate GOWORK"; fi
 	mkdir -p "$tmp/wsrc" && : >"$tmp/wsrc/go.work"
-	if build_env "$tmp/wsrc" "$tmp/w" "/g" | grep -qx "GOWORK=$(cd "$tmp/wsrc" && pwd -P)/go.work"; then ok "a source with go.work builds as its own workspace"; else bad "GOWORK does not name the source's go.work"; fi
+	if grep -qx "GOWORK=$(cd "$tmp/wsrc" && pwd -P)/go.work" <<<"$(build_env "$tmp/wsrc" "$tmp/w" "/g")"; then ok "a source with go.work builds as its own workspace"; else bad "GOWORK does not name the source's go.work"; fi
 
 	# GOWORK: a src reached through a symlinked parent must yield the resolved GOWORK.
 	mkdir -p "$tmp/real/s" && : >"$tmp/real/s/go.work" && ln -s "$tmp/real" "$tmp/link"
 	rs="$(cd "$tmp/real/s" && pwd -P)"
-	if build_env "$tmp/link/s" "$tmp/w" "/g" | grep -qx "GOWORK=$rs/go.work"; then ok "GOWORK names the resolved path through a symlinked parent"; else bad "GOWORK keeps the symlinked spelling"; fi
+	if grep -qx "GOWORK=$rs/go.work" <<<"$(build_env "$tmp/link/s" "$tmp/w" "/g")"; then ok "GOWORK names the resolved path through a symlinked parent"; else bad "GOWORK keeps the symlinked spelling"; fi
 	# GOWORK: cleanup removes a tree holding a read-only subtree.
 	mkdir -p "$tmp/ro/a/b" && : >"$tmp/ro/a/b/f" && chmod -R a-w "$tmp/ro/a"
 	cleanup_tree "$tmp/ro"
@@ -722,7 +807,7 @@ self_test() {
 	printf '99.0.0\n' >"$dest/kubernetes/.go-version"
 	if out="$(PAYLOAD_GO_VERSION="$cur" assert_toolchain "$dest/kubernetes" "$wk" "$gd" 2>&1)"; then
 		bad "a payload pin older than the source's .go-version was accepted"
-	elif printf '%s\n' "$out" | grep -q "older than the source"; then ok "a payload pin older than the source's .go-version refuses"; else bad "the old-pin refusal did not say why: $out"; fi
+	elif grep_text "$out" -q "older than the source"; then ok "a payload pin older than the source's .go-version refuses"; else bad "the old-pin refusal did not say why: $out"; fi
 	printf '1.0.0\n' >"$dest/kubernetes/.go-version"
 	# A hostile caller environment must not steer the go commands the build runs.
 	if (export GOFLAGS=-mod=mod GOTOOLCHAIN=go1.0.0 GOROOT=/nonexistent GOENV="$tmp/hostile.env"
@@ -743,7 +828,7 @@ self_test() {
 	if raise_problems "example.com/mod v1.2.3 $d14 GO-2026-0001" "$now" >/dev/null; then ok "a raise published exactly $COOLDOWN_DAYS days ago passes"; else bad "a raise $COOLDOWN_DAYS days old was refused"; fi
 	if out="$(raise_problems "example.com/mod v1.2.3 $d14m1 GO-2026-0001" "$now")"; then
 		bad "a raise inside its cooldown was accepted"
-	elif printf '%s\n' "$out" | grep -q "inside its $COOLDOWN_DAYS-day cooldown"; then ok "a raise one second short of $COOLDOWN_DAYS days is refused (the cooldown compares full timestamps)"; else bad "the cooldown refusal did not say why: $out"; fi
+	elif grep_text "$out" -q "inside its $COOLDOWN_DAYS-day cooldown"; then ok "a raise one second short of $COOLDOWN_DAYS days is refused (the cooldown compares full timestamps)"; else bad "the cooldown refusal did not say why: $out"; fi
 	if raise_problems "example.com/mod v1.2.3 $now GO-2026-0001" "$now" >/dev/null; then bad "a raise published now was accepted"; else ok "a raise published now is refused"; fi
 	local shape
 	for shape in "example.com/mod 1.2.3 $t0 GO-2026-0001" "example.com/mod v1.2.3 2026-01-01 GO-2026-0001" \
@@ -753,6 +838,33 @@ self_test() {
 		if raise_problems "$shape" "$now" >/dev/null; then bad "a malformed raise passed: '$shape'"; else ok "malformed raise refused: '$shape'"; fi
 	done
 	if raise_problems "$(printf 'example.com/mod v1.2.3 %s GO-2026-0001\nexample.com/mod v1.2.4 %s GO-2026-0002' "$t0" "$t0")" "$now" >/dev/null; then bad "a module listed twice passed"; else ok "a module listed twice is refused"; fi
+
+	echo "==> the cooldown exemptions"
+	local tomorrow yesterday ok_reason="an urgent security fix reachable here" young xp
+	tomorrow="$(date -u -j -v+1d -f '%Y-%m-%dT%H:%M:%SZ' "$now" +%Y-%m-%d)"
+	yesterday="$(date -u -j -v-1d -f '%Y-%m-%dT%H:%M:%SZ' "$now" +%Y-%m-%d)"
+	young="example.com/young v1.0.0 $now GO-2026-0001"
+	if out="$(exempt_problems "$EXEMPT" "$RAISES" - "$now")"; then ok "the committed exemptions are well-formed and unexpired"; else bad "the committed exemptions: $out"; fi
+	if out="$(EXEMPT="example.com/young v1.0.0 $tomorrow $ok_reason" raise_problems "$young" "$now")"; then ok "an exempted raise inside its cooldown passes"; else bad "an exempted young raise was refused: $out"; fi
+	if out="$(EXEMPT="example.com/young v1.0.0 $today $ok_reason" raise_problems "$young" "$now")"; then ok "an exemption holds through its expiry day"; else bad "an exemption expiring today was refused: $out"; fi
+	if out="$(EXEMPT="" raise_problems "$young" "$now")"; then bad "the same young raise without an exemption was accepted"; elif grep_text "$out" -q "inside its $COOLDOWN_DAYS-day cooldown"; then ok "the same young raise without an exemption is still refused"; else bad "the unexempted refusal did not say why: $out"; fi
+	if EXEMPT="example.com/young v1.0.1 $tomorrow $ok_reason" raise_problems "$young" "$now" >/dev/null; then bad "an exemption for another version covered the raise"; else ok "an exemption covers only its exact version"; fi
+	if EXEMPT="example.com/young v1.0.0 $yesterday $ok_reason" raise_problems "$young" "$now" >/dev/null; then bad "an expired exemption still covered a young raise"; else ok "an expired exemption no longer covers the raise"; fi
+	xp="example.com/young v1.0.0 $yesterday $ok_reason"
+	if out="$(exempt_problems "$xp" "$young" - "$now")"; then bad "an expired exemption passed"; elif grep_text "$out" -q "expired $yesterday"; then ok "an expired exemption is refused"; else bad "the expired exemption was not named: $out"; fi
+	xp="example.com/other v2.0.0 $tomorrow $ok_reason"
+	if out="$(exempt_problems "$xp" "$young" "" "$now")"; then bad "a stale exemption passed"; elif grep_text "$out" -q "exempt example.com/other v2.0.0: stale"; then ok "a stale exemption (neither raised nor pulled in) is refused"; else bad "the stale exemption was not named: $out"; fi
+	if exempt_problems "$xp" "$young" "example.com/other v2.0.1" "$now" >/dev/null; then bad "an exemption for a version other than the pulled-in one passed"; else ok "an exemption must name the pulled-in version exactly"; fi
+	if exempt_problems "$xp" "$young" "example.com/other v2.0.0" "$now" >/dev/null; then ok "an exemption naming a pulled-in version passes"; else bad "an exemption naming a pulled-in version was refused"; fi
+	if exempt_problems "$xp" "$young" - "$now" >/dev/null; then ok "before the re-vendor, an entry outside the raise list is left for the post-vendor check"; else bad "an entry outside the raise list was refused before the re-vendor"; fi
+	if (EXEMPT="example.com/pulled v3.0.0 $tomorrow $ok_reason"; cooldown_problem example.com/pulled v3.0.0 "$now" "$now" >/dev/null); then ok "an exemption covers a pulled-in version's cooldown"; else bad "an exempted pulled-in version was refused"; fi
+	for shape in "example.com/young v1.0.0 $tomorrow too short" "example.com/young v1.0.0 2026-13-45 $ok_reason" \
+		"example.com/young v1.0.0 ${tomorrow}T00:00:00Z $ok_reason" "example.com/young 1.0.0 $tomorrow $ok_reason" \
+		"nodot v1.0.0 $tomorrow $ok_reason" "example.com/young v1.0.0 $tomorrow"; do
+		if exempt_problems "$shape" "$young" - "$now" >/dev/null; then bad "a malformed exemption passed: '$shape'"; else ok "malformed exemption refused: '$shape'"; fi
+	done
+	if exempt_problems "$(printf 'example.com/young v1.0.0 %s %s\nexample.com/young v1.0.0 %s %s' "$tomorrow" "$ok_reason" "$tomorrow" "$ok_reason")" "$young" - "$now" >/dev/null; then bad "an exemption listed twice passed"; else ok "an exemption listed twice is refused"; fi
+
 	local k1 k2
 	k1="$(cache_key)"
 	k2="$(RAISES="$RAISES
@@ -761,6 +873,7 @@ example.com/mod v1.2.3 $t0 GO-2026-0001" cache_key)"
 	if [ "$k1" != "$k2" ]; then ok "a raise list change moves the cache key"; else bad "the cache key ignores the raise list"; fi
 	if [ "$k1" != "$(PAYLOAD_GO_VERSION=go1.0.1 cache_key)" ]; then ok "a toolchain change moves the cache key"; else bad "the cache key ignores the toolchain"; fi
 	if [ "$k1" != "$(REMOVALS="" cache_key)" ]; then ok "a removal list change moves the cache key"; else bad "the cache key ignores the removal list"; fi
+	if [ "$k1" != "$(EXEMPT="" cache_key)" ]; then ok "an exemption list change moves the cache key"; else bad "the cache key ignores the exemption list"; fi
 	if [ "$("$self" --print-raises)" = "$(printf '%s\n' "$RAISES" | awk '{print $1, $2}')" ] && [ "$("$self" --print-raises | wc -l | tr -d ' ')" = "$(printf '%s\n' "$RAISES" | wc -l | tr -d ' ')" ]; then ok "--print-raises prints each raise as <module> <version>"; else bad "--print-raises: $("$self" --print-raises)"; fi
 	if [ "$("$self" --print-raise-list-hash)" = "$(raise_list_hash)" ] && [ "$(raise_list_hash | cut -c1-16)" = "${k1##*-}" ]; then ok "--print-raise-list-hash is the hash the cache key abbreviates"; else bad "--print-raise-list-hash: $("$self" --print-raise-list-hash)"; fi
 
@@ -778,8 +891,8 @@ example.com/mod v1.2.3 $t0 GO-2026-0001" cache_key)"
 	local rx="d.example/gone v1.0.0 a.example/raised drops it"
 	rg="$(printf 'k8s.io/kubernetes a.example/raised@v1.2.0\na.example/raised@v1.2.0 b.example/dep@v1.1.0\nb.example/dep@v1.1.0 e.example/new@v0.1.0')"
 	if out="$(revendor_problems "$rb" "$ra" "$rg" "$rmains" "$rr" "$rx")"; then
-		if printf '%s\n' "$out" | grep -qx "pulled b.example/dep v1.0.0 -> v1.1.0" && printf '%s\n' "$out" | grep -qx "pulled e.example/new (new) -> v0.1.0" &&
-			printf '%s\n' "$out" | grep -qx "removed d.example/gone v1.0.0"; then
+		if grep_text "$out" -qx "pulled b.example/dep v1.0.0 -> v1.1.0" && grep_text "$out" -qx "pulled e.example/new (new) -> v0.1.0" &&
+			grep_text "$out" -qx "removed d.example/gone v1.0.0"; then
 			ok "changes required by a raise (directly and through another) pass and are reported"
 		else
 			bad "the explained change report: $out"
@@ -790,31 +903,31 @@ example.com/mod v1.2.3 $t0 GO-2026-0001" cache_key)"
 	rg2="$(printf 'k8s.io/kubernetes a.example/raised@v1.2.0\nk8s.io/api b.example/dep@v1.1.0\nk8s.io/api e.example/new@v0.1.0')"
 	if out="$(revendor_problems "$rb" "$ra" "$rg2" "$rmains" "$rr" "$rx")"; then
 		bad "a change required only by a main module passed"
-	elif printf '%s\n' "$out" | grep -q "PROBLEM b.example/dep v1.0.0 -> v1.1.0 is not explained"; then ok "a change only a main module requires is refused"; else bad "the unexplained change was not named: $out"; fi
+	elif grep_text "$out" -q "PROBLEM b.example/dep v1.0.0 -> v1.1.0 is not explained"; then ok "a change only a main module requires is refused"; else bad "the unexplained change was not named: $out"; fi
 	rg3="$(printf 'a.example/raised@v1.2.0 b.example/dep@v1.0.5\nb.example/dep@v1.1.0 e.example/new@v0.1.0')"
 	if revendor_problems "$rb" "$ra" "$rg3" "$rmains" "$rr" >/dev/null; then bad "a change at a version no raise requires passed"; else ok "a change to a version no raise requires is refused"; fi
-	if out="$(revendor_problems "$rb" "$rb" "" "$rmains" "$rr" "")"; then bad "a raise that moved nothing passed"; elif printf '%s\n' "$out" | grep -q "did not move"; then ok "a raise that did not move its module is refused"; else bad "the unmoved raise was not named: $out"; fi
+	if out="$(revendor_problems "$rb" "$rb" "" "$rmains" "$rr" "")"; then bad "a raise that moved nothing passed"; elif grep_text "$out" -q "did not move"; then ok "a raise that did not move its module is refused"; else bad "the unmoved raise was not named: $out"; fi
 	# A raise that lands above its listed version (another module required more).
 	local rabove rbelow
 	rabove="$(printf '%s\n' "$ra" | sed 's|^a.example/raised v1.2.0$|a.example/raised v1.10.0|')"
 	if out="$(revendor_problems "$rb" "$rabove" "$rg" "$rmains" "$rr" "$rx")"; then
 		bad "a raise landing above its listed version passed"
-	elif printf '%s\n' "$out" | grep -q "PROBLEM raise a.example/raised landed at v1.10.0, above its listed v1.2.0"; then ok "a raise landing above its listed version is refused (semver: v1.10.0 > v1.2.0)"; else bad "the above-listed landing was not named: $out"; fi
+	elif grep_text "$out" -q "PROBLEM raise a.example/raised landed at v1.10.0, above its listed v1.2.0"; then ok "a raise landing above its listed version is refused (semver: v1.10.0 > v1.2.0)"; else bad "the above-listed landing was not named: $out"; fi
 	rbelow="$(printf '%s\n' "$ra" | sed 's|^a.example/raised v1.2.0$|a.example/raised v1.1.9|')"
 	if out="$(revendor_problems "$rb" "$rbelow" "$rg" "$rmains" "$rr" "$rx")"; then
 		bad "a raise landing below its listed version passed"
-	elif printf '%s\n' "$out" | grep -q "landed at v1.1.9, below its listed v1.2.0"; then ok "a raise landing below its listed version is refused"; else bad "the below-listed landing was not named: $out"; fi
+	elif grep_text "$out" -q "landed at v1.1.9, below its listed v1.2.0"; then ok "a raise landing below its listed version is refused"; else bad "the below-listed landing was not named: $out"; fi
 	if out="$(revendor_problems "$rb" "$ra" "$rg" "$rmains" "$rr" "")"; then
 		bad "a removal the list does not name passed"
-	elif printf '%s\n' "$out" | grep -q "PROBLEM d.example/gone v1.0.0 left vendor/modules.txt"; then ok "a removal the removal list does not name is refused"; else bad "the unnamed removal was not named: $out"; fi
+	elif grep_text "$out" -q "PROBLEM d.example/gone v1.0.0 left vendor/modules.txt"; then ok "a removal the removal list does not name is refused"; else bad "the unnamed removal was not named: $out"; fi
 	if out="$(revendor_problems "$rb" "$ra" "$rg" "$rmains" "$rr" "$rx
-f.example/stays v1.0.0 nothing")"; then bad "a listed removal that did not happen passed"; elif printf '%s\n' "$out" | grep -q "PROBLEM removal f.example/stays"; then ok "a listed removal that did not happen is refused"; else bad "the stale removal was not named: $out"; fi
+f.example/stays v1.0.0 nothing")"; then bad "a listed removal that did not happen passed"; elif grep_text "$out" -q "PROBLEM removal f.example/stays"; then ok "a listed removal that did not happen is refused"; else bad "the stale removal was not named: $out"; fi
 	local rbr rar
 	rbr="$(printf '%s\n' "$rb" "g.example/repl v1.0.0 => ./local/repl")"
 	rar="$(printf '%s\n' "$ra" "g.example/repl v1.0.0 => ./elsewhere")"
 	if out="$(revendor_problems "$rbr" "$rar" "$rg" "$rmains" "$rr" "$rx")"; then
 		bad "a changed replacement passed"
-	elif printf '%s\n' "$out" | grep -q "PROBLEM g.example/repl: replacement changed"; then ok "a changed replacement (=>) is refused"; else bad "the replacement change was not named: $out"; fi
+	elif grep_text "$out" -q "PROBLEM g.example/repl: replacement changed"; then ok "a changed replacement (=>) is refused"; else bad "the replacement change was not named: $out"; fi
 	rar="$(printf '%s\n' "$ra" "g.example/repl v1.0.0 => ./local/repl")"
 	if revendor_problems "$rbr" "$rar" "$rg" "$rmains" "$rr" "$rx" >/dev/null; then ok "an unchanged replacement passes"; else bad "an unchanged replacement was refused"; fi
 	rar="$(printf '%s\n' "$ra" "g.example/repl v1.0.0")"
@@ -835,7 +948,7 @@ f.example/stays v1.0.0 nothing")"; then bad "a listed removal that did not happe
 	chmod 0755 "$tmp/pinless/build-cp.sh"
 	if out="$(PATH="$tmp/bin:$PATH" "$tmp/pinless/build-cp.sh" "$tmp/out" 2>&1)"; then
 		bad "build ran with a placeholder digest"
-	elif printf '%s\n' "$out" | grep -q "KUBE_SRC_SHA512 is not a pinned sha512"; then
+	elif grep_text "$out" -q "KUBE_SRC_SHA512 is not a pinned sha512"; then
 		ok "build refuses, naming the placeholder digest"
 	else
 		bad "build refused without naming the digest pin: $out"
@@ -849,12 +962,45 @@ f.example/stays v1.0.0 nothing")"; then bad "a listed removal that did not happe
 	chmod 0755 "$tmp/young/build-cp.sh"
 	if out="$(PATH="$tmp/bin:$PATH" "$tmp/young/build-cp.sh" "$tmp/out-young" 2>&1)"; then
 		bad "build ran with a raise published today"
-	elif printf '%s\n' "$out" | grep -q "raise example.com/young v1.0.0: published $today"'T.*'", inside its $COOLDOWN_DAYS-day cooldown"; then
+	elif grep_text "$out" -q "raise example.com/young v1.0.0: published $today"'T.*'", inside its $COOLDOWN_DAYS-day cooldown"; then
 		ok "build refuses, naming the raise inside its cooldown"
 	else
 		bad "build refused without naming the young raise: $out"
 	fi
 	if [ ! -e "$tmp/curl.log" ]; then ok "nothing was downloaded for the young raise"; else bad "curl ran before the raise list was checked"; fi
+
+	echo "==> an exempted young raise passes the pre-network checks; an expired exemption refuses before any network"
+	mkdir -p "$tmp/bin2" "$tmp/exempt/lib" "$tmp/expired/lib"
+	printf '#!/bin/sh\necho called >>"%s"\nexit 1\n' "$tmp/curl2.log" >"$tmp/bin2/curl"
+	chmod 0755 "$tmp/bin2/curl"
+	cp "$HERE/lib/gochild.sh" "$tmp/exempt/lib/"
+	cp "$HERE/lib/gochild.sh" "$tmp/expired/lib/"
+	awk -v d="$now" -v e="$tomorrow" -v r="$ok_reason" '
+		/^RAISES="/ { print "RAISES=\"example.com/young v1.0.0 " d " GO-2026-0001"; next }
+		/^EXEMPT="/ { print "EXEMPT=\"example.com/young v1.0.0 " e " " r; print substr($0, 9); next }
+		{ print }' "$self" >"$tmp/exempt/build-cp.sh"
+	chmod 0755 "$tmp/exempt/build-cp.sh"
+	if out="$(PATH="$tmp/bin2:$PATH" "$tmp/exempt/build-cp.sh" "$tmp/out-exempt" 2>&1)"; then
+		bad "the exempted build ran to completion against a failing curl"
+	elif grep_text "$out" -q "download of .* failed" && [ -e "$tmp/curl2.log" ]; then
+		ok "the exempted young raise passes the raise and exemption checks and reaches the download"
+	else
+		bad "the exempted young raise was refused before the download: $out"
+	fi
+	awk -v d="$now" -v e="$yesterday" -v r="$ok_reason" '
+		/^RAISES="/ { print "RAISES=\"example.com/young v1.0.0 " d " GO-2026-0001"; next }
+		/^EXEMPT="/ { print "EXEMPT=\"example.com/young v1.0.0 " e " " r; print substr($0, 9); next }
+		{ print }' "$self" >"$tmp/expired/build-cp.sh"
+	chmod 0755 "$tmp/expired/build-cp.sh"
+	rm -f "$tmp/curl2.log"
+	if out="$(PATH="$tmp/bin2:$PATH" "$tmp/expired/build-cp.sh" "$tmp/out-expired" 2>&1)"; then
+		bad "a build ran with an expired exemption"
+	elif grep_text "$out" -q "raise example.com/young v1.0.0: published .*inside its $COOLDOWN_DAYS-day cooldown"; then
+		ok "an expired exemption leaves the young raise refused, naming it"
+	else
+		bad "the expired exemption build refused without naming the raise: $out"
+	fi
+	if [ ! -e "$tmp/curl2.log" ]; then ok "nothing was downloaded under the expired exemption"; else bad "curl ran under an expired exemption"; fi
 
 	echo "==> outputs equal stage.sh's pinned-source list"
 	local mine theirs

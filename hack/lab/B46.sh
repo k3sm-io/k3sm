@@ -484,7 +484,7 @@ watchdog() {
 			"$(lease_renew kube-system kube-controller-manager)" >>"$EV/watch.tsv"
 		if [ "$readyz_bad" -ge 15 ]; then echo "/readyz failed for ${readyz_bad} s" >"$EV/watchdog.fired"; kill_fill "$pod"; return; fi
 		if [ "$now" -ge "$deadline" ]; then echo "leg wall clock reached" >"$EV/watchdog.fired"; kill_fill "$pod"; return; fi
-		if [ "$ceiling_at" -eq 0 ] && kc logs -n "$ns" "$pod" 2>/dev/null | grep -q 'b46-fill CEILING'; then ceiling_at="$now"; fi
+		if [ "$ceiling_at" -eq 0 ] && grep -q 'b46-fill CEILING' <<<"$(kc logs -n "$ns" "$pod" 2>/dev/null)"; then ceiling_at="$now"; fi
 		if [ "$ceiling_at" -ne 0 ] && [ "$phase" = Running ] && [ $((now - ceiling_at)) -ge 120 ]; then
 			echo "fill held at its ceiling for 120 s and neither mechanism acted" >"$EV/watchdog.fired"; kill_fill "$pod"; return
 		fi
@@ -525,7 +525,7 @@ wait_running() {
 # bracket keeps the remote shell from matching itself), and accepted only if
 # that pid's comm really is b46-fill.
 fill_pid() {
-	rsh "p=\$(pgrep -f '$(fill_pattern "$1")' | head -1); [ -n \"\$p\" ] || exit 0; c=\$(ps -o comm= -p \$p); [ \"\${c##*/}\" = b46-fill ] && echo \$p" 2>/dev/null | tr -d '[:space:]'
+	rsh "p=\$(pgrep -f '$(fill_pattern "$1")' | sed -n 1p); [ -n \"\$p\" ] || exit 0; c=\$(ps -o comm= -p \$p); [ \"\${c##*/}\" = b46-fill ] && echo \$p" 2>/dev/null | tr -d '[:space:]'
 }
 kernel_lines() {
 	# kernel_lines <start> <end|""> : the kernel's out-of-swap lines over a window.
@@ -599,7 +599,7 @@ leg1() {
 	ladder ok "l1.watchdog  did not fire"
 
 	server_log_since "$log_off" >"$EV/leg1-server.log" 2>&1 || true
-	if grep 'node memory pressure raised' "$EV/leg1-server.log" | grep -Eq 'signal=(compressor|swap)'; then
+	if grep -Eq 'signal=(compressor|swap)' <<<"$(grep 'node memory pressure raised' "$EV/leg1-server.log")"; then
 		ladder ok "l1.trip  a compressor or swap arm crossed its trip value"
 	else ladder no "l1.trip  no compressor or swap trip recorded (a fill that never reached a threshold is not a pass)"; fi
 
@@ -614,7 +614,7 @@ leg1() {
 	if [ "$phase" = Failed ] && [ "$reason" = Evicted ]; then ladder ok "l1.status  pod Failed/Evicted"
 	else ladder no "l1.status  pod phase/reason = $phase/$reason, want Failed/Evicted"; fi
 
-	mpmsg_seen="$(awk -F'\t' '$0 ~ /\tmp=True\t/ { for (i=1;i<=NF;i++) if ($i ~ /^mpmsg=/) print $i }' "$EV/watch.tsv" | grep -E 'compressor|swap|memory.available' | head -1)"
+	mpmsg_seen="$(awk -F'\t' '$0 ~ /\tmp=True\t/ { for (i=1;i<=NF;i++) if ($i ~ /^mpmsg=/) print $i }' "$EV/watch.tsv" | grep -E 'compressor|swap|memory.available' | sed -n 1p)"
 	if [ -n "$mpmsg_seen" ]; then ladder ok "l1.cond  MemoryPressure True naming its signal (${mpmsg_seen#mpmsg=})"
 	else ladder no "l1.cond  MemoryPressure was never observed True with a signal-naming Message"; fi
 
@@ -631,7 +631,7 @@ leg1() {
 		break
 	done
 	if [ "$(kc get node "$NODE" -o jsonpath='{.status.conditions[?(@.type=="MemoryPressure")].status}')" = False ] &&
-		! kc get node "$NODE" -o jsonpath='{.spec.taints[*].key}' | grep -q 'node.kubernetes.io/memory-pressure'; then
+		! grep -q 'node.kubernetes.io/memory-pressure' <<<"$(kc get node "$NODE" -o jsonpath='{.spec.taints[*].key}')"; then
 		ladder ok "l1.release  MemoryPressure back to False and the taint cleared"
 	else ladder no "l1.release  MemoryPressure or its taint did not clear within 5 minutes"; fi
 	cp "$EV/watch.tsv" "$EV/leg1-watch.tsv"
@@ -659,7 +659,7 @@ leg2() {
 	WATCH_PID=$!
 	skip_srv=""
 	while :; do
-		if [ -z "$skip_srv" ] && server_log_since "$log_off" 2>/dev/null | grep 'cannot evict a critical pod' | grep -q "pod=$NS2/$pod"; then
+		if [ -z "$skip_srv" ] && grep -q "pod=$NS2/$pod" <<<"$(server_log_since "$log_off" 2>/dev/null | grep 'cannot evict a critical pod')"; then
 			skip_srv="$(server_now)"
 		fi
 		exitc="$(kc get pod -n "$NS2" "$pod" -o jsonpath='{.status.containerStatuses[0].state.terminated.exitCode}' 2>/dev/null || true)"
@@ -672,7 +672,7 @@ leg2() {
 	ladder ok "l2.watchdog  did not fire"
 
 	server_log_since "$log_off" >"$EV/leg2-server.log" 2>&1 || true
-	if [ -n "$skip_srv" ] && ! grep 'eviction manager: evicting pod' "$EV/leg2-server.log" | grep -q "pod=$NS2/$pod"; then
+	if [ -n "$skip_srv" ] && ! grep -q "pod=$NS2/$pod" <<<"$(grep 'eviction manager: evicting pod' "$EV/leg2-server.log")"; then
 		ladder ok "l2.skip  the manager logged the critical-pod skip and evicted nothing"
 	else ladder no "l2.skip  skip logged=${skip_srv:+yes} / an eviction of the critical pod was logged"; fi
 

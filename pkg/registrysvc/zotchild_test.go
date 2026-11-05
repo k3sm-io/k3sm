@@ -127,9 +127,15 @@ func TestZotVariantNamesRaises(t *testing.T) {
 }
 
 // TestZotBuildArgs pins the build argv: zot's own main package, hash-checked
-// against the wrapper's go.sum, with no host path in the binary.
+// against the wrapper's go.sum, with no host path in the binary, and no build
+// tags, so no extension (search among them) is linked.
 func TestZotBuildArgs(t *testing.T) {
 	args := zotBuildArgs("/out/zot")
+	for _, a := range args {
+		if a == "-tags" || strings.HasPrefix(a, "-tags=") {
+			t.Errorf("zotBuildArgs = %q passes build tags; the child is the minimal build", args)
+		}
+	}
 	for _, want := range []string{"build", "-trimpath", "-buildvcs=false", "-mod=readonly", "/out/zot", zotModulePath} {
 		if !slices.Contains(args, want) {
 			t.Errorf("zotBuildArgs = %q, missing %q", args, want)

@@ -40,17 +40,18 @@ limitations under the License.
 // # Lifecycle
 //
 // Start brings the components up in dependency order and blocks until the
-// apiserver reports healthz ok (or ctx ends). Stop tears them down in REVERSE —
-// the apiserver first (so it drains and stops writing), then scheduler and
-// controller-manager, then kine LAST (so no component loses its datastore
-// mid-shutdown), and finally closes the SQLite database. The whole lifecycle is
-// ctx-driven.
+// apiserver reports healthz ok (or ctx ends). Stop tears them down in
+// shutdownOrder: the apiserver first (so it drains and stops writing), then
+// scheduler and controller-manager, then the datastore LAST (so no component
+// loses its datastore mid-shutdown); once the datastore child has exited its
+// SQLite database is no longer in use. The whole lifecycle is ctx-driven.
 //
 // # Auth posture
 //
 // The apiserver enforces Node,RBAC by default (DefaultAuthorizationMode); the
-// static bearer token remains for the in-process Virtual Kubelet node, the
-// post-bring-up provisioning client, and the healthz probe.
+// static bearer token remains for the post-bring-up admin client and the
+// provisioners built on it, kubectl, and the healthz probe; the in-process node and
+// the scheduler and controller-manager carry their own client certificates (below).
 //
 // # HA datastore
 //

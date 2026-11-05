@@ -129,7 +129,7 @@ echo "### build s3mem (CGO, public libproc — the rusage_darwin.go pattern)"
 ( cd "$W/s3" && export GOPATH=$W/gopath GOCACHE=$W/gocache GOMODCACHE=$W/gomodcache
   [ -f go.mod ] || "$GO" mod init k3sm.io/spike/s3mem >/dev/null 2>&1
   CGO_ENABLED=1 "$GO" build -o "$PREFIX/bin/s3mem" . ) || { echo "BUILD FAILED"; exit 1; }
-echo "  built $($PREFIX/bin/s3mem 2>&1 | head -0; echo ok) $(ls -l "$PREFIX/bin/s3mem" | awk '{print $5" bytes"}')"
+echo "  built $($PREFIX/bin/s3mem >/dev/null 2>&1; echo ok) $(ls -l "$PREFIX/bin/s3mem" | awk '{print $5" bytes"}')"
 
 mb() { awk -F, 'NR==1{next}{printf "  t=%-6s fp=%8.1fMB rss=%8.1fMB pgrp_n=%s pgrp_sum=%8.1fMB\n",$1,$3/1048576,$4/1048576,$5,$6/1048576}' "$1"; }
 
@@ -152,11 +152,11 @@ for _ in stream_generate(model, tok, prompt=p, max_tokens=MAX):
 print("DONE tokens=%d mlx_active=%d mlx_peak=%d" % (n, mx.get_active_memory(), mx.get_peak_memory()), flush=True)
 time.sleep(3)
 PY
-MP3=$(ls -d "$PREFIX"/hf/hub/models--*Llama-3.2-3B*/snapshots/* 2>/dev/null | head -1)
+MP3=$(ls -d "$PREFIX"/hf/hub/models--*Llama-3.2-3B*/snapshots/* 2>/dev/null | sed -n 1p)
 if [ -z "$MP3" ]; then
   echo "### fetching $MODEL_S3 (<=2 GB cap)"
   HF_HOME=$PREFIX/hf "$V" -c "from huggingface_hub import snapshot_download; print(snapshot_download('$MODEL_S3'))"
-  MP3=$(ls -d "$PREFIX"/hf/hub/models--*Llama-3.2-3B*/snapshots/* | head -1)
+  MP3=$(ls -d "$PREFIX"/hf/hub/models--*Llama-3.2-3B*/snapshots/* | sed -n 1p)
 fi
 echo "### (1)(2) visibility + sustained-generation growth — $MODEL_S3, 1200 tokens, under the S1 profile"
 ( cd "$POD" && env -i HOME="$POD" TMPDIR="$POD/tmp" PATH=/usr/bin:/bin MODEL_PATH="$MP3" \
@@ -205,7 +205,7 @@ probe() { # probe <name> <cap_gb> <wired_gb>
   mb "$PREFIX/logs/s3-$n.csv"
   echo "  jetsam events in window:"
   /usr/bin/log show --style compact --start "$t0" --predicate 'eventMessage CONTAINS "jetsam"' 2>/dev/null \
-    | grep -v 'log run noninteractively' | tail -n +2 | head -5 | sed 's/^/    /' || true
+    | grep -v 'log run noninteractively' | tail -n +2 | sed -n 1,5p | sed 's/^/    /' || true
 }
 echo "### (4) killer order — Metal wired limit set to 1 GB, allocate 8 GB past it"
 probe probeA 8 1

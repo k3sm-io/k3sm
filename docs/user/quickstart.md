@@ -14,13 +14,12 @@ curl -fsSL https://k3sm.io/install.sh | sh
 
 The script checks that this is an Apple silicon Mac on macOS 26+, downloads the release tarball and
 its checksums from GitHub Releases, verifies the sha256, prints exactly what it is about to do, and
-then runs `sudo k3sm install`. It installs the newest published release. Until the first stable
-version is tagged, that means the newest pre-release. To pin a particular one (the example names the release you are on today, so change it to the
+then runs `sudo k3sm install`. It installs the newest published release. To pin a particular one (the example names the release you are on today, so change it to the
 version you want), put the variable after
 the pipe so it reaches `sh`:
 
 ```sh
-curl -fsSL https://k3sm.io/install.sh | K3SM_INSTALL_VERSION=v0.2.0 sh
+curl -fsSL https://k3sm.io/install.sh | K3SM_INSTALL_VERSION=v0.2.3 sh
 ```
 
 Set `K3SM_INSTALL_DOWNLOAD_ONLY=1` the same way to download and verify into the current directory

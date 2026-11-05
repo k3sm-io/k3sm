@@ -160,3 +160,24 @@ func TestUninstallPurgeExplicitUser(t *testing.T) {
 		t.Error("no --user and no sudo environment must be refused")
 	}
 }
+
+// TestResolveThroughMissing pins that a path whose tail does not exist is still
+// resolved through the symlinks of its existing ancestor, so the data-root prefix
+// check gives the same answer on a Mac that has not been installed.
+func TestResolveThroughMissing(t *testing.T) {
+	real := t.TempDir()
+	resolvedReal, err := filepath.EvalSymlinks(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := resolveThroughMissing(filepath.Join(link, "lib", "k3sm")), filepath.Join(resolvedReal, "lib", "k3sm"); got != want {
+		t.Errorf("missing tail: got %q, want %q", got, want)
+	}
+	if got := resolveThroughMissing(link); got != resolvedReal {
+		t.Errorf("existing path: got %q, want %q", got, resolvedReal)
+	}
+}

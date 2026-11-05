@@ -29,6 +29,7 @@ import (
 
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/executor"
+	"k3sm.io/k3sm/pkg/install/order"
 	"k3sm.io/k3sm/pkg/nodecred"
 )
 
@@ -104,10 +105,10 @@ var (
 // node's.
 //
 // The agent is in the long class for the reason its own plist sets a raised
-// ExitTimeOut: its teardown is not instantaneous either (it stops its embedded
-// runtime's vm guests, closes the mesh device and drains the Service proxy's
-// listeners), so any unload budget at or below that
-// SIGTERM-to-SIGKILL grace would time out on precisely the slow-but-healthy
+// ExitTimeOut: its teardown is not instantaneous either (it closes its embedded
+// runtime's supervision, stops the managed-update watcher and the runtimed
+// socket, and closes the mesh device; agentTeardownSteps in plist.go), so any
+// unload budget at or below that SIGTERM-to-SIGKILL grace would time out on precisely the slow-but-healthy
 // shutdown the wait exists to tolerate — and the install would then refuse to
 // bootstrap into a label it had just asked to stop.
 func restartBudgetFor(label string) restartBudget {
@@ -224,7 +225,7 @@ func (w bringUpWindow) since(label string) time.Time {
 // the manifest position, because the manifest carries whichever of the two this
 // role installs and a positional rule would silently mean something else on the
 // other role.
-func isNodeDaemon(label string) bool { return label == ServerLabel || label == AgentLabel }
+func isNodeDaemon(label string) bool { return order.IsNodeDaemon(label) }
 
 // awaitNetdServing blocks until the netd helper ANSWERS on its unix socket, and
 // is the gap between the two daemons the restart sequence used to leave open.
@@ -511,11 +512,20 @@ func awaitRunning(ctx context.Context, sys System, label string, b restartBudget
 // are running right now. An operator reading an upgrade that failed needs those
 // three facts and no others.
 //
+// swappedBack, when not nil, runs right after the reverse swap succeeds and
+// before the restart.
+//
+// stuckMarker says the developer-mode marker could be neither removed nor
+// handed to nobody (markerRemoval.stillOn). If the reverse swap then fails,
+// the new tree stays live beside a marker that still reads on, and the
+// installed LaunchDaemon plists name paths inside it, so the next respawn or
+// reboot runs it with the app's signing checks off. The error says so.
+//
 // previous is the publish's own answer to "was there a tree here before". When it
 // is false the publish was a plain rename onto an absent install root — a first
 // install — so there is nothing to revert TO, and saying so is more useful than
 // swapping the new tree out and leaving the Mac with no install root at all.
-func revertInstallRoot(ctx context.Context, sys System, cfg Config, m []artifact, previous bool, cause error) error {
+func revertInstallRoot(ctx context.Context, sys System, cfg Config, m []artifact, previous bool, cause error, stuckMarker bool, swappedBack func()) error {
 	states := func() string {
 		s, _ := daemonStates(sys, longRunningDaemonLabels(m))
 		return strings.Join(s, ", ")
@@ -525,9 +535,17 @@ func revertInstallRoot(ctx context.Context, sys System, cfg Config, m []artifact
 	}
 	staging := cfg.swapDir()
 	if _, err := sys.SwapInstallRoot(staging, filepath.Clean(cfg.InstallDir)); err != nil {
+		if stuckMarker {
+			return fmt.Errorf("%w; ROLLBACK FAILED, the install root %s still holds the NEW signed tree and the previous one is at %s: %v; DEVELOPER MODE IS STILL ON: the developer-mode marker %s is beside the new tree and the installed LaunchDaemon plists name paths inside it, so the next respawn or reboot runs it with the signing checks off; clear the marker before anything restarts (%s), and if it cannot be cleared, run `sudo launchctl bootout system/<label>` and `sudo launchctl disable system/<label>` for each io.k3sm.* daemon, a stop-gap until the marker is cleared and the install is re-run; daemon state: %s", cause, cfg.InstallDir, staging, err, DeveloperModeMarkerPath, stuckMarkerRemedy(DeveloperModeMarkerPath), states())
+		}
 		return fmt.Errorf("%w; ROLLBACK FAILED, the install root %s still holds the NEW tree and the previous one is at %s: %v; daemon state: %s", cause, cfg.InstallDir, staging, err, states())
 	}
 	cfg.Logger.Warn("rolled the install root back to the previous tree", "live", filepath.Clean(cfg.InstallDir), "failed-tree", staging, "cause", cause)
+	// What the install changed beside the tree for the new one (the
+	// developer-mode marker) goes back before the daemons restart on the old.
+	if swappedBack != nil {
+		swappedBack()
+	}
 	// The daemons are restarted against what is live NOW. Whatever the failure
 	// was, this install may have booted a label out, or bootstrapped it onto the
 	// tree that has just been swapped away; only a restart makes the running
@@ -1200,4 +1218,32 @@ func longRunningDaemonLabels(m []artifact) []string {
 		}
 	}
 	return out
+}
+
+// refuseBesideStuckMarker ends an install whose marker still reads on after
+// the publish (markerRemoval.stillOn): an upgrade reverts the swap, and a
+// first install, with nothing to revert to, withdraws the new tree.
+func refuseBesideStuckMarker(ctx context.Context, sys System, cfg Config, m []artifact, previous bool, cause error) error {
+	if !previous {
+		return withdrawFirstInstallTree(sys, cfg, cause)
+	}
+	return revertInstallRoot(ctx, sys, cfg, m, previous, cause, true, nil)
+}
+
+// withdrawFirstInstallTree is the first-install refusal beside a marker that
+// still reads on (markerRemoval.stillOn). There is no previous tree to swap
+// back, and the new one must not stay at the install root: k3sm.app's root
+// steps run the installed CLI there as root, and with the marker on they skip
+// its signature check. So it renames the new tree from the install root to the
+// staging path, which the next install removes (prepareStagingDir), and
+// refuses if anything is already there. Nothing was wired or restarted on it.
+func withdrawFirstInstallTree(sys System, cfg Config, cause error) error {
+	live, staging := filepath.Clean(cfg.InstallDir), cfg.swapDir()
+	// One way only: a swap would put whatever occupies the staging path at
+	// the install root, so a staging path that exists is refused instead.
+	if err := sys.MoveInstallRootAside(live, staging); err != nil {
+		return fmt.Errorf("%w; first install: moving the new tree from the install root %s to %s failed too (%v), so it is still there beside the developer-mode marker %s, which still reads on; remove it with `sudo rm -rf %s` before k3sm.app runs anything as root", cause, live, staging, err, DeveloperModeMarkerPath, live)
+	}
+	cfg.Logger.Warn("moved the new tree out of the install root: the developer-mode marker still reads on", "install-root", live, "moved-to", staging)
+	return fmt.Errorf("%w; first install: the new tree was moved from the install root %s to %s (the next install removes it), and nothing was wired or started", cause, live, staging)
 }

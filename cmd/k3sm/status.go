@@ -440,8 +440,8 @@ func (r statusRunner) run(ctx context.Context, o statusOptions) int {
 
 // snapshot collects one answer for the requested view and returns its verdict
 // and the function that writes it. `status daemons -o json` is answered by the
-// launchd-only probe and its own shape; every other view and format by the
-// full report.
+// launchd-only probe and its own shape, `status top` by the top collector
+// (snapshotTop), and every other view and format by the full report.
 func (r statusRunner) snapshot(ctx context.Context, o statusOptions) (status.Verdict, func() int) {
 	if o.view == "daemons" && o.format == "json" {
 		if r.probe == nil {

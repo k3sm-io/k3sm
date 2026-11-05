@@ -1,0 +1,7 @@
+go test fuzz v1
+uint8(2)
+string("/v2/app/blobs/uploads/{u}")
+string("digest=sha256:88d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031589")
+string("")
+uint8(1)
+[]byte("abcd")

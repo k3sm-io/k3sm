@@ -197,7 +197,7 @@ func TestJoinRefusesTheControlPlaneNodeName(t *testing.T) {
 			t.Error("a refused join bound a node-password for the control plane's own name — the next join presenting that password would be accepted as the control plane")
 		}
 
-		// THE SIGNER WAS NEVER INVOKED. Both signing calls in handleJoin are
+		// THE SIGNER WAS NEVER INVOKED. All three signing calls in handleJoin are
 		// downstream of the enroll, and every certificate the handler signs goes
 		// into the response, so an enroll count of zero plus a body carrying no
 		// certificate is the mechanical statement that nothing was signed. (The
@@ -282,7 +282,7 @@ func TestJoinRefusesTheControlPlaneNodeName(t *testing.T) {
 		// Source order, read off handleJoin. The runtime rows above prove nothing
 		// was bound, written or signed for the refused request; this pins WHY —
 		// the refusal is textually ahead of the node-password bind, the enroll and
-		// both signing calls, all of which sit in handleJoin's straight-line body
+		// all three signing calls, all of which sit in handleJoin's straight-line body
 		// with no loop or branch that could run them out of order. Without it, a
 		// later edit could move the guard below the bind and only the negative
 		// assertions above would notice, one fixture at a time.

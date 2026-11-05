@@ -128,9 +128,12 @@ type ServerArgsRecord struct {
 //     one this install just minted;
 //   - more than MaxServerArgs arguments, or one longer than MaxServerArgLen —
 //     bounds on what a file can make launchd exec;
-//   - a NUL or a newline in any argument — neither can occur in an argument
-//     k3sm rendered, and both are the shapes that break the plist encoding and
-//     anything downstream that reads a line at a time.
+//   - a NUL, a carriage return or a newline in any argument — none can occur in
+//     an argument k3sm rendered, and all are the shapes that break the plist
+//     encoding and anything downstream that reads a line at a time;
+//   - an --lb-privileged-ports value the root network helper would refuse (a
+//     non-number, a port outside 1-1023, or a bare flag with no value) — a bad
+//     list fails where it is recorded, never as a root helper that crash-loops.
 //
 // It is applied on WRITE as well as on read, so the installer can never produce
 // a record its own next run would refuse.

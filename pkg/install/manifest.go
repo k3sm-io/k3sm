@@ -22,6 +22,7 @@ import (
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/helmchart"
+	"k3sm.io/k3sm/pkg/install/order"
 	"k3sm.io/k3sm/pkg/netdsvc"
 	"k3sm.io/k3sm/pkg/registrysvc"
 )
@@ -77,11 +78,10 @@ type artifact struct {
 	// the link and its target cannot name different files. Empty otherwise.
 	target string
 	// assertExists records whether the path is expected on disk today. It is
-	// false for the forward-declared cp-payload items (the /Library/k3sm/bin tree
-	// + relocated k3sm-netd): the packaging follow-up owns moving cp/kine off
-	// DataRoot into InstallDir, so those paths do not exist yet. The manifest
-	// proves the disposition (InstallDir-covered), not on-disk presence — that
-	// follow-up lights them up with no manifest change.
+	// false for entries an install may not have written (the InstallDir/bin
+	// directory entry itself, the optional version markers, files a data root
+	// from an older build lacks). The manifest proves the disposition
+	// (InstallDir-covered), not on-disk presence.
 	assertExists bool
 	// oneshot marks a kindDaemon that RUNS AND EXITS rather than staying up
 	// (io.k3sm.datavol). It changes two things and nothing else: the restart
@@ -163,10 +163,11 @@ func artifactManifest(cfg Config) []artifact {
 	// a payload whose marker does.
 	items = append(items, artifact{kind: kindFile, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin", helmchart.HelmMarkerName), assertExists: false})
 	items = append(items, []artifact{
-		// Forward-declared: the cp-payload bin tree + relocated k3sm-netd land
-		// under InstallDir once the packaging follow-up moves them off DataRoot. They
-		// do not exist on disk today (cp/kine land under DataRoot at runtime), so
-		// existence is not asserted; the InstallDir sweep already covers them.
+		// The InstallDir/bin directory holds the staged control-plane payload
+		// (asserted above, binary by binary). Existence of the directory entry
+		// itself is not asserted; the InstallDir sweep covers it. No k3sm-netd
+		// binary is staged (netd is a subcommand of k3sm), so that path is not
+		// asserted either.
 		{kind: kindDir, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin"), assertExists: false},
 		{kind: kindFile, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin", "k3sm-netd"), assertExists: false},
 
@@ -183,8 +184,12 @@ func artifactManifest(cfg Config) []artifact {
 	// root, and the reverse uninstall walk boots it out last of the three.
 	// assertExists is false because a Mac that never asked for a volume has no
 	// such plist, and one that just asked for its first has none yet either.
-	if cfg.dataVolumeDeclared {
-		items = append(items, artifact{kind: kindDaemon, disp: dispRemove, label: DatavolLabel, path: cfg.plistPath(DatavolLabel), oneshot: true, assertExists: false})
+	// The jobs come from pkg/install/order, the one definition of the start
+	// order the installer and the updater share: its oneshots lead it.
+	jobs := order.Start(orderRole(cfg.Role), cfg.dataVolumeDeclared)
+	for len(jobs) > 0 && jobs[0].Oneshot {
+		items = append(items, artifact{kind: kindDaemon, disp: dispRemove, label: jobs[0].Label, path: cfg.plistPath(jobs[0].Label), oneshot: true, assertExists: false})
+		jobs = jobs[1:]
 	}
 	// The staged join token, for an agent node only, and REMOVED on uninstall
 	// unlike everything else under the preserved data root. It is a credential
@@ -197,23 +202,26 @@ func artifactManifest(cfg Config) []artifact {
 	if cfg.Role == RoleAgent {
 		items = append(items, artifact{kind: kindFile, disp: dispRemove, path: cfg.agentTokenPath(), assertExists: false})
 	}
-	// The control plane's staged admin token, the same entry for the other role
-	// and in the same position, for the same reason: it is a system:masters
-	// bearer token with no use once this Mac is no longer a k3sm server, so it
-	// is REMOVED rather than preserved with the rest of the data root, and it is
-	// removed after the daemon that reads it has been booted out.
-	// assertExists is false because a data root an older build installed has no
-	// such file until the next install stages one.
 	// The endpoints record either node daemon publishes in the status
 	// directory, REMOVED after that daemon is booted out for the reason the
 	// server's records below are: it describes a node that no longer runs.
 	items = append(items, artifact{kind: kindFile, disp: dispRemove, path: filepath.Join(StateStatus.Path(cfg.DataRoot), EndpointsRecordName), assertExists: false})
+	// The budget record either node daemon rewrites there, REMOVED for the
+	// same reason. assertExists is false: a node writes it only once it runs.
+	items = append(items, artifact{kind: kindFile, disp: dispRemove, path: filepath.Join(StateStatus.Path(cfg.DataRoot), BudgetRecordName), assertExists: false})
 	// The update record, REMOVED for the same reason: it compares the nodes of
 	// a cluster this Mac no longer serves. Either role may hold one, because
 	// `sudo k3sm update check` writes it wherever it runs. assertExists is
 	// false: no check may have run.
 	items = append(items, artifact{kind: kindFile, disp: dispRemove, path: filepath.Join(StateStatus.Path(cfg.DataRoot), UpdateRecordName), assertExists: false})
 	if cfg.Role == RoleServer {
+		// The control plane's staged admin token, the counterpart of the agent's
+		// join token above: it is a system:masters bearer token with no use once
+		// this Mac is no longer a k3sm server, so it is REMOVED rather than
+		// preserved with the rest of the data root, and it is removed after the
+		// daemon that reads it has been booted out. assertExists is false because
+		// a data root an older build installed has no such file until the next
+		// install stages one.
 		items = append(items, artifact{kind: kindFile, disp: dispRemove, path: cfg.serverTokenPath(), assertExists: false})
 		// A joining HA server's staged server-class join token, removed for the
 		// same reason and with more cause: it decrypts every cluster CA. It
@@ -286,10 +294,10 @@ func artifactManifest(cfg Config) []artifact {
 	// ever in a manifest — a Mac that carried both would register two nodes out
 	// of one data root — and the position is the same either way, because both
 	// depend on the helper netd bootstraps first.
+	for _, j := range jobs {
+		items = append(items, artifact{kind: kindDaemon, disp: dispRemove, label: j.Label, path: cfg.plistPath(j.Label), assertExists: true})
+	}
 	items = append(items, []artifact{
-		{kind: kindDaemon, disp: dispRemove, label: NetdLabel, path: cfg.plistPath(NetdLabel), assertExists: true},
-		{kind: kindDaemon, disp: dispRemove, label: daemonLabel(cfg.Role), path: cfg.plistPath(daemonLabel(cfg.Role)), assertExists: true},
-
 		// The admin kubeconfig in the human's home — preserved (it may hold other
 		// clusters; k3sm never owns the whole file).
 		{kind: kindKubeconfig, disp: dispPreserve, user: cfg.TargetUser},
@@ -328,7 +336,21 @@ func artifactManifest(cfg Config) []artifact {
 		{kind: kindDir, disp: dispRemove, path: PodLogsDir, assertExists: false},
 		{kind: kindDir, disp: dispRemove, path: ContainerLogsDir, assertExists: false},
 	}...)
+	// The developer-mode marker, beside the install root and outside it, so
+	// the InstallDir sweep cannot reach it. Removed: an uninstalled Mac keeps
+	// no switch that turns the next install's signature checks off. The
+	// removal unlinks whatever is at the path, a symlink included, and never
+	// follows one. Only `install --developer-mode on` writes it.
+	items = append(items, artifact{kind: kindFile, disp: dispRemove, path: DeveloperModeMarkerPath, assertExists: false})
 	return items
+}
+
+// orderRole maps an install role onto the restart order's role.
+func orderRole(r Role) order.Role {
+	if r == RoleAgent {
+		return order.Agent
+	}
+	return order.Server
 }
 
 // carriesServerDaemon reports whether the manifest tears down the control-plane

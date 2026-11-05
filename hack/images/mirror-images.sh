@@ -141,7 +141,7 @@ for mf in "${MANIFESTS[@]}"; do
 			continue
 		fi
 		MISSING=$((MISSING + 1))
-		echo "missing   $name  $mir  ($(printf '%s' "$reason" | grep -Eo '(UNAUTHORIZED|DENIED|MANIFEST_UNKNOWN|NAME_UNKNOWN)[^"]*' | head -1 || true))"
+		echo "missing   $name  $mir  ($(printf '%s' "$reason" | grep -Eo '(UNAUTHORIZED|DENIED|MANIFEST_UNKNOWN|NAME_UNKNOWN)[^"]*' | sed -n 1p || true))"
 		echo "  $CRANE_SHOWN cp $src $dst"
 		[ -n "$RUN" ] || continue
 

@@ -422,10 +422,12 @@ func withManagedLabel(labels map[string]string) map[string]string {
 
 // ensureNodeDatapathRBAC provisions the node-datapath ClusterRole + its
 // ClusterRoleBinding to the system:nodes group — THE grant that keeps a joined
-// worker's datapath alive after the Node,RBAC flip. Its Service proxy, DNS resolver,
-// and mesh watcher authenticate as system:node:<name> and must get/list/watch
-// services (core), endpointslices (discovery.k8s.io), and meshpeers (net.k3sm.io),
-// none of which the Node authorizer or the stock system:node ClusterRole grant.
+// worker's mesh watcher alive after the Node,RBAC flip. It authenticates as
+// system:node:<name> and must get/list/watch meshpeers (net.k3sm.io), which the
+// Node authorizer and the stock system:node ClusterRole do not grant; services
+// (core) and endpointslices (discovery.k8s.io) are also granted here for the
+// node's own reads. The Service proxy, DNS resolver and NetworkPolicy watcher run
+// as the netserve identity under k3sm:netserve.
 // meshpeers is READ-only here; the WRITE path stays server-mediated behind
 // bootstrap.AuthorizeMeshPeerWrite, since NodeRestriction never covers a CRD.
 // Create-tolerate-AlreadyExists so a server restart is a no-op (never a mutation of

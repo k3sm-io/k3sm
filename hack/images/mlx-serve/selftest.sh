@@ -15,7 +15,7 @@
 #     build refuses one that is not;
 #   * the build refuses to run at all without uv;
 #   * the build packages with `k3sm build --no-record --output`, so it needs no
-#     root and never touches the node's image store;
+#     root and never records into the cluster registry;
 #   * walk-verify goes RED on an invalid signature, on a mislabelled layer, on a
 #     blob that does not match its digest, and on a non-Mach-O entrypoint — and
 #     GREEN on the universal-binary shape that a whole-file signature check
@@ -23,9 +23,23 @@
 #   * the k3sm-shard entrypoint renders the ring hostfile and the jaccl device
 #     matrix into the pod data volume from fake name resolution, retries and
 #     bounds resolution, and its liveness probe answers 0 and 1 correctly;
+#   * the entrypoint takes --served-model-name itself and makes the engine
+#     answer to that name on /v1/models and in a request's model field,
+#     against a fake engine module, and refuses to start when a hook it
+#     relies on is missing or reshaped (and, with a staged tree, finds every
+#     hook on the pinned mlx_lm.server);
+#   * run as the pod command, the entrypoint exits with the status the engine's
+#     main() returns, and SIGTERM reaches the engine, against a fake engine;
 #   * the k3sm-serve context guard refuses a request longer than the engine's
 #     window with vLLM's HTTP 400 and passes one inside it, against fakes and,
-#     when a staged tree is present, against the real vllm-mlx server.
+#     when a staged tree is present, against the real vllm-mlx server, on the
+#     completion, chat, Messages and Responses routes, streaming or not;
+#   * k3sm-serve lowers --max-kv-size for a model whose config.json geometry
+#     costs more KV bytes per token than k3sm sized it for, and leaves it alone
+#     for a smaller model, a missing config, a missing field and the off switch;
+#   * with a staged tree, the patched RotatingKVCache prefill mask keeps the
+#     attention-sink columns attended after a trim, which the pinned mlx-lm's
+#     own mask does not;
 #   * the stage Job stage-job.sh renders pins uv by version and published
 #     sha256 and the lockfile by digest, carries the checkout's files verbatim,
 #     fails closed on a digest mismatch, carries no credential, and is placed by
@@ -35,13 +49,39 @@
 #     drifted entrypoint module, or with a file the packaging user cannot read.
 #
 # Usage: hack/images/mlx-serve/selftest.sh
-# Exit: 0 all checks pass, 1 otherwise.
+#   --staged makes rung 9a (the served-name alias and the engine source on the
+#   pinned mlx-lm) fail instead of skipping when the staged tree or its mlx_lm
+#   is missing.
+#   --strict-self-test runs only the checks on that strictness and on rung 9a's
+#   pin source (hermetic, a few seconds): it re-runs this script's 9a verdict
+#   against an empty stage and a fixture stage and checks the verdicts.
+#   Any other argument is refused with exit 2.
+# Exit: 0 all checks pass, 1 otherwise, 2 on a usage error.
 set -uo pipefail
+
+STAGED_REQUIRED=0
+STRICT_SELF_TEST=0
+for arg in "$@"; do
+	case "$arg" in
+		--staged) STAGED_REQUIRED=1 ;;
+		--strict-self-test)
+			if [ -n "${K3SM_MLX_SELFTEST_ONLY:-}" ]; then
+				echo "selftest: --strict-self-test inside its own child run (recursion refused)" >&2
+				exit 2
+			fi
+			STRICT_SELF_TEST=1 ;;
+		*)
+			echo "selftest: unknown argument '$arg' (only --staged and --strict-self-test)" >&2
+			exit 2 ;;
+	esac
+done
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BUILD="$HERE/build.sh"
 WALK="$HERE/walk-verify.sh"
 LOCK="$HERE/requirements.lock"
+# The tree build.sh stages; rungs 9, 9s and 9a check the real engine in it.
+STAGED="${K3SM_MLX_STAGE:-${K3SM_MLX_WORK:-$HOME/.cache/k3sm/mlx-serve}/stage}"
 
 PASS=0; FAIL=0; SKIP=0
 ladder() {
@@ -56,6 +96,257 @@ echo "==> mlx-serve selftest"
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/mlx-selftest.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM
+
+# ---- shared by rungs 9e and 9a and by --strict-self-test --------------------
+# write_engine_source writes the engine-source driver rung 9e describes.
+write_engine_source() {
+	cat > "$WORK/engine-source.py" <<'PY'
+import importlib, importlib.util, os, sys
+sys.path.insert(0, sys.argv[1])
+site = os.path.realpath(sys.argv[2])
+sys.path.insert(1, site)
+import k3sm_shard as ks
+
+def check(name, cond):
+    print(("ok " if cond else "no ") + name, flush=True)
+
+pkg = ks.ENGINE_MODULE.split(".")[0]
+py, pyc, orphans = 0, 0, []
+for d, _, files in os.walk(os.path.join(site, pkg)):
+    for f in files:
+        p = os.path.join(d, f)
+        if f.endswith(".py"):
+            py += 1
+        elif f.endswith(".pyc"):
+            pyc += 1
+            try:
+                src = importlib.util.source_from_cache(p) if os.path.basename(d) == "__pycache__" else p[:-1]
+            except ValueError:
+                src = None
+            if src is None or not os.path.exists(src):
+                orphans.append(os.path.relpath(p, site))
+for o in sorted(orphans)[:10]:
+    print(f"selftest: sourceless bytecode {o}", file=sys.stderr)
+check(f"source.tree  every {pkg} bytecode file has its .py source beside it",
+      py > 0 and pyc > 0 and not orphans)
+
+try:
+    server = importlib.import_module(ks.ENGINE_MODULE)
+except Exception as e:
+    print(f"selftest: cannot import {ks.ENGINE_MODULE}: {e}", file=sys.stderr)
+    server = None
+mod = sys.modules.get(getattr(getattr(server, "run", None), "__module__", None) or "")
+f = getattr(mod, "__file__", None) or ""
+check(f"source.run  the module holding run is loaded from its .py in the site-packages, its bytecode beside it",
+      f.endswith(".py") and os.path.realpath(f).startswith(site + os.sep)
+      and os.path.exists(importlib.util.cache_from_source(f)))
+
+override = sys.argv[3] if len(sys.argv) > 3 else None
+if override is not None:
+    print(f"selftest: pin override {override}", file=sys.stderr)
+check("pin.real  runshape compares against k3sm_shard's own ENGINE_RUN_SHA256, not an override",
+      override is None)
+if override is not None:
+    ks.ENGINE_RUN_SHA256 = sys.argv[3]
+    if sys.argv[3] == "self" and server is not None:
+        try:
+            ks.ENGINE_RUN_SHA256 = ks.source_shape(server.run)
+        except ks.ShardError:
+            pass
+for name, fn in (("hooks  every hook the alias uses has the 0.32.2 signature, and run the pinned body", ks.check_engine_hooks),
+                 ("runshape  mlx_lm.server.run hashes to ENGINE_RUN_SHA256, the body the alias's run copies", ks.check_run_shape)):
+    try:
+        if server is None:
+            raise ks.ShardError(f"no {ks.ENGINE_MODULE} to check")
+        fn(server)
+        check(name, True)
+    except ks.ShardError as e:
+        print(f"k3sm-shard: {e}", file=sys.stderr)
+        check(name, False)
+PY
+}
+
+# make_engine_fixture <dir> writes a fixture mlx_lm (sources only) under <dir>.
+make_engine_fixture() {
+	mkdir -p "$1/mlx_lm"
+	: > "$1/mlx_lm/__init__.py"
+	cat > "$1/mlx_lm/server.py" <<'PY'
+import types
+mx = types.SimpleNamespace(distributed=types.SimpleNamespace(init=lambda: None))
+def main():
+    pass
+def run(host, port, model_provider, server_class=None, handler_class=None):
+    return _run_http_server(host, port, model_provider, server_class, handler_class)
+def _run_http_server(host, port, response_generator, server_class=None, handler_class=None):
+    pass
+class ModelProvider:
+    def load(self, model_path, adapter_path=None, draft_model_path=None):
+        pass
+class APIHandler:
+    def handle_models_request(self):
+        pass
+    def _set_completion_headers(self, status_code):
+        pass
+class ResponseGenerator:
+    def join(self):
+        pass
+class LRUPromptCache:
+    pass
+PY
+}
+
+# rung_9a is rung 9a (described where it is called); it needs the driver
+# write_engine_source writes.
+rung_9a() {
+	if [ -x "$STAGED/bin/python3.12" ] && [ -d "$STAGED/lib/python3.12/site-packages/mlx_lm" ]; then
+		ALIAS_CHECKS=0
+		src_out="$(cd "$WORK" && PYTHONDONTWRITEBYTECODE=1 "$STAGED/bin/python3.12" -I -B "$WORK/engine-source.py" "$HERE" "$STAGED/lib/python3.12/site-packages" 2>"$WORK/engine-real.err")"
+		while read -r verdict name; do
+			[ -n "$verdict" ] || continue
+			ALIAS_CHECKS=$((ALIAS_CHECKS + 1))
+			case "$verdict" in
+				ok) ladder ok "9a.$name" ;;
+				no) ladder no "9a.$name"; tail -5 "$WORK/engine-real.err" ;;
+				*)  ladder no "9a.driver  $verdict $name" ;;
+			esac
+		done <<< "$src_out"
+		cat > "$WORK/alias-real.py" <<'PY'
+import email.message, importlib, io, json, os, sys, tempfile, types
+sys.path.insert(0, sys.argv[1])
+import k3sm_shard as ks
+
+def check(name, cond):
+    print(("ok " if cond else "no ") + name, flush=True)
+
+server = importlib.import_module(ks.ENGINE_MODULE)
+stock_handler = server.APIHandler
+try:
+    ks.install_image_guard(server)
+    check("imgguard  mlx_lm.server._inline_image_urls is the 0.32.2 body the guard replaces, and is replaced", server._inline_image_urls is ks.refuse_remote_images)
+except ks.ShardError as e:
+    print(f"k3sm-shard: {e}", file=sys.stderr)
+    check("imgguard  mlx_lm.server._inline_image_urls is the 0.32.2 body the guard replaces, and is replaced", False)
+
+P, H, run = ks.install_alias(server, "org/m")
+check("install  ModelProvider and run are replaced, the handler subclasses the real one",
+      server.run is run and server.ModelProvider is P and issubclass(H, stock_handler))
+
+model_dir = tempfile.mkdtemp(dir=sys.argv[2])
+def answer(cls, path):
+    h = cls.__new__(cls)
+    h.path, h.created, h.wfile = path, 1700000000, io.BytesIO()
+    h.request_version, h.command, h.requestline = "HTTP/1.1", "GET", f"GET {path} HTTP/1.1"
+    h.client_address, h.headers, h.close_connection = ("127.0.0.1", 0), email.message.Message(), True
+    h.response_generator = types.SimpleNamespace(cli_args=types.SimpleNamespace(model=model_dir, allowed_origins=["*"]))
+    h.log_message = lambda *a: None
+    h.handle_models_request()
+    head, body = h.wfile.getvalue().split(b"\r\n\r\n", 1)
+    lines = head.decode().split("\r\n")
+    hdrs = sorted(l for l in lines[1:] if not l.lower().startswith(("date:", "server:")))
+    return lines[0], hdrs, json.loads(body)
+
+real = answer(stock_handler, "/v1/models")
+aliased = answer(H, "/v1/models")
+resolved = os.path.realpath(model_dir)
+renamed = [dict(d, id="org/m") if d["id"] == resolved else d for d in real[2]["data"]]
+check("models.real  the real listing names the --model path (what the alias replaces)",
+      [d["id"] for d in real[2]["data"]] == [resolved])
+check("models.same  the aliased listing is the real one with the id renamed: status, headers and body",
+      aliased[:2] == real[:2] and aliased[2] == {"object": real[2]["object"], "data": renamed})
+PY
+		mkdir -p "$WORK/alias-hf" "$WORK/alias-models"
+		alias_out="$(cd "$WORK" && HF_HUB_CACHE="$WORK/alias-hf" HF_HUB_OFFLINE=1 PYTHONDONTWRITEBYTECODE=1 "$STAGED/bin/python3.12" -I -B "$WORK/alias-real.py" "$HERE" "$WORK/alias-models" 2>"$WORK/alias-real.err")"
+		while read -r verdict name; do
+			[ -n "$verdict" ] || continue
+			ALIAS_CHECKS=$((ALIAS_CHECKS + 1))
+			case "$verdict" in
+				ok) ladder ok "9a.$name" ;;
+				no) ladder no "9a.$name" ;;
+				*)  ladder no "9a.driver  $verdict $name" ;;
+			esac
+		done <<< "$alias_out"
+		if [ "$ALIAS_CHECKS" -ge 9 ]; then
+			ladder ok "9a.count  all $ALIAS_CHECKS engine-source and alias checks reported"
+		else
+			ladder no "9a.count  only $ALIAS_CHECKS of 9 engine-source and alias checks reported (a driver crashed?)"
+			tail -20 "$WORK/engine-real.err" "$WORK/alias-real.err"
+		fi
+	elif [ "$STAGED_REQUIRED" = 1 ]; then
+		ladder no "9a.real  --staged, but no staged tree with mlx_lm at $STAGED (run build.sh, or set K3SM_MLX_STAGE)"
+	else
+		ladder skip "9a.real  no staged tree at $STAGED (run build.sh, or set K3SM_MLX_STAGE)"
+	fi
+}
+
+# K3SM_MLX_SELFTEST_ONLY=9a is --strict-self-test's child run: the argument
+# parse above, then only the 9a verdict, and the exit code a full run gives it.
+case "${K3SM_MLX_SELFTEST_ONLY:-}" in
+	"") ;;
+	9a)
+		write_engine_source
+		rung_9a
+		echo "mlx-serve selftest (9a only): $PASS passed, $FAIL failed, $SKIP skipped"
+		[ "$FAIL" -eq 0 ] || exit 1
+		exit 0 ;;
+	*)
+		echo "selftest: unknown K3SM_MLX_SELFTEST_ONLY '${K3SM_MLX_SELFTEST_ONLY}'" >&2
+		exit 2 ;;
+esac
+
+# ---- --strict-self-test — the --staged strictness and 9a's pin source ------
+# Nothing else in this file can go red when the --staged branch is deleted or
+# the flag is misspelled in the parse, or when rung 9a passes the driver a pin
+# override (which would make runshape pass whatever ENGINE_RUN_SHA256 says), so
+# this mode re-runs this script's own 9a verdict and checks it: against an empty
+# stage, --staged fails and exits 1 and no flag skips and exits 0; against a
+# fixture stage, 9a reports pin.real and fails runshape (the fixture is not the
+# pinned body); an unknown argument and a nested --strict-self-test exit 2.
+if [ "$STRICT_SELF_TEST" = 1 ]; then
+	# strict_leg <label> <want-exit> <stage> <args>... -- <want-line-regex>...
+	strict_leg() {
+		local label="$1" want="$2" stage="$3"; shift 3
+		local args=() lines=() out rc miss=""
+		while [ $# -gt 0 ] && [ "$1" != -- ]; do args+=("$1"); shift; done
+		[ $# -gt 0 ] && shift
+		lines=("$@")
+		out="$(K3SM_MLX_SELFTEST_ONLY=9a K3SM_MLX_STAGE="$stage" bash "$HERE/selftest.sh" ${args[@]+"${args[@]}"} 2>&1)"
+		rc=$?
+		for l in ${lines[@]+"${lines[@]}"}; do
+			grep -qE -- "$l" <<< "$out" || miss="$miss '$l'"
+		done
+		if [ "$rc" = "$want" ] && [ -z "$miss" ]; then
+			ladder ok "$label"
+		else
+			ladder no "$label (exit $rc, want $want; missing:${miss:- none})"
+			printf '%s\n' "$out" | tail -5
+		fi
+	}
+	mkdir -p "$WORK/strict-empty"
+	SFIX="$WORK/strict-stage"
+	mkdir -p "$SFIX/bin" "$SFIX/lib/python3.12/site-packages"
+	make_engine_fixture "$SFIX/lib/python3.12/site-packages"
+	if ! python3 -m compileall -q --invalidation-mode unchecked-hash "$SFIX/lib/python3.12/site-packages" >"$WORK/strict-compileall.err" 2>&1; then
+		ladder no "strict.compileall  python3 -m compileall failed on the fixture stage"
+		tail -5 "$WORK/strict-compileall.err"
+	fi
+	ln -s "$(command -v python3)" "$SFIX/bin/python3.12"
+	strict_leg "strict.staged  with --staged and an empty stage, 9a fails and the run exits 1" \
+		1 "$WORK/strict-empty" --staged -- '^FAIL  9a\.real  --staged'
+	strict_leg "strict.skip  with no flag and an empty stage, 9a skips and the run exits 0" \
+		0 "$WORK/strict-empty" -- '^SKIP  9a\.real  no staged tree' '\(9a only\): 0 passed, 0 failed, 1 skipped'
+	strict_leg "strict.pin  on a fixture stage, 9a checks the real pin: pin.real passes and runshape fails" \
+		1 "$SFIX" -- '^PASS  9a\.pin\.real' '^FAIL  9a\.runshape'
+	strict_leg "strict.unknown  an unknown argument (--stage) is refused with exit 2" \
+		2 "$WORK/strict-empty" --stage -- "unknown argument '--stage'"
+	strict_leg "strict.unknown=  an unknown argument (--staged=1) is refused with exit 2" \
+		2 "$WORK/strict-empty" --staged=1 -- "unknown argument '--staged=1'"
+	strict_leg "strict.recursion  --strict-self-test inside its own child run is refused with exit 2" \
+		2 "$WORK/strict-empty" --strict-self-test -- 'recursion refused'
+	echo "----------------------------------------"
+	echo "mlx-serve strict self-test: $PASS passed, $FAIL failed, $SKIP skipped"
+	[ "$FAIL" -eq 0 ] || exit 1
+	exit 0
+fi
 
 # ---- 0 — the scripts parse and are executable -------------------------------
 for s in "$BUILD" "$WALK" "$HERE/stage-job.sh" "$HERE/selftest.sh"; do
@@ -72,7 +363,7 @@ if command -v shellcheck >/dev/null 2>&1; then
 		ladder ok "0.shellcheck  clean"
 	else
 		ladder no "0.shellcheck  clean"
-		printf '%s\n' "$out" | head -40
+		printf '%s\n' "$out" | sed -n 1,40p
 	fi
 else
 	ladder skip "0.shellcheck  not installed on this host"
@@ -106,7 +397,7 @@ else
 	ladder no "1.exact  every requirement is an == pin"
 fi
 
-engine="$(grep -E '^[a-zA-Z0-9]' "$HERE/requirements.in" | head -1)"
+engine="$(grep -E '^[a-zA-Z0-9]' "$HERE/requirements.in" | sed -n 1p)"
 if [ -n "$engine" ] && grep -qxF "$engine \\" "$LOCK"; then
 	ladder ok "1.engine  requirements.in pin ($engine) is the lockfile's pin"
 else
@@ -134,21 +425,22 @@ done
 
 # ---- 3 — build.sh refuses to run without uv --------------------------------
 out="$(K3SM_MLX_UV=/nonexistent/uv "$BUILD" 2>&1)"; rc=$?
-if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'uv not found'; then
+if [ "$rc" -ne 0 ] && grep -q 'uv not found' <<<"$out"; then
 	ladder ok "3.uv  build.sh stops on a missing uv (exit $rc)"
 else
 	ladder no "3.uv  build.sh stops on a missing uv (exit $rc)"
 fi
 
 # The packaging step writes the layout only. Without --no-record, `k3sm build`
-# records into the node's image store through the runtime daemon's socket, which
-# an ordinary user cannot reach, so a non-root build would fail at packaging.
+# records the image in the cluster registry and warms this node's cache through
+# the runtime daemon's socket, which needs root, so a non-root build would fail at
+# packaging.
 # Every `k3sm build` invocation in build.sh must carry --no-record and --output.
 # shellcheck disable=SC2016 # the pattern is the literal text "$K3SM_BIN"
 calls="$(grep -F '"$K3SM_BIN" build ' "$BUILD")"
 if [ -n "$calls" ] &&
-	! printf '%s\n' "$calls" | grep -v -- '--no-record' | grep -q . &&
-	! printf '%s\n' "$calls" | grep -v -- '--output' | grep -q .; then
+	! grep -q . <<<"$(printf '%s\n' "$calls" | grep -v -- '--no-record')" &&
+	! grep -q . <<<"$(printf '%s\n' "$calls" | grep -v -- '--output')"; then
 	ladder ok "3.norecord  build.sh packages with k3sm build --no-record --output (no root, no store)"
 else
 	ladder no "3.norecord  build.sh packages with k3sm build --no-record --output (no root, no store)"
@@ -185,7 +477,7 @@ fi
 # is invisible to every check except this one.
 ep="$(grep -E '^ENTRYPOINT ' "$DF")"
 for token in '"-m"' '"serve"' '"--continuous-batching"' '"0.0.0.0"'; do
-	if printf '%s' "$ep" | grep -qF "$token"; then
+	if grep -qF "$token" <<<"$ep"; then
 		ladder ok "4.argv  ENTRYPOINT carries $token"
 	else
 		ladder no "4.argv  ENTRYPOINT carries $token"
@@ -193,7 +485,7 @@ for token in '"-m"' '"serve"' '"--continuous-batching"' '"0.0.0.0"'; do
 done
 # argv[0] must be the interpreter Mach-O itself — not /bin/python3, which is a
 # symlink, and not a shell wrapper.
-if printf '%s' "$ep" | grep -qE '\["/bin/python3\.[0-9]+"'; then
+if grep -qE '\["/bin/python3\.[0-9]+"' <<<"$ep"; then
 	ladder ok "4.argv0  ENTRYPOINT starts at the interpreter binary, not a symlink or a script"
 else
 	ladder no "4.argv0  ENTRYPOINT starts at the interpreter binary, not a symlink or a script"
@@ -232,11 +524,11 @@ else
 	ladder no "5.green  walk-verify passes a validly signed tree"
 fi
 out="$("$WALK" --tree "$BAD" 2>&1)"; rc=$?
-if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'INVALID'; then
+if [ "$rc" -eq 1 ] && grep -q 'INVALID' <<<"$out"; then
 	ladder ok "5.red  walk-verify fails a tree with an invalid-signature Mach-O (exit $rc)"
 else
 	ladder no "5.red  walk-verify fails a tree with an invalid-signature Mach-O (exit $rc)"
-	printf '%s\n' "$out" | head -10
+	printf '%s\n' "$out" | sed -n 1,10p
 fi
 
 # The universal-binary lesson, mechanized: a fat Mach-O whose target slice is
@@ -339,12 +631,12 @@ if "$WALK" --layout "$WORK/layout-ok" >/dev/null 2>&1; then
 	ladder ok "6.layout  walk-verify passes a well-formed layout"
 else
 	ladder no "6.layout  walk-verify passes a well-formed layout"
-	"$WALK" --layout "$WORK/layout-ok" 2>&1 | head -10
+	"$WALK" --layout "$WORK/layout-ok" 2>&1 | sed -n 1,10p
 fi
 
 mklayout "$WORK/layout-mislabelled" "$GOOD" mislabelled /bin/python3.12
 out="$("$WALK" --layout "$WORK/layout-mislabelled" 2>&1)"; rc=$?
-if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'gzip'; then
+if [ "$rc" -ne 0 ] && grep -q 'gzip' <<<"$out"; then
 	ladder ok "6.mislabelled  walk-verify fails a layer whose bytes contradict its media type"
 else
 	ladder no "6.mislabelled  walk-verify fails a layer whose bytes contradict its media type"
@@ -352,7 +644,7 @@ fi
 
 mklayout "$WORK/layout-corrupt" "$GOOD" corrupt /bin/python3.12
 out="$("$WALK" --layout "$WORK/layout-corrupt" 2>&1)"; rc=$?
-if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'digest'; then
+if [ "$rc" -ne 0 ] && grep -q 'digest' <<<"$out"; then
 	ladder ok "6.corrupt  walk-verify fails a blob that does not match its digest"
 else
 	ladder no "6.corrupt  walk-verify fails a blob that does not match its digest"
@@ -363,14 +655,14 @@ cp "$SYSBIN" "$SCRIPTEP/bin/python3.12"
 printf '#!/bin/sh\nexec /bin/python3.12 "$@"\n' > "$SCRIPTEP/bin/serve"
 mklayout "$WORK/layout-script" "$SCRIPTEP" plain /bin/serve
 out="$("$WALK" --layout "$WORK/layout-script" 2>&1)"; rc=$?
-if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'ENTRYPOINT'; then
+if [ "$rc" -ne 0 ] && grep -q 'ENTRYPOINT' <<<"$out"; then
 	ladder ok "6.entrypoint  walk-verify fails a non-Mach-O entrypoint"
 else
 	ladder no "6.entrypoint  walk-verify fails a non-Mach-O entrypoint"
 fi
 
 # ---- 7 — the k3sm-shard entrypoint (sharded ranks) ---------------------------
-# What a rank does before exec, with FAKE name resolution: no model, no GPU,
+# What a rank does before it starts the engine, with FAKE name resolution: no model, no GPU,
 # no cluster DNS. The live rendezvous (real per-pod records, two Macs, the
 # sandbox profile) is the M17 lab ladder's sharded-ring rung.
 SHARD="$HERE/k3sm_shard.py"
@@ -386,11 +678,34 @@ else
 fi
 
 cat > "$WORK/shard-driver.py" <<'PY'
-import http.server, json, os, socket, sys, threading
+import base64, http.server, json, os, socket, sys, threading
+from typing import Any, Dict, List
+from urllib.request import urlopen
 sys.path.insert(0, sys.argv[1])
 import k3sm_shard as ks
 
-work = sys.argv[2]
+def _image_url(part):
+    return part.get("image_url")
+
+def _image_parts(messages):
+    for message in messages:
+        yield from message["content"]
+
+# mlx-lm 0.32.2's mlx_lm.server._inline_image_urls, verbatim: the function the
+# remote-image guard replaces. Its normalized body hash is IMAGE_HOOK_SHA256.
+def _inline_image_urls(messages: List[Dict[str, Any]]) -> None:
+    """Replace http(s) image URLs with data URLs: all ranks read the same bytes."""
+    for part in _image_parts(messages):
+        url = _image_url(part)
+        if not url.startswith(("http://", "https://")):
+            continue
+        with urlopen(url, timeout=30) as response:
+            mime = response.headers.get_content_type()
+            data = base64.b64encode(response.read()).decode()
+        part.clear()
+        part.update(type="image_url", image_url={"url": f"data:{mime};base64,{data}"})
+
+here, work = sys.argv[1], sys.argv[2]  # serve() below rewrites sys.argv
 podvol = os.path.join(work, "podvol")
 os.makedirs(podvol)
 names = ["m-rank-0.m-headless.ns.svc", "m-rank-1.m-headless.ns.svc", "m-rank-2.m-headless.ns.svc"]
@@ -418,7 +733,7 @@ check("ring.hostfile  one [podIP:port] entry per rank, in rank order",
       json.loads(content) == [["10.42.0.5:29500"], ["10.42.1.5:29500"]])
 check("ring.datavolume  the hostfile lands inside TMPDIR and MLX_HOSTFILE names it",
       path.startswith(podvol + os.sep) and cenv["MLX_HOSTFILE"] == path)
-check("ring.argv  execs mlx_lm.server on 0.0.0.0 and the serve port, caller args last, no --pipeline for tensor",
+check("ring.argv  runs mlx_lm.server on 0.0.0.0 and the serve port, caller args last, no --pipeline for tensor",
       argv[1:8] == ["-m", "mlx_lm.server", "--host", "0.0.0.0", "--port", "8000", "--model"]
       and argv[-2:] == ["--max-tokens", "8"] and "--pipeline" not in argv)
 check("ring.env  MLX_RANK and MLX_WORLD_SIZE exported", cenv["MLX_RANK"] == "1" and cenv["MLX_WORLD_SIZE"] == "2")
@@ -485,6 +800,271 @@ for label, e in (("nodatavolume  refuses to write anywhere but the pod data volu
     except ks.ShardError:
         check(label, True)
 
+# --served-model-name: taken by the entrypoint, never passed to mlx_lm.server
+name, rest = ks.split_served_name(["--model", "/snap", "--served-model-name", "org/m", "--max-tokens", "8"])
+check("alias.split  --served-model-name is removed from the engine's argv and returned",
+      name == "org/m" and rest == ["--model", "/snap", "--max-tokens", "8"])
+name, rest = ks.split_served_name(["--served-model-name", "a", "--served-model-name=b"])
+check("alias.lastwins  the last --served-model-name wins, as a caller override does", name == "b" and rest == [])
+check("alias.absent  no --served-model-name leaves argv alone",
+      ks.split_served_name(["--model", "/m"]) == (None, ["--model", "/m"]))
+try:
+    ks.split_served_name(["--served-model-name"])
+    check("alias.novalue  --served-model-name without a name ends the rank", False)
+except ks.ShardError:
+    check("alias.novalue  --served-model-name without a name ends the rank", True)
+
+import io, types
+def fake_engine(**drop):
+    """A stand-in for mlx_lm.server 0.32.2 with the hooks the alias uses."""
+    m = types.ModuleType("mlx_lm.server")
+    rec = m.rec = {"loads": [], "http": None, "joined": False, "rank": 0}
+    class ModelProvider:
+        def __init__(self, cli_args):
+            self.cli_args = cli_args
+        def load(self, model_path, adapter_path=None, draft_model_path=None):
+            rec["loads"].append((model_path, adapter_path, draft_model_path))
+            return "model", "tokenizer"
+    class APIHandler:
+        def __init__(self, path):
+            self.path, self.created, self.wfile, self.status = path, 7, io.BytesIO(), None
+        def handle_models_request(self):
+            self.wfile.write(b"upstream")
+        def _set_completion_headers(self, status_code=200):
+            self.status = status_code
+        def end_headers(self):
+            pass
+    class ResponseGenerator:
+        def __init__(self, model_provider, prompt_cache):
+            self.model_provider, self.prompt_cache = model_provider, prompt_cache
+        def join(self):
+            rec["joined"] = True
+    def run(host, port, model_provider, server_class=None, handler_class=None):
+        raise AssertionError("the stock run was called")
+    def _run_http_server(host, port, response_generator, server_class=None, handler_class=APIHandler):
+        rec["http"] = (host, port, response_generator, handler_class)
+    def main():
+        rec["argv"] = list(sys.argv)
+        m.run("0.0.0.0", 8000, m.ModelProvider(types.SimpleNamespace(prompt_cache_size=3)))
+    group = types.SimpleNamespace(rank=lambda: rec["rank"])
+    m.mx = types.SimpleNamespace(distributed=types.SimpleNamespace(init=lambda: group))
+    m.ModelProvider, m.APIHandler, m.ResponseGenerator = ModelProvider, APIHandler, ResponseGenerator
+    m.LRUPromptCache = lambda size: ("cache", size)
+    m.run, m._run_http_server, m.main = run, _run_http_server, main
+    m._inline_image_urls = _inline_image_urls
+    for path, value in drop.items():
+        owner, _, attr = path.rpartition(".")
+        setattr(getattr(m, owner) if owner else m, attr, value)
+    return m
+
+# The rank checks run's source against the 0.32.0 pin; the stand-in's run is
+# not that body, so the driver pins the stand-in's own (rung 9a checks the real
+# engine against the real pin).
+ks.ENGINE_RUN_SHA256 = ks.source_shape(fake_engine().run)
+eng = fake_engine()
+P, Hd, _ = ks.install_alias(eng, "org/m")
+prov = eng.ModelProvider(types.SimpleNamespace(prompt_cache_size=3))
+prov.load("org/m", None, "default_model")
+prov.load("other/x", None, "default_model")
+check("alias.load  a request naming the served name loads default_model (the loaded snapshot), others pass through",
+      eng.rec["loads"] == [("default_model", None, "default_model"), ("other/x", None, "default_model")])
+def models(handler_cls, path):
+    h = handler_cls(path)
+    h.handle_models_request()
+    return h.status, h.wfile.getvalue()
+st, body = models(Hd, "/v1/models")
+check("alias.models  /v1/models lists the served name and nothing else",
+      st == 200 and [d["id"] for d in json.loads(body)["data"]] == ["org/m"])
+_, b1 = models(Hd, "/v1/models/org/m")
+_, b2 = models(Hd, "/v1/models/other/x")
+check("alias.modelsfilter  /v1/models/<id> finds the served name and no other",
+      [d["id"] for d in json.loads(b1)["data"]] == ["org/m"] and json.loads(b2)["data"] == [])
+eng.main()
+host, port, rg, handler = eng.rec["http"]
+check("alias.rank0  rank 0 serves HTTP through the aliased handler and provider",
+      handler is Hd and isinstance(rg.model_provider, P) and rg.prompt_cache == ("cache", 3) and port == 8000)
+eng = fake_engine()
+eng.rec["rank"] = 1
+ks.install_alias(eng, "org/m")
+eng.main()
+check("alias.rankn  every other rank joins the generator and serves no HTTP",
+      eng.rec["joined"] and eng.rec["http"] is None)
+eng = fake_engine()
+stock = (eng.ModelProvider, eng.APIHandler, eng.run)
+eng._run_http_server = None
+got = ks.install_alias(eng, None)
+check("alias.none  without a served name nothing is checked or replaced: the engine is stock",
+      got == stock and (eng.ModelProvider, eng.APIHandler, eng.run) == stock
+      and models(eng.APIHandler, "/v1/models")[1] == b"upstream")
+def fake_run(host, port, model_provider, server_class=None, handler_class=None):
+    group = mx.distributed.init()
+    return group
+try:
+    ks.check_run_shape(types.SimpleNamespace(run=fake_run))
+    check("alias.runshape  a run whose body is not the copied 0.32.2 one is refused with the re-derive instruction", False)
+except ks.ShardError as e:
+    check("alias.runshape  a run whose body is not the copied 0.32.2 one is refused with the re-derive instruction",
+          "re-derive" in str(e) and "ENGINE_RUN_SHA256" in str(e))
+for label, drop, needle in (
+        ("alias.failclosed.missing  an engine without _run_http_server ends the rank naming it",
+         {"_run_http_server": None}, "_run_http_server"),
+        ("alias.failclosed.signature  a ModelProvider.load with other parameters ends the rank naming it",
+         {"ModelProvider.load": lambda self, model_path: None}, "ModelProvider.load")):
+    eng = fake_engine(**drop)
+    stock_run, stock_provider = eng.run, eng.ModelProvider
+    try:
+        ks.install_alias(eng, "org/m")
+        check(label, False)
+    except ks.ShardError as e:
+        check(label, needle in str(e) and eng.run is stock_run and eng.ModelProvider is stock_provider)
+
+# the remote-image guard: mlx-lm 0.32.2 fetches any http(s) image URL in a chat
+# request; the entrypoint swaps that for a function that refuses all but data:
+hits = []
+class Probe(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        hits.append(self.path)
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"x")
+    def log_message(self, *a):
+        pass
+probe_srv = http.server.HTTPServer(("127.0.0.1", 0), Probe)
+threading.Thread(target=probe_srv.serve_forever, daemon=True).start()
+remote = f"http://127.0.0.1:{probe_srv.server_address[1]}/internal"
+eng = fake_engine()
+upstream = eng._inline_image_urls
+ks.install_image_guard(eng)
+check("imgguard.replaced  the engine's fetch is replaced by the refusing function",
+      eng._inline_image_urls is ks.refuse_remote_images and eng._inline_image_urls is not upstream)
+def refused(messages):
+    try:
+        eng._inline_image_urls(messages)
+    except ValueError:
+        return True
+    return False
+check("imgguard.http  a remote http URL is refused before any network call",
+      refused([{"role": "user", "content": [{"type": "image_url", "image_url": {"url": remote}}]}]) and hits == [])
+check("imgguard.https  https, a bare string URL, the 'image' key and file: are refused too",
+      all(refused([{"role": "user", "content": [part]}]) for part in (
+          {"type": "image_url", "image_url": {"url": "https://example.invalid/a.png"}},
+          {"type": "input_image", "image_url": "http://example.invalid/a.png"},
+          {"type": "image", "image": "https://example.invalid/a.png"},
+          {"type": "image_url", "image_url": {"url": "file:///etc/passwd"}},
+          {"type": "text", "image": {"url": "http://example.invalid/a.png"}},
+          {"type": "image_url", "image_url": 7}))
+      and hits == [])
+data_msgs = [{"role": "user", "content": [{"type": "text", "text": "hi"},
+                                          {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]},
+             {"role": "assistant", "content": "plain string content"}]
+before = json.dumps(data_msgs)
+check("imgguard.data  a data: URL passes and the messages are left unchanged",
+      not refused(data_msgs) and json.dumps(data_msgs) == before)
+def changed(**kw):
+    e = fake_engine()
+    def tampered(messages: List[Dict[str, Any]]) -> None:
+        for part in messages:
+            urlopen(part, timeout=30)
+    def renamed(msgs, extra):
+        pass
+    e._inline_image_urls = {"body": tampered, "sig": renamed, "gone": None}[kw["how"]]
+    try:
+        ks.install_image_guard(e)
+    except ks.ShardError as err:
+        return "_inline_image_urls" in str(err) and e._inline_image_urls is not ks.refuse_remote_images
+    return False
+check("imgguard.failclosed.body  a changed upstream body makes the hook check fail naming the hook", changed(how="body"))
+check("imgguard.failclosed.signature  another signature fails the check", changed(how="sig"))
+check("imgguard.failclosed.missing  an engine without the function fails the check", changed(how="gone"))
+eng = fake_engine()
+env_saved = dict(os.environ)
+try:
+    ks.serve({"MLX_RANK": "0"}, ["x", "y", "z"], None, importer=lambda name: eng)
+except AssertionError:
+    pass
+finally:
+    os.environ.clear()
+    os.environ.update(env_saved)
+check("imgguard.serve  serve() installs the guard on the stock path (no --served-model-name) too",
+      eng._inline_image_urls is ks.refuse_remote_images)
+probe_srv.shutdown()
+
+# serve: the rendezvous environment is in place before the engine is imported,
+# and the engine sees plan()'s argv (pipeline included) without the alias flag
+saved = dict(os.environ)
+seen = {}
+def importer(name):
+    seen["name"], seen["hostfile"] = name, os.environ.get("MLX_HOSTFILE")
+    seen["eng"] = fake_engine()
+    return seen["eng"]
+served, rest = ks.split_served_name(["--model", "/snap", "--served-model-name", "org/m"])
+files, cenv, cargv = ks.plan(env(K3SM_MLX_PARALLELISM="pipeline"), rest, resolver=resolver)
+try:
+    ks.serve(cenv, cargv, served, importer=importer)
+finally:
+    os.environ.clear()
+    os.environ.update(saved)
+check("serve.env  the engine is imported after MLX_HOSTFILE is set", seen["name"] == "mlx_lm.server"
+      and seen["hostfile"] == cenv["MLX_HOSTFILE"])
+check("serve.argv  main() sees the plan's argv, --pipeline kept, --served-model-name gone",
+      seen["eng"].rec["argv"] == ["mlx_lm.server", "--host", "0.0.0.0", "--port", "8000", "--pipeline", "--model", "/snap"])
+
+# the rank's exit is the engine's: run k3sm_shard as the pod command does,
+# against a fake mlx_lm.server package, and read the process's own status
+import inspect, signal, subprocess, time
+fakepkg = os.path.join(work, "fake-engine")
+os.makedirs(os.path.join(fakepkg, "mlx_lm"))
+open(os.path.join(fakepkg, "mlx_lm", "__init__.py"), "w").close()
+with open(os.path.join(fakepkg, "mlx_lm", "server.py"), "w") as f:
+    f.write(
+        "import os, signal, sys, time\n"
+        "ModelProvider = APIHandler = run = None\n"
+        "class Stop(Exception):\n"
+        "    pass\n"
+        "def _stop(signum, frame):\n"
+        "    raise Stop(signum)\n"
+        "def main():\n"
+        "    mode = os.environ['FAKE_ENGINE_MODE']\n"
+        "    if mode == 'fail':\n"
+        "        return 3\n"
+        "    signal.signal(signal.SIGTERM, _stop)\n"
+        "    open(os.environ['FAKE_ENGINE_READY'], 'w').close()\n"
+        "    try:\n"
+        "        time.sleep(30)\n"
+        "    except Stop as e:\n"
+        "        with open(os.environ['FAKE_ENGINE_GOT'], 'w') as g:\n"
+        "            g.write(str(e.args[0]))\n"
+        "        return 128 + e.args[0]\n"
+        "    return 0\n"
+        # serve() installs the remote-image guard first, so the fake carries
+        # the verbatim 0.32.2 function it checks and replaces
+        "import base64\n"
+        "from typing import Any, Dict, List\n"
+        "from urllib.request import urlopen\n"
+        + "".join(inspect.getsource(fn) for fn in (_image_url, _image_parts, _inline_image_urls)))
+def rank_proc(mode):
+    e = env(MLX_WORLD_SIZE="1", MLX_RANK="0", K3SM_MLX_RANKS=names[0], K3SM_POD_IP="10.42.0.5")
+    e.update(PYTHONPATH=os.pathsep.join([here, fakepkg]), PYTHONDONTWRITEBYTECODE="1", FAKE_ENGINE_MODE=mode,
+             FAKE_ENGINE_READY=os.path.join(work, "engine-ready"), FAKE_ENGINE_GOT=os.path.join(work, "engine-got"),
+             PATH=os.environ.get("PATH", ""))
+    return subprocess.Popen([sys.executable, "-m", "k3sm_shard", "--model", "/snap"], env=e,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL), e
+p, _ = rank_proc("fail")
+check("exit.status  an engine main() returning 3 makes the rank exit 3", p.wait(timeout=30) == 3)
+p, e = rank_proc("term")
+deadline = time.monotonic() + 30
+while not os.path.exists(e["FAKE_ENGINE_READY"]) and p.poll() is None and time.monotonic() < deadline:
+    time.sleep(0.05)
+p.send_signal(signal.SIGTERM)
+try:
+    rc = p.wait(timeout=30)
+except subprocess.TimeoutExpired:
+    p.kill()
+    rc = p.wait()
+got = open(e["FAKE_ENGINE_GOT"]).read() if os.path.exists(e["FAKE_ENGINE_GOT"]) else ""
+check("exit.sigterm  SIGTERM to the rank reaches the engine, and its shutdown status is the rank's",
+      got == str(int(signal.SIGTERM)) and rc == 128 + signal.SIGTERM)
+
 # the liveness probe against a local server
 class H(http.server.BaseHTTPRequestHandler):
     code = 200
@@ -523,10 +1103,10 @@ while read -r verdict name; do
 	esac
 done <<< "$shard_out"
 # A driver that crashed before its checks would otherwise pass vacuously.
-if [ "$SHARD_CHECKS" -ge 19 ]; then
+if [ "$SHARD_CHECKS" -ge 44 ]; then
 	ladder ok "7.count  all $SHARD_CHECKS entrypoint checks reported"
 else
-	ladder no "7.count  only $SHARD_CHECKS of 19 entrypoint checks reported (the driver crashed?)"
+	ladder no "7.count  only $SHARD_CHECKS of 44 entrypoint checks reported (the driver crashed?)"
 	head -20 "$WORK/shard-driver.err"
 fi
 
@@ -542,7 +1122,7 @@ if [ -f "$SERVE" ] && PYTHONDONTWRITEBYTECODE=1 python3 -c 'import ast, sys; ast
 else
 	ladder no "8.parse  k3sm_serve.py parses"
 fi
-if printf '%s' "$ep" | grep -qF '"k3sm_serve", "serve"' && grep -q '^SERVE_MODULE="k3sm_serve"$' "$BUILD" &&
+if grep -qF '"k3sm_serve", "serve"' <<<"$ep" && grep -q '^SERVE_MODULE="k3sm_serve"$' "$BUILD" &&
 	grep -qE '^	for module in .*SHARD_MODULE.*SERVE_MODULE' "$BUILD"; then
 	ladder ok "8.entrypoint  the ENTRYPOINT runs vllm-mlx's serve through k3sm_serve, and build.sh installs it"
 else
@@ -619,6 +1199,18 @@ server._resolve_request_max_tokens = lambda v: 32768 if v is None else v
 server._prepare_chat_completion_invocation = lambda engine, request, mt: types.SimpleNamespace(
     messages=request["messages"], chat_kwargs={"max_tokens": mt})
 server.stream_completion = lambda engine, prompt, request, mt, **kw: ("stream", mt)
+server._prepare_anthropic_endpoint_invocation = lambda engine, request, mt: types.SimpleNamespace(
+    messages=request["messages"], chat_kwargs={"max_tokens": mt})
+CONVERSIONS = []
+def to_chat_request(request):
+    CONVERSIONS.append(1)
+    return types.SimpleNamespace(messages=request["messages"], max_tokens=request.get("max_output_tokens"))
+def prepare_responses(request, *, validate_remote_media=True):
+    chat_request = server._responses_request_to_chat_request(request)
+    return (server._engine, chat_request, chat_request.messages,
+            {"max_tokens": chat_request.max_tokens or 32768})
+server._responses_request_to_chat_request = to_chat_request
+server._prepare_responses_request = prepare_responses
 mmc = lambda messages: (None, [], [], [])
 Refusal = ks.install(server, Engine, HTTPError, lambda status_code, content: (status_code, content), mmc, lambda t: t)
 
@@ -644,6 +1236,27 @@ p = server._prepare_chat_completion_invocation(eng, msgs(short), res(None))
 check("chat.default  an omitted max_tokens runs as the rest of the window (64 - 12)", p.chat_kwargs["max_tokens"] == 52)
 check("chat.templated  the chat count is of the engine's templated prompt, not the raw text",
       refusal(lambda: server._prepare_chat_completion_invocation(eng, msgs(" ".join(["w"] * 60)), res(3))) is not None)
+check("messages.over  an over-length /v1/messages request is refused with HTTP 400 (stream or not)",
+      refusal(lambda: server._prepare_anthropic_endpoint_invocation(eng, msgs(long), res(8))) is not None)
+p = server._prepare_anthropic_endpoint_invocation(eng, msgs(short), res(8))
+check("messages.fit  an in-window /v1/messages request passes with its max_tokens", p.chat_kwargs["max_tokens"] == 8)
+p = server._prepare_anthropic_endpoint_invocation(eng, msgs(short), res(None))
+check("messages.default  an omitted max_tokens runs as the rest of the window (64 - 12)",
+      p.chat_kwargs["max_tokens"] == 52)
+server._engine = eng
+resp = lambda t, mt=None: dict(msgs(t), max_output_tokens=mt)
+check("responses.stream  an over-length /v1/responses request is refused at the conversion the streaming "
+      "handler makes before its first SSE event",
+      refusal(lambda: server._responses_request_to_chat_request(resp(long, 8))) is not None)
+check("responses.streamfit  an in-window /v1/responses conversion returns the chat request",
+      server._responses_request_to_chat_request(resp(short, 8)).max_tokens == 8)
+check("responses.over  an over-length /v1/responses request is refused where its engine arguments are built",
+      refusal(lambda: server._prepare_responses_request(resp(long, 8))) is not None)
+CONVERSIONS.clear()
+_, _, _, kw = server._prepare_responses_request(resp(short))
+check("responses.default  an omitted max_output_tokens runs as the rest of the window (64 - 12)",
+      kw["max_tokens"] == 52)
+check("responses.once  the conversion inside the preparation is not checked a second time", CONVERSIONS == [1])
 check("stream.over  an over-length streaming completion is refused before the stream starts",
       refusal(lambda: server.stream_completion(eng, long, {}, res(8))) is not None)
 check("stream.fit  an in-window streaming completion streams", server.stream_completion(eng, short, {}, res(8)) == ("stream", 8))
@@ -683,11 +1296,159 @@ while read -r verdict name; do
 		*)  ladder no "8.driver  $verdict $name" ;;
 	esac
 done <<< "$serve_out"
-if [ "$SERVE_CHECKS" -ge 26 ]; then
+if [ "$SERVE_CHECKS" -ge 34 ]; then
 	ladder ok "8.count  all $SERVE_CHECKS guard checks reported"
 else
-	ladder no "8.count  only $SERVE_CHECKS of 26 guard checks reported (the driver crashed?)"
+	ladder no "8.count  only $SERVE_CHECKS of 34 guard checks reported (the driver crashed?)"
 	head -20 "$WORK/serve-driver.err"
+fi
+
+# ---- 8k — --max-kv-size clamped to the model's KV geometry ------------------
+# k3sm sizes --max-kv-size from a fixed 157286 KV bytes per token (a 3B model);
+# a larger model costs more, so k3sm_serve lowers the pin at start from the
+# model's config.json. Here against fake config.json files shaped like the real
+# Qwen2.5-32B, Qwen2.5-3B, Llama-3.3-70B and Gemma 3 (text_config) ones, a fake
+# Hub client and a fake engine CLI: no network, no engine.
+cat > "$WORK/kv-driver.py" <<'PY'
+import argparse, json, os, sys, types
+sys.path.insert(0, sys.argv[1])
+work = sys.argv[2]
+import k3sm_serve as ks
+
+def check(name, cond):
+    print(("ok " if cond else "no ") + name, flush=True)
+
+def config(name, **fields):
+    d = os.path.join(work, name)
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "config.json"), "w") as f:
+        json.dump(fields, f)
+    return d
+
+Q32 = config("qwen2.5-32b", num_hidden_layers=64, num_attention_heads=40, num_key_value_heads=8, hidden_size=5120)
+Q3 = config("qwen2.5-3b", num_hidden_layers=36, num_attention_heads=16, num_key_value_heads=2, hidden_size=2048)
+L70 = config("llama-3.3-70b", num_hidden_layers=80, num_attention_heads=64, num_key_value_heads=8, head_dim=128,
+             hidden_size=8192)
+G27 = config("gemma-3-27b", model_type="gemma3", text_config={"num_hidden_layers": 62, "num_attention_heads": 32,
+             "num_key_value_heads": 16, "head_dim": 128, "hidden_size": 5376})
+NOFIELD = config("nolayers", num_attention_heads=40, num_key_value_heads=8, hidden_size=5120)
+EMPTY = os.path.join(work, "no-config")
+os.makedirs(EMPTY, exist_ok=True)
+
+# A stand-in for vllm-mlx's serve parser: positional model, last --max-kv-size wins.
+P = argparse.ArgumentParser()
+P.add_argument("command")
+P.add_argument("model", nargs="?")
+P.add_argument("--max-kv-size", type=int)
+P.add_argument("--host"); P.add_argument("--port"); P.add_argument("--max-num-seqs")
+P.add_argument("--continuous-batching", action="store_true")
+def parse(argv):
+    a, _ = P.parse_known_args(argv)
+    return a.model, a.max_kv_size
+
+def argv(model, *tail, w="32768"):
+    return ["serve", "--continuous-batching", "--host", "0.0.0.0", "--port", "8080", model, "--port", "8080",
+            "--max-kv-size", w, "--max-num-seqs", "4", "--continuous-batching"] + list(tail)
+
+def run(args, env=None):
+    lines = []
+    out = ks.clamp_max_kv_size(args, env or {}, parse=parse, say=lines.append)
+    return out, lines
+
+a = argv(Q32)
+out, lines = run(a)
+check("clamp.32b  a Qwen2.5-32B geometry (262144 B/token) lowers 32768 to floor(32768 x 157286 / 262144) = 19660",
+      parse(out)[1] == 19660 and len(out) == len(a) and [t for t in out if t != "19660"] == [t for t in a if t != "32768"])
+check("clamp.log  one line names W, the geometry, both figures and the clamped value",
+      len(lines) == 1 and all(s in lines[0] for s in ("32768", "64 layers", "8 KV heads", "head_dim 128", "262144",
+                                                       "157286", "19660")))
+out, lines = run(argv(L70))
+check("clamp.70b  a Llama-3.3-70B geometry with an explicit head_dim (327680 B/token) lowers 32768 to 15728",
+      parse(out)[1] == 15728 and len(lines) == 1)
+out, lines = run(argv(G27))
+check("clamp.textconfig  a multimodal config's nested text_config is the geometry read (507904 B/token, 10147)",
+      parse(out)[1] == 10147 and "62 layers" in lines[0])
+a = argv(Q3)
+out, lines = run(a)
+check("noclamp.3b  a Qwen2.5-3B geometry (36864 B/token) leaves W alone, silently", out == a and lines == [])
+a = argv(EMPTY)
+out, lines = run(a)
+check("missing.config  a model with no config.json leaves W alone, with one line", out == a and len(lines) == 1)
+a = argv(NOFIELD)
+out, lines = run(a)
+check("missing.field  a config without num_hidden_layers leaves W alone, with one line",
+      out == a and len(lines) == 1 and "num_hidden_layers" in lines[0])
+a = argv(Q32)
+out, lines = run(a, {"K3SM_KV_GEOMETRY_CLAMP": "off"})
+check("off  K3SM_KV_GEOMETRY_CLAMP=off leaves W alone", out == a and len(lines) == 1)
+out, lines = run(a, {"K3SM_KV_BYTES_PER_TOKEN": "262144"})
+check("assumed.env  K3SM_KV_BYTES_PER_TOKEN is the assumed figure (sized for 262144: no clamp)", out == a and lines == [])
+out, lines = run(a, {"K3SM_KV_BYTES_PER_TOKEN": "lots"})
+check("assumed.bad  an unparsable K3SM_KV_BYTES_PER_TOKEN leaves W alone, with one line", out == a and len(lines) == 1)
+out, _ = run(argv(Q32, w="2048"), {"K3SM_KV_BYTES_PER_TOKEN": "1000"})
+check("floor  the clamp never goes below 1024", parse(out)[1] == 1024)
+a = argv(Q32, w="512")
+out, _ = run(a, {"K3SM_KV_BYTES_PER_TOKEN": "1000"})
+check("floor.noraise  a W already under 1024 is never raised", out == a)
+a = argv(Q32, "--max-kv-size", "16384")
+out, _ = run(a)
+check("override.last  the operator's later --max-kv-size is the W clamped (16384 -> 9830)", parse(out)[1] == 9830)
+a = [t for t in argv(Q32) if t not in ("--max-kv-size", "32768")] + ["--max-kv-size=32768"]
+out, _ = run(a)
+check("equals  a --max-kv-size=W spelling is rewritten in place", out[-1] == "--max-kv-size=19660" and len(out) == len(a))
+a = [t for t in argv(Q32) if t not in ("--max-kv-size", "32768")]
+out, lines = run(a)
+check("nokv  no --max-kv-size, nothing read or said", out == a and lines == [])
+out, _ = run(argv("Qwen/Qwen2.5-32B-Instruct"), {"K3SM_MODEL_CONFIG_DIR": Q32})
+check("configdir  K3SM_MODEL_CONFIG_DIR is read instead of the model reference", parse(out)[1] == 19660)
+
+calls = []
+hub = types.ModuleType("huggingface_hub")
+def snapshot_download(repo, **kw):
+    calls.append((repo, kw))
+    return Q32
+hub.snapshot_download = snapshot_download
+sys.modules["huggingface_hub"] = hub
+out, _ = run(argv("Qwen/Qwen2.5-32B-Instruct"))
+check("hub  a Hub reference fetches only config.json with snapshot_download, into the default cache",
+      calls == [("Qwen/Qwen2.5-32B-Instruct", {"allow_patterns": ["config.json"]})] and parse(out)[1] == 19660)
+def unreachable(repo, **kw):
+    raise OSError("offline")
+hub.snapshot_download = unreachable
+a = argv("Qwen/Qwen2.5-32B-Instruct")
+out, lines = run(a)
+check("hub.down  a Hub fetch that fails leaves W alone, with one line", out == a and len(lines) == 1)
+
+seen = []
+cli = types.ModuleType("vllm_mlx.cli")
+cli.main = lambda: seen.append(list(sys.argv))
+pkg = types.ModuleType("vllm_mlx")
+pkg.cli = cli
+sys.modules["vllm_mlx"], sys.modules["vllm_mlx.cli"] = pkg, cli
+ks.engine_serve_args = parse
+ks.install_on_engine = lambda: None
+os.environ.pop("K3SM_KV_GEOMETRY_CLAMP", None)
+os.environ.pop("K3SM_KV_BYTES_PER_TOKEN", None)
+os.environ.pop("K3SM_MODEL_CONFIG_DIR", None)
+rc = ks.main(argv(Q32))
+check("main  serve hands the engine the clamped argv", rc == 0 and len(seen) == 1 and parse(seen[0][1:])[1] == 19660)
+PY
+KV_CHECKS=0
+kv_out="$(PYTHONDONTWRITEBYTECODE=1 python3 "$WORK/kv-driver.py" "$HERE" "$WORK/kv" 2>"$WORK/kv-driver.err")"
+while read -r verdict name; do
+	[ -n "$verdict" ] || continue
+	KV_CHECKS=$((KV_CHECKS + 1))
+	case "$verdict" in
+		ok) ladder ok "8k.$name" ;;
+		no) ladder no "8k.$name" ;;
+		*)  ladder no "8k.driver  $verdict $name" ;;
+	esac
+done <<< "$kv_out"
+if [ "$KV_CHECKS" -ge 19 ]; then
+	ladder ok "8k.count  all $KV_CHECKS clamp checks reported"
+else
+	ladder no "8k.count  only $KV_CHECKS of 19 clamp checks reported (the driver crashed?)"
+	head -20 "$WORK/kv-driver.err"
 fi
 
 # ---- 9 — the guard on the REAL engine (needs a staged tree) -----------------
@@ -695,7 +1456,6 @@ fi
 # guard on the real server module and drives its real HTTP app (a fake engine
 # under it: no model, no GPU), so an engine bump that moves a seam is caught
 # here before an image is built. It needs the tree build.sh stages.
-STAGED="${K3SM_MLX_STAGE:-${K3SM_MLX_WORK:-$HOME/.cache/k3sm/mlx-serve}/stage}"
 if [ -x "$STAGED/bin/python3.12" ] && [ -d "$STAGED/lib/python3.12/site-packages/vllm_mlx" ]; then
 	cat > "$WORK/serve-real.py" <<'PY'
 import sys, types
@@ -741,6 +1501,7 @@ class Engine(BatchedEngine):
         self._model_name, self._loaded, self._engine, self._mllm_scheduler = "fake", True, Core(), None
 
 engine = Engine(64)
+server._engine = engine
 async def acquire(raw_request, **kw):
     return engine
 async def release(raw_request):
@@ -759,6 +1520,16 @@ def check(name, r, want, text=None):
     ok = r.status_code == want and (text is None or text in r.text)
     print(("ok " if ok else "no ") + "%s (HTTP %d)" % (name, r.status_code), flush=True)
 
+def refused_unstreamed(name, r):
+    # A refusal is the JSON error object and nothing else: no SSE event was
+    # written before it, and the engine never ran.
+    ok = (r.status_code == 400 and r.headers.get("content-type", "").startswith("application/json")
+          and r.json().get("error", {}).get("type") == "BadRequestError"
+          and "maximum context length is 64 tokens" in r.json()["error"]["message"]
+          and "event:" not in r.text and "data:" not in r.text and RAN == [])
+    print(("ok " if ok else "no ") + "%s (HTTP %d, %s)" % (name, r.status_code, r.headers.get("content-type")),
+          flush=True)
+
 chat = lambda t: [{"role": "user", "content": t}]
 for stream in (False, True):
     tag = "stream" if stream else "plain"
@@ -771,10 +1542,24 @@ for stream in (False, True):
           post("/v1/completions", prompt=long, max_tokens=8, stream=stream), 400, '"type":"BadRequestError"')
     check("real.cmpl.fit.%s  /v1/completions inside the window answers 200" % tag,
           post("/v1/completions", prompt=short, max_tokens=8, stream=stream), 200)
+for stream in (False, True):
+    tag = "stream" if stream else "plain"
+    RAN.clear()
+    refused_unstreamed("real.msgs.over.%s  /v1/messages over the window answers 400 before any SSE byte" % tag,
+                       post("/v1/messages", messages=chat(long), max_tokens=8, stream=stream))
+    check("real.msgs.fit.%s  /v1/messages inside the window answers 200" % tag,
+          post("/v1/messages", messages=chat(short), max_tokens=8, stream=stream), 200)
+    RAN.clear()
+    refused_unstreamed("real.resp.over.%s  /v1/responses over the window answers 400 before any SSE byte" % tag,
+                       post("/v1/responses", input=long, max_output_tokens=8, stream=stream))
+    check("real.resp.fit.%s  /v1/responses inside the window answers 200" % tag,
+          post("/v1/responses", input=short, max_output_tokens=8, stream=stream), 200)
 RAN.clear()
 post("/v1/chat/completions", messages=chat(short))
 post("/v1/completions", prompt=short)
-print(("ok " if RAN == [52, 54] else "no ") + "real.default  an omitted max_tokens runs as the rest of the window %r" % RAN)
+post("/v1/responses", input=short)
+print(("ok " if RAN[:2] == [52, 54] and len(RAN) == 3 and 0 < RAN[2] < 64 else "no ")
+      + "real.default  an omitted max_tokens runs as the rest of the window %r" % RAN)
 PY
 	REAL_CHECKS=0
 	real_out="$(cd "$WORK" && PYTHONDONTWRITEBYTECODE=1 "$STAGED/bin/python3.12" -I -B "$WORK/serve-real.py" "$HERE" 2>"$WORK/serve-real.err")"
@@ -787,23 +1572,201 @@ PY
 			*)  ladder no "9.driver  $verdict $name" ;;
 		esac
 	done <<< "$real_out"
-	if [ "$REAL_CHECKS" -ge 9 ]; then
+	if [ "$REAL_CHECKS" -ge 17 ]; then
 		ladder ok "9.count  all $REAL_CHECKS real-engine checks reported"
 	else
-		ladder no "9.count  only $REAL_CHECKS of 9 real-engine checks reported (the driver crashed?)"
+		ladder no "9.count  only $REAL_CHECKS of 17 real-engine checks reported (the driver crashed?)"
 		tail -20 "$WORK/serve-real.err"
 	fi
 else
 	ladder skip "9.real  no staged tree at $STAGED (run build.sh, or set K3SM_MLX_STAGE)"
 fi
 
+# ---- 9s — the attention-sink mask on the REAL mlx-lm cache (staged tree) ----
+# mlx-lm 0.32.2's RotatingKVCache keeps its first `keep` tokens as attention
+# sinks, but its prefill mask is a plain sliding window: once the cache has
+# trimmed, every query row masks the sink columns out (the upstream defect,
+# shown red here first). k3sm_serve patches make_mask; this rung drives the
+# pinned mlx-lm's own cache through a chunked prefill past its window and
+# checks, row by row, that each query sees the sinks plus exactly the
+# max_size - keep most recent tokens, which is what a decode step sees.
+if [ -x "$STAGED/bin/python3.12" ] && [ -d "$STAGED/lib/python3.12/site-packages/mlx_lm" ]; then
+	cat > "$WORK/sink-real.py" <<'PY'
+import sys, types
+sys.path.insert(0, sys.argv[1])
+import mlx.core as mx
+from mlx_lm.models.cache import RotatingKVCache, make_prompt_cache
+import k3sm_serve as ks
+
+W, KEEP = 16, 4
+
+def check(name, cond):
+    print(("ok " if cond else "no ") + name, flush=True)
+
+def rows_seen(size, keep, history, step, n, window=None, return_array=False):
+    """Prefill `history` ids in chunks of `step`, then n more; the ids each new row sees."""
+    cache = RotatingKVCache(max_size=size, keep=keep)
+    for start in range(0, history, step):
+        kv = mx.arange(start, min(start + step, history)).reshape(1, 1, -1, 1)
+        cache.update_and_fetch(kv, kv)
+    mask = cache.make_mask(n, window, return_array)
+    kv = mx.arange(history, history + n).reshape(1, 1, n, 1)
+    keys, _ = cache.update_and_fetch(kv, kv)
+    ids = keys[0, 0, :, 0].tolist()
+    rows = None if isinstance(mask, str) else mask.tolist()
+    seen = []
+    for row in range(n):
+        end = history + row + 1
+        seen.append(sorted(t for col, t in enumerate(ids) if (t < end if rows is None else rows[row][col])))
+    return seen, rows
+
+def decode_view(size, keep, end):
+    return list(range(min(keep, end))) + list(range(max(keep, end - (size - keep)), end))
+
+check("sink.target  make_prompt_cache(model, max_kv_size) builds RotatingKVCache with keep=4",
+      [c.keep for c in make_prompt_cache(types.SimpleNamespace(layers=[0]), max_kv_size=W)] == [KEEP])
+
+_, rows = rows_seen(W, KEEP, 40, 8, 8)
+check("sink.upstream  unpatched, a trimmed cache's prefill mask hides the sink columns (the defect is real)",
+      rows is not None and not all(all(r[:KEEP]) for r in rows))
+
+original = RotatingKVCache.make_mask
+classes = ks.rotating_cache_classes()
+ks.patch_rotating_kv_cache(classes, mx)
+check("sink.patched  RotatingKVCache.make_mask is replaced", RotatingKVCache.make_mask is not original)
+ks.patch_rotating_kv_cache(classes, mx)
+check("sink.idempotent  a second patch does not wrap the first",
+      RotatingKVCache.make_mask.__defaults__[-1] is original)
+
+seen, rows = rows_seen(W, KEEP, 40, 8, 8)
+check("sink.columns  after a trim, columns 0..3 are unmasked for every query row",
+      rows is not None and all(all(r[:KEEP]) for r in rows))
+check("sink.window  every row sees the sinks and the max_size - keep most recent tokens, as decode does",
+      all(seen[r] == decode_view(W, KEEP, 40 + r + 1) for r in range(8)))
+
+ok = True
+for size in (4, 8, 16):
+    for keep in sorted({1, min(4, size - 1), size - 1}):
+        for history in (0, size - 1, size, 2 * size + 3):
+            for step in (1, size + 1):
+                for n in (2, size + 2):
+                    for ra in (False, True):
+                        seen, _ = rows_seen(size, keep, history, step, n, None, ra)
+                        ok = ok and all(seen[r] == decode_view(size, keep, history + r + 1) for r in range(n))
+check("sink.sweep  the same holds across sizes, keeps, histories, chunk sizes and return_array", ok)
+
+same = True
+for keep, window in ((0, None), (0, 8), (KEEP, 8)):
+    for history in (0, 9, 40):
+        cache = RotatingKVCache(max_size=W, keep=keep)
+        for start in range(0, history, 8):
+            kv = mx.arange(start, min(start + 8, history)).reshape(1, 1, -1, 1)
+            cache.update_and_fetch(kv, kv)
+        a, b = cache.make_mask(6, window, True), original(cache, 6, window, True)
+        same = same and mx.array_equal(a, b).item()
+check("sink.unchanged  keep=0, or an explicit window other than the cache size, builds upstream's mask", same)
+
+try:
+    from mlx_vlm.models.cache import RotatingKVCache as VLM
+    check("sink.vlm  mlx-vlm's copy of RotatingKVCache is patched too",
+          VLM in classes and getattr(VLM.make_mask, ks.SINK_PATCHED, False))
+except ImportError:
+    check("sink.vlm  mlx-vlm is not installed; only mlx-lm's cache is patched", classes == [RotatingKVCache])
+
+class Moved:
+    def make_mask(self, N):
+        return None
+try:
+    ks.patch_rotating_kv_cache([Moved], mx)
+    check("sink.failclosed  a make_mask with another signature ends the process", False)
+except ks.GuardError:
+    check("sink.failclosed  a make_mask with another signature ends the process", True)
+PY
+	SINK_CHECKS=0
+	sink_out="$(cd "$WORK" && PYTHONDONTWRITEBYTECODE=1 "$STAGED/bin/python3.12" -I -B "$WORK/sink-real.py" "$HERE" 2>"$WORK/sink-real.err")"
+	while read -r verdict name; do
+		[ -n "$verdict" ] || continue
+		SINK_CHECKS=$((SINK_CHECKS + 1))
+		case "$verdict" in
+			ok) ladder ok "9s.$name" ;;
+			no) ladder no "9s.$name" ;;
+			*)  ladder no "9s.driver  $verdict $name" ;;
+		esac
+	done <<< "$sink_out"
+	if [ "$SINK_CHECKS" -ge 10 ]; then
+		ladder ok "9s.count  all $SINK_CHECKS sink-mask checks reported"
+	else
+		ladder no "9s.count  only $SINK_CHECKS of 10 sink-mask checks reported (the driver crashed?)"
+		tail -20 "$WORK/sink-real.err"
+	fi
+else
+	ladder skip "9s.real  no staged tree at $STAGED (run build.sh, or set K3SM_MLX_STAGE)"
+fi
+
+# ---- 9e — the engine-source check, on fixture engines (hermetic) -------------
+# A rank reads mlx_lm.server.run's source with inspect.getsource and refuses to
+# start unless it hashes to ENGINE_RUN_SHA256, so the image must carry the
+# engine's .py beside its bytecode. This driver checks exactly that, on any
+# site-packages: no sourceless bytecode in the engine package, the module
+# holding run loaded from its .py with its bytecode beside it, every hook, and
+# run's body against the pin (argv[3] overrides it; "self" pins the loaded
+# run's own; pin.real reports whether it did, and rung 9a requires it). Rung 9e proves it red on a fixture engine with a wrong pin and on
+# one whose .py was dropped beside its bytecode; rung 9a runs it on the
+# staged mlx_lm against the real pin.
+write_engine_source
+
+# engine_source <python> <site-packages> [pin] prints the driver's verdicts,
+# one per check, in order (the verdict word only, space-separated).
+engine_source() {
+	(cd "$WORK" && PYTHONDONTWRITEBYTECODE=1 "$1" -I -B "$WORK/engine-source.py" "$HERE" "$2" "${@:3}" 2>>"$WORK/engine-source.err") |
+		awk '{ printf "%s%s", (NR > 1 ? " " : ""), $1 } END { print "" }'
+}
+
+EFIX="$WORK/engine-fix"
+make_engine_fixture "$EFIX/good"
+# The good fixture is laid out as build.sh lays out the image: unchecked-hash
+# bytecode under __pycache__ beside every .py. The dropped one is what a build
+# that lost the sources would ship: legacy bytecode in place, no server.py.
+cp -R "$EFIX/good" "$EFIX/dropped"
+if ! python3 -m compileall -q --invalidation-mode unchecked-hash "$EFIX/good" >"$WORK/compileall.err" 2>&1 ||
+	! python3 -m compileall -q -b --invalidation-mode unchecked-hash "$EFIX/dropped" >>"$WORK/compileall.err" 2>&1; then
+	ladder no "9e.compileall  python3 -m compileall failed on the fixture engines, so the legs below may test no bytecode"
+	tail -5 "$WORK/compileall.err"
+fi
+rm -f "$EFIX/dropped/mlx_lm/server.py"
+for leg in \
+	"good|self|ok ok no ok ok|9e.green  a fixture engine with its sources, pinned to its own run, passes every check but pin.real (an override)" \
+	"good|$(printf '0%.0s' $(seq 64))|ok ok no no no|9e.pin  the same engine against a wrong ENGINE_RUN_SHA256 fails hooks and runshape, sources still ok" \
+	"dropped|self|no no no no no|9e.dropped  an engine whose server.py was dropped beside its bytecode fails the source checks and both hash checks"; do
+	IFS='|' read -r tree pin want label <<< "$leg"
+	got="$(engine_source python3 "$EFIX/$tree" "$pin")"
+	if [ "$got" = "$want" ]; then
+		ladder ok "$label"
+	else
+		ladder no "$label (got '$got', want '$want')"
+		tail -5 "$WORK/engine-source.err"
+	fi
+done
+
+# ---- 9a — the served-name alias against the pinned mlx-lm (staged tree) ------
+# k3sm_shard's alias hooks four mlx_lm.server internals; this rung checks them
+# on the real module the image carries, so an mlx-lm bump that moves one goes
+# red here before a rank refuses to start: the engine-source driver above
+# (sources beside the bytecode, every hook's signature, the source of the run
+# the alias copies against the real pin), the remote-image guard's hook against
+# its 0.32.2 body, then the real models listing against the aliased one. No
+# model is loaded and no distributed group is formed: the handlers are built
+# without a socket over an empty Hub cache. With --staged a missing tree is a
+# failure, not a skip.
+rung_9a
+
 # ---- 10 — the stage Job (stage-job.sh render) --------------------------------
 # A golden check of what the cluster is asked to run. The uv pin is repeated
 # here, independently of stage-job.sh, so an edited pin goes red until it is
 # re-checked against the release's published sha256 and edited here too.
 STAGEJOB="$HERE/stage-job.sh"
-GOLD_UV_VERSION="0.12.7"
-GOLD_UV_SHA256="127ebdda7ad953cdf198e964b570ea5771b85467ea93eb7cb6d6f8e6f55408f3"
+GOLD_UV_VERSION="0.13.1"
+GOLD_UV_SHA256="cfe454573412ff7380d15fc7dae5997ab53ffce72fce0a78e91ddbc84001acd2"
 GOLD_UV_URL="https://github.com/astral-sh/uv/releases/download/$GOLD_UV_VERSION/uv-aarch64-apple-darwin.tar.gz"
 GOLD_NODE="k3sm-golden"
 RJ="$WORK/stage-job.yaml"
@@ -875,10 +1838,10 @@ done <<< "$cm_out"
 # The entry script checks both digests before it runs anything, then stages
 # with build.sh --stage-only (the same checks as a host build).
 ENTRY="$WORK/entry/stage-entry.sh"
-lock_line="$(grep -n 'LOCK_SHA256.*shasum -a 256 -c' "$ENTRY" | cut -d: -f1 | head -1)"
-uv_line="$(grep -n 'UV_SHA256.*shasum -a 256 -c' "$ENTRY" | cut -d: -f1 | head -1)"
-tar_line="$(grep -n 'tar -xzf' "$ENTRY" | cut -d: -f1 | head -1)"
-build_line="$(grep -n 'build.sh" --stage-only' "$ENTRY" | cut -d: -f1 | head -1)"
+lock_line="$(grep -n 'LOCK_SHA256.*shasum -a 256 -c' "$ENTRY" | cut -d: -f1 | sed -n 1p)"
+uv_line="$(grep -n 'UV_SHA256.*shasum -a 256 -c' "$ENTRY" | cut -d: -f1 | sed -n 1p)"
+tar_line="$(grep -n 'tar -xzf' "$ENTRY" | cut -d: -f1 | sed -n 1p)"
+build_line="$(grep -n 'build.sh" --stage-only' "$ENTRY" | cut -d: -f1 | sed -n 1p)"
 if [ -n "$lock_line" ] && [ -n "$uv_line" ] && [ -n "$tar_line" ] && [ -n "$build_line" ] &&
 	[ "$uv_line" -lt "$tar_line" ] && [ "$lock_line" -lt "$build_line" ] && grep -q '^set -euo pipefail$' "$ENTRY"; then
 	ladder ok "10.entry  the lock and uv digests are checked (set -e) before uv is unpacked and build.sh --stage-only runs"
@@ -989,7 +1952,7 @@ fi
 refused() { # <label> <expected message> <build.sh args...>
 	local label="$1" msg="$2"; shift 2
 	out="$(fromstage "$@")"; rc=$?
-	if [ "$rc" -ne 0 ] && [ ! -f "$WORK/fake-argv" ] && printf '%s' "$out" | grep -q -- "$msg"; then
+	if [ "$rc" -ne 0 ] && [ ! -f "$WORK/fake-argv" ] && grep -q -- "$msg" <<<"$out"; then
 		ladder ok "11.$label  refused before packaging (exit $rc)"
 	else
 		ladder no "11.$label  refused before packaging (exit $rc)"

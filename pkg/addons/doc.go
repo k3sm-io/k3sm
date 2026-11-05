@@ -36,13 +36,18 @@ limitations under the License.
 //   - every k3sm pod runs as the same _k3sm uid (there is no per-pod uid isolation —
 //     see docs/privilege-model.md), so POSIX permissions are no barrier between a pod
 //     and the control plane's own work dir; and
-//   - the server work dir is not inside runtimed's sandbox-protected prefix set, so a
-//     pod can write into it; and
+//   - what keeps a confined pod out of <work dir>/server is runtimed's Seatbelt
+//     profile (sandbox.DaemonTreeSubdirs), which denies it read and write there. That
+//     is a profile rule, not a permission, and it names the work dir the profile was
+//     generated for, so a node started with a different --work-dir leaves the real
+//     tree unguarded and any process running as the service user outside the profile
+//     can still write it; and
 //   - the reconciler applies what it reads with the system:masters admin kubeconfig.
 //
 // Composed, an on-disk manifest directory would widen the set of principals that
-// reach cluster-admin from {holders of the 0600 admin kubeconfig} to {every pod on
-// the node}, without the change containing a single RBAC object. Compiling the
+// reach cluster-admin from {holders of the 0600 admin kubeconfig} to {any process
+// running as the service user}, without the change containing a single RBAC object, and
+// the one barrier left between that and a pod would be a profile rule. Compiling the
 // manifests into the binary via embed.FS removes the ingress rather than guarding it:
 // there is no writable path, no new principal, and manifest integrity is inherited
 // from the signed binary.

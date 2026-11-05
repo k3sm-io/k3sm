@@ -101,7 +101,7 @@ func imageTag(ctx context.Context, o imageOptions, out io.Writer) error {
 	// repository lacks first, then the manifest.
 	if src.flat.Context().RepositoryStr() == dst.flat.Context().RepositoryStr() {
 		err = remote.Put(dst.remote, desc, opts...)
-	} else {
+	} else if opts, err = withMountScopes(ctx, dst.remote, desc, opts); err == nil {
 		err = remote.Push(dst.remote, desc, opts...)
 	}
 	if err != nil {

@@ -28,7 +28,7 @@
 #                     completion below posts. The engine registers whatever it
 #                     decided to call the served snapshot (often a resolved
 #                     on-disk PATH, not examples/mlxmodel.yaml's repo id), so
-#                     posting the spec's repo id 404s a Ready pod (lab D10).
+#                     posting the spec's repo id 404s a Ready pod.
 #                     m8.0-b's pin check is untouched: it pins the SPEC, not
 #                     the served name.
 #   m8.6  completion— one OpenAI chat completion through the ClusterIP returns
@@ -61,6 +61,8 @@
 #   KUBECONFIG=/path/to/kubeconfig hack/acceptance/m8.sh
 #   hack/acceptance/m8.sh --plan     # print the ladder and the pins; touch nothing
 #   hack/acceptance/m8.sh --self-test  # render the manifest and the seed Job; no cluster
+#   hack/acceptance/m8.sh --render-seed-job <namespace> <node> <pvc>
+#                                    # print the m8.3-b seed Job for another driver
 #
 # Knobs (all optional):
 #   K3SM_MLX_IMAGE        serving image override, ideally the @sha256 digest pin
@@ -124,7 +126,7 @@ render_manifest() {
 # seed_image — the image the seed Job runs: the serving image (its interpreter
 # carries huggingface_hub, a dependency of the engine), as the gate will apply it.
 seed_image() {
-	render_manifest "$1" | grep -E '^[[:space:]]*image:' | head -1 | sed -E 's#^[[:space:]]*image:[[:space:]]*##'
+	render_manifest "$1" | grep -E '^[[:space:]]*image:' | sed -n 1p | sed -E 's#^[[:space:]]*image:[[:space:]]*##'
 }
 
 # render_seed_job <namespace> <node> <image> <pvc> — a Job that downloads the
@@ -192,39 +194,58 @@ if [ "${1:-}" = "--self-test" ]; then
 	st_fail=0
 	st() { if [ "$1" = ok ]; then echo "ok    $2"; else echo "FAIL  $2"; st_fail=1; fi; }
 	m="$(render_manifest lab-ns)"
-	printf '%s\n' "$m" | grep -qx '  namespace: lab-ns' && ! printf '%s\n' "$m" | grep -q 'namespace: default' &&
+	grep -qx '  namespace: lab-ns' <<<"$m" && ! grep -q 'namespace: default' <<<"$m" &&
 		st ok "namespace rendered into the example copy" || st no "namespace rendered into the example copy"
 	[ "$(printf '%s\n' "$m" | grep -c 'namespace:')" = 1 ] && st ok "exactly one namespace line" || st no "exactly one namespace line"
 	[ "$(render_manifest default)" = "$(cat "$EXAMPLE")" ] && st ok "default namespace leaves the example byte-identical" || st no "default namespace leaves the example byte-identical"
 	m="$(K3SM_MLX_IMAGE=example.invalid/img@sha256:abc render_manifest lab-ns)"
-	printf '%s\n' "$m" | grep -q 'image: example.invalid/img@sha256:abc' && st ok "image override still applies" || st no "image override still applies"
+	grep -q 'image: example.invalid/img@sha256:abc' <<<"$m" && st ok "image override still applies" || st no "image override still applies"
 	j="$(K3SM_LAB_TOLERATE_KEYS='estate.example.com/off' render_seed_job lab-ns node-a img:1 cache-$MODEL_NAME-0)"
 	for want in 'kind: Job' 'namespace: lab-ns' 'nodeName: node-a' 'kubernetes.io/os: darwin' \
 		'claimName: cache-qwen3-06b-0' 'image: img:1' "$MODEL_REPO" "$MODEL_REV" \
 		'value: /var/lib/mlx/cache/huggingface' '{key: estate.example.com/off, operator: Exists}'; do
-		printf '%s\n' "$j" | grep -qF -- "$want" && st ok "seed Job carries $want" || st no "seed Job carries $want"
+		grep -qF -- "$want" <<<"$j" && st ok "seed Job carries $want" || st no "seed Job carries $want"
 	done
 	[ "$(printf '%s\n' "$j" | grep -c 'k3sm.io/provider')" = 1 ] && st ok "seed Job tolerates k3sm.io/provider once" || st no "seed Job tolerates k3sm.io/provider once"
-	[ "$(printf '%s\n' "$j" | grep -c 'tolerations:')" = 1 ] && ! printf '%s\n' "$j" | grep -q 'operator: Exists}, {key: [^e]' &&
+	[ "$(printf '%s\n' "$j" | grep -c 'tolerations:')" = 1 ] && ! grep -q 'operator: Exists}, {key: [^e]' <<<"$j" &&
 		st ok "seed Job tolerates only the provider key and the named extras" || st no "seed Job tolerates only the provider key and the named extras"
-	printf '%s\n' "$j" | grep -qF -- "mountPath: $CACHE_MOUNT" && st ok "seed Job mounts the cache at $CACHE_MOUNT" || st no "seed Job mounts the cache at $CACHE_MOUNT"
+	grep -qF -- "mountPath: $CACHE_MOUNT" <<<"$j" && st ok "seed Job mounts the cache at $CACHE_MOUNT" || st no "seed Job mounts the cache at $CACHE_MOUNT"
 	go_mount="$(sed -nE 's/^[[:space:]]*CacheMountPath = "([^"]+)".*/\1/p' "$REPO_ROOT/pkg/mlx/render.go")"
 	go_home="$(sed -nE 's/^[[:space:]]*hfHomePath = CacheMountPath \+ "([^"]+)".*/\1/p' "$REPO_ROOT/pkg/mlx/render.go")"
 	[ -n "$go_mount" ] && [ "$CACHE_MOUNT" = "$go_mount" ] && st ok "gate cache mount equals the serving pod's ($go_mount)" || st no "gate cache mount equals the serving pod's (${go_mount:-unparsed})"
-	[ -n "$go_home" ] && [ "$HF_HOME_PATH" = "$go_mount$go_home" ] && printf '%s\n' "$j" | grep -qF -- "value: $go_mount$go_home" &&
+	[ -n "$go_home" ] && [ "$HF_HOME_PATH" = "$go_mount$go_home" ] && grep -qF -- "value: $go_mount$go_home" <<<"$j" &&
 		st ok "seed Job HF_HOME equals the serving pod's ($go_mount$go_home)" || st no "seed Job HF_HOME equals the serving pod's"
-	printf '%s\n' "$j" | grep -qF "cache_dir=c" && printf '%s\n' "$j" | grep -qF "c='.'+os.environ['HF_HOME']" &&
+	grep -qF "cache_dir=c" <<<"$j" && grep -qF "c='.'+os.environ['HF_HOME']" <<<"$j" &&
 		st ok "seed download targets a relative cache_dir under the mount" || st no "seed download targets a relative cache_dir under the mount"
 	body="$(cat "$0")"
-	del_line="$(printf '%s\n' "$body" | grep -n '^delete_seed_job$' | head -1 | cut -d: -f1)"
-	seed_line="$(printf '%s\n' "$body" | grep -n 'render_seed_job "\$NS"' | head -1 | cut -d: -f1)"
-	ready_line="$(printf '%s\n' "$body" | grep -n '^# m8.4 Ready' | head -1 | cut -d: -f1)"
+	del_line="$(printf '%s\n' "$body" | grep -n '^delete_seed_job$' | sed -n 1p | cut -d: -f1)"
+	seed_line="$(printf '%s\n' "$body" | grep -n 'render_seed_job "\$NS"' | sed -n 1p | cut -d: -f1)"
+	ready_line="$(printf '%s\n' "$body" | grep -n '^# m8.4 Ready' | sed -n 1p | cut -d: -f1)"
 	[ -n "$del_line" ] && [ -n "$seed_line" ] && [ -n "$ready_line" ] && [ "$seed_line" -lt "$del_line" ] && [ "$del_line" -lt "$ready_line" ] &&
 		st ok "seed Job is deleted after m8.3-b and before m8.4" || st no "seed Job is deleted after m8.3-b and before m8.4"
-	printf '%s\n' "$body" | grep -q 'cascade=foreground' && st ok "seed Job delete is foreground" || st no "seed Job delete is foreground"
-	[ "$(seed_image lab-ns)" = "$(grep -E '^[[:space:]]*image:' "$EXAMPLE" | head -1 | sed -E 's#^[[:space:]]*image:[[:space:]]*##')" ] &&
+	grep -q 'cascade=foreground' <<<"$body" && st ok "seed Job delete is foreground" || st no "seed Job delete is foreground"
+	[ "$(seed_image lab-ns)" = "$(grep -E '^[[:space:]]*image:' "$EXAMPLE" | sed -n 1p | sed -E 's#^[[:space:]]*image:[[:space:]]*##')" ] &&
 		st ok "seed image is the example's serving image" || st no "seed image is the example's serving image"
+	[ "$("$0" --render-seed-job lab-ns node-a "cache-$MODEL_NAME-0")" = "$(render_seed_job lab-ns node-a "$(seed_image lab-ns)" "cache-$MODEL_NAME-0")" ] &&
+		st ok "--render-seed-job prints the m8.3-b seed Job for the example's image" || st no "--render-seed-job prints the m8.3-b seed Job for the example's image"
+	if "$0" --render-seed-job lab-ns >/dev/null 2>&1; then st no "--render-seed-job refuses a short argument list"; else
+		[ $? -eq 2 ] && st ok "--render-seed-job refuses a short argument list" || st no "--render-seed-job refuses a short argument list"; fi
 	exit "$st_fail"
+fi
+
+# --------------------------------------------------------------------------------
+# --render-seed-job <namespace> <node> <pvc>: print the seed Job for the shipped
+# example's pinned revision, so another driver that applies examples/mlxmodel.yaml
+# (the release gate's demo tier) seeds the cache volume the way m8.3-b does, from
+# this one rendering, rather than carrying a copy of it. A pinned revision is
+# loaded from the cache and never fetched into it (pkg/mlx modelReference), so a
+# driver that skips this step waits on a replica that crash-loops for as long as
+# the cache stays empty.
+# --------------------------------------------------------------------------------
+if [ "${1:-}" = "--render-seed-job" ]; then
+	[ $# -eq 4 ] || { echo "m8.sh: --render-seed-job <namespace> <node> <pvc>" >&2; exit 2; }
+	render_seed_job "$2" "$3" "$(seed_image "$2")" "$4"
+	exit 0
 fi
 
 # --------------------------------------------------------------------------------
@@ -258,7 +279,7 @@ if [ "${1:-}" = "--plan" ] || [ "${1:-}" = "--dry-run" ]; then
 	echo "  m8.5  endpoint    ClusterIP allocated; status.endpoint published"
 	echo "  m8.5-c served id  GET /v1/models (singular) — the id every completion posts"
 	echo "  m8.6  completion  POST /v1/chat/completions via the ClusterIP returns tokens"
-	echo "  m8.7  concurrent  $CONCURRENCY simultaneous completions ALL succeed (S5-binding)"
+	echo "  m8.7  concurrent  $CONCURRENCY simultaneous completions ALL succeed (see hack/spike/m8/findings-s5.md)"
 	echo "  m8.8  latency     TTFT + tokens/sec, ClusterIP vs direct pod (recorded)"
 	echo "  m8.9  deletion    every operator-owned object absent; PVC deleted; PV retained"
 	echo
@@ -267,7 +288,7 @@ if [ "${1:-}" = "--plan" ] || [ "${1:-}" = "--dry-run" ]; then
 fi
 
 if [ $# -gt 0 ]; then
-	echo "m8.sh: unknown argument: $1 (try --plan or --self-test)" >&2
+	echo "m8.sh: unknown argument: $1 (try --plan, --self-test or --render-seed-job)" >&2
 	exit 2
 fi
 
@@ -280,7 +301,7 @@ kubectl --request-timeout=10s get --raw /healthz >/dev/null || {
 	echo "cluster at \$KUBECONFIG is not serving" >&2; exit 1
 }
 
-NS="${K3SM_MLX_NAMESPACE:-$(grep -E '^  namespace:' "$EXAMPLE" | head -1 | awk '{print $2}')}"
+NS="${K3SM_MLX_NAMESPACE:-$(grep -E '^  namespace:' "$EXAMPLE" | sed -n 1p | awk '{print $2}')}"
 NS="${NS:-default}"
 
 MANIFEST=""
@@ -317,7 +338,7 @@ else
 fi
 
 GPU_CAP="$(kubectl get nodes -o jsonpath='{.items[*].status.allocatable.mlx\.k3sm\.io/gpu}' 2>/dev/null || true)"
-if printf '%s' "$GPU_CAP" | grep -qE '[1-9]'; then
+if grep -qE '[1-9]' <<<"$GPU_CAP"; then
 	ladder ok "m8.0-c  a node advertises the mlx.k3sm.io/gpu extended resource (allocatable: $GPU_CAP)"
 else
 	ladder no "m8.0-c  NO node advertises mlx.k3sm.io/gpu — this gate requires apple-gpu (got: '${GPU_CAP:-none}')"
@@ -473,7 +494,7 @@ VIP="$CLUSTER_IP:$SERVING_PORT"
 #
 # The engine registers whatever it decided to call the served snapshot — often
 # a resolved on-disk PATH, not examples/mlxmodel.yaml's repo id — so a
-# completion posted against MODEL_REPO 404s a Ready pod (lab D10). Ask the
+# completion posted against MODEL_REPO 404s a Ready pod. Ask the
 # serving surface directly, require EXACTLY one model listed (a plural listing
 # would make "the" served id ambiguous), and use THAT id for every completion
 # below. m8.0-b's pin check is a different assertion (the SPEC matches the
@@ -544,7 +565,7 @@ read -r code _ _ <<<"$(completion "$VIP" 64 "$body")"
 text="$(tokens_of "$body")"
 if [ "$code" = "200" ] && [ -n "$text" ]; then
 	ladder ok "m8.6  OpenAI chat completion through the ClusterIP returned tokens"
-	note "reply: $(printf '%s' "$text" | head -c 120)"
+	note "reply: $(printf '%s' "${text:0:120}")"
 else
 	ladder no "m8.6  chat completion through the ClusterIP returned no tokens (http $code)"
 	head -c 400 "$body" | sed 's/^/      /' || true
@@ -552,7 +573,7 @@ fi
 rm -f "$body"
 
 # --------------------------------------------------------------------------------
-# m8.7 THE CONCURRENCY RUNG (S5-binding). See the header.
+# m8.7 THE CONCURRENCY RUNG (see hack/spike/m8/findings-s5.md). See the header.
 # --------------------------------------------------------------------------------
 cdir="$(mktemp -d)"
 pids=""

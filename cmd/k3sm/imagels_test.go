@@ -50,6 +50,7 @@ type imageFixture struct {
 	env              imageRegistryEnv
 	appV1, multi     string
 	registryHostPort string
+	reg              *registrytest.Registry
 }
 
 func newImageFixture(t *testing.T, reachable bool) imageFixture {
@@ -120,6 +121,7 @@ func newImageFixture(t *testing.T, reachable bool) imageFixture {
 		appV1:            appV1.Digest,
 		multi:            multi.Digest,
 		registryHostPort: "127.0.0.1:" + port,
+		reg:              reg,
 	}
 }
 

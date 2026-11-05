@@ -59,8 +59,8 @@ const (
 // sandbox.VMSpec it is handed. It is the ONE fake on the consumer side of the
 // wiring under test: everything between the provider's CreatePod and this call is
 // the real code path (the real runtime.Runtime, the real backend selection, the
-// real createVMPod). CreateVM then returns the same lab-gated stub error the
-// shipped backend does, so the pod fails exactly where production fails today.
+// real createVMPod). CreateVM then returns sandbox.ErrVMBootNotImplemented, the error the
+// non-darwin build returns, so the pod fails right after the spec is recorded.
 type recordingVMBackend struct {
 	mu     sync.Mutex
 	calls  int
@@ -73,8 +73,8 @@ func (b *recordingVMBackend) Name() string                     { return "recordi
 func (b *recordingVMBackend) GuestRosettaShareSupported() bool { return false }
 
 // The lifecycle legs of runtimed's VMBackend seam. This fake records a boot
-// request and never leaves a helper behind (CreateVM returns the lab-gated stub
-// error), so every one of them is a faithful no-op: there is nothing to stop,
+// request and never leaves a helper behind (CreateVM returns
+// sandbox.ErrVMBootNotImplemented), so every one of them is a faithful no-op: there is nothing to stop,
 // nothing to reap, no exit edge to watch, and no helper output to retain.
 func (b *recordingVMBackend) StopVM(context.Context, string, time.Duration) error { return nil }
 func (b *recordingVMBackend) StopAllVMs(context.Context) error                    { return nil }
@@ -311,10 +311,10 @@ func TestGuestNetworkWiredToRuntimed(t *testing.T) {
 		pod := vmPod("team-a", "guest")
 		id := string(pod.UID)
 
-		// The lab-gated CreateVM stub fails the pod AFTER recording the spec —
-		// production's exact behaviour today, and orthogonal to what is asserted.
+		// CreateVM returns sandbox.ErrVMBootNotImplemented, which fails the pod
+		// AFTER recording the spec; that is orthogonal to what is asserted.
 		if err := n.r.CreatePod(context.Background(), pod); err == nil {
-			t.Fatal("CreatePod: want the lab-gated vm boot failure, got nil")
+			t.Fatal("CreatePod: want the vm boot failure, got nil")
 		}
 
 		calls, spec := n.vmb.created()
@@ -461,7 +461,7 @@ func TestGuestNetworkWiredToRuntimed(t *testing.T) {
 		pod := vmPod("team-a", "churn")
 		id := string(pod.UID)
 
-		// CreatePod fails at the lab-gated boot — AFTER SetupGuest allocated. This
+		// CreatePod fails at the vm boot — AFTER SetupGuest allocated. This
 		// is the leak shape: the pod never existed to runtimed, so only the
 		// provider-side release can reclaim what the provider-side produce took,
 		// and it must happen HERE. VK records the failed create as ProviderFailed
@@ -469,7 +469,7 @@ func TestGuestNetworkWiredToRuntimed(t *testing.T) {
 		// create, so a release that waited for one would wait forever, and a
 		// pod left tracked would turn that retry into an UpdatePod no-op.
 		if err := n.r.CreatePod(context.Background(), pod); err == nil {
-			t.Fatal("CreatePod: want the lab-gated vm boot failure, got nil")
+			t.Fatal("CreatePod: want the vm boot failure, got nil")
 		}
 		if calls := n.ipam.guestSetupCalls(); len(calls) == 0 {
 			t.Fatal("SetupGuest was never called; the pod allocated nothing and the release below proves nothing")

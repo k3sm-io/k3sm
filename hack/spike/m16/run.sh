@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The M16 spike ladder — S0 through S4, in order, on the M16 rig.
 #
-# This script IS the M16.0 acceptance: hack/acceptance/phases.json carries an M16.0
+# This script is the acceptance for the M16 spike: hack/acceptance/phases.json carries a
 # row whose gate is this file, tier integration, requires dev-mac + apple-gpu + vz +
 # network, manual: false. So the spikes are run the way every other gate is run, the
 # findings are the write-back, and the M16 spike never reports "pending lab".

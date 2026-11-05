@@ -37,6 +37,7 @@ import (
 
 	"k3sm.io/darwin-net/pkg/podnet"
 	"k3sm.io/k3sm/pkg/netdsvc"
+	"k3sm.io/k3sm/pkg/updater/layout"
 	"k3sm.io/runtimed/pkg/sandbox"
 )
 
@@ -293,7 +294,13 @@ func teardownTail(ctx context.Context, sys System, cfg Config, fp flushPrefixes,
 //     start, means nothing of ours is there: skipped, and not a leftover;
 //   - the leader must be the installed k3sm-vmhost (its executable path) and
 //     run as the service user. A start-time match on any other process is a
-//     forged or corrupted record: never signalled, and reported.
+//     forged or corrupted record: never signalled, and reported. A helper
+//     running from a version directory that is neither current nor previous
+//     is stopped while that directory is there, since the tree keeps a version
+//     a running pod uses; a helper of the service user whose version directory
+//     is gone runs from a version the tree no longer retains, is never
+//     signalled, and is reported as the leftover it is, by pid, path and
+//     version.
 //
 // Nothing is ever matched by process name. The helpers are stopped together,
 // so the stage costs the longest wait, not their sum.
@@ -316,7 +323,7 @@ func stopVMHelpers(ctx context.Context, sys System, cfg Config) error {
 		errs = errors.Join(errs, fmt.Errorf("untrusted vm helper record %s (not acted on)", name))
 	}
 	verify := func(rec VMHostRecord) (bool, error) {
-		return verifyVMHelper(sys, cfg, rec, cfg.installedVMHost(), svcUID)
+		return verifyVMHelper(sys, cfg, rec, svcUID)
 	}
 	var helpers []VMHostRecord
 	for _, rec := range store.Records {
@@ -480,11 +487,24 @@ func shortenVMHelper(ctx context.Context, sys System, rec VMHostRecord, bound ti
 // recorded helper, the check every signal the teardown sends is preceded by:
 // the group can be inspected and its leader (pid == pgid) is alive with exactly
 // the recorded start time, and the leader is the installed k3sm-vmhost running
-// as the service user. A group that cannot be inspected, a gone leader or a
-// recycled pgid is false with no error (nothing of ours is provably there); a
-// start-time match on another executable or uid is false with an error (a
-// forged or corrupted record), as is an executable that cannot be read.
-func verifyVMHelper(sys System, cfg Config, rec VMHostRecord, want string, svcUID uint32) (bool, error) {
+// as the service user (isInstalledVMHost). A group that cannot be inspected, a
+// gone leader or a recycled pgid is false with no error (nothing of ours is
+// provably there); a start-time match on another executable or uid is false
+// with an error (a forged or corrupted record), as is an executable that cannot
+// be read. The leader is proven to be the recorded, running helper before its
+// executable is judged, so that path is a running vm pod's path, and the
+// version directory it lies in is retained as in use by that pod (the layout's
+// retention rule, retainedVersion) for as long as the directory is there. A
+// service-user helper running from a version directory the tree no longer
+// retains, one that is gone (unretainedVMHost), is false with an error of its own, naming
+// its pid, path and version and how to stop it: it is a real leftover, not a
+// forged record, but nothing vouches for its path any more, so it is reported
+// and never signalled. A service-user helper whose version directory cannot be
+// resolved for any reason but its being gone (EACCES, EIO) is false with an
+// error naming the unresolvable path and the two ways out (fix the path's
+// permissions, or stop the pid by hand): whether the tree retains its version
+// is unknown, so it is neither signalled nor called unretained.
+func verifyVMHelper(sys System, cfg Config, rec VMHostRecord, svcUID uint32) (bool, error) {
 	start, alive := sys.ProcessGroupLeaderStart(rec.Pgid)
 	if !alive {
 		return false, nil
@@ -497,11 +517,177 @@ func verifyVMHelper(sys System, cfg Config, rec VMHostRecord, want string, svcUI
 	switch {
 	case err != nil:
 		return false, fmt.Errorf("vm helper group %d: cannot read its executable, not signalled: %w", rec.Pgid, err)
-	case filepath.Clean(exe) != want || uid != svcUID:
+	}
+	installed, rerr := isInstalledVMHost(sys, cfg, exe, []string{exe})
+	switch {
+	case uid == svcUID && rerr != nil:
+		ver, _ := layout.New(cfg.InstallDir).VersionedBinary(filepath.Clean(exe), VMHostName)
+		cfg.Logger.Warn("a vm helper runs from a version directory that cannot be resolved, so whether this install retains it is unknown; not signalled",
+			"pod", rec.PodID, "pid", rec.Pgid, "exe", filepath.Clean(exe), "version", ver, "err", rerr)
+		return false, fmt.Errorf("vm helper pid %d (pod %s) runs %q from version %q, whose path cannot be resolved, so whether this install retains it is unknown; not signalled: %w; check that %q and each of its parents are owned by root and not writable by group or others (an I/O error means the disk needs checking); if ps -o pid,command -g %d shows only %q processes, stop it with: sudo kill -TERM -%d",
+			rec.Pgid, rec.PodID, filepath.Clean(exe), ver, rerr, filepath.Dir(filepath.Clean(exe)), rec.Pgid, filepath.Clean(exe), rec.Pgid)
+	case uid != svcUID || !installed:
+		if ver, ok := unretainedVMHost(sys, cfg, exe, []string{exe}); ok && uid == svcUID {
+			cfg.Logger.Warn("a vm helper runs from a version this install no longer retains; not signalled, stop it by hand",
+				"pod", rec.PodID, "pid", rec.Pgid, "exe", filepath.Clean(exe), "version", ver)
+			return false, fmt.Errorf("vm helper pid %d (pod %s) runs %q from version %q, which this install no longer retains; not signalled; if ps -o pid,command -g %d shows only %q processes, stop it with: sudo kill -TERM -%d",
+				rec.Pgid, rec.PodID, filepath.Clean(exe), ver, rec.Pgid, filepath.Clean(exe), rec.Pgid)
+		}
+		want := cfg.installedVMHost()
 		cfg.Logger.Warn("a vm helper record names a process that is not this install's k3sm-vmhost; not signalled", "pod", rec.PodID, "pgid", rec.Pgid, "exe", exe, "uid", uid)
 		return false, fmt.Errorf("vm helper record for group %d names %s (uid %d), not %s (uid %d); not signalled", rec.Pgid, exe, uid, want, svcUID)
 	}
 	return true, nil
+}
+
+// isInstalledVMHost reports whether exe, the executable path the kernel
+// recorded for a helper, is this install's k3sm-vmhost in any of the forms the
+// runtime can have started it through:
+//
+//   - the flat installed path (installedVMHost), which in the versioned layout
+//     is a compatibility symlink;
+//   - the same name through the current symlink (<InstallDir>/current/<name>);
+//   - the name directly inside a retained version directory
+//     (<InstallDir>/versions/<ver>/<name>), where the runtime's symlink-resolved
+//     lookup lands: <ver> must be a version the tree keeps by the layout's
+//     retention rule (retainedVersion), so a helper started before a flip
+//     still matches while its version is kept as previous, or while a running
+//     pod among podPaths keeps it in use, and a version the tree no longer
+//     retains, however validly named, is refused. Without a current link (the
+//     flat layout) no version directory is accepted;
+//   - the flat installed path with every symlink resolved, read only when the
+//     forms above do not match.
+//
+// Every other path, any other basename or a directory outside versions/
+// included, is refused. A tree that is root-owned to / is what makes a path
+// under versions/ an identity; this check names which of its files it is.
+//
+// The error is non-nil only when exe is a version-directory path whose
+// retention is unknown (retainedVersion): the answer is then false, and the
+// caller must neither signal the helper nor call it unretained.
+func isInstalledVMHost(sys System, cfg Config, exe string, podPaths []string) (bool, error) {
+	if !filepath.IsAbs(exe) {
+		return false, nil
+	}
+	exe = filepath.Clean(exe)
+	installed := cfg.installedVMHost()
+	tree := layout.New(cfg.InstallDir)
+	if exe == installed {
+		return true, nil
+	}
+	if through, err := tree.Binary(VMHostName); err == nil && exe == through {
+		return true, nil
+	}
+	if ver, ok := tree.VersionedBinary(exe, VMHostName); ok {
+		return retainedVersion(sys, tree, ver, podPaths)
+	}
+	resolved, err := sys.ResolvePath(installed)
+	if err != nil {
+		return false, nil
+	}
+	resolved = filepath.Clean(resolved)
+	if resolved == installed {
+		return false, nil
+	}
+	return exe == resolved && filepath.Base(resolved) == VMHostName, nil
+}
+
+// unretainedVMHost reports whether exe, refused by isInstalledVMHost, is the
+// helper's name directly inside a validly named version directory the tree
+// does not retain (retainedVersion over the same podPaths), and which version
+// that is. Such a helper was started from a version the updates since have
+// retired and removed. It is never signalled: once its version is no longer
+// retained, the tree no longer vouches for that path. The teardown reports it
+// by pid and path instead, as a leftover, rather than as a forged record. A
+// version whose retention is unknown is not unretained: false.
+func unretainedVMHost(sys System, cfg Config, exe string, podPaths []string) (string, bool) {
+	if !filepath.IsAbs(exe) {
+		return "", false
+	}
+	tree := layout.New(cfg.InstallDir)
+	ver, ok := tree.VersionedBinary(exe, VMHostName)
+	if !ok {
+		return "", false
+	}
+	if kept, err := retainedVersion(sys, tree, ver, podPaths); kept || err != nil {
+		return "", false
+	}
+	return ver, true
+}
+
+// retainedVersion reports whether the tree keeps ver, by the layout's own
+// retention rule (layout.Retained): the version current or previous points
+// at, the staged version, or a version a running pod uses. podPaths are the
+// paths of the running pods the caller has proven are running; the versions
+// they lie in are the in-use set (layout.PodVersions, which resolves each path
+// first, so a path whose version directory is gone names no version). A link
+// that is missing or does not read exactly versions/<ver> retains nothing, and
+// without a current link (the flat layout) no pod path retains a version
+// either. The teardown has no staged version to name: a version is staged by
+// the updater, which no running pod is started from.
+//
+// A pod path, or the versions directory, that cannot be resolved because it is
+// gone (fs.ErrNotExist) names no version. Any other resolve failure (EACCES,
+// EIO) leaves the version it may name unknown: when the links do not retain
+// ver on their own, retainedVersion then returns false with that error, and
+// the caller must neither signal the helper nor report it as unretained.
+func retainedVersion(sys System, tree layout.Layout, ver string, podPaths []string) (bool, error) {
+	var (
+		r       layout.Retained
+		unknown error
+	)
+	if v, err := tree.ResolveActive(sys.Readlink); err == nil {
+		r.Current = v
+		// Each resolve or listing failure is classified at its seam, where its
+		// cause is still the only error: a path that is gone names no version,
+		// any other failure leaves the version it may name unknown.
+		var unreadable bool
+		classify := func(err error) {
+			if err != nil && !errors.Is(err, fs.ErrNotExist) {
+				unreadable = true
+			}
+		}
+		eval := func(path string) (string, error) {
+			resolved, err := sys.ResolvePath(path)
+			classify(err)
+			return resolved, err
+		}
+		list := entryNames(sys)
+		names := func(dir string) ([]string, error) {
+			ns, err := list(dir)
+			classify(err)
+			return ns, err
+		}
+		inUse, err := tree.PodVersions(podPaths, eval, names)
+		r.InUse = inUse
+		if unreadable {
+			unknown = err
+		}
+	}
+	if v, err := tree.ResolvePrevious(sys.Readlink); err == nil {
+		r.Previous = v
+	}
+	if len(r.Reasons(ver)) > 0 {
+		return true, nil
+	}
+	return false, unknown
+}
+
+// entryNames is the listing seam layout.PodVersions maps a pod path's version
+// to the versions directory's own spelling of it through: the base names of
+// the entries sys.ListOwned reports directly inside dir.
+func entryNames(sys System) layout.ListNames {
+	return func(dir string) ([]string, error) {
+		ents, err := sys.ListOwned(dir)
+		if err != nil {
+			return nil, err
+		}
+		names := make([]string, len(ents))
+		for i, e := range ents {
+			names[i] = filepath.Base(e.Path)
+		}
+		return names, nil
+	}
 }
 
 // vmHelperStop is one helper the teardown sent SIGTERM, and how long it gets.

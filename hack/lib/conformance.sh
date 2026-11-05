@@ -37,7 +37,7 @@ run_conformance_slice() {
 	printf '%s\n' "$out" | sed 's/^/    /'
 
 	# A vacuous run (the -run pattern matched nothing) is RED, never green.
-	if printf '%s\n' "$out" | grep -qE 'no tests to run|warning: no tests to run'; then
+	if grep -qE 'no tests to run|warning: no tests to run' <<<"$out"; then
 		echo "  RED  conformance VACUOUS: -run '$run_regex' matched no tests (criterion set not authored)"
 		return 1
 	fi
@@ -45,10 +45,10 @@ run_conformance_slice() {
 	local crit name fail=0
 	for crit in "${crits[@]}"; do
 		name="Test${crit}"
-		if printf '%s\n' "$out" | grep -qE "^--- SKIP: ${name} \("; then
+		if grep -qE "^--- SKIP: ${name} \(" <<<"$out"; then
 			echo "  RED  ${name}: SKIPPED (expected PASS — feature missing or precondition unmet)"
 			fail=1
-		elif printf '%s\n' "$out" | grep -qE "^--- PASS: ${name} \("; then
+		elif grep -qE "^--- PASS: ${name} \(" <<<"$out"; then
 			echo "  PASS ${name}"
 		else
 			echo "  RED  ${name}: no top-level PASS (failed, errored, or not authored)"

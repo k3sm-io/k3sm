@@ -26,7 +26,10 @@
 #                    which goreleaser empties with --clean)
 #   --verify-only    build and sign NOTHING; run only the verification block
 #                    (completeness against the install contract, codesign --verify
-#                    on every Mach-O, the arm64 arch assert, and the k3sm-vmhost
+#                    on every Mach-O, the arm64 arch assert, the build-info check
+#                    (no staged file names a hack package of any k3sm module
+#                    or is an archive, every Go Mach-O a shipped main:
+#                    buildinfo_set_problems), and the k3sm-vmhost
 #                    virtualization-entitlement read-back) over a tree that already
 #                    exists. This is the seam a release gate run from the parent
 #                    checkout of all the repos drives so the artifact-quality tier re-uses THESE checks over
@@ -61,9 +64,12 @@
 #                    versioned name): k3sm builds them itself from pinned module
 #                    source in `k3sm payload`, with the toolchain
 #                    PAYLOAD_GO_VERSION pins, and staging proves each is the
-#                    pinned build.
-#                    kube.version is not on any list yet, so today --release
-#                    still refuses, naming it. Signing any of
+#                    pinned build. The control-plane marker kube.version
+#                    (KUBE_MARKER_FILE) is accepted only with a content proof:
+#                    a regular file whose bytes are exactly "<tag>\n", where
+#                    <tag> is the Kubernetes tag the --cp-build BUILD-STAMP
+#                    records and equals the executor's DefaultKubeVersion
+#                    (kube_marker_problems). Signing any of
 #                    this with a Developer ID is the attended signing pipeline's
 #                    job, never this script's. Without --release (the default)
 #                    staging is the ad-hoc lab staging, with the same
@@ -85,7 +91,8 @@
 #                    stamps. Empty (the default) leaves an unstamped dev build,
 #                    which reports its version from the embedded VCS build info.
 #   --self-test      hermetic self-test of the manifest, the signature parser, the
-#                    release refusal, the toolchain pin, the source-built children's
+#                    build-info check (throwaway mains built in its temp dir),
+#                    the release refusal, the toolchain pin, the source-built children's
 #                    build-stamp checks, the needs-network report and the
 #                    children vuln scan, against a planted local vulnerability
 #                    database (no network, no credentials, no keychain)
@@ -142,6 +149,11 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 WS_ROOT="$(cd "$REPO_ROOT/.." && pwd)"
 
+# grep_text TEXT GREP-ARGS...: grep over a string with no writer process. A
+# `printf ... | grep -q` pipeline lets grep exit on its first match, printf
+# takes EPIPE, and pipefail reports the pipeline failed.
+grep_text() { local text=$1; shift; grep "$@" <<<"$text"; }
+
 # The binary used to READ signatures (`codesign -dvvv`). Overridable so the
 # self-test can feed captured text through the same walk; signing always uses
 # the system codesign.
@@ -171,14 +183,34 @@ die() { echo "stage: $*" >&2; exit 1; }
 # rather than a name list, so an artifact added to pkg/install.RequiredSiblings
 # is checked without this script being edited. Universal binaries match too
 # ("Mach-O universal binary ..."). Prints one path per line, LC_ALL=C order.
+# Fails closed: a path file(1) cannot read is named on stderr and the walk
+# returns non-zero after it, so no caller can skip a file it never classified.
+# Callers capture the list first and test the status.
 macho_files() {
-	local f desc
+	local f desc bad=0
 	while IFS= read -r f; do
-		desc="$(file -b "$f" 2>/dev/null || echo '?')"
+		if ! desc="$(file_desc "$f")"; then
+			echo "stage: file(1) cannot read $f: ${desc:-no output}" >&2
+			bad=1
+			continue
+		fi
 		case "$desc" in
 		*Mach-O*) printf '%s\n' "$f" ;;
 		esac
 	done < <(find "$1" -type f | LC_ALL=C sort)
+	return "$bad"
+}
+
+# file_desc <path>: `LC_ALL=C file -b -- <path>`, non-zero when file(1) fails or reports that
+# it could not read the file (it exits 0 for "cannot open" and a missing read
+# permission).
+file_desc() {
+	local d
+	d="$(LC_ALL=C file -b -- "$1" 2>&1)" || { printf '%s\n' "$d"; return 1; }
+	case "$d" in
+	"" | "cannot open"* | "ERROR:"* | *"no read permission"*) printf '%s\n' "$d"; return 1 ;;
+	esac
+	printf '%s\n' "$d"
 }
 
 # ---- the codesign -dvvv parser -------------------------------------------------
@@ -221,7 +253,7 @@ release_sig_problems() {
 
 	if [ "$n_cd" != 1 ]; then
 		problem "flags: want exactly one CodeDirectory line, found $n_cd"
-	elif ! printf '%s' "$flags" | grep -Eq '^0x[0-9a-fA-F]{1,8}$'; then
+	elif ! grep_text "$flags" -Eq '^0x[0-9a-fA-F]{1,8}$'; then
 		problem "flags: CodeDirectory flags missing or malformed ('$flags')"
 	else
 		# Validated as 1-8 hex digits above, so the arithmetic is safe.
@@ -256,7 +288,7 @@ release_sig_problems() {
 	return "$bad"
 }
 
-valid_team() { printf '%s' "$1" | grep -Eq '^[A-Z0-9]{10}$'; }
+valid_team() { grep_text "$1" -Eq '^[A-Z0-9]{10}$'; }
 
 # verify_release_signatures <dir> <TEAMID>
 # The Developer ID policy over every Mach-O under <dir>, every slice of a
@@ -267,9 +299,11 @@ valid_team() { printf '%s' "$1" | grep -Eq '^[A-Z0-9]{10}$'; }
 # roots whose leaf certificate's OU is <TEAMID>. Reports every problem, then
 # returns non-zero if there was any (including fewer than MACHO_FLOOR Mach-Os).
 verify_release_signatures() {
-	local dir="$1" team="$2" f a archs out probs n=0 bad=0
+	local dir="$1" team="$2" f a archs out probs n=0 bad=0 mlist
 	local req="anchor apple generic and certificate leaf[subject.OU] = \"$team\""
+	mlist="$(macho_files "$dir")" || { echo "    file(1) cannot classify every file under $dir (above)"; bad=1; }
 	while IFS= read -r f; do
+		[ -n "$f" ] || continue
 		n=$((n + 1))
 		archs="$(lipo -archs "$f" 2>/dev/null || true)"
 		if [ -z "$archs" ]; then
@@ -286,7 +320,7 @@ verify_release_signatures() {
 				bad=1
 			fi
 		done
-	done < <(macho_files "$dir")
+	done <<<"$mlist"
 	if [ "$n" -lt "$MACHO_FLOOR" ]; then
 		echo "    only $n Mach-O(s) under $dir (floor $MACHO_FLOOR) — the set cannot be complete"; bad=1
 	fi
@@ -300,6 +334,9 @@ verify_release_signatures() {
 # past a symlinked Mach-O unverified), and no name carries a newline or a
 # backslash (both break the line-oriented walks and shasum's output format).
 # Run first by the manifest and by both verify modes.
+# `find ! -type f ! -type d` refuses every other entry (symlink, fifo, socket,
+# block or character device), and verify_tree runs this first, so it precedes
+# buildinfo_set_problems on every path: staging, --verify-only, --verify-release.
 tree_shape_problems() {
 	local tree="$1" odd bad=0
 	[ -d "$tree" ] || { echo "stage: $tree is not a directory"; return 1; }
@@ -348,7 +385,7 @@ manifest_write() {
 	} >"$tmp" || { rm -f "$tmp"; return 1; }
 	n="$(grep -vc '^#' "$tmp" || true)"
 	[ "$n" -gt 0 ] || { rm -f "$tmp"; echo "stage: manifest: no files under $tree" >&2; return 1; }
-	if grep -v '^#' "$tmp" | grep -Evq '^[0-9a-f]{64}  [^/].*$'; then
+	if grep -Evq '^[0-9a-f]{64}  [^/].*$' <<<"$(grep -v '^#' "$tmp")"; then
 		rm -f "$tmp"; echo "stage: manifest: a line is not '<sha256>  <relpath>'" >&2; return 1
 	fi
 	chmod 0644 "$tmp"
@@ -522,10 +559,10 @@ needs_network_modules() {
 		*"dial tcp"* | *"no such host"* | *"i/o timeout"* | *"connection refused"* | *"network is unreachable"* | *"TLS handshake timeout"* | *"connection reset by peer"* | *"proxyconnect"* | *"Client.Timeout exceeded"* | *"server misbehaving"*) ;;
 		*) continue ;;
 		esac
-		m="$(printf '%s\n' "$line" | grep -Eo '[A-Za-z0-9][A-Za-z0-9._~!/-]*\.[A-Za-z0-9._~!/-]*@v[0-9][^:[:space:]"]*' | head -1 || true)"
+		m="$(printf '%s\n' "$line" | grep -Eo '[A-Za-z0-9][A-Za-z0-9._~!/-]*\.[A-Za-z0-9._~!/-]*@v[0-9][^:[:space:]"]*' | sed -n 1p || true)"
 		m="${m%/go.mod}"
 		if [ -z "$m" ]; then
-			m="$(printf '%s\n' "$line" | sed -E -n 's#.*https://[^/]*/([^"[:space:]]+)/@v/(v[^"[:space:]]+)\.(info|mod|zip).*#\1@\2#p' | head -1 || true)"
+			m="$(printf '%s\n' "$line" | sed -E -n 's#.*https://[^/]*/([^"[:space:]]+)/@v/(v[^"[:space:]]+)\.(info|mod|zip).*#\1@\2#p' | sed -n 1p || true)"
 		fi
 		# A module path in a proxy URL is case-encoded ("!x" is "X").
 		m="$(printf '%s\n' "${m:-?}" | unbang)"
@@ -616,11 +653,42 @@ cp-payload/zot
 cp-payload/zot.version
 cp-payload/helm.version"
 
+# The control-plane version marker `k3sm payload` writes beside the four
+# control-plane binaries (pkg/executor KubeMarkerName). A text marker, not code:
+# release staging accepts it only when kube_marker_problems proves its content.
+KUBE_MARKER_FILE="cp-payload/kube.version"
+
 # release_payload_files: every cp-payload entry release staging accepts, one per
-# line: PINNED_SOURCE_FILES, K3SM_BUILT_FILES, and the k3sm-built helm under its
-# versioned name. Needs read_pins.
+# line: PINNED_SOURCE_FILES, KUBE_MARKER_FILE, K3SM_BUILT_FILES, and the
+# k3sm-built helm under its versioned name. Needs read_pins.
 release_payload_files() {
-	printf '%s\n%s\ncp-payload/%s\n' "$PINNED_SOURCE_FILES" "$K3SM_BUILT_FILES" "$HELM_BINARY"
+	printf '%s\n%s\n%s\ncp-payload/%s\n' "$PINNED_SOURCE_FILES" "$KUBE_MARKER_FILE" "$K3SM_BUILT_FILES" "$HELM_BINARY"
+}
+
+# kube_marker_problems <tree> <stamp-text> <kube-version>: non-zero, naming the
+# file and the expected content, unless <tree>/KUBE_MARKER_FILE is a regular file
+# (not a symlink) whose bytes are exactly "<tag>\n", where <tag> is the one
+# `tag: <tag> (commit ...)` line of <stamp-text> (the --cp-build BUILD-STAMP) and
+# equals <kube-version> (read_pins' DefaultKubeVersion).
+kube_marker_problems() {
+	local tree="$1" stamp="$2" kv="$3" f tags tag
+	f="$tree/$KUBE_MARKER_FILE"
+	tags="$(printf '%s\n' "$stamp" | sed -n 's/^tag: \([^[:space:]]*\) .*/\1/p')"
+	if [ -z "$tags" ] || [ "$(printf '%s\n' "$tags" | wc -l | tr -d ' ')" != 1 ]; then
+		echo "    $KUBE_MARKER_FILE: $CP_STAMP_NAME does not record exactly one tag line, so the marker has no expected content"
+		return 1
+	fi
+	tag="$tags"
+	if [ -z "$kv" ] || [ "$tag" != "$kv" ]; then
+		echo "    $KUBE_MARKER_FILE: $CP_STAMP_NAME records tag $tag, the executor's DefaultKubeVersion is '${kv}'"
+		return 1
+	fi
+	if [ -L "$f" ] || [ ! -f "$f" ]; then
+		printf '    %s: missing or not a regular file; expected exactly "%s\\n"\n' "$KUBE_MARKER_FILE" "$tag"
+		return 1
+	fi
+	cmp -s "$f" <(printf '%s\n' "$tag") || { printf '    %s: content is not exactly "%s\\n"\n' "$KUBE_MARKER_FILE" "$tag"; return 1; }
+	return 0
 }
 
 # cp_build_problems <dir>: non-zero, naming each problem, unless <dir> holds
@@ -637,7 +705,7 @@ cp_build_problems() {
 	for f in "$dir"/* "$dir"/.[!.]*; do
 		[ -e "$f" ] || [ -L "$f" ] || continue
 		[ "$(basename "$f")" = "$CP_STAMP_NAME" ] && continue
-		printf '%s\n' "$PINNED_SOURCE_FILES" | grep -qxF -- "cp-payload/$(basename "$f")" || { echo "    --cp-build holds an unexpected $(basename "$f")"; bad=1; }
+		grep_text "$PINNED_SOURCE_FILES" -qxF -- "cp-payload/$(basename "$f")" || { echo "    --cp-build holds an unexpected $(basename "$f")"; bad=1; }
 	done
 	return "$bad"
 }
@@ -657,12 +725,12 @@ cp_binary_problems() {
 	text="$(cat)"
 	gov="$(printf '%s\n' "$text" | sed -n '1s/^.*: \(go[0-9][^[:space:]]*\)$/\1/p')"
 	[ "$gov" = "$PAYLOAD_GO_VERSION" ] || { echo "PROBLEM $name: built with '${gov:-?}', the payload pins $PAYLOAD_GO_VERSION"; bad=1; }
-	printf '%s\n' "$text" | grep -Eqx "[[:space:]]*path[[:space:]]+k8s\.io/kubernetes/cmd/$name" || { echo "PROBLEM $name: main package is not k8s.io/kubernetes/cmd/$name"; bad=1; }
-	printf '%s\n' "$text" | grep -Eqx '[[:space:]]*mod[[:space:]]+k8s\.io/kubernetes[[:space:]]+\(devel\)[[:space:]]*' || { echo "PROBLEM $name: main module is not the k8s.io/kubernetes source build"; bad=1; }
+	grep_text "$text" -Eqx "[[:space:]]*path[[:space:]]+k8s\.io/kubernetes/cmd/$name" || { echo "PROBLEM $name: main package is not k8s.io/kubernetes/cmd/$name"; bad=1; }
+	grep_text "$text" -Eqx '[[:space:]]*mod[[:space:]]+k8s\.io/kubernetes[[:space:]]+\(devel\)[[:space:]]*' || { echo "PROBLEM $name: main module is not the k8s.io/kubernetes source build"; bad=1; }
 	for setting in CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 -trimpath=true; do
-		printf '%s\n' "$text" | grep -qx "[[:space:]]*build[[:space:]]$setting" || { echo "PROBLEM $name: build setting $setting is missing"; bad=1; }
+		grep_text "$text" -qx "[[:space:]]*build[[:space:]]$setting" || { echo "PROBLEM $name: build setting $setting is missing"; bad=1; }
 	done
-	printf '%s\n' "$text" | grep -Eq '^[[:space:]]*=>' && { echo "PROBLEM $name: a module is replaced"; bad=1; }
+	grep_text "$text" -Eq '^[[:space:]]*=>' && { echo "PROBLEM $name: a module is replaced"; bad=1; }
 	while read -r mod ver; do
 		[ -n "$mod" ] || continue
 		got="$(printf '%s\n' "$text" | awk -v m="$mod" '$1 == "dep" && $2 == m { print $3 }')"
@@ -715,10 +783,10 @@ cp_build_check() {
 	local dir="$1" key="$2" raises="$3" rhash="$4" stamp="$5" tag bad=0 stamped
 	tag="${key%%-go[0-9]*}"
 	cp_build_problems "$dir" || return 1
-	printf '%s\n' "$stamp" | grep -qxF -- "cache-key: $key" || { echo "    $CP_STAMP_NAME does not name cache key $key (built from another tag, toolchain or raise list)"; bad=1; }
-	printf '%s\n' "$stamp" | grep -qF -- "toolchain: $PAYLOAD_GO_VERSION " || { echo "    $CP_STAMP_NAME does not name toolchain $PAYLOAD_GO_VERSION"; bad=1; }
-	printf '%s\n' "$stamp" | grep -qF -- "tag: $tag " || { echo "    $CP_STAMP_NAME does not name tag $tag"; bad=1; }
-	printf '%s\n' "$stamp" | grep -qxF -- "raise-list-sha256: $rhash" || { echo "    $CP_STAMP_NAME does not name raise-list-sha256 $rhash (build-cp.sh's live raise list)"; bad=1; }
+	grep_text "$stamp" -qxF -- "cache-key: $key" || { echo "    $CP_STAMP_NAME does not name cache key $key (built from another tag, toolchain or raise list)"; bad=1; }
+	grep_text "$stamp" -qF -- "toolchain: $PAYLOAD_GO_VERSION " || { echo "    $CP_STAMP_NAME does not name toolchain $PAYLOAD_GO_VERSION"; bad=1; }
+	grep_text "$stamp" -qF -- "tag: $tag " || { echo "    $CP_STAMP_NAME does not name tag $tag"; bad=1; }
+	grep_text "$stamp" -qxF -- "raise-list-sha256: $rhash" || { echo "    $CP_STAMP_NAME does not name raise-list-sha256 $rhash (build-cp.sh's live raise list)"; bad=1; }
 	stamped="$(printf '%s\n' "$stamp" | sed -n 's/^raise-list: \([^ ]*\) \([^ ]*\) .*/\1 \2/p' | LC_ALL=C sort)"
 	[ "$stamped" = "$(printf '%s\n' "$raises" | sed '/^$/d' | LC_ALL=C sort)" ] || { echo "    $CP_STAMP_NAME's raise-list lines are not build-cp.sh's live raise list"; bad=1; }
 	cp_set_check "$dir" "$tag" "$raises" "$stamp" || bad=1
@@ -731,10 +799,10 @@ cp_build_check() {
 cp_live() {
 	local bcp="$1" key raises rhash
 	key="$("$bcp" --print-cache-key)" || { echo "stage: $bcp --print-cache-key failed" >&2; return 1; }
-	printf '%s' "$key" | grep -Eq '^v[0-9][0-9A-Za-z.+-]*-go[0-9][0-9.]*-[0-9a-f]{16}$' || { echo "stage: unexpected cache key '$key'" >&2; return 1; }
+	grep_text "$key" -Eq '^v[0-9][0-9A-Za-z.+-]*-go[0-9][0-9.]*-[0-9a-f]{16}$' || { echo "stage: unexpected cache key '$key'" >&2; return 1; }
 	raises="$("$bcp" --print-raises)" || { echo "stage: $bcp --print-raises failed" >&2; return 1; }
 	rhash="$("$bcp" --print-raise-list-hash)" || { echo "stage: $bcp --print-raise-list-hash failed" >&2; return 1; }
-	printf '%s' "$rhash" | grep -Eq '^[0-9a-f]{64}$' || { echo "stage: unexpected raise-list hash '$rhash'" >&2; return 1; }
+	grep_text "$rhash" -Eq '^[0-9a-f]{64}$' || { echo "stage: unexpected raise-list hash '$rhash'" >&2; return 1; }
 	printf 'CP_KEY=%q\nCP_RAISES=%q\nCP_RHASH=%q\n' "$key" "$raises" "$rhash"
 }
 
@@ -827,7 +895,7 @@ pinned_content_problems() {
 refuse_unpinned_payload() {
 	local tree="$1" list="$2" rel bad=0
 	while IFS= read -r rel; do
-		printf '%s\n' "$list" | grep -qxF -- "$rel" || { echo "    NOT BUILT FROM PINNED SOURCE: $rel"; bad=1; }
+		grep_text "$list" -qxF -- "$rel" || { echo "    NOT BUILT FROM PINNED SOURCE: $rel"; bad=1; }
 	done < <(cd "$tree" && find cp-payload -type f | LC_ALL=C sort)
 	return "$bad"
 }
@@ -966,7 +1034,7 @@ GO
 	expect() {
 		local name="$1" want="$2" s miss=""
 		shift 2
-		for s in "$@"; do printf '%s\n' "$o" | grep -qF -- "$s" || miss="$miss '$s'"; done
+		for s in "$@"; do grep_text "$o" -qF -- "$s" || miss="$miss '$s'"; done
 		if [ "$rc" = "$want" ] && [ -z "$miss" ]; then
 			ok "$name"
 		else
@@ -1066,8 +1134,8 @@ SH
 		done < <(release_payload_files)
 		want="$(release_payload_files | grep -vc '\.version$')"
 		if o="$(child_scan_set "$pd" 2>/dev/null)" && [ "$(printf '%s\n' "$o" | grep -c .)" = "$want" ] &&
-			printf '%s\n' "$o" | grep -q "^helm $HELM_VERSION $pd/$HELM_BINARY\$" &&
-			printf '%s\n' "$o" | grep -q "^kube-apiserver $KUBE_VERSION " && printf '%s\n' "$o" | grep -q "^zot $ZOT_VERSION "; then
+			grep_text "$o" -q "^helm $HELM_VERSION $pd/$HELM_BINARY\$" &&
+			grep_text "$o" -q "^kube-apiserver $KUBE_VERSION " && grep_text "$o" -q "^zot $ZOT_VERSION "; then
 			echo "  ok    vuln scan set: every Go binary of release_payload_files ($want), each under its pin"
 		else
 			echo "  FAIL  vuln scan set: $o"; exit 1
@@ -1075,7 +1143,7 @@ SH
 		echo "not a Go binary" >"$pd/kine"
 		if o="$(child_scan_set "$pd" 2>/dev/null)"; then
 			echo "  FAIL  a listed payload file that is not a Go binary was skipped, not red"; exit 1
-		elif printf '%s\n' "$o" | grep -q "PROBLEM kine: not a readable Go binary"; then
+		elif grep_text "$o" -q "PROBLEM kine: not a readable Go binary"; then
 			echo "  ok    vuln scan set: a listed payload file that is not a Go binary is red"
 		else
 			echo "  FAIL  vuln scan set: the non-Go kine not named: $o"; exit 1
@@ -1083,7 +1151,7 @@ SH
 		cp "$probe" "$pd/kine"
 		if o="$(ZOT_VERSION="" child_scan_set "$pd" 2>/dev/null)"; then
 			echo "  FAIL  a child whose pin resolves empty was scanned"; exit 1
-		elif printf '%s\n' "$o" | grep -q "PROBLEM zot: empty version"; then
+		elif grep_text "$o" -q "PROBLEM zot: empty version"; then
 			echo "  ok    vuln scan set: a child whose version resolves empty is red, named"
 		else
 			echo "  FAIL  vuln scan set: the empty zot version not named: $o"; exit 1
@@ -1093,13 +1161,122 @@ cp-payload/newchild"
 		cp "$probe" "$pd/newchild"
 		if o="$(child_scan_set "$pd" 2>/dev/null)"; then
 			echo "  FAIL  a payload child with no version mapping was scanned without a pin"; exit 1
-		elif printf '%s\n' "$o" | grep -q "PROBLEM newchild: no version mapping"; then
+		elif grep_text "$o" -q "PROBLEM newchild: no version mapping"; then
 			echo "  ok    vuln scan set: a new payload child with no version mapping is red"
 		else
 			echo "  FAIL  vuln scan set: newchild not named: $o"; exit 1
 		fi
 	) || fails=$((fails + 1))
 	unset -f scan expect
+}
+
+# ---- the build-info check ---------------------------------------------------------
+# The closed list of Go mains a staged tree may hold, one import path per line: the
+# three this script builds (the k3sm binary, the exec shim and the VM host), the four
+# control-plane binaries build-cp.sh builds, and the five children `k3sm payload`
+# builds (kine, the etcd wrapper, etcdutl, zot, helm). A main added to staging is
+# added here, or staging refuses the tree.
+SHIPPED_MAINS="k3sm.io/k3sm/cmd/k3sm
+k3sm.io/runtimed/cmd/k3sm-execshim
+k3sm.io/runtimed/cmd/k3sm-vmhost
+k8s.io/kubernetes/cmd/kube-apiserver
+k8s.io/kubernetes/cmd/kube-scheduler
+k8s.io/kubernetes/cmd/kube-controller-manager
+k8s.io/kubernetes/cmd/kubectl
+github.com/k3s-io/kine
+k3sm.io/etcd-child
+go.etcd.io/etcd/etcdutl/v3
+zotregistry.dev/zot/v2/cmd/zot
+helm.sh/helm/v4/cmd/helm"
+
+# The Mach-Os that are not Go binaries, by path relative to the tree: the two clang
+# DYLD interposers. Every other Mach-O must carry Go build info. A binary named
+# here gets only the byte scan, not the build-info check.
+NON_GO_MACHOS="libk3sm_pathrebase_shim.dylib
+libk3sm_getaddrinfo_shim.dylib"
+
+# The only files that may be neither a Mach-O nor in NON_GO_MACHOS, by path
+# relative to the tree, each a plain-text file: the payload manifest and the
+# pre-sign digests staging writes, and the version markers `k3sm payload` writes
+# beside the control-plane binaries (the installed set holds exactly these six).
+# Stub staging also permits its placeholder cp-payload files, whose bytes are
+# exactly "stub\n". Every other non-Mach-O file is refused.
+NON_MACHO_FILES="$MANIFEST_NAME
+$UPSTREAM_NAME
+cp-payload/kube.version
+cp-payload/kine.version
+cp-payload/etcd.version
+cp-payload/etcdutl.version
+cp-payload/zot.version
+cp-payload/helm.version"
+
+# A hack package of any k3sm module (k3sm, runtimed, darwin-net, apis, ...), as
+# an extended regex matched against the bytes of every staged file. The
+# build-info rule below matches module paths with
+# ^k3sm.io/<module>(/v<n>)?/hack(/|$).
+HACK_BYTES_RE='k3sm\.io/[A-Za-z0-9._-]+(/v[0-9]+)?/hack[/.]'
+
+# buildinfo_set_problems <tree> [stub]: the artifact check that nothing staged was built
+# from, or links, a hack package of a k3sm module (test tooling such as the OCI
+# conformance launcher, which is never shipped). Reads the artifacts rather than
+# the scripts that built them, so no spelling of a build command can get around
+# it. For every regular file in <tree>:
+#   - file(1) must classify it, and a file that is not a Mach-O must be a text
+#     file NON_MACHO_FILES names (stub staging, <stub> = "stub": or a cp-payload
+#     placeholder); an archive, a compressed or encoded blob, or raw data at any
+#     other path is refused, since its contents cannot be scanned;
+#   - its bytes may not match HACK_BYTES_RE, which is how a hack package linked
+#     into a main of its own module shows (build info lists modules, not
+#     packages; the function and file names in the pclntab survive -s -w and
+#     -trimpath), and how a text file naming one shows.
+# For every Mach-O, `go version -m` (read, never executed) must also report
+# exactly one main path, in SHIPPED_MAINS; no path, mod, dep or => module path
+# may name a hack package of a k3sm module; and no => replacement target may have a path
+# element named hack. A Mach-O without readable build info passes only when
+# NON_GO_MACHOS names it. Prints one line per problem; returns 0 only when there
+# are none.
+buildinfo_set_problems() {
+	local tree="$1" stub="${2:-}" f rel desc text mains bad=0 hits rc
+	while IFS= read -r f; do
+		[ -n "$f" ] || continue
+		rel="${f#"$tree"/}"
+		if ! desc="$(file_desc "$f")"; then
+			echo "    $rel: file(1) cannot read it (${desc:-no output})"; bad=1; continue
+		fi
+		rc=0
+		LC_ALL=C grep -aqE "$HACK_BYTES_RE" "$f" || rc=$?
+		case "$rc" in
+		0) echo "    $rel: names a k3sm hack package (in its bytes)"; bad=1 ;;
+		1) ;;
+		*) echo "    $rel: cannot be read for the hack-package scan"; bad=1 ;;
+		esac
+		case "$desc" in
+		*Mach-O*) ;;
+		*)
+			if [ "$stub" = stub ] && [ "${rel#cp-payload/}" != "$rel" ] && cmp -s "$f" <(printf 'stub\n'); then
+				continue
+			fi
+			case "$desc" in
+			*text*) grep_text "$NON_MACHO_FILES" -qxF -- "$rel" && continue ;;
+			esac
+			echo "    $rel: a non-Mach-O file NON_MACHO_FILES does not permit ($desc)"; bad=1; continue ;;
+		esac
+		if ! text="$("$GO" version -m "$f" 2>/dev/null)" || ! grep_text "$text" -Eq '^[[:space:]]+path[[:space:]]'; then
+			grep_text "$NON_GO_MACHOS" -qxF -- "$rel" || { echo "    $rel: a Mach-O with no Go build info that NON_GO_MACHOS does not name"; bad=1; }
+			continue
+		fi
+		mains="$(printf '%s\n' "$text" | awk '$1 == "path" { print $2 }')"
+		if [ "$(grep -c . <<<"$mains")" != 1 ]; then
+			echo "    $rel: build info names $(grep -c . <<<"$mains") main paths, not one"; bad=1
+		elif ! grep_text "$SHIPPED_MAINS" -qxF -- "$mains"; then
+			echo "    $rel: main $mains is not a shipped main (SHIPPED_MAINS)"; bad=1
+		fi
+		hits="$(printf '%s\n' "$text" | awk '($1 == "path" || $1 == "mod" || $1 == "dep" || $1 == "=>") && $2 ~ /^k3sm\.io\/[^\/]+(\/v[0-9]+)?\/hack(\/|$)/ { print $1 " " $2 }')"
+		[ -z "$hits" ] || { echo "    $rel: build info names a k3sm hack package: $(paste -sd ';' - <<<"$hits")"; bad=1; }
+		hits="$(printf '%s\n' "$text" | awk '$1 == "=>" { n = split($2, e, "/"); for (i = 1; i <= n; i++) if (e[i] == "hack") { print $2; break } }')"
+		[ -z "$hits" ] || { echo "    $rel: a module is replaced by a hack path: $(paste -sd ';' - <<<"$hits")"; bad=1; }
+	done < <(find "$tree" -type f | LC_ALL=C sort)
+	return "$bad"
 }
 
 # ---- self-test --------------------------------------------------------------------
@@ -1135,7 +1312,7 @@ self_test() {
 		local name="$1" want="$2" text="$3" o
 		if o="$(printf '%s\n' "$text" | release_sig_problems "$team")"; then
 			bad "$name: parser ACCEPTED it"
-		elif printf '%s\n' "$o" | grep -q -- "$want"; then
+		elif grep_text "$o" -q -- "$want"; then
 			ok "$name: rejected ($want)"
 		else
 			bad "$name: rejected but '$want' not named: $o"
@@ -1148,7 +1325,7 @@ self_test() {
 	if out="$(release_sig_problems "$team" <"$pos")"; then ok "positive fixture accepted"; else bad "positive fixture rejected: $out"; fi
 	if out="$(release_sig_problems ZZZZZ99999 <"$pos")"; then
 		bad "positive fixture accepted for another team"
-	elif printf '%s\n' "$out" | grep -q "^team:" && printf '%s\n' "$out" | grep -q "^authority:"; then
+	elif grep_text "$out" -q "^team:" && grep_text "$out" -q "^authority:"; then
 		ok "positive fixture rejected for another team (team, authority)"
 	else
 		bad "positive fixture, other team: problems not named: $out"
@@ -1207,9 +1384,9 @@ self_test() {
 		bad "ad-hoc tree PASSED the release policy"
 	else
 		for want in "flags: .* lacks the hardened runtime" "ad-hoc bit" "timestamp:" "team:" "authority:" "universal \[x86_64\]" "universal \[arm64\]"; do
-			if printf '%s\n' "$out" | grep -q -- "$want"; then ok "ad-hoc tree: '$want' reported"; else bad "ad-hoc tree: '$want' not reported"; fi
+			if grep_text "$out" -q -- "$want"; then ok "ad-hoc tree: '$want' reported"; else bad "ad-hoc tree: '$want' not reported"; fi
 		done
-		if printf '%s\n' "$out" | grep -q "k3sm-execshim \[arm64\]: flags:.*runtime"; then
+		if grep_text "$out" -q "k3sm-execshim \[arm64\]: flags:.*runtime"; then
 			bad "runtime-signed ad-hoc binary reported as lacking runtime"
 		else
 			ok "runtime-signed ad-hoc binary fails on the other fields only"
@@ -1221,7 +1398,7 @@ self_test() {
 	fi
 	if out="$("$self" "$tree" --verify-release "$team" 2>&1)"; then
 		bad "stage.sh <ad-hoc tree> --verify-release exited 0"
-	elif printf '%s\n' "$out" | grep -q "timestamp:"; then
+	elif grep_text "$out" -q "timestamp:"; then
 		ok "stage.sh <ad-hoc tree> --verify-release exits non-zero, naming the signature problems"
 	else
 		bad "stage.sh --verify-release failed without naming the signature problems"
@@ -1242,11 +1419,152 @@ cat "%s" >&2
 	chmod +x "$tmp/fake-codesign-badchain"
 	if out="$(CODESIGN="$tmp/fake-codesign-badchain" verify_release_signatures "$tree" "$team")"; then
 		bad "a failing chain-of-trust check was ignored"
-	elif printf '%s\n' "$out" | grep -q ": chain: "; then ok "a failing chain-of-trust check fails the walk"; else bad "chain failure not named: $out"; fi
+	elif grep_text "$out" -q ": chain: "; then ok "a failing chain-of-trust check fails the walk"; else bad "chain failure not named: $out"; fi
 	rm "$tree/universal"
 	if out="$(CODESIGN="$tmp/fake-codesign" verify_release_signatures "$tree" "$team")"; then
 		bad "a 3-Mach-O tree passed the floor"
-	elif printf '%s\n' "$out" | grep -q "floor"; then ok "Mach-O floor enforced"; else bad "floor failure not named: $out"; fi
+	elif grep_text "$out" -q "floor"; then ok "Mach-O floor enforced"; else bad "floor failure not named: $out"; fi
+
+	echo "==> build info: a shipped main passes, a hack package of any k3sm module is refused"
+	# Every binary is built from a throwaway module in the temp dir (never the
+	# repo), with -trimpath -ldflags='-s -w' as the payload's children are, and
+	# with no dependency to fetch: each dependency is a local replace.
+	local bm="$tmp/bi-k3sm" bd="$tmp/bi-dep" br="$tmp/bi-runtimed" bn="$tmp/bi-netdep" bx="$tmp/bi-rep/k3sm/hack/plantrep"
+	# The planted import paths, held in variables so the fixture lines below do
+	# not trip B1021's early-warning text scan of the release scripts.
+	local plantinit='import "os"\n\nfunc init() {\n\tif os.Getenv("K3SM_PLANT") != "" {\n\t\tprintln("plant")\n\t}\n}\n'
+	local hk=hack hp rp np vp bv="$tmp/bi-v2dep"
+	hp="k3sm.io/k3sm/$hk" rp="k3sm.io/runtimed/$hk" np="k3sm.io/darwin-net/$hk" vp="k3sm.io/apis/v2/$hk"
+	mkdir -p "$bv"
+	printf 'module %s/plantdep\n\ngo 1.26\n' "$vp" >"$bv/go.mod"
+	# shellcheck disable=SC2059 # plantinit is a fixed format with no operands
+	printf "package plantdep\n\n$plantinit" >"$bv/dep.go"
+	mkdir -p "$bm/cmd/k3sm" "$bm/cmd/k3sm-extra" "$bm/hack/plant/serve" "$bm/hack/plant/lib" "$bd" "$bn" "$bx" \
+		"$br/cmd/k3sm-execshim" "$br/cmd/k3sm-vmhost" "$br/hack/plant"
+	printf 'module k3sm.io/k3sm\n\ngo 1.26\n' >"$bm/go.mod"
+	printf 'package main\n\nfunc main() {}\n' >"$bm/cmd/k3sm/main.go"
+	printf '//go:build planthack\n\npackage main\n\nimport _ "%s/plant/lib"\n' "$hp" >"$bm/cmd/k3sm/plant.go"
+	printf 'package main\n\nfunc main() { println("extra") }\n' >"$bm/cmd/k3sm-extra/main.go"
+	printf 'package main\n\nfunc main() { println("serve") }\n' >"$bm/hack/plant/serve/main.go"
+	# shellcheck disable=SC2059 # plantinit is a fixed format with no operands
+	printf "package lib\n\n$plantinit" >"$bm/hack/plant/lib/lib.go"
+	printf 'module %s/plantdep\n\ngo 1.26\n' "$hp" >"$bd/go.mod"
+	# shellcheck disable=SC2059
+	printf "package plantdep\n\n$plantinit" >"$bd/dep.go"
+	printf 'module %s/plantdep\n\ngo 1.26\n' "$np" >"$bn/go.mod"
+	# shellcheck disable=SC2059
+	printf "package plantdep\n\n$plantinit" >"$bn/dep.go"
+	printf 'module example.com/plantrep\n\ngo 1.26\n' >"$bx/go.mod"
+	# shellcheck disable=SC2059
+	printf "package plantrep\n\n$plantinit" >"$bx/rep.go"
+	# shellcheck disable=SC2059
+	printf "package plant\n\n$plantinit" >"$br/hack/plant/plant.go"
+	printf 'module k3sm.io/runtimed\n\ngo 1.26\n\nrequire (\n\t%s/plantdep v0.0.0\n\t%s/plantdep v0.0.0\n\t%s/plantdep v0.0.0\n\texample.com/plantrep v0.0.0\n)\n\nreplace %s/plantdep => %s\n\nreplace %s/plantdep => %s\n\nreplace %s/plantdep => %s\n\nreplace example.com/plantrep => %s\n' \
+		"$hp" "$np" "$vp" "$hp" "$bd" "$np" "$bn" "$vp" "$bv" "$bx" >"$br/go.mod"
+	printf 'package main\n\nfunc main() { println("shim") }\n' >"$br/cmd/k3sm-execshim/main.go"
+	printf '//go:build k3smdep\n\npackage main\n\nimport _ "%s/plantdep"\n' "$hp" >"$br/cmd/k3sm-execshim/k3smdep.go"
+	printf '//go:build rlinked\n\npackage main\n\nimport _ "%s/plant"\n' "$rp" >"$br/cmd/k3sm-execshim/rlinked.go"
+	printf '//go:build v2dep\n\npackage main\n\nimport _ "%s/plantdep"\n' "$vp" >"$br/cmd/k3sm-execshim/v2dep.go"
+	printf '//go:build netdep\n\npackage main\n\nimport _ "%s/plantdep"\n' "$np" >"$br/cmd/k3sm-execshim/netdep.go"
+	printf 'package main\n\nimport _ "example.com/plantrep"\n\nfunc main() { println("vmhost") }\n' >"$br/cmd/k3sm-vmhost/main.go"
+	bgo() { (cd "$1" && shift && GOWORK=off GOTOOLCHAIN=local GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 "$GO" build -trimpath -ldflags='-s -w' "$@") >/dev/null 2>&1; }
+	# bt <name>: a fresh tree holding the two allowed clang dylibs.
+	bt() { rm -rf "$tmp/bi-$1"; mkdir -p "$tmp/bi-$1"; cp "$tree/k3sm" "$tmp/bi-$1/libk3sm_pathrebase_shim.dylib"; cp "$tree/k3sm" "$tmp/bi-$1/libk3sm_getaddrinfo_shim.dylib"; }
+	bt ok
+	if bgo "$bm" -o "$tmp/bi-ok/k3sm" ./cmd/k3sm && bgo "$bm" -o "$tmp/bi-serve" ./hack/plant/serve &&
+		bgo "$bm" -tags planthack -o "$tmp/bi-linked" ./cmd/k3sm && bgo "$bm" -o "$tmp/bi-extra" ./cmd/k3sm-extra &&
+		bgo "$br" -tags k3smdep -o "$tmp/bi-shim" ./cmd/k3sm-execshim && bgo "$br" -tags netdep -o "$tmp/bi-netshim" ./cmd/k3sm-execshim &&
+		bgo "$br" -tags v2dep -o "$tmp/bi-v2shim" ./cmd/k3sm-execshim &&
+		bgo "$br" -o "$tmp/bi-vmhost" ./cmd/k3sm-vmhost &&
+		bgo "$br" -tags rlinked -o "$tmp/bi-rlinked" ./cmd/k3sm-execshim; then
+		mkdir -p "$tmp/bi-ok/cp-payload"
+		printf '%s\n' v1.0.0 >"$tmp/bi-ok/cp-payload/kine.version"
+		printf '# manifest\n' >"$tmp/bi-ok/$MANIFEST_NAME"
+		printf '# digests\n' >"$tmp/bi-ok/$UPSTREAM_NAME"
+		if out="$(buildinfo_set_problems "$tmp/bi-ok")"; then ok "a k3sm.io/k3sm/cmd/k3sm build, the two named dylibs and the listed text files pass"; else bad "a shipped main was refused: $out"; fi
+		# bi_expect <case> <file> <rel> <want>...: the file planted in a fresh
+		# tree at <rel> is refused, naming every <want>.
+		bi_expect() {
+			local c="$1" src="$2" rel="$3" w; shift 3
+			bt "$c"; mkdir -p "$(dirname "$tmp/bi-$c/$rel")"; cp "$src" "$tmp/bi-$c/$rel"
+			if out="$(buildinfo_set_problems "$tmp/bi-$c")"; then bad "$c: refused nothing"; return; fi
+			for w in "$@"; do
+				if grep_text "$out" -qF -- "$w"; then ok "$c: refused ($w)"; else bad "$c: '$w' not named: $out"; fi
+			done
+		}
+		bi_expect "hack main" "$tmp/bi-serve" cp-payload/kubectl "main $hp/plant/serve is not a shipped main" "build info names a k3sm hack package: path $hp/plant/serve" "names a k3sm hack package (in its bytes)"
+		bi_expect "hack package linked into cmd/k3sm" "$tmp/bi-linked" k3sm "names a k3sm hack package (in its bytes)"
+		bi_expect "hack module as a dependency" "$tmp/bi-shim" k3sm-execshim "build info names a k3sm hack package: dep $hp/plantdep"
+		bi_expect "runtimed hack package linked into its main" "$tmp/bi-rlinked" k3sm-execshim "names a k3sm hack package (in its bytes)"
+		bi_expect "darwin-net hack module as a dependency" "$tmp/bi-netshim" k3sm-execshim "build info names a k3sm hack package: dep $np/plantdep"
+		bi_expect "a module replaced by a hack path" "$tmp/bi-vmhost" k3sm-vmhost "a module is replaced by a hack path: $bx"
+		bi_expect "unshipped main" "$tmp/bi-extra" k3sm-extra "main k3sm.io/k3sm/cmd/k3sm-extra is not a shipped main"
+		bi_expect "unnamed non-Go Mach-O" "$tree/k3sm" cp-payload/tool "cp-payload/tool: a Mach-O with no Go build info"
+		printf 'built from %s/plant/lib\n' "$rp" >"$tmp/bi-note"
+		bi_expect "a text file naming a hack package" "$tmp/bi-note" cp-payload/kine.version "cp-payload/kine.version: names a k3sm hack package (in its bytes)"
+		(cd "$tmp" && tar -cf bi-tar bi-note && gzip -c bi-note >bi-gz && zip -q bi-zip bi-note) >/dev/null 2>&1 || bad "the archive fixtures did not build"
+		bi_expect "apis v2 hack module as a dependency" "$tmp/bi-v2shim" k3sm-execshim "build info names a k3sm hack package: dep $vp/plantdep" "k3sm-execshim: names a k3sm hack package (in its bytes)"
+		printf 'from %s/x\n' "k3sm.io/runtimed/v3/$hk" >"$tmp/bi-v3note"
+		bi_expect "a text file naming a v3 module's hack package" "$tmp/bi-v3note" cp-payload/kine.version "names a k3sm hack package (in its bytes)"
+		local na="a non-Mach-O file NON_MACHO_FILES does not permit"
+		bi_expect "a tar archive" "$tmp/bi-tar" cp-payload/x "cp-payload/x: $na (POSIX tar archive"
+		bi_expect "a gzip file" "$tmp/bi-gz" cp-payload/x "cp-payload/x: $na (gzip compressed data"
+		bi_expect "a zip archive" "$tmp/bi-zip.zip" cp-payload/x "cp-payload/x: $na (Zip archive data"
+		printf '\000\001\002\377\376\375\020\021' >"$tmp/bi-raw"
+		bi_expect "a raw data blob" "$tmp/bi-raw" cp-payload/blob "cp-payload/blob: $na (data)"
+		bi_expect "raw data at a listed name" "$tmp/bi-raw" cp-payload/kine.version "cp-payload/kine.version: $na (data)"
+		bi_expect "an unlisted text file" "$tmp/bi-note" cp-payload/README "cp-payload/README: $na (ASCII text"
+		if command -v compression_tool >/dev/null 2>&1 && printf 'plant\n' | compression_tool -encode -a lzfse >"$tmp/bi-lzfse" 2>/dev/null; then
+			bi_expect "an lzfse blob" "$tmp/bi-lzfse" cp-payload/blob "cp-payload/blob: $na (lzfse"
+		else
+			echo "  skip  an lzfse blob: compression_tool is not available (the raw data case covers an unlisted blob)"
+		fi
+		bt stub; mkdir -p "$tmp/bi-stub/cp-payload"; printf 'stub\n' >"$tmp/bi-stub/cp-payload/kube-apiserver"
+		if out="$(buildinfo_set_problems "$tmp/bi-stub" stub)"; then ok "stub staging permits a cp-payload placeholder"; else bad "stub staging refused its placeholder: $out"; fi
+		if out="$(buildinfo_set_problems "$tmp/bi-stub")"; then bad "a placeholder passed outside stub staging"; elif grep_text "$out" -qF "cp-payload/kube-apiserver: $na"; then ok "a placeholder outside stub staging is refused"; else bad "placeholder refusal not named: $out"; fi
+		printf 'stub\n' >"$tmp/bi-stub/stray"
+		if out="$(buildinfo_set_problems "$tmp/bi-stub" stub)"; then bad "stub staging permitted a placeholder outside cp-payload"; else ok "stub staging permits placeholders only under cp-payload"; fi
+		if grep_text "$SHIPPED_MAINS" -Eq "$HACK_BYTES_RE|/$hk(/|\$)"; then bad "SHIPPED_MAINS names a hack package"; else ok "SHIPPED_MAINS names no hack package"; fi
+
+		echo "==> an unreadable file fails the walks closed"
+		if [ "$(id -u)" = 0 ]; then
+			echo "  skip  the unreadable-file cases: running as root, which reads a mode-000 file"
+		else
+			bt unread; printf 'x\n' >"$tmp/bi-unread/cp-payload-x"; chmod 000 "$tmp/bi-unread/cp-payload-x"
+			if out="$(macho_files "$tmp/bi-unread" 2>&1)"; then bad "macho_files skipped a file file(1) cannot read"; elif grep_text "$out" -qF "file(1) cannot read $tmp/bi-unread/cp-payload-x"; then ok "macho_files names a file file(1) cannot read and fails"; else bad "macho_files failure not named: $out"; fi
+			if out="$(buildinfo_set_problems "$tmp/bi-unread")"; then bad "the build-info check passed an unreadable file"; elif grep_text "$out" -qF "cp-payload-x: file(1) cannot read it"; then ok "the build-info check names an unreadable file"; else bad "unreadable file not named: $out"; fi
+			chmod 644 "$tmp/bi-unread/cp-payload-x"
+		fi
+
+		echo "==> --verify-only runs the check: it refuses a tree with a planted hack binary"
+		# k3sm (the fixture main prints no required artifacts), the two dylibs
+		# and one more Mach-O reach the floor; every one carries a signature.
+		# The running script, not $self: a mutated copy must test its own verify_tree.
+		local vt="$tmp/bi-verify" me
+		me="$HERE/$(basename "$0")"
+		rm -rf "$vt"; mkdir -p "$vt/cp-payload"
+		cp "$tmp/bi-ok/k3sm" "$tmp/bi-ok/libk3sm_pathrebase_shim.dylib" "$tmp/bi-ok/libk3sm_getaddrinfo_shim.dylib" "$vt/"
+		cp "$tmp/bi-ok/k3sm" "$vt/cp-payload/kube-apiserver"
+		for f in "$vt/k3sm" "$vt/cp-payload/kube-apiserver"; do codesign -s - -f "$f" >/dev/null 2>&1 || die "self-test: ad-hoc codesign failed for $f"; done
+		if out="$("$me" "$vt" --verify-only 2>&1)"; then
+			bad "--verify-only passed a tree with no k3sm-vmhost (the control tree is wrong)"
+		elif grep_text "$out" -qF "k3sm-vmhost is not in the tree" && ! grep_text "$out" -qF "names a k3sm hack package"; then
+			ok "control: a clean tree passes the build-info step and stops later, at k3sm-vmhost"
+		else
+			bad "control: the clean tree stopped somewhere else: $out"
+		fi
+		cp "$tmp/bi-serve" "$vt/cp-payload/kube-apiserver"
+		codesign -s - -f "$vt/cp-payload/kube-apiserver" >/dev/null 2>&1 || die "self-test: ad-hoc codesign failed"
+		if out="$("$me" "$vt" --verify-only 2>&1)"; then
+			bad "--verify-only passed a planted hack binary"
+		elif grep_text "$out" -qF "cp-payload/kube-apiserver: names a k3sm hack package" && grep_text "$out" -qF "a staged file names a k3sm hack package"; then
+			ok "--verify-only refuses the planted hack binary at the build-info step"
+		else
+			bad "--verify-only failed without naming the planted hack binary: $out"
+		fi
+	else
+		bad "the throwaway build-info fixtures did not build"
+	fi
 
 	echo "==> payload manifest"
 	local m1="$tmp/m1" m2="$tmp/m2" d
@@ -1289,11 +1607,11 @@ cat "%s" >&2
 	printf 'x\n' >"$sb/bad\\name"
 	for mode in --verify-only "--verify-release $team"; do
 		# shellcheck disable=SC2086 # mode is two words on purpose
-		if out="$("$self" "$st" $mode 2>&1)"; then bad "$mode accepted a symlink"; elif printf '%s\n' "$out" | grep -q "symlinks are not allowed"; then ok "$mode refuses a symlink"; else bad "$mode symlink refusal not named: $out"; fi
+		if out="$("$self" "$st" $mode 2>&1)"; then bad "$mode accepted a symlink"; elif grep_text "$out" -q "symlinks are not allowed"; then ok "$mode refuses a symlink"; else bad "$mode symlink refusal not named: $out"; fi
 		# shellcheck disable=SC2086
-		if out="$("$self" "$sn" $mode 2>&1)"; then bad "$mode accepted a newline name"; elif printf '%s\n' "$out" | grep -q "newline or backslash"; then ok "$mode refuses a newline in a name"; else bad "$mode newline refusal not named: $out"; fi
+		if out="$("$self" "$sn" $mode 2>&1)"; then bad "$mode accepted a newline name"; elif grep_text "$out" -q "newline or backslash"; then ok "$mode refuses a newline in a name"; else bad "$mode newline refusal not named: $out"; fi
 		# shellcheck disable=SC2086
-		if out="$("$self" "$sb" $mode 2>&1)"; then bad "$mode accepted a backslash name"; elif printf '%s\n' "$out" | grep -q "newline or backslash"; then ok "$mode refuses a backslash in a name"; else bad "$mode backslash refusal not named: $out"; fi
+		if out="$("$self" "$sb" $mode 2>&1)"; then bad "$mode accepted a backslash name"; elif grep_text "$out" -q "newline or backslash"; then ok "$mode refuses a backslash in a name"; else bad "$mode backslash refusal not named: $out"; fi
 	done
 
 	echo "==> manifest rewrite and verification (the release gate's manifest check)"
@@ -1304,14 +1622,14 @@ cat "%s" >&2
 	( manifest_write "$mt" "toolchain: test" ) || bad "manifest_write failed on the verify tree"
 	if out="$(verify_manifest "$mt")"; then ok "a fresh manifest verifies"; else bad "a fresh manifest failed: $out"; fi
 	printf 'signed\n' >>"$mt/k3sm"
-	if out="$(verify_manifest "$mt")"; then bad "a tampered file verified"; elif printf '%s\n' "$out" | grep -q "k3sm: FAILED"; then ok "a tampered file fails, named by shasum -c"; else bad "tamper failure not named: $out"; fi
+	if out="$(verify_manifest "$mt")"; then bad "a tampered file verified"; elif grep_text "$out" -q "k3sm: FAILED"; then ok "a tampered file fails, named by shasum -c"; else bad "tamper failure not named: $out"; fi
 	if "$self" --rewrite-manifest "$mt" >/dev/null && out="$(verify_manifest "$mt")"; then ok "--rewrite-manifest after a byte change verifies"; else bad "rewrite then verify failed: $out"; fi
 	if [ "$(head -1 "$mt/$MANIFEST_NAME")" = "# toolchain: test" ]; then ok "the rewrite keeps the comment lines"; else bad "the rewrite dropped the comment lines"; fi
 	printf 'new\n' >"$mt/added"
-	if out="$(verify_manifest "$mt")"; then bad "an added file verified"; elif printf '%s\n' "$out" | grep -q "file set"; then ok "an added file fails"; else bad "added-file failure not named: $out"; fi
+	if out="$(verify_manifest "$mt")"; then bad "an added file verified"; elif grep_text "$out" -q "file set"; then ok "an added file fails"; else bad "added-file failure not named: $out"; fi
 	rm "$mt/added"
 	printf '# edited\n' >>"$mt.$MANIFEST_NAME"
-	if out="$(verify_manifest "$mt")"; then bad "differing manifest copies verified"; elif printf '%s\n' "$out" | grep -q "differ"; then ok "differing in-tree and beside copies fail"; else bad "copy mismatch not named: $out"; fi
+	if out="$(verify_manifest "$mt")"; then bad "differing manifest copies verified"; elif grep_text "$out" -q "differ"; then ok "differing in-tree and beside copies fail"; else bad "copy mismatch not named: $out"; fi
 	rm "$mt.$MANIFEST_NAME"
 	if verify_manifest "$mt" >/dev/null; then bad "a missing beside copy verified"; else ok "a missing beside copy fails"; fi
 	"$self" --rewrite-manifest "$mt" >/dev/null
@@ -1330,7 +1648,7 @@ cat "%s" >&2
 	if [ "$out" = "cp-payload/kine cp-payload/kube-apiserver " ]; then ok "upstream digests cover exactly cp-payload"; else bad "upstream digest paths: '$out'"; fi
 	if out="$(refuse_unpinned_payload "$rt" "$PINNED_SOURCE_FILES")"; then
 		bad "release refusal let an unpinned payload through"
-	elif printf '%s\n' "$out" | grep -q "cp-payload/kine" && ! printf '%s\n' "$out" | grep -q "cp-payload/kube-apiserver"; then
+	elif grep_text "$out" -q "cp-payload/kine" && ! grep_text "$out" -q "cp-payload/kube-apiserver"; then
 		ok "the unpinned kine is refused, the pinned-source kube-apiserver is not"
 	else
 		bad "refusal did not name exactly the unpinned file: $out"
@@ -1341,20 +1659,20 @@ cat "%s" >&2
 	if [ "$PINNED_SOURCE_FILES" = "$("$HERE/build-cp.sh" --print-outputs)" ]; then ok "PINNED_SOURCE_FILES = build-cp.sh --print-outputs"; else bad "PINNED_SOURCE_FILES differs from build-cp.sh --print-outputs"; fi
 	if out="$("$self" "$tmp/release-out" --release 2>&1)"; then
 		bad "--release staging without --cp-build did not refuse"
-	elif printf '%s\n' "$out" | grep -q "build-cp.sh"; then ok "--release without --cp-build refuses, naming build-cp.sh"; else bad "--release refused without naming build-cp.sh: $out"; fi
+	elif grep_text "$out" -q "build-cp.sh"; then ok "--release without --cp-build refuses, naming build-cp.sh"; else bad "--release refused without naming build-cp.sh: $out"; fi
 	local cb="$tmp/cp-build" rel
 	mkdir -p "$cb"
 	while IFS= read -r rel; do printf 'built-%s\n' "${rel#cp-payload/}" >"$cb/${rel#cp-payload/}"; done <<<"$PINNED_SOURCE_FILES"
-	if out="$(cp_build_problems "$cb")"; then bad "a --cp-build without its stamp passed"; elif printf '%s\n' "$out" | grep -q "lacks $CP_STAMP_NAME"; then ok "a --cp-build without $CP_STAMP_NAME is refused"; else bad "the missing stamp was not named: $out"; fi
+	if out="$(cp_build_problems "$cb")"; then bad "a --cp-build without its stamp passed"; elif grep_text "$out" -q "lacks $CP_STAMP_NAME"; then ok "a --cp-build without $CP_STAMP_NAME is refused"; else bad "the missing stamp was not named: $out"; fi
 	printf 'cache-key: vX-goY-0000000000000000\ntoolchain: %s (fixture)\n' "$PAYLOAD_GO_VERSION" >"$cb/$CP_STAMP_NAME"
 	if cp_build_problems "$cb" >/dev/null; then ok "a complete --cp-build passes"; else bad "a complete --cp-build was refused"; fi
 	printf 'x\n' >"$cb/extra"
-	if out="$(cp_build_problems "$cb")"; then bad "an extra file in --cp-build passed"; elif printf '%s\n' "$out" | grep -q "unexpected extra"; then ok "an extra --cp-build file is refused"; else bad "extra file not named: $out"; fi
+	if out="$(cp_build_problems "$cb")"; then bad "an extra file in --cp-build passed"; elif grep_text "$out" -q "unexpected extra"; then ok "an extra --cp-build file is refused"; else bad "extra file not named: $out"; fi
 	rm "$cb/extra" "$cb/kubectl"
-	if out="$(cp_build_problems "$cb")"; then bad "a --cp-build missing kubectl passed"; elif printf '%s\n' "$out" | grep -q "lacks kubectl"; then ok "a missing --cp-build file is refused"; else bad "missing file not named: $out"; fi
+	if out="$(cp_build_problems "$cb")"; then bad "a --cp-build missing kubectl passed"; elif grep_text "$out" -q "lacks kubectl"; then ok "a missing --cp-build file is refused"; else bad "missing file not named: $out"; fi
 	if out="$("$self" "$tmp/release-out2" --release --cp-build "$cb" 2>&1)"; then
 		bad "--release with an incomplete --cp-build did not refuse"
-	elif printf '%s\n' "$out" | grep -q "lacks kubectl"; then ok "--release refuses an incomplete --cp-build before building"; else bad "--release did not name the incomplete --cp-build: $out"; fi
+	elif grep_text "$out" -q "lacks kubectl"; then ok "--release refuses an incomplete --cp-build before building"; else bad "--release did not name the incomplete --cp-build: $out"; fi
 	printf 'built-kubectl\n' >"$cb/kubectl"
 	local pt="$tmp/placed"
 	mkdir -p "$pt/cp-payload"
@@ -1374,18 +1692,18 @@ cat "%s" >&2
 	if grep -qx "STAMP_NAME=\"$CP_STAMP_NAME\"" "$HERE/build-cp.sh"; then ok "CP_STAMP_NAME = build-cp.sh's STAMP_NAME"; else bad "build-cp.sh does not write $CP_STAMP_NAME"; fi
 	if out="$("$self" "$tmp/release-out3" --release --cp-build "$cb" 2>&1)"; then
 		bad "--release with a stale --cp-build stamp did not refuse"
-	elif printf '%s\n' "$out" | grep -q "is not build-cp.sh's build for"; then ok "--release refuses a --cp-build built for another cache key"; else bad "--release did not name the stale stamp: $out"; fi
+	elif grep_text "$out" -q "is not build-cp.sh's build for"; then ok "--release refuses a --cp-build built for another cache key"; else bad "--release did not name the stale stamp: $out"; fi
 	chmod 0775 "$cb"
 	if out="$("$self" "$tmp/release-out4" --release --cp-build "$cb/" 2>&1)"; then
 		bad "--release with a group-writable --cp-build did not refuse"
-	elif printf '%s\n' "$out" | grep -q -- "--cp-build $cb is writable by group or other"; then ok "--release refuses a group-writable --cp-build directory"; else bad "--release did not name the group-writable --cp-build: $out"; fi
+	elif grep_text "$out" -q -- "--cp-build $cb is writable by group or other"; then ok "--release refuses a group-writable --cp-build directory"; else bad "--release did not name the group-writable --cp-build: $out"; fi
 	chmod 0755 "$cb"
 	local cbp
 	cbp="$(mktemp -d "$tmp/cbparent.XXXXXX")"
 	cp -R "$cb" "$cbp/build" && chmod 0757 "$cbp"
 	if out="$("$self" "$tmp/release-out5" --release --cp-build "$cbp/build" 2>&1)"; then
 		bad "--release with an other-writable --cp-build parent did not refuse"
-	elif printf '%s\n' "$out" | grep -q -- "--cp-build's parent $cbp is writable by group or other"; then ok "--release refuses a --cp-build whose parent is writable by others"; else bad "--release did not name the writable parent: $out"; fi
+	elif grep_text "$out" -q -- "--cp-build's parent $cbp is writable by group or other"; then ok "--release refuses a --cp-build whose parent is writable by others"; else bad "--release did not name the writable parent: $out"; fi
 	chmod 0700 "$cbp"
 	ln -s "$cb" "$tmp/cb-link"
 	if "$self" "$tmp/release-out6" --release --cp-build "$tmp/cb-link" >/dev/null 2>&1; then bad "--release accepted a symlinked --cp-build"; else ok "--release refuses a symlinked --cp-build"; fi
@@ -1447,27 +1765,27 @@ FAKEGO
 	# snapshot of <dir>'s stamp, with the fake toolchain.
 	cbc() { GO="$fgo" cp_build_check "$1" "$2" "${3-$fraises}" "${4:-$fhash}" "$(cat "$1/$CP_STAMP_NAME")"; }
 	if out="$(cbc "$fx" "$fkey")"; then ok "a build matching its stamp passes"; else bad "a matching build was refused: $out"; fi
-	if out="$(cbc "$fx" "v1.0.0-go1.0.0-1111111111111111")"; then bad "a stamp for another cache key passed"; elif printf '%s\n' "$out" | grep -q "does not name cache key"; then ok "a stamp for another cache key is refused"; else bad "the key mismatch was not named: $out"; fi
+	if out="$(cbc "$fx" "v1.0.0-go1.0.0-1111111111111111")"; then bad "a stamp for another cache key passed"; elif grep_text "$out" -q "does not name cache key"; then ok "a stamp for another cache key is refused"; else bad "the key mismatch was not named: $out"; fi
 	if (PAYLOAD_GO_VERSION=go1.0.1 cbc "$fx" "$fkey" >/dev/null); then bad "a build for another toolchain passed"; else ok "a stamp and binaries for another toolchain are refused"; fi
-	if out="$(cbc "$fx" "$fkey" "$fraises" "$(printf 'e%.0s' $(seq 1 64))")"; then bad "a stamp whose raise-list-sha256 is not build-cp's passed"; elif printf '%s\n' "$out" | grep -q "does not name raise-list-sha256"; then ok "a stamp whose raise-list-sha256 is not build-cp.sh's live hash is refused"; else bad "the raise hash mismatch was not named: $out"; fi
+	if out="$(cbc "$fx" "$fkey" "$fraises" "$(printf 'e%.0s' $(seq 1 64))")"; then bad "a stamp whose raise-list-sha256 is not build-cp's passed"; elif grep_text "$out" -q "does not name raise-list-sha256"; then ok "a stamp whose raise-list-sha256 is not build-cp.sh's live hash is refused"; else bad "the raise hash mismatch was not named: $out"; fi
 	if out="$(cbc "$fx" "$fkey" "example.com/raised v1.3.0")"; then
 		bad "a stamp whose raise lines differ from the live RAISES passed"
-	elif printf '%s\n' "$out" | grep -q "raise-list lines are not build-cp.sh's live raise list"; then ok "a stamp whose raise lines differ from build-cp.sh's live RAISES is refused"; else bad "the raise-line mismatch was not named: $out"; fi
+	elif grep_text "$out" -q "raise-list lines are not build-cp.sh's live raise list"; then ok "a stamp whose raise lines differ from build-cp.sh's live RAISES is refused"; else bad "the raise-line mismatch was not named: $out"; fi
 	cp "$fx/kubectl" "$tmp/kubectl.keep" && printf 'tampered\n' >>"$fx/kubectl"
-	if out="$(cbc "$fx" "$fkey")"; then bad "a binary whose bytes moved after the stamp passed"; elif printf '%s\n' "$out" | grep -q "kubectl: sha256 .* is not the one $CP_STAMP_NAME records"; then ok "a binary whose sha256 is not the stamp's is refused"; else bad "the digest mismatch was not named: $out"; fi
+	if out="$(cbc "$fx" "$fkey")"; then bad "a binary whose bytes moved after the stamp passed"; elif grep_text "$out" -q "kubectl: sha256 .* is not the one $CP_STAMP_NAME records"; then ok "a binary whose sha256 is not the stamp's is refused"; else bad "the digest mismatch was not named: $out"; fi
 	cp "$tmp/kubectl.keep" "$fx/kubectl"
 	grep '^sha256: .* kubectl$' "$fx/$CP_STAMP_NAME" >"$tmp/dup-line" && cat "$tmp/dup-line" >>"$fx/$CP_STAMP_NAME"
 	if cbc "$fx" "$fkey" >/dev/null; then bad "a stamp recording kubectl twice passed"; else ok "a stamp recording a binary twice is refused"; fi
 	fake_cp_build "$fx" "$fkey"
 	sed -i '' -e 's/^version v1.0.0$/version vX/' -e '/^built /d' "$fx/kube-scheduler"
 	(cd "$fx" && awk -v s="$(shasum -a 256 kube-scheduler | awk '{print $1}')" '$1 == "sha256:" && $3 == "kube-scheduler" { $2 = s } { print }' "$CP_STAMP_NAME" >"$CP_STAMP_NAME.n" && mv "$CP_STAMP_NAME.n" "$CP_STAMP_NAME")
-	if out="$(cbc "$fx" "$fkey")"; then bad "a binary without the tag's version string passed"; elif printf '%s\n' "$out" | grep -q "kube-scheduler: carries no v1.0.0 version string"; then ok "a binary without the tag's version string is refused"; else bad "the missing tag was not named: $out"; fi
+	if out="$(cbc "$fx" "$fkey")"; then bad "a binary without the tag's version string passed"; elif grep_text "$out" -q "kube-scheduler: carries no v1.0.0 version string"; then ok "a binary without the tag's version string is refused"; else bad "the missing tag was not named: $out"; fi
 	fake_cp_build "$fx" "$fkey"
 	printf 'raise-list: example.com/unlinked v1.0.0 2026-01-01T00:00:00Z GO-2026-0002\n' >>"$fx/$CP_STAMP_NAME"
-	if out="$(cbc "$fx" "$fkey" "$(printf '%s\nexample.com/unlinked v1.0.0' "$fraises")")"; then bad "a raised module no binary links passed"; elif printf '%s\n' "$out" | grep -q "no control-plane binary links raised example.com/unlinked"; then ok "a raised module that no binary links is refused"; else bad "the unlinked raise was not named: $out"; fi
+	if out="$(cbc "$fx" "$fkey" "$(printf '%s\nexample.com/unlinked v1.0.0' "$fraises")")"; then bad "a raised module no binary links passed"; elif grep_text "$out" -q "no control-plane binary links raised example.com/unlinked"; then ok "a raised module that no binary links is refused"; else bad "the unlinked raise was not named: $out"; fi
 	fake_cp_build "$fx" "$fkey"
 	sed -i '' 's|^raise-list: example.com/raised v1.2.0|raise-list: example.com/raised v1.3.0|' "$fx/$CP_STAMP_NAME"
-	if out="$(cbc "$fx" "$fkey" "example.com/raised v1.3.0")"; then bad "a raised module linked at another version passed"; elif printf '%s\n' "$out" | grep -q "links example.com/raised v1.2.0, the raise list lands it at v1.3.0"; then ok "a raised module linked at another version than the live raise list is refused"; else bad "the raise version mismatch was not named: $out"; fi
+	if out="$(cbc "$fx" "$fkey" "example.com/raised v1.3.0")"; then bad "a raised module linked at another version passed"; elif grep_text "$out" -q "links example.com/raised v1.2.0, the raise list lands it at v1.3.0"; then ok "a raised module linked at another version than the live raise list is refused"; else bad "the raise version mismatch was not named: $out"; fi
 
 	echo "==> a binary swapped in the build after its check never reaches the payload"
 	fake_cp_build "$fx" "$fkey"
@@ -1481,7 +1799,7 @@ FAKEGO
 	place_cp_build "$fx" "$swp" || bad "place_cp_build failed on the swap fixture"
 	if out="$(GO="$fgo" cp_set_check "$swp" v1.0.0 "$fraises" "$snap")"; then
 		bad "a binary swapped after the check passed the placed-copy check"
-	elif printf '%s\n' "$out" | grep -q "$swp/kubectl: sha256 .* is not the one $CP_STAMP_NAME records"; then ok "the placed copy of a binary swapped after the check is refused against the snapshot"; else bad "the swapped placed copy was not named: $out"; fi
+	elif grep_text "$out" -q "$swp/kubectl: sha256 .* is not the one $CP_STAMP_NAME records"; then ok "the placed copy of a binary swapped after the check is refused against the snapshot"; else bad "the swapped placed copy was not named: $out"; fi
 	if GO="$fgo" cp_set_check "$swp" v1.0.0 "$fraises" "$(cat "$fx/$CP_STAMP_NAME")" >/dev/null; then ok "(the rewritten stamp alone would have passed it: the snapshot is what refuses)"; else bad "the swap fixture is not a consistent rewrite"; fi
 	fake_cp_build "$fx" "$fkey"
 	rm -rf "$swp" && mkdir -p "$swp" && place_cp_build "$fx" "$swp"
@@ -1492,7 +1810,7 @@ FAKEGO
 	mkdir -p "$croot" && chmod 0700 "$croot"
 	if cache_root_problems "$croot" >/dev/null; then ok "a 0700 cache root of the effective uid passes"; else bad "a private cache root was refused"; fi
 	chmod 0775 "$croot"
-	if out="$(cache_root_problems "$croot")"; then bad "a group-writable cache root passed"; elif printf '%s\n' "$out" | grep -q "writable by group or other"; then ok "a group-writable cache root is refused"; else bad "the group-writable root was not named: $out"; fi
+	if out="$(cache_root_problems "$croot")"; then bad "a group-writable cache root passed"; elif grep_text "$out" -q "writable by group or other"; then ok "a group-writable cache root is refused"; else bad "the group-writable root was not named: $out"; fi
 	chmod 0757 "$croot"
 	if cache_root_problems "$croot" >/dev/null; then bad "an other-writable cache root passed"; else ok "an other-writable cache root is refused"; fi
 	if cache_root_problems /usr >/dev/null; then bad "a root-owned cache root passed"; else ok "a cache root owned by another uid is refused"; fi
@@ -1551,7 +1869,7 @@ FAILCP
 	if GO="$fgo" lab_cp_build "$cache" "$fb" >/dev/null 2>&1; then bad "a malformed cache key was accepted"; else ok "a malformed cache key is refused"; fi
 	printf '%s' "$key1" >"$tmp/fake-key"
 	chmod 0770 "$cache"
-	if out="$(GO="$fgo" lab_cp_build "$cache" "$fb" 2>&1)"; then bad "lab staging used a group-writable cache root"; elif printf '%s\n' "$out" | grep -q "writable by group or other"; then ok "lab staging refuses a group-writable cache root"; else bad "the cache root refusal: $out"; fi
+	if out="$(GO="$fgo" lab_cp_build "$cache" "$fb" 2>&1)"; then bad "lab staging used a group-writable cache root"; elif grep_text "$out" -q "writable by group or other"; then ok "lab staging refuses a group-writable cache root"; else bad "the cache root refusal: $out"; fi
 	chmod 0700 "$cache"
 
 	# End to end: lab staging runs the build-cp.sh beside it (no override exists,
@@ -1575,7 +1893,7 @@ FAILCP
 	chmod 0755 "$fbin/go" "$tree/hack/release/build-cp.sh" "$tree/hack/release/stage.sh"
 	if out="$(PATH="$fbin:$PATH" GO=go BUILD_CP=/usr/bin/false K3SM_CP_CACHE="$tmp/e2e-cache" "$tree/hack/release/stage.sh" "$tmp/lab-out" 2>&1)"; then
 		bad "lab staging went on after build-cp failed"
-	elif printf '%s\n' "$out" | grep -q "could not produce the control-plane binaries with hack/release/build-cp.sh"; then
+	elif grep_text "$out" -q "could not produce the control-plane binaries with hack/release/build-cp.sh"; then
 		case "$(cat "$e2e" 2>/dev/null)" in
 		"$(cd "$tmp/e2e-cache" && pwd -P)/.partial."??????) ok "lab staging runs the build-cp.sh beside it into its cache, ignores a BUILD_CP override, and stops when it fails" ;;
 		*) bad "lab staging ran build-cp into '$(cat "$e2e" 2>/dev/null)'" ;;
@@ -1585,24 +1903,46 @@ FAILCP
 	fi
 	if [ ! -e "$tmp/lab-out/k3sm" ]; then ok "nothing was built before the control-plane binaries were in hand"; else bad "k3sm was built before build-cp ran"; fi
 
-	echo "==> --release accepts k3sm's own kine/etcd/etcdutl/zot/helm builds, still refuses kube.version"
+	echo "==> --release accepts k3sm's own kine/etcd/etcdutl/zot/helm builds and a proven kube.version"
 	read_pins
-	local kb="$tmp/k3sm-built" rpf
+	local kb="$tmp/k3sm-built" rpf kstamp
 	rpf="$(release_payload_files)"
 	mkdir -p "$kb/cp-payload"
 	while IFS= read -r rel; do printf 'x\n' >"$kb/$rel"; done <<<"$rpf"
-	if printf '%s\n' "$rpf" | grep -qxF "cp-payload/$HELM_BINARY" && printf '%s\n' "$rpf" | grep -qxF cp-payload/helm.version && printf '%s\n' "$rpf" | grep -qxF cp-payload/zot && printf '%s\n' "$rpf" | grep -qxF cp-payload/zot.version; then
-		ok "the release list names $HELM_BINARY, helm.version, zot and zot.version"
+	printf '%s\n' "$KUBE_VERSION" >"$kb/$KUBE_MARKER_FILE"
+	kstamp="$(printf 'build-cp stamp\ntag: %s (commit 0)\ntoolchain: %s (the source'"'"'s .go-version: go1.0.0)\n' "$KUBE_VERSION" "$PAYLOAD_GO_VERSION")"
+	if grep_text "$rpf" -qxF "cp-payload/$HELM_BINARY" && grep_text "$rpf" -qxF cp-payload/helm.version && grep_text "$rpf" -qxF cp-payload/zot && grep_text "$rpf" -qxF cp-payload/zot.version && grep_text "$rpf" -qxF cp-payload/kube.version; then
+		ok "the release list names $HELM_BINARY, helm.version, zot, zot.version and kube.version"
 	else
-		bad "the release list lacks helm or zot: $rpf"
+		bad "the release list lacks helm, zot or kube.version: $rpf"
 	fi
-	if out="$(refuse_unpinned_payload "$kb" "$rpf")"; then ok "kine, etcd, etcdutl, zot, helm and their markers pass the release refusal"; else bad "k3sm's own builds or the pinned helm were refused: $out"; fi
-	printf 'x\n' >"$kb/cp-payload/kube.version"
+	if out="$(refuse_unpinned_payload "$kb" "$rpf")"; then ok "kine, etcd, etcdutl, zot, helm, kube.version and their markers pass the release refusal"; else bad "k3sm's own builds, kube.version or the pinned helm were refused: $out"; fi
+	if out="$(kube_marker_problems "$kb" "$kstamp" "$KUBE_VERSION")"; then ok "a kube.version of exactly \"$KUBE_VERSION\\n\" passes the content proof"; else bad "a correct kube.version was refused: $out"; fi
+	local kc
+	for kc in 'v1.36.0\n' 'x\n' "$KUBE_VERSION" "$KUBE_VERSION\\n$KUBE_VERSION\\n" "$KUBE_VERSION\\n\\n"; do
+		# shellcheck disable=SC2059 # the case is the format: it carries the escapes
+		printf "$kc" >"$kb/$KUBE_MARKER_FILE"
+		if out="$(kube_marker_problems "$kb" "$kstamp" "$KUBE_VERSION")"; then
+			bad "a kube.version of '$kc' passed the content proof"
+		elif grep_text "$out" -qF "cp-payload/kube.version: content is not exactly \"$KUBE_VERSION\\n\""; then
+			ok "a kube.version of '$kc' is refused, naming the file and the expected content"
+		else
+			bad "a kube.version of '$kc' was refused for the wrong reason: $out"
+		fi
+	done
+	rm -f "$kb/$KUBE_MARKER_FILE"
+	ln -s "$kb/cp-payload/kine.version" "$kb/$KUBE_MARKER_FILE"
+	if out="$(kube_marker_problems "$kb" "$kstamp" "$KUBE_VERSION")"; then bad "a symlinked kube.version passed the content proof"; elif grep_text "$out" -qF "cp-payload/kube.version: missing or not a regular file"; then ok "a symlinked kube.version is refused"; else bad "a symlinked kube.version was refused for the wrong reason: $out"; fi
+	rm -f "$kb/$KUBE_MARKER_FILE"
+	if out="$(kube_marker_problems "$kb" "$kstamp" "$KUBE_VERSION")"; then bad "a missing kube.version passed the content proof"; else ok "a missing kube.version is refused"; fi
+	printf '%s\n' "$KUBE_VERSION" >"$kb/$KUBE_MARKER_FILE"
+	if out="$(kube_marker_problems "$kb" "$kstamp" "v0.0.0")"; then bad "a stamp tag other than DefaultKubeVersion passed the content proof"; elif grep_text "$out" -qF "DefaultKubeVersion is 'v0.0.0'"; then ok "a --cp-build tag other than DefaultKubeVersion is refused"; else bad "a tag mismatch was refused for the wrong reason: $out"; fi
+	if out="$(kube_marker_problems "$kb" "build-cp stamp" "$KUBE_VERSION")"; then bad "a stamp without a tag line passed the content proof"; else ok "a stamp without a tag line is refused"; fi
 	printf 'x\n' >"$kb/cp-payload/helm-v0.0.0"
 	if out="$(refuse_unpinned_payload "$kb" "$rpf")"; then
-		bad "kube.version or an unpinned helm passed the release refusal"
-	elif printf '%s\n' "$out" | grep -q "kube.version" && printf '%s\n' "$out" | grep -q "helm-v0.0.0" && ! printf '%s\n' "$out" | grep -Eq "cp-payload/(kine|etcd|zot|$HELM_BINARY)\$"; then
-		ok "kube.version and a helm at another version are refused, the pinned set is not"
+		bad "an unpinned helm passed the release refusal"
+	elif grep_text "$out" -q "helm-v0.0.0" && ! grep_text "$out" -Eq "cp-payload/(kine|etcd|zot|kube\.version|$HELM_BINARY)\$"; then
+		ok "a helm at another version is refused, the pinned set and kube.version are not"
 	else
 		bad "release refusal named the wrong files: $out"
 	fi
@@ -1615,24 +1955,24 @@ FAILCP
 		else
 			echo "  FAIL  read_pins: kine '$KINE_VERSION' '$KINE_VARIANT' '$KINE_PATCH', etcd '$ETCD_VERSION' '$ETCD_VARIANT'"; exit 1
 		fi
-		if printf '%s' "$ZOT_VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' && [ "$ZOT_VARIANT" = "minimal+r1" ] && [ "$HELM_BINARY" = "helm-$HELM_VERSION" ] &&
-			printf '%s' "$HELM_VARIANT" | grep -Eq '^nocgo\+deps[0-9]+$' && printf '%s' "$HELM_RAISED" | tr ' ' '\n' | grep -qx 'golang.org/x/crypto@v[0-9.]*' && printf '%s' "$HELM_RAISED" | tr ' ' '\n' | grep -qx 'golang.org/x/net@v[0-9.]*'; then
+		if grep_text "$ZOT_VERSION" -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' && [ "$ZOT_VARIANT" = "minimal+r1" ] && [ "$HELM_BINARY" = "helm-$HELM_VERSION" ] &&
+			grep_text "$HELM_VARIANT" -Eq '^nocgo\+deps[0-9]+$' && ! grep_text "$(printf '%s' "$HELM_RAISED" | tr ' ' '\n')" -vqx '[a-z0-9./-]*@v[0-9.]*' && grep_text "$(printf '%s' "$HELM_RAISED" | tr ' ' '\n')" -qx 'golang.org/x/net@v[0-9.]*'; then
 			echo "  ok    read_pins: zot $ZOT_VERSION $ZOT_VARIANT, $HELM_BINARY $HELM_VARIANT raised $HELM_RAISED"
 		else
 			echo "  FAIL  read_pins: zot '$ZOT_VERSION' '$ZOT_VARIANT', helm '$HELM_BINARY' '$HELM_VARIANT' '$HELM_RAISED'"; exit 1
 		fi
-		if printf '%s' "$XNET_FLOOR" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+		if grep_text "$XNET_FLOOR" -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
 			echo "  ok    read_pins: kine and zot raise golang.org/x/net to $XNET_FLOOR"
 		else
 			echo "  FAIL  read_pins: XNET_FLOOR '$XNET_FLOOR'"; exit 1
 		fi
-		if printf '%s' "$HELM_COMMIT" | grep -Eq '^[0-9a-f]{40}$' && [ "$(printf '%s\n%s\n' "$HELM_MIN_GO" "$PAYLOAD_GO_VERSION" | sort -V | head -1)" = "$HELM_MIN_GO" ]; then
+		if grep_text "$HELM_COMMIT" -Eq '^[0-9a-f]{40}$' && [ "$(printf '%s\n%s\n' "$HELM_MIN_GO" "$PAYLOAD_GO_VERSION" | sort -V | sed -n 1p)" = "$HELM_MIN_GO" ]; then
 			echo "  ok    read_pins: helm commit $HELM_COMMIT; PAYLOAD_GO_VERSION $PAYLOAD_GO_VERSION is not older than HelmMinGoVersion $HELM_MIN_GO"
 		else
 			echo "  FAIL  read_pins: helm commit '$HELM_COMMIT', HelmMinGoVersion '$HELM_MIN_GO' newer than PAYLOAD_GO_VERSION $PAYLOAD_GO_VERSION?"; exit 1
 		fi
 	) || fails=$((fails + 1))
-	if printf '%s\n' "$PAYLOAD_GO_VERSION" | grep -Eq '^go[0-9]+\.[0-9]+\.[0-9]+$'; then ok "PAYLOAD_GO_VERSION is an exact release ($PAYLOAD_GO_VERSION)"; else bad "PAYLOAD_GO_VERSION '$PAYLOAD_GO_VERSION' is not an exact goX.Y.Z"; fi
+	if grep_text "$PAYLOAD_GO_VERSION" -Eq '^go[0-9]+\.[0-9]+\.[0-9]+$'; then ok "PAYLOAD_GO_VERSION is an exact release ($PAYLOAD_GO_VERSION)"; else bad "PAYLOAD_GO_VERSION '$PAYLOAD_GO_VERSION' is not an exact goX.Y.Z"; fi
 	# A fake go: `env GOVERSION` prints $FAKE_GOVERSION (and records GOTOOLCHAIN),
 	# `version -m <f>` prints the fixture for <f>'s base name.
 	local fgo="$tmp/fake-go"
@@ -1647,12 +1987,12 @@ FAKE
 	chmod +x "$fgo"
 	if GO="$fgo" FAKE_GOVERSION=go1.27.3 toolchain_problems go1.27.3 >/dev/null; then ok "the pinned toolchain passes"; else bad "the pinned toolchain was refused"; fi
 	if [ "$(cat "$tmp/fake-go.toolchain")" = local ]; then ok "the assert asks with GOTOOLCHAIN=local, as the payload build runs"; else bad "the assert did not set GOTOOLCHAIN=local"; fi
-	if out="$(GO="$fgo" FAKE_GOVERSION=go1.27.1 toolchain_problems go1.27.3)"; then bad "another toolchain passed"; elif printf '%s\n' "$out" | grep -q "go1.27.1.*pin go1.27.3"; then ok "another toolchain is refused, naming both"; else bad "toolchain refusal not named: $out"; fi
+	if out="$(GO="$fgo" FAKE_GOVERSION=go1.27.1 toolchain_problems go1.27.3)"; then bad "another toolchain passed"; elif grep_text "$out" -q "go1.27.1.*pin go1.27.3"; then ok "another toolchain is refused, naming both"; else bad "toolchain refusal not named: $out"; fi
 	if GO="$fgo" FAKE_GOVERSION='' toolchain_problems go1.27.3 >/dev/null; then bad "a failing go passed"; else ok "a go that cannot report its version is refused"; fi
 	# PATH holds no go, so even a broken assert could not build anything here.
 	if out="$(PATH=/usr/bin:/bin GO="$fgo" FAKE_GOVERSION=go1.0.0 "$self" "$tmp/stage-oldgo" 2>&1)"; then
 		bad "staging with a non-pinned go exited 0"
-	elif printf '%s\n' "$out" | grep -q "go1.0.0.*pin $PAYLOAD_GO_VERSION" && [ -z "$(ls -A "$tmp/stage-oldgo")" ]; then
+	elif grep_text "$out" -q "go1.0.0.*pin $PAYLOAD_GO_VERSION" && [ -z "$(ls -A "$tmp/stage-oldgo")" ]; then
 		ok "staging refuses a non-pinned go before building anything"
 	else
 		bad "staging with a non-pinned go did not refuse before building: $out"
@@ -1669,38 +2009,38 @@ FAKE
 		case "$kind" in kine) want=v0.17.2 ;; zot) want=v2.1.22 ;; *) want=v3.6.15 ;; esac
 		fx2="$td/goversion-$kind.txt"
 		if out="$(buildinfo_problems "$kind" "$want" go1.27.3 <"$fx2")"; then ok "$kind capture passes"; else bad "$kind capture rejected: $out"; fi
-		if out="$(buildinfo_problems "$kind" "$want" go1.27.9 <"$fx2")"; then bad "$kind: another toolchain passed"; elif printf '%s\n' "$out" | grep -q "built with 'go1.27.3'"; then ok "$kind: another toolchain is refused"; else bad "$kind: toolchain not named: $out"; fi
-		if out="$(sed 's/CGO_ENABLED=0/CGO_ENABLED=1/' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.3)"; then bad "$kind: a cgo build passed"; elif printf '%s\n' "$out" | grep -q "CGO_ENABLED=0"; then ok "$kind: a cgo build is refused"; else bad "$kind: cgo not named: $out"; fi
+		if out="$(buildinfo_problems "$kind" "$want" go1.27.9 <"$fx2")"; then bad "$kind: another toolchain passed"; elif grep_text "$out" -q "built with 'go1.27.3'"; then ok "$kind: another toolchain is refused"; else bad "$kind: toolchain not named: $out"; fi
+		if out="$(sed 's/CGO_ENABLED=0/CGO_ENABLED=1/' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.3)"; then bad "$kind: a cgo build passed"; elif grep_text "$out" -q "CGO_ENABLED=0"; then ok "$kind: a cgo build is refused"; else bad "$kind: cgo not named: $out"; fi
 		if out="$(grep -v -- '-trimpath' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.3)"; then bad "$kind: a build without -trimpath passed"; else ok "$kind: a build without -trimpath is refused"; fi
 		case "$kind" in
 		kine | zot)
-			if out="$(sed 's/\(golang\.org\/x\/net[[:space:]]\)v0\.60\.0/\1v0.59.0/' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.3)"; then bad "$kind: x/net v0.59.0 passed"; elif printf '%s\n' "$out" | grep -q "golang.org/x/net is v0.59.0, below the raised v0.60.0"; then ok "$kind: x/net v0.59.0 is reported"; else bad "$kind: x/net v0.59.0 not named: $out"; fi
+			if out="$(sed 's/\(golang\.org\/x\/net[[:space:]]\)v0\.60\.0/\1v0.59.0/' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.3)"; then bad "$kind: x/net v0.59.0 passed"; elif grep_text "$out" -q "golang.org/x/net is v0.59.0, below the raised v0.60.0"; then ok "$kind: x/net v0.59.0 is reported"; else bad "$kind: x/net v0.59.0 not named: $out"; fi
 			if out="$(sed 's/\(golang\.org\/x\/net[[:space:]]\)v0\.60\.0/\1v0.61.0/' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.3)"; then ok "$kind: a newer x/net passes"; else bad "$kind: a newer x/net was refused: $out"; fi
-			if out="$(grep -v 'golang\.org/x/net' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.3)"; then bad "$kind: a build info without x/net passed"; elif printf '%s\n' "$out" | grep -q "golang.org/x/net is not in the build info"; then ok "$kind: a missing x/net is reported"; else bad "$kind: missing x/net not named: $out"; fi
-			if out="$(XNET_FLOOR='' buildinfo_problems "$kind" "$want" go1.27.3 <"$fx2")"; then bad "$kind: passed with no x/net floor set"; elif printf '%s\n' "$out" | grep -q "no golang.org/x/net floor"; then ok "$kind: an unset x/net floor is refused"; else bad "$kind: unset floor not named: $out"; fi
+			if out="$(grep -v 'golang\.org/x/net' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.3)"; then bad "$kind: a build info without x/net passed"; elif grep_text "$out" -q "golang.org/x/net is not in the build info"; then ok "$kind: a missing x/net is reported"; else bad "$kind: missing x/net not named: $out"; fi
+			if out="$(XNET_FLOOR='' buildinfo_problems "$kind" "$want" go1.27.3 <"$fx2")"; then bad "$kind: passed with no x/net floor set"; elif grep_text "$out" -q "no golang.org/x/net floor"; then ok "$kind: an unset x/net floor is refused"; else bad "$kind: unset floor not named: $out"; fi
 			;;
 		esac
 		if out="$(sed 's/GOARCH=arm64/GOARCH=amd64/' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.3)"; then bad "$kind: an amd64 build passed"; else ok "$kind: an amd64 build is refused"; fi
-		if out="$(printf '%s\n\t=>\texample.com/fork\tv0.0.1\th1:x=\n' "$(cat "$fx2")" | buildinfo_problems "$kind" "$want" go1.27.3)"; then bad "$kind: a replaced module passed"; elif printf '%s\n' "$out" | grep -q "$kind: a module is replaced"; then ok "$kind: a replaced module is refused"; else bad "$kind: replace not named: $out"; fi
+		if out="$(printf '%s\n\t=>\texample.com/fork\tv0.0.1\th1:x=\n' "$(cat "$fx2")" | buildinfo_problems "$kind" "$want" go1.27.3)"; then bad "$kind: a replaced module passed"; elif grep_text "$out" -q "$kind: a module is replaced"; then ok "$kind: a replaced module is refused"; else bad "$kind: replace not named: $out"; fi
 		if out="$(sed 's/^\([[:space:]]*path[[:space:]]\).*/\1example.com\/other/' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.3)"; then bad "$kind: another main package passed"; else ok "$kind: another main package is refused"; fi
 	done
-	if out="$(buildinfo_problems etcd v3.6.14 go1.27.3 <"$td/goversion-etcd.txt")"; then bad "etcd at another version passed"; elif printf '%s\n' "$out" | grep -q "server/v3 is not at v3.6.14"; then ok "etcd at another version is refused"; else bad "etcd version not named: $out"; fi
+	if out="$(buildinfo_problems etcd v3.6.14 go1.27.3 <"$td/goversion-etcd.txt")"; then bad "etcd at another version passed"; elif grep_text "$out" -q "server/v3 is not at v3.6.14"; then ok "etcd at another version is refused"; else bad "etcd version not named: $out"; fi
 	if out="$(buildinfo_problems etcd v3.6.15 go1.27.3 <"$td/goversion-etcdutl.txt")"; then bad "etcdutl passed as etcd"; else ok "etcdutl does not pass as etcd"; fi
-	if out="$(buildinfo_problems zot v2.1.21 go1.27.3 <"$td/goversion-zot.txt")"; then bad "zot at another version passed"; elif printf '%s\n' "$out" | grep -q "zot/v2 is not at v2.1.21"; then ok "zot at another version is refused"; else bad "zot version not named: $out"; fi
-	if out="$(printf '%s\n\t=>\texample.com/fork\tv0.0.1\th1:x=\n' "$(cat "$td/goversion-etcd.txt")" | buildinfo_problems etcd v3.6.15 go1.27.3)"; then bad "a replaced module passed"; elif printf '%s\n' "$out" | grep -q "replaced"; then ok "a replaced module is refused"; else bad "replace not named: $out"; fi
+	if out="$(buildinfo_problems zot v2.1.21 go1.27.3 <"$td/goversion-zot.txt")"; then bad "zot at another version passed"; elif grep_text "$out" -q "zot/v2 is not at v2.1.21"; then ok "zot at another version is refused"; else bad "zot version not named: $out"; fi
+	if out="$(printf '%s\n\t=>\texample.com/fork\tv0.0.1\th1:x=\n' "$(cat "$td/goversion-etcd.txt")" | buildinfo_problems etcd v3.6.15 go1.27.3)"; then bad "a replaced module passed"; elif grep_text "$out" -q "replaced"; then ok "a replaced module is refused"; else bad "replace not named: $out"; fi
 	echo "==> the build stamp of helm (go version -m capture of the wrapper build; dep list trimmed)"
-	local hraised="golang.org/x/crypto@v0.57.0 golang.org/x/net@v0.60.0" hfx="$td/goversion-helm-v4.3.0.txt"
-	if out="$(helm_buildinfo_problems v4.3.0 go1.27.3 "$hraised" <"$hfx")"; then ok "helm capture passes"; else bad "helm capture rejected: $out"; fi
-	if out="$(helm_buildinfo_problems v4.3.0 go1.27.9 "$hraised" <"$hfx")"; then bad "helm: another toolchain passed"; elif printf '%s\n' "$out" | grep -q "helm: built with 'go1.27.3', the payload pins go1.27.9"; then ok "helm: a build on another toolchain is refused, naming both"; else bad "helm: toolchain not named: $out"; fi
-	if out="$(sed '1s/go1.27.3$/go1.27.1/' "$hfx" | helm_buildinfo_problems v4.3.0 go1.27.3 "$hraised")"; then bad "helm: the upstream release's go1.27.1 passed"; elif printf '%s\n' "$out" | grep -q "built with 'go1.27.1'"; then ok "helm: a build-info line on go1.27.1 (the upstream tarball's toolchain) is refused"; else bad "helm: go1.27.1 not named: $out"; fi
-	if out="$(sed 's/v0.60.0/v0.57.0/' "$hfx" | helm_buildinfo_problems v4.3.0 go1.27.3 "$hraised")"; then bad "helm: helm's own x/net passed"; elif printf '%s\n' "$out" | grep -q "golang.org/x/net is not at the raised v0.60.0"; then ok "helm: a build without the raised x/net is refused"; else bad "helm: raised x/net not named: $out"; fi
-	if out="$(grep -v 'golang.org/x/crypto' "$hfx" | helm_buildinfo_problems v4.3.0 go1.27.3 "$hraised")"; then bad "helm: a build without x/crypto passed"; elif printf '%s\n' "$out" | grep -q "golang.org/x/crypto is not at the raised v0.57.0"; then ok "helm: a build without the raised x/crypto is refused"; else bad "helm: raised x/crypto not named: $out"; fi
-	if out="$(helm_buildinfo_problems v4.3.1 go1.27.3 "$hraised" <"$hfx")"; then bad "helm at another version passed"; elif printf '%s\n' "$out" | grep -q "helm.sh/helm/v4 is not at v4.3.1"; then ok "helm at another version is refused"; else bad "helm version not named: $out"; fi
-	if out="$(sed 's/CGO_ENABLED=0/CGO_ENABLED=1/' "$hfx" | helm_buildinfo_problems v4.3.0 go1.27.3 "$hraised")"; then bad "helm: a cgo build passed"; else ok "helm: a cgo build is refused"; fi
-	if out="$(grep -v -- '-trimpath' "$hfx" | helm_buildinfo_problems v4.3.0 go1.27.3 "$hraised")"; then bad "helm: a build without -trimpath passed"; else ok "helm: a build without -trimpath is refused"; fi
-	if out="$(sed 's/GOARCH=arm64/GOARCH=amd64/' "$hfx" | helm_buildinfo_problems v4.3.0 go1.27.3 "$hraised")"; then bad "helm: an amd64 build passed"; else ok "helm: an amd64 build is refused"; fi
-	if out="$(printf '%s\n\t=>\texample.com/fork\tv0.0.1\th1:x=\n' "$(cat "$hfx")" | helm_buildinfo_problems v4.3.0 go1.27.3 "$hraised")"; then bad "helm: a replaced module passed"; elif printf '%s\n' "$out" | grep -q "replaced"; then ok "helm: a replaced module is refused"; else bad "helm: replace not named: $out"; fi
-	if out="$(helm_buildinfo_problems v4.3.0 go1.27.3 "" <"$hfx")"; then bad "helm: an empty raised set passed"; else ok "helm: an empty raised set is refused, never a vacuous pass"; fi
+	local hraised="golang.org/x/net@v0.62.0" hfx="$td/goversion-helm-v4.3.1.txt"
+	if out="$(helm_buildinfo_problems v4.3.1 go1.27.3 "$hraised" <"$hfx")"; then ok "helm capture passes"; else bad "helm capture rejected: $out"; fi
+	if out="$(helm_buildinfo_problems v4.3.1 go1.27.9 "$hraised" <"$hfx")"; then bad "helm: another toolchain passed"; elif grep_text "$out" -q "helm: built with 'go1.27.3', the payload pins go1.27.9"; then ok "helm: a build on another toolchain is refused, naming both"; else bad "helm: toolchain not named: $out"; fi
+	if out="$(sed '1s/go1.27.3$/go1.27.1/' "$hfx" | helm_buildinfo_problems v4.3.1 go1.27.3 "$hraised")"; then bad "helm: the upstream release's go1.27.1 passed"; elif grep_text "$out" -q "built with 'go1.27.1'"; then ok "helm: a build-info line on go1.27.1 (the upstream tarball's toolchain) is refused"; else bad "helm: go1.27.1 not named: $out"; fi
+	if out="$(sed 's/v0.62.0/v0.60.0/' "$hfx" | helm_buildinfo_problems v4.3.1 go1.27.3 "$hraised")"; then bad "helm: helm's own x/net passed"; elif grep_text "$out" -q "golang.org/x/net is not at the raised v0.62.0"; then ok "helm: a build without the raised x/net is refused"; else bad "helm: raised x/net not named: $out"; fi
+	if out="$(grep -v 'golang.org/x/crypto' "$hfx" | helm_buildinfo_problems v4.3.1 go1.27.3 "$hraised golang.org/x/crypto@v0.58.0")"; then bad "helm: a build without x/crypto passed"; elif grep_text "$out" -q "golang.org/x/crypto is not at the raised v0.58.0"; then ok "helm: a build without a second raised module (x/crypto) is refused"; else bad "helm: raised x/crypto not named: $out"; fi
+	if out="$(helm_buildinfo_problems v4.3.2 go1.27.3 "$hraised" <"$hfx")"; then bad "helm at another version passed"; elif grep_text "$out" -q "helm.sh/helm/v4 is not at v4.3.2"; then ok "helm at another version is refused"; else bad "helm version not named: $out"; fi
+	if out="$(sed 's/CGO_ENABLED=0/CGO_ENABLED=1/' "$hfx" | helm_buildinfo_problems v4.3.1 go1.27.3 "$hraised")"; then bad "helm: a cgo build passed"; else ok "helm: a cgo build is refused"; fi
+	if out="$(grep -v -- '-trimpath' "$hfx" | helm_buildinfo_problems v4.3.1 go1.27.3 "$hraised")"; then bad "helm: a build without -trimpath passed"; else ok "helm: a build without -trimpath is refused"; fi
+	if out="$(sed 's/GOARCH=arm64/GOARCH=amd64/' "$hfx" | helm_buildinfo_problems v4.3.1 go1.27.3 "$hraised")"; then bad "helm: an amd64 build passed"; else ok "helm: an amd64 build is refused"; fi
+	if out="$(printf '%s\n\t=>\texample.com/fork\tv0.0.1\th1:x=\n' "$(cat "$hfx")" | helm_buildinfo_problems v4.3.1 go1.27.3 "$hraised")"; then bad "helm: a replaced module passed"; elif grep_text "$out" -q "replaced"; then ok "helm: a replaced module is refused"; else bad "helm: replace not named: $out"; fi
+	if out="$(helm_buildinfo_problems v4.3.1 go1.27.3 "" <"$hfx")"; then bad "helm: an empty raised set passed"; else ok "helm: an empty raised set is refused, never a vacuous pass"; fi
 	if [ "$(buildinfo_settings <"$td/goversion-kine.txt" | tr ' ' '\n' | grep -c .)" = 8 ]; then ok "the build settings are recorded from the build info"; else bad "buildinfo_settings: $(buildinfo_settings <"$td/goversion-kine.txt")"; fi
 
 	echo "==> child_problems over a staged payload (fake go, real-shaped build info)"
@@ -1708,38 +2048,38 @@ FAKE
 	mkdir -p "$cpd"
 	(
 		KINE_VERSION=v0.17.2 KINE_VARIANT=nocgo+p2 KINE_PATCH=p2 ETCD_VERSION=v3.6.15 ETCD_VARIANT=nocgo GO="$fgo"
-		ZOT_VERSION=v2.1.22 ZOT_VARIANT=minimal+r1 HELM_BINARY=helm-v4.3.0 HELM_VERSION=v4.3.0 HELM_VARIANT=nocgo+deps1 XNET_FLOOR=v0.60.0
-		HELM_RAISED="golang.org/x/crypto@v0.57.0 golang.org/x/net@v0.60.0" HELM_COMMIT=bec5b06ed841fe5269972d864d5177944fd5970f
+		ZOT_VERSION=v2.1.22 ZOT_VARIANT=minimal+r1 HELM_BINARY=helm-v4.3.1 HELM_VERSION=v4.3.1 HELM_VARIANT=nocgo+deps3 XNET_FLOOR=v0.60.0
+		HELM_RAISED="golang.org/x/net@v0.62.0" HELM_COMMIT=c0d08d0d6d9424d4a14febb5e8a3e51b0dd00dff
 		printf 'zot\n' >"$cpd/zot"; echo "v2.1.22 minimal+r1" >"$cpd/zot.version"
-		printf 'mach-o...v4.3.0...bec5b06ed841fe5269972d864d5177944fd5970f...\n' >"$cpd/helm-v4.3.0"; echo "v4.3.0 nocgo+deps1" >"$cpd/helm.version"
+		printf 'mach-o...v4.3.1...c0d08d0d6d9424d4a14febb5e8a3e51b0dd00dff...\n' >"$cpd/helm-v4.3.1"; echo "v4.3.1 nocgo+deps3" >"$cpd/helm.version"
 		printf 'mach-o...v0.17.2+p2...\n' >"$cpd/kine"; echo "v0.17.2 nocgo+p2" >"$cpd/kine.version"
 		printf 'etcd\n' >"$cpd/etcd"; echo "v3.6.15 nocgo" >"$cpd/etcd.version"
 		printf 'etcdutl\n' >"$cpd/etcdutl"; echo "v3.6.15 nocgo" >"$cpd/etcdutl.version"
 		r=0
 		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  ok    the pinned children pass"; else echo "  FAIL  the pinned children were refused: $o"; r=1; fi
 		echo "v0.17.2 nocgo+p0" >"$cpd/kine.version"
-		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a patch-set mismatch passed"; r=1; elif printf '%s\n' "$o" | grep -q "kine.version"; then echo "  ok    a marker naming another patch set is refused"; else echo "  FAIL  marker not named: $o"; r=1; fi
+		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a patch-set mismatch passed"; r=1; elif grep_text "$o" -q "kine.version"; then echo "  ok    a marker naming another patch set is refused"; else echo "  FAIL  marker not named: $o"; r=1; fi
 		echo "v0.17.2 nocgo+p2" >"$cpd/kine.version"
 		printf 'mach-o...v0.17.2...\n' >"$cpd/kine"
-		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a kine without the stamped version passed"; r=1; elif printf '%s\n' "$o" | grep -q "stamped version"; then echo "  ok    a kine without its stamp is refused"; else echo "  FAIL  stamp not named: $o"; r=1; fi
+		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a kine without the stamped version passed"; r=1; elif grep_text "$o" -q "stamped version"; then echo "  ok    a kine without its stamp is refused"; else echo "  FAIL  stamp not named: $o"; r=1; fi
 		printf 'mach-o...v0.17.2+p2...\n' >"$cpd/kine"
 		rm "$cpd/etcdutl"
-		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a payload without etcdutl passed"; r=1; elif printf '%s\n' "$o" | grep -q "etcdutl: not staged"; then echo "  ok    a missing etcdutl is refused"; else echo "  FAIL  missing etcdutl not named: $o"; r=1; fi
+		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a payload without etcdutl passed"; r=1; elif grep_text "$o" -q "etcdutl: not staged"; then echo "  ok    a missing etcdutl is refused"; else echo "  FAIL  missing etcdutl not named: $o"; r=1; fi
 		printf 'etcdutl\n' >"$cpd/etcdutl"
 		echo "v2.1.20 minimal+r1" >"$cpd/zot.version"
-		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a zot marker at another pin passed"; r=1; elif printf '%s\n' "$o" | grep -q "zot.version"; then echo "  ok    a zot marker naming another pin is refused"; else echo "  FAIL  zot marker not named: $o"; r=1; fi
+		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a zot marker at another pin passed"; r=1; elif grep_text "$o" -q "zot.version"; then echo "  ok    a zot marker naming another pin is refused"; else echo "  FAIL  zot marker not named: $o"; r=1; fi
 		echo "v2.1.22 minimal+r1" >"$cpd/zot.version"
-		echo "v4.3.0 tarball" >"$cpd/helm.version"
-		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a helm marker naming another variant passed"; r=1; elif printf '%s\n' "$o" | grep -q "helm.version is not 'v4.3.0 nocgo+deps1'"; then echo "  ok    a helm marker naming another build variant is refused"; else echo "  FAIL  helm marker not named: $o"; r=1; fi
-		echo "v4.3.0 nocgo+deps1" >"$cpd/helm.version"
-		printf 'mach-o...v4.3.0...\n' >"$cpd/helm-v4.3.0"
-		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a helm without its stamped commit passed"; r=1; elif printf '%s\n' "$o" | grep -q "helm: the stamped string bec5b06ed841fe5269972d864d5177944fd5970f is not in the binary"; then echo "  ok    a helm built without its -X stamp (no commit in the bytes) is refused"; else echo "  FAIL  helm stamp not named: $o"; r=1; fi
-		printf 'mach-o...bec5b06ed841fe5269972d864d5177944fd5970f...\n' >"$cpd/helm-v4.3.0"
-		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a helm without its stamped version passed"; r=1; elif printf '%s\n' "$o" | grep -q "helm: the stamped string v4.3.0 is not in the binary"; then echo "  ok    a helm without its stamped version is refused"; else echo "  FAIL  helm version stamp not named: $o"; r=1; fi
-		printf 'mach-o...v4.3.0...bec5b06ed841fe5269972d864d5177944fd5970f...\n' >"$cpd/helm-v4.3.0"
-		if o="$(child_problems "$cpd" go1.27.9)"; then echo "  FAIL  a helm built on another toolchain passed child_problems"; r=1; elif printf '%s\n' "$o" | grep -q "^helm: built with 'go1.27.3', the payload pins go1.27.9"; then echo "  ok    child_problems names a helm built on another toolchain"; else echo "  FAIL  helm toolchain not named by child_problems: $o"; r=1; fi
-		rm "$cpd/zot" "$cpd/helm-v4.3.0"
-		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a payload without zot and helm passed"; r=1; elif printf '%s\n' "$o" | grep -q "zot: not staged" && printf '%s\n' "$o" | grep -q "helm-v4.3.0: not staged"; then echo "  ok    a missing zot and a missing helm are refused"; else echo "  FAIL  missing zot or helm not named: $o"; r=1; fi
+		echo "v4.3.1 tarball" >"$cpd/helm.version"
+		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a helm marker naming another variant passed"; r=1; elif grep_text "$o" -q "helm.version is not 'v4.3.1 nocgo+deps3'"; then echo "  ok    a helm marker naming another build variant is refused"; else echo "  FAIL  helm marker not named: $o"; r=1; fi
+		echo "v4.3.1 nocgo+deps3" >"$cpd/helm.version"
+		printf 'mach-o...v4.3.1...\n' >"$cpd/helm-v4.3.1"
+		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a helm without its stamped commit passed"; r=1; elif grep_text "$o" -q "helm: the stamped string c0d08d0d6d9424d4a14febb5e8a3e51b0dd00dff is not in the binary"; then echo "  ok    a helm built without its -X stamp (no commit in the bytes) is refused"; else echo "  FAIL  helm stamp not named: $o"; r=1; fi
+		printf 'mach-o...c0d08d0d6d9424d4a14febb5e8a3e51b0dd00dff...\n' >"$cpd/helm-v4.3.1"
+		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a helm without its stamped version passed"; r=1; elif grep_text "$o" -q "helm: the stamped string v4.3.1 is not in the binary"; then echo "  ok    a helm without its stamped version is refused"; else echo "  FAIL  helm version stamp not named: $o"; r=1; fi
+		printf 'mach-o...v4.3.1...c0d08d0d6d9424d4a14febb5e8a3e51b0dd00dff...\n' >"$cpd/helm-v4.3.1"
+		if o="$(child_problems "$cpd" go1.27.9)"; then echo "  FAIL  a helm built on another toolchain passed child_problems"; r=1; elif grep_text "$o" -q "^helm: built with 'go1.27.3', the payload pins go1.27.9"; then echo "  ok    child_problems names a helm built on another toolchain"; else echo "  FAIL  helm toolchain not named by child_problems: $o"; r=1; fi
+		rm "$cpd/zot" "$cpd/helm-v4.3.1"
+		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a payload without zot and helm passed"; r=1; elif grep_text "$o" -q "zot: not staged" && grep_text "$o" -q "helm-v4.3.1: not staged"; then echo "  ok    a missing zot and a missing helm are refused"; else echo "  FAIL  missing zot or helm not named: $o"; r=1; fi
 		exit "$r"
 	) || fails=$((fails + 1))
 
@@ -1865,7 +2205,7 @@ else
 	if [ "$RELEASE" = 1 ]; then
 		# Fail before building or downloading anything. A release never signs a
 		# third-party build: the control-plane binaries must come from k3sm's own
-		# pinned-source build, which does not exist yet.
+		# pinned-source build, hack/release/build-cp.sh, handed in as --cp-build.
 		[ "$STUB_PAYLOAD" = 0 ] || die "--release cannot stage stub payload files"
 		[ -x "$HERE/build-cp.sh" ] || die "--release: hack/release/build-cp.sh is missing or not executable"
 		[ -n "$CP_BUILD" ] ||
@@ -1923,6 +2263,11 @@ VMHOST_ENTITLEMENTS="$WS_ROOT/runtimed/cmd/k3sm-vmhost/vmhost.entitlements"
 verify_tree() {
 	local rel missing=0 f desc bad_sign=0 bad_arch=0 n_macho=0
 
+	# First on every path (staging, --verify-only, --verify-release): the walks
+	# below use `find -type f`, which would pass over a symlink, fifo, socket or
+	# device, so tree_shape_problems refuses every such entry before any of them.
+	tree_shape_problems "$OUT" || die "$OUT is not a plain tree of regular files"
+
 	echo "==> verify completeness against the install contract"
 	[ -x "$BIN" ] || die "$BIN is missing or not executable — cannot ask it what the set must contain"
 	for rel in $("$BIN" install --print-required-artifacts); do
@@ -1936,18 +2281,28 @@ verify_tree() {
 	# under Rosetta defaults to GOARCH=amd64, and dyld HARD-TERMINATES a process
 	# whose inserted library is the wrong architecture.
 	echo "==> verify codesign + arm64 over every Mach-O"
+	local mlist
+	mlist="$(macho_files "$OUT")" || die "file(1) cannot classify every file under $OUT (above)"
 	while IFS= read -r f; do
-		desc="$(file -b "$f" 2>/dev/null || echo '?')"
+		[ -n "$f" ] || continue
+		desc="$(LC_ALL=C file -b -- "$f" 2>/dev/null || echo '?')"
 		n_macho=$((n_macho + 1))
 		codesign --verify --strict "$f" >/dev/null 2>&1 || { echo "    UNSIGNED/INVALID: $f"; bad_sign=1; }
 		case "$desc" in
 		*arm64*) ;;
 		*) echo "    WRONG ARCH: $f -> $desc"; bad_arch=1 ;;
 		esac
-	done < <(macho_files "$OUT")
+	done <<<"$mlist"
 	[ "$bad_sign" = 0 ] || die "a staged Mach-O fails codesign --verify — launchd refuses it with OS_REASON_CODESIGNING"
 	[ "$bad_arch" = 0 ] || die "non-arm64 artifact staged (a Rosetta-defaulted toolchain? every build here pins GOARCH=arm64)"
 	[ "$n_macho" -ge "$MACHO_FLOOR" ] || die "only $n_macho Mach-O(s) found under $OUT — the set cannot be complete"
+
+	echo "==> verify every file: no k3sm hack package, no archive; every Go Mach-O a shipped main"
+	local bi_out
+	if ! bi_out="$(buildinfo_set_problems "$OUT" "$([ "$STUB_PAYLOAD" = 1 ] && echo stub)")"; then
+		printf '%s\n' "$bi_out" >&2
+		die "a staged file names a k3sm hack package or is an archive, or a Mach-O is not a shipped main (above)"
+	fi
 
 	# The entitlement, read back off the signed Mach-O. codesign attaches NO
 	# entitlements when AMFI's plist parser balks — while still producing a
@@ -1955,7 +2310,7 @@ verify_tree() {
 	# reason that matters (runtimed cmd/k3sm-vmhost/entitlements_test.go).
 	echo "==> verify k3sm-vmhost carries com.apple.security.virtualization"
 	[ -f "$OUT/k3sm-vmhost" ] || die "k3sm-vmhost is not in the tree"
-	codesign -d --entitlements - "$OUT/k3sm-vmhost" 2>/dev/null | grep -q "com.apple.security.virtualization" ||
+	grep -q "com.apple.security.virtualization" <<<"$(codesign -d --entitlements - "$OUT/k3sm-vmhost" 2>/dev/null)" ||
 		die "k3sm-vmhost carries no com.apple.security.virtualization entitlement — every vm-RuntimeClass pod would go Pending on the node's missing k3sm.io/virtualization label"
 
 	echo "    $n_macho Mach-O(s) verified"
@@ -1983,9 +2338,9 @@ fi
 
 echo "==> staging into $OUT (darwin/arm64)"
 
-# The pinned toolchain, before anything is built: `k3sm payload` builds kine and
-# etcd with the go on PATH (GOTOOLCHAIN=local), and the manifest records it. Stub
-# staging builds neither and is exempt.
+# The pinned toolchain, before anything is built: `k3sm payload` builds kine,
+# etcd, etcdutl, zot and helm with the go on PATH (GOTOOLCHAIN=local), and the
+# manifest records it. Stub staging builds none of them and is exempt.
 if [ "$STUB_PAYLOAD" = 0 ]; then
 	echo "==> assert the pinned Go toolchain ($PAYLOAD_GO_VERSION)"
 	tc_problem="$(toolchain_problems "$PAYLOAD_GO_VERSION")" || die "$tc_problem"
@@ -2034,10 +2389,10 @@ echo "==> build k3sm-vmhost (runtimed)"
 ( cd "$WS_ROOT" && go build -trimpath -o "$OUT/k3sm-vmhost" k3sm.io/runtimed/cmd/k3sm-vmhost )
 
 # The control-plane payload. `k3sm payload` downloads the pinned kwok-ci/k8s
-# binaries, builds kine (the patched build) and etcd and etcdutl (the wrapper module)
-# from pinned module source, exactly the builds the daemon would otherwise run on
-# demand, and — on this path — verifies every downloaded binary against its pinned
-# sha256, failing closed on a mismatch or an unexpected file. A module the cache
+# binaries, builds kine (the patched build), etcd and etcdutl (the wrapper module),
+# zot and helm from pinned module source, exactly the builds the daemon would
+# otherwise run on demand, and — on this path — verifies every downloaded binary
+# against its pinned sha256, failing closed on a mismatch or an unexpected file. A module the cache
 # lacks with no network reachable is reported as "needs network: <module>". The
 # four downloaded control-plane binaries are then replaced with build-cp.sh's.
 if [ "$STUB_PAYLOAD" = 1 ]; then
@@ -2099,6 +2454,8 @@ upstream_digests_write "$OUT" "$upstream_note" || die "could not write $OUT/$UPS
 if [ "$RELEASE" = 1 ]; then
 	pinned_content_problems "$OUT" "$CP_BUILD" ||
 		die "--release: the staged control-plane binaries are not the pinned-source build in $CP_BUILD"
+	kube_marker_problems "$OUT" "$CP_STAMP" "$KUBE_VERSION" ||
+		die "--release: the staged $KUBE_MARKER_FILE does not vouch for the --cp-build tag (above)"
 	refuse_unpinned_payload "$OUT" "$(release_payload_files)" ||
 		die "--release: refusing to sign cp-payload files not built from pinned source (hack/release/build-cp.sh, or k3sm's own kine/etcd/zot/helm build)"
 fi

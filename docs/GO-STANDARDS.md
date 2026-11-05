@@ -3,7 +3,7 @@
 The shared coding standards for every `k3sm.io/*` repo, kept identical across the four
 modules.
 
-Targets **darwin/arm64, macOS 26+**. Go **1.26.x** across all modules.
+Targets **darwin/arm64, macOS 26+**. Go **1.26 or later** (each `go.mod` declares `go 1.26.0`).
 
 ## Formatting & imports
 - `gofmt` (tabs) is non-negotiable — `gofmt -l` must be empty. `goimports` for import grouping.
@@ -22,7 +22,7 @@ Targets **darwin/arm64, macOS 26+**. Go **1.26.x** across all modules.
 - Wrap with context: `fmt.Errorf("create pod %s: %w", name, err)`. Preserve the chain with `%w`.
 - Error strings: lowercase, no trailing punctuation. Sentinels via `errors.New`; compare with
   `errors.Is` / `errors.As`, never string matching.
-- Check every error. If intentionally ignored, `_ = f()` with a reason, or a `//nolint` note.
+- Check every error. If intentionally ignored, `_ = f()` with a reason, or a `//lint:ignore <Check> <reason>` note (see the staticcheck suppression syntax under Commit gates).
 
 ## Context
 - `ctx context.Context` is the **first** parameter of any blocking/IO/RPC function.
@@ -45,7 +45,7 @@ Targets **darwin/arm64, macOS 26+**. Go **1.26.x** across all modules.
 - Guard shared state with `sync.Mutex`/`RWMutex`; document the locking discipline in a comment.
   Run `cb` callbacks (e.g. VK `NotifyPods`) **outside** held locks to avoid re-entrancy deadlock.
 - Every goroutine has a clear lifetime and a way to stop (`ctx`/done channel). No leaks.
-- The sender closes channels, never the receiver. Tests run with `-race`.
+- The sender closes channels, never the receiver. Tests must pass under `-race`; run `go test -race ./...` before a concurrency change.
 
 ## Logging
 - Structured logging via `log/slog`. No `fmt.Print*` in library code. Levels: Error/Warn/Info/Debug.
@@ -54,8 +54,11 @@ Targets **darwin/arm64, macOS 26+**. Go **1.26.x** across all modules.
 ## Testing
 - Table-driven tests with `t.Run` subtests; descriptive case names. Fixtures in `testdata/`
   (golden files where useful).
-- `go test ./...` must pass; CI runs `-race`. No network or real privilege in unit tests — fake at
+- `go test ./...` must pass, and `go test -race ./...` too; the `k3sm` gate runs `-race`. No network or real privilege in unit tests — fake at
   seams (interfaces). Integration/e2e tests are build-tagged and live separately.
+- A root check in an integration-tagged test goes through `k3smtest.SkipUnless(t, k3smtest.Root)`
+  (`k3sm.io/apis`), never a hand-rolled `os.Geteuid()` gate; `darwin-net`'s gate fails on a raw
+  `Geteuid` there.
 
 ## Dependencies
 - Keep the graph minimal. `go mod tidy` before every commit. Pin versions; no `@latest` in committed go.mod.
@@ -66,7 +69,9 @@ Targets **darwin/arm64, macOS 26+**. Go **1.26.x** across all modules.
   ported function names its upstream file and license in a comment, and the license must be
   Apache-2.0 compatible. Cryptography, TLS, authentication, password hashing, and parsers or
   decompressors of untrusted input are the exception: they stay on maintained libraries however
-  little of them you use.
+  little of them you use. Where no broadly accepted library does the job, write it in the repo and
+  treat it as security-critical: a security review, fuzz tests with committed seeds, explicit size
+  and count limits, and fail-closed handling of anything it does not recognise.
 - **Every dependency change is visible and checked.** `hack/deps.lock` records the full module
   graph, and `hack/verify-deps.sh` (run by `hack/ci.sh`) fails on any drift until the lock is
   regenerated with `--update`. A PR that adds or bumps a module explains why the module is needed
@@ -91,7 +96,7 @@ Targets **darwin/arm64, macOS 26+**. Go **1.26.x** across all modules.
     build compiles but reports those capabilities unavailable). kine is **not** embedded: the
     executor runs it as a pinned **child process**, built on demand out-of-module
     (`go install …/kine@pin`, built `CGO_ENABLED=0` against kine's pure-Go
-    `modernc.org/sqlite` backend since the kine pin collapse); `mattn/go-sqlite3` is not a
+    `modernc.org/sqlite` backend); `mattn/go-sqlite3` is not a
     dependency of any `k3sm.io` module and no longer ships in the kine child either.
   - `runtimed` — **`CGO_ENABLED=1`** (darwin syscall shims).
 
@@ -105,16 +110,25 @@ Targets **darwin/arm64, macOS 26+**. Go **1.26.x** across all modules.
 gofmt -l .                  # must print nothing
 go vet ./...                # clean
 go build ./...              # builds
-go test ./...               # passes (CI adds -race)
+go test ./...               # passes (run -race too; the k3sm gate does)
 hack/verify-boilerplate.sh  # every .go file carries the Apache-2.0 header
 go mod tidy                 # no diff
 staticcheck -tests=false ./...  # clean (pinned version below)
+hack/verify-deps.sh         # module graph matches hack/deps.lock, cooldown, OSV (needs network)
+govulncheck ./...           # clean (pinned version below)
 ```
 
 **staticcheck is pinned**, and this line is where the pin lives:
-`go install honnef.co/go/tools/cmd/staticcheck@2026.2.1`. Every repo's `hack/ci.sh` carries the
+`go install honnef.co/go/tools/cmd/staticcheck@2026.2.2`. Every repo's `hack/ci.sh` carries the
 same version as its `STATICCHECK_VERSION` constant and goes red when the installed binary is
 missing or reports any other version, because a different staticcheck reports different findings.
+The gate looks for `$(go env GOPATH)/bin/staticcheck-<version>` first, then `staticcheck` on `PATH`,
+then `$(go env GOPATH)/bin/staticcheck`, and uses the first that reports exactly the pin. The
+versioned name lets two pins be installed side by side while the repos move from one to the other:
+`GOBIN=<tmp> go install` the pinned release, then move `<tmp>/staticcheck` to
+`$(go env GOPATH)/bin/staticcheck-<version>`.
+govulncheck is pinned the same way, at `golang.org/x/vuln/cmd/govulncheck@v1.9.0`, in each repo's
+`GOVULNCHECK_VERSION`.
 - **Scope**: `-tests=false` checks non-test code only. Each repo's `hack/ci.sh` says why at the stage.
 - **Suppressions**: one syntax, on the line before the finding:
   `//lint:ignore <Check> <reason>`. A reason is required. `//nolint:...` is golangci-lint's
@@ -122,18 +136,6 @@ missing or reports any other version, because a different staticcheck reports di
 - **Bumping the pin**: bump it with the Go toolchain. An older staticcheck cannot read export data
   from a newer Go (2025.1 does not run under go1.27), so a toolchain bump can strand the old pin.
   Change this line and every `STATICCHECK_VERSION` together, and fix the new findings in the same change.
-- **Go 1.27.2 and later, until a newer staticcheck release ships**: 2026.2.1 installed with
-  `go install` cannot read Go 1.27.2's export data ("export data version 5 is greater than maximum
-  supported version 4"). Build the same release against a newer `golang.org/x/tools` instead; it
-  still reports 2026.2.1 and runs the same checks:
-  ```sh
-  mkdir -p /tmp/staticcheck && cd /tmp/staticcheck
-  printf 'module local/staticcheck\n\ngo 1.26.0\n' > go.mod
-  printf 'package main\n\nimport _ "honnef.co/go/tools/cmd/staticcheck"\n' > tools.go
-  go get honnef.co/go/tools@v0.8.1 golang.org/x/tools@v0.50.0 && go mod tidy
-  go build -o "$(go env GOPATH)/bin/staticcheck" honnef.co/go/tools/cmd/staticcheck
-  ```
-  Drop this step when the pin moves to a release that reads the current Go.
 
 Keep commits small and focused. **Sign off every commit** for the Developer Certificate of Origin (see
 `DCO` / `CONTRIBUTING.md`): use `git commit -s`, which adds a `Signed-off-by` line certifying the DCO.

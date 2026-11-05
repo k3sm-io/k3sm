@@ -150,7 +150,7 @@ func credentialAccess(ctx context.Context, workDir string) (acc registryAccess, 
 	if err != nil {
 		return registryAccess{}, true, err
 	}
-	return registryAccess{authority: authority, opts: []remote.Option{remote.WithContext(ctx), remote.WithAuth(auth)}}, true, nil
+	return registryAccess{authority: authority, opts: []remote.Option{remote.WithContext(ctx), remote.WithTransport(boundRequests(nil)), remote.WithAuth(auth)}}, true, nil
 }
 
 // registryReadAccess is how a read (inspect, save, and tag's reads) reaches the
@@ -166,7 +166,7 @@ func registryReadAccess(ctx context.Context, workDir string) (registryAccess, er
 	if authority == "" {
 		return registryAccess{}, fmt.Errorf("%w: this Mac serves no cluster registry (no serving registry record under %s or %s); run this on the server, whose registry it reads anonymously", errNoNodeRegistry, workDir, installedServerWorkDir)
 	}
-	return registryAccess{authority: authority, opts: []remote.Option{remote.WithContext(ctx), remote.WithTransport(loopbackReadTransport())}}, nil
+	return registryAccess{authority: authority, opts: []remote.Option{remote.WithContext(ctx), remote.WithTransport(boundRequests(loopbackReadTransport()))}}, nil
 }
 
 // loopbackReadTransport is the transport of an anonymous read at the
@@ -317,8 +317,9 @@ func isNotFound(err error) bool {
 }
 
 // registryError classifies a cluster-registry failure: a name the registry
-// does not hold is errNotInRegistry, a refused credential is errPushAuth, and
-// an unreachable registry is errPushNetwork, the sentinels push already uses.
+// does not hold is errNotInRegistry and a refused credential is errPushAuth (the
+// sentinel push uses); any other status, a missed deadline (which names
+// --timeout) or a transport failure is wrapped with what was being done.
 func registryError(what string, err error) error {
 	if isNotFound(err) {
 		return fmt.Errorf("%s: %w", what, errNotInRegistry)

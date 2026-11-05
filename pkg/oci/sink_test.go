@@ -17,6 +17,7 @@ limitations under the License.
 package oci
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 
@@ -26,6 +27,9 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/layout"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/random"
+	"github.com/google/go-containerregistry/pkg/v1/tarball"
+	"github.com/google/go-containerregistry/pkg/v1/types"
+	"github.com/google/go-containerregistry/pkg/v1/validate"
 )
 
 // TestLayoutSinkWriteIndex pins the multi-platform half of the layout sink: an
@@ -139,4 +143,71 @@ func twoPlatformIndex(t *testing.T) ggcrv1.ImageIndex {
 		})
 	}
 	return idx
+}
+
+// TestSinksCarryGzipLayers writes a built image through both sinks and reads
+// each back the way a consumer would (`docker load` for the tarball, `k3sm
+// image import` for the layout): the image must validate in full (every blob
+// re-hashed against its digest, every layer gunzipped against its diff_id) with
+// gzip layers. The layout keeps the OCI tar+gzip media type and the built
+// manifest digest; a docker-save tarball stores no manifest, so its reader
+// synthesizes a Docker one and the gzip layer reads back under Docker's name
+// for the same thing.
+func TestSinksCarryGzipLayers(t *testing.T) {
+	t.Parallel()
+	img := buildGzipFixture(t)
+	want, err := img.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, err := name.NewTag("example.com/app:v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	check := func(t *testing.T, got ggcrv1.Image, wantMT types.MediaType) {
+		t.Helper()
+		if err := validate.Image(got); err != nil {
+			t.Fatalf("read-back image does not validate: %v", err)
+		}
+		m, err := got.Manifest()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, l := range m.Layers {
+			if l.MediaType != wantMT {
+				t.Errorf("layer %d media type %q, want %q", i, l.MediaType, wantMT)
+			}
+		}
+	}
+
+	t.Run("tarball", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(t.TempDir(), "img.tar")
+		if err := (TarballSink{Path: path}).Write(context.Background(), ref, img); err != nil {
+			t.Fatal(err)
+		}
+		got, err := tarball.ImageFromPath(path, &ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		check(t, got, types.DockerLayer)
+	})
+
+	t.Run("layout", func(t *testing.T) {
+		t.Parallel()
+		dir := filepath.Join(t.TempDir(), "layout")
+		if err := (LayoutSink{Path: dir}).Write(context.Background(), ref, img); err != nil {
+			t.Fatal(err)
+		}
+		p, err := layout.FromPath(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := p.Image(want)
+		if err != nil {
+			t.Fatalf("layout does not hold the built manifest %s: %v", want, err)
+		}
+		check(t, got, types.OCILayer)
+	})
 }

@@ -11,8 +11,9 @@
 # What it answers, in order:
 #   s1.1  the toolchain is PINNED, not defaulted — the Rust toolchain and maturin
 #         versions are recorded here because a compiled PyO3 extension's behaviour
-#         depends on the compiler, not only on the source, and the image build
-# asserts these same two pins before it stages anything.
+#         depends on the compiler, not only on the source, and the planned
+#         mlx-worker image build is to assert these same two pins before it
+#         stages anything.
 #   s1.2  the build completes, and the RESOLVED COMMIT is recorded. That sha is the
 #         pin we promote to the first tag containing it; nothing in this
 #         repo hard-codes a commit it has not built.
@@ -108,7 +109,7 @@ else
 fi
 
 # ---- s1.3 the artifact record ----------------------------------------------------
-WHEEL=$(ls -t "$W/wheels"/*.whl 2>/dev/null | head -1)
+WHEEL=$(ls -t "$W/wheels"/*.whl 2>/dev/null | sed -n 1p)
 [ -n "$WHEEL" ] || { verdict FAIL "s1.3 wheel  the build reported success but produced no wheel"; exit 0; }
 SHA=$(shasum -a 256 "$WHEEL" | awk '{print $1}')
 recorded "s1.3 wheel: $(basename "$WHEEL") sha256=$SHA — a REPRODUCIBILITY RECORD, not provenance: no published darwin wheel exists to pin against"
@@ -162,7 +163,7 @@ nohup "$V" -m dynamo.mocker --discovery-backend file \
 MK=$!
 READY=no
 for i in $(seq 1 60); do
-  curl -fsS -m 3 http://127.0.0.1:8111/v1/models 2>/dev/null | grep -q mock && { READY=yes; break; }
+  grep -q mock <<<"$(curl -fsS -m 3 http://127.0.0.1:8111/v1/models 2>/dev/null)" && { READY=yes; break; }
   sleep 2
 done
 if [ "$READY" = yes ]; then
@@ -171,7 +172,7 @@ if [ "$READY" = yes ]; then
     -d '{"model":"mock-model","max_tokens":16,"messages":[{"role":"user","content":"hello"}]}' 2>&1)
   case "$OUT" in
     *choices*) verdict PASS "s1.4 smoke  frontend + mocker with --discovery-backend file served a completion: no etcd, no NATS, no Kubernetes" ;;
-    *) verdict FAIL "s1.4 smoke  /v1/models answered but the completion did not: $(printf '%s' "$OUT" | head -c 200)" ;;
+    *) verdict FAIL "s1.4 smoke  /v1/models answered but the completion did not: $(printf '%s' "${OUT:0:200}")" ;;
   esac
 else
   verdict FAIL "s1.4 smoke  the file-discovery frontend never listed the mocker's model (see $W/frontend.log, $W/mocker.log)"

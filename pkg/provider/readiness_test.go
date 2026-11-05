@@ -127,7 +127,7 @@ func TestRollingUpdateSurfacesReadyGates(t *testing.T) {
 	})
 
 	// (f) an EXTERNAL/non-owned condition SURVIVES a toPodStatus status rebuild
-	// (merge-not-replace). toPodStatus otherwise emits only the four owned
+	// (merge-not-replace). toPodStatus otherwise emits only the five owned
 	// conditions; without the carry-forward the gate condition would be clobbered.
 	t.Run("external condition survives toPodStatus rebuild", func(t *testing.T) {
 		pod := gatedPod([]string{"example.com/g"}, trueCond("example.com/g"))

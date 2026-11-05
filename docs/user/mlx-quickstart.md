@@ -43,7 +43,7 @@ Three fields in it look optional but are not:
 
 | Field | Why you must set it |
 |---|---|
-| `runtime.image` | k3sm ships no built-in serving image. Use the published `mlx-serve` image, ideally by digest. The digest for your release is recorded in [the image's build notes](../../hack/images/mlx-serve/README.md). |
+| `runtime.image` | k3sm ships no built-in serving image. Use the published `mlx-serve` image, ideally by digest. The digest for this release is in [`examples/mlxmodel.yaml`](../../examples/mlxmodel.yaml); [the image's build notes](../../hack/images/mlx-serve/README.md) show how the image is built and published. |
 | `port` | Must match the image; `mlx-serve` listens on 8000. |
 | `cache.storageClassName` | k3sm marks no StorageClass as default, so `local-path` must be named or the cache volume never binds. See [Storage](storage.md). |
 
@@ -51,6 +51,14 @@ Three fields in it look optional but are not:
 is both the scheduling constraint and the budget the serving engine's context window is derived from.
 More memory buys a longer context; too little is rejected up front with a reason, rather than failing
 later on the node.
+
+The context is pinned with the engine's `--max-kv-size`: a quarter of `memory`, after a fixed runtime
+allowance and 6% headroom, is set aside for the KV cache of four concurrent sequences, and divided by
+what one token costs. The weights are downloaded inside the pod after that pin is set, so the cost per
+token is a fixed estimate of about 0.15 MiB, measured on a 3B model. Larger models cost more: a
+64-layer 32B model with 8 KV heads of dimension 128 grows 2 x 2 bytes x 64 x 8 x 128 = 256 KiB per
+token at fp16. For a large model, raise `memory` or set a lower `--max-kv-size` in `runtime.args`,
+which is applied after the derived pin.
 
 Pin `revision` to an exact model revision. Leaving it empty means the repository's default branch, which
 moves, and two replicas started weeks apart would then serve different weights under one object.
@@ -60,9 +68,10 @@ k3sm points it at that revision's directory **inside the cache volume** instead:
 
 - `revision` requires `cache`. Without a cache volume there is no such directory, and the model is
   rejected up front with an `InvalidSpec` reason rather than served from the moving default branch.
-- A pinned revision is loaded from the cache, not fetched into it. On a volume that has never held this
-  model, leave `revision` empty for the first start (the engine downloads the default branch), or stage
-  the weights into the volume yourself.
+- On a volume that has never held this revision, the serving image fetches it into the cache before the
+  engine starts. Pin the full commit hash: a branch or tag name is refused at start, because it moves.
+  If the fetch fails and the revision is not already in the volume, the pod exits naming the revision
+  and retries on restart; once it is in the volume, a restart without network serves it from there.
 
 `quantization` is rejected today, because the engine has no expression for it and serving a different
 variant than the one asked for would look like success. Name the quantized repository in `model`
@@ -70,8 +79,7 @@ instead. `mlx-community/Qwen3-0.6B-4bit` already does.
 
 ## 3. Watch It Become Ready
 
-The first start downloads the weights, which can take a while on a cold cache. If `revision` is
-pinned, the weights must already be in the volume (above). Read the **conditions**, not the `PHASE`
+The first start downloads the weights, which can take a while on a cold cache. Read the **conditions**, not the `PHASE`
 column. `PHASE` is a one-word summary for humans and loses information:
 
 ```sh
@@ -82,7 +90,9 @@ kubectl wait --for=condition=Ready mlxmodel/qwen3-06b --timeout=30m
 
 The `Ready` condition's `reason` names the state: `Pending` (no replica running yet), `Downloading`
 (fetching weights), `Loading` (weights fetched, model loading), `Serving` (ready), `PodFailed` (the
-replica died), `ScaledToZero` (you set `replicas: 0`).
+replica died), `Crashing` (the serving container keeps exiting or cannot start; the message gives the
+replica, the last exit code and the error), `ImagePullFailed` (the serving image cannot be pulled),
+`ScaledToZero` (you set `replicas: 0`).
 
 There is no liveness probe on the serving pod, because a first start is an unbounded download and a
 probe that killed it would restart the download from zero.
@@ -129,8 +139,8 @@ That removes the serving workload, both Services, and the cache PVC. The underly
 - Because it runs natively, a served model shares the `_k3sm` trust domain with the other native Pods on
   that Mac. Serve **models and code you trust**; see [Limitations](limitations.md).
 - Weights never live in the image. They are downloaded on first start into the cache volume, so give
-  that volume room for the model you are serving. A pinned `revision` is loaded from that volume rather
-  than downloaded into it (see step 2).
+  that volume room for the model you are serving. A pinned `revision` is downloaded into that volume
+  the same way, once (see step 2).
 - Sharded serving is [experimental](README.md#what-experimental-means): an alpha, for trusted tenancy only, and not yet run on hardware.
   A model may set `spec.distributed` (`ranks`, `backend`, `parallelism`), and the operator places
   the ranks as gang-scheduled rank Pods with per-rank DNS and reports placement and link health in

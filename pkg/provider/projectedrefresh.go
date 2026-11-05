@@ -236,7 +236,8 @@ func refreshFailureClass(err error) string {
 func (t *podTrack) refreshable() bool {
 	t.restartMu.Lock()
 	defer t.restartMu.Unlock()
-	return !t.deleting && t.parked == nil
+	// A pod refused at admission has no volumes to refresh.
+	return !t.deleting && t.parked == nil && !t.rejected
 }
 
 // markRefreshWarned records that volume's refresh reported kind with class,

@@ -297,11 +297,11 @@ has()        { grep -qF "$1" "$OUT"; }
 sudo_ran()   { grep -qE '^sudo .*k3sm install$' "$OUT"; }
 k3sm_ran()   { grep -qE '^k3sm install$' "$KLOG"; }
 no_exec()    { ! grep -qE '^sudo ' "$OUT" && [ ! -s "$KLOG" ]; }
-staging_gone() { ! find "$CASE_TMP" -mindepth 1 -maxdepth 1 -name 'k3sm-install.*' 2>/dev/null | grep -q .; }
+staging_gone() { ! grep -q . <<<"$(find "$CASE_TMP" -mindepth 1 -maxdepth 1 -name 'k3sm-install.*' 2>/dev/null)"; }
 banner_before_sudo() {
 	local b s
-	b="$(grep -nF 'about to run: sudo' "$OUT" | head -1 | cut -d: -f1)"
-	s="$(grep -nE '^sudo ' "$OUT" | head -1 | cut -d: -f1)"
+	b="$(grep -nF 'about to run: sudo' "$OUT" | sed -n 1p | cut -d: -f1)"
+	s="$(grep -nE '^sudo ' "$OUT" | sed -n 1p | cut -d: -f1)"
 	[ -n "$b" ] && [ -n "$s" ] && [ "$b" -lt "$s" ]
 }
 
@@ -385,7 +385,7 @@ else
 	ladder no "b137.T8  download-only: artifacts in cwd, no sudo (rc=$CASE_RC)"
 fi
 
-# T9 — zero-release latest shape (the exact state the live channel ships into).
+# T9 — zero-release latest shape (a channel with no published release yet).
 run_case t9 K3SM_INSTALL_BASE_URL="$BASE_ZERO"
 if [ "$CASE_RC" -ne 0 ] && has 'published yet' && no_exec; then
 	ladder ok "b137.T9  zero-release latest: friendly 'published yet?' abort"
@@ -489,7 +489,7 @@ run_case t17 PATH="$HINT_PATH" \
 	K3SM_INSTALL_BASE_URL="$BASE_OK" K3SM_INSTALL_VERSION=v9.9.9
 if [ "$CASE_RC" -eq 0 ] && sudo_ran && k3sm_ran \
 	&& has 'installed to /Library/k3sm; /usr/local/bin/k3sm is the launcher' \
-	&& ! has 'installed — try:'; then
+	&& ! has 'installed. Try:'; then
 	ladder ok "b137.T17 k3sm NOT on PATH: closing hint names the launcher + the PATH remedy"
 else
 	ladder no "b137.T17 k3sm NOT on PATH: closing hint names the launcher + the PATH remedy (rc=$CASE_RC)"
@@ -507,7 +507,7 @@ chmod +x "$HINT_STUBS/k3sm"
 run_case t18 PATH="$STUBS:$HINT_STUBS:/usr/bin:/bin" \
 	K3SM_INSTALL_BASE_URL="$BASE_OK" K3SM_INSTALL_VERSION=v9.9.9
 if [ "$CASE_RC" -eq 0 ] && sudo_ran && k3sm_ran \
-	&& has 'installed — try: k3sm status, then k3sm kubectl get nodes' \
+	&& has 'installed. Try: k3sm status, then k3sm kubectl get nodes' \
 	&& ! has 'is the launcher'; then
 	ladder ok "b137.T18 k3sm ON PATH: closing hint is the runnable one"
 else

@@ -318,6 +318,10 @@ type Collector struct {
 	// a permission error sets network.appliedReadable false. The daemons
 	// probe never calls it.
 	NetworkApplied func(role install.Role) ([]byte, error)
+	// Budget reads the node daemon's budget record (BudgetPath in the status
+	// directory in production). OPTIONAL: nil, an error or an unusable record
+	// leaves the report's budget block out. The daemons probe never calls it.
+	Budget func() ([]byte, error)
 	// AgentJoinServer returns the control-plane host the installed agent
 	// joins: ONLY the --server value of the agent LaunchDaemon's argv
 	// (install.AgentJoinServer in production). OPTIONAL: nil, or an error,
@@ -355,17 +359,26 @@ type Collector struct {
 	// found. OPTIONAL: nil leaves the row to report only that a client exists.
 	ReviewSelf func(ctx context.Context, kube Kube) (string, error)
 	// ServerAnchor proves, on a server, that the apiserver URL the report's
-	// client dials is this Mac's own control plane (ServerAnchor in
-	// production). The datastore and serving-cert rows of an account that
+	// client dials is this Mac's own control plane (NodeAnchor in
+	// production: the published endpoints record when this node has one, else
+	// ServerAnchor). The datastore and serving-cert rows of an account that
 	// cannot read the work dir vouch for what that endpoint answers only when
 	// it passes. OPTIONAL: nil anchors nothing, and those rows stay unknown.
 	ServerAnchor Anchor
-	Paths        Paths
-	EUID         int
-	ServiceUID   int
-	Now          func() time.Time
-	Version      version.Info
-	Host         string
+	// DeveloperMode reads the developer-mode marker
+	// (install.ReadDeveloperModeState in production). OPTIONAL: nil leaves
+	// the developer-mode row out.
+	DeveloperMode func() install.DeveloperModeState
+	// SigningTeamID reads the Team ID of a binary's signature
+	// (install.CodesignTeamID in production), for the developer-mode row's
+	// wide signing key. OPTIONAL: nil leaves that key out.
+	SigningTeamID func(ctx context.Context, path string) (string, error)
+	Paths         Paths
+	EUID          int
+	ServiceUID    int
+	Now           func() time.Time
+	Version       version.Info
+	Host          string
 	// Hostname is this Mac's host name, used to pick THIS node out of a
 	// multi-node cluster's node list. Empty leaves the node row to its fallback.
 	Hostname string

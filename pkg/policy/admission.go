@@ -91,8 +91,8 @@ const (
 )
 
 // reservedLBPortPolicyName / reservedLBPortBindingName name the deny policy
-// that rejects a LoadBalancer Service declaring a port k3sm's own wildcard
-// listeners occupy.
+// that rejects a LoadBalancer Service declaring a reserved port (ports.Reserved:
+// one of k3sm's own node listeners, or a macOS host service).
 const (
 	reservedLBPortPolicyName  = "k3sm-reject-loadbalancer-reserved-port"
 	reservedLBPortBindingName = "k3sm-reject-loadbalancer-reserved-port-binding"

@@ -149,6 +149,9 @@ func (r *runtimedRuntime) reapOrphans(ctx context.Context) {
 	if r.podSource == nil {
 		return
 	}
+	// Taken before the list: a budget-history entry recorded after it is kept
+	// whatever the list says.
+	mark := r.history.mark()
 	listCtx, cancel := context.WithTimeout(ctx, orphanAPITimeout)
 	listed, err := r.podSource.listNodePods(listCtx, r.nodeName)
 	cancel()
@@ -165,6 +168,9 @@ func (r *runtimedRuntime) reapOrphans(ctx context.Context) {
 	// A retained terminated pod the apiserver no longer holds owes no logs: drop
 	// it, and the log GC removes its tree on its next sweep.
 	r.pruneRetained(present)
+	// The budget history's intents and classified exits live as long as their
+	// pod: drop the ones whose pod is neither listed nor tracked.
+	r.pruneBudgetHistory(present, mark)
 
 	r.mu.Lock()
 	tracked := make(map[string]orphanCandidate, len(r.track))
@@ -273,6 +279,15 @@ func (r *runtimedRuntime) reapOrphan(ctx context.Context, pod *corev1.Pod, t *po
 	pod = t.pod // the latest spec for this same track, still under r.mu
 	r.mu.Unlock()
 
+	if t.rejected {
+		// Refused at admission: the runtime never heard of it, so there is
+		// nothing to tear down, only the track to forget.
+		r.forgetRejected(ctx, pod, t)
+		r.orphanMu.Lock()
+		delete(r.orphanGauges, id)
+		r.orphanMu.Unlock()
+		return
+	}
 	r.log.Info("orphan reaper: the apiserver no longer holds a pod this node runs; tearing it down",
 		"namespace", pod.Namespace, "name", pod.Name, "uid", id,
 		"consecutiveNotFound", orphanReapThreshold)

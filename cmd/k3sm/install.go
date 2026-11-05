@@ -42,10 +42,12 @@ import (
 	"k3sm.io/k3sm/pkg/version"
 )
 
-// runInstall lays down k3sm's two root LaunchDaemons (io.k3sm.netd as root,
-// io.k3sm.server as the _k3sm user) via the install package's system seam. It is
+// runInstall lays down k3sm's LaunchDaemons (io.k3sm.netd as root, and
+// io.k3sm.server, or io.k3sm.agent with --agent, as the _k3sm user; plus the root
+// io.k3sm.datavol oneshot when this Mac has a data volume) via the install
+// package's system seam. It is
 // the single root step (run as `sudo k3sm install`): it copies THIS binary into
-// the root-owned install dir, writes the plists, bootstraps both daemons, and
+// the root-owned install dir, writes the plists, bootstraps the daemons, and
 // writes the admin kubeconfig to the invoking human's home ($SUDO_USER), owned by
 // them. Code signing and notarization happen at release time, in hack/release.
 func runInstall(args []string) error {
@@ -87,11 +89,14 @@ func runInstall(args []string) error {
 	if cfg.TLSSANs, err = opts.resolveTLSSANs(os.ReadFile, installedPlistPath(install.ServerLabel), dataroot.DefaultServerArgsRecordPath); err != nil {
 		return err
 	}
+	// The signature reader: the --from-staging continuity check reads through
+	// it, and so does the check that a team-signed install turns developer
+	// mode off.
+	cfg.Signer = install.CodesignTeamID{}
 	if opts.fromStaging != "" {
-		// The seams the --from-staging predicate and the signing continuity
-		// check read through, and the version the downgrade rule compares.
+		// The seam the --from-staging predicate reads through, and the
+		// version the downgrade rule compares.
 		cfg.StagingFS = install.NewDarwinStagingFS()
-		cfg.Signer = install.CodesignTeamID{}
 		cfg.StagedVersion = version.Get().Version
 	}
 	if cfg, err = opts.resolveInPlace(cfg, func(c install.Config) (install.Config, error) {
@@ -214,27 +219,28 @@ func (e installEnv) prepare(args []string) (opts installFlags, self string, volu
 // the rendered daemon arguments, is assertable without root.
 func (o installFlags) installConfig(self string, volume *datavol.Options, logger *slog.Logger) install.Config {
 	return install.Config{
-		Role:              o.role(),
-		JoinServer:        o.server,
-		NodeIP:            o.nodeIP,
-		ClusterInit:       o.clusterInit,
-		ServerJoin:        o.serverJoin,
-		TokenFile:         o.tokenFile,
-		BinarySource:      self,
-		TargetUser:        o.targetUser,
-		ServiceCIDR:       o.serviceCIDR,
-		DataVolume:        volume,
-		RemoveOldDataRoot: o.removeOldDataRoot,
-		MeshIP:            o.meshIP,
-		TLSSANs:           o.tlsSANs,
-		KubeconfigName:    o.recordedKubeconfigName(),
-		NodePortAddresses: o.recordedNodePortAddresses(),
-		LAN:               o.recordedLAN(),
-		SecretsEncryption: o.secretsEncryption,
-		UpdateReleaseBase: o.updateReleaseBase,
-		EtcdSnapshots:     o.etcdSnapshotFlags(),
-		Start:             o.start,
-		Logger:            logger,
+		Role:                 o.role(),
+		JoinServer:           o.server,
+		NodeIP:               o.nodeIP,
+		ClusterInit:          o.clusterInit,
+		ServerJoin:           o.serverJoin,
+		TokenFile:            o.tokenFile,
+		BinarySource:         self,
+		TargetUser:           o.targetUser,
+		ServiceCIDR:          o.serviceCIDR,
+		DataVolume:           volume,
+		RemoveOldDataRoot:    o.removeOldDataRoot,
+		MeshIP:               o.meshIP,
+		TLSSANs:              o.tlsSANs,
+		KubeconfigName:       o.recordedKubeconfigName(),
+		NodePortAddresses:    o.recordedNodePortAddresses(),
+		LAN:                  o.recordedLAN(),
+		SecretsEncryption:    o.secretsEncryption,
+		UpdateReleaseBase:    o.updateReleaseBase,
+		EtcdSnapshots:        o.etcdSnapshotFlags(),
+		Start:                o.start,
+		Logger:               logger,
+		DeveloperModeOptions: install.DeveloperModeOptions{DeveloperMode: o.developerMode},
 		StagingOptions: install.StagingOptions{
 			FromStagingDir:       o.fromStaging,
 			AllowDowngrade:       o.allowDowngrade,
@@ -391,6 +397,10 @@ type installFlags struct {
 	// requireTeamSignature is --require-team-signature, with --from-staging
 	// only (install.StagingOptions.RequireTeamSignature).
 	requireTeamSignature bool
+	// developerMode is --developer-mode, validated to exactly on or off;
+	// unset when the flag was not passed (install.Config.DeveloperMode).
+	developerMode    install.DeveloperMode
+	developerModeRaw string
 	// updateReleaseBase is --update-release-base, validated by
 	// update.ParseReleaseBase and normalized (install.Config.UpdateReleaseBase).
 	updateReleaseBase string
@@ -415,6 +425,7 @@ func parseInstallFlags(args []string) (installFlags, error) {
 	fs.BoolVar(&o.allowDowngrade, "allow-downgrade", false, "with --from-staging: install even when the installed k3sm is newer, or its version cannot be read")
 	fs.StringVar(&o.updateReleaseBase, update.ReleaseBaseFlag, "", releaseBaseUsage)
 	fs.BoolVar(&o.requireTeamSignature, "require-team-signature", false, "with --from-staging: refuse the install unless every Mach-O in the staging directory carries a Developer ID team signature, whatever the installed k3sm is signed with")
+	fs.StringVar(&o.developerModeRaw, "developer-mode", "", "on or off. on: developer mode, for a build from source; the signature of the k3sm that runs as root is no longer checked, and an ad-hoc signed build may replace a team-signed one. off: the signature checks are back on. Not passed, the mode stays as it is, except that a signed install turns it off: a plain install whose k3sm carries a Developer ID signature of any team (the other programs it installs are not checked), and with --from-staging every binary in the staging directory signed by the team the signing checks require (the installed build's team, when it has one). Recorded in "+install.DeveloperModeMarkerPath)
 	fs.BoolVar(&o.start, "start", false, "on a node stopped with 'k3sm stop', start it after installing (without it the node is updated and stays stopped)")
 	fs.BoolVar(&o.printRequired, "print-required-artifacts", false, "print the artifacts that must sit beside this binary (one per line, relative) and exit; needs no privilege")
 	fs.BoolVar(&o.dataVolume, "data-volume", false, "keep the data root on a dedicated, size-capped APFS volume: create it, adopt an existing one, or migrate onto it")
@@ -453,6 +464,13 @@ func parseInstallFlags(args []string) (installFlags, error) {
 			return o, fmt.Errorf("--lan: %w", err)
 		}
 		o.lan = lan
+	}
+	if o.set["developer-mode"] {
+		mode, err := install.ParseDeveloperMode(o.developerModeRaw)
+		if err != nil {
+			return o, fmt.Errorf("--developer-mode: %w", err)
+		}
+		o.developerMode = mode
 	}
 	o.nodePortAddresses = strings.TrimSpace(o.nodePortAddresses) // whitespace-only clears, like ""
 	if err := validateNodePortAddresses(o.nodePortAddresses); err != nil {
@@ -772,6 +790,27 @@ func resolvePurgeTarget(userFlag, sudoUser, sudoUID string) (name, home string, 
 	return purgeTarget(sudoUser, sudoUID)
 }
 
+// resolveThroughMissing returns path with its symlinks resolved even when its tail
+// does not exist: the longest existing ancestor is resolved and the rest is put back.
+// EvalSymlinks alone fails on a missing path, which left /var/lib/k3sm unresolved
+// beside a home resolved to /private/var, so the prefix check below passed only on a
+// Mac where k3sm was already installed.
+func resolveThroughMissing(path string) string {
+	path = filepath.Clean(path)
+	var rest []string
+	for p := path; ; {
+		if resolved, err := filepath.EvalSymlinks(p); err == nil {
+			return filepath.Join(append([]string{resolved}, rest...)...)
+		}
+		parent := filepath.Dir(p)
+		if parent == p {
+			return path
+		}
+		rest = append([]string{filepath.Base(p)}, rest...)
+		p = parent
+	}
+}
+
 // explicitPurgeTarget resolves --user. The uid and home come only from the
 // account lookup, never from SUDO_UID. It refuses root, a uid below 501, a
 // service account (a leading underscore, nobody, daemon; nobody's uid is
@@ -800,10 +839,7 @@ func explicitPurgeTarget(name string) (string, string, error) {
 		return "", "", fmt.Errorf("resolve the home of --user %s: %w", name, err)
 	}
 	home = filepath.Clean(home)
-	dataRoot := filepath.Clean(install.DefaultDataRoot)
-	if resolved, err := filepath.EvalSymlinks(dataRoot); err == nil {
-		dataRoot = resolved
-	}
+	dataRoot := resolveThroughMissing(install.DefaultDataRoot)
 	if home == "/" || dataRoot == home || strings.HasPrefix(dataRoot, home+"/") {
 		return "", "", fmt.Errorf("--user %s has home %s, which contains the cluster data; refusing", name, home)
 	}

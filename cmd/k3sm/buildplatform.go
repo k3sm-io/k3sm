@@ -182,11 +182,11 @@ func emulationRefusal(o buildOptions, parseErr error) error {
 // cache holds, and reports its platform.
 //
 // The cache holds single-platform entries, and the reason the choice is not
-// arbitrary is the summary line it feeds: the build tells the operator to
-// a Pod naming `<tag>`, and that is true only for an image a Pod on
-// this node can actually run. So the pick is the platform the node's own Linux
-// guests run — the engine's guest platform — and a build that produced none is
-// refused rather than recorded under a name that would not start.
+// arbitrary is the summary line it feeds: the build tells the operator to name
+// `<tag>` in a Pod, and that is true only for an image a Pod on this node can
+// actually run. So the pick is the platform the node's own Linux guests run, the
+// engine's guest platform, and a build that produced none is refused rather than
+// recorded under a name that would not start.
 func selectStoreImage(idx ggcrv1.ImageIndex, want string) (ggcrv1.Image, string, error) {
 	manifest, err := idx.IndexManifest()
 	if err != nil {

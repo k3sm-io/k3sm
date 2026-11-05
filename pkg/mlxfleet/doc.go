@@ -45,7 +45,7 @@ limitations under the License.
 // DynamoWorkerMetadata. That is the whole of the operator's
 // config/crd/bases at the commit above.
 //
-// Two records in testdata/ carry the version in their file name, so bumping
+// Three records in testdata/ carry the version in their file name, so bumping
 // ChartVersion without re-recording them fails the tests that read them:
 //
 //   - crds-<ChartVersion>.txt is the CRD set the operator image applies — one

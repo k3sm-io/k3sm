@@ -27,7 +27,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 )
 
-// TestM3_3_InfraVIPExemptionAndMeshEgressPassed proves netserve.New passes the
+// TestInfraVIPExemptionAndMeshEgressPassed proves netserve.New passes the
 // right node-local-datapath config to the Service proxy for: the DNS VIP is
 // recorded as the infra-VIP exemption (the proxy steps aside so the per-node
 // resolver owns 10.43.0.10:53 — no EADDRINUSE) and the node's mesh-egress /32 is
@@ -35,7 +35,7 @@ import (
 // blackholed by wireguard). darwin-net's proxy exempt_test.go / meshegress_test.go
 // prove the proxy HONORS these; this proves k3sm SUPPLIES the right values, and
 // selects the netd-helper binder when unprivileged.
-func TestM3_3_InfraVIPExemptionAndMeshEgressPassed(t *testing.T) {
+func TestInfraVIPExemptionAndMeshEgressPassed(t *testing.T) {
 	t.Parallel()
 
 	s := New(Config{

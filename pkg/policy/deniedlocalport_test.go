@@ -29,7 +29,7 @@ import (
 	"k3sm.io/k3sm/pkg/ports"
 )
 
-// kinePort / freePort are the two numbers this file argues about: the default
+// kinePort / freePort are the two numbers this file argues about: a sample
 // loopback datastore listener port a server denies, and its neighbour, which
 // nothing denies. They are written here rather than imported from pkg/executor so
 // the test states the case it is making (12379 is denied, 12380 is not) instead of

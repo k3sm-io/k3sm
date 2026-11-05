@@ -77,7 +77,7 @@ type podRootChoice struct {
 //     logAgentPodRoot emits is how they are told to make it;
 //   - else the durable default, executor.RuntimeRoot(workDir) — the work dir's
 //     PARENT, which is exactly the derivation `k3sm server` uses for an empty
-//     --pod-root (cmd/k3sm/server.go:321). One rule, two roles: the SBPL work
+//     --pod-root (cmd/k3sm/serverprovision.go:255). One rule, two roles: the SBPL work
 //     dir then resides under the daemon home and the sandbox's containment check
 //     stays active.
 //

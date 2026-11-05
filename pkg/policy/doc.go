@@ -32,12 +32,15 @@ limitations under the License.
 //     _k3sm identity, since the runtime has no per-pod uid/gid isolation — rejected
 //     at admission, never silently coerced.
 //   - reserved LoadBalancer port: a type: LoadBalancer Service may not declare a
-//     port k3sm's own wildcard listeners hold (the NodePort range, the kubelet API
-//     port), which the Service could never have won the bind for anyway. The
-//     rejection is the legible half of a guard svclb also enforces at the datapath.
+//     port in ports.Reserved: the NodePort range and the kubelet API port, which
+//     k3sm's own node listeners hold, and the macOS host-service ports (22, 53,
+//     88, 445, 548, 631), which a tenant listener would keep their service from
+//     binding. The rejection is the legible half of a guard svclb also enforces
+//     at the datapath.
 //   - denied local port: a Service may not publish a port every confined pod's
-//     sandbox denies connect() to (today the node's loopback datastore listener,
-//     cmd/k3sm's opts.deniedLocalPorts()). Unlike the one above this has NO type
+//     sandbox denies connect() to (the node's loopback datastore client port and, in
+//     the etcd posture, the member's loopback metrics port; see cmd/k3sm's
+//     opts.deniedLocalPorts()). Unlike the one above this has NO type
 //     scope: the sandbox denies by port number whatever address the pod dials, so
 //     a ClusterIP and a headless Service are as unreachable as a LoadBalancer.
 //

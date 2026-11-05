@@ -150,7 +150,7 @@ func respondTyped(t *testing.T, r *clusterResolver, name string, qtype dnsmessag
 }
 
 // TestHeadlessServiceReturnsAllPodIPs is the server-side DNS-identity
-// gate (Res.1): the per-node resolver serves the record surface darwin-net's
+// gate: the per-node resolver serves the record surface darwin-net's
 // dns.Synthesize builds from the Services + EndpointSlices listers — the
 // headless all-ready-backends A set (readiness-filtered), the StatefulSet
 // hostname identity A record, one SRV per endpoint under the named port, the

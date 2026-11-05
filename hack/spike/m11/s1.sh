@@ -625,7 +625,7 @@ run_order after
 # capture is itself recorded (it means no Seatbelt denial was logged).
 echo "-- Seatbelt denial log (verbatim; empty = none logged)"
 log show --last 4m --style syslog --predicate 'eventMessage CONTAINS "vzboot"' 2>/dev/null \
-  | grep -iE 'sandbox|deny' | head -40 | sed 's/^/     /' || true
+  | grep -iE 'sandbox|deny' | sed -n 1,40p | sed 's/^/     /' || true
 
 for o in before after; do
   if grep -q "VZBOOT_SB_VERDICT_$(echo "$o" | tr a-z A-Z)=worked" "out/seatbelt-$o.log"; then

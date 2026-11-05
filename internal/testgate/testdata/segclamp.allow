@@ -48,7 +48,7 @@ pkg/bootstrap/meshendpoint.go NodeIdentityClient http.Transport{} # mesh-endpoin
 cmd/k3sm/agentmesh.go localAddrDialer field net.Dialer # records the underlay source address of the join dial
 cmd/k3sm/agentmesh.go pinnedJoinClient net.Dialer{} # join dial toward the --server underlay address
 cmd/k3sm/agent.go agentResumeFromCredential net.Dialer{} # route probe toward the --server underlay address
-cmd/k3sm/meshrefresh.go newWorkerEndpointRefresher net.Dialer{} # route probe toward the --server underlay address
+cmd/k3sm/meshrefresh.go - net.Dialer{} # controlPlaneSourceIP: route probe toward the --server underlay address
 
 # Internet downloads, digest-verified, over the default route.
 pkg/builder/buildxhost.go downloadTo http.DefaultClient # buildx release asset download

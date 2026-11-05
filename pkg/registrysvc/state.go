@@ -211,8 +211,9 @@ func PublishedStatePath(workDir string) string {
 
 // WriteState records st for workDir atomically (a temp file renamed over the
 // record): the 0600 original in the work dir, then, when the status directory
-// exists, a 0644 copy there. The record holds a state, a port, an address, a
-// reason and a pid, never a credential, so the copy is safe to publish; a
+// exists, a 0644 copy there. The record holds states, ports, addresses, names, a
+// certificate expiry, reasons and a pid, never a credential or anything derived
+// from one, so the copy is safe to publish; a
 // server with no status directory (a hand-run server, an older data root)
 // writes the original only.
 func WriteState(workDir string, st State) error {

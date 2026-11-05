@@ -266,6 +266,16 @@ func (f *fakeRuntimeServer) ListPodStats(_ context.Context, req *runtimev1.ListP
 	return resp, nil
 }
 
+// GetRuntimeInfo answers the probe the way runtimed does, by name, so the fake
+// keeps the shared runtime/v1 contract. It reports no conditions, no GPU facts
+// and healthy=false: the node then advertises nothing and reads the runtime as
+// unhealthy, the same verdicts a failed probe gives, so a test that never asked
+// about capabilities sees the behavior it always had. A test that needs
+// capabilities embeds this fake and overrides the method.
+func (f *fakeRuntimeServer) GetRuntimeInfo(context.Context, *runtimev1.GetRuntimeInfoRequest) (*runtimev1.GetRuntimeInfoResponse, error) {
+	return &runtimev1.GetRuntimeInfoResponse{RuntimeName: runtimed.RuntimeName}, nil
+}
+
 // RestartContainer records the in-place container restart the provider's probe
 // runner drives on a committed liveness failure, returning a
 // successful response with the restarted container's status.

@@ -14,9 +14,9 @@ release tag, when it was published, the Kubernetes version it ships when its rel
 version of the `k3sm` binary you ran, and every node of the cluster with the version its kubelet
 reports, marked `current`, `behind`, or `ahead` (newer than the latest release, such as a build of
 a tag not yet published). A build of an untagged commit, whose version is a Go pseudo-version such
-as `v0.1.8-0.20261025152241-96fbff948562`, ranks by the release it leads up to: it is `ahead` of
-v0.1.7, `behind` v0.1.8, and is shown as an untagged build, for example `ahead, untagged build of
-0.1.8`. A node whose kubelet reports no k3sm version, a development build, or a build from a
+as `v0.2.1-0.20261101120000-96fbff948562`, ranks by the release it leads up to: it is `ahead` of
+v0.2.0, `behind` v0.2.1, and is shown as an untagged build, for example `ahead, untagged build of
+0.2.1`. A node whose kubelet reports no k3sm version, a development build, or a build from a
 modified tree is `unknown`. It only reads; it downloads and installs nothing. It exits 0 when the check finished and 1 when it
 could not (GitHub unreachable, for example), with the reason on stderr.
 
@@ -103,8 +103,47 @@ controller set it; a node you cordoned yourself stays cordoned. It prints each s
 update status` to see which node failed and why before you abort, and fix that node before the
 next `apply`.
 
-The k3sm app offers the same update as a menu item and a button, both of which run
-`k3sm update apply`.
+The k3sm app offers the same updates; see [Updating From k3sm.app](#updating-from-k3smapp).
+
+## Updating From k3sm.app
+
+The command-line path above is unchanged and needs nothing from the app. The app adds a second
+path with two parts: it checks for a newer app, and it moves k3sm to the release it carries.
+
+**The app's own release.** A release build of the app checks for a newer k3sm.app about a minute
+after it starts and then about once a day (half as often under Low power). A check also runs when you choose
+Check for Updates in the app menu or Check Now in Settings > Updates. The check reads one signed
+release index from GitHub. The app verifies the signature and refuses an index older than one it has
+already accepted, so a replayed index is not an offer. A newer release raises a notification, once
+per release while "Notify me when an update is available" is on, and a line in the menu and in Settings > Updates. A release that needs a newer macOS
+than yours is shown and not offered. A development build never checks. Settings > Updates holds
+**Check for app updates automatically**, on by default; with it off, only Check for Updates and
+Check Now send the request. What the request sends is on [Privacy](privacy.md).
+
+**The cluster, pinned to the app's payload.** Each app bundle carries one k3sm release and a signed
+record of that release's archive checksum. When the app carries a newer k3sm than the server runs and
+the cluster has workers, the menu and Settings > Updates offer **Update the Cluster to <tag>**. The app
+asks for an administrator password once. It copies its own bundle into a root-owned stage, checks the
+copy's signature, reads the checksum from the copy, and runs
+
+```sh
+k3sm update apply --yes --version <tag> --pin-sha256 <digest>
+```
+
+so the roll is bound to the bytes the app carries rather than to whatever the release host serves.
+The update controller refuses the release, before any node is cordoned, unless the release's
+checksums file carries exactly that digest. Workers update first and the server last, as for any
+managed update. The app refuses to start the roll when a node is not Ready, when the node list could
+not be read, when a node already runs a newer release, when the installed `k3sm` or the running
+controller does not know the release pin, or when the server runs a release more than one minor
+version older than the app's.
+
+The same flags are on the command line. `--pin-sha256 <digest>` needs `--version` and root, and
+`k3sm update apply --clear-pin` (root, no other flag) removes the pin; both are described under
+[Managed Update](#managed-update). The app does not clear the pin for you.
+
+On a one-node server, and on a worker, the app instead installs the release it carries over this
+Mac's k3sm, with `k3sm install --from-staging`.
 
 ## Single Node
 
@@ -141,7 +180,10 @@ kern.maxfilesperproc=131072` raises it until the next reboot.
 A cluster upgrades **one node at a time**, not all at once. Restarting each node's daemon via `launchctl
 kickstart` creates a short **binary-version-skew window** where old and new nodes coexist; k3sm releases
 are designed so adjacent versions interoperate across that window. Upgrade agents first and the
-control-plane Mac last unless a release note says otherwise. An HA cluster has its own order, mint-authority server first; see [HA](ha.md#upgrading-an-ha-cluster-to-the-aggregation-layer). See [Multi-node](multi-node.md) and
+control-plane Mac last unless a release note says otherwise. The upgrade to v0.2 from a v0.1 release
+is such an exception: upgrade the server first. An agent on v0.2 needs the datapath identity
+certificate that only a v0.2 server issues; an agent upgraded before its server logs that and retries
+every half minute until the server is upgraded (see [Multi-node](multi-node.md#the-datapath-identity)). An HA cluster has its own order, mint-authority server first; see [HA](ha.md#upgrading-an-ha-cluster-to-the-aggregation-layer). See [Multi-node](multi-node.md) and
 [HA](ha.md).
 
 ## How a Managed Update Runs
@@ -400,9 +442,10 @@ sudo k3sm image migrate -o json    # the report as JSON
 ```
 
 `sudo` is needed because the copy reads the node's image store through the runtime's socket, which
-only root and the k3sm service user can open, as for `k3sm image prune`. On a worker, `--report`
-needs it too, since the journal there is readable by root only; without `sudo` the command stops and
-says so. A copy you run pushes the
+only root and the k3sm service user can open, as for `k3sm image prune`. `--report` needs it too,
+since the journal it prints is readable by root only. Without `sudo`, on a server `--report` prints
+the summary `k3sm status` shows (the state and the counts) and says the per-image report needs
+`sudo`, and `-o json` stops and says so; on a worker the command stops and says so. A copy you run pushes the
 way `k3sm build --push` does: through the push gate, with a builder token minted from your
 kubeconfig, to the server's loopback gate on the server and to the server's cluster address on a
 worker. So on a worker you need the kubeconfig described in
@@ -426,7 +469,7 @@ What it does with each image in the node store:
 
 The migration never deletes anything from a node store and never changes its records, so rolling
 back to the previous release finds every image where it was. It is resumable: progress is journalled
-under the work dir (`image-migration/journal.json`) after each image, a re-run skips images the
+under the work dir (`/var/lib/k3sm/server/image-migration/journal.json` by default) after each image, a re-run skips images the
 registry already holds at their digest, and an interrupted run continues where it stopped. A digest-only
 reference (`repo@sha256:...`) has no tag to keep and lands as `<repository>:k3sm-migrated-<12 hex>`.
 

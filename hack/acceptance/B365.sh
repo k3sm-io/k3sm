@@ -23,12 +23,8 @@ K3SM_ROOT="$(cd "$HERE/../.." && pwd)"
 SELF="$HERE/B365.sh"
 DOC="$K3SM_ROOT/docs/user/troubleshooting.md"
 MULTINODE_DOC="$K3SM_ROOT/docs/user/multi-node.md"
-# The voice lint lives in the workspace control-center, one level above the
-# repo checkout in the ordinary layout -- but a lane checkout
-# The voice lint is a workspace-tier gate; this public repo's script must stand
-# alone (no workspace path may appear here). The rung runs only when the caller
-# names the lint through K3SM_VOICE_LINT; otherwise it SKIPs, and the workspace
-# ci (which owns the lint) still covers the file at publish.
+# The voice lint is not part of this repo. The rung runs only when the caller
+# names the lint through K3SM_VOICE_LINT; otherwise it SKIPs.
 VOICE_LINT="${K3SM_VOICE_LINT:-}"
 
 PASS=0; FAIL=0
@@ -57,7 +53,7 @@ ladder "$h" "b365.1  troubleshooting.md has an offline-node/stuck-terminating he
 # Scope every remaining troubleshooting.md rung to the section body, from that
 # heading to the next H2 (or EOF) — never the whole file, or a coincidental hit
 # elsewhere (or the gate's own comment header) would pass a missing section.
-start_line="$(grep -nE '^## .*Node Went Offline.*Stuck Terminating' "$DOC" | head -1 | cut -d: -f1)"
+start_line="$(grep -nE '^## .*Node Went Offline.*Stuck Terminating' "$DOC" | sed -n 1p | cut -d: -f1)"
 if [ -n "$start_line" ]; then
 	end_line="$(awk -v s="$start_line" 'NR>s && /^## /{print NR; exit}' "$DOC")"
 	[ -n "$end_line" ] || end_line=$(( $(wc -l < "$DOC") + 1 ))
@@ -71,11 +67,11 @@ a=ok
 if [ -z "$SECTION" ]; then
 	a=no
 else
-	printf '%s\n' "$SECTION" | grep -qi 'asleep' || a=no
-	printf '%s\n' "$SECTION" | grep -qi 'ping its LAN address\|ping.*LAN' || a=no
+	grep -qi 'asleep' <<<"$SECTION" || a=no
+	grep -qi 'ping its LAN address\|ping.*LAN' <<<"$SECTION" || a=no
 	# It must precede the taint command, or a reader could act before checking.
-	asleep_pos="$(printf '%s\n' "$SECTION" | grep -ni 'asleep' | head -1 | cut -d: -f1)"
-	taint_pos="$(printf '%s\n' "$SECTION" | grep -ni 'kubectl taint node' | head -1 | cut -d: -f1)"
+	asleep_pos="$(printf '%s\n' "$SECTION" | grep -ni 'asleep' | sed -n 1p | cut -d: -f1)"
+	taint_pos="$(printf '%s\n' "$SECTION" | grep -ni 'kubectl taint node' | sed -n 1p | cut -d: -f1)"
 	if [ -z "$asleep_pos" ] || [ -z "$taint_pos" ] || [ "$asleep_pos" -ge "$taint_pos" ]; then
 		a=no
 	fi
@@ -87,10 +83,10 @@ br=ok
 if [ -z "$SECTION" ]; then
 	br=no
 else
-	printf '%s\n' "$SECTION" | grep -qi 'coming back' || br=no
-	printf '%s\n' "$SECTION" | grep -qi 'stop after' || br=no
-	printf '%s\n' "$SECTION" | grep -qi 'leaving the cluster' || br=no
-	printf '%s\n' "$SECTION" | grep -q 'multi-node.md#removing-a-worker' || br=no
+	grep -qi 'coming back' <<<"$SECTION" || br=no
+	grep -qi 'stop after' <<<"$SECTION" || br=no
+	grep -qi 'leaving the cluster' <<<"$SECTION" || br=no
+	grep -q 'multi-node.md#removing-a-worker' <<<"$SECTION" || br=no
 fi
 ladder "$br" "b365.3  the section names the coming-back-vs-leaving branch and cross-links the removal flow"
 
@@ -99,8 +95,8 @@ t=ok
 if [ -z "$SECTION" ]; then
 	t=no
 else
-	printf '%s\n' "$SECTION" | grep -qF 'kubectl taint node <name> node.kubernetes.io/out-of-service=nodeshutdown:NoExecute' || t=no
-	printf '%s\n' "$SECTION" | grep -qF 'kubectl taint node <name> node.kubernetes.io/out-of-service:NoExecute-' || t=no
+	grep -qF 'kubectl taint node <name> node.kubernetes.io/out-of-service=nodeshutdown:NoExecute' <<<"$SECTION" || t=no
+	grep -qF 'kubectl taint node <name> node.kubernetes.io/out-of-service:NoExecute-' <<<"$SECTION" || t=no
 fi
 ladder "$t" "b365.4  the section gives the exact apply and remove out-of-service NoExecute taint commands"
 
@@ -109,13 +105,13 @@ f=ok
 if [ -z "$SECTION" ]; then
 	f=no
 else
-	printf '%s\n' "$SECTION" | grep -qF -- '--grace-period=0' || f=no
-	printf '%s\n' "$SECTION" | grep -qi 'force' || f=no
-	printf '%s\n' "$SECTION" | grep -qi 'two copies can run at once' || f=no
+	grep -qF -- '--grace-period=0' <<<"$SECTION" || f=no
+	grep -qi 'force' <<<"$SECTION" || f=no
+	grep -qi 'two copies can run at once' <<<"$SECTION" || f=no
 	# No em dash anywhere in the section, per the public-tier voice rule; the
 	# voice lint below also catches this, but pinning it here names WHY. The
 	# literal byte match (not -P, absent from BSD grep) is portable to macOS.
-	printf '%s\n' "$SECTION" | grep -qF $'\xe2\x80\x94' && f=no
+	grep -qF $'\xe2\x80\x94' <<<"$SECTION" && f=no
 fi
 ladder "$f" "b365.5  the force-delete escape names --grace-period=0 and the split-brain caveat without an em dash"
 
@@ -124,7 +120,7 @@ s=ok
 if [ -z "$SECTION" ]; then
 	s=no
 else
-	printf '%s\n' "$SECTION" | grep -qi 'k3sm status' || s=no
+	grep -qi 'k3sm status' <<<"$SECTION" || s=no
 fi
 ladder "$s" "b365.6  the section points at the k3sm status workloads-row pointer"
 
@@ -133,9 +129,9 @@ d=ok
 if [ -z "$SECTION" ]; then
 	d=no
 else
-	printf '%s\n' "$SECTION" | grep -qi 'maxSurge' || d=no
-	printf '%s\n' "$SECTION" | grep -qi 'maxUnavailable' || d=no
-	printf '%s\n' "$SECTION" | grep -qi 'DaemonSet' || d=no
+	grep -qi 'maxSurge' <<<"$SECTION" || d=no
+	grep -qi 'maxUnavailable' <<<"$SECTION" || d=no
+	grep -qi 'DaemonSet' <<<"$SECTION" || d=no
 fi
 ladder "$d" "b365.7  the section covers DaemonSet surge settings so one offline node cannot freeze a rollout"
 

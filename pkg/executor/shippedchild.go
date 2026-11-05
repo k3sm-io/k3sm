@@ -33,7 +33,7 @@ import (
 	"k3sm.io/k3sm/internal/binsign"
 )
 
-// The shipped source-built children (kine, etcd, etcdutl) on the release path.
+// The shipped source-built children (kine, etcd, etcdutl, helm) on the release path.
 //
 // A Developer ID-signed k3sm runs the kine and etcd its signed payload carries and
 // nothing else: it never builds them, never looks for a Go toolchain, and ignores
@@ -42,7 +42,8 @@ import (
 // its build stamp read, from the verified bytes themselves (never by running the
 // binary): the version kine's release build stamps into kine's version package, the
 // etcd module version Go records in the binary's build info, and the CGO_ENABLED
-// setting the build info records. That stamp is rendered as the same (version,
+// setting the build info records; for helm, the helm module version and build
+// settings its build info records (helmStampOf). That stamp is rendered as the same (version,
 // variant) pair the dev path's version marker records, and must equal the pins.
 
 // ErrPayloadStamp reports a release-path payload binary whose build stamp, read from

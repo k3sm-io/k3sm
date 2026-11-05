@@ -268,7 +268,7 @@ spike_preflight() {
   [ -r "$KUBECONFIG_RIG" ] || { echo "SPIKE PREFLIGHT FAIL: no kubeconfig at $KUBECONFIG_RIG"; missing=1; }
   [ "$missing" -eq 0 ] || exit 1
   kc get --raw /healthz >/dev/null || { echo "SPIKE PREFLIGHT FAIL: the lab host's apiserver does not answer /healthz"; exit 1; }
-  echo "preflight ok: $(kubectl version --client -o yaml 2>/dev/null | head -2 | tr '\n' ' ')"
+  echo "preflight ok: $(kubectl version --client -o yaml 2>/dev/null | sed -n 1,2p | tr '\n' ' ')"
 }
 PREEOF
 

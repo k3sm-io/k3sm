@@ -268,6 +268,12 @@ func ServerPlist(cfg Config) []byte {
 // A stopping server runs its deferred steps on two lanes at once:
 //
 //	NODE LANE, on the daemon's own goroutine, one step after another:
+//	eviction loop stop 10s  provider.EvictionStopTimeout: the wait for the
+//	                        node-pressure eviction loop to return, run first
+//	                        because the loop acts through the runtime.
+//	budget history      3s  provider.BudgetHistoryStopBound: the budget history
+//	                        writer's join and its last write, run just before
+//	                        the runtime closes so the last counts reach disk.
 //	runtimed close      2s  defaultCloseGrace, runtimed pkg/runtime/close.go: the
 //	                        embedded runtime's close, deferred by startNode. It
 //	                        stops no pod: native pods and vm pods' k3sm-vmhost
@@ -318,30 +324,38 @@ func ServerPlist(cfg Config) []byte {
 //	headroom           10s  launchd's own signal/reap latency and the log flush.
 //
 // So the server's budget is the LONGER of the two lanes, plus the steps after the
-// wait: max(2+2+5+30, 5+25+30+5) + 5 + 10 = 80s. A worker runs no control plane,
+// wait: max(10+3+2+2+5+30, 5+25+30+5) + 5 + 10 = 80s. A worker runs no control plane,
 // no ingest registry and no operators, so its budget is its node lane alone:
-// 2+2+5+5+10 = 24s.
+// 10+3+2+2+5+5+10 = 37s.
 //
-// Every bound is a LITERAL here so the table can be read in one place. Two are
+// Every bound is a LITERAL here so the table can be read in one place. Four are
 // bound back to their owners by more than trust: TestExitTimeOutCoversTheDaemonTeardown
-// compares the control-plane step with executor.StopBound (the one owner this
-// package can import), and hack/acceptance/B253.sh's CI tier reads runtimed's
+// compares the control-plane step with executor.StopBound,
+// TestExitTimeOutCountsTheBudgetHistoryStop and TestExitTimeOutCountsTheEvictionLoopStop
+// compare the budget history and eviction loop steps with provider.BudgetHistoryStopBound
+// and provider.EvictionStopTimeout (both owners importable from a test), and hack/acceptance/B253.sh's CI tier reads runtimed's
 // close grace out of its module and compares it with the close step. The steps
 // whose owners live in package main have no importable owner and no gate; the
 // headroom absorbs a small drift in any of them.
 //
 // The sums are rounded UP to the next multiple of ten, because an ExitTimeOut is
-// read by operators in a plist and 30 is legible where 24 invites the question of
-// what the 4 was for. Rounding up can only add headroom.
+// read by operators in a plist and 30 is legible where 27 invites the question of
+// what the 7 was for. Rounding up can only add headroom.
 //
 // A changed ExitTimeOut reaches a Mac only through the plist launchd reads, so it
 // takes effect at the next `k3sm install` (or managed update), not at a restart.
 const (
-	teardownRuntimedClose = 2
-	teardownControlSocket = 5
-	teardownControlPlane  = 30
-	teardownMesh          = 5
-	teardownHeadroom      = 10
+	// teardownEvictionStop is provider.EvictionStopTimeout in whole seconds: the
+	// node teardown's wait for the eviction loop.
+	teardownEvictionStop = 10
+	// teardownBudgetHistoryStop is provider.BudgetHistoryStopBound in whole
+	// seconds, rounded up: the node teardown's StopBudgetHistory.
+	teardownBudgetHistoryStop = 3
+	teardownRuntimedClose     = 2
+	teardownControlSocket     = 5
+	teardownControlPlane      = 30
+	teardownMesh              = 5
+	teardownHeadroom          = 10
 
 	// teardownStopWaitMargin is the slack runServer's WAIT for the control-plane
 	// lane adds on top of that lane's own steps — cmd/k3sm's
@@ -397,6 +411,8 @@ type teardownStep struct {
 // order each lane runs them. TestExitTimeOutCoversEveryTeardownStep names each
 // step it expects and checks the plist's ExitTimeOut covers them.
 var serverTeardownSteps = []teardownStep{
+	{"eviction loop stop (provider.EvictionStopTimeout)", teardownEvictionStop, laneNode},
+	{"budget history stop (provider.BudgetHistoryStopBound)", teardownBudgetHistoryStop, laneNode},
 	{"runtimed close (defaultCloseGrace)", teardownRuntimedClose, laneNode},
 	{"node update watcher stop (nodeUpdateStopGrace)", teardownNodeUpdate, laneNode},
 	{"node interconnect handlers stop (context drain)", 0, laneNode},
@@ -429,6 +445,8 @@ var serverTeardownSteps = []teardownStep{
 // agentTeardownSteps is every deferred step of a stopping `k3sm agent`: its
 // node's, then its mesh teardown. It has no control-plane lane.
 var agentTeardownSteps = []teardownStep{
+	{"eviction loop stop (provider.EvictionStopTimeout)", teardownEvictionStop, laneNode},
+	{"budget history stop (provider.BudgetHistoryStopBound)", teardownBudgetHistoryStop, laneNode},
 	{"runtimed close (defaultCloseGrace)", teardownRuntimedClose, laneNode},
 	{"node update watcher stop (nodeUpdateStopGrace)", teardownNodeUpdate, laneNode},
 	{"node interconnect handlers stop (context drain)", 0, laneNode},
@@ -493,13 +511,14 @@ const agentThrottleInterval = 10
 // The join credential is rendered as a --token-file PATH and NEVER as a token
 // value. A LaunchDaemon plist is root-owned 0644, so a token on this argv would
 // be readable by every account on the Mac and visible in `ps` for the life of
-// the process; the file the path names is the operator's, is read once at
-// start, and is theirs to delete once the node has joined. A node that has
+// the process; the file the path names is the installer's staged copy in the
+// agent work dir, read at start; the operator's own token file is never
+// referenced by the daemon and is theirs to delete once the node has joined. A node that has
 // already joined needs neither: it starts from its stored credential.
 //
 // ExitTimeOut is derived the same way the server's is (see serverExitTimeOut),
-// from the stages an AGENT runs: it stops its embedded runtime's vm guests, tears
-// down the runtimed control socket, drains the Service proxy's listeners and runs
+// from the stages an AGENT runs: it closes its embedded runtime's supervision,
+// tears down the runtimed control socket, drains the Service proxy's listeners and runs
 // the same deferred mesh teardown the server does — everything except the
 // control-plane stop, which a worker has no control plane to run. A SIGKILL
 // part-way through leaves vm helpers, or a utun and its routes, behind on a node

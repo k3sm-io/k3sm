@@ -1,0 +1,5 @@
+example.com/schild v0.4.0 h1:schildzip=
+example.com/schild v0.4.0/go.mod h1:schildmod=
+example.com/old v1.2.3 h1:oldzip=
+example.com/old v1.2.3/go.mod h1:oldmod=
+example.com/sextra v1.0.0 h1:sextra=

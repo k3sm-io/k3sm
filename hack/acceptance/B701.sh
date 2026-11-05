@@ -313,7 +313,7 @@ server_dir_kind_body() {
 server_dir_kind() {
 	if [ ! -e "$1" ] && [ ! -L "$1" ]; then echo absent; return; fi
 	if [ -L "$1" ] || [ ! -d "$1" ]; then echo other; return; fi
-	if [ -n "$(find "$1" -mindepth 1 -maxdepth 1 ! -name image-migration -print 2>/dev/null | head -1)" ] ||
+	if [ -n "$(find "$1" -mindepth 1 -maxdepth 1 ! -name image-migration -print 2>/dev/null | sed -n 1p)" ] ||
 		[ -L "$1/image-migration" ] || [ ! -d "$1/image-migration" ]; then
 		echo other
 		return
@@ -397,10 +397,10 @@ probe_script() {
 		"BOOT_BOUND=$BOOT_BOUND" "SERVER_DIR=$SERVER_DIR" "SERVER_LOG=$SERVER_LOG"
 	cat <<'BODY'
 newlog() { tail -c +"$((OFF + 1))" "$SERVER_LOG" 2>/dev/null; }
-seen() { newlog | grep -qF "$1"; }
+seen() { grep -qF "$1" <<<"$(newlog)"; }
 kc() { K3SM_WORK_DIR="$SERVER_DIR" "$K3SM" kubectl "$@" 2>/dev/null; }
 utun_up() {
-	ifconfig 2>/dev/null | awk '/^utun[0-9]+:/ { u = 1; next } /^[^ \t]/ { u = 0 } u && /inet /' | grep -qF "inet $LINK --> $LINK "
+	grep -qF "inet $LINK --> $LINK " <<<"$(ifconfig 2>/dev/null | awk '/^utun[0-9]+:/ { u = 1; next } /^[^ \t]/ { u = 0 } u && /inet /')"
 }
 healthy=0
 deadline=$((SECONDS + HEALTHY_BOUND))
@@ -479,7 +479,7 @@ if [ -e "$PRESERVE_DIR" ] || [ -L "$PRESERVE_DIR" ]; then
 	[ -d "$PRESERVE_DIR" ] && [ ! -L "$PRESERVE_DIR" ] || fail the-preserve-path-is-not-a-directory
 	if [ -e "$SERVER_DIR" ] || [ -L "$SERVER_DIR" ]; then
 		[ -d "$SERVER_DIR" ] && [ ! -L "$SERVER_DIR" ] || fail the-server-dir-is-not-a-directory
-		[ -z "$(find "$SERVER_DIR" -mindepth 1 -maxdepth 1 -print 2>/dev/null | head -1)" ] || fail the-server-dir-is-not-empty
+		[ -z "$(find "$SERVER_DIR" -mindepth 1 -maxdepth 1 -print 2>/dev/null | sed -n 1p)" ] || fail the-server-dir-is-not-empty
 	else
 		(umask 077 && mkdir "$SERVER_DIR") || fail mkdir-the-server-dir
 	fi
@@ -905,7 +905,7 @@ REMOTE_S="$(on_server 'mktemp -d "${TMPDIR:-/tmp}/fdb.XXXXXX"' 2>/dev/null | tai
 [ -n "$REMOTE_W" ] && [ -n "$REMOTE_S" ] || refuse "could not make a run directory on both Macs"
 
 PRE_FACTS="$(as_root worker facts "$(facts_script "$WK3SM")" 2>&1)" || true
-printf '%s\n' "$PRE_FACTS" | grep -q '^FDB end$' || refuse "the worker's fact script did not finish: $(printf '%s' "$PRE_FACTS" | tail -3 | tr '\n' ' ')"
+grep -q '^FDB end$' <<<"$PRE_FACTS" || refuse "the worker's fact script did not finish: $(printf '%s' "$PRE_FACTS" | tail -3 | tr '\n' ' ')"
 [ "$(probe_field "$PRE_FACTS" agent_plist)" = 1 ] || refuse "the worker carries no agent LaunchDaemon ($AGENT_PLIST): it is not a joined worker"
 [ "$(probe_field "$PRE_FACTS" server_plist)" = 0 ] || refuse "the worker carries a server LaunchDaemon ($SERVER_PLIST)"
 [ "$(probe_field "$PRE_FACTS" preserve)" = 0 ] || refuse "the worker already holds $PRESERVE_DIR: a previous run was interrupted with the image-migration journal moved aside. Put it back by hand, then run again: sudo mkdir $SERVER_DIR if it is absent (it must be empty), give it the owner and mode the previous run log recorded (sudo chown <uid:gid> $SERVER_DIR; sudo chmod <mode> $SERVER_DIR), then sudo mv $PRESERVE_DIR $MIGRATION_DIR"
@@ -1123,7 +1123,7 @@ leg_pre() {
 	printf '%s\n' "$PRE_WORKER_VERSION" >"$EVIDENCE/pre-worker-version.txt"
 	PRE_STORAGE="$(printf '%s\n' "$PRE_FACTS" | sed -n 's/^FDB-S //p')"
 	printf '%s\n' "$PRE_STORAGE" >"$EVIDENCE/pre-storage.txt"
-	DETAIL="$(wc -l <"$EVIDENCE/pre-meta.txt" | tr -d ' ') non-k3sm label/taint(s), $(printf '%s' "$PRE_STORAGE" | grep -c . || true) PV entr(ies), worker version $(printf '%s' "$PRE_WORKER_VERSION" | head -1)"
+	DETAIL="$(wc -l <"$EVIDENCE/pre-meta.txt" | tr -d ' ') non-k3sm label/taint(s), $(printf '%s' "$PRE_STORAGE" | grep -c . || true) PV entr(ies), worker version $(printf '%s' "$PRE_WORKER_VERSION" | sed -n 1p)"
 }
 run_leg fdb.1
 leg_pre || leg_red
@@ -1250,7 +1250,7 @@ leg_end() {
 		DETAIL="$SERVER_DIR is $(probe_field "$out" server_dir_owner_mode), not $SD_OWNER_MODE as before ($EVIDENCE/final-facts.txt)"
 		return 1
 	fi
-	DETAIL="server $(printf '%s' "$sv" | head -1); worker $(printf '%s' "$wv" | head -1), unchanged; every PV entry present; no throwaway server state left"
+	DETAIL="server $(printf '%s' "$sv" | sed -n 1p); worker $(printf '%s' "$wv" | sed -n 1p), unchanged; every PV entry present; no throwaway server state left"
 }
 run_leg fdb.6
 leg_end || leg_red

@@ -68,7 +68,8 @@ const (
 // DeciderConfig configures the Decider, the server-side half of svclb.
 type DeciderConfig struct {
 	// Client is the server's admin client: it watches Nodes and Services and is
-	// the only writer of HostsAnnotation and of LoadBalancer status.
+	// the only writer of HostsAnnotation and of the LoadBalancer status of every
+	// Service svclb claims (the ingress host writes its own Service's status).
 	Client kubernetes.Interface
 	// SelfNode and SelfAddr are the server's own node and the address the
 	// server derived for it (server-held data: the server process IS that

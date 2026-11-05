@@ -34,7 +34,7 @@ import (
 // round trip costs and far above what a node needs.
 //
 // Onboarding several Macs against ONE token is the case this deliberately does
-// not widen the burst for. The mitigation is a fresh token per batch, which is
+// not widen the burst for. The mitigation is a token per Mac, which is
 // cheap and already the normal way to hand out a join (see
 // docs/user/multi-node.md); widening the burst instead would buy the attacker
 // the same room it bought the operator.
@@ -69,7 +69,7 @@ type joinRateBucket struct {
 // WHAT IT BOUNDS. Everything handleJoin does from the node-password bind
 // onwards: the first-write-wins name binding, the CSR parse and policy checks,
 // the mesh enroll's index carve and the release that gives it back, and up to
-// two signatures. A holder of ONE valid worker token could otherwise drive that
+// three signatures. A holder of ONE valid worker token could otherwise drive that
 // whole round trip as fast as the network allows, enrolling and releasing
 // without bound.
 //

@@ -50,7 +50,7 @@ fi
 # also selects every TestM10_* test in the suite -- which is how this gate came to
 # fail on M10 audit/PSA criteria it does not own and cannot satisfy (they need a
 # default ServiceAccount this bring-up has not created). Anchor any gate's -run.
-if ( cd "$REPO_ROOT" && CGO_ENABLED=1 go test -tags e2e -run '^TestM1$' -timeout 300s ./e2e/... ); then
+if ( cd "$REPO_ROOT" && CGO_ENABLED=1 go test -tags e2e -count=1 -run '^TestM1$' -timeout 300s ./e2e/... ); then
 	ladder ok "m1.A  image->Running + expose->ClusterIP + DNS Service (e2e TestM1)"
 else
 	ladder no "m1.A  image->Running + expose->ClusterIP + DNS Service (e2e TestM1)"

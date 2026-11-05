@@ -68,8 +68,9 @@ type ReleaseIndex struct {
 	// MinimumMacOS is the lowest macOS release the set runs on, MAJOR[.MINOR[.PATCH]].
 	MinimumMacOS string `json:"minimumMacOS"`
 	// MinimumSupportedTag is the oldest final release the project still
-	// supports, vMAJOR.MINOR.PATCH, at or below Tag. The app refuses to go
-	// back to a release below it, and a later index can raise it.
+	// supports, vMAJOR.MINOR.PATCH, at or below Tag. It is the floor the
+	// app's go-back is to honour (docs/design/release-index.md), and a later
+	// index can raise it. ParseReleaseIndex checks its grammar only.
 	MinimumSupportedTag string `json:"minimumSupportedTag"`
 	// App is the app half of the set.
 	App ReleaseIndexApp `json:"app"`

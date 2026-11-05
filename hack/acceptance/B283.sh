@@ -108,9 +108,9 @@ if grep -qE 'r\.TLS\.PeerCertificates' "$K3SM_ROOT/pkg/bootstrap/meshendpoint.go
 # deregistration verb); the pin is that it runs AuthorizeMeshPeerWrite on the
 # cert's node against the body's, and that handleMeshEndpoint hands it the
 # leaf from verifiedNodeLeaf and the request's NodeName.
-sed -n '/^func (s \*Server) authorizeNodeSelf(/,/^}/p' "$K3SM_ROOT/pkg/bootstrap/meshendpoint.go" | grep -qE 'AuthorizeMeshPeerWrite\(certNode, bodyNode\)' || v=no
-sed -n '/^func (s \*Server) handleMeshEndpoint(/,/^}/p' "$K3SM_ROOT/pkg/bootstrap/meshendpoint.go" | grep -qE 's\.verifiedNodeLeaf\(w, r, ' || v=no
-sed -n '/^func (s \*Server) handleMeshEndpoint(/,/^}/p' "$K3SM_ROOT/pkg/bootstrap/meshendpoint.go" | grep -qE 's\.authorizeNodeSelf\(w, leaf, req\.NodeName, ' || v=no
+grep -qE 'AuthorizeMeshPeerWrite\(certNode, bodyNode\)' <<<"$(sed -n '/^func (s \*Server) authorizeNodeSelf(/,/^}/p' "$K3SM_ROOT/pkg/bootstrap/meshendpoint.go")" || v=no
+grep -qE 's\.verifiedNodeLeaf\(w, r, ' <<<"$(sed -n '/^func (s \*Server) handleMeshEndpoint(/,/^}/p' "$K3SM_ROOT/pkg/bootstrap/meshendpoint.go")" || v=no
+grep -qE 's\.authorizeNodeSelf\(w, leaf, req\.NodeName, ' <<<"$(sed -n '/^func (s \*Server) handleMeshEndpoint(/,/^}/p' "$K3SM_ROOT/pkg/bootstrap/meshendpoint.go")" || v=no
 ladder "$v" "b283.1  the handler authorizes on VerifiedChains (never PeerCertificates) + AuthorizeMeshPeerWrite"
 
 s=ok
@@ -137,11 +137,11 @@ run_test() {
 		ladder no "$id  $name ($pkg) passed"
 		return
 	fi
-	if printf '%s\n' "$out" | grep -qE 'no tests to run|no test files'; then
+	if grep -qE 'no tests to run|no test files' <<<"$out"; then
 		ladder no "$id  $name ($pkg) actually RAN — go test reported no tests to run (renamed test?)"
 		return
 	fi
-	if ! printf '%s\n' "$out" | grep -qE "^[[:space:]]*--- PASS: ${name}( |\$)"; then
+	if ! grep -qE "^[[:space:]]*--- PASS: ${name}( |\$)" <<<"$out"; then
 		ladder no "$id  $name ($pkg) actually RAN — no top-level --- PASS line"
 		return
 	fi

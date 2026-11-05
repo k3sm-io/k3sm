@@ -22,9 +22,10 @@ import "context"
 // k3s pkg/executor/embed pattern: apiserver + scheduler + controller-manager +
 // kine as goroutines in THIS process, no child binaries. It is a stub: a feasibility test
 // showed importing the k3s-io/kubernetes command trees into this module is
-// infeasible today, so every method returns ErrEmbeddedNotImplemented. The seam
-// exists so the strategy can land in a later milestone without disturbing
-// callers (which select via the Strategy flag).
+// infeasible today, so Start returns ErrEmbeddedNotImplemented and Ready never
+// reports true. The seam exists so the strategy can land in a later milestone
+// behind the Executor interface; today the server always constructs a Supervised
+// executor.
 type Embedded struct {
 	cfg Config
 }

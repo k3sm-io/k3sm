@@ -49,6 +49,12 @@ const defaultBuilderTokenDuration = time.Hour
 // sent.
 const minBuilderTokenDuration = 10 * time.Minute
 
+// maxBuilderTokenDuration is the longest lifetime a builder token is minted
+// for. The apiserver runs with no --service-account-max-token-expiration, so
+// it would issue a push credential for any lifetime asked; this ceiling is the
+// bound, and a longer request is refused here rather than sent.
+const maxBuilderTokenDuration = 24 * time.Hour
+
 // builderTokenUser is the username a builder token is presented with. The push
 // gate ignores it: the token is the whole credential.
 const builderTokenUser = "builder"
@@ -88,12 +94,17 @@ func (t builderToken) String() string {
 }
 
 // mintBuilderToken asks the cluster for a token for the builder ServiceAccount,
-// audience registrysvc.RegistryAudience, valid for d. A token the apiserver
-// issued for LESS than d means d is above its maximum, and is refused rather
-// than handed back as if it were what was asked for.
+// audience registrysvc.RegistryAudience, valid for d. A d outside
+// [minBuilderTokenDuration, maxBuilderTokenDuration] is refused before any
+// request. A token the apiserver issued for LESS than d means it clamped the
+// lifetime, and is refused rather than handed back as if it were what was
+// asked for.
 func mintBuilderToken(ctx context.Context, sa serviceAccountTokens, d time.Duration, now func() time.Time) (builderToken, error) {
 	if d < minBuilderTokenDuration {
 		return builderToken{}, fmt.Errorf("%w: %s is below the minimum of %s", errBuilderTokenDuration, d, minBuilderTokenDuration)
+	}
+	if d > maxBuilderTokenDuration {
+		return builderToken{}, fmt.Errorf("%w: %s is above the maximum of %s", errBuilderTokenDuration, d, maxBuilderTokenDuration)
 	}
 	secs := int64(d / time.Second)
 	asked := now()
@@ -116,8 +127,10 @@ func mintBuilderToken(ctx context.Context, sa serviceAccountTokens, d time.Durat
 		return builderToken{}, fmt.Errorf("%w: the apiserver answered with no token", errBuilderTokenRefused)
 	}
 	exp := resp.Status.ExpirationTimestamp.Time
-	// A minute of slack covers the round trip and clock skew between this Mac
-	// and the server; a clamp to the apiserver's maximum is far larger.
+	// The ceiling is maxBuilderTokenDuration, checked above; this clamp check
+	// is defence in depth, should an apiserver maximum below it ever be
+	// configured. A minute of slack covers the round trip and clock skew
+	// between this Mac and the server; such a clamp is far larger.
 	if exp.Before(asked.Add(d - time.Minute)) {
 		return builderToken{}, fmt.Errorf("%w: %s is above the cluster's maximum (it issued a token valid until %s)",
 			errBuilderTokenDuration, d, exp.UTC().Format(time.RFC3339))

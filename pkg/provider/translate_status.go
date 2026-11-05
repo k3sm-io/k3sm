@@ -112,7 +112,7 @@ func toPodStatus(pod *corev1.Pod, rs *runtimev1.PodStatus, nodeIP string, startT
 	if containersReady {
 		crStatus = corev1.ConditionTrue
 	}
-	// Merge-not-replace (mirrors the QOSClass carry-forward above): emit the four
+	// Merge-not-replace (mirrors the QOSClass carry-forward above): emit the five
 	// provider-owned conditions — PodReady via the shared computeReadiness seam so
 	// spec.readinessGates are honored — then carry forward any external condition
 	// on the input pod (e.g. a readinessGate a controller patched) so it survives
@@ -456,8 +456,9 @@ func isProviderOwnedCondition(t corev1.PodConditionType) bool {
 	}
 }
 
-// carryForwardExternalConditions returns the pod's existing conditions minus the
-// four provider-owned types, so external/readinessGate conditions survive a provider
+// carryForwardExternalConditions returns the pod's existing conditions minus every
+// type isProviderOwnedCondition claims (the five Pod conditions the provider
+// computes and the node-owned runtime conditions), so external/readinessGate conditions survive a provider
 // status rebuild (merge-not-replace, mirroring the QOSClass carry-forward in
 // toPodStatus). A nil pod yields nil.
 //

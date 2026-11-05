@@ -40,6 +40,17 @@ type fakePurge struct {
 	stats map[string]PathStat
 	// resolved answers ResolvePath; an absent key resolves to itself.
 	resolved map[string]string
+	// gone makes ResolvePath fail with fs.ErrNotExist for a path under any
+	// of its keys: a directory that no longer exists.
+	gone map[string]bool
+	// resolveErrs makes ResolvePath fail with its value for a path under any
+	// of its keys: a directory that exists but cannot be read (EACCES, EIO).
+	resolveErrs map[string]error
+	// listErrs makes ListOwned fail with its value for a directory that is one
+	// of its keys: a directory whose entries cannot be read (EACCES, EIO).
+	listErrs map[string]error
+	// links answers Readlink; an absent key is not a symlink that exists.
+	links map[string]string
 	// markers answers ReadDataRootMarker; markerErrs overrides it.
 	markers    map[string]dataroot.MarkerFacts
 	markerErrs map[string]error
@@ -128,10 +139,28 @@ func (f *fakeSystem) putMarker(dir string, facts dataroot.MarkerFacts) {
 
 func (f *fakeSystem) ResolvePath(path string) (string, error) {
 	f.calls = append(f.calls, "ResolvePath:"+path)
+	for dir := range f.purge.gone {
+		if path == dir || strings.HasPrefix(path, dir+"/") {
+			return "", &fs.PathError{Op: "lstat", Path: dir, Err: fs.ErrNotExist}
+		}
+	}
+	for dir, err := range f.purge.resolveErrs {
+		if path == dir || strings.HasPrefix(path, dir+"/") {
+			return "", &fs.PathError{Op: "lstat", Path: dir, Err: err}
+		}
+	}
 	if r, ok := f.purge.resolved[path]; ok {
 		return r, nil
 	}
 	return path, nil
+}
+
+func (f *fakeSystem) Readlink(path string) (string, error) {
+	f.calls = append(f.calls, "Readlink:"+path)
+	if t, ok := f.purge.links[path]; ok {
+		return t, nil
+	}
+	return "", &fs.PathError{Op: "readlink", Path: path, Err: fs.ErrNotExist}
 }
 
 func (f *fakeSystem) StatNoFollow(path string) (PathStat, error) {

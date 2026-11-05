@@ -87,6 +87,12 @@ func (g gateRegistry) dial(ctx context.Context, _, addr string) (net.Conn, error
 
 func startGateRegistry(t *testing.T) gateRegistry {
 	t.Helper()
+	return startGateRegistryWith(t, registry.New(registry.Logger(log.New(io.Discard, "", 0))))
+}
+
+// startGateRegistryWith is startGateRegistry serving inner as the registry.
+func startGateRegistryWith(t *testing.T, inner http.Handler) gateRegistry {
+	t.Helper()
 	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -115,7 +121,7 @@ func startGateRegistry(t *testing.T) gateRegistry {
 	if err != nil {
 		t.Fatal(err)
 	}
-	probe := &authProbe{inner: registry.New(registry.Logger(log.New(io.Discard, "", 0)))}
+	probe := &authProbe{inner: inner}
 	ln := &memListener{
 		ap:    netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), gateRegistryPort),
 		conns: make(chan net.Conn), closed: make(chan struct{}),

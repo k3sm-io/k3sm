@@ -40,8 +40,9 @@ const registryServingValidity = 30 * 24 * time.Hour
 // the controller-manager republishes into every namespace as kube-root-ca.crt,
 // so every Pod already trusts it through its service-account ca.crt. The key
 // is generated and held in memory and is never written to disk; the identity
-// re-mints before expiry with the other in-memory component certificates'
-// lifetime (registryServingValidity) and the shared margin.
+// re-mints before expiry with the shared margin (nodecred.ExpiryMargin), at its
+// own shorter lifetime (registryServingValidity), not the other component
+// certificates' executor.ComponentCertValidity.
 //
 // It returns nil, and logs why, when the hierarchy cannot be loaded or carries
 // no cluster CA key. The relay then stays off: there is no plain-HTTP relay to

@@ -18,6 +18,7 @@ package mlx
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -63,6 +64,17 @@ const (
 	// model is not serving. Under the StatefulSet's Always restart policy this
 	// should not happen, which is why it is reported rather than waited out.
 	ReasonPodFailed = "PodFailed"
+	// ReasonCrashing means a replica's serving container keeps failing: the
+	// kubelet is backing off restarting it (CrashLoopBackOff), could not create
+	// or start it, or it last exited non-zero and has not become ready since.
+	// The message names the replica, the waiting reason, the last exit code and
+	// what the container or the kubelet said. Restarts continue, but a crash
+	// that repeats rarely heals without a change to the spec or the image.
+	ReasonCrashing = "Crashing"
+	// ReasonImagePullFailed means a replica's serving image cannot be pulled
+	// (ErrImagePull, ImagePullBackOff, InvalidImageName). The message carries
+	// the kubelet's pull error.
+	ReasonImagePullFailed = "ImagePullFailed"
 )
 
 // ProbeVerdict is one replica's serving-surface verdict as observed by the
@@ -122,6 +134,34 @@ type PodState struct {
 	// pod never counts as ready, even while its Ready condition is still true:
 	// it is on its way out and the Service is already draining it.
 	Terminating bool
+	// Container is what the kubelet last said about the serving container: why
+	// it is waiting and how it last exited. It is what tells a replica that is
+	// still starting from one that keeps failing, which readiness alone cannot:
+	// both are simply not ready. Build it with ServingContainerState.
+	Container ContainerState
+}
+
+// ContainerState is the serving container's waiting and last-exit facts, copied
+// out of the pod's container status so the derivation stays a function of plain
+// values. The zero value means "nothing known", which derives as a replica that
+// is starting, never as one that is failing.
+type ContainerState struct {
+	// WaitingReason is State.Waiting.Reason (CrashLoopBackOff, ImagePullBackOff,
+	// ContainerCreating, ...), empty when the container is not waiting.
+	WaitingReason string
+	// WaitingMessage is State.Waiting.Message.
+	WaitingMessage string
+	// Terminated reports that the container either is terminated now or has a
+	// last termination on record; ExitCode, TerminatedReason and
+	// TerminatedMessage describe that exit (the current one first).
+	Terminated bool
+	// ExitCode is the exit code of that termination.
+	ExitCode int32
+	// TerminatedReason is the kubelet's reason for that termination (Error,
+	// OOMKilled, Completed).
+	TerminatedReason string
+	// TerminatedMessage is the termination message the container wrote.
+	TerminatedMessage string
 }
 
 // Observation is the injected state one status derivation reads: the replicas
@@ -280,7 +320,10 @@ func PhaseFromConditions(conds []metav1.Condition) mlxv1alpha1.MLXModelPhase {
 		return mlxv1alpha1.MLXModelPhaseDownloading
 	case ReasonLoading:
 		return mlxv1alpha1.MLXModelPhaseLoading
-	case ReasonPodFailed:
+	case ReasonPodFailed, ReasonCrashing, ReasonImagePullFailed:
+		// A crash loop and a failing pull are retried by the kubelet, but they
+		// repeat until the spec or the image changes, which is what Failed
+		// tells a human reading the column.
 		return mlxv1alpha1.MLXModelPhaseFailed
 	default:
 		return ""
@@ -354,7 +397,9 @@ const (
 //     currently serving traffic is worse than one that omits a fault the owned
 //     StatefulSet's own conditions still carry;
 //  3. failure before progress — a terminal pod outranks a sibling that is merely
-//     starting, because waiting on the sibling hides the fault;
+//     starting, because waiting on the sibling hides the fault; a replica whose
+//     serving container keeps failing (see containerFault) comes next, for the
+//     same reason;
 //  4. otherwise the LAGGARD's stage, per replicaStage above.
 //
 // "Ready" here is REVISION-AWARE: a replica counts only when it is Ready, not
@@ -369,6 +414,7 @@ const (
 func deriveReady(desired int32, obs Observation, unit string) (ready bool, counts replicaCounts, reason, message string) {
 	counts.replicas = int32(len(obs.Pods))
 	var failed, laggardName string
+	var faultName, faultReason, faultDetail string
 	laggardStale := false
 	laggard := stageReady
 	for _, p := range obs.Pods {
@@ -385,6 +431,12 @@ func deriveReady(desired int32, obs Observation, unit string) (ready bool, count
 		s := stageOf(p, obs.CurrentRevision)
 		if s == stageReady {
 			counts.ready++
+			continue
+		}
+		if r, d, ok := containerFault(p, obs.CurrentRevision); ok {
+			if faultName == "" {
+				faultName, faultReason, faultDetail = p.Name, r, d
+			}
 			continue
 		}
 		if s < laggard {
@@ -406,6 +458,8 @@ func deriveReady(desired int32, obs Observation, unit string) (ready bool, count
 		return true, counts, ReasonServing, fmt.Sprintf("%d of %d %s ready", readyCount, desired, unit)
 	case failed != "":
 		return false, counts, ReasonPodFailed, fmt.Sprintf("replica %s failed (%d of %d %s ready)", failed, readyCount, desired, unit)
+	case faultName != "":
+		return false, counts, faultReason, fmt.Sprintf("replica %s %s (%d of %d %s ready)", faultName, faultDetail, readyCount, desired, unit)
 	case laggard == stageLoading:
 		return false, counts, ReasonLoading, fmt.Sprintf("replica %s is loading the model (%d of %d %s ready)", laggardName, readyCount, desired, unit)
 	case laggard == stageDownloading:
@@ -434,4 +488,113 @@ func endpoint(m *mlxv1alpha1.MLXModel, opts StatusOptions) string {
 		domain = dns.DefaultClusterDomain
 	}
 	return fmt.Sprintf("%s.%s.svc.%s:%d", ServiceName(m.Name), m.Namespace, domain, port)
+}
+
+// ServingContainerState copies the serving container's waiting and last-exit
+// facts out of pod's status. A pod with no status for the serving container yet
+// yields the zero value.
+func ServingContainerState(pod *corev1.Pod) ContainerState {
+	if pod == nil {
+		return ContainerState{}
+	}
+	for i := range pod.Status.ContainerStatuses {
+		cs := &pod.Status.ContainerStatuses[i]
+		if cs.Name != containerName {
+			continue
+		}
+		var out ContainerState
+		if w := cs.State.Waiting; w != nil {
+			out.WaitingReason, out.WaitingMessage = w.Reason, w.Message
+		}
+		t := cs.State.Terminated
+		if t == nil {
+			t = cs.LastTerminationState.Terminated
+		}
+		if t != nil {
+			out.Terminated = true
+			out.ExitCode, out.TerminatedReason, out.TerminatedMessage = t.ExitCode, t.Reason, t.Message
+		}
+		return out
+	}
+	return ContainerState{}
+}
+
+// The kubelet waiting reasons that mean the serving image cannot be pulled, and
+// those that mean the container cannot be created or started or keeps exiting.
+// Any other waiting reason (ContainerCreating, PodInitializing) is a wait.
+var (
+	pullFailureReasons = map[string]bool{
+		"ErrImagePull":      true,
+		"ImagePullBackOff":  true,
+		"InvalidImageName":  true,
+		"ErrImageNeverPull": true,
+	}
+	crashReasons = map[string]bool{
+		"CrashLoopBackOff":           true,
+		"CreateContainerError":       true,
+		"CreateContainerConfigError": true,
+		"RunContainerError":          true,
+	}
+)
+
+// maxFaultMessageRunes caps the container and kubelet text a fault message
+// quotes. A Python traceback in a termination message runs to kilobytes; the
+// condition needs its first line or two, and `kubectl logs` has the rest.
+const maxFaultMessageRunes = 256
+
+// containerFault reports whether a not-ready replica's serving container is
+// failing rather than starting, with the Ready reason and the message detail
+// that say so. It looks only at a replica that is not ready, not terminating
+// and on the current pod template (or any, while the current one is unknown):
+// an old-revision pod's crash is being replaced by the roll, and a ready pod's
+// past crash is history.
+func containerFault(p PodState, current string) (reason, detail string, ok bool) {
+	if p.Ready || p.Terminating || p.Phase == corev1.PodSucceeded || (current != "" && !isCurrent(p, current)) {
+		return "", "", false
+	}
+	c := p.Container
+	switch {
+	case pullFailureReasons[c.WaitingReason]:
+		d := "cannot pull its image: " + c.WaitingReason
+		if msg := faultText(c.WaitingMessage); msg != "" {
+			d += ": " + msg
+		}
+		return ReasonImagePullFailed, d, true
+	case crashReasons[c.WaitingReason], c.Terminated && c.ExitCode != 0:
+		var parts []string
+		if c.WaitingReason != "" {
+			parts = append(parts, c.WaitingReason)
+		}
+		if c.Terminated {
+			exit := fmt.Sprintf("last exit code %d", c.ExitCode)
+			if c.TerminatedReason != "" {
+				exit += " (" + c.TerminatedReason + ")"
+			}
+			parts = append(parts, exit)
+		}
+		d := "is crashing: " + strings.Join(parts, ", ")
+		if msg := faultText(c.TerminatedMessage, c.WaitingMessage); msg != "" {
+			d += ": " + msg
+		}
+		return ReasonCrashing, d, true
+	default:
+		return "", "", false
+	}
+}
+
+// faultText joins the non-empty messages with "; ", folds every run of
+// whitespace (newlines included) to one space so the condition stays one line,
+// and truncates the result to maxFaultMessageRunes.
+func faultText(msgs ...string) string {
+	var kept []string
+	for _, m := range msgs {
+		if f := strings.Join(strings.Fields(m), " "); f != "" {
+			kept = append(kept, f)
+		}
+	}
+	out := strings.Join(kept, "; ")
+	if r := []rune(out); len(r) > maxFaultMessageRunes {
+		out = string(r[:maxFaultMessageRunes]) + "..."
+	}
+	return out
 }

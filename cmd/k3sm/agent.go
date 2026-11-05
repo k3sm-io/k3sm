@@ -141,8 +141,8 @@ func registerAgentFlags(fs *flag.FlagSet, opts *agentOptions) {
 // escalating one deliberately: nothing here recovers by waiting longer, and an
 // operator who fixes the cause should not then wait minutes for the retry.
 //
-// (There is no agent LaunchDaemon renderer in this repo yet; the supervisor is
-// whatever the operator wrote. The backoff costs nothing when it is a shell.)
+// (The agent LaunchDaemon is rendered by pkg/install's AgentPlist with a bare
+// KeepAlive, which is the supervisor this backoff is written for.)
 const agentTerminalBackoff = 30 * time.Second
 
 // agentTerminalDelay is the backoff actually applied. Tests shorten it; nothing
@@ -285,7 +285,7 @@ func refuseAgentOnServerMac(sys install.PlistReader) error {
 // the daemon's own half, and it matters for the starts install is not driving:
 // a reboot, a `launchctl kickstart`, a helper an operator restarted underneath
 // a running worker. Ten seconds is deliberately shorter than the terminal
-// backoff a start failure would cost (30s) and shorter still than launchd's
+// backoff a start failure would cost (30s) and equal to launchd's
 // respawn throttle — a helper that is merely a second late costs a few polls
 // instead of a recorded failure, and one that is genuinely not coming back is
 // still reported inside the same minute.
@@ -491,8 +491,10 @@ func agentStart(ctx context.Context, opts agentOptions, breaker *crashBreaker, l
 
 	// Bring up the wireguard mesh (the root utun leg, direct or via the helper) and
 	// keep it converging via the MeshPeer watch, THEN the node-local datapath (the
-	// Service proxy + per-node cluster DNS resolver). `--network none` skips both
-	// (control-plane-only / CI join); the node still registers below.
+	// Service proxy + per-node cluster DNS resolver). `--network none` skips both;
+	// a worker under it then refuses to start, because its kubelet API must bind
+	// the assigned mesh address that only the mesh plumbs (warnNoDatapathInternalIP,
+	// errKubeletAddress).
 	//
 	// datapath is the Server the in-process node feeds vm-pod transport overrides
 	// into; it stays nil under `--network none`, where there is no proxy to feed.
@@ -806,6 +808,8 @@ func agentNodeOptions(opts agentOptions, res *bootstrap.JoinResult, kubeconfigPa
 		kubeletPort: ports.KubeletAPIPort,
 		podRoot:     opts.podRoot,
 		updateRoot:  updateRootFor(opts.workDir),
+		budgetDir:   budgetDirFor(opts.workDir),
+		statusDir:   agentStatusDir(opts.workDir),
 		// The recorded release base, which the update watcher's pin admits.
 		updateReleaseBase: opts.updateReleaseBase,
 		// The cluster CA this worker's credential pins: an update's signer
@@ -1053,7 +1057,7 @@ func meshTeardownOnExit(ctx context.Context, down meshTeardown, logger *slog.Log
 // bring-up-then-teardown sequence with no privilege and no apiserver.
 type meshSeam struct {
 	newMesh  func(self netip.Prefix, opts ...mesh.Option) (meshDatapath, error)
-	newWatch func(cfg *rest.Config, m meshDatapath, logger *slog.Logger) (meshWatch, error)
+	newWatch func(cfg *rest.Config, m meshDatapath, logger *slog.Logger, opts ...mesh.WatcherOption) (meshWatch, error)
 }
 
 // productionMeshSeam builds the real wireguard mesh and its watcher. The watcher
@@ -1063,12 +1067,12 @@ var productionMeshSeam = meshSeam{
 	newMesh: func(self netip.Prefix, opts ...mesh.Option) (meshDatapath, error) {
 		return mesh.New(self, opts...)
 	},
-	newWatch: func(cfg *rest.Config, m meshDatapath, logger *slog.Logger) (meshWatch, error) {
+	newWatch: func(cfg *rest.Config, m meshDatapath, logger *slog.Logger, opts ...mesh.WatcherOption) (meshWatch, error) {
 		wg, ok := m.(*mesh.Mesh)
 		if !ok {
 			return nil, fmt.Errorf("mesh watcher needs darwin-net's *mesh.Mesh, got %T", m)
 		}
-		return mesh.NewWatcher(cfg, wg, logger)
+		return mesh.NewWatcher(cfg, wg, logger, opts...)
 	},
 }
 
@@ -1158,7 +1162,11 @@ func bringUpMesh(ctx context.Context, in meshBringUp, mode hostnet.Mode, logger 
 	if restErr != nil {
 		return teardown, fmt.Errorf("load kubeconfig for mesh watch: %w", restErr)
 	}
-	watcher, err := activeMeshSeam.newWatch(restCfg, m, logger)
+	var watchOpts []mesh.WatcherOption
+	if in.handshakeStatus {
+		watchOpts = append(watchOpts, mesh.WithHandshakeStatus())
+	}
+	watcher, err := activeMeshSeam.newWatch(restCfg, m, logger, watchOpts...)
 	if err != nil {
 		return teardown, fmt.Errorf("build mesh watcher: %w", err)
 	}

@@ -1,0 +1,7 @@
+go test fuzz v1
+uint8(0)
+string("/v2/app/referrers/{s}")
+string("last={s}&n=0")
+string("")
+uint8(0)
+[]byte("")

@@ -49,8 +49,8 @@ func testKubeletAuth(t *testing.T) *provider.KubeletEndpointAuth {
 }
 
 // upstreamProxyable is the apiserver node-proxy predicate, restated from
-// kubernetes v1.36.2 pkg/registry/core/node/strategy.go:275-291
-// (isProxyableHostname, reached from ResourceLocation at :256):
+// kubernetes v1.37.1 pkg/registry/core/node/strategy.go
+// (isProxyableHostname, reached from ResourceLocation):
 //
 //	resp, err := net.DefaultResolver.LookupIPAddr(ctx, hostname)
 //	...

@@ -95,7 +95,11 @@ ladder "$w" "b282.1  the provider reads the FILE (podlogs.ReadLogs) and no longe
 
 w=ok
 grep -qE 'ExtraRoutes' "$K3SM_ROOT/pkg/provider/vkadapter/vkadapter.go" || w=no
-grep -qE 'ExtraRoutes:\s*containerLogRoutes\(prov\)' "$K3SM_ROOT/cmd/k3sm/node.go" || w=no
+# The logs route rides the ExtraRoutes value, alone or as the first operand of
+# an append that adds other k3sm routes, and containerLogRoutes is called from
+# exactly one place in non-test cmd/ code: no second registration path.
+grep -qE 'ExtraRoutes:\s*(append\()?containerLogRoutes\(prov\)' "$K3SM_ROOT/cmd/k3sm/node.go" || w=no
+[ "$(grep -rhoE 'containerLogRoutes\(prov\)' --include='*.go' --exclude='*_test.go' "$K3SM_ROOT/cmd" | wc -l | tr -d ' ')" = 1 ] || w=no
 grep -qE 'HandlerPath\s*=\s*"/containerLogs/"' "$K3SM_ROOT/pkg/provider/podlogs/handler.go" || w=no
 ladder "$w" "b282.1  the kubelet /containerLogs handler is registered through the ONE vkadapter seam"
 
@@ -134,11 +138,11 @@ run_test() {
 		ladder no "$id  $name ($pkg) passed"
 		return
 	fi
-	if printf '%s\n' "$out" | grep -qE 'no tests to run|no test files'; then
+	if grep -qE 'no tests to run|no test files' <<<"$out"; then
 		ladder no "$id  $name ($pkg) actually RAN — go test reported no tests to run (renamed test?)"
 		return
 	fi
-	if ! printf '%s\n' "$out" | grep -qE "^[[:space:]]*--- PASS: ${name}( |\$)"; then
+	if ! grep -qE "^[[:space:]]*--- PASS: ${name}( |\$)" <<<"$out"; then
 		ladder no "$id  $name ($pkg) actually RAN — no top-level --- PASS line"
 		return
 	fi
@@ -330,7 +334,7 @@ else
 		# for both, the same readiness gate the release suite applies.
 		ready=0
 		for i in $(seq 1 60); do
-			if bkc get node b282-logs -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null | grep -q True \
+			if grep -q True <<<"$(bkc get node b282-logs -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" \
 				&& bkc get serviceaccount default >/dev/null 2>&1; then ready=1; break; fi
 			sleep 2
 		done
@@ -342,7 +346,7 @@ else
 		# Wait for the log file to appear, then for the writer to finish.
 		n=0; dir=""
 		while [ $n -lt 180 ]; do
-			dir="$(find "$LOGTREE" -type d -name chatty 2>/dev/null | head -1 || true)"
+			dir="$(find "$LOGTREE" -type d -name chatty 2>/dev/null | sed -n 1p || true)"
 			[ -n "$dir" ] && [ -f "$dir/0.log" ] && break
 			sleep 1; n=$((n+1))
 		done
@@ -357,8 +361,8 @@ else
 		# rotation the current 0.log can be empty and the content sits in the
 		# newest timestamped sibling (upstream keeps that one uncompressed).
 		sample="$dir/0.log"
-		[ -s "$sample" ] || sample="$(ls "$dir"/0.log.[0-9]* 2>/dev/null | grep -v '\.gz$' | head -1)"
-		if [ -n "$dir" ] && head -1 "$sample" 2>/dev/null | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z? (stdout|stderr) [FP] '; then
+		[ -s "$sample" ] || sample="$(ls "$dir"/0.log.[0-9]* 2>/dev/null | grep -v '\.gz$' | sed -n 1p)"
+		if [ -n "$dir" ] && grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z? (stdout|stderr) [FP] ' <<<"$(head -1 "$sample" 2>/dev/null)"; then
 			ladder ok "b282.L1  the file is in the CRI line format (<timestamp> <stream> <F|P> <content>)"
 		else
 			ladder no "b282.L1  the file is in the CRI line format; first line: $(head -1 "$sample" 2>/dev/null | cut -c1-80)"
@@ -394,7 +398,7 @@ else
 		else
 			ladder no "b282.L3  --limit-bytes cuts mid-line (got: $(bkc logs chatty --tail 1 --limit-bytes 4 2>&1 | cut -c1-60))"
 		fi
-		if bkc logs chatty --tail 1 --timestamps 2>/dev/null | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z? LASTLINE$'; then
+		if grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z? LASTLINE$' <<<"$(bkc logs chatty --tail 1 --timestamps 2>/dev/null)"; then
 			ladder ok "b282.L3  --timestamps prefixes the line with its own timestamp"
 		else
 			ladder no "b282.L3  --timestamps prefixes the line (got: $(bkc logs chatty --tail 1 --timestamps 2>&1 | cut -c1-60))"
@@ -451,7 +455,7 @@ else
 		bkc apply -f "$B282_WORK/restarter.yaml" >/dev/null 2>&1 || true
 		n=0; prev=no
 		while [ $n -lt 180 ]; do
-			if bkc logs restarter --previous 2>/dev/null | grep -q INSTANCE-; then prev=ok; break; fi
+			if grep -q INSTANCE- <<<"$(bkc logs restarter --previous 2>/dev/null)"; then prev=ok; break; fi
 			sleep 2; n=$((n+2))
 		done
 		ladder "$prev" "b282.L5  after a restart, \`kubectl logs --previous\` returns the earlier instance's output"

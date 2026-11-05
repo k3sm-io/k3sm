@@ -65,9 +65,8 @@ import (
 // join RPC, this server's EnrollSelf, the member route's reservation, refreshes and
 // releases), so one process never interleaves two of them. It is not what makes a
 // range unique across processes; the claim is. A worker's podCIDR is the LOWEST
-// index ≥ 1 whose claim it wins (index 0 is the first server's by convention); it is
-// a dev-scale scheme — robust index recycling across node deletes is not
-// implemented.
+// index ≥ 1 whose claim it wins (index 0 is the first server's by convention); a
+// deleted node's range is reused through Deregister.
 type meshEnroller struct {
 	client     rest.Interface
 	clusterPod netip.Prefix
@@ -227,9 +226,9 @@ func (e *meshEnroller) Enroll(ctx context.Context, nodeName string, req netv1.Me
 
 // ReleaseAllocation implements bootstrap.Enroller: it deletes the MeshPeer a FRESH
 // Enroll wrote for a join that then failed, so the pod /24 it carved goes back to
-// lowestFreeNodeIndex instead of being burned. Index recycling across node DELETES
-// is a separate, unimplemented concern; this is only the undo of an allocation the
-// same request just made.
+// lowestFreeNodeIndex instead of being burned. A node's deletion gives its range
+// back through Deregister; this is only the undo of an allocation the same
+// request just made.
 //
 // It deletes the peer THIS join wrote and no other. The node name does not
 // identify that peer: a second join of the same name — a launchd-orphaned retry is

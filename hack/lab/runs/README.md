@@ -45,7 +45,7 @@ missing any of them is not evidence:
 | `git_sha.<repo>` | The commit each of the four modules was built from — `apis`, `runtimed`, `darwin-net`, `k3sm`. One binary, four repos; a single "the SHA" would be a lie. `unknown` when a sibling repo is not checked out, which is an evidence gap to see, not to hide. |
 | `result` | `PASS` or `FAIL`, recorded **in the log**. Exit status is not archived; a log whose verdict must be inferred from its prose gets inferred wrong. The header opens with a provisional, fail-closed `result:` line; the **last** `result:` line in the log is authoritative (`emit_run_log_verdict` in `hack/lab/lib/runlog.sh`). |
 
-`mode`, `rc_tag` and `started_utc` ride along for context.
+`mode`, `rc_tag`, `started_utc` and `tolerate_keys` ride along for context; the closing verdict adds `finished_utc`.
 
 ## Running a gate
 

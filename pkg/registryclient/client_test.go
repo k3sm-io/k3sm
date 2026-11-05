@@ -21,8 +21,10 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -242,5 +244,67 @@ func TestNewValidatesTheBaseURL(t *testing.T) {
 	c, err := registryclient.New("https://127.0.0.1:6450/", registryclient.Options{})
 	if err != nil || c.Host() != "127.0.0.1:6450" {
 		t.Errorf("New = %v, %v; want host 127.0.0.1:6450", c, err)
+	}
+}
+
+// TestDescriberReadsEachDigestOnce: a Describer reads each tag's own manifest
+// and each child manifest or config a digest names once, however many tags
+// and concurrent callers reach it, and describes exactly what Describe does.
+func TestDescriberReadsEachDigestOnce(t *testing.T) {
+	reg := registrytest.New()
+	base := []byte("base")
+	a := reg.Image("mirror", "", registryclient.Platform{OS: "linux", Architecture: "arm64"}, base, []byte("arm"))
+	b := reg.Image("mirror", "", registryclient.Platform{OS: "linux", Architecture: "amd64"}, base, []byte("amd"))
+	tags := []string{"v1", "v1.0", "latest", "stable"}
+	for _, tag := range tags {
+		reg.Index("mirror", tag, a, b)
+	}
+	reg.Image("lone", "v1", registryclient.Platform{OS: "darwin", Architecture: "arm64"}, base)
+	reg.Image("lone", "v2", registryclient.Platform{OS: "darwin", Architecture: "arm64"}, base)
+
+	var mu sync.Mutex
+	reads := map[string]int{}
+	counted := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		reads[r.URL.Path]++
+		mu.Unlock()
+		reg.Handler().ServeHTTP(w, r)
+	})
+	c := newClient(t, counted, registryclient.Options{})
+	d := c.NewDescriber()
+	type ref struct{ repo, tag string }
+	refs := []ref{{"lone", "v1"}, {"lone", "v2"}}
+	for _, tag := range tags {
+		refs = append(refs, ref{"mirror", tag})
+	}
+	got := make([]registryclient.Image, len(refs))
+	var wg sync.WaitGroup
+	for i, r := range refs {
+		wg.Go(func() {
+			img, err := d.Describe(context.Background(), r.repo, r.tag)
+			if err != nil {
+				t.Errorf("Describe %s:%s: %v", r.repo, r.tag, err)
+			}
+			got[i] = img
+		})
+	}
+	wg.Wait()
+	for path, n := range reads {
+		if n != 1 {
+			t.Errorf("%s read %d times; want once", path, n)
+		}
+	}
+	// 6 tag manifests, 2 index children, and the lone images' one shared config.
+	if len(reads) != 9 {
+		t.Errorf("%d distinct reads %v; want 9", len(reads), reads)
+	}
+	for i, r := range refs {
+		want, err := c.Describe(context.Background(), r.repo, r.tag)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got[i], want) {
+			t.Errorf("%s:%s through the Describer = %+v; Describe = %+v", r.repo, r.tag, got[i], want)
+		}
 	}
 }

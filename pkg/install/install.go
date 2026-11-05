@@ -14,11 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package install lays down (and tears down) k3sm's two boot-surviving root
-// LaunchDaemons — io.k3sm.netd (the root privileged-network helper) and
-// io.k3sm.server (the control plane, running as the unprivileged _k3sm user) —
-// behind a small System seam so the privileged orchestration is unit-testable
-// with a fake. The real darwin System (sysadminctl/dscl, ditto, launchctl,
+// Package install lays down (and tears down) k3sm's boot-surviving root
+// LaunchDaemons: io.k3sm.netd (the root privileged-network helper), the role's
+// node daemon (io.k3sm.server or io.k3sm.agent, as the unprivileged _k3sm user)
+// and, with a data volume, the io.k3sm.datavol mount oneshot, behind a small
+// System seam so the orchestration is unit-testable with a fake. The real darwin System (sysadminctl/dscl, ditto, launchctl,
 // chown) lives in install_darwin.go; the seam, the install/uninstall ordering,
 // the launchd plist rendering, and the fake live here.
 //
@@ -50,30 +50,31 @@ import (
 	"k3sm.io/k3sm/pkg/datavol"
 	"k3sm.io/k3sm/pkg/defaults"
 	"k3sm.io/k3sm/pkg/executor"
+	"k3sm.io/k3sm/pkg/install/order"
 	"k3sm.io/k3sm/pkg/netdsvc"
 	"k3sm.io/k3sm/pkg/provider/podlogs"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 	"k3sm.io/runtimed/pkg/sandbox"
 )
 
-// Reverse-DNS launchd labels for the two daemons (io.k3sm.* per the project
-// conventions). netd is root; server runs as the _k3sm service user.
+// Reverse-DNS launchd labels for the daemons (io.k3sm.* per the project
+// conventions); their home, and their start order, is pkg/install/order.
 const (
 	// NetdLabel is the root privileged-network helper LaunchDaemon.
-	NetdLabel = "io.k3sm.netd"
+	NetdLabel = order.NetdLabel
 	// ServerLabel is the control-plane LaunchDaemon (UserName=_k3sm).
-	ServerLabel = "io.k3sm.server"
+	ServerLabel = order.ServerLabel
 	// AgentLabel is the joining-worker LaunchDaemon (UserName=_k3sm): `k3sm
 	// agent`, the node half of the distribution on a Mac that has no control
 	// plane of its own. It is the SIBLING of ServerLabel, never its companion —
 	// a node carries one or the other, which is what RoleServer/RoleAgent
 	// decide and what Install refuses to blur.
-	AgentLabel = "io.k3sm.agent"
+	AgentLabel = order.AgentLabel
 	// DatavolLabel is the data-volume mount LaunchDaemon. It is root, it is a
 	// ONESHOT (`k3sm datavol mount` mounts and exits), and it exists because
 	// launchd offers no ordering: netd and the server would otherwise race disk
 	// arbitration for the volume their data root lives on. See DatavolPlist.
-	DatavolLabel = "io.k3sm.datavol"
+	DatavolLabel = order.DatavolLabel
 )
 
 // Leaf values shared with the runtime packages; their home is pkg/defaults.
@@ -114,7 +115,7 @@ const (
 	// copy of a signed Mach-O out of its install tree is a signature/notarization
 	// hazard a symlink simply does not have.
 	DefaultLinkDir = "/usr/local/bin"
-	// DefaultLaunchDaemonDir is where the two .plist files are written.
+	// DefaultLaunchDaemonDir is where the LaunchDaemon plist files are written.
 	DefaultLaunchDaemonDir = "/Library/LaunchDaemons"
 	// DefaultDataRoot is the data root (the _k3sm home): the control-plane
 	// work-dir, runtimed pods/storage/image cache and the root-only mesh keys
@@ -408,12 +409,7 @@ func RoleFromPlists(serverPresent, agentPresent bool) (Role, bool) {
 // daemonLabel is the LaunchDaemon label a role's node daemon carries. It is a
 // function rather than a method because Role is an alias for a type this
 // package does not define, and the LABELS are this package's own.
-func daemonLabel(r Role) string {
-	if r == RoleAgent {
-		return AgentLabel
-	}
-	return ServerLabel
-}
+func daemonLabel(r Role) string { return orderRole(r).NodeLabel() }
 
 // EntryKind is what an OwnedEntry IS, stated explicitly rather than left to a
 // caller to re-derive from the type bits.
@@ -692,6 +688,9 @@ type System interface {
 	// PARAMETERS so the row a caller applied is visible at the seam and a test
 	// can assert that the root was never handed to the service user.
 	EnsureOwnedDir(dir string, uid, gid int, mode fs.FileMode) error
+	// EnsureOwnedFile creates or repairs the regular file at path at exactly
+	// uid:gid and mode, refusing a non-regular entry; see ensureFileOwnedBy.
+	EnsureOwnedFile(path string, uid, gid int, mode fs.FileMode) error
 	// RemoveEntry removes the entry name DIRECTLY inside dir — a file, or an
 	// EMPTY directory — and nothing else. Absent (dir or entry) is success, so a
 	// re-run is idempotent.
@@ -780,6 +779,9 @@ type System interface {
 	// not a documented property of the swap — rename(2) states atomicity for the
 	// plain form only — so nothing here or in its callers claims it as one.
 	SwapInstallRoot(staging, live string) (previous bool, err error)
+	// MoveInstallRootAside renames live to aside one way only: an existing aside,
+	// even empty, is refused (fs.ErrExist), and nothing is ever put at live.
+	MoveInstallRootAside(live, aside string) error
 	// InstallSpace reports the bytes currently free on the filesystem holding
 	// dir, and the total bytes the named sources occupy — a source that is
 	// absent contributing zero, because the copy that needs it owns that
@@ -831,15 +833,19 @@ type System interface {
 	// directory through its own seam, so one write cannot silently loosen a
 	// directory another step decided).
 	//
-	// It is WriteServiceUserFile's opposite number and exists for exactly one
-	// file today: the root-only copy of this node's wireguard private key in
-	// MeshKeyDir. The service-user seam cannot be reused for it, because handing
+	// It is WriteServiceUserFile's opposite number and exists for the files root
+	// alone may place: the root-only copy of this node's wireguard private key in
+	// MeshKeyDir, the worker's cluster CA copy, the LAN network record and the
+	// shadow manifest. The service-user seam cannot be reused for it, because handing
 	// that copy to _k3sm would erase the only difference between the two copies —
 	// see MeshKeyDirMode.
 	//
 	// The mode is a PARAMETER, as on every other write seam here, so the policy
 	// is visible at the call site and assertable without privilege.
 	WriteRootOnlyFile(path string, contents []byte, mode fs.FileMode) error
+	// HasACL reports whether path carries an extended ACL, never following a
+	// symlink at path. Read-only; the developer-mode marker counts only without.
+	HasACL(path string) (bool, error)
 	// Owner reports who owns the entry at path, what it permits, and what kind
 	// of entry it is — an lstat, so a symlink is described rather than followed.
 	// A missing entry has ReadFile's contract (an error satisfying
@@ -1119,6 +1125,9 @@ type System interface {
 
 	// ResolvePath returns path with every symlink resolved (EvalSymlinks).
 	ResolvePath(path string) (string, error)
+	// Readlink reads one symlink's target, as os.Readlink does. The vm helper
+	// identity check reads the current and previous links through it.
+	Readlink(path string) (string, error)
 	// StatNoFollow lstats path. A missing path has ReadFile's fs.ErrNotExist
 	// contract.
 	StatNoFollow(path string) (PathStat, error)
@@ -1241,8 +1250,8 @@ type Config struct {
 	// crash-loop. Defaults to the k3sm-execshim sibling of BinarySource.
 	ExecShimSource string
 	// PayloadSource is a directory holding the control-plane payload
-	// (executor.PayloadBinaries: kube-apiserver/scheduler/controller-manager/
-	// kubectl + kine + etcd) staged by `k3sm payload <dir>`. Install copies it to
+	// (executor.PayloadBinaries: kube-apiserver, kube-scheduler,
+	// kube-controller-manager, kubectl, kine, etcd, etcdutl, helm and zot) staged by `k3sm payload <dir>`. Install copies it to
 	// InstallDir/bin, from which the daemon boot seeds its workdir — the launchd
 	// _k3sm daemon has neither gh nor a Go toolchain to acquire them itself.
 	// Defaults to the cp-payload sibling dir of BinarySource.
@@ -1339,6 +1348,8 @@ type Config struct {
 	LAN *LAN
 	// NetworkRecord is where LAN is recorded; empty is DefaultNetworkRecordPath.
 	NetworkRecord string
+	// DeveloperModeOptions is `k3sm install --developer-mode` (developermode.go).
+	DeveloperModeOptions
 	// ExtraAgentArgs are operator-supplied `k3sm agent` arguments appended to the
 	// fixed set AgentPlist renders (--mesh-port, --dns-vip, …). Install
 	// populates it exactly as it populates ExtraServerArgs: from the agent plist
@@ -1748,53 +1759,6 @@ func stageTokenFile(sys System, uid uint32, token, dst, what string, mode, dirMo
 	return nil
 }
 
-// ensureStateTree applies the ownership table (OwnershipOf) to the data root and
-// every service-user tree under it, in the table's order.
-//
-// The root goes FIRST, and that order is the safety argument for everything
-// after it. Each level is repaired by path, and a by-path chown is only as safe
-// as the directory the path is resolved in: once the root is root:wheel 0755,
-// no unprivileged principal can rename or replace any entry directly inside it,
-// so the service-user trees chowned next are the directories that were there
-// when they were checked (and EnsureOwnedDir refuses one that is a symlink).
-// Healing a root an older build left service-user-owned is this same first
-// step; nothing else in the installer ever hands the root to the service user.
-//
-// The trees are created as root because the service user can no longer create
-// a top-level directory of its own under a root-owned root.
-//
-// Three rows are applied by a later step instead, each through its own seam and
-// with the same row's values:
-//
-//   - the key directory is MeshKeyDir, a fixed path the netd plist names
-//     whatever this Config's data root is, and provisionMeshKey ensures it
-//     (EnsureMeshKeyDir) before it writes a key;
-//   - the two work dirs are handed over by the steps that write into them
-//     (WriteServiceUserFile creates its parent at ServerTokenDirMode or
-//     AgentTokenDirMode), and the agent's is ALSO where adoptLegacyAgentFiles
-//     migrates root-owned credentials files-first, directory-last, so the
-//     service user never owns that directory while a root-owned file in it is
-//     still pending. Chowning it here, before that step, would break the order.
-func ensureStateTree(sys System, cfg Config, uid uint32) error {
-	appliedLater := map[StateLevel]bool{
-		StateKeys:                        true,
-		StateLevel(sandbox.ServerSubdir): true,
-		StateLevel(agentWorkSubdir):      true,
-	}
-	for _, level := range StateLevels() {
-		if appliedLater[level] {
-			continue
-		}
-		own, _ := OwnershipOf(level)
-		dir := level.Path(cfg.DataRoot)
-		if err := sys.EnsureOwnedDir(dir, own.UID(int(uid)), own.GID, own.Mode); err != nil {
-			return fmt.Errorf("install: ensure %s (%d:%d %#o): %w", dir, own.UID(int(uid)), own.GID, own.Mode, err)
-		}
-	}
-	cfg.Logger.Info("ensured the data root and the service user's trees under it", "root", cfg.DataRoot, "trees", len(ServiceLevels()))
-	return nil
-}
-
 // ErrNotRegularFile is what ReadRegularFile reports for a path that exists but
 // is a symlink, a directory, a device or a fifo. It is a sentinel because the
 // callers must tell it apart from "absent": absence is a posture (nothing has
@@ -1856,9 +1820,9 @@ func (c Config) plistPath(label string) string {
 	return filepath.Join(c.LaunchDaemonDir, label+".plist")
 }
 
-// Install lays down both daemons in dependency order. It is the single root step
-// (run via sudo): ensure _k3sm, copy the binary root-owned, write the two
-// plists, bootstrap netd (the helper) BEFORE server (which needs it), then write
+// Install lays down the daemons the role needs in dependency order. It is the
+// single root step (run via sudo): ensure _k3sm, copy the binary root-owned,
+// write the plists, bootstrap netd (the helper) BEFORE server (which needs it), then write
 // the admin kubeconfig to the human's home. The caller has already verified root.
 func Install(ctx context.Context, sys System, cfg Config) error {
 	_, err := InstallWithResult(ctx, sys, cfg)
@@ -1873,6 +1837,9 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	// record, between this instant and its bootout; startedAt is only the
 	// window's fallback there.
 	startedAt := time.Now()
+	if err := resolveDeveloperMode(sys, &cfg); err != nil {
+		return err
+	}
 	if err := preflightFromStaging(ctx, &cfg); err != nil {
 		return err
 	}
@@ -1975,6 +1942,12 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 		return fmt.Errorf("install: %w", err)
 	}
 	defer release()
+	// The developer-mode marker, before the install root is swapped. A
+	// removal waits for the swap to commit (2f′).
+	removeMarker, err := applyDeveloperMode(ctx, sys, cfg)
+	if err != nil {
+		return err
+	}
 
 	if cfg.AdminToken == "" && !cfg.keepAdminToken {
 		tok, err := generateToken()
@@ -2428,6 +2401,29 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	if err != nil {
 		return err
 	}
+	// 2f′. The developer-mode marker removal applyDeveloperMode decided on,
+	//      the moment the swap commits and before anything is wired or
+	//      restarted on the new tree, so the app's root steps never read
+	//      developer mode as on beside it. A failed swap above leaves the
+	//      marker untouched; a revert below restores it (markerRemoval.restore),
+	//      so a build from source that is rolled back to stays in developer
+	//      mode. A removal that failed but left the marker reading invalid is
+	//      reported only once the install has finished, at the end of step 5.
+	//      A crash between the publish and the withdraw or revert below can
+	//      still leave the new tree beside a marker that reads on: a window
+	//      that predates this step, held under the install lock, nothing wired.
+	dropErr := removeMarker.drop(sys, cfg)
+	// 2f″. A marker that could be neither removed nor disowned still reads
+	//      on, and the signed tree must not run beside it: the app's root
+	//      steps would skip the signing continuity check. Fail closed. The
+	//      previous tree and its marker are the consistent pair, so the swap
+	//      is reverted and the daemons restart on the previous tree, never on
+	//      this one; a first install moves the new tree out of the install
+	//      root and stops before anything is wired (refuseBesideStuckMarker).
+	if removeMarker.stillOn() {
+		restartOwned = previous // a revert restarts, and reports, every daemon
+		return refuseBesideStuckMarker(ctx, sys, cfg, m, previous, dropErr)
+	}
 
 	// 3. The launcher link and the plists, in that order, and BOTH after the
 	//    publish: each names a fixed absolute path inside the install root, and
@@ -2440,7 +2436,7 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	//    target mean the new tree the moment it is live.
 	restartOwned = true // step 4 restarts, and on failure reports, every daemon
 	if err := publishedWiring(ctx, sys, cfg, m, startedAt); err != nil {
-		return revertInstallRoot(ctx, sys, cfg, m, previous, err)
+		return revertInstallRoot(ctx, sys, cfg, m, previous, err, false, func() { removeMarker.restore(sys, cfg) })
 	}
 
 	// 4c. REAP, and not one step earlier. The previous install root is still
@@ -2471,27 +2467,38 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	//    because one that skipped verification would look like success. The merge
 	//    replaces the whole k3sm cluster entry, so a kubeconfig an earlier release
 	//    wrote (a self-signed pin, or skip-verify) is rewritten.
-	if cfg.Role != RoleAgent {
-		if err := awaitClusterCA(ctx, sys, &cfg, clusterCAWaitBudget); err != nil {
-			return err
-		}
-		kubeconfig, err := AdminKubeconfig(cfg)
-		if err != nil {
-			return fmt.Errorf("install: render admin kubeconfig: %w", err)
-		}
-		kubeconfigPath, err := sys.WriteUserKubeconfig(cfg.TargetUser, cfg.kubeconfigName(), kubeconfig)
-		if err != nil {
-			return fmt.Errorf("install: write admin kubeconfig for %s: %w", cfg.TargetUser, err)
-		}
-		// Record the path just written in the server arguments record, so a root
-		// `k3sm status` checks this file's anchor and never guesses a home.
-		cfg.AdminKubeconfigPath = kubeconfigPath
-		if err := writeServerArgsRecord(sys, cfg); err != nil {
-			return err
-		}
+	if err := writeAdminKubeconfig(ctx, sys, &cfg); err != nil {
+		// A marker removal or read that failed at 2f′ is reported beside it,
+		// so neither is lost behind the kubeconfig error.
+		return errors.Join(err, dropErr)
 	}
 	cfg.Logger.Info("k3sm installed", "install-dir", cfg.InstallDir, "link", cfg.installedLink(), "kubeconfig-owner", cfg.TargetUser)
-	return nil
+	// The marker removal that failed at 2f′, now that the install is done.
+	return dropErr
+}
+
+// writeAdminKubeconfig is Install's step 5 on a control plane: wait for the
+// cluster CA, write the admin kubeconfig pinned to it, and record its path in
+// the server arguments record. An agent writes none.
+func writeAdminKubeconfig(ctx context.Context, sys System, cfg *Config) error {
+	if cfg.Role == RoleAgent {
+		return nil
+	}
+	if err := awaitClusterCA(ctx, sys, cfg, clusterCAWaitBudget); err != nil {
+		return err
+	}
+	kubeconfig, err := AdminKubeconfig(*cfg)
+	if err != nil {
+		return fmt.Errorf("install: render admin kubeconfig: %w", err)
+	}
+	kubeconfigPath, err := sys.WriteUserKubeconfig(cfg.TargetUser, cfg.kubeconfigName(), kubeconfig)
+	if err != nil {
+		return fmt.Errorf("install: write admin kubeconfig for %s: %w", cfg.TargetUser, err)
+	}
+	// Record the path just written in the server arguments record, so a root
+	// `k3sm status` checks this file's anchor and never guesses a home.
+	cfg.AdminKubeconfigPath = kubeconfigPath
+	return writeServerArgsRecord(sys, *cfg)
 }
 
 // publishedWiring is everything an install does once the new tree is live: the
@@ -2613,7 +2620,7 @@ func publishedWiring(ctx context.Context, sys System, cfg Config, m []artifact, 
 // used to assert the opposite — "netd's SIGTERM handler then flushes lo0/pf/utun"
 // — and believing it is how the residue below went unaccounted for.
 //
-// So a booted-out netd leaves durable kernel state, and uninstall removes two
+// So a booted-out netd leaves durable kernel state, and uninstall removes three
 // classes of it:
 //
 //   - lo0 inet aliases — SWEPT, by the FlushLo0Aliases backstop below, precisely

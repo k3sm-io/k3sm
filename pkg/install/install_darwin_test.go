@@ -1666,3 +1666,129 @@ func TestReadOwnedRegularFileOnDisk(t *testing.T) {
 		}
 	})
 }
+
+// TestEnsureFileOwnedBy exercises EnsureOwnedFile's body against a real
+// filesystem, with the test process's own uid and gid (a permitted no-op
+// chown): only a real symlink, directory and fifo prove the lstat, O_NOFOLLOW
+// and fstat refusals, and that a refusal leaves the entry as it was.
+func TestEnsureFileOwnedBy(t *testing.T) {
+	uid, gid := os.Getuid(), os.Getgid()
+
+	t.Run("an absent file is created at the mode", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "runtimed.lock")
+		if err := ensureFileOwnedBy(path, uid, gid, 0o600); err != nil {
+			t.Fatalf("ensureFileOwnedBy: %v", err)
+		}
+		assertMode(t, path, 0o600)
+	})
+
+	t.Run("an existing file keeps its content and is repaired to the mode", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "runtimed.lock")
+		if err := os.WriteFile(path, []byte("123\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := ensureFileOwnedBy(path, uid, gid, 0o600); err != nil {
+			t.Fatalf("ensureFileOwnedBy: %v", err)
+		}
+		assertMode(t, path, 0o600)
+		if b, err := os.ReadFile(path); err != nil || string(b) != "123\n" {
+			t.Errorf("content = %q, %v; want it untouched", b, err)
+		}
+	})
+
+	t.Run("a symlink is refused and its target left alone", func(t *testing.T) {
+		root := t.TempDir()
+		target := filepath.Join(root, "elsewhere")
+		if err := os.WriteFile(target, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(target, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(root, "runtimed.lock")
+		if err := os.Symlink(target, path); err != nil {
+			t.Fatal(err)
+		}
+		err := ensureFileOwnedBy(path, uid, gid, 0o600)
+		if !errors.Is(err, ErrNotRegularFile) || !errors.Is(err, errSymlinkRefused) {
+			t.Fatalf("ensureFileOwnedBy = %v, want the symlink refusal", err)
+		}
+		assertMode(t, target, 0o644)
+		if fi, err := os.Lstat(path); err != nil || fi.Mode()&fs.ModeSymlink == 0 {
+			t.Errorf("the symlink was not left in place: %v, %v", fi, err)
+		}
+	})
+
+	t.Run("a dangling symlink is refused and nothing is created", func(t *testing.T) {
+		root := t.TempDir()
+		target := filepath.Join(root, "absent")
+		path := filepath.Join(root, "runtimed.lock")
+		if err := os.Symlink(target, path); err != nil {
+			t.Fatal(err)
+		}
+		if err := ensureFileOwnedBy(path, uid, gid, 0o600); !errors.Is(err, ErrNotRegularFile) {
+			t.Fatalf("ensureFileOwnedBy = %v, want ErrNotRegularFile", err)
+		}
+		if _, err := os.Lstat(target); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("the symlink's target was created: %v", err)
+		}
+	})
+
+	t.Run("a directory is refused and left alone", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "runtimed.lock")
+		mkdir(t, path, 0o755)
+		if err := ensureFileOwnedBy(path, uid, gid, 0o600); !errors.Is(err, ErrNotRegularFile) {
+			t.Fatalf("ensureFileOwnedBy = %v, want ErrNotRegularFile", err)
+		}
+		assertMode(t, path, 0o755)
+	})
+
+	t.Run("a hard link to another file is refused and neither name changes", func(t *testing.T) {
+		root := t.TempDir()
+		other := filepath.Join(root, "elsewhere")
+		if err := os.WriteFile(other, []byte("secret\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(other, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(root, "runtimed.lock")
+		if err := os.Link(other, path); err != nil {
+			t.Fatal(err)
+		}
+		before, err := os.Stat(other)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = ensureFileOwnedBy(path, uid, gid, 0o600)
+		if !errors.Is(err, ErrNotRegularFile) || !errors.Is(err, errHardlinkRefused) {
+			t.Fatalf("ensureFileOwnedBy = %v, want the hard link refusal", err)
+		}
+		for _, name := range []string{other, path} {
+			fi, err := os.Lstat(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			st, bst := fi.Sys().(*syscall.Stat_t), before.Sys().(*syscall.Stat_t)
+			if fi.Mode() != before.Mode() || st.Uid != bst.Uid || st.Gid != bst.Gid {
+				t.Errorf("%s = %v %d:%d, want it untouched at %v %d:%d", name, fi.Mode(), st.Uid, st.Gid, before.Mode(), bst.Uid, bst.Gid)
+			}
+			if b, err := os.ReadFile(name); err != nil || string(b) != "secret\n" {
+				t.Errorf("%s content = %q, %v; want it untouched", name, b, err)
+			}
+		}
+	})
+
+	t.Run("a fifo is refused without blocking", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "runtimed.lock")
+		if err := syscall.Mkfifo(path, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := ensureFileOwnedBy(path, uid, gid, 0o600); !errors.Is(err, ErrNotRegularFile) {
+			t.Fatalf("ensureFileOwnedBy = %v, want ErrNotRegularFile", err)
+		}
+	})
+}

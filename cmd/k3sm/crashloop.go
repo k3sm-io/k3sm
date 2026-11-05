@@ -145,9 +145,13 @@ func (b *crashBreaker) write(add func(*executor.CrashRecord, time.Time) bool) (t
 // launchd PATH that lacked `go` this lap lacks it on every lap. The release-path
 // payload refusals (executor.ErrPayloadSignature, executor.ErrPayloadStamp,
 // executor.ErrSelfSignatureUnreadable) are permanent for the same reason: the
-// signed bytes on disk are the same on every lap, and the remedy is a reinstall. (The joining
-// server's permanent member-route refusal is the other permanent class; it fails
-// before the executor starts, so noteEtcdMemberRouteFailure records it.)
+// signed bytes on disk are the same on every lap, and the remedy is a reinstall. An etcd member a
+// restore superseded (executor.EtcdSupersededError) and a kine payload staged by
+// a different build (executor.ErrKinePayloadStale, checked before
+// ErrNoGoToolchain, which it wraps) are permanent too: the data dir and the
+// payload are the same on every lap. (The joining server's permanent
+// member-route refusal is one more permanent class; it fails before the
+// executor starts, so noteEtcdMemberRouteFailure records it.)
 //
 // A bring-up this daemon's own stop cancelled is not recorded at all
 // (cancelledByStop). stop is the daemon's signal context; a done stop with a

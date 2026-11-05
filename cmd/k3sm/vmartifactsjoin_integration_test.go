@@ -58,15 +58,15 @@ import (
 //
 // # Why the assertions are two-sided
 //
-// The shipped pin is UNMINTED (guestartifacts.ErrPinIncomplete), so today both
-// nodes correctly report no artifacts. A test that asserted that literal — label
-// absent, cache empty — would be asserting the CURRENT STATE OF THE PIN, and
-// would go red the day the guest build lands its digests, on a cluster that had
-// become MORE correct. So nothing here is compared against a constant: the two
+// The shipped pin is minted, so both nodes normally report artifacts; a node
+// whose fetch fails reports none. A test that asserted either literal — label
+// present and cache full, or label absent and cache empty — would be asserting
+// the CURRENT STATE OF THE FETCH, and would go red on a host that was behaving
+// correctly. So nothing here is compared against a constant: the two
 // nodes' verdicts are compared against EACH OTHER, and each node's advertisement
 // is compared against its own disk. Both properties are the ones that must hold
-// before and after the mint, and the test's meaning does not change when the pin
-// does.
+// whether or not the fetch succeeds, and the test's meaning does not change when
+// the pin does.
 //
 // # Why one Mac
 //
@@ -125,8 +125,8 @@ func TestIntegrationGuestArtifactsAgreeAcrossJoinedNodes(t *testing.T) {
 
 	// (i) The two nodes derived the SAME guest-artifact verdict.
 	//
-	// Compared as a pair, never against a literal: see the file comment. Both-false
-	// (today, unminted pin) and both-true (after the mint) are equally green; a
+	// Compared as a pair, never against a literal: see the file comment. Both-true
+	// (a fetched, verified set) and both-false (an air-gapped host with nothing cached) are equally green; a
 	// SPLIT verdict on one host, from one binary, against one pin, is the failure —
 	// it means one of the two paths is not running ensure.
 	serverLabel, serverHas := server.Labels[runtimeclass.LabelVMArtifacts]

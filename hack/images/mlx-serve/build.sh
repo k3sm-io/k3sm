@@ -35,7 +35,7 @@
 # Requires: macOS on Apple silicon, uv, python3, and a `k3sm` binary
 # (--stage-only needs only uv; --from-stage needs no uv). It needs no root: it
 # packages with `k3sm build --no-record`, which writes the OCI layout and never
-# touches this node's image store. It writes only under its work dir (and, with
+# records into the cluster registry or this node's cache. It writes only under its work dir (and, with
 # --stage-only, the --stage dir) and pushes nothing anywhere — see README.md for
 # the publish step.
 set -euo pipefail
@@ -48,12 +48,12 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # is not a pin — a later uv ships a newer python-build-standalone build of the
 # same CPython patch version — so the URL is asserted before staging.
 PY_KEY="cpython-3.12.14-macos-aarch64-none"
-PY_URL="https://releases.astral.sh/github/python-build-standalone/releases/download/20260825/cpython-3.12.14%2B20260825-aarch64-apple-darwin-install_only_stripped.tar.gz"
+PY_URL="https://releases.astral.sh/github/python-build-standalone/releases/download/20260929/cpython-3.12.14%2B20260929-aarch64-apple-darwin-install_only_stripped.tar.gz"
 PY_BIN="bin/python3.12"
 # The uv that generated requirements.lock. Older uv is refused rather than
 # tried: the JSON interpreter listing this script pins against is not in every
 # release, and a silent skip of the URL assertion would un-pin the interpreter.
-UV_MIN="0.12.7"
+UV_MIN="0.13.1"
 
 # The serving contract, and the one flag the engine will not work without.
 # At its defaults this engine serves ONE request at a time and answers HTTP 503
@@ -68,8 +68,8 @@ SERVE_HOST="0.0.0.0"
 HF_HOME_PATH="/models"
 
 # The sharded-rank entrypoint module (k3sm_shard.py beside this script). A
-# sharded MLXModel's rank Pods run it instead of the ENTRYPOINT; it execs
-# mlx_lm.server, which the engine's closure already carries.
+# sharded MLXModel's rank Pods run it instead of the ENTRYPOINT; it runs
+# mlx_lm.server, which the engine's closure already carries, in its own process.
 SHARD_MODULE="k3sm_shard"
 # The single-node entrypoint module (k3sm_serve.py beside this script). It runs
 # the engine's own CLI (vllm_mlx.cli) in-process with the same argv, after
@@ -77,9 +77,10 @@ SHARD_MODULE="k3sm_shard"
 # refused with HTTP 400 instead of served through a rotating cache.
 SERVE_MODULE="k3sm_serve"
 
-# The tag this script builds and pushes. A build output has no digest until it is built,
+# The tag this script builds under (the publish step, `k3sm image push`, is the
+# operator's; see README.md). A build output has no digest until it is built,
 # so it stays a tag here; consumers pin the digest the registry reports for it.
-DEFAULT_TAG="ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.1"
+DEFAULT_TAG="ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.3"
 
 # ---- options ----------------------------------------------------------------
 WORK="${K3SM_MLX_WORK:-$HOME/.cache/k3sm/mlx-serve}"
@@ -131,7 +132,7 @@ EOF
 # engine_pin echoes the engine requirement exactly as requirements.in pins it,
 # so the image label cannot drift from what is actually installed.
 engine_pin() {
-	grep -E '^[a-zA-Z0-9]' "$HERE/requirements.in" | head -1
+	grep -E '^[a-zA-Z0-9]' "$HERE/requirements.in" | sed -n 1p
 }
 
 # ---- lockfile ---------------------------------------------------------------
@@ -168,7 +169,7 @@ verify_lock() {
 	if [ "${reqs:-0}" -eq 0 ]; then
 		die "$lock has no requirements — refusing to build an empty payload"
 	fi
-	if printf '%s\n' "$report" | grep -q '^  REFUSED'; then
+	if grep -q '^  REFUSED' <<<"$report"; then
 		printf '%s\n' "$report" | grep '^  REFUSED' >&2
 		echo "mlx-serve: $lock is not fully hash-pinned." >&2
 		echo "           Regenerate it with 'uv pip compile --generate-hashes' — see README.md." >&2
@@ -198,7 +199,7 @@ require_uv() {
 	local have
 	have="$("$UV" --version 2>/dev/null | awk '{print $2}')"
 	[ -n "$have" ] || die "cannot read a version from '$UV --version'"
-	if [ "$(printf '%s\n%s\n' "$UV_MIN" "$have" | sort -V | head -1)" != "$UV_MIN" ]; then
+	if [ "$(printf '%s\n%s\n' "$UV_MIN" "$have" | sort -V | sed -n 1p)" != "$UV_MIN" ]; then
 		die "uv $have is older than the pinned minimum $UV_MIN (requirements.lock was generated with $UV_MIN)"
 	fi
 	echo "  uv: $have ($UV)"
@@ -365,7 +366,7 @@ for m in sorted(missing)[:20]:
     print(m)
 PY
 )" || die "cannot run the staged interpreter to check the precompile"
-	read -r total missing <<< "$(printf '%s\n' "$out" | head -1)"
+	read -r total missing <<< "$(printf '%s\n' "$out" | sed -n 1p)"
 	if [ "$missing" -gt 0 ]; then
 		printf '%s\n' "$out" | tail -n +2 | sed 's/^/    no .pyc: /'
 	fi

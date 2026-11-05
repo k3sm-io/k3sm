@@ -101,10 +101,10 @@ func pushCtx(t *testing.T) string {
 //
 // The rule has two halves and both are load-bearing. A tag that names a registry
 // goes there, spelled as written — k3sm never re-aims an explicit reference. A
-// BARE tag goes to THIS node's ingest registry, which is the push-side mirror of
-// the pull side: a Pod naming "myapp:v1" is served from that registry first, so
-// a build that pushed it anywhere else would publish an image no Pod resolves —
-// and, on Docker Hub, would publish it to the internet.
+// BARE tag goes to the cluster registry through the push gate, the push-side
+// mirror of the pull side: a Pod naming "myapp:v1" is served from that registry,
+// so a build that pushed it anywhere else would publish an image no Pod
+// resolves — and, on Docker Hub, would publish it to the internet.
 func TestResolvePushTarget(t *testing.T) {
 	const addr = "127.0.0.1:6450"
 

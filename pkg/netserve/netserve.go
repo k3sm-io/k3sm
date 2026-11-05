@@ -105,7 +105,7 @@ type Config struct {
 	// routable-advertise node (mesh), where the apiserver publishes its own valid
 	// kubernetes endpoints and the proxy follows the real slice.
 	APIServerEndpoint string
-	// NodeIP is the node InternalIP (reserved for future mesh wiring).
+	// NodeIP is the node InternalIP; it seeds the NetworkPolicy table's always-allow source set.
 	NodeIP string
 	// NodeAddress is the address this node ADVERTISES (the Node object's
 	// InternalIP and the address the ingress host publishes as the canonical

@@ -510,6 +510,7 @@ func (c *Controller) observe(ctx context.Context, m *mlxv1alpha1.MLXModel) (mlx.
 			// old-revision: the safe direction (see mlx.PodState.Revision).
 			Revision:    pod.Labels[appsv1.ControllerRevisionHashLabelKey],
 			Terminating: pod.DeletionTimestamp != nil,
+			Container:   mlx.ServingContainerState(pod),
 		}
 		if !state.Ready && state.Phase == corev1.PodRunning && pod.Status.PodIP != "" {
 			state.Probe = c.probe(ctx, m, pod.Status.PodIP)

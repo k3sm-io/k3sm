@@ -220,17 +220,15 @@ func splitLoopback(hostPort string) (host, port string, ok bool) {
 	return "", "", false
 }
 
-// writeSecretFile writes b to path at 0600 through a temp file in the same
-// directory, so a reader never observes a partially written secret and an
-// interrupted write never leaves a truncated one in place.
+// writeSecretFile writes b to path at 0600 through writeFileInDir, in the
+// directory that holds path, which is checked and narrowed by openStateDir
+// first: a symlinked or foreign directory is refused, and a wider mode of this
+// user's own is corrected to 0700.
 func writeSecretFile(path string, b []byte) error {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+	d, err := openStateDir(filepath.Dir(path))
+	if err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	defer d.Close()
+	return writeFileInDir(d, path, b)
 }

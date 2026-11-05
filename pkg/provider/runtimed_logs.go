@@ -178,6 +178,13 @@ func (r *runtimedRuntime) containerStatus(ctx context.Context, namespace, podNam
 	if !ok {
 		return nil, vkadapter.NotFoundf("pod %q not found", namespace+"/"+podName)
 	}
+	// A pod refused at admission never started a container, so the kubelet's
+	// answer is validateContainerLogStatus's for a container with no status
+	// (pkg/kubelet/kubelet_pods.go, v1.36.2), and the runtime, which never heard
+	// of the pod, is not asked.
+	if t := r.trackByID(id); t != nil && t.rejected {
+		return nil, fmt.Errorf("container %q in pod %q is not available", containerName, podName)
+	}
 	resp, err := r.rt.GetPodStatus(ctx, &runtimev1.GetPodStatusRequest{PodId: id})
 	if err != nil {
 		return nil, fmt.Errorf("runtimed get pod status %s/%s: %w", namespace, podName, err)

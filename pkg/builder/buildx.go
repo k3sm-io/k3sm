@@ -32,8 +32,8 @@ import (
 //
 // It is verified in-pod on EVERY run, not only on download: the binary lives on
 // a PVC that outlives any single pod, so "we fetched it correctly once" is not
-// the property that matters. The v0.17.1 pin was proven live on the k3sm vm
-// path on 2026-09-02; the v0.38.0 bump has not yet been run live there.
+// the property that matters. The v0.17.1 pin was first proven live on the k3sm
+// vm path on 2026-09-02, and the v0.38.0 pin has since run live there as well.
 //
 // The asset is the linux-arm64 build because buildx must match the GUEST arch —
 // a different axis from the --platform an image targets. The Linux guest that

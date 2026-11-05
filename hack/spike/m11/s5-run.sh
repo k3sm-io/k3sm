@@ -259,9 +259,9 @@ if [ "$S5_ROLE" = "prober" ]; then
   # The ARP verdict turns on lladdr, NOT on the peer merely APPEARING in the
   # table: a FAILED entry is a record that resolution was ATTEMPTED and did not
   # answer, which is the opposite of adjacency.
-  if ip neigh show | grep "^$S5_PEER " | grep -q lladdr; then
+  if grep -q lladdr <<<"$(ip neigh show | grep "^$S5_PEER ")"; then
     log "S5_C4_ADJACENCY=L2-adjacent (peer ARP-resolved to an lladdr)"
-  elif ip neigh show | grep -q "^$S5_PEER "; then
+  elif grep -q "^$S5_PEER " <<<"$(ip neigh show)"; then
     log "S5_C4_ADJACENCY=NOT-adjacent (ARP attempted, no lladdr: $(ip neigh show | grep "^$S5_PEER " | tr '\n' '|'))"
   else
     log "S5_C4_ADJACENCY=NOT-adjacent (no ARP entry for the peer at all)"
@@ -700,7 +700,7 @@ export S5_SHARE_DIR="$S5DIR/share" S5_WAIT=70
 
 # A locally-administered MAC derived from a fixed string, so the DHCP server
 # sees the SAME client across restarts. Criterion 5 asks whether that is enough
-# to keep the lease: per-pod attributionb's address->pod registry is only buildable if it is.
+# to keep the lease: the lease-based per-pod attribution's address->pod registry is only buildable if it is.
 MAC_A=$(printf '5a:c3:%s' "$(echo -n k3sm-s5-guest-a | shasum -a 256 | cut -c1-8 | sed 's/../&:/g;s/:$//')")
 MAC_CTL=$(printf '5a:c3:%s' "$(echo -n k3sm-s5-guest-ctl | shasum -a 256 | cut -c1-8 | sed 's/../&:/g;s/:$//')")
 echo "S5_C5_MAC_A=$MAC_A"

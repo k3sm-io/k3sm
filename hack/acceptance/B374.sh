@@ -22,12 +22,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 K3SM_ROOT="$(cd "$HERE/../.." && pwd)"
 SELF="$HERE/B374.sh"
 DOC="$K3SM_ROOT/docs/privilege-model.md"
-# The voice lint lives in the workspace control-center, one level above the
-# repo checkout in the ordinary layout -- but this public repo's script must
-# stand alone (no workspace path may appear here). The rung
-# runs only when the caller names the lint through K3SM_VOICE_LINT; otherwise
-# it SKIPs, and the workspace ci (which owns the lint) still covers the file
-# at publish.
+# The voice lint is not part of this repo. The rung runs only when the caller
+# names the lint through K3SM_VOICE_LINT; otherwise it SKIPs.
 VOICE_LINT="${K3SM_VOICE_LINT:-}"
 
 PASS=0; FAIL=0
@@ -70,8 +66,8 @@ ladder "$fixed" "b374.2  the corrected sentence names the best-effort pfctl flus
 # enables, disables or configures pf, so pf's state is the Mac owner's.
 deferred=ok
 JOINED="$(tr '\n' ' ' < "$DOC" | tr -s ' ')"
-printf '%s' "$JOINED" | grep -qi 'never enables, disables or configures' || deferred=no
-printf '%s' "$JOINED" | grep -qi 'whatever the Mac.s owner set' || deferred=no
+grep -qi 'never enables, disables or configures' <<<"$JOINED" || deferred=no
+grep -qi 'whatever the Mac.s owner set' <<<"$JOINED" || deferred=no
 ladder "$deferred" "b374.3  the doc states k3sm never enables or configures pf"
 
 # ---- b374.4 — the workspace voice lint, fatal-only --------------------------

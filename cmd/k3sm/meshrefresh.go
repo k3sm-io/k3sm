@@ -19,8 +19,10 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
+	"strconv"
 	"time"
 
 	"k3sm.io/k3sm/pkg/bootstrap"
@@ -47,17 +49,19 @@ const meshRefreshInterval = 30 * time.Second
 //
 // Both roles run one. The seams are the two things that differ between them:
 //
-//   - derive re-runs the SAME derivation the initial publish used — a worker
+//   - derive re-runs the derivation the initial publish used: a worker
 //     re-probes the control plane so the kernel's own route lookup answers
 //     "which of this Mac's addresses reaches the server", the control-plane node
-//     re-scans its underlay interfaces;
+//     re-scans its underlay interfaces. A worker that cannot reach the control
+//     plane derives nothing (workerRefreshEndpoint), and a worker whose probe
+//     connected reports its sighting as route-proven;
 //   - publish is the write — the node-certificate-authenticated POST for a
 //     worker, an in-process enroller call for the server.
 //
 // Locking: none. Run is the single reader and writer of every field below, and
 // the seams are called from it.
 type meshEndpointRefresher struct {
-	derive   func(ctx context.Context) (string, error)
+	derive   func(ctx context.Context) (meshEndpointSighting, error)
 	publish  func(ctx context.Context, endpoint string) error
 	interval time.Duration
 	log      *slog.Logger
@@ -75,7 +79,7 @@ type meshEndpointRefresher struct {
 	// interface that is about to go away, and publishing it would point every
 	// peer at a dead address for a full resync period. Two consecutive identical
 	// derivations cost one extra interval and cannot be produced by a single
-	// transient sample.
+	// transient sample. A route-proven sighting skips it (meshEndpointSighting).
 	candidate string
 	// announced is the candidate already named in the "mesh endpoint changed"
 	// log line, so a publish that fails and is retried does not repeat it.
@@ -111,10 +115,23 @@ func (r *meshEndpointRefresher) Run(ctx context.Context) error {
 	}
 }
 
+// meshEndpointSighting is one derivation's answer.
+type meshEndpointSighting struct {
+	// endpoint is the host:port derived.
+	endpoint string
+	// routeProven is true when a connection to the control plane was just opened
+	// from endpoint's address. That address reaches the cluster now, so a flap
+	// cannot have produced it and the two-tick debounce is not needed: the
+	// refresher publishes it on the first sighting, which is what gets a node that
+	// regains its route to the server back into every peer's MeshPeer promptly.
+	routeProven bool
+}
+
 // tickOnce runs one derive → debounce → publish cycle. It is the whole decision,
 // and it is deliberately the only place any of the three fields moves.
 func (r *meshEndpointRefresher) tickOnce(ctx context.Context) {
-	endpoint, err := r.derive(ctx)
+	sighting, err := r.derive(ctx)
+	endpoint := sighting.endpoint
 	if err != nil {
 		// The last published value stays published, and a pending candidate stays
 		// pending. A node that cannot currently tell which of its addresses
@@ -130,7 +147,7 @@ func (r *meshEndpointRefresher) tickOnce(ctx context.Context) {
 		r.candidate = ""
 		return
 	}
-	if endpoint != r.candidate {
+	if !sighting.routeProven && endpoint != r.candidate {
 		r.candidate = endpoint
 		return
 	}
@@ -169,17 +186,11 @@ func newWorkerEndpointRefresher(opts agentOptions, res *bootstrap.JoinResult, jo
 	}
 	serverURL := "https://" + joinHost
 	return &meshEndpointRefresher{
-		derive: func(ctx context.Context) (string, error) {
-			// A FRESH dialer each time. Reusing the join's dialer would keep its
-			// captured address when a probe fails, which is exactly the stale
-			// value this loop exists to replace; a fresh one reports nothing and
-			// underlayMeshEndpoint falls back to its interface scan.
-			d := &localAddrDialer{dialer: net.Dialer{Timeout: 5 * time.Second}}
-			d.probe(ctx, joinHost)
+		derive: func(ctx context.Context) (meshEndpointSighting, error) {
 			// The mesh address the candidates are filtered against is the
 			// ASSIGNED one (agentInternalIP), so a node that passed no --node-ip
 			// still excludes its own mesh /32 from the endpoints it advertises.
-			return underlayMeshEndpoint(d.localIP(), agentInternalIP(res), opts.meshPort)
+			return workerRefreshEndpoint(ctx, joinHost, agentInternalIP(res), opts.meshPort)
 		},
 		publish: func(ctx context.Context, endpoint string) error {
 			return bootstrap.RefreshMeshEndpoint(ctx, client, serverURL, opts.nodeName, endpoint)
@@ -191,6 +202,45 @@ func newWorkerEndpointRefresher(opts agentOptions, res *bootstrap.JoinResult, jo
 	}, nil
 }
 
+// controlPlaneSourceIP opens and closes a TCP connection to joinHost and returns
+// the local address it used: the source address of the route to the control
+// plane, proven by a connection that reached it. A FRESH dialer each call, so a
+// failed probe can never report the address an earlier one captured. Package var
+// so a test can stand in for the network.
+var controlPlaneSourceIP = func(ctx context.Context, joinHost string) (net.IP, error) {
+	d := &localAddrDialer{dialer: net.Dialer{Timeout: 5 * time.Second}}
+	dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	conn, err := d.DialContext(dialCtx, "tcp", joinHost)
+	if err != nil {
+		return nil, err
+	}
+	_ = conn.Close() // a probe: nothing was written, so a close error loses nothing
+	return d.localIP(), nil
+}
+
+// workerRefreshEndpoint is a joined worker's periodic derivation.
+//
+// It derives nothing while the control plane is unreachable. Away from the
+// cluster's network the interface scan can only offer addresses no peer can dial
+// (a hotspot's CGNAT address, a CLAT address, another LAN's private address), and
+// the publish would fail anyway because it goes to the same unreachable server;
+// the value peers hold is kept. When the probe connects, its source address is
+// the endpoint and the sighting is route-proven, so it is published on the first
+// tick after the route returns. If that source is unusable (it is inside the
+// mesh, or special-purpose) the interface scan answers instead, without proof.
+func workerRefreshEndpoint(ctx context.Context, joinHost, meshIP string, port int) (meshEndpointSighting, error) {
+	local, err := controlPlaneSourceIP(ctx, joinHost)
+	if err != nil {
+		return meshEndpointSighting{}, fmt.Errorf("the control plane at %s is unreachable from this node, so no address of this node is known to reach it: %w", joinHost, err)
+	}
+	if host := usableUnderlayIP(local, meshIP); host != "" {
+		return meshEndpointSighting{endpoint: net.JoinHostPort(host, strconv.Itoa(port)), routeProven: true}, nil
+	}
+	endpoint, err := underlayMeshEndpoint(nil, meshIP, port)
+	return meshEndpointSighting{endpoint: endpoint}, err
+}
+
 // newServerEndpointRefresher builds the control-plane node's refresher. It writes
 // through the same locked enroller the join RPC uses (no HTTP, no certificate —
 // this process IS the supervisor), and re-derives with serverMeshEndpoint, whose
@@ -198,8 +248,9 @@ func newWorkerEndpointRefresher(opts agentOptions, res *bootstrap.JoinResult, jo
 // node's own mesh utun.
 func newServerEndpointRefresher(e *meshEnroller, opts serverOptions, initialEndpoint string, logger *slog.Logger) *meshEndpointRefresher {
 	return &meshEndpointRefresher{
-		derive: func(context.Context) (string, error) {
-			return serverMeshEndpoint(opts.nodeIP, opts.meshIP, serverMeshListenPort)
+		derive: func(context.Context) (meshEndpointSighting, error) {
+			endpoint, err := serverMeshEndpoint(opts.nodeIP, opts.meshIP, serverMeshListenPort)
+			return meshEndpointSighting{endpoint: endpoint}, err
 		},
 		publish: func(ctx context.Context, endpoint string) error {
 			return e.RefreshEndpoint(ctx, opts.nodeName, endpoint)

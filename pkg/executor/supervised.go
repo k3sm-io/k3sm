@@ -17,8 +17,10 @@ limitations under the License.
 package executor
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"net"
@@ -85,9 +87,10 @@ const drainGrace = 5 * time.Second
 // reapers.Wait that follows it.
 //
 // It is exported because it is NOT only this package's business: it is one stage
-// of the single ExitTimeOut launchd gives the daemon, and pkg/install derives that
-// number from this symbol rather than from a literal that would drift the moment
-// drainGrace or the component count changed.
+// of the single ExitTimeOut launchd gives the daemon, and pkg/install's teardown
+// table carries it as a literal that TestExitTimeOutCoversTheDaemonTeardown checks
+// against this symbol, so a change to drainGrace or the component count reds that
+// test instead of drifting.
 //
 // It is a budget Stop KEEPS: every wait in the teardown selects on the caller's
 // context, so a daemon that calls Stop under this bound gets it back at the
@@ -224,15 +227,27 @@ func (c *component) exitedNow() bool {
 // Concurrency: mu guards comps, started, and token — every read and write of
 // those three fields is under mu, including the token reads on the
 // RESTConfigToken/Ready paths a caller may drive concurrently with Start. The
-// components run until Stop, which tears them down in reverse dependency order.
+// components run until Stop, which stops them in shutdownOrder: the apiserver first,
+// then the scheduler and controller-manager, and the datastore (kine or etcd) last.
 // mu is never held across provision/bringUp, so a Ready poll is never blocked by
 // a boot in progress. No Context is stored.
 type Supervised struct {
-	cfg    Config
-	client *http.Client
+	cfg Config
+	// probe is the healthz probe's HTTP client, rebuilt whenever the cluster CA it
+	// trusts changes on disk (see probeClient). Guarded by probeMu, which is never
+	// held with mu.
+	probeMu sync.Mutex
+	probe   *http.Client
+	probeCA []byte
+	// probeErr is the last probe failure logged, so each distinct failure is logged
+	// once rather than every poll; a success clears it. Guarded by probeMu.
+	probeErr string
+	// probeDial replaces the probe's dialer in tests (an in-memory pipe); nil, as
+	// NewSupervised leaves it, dials through the segment-clamped tcpseg.Dialer.
+	probeDial func(ctx context.Context, network, addr string) (net.Conn, error)
 
 	mu      sync.Mutex
-	comps   []*component // in start order; Stop walks it in reverse
+	comps   []*component // in start order; Stop stops them in shutdownOrder
 	started bool
 	// supervising is the BACKSTOP for the per-component flags: component.supervised
 	// is the real gate, marked at each child's own readiness gate, and this is
@@ -293,17 +308,6 @@ func NewSupervised(cfg Config) *Supervised {
 		cfg:   cfg,
 		token: cfg.Token,
 		etcd:  defaultEtcdSeams(),
-		// The healthz probe is token-less and carries no credential, so it does not yet
-		// verify the apiserver's cluster-CA serving leaf. The probe dials the apiserver's
-		// bind host, which is the node or mesh address on a multi-node server, so its
-		// dialer clamps the TCP segment size like every other node-address connection.
-		client: &http.Client{
-			Timeout: 3 * time.Second,
-			Transport: &http.Transport{
-				DialContext:     (&tcpseg.Dialer{}).DialContext,
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-			},
-		},
 	}
 }
 
@@ -581,8 +585,8 @@ func (s *Supervised) provision(ctx context.Context) error {
 // authenticate with — each its own system: identity instead of the shared system:masters
 // admin token (the k3s model; no shared component identity). The certs
 // are signed by the signing CA (= --client-ca-file). EnsureHierarchy is idempotent — it
-// loads an existing hierarchy (the mesh path in cmd/k3sm/server.go creates it before
-// Start), so single-node mints a fresh hierarchy and both paths re-issue the component
+// loads an existing hierarchy (the mesh path, provisionMeshPKI in
+// cmd/k3sm/serverprovision.go, creates it before Start), so single-node mints a fresh hierarchy and both paths re-issue the component
 // kubeconfigs against the same CA on every boot. It runs in provision() (before bringUp
 // starts the scheduler/KCM) so the kubeconfigs and the client-CA exist when those
 // components — and the apiserver — start.
@@ -622,20 +626,6 @@ func (s *Supervised) provisionComponentCerts() error {
 // bind within a second or are never going to.
 const componentReadyTimeout = 30 * time.Second
 
-// bringUp starts the components in order and waits for the apiserver to be
-// healthy before starting scheduler + controller-manager. Each bring-up wait
-// selects on child-exit as well as readiness (fail fast): a kine or
-// apiserver that dies on a bad flag/config surfaces immediately — with its log
-// tail — instead of wedging opaquely until the healthz timeout.
-//
-// The scheduler and the controller-manager get that same wait, and they need it
-// for a reason the earlier components did not have: they were previously started
-// fire-and-forget, so a component that died on its own secure-port bind left
-// bring-up reporting success and the failure surfaced far downstream as something
-// else entirely — a control plane with no service-account controller fails at the
-// first namespace bootstrap, which reads as a bootstrap defect and not as a dead
-// KCM. Waiting on the listener each one owns puts the error back where the fault
-// is, with that component's name and log tail.
 // markSupervised promotes one component from "coming up" to "supervised": from
 // here its own death is a crash for OnComponentExit to report, not a bring-up
 // failure awaitHealthy is already reporting.
@@ -682,6 +672,20 @@ func (s *Supervised) markSupervised(c *component) error {
 		c.name, c.waitErr, c.logPath, RedactedLogTail(c.logPath)))
 }
 
+// bringUp starts the components in order and waits for the apiserver to be
+// healthy before starting scheduler + controller-manager. Each bring-up wait
+// selects on child-exit as well as readiness (fail fast): a kine or
+// apiserver that dies on a bad flag/config surfaces immediately — with its log
+// tail — instead of wedging opaquely until the healthz timeout.
+//
+// The scheduler and the controller-manager get that same wait, and they need it
+// for a reason the earlier components did not have: they were previously started
+// fire-and-forget, so a component that died on its own secure-port bind left
+// bring-up reporting success and the failure surfaced far downstream as something
+// else entirely — a control plane with no service-account controller fails at the
+// first namespace bootstrap, which reads as a bootstrap defect and not as a dead
+// KCM. Waiting on the listener each one owns puts the error back where the fault
+// is, with that component's name and log tail.
 func (s *Supervised) bringUp(ctx context.Context) error {
 	if s.cfg.Etcd != nil {
 		if err := s.bringUpEtcdMember(ctx); err != nil {
@@ -1330,21 +1334,115 @@ func redactLogTail(tail string) string {
 // apiserver's EFFECTIVE BIND (apiServerURL), not loopback: a mesh server binds its
 // wireguard IP only, so a hardcoded loopback probe would never observe it healthy and
 // bring-up would wedge until the healthTimeout.
+//
+// The probe carries the system:masters admin bearer token (anonymous auth is off),
+// so it sends it only to a server that proves itself: the client verifies the
+// serving certificate against the cluster CA in the work dir, exactly as the admin
+// kubeconfig does. A listener that took the bind address first, or answers while
+// the apiserver restarts, fails the handshake and never sees the token. Without a
+// readable cluster CA the probe reports not ready rather than skip verification.
 func (s *Supervised) Ready(ctx context.Context) bool {
 	url := apiServerURL(s.cfg) + "/healthz"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return false
 	}
-	req.Header.Set("Authorization", "Bearer "+s.currentToken())
-	resp, err := s.client.Do(req)
+	client, err := s.probeClient()
 	if err != nil {
+		s.noteProbe(err)
+		return false
+	}
+	req.Header.Set("Authorization", "Bearer "+s.currentToken())
+	resp, err := client.Do(req)
+	if err != nil {
+		s.noteProbe(err)
 		return false
 	}
 	defer resp.Body.Close()
+	s.noteProbe(nil)
 	buf := make([]byte, 2)
 	n, _ := resp.Body.Read(buf)
 	return resp.StatusCode == http.StatusOK && string(buf[:n]) == "ok"
+}
+
+// noteProbe logs a healthz probe failure once per distinct error, so a probe that
+// fails the same way on every poll (a refused connection while the apiserver
+// starts, or a serving leaf the probe will not trust) is visible without flooding
+// the log. A certificate the probe refuses is a Warn: bring-up can only time out
+// behind it. Anything else is a Debug. A nil err (a response arrived) clears the
+// memory, so a later failure is logged again.
+func (s *Supervised) noteProbe(err error) {
+	s.probeMu.Lock()
+	if err == nil {
+		s.probeErr = ""
+		s.probeMu.Unlock()
+		return
+	}
+	msg := err.Error()
+	if msg == s.probeErr {
+		s.probeMu.Unlock()
+		return
+	}
+	s.probeErr = msg
+	s.probeMu.Unlock()
+	var verr *tls.CertificateVerificationError
+	if errors.As(err, &verr) {
+		s.cfg.Logger.Warn("apiserver healthz probe refused the serving certificate; the probe trusts only the cluster CA and the name "+probeServerName,
+			"url", apiServerURL(s.cfg), "err", err)
+		return
+	}
+	s.cfg.Logger.Debug("apiserver healthz probe failed", "url", apiServerURL(s.cfg), "err", err)
+}
+
+// probeServerName is the name the healthz probe verifies the apiserver's serving
+// leaf against. cmd/k3sm issues every leaf with the fixed in-cluster DNS set
+// (apiServerFixedDNS there), of which "kubernetes" is the first, on every topology.
+const probeServerName = "kubernetes"
+
+// probeClient returns the healthz probe's HTTP client, trusting only the cluster CA
+// at certs.ClusterCACertPath. The CA is re-read on every call (a small file, polled
+// at the probe's cadence) so a probe that ran before Start minted the hierarchy, or
+// a CA replaced under a reset work dir, is picked up; the client and its pooled
+// connections are rebuilt only when the bytes change. A missing or unparsable CA is
+// an error, and Ready treats it as not ready: there is no unverified fallback.
+// The client dials the bind host (apiServerURL) but verifies the leaf against
+// probeServerName, not that host: the bind host is not a SAN on every topology (a
+// server without a mesh that runs a non-loopback --node-ip binds that IP, which
+// the leaf carries only when --tls-san names it), while every apiserver leaf
+// carries the fixed in-cluster name.
+func (s *Supervised) probeClient() (*http.Client, error) {
+	caPEM, err := os.ReadFile(certs.ClusterCACertPath(s.cfg.WorkDir))
+	if err != nil {
+		return nil, fmt.Errorf("read the cluster CA for the healthz probe: %w", err)
+	}
+	s.probeMu.Lock()
+	defer s.probeMu.Unlock()
+	if s.probe != nil && bytes.Equal(s.probeCA, caPEM) {
+		return s.probe, nil
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		return nil, fmt.Errorf("parse the cluster CA %s: no certificate", certs.ClusterCACertPath(s.cfg.WorkDir))
+	}
+	if s.probe != nil {
+		s.probe.CloseIdleConnections()
+	}
+	// The probe dials the apiserver's bind host, which is the node or mesh address on
+	// a multi-node server, so its dialer clamps the TCP segment size like every other
+	// node-address connection.
+	dial := s.probeDial
+	if dial == nil {
+		dial = (&tcpseg.Dialer{}).DialContext
+	}
+	s.probe = &http.Client{
+		Timeout: 3 * time.Second,
+		Transport: &http.Transport{
+			DialContext:     dial,
+			TLSClientConfig: &tls.Config{RootCAs: pool, ServerName: probeServerName, MinVersion: tls.VersionTLS12},
+		},
+	}
+	s.probeCA = caPEM
+	return s.probe, nil
 }
 
 // ErrStopBudgetExceeded is returned by Stop when its context ended before every
@@ -1356,14 +1454,14 @@ func (s *Supervised) Ready(ctx context.Context) bool {
 // posture the next server start stops it (ReapOrphanedControlPlane).
 var ErrStopBudgetExceeded = errors.New("control-plane teardown exceeded its budget")
 
-// Stop tears the control plane down in reverse dependency order: the components
-// were appended in start order (kine, apiserver, scheduler, controller-manager),
-// so walking the slice in reverse stops the apiserver and the controllers first
-// and kine last, after which the SQLite DB is no longer in use. Idempotent.
+// Stop tears the control plane down in shutdownOrder: the components were appended
+// in start order (kine, apiserver, scheduler, controller-manager), and Stop stops
+// the apiserver first, then the scheduler and controller-manager, and the datastore
+// (kine or etcd) last, after which the SQLite DB is no longer in use. Idempotent.
 //
 // It HONOURS ctx, and that is the whole of its contract. The daemon calls it under
-// context.WithTimeout(…, StopBound) and pkg/install derives the plist's
-// ExitTimeOut from that same symbol — but Stop used to ignore the context
+// context.WithTimeout(…, StopBound), and pkg/install's ExitTimeOut budgets that
+// same bound (its literal is test-checked against StopBound), but Stop used to ignore the context
 // entirely, waiting on a component's exited channel without a bound once the
 // SIGKILL was out. A child that would not die, or a reaper that never observed the
 // death, therefore parked the teardown forever, launchd answered the blown
@@ -1400,8 +1498,8 @@ func (s *Supervised) Stop(ctx context.Context) error {
 	s.stopEtcdSnapshotSchedule(ctx)
 	s.stopEtcdWatcher(ctx)
 
-	// Reverse start order = correct shutdown order, but the datastore (index 0) must
-	// die last. Build the explicit order: apiserver, scheduler, controller-manager,
+	// Start order with the datastore moved last = correct shutdown order
+	// (shutdownOrder): apiserver, scheduler, controller-manager,
 	// then kine or etcd.
 	var alive []string
 	var unreaped []*component

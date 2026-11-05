@@ -57,7 +57,7 @@ Commands ("server", "agent", "node", "netd", "install", "uninstall", "stop", "st
   kubeconfig  print the admin kubeconfig, or --write/merge it into ~/.kube/config
   status      show what is running (daemons, apiserver, node, workloads, data root; status top for CPU and memory) — the exit code is the verdict, see k3sm status --help
   alerts      only what needs attention, each with its cause, fix steps and docs page (-o json)
-  update      check for a newer k3sm release and which nodes are behind it (update check)
+  update      check for a newer k3sm release and which nodes are behind it, then apply it (update check|apply|status|cancel|abort)
   doctor      run preflight environment + datastore-posture checks
               (--report writes a redacted bug-report bundle)
   snapshot    back up, restore, list and prune datastore snapshots (snapshot save|restore|ls|delete|prune)

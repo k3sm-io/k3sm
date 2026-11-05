@@ -1,0 +1,17 @@
+# A tree the scanner plants under a temporary root: a line `== <path>` starts
+# the file at <path>. main.sh does not set pipefail and sources a library through
+# $HERE; the library sources a second one through $REPO_ROOT. Neither library
+# sets pipefail, so the readers they hold are not flagged.
+== hack/x/main.sh
+#!/usr/bin/env bash
+HERE="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$HERE/../.." && pwd)"
+# shellcheck source=lib/reader.sh
+. "$HERE/lib/reader.sh"
+first_line
+== hack/x/lib/reader.sh
+# A library: it sets no shell options of its own.
+. "$REPO_ROOT/hack/x/lib/inner.sh"
+first_line() { gen | head -1; }
+== hack/x/lib/inner.sh
+first_match() { gen | grep -m1 pat; }

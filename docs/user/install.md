@@ -102,9 +102,9 @@ write into it.
 
 ## Install Channels
 
-k3sm ships through three channels, listed in shipping order:
+k3sm ships through two channels:
 
-1. **The install script (first to ship):**
+1. **The install script:**
 
    ```sh
    curl -fsSL https://k3sm.io/install.sh | sh
@@ -113,12 +113,12 @@ k3sm ships through three channels, listed in shipping order:
    The script preflights (Apple silicon, macOS 26+), downloads the release tarball and its
    checksums from GitHub Releases, verifies the sha256, prints exactly what it is about to do,
    and then runs `sudo k3sm install`. The verification checks **same-origin integrity**, meaning
-   the tarball matches the checksums published beside it. It does not check publisher identity.
-   Publisher identity comes from the other two channels: the app download is Developer ID signed
-   and notarized, and so is the `.pkg`. Environment variables set the
+   the tarball matches the checksums published beside it. The script does not check publisher
+   identity, but the programs in the tarball are Developer ID signed and notarized, and
+   `codesign --verify --strict /Library/k3sm/k3sm` checks that after install. Environment variables set the
    options. `K3SM_INSTALL_VERSION` pins a release, and it is also the repair path, since an
    unpinned re-run jumps to latest. The variable must reach `sh`, so it goes after the pipe:
-   `curl -fsSL https://k3sm.io/install.sh | K3SM_INSTALL_VERSION=v0.2.0 sh` (v0.2.0 is the release you are on
+   `curl -fsSL https://k3sm.io/install.sh | K3SM_INSTALL_VERSION=v0.2.3 sh` (v0.2.3 is the release you are on
    today, so a repair pins the newest tag and never an older one; the [releases page](https://k3sm.io/releases/) lists every version you can pin).
    `K3SM_INSTALL_DOWNLOAD_ONLY=1` downloads and verifies into
    the current directory without ever running `sudo`, so you can inspect first. Re-running the
@@ -126,22 +126,16 @@ k3sm ships through three channels, listed in shipping order:
 
 2. **The k3sm app,** a signed, notarized download from k3sm.io (see [Installing From k3sm.app](#installing-from-k3smapp)).
 
-3. **Notarized `.pkg`** is a signed, stapled installer package for offline and managed
-   installs.
-
-> **Status:** pre-release builds are published; the script resolves the newest one, and a pin
-> via `K3SM_INSTALL_VERSION` always wins. The `.pkg` arrives with the first stable release.
-
-Every channel manages the same `/Library/k3sm`. Once more than one has shipped, run
-`sudo k3sm install` after switching so the daemons run the newly delivered binary, or run
+Both channels manage the same `/Library/k3sm`. Run
+`sudo k3sm install` after switching from one to the other so the daemons run the newly delivered binary, or run
 `sudo k3sm uninstall` first for a clean cutover.
 
 ### Installing From k3sm.app
 
 k3sm.app is built from its own public repository, [k3sm-io/app](https://github.com/k3sm-io/app),
 a separate SwiftPM package. The command-line install needs nothing from the app. The app runs the
-same `k3sm install` with the same defaults as `install.sh`, adding only `--from-staging` and
-`--user`, and it installs the release it carries, which can be older than the newest release the
+same `k3sm install` with the same defaults as `install.sh`, adding `--from-staging` and `--user`
+(and, to join a cluster, `--agent`, `--server` and `--token-file`), and it installs the release it carries, which can be older than the newest release the
 script picks.
 
 When the app is installed in `/Applications`, `k3sm install`, `k3sm start` and
@@ -183,8 +177,64 @@ node credential. A server rewrites the admin kubeconfig for `--user`, or without
 the kubeconfig the last install wrote. With nothing installed and no `--user`, it refuses: there is
 nothing to update in place. A plain `sudo k3sm install` makes none of these checks and is unchanged.
 
-To remove an install made from the app, run `sudo k3sm uninstall`, or use Uninstall in the app's
-window. Dragging the app to the Trash does not remove k3sm: the cluster keeps running.
+The app also updates itself and the cluster. It checks for a newer k3sm.app, and it can move the
+cluster to the k3sm release it carries, bound to that release's checksum with `--pin-sha256`.
+[Upgrade](upgrade.md#updating-from-k3smapp) describes both beside the command-line path, which is
+unchanged, and [Privacy](privacy.md) lists what the check sends.
+
+To remove an install made from the app, run `sudo k3sm uninstall`, or use **Uninstall k3sm…** in the
+app's Settings > Advanced, which keeps the cluster's data unless you tick **Also delete k3sm's
+data**. Dragging the app to the Trash does not remove k3sm: the cluster keeps running.
+
+## Developer mode
+
+Developer mode is for a build from source. It turns the signature checks off on this Mac, so a
+build you made yourself can be installed, and so a developer build of k3sm.app can install,
+update, stop and start it.
+
+- **Contributors.** Run `sudo <tree>/k3sm install --developer-mode on` with the binary you built.
+  An ad-hoc signed build may then replace a team-signed one, and a developer build of the app can
+  install, update, stop and start that k3sm. The downgrade rule still applies: pass
+  `--allow-downgrade` to install an older version on purpose.
+- **Turned on by mistake.** Run `sudo <tree>/k3sm install --developer-mode off` from any tree,
+  or install a Developer ID signed k3sm, which turns developer mode off:
+  - a plain `sudo k3sm install` turns it off when the `k3sm` doing the install carries a
+    Developer ID Application signature of any team, not only the team that signs k3sm releases.
+    The team is not compared with the installed one, and the other programs the install lays
+    down are not checked. The log line names the Developer ID team that signed the `k3sm` doing
+    the install, not a check against the release team. The signature is read from that
+    program's path, not from the bytes later copied into the install root, so a swap of the
+    program between the check and the copy is not seen; a wrong reading can only turn
+    developer mode off, or leave it on with the reason logged. This check only turns developer mode off, which turns the
+    signature checks back on. A plain install turns it off only when the marker exists, valid or
+    not (an invalid marker is removed too). An ad-hoc signed build from source, or one signed for
+    Apple Development, leaves it on, because neither is a Developer ID signature;
+  - an update through k3sm.app turns it off only when every program in the update carries a
+    Developer ID Application signature of one team, and that team is the installed k3sm's when
+    the installed k3sm has one. That is the same team the signature checks require of an update
+    when the mode is off. The log line names the Developer ID team every staged program shares.
+
+  An install that leaves the mode on says why.
+- **Auditing a Mac.** The record is the marker `/Library/k3sm.developer-mode`: a root-owned file,
+  and its presence is the whole record. `k3sm status` shows a `developer-mode` row at severity
+  `warn` while it is there, with the state `on` for a valid marker and `invalid` for anything else
+  at that path (a symlink, a file that is not root-owned, a file others can write, or one with an
+  ACL), or for a marker under a `/` or `/Library` that is not a root-owned real directory that
+  neither group nor others can write, with no ACL. An invalid marker is ignored and the checks stay on. The status `verdict` stays `ok` while
+  the mode is on, and only the `developer-mode` row warns, so automation that audits a Mac reads
+  that row rather than the verdict. A release build of the app never uses the mode.
+  `k3sm uninstall` removes the marker.
+- **How long it lasts.** The marker sits outside the install root, so it survives reboots and
+  ordinary updates. `--developer-mode on` writes it before anything else the install changes, and
+  an install that fails after that leaves it in place, so the checks stay off.
+- **Given up while it is on.** The signature of the k3sm that runs as root is not compared with the
+  installed one. A corrupt copy is still refused, as are the staging directory checks and
+  `--require-team-signature`.
+- Without the flag, the mode stays as it is, except for the signed installs described above.
+  `--developer-mode` is accepted on every install shape. If the marker changes while an install
+  is running, the install refuses and asks to be run again.
+
+See [Status JSON](status-json.md) for the row.
 
 ## Secrets Encryption at Rest
 
@@ -371,6 +421,9 @@ mints a new one, and so are the records the node writes for `k3sm status` (in th
 and in `/var/lib/k3sm/status/`), because they describe a node that no longer runs. The command prints the full list of what it kept. If you
 installed a data volume, it stays mounted and declared; the command prints `sudo k3sm install
 --data-volume` to reinstall onto it and `sudo k3sm datavol delete --yes` to remove it for good.
+
+Uninstall also removes the developer-mode marker `/Library/k3sm.developer-mode`, if there is one (see
+[Developer mode](#developer-mode)).
 
 Uninstall also removes `/Library/k3sm.staging`, the directory the k3sm app copies itself into, and
 refuses to run while the app is in the middle of an install.

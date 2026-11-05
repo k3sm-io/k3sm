@@ -307,7 +307,7 @@ while IFS=$'\t' read -r path kind arches; do
 		[ "$VERBOSE" -eq 0 ] || echo "  ok ($want)  $rel"
 	else
 		bad=$((bad + 1))
-		echo "  INVALID ($want)  $rel: $(printf '%s' "$msg" | head -1 | sed 's|^.*: ||')"
+		echo "  INVALID ($want)  $rel: $(printf '%s' "$msg" | sed -n 1p | sed 's|^.*: ||')"
 	fi
 done < "$CAND"
 ELAPSED=$(( $(date +%s) - START ))

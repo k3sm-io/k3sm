@@ -118,13 +118,8 @@ func TestInstallAgentFlags(t *testing.T) {
 
 	t.Run("every name in a refusal list is a real flag of this command", func(t *testing.T) {
 		// A refusal keyed on a name the FlagSet does not register can never fire,
-		// so the list would rot in silence. --mesh-ip is the one deliberate
-		// exception: it is listed ahead of the flag itself landing, so that the
-		// refusal is already right on the day it does.
+		// so the list would rot in silence.
 		for _, name := range append(append([]string{}, serverOnlyInstallFlags...), "server", "token-file", "node-ip") {
-			if name == "mesh-ip" {
-				continue
-			}
 			_, err := parseInstallFlags([]string{"--" + name})
 			if err != nil && strings.Contains(err.Error(), "not defined") {
 				t.Errorf("--%s is named in a refusal list but is not a flag of `k3sm install`", name)

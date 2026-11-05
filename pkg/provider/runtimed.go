@@ -36,6 +36,7 @@ import (
 	statsv1alpha1 "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 	"k8s.io/utils/clock"
 
+	budgetv1alpha1 "k3sm.io/apis/budget/v1alpha1"
 	netv1 "k3sm.io/apis/net/v1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/darwin-net/pkg/dns"
@@ -142,7 +143,11 @@ type runtimedRuntime struct {
 	// happens to be published on the same port is also unreachable from a
 	// confined pod (see the proto field's own doc comment).
 	deniedLocalPorts []uint32
-	log              *slog.Logger
+	// history is the node's persisted eviction, OOM and restart history
+	// (budgethistory.go), opened from RuntimedConfig.BudgetDir. nil records
+	// nothing. Set at construction, never replaced.
+	history *BudgetHistory
+	log     *slog.Logger
 
 	// developerDir is this node's active developer directory (`xcode-select -p`),
 	// resolved ONCE at construction and stamped onto the SandboxProfile of every
@@ -207,7 +212,7 @@ type runtimedRuntime struct {
 	probeTransport http.RoundTripper
 
 	// client force-deletes a pod from the apiserver the instant its containers are
-	// torn down. Virtual Kubelet's PodController (v1.12.0) otherwise delays the
+	// torn down. Virtual Kubelet's PodController (v1.14.0) otherwise delays the
 	// API-side delete of a running-then-deleted pod by the FULL
 	// deletionGracePeriodSeconds: its prompt path (syncPodInProvider force-deleting
 	// on !running) is reachable only via the informer, whose podShouldEnqueue →
@@ -245,6 +250,30 @@ type runtimedRuntime struct {
 	retained map[string]*corev1.Pod
 	probers  map[string]*podProber // pod id -> provider-served probe runner
 	notify   func(*corev1.Pod)
+	// admission is the pressure source CreatePod admits a new pod against
+	// (admission.go); nil admits every pod. Guarded by mu.
+	admission admissionPressure
+	// admitting counts, per pod id, the creates admission let through that have
+	// not yet returned (admission.go, admitOnCreate). A refusal for a pod with an
+	// admitted create in flight yields to it, so the decision and its result are
+	// published together. Guarded by mu; created on first use.
+	admitting map[string]int
+	// admittedHook, when set, runs in CreatePod right after admission let the
+	// create through, before anything is registered: the seam a test uses to hold
+	// one create inside the admission window. Nil in production; set before any
+	// create and never changed, so it is read without mu.
+	admittedHook func(podID string)
+	// fenceReleasing holds, per pod id, a channel closed when CreatePod's fence
+	// has released what a refused create acquired (runtimed.go, CreatePod).
+	// admitOnCreate waits on it, so no create of the pod is admitted during the
+	// release. Guarded by mu; created on first use.
+	fenceReleasing map[string]chan struct{}
+	// fenceReleaseHook and fenceWaitHook, when set, run at the fence after the
+	// unlock and before the release, and in admitOnCreate before it waits on a
+	// release: the seams a test uses to admit a create inside that window. Nil
+	// in production; set before any create and never changed, read without mu.
+	fenceReleaseHook func(podID string)
+	fenceWaitHook    func(podID string)
 	// compensating is the set of pod ids with a compensating delete owed and in
 	// flight — a guest a parked pod's retry built after the pod was deleted, which
 	// nothing but this provider knows about (runtimed_pull.go). It is
@@ -279,6 +308,25 @@ type runtimedRuntime struct {
 // by it. Idempotent, and safe to call from any goroutine.
 func (r *runtimedRuntime) shutdown() {
 	r.lifetimeOnce.Do(func() { close(r.lifetime) })
+}
+
+// Close releases the embedded runtime: it ends the provider's lifetime workers,
+// stops the runtime's pod supervision (every pod process keeps running) and
+// lets go of the runtime root's lock, so a later runtime on the same root can
+// start, as a restarted daemon does. Idempotent.
+//
+// The node does not call this: its exit path closes the same runtime through
+// ServableRuntime (cmd/k3sm), after it has stopped the eviction loop and
+// flushed the budget history, because both act through the runtime. Close is
+// for an owner that holds only the provider.
+func (r *runtimedRuntime) Close() error {
+	r.shutdown()
+	if c, ok := r.rt.(interface{ Close() error }); ok {
+		if err := c.Close(); err != nil {
+			return fmt.Errorf("close embedded runtime: %w", err)
+		}
+	}
+	return nil
 }
 
 // podTrack is the provider-side bookkeeping the runtime does not retain: a stable
@@ -356,6 +404,11 @@ type podTrack struct {
 	// runtime reports during or after the teardown can turn an evicted pod back
 	// into a running or restarting one. Guarded by restartMu with deleting.
 	evicted *corev1.PodStatus
+	// rejected marks a track whose pod was refused at admission (admission.go):
+	// evicted holds its rejected status, and the runtime never heard of it, so
+	// DeletePod forgets it without a runtime teardown. Set before the track is
+	// published and never changed.
+	rejected bool
 
 	// hookMu guards postStart — the per-container postStart hook bookkeeping of
 	// the postStart fidelity path (poststart.go): the pending/failed readiness gate the
@@ -568,8 +621,18 @@ type RuntimedConfig struct {
 	// ContainerLogMonitorInterval is how often the rotation scan runs (kubelet
 	// containerLogMonitorInterval; default 10s).
 	ContainerLogMonitorInterval time.Duration
+	// BudgetDir is the node's budget state directory, <workdir>/budget/ under
+	// the node's own (server or agent) work dir: protected, mode 0700, outside
+	// every tree a pod can open. The persisted eviction, OOM and restart
+	// history lives there. Empty keeps no history (a standalone `k3sm node`).
+	BudgetDir string
 	// Logger is the structured logger; a discard logger is used if nil.
 	Logger *slog.Logger
+
+	// rootLockWait is runtimed's Deps.RootLockWait: how long New waits for
+	// another runtime to let go of Root. Zero is runtimed's default; it is a
+	// test seam, so a test whose runtime was not closed fails at once.
+	rootLockWait time.Duration
 }
 
 // NewRuntimed builds a runtimedRuntime, constructing the in-process runtime with
@@ -590,6 +653,14 @@ func NewRuntimed(ctx context.Context, cfg RuntimedConfig) (*runtimedRuntime, err
 	// empty) deny stanza for the control-plane datastore port.
 	if _, err := normalizeLocalPortDenies(cfg.DeniedLocalPorts); err != nil {
 		return nil, fmt.Errorf("init runtimed: %w", err)
+	}
+	// The budget history opens before anything runs, so the first exit the
+	// startup attach observes is classified against the persisted intents.
+	var history *BudgetHistory
+	if cfg.BudgetDir != "" {
+		// It never fails the node: an unusable dir or file degrades to an
+		// in-memory history with a Warn log.
+		history = OpenBudgetHistory(cfg.BudgetDir, budgetFingerprint(binaryIdentity(version.Get())), log)
 	}
 	// runtimed never talks to the apiserver: the provider (which holds the client)
 	// supplies the volume Resolver + imagePullSecret CredentialResolver. nil client
@@ -638,6 +709,7 @@ func NewRuntimed(ctx context.Context, cfg RuntimedConfig) (*runtimedRuntime, err
 		)
 	}
 	deps.Resolver = resolver
+	deps.RootLockWait = cfg.rootLockWait
 	deps.Credentials = creds
 	deps.Network = network
 	// The cluster-mirror seam. Threaded as DATA, exactly like the resolver and the
@@ -677,6 +749,7 @@ func NewRuntimed(ctx context.Context, cfg RuntimedConfig) (*runtimedRuntime, err
 		return nil, fmt.Errorf("init runtimed: %w", err)
 	}
 	r := newRuntimedWith(rt, cfg, resolver, log)
+	r.history = history
 	// Startup re-attachment, then the startup pod reap — MUST run here,
 	// in-process, before any CreatePod can be served. The embedded node drives
 	// this Runtime by direct RPC and never runs runtime.Server.Serve, so
@@ -1650,6 +1723,26 @@ func (r *runtimedRuntime) buildBox(ctx context.Context, pod *corev1.Pod, podIP s
 	return box, nil
 }
 
+// fenceRelease frees what a create refused at CreatePod's fence acquired (the
+// /32, the lo0 alias, the interconnect slot and the references), then ends the
+// wait admitOnCreate holds new creates of the pod in. The wait ends in a defer,
+// so a panic in the release cannot leave every later create of the pod waiting;
+// the panic is not recovered.
+func (r *runtimedRuntime) fenceRelease(pod *corev1.Pod, released chan struct{}) {
+	id := string(pod.UID)
+	defer func() {
+		r.mu.Lock()
+		delete(r.fenceReleasing, id)
+		r.mu.Unlock()
+		close(released)
+	}()
+	if hook := r.fenceReleaseHook; hook != nil {
+		hook(id)
+	}
+	r.releasePodNetwork(pod)
+	r.refs.UnregisterPod(pod.UID)
+}
+
 // CreatePod translates the pod to a PodBox and asks the runtime to start it. The
 // runtime returns a typed failure inside the response (the RPC itself returns
 // nil) when the fail-closed gate rejects the pod; CreatePod surfaces that as an
@@ -1660,10 +1753,21 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	// Failed pod; this is the provider's own fence behind it, so a restarted
 	// node cannot resurrect a restartPolicy: Always pod that was evicted for
 	// filling memory.
-	if isEvictedPod(pod) {
-		r.log.Info("CreatePod: the pod was evicted from this node; not creating it",
+	if isEvictedPod(pod) || isBudgetRejectedPod(pod) {
+		r.log.Info("CreatePod: the pod was evicted from or rejected by this node; not creating it",
 			"namespace", pod.Namespace, "name", pod.Name, "uid", string(pod.UID))
 		return nil
+	}
+	// Node-side admission under pressure (admission.go), before anything is
+	// registered or allocated: a refused pod holds no address, no references and
+	// no sandbox, only its terminal status.
+	refused, admitted := r.admitOnCreate(ctx, pod)
+	if refused {
+		return nil
+	}
+	defer admitted.done()
+	if hook := r.admittedHook; hook != nil {
+		hook(string(pod.UID))
 	}
 	// Bind the pod's identity (ServiceAccount + name + UID) to the request context
 	// so the shared volume Resolver mints the in-pod-API token (projected SA-token
@@ -1752,6 +1856,48 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 
 	r.mu.Lock()
 	old := r.track[id]
+	if old != nil && old.evictedStatus() != nil {
+		// The pod was refused at admission or evicted while this create ran. Its
+		// terminal status is already the apiserver's; a live track here would run
+		// a pod the apiserver reports Failed. Admission's in-flight count keeps a
+		// refusal from landing between an admitted create's decision and this
+		// point, so this is the fence behind it. With the count taken on every
+		// admitted path, this branch is defence in depth.
+		//
+		// A refused pod holds nothing, and its delete (forgetRejected) frees
+		// nothing, so the /32, the lo0 alias, the interconnect slot and the
+		// references this create acquired are released here. An evicted track
+		// keeps them: its DeletePod tears them down. All of them are keyed by
+		// the pod's UID, so the release is decided under r.mu: this create ends
+		// its own in-flight count first, and releases only when no other
+		// admitted create of the pod is in flight. Otherwise that create owns
+		// the resources (it reaches this fence itself, or runs the pod after a
+		// delete forgot the rejection), and releasing would take them from it.
+		// While the release runs, fenceReleasing makes admitOnCreate hold every
+		// new create of the pod, so none is admitted in the window after the
+		// unlock. The release takes only its own leaf locks.
+		admitted.doneLocked()
+		var released chan struct{}
+		// When the release is skipped because another admitted create is in
+		// flight and that create then fails before its own fence, nothing
+		// releases the rejected pod's resources. That needs a rejected track
+		// beside two in-flight creates, which admitOnCreate makes close to
+		// unreachable.
+		if old.rejected && r.admitting[id] == 0 && r.fenceReleasing[id] == nil {
+			released = make(chan struct{})
+			if r.fenceReleasing == nil {
+				r.fenceReleasing = map[string]chan struct{}{}
+			}
+			r.fenceReleasing[id] = released
+		}
+		r.mu.Unlock()
+		r.log.Warn("CreatePod: the pod became terminal on this node while it was being created; not creating it",
+			"namespace", pod.Namespace, "name", pod.Name, "uid", id, "rejected", old.rejected, "released", released != nil)
+		if released != nil {
+			r.fenceRelease(pod, released)
+		}
+		return nil
+	}
 	if wantsGPU {
 		// CHECK AND INSERT IN ONE CRITICAL SECTION. Two concurrent GPU creates that
 		// each read the admitted total before either wrote its own track would both
@@ -1943,7 +2089,8 @@ func (r *runtimedRuntime) gpuCeilingBytes(ctx context.Context) int64 {
 func (r *runtimedRuntime) admittedGPUMemoryLocked(excludeID string) int64 {
 	var sum int64
 	for trackedID, t := range r.track {
-		if trackedID == excludeID || t == nil || t.pod == nil {
+		// A pod refused at admission holds no GPU memory.
+		if trackedID == excludeID || t == nil || t.pod == nil || t.rejected {
 			continue
 		}
 		if !podRequestsGPU(t.pod) {
@@ -2120,6 +2267,11 @@ func (r *runtimedRuntime) DeletePod(ctx context.Context, pod *corev1.Pod) error 
 			t = live
 		}
 	}
+	// A pod refused at admission never reached the runtime: forget it.
+	if t != nil && t.rejected {
+		r.forgetRejected(ctx, pod, t)
+		return nil
+	}
 	// An evicted pod's processes are already gone (evictPod stopped them), so
 	// there is nothing for a preStop hook to run in: finish the teardown it left
 	// for this call (the /32, the log tree, the track, the apiserver object).
@@ -2207,10 +2359,19 @@ func (r *runtimedRuntime) evictPod(ctx context.Context, pod *corev1.Pod, n evict
 	r.recorder.Event(tracked, corev1.EventTypeWarning, reasonEvicted, n.message)
 
 	t.quiesceForEviction()
+	// The intent write is time-boxed: a stalled disk must not hold back the
+	// kill that keeps the node from running out of memory.
+	intent := r.recordStopIntentWithin(tracked, "", budgetIntentWriteBound)
 	if _, err := r.rt.DeletePod(ctx, &runtimev1.DeletePodRequest{PodId: id, GracePeriodSeconds: 0}); err != nil {
+		// Only a definitive refusal proves the kill did not happen; after a
+		// deadline or a lost transport it may have, so the intent stays.
+		if stopNotIssued(err) {
+			r.history.dropIntent(intent)
+		}
 		t.unmarkEvicted(st)
 		return fmt.Errorf("runtimed delete pod %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
+	r.recordBudgetEvent(tracked, budgetv1alpha1.CounterEviction)
 	r.stopProber(id)
 	r.transport.drop(id)
 
@@ -2257,8 +2418,13 @@ func (t *podTrack) quiesce() {
 // idempotent re-create installed meanwhile is left alone.
 func (r *runtimedRuntime) teardownPod(ctx context.Context, pod *corev1.Pod, grace int64, owned *podTrack) error {
 	id := string(pod.UID)
+	intent := r.recordStopIntent(pod, "")
 	_, err := r.rt.DeletePod(ctx, &runtimev1.DeletePodRequest{PodId: id, GracePeriodSeconds: grace})
 	if err != nil {
+		// Only a definitive refusal proves the stop did not happen.
+		if stopNotIssued(err) {
+			r.history.dropIntent(intent)
+		}
 		return fmt.Errorf("runtimed delete pod %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
 	// Stop the probe runner before forgetting the pod (stopProber waits for the
@@ -2382,8 +2548,8 @@ func (r *runtimedRuntime) GetPodStatus(ctx context.Context, namespace, name stri
 // GetPods returns every tracked pod with its current status applied.
 func (r *runtimedRuntime) GetPods(ctx context.Context) ([]*corev1.Pod, error) {
 	// The pod POINTER is snapshotted inside the critical section, not just the
-	// track. r.mu guards the t.pod field itself — UpdatePod reassigns it at
-	// :1170 under this same lock — so reading t.pod out in the loop below was a
+	// track. r.mu guards the t.pod field itself — UpdatePod reassigns it
+	// under this same lock — so reading t.pod out in the loop below was a
 	// data race, reported by -race against the 10s backstop's GetPods running
 	// concurrently with a VK pod worker's UpdatePod. It is the one mutable field
 	// of podTrack that r.mu guards: readyMu, restartMu and hookMu exist
@@ -2557,6 +2723,8 @@ func (r *runtimedRuntime) Watch(ctx context.Context, cb func(*corev1.Pod)) {
 	r.notify = cb
 	r.mu.Unlock()
 
+	// The budget history's one writer, for the provider's run lifetime.
+	r.history.start(ctx)
 	go r.runWatch(ctx)
 	go r.runBackstop(ctx)
 	go r.runOrphanReaper(ctx)

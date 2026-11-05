@@ -150,7 +150,7 @@ rsh "sudo -n true" >/dev/null 2>&1 || { echo "ssh + passwordless sudo is require
 LOCAL_NODE=""; LOCAL_NODE_IP=""; PEER_NODE=""; PEER_NODE_IP=""
 while read -r name ip ready; do
 	[ "$ready" = "True" ] || { echo "node $name is not Ready" >&2; exit 1; }
-	if ifconfig lo0 | grep -q "inet $ip "; then
+	if grep -q "inet $ip " <<<"$(ifconfig lo0)"; then
 		LOCAL_NODE="$name"; LOCAL_NODE_IP="$ip"
 	elif [ -z "$PEER_NODE" ]; then
 		PEER_NODE="$name"; PEER_NODE_IP="$ip"
@@ -362,7 +362,7 @@ mss_rows() {
 # ── Leg: pf (read-only) ───────────────────────────────────────────────────────
 ANCHOR_LOCAL=unknown; ANCHOR_PEER=unknown
 pf_read() {
-	echo "## pfctl -s info"; sudo -n pfctl -s info 2>&1 | grep -v ALTQ | head -4
+	echo "## pfctl -s info"; sudo -n pfctl -s info 2>&1 | grep -v ALTQ | sed -n 1,4p
 	echo "## pfctl -sr"; sudo -n pfctl -sr 2>&1 | grep -v ALTQ
 	echo "## pfctl -a io.k3sm.mesh -sr"; sudo -n pfctl -a io.k3sm.mesh -sr 2>&1 | grep -v ALTQ
 }
@@ -374,14 +374,14 @@ leg_pf() {
 		echo "## ifconfig $LOCAL_UTUN"; ifconfig "$LOCAL_UTUN"
 		echo "## route -n get $PEER_NODE_IP"; route -n get "$PEER_NODE_IP"
 		echo "### peer ($PEER_NODE)"
-		rsh "sudo -n pfctl -s info 2>&1 | grep -v ALTQ | head -4; echo '## pfctl -sr'; sudo -n pfctl -sr 2>&1 | grep -v ALTQ; echo '## pfctl -a io.k3sm.mesh -sr'; sudo -n pfctl -a io.k3sm.mesh -sr 2>&1 | grep -v ALTQ; echo '## ifconfig $PEER_UTUN'; ifconfig $PEER_UTUN; echo '## route -n get $LOCAL_NODE_IP'; route -n get $LOCAL_NODE_IP"
+		rsh "sudo -n pfctl -s info 2>&1 | grep -v ALTQ | sed -n 1,4p; echo '## pfctl -sr'; sudo -n pfctl -sr 2>&1 | grep -v ALTQ; echo '## pfctl -a io.k3sm.mesh -sr'; sudo -n pfctl -a io.k3sm.mesh -sr 2>&1 | grep -v ALTQ; echo '## ifconfig $PEER_UTUN'; ifconfig $PEER_UTUN; echo '## route -n get $LOCAL_NODE_IP'; route -n get $LOCAL_NODE_IP"
 	} >"$f" 2>&1
-	if sudo -n pfctl -sr 2>/dev/null | grep -q 'io\.k3sm\.mesh'; then ANCHOR_LOCAL=referenced; else ANCHOR_LOCAL=unreferenced; fi
-	if rsh "sudo -n pfctl -sr 2>/dev/null" | grep -q 'io\.k3sm\.mesh'; then ANCHOR_PEER=referenced; else ANCHOR_PEER=unreferenced; fi
+	if grep -q 'io\.k3sm\.mesh' <<<"$(sudo -n pfctl -sr 2>/dev/null)"; then ANCHOR_LOCAL=referenced; else ANCHOR_LOCAL=unreferenced; fi
+	if grep -q 'io\.k3sm\.mesh' <<<"$(rsh "sudo -n pfctl -sr 2>/dev/null")"; then ANCHOR_PEER=referenced; else ANCHOR_PEER=unreferenced; fi
 	PF_LOCAL="$(sudo -n pfctl -s info 2>/dev/null | awk '/^Status:/{print $2}')"
 	PF_PEER="$(rsh "sudo -n pfctl -s info 2>/dev/null" | awk '/^Status:/{print $2}')"
-	UTUN_MTU_LOCAL="$(ifconfig "$LOCAL_UTUN" | sed -nE 's/.* mtu ([0-9]+).*/\1/p' | head -1)"
-	UTUN_MTU_PEER="$(rsh "ifconfig $PEER_UTUN" | sed -nE 's/.* mtu ([0-9]+).*/\1/p' | head -1)"
+	UTUN_MTU_LOCAL="$(ifconfig "$LOCAL_UTUN" | sed -nE 's/.* mtu ([0-9]+).*/\1/p' | sed -n 1p)"
+	UTUN_MTU_PEER="$(rsh "ifconfig $PEER_UTUN" | sed -nE 's/.* mtu ([0-9]+).*/\1/p' | sed -n 1p)"
 	ROUTE_MTU_LOCAL="$(route -n get "$PEER_NODE_IP" | awk '/mtu/{getline; print $7}')"
 	ROUTE_MTU_PEER="$(rsh "route -n get $LOCAL_NODE_IP" | awk '/mtu/{getline; print $7}')"
 	log "pf: local status=$PF_LOCAL anchor=$ANCHOR_LOCAL utun_mtu=$UTUN_MTU_LOCAL route_mtu=$ROUTE_MTU_LOCAL; peer status=$PF_PEER anchor=$ANCHOR_PEER utun_mtu=$UTUN_MTU_PEER route_mtu=$ROUTE_MTU_PEER"
@@ -434,8 +434,8 @@ pods_up() {
 	local i p ip
 	for p in "$POD_L:$POD_L_IP" "$POD_P:$POD_P_IP"; do
 		ip="${p#*:}"; p="${p%%:*}"
-		for i in $(seq 1 30); do srv_state "$p" "$ip" | grep -q '"ready": true' && break; sleep 1; done
-		srv_state "$p" "$ip" | grep -q "\"ip\": \"$ip\"" || { log "pod $p server not ready: $(srv_state "$p" "$ip" 2>&1 | tail -3)"; return 1; }
+		for i in $(seq 1 30); do grep -q '"ready": true' <<<"$(srv_state "$p" "$ip")" && break; sleep 1; done
+		grep -q "\"ip\": \"$ip\"" <<<"$(srv_state "$p" "$ip")" || { log "pod $p server not ready: $(srv_state "$p" "$ip" 2>&1 | tail -3)"; return 1; }
 	done
 	log "pods: $POD_L $POD_L_IP on $LOCAL_NODE; $POD_P $POD_P_IP on $PEER_NODE"
 }
@@ -466,7 +466,7 @@ leg_mss() {
 	cap_stop peer "port $PORT_SYN"
 	{ mss_rows "$d/cap-local.txt" "local-$LOCAL_UTUN"; mss_rows "$d/cap-peer.txt" "peer-$PEER_UTUN"; } | tee -a "$MSS_ROWS_FILE" >"$d/rows.txt"
 	log "mss: $(wc -l <"$d/rows.txt" | tr -d ' ') SYN/SYN-ACK observations; client TCP_MAXSEG: $(grep -o 'maxseg=[0-9-]*' "$d/clients.log" | tr '\n' ' ')"
-	[ "$(grep -c 'syn-ok' "$d/clients.log")" -eq 4 ] || { log "mss: not all four clients connected: $(grep -v syn-ok "$d/clients.log" | head -5)"; return 1; }
+	[ "$(grep -c 'syn-ok' "$d/clients.log")" -eq 4 ] || { log "mss: not all four clients connected: $(grep -v syn-ok "$d/clients.log" | sed -n 1,5p)"; return 1; }
 }
 
 # ── Leg: udp ──────────────────────────────────────────────────────────────────
@@ -538,7 +538,7 @@ leg_pmtud() {
 		done
 		local oif
 		oif="$(route -n get "$PEER_ENDPOINT_HOST" 2>/dev/null | awk '/interface:/{print $2}')"
-		echo "outer interface $oif mtu=$(ifconfig "$oif" 2>/dev/null | sed -nE 's/.* mtu ([0-9]+).*/\1/p' | head -1)" >>"$PMTUD_TABLE"
+		echo "outer interface $oif mtu=$(ifconfig "$oif" 2>/dev/null | sed -nE 's/.* mtu ([0-9]+).*/\1/p' | sed -n 1p)" >>"$PMTUD_TABLE"
 	else
 		echo "outer path: no MeshPeer endpoint found" >>"$PMTUD_TABLE"
 	fi

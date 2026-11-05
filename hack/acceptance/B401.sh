@@ -115,7 +115,7 @@ launch_ln="${l%%$'\t'*}"
 if [ -z "$if_ln" ] || [ -z "$fi_ln" ]; then
 	b4=no; echo "  server_up: cannot locate the if [ \"\$runtime\" = runtimed ] ... fi block"
 else
-	if printf '%s\n' "$sb" | awk -F'\037' -v s="$if_ln" -v e="$fi_ln" '$1 > s && $1 < e' | grep -q -- '--pod-logs-dir'; then
+	if grep -q -- '--pod-logs-dir' <<<"$(printf '%s\n' "$sb" | awk -F'\037' -v s="$if_ln" -v e="$fi_ln" '$1 > s && $1 < e')"; then
 		b4=no; echo "  server_up: --pod-logs-dir appears inside the runtimed-only block"
 	fi
 	if [ -z "$launch_ln" ] || [ "$launch_ln" -le "$fi_ln" ]; then

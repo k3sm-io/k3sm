@@ -183,18 +183,19 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 }
 
 // Handler returns the bootstrap HTTP mux (CACertPath + JoinPath +
-// MeshEndpointPath + DeregisterPath, plus the server-bootstrap CA-bundle endpoint
+// MeshEndpointPath + DeregisterPath + NetserveCertPath, plus the server-bootstrap CA-bundle endpoint
 // when ServerAuth + Bundle are configured, and the server-class etcd member routes
 // when ServerAuth + Members are configured).
 //
 // The routes do NOT share an authentication scheme, and that is deliberate:
 // /cacert, /join and /server-bootstrap are reached by a node that holds no cluster
 // certificate yet, so they authenticate a token (or nothing, for the public CA);
-// MeshEndpointPath and DeregisterPath are reached only by a node that has already
-// joined, so they authenticate that node's own certificate and accept no token at
-// all. Those two are the cluster's whole node-certificate-authenticated surface:
-// one moves a node's endpoint, the other removes the node, and neither can name
-// any node but the one the certificate identifies.
+// MeshEndpointPath, DeregisterPath and NetserveCertPath are reached only by a node
+// that has already joined, so they authenticate that node's own certificate and accept no token at
+// all. Those three are the cluster's whole node-certificate-authenticated surface:
+// one moves a node's endpoint, one removes the node, one issues the node's own
+// netserve certificate, and none can name any node but the one the certificate
+// identifies.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc(CACertPath, s.handleCACert)
@@ -352,7 +353,7 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 
 	// 1b. PER-TOKEN RATE LIMIT. Everything below this line is the expensive half
 	// of a join — the node-password bind, the CSR parse and policy checks, the
-	// mesh enroll's index carve and the release that gives it back, and up to two
+	// mesh enroll's index carve and the release that gives it back, and up to three
 	// signatures. A holder of one valid worker token could otherwise drive that
 	// round trip as fast as the network allows, enrolling and releasing without
 	// bound, and every one of those requests is authenticated, so nothing above

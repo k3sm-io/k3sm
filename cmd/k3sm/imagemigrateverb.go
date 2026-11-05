@@ -23,6 +23,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
@@ -232,8 +233,10 @@ in the node store and runnable until it is loaded again.
 The server runs this by itself on its first start after an upgrade. A worker
 never pushes on its own: run it there by hand, with sudo, because the node
 store is read through the runtime's socket, which only root and the k3sm
-service user may open (as for image prune). On a worker --report needs sudo
-too, because the journal is root's there. The copy goes through the push
+service user may open (as for image prune). --report needs sudo too, because
+the journal it prints is root's. Without sudo, on a server --report prints the
+summary k3sm status shows and -o json is refused; on a worker both are
+refused. The copy goes through the push
 gate with a builder token minted from your kubeconfig, the way
 k3sm build --push does: on a server to its loopback gate, on a worker to the
 server's cluster address. Progress is journalled on this node.
@@ -292,6 +295,9 @@ func imageMigrateCommand(ctx context.Context, o imageMigrateOptions, out io.Writ
 		err error
 	)
 	if o.report {
+		if handled, rerr := reportPublishedMigration(o, out); handled {
+			return rerr
+		}
 		j, err = readMigrationJournal(o.workDir)
 	} else {
 		if err := migrateRuntimeAccess(o.socket); err != nil {
@@ -355,7 +361,57 @@ func migrateAgentAccess() error {
 	if role, _ := migrateRole(); role != install.RoleAgent || status.RuntimedReachable(migrateGeteuid(), migrateServiceUID()) {
 		return nil
 	}
-	return errors.New("on a worker, k3sm image migrate (--report included) reads this node's image store and its migration journal, which only root and the k3sm service user may open; run it with sudo: sudo k3sm image migrate")
+	return migrateNeedsSudo("sudo k3sm image migrate")
+}
+
+// errMigrateNeedsSudo is why an ordinary account is refused the verb, or the
+// per-image report, on an installed node.
+var errMigrateNeedsSudo = errors.New("k3sm image migrate (--report included) reads this node's image store and its migration journal, which only root and the k3sm service user may open")
+
+// migrateNeedsSudo is the refusal, naming the command to run instead.
+func migrateNeedsSudo(command string) error {
+	return fmt.Errorf("%w; run it with sudo: %s", errMigrateNeedsSudo, command)
+}
+
+// reportPublishedMigration answers --report for an ordinary account on a
+// server whose work dir holds no journal it can read. The server's journal is
+// under the installed, root-only work dir, so the work dir such an account
+// resolves (its own <home>/server, or any --work-dir) holds none, and an
+// empty journal printed from there would report a migration that never ran
+// there as incomplete. It prints instead the summary the server publishes for
+// `k3sm status`, and says the per-image report needs sudo. -o json, whose
+// shape is the journal, is refused rather than built from the summary, and so
+// is a server that has published no summary. handled is false when the
+// caller's own report applies: root, the service user, any role but a server
+// (a worker refused earlier, an uninstalled Mac's hand-run server), or a
+// journal this account can read.
+func reportPublishedMigration(o imageMigrateOptions, out io.Writer) (handled bool, err error) {
+	if status.RuntimedReachable(migrateGeteuid(), migrateServiceUID()) {
+		return false, nil
+	}
+	if role, _ := migrateRole(); role != install.RoleServer {
+		return false, nil
+	}
+	_, rerr := os.ReadFile(migrationJournalPath(o.workDir))
+	if rerr == nil || (!errors.Is(rerr, fs.ErrNotExist) && !errors.Is(rerr, fs.ErrPermission)) {
+		return false, nil
+	}
+	refusal := migrateNeedsSudo("sudo k3sm image migrate --report")
+	if o.output == "json" {
+		return true, refusal
+	}
+	path := status.ImageMigrationSummaryPath(installedServerWorkDir)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return true, refusal
+	}
+	s, err := status.ParseImageMigrationSummary(raw)
+	if err != nil {
+		return true, errors.Join(refusal, fmt.Errorf("%s: %w", path, err))
+	}
+	fmt.Fprintf(out, "image migration %s (from %s)\n", s.Detail(), path)
+	fmt.Fprintf(out, "the per-image report is in the journal: %v\n", refusal)
+	return true, nil
 }
 
 // migrationLock serialises migrations within this process: the on-upgrade
