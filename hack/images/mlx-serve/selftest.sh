@@ -34,7 +34,7 @@
 #     window with vLLM's HTTP 400 and passes one inside it, against fakes and,
 #     when a staged tree is present, against the real vllm-mlx server, on the
 #     completion, chat, Messages and Responses routes, streaming or not;
-#   * k3sm-serve refuses every image URL that is not a data: URL before a name is
+#   * k3sm-serve refuses every media URL that is not a data: URL before a name is
 #     resolved, and refuses to start when the function it replaces has moved,
 #     against fakes and, with a staged tree, on the real vllm-mlx routes;
 #   * k3sm-serve lowers --max-kv-size for a model whose config.json geometry
@@ -59,7 +59,8 @@
 #   pin source (hermetic, a few seconds): it re-runs this script's 9a verdict
 #   against an empty stage and a fixture stage and checks the verdicts.
 #   --case serve.image.remote runs only that case: k3sm_serve's refusal of remote
-#   image URLs, on fakes and, when a staged tree is present, on the real engine.
+#   image, video and audio URLs, on fakes and, when a staged tree is present, on
+#   the real engine.
 #   Any other argument is refused with exit 2.
 # Exit: 0 all checks pass, 1 otherwise, 2 on a usage error.
 set -uo pipefail
@@ -401,15 +402,15 @@ PY
 }
 
 # rung_serve_image_remote is the case serve.image.remote: k3sm_serve refuses
-# every image URL that is not a data: URL, before any name is resolved. First
-# against fakes, whose download_image and _validate_remote_media_urls are
-# vllm-mlx 0.5.0's verbatim, so the pins are checked on any Mac; then, on a
-# staged tree, on the real modules behind the real HTTP app (a fake engine under
-# it: no model, no GPU, and socket.getaddrinfo and requests.request replaced by
-# recorders, so nothing leaves this Mac). The real leg first proves the stock
-# function does resolve and fetch, so the refusals cannot pass vacuously, and
-# then drives the chat, Responses and Anthropic routes, streaming or not. With
-# --staged a missing tree is a failure, not a skip.
+# every image, video or audio URL that is not a data: URL, before any name is
+# resolved. First against fakes, whose fetch functions and
+# _validate_remote_media_urls are vllm-mlx 0.5.0's verbatim, so the pins are
+# checked on any Mac; then, on a staged tree, on the real modules behind the real
+# HTTP app (a fake engine under it: no model, no GPU, and socket.getaddrinfo and
+# requests.request replaced by recorders, so nothing leaves this Mac). The real
+# leg first proves the stock engine does resolve and fetch, so the refusals cannot
+# pass vacuously, and then drives the chat, Responses and Anthropic routes,
+# streaming or not. With --staged a missing tree is a failure, not a skip.
 rung_serve_image_remote() {
 	cat > "$WORK/serve-image.py" <<'PY'
 import http.server, sys, threading
@@ -418,6 +419,9 @@ import k3sm_serve as ks
 import k3sm_shard as shard
 
 MAX_IMAGE_SIZE = 20 * 1024 * 1024
+MAX_VIDEO_SIZE = 500 * 1024 * 1024
+MAX_AUDIO_SIZE = 100 * 1024 * 1024
+FETCHES = ("download_image", "download_video", "download_audio")
 
 def check(name, cond):
     print(("ok " if cond else "no ") + name, flush=True)
@@ -426,7 +430,7 @@ class Message:
     def __init__(self, content):
         self.content = content
 
-# vllm-mlx 0.5.0's vllm_mlx/models/mllm.py download_image, verbatim (Apache-2.0).
+# vllm-mlx 0.5.0's vllm_mlx/models/mllm.py fetch functions, verbatim (Apache-2.0).
 def download_image(url: str, timeout: int = 30, max_size: int = MAX_IMAGE_SIZE) -> str:
     """
     Download image from URL and return local path.
@@ -514,24 +518,35 @@ def download_image(url: str, timeout: int = 30, max_size: int = MAX_IMAGE_SIZE) 
 
     return _temp_manager.register(temp_file.name)
 
+def download_video(url: str, timeout: int = 120, max_size: int = MAX_VIDEO_SIZE) -> str:
+    """Download video from URL and return local path."""
+    return _download_media(url, "video", _VIDEO_EXT_MAP, ".mp4", timeout, max_size)
+
+def download_audio(url: str, timeout: int = 120, max_size: int = MAX_AUDIO_SIZE) -> str:
+    """Download audio from URL and return local path."""
+    return _download_media(url, "audio", _AUDIO_EXT_MAP, ".wav", timeout, max_size)
+
 # vllm-mlx 0.5.0's vllm_mlx/server.py _validate_remote_media_urls, verbatim.
 def _validate_remote_media_urls(messages: list[Message | dict]) -> None:
     """Validate remote media URLs during request preparation."""
     for url in _iter_remote_media_urls(messages):
         _validate_url_safety(url)
 
+STOCK = {"download_image": download_image, "download_video": download_video, "download_audio": download_audio}
+
 class UnsafeRemoteURLError(ValueError):
     def __init__(self, message, *, public_message="Remote media URL is not allowed"):
         super().__init__(message)
         self.public_message = public_message
 
-class Mllm:
+class Module:
     pass
 
 def engine():
     """A fresh (server, mllm) pair, as the guard finds them on the real engine."""
-    mllm, server = Mllm(), Mllm()
-    mllm.download_image = download_image
+    mllm, server = Module(), Module()
+    for name, func in STOCK.items():
+        setattr(mllm, name, func)
     server.UnsafeRemoteURLError = UnsafeRemoteURLError
     server._validate_remote_media_urls = _validate_remote_media_urls
     return server, mllm
@@ -557,72 +572,80 @@ probe_srv = http.server.HTTPServer(("127.0.0.1", 0), Probe)
 threading.Thread(target=probe_srv.serve_forever, daemon=True).start()
 local = "http://127.0.0.1:%d/internal" % probe_srv.server_address[1]
 
-check("pin.fetch  the fixture's download_image is the body IMAGE_FETCH_SHA256 pins",
-      ks.source_shape(download_image) == ks.IMAGE_FETCH_SHA256)
+for name in FETCHES:
+    check("pin.%s  the fixture's %s is the body FETCH_HOOKS pins" % (name, name),
+          ks.source_shape(STOCK[name]) == ks.FETCH_HOOKS.get(name))
 check("pin.check  the fixture's _validate_remote_media_urls is the body MEDIA_CHECK_SHA256 pins",
       ks.source_shape(_validate_remote_media_urls) == ks.MEDIA_CHECK_SHA256)
 check("pin.shape  the hash is the same normalization k3sm_shard pins mlx-lm with",
       ks.source_shape(download_image) == shard.source_shape(download_image))
 
 server, mllm = engine()
-ks.install_image_guard(server, mllm)
-check("replaced  download_image is replaced and the validator is wrapped",
-      mllm.download_image is not download_image and server._validate_remote_media_urls is not _validate_remote_media_urls)
+ks.install_media_guard(server, mllm)
+check("replaced  every fetch function is replaced and the validator is wrapped",
+      all(getattr(mllm, n) is not STOCK[n] for n in FETCHES)
+      and server._validate_remote_media_urls is not _validate_remote_media_urls)
 
 def refused(part, s=None):
     s = s or server
     try:
         s._validate_remote_media_urls([{"role": "user", "content": [part]}])
     except UnsafeRemoteURLError as e:
-        return e.public_message == ks.IMAGE_REFUSAL
+        return e.public_message == ks.MEDIA_REFUSAL
     return False
 
 def fetch_refused(url):
-    try:
-        mllm.download_image(url)
-    except UnsafeRemoteURLError:
-        return True
-    return False
+    for name in FETCHES:
+        try:
+            getattr(mllm, name)(url)
+        except UnsafeRemoteURLError:
+            continue
+        return False
+    return True
 
-def image_url(url):
-    return {"type": "image_url", "image_url": {"url": url}}
+KINDS = ("image_url", "video_url", "audio_url")
+def typed(kind, url):
+    return {"type": kind, kind: {"url": url}}
 
-check("http  a remote http URL is refused with the public message, nothing reaches a local listener",
-      refused(image_url(local)) and fetch_refused(local) and hits == [])
-check("https  a remote https URL is refused",
-      refused(image_url("https://example.invalid/a.png")) and fetch_refused("https://example.invalid/a.png"))
+check("http  a remote http URL of each kind is refused with the public message, nothing reaches a local listener",
+      all(refused(typed(k, local)) for k in KINDS) and fetch_refused(local) and hits == [])
+check("https  a remote https URL of each kind is refused",
+      all(refused(typed(k, "https://example.invalid/a")) for k in KINDS) and fetch_refused("https://example.invalid/a"))
 check("rebinding  a name built to answer public then private is refused, whatever it resolves to",
-      refused(image_url("http://7f000001.5db8d822.rbndr.invalid/a.png"))
-      and fetch_refused("http://7f000001.5db8d822.rbndr.invalid/a.png"))
-check("shapes  a bare string, the image key, the url key, a nested url, a dict without one and file: are refused",
-      all(refused(p) for p in (
-          {"type": "image_url", "image_url": "http://example.invalid/a.png"},
-          {"type": "image", "image": "https://example.invalid/a.png"},
-          {"type": "image", "image": {"url": "https://example.invalid/a.png"}},
-          {"type": "image", "url": "https://example.invalid/a.png"},
-          {"type": "image_url", "image_url": {"url": {"url": "http://example.invalid/a.png"}}},
-          {"type": "image_url", "image_url": {"image_url": "http://example.invalid/a.png"}},
-          {"type": "text", "image": "http://example.invalid/a.png"},
-          image_url("file:///etc/passwd"),
-          image_url("/etc/passwd"),
-          image_url("HTTP://EXAMPLE.INVALID/A.PNG"),
-          {"type": "image_url", "image_url": 7})) and hits == [])
+      all(refused(typed(k, "http://7f000001.5db8d822.rbndr.invalid/a")) for k in KINDS)
+      and fetch_refused("http://7f000001.5db8d822.rbndr.invalid/a"))
+U = "https://example.invalid/a"
+check("shapes  every key and shape the engine reads, a local path and file: are refused",
+      all(refused(p) for k in ("image", "video", "audio") for p in (
+          {"type": "%s_url" % k, "%s_url" % k: U},
+          {"type": "%s_url" % k, "%s_url" % k: {"url": {"url": U}}},
+          {"type": "%s_url" % k, "%s_url" % k: {"%s_url" % k: U}},
+          {"type": "%s_url" % k, "%s_url" % k: 7},
+          {"type": k, k: U},
+          {"type": k, k: {"url": U}},
+          {"type": k, "url": U},
+          {"type": "text", k: U},
+          {"type": "%s_url" % k, "%s_url" % k: {"url": "file:///etc/passwd"}},
+          {"type": "%s_url" % k, "%s_url" % k: {"url": "/etc/passwd"}},
+          {"type": "%s_url" % k, "%s_url" % k: {"url": "HTTP://EXAMPLE.INVALID/A"}})) and hits == [])
 class Part:
     def __init__(self, **kw):
         self.kw = kw
     def model_dump(self, exclude_none=False):
         return self.kw
 try:
-    server._validate_remote_media_urls([Message([Part(type="image_url", image_url={"url": "https://example.invalid/a.png"})])])
+    server._validate_remote_media_urls([Message([Part(type="audio_url", audio_url={"url": U})])])
     check("models  a pydantic message and part are read as the server hands them over", False)
 except UnsafeRemoteURLError:
     check("models  a pydantic message and part are read as the server hands them over", True)
 SEEN.clear()
-data = [{"role": "user", "content": [{"type": "text", "text": "hi"}, image_url("data:image/png;base64,AAAA")]},
+data = [{"role": "user", "content": [{"type": "text", "text": "hi"}, typed("image_url", "data:image/png;base64,AAAA"),
+                                     typed("video_url", "data:video/mp4;base64,AAAA"),
+                                     typed("audio_url", "data:audio/wav;base64,AAAA")]},
         {"role": "assistant", "content": "plain string content"},
         Message([Part(type="image_url", image_url={"url": "data:image/png;base64,AAAA"}), Part(type="text", text="x")])]
 server._validate_remote_media_urls(data)
-check("data  a data: URL passes, and upstream's validator still runs for the rest of the media",
+check("data  a data: URL of each kind passes, and upstream's validator still runs",
       len(SEEN) == 1 and SEEN[0] is data)
 
 def fetch_moved(url, timeout=30, max_size=MAX_IMAGE_SIZE):
@@ -633,17 +656,17 @@ def renamed(other, *a):
     pass
 def moved(hook, how):
     s, m = engine()
-    owner = m if hook == "download_image" else s
-    stock = {"body": fetch_moved if owner is m else check_moved, "sig": renamed, "gone": None}[how]
+    owner = s if hook == "_validate_remote_media_urls" else m
+    stock = {"body": check_moved if owner is s else fetch_moved, "sig": renamed, "gone": None}[how]
     setattr(owner, hook, stock)
     try:
-        ks.install_image_guard(s, m)
+        ks.install_media_guard(s, m)
     except ks.GuardError as e:
-        return (hook in str(e) and getattr(owner, hook) is stock
-                and m.download_image in (download_image, stock)
+        untouched = all(getattr(m, n) in (STOCK[n], stock) for n in FETCHES)
+        return (hook in str(e) and getattr(owner, hook) is stock and untouched
                 and s._validate_remote_media_urls in (_validate_remote_media_urls, stock))
     return False
-for hook in ("download_image", "_validate_remote_media_urls"):
+for hook in FETCHES + ("_validate_remote_media_urls",):
     check("failclosed.body.%s  a changed upstream body ends the process naming the hook" % hook, moved(hook, "body"))
     check("failclosed.signature.%s  another signature ends the process naming the hook" % hook, moved(hook, "sig"))
     check("failclosed.missing.%s  an engine without the function ends the process naming the hook" % hook,
@@ -651,7 +674,7 @@ for hook in ("download_image", "_validate_remote_media_urls"):
 s, m = engine()
 del s.UnsafeRemoteURLError
 try:
-    ks.install_image_guard(s, m)
+    ks.install_media_guard(s, m)
     check("failclosed.refusal  an engine without the refusal class ends the process", False)
 except ks.GuardError as e:
     check("failclosed.refusal  an engine without the refusal class ends the process",
@@ -669,10 +692,10 @@ PY
 			*)  ladder no "serve.image.remote.driver  $verdict $name" ;;
 		esac
 	done <<< "$out"
-	if [ "$checks" -ge 17 ]; then
+	if [ "$checks" -ge 25 ]; then
 		ladder ok "serve.image.remote.count  all $checks fixture checks reported"
 	else
-		ladder no "serve.image.remote.count  only $checks of 17 fixture checks reported (the driver crashed?)"
+		ladder no "serve.image.remote.count  only $checks of 25 fixture checks reported (the driver crashed?)"
 		tail -5 "$WORK/serve-image.err"
 	fi
 
@@ -685,7 +708,7 @@ PY
 		return
 	fi
 	cat > "$WORK/serve-image-real.py" <<'PY'
-import base64, logging, os, socket, sys, types
+import base64, logging, os, socket, sys, tempfile, types
 sys.path.insert(0, sys.argv[1])
 logging.disable(logging.WARNING)
 import k3sm_serve as ks
@@ -699,7 +722,9 @@ def check(name, cond):
 
 # Nothing leaves this Mac: the first lookup of a name answers a public address
 # and every later one a private address, the shape a rebinding name has.
-LOOKUPS, FETCHES, ANSWERS = [], [], {}
+LOOKUPS, FETCHES, ANSWERS, RAN = [], [], {}, []
+def reset():
+    LOOKUPS.clear(), FETCHES.clear(), ANSWERS.clear(), RAN.clear()
 def lookup(host, port, *a, **kw):
     LOOKUPS.append(host)
     ANSWERS[host] = ANSWERS.get(host, 0) + 1
@@ -711,44 +736,16 @@ def fetch(method, url, **kw):
 socket.getaddrinfo = lookup
 mllm.requests.request = fetch
 
-HTTP, HTTPS = "http://example.invalid/a.png", "https://example.invalid/a.png"
-REBIND = "http://7f000001.5db8d822.rbndr.invalid/a.png"
+HTTP, HTTPS = "http://example.invalid/a", "https://example.invalid/a"
+REBIND = "http://7f000001.5db8d822.rbndr.invalid/a"
+URLS = (("http", HTTP), ("https", HTTPS), ("rebinding", REBIND))
 PNG = "data:image/png;base64," + base64.b64encode(
     b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
     b"\x00\x00\x00\rIDATx\x9cc\xf8\xcf\xc0\xf0\x1f\x00\x05\x00\x01\xff\x89\x99=\x1d\x00\x00\x00\x00IEND\xaeB`\x82"
 ).decode()
-
-def stock_fetches(url):
-    LOOKUPS.clear(), FETCHES.clear(), ANSWERS.clear()
-    try:
-        mllm.process_image_input(url)
-    except Exception:
-        pass
-    return list(LOOKUPS), list(FETCHES)
-looked, fetched = stock_fetches(REBIND)
-check("real.stock  the unguarded engine resolves a rebinding name and then requests it (what the guard removes)",
-      len(looked) >= 2 and fetched[:1] == [("HEAD", REBIND)])
-
-stock_fetch, stock_check = mllm.download_image, server._validate_remote_media_urls
-ks.install_on_engine()
-check("real.install  install_on_engine checks the real pins and installs the guard",
-      mllm.download_image is not stock_fetch and server._validate_remote_media_urls is not stock_check)
-
-def quiet(url):
-    """The fetch path alone: no lookup and no request, and the input is refused."""
-    LOOKUPS.clear(), FETCHES.clear(), ANSWERS.clear()
-    try:
-        mllm.process_image_input(url)
-    except server.UnsafeRemoteURLError:
-        return LOOKUPS == [] and FETCHES == []
-    return False
-check("real.fetch.http  process_image_input refuses http with no lookup and no request", quiet(HTTP))
-check("real.fetch.https  process_image_input refuses https with no lookup and no request", quiet(HTTPS))
-check("real.fetch.rebinding  process_image_input refuses a rebinding name with no lookup and no request", quiet(REBIND))
-LOOKUPS.clear(), FETCHES.clear()
-path = mllm.process_image_input(PNG)
-check("real.fetch.data  process_image_input writes a data: image to a local file, with no lookup and no request",
-      os.path.exists(path) and LOOKUPS == [] and FETCHES == [])
+DATA = {"image": PNG, "video": "data:video/mp4;base64,AAAA", "audio": "data:audio/wav;base64,AAAA"}
+INPUT = {"image": mllm.process_image_input, "video": mllm.process_video_input, "audio": mllm.process_audio_input}
+KINDS = tuple(INPUT)
 
 class Tok:
     def encode(self, text):
@@ -763,7 +760,6 @@ class Out:
         self.prompt_tokens, self.completion_tokens = len(prompt.split()), 1
         self.finish_reason, self.finished = "stop", True
 
-RAN = []
 class Core:
     async def generate(self, prompt, sampling_params):
         RAN.append(prompt)
@@ -792,56 +788,108 @@ server._release_engine_for_request = release
 server._validate_model_name = lambda model: None
 client = TestClient(server.app)
 
-def part(url):
-    return {"type": "image_url", "image_url": {"url": url}}
-def chat(url):
-    return {"messages": [{"role": "user", "content": [{"type": "text", "text": "what is this"}, part(url)]}],
-            "max_tokens": 8}
+def part(kind, url):
+    return {"type": "%s_url" % kind, "%s_url" % kind: {"url": url}}
+def chat(p):
+    return {"messages": [{"role": "user", "content": [{"type": "text", "text": "what is this"}, p]}], "max_tokens": 8}
+def responses(p):
+    # The one Responses input item vllm-mlx 0.5.0 hands over with its parts intact.
+    return {"input": [{"type": "function_call_output", "call_id": "c", "output": [p]}], "max_output_tokens": 8}
 def anthropic(url):
     return {"messages": [{"role": "user", "content": [
         {"type": "text", "text": "what is this"}, {"type": "image", "source": {"type": "url", "url": url}}]}],
         "max_tokens": 8}
-def responses(url):
-    # The one Responses input item vllm-mlx 0.5.0 hands over with its parts intact.
-    return {"input": [{"type": "function_call_output", "call_id": "c", "output": [part(url)]}],
-            "max_output_tokens": 8}
-
-def post(path, body, stream):
+def post(path, body, stream=False):
+    reset()
     return client.post(path, json=dict(body, model="fake", stream=stream))
-
 def verdict(name, ok, r):
     print(("ok " if ok else "no ") + "%s (HTTP %d, %d lookups, %d requests)"
           % (name, r.status_code, len(LOOKUPS), len(FETCHES)), flush=True)
 
-URLS = (("http", HTTP), ("https", HTTPS), ("rebinding", REBIND))
+# A part ContentPart cannot validate falls through Message.content's list[dict]
+# arm with its keys intact, which is how the image, audio and url keys arrive.
+def raw(p):
+    return dict(p, text=7)
+RAW = (("image.key", raw({"type": "image", "image": HTTPS})), ("image.url", raw({"type": "image", "url": HTTPS})),
+       ("video.key", {"type": "video", "video": HTTPS}), ("video.url", raw({"type": "video", "url": HTTPS})),
+       ("audio.key", raw({"type": "audio", "audio": HTTPS})), ("audio.url", raw({"type": "audio", "url": HTTPS})))
+
+for kind in KINDS:
+    reset()
+    try:
+        INPUT[kind](REBIND)
+    except Exception:
+        pass
+    check("real.stock.%s  the unguarded engine resolves a rebinding name and requests it (what the guard removes)" % kind,
+          len(LOOKUPS) >= 2 and FETCHES[:1] == [("HEAD", REBIND)])
+with tempfile.NamedTemporaryFile(suffix=".wav") as f:
+    check("real.stock.audio.path  the unguarded engine takes an audio input that is a local path as it is",
+          mllm.process_audio_input(f.name) == f.name)
+for name, p in RAW:
+    r = post("/v1/chat/completions", chat(p))
+    check("real.stock.raw.%s  an unguarded chat request carrying the shape reaches the name lookup" % name,
+          LOOKUPS == ["example.invalid"])
+
+stock = {n: getattr(mllm, n) for n in ("download_image", "download_video", "download_audio")}
+stock_check = server._validate_remote_media_urls
+ks.install_on_engine()
+check("real.install  install_on_engine checks the real pins and installs the guard",
+      all(getattr(mllm, n) is not f for n, f in stock.items()) and server._validate_remote_media_urls is not stock_check)
+
+for kind in KINDS:
+    for uname, url in URLS:
+        reset()
+        try:
+            INPUT[kind](url)
+            ok = False
+        except server.UnsafeRemoteURLError:
+            ok = LOOKUPS == [] and FETCHES == []
+        except Exception:
+            ok = False
+        check("real.fetch.%s.%s  process_%s_input refuses it with no lookup and no request" % (kind, uname, kind), ok)
+    reset()
+    path = INPUT[kind](DATA[kind])
+    check("real.fetch.%s.data  process_%s_input writes a data: URL to a local file, with no lookup or request" % (kind, kind),
+          os.path.exists(path) and LOOKUPS == [] and FETCHES == [])
+
 for rname, path, shape in (("chat", "/v1/chat/completions", chat), ("responses", "/v1/responses", responses)):
     for stream in (False, True):
         tag = "%s.%s" % (rname, "stream" if stream else "plain")
-        for uname, url in URLS:
-            LOOKUPS.clear(), FETCHES.clear(), RAN.clear()
-            r = post(path, shape(url), stream)
-            verdict("real.%s.%s  answers 400 before any byte, with no lookup, request or engine call" % (tag, uname),
-                    r.status_code == 400 and ks.IMAGE_REFUSAL in r.text and "event:" not in r.text
-                    and LOOKUPS == [] and FETCHES == [] and RAN == [], r)
-        LOOKUPS.clear(), FETCHES.clear()
-        r = post(path, shape(PNG), stream)
-        verdict("real.%s.data  a data: image answers 200 with no lookup or request" % tag,
-                r.status_code == 200 and LOOKUPS == [] and FETCHES == [], r)
+        for kind in KINDS:
+            for uname, url in URLS:
+                r = post(path, shape(part(kind, url)), stream)
+                verdict("real.%s.%s.%s  answers 400 before any byte, with no lookup, request or engine call" % (tag, kind, uname),
+                        r.status_code == 400 and ks.MEDIA_REFUSAL in r.text and "event:" not in r.text
+                        and LOOKUPS == [] and FETCHES == [] and RAN == [], r)
+            r = post(path, shape(part(kind, DATA[kind])), stream)
+            verdict("real.%s.%s.data  a data: URL answers 200 with no lookup or request" % (tag, kind),
+                    r.status_code == 200 and LOOKUPS == [] and FETCHES == [], r)
+        for name, p in RAW:
+            r = post(path, shape(p), stream)
+            verdict("real.%s.raw.%s  the shape answers 400 with no lookup, request or engine call" % (tag, name),
+                    r.status_code == 400 and ks.MEDIA_REFUSAL in r.text and LOOKUPS == [] and FETCHES == [] and RAN == [], r)
+        r = post(path, shape(raw({"type": "audio_url", "audio_url": {"url": "/etc/passwd"}})), stream)
+        verdict("real.%s.localpath  an audio local path answers 400" % tag,
+                r.status_code == 400 and ks.MEDIA_REFUSAL in r.text and RAN == [], r)
+
 # vllm-mlx 0.5.0's Anthropic adapter drops an image block, so there is nothing to
 # refuse on /v1/messages: the request is served without it and nothing is fetched.
 for stream in (False, True):
     tag = "messages.%s" % ("stream" if stream else "plain")
     for uname, url in URLS + (("data", PNG),):
-        LOOKUPS.clear(), FETCHES.clear()
         r = post("/v1/messages", anthropic(url), stream)
         verdict("real.%s.%s  the adapter drops the image block: no lookup and no request" % (tag, uname),
                 r.status_code == 200 and LOOKUPS == [] and FETCHES == [], r)
-
-LOOKUPS.clear(), FETCHES.clear(), RAN.clear()
-r = post("/v1/chat/completions", {"messages": [{"role": "user", "content": [
-    {"type": "video_url", "video_url": {"url": "http://127.0.0.1/a.mp4"}}]}], "max_tokens": 8}, False)
-check("real.wrapped  a private video URL is still refused by upstream's own validator, which the guard wraps",
-      r.status_code == 400 and ks.IMAGE_REFUSAL not in r.text and FETCHES == [])
+# Likewise a Responses message item: _response_content_to_text keeps text parts,
+# and nothing in vllm-mlx 0.5.0 reads input_image, input_audio or input_file.
+for stream in (False, True):
+    tag = "responses.%s" % ("stream" if stream else "plain")
+    for name, p in (("input_image", {"type": "input_image", "image_url": HTTPS}),
+                    ("image_url", part("image", HTTPS)), ("input_audio", {"type": "input_audio", "input_audio": {"url": HTTPS}})):
+        r = post("/v1/responses", {"input": [{"type": "message", "role": "user",
+                                              "content": [{"type": "input_text", "text": "hi"}, p]}], "max_output_tokens": 8}, stream)
+        verdict("real.%s.message.%s  a message item keeps text parts only: no lookup and no request" % (tag, name),
+                r.status_code == 200 and LOOKUPS == [] and FETCHES == [], r)
 PY
 	checks=0
 	out="$(cd "$WORK" && PYTHONDONTWRITEBYTECODE=1 "$STAGED/bin/python3.12" -I -B "$WORK/serve-image-real.py" "$HERE" 2>"$WORK/serve-image-real.err")"
@@ -854,10 +902,10 @@ PY
 			*)  ladder no "serve.image.remote.driver  $verdict $name" ;;
 		esac
 	done <<< "$out"
-	if [ "$checks" -ge 31 ]; then
+	if [ "$checks" -ge 113 ]; then
 		ladder ok "serve.image.remote.real.count  all $checks real-engine checks reported"
 	else
-		ladder no "serve.image.remote.real.count  only $checks of 31 real-engine checks reported (the driver crashed?)"
+		ladder no "serve.image.remote.real.count  only $checks of 113 real-engine checks reported (the driver crashed?)"
 		tail -15 "$WORK/serve-image-real.err"
 	fi
 }
@@ -2063,7 +2111,7 @@ else
 	head -20 "$WORK/kv-driver.err"
 fi
 
-# ---- serve.image.remote — no image fetch on the single-node path --------------
+# ---- serve.image.remote — no media fetch on the single-node path --------------
 rung_serve_image_remote
 
 # ---- 9 — the guard on the REAL engine (needs a staged tree) -----------------

@@ -52,27 +52,30 @@ an engine bump fails loudly rather than serving unguarded; selftest rung 9
 checks the hooks against a staged tree. Image and audio tokens a multimodal
 processor adds after the template are not counted.
 
-**Remote image URLs are refused.** `k3sm_serve` refuses every image URL that is not a `data:` URL; a client sends
-the image inline as a base64 `data:` URL. vllm-mlx 0.5.0 would otherwise fetch an
-`http(s)` image URL through `vllm_mlx/models/mllm.py`'s `download_image`. Its
-`_validate_url_safety` rejects a name that resolves to a non-global address, but
-`requests` resolves the name again to connect, so a name that answers differently
-the second time (DNS rebinding) reaches an internal address, and any global
-address is still a blind GET from the pod.
+**Remote media URLs are refused.** `k3sm_serve` refuses every image, video or
+audio URL that is not a `data:` URL, including a local path; a client sends media
+inline as a base64 `data:` URL. vllm-mlx 0.5.0 would otherwise fetch an `http(s)`
+URL through `vllm_mlx/models/mllm.py`'s `download_image`, `download_video` and
+`download_audio`. Its `_validate_url_safety` rejects a name that resolves to a
+non-global address, but `requests` resolves the name again to connect, so a name
+that answers differently the second time (DNS rebinding) reaches an internal
+address, and any global address is still a blind GET from the pod.
 
-The entrypoint hooks two functions. It wraps `server._validate_remote_media_urls`,
-so a request is answered HTTP 400 before a response starts and before a name is
-resolved, and it replaces `download_image`, the one function that fetches, so no
-other path reaches the network for an image. Each original's signature and
-normalized body hash (`IMAGE_FETCH_SHA256`, `MEDIA_CHECK_SHA256`) are checked
-first, and the process exits naming the hook if either moved. `/v1/messages` has
-nothing to refuse: vllm-mlx's Anthropic adapter drops an image block, so the
-request is served without the image. Video and audio URLs are not covered: they
-stay behind vllm-mlx's own validator, with the same rebinding gap.
+The refusal looks at the parts `image_url`, `video_url` and `audio_url` under the
+key of that name, and `image`, `video` and `audio` under that key or `url`. The
+entrypoint wraps `server._validate_remote_media_urls`, so a request is answered
+HTTP 400 before a response starts and before a name is resolved, and it replaces
+the three download functions, so no other path reaches the network for a request's
+media. Each original's signature and normalized body hash (`FETCH_HOOKS`,
+`MEDIA_CHECK_SHA256`) are checked first, and the process exits naming the hook if
+one moved. `/v1/messages` has nothing to refuse: vllm-mlx's Anthropic adapter drops
+an image block, so the request is served without the image. A Responses `message`
+item is the same: its content keeps text parts only, and nothing in vllm-mlx reads
+`input_image`. Its `function_call_output` keeps its parts and is refused.
 
 `selftest.sh --case serve.image.remote` runs the check alone: http, https, a
-rebinding-shaped name and a `data:` pass, against fixtures carrying the two
-functions verbatim and, on a staged tree, on the real routes with name lookups
+rebinding-shaped name and a `data:` pass for each kind, against fixtures carrying
+the functions verbatim and, on a staged tree, on the real routes with name lookups
 and requests recorded.
 
 `k3sm_serve` also patches the prefill mask of mlx-lm's `RotatingKVCache`. The
