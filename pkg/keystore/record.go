@@ -28,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 )
 
 // This file is the record layer: the binary encoding of a sealed record, the
@@ -250,18 +251,26 @@ func checkValue(kind Kind, value []byte) error {
 	}
 }
 
-// checkName validates an entry name before it becomes a file name: 1 to 253
-// bytes of lowercase letters, digits, '-' and '.', beginning and ending with a
+// checkName validates an entry name before it becomes a file name: a
+// Kubernetes DNS-1123 subdomain, that is 1 to 253 bytes of dot-separated
+// labels, each lowercase letters, digits and '-', beginning and ending with a
 // letter or digit. Lowercase only, because APFS is case-insensitive by default
 // and two names that differ only in case would share one directory. No leading
 // dot, because the store's own files (.lock, temporary files) are dot names.
+// And the delivered Secret's name defaults to the entry name, so it must be a
+// valid one.
 func checkName(name string) error {
-	if name == "" || len(name) > maxNameLen || !alnum(name[0]) || !alnum(name[len(name)-1]) {
+	if name == "" || len(name) > maxNameLen {
 		return fmt.Errorf("%w: %q", ErrInvalidName, name)
 	}
-	for i := 1; i < len(name)-1; i++ {
-		if c := name[i]; !alnum(c) && c != '-' && c != '.' {
+	for _, label := range strings.Split(name, ".") {
+		if label == "" || !alnum(label[0]) || !alnum(label[len(label)-1]) {
 			return fmt.Errorf("%w: %q", ErrInvalidName, name)
+		}
+		for i := 1; i < len(label)-1; i++ {
+			if c := label[i]; !alnum(c) && c != '-' {
+				return fmt.Errorf("%w: %q", ErrInvalidName, name)
+			}
 		}
 	}
 	return nil
