@@ -21,9 +21,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -591,5 +593,81 @@ func TestCreatePodFenceReleaseRunsOnPanic(t *testing.T) {
 	}
 	if tr := x.r.trackByID(id); tr == nil || !tr.rejected {
 		t.Errorf("the refusal did not stand (%s)", trackState(tr))
+	}
+}
+
+// TestUpdatePodPanicBeforeItsCheckEnds: a panic while UpdatePod judges the pod
+// reaches the caller and leaves r.mu free, with the update's count ended exactly
+// once. The deferred end of the count takes r.mu, so it fails here (bounded, not
+// hanging) when that defer can run with r.mu still held: the panic never leaves
+// and every later provider call waits on the lock. The wait's own window has r.mu
+// released, so it covers an unlock that assumes the lock is always held, which
+// would be fatal and not a panic at all.
+func TestUpdatePodPanicBeforeItsCheckEnds(t *testing.T) {
+	errHook := errors.New("wait hook panicked")
+	for _, tc := range []struct {
+		name  string
+		setup func(x *terminalUpdateFixture, id string)
+		want  func(p any) bool
+	}{
+		{
+			name: "with r.mu held",
+			// A nil track entry: reading it is the first thing the check does.
+			setup: func(x *terminalUpdateFixture, id string) {
+				x.r.track[id] = nil
+			},
+			want: func(p any) bool { _, ok := p.(runtime.Error); return ok },
+		},
+		{
+			name: "with r.mu released for the wait",
+			setup: func(x *terminalUpdateFixture, id string) {
+				x.r.fenceReleasing = map[string]chan struct{}{id: make(chan struct{})}
+				x.r.updateWaitHook = func(string) { panic(errHook) }
+			},
+			want: func(p any) bool { return p == any(errHook) },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			x := newTerminalUpdateFixture(t, compressorAt(10))
+			id := string(x.pod.UID)
+			x.r.mu.Lock()
+			tc.setup(x, id)
+			// Another update in flight, so a count ended twice or not at all shows
+			// and no release is claimed.
+			x.r.updating = map[string]int{id: 1}
+			x.r.mu.Unlock()
+
+			recovered := make(chan error, 1)
+			go func() {
+				defer func() {
+					if p := recover(); !tc.want(p) {
+						recovered <- fmt.Errorf("recovered %v, want the panic", p)
+						return
+					}
+					recovered <- nil
+				}()
+				_ = x.r.UpdatePod(context.Background(), x.pod.DeepCopy())
+			}()
+			if err := awaitErr(t, recovered, "the panic to reach the caller"); err != nil {
+				t.Fatal(err)
+			}
+
+			count := make(chan int, 1)
+			go func() {
+				x.r.mu.Lock()
+				defer x.r.mu.Unlock()
+				count <- x.r.updating[id]
+			}()
+			tm := time.NewTimer(admissionAwaitBound)
+			defer tm.Stop()
+			select {
+			case n := <-count:
+				if n != 1 {
+					t.Errorf("updates in flight = %d, want the other one alone", n)
+				}
+			case <-tm.C:
+				t.Fatal("the panic left r.mu held")
+			}
+		})
 	}
 }

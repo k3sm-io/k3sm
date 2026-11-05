@@ -332,7 +332,8 @@ func (r *runtimedRuntime) admitDoneLocked(id string) {
 // what the pod's UID holds. A waiter is woken only when the last admitted create
 // returns, not when that create publishes its track, so a slow runtime call delays
 // it by the same amount. It returns ctx's error if ctx ends first. The caller holds
-// r.mu on entry and on every return; the wait itself runs with r.mu released.
+// r.mu on entry and on every return, a panic included; the wait itself runs with
+// r.mu released.
 func (r *runtimedRuntime) awaitUpdateVerdictLocked(ctx context.Context, pod *corev1.Pod) error {
 	id := string(pod.UID)
 	for {
@@ -340,17 +341,25 @@ func (r *runtimedRuntime) awaitUpdateVerdictLocked(ctx context.Context, pod *cor
 		if ch == nil {
 			return nil
 		}
-		r.mu.Unlock()
-		if hook := r.updateWaitHook; hook != nil {
-			hook(id)
+		if err := r.waitForUpdateVerdict(ctx, id, ch); err != nil {
+			return err
 		}
-		select {
-		case <-ch:
-			r.mu.Lock()
-		case <-ctx.Done():
-			r.mu.Lock()
-			return ctx.Err()
-		}
+	}
+}
+
+// waitForUpdateVerdict waits on ch with r.mu released. The relock is deferred, so a
+// panic in the wait still returns the lock to a caller that unlocks in a defer.
+func (r *runtimedRuntime) waitForUpdateVerdict(ctx context.Context, id string, ch <-chan struct{}) error {
+	r.mu.Unlock()
+	defer r.mu.Lock()
+	if hook := r.updateWaitHook; hook != nil {
+		hook(id)
+	}
+	select {
+	case <-ch:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 

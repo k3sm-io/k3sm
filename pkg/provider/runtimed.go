@@ -2356,50 +2356,20 @@ func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error 
 	// this seam is kept uniform for CreatePod and UpdatePod rather than split.
 	ctx = withPodIdentity(ctx, pod)
 	id := string(pod.UID)
-	r.mu.Lock()
 	// Counted before the wait, so a delete landing during it leaves the release
 	// to this update, which would otherwise wake to an untracked pod and allocate.
-	if r.updating == nil {
-		r.updating = map[string]int{}
-	}
-	r.updating[id]++
+	r.beginUpdate(id)
+	// updateDone takes r.mu, so this defer has to run with r.mu released, a panic
+	// included: checkUpdate holds the lock only inside its own frame.
 	defer r.updateDone(pod)
-	if err := r.awaitUpdateVerdictLocked(ctx, pod); err != nil {
-		r.mu.Unlock()
+	t, previous, proceed, err := r.checkUpdate(ctx, pod)
+	if err != nil {
 		return fmt.Errorf("update pod %s/%s: wait for the admission verdict: %w", pod.Namespace, pod.Name, err)
 	}
-	t, tracked := r.track[id]
-	// A pod whose delete has begun gets no update either: anything acquired behind
-	// the delete's release has no owner. With no track, the deletion stamp is the
-	// only sign an update that arrives after the delete has of it.
-	terminal := isEvictedPod(pod) || isBudgetRejectedPod(pod) || pod.DeletionTimestamp != nil
-	if tracked {
-		terminal = t.rejected || t.evictedStatus() != nil || trackDeleting(t)
-	}
-	if _, deleted := r.deleteOwed[id]; deleted {
-		terminal = true
-	}
-	if terminal {
-		// Virtual Kubelet reaches here when a refused or evicted pod's labels,
-		// annotations, images or tolerations change. A refused pod holds nothing
-		// and its delete (forgetRejected) frees nothing, so anything acquired
-		// below would stay held until the daemon restarts; runtimed has already
-		// forgotten an evicted pod, so the RPC could only fail. The tracked spec
-		// stays too: an eviction whose teardown fails is rolled back, and the
-		// difference brings the update back for the pod that is still running.
-		r.mu.Unlock()
+	if !proceed {
 		return nil
 	}
-	// A spec change (an ephemeral container added) can add references; the
-	// registration is replaced, so a removed reference stops being fetchable.
-	r.noteHeldLocked(id)
-	r.refs.RegisterPod(pod)
-	var previous *corev1.Pod
-	if tracked {
-		previous = t.pod
-		t.pod = pod.DeepCopy()
-	}
-	r.mu.Unlock()
+	tracked := t != nil
 	if hook := r.updateCheckedHook; hook != nil {
 		hook(id)
 	}
@@ -2478,6 +2448,60 @@ func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error 
 	r.recordEphemeralRejections(previous, pod, "")
 	r.dispatch(id, resp.GetStatus())
 	return nil
+}
+
+// beginUpdate counts one UpdatePod in flight for pod id; updateDone ends the count.
+func (r *runtimedRuntime) beginUpdate(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.updating == nil {
+		r.updating = map[string]int{}
+	}
+	r.updating[id]++
+}
+
+// checkUpdate is the part of UpdatePod under r.mu: it waits for the admission
+// verdict, judges whether the pod takes an update, and if so registers its
+// references and replaces the tracked spec. It reports the pod's track (nil when
+// untracked), the spec it replaced, and whether the update goes on. A panic here
+// unlocks on its way out, so it reaches UpdatePod's caller.
+func (r *runtimedRuntime) checkUpdate(ctx context.Context, pod *corev1.Pod) (t *podTrack, previous *corev1.Pod, proceed bool, err error) {
+	id := string(pod.UID)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.awaitUpdateVerdictLocked(ctx, pod); err != nil {
+		return nil, nil, false, err
+	}
+	t, tracked := r.track[id]
+	// A pod whose delete has begun gets no update either: anything acquired behind
+	// the delete's release has no owner. With no track, the deletion stamp is the
+	// only sign an update that arrives after the delete has of it.
+	terminal := isEvictedPod(pod) || isBudgetRejectedPod(pod) || pod.DeletionTimestamp != nil
+	if tracked {
+		terminal = t.rejected || t.evictedStatus() != nil || trackDeleting(t)
+	}
+	if _, deleted := r.deleteOwed[id]; deleted {
+		terminal = true
+	}
+	if terminal {
+		// Virtual Kubelet reaches here when a refused or evicted pod's labels,
+		// annotations, images or tolerations change. A refused pod holds nothing
+		// and its delete (forgetRejected) frees nothing, so anything acquired
+		// below would stay held until the daemon restarts; runtimed has already
+		// forgotten an evicted pod, so the RPC could only fail. The tracked spec
+		// stays too: an eviction whose teardown fails is rolled back, and the
+		// difference brings the update back for the pod that is still running.
+		return nil, nil, false, nil
+	}
+	// A spec change (an ephemeral container added) can add references; the
+	// registration is replaced, so a removed reference stops being fetchable.
+	r.noteHeldLocked(id)
+	r.refs.RegisterPod(pod)
+	if tracked {
+		previous = t.pod
+		t.pod = pod.DeepCopy()
+	}
+	return t, previous, true, nil
 }
 
 // dispatchCurrent reads the pod's current status from the runtime and publishes
