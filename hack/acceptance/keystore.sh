@@ -45,8 +45,9 @@ check() { # row, description, tests...
 	if [ "$pkg_ok" = 1 ] && ran "$@"; then pass "$id" "$desc"; else fail "$id" "$desc"; fi
 }
 
-base="${KEYSTORE_BASE:-$(git merge-base HEAD origin/main)}"
-if git diff --quiet "$base" -- go.mod go.sum; then
+if ! base="${KEYSTORE_BASE:-$(git merge-base HEAD origin/main 2>/dev/null)}" || [ -z "$base" ]; then
+	fail G1 "no base to diff go.mod and go.sum against: fetch origin/main or set KEYSTORE_BASE"
+elif git diff --quiet "$base" -- go.mod go.sum; then
 	pass G1 "go.mod and go.sum unchanged since $(git rev-parse --short "$base")"
 else
 	fail G1 "go.mod or go.sum changed since $(git rev-parse --short "$base")"
@@ -65,9 +66,11 @@ check G10 "the master is minted only by the first put, never over entries" TestM
 check G11 "the master is judged on the open descriptor" TestMasterTrust
 pend G12 "Rewrap resumes after a crash at every step (PR 3)"
 pend G13 "a crash between the master renames is completed (PR 3)"
-check G14 "one lock with a bounded wait" TestLockBoundedWait TestConcurrentOperations
-check G15 "files a root verb writes are the service user's, at the layout's modes" TestOwnership
-check G16 "List marks an unreadable entry with Err (library)" TestListMarksCorruptEntry
+check G14 "one lock with a bounded wait, and no read that blocks" TestLockBoundedWait TestConcurrentOperations TestFIFORefused
+check G15 "files a root verb writes are the service user's, at the layout's modes, inside the store" \
+	TestOwnership TestCredSymlinkRefused TestRefusesSymlinks
+check G16 "List marks an unreadable entry with Err, and Delete still removes it (library)" \
+	TestListMarksCorruptEntry TestDeleteCorruptEntry
 pend G16 "list exits 1 on a corrupt entry (PR 4: k3sm keys)"
 pend G17 "show prints a value only with --reveal, byte-exact (PR 4)"
 pend G18 "delivery refused while encryption is off (PR 5)"
