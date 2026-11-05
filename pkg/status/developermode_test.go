@@ -108,3 +108,34 @@ func TestDeveloperModeRow(t *testing.T) {
 		}
 	})
 }
+
+// TestDeveloperModeInvalidRowNamesAncestorCause pins that an invalid marker
+// whose cause is a directory above it names that directory in the detail and
+// the remedy, and that a marker-file cause keeps the sudo rm remedy.
+func TestDeveloperModeInvalidRowNamesAncestorCause(t *testing.T) {
+	t.Parallel()
+	row := func(dir string) Row {
+		c := Collector{DeveloperMode: func() install.DeveloperModeState { return install.DeveloperModeInvalid }}
+		c.DeveloperModeAncestor = func() string { return dir }
+		r, ok := c.developerModeRow(context.Background())
+		if !ok {
+			t.Fatal("no developer-mode row")
+		}
+		return r
+	}
+	r := row("/Library")
+	if !strings.Contains(r.Detail, "/Library") || !strings.Contains(r.Remedy, "/Library") || strings.Contains(r.Remedy, "sudo rm") {
+		t.Errorf("ancestor row = %+v", r)
+	}
+	a := developerModeAlert(r)
+	if a == nil || strings.Contains(a.Cause, "not a root-owned file nobody") {
+		t.Errorf("ancestor alert = %+v", a)
+	}
+	r = row("")
+	if ma := developerModeAlert(r); ma == nil || len(ma.Fix) != 1 || ma.Fix[0].Command != developerModeInvalidRemedy {
+		t.Errorf("marker-file alert = %+v, want the sudo rm step", ma)
+	}
+	if r.Detail != developerModeInvalidDetail || r.Remedy != developerModeInvalidRemedy {
+		t.Errorf("marker-file row = %+v", r)
+	}
+}
