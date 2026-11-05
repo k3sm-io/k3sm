@@ -3,7 +3,7 @@
 # The seeded deadlines are staggered by package, one package a week, so they do
 # not all expire together. Fixing a test means deleting its entry and lowering
 # the count; adding an entry means raising it, in the same reviewed change.
-# count: 166
+# count: 164
 cmd/k3sm/agentcrashloop_test.go:time.After seeded 2026-10-29, predates the lint 2027-01-04
 cmd/k3sm/agentcrashloop_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-01-04
 cmd/k3sm/agentrestart_integration_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-01-04
@@ -118,7 +118,6 @@ pkg/provider/delegatedauth_test.go:time.After seeded 2026-10-29, predates the li
 pkg/provider/ephemeral_test.go:time.After seeded 2026-10-29, predates the lint 2027-05-03
 pkg/provider/events_test.go:time.After seeded 2026-10-29, predates the lint 2027-05-03
 pkg/provider/events_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-05-03
-pkg/provider/eviction_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-05-03
 pkg/provider/hostprocess_test.go:time.After seeded 2026-10-29, predates the lint 2027-05-03
 pkg/provider/hostprocess_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-05-03
 pkg/provider/lifecycle_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-05-03
@@ -140,7 +139,6 @@ pkg/provider/pressure_test.go:time.Sleep seeded 2026-10-29, predates the lint 20
 pkg/provider/probe_test.go:time.After seeded 2026-10-29, predates the lint 2027-05-03
 pkg/provider/probe_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-05-03
 pkg/provider/projectedrefresh_test.go:time.After seeded 2026-10-29, predates the lint 2027-05-03
-pkg/provider/projectedrefresh_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-05-03
 pkg/provider/pullfailure_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-05-03
 pkg/provider/readytostart_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-05-03
 pkg/provider/runtimed_attach_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-05-03
