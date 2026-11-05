@@ -108,6 +108,9 @@ pin, its date, and the tarball's sha256.
 
 ### Fixed
 
+- `k3sm stop` and `k3sm uninstall` stop a `vm` helper whose path spells its version in a different
+  case than the versions directory. It was reported as no longer retained and left running. A
+  stray file or symlink named like a version no longer counts as a retained version.
 - `k3sm status` names the cause of an invalid developer-mode row: when `/` or `/Library` is the
   problem, the detail and remedy name that directory instead of suggesting `sudo rm` of the marker,
   which does not fix it. [Status JSON](docs/user/status-json.md) describes the row.
