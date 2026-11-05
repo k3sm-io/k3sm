@@ -15,9 +15,10 @@ limitations under the License.
 */
 
 // Package update answers "is there a newer k3sm, and which nodes are not on
-// it?". Check resolves the latest release exactly the way install.sh does,
-// reads the version of this binary and of every Node, and compares them.
-// Check only reads; the Watcher (below) is the half that installs a release.
+// it?". Check resolves the latest release, on the stable channel exactly the
+// way install.sh does and on the rc channel from the release listing, reads the
+// version of this binary and of every Node, and compares them. Check only
+// reads; the Watcher (below) is the half that installs a release.
 //
 // The tag a release index answers with is data. It is validated to the
 // characters a git version tag carries and is never handed to a shell or a

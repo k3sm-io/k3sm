@@ -32,6 +32,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
+	updatesv1alpha1 "k3sm.io/apis/updates/v1alpha1"
 	"k3sm.io/k3sm/pkg/status"
 	"k3sm.io/k3sm/pkg/version"
 )
@@ -63,6 +64,10 @@ type Inputs struct {
 	Installed version.Info
 	// Now is the clock; nil is time.Now.
 	Now func() time.Time
+	// Channel is the release channel the check resolves on. Empty is
+	// updatesv1alpha1.UpdateChannelStable; a value that is neither fails the
+	// check rather than resolving as either.
+	Channel updatesv1alpha1.UpdateChannel
 }
 
 // Release is the latest release as the index describes it.
@@ -159,7 +164,14 @@ func Check(ctx context.Context, in Inputs) (Report, error) {
 // refused redirect, in which case a failure of the fallback reports both
 // errors. A stable release, once
 // one exists, therefore always wins.
+//
+// On the rc channel it is instead the highest release of the channel's listing
+// (newestOnChannel), and a failure there is that failure, never the stable
+// answer. A channel that is neither is refused before anything is read.
 func Latest(ctx context.Context, in Inputs) (Release, error) {
+	if err := checkChannel(in.Channel); err != nil {
+		return Release{}, err
+	}
 	timeout := in.Timeout
 	if timeout <= 0 {
 		timeout = DefaultTimeout
@@ -171,6 +183,9 @@ func Latest(ctx context.Context, in Inputs) (Release, error) {
 		base = DefaultBaseURL
 	}
 	r := reader{client: noDowngrade(in.HTTP), base: base, ua: "k3sm/" + in.Installed.Version}
+	if in.Channel == updatesv1alpha1.UpdateChannelRC {
+		return r.newestOnChannel(ctx)
+	}
 
 	tag, stableErr := r.stableTag(ctx)
 	if errors.Is(stableErr, errBadTag) || errors.Is(stableErr, errRedirectPin) {
@@ -346,24 +361,30 @@ func (r reader) newestAny(ctx context.Context) (Release, error) {
 
 // getJSON GETs u and decodes at most maxIndexBytes of it into v.
 func (r reader) getJSON(ctx context.Context, u string, v any) error {
+	_, err := r.getJSONHeader(ctx, u, v)
+	return err
+}
+
+// getJSONHeader is getJSON that also returns the response's headers.
+func (r reader) getJSONHeader(ctx context.Context, u string, v any) (http.Header, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", r.ua)
 	resp, err := r.client.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("%s: %s", resp.Request.URL.Redacted(), resp.Status)
+		return nil, fmt.Errorf("%s: %s", resp.Request.URL.Redacted(), resp.Status)
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxIndexBytes)).Decode(v); err != nil {
-		return fmt.Errorf("decode %s: %w", resp.Request.URL.Redacted(), err)
+		return nil, fmt.Errorf("decode %s: %w", resp.Request.URL.Redacted(), err)
 	}
-	return nil
+	return resp.Header, nil
 }
 
 // ValidTag reports whether tag is a usable release tag (version.ValidTag,
