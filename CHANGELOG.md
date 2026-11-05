@@ -121,6 +121,10 @@ pin, its date, and the tarball's sha256.
   A node installed by an earlier release gets the directory from one install of this release by any
   install path, because a managed update cannot bring it; on a release with this fix, `sudo k3sm
   restart` recreates a missing one. See [Upgrade](docs/user/upgrade.md).
+- An edit to a Pod's labels, annotations, images or tolerations that reached the node while the
+  Pod was being evicted, before its `Failed` status reached the API server, no longer replaces the
+  eviction with a `ProviderFailed` status. The node drops the update, since the evicted Pod no
+  longer exists in the runtime.
 - A component that crashes during start-up on a busy host is now reported with its exit status
   instead of as a health timeout.
 - A server or agent installed from a build of main exited at every start with `open runtime root
