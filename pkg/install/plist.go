@@ -289,7 +289,8 @@ func ServerPlist(cfg Config) []byte {
 //	update controller  30s  updateControllerStopWait, cmd/k3sm/serverphases.go —
 //	                        SERVER ONLY, inside the operators' stop.
 //	(drains)            0s  every other deferred stop of startNode and runServer
-//	                        (the interconnect handlers, the heartbeat watch, the
+//	                        (the budget publisher, the interconnect handlers, the
+//	                        heartbeat watch, the
 //	                        svclb hoster, the event broadcaster, the interconnect
 //	                        resolver, the MLX operator, the provisioner, the etcd
 //	                        admin client, the manifest directory, the helm
@@ -414,6 +415,7 @@ var serverTeardownSteps = []teardownStep{
 	{"eviction loop stop (provider.EvictionStopTimeout)", teardownEvictionStop, laneNode},
 	{"budget history stop (provider.BudgetHistoryStopBound)", teardownBudgetHistoryStop, laneNode},
 	{"runtimed close (defaultCloseGrace)", teardownRuntimedClose, laneNode},
+	{"budget publisher stop (context drain)", 0, laneNode},
 	{"node update watcher stop (nodeUpdateStopGrace)", teardownNodeUpdate, laneNode},
 	{"node interconnect handlers stop (context drain)", 0, laneNode},
 	{"heartbeat watch stop (context drain)", 0, laneNode},
@@ -448,6 +450,7 @@ var agentTeardownSteps = []teardownStep{
 	{"eviction loop stop (provider.EvictionStopTimeout)", teardownEvictionStop, laneNode},
 	{"budget history stop (provider.BudgetHistoryStopBound)", teardownBudgetHistoryStop, laneNode},
 	{"runtimed close (defaultCloseGrace)", teardownRuntimedClose, laneNode},
+	{"budget publisher stop (context drain)", 0, laneNode},
 	{"node update watcher stop (nodeUpdateStopGrace)", teardownNodeUpdate, laneNode},
 	{"node interconnect handlers stop (context drain)", 0, laneNode},
 	{"heartbeat watch stop (context drain)", 0, laneNode},
