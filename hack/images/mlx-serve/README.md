@@ -52,6 +52,32 @@ an engine bump fails loudly rather than serving unguarded; selftest rung 9
 checks the hooks against a staged tree. Image and audio tokens a multimodal
 processor adds after the template are not counted.
 
+**Remote media URLs are refused.** `k3sm_serve` refuses every image, video or
+audio URL that is not a `data:` URL, including a local path; a client sends media
+inline as a base64 `data:` URL. vllm-mlx 0.5.0 would otherwise fetch an `http(s)`
+URL through `vllm_mlx/models/mllm.py`'s `download_image`, `download_video` and
+`download_audio`. Its `_validate_url_safety` rejects a name that resolves to a
+non-global address, but `requests` resolves the name again to connect, so a name
+that answers differently the second time (DNS rebinding) reaches an internal
+address, and any global address is still a blind GET from the pod.
+
+The refusal looks at the parts `image_url`, `video_url` and `audio_url` under the
+key of that name, and `image`, `video` and `audio` under that key or `url`. The
+entrypoint wraps `server._validate_remote_media_urls`, so a request is answered
+HTTP 400 before a response starts and before a name is resolved, and it replaces
+the three download functions, so no other path reaches the network for a request's
+media. Each original's signature and normalized body hash (`FETCH_HOOKS`,
+`MEDIA_CHECK_SHA256`) are checked first, and the process exits naming the hook if
+one moved. `/v1/messages` has nothing to refuse: vllm-mlx's Anthropic adapter drops
+an image block, so the request is served without the image. A Responses `message`
+item is the same: its content keeps text parts only, and nothing in vllm-mlx reads
+`input_image`. Its `function_call_output` keeps its parts and is refused.
+
+`selftest.sh --case serve.image.remote` runs the check alone: http, https, a
+rebinding-shaped name and a `data:` pass for each kind, against fixtures carrying
+the functions verbatim and, on a staged tree, on the real routes with name lookups
+and requests recorded.
+
 `k3sm_serve` also patches the prefill mask of mlx-lm's `RotatingKVCache`. The
 cache keeps its first four tokens as attention sinks, but mlx-lm (0.32.0 and 0.32.2) builds
 the multi-token mask as a plain sliding window, so after a chunked prefill
@@ -143,8 +169,13 @@ last.
 itself and does not pass it on. Without it a pinned model, whose `--model` is
 the snapshot path in the cache volume, would list that path on `/v1/models`,
 and a request naming `spec.model` would make every rank load the model again
-from the Hub cache. With it, `/v1/models` lists `spec.model` alone and a request
-naming `spec.model` is served by the model already loaded. This hooks four
+from the Hub cache. With it, `/v1/models` lists `spec.model` alone, a request
+naming `spec.model` or no model is served by the model already loaded, and a
+request naming any other `model`, `draft_model` or `adapters` is answered HTTP
+404. The engine would otherwise hand a model or draft model, which any client of
+the port sets, to its loader, which downloads the repository and drops the model
+being served. The selftest checks the status through the real handler. The operator always renders the
+option on a rank. This hooks four
 `mlx_lm.server` internals (`ModelProvider.load`,
 `APIHandler.handle_models_request`, `run` and `_run_http_server`). The rank
 checks each one against the shape mlx-lm 0.32.2 gives it (the same as 0.32.0) and exits, naming the
@@ -175,10 +206,8 @@ fail-closed: the original's signature and normalized body hash
 either moved. The selftest drives the guard against a fake engine (a remote URL
 is refused with no request reaching a local listener, a `data:` URL passes, a
 changed body, another signature or a missing function fails the check) and, on
-a staged tree, checks the real function. The single-node entrypoint
-(`k3sm_serve`) runs `vllm_mlx.cli`, which does not import `mlx_lm.server`, so
-this guard does not cover it; whether vllm-mlx or mlx-vlm fetch remote image
-URLs on that path has not been examined here.
+a staged tree, checks the real function. The single-node entrypoint has a guard
+of its own, described under [Context length](#context-length).
 
 `k3sm_shard --probe` is the rank-0 liveness probe: a one-token completion
 against the local server every 60 seconds, to catch a collective that hung
@@ -338,6 +367,7 @@ display-only and the next push moves it.
 
 ```sh
 hack/images/mlx-serve/selftest.sh
+hack/images/mlx-serve/selftest.sh --case serve.image.remote   # one check alone
 ```
 
 Runs in seconds on any Mac and needs neither uv nor a `k3sm` binary: it checks

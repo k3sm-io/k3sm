@@ -41,8 +41,10 @@ value, so a pinned model (whose --model is the snapshot path in the cache
 volume) would list that path on /v1/models, and a request naming the model's
 repository id would make every rank load that id afresh. The entrypoint takes
 the option itself and makes the engine answer to that one name: a request
-whose model is the name is served by the model already loaded, and
-/v1/models lists the name alone. That needs four hooks in mlx_lm.server
+whose model is the name, or that names none, is served by the model already
+loaded, a request naming any other model, draft_model or adapters is refused
+(HTTP 404) rather than made a repository to fetch and load, and /v1/models lists
+the name alone. That needs four hooks in mlx_lm.server
 (ModelProvider.load, APIHandler.handle_models_request, run and
 _run_http_server), none of them a published API. install_alias checks each
 against the shape it was written for, mlx-lm 0.32.2, and the source of run
@@ -413,6 +415,10 @@ def check_engine_hooks(server):
     check_run_shape(server)
 
 
+class ModelRefused(ValueError):
+    """A request named a model other than the one this rank serves."""
+
+
 def install_alias(server, served):
     """Make the engine module serve its --model under the name served.
 
@@ -425,11 +431,22 @@ def install_alias(server, served):
     check_engine_hooks(server)
 
     class AliasedModelProvider(server.ModelProvider):
-        """Maps the served name to the model already loaded."""
+        """Serves the model already loaded under the served name, and nothing else.
+
+        A request body sets all three arguments (model, adapters, draft_model).
+        The engine would hand any other model or draft model to its loader, which
+        downloads it from the Hub and drops the loaded model.
+        """
 
         def load(self, model_path, adapter_path=None, draft_model_path=None):
             if model_path == served:
                 model_path = ENGINE_DEFAULT_MODEL
+            elif model_path != ENGINE_DEFAULT_MODEL:
+                raise ModelRefused(f"this server serves {served!r} only, not {model_path!r}")
+            if adapter_path not in (None, self.cli_args.adapter_path):
+                raise ModelRefused(f"this server serves {served!r} only, with no adapter {adapter_path!r}")
+            if draft_model_path not in (None, ENGINE_DEFAULT_MODEL, self.cli_args.draft_model):
+                raise ModelRefused(f"this server serves {served!r} only, with no draft model {draft_model_path!r}")
             return super().load(model_path, adapter_path, draft_model_path)
 
     class AliasedAPIHandler(server.APIHandler):
