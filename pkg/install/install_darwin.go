@@ -1334,7 +1334,7 @@ func (darwinSystem) Rename(old, new string) error {
 // RemoveTree deletes path and everything under it. See the System interface for
 // why it is separate from RemoveAll.
 func (darwinSystem) RemoveTree(path string) error {
-	if err := os.RemoveAll(path); err != nil {
+	if err := removeTreeFlagged(path); err != nil {
 		return fmt.Errorf("remove %s: %w", path, err)
 	}
 	return nil
