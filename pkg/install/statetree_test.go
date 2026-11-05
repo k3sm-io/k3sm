@@ -700,6 +700,26 @@ func TestEnsureStateTreeHandsUpdateRootToServiceUser(t *testing.T) {
 		}
 	})
 
+	// The chown and chmod of the tree are by path, which is safe only because
+	// by then no unprivileged principal can rename anything under the root.
+	t.Run("the table and the install apply it after the data root", func(t *testing.T) {
+		levels := StateLevels()
+		if r, u := slices.Index(levels, StateRoot), slices.Index(levels, level); r != 0 || u <= r {
+			t.Errorf("StateLevels() puts the root at %d and %s at %d; want the root first", r, level, u)
+		}
+		f := &fakeSystem{}
+		cfg := serverCfg()
+		cfg.Logger = slog.New(slog.DiscardHandler)
+		cfg.DataRoot = DefaultDataRoot
+		if err := ensureStateTree(f, cfg, svcUID); err != nil {
+			t.Fatalf("ensureStateTree: %v", err)
+		}
+		rootCall := fmt.Sprintf("EnsureOwnedDir:%s:0:0:%#o", DefaultDataRoot, StateRootMode)
+		if r, u := idx(f.calls, rootCall), idx(f.calls, dirCall(dir)); r < 0 || u < r {
+			t.Errorf("%s was ensured at %d, before the data root at %d", dir, u, r)
+		}
+	})
+
 	want := OwnedEntry{Path: dir, UID: svcUID, GID: ServiceTreeGID, Mode: 0o700, Kind: EntryDir}
 	cases := []struct {
 		name    string

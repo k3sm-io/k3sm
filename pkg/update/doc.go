@@ -66,9 +66,8 @@ limitations under the License.
 // controller owns, and clears, every other update annotation.
 //
 // A refusal or a failed install writes Failed with the reason and names `k3sm
-// update abort`, the recovery for the cordon the node keeps, and the download
-// directory stays for diagnosis until the next attempt or the next
-// start removes it. Nothing downloaded is opened or run by this package.
+// update abort` as the recovery, and the download directory stays for diagnosis
+// until the next attempt or the next start removes it. Nothing downloaded is opened or run by this package.
 //
 // The phase annotation reads "<phase>" or "<phase>: <message>", the message
 // at most MaxMessageBytes with control characters removed.

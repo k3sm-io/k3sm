@@ -55,6 +55,8 @@ and one residual limitation remains (no per-pod uid isolation).
   arguments row as unreadable as this user, which never changes the verdict, and `sudo k3sm status`
   shows it.
 - The kine/SQLite datastore under the server work directory (see [Backup & restore](backup-restore.md)).
+- The managed update's working directory, **`/var/lib/k3sm/updates`**, owned by `_k3sm`, mode `0700`,
+  on both roles (see [Upgrade](upgrade.md#on-each-node)).
 - An empty auto-deploy manifest directory, **`/var/lib/k3sm/manifests`**, owned by `root:wheel`,
   mode `0755` (see below).
 

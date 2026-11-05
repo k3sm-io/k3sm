@@ -258,7 +258,7 @@ node:
    version reports it.
 
 The node never runs a downloaded binary itself. A refusal or a failed install writes `Failed`
-with the reason and names `k3sm update abort`, the recovery for the cordon the node keeps
+with the reason and names `k3sm update abort` as the recovery
 (`kubectl get node <name> -o jsonpath='{.metadata.annotations.k3sm\.io/update-phase}'`),
 and the download directory stays for diagnosis until the next update attempt or the next daemon
 start removes it. A node without the `k3sm-netd` helper, such as a standalone `k3sm node`, does not
@@ -266,11 +266,20 @@ take part. A worker that joined before this release has no root-owned CA copy un
 installed again (`sudo k3sm install --agent --server <server>`), and until then its helper refuses
 every managed update.
 
-A node installed by a release that did not lay down `/var/lib/k3sm/updates` has no such directory
-and cannot make one, so a managed update fails on it at the first step. Before its first managed
-update, install this release on it once by hand: `sudo k3sm install` on a server, `sudo k3sm install --agent --server
-<server>` on a worker. A node that has already failed this way stays cordoned; run `k3sm update
-abort` first, then the install.
+A node installed by a release that did not lay down `/var/lib/k3sm/updates` cannot make that
+directory, so a managed update fails on it at the first step, and the managed update cannot bring
+the fix to it. To check a node, run `ls -ld /var/lib/k3sm/updates`: it needs nothing if that shows
+`drwx------` and the `_k3sm` user. Otherwise it needs one install of a release that has the
+directory, by any install path. On a worker this is the same install the note above asks for,
+`sudo k3sm install --agent --server <server>`, and it needs no token, because a joined worker
+resumes from its stored credential. On a server it is `sudo k3sm install`, which mints a new admin
+token, so copy the admin kubeconfig again with `k3sm kubeconfig`; on a one-node server, the k3sm
+app's install keeps the token. Either way the install restarts the node's daemons and recreates
+its Pods, as any upgrade does. If a roll has already failed on the node, run `k3sm update abort`
+first.
+
+On a node that already runs such a release, a missing directory needs no install: `k3sm-netd`
+recreates it when it starts, so `sudo k3sm restart` is enough.
 
 ### Release Base for a Mirror or a Lab
 

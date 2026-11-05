@@ -37,6 +37,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
@@ -48,6 +49,7 @@ import (
 	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/hostnet"
 	"k3sm.io/k3sm/pkg/update"
+	"k3sm.io/k3sm/pkg/updatectl"
 	"k3sm.io/k3sm/pkg/version"
 )
 
@@ -514,8 +516,10 @@ func TestUpdateApplyVerifiesBeforeInstall(t *testing.T) {
 			if !strings.Contains(last, tc.wantMsg) {
 				t.Errorf("Failed value = %q, want it to say %q", last, tc.wantMsg)
 			}
-			if !strings.Contains(last, "`k3sm update abort`") {
-				t.Errorf("Failed value = %q, want it to name the recovery", last)
+			// These nodes are not cordoned, and a payload refused here may not
+			// be the controller's, so the message must not claim a cordon.
+			if !strings.Contains(last, "`k3sm update abort`") || strings.Contains(last, "cordon") {
+				t.Errorf("Failed value = %q, want it to name the recovery and claim no cordon", last)
 			}
 			if len(r.netd.calls) != 0 {
 				t.Errorf("ApplyUpdate was called after a refusal: %+v", r.netd.calls)
@@ -534,7 +538,7 @@ func TestUpdateApplyVerifiesBeforeInstall(t *testing.T) {
 			t.Fatalf("phases %v, fetched %v, calls %d; want Failed before any download", names, r.fetch.urls, len(r.netd.calls))
 		}
 		last := got[len(got)-1]
-		for _, want := range []string{"does not exist", "`sudo k3sm install`", "`k3sm update abort`"} {
+		for _, want := range []string{"does not exist", "`sudo k3sm restart`", "`k3sm update abort`"} {
 			if !strings.Contains(last, want) {
 				t.Errorf("Failed value = %q, want it to say %q", last, want)
 			}
@@ -672,5 +676,80 @@ func TestUpdateApplyWritesRestartingBeforeTheExec(t *testing.T) {
 	}
 	if got, want := phaseNames(phasesWritten(t, cs)), []string{"Downloading", "Verifying", "Installing", "Restarting", "Done"}; !slices.Equal(got, want) {
 		t.Fatalf("phases written %v, want %v", got, want)
+	}
+}
+
+// TestUpdateAbortReleasesANodeRefusedAtTheUpdateRoot runs both halves on one
+// cluster: the watcher refuses at the absent update root, before any download,
+// and `k3sm update abort` then lifts the controller's cordon and clears every
+// update annotation. Abort reads only what the controller wrote at the cordon
+// and the handover, so a node that failed at its first step is recoverable.
+func TestUpdateAbortReleasesANodeRefusedAtTheUpdateRoot(t *testing.T) {
+	good := update.Payload{Version: updTestTag, URL: updTestURL, SHA256: updSHA256Hex(updTestArchive), Signature: updatesv1alpha1.UpdateSignatureIfSigned}
+	node := handedOverNode(t, good, nil)
+	node.Labels = map[string]string{"node-role.kubernetes.io/control-plane": "true"}
+	node.Spec.Unschedulable = true
+	node.Status.NodeInfo.KubeletVersion = version.Info{KubeVersion: updTestKube, Version: updTestRunning}.NodeVersion()
+	holder := updTestNode
+	c := newUpdateCluster(node, &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{Name: updatectl.LeaseName, Namespace: updatectl.LeaseNamespace},
+		Spec:       coordinationv1.LeaseSpec{HolderIdentity: &holder},
+	})
+	if code, _, errOut := c.run(t, "apply", "--yes", "--version", updTestTag); code != 0 {
+		t.Fatalf("apply: exit %d, stderr %s", code, errOut)
+	}
+
+	ff := &fakeFetcher{archive: updTestArchive}
+	netd := &fakeNetd{t: t}
+	root := filepath.Join(t.TempDir(), "updates")
+	w, err := newNodeUpdater(nodeOptions{
+		nodeName:           updTestNode,
+		netMode:            hostnet.Mode{Backend: hostnet.BackendHelper, Socket: "/var/lib/k3sm/run/netd.sock"},
+		updateRoot:         root,
+		updateClusterCAPEM: updSigning().ca.CertPEM,
+	}, c.cs, nodeUpdateDeps{
+		fetcher: ff,
+		netd:    netd,
+		running: version.Info{Version: updTestRunning, KubeVersion: updTestKube},
+	}, slog.New(slog.DiscardHandler))
+	if err != nil || w == nil {
+		t.Fatalf("newNodeUpdater = %v, %v", w, err)
+	}
+	if err := w.Sync(context.Background()); err != nil {
+		t.Fatalf("Sync = %v", err)
+	}
+	if len(ff.urls) != 0 || len(netd.calls) != 0 {
+		t.Fatalf("fetched %v, calls %d; want the refusal before any download", ff.urls, len(netd.calls))
+	}
+	failed := c.node(t, updTestNode)
+	if p, msg := update.ParsePhase(failed.Annotations[updatesv1alpha1.AnnotationUpdatePhase]); p != updatesv1alpha1.UpdateNodePhaseFailed || !strings.Contains(msg, "does not exist") {
+		t.Fatalf("phase %q, message %q; want Failed at the absent root", p, msg)
+	}
+	if !failed.Spec.Unschedulable {
+		t.Fatal("the node lost its cordon before the abort")
+	}
+	c.setStatus(t, updatesv1alpha1.UpdateStatus{
+		Phase: updatesv1alpha1.UpdatePhaseFailed,
+		Nodes: []updatesv1alpha1.UpdateNodeStatus{{Name: updTestNode, To: updTestTag, Phase: updatesv1alpha1.UpdateNodePhaseFailed, Message: "update refused"}},
+	})
+
+	code, out, errOut := c.run(t, "abort")
+	if code != 0 {
+		t.Fatalf("abort: exit %d, stderr %s", code, errOut)
+	}
+	if !strings.Contains(out, "uncordoned") {
+		t.Errorf("abort output lacks the uncordon:\n%s", out)
+	}
+	released := c.node(t, updTestNode)
+	if released.Spec.Unschedulable {
+		t.Error("the node is still cordoned after the abort")
+	}
+	for k := range released.Annotations {
+		if strings.HasPrefix(k, "k3sm.io/update-") {
+			t.Errorf("the node keeps %s after the abort", k)
+		}
+	}
+	if u := c.get(t); u.Status.Phase != updatesv1alpha1.UpdatePhaseCancelled {
+		t.Errorf("Update phase = %q, want Cancelled", u.Status.Phase)
 	}
 }

@@ -358,9 +358,11 @@ func (m *phaseMirror) advance(ph wire.UpdatePhase) (updatesv1alpha1.UpdateNodePh
 	return "", false
 }
 
-// failRecovery ends every Failed message: a failed step leaves the node
-// cordoned, and the annotation is where an operator reads why.
-const failRecovery = "; the node stays cordoned, `k3sm update abort` recovers it"
+// failRecovery ends every Failed message, because the annotation is where an
+// operator reads why. It does not claim the node is cordoned: the controller
+// cordons before it hands over, but the attempt reads only the annotations, and
+// a payload refused here may never have come from the controller.
+const failRecovery = "; recover with `k3sm update abort`"
 
 // fail writes Failed with err's message and, when the installer's log tail is
 // known, its last line, then the recovery. The reason is the part that gives
@@ -446,12 +448,13 @@ func (w *Watcher) newAttemptDir() (string, error) {
 
 // ensureRoot requires Root to be a real directory owned by this process's uid,
 // and sets it to mode 0700. It never creates Root: the data root it sits in is
-// root-owned, and an install lays the tree down.
+// root-owned, and the root helper of this same build recreates the tree at its
+// next start.
 func (w *Watcher) ensureRoot() error {
 	root := w.cfg.Root
 	fi, err := os.Lstat(root)
 	if errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("%w: the update root does not exist; installing this node again with `sudo k3sm install` creates %s", ErrRefused, root)
+		return fmt.Errorf("%w: the update root does not exist; `sudo k3sm restart` on this node recreates %s", ErrRefused, root)
 	}
 	if err != nil {
 		return fmt.Errorf("inspect the update root %s: %w", root, err)
