@@ -103,8 +103,15 @@ The fixed decisions:
   (owner, mode) and against its fingerprint. The fingerprint detects a wrong file, not
   tampering. `sudo k3sm keys` runs as root against a file owned by the service user, so
   ownership is checked, not assumed.
-- Entry names are validated before they become file names: not empty, no path separator,
-  not made only of dots.
+- Entry names are validated before they become file names: each must be a Kubernetes
+  DNS-1123 subdomain, 1 to 253 bytes of dot-separated labels of lowercase letters, digits
+  and `-`, each label beginning and ending with a letter or digit. That rules out a path
+  separator and a name made only of dots, and also two names that differ only in case
+  (APFS is case-insensitive by default, so they would share one directory while the record
+  binds the name as given) and a dot name (the store's own `.lock` and temporary files are
+  dot names). The default delivered Secret name is the entry name, so the rule also keeps
+  that default a valid Kubernetes name. Every operation checks the name, so the rule cannot
+  be narrowed later without stranding entries made under it.
 - The fingerprint of an Ed25519 entry is a digest of its public key; that of an opaque
   entry is keyed (an HMAC under a key derived from the master) or truncated, never a plain
   hash of the value, so List output is not a guessing oracle for a low-entropy value.
@@ -122,6 +129,7 @@ The fixed decisions:
       encryption-config.yaml            existing secretbox pair, unchanged
       encryption-config.sha256
       keystore-master/                  0700, service user: the master pair, nothing else
+                                        (a crash mid-write can leave an ignored temp file)
         master                          0600: 32 random bytes
         master.sha256                   0600: hex SHA-256 of the master bytes
         master.next                     present only mid-Rewrap
@@ -145,17 +153,25 @@ history, and a backup of `keystore/` alone must not also carry the one file that
 all of them.
 
 `cred/` and `cred/keystore-master/` are created, if absent, at 0700 and owned by the
-service user, using the same root-writes-a-service-user-owned-file seam the installer
-already uses for the encryption pair. The two root-owned files under the data root are
-the exception to "owned by the service user": they exist because a Pod must not be able to
-write them.
+service user, with the same discipline the installer's `WriteServiceUserFile` uses for the
+encryption pair (owner and mode bound to the open descriptor before anything is published)
+but not that function: it lives in `pkg/install`, chowns its directory by name, and fsyncs
+nothing, where the keystore's crash order needs the file and the directory fsynced. Every
+directory is opened as an `os.Root` and checked (a real directory, the service user's,
+closed to group and others), and `keystore-master/` is opened relative to `cred/`, never
+by its full path, because the service user owns `server/` and could replace `cred/` with a
+symlink. The two root-owned files under the data root are the exception to "owned by the
+service user": they exist because a Pod must not be able to write them.
 
 ### Master key lifecycle
 
 - **Who mints it.** Only k3sm, from `crypto/rand`, 32 bytes. An operator never supplies a
   master key, to any verb, and no verb takes one as input.
 - **When it is created.** By the first root-run `k3sm keys put` that finds no master and
-  an empty or absent `keystore/`. There is no install step: Phase A changes nothing in
+  an empty or absent `keystore/`. The one other state a put mints over, still only with
+  `keystore/` empty, is the one an interrupted mint leaves: a master that passes every
+  check of its own with no fingerprint file beside it. A master that fails a check of its
+  own is refused, never replaced. There is no install step: Phase A changes nothing in
   `k3sm install`, so the keystore is available on a cluster that already exists, with or
   without `--secrets-encryption`, and nothing about that cluster is migrated or imported.
 - **When it is never created.** If `keystore/` holds entries and the master is missing,
@@ -311,8 +327,10 @@ Ed25519: `hex(sha256(publicKey))` — a plain digest is fine since a public key 
 secret, mirroring `EncryptionKeyFingerprint` in `pkg/executor/secretsencryption.go`.
 Opaque: `hex(HMAC-SHA256(fpKey, value))` truncated to 16 bytes, where
 `fpKey = HMAC-SHA256(master, "k3sm-keystore-fingerprint-v1")` — a fixed-label HMAC under
-the master, computed once per master rather than per entry, so the master is never used
-directly both as a raw AES-GCM key on one path and an HMAC key on another.
+the master, computed once per master rather than per entry. The key that seals records is
+derived the same way, `sealKey = HMAC-SHA256(master, "k3sm-keystore-seal-v1")`, so the
+master keys only HMAC under fixed labels and is never used both as a raw AES-GCM key on
+one path and an HMAC key on another.
 
 **Where it is stored: nowhere.** It is computed when a version is read, from the decrypted
 value. `list` therefore opens each version once; that is one small AES-GCM open per version
@@ -339,11 +357,15 @@ interrupt (see "Rewrap").
 ### List, when one entry is corrupt
 
 Decided: per entry, not for the whole call. `Store.List` returns every entry it can name.
-An entry whose `current` fails to open (corrupt, stale, or truncated) is still returned,
-carrying the error. The contract changes: `Entry` gains `Err error`, non-nil exactly when
-the entry could not be opened, and `Current` and `Versions` are then zero. `List` returns a
-non-nil error for the whole call only for a failure that is not about one entry: the
-master missing or untrusted, or the lock timing out.
+An entry whose generation file, `current`, or any version `current` covers fails to open
+(missing, corrupt, stale, or truncated) is still returned, carrying the error; an old
+version that no longer opens is damage the operator should see. A file that cannot be read
+for want of permission, or an I/O error, is reported as that, not as `ErrCorrupt`, whose
+fix (restore from backup) would be the wrong one. `rm` reads nothing inside an entry, so it
+removes one `list` reports as corrupt. The contract changes: `Entry` gains `Err error`,
+non-nil exactly when the entry could not be opened, and `Current` and `Versions` are then
+zero. `List` returns a non-nil error for the whole call only for a failure that is not
+about one entry: the master missing or untrusted, or the lock timing out.
 
 The reason is what an operator running `list` needs: the truth about every entry,
 including which one is wrong, not a refusal that hides the healthy ones. A consumer that
