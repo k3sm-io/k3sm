@@ -42,12 +42,13 @@ func TestDeveloperModeOffKeepsMarkerOnDeveloperIDError(t *testing.T) {
 	cases := []struct {
 		name string
 		path string
+		want string
 	}{
-		{name: "the installed k3sm", path: installed},
-		{name: "the staged k3sm", path: staged},
+		{name: "the installed k3sm", path: installed, want: "the installed k3sm names no Developer ID team"},
+		{name: "the staged k3sm", path: staged, want: "the staged k3sm is not signed by the installed team"},
 	}
 	for _, h := range []string{ExecShimName, PathShimName, DNSShimName, VMHostName, "bin/kine"} {
-		cases = append(cases, struct{ name, path string }{name: "helper " + h, path: filepath.Join(testPayloadDir, h)})
+		cases = append(cases, struct{ name, path, want string }{name: "helper " + h, path: filepath.Join(testPayloadDir, h), want: "not every binary in the staged tree is signed by team"})
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -73,9 +74,7 @@ func TestDeveloperModeOffKeepsMarkerOnDeveloperIDError(t *testing.T) {
 			if !markerOn(f) {
 				t.Errorf("the marker is not On after the install; logs:\n%s", logs.String())
 			}
-			if !strings.Contains(logs.String(), "level=WARN") || !strings.Contains(logs.String(), `"developer mode stays on`) {
-				t.Errorf("no stays-on Warn; logs:\n%s", logs.String())
-			}
+			wantStaysOn(t, logs.String(), tc.want)
 		})
 	}
 }
@@ -102,17 +101,18 @@ func TestDeveloperModeKeptOnEveryPlainVerificationError(t *testing.T) {
 	cases := []struct {
 		name   string
 		src    string
+		want   string
 		signer func(cancel context.CancelFunc) TeamIDReader
 	}{
-		{name: "a generic TeamID error (codesign missing)", src: src,
+		{name: "a generic TeamID error (codesign missing)", src: src, want: "executable file not found",
 			signer: func(context.CancelFunc) TeamIDReader {
 				return fakeSigner{errs: map[string]error{src: errors.New("exec: \"codesign\": executable file not found in $PATH")}}
 			}},
-		{name: "an unreadable signature", src: src,
+		{name: "an unreadable signature", src: src, want: errSignatureUnreadable.Error(),
 			signer: func(context.CancelFunc) TeamIDReader {
 				return fakeSigner{errs: map[string]error{src: errSignatureUnreadable}}
 			}},
-		{name: "a cancelled context", src: src,
+		{name: "a cancelled context", src: src, want: "context canceled",
 			signer: func(cancel context.CancelFunc) TeamIDReader { return cancelingSigner{cancel: cancel} }},
 	}
 	for _, tc := range cases {
@@ -136,17 +136,28 @@ func TestDeveloperModeKeptOnEveryPlainVerificationError(t *testing.T) {
 			if !markerOn(f) {
 				t.Errorf("the marker is not On after the install; logs:\n%s", logs.String())
 			}
-			if !strings.Contains(logs.String(), "developer mode stays on") {
-				t.Errorf("no stays-on Warn; logs:\n%s", logs.String())
-			}
+			wantStaysOn(t, logs.String(), tc.want)
 		})
+	}
+}
+
+// wantStaysOn asserts the install logged the stays-on Warn and that it names
+// the specific cause, so a pass for a different reason is rejected.
+func wantStaysOn(t *testing.T, logs, reason string) {
+	t.Helper()
+	if !strings.Contains(logs, "level=WARN") || !strings.Contains(logs, "developer mode stays on: ") {
+		t.Errorf("no stays-on Warn; logs:\n%s", logs)
+		return
+	}
+	if !strings.Contains(logs, reason) {
+		t.Errorf("the stays-on Warn does not name %q; logs:\n%s", reason, logs)
 	}
 }
 
 // TestDeveloperModeKeptOnEmptyExecutablePath pins that a plain install naming
 // no k3sm binary keeps the marker. Install itself refuses an empty
-// BinarySource, so the decision is read at plainInstallTeam, which returns
-// before any signature is read.
+// BinarySource, so it drives applyDeveloperMode and drop, the caller that
+// consumes the keep reason, with a signer that would accept the empty path.
 func TestDeveloperModeKeptOnEmptyExecutablePath(t *testing.T) {
 	t.Parallel()
 	f := &fakeSystem{owners: map[string]OwnedEntry{}}
@@ -156,13 +167,65 @@ func TestDeveloperModeKeptOnEmptyExecutablePath(t *testing.T) {
 	if !markerOn(f) {
 		t.Fatal("the marker is not On before the install")
 	}
-	cfg := Config{TargetUser: "alice"}
+	var logs strings.Builder
+	cfg := Config{TargetUser: "alice", Logger: slog.New(slog.NewTextHandler(&logs, nil))}
 	cfg.Signer = fakeSigner{ids: map[string]string{"": testTeamID}}
-	team, keep := plainInstallTeam(context.Background(), cfg)
-	if team != "" || keep == "" {
-		t.Errorf("plainInstallTeam = (%q, %q), want no team and a keep reason", team, keep)
+	removal, err := applyDeveloperMode(context.Background(), f, cfg)
+	if err != nil {
+		t.Fatalf("applyDeveloperMode = %v", err)
+	}
+	if err := removal.drop(f, cfg); err != nil {
+		t.Fatalf("drop = %v", err)
 	}
 	if !markerOn(f) {
-		t.Error("the marker is not On after the decision")
+		t.Errorf("the marker is not On after the install; logs:\n%s", logs.String())
 	}
+	wantStaysOn(t, logs.String(), "names no k3sm binary")
+}
+
+// TestDeveloperModeOffKeepsMarkerOnInstalledAndStagedTeamErrors pins the two
+// --from-staging keep-on branches the signing table never reached (the
+// installed k3sm's signature unreadable; an ad-hoc installed k3sm beside an
+// ad-hoc staged one), and is the one gate for every keep-on test of this
+// file: a run of it alone covers them all.
+func TestDeveloperModeOffKeepsMarkerOnInstalledAndStagedTeamErrors(t *testing.T) {
+	t.Parallel()
+	installed := Config{}.withDefaults().installedBinary()
+	_, probe := stagedFixture()
+	staged := probe.Executable
+	cases := []struct {
+		name   string
+		signer fakeSigner
+		want   string
+	}{
+		{name: "the installed signature cannot be read",
+			signer: fakeSigner{ids: signedTree(nil), errs: map[string]error{installed: errors.New("codesign: resource busy")}},
+			want:   "the signature of the installed k3sm could not be read (codesign: resource busy)"},
+		{name: "an ad-hoc installed k3sm beside an ad-hoc staged k3sm",
+			signer: fakeSigner{ids: signedTree(nil), errs: map[string]error{installed: ErrNoTeamID, staged: ErrNoTeamID}},
+			want:   "the staged k3sm carries no Developer ID team signature"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f, cfg, logs := devModeStagedInstall(t, tc.signer)
+			if err := preflightFromStaging(context.Background(), &cfg); err != nil {
+				t.Fatalf("preflightFromStaging = %v, want accepted in developer mode", err)
+			}
+			removal, err := applyDeveloperMode(context.Background(), f, cfg)
+			if err != nil {
+				t.Fatalf("applyDeveloperMode = %v", err)
+			}
+			if err := removal.drop(f, cfg); err != nil {
+				t.Fatalf("drop = %v", err)
+			}
+			if !markerOn(f) {
+				t.Errorf("the marker is not On after the install; logs:\n%s", logs.String())
+			}
+			wantStaysOn(t, logs.String(), tc.want)
+		})
+	}
+	t.Run("TestDeveloperModeOffKeepsMarkerOnDeveloperIDError", TestDeveloperModeOffKeepsMarkerOnDeveloperIDError)
+	t.Run("TestDeveloperModeKeptOnEveryPlainVerificationError", TestDeveloperModeKeptOnEveryPlainVerificationError)
+	t.Run("TestDeveloperModeKeptOnEmptyExecutablePath", TestDeveloperModeKeptOnEmptyExecutablePath)
 }
