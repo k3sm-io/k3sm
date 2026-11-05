@@ -138,9 +138,6 @@ pin, its date, and the tarball's sha256.
   moves on past the limit. It follows no symlink, and it reports a volume mounted inside the tree
   and leaves it alone. A file with a system flag, or a hard-linked file with a locking flag, is still
   refused and named, and uninstall fails until it is dealt with.
-- A sharded `MLXModel` answers HTTP 404 to a request naming any model but `spec.model`; before, the
-  name in a request body made every rank download that repository and drop the model it was
-  serving. The fix is in the `mlx-serve` sharded entrypoint, so it ships with the next image tag.
 - A sharded `MLXModel` answers HTTP 404 to a request naming any model but `spec.model`, or any
   `draft_model` or `adapters`; before, a model named in a request body made every rank download that
   repository and drop the model it was serving. The fix is in the `mlx-serve` sharded entrypoint, so it ships with the next image tag.
