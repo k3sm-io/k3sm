@@ -338,29 +338,47 @@ func TestBudgetHistoryRingIsBounded(t *testing.T) {
 	}
 }
 
-// TestBudgetHistoryValidatorKnowsEveryReason pins that the reasons
-// recordLocked counts and the reasons validHistoryEvent accepts from a stored
-// ring are the same set: a reason the recorder counts but the validator does
-// not know would be dropped from the history on the next read, and a reason the
-// validator accepts but the recorder never counts is a list gone stale. Every
-// counter reason the apis vocabulary names is tried, plus one it does not.
-func TestBudgetHistoryValidatorKnowsEveryReason(t *testing.T) {
+// TestBudgetHistoryReasonsListMatchesRecorder pins that historyReasons, the
+// reasons recordLocked counts and the reasons validHistoryEvent accepts from a
+// stored ring are the same set. Each listed reason must be counted into its
+// own total and accepted by the validator, so a reason added to the list but
+// not to recordLocked (or the reverse) goes red. A reason the list omits must
+// be neither counted nor accepted. The apis vocabulary exports no list of
+// every CounterReason, so a reason apis gains that neither this list nor the
+// recorder names is not caught here; only the values apis marks unknown or
+// invalid are tried beyond the list.
+func TestBudgetHistoryReasonsListMatchesRecorder(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
-	reasons := []budgetv1alpha1.CounterReason{
-		budgetv1alpha1.CounterEviction, budgetv1alpha1.CounterOOMKill, budgetv1alpha1.CounterKernelKill,
-		budgetv1alpha1.CounterRestart, budgetv1alpha1.CounterMemHigh, budgetv1alpha1.CounterTier1Refused,
-		budgetv1alpha1.CounterUnknown, "not-a-reason",
-	}
-	for _, reason := range reasons {
+	seen := map[historyTotals]budgetv1alpha1.CounterReason{}
+	for _, reason := range historyReasons {
 		t.Run(string(reason), func(t *testing.T) {
+			if !reason.Valid() || reason == budgetv1alpha1.CounterUnknown {
+				t.Fatalf("historyReasons names %q, which apis does not define as a counted reason", reason)
+			}
 			h := &BudgetHistory{st: newHistoryState()}
 			h.recordLocked("pod", budgetv1alpha1.BandBatch, reason, now)
-			counted := h.st.Totals[budgetv1alpha1.BandBatch] != historyTotals{}
-			if len(h.st.Ring) != 1 {
-				t.Fatalf("recordLocked(%q) left %d ring entries, want 1", reason, len(h.st.Ring))
+			got := h.st.Totals[budgetv1alpha1.BandBatch]
+			if got == (historyTotals{}) {
+				t.Fatalf("recordLocked does not count listed reason %q", reason)
 			}
-			if valid := validHistoryEvent(h.st.Ring[0]); valid != counted {
-				t.Errorf("reason %q: recordLocked counts it = %v, validHistoryEvent accepts it = %v", reason, counted, valid)
+			if prev, dup := seen[got]; dup {
+				t.Errorf("reasons %q and %q count into the same total", prev, reason)
+			}
+			seen[got] = reason
+			if len(h.st.Ring) != 1 || !validHistoryEvent(h.st.Ring[0]) {
+				t.Errorf("validHistoryEvent rejects listed reason %q", reason)
+			}
+		})
+	}
+	for _, reason := range []budgetv1alpha1.CounterReason{budgetv1alpha1.CounterUnknown, "not-a-reason"} {
+		t.Run("unlisted/"+string(reason), func(t *testing.T) {
+			h := &BudgetHistory{st: newHistoryState()}
+			h.recordLocked("pod", budgetv1alpha1.BandBatch, reason, now)
+			if h.st.Totals[budgetv1alpha1.BandBatch] != (historyTotals{}) {
+				t.Errorf("recordLocked counts unlisted reason %q", reason)
+			}
+			if len(h.st.Ring) != 1 || validHistoryEvent(h.st.Ring[0]) {
+				t.Errorf("validHistoryEvent accepts unlisted reason %q", reason)
 			}
 		})
 	}
