@@ -14,12 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Command indexcheck decodes one release index document with
-// k3sm.io/k3sm/pkg/update.ParseReleaseIndex and prints the fields a release
-// must match, one key=value line each, in a fixed order. hack/release/publish.sh
-// runs it on the content it extracts from the signed index, so the document a
-// release uploads passes the same decoder the schema is pinned to, and then
-// compares the printed fields with the release's own assets.
+// Command indexcheck decodes one release index document and prints the fields a
+// release must match, one key=value line each, in a fixed order.
+// hack/release/publish.sh runs it on the content it extracts from the signed
+// index, so the document a release uploads passes the same decoder the schema
+// is pinned to, and then compares the printed fields with the release's own
+// assets.
+//
+//	indexcheck final <release-index.json>
+//	indexcheck candidate <tag> <release-index.json>
+//
+// The caller names the document it expects: final decodes with
+// k3sm.io/k3sm/pkg/update.ParseReleaseIndex, and candidate with
+// ParseCandidateIndex at the release of tag. The document never picks its own
+// decoder.
 //
 // It decodes content only: it never verifies a signature.
 package main
@@ -41,22 +49,32 @@ func main() {
 	}
 }
 
-// run decodes the document at args[0] and writes its fields to w.
+const usage = "usage: indexcheck final <release-index.json> | indexcheck candidate <tag> <release-index.json>"
+
+// run decodes the document the arguments name and writes its fields to w.
 func run(args []string, w io.Writer) error {
-	if len(args) != 1 {
-		return errors.New("usage: indexcheck <release-index.json>")
+	var path string
+	var parse func(raw []byte) (update.ReleaseIndex, error)
+	switch {
+	case len(args) == 2 && args[0] == "final":
+		path, parse = args[1], update.ParseReleaseIndex
+	case len(args) == 3 && args[0] == "candidate":
+		path = args[2]
+		parse = func(raw []byte) (update.ReleaseIndex, error) { return update.ParseCandidateIndex(raw, args[1]) }
+	default:
+		return errors.New(usage)
 	}
-	f, err := os.Open(args[0])
+	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = f.Close() }() // read-only; a close error loses nothing
-	// One byte over the cap is enough for ParseReleaseIndex to refuse it.
+	// One byte over the cap is enough for either decoder to refuse it.
 	raw, err := io.ReadAll(io.LimitReader(f, update.MaxReleaseIndexBytes+1))
 	if err != nil {
-		return fmt.Errorf("read %s: %w", args[0], err)
+		return fmt.Errorf("read %s: %w", path, err)
 	}
-	ix, err := update.ParseReleaseIndex(raw)
+	ix, err := parse(raw)
 	if err != nil {
 		return err
 	}

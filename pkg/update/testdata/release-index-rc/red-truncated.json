@@ -1,0 +1,13 @@
+{
+  "schema": "k3sm-release-index-rc/v1",
+  "context": "io.k3sm.release-index-rc/v1",
+  "issuedAt": "2026-11-05T12:30:45Z",
+  "tag": "v0.3.0-rc.2",
+  "minimumMacOS": "26.0",
+  "minimumSupportedTag": "v0.2.0",
+  "app": {
+    "bundleID": "io.k3sm.app",
+    "shortVersion": "0.3.0",
+    "image": {
+      "name": "k3sm_0.3.0-rc.2_darwin_arm64.dmg",
+      "url": "https://github.com/k3sm-io/k3sm/releases/download/v0.3.0-

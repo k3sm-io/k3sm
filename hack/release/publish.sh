@@ -47,11 +47,12 @@
 #                 leading v). It is checked as described below, never trusted
 #                 for its name, and uploaded twice: under that name and under
 #                 the fixed alias k3sm_darwin_arm64.dmg.
-#   --release-index (--upload only, final releases only) the signed release
-#                 index, named exactly k3sm_<version>_release-index.p7m. It
-#                 needs --disk-image, is checked as described below, never
-#                 trusted for its name, and uploaded twice: under that name
-#                 and under the fixed alias k3sm_release-index.p7m.
+#   --release-index (--upload only) the signed release index, named exactly
+#                 k3sm_<version>_release-index.p7m. It needs --disk-image and
+#                 is checked as described below, never trusted for its name. A
+#                 final release uploads it twice, under that name and under the
+#                 fixed alias k3sm_release-index.p7m; a release candidate
+#                 uploads it once, under that name.
 #   --self-test   hermetic test of the refusals and the promote check, with
 #                 every signing, notary, keychain and GitHub tool replaced by a
 #                 fake on PATH (no network, no credentials, no keychain)
@@ -78,7 +79,7 @@
 #      checked again: the stage tree and the tarball against PAYLOAD-SHA256,
 #      the tarball's SHA-256 against the one step 5 checked (the seal's under
 #      --upload), the disk image copy and its alias against the hash taken
-#      at its checks, the release index copy and its alias likewise, and the
+#      at its checks, the release index copy and any alias likewise, and the
 #      checksums file against all of them; then
 #      gh release create <tag> --draft --verify-tag with those assets
 #      (--prerelease for an -rc.N tag)
@@ -90,8 +91,9 @@
 #   8. only then promote: gh release edit <tag> --draft=false, with --latest
 #      for a final version and --latest=false for a release candidate; a
 #      final release of v0.3.0 or later whose assets hold the disk image
-#      without both release index assets, or a release candidate or a final
-#      release below v0.3.0 holding either, is refused here
+#      without both release index assets, a release candidate holding the
+#      index alias, or any release below v0.3.0 holding an index asset, is
+#      refused here
 #
 # THE TARBALL'S SHAPE is the one install.sh (at the repo root) consumes: the
 # assets k3sm_<version>_darwin_arm64.tar.gz and k3sm_<version>_checksums.txt
@@ -156,12 +158,12 @@
 # link never answers 404; a release candidate needs none. The one-shot,
 # tarball-only run takes no image and does not apply this check.
 #
-# THE RELEASE INDEX (--upload --release-index, final releases from v0.3.0
-# only; operator ruling of 2026-10-23: the self-updater, the only reader of
-# the index, first ships in v0.3). The app
-# fetches releases/latest/download/k3sm_release-index.p7m to learn the newest
-# final release and the exact bytes of its version set
-# (docs/design/release-index.md). The file is CMS SignedData; this script
+# THE RELEASE INDEX (--upload --release-index, releases from v0.3.0 only;
+# operator ruling of 2026-10-23: the self-updater, the only reader of the
+# index, first ships in v0.3). The app fetches
+# releases/latest/download/k3sm_release-index.p7m to learn the newest final
+# release and the exact bytes of its version set, and a candidate's own document
+# by its tag (docs/design/release-index.md). The file is CMS SignedData; this script
 # neither signs it nor verifies the signature (the app's release step does
 # both). The file is copied, mode 0444, into a private 0700 directory,
 # <stage-dir>.assets/release-index, and that copy is what is checked, hashed
@@ -171,8 +173,11 @@
 #   - it is 1 byte to 128 KiB: the document's 64 KiB cap plus the signer's
 #     certificate chain and the timestamp token
 #   - security cms -D extracts the signed content (no key is needed for that),
-#     and the decoder the schema is pinned to, pkg/update.ParseReleaseIndex,
-#     run as go run ./hack/release/indexcheck, accepts it
+#     and the decoder the release tag selects accepts it, run as go run
+#     ./hack/release/indexcheck final <file> (pkg/update.ParseReleaseIndex) for
+#     a final release or ... candidate <tag> <file>
+#     (pkg/update.ParseCandidateIndex at this tag) for a release candidate, so
+#     neither takes the other's document
 #   - the decoded fields name exactly this release: the tag, the disk image's
 #     name, sha256 and size, the tarball's name and sealed hash, and the
 #     sha256 of the stage tree's PAYLOAD-SHA256
@@ -184,11 +189,13 @@
 # checksums file after the image's. The draft carries seven assets and step 7
 # checks all seven, the index and its alias against the hash taken at the
 # index's checks. A final --upload of v0.3.0 or later without --release-index
-# is refused before any check (index-required). A release candidate given one
-# is refused (index-rc): a release candidate is never latest and publishes no
-# index. A final release below v0.3.0 may carry the disk image with no index,
-# and is refused if given one (index-early): the app in v0.2 never reads it.
-# An -rc.N version counts as below its final, so v0.3.0-rc.1 is below v0.3.0.
+# is refused before any check (index-required). A release candidate of v0.3.0
+# or later may carry its document, and carries no alias: it is never latest, so
+# the alias would answer nobody, and a stable reader must never meet its
+# document. Its draft holds six assets, and a draft holding the alias is not
+# promoted (index-rc-alias). A release below v0.3.0 may carry the disk image with
+# no index, and is refused if given one (index-early): the app in v0.2 never
+# reads it. A candidate takes its final's place here, so v0.3.0-rc.1 is in.
 #
 # A draft whose assets fail step 7 is never promoted, so a failed or partial
 # upload of a large asset cannot become the latest release that an install
@@ -236,9 +243,10 @@ version_lt() {
 	done
 	return 1
 }
-# index_era <tag>: zero when a final release of this version carries the
-# release index (v0.3.0 and later). The app's self-updater ships in v0.3.
-index_era() { ! is_rc "$1" && ! version_lt "$1" v0.3.0; }
+# index_era <tag>: zero when a release of this version may carry the release
+# index (v0.3.0 and later, its candidates included). The app's self-updater
+# ships in v0.3.
+index_era() { ! version_lt "${1%%-rc.*}" v0.3.0; }
 
 # tag_binding_problems <repo-dir> <ref>: zero when the worktree is clean
 # (untracked files included) and <ref>'s commit is HEAD. Called with
@@ -507,7 +515,8 @@ promote() {
 # under --upload), the image and index copies against the hashes taken when
 # they were checked, and the checksums file against all of them. Then create
 # the draft and promote. Three assets (tarball, manifest, checksums), five with
-# the image and its alias, seven with the release index and its alias too.
+# the image and its alias, seven with the release index and its alias too, or
+# six on a release candidate, whose index has no alias.
 upload() {
 	local tag="$1" repo="$2" notes="$3" dir="$4" tree="$5" tsha="$6" isha="${7:-}" xsha="${8:-}" count=3 names=() n problems pre=() base img
 	base="$(asset_base "$tag")"
@@ -515,9 +524,8 @@ upload() {
 	[ -z "$isha" ] || count=5
 	if [ -n "$xsha" ]; then
 		[ -n "$isha" ] || die "upload was given a release index hash without an image hash"
-		is_rc "$tag" &&
-			refuse index-rc "$tag is a release candidate; a release index is for final releases only; nothing was uploaded."
 		count=7
+		is_rc "$tag" && count=6
 	fi
 	if ! problems="$(tree_manifest_problems "$tree" "$tree/PAYLOAD-SHA256")"; then
 		printf '%s\n' "$problems" >&2
@@ -536,7 +544,9 @@ upload() {
 		done
 	fi
 	if [ -n "$xsha" ]; then
-		for img in "$(asset_path "$dir" "$tag" "$(index_name "$tag")")" "$(asset_path "$dir" "$tag" "$INDEX_ALIAS_NAME")"; do
+		pre=("$(asset_path "$dir" "$tag" "$(index_name "$tag")")")
+		is_rc "$tag" || pre+=("$(asset_path "$dir" "$tag" "$INDEX_ALIAS_NAME")")
+		for img in "${pre[@]}"; do
 			[ -f "$img" ] && [ ! -L "$img" ] && [ "$(sha256_of "$img")" = "$xsha" ] ||
 				refuse index-changed "the release index or its alias $(basename "$img") changed after its checks (sha256 $xsha); nothing was uploaded."
 		done
@@ -547,6 +557,7 @@ upload() {
 	fi
 	while IFS= read -r n; do names+=("$(asset_path "$dir" "$tag" "$n")"); done < <(expected_assets "$tag" "$dir")
 	[ "${#names[@]}" -eq "$count" ] || die "expected $count assets in $dir, the checksums file names ${#names[@]}"
+	pre=()
 	is_rc "$tag" && pre=(--prerelease)
 	echo "==> create the draft release $tag on $repo"
 	gh release create "$tag" --repo "$repo" --draft ${pre[@]+"${pre[@]}"} --verify-tag --title "$tag" --notes-file "$notes" "${names[@]}" ||
@@ -605,9 +616,10 @@ seal_value() { sed -n "s/^$2=//p" "$1"; }
 # the checksums file holds exactly the lines shasum writes for the tarball and
 # manifest assets now, followed, when an image hash is given, by exactly that
 # image's line and then its alias's line with the same hash, and then, when an
-# index hash is given, the index's line and its alias's the same way; and the
-# directory holds nothing but those assets (the image, the index and their
-# aliases only in their private directories, and only when a hash is given).
+# index hash is given, the index's line and, on a final release, its alias's
+# the same way; and the directory holds nothing but those assets (the image, the
+# index and their aliases only in their private directories, and only when a
+# hash is given, so a release candidate's holds no index alias).
 checksums_problems() {
 	local tag="$1" dir="$2" isha="${3:-}" xsha="${4:-}" base sums img idx want got extra allowed
 	base="$(asset_base "$tag")"
@@ -618,7 +630,8 @@ checksums_problems() {
 	want="$(cd "$dir" && shasum -a 256 "$base.tar.gz" "$base.PAYLOAD-SHA256" 2>/dev/null)" ||
 		{ echo "    the tarball or manifest asset is missing from $dir"; return 1; }
 	[ -z "$isha" ] || want="$want"$'\n'"$isha  $img"$'\n'"$isha  $IMAGE_ALIAS_NAME"
-	[ -z "$xsha" ] || want="$want"$'\n'"$xsha  $idx"$'\n'"$xsha  $INDEX_ALIAS_NAME"
+	[ -z "$xsha" ] || want="$want"$'\n'"$xsha  $idx"
+	[ -z "$xsha" ] || is_rc "$tag" || want="$want"$'\n'"$xsha  $INDEX_ALIAS_NAME"
 	got="$(cat "$dir/$sums")"
 	if [ "$want" != "$got" ]; then
 		echo "    $sums does not hold exactly the expected lines:"
@@ -627,7 +640,8 @@ checksums_problems() {
 	fi
 	allowed=(-e "$base.tar.gz" -e "$base.PAYLOAD-SHA256" -e "$sums")
 	[ -z "$isha" ] || allowed+=(-e "$IMAGE_DIR_NAME" -e "$IMAGE_DIR_NAME/$img" -e "$IMAGE_DIR_NAME/$IMAGE_ALIAS_NAME")
-	[ -z "$xsha" ] || allowed+=(-e "$INDEX_DIR_NAME" -e "$INDEX_DIR_NAME/$idx" -e "$INDEX_DIR_NAME/$INDEX_ALIAS_NAME")
+	[ -z "$xsha" ] || allowed+=(-e "$INDEX_DIR_NAME" -e "$INDEX_DIR_NAME/$idx")
+	[ -z "$xsha" ] || is_rc "$tag" || allowed+=(-e "$INDEX_DIR_NAME/$INDEX_ALIAS_NAME")
 	extra="$(cd "$dir" && find . -mindepth 1 | sed 's|^\./||' | grep -vxF "${allowed[@]}" || true)"
 	[ -z "$extra" ] || { echo "    $dir holds files that are not release assets:"; printf '%s\n' "$extra" | sed 's/^/      /'; return 1; }
 	if [ -n "$isha" ] && { [ -L "$dir/$IMAGE_DIR_NAME" ] || [ ! -d "$dir/$IMAGE_DIR_NAME" ]; }; then
@@ -864,20 +878,16 @@ check_image_name() {
 
 # require_index_for_final <tag> <index>: a final release is promoted --latest,
 # and the app's update check fetches releases/latest/download/$INDEX_ALIAS_NAME,
-# so a final release without the index would answer 404 to every app. A
-# release candidate is never latest and carries none. A final release below
-# v0.3.0 has no reader of the index, so it carries none either.
+# so a final release without the index would answer 404 to every app. A release
+# below v0.3.0 has no reader of the index, so it carries none. A release
+# candidate is never latest, so its document is its own to carry or not.
 require_index_for_final() {
-	if is_rc "$1"; then
-		[ -z "${2:-}" ] ||
-			refuse index-rc "$1 is a release candidate; a release index is for final releases only; nothing was uploaded."
-		return 0
-	fi
 	if ! index_era "$1"; then
 		[ -z "${2:-}" ] ||
 			refuse index-early "$1 is below v0.3.0, where no app reads a release index; drop --release-index; nothing was uploaded."
 		return 0
 	fi
+	is_rc "$1" && return 0
 	[ -n "${2:-}" ] ||
 		refuse index-required "$1 is a final release and needs --release-index: without it releases/latest/download/$INDEX_ALIAS_NAME would answer 404 to every app; nothing was uploaded."
 }
@@ -890,10 +900,17 @@ check_index_name() {
 		refuse index-name "the release index must be named exactly $name, not $(basename "$1"); nothing was uploaded."
 }
 
-# index_fields <json>: decode the index content with the decoder the schema is
-# pinned to and print the fields a release must match, key=value, in order.
-# A function so the self-test can count its calls.
-index_fields() { (cd "$REPO_ROOT" && go run ./hack/release/indexcheck "$1"); }
+# index_fields <json> <tag>: decode the index content with the decoder the
+# schema is pinned to, chosen by this release's tag and never by the document,
+# and print the fields a release must match, key=value, in order. A function so
+# the self-test can count its calls.
+index_fields() {
+	if is_rc "$2"; then
+		(cd "$REPO_ROOT" && go run ./hack/release/indexcheck candidate "$2" "$1")
+	else
+		(cd "$REPO_ROOT" && go run ./hack/release/indexcheck final "$1")
+	fi
+}
 
 # release_index_problems <index> <tag> <manifest> <image-copy> <image-sha256>
 # <tarball-sha256>: extract the signed content of <index> and check it decodes
@@ -906,7 +923,7 @@ release_index_problems() {
 	if ! security cms -D -i "$ix" -o "$x/index.json" >/dev/null 2>&1 || [ ! -f "$x/index.json" ]; then
 		echo "    security cms -D cannot extract the signed content of $(basename "$ix")"; rm -rf "$x"; return 1
 	fi
-	if ! got="$(index_fields "$x/index.json" 2>&1)"; then
+	if ! got="$(index_fields "$x/index.json" "$tag" 2>&1)"; then
 		echo "    the decoder refuses the index content:"; printf '%s\n' "$got" | sed 's/^/      /'; rm -rf "$x"; return 1
 	fi
 	rm -rf "$x"
@@ -933,14 +950,13 @@ release_index_problems() {
 # add_release_index <file> <tag> <assetdir> <manifest> <image-sha256>
 # <tarball-sha256>: copy the index, mode 0444, into a private 0700 directory
 # under the assets, check that copy (size, then content against this
-# release), hash it once into INDEX_SHA256, copy it to the fixed-name alias
-# beside it, refuse unless the alias hashes the same, and append both
-# checksums lines. upload re-hashes both right before the draft.
+# release), and hash it once into INDEX_SHA256. A final release then copies it
+# to the fixed-name alias beside it and refuses unless the alias hashes the same.
+# Append the checksums lines, one for a release candidate and two for a final
+# release. upload re-hashes each file right before the draft.
 INDEX_SHA256=""
 add_release_index() {
 	local src="$1" tag="$2" dir="$3" manifest="$4" isha="$5" tsha="$6" name xdir copy alias size report
-	is_rc "$tag" &&
-		refuse index-rc "$tag is a release candidate; a release index is for final releases only; nothing was uploaded."
 	index_era "$tag" ||
 		refuse index-early "$tag is below v0.3.0, where no app reads a release index; drop --release-index; nothing was uploaded."
 	check_index_name "$src" "$tag"
@@ -965,6 +981,11 @@ add_release_index() {
 	fi
 	printf '%s\n' "$report"
 	INDEX_SHA256="$(sha256_of "$copy")"
+	if is_rc "$tag"; then
+		printf '%s  %s\n' "$INDEX_SHA256" "$name" >>"$dir/$(checksums_name "$tag")" ||
+			die "could not append the release index to the checksums file"
+		return 0
+	fi
 	alias="$xdir/$INDEX_ALIAS_NAME"
 	if ! { cp "$copy" "$alias.tmp" && chmod 444 "$alias.tmp" && mv "$alias.tmp" "$alias"; }; then
 		die "could not copy the release index to its alias $alias"
@@ -977,25 +998,25 @@ add_release_index() {
 
 # index_promote_check <tag> <repo> <assetdir>: the release index rule at the
 # promote step, over the asset set verify_draft just matched to the draft. A
-# release candidate carries no index; a final release below v0.3.0 carries
-# none; a final release from v0.3.0 that carries the app's disk image carries
-# both index assets.
+# release below v0.3.0 carries no index asset; a release candidate from v0.3.0
+# carries no index alias; a final release from v0.3.0 that carries the app's
+# disk image carries both index assets.
 index_promote_check() {
 	local tag="$1" repo="$2" names has_img=0 has_idx=0 has_alias=0
 	names="$(expected_assets "$tag" "$3")"
 	grep -qxF "$(image_name "$tag")" <<<"$names" && has_img=1
 	grep -qxF "$(index_name "$tag")" <<<"$names" && has_idx=1
 	grep -qxF "$INDEX_ALIAS_NAME" <<<"$names" && has_alias=1
-	if is_rc "$tag"; then
+	if ! index_era "$tag"; then
 		[ "$has_idx$has_alias" = 00 ] ||
-			refuse index-rc "the draft release candidate $tag carries a release index; it was NOT promoted." \
+			refuse index-early "the draft $tag is below v0.3.0 and carries a release index; it was NOT promoted." \
 				"Delete the draft (gh release delete $tag --repo $repo) and publish again without --release-index."
 		return 0
 	fi
-	if ! index_era "$tag"; then
-		[ "$has_idx$has_alias" = 00 ] ||
-			refuse index-early "the draft final release $tag is below v0.3.0 and carries a release index; it was NOT promoted." \
-				"Delete the draft (gh release delete $tag --repo $repo) and publish again without --release-index."
+	if is_rc "$tag"; then
+		[ "$has_alias" = 0 ] ||
+			refuse index-rc-alias "the draft release candidate $tag carries the alias $INDEX_ALIAS_NAME; it was NOT promoted." \
+				"Delete the draft (gh release delete $tag --repo $repo) and publish again."
 		return 0
 	fi
 	[ "$has_img" = 0 ] || [ "$has_idx$has_alias" = 11 ] ||
@@ -1011,8 +1032,6 @@ run_upload() {
 	assets="$tree.assets"
 	[ -z "$img" ] || check_image_name "$img" "$tag"
 	if [ -n "$idx" ]; then
-		is_rc "$tag" &&
-			refuse index-rc "$tag is a release candidate; a release index is for final releases only; nothing was uploaded."
 		index_era "$tag" ||
 			refuse index-early "$tag is below v0.3.0, where no app reads a release index; drop --release-index; nothing was uploaded."
 		check_index_name "$idx" "$tag"
@@ -1186,9 +1205,11 @@ mk_sealed() {
 	write_seal "$1/tree.seal" "$tag" "$head2" "$1/tree/PAYLOAD-SHA256" "$1/tree.assets/$(asset_base "$tag").tar.gz" "$TEAM"
 }
 # mk_image <dir> <tree> [version]: a fixture image of k3sm.app around <tree>,
-# at <dir>/out/<the closed name>; the fake hdiutil mounts <dir>/root
+# at <dir>/out/<the closed name>; the fake hdiutil mounts <dir>/root. The version
+# defaults to the tag's x.y.z core, as CFBundleShortVersionString takes it.
 mk_image() {
-	local r="$1/root" v="${3:-${tag#v}}"
+	local r="$1/root" c="${tag#v}" v
+	v="${3:-${c%%-rc.*}}"
 	mkdir -p "$r/k3sm.app/Contents/Resources" "$1/out"
 	cp -R "$2" "$r/k3sm.app/Contents/Resources/payload"
 	printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>CFBundleShortVersionString</key><string>%s</string></dict></plist>\n' "$v" >"$r/k3sm.app/Contents/Info.plist"
@@ -1223,22 +1244,35 @@ up_promoted() {
 		bad "$1 (rc=$rc, log: $(tr '\n' ';' <"$log"))"; printf '%s\n' "$out" | sed 's/^/       /'
 	fi
 }
+# up_candidate_promoted <name> <asset-count>: the last run_up created a
+# prerelease draft of exactly that many assets and promoted it, never as latest
+up_candidate_promoted() {
+	if [ "$rc" -eq 0 ] && [ "$(grep -c . "$T/uploaded" 2>/dev/null)" = "$2" ] &&
+		grep -q "^gh release create $tag .* --draft --prerelease --verify-tag " "$log" &&
+		grep -qx -- "gh release edit $tag --repo $repo --draft=false --latest=false" "$log"; then ok "$1"; else
+		bad "$1 (rc=$rc, log: $(tr '\n' ';' <"$log"))"; printf '%s\n' "$out" | sed 's/^/       /'
+	fi
+}
 # fresh <var>: a new sealed fixture directory in <var>
 fresh() { n=$((n + 1)); W="$T/ph$n"; mk_sealed "$W"; }
 
 # mk_index <dir> [jq-filter]: a fixture release index for the sealed fixture in
 # <dir> and its image at <dir>/img/out, at <dir>/idx/<the closed name>: the
 # line FIXTURE-CMS, then the JSON document, which the fake security cms -D
-# extracts. The jq filter edits the document.
+# extracts. The tag decides which document it is: a release candidate's carries
+# the candidate strings, the x.y.z core as its short version and a final floor.
+# The jq filter edits the document.
 mk_index() {
-	local d="$1" im json
+	local d="$1" im json v="${tag#v}" suffix="" floor="$tag"
+	if is_rc "$tag"; then v="${v%%-rc.*}"; suffix=-rc; floor=v0.1.0; fi
 	im="$d/img/out/$(image_name "$tag")"
 	mkdir -p "$d/idx"
-	json="$(jq -n --arg tag "$tag" --arg v "${tag#v}" --arg name "$(image_name "$tag")" --arg sha "$(sha256_of "$im")" \
+	json="$(jq -n --arg tag "$tag" --arg v "$v" --arg name "$(image_name "$tag")" --arg sha "$(sha256_of "$im")" \
+		--arg schema "k3sm-release-index$suffix/v1" --arg context "io.k3sm.release-index$suffix/v1" --arg floor "$floor" \
 		--argjson size "$(stat -f %z "$im")" --arg archive "$(asset_base "$tag").tar.gz" \
 		--arg asha "$(sha256_of "$d/tree.assets/$(asset_base "$tag").tar.gz")" --arg msha "$(sha256_of "$d/tree/PAYLOAD-SHA256")" \
-		'{schema: "k3sm-release-index/v1", context: "io.k3sm.release-index/v1", issuedAt: "2026-11-02T18:04:11Z",
-		  tag: $tag, minimumMacOS: "26.0", minimumSupportedTag: $tag,
+		'{schema: $schema, context: $context, issuedAt: "2026-11-02T18:04:11Z",
+		  tag: $tag, minimumMacOS: "26.0", minimumSupportedTag: $floor,
 		  app: {bundleID: "io.k3sm.app", shortVersion: $v,
 		        image: {name: $name, url: ("https://github.com/k3sm-io/k3sm/releases/download/" + $tag + "/" + $name),
 		                sha256: $sha, size: $size}},
@@ -1251,7 +1285,7 @@ mk_index() {
 index_era_cases() {
 	local tag=v0.2.0 g
 	echo "the release index by version"
-	for g in "v0.2.0 0" "v0.2.9 0" "v0.3.0-rc.1 0" "v0.3.0 1" "v0.10.0 1" "v1.0.0 1"; do
+	for g in "v0.2.0 0" "v0.2.9 0" "v0.2.9-rc.1 0" "v0.3.0-rc.1 1" "v0.3.0 1" "v0.3.1-rc.1 1" "v0.10.0 1" "v1.0.0 1"; do
 		if { index_era "${g% *}" && [ "${g#* }" = 1 ]; } || { ! index_era "${g% *}" && [ "${g#* }" = 0 ]; }; then
 			ok "index_era ${g% *} is ${g#* }"
 		else bad "index_era ${g% *} is not ${g#* }"; fi
@@ -1276,18 +1310,190 @@ index_era_cases() {
 	run_up "$W/tree" "$W/img/out/$(image_name "$tag")" "$W/idx/$(index_name "$tag")"
 	up_promoted "v0.3.0 final with the image and both index assets is promoted" 7
 
-	rc=0; out="$( (require_index_for_final "$rctag" "$T/x.p7m") 2>&1)" || rc=$?
-	if [ "$rc" -eq 2 ] && grep -q "REFUSE: index-rc" <<<"$out"; then ok "a release candidate given an index is still refused"; else
-		bad "rc with index (rc=$rc: $out)"; fi
-	rc=0; out="$( (require_index_for_final "$rctag" "") 2>&1)" || rc=$?
-	if [ "$rc" -eq 0 ]; then ok "a release candidate without an index still passes"; else bad "rc without index (rc=$rc: $out)"; fi
+	rc=0; out="$( (require_index_for_final v0.3.0-rc.1 "$T/x.p7m") 2>&1)" || rc=$?
+	if [ "$rc" -eq 0 ]; then ok "a release candidate of v0.3.0 given an index passes"; else bad "v0.3.0-rc.1 with index (rc=$rc: $out)"; fi
+	rc=0; out="$( (require_index_for_final v0.3.0-rc.1 "") 2>&1)" || rc=$?
+	if [ "$rc" -eq 0 ]; then ok "a release candidate of v0.3.0 without an index still passes"; else bad "v0.3.0-rc.1 without index (rc=$rc: $out)"; fi
+	rc=0; out="$( (require_index_for_final v0.2.9-rc.1 "$T/x.p7m") 2>&1)" || rc=$?
+	if [ "$rc" -eq 2 ] && grep -q "REFUSE: index-early" <<<"$out"; then ok "a release candidate below v0.3.0 given an index is refused"; else
+		bad "v0.2.9-rc.1 with index (rc=$rc: $out)"; fi
+	rc=0; out="$( (require_index_for_final v0.2.9-rc.1 "") 2>&1)" || rc=$?
+	if [ "$rc" -eq 0 ]; then ok "a release candidate below v0.3.0 without an index still passes"; else bad "v0.2.9-rc.1 without index (rc=$rc: $out)"; fi
+}
+
+# candidate_draft_assets <dir> <rc-tag> <with-alias>: an assets directory for
+# the tag holding an index, with its alias when <with-alias> is 1, in A3, and
+# the list of files a fake draft holds in $T/uploaded.
+candidate_draft_assets() {
+	local x="$1" t="$2" n2
+	mk_payload "$x/tree"
+	(PATH="$FPATH" package_assets "$x/tree" "$t" "$x/tree.assets") >/dev/null 2>&1
+	A3="$x/tree.assets"
+	mkdir -m 700 "$A3/$INDEX_DIR_NAME"
+	printf 'FIXTURE-CMS\n{}\n' >"$A3/$INDEX_DIR_NAME/$(index_name "$t")"
+	(cd "$A3/$INDEX_DIR_NAME" && shasum -a 256 "$(index_name "$t")") >>"$A3/$(checksums_name "$t")"
+	if [ "$3" = 1 ]; then
+		cp "$A3/$INDEX_DIR_NAME/$(index_name "$t")" "$A3/$INDEX_DIR_NAME/$INDEX_ALIAS_NAME"
+		(cd "$A3/$INDEX_DIR_NAME" && shasum -a 256 "$INDEX_ALIAS_NAME") >>"$A3/$(checksums_name "$t")"
+	fi
+	: >"$log"; rm -f "$T/uploaded"
+	while IFS= read -r n2; do asset_path "$A3" "$t" "$n2"; echo; done < <(expected_assets "$t" "$A3") >"$T/uploaded"
+}
+
+# candidate_after_checks <mutator>: run a candidate's checks in $W, run the
+# mutator over its assets, then upload. Sets rc and out; log holds the tool calls.
+candidate_after_checks() {
+	: >"$log"; rc=0
+	out="$( (PATH="$FPATH" FAKE_GH_CREATE_OK=1 FAKE_GH_EDIT_OK=1 FAKE_CODESIGN_VERIFY_OK=1 FAKE_STAPLER_OK=1 FAKE_SPCTL_OK=1 \
+		candidate_checks_then_upload "$1") 2>&1)" || rc=$?
+}
+candidate_checks_then_upload() {
+	verify_release() { :; }
+	upload_checks "$G2" "$ref2" "$tag" "$TEAM" "$W/tree" "$W/tree.assets" "$W/tree.seal"
+	add_disk_image "$W/img/out/$(image_name "$tag")" "$tag" "$TEAM" "$W/tree/PAYLOAD-SHA256" "$W/tree.assets"
+	add_release_index "$W/idx/$(index_name "$tag")" "$tag" "$W/tree.assets" "$W/tree/PAYLOAD-SHA256" "$IMAGE_SHA256" "$(seal_value "$W/tree.seal" tarball_sha256)"
+	"$1"
+	upload "$tag" "$repo" "$T/notes.md" "$W/tree.assets" "$W/tree" "$(seal_value "$W/tree.seal" tarball_sha256)" "$IMAGE_SHA256" "$INDEX_SHA256"
+}
+
+# candidate_index_cases: a release candidate's own document, its one upload and
+# the absence of an alias. Runs at a tag of its own, whatever the caller's are.
+candidate_index_cases() {
+	local tag=v0.3.1-rc.1 xd ix sums A3
+	echo "the candidate release index"
+
+	fresh; mk_image "$W/img" "$W/tree"; mk_index "$W"
+	run_up "$W/tree" "$W/img/out/$(image_name "$tag")" "$W/idx/$(index_name "$tag")"
+	up_candidate_promoted "control: a release candidate with the image and its document is promoted, never latest, with six assets" 6
+	if grep -qx "    the index sets the minimum supported tag v0.1.0" <<<"$out"; then
+		ok "the minimum supported tag a candidate's document carries is printed"
+	else
+		bad "a candidate's minimum supported tag is not printed"; printf '%s\n' "$out" | sed 's/^/       /'
+	fi
+	xd="$W/tree.assets/$INDEX_DIR_NAME"
+	ix="$xd/$(index_name "$tag")"
+	sums="$W/tree.assets/$(checksums_name "$tag")"
+	if [ "$(stat -f %Lp "$xd")" = 700 ] && [ "$(stat -f %Lp "$ix")" = 444 ] && [ ! -e "$xd/$INDEX_ALIAS_NAME" ] &&
+		! grep -q "$INDEX_ALIAS_NAME" "$sums" "$T/uploaded" &&
+		[ "$(sed -n 5p "$sums")" = "$(sha256_of "$ix")  $(index_name "$tag")" ] && [ "$(grep -c . "$sums")" = 5 ] &&
+		grep -qxF "$ix" "$T/uploaded"; then
+		ok "a candidate's document is uploaded once, under its versioned name, and no alias exists anywhere"
+	else
+		bad "candidate index assets (uploaded: $(tr '\n' ';' <"$T/uploaded"), sums: $(tr '\n' ';' <"$sums"))"
+	fi
+
+	# The kind comes from the tag: neither release takes the other's document.
+	fresh; mk_image "$W/img" "$W/tree"
+	mk_index "$W" '.schema = "k3sm-release-index/v1" | .context = "io.k3sm.release-index/v1"'
+	run_up "$W/tree" "$W/img/out/$(image_name "$tag")" "$W/idx/$(index_name "$tag")"
+	up_refuses "a release candidate given a document under the stable strings refuses" index-unverified
+	grep -q "schema is not k3sm-release-index-rc/v1" <<<"$out" || bad "the stable schema on a candidate is not named"
+
+	# A document valid for rc.1, carried under the name of rc.2.
+	tag=v0.3.1-rc.2
+	fresh; mk_image "$W/img" "$W/tree"
+	mk_index "$W" 'walk(if type == "string" then gsub("rc\\.2"; "rc.1") else . end)'
+	run_up "$W/tree" "$W/img/out/$(image_name "$tag")" "$W/idx/$(index_name "$tag")"
+	up_refuses "a valid rc.1 document at the rc.2 path refuses" index-unverified
+	grep -q "tag v0.3.1-rc.1 is not the requested v0.3.1-rc.2" <<<"$out" || bad "the replayed candidate is not named"
+	tag=v0.3.1-rc.1
+
+	# The fixed name, and the image it needs.
+	fresh; mk_image "$W/img" "$W/tree"; mk_index "$W"
+	mv "$W/idx/$(index_name "$tag")" "$W/idx/$INDEX_ALIAS_NAME"
+	run_up "$W/tree" "$W/img/out/$(image_name "$tag")" "$W/idx/$INDEX_ALIAS_NAME"
+	up_refuses "a candidate's document under the alias name refuses" index-name
+	fresh; mk_image "$W/img" "$W/tree"; mk_index "$W"
+	run_up "$W/tree" "" "$W/idx/$(index_name "$tag")"
+	up_refuses "a candidate's document without --disk-image refuses" index-needs-image
+
+	# A release candidate without a document still ships.
+	fresh; mk_image "$W/img" "$W/tree"
+	run_up "$W/tree" "$W/img/out/$(image_name "$tag")"
+	up_candidate_promoted "a release candidate with the image and no document is promoted with five assets" 5
+	fresh
+	run_up "$W/tree"
+	up_candidate_promoted "a release candidate with only the tarball is promoted with three assets" 3
+
+	# An alias on a candidate: refused before the draft and at promote.
+	# shellcheck disable=SC2329 # invoked by name through candidate_after_checks
+	plant_alias() {
+		cp "$W/tree.assets/$INDEX_DIR_NAME/$(index_name "$tag")" "$W/tree.assets/$INDEX_DIR_NAME/$INDEX_ALIAS_NAME"
+		printf '%s  %s\n' "$INDEX_SHA256" "$INDEX_ALIAS_NAME" >>"$W/tree.assets/$(checksums_name "$tag")"
+	}
+	# shellcheck disable=SC2329 # invoked by name through candidate_after_checks
+	plant_alias_file() { cp "$W/tree.assets/$INDEX_DIR_NAME/$(index_name "$tag")" "$W/tree.assets/$INDEX_DIR_NAME/$INDEX_ALIAS_NAME"; }
+	# shellcheck disable=SC2329 # invoked by name through candidate_after_checks
+	change_candidate_index() {
+		chmod u+w "$W/tree.assets/$INDEX_DIR_NAME/$(index_name "$tag")"
+		printf 'x' >>"$W/tree.assets/$INDEX_DIR_NAME/$(index_name "$tag")"
+	}
+	fresh; mk_image "$W/img" "$W/tree"; mk_index "$W"
+	candidate_after_checks plant_alias
+	up_refuses "a candidate's assets naming an index alias refuse before any gh call" checksums
+	fresh; mk_image "$W/img" "$W/tree"; mk_index "$W"
+	candidate_after_checks plant_alias_file
+	up_refuses "an index alias file beside a candidate's document refuses before any gh call" checksums
+	fresh; mk_image "$W/img" "$W/tree"; mk_index "$W"
+	candidate_after_checks change_candidate_index
+	up_refuses "a candidate's document changed after its checks refuses before upload" index-changed
+	unset -f plant_alias plant_alias_file change_candidate_index
+
+	candidate_draft_assets "$T/ixrc" "$tag" 1
+	rc=0
+	out="$( (PATH="$FPATH" FAKE_GH_UPLOADED="$T/uploaded" FAKE_GH_EDIT_OK=1 promote "$tag" "$repo" "$A3") 2>&1)" || rc=$?
+	if [ "$rc" -ne 0 ] && grep -q "REFUSE: index-rc-alias" <<<"$out" && ! grep -q "draft-unverified" <<<"$out" &&
+		grep -q '^gh release view' "$log" && ! grep -q '^gh release edit' "$log"; then
+		ok "a release candidate draft that carries the index alias is not promoted"
+	else
+		bad "promote of an rc with an alias (rc=$rc, log: $(tr '\n' ';' <"$log"))"; printf '%s\n' "$out" | sed 's/^/       /'
+	fi
+	candidate_draft_assets "$T/ixrc-noalias" "$tag" 0
+	rc=0
+	out="$( (PATH="$FPATH" FAKE_GH_UPLOADED="$T/uploaded" FAKE_GH_EDIT_OK=1 promote "$tag" "$repo" "$A3") 2>&1)" || rc=$?
+	if [ "$rc" -eq 0 ] && grep -qx -- "gh release edit $tag --repo $repo --draft=false --latest=false" "$log"; then
+		ok "control: a release candidate draft with its document and no alias is promoted"
+	else
+		bad "promote of an rc with its document (rc=$rc, log: $(tr '\n' ';' <"$log"))"; printf '%s\n' "$out" | sed 's/^/       /'
+	fi
+	candidate_draft_assets "$T/ixrc-early" v0.2.9-rc.1 0
+	rc=0
+	out="$( (PATH="$FPATH" FAKE_GH_UPLOADED="$T/uploaded" FAKE_GH_EDIT_OK=1 promote v0.2.9-rc.1 "$repo" "$A3") 2>&1)" || rc=$?
+	if [ "$rc" -ne 0 ] && grep -q "REFUSE: index-early" <<<"$out" && ! grep -q '^gh release edit' "$log"; then
+		ok "a release candidate draft below v0.3.0 that carries a document is not promoted"
+	else
+		bad "promote of an early rc with a document (rc=$rc, log: $(tr '\n' ';' <"$log"))"; printf '%s\n' "$out" | sed 's/^/       /'
+	fi
+
+	# The draft read-back: the document missing, and an alias that appeared.
+	fresh; mk_image "$W/img" "$W/tree"; mk_index "$W"
+	view_jq=".assets |= map(select(.name != \"$(index_name "$tag")\"))" run_up "$W/tree" "$W/img/out/$(image_name "$tag")" "$W/idx/$(index_name "$tag")"
+	if [ "$rc" -ne 0 ] && grep -q "REFUSE: draft-unverified" <<<"$out" && ! grep -q '^gh release edit' "$log"; then
+		ok "a candidate's document missing from the draft read-back refuses before promote"
+	else
+		bad "candidate document missing from the read-back (rc=$rc, log: $(tr '\n' ';' <"$log"))"; printf '%s\n' "$out" | sed 's/^/       /'
+	fi
+	fresh; mk_image "$W/img" "$W/tree"; mk_index "$W"
+	view_jq=".assets += [.assets[0] | .name = \"$INDEX_ALIAS_NAME\"]" run_up "$W/tree" "$W/img/out/$(image_name "$tag")" "$W/idx/$(index_name "$tag")"
+	if [ "$rc" -ne 0 ] && grep -q "REFUSE: draft-unverified" <<<"$out" && grep -q "$INDEX_ALIAS_NAME" <<<"$out" &&
+		! grep -q '^gh release edit' "$log"; then
+		ok "an index alias that appears in a candidate's draft read-back refuses before promote"
+	else
+		bad "alias in a candidate's read-back (rc=$rc, log: $(tr '\n' ';' <"$log"))"; printf '%s\n' "$out" | sed 's/^/       /'
+	fi
+
+	# Below v0.3.0 the candidate takes its final's place.
+	tag=v0.2.9-rc.1
+	fresh; mk_image "$W/img" "$W/tree"; mk_index "$W"
+	run_up "$W/tree" "$W/img/out/$(image_name "$tag")" "$W/idx/$(index_name "$tag")"
+	up_refuses "a release candidate below v0.3.0 given its document is refused before any gh call" index-early
+	: >"$log"
 }
 
 # index_cases: the release index cases, run by --self-test and alone by
-# --self-test-index. They read the caller's fixtures as the helpers above do,
-# and rctag, a release candidate tag.
+# --self-test-index. They read the caller's fixtures as the helpers above do.
 index_cases() {
-	local ix xd sums A3 x n2
+	local ix xd sums
 	echo "the release index"
 
 	fresh; mk_image "$W/img" "$W/tree"; mk_index "$W"
@@ -1339,48 +1545,14 @@ index_cases() {
 		bad "final draft without the index (rc=$rc, log: $(tr '\n' ';' <"$log"))"; printf '%s\n' "$out" | sed 's/^/       /'
 	fi
 
-	# A release candidate never carries an index: refused before any check, by
-	# the index's own checks, by upload, and at promote.
-	rc=0; out="$( (require_index_for_final "$rctag" "$T/x.p7m") 2>&1)" || rc=$?
-	if [ "$rc" -eq 2 ] && grep -q "REFUSE: index-rc" <<<"$out"; then ok "a release candidate given --release-index refuses"; else
-		bad "rc with index (rc=$rc: $out)"; fi
-	rc=0; out="$( (require_index_for_final "$rctag" "") 2>&1)" || rc=$?
-	if [ "$rc" -eq 0 ]; then ok "control: a release candidate without --release-index passes the requirement"; else bad "rc without index (rc=$rc: $out)"; fi
-	fresh; mk_image "$W/img" "$W/tree"; mk_index "$W"
-	: >"$log"; rc=0
-	out="$( (PATH="$FPATH" add_release_index "$W/idx/$(index_name "$tag")" "$rctag" "$W/tree.assets" "$W/tree/PAYLOAD-SHA256" \
-		"$(printf 'a%.0s' $(seq 64))" "$(seal_value "$W/tree.seal" tarball_sha256)") 2>&1)" || rc=$?
-	if [ "$rc" -ne 0 ] && grep -q "REFUSE: index-rc" <<<"$out" && [ ! -s "$log" ] && [ ! -e "$W/tree.assets/$INDEX_DIR_NAME" ]; then
-		ok "the index's own checks refuse a release candidate before copying it"
-	else
-		bad "add_release_index on an rc (rc=$rc, log: $(tr '\n' ';' <"$log"))"; printf '%s\n' "$out" | sed 's/^/       /'
-	fi
-	# An rc assets directory that carries an index next to its sealed assets.
-	x="$T/ixrc"; mk_payload "$x/tree"
-	(PATH="$FPATH" package_assets "$x/tree" "$rctag" "$x/tree.assets") >/dev/null 2>&1
-	A3="$x/tree.assets"
-	mkdir -m 700 "$A3/$INDEX_DIR_NAME"
-	printf 'FIXTURE-CMS\n{}\n' >"$A3/$INDEX_DIR_NAME/$(index_name "$rctag")"
-	cp "$A3/$INDEX_DIR_NAME/$(index_name "$rctag")" "$A3/$INDEX_DIR_NAME/$INDEX_ALIAS_NAME"
-	(cd "$A3/$INDEX_DIR_NAME" && shasum -a 256 "$(index_name "$rctag")" "$INDEX_ALIAS_NAME") >>"$A3/$(checksums_name "$rctag")"
-	: >"$log"; rc=0
-	out="$( (PATH="$FPATH" FAKE_GH_CREATE_OK=1 FAKE_GH_EDIT_OK=1 upload "$rctag" "$repo" "$T/notes.md" "$A3" "$x/tree" \
-		"$(sha256_of "$A3/$(asset_base "$rctag").tar.gz")" "$(printf 'a%.0s' $(seq 64))" "$(sha256_of "$A3/$INDEX_DIR_NAME/$INDEX_ALIAS_NAME")") 2>&1)" || rc=$?
-	if [ "$rc" -ne 0 ] && grep -q "REFUSE: index-rc" <<<"$out" && ! grep -q '^gh ' "$log"; then
-		ok "upload refuses a release candidate with an index before any gh call"
-	else
-		bad "upload of an rc with an index (rc=$rc, log: $(tr '\n' ';' <"$log"))"; printf '%s\n' "$out" | sed 's/^/       /'
-	fi
-	: >"$log"; rm -f "$T/uploaded"
-	while IFS= read -r n2; do asset_path "$A3" "$rctag" "$n2"; echo; done < <(expected_assets "$rctag" "$A3") >"$T/uploaded"
-	rc=0
-	out="$( (PATH="$FPATH" FAKE_GH_UPLOADED="$T/uploaded" FAKE_GH_EDIT_OK=1 promote "$rctag" "$repo" "$A3") 2>&1)" || rc=$?
-	if [ "$rc" -ne 0 ] && grep -q "REFUSE: index-rc" <<<"$out" && ! grep -q "draft-unverified" <<<"$out" &&
-		grep -q '^gh release view' "$log" && ! grep -q '^gh release edit' "$log"; then
-		ok "a release candidate draft that carries an index is not promoted"
-	else
-		bad "promote of an rc with an index (rc=$rc, log: $(tr '\n' ';' <"$log"))"; printf '%s\n' "$out" | sed 's/^/       /'
-	fi
+	# A final release never takes a candidate's document.
+	fresh; mk_image "$W/img" "$W/tree"
+	mk_index "$W" '.schema = "k3sm-release-index-rc/v1" | .context = "io.k3sm.release-index-rc/v1"'
+	run_up "$W/tree" "$W/img/out/$(image_name "$tag")" "$W/idx/$(index_name "$tag")"
+	up_refuses "a final release given a document under the candidate strings refuses" index-unverified
+	grep -q "schema is not k3sm-release-index/v1" <<<"$out" || bad "the candidate schema on a final release is not named"
+
+	candidate_index_cases
 
 	# The size bound: 1 byte to INDEX_MAX_BYTES, checked before any extraction.
 	fresh; mk_image "$W/img" "$W/tree"; mk_index "$W"
@@ -1495,7 +1667,7 @@ index_cases() {
 
 # self_test_index: the release index cases alone, on their own fixtures.
 self_test_index() {
-	local fails=0 passes=0 T log out rc tag=v0.3.0 rctag=v0.3.1-rc.1 repo=example/k3sm TEAM=ABCDE12345
+	local fails=0 passes=0 T log out rc tag=v0.3.0 repo=example/k3sm TEAM=ABCDE12345
 	T="$(mktemp -d)"
 	SELFTEST_TMP="$T"
 	trap 'rm -rf "$SELFTEST_TMP"' EXIT
