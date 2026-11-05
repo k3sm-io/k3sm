@@ -498,7 +498,7 @@ func (r updateRecorder) run(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			r.logCheck(err)
+			r.logCheck(err, watch.unread)
 			watch.checked(rep, err)
 			rec := rep.Record(err)
 			rec.Roll = roll
@@ -802,21 +802,14 @@ func runUpdateApply(ctx context.Context, args []string, env updateEnv) int {
 			updatesv1alpha1.UpdateName, status.ClipText(existing.Spec.Version, 128), updatePhase(existing))
 		return exitInternalError
 	}
-	// Apply reads the object itself and not the published pair, whatever role
-	// this Mac has: only a credential that may roll the cluster gets here, and
-	// the target is computed on the channel as it stands now.
-	reading, channelErr := channelSource{dyn: dyn, kube: cs}.read(ctx)
-	if reading.note != "" {
-		fmt.Fprintln(env.errOut, "k3sm update apply:", reading.note)
-	}
+	// Apply reads only the object, whatever role this Mac has: the target is
+	// computed on the channel as it stands now, never chosen by what a Node
+	// publishes, and --yes means nobody may see the plan before the roll starts.
+	reading, channelErr := channelSource{dyn: dyn, objectOnly: true}.read(ctx)
 	target := *tag
 	if target == "" {
 		if channelErr != nil {
 			fmt.Fprintf(env.errOut, "k3sm update apply: %v; name a release with --version\n", channelErr)
-			return exitInternalError
-		}
-		if reading.degraded {
-			fmt.Fprintln(env.errOut, "k3sm update apply: refusing to choose a release on a channel that could not be read; name one with --version")
 			return exitInternalError
 		}
 		in := env.inputs

@@ -311,7 +311,7 @@ func TestUpdateCheckReadsTheChannelFromItsSource(t *testing.T) {
 		})
 		src := channelSource{dyn: c.dyn, kube: c.cs, pairOnly: true}
 		got, err := src.read(context.Background())
-		if err != nil || got.channel != stable || !got.degraded || !strings.Contains(got.note, "the server's channel could not be read") {
+		if err != nil || got.channel != stable || !strings.Contains(got.note, "the server's channel could not be read") {
 			t.Errorf("reading = %+v, err %v", got, err)
 		}
 	})
@@ -568,6 +568,42 @@ func TestUpdateCheckReadsTheChannelFromItsSource(t *testing.T) {
 				t.Errorf("%d Warn lines, want 1:\n%s", got, sink.String())
 			}
 		})
+		t.Run("a check that keeps failing on the channel, once per spell", func(t *testing.T) {
+			const msg = "could not check for a k3sm update"
+			var failing atomic.Bool
+			failing.Store(true)
+			sink := &syncBuffer{}
+			wd := installedWorkDir(t)
+			// Every poll reads the channel, so every poll forces a check.
+			run := start(t, stable, wd, sink, func() error {
+				if failing.Load() {
+					return fmt.Errorf("%w: etcd away", errChannelUnreadable)
+				}
+				return nil
+			})
+			waitFor(t, "repeated checks", func() bool { return run.checks.Load() >= 5 })
+			if got := warns(sink, msg); got != 1 {
+				t.Errorf("%d Warn lines over %d checks, want 1:\n%s", got, run.checks.Load(), sink.String())
+			}
+
+			// A check that reads the channel ends the spell.
+			failing.Store(false)
+			waitFor(t, "the good check", func() bool { return readUpdateRecord(wd).Error == "" && readUpdateRecord(wd).Latest != "" })
+			settle(t, run, 5)
+			at := run.checks.Load()
+			settle(t, run, 5)
+			if got := run.checks.Load(); got != at {
+				t.Errorf("%d more checks after the spell ended", got-at)
+			}
+
+			// The next failure is a new spell, forced here by a channel change.
+			failing.Store(true)
+			run.channel.Store(rc)
+			waitFor(t, "repeated checks", func() bool { return run.checks.Load() >= at+5 })
+			if got := warns(sink, msg); got != 2 {
+				t.Errorf("%d Warn lines after a second spell, want 2:\n%s", got, sink.String())
+			}
+		})
 		t.Run("a failed listing", func(t *testing.T) {
 			for _, sentinel := range []error{update.ErrChannelList, update.ErrChannelPageCap, update.ErrNoChannelRelease} {
 				sink := &syncBuffer{}
@@ -597,6 +633,12 @@ func TestUpdateCheckReadsTheChannelFromItsSource(t *testing.T) {
 		got, err := r.readChannel(context.Background())
 		if err != nil || got.channel != rc {
 			t.Fatalf("poll read %+v, %v", got, err)
+		}
+		pair := newUpdateCluster(publishingServer("studio", "v0.3.0-rc.2", "rc"))
+		pair.policyAnswers(forbidden)
+		r = newUpdateRecorder(t.TempDir(), "studio", fakeIndexURL, pair.cs, pair.dyn, slog.New(slog.DiscardHandler))
+		if got, err := r.readChannel(context.Background()); err != nil || got.channel != rc {
+			t.Errorf("a Forbidden poll read %+v, %v; the recorder keeps the pair", got, err)
 		}
 		c = newUpdateCluster()
 		c.setPolicy(t, "beta")
@@ -740,6 +782,30 @@ func TestUpdateCheckReadsTheChannelFromItsSource(t *testing.T) {
 					t.Errorf("plan does not say the channel was not read:\n%s", out)
 				}
 			})
+		}
+	})
+
+	t.Run("apply never lets the pair choose a release", func(t *testing.T) {
+		c := newUpdateCluster(publishingServer("studio", "v0.3.0-rc.2", "rc"))
+		c.policyAnswers(forbidden)
+		x := &channelIndex{stable: "v0.2.3", listed: []string{"v0.3.0-rc.2"}}
+		code, _, errOut := applyOn(t, c, x, nil)
+		if code != exitInternalError || !strings.Contains(errOut, errChannelUnreadable.Error()) || !strings.Contains(errOut, "--version") {
+			t.Fatalf("exit %d, stderr %q", code, errOut)
+		}
+		if u, _ := getUpdate(context.Background(), c.dyn); u != nil {
+			t.Errorf("the pair chose a roll: %+v", u)
+		}
+		if x.redirects.Load()+x.lists.Load() != 0 {
+			t.Error("resolved a release on a channel it may not read")
+		}
+		code, out, errOut := applyOn(t, c, x, nil, "--version", "v0.2.3")
+		if code != 0 {
+			t.Fatalf("--version: exit %d, stderr %q", code, errOut)
+		}
+		hasLine(t, out, "channel           could not be read\n")
+		if got := c.get(t).Spec.Version; got != "v0.2.3" {
+			t.Errorf("spec.version = %q", got)
 		}
 	})
 

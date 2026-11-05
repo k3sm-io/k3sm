@@ -53,9 +53,6 @@ type channelReading struct {
 	// note says why this reader runs as stable when it does so on anything but
 	// the cluster's plain answer; empty otherwise.
 	note string
-	// degraded is whether channel is a guess because the setting could not be
-	// read: fine for a report, not for choosing a release to roll to.
-	degraded bool
 }
 
 // channelSource reads the release channel with the credentials a check already
@@ -69,6 +66,10 @@ type channelSource struct {
 	kube kubernetes.Interface
 	// pairOnly reads only the pair, as a worker does.
 	pairOnly bool
+	// objectOnly never falls back to the pair: a Forbidden object is unreadable.
+	// Apply sets it, because the pair is display and offer data and must not
+	// choose a release to roll a cluster to.
+	objectOnly bool
 }
 
 // read is the channel. Everything but an unreadable or unknown object, which is
@@ -87,7 +88,7 @@ func (s channelSource) read(ctx context.Context) (channelReading, error) {
 	switch {
 	case apierrors.IsNotFound(err):
 		return channelReading{channel: updatesv1alpha1.UpdateChannelStable}, nil
-	case apierrors.IsForbidden(err):
+	case apierrors.IsForbidden(err) && !s.objectOnly:
 		return s.readPair(ctx), nil
 	case err != nil:
 		return channelReading{}, fmt.Errorf("%w: %w", errChannelUnreadable, err)
@@ -112,9 +113,8 @@ func (s channelSource) read(ctx context.Context) (channelReading, error) {
 func (s channelSource) readPair(ctx context.Context) channelReading {
 	cannot := func(why string) channelReading {
 		return channelReading{
-			channel:  updatesv1alpha1.UpdateChannelStable,
-			note:     "the server's channel could not be read (" + status.ClipText(why, 256) + "); checking as stable",
-			degraded: true,
+			channel: updatesv1alpha1.UpdateChannelStable,
+			note:    "the server's channel could not be read (" + status.ClipText(why, 256) + "); checking as stable",
 		}
 	}
 	if s.kube == nil {
@@ -216,9 +216,16 @@ func (r updateRecorder) pollChannel(ctx context.Context, w *channelWatch) bool {
 // logCheck logs a failed check: at Warn when the channel is why, because a quiet
 // edit or a broken listing would otherwise go unseen outside the row, and at Info
 // when it is the ordinary case of a Mac with no route to the release host.
-func (r updateRecorder) logCheck(err error) {
+//
+// A poll that can read the channel forces a check after one that could not, so a
+// check whose own read keeps failing repeats on every poll. unread says the last
+// check already failed that way: this spell has had its Warn, and it takes a check
+// that reads the channel to start another.
+func (r updateRecorder) logCheck(err error, unread bool) {
 	switch {
 	case err == nil:
+	case unread && errors.Is(err, errChannelUnreadable):
+		r.logger.Debug("could not check for a k3sm update", "err", err)
 	case errors.Is(err, errChannelUnreadable), errors.Is(err, update.ErrChannelList),
 		errors.Is(err, update.ErrChannelPageCap), errors.Is(err, update.ErrNoChannelRelease):
 		r.logger.Warn("could not check for a k3sm update", "err", err)
@@ -229,11 +236,8 @@ func (r updateRecorder) logCheck(err error) {
 
 // planChannel is the plan's channel line.
 func planChannel(reading channelReading, err error) string {
-	switch {
-	case err != nil:
+	if err != nil {
 		return "could not be read"
-	case reading.degraded:
-		return string(reading.channel) + " (the server's channel could not be read)"
 	}
 	return string(reading.channel)
 }
