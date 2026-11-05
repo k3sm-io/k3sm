@@ -83,7 +83,7 @@ func TestTeardownUnknownRetentionCoversEveryNonENOENTError(t *testing.T) {
 			f := &fakeSystem{}
 			f.podLeaders = map[int]int64{stale: 1, live: 2}
 			f.life.vmhosts = []VMHostRecord{
-				{Schema: 1, PodID: "stale-pod", Pgid: stale, StartUnixNano: 1},
+				{Schema: 1, PodID: "stale-pod", Pgid: stale, StartUnixNano: 1, RunDir: "/run/stale-pod"},
 				{Schema: 1, PodID: "live-pod", Pgid: live, StartUnixNano: 2},
 			}
 			f.life.procs = map[int]fakeProc{
@@ -134,7 +134,7 @@ func TestTeardownUnknownRetentionCoversEveryNonENOENTError(t *testing.T) {
 				tc.text,
 				fmt.Sprintf("check that %q and each of its parents are owned by root and not writable by group or others", versions+"/0.2.8"),
 				"an I/O error means the disk needs checking",
-				fmt.Sprintf("if ps -o pid,command -g %d shows only %q processes, stop it with: sudo kill -TERM -%d", stale, staleExe, stale),
+				fmt.Sprintf("if ps -ww -o pid,command -g %d shows only %s processes whose command line carries %q (pod stale-pod's own -log-file argument), stop it with: sudo kill -TERM -%d", stale, staleExe, "/run/stale-pod/vmhost.log", stale),
 			} {
 				if !strings.Contains(msg, want) {
 					t.Errorf("stopVMHelpers = %q, want it to name %q", msg, want)
