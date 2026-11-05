@@ -24,6 +24,8 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+
+	"k3sm.io/k3sm/pkg/updater/layout"
 )
 
 // TestTeardownKeepsAHelperWhosePathSpellsTheVersionInOtherCase pins the
@@ -57,6 +59,56 @@ func TestTeardownKeepsAHelperWhosePathSpellsTheVersionInOtherCase(t *testing.T) 
 	}
 	if strings.Contains(logs.String(), "no longer retains") {
 		t.Errorf("the helper was logged as unretained:\n%s", logs.String())
+	}
+}
+
+// TestRetainedVersionFoldsTheLinksSpelling pins each link's own source of a
+// retained spelling: with no pod path, only the link that points at the
+// differently cased directory can keep the helper's version.
+func TestRetainedVersionFoldsTheLinksSpelling(t *testing.T) {
+	const helperVer = "0.3.0-RC1"
+	for _, tc := range []struct {
+		name  string
+		links map[string]string
+		want  bool
+	}{
+		{
+			name: "current names the directory's spelling",
+			links: map[string]string{
+				DefaultInstallDir + "/current":  "versions/0.3.0-rc1",
+				DefaultInstallDir + "/previous": "versions/0.2.9",
+			},
+			want: true,
+		},
+		{
+			name: "previous names the directory's spelling",
+			links: map[string]string{
+				DefaultInstallDir + "/current":  "versions/0.3.0",
+				DefaultInstallDir + "/previous": "versions/0.3.0-rc1",
+			},
+			want: true,
+		},
+		{
+			name: "neither link names it",
+			links: map[string]string{
+				DefaultInstallDir + "/current":  "versions/0.3.0",
+				DefaultInstallDir + "/previous": "versions/0.2.9",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeSystem{}
+			f.purge.links = tc.links
+			f.owners = versionDirs("0.3.0-rc1", "0.2.9", "0.3.0")
+
+			got, err := retainedVersion(f, layout.New(DefaultInstallDir), helperVer, nil)
+			if err != nil {
+				t.Fatalf("retainedVersion = %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("retainedVersion = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 

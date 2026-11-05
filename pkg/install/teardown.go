@@ -669,7 +669,8 @@ func retainedVersion(sys System, tree layout.Layout, ver string, podPaths []stri
 	}
 	// The helper's path may spell ver in another case than the directory the
 	// tree keeps (the default volume is case-insensitive); the retention rule
-	// compares names exactly, so ask it under each spelling the tree holds.
+	// compares names exactly, so ask it under each spelling the tree holds. This
+	// assumes that volume: on a case-sensitive one the fold can only keep more.
 	spellings := append([]string{ver, r.Current, r.Previous, r.Staged}, r.InUse...)
 	for _, name := range spellings {
 		if strings.EqualFold(name, ver) && len(r.Reasons(name)) > 0 {
