@@ -650,6 +650,7 @@ func TestNewServerRefusesAHalfWiredConfig(t *testing.T) {
 		{name: "no access", cfg: api.Config{}},
 		{name: "an authorizer", a: a, cfg: api.Config{Authorize: api.AllowAll}},
 		{name: "a connection hook", a: a, cfg: api.Config{ConnClosed: func(string) {}}},
+		{name: "a principal hook", a: a, cfg: api.Config{Principal: func(*http.Request) string { return "" }}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -657,5 +658,61 @@ func TestNewServerRefusesAHalfWiredConfig(t *testing.T) {
 				t.Fatalf("NewServer = %v, %v; want a refusal", srv, err)
 			}
 		})
+	}
+}
+
+// TestSessionShare pins the principals' shares of the upload sessions: the
+// push gate relays writes from every cluster identity RBAC lets push, so a
+// server built by NewServer keeps it from taking the slots the local CLI
+// needs, and the reverse. Refused past either the share or the total, a slot
+// given back is usable again, and looking up a principal spends no failure
+// token.
+func TestSessionShare(t *testing.T) {
+	st, err := store.OpenWorkDir(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := newAccess(t, func(c *Config) { c.Burst = 1 })
+	srv, err := NewServer(a, api.Config{Store: st, GCGrace: time.Hour, MaxSessions: 8, FreeSpace: func() (uint64, error) { return 1 << 40, nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := &registry{srv: srv}
+	const start = "/v2/app/blobs/uploads/"
+	var gateSessions []string
+	for range 6 {
+		w := g.do(asGate, http.MethodPost, start, nil)
+		g.must(t, w, http.StatusAccepted)
+		gateSessions = append(gateSessions, w.Header().Get("Location"))
+	}
+	g.must(t, g.do(asGate, http.MethodPost, start, nil), http.StatusServiceUnavailable)
+	// The gate's share spent, the CLI still has what the gate may not take.
+	for range 2 {
+		g.must(t, g.do(asPush, http.MethodPost, start, nil), http.StatusAccepted)
+	}
+	g.must(t, g.do(asPush, http.MethodPost, start, nil), http.StatusServiceUnavailable)
+	g.must(t, g.do(anonymous, http.MethodPost, start, nil), http.StatusUnauthorized)
+	// A cancelled session gives its slot back to the principal that held it.
+	g.must(t, g.do(asPush, http.MethodDelete, gateSessions[0], nil), http.StatusNoContent)
+	g.must(t, g.do(asGate, http.MethodPost, start, nil), http.StatusAccepted)
+
+	bad := httptest.NewRequest(http.MethodGet, "/v2/", nil)
+	bad.RemoteAddr = "127.0.0.1:1"
+	bad.Header.Set("Authorization", wrong.auth)
+	for range 3 {
+		if got := a.Principal(bad); got != "" {
+			t.Fatalf("Principal of a wrong secret = %q", got)
+		}
+	}
+	if err := a.Authorize(bad, api.VerbRead, ref.Name{}); !errors.Is(err, api.ErrUnauthenticated) {
+		t.Fatalf("Authorize after Principal lookups = %v; the lookups spent the bucket", err)
+	}
+	good := httptest.NewRequest(http.MethodGet, "/v2/", nil)
+	good.Header.Set("Authorization", asGate.auth)
+	if got := a.Principal(good); got != UserGate {
+		t.Fatalf("Principal of the gate's secret = %q", got)
+	}
+	if got := a.Principal(httptest.NewRequest(http.MethodGet, "/v2/", nil)); got != "" {
+		t.Fatalf("Principal of no credential = %q", got)
 	}
 }

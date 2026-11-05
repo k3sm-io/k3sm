@@ -54,7 +54,8 @@ limitations under the License.
 //   - a DELETE with If-Match is conditional on the repository's index state
 //     (store.IndexState of its rows, as a quoted entity tag), compared under
 //     the repository lock; a state that no longer holds is 412 and deletes
-//     nothing. The registry this replaces ignores If-Match;
+//     nothing, and so is a conditional DELETE by digest of a digest any row
+//     tags. The registry this replaces ignores If-Match;
 //   - blobs are never deleted through the API; garbage collection removes
 //     them.
 //
@@ -87,20 +88,34 @@ limitations under the License.
 //
 //   - at most MaxSessions upload sessions in use at once (503 beyond); only a
 //     session the server created or the store confirmed counts, so an id a
-//     client makes up takes no slot. There is no per-principal cap: one
-//     client may use every slot;
+//     client makes up takes no slot. Where Config.Principal is set, one
+//     principal holds at most MaxSessionsPerPrincipal of them, three quarters
+//     by default, so the push gate's relayed writers cannot shut out the local
+//     CLI, or the reverse. A session the server finds on disk rather than
+//     creates has no owner and counts only against the total. The principals
+//     are not told apart further: writers behind the gate share its share;
 //   - an upload session holds at most MaxUploadSize bytes: a known length over
 //     it is refused before a write, and a chunk of unknown length that would
 //     pass it is refused with 413 and cut back, so no byte past the cap stays;
 //   - an upload is refused with 507 when the store volume would keep less than
-//     MinFreeSpace free, checked against a known length before the first write
-//     and again every 64 MiB while a body streams;
-//   - a request body must bring BodyMinBytes in every BodyWindow, may not go
-//     BodyIdle without a byte, and may not run past UploadTimeout (408);
+//     MinFreeSpace free. Bodies in flight are counted together: each reserves
+//     its known length, or 64 MiB at a time, and gives bytes back as the store
+//     writes them, so N sessions cannot undershoot the floor by N times 64 MiB.
+//     Free space itself is read again every 64 MiB. The reservation covers
+//     upload bodies only, this server's only, and is as current as statfs;
+//   - a request body must bring BodyMinBytes in each BodyWindow, may not go
+//     BodyIdle without a byte, and may not run past UploadTimeout (408). The
+//     first window opens at the first read, after any wait for the session's
+//     lock. The windows are consecutive, so a body that has its BodyMinBytes
+//     may then stay silent for up to BodyIdle (progressBody);
 //   - a header read timeout of 30 s, and a write deadline set per request
 //     (ResponseTimeout, plus UploadTimeout for a request with a body, plus a
 //     blob's size at MinWriteRate for a blob GET) instead of a server-wide
-//     write timeout, so a large blob GET is not cut;
+//     write timeout, so a large blob GET is not cut while it moves. A blob GET
+//     larger than a ResponseTimeout at MinWriteRate must deliver that much in
+//     each ResponseTimeout, so a reader that stalls gives back its descriptor
+//     within ResponseTimeout rather than after the whole size's time; there is
+//     no cap on concurrent GETs beyond MaxConns;
 //   - HTTPServer serves at most MaxConns connections at once and closes one
 //     past that before a request is read; it reports each connection's end
 //     (closed or hijacked) to ConnClosed, so an Authorizer that keys state on
@@ -124,4 +139,8 @@ limitations under the License.
 // Access decisions belong to the Authorizer the caller supplies, which New
 // requires (AllowAll is the explicit open registry); the package classifies
 // each request as a read, a write or a delete (an upload cancel is a delete).
+// The catalog asks it once per repository it visits, and the hook has no list
+// form on purpose: the visit budget and ceiling already bound the calls, and
+// the access model the registry runs with decides by verb and principal, at
+// the cost of one hash and one compare per visit.
 package api

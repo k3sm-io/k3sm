@@ -25,6 +25,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -377,6 +378,9 @@ func (s *Server) blobsPresent(n ref.Name, needs []digest.Digest) error {
 // still names.
 var errNamedByIndex = errorf(http.StatusMethodNotAllowed, codeDenied, "the manifest is named by an index in the repository")
 
+// errTaggedDigest is a conditional digest DELETE of a digest a row tags.
+var errTaggedDigest = errorf(http.StatusPreconditionFailed, codeDenied, "the digest is tagged; delete the tag")
+
 // errPreconditionFailed is a DELETE whose If-Match names no state the
 // repository is in.
 var errPreconditionFailed = errorf(http.StatusPreconditionFailed, codeDenied, "the repository changed since the state the request names")
@@ -391,6 +395,13 @@ var errPreconditionFailed = errorf(http.StatusPreconditionFailed, codeDenied, "t
 // nothing. A request without If-Match is unconditional. Presence is any
 // If-Match field line, so a request whose If-Match lines are empty or hold no
 // well-formed tag is a 412, never unconditional (RFC 9110 section 13.1.1).
+//
+// A conditional DELETE by digest also refuses, with 412, a digest any row
+// tags, whatever state it names: the caller is removing what it believes is an
+// untagged manifest, and an entity tag read after the tag landed would not say
+// otherwise. Only a DELETE naming the tag removes a tagged row conditionally.
+// An unconditional DELETE by digest removes every row of the digest, as the
+// registry this replaces does.
 func (s *Server) deleteManifest(w http.ResponseWriter, r *http.Request, n ref.Name) {
 	if !s.allow(w, r, VerbDelete, n) {
 		return
@@ -422,6 +433,9 @@ func (s *Server) deleteManifest(w http.ResponseWriter, r *http.Request, n ref.Na
 			if err := precondition(rows); err != nil {
 				return err
 			}
+			if conditional && digestTagged(rows, rf.Digest) {
+				return errTaggedDigest
+			}
 			return s.notNamedByIndex(n, rows, rf.Digest)
 		})
 	}
@@ -431,6 +445,13 @@ func (s *Server) deleteManifest(w http.ResponseWriter, r *http.Request, n ref.Na
 	}
 	s.log.Info("registry manifest deleted", "repository", n.String(), "reference", rf.String())
 	w.WriteHeader(http.StatusAccepted)
+}
+
+// digestTagged reports whether a row of rows tags d.
+func digestTagged(rows []ispec.Descriptor, d digest.Digest) bool {
+	return slices.ContainsFunc(rows, func(r ispec.Descriptor) bool {
+		return r.Digest == d && r.Annotations[ispec.AnnotationRefName] != ""
+	})
 }
 
 // matchesEntityTag reports whether the If-Match field values match state:

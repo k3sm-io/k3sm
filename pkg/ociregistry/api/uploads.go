@@ -65,12 +65,13 @@ func (s *Server) getBlob(w http.ResponseWriter, r *http.Request, n ref.Name) {
 			return
 		}
 	}
-	s.setWriteDeadline(w, s.now().Add(s.writeWindow(fi.Size())))
+	end := s.now().Add(s.writeWindow(fi.Size()))
+	s.setWriteDeadline(w, end)
 	h := w.Header()
 	h.Set("Docker-Content-Digest", d.String())
 	h.Set("Content-Type", "application/octet-stream")
 	h.Set("ETag", `"`+d.String()+`"`)
-	http.ServeContent(w, r, "", time.Time{}, f)
+	http.ServeContent(s.floored(w, r, fi.Size(), end), r, "", time.Time{}, f)
 }
 
 // graceFresh reports whether an object last touched at mtime has more than
@@ -253,18 +254,45 @@ func (s *Server) mount(w http.ResponseWriter, r *http.Request, n ref.Name, mount
 // would become, shorter of space than MinFreeSpace.
 var errInsufficientSpace = errors.New("insufficient free space")
 
-// roomFor refuses an upload of need bytes (0 when the length is not known)
-// unless the store volume keeps MinFreeSpace free after it. The answer never
-// says how much space there is.
+// roomFor refuses an upload of need bytes (0 or less when the length is not
+// known) unless the store volume keeps MinFreeSpace free after it and after
+// what the bodies in flight have reserved. It reserves nothing: claim does,
+// when a body starts to arrive. The answer never says how much space there is.
 func (s *Server) roomFor(need int64) error {
+	s.spaceMu.Lock()
+	defer s.spaceMu.Unlock()
+	return s.roomLocked(max(need, 0))
+}
+
+// roomLocked is roomFor with spaceMu held.
+func (s *Server) roomLocked(need int64) error {
 	free, err := s.freeSpace()
 	if err != nil {
 		return fmt.Errorf("%w: %w", errInsufficientSpace, err)
 	}
-	if free < s.minFree || need > 0 && uint64(need) > free-s.minFree {
-		return fmt.Errorf("%w: %d bytes free, %d kept, %d asked", errInsufficientSpace, free, s.minFree, max(need, 0))
+	if free < s.minFree || uint64(s.spaceHeld+need) > free-s.minFree {
+		return fmt.Errorf("%w: %d bytes free, %d kept, %d held, %d asked", errInsufficientSpace, free, s.minFree, s.spaceHeld, need)
 	}
 	return nil
+}
+
+// claim reserves need bytes for a body in flight, refusing as roomFor does.
+// A claim of 0 only checks that what is already reserved still fits.
+func (s *Server) claim(need int64) error {
+	s.spaceMu.Lock()
+	defer s.spaceMu.Unlock()
+	if err := s.roomLocked(need); err != nil {
+		return err
+	}
+	s.spaceHeld += need
+	return nil
+}
+
+// unclaim gives back n reserved bytes.
+func (s *Server) unclaim(n int64) {
+	s.spaceMu.Lock()
+	s.spaceHeld -= n
+	s.spaceMu.Unlock()
 }
 
 // tooLarge refuses a body whose known length alone passes MaxUploadSize.
@@ -275,25 +303,70 @@ func (s *Server) tooLarge(r *http.Request) error {
 	return nil
 }
 
-// spaceReader re-checks free space every `every` bytes of a body, failing the
-// read with errInsufficientSpace once the volume falls under MinFreeSpace.
+// spaceReader holds a body's share of the store volume while it streams, so
+// that bodies in flight are checked in aggregate: free space alone says nothing
+// about bytes another body has yet to deliver. Its first read reserves a known
+// length whole, or every bytes of an unknown one, and takes the next every
+// bytes when that runs out; a known length is checked again each every bytes.
+// A read gives back what the read before it delivered, since the store has
+// written those bytes and statfs now counts them. The reservation starts at the
+// first read, so a request waiting for its session's lock holds none. The
+// caller calls done when the body is finished with. It is used by one goroutine.
 type spaceReader struct {
 	r     io.Reader
-	room  func(int64) error
+	s     *Server
 	every int64
-	since int64
+	// left is what a known length has yet to bring; negative when unknown.
+	left    int64
+	held    int64
+	since   int64
+	last    int64
+	started bool
 }
 
 func (sr *spaceReader) Read(p []byte) (int, error) {
+	if give := min(sr.last, sr.held); give > 0 {
+		sr.s.unclaim(give)
+		sr.held -= give
+	}
+	sr.last = 0
+	need, check := int64(0), false
+	switch {
+	case !sr.started:
+		sr.started = true
+		need, check = sr.left, true
+		if need < 0 {
+			need = sr.every
+		}
+	case sr.left == 0:
+		// The promised bytes are in; this read only finds the end.
+	case sr.held <= 0:
+		need, check = sr.every, true
+	case sr.since >= sr.every:
+		check = true
+	}
+	if check {
+		if err := sr.s.claim(need); err != nil {
+			return 0, err
+		}
+		sr.held += need
+		sr.since = 0
+	}
 	n, err := sr.r.Read(p)
 	sr.since += int64(n)
-	if sr.since >= sr.every {
-		sr.since = 0
-		if rerr := sr.room(0); rerr != nil {
-			return n, rerr
-		}
+	sr.last = int64(n)
+	if sr.left > 0 {
+		sr.left = max(sr.left-int64(n), 0)
 	}
 	return n, err
+}
+
+// done gives back whatever is still reserved.
+func (sr *spaceReader) done() {
+	if sr.held > 0 {
+		sr.s.unclaim(sr.held)
+	}
+	sr.held, sr.last = 0, 0
 }
 
 // newSession admits and creates a session, returning its id.
@@ -311,7 +384,11 @@ func (s *Server) newSession(r *http.Request, n ref.Name) (string, error) {
 // before the file exists, so the cap holds while the store creates it; it is
 // given back on every other way out, a panic included.
 func (s *Server) admitSession(r *http.Request, n ref.Name) (string, *session, func(), error) {
-	e, release, err := s.sessions.admit()
+	owner := ""
+	if s.principal != nil {
+		owner = s.principal(r)
+	}
+	e, release, err := s.sessions.admit(owner)
 	if err != nil {
 		return "", nil, nil, err
 	}
@@ -319,7 +396,7 @@ func (s *Server) admitSession(r *http.Request, n ref.Name) (string, *session, fu
 	defer func() {
 		if !bound {
 			release()
-			s.sessions.abandon()
+			s.sessions.abandon(e)
 		}
 	}()
 	if s.sessionAdmitted != nil {
@@ -430,13 +507,14 @@ func chunkOffset(r *http.Request) (int64, error) {
 // appendChunk appends the request body to session id at offset (-1: at its
 // end), hashing it as it streams when the session's hash is still known.
 // The caller holds e.
-// The session may not grow past MaxUploadSize, and free space is checked
-// again every 64 MiB of the body.
+// The session may not grow past MaxUploadSize, and the body holds its share of
+// the volume while it streams (spaceReader).
 func (s *Server) appendChunk(r *http.Request, w http.ResponseWriter, n ref.Name, id string, e *session, offset int64) (int64, error) {
 	if s.chunkAppending != nil {
 		s.chunkAppending()
 	}
-	body := &spaceReader{r: s.body(w, r), room: s.roomFor, every: s.spaceEvery}
+	body := &spaceReader{r: s.body(w, r), s: s, every: s.spaceEvery, left: r.ContentLength}
+	defer body.done()
 	tee := e.hash.writer()
 	newLen, err := s.st.AppendUploadLimit(r.Context(), n, id, offset, s.maxUpload, io.TeeReader(body, tee))
 	e.hash.settle(newLen, err)
@@ -463,6 +541,9 @@ func (s *Server) settle(key string, e *session, err error) {
 // commit finishes session id as blob d: with the streamed hash when it covers
 // the session and matches, else by hashing the file again. The caller holds e.
 func (s *Server) commit(r *http.Request, n ref.Name, id string, e *session, d digest.Digest) error {
+	if s.uploadCommitting != nil {
+		defer s.uploadCommitting()
+	}
 	if sum, size, ok := e.hash.sum(d.Algorithm()); ok && sum == d {
 		return s.st.CommitHashedUpload(r.Context(), n, id, d, size)
 	}
@@ -542,7 +623,16 @@ func (s *Server) finishUpload(w http.ResponseWriter, r *http.Request, n ref.Name
 	}
 	key := sessionKey(n, id)
 	e, release := s.sessions.acquire(key)
-	defer release()
+	// A commit that panics may have committed, and either way its entry
+	// would hold a slot until SessionIdle, so it leaves the table too. Losing
+	// the entry of a session that survived costs a re-hash at its commit.
+	committing := false
+	defer func() {
+		release()
+		if committing {
+			s.sessions.forget(key)
+		}
+	}()
 	if chunk {
 		_, err := s.appendChunk(r, w, n, id, e, offset)
 		s.settle(key, e, err)
@@ -551,7 +641,10 @@ func (s *Server) finishUpload(w http.ResponseWriter, r *http.Request, n ref.Name
 			return
 		}
 	}
-	if err := s.commit(r, n, id, e, d); err != nil {
+	committing = true
+	err = s.commit(r, n, id, e, d)
+	committing = false
+	if err != nil {
 		s.settle(key, e, err)
 		s.fail(w, r, err)
 		return

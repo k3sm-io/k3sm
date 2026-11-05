@@ -123,20 +123,29 @@ var errTooManySessions = errors.New("too many upload sessions")
 // or one the store has accepted an operation on. An entry acquire creates for
 // an id the server has not seen is unconfirmed until then, and the caller
 // drops it on a store error, so ids a client makes up cannot fill the table.
-// There is no per-principal cap: one client may use every slot.
+//
+// A session admitted for a named principal also counts against that
+// principal's share, so one principal cannot take the slots the others need.
+// An entry acquire creates has no owner (the id may predate this process) and
+// counts only against max.
 type sessions struct {
-	max  int
-	idle time.Duration
-	now  func() time.Time
+	max   int
+	share int
+	idle  time.Duration
+	now   func() time.Time
 
-	mu       sync.Mutex
-	m        map[string]*session
-	reserved int
+	mu         sync.Mutex
+	m          map[string]*session
+	reserved   int
+	reservedBy map[string]int
 }
 
 type session struct {
 	mu   sync.Mutex
 	hash hashState
+	// owner is the principal the session was admitted for, "" when none is
+	// known. It is set before the entry is shared and never changes.
+	owner string
 
 	// Guarded by sessions.mu.
 	busy      int
@@ -144,8 +153,8 @@ type session struct {
 	confirmed bool
 }
 
-func newSessions(max int, idle time.Duration, now func() time.Time) *sessions {
-	return &sessions{max: max, idle: idle, now: now, m: map[string]*session{}}
+func newSessions(max, share int, idle time.Duration, now func() time.Time) *sessions {
+	return &sessions{max: max, share: share, idle: idle, now: now, m: map[string]*session{}, reservedBy: map[string]int{}}
 }
 
 // prune drops entries idle longer than the idle bound. The caller holds mu.
@@ -170,19 +179,34 @@ func (t *sessions) inUse() int {
 	return n
 }
 
-// admit reserves a slot for a new session, refusing with errTooManySessions
-// when max sessions are in use or reserved. The entry is returned locked and
-// is not yet in the table; bind adds it under the session's key once the
-// session exists, abandon gives the slot back. release unlocks it.
-func (t *sessions) admit() (*session, func(), error) {
+// heldBy counts the entries and reserved slots of principal owner. The caller
+// holds mu.
+func (t *sessions) heldBy(owner string) int {
+	n := t.reservedBy[owner]
+	for _, e := range t.m {
+		if e.confirmed && e.owner == owner {
+			n++
+		}
+	}
+	return n
+}
+
+// admit reserves a slot for a new session of principal owner ("" when none is
+// known), refusing with errTooManySessions when max sessions are in use or
+// reserved, or when a named owner already holds its share. The entry is
+// returned locked and is not yet in the table; bind adds it under the
+// session's key once the session exists, abandon gives the slot back. release
+// unlocks it.
+func (t *sessions) admit(owner string) (*session, func(), error) {
 	t.mu.Lock()
 	t.prune()
-	if t.inUse() >= t.max {
+	if t.inUse() >= t.max || owner != "" && t.heldBy(owner) >= t.share {
 		t.mu.Unlock()
 		return nil, nil, errTooManySessions
 	}
 	t.reserved++
-	e := &session{hash: newHashState(), busy: 1, last: t.now(), confirmed: true}
+	t.reservedBy[owner]++
+	e := &session{hash: newHashState(), owner: owner, busy: 1, last: t.now(), confirmed: true}
 	t.mu.Unlock()
 	e.mu.Lock()
 	return e, t.releaser(e), nil
@@ -191,16 +215,24 @@ func (t *sessions) admit() (*session, func(), error) {
 // bind adds an admitted entry under key.
 func (t *sessions) bind(key string, e *session) {
 	t.mu.Lock()
-	t.reserved--
+	t.unreserve(e.owner)
 	t.m[key] = e
 	t.mu.Unlock()
 }
 
 // abandon gives back an admitted entry's slot.
-func (t *sessions) abandon() {
+func (t *sessions) abandon(e *session) {
 	t.mu.Lock()
-	t.reserved--
+	t.unreserve(e.owner)
 	t.mu.Unlock()
+}
+
+// unreserve drops one reserved slot of owner. The caller holds mu.
+func (t *sessions) unreserve(owner string) {
+	t.reserved--
+	if t.reservedBy[owner]--; t.reservedBy[owner] <= 0 {
+		delete(t.reservedBy, owner)
+	}
 }
 
 // acquire returns the entry for key locked; release unlocks it. A key the
