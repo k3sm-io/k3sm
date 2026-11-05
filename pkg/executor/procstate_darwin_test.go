@@ -47,6 +47,9 @@ func TestProcessExitedMonotoneAcrossReap(t *testing.T) {
 		for !processExited(pid) {
 			if time.Now().After(deadline) {
 				_ = cmd.Wait() // reap before failing; the verdict is the failure
+				if i == 0 {
+					t.Fatalf("child %d (pid %d): never reported exited", i, pid)
+				}
 				t.Skipf("child %d (pid %d): host too loaded to observe the exit in time", i, pid)
 			}
 			runtime.Gosched() // a barrier poll, not a budget: the deadline above is the only bound
