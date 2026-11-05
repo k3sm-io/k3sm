@@ -1000,12 +1000,29 @@ func statusRecordDirOf(cfg RuntimedConfig) (string, error) {
 	}
 	own := filepath.Join(runtimeRoot(cfg.Root), sandbox.StatusSubdir)
 	if dir != "" && withoutFirmlink(dir) == withoutFirmlink(own) {
+		warnStatusDirEscapes(cfg.Logger, own)
 		return own, nil
 	}
 	if err := checkStatusRecordDir(dir); err != nil {
 		return "", err
 	}
 	return dir, nil
+}
+
+// warnStatusDirEscapes logs once when the runtime's own status directory resolves
+// to a different place than its spelling, because the sandbox deny written from
+// the spelling does not follow the link. A resolution error (the directory does
+// not exist yet) logs nothing: the node still starts.
+func warnStatusDirEscapes(log *slog.Logger, own string) {
+	if log == nil {
+		return
+	}
+	resolved, err := filepath.EvalSymlinks(own)
+	if err != nil || withoutFirmlink(resolved) == withoutFirmlink(own) {
+		return
+	}
+	log.Warn("the status directory resolves elsewhere; the sandbox deny on it does not cover the real location",
+		"status_dir", own, "resolved", resolved)
 }
 
 // ErrDataRootNotCanonical reports a data root, or its server or agent directory,

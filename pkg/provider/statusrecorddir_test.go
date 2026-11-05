@@ -216,33 +216,46 @@ func TestStatusRecordDirCheckSkipsADefaultNode(t *testing.T) {
 	cases := []struct {
 		name string
 		// root returns the pod root for a data root of base.
-		root    func(base string) string
-		wantErr error
+		root     func(base string) string
+		wantErr  error
+		wantWarn bool
+		realDir  bool
 	}{
-		{"a default node starts", func(base string) string { return base }, nil},
-		{"a custom pod root is refused", func(base string) string { return filepath.Join(base, "pods-root") }, ErrStatusRecordDirNotCanonical},
+		{"a default node with a real status directory does not warn", func(base string) string { return base }, nil, false, true},
+		{"a default node starts", func(base string) string { return base }, nil, true, false},
+		{"a custom pod root is refused", func(base string) string { return filepath.Join(base, "pods-root") }, ErrStatusRecordDirNotCanonical, false, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			stageExecShim(t)
 			base := resolvedTempDir(t)
 			elsewhere := filepath.Join(base, "elsewhere")
-			if err := os.MkdirAll(elsewhere, 0o755); err != nil {
+			var err error
+			if err = os.MkdirAll(elsewhere, 0o755); err != nil {
 				t.Fatal(err)
 			}
 			statusDir := filepath.Join(base, "status")
-			if err := os.Symlink(elsewhere, statusDir); err != nil {
+			if tc.realDir {
+				err = os.Mkdir(statusDir, 0o755)
+			} else {
+				err = os.Symlink(elsewhere, statusDir)
+			}
+			if err != nil {
 				t.Fatal(err)
 			}
-			_, err := NewRuntimed(context.Background(), RuntimedConfig{
+			var logs bytes.Buffer
+			_, err = NewRuntimed(context.Background(), RuntimedConfig{
 				NodeName:        "n1",
 				Root:            tc.root(base),
 				PodLogsDir:      filepath.Join(base, "podlogs"),
 				StatusRecordDir: statusDir,
-				Logger:          slog.New(slog.DiscardHandler),
+				Logger:          slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn})),
 			})
 			if !errors.Is(err, tc.wantErr) || (tc.wantErr == nil && err != nil) {
 				t.Fatalf("NewRuntimed err = %v, want %v", err, tc.wantErr)
+			}
+			if got := strings.Contains(logs.String(), "resolves elsewhere"); got != tc.wantWarn {
+				t.Fatalf("warning logged = %v, want %v; log: %s", got, tc.wantWarn, logs.String())
 			}
 		})
 	}
