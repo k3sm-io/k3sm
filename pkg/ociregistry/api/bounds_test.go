@@ -17,9 +17,11 @@ limitations under the License.
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -50,20 +52,92 @@ func nextLink(t *testing.T, h http.Header) string {
 	return strings.TrimSuffix(strings.TrimPrefix(l, "<"), `>; rel="next"`)
 }
 
+// treeWorkers is how many goroutines lay out or remove a big tree. Creating and
+// unlinking files spends its time waiting on the volume, and on a host busy with
+// other writers that wait is what dominates these tests. Past about this many
+// workers the wall clock stops improving and the kernel only burns more CPU.
+const treeWorkers = 8
+
+// eachParallel runs fn on every item from up to treeWorkers goroutines and
+// returns when all are done. fn must not call t.Fatal.
+func eachParallel[T any](items []T, fn func(T)) {
+	work := make(chan T)
+	var wg sync.WaitGroup
+	for range min(treeWorkers, len(items)) {
+		wg.Go(func() {
+			for it := range work {
+				fn(it)
+			}
+		})
+	}
+	for _, it := range items {
+		work <- it
+	}
+	close(work)
+	wg.Wait()
+}
+
+// dropTree removes what it can of root, its files first and then its
+// directories, deepest first. It is best effort: t.TempDir's own removal runs
+// after it, and reports whatever is left that cannot go.
+func dropTree(root string) {
+	var files []string
+	var dirs [][]string
+	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		switch {
+		case err != nil:
+		case d.IsDir():
+			depth := strings.Count(p[len(root):], string(filepath.Separator))
+			for len(dirs) <= depth {
+				dirs = append(dirs, nil)
+			}
+			dirs[depth] = append(dirs[depth], p)
+		default:
+			files = append(files, p)
+		}
+		return nil
+	})
+	remove := func(p string) { _ = os.Remove(p) } // best effort, see above
+	eachParallel(files, remove)
+	for _, level := range slices.Backward(dirs) {
+		eachParallel(level, remove)
+	}
+}
+
 // layRepos lays out repositories by hand (the files the store checks for), so
-// a test can make thousands without an fsync each.
+// a test can make thousands without an fsync each. Each is a clone of one
+// template, one system call where writing it out takes eight.
 func layRepos(t *testing.T, root string, names []string) {
 	t.Helper()
-	for _, n := range names {
-		dir := filepath.Join(root, filepath.FromSlash(n))
-		if err := os.MkdirAll(filepath.Join(dir, "blobs"), 0o700); err != nil {
+	tmpl := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(filepath.Join(tmpl, "blobs"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for f, b := range map[string]string{"oci-layout": `{"imageLayoutVersion":"1.0.0"}`, "index.json": `{"schemaVersion":2,"manifests":[]}`} {
+		if err := os.WriteFile(filepath.Join(tmpl, f), []byte(b), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		for f, b := range map[string]string{"oci-layout": `{"imageLayoutVersion":"1.0.0"}`, "index.json": `{"schemaVersion":2,"manifests":[]}`} {
-			if err := os.WriteFile(filepath.Join(dir, f), []byte(b), 0o600); err != nil {
-				t.Fatal(err)
-			}
+	}
+	parents := map[string]bool{}
+	for _, n := range names {
+		parents[filepath.Dir(filepath.Join(root, filepath.FromSlash(n)))] = true
+	}
+	for p := range parents {
+		if err := os.MkdirAll(p, 0o700); err != nil {
+			t.Fatal(err)
 		}
+	}
+	eachParallel(names, func(n string) {
+		dst := filepath.Join(root, filepath.FromSlash(n))
+		if cloneDir(tmpl, dst) == nil {
+			return
+		}
+		if err := os.CopyFS(dst, os.DirFS(tmpl)); err != nil {
+			t.Error(err)
+		}
+	})
+	if t.Failed() {
+		t.FailNow()
 	}
 }
 
@@ -83,12 +157,16 @@ func (f *fixture) addRows(t *testing.T, repo string, bodies [][]byte) {
 	if err := os.MkdirAll(filepath.Join(dir, "blobs", "sha256"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	for _, b := range bodies {
-		d := dg(b)
-		if err := os.WriteFile(filepath.Join(dir, "blobs", "sha256", d.Encoded()), b, 0o600); err != nil {
-			t.Fatal(err)
+	eachParallel(bodies, func(b []byte) {
+		if err := os.WriteFile(filepath.Join(dir, "blobs", "sha256", dg(b).Encoded()), b, 0o600); err != nil {
+			t.Error(err)
 		}
-		idx.Manifests = append(idx.Manifests, ispec.Descriptor{MediaType: ispec.MediaTypeImageManifest, Digest: d, Size: int64(len(b))})
+	})
+	if t.Failed() {
+		t.FailNow()
+	}
+	for _, b := range bodies {
+		idx.Manifests = append(idx.Manifests, ispec.Descriptor{MediaType: ispec.MediaTypeImageManifest, Digest: dg(b), Size: int64(len(b))})
 	}
 	raw, _ = json.Marshal(idx)
 	tmp := filepath.Join(dir, ".uploads", "test-index")
@@ -431,10 +509,13 @@ func TestListingBounds(t *testing.T) {
 				MediaType: ispec.MediaTypeImageManifest, ArtifactType: "application/vnd.example.big",
 				Config: ispec.DescriptorEmptyJSON, Layers: []ispec.Descriptor{},
 				Subject:     &ispec.Descriptor{MediaType: ispec.MediaTypeImageManifest, Digest: dg(subject), Size: int64(len(subject))},
-				Annotations: map[string]string{"pad": strings.Repeat(fmt.Sprint(i%10), 4<<20-1024)},
+				Annotations: map[string]string{"pad": "@"},
 			}
 			m.SchemaVersion = 2
 			b, _ := json.Marshal(m)
+			// Spliced in, not marshalled: encoding 4 MiB byte by byte takes
+			// seconds under -race, and only the server's read is under test.
+			b = bytes.Replace(b, []byte(`"@"`), []byte(`"`+strings.Repeat(fmt.Sprint(i%10), 4<<20-1024)+`"`), 1)
 			if len(b) > 4<<20 {
 				t.Fatalf("a %d-byte manifest", len(b))
 			}

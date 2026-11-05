@@ -49,7 +49,15 @@ type fixture struct {
 
 func newFixture(t testing.TB, opts ...func(*Config)) *fixture {
 	t.Helper()
-	st, err := store.OpenWorkDir(t.TempDir())
+	work := t.TempDir()
+	t.Cleanup(func() { dropTree(work) }) // runs before t.TempDir's serial removal
+	return fixtureOver(t, work, opts...)
+}
+
+// fixtureOver is a server over the store in work.
+func fixtureOver(t testing.TB, work string, opts ...func(*Config)) *fixture {
+	t.Helper()
+	st, err := store.OpenWorkDir(work)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,6 +70,31 @@ func newFixture(t testing.TB, opts ...func(*Config)) *fixture {
 		t.Fatal(err)
 	}
 	return &fixture{srv: srv, st: st, root: st.Root()}
+}
+
+// clone is a new server over a copy of f's store as it is now. A push syncs to
+// the medium several times, so a test whose cases all start from the same pushed
+// state pushes it once and clones it per case. Nothing of f's server carries
+// over: the clone has its own caches and sessions.
+func (f *fixture) clone(t testing.TB, opts ...func(*Config)) *fixture {
+	t.Helper()
+	work := filepath.Join(t.TempDir(), "work")
+	cloneWork(t, f.workDir(), work)
+	return fixtureOver(t, work, opts...)
+}
+
+// workDir is the directory holding f's store and its state.
+func (f *fixture) workDir() string { return filepath.Dir(f.root) }
+
+// cloneWork copies the directory tree src to dst, which must not exist.
+func cloneWork(t testing.TB, src, dst string) {
+	t.Helper()
+	if cloneDir(src, dst) == nil {
+		return
+	}
+	if err := os.CopyFS(dst, os.DirFS(src)); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // req builds a request; hdr is header name/value pairs.
@@ -89,7 +122,7 @@ func (f *fixture) do(method, path string, body []byte, hdr ...string) *httptest.
 }
 
 // want fails unless w has status and, when code is set, that error code.
-func want(t *testing.T, w *httptest.ResponseRecorder, status int, code string) {
+func want(t testing.TB, w *httptest.ResponseRecorder, status int, code string) {
 	t.Helper()
 	if w.Code != status {
 		t.Fatalf("status %d, want %d; body %s", w.Code, status, w.Body.String())
@@ -106,7 +139,7 @@ func want(t *testing.T, w *httptest.ResponseRecorder, status int, code string) {
 func dg(b []byte) digest.Digest { return digest.FromBytes(b) }
 
 // pushBlob pushes b to repo monolithically.
-func (f *fixture) pushBlob(t *testing.T, repo string, b []byte) digest.Digest {
+func (f *fixture) pushBlob(t testing.TB, repo string, b []byte) digest.Digest {
 	t.Helper()
 	d := dg(b)
 	w := f.do(http.MethodPost, "/v2/"+repo+"/blobs/uploads/?digest="+d.String(), b, "Content-Type", "application/octet-stream")
@@ -115,14 +148,14 @@ func (f *fixture) pushBlob(t *testing.T, repo string, b []byte) digest.Digest {
 }
 
 // pushManifest PUTs body as a manifest of mediaType at reference.
-func (f *fixture) pushManifest(t *testing.T, repo, reference, mediaType string, body []byte) *httptest.ResponseRecorder {
+func (f *fixture) pushManifest(t testing.TB, repo, reference, mediaType string, body []byte) *httptest.ResponseRecorder {
 	t.Helper()
 	return f.do(http.MethodPut, "/v2/"+repo+"/manifests/"+reference, body, "Content-Type", mediaType)
 }
 
 // image pushes a config and one layer and an OCI manifest naming them, tagged
 // when tag is set, and returns the manifest body.
-func (f *fixture) image(t *testing.T, repo, tag, layer string) []byte {
+func (f *fixture) image(t testing.TB, repo, tag, layer string) []byte {
 	t.Helper()
 	cfg := []byte(`{"architecture":"arm64","os":"linux","seed":"` + layer + `"}`)
 	cd := f.pushBlob(t, repo, cfg)
@@ -143,7 +176,7 @@ func (f *fixture) image(t *testing.T, repo, tag, layer string) []byte {
 }
 
 // index pushes an OCI index of children, tagged when tag is set.
-func (f *fixture) index(t *testing.T, repo, tag string, children ...[]byte) []byte {
+func (f *fixture) index(t testing.TB, repo, tag string, children ...[]byte) []byte {
 	t.Helper()
 	idx := ispec.Index{MediaType: ispec.MediaTypeImageIndex}
 	idx.SchemaVersion = 2
@@ -173,7 +206,7 @@ func (f *fixture) tagsOf(t *testing.T, repo, query string) ([]string, http.Heade
 	return tl.Tags, w.Header()
 }
 
-func (f *fixture) rows(t *testing.T, repo string) []ispec.Descriptor {
+func (f *fixture) rows(t testing.TB, repo string) []ispec.Descriptor {
 	t.Helper()
 	n, _ := ref.ParseName(repo)
 	idx, err := f.st.Index(n)

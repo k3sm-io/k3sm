@@ -85,6 +85,10 @@ func TestConditionalDelete(t *testing.T) {
 		want(t, f.do(http.MethodDelete, "/v2/app/manifests/v1", nil, "If-Match", `"`+state(t, f)+`"`), http.StatusAccepted, "")
 	})
 
+	// The table cases each delete from their own copy of one pushed state.
+	oneImage := newFixture(t)
+	oneBody := oneImage.image(t, "app", "", "l")
+	oneState := state(t, oneImage)
 	for _, tc := range []struct {
 		name, ifMatch string
 		status        int
@@ -107,15 +111,19 @@ func TestConditionalDelete(t *testing.T) {
 		{"a tag run into the next member fails the whole list", `"<state>""x"`, http.StatusPreconditionFailed},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			f := newFixture(t)
-			body := f.image(t, "app", "", "l")
-			v := strings.ReplaceAll(tc.ifMatch, "<state>", state(t, f))
-			want(t, f.do(http.MethodDelete, "/v2/app/manifests/"+dg(body).String(), nil, "If-Match", v), tc.status, "")
+			f := oneImage.clone(t)
+			v := strings.ReplaceAll(tc.ifMatch, "<state>", oneState)
+			want(t, f.do(http.MethodDelete, "/v2/app/manifests/"+dg(oneBody).String(), nil, "If-Match", v), tc.status, "")
 		})
 	}
 
 	// Several If-Match field lines are one list (RFC 9110 section 5.3): an
 	// empty first line must not turn the condition off for the lines after it.
+	twoImages := newFixture(t)
+	body := twoImages.image(t, "app", "", "l")
+	stale := state(t, twoImages)
+	twoImages.image(t, "app", "v1", "m")
+	cur := state(t, twoImages)
 	for _, tc := range []struct {
 		name   string
 		lines  []string
@@ -127,11 +135,7 @@ func TestConditionalDelete(t *testing.T) {
 		{"only empty lines are refused", []string{"", ""}, http.StatusPreconditionFailed},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			f := newFixture(t)
-			body := f.image(t, "app", "", "l")
-			stale := state(t, f)
-			f.image(t, "app", "v1", "m")
-			cur := state(t, f)
+			f := twoImages.clone(t)
 			r := req(http.MethodDelete, "/v2/app/manifests/"+dg(body).String(), nil)
 			for _, l := range tc.lines {
 				r.Header.Add("If-Match", strings.NewReplacer("<state>", cur, "<stale>", stale).Replace(l))
