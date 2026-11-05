@@ -173,10 +173,11 @@
 #   - it is 1 byte to 128 KiB: the document's 64 KiB cap plus the signer's
 #     certificate chain and the timestamp token
 #   - security cms -D extracts the signed content (no key is needed for that),
-#     and the decoder the schema is pinned to, run as go run
-#     ./hack/release/indexcheck, accepts it: pkg/update.ParseReleaseIndex for a
-#     final release, pkg/update.ParseCandidateIndex at this tag for a release
-#     candidate, so neither takes the other's document
+#     and the decoder the release tag selects accepts it, run as go run
+#     ./hack/release/indexcheck final <file> (pkg/update.ParseReleaseIndex) for
+#     a final release or ... candidate <tag> <file>
+#     (pkg/update.ParseCandidateIndex at this tag) for a release candidate, so
+#     neither takes the other's document
 #   - the decoded fields name exactly this release: the tag, the disk image's
 #     name, sha256 and size, the tarball's name and sealed hash, and the
 #     sha256 of the stage tree's PAYLOAD-SHA256

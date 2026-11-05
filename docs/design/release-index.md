@@ -203,6 +203,9 @@ committed.
 decoder reads: this path and these rules, with no other agreement between the
 two repositories.
 
+- The app's reader takes the requested tag from its discovery step as a required
+  input and never defaults it, because the replayed fixtures below can be refused
+  only against that tag.
 - `index.json` is the canonical candidate document, for the tag `v0.3.0-rc.2`.
   It must decode at that tag and re-encode to the same bytes.
 - Every `red-*.json` file must be refused when read as the candidate document
