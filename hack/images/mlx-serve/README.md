@@ -168,9 +168,10 @@ the snapshot path in the cache volume, would list that path on `/v1/models`,
 and a request naming `spec.model` would make every rank load the model again
 from the Hub cache. With it, `/v1/models` lists `spec.model` alone, a request
 naming `spec.model` or no model is served by the model already loaded, and a
-request naming anything else is answered HTTP 404. The engine would otherwise
-hand that name, which any client of the port sets, to its loader, which downloads
-the repository and drops the model being served. The operator always renders the
+request naming any other `model`, `draft_model` or `adapters` is answered HTTP
+404. The engine would otherwise hand a model or draft model, which any client of
+the port sets, to its loader, which downloads the repository and drops the model
+being served. The selftest checks the status through the real handler. The operator always renders the
 option on a rank. This hooks four
 `mlx_lm.server` internals (`ModelProvider.load`,
 `APIHandler.handle_models_request`, `run` and `_run_http_server`). The rank

@@ -284,10 +284,14 @@ def snapshot_download(*a, **kw):
     fetched.append(a[0] if a else kw.get("repo_id"))
     raise RuntimeError("selftest: no network")
 mlx_lm.utils.snapshot_download = snapshot_download
-def provider(cls):
-    p = cls(types.SimpleNamespace(model=model_dir, adapter_path=None, draft_model=None, trust_remote_code=False,
-                                  chat_template="", pipeline=True, use_default_chat_template=False))
-    p.is_distributed = True
+CLI = dict(model=model_dir, adapter_path=None, draft_model=None, trust_remote_code=False, chat_template="",
+           pipeline=True, use_default_chat_template=False, prompt_cache_size=1, allowed_origins=["*"], max_tokens=8,
+           temp=0.0, top_p=1.0, top_k=0, min_p=0.0, num_draft_tokens=3, decode_concurrency=1, prompt_concurrency=1,
+           prefill_step_size=1, prompt_cache_bytes=None, chat_template_args={}, kv_bits=None, kv_group_size=64,
+           quantized_kv_start=0)
+def provider(cls, distributed=True):
+    p = cls(types.SimpleNamespace(**CLI))
+    p.is_distributed = distributed
     return p
 def attempt(p, *load_args):
     fetched.clear()
@@ -304,15 +308,73 @@ for name in ("attacker/repo", "/etc", "other"):
     err = attempt(p, name, None, "default_model")
     check("modelfield.refused  a request body's model %r fetches nothing and is refused" % name,
           isinstance(err, ks.ModelRefused) and fetched == [])
-err = attempt(p, "org/m", None, "attacker/draft")
-check("modelfield.draft  a draft_model on a rank fetches nothing (the engine refuses it when distributed)",
-      isinstance(err, ValueError) and fetched == [])
 loaded = []
 p._load = lambda *key: loaded.append(key)
 attempt(p, "org/m", None, "default_model")
 attempt(p, "default_model", None, "default_model")
 check("modelfield.served  the served name and no name load the --model, with no fetch",
       loaded == [(model_dir, None, None)] * 2 and fetched == [])
+
+# The handler fills all three from the body (model, draft_model, adapters), so
+# each is a request field here. On a rank that is not distributed (world size 1)
+# the stock loader would load a body's draft_model; the leg below shows it.
+named = []
+stock_load = server.load
+def record_load(path, **kw):
+    named.append(path)
+    if path != model_dir:
+        raise RuntimeError("selftest: no network")
+    return types.SimpleNamespace(), types.SimpleNamespace(chat_template="x", vocab_size=1), {}
+server.load = record_load
+attempt(provider(stock_provider, distributed=False), "default_model", None, "attacker/draft")
+check("draftfield.stock  a stock provider off a distributed group loads the draft_model a body names %r" % named,
+      named == [model_dir, "attacker/draft"])
+named.clear()
+stock_key = []
+sp = provider(stock_provider, distributed=False)
+sp._load = lambda *key: stock_key.append(key)
+sp.load("default_model", "attacker/adapter", "default_model")
+check("adapterfield.stock  the stock map drops a body's adapters beside the default model, so it loads nothing %r" % stock_key,
+      stock_key == [(model_dir, None, None)])
+for distributed in (True, False):
+    tag = "rank" if distributed else "single"
+    p = provider(P, distributed=distributed)
+    named.clear()
+    for field, load_args in (("draft", ("org/m", None, "attacker/draft")), ("adapter", ("org/m", "attacker/adapter", "default_model")),
+                             ("draftdefault", ("default_model", None, "attacker/draft")),
+                             ("adapterdefault", ("default_model", "attacker/adapter", "default_model"))):
+        err = attempt(p, *load_args)
+        check("%sfield.%s  the right model with a body's %s is refused and fetches nothing" % (field, tag, field),
+              isinstance(err, ks.ModelRefused) and fetched == [] and named == [])
+server.load = stock_load
+
+# The status a client sees, through the real handler and response generator, with
+# the load that matters stubbed: the refusal is raised on the generation thread,
+# carried back on the response queue, and answered by the handler's own except.
+provider_h = provider(P, distributed=False)
+provider_h._load = lambda *key: setattr(provider_h, "model_key", key)
+generator = server.ResponseGenerator(provider_h, server.LRUPromptCache(1))
+def post_handler(cls_body):
+    raw = json.dumps(cls_body).encode()
+    h = H.__new__(H)
+    h.path, h.created, h.wfile, h.rfile = "/v1/chat/completions", 1700000000, io.BytesIO(), io.BytesIO(raw)
+    h.request_version, h.command, h.requestline = "HTTP/1.1", "POST", "POST /v1/chat/completions HTTP/1.1"
+    h.client_address, h.headers, h.close_connection = ("127.0.0.1", 0), email.message.Message(), True
+    h.headers["Content-Length"] = str(len(raw))
+    h.response_generator, h.system_fingerprint = generator, "fp"
+    h.log_message = lambda *a: None
+    h.do_POST()
+    head, body = h.wfile.getvalue().split(b"\r\n\r\n", 1)
+    return int(head.split(b" ")[1]), body.decode()
+msgs = [{"role": "user", "content": "hi"}]
+for name, body in (("model", {"model": "attacker/repo"}), ("model.stream", {"model": "attacker/repo", "stream": True}),
+                   ("draft", {"model": "org/m", "draft_model": "attacker/draft"}),
+                   ("adapters", {"model": "org/m", "adapters": "attacker/adapter"})):
+    fetched.clear()
+    status, text = post_handler(dict(body, messages=msgs))
+    check("http.%s  the real handler answers 404 with the refusal and fetches nothing (HTTP %d)" % (name, status),
+          status == 404 and "serves" in json.loads(text).get("error", "") and fetched == [])
+generator.stop_and_join()
 PY
 		mkdir -p "$WORK/alias-hf" "$WORK/alias-models"
 		alias_out="$(cd "$WORK" && HF_HUB_CACHE="$WORK/alias-hf" HF_HUB_OFFLINE=1 PYTHONDONTWRITEBYTECODE=1 "$STAGED/bin/python3.12" -I -B "$WORK/alias-real.py" "$HERE" "$WORK/alias-models" 2>"$WORK/alias-real.err")"
@@ -325,10 +387,10 @@ PY
 				*)  ladder no "9a.driver  $verdict $name" ;;
 			esac
 		done <<< "$alias_out"
-		if [ "$ALIAS_CHECKS" -ge 15 ]; then
+		if [ "$ALIAS_CHECKS" -ge 28 ]; then
 			ladder ok "9a.count  all $ALIAS_CHECKS engine-source and alias checks reported"
 		else
-			ladder no "9a.count  only $ALIAS_CHECKS of 15 engine-source and alias checks reported (a driver crashed?)"
+			ladder no "9a.count  only $ALIAS_CHECKS of 28 engine-source and alias checks reported (a driver crashed?)"
 			tail -20 "$WORK/engine-real.err" "$WORK/alias-real.err"
 		fi
 	elif [ "$STAGED_REQUIRED" = 1 ]; then
@@ -1395,6 +1457,7 @@ ks.ENGINE_RUN_SHA256 = ks.source_shape(fake_engine().run)
 eng = fake_engine()
 P, Hd, _ = ks.install_alias(eng, "org/m")
 prov = eng.ModelProvider(types.SimpleNamespace(prompt_cache_size=3))
+prov.cli_args = types.SimpleNamespace(adapter_path=None, draft_model=None)
 prov.load("org/m", None, "default_model")
 prov.load("default_model", None, "default_model")
 check("alias.load  a request naming the served name, or none, loads default_model (the loaded snapshot)",
@@ -1408,6 +1471,15 @@ def load_refused(name):
     return False
 check("alias.refused  a request naming anything else is refused before the engine's load runs",
       all(load_refused(n) for n in ("other/x", "/snap", "../x", "")) and eng.rec["loads"] == [])
+def field_refused(*load_args):
+    try:
+        prov.load(*load_args)
+    except ks.ModelRefused:
+        return True
+    return False
+check("alias.refused.fields  a draft model or an adapter beside the right model is refused before the engine's load runs",
+      field_refused("org/m", None, "other/x") and field_refused("org/m", "other/x", "default_model")
+      and field_refused("default_model", None, "other/x") and eng.rec["loads"] == [])
 def models(handler_cls, path):
     h = handler_cls(path)
     h.handle_models_request()
@@ -1643,10 +1715,10 @@ while read -r verdict name; do
 	esac
 done <<< "$shard_out"
 # A driver that crashed before its checks would otherwise pass vacuously.
-if [ "$SHARD_CHECKS" -ge 45 ]; then
+if [ "$SHARD_CHECKS" -ge 46 ]; then
 	ladder ok "7.count  all $SHARD_CHECKS entrypoint checks reported"
 else
-	ladder no "7.count  only $SHARD_CHECKS of 45 entrypoint checks reported (the driver crashed?)"
+	ladder no "7.count  only $SHARD_CHECKS of 46 entrypoint checks reported (the driver crashed?)"
 	head -20 "$WORK/shard-driver.err"
 fi
 

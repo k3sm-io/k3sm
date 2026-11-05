@@ -141,6 +141,9 @@ pin, its date, and the tarball's sha256.
 - A sharded `MLXModel` answers HTTP 404 to a request naming any model but `spec.model`; before, the
   name in a request body made every rank download that repository and drop the model it was
   serving. The fix is in the `mlx-serve` sharded entrypoint, so it ships with the next image tag.
+- A sharded `MLXModel` answers HTTP 404 to a request naming any model but `spec.model`, or any
+  `draft_model` or `adapters`; before, a model named in a request body made every rank download that
+  repository and drop the model it was serving. The fix is in the `mlx-serve` sharded entrypoint, so it ships with the next image tag.
 - A single-node `MLXModel` refuses every image URL that is not a `data:` URL with HTTP 400, before a
   name is resolved; before, vllm-mlx fetched `http(s)` image URLs from the pod, and a name that
   resolved differently the second time could reach an internal address. Send images inline as
