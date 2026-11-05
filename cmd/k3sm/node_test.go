@@ -37,8 +37,14 @@ import (
 
 	"k3sm.io/darwin-net/pkg/dns"
 
+	"k3sm.io/k3sm/pkg/bootstrap"
+	"k3sm.io/k3sm/pkg/executor"
+	"k3sm.io/k3sm/pkg/hostnet"
+	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/provider"
 	"k3sm.io/k3sm/pkg/runtimeclass"
+	"k3sm.io/k3sm/pkg/status"
+	"k3sm.io/runtimed/pkg/sandbox"
 )
 
 // TestNodeInternalIP pins the globally-unicast NodeInternalIP derivation the VK
@@ -118,6 +124,55 @@ func TestRuntimedConfiguresPostureVIPs(t *testing.T) {
 	// 10.43.0.1), so it tracks the CIDR rather than a second hardcoded literal.
 	if got := apiServerVIP(); got != "10.43.0.1" {
 		t.Errorf("apiServerVIP() = %q, want 10.43.0.1 (first host of the cluster service CIDR)", got)
+	}
+}
+
+// TestRuntimedConfigDeniesTheDataRootStatusDir pins which directory the status
+// record deny names on each role: the data root's, whichever root the runtime uses.
+// A default node's value is the runtime's own <WorkDir>/status, so its profile does
+// not move; a custom --pod-root leaves it at the data root, which is the case the
+// deny used to miss. The server builds its statusDir in serverNodeOptions from the
+// same status.Dir the agent's comes from.
+func TestRuntimedConfigDeniesTheDataRootStatusDir(t *testing.T) {
+	t.Parallel()
+	const custom = "/opt/k3sm-pods"
+	serverDir := filepath.Join(install.DefaultDataRoot, "server")
+	agentDir := filepath.Join(install.DefaultDataRoot, "agent")
+	want := install.StateStatus.Path(install.DefaultDataRoot)
+	join := &bootstrap.JoinResult{PodCIDR: "100.64.2.0/24", MeshIP: "100.64.2.1"}
+	agent := func(podRoot string) nodeOptions {
+		return agentNodeOptions(agentOptions{workDir: agentDir, podRoot: podRoot}, join, "", hostnet.Mode{Backend: hostnet.BackendHelper}, nil)
+	}
+	cases := []struct {
+		name     string
+		opts     nodeOptions
+		wantRoot string
+	}{
+		{"default server", nodeOptions{podRoot: executor.RuntimeRoot(serverDir), statusDir: status.Dir(serverDir)}, install.DefaultDataRoot},
+		{"custom pod root server", nodeOptions{podRoot: custom, statusDir: status.Dir(serverDir)}, custom},
+		{"default agent", agent(executor.RuntimeRoot(agentDir)), install.DefaultDataRoot},
+		{"custom pod root agent", agent(custom), custom},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := runtimedConfig(tc.opts, nil)
+			if cfg.Root != tc.wantRoot {
+				t.Fatalf("Root = %q, want %q", cfg.Root, tc.wantRoot)
+			}
+			if cfg.StatusRecordDir != want {
+				t.Errorf("StatusRecordDir = %q, want the data root's %q", cfg.StatusRecordDir, want)
+			}
+			if tc.wantRoot == install.DefaultDataRoot {
+				if joined := filepath.Join(cfg.Root, sandbox.StatusSubdir); cfg.StatusRecordDir != joined {
+					t.Errorf("StatusRecordDir = %q, want the runtime's own %q on a default node", cfg.StatusRecordDir, joined)
+				}
+			}
+		})
+	}
+	// The standalone `k3sm node` publishes no records, so it names no directory.
+	if got := runtimedConfig(nodeOptions{standalone: true}, nil).StatusRecordDir; got != "" {
+		t.Errorf("standalone StatusRecordDir = %q, want empty", got)
 	}
 }
 

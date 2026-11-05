@@ -111,6 +111,10 @@ pin, its date, and the tarball's sha256.
 - `k3sm stop` and `k3sm uninstall` stop a `vm` helper whose path spells its version in a different
   case than the versions directory. It was reported as no longer retained and left running. A
   stray file or symlink named like a version no longer counts as a retained version.
+- The sandbox's explicit deny now follows the status records `k3sm status` reports on a node started
+  with a non-default `--pod-root`, naming the data root's status directory. A node with
+  a non-default pod root recreates its pods once on upgrade, and a node whose status directory is
+  reached through a symlink refuses to start, naming the path. A node on the default paths is unchanged.
 - `k3sm status` names the cause of an invalid developer-mode row: when `/` or `/Library` is the
   problem, the detail and remedy name that directory instead of suggesting `sudo rm` of the marker,
   which does not fix it. [Status JSON](docs/user/status-json.md) describes the row.

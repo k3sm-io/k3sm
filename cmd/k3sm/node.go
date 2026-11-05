@@ -1820,6 +1820,9 @@ func runtimedConfig(opts nodeOptions, cs kubernetes.Interface) provider.Runtimed
 		NodeName: opts.nodeName,
 		NodeIP:   opts.nodeIP,
 		Root:     opts.podRoot,
+		// The directory the node publishes its status records into, one value
+		// with the writers, so the deny names what they write.
+		StatusRecordDir: opts.statusDir,
 		// The persisted eviction, OOM and restart history, under the node's
 		// own work dir and outside every pod-readable tree.
 		BudgetDir: opts.budgetDir,
