@@ -354,16 +354,19 @@ func TestUpdateCheckReadsTheChannelFromItsSource(t *testing.T) {
 	})
 
 	// The recorder: a fixed clock inside the hour of a recorded check, a poll every
-	// millisecond, and a counter of each read and check.
+	// millisecond, a counter of each read and check, and polled, which each poll
+	// signals so a waiter looks again. Its one slot means a signal that finds it
+	// full loses nothing: the waiter has yet to look.
 	now := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
 	type recorderRun struct {
 		polls, checks atomic.Int32
 		channel       atomic.Value
 		readErr       atomic.Pointer[error]
+		polled        chan struct{}
 	}
 	start := func(t *testing.T, live updatesv1alpha1.UpdateChannel, wd string, sink *syncBuffer, checkErr func() error, unreadable ...error) *recorderRun {
 		t.Helper()
-		run := &recorderRun{}
+		run := &recorderRun{polled: make(chan struct{}, 1)}
 		run.channel.Store(live)
 		if len(unreadable) == 1 {
 			run.readErr.Store(&unreadable[0])
@@ -391,7 +394,13 @@ func TestUpdateCheckReadsTheChannelFromItsSource(t *testing.T) {
 				return update.Report{CheckedAt: now, Channel: ch, Latest: update.Release{Tag: "v0.2.3"}, Nodes: []update.Node{}}, nil
 			},
 			readChannel: func(context.Context) (channelReading, error) {
-				defer run.polls.Add(1)
+				defer func() {
+					run.polls.Add(1)
+					select {
+					case run.polled <- struct{}{}:
+					default:
+					}
+				}()
 				if e := run.readErr.Load(); e != nil {
 					return channelReading{}, *e
 				}
@@ -408,21 +417,25 @@ func TestUpdateCheckReadsTheChannelFromItsSource(t *testing.T) {
 		}()
 		return run
 	}
-	waitFor := func(t *testing.T, what string, ok func() bool) {
+	// waitFor looks again after each poll: the recorder polls for as long as it
+	// runs, so whatever a check changes is seen by the next poll at the latest.
+	waitFor := func(t *testing.T, run *recorderRun, what string, ok func() bool) {
 		t.Helper()
-		deadline := time.Now().Add(10 * time.Second)
+		deadline := time.NewTimer(10 * time.Second)
+		defer deadline.Stop()
 		for !ok() {
-			if time.Now().After(deadline) {
+			select {
+			case <-run.polled:
+			case <-deadline.C:
 				t.Fatalf("timed out waiting for %s", what)
 			}
-			time.Sleep(time.Millisecond)
 		}
 	}
 	// settle waits for n more polls, so "no further check" means something.
 	settle := func(t *testing.T, run *recorderRun, n int32) {
 		t.Helper()
 		from := run.polls.Load()
-		waitFor(t, "polls", func() bool { return run.polls.Load() >= from+n })
+		waitFor(t, run, "polls", func() bool { return run.polls.Load() >= from+n })
 	}
 	freshRecord := func(t *testing.T, ch updatesv1alpha1.UpdateChannel) string {
 		t.Helper()
@@ -441,7 +454,7 @@ func TestUpdateCheckReadsTheChannelFromItsSource(t *testing.T) {
 			t.Fatalf("%d checks inside the hour with no change", got)
 		}
 		run.channel.Store(rc)
-		waitFor(t, "the recheck", func() bool { return readUpdateRecord(wd).Channel == rc })
+		waitFor(t, run, "the recheck", func() bool { return readUpdateRecord(wd).Channel == rc })
 		settle(t, run, 20)
 		if got := run.checks.Load(); got != 1 {
 			t.Errorf("%d checks after one change, want 1", got)
@@ -453,7 +466,7 @@ func TestUpdateCheckReadsTheChannelFromItsSource(t *testing.T) {
 			t.Run(fmt.Sprintf("%s to %s", tc.recorded, tc.live), func(t *testing.T) {
 				wd := freshRecord(t, tc.recorded)
 				run := start(t, tc.live, wd, nil, nil)
-				waitFor(t, "the recheck", func() bool { return run.checks.Load() >= 1 })
+				waitFor(t, run, "the recheck", func() bool { return run.checks.Load() >= 1 })
 				settle(t, run, 20)
 				if got := run.checks.Load(); got != 1 {
 					t.Errorf("%d checks, want 1", got)
@@ -491,7 +504,7 @@ func TestUpdateCheckReadsTheChannelFromItsSource(t *testing.T) {
 	t.Run("a failed recheck waits for the interval", func(t *testing.T) {
 		wd := freshRecord(t, stable)
 		run := start(t, rc, wd, nil, func() error { return fmt.Errorf("resolve: %w", update.ErrChannelList) })
-		waitFor(t, "the recheck", func() bool { return run.checks.Load() >= 1 })
+		waitFor(t, run, "the recheck", func() bool { return run.checks.Load() >= 1 })
 		settle(t, run, 20)
 		if got := run.checks.Load(); got != 1 {
 			t.Errorf("%d checks; a failed listing is retried on every poll", got)
@@ -507,7 +520,7 @@ func TestUpdateCheckReadsTheChannelFromItsSource(t *testing.T) {
 	t.Run("a server with nowhere to record does not recheck on every poll", func(t *testing.T) {
 		wd := t.TempDir() + "/server"
 		r := start(t, rc, wd, nil, nil)
-		waitFor(t, "the check", func() bool { return r.checks.Load() >= 1 })
+		waitFor(t, r, "the check", func() bool { return r.checks.Load() >= 1 })
 		settle(t, r, 20)
 		if got := r.checks.Load(); got != 1 {
 			t.Errorf("%d checks with no record to compare with, want 1", got)
@@ -524,14 +537,14 @@ func TestUpdateCheckReadsTheChannelFromItsSource(t *testing.T) {
 			}
 			return nil
 		}, fmt.Errorf("%w: etcd away", errChannelUnreadable))
-		waitFor(t, "the failed check", func() bool { return strings.Contains(readUpdateRecord(wd).Error, "etcd away") })
+		waitFor(t, run, "the failed check", func() bool { return strings.Contains(readUpdateRecord(wd).Error, "etcd away") })
 		settle(t, run, 5)
 		if got := run.checks.Load(); got != 1 {
 			t.Fatalf("%d checks while the channel stays unreadable, want 1", got)
 		}
 		failing.Store(false)
 		run.readErr.Store(nil)
-		waitFor(t, "the recheck", func() bool { return readUpdateRecord(wd).Error == "" && run.checks.Load() >= 2 })
+		waitFor(t, run, "the recheck", func() bool { return readUpdateRecord(wd).Error == "" && run.checks.Load() >= 2 })
 		settle(t, run, 20)
 		if got := run.checks.Load(); got != 2 {
 			t.Errorf("%d checks after the channel came back, want 2", got)
@@ -551,7 +564,7 @@ func TestUpdateCheckReadsTheChannelFromItsSource(t *testing.T) {
 		t.Run("a channel change", func(t *testing.T) {
 			sink := &syncBuffer{}
 			run := start(t, rc, freshRecord(t, stable), sink, nil)
-			waitFor(t, "the recheck", func() bool { return run.checks.Load() >= 1 })
+			waitFor(t, run, "the recheck", func() bool { return run.checks.Load() >= 1 })
 			settle(t, run, 10)
 			if got := warns(sink, "the update channel changed"); got != 1 {
 				t.Errorf("%d Warn lines, want 1:\n%s", got, sink.String())
@@ -581,14 +594,14 @@ func TestUpdateCheckReadsTheChannelFromItsSource(t *testing.T) {
 				}
 				return nil
 			})
-			waitFor(t, "repeated checks", func() bool { return run.checks.Load() >= 5 })
+			waitFor(t, run, "repeated checks", func() bool { return run.checks.Load() >= 5 })
 			if got := warns(sink, msg); got != 1 {
 				t.Errorf("%d Warn lines over %d checks, want 1:\n%s", got, run.checks.Load(), sink.String())
 			}
 
 			// A check that reads the channel ends the spell.
 			failing.Store(false)
-			waitFor(t, "the good check", func() bool { return readUpdateRecord(wd).Error == "" && readUpdateRecord(wd).Latest != "" })
+			waitFor(t, run, "the good check", func() bool { return readUpdateRecord(wd).Error == "" && readUpdateRecord(wd).Latest != "" })
 			settle(t, run, 5)
 			at := run.checks.Load()
 			settle(t, run, 5)
@@ -599,7 +612,7 @@ func TestUpdateCheckReadsTheChannelFromItsSource(t *testing.T) {
 			// The next failure is a new spell, forced here by a channel change.
 			failing.Store(true)
 			run.channel.Store(rc)
-			waitFor(t, "repeated checks", func() bool { return run.checks.Load() >= at+5 })
+			waitFor(t, run, "repeated checks", func() bool { return run.checks.Load() >= at+5 })
 			if got := warns(sink, msg); got != 2 {
 				t.Errorf("%d Warn lines after a second spell, want 2:\n%s", got, sink.String())
 			}
@@ -608,7 +621,7 @@ func TestUpdateCheckReadsTheChannelFromItsSource(t *testing.T) {
 			for _, sentinel := range []error{update.ErrChannelList, update.ErrChannelPageCap, update.ErrNoChannelRelease} {
 				sink := &syncBuffer{}
 				run := start(t, stable, installedWorkDir(t), sink, func() error { return fmt.Errorf("resolve: %w", sentinel) })
-				waitFor(t, "the check", func() bool { return run.checks.Load() >= 1 })
+				waitFor(t, run, "the check", func() bool { return run.checks.Load() >= 1 })
 				settle(t, run, 2)
 				if got := warns(sink, "could not check for a k3sm update"); got != 1 {
 					t.Errorf("%v: %d Warn lines, want 1:\n%s", sentinel, got, sink.String())
@@ -618,7 +631,7 @@ func TestUpdateCheckReadsTheChannelFromItsSource(t *testing.T) {
 		t.Run("an unreachable release host stays at Info", func(t *testing.T) {
 			sink := &syncBuffer{}
 			run := start(t, stable, installedWorkDir(t), sink, func() error { return errors.New("connection refused") })
-			waitFor(t, "the check", func() bool { return run.checks.Load() >= 1 })
+			waitFor(t, run, "the check", func() bool { return run.checks.Load() >= 1 })
 			settle(t, run, 2)
 			if strings.Contains(sink.String(), "level=WARN") || !strings.Contains(sink.String(), "level=INFO") {
 				t.Errorf("log:\n%s", sink.String())

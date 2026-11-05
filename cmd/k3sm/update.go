@@ -806,14 +806,14 @@ func runUpdateApply(ctx context.Context, args []string, env updateEnv) int {
 	// computed on the channel as it stands now, never chosen by what a Node
 	// publishes, and --yes means nobody may see the plan before the roll starts.
 	reading, channelErr := channelSource{dyn: dyn, objectOnly: true}.read(ctx)
+	if *tag == "" && channelErr != nil {
+		fmt.Fprintf(env.errOut, "k3sm update apply: %v; name a release with --version\n", channelErr)
+		return exitInternalError
+	}
+	in := env.inputs
+	in.Channel = reading.channel
 	target := *tag
 	if target == "" {
-		if channelErr != nil {
-			fmt.Fprintf(env.errOut, "k3sm update apply: %v; name a release with --version\n", channelErr)
-			return exitInternalError
-		}
-		in := env.inputs
-		in.Channel = reading.channel
 		rel, err := update.Latest(ctx, in)
 		if err != nil {
 			fmt.Fprintln(env.errOut, "k3sm update apply: resolve the latest release:", err)
