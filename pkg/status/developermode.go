@@ -19,6 +19,8 @@ package status
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 
 	"k3sm.io/k3sm/pkg/install"
 )
@@ -34,6 +36,13 @@ const (
 	developerModeOnDetail      = "Developer mode: the signature of the k3sm that runs as root is not checked"
 	developerModeOnRemedy      = "Run sudo k3sm install --developer-mode off. Installing a release signed with a Developer ID also turns it off; reinstalling an ad-hoc signed build from source does not"
 	developerModeInvalidDetail = "A developer-mode marker exists but is not a root-owned file, so it is ignored and the signature checks stay on"
+)
+
+// The ancestor cause: the marker is fine and a directory above it is not, so
+// removing the marker would not help.
+const (
+	developerModeAncestorDetailFmt = "A developer-mode marker exists but %s, a directory above it, is not a root-owned real directory that neither group nor others can write, with no ACL, so the marker is ignored and the signature checks stay on"
+	developerModeAncestorRemedyFmt = "Make %s a root-owned real directory that neither group nor others can write, with no ACL; removing the marker does not fix it"
 )
 
 // developerModeInvalidRemedy removes a marker that fails the checks.
@@ -53,6 +62,12 @@ func (c Collector) developerModeRow(ctx context.Context) (Row, bool) {
 		row.State, row.Detail, row.Remedy = StateOn, developerModeOnDetail, developerModeOnRemedy
 	case install.DeveloperModeInvalid:
 		row.State, row.Detail, row.Remedy = StateInvalid, developerModeInvalidDetail, developerModeInvalidRemedy
+		if c.DeveloperModeAncestor != nil {
+			if dir := c.DeveloperModeAncestor(); dir != "" {
+				row.Detail = fmt.Sprintf(developerModeAncestorDetailFmt, dir)
+				row.Remedy = fmt.Sprintf(developerModeAncestorRemedyFmt, dir)
+			}
+		}
 	default:
 		return Row{}, false
 	}
@@ -86,6 +101,10 @@ func developerModeAlert(r Row) *Alert {
 		return alert("Developer mode is on, so k3sm does not check the signature of the k3sm that runs as root.", docsDeveloperMode,
 			manual(developerModeOnRemedy))
 	case StateInvalid:
+		if !strings.HasPrefix(r.Remedy, "sudo rm ") {
+			return alert("A directory above the developer-mode marker is not a root-owned real directory nobody else can write; the marker is ignored and the signature checks stay on.", docsDeveloperMode,
+				manual(r.Remedy))
+		}
 		return alert("Something is at the developer-mode marker path that is not a root-owned file nobody else can write; it is ignored and the signature checks stay on.", docsDeveloperMode,
 			cmd("Remove it", developerModeInvalidRemedy))
 	}

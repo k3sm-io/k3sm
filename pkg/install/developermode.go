@@ -211,6 +211,36 @@ func developerModeState(f DeveloperModeFacts, owner int) DeveloperModeState {
 	return DeveloperModeMarkerOn
 }
 
+// DeveloperModeAncestorCause names the first directory above the marker at
+// path that makes an otherwise valid marker invalid: not a real directory, not
+// root-owned, writable by group or others, or carrying an ACL. It is "" when
+// the marker itself is the cause, or when nothing is wrong with the
+// directories.
+func DeveloperModeAncestorCause(f DeveloperModeFacts, path string) string {
+	if f.Err != nil || !f.Exists || f.Entry.Kind != EntryRegular || len(f.Ancestors) == 0 {
+		return ""
+	}
+	if f.Entry.UID != 0 || f.Entry.Mode.Perm()&0o022 != 0 || f.HasACL {
+		return ""
+	}
+	dirs, err := markerAncestors("/", path)
+	if err != nil {
+		return ""
+	}
+	for i, a := range f.Ancestors {
+		if i < len(dirs) && (a.Err != nil || a.Entry.Kind != EntryDir || a.Entry.UID != 0 || a.Entry.Mode.Perm()&0o022 != 0 || a.HasACL) {
+			return dirs[i]
+		}
+	}
+	return ""
+}
+
+// ReadDeveloperModeAncestorCause is DeveloperModeAncestorCause of the marker
+// at path, read through sys.
+func ReadDeveloperModeAncestorCause(sys System, path string) string {
+	return DeveloperModeAncestorCause(ReadDeveloperModeFacts(sys, path), path)
+}
+
 // ReadDeveloperModeFacts lstats the marker at path and every directory above
 // it, from /, through sys, and probes each for an ACL. It never follows a
 // symlink.

@@ -369,6 +369,11 @@ type Collector struct {
 	// (install.ReadDeveloperModeState in production). OPTIONAL: nil leaves
 	// the developer-mode row out.
 	DeveloperMode func() install.DeveloperModeState
+	// DeveloperModeAncestor names the directory above the marker that makes
+	// an invalid marker invalid (install.ReadDeveloperModeAncestorCause in
+	// production), "" when the marker file itself is the cause. OPTIONAL: nil
+	// reads as the marker file.
+	DeveloperModeAncestor func() string
 	// SigningTeamID reads the Team ID of a binary's signature
 	// (install.CodesignTeamID in production), for the developer-mode row's
 	// wide signing key. OPTIONAL: nil leaves that key out.

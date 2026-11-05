@@ -246,6 +246,9 @@ func newStatusCollector() status.Collector {
 		// (lstat, no symlink followed, plus the ACL probe; no privilege
 		// needed), and the installed k3sm's signing for the row's wide key.
 		DeveloperMode: statusDeveloperMode,
+		DeveloperModeAncestor: func() string {
+			return install.ReadDeveloperModeAncestorCause(install.NewDarwinSystem(), install.DeveloperModeMarkerPath)
+		},
 		SigningTeamID: install.CodesignTeamID{}.TeamID,
 		// The join target of a worker, through the installer's one reader of
 		// the agent plist's --server (the agent arguments record does not carry
