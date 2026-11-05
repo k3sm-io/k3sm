@@ -481,6 +481,14 @@ type RuntimedConfig struct {
 	// renders no extra deny. NewRuntimed refuses a value the deny would not match
 	// (ErrStatusRecordDirNotCanonical).
 	StatusRecordDir string
+	// DataRoot is the data root, whose server and agent directories hold the CA
+	// keys, the kine database and the node password. It is Root only when the pod
+	// root is left at its default, and the Seatbelt denies runtimed renders from
+	// this value name those directories wherever Root is. Empty (the standalone
+	// `k3sm node`, which keeps no such state) renders no extra deny, and so does the
+	// runtime's own root. Otherwise NewRuntimed refuses a value the denies would not
+	// match (ErrDataRootNotCanonical).
+	DataRoot string
 	// DyldShim, when set, is the getaddrinfo DNS shim dylib injected into each
 	// pod via the PodBox annotation runtimed maps to DYLD_INSERT_LIBRARIES. The
 	// file is also added to every pod's Seatbelt read allow (stampShimReadPaths).
@@ -687,6 +695,11 @@ func NewRuntimed(ctx context.Context, cfg RuntimedConfig) (*runtimedRuntime, err
 		log.Error("refusing to start: pods could write the status records", "err", err)
 		return nil, fmt.Errorf("init runtimed: %w", err)
 	}
+	dataRoot, err := dataRootOf(cfg)
+	if err != nil {
+		log.Error("refusing to start: the sandbox could not deny the control-plane state", "err", err)
+		return nil, fmt.Errorf("init runtimed: %w", err)
+	}
 	// The budget history opens before anything runs, so the first exit the
 	// startup attach observes is classified against the persisted intents.
 	var history *BudgetHistory
@@ -778,12 +791,19 @@ func NewRuntimed(ctx context.Context, cfg RuntimedConfig) (*runtimedRuntime, err
 		// The status records' real location, denied beside <Root>/status. On a
 		// default node the two are one path and the profile does not change.
 		StatusRecordDir: statusRecordDir,
-		PathShimPath:    cfg.PathShim,
-		ShadowBinDir:    cfg.ShadowBinDir,
+		// The control-plane state's real location, denied beside <Root>/server
+		// and <Root>/agent. On a default node the two are one path and the profile
+		// does not change.
+		DataRoot:     dataRoot,
+		PathShimPath: cfg.PathShim,
+		ShadowBinDir: cfg.ShadowBinDir,
 	}, deps)
 	if err != nil {
 		if errors.Is(err, sandbox.ErrInvalidStatusRecordDir) {
 			log.Error("refusing to start: pods could write the status records", "err", err)
+		}
+		if errors.Is(err, sandbox.ErrInvalidDataRoot) {
+			log.Error("refusing to start: the sandbox could not deny the control-plane state", "err", err)
 		}
 		return nil, fmt.Errorf("init runtimed: %w", err)
 	}
@@ -969,18 +989,75 @@ var ErrStatusRecordDirNotCanonical = errors.New("status record dir is not its ow
 // (a relative --work-dir) is made absolute, because that is where the records it
 // names are written, and runtime.New refuses a relative one.
 func statusRecordDirOf(cfg RuntimedConfig) (string, error) {
-	dir := cfg.StatusRecordDir
-	if dir != "" && !filepath.IsAbs(dir) {
-		abs, err := filepath.Abs(dir)
-		if err != nil {
-			return "", fmt.Errorf("%w: %q: %w", ErrStatusRecordDirNotCanonical, dir, err)
-		}
-		dir = abs
+	dir, err := absDenyDir(cfg.StatusRecordDir, ErrStatusRecordDirNotCanonical)
+	if err != nil {
+		return "", err
 	}
 	if err := checkStatusRecordDir(dir); err != nil {
 		return "", err
 	}
 	return dir, nil
+}
+
+// ErrDataRootNotCanonical reports a data root, or its server or agent directory,
+// that exists under a path other than the one configured, a symlink or a spelling
+// the macOS firmlinks do not explain. libsandbox matches resolved paths, so the
+// Seatbelt deny written from the configured string would match nothing, and
+// nothing would report it.
+var ErrDataRootNotCanonical = errors.New("data root is not its own resolved path")
+
+// dataRootOf returns the data root the Seatbelt denies are written from, or an
+// error when a deny could not match. A relative value (a relative --work-dir) is
+// made absolute, because that is where the state it names is written, and
+// runtime.New refuses a relative one.
+//
+// A data root that is the runtime's own root returns in the runtime's spelling and
+// is not checked. The profile adds no deny for it, so there is no new deny that could
+// fail to match, and refusing a node that starts today would change a default node
+// for nothing.
+func dataRootOf(cfg RuntimedConfig) (string, error) {
+	dir, err := absDenyDir(cfg.DataRoot, ErrDataRootNotCanonical)
+	if err != nil {
+		return "", err
+	}
+	root := runtimeRoot(cfg.Root)
+	if dir != "" && withoutFirmlink(dir) == withoutFirmlink(root) {
+		return root, nil
+	}
+	if err := checkDataRoot(dir); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+// checkDataRoot refuses a data root whose resolved path is not the configured
+// string, and one whose denied children are not, since either would leave a deny
+// matching nothing. The list is the one the profile renders.
+func checkDataRoot(dir string) error {
+	if dir == "" {
+		return nil
+	}
+	if err := checkResolvedDir(dir, ErrDataRootNotCanonical); err != nil {
+		return err
+	}
+	for _, sub := range sandbox.DataRootDenySubdirs() {
+		if err := checkResolvedDir(filepath.Join(dir, sub), ErrDataRootNotCanonical); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// absDenyDir makes a set deny directory absolute. Empty stays empty.
+func absDenyDir(dir string, sentinel error) (string, error) {
+	if dir == "" || filepath.IsAbs(dir) {
+		return dir, nil
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", fmt.Errorf("%w: %q: %w", sentinel, dir, err)
+	}
+	return abs, nil
 }
 
 // checkStatusRecordDir refuses a status record directory whose resolved path is
@@ -991,18 +1068,25 @@ func checkStatusRecordDir(dir string) error {
 	if dir == "" {
 		return nil
 	}
+	return checkResolvedDir(dir, ErrStatusRecordDirNotCanonical)
+}
+
+// checkResolvedDir refuses, with sentinel, a directory that exists under a path
+// other than dir, the firmlinks aside. A missing directory passes and an unreadable
+// one fails, for the reasons checkStatusRecordDir gives.
+func checkResolvedDir(dir string, sentinel error) error {
 	if _, err := os.Lstat(dir); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil
 		}
-		return fmt.Errorf("%w: %q: %w", ErrStatusRecordDirNotCanonical, dir, err)
+		return fmt.Errorf("%w: %q: %w", sentinel, dir, err)
 	}
 	resolved, err := filepath.EvalSymlinks(dir)
 	if err != nil {
-		return fmt.Errorf("%w: %q: %w", ErrStatusRecordDirNotCanonical, dir, err)
+		return fmt.Errorf("%w: %q: %w", sentinel, dir, err)
 	}
 	if withoutFirmlink(resolved) != withoutFirmlink(dir) {
-		return fmt.Errorf("%w: %q resolves to %q", ErrStatusRecordDirNotCanonical, dir, resolved)
+		return fmt.Errorf("%w: %q resolves to %q", sentinel, dir, resolved)
 	}
 	return nil
 }

@@ -313,6 +313,11 @@ type nodeOptions struct {
 	// status`. `k3sm server` and `k3sm agent` set it; empty (the standalone
 	// `k3sm node`) records no budget.
 	statusDir string
+	// dataRoot is the data root, the parent of the role's work dir, whose server
+	// and agent directories the Seatbelt profile denies wherever the pod root is.
+	// `k3sm server` and `k3sm agent` set it; empty (the standalone `k3sm node`)
+	// names none.
+	dataRoot string
 	// updateRoot is the managed update's directory under the data root
 	// (updateRootFor). `k3sm server` and `k3sm agent` set it; empty (the
 	// standalone `k3sm node`) runs no update watcher.
@@ -1827,6 +1832,9 @@ func runtimedConfig(opts nodeOptions, cs kubernetes.Interface) provider.Runtimed
 		// The directory the node publishes its status records into, one value
 		// with the writers, so the deny names what they write.
 		StatusRecordDir: opts.statusDir,
+		// The root of the control-plane state, so the denies name what the role
+		// writes when the pod root is somewhere else.
+		DataRoot: opts.dataRoot,
 		// The persisted eviction, OOM and restart history, under the node's
 		// own work dir and outside every pod-readable tree.
 		BudgetDir: opts.budgetDir,
