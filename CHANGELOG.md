@@ -122,6 +122,10 @@ pin, its date, and the tarball's sha256.
 
 ### Fixed
 
+- Turning Spotlight indexing off for the data volume no longer waits indefinitely on `mdutil`. The
+  `.metadata_never_index` marker is what excludes the volume and is written first, so the `mdutil`
+  call now has a 15 second limit, after which it is stopped and the mount or migration carries on.
+
 - A refused pod ends holding no address, lo0 alias or reference entry even when an update overlaps its
   admission: the update waits for the admission verdict, and one already under way when the refusal
   lands stops before the runtime call and frees what it took.
