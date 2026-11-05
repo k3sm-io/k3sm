@@ -1852,6 +1852,9 @@ func TestEnsureFileOwnedByViaSeams(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "runtimed.lock")
 		ops := fileOps{
 			open: func(p string, m int, perm uint32) (int, error) {
+				if m&unix.O_NOFOLLOW == 0 {
+					t.Errorf("open flags %#x lack O_NOFOLLOW", m)
+				}
 				return -1, unix.ELOOP
 			},
 			fchown: func(fd, uid, gid int) error {
@@ -1862,6 +1865,68 @@ func TestEnsureFileOwnedByViaSeams(t *testing.T) {
 		err := ensureFileOwnedByVia(ops, path, os.Getuid(), os.Getgid(), 0o600)
 		if !errors.Is(err, ErrNotRegularFile) || !errors.Is(err, errSymlinkRefused) {
 			t.Fatalf("ensureFileOwnedByVia = %v, want the symlink refusal", err)
+		}
+	})
+}
+
+// TestEnsureFileOwnedRefusalsNeverChown proves every refusal leaves the owner
+// alone: the open carries O_NOFOLLOW, so a symlink swapped in after the lstat
+// fails the open, and a hard link is refused on its link count. A fchown on
+// either would hand another file to the service user.
+func TestEnsureFileOwnedRefusalsNeverChown(t *testing.T) {
+	failChown := func(t *testing.T) func(fd, uid, gid int) error {
+		return func(fd, uid, gid int) error {
+			t.Errorf("fchown(%d, %d, %d) was called on a refused entry", fd, uid, gid)
+			return nil
+		}
+	}
+
+	t.Run("the open carries O_NOFOLLOW so a swapped-in symlink is refused", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "runtimed.lock")
+		target := filepath.Join(dir, "target")
+		if err := os.WriteFile(target, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		ops := fileOps{
+			open: func(p string, m int, perm uint32) (int, error) {
+				// The swap lands between the lstat and the open.
+				if err := os.Remove(p); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(target, p); err != nil {
+					t.Fatal(err)
+				}
+				if m&unix.O_NOFOLLOW == 0 {
+					t.Errorf("open flags %#x lack O_NOFOLLOW", m)
+				}
+				return unix.Open(p, m, perm)
+			},
+			fchown: failChown(t),
+		}
+		err := ensureFileOwnedByVia(ops, path, os.Getuid()+1, os.Getgid()+1, 0o600)
+		if !errors.Is(err, ErrNotRegularFile) || !errors.Is(err, errSymlinkRefused) {
+			t.Fatalf("ensureFileOwnedByVia = %v, want the symlink refusal", err)
+		}
+	})
+
+	t.Run("a hard link is refused before any fchown", func(t *testing.T) {
+		dir := t.TempDir()
+		other := filepath.Join(dir, "other")
+		path := filepath.Join(dir, "runtimed.lock")
+		if err := os.WriteFile(other, []byte("keep"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Link(other, path); err != nil {
+			t.Fatal(err)
+		}
+		ops := fileOps{open: unix.Open, fchown: failChown(t)}
+		err := ensureFileOwnedByVia(ops, path, os.Getuid()+1, os.Getgid()+1, 0o644)
+		if !errors.Is(err, ErrNotRegularFile) || !errors.Is(err, errHardlinkRefused) {
+			t.Fatalf("ensureFileOwnedByVia = %v, want the hard-link refusal", err)
 		}
 	})
 }
