@@ -265,23 +265,35 @@ type runtimedRuntime struct {
 	// admitted create returns, for an UpdatePod waiting for the verdict
 	// (admission.go, awaitUpdateVerdictLocked). Guarded by mu; created on first use.
 	admitSettled map[string]chan struct{}
-	// updating counts, per pod id, the UpdatePods past their terminal check that
-	// have not returned. Each may still acquire the pod's /32, so a release cannot
-	// start while it is non-zero (admission.go, claimFenceReleaseLocked). Guarded
-	// by mu; created on first use.
+	// updating counts, per pod id, the UpdatePods that have not returned, from
+	// before they wait for a verdict. Each may still acquire the pod's /32, so a
+	// release cannot start while it is non-zero (admission.go,
+	// claimFenceReleaseLocked). Guarded by mu; created on first use.
 	updating map[string]int
+	// held is the set of pods a create or update has begun acquiring for with no
+	// release since: what a refusal has to free, because a refused pod's delete
+	// frees nothing. An address reserved by a startup re-attachment is not in it
+	// (attachPod). Set before the acquiring, cleared by releasePodNetwork. Guarded
+	// by mu; created on first use.
+	held map[string]struct{}
+	// deleteOwed holds, per pod id, a delete that landed behind an UpdatePod in
+	// flight. The pod is stopped and gone from the apiserver; the release and the
+	// track delete are the last call out's (claimFenceReleaseLocked), since until
+	// then an update can still acquire by the pod's UID. Guarded by mu; created on
+	// first use.
+	deleteOwed map[string]*owedDelete
 	// admittedHook, when set, runs in CreatePod right after admission let the
 	// create through, before anything is registered: the seam a test uses to hold
 	// one create inside the admission window. Nil in production; set before any
 	// create and never changed, so it is read without mu.
 	admittedHook func(podID string)
-	// fenceReleasing holds, per pod id, a channel closed when CreatePod's fence
-	// has released what a refused create acquired (runtimed.go, CreatePod).
-	// admitOnCreate waits on it, so no create of the pod is admitted during the
-	// release. Guarded by mu; created on first use.
+	// fenceReleasing holds, per pod id, a channel closed when a claimed release is
+	// over (admission.go, claimFenceReleaseLocked; runtimed.go, fenceRelease).
+	// admitOnCreate and UpdatePod wait on it, so no create or update of the pod
+	// acquires during the release. Guarded by mu; created on first use.
 	fenceReleasing map[string]chan struct{}
-	// fenceReleaseHook and fenceWaitHook, when set, run at the fence after the
-	// unlock and before the release, and in admitOnCreate before it waits on a
+	// fenceReleaseHook and fenceWaitHook, when set, run after a release is claimed
+	// and before it frees anything, and in admitOnCreate before it waits on a
 	// release: the seams a test uses to admit a create inside that window. Nil
 	// in production; set before any create and never changed, read without mu.
 	fenceReleaseHook func(podID string)
@@ -1704,6 +1716,10 @@ func (r *runtimedRuntime) allocError(pod *corev1.Pod, err error) error {
 // that follows, through here.
 func (r *runtimedRuntime) releasePodNetwork(pod *corev1.Pod) {
 	id := string(pod.UID)
+	// Before the release, so a mark an overlapping call sets after this survives it.
+	r.mu.Lock()
+	delete(r.held, id)
+	r.mu.Unlock()
 	// The interconnect alias and slot go with the pod's network, on every
 	// release path, and do not depend on the pod-network seam.
 	r.interconnect.detach(pod)
@@ -1907,23 +1923,32 @@ func (r *runtimedRuntime) buildBox(ctx context.Context, pod *corev1.Pod, podIP s
 	return box, nil
 }
 
-// fenceRelease frees what a create refused at CreatePod's fence acquired (the
-// /32, the lo0 alias, the interconnect slot and the references), then ends the
-// wait admitOnCreate holds new creates of the pod in. The wait ends in a defer,
-// so a panic in the release cannot leave every later create of the pod waiting;
-// the panic is not recovered.
-func (r *runtimedRuntime) fenceRelease(pod *corev1.Pod, released chan struct{}) {
+// fenceRelease carries out a claim (claimFenceReleaseLocked): it frees what the
+// pod's UID holds (the /32, the lo0 alias, the interconnect slot and the
+// references), forgets the track if a delete is owed, then ends the wait new
+// creates and updates of the pod are held in. The wait ends in a defer, so a panic
+// in the release cannot leave them waiting; the panic is not recovered. Ending the
+// wait decides again, for a delete owed while this release ran.
+func (r *runtimedRuntime) fenceRelease(pod *corev1.Pod, c *fenceClaim) {
 	id := string(pod.UID)
 	defer func() {
 		r.mu.Lock()
 		delete(r.fenceReleasing, id)
+		next := r.claimFenceReleaseLocked(id)
 		r.mu.Unlock()
-		close(released)
+		close(c.released)
+		if next != nil {
+			r.fenceRelease(pod, next)
+		}
 	}()
 	if hook := r.fenceReleaseHook; hook != nil {
 		hook(id)
 	}
 	r.releasePodNetwork(pod)
+	if c.del != nil {
+		r.forgetTorndown(pod, c.del.owned)
+		return
+	}
 	r.refs.UnregisterPod(pod.UID)
 }
 
@@ -1949,7 +1974,9 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	if refused {
 		return nil
 	}
-	defer admitted.done()
+	// A deferred call so a panic anywhere below still ends the count, and with it
+	// runs any release this create is the last one out to owe.
+	defer r.createDone(pod, admitted)
 	if hook := r.admittedHook; hook != nil {
 		hook(string(pod.UID))
 	}
@@ -1964,6 +1991,9 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	// one (env resolution, volume materialization, the image pull): the
 	// resolver refuses an unreferenced object. The create deadline bounds the
 	// Forbidden retry of every read this create makes, together.
+	r.mu.Lock()
+	r.noteHeldLocked(string(pod.UID))
+	r.mu.Unlock()
 	r.refs.RegisterPod(pod)
 	ctx = r.refs.withCreateFetchBudget(ctx)
 	id := string(pod.UID)
@@ -1983,9 +2013,10 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	}
 	// Ordering: allocate the pod's /32 BEFORE translation/env
 	// resolution so box.PodIp and the status.podIP downward-API env carry it. A
-	// translate failure below does NOT release it here (an idempotent retry or
-	// the eventual DeletePod → releasePodNetwork reclaims it; auto-releasing
-	// would also rip a live pod's alias away on an UpdatePod translate error).
+	// translate failure below does NOT release it here (an idempotent retry, the
+	// eventual DeletePod → releasePodNetwork, or a later refusal reclaims it;
+	// auto-releasing would also rip a live pod's alias away on an UpdatePod
+	// translate error).
 	podIP, err := r.podIP(ctx, pod)
 	if err != nil {
 		// Log here (not just return) so the failure reaches server.log — VK's own
@@ -2040,39 +2071,22 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 
 	r.mu.Lock()
 	old := r.track[id]
-	if old != nil && old.evictedStatus() != nil {
-		// The pod was refused at admission or evicted while this create ran. Its
-		// terminal status is already the apiserver's; a live track here would run
-		// a pod the apiserver reports Failed. Admission's in-flight count keeps a
-		// refusal from landing between an admitted create's decision and this
-		// point, so this is the fence behind it. With the count taken on every
-		// admitted path, this branch is defence in depth.
+	_, deleted := r.deleteOwed[id]
+	if deleted || (old != nil && old.evictedStatus() != nil) {
+		// The pod was refused at admission, evicted or deleted while this create
+		// ran. A terminal status is already the apiserver's; a live track here
+		// would run a pod the apiserver reports Failed or no longer holds.
+		// Admission's in-flight count keeps a refusal from landing between an
+		// admitted create's decision and this point, so for a refusal this is the
+		// fence behind it, in defence in depth.
 		//
 		// A refused pod holds nothing, and its delete (forgetRejected) frees
-		// nothing, so the /32, the lo0 alias, the interconnect slot and the
-		// references this create acquired are released here. An evicted track
-		// keeps them: its DeletePod tears them down. All of them are keyed by
-		// the pod's UID, so the release is decided under r.mu: this create ends
-		// its own in-flight count first, and releases only when no other
-		// admitted create or update of the pod is in flight. Otherwise that call
-		// owns the resources (it reaches this decision itself, or runs the pod
-		// after a delete forgot the rejection), and releasing would take them
-		// from it. While the release runs, fenceReleasing holds every new create
-		// and update of the pod, so none acquires in the window after the unlock.
-		// The release takes only its own leaf locks.
-		admitted.doneLocked()
-		// When the release is skipped because another admitted create is in
-		// flight and that create then fails before its own fence, nothing
-		// releases the rejected pod's resources. That needs a rejected track
-		// beside two in-flight creates, which admitOnCreate makes close to
-		// unreachable.
-		released := r.claimFenceReleaseLocked(id, old)
+		// nothing, so what this create acquired is released on its way out
+		// (createDone), where the last in-flight call of the pod decides under
+		// r.mu. An evicted track keeps it: its DeletePod tears it down.
 		r.mu.Unlock()
 		r.log.Warn("CreatePod: the pod became terminal on this node while it was being created; not creating it",
-			"namespace", pod.Namespace, "name", pod.Name, "uid", id, "rejected", old.rejected, "released", released != nil)
-		if released != nil {
-			r.fenceRelease(pod, released)
-		}
+			"namespace", pod.Namespace, "name", pod.Name, "uid", id, "deleted", deleted)
 		return nil
 	}
 	if wantsGPU {
@@ -2322,7 +2336,9 @@ func (r *runtimedRuntime) completeCreate(pod *corev1.Pod, t *podTrack, rs *runti
 // Virtual Kubelet orders calls per pod, and this does not depend on it. An update
 // overlapping an admission waits for the verdict (awaitUpdateVerdictLocked); a
 // refusal landing behind one past its check is judged again before the runtime
-// call, and what the update took is released when it returns (updateDone).
+// call, and what the update took is released when it returns (updateDone). So is
+// a delete landing behind one: the update stops, and the last call out finishes
+// the delete (teardownPod, claimFenceReleaseLocked).
 func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error {
 	// Identity binding kept for the SAME in-process seam CreatePod uses, but
 	// UpdatePod itself never mints a token or re-reads a ConfigMap/Secret
@@ -2341,14 +2357,27 @@ func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error 
 	ctx = withPodIdentity(ctx, pod)
 	id := string(pod.UID)
 	r.mu.Lock()
+	// Counted before the wait, so a delete landing during it leaves the release
+	// to this update, which would otherwise wake to an untracked pod and allocate.
+	if r.updating == nil {
+		r.updating = map[string]int{}
+	}
+	r.updating[id]++
+	defer r.updateDone(pod)
 	if err := r.awaitUpdateVerdictLocked(ctx, pod); err != nil {
 		r.mu.Unlock()
 		return fmt.Errorf("update pod %s/%s: wait for the admission verdict: %w", pod.Namespace, pod.Name, err)
 	}
 	t, tracked := r.track[id]
-	terminal := isEvictedPod(pod) || isBudgetRejectedPod(pod)
+	// A pod whose delete has begun gets no update either: anything acquired behind
+	// the delete's release has no owner. With no track, the deletion stamp is the
+	// only sign an update that arrives after the delete has of it.
+	terminal := isEvictedPod(pod) || isBudgetRejectedPod(pod) || pod.DeletionTimestamp != nil
 	if tracked {
-		terminal = t.rejected || t.evictedStatus() != nil
+		terminal = t.rejected || t.evictedStatus() != nil || trackDeleting(t)
+	}
+	if _, deleted := r.deleteOwed[id]; deleted {
+		terminal = true
 	}
 	if terminal {
 		// Virtual Kubelet reaches here when a refused or evicted pod's labels,
@@ -2363,20 +2392,21 @@ func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error 
 	}
 	// A spec change (an ephemeral container added) can add references; the
 	// registration is replaced, so a removed reference stops being fetchable.
+	r.noteHeldLocked(id)
 	r.refs.RegisterPod(pod)
 	var previous *corev1.Pod
 	if tracked {
 		previous = t.pod
 		t.pod = pod.DeepCopy()
 	}
-	if r.updating == nil {
-		r.updating = map[string]int{}
-	}
-	r.updating[id]++
 	r.mu.Unlock()
-	defer r.updateDone(pod)
 	if hook := r.updateCheckedHook; hook != nil {
 		hook(id)
+	}
+	// A refusal or a delete that landed since the check holds: nothing more is
+	// acquired, and updateDone releases what this update took.
+	if r.updateStoppedNow(id) {
+		return nil
 	}
 	if tracked {
 		// A container whose image reference changed is a different pull: retire
@@ -2411,10 +2441,10 @@ func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error 
 	if err != nil {
 		return fmt.Errorf("translate pod %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
-	// A refusal that landed since the check holds: runtimed never heard of the
-	// pod, and updateDone releases what this update took. One landing after this
-	// read costs an RPC runtimed answers NotFound; the release still runs.
-	if r.refusedNow(id) {
+	// Judged again, as the allocation and the translation can take a while. One
+	// landing after this read costs an RPC runtimed answers NotFound; the release
+	// still runs.
+	if r.updateStoppedNow(id) {
 		return nil
 	}
 	resp, err := r.rt.UpdatePod(ctx, &runtimev1.UpdatePodRequest{Pod: box})
@@ -2637,6 +2667,11 @@ func (t *podTrack) quiesce() {
 // id holds (DeletePod's contract). Non-nil forgets the track only if it is still
 // owned — identity, not presence, as untrackRejectedCreate does — so a track an
 // idempotent re-create installed meanwhile is left alone.
+//
+// With an UpdatePod in flight the pod is stopped and removed from the apiserver
+// here, and the release and the track delete wait for the last update out, as it
+// can still acquire by the pod's UID (claimFenceReleaseLocked). The update stops at
+// its next check, since owing the delete is what it reads.
 func (r *runtimedRuntime) teardownPod(ctx context.Context, pod *corev1.Pod, grace int64, owned *podTrack) error {
 	id := string(pod.UID)
 	intent := r.recordStopIntent(pod, "")
@@ -2651,6 +2686,15 @@ func (r *runtimedRuntime) teardownPod(ctx context.Context, pod *corev1.Pod, grac
 	// Stop the probe runner before forgetting the pod (stopProber waits for the
 	// loops outside the lock, so no probe goroutine outlives the pod).
 	r.stopProber(id)
+	r.mu.Lock()
+	if r.updating[id] != 0 {
+		r.oweDeleteLocked(id, owned)
+		r.mu.Unlock()
+		r.removePodLogs(pod)
+		r.forceDeleteFromAPI(ctx, pod)
+		return nil
+	}
+	r.mu.Unlock()
 	// Drop any Service-proxy transport override for the pod, THEN release its /32
 	// (log-and-continue; idempotent after runtimed's own delete-path teardown) so
 	// pod churn never leaks a node pool address. releasePodNetwork does both, in
@@ -2665,6 +2709,21 @@ func (r *runtimedRuntime) teardownPod(ctx context.Context, pod *corev1.Pod, grac
 	// held the file open would strand the output on an unlinked inode, which is
 	// the one way this node can lose logs without saying so.
 	r.removePodLogs(pod)
+	r.forgetTorndown(pod, owned)
+	// Force-delete the pod from the apiserver now that runtimed has torn its
+	// containers down (r.rt.DeletePod is synchronous). Virtual Kubelet would
+	// otherwise leave a running-then-deleted pod in the API for the FULL
+	// deletionGracePeriodSeconds — see the r.client field doc for why its prompt
+	// path is unreachable via status. grace 0 = immediate; best-effort and
+	// NotFound-tolerant (VK may have force-deleted it first; either order is fine).
+	r.forceDeleteFromAPI(ctx, pod)
+	return nil
+}
+
+// forgetTorndown is the end of a teardown: the track goes (owned selects which, as
+// in teardownPod) with the references, and the track's workers are cancelled again.
+func (r *runtimedRuntime) forgetTorndown(pod *corev1.Pod, owned *podTrack) {
+	id := string(pod.UID)
 	r.mu.Lock()
 	t := r.track[id]
 	forget := false
@@ -2692,14 +2751,6 @@ func (r *runtimedRuntime) teardownPod(ctx context.Context, pod *corev1.Pod, grac
 		t.cancelRestarts()
 		t.cancelPulls()
 	}
-	// Force-delete the pod from the apiserver now that runtimed has torn its
-	// containers down (r.rt.DeletePod is synchronous). Virtual Kubelet would
-	// otherwise leave a running-then-deleted pod in the API for the FULL
-	// deletionGracePeriodSeconds — see the r.client field doc for why its prompt
-	// path is unreachable via status. grace 0 = immediate; best-effort and
-	// NotFound-tolerant (VK may have force-deleted it first; either order is fine).
-	r.forceDeleteFromAPI(ctx, pod)
-	return nil
 }
 
 // forceDeleteFromAPI removes pod from the apiserver with grace 0 so a

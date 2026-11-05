@@ -99,6 +99,14 @@ func TestHoldFirstAdmittedReleasesAtCleanup(t *testing.T) {
 	})
 }
 
+// admitDone ends one admitted create of pod id by hand, the forged state a test
+// uses to land a refusal inside an admitted create's window.
+func (r *runtimedRuntime) admitDone(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.admitDoneLocked(id)
+}
+
 // awaitClosed waits for ch to close, failing the test after admissionAwaitBound.
 func awaitClosed(t *testing.T, ch <-chan struct{}, what string) {
 	t.Helper()
@@ -350,7 +358,11 @@ func TestAdmissionInFlightLeakDoesNotBypassRetry(t *testing.T) {
 		if refused || ticket == nil {
 			t.Fatalf("admission refused %s (refused %v, ticket nil %v)", pod.Name, refused, ticket == nil)
 		}
-		return ticket.done
+		return func() {
+			h.r.mu.Lock()
+			defer h.r.mu.Unlock()
+			ticket.doneLocked()
+		}
 	}
 
 	t.Run("two in flight, one done: a refusal still yields to the other", func(t *testing.T) {
