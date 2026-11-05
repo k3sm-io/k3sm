@@ -988,10 +988,19 @@ var ErrStatusRecordDirNotCanonical = errors.New("status record dir is not its ow
 // written from, or an error when the deny could not match it. A relative value
 // (a relative --work-dir) is made absolute, because that is where the records it
 // names are written, and runtime.New refuses a relative one.
+//
+// A status directory that is the runtime's own <root>/status returns in the
+// runtime's spelling and is not checked. The profile denies <WorkDir>/status
+// whatever this value says, so there is no new deny that could fail to match, and
+// refusing a node that starts today would change a default node for nothing.
 func statusRecordDirOf(cfg RuntimedConfig) (string, error) {
 	dir, err := absDenyDir(cfg.StatusRecordDir, ErrStatusRecordDirNotCanonical)
 	if err != nil {
 		return "", err
+	}
+	own := filepath.Join(runtimeRoot(cfg.Root), sandbox.StatusSubdir)
+	if dir != "" && withoutFirmlink(dir) == withoutFirmlink(own) {
+		return own, nil
 	}
 	if err := checkStatusRecordDir(dir); err != nil {
 		return "", err

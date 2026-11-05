@@ -146,7 +146,8 @@ pin, its date, and the tarball's sha256.
 - The sandbox's explicit deny now follows the status records `k3sm status` reports on a node started
   with a non-default `--pod-root`, naming the data root's status directory. A node with
   a non-default pod root recreates its pods once on upgrade, and a node whose status directory is
-  reached through a symlink refuses to start, naming the path. A node on the default paths is unchanged.
+  reached through a symlink refuses to start, naming the path. A node on the default pod root is unchanged,
+  whatever its status directory resolves to.
 - `sudo k3sm uninstall` no longer fails with a staging sweep error, on that run and every re-run,
   when a leftover staging tree holds a file or directory with the `uchg`, `uappnd` or `uunlnk` flag,
   or is deeper than the process's open-file limit. The sweep clears those flags inside the tree and
@@ -165,7 +166,8 @@ pin, its date, and the tarball's sha256.
   started with a non-default `--pod-root`, naming the `server` and `agent` directories at the data
   root. Such a node recreates its pods once on upgrade, and refuses to start, naming the path, when
   the data root or either directory is reached through a symlink, or when `--pod-root` is inside either
-  directory. A node on the default paths is unchanged.
+  directory. A node on the default pod root is unchanged,
+  whatever its status directory resolves to.
 - `k3sm status` names the cause of an invalid developer-mode row: when `/` or `/Library` is the
   problem, the detail and remedy name that directory instead of suggesting `sudo rm` of the marker,
   which does not fix it. [Status JSON](docs/user/status-json.md) describes the row.

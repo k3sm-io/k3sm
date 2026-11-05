@@ -166,18 +166,21 @@ func TestCheckStatusRecordDir(t *testing.T) {
 func TestNewRuntimedRefusesAStatusRecordDirItCannotDeny(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
-		name  string
+		name string
+		// root is the pod root under the data root: a symlinked status directory
+		// is only refused where it is not the runtime's own.
+		root  string
 		setup func(t *testing.T, base string) string
 		want  error
 	}{
-		{"a symlinked directory, refused here", func(t *testing.T, base string) string {
+		{"a symlinked directory, refused here", "custom-root", func(t *testing.T, base string) string {
 			dir := filepath.Join(base, "status")
 			if err := os.Symlink(base, dir); err != nil {
 				t.Fatal(err)
 			}
 			return dir
 		}, ErrStatusRecordDirNotCanonical},
-		{"under the pods root, refused by the runtime", func(_ *testing.T, base string) string {
+		{"under the pods root, refused by the runtime", "", func(_ *testing.T, base string) string {
 			return filepath.Join(base, "pods", "status")
 		}, sandbox.ErrInvalidStatusRecordDir},
 	}
@@ -188,7 +191,7 @@ func TestNewRuntimedRefusesAStatusRecordDirItCannotDeny(t *testing.T) {
 			var logged bytes.Buffer
 			_, err := NewRuntimed(context.Background(), RuntimedConfig{
 				NodeName:        "n1",
-				Root:            base,
+				Root:            filepath.Join(base, tc.root),
 				PodLogsDir:      filepath.Join(base, "podlogs"),
 				StatusRecordDir: tc.setup(t, base),
 				Logger:          slog.New(slog.NewTextHandler(&logged, nil)),
@@ -198,6 +201,48 @@ func TestNewRuntimedRefusesAStatusRecordDirItCannotDeny(t *testing.T) {
 			}
 			if !strings.Contains(logged.String(), "level=ERROR") || !strings.Contains(logged.String(), tc.want.Error()) {
 				t.Errorf("the refusal is not logged by name:\n%s", logged.String())
+			}
+		})
+	}
+}
+
+// TestStatusRecordDirCheckSkipsADefaultNode pins that the symlink check follows the
+// pod root. The profile denies <WorkDir>/status whatever the field says, so on a
+// default node (the status directory is the runtime's own) a symlink there adds no
+// deny that could match nothing, and refusing it would stop a node that starts
+// today. Anywhere else the field is the only thing naming the directory, so the
+// symlink is still refused. It drives NewRuntimed, the entry that reads the field.
+func TestStatusRecordDirCheckSkipsADefaultNode(t *testing.T) {
+	cases := []struct {
+		name string
+		// root returns the pod root for a data root of base.
+		root    func(base string) string
+		wantErr error
+	}{
+		{"a default node starts", func(base string) string { return base }, nil},
+		{"a custom pod root is refused", func(base string) string { return filepath.Join(base, "pods-root") }, ErrStatusRecordDirNotCanonical},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stageExecShim(t)
+			base := resolvedTempDir(t)
+			elsewhere := filepath.Join(base, "elsewhere")
+			if err := os.MkdirAll(elsewhere, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			statusDir := filepath.Join(base, "status")
+			if err := os.Symlink(elsewhere, statusDir); err != nil {
+				t.Fatal(err)
+			}
+			_, err := NewRuntimed(context.Background(), RuntimedConfig{
+				NodeName:        "n1",
+				Root:            tc.root(base),
+				PodLogsDir:      filepath.Join(base, "podlogs"),
+				StatusRecordDir: statusDir,
+				Logger:          slog.New(slog.DiscardHandler),
+			})
+			if !errors.Is(err, tc.wantErr) || (tc.wantErr == nil && err != nil) {
+				t.Fatalf("NewRuntimed err = %v, want %v", err, tc.wantErr)
 			}
 		})
 	}
