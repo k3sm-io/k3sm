@@ -128,6 +128,67 @@ func fmtRungs(a [numBudgetRungs]*int64) string {
 	return strings.Join(parts, "/")
 }
 
+// TestDefaultLadderMatchesTheRuledRungs pins the three memory signals of the
+// default ladder to the values ruled on 2026-11-01: memory.available warns at
+// max(1Gi, 11% mem), memory.compressor at 56% of its limit, and memory.swap on a
+// 512Mi rise within 60 s, with its admit-stop and critical rungs at 1Gi and 2Gi
+// to keep the ladder ordered. Every value is a literal, not derived from the
+// constants the ladder is built from. The compressor rungs are in permille, the
+// unit SignalMemoryCompressor publishes, so 56% is 560.
+func TestDefaultLadderMatchesTheRuledRungs(t *testing.T) {
+	const none = -1
+	hosts := []struct {
+		memGi    int64
+		memory   [numBudgetRungs]*int64
+		swapGate int64
+	}{
+		// On 8 GiB the 1Gi floor sets the warn rung; 11% would be 901Mi.
+		{8, ptrs(1073741824, 805306368, 536870912, 268435456, 104857600), 2 * tGi},
+		{16, ptrs(1889785610, 1374389534, 858993459, 429496729, 104857600), 4 * tGi},
+		{32, ptrs(3779571220, 2748779069, 1717986918, 858993459, 104857600), 8 * tGi},
+		{64, ptrs(7559142440, 5497558138, 3435973836, 1717986918, 104857600), 16 * tGi},
+		{128, ptrs(15118284881, 10995116277, 6871947673, 3435973836, 104857600), 32 * tGi},
+	}
+	for _, h := range hosts {
+		t.Run(fmt.Sprintf("%dGiB", h.memGi), func(t *testing.T) {
+			l := defaultLadder(h.memGi*tGi, 2000)
+			want := []struct {
+				id    budgetv1alpha1.SignalID
+				rungs [numBudgetRungs]*int64
+			}{
+				{budgetv1alpha1.SignalMemoryAvailable, h.memory},
+				{budgetv1alpha1.SignalMemoryCompressor, ptrs(560, 600, 700, 750, 800)},
+				// No soft or hard rung: swap growth alone never evicts.
+				{budgetv1alpha1.SignalMemorySwap, ptrs(512*tMi, tGi, 2*tGi, none, none)},
+			}
+			for _, w := range want {
+				sl := ladderSignal(l, w.id)
+				for r := rungWarn; r < numBudgetRungs; r++ {
+					got, wantRung := "-", "-"
+					if sl.rungs[r] != nil {
+						got = fmt.Sprint(*sl.rungs[r])
+					}
+					if w.rungs[r] != nil {
+						wantRung = fmt.Sprint(*w.rungs[r])
+					}
+					if got != wantRung {
+						t.Errorf("%s %s = %s, want %s", w.id, budgetRungNames[r], got, wantRung)
+					}
+				}
+			}
+			if got := budgetv1alpha1.SignalMemoryCompressor.Unit(); got != budgetv1alpha1.UnitPermille {
+				t.Errorf("memory.compressor unit = %q, want permille", got)
+			}
+			if sl := ladderSignal(l, budgetv1alpha1.SignalMemorySwap); sl.windowSeconds == nil || *sl.windowSeconds != 60 {
+				t.Errorf("memory.swap window = %v, want 60 s", sl.windowSeconds)
+			}
+			if got := l.darwin.swapGateBytes; got != h.swapGate {
+				t.Errorf("memory.swap gate = %d, want %d", got, h.swapGate)
+			}
+		})
+	}
+}
+
 // TestBudgetOfLadderPerHostSize is the node-budget ladder gate: the default ladder
 // pins every rung and release in exact values for 8, 16, 32, 64 and 128 GiB
 // hosts (and the pid ladder for two process ceilings), and on each host every
@@ -145,17 +206,17 @@ func TestBudgetOfLadderPerHostSize(t *testing.T) {
 			[5]int64{1073741824, 805306368, 536870912, 268435456, 104857600},
 			[5]int64{1207959552, 939524096, 671088640, 402653184, 209715200}, 8 * tGi},
 		{16, 4000,
-			[5]int64{2061584302, 1374389534, 858993459, 429496729, 104857600},
-			[5]int64{2405181686, 1717986918, 1116691496, 644245094, 209715200}, 8 * tGi},
+			[5]int64{1889785610, 1374389534, 858993459, 429496729, 104857600},
+			[5]int64{2147483648, 1632087572, 1116691496, 644245094, 209715200}, 8 * tGi},
 		{32, 8000,
-			[5]int64{4123168604, 2748779069, 1717986918, 858993459, 104857600},
-			[5]int64{4810363371, 3435973836, 2233382993, 1288490188, 209715200}, 8 * tGi},
+			[5]int64{3779571220, 2748779069, 1717986918, 858993459, 104857600},
+			[5]int64{4294967295, 3264175144, 2233382993, 1288490188, 209715200}, 8 * tGi},
 		{64, 16000,
-			[5]int64{8246337208, 5497558138, 3435973836, 1717986918, 104857600},
-			[5]int64{9620726743, 6871947673, 4466765987, 2576980377, 209715200}, 16 * tGi},
+			[5]int64{7559142440, 5497558138, 3435973836, 1717986918, 104857600},
+			[5]int64{8589934591, 6528350289, 4466765987, 2576980377, 209715200}, 16 * tGi},
 		{128, 16000,
-			[5]int64{16492674416, 10995116277, 6871947673, 3435973836, 104857600},
-			[5]int64{19241453485, 13743895346, 8933531975, 5153960754, 209715200}, 32 * tGi},
+			[5]int64{15118284881, 10995116277, 6871947673, 3435973836, 104857600},
+			[5]int64{17179869183, 13056700579, 8933531975, 5153960754, 209715200}, 32 * tGi},
 	}
 	for _, h := range hosts {
 		t.Run(fmt.Sprintf("%dGiB/maxproc %d", h.memGi, h.pidMax), func(t *testing.T) {
@@ -164,10 +225,10 @@ func TestBudgetOfLadderPerHostSize(t *testing.T) {
 			p := h.pidMax
 			want := map[budgetv1alpha1.SignalID][2][numBudgetRungs]*int64{
 				budgetv1alpha1.SignalMemoryAvailable: {ptrs(h.mem[:]...), ptrs(h.memRel[:]...)},
-				budgetv1alpha1.SignalMemoryCompressor: {ptrs(500, 600, 700, 750, 800),
-					ptrs(450, 550, 650, 725, 700)},
-				budgetv1alpha1.SignalMemorySwap: {ptrs(256*tMi, 512*tMi, tGi, none, none),
-					ptrs(128*tMi, 384*tMi, 768*tMi, none, none)},
+				budgetv1alpha1.SignalMemoryCompressor: {ptrs(560, 600, 700, 750, 800),
+					ptrs(540, 580, 650, 725, 700)},
+				budgetv1alpha1.SignalMemorySwap: {ptrs(512*tMi, tGi, 2*tGi, none, none),
+					ptrs(256*tMi, 768*tMi, 1536*tMi, none, none)},
 				budgetv1alpha1.SignalSwapfsAvailable: {ptrs(3*F, 2*F, F*3/2, none, F),
 					ptrs(F*7/2, F*5/2, F*7/4, none, F*3/2)},
 				budgetv1alpha1.SignalNodefsAvailable: {ptrs(20*tGi, 15*tGi, 10*tGi, none, 2*tGi),
@@ -322,12 +383,12 @@ func TestBudgetMemorySwapGrowthWindow(t *testing.T) {
 	if v := swapValue(obs); v != nil {
 		t.Fatalf("first sample: memory.swap = %d, want unset", *v)
 	}
-	obs, h := rig.step(10*time.Second, swapUsed(5*tGi+256*tMi))
-	if v := swapValue(obs); v == nil || *v != 256*tMi {
-		t.Fatalf("a 256Mi rise in 10s: memory.swap = %v, want 256Mi", v)
+	obs, h := rig.step(10*time.Second, swapUsed(5*tGi+512*tMi))
+	if v := swapValue(obs); v == nil || *v != 512*tMi {
+		t.Fatalf("a 512Mi rise in 10s: memory.swap = %v, want 512Mi", v)
 	}
 	if heldRung(h, budgetv1alpha1.SignalMemorySwap) != rungWarn || obs.Level != budgetv1alpha1.LevelWarn {
-		t.Errorf("a 256Mi rise holds warn: rung %d level %q", heldRung(h, budgetv1alpha1.SignalMemorySwap), obs.Level)
+		t.Errorf("a 512Mi rise holds warn: rung %d level %q", heldRung(h, budgetv1alpha1.SignalMemorySwap), obs.Level)
 	}
 	// Falling swap clamps at 0, never negative.
 	obs, _ = rig.step(10*time.Second, swapUsed(4*tGi))
