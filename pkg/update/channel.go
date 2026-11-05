@@ -40,16 +40,16 @@ const (
 )
 
 var (
-	// errUnknownChannel is a channel that is neither stable nor rc.
-	errUnknownChannel = errors.New("refusing an unknown update channel")
-	// errChannelList is a channel listing that could not be read to its end. It
+	// ErrUnknownChannel is a channel that is neither stable nor rc.
+	ErrUnknownChannel = errors.New("refusing an unknown update channel")
+	// ErrChannelList is a channel listing that could not be read to its end. It
 	// never falls back to the stable answer, because that would offer a cluster
 	// on rc a release its channel did not choose.
-	errChannelList = errors.New("the rc channel's release listing failed")
-	// errChannelPageCap is a listing with more to read at maxListPages.
-	errChannelPageCap = errors.New("the rc channel's release listing did not end")
-	// errNoChannelRelease is a listing that held no release the channel offers.
-	errNoChannelRelease = errors.New("no k3sm release on the rc channel")
+	ErrChannelList = errors.New("the rc channel's release listing failed")
+	// ErrChannelPageCap is a listing with more to read at maxListPages.
+	ErrChannelPageCap = errors.New("the rc channel's release listing did not end")
+	// ErrNoChannelRelease is a listing that held no release the channel offers.
+	ErrNoChannelRelease = errors.New("no k3sm release on the rc channel")
 )
 
 // newestOnChannel is the highest release the rc channel offers: of the published
@@ -70,7 +70,7 @@ func (r reader) newestOnChannel(ctx context.Context) (Release, error) {
 		var list []apiRelease
 		hdr, err := r.getJSONHeader(ctx, u, &list)
 		if err != nil {
-			return Release{}, fmt.Errorf("%w: %w", errChannelList, err)
+			return Release{}, fmt.Errorf("%w: %w", ErrChannelList, err)
 		}
 		for _, a := range list {
 			rel, ok := a.release()
@@ -85,16 +85,16 @@ func (r reader) newestOnChannel(ctx context.Context) (Release, error) {
 		}
 		more, err := linkHasNext(hdr.Values("Link"))
 		if err != nil {
-			return Release{}, fmt.Errorf("%w: page %d: %w", errChannelList, page, err)
+			return Release{}, fmt.Errorf("%w: page %d: %w", ErrChannelList, page, err)
 		}
 		if !more {
 			if best.Tag == "" {
-				return Release{}, fmt.Errorf("%w at %s", errNoChannelRelease, r.base)
+				return Release{}, fmt.Errorf("%w at %s", ErrNoChannelRelease, r.base)
 			}
 			return best, nil
 		}
 	}
-	return Release{}, fmt.Errorf("%w within %d pages at %s", errChannelPageCap, maxListPages, r.base)
+	return Release{}, fmt.Errorf("%w within %d pages at %s", ErrChannelPageCap, maxListPages, r.base)
 }
 
 // checkChannel refuses a channel other than stable (or empty, which means
@@ -104,7 +104,7 @@ func checkChannel(ch updatesv1alpha1.UpdateChannel) error {
 	case "", updatesv1alpha1.UpdateChannelStable, updatesv1alpha1.UpdateChannelRC:
 		return nil
 	}
-	return fmt.Errorf("%w %q", errUnknownChannel, ch)
+	return fmt.Errorf("%w %q", ErrUnknownChannel, ch)
 }
 
 // linkHasNext reports whether the Link header values (RFC 8288) carry a link

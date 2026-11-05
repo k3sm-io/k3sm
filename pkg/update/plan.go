@@ -20,11 +20,13 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 	"text/tabwriter"
 
 	corev1 "k8s.io/api/core/v1"
 
 	"k3sm.io/k3sm/pkg/status"
+	"k3sm.io/k3sm/pkg/version"
 )
 
 // controlPlaneLabel marks a server Node.
@@ -87,6 +89,14 @@ type Plan struct {
 	Signature string `json:"signature"`
 	// AllowDowngrade is spec.allowDowngrade.
 	AllowDowngrade bool `json:"allowDowngrade"`
+	// Channel is the release channel as read for this plan, for a person;
+	// empty prints no line.
+	Channel string `json:"channel,omitempty"`
+	// Pin says whether a release pin binds this roll, for a person; empty
+	// prints no line.
+	Pin string `json:"pin,omitempty"`
+	// Pinned is whether Pin names a pin for Target.
+	Pinned bool `json:"pinned,omitempty"`
 }
 
 // NewPlan is the plan to move nodes to target, in RollOrder.
@@ -103,9 +113,20 @@ func NewPlan(target string, nodes []corev1.Node, controllerNode string, drain bo
 // node says of itself, so they are control-stripped first.
 func (p Plan) Render(w io.Writer) {
 	tw := tabwriter.NewWriter(w, 0, 0, 3, ' ', 0)
-	fmt.Fprintf(tw, "target\t%s\n", status.ClipText(p.Target, 128))
+	candidate := isCandidate(p.Target)
+	target := status.ClipText(p.Target, 128)
+	if candidate {
+		target += " (release candidate)"
+	}
+	fmt.Fprintf(tw, "target\t%s\n", target)
+	if p.Channel != "" {
+		fmt.Fprintf(tw, "channel\t%s\n", p.Channel)
+	}
 	fmt.Fprintf(tw, "drain\t%s\n", yesNo(p.Drain))
 	fmt.Fprintf(tw, "signature\t%s\n", p.Signature)
+	if p.Pin != "" {
+		fmt.Fprintf(tw, "pin\t%s\n", p.Pin)
+	}
 	fmt.Fprintf(tw, "allow downgrade\t%s\n", yesNo(p.AllowDowngrade))
 	fmt.Fprintf(tw, "\nORDER\tNODE\tVERSION\tSTATE\n")
 	for i, n := range p.Nodes {
@@ -115,6 +136,15 @@ func (p Plan) Render(w io.Writer) {
 	if p.ControllerNode == "" {
 		fmt.Fprintln(w, "\nThe server that runs the update controller goes last; which one it is was not known, so the servers are listed by name.")
 	}
+	if candidate && p.Pin != "" && !p.Pinned {
+		fmt.Fprintln(w, "\nNo pin is known to bind this release candidate roll. --pin-sha256 binds it to one archive digest.")
+	}
+}
+
+// isCandidate reports whether tag is a release candidate in the one spelling a
+// channel offers.
+func isCandidate(tag string) bool {
+	return version.CanonicalTag(tag) && strings.Contains(tag, "-rc.")
 }
 
 func yesNo(b bool) string {

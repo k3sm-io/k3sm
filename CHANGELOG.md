@@ -18,6 +18,11 @@ pin, its date, and the tarball's sha256.
   reports that as `rejected`, and reports `clamped` when it clamps a reserve above the measured value
   or a tier-1 timer past its floor. No RBAC changes. Nothing writes the policy annotation yet, and a
   policy's values are held but not yet acted on.
+- `k3sm update check` and `k3sm update apply` follow the cluster's update channel: the `UpdatePolicy`
+  named `cluster` where the credentials may read it, otherwise the channel a server publishes on its
+  Node, and `stable` when neither exists. `check` names the channel on its first line and as `channel`
+  in `-o json`, and a server rechecks when the channel changes. `apply` refuses to choose a release on a
+  channel it cannot read, and its plan names the channel and whether a release pin is set.
 - `k3sm status -o json` carries this node's budget as an optional `budget` object (pressure level,
   admission, each signal against its rungs, and the headroom recommendation), in the schema of
   `NodeBudget.status`. `schemaVersion` stays `1`. [Status JSON](docs/user/status-json.md#budget)
