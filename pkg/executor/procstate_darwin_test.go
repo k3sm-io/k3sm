@@ -27,11 +27,13 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// TestProcessExitedMonotoneAcrossReap pins that processExited never flips back to
+// TestProcessExitedMonotoneAcrossReapSmoke exercises the real kernel as a smoke
+// test; the deterministic claim lives in TestProcessExitedMonotoneAcrossReapSeam.
+// It pins that processExited never flips back to
 // "running" once it has said "exited": a child observed as a zombie must still read
 // exited while, and after, the reaper's wait4 removes it from the process table. A
 // verdict built from two kernel reads straddling the reap answered false here.
-func TestProcessExitedMonotoneAcrossReap(t *testing.T) {
+func TestProcessExitedMonotoneAcrossReapSmoke(t *testing.T) {
 	children := 300
 	if testing.Short() {
 		children = 20
@@ -50,6 +52,10 @@ func TestProcessExitedMonotoneAcrossReap(t *testing.T) {
 				if i == 0 {
 					t.Fatalf("child %d (pid %d): never reported exited", i, pid)
 				}
+				// Only child 0 is a hard real-kernel check. On a loaded host the
+				// exit can outlast the deadline for later children, and failing
+				// there would test the host, not processExited; the seam test
+				// covers the reap race deterministically.
 				t.Skipf("child %d (pid %d): host too loaded to observe the exit in time", i, pid)
 			}
 			runtime.Gosched() // a barrier poll, not a budget: the deadline above is the only bound
@@ -76,24 +82,28 @@ func TestProcessExitedMonotoneAcrossReap(t *testing.T) {
 }
 
 // TestProcessExitedMonotoneAcrossReapSeam drives the straddle deterministically:
-// the first read is the zombie record, the next reads are the empty slot a reap
-// leaves behind. The verdict must stay "exited" across the reap.
+// the reap lands immediately after the first kernel read, so a verdict that reads
+// the kernel twice sees the zombie record and then the empty slot a reap leaves
+// behind. The verdict must stay "exited" however many reads it makes, and it is
+// the test that carries the monotone claim.
 func TestProcessExitedMonotoneAcrossReapSeam(t *testing.T) {
 	zombie := make([]byte, unix.SizeofKinfoProc)
 	var kp unix.KinfoProc
 	kp.Proc.P_stat = pStatZombie
 	copy(zombie, (*[unix.SizeofKinfoProc]byte)(unsafe.Pointer(&kp))[:])
 	reaped := false
+	reads := 0
 	read := func(int) ([]byte, error) {
-		if !reaped {
-			return zombie, nil
+		reads++
+		if reaped {
+			return nil, nil
 		}
-		return nil, nil
+		reaped = true // the reaper's wait4 lands right after this read
+		return zombie, nil
 	}
 	if !processExitedVia(read, 42) {
-		t.Fatal("zombie record read as running")
+		t.Fatalf("zombie record read as running (kernel reads: %d)", reads)
 	}
-	reaped = true
 	if !processExitedVia(read, 42) {
 		t.Fatal("reported running after the reap")
 	}
