@@ -634,12 +634,12 @@ func TestEvictionKillsVictimAndSetsEvictedReason(t *testing.T) {
 		}
 		hogTrack := h.r.trackByID("uid-hog")
 		h.r.buildStatus(hog.DeepCopy(), hogTrack, exit("uid-hog"), nil)
-		// The re-exec timer is armed asynchronously, so "not armed" is held over
-		// a settle window rather than read once.
-		for deadline := time.Now().Add(100 * time.Millisecond); time.Now().Before(deadline); time.Sleep(2 * time.Millisecond) {
-			if clk.HasWaiters() {
-				t.Fatal("an evicted pod's exit armed a re-exec")
-			}
+		// The re-exec timer is armed by a goroutine, but the decision to start
+		// one is taken synchronously inside buildStatus, so the absence of an
+		// in-flight attempt is read directly rather than inferred from a timer
+		// that may simply not have been armed yet.
+		if restartScheduled(hogTrack, "c0") || clk.HasWaiters() {
+			t.Fatal("an evicted pod's exit armed a re-exec")
 		}
 		h.f.mu.Lock()
 		restarts, starts := h.f.restartCalls, h.f.startCalls

@@ -36,6 +36,7 @@ import (
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/clock"
 	testclock "k8s.io/utils/clock/testing"
 
 	"k3sm.io/runtimed/pkg/mount"
@@ -420,43 +421,82 @@ func TestProjectedRefreshLoopCallsRuntimeAndReportsFailures(t *testing.T) {
 			t.Fatalf("uncached reads brought the GET count to %d, want 4", got)
 		}
 	})
+}
 
-	t.Run("the loop ticks at its own interval and stops with ctx", func(t *testing.T) {
-		x := newRefreshFixture(t, nil)
-		x.track(runtimedPod("default", "a"))
-		clk := testclock.NewFakeClock(time.Unix(0, 0))
-		x.r.clk = clk
-		x.f.called = make(chan string, 4)
-		ctx, cancel := context.WithCancel(context.Background())
-		done := make(chan struct{})
-		go func() {
-			x.r.runProjectedRefresh(ctx)
-			close(done)
-		}()
-		deadline := time.Now().Add(5 * time.Second)
-		for !clk.HasWaiters() {
-			if time.Now().After(deadline) {
-				t.Fatal("the loop never armed its ticker")
-			}
-			time.Sleep(time.Millisecond)
-		}
-		clk.Step(resyncInterval)
+// heldTicker is a ticker the test drives by hand and records the interval it
+// was created with.
+type heldTicker struct {
+	c        chan time.Time
+	interval time.Duration
+}
+
+func (h *heldTicker) C() <-chan time.Time { return h.c }
+func (h *heldTicker) Stop()               {}
+
+// heldTickerClock hands runProjectedRefresh a ticker the test fires itself.
+type heldTickerClock struct {
+	*testclock.FakeClock
+	made chan *heldTicker
+}
+
+func (c *heldTickerClock) NewTicker(d time.Duration) clock.Ticker {
+	tk := &heldTicker{c: make(chan time.Time), interval: d}
+	c.made <- tk
+	return tk
+}
+
+// TestProjectedRefreshCadenceNegativeIsBarriered pins that the refresh loop
+// ticks at projectedRefreshInterval and not at resyncInterval, and stops with
+// its context.
+//
+// "Nothing refreshes at resyncInterval" is not asserted by stepping a fake
+// clock and waiting out a window for a refresh that did not come: that passes
+// vacuously on a slow host. The cadence is read where it is decided, as the
+// interval the loop asks its clock's ticker for, and the loop's response to a
+// tick is driven through a ticker the test owns, whose unbuffered channel
+// makes each send a barrier: it returns only once the loop has taken the tick.
+func TestProjectedRefreshCadenceNegativeIsBarriered(t *testing.T) {
+	x := newRefreshFixture(t, nil)
+	x.track(runtimedPod("default", "a"))
+	clk := &heldTickerClock{FakeClock: testclock.NewFakeClock(time.Unix(0, 0)), made: make(chan *heldTicker, 1)}
+	x.r.clk = clk
+	x.f.called = make(chan string)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		x.r.runProjectedRefresh(ctx)
+		close(done)
+	}()
+
+	var tk *heldTicker
+	select {
+	case tk = <-clk.made:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the loop never created its ticker")
+	}
+	if tk.interval != projectedRefreshInterval {
+		t.Fatalf("the loop ticks every %v, want projectedRefreshInterval (%v): the refresh cadence is not resyncInterval (%v)",
+			tk.interval, projectedRefreshInterval, resyncInterval)
+	}
+
+	// A tick refreshes, one refresh per tick.
+	for i := range 2 {
 		select {
-		case id := <-x.f.called:
-			t.Fatalf("refreshed %s after resyncInterval; the refresh cadence is its own", id)
-		case <-time.After(50 * time.Millisecond):
+		case tk.c <- time.Time{}:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("tick %d: the loop never took it", i)
 		}
-		clk.Step(projectedRefreshInterval - resyncInterval)
 		select {
 		case <-x.f.called:
 		case <-time.After(5 * time.Second):
-			t.Fatal("no refresh after projectedRefreshInterval")
+			t.Fatalf("tick %d: no refresh", i)
 		}
-		cancel()
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			t.Fatal("the loop did not stop with its context")
-		}
-	})
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the loop did not stop with its context")
+	}
 }
