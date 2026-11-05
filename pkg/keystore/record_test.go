@@ -21,10 +21,12 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"strings"
 	"testing"
+	"testing/iotest"
 )
 
 // testKey is a fixed 32-byte seal key for record-level tests.
@@ -122,7 +124,7 @@ func TestSealNonceIsFresh(t *testing.T) {
 	}
 
 	d := testRecord()
-	if err := d.seal(testKey, []byte("same"), failingReader{}); err == nil {
+	if err := d.seal(testKey, []byte("same"), iotest.ErrReader(errors.New("no entropy"))); err == nil {
 		t.Fatal("seal with a failing entropy source succeeded")
 	}
 }
@@ -153,14 +155,13 @@ func TestParseRecordRefusesMalformed(t *testing.T) {
 	good := r.marshal()
 	nameLen := func(n uint16) []byte {
 		b := bytes.Clone(good)
-		b[2], b[3] = byte(n>>8), byte(n)
+		binary.BigEndian.PutUint16(b[2:], n)
 		return b
 	}
-	ctLen := func(delta int) []byte {
+	ctLen := func(delta uint32) []byte {
 		b := bytes.Clone(good)
 		off := 4 + len(r.name) + 44
-		c := int(b[off])<<24 | int(b[off+1])<<16 | int(b[off+2])<<8 | int(b[off+3]) + delta
-		b[off], b[off+1], b[off+2], b[off+3] = byte(c>>24), byte(c>>16), byte(c>>8), byte(c)
+		binary.BigEndian.PutUint32(b[off:], binary.BigEndian.Uint32(b[off:])+delta)
 		return b
 	}
 	tests := []struct {
@@ -172,7 +173,7 @@ func TestParseRecordRefusesMalformed(t *testing.T) {
 		{"zero name length", nameLen(0)},
 		{"name length past the file", nameLen(uint16(len(good)))},
 		{"name length over the limit", nameLen(maxNameLen + 1)},
-		{"ciphertext length short of the file", ctLen(-1)},
+		{"ciphertext length short of the file", ctLen(^uint32(0))}, // minus one
 		{"ciphertext length past the file", ctLen(1)},
 		{"truncated", good[:len(good)-1]},
 		{"trailing byte", append(bytes.Clone(good), 0)},
@@ -211,8 +212,11 @@ func FuzzParseRecord(f *testing.F) {
 }
 
 func TestCheckName(t *testing.T) {
-	good := []string{"a", "0", "signer-key", "signer.key", "a-b.c-d", strings.Repeat("a", maxNameLen)}
-	bad := []string{"", ".", "..", ".lock", "a/b", "../x", "-a", "a-", "a.", "Key", "sIgner", "a_b", "a b", "a\x00b", "a\nb", "é", strings.Repeat("a", maxNameLen+1)}
+	good := []string{"a", "0", "signer-key", "signer.key", "a-b.c-d", "a--b", strings.Repeat("a", maxNameLen), strings.Repeat("a.", maxNameLen/2) + "a"}
+	bad := []string{"", ".", "..", ".lock", "a/b", "../x", "-a", "a-", "a.", "Key", "sIgner", "a_b", "a b", "a\x00b", "a\nb", "é", strings.Repeat("a", maxNameLen+1),
+		// Each dot-separated label begins and ends with a letter or digit, as a
+		// Kubernetes DNS-1123 subdomain requires.
+		"a..b", "a.-b", "a-.b", "a-..a", "0..0"}
 	for _, n := range good {
 		if err := checkName(n); err != nil {
 			t.Errorf("checkName(%q) = %v, want nil", n, err)
@@ -225,9 +229,10 @@ func TestCheckName(t *testing.T) {
 	}
 }
 
-// FuzzCheckName: any accepted name is a safe, single, case-unique file name.
+// FuzzCheckName: any accepted name is a safe, single, case-unique file name,
+// and a DNS-1123 subdomain: every label begins and ends with a letter or digit.
 func FuzzCheckName(f *testing.F) {
-	for _, s := range []string{"signer-key", ".lock", "..", "a/b", "Key"} {
+	for _, s := range []string{"signer-key", ".lock", "..", "a/b", "Key", "a.-b"} {
 		f.Add(s)
 	}
 	f.Fuzz(func(t *testing.T, name string) {
@@ -236,6 +241,11 @@ func FuzzCheckName(f *testing.F) {
 		}
 		if len(name) == 0 || len(name) > maxNameLen || name[0] == '.' || strings.ContainsAny(name, "/\x00") || strings.ToLower(name) != name {
 			t.Fatalf("checkName accepted %q", name)
+		}
+		for _, bad := range []string{"..", ".-", "-."} {
+			if strings.Contains(name, bad) {
+				t.Fatalf("checkName accepted %q, which has a label that does not begin and end with a letter or digit", name)
+			}
 		}
 	})
 }
@@ -302,7 +312,3 @@ func TestDerivedKeysAreSeparate(t *testing.T) {
 		t.Fatal("a derived key equals the master or the other derived key")
 	}
 }
-
-type failingReader struct{}
-
-func (failingReader) Read([]byte) (int, error) { return 0, errors.New("no entropy") }

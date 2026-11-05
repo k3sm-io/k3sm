@@ -44,10 +44,11 @@ type Config struct {
 	// Dir is the entries' directory, <server work dir>/keystore.
 	Dir string
 	// MasterDir is the master pair's directory,
-	// <server work dir>/cred/keystore-master. Its parent must not be Dir.
+	// <server work dir>/cred/keystore-master.
 	MasterDir string
 	// UID and GID are the service user's. Every file and directory the store
-	// creates is handed to them, and every one it reads must be owned by UID.
+	// creates is handed to them, and the entries' directory, cred/, the master
+	// directory and the master file must be owned by UID.
 	UID, GID uint32
 }
 
@@ -67,8 +68,8 @@ type FileStore struct {
 	now      func() time.Time
 	chown    func(f *os.File, uid, gid int) error
 	lockWait time.Duration
-	// step, when non-nil, is called at each durable step of a write; a
-	// non-nil return aborts the write there, as a crash would.
+	// step is called at each durable step of a write; a non-nil return aborts
+	// the write there, as a crash would.
 	step func(name string) error
 }
 
@@ -92,36 +93,35 @@ func New(cfg Config) *FileStore {
 // the current pointer; an entry directory without a pointer is an interrupted
 // Put, which the next Put of that name discards.
 func (s *FileStore) Put(ctx context.Context, name string, kind Kind, value []byte) (Version, error) {
-	if err := checkName(name); err != nil {
-		return Version{}, err
-	}
-	if err := checkValue(kind, value); err != nil {
-		return Version{}, fmt.Errorf("put %s: %w", name, err)
-	}
-	root, err := s.openDir(s.dir, true)
-	if err != nil {
-		return Version{}, fmt.Errorf("put %s: %w", name, err)
-	}
-	defer func() { _ = root.Close() }() // writes are fsynced by writeFile
-	unlock, err := s.lock(ctx, root, true)
-	if err != nil {
-		return Version{}, fmt.Errorf("put %s: %w", name, err)
-	}
-	defer unlock()
-	k, err := s.masterForPut(root)
-	if err != nil {
-		return Version{}, fmt.Errorf("put %s: %w", name, err)
-	}
-	e, err := s.createEntry(root, name)
-	if err != nil {
-		return Version{}, fmt.Errorf("put %s: %w", name, err)
-	}
-	defer e.close()
-	v, err := s.writeEntry(e, k, kind, value)
+	v, err := s.put(ctx, name, kind, value)
 	if err != nil {
 		return Version{}, fmt.Errorf("put %s: %w", name, err)
 	}
 	return v, nil
+}
+
+func (s *FileStore) put(ctx context.Context, name string, kind Kind, value []byte) (Version, error) {
+	if err := checkName(name); err != nil {
+		return Version{}, err
+	}
+	if err := checkValue(kind, value); err != nil {
+		return Version{}, err
+	}
+	root, done, err := s.openLocked(ctx, true, true)
+	if err != nil {
+		return Version{}, err
+	}
+	defer done()
+	k, err := s.masterForPut(root)
+	if err != nil {
+		return Version{}, err
+	}
+	e, err := s.createEntry(root, name)
+	if err != nil {
+		return Version{}, err
+	}
+	defer e.close()
+	return s.writeEntry(e, k, kind, value)
 }
 
 // createEntry makes name's directory with a fresh generation. A directory
@@ -179,7 +179,7 @@ func (s *FileStore) writeEntry(e *entry, k keys, kind Kind, value []byte) (Versi
 	if err := s.writeFile(e.root, currentName, ptr.marshal()); err != nil {
 		return Version{}, err
 	}
-	return versionOf(rec, kind, value, k), nil
+	return versionOf(rec, value, k.fingerprint), nil
 }
 
 // Current returns the version the current pointer names, with its value.
@@ -223,63 +223,64 @@ func (s *FileStore) Get(ctx context.Context, name string, version uint64) (Versi
 // read runs fn on name's entry under the shared lock. A missing entries'
 // directory, entry directory or current pointer is ErrNotFound.
 func (s *FileStore) read(ctx context.Context, name string, fn func(*entry, keys) error) error {
-	if err := checkName(name); err != nil {
-		return err
-	}
-	root, err := s.openDir(s.dir, false)
-	if errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("%s: %w", name, ErrNotFound)
-	}
+	err := func() error {
+		if err := checkName(name); err != nil {
+			return err
+		}
+		root, done, err := s.openLocked(ctx, false, false)
+		if errors.Is(err, fs.ErrNotExist) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		defer done()
+		e, err := openEntry(root, name)
+		if err != nil {
+			return err
+		}
+		defer e.close()
+		k, err := s.loadMaster()
+		if err != nil {
+			return err
+		}
+		return fn(e, k)
+	}()
 	if err != nil {
-		return fmt.Errorf("%s: %w", name, err)
-	}
-	defer func() { _ = root.Close() }() // read-only; nothing to flush
-	unlock, err := s.lock(ctx, root, false)
-	if err != nil {
-		return fmt.Errorf("%s: %w", name, err)
-	}
-	defer unlock()
-	e, err := openEntry(root, name)
-	if err != nil {
-		return fmt.Errorf("%s: %w", name, err)
-	}
-	defer e.close()
-	k, err := s.loadMaster()
-	if err != nil {
-		return fmt.Errorf("%s: %w", name, err)
-	}
-	if err := fn(e, k); err != nil {
 		return fmt.Errorf("%s: %w", name, err)
 	}
 	return nil
 }
 
-// List returns every entry, sorted by name. An entry that cannot be opened is
-// returned with Err set and nothing else. A directory that is not an entry (an
-// interrupted Put, or a name Put would refuse) is not listed.
+// List returns every entry, sorted by name. An entry that cannot be opened,
+// or any of whose committed versions cannot, is returned with Err set and
+// nothing else. A directory that is not an entry (an interrupted Put, or a
+// name Put would refuse) is not listed.
 func (s *FileStore) List(ctx context.Context) ([]Entry, error) {
-	root, err := s.openDir(s.dir, false)
+	out, err := s.list(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list: %w", err)
+	}
+	return out, nil
+}
+
+func (s *FileStore) list(ctx context.Context) ([]Entry, error) {
+	root, done, err := s.openLocked(ctx, false, false)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("list: %w", err)
+		return nil, err
 	}
-	defer func() { _ = root.Close() }() // read-only; nothing to flush
-	unlock, err := s.lock(ctx, root, false)
-	if err != nil {
-		return nil, fmt.Errorf("list: %w", err)
-	}
-	defer unlock()
+	defer done()
 	names, err := readDirNames(root)
 	if err != nil {
-		return nil, fmt.Errorf("list: %w", err)
+		return nil, err
 	}
 	sort.Strings(names)
 	var (
-		out    []Entry
-		k      keys
-		loaded bool
+		out []Entry
+		k   keys
 	)
 	for _, name := range names {
 		if checkName(name) != nil {
@@ -289,38 +290,36 @@ func (s *FileStore) List(ctx context.Context) ([]Entry, error) {
 		if errors.Is(err, ErrNotFound) {
 			continue
 		}
-		if err == nil && !loaded {
-			// The master is needed only once there is an entry to open, and
-			// its failure is about every entry, so it fails the whole call.
+		if err != nil {
+			out = append(out, Entry{Name: name, Err: err})
+			continue
+		}
+		// The master is needed only once there is an entry to open, and its
+		// failure is about every entry, so it fails the whole call.
+		if k.seal == nil {
 			if k, err = s.loadMaster(); err != nil {
 				e.close()
-				return nil, fmt.Errorf("list: %w", err)
+				return nil, err
 			}
-			loaded = true
 		}
-		out = append(out, listEntry(e, err, k, name))
-		if e != nil {
-			e.close()
-		}
+		out = append(out, listEntry(e, k))
+		e.close()
 	}
 	return out, nil
 }
 
-// listEntry opens every committed version of e for List. Any failure,
-// including openErr from opening e itself, is the entry's Err.
-func listEntry(e *entry, openErr error, k keys, name string) Entry {
-	if openErr != nil {
-		return Entry{Name: name, Err: openErr}
-	}
+// listEntry opens every committed version of e for List. Any failure is the
+// entry's Err.
+func listEntry(e *entry, k keys) Entry {
 	cur, err := e.pointer(k)
 	if err != nil {
-		return Entry{Name: name, Err: err}
+		return Entry{Name: e.name, Err: err}
 	}
-	out := Entry{Name: name, Versions: make([]Version, 0, cur)}
+	out := Entry{Name: e.name, Versions: make([]Version, 0, cur)}
 	for n := uint64(1); n <= cur; n++ {
 		v, _, err := e.version(k, n)
 		if err != nil {
-			return Entry{Name: name, Err: fmt.Errorf("version %d: %w", n, err)}
+			return Entry{Name: e.name, Err: fmt.Errorf("version %d: %w", n, err)}
 		}
 		out.Versions = append(out.Versions, v)
 	}
@@ -330,46 +329,45 @@ func listEntry(e *entry, openErr error, k keys, name string) Entry {
 
 // Delete removes name and every version of it. The pointer is removed first,
 // so an interrupted Delete leaves an interrupted Put: not an entry, and
-// discarded by the next Put of the name.
+// discarded by the next Put of the name. Delete reads nothing inside the
+// entry, so it removes one List reports as corrupt.
 func (s *FileStore) Delete(ctx context.Context, name string) error {
-	if err := checkName(name); err != nil {
-		return err
-	}
-	root, err := s.openDir(s.dir, false)
-	if errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("delete %s: %w", name, ErrNotFound)
-	}
-	if err != nil {
-		return fmt.Errorf("delete %s: %w", name, err)
-	}
-	defer func() { _ = root.Close() }() // removals are fsynced below
-	unlock, err := s.lock(ctx, root, true)
-	if err != nil {
-		return fmt.Errorf("delete %s: %w", name, err)
-	}
-	defer unlock()
-	e, err := openEntry(root, name)
-	if err != nil {
-		return fmt.Errorf("delete %s: %w", name, err)
-	}
-	err = e.root.Remove(currentName)
-	if err == nil {
-		err = syncDir(e.root)
-	}
-	e.close()
-	if err == nil {
-		err = s.step("delete " + name)
-	}
-	if err == nil {
-		err = root.RemoveAll(name)
-	}
-	if err == nil {
-		err = syncDir(root)
-	}
-	if err != nil {
+	if err := s.delete(ctx, name); err != nil {
 		return fmt.Errorf("delete %s: %w", name, err)
 	}
 	return nil
+}
+
+func (s *FileStore) delete(ctx context.Context, name string) error {
+	if err := checkName(name); err != nil {
+		return err
+	}
+	root, done, err := s.openLocked(ctx, false, true)
+	if errors.Is(err, fs.ErrNotExist) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	defer done()
+	e, err := openEntryDir(root, name)
+	if err != nil {
+		return err
+	}
+	defer e.close()
+	if err := e.root.Remove(currentName); err != nil {
+		return err
+	}
+	if err := syncDir(e.root); err != nil {
+		return err
+	}
+	if err := s.step("delete " + name); err != nil {
+		return err
+	}
+	if err := root.RemoveAll(name); err != nil {
+		return err
+	}
+	return syncDir(root)
 }
 
 // entry is one open entry directory and its generation.
@@ -379,9 +377,32 @@ type entry struct {
 	generation [generationSize]byte
 }
 
-// openEntry opens name's directory and reads its generation. A missing
-// directory, or one without a current pointer, is ErrNotFound.
+// openEntry opens name's directory and reads its generation.
 func openEntry(root *os.Root, name string) (*entry, error) {
+	e, err := openEntryDir(root, name)
+	if err != nil {
+		return nil, err
+	}
+	b, _, err := readFile(e.root, generationName, generationFileSize)
+	if err == nil && (len(b) != generationFileSize || b[len(b)-1] != '\n') {
+		err = fmt.Errorf("%w: malformed", errBadFile)
+	}
+	if err == nil {
+		if _, herr := hex.Decode(e.generation[:], b[:len(b)-1]); herr != nil {
+			err = fmt.Errorf("%w: %w", errBadFile, herr)
+		}
+	}
+	if err != nil {
+		e.close()
+		return nil, readError(generationName, err)
+	}
+	return e, nil
+}
+
+// openEntryDir opens name's directory. A missing directory, or one without a
+// current pointer, is ErrNotFound; one that is not a real directory is
+// ErrCorrupt.
+func openEntryDir(root *os.Root, name string) (*entry, error) {
 	fi, err := root.Lstat(name)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, ErrNotFound
@@ -410,32 +431,29 @@ func openEntry(root *os.Root, name string) (*entry, error) {
 		}
 		return nil, err
 	}
-	b, _, err := readFile(sub, generationName, generationFileSize)
-	if err == nil && (len(b) != generationFileSize || b[len(b)-1] != '\n') {
-		err = errors.New("malformed")
-	}
-	if err == nil {
-		_, err = hex.Decode(e.generation[:], b[:len(b)-1])
-	}
-	if err != nil {
-		e.close()
-		return nil, fmt.Errorf("%w: the generation file: %w", ErrCorrupt, err)
-	}
 	return e, nil
 }
 
 func (e *entry) close() { _ = e.root.Close() } // read-only or already fsynced
+
+// readError classifies an error reading name inside an entry: a missing file
+// or one of the wrong shape is ErrCorrupt, and anything else (a permission or
+// I/O error) is returned as it is, because restoring from backup does not fix
+// it.
+func readError(name string, err error) error {
+	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, errBadFile) {
+		return fmt.Errorf("%w: %s: %w", ErrCorrupt, name, err)
+	}
+	return fmt.Errorf("read %s: %w", name, err)
+}
 
 // openRecord reads the record file name of e and opens it, refusing a record
 // that does not belong there: a pointer where a version belongs or the
 // reverse, or another name, version or generation.
 func (e *entry) openRecord(k keys, name string, pointer bool, version uint64) (record, []byte, error) {
 	b, _, err := readFile(e.root, name, maxRecordSize)
-	if errors.Is(err, fs.ErrNotExist) {
-		return record{}, nil, fmt.Errorf("%w: %s is missing", ErrCorrupt, name)
-	}
 	if err != nil {
-		return record{}, nil, fmt.Errorf("%w: %s: %w", ErrCorrupt, name, err)
+		return record{}, nil, readError(name, err)
 	}
 	r, err := parseRecord(b)
 	if err != nil {
@@ -481,24 +499,24 @@ func (e *entry) version(k keys, n uint64) (Version, []byte, error) {
 	if err != nil {
 		return Version{}, nil, err
 	}
-	kind := Kind(r.kind)
 	// The value authenticated, so it is what a Put sealed; a value that does
 	// not validate is still refused rather than handed to a fingerprint that
 	// assumes a valid key.
-	if err := checkValue(kind, value); err != nil {
+	if err := checkValue(Kind(r.kind), value); err != nil {
 		return Version{}, nil, fmt.Errorf("%w: version %d: %w", ErrCorrupt, n, err)
 	}
-	return versionOf(r, kind, value, k), value, nil
+	return versionOf(r, value, k.fingerprint), value, nil
 }
 
 // versionOf is the metadata of the version r seals value as.
-func versionOf(r record, kind Kind, value []byte, k keys) Version {
+func versionOf(r record, value, fpKey []byte) Version {
+	kind := Kind(r.kind)
 	return Version{
 		Name:        r.name,
 		Version:     r.version,
 		Kind:        kind,
 		Created:     time.Unix(r.created, 0),
-		Fingerprint: fingerprint(kind, value, k.fingerprint),
+		Fingerprint: fingerprint(kind, value, fpKey),
 	}
 }
 

@@ -38,17 +38,35 @@ const (
 	fingerprintFileSize = 2*sha256.Size + 1
 )
 
+// errFingerprintMissing reports a master that passed its own checks with no
+// fingerprint file beside it: the state a mint interrupted between its two
+// writes leaves.
+var errFingerprintMissing = errors.New("the master fingerprint file is missing")
+
 // masterFingerprint is the content of the fingerprint file for master.
 func masterFingerprint(master []byte) string {
 	sum := sha256.Sum256(master)
 	return hex.EncodeToString(sum[:]) + "\n"
 }
 
+// openMasterDir opens the master directory inside cred/, both checked as
+// openDir checks a directory, creating them with create set. The master
+// directory is opened relative to cred/, never by its full path, because the
+// service user owns server/ and could replace cred/ with a symlink.
+func (s *FileStore) openMasterDir(create bool) (*os.Root, error) {
+	cred, err := s.openDir(filepath.Dir(s.masterDir), create)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = cred.Close() }() // the master directory is opened; cred/ is done with
+	return s.openSubdir(cred, filepath.Base(s.masterDir), create)
+}
+
 // loadMaster opens the master pair and returns the keys derived from it. A
 // master directory or master file that is absent is ErrMasterMissing; one that
 // fails a check is ErrMasterUntrusted.
 func (s *FileStore) loadMaster() (keys, error) {
-	root, err := s.openDir(s.masterDir, false)
+	root, err := s.openMasterDir(false)
 	if errors.Is(err, fs.ErrNotExist) {
 		return keys{}, ErrMasterMissing
 	}
@@ -86,6 +104,9 @@ func (s *FileStore) readMaster(root *os.Root) ([]byte, error) {
 		return nil, fmt.Errorf("%w: %d bytes, want %d", ErrMasterUntrusted, len(master), masterSize)
 	}
 	recorded, _, err := readFile(root, masterFingerprintName, fingerprintFileSize)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("%w: %w", ErrMasterUntrusted, errFingerprintMissing)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("%w: the fingerprint file: %w", ErrMasterUntrusted, err)
 	}
@@ -100,51 +121,31 @@ func (s *FileStore) readMaster(root *os.Root) ([]byte, error) {
 // the caller holds the exclusive lock, so two first Puts cannot mint two
 // masters.
 //
-// A master is minted only when no entry directory exists. With entries and no
-// master, every entry would be unreadable under a new one, so that is
-// ErrMasterMissing, never a repair. Without entries, a missing master file or
-// a missing fingerprint file is the state an interrupted first Put leaves, and
-// minting again over it loses nothing. A master that is present and fails its
-// checks is refused either way.
+// A master is minted only while the entries' directory holds no name an entry
+// could have, complete or not: with entries and no master, every entry would
+// be unreadable under a new one, so that is ErrMasterMissing, never a repair.
+// Without entries, two states are minted over, because an interrupted first
+// Put leaves them and nothing was sealed under them: no master file, and a
+// master that passed every check but has no fingerprint file. A master that
+// fails any check of its own is refused, entries or not.
 func (s *FileStore) masterForPut(entries *os.Root) (keys, error) {
 	k, err := s.loadMaster()
 	if err == nil {
 		return k, nil
 	}
-	if !errors.Is(err, ErrMasterMissing) && !s.fingerprintMissing() {
+	if !errors.Is(err, ErrMasterMissing) && !errors.Is(err, errFingerprintMissing) {
 		return keys{}, err
 	}
-	has, herr := hasEntries(entries)
-	if herr != nil {
-		return keys{}, herr
-	}
-	if has {
-		return keys{}, err
-	}
-	return s.mintMaster()
-}
-
-// fingerprintMissing reports whether the master directory exists and its
-// fingerprint file does not: the state a mint interrupted between its two
-// writes leaves.
-func (s *FileStore) fingerprintMissing() bool {
-	_, err := os.Lstat(filepath.Join(s.masterDir, masterFingerprintName))
-	return errors.Is(err, fs.ErrNotExist)
-}
-
-// hasEntries reports whether the entries' directory holds any entry
-// directory, complete or not.
-func hasEntries(entries *os.Root) (bool, error) {
-	names, err := readDirNames(entries)
-	if err != nil {
-		return false, err
+	names, rerr := readDirNames(entries)
+	if rerr != nil {
+		return keys{}, rerr
 	}
 	for _, n := range names {
 		if checkName(n) == nil {
-			return true, nil
+			return keys{}, err
 		}
 	}
-	return false, nil
+	return s.mintMaster()
 }
 
 // mintMaster mints a master from the store's entropy source and writes the
@@ -152,16 +153,7 @@ func hasEntries(entries *os.Root) (bool, error) {
 // fingerprint, so an interruption leaves no fingerprint, never one that
 // vouches for a key that was not written.
 func (s *FileStore) mintMaster() (keys, error) {
-	cred := filepath.Dir(s.masterDir)
-	switch err := os.Mkdir(cred, dirMode); {
-	case err == nil:
-		if err := s.handOver(cred); err != nil {
-			return keys{}, err
-		}
-	case !errors.Is(err, fs.ErrExist):
-		return keys{}, fmt.Errorf("create %s: %w", cred, err)
-	}
-	root, err := s.openDir(s.masterDir, true)
+	root, err := s.openMasterDir(true)
 	if err != nil {
 		return keys{}, fmt.Errorf("%w: %w", ErrMasterUntrusted, err)
 	}
@@ -180,14 +172,4 @@ func (s *FileStore) mintMaster() (keys, error) {
 		return keys{}, err
 	}
 	return deriveKeys(master), nil
-}
-
-// readDirNames lists the names in root's directory.
-func readDirNames(root *os.Root) ([]string, error) {
-	d, err := root.Open(".")
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = d.Close() }() // read-only; nothing to flush
-	return d.Readdirnames(-1)
 }

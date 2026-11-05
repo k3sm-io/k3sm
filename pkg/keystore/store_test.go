@@ -24,6 +24,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -32,8 +33,6 @@ import (
 	"syscall"
 	"testing"
 	"time"
-
-	"golang.org/x/sys/unix"
 )
 
 // newTestStore returns a FileStore over a fresh server work dir, owned by the
@@ -99,18 +98,11 @@ func TestPutCurrentGet(t *testing.T) {
 			}
 		})
 	}
-	if a, _, _ := s.Current(ctx, "signer"); a.Fingerprint != mustCurrent(t, s, "signer-expanded").Fingerprint {
-		t.Fatal("a seed and its expanded key have different fingerprints")
+	a, _, errA := s.Current(ctx, "signer")
+	b, _, errB := s.Current(ctx, "signer-expanded")
+	if errA != nil || errB != nil || a.Fingerprint != b.Fingerprint {
+		t.Fatalf("a seed and its expanded key: fingerprints %q, %q (%v, %v), want equal", a.Fingerprint, b.Fingerprint, errA, errB)
 	}
-}
-
-func mustCurrent(t *testing.T, s *FileStore, name string) Version {
-	t.Helper()
-	v, _, err := s.Current(context.Background(), name)
-	if err != nil {
-		t.Fatalf("Current %s: %v", name, err)
-	}
-	return v
 }
 
 func TestPutRefuses(t *testing.T) {
@@ -252,7 +244,7 @@ func TestMasterMint(t *testing.T) {
 	t.Run("minted from the entropy source", func(t *testing.T) {
 		s, server := newTestStore(t)
 		want := bytes.Repeat([]byte{0xC3}, masterSize)
-		s.rand = prefixed(want)
+		s.rand = io.MultiReader(bytes.NewReader(want), rand.Reader)
 		mustPut(t, s, "a", KindOpaque, []byte("a"))
 		if got, _ := os.ReadFile(master(server)); !bytes.Equal(got, want) {
 			t.Fatalf("master = %x, want the entropy source's first %d bytes", got, masterSize)
@@ -292,38 +284,46 @@ func TestMasterMint(t *testing.T) {
 		}
 	})
 
-	t.Run("a present master that fails its check is not replaced", func(t *testing.T) {
-		s, server := newTestStore(t)
-		mustPut(t, s, "a", KindOpaque, []byte("a"))
-		if err := s.Delete(ctx, "a"); err != nil {
-			t.Fatal(err)
-		}
-		fp := filepath.Join(filepath.Dir(master(server)), masterFingerprintName)
-		if err := os.WriteFile(fp, []byte(strings.Repeat("0", 64)+"\n"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		before, _ := os.ReadFile(master(server))
-		if _, err := s.Put(ctx, "b", KindOpaque, []byte("b")); !errors.Is(err, ErrMasterUntrusted) {
-			t.Fatalf("Put over a mismatched master: %v, want ErrMasterUntrusted", err)
-		}
-		if after, _ := os.ReadFile(master(server)); !bytes.Equal(before, after) {
-			t.Fatal("a master that failed its check was replaced")
-		}
-	})
-}
-
-// prefixed returns a reader that yields b, then crypto-random bytes.
-func prefixed(b []byte) *prefixReader { return &prefixReader{prefix: b} }
-
-type prefixReader struct{ prefix []byte }
-
-func (p *prefixReader) Read(b []byte) (int, error) {
-	if len(p.prefix) > 0 {
-		n := copy(b, p.prefix)
-		p.prefix = p.prefix[n:]
-		return n, nil
+	// With no entries left, a master that fails a check of its own is still
+	// refused, with or without its fingerprint file: only an absent master, or
+	// a sound one missing its fingerprint, is minted over.
+	for _, tt := range []struct {
+		name   string
+		damage func(t *testing.T, dir string)
+	}{
+		{"fingerprint mismatch", func(t *testing.T, dir string) {
+			writeFile(t, filepath.Join(dir, masterFingerprintName), strings.Repeat("0", 64)+"\n")
+		}},
+		{"mode 0644, no fingerprint", func(t *testing.T, dir string) {
+			chmod(t, filepath.Join(dir, masterName), 0o644)
+			remove(t, filepath.Join(dir, masterFingerprintName))
+		}},
+		{"short, no fingerprint", func(t *testing.T, dir string) {
+			writeFile(t, filepath.Join(dir, masterName), "short")
+			remove(t, filepath.Join(dir, masterFingerprintName))
+		}},
+		{"symlink, no fingerprint", func(t *testing.T, dir string) {
+			copyFile(t, filepath.Join(dir, masterName), filepath.Join(dir, "copy"))
+			replaceWithSymlink(t, filepath.Join(dir, masterName), "copy")
+			remove(t, filepath.Join(dir, masterFingerprintName))
+		}},
+	} {
+		t.Run("not replaced: "+tt.name, func(t *testing.T) {
+			s, server := newTestStore(t)
+			mustPut(t, s, "a", KindOpaque, []byte("a"))
+			if err := s.Delete(ctx, "a"); err != nil {
+				t.Fatal(err)
+			}
+			tt.damage(t, filepath.Dir(master(server)))
+			before, _ := os.Lstat(master(server))
+			if _, err := s.Put(ctx, "b", KindOpaque, []byte("b")); !errors.Is(err, ErrMasterUntrusted) {
+				t.Fatalf("Put over a damaged master: %v, want ErrMasterUntrusted", err)
+			}
+			if after, _ := os.Lstat(master(server)); !os.SameFile(before, after) {
+				t.Fatal("a master that failed its check was replaced")
+			}
+		})
 	}
-	return rand.Read(b)
 }
 
 // TestMasterTrust is gate row G11: the master is opened without following a
@@ -337,10 +337,6 @@ func TestMasterTrust(t *testing.T) {
 	}{
 		{"mode 0644", func(t *testing.T, _ *FileStore, dir string) { chmod(t, filepath.Join(dir, masterName), 0o644) }},
 		{"mode 0400", func(t *testing.T, _ *FileStore, dir string) { chmod(t, filepath.Join(dir, masterName), 0o400) }},
-		{"owner", func(_ *testing.T, s *FileStore, _ string) {
-			s.uid++
-			s.chown = func(*os.File, int, int) error { return nil }
-		}},
 		{"symlink to a valid copy", func(t *testing.T, _ *FileStore, dir string) {
 			m := filepath.Join(dir, masterName)
 			copyFile(t, m, filepath.Join(dir, "copy"))
@@ -357,6 +353,8 @@ func TestMasterTrust(t *testing.T) {
 			writeFile(t, filepath.Join(dir, masterFingerprintName), masterFingerprint([]byte("short")))
 		}},
 		{"directory mode 0755", func(t *testing.T, _ *FileStore, dir string) { chmod(t, dir, 0o755) }},
+		{"cred mode 0755", func(t *testing.T, _ *FileStore, dir string) { chmod(t, filepath.Dir(dir), 0o755) }},
+		{"master is a FIFO", func(t *testing.T, _ *FileStore, dir string) { replaceWithFIFO(t, filepath.Join(dir, masterName)) }},
 		{"directory is a symlink", func(t *testing.T, _ *FileStore, dir string) {
 			if err := os.Rename(dir, dir+".real"); err != nil {
 				t.Fatal(err)
@@ -371,15 +369,143 @@ func TestMasterTrust(t *testing.T) {
 			s, server := newTestStore(t)
 			mustPut(t, s, "a", KindOpaque, []byte("a"))
 			tt.damage(t, s, filepath.Join(server, "cred", "keystore-master"))
-			_, err := s.loadMaster()
-			if !errors.Is(err, ErrMasterUntrusted) {
-				t.Fatalf("loadMaster: %v, want ErrMasterUntrusted", err)
-			}
-			if tt.name == "owner" {
-				return // the store's own directory now fails the owner check first
-			}
-			if _, _, err := s.Current(ctx, "a"); !errors.Is(err, ErrMasterUntrusted) {
+			if _, _, err := within(t, func() (Version, []byte, error) { return s.Current(ctx, "a") }); !errors.Is(err, ErrMasterUntrusted) {
 				t.Fatalf("Current: %v, want ErrMasterUntrusted", err)
+			}
+		})
+	}
+
+	// A test cannot give a file to another user, so the owner case judges the
+	// master file alone: its directory is opened as the test user, and the
+	// store that reads it expects another uid. Only the check on the file's
+	// own descriptor can refuse it.
+	t.Run("owner of the file", func(t *testing.T) {
+		s, server := newTestStore(t)
+		mustPut(t, s, "a", KindOpaque, []byte("a"))
+		dir, err := os.OpenRoot(filepath.Join(server, "cred", "keystore-master"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = dir.Close() }()
+		if _, err := s.readMaster(dir); err != nil {
+			t.Fatalf("readMaster as the owner: %v", err)
+		}
+		other := *s
+		other.uid++
+		if _, err := other.readMaster(dir); !errors.Is(err, ErrMasterUntrusted) {
+			t.Fatalf("readMaster as another uid: %v, want ErrMasterUntrusted", err)
+		}
+	})
+}
+
+// within runs fn and fails the test if it does not return within five
+// seconds: a read that blocks (on a FIFO, say) must fail, not hang the suite.
+func within(t *testing.T, fn func() (Version, []byte, error)) (Version, []byte, error) {
+	t.Helper()
+	type result struct {
+		v   Version
+		val []byte
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		v, val, err := fn()
+		done <- result{v, val, err}
+	}()
+	select {
+	case r := <-done:
+		return r.v, r.val, r.err
+	case <-time.After(5 * time.Second):
+		t.Fatal("the read blocked for five seconds")
+		return Version{}, nil, nil
+	}
+}
+
+// TestFIFORefused is part of gate row G14 (never a hang): a FIFO planted at
+// any file the store reads is refused at once, not waited on.
+func TestFIFORefused(t *testing.T) {
+	ctx := context.Background()
+	for _, name := range []string{"v1", currentName, generationName} {
+		t.Run(name, func(t *testing.T) {
+			s, server := newTestStore(t)
+			mustPut(t, s, "a", KindOpaque, []byte("a"))
+			replaceWithFIFO(t, filepath.Join(server, "keystore", "a", name))
+			if _, _, err := within(t, func() (Version, []byte, error) { return s.Current(ctx, "a") }); !errors.Is(err, ErrCorrupt) {
+				t.Fatalf("Current: %v, want ErrCorrupt", err)
+			}
+			_, _, err := within(t, func() (Version, []byte, error) {
+				got, err := s.List(ctx)
+				if err == nil && (len(got) != 1 || !errors.Is(got[0].Err, ErrCorrupt)) {
+					err = fmt.Errorf("List = %+v, want the entry marked ErrCorrupt", got)
+				}
+				return Version{}, nil, err
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+// TestCredSymlinkRefused: a first Put does not follow cred/ through a symlink,
+// so a root-run verb never creates the master directory outside the store.
+func TestCredSymlinkRefused(t *testing.T) {
+	s, server := newTestStore(t)
+	outside := filepath.Join(filepath.Dir(server), "outside")
+	if err := os.Mkdir(outside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(server, "cred")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Put(context.Background(), "a", KindOpaque, []byte("a")); !errors.Is(err, ErrMasterUntrusted) {
+		t.Fatalf("Put with cred/ a symlink: %v, want ErrMasterUntrusted", err)
+	}
+	if names, _ := os.ReadDir(outside); len(names) != 0 {
+		t.Fatalf("the Put created %v outside the store", names)
+	}
+}
+
+// TestDeleteCorruptEntry: an entry List marks corrupt can still be deleted,
+// whatever inside it is damaged.
+func TestDeleteCorruptEntry(t *testing.T) {
+	ctx := context.Background()
+	for _, name := range []string{generationName, "v1", currentName} {
+		t.Run(name, func(t *testing.T) {
+			s, server := newTestStore(t)
+			mustPut(t, s, "a", KindOpaque, []byte("a"))
+			writeFile(t, filepath.Join(server, "keystore", "a", name), "garbage")
+			if got, err := s.List(ctx); err != nil || len(got) != 1 || got[0].Err == nil {
+				t.Fatalf("List = %+v %v, want the entry marked", got, err)
+			}
+			if err := s.Delete(ctx, "a"); err != nil {
+				t.Fatalf("Delete: %v", err)
+			}
+			if _, _, err := s.Current(ctx, "a"); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("Current after Delete: %v, want ErrNotFound", err)
+			}
+		})
+	}
+}
+
+// TestReadErrorIsNotCorrupt: a file that cannot be read for want of
+// permission is reported as that, not as ErrCorrupt, whose fix (restore from
+// backup) would be the wrong one.
+func TestReadErrorIsNotCorrupt(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads a mode-0 file")
+	}
+	ctx := context.Background()
+	for _, name := range []string{"v1", currentName, generationName} {
+		t.Run(name, func(t *testing.T) {
+			s, server := newTestStore(t)
+			mustPut(t, s, "a", KindOpaque, []byte("a"))
+			p := filepath.Join(server, "keystore", "a", name)
+			chmod(t, p, 0)
+			t.Cleanup(func() { _ = os.Chmod(p, 0o600) })
+			_, _, err := s.Current(ctx, "a")
+			if err == nil || errors.Is(err, ErrCorrupt) || !errors.Is(err, fs.ErrPermission) {
+				t.Fatalf("Current: %v, want a permission error that is not ErrCorrupt", err)
 			}
 		})
 	}
@@ -399,7 +525,7 @@ func TestLockBoundedWait(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = f.Close() })
-		if err := unix.Flock(int(f.Fd()), how); err != nil {
+		if err := syscall.Flock(int(f.Fd()), how); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -413,21 +539,21 @@ func TestLockBoundedWait(t *testing.T) {
 	}
 
 	t.Run("exclusive holder blocks reads and writes", func(t *testing.T) {
-		hold(t, unix.LOCK_EX)
+		hold(t, syscall.LOCK_EX)
 		bounded(t, "Put", func() error { _, err := s.Put(ctx, "b", KindOpaque, []byte("b")); return err })
 		bounded(t, "Current", func() error { _, _, err := s.Current(ctx, "a"); return err })
 		bounded(t, "List", func() error { _, err := s.List(ctx); return err })
 		bounded(t, "Delete", func() error { return s.Delete(ctx, "a") })
 	})
 	t.Run("shared holder blocks only writes", func(t *testing.T) {
-		hold(t, unix.LOCK_SH)
+		hold(t, syscall.LOCK_SH)
 		bounded(t, "Put", func() error { _, err := s.Put(ctx, "b", KindOpaque, []byte("b")); return err })
 		if _, _, err := s.Current(ctx, "a"); err != nil {
 			t.Fatalf("Current under a shared lock: %v", err)
 		}
 	})
 	t.Run("a cancelled context ends the wait", func(t *testing.T) {
-		hold(t, unix.LOCK_EX)
+		hold(t, syscall.LOCK_EX)
 		s.lockWait = time.Minute
 		cctx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
 		defer cancel()
@@ -720,6 +846,14 @@ func flipLastByte(t *testing.T, p string) {
 	}
 	b[len(b)-1] ^= 1
 	if err := os.WriteFile(p, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func replaceWithFIFO(t *testing.T, p string) {
+	t.Helper()
+	remove(t, p)
+	if err := syscall.Mkfifo(p, 0o600); err != nil {
 		t.Fatal(err)
 	}
 }
