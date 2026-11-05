@@ -57,6 +57,25 @@ func TestConditionalDelete(t *testing.T) {
 		want(t, f.do(http.MethodGet, "/v2/app/manifests/v1", nil), http.StatusOK, "")
 	})
 
+	t.Run("a conditional digest DELETE refuses a digest a row tags", func(t *testing.T) {
+		f := newFixture(t)
+		body := f.image(t, "app", "v1", "l")
+		// The state is current: only the tag can refuse this, and only the
+		// tag's own DELETE removes it.
+		for _, cond := range []string{`"` + state(t, f) + `"`, "*"} {
+			want(t, f.do(http.MethodDelete, "/v2/app/manifests/"+dg(body).String(), nil, "If-Match", cond), http.StatusPreconditionFailed, codeDenied)
+			want(t, f.do(http.MethodGet, "/v2/app/manifests/v1", nil), http.StatusOK, "")
+		}
+		// One tagged row of several refuses the digest.
+		want(t, f.pushManifest(t, "app", "v2", ispec.MediaTypeImageManifest, body), http.StatusCreated, "")
+		want(t, f.do(http.MethodDelete, "/v2/app/manifests/v1", nil, "If-Match", `"`+state(t, f)+`"`), http.StatusAccepted, "")
+		want(t, f.do(http.MethodDelete, "/v2/app/manifests/"+dg(body).String(), nil, "If-Match", `"`+state(t, f)+`"`), http.StatusPreconditionFailed, codeDenied)
+		want(t, f.do(http.MethodGet, "/v2/app/manifests/v2", nil), http.StatusOK, "")
+		// A request with no condition keeps the behaviour clients rely on.
+		want(t, f.do(http.MethodDelete, "/v2/app/manifests/"+dg(body).String(), nil), http.StatusAccepted, "")
+		want(t, f.do(http.MethodGet, "/v2/app/manifests/v2", nil), http.StatusNotFound, codeManifestUnknown)
+	})
+
 	t.Run("a tag DELETE is conditional too", func(t *testing.T) {
 		f := newFixture(t)
 		f.image(t, "app", "v1", "l")

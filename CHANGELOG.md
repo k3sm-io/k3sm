@@ -148,6 +148,14 @@ pin, its date, and the tarball's sha256.
   file in the data root, which belongs to root. `k3sm install` now creates that one file for the
   service user, mode 0600, and repairs one left owned by root; the data root keeps its mode.
 - The server and agent no longer warn about the mesh key on every start under the service user.
+- The new registry server, which no k3sm command starts yet, holds its clients to more of its limits.
+  A `DELETE` by digest that sends `If-Match` answers 412 and removes nothing when any tag names the digest; without `If-Match` it
+  still removes the tags too. Each principal is limited to its share of the upload sessions and
+  answers 503 past it, so the push gate's writers cannot shut out the local CLI, or the reverse.
+  Uploads in flight share one free-space reservation, and a principal may hold at most three
+  quarters of it, so past that an upload answers 507, even one that would fit on the volume by
+  itself. A blob `GET` whose reader stalls is cut after the response timeout, 2 minutes by default,
+  rather than after the time the blob's size allows, and the client resumes with a `Range` request.
 - The k3sm registry server answers a manifest whose stored bytes no longer match its digest or
   size with a 500 that sends nothing of the manifest, logged at Error with the digest, instead of
   a 400 `DIGEST_INVALID` that blamed the client. A blob mount from a corrupt source answers the

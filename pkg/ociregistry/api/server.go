@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"os"
 	"runtime/debug"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -68,7 +69,7 @@ const (
 	// GET is given time for.
 	DefaultMinWriteRate = 512 << 10
 	// spaceCheckEvery is how many body bytes an upload streams between two
-	// free-space checks.
+	// free-space checks, and what a body of unknown length reserves at a time.
 	spaceCheckEvery = 64 << 20
 	// ReadHeaderTimeout bounds reading a request's headers.
 	ReadHeaderTimeout = 30 * time.Second
@@ -144,6 +145,15 @@ type Config struct {
 	// MaxSessions is the most upload sessions in use at once
 	// (DefaultMaxSessions when zero).
 	MaxSessions int
+	// Principal, when set, names the principal of a request the Authorizer
+	// has allowed, "" for none. Each named principal then holds at most
+	// MaxSessionsPerPrincipal of the MaxSessions, and at most three quarters
+	// of the room above MinFreeSpace in reserved upload bytes. A request it
+	// names no principal for has neither limit.
+	Principal func(*http.Request) string
+	// MaxSessionsPerPrincipal is one named principal's share of MaxSessions
+	// (three quarters of MaxSessions, at least one, when zero).
+	MaxSessionsPerPrincipal int
 	// SessionIdle is how long a session may go unused before it stops
 	// counting against MaxSessions (DefaultSessionIdle when zero).
 	SessionIdle time.Duration
@@ -151,8 +161,9 @@ type Config struct {
 	// (DefaultBodyIdle when zero).
 	BodyIdle time.Duration
 	// BodyWindow and BodyMinBytes are the minimum progress of a request
-	// body: at least BodyMinBytes in every BodyWindow, or the request fails
-	// with 408 (DefaultBodyWindow and DefaultBodyMinBytes when zero).
+	// body: BodyMinBytes in each BodyWindow, counted as progressBody says, or
+	// the request fails with 408 (DefaultBodyWindow and DefaultBodyMinBytes
+	// when zero).
 	BodyWindow   time.Duration
 	BodyMinBytes int64
 	// UploadTimeout bounds the whole of a request that carries a body
@@ -166,7 +177,8 @@ type Config struct {
 	// MinWriteRate the slowest rate a blob GET is given time for on top of it
 	// (DefaultResponseTimeout and DefaultMinWriteRate when zero). The write
 	// deadline is set per request, so a large blob GET is never cut by a
-	// server-wide timeout.
+	// server-wide timeout. A large blob GET must also keep moving: each
+	// ResponseTimeout must carry a ResponseTimeout's worth of MinWriteRate.
 	ResponseTimeout time.Duration
 	MinWriteRate    int64
 	// GCGrace is the grace of the garbage collector that sweeps Store, the
@@ -210,7 +222,14 @@ type Server struct {
 	connClosed    func(remoteAddr string)
 	now           func() time.Time
 	sessions      *sessions
-	router        *mux.Router
+	principal     func(*http.Request) string
+	// spaceMu guards spaceHeld, the bytes in-flight upload bodies have
+	// reserved and not yet delivered to the store, and spaceHeldBy, the part
+	// of it each named principal holds.
+	spaceMu     sync.Mutex
+	spaceHeld   int64
+	spaceHeldBy map[string]int64
+	router      *mux.Router
 	// catalogPage and catalogMax are the catalog's default and largest page.
 	catalogPage, catalogMax int
 	// catalogCeil is the catalog walk's hard ceiling as a multiple of its
@@ -244,9 +263,11 @@ type Server struct {
 	manifestRead func()
 	// sessionAdmitted and chunkAppending, when set, run after a new session's
 	// slot is reserved and before a chunk is appended (seams for tests that
-	// make those steps panic).
-	sessionAdmitted func()
-	chunkAppending  func()
+	// make those steps panic). uploadCommitting, when set, runs as a commit
+	// returns, the same way.
+	sessionAdmitted  func()
+	chunkAppending   func()
+	uploadCommitting func()
 }
 
 // New returns a Server over cfg.Store. It logs the effective RLIMIT_NOFILE,
@@ -289,6 +310,8 @@ func New(cfg Config) (*Server, error) {
 		touchFails:    newTouchFails(maxTouchFails),
 		maxConns:      positive(cfg.MaxConns, DefaultMaxConns),
 		connClosed:    cfg.ConnClosed,
+		principal:     cfg.Principal,
+		spaceHeldBy:   map[string]int64{},
 		setWriteDeadline: func(w http.ResponseWriter, t time.Time) {
 			_ = http.NewResponseController(w).SetWriteDeadline(t) // ErrNotSupported off a real connection
 		},
@@ -311,7 +334,11 @@ func New(cfg Config) (*Server, error) {
 		now = time.Now
 	}
 	s.now = now
-	s.sessions = newSessions(maxSessions, idle, now)
+	share := cfg.MaxSessionsPerPrincipal
+	if share <= 0 {
+		share = max(maxSessions-maxSessions/4, 1)
+	}
+	s.sessions = newSessions(maxSessions, share, idle, now)
 	var rl unix.Rlimit
 	if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &rl); err == nil {
 		s.log.Info("registry api ready", "root", cfg.Store.Root(), "rlimit_nofile", rl.Cur, "max_sessions", maxSessions)
@@ -489,11 +516,21 @@ var (
 )
 
 // progressBody wraps a request body so that it must keep making progress: no
-// read may wait longer than idle, every window must bring at least minBytes,
+// read may wait longer than idle, each window must bring at least minBytes,
 // and nothing is read after deadline. The connection's read deadline is moved
 // to the earliest of those bounds before each read, so a stalled peer is cut
 // by the kernel rather than waited on; where it cannot be set (an in-process
-// transport) the checks between reads still hold. It is used by one goroutine.
+// transport) the checks between reads still hold.
+//
+// The first window opens at the first read, so the time a request waits for
+// its session's lock before the store reads the body is not charged to the
+// client (deadline still is: it bounds the whole request). Windows are
+// consecutive rather than sliding, and a window that has its minBytes is
+// checked again only at the next read. So this is a floor over windows, not a
+// rate: a body that has brought minBytes may then stay silent for up to idle
+// before the next window opens, and a burst and that silence can repeat. Each
+// repeat brings minBytes, so a body makes at least minBytes per
+// max(window, idle). It is used by one goroutine.
 type progressBody struct {
 	rc       *http.ResponseController
 	body     io.Reader
@@ -511,6 +548,9 @@ func (b *progressBody) Read(p []byte) (int, error) {
 	t := b.now()
 	if !t.Before(b.deadline) {
 		return 0, errRequestTooLong
+	}
+	if b.winStart.IsZero() {
+		b.winStart = t
 	}
 	if t.Sub(b.winStart) >= b.window {
 		if b.winBytes < b.minBytes {
@@ -541,7 +581,7 @@ func (s *Server) body(w http.ResponseWriter, r *http.Request) io.Reader {
 	return &progressBody{
 		rc: http.NewResponseController(w), body: r.Body, now: s.now,
 		idle: s.bodyIdle, window: s.bodyWindow, minBytes: s.bodyMinBytes,
-		deadline: t.Add(s.uploadTimeout), winStart: t,
+		deadline: t.Add(s.uploadTimeout),
 	}
 }
 

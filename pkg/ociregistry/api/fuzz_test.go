@@ -192,22 +192,22 @@ func TestSessionTable(t *testing.T) {
 	mustTime := func(sec int64) time.Time { return time.Unix(sec, 0) }
 	now := mustTime(0)
 	clock := func() time.Time { return now }
-	tab := newSessions(2, 10*time.Second, clock)
-	e1, rel1, err := tab.admit()
+	tab := newSessions(2, 2, 10*time.Second, clock)
+	e1, rel1, err := tab.admit("")
 	if err != nil {
 		t.Fatal(err)
 	}
 	tab.bind("a", e1)
 	rel1()
-	_, rel2, err := tab.admit()
+	e2, rel2, err := tab.admit("")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := tab.admit(); !errors.Is(err, errTooManySessions) {
+	if _, _, err := tab.admit(""); !errors.Is(err, errTooManySessions) {
 		t.Fatalf("a third admission = %v, want errTooManySessions", err)
 	}
 	rel2()
-	tab.abandon()
+	tab.abandon(e2)
 	if tab.live() != 1 {
 		t.Fatalf("live = %d after an abandoned admission, want 1", tab.live())
 	}
@@ -235,13 +235,13 @@ func TestSessionTable(t *testing.T) {
 	if tab.live() != 0 {
 		t.Errorf("live = %d with only an unconfirmed entry, want 0", tab.live())
 	}
-	ea, rela, err := tab.admit()
+	ea, rela, err := tab.admit("")
 	if err != nil {
 		t.Fatalf("an admission beside an unconfirmed entry = %v", err)
 	}
 	tab.bind("b", ea)
 	rela()
-	eb, relb, err := tab.admit()
+	eb, relb, err := tab.admit("")
 	if err != nil {
 		t.Fatalf("a second admission beside an unconfirmed entry = %v", err)
 	}
