@@ -19,6 +19,8 @@ package install
 import (
 	"strings"
 	"testing"
+
+	"k3sm.io/runtimed/pkg/sandbox"
 )
 
 // TestTeardownKillHintNamesThePod pins that the by-hand kill hint carries the
@@ -30,8 +32,8 @@ func TestTeardownKillHintNamesThePod(t *testing.T) {
 	a := VMHostRecord{PodID: "pod-a", Pgid: 41, RunDir: "/var/run/pods/pod-a/run"}
 	b := VMHostRecord{PodID: "pod-b", Pgid: 42, RunDir: "/var/run/pods/pod-b/run"}
 	hint := vmHelperKillHint(a, exe)
-	if !strings.Contains(hint, a.RunDir+"/") {
-		t.Errorf("hint lacks the pod's own run dir token: %s", hint)
+	if !strings.Contains(hint, a.RunDir+"/"+sandbox.VMHostLogName) {
+		t.Errorf("hint lacks the pod's own log path token: %s", hint)
 	}
 	if strings.Contains(hint, b.RunDir) || strings.Contains(hint, "pod-b") {
 		t.Errorf("hint carries another pod's token: %s", hint)
