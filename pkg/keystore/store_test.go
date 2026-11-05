@@ -400,6 +400,8 @@ func TestMasterTrust(t *testing.T) {
 
 // within runs fn and fails the test if it does not return within five
 // seconds: a read that blocks (on a FIFO, say) must fail, not hang the suite.
+// The bound is a watchdog that fires only when the test is already failing,
+// so it cannot make a passing run flaky.
 func within(t *testing.T, fn func() (Version, []byte, error)) (Version, []byte, error) {
 	t.Helper()
 	type result struct {
@@ -412,10 +414,12 @@ func within(t *testing.T, fn func() (Version, []byte, error)) (Version, []byte, 
 		v, val, err := fn()
 		done <- result{v, val, err}
 	}()
+	watchdog, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
 	select {
 	case r := <-done:
 		return r.v, r.val, r.err
-	case <-time.After(5 * time.Second):
+	case <-watchdog.Done():
 		t.Fatal("the read blocked for five seconds")
 		return Version{}, nil, nil
 	}
