@@ -107,12 +107,55 @@ func terminalUpdates() []struct {
 	}
 }
 
+// assertAcquiredNothing fails t if the pod holds any resource an update could
+// acquire, or the runtime was called for it.
+func (x *terminalUpdateFixture) assertAcquiredNothing(t *testing.T) {
+	t.Helper()
+	id := string(x.pod.UID)
+	if ip, ok := x.ipam.allocations()[id]; ok {
+		t.Errorf("the update allocated /32 %s and its lo0 alias", ip)
+	}
+	if n := x.ipamSetups(); n != 0 {
+		t.Errorf("pod network setups = %d, want 0", n)
+	}
+	if rec := x.r.interconnect.record(id); rec != nil {
+		t.Errorf("the update attached the interconnect (%+v)", rec)
+	}
+	if n := attachedSlots(x.r.interconnect); n != 0 {
+		t.Errorf("interconnect slots held = %d, want 0", n)
+	}
+	if ensured, _ := x.aliases.calls(); len(ensured) != 0 {
+		t.Errorf("interconnect aliases ensured %v, want none", ensured)
+	}
+	if _, registered := x.registeredRefs(); registered {
+		t.Error("the update registered the pod's references")
+	}
+	if n := x.f.updateCount(); n != 0 {
+		t.Errorf("runtime UpdatePod calls = %d, want 0", n)
+	}
+	if n := x.f.createCount(); n != 0 {
+		t.Errorf("runtime CreatePod calls = %d, want 0", n)
+	}
+}
+
 // TestUpdatePodOnRejectedTrackAcquiresNothing: virtual-kubelet calls UpdatePod
 // for a refused pod whose spec differs from the tracked one, and a refused
 // pod's delete frees nothing. An update must therefore acquire nothing: no /32
 // and lo0 alias, no interconnect attach, no reference registration, no runtime
 // call. Fails when UpdatePod registers and allocates before looking at the
 // track: the lease and the references stay held until the daemon restarts.
+//
+// "rejected flag only": the guard reads t.rejected itself, so it does not rest
+// on a refused track also carrying an evicted status. Fails when only
+// evictedStatus is read.
+//
+// "untracked": a restarted node tracks no terminal pod, and the object's own
+// status is then the only record, the fence CreatePod applies. Fails when the
+// guard looks only at the track.
+//
+// "untracked, not terminal": a Failed object with any other reason, or a pod
+// not Failed at all, keeps the path it had. It pins that the fence is not wider
+// than CreatePod's, and that the fixture sees an acquisition when one happens.
 //
 // The evicted cases: runtimed already forgot an evicted pod, so an update could
 // only fail in the runtime and be returned to virtual-kubelet. What the pod
@@ -137,36 +180,42 @@ func TestUpdatePodOnRejectedTrackAcquiresNothing(t *testing.T) {
 				t.Errorf("UpdatePod = %v, want nil", err)
 			}
 
-			if ip, ok := x.ipam.allocations()[id]; ok {
-				t.Errorf("the update allocated /32 %s and its lo0 alias", ip)
-			}
-			if n := x.ipamSetups(); n != 0 {
-				t.Errorf("pod network setups = %d, want 0", n)
-			}
-			if rec := x.r.interconnect.record(id); rec != nil {
-				t.Errorf("the update attached the interconnect (%+v)", rec)
-			}
-			if n := attachedSlots(x.r.interconnect); n != 0 {
-				t.Errorf("interconnect slots held = %d, want 0", n)
-			}
-			if ensured, _ := x.aliases.calls(); len(ensured) != 0 {
-				t.Errorf("interconnect aliases ensured %v, want none", ensured)
-			}
-			if _, registered := x.registeredRefs(); registered {
-				t.Error("the update registered the refused pod's references")
-			}
-			if n := x.f.updateCount(); n != 0 {
-				t.Errorf("runtime UpdatePod calls = %d, want 0", n)
-			}
-			if n := x.f.createCount(); n != 0 {
-				t.Errorf("runtime CreatePod calls = %d, want 0", n)
-			}
+			x.assertAcquiredNothing(t)
 			if got := x.r.trackByID(id); got != tr || !got.rejected {
 				t.Errorf("the refusal did not stand (%s)", trackState(got))
 			}
 		})
-	}
-	for _, tc := range terminalUpdates() {
+		t.Run("rejected flag only, "+tc.name, func(t *testing.T) {
+			x := newTerminalUpdateFixture(t, compressorAt(10))
+			tr := &podTrack{pod: x.pod.DeepCopy(), rejected: true}
+			x.r.mu.Lock()
+			x.r.track[string(x.pod.UID)] = tr
+			x.r.mu.Unlock()
+
+			updated := x.pod.DeepCopy()
+			tc.edit(updated)
+			if err := x.r.UpdatePod(ctx, updated); err != nil {
+				t.Errorf("UpdatePod = %v, want nil", err)
+			}
+
+			x.assertAcquiredNothing(t)
+		})
+		for _, reason := range []string{reasonEvicted, reasonNodeBudgetCritical} {
+			t.Run("untracked, "+reason+", "+tc.name, func(t *testing.T) {
+				x := newTerminalUpdateFixture(t, compressorAt(10))
+				updated := x.pod.DeepCopy()
+				updated.Status.Phase, updated.Status.Reason = corev1.PodFailed, reason
+				tc.edit(updated)
+				if err := x.r.UpdatePod(ctx, updated); err != nil {
+					t.Errorf("UpdatePod = %v, want nil", err)
+				}
+
+				x.assertAcquiredNothing(t)
+				if tr := x.r.trackByID(string(x.pod.UID)); tr != nil {
+					t.Errorf("the update installed a track (%s)", trackState(tr))
+				}
+			})
+		}
 		t.Run("evicted, "+tc.name, func(t *testing.T) {
 			x := newTerminalUpdateFixture(t, compressorAt(10))
 			id := string(x.pod.UID)
@@ -200,6 +249,32 @@ func TestUpdatePodOnRejectedTrackAcquiresNothing(t *testing.T) {
 			}
 			if got := x.r.trackByID(id); got != tr || got.evictedStatus() == nil {
 				t.Errorf("the eviction did not stand (%s)", trackState(got))
+			}
+		})
+	}
+	for _, tc := range []struct {
+		name   string
+		phase  corev1.PodPhase
+		reason string
+	}{
+		{"untracked, not terminal, Failed with another reason", corev1.PodFailed, "ProviderFailed"},
+		{"untracked, not terminal, Pending", corev1.PodPending, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			x := newTerminalUpdateFixture(t, compressorAt(10))
+			updated := x.pod.DeepCopy()
+			updated.Status.Phase, updated.Status.Reason = tc.phase, tc.reason
+			// The fixture's runtime serves no UpdatePod, so the error is expected:
+			// what is pinned is that the path was taken.
+			_ = x.r.UpdatePod(ctx, updated)
+			if n := x.f.updateCount(); n != 1 {
+				t.Errorf("runtime UpdatePod calls = %d, want 1", n)
+			}
+			if n := x.ipamSetups(); n != 1 {
+				t.Errorf("pod network setups = %d, want 1", n)
+			}
+			if _, registered := x.registeredRefs(); !registered {
+				t.Error("the pod's references were not registered")
 			}
 		})
 	}

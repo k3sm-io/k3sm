@@ -2137,7 +2137,10 @@ func (r *runtimedRuntime) completeCreate(pod *corev1.Pod, t *podTrack, rs *runti
 // reported on the debug container, never as the pod's failure.
 //
 // A pod refused at admission or evicted is terminal and gets no update, as it
-// gets no create: nothing is registered, allocated or sent to the runtime.
+// gets no create: nothing is registered, allocated or sent to the runtime. That
+// holds for a terminal track and, with no track, for a pod whose apiserver
+// object is terminal (CreatePod's fence), which a restarted node no longer
+// tracks.
 func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error {
 	// Identity binding kept for the SAME in-process seam CreatePod uses, but
 	// UpdatePod itself never mints a token or re-reads a ConfigMap/Secret
@@ -2157,7 +2160,11 @@ func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error 
 	id := string(pod.UID)
 	r.mu.Lock()
 	t, tracked := r.track[id]
-	if tracked && t.evictedStatus() != nil {
+	terminal := isEvictedPod(pod) || isBudgetRejectedPod(pod)
+	if tracked {
+		terminal = t.rejected || t.evictedStatus() != nil
+	}
+	if terminal {
 		// Virtual Kubelet reaches here when a refused or evicted pod's labels,
 		// annotations, images or tolerations change. A refused pod holds nothing
 		// and its delete (forgetRejected) frees nothing, so anything acquired
