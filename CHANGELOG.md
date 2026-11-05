@@ -111,6 +111,13 @@ pin, its date, and the tarball's sha256.
 - `k3sm status` names the cause of an invalid developer-mode row: when `/` or `/Library` is the
   problem, the detail and remedy name that directory instead of suggesting `sudo rm` of the marker,
   which does not fix it. [Status JSON](docs/user/status-json.md) describes the row.
+- `k3sm update apply` failed on a node at its first step and left it cordoned, because the daemon
+  cannot create `/var/lib/k3sm/updates` under the root-owned data root. `k3sm install`
+  now creates that directory for the service user, mode 0700, on both roles, `k3sm-netd` repairs it,
+  and uninstall removes it. A node's `Failed` message now names `k3sm update abort` as the recovery.
+  A node installed by an earlier release gets the directory from one install of this release by any
+  install path, because a managed update cannot bring it; on a release with this fix, `sudo k3sm
+  restart` recreates a missing one. See [Upgrade](docs/user/upgrade.md).
 - A component that crashes during start-up on a busy host is now reported with its exit status
   instead of as a health timeout.
 - A server or agent installed from a build of main exited at every start with `open runtime root

@@ -82,8 +82,9 @@ type Config struct {
 	// Running is the running build's version provenance.
 	Running version.Info
 	// Root is the directory, under the data root and owned by the service
-	// user, the attempt directories are made in. It is created (0700) when
-	// absent.
+	// user, the attempt directories are made in (install.StateUpdates). The
+	// installer creates it and the root helper repairs it; the Watcher never
+	// creates it, because the data root is root-owned.
 	Root string
 	// Fetcher downloads the release archive.
 	Fetcher Fetcher
@@ -357,15 +358,22 @@ func (m *phaseMirror) advance(ph wire.UpdatePhase) (updatesv1alpha1.UpdateNodePh
 	return "", false
 }
 
+// failRecovery ends every Failed message, because the annotation is where an
+// operator reads why. It does not claim the node is cordoned: the controller
+// cordons before it hands over, but the attempt reads only the annotations, and
+// a payload refused here may never have come from the controller.
+const failRecovery = "; recover with `k3sm update abort`"
+
 // fail writes Failed with err's message and, when the installer's log tail is
-// known, its last line.
+// known, its last line, then the recovery. The reason is the part that gives
+// way to the annotation's bound, so a long one cannot clip the recovery off.
 func (w *Watcher) fail(ctx context.Context, log *slog.Logger, err error, tail string) error {
 	msg := err.Error()
 	if last := lastLine(tail); last != "" {
 		msg += " (installer: " + last + ")"
 	}
 	log.Error("update: this node's update failed", "err", err, "installer-log", tail)
-	return w.setPhase(ctx, updatesv1alpha1.UpdateNodePhaseFailed, msg)
+	return w.setPhase(ctx, updatesv1alpha1.UpdateNodePhaseFailed, clipMessage(msg, MaxMessageBytes-len(failRecovery))+failRecovery)
 }
 
 func lastLine(s string) string {
@@ -438,14 +446,16 @@ func (w *Watcher) newAttemptDir() (string, error) {
 	return dir, nil
 }
 
-// ensureRoot creates Root (0700) when it is absent and otherwise requires a
-// real directory owned by this process's uid, which it sets to mode 0700.
+// ensureRoot requires Root to be a real directory owned by this process's uid,
+// and sets it to mode 0700. It never creates Root: the data root it sits in is
+// root-owned, and the root helper of this same build recreates the tree at its
+// next start.
 func (w *Watcher) ensureRoot() error {
 	root := w.cfg.Root
-	if err := os.Mkdir(root, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
-		return fmt.Errorf("create the update root %s: %w", root, err)
-	}
 	fi, err := os.Lstat(root)
+	if errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("%w: the update root does not exist; `sudo k3sm restart` on this node recreates %s", ErrRefused, root)
+	}
 	if err != nil {
 		return fmt.Errorf("inspect the update root %s: %w", root, err)
 	}

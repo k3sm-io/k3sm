@@ -21,7 +21,6 @@ import (
 	"errors"
 	"log/slog"
 	"net/url"
-	"path/filepath"
 	"time"
 
 	"k8s.io/client-go/kubernetes"
@@ -29,6 +28,7 @@ import (
 	"k3sm.io/darwin-net/pkg/netd/wire"
 
 	"k3sm.io/k3sm/pkg/executor"
+	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/update"
 	"k3sm.io/k3sm/pkg/version"
 )
@@ -56,15 +56,12 @@ func releaseBaseURL(raw string) string {
 	return u.String()
 }
 
-// updateSubdir is the directory of the data root the managed update downloads
-// and unpacks a release in (<data root>/updates).
-const updateSubdir = "updates"
-
 // updateRootFor is the managed update's directory for a daemon whose work dir
-// is workDir: <data root>/updates, beside the server and agent work dirs, and
-// owned by the service user like the rest of the data root.
+// is workDir: <data root>/updates (install.StateUpdates), beside the server and
+// agent work dirs. Install creates it for the service user and netd repairs
+// it; the daemon only uses it.
 func updateRootFor(workDir string) string {
-	return filepath.Join(executor.RuntimeRoot(workDir), updateSubdir)
+	return install.StateUpdates.Path(executor.RuntimeRoot(workDir))
 }
 
 // nodeUpdateDeps are the seams of the node-side managed update: the archive

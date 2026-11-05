@@ -151,17 +151,22 @@ func FormatPhase(phase updatesv1alpha1.UpdateNodePhase, msg string) string {
 		}
 		return r
 	}, msg))
-	if len(msg) > MaxMessageBytes {
-		cut := MaxMessageBytes
-		for cut > 0 && !utf8.RuneStart(msg[cut]) {
-			cut--
-		}
-		msg = msg[:cut]
-	}
+	msg = clipMessage(msg, MaxMessageBytes)
 	if msg == "" {
 		return string(phase)
 	}
 	return string(phase) + ": " + msg
+}
+
+// clipMessage clips msg to at most limit bytes at a rune boundary.
+func clipMessage(msg string, limit int) string {
+	if len(msg) <= limit {
+		return msg
+	}
+	for limit > 0 && !utf8.RuneStart(msg[limit]) {
+		limit--
+	}
+	return msg[:limit]
 }
 
 // ParsePhase splits a phase annotation value into its phase and message.
