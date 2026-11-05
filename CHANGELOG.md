@@ -108,6 +108,9 @@ pin, its date, and the tarball's sha256.
 
 ### Fixed
 
+- `k3sm status` names the cause of an invalid developer-mode row: when `/` or `/Library` is the
+  problem, the detail and remedy name that directory instead of suggesting `sudo rm` of the marker,
+  which does not fix it. [Status JSON](docs/user/status-json.md) describes the row.
 - A component that crashes during start-up on a busy host is now reported with its exit status
   instead of as a health timeout.
 - A server or agent installed from a build of main exited at every start with `open runtime root

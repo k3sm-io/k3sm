@@ -20,7 +20,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 
 	"k3sm.io/k3sm/pkg/install"
 )
@@ -101,7 +100,7 @@ func developerModeAlert(r Row) *Alert {
 		return alert("Developer mode is on, so k3sm does not check the signature of the k3sm that runs as root.", docsDeveloperMode,
 			manual(developerModeOnRemedy))
 	case StateInvalid:
-		if !strings.HasPrefix(r.Remedy, "sudo rm ") {
+		if r.Remedy != developerModeInvalidRemedy {
 			return alert("A directory above the developer-mode marker is not a root-owned real directory nobody else can write; the marker is ignored and the signature checks stay on.", docsDeveloperMode,
 				manual(r.Remedy))
 		}

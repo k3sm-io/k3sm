@@ -192,47 +192,48 @@ func DeveloperModeMarkerState(f DeveloperModeFacts) DeveloperModeState {
 // developerModeState is DeveloperModeMarkerState with every path owned by
 // owner. Only the on-disk test passes anything but root.
 func developerModeState(f DeveloperModeFacts, owner int) DeveloperModeState {
+	state, _ := developerModeJudge(f, owner)
+	return state
+}
+
+// developerModeJudge is the one validity predicate. It returns the state and,
+// when the state is invalid only because a directory above a sound marker
+// failed, that directory's index in f.Ancestors; otherwise -1.
+func developerModeJudge(f DeveloperModeFacts, owner int) (DeveloperModeState, int) {
 	held := func(e OwnedEntry, acl bool) bool {
 		return e.UID == owner && e.Mode.Perm()&0o022 == 0 && !acl
 	}
 	switch {
 	case f.Err != nil:
-		return DeveloperModeInvalid
+		return DeveloperModeInvalid, -1
 	case !f.Exists:
-		return DeveloperModeAbsent
+		return DeveloperModeAbsent, -1
 	case f.Entry.Kind != EntryRegular, !held(f.Entry, f.HasACL), len(f.Ancestors) == 0:
-		return DeveloperModeInvalid
+		return DeveloperModeInvalid, -1
 	}
-	for _, a := range f.Ancestors {
+	for i, a := range f.Ancestors {
 		if a.Err != nil || a.Entry.Kind != EntryDir || !held(a.Entry, a.HasACL) {
-			return DeveloperModeInvalid
+			return DeveloperModeInvalid, i
 		}
 	}
-	return DeveloperModeMarkerOn
+	return DeveloperModeMarkerOn, -1
 }
 
 // DeveloperModeAncestorCause names the first directory above the marker at
-// path that makes an otherwise valid marker invalid: not a real directory, not
-// root-owned, writable by group or others, or carrying an ACL. It is "" when
-// the marker itself is the cause, or when nothing is wrong with the
-// directories.
+// path that makes an otherwise sound marker invalid: a symlink or other
+// non-directory, a probe failure, not root-owned, writable by group or
+// others, or carrying an ACL. It is "" when the marker itself is the cause,
+// or when nothing is wrong.
 func DeveloperModeAncestorCause(f DeveloperModeFacts, path string) string {
-	if f.Err != nil || !f.Exists || f.Entry.Kind != EntryRegular || len(f.Ancestors) == 0 {
-		return ""
-	}
-	if f.Entry.UID != 0 || f.Entry.Mode.Perm()&0o022 != 0 || f.HasACL {
+	_, i := developerModeJudge(f, 0)
+	if i < 0 {
 		return ""
 	}
 	dirs, err := markerAncestors("/", path)
-	if err != nil {
+	if err != nil || i >= len(dirs) {
 		return ""
 	}
-	for i, a := range f.Ancestors {
-		if i < len(dirs) && (a.Err != nil || a.Entry.Kind != EntryDir || a.Entry.UID != 0 || a.Entry.Mode.Perm()&0o022 != 0 || a.HasACL) {
-			return dirs[i]
-		}
-	}
-	return ""
+	return dirs[i]
 }
 
 // ReadDeveloperModeAncestorCause is DeveloperModeAncestorCause of the marker

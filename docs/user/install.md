@@ -220,8 +220,12 @@ update, stop and start it.
   `warn` while it is there, with the state `on` for a valid marker and `invalid` for anything else
   at that path (a symlink, a file that is not root-owned, a file others can write, or one with an
   ACL), or for a marker under a `/` or `/Library` that is not a root-owned real directory that
-  neither group nor others can write, with no ACL. An invalid marker is ignored and the checks stay on; the row's `detail` says whether the marker file or a directory above it is the cause and names the directory, and removing the marker fixes only the first. `--developer-mode off` removes the marker only after the install's swap, and a rollback restores it. The status `verdict` stays `ok` while
-  the mode is on, and only the `developer-mode` row warns, so automation that audits a Mac reads
+  neither group nor others can write, with no ACL.
+  An invalid marker is ignored and the checks stay on. The row's `detail` says whether the marker
+  file or a directory above it is the cause and names the directory, and removing the marker fixes
+  only the first. `--developer-mode off` removes the marker once the install root's swap has
+  committed, and if the install is then rolled back, a valid marker it removed is put back. The status `verdict` stays `ok`
+  while the mode is on, and only the `developer-mode` row warns, so automation that audits a Mac reads
   that row rather than the verdict. A release build of the app never uses the mode.
   `k3sm uninstall` removes the marker.
 - **How long it lasts.** The marker sits outside the install root, so it survives reboots and

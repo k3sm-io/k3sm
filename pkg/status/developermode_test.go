@@ -132,6 +132,9 @@ func TestDeveloperModeInvalidRowNamesAncestorCause(t *testing.T) {
 		t.Errorf("ancestor alert = %+v", a)
 	}
 	r = row("")
+	if ma := developerModeAlert(r); ma == nil || len(ma.Fix) != 1 || ma.Fix[0].Command != developerModeInvalidRemedy {
+		t.Errorf("marker-file alert = %+v, want the sudo rm step", ma)
+	}
 	if r.Detail != developerModeInvalidDetail || r.Remedy != developerModeInvalidRemedy {
 		t.Errorf("marker-file row = %+v", r)
 	}

@@ -16,7 +16,10 @@ limitations under the License.
 
 package install
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 // TestDeveloperModeAncestorCause pins which directory is named: the first bad
 // one above a sound marker, and nothing when the marker itself is the cause.
@@ -34,6 +37,8 @@ func TestDeveloperModeAncestorCause(t *testing.T) {
 		{"all sound", DeveloperModeFacts{Exists: true, Entry: file, Ancestors: []DeveloperModeAncestor{{Entry: good}, {Entry: good}}}, ""},
 		{"library writable", DeveloperModeFacts{Exists: true, Entry: file, Ancestors: []DeveloperModeAncestor{{Entry: good}, {Entry: bad}}}, "/Library"},
 		{"root acl", DeveloperModeFacts{Exists: true, Entry: file, Ancestors: []DeveloperModeAncestor{{Entry: good, HasACL: true}, {Entry: good}}}, "/"},
+		{"symlink root", DeveloperModeFacts{Exists: true, Entry: file, Ancestors: []DeveloperModeAncestor{{Entry: OwnedEntry{Kind: EntrySymlink, Mode: 0o755}}, {Entry: good}}}, "/"},
+		{"probe error on library", DeveloperModeFacts{Exists: true, Entry: file, Ancestors: []DeveloperModeAncestor{{Entry: good}, {Err: errors.New("lstat failed")}}}, "/Library"},
 		{"marker is the cause", DeveloperModeFacts{Exists: true, Entry: OwnedEntry{Kind: EntryRegular, UID: 501, Mode: 0o644}, Ancestors: []DeveloperModeAncestor{{Entry: bad}, {Entry: bad}}}, ""},
 	}
 	for _, tc := range cases {
