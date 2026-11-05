@@ -237,7 +237,8 @@ node:
    (following redirects only to `objects.githubusercontent.com` and
    `release-assets.githubusercontent.com`, each one checked), at most 512 MiB and within 10
    minutes, into a fresh directory under `/var/lib/k3sm/updates` that only the `_k3sm` user can
-   read. A node installed with `--update-release-base` also accepts that base's own host (below).
+   read. `k3sm install` creates `/var/lib/k3sm/updates` on both roles; the daemon cannot, because
+   the data root belongs to root. A node installed with `--update-release-base` also accepts that base's own host (below).
 3. Writes `Verifying` and checks the archive's sha256 against the signed payload.
 4. Writes `Installing` and hands the archive, the payload, its signature and the signer to the
    `k3sm-netd` root helper. The helper verifies them again (above), unpacks only the build set
@@ -257,12 +258,19 @@ node:
    version reports it.
 
 The node never runs a downloaded binary itself. A refusal or a failed install writes `Failed`
-with the reason (`kubectl get node <name> -o jsonpath='{.metadata.annotations.k3sm\.io/update-phase}'`),
+with the reason and names `k3sm update abort`, the recovery for the cordon the node keeps
+(`kubectl get node <name> -o jsonpath='{.metadata.annotations.k3sm\.io/update-phase}'`),
 and the download directory stays for diagnosis until the next update attempt or the next daemon
 start removes it. A node without the `k3sm-netd` helper, such as a standalone `k3sm node`, does not
 take part. A worker that joined before this release has no root-owned CA copy until it is
 installed again (`sudo k3sm install --agent --server <server>`), and until then its helper refuses
 every managed update.
+
+A node installed by a release that did not lay down `/var/lib/k3sm/updates` has no such directory
+and cannot make one, so a managed update fails on it at the first step. Before its first managed
+update, install this release on it once by hand: `sudo k3sm install` on a server, `sudo k3sm install --agent --server
+<server>` on a worker. A node that has already failed this way stays cordoned; run `k3sm update
+abort` first, then the install.
 
 ### Release Base for a Mirror or a Lab
 

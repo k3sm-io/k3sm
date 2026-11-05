@@ -35,6 +35,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -230,6 +231,9 @@ type updateCase struct {
 	ready    func(context.Context) bool
 	base     string
 	pinnedCA []byte
+	// noRoot leaves the update root uncreated, as on a node an older release
+	// installed; every other case has it, as install lays it down.
+	noRoot bool
 }
 
 func runNodeUpdate(t *testing.T, c updateCase) updateRun {
@@ -250,6 +254,11 @@ func runNodeUpdate(t *testing.T, c updateCase) updateRun {
 	cs := fake.NewClientset(c.node)
 	ff := &fakeFetcher{archive: c.archive}
 	root := filepath.Join(t.TempDir(), "updates")
+	if !c.noRoot {
+		if err := os.Mkdir(root, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
 	opts := nodeOptions{
 		nodeName:           updTestNode,
 		netMode:            hostnet.Mode{Backend: hostnet.BackendHelper, Socket: "/var/lib/k3sm/run/netd.sock"},
@@ -394,6 +403,9 @@ func TestUpdateApplyVerifiesBeforeInstall(t *testing.T) {
 		if !strings.Contains(last, "exit status 1") || !strings.Contains(last, "install: refused the staged build") || strings.ContainsRune(last, '\x07') {
 			t.Errorf("Failed value = %q, want the error and the installer's last line, control characters stripped", last)
 		}
+		if !strings.Contains(last, "`k3sm update abort`") {
+			t.Errorf("Failed value = %q, want it to name the recovery", last)
+		}
 		if _, msg := update.ParsePhase(last); len(msg) > update.MaxMessageBytes {
 			t.Errorf("message is %d bytes, over %d", len(msg), update.MaxMessageBytes)
 		}
@@ -498,8 +510,12 @@ func TestUpdateApplyVerifiesBeforeInstall(t *testing.T) {
 			if names := phaseNames(got); !slices.Equal(names, tc.wantPhases) {
 				t.Fatalf("phases = %v, want %v", names, tc.wantPhases)
 			}
-			if last := got[len(got)-1]; !strings.Contains(last, tc.wantMsg) {
+			last := got[len(got)-1]
+			if !strings.Contains(last, tc.wantMsg) {
 				t.Errorf("Failed value = %q, want it to say %q", last, tc.wantMsg)
+			}
+			if !strings.Contains(last, "`k3sm update abort`") {
+				t.Errorf("Failed value = %q, want it to name the recovery", last)
 			}
 			if len(r.netd.calls) != 0 {
 				t.Errorf("ApplyUpdate was called after a refusal: %+v", r.netd.calls)
@@ -509,6 +525,39 @@ func TestUpdateApplyVerifiesBeforeInstall(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("an absent update root is refused, never created", func(t *testing.T) {
+		t.Parallel()
+		r := runNodeUpdate(t, updateCase{node: handedOverNode(t, good, nil), noRoot: true})
+		got := phasesWritten(t, r.cs)
+		if names := phaseNames(got); !slices.Equal(names, []string{"Failed"}) || len(r.fetch.urls) != 0 || len(r.netd.calls) != 0 {
+			t.Fatalf("phases %v, fetched %v, calls %d; want Failed before any download", names, r.fetch.urls, len(r.netd.calls))
+		}
+		last := got[len(got)-1]
+		for _, want := range []string{"does not exist", "`sudo k3sm install`", "`k3sm update abort`"} {
+			if !strings.Contains(last, want) {
+				t.Errorf("Failed value = %q, want it to say %q", last, want)
+			}
+		}
+		if _, err := os.Lstat(r.root); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("the watcher created the update root (lstat: %v)", err)
+		}
+	})
+
+	t.Run("a long installer line cannot clip the recovery off the message", func(t *testing.T) {
+		t.Parallel()
+		netd := &fakeNetd{err: errors.New("netd ApplyUpdate failed: the installer failed: exit status 1"),
+			result: wire.UpdateResult{Phase: wire.UpdatePhaseFailed, Log: strings.Repeat("é", 2*update.MaxMessageBytes)}}
+		r := runNodeUpdate(t, updateCase{node: handedOverNode(t, good, nil), netd: netd})
+		got := phasesWritten(t, r.cs)
+		_, msg := update.ParsePhase(got[len(got)-1])
+		if len(msg) > update.MaxMessageBytes {
+			t.Errorf("message is %d bytes, over %d", len(msg), update.MaxMessageBytes)
+		}
+		if !strings.Contains(msg, "exit status 1") || !strings.Contains(msg, "`k3sm update abort`") || !utf8.ValidString(msg) {
+			t.Errorf("message = %q, want the reason and the recovery, valid UTF-8", msg)
+		}
+	})
 
 	t.Run("a node pinning another cluster's CA refuses this cluster's signer", func(t *testing.T) {
 		t.Parallel()
@@ -562,6 +611,9 @@ func TestUpdateApplyWritesRestartingBeforeTheExec(t *testing.T) {
 	defer watch.Stop()
 
 	root := filepath.Join(t.TempDir(), "updates")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	daemon := func(running string, netd update.Netd) *update.Watcher {
 		t.Helper()
 		w, err := newNodeUpdater(nodeOptions{

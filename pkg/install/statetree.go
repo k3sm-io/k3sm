@@ -215,7 +215,19 @@ const (
 	// StateStatus is the service user's world-readable status directory
 	// (StatusSubdir).
 	StateStatus StateLevel = StatusSubdir
+	// StateUpdates is the managed update's working directory: each node
+	// daemon downloads a release archive into a fresh attempt directory here
+	// before handing it to the root helper (pkg/update.Watcher).
+	StateUpdates StateLevel = UpdatesSubdir
 )
+
+// UpdatesSubdir is the data-root subdirectory of the managed update
+// (StateUpdates).
+const UpdatesSubdir = "updates"
+
+// UpdatesDirMode is the update root's mode: the service user's own, because a
+// downloaded archive is not for any other account to read or replace.
+const UpdatesDirMode fs.FileMode = 0o700
 
 // Path joins the level onto a data root.
 func (l StateLevel) Path(dataRoot string) string {
@@ -258,6 +270,8 @@ var stateTree = func() []stateLevel {
 		// The records the server publishes for `k3sm status`, readable by any
 		// account (StatusSubdir).
 		{StateStatus, svc(StatusDirMode)},
+		// The managed update's downloads, on both roles (StateUpdates).
+		{StateUpdates, svc(UpdatesDirMode)},
 		{StateLevel(sandbox.ServerSubdir), svc(ServerTokenDirMode)},
 		{StateLevel(agentWorkSubdir), svc(AgentTokenDirMode)},
 		// The per-pod rootfs parent and the PersistentVolume parent.

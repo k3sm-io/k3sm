@@ -214,6 +214,11 @@ func artifactManifest(cfg Config) []artifact {
 	// `sudo k3sm update check` writes it wherever it runs. assertExists is
 	// false: no check may have run.
 	items = append(items, artifact{kind: kindFile, disp: dispRemove, path: filepath.Join(StateStatus.Path(cfg.DataRoot), UpdateRecordName), assertExists: false})
+	// The managed update's working directory (StateUpdates), REMOVED after the
+	// node daemon that downloads into it is booted out: it holds only release
+	// archives an attempt left for diagnosis. assertExists is false: an
+	// install that predates the tree has none.
+	items = append(items, artifact{kind: kindDir, disp: dispRemove, path: StateUpdates.Path(cfg.DataRoot), assertExists: false})
 	if cfg.Role == RoleServer {
 		// The control plane's staged admin token, the counterpart of the agent's
 		// join token above: it is a system:masters bearer token with no use once

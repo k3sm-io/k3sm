@@ -25,6 +25,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -672,4 +673,100 @@ func TestEnsureStateTreeHandsRuntimeRootLockToServiceUser(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestEnsureStateTreeHandsUpdateRootToServiceUser pins the managed update's
+// working directory. The node daemon runs as the service user under a data
+// root that is root:wheel 0755, so it cannot make <data root>/updates itself:
+// the install has to, on both roles, for the service user at 0700. netd repairs
+// it from the same row, and uninstall removes it with whatever an attempt left
+// inside. The level is spelled as the literal the daemon joins onto the data
+// root, so a rename on either side reds here.
+func TestEnsureStateTreeHandsUpdateRootToServiceUser(t *testing.T) {
+	const svcUID = 271
+	level := StateLevel("updates")
+	dir := level.Path(DefaultDataRoot)
+	dirCall := func(path string) string {
+		return fmt.Sprintf("EnsureOwnedDir:%s:%d:%d:%#o", path, svcUID, ServiceTreeGID, fs.FileMode(0o700))
+	}
+
+	t.Run("the table makes it a service-user tree netd repairs", func(t *testing.T) {
+		own, ok := OwnershipOf(level)
+		if !ok || own.Principal != PrincipalServiceUser || own.GID != ServiceTreeGID || own.Mode != 0o700 {
+			t.Errorf("OwnershipOf(%s) = %+v, %v; want the service user, gid %d, mode 0700", level, own, ok, ServiceTreeGID)
+		}
+		if !slices.Contains(ServiceLevels(), level) {
+			t.Errorf("%s is not a service level, so netd would not repair it", level)
+		}
+	})
+
+	want := OwnedEntry{Path: dir, UID: svcUID, GID: ServiceTreeGID, Mode: 0o700, Kind: EntryDir}
+	cases := []struct {
+		name    string
+		seed    *OwnedEntry
+		wantErr bool
+		want    OwnedEntry
+	}{
+		{name: "an absent directory is created for the service user", want: want},
+		{
+			name: "a root-owned directory is handed to the service user",
+			seed: &OwnedEntry{UID: 0, GID: 0, Mode: 0o755 | fs.ModeDir, Kind: EntryDir},
+			want: want,
+		},
+		{
+			name:    "a symlink is refused and left alone",
+			seed:    &OwnedEntry{UID: svcUID, GID: ServiceTreeGID, Mode: 0o755 | fs.ModeSymlink, Kind: EntrySymlink},
+			wantErr: true,
+			want:    OwnedEntry{Path: dir, UID: svcUID, GID: ServiceTreeGID, Mode: 0o755 | fs.ModeSymlink, Kind: EntrySymlink},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeSystem{}
+			if tc.seed != nil {
+				f.putOwnedEntry(dir, *tc.seed)
+			}
+			cfg := serverCfg()
+			cfg.Logger = slog.New(slog.DiscardHandler)
+			cfg.DataRoot = DefaultDataRoot
+			err := ensureStateTree(f, cfg, svcUID)
+			if tc.wantErr != (err != nil) {
+				t.Errorf("ensureStateTree = %v, wantErr %v", err, tc.wantErr)
+			}
+			wantCall(t, f, dirCall(dir))
+			if got := f.owners[dir]; got != tc.want {
+				t.Errorf("%s = %+v, want %+v", dir, got, tc.want)
+			}
+		})
+	}
+
+	t.Run("both roles lay it down and their manifests remove it", func(t *testing.T) {
+		shrinkRestartBudgets(t)
+		for _, role := range []Role{RoleServer, RoleAgent} {
+			f := &fakeSystem{}
+			cfg := testConfig(t)
+			if role == RoleAgent {
+				seedJoinedAgent(t, f)
+				cfg = agentCfg(t)
+			}
+			if err := Install(context.Background(), f, cfg); err != nil {
+				t.Fatalf("%v Install: %v", role, err)
+			}
+			dc := cfg.withDefaults()
+			path := level.Path(dc.DataRoot)
+			wantCall(t, f, dirCall(path))
+			found := false
+			for _, a := range artifactManifest(dc) {
+				if a.path == path {
+					found = true
+					if a.kind != kindDir || a.disp != dispRemove {
+						t.Errorf("%v manifest carries %s as kind %v disp %v, want a removed directory", role, path, a.kind, a.disp)
+					}
+				}
+			}
+			if !found {
+				t.Errorf("%v manifest does not carry %s", role, path)
+			}
+		}
+	})
 }

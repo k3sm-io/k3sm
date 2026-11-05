@@ -1912,6 +1912,7 @@ func TestInstallOrchestration(t *testing.T) {
 		"EnsureOwnedDir:/var/lib/k3sm/run:271:20:0700",
 		"EnsureOwnedDir:/var/lib/k3sm/Library:271:20:0700",
 		"EnsureOwnedDir:/var/lib/k3sm/status:271:20:0755",
+		"EnsureOwnedDir:/var/lib/k3sm/updates:271:20:0700",
 		"EnsureOwnedDir:/var/lib/k3sm/pods:271:20:0750",
 		"EnsureOwnedDir:/var/lib/k3sm/storage:271:20:0750",
 		"EnsureOwnedDir:/var/lib/k3sm/blobs:271:20:0750",
@@ -2324,6 +2325,7 @@ func TestUninstallIdempotent(t *testing.T) {
 		// no use on a Mac that is no longer a k3sm server, and it goes AFTER the
 		// daemon that reads it has been booted out.
 		"RemoveAll:/var/lib/k3sm/server/token",
+		"RemoveAll:/var/lib/k3sm/updates",
 		"RemoveAll:/var/lib/k3sm/status/update.json",
 		"RemoveAll:/var/lib/k3sm/status/budget.json",
 		"RemoveAll:/var/lib/k3sm/status/endpoints.json",
@@ -3004,6 +3006,11 @@ func TestUninstallManifestCoversInstall(t *testing.T) {
 		// server; it is admitted by that exact path, and only on the server role.
 		if dc.Role == RoleServer {
 			created[dc.serverJoinTokenPath()] = true
+		}
+		// The managed update's working directory: a state-tree row install
+		// lays down on both roles (EnsureOwnedDir), removed with its contents.
+		if slices.Contains(installCalls, fmt.Sprintf("EnsureOwnedDir:%s:%d:%d:%#o", StateUpdates.Path(dc.DataRoot), 271, ServiceTreeGID, UpdatesDirMode)) {
+			created[StateUpdates.Path(dc.DataRoot)] = true
 		}
 		// The `k3sm status` records are written by the server daemon this
 		// install bootstrapped, in its work dir and in the status directory, so
