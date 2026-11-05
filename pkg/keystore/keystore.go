@@ -129,9 +129,12 @@ type Store interface {
 // pkg/executor/secretsencryption.go.
 var (
 	// ErrInvalidName reports an entry name that may not be used. A name is
-	// validated before it becomes a file name: it is not empty, contains no
-	// path separator, and is not made only of dots.
-	ErrInvalidName = errors.New("invalid keystore entry name: it must be non-empty, contain no path separator, and not consist only of dots")
+	// validated before it becomes a file name: 1 to 253 bytes of lowercase
+	// letters, digits, '-' and '.', beginning and ending with a letter or
+	// digit. That rules out a path separator, a name made only of dots, a
+	// name that differs from another only in case (APFS is case-insensitive
+	// by default), and a dot name the store keeps for its own files.
+	ErrInvalidName = errors.New("invalid keystore entry name: it must be 1 to 253 lowercase letters, digits, '-' or '.', beginning and ending with a letter or digit")
 	// ErrExists reports a Put on a name that already exists; a new value for
 	// an existing entry is a Rotate.
 	ErrExists = errors.New("keystore entry already exists; use rotate to store a new version")
