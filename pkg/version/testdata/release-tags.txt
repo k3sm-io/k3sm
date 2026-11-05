@@ -1,0 +1,52 @@
+# The release tag grammar, as one corpus for every reader that holds a copy of
+# it. Each line is a verdict and a tag: `canonical` is a tag the release channel
+# may offer, `refused` is one it never does, however high it ranks.
+#
+# A refused tag here passes ValidTag and carries a high version on purpose, so a
+# reader that loses the grammar check picks it and the test goes red. rc.0 stays
+# canonical: a release tool may refuse to cut it, but a reader takes it.
+
+canonical v0.0.0
+canonical v0.3.0
+canonical v0.3.0-rc.0
+canonical v0.3.0-rc.1
+canonical v0.3.0-rc.9
+canonical v0.3.0-rc.10
+canonical v0.3.0-rc.9999
+canonical v10.20.30
+canonical v999999999.999999999.999999999
+
+# Not three plain numeric fields behind a lowercase v.
+refused 9.0.0
+refused V9.0.0
+refused v9.0
+refused v9.0.0.0
+refused v09.0.0
+refused v9.00.0
+refused v9.0.00
+refused v1000000000.0.0
+
+# A candidate suffix in any other spelling.
+refused v9.0.0-rc
+refused v9.0.0-rc.
+refused v9.0.0-rc1
+refused v9.0.0-RC.1
+refused v9.0.0-rc.01
+refused v9.0.0-rc.10000
+refused v9.0.0-rc.1.2
+refused v9.0.0-rc.1+build.5
+
+# Another prerelease name, and build metadata.
+refused v9.0.0-alpha
+refused v9.0.0-beta.1
+refused v9.0.0+build.5
+
+# A development build, a modified tree, and Go pseudo-versions.
+refused dev
+refused v9.0.0-dev
+refused v9.0.0-dirty
+refused v9.0.0.dirty
+refused v9.0.0+dirty
+refused v0.0.0-20261015120000-0123456789ab
+refused v9.0.1-0.20261015120000-0123456789ab
+refused v9.0.1-rc.1.0.20261015120000-0123456789ab

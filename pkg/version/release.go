@@ -42,6 +42,18 @@ func ValidTag(tag string) bool {
 	return true
 }
 
+// canonicalTag is the grammar of a tag a release channel offers: vX.Y.Z or
+// vX.Y.Z-rc.N, each number with no leading zero and bounded in length.
+// testdata/release-tags.txt is the corpus every reader of it is held to.
+var canonicalTag = regexp.MustCompile(`^v(0|[1-9][0-9]{0,8})(\.(0|[1-9][0-9]{0,8})){2}(-rc\.(0|[1-9][0-9]{0,3}))?$`)
+
+// CanonicalTag reports whether tag is a final release or a release candidate in
+// the one spelling a release channel offers. It is narrower than ValidTag, which
+// says only that a tag is safe to handle: another prerelease name, a Go
+// pseudo-version or a development build is valid and not canonical. Every
+// canonical tag orders under CompareReleases.
+func CanonicalTag(tag string) bool { return canonicalTag.MatchString(tag) }
+
 // nodeK3smMarker separates the Kubernetes version from the k3sm release in a
 // node's kubelet version (Info.NodeVersion).
 const nodeK3smMarker = "+k3sm."
