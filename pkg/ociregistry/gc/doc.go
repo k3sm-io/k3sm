@@ -63,9 +63,18 @@ limitations under the License.
 // existed, even into the same directory, gets a new id and so a report-only
 // sweep again; a backup or copy that carries the id file is the same store. A
 // restore merged over a live root keeps the id and is not told apart from a
-// push, in the repositories the marker names (see markerRecord). A sweep that
-// would delete more than half of a repository's blobs stops with ErrMassDelete,
-// unless it
+// push, in the repositories the marker names (see markerRecord), unless it
+// leaves index.json fewer rows than the store recorded writing it: any sweep of
+// such a repository stops with ErrRowsLost, before it plans, until the rows are
+// restored or the record is removed (see store.Locked.CheckRows). A sweep that
+// would delete more than half of a repository's blobs stops with ErrMassDelete.
+// While a row stays, only the blobs the rows describe count, on both sides of the
+// half: each row's manifest and every digest in a manifest body the sweep read.
+// A blob outside them is one no image in the repository uses, so blobs a pusher
+// uploads beside a tagged image cannot hold the brake; they go by the grace rule.
+// When a body the sweep read fails its hash, what it names is not known, and
+// every blob counts again.
+// The brake does not stop the sweep when it
 // empties the repository (it leaves no row and every blob it reaps is older
 // than the last change to the rows) or the repository is an abandoned first
 // push. The emptying rule does not free a first push's blobs while they are
@@ -88,10 +97,13 @@ limitations under the License.
 // list, such as a Docker schema1 manifest or any body with a schema1 fsLayers
 // field) stops that repository's sweep: it never deletes on a guess. The server
 // refuses at PUT whatever Readable refuses, so a pusher cannot store such a row.
-// A blob an index names as a child, with no row, stops the sweep too when it is
-// over the size cap or fails its hash. If it verifies but the strict read refuses
-// it, it does not stop the sweep: it may be a blob or an older manifest, so it is
-// kept along with every digest its JSON holds, and those digests are followed
-// through whatever bodies the store has for them (see makePlan). One of those over
-// the size cap or failing its hash is kept and stops nothing.
+// A blob an index names as a child, with no row, stops the sweep too when it
+// fails its hash. One over the size cap is no manifest, since the server neither
+// stores nor serves one that large, so it is kept as a blob, not read, and stops
+// nothing, whatever media type the index gives it. If it verifies but the strict
+// read refuses it, it does not stop the sweep: it may be a blob or an older
+// manifest, so it is kept along with every digest its JSON holds, and those
+// digests are followed through whatever bodies the store has for them (see
+// makePlan). One of those over the size cap or failing its hash is kept and stops
+// nothing.
 package gc
