@@ -62,9 +62,10 @@
 # Records that predate the run. `k3sm update apply` replaces a finished Update named
 # current, and the run sets the channel, so neither an Update nor an UpdatePolicy already
 # there can survive it. Saving one and putting it back is no answer: an Update created
-# again has no status, so the controller would take it for a new roll. So the run refuses
-# them (exit 2, the rig untouched) and the operator decides; what it deletes at the end is
-# only what it created.
+# again has no status, so the controller would take it for a new roll. A release pin
+# binds what a roll may install, so a run over one proves something else. So the run
+# refuses all three (exit 2, the rig untouched) and the operator decides; what it deletes
+# at the end is only what it created. It never sets a pin, so it never clears one.
 #
 # When a GET has happened. Node phase Downloading does not say one has been made: the
 # controller writes it at the handover, before the node has read it. So a.1 and b.1 read
@@ -512,6 +513,8 @@ def parts(t):
     return (int(m[1]), int(m[2]), int(m[3]), 1 if m[4] is None else 0, int(m[4] or 0))
 def ver_parts(v):
     return parts("v" + v) if re.match(r"^\d", v) and "main" not in v else (0, 0, 0, 0, 0)
+def pin_path():
+    return os.path.join(os.environ["K3SM_B1240_DATA_ROOT"], "server", "update", "release-pin")
 def latest(ch):
     b = s["base"].get(SRV, "")
     if ch == "rc":
@@ -654,6 +657,9 @@ elif argv[:1] == ["install"]:
     s["ver"][node], s["stopped"][host] = ver, False
     s["cord"][node] = False
     s["installs"] = s.get("installs", 0) + 1
+    if brk == "pin-at-install" and ver != "main":
+        os.makedirs(os.path.dirname(pin_path()), exist_ok=True)
+        open(pin_path(), "w").close()
     root = os.environ["K3SM_B1240_DATA_ROOT"]
     if brk != "no-updates-row":
         os.makedirs(os.path.join(root, "updates"), mode=0o700, exist_ok=True)
@@ -679,6 +685,8 @@ elif argv[:2] == ["update", "check"]:
     out(check())
 elif argv[:2] == ["update", "apply"]:
     if "--clear-pin" in argv:
+        if os.path.exists(pin_path()):
+            os.remove(pin_path())
         print("There is no release pin.")
     else:
         tag = argv[argv.index("--version") + 1] if "--version" in argv else latest(s["channel"] or "stable")
@@ -991,19 +999,23 @@ self_test() {
 	u="$(grep -n 'update apply --yes' "$f" | head -1 | cut -d: -f1)"
 	check "$([ -n "$u" ] && [ "${v%% *}" -gt "$u" ] && [ "${v#* }" = "" ] && echo ok)" "green run deletes the Update once, after it created one (deleted at line $v, created at $u)"
 	check "$([ "$(grep -c 'kubectl delete updatepolic' "$f")" = 1 ] && echo ok)" "green run deletes the UpdatePolicy once"
-	for brk in old-update old-policy; do
+	if grep -q 'clear-pin' "$f"; then check no "green run clears no release pin"; else check ok "green run clears no release pin"; fi
+	mkdir -p "$tmp/old-pin/data/server/update"
+	: >"$tmp/old-pin/data/server/update/release-pin"
+	for brk in old-update old-policy old-pin; do
 		out="$(run_fake "$tmp/$brk" "$brk" 47998 "$tmp/$brk-ev")" && code=0 || code=$?
 		case "$out" in *"predate"*) ;; *) code="no reason given" ;; esac
 		check "$([ "$code" = 2 ] && [ ! -e "$tmp/$brk-ev" ] && echo ok)" "$brk: refused, exit 2, nothing created (got $code)"
 		if grep -Eq ' (stop|install|update apply|kubectl delete)( |$)' "$tmp/$brk/calls.log"; then check no "$brk: the rig untouched, nothing deleted"; else check ok "$brk: the rig untouched, nothing deleted"; fi
 	done
+	check "$([ -e "$tmp/old-pin/data/server/update/release-pin" ] && echo ok)" "old-pin: the pin is still there"
 
 	# The negative controls: each property broken alone reds its own leg, exit 1, and the
 	# rig is still put back on this tree's build. They run side by side: each is a full run.
 	port=47901
 	for row in no-updates-row:c.1 forward-dead:f.1 cel-name:p.1 cel-value:p.2 stable-rc:s.1 \
 		roll-on-set:r.1 worker-row:r.2 server-first:a.1 no-get-rc1:a.1 server-races:a.1 stays-cordoned:a.2 \
-		no-resume:b.1 no-refetch:b.1 no-get-rc2:b.1 \
+		no-resume:b.1 no-refetch:b.1 no-get-rc2:b.1 pin-at-install:c.2 \
 		server-restart-fails:b.2 pod-fails:b.3 no-refuse:l.2 mid-channel:m.1 no-fallback:w.1 \
 		worker-install-fails:c.1 cancel-ignored:w.1 no-get:w.1 abort-keeps-cordon:w.2 past-failure:w.3 leftover:e.1 base-left:e.2 label-lost:e.3; do
 		(
@@ -1032,6 +1044,7 @@ self_test() {
 		cat "$f"
 		if grep -q '^FAIL' "$f"; then bad=1; fi
 	done
+	check "$([ -e "$tmp/b-pin-at-install/data/server/update/release-pin" ] && echo ok)" "a pin the run did not set stays at the end"
 	check "$([ ! -e "$tmp/b-worker-install-fails/token-left" ] && echo ok)" "a failed install leaves no token file"
 	check "$([ "$(find "$tmp/b-base-left/.kube" -name 'config.b1240-*' | wc -l)" -gt 1 ] && echo ok)" "a restore that did not pass keeps its kubeconfig copies"
 	if grep -rqF --exclude=B1240.sh fake-token "$tmp/b-worker-install-fails-ev"; then check no "a failed install: the token is not in the evidence"; else check ok "a failed install: the token is not in the evidence"; fi
@@ -1137,6 +1150,13 @@ for side in server worker; do
 	fi
 done
 nodes_doc() { rsh "$SERVER" sudo "$K3SM_BIN" kubectl get nodes -o json </dev/null; }
+# pin_state: present or absent, for the server's release pin. A read only: `--clear-pin`
+# would remove the pin to say so.
+PIN_PATH="$DATA_ROOT/server/update/release-pin"
+pin_state() {
+	# shellcheck disable=SC2016 # expands in the remote shell
+	rsh_probe "$SERVER" "$(quoted sudo -n /bin/bash -c 'if [ -e "$1" ] || [ -L "$1" ]; then echo present; else echo absent; fi' sh "$PIN_PATH")" 2>/dev/null
+}
 kc get --raw /healthz >/dev/null 2>&1 </dev/null || refuse "the cluster is not serving (/healthz, sudo k3sm kubectl on the server)"
 DOC="$(nodes_doc 2>/dev/null)" || refuse "cannot list the nodes"
 SERVER_NODE="$(printf '%s' "$DOC" | J '" ".join(i["metadata"]["name"] for i in d["items"] if "node-role.kubernetes.io/control-plane" in i["metadata"].get("labels",{}))')"
@@ -1165,6 +1185,12 @@ RECORDS="$(kc get updates.updates.k3sm.io,updatepolicies.updates.k3sm.io -o name
 if [ -n "$RECORDS" ]; then
 	refuse "these predate the run and a roll would replace them: $(tr '\n' ' ' <<<"$RECORDS")(see --help); remove them yourself if they can go"
 fi
+PIN="$(pin_state)" || refuse "cannot read the release pin $PIN_PATH on the server"
+case "$PIN" in
+absent) ;;
+present) refuse "a release pin predates the run and would bind its rolls: $PIN_PATH (see --help); remove it yourself if it can go" ;;
+*) refuse "cannot read the release pin $PIN_PATH on the server (got '$PIN')" ;;
+esac
 FOREIGN_BEFORE="$(printf '%s' "$DOC" | J '"; ".join(i["metadata"]["name"]+": "+foreign(i) for i in sorted(d["items"], key=lambda i: i["metadata"]["name"]))')"
 
 mkdir -p "$EVIDENCE/scripts" "$EVIDENCE/pods" "$EVIDENCE/manifests" "$SETS"
@@ -1512,7 +1538,7 @@ offers() {
 row_of() { "$1" status -o json </dev/null 2>/dev/null | J "$2"; }
 
 leg_clean() {
-	local v before_s before_w at s w born now
+	local v before_s before_w at s w born now pin
 	RIG_TOUCHED=1
 	# The worker first, so it does not spend the stop retrying a server that went away.
 	before_w="$(clean_node "$WORKER" "$WORKER_WORK" worker 2>&1)" || true
@@ -1552,8 +1578,9 @@ leg_clean() {
 		leg c.2 no "the nodes were not Ready and schedulable within ${READY_TIMEOUT}s"
 		return 1
 	}
-	k update apply --clear-pin </dev/null >>"$RUNLOG" 2>&1 || true
 	now="$(kc get updates.updates.k3sm.io,updatepolicies.updates.k3sm.io -o name </dev/null 2>/dev/null || true)"
+	pin="$(pin_state)" || pin=unreadable
+	[ "$pin" = absent ] || now="${now:+$now }release pin $pin"
 	log "installed: server $(rsh "$SERVER" "$K3SM_BIN" version </dev/null | sed -n 1p); worker $(rsh "$WORKER" "$K3SM_BIN" version </dev/null | sed -n 1p)"
 	if both_on "$TAG_BASE" && [ -z "$now" ]; then
 		leg c.2 ok "both on $TAG_BASE, no pin, Update or UpdatePolicy"
@@ -2043,7 +2070,6 @@ put_back() {
 		copy_kubeconfig
 		wait_ready || log "the nodes did not come Ready within ${READY_TIMEOUT}s"
 		{
-			k update apply --clear-pin
 			kc delete namespace "$NS" --ignore-not-found --wait=true --timeout=120s
 			if [ "$RUN_UPDATE" = 1 ]; then kc delete updates.updates.k3sm.io current --ignore-not-found; fi
 			if [ "$RUN_POLICY" = 1 ]; then kc delete updatepolicies.updates.k3sm.io cluster --ignore-not-found; fi
