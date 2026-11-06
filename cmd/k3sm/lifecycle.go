@@ -147,14 +147,20 @@ func lifecycleExit(verb string, err error, stderr io.Writer) int {
 		return 0
 	}
 	fmt.Fprintf(stderr, "k3sm %s: %v\n", verb, err)
-	if errors.Is(err, install.ErrNodeStillCordoned) {
-		fmt.Fprintf(stderr, "%s: the daemons are up; re-run 'sudo k3sm start' to uncordon it\n", install.StillCordonedMarker)
-	}
+	reportStillCordoned(err, stderr)
 	var serr *install.StopIncompleteError
 	if errors.As(err, &serr) {
 		return serr.ExitCode()
 	}
 	return exitLifecycleFailed
+}
+
+// reportStillCordoned prints the marker line a caller reads when err says the
+// node is still cordoned, and nothing otherwise.
+func reportStillCordoned(err error, stderr io.Writer) {
+	if errors.Is(err, install.ErrNodeStillCordoned) {
+		fmt.Fprintf(stderr, "%s: the daemons are up; re-run 'sudo k3sm start' to uncordon it\n", install.StillCordonedMarker)
+	}
 }
 
 // requireRoot refuses a lifecycle verb run without root.

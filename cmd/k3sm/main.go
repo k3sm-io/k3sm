@@ -107,7 +107,9 @@ func main() {
 		}
 	case "install":
 		if err := runInstall(os.Args[2:]); err != nil {
-			os.Exit(lifecycleExit("install", err, os.Stderr))
+			fmt.Fprintln(os.Stderr, "k3sm install:", err)
+			reportStillCordoned(err, os.Stderr)
+			os.Exit(1)
 		}
 	case "payload":
 		if err := runPayload(os.Args[2:]); err != nil {
