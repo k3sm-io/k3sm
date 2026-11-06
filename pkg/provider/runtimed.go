@@ -2160,7 +2160,7 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 			// would be misleading when the missing number is the pod's own.
 			msg := msgFailedGPUFit(gpuWant, admitted, gpuCeiling)
 			if errors.Is(err, gpucapacity.ErrGPUMemoryUnbounded) {
-				msg = msgFailedGPUUnbounded(podGPUResource(pod), gpuCeiling)
+				msg = msgFailedGPUUnbounded(gpucapacity.GrantResource(pod), gpuCeiling)
 			}
 			r.recorder.Event(pod, corev1.EventTypeWarning, reasonFailedGPUFit, msg)
 			return fmt.Errorf("create pod %s/%s: %w", pod.Namespace, pod.Name, err)
