@@ -1,13 +1,13 @@
 # Every test in this package across the move of the registry child from zot to
 # `k3sm registry serve`: name, kept|rewritten|added|deleted, reason.
 # TestTestManifestIsComplete checks this file against the source.
-FuzzClassify kept the push gate is unchanged
+FuzzClassify rewritten the gate reads names through the shared validator
 TestAdvertisement kept the relay and cluster publication do not touch the child
 TestApplyServeCredential added new with the child switch
 TestAwaitNeedsA200 added new with the child switch
 TestCheckDataVolume added new with the child switch
 TestChildCommand added new with the child switch
-TestClassify rewritten its table moved to classifyCorpus so the differential test reads the same rows; the assertions are unchanged
+TestClassify rewritten the gate reads names through the shared validator
 TestCloseInheritedDescriptors added new with the child switch
 TestClusterEndpointAddress kept the relay and cluster publication do not touch the child
 TestCredentialMatchesRegistry kept the relay and cluster publication do not touch the child

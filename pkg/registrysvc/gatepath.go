@@ -20,6 +20,8 @@ import (
 	"net/url"
 	"path"
 	"strings"
+
+	"k3sm.io/k3sm/pkg/ociregistry/ref"
 )
 
 // The push gate's request classifier: which requests are anonymous reads that
@@ -28,11 +30,14 @@ import (
 //
 // It is PURE and FAIL-CLOSED. A write is forwarded with the gate's own registry
 // credential attached, so the repository a write is authorized for must be the
-// repository zot then acts on. The parser therefore refuses every spelling that
-// could be read two ways: a percent escape, a backslash, an empty or dot
-// segment, a NUL or control byte, an uppercase letter outside a tag, and a
-// repository component that is one of the route words. What it accepts, it
-// forwards byte for byte as the path it parsed.
+// repository the registry then acts on. The parser therefore refuses every
+// spelling that could be read two ways: a percent escape, a backslash, an empty
+// or dot segment, and a NUL or control byte. Repository names, tags and digests
+// are read by pkg/ociregistry/ref, the validator the registry server uses, and
+// the path is split as the server's router splits it: the route is the tail of
+// the path and the name is everything before it, so a component spelled manifests
+// or uploads has one reading, and blobs is a layout word ref refuses. What the
+// parser accepts, it forwards byte for byte as the path it parsed.
 
 // gateOp is what the gate does with one request.
 type gateOp uint8
@@ -95,19 +100,11 @@ type gateRoute struct {
 	path, query string
 }
 
-// Limits from the distribution specification: a repository name is at most 255
-// characters, a tag at most 128.
+// Limits of the two tokens the shared validator does not read.
 const (
-	maxRepoNameLen = 255
-	maxTagLen      = 128
 	maxUploadIDLen = 128
 	maxStateLen    = 4096
 )
-
-// routeWords are the path segments the registry's router splits a request on.
-// A repository component spelled as one could be split two ways, so a write
-// naming one is refused.
-var routeWords = map[string]bool{"blobs": true, "manifests": true, "uploads": true}
 
 // classify decides what the gate does with a request, from its method, the
 // path exactly as it appeared on the request line, and the raw query.
@@ -201,7 +198,7 @@ func classifyWrite(op gateOp, rawPath, rawQuery string) gateRoute {
 		if n < 3 || segs[n-2] != "manifests" {
 			return gateRoute{op: opRefused}
 		}
-		if !validReference(segs[n-1]) {
+		if _, err := ref.ParseReference(segs[n-1]); err != nil {
 			return gateRoute{op: opInvalid}
 		}
 		name = segs[:n-2]
@@ -209,7 +206,7 @@ func classifyWrite(op gateOp, rawPath, rawQuery string) gateRoute {
 		return gateRoute{op: opRefused}
 	}
 	repo := strings.Join(name, "/")
-	if !validRepoName(repo) {
+	if _, err := ref.ParseName(repo); err != nil {
 		return gateRoute{op: opInvalid}
 	}
 	route := gateRoute{op: op, repo: repo, path: rawPath}
@@ -243,98 +240,7 @@ func cleanPath(p string) bool {
 	return true
 }
 
-// validRepoName checks a repository name against the distribution grammar
-// (components of [a-z0-9] runs joined by '.', '_', '__' or runs of '-',
-// separated by '/'), its length cap, and the route-word refusal.
-func validRepoName(name string) bool {
-	if name == "" || len(name) > maxRepoNameLen {
-		return false
-	}
-	for _, comp := range strings.Split(name, "/") {
-		if !validRepoComponent(comp) || routeWords[comp] {
-			return false
-		}
-	}
-	return true
-}
-
-// validRepoComponent matches [a-z0-9]+(?:(?:\.|_|__|-+)[a-z0-9]+)*.
-func validRepoComponent(c string) bool {
-	if c == "" {
-		return false
-	}
-	i := 0
-	alnumRun := func() bool {
-		start := i
-		for i < len(c) && isLowerAlnum(c[i]) {
-			i++
-		}
-		return i > start
-	}
-	if !alnumRun() {
-		return false
-	}
-	for i < len(c) {
-		switch {
-		case c[i] == '.':
-			i++
-		case c[i] == '_':
-			i++
-			if i < len(c) && c[i] == '_' {
-				i++
-			}
-		case c[i] == '-':
-			for i < len(c) && c[i] == '-' {
-				i++
-			}
-		default:
-			return false
-		}
-		if !alnumRun() {
-			return false
-		}
-	}
-	return true
-}
-
 func isLowerAlnum(b byte) bool { return (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') }
-
-// validReference accepts a tag ([A-Za-z0-9_][A-Za-z0-9._-]{0,127}, the one
-// place the specification allows uppercase) or a digest.
-func validReference(ref string) bool {
-	if strings.Contains(ref, ":") {
-		return validDigest(ref)
-	}
-	if ref == "" || len(ref) > maxTagLen {
-		return false
-	}
-	for i := 0; i < len(ref); i++ {
-		b := ref[i]
-		ok := isLowerAlnum(b) || (b >= 'A' && b <= 'Z') || b == '_' || (i > 0 && (b == '.' || b == '-'))
-		if !ok {
-			return false
-		}
-	}
-	return true
-}
-
-// validDigest accepts sha256:<64 hex> and sha512:<128 hex>, lowercase.
-func validDigest(d string) bool {
-	algo, hex, ok := strings.Cut(d, ":")
-	if !ok {
-		return false
-	}
-	want := map[string]int{"sha256": 64, "sha512": 128}[algo]
-	if want == 0 || len(hex) != want {
-		return false
-	}
-	for i := 0; i < len(hex); i++ {
-		if !((hex[i] >= '0' && hex[i] <= '9') || (hex[i] >= 'a' && hex[i] <= 'f')) {
-			return false
-		}
-	}
-	return true
-}
 
 // validUploadID accepts an upload session id: the registry mints a lowercase
 // UUID, so a lowercase alphanumeric, dash and underscore token of bounded
@@ -404,9 +310,11 @@ func parseWriteQuery(op gateOp, rawQuery string) (query, from string, ok bool) {
 			valid := false
 			switch k {
 			case "digest", "mount":
-				valid = validDigest(dv)
+				_, err := ref.ParseDigest(dv)
+				valid = err == nil
 			case "from":
-				valid = validRepoName(dv)
+				_, err := ref.ParseName(dv)
+				valid = err == nil
 			case "_state":
 				valid = validState(dv)
 			case "origin":

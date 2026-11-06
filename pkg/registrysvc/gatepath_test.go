@@ -20,6 +20,8 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+
+	"k3sm.io/k3sm/pkg/ociregistry/ref"
 )
 
 // TestClassify pins the classifier row by row: the write shapes it admits and
@@ -95,7 +97,20 @@ func classifyCorpus() []classifyCase {
 		{"PUT", "/v2/a__b/c-d.e/manifests/v1", "", opManifestPut, "a__b/c-d.e", "", ""},
 		{"PUT", "/v2/a___b/manifests/v1", "", opInvalid, "", "", ""},
 		{"PUT", "/v2/a-/manifests/v1", "", opInvalid, "", "", ""},
-		{"PUT", "/v2/a/uploads/manifests/v1", "", opInvalid, "", "", ""},
+		{"PUT", "/v2/a/uploads/manifests/v1", "", opManifestPut, "a/uploads", "", ""},
+		{"PUT", "/v2/manifests/manifests/v1", "", opManifestPut, "manifests", "", ""},
+		{"POST", "/v2/a/manifests/blobs/uploads/", "", opUploadStart, "a/manifests", "", ""},
+		{"POST", "/v2/a/blobs/uploads/", "mount=" + d + "&from=a/uploads", opUploadStart, "a", "a/uploads", "from=a%2Fuploads&mount=" + url.QueryEscape(d)},
+		{"PUT", "/v2/a/blobs/manifests/v1", "", opInvalid, "", "", ""},
+		{"PUT", "/v2/index.json/manifests/v1", "", opInvalid, "", "", ""},
+		{"PUT", "/v2/a/index.json/manifests/v1", "", opInvalid, "", "", ""},
+		{"PUT", "/v2/oci-layout/b/manifests/v1", "", opInvalid, "", "", ""},
+		{"PUT", "/v2/a/.uploads/manifests/v1", "", opInvalid, "", "", ""},
+		{"PUT", "/v2/cache.db/manifests/v1", "", opInvalid, "", "", ""},
+		{"PUT", "/v2/htpasswd/a/manifests/v1", "", opInvalid, "", "", ""},
+		{"PUT", "/v2/a/htpasswd/manifests/v1", "", opManifestPut, "a/htpasswd", "", ""},
+		{"POST", "/v2/a/blobs/uploads/", "mount=" + d + "&from=a/index.json", opInvalid, "", "", ""},
+		{"POST", "/v2/index.json/blobs/uploads/", "", opInvalid, "", "", ""},
 		{"PUT", "/v2/" + strings.Repeat("a", 256) + "/manifests/v1", "", opInvalid, "", "", ""},
 		{"PUT", "/v2/a/%2e%2e/manifests/v1", "", opInvalid, "", "", ""},
 		{"PUT", "/v2/a/manifests/v1\x00", "", opInvalid, "", "", ""},
@@ -109,8 +124,8 @@ func classifyCorpus() []classifyCase {
 }
 
 // FuzzClassify asserts the classifier's invariants on arbitrary input: it never
-// panics, every write it admits names a repository that satisfies the
-// distribution grammar, forwards exactly the path it parsed, carries no byte
+// panics, every write it admits names a repository the shared validator accepts,
+// forwards exactly the path it parsed, carries no byte
 // that could be decoded or cleaned into another path, and re-parses to itself.
 func FuzzClassify(f *testing.F) {
 	d := "sha256:" + strings.Repeat("a", 64)
@@ -121,6 +136,9 @@ func FuzzClassify(f *testing.F) {
 		{"GET", "/v2/a/blobs/%75ploads/x", ""},
 		{"PUT", "/v2/a/../b/manifests/v1", ""},
 		{"DELETE", "/v2/a/manifests/v1", ""},
+		{"PUT", "/v2/a/index.json/manifests/v1", ""},
+		{"PUT", "/v2/a/uploads/manifests/v1", ""},
+		{"POST", "/v2/a/blobs/uploads/", "mount=" + d + "&from=%61"},
 	} {
 		f.Add(s[0], s[1], s[2])
 	}
@@ -135,14 +153,16 @@ func FuzzClassify(f *testing.F) {
 		if method == "DELETE" {
 			t.Fatalf("DELETE classified as %s", r.op)
 		}
-		if r.path != path || !cleanPath(r.path) || !validRepoName(r.repo) {
-			t.Fatalf("admitted %q as %+v", path, r)
+		if _, err := ref.ParseName(r.repo); err != nil || r.path != path || !cleanPath(r.path) {
+			t.Fatalf("admitted %q as %+v: %v", path, r, err)
 		}
 		if dec, err := url.PathUnescape(r.path); err != nil || dec != r.path {
 			t.Fatalf("admitted a path that decodes differently: %q", r.path)
 		}
-		if r.from != "" && !validRepoName(r.from) {
-			t.Fatalf("admitted a mount source %q", r.from)
+		if r.from != "" {
+			if _, err := ref.ParseName(r.from); err != nil {
+				t.Fatalf("admitted a mount source %q: %v", r.from, err)
+			}
 		}
 		if again := classify(method, r.path, r.query); again != r {
 			t.Fatalf("the forwarded request re-classifies as %+v, want %+v", again, r)
