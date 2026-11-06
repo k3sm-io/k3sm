@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -33,12 +34,13 @@ import (
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"golang.org/x/sys/unix"
 
+	"k3sm.io/k3sm/internal/atomicfile"
 	"k3sm.io/k3sm/pkg/ociregistry/ref"
 	"k3sm.io/k3sm/pkg/ociregistry/store"
 )
 
-// MarkerName is the file in the state directory a first, report-only sweep
-// writes. Its presence lets later sweeps delete.
+// MarkerName is the file in the state directory that records the repositories
+// a report-only sweep has reviewed. Only those are swept for deletion.
 const MarkerName = "gc-ran"
 
 // AbandonFactor is how many grace periods old a repository with no rows must
@@ -92,15 +94,22 @@ type Object struct {
 
 // Report is what a sweep did.
 type Report struct {
-	// ReportOnly is a first sweep: Objects lists what it would have reaped,
-	// and nothing was deleted.
+	// ReportOnly is a sweep in which no repository had been reviewed: Objects
+	// lists what it would have reaped, and nothing was deleted.
 	ReportOnly bool
-	Objects    []Object
+	// Objects lists what the sweep reaped.
+	Objects []Object
 	// Stopped lists the repositories whose sweep stopped on a brake.
 	Stopped []string
 	// Failed lists the repositories whose sweep failed for another reason,
 	// such as a manifest it could not read. Nothing was reaped in them.
 	Failed []string
+	// Reviewing lists the repositories this sweep only reported on, because
+	// no earlier sweep had reviewed them.
+	Reviewing []string
+	// WouldReap lists what the repositories in Reviewing would have reaped,
+	// a braked repository's included.
+	WouldReap []Object
 }
 
 // Count returns the number of objects of kind k in the report.
@@ -195,16 +204,16 @@ func New(s *store.Store, o Options) (*Collector, error) {
 // a brake or an error is skipped, listed in the report's Stopped or Failed,
 // and named in the returned error; the others are still swept.
 //
-// A report-only first sweep writes the marker, bound to the store id, only
-// when the store held a repository and every repository was planned, braked
-// (ErrMassDelete) or failed as unreadable (ErrUnreadable). A braked or
-// unreadable repository keeps failing closed in later sweeps, so it does not
-// hold the rest of the store at report-only. Any other failure (an I/O
-// error, too many open files, a repository removed mid-sweep) may pass, and
-// the repository it hit has not been reviewed: the marker stays unwritten and
-// the next sweep only reports again. A store with no repository has nothing
-// to review, so content restored into it later still gets a report-only
-// sweep.
+// Review is per repository. The marker, bound to the store id, names the
+// repositories a report-only sweep has reviewed, and only those are swept for
+// deletion. Any other repository is reported on, and the sweep adds it to the
+// marker when its plan was made and no brake stopped it. A repository that is
+// braked or failed, for any reason and however long, stays out of the marker:
+// it holds no other repository, and the first sweep that can plan it without a
+// brake reports what it would reap before a later one reaps it. A name that has
+// left the store leaves the marker, so a repository that comes back is new.
+// A sweep that reviewed nothing writes no marker over a store that has none,
+// so content restored into it later still gets a report-only sweep.
 func (c *Collector) Sweep(ctx context.Context) (Report, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -214,17 +223,19 @@ func (c *Collector) Sweep(ctx context.Context) (Report, error) {
 	marker := filepath.Join(c.s.StateDir(), MarkerName)
 	id, _, err := c.s.ID()
 	if err != nil {
-		return Report{}, fmt.Errorf("gc: %w", err)
+		return Report{ReportOnly: true}, fmt.Errorf("gc: %w: no sweep deletes until it is repaired; remove %s and the next sweep only reports",
+			err, filepath.Join(c.s.Root(), store.IDFile))
 	}
-	ran, err := c.markerMatches(marker, id)
+	reviewed, err := c.readReviewed(marker, id)
 	if err != nil {
-		return Report{}, err
+		return Report{ReportOnly: true}, err
 	}
-	rep := Report{ReportOnly: !ran}
+	rep := Report{ReportOnly: len(reviewed) == 0}
 	repos, err := c.s.Repositories()
 	if err != nil {
 		return rep, err
 	}
+	next := make(map[string]bool, len(repos))
 	var errs []error
 	if !rep.ReportOnly {
 		// A layout a stopped RemoveLayout left is not listed above, so it
@@ -237,36 +248,38 @@ func (c *Collector) Sweep(ctx context.Context) (Report, error) {
 			errs = append(errs, fmt.Errorf("gc: %w", err))
 		}
 	}
-	var unreviewed []string // repositories a failure that may pass left unreviewed
 	for _, n := range repos {
 		if err := ctx.Err(); err != nil {
 			return rep, err
 		}
-		objs, err := c.sweepRepo(ctx, n, rep.ReportOnly)
-		rep.Objects = append(rep.Objects, objs...)
+		name := n.String()
+		review := !reviewed[name]
+		objs, err := c.sweepRepo(ctx, n, review)
+		if review {
+			rep.Reviewing = append(rep.Reviewing, name)
+			rep.WouldReap = append(rep.WouldReap, objs...)
+		} else {
+			next[name] = true
+			rep.Objects = append(rep.Objects, objs...)
+		}
 		if err != nil {
 			if errors.Is(err, ErrMassDelete) {
-				rep.Stopped = append(rep.Stopped, n.String())
+				rep.Stopped = append(rep.Stopped, name)
 			} else {
-				rep.Failed = append(rep.Failed, n.String())
-			}
-			if !errors.Is(err, ErrMassDelete) && !errors.Is(err, ErrUnreadable) {
-				unreviewed = append(unreviewed, n.String())
+				rep.Failed = append(rep.Failed, name)
 			}
 			errs = append(errs, fmt.Errorf("gc %s: %w", n, err))
+			continue
 		}
+		next[name] = true
 	}
+	rep.ReportOnly = len(rep.Reviewing) == len(repos)
 	if rep.ReportOnly {
-		switch {
-		case len(repos) == 0:
-			c.log.Info("registry gc: the store holds no repository; the gc-ran marker is not written")
-		case len(unreviewed) > 0:
-			c.log.Warn("registry gc: a repository failed for a reason that may pass; the gc-ran marker is not written and the next sweep only reports",
-				"repositories", unreviewed)
-		default:
-			if err := WriteMarker(c.s, c.now()); err != nil {
-				errs = append(errs, err)
-			}
+		rep.Objects = rep.WouldReap
+	}
+	if !maps.Equal(next, reviewed) {
+		if err := writeReviewed(c.s, c.now(), next); err != nil {
+			errs = append(errs, fmt.Errorf("%w: the repositories under review delete nothing until this write succeeds", err))
 		}
 	}
 	return rep, errors.Join(errs...)
@@ -288,14 +301,11 @@ func (c *Collector) sweepRepo(ctx context.Context, n ref.Name, reportOnly bool) 
 			return nil, nil
 		}
 		if reportOnly {
-			if err := c.brake(n, m.p, m.idx, m.cont); err != nil {
-				return nil, err
-			}
 			objs := m.p.objects(n)
 			for _, o := range objs {
 				c.log.Info("registry gc: would reap", "repository", o.Repository, "kind", o.Kind, "name", o.Name, "reason", o.Reason)
 			}
-			return objs, nil
+			return objs, c.brake(n, m.p, m.idx, m.cont)
 		}
 		if c.afterMark != nil {
 			c.afterMark(n)
@@ -921,96 +931,106 @@ func planError(what string, err error) error {
 	}
 }
 
-// markerRecord is the marker's content: when the report-only sweep ran,
-// and the id of the store it ran over (store.IDFile in the root).
+// markerRecord is the marker's content: when a report-only sweep last changed
+// it, the id of the store it ran over (store.IDFile in the root), and the
+// repositories reviewed so far.
 //
 // The id, not the root directory's device and inode, is the binding because
 // a restore by rsync or tar into the existing root keeps the root's inode.
 // The id file is written the first time a marker is, so a backup taken
 // before it existed restores without it, and the next sweep mints a new id
 // and only reports. A backup or copy that carries the id file is the same
-// store, and its sweeps delete when the state directory still holds the
-// marker; deleting there is what they would have done before the backup.
-// Content merged into a live root without removing its id file is not told
-// apart from the store's own content.
+// store, and its sweeps delete in the repositories the state directory's
+// marker names; deleting there is what they would have done before the backup.
+//
+// A restore merged over a live root keeps the id, and the collector cannot tell
+// a restored index.json from a push: a fingerprint of the rows taken at review
+// goes stale with the next push, and one that forced a report-only sweep would
+// let a pusher hold the repository there by pushing once per sweep. So a merged
+// repository the marker does not name reports first, one it names is swept, and
+// the rule docs/user/registry.md gives is to restore into an emptied root, or
+// to remove the id file before the server starts.
 type markerRecord struct {
-	Ran   string `json:"ran"`
-	Store string `json:"store"`
+	Ran      string   `json:"ran"`
+	Store    string   `json:"store"`
+	Reviewed []string `json:"reviewed"`
 }
 
-// maxMarkerSize bounds the marker read.
-const maxMarkerSize = 4096
-
-// markerMatches reports whether the marker at p records a report-only sweep
-// over the store with id id. A missing marker, one written for another store
-// or in an older form, or an empty id (the root has no id file) does not
-// match: the sweep reports only and writes it again.
-func (c *Collector) markerMatches(p, id string) (bool, error) {
+// readReviewed returns the repositories the marker at p names as reviewed for
+// the store with id id. A missing marker, one written for another store or in
+// an older form, or an empty id (the root has no id file) names none: those
+// repositories report only and the marker is written again.
+//
+// The read has no size bound. The set grows with the repositories, which a
+// pusher can create, so a bound would be a way to turn the collector off, and
+// the sweep already holds every repository's name in memory.
+func (c *Collector) readReviewed(p, id string) (map[string]bool, error) {
 	fi, err := os.Lstat(p)
 	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
+		return nil, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("gc marker: %w", err)
+		return nil, fmt.Errorf("gc marker: %w", err)
 	}
 	if !fi.Mode().IsRegular() {
-		return false, fmt.Errorf("gc marker %s is not a regular file", p)
+		return nil, fmt.Errorf("gc marker %s is not a regular file", p)
 	}
 	f, err := os.OpenFile(p, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return false, fmt.Errorf("gc marker: %w", err)
+		return nil, fmt.Errorf("gc marker: %w", err)
 	}
 	defer f.Close()
-	b, err := io.ReadAll(io.LimitReader(f, maxMarkerSize+1))
+	b, err := io.ReadAll(f)
 	if err != nil {
-		return false, fmt.Errorf("gc marker: %w", err)
+		return nil, fmt.Errorf("gc marker: %w", err)
 	}
 	var m markerRecord
-	if len(b) > maxMarkerSize || json.Unmarshal(b, &m) != nil || id == "" || m.Store != id {
+	if json.Unmarshal(b, &m) != nil || id == "" || m.Store != id {
 		c.log.Warn("registry gc: the gc-ran marker was not written for this store; the next sweep only reports",
 			"marker", p, "root", c.s.Root())
-		return false, nil
+		return nil, nil
 	}
-	return true, nil
+	reviewed := make(map[string]bool, len(m.Reviewed))
+	for _, n := range m.Reviewed {
+		reviewed[n] = true
+	}
+	return reviewed, nil
 }
 
-// WriteMarker records that a report-only sweep ran over s, as the first
-// sweep does, so the next sweep over s deletes. It binds the record to s's
-// store id, writing the id first when the root holds none; a store whose
+// WriteMarker records that a report-only sweep reviewed every repository s
+// holds now, so the next sweep over s deletes in them. It binds the record to
+// s's store id, writing the id first when the root holds none; a store whose
 // root has another id, or none, sweeps report-only again.
 func WriteMarker(s *store.Store, now time.Time) error {
+	repos, err := s.Repositories()
+	if err != nil {
+		return fmt.Errorf("write gc marker: %w", err)
+	}
+	reviewed := make(map[string]bool, len(repos))
+	for _, n := range repos {
+		reviewed[n.String()] = true
+	}
+	return writeReviewed(s, now, reviewed)
+}
+
+// writeReviewed records, durably and atomically, the repositories reviewed in
+// s, writing the store id first when the root holds none.
+func writeReviewed(s *store.Store, now time.Time, reviewed map[string]bool) error {
 	id, err := s.EnsureID()
 	if err != nil {
 		return fmt.Errorf("write gc marker: %w", err)
 	}
-	return writeMarker(filepath.Join(s.StateDir(), MarkerName), now, id)
-}
-
-// writeMarker records, durably, that a report-only sweep ran over the store
-// with id id.
-func writeMarker(p string, now time.Time, id string) error {
-	b, err := json.Marshal(markerRecord{Ran: now.UTC().Format(time.RFC3339), Store: id})
+	names := make([]string, 0, len(reviewed))
+	for n := range reviewed {
+		names = append(names, n)
+	}
+	slices.Sort(names)
+	b, err := json.Marshal(markerRecord{Ran: now.UTC().Format(time.RFC3339), Store: id, Reviewed: names})
 	if err != nil {
 		return fmt.Errorf("write gc marker: %w", err)
 	}
-	f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
-	if err != nil {
+	if err := atomicfile.Replace(filepath.Join(s.StateDir(), MarkerName), append(b, '\n'), 0o600); err != nil {
 		return fmt.Errorf("write gc marker: %w", err)
 	}
-	_, werr := f.Write(append(b, '\n'))
-	if werr == nil {
-		werr = f.Sync()
-	}
-	if cerr := f.Close(); werr == nil {
-		werr = cerr
-	}
-	if werr != nil {
-		return fmt.Errorf("write gc marker: %w", werr)
-	}
-	d, err := os.Open(filepath.Dir(p))
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	return d.Sync()
+	return nil
 }

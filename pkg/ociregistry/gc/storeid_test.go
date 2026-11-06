@@ -185,11 +185,11 @@ func TestCopiedStoreFollowsItsStoreID(t *testing.T) {
 	}
 }
 
-// TestTransientFailureLeavesNoMarker fails one repository of a first sweep
-// for a reason that may pass (the repository removed mid-sweep, a manifest
-// body that cannot be opened). The sweep reports it and writes no marker, so
-// the next sweep only reports again and reviews that repository.
-func TestTransientFailureLeavesNoMarker(t *testing.T) {
+// TestFailureThatMayPassLeavesItsRepositoryUnreviewed fails one repository of a
+// first sweep for a reason that may pass (the repository removed mid-sweep, a
+// manifest body that cannot be opened). The sweep reports it, the marker names
+// only the other repository, and the next sweep deletes there.
+func TestFailureThatMayPassLeavesItsRepositoryUnreviewed(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		root    bool // the case cannot run as root
@@ -237,12 +237,9 @@ func TestTransientFailureLeavesNoMarker(t *testing.T) {
 			if err == nil || errors.Is(err, ErrUnreadable) || !rep.ReportOnly || !slices.Equal(rep.Failed, []string{"bad"}) {
 				t.Fatalf("first sweep: %+v, %v; want report-only, bad failed with an error that is not ErrUnreadable", rep, err)
 			}
-			if e.markerExists(t) {
-				t.Fatal("a transient failure in the report-only sweep wrote the marker")
-			}
 			c.onRead = nil
-			if rep, _ := c.Sweep(e.ctx); !rep.ReportOnly || !e.has(name(t, "a"), digest.FromString("a orphan")) {
-				t.Fatalf("second sweep: %+v, want report-only again", rep)
+			if rep, _ := c.Sweep(e.ctx); rep.ReportOnly || e.has(name(t, "a"), digest.FromString("a orphan")) {
+				t.Fatalf("second sweep: %+v, want a's orphan reaped", rep)
 			}
 		})
 	}

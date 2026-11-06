@@ -3,13 +3,15 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # The registry's online garbage collector reads manifests without the
-# repository lock, does not let one unreadable repository hold the whole
-# store at its report-only first sweep, writes its gc-ran marker only when no
-# repository failed for a reason that may pass and the store is not empty,
-# and binds the marker to a random store id kept in the store root. It frees an abandoned first push from the half brake once the
+# repository lock, reviews each repository in its own report-only sweep, so
+# one that fails holds no other, names in its gc-ran marker only the repositories
+# reviewed, and binds the marker to a random store id kept in the store root.
+# It frees an abandoned first push from the half brake once the
 # repository has gone unwritten for the abandon horizon, and treats any body
 # with a Docker schema1 fsLayers field as unreadable, which the server
-# refuses at PUT.
+# refuses at PUT. The marker names each reviewed repository, a pusher-named
+# child blob does not stop a sweep, and the server stores only what the
+# collector reads.
 #
 # --check runs, by name, with the race detector on, in pkg/ociregistry/gc:
 #   TestPushProceedsWhileTheSweepReadsManifests     the sweep pauses at every
@@ -25,9 +27,36 @@
 #                                                   ones is reported, the marker
 #                                                   is written, and the next sweep
 #                                                   reaps only in the good ones
-#   TestTransientFailureLeavesNoMarker              a repository failed for a reason
-#                                                   that may pass leaves no marker,
-#                                                   and the next sweep reports only
+#   TestFailureThatMayPassLeavesItsRepositoryUnreviewed
+#                                                   a repository failed for a reason
+#                                                   that may pass is not reviewed, and
+#                                                   the next sweep deletes elsewhere
+#   TestFailureThatMayPassHoldsOnlyItsRepository    a failure that persists holds no
+#                                                   other repository, and its own
+#                                                   repository reports after repair
+#   TestUnreadableAtTheFirstSweepIsReviewedAfterRepair
+#                                                   nothing unreviewed deletes once
+#                                                   the body is readable again
+#   TestBrakedFirstSweepListsAndWaits               a braked first sweep lists what
+#                                                   it would reap; the abandon horizon
+#                                                   reports before it deletes
+#   TestReviewedSetIsNotBoundedBySize               repositories cannot outgrow the
+#                                                   marker and turn the collector off
+#   TestMergeRestoreFollowsTheDocumentedRule        the restore rule docs/user/registry.md
+#                                                   gives, and its recovery
+#   TestBadStoreIDSaysHowToRecover                  a corrupt id file deletes nothing,
+#                                                   and removing it recovers
+#   TestUnwritableStoreIDSaysWhyNothingDeletes      a root that refuses the id file
+#                                                   says so on every sweep
+#   TestIndexChildThatIsNoManifestDoesNotStopTheSweep
+#                                                   a blob named as a child, with no
+#                                                   row, is kept and not followed
+#   TestChildDigestThatNamesNoBlobDoesNotStopTheSweep
+#                                                   a child digest no blob can have
+#                                                   does not fail the plan
+#   TestChildWithARowStaysFailClosed                a child with a row that cannot be
+#                                                   read still stops the sweep
+#   TestRowlessChildThatParsesIsStillFollowed       a readable child keeps what it names
 #   TestRestoredRootReportsOnlyAgain                a backup without the store id
 #                                                   restored into the same root
 #                                                   directory sweeps report-only
@@ -59,6 +88,9 @@
 #                                                   manifest under any media type
 #   TestPutManifestRejectsFSLayersAtSchemaVersion2  nor any body with an fsLayers
 #                                                   field, at schemaVersion 2 too
+#   TestPutAcceptsOnlyWhatTheCollectorReads         the server stores no body the
+#                                                   collector cannot read, an index
+#                                                   with no manifests array included
 # then the gc package, also under -race.
 #
 # Usage: hack/acceptance/B1036.sh --check
@@ -75,7 +107,18 @@ TESTS=(
 	TestPushProceedsWhileTheSweepReadsManifests
 	TestLockedPassAnswersOnlyFromAnUnchangedRead
 	TestOneUnreadableRepositoryStillWritesTheMarker
-	TestTransientFailureLeavesNoMarker
+	TestFailureThatMayPassLeavesItsRepositoryUnreviewed
+	TestFailureThatMayPassHoldsOnlyItsRepository
+	TestUnreadableAtTheFirstSweepIsReviewedAfterRepair
+	TestBrakedFirstSweepListsAndWaits
+	TestReviewedSetIsNotBoundedBySize
+	TestMergeRestoreFollowsTheDocumentedRule
+	TestBadStoreIDSaysHowToRecover
+	TestUnwritableStoreIDSaysWhyNothingDeletes
+	TestIndexChildThatIsNoManifestDoesNotStopTheSweep
+	TestChildDigestThatNamesNoBlobDoesNotStopTheSweep
+	TestChildWithARowStaysFailClosed
+	TestRowlessChildThatParsesIsStillFollowed
 	TestRestoredRootReportsOnlyAgain
 	TestEmptyFirstSweepThenRestoreReportsOnly
 	TestCopiedStoreFollowsItsStoreID
@@ -91,6 +134,7 @@ STORE_TESTS=(
 API_TESTS=(
 	TestPutManifestRejectsDockerSchema1
 	TestPutManifestRejectsFSLayersAtSchemaVersion2
+	TestPutAcceptsOnlyWhatTheCollectorReads
 )
 re="^($(IFS='|'; echo "${TESTS[*]}"))\$"
 out="$(go test -race -count=1 -v -run "$re" ./pkg/ociregistry/gc/ 2>&1)" || {
