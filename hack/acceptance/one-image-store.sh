@@ -62,9 +62,13 @@
 #   ois.9   the upgrade migration: the server's own journal (`image migrate --report
 #           -o json`) is complete; `sudo k3sm image migrate -o json` on the seeded node
 #           records $K3SM_OIS_PREMIGRATE_REF as migrated, present or renamed with a
-#           target, `image ls` lists the target at the record's digest, a re-run
-#           records it present (resumable, nothing pushed twice), and the node still
-#           reports the source digest in status.images (nothing was deleted)
+#           target and `image ls` lists the target at the record's digest. A re-run
+#           keeps every finished record as it was, because the journal says what
+#           happened when the image finished: `migrated` stays `migrated` and never
+#           turns into `present`. So the journal cannot show a second push, and the
+#           leg reads the registry's own log: no `registry manifest pushed` line for a
+#           repository the journal names since the re-run began. The node still reports
+#           the source digest in status.images (nothing was deleted)
 #   ois.10  server down: with io.k3sm.server booted out, both worker app pods still
 #           answer HTTP on their pod IPs, and a worker `image pull` of app:uncached
 #           fails, while the same pull of app:control succeeded just before; the
@@ -132,6 +136,9 @@ SERVER_PLIST="${K3SM_OIS_SERVER_PLIST:-/Library/LaunchDaemons/io.k3sm.server.pli
 # registrysvc.StateDir(<work-dir>) = <work-dir>/registry, and a root k3sm resolves
 # its work dir to executor.DefaultWorkDir (/var/lib/k3sm/server).
 REGISTRY_ROOT="/var/lib/k3sm/server/registry"
+# REGISTRY_LOG is the registry child's log beside that root (registrysvc.LogPath),
+# JSON records, truncated when the child starts.
+REGISTRY_LOG="/var/lib/k3sm/server/registry.log"
 REQUIRED_ENV="KUBECONFIG K3SM_OIS_SERVER_NODE K3SM_OIS_WORKER_NODE K3SM_OIS_SERVER_SSH K3SM_OIS_WORKER_SSH K3SM_OIS_PREMIGRATE_REF"
 
 # The leg table: `name|statement`. --plan prints it, the run reports against it, and
@@ -153,11 +160,23 @@ LEGS=(
 
 # OIS_PY reads one JSON document on stdin and answers one question about it. The
 # documents are `k3sm image ls -o json`, `k3sm image prune -o json` and the
-# `k3sm image migrate -o json` journal.
+# `k3sm image migrate -o json` journal. The log-* ops read registry.log lines instead.
 OIS_PY='
 import json, sys
 op, a = sys.argv[1], sys.argv[2:]
-d = json.load(sys.stdin)
+d = {}
+if op.startswith("log-"):
+    sys.stdin.reconfigure(errors="replace")
+else:
+    d = json.load(sys.stdin)
+def log_records():
+    for line in sys.stdin:
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(r, dict):
+            yield r
 def image(ref):
     for i in d.get("images") or []:
         if i.get("reference") == ref:
@@ -197,11 +216,74 @@ elif op == "mig-record":
         if ref == want or ref.endswith("/" + want):
             print("\t".join([r.get("outcome", ""), r.get("target", "") or "-", r.get("digest", "") or "-", ",".join(r.get("sources") or []) or "-"]))
             break
+elif op == "mig-moved":
+    # A record of the earlier journal (a[0]) that this one changed, for the same
+    # source. An unexportable image is retried, so only a finished record counts.
+    with open(a[0]) as f:
+        first = {r.get("reference"): r for r in json.load(f).get("images") or []}
+    for r in d.get("images") or []:
+        p = first.get(r.get("reference"))
+        if p is None or p.get("outcome") == "unexportable" or p.get("sources") != r.get("sources"):
+            continue
+        if any(p.get(k) != r.get(k) for k in ("outcome", "target", "digest")):
+            print(r.get("reference", "") + "(" + p.get("outcome", "") + "->" + r.get("outcome", "") + ")")
+elif op == "mig-finished":
+    # repository@tag and repository@digest of each image the earlier journal (a[0])
+    # already finished in the registry, for the same source: a re-run has no reason
+    # to push any of them.
+    with open(a[0]) as f:
+        first = {r.get("reference"): r for r in json.load(f).get("images") or []}
+    names = set()
+    for r in d.get("images") or []:
+        p = first.get(r.get("reference"))
+        if p is None or not p.get("target") or p.get("sources") != r.get("sources"):
+            continue
+        repo, tag = p["target"].split("/", 1)[1].rsplit(":", 1)
+        names.add(repo + "@" + tag)
+        names.add(repo + "@" + p.get("digest", ""))
+    print("\n".join(sorted(names)))
+elif op == "log-pushes":
+    for r in log_records():
+        name = str(r.get("repository")) + "@" + str(r.get("reference"))
+        if r.get("msg") == "registry manifest pushed" and name in a:
+            print(name)
+elif op == "log-restarts":
+    print(sum(1 for r in log_records() if r.get("msg") == "registry server serving"))
 else:
     sys.exit("unknown op " + op)
 '
 # ojson <op> [args...] < document
 ojson() { python3 -c "$OIS_PY" "$@"; }
+
+# rerun_verdict <first-journal> <second-journal> <registry-log-since-the-re-run> <reference>:
+# silent when the re-run left every finished record alone and pushed nothing; otherwise
+# says why not and fails. A push of anything else is someone else's, or a retried image's.
+rerun_verdict() {
+	local first="$1" second="$2" window="$3" ref="$4" moved finished pushes
+	moved="$(ojson mig-moved "$first" <"$second" | tr '\n' ' ')" || {
+		echo "the journals could not be read"
+		return 1
+	}
+	[ -z "$moved" ] || {
+		echo "the re-run changed finished records: $moved"
+		return 1
+	}
+	[ -n "$(ojson mig-record "$ref" <"$second")" ] || {
+		echo "the re-run has no record of $ref"
+		return 1
+	}
+	[ "$(ojson log-restarts <"$window")" = 0 ] || {
+		echo "the registry restarted during the re-run, so its log cannot say what was pushed"
+		return 1
+	}
+	finished="$(ojson mig-finished "$first" <"$second")"
+	# shellcheck disable=SC2086 # one word per name
+	pushes="$(ojson log-pushes $finished <"$window" | tr '\n' ' ')"
+	[ -z "$pushes" ] || {
+		echo "the re-run pushed what the registry already holds: $pushes"
+		return 1
+	}
+}
 
 # manifest_blob <registry-root> <repository> <sha256:hex>: the path zot stores the
 # manifest blob at (<root>/<repository>/blobs/sha256/<hex>, as prune.go's blobPath);
@@ -446,6 +528,54 @@ plan() {
 
 # ---- --self-test --------------------------------------------------------------------------
 
+# self_test_rerun: the re-run's verdict, on fixtures. The first
+# row is the shape a real re-run leaves, which an assertion of `present` calls red. The
+# rows named mutant are what a re-run that re-pushes would leave: the journal alone
+# cannot tell the first of them from the good one.
+self_test_rerun() {
+	local dir rec_m rec_p line_alpine line_other f want first second window expect out verdict
+	dir="$(mktemp -d "${TMPDIR:-/tmp}/ois-rerun.XXXXXX")"
+	rec_m='{"reference":"alpine:3.20","sources":["sha256:0a"],"outcome":"migrated","target":"registry-k3sm:6450/alpine:3.20","digest":"sha256:0a"}'
+	rec_p='{"reference":"alpine:3.20","sources":["sha256:0a"],"outcome":"present","target":"registry-k3sm:6450/alpine:3.20","digest":"sha256:0a"}'
+	line_alpine='{"time":"t","level":"INFO","msg":"registry manifest pushed","repository":"alpine","reference":"3.20","digest":"sha256:0a"}'
+	line_other='{"time":"t","level":"INFO","msg":"registry manifest pushed","repository":"someone/else","reference":"v1","digest":"sha256:0c"}'
+	printf '{"images":[%s]}' "$rec_m" >"$dir/migrated.json"
+	printf '{"images":[%s]}' "$rec_p" >"$dir/present.json"
+	printf '{"images":[{"reference":"alpine:3.20","sources":["sha256:0a"],"outcome":"unexportable"}]}' >"$dir/unexportable.json"
+	printf '{"images":[{"reference":"alpine:3.20","sources":["sha256:0b"],"outcome":"migrated","target":"registry-k3sm:6450/alpine:3.20","digest":"sha256:0b"}]}' >"$dir/newsource.json"
+	printf '{"images":[{"reference":"other:v1","sources":["sha256:0d"],"outcome":"cached"}]}' >"$dir/noseed.json"
+	: >"$dir/quiet.log"
+	printf '%s\n' "$line_alpine" >"$dir/pushed.log"
+	printf 'not json\n\n%s\n{"msg":"registry manifest head"}\n' "$line_other" >"$dir/foreign.log"
+	printf '{"msg":"registry server serving"}\n' >"$dir/restarted.log"
+	# first journal|second journal|registry log|expected verdict (empty is green)|what it proves
+	while IFS='|' read -r first second window expect; do
+		out="$(rerun_verdict "$dir/$first.json" "$dir/$second.json" "$dir/$window.log" alpine:3.20 2>&1)" && verdict=green || verdict=red
+		want="${expect%%:*}"
+		f=no
+		if [ "$want" = green ]; then
+			[ "$verdict" = green ] && f=ok
+		elif [ "$verdict" = red ]; then
+			case "$out" in *"$want"*) f=ok ;; esac
+		fi
+		check "$f" "rerun_verdict: ${expect#*:} (got $verdict: $out)"
+	done <<'ROWS'
+migrated|migrated|quiet|green:migrated stays migrated with no push
+present|present|quiet|green:present stays present with no push
+migrated|migrated|foreign|green:another repository's push and log noise do not count
+unexportable|migrated|pushed|green:a retried unexportable image may push
+newsource|migrated|pushed|green:a new source digest for the reference may push
+migrated|migrated|pushed|alpine@3.20:mutant, a re-push whose journal is unchanged
+present|present|pushed|alpine@3.20:mutant, a re-push recorded present
+present|migrated|pushed|present->migrated:mutant, a re-push the journal shows
+migrated|present|quiet|migrated->present:mutant, a finished record rewritten
+migrated|migrated|restarted|restarted:a registry restart leaves the log unable to say
+migrated|noseed|quiet|no record:the seed gone from the re-run's journal
+ROWS
+	check "$(grep -q '"registry manifest pushed"' "$REPO_ROOT/pkg/ociregistry/api/manifests.go" && grep -q '"registry server serving"' "$REPO_ROOT/pkg/registrysvc/serve.go" && echo ok)" "the registry still logs the two lines rerun_verdict reads"
+	rm -rf "$dir"
+}
+
 self_test() {
 	local bad=0 row name names="" dup="" src t m tmp fake out code tol
 	check() { if [ "$1" = ok ]; then echo "ok    $2"; else echo "FAIL  $2"; bad=1; fi; }
@@ -488,6 +618,7 @@ self_test() {
 	check "$([ "$(printf '%s' "$t" | ojson mig-complete)" = true ] && echo ok)" "mig-complete"
 	check "$([ "$(printf '%s' "$t" | ojson mig-record ois-premig:v1)" = "$(printf 'migrated\tregistry-k3sm:6450/ois-premig:v1\tsha256:0a\tsha256:0b,sha256:0a')" ] && echo ok)" "mig-record: matched by its trailing reference"
 	check "$([ -z "$(printf '%s' "$t" | ojson mig-record other:v1)" ] && echo ok)" "mig-record: an absent reference is empty"
+	self_test_rerun
 	t="$(printf 'sha256:%064d' 0)"
 	check "$([ "$(manifest_blob /r ois-1-pods/aged "$t")" = "/r/ois-1-pods/aged/blobs/sha256/${t#sha256:}" ] && echo ok)" "manifest_blob: <root>/<repository>/blobs/sha256/<hex>"
 	check "$(if manifest_blob /r x "sha256:abc" >/dev/null; then echo no; else echo ok; fi)" "manifest_blob: a short digest is refused"
@@ -1165,7 +1296,7 @@ leg_pass
 
 # ---- ois.9 the upgrade migration --------------------------------------------------------
 leg_migrate() {
-	local seed_ssh first second rec outcome target digest sources listed images src found="" before
+	local seed_ssh first second rec outcome target digest sources listed images src found="" before log_start log_now window verdict
 	before="$(image_ls ois.9-image-ls-before)" || {
 		DETAIL="image ls failed before the migration"
 		return 1
@@ -1198,12 +1329,33 @@ leg_migrate() {
 		DETAIL="image ls lists $target at '${listed:-absent}', the record says $digest"
 		return 1
 	}
+	# The control: the log must show a push this run is known to have made, or its
+	# silence below would prove nothing.
+	[ -n "$(on_server "sudo -n grep -F 'registry manifest pushed' '$REGISTRY_LOG'" 2>/dev/null | ojson log-pushes "$APP_REPO@v1")" ] || {
+		DETAIL="$REGISTRY_LOG shows no push of $APP_REPO:v1, so it cannot prove the re-run pushed nothing"
+		return 1
+	}
+	log_start="$(on_server "sudo -n wc -c <'$REGISTRY_LOG'" 2>/dev/null | tail -1 | tr -d ' ')"
+	[[ "$log_start" =~ ^[0-9]+$ ]] || {
+		DETAIL="could not size $REGISTRY_LOG before the re-run (got '$log_start')"
+		return 1
+	}
 	second="$(on "$seed_ssh" 'sudo -n k3sm image migrate -o json' 2>"$EVIDENCE/ois.9-second.err" | tee "$EVIDENCE/ois.9-second.json")" || {
 		DETAIL="the re-run of image migrate failed"
 		return 1
 	}
-	[ "$(printf '%s' "$second" | ojson mig-record "$K3SM_OIS_PREMIGRATE_REF" | cut -f1)" = present ] || {
-		DETAIL="the re-run did not record $K3SM_OIS_PREMIGRATE_REF present"
+	log_now="$(on_server "sudo -n wc -c <'$REGISTRY_LOG'" 2>/dev/null | tail -1 | tr -d ' ')"
+	[[ "$log_now" =~ ^[0-9]+$ ]] && [ "$log_now" -ge "$log_start" ] || {
+		DETAIL="$REGISTRY_LOG went from $log_start to '$log_now' bytes during the re-run, so it cannot say what was pushed"
+		return 1
+	}
+	window="$EVIDENCE/ois.9-rerun-registry-log.txt"
+	on_server "sudo -n tail -c +$((log_start + 1)) '$REGISTRY_LOG'" >"$window" 2>"$EVIDENCE/ois.9-rerun-registry-log.err" || {
+		DETAIL="could not read $REGISTRY_LOG after the re-run"
+		return 1
+	}
+	verdict="$(rerun_verdict "$EVIDENCE/ois.9-first.json" "$EVIDENCE/ois.9-second.json" "$window" "$K3SM_OIS_PREMIGRATE_REF")" || {
+		DETAIL="$verdict"
 		return 1
 	}
 	images="$(kc get node "$SEED_NODE" -o jsonpath='{range .status.images[*]}{.names}{"\n"}{end}' 2>/dev/null)"
@@ -1211,7 +1363,7 @@ leg_migrate() {
 	for src in $(printf '%s' "$sources" | tr ',' ' '); do
 		case "$images" in *"${src#sha256:}"*) found="$src" ;; esac
 	done
-	DETAIL="$K3SM_OIS_PREMIGRATE_REF $outcome -> $target @ $digest; re-run present; source ${found:-not in status.images}"
+	DETAIL="$K3SM_OIS_PREMIGRATE_REF $outcome -> $target @ $digest; re-run kept the record and pushed nothing; source ${found:-not in status.images}"
 	if [ -z "$found" ]; then
 		case " $(image_ls ois.9-image-ls-cap | ojson ls-incomplete) " in *" $SEED_NODE "*)
 			DETAIL="$DETAIL (NOTE $SEED_NODE is over the 50-entry status cap, so the node store could not be read through it)"
