@@ -37,8 +37,8 @@ import (
 )
 
 // saveExecEntry adds an exec entry to the current user of the kubeconfig at path.
-// It names a harmless program that records being run, and it returns that record's
-// path for assertNeverRan.
+// It names a program that records being run, and it returns that record's path for
+// assertNeverRan.
 func saveExecEntry(t *testing.T, path string) (ran string) {
 	t.Helper()
 	dir := t.TempDir()

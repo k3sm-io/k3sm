@@ -144,12 +144,6 @@ pin, its date, and the tarball's sha256.
 
 ### Changed
 
-- `k3sm netd`, and the node marking and worker count around `k3sm stop`, `start` and `restart`, accept
-  only inline credentials in the kubeconfig they load. A user with `exec`, `auth-provider`, `tokenFile`,
-  `client-certificate`, `client-key` or an `as` impersonation key, or a cluster with `certificate-authority`,
-  is refused. The kubeconfigs k3sm writes already hold everything inline, so an installed node sees no
-  change. For a refused file, netd logs a warning naming the file and the reason, denies binds below 1024
-  and keeps retrying, and the lifecycle verbs report the refusal in their load error.
 - A node refuses a GPU pod with a `FailedGPUFit` Event when the units held under `mlx.k3sm.io/gpu` and
   `k3sm.io/gpu` together, plus the pod's own, pass the node's GPU slot count. This now holds for pods that
   name only `mlx.k3sm.io/gpu`, and on a node whose GPU memory ceiling is unknown: a pod bound past the
@@ -228,20 +222,9 @@ pin, its date, and the tarball's sha256.
 - A rollback of `sudo k3sm install` no longer leaves `~/.kube/config` getting `Unauthorized`. It puts the
   previous admin token back, so every copy of the kubeconfig keeps working, or, when it cannot, writes the
   kubeconfig with the new token and says to copy it again.
-- netd's warning for a kubeconfig whose credentials are not inline says what to do about that, not about a
-  role change.
-- As root, `k3sm kubectl`, `k3sm interconnect` and the builder verbs use only inline credentials and no
-  longer read `$HOME`: root takes the work dir's admin kubeconfig, then `$KUBECONFIG` or
-  `interconnect --kubeconfig` when the file is owned by root or by the person who ran sudo, then that
-  person's `~/.kube/config`, then root's, with both homes from the user database. A file with `exec`,
-  `auth-provider` or path entries in the context it would use is refused with the entry and the reason,
-  and each refusal says what to do. kubectl gets the checked context by descriptor, so under sudo
-  `k3sm kubectl config` writes do not persist; run `k3sm kubectl` without sudo for those. Other accounts
-  are unchanged.
-- As root, `k3sm kubectl` runs only a kubectl that is root-owned and not group- or world-writable, with
-  every parent directory the same. It takes the first that passes of the work dir's kubectl, the one
-  `k3sm install` lays down under `/Library/k3sm/bin`, and one on `PATH`. When none passes it says why for
-  each and to run `sudo k3sm install`, or `k3sm kubectl` without sudo. Other accounts are unchanged.
+- Hardening: as root, k3sm uses only checked, inline kubeconfigs and the installed kubectl, and netd on a
+  worker trusts only its own copy of the cluster CA. A refusal says what to do. Under sudo, your kubectl
+  plugins and `k3sm kubectl config` writes do not work; run without sudo for those.
 - `k3sm install` with a new `--mesh-ip` on a control-plane node no longer leaves the server refused its new
   address at every start. The install removes the pod range netd recorded when it names another range than
   the new address's, and removes the interconnect aliases of the old range from `bridge0`. A failed removal
