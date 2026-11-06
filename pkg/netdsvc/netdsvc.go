@@ -139,8 +139,8 @@ type Options struct {
 	// applies to an unreadable file.
 	MeshKeyDir string
 	// ClusterCAPath is the cluster CA certificate a managed update's signer
-	// must chain to (`k3sm netd --cluster-ca`): the server's own PKI copy, or a
-	// worker's root-only copy. Empty makes the daemon refuse every ApplyUpdate.
+	// must chain to (`k3sm netd --cluster-ca`): the node's root-only copy, on a
+	// server and on a worker alike. Empty makes the daemon refuse every ApplyUpdate.
 	ClusterCAPath string
 	// Logger is the structured logger threaded into the daemon; nil uses
 	// slog.Default via netd.NewServer.
