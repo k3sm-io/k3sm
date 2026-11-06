@@ -122,7 +122,7 @@ read -r -d '' RUNG_TABLE <<'RUNGS' || true
 r0-disarmed|after the join the Interconnect exists with enabled false, no k3sm alias on bridge0, no desired annotation, no member up, no segment, no armedBy, no attached pod|crd,bridge,index,unarmed|assert_r0_disarmed|r0-disarmed/|BI6
 r1-arm|k3sm interconnect enable: armedBy is the caller, the InterconnectArmed Warning Event, the slot-0 alias on exactly the cabled nodes, ic-peers up on both|crd,verbs,doctor,netd,armable|assert_r1_arm|r1-arm/|BI6
 r2-attach|an annotated pod gets a slot: K3SM_INTERCONNECT_IP is its alias, the listener's lsof address is the slot not *, the peer's ARP entry is the peer's MAC|armed,attach,tools|assert_r2_attach|r2-attach/|BI7
-r3-cable-path|a fixed transfer to the peer slot address: route bridge0, peer MAC, the Thunderbolt member counters rise by the payload, the LAN stays flat; RTT slot vs mesh RECORDED|armed,attached,tools|assert_r3_cable_path|r3-cable-path/|BI10
+r3-cable-path|a fixed transfer to the peer slot address: route bridge0, peer MAC, the sender's Thunderbolt member rises by the payload, the receiver holds it on the slot with its ACKs on the cable and its LAN and mesh flat; RTT slot vs mesh RECORDED|armed,attached,tools|assert_r3_cable_path|r3-cable-path/|BI10
 r4-mesh-traffic|pod-to-pod and ClusterIP flows ride a utun and the LAN with the cable flat; a wildcard listener is unreachable on its slot; an unbound dial sources K3SM_INTERCONNECT_IP|armed,attached,tools|assert_r4_mesh_traffic|r4-mesh-traffic/|BI4
 r5-ring|a sharded MLXModel with interconnect thunderbolt serves through rank 0: ranks on slot-1 addresses, the ring on the cable, LinksHealthy True, the endpoint on the pod IP; tokens/s RECORDED beside network and single-Mac|armed,mlxhosts,gpu,mlximage|assert_r5_ring|r5-ring/|BI8
 r6-unplug|a pulled cable: member down <= 20 s and the MLX re-render <= 30 s after the carrier drop, the mesh loses at most one reply, UpHold 60 s on replug, one transition per direction, no second gang restart inside 5 min|armed,ring,operator|assert_r6_unplug|r6-unplug/|BI6
@@ -657,27 +657,39 @@ EOF
 # measure_rtt <label> <dst> — RECORDED RTT, five pings, average.
 measure_rtt() { on_local "ping -c 5 -q $2" 2>/dev/null | awk -F/ '/round-trip/{print $5; exit}'; }
 
+# A bridge member's Ibytes reads 0 on both Macs, whatever arrives, so the receiver's
+# member counter holds only the ACKs it sent and can never reach the payload. The
+# local Mac (the sender) still answers with its member's bytes; the peer answers
+# with what the listener on its slot received, its ACKs on the cable, and its LAN and
+# mesh counters flat, which is what a payload taking either path would move.
 assert_r3_cable_path() {
-	local bytes=$((PAYLOAD_MB * 1048576)) dst="$peer_ICIP" s got r0l r0p r1l r1p tbd land v rtt_ic rtt_mesh
+	local bytes=$((PAYLOAD_MB * 1048576)) dst="$peer_ICIP" s got r0l r0p r1l r1p tbd land utd v rtt_ic rtt_mesh
 	for s in local peer; do
 		on "$s" "route -n get $(side_var "$(other "$s")" ICIP)" >"$RUNG_DIR/$s-route.txt" 2>&1
 		check "$s Mac: route -n get $(side_var "$(other "$s")" ICIP) names bridge0" test "$(icp_route_iface "$RUNG_DIR/$s-route.txt")" = bridge0
 		counters "$s" before "$(side_var "$s" TB)" "$(side_var "$s" LAN)"
 		record_link_context "$s"
 	done
+	counters peer before "$PEER_UTUN"
 	r0l="$(retrans local)" r0p="$(retrans peer)"
 	on_local "dd if=/dev/zero bs=1048576 count=$PAYLOAD_MB 2>/dev/null | nc -G 5 -w 15 $dst 5400" >"$RUNG_DIR/transfer.txt" 2>&1
 	sleep 2
 	r1l="$(retrans local)" r1p="$(retrans peer)"
+	got="$(pod_log_value ic-l-peer RECV5400=)"
+	counters peer after "$PEER_UTUN"
 	for s in local peer; do
 		counters "$s" after "$(side_var "$s" TB)" "$(side_var "$s" LAN)"
 		tbd="$(icp_total_delta "$RUNG_DIR/$s-before-$(side_var "$s" TB).txt" "$RUNG_DIR/$s-after-$(side_var "$s" TB).txt")" || tbd=0
 		land="$(icp_total_delta "$RUNG_DIR/$s-before-$(side_var "$s" LAN).txt" "$RUNG_DIR/$s-after-$(side_var "$s" LAN).txt")" || land=999999999999
-		check "$s Mac: counters ($(side_var "$s" TB) vs LAN $(side_var "$s" LAN))" icp_cable_path_verdict "$bytes" "$tbd" "$land" "$LAN_SLACK"
+		if [ "$s" = local ]; then
+			check "local Mac (sender): counters ($local_TB vs LAN $local_LAN)" icp_cable_path_verdict "$bytes" "$tbd" "$land" "$LAN_SLACK"
+		else
+			utd="$(icp_total_delta "$RUNG_DIR/peer-before-$PEER_UTUN.txt" "$RUNG_DIR/peer-after-$PEER_UTUN.txt")" || utd=999999999999
+			check "peer Mac (receiver): slot bytes and counters ($peer_TB vs LAN $peer_LAN, mesh $PEER_UTUN)" icp_cable_receiver_verdict "$bytes" "${got:-0}" "$tbd" "$land" "$utd" "$LAN_SLACK"
+		fi
 		line="$(on "$s" "arp -n $(side_var "$(other "$s")" ICIP)" 2>&1)"
 		check "$s Mac: ARP for the peer slot address" icp_arp_verdict "$line" "$(side_var "$s" MACS)" "$(side_var "$(other "$s")" MACS)"
 	done
-	got="$(pod_log_value ic-l-peer RECV5400=)"
 	check "the peer pod received the whole payload on its slot address ($got of $bytes bytes)" test "${got:-0}" = "$bytes"
 	rec "tcp retransmits during the transfer: local +$((${r1l:-0} - ${r0l:-0})), peer +$((${r1p:-0} - ${r0p:-0}))"
 	rtt_ic="$(measure_rtt slot "$dst")" rtt_mesh="$(measure_rtt mesh "$peer_MESH")"
@@ -1802,7 +1814,9 @@ st_driver_run() {
 	D="$FIXTURES/driver/$prof" F="$FIXTURES"
 	RUNG_DIR="$(mktemp -d -t m17-driver.XXXXXX)" RUNG="$rung" R_PASS=0 R_FAIL=0
 	PAYLOAD_MB=128 LAN_SLACK=8388608 NS=stub
-	local_TB=en2 peer_TB=en2 local_LAN=en0 peer_LAN=en0 local_NODE=node-a peer_NODE=node-b
+	local_TB=en2 peer_TB=en2 local_LAN=en0 peer_LAN=en0 local_NODE=node-a peer_NODE=node-b PEER_UTUN=utun4
+	# The interfaces of the captured r3 run, whose counters the cable profiles carry.
+	[ "$rung" != r3 ] || local_LAN=en1 peer_TB=en1
 	local_MACS="36:a1:5c:00:00:01" peer_MACS="36:a1:5c:00:00:02" local_ICIP=169.254.0.11 peer_ICIP=169.254.0.19
 	peer_MESH=100.64.1.1 peer_SLOT0=169.254.0.9 MESH_UTUN=utun3 BG_PIDS=""
 	sleep() { :; }
@@ -1822,7 +1836,13 @@ st_driver_run() {
 	}
 	pod_ip() { echo 10.42.1.7; }
 	kc() { case "$*" in *clusterIP*) echo 10.43.0.10 ;; esac; }
-	pod_log_value() { case "$2" in RECV*) echo $((PAYLOAD_MB * 1048576)) ;; ICIP=) echo 169.254.0.12 ;; esac; }
+	pod_log_value() {
+		case "$2" in
+		RECV5400=) if [ -f "$D/recv5400" ]; then cat "$D/recv5400"; else echo $((PAYLOAD_MB * 1048576)); fi ;;
+		RECV*) echo $((PAYLOAD_MB * 1048576)) ;;
+		ICIP=) echo 169.254.0.12 ;;
+		esac
+	}
 	# Each read of the listener's log finds one line more, so each flow adds one;
 	# the flow-lost mutant's listener never logs a second stream.
 	: >"$RUNG_DIR/.recv-lines"
@@ -1830,7 +1850,21 @@ st_driver_run() {
 		echo x >>"$RUNG_DIR/.recv-lines"
 		if [ "$mutant" = flow-lost ]; then echo 1; else wc -l <"$RUNG_DIR/.recv-lines" | tr -d ' '; fi
 	}
-	counters() { local side="$1" tag="$2" i; shift 2; for i in "$@"; do cp "$D/netstat-I-$i-${tag##*-}.txt" "$RUNG_DIR/$side-$tag-$i.txt"; done; }
+	# A profile's own file for this side, then its shared file, then the green cable
+	# reading, so a red cable profile holds only the counters it breaks.
+	counters() {
+		local side="$1" tag="$2" i f g
+		shift 2
+		for i in "$@"; do
+			f="netstat-I-$i-${tag##*-}.txt"
+			for g in "$D/$side-$f" "$D/$f" "$F/driver/cable/$side-$f"; do
+				if [ -f "$g" ]; then
+					cp "$g" "$RUNG_DIR/$side-$tag-$i.txt"
+					break
+				fi
+			done
+		done
+	}
 	on() {
 		case "$2" in
 		"route -n get 10.42."* | "route -n get 100.64."*) cat "$F/route-get-utun.txt" ;;
@@ -1869,9 +1903,9 @@ st_driver_red() {
 	local out
 	out="$(st_driver_run "$1" "$2" "$3")"
 	if [[ "$out" == *"FAIL"*"$4"* ]] && [[ "$out" == *"DRIVER passes="* ]] && [[ "$out" != *" fails=0"* ]]; then
-		echo "ok    rung driver $1 red: $3"
+		echo "ok    rung driver $1 red: ${3:-$2}"
 	else
-		echo "MISS  rung driver $1 red: $3: $(printf '%s' "$out" | grep -E '^(FAIL|DRIVER)' | sed -n 1,5p | tr '\n' ';')"
+		echo "MISS  rung driver $1 red: ${3:-$2}: $(printf '%s' "$out" | grep -E '^(FAIL|DRIVER)' | sed -n 1,5p | tr '\n' ';')"
 		ST_MISS=$((ST_MISS + 1))
 	fi
 }
@@ -2157,6 +2191,18 @@ self_test_body() {
 	fi
 	st_driver r3 cable 0
 	st_driver r3 cable-red 1
+	st_driver r3 cable-captured 1
+	st_driver_red r3 cable-captured "" "received 72704 of 134217728 bytes on the slot"
+	st_driver_red r3 cable-peer-lan "" "the payload arrived by the LAN"
+	st_driver_red r3 cable-peer-mesh "" "the payload arrived by the mesh"
+	st_driver_red r3 cable-peer-noack "" "ACKs did not leave by the cable"
+	st_eq "the captured member shape: Ibytes 0, so the delta is the ACKs alone" "$(icp_total_delta "$F/driver/cable/peer-netstat-I-en1-before.txt" "$F/driver/cable-peer-noack/peer-netstat-I-en1-after.txt")" 4256
+	st "the receiver: the slot holds it, ACKs on the cable, LAN and mesh flat" 0 icp_cable_receiver_verdict 134217728 134217728 7800000 287301 2000 8388608
+	st "the receiver red: the slot holds less than the payload" 1 icp_cable_receiver_verdict 134217728 72704 7800000 287301 2000 8388608
+	st "the receiver red: the LAN moved the payload" 1 icp_cable_receiver_verdict 134217728 134217728 7800000 141000000 2000 8388608
+	st "the receiver red: the mesh moved the payload" 1 icp_cable_receiver_verdict 134217728 134217728 7800000 287301 141000000 8388608
+	st "the receiver red: only chatter on the cable" 1 icp_cable_receiver_verdict 134217728 134217728 4256 287301 2000 8388608
+	st "a counter reading with no link row is a failed read, never a flat counter" 1 icp_total_delta "$F/hello-error.txt" "$F/hello-error.txt"
 	st_driver r4 mesh 0
 	st_driver r4 mesh-red 1
 	st_driver_red r4 mesh flow-lost "the peer pod's 5401 listener received the payload"

@@ -1,0 +1,3 @@
+Name       Mtu   Network       Address            Ipkts Ierrs     Ibytes    Opkts Oerrs     Obytes  Coll
+utun4      1380  <Link#20>                      5010     0 701000 5210     0 801000     0
+utun4      1380  100.64.1      100.64.1.1      5010     - 701000 5210     - 801000     -

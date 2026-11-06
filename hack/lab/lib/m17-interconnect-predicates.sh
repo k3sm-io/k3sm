@@ -152,6 +152,8 @@ icp_total_delta() {
 	local bi bo ai ao
 	read -r bi bo < <(icp_netstat_link_bytes "$1")
 	read -r ai ao < <(icp_netstat_link_bytes "$2")
+	# No link row (an ssh error in the file, a missing file) is not a flat counter.
+	[ -n "$bi$bo" ] && [ -n "$ai$ao" ] || return 1
 	icp_counter_delta $((${bi:-0} + ${bo:-0})) $((${ai:-0} + ${ao:-0}))
 }
 
@@ -169,6 +171,35 @@ icp_cable_path_verdict() {
 		return 1
 	fi
 	echo "PASS Thunderbolt member +$tb bytes >= payload $p; LAN +$lan bytes <= slack $slack"
+}
+
+# icp_cable_receiver_verdict <payload> <bytes on the slot> <member delta> <LAN delta>
+# <mesh delta> <slack> — the r3 receiver half. A bridge member's Ibytes reads 0, so its
+# delta is the ACKs this Mac sent and never reaches the payload: the slot's listener
+# says what arrived, and the LAN and mesh counters say it did not come that way. The
+# ACK floor is 1/4096 of the payload (one 78-byte ACK per 64 KiB is 1/840), above the
+# probe chatter of a cable carrying nothing, because ACKs that left by the LAN
+# would fit inside the LAN's slack.
+icp_cable_receiver_verdict() {
+	local p="$1" got="$2" tb="$3" lan="$4" mesh="$5" slack="$6" floor
+	floor=$(($1 / 4096))
+	if [ "$got" != "$p" ]; then
+		echo "FAIL received $got of $p bytes on the slot"
+		return 1
+	fi
+	if [ "$lan" -gt "$slack" ]; then
+		echo "FAIL the LAN interface moved $lan bytes, beyond the $slack-byte slack (the payload arrived by the LAN)"
+		return 1
+	fi
+	if [ "$mesh" -gt "$slack" ]; then
+		echo "FAIL the mesh tunnel moved $mesh bytes, beyond the $slack-byte slack (the payload arrived by the mesh)"
+		return 1
+	fi
+	if [ "$tb" -lt "$floor" ]; then
+		echo "FAIL the Thunderbolt member moved $tb bytes, under the $floor-byte floor (the ACKs did not leave by the cable)"
+		return 1
+	fi
+	echo "PASS $got bytes on the slot; Thunderbolt member +$tb bytes of ACKs >= $floor; LAN +$lan and mesh +$mesh bytes <= slack $slack"
 }
 
 # icp_flow_received_verdict <payload> <log lines before> <log lines after> <last count>
