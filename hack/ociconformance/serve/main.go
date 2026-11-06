@@ -50,6 +50,9 @@ import (
 // minSecretBytes is the shortest k3sm secret accepted from -secret-file.
 const minSecretBytes = 32
 
+// gcGrace is the collector grace api.New requires. A run is far shorter.
+const gcGrace = time.Hour
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "serve: %v\n", err)
@@ -95,7 +98,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	srv, err := api.New(api.Config{Store: st, Logger: log, Authorize: access.Authorize, MinFreeSpace: *minFree})
+	srv, err := api.New(serverConfig(st, log, access.Authorize, *minFree))
 	if err != nil {
 		return err
 	}
@@ -126,6 +129,11 @@ func run() error {
 		return fmt.Errorf("serve: %w", err)
 	}
 	return nil
+}
+
+// serverConfig is the launcher's registry configuration.
+func serverConfig(st *store.Store, log *slog.Logger, authorize api.Authorizer, minFree uint64) api.Config {
+	return api.Config{Store: st, Logger: log, Authorize: authorize, MinFreeSpace: minFree, GCGrace: gcGrace}
 }
 
 // writeAddr writes addr to path through a rename, so a reader never sees a

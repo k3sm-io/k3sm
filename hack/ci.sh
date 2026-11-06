@@ -215,6 +215,11 @@ if grep -qx "module k3sm.io/k3sm" go.mod 2>/dev/null; then
 	# against a planted local database. set -e reads its exit code.
 	echo "==> [k3sm] release stage (self-test)"
 	hack/release/stage.sh --self-test
+	# The registry against the OCI distribution-spec suite: the launcher stopped
+	# starting once with nothing noticing, because no gate ran it. About 20 s, and
+	# the run itself is network-confined.
+	echo "==> [k3sm] OCI conformance"
+	hack/acceptance/B1021.sh --run
 	echo "==> [k3sm] verify-deps (self-test)"
 	hack/verify-deps.sh --self-test
 	echo "==> [k3sm] verify-deps"
