@@ -19,8 +19,10 @@ limitations under the License.
 // deletes something a push in flight still needs.
 //
 // What it reaps, once an object is older than the grace period:
-// untagged manifests that no kept index names and that carry no subject;
-// blobs no kept manifest references; upload sessions not written within the
+// untagged manifests that no kept index names, a referrer (one that carries a
+// subject) among them only when its subject is not kept, so a referrer whose
+// subject is gone does not hold its repository; blobs no kept manifest
+// references; upload sessions not written within the
 // grace; and the layout of an empty repository. It also reaps, at any age,
 // two kinds of leftovers a crash makes: an upload session whose inode a commit
 // linked into blobs/ before it could remove the session (a second link, which

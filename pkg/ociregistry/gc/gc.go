@@ -928,8 +928,12 @@ func parseBody(b []byte) (refs, error) {
 // before cutoff):
 //
 //   - a tagged row is kept; so is an untagged row whose manifest is younger
-//     than the grace, carries a subject, or has no body to judge by;
+//     than the grace or has no body to judge by;
 //   - every manifest a kept index names is kept, transitively;
+//   - an untagged row that carries a subject (a referrer) is kept while its
+//     subject is live, transitively: kept, referenced by a kept manifest, or a
+//     blob younger than the grace. A referrer whose subject is absent or is
+//     itself reaped is an orphan and is reaped as any untagged row is;
 //   - every other untagged row is reaped;
 //   - a blob is kept when a kept manifest is it or references it, or when it
 //     is younger than the grace; the rest are reaped;
@@ -998,6 +1002,10 @@ func makePlan(idx ispec.Index, cont store.Contents, cutoff time.Time, refsOf fun
 		}
 	}
 	candidates := map[digest.Digest]bool{}
+	// referrers are the untagged rows past the grace that carry a subject,
+	// held back until the walk says whether their subject is live.
+	type referrer struct{ d, subject digest.Digest }
+	var referrers []referrer
 	hasRow := make(map[digest.Digest]bool, len(idx.Manifests))
 	for _, r := range idx.Manifests {
 		hasRow[r.Digest] = true
@@ -1017,7 +1025,7 @@ func makePlan(idx ispec.Index, cont store.Contents, cutoff time.Time, refsOf fun
 			return plan{}, planError("untagged "+r.Digest.String(), err)
 		}
 		if m.Subject != nil {
-			enqueue(item{d: r.Digest, required: true})
+			referrers = append(referrers, referrer{d: r.Digest, subject: m.Subject.Digest})
 			continue
 		}
 		candidates[r.Digest] = true
@@ -1025,51 +1033,85 @@ func makePlan(idx ispec.Index, cont store.Contents, cutoff time.Time, refsOf fun
 
 	kept := map[digest.Digest]bool{}       // manifests reachable from a kept row
 	referenced := map[digest.Digest]bool{} // blobs a kept manifest is or names
-	for len(queue) > 0 {
-		it := queue[0]
-		queue = queue[1:]
-		if kept[it.d] {
-			continue
-		}
-		referenced[it.d] = true
-		m, err := refsOf(it.d)
-		// Left unvisited: the same digest named by a readable body must still
-		// fail the plan, and which of the two is walked first is the row order's
-		// choice. A repeat costs no read, since refsOf remembers.
-		var v *unverifiedError
-		if it.scanned && !hasRow[it.d] && errors.As(err, &v) {
-			continue
-		}
-		kept[it.d] = true
-		if errors.Is(err, store.ErrBlobUnknown) && !it.required {
-			continue
-		}
-		var u *unparsedError
-		if errors.As(err, &u) && !it.required && !hasRow[it.d] {
-			for _, d := range u.named {
-				referenced[d] = true
-				if _, stored := mtime[d]; stored && !kept[d] {
-					enqueue(item{d: d, scanned: true})
-				}
-			}
-			continue
-		}
-		if err != nil {
-			return plan{}, planError(it.d.String(), err)
-		}
-		if m.Config != nil {
-			referenced[m.Config.Digest] = true
-		}
-		for _, l := range m.Layers {
-			referenced[l.Digest] = true
-		}
-		for _, ch := range m.Manifests {
-			if _, err := ref.ParseDigest(ch.Digest.String()); err != nil {
+	// walk empties the queue: it keeps every manifest it reaches and marks
+	// what each one names.
+	walk := func() error {
+		for len(queue) > 0 {
+			it := queue[0]
+			queue = queue[1:]
+			if kept[it.d] {
 				continue
 			}
-			referenced[ch.Digest] = true
-			enqueue(item{d: ch.Digest})
+			referenced[it.d] = true
+			m, err := refsOf(it.d)
+			// Left unvisited: the same digest named by a readable body must still
+			// fail the plan, and which of the two is walked first is the row order's
+			// choice. A repeat costs no read, since refsOf remembers.
+			var v *unverifiedError
+			if it.scanned && !hasRow[it.d] && errors.As(err, &v) {
+				continue
+			}
+			kept[it.d] = true
+			if errors.Is(err, store.ErrBlobUnknown) && !it.required {
+				continue
+			}
+			var u *unparsedError
+			if errors.As(err, &u) && !it.required && !hasRow[it.d] {
+				for _, d := range u.named {
+					referenced[d] = true
+					if _, stored := mtime[d]; stored && !kept[d] {
+						enqueue(item{d: d, scanned: true})
+					}
+				}
+				continue
+			}
+			if err != nil {
+				return planError(it.d.String(), err)
+			}
+			if m.Config != nil {
+				referenced[m.Config.Digest] = true
+			}
+			for _, l := range m.Layers {
+				referenced[l.Digest] = true
+			}
+			for _, ch := range m.Manifests {
+				if _, err := ref.ParseDigest(ch.Digest.String()); err != nil {
+					continue
+				}
+				referenced[ch.Digest] = true
+				enqueue(item{d: ch.Digest})
+			}
 		}
+		return nil
+	}
+	// live reports whether subject s stays after this plan: a manifest the walk
+	// kept, a blob a kept manifest names, or a blob too young to reap.
+	live := func(s digest.Digest) bool {
+		t, stored := mtime[s]
+		return kept[s] || referenced[s] || (stored && !old(t))
+	}
+	for {
+		if err := walk(); err != nil {
+			return plan{}, err
+		}
+		// A referrer whose subject the walk kept is kept in turn, and what it
+		// names may keep another referrer's subject, so walk again until no
+		// referrer joins. What is left has no live subject: an orphan.
+		rest := referrers[:0]
+		for _, r := range referrers {
+			if live(r.subject) {
+				enqueue(item{d: r.d, required: true})
+			} else {
+				rest = append(rest, r)
+			}
+		}
+		if len(rest) == len(referrers) {
+			break
+		}
+		referrers = rest
+	}
+	for _, r := range referrers {
+		candidates[r.d] = true
 	}
 
 	p := plan{rows: map[digest.Digest]bool{}, blobs: map[digest.Digest]bool{}, sessions: map[string]bool{}, committed: map[string]bool{}, temps: map[string]store.Temp{}}
