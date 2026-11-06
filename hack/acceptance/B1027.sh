@@ -984,6 +984,16 @@ s_c2() {
 	}
 	DETAIL="ls push pull tag untag inspect save prune(dry run)"
 }
+# builder_ready - the buildx push needs the builder engine, a Pod a reinstall
+# can remove. Start it when it is not running and remember that this run did,
+# so f.1 stops it again and leaves the rig as it was found.
+BUILDER_STARTED=0
+builder_ready() {
+	ku builder status >"$EVIDENCE/c.3-builder-status.txt" 2>&1 || true
+	grep -q 'Running' "$EVIDENCE/c.3-builder-status.txt" && return 0
+	bounded "$INSTALL_TIMEOUT" rsh_raw "$SERVER" "$(quoted "$K3SM_BIN" builder up)" >"$EVIDENCE/c.3-builder-up.txt" 2>&1 </dev/null || return 1
+	BUILDER_STARTED=1
+}
 s_c3() {
 	local v d
 	put "$SERVER" "$LOCAL_WORK/ctx.tar.gz" "$SERVER_WORK/ctx.tar.gz" || return 1
@@ -994,6 +1004,10 @@ s_c3() {
 			return 1
 		}
 	done
+	builder_ready || {
+		why "the builder engine did not start (c.3-builder-up.txt)"
+		return 1
+	}
 	rsh "$SERVER" /bin/mkdir -p "$SERVER_WORK/docker" || return 1
 	rsh "$SERVER" /usr/bin/env "DOCKER_CONFIG=$SERVER_WORK/docker" "$K3SM_BIN" registry login >"$EVIDENCE/c.3-login.txt" 2>&1 || {
 		why "registry login into the run's own DOCKER_CONFIG"
@@ -1260,6 +1274,7 @@ s_f1() {
 rm -rf $(quoted "$STORE/$P")
 EOF
 	rsh "$SERVER" /bin/rm -rf "$SERVER_WORK/docker" || true
+	[ "$BUILDER_STARTED" = 0 ] || ku builder down </dev/null || rc=1
 	if [ "$KUBE_COPIES" -gt 0 ]; then
 		local i=1 files=""
 		while [ "$i" -le "$KUBE_COPIES" ]; do
@@ -1627,6 +1642,10 @@ build)
 	exit 0
 	;;
 builder)
+	case "$verb2" in
+	status) echo "State: Running"; exit 0 ;;
+	up | down) echo "builder $verb2" >>"$S/calls"; exit 0 ;;
+	esac
 	d="sha256:$(printf '%s' "$tag$(cat "${pos[1]}/Dockerfile")" | shasum -a 256 | cut -d' ' -f1)"
 	settag "${tag#*/}" "$d"
 	write_repo "$(echo "${tag#*/}" | sed 's/:[^:]*$//')" "$d"
