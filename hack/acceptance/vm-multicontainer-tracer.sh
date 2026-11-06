@@ -62,6 +62,7 @@ SELF="$HERE/vm-multicontainer-tracer.sh"
 . "$REPO_ROOT/hack/lab/lib/tolerations.sh"
 
 GATE_NAME="vm-multicontainer-tracer"
+# shellcheck disable=SC2034  # read by the sourced runlog.sh
 MODE="same-image"
 NS="vm-tracer"
 
