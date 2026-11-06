@@ -40,7 +40,8 @@
 #   r5-ring          a sharded MLXModel on the interconnect serves through rank 0
 #   r6-unplug        the unplug budget measured from the carrier event; UpHold; one restart
 #   r7-desired-forge a node-forged desired annotation yields no out-of-policy alias
-#   r8-killswitch    k3sm interconnect disable leaves no reserved-half state anywhere
+#   r8-killswitch    k3sm interconnect disable: running attached pods keep their addresses and
+#                    new pods do not attach; deleting the pods leaves no reserved-half state
 #   r9-downgrade     the previous binary node by node leaves no state; HelperTooOld leg
 #
 # THE EXIT CONTRACT:
@@ -122,7 +123,7 @@ r4-mesh-traffic|pod-to-pod and ClusterIP flows ride a utun and the LAN with the 
 r5-ring|a sharded MLXModel with interconnect thunderbolt serves through rank 0: ranks on slot-1 addresses, the ring on the cable, LinksHealthy True, the endpoint on the pod IP; tokens/s RECORDED beside network and single-Mac|armed,mlxhosts,gpu,mlximage|assert_r5_ring|r5-ring/|BI8
 r6-unplug|a pulled cable: member down <= 20 s and the MLX re-render <= 30 s after the carrier drop, the mesh loses at most one reply, UpHold 60 s on replug, one transition per direction, no second gang restart inside 5 min|armed,ring,operator|assert_r6_unplug|r6-unplug/|BI6
 r7-desired-forge|no-address-channel smoke test: the desired annotation carries no address or slot, so values the node forges with its own credential (unknown address/slot fields, a foreign interconnect name, schema 99) can only hold or drop slot 0: no out-of-policy alias or route, only the two netd verbs; an in-policy rewrite restores slot 0|armed,nodecred|assert_r7_desired_forge|r7-desired-forge/|BI3
-r8-killswitch|k3sm interconnect disable: no reserved-half address, route, permanent ARP or ledger entry on either Mac, membership, lo0 and the mesh unchanged, the annotation and attached pods gone, no member up, no segment, no armedBy, the ring on the mesh|armed|assert_r8_killswitch|r8-killswitch/|BI6
+r8-killswitch|k3sm interconnect disable: the annotation goes, a new pod does not attach, a running attached pod keeps its address, lo0 and the mesh unchanged, the ring on the mesh; once the pods are deleted no reserved-half address, route, permanent ARP or ledger entry on either Mac, membership unchanged, no member up, no segment, no armedBy|armed|assert_r8_killswitch|r8-killswitch/|BI6
 r9-downgrade|disable, then the previous binary node by node: every r8 host assertion again, doctor ic-stray and ic-residue clean, HelperTooOld on the mixed leg, no reboot; then the artifact under test is reinstalled|disarmed,prevbin|assert_r9_downgrade|r9-downgrade/|BI3
 RUNGS
 REQUIRED_IDS="r0-disarmed r1-arm r2-attach r3-cable-path r4-mesh-traffic r5-ring r6-unplug r7-desired-forge r8-killswitch r9-downgrade"
@@ -1085,32 +1086,108 @@ host_clean() {
 	done
 }
 
+# The pod started after the disarm: it reports the env it was given and stays up
+# until r8 deletes it. Single-quoted on purpose: it expands in the pod.
+# shellcheck disable=SC2016
+LATE_POD_CMD='echo "ICIP=${K3SM_INTERCONNECT_IP:-}"; exec /bin/sleep 3600'
+R8_POD_NAMES="ic-l-local ic-l-peer ic-late-local ic-late-peer"
+
+desired_gone_on() { [ -z "$(desired_of "$(node_of "$1")")" ]; }
+# late_pod_env_clear <pod> — the pod ran, and its env held no interconnect address.
+late_pod_env_clear() { [ "$(kc logs -n "$NS" "$1" 2>/dev/null | sed -n 1p)" = "ICIP=" ]; }
+# r8_pods_gone — none of r8's pods is left in the apiserver.
+# shellcheck disable=SC2086 # R8_POD_NAMES is a list of pod names
+r8_pods_gone() { [ -z "$(kc get pod -n "$NS" --ignore-not-found -o name $R8_POD_NAMES 2>/dev/null)" ]; }
+# lo0_lost <before file> <now file> [address...] — every inet of the before snapshot
+# is still on lo0, the named addresses aside; the ones that went are printed. New
+# addresses are not a loss: any pod started in between adds one.
+lo0_lost() {
+	local before="$1" now="$2" a lost=""
+	shift 2
+	while read -r _ a _; do
+		case " $* " in *" $a "*) continue ;; esac
+		awk -v a="$a" '$2==a{f=1} END{exit !f}' "$now" || lost="$lost $a"
+	done <"$before"
+	[ -z "$lost" ] || {
+		echo "gone from lo0:$lost"
+		return 1
+	}
+}
+# r8_no_new_attach <side> — the pod created after the disarm started without an address.
+r8_no_new_attach() {
+	local p="ic-late-$1" c
+	if ! wait_until 180 pod_ready "$p"; then
+		fail "$p, created after the disarm, never became Ready on $(node_of "$1")"
+		return 0
+	fi
+	c="$(pod_attached "$p")"
+	check "$p, created after the disarm: k3sm.io/InterconnectAttached is False ('$c')" test "$c" = False
+	check "$p, created after the disarm: its env holds no K3SM_INTERCONNECT_IP" late_pod_env_clear "$p"
+}
+# r8_keeps_address <side> — the pod attached before the disarm still holds its address,
+# and the node's own address it rides is still there.
+r8_keeps_address() {
+	local p="ic-l-$1" c ip slot0
+	c="$(pod_attached "$p")"
+	ip="$(side_var "$1" ICIP)" slot0="$(side_var "$1" SLOT0)"
+	check "pod $p, still running: it keeps k3sm.io/InterconnectAttached True ('$c')" test "$c" = True
+	check "$1 Mac: $p's address $ip is still a /32 on bridge0" alias_present "$1" "$ip" 0xffffffff
+	check "$1 Mac: the node's own address $slot0 stays while a pod on it holds one" alias_present "$1" "$slot0" 0xffffff00
+}
+
+# What a disarm promises (docs/user/interconnects.md, Arming): "No new Pod attaches.
+# A Pod that already holds an address keeps it until the Pod is deleted or restarted,
+# and each node removes its own address once no Pod on it holds one." So disable alone
+# does not empty bridge0 while ic-l-* run, and this rung does not ask it to. It asserts
+# both sides of the sentence, in order: the annotation goes, a new pod gets no address,
+# a running pod keeps its address and the node keeps its own; then the pods are
+# deleted, the documented way out, and only then is every address, route and ledger
+# entry required to be gone.
+#
+# The code behind each step: the pod's alias goes only in the release path
+# (pkg/provider/interconnect.go detach), netd refuses to remove slot 0 while a pod
+# slot is owned (darwin-net pkg/netd/interconnect.go handleRemoveInterconnectAlias),
+# and the node retries that removal on its DesiredInterval tick, which nothing
+# triggers early (pkg/interconnect/desired.go Run). A member's state does not read
+# spec.enabled (pkg/interconnect/resolve.go Resolve) and slot 0 keeps its peer
+# answering, so "no member up" is only owed once the pods are gone too.
 assert_r8_killswitch() {
-	local s out mp0 mp1 p
+	local s out mp0 p hold_until has_ring=0 rank_ips=""
 	for s in local peer; do snap "$s" pre; done
 	kc get meshpeers.net.k3sm.io -o jsonpath='{range .items[*]}{.metadata.name} {.spec}{"\n"}{end}' >"$RUNG_DIR/meshpeers-pre.txt" 2>&1
+	# The fallback restarts the rank pods, so their lo0 addresses change by design.
+	if kc get mlxmodel -n "$NS" ic-ring >/dev/null 2>&1; then
+		has_ring=1
+		for p in $(rank_pods ic-ring | awk '{print $1}'); do rank_ips="$rank_ips $(pod_ip "$p")"; done
+	fi
 	out="$(on_local "$K3SM_BIN interconnect disable" 2>&1)"
 	printf '%s\n' "$out" >"$RUNG_DIR/disable.txt"
 	info "$out"
 	for s in local peer; do
-		wait_until 180 halves_empty_on "$s" || true
-		host_clean "$s" post
-		check "$s Mac: lo0 pod aliases unchanged" cmp -s "$RUNG_DIR/$s-pre-lo0.txt" "$RUNG_DIR/$s-post-lo0.txt"
-		check "$s Mac: desired annotation gone from node $(node_of "$s")" test -z "$(desired_of "$(node_of "$s")")"
+		wait_until 120 desired_gone_on "$s" || true
+		check "$s Mac: desired annotation gone from node $(node_of "$s")" desired_gone_on "$s"
 	done
-	ARMED_BY_RUN=0
-	kc get meshpeers.net.k3sm.io -o jsonpath='{range .items[*]}{.metadata.name} {.spec}{"\n"}{end}' >"$RUNG_DIR/meshpeers-post.txt" 2>&1
-	check "MeshPeer specs (wireguard peers and AllowedIPs) unchanged" cmp -s "$RUNG_DIR/meshpeers-pre.txt" "$RUNG_DIR/meshpeers-post.txt"
-	mp0="$(on_local "ping -c 3 -t 6 $peer_MESH" | awk '/packets received/{print $4}')"
-	check "the mesh ping still answers ($mp0/3)" test "${mp0:-0}" -gt 0
-	check_disarmed
-	for p in ic-l-local ic-l-peer; do
-		mp1="$(pod_attached "$p")"
-		check "pod $p: k3sm.io/InterconnectAttached is False ('$mp1')" test "$mp1" = False
+	# One whole tick of the node's handler, so its removal has been tried and refused
+	# before the hold is read; the first seconds also let each node's own informer
+	# see the annotation go before a new pod asks it.
+	hold_until=$((SECONDS + DESIRED_INTERVAL + 5))
+	sleep 5
+	kc create namespace "$NS" >/dev/null 2>&1 && NS_CREATED=1
+	for s in local peer; do ic_pod "ic-late-$s" "$(node_of "$s")" 1 "$LATE_POD_CMD"; done
+	for s in local peer; do r8_no_new_attach "$s"; done
+	[ "$SECONDS" -ge "$hold_until" ] || sleep $((hold_until - SECONDS))
+	for s in local peer; do
+		if need attached; then
+			r8_keeps_address "$s"
+		else
+			rec "$s Mac: no pod attached in r2, so 'a running pod keeps its address' is not exercised"
+		fi
+		snap "$s" held
+		# shellcheck disable=SC2086 # rank_ips is a list of addresses
+		check "$s Mac: lo0 lost no address to the disarm" lo0_lost "$RUNG_DIR/$s-pre-lo0.txt" "$RUNG_DIR/$s-held-lo0.txt" $rank_ips
 	done
-	scrape_metrics post
-	check "k3sm_interconnect_attached_pods is 0" test "$(icp_metric_sum "$RUNG_DIR/metrics-post.txt" k3sm_interconnect_attached_pods)" = 0
-	if kc get mlxmodel -n "$NS" ic-ring >/dev/null 2>&1; then
+	# The ranks hold slot 1, so they must be off the cable before slot 0 can go.
+	if [ "$has_ring" = 1 ]; then
 		if wait_until 180 ring_on network; then
 			pass "the ring fell back to the mesh (both ranks on the network path)"
 		else
@@ -1119,6 +1196,26 @@ assert_r8_killswitch() {
 	else
 		rec "no ring model to fall back (r5 did not leave one); the ring half of the kill switch is not exercised"
 	fi
+	# shellcheck disable=SC2086 # R8_POD_NAMES is a list of pod names
+	kc delete pod -n "$NS" --ignore-not-found --wait=false $R8_POD_NAMES >/dev/null 2>&1
+	if wait_until 120 r8_pods_gone; then
+		pass "the attached pods are deleted ($R8_POD_NAMES)"
+	else
+		fail "the attached pods were not gone within 120 s of the delete ($R8_POD_NAMES)"
+	fi
+	for s in local peer; do
+		wait_until $((3 * DESIRED_INTERVAL)) halves_empty_on "$s" || true
+		host_clean "$s" post
+		check "$s Mac: desired annotation still gone from node $(node_of "$s")" desired_gone_on "$s"
+	done
+	ARMED_BY_RUN=0
+	kc get meshpeers.net.k3sm.io -o jsonpath='{range .items[*]}{.metadata.name} {.spec}{"\n"}{end}' >"$RUNG_DIR/meshpeers-post.txt" 2>&1
+	check "MeshPeer specs (wireguard peers and AllowedIPs) unchanged" cmp -s "$RUNG_DIR/meshpeers-pre.txt" "$RUNG_DIR/meshpeers-post.txt"
+	mp0="$(on_local "ping -c 3 -t 6 $peer_MESH" | awk '/packets received/{print $4}')"
+	check "the mesh ping still answers ($mp0/3)" test "${mp0:-0}" -gt 0
+	check_disarmed
+	scrape_metrics post
+	check "k3sm_interconnect_attached_pods is 0" test "$(icp_metric_sum "$RUNG_DIR/metrics-post.txt" k3sm_interconnect_attached_pods)" = 0
 	[ "$R_FAIL" = 0 ] && HAVE="$HAVE disarmed"
 	return 0
 }
@@ -1614,6 +1711,78 @@ st_driver() {
 	fi
 }
 
+# st_r8_run <profile> — the real r8 assertion with the host and cluster stubbed: bridge0
+# reads armed until the pods are deleted, so the green profile passes only when the
+# hold is read before the delete and the empty halves after it. Each other profile
+# breaks one promise. The stubs live only in the subshell st_out runs this in, and
+# they read r8_dir because check's own local d would shadow a d here.
+st_r8_run() {
+	local prof="$1" F="$FIXTURES" r8_dir s
+	r8_dir="$(mktemp -d -t m17-r8.XXXXXX)"
+	RUNG_DIR="$r8_dir" BASE_DIR="$r8_dir" RUNG=r8 R_PASS=0 R_FAIL=0 NS=stub DESIRED_INTERVAL=0 HAVE=attached NS_CREATED=0 ARMED_BY_RUN=1
+	# shellcheck disable=SC2034 # read through side_var and node_of
+	local_NODE=node-a peer_NODE=node-b local_IDX=3 peer_IDX=3 local_OS=x peer_OS=x
+	# shellcheck disable=SC2034 # read through side_var
+	local_SLOT0=169.254.0.25 peer_SLOT0=169.254.0.25 local_ICIP=169.254.0.26 peer_ICIP=169.254.0.27 peer_MESH=100.64.1.1
+	for s in local peer; do
+		cp "$F/netstat-rn-baseline.txt" "$r8_dir/$s-base-netstat.txt"
+		cp "$F/ifconfig-bridge0-disarmed.txt" "$r8_dir/$s-base-bridge0.txt"
+	done
+	[ "$prof" != no-attached ] || HAVE=""
+	sleep() { :; }
+	wait_until() { shift; "$@"; }
+	rec() { :; }
+	info() { :; }
+	ic_pod() { :; }
+	pod_ready() { :; }
+	pod_attached() {
+		case "$1" in
+		ic-late-*) if [ "$prof" = late-attached ]; then echo True; else echo False; fi ;;
+		*) if [ "$prof" = cond-false ]; then echo False; else echo True; fi ;;
+		esac
+	}
+	desired_of() { [ "$prof" != annotation-stays ] && [ -e "$r8_dir/.disabled" ] || echo '{"schema":1}'; }
+	ic_json() { cat "$F/interconnect-disarmed-members-down.json"; }
+	read_ledger() { cp "$F/ledger-empty.json" "$RUNG_DIR/ledger-$1.json"; }
+	scrape_metrics() { cp "$F/metrics-after.txt" "$RUNG_DIR/metrics-$1.txt"; }
+	kc() {
+		case "$*" in
+		"delete pod"*) [ "$prof" = pods-stuck ] || : >"$r8_dir/.deleted" ;;
+		"get pod -n stub --ignore-not-found"*) [ -e "$r8_dir/.deleted" ] || echo pod/ic-l-local ;;
+		"get meshpeers"*) echo "node-a {}" ;;
+		"logs "*) echo "ICIP=" ;;
+		*) return 1 ;;
+		esac
+	}
+	on() {
+		case "$2" in
+		"ifconfig bridge0")
+			if [ "$prof" = stuck ]; then
+				cat "$F/ifconfig-bridge0-armed.txt"
+			elif [ -e "$r8_dir/.deleted" ] || { [ "$prof" = dropped-early ] && [ -e "$r8_dir/.disabled" ]; }; then
+				cat "$F/ifconfig-bridge0-disarmed.txt"
+			else
+				cat "$F/ifconfig-bridge0-armed.txt"
+			fi
+			;;
+		"netstat -rn -f inet") cat "$F/netstat-rn-baseline.txt" ;;
+		"arp -an") cat "$F/arp-an-clean.txt" ;;
+		"ifconfig lo0"*)
+			if [ "$prof" = lo0-lost ] && [ -e "$r8_dir/.disabled" ]; then cat "$F/lo0-lost-egress.txt"; else cat "$F/lo0-before.txt"; fi
+			;;
+		esac
+	}
+	on_local() {
+		case "$1" in
+		*"interconnect disable") : >"$r8_dir/.disabled" ;;
+		"ping "*) echo "3 packets transmitted, 3 packets received, 0.0% packet loss" ;;
+		esac
+	}
+	assert_r8_killswitch
+	rm -rf "$r8_dir"
+	echo "DRIVER passes=$R_PASS fails=$R_FAIL"
+}
+
 self_test_body() {
 	local F="$FIXTURES" tmp r
 	if [ "${K3SM_M17_SELFTEST_HANG:-}" = 1 ]; then
@@ -1799,6 +1968,20 @@ self_test_body() {
 	st_driver r3 cable-red 1
 	st_driver r4 mesh 0
 	st_driver r4 mesh-red 1
+	st "lo0: every address still there" 0 lo0_lost "$F/lo0-before.txt" "$F/lo0-before.txt"
+	st "lo0: a new address is no loss" 0 lo0_lost "$F/lo0-lost-egress.txt" "$F/lo0-before.txt"
+	st_out "lo0 red: the lost address is named" "gone from lo0: 100.64.3.1" lo0_lost "$F/lo0-before.txt" "$F/lo0-lost-egress.txt"
+	st "lo0: a rank pod's address may go" 0 lo0_lost "$F/lo0-before.txt" "$F/lo0-lost-egress.txt" 100.64.3.1
+	st_out "r8: the documented disarm, hold before the delete and empty after it" "DRIVER passes=31 fails=0" st_r8_run green
+	st_out "r8: no pod attached in r2 skips only the hold" "DRIVER passes=25 fails=0" st_r8_run no-attached
+	st_out "r8 red: an address dropped while its pod runs" "FAIL      [r8] local Mac: ic-l-local's address 169.254.0.26 is still a /32" st_r8_run dropped-early
+	st_out "r8 red: the node's own address dropped while a pod rides it" "FAIL      [r8] local Mac: the node's own address 169.254.0.25 stays" st_r8_run dropped-early
+	st_out "r8 red: a running pod's condition went False" "FAIL      [r8] pod ic-l-local, still running" st_r8_run cond-false
+	st_out "r8 red: a pod created after the disarm attached" "FAIL      [r8] ic-late-peer, created after the disarm" st_r8_run late-attached
+	st_out "r8 red: the annotation stays" "FAIL      [r8] peer Mac: desired annotation gone" st_r8_run annotation-stays
+	st_out "r8 red: the disarm took a lo0 address" "FAIL      [r8] local Mac: lo0 lost no address to the disarm: gone from lo0: 100.64.3.1" st_r8_run lo0-lost
+	st_out "r8 red: addresses left after the pods went" "FAIL      [r8] peer Mac: no inet in 169.254.0.0/24" st_r8_run stuck
+	st_out "r8 red: the pods never went" "FAIL      [r8] the attached pods were not gone" st_r8_run pods-stuck
 	rm -rf "$tmp"
 	if [ "$ST_MISS" -gt 0 ]; then
 		echo "$ROW self-test: FAIL ($ST_MISS miss(es))"
