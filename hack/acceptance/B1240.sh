@@ -28,9 +28,10 @@
 #   r.1  `k3sm update channel rc` offers rc.1 and starts no roll
 #   r.2  the worker's status row names rc and rc.1
 #   a.1  apply to rc.1: worker before server, and the worker's archive came through the
-#        forward (fetched while the server was still Pending)
+#        forward (the index logged its 200 while the server was still Pending)
 #   a.2  the roll to rc.1 succeeds, both nodes on it, nothing cordoned
-#   b.1  on the roll to rc.2 the worker is bounced mid-download and fetches again
+#   b.1  on the roll to rc.2 the worker is bounced once its archive GET is answered, and a
+#        second GET is answered while the server is still Pending
 #   b.2  the server is restarted mid-roll and its controller carries on
 #   b.3  the roll to rc.2 succeeds, nothing cordoned, a Pod runs on each Mac
 #   l.1  leaving rc on rc.2: every node ahead, no offer
@@ -65,10 +66,12 @@
 # them (exit 2, the rig untouched) and the operator decides; what it deletes at the end is
 # only what it created.
 #
-# When a withdrawal happens. Node phase Downloading does not say a GET has been made: the
-# controller writes it at the handover, before the node has read it. So w.1 and w.2
-# withdraw once the index has logged the worker's 200, which is when its file is open, and
-# w.3 holds the worker's GET at the index, withdraws, then lets the GET be answered.
+# When a GET has happened. Node phase Downloading does not say one has been made: the
+# controller writes it at the handover, before the node has read it. So a.1 and b.1 read
+# their counts, and w.1 and w.2 withdraw, once the index has logged the worker's 200, which
+# is when its file is open, and w.3 holds the worker's GET at the index, withdraws, then
+# lets the GET be answered. The server's archive GET looks the same in that log, so a.1 and
+# b.1 read the server as Pending after the 200 they count: it had not fetched by then.
 #
 # Run it detached: it takes over an hour. One poll or remote step is bounded, and the
 # legs poll until their own budgets end. It takes the rig for the run; one rig run at a
@@ -545,15 +548,16 @@ def fetch(n, tag):
         return True
     except urllib.error.HTTPError:
         return False
-# The withdrawal legs' tags move as a real node does: Downloading comes first, and the GET
-# reaches the index a moment later, from another process. A withdrawal timed on the phase
-# alone turns that GET into a 404. (a.1 and b.1 still read the count at Downloading.)
-def async_fetch(tag):
-    return tag.startswith("v0.92.")
+# A node moves as a real one does: Downloading comes first, and the GET reaches the index a
+# moment later, from another process. A count read at the phase alone finds no GET, and a
+# withdrawal timed on it turns that GET into a 404.
+NO_GET = {"no-get": "v0.92.0-rc.1", "no-get-rc1": "v0.91.0-rc.1", "no-get-rc2": "v0.91.0-rc.2"}
 def fetch_file(n, tag):
     return os.path.join(st_dir, "fetch-%s-%s" % (n, tag))
 def fetch_later(n, tag):
     url = s["base"].get(n) + "/download/" + tag + "/k3sm_" + tag[1:] + "_darwin_arm64.tar.gz"
+    if os.path.exists(fetch_file(n, tag)):
+        os.remove(fetch_file(n, tag))
     sh = 'sleep 0.5; /usr/bin/curl -s -o /dev/null --max-time 20 -w "%{http_code}" "$1" >"$2.tmp"; mv "$2.tmp" "$2"'
     subprocess.Popen(["/bin/sh", "-c", sh, "sh", url, fetch_file(n, tag)], stdin=subprocess.DEVNULL,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
@@ -578,28 +582,25 @@ def tick():
                 return
             s["cord"][name] = True
             row["phase"] = "Downloading"
-            if async_fetch(u["version"]):
-                row["held"] = 0
-                if not (brk == "no-get" and u["version"] == "v0.92.0-rc.1"):
-                    fetch_later(name, u["version"])
-                return
-            if not fetch(name, u["version"]):
-                row.update(phase="Failed", message="fetch the archive: http 404 Not Found")
-                u.update(phase="Failed", finished=True)
-                return
             row["held"] = 0
+            if NO_GET.get(brk) != u["version"]:
+                fetch_later(name, u["version"])
             return
         if row["phase"] == "Downloading":
-            if async_fetch(u["version"]):
-                if not os.path.exists(fetch_file(name, u["version"])):
-                    return
-                if open(fetch_file(name, u["version"])).read() != "200":
-                    row.update(phase="Failed", message="fetch the archive: http 404 Not Found")
-                    u.update(phase="Failed", finished=True)
-                    if brk == "past-failure":
-                        s["cord"][SRV] = True
-                        u["nodes"][-1]["phase"] = "Downloading"
-                    return
+            last = u["nodes"][-1]
+            if brk == "server-races" and u["version"] == "v0.91.0-rc.1" and last["phase"] == "Pending":
+                s["cord"][SRV] = True
+                last.update(phase="Downloading", held=0)
+                fetch_later(SRV, u["version"])
+            if not os.path.exists(fetch_file(name, u["version"])):
+                return
+            if open(fetch_file(name, u["version"])).read() != "200":
+                row.update(phase="Failed", message="fetch the archive: http 404 Not Found")
+                u.update(phase="Failed", finished=True)
+                if brk == "past-failure":
+                    s["cord"][SRV] = True
+                    u["nodes"][-1]["phase"] = "Downloading"
+                return
             row["held"] += 1
             if row["held"] < 4 or (brk == "no-resume" and s.get("bounced")):
                 return
@@ -618,7 +619,7 @@ elif argv[:1] == ["restart"]:
     if host == "wrk" and u and not u["finished"]:
         s["bounced"] = True
         for row in u["nodes"]:
-            if row["name"] == WRK and row["phase"] == "Downloading" and brk != "no-resume":
+            if row["name"] == WRK and row["phase"] == "Downloading" and brk not in ("no-resume", "no-refetch"):
                 fetch(WRK, u["version"])
                 row["held"] = 0
     if host == "srv" and brk == "server-restart-fails":
@@ -1001,7 +1002,8 @@ self_test() {
 	# rig is still put back on this tree's build. They run side by side: each is a full run.
 	port=47901
 	for row in no-updates-row:c.1 forward-dead:f.1 cel-name:p.1 cel-value:p.2 stable-rc:s.1 \
-		roll-on-set:r.1 worker-row:r.2 server-first:a.1 stays-cordoned:a.2 no-resume:b.1 \
+		roll-on-set:r.1 worker-row:r.2 server-first:a.1 no-get-rc1:a.1 server-races:a.1 stays-cordoned:a.2 \
+		no-resume:b.1 no-refetch:b.1 no-get-rc2:b.1 \
 		server-restart-fails:b.2 pod-fails:b.3 no-refuse:l.2 mid-channel:m.1 no-fallback:w.1 \
 		worker-install-fails:c.1 cancel-ignored:w.1 no-get:w.1 abort-keeps-cordon:w.2 past-failure:w.3 leftover:e.1 base-left:e.2 label-lost:e.3; do
 		(
@@ -1278,10 +1280,6 @@ idx() { rsh_raw "$SERVER" "$1" </dev/null; }
 publish() { idx "mv $INDEX_DIR/held/$1 $INDEX_DIR/published/$1"; }
 withdraw() { idx "mv $INDEX_DIR/published/$1 $INDEX_DIR/withdrawn/$1"; }
 hold_downloads() { idx "printf '%s' $1 >$INDEX_DIR/throttle"; }
-# fetches_of <tag>: the archive GETs the index has answered for tag.
-fetches_of() {
-	idx "grep -c ' GET $INDEX_PATH/download/$1/$(archive_name "$1") ' $INDEX_DIR/access.log || true"
-}
 # archive_answers <tag> <code>: the archive GETs the index logged with this code for tag.
 archive_answers() {
 	idx "grep -c ' GET $INDEX_PATH/download/$1/$(archive_name "$1") $2 ' $INDEX_DIR/access.log || true"
@@ -1674,13 +1672,18 @@ leg_rc1() {
 		leg a.1 no "the worker never reported Downloading: $(st 'node("'"$WORKER_NODE"'")')"
 		return 1
 	fi
+	if ! wait_archive "$TAG_RC1" 200; then
+		leg a.1 no "the index served the worker no archive within ${READY_TIMEOUT}s"
+		return 1
+	fi
+	read_status || ST='{}'
 	order="$(st '" ".join(n["name"] for n in d["nodes"])')"
 	server_phase="$(st 'node("'"$SERVER_NODE"'").get("phase","")')"
-	fetched="$(fetches_of "$TAG_RC1")"
+	fetched="$(archive_answers "$TAG_RC1" 200)"
 	if [ "$order" = "$WORKER_NODE $SERVER_NODE" ] && [ "$server_phase" = Pending ] && [ "${fetched:-0}" -ge 1 ]; then
-		leg a.1 ok "order $order; the server Pending while the index served the archive ($fetched fetch)"
+		leg a.1 ok "order $order; the server still Pending after the index's 200 ($fetched served)"
 	else
-		leg a.1 no "order '$order', server '$server_phase', archive fetches ${fetched:-0}"
+		leg a.1 no "order '$order', server '$server_phase' after the 200, archives served ${fetched:-0}"
 	fi
 	hold_downloads 0
 	wait_roll "$ROLL_TIMEOUT" || true
@@ -1719,7 +1722,7 @@ run_probes() {
 }
 
 leg_rc2() {
-	local first second deadline
+	local first second deadline server_phase
 	publish "$TAG_RC2" || return 1
 	offers "$TAG_RC2" behind || log "note: $CHECK (want $TAG_RC2 offered)"
 	hold_downloads "$THROTTLE"
@@ -1731,23 +1734,29 @@ leg_rc2() {
 		leg b.1 no "the worker never reported Downloading"
 		return 1
 	fi
-	first="$(fetches_of "$TAG_RC2")"
+	if ! wait_archive "$TAG_RC2" 200; then
+		leg b.1 no "the index served the worker no archive within ${READY_TIMEOUT}s"
+		return 1
+	fi
+	first="$(archive_answers "$TAG_RC2" 200)"
 	# A restart outlasts STEP_TIMEOUT on a loaded Mac: it stops every Pod first.
 	bounded "$INSTALL_TIMEOUT" rsh_raw "$WORKER" "$(quoted sudo "$K3SM_BIN" restart --reason b1240-bounce)" </dev/null >>"$RUNLOG" 2>&1 || log "note: the worker's restart exited non-zero"
-	# The fetch count is what a resume shows: its daemon starts the download over.
+	# A second 200 is what a resume shows, its daemon starting the download over, unless the
+	# server has moved: that GET would be the server's own.
 	deadline=$((SECONDS + READY_TIMEOUT))
 	second="$first"
 	while [ "$SECONDS" -lt "$deadline" ]; do
-		second="$(fetches_of "$TAG_RC2")"
+		second="$(archive_answers "$TAG_RC2" 200)"
 		[ "${second:-0}" -gt "${first:-0}" ] && break
 		read_status || true
 		sleep "$POLL"
 	done
 	read_status || ST='{}'
-	if [ "${second:-0}" -gt "${first:-0}" ] && [ "$(st 'd.get("finished",False)')" != True ]; then
-		leg b.1 ok "archive fetches $first then $second; the roll held"
+	server_phase="$(st 'node("'"$SERVER_NODE"'").get("phase","")')"
+	if [ "${second:-0}" -gt "${first:-0}" ] && [ "$server_phase" = Pending ] && [ "$(st 'd.get("finished",False)')" != True ]; then
+		leg b.1 ok "archives served $first then $second, the server still Pending; the roll held"
 	else
-		leg b.1 no "archive fetches $first then $second; the roll is '$(st 'd.get("phase","")')'"
+		leg b.1 no "archives served $first then $second; the server '$server_phase'; the roll is '$(st 'd.get("phase","")')'"
 	fi
 	if bounded "$INSTALL_TIMEOUT" rsh_raw "$SERVER" "$(quoted sudo "$K3SM_BIN" restart --reason b1240-bounce)" </dev/null >>"$RUNLOG" 2>&1; then
 		leg b.2 ok "the server restarted while the worker was mid-update; the roll goes on below"
