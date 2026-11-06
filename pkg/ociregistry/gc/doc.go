@@ -63,7 +63,10 @@ limitations under the License.
 // existed, even into the same directory, gets a new id and so a report-only
 // sweep again; a backup or copy that carries the id file is the same store. A
 // restore merged over a live root keeps the id and is not told apart from a
-// push, in the repositories the marker names (see markerRecord). A sweep that
+// push, in the repositories the marker names (see markerRecord), unless it
+// leaves index.json fewer rows than the store recorded writing it: any sweep of
+// such a repository stops with ErrRowsLost, before it plans, until the rows are
+// restored or the record is removed (see store.Locked.CheckRows). A sweep that
 // would delete more than half of a repository's blobs stops with ErrMassDelete.
 // While a row stays, only the blobs the rows describe count, on both sides of the
 // half: each row's manifest and every digest in a manifest body the sweep read.

@@ -112,7 +112,7 @@ func FuzzHandlers(f *testing.F) {
 // one of: a directory in dirs, the store root and state directory, a
 // directory whose path below root is a repository name (or a name's parent),
 // a repository's oci-layout, index.json, blobs/<algorithm>/<hex> and
-// .uploads/<id>, and the state directory's locks/<hex>.
+// .uploads/<id>, and the state directory's locks/<hex> and rows/<hex>.
 func strayEntries(t *testing.T, base string, dirs map[string]bool, root, state string) []string {
 	t.Helper()
 	var bad []string
@@ -155,7 +155,8 @@ func storeEntry(p string, isDir bool, root, state string) bool {
 	}
 	if rel, err := filepath.Rel(state, p); err == nil && !strings.HasPrefix(rel, "..") {
 		e := strings.Split(rel, string(filepath.Separator))
-		return (len(e) == 1 && e[0] == "locks" && isDir) || (len(e) == 2 && e[0] == "locks" && !isDir && hex(e[1]))
+		stateDir := e[0] == "locks" || e[0] == "rows"
+		return (len(e) == 1 && stateDir && isDir) || (len(e) == 2 && stateDir && !isDir && hex(e[1]))
 	}
 	rel, err := filepath.Rel(root, p)
 	if err != nil || strings.HasPrefix(rel, "..") {

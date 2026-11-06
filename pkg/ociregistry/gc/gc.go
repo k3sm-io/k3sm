@@ -63,6 +63,11 @@ var (
 	// ErrChanged is a repository sweep skipped because the repository's
 	// index or manifests changed between every read and the lock.
 	ErrChanged = errors.New("gc: repository kept changing during the sweep")
+	// ErrRowsLost is a repository sweep stopped because index.json holds
+	// fewer rows than the store recorded writing (store.ErrRowsLost): rows
+	// were dropped behind the store's back, and the blobs they named would
+	// look unused. It is a brake, reported in Stopped, and not retried.
+	ErrRowsLost = store.ErrRowsLost
 )
 
 // errStale is a locked pass that found the index or a manifest it read
@@ -275,7 +280,7 @@ func (c *Collector) Sweep(ctx context.Context) (Report, error) {
 			rep.Objects = append(rep.Objects, objs...)
 		}
 		if err != nil {
-			if errors.Is(err, ErrMassDelete) {
+			if errors.Is(err, ErrMassDelete) || errors.Is(err, ErrRowsLost) {
 				rep.Stopped = append(rep.Stopped, name)
 			} else {
 				rep.Failed = append(rep.Failed, name)
@@ -305,6 +310,9 @@ func (c *Collector) Sweep(ctx context.Context) (Report, error) {
 // and the repository is marked again, up to maxPlans times.
 func (c *Collector) sweepRepo(ctx context.Context, n ref.Name, reportOnly bool) ([]Object, error) {
 	for range maxPlans {
+		if err := c.checkRows(ctx, n); err != nil {
+			return nil, err
+		}
 		m, err := c.mark(ctx, n, c.now().Add(-c.grace))
 		if err != nil {
 			return nil, err
@@ -335,6 +343,22 @@ func (c *Collector) sweepRepo(ctx context.Context, n ref.Name, reportOnly bool) 
 	return nil, fmt.Errorf("%w: planned %d times", ErrChanged, maxPlans)
 }
 
+// checkRows stops n's sweep, before anything is planned, when index.json
+// holds fewer rows than the store recorded (see store.Locked.CheckRows). The
+// check takes the repository lock, since a push writes the index and the
+// record in two steps.
+func (c *Collector) checkRows(ctx context.Context, n ref.Name) error {
+	return c.rowsChecked(n, c.s.WithLock(ctx, n, func(l *store.Locked) error { return l.CheckRows() }))
+}
+
+// rowsChecked logs a check's ErrRowsLost and returns err.
+func (c *Collector) rowsChecked(n ref.Name, err error) error {
+	if errors.Is(err, ErrRowsLost) {
+		c.log.Error("registry gc: sweep stopped", "repository", n.String(), "reason", "index.json lost rows", "err", err)
+	}
+	return err
+}
+
 // sweepLocked is the locked pass over m. It returns errStale, having deleted
 // nothing, when index.json's rows differ from the mark's or a manifest the
 // plan follows is not the one the mark read.
@@ -356,6 +380,11 @@ func (c *Collector) sweepLocked(ctx context.Context, n ref.Name, m marked) ([]Ob
 		}
 		if got != want {
 			return errStale
+		}
+		// Again under the lock that deletes: rows dropped after the check
+		// above and before the mark leave the index the mark read unchanged.
+		if err := c.rowsChecked(n, l.CheckRows()); err != nil {
+			return err
 		}
 		cont, err := l.Contents()
 		if err != nil {
@@ -1266,8 +1295,9 @@ func planError(what string, err error) error {
 // store, and its sweeps delete in the repositories the state directory's
 // marker names; deleting there is what they would have done before the backup.
 //
-// A restore merged over a live root keeps the id, and the collector cannot tell
-// a restored index.json from a push: a fingerprint of the rows taken at review
+// A restore merged over a live root keeps the id, and apart from one that
+// leaves index.json fewer rows than the store recorded (ErrRowsLost), the
+// collector cannot tell a restored index.json from a push: a fingerprint of the rows taken at review
 // goes stale with the next push, and one that forced a report-only sweep would
 // let a pusher hold the repository there by pushing once per sweep. So a merged
 // repository the marker does not name reports first, one it names is swept, and

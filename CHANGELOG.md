@@ -210,6 +210,12 @@ pin, its date, and the tarball's sha256.
   keeps its blobs as before. When a tag moves, the old image's signatures are reaped with it after the grace,
   and a referrer pushed before its subject, as when an image is signed and then copied, is protected only by
   the grace period: push the subject within it.
+- Registry garbage collection stops a repository's sweep, and deletes nothing in it, when its `index.json`
+  holds fewer rows than the registry last wrote, as after a rolled-back or hand-edited `index.json` or a
+  backup merged over a live registry. Before, the images whose rows went were deleted at the next sweep.
+  The registry records each repository's row count under `<work-dir>/registry-state/rows/`, and the
+  sweep's log line names the record to remove once the index is as it should be. A registry from an
+  earlier build records its counts at the first sweep and is never stopped by a missing record.
 - A push to the registry that would take a repository's `index.json` past 64 MiB, the most the registry
   reads, now fails and changes nothing. With very many tags such a push used to succeed and leave the
   repository unreadable, its tags undeletable included. The refused push answers `403 DENIED` saying the

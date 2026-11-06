@@ -293,8 +293,9 @@ func (l *Locked) SetRows(rows []ispec.Descriptor) error {
 	if err != nil {
 		return err
 	}
+	prev := len(idx.Manifests)
 	idx.Manifests = rows
-	return l.s.writeIndex(l.dir, idx)
+	return l.s.writeIndex(l.dir, idx, prev)
 }
 
 // StatBlob re-states blob d.
@@ -478,6 +479,11 @@ func (l *Locked) RemoveLayout(idleBefore time.Time) (bool, error) {
 			}
 		}
 	}
+	// The record goes after index.json: a layout recreated over a record left
+	// by a crash here starts its count again (writeIndex, prev -1).
+	if err := l.s.removeRowCount(l.dir); err != nil {
+		return false, err
+	}
 	dirs := []string{filepath.Join(l.dir, uploadsDir), filepath.Join(l.dir, tempsDir)}
 	for _, a := range algs {
 		dirs = append(dirs, filepath.Join(l.dir, blobsDir, a.Name()))
@@ -613,6 +619,9 @@ func (s *Store) reapHalfRemoved(ctx context.Context, n ref.Name) (bool, error) {
 		if err := os.Remove(d); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return false, err
 		}
+	}
+	if err := s.removeRowCount(dir); err != nil {
+		return false, err
 	}
 	return true, syncDir(dir)
 }

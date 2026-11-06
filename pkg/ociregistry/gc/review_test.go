@@ -282,10 +282,12 @@ func TestSweepCountsOnlyWhatItReaped(t *testing.T) {
 	}
 }
 
-// TestMergeRestoreFollowsTheDocumentedRule pins what docs/user/registry.md says about a restore merged over a live root, which keeps its store id. The
-// collector cannot tell a restored index.json from a push. A repository the
-// reviewed set does not hold still reports first, but one it holds deletes what
-// the restored rows no longer name, unless the id file went first.
+// TestMergeRestoreFollowsTheDocumentedRule pins what a sweep does after a restore
+// merged over a live root, which keeps its store id. A repository the reviewed
+// set does not hold reports first. In one it holds, a restored index.json with
+// fewer rows than the store recorded stops the sweep (ErrRowsLost), so what the
+// restored rows no longer name is kept; removing the id file first makes the
+// sweep report instead.
 func TestMergeRestoreFollowsTheDocumentedRule(t *testing.T) {
 	// setup reviews app with a tag v1, takes a snapshot of app, pushes a tag v2,
 	// and merges the snapshot back over the live root.
@@ -329,11 +331,14 @@ func TestMergeRestoreFollowsTheDocumentedRule(t *testing.T) {
 			t.Fatalf("sweep after the merge: %+v, want merged reported on and its orphan kept", rep)
 		}
 	})
-	t.Run("a merge over a reviewed repository is the documented limit", func(t *testing.T) {
+	t.Run("a merge that drops rows of a reviewed repository stops its sweep", func(t *testing.T) {
 		e, c, later := setup(t)
-		e.sweep(t, c)
-		if e.has(name(t, "app"), later.manifest.Digest) {
-			t.Fatal("the sweep kept what the restored rows do not name; update the guide")
+		rep, err := c.Sweep(e.ctx)
+		if !errors.Is(err, ErrRowsLost) || !slices.Equal(rep.Stopped, []string{"app"}) {
+			t.Fatalf("sweep: %+v, %v; want ErrRowsLost for app", rep, err)
+		}
+		if !e.hasAll(name(t, "app"), later.blobs()) {
+			t.Fatal("the sweep reaped what the restored rows dropped")
 		}
 	})
 	t.Run("removing the id file first makes the sweep report", func(t *testing.T) {
