@@ -355,7 +355,10 @@ func ReadLogsWith(ctx context.Context, path string, open Opener, opts *Options, 
 					defer func() { _ = watcher.Close() }()
 					// The DIRECTORY, not the file: a rotation replaces the file,
 					// and a watch on the old inode would go deaf.
-					if err := watcher.Add(dir); err != nil {
+					// A pod's delete can remove the tree while this read holds the
+					// file open. There is nothing left to watch, and logForceCheckPeriod
+					// still asks isRunning when the read is over.
+					if err := watcher.Add(dir); err != nil && !errors.Is(err, fs.ErrNotExist) {
 						return fmt.Errorf("failed to watch directory %q: %w", dir, err)
 					}
 					// Re-read immediately: anything written between the EOF above
