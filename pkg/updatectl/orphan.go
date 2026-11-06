@@ -125,18 +125,19 @@ func (c *Controller) releaseOrphan(ctx context.Context, n *corev1.Node, keys []s
 	if _, err := c.patchNode(ctx, n.Name, patch); err != nil {
 		return err
 	}
-	cordon := "the node was not cordoned"
-	switch {
-	case uncordon:
-		cordon = "its cordon was lifted"
-	case n.Spec.Unschedulable:
-		cordon = "its cordon is not the update controller's and stays"
+	still := n.Spec.Unschedulable && !uncordon
+	if !uncordon {
+		// Nothing was held: the roll's leftovers went, which is bookkeeping.
+		c.log.Debug("update controller: cleared update annotations no Update accounts for",
+			"node", n.Name, "cleared", keys, "still_cordoned", still)
+		return nil
 	}
-	c.log.Info("update controller: no Update accounts for this node's update annotations; released it",
-		"node", n.Name, "cleared", keys, "uncordoned", uncordon, "still_cordoned", n.Spec.Unschedulable && !uncordon)
+	c.log.Info("update controller: a finished or deleted Update had held this node; lifted its cordon",
+		"node", n.Name, "cleared", keys)
 	if c.cfg.Recorder != nil {
 		c.cfg.Recorder.Eventf(&corev1.ObjectReference{APIVersion: "v1", Kind: "Node", Name: n.Name, UID: n.UID},
-			corev1.EventTypeNormal, ReasonOrphanReleased, "no Update accounts for its update annotations: cleared them; %s", cordon)
+			corev1.EventTypeNormal, ReasonOrphanReleased,
+			"node %s was held by an update that has finished or been deleted; its cordon was lifted", n.Name)
 	}
 	return nil
 }

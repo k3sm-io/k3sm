@@ -206,7 +206,7 @@ pin, its date, and the tarball's sha256.
   gone when the server starts, left the node `SchedulingDisabled` with its `k3sm.io/update-*` annotations.
   The update controller now clears those annotations when no `Update` accounts for them, and lifts the cordon
   only where it made the cordon: a node you cordoned yourself stays cordoned. It records an
-  `UpdateOrphanReleased` Event on the Node. A live roll is not touched, and a failed roll keeps its node as it
+  `UpdateOrphanReleased` Event on the Node when it lifts a cordon, and none when there was none to lift. A live roll is not touched, and a failed roll keeps its node as it
   was until `k3sm update abort` or a delete of the `Update`. A node that finished a roll keeps
   `k3sm.io/update-version`, `-payload` and `-phase` only while its `Update` stands, and no longer keeps the
   signature and signer certificate. No RBAC changes.

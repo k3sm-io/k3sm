@@ -184,6 +184,56 @@ func TestDeletedUpdateReleasesTheNode(t *testing.T) {
 	})
 }
 
+// drainEvents is the Events the recorder holds, emptied.
+func (r *rig) drainEvents() []string {
+	var out []string
+	for {
+		select {
+		case e := <-r.recorder.Events:
+			out = append(out, e)
+		default:
+			return out
+		}
+	}
+}
+
+// Clearing the leftovers of a finished Update from a node with no cordon to lift
+// is bookkeeping: no Event. Lifting a cordon is worth one, naming the node.
+func TestReplacingAFinishedUpdateRaisesNoOrphanEvent(t *testing.T) {
+	r := newRig(t, threeNodes()...)
+	r.createUpdate(updatesv1alpha1.UpdateName, updatesv1alpha1.UpdateSpec{Version: target})
+	c := r.controller()
+	r.drive(c, nil)
+	r.pass(c)
+	r.drainEvents()
+
+	r.deleteUpdate(updatesv1alpha1.UpdateName)
+	r.pass(c)
+
+	for _, name := range []string{"w1", "w2", serverName} {
+		wantReleased(t, r, name, false)
+	}
+	for _, e := range r.drainEvents() {
+		if strings.Contains(e, ReasonOrphanReleased) {
+			t.Errorf("an uncordoned node raised %q", e)
+		}
+	}
+
+	f, fc := failedRoll(t, threeNodes()...)
+	f.drainEvents()
+	f.deleteUpdate(updatesv1alpha1.UpdateName)
+	f.pass(fc)
+	var got []string
+	for _, e := range f.drainEvents() {
+		if strings.Contains(e, ReasonOrphanReleased) {
+			got = append(got, e)
+		}
+	}
+	if len(got) != 1 || !strings.Contains(got[0], "Normal") || !strings.Contains(got[0], "w1") || !strings.Contains(got[0], "cordon was lifted") {
+		t.Errorf("lifting w1's cordon raised %q, want one Normal Event naming w1", got)
+	}
+}
+
 // A roll that has started owns its nodes, whatever its entries read: the entry
 // of a node handed over just before a restart can still read Pending.
 func TestLiveUpdateKeepsItsHandover(t *testing.T) {
