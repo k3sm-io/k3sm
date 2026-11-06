@@ -620,13 +620,15 @@ Nothing is deleted in any of these cases. Each shows on every sweep in the
   unreadable, which refuses it the same way. On a fault that persists, fix the permissions or the
   disk under `<work-dir>/registry`, or delete the digest; if the digest delete is refused too,
   repair the other index's file first. An index's child that has no row of its
-  own stops the sweep the same way only when it is over the 4 MiB manifest limit or its bytes do
-  not hash to its digest: delete the index that names it. Any other blob named as a child does not
-  stop the sweep. It is kept, along with every digest its JSON contains, and the sweep follows each
-  of those digests the repository holds a blob for. A manifest found this way keeps what it names,
-  as any manifest does, and if it is an index, a child of its own over the limit or failing its hash
-  stops the sweep too. A blob the strict read refuses is searched for digests in the same way. A
-  blob over the limit or failing its hash is kept and stops nothing. A sweep reads each blob at most
+  own stops the sweep the same way only when its bytes do not hash to its digest: delete the index
+  that names it. A child with no row over the 4 MiB manifest limit is no manifest the registry would
+  store or serve, so it is kept as a blob, is not read, and stops nothing, whatever media type the
+  index gives it. Any other blob named as a child does not stop the sweep either. It is kept, along
+  with every digest its JSON contains, and the sweep follows each of those digests the repository
+  holds a blob for. A manifest found this way keeps what it names, as any manifest does, and if it
+  is an index, a child of its own failing its hash stops the sweep too. A blob the strict read
+  refuses is searched for digests in the same way. A blob found this way that is over the limit or
+  fails its hash is kept and stops nothing. A sweep reads each blob at most
   once per pass over a repository, and at most 4 MiB of it, so the extra reading is bounded by the
   number of blobs the repository holds, and the memory by the digests those blobs name, each held
   once however often a body repeats it. A cancelled sweep stops before its next read.
