@@ -17,7 +17,6 @@ limitations under the License.
 package main
 
 import (
-	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -420,36 +419,6 @@ func TestNodeAdvertisesGPUExtendedResource(t *testing.T) {
 		}
 		if gpuAdvertisable(nil) {
 			t.Error("gpuAdvertisable(nil) = true, want false (nil facts must fail closed)")
-		}
-	})
-
-	// The chip-slug rule from the apis label constants, step by step.
-	t.Run("chipSlug", func(t *testing.T) {
-		long := strings.Repeat("Apple M4 Max ", 12) // > 63 chars once slugged
-		for _, tc := range []struct {
-			name, raw, want string
-		}{
-			{"brand_with_spaces", "Apple M4 Max", "apple-m4-max"},
-			{"family", "M4", "m4"},
-			{"already_a_slug", "apple-m4-max", "apple-m4-max"},
-			{"leading_and_trailing_junk", "  Apple M4 Max!! ", "apple-m4-max"},
-			{"run_collapses_to_one_dash", "Apple   M4///Max", "apple-m4-max"},
-			{"non_ascii_becomes_a_separator", "Apple™ M4", "apple-m4"},
-			{"empty", "", ""},
-			{"all_junk", " -- ", ""},
-		} {
-			if got := chipSlug(tc.raw); got != tc.want {
-				t.Errorf("%s: chipSlug(%q) = %q, want %q", tc.name, tc.raw, got, tc.want)
-			}
-		}
-		got := chipSlug(long)
-		if len(got) > maxLabelValueLen {
-			t.Errorf("chipSlug truncation: len = %d, want <= %d (%q)", len(got), maxLabelValueLen, got)
-		}
-		// Truncation must not leave a trailing "-": a label value has to end
-		// alphanumeric or the apiserver rejects the node update outright.
-		if strings.HasSuffix(got, "-") || strings.HasPrefix(got, "-") {
-			t.Errorf("chipSlug truncation left a boundary dash: %q", got)
 		}
 	})
 

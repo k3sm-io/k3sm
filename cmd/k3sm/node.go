@@ -2219,8 +2219,8 @@ func configureNode(n *corev1.Node, name, ip, listen string, caps provider.NodeCa
 		"reserve_bytes", reserve,
 		"allocatable_mem_bytes", n.Status.Allocatable.Memory().Value(),
 		"reserve_term", reserveTerm)
-	// GPU advertisement: the mlx.k3sm.io/gpu extended resource in Capacity AND
-	// Allocatable plus the mlx.k3sm.io chip/memory labels, fail-closed off runtimed's
+	// GPU advertisement: the mlx.k3sm.io/gpu and k3sm.io/gpu extended resources in
+	// Capacity AND Allocatable plus their chip/memory labels, fail-closed off runtimed's
 	// GPUFacts and REMOVED on capability loss (see applyGPUAdvertisement). It runs
 	// AFTER both resource lists are built, deliberately: nodeAllocatable DeepCopies
 	// Capacity, so advertising earlier would have the GPU reach Allocatable by copy
