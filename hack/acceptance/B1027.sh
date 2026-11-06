@@ -1013,8 +1013,15 @@ s_c3() {
 		why "registry login into the run's own DOCKER_CONFIG"
 		return 1
 	}
-	bounded "$INSTALL_TIMEOUT" rsh_raw "$SERVER" "$(quoted /usr/bin/env "DOCKER_CONFIG=$SERVER_WORK/docker" "$K3SM_BIN" builder buildx build --push -t "$BUILDX_HOST/$P/buildx:v1" "$SERVER_WORK/ctx-v1")" >"$EVIDENCE/c.3-buildx.txt" 2>&1 || {
-		why "buildx push to $BUILDX_HOST (c.3-buildx.txt)"
+	# A raw buildx build hands its OCI layout to `k3sm image push`, the path the
+	# builder guide gives: the engine's loopback is not this Mac's, so a
+	# `buildx --push` to the loopback gate cannot reach it.
+	bounded "$INSTALL_TIMEOUT" rsh_raw "$SERVER" "$(quoted "$K3SM_BIN" builder buildx build -o "type=oci,dest=$SERVER_WORK/buildx-v1,tar=false" "$SERVER_WORK/ctx-v1")" >"$EVIDENCE/c.3-buildx.txt" 2>&1 || {
+		why "buildx build to an OCI layout (c.3-buildx.txt)"
+		return 1
+	}
+	ki push "$SERVER_WORK/buildx-v1" "$BUILDX_HOST/$P/buildx:v1" >"$EVIDENCE/c.3-buildx-push.txt" 2>&1 || {
+		why "image push of the buildx layout to $BUILDX_HOST (c.3-buildx-push.txt)"
 		return 1
 	}
 	ls_pairs c.3-ls || return 1
@@ -1645,6 +1652,15 @@ builder)
 	case "$verb2" in
 	status) echo "State: Running"; exit 0 ;;
 	up | down) echo "builder $verb2" >>"$S/calls"; exit 0 ;;
+	esac
+	case "$out" in *dest=*)
+		dest="${out#*dest=}" dest="${dest%%,*}"
+		mkdir -p "$dest/blobs/sha256"
+		d="sha256:$(printf '%s' "$(cat "${pos[1]}/Dockerfile")" | shasum -a 256 | cut -d' ' -f1)"
+		echo "{\"manifests\":[{\"digest\":\"$d\"}]}" >"$dest/index.json"
+		: >"$dest/blobs/sha256/${d#sha256:}"
+		exit 0
+		;;
 	esac
 	d="sha256:$(printf '%s' "$tag$(cat "${pos[1]}/Dockerfile")" | shasum -a 256 | cut -d' ' -f1)"
 	settag "${tag#*/}" "$d"
