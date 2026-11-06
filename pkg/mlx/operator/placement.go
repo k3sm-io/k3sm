@@ -331,9 +331,9 @@ func hasGPU(node *corev1.Node) bool {
 
 // gpuSlotFree reports whether one more rank's GPU slot fits on node beside the
 // held units. This is the scheduler's extended-resource rule over slot units:
-// the node's allocatable mlx.k3sm.io/gpu count (what mlx.GPUSlots advertised)
+// the node's allocatable mlx.k3sm.io/gpu count (what gpucapacity.GPUSlots advertised)
 // minus the slots already requested on it. A node advertising no slot is never
-// free. The provider's byte-level admission (mlx.GPUFits) still runs later and
+// free. The provider's byte-level admission (gpucapacity.GPUFits) still runs later and
 // is not mirrored here.
 func gpuSlotFree(node *corev1.Node, held int64) bool {
 	slots := node.Status.Allocatable[corev1.ResourceName(mlxv1alpha1.ResourceGPU)]
