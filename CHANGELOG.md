@@ -173,6 +173,12 @@ pin, its date, and the tarball's sha256.
   and a name that resolved differently the second time could reach an internal address. Send media
   inline as base64 `data:` URLs. The fix is in the `mlx-serve` entrypoint, so it ships with the next
   image tag: an already published tag does not have it.
+- A single-node `MLXModel` no longer downloads and loads a model a request names. `/v1/audio/transcriptions`
+  and `/v1/audio/speech` answer HTTP 400, and `/v1/embeddings` answers HTTP 400 unless an operator pins
+  a model with `--embedding-model` in `spec.runtime.args`. A media `data:` URL must now be
+  `data:image/`, `data:video/` or `data:audio/`. Both fixes are in the `mlx-serve` entrypoint, so they
+  ship with the next image tag. The docs now state that the serving port has no API key and who can
+  reach it. [MLX quickstart](docs/user/mlx-quickstart.md#things-to-know) has the details.
 - The sandbox's explicit denies now follow the CA keys, the datastore and the node password on a node
   started with a non-default `--pod-root`, naming the `server` and `agent` directories at the data
   root. Such a node recreates its pods once on upgrade, and refuses to start, naming the path, when

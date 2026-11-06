@@ -80,6 +80,32 @@ rebinding-shaped name and a `data:` pass for each kind, against fixtures carryin
 the functions verbatim and, on a staged tree, on the real routes with name lookups
 and requests recorded.
 
+**A request cannot load another model.** vllm-mlx 0.5.0's `/v1/embeddings`,
+`/v1/audio/transcriptions` and `/v1/audio/speech` resolve a model named in the
+request against fixed lists in `endpoint_model_policies.py`, and download and load
+a listed model that is not loaded, beside the served one. `k3sm_serve` replaces
+those three resolvers, after checking each one's signature and normalized body
+hash (`MODEL_ROUTE_HOOKS`); the process exits naming the hook if one moved.
+
+- `/v1/embeddings` answers HTTP 400 until an operator pins a model with
+  `--embedding-model <repo>` in `spec.runtime.args`. The engine then loads that
+  model at start and locks the route to its name. k3sm does not render the option
+  itself: `spec.model` is the only model it could name, and the option loads
+  through `mlx-embeddings` before the server starts, so a chat architecture
+  `mlx-embeddings` does not know exits the pod and one it does know takes a second
+  copy of the weights. A pinned model is not counted in the `memory` a pod is sized
+  for, and it downloads into the cache volume at start, so a pod that pins one
+  needs room for both.
+- `/v1/audio/transcriptions` and `/v1/audio/speech` answer HTTP 400. The engine has
+  no option that pins a model for them, so there is nothing to allow. A multipart
+  upload to the transcription route is read by the HTTP framework before the
+  refusal.
+- `/v1/rerank` already answers 404 unless `--rerank-model` was given.
+
+`selftest.sh --case serve.model.routes` runs the check alone, against fixtures
+carrying the resolvers verbatim and, on a staged tree, on the real routes with
+the loaders recorded.
+
 `k3sm_serve` also patches the prefill mask of mlx-lm's `RotatingKVCache`. The
 cache keeps its first four tokens as attention sinks, but mlx-lm (0.32.0 and 0.32.2) builds
 the multi-token mask as a plain sliding window, so after a chunked prefill
@@ -370,6 +396,7 @@ display-only and the next push moves it.
 ```sh
 hack/images/mlx-serve/selftest.sh
 hack/images/mlx-serve/selftest.sh --case serve.image.remote   # one check alone
+hack/images/mlx-serve/selftest.sh --case serve.model.routes   # one check alone
 ```
 
 Runs in seconds on any Mac and needs neither uv nor a `k3sm` binary: it checks

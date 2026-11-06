@@ -37,6 +37,10 @@
 #   * k3sm-serve refuses every media URL that is not a data: URL before a name is
 #     resolved, and refuses to start when the function it replaces has moved,
 #     against fakes and, with a staged tree, on the real vllm-mlx routes;
+#   * k3sm-serve refuses a media data: URL that is not image, video or audio, and
+#     the routes that would load an embedding, speech-to-text or text-to-speech
+#     model a request names, against fakes and, with a staged tree, on the real
+#     routes;
 #   * k3sm-serve lowers --max-kv-size for a model whose config.json geometry
 #     costs more KV bytes per token than k3sm sized it for, and leaves it alone
 #     for a smaller model, a missing config, a missing field and the off switch;
@@ -61,6 +65,9 @@
 #   --case serve.image.remote runs only that case: k3sm_serve's refusal of remote
 #   image, video and audio URLs, on fakes and, when a staged tree is present, on
 #   the real engine.
+#   --case serve.model.routes runs only that case: k3sm_serve's refusal of the
+#   embedding and audio model routes, on fakes and, when a staged tree is present,
+#   on the real engine.
 #   Any other argument is refused with exit 2.
 # Exit: 0 all checks pass, 1 otherwise, 2 on a usage error.
 set -uo pipefail
@@ -91,9 +98,9 @@ while [ $# -gt 0 ]; do
 	shift
 done
 case "$CASE" in
-	""|serve.image.remote) ;;
+	""|serve.image.remote|serve.model.routes) ;;
 	*)
-		echo "selftest: unknown case '$CASE' (only serve.image.remote)" >&2
+		echo "selftest: unknown case '$CASE' (only serve.image.remote or serve.model.routes)" >&2
 		exit 2 ;;
 esac
 
@@ -919,6 +926,334 @@ PY
 	fi
 }
 
+# rung_serve_model_routes is the case serve.model.routes: k3sm_serve refuses the
+# routes that would load a model a request names. First against fixtures carrying
+# vllm-mlx 0.5.0's endpoint_model_policies verbatim, so the pins are checked on any
+# Mac; then, on a staged tree, on the real HTTP app with the engines' constructors
+# and the embedding loader replaced by recorders, so nothing is downloaded. The
+# real leg first proves the stock routes do reach a load, so the refusals cannot
+# pass vacuously. With --staged a missing tree is a failure, not a skip.
+rung_serve_model_routes() {
+	cat > "$WORK/serve-routes.py" <<'PY'
+import sys, types
+sys.path.insert(0, sys.argv[1])
+import k3sm_serve as ks
+
+def check(name, cond):
+    print(("ok " if cond else "no ") + name, flush=True)
+
+class HTTPException(Exception):
+    def __init__(self, status_code, detail=None):
+        super().__init__(detail)
+        self.status_code, self.detail = status_code, detail
+
+_EMBEDDING_MODELS = frozenset(
+    {
+        "mlx-community/ModernBERT-base-mlx",
+        "mlx-community/all-MiniLM-L6-v2-4bit",
+        "mlx-community/bert-base-uncased-mlx",
+        "mlx-community/bge-large-en-v1.5-4bit",
+        "mlx-community/embeddinggemma-300m-6bit",
+        "mlx-community/multilingual-e5-large-mlx",
+        "mlx-community/multilingual-e5-small-mlx",
+    }
+)
+
+_STT_MODEL_ALIASES = {
+    "whisper-large-v3": "mlx-community/whisper-large-v3-mlx",
+    "whisper-large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
+    "whisper-medium": "mlx-community/whisper-medium-mlx",
+    "whisper-small": "mlx-community/whisper-small-mlx",
+    "parakeet": "mlx-community/parakeet-tdt-0.6b-v2",
+    "parakeet-v3": "mlx-community/parakeet-tdt-0.6b-v3",
+}
+
+_TTS_MODEL_ALIASES = {
+    "kokoro": "mlx-community/Kokoro-82M-bf16",
+    "kokoro-4bit": "mlx-community/Kokoro-82M-4bit",
+    "chatterbox": "mlx-community/chatterbox-turbo-fp16",
+    "chatterbox-4bit": "mlx-community/chatterbox-turbo-4bit",
+    "vibevoice": "mlx-community/VibeVoice-Realtime-0.5B-4bit",
+    "voxcpm": "mlx-community/VoxCPM1.5",
+}
+
+
+def _with_identity_aliases(model_map: dict[str, str]) -> dict[str, str]:
+    expanded = dict(model_map)
+    for model_name in model_map.values():
+        expanded[model_name] = model_name
+    return expanded
+
+
+_STT_MODEL_MAP = _with_identity_aliases(_STT_MODEL_ALIASES)
+_TTS_MODEL_MAP = _with_identity_aliases(_TTS_MODEL_ALIASES)
+
+
+def _reject_unknown_embedding_model(requested_model: str) -> None:
+    supported = ", ".join(sorted(_EMBEDDING_MODELS))
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"Embedding model '{requested_model}' is not available. "
+            "Request-time embedding model loading is limited to the supported "
+            f"allowlist: {supported}. To use a different embedding model, start "
+            "the server with --embedding-model <model>."
+        ),
+    )
+
+
+def _reject_unknown_audio_model(
+    endpoint: str,
+    requested_model: str,
+    supported_aliases: dict[str, str],
+) -> None:
+    aliases = ", ".join(sorted(supported_aliases))
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"{endpoint} model '{requested_model}' is not available. "
+            f"Supported request models are: {aliases}. Exact configured model IDs "
+            "for those aliases are also accepted."
+        ),
+    )
+
+
+def resolve_embedding_model_name(
+    requested_model: str,
+    *,
+    locked_model: str | None = None,
+) -> str:
+    """Resolve the embedding model for a request or raise HTTP 400."""
+    if locked_model is not None:
+        if requested_model == locked_model:
+            return locked_model
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Embedding model '{requested_model}' is not available. "
+                f"This server was started with --embedding-model {locked_model}. "
+                f"Only '{locked_model}' can be used for embeddings. Restart the "
+                f"server with a different --embedding-model to use '{requested_model}'."
+            ),
+        )
+
+    if requested_model in _EMBEDDING_MODELS:
+        return requested_model
+
+    _reject_unknown_embedding_model(requested_model)
+
+
+def resolve_stt_model_name(requested_model: str) -> str:
+    """Resolve an STT request model alias or configured model ID."""
+    if requested_model in _STT_MODEL_MAP:
+        return _STT_MODEL_MAP[requested_model]
+    _reject_unknown_audio_model("Transcription", requested_model, _STT_MODEL_ALIASES)
+
+
+def resolve_tts_model_name(requested_model: str) -> str:
+    """Resolve a TTS request model alias or configured model ID."""
+    if requested_model in _TTS_MODEL_MAP:
+        return _TTS_MODEL_MAP[requested_model]
+    _reject_unknown_audio_model("Speech", requested_model, _TTS_MODEL_ALIASES)
+
+STOCK = {"resolve_embedding_model_name": resolve_embedding_model_name,
+         "resolve_stt_model_name": resolve_stt_model_name,
+         "resolve_tts_model_name": resolve_tts_model_name}
+def engine():
+    return types.SimpleNamespace(**STOCK)
+
+def answer(func, *a, **kw):
+    try:
+        return "served", func(*a, **kw)
+    except HTTPException as e:
+        return e.status_code, e.detail
+
+for name, stock in STOCK.items():
+    check("pin.%s  the fixture's %s is the body MODEL_ROUTE_HOOKS pins" % (name, name),
+          ks.source_shape(stock) == ks.MODEL_ROUTE_HOOKS[name][1])
+check("stock.embedding  the unguarded engine resolves an allowlisted embedding model to a load",
+      answer(resolve_embedding_model_name, "mlx-community/embeddinggemma-300m-6bit")[0] == "served")
+check("stock.stt  the unguarded engine resolves a speech-to-text alias to a load",
+      answer(resolve_stt_model_name, "whisper-small") == ("served", "mlx-community/whisper-small-mlx"))
+check("stock.tts  the unguarded engine resolves a text-to-speech alias to a load",
+      answer(resolve_tts_model_name, "kokoro") == ("served", "mlx-community/Kokoro-82M-bf16"))
+
+server = engine()
+ks.install_model_route_guard(server, HTTPException)
+check("replaced  all three resolvers are replaced",
+      all(getattr(server, n) is not f for n, f in STOCK.items()))
+
+E = server.resolve_embedding_model_name
+EMBED = "mlx-community/embeddinggemma-300m-6bit"
+check("embedding.allowlisted  with no pin an allowlisted embedding model is refused with HTTP 400",
+      answer(E, EMBED, locked_model=None) == (400, ks.EMBEDDING_REFUSAL))
+check("embedding.unlisted  with no pin an unlisted name is refused the same way",
+      answer(E, "attacker/anything", locked_model=None) == (400, ks.EMBEDDING_REFUSAL))
+check("embedding.pinned  the model an operator pinned with --embedding-model is served",
+      answer(E, "org/operator-pinned", locked_model="org/operator-pinned") == ("served", "org/operator-pinned"))
+status, detail = answer(E, EMBED, locked_model="org/operator-pinned")
+check("embedding.other  with a pin, any other name still gets the engine's own HTTP 400",
+      status == 400 and "org/operator-pinned" in detail)
+for tag, func, names in (("stt", server.resolve_stt_model_name,
+                          ("whisper-small", "mlx-community/whisper-small-mlx", "parakeet", "attacker/anything")),
+                         ("tts", server.resolve_tts_model_name,
+                          ("kokoro", "mlx-community/Kokoro-82M-bf16", "chatterbox", "attacker/anything"))):
+    check("%s.refused  every alias, repository id and unlisted name is refused with HTTP 400" % tag,
+          all(answer(func, n) == (400, ks.AUDIO_REFUSAL) for n in names))
+check("noecho  a refusal does not repeat what the client named",
+      "attacker" not in ks.EMBEDDING_REFUSAL and "attacker" not in ks.AUDIO_REFUSAL
+      and "attacker" not in answer(E, "attacker/anything", locked_model=None)[1])
+
+def moved_body(requested_model, *, locked_model=None):
+    return requested_model
+def moved_audio(requested_model):
+    return requested_model
+def renamed(other):
+    return other
+def moved(hook, how):
+    s = engine()
+    body = moved_body if hook == "resolve_embedding_model_name" else moved_audio
+    stock = {"body": body, "sig": renamed, "gone": None}[how]
+    setattr(s, hook, stock)
+    try:
+        ks.install_model_route_guard(s, HTTPException)
+    except ks.GuardError as e:
+        untouched = all(getattr(s, n) in (STOCK[n], stock) for n in STOCK)
+        return hook in str(e) and untouched
+    return False
+for hook in STOCK:
+    check("failclosed.body.%s  a changed upstream body ends the process naming the hook" % hook, moved(hook, "body"))
+    check("failclosed.signature.%s  another signature ends the process naming the hook" % hook, moved(hook, "sig"))
+    check("failclosed.missing.%s  an engine without the function ends the process naming the hook" % hook,
+          moved(hook, "gone"))
+PY
+	local checks=0 out verdict name
+	out="$(PYTHONDONTWRITEBYTECODE=1 python3 "$WORK/serve-routes.py" "$HERE" 2>"$WORK/serve-routes.err")"
+	while read -r verdict name; do
+		[ -n "$verdict" ] || continue
+		checks=$((checks + 1))
+		case "$verdict" in
+			ok) ladder ok "serve.model.routes.$name" ;;
+			no) ladder no "serve.model.routes.$name" ;;
+			*)  ladder no "serve.model.routes.driver  $verdict $name" ;;
+		esac
+	done <<< "$out"
+	if [ "$checks" -ge 23 ]; then
+		ladder ok "serve.model.routes.count  all $checks fixture checks reported"
+	else
+		ladder no "serve.model.routes.count  only $checks of 23 fixture checks reported (the driver crashed?)"
+		tail -5 "$WORK/serve-routes.err"
+	fi
+
+	if ! { [ -x "$STAGED/bin/python3.12" ] && [ -d "$STAGED/lib/python3.12/site-packages/vllm_mlx" ]; }; then
+		if [ "$STAGED_REQUIRED" = 1 ]; then
+			ladder no "serve.model.routes.real  --staged, but no staged tree with vllm_mlx at $STAGED (run build.sh, or set K3SM_MLX_STAGE)"
+		else
+			ladder skip "serve.model.routes.real  no staged tree at $STAGED (run build.sh, or set K3SM_MLX_STAGE)"
+		fi
+		return
+	fi
+	cat > "$WORK/serve-routes-real.py" <<'PY'
+import logging, sys
+sys.path.insert(0, sys.argv[1])
+logging.disable(logging.WARNING)
+import k3sm_serve as ks
+from fastapi.testclient import TestClient
+from vllm_mlx import server
+from vllm_mlx.audio import stt, tts
+from vllm_mlx.cli import create_parser
+
+def check(name, cond):
+    print(("ok " if cond else "no ") + name, flush=True)
+
+# Every load is recorded and then fails, so nothing is downloaded or run.
+LOADS = []
+def record_embedding(name, *, lock=False, reuse_existing=True):
+    LOADS.append(name)
+    raise RuntimeError("selftest: no load")
+class Recorder:
+    def __init__(self, name):
+        LOADS.append(name)
+        self.model_name = name
+    def load(self):
+        raise RuntimeError("selftest: no load")
+server.load_embedding_model = record_embedding
+stt.STTEngine = Recorder
+tts.TTSEngine = Recorder
+
+client = TestClient(server.app, raise_server_exceptions=False)
+EMBED = "mlx-community/embeddinggemma-300m-6bit"
+def embeddings(model):
+    return client.post("/v1/embeddings", json={"model": model, "input": "hi"})
+def transcribe(model):
+    return client.post("/v1/audio/transcriptions", params={"model": model},
+                       files={"file": ("a.wav", b"RIFF", "audio/wav")})
+def speak(model):
+    return client.post("/v1/audio/speech", params={"model": model, "input": "hi"})
+def loaded(call, model):
+    LOADS.clear()
+    call(model)
+    return list(LOADS)
+
+check("real.stock.embedding  the unguarded route loads an allowlisted model a request names",
+      loaded(embeddings, EMBED) == [EMBED])
+check("real.stock.stt  the unguarded route loads a speech-to-text model a request names",
+      loaded(transcribe, "whisper-small") == ["mlx-community/whisper-small-mlx"])
+check("real.stock.tts  the unguarded route loads a text-to-speech model a request names",
+      loaded(speak, "kokoro") == ["mlx-community/Kokoro-82M-bf16"])
+
+ks.install_on_engine()
+def refused(call, model, text):
+    LOADS.clear()
+    r = call(model)
+    return r.status_code == 400 and text in r.text and LOADS == []
+check("real.embedding.allowlisted  with no pin the route answers 400 and loads nothing",
+      refused(embeddings, EMBED, ks.EMBEDDING_REFUSAL))
+check("real.embedding.unlisted  an unlisted name answers the same 400",
+      refused(embeddings, "attacker/anything", ks.EMBEDDING_REFUSAL))
+check("real.stt.alias  a speech-to-text alias answers 400 and loads nothing",
+      refused(transcribe, "whisper-small", ks.AUDIO_REFUSAL))
+check("real.stt.default  a request naming no model answers 400 and loads nothing",
+      refused(lambda _m: client.post("/v1/audio/transcriptions", files={"file": ("a.wav", b"RIFF", "audio/wav")}),
+              None, ks.AUDIO_REFUSAL))
+check("real.tts.alias  a text-to-speech alias answers 400 and loads nothing",
+      refused(speak, "kokoro", ks.AUDIO_REFUSAL))
+check("real.tts.default  a request naming no model answers 400 and loads nothing",
+      refused(lambda _m: client.post("/v1/audio/speech", params={"input": "hi"}), None, ks.AUDIO_REFUSAL))
+server._embedding_model_locked = "org/operator-pinned"
+check("real.embedding.pinned  the model an operator pinned reaches the loader",
+      loaded(embeddings, "org/operator-pinned") == ["org/operator-pinned"])
+check("real.embedding.other  with a pin, any other name answers the engine's own 400",
+      refused(embeddings, EMBED, "org/operator-pinned"))
+server._embedding_model_locked = None
+args, _ = create_parser().parse_known_args(["serve", "m"])
+check("real.apikey.default  --api-key defaults to none on the pinned engine", args.api_key is None)
+check("real.apikey.open  with no --api-key a request with no credential reaches the route",
+      server._api_key is None and client.get("/v1/models").status_code == 200)
+server._api_key = "selftest-key"
+check("real.apikey.set  with --api-key set a request with no credential answers 401",
+      client.get("/v1/models").status_code == 401)
+server._api_key = None
+PY
+	checks=0
+	out="$(cd "$WORK" && PYTHONDONTWRITEBYTECODE=1 "$STAGED/bin/python3.12" -I -B "$WORK/serve-routes-real.py" "$HERE" 2>"$WORK/serve-routes-real.err")"
+	while read -r verdict name; do
+		[ -n "$verdict" ] || continue
+		checks=$((checks + 1))
+		case "$verdict" in
+			ok) ladder ok "serve.model.routes.$name" ;;
+			no) ladder no "serve.model.routes.$name" ;;
+			*)  ladder no "serve.model.routes.driver  $verdict $name" ;;
+		esac
+	done <<< "$out"
+	if [ "$checks" -ge 14 ]; then
+		ladder ok "serve.model.routes.real.count  all $checks real-engine checks reported"
+	else
+		ladder no "serve.model.routes.real.count  only $checks of 14 real-engine checks reported (the driver crashed?)"
+		tail -15 "$WORK/serve-routes-real.err"
+	fi
+}
+
 # K3SM_MLX_SELFTEST_ONLY=9a is --strict-self-test's child run: the argument
 # parse above, then only the 9a verdict, and the exit code a full run gives it.
 case "${K3SM_MLX_SELFTEST_ONLY:-}" in
@@ -935,7 +1270,10 @@ case "${K3SM_MLX_SELFTEST_ONLY:-}" in
 esac
 
 if [ -n "$CASE" ]; then
-	rung_serve_image_remote
+	case "$CASE" in
+		serve.image.remote) rung_serve_image_remote ;;
+		serve.model.routes) rung_serve_model_routes ;;
+	esac
 	echo "mlx-serve selftest ($CASE only): $PASS passed, $FAIL failed, $SKIP skipped"
 	[ "$FAIL" -eq 0 ] || exit 1
 	exit 0
@@ -2122,6 +2460,9 @@ fi
 
 # ---- serve.image.remote — no media fetch on the single-node path --------------
 rung_serve_image_remote
+
+# ---- serve.model.routes — no model loaded on a request's say-so ---------------
+rung_serve_model_routes
 
 # ---- 9 — the guard on the REAL engine (needs a staged tree) -----------------
 # The seams above are vllm-mlx 0.5.0's own functions; this rung installs the

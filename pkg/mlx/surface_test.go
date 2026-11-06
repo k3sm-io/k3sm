@@ -57,6 +57,7 @@ var measuredSurface = map[string]bool{
 	"--port":                true,
 	"--served-model-name":   true,
 	"--host":                true,
+	"--embedding-model":     true,
 }
 
 // absentFlags are the options the render used to emit and this engine does NOT
@@ -216,6 +217,64 @@ func TestEngineArgsServeTheModelUnderItsSpecName(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestEngineArgsPinEmbeddingModel pins how /v1/embeddings stops lazy-loading. The
+// pinned engine's --embedding-model is the only lock it has on that route, and it
+// loads eagerly: its CLI hands the value to mlx-embeddings before it serves, with
+// nothing catching a failure. spec.model is the only model a render can name, so
+// rendering the flag would exit the pod on a chat architecture mlx-embeddings does
+// not know, and load a second copy of the weights on one it does.
+//
+// So the render leaves the flag out, the image's entrypoint refuses the route while
+// no model is pinned, and an operator who wants embeddings pins one in
+// spec.runtime.args, which the engine locks the route to. The guard's behaviour is
+// checked in hack/images/mlx-serve/selftest.sh; this test holds the three pieces
+// together.
+func TestEngineArgsPinEmbeddingModel(t *testing.T) {
+	const flag = "--embedding-model"
+
+	t.Run("the_render_names_no_embedding_model", func(t *testing.T) {
+		for _, tc := range surfaceCases() {
+			rendered, _ := splitRendered(t, tc.model)
+			if slices.Contains(rendered, flag) {
+				t.Errorf("%s: rendered argv %v carries %s, which loads spec.model through mlx-embeddings at start", tc.name, rendered, flag)
+			}
+		}
+	})
+
+	t.Run("an_operator_pin_reaches_the_engine", func(t *testing.T) {
+		m := newModel()
+		m.Spec.Runtime.Args = []string{flag, "mlx-community/embeddinggemma-300m-6bit"}
+		rendered, caller := splitRendered(t, m)
+		entry := entrypointArgv(t)
+		argv := append(append(slices.Clone(entry[slices.Index(entry, "serve")+1:]), rendered...), caller...)
+		positionals, err := scanEngineArgv(argv)
+		if err != nil {
+			t.Fatalf("composed argv %v: %v", argv, err)
+		}
+		if len(positionals) != 1 {
+			t.Errorf("composed argv %v has positionals %v, want only the model", argv, positionals)
+		}
+		if !reflect.DeepEqual(caller, m.Spec.Runtime.Args) {
+			t.Errorf("trailing args = %v, want the pin %v verbatim and last", caller, m.Spec.Runtime.Args)
+		}
+	})
+
+	t.Run("the_entrypoint_refuses_the_route_while_no_model_is_pinned", func(t *testing.T) {
+		path := filepath.Join("..", "..", "hack", "images", "mlx-serve", "k3sm_serve.py")
+		b, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		install := regexp.MustCompile(`(?ms)^def install_on_engine\(\):\n(.*?)^def `).FindSubmatch(b)
+		if install == nil {
+			t.Fatalf("%s has no install_on_engine; the guard's wiring moved and this test must follow it", path)
+		}
+		if !regexp.MustCompile(`(?m)^\s+install_model_route_guard\(server, HTTPException\)$`).Match(install[1]) {
+			t.Errorf("%s install_on_engine does not call install_model_route_guard(server, HTTPException): /v1/embeddings would load a model a request names", path)
+		}
+	})
 }
 
 // shardSurface is the option set the sharded render owns, measured against the

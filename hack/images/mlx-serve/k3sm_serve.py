@@ -12,7 +12,8 @@ plus completion would not fit the engine's context window is refused with HTTP
 patches the prefill mask of mlx-lm's rotating cache so the cache's attention
 sinks stay attended (see The attention sinks, below). It refuses every image,
 video or audio URL that is not an inline data: URL of that family (see Remote
-media URLs, below).
+media URLs, below), and the routes that would load a model a request names (see
+Model routes, below).
 
 Why the guard exists. vllm-mlx 0.5.0 has no max-model-len option and does no
 prompt-length validation: its only per-sequence bound is --max-kv-size, which
@@ -130,6 +131,25 @@ for it. The originals' signatures and normalized body hashes are checked first,
 and the process exits if any moved. vllm-mlx's modules that import
 process_image_input and process_video_input by name still reach the replacements:
 those functions look the download functions up in their own module when called.
+
+Model routes. vllm-mlx 0.5.0's /v1/embeddings, /v1/audio/transcriptions and
+/v1/audio/speech resolve a model named in the request against fixed lists in its
+endpoint_model_policies, and a listed model that is not loaded is downloaded and
+loaded beside the served one: a client's request spends the pod's egress, cache
+disk and unified memory. install_model_route_guard replaces the three resolvers
+in the server module, which the routes call by that name, after checking the
+signature and normalized body hash of each.
+
+  * /v1/embeddings: while no model is pinned the route answers HTTP 400. An
+    operator pins one with --embedding-model in spec.runtime.args; the engine
+    loads it at start and locks the route to that name, and the engine's own
+    check then applies. k3sm does not render the option: it loads eagerly and
+    exits the pod if the load fails, and the served model is usually not one
+    mlx-embeddings can load.
+  * /v1/audio/transcriptions and /v1/audio/speech: the engine has no option that
+    pins a model, so these answer HTTP 400.
+
+/v1/rerank needs nothing: the engine refuses it unless --rerank-model was given.
 """
 
 import hashlib
@@ -457,6 +477,21 @@ MEDIA_REFUSAL = ("remote media URLs are not fetched by this server; send the med
 # the check has the same case and whitespace behaviour as the engine's.
 MEDIA_DATA_PREFIXES = ("data:image/", "data:video/", "data:audio/")
 
+# The resolvers install_model_route_guard takes over, as vllm-mlx 0.5.0 has them:
+# name -> (parameters, normalized body hash). A bump that changes one must read
+# the new source, then pin the new hash.
+MODEL_ROUTE_HOOKS = {
+    "resolve_embedding_model_name": (("requested_model", "locked_model"),
+                                     "cfe0f9750aca8c6c5cceff700c6323c155f8b0b610054e2a474e4f8ec4577777"),
+    "resolve_stt_model_name": (("requested_model",),
+                               "90aa05f1b9dd0a8317eeeb536fd9463741aabaa2ae2137e08eeaf5149e145ac8"),
+    "resolve_tts_model_name": (("requested_model",),
+                               "92082298ef4b24e08c3ef1681805b7b3cc896fb584ef561bc755ea0d016fde0e"),
+}
+EMBEDDING_REFUSAL = ("this server loads no embedding model on request; start it with --embedding-model in "
+                     "spec.runtime.args to serve embeddings")
+AUDIO_REFUSAL = "this server loads no speech-to-text or text-to-speech model"
+
 
 def source_shape(func):
     """sha256 of func's source with comments, blank lines and layout removed.
@@ -470,7 +505,7 @@ def source_shape(func):
         toks = [t.string for t in tokenize.generate_tokens(io.StringIO(src).readline) if t.type not in skip]
     except (OSError, TypeError, SyntaxError, tokenize.TokenError) as e:
         raise GuardError(f"cannot read the source of {getattr(func, '__name__', func)!s} to check it against the "
-                         f"vllm-mlx 0.5.0 body the media guard was written against: {e}") from None
+                         f"vllm-mlx 0.5.0 body the guard was written against: {e}") from None
     return hashlib.sha256(" ".join(toks).encode()).hexdigest()
 
 
@@ -479,10 +514,10 @@ def _pinned_hook(owner, name, params, sha256):
     func = _seam(owner, name)
     got = tuple(inspect.signature(func).parameters)
     if got != params:
-        raise GuardError(f"{name} takes {got}; the media guard was written against vllm-mlx 0.5.0's {params}")
+        raise GuardError(f"{name} takes {got}; the guard was written against vllm-mlx 0.5.0's {params}")
     shape = source_shape(func)
     if shape != sha256:
-        raise GuardError(f"{name} is not the vllm-mlx 0.5.0 body the media guard takes over (source sha256 {shape}, "
+        raise GuardError(f"{name} is not the vllm-mlx 0.5.0 body the guard takes over (source sha256 {shape}, "
                          f"pinned {sha256}): read the new source, then pin its hash")
     return func
 
@@ -539,6 +574,31 @@ def install_media_guard(server, mllm):
     for name in FETCH_HOOKS:
         setattr(mllm, name, refuse_fetch)
     setattr(server, MEDIA_CHECK_HOOK, check_media_guarded)
+
+
+def install_model_route_guard(server, http_exception):
+    """Refuse the routes that would load a model a request names.
+
+    server is vllm_mlx.server and http_exception is fastapi's HTTPException,
+    parameters so the guard can be exercised against fakes. Nothing is replaced
+    unless every resolver is the pinned one. A refusal does not repeat the name
+    the client sent.
+    """
+    resolvers = {name: _pinned_hook(server, name, params, sha256)
+                 for name, (params, sha256) in MODEL_ROUTE_HOOKS.items()}
+    resolve_embedding = resolvers["resolve_embedding_model_name"]
+
+    def resolve_embedding_guarded(requested_model, *, locked_model=None):
+        if locked_model is None:
+            raise http_exception(status_code=STATUS, detail=EMBEDDING_REFUSAL)
+        return resolve_embedding(requested_model, locked_model=locked_model)
+
+    def refuse_audio(requested_model):
+        raise http_exception(status_code=STATUS, detail=AUDIO_REFUSAL)
+
+    server.resolve_embedding_model_name = resolve_embedding_guarded
+    server.resolve_stt_model_name = refuse_audio
+    server.resolve_tts_model_name = refuse_audio
 
 
 KV_CLAMP_ENV = "K3SM_KV_GEOMETRY_CLAMP"
@@ -845,6 +905,7 @@ def install_on_engine():
     from vllm_mlx.models import mllm
 
     install_media_guard(server, mllm)
+    install_model_route_guard(server, HTTPException)
     return install(server, BatchedEngine, HTTPException, JSONResponse, extract_multimodal_content,
                    convert_tools_for_template)
 
@@ -869,7 +930,7 @@ def main(argv=None):
             return 2
         print("k3sm-serve: context guard on /v1/completions, /v1/chat/completions, /v1/messages and "
               "/v1/responses (window: the engine's --max-kv-size); RotatingKVCache sink mask patched; "
-              "remote media URLs refused",
+              "remote media URLs refused; embedding and audio models not loaded on request",
               file=sys.stderr, flush=True)
     from vllm_mlx import cli
 
