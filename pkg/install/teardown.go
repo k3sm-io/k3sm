@@ -524,20 +524,38 @@ func verifyVMHelper(sys System, cfg Config, rec VMHostRecord, svcUID uint32) (bo
 		ver, _ := layout.New(cfg.InstallDir).VersionedBinary(filepath.Clean(exe), VMHostName)
 		cfg.Logger.Warn("a vm helper runs from a version directory that cannot be resolved, so whether this install retains it is unknown; not signalled",
 			"pod", rec.PodID, "pid", rec.Pgid, "exe", filepath.Clean(exe), "version", ver, "err", rerr)
-		return false, fmt.Errorf("vm helper pid %d (pod %s) runs %q from version %q, whose path cannot be resolved, so whether this install retains it is unknown; not signalled: %w; check that %q and each of its parents are owned by root and not writable by group or others (an I/O error means the disk needs checking); if ps -o pid,command -g %d shows only %q processes, stop it with: sudo kill -TERM -%d",
-			rec.Pgid, rec.PodID, filepath.Clean(exe), ver, rerr, filepath.Dir(filepath.Clean(exe)), rec.Pgid, filepath.Clean(exe), rec.Pgid)
+		return false, fmt.Errorf("vm helper pid %d (pod %s) runs %q from version %q, whose path cannot be resolved, so whether this install retains it is unknown; not signalled: %w; check that %q and each of its parents are owned by root and not writable by group or others (an I/O error means the disk needs checking); %s",
+			rec.Pgid, rec.PodID, filepath.Clean(exe), ver, rerr, filepath.Dir(filepath.Clean(exe)), vmHelperKillHint(rec, exe))
 	case uid != svcUID || !installed:
 		if ver, ok := unretainedVMHost(sys, cfg, exe, []string{exe}); ok && uid == svcUID {
 			cfg.Logger.Warn("a vm helper runs from a version this install no longer retains; not signalled, stop it by hand",
 				"pod", rec.PodID, "pid", rec.Pgid, "exe", filepath.Clean(exe), "version", ver)
-			return false, fmt.Errorf("vm helper pid %d (pod %s) runs %q from version %q, which this install no longer retains; not signalled; if ps -o pid,command -g %d shows only %q processes, stop it with: sudo kill -TERM -%d",
-				rec.Pgid, rec.PodID, filepath.Clean(exe), ver, rec.Pgid, filepath.Clean(exe), rec.Pgid)
+			return false, fmt.Errorf("vm helper pid %d (pod %s) runs %q from version %q, which this install no longer retains; not signalled; %s",
+				rec.Pgid, rec.PodID, filepath.Clean(exe), ver, vmHelperKillHint(rec, exe))
 		}
 		want := cfg.installedVMHost()
 		cfg.Logger.Warn("a vm helper record names a process that is not this install's k3sm-vmhost; not signalled", "pod", rec.PodID, "pgid", rec.Pgid, "exe", exe, "uid", uid)
 		return false, fmt.Errorf("vm helper record for group %d names %s (uid %d), not %s (uid %d); not signalled", rec.Pgid, exe, uid, want, svcUID)
 	}
 	return true, nil
+}
+
+// vmHelperKillHint is the by-hand stop an unsignalled helper's error ends with.
+// ps shows each process's command line, not its executable, so the check is by
+// command line: runtimed starts the helper with argv[0] the helper's path and a
+// "-log-file" argument inside the pod's own run dir, so that run dir's log path
+// names this pod and no other, even when another pod's helper runs the same
+// retained executable. A record with no run dir (written by an earlier runtime)
+// carries no per-pod token, and the hint says so. The code only words the hint;
+// it never signals.
+func vmHelperKillHint(rec VMHostRecord, exe string) string {
+	exe = filepath.Clean(exe)
+	if rec.RunDir == "" {
+		return fmt.Sprintf("this record names no run dir, so no per-pod token is known; stop it by hand only after confirming from the command lines in ps -ww -o pid,command -g %d that the group is pod %s's %s helper", rec.Pgid, rec.PodID, exe)
+	}
+	token := filepath.Join(rec.RunDir, sandbox.VMHostLogName)
+	return fmt.Sprintf("compared by command line: if ps -ww -o pid,command -g %d shows only %s processes whose command line carries %q (pod %s's own -log-file argument), stop it with: sudo kill -TERM -%d",
+		rec.Pgid, exe, token, rec.PodID, rec.Pgid)
 }
 
 // isInstalledVMHost reports whether exe, the executable path the kernel

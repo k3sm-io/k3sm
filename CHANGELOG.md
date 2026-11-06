@@ -138,6 +138,8 @@ pin, its date, and the tarball's sha256.
 - The built-in registry pages a tag list that names no `n`: it answers the first 1,000 tags with a
   `Link` to the next page, as the catalog does, instead of every tag in one response. An explicit
   `n` is unchanged.
+- The by-hand stop hint printed when an uninstall leaves a vm pod's helper running now names that pod's own
+  command-line argument, so a group running the same helper for another pod does not pass the check.
 - `k3sm stop` and `k3sm uninstall` stop a `vm` helper whose path spells its version in a different
   case than the versions directory. It was reported as no longer retained and left running. A
   stray file or symlink named like a version no longer counts as a retained version.
