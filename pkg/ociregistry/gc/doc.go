@@ -70,5 +70,8 @@ limitations under the License.
 // Anything the collector cannot read (a manifest body that is missing, does
 // not parse, or is not an OCI or Docker v2 image manifest, index or manifest
 // list, such as a Docker schema1 manifest or any body with a schema1 fsLayers
-// field) stops that repository's sweep: it never deletes on a guess.
+// field) stops that repository's sweep: it never deletes on a guess. The server
+// refuses at PUT whatever Readable refuses, so a pusher cannot store such a row.
+// A blob an index merely names as a child is not such a body: without a row it
+// was never accepted as a manifest, so it is kept and not followed (see makePlan).
 package gc

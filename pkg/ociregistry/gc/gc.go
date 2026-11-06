@@ -728,28 +728,46 @@ type refs struct {
 // any body with a Docker schema1 fsLayers field, even at schemaVersion 2, so
 // a schema1-shaped body never reads as one that references nothing.
 func parseRefs(d digest.Digest, b []byte) (refs, error) {
-	var r refs
-	if err := json.Unmarshal(b, &r); err != nil {
+	r, err := parseBody(b)
+	if err != nil {
 		return refs{}, fmt.Errorf("%w: %s: %v", ErrUnreadable, d, err)
 	}
+	return r, nil
+}
+
+// Readable returns why the collector could not read body as a manifest, or nil.
+// The server stores nothing it refuses: a row the collector cannot read stops
+// every sweep of its repository until the row is deleted, so what the server
+// accepts must not be decided by a second reading of the body.
+func Readable(body []byte) error {
+	_, err := parseBody(body)
+	return err
+}
+
+// parseBody is parseRefs without the digest and the sentinel.
+func parseBody(b []byte) (refs, error) {
+	var r refs
+	if err := json.Unmarshal(b, &r); err != nil {
+		return refs{}, err
+	}
 	if r.FSLayers != nil {
-		return refs{}, fmt.Errorf("%w: %s: a Docker schema1 fsLayers field", ErrUnreadable, d)
+		return refs{}, errors.New("a Docker schema1 fsLayers field")
 	}
 	if r.SchemaVersion != 2 {
-		return refs{}, fmt.Errorf("%w: %s: schemaVersion %d, want 2", ErrUnreadable, d, r.SchemaVersion)
+		return refs{}, fmt.Errorf("schemaVersion %d, want 2", r.SchemaVersion)
 	}
 	switch r.MediaType {
 	case ispec.MediaTypeImageManifest, mediaTypeDockerManifest:
 		if r.Config == nil {
-			return refs{}, fmt.Errorf("%w: %s: image manifest without a config", ErrUnreadable, d)
+			return refs{}, errors.New("image manifest without a config")
 		}
 	case ispec.MediaTypeImageIndex, mediaTypeDockerManifestList:
 	case "":
 		if r.Config == nil && r.Manifests == nil {
-			return refs{}, fmt.Errorf("%w: %s: no mediaType, and neither a config nor a manifests array", ErrUnreadable, d)
+			return refs{}, errors.New("no mediaType, and neither a config nor a manifests array")
 		}
 	default:
-		return refs{}, fmt.Errorf("%w: %s: unknown mediaType %q", ErrUnreadable, d, r.MediaType)
+		return refs{}, fmt.Errorf("unknown mediaType %q", r.MediaType)
 	}
 	return r, nil
 }
@@ -774,6 +792,16 @@ func parseRefs(d digest.Digest, b []byte) (refs, error) {
 // manifest d references: an error wrapping store.ErrBlobUnknown for a missing
 // body, ErrUnreadable for one that does not verify or parse, or errStale,
 // which fails the plan unwrapped.
+//
+// An index child with no row in idx is the exception. A child is not required
+// to exist at PUT and its descriptor says what the pusher likes, so any blob
+// can be named as one, and failing the plan on it would let a pusher stop the
+// repository's sweeps for good. A manifest this store accepted has a row until
+// a delete or a sweep removes it, and the server stores only what parseBody
+// reads, so a body with no row that is unreadable was pushed as a blob: the
+// blob is kept, and nothing is followed from it. A body with no row that does
+// read is followed, and a child with a row that is unreadable fails the plan. A
+// child digest that is not a digest is skipped: no blob can have it.
 func makePlan(idx ispec.Index, cont store.Contents, cutoff time.Time, refsOf func(digest.Digest) (refs, error)) (plan, error) {
 	mtime := make(map[digest.Digest]time.Time, len(cont.Blobs))
 	for _, b := range cont.Blobs {
@@ -787,6 +815,10 @@ func makePlan(idx ispec.Index, cont store.Contents, cutoff time.Time, refsOf fun
 	}
 	var queue []item
 	candidates := map[digest.Digest]bool{}
+	hasRow := make(map[digest.Digest]bool, len(idx.Manifests))
+	for _, r := range idx.Manifests {
+		hasRow[r.Digest] = true
+	}
 	for _, r := range idx.Manifests {
 		if _, tagged := r.Annotations[ispec.AnnotationRefName]; tagged {
 			queue = append(queue, item{r.Digest, true})
@@ -822,6 +854,9 @@ func makePlan(idx ispec.Index, cont store.Contents, cutoff time.Time, refsOf fun
 		if errors.Is(err, store.ErrBlobUnknown) && !it.required {
 			continue
 		}
+		if errors.Is(err, ErrUnreadable) && !it.required && !hasRow[it.d] {
+			continue
+		}
 		if err != nil {
 			return plan{}, planError(it.d.String(), err)
 		}
@@ -832,6 +867,9 @@ func makePlan(idx ispec.Index, cont store.Contents, cutoff time.Time, refsOf fun
 			referenced[l.Digest] = true
 		}
 		for _, ch := range m.Manifests {
+			if _, err := ref.ParseDigest(ch.Digest.String()); err != nil {
+				continue
+			}
 			referenced[ch.Digest] = true
 			queue = append(queue, item{ch.Digest, false})
 		}
