@@ -936,11 +936,7 @@ tested rig and both a property of the shared-filesystem transport, not of PVC st
 - **Sequential throughput is transport-bound, not disk-bound.** Sequential IO over the
   shared filesystem reached roughly 1.2 GB/s write and 2.8 GB/s read on the tested rig. Those figures
   describe the transport's ceiling on that rig, not a durable-media benchmark.
-- **The host volume is case-insensitive, and a case-colliding pair of names collapses silently inside
-  the guest.** Creating `File` and then `file` inside the guest does not produce two files. It produces
-  one, with no error returned to either write. Image layers are checked for this kind of collision when
-  they are unpacked, but a workload's own runtime writes are not, so a workload that itself creates
-  case-colliding filenames on this path will lose data silently.
+- **A plain-directory data root is case-insensitive; a `--data-volume` root is not.** On a plain directory, an image holding a case-only pair is refused, naming both paths and the fix, and a pair a workload creates itself in the guest (`File`, then `file`) collapses to one file with no error. Behaviour inside the guest on a data volume has not been measured.
 
 ### `vm` Pods: Services and Direct Pod IPs
 

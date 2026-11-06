@@ -164,6 +164,7 @@ pin, its date, and the tarball's sha256.
 
 ### Fixed
 
+- A `vm` image with paths differing only by case now gets a refusal naming both paths and the fix on a case-insensitive data root, and is refused rather than merged when cloned into a case-insensitive pod rootfs.
 - The registry now checks a caller's access before it reads the digest or upload id in the request, so
   a caller who may not read or write a repository gets the same 401 or 403 for a malformed digest or
   upload id as for a well-formed one, where it used to get a 400 or 404. A mount whose source the
