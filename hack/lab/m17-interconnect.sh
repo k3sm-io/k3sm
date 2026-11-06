@@ -287,7 +287,7 @@ check_disarmed() {
 # scrape_metrics <tag> — every node's interconnect metrics endpoint.
 scrape_metrics() {
 	local n
-	for n in $L_NODE $P_NODE; do
+	for n in $local_NODE $peer_NODE; do
 		kc get --raw "/api/v1/nodes/$n/proxy/metrics/interconnect" >"$RUNG_DIR/metrics-$1-$n.txt" 2>&1 || true
 	done
 	cat "$RUNG_DIR"/metrics-"$1"-*.txt >"$RUNG_DIR/metrics-$1.txt" 2>/dev/null
@@ -1625,6 +1625,21 @@ st_reinstall() {
 # st_reinstall_calls <side> <join rc> <install rc> — the calls, one line.
 st_reinstall_calls() { st_reinstall "$@" | tr '\n' ';'; }
 
+# st_scrape_metrics — the real scrape under the ladder's set -u, with the client
+# stubbed; prints the paths it asked for.
+st_scrape_metrics() {
+	local d
+	d="$(mktemp -d -t m17-scrape.XXXXXX)"
+	RUNG_DIR="$d" local_NODE=node-a peer_NODE=node-b
+	kc() { echo "$3" >>"$d/asked"; }
+	(
+		set -u
+		scrape_metrics before
+	) || echo "scrape exited $?"
+	cat "$d/asked" 2>/dev/null
+	rm -rf "$d"
+}
+
 # st_owed_rung — the real runner over r6 with no terminal and a following rung: r6
 # is recorded REFUSED and owed, and the next rung still runs.
 st_owed_rung() {
@@ -1902,6 +1917,7 @@ self_test_body() {
 	st "UpHold red: 30 s" 1 icp_uphold_verdict 200.0 230.0
 	st "UpHold red: no replug timestamp" 1 icp_uphold_verdict 200.0 ""
 	st_eq "ping gap: none" "$(icp_ping_max_gap "$F/ping-gap0.txt")" 0
+	st_eq "metrics: every node is scraped by the names the run sets" "$(st_scrape_metrics | tr '\n' ' ')" "/api/v1/nodes/node-a/proxy/metrics/interconnect /api/v1/nodes/node-b/proxy/metrics/interconnect "
 	st_eq "ping gap: one" "$(icp_ping_max_gap "$F/ping-gap1.txt")" 1
 	st_eq "ping gap red: three" "$(icp_ping_max_gap "$F/ping-gap3.txt")" 3
 
