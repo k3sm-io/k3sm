@@ -125,7 +125,8 @@ func newGate(cfg gateConfig) *gate {
 }
 
 // rewrite points the outbound request at the loopback registry. Every client
-// credential is dropped, so a forwarded
+// credential is dropped, and so is the legacy zot UI session header, kept for the
+// one release a reclaimed zot child may still answer, so a forwarded
 // request authenticates as exactly what the gate decided: nothing for a read,
 // the gate's credential for an authorized write. The path and query are left
 // as the handler set them, and the Host header as the client sent it.
@@ -135,6 +136,7 @@ func (g *gate) rewrite(pr *httputil.ProxyRequest, attach bool) {
 	pr.Out.Header.Del("Authorization")
 	pr.Out.Header.Del("Proxy-Authorization")
 	pr.Out.Header.Del("Cookie")
+	pr.Out.Header.Del("X-Zot-Api-Client")
 	if attach {
 		pr.Out.SetBasicAuth(g.cred.Username, g.cred.Password)
 	}

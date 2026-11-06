@@ -36,8 +36,8 @@ fi
 # path, grouped by why. A row whose file no longer mentions zot is printed as a
 # note and stays harmless, so a later removal does not red this gate.
 ALLOWED="
-# docs/m23-plan.md resolution 3: the legacy child is reclaimed and tolerated for
-# one release.
+# The legacy child is reclaimed and tolerated for one release.
+pkg/registrysvc/gate.go
 pkg/registrysvc/orphan.go
 pkg/registrysvc/orphan_darwin_test.go
 pkg/registrysvc/orphan_integration_test.go
