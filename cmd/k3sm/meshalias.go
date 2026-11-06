@@ -160,7 +160,7 @@ func addrIsLocal(ip netip.Addr) (bool, error) {
 // rather than reached for sideways because this is the one caller that must run
 // before any mesh or proxy object exists.
 func plumbLo0Alias(ctx context.Context, ip netip.Addr) error {
-	out, err := exec.CommandContext(ctx, "ifconfig", "lo0", "alias", fmt.Sprintf("%s/32", ip)).CombinedOutput()
+	out, err := exec.CommandContext(ctx, ifconfigPath, "lo0", "alias", fmt.Sprintf("%s/32", ip)).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("ifconfig lo0 alias %s/32: %w: %s", ip, err, out)
 	}

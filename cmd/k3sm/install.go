@@ -670,7 +670,7 @@ func (o installFlags) dataVolumeOptions(k3smVersion string) (*datavol.Options, e
 // note printed beside an install is not worth failing that install over. An
 // unanswerable probe reports false and prints nothing.
 func fileVaultOn() bool {
-	out, err := exec.Command("fdesetup", "status").CombinedOutput()
+	out, err := exec.Command(fdesetupPath, "status").CombinedOutput()
 	if err != nil {
 		return false
 	}

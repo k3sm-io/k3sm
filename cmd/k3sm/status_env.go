@@ -579,12 +579,12 @@ type launchctlProbe struct{}
 
 // Print runs `launchctl print system/<label>`.
 func (launchctlProbe) Print(label string) ([]byte, error) {
-	return exec.Command("launchctl", "print", "system/"+label).CombinedOutput()
+	return exec.Command(launchctlPath, "print", "system/"+label).CombinedOutput()
 }
 
 // PrintDisabled runs `launchctl print-disabled system`.
 func (launchctlProbe) PrintDisabled() ([]byte, error) {
-	return exec.Command("launchctl", "print-disabled", "system").CombinedOutput()
+	return exec.Command(launchctlPath, "print-disabled", "system").CombinedOutput()
 }
 
 // osStatusFS is the real filesystem seam.

@@ -42,15 +42,19 @@ import (
 // port enumeration) is the slow one.
 const icProbeTimeout = 20 * time.Second
 
-// The executables the probes run, by absolute path, so a PATH entry can never
+// The system tools this binary runs, by absolute path, so a PATH entry can never
 // stand in for one (`sudo k3sm doctor` runs them as root).
 const (
-	ifconfigPath = "/sbin/ifconfig"
-	pingPath     = "/sbin/ping"
-	arpPath      = "/usr/sbin/arp"
-	netstatPath  = "/usr/sbin/netstat"
-	pmsetPath    = "/usr/bin/pmset"
-	defaultsPath = "/usr/bin/defaults"
+	ifconfigPath  = "/sbin/ifconfig"
+	pingPath      = "/sbin/ping"
+	arpPath       = "/usr/sbin/arp"
+	netstatPath   = "/usr/sbin/netstat"
+	pmsetPath     = "/usr/bin/pmset"
+	defaultsPath  = "/usr/bin/defaults"
+	launchctlPath = "/bin/launchctl"
+	sysctlPath    = "/usr/sbin/sysctl"
+	csrutilPath   = "/usr/bin/csrutil"
+	fdesetupPath  = "/usr/bin/fdesetup"
 )
 
 // icPingTimeout bounds one peer ping, in whole seconds as `ping -t` takes it.

@@ -318,6 +318,6 @@ func writeReportFile(dir, name string, data []byte) error {
 // this function is the only place in the bundle path that ever holds it. See
 // daemonSnapshot for why that is structural rather than a redaction.
 func probeDaemonInfo(label string) status.DaemonInfo {
-	out, err := exec.Command("launchctl", "print", "system/"+label).CombinedOutput()
+	out, err := exec.Command(launchctlPath, "print", "system/"+label).CombinedOutput()
 	return status.ParseLaunchctlPrint(out, err)
 }

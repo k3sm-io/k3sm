@@ -127,7 +127,7 @@ func defaultNetworkEnv(stdout, stderr io.Writer) networkEnv {
 
 // launchctlHUP sends SIGHUP to a system-domain daemon through launchd.
 func launchctlHUP(ctx context.Context, label string) error {
-	out, err := exec.CommandContext(ctx, "launchctl", "kill", "HUP", "system/"+label).CombinedOutput()
+	out, err := exec.CommandContext(ctx, launchctlPath, "kill", "HUP", "system/"+label).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("launchctl kill HUP system/%s: %w: %s", label, err, strings.TrimSpace(string(out)))
 	}

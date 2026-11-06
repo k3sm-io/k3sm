@@ -800,7 +800,7 @@ func realDoctorEnv(workDir string) doctorEnv {
 
 // probeMacOSVersion reads kern.osproductversion via sysctl (e.g. "26.1").
 func probeMacOSVersion() (string, error) {
-	out, err := exec.Command("sysctl", "-n", "kern.osproductversion").Output()
+	out, err := exec.Command(sysctlPath, "-n", "kern.osproductversion").Output()
 	if err != nil {
 		return "", err
 	}
@@ -809,7 +809,7 @@ func probeMacOSVersion() (string, error) {
 
 // probeSIPEnabled parses `csrutil status` for the enabled marker.
 func probeSIPEnabled() (bool, error) {
-	out, err := exec.Command("csrutil", "status").Output()
+	out, err := exec.Command(csrutilPath, "status").Output()
 	if err != nil {
 		return false, err
 	}
@@ -829,7 +829,7 @@ func probeHelperState() (installed, running bool) {
 // The output is never carried into a result: `launchctl print` echoes the job's
 // whole argv, and a node daemon's argv is where a join token would be.
 func probeDaemonState(label string) (installed, running bool) {
-	out, err := exec.Command("launchctl", "print", "system/"+label).CombinedOutput()
+	out, err := exec.Command(launchctlPath, "print", "system/"+label).CombinedOutput()
 	if err != nil {
 		return false, false
 	}
