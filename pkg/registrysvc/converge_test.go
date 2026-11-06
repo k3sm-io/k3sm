@@ -68,6 +68,8 @@ type loopRig struct {
 	passCt chan context.Context
 	hold   bool
 	rep    store.ConvergeReport
+	// passErr is what a pass that is not held returns.
+	passErr error
 }
 
 func newLoopRig(t *testing.T) *loopRig {
@@ -111,7 +113,7 @@ func newLoopRig(t *testing.T) *loopRig {
 			<-ctx.Done()
 			return r.rep, ctx.Err()
 		}
-		return r.rep, nil
+		return r.rep, r.passErr
 	}
 	return r
 }
@@ -267,6 +269,302 @@ func TestConvergeLoopSchedule(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) { tt.run(newLoopRig(t)) })
 	}
+}
+
+// lastPass drains the rig's record of passes and returns the newest one's options.
+func (r *loopRig) lastPass() store.ConvergeOptions {
+	r.t.Helper()
+	var o store.ConvergeOptions
+	seen := false
+	for {
+		select {
+		case o = <-r.passes:
+			seen = true
+			<-r.passCt
+		default:
+			if !seen {
+				r.t.Fatal("no pass ran")
+			}
+			return o
+		}
+	}
+}
+
+// passesFrom keeps offering the loop a free store, a day between looks, and
+// returns how many passes it starts on its own. The rig's clock ends at the last
+// look, which is returned too.
+func (r *loopRig) passesFrom(at time.Duration) (int, time.Duration) {
+	r.t.Helper()
+	const looks = 10
+	passes := 0
+	for range looks {
+		at += 24 * time.Hour
+		r.at(at)
+		if r.l.cur == nil {
+			return passes, at
+		}
+		passes++
+		r.finish()
+		r.lastPass()
+	}
+	r.t.Fatalf("the loop was still starting passes after %d", passes)
+	return passes, at
+}
+
+// TestConvergeRearmsAfterASweepReviewsARepository: copies in a repository a sweep
+// has just reviewed merge one idle wait after that sweep, with no commit, and a
+// sweep that reviewed nothing new costs no pass.
+func TestConvergeRearmsAfterASweepReviewsARepository(t *testing.T) {
+	const after = 2 * time.Hour
+	second, err := ref.ParseName("second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := newLoopRig(t)
+	r.fence.swept()
+	initRepo(t, r.st, "first")
+	if err := gc.WriteMarker(r.st, r.t0); err != nil {
+		t.Fatal(err)
+	}
+	r.at(after)
+	r.wantPass("the start trigger", convergeWhyIdle)
+	r.finish()
+	r.lastPass()
+	r.at(after + 24*time.Hour)
+	r.wantNoPass("nothing since the pass")
+
+	// A real sweep through the loop's own wiring reviews the new repository.
+	initRepo(t, r.st, "second")
+	collector, err := gc.New(r.st, gc.Options{Grace: time.Millisecond, Log: r.l.log})
+	if err != nil {
+		t.Fatal(err)
+	}
+	swept := after + 25*time.Hour
+	r.set(swept)
+	ctx, cancel := context.WithCancel(r.ctx)
+	finished := make(chan struct{}, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		sweepLoop(ctx, collector, time.Millisecond, time.Hour, r.fence, func() {
+			r.l.sweepFinished()
+			finished <- struct{}{}
+		}, r.l.reports, r.l.log)
+	}()
+	bound := time.NewTimer(serveAwaitBound)
+	defer bound.Stop()
+	select {
+	case <-finished:
+	case <-bound.C:
+		t.Fatal("the sweep did not finish")
+	}
+	cancel()
+	<-done
+
+	r.at(swept + rigWait - time.Second)
+	r.wantNoPass("a second short of the idle wait from the sweep")
+	r.at(swept + rigWait)
+	r.wantPass("the sweep that reviewed a repository", convergeWhyIdle)
+	r.finish()
+	if !r.lastPass().Reviewed(second) {
+		t.Fatal("the pass after the sweep does not name the repository it reviewed")
+	}
+
+	// The same set again, which is what every later sweep of an idle store finds.
+	later := swept + 24*time.Hour
+	r.set(later)
+	r.l.sweepFinished()
+	r.at(later + 24*time.Hour)
+	r.wantNoPass("a sweep that reviewed nothing new")
+}
+
+// TestConvergeRearmsWhileBudgetLeavesWork: a pass its own limits stopped gets a
+// later one, on the same terms as any other.
+func TestConvergeRearmsWhileBudgetLeavesWork(t *testing.T) {
+	const after = 2 * time.Hour
+	budget := store.ConvergeReport{Merged: 1, Pending: 4, Skipped: map[store.SkipReason]int{store.SkipHashBudget: 4}}
+	limit := store.ConvergeReport{Merged: 1024, Pending: 4, MergeLimited: true}
+	// first starts a pass that leaves rep's work and ends it at ended.
+	first := func(r *loopRig, rep store.ConvergeReport, ended time.Duration) {
+		r.t.Helper()
+		r.fence.swept()
+		r.rep = rep
+		r.at(after)
+		r.wantPass("the start trigger", convergeWhyIdle)
+		r.set(ended)
+		r.finish()
+		r.lastPass()
+	}
+	for name, rep := range map[string]store.ConvergeReport{"the hash budget": budget, "the merge limit": limit} {
+		t.Run(name+" takes a later pass, an idle wait after this one ended", func(t *testing.T) {
+			r := newLoopRig(t)
+			ended := after + time.Minute
+			first(r, rep, ended)
+			r.at(ended + rigWait - time.Second)
+			r.wantNoPass("a second short of the idle wait")
+			r.rep = store.ConvergeReport{Merged: 4}
+			r.at(ended + rigWait)
+			r.wantPass("the work the limit left", convergeWhyIdle)
+			r.finish()
+			r.lastPass()
+			r.at(ended + 24*time.Hour)
+			r.wantNoPass("the work is done")
+		})
+	}
+	t.Run("passes go on as long as they merge", func(t *testing.T) {
+		r := newLoopRig(t)
+		first(r, budget, after)
+		at := after
+		for i := range 3 * serveConvergeMaxFruitless {
+			at += rigWait
+			r.at(at)
+			r.wantPass(fmt.Sprintf("later pass %d", i), convergeWhyIdle)
+			r.finish()
+			r.lastPass()
+		}
+	})
+	t.Run("a live session holds the later pass, with no bound of its own", func(t *testing.T) {
+		r := newLoopRig(t)
+		first(r, budget, after)
+		r.sessions.Store(1)
+		r.at(after + 24*time.Hour)
+		r.wantNoPass("a live session")
+		r.sessions.Store(0)
+		r.at(after + 24*time.Hour + rigWait)
+		r.wantPass("idle again", convergeWhyIdle)
+	})
+	t.Run("low space does not skip the spacing", func(t *testing.T) {
+		r := newLoopRig(t)
+		first(r, budget, after)
+		r.free.Store(1)
+		r.at(after + serveConvergeFreeEvery)
+		r.wantNoPass("low space inside the spacing")
+		r.at(after + serveConvergeIdle - time.Second)
+		r.wantNoPass("low space a second short of the spacing")
+		r.at(after + serveConvergeIdle)
+		r.wantPass("low space past the spacing", convergeWhyLowSpace)
+	})
+	t.Run("a commit during the pass keeps its own bound", func(t *testing.T) {
+		r := newLoopRig(t)
+		r.fence.swept()
+		r.rep = budget
+		r.at(after)
+		r.wantPass("the start trigger", convergeWhyIdle)
+		r.commitAt(after + time.Second)
+		r.set(after + time.Minute)
+		r.finish()
+		r.lastPass()
+		r.sessions.Store(1)
+		r.at(after + time.Second + serveConvergeBound - time.Second)
+		r.wantNoPass("inside the commit's bound")
+		r.at(after + time.Second + serveConvergeBound)
+		r.wantPass("the commit's bound", convergeWhyBound)
+	})
+	t.Run("a pass an upload stopped keeps its trigger and its bound", func(t *testing.T) {
+		r := newLoopRig(t)
+		r.fence.swept()
+		r.hold = true
+		r.rep = budget
+		r.commitAt(after)
+		r.at(after + rigWait)
+		r.wantPass("idle", convergeWhyIdle)
+		r.sessions.Store(1)
+		r.at(after + rigWait + time.Second)
+		r.finish()
+		r.at(after + serveConvergeBound)
+		r.wantPass("the stopped pass's bound stands", convergeWhyBound)
+		r.l.cur.cancel()
+		r.finish()
+	})
+}
+
+// TestConvergeDoesNotSpinOnPermanentSkips: what a later pass would only repeat
+// sets no trigger, and passes that leave work but get nowhere stop at the cap.
+func TestConvergeDoesNotSpinOnPermanentSkips(t *testing.T) {
+	const after = 2 * time.Hour
+	failed := errors.New("sync failed")
+	budget := map[store.SkipReason]int{store.SkipHashBudget: 4}
+	t.Run("permanent skips", func(t *testing.T) {
+		tests := []struct {
+			name string
+			rep  store.ConvergeReport
+			err  error
+		}{
+			{"not reviewed", store.ConvergeReport{Pending: 2, Skipped: map[store.SkipReason]int{store.SkipNotReviewed: 2}}, nil},
+			{"keeper full", store.ConvergeReport{Pending: 2, Skipped: map[store.SkipReason]int{store.SkipKeeperFull: 2}}, nil},
+			{"no keeper", store.ConvergeReport{Pending: 2, CorruptKeepers: 1, Skipped: map[store.SkipReason]int{store.SkipNoKeeper: 2}}, nil},
+			{"a sync failure with nothing else", store.ConvergeReport{Pending: 2, Skipped: map[store.SkipReason]int{store.SkipSync: 1}}, failed},
+			{"a merge beside them", store.ConvergeReport{Merged: 1, Pending: 2, Skipped: map[store.SkipReason]int{store.SkipNotReviewed: 2}}, nil},
+			{"the merge limit with nothing pending", store.ConvergeReport{Merged: 1024, MergeLimited: true}, nil},
+			{"a truncated scan, which reads the same entries next time", store.ConvergeReport{Pending: 2, ScanTruncated: true}, nil},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				r := newLoopRig(t)
+				r.fence.swept()
+				r.rep, r.passErr = tt.rep, tt.err
+				r.at(after)
+				r.wantPass("the start trigger", convergeWhyIdle)
+				r.finish()
+				r.lastPass()
+				if got, _ := r.passesFrom(after); got != 0 {
+					t.Errorf("%d more passes with nothing a later pass could do", got)
+				}
+				r.free.Store(1)
+				r.at(after + 365*24*time.Hour)
+				r.wantNoPass("low space with no commit since")
+			})
+		}
+	})
+	t.Run("work left and nothing merged", func(t *testing.T) {
+		tests := []struct {
+			name string
+			rep  store.ConvergeReport
+			err  error
+		}{
+			{"a corrupt keeper", store.ConvergeReport{Pending: 4, CorruptKeepers: 1, HashedBytes: 16 << 30, Skipped: budget}, nil},
+			{"a repeating failure", store.ConvergeReport{Pending: 4, Skipped: budget}, failed},
+			{"a repeating failure that still merges", store.ConvergeReport{Merged: 1, Pending: 4, Skipped: budget}, failed},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				r := newLoopRig(t)
+				r.fence.swept()
+				r.rep, r.passErr = tt.rep, tt.err
+				got, at := r.passesFrom(0)
+				if got != serveConvergeMaxFruitless {
+					t.Fatalf("%d passes, want the cap of %d", got, serveConvergeMaxFruitless)
+				}
+				r.commitAt(at + time.Hour)
+				r.at(at + time.Hour + rigWait)
+				r.wantPass("a commit past the cap", convergeWhyIdle)
+				r.finish()
+				r.lastPass()
+				if more, _ := r.passesFrom(at + time.Hour); more != 0 {
+					t.Errorf("%d passes of its own after the commit's, past the cap", more)
+				}
+			})
+		}
+	})
+	t.Run("a merge clears the count", func(t *testing.T) {
+		r := newLoopRig(t)
+		r.fence.swept()
+		r.rep = store.ConvergeReport{Pending: 4, Skipped: budget}
+		at := time.Duration(0)
+		// One short of the cap, a merge, and then the cap's whole allowance.
+		merged := make([]int, 2*serveConvergeMaxFruitless)
+		merged[serveConvergeMaxFruitless-1] = 1
+		for i, m := range merged {
+			r.rep.Merged = m
+			at += 24 * time.Hour
+			r.at(at)
+			r.wantPass(fmt.Sprintf("pass %d", i), convergeWhyIdle)
+			r.finish()
+			r.lastPass()
+		}
+		r.at(at + 24*time.Hour)
+		r.wantNoPass("past the cap again")
+	})
 }
 
 // TestConvergeLoopStopsForAnUpload pins which passes an upload stops.
@@ -541,7 +839,7 @@ func TestSweepWaitsForAPass(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		sweepLoop(ctx, collector, time.Millisecond, time.Hour, r.fence, r.l.reports, r.l.log)
+		sweepLoop(ctx, collector, time.Millisecond, time.Hour, r.fence, func() {}, r.l.reports, r.l.log)
 	}()
 	defer func() {
 		cancel()
@@ -699,6 +997,9 @@ func TestServeConvergeCadence(t *testing.T) {
 		serveConvergeFreeEvery != 30*time.Second || serveConvergeLowFree != 4<<30 {
 		t.Errorf("idle %v, jitter %v, bound %v, free every %v, low free %d", serveConvergeIdle, serveConvergeJitter,
 			serveConvergeBound, serveConvergeFreeEvery, uint64(serveConvergeLowFree))
+	}
+	if serveConvergeMaxFruitless != 3 {
+		t.Errorf("max fruitless passes %d", serveConvergeMaxFruitless)
 	}
 }
 

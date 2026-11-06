@@ -39,6 +39,8 @@ import (
 // A pass (store.Converge) runs when the store has been idle, so a commit does no
 // work for it and answers the same whether another repository holds the digest.
 // The trigger is set at start and by every commit and mount, and only in memory.
+// Two things set it again with no commit: a sweep that reviewed a repository the
+// last pass could not rewrite, and a pass whose own limits left work.
 
 // Timings of the dedupe loop.
 const (
@@ -58,6 +60,14 @@ const (
 	// serveConvergeTick is how often the loop looks at its conditions. It reads
 	// only memory, except for the free space above.
 	serveConvergeTick = 5 * time.Second
+	// serveConvergeMaxFruitless is how many passes in a row may leave work and merge
+	// nothing, or fail, before a pass stops setting its own trigger. A merge is what
+	// a further pass is for, and copies are finite, so passes that merge always end.
+	// One with no merge may still be worth it, as the hash budget's rotation hands
+	// the next pass another digest, but a corrupt keeper or a failing volume would
+	// repeat forever. So at most this many passes, about 48 GiB of hashing, follow
+	// from one commit, mount, reviewing sweep or start.
+	serveConvergeMaxFruitless = 3
 )
 
 // Why a pass started, as registry.log says it.
@@ -123,10 +133,15 @@ type convergeLoop struct {
 	floor time.Time
 
 	mu sync.Mutex
-	// armed is the trigger. first is the first commit that set it, zero when only
-	// the start set it, and last the latest commit, which outlives the trigger.
+	// armed is the trigger. first is the first commit that set it, zero when no
+	// commit did, and last the latest commit or re-arm, which outlives the trigger.
 	armed       bool
 	first, last time.Time
+	// rest is the end of a re-arm's spacing, which low space does not skip. A commit
+	// clears it, since low space with a commit starts a pass at once.
+	rest time.Time
+	// reviewed is the set the last pass or sweep read from the marker.
+	reviewed map[string]bool
 
 	// busy is the last tick that saw a live session.
 	busy time.Time
@@ -138,6 +153,9 @@ type convergeLoop struct {
 	// freeRead is when that read was.
 	low      bool
 	freeRead time.Time
+	// fruitless counts the passes in a row that left work and merged nothing or
+	// failed, against serveConvergeMaxFruitless.
+	fruitless int
 	// cur is the pass running.
 	cur *convergeRun
 }
@@ -200,6 +218,48 @@ func (l *convergeLoop) commit() {
 		l.first = now
 	}
 	l.last = now
+	l.rest = time.Time{}
+}
+
+// rearm sets the trigger with no commit behind it: the idle wait runs from now, and
+// no bound runs, since only a commit's does. A trigger already set stands as it is.
+func (l *convergeLoop) rearm(now time.Time) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.armed {
+		return
+	}
+	l.armed, l.last, l.rest = true, now, now.Add(serveConvergeIdle)
+}
+
+// sweepFinished re-arms the loop when the sweep's marker names a repository the
+// last pass or sweep did not see. A marker it cannot read names nothing new, and
+// the pass this would have started could not have read it either.
+func (l *convergeLoop) sweepFinished() {
+	reviewed, err := gc.ReadReviewed(l.store, l.log)
+	if err != nil {
+		l.log.Warn("registry dedupe: could not read the reviewed repositories after a sweep", "err", err)
+		return
+	}
+	if l.noteReviewed(reviewed) {
+		l.rearm(l.now())
+	}
+}
+
+// noteReviewed records the marker's set and reports whether it names a repository
+// the last one did not.
+func (l *convergeLoop) noteReviewed(reviewed map[string]bool) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	added := false
+	for name := range reviewed {
+		if !l.reviewed[name] {
+			added = true
+			break
+		}
+	}
+	l.reviewed = reviewed
+	return added
 }
 
 // run drives the loop until ctx ends, and waits out a pass in flight.
@@ -244,9 +304,9 @@ func (l *convergeLoop) step(ctx context.Context, now time.Time) {
 		return
 	}
 	l.mu.Lock()
-	armed, first, last := l.armed, l.first, l.last
+	armed, first, last, rest := l.armed, l.first, l.last, l.rest
 	l.mu.Unlock()
-	if !armed || now.Before(l.floor) || !l.fence.hasSwept() {
+	if !armed || now.Before(l.floor) || now.Before(rest) || !l.fence.hasSwept() {
 		return
 	}
 	if !l.waitDrawn {
@@ -315,6 +375,7 @@ func (l *convergeLoop) pass(ctx context.Context) (store.ConvergeReport, error) {
 	if err != nil {
 		return store.ConvergeReport{}, err
 	}
+	l.noteReviewed(reviewed)
 	return l.converge(ctx, store.ConvergeOptions{
 		Reviewed: func(n ref.Name) bool { return reviewed[n.String()] },
 		Log:      l.log,
@@ -322,8 +383,8 @@ func (l *convergeLoop) pass(ctx context.Context) (store.ConvergeReport, error) {
 	})
 }
 
-// finish takes a pass's result: it restores the trigger of a stopped pass, logs
-// the outcome and reports it. A pass the server's stop ended reports nothing, as
+// finish takes a pass's result: it restores the trigger of a stopped pass, re-arms
+// after one that left work, logs the outcome and reports it. A pass the server's stop ended reports nothing, as
 // a sweep the stop ended does not; its merges were each logged. The store logs
 // each merge and each corrupt file itself.
 func (l *convergeLoop) finish(ctx context.Context, res convergeResult) {
@@ -360,6 +421,9 @@ func (l *convergeLoop) finish(ctx context.Context, res convergeResult) {
 		attrs = append(attrs, "err", res.err)
 	}
 	l.log.Log(ctx, level, "registry dedupe: pass finished", attrs...)
+	if !run.stopped {
+		l.rearmForWork(res)
+	}
 	l.reports.dedupe(DedupeStatus{
 		LastPass:        l.now().UTC(),
 		Merged:          res.rep.Merged,
@@ -368,6 +432,25 @@ func (l *convergeLoop) finish(ctx context.Context, res convergeResult) {
 		CorruptReplaced: res.rep.CorruptReplaced,
 		Skipped:         skipped,
 	})
+}
+
+// rearmForWork sets the trigger when res left work a later pass could do, until
+// serveConvergeMaxFruitless passes in a row have got nowhere with it.
+func (l *convergeLoop) rearmForWork(res convergeResult) {
+	switch {
+	case !res.rep.LeftWork():
+		l.fruitless = 0
+		return
+	case res.err != nil || res.rep.Merged == 0:
+		l.fruitless++
+	default:
+		l.fruitless = 0
+	}
+	if l.fruitless >= serveConvergeMaxFruitless {
+		l.log.Warn("registry dedupe: passes left copies and merged nothing; the next commit, mount or start runs another", "passes", l.fruitless)
+		return
+	}
+	l.rearm(l.now())
 }
 
 // watchCommits calls committed after each POST or PUT answered 201, which is how

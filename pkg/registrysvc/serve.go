@@ -205,7 +205,7 @@ func runServer(ctx context.Context, workDir string, cfg ServeConfig, d serveDeps
 	bg, stopBG := context.WithCancel(ctx)
 	defer stopBG()
 	var wg sync.WaitGroup
-	wg.Go(func() { sweepLoop(bg, collector, d.gcGrace, d.gcInterval, fence, reports, log) })
+	wg.Go(func() { sweepLoop(bg, collector, d.gcGrace, d.gcInterval, fence, dedupe.sweepFinished, reports, log) })
 	wg.Go(func() { dedupe.run(bg) })
 	wg.Go(func() { reportLoop(bg, server, d.statusEvery, reports) })
 
@@ -233,8 +233,9 @@ func runServer(ctx context.Context, workDir string, cfg ServeConfig, d serveDeps
 
 // sweepLoop sweeps at the first moment the collector allows, a little past its
 // grace, and then every interval. A sweep holds fence, so it never runs beside a
-// dedupe pass.
-func sweepLoop(ctx context.Context, c *gc.Collector, grace, interval time.Duration, fence *sweepFence, reports statusReporter, log *slog.Logger) {
+// dedupe pass, and finished runs after each sweep the stop did not end, with the
+// fence still held.
+func sweepLoop(ctx context.Context, c *gc.Collector, grace, interval time.Duration, fence *sweepFence, finished func(), reports statusReporter, log *slog.Logger) {
 	wait := time.NewTimer(grace + grace/60)
 	defer wait.Stop()
 	for {
@@ -245,6 +246,9 @@ func sweepLoop(ctx context.Context, c *gc.Collector, grace, interval time.Durati
 		}
 		fence.mu.Lock()
 		sweepOnce(ctx, c, reports, log)
+		if ctx.Err() == nil {
+			finished()
+		}
 		fence.mu.Unlock()
 		fence.swept()
 		wait.Reset(interval)

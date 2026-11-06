@@ -221,10 +221,20 @@ type ConvergeReport struct {
 	CorruptKeepers int
 	// HashedBytes is how much the pass hashed.
 	HashedBytes int64
-	// ScanTruncated says the scan stopped at its entry limit.
+	// ScanTruncated says the scan stopped at its entry limit. A later pass scans the
+	// same entries, so this alone is no reason to run one.
 	ScanTruncated bool
+	// MergeLimited says the pass spent its merge limit.
+	MergeLimited bool
 	// Skipped counts what was left, by reason.
 	Skipped map[SkipReason]int
+}
+
+// LeftWork reports whether the pass's own limits left copies that a later pass
+// could merge: its hash budget, or its merge limit with copies pending. Every
+// other reason a copy stays repeats until something changes, so it does not count.
+func (r ConvergeReport) LeftWork() bool {
+	return r.Skipped[SkipHashBudget] > 0 || (r.MergeLimited && r.Pending > 0)
 }
 
 // convergeStat is what the pass reads from one lstat or fstat.
@@ -427,6 +437,7 @@ func (s *Store) Converge(ctx context.Context, o ConvergeOptions) (ConvergeReport
 	for _, g := range groups {
 		p.rep.Pending += g.pending()
 	}
+	p.rep.MergeLimited = p.mergesLeft() <= 0
 	return p.rep, runErr
 }
 

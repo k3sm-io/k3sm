@@ -1202,6 +1202,16 @@ func TestConvergeLimits(t *testing.T) {
 		if rep.Pending != 2 {
 			t.Errorf("pending = %d, want the small blob's 2", rep.Pending)
 		}
+		if !rep.MergeLimited || !rep.LeftWork() {
+			t.Errorf("a pass the merge limit stopped does not say it left work: %+v", rep)
+		}
+		rep = f.converge(func(o *ConvergeOptions) { o.limits.merges = 2 })
+		if !rep.MergeLimited || rep.Pending != 0 || rep.LeftWork() {
+			t.Errorf("the limit reached with nothing pending left work: %+v", rep)
+		}
+		if rep = f.converge(nil); rep.MergeLimited || rep.LeftWork() {
+			t.Errorf("a pass with nothing to do left work: %+v", rep)
+		}
 	})
 	t.Run("a blob past the budget converges one target a pass", func(t *testing.T) {
 		f := newConvergeFixture(t)
@@ -1216,9 +1226,15 @@ func TestConvergeLimits(t *testing.T) {
 		if rep.Pending != 1 {
 			t.Errorf("pending = %d, want 1", rep.Pending)
 		}
+		if !rep.LeftWork() {
+			t.Errorf("a pass the budget stopped does not say it left work: %+v", rep)
+		}
 		rep = f.converge(lim)
 		if rep.Merged != 1 || !f.same("a", "c", d) || !f.same("a", "b", d) {
 			t.Errorf("second pass: %+v", rep)
+		}
+		if rep.LeftWork() {
+			t.Errorf("the last copy merged and the pass still left work: %+v", rep)
 		}
 	})
 	t.Run("the exemption is the first digest's", func(t *testing.T) {

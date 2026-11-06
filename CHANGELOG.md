@@ -91,8 +91,11 @@ pin, its date, and the tarball's sha256.
   of jitter, and at most 15 minutes after the first commit it has not yet covered. Below 4 GiB free it
   starts without the wait. An upload stops a pass between merges, unless the 15 minutes have passed or
   space is low. No pass runs within an hour of start, or before the first garbage collection, and only
-  a repository garbage collection has reported is rewritten. A copy a pass leaves waits for the next
-  commit, mount or server start. `registry.log` records each merge and each pass, and
+  a repository garbage collection has reported is rewritten, so a new repository's copies wait for its
+  first sweep, at most 6 hours, and merge about 2 minutes after it. A pass stopped by its limit of
+  16 GiB hashed or 1,024 merges is followed by another after the same wait, until three in a row merge
+  nothing or fail. Any other copy a pass leaves waits for the next commit, mount or server start.
+  `registry.log` records each merge and each pass, and
   `registry-state.json` gains a `dedupe` object with the last pass's counts. `du -sk` of the registry
   root falls to one copy; `du` of a single repository still shows its full size.
 - The registry store k3sm is replacing zot with has an online garbage collector that runs
