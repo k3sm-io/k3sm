@@ -184,7 +184,7 @@ func contractServer(t *testing.T, netd, server string, kube Kube, kubeErr error)
 func contractDeveloperMode(t *testing.T, state install.DeveloperModeState, team string, err error) Collector {
 	t.Helper()
 	c := contractServer(t, "launchctl_netd_running.txt", "launchctl_netd_running.txt", heartbeatingKube(goldenTime), nil)
-	c.DeveloperMode = func() install.DeveloperModeState { return state }
+	c.DeveloperMode = func() install.DeveloperModeFacts { return markerFacts(state) }
 	c.SigningTeamID = func(context.Context, string) (string, error) { return team, err }
 	return c
 }

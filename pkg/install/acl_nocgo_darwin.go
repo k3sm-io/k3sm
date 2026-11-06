@@ -21,7 +21,7 @@ package install
 import "fmt"
 
 // pathHasACL cannot read an ACL in a build without cgo, so it fails: a
-// developer-mode marker then reads as invalid and the signature checks stay on.
+// developer-mode marker then does not read on and the signature checks stay on.
 func pathHasACL(path string) (bool, error) {
 	return false, fmt.Errorf("read the ACL of %s: this k3sm was built without cgo", path)
 }

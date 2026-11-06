@@ -42,7 +42,10 @@ import (
 // a real directory held to the same owner, mode and ACL checks
 // (DeveloperModeMarkerState). It is the predicate k3sm.app applies before a
 // root step. A marker that fails any of those checks is reported as invalid
-// and counts as absent, so the checks stay on.
+// and counts as absent, so the checks stay on. A read that could not see the
+// marker is unknown: it never turns the mode on for the install doing that
+// read, and a report says it cannot tell, because a read from another account
+// may find a valid marker there.
 
 // DeveloperModeMarkerPath is the developer-mode marker. k3sm.app hardcodes the same path.
 const DeveloperModeMarkerPath = "/Library/k3sm.developer-mode"
@@ -154,21 +157,31 @@ const (
 	DeveloperModeMarkerOn DeveloperModeState = "on"
 	// DeveloperModeInvalid means something is at the marker path that fails a
 	// check (a symlink, not a regular file, not root-owned, writable by group
-	// or others, an ACL, or unreadable facts). It counts as absent.
+	// or others, an ACL) or sits under a directory that does. It counts as
+	// absent.
 	DeveloperModeInvalid DeveloperModeState = "invalid"
+	// DeveloperModeUnknown means a probe of the marker itself failed, so this
+	// read cannot say what is at the path, or whether anything is: an account
+	// that cannot search a directory above it gets this for a valid marker and
+	// for an empty path alike. Only DeveloperModeMarkerOn turns developer mode
+	// on, so an install that reads this runs the signature checks. It is not
+	// absent, so a report keeps its row and an install still compares it with
+	// the read under the install lock.
+	DeveloperModeUnknown DeveloperModeState = "unknown"
 )
 
 // DeveloperModeFacts is what an lstat and an ACL probe say about the marker
 // path and the directories above it. Exists false means nothing is there; Err
-// is a probe that failed for any other reason.
+// is a probe of the marker that failed for any other reason, and with Err set
+// Exists and Entry say nothing about what is at the path.
 type DeveloperModeFacts struct {
 	Exists bool
 	Entry  OwnedEntry
 	HasACL bool
 	Err    error
 	// Ancestors describes every directory above the marker, from / down. It
-	// is read only for a marker that is a regular file without an ACL, and a
-	// marker with no ancestor described is invalid.
+	// is left out for a regular file with an ACL, and a marker with no ancestor
+	// described is invalid.
 	Ancestors []DeveloperModeAncestor
 }
 
@@ -197,33 +210,41 @@ func developerModeState(f DeveloperModeFacts, owner int) DeveloperModeState {
 }
 
 // developerModeJudge is the one validity predicate. It returns the state and,
-// when the state is invalid only because a directory above a sound marker
-// failed, that directory's index in f.Ancestors; otherwise -1.
+// when a directory above the marker failed, that directory's index in
+// f.Ancestors; otherwise -1. The directory comes first even for a marker that
+// is invalid by itself: a removal command must not be aimed at a path a
+// directory nobody can trust leads to.
 func developerModeJudge(f DeveloperModeFacts, owner int) (DeveloperModeState, int) {
 	held := func(e OwnedEntry, acl bool) bool {
 		return e.UID == owner && e.Mode.Perm()&0o022 == 0 && !acl
 	}
 	switch {
 	case f.Err != nil:
-		return DeveloperModeInvalid, -1
+		return DeveloperModeUnknown, -1
 	case !f.Exists:
 		return DeveloperModeAbsent, -1
-	case f.Entry.Kind != EntryRegular, !held(f.Entry, f.HasACL), len(f.Ancestors) == 0:
-		return DeveloperModeInvalid, -1
 	}
+	bad := -1
 	for i, a := range f.Ancestors {
 		if a.Err != nil || a.Entry.Kind != EntryDir || !held(a.Entry, a.HasACL) {
-			return DeveloperModeInvalid, i
+			bad = i
+			break
 		}
+	}
+	switch {
+	case bad >= 0:
+		return DeveloperModeInvalid, bad
+	case f.Entry.Kind != EntryRegular, !held(f.Entry, f.HasACL), len(f.Ancestors) == 0:
+		return DeveloperModeInvalid, -1
 	}
 	return DeveloperModeMarkerOn, -1
 }
 
 // DeveloperModeAncestorCause names the first directory above the marker at
-// path that makes an otherwise sound marker invalid: a symlink or other
-// non-directory, a probe failure, not root-owned, writable by group or
-// others, or carrying an ACL. It is "" when the marker itself is the cause,
-// or when nothing is wrong.
+// path that makes an otherwise sound marker invalid, or that sits above a
+// marker that is not a regular file: a symlink or other non-directory, a probe
+// failure, not root-owned, writable by group or others, or carrying an ACL. It
+// is "" when a regular marker itself is the cause, or when nothing is wrong.
 func DeveloperModeAncestorCause(f DeveloperModeFacts, path string) string {
 	_, i := developerModeJudge(f, 0)
 	if i < 0 {
@@ -236,10 +257,10 @@ func DeveloperModeAncestorCause(f DeveloperModeFacts, path string) string {
 	return dirs[i]
 }
 
-// ReadDeveloperModeAncestorCause is DeveloperModeAncestorCause of the marker
-// at path, read through sys.
-func ReadDeveloperModeAncestorCause(sys System, path string) string {
-	return DeveloperModeAncestorCause(ReadDeveloperModeFacts(sys, path), path)
+// DeveloperModeMarkerIsDir reports whether the facts show a directory at the
+// marker path. rm refuses a directory without -r, so the remedy depends on it.
+func DeveloperModeMarkerIsDir(f DeveloperModeFacts) bool {
+	return f.Err == nil && f.Exists && f.Entry.Kind == EntryDir
 }
 
 // ReadDeveloperModeFacts lstats the marker at path and every directory above
@@ -261,11 +282,10 @@ func readDeveloperModeFacts(sys System, root, path string) DeveloperModeFacts {
 		return DeveloperModeFacts{Exists: true, Err: err}
 	}
 	f := DeveloperModeFacts{Exists: true, Entry: e}
-	if e.Kind != EntryRegular {
-		return f
-	}
-	if f.HasACL, f.Err = sys.HasACL(path); f.Err != nil || f.HasACL {
-		return f
+	if e.Kind == EntryRegular {
+		if f.HasACL, f.Err = sys.HasACL(path); f.Err != nil {
+			return f
+		}
 	}
 	dirs, err := markerAncestors(root, path)
 	if err != nil {
@@ -277,6 +297,13 @@ func readDeveloperModeFacts(sys System, root, path string) DeveloperModeFacts {
 		a.Entry, a.Err = sys.Owner(dir)
 		if a.Err == nil && a.Entry.Kind == EntryDir {
 			a.HasACL, a.Err = sys.HasACL(dir)
+		}
+		// Above a non-regular marker a failed probe says nothing about the
+		// directory, and a build without cgo fails every ACL probe. So it is
+		// the read that failed, not a directory to repair.
+		if a.Err != nil && e.Kind != EntryRegular {
+			f.Err, f.Ancestors = a.Err, nil
+			return f
 		}
 		f.Ancestors = append(f.Ancestors, a)
 	}
@@ -379,6 +406,10 @@ func applyDeveloperMode(ctx context.Context, sys System, cfg Config) (*markerRem
 		team, keepReason = plainInstallTeam(ctx, cfg)
 	}
 	if team == "" {
+		if state == DeveloperModeUnknown {
+			cfg.Logger.Warn("the developer-mode marker could not be read: it does not turn developer mode on for this install, and it stays because "+keepReason, "marker", path)
+			return nil, nil
+		}
 		if state == DeveloperModeInvalid {
 			cfg.Logger.Warn("ignored invalid marker: it does not turn developer mode on, and it stays because "+keepReason, "marker", path)
 			return nil, nil
@@ -386,18 +417,20 @@ func applyDeveloperMode(ctx context.Context, sys System, cfg Config) (*markerRem
 		cfg.Logger.Warn("developer mode stays on: "+keepReason+"; run k3sm install --developer-mode off to turn it off", "marker", path)
 		return nil, nil
 	}
-	return &markerRemoval{path: path, team: team, invalid: state == DeveloperModeInvalid}, nil
+	return &markerRemoval{path: path, team: team, invalid: state == DeveloperModeInvalid, unread: state == DeveloperModeUnknown}, nil
 }
 
 // markerRemoval is a developer-mode marker removal applyDeveloperMode decided
 // on. team is the signing team that turned developer mode off, empty for
-// --developer-mode off; invalid says the marker was judged invalid. drop
+// --developer-mode off; invalid says the marker was judged invalid, and unread
+// that it could not be read at all. drop
 // fills saved and savedMode with a valid marker's bytes and mode before it
 // removes it, so restore can put it back if the install root is reverted.
 type markerRemoval struct {
 	path      string
 	team      string
 	invalid   bool
+	unread    bool
 	removed   bool
 	saved     []byte
 	savedMode fs.FileMode
@@ -406,9 +439,10 @@ type markerRemoval struct {
 	stuck bool
 }
 
-// stillOn reports whether drop left a marker that still reads on: neither
-// removal attempt nor the disown cleared it. The install must not wire or
-// restart the new tree beside it, so it reverts the swap instead.
+// stillOn reports whether drop left a marker that still reads on, or that it
+// can no longer read: neither removal attempt nor the disown cleared it. The
+// install must not wire or restart the new tree beside it, so it reverts the
+// swap instead.
 func (r *markerRemoval) stillOn() bool {
 	return r != nil && r.stuck
 }
@@ -462,7 +496,9 @@ func (r *markerRemoval) drop(sys System, cfg Config) error {
 		if cfg.FromStagingDir != "" {
 			subject = "the Developer ID team every staged program shares"
 		}
-		if r.invalid {
+		if r.unread {
+			cfg.Logger.Info("removed a developer-mode marker that could not be read, by "+subject, "signer-team-id", r.team, "marker", r.path)
+		} else if r.invalid {
 			cfg.Logger.Info("removed an invalid developer-mode marker, by "+subject, "signer-team-id", r.team, "marker", r.path)
 		} else {
 			cfg.Logger.Info("developer mode turned off by "+subject, "signer-team-id", r.team, "marker", r.path)
@@ -473,7 +509,9 @@ func (r *markerRemoval) drop(sys System, cfg Config) error {
 
 // disown is drop's fallback for a marker that could not be removed: it hands
 // a regular file at the path to nobody, then reads the marker again. It
-// returns an error with the remedy only when the marker still reads on.
+// returns an error with the remedy only when the marker still reads on, or
+// when it can no longer be read and the handover did not happen, so nothing
+// shows the marker stopped counting.
 func (r *markerRemoval) disown(sys System, cfg Config, removeErr error) error {
 	chownErr := errors.New("it is not a regular file")
 	if e, err := sys.Owner(r.path); err != nil {
@@ -481,11 +519,20 @@ func (r *markerRemoval) disown(sys System, cfg Config, removeErr error) error {
 	} else if e.Kind == EntryRegular {
 		chownErr = sys.Chown(r.path, markerDisownUID, e.GID)
 	}
-	if state := ReadDeveloperModeState(sys, r.path); state != DeveloperModeMarkerOn {
+	state := ReadDeveloperModeState(sys, r.path)
+	unread := state == DeveloperModeUnknown && chownErr != nil
+	if state == DeveloperModeUnknown && !unread {
+		cfg.Logger.Warn("the developer-mode marker could not be removed; it was handed to nobody, and a read afterwards failed, so that it no longer turns developer mode on is inferred from the handover and not confirmed", "marker", r.path, "err", removeErr)
+		return nil
+	}
+	if state != DeveloperModeMarkerOn && !unread {
 		cfg.Logger.Warn("the developer-mode marker could not be removed; it now reads "+string(state)+" and does not turn developer mode on", "marker", r.path, "err", removeErr)
 		return nil
 	}
 	r.stuck = true
+	if unread {
+		return fmt.Errorf("install: %w, and handing the marker to nobody failed too (%v), and the marker cannot be read, so developer mode may still be on; %s", removeErr, chownErr, stuckMarkerRemedy(r.path))
+	}
 	return fmt.Errorf("install: %w, and handing the marker to nobody failed too (%v), so developer mode is still on; %s", removeErr, chownErr, stuckMarkerRemedy(r.path))
 }
 

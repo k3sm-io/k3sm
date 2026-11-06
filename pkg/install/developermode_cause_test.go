@@ -22,7 +22,7 @@ import (
 )
 
 // TestDeveloperModeAncestorCause pins which directory is named: the first bad
-// one above a sound marker, and nothing when the marker itself is the cause.
+// one above any marker, and nothing when the marker alone is the cause.
 func TestDeveloperModeAncestorCause(t *testing.T) {
 	t.Parallel()
 	good := OwnedEntry{Kind: EntryDir, Mode: 0o755}
@@ -39,11 +39,20 @@ func TestDeveloperModeAncestorCause(t *testing.T) {
 		{"root acl", DeveloperModeFacts{Exists: true, Entry: file, Ancestors: []DeveloperModeAncestor{{Entry: good, HasACL: true}, {Entry: good}}}, "/"},
 		{"symlink root", DeveloperModeFacts{Exists: true, Entry: file, Ancestors: []DeveloperModeAncestor{{Entry: OwnedEntry{Kind: EntrySymlink, Mode: 0o755}}, {Entry: good}}}, "/"},
 		{"probe error on library", DeveloperModeFacts{Exists: true, Entry: file, Ancestors: []DeveloperModeAncestor{{Entry: good}, {Err: errors.New("lstat failed")}}}, "/Library"},
-		{"marker is the cause", DeveloperModeFacts{Exists: true, Entry: OwnedEntry{Kind: EntryRegular, UID: 501, Mode: 0o644}, Ancestors: []DeveloperModeAncestor{{Entry: bad}, {Entry: bad}}}, ""},
+		{"a directory marker under a bad directory", DeveloperModeFacts{Exists: true, Entry: good, Ancestors: []DeveloperModeAncestor{{Entry: good}, {Entry: bad}}}, "/Library"},
+		{"a directory marker under sound directories", DeveloperModeFacts{Exists: true, Entry: good, Ancestors: []DeveloperModeAncestor{{Entry: good}, {Entry: good}}}, ""},
+		{"a symlink marker under a bad root", DeveloperModeFacts{Exists: true, Entry: OwnedEntry{Kind: EntrySymlink, Mode: 0o755}, Ancestors: []DeveloperModeAncestor{{Entry: bad}, {Entry: good}}}, "/"},
+		{"marker unread", DeveloperModeFacts{Exists: true, Err: errors.New("lstat failed")}, ""},
+		{"marker is the cause", DeveloperModeFacts{Exists: true, Entry: OwnedEntry{Kind: EntryRegular, UID: 501, Mode: 0o644}, Ancestors: []DeveloperModeAncestor{{Entry: good}, {Entry: good}}}, ""},
+		{"a bad marker under a bad directory", DeveloperModeFacts{Exists: true, Entry: OwnedEntry{Kind: EntryRegular, UID: 501, Mode: 0o644}, Ancestors: []DeveloperModeAncestor{{Entry: bad}, {Entry: bad}}}, "/"},
+		{"a marker with an ACL under a bad directory", DeveloperModeFacts{Exists: true, Entry: file, HasACL: true, Ancestors: []DeveloperModeAncestor{{Entry: good}, {Entry: bad}}}, "/Library"},
 	}
 	for _, tc := range cases {
-		if got := DeveloperModeAncestorCause(tc.f, path); got != tc.want {
-			t.Errorf("%s: cause %q, want %q", tc.name, got, tc.want)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := DeveloperModeAncestorCause(tc.f, path); got != tc.want {
+				t.Errorf("cause %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

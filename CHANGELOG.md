@@ -169,6 +169,14 @@ pin, its date, and the tarball's sha256.
 - `k3sm status` names the cause of an invalid developer-mode row: when `/` or `/Library` is the
   problem, the detail and remedy name that directory instead of suggesting `sudo rm` of the marker,
   which does not fix it. [Status JSON](docs/user/status-json.md) describes the row.
+- `k3sm status` no longer tells you to `sudo rm` a developer-mode marker it could not read. When the
+  path cannot be read, for example under a directory the account running it cannot search, the
+  `developer-mode` row is `unknown` and says it cannot tell whether the mode is on, with
+  `sudo k3sm status` as the remedy. A directory at the marker path gets `sudo rm -r`, which `rm`
+  accepts, unless a directory above it is unsound, and the remedy for a bad `/` or `/Library` now
+  says removing the marker clears the row but leaves that directory as it is. An install that cannot
+  read the marker runs the signature checks, and one that cannot clear an unread marker rolls back,
+  because the mode may still be on.
 - `k3sm update apply` failed on a node at its first step and left it cordoned, because the daemon
   cannot create `/var/lib/k3sm/updates` under the root-owned data root. `k3sm install`
   now creates that directory for the service user, mode 0700, on both roles, `k3sm-netd` repairs it,
