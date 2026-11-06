@@ -18,6 +18,9 @@
 #   TestGateAndServerAgree                  the gate and the server read one repository and
 #                                           one mount source, over the classifier's corpus
 #                                           and near-miss spellings
+#   TestServedRegistryRefusesEncodedPaths   a credentialed client past the gate gets the
+#                                           refusal of a percent escape in the path
+#   FuzzGateAndServerAgree                  the same agreement over its committed seed corpus
 #   TestTestManifestIsComplete              no test left this package without a recorded reason
 # then the status probe, the executor's zot tolerance and reap tiers, and the
 # install's removal of a leftover zot.
@@ -36,7 +39,7 @@ cd "$K3SM_ROOT"
 export CGO_ENABLED=1
 
 go test -race -count=1 -v -tags integration \
-	-run '^(TestServiceRunsTheK3smRegistry|TestServedRegistryRefusesAnonymousPush|TestRestartRebindsTheIngestPort|TestChildCommand|TestSpawnRefusesAMovedExecutable|TestStartRefusesARootDaemon|TestProvisionWritesTheChildsConfig|TestRecordKeepsTheServersFields|TestIsOrphanedChild|TestReclaimRechecksBeforeEachSignal|TestAwaitNeedsA200|TestStoreLeavesZotsDatabasesAlone|TestGateAndServerAgree|TestTestManifestIsComplete)$' \
+	-run '^(TestServiceRunsTheK3smRegistry|TestServedRegistryRefusesAnonymousPush|TestRestartRebindsTheIngestPort|TestChildCommand|TestSpawnRefusesAMovedExecutable|TestStartRefusesARootDaemon|TestProvisionWritesTheChildsConfig|TestRecordKeepsTheServersFields|TestIsOrphanedChild|TestReclaimRechecksBeforeEachSignal|TestAwaitNeedsA200|TestStoreLeavesZotsDatabasesAlone|TestGateAndServerAgree|TestServedRegistryRefusesEncodedPaths|FuzzGateAndServerAgree|TestTestManifestIsComplete)$' \
 	./pkg/registrysvc
 go test -race -count=1 -v -run '^TestRegistryAnswered$' ./pkg/status
 go test -race -count=1 -v -run '^(TestVerifyPayloadSetToleratesZot|TestReapTiersKeepZotAndNeverListK3sm)$' ./pkg/executor
