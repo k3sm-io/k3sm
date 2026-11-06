@@ -860,9 +860,11 @@ rerender_after() {
 	return 1
 }
 
+operator_tty() { (: </dev/tty) 2>/dev/null; }
+
 assert_r6_unplug() {
-	if ! (: </dev/tty) 2>/dev/null; then
-		refuse_rung "$(prereq_what operator)" BI10
+	if ! operator_tty; then
+		refuse_rung "owed, not passed: no operator at /dev/tty to pull and replug the cable" BI10
 		return 2
 	fi
 	local stopf="$RUNG_DIR/poll.stop" mark t0 t1 t1p t2 r0 r1 gap s d before after n uids1 restarted1 pingn=6000
@@ -1305,6 +1307,45 @@ EOF
 	fi
 }
 
+# run_rungs — every rung in table order, one verdict line each in rungs.tsv. A
+# REFUSED rung is owed, not passed: the run goes on to the next rung, the exit is
+# never 0 (N_REFUSED), and --verify-twice wants exactly PASS.
+need() { grep -qw "$1" <<<"$HAVE"; }
+run_rungs() {
+	while IFS='|' read -r id summary prereqs fn ev bi; do
+		[ -n "$id" ] || continue
+		RUNG="$id" RUNG_DIR="$EVIDENCE_DIR/${ev%/}" R_PASS=0 R_FAIL=0 R_REFUSED_MSG=""
+		mkdir -p "$RUNG_DIR"
+		printf '\n==> %s (%s): %s\n' "$id" "$bi" "$summary"
+		missing=""
+		for p in ${prereqs//,/ }; do
+			case " $PREREQ_STATIC $PREREQ_RUNTIME " in *" $p "*) need "$p" || missing="$p" ;; esac
+			[ -n "$missing" ] && break
+		done
+		verdict=""
+		if [ -n "$missing" ]; then
+			echo "REFUSED($id): $(prereq_what "$missing")"
+			verdict=REFUSED
+		else
+			rc=0
+			"$fn" </dev/null || rc=$?
+			if [ "$rc" = 2 ] || [ -n "$R_REFUSED_MSG" ]; then
+				echo "REFUSED($id): ${R_REFUSED_MSG:-the assertion refused}"
+				verdict=REFUSED
+			elif [ "$R_FAIL" = 0 ] && [ "$R_PASS" -gt 0 ]; then
+				verdict=PASS
+			else
+				verdict=FAIL
+			fi
+		fi
+		[ "$id" = r0-disarmed ] && [ "$verdict" = PASS ] && HAVE="$HAVE armable"
+		[ "$id" = r1-arm ] && [ "$verdict" = PASS ] && HAVE="$HAVE armed"
+		case "$verdict" in PASS) N_PASS=$((N_PASS + 1)) ;; FAIL) N_FAIL=$((N_FAIL + 1)) ;; REFUSED) N_REFUSED=$((N_REFUSED + 1)) ;; esac
+		printf '%s\t%s\n' "$id" "$verdict" >>"$EVIDENCE_DIR/rungs.tsv"
+		echo "RUNG $id $verdict ($R_PASS passed, $R_FAIL failed)"
+	done <<<"$RUNG_TABLE"
+}
+
 # ── --plan ──────────────────────────────────────────────────────────────────────
 print_plan() {
 	local id summary prereqs fn ev bi tmp rc
@@ -1476,6 +1517,21 @@ st_reinstall() {
 }
 # st_reinstall_calls <side> <join rc> <install rc> — the calls, one line.
 st_reinstall_calls() { st_reinstall "$@" | tr '\n' ';'; }
+
+# st_owed_rung — the real runner over r6 with no terminal and a following rung: r6
+# is recorded REFUSED and owed, and the next rung still runs.
+st_owed_rung() {
+	local d
+	d="$(mktemp -d -t m17-owed.XXXXXX)"
+	EVIDENCE_DIR="$d" HAVE="armed" N_PASS=0 N_FAIL=0 N_REFUSED=0
+	operator_tty() { return 1; }
+	assert_r7_desired_forge() { pass "stub"; }
+	RUNG_TABLE="$(printf 'r6-unplug|s|armed,operator|assert_r6_unplug|r6-unplug/|BI6\nr7-desired-forge|s|armed|assert_r7_desired_forge|r7/|BI3')"
+	run_rungs
+	cat "$d/rungs.tsv"
+	echo "counts pass=$N_PASS fail=$N_FAIL refused=$N_REFUSED"
+	rm -rf "$d"
+}
 
 # st_hello_payload — the composed netd_hello payload, with nothing executed.
 st_hello_payload() {
@@ -1720,6 +1776,12 @@ self_test_body() {
 	st "verify-twice red: a rung REFUSED (exit 2)" 1 icp_verify_twice "$F/run-a" "$F/run-b-refused" "$REQUIRED_IDS"
 	st "verify-twice red: only rungs.tsv says REFUSED" 1 icp_verify_twice "$F/run-a" "$F/run-b-rung-refused" "$REQUIRED_IDS"
 	st_out "verify-twice red: the per-rung check names it" "rung r5-ring is 'REFUSED', not PASS" icp_verify_twice "$F/run-a" "$F/run-b-rung-refused" "$REQUIRED_IDS"
+	st "verify-twice red: r6 owed, with no operator" 1 icp_verify_twice "$F/run-a" "$F/run-b-r6-owed" "$REQUIRED_IDS"
+	st_out "verify-twice red: r6 owed is named" "rung r6-unplug is 'REFUSED', not PASS" icp_verify_twice "$F/run-a" "$F/run-b-r6-owed" "$REQUIRED_IDS"
+	st_out "no terminal: r6 is refused as owed" "REFUSED(r6-unplug): owed, not passed: no operator at /dev/tty" st_owed_rung
+	st_out "no terminal: rungs.tsv records r6 REFUSED" "r6-unplug	REFUSED" st_owed_rung
+	st_out "no terminal: the next rung still runs" "r7-desired-forge	PASS" st_owed_rung
+	st_out "no terminal: the counts leave the exit non-zero" "counts pass=1 fail=0 refused=1" st_owed_rung
 	st_out "verify-twice red: a copied log is one run (started_utc)" "started_utc is the same in both" icp_verify_twice "$F/run-a" "$F/run-a" "$REQUIRED_IDS"
 	st "--verify-twice mode exits 0 on the green pair" 0 gate_run 0 PASS -- --verify-twice "$F/run-a" "$F/run-b"
 	st "--verify-twice mode exits 1 on a copy" 0 gate_run 1 - -- --verify-twice "$F/run-a" "$F/run-a"
@@ -1908,7 +1970,6 @@ trap 'exit 130' INT TERM HUP
 BASE_DIR="$EVIDENCE_DIR/baseline"
 RUNG_DIR="$BASE_DIR"
 mkdir -p "$BASE_DIR"
-need() { grep -qw "$1" <<<"$HAVE"; }
 probe_miss() { refuse_run "${2:-probe}" "$(prereq_what "$1")${3:+: $3}"; }
 for t in kubectl ssh scp python3 nc curl; do
 	command -v "$t" >/dev/null 2>&1 || probe_miss tools preflight "the local Mac has no $t on PATH"
@@ -2007,38 +2068,7 @@ FINAL_RC=1
 echo "baseline: local $local_NODE (index $local_IDX, $local_TB, LAN $local_LAN, macOS $local_OS), peer $peer_NODE (index $peer_IDX, $peer_TB, LAN $peer_LAN, macOS $peer_OS); artifact $local_SHA; worker $WORKER_NODE"
 
 # ── The rungs, in table order ──────────────────────────────────────────────────
-while IFS='|' read -r id summary prereqs fn ev bi; do
-	[ -n "$id" ] || continue
-	RUNG="$id" RUNG_DIR="$EVIDENCE_DIR/${ev%/}" R_PASS=0 R_FAIL=0 R_REFUSED_MSG=""
-	mkdir -p "$RUNG_DIR"
-	printf '\n==> %s (%s): %s\n' "$id" "$bi" "$summary"
-	missing=""
-	for p in ${prereqs//,/ }; do
-		case " $PREREQ_STATIC $PREREQ_RUNTIME " in *" $p "*) need "$p" || missing="$p" ;; esac
-		[ -n "$missing" ] && break
-	done
-	verdict=""
-	if [ -n "$missing" ]; then
-		echo "REFUSED($id): $(prereq_what "$missing")"
-		verdict=REFUSED
-	else
-		rc=0
-		"$fn" </dev/null || rc=$?
-		if [ "$rc" = 2 ] || [ -n "$R_REFUSED_MSG" ]; then
-			echo "REFUSED($id): ${R_REFUSED_MSG:-the assertion refused}"
-			verdict=REFUSED
-		elif [ "$R_FAIL" = 0 ] && [ "$R_PASS" -gt 0 ]; then
-			verdict=PASS
-		else
-			verdict=FAIL
-		fi
-	fi
-	[ "$id" = r0-disarmed ] && [ "$verdict" = PASS ] && HAVE="$HAVE armable"
-	[ "$id" = r1-arm ] && [ "$verdict" = PASS ] && HAVE="$HAVE armed"
-	case "$verdict" in PASS) N_PASS=$((N_PASS + 1)) ;; FAIL) N_FAIL=$((N_FAIL + 1)) ;; REFUSED) N_REFUSED=$((N_REFUSED + 1)) ;; esac
-	printf '%s\t%s\n' "$id" "$verdict" >>"$EVIDENCE_DIR/rungs.tsv"
-	echo "RUNG $id $verdict ($R_PASS passed, $R_FAIL failed)"
-done <<<"$RUNG_TABLE"
+run_rungs
 
 if [ "$N_FAIL" -gt 0 ]; then
 	FINAL_RC=1
