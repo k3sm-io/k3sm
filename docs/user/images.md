@@ -358,8 +358,12 @@ and now names a newer image, or when `untag` removes a tag. It keeps every tagge
 - a manifest younger than an hour, since a multi-platform push uploads its per-platform
   manifests before the index that names them.
 
-A deleted manifest's layers are reclaimed by the registry's own garbage collection on its next
-sweep, so disk usage drops some time after the prune. An untagged manifest that a Pod names by
+A forced prune that deletes any manifest then has the registry's own garbage collection sweep
+the repositories it deleted from at once, under the same one-hour grace and mass-delete brake as
+every sweep, and the report says how many blobs and bytes that freed. A layer that sweep leaves,
+and the layers of manifests deleted any other way, are reclaimed on the registry's next scheduled
+sweep, every six hours. A sweep the brake stops, or that cannot run, is reported and does not
+change the exit status. An untagged manifest that a Pod names by
 digest is deleted too, so give anything you run by digest a tag. The registry half runs on the
 server that holds the registry, as the control plane's user. It reads the registry's storage
 and deletes through the registry's API with that server's own push credential. On a node with
@@ -374,7 +378,9 @@ anywhere.
 The `-o json` document has three keys. `dryRun` is true without `--force`. `registry` holds
 `name`, `skipped` (set only on a node without a registry), `manifests` (each with `repository`,
 `digest`, `mediaType` and `size`, deleted or to be deleted), `kept` (the untagged manifests kept,
-each with its `reason`), and, when present, `unreadable` repositories and `failed` deletions.
+each with its `reason`), and, when present, `unreadable` repositories, `failed` deletions and
+the `sweep` a forced prune ran (`repositories`, `blobs`, `bytes`, and any `stopped`, `failed` or
+`reviewing` repositories and `error`).
 `cache` holds `blobs`, `reclaimedBytes` and `kept` (counts by reason). The command exits non-zero
 when any deletion fails, after printing the report.
 
