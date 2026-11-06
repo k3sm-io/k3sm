@@ -210,6 +210,9 @@ pin, its date, and the tarball's sha256.
   keeps its blobs as before. When a tag moves, the old image's signatures are reaped with it after the grace,
   and a referrer pushed before its subject, as when an image is signed and then copied, is protected only by
   the grace period: push the subject within it.
+- A push to the registry that would take a repository's `index.json` past 64 MiB, the most the registry
+  reads, now fails and changes nothing. With very many tags such a push used to succeed and leave the
+  repository unreadable, its tags undeletable included. Deleting tags makes room for the next push.
 - A registry image index that names a layer, or any blob over 4 MiB, as one of its manifests no longer stops
   garbage collection of its repository until the index is deleted. A blob that large is no manifest the
   registry stores or serves, so collection keeps it as a blob without reading it, whatever media type the

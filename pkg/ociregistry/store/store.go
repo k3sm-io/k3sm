@@ -48,15 +48,18 @@ const (
 	// tempsDir holds the link a blob replacement renames over a blob. It is beside
 	// blobs/ because the rename must stay on one volume, and not inside it because
 	// zot's GC fails a repository on any name in blobs/<algorithm>/ that is no digest.
-	tempsDir    = ".temps"
-	locksDir    = "locks"
-	fileMode    = 0o600
-	dirMode     = 0o700
-	maxIndexLen = 64 << 20
+	tempsDir = ".temps"
+	locksDir = "locks"
+	fileMode = 0o600
+	dirMode  = 0o700
 	// MaxManifestSize is the largest manifest body the store reads: the
 	// registry's 4 MiB manifest cap.
 	MaxManifestSize = 4 << 20
 )
+
+// maxIndexLen is the largest index.json the store reads, and so the largest it
+// writes. A variable so a test can lower it.
+var maxIndexLen int64 = 64 << 20
 
 // layoutBody is oci-layout's content, as zot writes it.
 var layoutBody = []byte(`{"imageLayoutVersion":"1.0.0"}`)
@@ -90,6 +93,10 @@ var (
 	// ErrNotRegular is a store entry that should be a regular file or a
 	// directory and is not.
 	ErrNotRegular = errors.New("unexpected file type in the store")
+	// ErrIndexFull is a change to a repository's index.json that would take it
+	// past the size the store reads. The change is refused, so the repository
+	// stays readable; deleting tags makes room.
+	ErrIndexFull = errors.New("repository index full")
 )
 
 // Store is the on-disk registry store. Its methods are safe for concurrent use
@@ -254,7 +261,7 @@ func decodeIndex(r io.Reader, p string) (ispec.Index, error) {
 		return ispec.Index{}, fmt.Errorf("read index: read %s: %w", p, err)
 	}
 	if int64(len(b)) > maxIndexLen {
-		return ispec.Index{}, fmt.Errorf("read index: read %s: larger than %d bytes", p, int64(maxIndexLen))
+		return ispec.Index{}, fmt.Errorf("read index: read %s: larger than %d bytes", p, maxIndexLen)
 	}
 	var idx ispec.Index
 	if err := json.Unmarshal(b, &idx); err != nil {
@@ -525,10 +532,17 @@ func (s *Store) createFile(p string, body []byte) error {
 
 // writeIndex replaces dir's index.json: a temp file under .uploads,
 // F_FULLFSYNC, rename, directory sync. The caller holds the repository lock.
+// An index longer than the store reads is ErrIndexFull, and nothing is
+// written: a write that crossed the limit would leave the repository
+// unreadable, its tags undeletable included. Removing rows shrinks an index
+// the store wrote, so a delete makes room rather than being refused.
 func (s *Store) writeIndex(dir string, idx ispec.Index) error {
 	b, err := json.Marshal(idx)
 	if err != nil {
 		return fmt.Errorf("encode index: %w", err)
+	}
+	if int64(len(b)) > maxIndexLen {
+		return fmt.Errorf("%w: %d rows would take index.json to %d bytes, past %d", ErrIndexFull, len(idx.Manifests), len(b), maxIndexLen)
 	}
 	id, err := newID()
 	if err != nil {
