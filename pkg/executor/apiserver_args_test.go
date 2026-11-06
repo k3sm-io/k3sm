@@ -315,3 +315,23 @@ func TestLoopbackComponentPortsAreConfigurable(t *testing.T) {
 		t.Errorf("controller-manager --secure-port on a zero Config = %q, want %d", got, DefaultControllerManagerPort)
 	}
 }
+
+// TestUpdateChannelPairRestsOnNodeRestriction pins what lets a reader trust the
+// release channel a server publishes: it reads only a control-plane Node's pair,
+// and NodeRestriction is what refuses a worker labelling itself one.
+func TestUpdateChannelPairRestsOnNodeRestriction(t *testing.T) {
+	t.Run("NodeRestriction stays in the admission args", func(t *testing.T) {
+		cfg := Config{WorkDir: "/wd", KinePort: 2379, APIServerPort: 6444, NodeIP: "127.0.0.1"}
+		for name, args := range map[string][]string{
+			"raw":       apiServerArgs(cfg),
+			"defaulted": apiServerArgs(cfg.withDefaults()),
+		} {
+			if !hasArg(args, "--enable-admission-plugins=NodeRestriction") {
+				t.Errorf("%s: NodeRestriction is not enabled, so a worker could label itself control-plane: %v", name, args)
+			}
+			if got := flagValue(args, "--disable-admission-plugins"); strings.Contains(got, "NodeRestriction") {
+				t.Errorf("%s: --disable-admission-plugins=%s", name, got)
+			}
+		}
+	})
+}

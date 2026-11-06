@@ -12,6 +12,12 @@ pin, its date, and the tarball's sha256.
 
 ### Added
 
+- `k3sm status` names the update channel: the update row carries `wide.channel`, on the rolling row too,
+  and on `rc` its `detail` ends in `; channel rc`. A failed check on `rc` also names the last good
+  release and when it was checked. A server publishes the channel beside the latest release as the
+  `k3sm.io/release-channel` annotation on its own Node, where a worker's row reads it, and a failed
+  check publishes neither. A worker's row reads `stable` from a server that publishes no channel. On
+  `stable` the row's `detail` does not change. No RBAC changes.
 - `k3sm update channel` prints the cluster's update channel, and fails rather than guess when the
   cluster gives no answer. `k3sm update channel stable|rc` sets it and runs a check, and exits 3 when
   the channel was set but the check failed. A channel changes what is offered and never starts a roll.
