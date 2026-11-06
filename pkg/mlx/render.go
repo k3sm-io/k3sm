@@ -54,8 +54,9 @@ var (
 	// apiserver rejects an over-long one at create time — on the controller's
 	// behalf, where the operator does not see it.
 	ErrNameTooLong = errors.New("derived service name exceeds the 63-character dns label limit")
-	// ErrNoSpecModel is returned when spec.model is empty. There is nothing to
-	// serve, and the serving container would start, find no model, and fail.
+	// ErrNoSpecModel is returned when neither spec.model nor spec.artifact is
+	// set. There is nothing to serve, and the serving container would start,
+	// find no model, and fail.
 	ErrNoSpecModel = errors.New("spec.model is required")
 	// ErrNoMemory is returned when spec.memory is unset or non-positive. On Apple
 	// Silicon the GPU shares system memory, so this is the real scheduling
@@ -222,6 +223,11 @@ type Options struct {
 	DefaultImage string
 	// DefaultPort is the serving port used when spec.port is 0.
 	DefaultPort int32
+	// RegistryHost is the cluster registry's host[:port], the only registry a
+	// spec.artifact reference may name. Empty refuses every artifact model.
+	// It is not part of SpecHash: it is a fact about the cluster, and adding
+	// it must not restart a Hub model's gang.
+	RegistryHost string `json:"-"`
 }
 
 // Objects are the API objects that serve one MLXModel. Every one of them carries
@@ -314,7 +320,7 @@ func Render(m *mlxv1alpha1.MLXModel, opts Options) (*Objects, error) {
 	}
 
 	return &Objects{
-		StatefulSet:      statefulSet(m, p.owner, p.image, p.modelRef, p.port, p.replicas, p.nodeSelector, sizing),
+		StatefulSet:      statefulSet(m, p, sizing),
 		HeadlessService:  headlessService(m, p.owner, p.port),
 		ClusterIPService: clusterIPService(m, p.owner, p.port),
 	}, nil
@@ -324,9 +330,13 @@ func Render(m *mlxv1alpha1.MLXModel, opts Options) (*Objects, error) {
 // object: the checks and defaults the single-node and the sharded render share,
 // so the two cannot disagree about what a valid spec is.
 type prepared struct {
-	owner        metav1.OwnerReference
-	image        string
-	modelRef     string
+	owner      metav1.OwnerReference
+	image      string
+	modelRef   string
+	servedName string
+	// artifact is the read-only image volume holding an artifact model's
+	// weights; nil for a Hub model.
+	artifact     *corev1.Volume
 	port         int32
 	replicas     int32
 	nodeSelector map[string]string
@@ -346,7 +356,7 @@ func prepare(m *mlxv1alpha1.MLXModel, opts Options) (prepared, error) {
 		return prepared{}, renderErr(m, fmt.Errorf("%w: %q is %d characters", ErrNameTooLong,
 			HeadlessServiceName(m.Name), len(HeadlessServiceName(m.Name))))
 	}
-	if m.Spec.Model == "" {
+	if m.Spec.Model == "" && m.Spec.Artifact == nil {
 		return prepared{}, renderErr(m, ErrNoSpecModel)
 	}
 	if m.Spec.Memory.Sign() <= 0 {
@@ -387,8 +397,17 @@ func prepare(m *mlxv1alpha1.MLXModel, opts Options) (prepared, error) {
 	if m.Spec.Quantization != "" {
 		return prepared{}, renderErr(m, fmt.Errorf("%w: spec.quantization=%q", ErrQuantizationUnsupported, m.Spec.Quantization))
 	}
-	modelRef, err := modelReference(m.Spec)
-	if err != nil {
+	// An artifact model is never fetched from the Hub: any refusal here ends
+	// the render, and the engine is pointed at the read-only mount.
+	modelRef, servedName := "", m.Spec.Model
+	var artifact *corev1.Volume
+	var err error
+	if m.Spec.Artifact != nil {
+		if artifact, err = artifactVolume(m, opts); err != nil {
+			return prepared{}, renderErr(m, err)
+		}
+		modelRef, servedName = ArtifactMountPath, ServedModelName(m)
+	} else if modelRef, err = modelReference(m.Spec); err != nil {
 		return prepared{}, renderErr(m, err)
 	}
 
@@ -401,6 +420,8 @@ func prepare(m *mlxv1alpha1.MLXModel, opts Options) (prepared, error) {
 		owner:        ownerReference(m),
 		image:        image,
 		modelRef:     modelRef,
+		servedName:   servedName,
+		artifact:     artifact,
 		port:         port,
 		replicas:     replicas,
 		nodeSelector: nodeSelector,
@@ -559,7 +580,8 @@ func modelReference(spec mlxv1alpha1.MLXModelSpec) (string, error) {
 
 // engineArgs builds the serving container's argument vector in three blocks: the
 // model POSITIONAL, the port to listen on and the served model name (spec.model,
-// whatever the positional resolves to); the memory-derived sizing pins and
+// whatever the positional resolves to, or metadata.name for an artifact model,
+// which has no spec.model); the memory-derived sizing pins and
 // the required --continuous-batching flag (see sizing.go); then the caller's own
 // arguments LAST so an operator can override any of it without this package
 // growing a flag per knob.
@@ -576,22 +598,23 @@ func modelReference(spec mlxv1alpha1.MLXModelSpec) (string, error) {
 // default. Caller args are NOT checked against the measured surface: an operator
 // running a newer engine must be able to pass an option this package has never
 // heard of.
-func engineArgs(spec mlxv1alpha1.MLXModelSpec, modelRef string, port int32, sizing Sizing) []string {
+func engineArgs(spec mlxv1alpha1.MLXModelSpec, modelRef, servedName string, port int32, sizing Sizing) []string {
 	args := []string{
 		modelRef,
 		argPort, strconv.FormatInt(int64(port), 10),
-		argServedModelName, spec.Model,
+		argServedModelName, servedName,
 	}
 	args = append(args, sizing.Args()...)
 	return append(args, spec.Runtime.Args...)
 }
 
 // statefulSet renders the serving StatefulSet.
-func statefulSet(m *mlxv1alpha1.MLXModel, owner metav1.OwnerReference, image, modelRef string, port, replicas int32, nodeSelector map[string]string, sizing Sizing) *appsv1.StatefulSet {
+func statefulSet(m *mlxv1alpha1.MLXModel, p prepared, sizing Sizing) *appsv1.StatefulSet {
+	owner, port := p.owner, p.port
 	container := corev1.Container{
 		Name:  containerName,
-		Image: image,
-		Args:  engineArgs(m.Spec, modelRef, port, sizing),
+		Image: p.image,
+		Args:  engineArgs(m.Spec, p.modelRef, p.servedName, port, sizing),
 		Ports: []corev1.ContainerPort{{
 			Name:          portName,
 			ContainerPort: port,
@@ -625,6 +648,11 @@ func statefulSet(m *mlxv1alpha1.MLXModel, owner metav1.OwnerReference, image, mo
 		})
 		claims = append(claims, cacheClaim(m, *c))
 	}
+	var volumes []corev1.Volume
+	if p.artifact != nil {
+		container.VolumeMounts = append(container.VolumeMounts, artifactMount())
+		volumes = append(volumes, *p.artifact)
+	}
 
 	return &appsv1.StatefulSet{
 		TypeMeta: metav1.TypeMeta{APIVersion: appsv1.SchemeGroupVersion.String(), Kind: "StatefulSet"},
@@ -635,7 +663,7 @@ func statefulSet(m *mlxv1alpha1.MLXModel, owner metav1.OwnerReference, image, mo
 			OwnerReferences: []metav1.OwnerReference{owner},
 		},
 		Spec: appsv1.StatefulSetSpec{
-			Replicas:    ptr.To(replicas),
+			Replicas:    ptr.To(p.replicas),
 			ServiceName: HeadlessServiceName(m.Name),
 			Selector:    &metav1.LabelSelector{MatchLabels: selectorLabels(m.Name)},
 			// Parallel, not the OrderedReady default: readiness here is gated on a
@@ -653,9 +681,10 @@ func statefulSet(m *mlxv1alpha1.MLXModel, owner metav1.OwnerReference, image, mo
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: Labels(m.Name)},
 				Spec: corev1.PodSpec{
-					NodeSelector: nodeSelector,
+					NodeSelector: p.nodeSelector,
 					Tolerations:  providerTolerations(),
 					Containers:   []corev1.Container{container},
+					Volumes:      volumes,
 				},
 			},
 		},

@@ -770,7 +770,7 @@ func startMLXOperator(ctx context.Context, plan serverPlan, restCfg *rest.Config
 	} else {
 		indices = meshPeerIndexSet(list)
 	}
-	mlxOp, err := operator.New(mlxOperatorConfig(cs, dynClient, crdClient, mlxGPU, indices, plan.opts.domain, logger))
+	mlxOp, err := operator.New(mlxOperatorConfig(cs, dynClient, crdClient, mlxGPU, indices, plan.opts.registryPort, plan.opts.domain, logger))
 	if err != nil {
 		logger.Error("build the mlx operator", "err", err)
 		return mlxGPU, noStop

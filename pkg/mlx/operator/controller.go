@@ -106,6 +106,10 @@ type Config struct {
 	// GPU supplies the node GPU facts the pre-render fit check reads. nil skips
 	// the fit check — see GPUSource.
 	GPU GPUSource
+	// Artifacts resolves a spec.artifact tag to a manifest digest in the
+	// cluster registry (RegistryResolver). nil leaves only references by
+	// digest servable; a tag reference reports InvalidSpec.
+	Artifacts ArtifactResolver
 	// InterconnectIndices returns every node's cluster index, from its pod /24:
 	// the derivation the interconnect resolver uses (the server wires the same
 	// MeshPeer-backed source into both). Sharded placement turns each index into
@@ -115,7 +119,8 @@ type Config struct {
 	// thunderbolt reports NoInterconnectSegment).
 	InterconnectIndices func(ctx context.Context) (interconnect.Indices, error)
 	// Options are the operator-level render defaults (the pinned serving image
-	// and port) an MLXModel spec does not have to state. They are also what the
+	// and port, and the cluster registry host an artifact must name) an
+	// MLXModel spec does not have to state. They are also what the
 	// published status endpoint resolves its port through, so the endpoint cannot
 	// name a port the rendered Service does not expose.
 	Options mlx.Options
@@ -141,6 +146,7 @@ type Controller struct {
 	dyn       dynamic.Interface
 	crd       crdensure.CRDClient
 	gpu       GPUSource
+	artifacts ArtifactResolver
 	indices   func(ctx context.Context) (interconnect.Indices, error)
 	opts      mlx.Options
 	domain    string
@@ -178,6 +184,7 @@ func New(cfg Config) (*Controller, error) {
 		dyn:       cfg.Dynamic,
 		crd:       cfg.CRD,
 		gpu:       cfg.GPU,
+		artifacts: cfg.Artifacts,
 		indices:   cfg.InterconnectIndices,
 		opts:      cfg.Options,
 		domain:    cfg.ClusterDomain,
@@ -415,6 +422,20 @@ func (c *Controller) Reconcile(ctx context.Context, key string) error {
 		return nil
 	}
 
+	// The artifact digest first, before any status can be written at this
+	// generation (see resolveArtifact). A failure is reported; a registry
+	// error is retried, a missing resolver waits for the configuration.
+	if err := c.resolveArtifact(ctx, model); err != nil {
+		c.log.Warn("mlxmodel artifact cannot be resolved; no objects applied", "mlxmodel", key, "err", err)
+		if werr := c.writeStatus(ctx, raw, model, invalidSpecStatus(model, err, c.now())); werr != nil {
+			return werr
+		}
+		if errors.Is(err, errNoResolver) {
+			return nil
+		}
+		return err
+	}
+
 	// A sharded model is a different workload shape (rank Pods, not a
 	// StatefulSet) with its own fit, placement and lifecycle; see sharded.go.
 	if model.Spec.Distributed != nil {
@@ -546,7 +567,7 @@ func (c *Controller) probe(ctx context.Context, m *mlxv1alpha1.MLXModel, podIP s
 		return mlx.ProbeUnknown
 	}
 	base := fmt.Sprintf("http://%s", hostPort(podIP, port))
-	return mlx.ProbeOpenAISurface(ctx, c.transport, base, m.Spec.Model, probeTimeout)
+	return mlx.ProbeOpenAISurface(ctx, c.transport, base, mlx.ServedModelName(m), probeTimeout)
 }
 
 // podReady reads a pod's Ready condition.
@@ -567,7 +588,7 @@ func podReady(pod *corev1.Pod) bool {
 // per resync forever, and each write is a watch event that re-enqueues the model
 // that produced it.
 func (c *Controller) writeStatus(ctx context.Context, raw *unstructured.Unstructured, m *mlxv1alpha1.MLXModel, status mlxv1alpha1.MLXModelStatus) error {
-	if statusEqual(m.Status, status) {
+	if statusEqual(m.Status, status) && storedResolvedArtifact(raw) == status.ResolvedArtifact {
 		return nil
 	}
 	next := m.DeepCopy()

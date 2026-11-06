@@ -443,6 +443,10 @@ func shardedServices(m *mlxv1alpha1.MLXModel, p prepared) (headless, clusterIP *
 // mean the same thing, so they hash the same, exactly as the field's absence
 // hashed before. An explicit thunderbolt or network still moves the hash: like
 // any other spec edit, a changed path request re-renders the gang.
+//
+// An artifact model's resolved digest (status.resolvedArtifact) is hashed too,
+// so a gang whose ranks run another digest is restarted onto the recorded one.
+// It is omitted when empty, so a Hub model hashes exactly as it always has.
 func SpecHash(m *mlxv1alpha1.MLXModel, opts Options) (string, error) {
 	spec := m.Spec
 	if d := spec.Distributed; d != nil && d.Interconnect == mlxv1alpha1.MLXInterconnectAuto {
@@ -450,10 +454,15 @@ func SpecHash(m *mlxv1alpha1.MLXModel, opts Options) (string, error) {
 		norm.Interconnect = ""
 		spec.Distributed = &norm
 	}
+	var resolved string
+	if spec.Artifact != nil {
+		resolved = m.Status.ResolvedArtifact
+	}
 	raw, err := json.Marshal(struct {
-		Spec    mlxv1alpha1.MLXModelSpec `json:"spec"`
-		Options Options                  `json:"options"`
-	}{spec, opts})
+		Spec             mlxv1alpha1.MLXModelSpec `json:"spec"`
+		Options          Options                  `json:"options"`
+		ResolvedArtifact string                   `json:"resolvedArtifact,omitempty"`
+	}{spec, opts, resolved})
 	if err != nil {
 		return "", fmt.Errorf("hash spec: %w", err)
 	}
@@ -533,12 +542,13 @@ func rankPod(m *mlxv1alpha1.MLXModel, p prepared, placement Placement, r RankPla
 		Command: []string{shardInterpreter, "-m", shardModule},
 		// The model leads, then the name it serves under, then the caller's
 		// own arguments LAST: the override seam the single-node engineArgs
-		// keeps. The served name is spec.model, as on the single-node path: a
-		// pinned modelRef is the snapshot path, which no client names. The
+		// keeps. The served name is spec.model (metadata.name for an artifact
+		// model), as on the single-node path: a pinned modelRef is the
+		// snapshot path and an artifact's is its mount, which no client names. The
 		// entrypoint takes --served-model-name itself (mlx_lm.server has no
 		// such option) and adds --host, --port and --pipeline from the
 		// environment.
-		Args: append([]string{shardModelFlag, p.modelRef, argServedModelName, m.Spec.Model}, m.Spec.Runtime.Args...),
+		Args: append([]string{shardModelFlag, p.modelRef, argServedModelName, p.servedName}, m.Spec.Runtime.Args...),
 		Ports: []corev1.ContainerPort{{
 			Name:          collectivePortName,
 			ContainerPort: CollectivePort,
@@ -583,6 +593,10 @@ func rankPod(m *mlxv1alpha1.MLXModel, p prepared, placement Placement, r RankPla
 				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: claim.Name},
 			},
 		})
+	}
+	if p.artifact != nil {
+		container.VolumeMounts = append(container.VolumeMounts, artifactMount())
+		volumes = append(volumes, *p.artifact)
 	}
 
 	return &corev1.Pod{
