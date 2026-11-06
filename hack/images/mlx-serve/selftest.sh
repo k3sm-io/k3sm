@@ -1769,15 +1769,27 @@ def no_lookup(name):
 files, cenv, _ = ks.plan(env(K3SM_MLX_HOSTS=tb_hosts, K3SM_INTERCONNECT_IP="169.254.0.10"), [], resolver=no_lookup)
 check("tb.hostfile  K3SM_MLX_HOSTS becomes the hostfile in rank order, with no name lookup",
       json.loads(next(iter(files.values()))) == [["169.254.0.2:29500"], ["169.254.0.10:29500"]])
-for label, e in (("tb.mismatch  refuses an own entry that is not K3SM_INTERCONNECT_IP",
-                  env(K3SM_MLX_HOSTS=tb_hosts, K3SM_INTERCONNECT_IP="169.254.0.18")),
-                 ("tb.unattached  refuses K3SM_MLX_HOSTS without K3SM_INTERCONNECT_IP",
-                  env(K3SM_MLX_HOSTS=tb_hosts))):
+# Each refusal also ends the rank with its own status: a misplaced rank exits
+# MISPLACED_STATUS (3, a placement error the operator re-places), an unattached
+# one REFUSED_STATUS (2, an interconnect loss).
+for label, e, want in (("tb.mismatch  refuses an own entry that is not K3SM_INTERCONNECT_IP, exiting 3",
+                        env(K3SM_MLX_HOSTS=tb_hosts, K3SM_INTERCONNECT_IP="169.254.0.18"), 3),
+                       ("tb.unattached  refuses K3SM_MLX_HOSTS without K3SM_INTERCONNECT_IP, exiting 2",
+                        env(K3SM_MLX_HOSTS=tb_hosts), 2)):
     try:
         ks.plan(e, [], resolver=no_lookup)
-        check(label, False)
+        refused = False
     except ks.ShardError:
-        check(label, True)
+        refused = True
+    saved = dict(os.environ)
+    os.environ.clear()
+    os.environ.update(e)
+    try:
+        rc = ks.main(["--model", "/m"])
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+    check(label, refused and rc == want and want in (ks.MISPLACED_STATUS, ks.REFUSED_STATUS))
 
 # refusals: no pod data volume, a rank list that disagrees with the world size
 for label, e in (("nodatavolume  refuses to write anywhere but the pod data volume", env(TMPDIR=None)),

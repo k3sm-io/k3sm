@@ -177,6 +177,22 @@ func (c *Controller) reconcileSharded(ctx context.Context, key string, raw *unst
 			obs.LostRanks = lost
 			return c.interconnectLost(ctx, key, raw, model, ic, obs)
 		}
+		// A rank given the wrong interconnect address is a placement error, not
+		// an interconnect loss: the cable is up. The gang is re-placed with no
+		// restart record, and the re-placement waits for the nodes' desired
+		// annotations like any other. A real loss in the same gang is handled
+		// above, first.
+		if misplaced := misplacedRanks(pods); len(misplaced) > 0 {
+			fault := fmt.Sprintf("placement error: %s; re-placing the gang", strings.Join(misplaced, ", "))
+			if err := c.deleteRankPods(ctx, model, fault); err != nil {
+				return err
+			}
+			c.log.Warn("sharded mlxmodel rank was placed on the wrong interconnect slot; re-placing the gang", "mlxmodel", key, "ranks", misplaced)
+			c.queue.AddAfter(key, gangRetry)
+			return c.writeShardedStatus(ctx, raw, model, mlx.ShardObservation{
+				Desired: desired, GangRestart: fault, Pods: c.observeRanks(ctx, model, pods),
+			})
+		}
 		fault, err := c.gangFault(ctx, model, pods, hash)
 		if err != nil {
 			return err
@@ -382,11 +398,13 @@ func (c *Controller) forceNetwork(model *mlxv1alpha1.MLXModel) bool {
 //   - its k3sm.io/InterconnectAttached condition is False (the attach was
 //     refused);
 //   - it failed with exit status 2, k3sm-shard's refusal to start (no
-//     interconnect address, or its hostfile entry is not its address);
+//     interconnect address);
 //   - it failed before any attach was recorded.
 //
 // Every one is an interconnect loss with the loss's limit, never the generic
 // gang restart, which would re-resolve straight back onto the cable. A rank
+// that exited shardMisplacedExit is not listed: it held an interconnect
+// address, only not the one its hostfile entry names (misplacedRanks). A rank
 // that failed otherwise, after its attach succeeded, is the generic gang fault.
 // A gang on the network path lists nothing.
 func lostRanks(pods []corev1.Pod) []string {
@@ -406,6 +424,7 @@ func lostRanks(pods []corev1.Pod) []string {
 		case attach != nil && attach.Status == corev1.ConditionFalse:
 			out = append(out, fmt.Sprintf("%s (attach refused, %s: %s)", pod.Name, attach.Reason, attach.Message))
 		case pod.Status.Phase != corev1.PodFailed:
+		case exitedWith(pod, shardMisplacedExit):
 		case exitedWith(pod, shardRefusedExit):
 			out = append(out, fmt.Sprintf("%s (exited %d: k3sm-shard refused to start on the interconnect)", pod.Name, shardRefusedExit))
 		case attach == nil:
@@ -415,10 +434,34 @@ func lostRanks(pods []corev1.Pod) []string {
 	return out
 }
 
-// shardRefusedExit is the exit status of k3sm-shard refusing to start a rank
-// (hack/images/mlx-serve/k3sm_shard.py main): on the thunderbolt path, a rank
-// without its interconnect address or whose hostfile entry is not it.
-const shardRefusedExit = 2
+// The k3sm-shard exit statuses the operator reads
+// (hack/images/mlx-serve/k3sm_shard.py, REFUSED_STATUS and MISPLACED_STATUS;
+// TestShardExitStatusesMatchTheScript keeps them in sync).
+const (
+	// shardRefusedExit is k3sm-shard refusing to start a rank: on the
+	// thunderbolt path, a rank without its interconnect address.
+	shardRefusedExit = 2
+	// shardMisplacedExit is k3sm-shard refusing a rank on the thunderbolt path
+	// whose interconnect address is not the one its K3SM_MLX_HOSTS entry
+	// names: the node's provider gave it another slot.
+	shardMisplacedExit = 3
+)
+
+// misplacedRanks lists the rank Pods on the thunderbolt path that exited
+// shardMisplacedExit, as "pod (why)". Each is a placement error the operator
+// retries by re-placing the gang, never an interconnect loss.
+func misplacedRanks(pods []corev1.Pod) []string {
+	var out []string
+	for i := range pods {
+		pod := &pods[i]
+		if pod.Annotations[mlx.AnnotationInterconnect] != string(mlxv1alpha1.MLXInterconnectThunderbolt) ||
+			pod.Status.Phase != corev1.PodFailed || !exitedWith(pod, shardMisplacedExit) {
+			continue
+		}
+		out = append(out, fmt.Sprintf("%s (exited %d: its interconnect address is not the one K3SM_MLX_HOSTS names)", pod.Name, shardMisplacedExit))
+	}
+	return out
+}
 
 // exitedWith reports whether any of the pod's containers terminated with code.
 func exitedWith(pod *corev1.Pod, code int32) bool {
