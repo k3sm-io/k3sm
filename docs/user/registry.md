@@ -539,6 +539,10 @@ with a delay long enough that a slow push is never collected out from under itse
 directory while the server is stopped resets the registry to empty; nothing else in the cluster
 depends on its contents.
 
+A signature or other referrer is kept while the image it names as its subject is. When a tag moves,
+the old image's signatures are collected with it after the delay, and a referrer pushed before its
+image (signed, then copied) is protected only by that delay, so push the image within it.
+
 The first sweep that meets a repository only reports. The server log lists what it would remove as
 `registry gc: would reap` lines, and later sweeps delete. A repository stays in that state until a
 sweep can read it and the half-repository brake lets it through, and one in that state does not

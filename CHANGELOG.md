@@ -203,6 +203,13 @@ pin, its date, and the tarball's sha256.
 
 ### Fixed
 
+- The registry's garbage collection no longer stops every sweep of a repository that holds only untagged
+  manifests when one of them is a referrer, such as a signature, whose subject is gone. Such a referrer is now
+  reaped once it is older than the grace period, with its subject's image, as `k3sm image prune` already
+  treats it. A referrer whose subject is kept, by a tag, by a kept index or by being younger than the grace,
+  keeps its blobs as before. When a tag moves, the old image's signatures are reaped with it after the grace,
+  and a referrer pushed before its subject, as when an image is signed and then copied, is protected only by
+  the grace period: push the subject within it.
 - A managed update no longer stalls on a node when a phase write fails, as it does when the server restarts
   during that node's update. The node used to stop working on the update without saying so, until the update
   controller's 30-minute node timeout failed the roll. It now retries the write for up to 5 minutes of backoff,

@@ -67,14 +67,14 @@ func imageBlobs(t *testing.T, body []byte) []digest.Digest {
 // TestReadPathsAfterReap pins what every registry read path answers once one
 // sweep has reaped content, with the referrers view warm before the sweep and
 // cold (a second server over the swept store) after it. In "app" the sweep
-// reaps an untagged image past the grace and keeps a tagged one; a manifest
-// that carries a subject is never reaped (gc makePlan), so both images keep
-// their signature. "gone" was emptied by a DELETE, so the sweep reaps its
+// reaps an untagged image past the grace and keeps a tagged one. A signature
+// is kept while its subject is (gc makePlan), so the tagged image keeps its
+// signature and the reaped one's goes with it. "gone" was emptied by a DELETE, so the sweep reaps its
 // blobs (older than its index, which lifts the half brake) and drops its layout.
 //
-//   - referrers of a reaped subject: 200 listing the surviving signature, the
-//     spec's answer for an unknown subject, warm or cold, and the signature
-//     and its config still read; the reaped subject's row is never read again;
+//   - referrers of a reaped subject: 200 with an empty list, the spec's answer
+//     for an unknown subject, warm or cold, and the signature and its config
+//     answer 404; the reaped subject's row is never read again;
 //   - tag list: the tagged name only; of the dropped repository, 404 NAME_UNKNOWN;
 //   - catalog: "app" only, once the layout of "gone" is removed;
 //   - GET and HEAD of a reaped manifest: 404 MANIFEST_UNKNOWN (HEAD no body);
@@ -99,7 +99,6 @@ func TestReadPathsAfterReap(t *testing.T) {
 
 	reapedBlobs := append(imageBlobs(t, reapedImg), reapedSigCfg)
 	f.age(t, "app", old, append([]digest.Digest{dg(reapedImg), dg(reapedSig), dg(keptSig), keptSigCfg}, reapedBlobs...)...)
-	reapedBlobs = reapedBlobs[:2] // the signature's config stays with the signature
 	goneBlobs := imageBlobs(t, goneImg)
 	f.age(t, "gone", old.Add(-grace), append([]digest.Digest{dg(goneImg)}, goneBlobs...)...)
 	if err := os.Chtimes(filepath.Join(f.root, "gone", "index.json"), old, old); err != nil {
@@ -138,9 +137,9 @@ func TestReadPathsAfterReap(t *testing.T) {
 		srv.f.srv.referrerRead = func(d digest.Digest) { reads = append(reads, d) }
 		t.Run(srv.name, func(t *testing.T) {
 			f := srv.f
-			t.Run("referrers of a reaped subject remain", func(t *testing.T) {
-				if got := referrers(f, "app", reapedImg); !slices.Equal(got, []digest.Digest{dg(reapedSig)}) {
-					t.Errorf("referrers %v, want the surviving signature", got)
+			t.Run("referrers of a reaped subject go with it", func(t *testing.T) {
+				if got := referrers(f, "app", reapedImg); len(got) != 0 {
+					t.Errorf("referrers %v, want none", got)
 				}
 			})
 			t.Run("referrers of a kept subject remain", func(t *testing.T) {
@@ -168,7 +167,7 @@ func TestReadPathsAfterReap(t *testing.T) {
 				for _, m := range []struct {
 					repo string
 					body []byte
-				}{{"app", reapedImg}, {"gone", goneImg}} {
+				}{{"app", reapedImg}, {"app", reapedSig}, {"gone", goneImg}} {
 					p := "/v2/" + m.repo + "/manifests/" + dg(m.body).String()
 					code := codeManifestUnknown
 					if m.repo == "gone" {
@@ -179,9 +178,7 @@ func TestReadPathsAfterReap(t *testing.T) {
 						t.Errorf("HEAD %s: %d with %d body bytes", p, w.Code, w.Body.Len())
 					}
 				}
-				for _, d := range []digest.Digest{dg(reapedSig), dg(keptSig)} {
-					want(t, f.do(http.MethodGet, "/v2/app/manifests/"+d.String(), nil), http.StatusOK, "")
-				}
+				want(t, f.do(http.MethodGet, "/v2/app/manifests/"+dg(keptSig).String(), nil), http.StatusOK, "")
 				want(t, f.do(http.MethodGet, "/v2/app/manifests/kept", nil), http.StatusOK, "")
 			})
 			t.Run("blobs", func(t *testing.T) {
@@ -190,7 +187,7 @@ func TestReadPathsAfterReap(t *testing.T) {
 					d    digest.Digest
 					live bool
 				}{
-					{"app", reapedBlobs[0], false}, {"app", reapedBlobs[1], false}, {"app", reapedSigCfg, true},
+					{"app", reapedBlobs[0], false}, {"app", reapedBlobs[1], false}, {"app", reapedSigCfg, false},
 					{"gone", goneBlobs[0], false}, {"gone", goneBlobs[1], false},
 					{"app", imageBlobs(t, keptImg)[0], true}, {"app", imageBlobs(t, keptImg)[1], true},
 				} {
