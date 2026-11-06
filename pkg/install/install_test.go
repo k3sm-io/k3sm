@@ -25,6 +25,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -192,6 +193,8 @@ type fakeSystem struct {
 	// control plane — so an unconfigured fake describes a reachable cluster and
 	// only a test about multi-address resolution has to say anything.
 	joinAddrs map[string][]string
+	// apiServerDial answers DialAPIServer; nil means nothing is listening.
+	apiServerDial func(ctx context.Context, addr string) (net.Conn, error)
 	// joinDialErrs are the addresses DialJoinServer REFUSES, keyed by host:port.
 	// The zero value answers on every address, for the reason above: a test that
 	// wants the crash-loop this preflight prevents states the refusal itself.
@@ -1165,6 +1168,16 @@ func (f *fakeSystem) DialJoinServer(addr string, _ time.Duration) error {
 	return f.joinDialErrs[addr]
 }
 
+// DialAPIServer records the address and answers from apiServerDial; with none set
+// nothing is listening, which is a first install's and a stopped node's apiserver.
+func (f *fakeSystem) DialAPIServer(ctx context.Context, addr string) (net.Conn, error) {
+	f.calls = append(f.calls, "DialAPIServer:"+addr)
+	if f.apiServerDial != nil {
+		return f.apiServerDial(ctx, addr)
+	}
+	return nil, fmt.Errorf("dial tcp %s: connect: %w", addr, syscall.ECONNREFUSED)
+}
+
 // FetchJoinCA records the address and serves the configured CA: the per-address
 // entry, then the every-address one, then this package's own test cluster.
 func (f *fakeSystem) FetchJoinCA(addr string, _ time.Duration) ([]byte, error) {
@@ -1926,6 +1939,9 @@ func TestInstallOrchestration(t *testing.T) {
 		// LAN switch an install with neither --lan nor a record writes (the
 		// fake reports every path present, so this answers at the first one).
 		"PathExists:/Library/LaunchDaemons/io.k3sm.server.plist",
+		// A first root-only CA copy is checked while an apiserver could still answer:
+		// there is no CA yet, so nothing is asked.
+		"ReadFile:/var/lib/k3sm/server/tls/cluster-ca.crt",
 		// The upgrade check: is any daemon an earlier install left running?
 		// Read-only probes, node daemon first; on this first install neither is
 		// loaded, so nothing is booted out before the state tree is re-owned.

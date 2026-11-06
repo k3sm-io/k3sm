@@ -968,6 +968,11 @@ func (darwinSystem) DialJoinServer(addr string, timeout time.Duration) error {
 	return nil
 }
 
+// DialAPIServer opens a TCP connection to this server's apiserver at addr.
+func (darwinSystem) DialAPIServer(ctx context.Context, addr string) (net.Conn, error) {
+	return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+}
+
 // FetchJoinCA reads the cluster CA PEM the bootstrap listener at addr serves.
 //
 // The TLS posture is InsecureSkipVerify with NO replacement verification, which

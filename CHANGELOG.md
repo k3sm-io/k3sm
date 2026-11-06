@@ -232,6 +232,10 @@ pin, its date, and the tarball's sha256.
   warns, also when the control plane has just made a new CA. To start a new cluster on a node that has a copy, a
   former worker or one whose work dir was removed, run `sudo rm /var/lib/k3sm/keys/cluster-ca.crt` and then
   `sudo k3sm install`; until then its root commands and `k3sm-netd` keep checking the apiserver against the old CA.
+  Before writing a server's first copy, install checks that a running apiserver's certificate chains to the CA and
+  writes nothing, with a warning, if it does not. A worker's first copy, taken from its node credential, is checked
+  the same way against a root-owned join token's CA hash. With nothing to check against, install writes the copy as
+  before and logs it as unverified.
 - `k3sm netd` as root with a `--kubeconfig` an install did not write now needs `--cluster-ca` naming a root-owned
   CA. Without one it starts no informers, denies privileged binds, and logs what to pass.
 - An agent run as root accepts only inline credentials in the kubeconfigs its mesh watcher, MeshPeer list and

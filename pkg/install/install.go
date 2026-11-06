@@ -40,7 +40,6 @@ import (
 	"net/netip"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -560,6 +559,10 @@ type System interface {
 	// not answer inside timeout. It proves reachability and nothing else — the
 	// cluster's identity is FetchJoinCA's question.
 	DialJoinServer(addr string, timeout time.Duration) error
+	// DialAPIServer opens a TCP connection to addr (a host:port, this server's
+	// apiserver), for checkServedCA to read the certificate it serves. ctx bounds
+	// the dial.
+	DialAPIServer(ctx context.Context, addr string) (net.Conn, error)
 	// FetchJoinCA returns the cluster CA PEM the bootstrap listener at addr
 	// serves on bootstrap.CACertPath — the unauthenticated, deliberately public
 	// endpoint a node with no credential reads to learn which cluster it is
@@ -1537,6 +1540,14 @@ type Config struct {
 	// restart step, where an install with Start runs the start precondition
 	// and removes it.
 	userStop *userStopState
+	// servedCA is what the running apiserver said about a server's first root-only
+	// CA copy, asked before the daemons stop; nil when it was not asked. Install
+	// sets it (checkServedCABeforeStop).
+	servedCA *servedCACheck
+	// heldTokenPin is the CA hash of a worker's root-held join token, read before
+	// the work dir's files change hands; empty when there is none. Install sets it
+	// (rootHeldTokenPin).
+	heldTokenPin string
 }
 
 // userStopState is a stop marker as Install read it: the content, or the
@@ -2072,6 +2083,9 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 				stopAttrs(marker, cfg)...)
 		}
 	}
+	// A server's first root-only CA copy is checked here (step 2e writes it), since
+	// the stop below takes the apiserver away.
+	cfg.servedCA = checkServedCABeforeStop(ctx, sys, cfg, serverArgs)
 	stopped, err := stopRunningDaemons(ctx, sys, m, cfg.Logger)
 	// Until step 4 takes over restarting them, a failure leaves the stopped
 	// daemons stopped, and the error says so rather than leaving the operator
@@ -2194,6 +2208,9 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	//     node-password, and for why this is a migration to the fresh-install
 	//     posture rather than a widening of it.
 	if cfg.Role == RoleAgent {
+		if len(joinCA) == 0 {
+			cfg.heldTokenPin = rootHeldTokenPin(sys, cfg)
+		}
 		if err := adoptLegacyAgentFiles(sys, cfg, uid); err != nil {
 			return err
 		}
@@ -2409,13 +2426,15 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	//
 	//     The CA found here also gives an upgraded server its root-only copy, before
 	//     the publish below, so no helper restarted on the new tree goes without it.
+	//     The daemons are stopped by now, so a first copy goes by the check made
+	//     before they stopped (cfg.servedCA).
 	if cfg.Role != RoleAgent {
 		caPath := certs.ClusterCACertPath(cfg.serverWorkDir())
 		ca, err := sys.ReadFile(caPath)
 		switch {
 		case err == nil:
 			cfg.ClusterCA = ca
-			if err := provisionServerClusterCA(sys, cfg, ca); err != nil {
+			if err := provisionServerClusterCA(ctx, sys, cfg, ca); err != nil {
 				return err
 			}
 		case errors.Is(err, fs.ErrNotExist):
@@ -2975,35 +2994,6 @@ var ErrClusterCATimeout = errors.New("the control plane did not write the cluste
 // insecure-skip-tls-verify.
 var ErrNoClusterCA = errors.New("no cluster CA to pin in the admin kubeconfig")
 
-// awaitClusterCA fills cfg.ClusterCA with the cluster CA the control plane mints on
-// its first boot, reading certs.ClusterCACertPath every b.poll for at most
-// b.running. A CA already read (step 2e, an upgrade) returns at once. A read error
-// other than not-exist fails at once. A timeout is ErrClusterCATimeout naming the
-// path and the recovery.
-func awaitClusterCA(ctx context.Context, sys System, cfg *Config, b restartBudget) error {
-	if len(cfg.ClusterCA) > 0 {
-		return nil
-	}
-	caPath := certs.ClusterCACertPath(cfg.serverWorkDir())
-	ctx, cancel := context.WithTimeout(ctx, b.running)
-	defer cancel()
-	for {
-		ca, err := sys.ReadFile(caPath)
-		switch {
-		case err == nil && len(ca) > 0:
-			cfg.ClusterCA = ca
-			return nil
-		case err != nil && !errors.Is(err, fs.ErrNotExist):
-			return fmt.Errorf("install: read cluster CA %s: %w", caPath, err)
-		}
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("install: %w: waited %s for %s; check the server log, then run `sudo k3sm install` again", ErrClusterCATimeout, b.running, caPath)
-		case <-time.After(b.poll):
-		}
-	}
-}
-
 // AdminKubeconfig renders the admin kubeconfig (the apiserver's EFFECTIVE
 // address + the shared static token) written to the human's home so `kubectl`
 // works once the server is up. It pins the cluster CA (Config.ClusterCA) as
@@ -3019,11 +3009,7 @@ func AdminKubeconfig(cfg Config) ([]byte, error) {
 	if len(cfg.ClusterCA) == 0 {
 		return nil, ErrNoClusterCA
 	}
-	host := adminLoopbackHost
-	if mesh := cfg.meshIP(); mesh != "" {
-		host = mesh
-	}
-	server := "https://" + net.JoinHostPort(host, strconv.Itoa(cfg.APIServerPort))
+	server := "https://" + cfg.apiServerAddr()
 	return []byte(fmt.Sprintf(`apiVersion: v1
 kind: Config
 clusters:
