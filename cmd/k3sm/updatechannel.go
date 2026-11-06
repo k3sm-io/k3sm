@@ -74,6 +74,12 @@ type channelReading struct {
 	// note says why this reader runs as stable when it does so on anything but
 	// the cluster's plain answer; empty otherwise.
 	note string
+	// publishedBy names the server whose published pair gave this answer; empty
+	// when it came from the object.
+	publishedBy string
+	// unreached says why the cluster gave no answer at all, so the channel is only
+	// the fallback a check runs on, and is not one to print as the cluster's.
+	unreached string
 }
 
 // channelSource reads the release channel with the credentials a check already
@@ -103,7 +109,7 @@ func (s channelSource) read(ctx context.Context) (channelReading, error) {
 		return s.readPair(ctx), nil
 	}
 	if s.dyn == nil {
-		return channelReading{channel: updatesv1alpha1.UpdateChannelStable, note: "no cluster to read the update channel from; checking as stable"}, nil
+		return channelReading{channel: updatesv1alpha1.UpdateChannelStable, note: "no cluster to read the update channel from; checking as stable", unreached: "no cluster client"}, nil
 	}
 	obj, err := s.dyn.Resource(updatePolicyGVR).Get(ctx, updatesv1alpha1.UpdatePolicyName, metav1.GetOptions{})
 	switch {
@@ -112,7 +118,7 @@ func (s channelSource) read(ctx context.Context) (channelReading, error) {
 	case apierrors.IsForbidden(err) && !s.objectOnly:
 		return s.readPair(ctx), nil
 	case err != nil:
-		return channelReading{}, fmt.Errorf("%w: %w", errChannelUnreadable, err)
+		return channelReading{unreached: err.Error()}, fmt.Errorf("%w: %w", errChannelUnreadable, err)
 	}
 	var policy updatesv1alpha1.UpdatePolicy
 	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.Object, &policy); err != nil {
@@ -139,24 +145,28 @@ func (s channelSource) readPair(ctx context.Context) channelReading {
 		}
 	}
 	if s.kube == nil {
-		return cannot("no cluster client")
+		r := cannot("no cluster client")
+		r.unreached = "no cluster client"
+		return r
 	}
 	nodes, err := s.kube.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return cannot(err.Error())
+		r := cannot(err.Error())
+		r.unreached = err.Error()
+		return r
 	}
-	rec, _, ok := status.PublishedUpdateRecord(nodes.Items)
+	rec, server, ok := status.PublishedUpdateRecord(nodes.Items)
 	if !ok {
-		return channelReading{channel: updatesv1alpha1.UpdateChannelStable, note: "no server has published a channel yet; checking as stable"}
+		return channelReading{channel: updatesv1alpha1.UpdateChannelStable, note: "no server has published a channel yet; checking as stable", unreached: "no server has published a channel yet"}
 	}
 	switch rec.Channel {
 	case "", updatesv1alpha1.UpdateChannelStable:
-		return channelReading{channel: updatesv1alpha1.UpdateChannelStable}
+		return channelReading{channel: updatesv1alpha1.UpdateChannelStable, publishedBy: server}
 	case updatesv1alpha1.UpdateChannelRC:
 		if !version.CanonicalTag(rec.Latest) {
 			return cannot(fmt.Sprintf("the release published with it, %q, is not a release tag", rec.Latest))
 		}
-		return channelReading{channel: updatesv1alpha1.UpdateChannelRC, published: rec.Latest}
+		return channelReading{channel: updatesv1alpha1.UpdateChannelRC, published: rec.Latest, publishedBy: server}
 	}
 	return cannot(fmt.Sprintf("%v %q", update.ErrUnknownChannel, rec.Channel))
 }
@@ -292,7 +302,7 @@ func planPin(env updateEnv, target string, pinning bool, sha string) (string, bo
 }
 
 // runUpdateChannel is `k3sm update channel [stable|rc]`: bare it prints the
-// channel this Mac would check on, and with a value it writes the UpdatePolicy and
+// cluster's channel, and with a value it writes the UpdatePolicy and
 // runs a check. A channel changes what is offered and never starts a roll.
 func runUpdateChannel(ctx context.Context, args []string, env updateEnv) int {
 	switch len(args) {
@@ -305,15 +315,30 @@ func runUpdateChannel(ctx context.Context, args []string, env updateEnv) int {
 	return exitUsage
 }
 
-// showUpdateChannel prints the channel, from the same source a check reads.
+// showUpdateChannel prints the channel, from the same source a check reads. The
+// stable a check falls back on is the check's own: with no answer from the cluster
+// this prints no channel and fails, because a script reading stdout could not tell
+// that stable from the cluster's. Only stdout carries the channel; where a published
+// answer came from goes to stderr.
 func showUpdateChannel(ctx context.Context, env updateEnv) int {
 	reading, err := channelSource{dyn: env.dyn, kube: env.inputs.Kube, pairOnly: env.worker}.read(ctx)
+	if reading.unreached != "" {
+		why := reading.unreached
+		if env.kubeErr != nil {
+			why = env.kubeErr.Error()
+		}
+		fmt.Fprintln(env.errOut, "k3sm update channel: cannot reach the cluster:", why)
+		return exitInternalError
+	}
 	if err != nil {
 		fmt.Fprintln(env.errOut, "k3sm update channel:", err)
 		return exitInternalError
 	}
 	if reading.note != "" {
 		fmt.Fprintln(env.errOut, "k3sm update:", reading.note)
+	}
+	if reading.publishedBy != "" {
+		fmt.Fprintf(env.errOut, "k3sm update: this is the channel published by the server %q, which can lag a change\n", status.ClipText(reading.publishedBy, 253))
 	}
 	fmt.Fprintln(env.out, reading.channel)
 	return 0

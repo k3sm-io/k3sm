@@ -87,9 +87,10 @@ Usage:
   abort   the recovery after a failed step: clear the k3sm.io/update-*
           annotations on every node, uncordon each node the controller
           cordoned (never one you cordoned), and mark the Update Cancelled
-  channel print the update channel; with stable or rc, set it (this takes
-          cluster-admin) and run a check. A channel changes what is offered
-          and never starts a roll
+  channel print the cluster's update channel, or fail if the cluster gives no
+          answer (a worker prints the channel its server published and says so
+          on stderr); with stable or rc, set it (this takes cluster-admin) and
+          run a check. A channel changes what is offered and never starts a roll
 
 Flags:
   -o text|json        output format (check, status; default text)
@@ -117,9 +118,9 @@ Flags:
 
 Every subcommand reaches the cluster with the credentials
 ` + "`k3sm status`" + ` uses: the server's admin kubeconfig as root or the service
-user, the k3sm context of ~/.kube/config otherwise. Only check and a bare
-channel also work with no reachable cluster: check then compares this Mac's
-k3sm alone with the latest release, and channel prints stable.
+user, the k3sm context of ~/.kube/config otherwise. Only check also works
+with no reachable cluster: it then compares this Mac's k3sm alone with the
+latest release.
 
 Exit codes: 0 done, 1 it could not be done (the error says why), 2 usage, or
 apply without --yes on a stdin that is not a terminal, 3 channel set the channel

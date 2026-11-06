@@ -930,29 +930,96 @@ func TestUpdateChannelVerb(t *testing.T) {
 		}
 	})
 
-	t.Run("bare with no cluster prints stable and says so", func(t *testing.T) {
+	// unreached is the one failure of a bare read: no channel on stdout, a non-zero
+	// exit, and the words a script's operator can act on.
+	unreached := func(t *testing.T, code int, out, errOut, why string) {
+		t.Helper()
+		if code != exitInternalError || out != "" || !strings.Contains(errOut, "cannot reach the cluster") || !strings.Contains(errOut, why) {
+			t.Errorf("exit %d, out %q, stderr %q, want the failure naming %q", code, out, errOut, why)
+		}
+		if strings.Contains(errOut, "checking as stable") {
+			t.Errorf("stderr %q speaks of a check", errOut)
+		}
+	}
+	forbidden := apierrors.NewForbidden(gr, updatesv1alpha1.UpdatePolicyName, errors.New("no rule"))
+
+	t.Run("bare with no cluster fails and prints no channel", func(t *testing.T) {
 		code, out, errOut := newUpdateCluster().runWith(t, func(env *updateEnv) {
 			env.dyn, env.inputs.Kube, env.kubeErr = nil, nil, errors.New("no kubeconfig")
 		}, "channel")
-		if code != 0 || out != "stable\n" || !strings.Contains(errOut, "no cluster to read the update channel from") {
-			t.Errorf("exit %d, out %q, stderr %q", code, out, errOut)
-		}
+		unreached(t, code, out, errOut, "no kubeconfig")
 	})
 
-	t.Run("bare on an unknown value fails", func(t *testing.T) {
+	t.Run("bare with an unreadable object fails and prints no channel", func(t *testing.T) {
+		c := newUpdateCluster()
+		c.policyAnswers(apierrors.NewInternalError(errors.New("etcd down")))
+		code, out, errOut := c.run(t, "channel")
+		unreached(t, code, out, errOut, "etcd down")
+	})
+
+	t.Run("bare on an unknown value is its own failure", func(t *testing.T) {
 		c := newUpdateCluster()
 		c.setPolicy(t, "beta")
 		code, out, errOut := c.run(t, "channel")
-		if code != exitInternalError || out != "" || !strings.Contains(errOut, "beta") {
+		if code != exitInternalError || out != "" || !strings.Contains(errOut, "beta") || strings.Contains(errOut, "cannot reach") {
 			t.Errorf("exit %d, out %q, stderr %q", code, out, errOut)
 		}
 	})
 
-	t.Run("bare on a worker reads the published pair", func(t *testing.T) {
+	t.Run("bare on a worker reads the published pair and says so", func(t *testing.T) {
 		c := newUpdateCluster(publishingServer("server", "v0.3.0-rc.1", "rc"))
-		code, out, _ := c.runWith(t, func(env *updateEnv) { env.worker = true }, "channel")
+		code, out, errOut := c.runWith(t, func(env *updateEnv) { env.worker = true }, "channel")
 		if code != 0 || out != "rc\n" || c.policyReads() != 0 {
 			t.Errorf("exit %d, out %q, %d object reads", code, out, c.policyReads())
+		}
+		if !strings.Contains(errOut, `published by the server "server"`) {
+			t.Errorf("stderr %q does not say where the answer came from", errOut)
+		}
+	})
+
+	t.Run("bare where the object is forbidden reads the pair and says so", func(t *testing.T) {
+		c := newUpdateCluster(publishingServer("server", "v0.2.3", ""))
+		c.policyAnswers(forbidden)
+		code, out, errOut := c.run(t, "channel")
+		if code != 0 || out != "stable\n" || !strings.Contains(errOut, "published by the server") {
+			t.Errorf("exit %d, out %q, stderr %q", code, out, errOut)
+		}
+	})
+
+	t.Run("bare on a worker with no pair fails", func(t *testing.T) {
+		code, out, errOut := newUpdateCluster().runWith(t, func(env *updateEnv) { env.worker = true }, "channel")
+		unreached(t, code, out, errOut, "no server has published a channel")
+	})
+
+	t.Run("bare where the object is forbidden and there is no pair fails", func(t *testing.T) {
+		c := newUpdateCluster()
+		c.policyAnswers(forbidden)
+		code, out, errOut := c.run(t, "channel")
+		unreached(t, code, out, errOut, "no server has published a channel")
+	})
+
+	t.Run("bare on a worker that cannot list Nodes fails", func(t *testing.T) {
+		c := newUpdateCluster(publishingServer("server", "v0.2.3", "stable"))
+		c.cs.PrependReactor("list", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("connection refused")
+		})
+		code, out, errOut := c.runWith(t, func(env *updateEnv) { env.worker = true }, "channel")
+		unreached(t, code, out, errOut, "connection refused")
+	})
+
+	t.Run("bare on a worker with no cluster fails", func(t *testing.T) {
+		code, out, errOut := newUpdateCluster().runWith(t, func(env *updateEnv) {
+			env.worker = true
+			env.dyn, env.inputs.Kube, env.kubeErr = nil, nil, errors.New("no kubeconfig")
+		}, "channel")
+		unreached(t, code, out, errOut, "no kubeconfig")
+	})
+
+	t.Run("bare on a pair with an unknown channel degrades and says why", func(t *testing.T) {
+		c := newUpdateCluster(publishingServer("server", "v0.2.3", "beta"))
+		code, out, errOut := c.runWith(t, func(env *updateEnv) { env.worker = true }, "channel")
+		if code != 0 || out != "stable\n" || !strings.Contains(errOut, "beta") {
+			t.Errorf("exit %d, out %q, stderr %q", code, out, errOut)
 		}
 	})
 
