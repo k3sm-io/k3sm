@@ -274,8 +274,13 @@ func userKubeconfigCandidates(kubeconfigEnv, home string) []string {
 	return out
 }
 
-// resolveKubectl finds the kubectl binary to exec.
+// resolveKubectl finds the kubectl binary to exec. Root takes only a checked one
+// (resolveKubectlAsRoot); every other account, the service user included, takes
+// the first candidate that exists.
 func resolveKubectl(workDir string) (string, error) {
+	if processEuid() == 0 {
+		return resolveKubectlAsRoot(workDir, install.DefaultInstallDir, kubectlExecCheck, exec.LookPath)
+	}
 	return resolveKubectlIn(workDir, install.DefaultInstallDir, fileExists, exec.LookPath)
 }
 

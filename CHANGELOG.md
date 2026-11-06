@@ -228,6 +228,10 @@ pin, its date, and the tarball's sha256.
 - A rollback of `sudo k3sm install` no longer leaves `~/.kube/config` getting `Unauthorized`. It puts the
   previous admin token back, so every copy of the kubeconfig keeps working, or, when it cannot, writes the
   kubeconfig with the new token and says to copy it again.
+- As root, `k3sm kubectl` runs only a kubectl that is root-owned and not group- or world-writable, with
+  every parent directory the same. It takes the first that passes of the work dir's kubectl, the one
+  `k3sm install` lays down under `/Library/k3sm/bin`, and one on `PATH`. When none passes it says why for
+  each and to run `sudo k3sm install`, or `k3sm kubectl` without sudo. Other accounts are unchanged.
 - `k3sm install` with a new `--mesh-ip` on a control-plane node no longer leaves the server refused its new
   address at every start. The install removes the pod range netd recorded when it names another range than
   the new address's, and removes the interconnect aliases of the old range from `bridge0`. A failed removal
