@@ -313,7 +313,7 @@ func (c *Collector) sweepRepo(ctx context.Context, n ref.Name, reportOnly bool) 
 			return nil, nil
 		}
 		if reportOnly {
-			q, err := c.brake(n, m.p, m.idx, m.cont)
+			q, err := c.brake(n, m.p, m.idx, m.cont, m.reads)
 			if err != nil {
 				q = m.p
 			}
@@ -365,7 +365,7 @@ func (c *Collector) sweepLocked(ctx context.Context, n ref.Name, m marked) ([]Ob
 		if err != nil {
 			return err
 		}
-		final, err := c.brake(n, m.p.intersect(q), idx, cont)
+		final, err := c.brake(n, m.p.intersect(q), idx, cont, m.reads)
 		if err != nil {
 			return err
 		}
@@ -408,13 +408,15 @@ func (c *Collector) mark(ctx context.Context, n ref.Name, cutoff time.Time) (mar
 }
 
 // manifestRead is what the mark found for one manifest digest: whether the
-// blob was there, its size, and what its body references (or why it could
-// not be read).
+// blob was there, its size, what its body references (or why it could not be
+// read), and, for a body that hashed to its digest, every digest its JSON holds
+// (scanDigests), which the brake counts against.
 type manifestRead struct {
 	present bool
 	size    int64
 	refs    refs
 	err     error
+	named   []digest.Digest
 }
 
 // sized reports whether the mark's read holds the size of the body: any read
@@ -451,6 +453,12 @@ func (r reads) unlocked(read func(digest.Digest) ([]byte, error)) func(digest.Di
 			e.present = true
 			e.size = int64(len(b))
 			e.refs, e.err = parseRefs(d, b)
+			var u *unparsedError
+			if errors.As(e.err, &u) {
+				e.named = u.named
+			} else {
+				e.named = scanDigests(b)
+			}
 		}
 		r[d] = e
 		return e.refs, e.err
@@ -494,6 +502,17 @@ func (r reads) locked(cont store.Contents) func(digest.Digest) (refs, error) {
 // an abandoned first push, or it can go on without the blobs the rule below does
 // not vouch for (see leaveNewerOut).
 //
+// While the plan leaves a row, only the blobs the rows describe count, on both
+// sides of the half (see described): a blob no row is and no manifest body the
+// mark read names anywhere is outside what any image in the repository uses,
+// and goes by the grace rule alone. Otherwise a pusher who uploads enough such
+// blobs next to a tagged image would stop every sweep for as long as the tag
+// stays. What the brake is for still counts: a plan that would reap a blob a
+// kept body names in a field the parse does not follow, or the rows a broken
+// rule would drop with the blobs they name. A plan that leaves no row counts
+// every blob, so the rules below for a first push and an emptied repository
+// are unchanged.
+//
 // A plan empties the repository when it leaves no row (every row, if there
 // were any, is one it reaps) and every blob it reaps predates index.json's
 // last write. index.json is written when a repository's layout is made, before
@@ -514,8 +533,9 @@ func (r reads) locked(cont store.Contents) func(digest.Digest) (refs, error) {
 // and upload sessions are all older than the abandon horizon (see abandoned).
 //
 // On a stop the plan returned is empty and the caller holds the one it passed.
-func (c *Collector) brake(n ref.Name, p plan, idx ispec.Index, cont store.Contents) (plan, error) {
-	if 2*len(p.blobs) <= len(cont.Blobs) || emptyingRule(p, idx, cont) || abandoned(idx, cont, c.now().Add(-c.abandon)) {
+func (c *Collector) brake(n ref.Name, p plan, idx ispec.Index, cont store.Contents, r reads) (plan, error) {
+	reap, of := counted(p, idx, cont, r)
+	if 2*reap <= of || emptyingRule(p, idx, cont) || abandoned(idx, cont, c.now().Add(-c.abandon)) {
 		return p, nil
 	}
 	if q, ok := leaveNewerOut(p, idx, cont); ok {
@@ -523,9 +543,53 @@ func (c *Collector) brake(n ref.Name, p plan, idx ispec.Index, cont store.Conten
 			"reap", len(q.blobs), "left", len(p.blobs)-len(q.blobs))
 		return q, nil
 	}
-	c.log.Error("registry gc: sweep stopped", "repository", n.String(), "reap", len(p.blobs), "blobs", len(cont.Blobs),
+	c.log.Error("registry gc: sweep stopped", "repository", n.String(), "reap", reap, "blobs", of,
 		"reason", "more than half of the repository's blobs")
-	return plan{}, fmt.Errorf("%w: %d of %d", ErrMassDelete, len(p.blobs), len(cont.Blobs))
+	return plan{}, fmt.Errorf("%w: %d of %d", ErrMassDelete, reap, of)
+}
+
+// counted returns how many blobs p reaps and how many cont holds, as the half
+// brake counts them: every blob when p leaves no row, otherwise only the blobs
+// the rows describe.
+func counted(p plan, idx ispec.Index, cont store.Contents, r reads) (reap, of int) {
+	if removesEveryRow(p, idx) {
+		return len(p.blobs), len(cont.Blobs)
+	}
+	in := described(idx, r)
+	for _, b := range cont.Blobs {
+		if in[b.Digest] {
+			of++
+			if p.blobs[b.Digest] {
+				reap++
+			}
+		}
+	}
+	return reap, of
+}
+
+// described returns the digests the rows describe: each row's manifest, and
+// each body the mark read with every digest its JSON holds. Every row's body
+// is read (a tagged row's, an untagged row's past the grace to judge it, a young
+// one's to keep what it names), and so is every manifest a kept body leads to,
+// so what no row is and no body names is a blob no image in the repository
+// uses. The scan, not the parse, is what is counted, so a reference the parse
+// misses still counts. A body over the size cap or failing its hash adds only
+// its own digest.
+func described(idx ispec.Index, r reads) map[digest.Digest]bool {
+	out := make(map[digest.Digest]bool, len(idx.Manifests)+len(r))
+	for _, row := range idx.Manifests {
+		out[row.Digest] = true
+	}
+	for d, e := range r {
+		if !e.present {
+			continue
+		}
+		out[d] = true
+		for _, x := range e.named {
+			out[x] = true
+		}
+	}
+	return out
 }
 
 // emptyingRule is the rule brake applies (a seam for the test that proves

@@ -275,7 +275,7 @@ func TestBrakeStillHolds(t *testing.T) {
 		{name: "rows go, every blob newer", rows: []ispec.Descriptor{{Digest: d3}}, plan: plan{rows: map[digest.Digest]bool{d3: true}, blobs: map[digest.Digest]bool{d3: true}}, cont: blobs[2:], blobs: map[digest.Digest]bool{}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := c.brake(name(t, "app"), tc.plan, ispec.Index{Manifests: tc.rows}, store.Contents{Blobs: tc.cont, IndexModTime: at})
+			got, err := c.brake(name(t, "app"), tc.plan, ispec.Index{Manifests: tc.rows}, store.Contents{Blobs: tc.cont, IndexModTime: at}, nil)
 			if tc.blobs == nil {
 				if !errors.Is(err, ErrMassDelete) {
 					t.Fatalf("brake: %v, want ErrMassDelete", err)
@@ -307,7 +307,7 @@ func TestBrakeLeavesABlobAsNewAsTheIndex(t *testing.T) {
 	d1, d2 := digest.FromString("1"), digest.FromString("2")
 	c := &Collector{log: slog.New(slog.NewTextHandler(io.Discard, nil)), now: func() time.Time { return at }, abandon: AbandonFactor * grace}
 	got, err := c.brake(name(t, "app"), plan{blobs: map[digest.Digest]bool{d1: true, d2: true}}, ispec.Index{},
-		store.Contents{Blobs: []store.Blob{{Digest: d1, ModTime: at.Add(-time.Nanosecond)}, {Digest: d2, ModTime: at}}, IndexModTime: at})
+		store.Contents{Blobs: []store.Blob{{Digest: d1, ModTime: at.Add(-time.Nanosecond)}, {Digest: d2, ModTime: at}}, IndexModTime: at}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

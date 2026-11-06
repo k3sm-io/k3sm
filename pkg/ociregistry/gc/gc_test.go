@@ -164,6 +164,7 @@ func TestStopsAtHalfARepository(t *testing.T) {
 	n := name(t, "app")
 	e.clk.set(-2 * time.Hour)
 	img := e.push(t, n, "v1", "app", []byte("layer"))
+	old := e.push(t, n, "", "old", []byte("old 1"), []byte("old 2"), []byte("old 3"))
 	var orphans []digest.Digest
 	for _, b := range []string{"o1", "o2", "o3", "o4"} {
 		orphans = append(orphans, e.blob(t, n, []byte(b)).Digest)
@@ -172,11 +173,13 @@ func TestStopsAtHalfARepository(t *testing.T) {
 	e.ran(t)
 	e.clk.set(0)
 
+	// The untagged image is 5 of the 8 blobs the rows describe; the orphans
+	// are outside them and do not count.
 	rep, err := c.Sweep(e.ctx)
 	if !errors.Is(err, ErrMassDelete) || !slices.Equal(rep.Stopped, []string{"app"}) {
-		t.Fatalf("sweep of 4 of 7 blobs: %v, stopped %v; want ErrMassDelete for app", err, rep.Stopped)
+		t.Fatalf("sweep of 5 of 8 described blobs: %v, stopped %v; want ErrMassDelete for app", err, rep.Stopped)
 	}
-	for _, d := range orphans {
+	for _, d := range append(old.blobs(), orphans...) {
 		if !e.has(n, d) {
 			t.Fatalf("the stopped sweep deleted %s", d)
 		}
@@ -187,8 +190,8 @@ func TestStopsAtHalfARepository(t *testing.T) {
 		t.Fatal(err)
 	}
 	rep = e.sweep(t, c)
-	if rep.Count(KindBlob) != 7 {
-		t.Fatalf("sweep of the emptied repository reaped %d blobs, want 7", rep.Count(KindBlob))
+	if rep.Count(KindBlob) != 12 {
+		t.Fatalf("sweep of the emptied repository reaped %d blobs, want 12", rep.Count(KindBlob))
 	}
 	// The layout goes once index.json is past the grace too.
 	if rep.Count(KindRepository) != 0 {

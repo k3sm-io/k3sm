@@ -64,8 +64,12 @@ limitations under the License.
 // sweep again; a backup or copy that carries the id file is the same store. A
 // restore merged over a live root keeps the id and is not told apart from a
 // push, in the repositories the marker names (see markerRecord). A sweep that
-// would delete more than half of a repository's blobs stops with ErrMassDelete,
-// unless it
+// would delete more than half of a repository's blobs stops with ErrMassDelete.
+// While a row stays, only the blobs the rows describe count, on both sides of the
+// half: each row's manifest and every digest in a manifest body the sweep read.
+// A blob outside them is one no image in the repository uses, so blobs a pusher
+// uploads beside a tagged image cannot hold the brake; they go by the grace rule.
+// The brake does not stop the sweep when it
 // empties the repository (it leaves no row and every blob it reaps is older
 // than the last change to the rows) or the repository is an abandoned first
 // push. The emptying rule does not free a first push's blobs while they are

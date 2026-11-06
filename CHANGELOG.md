@@ -210,6 +210,12 @@ pin, its date, and the tarball's sha256.
   keeps its blobs as before. When a tag moves, the old image's signatures are reaped with it after the grace,
   and a referrer pushed before its subject, as when an image is signed and then copied, is protected only by
   the grace period: push the subject within it.
+- Blobs pushed to a registry repository without any manifest naming them no longer stop its garbage
+  collection while a tag stays. Enough of them beside a tagged image used to trip the brake that stops a
+  sweep deleting more than half of a repository's blobs, on every sweep. While a repository keeps a
+  manifest, the brake now counts only the blobs its manifests are or name, so those blobs are collected
+  once past the grace period, and a sweep that would delete more than half of what the images use still
+  stops.
 - A managed update no longer stalls on a node when a phase write fails, as it does when the server restarts
   during that node's update. The node used to stop working on the update without saying so, until the update
   controller's 30-minute node timeout failed the roll. It now retries the write for up to 5 minutes of backoff,
