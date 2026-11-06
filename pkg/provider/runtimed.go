@@ -1000,15 +1000,41 @@ var ErrStatusRecordDirNotCanonical = errors.New("status record dir is not its ow
 // written from, or an error when the deny could not match it. A relative value
 // (a relative --work-dir) is made absolute, because that is where the records it
 // names are written, and runtime.New refuses a relative one.
+//
+// A status directory that is the runtime's own <root>/status returns in the
+// runtime's spelling and is not checked. The profile denies <WorkDir>/status
+// whatever this value says, so there is no new deny that could fail to match, and
+// refusing a node that starts today would change a default node for nothing.
 func statusRecordDirOf(cfg RuntimedConfig) (string, error) {
 	dir, err := absDenyDir(cfg.StatusRecordDir, ErrStatusRecordDirNotCanonical)
 	if err != nil {
 		return "", err
 	}
+	own := filepath.Join(runtimeRoot(cfg.Root), sandbox.StatusSubdir)
+	if dir != "" && withoutFirmlink(dir) == withoutFirmlink(own) {
+		warnStatusDirEscapes(cfg.Logger, own)
+		return own, nil
+	}
 	if err := checkStatusRecordDir(dir); err != nil {
 		return "", err
 	}
 	return dir, nil
+}
+
+// warnStatusDirEscapes logs once when the runtime's own status directory resolves
+// to a different place than its spelling, because the sandbox deny written from
+// the spelling does not follow the link. A resolution error (the directory does
+// not exist yet) logs nothing: the node still starts.
+func warnStatusDirEscapes(log *slog.Logger, own string) {
+	if log == nil {
+		return
+	}
+	resolved, err := filepath.EvalSymlinks(own)
+	if err != nil || withoutFirmlink(resolved) == withoutFirmlink(own) {
+		return
+	}
+	log.Warn("the status directory resolves elsewhere; the sandbox deny on it does not cover the real location",
+		"status_dir", own, "resolved", resolved)
 }
 
 // ErrDataRootNotCanonical reports a data root, or its server or agent directory,

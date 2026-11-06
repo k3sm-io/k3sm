@@ -151,7 +151,9 @@ pin, its date, and the tarball's sha256.
 - The sandbox's explicit deny now follows the status records `k3sm status` reports on a node started
   with a non-default `--pod-root`, naming the data root's status directory. A node with
   a non-default pod root recreates its pods once on upgrade, and a node whose status directory is
-  reached through a symlink refuses to start, naming the path. A node on the default paths is unchanged.
+  reached through a symlink refuses to start, naming the path. A node on the default pod root is unchanged,
+  whatever its status directory resolves to, and a status directory behind a symlink logs a warning
+  because the sandbox deny does not follow the link.
 - `sudo k3sm uninstall` no longer fails with a staging sweep error, on that run and every re-run,
   when a leftover staging tree holds a file or directory with the `uchg`, `uappnd` or `uunlnk` flag,
   or is deeper than the process's open-file limit. The sweep clears those flags inside the tree and
