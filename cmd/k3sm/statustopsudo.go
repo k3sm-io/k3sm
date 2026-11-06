@@ -25,7 +25,9 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"slices"
 	"strconv"
+	"strings"
 	"syscall"
 
 	corev1 "k8s.io/api/core/v1"
@@ -33,6 +35,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 
+	"k3sm.io/k3sm/pkg/kubeclient"
 	"k3sm.io/k3sm/pkg/status"
 )
 
@@ -221,11 +224,13 @@ func (in topSudoInputs) userKubeconfigFile() ([]byte, string, error) {
 
 // parseSudoUserKubeconfig parses the user's kubeconfig and checks that the
 // pinned context can be used as root without acting for the file's author: it
-// must exist, and the credentials it selects must be inline. An exec or
-// auth-provider plugin would run a program the user named as root, and a file
-// reference (a token file, a client key, a CA path) would have root read a
-// file the user may not; both are refused. The kubeconfig `k3sm install`
-// writes carries the CA and the token inline.
+// must exist, and the entries it selects must pass the list the checked load
+// uses (kubeclient.ClusterFieldsNotInline, kubeclient.UserFieldsNotInline). An
+// exec or auth-provider plugin would run a program the user named as root, a file
+// reference (a token file, a client key, a CA path) would have root read a file
+// the user may not, and proxy-url and the impersonation fields change who root
+// talks to or as; all are refused. The kubeconfig `k3sm install` writes carries
+// the CA and the token inline.
 func parseSudoUserKubeconfig(data []byte, path, contextName string) (*clientcmdapi.Config, error) {
 	cfg, err := clientcmd.Load(data)
 	if err != nil {
@@ -239,15 +244,21 @@ func parseSudoUserKubeconfig(data []byte, path, contextName string) (*clientcmda
 	if !ok || cluster == nil {
 		return nil, fmt.Errorf("context %q names a cluster %q it does not define", contextName, kctx.Cluster)
 	}
-	if cluster.CertificateAuthority != "" {
-		return nil, fmt.Errorf("cluster %q reads its CA from a file, which root does not read on a user's behalf, %w", kctx.Cluster, errSudoKubeconfigRefused)
+	if fields := kubeclient.ClusterFieldsNotInline(cluster); len(fields) > 0 {
+		if slices.Contains(fields, "certificate-authority") {
+			return nil, fmt.Errorf("cluster %q reads its CA from a file, which root does not read on a user's behalf, %w", kctx.Cluster, errSudoKubeconfigRefused)
+		}
+		return nil, fmt.Errorf("cluster %q sets %s, which root does not use on a user's behalf, %w", kctx.Cluster, strings.Join(fields, ", "), errSudoKubeconfigRefused)
 	}
 	if auth, ok := cfg.AuthInfos[kctx.AuthInfo]; ok && auth != nil {
+		fields := kubeclient.UserFieldsNotInline(auth)
 		switch {
-		case auth.Exec != nil || auth.AuthProvider != nil:
+		case slices.Contains(fields, "exec") || slices.Contains(fields, "auth-provider"):
 			return nil, fmt.Errorf("user %q runs a credential plugin, which root does not run on a user's behalf, %w", kctx.AuthInfo, errSudoKubeconfigRefused)
-		case auth.TokenFile != "" || auth.ClientCertificate != "" || auth.ClientKey != "":
+		case slices.Contains(fields, "tokenFile") || slices.Contains(fields, "client-certificate") || slices.Contains(fields, "client-key"):
 			return nil, fmt.Errorf("user %q reads its credential from a file, which root does not read on a user's behalf, %w", kctx.AuthInfo, errSudoKubeconfigRefused)
+		case len(fields) > 0:
+			return nil, fmt.Errorf("user %q sets %s, which root does not use on a user's behalf, %w", kctx.AuthInfo, strings.Join(fields, ", "), errSudoKubeconfigRefused)
 		}
 	}
 	for _, c := range cfg.Clusters {

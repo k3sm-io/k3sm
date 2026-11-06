@@ -244,6 +244,9 @@ pin, its date, and the tarball's sha256.
   kubeconfigs k3sm writes are all inline.
 - A kubeconfig that a root command loads with the inline-credentials check is also refused when a cluster entry
   sets `proxy-url`.
+- `sudo k3sm kubectl`, `sudo k3sm status` and the other root verbs that read a person's kubeconfig use that same list
+  for the context they select, so `proxy-url`, `as`, `as-uid`, `as-groups` and `as-user-extra` are refused there too.
+  Other contexts in the file are not checked or used.
 - A worker's root helper, `sudo k3sm kubectl` and the other root verbs on a worker, and `k3sm stop` and `k3sm start`
   there, verify the apiserver's certificate against the kubernetes Service address, `10.43.0.1`, which
   every apiserver certificate carries and no other certificate of the cluster does. They still connect to the

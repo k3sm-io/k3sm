@@ -187,12 +187,12 @@ func restConfigFrom(raw *clientcmdapi.Config) (*rest.Config, error) {
 func checkInline(raw *clientcmdapi.Config) error {
 	var refused []string
 	for _, name := range sortedKeys(raw.AuthInfos) {
-		if fields := userFieldsNotInline(raw.AuthInfos[name]); len(fields) > 0 {
+		if fields := UserFieldsNotInline(raw.AuthInfos[name]); len(fields) > 0 {
 			refused = append(refused, fmt.Sprintf("user %q sets %s", name, strings.Join(fields, ", ")))
 		}
 	}
 	for _, name := range sortedKeys(raw.Clusters) {
-		if fields := clusterFieldsNotInline(raw.Clusters[name]); len(fields) > 0 {
+		if fields := ClusterFieldsNotInline(raw.Clusters[name]); len(fields) > 0 {
 			refused = append(refused, fmt.Sprintf("cluster %q sets %s", name, strings.Join(fields, ", ")))
 		}
 	}
@@ -202,9 +202,11 @@ func checkInline(raw *clientcmdapi.Config) error {
 	return fmt.Errorf("%s: %w", strings.Join(refused, "; "), ErrCredentialsNotInline)
 }
 
-// clusterFieldsNotInline returns the kubeconfig keys c sets that checkInline refuses.
-// proxy-url is one of them: a checked client connects to the file's server directly.
-func clusterFieldsNotInline(c *clientcmdapi.Cluster) []string {
+// ClusterFieldsNotInline returns the kubeconfig keys c sets that a checked load
+// refuses, in a fixed order. proxy-url is one of them: a checked client connects to
+// the file's server directly. It is the one list of them, for a caller that reads a
+// kubeconfig itself and checks only the entries it keeps.
+func ClusterFieldsNotInline(c *clientcmdapi.Cluster) []string {
 	if c == nil {
 		return nil
 	}
@@ -218,8 +220,9 @@ func clusterFieldsNotInline(c *clientcmdapi.Cluster) []string {
 	return fields
 }
 
-// userFieldsNotInline returns the kubeconfig keys u sets that checkInline refuses.
-func userFieldsNotInline(u *clientcmdapi.AuthInfo) []string {
+// UserFieldsNotInline returns the kubeconfig keys u sets that a checked load refuses,
+// in a fixed order, as ClusterFieldsNotInline does for a cluster.
+func UserFieldsNotInline(u *clientcmdapi.AuthInfo) []string {
 	if u == nil {
 		return nil
 	}
