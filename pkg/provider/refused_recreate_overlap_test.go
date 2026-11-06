@@ -164,3 +164,17 @@ func testRefusalBesideParkedRetry(t *testing.T) {
 		t.Error("the refusal is still owed with the guest running")
 	}
 }
+
+// TestCreateRPCHasNoTransportToLoseAGuest pins why neither create path compensates a
+// create RPC that returns an error: the provider holds the runtime in process, as the
+// server, not over a connection. Its only error return comes before it builds anything
+// (refuseBesideUnadoptedHelper, CreatePod in runtimed's pkg/runtime). This stops
+// compiling if the field becomes a client, which is when a transport error could hide
+// a built guest and both paths would owe a compensating delete.
+func TestCreateRPCHasNoTransportToLoseAGuest(t *testing.T) {
+	r, f, _, _ := newPullProvider(t)
+	var server runtimev1.RuntimeServer = r.rt
+	if server != runtimev1.RuntimeServer(f) {
+		t.Errorf("the provider's runtime = %T, want the server it was built with", server)
+	}
+}

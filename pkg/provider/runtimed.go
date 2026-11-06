@@ -2239,6 +2239,8 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 
 	resp, err := r.rt.CreatePod(ctx, &runtimev1.CreatePodRequest{Pod: box})
 	if err != nil {
+		// No guest to compensate for: r.rt is the runtime in process, and its one
+		// error return comes before it builds (TestCreateRPCHasNoTransportToLoseAGuest).
 		r.log.Error("CreatePod: runtimed RPC", "namespace", pod.Namespace, "name", pod.Name, "err", err)
 		return fmt.Errorf("runtimed create pod %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
