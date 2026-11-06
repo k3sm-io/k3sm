@@ -20,6 +20,8 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -85,6 +87,68 @@ func TestStoredUnreadableRowClearsOnDelete(t *testing.T) {
 	if _, err := f.deletingCollector(t, grace).Sweep(context.Background()); err != nil {
 		t.Fatalf("sweep after the delete: %v", err)
 	}
+}
+
+// TestDeleteTagOfAnUnreadableBody pins the rows the collector could not get past:
+// a body it cannot read goes with its last tag rather than stay as an untagged
+// row, and a read that may pass refuses the delete and changes nothing.
+func TestDeleteTagOfAnUnreadableBody(t *testing.T) {
+	const grace = time.Hour
+	blob := func(f *fixture, body []byte) string {
+		return filepath.Join(f.root, "app", "blobs", "sha256", dg(body).Encoded())
+	}
+	for _, tc := range []struct {
+		name   string
+		damage func(t *testing.T, p string)
+	}{
+		{"a body that fails its hash", func(t *testing.T, p string) {
+			if err := os.Chmod(p, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(p, []byte(`{"damaged":true}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"a missing body", func(t *testing.T, p string) {
+			if err := os.Remove(p); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			body := f.image(t, "app", "v1", "l")
+			tc.damage(t, blob(f, body))
+			want(t, f.do(http.MethodDelete, "/v2/app/manifests/v1", nil), http.StatusAccepted, "")
+			if rows := f.rows(t, "app"); len(rows) != 0 {
+				t.Errorf("rows after the delete = %+v, want none", rows)
+			}
+			if _, err := f.deletingCollector(t, grace).Sweep(context.Background()); err != nil {
+				t.Errorf("sweep after the delete: %v", err)
+			}
+		})
+	}
+	t.Run("a read that may pass refuses the delete", func(t *testing.T) {
+		f := newFixture(t)
+		body := f.image(t, "app", "v1", "l")
+		p := blob(f, body)
+		if err := os.Chmod(p, 0); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(p, 0o600) })
+		if r, err := os.Open(p); err == nil {
+			r.Close()
+			t.Skip("this user reads a mode 000 file")
+		}
+		want(t, f.do(http.MethodDelete, "/v2/app/manifests/v1", nil), http.StatusInternalServerError, "")
+		if err := os.Chmod(p, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if rows := f.rows(t, "app"); len(rows) != 1 || rows[0].Annotations[ispec.AnnotationRefName] != "v1" {
+			t.Errorf("rows after the refused delete = %+v, want v1's", rows)
+		}
+		want(t, f.do(http.MethodDelete, "/v2/app/manifests/v1", nil), http.StatusAccepted, "")
+	})
 }
 
 func mustName(t *testing.T, s string) ref.Name {

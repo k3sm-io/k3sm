@@ -575,7 +575,14 @@ Nothing is deleted in any of these cases. Each shows on every sweep in the
 - **`manifest unreadable`.** A stored manifest cannot be read, so the sweep of that repository
   stops and the others go on. The server now refuses such a manifest at push, but one pushed
   earlier stays until you delete it: delete its tag, or its digest if it has no tag, and sweeps of
-  that repository run again. The error names the digest. An index's child that has no row of its
+  that repository run again. The error names the digest. Deleting a tag clears the row when the
+  read failed because the manifest is over the size limit, fails its hash, has no blob, or is not a
+  regular file or is a symlink. Any other read error, such as a permission or I/O fault, makes the
+  tag delete answer 500 and change nothing. Deleting by digest does not read the manifest's own
+  body, so it clears the row whatever the fault, unless another index in the repository is also
+  unreadable, which refuses it the same way. On a fault that persists, fix the permissions or the
+  disk under `<work-dir>/registry`, or delete the digest; if the digest delete is refused too,
+  repair the other index's file first. An index's child that has no row of its
   own stops the sweep the same way only when it is over the 4 MiB manifest limit or its bytes do
   not hash to its digest: delete the index that names it. Any other blob named as a child does not
   stop the sweep. It is kept, along with every digest its JSON contains, and the sweep follows each

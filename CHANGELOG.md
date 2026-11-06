@@ -167,6 +167,9 @@ pin, its date, and the tarball's sha256.
 
 ### Fixed
 
+- `k3sm image untag` of an image's last tag no longer makes the image unreadable by digest in the
+  cluster registry. The manifest stays readable at `repository@sha256:...`, and `k3sm image prune` sees
+  it as untagged, until prune or the registry's garbage collection removes it.
 - A `vm` image with paths differing only by case now gets a refusal naming both paths and the fix on a case-insensitive data root, and is refused rather than merged when cloned into a case-insensitive pod rootfs.
 - A `vm` Pod's probes now end when its delete starts, so none runs during `preStop` or while the guest stops. Its relay closes before the guest gets `SIGTERM` and stays closed. It used to close part-way through the grace period and could reopen briefly once the guest had stopped, onto an address macOS may give to another guest. A connection through the relay no longer drains during the grace period. A native Pod's probes are unchanged.
 - A `vm` Pod's probes now end when its delete starts, so none runs during `preStop` or while the guest stops. Its relay now stays up until the guest has stopped, so connections through it can drain and new dials still land during the grace period, then closes once and cannot reopen. It used to close part-way through the grace period and could reopen briefly once the guest had stopped, onto an address macOS may give to another guest. A native Pod's probes are unchanged.

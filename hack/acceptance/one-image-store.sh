@@ -1005,7 +1005,7 @@ seed_aged() {
 		return 1
 	}
 	if ! on_server "k3sm image inspect '$REG/$AGED_REPO@$AGED_DIGEST'" >"$EVIDENCE/ois.8-inspect-seed.txt" 2>&1; then
-		DETAIL="seed: $AGED_REPO@$AGED_DIGEST is gone before the dry run; the registry's own garbage collection (zot gc) removed the untagged manifest, so prune had nothing aged to delete (ois.8-inspect-seed.txt)"
+		DETAIL="seed: $AGED_REPO@$AGED_DIGEST is gone before the dry run; the registry's own garbage collection removed the untagged manifest, so prune had nothing aged to delete (ois.8-inspect-seed.txt)"
 		return 1
 	fi
 }
