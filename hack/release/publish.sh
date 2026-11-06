@@ -14,6 +14,7 @@
 #                           --team-id <TEAMID> --notes-file <file>
 #                           [--disk-image <file>] [--release-index <file>]
 #                           [--repo <owner/name>]
+#   hack/release/publish.sh --plan <tag>
 #   hack/release/publish.sh --self-test
 #   hack/release/publish.sh --self-test-index
 #
@@ -28,8 +29,9 @@
 #                     and adds the disk image if one is given, then steps 6 to 8.
 #                     It builds and signs nothing.
 #
-#   --version     the release tag, which must already exist on the repo
-#                 (vMAJOR.MINOR.PATCH or ...-rc.N); this script never creates one
+#   --version     the release tag, which must already exist on the repo and be
+#                 canonical by pkg/version/testdata/release-tags.txt (vMAJOR.MINOR.PATCH
+#                 or ...-rc.N, no leading zeros); this script never creates one
 #   --stage-dir   where stage.sh assembles the tree (must not exist yet, and
 #                 must sit outside the k3sm worktree, which has to stay clean);
 #                 the upload assets are written beside it, in <stage-dir>.assets.
@@ -53,6 +55,11 @@
 #                 final release uploads it twice, under that name and under the
 #                 fixed alias k3sm_release-index.p7m; a release candidate
 #                 uploads it once, under that name.
+#   --plan        print what a release of this tag would publish, key=value, and
+#                 stop: the flag it is promoted with, whether it may carry a stable
+#                 index, and the aliases. Refuses a non-canonical tag
+#                 (non-canonical-tag). It reads only its argument and runs no tool,
+#                 so a pre-tag check can ask, and it answers before the refusal below.
 #   --self-test   hermetic test of the refusals and the promote check, with
 #                 every signing, notary, keychain and GitHub tool replaced by a
 #                 fake on PATH (no network, no credentials, no keychain)
@@ -201,7 +208,7 @@
 # upload of a large asset cannot become the latest release that an install
 # script fetches. The draft is left for the operator to inspect and delete.
 #
-# THE REFUSAL. Outside --self-test this script refuses, in every mode
+# THE REFUSAL. Outside --self-test and --plan this script refuses, in every mode
 # (one-shot, --through-verify and --upload), before it parses an argument, when CLAUDECODE or K3SM_AUTO is set at all or when /dev/tty cannot
 # be opened, and sign.sh repeats the full check. Like sign.sh's, it is a guard
 # against accident, not a security boundary: the real controls are the
@@ -222,8 +229,24 @@ refuse() {
 }
 die() { echo "publish: $*" >&2; exit 1; }
 
-valid_version() { [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; }
+# valid_version <tag>: pkg/version.CanonicalTag's grammar, the one
+# pkg/version/testdata/release-tags.txt holds every reader to. A wider one would let a
+# run publish a tag such as rc.01 that the channel then refuses, stranding a signed
+# release under a tag that is never reused.
+valid_version() { [[ "$1" =~ ^v(0|[1-9][0-9]{0,8})(\.(0|[1-9][0-9]{0,8})){2}(-rc\.(0|[1-9][0-9]{0,3}))?$ ]]; }
+require_canonical_version() {
+	valid_version "$1" ||
+		refuse non-canonical-tag "'$1' is not canonical by pkg/version/testdata/release-tags.txt: vMAJOR.MINOR.PATCH[-rc.N], no leading zeros; nothing was uploaded."
+}
 is_rc() { [[ "$1" =~ -rc\.[0-9]+$ ]]; }
+# latest_flag <tag>: how a release is promoted. A release candidate must never become
+# the latest release install.sh resolves; a final version always does.
+latest_flag() { if is_rc "$1"; then echo --latest=false; else echo --latest; fi; }
+# has_index_alias <tag>: zero when a release's document also goes up under the fixed
+# alias. A candidate is never latest, so the alias would answer nobody.
+has_index_alias() { ! is_rc "$1"; }
+# index_decoder <tag>: the decoder this tag selects for its document.
+index_decoder() { if is_rc "$1"; then echo candidate; else echo final; fi; }
 
 # version_lt <a> <b>: zero when version a sorts strictly below version b. Both
 # are vMAJOR.MINOR.PATCH with an optional -rc.N, which sorts below its final
@@ -501,11 +524,7 @@ promote() {
 	fi
 	index_promote_check "$tag" "$repo" "$dir"
 	echo "==> draft $tag verified; promoting"
-	# A release candidate must never become the latest release install.sh
-	# resolves; a final version always does.
-	local latest="--latest"
-	is_rc "$tag" && latest="--latest=false"
-	gh release edit "$tag" --repo "$repo" --draft=false "$latest" || die "promoting $tag failed; the verified draft is still in place"
+	gh release edit "$tag" --repo "$repo" --draft=false "$(latest_flag "$tag")" || die "promoting $tag failed; the verified draft is still in place"
 }
 
 # upload <tag> <repo> <notes> <assetdir> <stage-tree> <tarball-sha256>
@@ -524,8 +543,8 @@ upload() {
 	[ -z "$isha" ] || count=5
 	if [ -n "$xsha" ]; then
 		[ -n "$isha" ] || die "upload was given a release index hash without an image hash"
-		count=7
-		is_rc "$tag" && count=6
+		count=6
+		has_index_alias "$tag" && count=7
 	fi
 	if ! problems="$(tree_manifest_problems "$tree" "$tree/PAYLOAD-SHA256")"; then
 		printf '%s\n' "$problems" >&2
@@ -545,7 +564,7 @@ upload() {
 	fi
 	if [ -n "$xsha" ]; then
 		pre=("$(asset_path "$dir" "$tag" "$(index_name "$tag")")")
-		is_rc "$tag" || pre+=("$(asset_path "$dir" "$tag" "$INDEX_ALIAS_NAME")")
+		! has_index_alias "$tag" || pre+=("$(asset_path "$dir" "$tag" "$INDEX_ALIAS_NAME")")
 		for img in "${pre[@]}"; do
 			[ -f "$img" ] && [ ! -L "$img" ] && [ "$(sha256_of "$img")" = "$xsha" ] ||
 				refuse index-changed "the release index or its alias $(basename "$img") changed after its checks (sha256 $xsha); nothing was uploaded."
@@ -631,7 +650,7 @@ checksums_problems() {
 		{ echo "    the tarball or manifest asset is missing from $dir"; return 1; }
 	[ -z "$isha" ] || want="$want"$'\n'"$isha  $img"$'\n'"$isha  $IMAGE_ALIAS_NAME"
 	[ -z "$xsha" ] || want="$want"$'\n'"$xsha  $idx"
-	[ -z "$xsha" ] || is_rc "$tag" || want="$want"$'\n'"$xsha  $INDEX_ALIAS_NAME"
+	[ -z "$xsha" ] || ! has_index_alias "$tag" || want="$want"$'\n'"$xsha  $INDEX_ALIAS_NAME"
 	got="$(cat "$dir/$sums")"
 	if [ "$want" != "$got" ]; then
 		echo "    $sums does not hold exactly the expected lines:"
@@ -641,7 +660,7 @@ checksums_problems() {
 	allowed=(-e "$base.tar.gz" -e "$base.PAYLOAD-SHA256" -e "$sums")
 	[ -z "$isha" ] || allowed+=(-e "$IMAGE_DIR_NAME" -e "$IMAGE_DIR_NAME/$img" -e "$IMAGE_DIR_NAME/$IMAGE_ALIAS_NAME")
 	[ -z "$xsha" ] || allowed+=(-e "$INDEX_DIR_NAME" -e "$INDEX_DIR_NAME/$idx")
-	[ -z "$xsha" ] || is_rc "$tag" || allowed+=(-e "$INDEX_DIR_NAME/$INDEX_ALIAS_NAME")
+	[ -z "$xsha" ] || ! has_index_alias "$tag" || allowed+=(-e "$INDEX_DIR_NAME/$INDEX_ALIAS_NAME")
 	extra="$(cd "$dir" && find . -mindepth 1 | sed 's|^\./||' | grep -vxF "${allowed[@]}" || true)"
 	[ -z "$extra" ] || { echo "    $dir holds files that are not release assets:"; printf '%s\n' "$extra" | sed 's/^/      /'; return 1; }
 	if [ -n "$isha" ] && { [ -L "$dir/$IMAGE_DIR_NAME" ] || [ ! -d "$dir/$IMAGE_DIR_NAME" ]; }; then
@@ -910,7 +929,7 @@ check_index_name() {
 # and print the fields a release must match, key=value, in order. A function so
 # the self-test can count its calls.
 index_fields() {
-	if is_rc "$2"; then
+	if [ "$(index_decoder "$2")" = candidate ]; then
 		(cd "$REPO_ROOT" && go run ./hack/release/indexcheck candidate "$2" "$1")
 	else
 		(cd "$REPO_ROOT" && go run ./hack/release/indexcheck final "$1")
@@ -986,7 +1005,7 @@ add_release_index() {
 	fi
 	printf '%s\n' "$report"
 	INDEX_SHA256="$(sha256_of "$copy")"
-	if is_rc "$tag"; then
+	if ! has_index_alias "$tag"; then
 		printf '%s  %s\n' "$INDEX_SHA256" "$name" >>"$dir/$(checksums_name "$tag")" ||
 			die "could not append the release index to the checksums file"
 		return 0
@@ -1056,6 +1075,21 @@ run_upload() {
 	fi
 	echo "==> upload: draft, verify, promote"
 	upload "$tag" "$repo" "$notes" "$assets" "$tree" "$(seal_value "$tree.seal" tarball_sha256)" "$IMAGE_SHA256" "$INDEX_SHA256"
+}
+
+# publish_plan <tag>: what a release of <tag> would publish, read from the functions the
+# upload itself runs, so the plan and the upload cannot disagree. stable_index is whether
+# it may carry a document a stable reader takes. image_alias is the fixed-name asset an
+# image release carries when it has an image; on a candidate it is an ordinary asset that
+# nothing resolves, because only the release marked latest answers
+# releases/latest/download/.
+publish_plan() {
+	local tag="$1" stable_index=no index_alias=none
+	require_canonical_version "$tag"
+	if index_era "$tag" && [ "$(index_decoder "$tag")" = final ]; then stable_index=yes; fi
+	if index_era "$tag" && has_index_alias "$tag"; then index_alias="$INDEX_ALIAS_NAME"; fi
+	printf 'tag=%s\nlatest=%s\nstable_index=%s\nindex_alias=%s\nimage_alias=%s\n' \
+		"$tag" "$(latest_flag "$tag")" "$stable_index" "$index_alias" "$IMAGE_ALIAS_NAME"
 }
 
 # ---- self-test ------------------------------------------------------------------
@@ -2433,6 +2467,26 @@ EOF
 	done
 	rc=0; out="$( (require_image_for_final "$tag" "$T/x.dmg") 2>&1)" || rc=$?
 	if [ "$rc" -eq 0 ]; then ok "a final release with --disk-image passes the requirement"; else bad "final with image (rc=$rc: $out)"; fi
+	# The refusal the argument parser applies to --version, by its token, with the
+	# automation guard still in front of the parser itself.
+	rc=0; out="$( (require_canonical_version v0.3.0-rc.01) 2>&1)" || rc=$?
+	expect_refusal "--version rc.01 refuses as non-canonical" non-canonical-tag "$out" "$rc"
+	rc=0; out="$( (require_canonical_version "$rctag") 2>&1)" || rc=$?
+	if [ "$rc" -eq 0 ]; then ok "the self-test's own candidate tag is canonical"; else bad "canonical rc tag (rc=$rc: $out)"; fi
+	# The plan answers from the functions the upload runs; promote_case and the index
+	# cases above hold those functions to what gh is told.
+	out="$(publish_plan v0.3.0-rc.1)"
+	if [ "$out" = $'tag=v0.3.0-rc.1\nlatest=--latest=false\nstable_index=no\nindex_alias=none\nimage_alias=k3sm_darwin_arm64.dmg' ]; then
+		ok "a candidate plans --latest=false, no stable index and no index alias"
+	else bad "candidate plan: $out"; fi
+	out="$(publish_plan v0.3.0)"
+	if [ "$out" = $'tag=v0.3.0\nlatest=--latest\nstable_index=yes\nindex_alias=k3sm_release-index.p7m\nimage_alias=k3sm_darwin_arm64.dmg' ]; then
+		ok "a final in the index era plans --latest, the stable index and its alias"
+	else bad "final plan: $out"; fi
+	out="$(publish_plan v0.2.9)"
+	if [ "$out" = $'tag=v0.2.9\nlatest=--latest\nstable_index=no\nindex_alias=none\nimage_alias=k3sm_darwin_arm64.dmg' ]; then
+		ok "a final below v0.3.0 plans --latest and no index"
+	else bad "pre-era plan: $out"; fi
 	if command -v shellcheck >/dev/null 2>&1; then
 		if shellcheck "$HERE/publish.sh" "$sign"; then ok "shellcheck"; else bad "shellcheck"; fi
 	else
@@ -2458,6 +2512,10 @@ fi
 if [ "$#" -eq 1 ] && [ "$1" = "--self-test-index" ]; then
 	self_test_index
 	exit $?
+fi
+if [ "$#" -eq 2 ] && [ "$1" = "--plan" ]; then
+	publish_plan "$2"
+	exit 0
 fi
 
 # ---- the refusal: before any argument -------------------------------------------
@@ -2502,7 +2560,7 @@ done
 for v in $unused; do
 	[ -z "${!v}" ] || die "$v is not used by the $MODE run (see --help)"
 done
-valid_version "$VERSION" || die "--version '$VERSION' is not vMAJOR.MINOR.PATCH[-rc.N]"
+require_canonical_version "$VERSION"
 [[ "$TEAM_ID" =~ ^[A-Z0-9]{10}$ ]] || die "--team-id '$TEAM_ID' is not a 10-character Team ID"
 [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "--repo '$REPO' is not owner/name"
 [ -z "$NOTES" ] || [ -f "$NOTES" ] || die "--notes-file $NOTES is not a file"
