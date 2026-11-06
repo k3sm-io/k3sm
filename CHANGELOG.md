@@ -196,6 +196,12 @@ pin, its date, and the tarball's sha256.
 
 ### Fixed
 
+- A managed update no longer stalls on a node when a phase write fails, as it does when the server restarts
+  during that node's update. The node used to stop working on the update without saying so, until the update
+  controller's 30-minute node timeout failed the roll. It now retries the write for up to 5 minutes of backoff,
+  logging each try, and carries on from the step it reached without fetching or installing anything twice. If
+  the write still fails, the node keeps the last phase it wrote and tries again from the start of the download,
+  and the node timeout remains the limit. No RBAC changes.
 - `sudo k3sm start` and `sudo k3sm install --start` on a stopped server no longer fail with `Unauthorized`
   when they reach the apiserver as it comes back, which rolled the install back and left the node cordoned.
   For 30 seconds after the first rejection they retry and read the admin kubeconfig again, within the
