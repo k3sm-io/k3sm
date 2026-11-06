@@ -196,6 +196,11 @@ pin, its date, and the tarball's sha256.
 
 ### Fixed
 
+- `sudo k3sm start` and `sudo k3sm install --start` on a stopped server no longer fail with `Unauthorized`
+  when they reach the apiserver as it comes back, which rolled the install back and left the node cordoned.
+  For 30 seconds after the first rejection they retry and read the admin kubeconfig again, within the
+  existing 90-second limit for the uncordon. A credential still rejected after that fails as before, and a
+  start that restarted nothing, or one on a worker, still fails on the first rejection.
 - `k3sm install` with a new `--mesh-ip` on a control-plane node no longer leaves the server refused its new
   address at every start. The install removes the pod range netd recorded when it names another range than
   the new address's, and removes the interconnect aliases of the old range from `bridge0`. A failed removal

@@ -211,6 +211,121 @@ func TestStartUncordonsOnceTheNodeIsReachable(t *testing.T) {
 	}
 }
 
+// TestStartRetriesUnauthorizedWhileTheServerRestarts is the gate for a 401 seen
+// right after a start or an install --start restarted the control plane: it is
+// retried for uncordonRestartGrace, and everywhere else it stays definitive.
+func TestStartRetriesUnauthorizedWhileTheServerRestarts(t *testing.T) {
+	rejected := fmt.Errorf("get node k3sm-mac: %w", apierrors.NewUnauthorized("Unauthorized"))
+	// markNode returns the 401 for the first rejections calls, or always when
+	// rejections is negative, and counts the calls.
+	markNode := func(rejections int, calls *int) func(context.Context, bool, string, string) error {
+		return func(context.Context, bool, string, string) error {
+			*calls++
+			if rejections < 0 || *calls <= rejections {
+				return rejected
+			}
+			return nil
+		}
+	}
+	shrink := func(t *testing.T, budget, grace time.Duration) {
+		t.Helper()
+		orig := uncordonRestartGrace
+		t.Cleanup(func() { uncordonRestartGrace = orig })
+		uncordonRestartGrace = grace
+		uncordonBudget = restartBudget{running: budget, poll: time.Millisecond}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	t.Run("a start lands the uncordon once the 401s stop", func(t *testing.T) {
+		f, cfg, _ := stoppedNodeOfRole(t, RoleServer)
+		shrink(t, time.Minute, time.Minute)
+		var calls int
+		cfg.MarkNode = markNode(3, &calls)
+		if err := Start(ctx, f, cfg, ActorUser, "test"); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		if calls != 4 {
+			t.Errorf("MarkNode ran %d times, want 4", calls)
+		}
+	})
+	t.Run("an install --start lands it too, and rolls nothing back", func(t *testing.T) {
+		f, cfg, logs := stoppedNodeOfRole(t, RoleServer)
+		shrink(t, time.Minute, time.Minute)
+		var calls int
+		cfg.MarkNode = markNode(3, &calls)
+		cfg.Start = true
+		if err := Install(ctx, f, cfg); err != nil {
+			t.Fatalf("Install --start: %v", err)
+		}
+		if calls != 4 {
+			t.Errorf("MarkNode ran %d times, want 4", calls)
+		}
+		if strings.Contains(logs.String(), "rolled the install root back") {
+			t.Errorf("the install rolled back:\n%s", logs.String())
+		}
+	})
+	t.Run("a 401 past the grace fails without waiting out the budget", func(t *testing.T) {
+		f, cfg, _ := stoppedNodeOfRole(t, RoleServer)
+		shrink(t, time.Minute, 5*time.Millisecond)
+		var calls int
+		cfg.MarkNode = markNode(-1, &calls)
+		err := Start(ctx, f, cfg, ActorUser, "test")
+		if !apierrors.IsUnauthorized(err) || errors.Is(err, ErrNodeStillCordoned) {
+			t.Fatalf("Start = %v, want the 401 and not ErrNodeStillCordoned", err)
+		}
+		if calls < 2 {
+			t.Errorf("MarkNode ran %d times, want the 401 retried", calls)
+		}
+		if uncordonPendingPresent(f, cfg.withDefaults()) {
+			t.Error("a rejected credential recorded a pending uncordon, which only an exhausted budget does")
+		}
+	})
+	t.Run("a budget shorter than the grace still ends the wait", func(t *testing.T) {
+		f, cfg, _ := stoppedNodeOfRole(t, RoleServer)
+		shrink(t, 20*time.Millisecond, time.Minute)
+		var calls int
+		cfg.MarkNode = markNode(-1, &calls)
+		err := Start(ctx, f, cfg, ActorUser, "test")
+		if !errors.Is(err, ErrNodeStillCordoned) || !apierrors.IsUnauthorized(err) {
+			t.Fatalf("Start = %v, want ErrNodeStillCordoned wrapping the 401", err)
+		}
+		if !uncordonPendingPresent(f, cfg.withDefaults()) {
+			t.Error("the exhausted budget did not record the pending uncordon")
+		}
+	})
+	t.Run("a start that restarted nothing fails on the first 401", func(t *testing.T) {
+		f, cfg, _ := stoppedNodeOfRole(t, RoleServer)
+		if err := Start(ctx, f, cfg, ActorUser, "first"); err != nil {
+			t.Fatalf("first Start: %v", err)
+		}
+		if err := writeUncordonPending(f, cfg.withDefaults(), ActorUser, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		shrink(t, time.Minute, time.Minute)
+		var calls int
+		cfg.MarkNode = markNode(-1, &calls)
+		if err := Start(ctx, f, cfg, ActorUser, "test"); !apierrors.IsUnauthorized(err) {
+			t.Fatalf("Start = %v, want the 401", err)
+		}
+		if calls != 1 {
+			t.Errorf("MarkNode ran %d times, want 1", calls)
+		}
+	})
+	t.Run("a worker fails on the first 401: its restart restarted no apiserver", func(t *testing.T) {
+		f, cfg, _ := stoppedNodeOfRole(t, RoleAgent)
+		shrink(t, time.Minute, time.Minute)
+		var calls int
+		cfg.MarkNode = markNode(-1, &calls)
+		if err := Start(ctx, f, cfg, ActorUser, "test"); !apierrors.IsUnauthorized(err) {
+			t.Fatalf("Start = %v, want the 401", err)
+		}
+		if calls != 1 {
+			t.Errorf("MarkNode ran %d times, want 1", calls)
+		}
+	})
+}
+
 // TestUncordonPendingMarkerLifecycle pins who else reads and clears the
 // uncordon-pending marker: install --start uses the same retrying uncordon
 // and records the repair, and a stop and an uninstall remove the marker.

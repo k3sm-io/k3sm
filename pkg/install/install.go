@@ -2630,7 +2630,7 @@ func publishedWiring(ctx context.Context, sys System, cfg Config, m []artifact, 
 		if err := sys.RemoveStopMarker(cfg.StopMarker); err != nil {
 			return fmt.Errorf("install: --start: the daemons are running but the stop marker %s could not be removed (run `sudo k3sm start`): %w", cfg.StopMarker, err)
 		}
-		if err := uncordonAfterStart(ctx, sys, cfg, ActorUser, "k3sm install --start"); err != nil {
+		if err := uncordonAfterStart(ctx, sys, cfg, ActorUser, "k3sm install --start", true); err != nil {
 			return fmt.Errorf("install: --start: %w", err)
 		}
 	}
