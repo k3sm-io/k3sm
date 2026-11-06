@@ -17,10 +17,14 @@ limitations under the License.
 package api
 
 import (
+	"bytes"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -211,18 +215,114 @@ func TestPutIndexAllowsAMissingChildAndFreshensPresentOnes(t *testing.T) {
 			t.Error("the stale child was not touched")
 		}
 	})
-	t.Run("a failed touch refuses the PUT and writes no row", func(t *testing.T) {
+	t.Run("a failed touch is logged and the PUT lands", func(t *testing.T) {
+		var logs bytes.Buffer
+		var mu sync.Mutex
+		f := newFixture(t, withGrace, func(c *Config) {
+			c.Logger = slog.New(slog.NewTextHandler(&lockedWriter{w: &logs, mu: &mu}, nil))
+		})
+		child := dg(f.image(t, "app", "", "child-layer"))
+		f.age(t, "app", time.Now().Add(-2*grace), child)
+		calls := 0
+		f.st.SetFutimes(func(*os.File, time.Time) error { calls++; return syscall.EROFS })
+		body := indexBody(t, nil, child)
+		want(t, f.pushManifest(t, "app", "v1", ispec.MediaTypeImageIndex, body), http.StatusCreated, "")
+		if !f.hasRow(t, "app", dg(body)) {
+			t.Error("no row for the index after a failed touch")
+		}
+		// As for a HEAD, the object is not asked again inside the window.
+		want(t, f.pushManifest(t, "app", "v2", ispec.MediaTypeImageIndex, body), http.StatusCreated, "")
+		if calls != 1 {
+			t.Errorf("futimes called %d times over two PUTs, want 1", calls)
+		}
+		mu.Lock()
+		got := logs.String()
+		mu.Unlock()
+		if n := strings.Count(got, "grace touch failed"); n != 1 || !strings.Contains(got, child.String()) {
+			t.Errorf("logged %d failed touches, want 1 naming %s; log:\n%s", n, child, got)
+		}
+	})
+	t.Run("a failed touch does not excuse a required blob", func(t *testing.T) {
+		f := newFixture(t, withGrace)
+		cfg, layer := []byte("artifact-config"), []byte("artifact-layer")
+		f.pushBlob(t, "app", cfg)
+		subject := dg(f.image(t, "app", "", "subject-layer"))
+		f.age(t, "app", time.Now().Add(-2*grace), subject)
+		f.st.SetFutimes(func(*os.File, time.Time) error { return syscall.EROFS })
+		body := artifactBody(t, cfg, layer, &ispec.Descriptor{MediaType: ispec.MediaTypeImageManifest, Digest: subject, Size: 1})
+		want(t, f.pushManifest(t, "app", "v1", ispec.MediaTypeImageManifest, body), http.StatusBadRequest, codeManifestBlobUnknown)
+	})
+	t.Run("a child named twice, and as the subject, is touched once", func(t *testing.T) {
 		f := newFixture(t, withGrace)
 		child := dg(f.image(t, "app", "", "child-layer"))
 		f.age(t, "app", time.Now().Add(-2*grace), child)
-		f.st.SetFutimes(func(*os.File, time.Time) error { return syscall.EROFS })
-		body := indexBody(t, nil, child)
-		w := f.pushManifest(t, "app", "v1", ispec.MediaTypeImageIndex, body)
-		if w.Code != http.StatusInternalServerError {
-			t.Errorf("status %d, want 500", w.Code)
+		calls := 0
+		// The seam leaves the mtime old, so every repeat would reach it.
+		f.st.SetFutimes(func(*os.File, time.Time) error { calls++; return nil })
+		body := indexBody(t, &ispec.Descriptor{MediaType: ispec.MediaTypeImageManifest, Digest: child, Size: 1}, child, child, child)
+		want(t, f.pushManifest(t, "app", "v1", ispec.MediaTypeImageIndex, body), http.StatusCreated, "")
+		if calls != 1 {
+			t.Errorf("futimes called %d times, want 1", calls)
 		}
-		if f.hasRow(t, "app", dg(body)) {
-			t.Error("a row was written after the touch failed")
+	})
+	t.Run("the touch runs once for a PUT with tags", func(t *testing.T) {
+		f := newFixture(t, withGrace)
+		child := dg(f.image(t, "app", "", "child-layer"))
+		f.age(t, "app", time.Now().Add(-2*grace), child)
+		calls := 0
+		f.st.SetFutimes(func(*os.File, time.Time) error { calls++; return nil })
+		body := indexBody(t, nil, child)
+		want(t, f.pushManifest(t, "app", dg(body).String()+"?tag=a&tag=b&tag=c", ispec.MediaTypeImageIndex, body), http.StatusCreated, "")
+		if calls != 1 {
+			t.Errorf("futimes called %d times over a digest and three tags, want 1", calls)
+		}
+	})
+	t.Run("past the cap the rest are skipped with one log line", func(t *testing.T) {
+		var logs bytes.Buffer
+		var mu sync.Mutex
+		f := newFixture(t, withGrace, func(c *Config) {
+			c.Logger = slog.New(slog.NewTextHandler(&lockedWriter{w: &logs, mu: &mu}, nil))
+		})
+		first := dg(f.image(t, "app", "", "first-layer"))
+		last := dg(f.image(t, "app", "", "last-layer"))
+		old := time.Now().Add(-2 * grace).Truncate(time.Second)
+		f.age(t, "app", old, first, last)
+		children := []digest.Digest{first}
+		for i := range maxManifestTouches + 4 {
+			children = append(children, digest.FromString(strconv.Itoa(i)))
+		}
+		children = append(children, last)
+		body := indexBody(t, nil, children...)
+		want(t, f.pushManifest(t, "app", "v1", ispec.MediaTypeImageIndex, body), http.StatusCreated, "")
+		if got := f.mtime(t, "app", first); !got.After(old) {
+			t.Errorf("the first child inside the cap has mtime %s", got)
+		}
+		if got := f.mtime(t, "app", last); !got.Equal(old) {
+			t.Errorf("a child past the cap has mtime %s, want %s", got, old)
+		}
+		mu.Lock()
+		got := logs.String()
+		mu.Unlock()
+		if n := strings.Count(got, "grace touch skipped"); n != 1 {
+			t.Errorf("logged the cap %d times, want 1; log:\n%s", n, got)
+		}
+		if !strings.Contains(got, "skipped=6") {
+			t.Errorf("the log does not count the 6 skipped; log:\n%s", got)
+		}
+	})
+	t.Run("the subject is inside the cap whatever the index holds", func(t *testing.T) {
+		f := newFixture(t, withGrace)
+		subject := dg(f.image(t, "app", "", "subject-layer"))
+		old := time.Now().Add(-2 * grace).Truncate(time.Second)
+		f.age(t, "app", old, subject)
+		children := make([]digest.Digest, 0, maxManifestTouches+1)
+		for i := range maxManifestTouches + 1 {
+			children = append(children, digest.FromString(strconv.Itoa(i)))
+		}
+		body := indexBody(t, &ispec.Descriptor{MediaType: ispec.MediaTypeImageManifest, Digest: subject, Size: 1}, children...)
+		want(t, f.pushManifest(t, "app", "v1", ispec.MediaTypeImageIndex, body), http.StatusCreated, "")
+		if got := f.mtime(t, "app", subject); !got.After(old) {
+			t.Errorf("the subject has mtime %s", got)
 		}
 	})
 	t.Run("a child reaped between the first check and the lock is still accepted", func(t *testing.T) {

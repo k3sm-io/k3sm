@@ -43,8 +43,10 @@ limitations under the License.
 //     registry: it requires no blobs of a manifest whose config type is neither
 //     an OCI image config nor the empty descriptor, and this server does. A PUT
 //     restarts the garbage-collection grace of each index child and subject the
-//     repository holds, under the repository lock and never while half that
-//     grace is left, and refuses, with nothing written, when a touch fails;
+//     repository holds, under the repository lock, once per request, never
+//     while half that grace is left and for at most maxManifestTouches
+//     distinct objects. That touch is best-effort: a failure is logged and the
+//     PUT answered;
 //   - a blob GET goes through http.ServeContent, so Range, 206 and 416 are
 //     the standard library's; a blob HEAD restarts the blob's
 //     garbage-collection grace (store.TouchBlob, bounded as below), so a
