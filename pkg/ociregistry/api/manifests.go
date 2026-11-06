@@ -184,9 +184,11 @@ type checkedManifest struct {
 //   - schemaVersion is 2, and a mediaType field, when present, is mt;
 //   - every descriptor carries a valid digest and a non-negative size;
 //   - a Docker v2 manifest needs its config and every layer present;
-//   - an OCI manifest needs its config and layers present when the config is
-//     an OCI image config or the empty descriptor, except non-distributable
-//     layers; with any other config type nothing is required;
+//   - an OCI manifest needs its config and every layer present, except
+//     non-distributable layers, whatever its config type: the registry this
+//     replaces skips the check for a config type other than an OCI image
+//     config or the empty descriptor, which let an artifact be stored with
+//     a blob the collector had already reaped;
 //   - an index or manifest list requires nothing: children need not exist.
 //
 // It also refuses any body with a Docker schema1 fsLayers field, whatever its
@@ -247,12 +249,7 @@ func checkManifest(mt string, body []byte) (checkedManifest, error) {
 			layers = append(layers, d)
 		}
 	}
-	switch {
-	case mt == mediaTypeDockerManifest:
-		out.needs = append([]digest.Digest{cfg}, layers...)
-	case m.Config.MediaType == ispec.MediaTypeImageConfig || m.Config.MediaType == ispec.MediaTypeEmptyJSON:
-		out.needs = append([]digest.Digest{cfg}, layers...)
-	}
+	out.needs = append([]digest.Digest{cfg}, layers...)
 	return out, subjectOf(m.Subject, &out)
 }
 
