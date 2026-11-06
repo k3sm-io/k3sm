@@ -438,6 +438,10 @@ type podTrack struct {
 	// surface, so the check and the unpark are one critical section
 	// (commitParkedCreate).
 	deleting bool
+	// stop is the state of the runtime DeletePod calls made for this track, which
+	// a log follower reads to tell a pod still stopping from one that is gone
+	// (followRunning). Guarded by restartMu with deleting.
+	stop runtimeStop
 	// evicted, when non-nil, is the terminal status of a pod the node-pressure
 	// eviction manager evicted (evictPod). It is set BEFORE the runtime teardown
 	// starts and never cleared; every status path returns it first, so nothing the
@@ -2946,7 +2950,10 @@ func (t *podTrack) quiesce() {
 func (r *runtimedRuntime) teardownPod(ctx context.Context, pod *corev1.Pod, grace int64, owned *podTrack) error {
 	id := string(pod.UID)
 	intent := r.recordStopIntent(pod, "")
+	t := r.trackByID(id)
+	t.beginRuntimeStop()
 	_, err := r.rt.DeletePod(ctx, &runtimev1.DeletePodRequest{PodId: id, GracePeriodSeconds: grace})
+	t.endRuntimeStop(err)
 	if err != nil {
 		// Only a definitive refusal proves the stop did not happen.
 		if stopNotIssued(err) {

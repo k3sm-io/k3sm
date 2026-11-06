@@ -267,3 +267,33 @@ func TestFindTailLineStartIndex(t *testing.T) {
 		})
 	}
 }
+
+// TestReadLogsFollowSurvivesARemovedDirectory pins the delete race: a follower
+// that opened its file just before the pod's log tree was removed has no directory
+// left to watch, and still reads what the descriptor holds and ends cleanly.
+func TestReadLogsFollowSurvivesARemovedDirectory(t *testing.T) {
+	ts := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	path := writeLog(t, line(ts, "stdout", "F", "kept"))
+
+	open := func(p string) (*os.File, error) {
+		f, err := os.Open(p)
+		if err != nil {
+			return nil, err
+		}
+		if err := os.RemoveAll(filepath.Dir(p)); err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+		return f, nil
+	}
+	exited := func(context.Context) (bool, error) { return false, nil }
+
+	var out bytes.Buffer
+	err := ReadLogsWith(context.Background(), path, open, &Options{Follow: true}, exited, nil, &out, &out)
+	if err != nil {
+		t.Fatalf("ReadLogsWith: %v", err)
+	}
+	if got := out.String(); got != "kept\n" {
+		t.Errorf("output = %q, want the line the open descriptor holds", got)
+	}
+}
