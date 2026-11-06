@@ -347,6 +347,11 @@ func New(cfg Config) (*Server, error) {
 	return s, nil
 }
 
+// UploadSessions returns how many upload sessions count against MaxSessions
+// now: the sessions this process has tracked and not yet seen go idle, plus
+// the slots reserved for sessions being created.
+func (s *Server) UploadSessions() int { return s.sessions.live() }
+
 // positive returns v, or def when v is not positive.
 func positive[T int | int64 | time.Duration](v, def T) T {
 	if v <= 0 {

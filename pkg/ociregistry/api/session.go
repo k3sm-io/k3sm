@@ -179,6 +179,14 @@ func (t *sessions) inUse() int {
 	return n
 }
 
+// live counts the sessions in use now, pruning the idle ones first.
+func (t *sessions) live() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.prune()
+	return t.inUse()
+}
+
 // heldBy counts the entries and reserved slots of principal owner. The caller
 // holds mu.
 func (t *sessions) heldBy(owner string) int {
