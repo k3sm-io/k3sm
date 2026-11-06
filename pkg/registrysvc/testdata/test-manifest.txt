@@ -25,6 +25,7 @@ TestGateRefusesLongLivedBuilderToken kept the push gate is unchanged
 TestGenerateCredential kept the credential files are unchanged
 TestHostingDocument kept the relay and cluster publication do not touch the child
 TestIsOrphanedChild added new with the child switch
+TestLookupPrimaryGID added root drops only to the group the named user holds
 TestLoopbackAuthority kept the push gate is unchanged
 TestLoopbackGateAnswersOnLoopbackOnly kept the push gate is unchanged
 TestLoopbackGateBindsLoopbackOnly kept the push gate is unchanged

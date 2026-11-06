@@ -24,6 +24,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -326,19 +327,31 @@ type identity struct {
 	geteuid, getuid, getegid func() int
 	setgroups                func([]int) error
 	setgid, setuid           func(int) error
+	// primaryGID is the primary group of the user uid, from its account record.
+	primaryGID func(uid int) (int, error)
 }
 
 func osIdentity() identity {
 	return identity{
 		geteuid: unix.Geteuid, getuid: unix.Getuid, getegid: unix.Getegid,
 		setgroups: unix.Setgroups, setgid: unix.Setgid, setuid: unix.Setuid,
+		primaryGID: lookupPrimaryGID,
 	}
+}
+
+// lookupPrimaryGID reads uid's primary group from its account record.
+func lookupPrimaryGID(uid int) (int, error) {
+	u, err := user.LookupId(strconv.Itoa(uid))
+	if err != nil {
+		return 0, err
+	}
+	return strconv.Atoi(u.Gid)
 }
 
 // applyServeCredential takes the process off root onto cfg's service credential
 // when it was started as root, and otherwise checks it already holds it. A root
-// process with no credential to take refuses, as does one whose drop does not
-// verify. Darwin credentials are per process, so the drop reaches every thread.
+// process with no credential to take refuses, as does one whose group is not the
+// named user's primary group or whose drop does not verify. Darwin credentials are per process, so the drop reaches every thread.
 func applyServeCredential(cfg ServeConfig, id identity) error {
 	if id.geteuid() != 0 && id.getuid() != 0 {
 		if cfg.UID != 0 && (id.geteuid() != cfg.UID || id.getegid() != cfg.GID) {
@@ -348,6 +361,16 @@ func applyServeCredential(cfg ServeConfig, id identity) error {
 	}
 	if cfg.UID == 0 {
 		return fmt.Errorf("%w: the config names no service credential", ErrServeAsRoot)
+	}
+	// Root takes the group from a config the user it names can write, so the
+	// config cannot be what grants it: the group must be the one the account
+	// record gives that user. A server run by launchd holds exactly that group.
+	gid, err := id.primaryGID(cfg.UID)
+	if err != nil {
+		return fmt.Errorf("%w: read the account of uid %d: %w", ErrServeCredential, cfg.UID, err)
+	}
+	if gid != cfg.GID {
+		return fmt.Errorf("%w: the config names group %d, and uid %d's primary group is %d", ErrServeCredential, cfg.GID, cfg.UID, gid)
 	}
 	if err := id.setgroups([]int{cfg.GID}); err != nil {
 		return fmt.Errorf("%w: setgroups: %w", ErrServeAsRoot, err)

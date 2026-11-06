@@ -24,7 +24,9 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -148,6 +150,10 @@ type fakeIdentity struct {
 	failSetuid       error
 	ignoreSetuid     bool
 	returnsToRoot    bool
+	// primary is the group the named user's account record gives it, 498 when
+	// unset; primaryErr is an account record that cannot be read.
+	primary    int
+	primaryErr error
 }
 
 func (f *fakeIdentity) identity() identity {
@@ -155,6 +161,12 @@ func (f *fakeIdentity) identity() identity {
 		geteuid: func() int { return f.euid },
 		getuid:  func() int { return f.ruid },
 		getegid: func() int { return f.egid },
+		primaryGID: func(int) (int, error) {
+			if f.primary != 0 {
+				return f.primary, f.primaryErr
+			}
+			return 498, f.primaryErr
+		},
 		setgroups: func(g []int) error {
 			f.calls = append(f.calls, "setgroups")
 			return nil
@@ -197,6 +209,10 @@ func TestApplyServeCredential(t *testing.T) {
 		{name: "root whose setuid fails refuses", id: fakeIdentity{failSetuid: unix.EPERM}, uid: 499, gid: 498, want: ErrServeAsRoot, wantCalls: "setgroups setgid setuid"},
 		{name: "root whose setuid does not take refuses", id: fakeIdentity{ignoreSetuid: true}, uid: 499, gid: 498, want: ErrServeAsRoot, wantCalls: "setgroups setgid setuid"},
 		{name: "root that can return to root refuses", id: fakeIdentity{returnsToRoot: true}, uid: 499, gid: 498, want: ErrServeAsRoot, wantCalls: "setgroups setgid setuid setuid"},
+		{name: "root drops to the service user's real shape", id: fakeIdentity{primary: 20}, uid: 499, gid: 20, wantCalls: "setgroups setgid setuid setuid"},
+		{name: "root refuses group 0 for a user that does not hold it", id: fakeIdentity{}, uid: 499, gid: 0, want: ErrServeCredential},
+		{name: "root refuses a group other than the user's own", id: fakeIdentity{}, uid: 499, gid: 80, want: ErrServeCredential},
+		{name: "root refuses a user with no account record", id: fakeIdentity{primaryErr: errors.New("no such user")}, uid: 499, gid: 498, want: ErrServeCredential},
 		{name: "the service user with its credential runs", id: fakeIdentity{euid: 499, ruid: 499, egid: 498}, uid: 499, gid: 498},
 		{name: "an unprivileged user with no credential named runs", id: fakeIdentity{euid: 501, ruid: 501, egid: 20}},
 		{name: "another user refuses", id: fakeIdentity{euid: 501, ruid: 501, egid: 498}, uid: 499, gid: 498, want: ErrServeCredential},
@@ -216,6 +232,22 @@ func TestApplyServeCredential(t *testing.T) {
 	}
 }
 
+// TestLookupPrimaryGID reads the real account database: the running user's group,
+// and an error for a uid with no account.
+func TestLookupPrimaryGID(t *testing.T) {
+	u, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := lookupPrimaryGID(os.Getuid())
+	if err != nil || strconv.Itoa(got) != u.Gid {
+		t.Errorf("lookupPrimaryGID(%d) = %d, %v, want %s", os.Getuid(), got, err, u.Gid)
+	}
+	if got, err := lookupPrimaryGID(987654321); err == nil {
+		t.Errorf("a uid with no account has group %d", got)
+	}
+}
+
 // TestServeRefusesBeforeTheStoreOpens pins that every startup refusal comes
 // before store.Open, which would create the store root.
 func TestServeRefusesBeforeTheStoreOpens(t *testing.T) {
@@ -228,7 +260,7 @@ func TestServeRefusesBeforeTheStoreOpens(t *testing.T) {
 		{
 			name: "root whose drop fails",
 			edit: func(c *ServeConfig) { c.UID, c.GID = os.Getuid(), os.Getgid() },
-			deps: func(d *serveDeps) { d.ident = (&fakeIdentity{failSetuid: unix.EPERM}).identity() },
+			deps: func(d *serveDeps) { d.ident = (&fakeIdentity{failSetuid: unix.EPERM, primary: os.Getgid()}).identity() },
 			want: ErrServeAsRoot,
 		},
 		{
@@ -289,7 +321,7 @@ func TestServeRefusesBeforeTheStoreOpens(t *testing.T) {
 // store root is created only after the last credential call.
 func TestServeDropsRootBeforeTheStoreOpens(t *testing.T) {
 	work := writeTestServeConfig(t, func(c *ServeConfig) { c.UID, c.GID = os.Getuid(), os.Getgid() })
-	fake := fakeIdentity{}
+	fake := fakeIdentity{primary: os.Getgid()}
 	id := fake.identity()
 	inner := id.setuid
 	var absentAtDrop bool
