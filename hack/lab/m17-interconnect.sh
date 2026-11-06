@@ -58,7 +58,7 @@
 # directory per run under it and the exit trap removes that directory.
 # Optional knobs (each recorded in the log):
 #   K3SM_M17_LOCAL_NODE, K3SM_M17_PEER_NODE   node names (default: matched by mesh address)
-#   K3SM_M17_CLUSTER_CIDR      the cluster pod aggregate (default 10.42.0.0/16)
+#   K3SM_M17_CLUSTER_CIDR      the cluster pod aggregate (default 100.64.0.0/10)
 #   K3SM_M17_PAYLOAD_MB        r3/r4 payload in MiB (default 128, at least 100)
 #   K3SM_M17_LAN_SLACK_BYTES   bytes the flat interface may move (default 8388608)
 #   K3SM_M17_DESIRED_INTERVAL  seconds of the node's DesiredInterval (default 60)
@@ -1011,11 +1011,16 @@ EOF
 	# desired.go Reconcile over apis ParseInterconnectDesired): extra fields are
 	# ignored and a foreign interconnect name is still a valid object name, so both
 	# parse and the handler ENSURES slot 0 (held); schema 99 fails the schema read,
-	# is treated as absent, and the handler REMOVES slot 0 (the safe direction).
+	# is treated as absent, and the handler asks to REMOVE slot 0 (the safe direction);
+	# netd refuses that while pod slots are owned, so slot 0 then stays.
 	# The server's resolver rewrites the value on its next reconcile, so the
 	# forged value may be live only briefly; the samples record which value each
 	# one saw.
-	local fv held total seen rm0 rm1
+	local fv held total seen rm0 rm1 riders rs
+	riders=0
+	for rs in 1 2 3 4 5 6 7; do
+		grep -qF -- "$(icp_slot_addr "$idx" "$rs")" "$RUNG_DIR/$side-before-bridge0.txt" && riders=$((riders + 1))
+	done
 	for v in extra name schema; do
 		fv="$(forge_value "$orig" "$v")"
 		scrape_metrics "pre-$v"
@@ -1041,6 +1046,11 @@ EOF
 		schema)
 			if [ "$seen" = 0 ] && [ "$rm1" = "$rm0" ]; then
 				rec "forge 'schema': the resolver restored the annotation before any sample or handler saw schema 99; the handler's removal is not observable in this run"
+			elif [ "$riders" -gt 0 ]; then
+				# netd refuses slot 0 while a pod slot is owned (ErrInterconnectTeardownOrder),
+				# so the handler's removal fails and slot 0 stays: the safe direction.
+				check "forge 'schema' reads as absent but netd refuses slot 0 while $riders pod slot(s) are held (held in $held of $total samples, RemoveInterconnectAlias ok +$((rm1 - rm0)))" \
+					test "$held" = "$total" -a $((rm1 - rm0)) -eq 0
 			else
 				check "forge 'schema' reads as absent, so the handler removed slot 0 (RemoveInterconnectAlias ok +$((rm1 - rm0)), slot 0 absent in $((total - held)) samples)" \
 					test $((rm1 - rm0)) -gt 0 -a "$held" -lt "$total"
@@ -1215,7 +1225,7 @@ assert_r8_killswitch() {
 	check "the mesh ping still answers ($mp0/3)" test "${mp0:-0}" -gt 0
 	check_disarmed
 	scrape_metrics post
-	check "k3sm_interconnect_attached_pods is 0" test "$(icp_metric_sum "$RUNG_DIR/metrics-post.txt" k3sm_interconnect_attached_pods)" = 0
+	# k3sm_interconnect_attached_pods is not checked: status.attachedPods has no non-test writer, so 0 proves nothing.
 	[ "$R_FAIL" = 0 ] && HAVE="$HAVE disarmed"
 	return 0
 }
@@ -1896,7 +1906,7 @@ self_test_body() {
 	st_eq "ping gap red: three" "$(icp_ping_max_gap "$F/ping-gap3.txt")" 3
 
 	st_eq "transitions delta node-a" "$(($(icp_metric_sum "$F/metrics-after.txt" k3sm_interconnect_member_transitions_total 'node="node-a"') - $(icp_metric_sum "$F/metrics-before.txt" k3sm_interconnect_member_transitions_total 'node="node-a"')))" 2
-	st_eq "attached pods" "$(icp_metric_sum "$F/metrics-after.txt" k3sm_interconnect_attached_pods)" 0
+	# attached pods: not checked (the gauge has no non-test writer, so 0 is vacuous)
 	st "netd verbs: the closed two" 0 icp_netd_verbs_closed "$F/metrics-after.txt"
 	st "netd verbs red: a foreign verb" 1 icp_netd_verbs_closed "$F/metrics-foreign-verb.txt"
 	st_eq "netd Hello frame bytes (4-byte big-endian length + JSON)" "$(icp_netd_hello_frame)" "$(cat "$F/netd-hello-frame.hex")"
@@ -1972,8 +1982,8 @@ self_test_body() {
 	st "lo0: a new address is no loss" 0 lo0_lost "$F/lo0-lost-egress.txt" "$F/lo0-before.txt"
 	st_out "lo0 red: the lost address is named" "gone from lo0: 100.64.3.1" lo0_lost "$F/lo0-before.txt" "$F/lo0-lost-egress.txt"
 	st "lo0: a rank pod's address may go" 0 lo0_lost "$F/lo0-before.txt" "$F/lo0-lost-egress.txt" 100.64.3.1
-	st_out "r8: the documented disarm, hold before the delete and empty after it" "DRIVER passes=31 fails=0" st_r8_run green
-	st_out "r8: no pod attached in r2 skips only the hold" "DRIVER passes=25 fails=0" st_r8_run no-attached
+	st_out "r8: the documented disarm, hold before the delete and empty after it" "DRIVER passes=30 fails=0" st_r8_run green
+	st_out "r8: no pod attached in r2 skips only the hold" "DRIVER passes=24 fails=0" st_r8_run no-attached
 	st_out "r8 red: an address dropped while its pod runs" "FAIL      [r8] local Mac: ic-l-local's address 169.254.0.26 is still a /32" st_r8_run dropped-early
 	st_out "r8 red: the node's own address dropped while a pod rides it" "FAIL      [r8] local Mac: the node's own address 169.254.0.25 stays" st_r8_run dropped-early
 	st_out "r8 red: a running pod's condition went False" "FAIL      [r8] pod ic-l-local, still running" st_r8_run cond-false
@@ -2086,7 +2096,7 @@ PAYLOAD_MB="${K3SM_M17_PAYLOAD_MB:-128}"
 [ "$PAYLOAD_MB" -ge 100 ] 2>/dev/null || refuse_run preflight "K3SM_M17_PAYLOAD_MB=$PAYLOAD_MB; the transfer is at least 100 MiB (BI10)"
 LAN_SLACK="${K3SM_M17_LAN_SLACK_BYTES:-8388608}"
 DESIRED_INTERVAL="${K3SM_M17_DESIRED_INTERVAL:-60}"
-CLUSTER_CIDR="${K3SM_M17_CLUSTER_CIDR:-10.42.0.0/16}"
+CLUSTER_CIDR="${K3SM_M17_CLUSTER_CIDR:-100.64.0.0/10}"
 MLX_MODEL="${K3SM_M17_MLX_MODEL:-mlx-community/Qwen2.5-0.5B-Instruct-4bit}"
 MLX_MEMORY="${K3SM_M17_MLX_MEMORY:-4Gi}"
 MLX_READY_TIMEOUT="${K3SM_M17_MLX_READY_TIMEOUT:-1800}"
