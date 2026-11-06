@@ -18,6 +18,7 @@ package registrysvc
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -251,6 +252,35 @@ func TestPruneThroughTheStore(t *testing.T) {
 		want := []string{digestOf(ix), digestOf(c1), digestOf(lone), digestOf(c2)}
 		if strings.Join(got, ",") != strings.Join(want, ",") {
 			t.Errorf("delete = %v; want the index first, then the manifests in index order: %v", got, want)
+		}
+	})
+
+	t.Run("a manifest whose last tag was deleted is planned, once it is aged", func(t *testing.T) {
+		wd := t.TempDir()
+		st, err := store.OpenWorkDir(wd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n, err := ref.ParseName("r")
+		if err != nil {
+			t.Fatal(err)
+		}
+		a := manifestBody("a")
+		ctx := context.Background()
+		if _, err := st.PutManifest(ctx, n, ref.Reference{Tag: "v1"}, manifestType, a); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.DeleteTag(ctx, n, "v1"); err != nil {
+			t.Fatal(err)
+		}
+		p := PlanRepository(wd, "r", time.Now())
+		if len(p.Delete) != 0 || len(p.Kept) != 1 || p.Kept[0].Digest != digestOf(a) || p.Kept[0].Reason != KeepRecent {
+			t.Errorf("just untagged: delete = %v, kept = %+v; want it kept as recent", digests(p.Delete), p.Kept)
+		}
+		ageBlobs(t, wd, "r", old, digestOf(a))
+		p = PlanRepository(wd, "r", time.Now())
+		if got := digests(p.Delete); len(got) != 1 || got[0] != digestOf(a) {
+			t.Errorf("aged: delete = %v, kept = %+v; want %s planned", got, p.Kept, digestOf(a))
 		}
 	})
 

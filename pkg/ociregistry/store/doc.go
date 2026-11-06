@@ -24,8 +24,9 @@ limitations under the License.
 // every manifest body, and .uploads/<uuid> for upload sessions, each a plain
 // file whose length is its offset. Tags are org.opencontainers.image.ref.name
 // annotations on index.json rows, one row per (digest, tag); a manifest pushed
-// by digest, an index's child among them, is an untagged row. Files are 0600
-// and directories 0700, as zot makes them.
+// by digest, an index's child among them, is an untagged row, and so is a
+// manifest whose last tag was deleted or moved. Files are 0600 and directories
+// 0700, as zot makes them.
 //
 // zot's cache.db and meta.db stay in the root, never read, written or deleted,
 // so a rollback finds them. A blob already present in another repository is

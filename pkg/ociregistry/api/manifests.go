@@ -516,7 +516,9 @@ func (s *Server) deleteManifest(w http.ResponseWriter, r *http.Request, n ref.Na
 		return nil
 	}
 	if rf.Tag != "" {
-		err = s.st.DeleteTagChecked(r.Context(), n, rf.Tag, precondition)
+		err = s.st.DeleteTagChecked(r.Context(), n, rf.Tag, precondition, func(row ispec.Descriptor) (bool, error) {
+			return s.keepsUntaggedRow(n, row)
+		})
 	} else {
 		err = s.st.DeleteDigestChecked(r.Context(), n, rf.Digest, func(rows []ispec.Descriptor) error {
 			if err := precondition(rows); err != nil {
@@ -534,6 +536,24 @@ func (s *Server) deleteManifest(w http.ResponseWriter, r *http.Request, n ref.Na
 	}
 	s.log.Info("registry manifest deleted", "repository", n.String(), "reference", rf.String())
 	w.WriteHeader(http.StatusAccepted)
+}
+
+// keepsUntaggedRow reports whether a manifest losing its last tag keeps an
+// untagged row, which is what leaves it readable by digest until a digest
+// DELETE or GC. One whose body the collector cannot read does not: the row would
+// stop every sweep of the repository, and deleting the tag is the documented way
+// to clear it. A read failure that may pass deletes nothing.
+func (s *Server) keepsUntaggedRow(n ref.Name, row ispec.Descriptor) (bool, error) {
+	body, err := s.readManifestBlob(n, row)
+	switch {
+	case err == nil:
+		return gc.Readable(body) == nil, nil
+	case errors.Is(err, errManifestSize), errors.Is(err, store.ErrStoreCorrupt), errors.Is(err, store.ErrBlobUnknown),
+		errors.Is(err, store.ErrNotRegular), errors.Is(err, ref.ErrSymlink):
+		return false, nil
+	default:
+		return false, fmt.Errorf("read manifest %s: %w", row.Digest, err)
+	}
 }
 
 // digestTagged reports whether a row of rows tags d.
