@@ -614,7 +614,7 @@ func TestScanDigests(t *testing.T) {
 		{"open objects", filled("", `{"a":`), 0},
 		{"a long string", filled(`"`, "x"), 0},
 		{"many small values", filled("[", "1,"), 0},
-		{"digests", filled("[", digestUnit), (store.MaxManifestSize - 1) / len(digestUnit)},
+		{"repeats of one digest", filled("[", digestUnit), 1},
 	} {
 		t.Run("at the cap: "+tc.name, func(t *testing.T) {
 			if got := len(scanDigests(tc.body)); got != tc.want {

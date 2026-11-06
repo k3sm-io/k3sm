@@ -296,7 +296,7 @@ func (c *Collector) Sweep(ctx context.Context) (Report, error) {
 // and the repository is marked again, up to maxPlans times.
 func (c *Collector) sweepRepo(ctx context.Context, n ref.Name, reportOnly bool) ([]Object, error) {
 	for range maxPlans {
-		m, err := c.mark(n, c.now().Add(-c.grace))
+		m, err := c.mark(ctx, n, c.now().Add(-c.grace))
 		if err != nil {
 			return nil, err
 		}
@@ -372,8 +372,9 @@ type marked struct {
 }
 
 // mark plans n's sweep from an unlocked snapshot, reading, verifying and
-// parsing every manifest body the plan follows.
-func (c *Collector) mark(n ref.Name, cutoff time.Time) (marked, error) {
+// parsing every manifest body the plan follows. It checks ctx before each body
+// read and returns its error, so a cancelled sweep ends having deleted nothing.
+func (c *Collector) mark(ctx context.Context, n ref.Name, cutoff time.Time) (marked, error) {
 	idx, err := c.s.Index(n)
 	if err != nil {
 		return marked{}, err
@@ -383,7 +384,13 @@ func (c *Collector) mark(n ref.Name, cutoff time.Time) (marked, error) {
 		return marked{}, err
 	}
 	m := marked{idx: idx, cont: cont, reads: reads{}}
-	m.p, err = makePlan(idx, cont, cutoff, m.reads.unlocked(c.reader(n)))
+	read := c.reader(n)
+	m.p, err = makePlan(idx, cont, cutoff, m.reads.unlocked(func(d digest.Digest) ([]byte, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return read(d)
+	}))
 	return m, err
 }
 
@@ -800,8 +807,8 @@ func (e *unverifiedError) Error() string {
 
 func (e *unverifiedError) Unwrap() error { return ErrUnreadable }
 
-// scanDigests returns every string in the JSON body b that ref.ParseDigest
-// accepts, at any depth and at every occurrence of a repeated key. It stops at
+// scanDigests returns, once each and in order of first occurrence, every string
+// in the JSON body b that ref.ParseDigest accepts, at any depth and at every occurrence of a repeated key. It stops at
 // the first thing that is not JSON and returns what it found before it. Object
 // keys count too: the decoder's tokens do not tell them from values, and keeping
 // too much is the safe side.
@@ -816,13 +823,15 @@ func scanDigests(b []byte) []digest.Digest {
 	dec := json.NewDecoder(bytes.NewReader(b))
 	dec.UseNumber()
 	var out []digest.Digest
+	seen := map[digest.Digest]bool{}
 	for {
 		tok, err := dec.Token()
 		if err != nil {
 			return out
 		}
 		if s, ok := tok.(string); ok {
-			if d, err := ref.ParseDigest(s); err == nil {
+			if d, err := ref.ParseDigest(s); err == nil && !seen[d] {
+				seen[d] = true
 				out = append(out, d)
 			}
 		}
@@ -907,7 +916,7 @@ func parseBody(b []byte) (refs, error) {
 // The kept set bounds this. A body is followed once however often it is named, so
 // a cycle ends at its second visit, and a fan-out reads each blob at most once: a
 // repeat of a digest, however many a body holds (about 56000 fill the size cap),
-// costs a queue entry and no read. A mark so reads at most one body per blob the
+// costs one queue entry and no read (the scan returns a digest once, and the queue takes an item once). A mark so reads at most one body per blob the
 // repository holds, of at most store.MaxManifestSize+1 bytes, and a sweep marks a
 // repository at most maxPlans times. The locked pass reads nothing, and a digest
 // it finds in the contents that the mark did not read is errStale.
@@ -930,6 +939,16 @@ func makePlan(idx ispec.Index, cont store.Contents, cutoff time.Time, refsOf fun
 		scanned  bool // found by scanDigests, not named by a readable body
 	}
 	var queue []item
+	// queued holds the items ever enqueued, whole: an item found by the scan and
+	// the same digest named by a readable body differ in scanned, so the first
+	// never stands in for the second, which must still reach the check below.
+	queued := map[item]bool{}
+	enqueue := func(it item) {
+		if !queued[it] {
+			queued[it] = true
+			queue = append(queue, it)
+		}
+	}
 	candidates := map[digest.Digest]bool{}
 	hasRow := make(map[digest.Digest]bool, len(idx.Manifests))
 	for _, r := range idx.Manifests {
@@ -937,12 +956,12 @@ func makePlan(idx ispec.Index, cont store.Contents, cutoff time.Time, refsOf fun
 	}
 	for _, r := range idx.Manifests {
 		if _, tagged := r.Annotations[ispec.AnnotationRefName]; tagged {
-			queue = append(queue, item{d: r.Digest, required: true})
+			enqueue(item{d: r.Digest, required: true})
 			continue
 		}
 		t, ok := mtime[r.Digest]
 		if !ok || !old(t) {
-			queue = append(queue, item{d: r.Digest})
+			enqueue(item{d: r.Digest})
 			continue
 		}
 		m, err := refsOf(r.Digest)
@@ -950,7 +969,7 @@ func makePlan(idx ispec.Index, cont store.Contents, cutoff time.Time, refsOf fun
 			return plan{}, planError("untagged "+r.Digest.String(), err)
 		}
 		if m.Subject != nil {
-			queue = append(queue, item{d: r.Digest, required: true})
+			enqueue(item{d: r.Digest, required: true})
 			continue
 		}
 		candidates[r.Digest] = true
@@ -982,7 +1001,7 @@ func makePlan(idx ispec.Index, cont store.Contents, cutoff time.Time, refsOf fun
 			for _, d := range u.named {
 				referenced[d] = true
 				if _, stored := mtime[d]; stored && !kept[d] {
-					queue = append(queue, item{d: d, scanned: true})
+					enqueue(item{d: d, scanned: true})
 				}
 			}
 			continue
@@ -1001,7 +1020,7 @@ func makePlan(idx ispec.Index, cont store.Contents, cutoff time.Time, refsOf fun
 				continue
 			}
 			referenced[ch.Digest] = true
-			queue = append(queue, item{d: ch.Digest})
+			enqueue(item{d: ch.Digest})
 		}
 	}
 

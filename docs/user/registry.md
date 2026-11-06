@@ -584,7 +584,8 @@ Nothing is deleted in any of these cases. Each shows on every sweep in the
   stops the sweep too. A blob the strict read refuses is searched for digests in the same way. A
   blob over the limit or failing its hash is kept and stops nothing. A sweep reads each blob at most
   once per pass over a repository, and at most 4 MiB of it, so the extra reading is bounded by the
-  number of blobs the repository holds.
+  number of blobs the repository holds, and the memory by the digests those blobs name, each held
+  once however often a body repeats it. A cancelled sweep stops before its next read.
 - **`would delete more than half`.** The half-repository brake stopped the sweep of that repository,
   and a `registry gc: sweep stopped` line says how many blobs it held back. Check that the
   repository's tags are the ones you expect.
