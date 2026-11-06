@@ -183,6 +183,12 @@ pin, its date, and the tarball's sha256.
   of those aliases is logged and does not stop the install. The old mesh address and the old range's pod
   aliases stay on `lo0` until `k3sm stop`, `k3sm uninstall` or a reboot. A reinstall that keeps its
   `--mesh-ip`, and any worker reinstall, keeps the recorded range.
+- A registry garbage collection no longer stops at the half-repository brake, and keeps a removed
+  image's blobs, because one blob of that image is newer than the repository's last row change, as a
+  blob shared with another repository is when that repository touches it after the delete. When a
+  sweep removes every row, it now reaps the blobs older than the last row change and leaves the newer
+  ones out; removing rows lets the next sweep reap those too. With no row to remove, a blob left out
+  waits for the abandon horizon, and a first push with no manifest yet still reaps nothing.
 - `k3sm image untag` of an image's last tag no longer makes the image unreadable by digest in the
   cluster registry. The manifest stays readable at `repository@sha256:...`, and `k3sm image prune` sees
   it as untagged, until prune or the registry's garbage collection removes it.

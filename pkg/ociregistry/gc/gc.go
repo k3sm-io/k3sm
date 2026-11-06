@@ -304,11 +304,15 @@ func (c *Collector) sweepRepo(ctx context.Context, n ref.Name, reportOnly bool) 
 			return nil, nil
 		}
 		if reportOnly {
-			objs := m.p.objects(n)
+			q, err := c.brake(n, m.p, m.idx, m.cont)
+			if err != nil {
+				q = m.p
+			}
+			objs := q.objects(n)
 			for _, o := range objs {
 				c.log.Info("registry gc: would reap", "repository", o.Repository, "kind", o.Kind, "name", o.Name, "reason", o.Reason)
 			}
-			return objs, c.brake(n, m.p, m.idx, m.cont)
+			return objs, err
 		}
 		if c.afterMark != nil {
 			c.afterMark(n)
@@ -352,8 +356,8 @@ func (c *Collector) sweepLocked(ctx context.Context, n ref.Name, m marked) ([]Ob
 		if err != nil {
 			return err
 		}
-		final := m.p.intersect(q)
-		if err := c.brake(n, final, idx, cont); err != nil {
+		final, err := c.brake(n, m.p.intersect(q), idx, cont)
+		if err != nil {
 			return err
 		}
 		objs, err = c.apply(l, n, final, idx, cutoff)
@@ -475,9 +479,11 @@ func (r reads) locked(cont store.Contents) func(digest.Digest) (refs, error) {
 	}
 }
 
-// brake applies the half-repository rule to a plan over idx and cont: a plan
-// that would reap more than half of the repository's blobs stops, unless it
-// empties the repository or the repository is an abandoned first push.
+// brake applies the half-repository rule to a plan over idx and cont, and
+// returns the plan to apply: a plan that would reap more than half of the
+// repository's blobs stops, unless it empties the repository, the repository is
+// an abandoned first push, or it can go on without the blobs the rule below does
+// not vouch for (see leaveNewerOut).
 //
 // A plan empties the repository when it leaves no row (every row, if there
 // were any, is one it reaps) and every blob it reaps predates index.json's
@@ -497,13 +503,20 @@ func (r reads) locked(cont store.Contents) func(digest.Digest) (refs, error) {
 // A first push that was abandoned would stay under the brake for ever, so the
 // brake does not apply to a repository with no rows whose index.json, blobs
 // and upload sessions are all older than the abandon horizon (see abandoned).
-func (c *Collector) brake(n ref.Name, p plan, idx ispec.Index, cont store.Contents) error {
+//
+// On a stop the plan returned is empty and the caller holds the one it passed.
+func (c *Collector) brake(n ref.Name, p plan, idx ispec.Index, cont store.Contents) (plan, error) {
 	if 2*len(p.blobs) <= len(cont.Blobs) || emptyingRule(p, idx, cont) || abandoned(idx, cont, c.now().Add(-c.abandon)) {
-		return nil
+		return p, nil
+	}
+	if q, ok := leaveNewerOut(p, idx, cont); ok {
+		c.log.Info("registry gc: leaving out blobs not older than index.json", "repository", n.String(),
+			"reap", len(q.blobs), "left", len(p.blobs)-len(q.blobs))
+		return q, nil
 	}
 	c.log.Error("registry gc: sweep stopped", "repository", n.String(), "reap", len(p.blobs), "blobs", len(cont.Blobs),
 		"reason", "more than half of the repository's blobs")
-	return fmt.Errorf("%w: %d of %d", ErrMassDelete, len(p.blobs), len(cont.Blobs))
+	return plan{}, fmt.Errorf("%w: %d of %d", ErrMassDelete, len(p.blobs), len(cont.Blobs))
 }
 
 // emptyingRule is the rule brake applies (a seam for the test that proves
@@ -513,10 +526,8 @@ var emptyingRule = emptying
 // emptying reports whether p empties the repository, by the rule brake
 // documents.
 func emptying(p plan, idx ispec.Index, cont store.Contents) bool {
-	for _, r := range idx.Manifests {
-		if _, tagged := r.Annotations[ispec.AnnotationRefName]; tagged || !p.rows[r.Digest] {
-			return false
-		}
+	if !removesEveryRow(p, idx) {
+		return false
 	}
 	for _, b := range cont.Blobs {
 		if p.blobs[b.Digest] && !b.ModTime.Before(cont.IndexModTime) {
@@ -524,6 +535,43 @@ func emptying(p plan, idx ispec.Index, cont store.Contents) bool {
 		}
 	}
 	return true
+}
+
+// removesEveryRow reports whether p leaves idx with no row.
+func removesEveryRow(p plan, idx ispec.Index) bool {
+	for _, r := range idx.Manifests {
+		if _, tagged := r.Annotations[ispec.AnnotationRefName]; tagged || !p.rows[r.Digest] {
+			return false
+		}
+	}
+	return true
+}
+
+// leaveNewerOut is what stands in for stopping a plan that removes every row but
+// names a blob not older than index.json: a touch through an inode another
+// repository shares, or a mount, can make one blob newer than a delete, and that
+// one blob must not hold the rest of a removed image. The plan goes on with only
+// the blobs older than index.json, each of which the rule in brake vouches for,
+// and with the rows, whose removal moves index.json past what was left out, so the
+// next sweep reaps those too.
+//
+// It reports false when that leaves nothing to remove, which is a first push, its
+// blobs all newer than an index with no row: the brake stops it, and it waits for
+// the abandon horizon. So does a blob left out of a repository with no rows, since
+// nothing then moves index.json. While another repository names the inode that
+// blob holds no bytes.
+func leaveNewerOut(p plan, idx ispec.Index, cont store.Contents) (plan, bool) {
+	if !removesEveryRow(p, idx) {
+		return plan{}, false
+	}
+	p.blobs = maps.Clone(p.blobs)
+	for _, b := range cont.Blobs {
+		if !b.ModTime.Before(cont.IndexModTime) {
+			delete(p.blobs, b.Digest)
+		}
+	}
+	p.emptyRepo = false
+	return p, len(p.rows) > 0 || len(p.blobs) > 0
 }
 
 // abandoned reports whether the repository is a first push nobody has

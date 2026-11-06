@@ -132,7 +132,7 @@ func TestBrakeBoundary(t *testing.T) {
 		for _, d := range ds[:reap] {
 			p.blobs[d] = true
 		}
-		err := c.brake(name(t, "app"), p, idx, cont)
+		_, err := c.brake(name(t, "app"), p, idx, cont)
 		if got := errors.Is(err, ErrMassDelete); got != stop {
 			t.Errorf("%d of 6: stopped %v (%v), want %v", reap, got, err, stop)
 		}

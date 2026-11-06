@@ -67,7 +67,13 @@ limitations under the License.
 // newer than its index, but any later write to the rows (another tag pushed
 // or deleted in the repository) advances index.json past them, and from then
 // on the brake does not tell them from what a removed image left. The grace
-// period, not the brake, is what guards a push's blobs. A repository with no rows whose index.json,
+// period, not the brake, is what guards a push's blobs. A plan that leaves no row
+// but names a blob not older than index.json, such as one a repository sharing its
+// inode touched after the delete, does not stop: it reaps the blobs older than
+// index.json and leaves that one out, unless that leaves it nothing to remove, as a
+// first push's does. Removing rows moves index.json, so the next sweep reaps what
+// was left out. With no rows to remove, it waits for the abandon horizon.
+// A repository with no rows whose index.json,
 // blobs and upload sessions have all gone unwritten for the abandon horizon
 // (AbandonFactor grace periods unless Options.Abandon says otherwise) is an
 // abandoned first push: the brake no longer applies to it, and its blobs are
