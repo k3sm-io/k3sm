@@ -288,6 +288,10 @@ type runtimedRuntime struct {
 	// track and carries no deletion stamp (admission.go, uidTombstones). Guarded by
 	// mu; usable at its zero value.
 	tombstones uidTombstones
+	// deleteInRPC counts, per pod id, the teardowns inside the runtime's DeletePod and
+	// not yet remembered in tornDown (createBehindDelete). Guarded by mu; created on
+	// first use.
+	deleteInRPC map[string]int
 	// tornDown remembers the UIDs of recent teardowns, for a create that arrives behind
 	// one (createIsStale). Unlike tombstones it leaves out a refused pod's delete, which
 	// tore nothing down. Guarded by mu; usable at its zero value.
@@ -322,6 +326,9 @@ type runtimedRuntime struct {
 	// is what the delete is keyed on anyway. It is also the dedupe: one loop per
 	// pod id, however many late creates land for it.
 	compensating map[string]bool // pod id -> the delete is outstanding (true), or landed with its release running (false)
+	// compensateAgain marks a pod id whose running compensating delete owes one more
+	// attempt, for a late create that joined it. Guarded by mu; created on first use.
+	compensateAgain map[string]bool
 
 	// lifetime is closed when the provider shuts down — the Watch context, which
 	// bounds every other provider-owned goroutine, ending. It bounds the ONE
@@ -2011,8 +2018,9 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 		return nil
 	}
 	// A UID this node has torn down is never created again, and a UID is never
-	// reused, so this create read a pod that is gone. Past this check, a delete behind
-	// the create is answered by its fence below and by createBehindDelete.
+	// reused, so this create read a pod that is gone. admitOnCreate reads it again
+	// where it counts the create; past that, a delete behind the create is answered by
+	// its fence below and by createBehindDelete.
 	if r.createIsStale(string(pod.UID)) {
 		r.log.Info("CreatePod: this node has already deleted the pod; not creating it",
 			"namespace", pod.Namespace, "name", pod.Name, "uid", string(pod.UID))
@@ -2292,10 +2300,17 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 //
 // A refusal owed is no delete: the create that landed keeps its guest, and the refusal
 // is withdrawn in the same decision.
+//
+// A delete inside its RPC is read by the UID as well as by the track, because the mark
+// can be on no track this create can see: the delete found none, or a refused create
+// took the marked one, whereupon GetPod answers NotFound and Virtual Kubelet's requeue
+// is another CreatePod. Its queue keeps its own delete of the pod out of a create
+// (TestPodControllerRunsOneCallPerPodKey, vkadapter), so what reaches this is the
+// orphan reaper's delete, off that queue. A same-name successor is another UID.
 func (r *runtimedRuntime) createBehindDelete(id string, t *podTrack) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if del := r.deleteOwed[id]; (del != nil && !del.refusal) || trackDeleting(t) {
+	if del := r.deleteOwed[id]; (del != nil && !del.refusal) || trackDeleting(t) || r.deleteInRPC[id] != 0 {
 		return true
 	}
 	if live := r.track[id]; live != nil && trackDeleting(live) {
@@ -2952,9 +2967,15 @@ func (r *runtimedRuntime) teardownPod(ctx context.Context, pod *corev1.Pod, grac
 	intent := r.recordStopIntent(pod, "")
 	t := r.trackByID(id)
 	t.beginRuntimeStop()
+	r.mu.Lock()
+	r.beginDeleteRPCLocked(id)
+	r.mu.Unlock()
 	_, err := r.rt.DeletePod(ctx, &runtimev1.DeletePodRequest{PodId: id, GracePeriodSeconds: grace})
 	t.endRuntimeStop(err)
 	if err != nil {
+		r.mu.Lock()
+		r.endDeleteRPCLocked(id)
+		r.mu.Unlock()
 		// Only a definitive refusal proves the stop did not happen.
 		if stopNotIssued(err) {
 			r.history.dropIntent(intent)
@@ -2965,6 +2986,9 @@ func (r *runtimedRuntime) teardownPod(ctx context.Context, pod *corev1.Pod, grac
 	// loops outside the lock, so no probe goroutine outlives the pod).
 	r.stopProber(id)
 	r.mu.Lock()
+	// In one section with the tombstone: a create landing from here on is either
+	// counted, so the delete is owed and it reads that, or stale.
+	r.endDeleteRPCLocked(id)
 	r.tombstones.add(id)
 	r.tornDown.add(id)
 	if r.inFlightLocked(id) {
@@ -2998,6 +3022,24 @@ func (r *runtimedRuntime) teardownPod(ctx context.Context, pod *corev1.Pod, grac
 	// NotFound-tolerant (VK may have force-deleted it first; either order is fine).
 	r.forceDeleteFromAPI(ctx, pod)
 	return nil
+}
+
+// beginDeleteRPCLocked counts a teardown of pod id entering the runtime's DeletePod.
+// The caller holds r.mu.
+func (r *runtimedRuntime) beginDeleteRPCLocked(id string) {
+	if r.deleteInRPC == nil {
+		r.deleteInRPC = map[string]int{}
+	}
+	r.deleteInRPC[id]++
+}
+
+// endDeleteRPCLocked ends that count. The caller holds r.mu.
+func (r *runtimedRuntime) endDeleteRPCLocked(id string) {
+	if r.deleteInRPC[id] <= 1 {
+		delete(r.deleteInRPC, id)
+		return
+	}
+	r.deleteInRPC[id]--
 }
 
 // forgetTorndown is the end of a teardown: the track goes (owned selects which, as

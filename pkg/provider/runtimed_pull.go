@@ -1307,7 +1307,11 @@ func (r *runtimedRuntime) commitParkedCreate(t *podTrack, podID string) commitRe
 // nothing re-arms it. The retry runs on the shared crashLoopBackoff primitive
 // (never a second schedule) against the provider clock, and is recorded in
 // r.compensating so a second late create for the same id joins the loop already
-// running instead of starting a rival one.
+// running instead of starting a rival one. Joining asks that loop for one more delete
+// (r.compensateAgain): runtimed forgets the pod first thing in its DeletePod, so the
+// attempt under way can already be past a guest this create has just registered. Two
+// creates can be out together because an image edit of a parked pod retires its retry's
+// schedule while that retry's RPC runs on (retryPullsForChangedImages).
 //
 // It roots its own delete calls at context.Background: the worker's context was
 // cancelled by the very delete being compensated for, and a cancelled context
@@ -1322,7 +1326,12 @@ func (r *runtimedRuntime) compensateLateCreate(pod *corev1.Pod) {
 	podID := string(pod.UID)
 	r.mu.Lock()
 	_, already := r.compensating[podID]
-	if !already {
+	if already {
+		if r.compensateAgain == nil {
+			r.compensateAgain = map[string]bool{}
+		}
+		r.compensateAgain[podID] = true
+	} else {
 		if r.compensating == nil {
 			r.compensating = map[string]bool{}
 		}
@@ -1342,24 +1351,21 @@ func (r *runtimedRuntime) compensateLateCreate(pod *corev1.Pod) {
 // down, and clears the pod's entry in r.compensating either way.
 //
 // Once the delete lands, it is the last call out if nothing else is, so it runs the
-// release a delete owes; an entry at false is no longer in flight but still joins a
-// second late create. A shutdown releases nothing, as the guest was never confirmed
-// gone: the next daemon start decides it.
+// release a delete owes; the entry stays at false while that runs. A shutdown releases
+// nothing, as the guest was never confirmed gone: the next daemon start decides it.
 func (r *runtimedRuntime) runCompensatingDelete(pod *corev1.Pod, podID string) {
-	landed := false
+	var claim *fenceClaim
+	retired := false
 	defer func() {
-		var claim *fenceClaim
-		r.mu.Lock()
-		if landed {
-			r.compensating[podID] = false
-			claim = r.claimFenceReleaseLocked(podID)
-		}
-		r.mu.Unlock()
 		if claim != nil {
 			r.fenceRelease(pod, claim)
 		}
+		if retired {
+			return
+		}
 		r.mu.Lock()
 		delete(r.compensating, podID)
+		delete(r.compensateAgain, podID)
 		r.mu.Unlock()
 	}()
 	// The pod's own grace, floored, as an ordinary delete resolves it. Wire 0
@@ -1372,7 +1378,11 @@ func (r *runtimedRuntime) runCompensatingDelete(pod *corev1.Pod, podID string) {
 		_, err := r.rt.DeletePod(context.Background(),
 			&runtimev1.DeletePodRequest{PodId: podID, GracePeriodSeconds: grace})
 		if err == nil {
-			landed = true
+			var again bool
+			again, claim, retired = r.compensatingDeleteLanded(podID)
+			if again {
+				continue
+			}
 			return
 		}
 		r.log.Warn("could not delete the pod a late create left behind; retrying under the back-off",
@@ -1386,6 +1396,29 @@ func (r *runtimedRuntime) runCompensatingDelete(pod *corev1.Pod, podID string) {
 		case <-r.clk.After(backoff.Next()):
 		}
 	}
+}
+
+// compensatingDeleteLanded decides, in one r.mu section with the late creates that
+// join, what a landed compensating delete of pod id does next: again if a create joined
+// behind this attempt, else the release if it is the last call out, else nothing. With
+// no release to run the entry goes here (retired), and a late create still out opens a
+// delete of its own. With one, the entry stays at false until the release is over, and
+// no late create can reach it: the claim needs every create and retry returned, a new
+// create reads the entry as stale, and a new retry reads the track's delete.
+func (r *runtimedRuntime) compensatingDeleteLanded(id string) (again bool, claim *fenceClaim, retired bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.compensateAgain[id] {
+		delete(r.compensateAgain, id)
+		return true, nil, false
+	}
+	r.compensating[id] = false
+	claim = r.claimFenceReleaseLocked(id)
+	if claim == nil {
+		delete(r.compensating, id)
+		return false, nil, true
+	}
+	return false, claim, false
 }
 
 // retryPullsForChangedImages is the UpdatePod half of the cadence rules: a
