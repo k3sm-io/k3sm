@@ -191,9 +191,10 @@ func stopHoldingDeletes(f *fakeRuntimeServer) {
 // testCreateInsideReaperDelete is the order the off-queue reaper can reach: a create
 // running from a stale informer is refused while the reaper's delete is inside its
 // RPC, which takes the track, so GetPod answers NotFound and Virtual Kubelet's requeue
-// is a CreatePod. That one lands in the same RPC. The next ticks take the bare track.
-// Fails when a landing create reads only the track for a delete that has begun: the
-// guest stands with its /32 released behind it.
+// is a CreatePod. That one lands in the same RPC. Fails when a landing create reads only
+// the track for a delete that has begun: the guest stands with its /32 released behind
+// it. Fails when the track that create installed outlives the delete, as nothing is left
+// to remove but the reaper's next three ticks.
 func testCreateInsideReaperDelete(t *testing.T) {
 	ctx := context.Background()
 	x := newTerminalUpdateFixture(t, compressorAt(10))
@@ -237,9 +238,6 @@ func testCreateInsideReaperDelete(t *testing.T) {
 	waitRestart(t, "the compensating delete to retire", func() bool { return compensatingCount(x.r) == 0 })
 	if x.f.hasCreated(id) {
 		t.Error("the guest the requeued create built outlived the delete")
-	}
-	if late := x.r.trackByID(id); late != nil {
-		x.r.reapOrphan(ctx, x.pod.DeepCopy(), late)
 	}
 	x.assertForgotten(t)
 }
