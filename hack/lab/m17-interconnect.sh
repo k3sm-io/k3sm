@@ -90,7 +90,10 @@
 # Evidence: the run log is hack/lab/runs/m17-lab-<rc-tag>-<UTCdate>.log (gitignored;
 # hack/lab/runs/README.md) and EVIDENCE_DIR/run.log, with the M11 run-log header
 # (gate, artifact_sha256, git_sha.<repo>, result) emitted by hack/lab/lib/runlog.sh;
-# per-rung transcripts, counters and figures sit under EVIDENCE_DIR/<rung>/;
+# per-rung transcripts, counters and figures sit under EVIDENCE_DIR/<rung>/; a rung
+# that does not pass adds the test namespace's Events, pods and MLXModels as ns-*,
+# and a run that does not pass adds them to every rung directory as ns-at-exit-*,
+# read before the exit trap deletes the namespace;
 # EVIDENCE_DIR/rungs.tsv is the per-rung verdict --verify-twice reads.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -1714,6 +1717,31 @@ EOF
 	fi
 }
 
+# capture_ns_evidence <dir> <prefix> — what the namespace knows now. Events expire
+# and the namespace goes at exit, so this is the one chance to read them; a
+# failed read lands in the file and never changes a verdict.
+capture_ns_evidence() {
+	kc get events -n "$NS" --sort-by=.lastTimestamp -o wide >"$1/$2-events.txt" 2>&1
+	kc get events -n "$NS" -o json >"$1/$2-events.json" 2>&1
+	kc get pods -n "$NS" -o wide >"$1/$2-pods.txt" 2>&1
+	kc get mlxmodels -n "$NS" -o json >"$1/$2-mlxmodels.json" 2>&1
+	return 0
+}
+# capture_exit_evidence — one reading of the namespace, into every rung directory.
+capture_exit_evidence() {
+	local d f first=""
+	for d in "$EVIDENCE_DIR"/r[0-9]-*/; do
+		[ -d "$d" ] || continue
+		if [ -z "$first" ]; then
+			first="$d"
+			capture_ns_evidence "$d" ns-at-exit
+			continue
+		fi
+		for f in "$first"ns-at-exit-*; do cp "$f" "$d" 2>/dev/null; done
+	done
+	return 0
+}
+
 # run_rungs — every rung in table order, one verdict line each in rungs.tsv. A
 # REFUSED rung is owed, not passed: the run goes on to the next rung, the exit is
 # never 0 (N_REFUSED), and --verify-twice wants exactly PASS.
@@ -1749,6 +1777,7 @@ run_rungs() {
 		[ "$id" = r1-arm ] && [ "$verdict" = PASS ] && HAVE="$HAVE armed"
 		case "$verdict" in PASS) N_PASS=$((N_PASS + 1)) ;; FAIL) N_FAIL=$((N_FAIL + 1)) ;; REFUSED) N_REFUSED=$((N_REFUSED + 1)) ;; esac
 		printf '%s\t%s\n' "$id" "$verdict" >>"$EVIDENCE_DIR/rungs.tsv"
+		[ "$verdict" = PASS ] || capture_ns_evidence "$RUNG_DIR" ns
 		echo "RUNG $id $verdict ($R_PASS passed, $R_FAIL failed)"
 	done <<<"$RUNG_TABLE"
 }
@@ -2169,6 +2198,43 @@ st_r5_run() {
 	rm -rf "$r5_dir"
 }
 
+# st_rungs_run <red rung id|-> — the real run_rungs over the real table with every
+# assertion stubbed to pass, one to fail; prints rungs.tsv and which ns files exist.
+st_rungs_run() {
+	local red="$1" id summary prereqs fn ev bi ev_dir
+	ev_dir="$(mktemp -d -t m17-rungs.XXXXXX)"
+	EVIDENCE_DIR="$ev_dir" NS=stub HAVE="$PREREQ_STATIC $PREREQ_RUNTIME" N_PASS=0 N_FAIL=0 N_REFUSED=0
+	: >"$ev_dir/rungs.tsv"
+	while IFS='|' read -r id summary prereqs fn ev bi; do
+		[ -n "$id" ] || continue
+		if [ "$id" = "$red" ]; then
+			eval "$fn() { fail stubbed; }"
+		else
+			eval "$fn() { pass stubbed; echo \"RAN $id\"; }"
+		fi
+	done <<<"$RUNG_TABLE"
+	kc() { echo "kc $*"; }
+	run_rungs
+	echo "TSV $(tr '\t\n' ':;' <"$ev_dir/rungs.tsv")"
+	(cd "$ev_dir" && find . -name 'ns-*' | sort | sed 's/^/NSFILE /')
+	rm -rf "$ev_dir"
+}
+# st_exit_evidence — every rung directory gets the exit reading, from one read.
+st_exit_evidence() {
+	local ev_dir
+	ev_dir="$(mktemp -d -t m17-exit.XXXXXX)"
+	mkdir -p "$ev_dir/r0-disarmed" "$ev_dir/r5-ring" "$ev_dir/baseline"
+	EVIDENCE_DIR="$ev_dir" NS=stub
+	kc() {
+		echo "kc $*" >>"$ev_dir/.calls"
+		echo "kc $*"
+	}
+	capture_exit_evidence
+	(cd "$ev_dir" && find . -name 'ns-at-exit-events.txt' | sort | tr '\n' ' ')
+	echo "READS $(grep -c 'get events.*wide' "$ev_dir/.calls")"
+	rm -rf "$ev_dir"
+}
+
 # st_r8_run <profile> — the real r8 assertion with the host and cluster stubbed: bridge0
 # reads armed until the pods are deleted, so the green profile passes only when the
 # hold is read before the delete and the empty halves after it. Each other profile
@@ -2466,6 +2532,12 @@ self_test_body() {
 	st_out "r5 saves the status of an InvalidSpec model" "SAVED mlxmodel-ic-ring.json" st_r5_run invalid
 	st_out "r5 still runs out its budget for a model that is only slow" "never became Ready within 2s" st_r5_run slow
 	st_out "r5 saves the status of a model that timed out" "SAVED mlxmodel-ic-ring.json" st_r5_run slow
+	st_out "a failing rung is recorded" "r3-cable-path:FAIL;" st_rungs_run r3-cable-path
+	st_out "a failing rung saves the namespace's Events" "NSFILE ./r3-cable-path/ns-events.txt" st_rungs_run r3-cable-path
+	st_out "a failing rung saves the MLXModels" "NSFILE ./r3-cable-path/ns-mlxmodels.json" st_rungs_run r3-cable-path
+	st_eq "only the failing rung saves them" "$(st_rungs_run r3-cable-path | grep -c 'ns-events.txt')" 1
+	st_eq "a passing ladder saves none" "$(st_rungs_run - | grep -c '^NSFILE')" 0
+	st_out "the exit reading reaches every rung directory" "./r0-disarmed/ns-at-exit-events.txt ./r5-ring/ns-at-exit-events.txt READS 1" st_exit_evidence
 	st_driver r3 cable 0
 	st_driver r3 cable-red 1
 	st_driver r3 cable-captured 1
@@ -2666,6 +2738,10 @@ on_exit() {
 	for p in $BG_PIDS; do kill "$p" 2>/dev/null; done
 	for p in $PING_PIDS; do sudo -n kill "$p" 2>/dev/null; done
 	[ -n "${RUNG_DIR:-}" ] && touch "$RUNG_DIR/poll.stop" 2>/dev/null
+	# Exit 0 only when every rung passed; an interrupted ladder is a FAIL.
+	if [ "$rc" = 0 ] && { [ "$N_FAIL" -gt 0 ] || [ "$N_REFUSED" -gt 0 ] || [ "$N_PASS" -lt 10 ]; }; then rc=1; fi
+	# Before anything below deletes the namespace; no rung ran before HAVE is set.
+	[ "$rc" = 0 ] || [ -z "$HAVE" ] || capture_exit_evidence
 	if [ -n "$FORGED_SIDE" ]; then
 		echo "cleanup: restoring node $(node_of "$FORGED_SIDE")'s desired annotation"
 		if [ -n "$FORGED_ORIG" ]; then
@@ -2683,8 +2759,6 @@ on_exit() {
 	[ -z "$R9_DOWNGRADED" ] || echo "cleanup: r9 did not finish; these Macs may be on the previous build, so reinstall the artifact under test: $R9_DOWNGRADED"
 	fixtures_remove
 	remote_dir_remove
-	# Exit 0 only when every rung passed; an interrupted ladder is a FAIL.
-	if [ "$rc" = 0 ] && { [ "$N_FAIL" -gt 0 ] || [ "$N_REFUSED" -gt 0 ] || [ "$N_PASS" -lt 10 ]; }; then rc=1; fi
 	case "$rc" in 0 | 1 | 2) ;; *) rc=1 ;; esac
 	echo "----------------------------------------"
 	echo "$ROW: $N_PASS rung(s) PASS, $N_FAIL FAIL, $N_REFUSED REFUSED (evidence: $EVIDENCE_DIR)"
