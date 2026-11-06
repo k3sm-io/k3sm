@@ -336,20 +336,27 @@ func renderPrune(out io.Writer, r pruneReport) {
 }
 
 // renderSweep renders the sweep after a forced prune: what it freed, and
-// each reason it freed less than it might have.
+// each reason it freed less than it might have. Every string is printed
+// through registrysvc.Printable, whichever path it came by, so neither the
+// registry's answer nor an error text can write terminal controls.
 func renderSweep(out io.Writer, s registrysvc.CollectResult) {
-	fmt.Fprintf(out, "  swept %s: freed %d blob(s), %s\n", strings.Join(s.Repositories, ", "), s.Blobs, humanBytes(uint64(max(s.Bytes, 0))))
+	p := registrysvc.Printable
+	repos := make([]string, len(s.Repositories))
+	for i, r := range s.Repositories {
+		repos[i] = p(r)
+	}
+	fmt.Fprintf(out, "  swept %s: freed %d blob(s), %s\n", strings.Join(repos, ", "), s.Blobs, humanBytes(uint64(max(s.Bytes, 0))))
 	for _, repo := range s.Stopped {
-		fmt.Fprintf(out, "  sweep stopped by the mass-delete brake, nothing freed: %s\n", repo)
+		fmt.Fprintf(out, "  sweep stopped by the mass-delete brake, nothing freed: %s\n", p(repo))
 	}
 	for _, repo := range s.Reviewing {
-		fmt.Fprintf(out, "  not yet reviewed by the registry's garbage collection, only reported on: %s\n", repo)
+		fmt.Fprintf(out, "  not yet reviewed by the registry's garbage collection, only reported on: %s\n", p(repo))
 	}
 	for _, repo := range s.Failed {
-		fmt.Fprintf(out, "  sweep failed, nothing freed: %s\n", repo)
+		fmt.Fprintf(out, "  sweep failed, nothing freed: %s\n", p(repo))
 	}
 	if s.Error != "" {
-		fmt.Fprintf(out, "  sweep: %s; the registry's scheduled garbage collection reclaims what this sweep did not\n", s.Error)
+		fmt.Fprintf(out, "  sweep: %s; the registry's scheduled garbage collection reclaims what this sweep did not\n", p(s.Error))
 	}
 }
 

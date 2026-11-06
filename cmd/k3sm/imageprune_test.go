@@ -454,6 +454,21 @@ func TestImagePruneForceSweepsThePrunedRepositories(t *testing.T) {
 		}
 
 		workDir, sock, reg = newPrune(t)
+		reg.sweep = registrysvc.CollectResult{Failed: []string{"multi\x1b[2J"}, Error: "bad\x1b]0;owned\x07 news\u202e"}
+		out, err = runPruneCmd(t, reg, []string{"--socket", sock, "--work-dir", workDir, "prune", "--force"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.ContainsAny(out, "\x1b\x07\u202e") {
+			t.Errorf("table carries control characters from the sweep's answer: %q", out)
+		}
+		for _, w := range []string{"sweep failed, nothing freed: multi[2J\n", "sweep: bad]0;owned news;"} {
+			if !strings.Contains(out, w) {
+				t.Errorf("table missing %q:\n%s", w, out)
+			}
+		}
+
+		workDir, sock, reg = newPrune(t)
 		reg.sweepErr = errors.New("connection refused")
 		out, err = runPruneCmd(t, reg, []string{"--socket", sock, "--work-dir", workDir, "prune", "--force", "-o", "json"})
 		if err != nil {
