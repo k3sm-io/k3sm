@@ -2442,7 +2442,7 @@ self_test_body() {
 	st_out "reinstall red: a refused install is the status" "status 7" st_reinstall local 0 7
 	st "K3SM_LAB=1 without a remote scratch exits 2" 0 gate_run 2 "K3SM_M17_REMOTE_SCRATCH is unset" K3SM_LAB=1 PEER_SSH=x EVIDENCE_DIR="$tmp/ev" --
 	st "K3SM_LAB=1 with a remote scratch in /tmp exits 2" 0 gate_run 2 "shared temporary directory" K3SM_LAB=1 PEER_SSH=x EVIDENCE_DIR="$tmp/ev" K3SM_M17_REMOTE_SCRATCH=/tmp/x --
-	st "remote scratch: a private absolute directory" 0 remote_scratch_problem /Users/miko/Code/k3sm-io.scratch
+	st "remote scratch: a private absolute directory" 0 remote_scratch_problem /Users/x/scratch
 	# shellcheck disable=SC2016 # the $(x) is a literal value under test
 	for r in "" rel/dir / /tmp /tmp/x /private/tmp/x /var/tmp/x /var/folders/ab/x /private/var/folders/ab/x "/Users/a b" '/Users/a;b' '/Users/$(x)' /Users/a/../b /Users/a/./b; do
 		st "remote scratch red: '$r'" 1 remote_scratch_problem "$r"
