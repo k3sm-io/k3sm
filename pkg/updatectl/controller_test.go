@@ -19,15 +19,19 @@ package updatectl
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apiextensionsfake "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/fake"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -39,6 +43,7 @@ import (
 	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/record"
 
+	crdconfig "k3sm.io/apis/config/crd"
 	updatesv1alpha1 "k3sm.io/apis/updates/v1alpha1"
 	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/update"
@@ -603,4 +608,88 @@ func TestUpdateSignerIsShortLived(t *testing.T) {
 	if certs.UpdateSignerValidity != 24*time.Hour {
 		t.Errorf("UpdateSignerValidity = %v, want a day", certs.UpdateSignerValidity)
 	}
+}
+
+// TestEnsureCRDs: the controller applies both CRDs, the Update first, and is not
+// done with one until the API server reports it established. A refusal comes back
+// for Run's retry and leaves the Update CRD applied.
+func TestEnsureCRDs(t *testing.T) {
+	crdClient := func(refuse string, unestablishedGets int) (*apiextensionsfake.Clientset, *[]string, *atomic.Int32) {
+		var applied []string
+		var gets atomic.Int32
+		cs := apiextensionsfake.NewSimpleClientset()
+		cs.PrependReactor("patch", "customresourcedefinitions", func(a k8stesting.Action) (bool, runtime.Object, error) {
+			name := a.(k8stesting.PatchAction).GetName()
+			if name == refuse {
+				return true, nil, errors.New("refused")
+			}
+			applied = append(applied, name)
+			return true, &apiextensionsv1.CustomResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: name}}, nil
+		})
+		cs.PrependReactor("get", "customresourcedefinitions", func(a k8stesting.Action) (bool, runtime.Object, error) {
+			crd := &apiextensionsv1.CustomResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: a.(k8stesting.GetAction).GetName()}}
+			if int(gets.Add(1)) > unestablishedGets {
+				crd.Status.Conditions = []apiextensionsv1.CustomResourceDefinitionCondition{{Type: apiextensionsv1.Established, Status: apiextensionsv1.ConditionTrue}}
+			}
+			return true, crd, nil
+		})
+		return cs, &applied, &gets
+	}
+	const updateCRDName = "updates.updates.k3sm.io"
+
+	t.Run("both are applied and established", func(t *testing.T) {
+		c := newRig(t).controller()
+		cs, applied, gets := crdClient("", 2)
+		c.cfg.CRD = cs
+		if err := c.ensureCRDs(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if want := []string{updateCRDName, crdconfig.UpdatePolicyCRDName}; !reflect.DeepEqual(*applied, want) {
+			t.Errorf("applied %v, want %v", *applied, want)
+		}
+		if got := gets.Load(); got != 4 {
+			t.Errorf("%d reads, want the two unestablished and one for each CRD", got)
+		}
+	})
+
+	t.Run("a refused UpdatePolicy CRD is an error", func(t *testing.T) {
+		c := newRig(t).controller()
+		cs, applied, _ := crdClient(crdconfig.UpdatePolicyCRDName, 0)
+		c.cfg.CRD = cs
+		err := c.ensureCRDs(context.Background())
+		if err == nil || !strings.Contains(err.Error(), crdconfig.UpdatePolicyCRDName) {
+			t.Fatalf("err = %v", err)
+		}
+		if want := []string{updateCRDName}; !reflect.DeepEqual(*applied, want) {
+			t.Errorf("applied %v, want %v", *applied, want)
+		}
+	})
+
+	t.Run("Run ensures them before it leads", func(t *testing.T) {
+		c := newRig(t).controller()
+		cs, applied, _ := crdClient("", 0)
+		c.cfg.CRD = cs
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := make(chan error, 1)
+		go func() { done <- c.Run(ctx) }()
+		deadline := time.After(10 * time.Second)
+		for {
+			if leases, err := c.cfg.Client.CoordinationV1().Leases(LeaseNamespace).List(ctx, metav1.ListOptions{}); err == nil && len(leases.Items) > 0 {
+				break
+			}
+			select {
+			case <-deadline:
+				t.Fatal("the controller never campaigned")
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+		cancel()
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		if want := []string{updateCRDName, crdconfig.UpdatePolicyCRDName}; !reflect.DeepEqual(*applied, want) {
+			t.Errorf("applied %v, want %v", *applied, want)
+		}
+	})
 }

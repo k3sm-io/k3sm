@@ -80,7 +80,8 @@ type Config struct {
 	// Dynamic reads and writes the Update objects (apis publishes the types,
 	// no generated clientset). Required.
 	Dynamic dynamic.Interface
-	// CRD applies and establishes the Update CRD before the controller starts.
+	// CRD applies and establishes the Update and UpdatePolicy CRDs before the
+	// controller starts.
 	// nil skips the ensure.
 	CRD crdensure.CRDClient
 	// Resolver resolves the target release. nil means HTTPResolver{}.
@@ -166,20 +167,33 @@ func New(cfg Config) (*Controller, error) {
 	return &Controller{cfg: cfg, log: log, kick: make(chan struct{}, 1)}, nil
 }
 
-// Run ensures the Update CRD (retrying until it takes), then campaigns for the
+// ensureCRDs applies the Update and UpdatePolicy CRDs and waits, within
+// crdensure's bound, for each to be established. The controller reads only Update;
+// it ensures UpdatePolicy because `k3sm update channel` writes one, and the server
+// creates no such object itself.
+func (c *Controller) ensureCRDs(ctx context.Context) error {
+	for _, manifest := range [][]byte{crdconfig.UpdateCRD(), crdconfig.UpdatePolicyCRD()} {
+		if _, err := crdensure.Ensure(ctx, c.cfg.CRD, manifest, crdensure.Options{Log: c.log}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Run ensures its CRDs (retrying until they take), then campaigns for the
 // Lease and reconciles while it leads, until ctx ends. Start it only once the
 // apiserver is healthy, and drain it before the control plane stops.
 func (c *Controller) Run(ctx context.Context) error {
 	if c.cfg.CRD != nil {
 		for {
-			_, err := crdensure.Ensure(ctx, c.cfg.CRD, crdconfig.UpdateCRD(), crdensure.Options{Log: c.log})
+			err := c.ensureCRDs(ctx)
 			if err == nil {
 				break
 			}
 			if ctx.Err() != nil {
 				return nil
 			}
-			c.log.Error("update controller: ensure the update crd; retrying", "err", err)
+			c.log.Error("update controller: ensure its crds; retrying", "err", err)
 			select {
 			case <-ctx.Done():
 				return nil
