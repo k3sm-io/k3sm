@@ -66,6 +66,10 @@ type ServerConfig struct {
 	// the etcd member routes have no second layer, and an empty name would let a
 	// member request under this server's own name remove the member serving it.
 	SelfNodeName string
+	// ReservedNodeNames are the DNS names on this server's apiserver certificate
+	// beyond the fixed set (--tls-san). A join for one, and a request listing one as
+	// a SAN, is refused like the fixed names (CheckReservedNodeName).
+	ReservedNodeNames []string
 	// Enroller performs the controller-mediated mesh enroll (MeshPeer write + peer
 	// snapshot).
 	Enroller Enroller
@@ -333,8 +337,13 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 	// (case, surrounding space, a trailing dot) never reaches this point: the
 	// canonical-form check at the top of the handler answers it with its own 400
 	// first. It sits before the rate limit so a malformed request spends no
-	// token budget.
-	if err := ValidateNodeName(req.NodeName); err != nil {
+	// token budget. A name reserved for the apiserver or the local host is refused
+	// here too, with the message the person joining reads.
+	err = ValidateNodeName(req.NodeName)
+	if err == nil {
+		err = CheckReservedNodeName(req.NodeName, s.cfg.ReservedNodeNames)
+	}
+	if err != nil {
 		s.cfg.Logger.Warn("join rejected", "reason", "node-name", "err", err, "remote", r.RemoteAddr)
 		http.Error(w, "join refused: "+err.Error(), http.StatusBadRequest)
 		return
@@ -424,7 +433,7 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "parse client CSR: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	if err := CheckNodeCSR(clientCSR, req.NodeName); err != nil {
+	if err := CheckNodeCSR(clientCSR, req.NodeName, s.cfg.ReservedNodeNames...); err != nil {
 		s.cfg.Logger.Warn("join rejected", "reason", "csr-denied", "node", req.NodeName, "err", err)
 		http.Error(w, "client CSR denied", http.StatusForbidden)
 		return
@@ -437,7 +446,7 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "parse serving CSR: "+err.Error(), http.StatusBadRequest)
 			return
 		}
-		if err := CheckNodeCSR(servingCSR, req.NodeName); err != nil {
+		if err := CheckServingCSR(servingCSR, req.NodeName, s.cfg.ReservedNodeNames...); err != nil {
 			s.cfg.Logger.Warn("join rejected", "reason", "serving-csr-denied", "node", req.NodeName, "err", err)
 			http.Error(w, "serving CSR denied", http.StatusForbidden)
 			return
@@ -511,7 +520,7 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	id := NodeIdentity{NodeName: req.NodeName, InternalIP: assignedIP.String()}
+	id := NodeIdentity{NodeName: req.NodeName, InternalIP: assignedIP.String(), Reserved: s.cfg.ReservedNodeNames}
 
 	// 5. The CSRs → a system:node client cert (signing CA) and an optional
 	// kubelet-serving cert (cluster CA → --kubelet-certificate-authority), both

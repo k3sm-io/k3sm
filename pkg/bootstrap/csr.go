@@ -26,9 +26,13 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
+	"slices"
+	"strings"
 	"time"
 
 	"k3sm.io/k3sm/pkg/certs"
+	"k3sm.io/k3sm/pkg/defaults"
 )
 
 // The canonical kubelet identity. The Node authorizer keys off exactly this
@@ -77,7 +81,8 @@ const (
 // WITHOUT the mesh address the enroll has not yet assigned: the self-signature
 // (the proof that the requester holds the private key), the public key, and the
 // half of the SAN policy that does not depend on the address — no DNS SAN naming
-// another identity, and no more IP SANs than the one a node may assert about
+// another identity or reserved for the apiserver (reserved adds a server's
+// configured names), and no more IP SANs than the one a node may assert about
 // itself.
 //
 // It exists to be called BEFORE the enroll. The enroll ALLOCATES this node's pod
@@ -86,8 +91,34 @@ const (
 // abort at a CSR it never intended to be signed. What this cannot judge — whether
 // an IP SAN is the address the allocator actually assigned — stays with the
 // approver (NodeIdentity.checkSANs), which is the only thing left on the far side.
-func CheckNodeCSR(csr *x509.CertificateRequest, nodeName string) error {
-	if csr == nil || nodeName == "" {
+func CheckNodeCSR(csr *x509.CertificateRequest, nodeName string, reserved ...string) error {
+	if csr == nil {
+		return ErrEmptyIdentity
+	}
+	return checkNodeCSR(csr, csr.DNSNames, nodeName, reserved)
+}
+
+// CheckServingCSR is CheckNodeCSR for a kubelet serving request. It differs in one
+// way: released k3sm agents list localhost in this request, so that one entry is
+// disregarded rather than refused. A request's SANs are never copied into the
+// certificate, which names only the node and its assigned address.
+func CheckServingCSR(csr *x509.CertificateRequest, nodeName string, reserved ...string) error {
+	if csr == nil {
+		return ErrEmptyIdentity
+	}
+	return checkNodeCSR(csr, withoutLocalhost(csr.DNSNames), nodeName, reserved)
+}
+
+// withoutLocalhost returns names with the localhost entry released agents send
+// taken out.
+func withoutLocalhost(names []string) []string {
+	return slices.DeleteFunc(slices.Clone(names), func(n string) bool { return n == "localhost" })
+}
+
+// checkNodeCSR is the shared body of CheckNodeCSR and CheckServingCSR, judging
+// dnsNames as the request's DNS SANs.
+func checkNodeCSR(csr *x509.CertificateRequest, dnsNames []string, nodeName string, reserved []string) error {
+	if nodeName == "" {
 		return ErrEmptyIdentity
 	}
 	// The KEY is judged before the SIGNATURE, deliberately. Verifying the
@@ -100,7 +131,7 @@ func CheckNodeCSR(csr *x509.CertificateRequest, nodeName string) error {
 	if err := csr.CheckSignature(); err != nil {
 		return fmt.Errorf("verify CSR self-signature: %w", err)
 	}
-	if err := checkDNSSANs(csr.DNSNames, nodeName); err != nil {
+	if err := checkDNSSANs(dnsNames, nodeName, reserved); err != nil {
 		return err
 	}
 	if len(csr.IPAddresses) > 1 {
@@ -139,14 +170,18 @@ func checkCSRKey(pub any) error {
 	}
 }
 
-// checkDNSSANs rejects any DNS SAN not bound to nodeName. The permitted set — the
-// bare node name, its system:node: form, and localhost — is fixed by the node's
-// NAME alone, which is what makes this half of the SAN policy decidable before the
-// enroll assigns an address (see CheckNodeCSR).
-func checkDNSSANs(names []string, nodeName string) error {
+// checkDNSSANs rejects any DNS SAN not bound to nodeName, and any reserved name
+// (isReservedName, with reserved as the configured names) whatever the node is
+// called. The permitted set — the bare node name and its system:node: form — is
+// fixed by the node's NAME alone, which is what makes this half of the SAN policy
+// decidable before the enroll assigns an address (see CheckNodeCSR).
+func checkDNSSANs(names []string, nodeName string, reserved []string) error {
 	for _, d := range names {
+		if isReservedName(strings.TrimPrefix(d, systemNodePrefix), reserved) {
+			return fmt.Errorf("%w: DNS SAN %q is reserved for the apiserver or the local host", ErrCrossNodeSAN, d)
+		}
 		switch d {
-		case nodeName, systemNodePrefix + nodeName, "localhost":
+		case nodeName, systemNodePrefix + nodeName:
 		default:
 			return fmt.Errorf("%w: DNS SAN %q is not node %q", ErrCrossNodeSAN, d, nodeName)
 		}
@@ -164,9 +199,22 @@ type NodeIdentity struct {
 	// InternalIP is the node's advertised InternalIP — the only IP SAN the approver
 	// permits in an issued certificate.
 	InternalIP string
+	// Reserved holds the configured DNS names no node may take (a server's
+	// --tls-san), beside the fixed set isReservedName always refuses.
+	Reserved []string
 }
 
-// validate checks the identity is fully specified and returns the parsed IP.
+// ErrReservedNodeAddress refuses an identity whose address is the kubernetes
+// Service IP, the address a worker verifies its apiserver against. The allocator
+// assigns from the cluster pod range and never yields it; this keeps that true at
+// the signer. Compare with errors.Is.
+var ErrReservedNodeAddress = errors.New("the address is the kubernetes Service IP, which no node may hold")
+
+// kubernetesServiceIP is the first address of defaults.ServiceCIDR.
+var kubernetesServiceIP = net.IP(netip.MustParsePrefix(defaults.ServiceCIDR).Masked().Addr().Next().AsSlice())
+
+// validate checks the identity is fully specified and neither reserved nor holding
+// a reserved address, and returns the parsed IP.
 func (id NodeIdentity) validate() (net.IP, error) {
 	if id.NodeName == "" || id.InternalIP == "" {
 		return nil, ErrEmptyIdentity
@@ -175,20 +223,26 @@ func (id NodeIdentity) validate() (net.IP, error) {
 	if ip == nil {
 		return nil, fmt.Errorf("%w: InternalIP %q is not an IP", ErrEmptyIdentity, id.InternalIP)
 	}
+	if err := CheckReservedNodeName(id.NodeName, id.Reserved); err != nil {
+		return nil, err
+	}
+	if ip.Equal(kubernetesServiceIP) {
+		return nil, fmt.Errorf("node %q: %w", id.NodeName, ErrReservedNodeAddress)
+	}
 	return ip, nil
 }
 
 // checkSANs rejects any SAN in the CSR not bound to id: an IP SAN other than the
-// node InternalIP, or a DNS SAN naming a node other than id.NodeName (system:node:
-// and the bare name + localhost are the only permitted DNS SANs). This is the
+// node InternalIP, or a DNS SAN in dnsNames naming a node other than id.NodeName
+// (system:node: and the bare name are the only permitted DNS SANs). This is the
 // cross-node-SAN guard the CSR auto-approver enforces.
-func (id NodeIdentity) checkSANs(csr *x509.CertificateRequest, ip net.IP) error {
+func (id NodeIdentity) checkSANs(csr *x509.CertificateRequest, dnsNames []string, ip net.IP) error {
 	for _, reqIP := range csr.IPAddresses {
 		if !reqIP.Equal(ip) {
 			return fmt.Errorf("%w: IP SAN %s is not node %q InternalIP %s", ErrCrossNodeSAN, reqIP, id.NodeName, id.InternalIP)
 		}
 	}
-	return checkDNSSANs(csr.DNSNames, id.NodeName)
+	return checkDNSSANs(dnsNames, id.NodeName, id.Reserved)
 }
 
 // ApproveAndSignNodeCSR validates csr against id (rejecting any cross-node SAN) and,
@@ -202,7 +256,7 @@ func ApproveAndSignNodeCSR(signingCA *certs.CA, csr *x509.CertificateRequest, id
 	if err != nil {
 		return nil, err
 	}
-	if err := id.checkSANs(csr, ip); err != nil {
+	if err := id.checkSANs(csr, csr.DNSNames, ip); err != nil {
 		return nil, err
 	}
 	subject := pkix.Name{
@@ -213,8 +267,8 @@ func ApproveAndSignNodeCSR(signingCA *certs.CA, csr *x509.CertificateRequest, id
 }
 
 // ApproveAndSignKubeletServing validates csr against id and signs it with the
-// CLUSTER CA as a SERVING certificate (CN=id.NodeName) carrying the node InternalIP +
-// name as SANs, so the apiserver — started --kubelet-certificate-authority=<cluster
+// CLUSTER CA as a SERVING certificate (CN=id.NodeName) carrying only the node
+// InternalIP + name as SANs, so the apiserver — started --kubelet-certificate-authority=<cluster
 // CA> — verifies the node's :10250 endpoint and remote exec/logs are not MITM-able.
 // The node keeps its own serving private key (the server signs only its CSR).
 func ApproveAndSignKubeletServing(clusterCA *certs.CA, csr *x509.CertificateRequest, id NodeIdentity, validFor time.Duration) ([]byte, error) {
@@ -222,12 +276,11 @@ func ApproveAndSignKubeletServing(clusterCA *certs.CA, csr *x509.CertificateRequ
 	if err != nil {
 		return nil, err
 	}
-	if err := id.checkSANs(csr, ip); err != nil {
+	if err := id.checkSANs(csr, withoutLocalhost(csr.DNSNames), ip); err != nil {
 		return nil, err
 	}
 	subject := pkix.Name{CommonName: id.NodeName}
-	dns := []string{id.NodeName, "localhost"}
-	return clusterCA.SignServingCSR(csr, subject, dns, []net.IP{ip}, validFor)
+	return clusterCA.SignServingCSR(csr, subject, []string{id.NodeName}, []net.IP{ip}, validFor)
 }
 
 // CheckNetserveCSR validates a netserve CSR as far as the request alone allows:

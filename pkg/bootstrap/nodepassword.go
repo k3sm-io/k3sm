@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 
@@ -67,7 +68,8 @@ const MaxNodePasswordLength = 72
 // subdomain (the Node object's own naming rule) and short enough that its
 // binding's Secret name is one too. The join handler checks it before the store
 // is touched, so a name the datastore would refuse is a 400 to the caller rather
-// than a datastore error.
+// than a datastore error. It also refuses the names CheckReservedNodeName reserves
+// whatever the configuration.
 func ValidateNodeName(name string) error {
 	if len(name) > MaxNodeNameLength {
 		return fmt.Errorf("node name is %d characters, longer than the %d a node-password binding allows", len(name), MaxNodeNameLength)
@@ -75,7 +77,37 @@ func ValidateNodeName(name string) error {
 	if errs := validation.IsDNS1123Subdomain(name); len(errs) > 0 {
 		return fmt.Errorf("node name %q is not a valid DNS-1123 subdomain: %s", name, strings.Join(errs, "; "))
 	}
+	return CheckReservedNodeName(name, nil)
+}
+
+// ErrReservedNodeName is wrapped by every refusal of a name reserved for the
+// apiserver or the local host. Compare with errors.Is.
+var ErrReservedNodeName = errors.New("reserved node name")
+
+// CheckReservedNodeName refuses a node name that a client could expect to identify
+// the apiserver or the local host: kubernetes, its kubernetes.default forms under
+// any cluster domain, localhost, and the configured DNS names (a server's --tls-san).
+func CheckReservedNodeName(name string, configured []string) error {
+	if isReservedName(name, configured) {
+		return fmt.Errorf("%w: %s belongs to the apiserver or the local host; set another with --node-name", ErrReservedNodeName, quoteNodeName(name))
+	}
 	return nil
+}
+
+// isReservedName is the one judgement of CheckReservedNodeName and the CSR SAN
+// policy. It compares the way a certificate name is matched, ignoring case and a
+// trailing dot.
+func isReservedName(name string, configured []string) bool {
+	n := normalizeReservedName(name)
+	if n == "kubernetes" || n == "localhost" || n == "kubernetes.default" || strings.HasPrefix(n, "kubernetes.default.") {
+		return true
+	}
+	return slices.ContainsFunc(configured, func(c string) bool { return normalizeReservedName(c) == n })
+}
+
+// normalizeReservedName lowercases name and drops any trailing dot.
+func normalizeReservedName(name string) string {
+	return strings.ToLower(strings.TrimRight(name, "."))
 }
 
 // GenerateNodePassword returns a fresh high-entropy node-password (32 random bytes,

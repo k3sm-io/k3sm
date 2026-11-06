@@ -167,6 +167,9 @@ func Join(ctx context.Context, opts JoinOptions) (*JoinResult, error) {
 	if opts.NodeName == "" {
 		return nil, fmt.Errorf("bootstrap join: NodeName is required")
 	}
+	if err := CheckReservedNodeName(opts.NodeName, nil); err != nil {
+		return nil, fmt.Errorf("bootstrap join: %w", err)
+	}
 	// The CSRs carry an IP SAN only when this node ASSERTS an address. With no
 	// assertion there is nothing truthful to put there — the address is the
 	// server's to assign — and none is needed: the approver ignores the CSR's
@@ -189,7 +192,7 @@ func Join(ctx context.Context, opts JoinOptions) (*JoinResult, error) {
 	}
 	servingKeyPEM, servingCSRPEM, err := generateCSR(
 		pkix.Name{CommonName: opts.NodeName},
-		[]string{opts.NodeName, "localhost"}, ips)
+		[]string{opts.NodeName}, ips)
 	if err != nil {
 		return nil, fmt.Errorf("generate serving CSR: %w", err)
 	}
