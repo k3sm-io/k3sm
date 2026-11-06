@@ -82,7 +82,9 @@
 #   K3SM_B1240_WORKER_SSH     ssh name of the worker, or `local`
 #   K3SM_B1240_SERVER_LAN     the server's LAN address, which the worker joins
 #   K3SM_B1240_SERVER_WORK    empty or absent absolute directory on the server (scratch)
-#   K3SM_B1240_WORKER_WORK    empty or absent absolute directory on the worker (scratch)
+#   K3SM_B1240_WORKER_WORK    empty or absent absolute directory on the worker (scratch);
+#                             the join token sits in its private/ during an install, so
+#                             neither work directory may be inside the evidence directory
 #   K3SM_B1240_SETS           directory for the built sets on this Mac; a set found
 #                             complete there is reused, so a re-run skips the builds
 # Optional:
@@ -622,12 +624,24 @@ elif argv[:1] == ["restart"]:
     if host == "srv" and brk == "server-restart-fails":
         sys.exit(1)
 elif argv[:1] == ["token"]:
+    if os.path.exists(os.path.join(os.environ["K3SM_B1240_WORKER_WORK"], "private", "join-token")):
+        open(os.path.join(st_dir, "token-left"), "w").close()
     print("fake-token")
 elif argv[:1] == ["install"]:
     ver = open(os.path.join(os.environ["FAKE_SET_DIR"], "fake-version")).read().strip()
     node = NODES[host]
     if "--agent" in argv and not ("--server" in argv and "--token-file" in argv):
         sys.exit("install --agent needs --server and --token-file")
+    if "--agent" in argv:
+        tf = argv[argv.index("--token-file") + 1]
+        if os.path.dirname(tf) != os.path.join(os.environ["K3SM_B1240_WORKER_WORK"], "private"):
+            sys.exit("the token file is outside the private directory: " + tf)
+        if os.stat(tf).st_mode & 0o777 != 0o600 or os.stat(os.path.dirname(tf)).st_mode & 0o777 != 0o700:
+            sys.exit("the token file is not 0600 in a 0700 directory")
+        if open(tf).read().strip() != "fake-token":
+            sys.exit("the token file does not hold the token")
+        if brk == "worker-install-fails" and ver != "main":
+            sys.exit("the install failed")
     for a in argv:
         if a.startswith("--update-release-base="):
             s["base"][node] = a.split("=", 1)[1]
@@ -946,6 +960,9 @@ self_test() {
 	out="$(run_fake "$tmp/occ" "" 47998 "$tmp/occ-ev")" && code=0 || code=$?
 	check "$([ "$code" = 2 ] && [ ! -e "$tmp/occ-ev" ] && echo ok)" "a work directory in use: refused, exit 2, nothing created (got $code)"
 
+	out="$(run_fake "$tmp/inev" "" 47998 "$tmp/inev")" && code=0 || code=$?
+	check "$([ "$code" = 2 ] && [ ! -e "$tmp/inev/calls.log" ] && echo ok)" "a work directory inside the evidence: refused, exit 2, no k3sm call (got $code)"
+
 	# The positive control: every leg, in one run.
 	out="$(run_fake "$tmp/green" "" 47900 "$tmp/green-ev")" && code=0 || code=$?
 	if [ "$code" != 0 ]; then printf '%s\n' "$out"; fi
@@ -962,6 +979,8 @@ self_test() {
 	if grep -q 'delete namespace '"$NS" "$tmp/green/calls.log"; then check ok "green run deletes its namespace"; else check no "green run deletes its namespace"; fi
 	if pgrep -f "$tmp/green/server/index.py" >/dev/null 2>&1; then check no "green run stops its index"; else check ok "green run stops its index"; fi
 
+	if grep -rqF --exclude=B1240.sh fake-token "$tmp/green-ev"; then check no "green run: the token is not in the evidence"; else check ok "green run: the token is not in the evidence"; fi
+	check "$([ ! -e "$tmp/green/token-left" ] && echo ok)" "green run: no token file outlives its install"
 	f="$tmp/green/calls.log"
 	v="$(grep -n 'kubectl delete updates\.' "$f" | cut -d: -f1 | tr '\n' ' ')"
 	u="$(grep -n 'update apply --yes' "$f" | head -1 | cut -d: -f1)"
@@ -980,7 +999,7 @@ self_test() {
 	for row in no-updates-row:c.1 forward-dead:f.1 cel-name:p.1 cel-value:p.2 stable-rc:s.1 \
 		roll-on-set:r.1 worker-row:r.2 server-first:a.1 stays-cordoned:a.2 no-resume:b.1 \
 		server-restart-fails:b.2 pod-fails:b.3 no-refuse:l.2 mid-channel:m.1 no-fallback:w.1 \
-		cancel-ignored:w.1 no-get:w.1 abort-keeps-cordon:w.2 past-failure:w.3 leftover:e.1 base-left:e.2 label-lost:e.3; do
+		worker-install-fails:c.1 cancel-ignored:w.1 no-get:w.1 abort-keeps-cordon:w.2 past-failure:w.3 leftover:e.1 base-left:e.2 label-lost:e.3; do
 		(
 			brk="${row%%:*}"
 			want="${row#*:}"
@@ -1007,6 +1026,8 @@ self_test() {
 		cat "$f"
 		if grep -q '^FAIL' "$f"; then bad=1; fi
 	done
+	check "$([ ! -e "$tmp/b-worker-install-fails/token-left" ] && echo ok)" "a failed install leaves no token file"
+	if grep -rqF --exclude=B1240.sh fake-token "$tmp/b-worker-install-fails-ev"; then check no "a failed install: the token is not in the evidence"; else check ok "a failed install: the token is not in the evidence"; fi
 	if grep -Eq 'kubectl delete (updates\.|updatepolic)' "$tmp/b-no-updates-row/calls.log"; then check no "a run stopped before any roll deletes no Update or UpdatePolicy"; else check ok "a run stopped before any roll deletes no Update or UpdatePolicy"; fi
 	rm -rf "$tmp"
 
@@ -1066,6 +1087,9 @@ for p in "$SERVER_WORK" "$WORKER_WORK" "$SETS"; do
 	/*) ;;
 	*) refuse "a work directory must be absolute (got '$p')" ;;
 	esac
+done
+for p in "$SERVER_WORK" "$WORKER_WORK"; do
+	case "$p/" in "$EVIDENCE"/*) refuse "a work directory must not be inside the evidence directory (got '$p')" ;; esac
 done
 for v in "$STEP_TIMEOUT" "$READY_TIMEOUT" "$THROTTLE"; do
 	case "$v" in '' | *[!0-9]*) refuse "a timeout must be a number of seconds (got '$v')" ;; esac
@@ -1310,6 +1334,12 @@ echo "removed_at=\$(date +%s)"
 if [ -e "\$DATA/updates" ]; then echo updates=present; else echo updates=absent; fi
 EOF
 }
+# token_path: the join token's one home, in a directory only the account can read, which
+# the put-back removes and which is never under the evidence (the preflight refuses that).
+token_path() { printf '%s' "$WORKER_WORK/private/join-token"; }
+# drop_token: the install's own script removes the file on every way out but a kill; this
+# covers that. The directory is the account's, so it can unlink root's file.
+drop_token() { rsh "$WORKER" /bin/rm -f "$(token_path)" </dev/null >/dev/null 2>&1 || true; }
 # install_server <set> <base> / install_worker <set> <base>: an in-place install keeps the
 # node's other arguments and, on the server, its datastore. A worker takes a fresh short
 # token first, so its root-owned cluster CA is pinned to what the token names.
@@ -1320,7 +1350,7 @@ exec $(quoted "$SERVER_WORK/$1/k3sm") install --start --update-release-base=$(qu
 EOF
 }
 install_worker() {
-	local token i=0
+	local token i=0 rc=0
 	while [ "$i" -lt 40 ]; do
 		rsh "$WORKER" nc -z -G 3 "$SERVER_LAN" 9345 </dev/null >/dev/null 2>&1 && break
 		sleep 3
@@ -1332,17 +1362,22 @@ install_worker() {
 	}
 	token="$(k token create --ttl 5m --work-dir "$DATA_ROOT/server" </dev/null 2>/dev/null)" || return 1
 	[ -n "$token" ] || return 1
-	root_run "$WORKER" "$WORKER_WORK" "install-worker-$1" "$INSTALL_TIMEOUT" 3< <(printf '%s\n' "$token") <<EOF
+	root_run "$WORKER" "$WORKER_WORK" "install-worker-$1" "$INSTALL_TIMEOUT" 3< <(printf '%s\n' "$token") <<EOF || rc=$?
 TU=$(quoted "${K3SM_B1240_USER:-$(rsh_raw "$WORKER" "id -un" </dev/null)}")
 IFS= read -r token
+tf=$(quoted "$(token_path)")
+trap 'rm -f "\$tf"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 umask 077
-tf="\$(mktemp /tmp/k3sm-join-token.XXXXXX)"
-printf '%s\n' "\$token" >"\$tf"
-$(quoted "$WORKER_WORK/$1/k3sm") install --agent --server $(quoted "$SERVER_LAN") --token-file "\$tf" --start --update-release-base=$(quoted "$2") --user "\$TU"
-rc=\$?
 rm -f "\$tf"
-exit \$rc
+printf '%s\n' "\$token" >"\$tf"
+chmod 600 "\$tf"
+$(quoted "$WORKER_WORK/$1/k3sm") install --agent --server $(quoted "$SERVER_LAN") --token-file "\$tf" --start --update-release-base=$(quoted "$2") --user "\$TU"
 EOF
+	drop_token
+	return "$rc"
 }
 # updates_dir <host>: owner, mode and birth of the updates directory.
 updates_dir() { rsh "$1" sudo /usr/bin/stat -f '%Su %Lp %B' "$DATA_ROOT/updates" </dev/null 2>/dev/null; }
@@ -2026,6 +2061,7 @@ leg_end() {
 on_exit() {
 	local rc=$?
 	trap - EXIT
+	drop_token
 	if [ "$PUT_BACK" = 0 ]; then
 		put_back
 		log "the run stopped early (exit $rc)"
@@ -2044,6 +2080,7 @@ kc get nodes,pods -A -o wide </dev/null >"$EVIDENCE/get-before.txt" 2>&1 || true
 cp "$SELF" "$EVIDENCE/B1240.sh"
 rsh "$SERVER" /bin/mkdir -p -m 700 "$SERVER_WORK" </dev/null
 rsh "$WORKER" /bin/mkdir -p -m 700 "$WORKER_WORK" </dev/null
+rsh "$WORKER" /bin/mkdir -p -m 700 "$WORKER_WORK/private" </dev/null
 rsh_raw "$SERVER" "mkdir -p $INDEX_DIR/held $INDEX_DIR/published $INDEX_DIR/withdrawn" </dev/null
 for t in $ALL_TAGS; do
 	rsh_raw "$SERVER" "mkdir -p $INDEX_DIR/held/$t" </dev/null
