@@ -95,6 +95,7 @@ TestServingRefreshSurvivesPanickingMint kept the relay and cluster publication d
 TestShutdownIsSafeBeforeStart kept the behaviour it pins is unchanged by the child switch
 TestSourceLimiter kept the relay and cluster publication do not touch the child
 TestSpawnRefusesAMovedExecutable added new with the child switch
+TestSpawnRefusesAnUnsafeLog added the spawn opens registry.log as the server does
 TestStartRefusesARootDaemon added new with the child switch
 TestStateUpdatesDoNotLoseWrites added new with the child switch
 TestStoreLeavesZotsDatabasesAlone added new with the child switch

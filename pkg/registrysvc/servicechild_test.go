@@ -25,8 +25,11 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // childTestService is a service whose executable is fixed.
@@ -92,6 +95,50 @@ func TestSpawnRefusesAMovedExecutable(t *testing.T) {
 		}
 		if _, err := s.spawn(); !errors.Is(err, boom) {
 			t.Fatalf("spawn = %v, want the resolve error", err)
+		}
+	})
+}
+
+// TestSpawnRefusesAnUnsafeLog: the spawn opens registry.log without following a
+// symlink and only as a regular file, as the server does, and starts no child when
+// it cannot. The file a symlink names is left as it was.
+func TestSpawnRefusesAnUnsafeLog(t *testing.T) {
+	t.Run("a symlink", func(t *testing.T) {
+		s := childTestService(t, "/usr/bin/true")
+		victim := filepath.Join(t.TempDir(), "victim")
+		if err := os.WriteFile(victim, []byte("keep"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Dir(LogPath(s.cfg.WorkDir)), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(victim, LogPath(s.cfg.WorkDir)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.spawn(); err == nil || !errors.Is(err, unix.ELOOP) {
+			t.Errorf("spawn = %v, want ELOOP", err)
+		}
+		if b, err := os.ReadFile(victim); err != nil || string(b) != "keep" {
+			t.Errorf("the symlink's target: %q, %v", b, err)
+		}
+	})
+	t.Run("a fifo", func(t *testing.T) {
+		s := childTestService(t, "/usr/bin/true")
+		log := LogPath(s.cfg.WorkDir)
+		if err := os.MkdirAll(filepath.Dir(log), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := unix.Mkfifo(log, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		// A reader, so the spawn's open for writing returns.
+		reader, err := os.OpenFile(log, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer reader.Close()
+		if _, err := s.spawn(); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+			t.Errorf("spawn = %v, want a refusal of the fifo", err)
 		}
 	})
 }

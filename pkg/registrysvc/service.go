@@ -399,7 +399,7 @@ func (s *Service) spawn() (chan struct{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	lf, err := os.OpenFile(LogPath(s.cfg.WorkDir), os.O_CREATE|os.O_WRONLY|os.O_TRUNC|os.O_APPEND, 0o600)
+	lf, err := openRegistryLog(s.cfg.WorkDir, os.O_TRUNC)
 	if err != nil {
 		return nil, fmt.Errorf("create the registry log: %w", err)
 	}

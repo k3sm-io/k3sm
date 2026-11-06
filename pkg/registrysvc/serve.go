@@ -464,9 +464,21 @@ func checkDataVolume(volume, storeRoot string) error {
 // openServeLog opens registry.log for appending, 0600. It appends because the
 // daemon's redirect of the child's stdio shares the file.
 func openServeLog(workDir string) (*os.File, error) {
-	f, err := os.OpenFile(LogPath(workDir), os.O_WRONLY|os.O_APPEND|os.O_CREATE|syscall.O_NOFOLLOW, 0o600)
+	f, err := openRegistryLog(workDir, 0)
 	if err != nil {
 		return nil, fmt.Errorf("open the registry log: %w", err)
+	}
+	return f, nil
+}
+
+// openRegistryLog opens registry.log for appending, 0600, with extra flags. It
+// follows no symlink and accepts only a regular file, so neither the daemon nor
+// the server writes through something planted at the name. O_TRUNC touches only
+// what O_NOFOLLOW opened, and a non-file ignores it.
+func openRegistryLog(workDir string, extra int) (*os.File, error) {
+	f, err := os.OpenFile(LogPath(workDir), os.O_WRONLY|os.O_APPEND|os.O_CREATE|syscall.O_NOFOLLOW|extra, 0o600)
+	if err != nil {
+		return nil, err
 	}
 	fi, err := f.Stat()
 	if err == nil && !fi.Mode().IsRegular() {
@@ -474,7 +486,7 @@ func openServeLog(workDir string) (*os.File, error) {
 	}
 	if err != nil {
 		_ = f.Close()
-		return nil, fmt.Errorf("open the registry log: %w", err)
+		return nil, err
 	}
 	return f, nil
 }
