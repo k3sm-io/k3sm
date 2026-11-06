@@ -22,7 +22,10 @@ limitations under the License.
 // in the directory its name maps to (pkg/ociregistry/ref), nested by name
 // component: oci-layout, index.json, blobs/<algorithm>/<hex> for every blob and
 // every manifest body, and .uploads/<uuid> for upload sessions, each a plain
-// file whose length is its offset. Tags are org.opencontainers.image.ref.name
+// file whose length is its offset. A blob replacement's temp link is
+// .temps/.tmp-<uuid>, which is there only until its rename or, after a crash,
+// until GC reaps it: zot ignores that directory, and fails GC of a repository with
+// such a name among its blobs, so a rollback finds nothing it cannot collect. Tags are org.opencontainers.image.ref.name
 // annotations on index.json rows, one row per (digest, tag); a manifest pushed
 // by digest, an index's child among them, is an untagged row, and so is a
 // manifest whose last tag was deleted or moved. Files are 0600 and directories
@@ -35,7 +38,7 @@ limitations under the License.
 // (link-or-keep), because the inode is shared across repositories. "Keep"
 // is verified: an existing destination is kept only after its content hashes
 // to the blob's digest. One that does not is replaced by a link of the
-// verified source under a temp name in the same directory and a rename over
+// verified source under a temp name in .temps and a rename over
 // it, so the bad inode is left unchanged for whoever else links it. A link is
 // made by path only after re-checking that the path still names the inode
 // that was hashed, and every upload session operation re-checks, after taking

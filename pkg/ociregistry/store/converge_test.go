@@ -538,49 +538,72 @@ func TestConvergeKeeperFullSpendsNoBudget(t *testing.T) {
 }
 
 // TestConvergeCrashAtTheTemp starts from what a crash between the link and the
-// rename leaves. The temp's link refuses the keeper, the copy stays, and GC's own
-// removal of the temp lets a later pass finish.
+// rename leaves, in .temps and in the blob directory earlier builds linked in. The
+// temp's link refuses the keeper, the copy stays, and GC's own removal of the temp
+// lets a later pass finish.
 func TestConvergeCrashAtTheTemp(t *testing.T) {
-	f := newConvergeFixture(t)
-	body := blobBytes(8, 4096)
-	d := f.push("a", body)
-	f.push("b", body)
-	f.age("a", d, time.Hour)
-	f.age("b", d, 2*time.Hour)
-	id, err := newID()
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmp := filepath.Join(filepath.Dir(f.path("b", d)), tempPrefix+id)
-	if err := os.Link(f.path("a", d), tmp); err != nil {
-		t.Fatal(err)
-	}
-	copyOfB := f.stat("b", d)
+	for _, tc := range []struct {
+		name string
+		dir  func(f *convergeFixture, d digest.Digest) string
+		alg  string
+	}{
+		{"in temps", func(f *convergeFixture, d digest.Digest) string {
+			dir := filepath.Join(filepath.Dir(filepath.Dir(filepath.Dir(f.path("b", d)))), tempsDir)
+			if err := os.Mkdir(dir, dirMode); err != nil {
+				f.t.Fatal(err)
+			}
+			return dir
+		}, ""},
+		{"beside the blob", func(f *convergeFixture, d digest.Digest) string {
+			return filepath.Dir(f.path("b", d))
+		}, "sha256"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newConvergeFixture(t)
+			body := blobBytes(8, 4096)
+			d := f.push("a", body)
+			f.push("b", body)
+			f.age("a", d, time.Hour)
+			f.age("b", d, 2*time.Hour)
+			id, err := newID()
+			if err != nil {
+				t.Fatal(err)
+			}
+			tmp := filepath.Join(tc.dir(f, d), tempPrefix+id)
+			if err := os.Link(f.path("a", d), tmp); err != nil {
+				t.Fatal(err)
+			}
+			copyOfB := f.stat("b", d)
 
-	rep := f.converge(nil)
-	if rep.Merged != 0 || !os.SameFile(f.stat("b", d), copyOfB) {
-		t.Fatalf("merged with a crashed temp on the keeper: %+v", rep)
-	}
-	wantSkip(t, rep, SkipKeeperRefused, 1)
-	if !bytes.Equal(f.readBlob("b", d), body) {
-		t.Error("b no longer reads its blob")
-	}
+			rep := f.converge(nil)
+			if rep.Merged != 0 || !os.SameFile(f.stat("b", d), copyOfB) {
+				t.Fatalf("merged with a crashed temp on the keeper: %+v", rep)
+			}
+			wantSkip(t, rep, SkipKeeperRefused, 1)
+			if !bytes.Equal(f.readBlob("b", d), body) {
+				t.Error("b no longer reads its blob")
+			}
 
-	err = f.s.WithLock(f.ctx, f.name("b"), func(l *Locked) error {
-		c, err := l.Contents()
-		if err != nil {
-			return err
-		}
-		if len(c.Temps) != 1 {
-			t.Fatalf("temps = %+v, want the crash's", c.Temps)
-		}
-		return l.RemoveTemp(c.Temps[0])
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rep := f.converge(nil); rep.Merged != 1 || !f.same("a", "b", d) {
-		t.Errorf("the pass after the temp was reaped did not merge: %+v", rep)
+			err = f.s.WithLock(f.ctx, f.name("b"), func(l *Locked) error {
+				c, err := l.Contents()
+				if err != nil {
+					return err
+				}
+				if len(c.Temps) != 1 || c.Temps[0].Algorithm != tc.alg {
+					t.Fatalf("temps = %+v, want the crash's", c.Temps)
+				}
+				return l.RemoveTemp(c.Temps[0])
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Lstat(tmp); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("the temp survived its removal: %v", err)
+			}
+			if rep := f.converge(nil); rep.Merged != 1 || !f.same("a", "b", d) {
+				t.Errorf("the pass after the temp was reaped did not merge: %+v", rep)
+			}
+		})
 	}
 }
 
@@ -1473,8 +1496,8 @@ func TestConvergeSyncFailures(t *testing.T) {
 				return fullSync(file)
 			}
 		})
-		if dirs != 2 || !f.same("a", "c", d) {
-			t.Errorf("synced %d directories, want one for each of two merges", dirs)
+		if dirs != 4 || !f.same("a", "c", d) {
+			t.Errorf("synced %d directories, want two for each of two merges", dirs)
 		}
 	})
 }

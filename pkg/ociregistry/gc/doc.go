@@ -25,8 +25,8 @@ limitations under the License.
 // two kinds of leftovers a crash makes: an upload session whose inode a commit
 // linked into blobs/ before it could remove the session (a second link, which
 // the store's session check refuses, so a cancel cannot), and a .tmp-<uuid>
-// link a blob replacement left before its rename. A temp link is never counted
-// as a blob.
+// link a blob replacement left before its rename, in .temps or, from an earlier
+// build, among the blobs. A temp link is never counted as a blob.
 //
 // Protection is on disk. Every mount, link and upload commit touches the
 // shared blob inode's mtime under the repository's lock, so age is the time
