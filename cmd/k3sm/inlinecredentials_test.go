@@ -105,7 +105,7 @@ func TestStartServiceInformerAcceptsOnlyInlineCredentials(t *testing.T) {
 	path := writeServiceKubeconfig(t)
 	ran := saveExecEntry(t, path)
 
-	_, err := startServiceInformer(context.Background(), path)
+	_, err := startServiceInformer(context.Background(), authorizerKube{kubeconfig: path})
 	if !errors.Is(err, kubeclient.ErrCredentialsNotInline) {
 		t.Fatalf("err = %v, want ErrCredentialsNotInline", err)
 	}
@@ -149,7 +149,7 @@ func TestStartVMPodInformersAcceptsOnlyInlineCredentials(t *testing.T) {
 	path := writeServiceKubeconfig(t)
 	ran := saveExecEntry(t, path)
 
-	_, _, err := startVMPodInformers(context.Background(), path)
+	_, _, err := startVMPodInformers(context.Background(), authorizerKube{kubeconfig: path})
 	if !errors.Is(err, kubeclient.ErrCredentialsNotInline) {
 		t.Fatalf("err = %v, want ErrCredentialsNotInline", err)
 	}
@@ -190,7 +190,7 @@ func TestAuthorizerKeepsRetryingARefusedKubeconfig(t *testing.T) {
 	returned := make(chan struct{})
 	go func() {
 		defer close(returned)
-		activateServiceAuthorizer(ctx, path, slog.New(h), func(corev1listers.ServiceLister) {
+		activateServiceAuthorizer(ctx, authorizerKube{kubeconfig: path}, slog.New(h), func(corev1listers.ServiceLister) {
 			installed <- struct{}{}
 		})
 	}()

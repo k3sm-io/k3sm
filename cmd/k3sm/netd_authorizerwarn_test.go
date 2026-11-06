@@ -89,10 +89,10 @@ func newAuthorizerFixture(t *testing.T) authorizerFixture {
 	if err := os.WriteFile(f.kubeconfig, []byte("apiVersion: v1\nusers: [{name: x, user: {token: "+authorizerFixtureToken+"}\nclusters: {{{\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, f.loadErr = startServiceInformer(context.Background(), f.kubeconfig); f.loadErr == nil {
+	if _, f.loadErr = startServiceInformer(context.Background(), authorizerKube{kubeconfig: f.kubeconfig}); f.loadErr == nil {
 		t.Fatal("startServiceInformer accepted an unparseable kubeconfig")
 	}
-	if _, f.missingErr = startServiceInformer(context.Background(), filepath.Join(dir, "absent.kubeconfig")); f.missingErr == nil {
+	if _, f.missingErr = startServiceInformer(context.Background(), authorizerKube{kubeconfig: filepath.Join(dir, "absent.kubeconfig")}); f.missingErr == nil {
 		t.Fatal("startServiceInformer accepted a missing kubeconfig")
 	}
 	f.unauthorized = fmt.Errorf("service cache did not sync within 10s: %w", apierrors.NewUnauthorized("Unauthorized"))

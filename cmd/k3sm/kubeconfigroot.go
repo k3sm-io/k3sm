@@ -186,6 +186,30 @@ func rootKubectlEnv(env []string, kubeconfig, home string) []string {
 	return append(out, "KUBECONFIG="+kubeconfig)
 }
 
+// errClusterAnchor marks a worker whose root-only cluster CA cannot be used.
+var errClusterAnchor = errors.New("this worker's root-only cluster CA cannot be used")
+
+// clusterAnchorRemedy says how a worker gets its root-only cluster CA back, the
+// same install in each case.
+var clusterAnchorRemedy = "run `sudo k3sm install --agent --server <server> --token-file <file>` to pin it from a join token, or leave out --token-file to take it from the node credential; first remove a copy with the wrong owner or mode: `sudo rm " + install.AgentClusterCAPath + "`"
+
+// readClusterAnchor reads a worker's root-only cluster CA with its owner and mode
+// from the open descriptor. A nil readFile means readOwnedFile. Every refusal
+// wraps errClusterAnchor.
+func readClusterAnchor(path string, readFile func(string) (sudoKubeconfigFile, error)) ([]byte, error) {
+	if readFile == nil {
+		readFile = readOwnedFile
+	}
+	f, err := readFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", errClusterAnchor, err)
+	}
+	if err := checkFileShape(path, f, map[uint32]string{0: "root"}); err != nil {
+		return nil, fmt.Errorf("%w: %w", errClusterAnchor, err)
+	}
+	return f.data, nil
+}
+
 // checkFileShape refuses anything but a regular file with no group or other
 // write bit, owned by one of owners. owners nil accepts any owner.
 func checkFileShape(path string, f sudoKubeconfigFile, owners map[uint32]string) error {

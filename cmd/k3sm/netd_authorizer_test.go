@@ -44,7 +44,7 @@ func TestBuildServiceSetDenyAllUntilReady(t *testing.T) {
 	defer cancel()
 
 	missing := filepath.Join(t.TempDir(), "does-not-exist.kubeconfig")
-	declares, lbDeclarers, synced, _ := buildServiceSet(ctx, missing, quietLogger())
+	declares, lbDeclarers, synced, _ := buildServiceSet(ctx, authorizerKube{kubeconfig: missing}, quietLogger())
 
 	// The predicates must be non-nil: a nil PortAuthorizer input can never later
 	// authorize, so the async swap-in only works if the closures exist up front.
@@ -80,7 +80,7 @@ func TestCanonicalLBServiceIsTheIngressService(t *testing.T) {
 // --kubeconfig configured → nil predicates (netd denies every <1024 bind, the
 // existing "no authoritative Service set" contract).
 func TestBuildServiceSetEmptyKubeconfigDenies(t *testing.T) {
-	declares, lbDeclarers, synced, _ := buildServiceSet(context.Background(), "", quietLogger())
+	declares, lbDeclarers, synced, _ := buildServiceSet(context.Background(), authorizerKube{}, quietLogger())
 	if declares != nil || lbDeclarers != nil || synced != nil {
 		t.Fatal("empty --kubeconfig must yield nil predicates (deny-all, no authoritative set)")
 	}
@@ -95,7 +95,7 @@ func TestStartServiceInformerRetryableOnMissingKubeconfig(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := startServiceInformer(ctx, filepath.Join(t.TempDir(), "absent.kubeconfig"))
+		_, err := startServiceInformer(ctx, authorizerKube{kubeconfig: filepath.Join(t.TempDir(), "absent.kubeconfig")})
 		done <- err
 	}()
 	select {

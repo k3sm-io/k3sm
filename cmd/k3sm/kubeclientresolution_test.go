@@ -143,7 +143,7 @@ func TestNewKubeClientResolution(t *testing.T) {
 	t.Run("netd absent kubeconfig fails its existence check", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_, err := startServiceInformer(ctx, filepath.Join(t.TempDir(), "absent.kubeconfig"))
+		_, err := startServiceInformer(ctx, authorizerKube{kubeconfig: filepath.Join(t.TempDir(), "absent.kubeconfig")})
 		if err == nil {
 			t.Fatal("expected an error for a missing kubeconfig")
 		}
@@ -156,7 +156,7 @@ func TestNewKubeClientResolution(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		kc := writeUnparseableKubeconfigAt(t, filepath.Join(t.TempDir(), "kubeconfig"))
-		_, err := startServiceInformer(ctx, kc)
+		_, err := startServiceInformer(ctx, authorizerKube{kubeconfig: kc})
 		if err == nil {
 			t.Fatal("expected an error for an unparseable kubeconfig")
 		}

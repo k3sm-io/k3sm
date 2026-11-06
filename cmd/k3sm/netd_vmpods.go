@@ -20,9 +20,7 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/pem"
-	"errors"
 	"fmt"
-	"io/fs"
 	"log/slog"
 	"net/netip"
 	"os"
@@ -44,7 +42,6 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/darwin-net/pkg/proxy"
 
-	"k3sm.io/k3sm/pkg/kubeclient"
 	"k3sm.io/k3sm/pkg/provider"
 )
 
@@ -137,40 +134,49 @@ func (s *vmPodSet) ports(addr netip.Addr) []uint16 {
 // the background, the way buildServiceSet does: netd serves before the server
 // writes its kubeconfig, so the set starts empty (deny) and fills once the
 // informers sync. With no kubeconfig the predicate is nil and the class denies.
-func buildVMPodSet(ctx context.Context, kubeconfig string, logger *slog.Logger) func(netip.Addr) []uint16 {
-	if kubeconfig == "" {
+func buildVMPodSet(ctx context.Context, kube authorizerKube, logger *slog.Logger) func(netip.Addr) []uint16 {
+	if kube.kubeconfig == "" {
 		return nil
 	}
 	set := &vmPodSet{}
-	go activateVMPodSet(ctx, kubeconfig, logger, set.install)
+	go activateVMPodSet(ctx, kube, logger, set.install)
 	return set.ports
 }
 
 // activateVMPodSet retries startVMPodInformers until it syncs or ctx ends. A
 // failure stays at Debug except a 403, which is an RBAC fact rather than the
-// boot race and is warned once per distinct error: until it clears, a vm pod's
-// privileged relay ports stay refused while every other netd verb works.
-func activateVMPodSet(ctx context.Context, kubeconfig string, logger *slog.Logger, install func(pods, eps cache.Indexer)) {
+// boot race, and a worker's unusable root-only cluster CA; each is warned once
+// per distinct error. Until it clears, a vm pod's privileged relay ports stay
+// refused while every other netd verb works.
+func activateVMPodSet(ctx context.Context, kube authorizerKube, logger *slog.Logger, install func(pods, eps cache.Indexer)) {
 	const retry = 2 * time.Second
 	lastWarned := ""
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		pods, eps, err := startVMPodInformers(ctx, kubeconfig)
+		pods, eps, err := startVMPodInformers(ctx, kube)
 		if err == nil {
 			install(pods, eps)
 			logger.Info("vm pod set ready: privileged (<1024) relay binds on published vm pod addresses now authorized against this node's pods",
-				"kubeconfig", kubeconfig)
+				"kubeconfig", kube.kubeconfig)
 			return
 		}
-		if apierrors.IsForbidden(err) && err.Error() != lastWarned {
+		switch {
+		case err.Error() == lastWarned:
+			logger.Debug("vm pod set not ready; privileged relay binds on vm pod addresses denied until it is",
+				"kubeconfig", kube.kubeconfig, "err", err)
+		case apierrors.IsForbidden(err):
 			lastWarned = err.Error()
 			logger.Warn("vm pod set cannot start: the apiserver refused netd's credential access to pods or EndpointSlices (403 Forbidden); privileged relay ports on vm pod addresses stay refused",
-				"kubeconfig", kubeconfig)
-		} else {
+				"kubeconfig", kube.kubeconfig)
+		case isClusterAnchorError(err):
+			lastWarned = err.Error()
+			logger.Warn("vm pod set cannot start: this worker's root-only cluster CA is missing or unusable; privileged relay ports on vm pod addresses stay refused",
+				"kubeconfig", kube.kubeconfig, "remedy", clusterAnchorRemedy)
+		default:
 			logger.Debug("vm pod set not ready; privileged relay binds on vm pod addresses denied until it is",
-				"kubeconfig", kubeconfig, "err", err)
+				"kubeconfig", kube.kubeconfig, "err", err)
 		}
 		select {
 		case <-ctx.Done():
@@ -180,15 +186,12 @@ func activateVMPodSet(ctx context.Context, kubeconfig string, logger *slog.Logge
 	}
 }
 
-// startVMPodInformers loads kubeconfig and hands off to runVMPodInformers, with
-// the pods scoped to the node the credential names, if it names one.
-func startVMPodInformers(ctx context.Context, kubeconfig string) (pods, eps cache.Indexer, err error) {
-	if _, err := os.Stat(kubeconfig); err != nil {
-		return nil, nil, fmt.Errorf("stat kubeconfig: %w", kubeconfigUnusableError{err: err, missing: errors.Is(err, fs.ErrNotExist)})
-	}
-	cfg, cs, err := kubeclient.FromCheckedPath(kubeconfig)
+// startVMPodInformers loads the kube source and hands off to runVMPodInformers,
+// with the pods scoped to the node the credential names, if it names one.
+func startVMPodInformers(ctx context.Context, kube authorizerKube) (pods, eps cache.Indexer, err error) {
+	cfg, cs, err := kube.load()
 	if err != nil {
-		return nil, nil, fmt.Errorf("load kubeconfig: %w", kubeconfigUnusableError{err: err})
+		return nil, nil, err
 	}
 	node, err := credentialNodeName(cfg)
 	if err != nil {
