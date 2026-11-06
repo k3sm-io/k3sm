@@ -1195,3 +1195,123 @@ func TestUpdateChannelVerb(t *testing.T) {
 		}
 	})
 }
+
+// TestUpdateChannelPairOnTheNode pins the channel and latest release a server
+// publishes as one pair through the real recorder and publisher, and that a
+// worker's check reads that pair instead of asking the release host.
+func TestUpdateChannelPairOnTheNode(t *testing.T) {
+	const (
+		stable = updatesv1alpha1.UpdateChannelStable
+		rc     = updatesv1alpha1.UpdateChannelRC
+	)
+
+	t.Run("a flip then a failed check keeps the old pair together", func(t *testing.T) {
+		now := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+		wd := installedWorkDir(t)
+		cs := fake.NewClientset(&corev1.Node{ObjectMeta: metav1.ObjectMeta{
+			Name:   "studio",
+			Labels: map[string]string{"node-role.kubernetes.io/control-plane": ""},
+		}})
+		var channel atomic.Value
+		channel.Store(rc)
+		polled := make(chan struct{}, 1)
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			updateRecorder{
+				workDir: wd,
+				check: func(context.Context) (update.Report, error) {
+					ch := channel.Load().(updatesv1alpha1.UpdateChannel)
+					if ch == stable {
+						return update.Report{CheckedAt: now, Channel: ch}, errors.New("dial tcp: refused")
+					}
+					return update.Report{CheckedAt: now, Channel: ch, Latest: update.Release{Tag: "v0.3.0-rc.2"}, Nodes: []update.Node{}}, nil
+				},
+				readChannel: func(context.Context) (channelReading, error) {
+					defer func() {
+						select {
+						case polled <- struct{}{}:
+						default:
+						}
+					}()
+					return channelReading{channel: channel.Load().(updatesv1alpha1.UpdateChannel)}, nil
+				},
+				interval:  time.Hour,
+				rollEvery: time.Millisecond,
+				now:       func() time.Time { return now },
+				logger:    slog.New(slog.DiscardHandler),
+				publish:   nodeAnnotationPublisher(cs, "studio"),
+			}.run(ctx)
+		}()
+		defer func() { cancel(); <-done }()
+
+		// The recorder polls for as long as it runs, so each look follows a poll.
+		deadline := time.NewTimer(10 * time.Second)
+		defer deadline.Stop()
+		waitFor := func(what string, ok func() bool) {
+			t.Helper()
+			for !ok() {
+				select {
+				case <-polled:
+				case <-deadline.C:
+					t.Fatalf("timed out waiting for %s", what)
+				}
+			}
+		}
+		node := func() *corev1.Node {
+			t.Helper()
+			n, err := cs.CoreV1().Nodes().Get(context.Background(), "studio", metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return n
+		}
+		waitFor("the pair", func() bool { return node().Annotations[status.NodeReleaseLatestAnnotation] != "" })
+		pair := node().Annotations
+		if pair[updatesv1alpha1.AnnotationReleaseChannel] != "rc" || pair[status.NodeReleaseLatestAnnotation] != "v0.3.0-rc.2" {
+			t.Fatalf("published %v", pair)
+		}
+
+		channel.Store(stable)
+		waitFor("the failed check", func() bool { return readUpdateRecord(wd).Error != "" })
+		// A recorder that split the pair does so on a later poll: see two more.
+		for range 2 {
+			select {
+			case <-polled:
+			case <-deadline.C:
+				t.Fatal("timed out waiting for a poll")
+			}
+		}
+
+		if rec := readUpdateRecord(wd); rec.Channel != stable || rec.Latest != "" {
+			t.Errorf("record = %+v", rec)
+		}
+		got := node()
+		if !sameAnnotations(got.Annotations, pair) {
+			t.Errorf("annotations moved to %v, want the old pair %v", got.Annotations, pair)
+		}
+		rec, server, ok := status.PublishedUpdateRecord([]corev1.Node{*got})
+		if !ok || server != "studio" || rec.Channel != rc || rec.Latest != "v0.3.0-rc.2" {
+			t.Errorf("PublishedUpdateRecord = %+v, %q, %v", rec, server, ok)
+		}
+	})
+
+	t.Run("the worker does not list on rc", func(t *testing.T) {
+		c := newUpdateCluster(publishingServer("studio", "v0.3.0-rc.2", "rc"))
+		x := &channelIndex{stable: "v0.2.3", listed: []string{"v9.9.9"}}
+		code, rep, _, _ := checkReport(t, c, x, func(env *updateEnv) { env.worker = true })
+		if code != 0 || rep.Channel != rc || rep.Latest.Tag != "v0.3.0-rc.2" {
+			t.Fatalf("exit %d, report %+v", code, rep)
+		}
+		if asked := x.lists.Load() + x.redirects.Load(); asked != 0 {
+			t.Errorf("a worker on rc asked the release host %d times; only a server lists", asked)
+		}
+		// The same check on stable does ask, so the count above can move.
+		s := newUpdateCluster(publishingServer("studio", "v0.2.3", "stable"))
+		y := &channelIndex{stable: "v0.2.3"}
+		if code, _, _, _ := checkReport(t, s, y, func(env *updateEnv) { env.worker = true }); code != 0 || y.redirects.Load() == 0 {
+			t.Errorf("a worker on stable: exit %d, %d redirects", code, y.redirects.Load())
+		}
+	})
+}

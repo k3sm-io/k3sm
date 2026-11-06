@@ -285,3 +285,12 @@ func sortedKeys(m map[string]string) []string {
 	sort.Strings(out)
 	return out
 }
+
+// TestNodeRestrictionForbidsTheLabelThePublishedPairTrusts pins the other half of
+// the release pair's trust: a node identity may not set the label that makes its
+// Node one whose pair a reader takes (status.PublishedUpdateRecord).
+func TestNodeRestrictionForbidsTheLabelThePublishedPairTrusts(t *testing.T) {
+	if !nodeRestrictionForbids("node-role.kubernetes.io/control-plane") {
+		t.Error("a node may set node-role.kubernetes.io/control-plane on itself, so a worker could pose as the server that publishes the channel")
+	}
+}
