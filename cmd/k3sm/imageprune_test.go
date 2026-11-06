@@ -432,8 +432,12 @@ func TestImagePruneForceSweepsThePrunedRepositories(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !strings.Contains(out, "  swept app, multi: freed 4 blob(s), "+humanBytes(3<<20)+"\n") {
-			t.Errorf("table does not report the sweep:\n%s", out)
+		// The summary line is the app's contract and stays as it was; the
+		// sweep is reported on the line after it.
+		want := "  deleted 3 untagged manifest(s); the registry's garbage collection reclaims their layers on its next sweep\n" +
+			"  swept app, multi: freed 4 blob(s), " + humanBytes(3<<20) + "\n"
+		if !strings.Contains(out, want) {
+			t.Errorf("table does not carry the summary and then the sweep:\n%s", out)
 		}
 	})
 

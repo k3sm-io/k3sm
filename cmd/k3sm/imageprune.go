@@ -293,15 +293,8 @@ func renderPrune(out io.Writer, r pruneReport) {
 		for _, m := range reg.Failed {
 			fmt.Fprintf(out, "  could not delete %s@%s: %s\n", m.Repository, m.Digest, m.Error)
 		}
-		switch {
-		case r.DryRun:
-			fmt.Fprintf(out, "  %s %d untagged manifest(s); --force deletes them and sweeps their repositories for the layers they held\n", verb, len(reg.Manifests))
-		default:
-			fmt.Fprintf(out, "  %s %d untagged manifest(s)\n", verb, len(reg.Manifests))
-		}
-		if reg.Sweep != nil {
-			renderSweep(out, *reg.Sweep)
-		}
+		fmt.Fprintf(out, "  %s %d untagged manifest(s); the registry's garbage collection reclaims their layers on its next sweep\n", verb, len(reg.Manifests))
+		renderSweep(out, reg.Sweep)
 		if len(reg.Kept) > 0 {
 			counts := map[string]int{}
 			for _, k := range reg.Kept {
@@ -335,11 +328,29 @@ func renderPrune(out io.Writer, r pruneReport) {
 	}
 }
 
-// renderSweep renders the sweep after a forced prune: what it freed, and
-// each reason it freed less than it might have. Every string is printed
+// renderCounts prints reason counts in a stable order.
+func renderCounts(out io.Writer, counts map[string]int, indent string) {
+	reasons := make([]string, 0, len(counts))
+	for r := range counts {
+		reasons = append(reasons, r)
+	}
+	sort.Strings(reasons)
+	for _, r := range reasons {
+		fmt.Fprintf(out, "%s%-28s %d\n", indent, r, counts[r])
+	}
+}
+
+// renderSweep renders the sweep after a forced prune, when there was one:
+// what it freed, and each reason it freed less than it might have. It prints
+// below renderPrune's summary line, whose "next sweep" still holds for a dry
+// run and for whatever this sweep leaves; that line's text is a contract with
+// the app, so this one adds lines rather than change it. Every string is printed
 // through registrysvc.Printable, whichever path it came by, so neither the
 // registry's answer nor an error text can write terminal controls.
-func renderSweep(out io.Writer, s registrysvc.CollectResult) {
+func renderSweep(out io.Writer, s *registrysvc.CollectResult) {
+	if s == nil {
+		return
+	}
 	p := registrysvc.Printable
 	repos := make([]string, len(s.Repositories))
 	for i, r := range s.Repositories {
@@ -357,17 +368,5 @@ func renderSweep(out io.Writer, s registrysvc.CollectResult) {
 	}
 	if s.Error != "" {
 		fmt.Fprintf(out, "  sweep: %s; the registry's scheduled garbage collection reclaims what this sweep did not\n", p(s.Error))
-	}
-}
-
-// renderCounts prints reason counts in a stable order.
-func renderCounts(out io.Writer, counts map[string]int, indent string) {
-	reasons := make([]string, 0, len(counts))
-	for r := range counts {
-		reasons = append(reasons, r)
-	}
-	sort.Strings(reasons)
-	for _, r := range reasons {
-		fmt.Fprintf(out, "%s%-28s %d\n", indent, r, counts[r])
 	}
 }
