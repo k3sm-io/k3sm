@@ -924,7 +924,9 @@ self_test() {
 	run_fake() { # <state-dir> <break> <port> <args...>
 		local state="$1" brk="$2" p="$3"
 		shift 3
-		mkdir -p "$state/data/updates" "$state/server" "$state/worker"
+		mkdir -p "$state/data/updates" "$state/server" "$state/worker" "$state/.kube"
+		printf 'seed\n' >"$state/.kube/config"
+		printf 'older\n' >"$state/.kube/config.b1240-19990101000000"
 		env -i "$t" HOME="$state" TMPDIR="$state" FAKE_STATE="$state" FAKE_BREAK="$brk" K3SM_LAB=1 \
 			K3SM_B1240_SERVER_SSH=srv K3SM_B1240_WORKER_SSH=wrk K3SM_B1240_SERVER_LAN=192.0.2.1 \
 			K3SM_B1240_SERVER_WORK="$state/server" K3SM_B1240_WORKER_WORK="$state/worker" \
@@ -981,6 +983,8 @@ self_test() {
 
 	if grep -rqF --exclude=B1240.sh fake-token "$tmp/green-ev"; then check no "green run: the token is not in the evidence"; else check ok "green run: the token is not in the evidence"; fi
 	check "$([ ! -e "$tmp/green/token-left" ] && echo ok)" "green run: no token file outlives its install"
+	check "$([ "$(find "$tmp/green/.kube" -name 'config.b1240-*' -exec basename {} \;)" = config.b1240-19990101000000 ] && echo ok)" "green run: its kubeconfig copies are gone, another's stays"
+	check "$(grep -q '^apiVersion' "$tmp/green/.kube/config" && echo ok)" "green run: the live kubeconfig stays, refreshed"
 	f="$tmp/green/calls.log"
 	v="$(grep -n 'kubectl delete updates\.' "$f" | cut -d: -f1 | tr '\n' ' ')"
 	u="$(grep -n 'update apply --yes' "$f" | head -1 | cut -d: -f1)"
@@ -1027,6 +1031,7 @@ self_test() {
 		if grep -q '^FAIL' "$f"; then bad=1; fi
 	done
 	check "$([ ! -e "$tmp/b-worker-install-fails/token-left" ] && echo ok)" "a failed install leaves no token file"
+	check "$([ "$(find "$tmp/b-base-left/.kube" -name 'config.b1240-*' | wc -l)" -gt 1 ] && echo ok)" "a restore that did not pass keeps its kubeconfig copies"
 	if grep -rqF --exclude=B1240.sh fake-token "$tmp/b-worker-install-fails-ev"; then check no "a failed install: the token is not in the evidence"; else check ok "a failed install: the token is not in the evidence"; fi
 	if grep -Eq 'kubectl delete (updates\.|updatepolic)' "$tmp/b-no-updates-row/calls.log"; then check no "a run stopped before any roll deletes no Update or UpdatePolicy"; else check ok "a run stopped before any roll deletes no Update or UpdatePolicy"; fi
 	rm -rf "$tmp"
@@ -1382,15 +1387,41 @@ EOF
 # updates_dir <host>: owner, mode and birth of the updates directory.
 updates_dir() { rsh "$1" sudo /usr/bin/stat -f '%Su %Lp %B' "$DATA_ROOT/updates" </dev/null 2>/dev/null; }
 # copy_kubeconfig: a server install rotates the admin token, and the worker's copy is the
-# laptop's own kubeconfig. A dated backup first, and never an empty overwrite.
+# laptop's own kubeconfig. A dated backup first, and never an empty overwrite. Each backup
+# is named for this run, so drop_kube_copies can tell them from anyone else's; KUBE_FRESH
+# says whether the last copy reached the worker.
+RUN_ID="$(date +%Y%m%d%H%M%S)-$$"
+KUBE_COPIES=0
+KUBE_FRESH=0
 copy_kubeconfig() {
 	local cfg
+	KUBE_FRESH=0
 	cfg="$(rsh "$SERVER" "$K3SM_BIN" kubectl config view --minify --flatten --raw --context "$CONTEXT" </dev/null 2>/dev/null)" || cfg=""
 	if [ -z "$cfg" ]; then
 		log "note: could not read the admin context $CONTEXT on the server; the worker's ~/.kube/config is stale"
 		return 0
 	fi
-	printf '%s\n' "$cfg" | bounded "$STEP_TIMEOUT" rsh_raw "$WORKER" "umask 077; mkdir -p ~/.kube; if [ -f ~/.kube/config ]; then cp ~/.kube/config ~/.kube/config.b1240-\$(date +%Y%m%d%H%M%S); fi; cat >~/.kube/config" || log "note: could not copy the admin kubeconfig to the worker"
+	KUBE_COPIES=$((KUBE_COPIES + 1))
+	if printf '%s\n' "$cfg" | bounded "$STEP_TIMEOUT" rsh_raw "$WORKER" "umask 077; mkdir -p ~/.kube; if [ -f ~/.kube/config ]; then cp ~/.kube/config ~/.kube/config.b1240-$RUN_ID-$KUBE_COPIES; fi; cat >~/.kube/config"; then
+		KUBE_FRESH=1
+	else
+		log "note: could not copy the admin kubeconfig to the worker"
+	fi
+}
+# drop_kube_copies: this run's backups, named one by one. The live config stays, and so
+# does any other copy, which is not this run's to remove.
+drop_kube_copies() {
+	local i=1 files=""
+	while [ "$i" -le "$KUBE_COPIES" ]; do
+		files="$files ~/.kube/config.b1240-$RUN_ID-$i"
+		i=$((i + 1))
+	done
+	[ -n "$files" ] || return 0
+	if bounded "$STEP_TIMEOUT" rsh_raw "$WORKER" "rm -f$files" </dev/null; then
+		log "removed this run's $KUBE_COPIES dated kubeconfig copies from the worker"
+	else
+		log "note: could not remove this run's dated kubeconfig copies (~/.kube/config.b1240-$RUN_ID-*)"
+	fi
 }
 # wait_ready: both nodes Ready and schedulable: `k3sm stop` cordons, and the start lifts it.
 wait_ready() {
@@ -2047,6 +2078,12 @@ leg_end() {
 	esac
 	if ! wait_ready; then base_left="$base_left (not Ready and schedulable)"; fi
 	if [ -z "$base_left" ]; then leg e.2 ok "both on $want, Ready, $GITHUB_BASE recorded"; else leg e.2 no "$base_left"; fi
+	# Only a restore that held makes the backups spare.
+	if [ -z "$base_left" ] && [ "$KUBE_FRESH" = 1 ]; then
+		drop_kube_copies
+	else
+		log "kept this run's dated kubeconfig copies on the worker (~/.kube/config.b1240-$RUN_ID-*): the restore did not pass"
+	fi
 
 	doc="$(nodes_doc 2>/dev/null)" || doc=""
 	after="$(printf '%s' "$doc" | J '"; ".join(i["metadata"]["name"]+": "+foreign(i) for i in sorted(d["items"], key=lambda i: i["metadata"]["name"]))' 2>/dev/null || echo unreadable)"
