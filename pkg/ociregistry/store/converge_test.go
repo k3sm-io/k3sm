@@ -1128,6 +1128,139 @@ func TestConvergeLimits(t *testing.T) {
 	})
 }
 
+// copies pushes body to each repository, newest first, and returns its digest.
+func (f *convergeFixture) copies(body []byte, repos ...string) digest.Digest {
+	f.t.Helper()
+	var d digest.Digest
+	for i, r := range repos {
+		d = f.push(r, body)
+		f.age(r, d, time.Duration(i+1)*time.Hour)
+	}
+	return d
+}
+
+// passesUntil runs passes over budget until done reports true and returns how many
+// it took, or fails at limit.
+func (f *convergeFixture) passesUntil(budget int64, rot *ConvergeRotation, limit int, done func() bool) int {
+	f.t.Helper()
+	for pass := 1; pass <= limit; pass++ {
+		f.converge(func(o *ConvergeOptions) {
+			o.limits.hashBytes = budget
+			o.Rotation = rot
+		})
+		if done() {
+			return pass
+		}
+	}
+	f.t.Fatalf("not done after %d passes", limit)
+	return 0
+}
+
+// TestConvergeRotation is one pusher's large blob in many copies: it may not set
+// the schedule of every pass until its last copy has merged.
+func TestConvergeRotation(t *testing.T) {
+	const budget = 10_000
+	repos := []string{"p/a", "p/b", "p/c", "p/d", "p/e", "p/f"}
+	for _, tc := range []struct {
+		name string
+		size int
+	}{
+		{"past the budget, on its exemption", 3 * budget},
+		{"within the budget, spending all of it", budget / 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newConvergeFixture(t)
+			big := f.copies(blobBytes(70, tc.size), repos...)
+			small := f.copies(blobBytes(71, 1024), "v/a", "v/b")
+			rot := &ConvergeRotation{}
+			pass := f.passesUntil(budget, rot, len(repos), func() bool { return f.same("v/a", "v/b", small) })
+			if pass != 2 {
+				t.Errorf("the smaller digest merged on pass %d, want 2 of %d copies' passes", pass, len(repos)-1)
+			}
+			// The large digest still gets there, one target or two each time it leads.
+			f.passesUntil(budget, rot, len(repos), func() bool {
+				for _, r := range repos[1:] {
+					if !f.same(repos[0], r, big) {
+						return false
+					}
+				}
+				return true
+			})
+		})
+	}
+	t.Run("two large digests take turns ahead of a small one", func(t *testing.T) {
+		f := newConvergeFixture(t)
+		f.copies(blobBytes(72, 3*budget), repos...)
+		f.copies(blobBytes(73, 2*budget), repos...)
+		small := f.copies(blobBytes(74, 1024), "v/a", "v/b")
+		pass := f.passesUntil(budget, &ConvergeRotation{}, 3, func() bool { return f.same("v/a", "v/b", small) })
+		if pass != 3 {
+			t.Errorf("the smaller digest merged on pass %d, want 3", pass)
+		}
+	})
+	t.Run("a large digest not hashed keeps its place", func(t *testing.T) {
+		f := newConvergeFixture(t)
+		big := f.copies(blobBytes(75, 3*budget), repos[:3]...)
+		small := f.copies(blobBytes(76, 1024), repos[3:]...)
+		rot := &ConvergeRotation{}
+		reports := make([]ConvergeReport, 3)
+		for i := range reports {
+			reports[i] = f.converge(func(o *ConvergeOptions) {
+				o.limits.hashBytes = budget
+				o.Rotation = rot
+			})
+		}
+		// Led, then waits while the small one leads, then leads again.
+		if reports[0].HashedBytes != 6*budget || reports[0].Merged != 1 {
+			t.Errorf("pass 1: %+v", reports[0])
+		}
+		if reports[1].HashedBytes != 2*1024+1024 || reports[1].Merged != 2 || !f.same(repos[3], repos[5], small) {
+			t.Errorf("pass 2: %+v", reports[1])
+		}
+		wantSkip(t, reports[1], SkipHashBudget, 1)
+		if reports[2].Merged != 1 || !f.same(repos[0], repos[2], big) {
+			t.Errorf("pass 3: %+v", reports[2])
+		}
+	})
+	t.Run("a digest that fails its sync gives way", func(t *testing.T) {
+		f := newConvergeFixture(t)
+		ds := f.groupsOf(77, 4096, convergeMaxSyncFailures)
+		good := f.copies(blobBytes(80, 1024), "v/a", "v/b")
+		bad := f.inodeOf("a", ds...)
+		rot := &ConvergeRotation{}
+		rep, err := f.convergeErr(func(o *ConvergeOptions) {
+			o.Rotation = rot
+			o.seams.sync = f.syncFailsFor(unix.EIO, bad)
+		})
+		if !errors.Is(err, unix.EIO) || rep.Merged != 0 {
+			t.Fatalf("first pass: %v, %+v", err, rep)
+		}
+		// The three still fail after it and end this pass too. That error is theirs.
+		rep, err = f.convergeErr(func(o *ConvergeOptions) {
+			o.Rotation = rot
+			o.seams.sync = f.syncFailsFor(unix.EIO, bad)
+		})
+		if !errors.Is(err, unix.EIO) {
+			t.Errorf("second pass: err = %v", err)
+		}
+		if rep.Merged != 1 || !f.same("v/a", "v/b", good) {
+			t.Errorf("the good digest never ran behind three bad ones: %+v", rep)
+		}
+	})
+	t.Run("a finished digest leaves the rotation", func(t *testing.T) {
+		f := newConvergeFixture(t)
+		d := f.copies(blobBytes(81, 2048), "v/a", "v/b")
+		rot := &ConvergeRotation{}
+		f.converge(func(o *ConvergeOptions) { o.Rotation = rot })
+		if !f.same("v/a", "v/b", d) {
+			t.Fatal("did not merge")
+		}
+		if len(rot.served) != 0 {
+			t.Errorf("rotation holds %d groups with nothing left to do", len(rot.served))
+		}
+	})
+}
+
 // TestConvergeHoldsTheHashRate asks for the wait the bytes hashed so far owe.
 func TestConvergeHoldsTheHashRate(t *testing.T) {
 	f := newConvergeFixture(t)

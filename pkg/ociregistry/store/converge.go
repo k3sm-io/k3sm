@@ -29,6 +29,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -48,7 +49,7 @@ const (
 	// convergeMaxMerges is how many names a pass replaces.
 	convergeMaxMerges = 1024
 	// convergeMaxHashBytes is how much a pass hashes, keepers and targets
-	// together. The first digest it works on is exempt: see hashAllowed.
+	// together. The first digest it hashes is exempt: see hashAllowed.
 	convergeMaxHashBytes = 16 << 30
 	// convergeHashRate is how fast a pass hashes, in bytes a second.
 	convergeHashRate = 256 << 20
@@ -123,6 +124,9 @@ type ConvergeOptions struct {
 	Reviewed func(ref.Name) bool
 	// Log receives each merge and each corrupt file (slog.Default when nil).
 	Log *slog.Logger
+	// Rotation is what passes share so that no digest leads them all. The loop
+	// driving the passes keeps one; nil leaves every pass in the fixed order.
+	Rotation *ConvergeRotation
 
 	// limits and seams are zero outside this package's tests.
 	limits convergeLimits
@@ -148,6 +152,55 @@ type convergeSeams struct {
 	// scanned runs after the scan, and beforeMerge before each target's lock.
 	scanned     func()
 	beforeMerge func(ref.Name)
+}
+
+// ConvergeRotation keeps a digest that spent hash budget and still has copies
+// from leading the next pass, which also keeps it from setting the schedule for
+// every pass until its last copy merged. It holds only that order, in memory; a
+// new one starts again at largest first, and costs nothing else. The zero value
+// is ready to use.
+type ConvergeRotation struct {
+	mu sync.Mutex
+	// pass counts the passes recorded, and served is the pass each unfinished
+	// group last hashed in. Groups no longer in a pass's work leave it, so it is no
+	// larger than the table.
+	pass   uint64
+	served map[convergeGroupKey]uint64
+}
+
+// order sorts groups, which are largest first, so that the longest since served
+// comes first. A group never served comes before any that was, and size decides
+// among equals.
+func (r *ConvergeRotation) order(groups []*convergeGroup) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	slices.SortStableFunc(groups, func(a, b *convergeGroup) int {
+		return cmp.Compare(r.served[a.key()], r.served[b.key()])
+	})
+}
+
+// record notes one pass over groups.
+func (r *ConvergeRotation) record(groups []*convergeGroup) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.pass++
+	next := make(map[convergeGroupKey]uint64)
+	for _, g := range groups {
+		switch at, ok := r.served[g.key()]; {
+		case g.pending() <= 0:
+		case g.hashed:
+			next[g.key()] = r.pass
+		case ok:
+			next[g.key()] = at
+		}
+	}
+	r.served = next
 }
 
 // ConvergeReport is what a pass did. It holds no digest or repository name, so a
@@ -215,7 +268,11 @@ type convergeGroup struct {
 	// keeper is the verified keeper, and merged how many names went to it.
 	keeper *convergeInode
 	merged int
+	// hashed says this pass read bytes of the group.
+	hashed bool
 }
+
+func (g *convergeGroup) key() convergeGroupKey { return convergeGroupKey{g.digest, g.dev} }
 
 type convergeGroupKey struct {
 	digest digest.Digest
@@ -310,7 +367,8 @@ func (g *convergeGroup) pending() int {
 // more inodes on one device, it makes every repository it may rewrite name the
 // inode with the newest mtime. Commits and mounts do none of this, so a push
 // answers the same whatever other repositories hold, and copies already on disk
-// converge by the same code. It keeps no state; the table is rebuilt each pass.
+// converge by the same code. It keeps no state but the order o.Rotation holds; the
+// table is rebuilt each pass.
 //
 // Link-or-keep holds throughout: every failure keeps the copy, and the one step
 // that drops a name is an atomic rename with verified, durable bytes behind it.
@@ -353,6 +411,8 @@ func (s *Store) Converge(ctx context.Context, o ConvergeOptions) (ConvergeReport
 		p.o.seams.scanned()
 	}
 	groups := table.work()
+	p.o.Rotation.order(groups)
+	defer func() { p.o.Rotation.record(groups) }()
 	var runErr error
 	for _, g := range groups {
 		if runErr = ctx.Err(); runErr != nil || p.mergesLeft() == 0 {
@@ -565,11 +625,13 @@ func (p *convergePass) anyTarget(g *convergeGroup, keeper *convergeInode) bool {
 
 // converge runs steps 2 to 5 for one group.
 func (p *convergePass) converge(ctx context.Context, g *convergeGroup) error {
+	hashedBefore := p.rep.HashedBytes
 	defer func() {
 		// Whatever this digest cost, the exemption covers one digest.
 		if p.rep.HashedBytes > 0 {
 			p.first = false
 		}
+		g.hashed = p.rep.HashedBytes > hashedBefore
 	}()
 	k, err := p.chooseKeeper(ctx, g)
 	if err != nil {
@@ -713,8 +775,9 @@ func (p *convergePass) nlinkOK(fi os.FileInfo, counted uint64) bool {
 // hashAllowed reports whether the budget covers a file of size bytes. The pass's
 // first digest passes whatever its size, through its keeper and its first
 // target: a merge needs both hashed, so a layer larger than the budget would
-// otherwise hash its keeper every pass and never merge. It converges one target a
-// pass. Largest first makes it the same digest again until it is done.
+// otherwise hash its keeper every pass and never merge. It converges one target
+// each time it leads. ConvergeRotation decides when that is, so one digest in many
+// copies does not take the budget from every other until it is done.
 func (p *convergePass) hashAllowed(size int64) bool {
 	return p.first || p.rep.HashedBytes+size <= p.lim.hashBytes
 }
