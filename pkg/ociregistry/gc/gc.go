@@ -709,7 +709,7 @@ type plan struct {
 	blobs     map[digest.Digest]bool
 	sessions  map[string]bool
 	committed map[string]bool       // the sessions with a second link
-	temps     map[string]store.Temp // by <algorithm>/<name>
+	temps     map[string]store.Temp // by Path
 	emptyRepo bool
 }
 
@@ -1095,7 +1095,7 @@ func makePlan(idx ispec.Index, cont store.Contents, cutoff time.Time, refsOf fun
 		}
 	}
 	for _, t := range cont.Temps {
-		p.temps[t.Algorithm+"/"+t.Name] = t
+		p.temps[t.Path()] = t
 	}
 	p.emptyRepo = remainingRows == 0 && len(p.blobs) == len(cont.Blobs) &&
 		len(p.sessions) == len(cont.Sessions) && cont.Unknown == 0 && old(cont.IndexModTime)

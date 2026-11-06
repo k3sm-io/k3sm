@@ -41,10 +41,14 @@ import (
 // Layout names inside a repository directory, and the state directory's lock
 // subdirectory.
 const (
-	layoutFile  = "oci-layout"
-	indexFile   = "index.json"
-	blobsDir    = "blobs"
-	uploadsDir  = ".uploads"
+	layoutFile = "oci-layout"
+	indexFile  = "index.json"
+	blobsDir   = "blobs"
+	uploadsDir = ".uploads"
+	// tempsDir holds the link a blob replacement renames over a blob. It is beside
+	// blobs/ because the rename must stay on one volume, and not inside it because
+	// zot's GC fails a repository on any name in blobs/<algorithm>/ that is no digest.
+	tempsDir    = ".temps"
 	locksDir    = "locks"
 	fileMode    = 0o600
 	dirMode     = 0o700

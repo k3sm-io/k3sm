@@ -398,9 +398,9 @@ func (g *convergeGroup) pending() int {
 //     ErrStoreCorrupt and the merge goes ahead, since the replacement is the
 //     repair: the hash is evidence and gates nothing.
 //  5. Merge one target at a time, holding only that target's repository lock:
-//     re-check it all, link the keeper's path to .tmp-<uuid>, check that it is
-//     the descriptor's inode, rename it over the target, F_FULLFSYNC the
-//     directory. Two repository locks are never held together, and the lock is
+//     re-check it all, link the keeper's path to .temps/.tmp-<uuid>, check that it
+//     is the descriptor's inode, rename it over the target, F_FULLFSYNC both
+//     directories. Two repository locks are never held together, and the lock is
 //     held for no hash.
 //
 // The keeper is at least as new as its target and target touches take the lock
@@ -1059,11 +1059,10 @@ func (p *convergePass) relink(l *Locked, g *convergeGroup, k *verifiedKeeper, in
 		return SkipKeeperFull, 0, nil
 	}
 
-	id, err := newID()
+	tmp, err := p.s.tempName(l.dir)
 	if err != nil {
-		return SkipLinkFailed, 0, err
+		return renameFailure(err), 0, err
 	}
-	tmp := filepath.Join(filepath.Dir(dst), tempPrefix+id)
 	if err := p.o.seams.link(k.path, tmp); err != nil {
 		reason := linkFailure(err)
 		if reason == SkipKeeperFull {
@@ -1088,7 +1087,12 @@ func (p *convergePass) relink(l *Locked, g *convergeGroup, k *verifiedKeeper, in
 	if nlink(tfi) == 1 {
 		reclaimed = tst.size
 	}
+	// The rename left one directory and entered another, and either can reach the
+	// medium first.
 	if err := p.syncDir(filepath.Dir(dst)); err != nil {
+		return SkipSync, reclaimed, err
+	}
+	if err := p.syncDir(filepath.Dir(tmp)); err != nil {
 		return SkipSync, reclaimed, err
 	}
 	return "", reclaimed, nil

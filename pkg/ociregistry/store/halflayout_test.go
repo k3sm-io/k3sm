@@ -84,6 +84,17 @@ func TestSweepReapsAHalfRemovedLayout(t *testing.T) {
 		{"unknown file", func(t *testing.T, repo string) {
 			write(t, filepath.Join(repo, "notes.txt"))
 		}, false},
+		{"empty temps", func(t *testing.T, repo string) {
+			if err := os.Mkdir(filepath.Join(repo, ".temps"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}, true},
+		{"a temp", func(t *testing.T, repo string) {
+			write(t, filepath.Join(repo, ".temps", ".tmp-11111111-1111-4111-8111-111111111111"))
+		}, false},
+		{"temps is a file", func(t *testing.T, repo string) {
+			write(t, filepath.Join(repo, ".temps"))
+		}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -102,8 +113,8 @@ func TestSweepReapsAHalfRemovedLayout(t *testing.T) {
 			if gone := !exists(filepath.Join(repo, "oci-layout")); gone != tc.reaped {
 				t.Fatalf("oci-layout gone=%v, want %v", gone, tc.reaped)
 			}
-			if tc.reaped && (exists(filepath.Join(repo, "blobs")) || exists(filepath.Join(repo, ".uploads"))) {
-				t.Fatal("blobs/ or .uploads/ left behind")
+			if tc.reaped && (exists(filepath.Join(repo, "blobs")) || exists(filepath.Join(repo, ".uploads")) || exists(filepath.Join(repo, ".temps"))) {
+				t.Fatal("blobs/, .uploads/ or .temps/ left behind")
 			}
 		})
 	}

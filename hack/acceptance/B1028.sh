@@ -12,8 +12,15 @@
 #   manifest GET time to first byte (mean of 20)
 #   `image ls` over 200 tags: tags/list plus one manifest HEAD per tag, the
 #     requests the listing makes, timed end to end
+# Asserted on the k3sm registry, and part of the pass rule:
+#   one blob pushed to two tagged repositories with no mount is two inodes after
+#   the push; once a dedupe pass has finished, the two names share one inode and
+#   each repository still serves the blob's bytes. registry-dedupe.sh says when a
+#   pass can run and how the script knows one has: this adds about 61 minutes,
+#   counted from the k3sm server's start, and no verb shortens that.
 # Recorded as facts, never judged:
-#   store bytes after one blob is pushed to two repositories with no mount
+#   store bytes after one blob is pushed to two repositories with no mount, and
+#   on k3sm the same after the dedupe pass
 #   a pull with the client held to 512 KiB/s (curl --limit-rate): time, curl
 #     exit status, and whether the server still answers afterwards
 #
@@ -21,8 +28,8 @@
 # not start above load 4: the gate waits up to --load-wait seconds, then refuses
 # with exit 4 and measures nothing.
 #
-# Pass rule: k3sm push and pull MB/s each >= 0.8x zot's, and k3sm RSS lower than
-# zot's at idle and under load. Exit 0 pass, 1 fail, 2 usage, 3 LAB-PENDING
+# Pass rule: k3sm push and pull MB/s each >= 0.8x zot's, k3sm RSS lower than
+# zot's at idle and under load, and the dedupe assertion. Exit 0 pass, 1 fail, 2 usage, 3 LAB-PENDING
 # (K3SM_LAB unset: not a pass), 4 load refused.
 #
 # k3sm is started as `k3sm registry serve --config <work>/k3sm/registry-state/
@@ -36,11 +43,15 @@
 #
 # Usage:
 #   K3SM_LAB=1 hack/acceptance/B1028.sh --lab --zot PATH --k3sm PATH --work DIR \
-#       [--layer-mib N] [--load-wait SECONDS]
+#       [--layer-mib N] [--load-wait SECONDS] [--pass-wait SECONDS]
 #   hack/acceptance/B1028.sh --self-test
 # Requires: curl, python3 (free port), shasum, htpasswd, awk, ps, sysctl.
 # shellcheck disable=SC2034,SC2153  # R_*, Z_* and K_* are set and read indirectly (bash 3.2 has no associative arrays)
 set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source-path=SCRIPTDIR source=registry-dedupe.sh
+. "$HERE/registry-dedupe.sh"
 
 GATE_NAME=B1028
 USER_NAME=k3sm
@@ -59,6 +70,9 @@ verdict() {
 	ratio_ok "$2" "$1" && ratio_ok "$4" "$3" && lower "$6" "$5" && lower "$8" "$7" && echo PASS || echo FAIL
 }
 
+# final_verdict <throughput and RSS verdict> <dedupe result>
+final_verdict() { if [ "$1" = PASS ] && [ "$2" = PASS ]; then echo PASS; else echo FAIL; fi; }
+
 self_test() {
 	local bad=0
 	chk() { [ "$2" = "$3" ] || { echo "self-test FAIL: $1: got $2, want $3"; bad=1; }; }
@@ -75,14 +89,19 @@ self_test() {
 	chk "idle rss higher" "$(verdict 100 90 100 120 50 50 200 150)" FAIL
 	chk "peak rss higher" "$(verdict 100 90 100 120 50 40 200 250)" FAIL
 	chk "zero rss is no data" "$(verdict 100 90 100 120 50 0 200 150)" FAIL
+	chk "dedupe holds" "$(final_verdict PASS PASS)" PASS
+	chk "dedupe failed" "$(final_verdict PASS FAIL)" FAIL
+	chk "dedupe not measured" "$(final_verdict PASS n/a)" FAIL
+	chk "throughput failed" "$(final_verdict FAIL PASS)" FAIL
+	rd_self_test || bad=1
 	[ "$bad" = 0 ] || exit 1
 	echo "$GATE_NAME self-test: PASS"
 }
 
 if [ "${1:-}" = "--self-test" ] && [ $# -eq 1 ]; then self_test; exit 0; fi
 
-usage() { echo "usage: $0 --lab --zot PATH --k3sm PATH --work DIR [--layer-mib N] [--load-wait S] | --self-test" >&2; exit 2; }
-LAB=0; ZOT=""; K3SM=""; WORK=""; LAYER_MIB=1024; LOAD_WAIT=120
+usage() { echo "usage: $0 --lab --zot PATH --k3sm PATH --work DIR [--layer-mib N] [--load-wait S] [--pass-wait S] | --self-test" >&2; exit 2; }
+LAB=0; ZOT=""; K3SM=""; WORK=""; LAYER_MIB=1024; LOAD_WAIT=120; PASS_WAIT=4500
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--lab) LAB=1; shift ;;
@@ -91,6 +110,7 @@ while [ $# -gt 0 ]; do
 	--work) [ $# -ge 2 ] || usage; WORK="$2"; shift 2 ;;
 	--layer-mib) [ $# -ge 2 ] || usage; LAYER_MIB="$2"; shift 2 ;;
 	--load-wait) [ $# -ge 2 ] || usage; LOAD_WAIT="$2"; shift 2 ;;
+	--pass-wait) [ $# -ge 2 ] || usage; PASS_WAIT="$2"; shift 2 ;;
 	*) usage ;;
 	esac
 done
@@ -100,7 +120,7 @@ if [ "${K3SM_LAB:-}" != "1" ]; then
 	exit 3
 fi
 [ -x "$ZOT" ] && [ -x "$K3SM" ] && [ -d "$WORK" ] || { echo "--zot and --k3sm must be executable and --work an existing directory" >&2; exit 2; }
-case "$LAYER_MIB$LOAD_WAIT" in *[!0-9]* | "") usage ;; esac
+case "$LAYER_MIB$LOAD_WAIT$PASS_WAIT" in *[!0-9]* | "") usage ;; esac
 [ "$LAYER_MIB" -ge 1 ] || usage
 for t in curl python3 shasum htpasswd awk ps; do command -v "$t" >/dev/null || { echo "$GATE_NAME: $t is required" >&2; exit 2; }; done
 
@@ -138,8 +158,8 @@ gate_load() {
 	done
 }
 
-free_port() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])'; }
-sha_of() { shasum -a 256 "$1" | awk '{print "sha256:"$1}'; }
+free_port() { rd_free_port; }
+sha_of() { rd_sha_of "$1"; }
 now() { python3 -c 'import time; print(time.time())'; }
 rss_kib() { ps -o rss= -p "$1" | tr -d ' '; }
 dir_bytes() { du -sk "$1" | awk '{print $1*1024}'; }
@@ -147,29 +167,9 @@ mkblob() { head -c "$(( $2 * 1048576 ))" /dev/urandom >"$1"; }
 
 CURL=(curl -sS -u "$USER_NAME:$PASSWORD")
 BASE=""
-# upload <repo> <file> <digest> - POST, one PATCH of the whole body, PUT to close.
-# The body is streamed with -T: --data-binary @file reads the file into memory first.
-upload() {
-	local repo="$1" file="$2" digest="$3" loc
-	loc="$("${CURL[@]}" -D - -o /dev/null -X POST "$BASE/v2/$repo/blobs/uploads/" | awk 'tolower($1)=="location:"{gsub(/\r/,""); print $2}')"
-	[ -n "$loc" ] || return 1
-	case "$loc" in http*) ;; *) loc="$BASE$loc" ;; esac
-	loc="$("${CURL[@]}" -D - -o /dev/null -X PATCH -H 'Content-Type: application/octet-stream' -T "$file" "$loc" | awk 'tolower($1)=="location:"{gsub(/\r/,""); print $2}')"
-	[ -n "$loc" ] || return 1
-	case "$loc" in http*) ;; *) loc="$BASE$loc" ;; esac
-	case "$loc" in *\?*) loc="$loc&digest=$digest" ;; *) loc="$loc?digest=$digest" ;; esac
-	"${CURL[@]}" -o /dev/null -w '%{http_code}' -X PUT -H 'Content-Length: 0' "$loc" | grep -q '^201$'
-}
+upload() { rd_upload "$@"; }
 # put_manifest <repo> <tag> <layer digest> <layer size> - config blob + manifest; echoes nothing.
-put_manifest() {
-	local repo="$1" tag="$2" ld="$3" ls="$4" cfg="$RUN/cfg.json" cd m
-	[ -f "$cfg" ] || printf '{"architecture":"arm64","os":"linux","rootfs":{"type":"layers","diff_ids":[]}}' >"$cfg"
-	cd="$(sha_of "$cfg")"
-	upload "$repo" "$cfg" "$cd" || return 1
-	m="$(printf '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"%s","size":%s},"layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"%s","size":%s}]}' "$cd" "$(wc -c <"$cfg" | tr -d ' ')" "$ld" "$ls")"
-	printf '%s' "$m" >"$RUN/m.json"
-	"${CURL[@]}" -o /dev/null -w '%{http_code}' -X PUT -H 'Content-Type: application/vnd.oci.image.manifest.v1+json' --data-binary "@$RUN/m.json" "$BASE/v2/$repo/manifests/$tag" | grep -q '^201$'
-}
+put_manifest() { rd_put_manifest "$RUN" "$@"; }
 
 # start_server <name> - sets BASE, SPID, STORE for the named server.
 start_server() {
@@ -197,6 +197,7 @@ JSON
 {"principals":[{"user":"k3sm","secretSHA256":"$h"},{"user":"k3sm-gate","secretSHA256":"$h"}],"listen":"127.0.0.1:$port"}
 JSON
 		chmod 600 "$dir/registry-state/serve.json"
+		K3SM_LOG="$dir/registry.log"; K3SM_START="$(date +%s)"
 		"$K3SM" registry serve --config "$dir/registry-state/serve.json" >"$dir/server.log" 2>&1 &
 		;;
 	esac
@@ -272,12 +273,15 @@ measure() {
 	R_LSN="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["tags"]))' "$RUN/tags.json")"
 
 	# Facts. One blob, two repositories, no mount: the second upload is a full upload.
+	# Each is tagged, since a dedupe pass rewrites only a repository with a tag.
 	gate_load "$name store size, one blob in two repositories"
-	local before after sd; sd="$(sha_of "$d/small")"
+	local before after sd ss from=0; sd="$(sha_of "$d/small")"; ss="$(wc -c <"$d/small" | tr -d ' ')"
 	before="$(dir_bytes "$STORE")"
 	upload dup/one "$d/small" "$sd"; upload dup/two "$d/small" "$sd"
+	put_manifest dup/one v1 "$sd" "$ss"; put_manifest dup/two v1 "$sd" "$ss"
 	after="$(dir_bytes "$STORE")"
 	R_DUP="$((after - before))"
+	[ "$name" != k3sm ] || from="$(rd_lines "$K3SM_LOG")"
 
 	gate_load "$name throttled pull"
 	local rc=0 srv
@@ -286,10 +290,23 @@ measure() {
 	t1="$(now)"
 	R_THR_S="$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.1f", b-a}')"; R_THR_RC="$rc"
 	srv="$("${CURL[@]}" -o /dev/null -w '%{http_code}' "$BASE/v2/")"; R_THR_UP="$srv"
+
+	# zot links at the commit, so only the k3sm registry has a pass to wait for.
+	R_DEDUPE=n/a; R_DUP_PASS=n/a
+	if [ "$name" = k3sm ]; then
+		log "waiting for the first sweep and a dedupe pass (about 61 minutes from the server's start)"
+		if rd_dedupe_leg "$K3SM_LOG" "$STORE" dup/one dup/two "$sd" "$from" "$((K3SM_START + PASS_WAIT))" "$SPID"; then
+			R_DEDUPE=PASS
+		else
+			R_DEDUPE=FAIL
+		fi
+		after="$(dir_bytes "$STORE")"
+		R_DUP_PASS="$((after - before))"
+	fi
 	stop_server
 }
 
-fields="IDLE PUSH PULL PEAK TTFB LS LSN DUP THR_S THR_RC THR_UP"
+fields="IDLE PUSH PULL PEAK TTFB LS LSN DUP DUP_PASS DEDUPE THR_S THR_RC THR_UP"
 
 log "building inputs under $RUN/data"
 mkdir -p "$RUN/data"
@@ -313,11 +330,14 @@ row "RSS peak, $CONC concurrent pushes (KiB)" "${Z_PEAK}" "${K_PEAK}"
 row "manifest GET TTFB, mean of 20 (s)" "${Z_TTFB}" "${K_TTFB}"
 row "image ls, ${Z_LSN}/${K_LSN} tags (s)" "${Z_LS}" "${K_LS}"
 row "fact: store growth, 1 blob in 2 repos (B)" "${Z_DUP}" "${K_DUP}"
+row "fact: the same after a dedupe pass (B)" "${Z_DUP_PASS}" "${K_DUP_PASS}"
+row "dedupe: one inode, both repos serve the bytes" "${Z_DEDUPE}" "${K_DEDUPE}"
 row "fact: 512KiB/s 6MiB pull (s)" "${Z_THR_S}" "${K_THR_S}"
 row "fact: 512KiB/s pull curl exit" "${Z_THR_RC}" "${K_THR_RC}"
 row "fact: /v2/ after throttled pull (http)" "${Z_THR_UP}" "${K_THR_UP}"
 echo
 v="$(verdict "${Z_PUSH}" "${K_PUSH}" "${Z_PULL}" "${K_PULL}" "${Z_IDLE}" "${K_IDLE}" "${Z_PEAK}" "${K_PEAK}")"
-echo "rule: push and pull >= 0.8x zot, RSS idle and peak lower than zot"
+v="$(final_verdict "$v" "${K_DEDUPE}")"
+echo "rule: push and pull >= 0.8x zot, RSS idle and peak lower than zot, dedupe holds after a pass"
 echo "result: $v"
 [ "$v" = PASS ] || exit 1

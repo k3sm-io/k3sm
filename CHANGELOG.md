@@ -103,7 +103,9 @@ pin, its date, and the tarball's sha256.
   or more apart. Any other copy a pass leaves waits for the next commit, mount or server start.
   `registry.log` records each merge and each pass, and
   `registry-state.json` gains a `dedupe` object with the last pass's counts. `du -sk` of the registry
-  root falls to one copy; `du` of a single repository still shows its full size.
+  root falls to one copy; `du` of a single repository still shows its full size. A crash during a
+  merge can leave a link in the repository's `.temps` directory, which garbage collection removes and
+  zot ignores, so a rollback to zot still collects that repository.
 - The registry store k3sm is replacing zot with has an online garbage collector that runs
   while pushes continue. A blob's age counts from the last mount, link or upload that named it,
   recorded on disk so a restart keeps it, and a sweep re-reads the index and re-checks each
