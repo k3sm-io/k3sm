@@ -1,6 +1,6 @@
 # The cluster registry
 
-Every k3sm server runs a small **OCI registry**, the cluster's one image store. You push a locally
+Every k3sm server runs its own small **OCI registry**, the cluster's one image store. It is k3sm's own, built into the server, with no separate registry program to install or run. It serves the OCI distribution API, collects its own garbage, and takes writes through the push gate. You push a locally
 built image to it and a Pod pulls it back through the ordinary Kubernetes image path, including
 `imagePullPolicy: Always`, the digest index, and real pull failures.
 
