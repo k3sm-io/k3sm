@@ -25,13 +25,35 @@ import (
 // TestClassify pins the classifier row by row: the write shapes it admits and
 // the repository it reads out of each, and the spellings it refuses.
 func TestClassify(t *testing.T) {
+	for _, tc := range classifyCorpus() {
+		t.Run(tc.method+" "+tc.path+"?"+tc.query, func(t *testing.T) {
+			r := classify(tc.method, tc.path, tc.query)
+			if r.op != tc.op {
+				t.Fatalf("op = %s, want %s", r.op, tc.op)
+			}
+			if !r.op.isWrite() {
+				return
+			}
+			if r.repo != tc.repo || r.from != tc.from || r.query != tc.fwdQuery || r.path != tc.path {
+				t.Errorf("route = %+v, want repo %q from %q query %q path %q", r, tc.repo, tc.from, tc.fwdQuery, tc.path)
+			}
+		})
+	}
+}
+
+// classifyCase is one row of the classifier's corpus.
+type classifyCase struct {
+	method, path, query string
+	op                  gateOp
+	repo, from          string
+	fwdQuery            string
+}
+
+// classifyCorpus is the classifier's corpus, also fed to the registry server by
+// TestGateAndServerAgree.
+func classifyCorpus() []classifyCase {
 	d := "sha256:" + strings.Repeat("a", 64)
-	tests := []struct {
-		method, path, query string
-		op                  gateOp
-		repo, from          string
-		fwdQuery            string
-	}{
+	return []classifyCase{
 		{"GET", "/v2/", "", opRead, "", "", ""},
 		{"GET", "/v2/_catalog", "n=10", opRead, "", "", ""},
 		{"HEAD", "/v2/a/b/manifests/v1", "", opRead, "", "", ""},
@@ -83,20 +105,6 @@ func TestClassify(t *testing.T) {
 		{"DELETE", "/v2/a/blobs/uploads/u-1", "", opRefused, "", "", ""},
 		{"OPTIONS", "/v2/", "", opRefused, "", "", ""},
 		{"CONNECT", "/v2/", "", opRefused, "", "", ""},
-	}
-	for _, tc := range tests {
-		t.Run(tc.method+" "+tc.path+"?"+tc.query, func(t *testing.T) {
-			r := classify(tc.method, tc.path, tc.query)
-			if r.op != tc.op {
-				t.Fatalf("op = %s, want %s", r.op, tc.op)
-			}
-			if !r.op.isWrite() {
-				return
-			}
-			if r.repo != tc.repo || r.from != tc.from || r.query != tc.fwdQuery || r.path != tc.path {
-				t.Errorf("route = %+v, want repo %q from %q query %q path %q", r, tc.repo, tc.from, tc.fwdQuery, tc.path)
-			}
-		})
 	}
 }
 
