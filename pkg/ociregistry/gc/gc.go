@@ -226,6 +226,17 @@ func (c *Collector) Sweep(ctx context.Context) (Report, error) {
 		return rep, err
 	}
 	var errs []error
+	if !rep.ReportOnly {
+		// A layout a stopped RemoveLayout left is not listed above, so it
+		// would never be reaped otherwise.
+		reaped, err := c.s.ReapHalfRemovedLayouts(ctx)
+		for _, n := range reaped {
+			c.log.Info("registry gc: reaped a half-removed layout", "repository", n.String())
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("gc: %w", err))
+		}
+	}
 	var unreviewed []string // repositories a failure that may pass left unreviewed
 	for _, n := range repos {
 		if err := ctx.Err(); err != nil {
