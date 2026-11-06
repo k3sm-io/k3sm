@@ -347,6 +347,11 @@ func New(cfg Config) (*Server, error) {
 	return s, nil
 }
 
+// UploadSessions returns how many upload sessions count against MaxSessions
+// now: the sessions this process has tracked and not yet seen go idle, plus
+// the slots reserved for sessions being created.
+func (s *Server) UploadSessions() int { return s.sessions.live() }
+
 // positive returns v, or def when v is not positive.
 func positive[T int | int64 | time.Duration](v, def T) T {
 	if v <= 0 {
@@ -407,7 +412,8 @@ func (s *Server) connState() func(net.Conn, http.ConnState) {
 
 // ServeHTTP serves one request, recovering from a panic in any handler. It
 // sets the response's write deadline: ResponseTimeout, after UploadTimeout for
-// a request that carries a body; a blob GET moves it out by the blob's size.
+// a request that carries a body; a blob GET moves it out by the blob's size. A
+// path that holds a percent escape is refused here, on every route.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	window := s.respTimeout
 	switch r.Method {
@@ -427,6 +433,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.log.Error("registry handler panicked", "method", r.Method, "path", r.URL.Path, "panic", fmt.Sprint(v), "stack", string(debug.Stack()))
 		s.writeError(w, r, errorf(http.StatusInternalServerError, codeUnavailable, "internal error"))
 	}()
+	// The router matches on the decoded path, so a%2fb would route as the
+	// repository a/b and an escaped slash could move a route word. The push gate
+	// refuses every escape on a write and passes a read through as received, so
+	// the one reading both can hold is a path with nothing to decode. A query is
+	// not a path: from=a%2Fb is how a mount's source is spelled.
+	if r.URL.EscapedPath() != r.URL.Path {
+		s.writeError(w, r, errorf(http.StatusBadRequest, codeNameInvalid, "the request path holds a percent escape"))
+		return
+	}
 	s.router.ServeHTTP(w, r)
 }
 

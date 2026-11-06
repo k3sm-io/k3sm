@@ -141,10 +141,9 @@ func digests(ms []StoredManifest) []string {
 	return out
 }
 
-func TestPruneGraceIsTheGCDelay(t *testing.T) {
-	d, err := time.ParseDuration(gcDelay)
-	if err != nil || d != PruneGrace {
-		t.Errorf("PruneGrace = %v, gcDelay = %q (%v): they must agree", PruneGrace, gcDelay, err)
+func TestPruneGraceIsTheGCGrace(t *testing.T) {
+	if PruneGrace != serveGCGrace {
+		t.Errorf("PruneGrace = %v, serveGCGrace = %v: they must agree", PruneGrace, serveGCGrace)
 	}
 }
 

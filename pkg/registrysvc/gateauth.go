@@ -36,6 +36,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"k3sm.io/k3sm/pkg/ociregistry/ref"
 )
 
 // The push gate's authorization: a pod pushes with its own projected
@@ -419,7 +421,7 @@ func (a *authorizer) namespacePrefix(ctx context.Context, ns string) (namespaceR
 			// unique, so no two namespaces can hold one prefix, and the gate
 			// needs no read of any namespace but the pushing one.
 			r = namespaceResult{reason: "the namespace's " + PushLabel + " label must equal the namespace name: run kubectl label namespace " + ns + " " + PushLabel + "=" + ns + " --overwrite"}
-		case !pushPrefixValue.MatchString(v) || len(v) > maxRepoNameLen:
+		case !pushPrefixValue.MatchString(v) || len(v) > ref.MaxNameLength:
 			r = namespaceResult{reason: "the namespace's " + PushLabel + " label is not a valid repository prefix"}
 		default:
 			r = namespaceResult{prefix: v}

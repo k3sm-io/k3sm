@@ -19,7 +19,9 @@ limitations under the License.
 package registrysvc
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -48,6 +50,18 @@ func TestMain(m *testing.M) {
 		runFakeZot(false)
 	case "listen-ignore-term":
 		runFakeZot(true)
+	}
+	// The argv spawn gives the child, with this test binary as the executable: it
+	// runs what `k3sm registry serve` runs.
+	if len(os.Args) == 5 && os.Args[1] == "registry" && os.Args[2] == "serve" && os.Args[3] == "--config" {
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+		err := Serve(ctx, os.Args[4])
+		stop()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "registry serve:", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
 	}
 	os.Exit(m.Run())
 }
@@ -86,13 +100,17 @@ func TestRestartRebindsTheIngestPort(t *testing.T) {
 		mode        string
 		orphan      bool
 		otherConfig bool
-		wantErr     error
-		wantGone    bool
+		// current runs it with the argv of the current child, not the legacy zot.
+		current  bool
+		wantErr  error
+		wantGone bool
 	}{
 		{name: "an orphaned child is reclaimed and the port rebinds", mode: "listen", orphan: true, wantGone: true},
 		{name: "an orphan that ignores SIGTERM is killed and the port rebinds", mode: "listen-ignore-term", orphan: true, wantGone: true},
 		{name: "a child whose parent is alive is left alone", mode: "listen", wantErr: ErrPortHeld},
 		{name: "an orphan serving another config is left alone", mode: "listen", orphan: true, otherConfig: true, wantErr: ErrPortHeld},
+		{name: "an orphaned k3sm registry server is reclaimed", mode: "listen", orphan: true, current: true, wantGone: true},
+		{name: "a k3sm registry server whose parent is alive is left alone", mode: "listen", current: true, wantErr: ErrPortHeld},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -101,7 +119,12 @@ func TestRestartRebindsTheIngestPort(t *testing.T) {
 			if tc.otherConfig {
 				cfg = filepath.Join(t.TempDir(), "config.json")
 			}
-			pid := startFakeZot(t, s, tc.mode, cfg, tc.orphan)
+			var pid int
+			if tc.current {
+				pid = startFakeChild(t, s, tc.mode, s.childArgv(), tc.orphan)
+			} else {
+				pid = startFakeChild(t, s, tc.mode, []string{ZotPath(s.cfg.BinDir), "serve", cfg}, tc.orphan)
+			}
 
 			err := s.claimPort(t.Context())
 			if tc.wantErr != nil {
@@ -183,17 +206,17 @@ func copyFile(t *testing.T, src, dst string) {
 	}
 }
 
-// startFakeZot starts the fake child with the argv spawn gives the real one
-// (serving cfg) and waits until it listens. orphan starts it from a shell that
+// startFakeChild starts the fake child with argv, the one spawn gives the real
+// child or the one the previous release gave zot, and waits until it listens. orphan starts it from a shell that
 // exits at once, so it is re-parented to launchd exactly as a killed server's
 // child is. The process is SIGKILLed at cleanup whatever the test did.
-func startFakeZot(t *testing.T, s *Service, mode, cfg string, orphan bool) int {
+func startFakeChild(t *testing.T, s *Service, mode string, argv []string, orphan bool) int {
 	t.Helper()
 	env := append(os.Environ(), fakeZotEnv+"="+mode, fakeZotAddrEnv+"="+s.Addr())
-	zot := ZotPath(s.cfg.BinDir)
 	var pid int
 	if orphan {
-		sh := exec.Command("/bin/sh", "-c", `"$0" serve "$1" </dev/null >/dev/null 2>&1 & echo $!`, zot, cfg)
+		sh := exec.Command("/bin/sh", "-c", `"$0" "$@" </dev/null >/dev/null 2>&1 & echo $!`, argv[0])
+		sh.Args = append(sh.Args, argv[1:]...)
 		sh.Env = env
 		out, err := sh.Output()
 		if err != nil {
@@ -203,7 +226,7 @@ func startFakeZot(t *testing.T, s *Service, mode, cfg string, orphan bool) int {
 			t.Fatalf("read the orphan's pid from %q: %v", out, err)
 		}
 	} else {
-		c := exec.Command(zot, "serve", cfg)
+		c := exec.Command(argv[0], argv[1:]...)
 		c.Env = env
 		if err := c.Start(); err != nil {
 			t.Fatalf("start the fake zot: %v", err)

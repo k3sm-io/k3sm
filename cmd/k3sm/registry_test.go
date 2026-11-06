@@ -74,21 +74,19 @@ func TestRegistryPortFlagParses(t *testing.T) {
 	}
 }
 
-// TestRegistryConfig pins the flag-to-config mapping, including the payload dir
-// that lets a packaged install seed the zot binary instead of building it — a
-// launchd daemon has no Go toolchain, so losing that field would turn every
-// packaged boot into a failed registry.
+// TestRegistryConfig pins the flag-to-config mapping, including the data volume
+// the child must find the store on.
 func TestRegistryConfig(t *testing.T) {
 	opts := serverOptions{workDir: "/var/lib/k3sm/server", registryPort: 6450}
-	cfg := registryConfig(opts, "/opt/k3sm/bin", slog.Default())
+	cfg := registryConfig(opts, "/var/lib/k3sm", slog.Default())
 	if cfg.WorkDir != opts.workDir {
 		t.Errorf("WorkDir = %q, want %q", cfg.WorkDir, opts.workDir)
 	}
 	if cfg.Port != opts.registryPort {
 		t.Errorf("Port = %d, want %d", cfg.Port, opts.registryPort)
 	}
-	if cfg.PayloadBinDir != "/opt/k3sm/bin" {
-		t.Errorf("PayloadBinDir = %q, want the staged payload dir", cfg.PayloadBinDir)
+	if cfg.DataVolume != "/var/lib/k3sm" {
+		t.Errorf("DataVolume = %q, want the data volume", cfg.DataVolume)
 	}
 	if cfg.BindAddress != "" {
 		t.Errorf("BindAddress = %q, want empty so registrysvc's loopback default applies", cfg.BindAddress)

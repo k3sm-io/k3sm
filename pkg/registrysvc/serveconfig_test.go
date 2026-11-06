@@ -18,11 +18,13 @@ package registrysvc
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"strings"
 	"testing"
 
 	"k3sm.io/k3sm/pkg/ociregistry/auth"
+	"k3sm.io/k3sm/pkg/ociregistry/store"
 )
 
 // TestServeConfig checks that the daemon writes both per-boot principals'
@@ -135,10 +137,10 @@ func TestServeConfig(t *testing.T) {
 		})
 	}
 	t.Run("refuses credentials of the wrong users", func(t *testing.T) {
-		if _, err := renderServeConfig(gate, push); err == nil {
+		if _, err := renderServeConfig(gate, push, ServeConfig{}); err == nil {
 			t.Fatal("renderServeConfig accepted swapped credentials")
 		}
-		if _, err := renderServeConfig(push, Credential{Username: gateUser}); err == nil {
+		if _, err := renderServeConfig(push, Credential{Username: gateUser}, ServeConfig{}); err == nil {
 			t.Fatal("renderServeConfig accepted an empty secret")
 		}
 	})
@@ -211,4 +213,55 @@ func TestServeStateDirHardening(t *testing.T) {
 			t.Errorf("state dir mode %#o, want 0700", fi.Mode().Perm())
 		}
 	})
+}
+
+// TestValidateForServingRefusesNonLoopback pins the bind discipline on the listener
+// the server actually binds, so no serve config can produce a wildcard or routable
+// bind. An empty host is the one net.Listen would read as every interface.
+func TestValidateForServingRefusesNonLoopback(t *testing.T) {
+	for _, listen := range []string{"0.0.0.0:6450", "[::]:6450", "10.0.0.4:6450", "localhost:6450", ":6450"} {
+		t.Run(listen, func(t *testing.T) {
+			err := ServeConfig{Listen: listen}.validateForServing()
+			if !errors.Is(err, ErrNonLoopbackBind) {
+				t.Fatalf("validateForServing(%q) err = %v, want ErrNonLoopbackBind", listen, err)
+			}
+		})
+	}
+}
+
+// TestRenderServeConfigIsDeterministic pins that two renders of the same inputs
+// produce identical bytes, so a difference between two configs always means a
+// setting or a secret changed.
+func TestRenderServeConfigIsDeterministic(t *testing.T) {
+	push := Credential{Username: pushUser, Password: "push-secret"}
+	gate := Credential{Username: gateUser, Password: "gate-secret"}
+	settings := ServeConfig{Listen: "127.0.0.1:6450", DataVolume: "/var/lib/k3sm", UID: 499, GID: 498}
+	a, err := renderServeConfig(push, gate, settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := renderServeConfig(push, gate, settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(a, b) {
+		t.Errorf("two renders of the same inputs differ:\n%s\n---\n%s", a, b)
+	}
+}
+
+// TestStoreRootIsTheStateDir pins that the store the server opens is the directory
+// this package names: the data-volume check runs against StateDir, so a store
+// rooted anywhere else would escape it.
+func TestStoreRootIsTheStateDir(t *testing.T) {
+	work := t.TempDir()
+	st, err := store.OpenWorkDir(work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Root() != StateDir(work) {
+		t.Errorf("store root = %q, want %q", st.Root(), StateDir(work))
+	}
+	if st.StateDir() != ServeStateDir(work) {
+		t.Errorf("store state dir = %q, want %q", st.StateDir(), ServeStateDir(work))
+	}
 }

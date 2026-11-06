@@ -39,6 +39,7 @@ import (
 	"k3sm.io/k3sm/pkg/addons"
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/certs"
+	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/ingresshost"
 	"k3sm.io/k3sm/pkg/install"
@@ -249,21 +250,15 @@ func startServerRegistry(ctx context.Context, plan serverPlan, restCfg *rest.Con
 		retractOptedOutRegistryService(ctx, opts, cs, logger)
 		return noStop, puller
 	}
-	cfg := registryConfig(opts, plan.cfg.PayloadBinDir, logger)
-	// The boot's one signing decision: a release-signed daemon runs only the zot
-	// its signed payload ships, verified and never re-signed.
-	// An undecidable signing path fails closed: no registry rather than a zot
-	// nothing verified.
-	verifier, release, err := executor.ResolveReleaseVerifier(ctx, logger)
+	// An undecidable data volume fails closed: no registry rather than a store
+	// that may land on the system volume.
+	dataVolume, err := registryDataVolume(dataroot.OSFS{}, opts.workDir)
 	if err != nil {
-		logger.Error("ingest registry disabled: the signing path cannot be decided, so the payload's zot cannot be verified",
-			"err", err, "remedy", executor.SelfSignatureRemedy)
-		recordRegistryDisabled(opts, "the signing path cannot be decided, so the payload's zot cannot be verified: "+err.Error(), logger)
+		logger.Error("ingest registry disabled: the data volume cannot be decided", "err", err)
+		recordRegistryDisabled(opts, "the data volume cannot be decided: "+err.Error(), logger)
 		return noStop, puller
 	}
-	if release {
-		cfg.ReleaseVerifier = verifier
-	}
+	cfg := registryConfig(opts, dataVolume, logger)
 	svc, err := registrysvc.New(cfg)
 	if err != nil {
 		logger.Error("ingest registry disabled", "err", err)

@@ -22,7 +22,10 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
+
+	"k3sm.io/k3sm/pkg/registrysvc"
 )
 
 // writeFiles lays down a fake payload tree. These tests exercise the verifier's
@@ -116,6 +119,38 @@ func TestVerifyPayloadSetRejectsExtraFiles(t *testing.T) {
 	}
 	if !errors.Is(err, ErrPayloadDigestMismatch) {
 		t.Fatalf("error = %v, want ErrPayloadDigestMismatch", err)
+	}
+}
+
+// TestVerifyPayloadSetToleratesZot pins the release that moves off zot: a payload
+// verifies whether it still carries zot and its marker or not, and anything else
+// beside them is still refused.
+func TestVerifyPayloadSetToleratesZot(t *testing.T) {
+	var without []string
+	for _, b := range PayloadBinaries() {
+		if b != registrysvc.ZotBinaryName {
+			without = append(without, b)
+		}
+	}
+	for _, tc := range []struct {
+		name  string
+		files []string
+	}{
+		{"neither", without},
+		{"zot", append(slices.Clone(without), registrysvc.ZotBinaryName)},
+		{"zot and its marker", append(slices.Clone(without), registrysvc.ZotBinaryName, registrysvc.ZotMarkerName)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeFiles(t, dir, tc.files...)
+			if err := VerifyPayloadSet(dir); err != nil {
+				t.Errorf("VerifyPayloadSet = %v", err)
+			}
+			writeFiles(t, dir, "totally-unexpected-tool")
+			if err := VerifyPayloadSet(dir); !errors.Is(err, ErrPayloadDigestMismatch) {
+				t.Errorf("with an extra file: %v, want ErrPayloadDigestMismatch", err)
+			}
+		})
 	}
 }
 

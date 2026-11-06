@@ -38,22 +38,40 @@ func listOwnProcesses() ([]procEntry, error) {
 		return nil, fmt.Errorf("sysctl kern.proc.uid: %w", err)
 	}
 	out := make([]procEntry, 0, len(kps))
-	for _, kp := range kps {
-		pid := int(kp.Proc.P_pid)
-		if pid <= 1 || kp.Proc.P_stat == procStateZombie {
-			continue
+	for i := range kps {
+		if p, ok := procEntryOf(&kps[i]); ok {
+			out = append(out, p)
 		}
-		raw, err := unix.SysctlRaw("kern.procargs2", pid)
-		if err != nil {
-			continue
-		}
-		argv, err := procargsArgv(raw)
-		if err != nil {
-			continue
-		}
-		out = append(out, procEntry{pid: pid, ppid: int(kp.Eproc.Ppid), pgid: int(kp.Eproc.Pgid), argv: argv})
 	}
 	return out, nil
+}
+
+// lookupOwnProcess re-reads one pid; false when it is gone, a zombie, or its
+// arguments cannot be read.
+func lookupOwnProcess(pid int) (procEntry, bool) {
+	kp, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
+	if err != nil || int(kp.Proc.P_pid) != pid {
+		return procEntry{}, false
+	}
+	return procEntryOf(kp)
+}
+
+// procEntryOf reads one process's argv beside its kinfo. A zombie, launchd or a
+// process whose arguments cannot be read is not an entry.
+func procEntryOf(kp *unix.KinfoProc) (procEntry, bool) {
+	pid := int(kp.Proc.P_pid)
+	if pid <= 1 || kp.Proc.P_stat == procStateZombie {
+		return procEntry{}, false
+	}
+	raw, err := unix.SysctlRaw("kern.procargs2", pid)
+	if err != nil {
+		return procEntry{}, false
+	}
+	argv, err := procargsArgv(raw)
+	if err != nil {
+		return procEntry{}, false
+	}
+	return procEntry{pid: pid, ppid: int(kp.Eproc.Ppid), pgid: int(kp.Eproc.Pgid), uid: int(kp.Eproc.Ucred.Uid), argv: argv}, true
 }
 
 // procargsArgv extracts argv from a kern.procargs2 buffer: a native-endian

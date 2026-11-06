@@ -20,7 +20,9 @@ limitations under the License.
 //
 // Every repository name, tag, digest and session id in a path or a query is
 // validated through pkg/ociregistry/ref before the store is touched, reads
-// included. Routing is github.com/gorilla/mux, manifests decode with
+// included, and a path holding a percent escape is refused before it is routed,
+// so the repository is the one the path spells and the push gate reads.
+// Routing is github.com/gorilla/mux, manifests decode with
 // encoding/json into the image-spec types, and digests verify with go-digest.
 // Two pieces are written here because no maintained library implements them:
 // the upload session state machine (session.go) and the parsing of the OCI

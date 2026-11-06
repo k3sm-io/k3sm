@@ -1588,6 +1588,29 @@ func (f *fakeSystem) RemoveEntry(dir, name string) error {
 	return nil
 }
 
+// RemoveEntryBeneath records the removal and removes the file. A symlink in the
+// ownership table at the root or any level below it is refused, as O_NOFOLLOW
+// refuses it, and removeEntryErrs answers as it does for RemoveEntry.
+func (f *fakeSystem) RemoveEntryBeneath(root string, subdirs []string, name string) error {
+	f.calls = append(f.calls, "RemoveEntryBeneath:"+root+":"+strings.Join(subdirs, "/")+":"+name)
+	dir := root
+	for i := -1; i < len(subdirs); i++ {
+		if i >= 0 {
+			dir = filepath.Join(dir, subdirs[i])
+		}
+		if f.owners[dir].Kind == EntrySymlink {
+			return fmt.Errorf("remove %s beneath %s: open %s: too many levels of symbolic links (O_NOFOLLOW)", name, root, dir)
+		}
+	}
+	p := filepath.Join(dir, name)
+	if err, ok := f.removeEntryErrs[p]; ok {
+		return fmt.Errorf("remove %s beneath %s: %w", name, root, err)
+	}
+	delete(f.files, p)
+	delete(f.owners, p)
+	return nil
+}
+
 // OpenDirNoFollow records the open and hands out a numbered handle. A symlink
 // (in the ownership table) at dir is refused, as O_NOFOLLOW refuses it; a dir
 // with no ownership entry is absent. The handle keeps reading the directory it
@@ -2091,6 +2114,10 @@ func TestInstallOrchestration(t *testing.T) {
 		// one, and removes it HERE and not a step earlier
 		// (TestInstallStagesTheRootAndPublishesItOnce).
 		//
+		// The zot an earlier release staged goes at the same point: past it, the
+		// install is not rolled back.
+		"RemoveEntryBeneath:/var/lib/k3sm:server/bin:zot",
+		"RemoveEntryBeneath:/var/lib/k3sm:server/bin:zot.version",
 		// The cluster CA the first boot minted, waited for AFTER the bootstrap and
 		// outside the publish, then pinned in the admin kubeconfig.
 		"ReadFile:/var/lib/k3sm/server/tls/cluster-ca.crt",
@@ -3459,6 +3486,74 @@ func TestInstallStagesTheZotMarker(t *testing.T) {
 	if !registrysvc.PayloadVouchesZot(bin, registrysvc.DefaultZotVersion) {
 		t.Errorf("the staged zot set is not one the server would use (marker %q, pin %s)", marker, registrysvc.DefaultZotVersion)
 	}
+}
+
+// TestInstallRemovesTheLeftoverZot: an install removes the zot an earlier release
+// staged in the work dir, and its marker, whether or not they are there. Where it
+// does so among the other steps is pinned by TestInstallOrchestration: past the
+// point a failed install reverts to the previous release.
+func TestInstallRemovesTheLeftoverZot(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		present bool
+	}{{"present", true}, {"absent", false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeSystem{}
+			cfg := Config{BinarySource: "/tmp/build/k3sm", TargetUser: "alice"}
+			bin := filepath.Join(cfg.withDefaults().serverWorkDir(), "bin")
+			if tc.present {
+				f.files = map[string][]byte{
+					filepath.Join(bin, registrysvc.ZotBinaryName): []byte("zot"),
+					filepath.Join(bin, registrysvc.ZotMarkerName): []byte("v2 minimal"),
+				}
+			}
+			if err := Install(context.Background(), f, cfg); err != nil {
+				t.Fatalf("Install: %v", err)
+			}
+			for _, name := range []string{registrysvc.ZotBinaryName, registrysvc.ZotMarkerName} {
+				if !slices.Contains(f.calls, "RemoveEntryBeneath:/var/lib/k3sm:server/bin:"+name) {
+					t.Errorf("no removal of %s: %v", name, f.calls)
+				}
+				if _, ok := f.files[filepath.Join(bin, name)]; ok {
+					t.Errorf("%s survived the install", name)
+				}
+			}
+		})
+	}
+	t.Run("an install that fails keeps it for the release it reverts to", func(t *testing.T) {
+		cfg := Config{BinarySource: "/tmp/build/k3sm", TargetUser: "alice"}
+		f := &fakeSystem{bootstrapAlways: map[string]error{"io.k3sm.server": errors.New("refused")}}
+		if err := Install(context.Background(), f, cfg); err == nil {
+			t.Fatal("Install succeeded with the server refusing to bootstrap")
+		}
+		if slices.Contains(f.calls, "RemoveEntryBeneath:/var/lib/k3sm:server/bin:"+registrysvc.ZotBinaryName) {
+			t.Errorf("a failed install removed zot: %v", f.calls)
+		}
+	})
+	t.Run("a failed removal does not fail the install", func(t *testing.T) {
+		cfg := Config{BinarySource: "/tmp/build/k3sm", TargetUser: "alice"}
+		bin := filepath.Join(cfg.withDefaults().serverWorkDir(), "bin")
+		f := &fakeSystem{removeEntryErrs: map[string]error{filepath.Join(bin, registrysvc.ZotBinaryName): errors.New("busy")}}
+		if err := Install(context.Background(), f, cfg); err != nil {
+			t.Fatalf("Install: %v", err)
+		}
+	})
+	t.Run("a refused removal does not fail the install", func(t *testing.T) {
+		cfg := Config{BinarySource: "/tmp/build/k3sm", TargetUser: "alice"}
+		work := cfg.withDefaults().serverWorkDir()
+		bin := filepath.Join(work, "bin")
+		zot := filepath.Join(bin, registrysvc.ZotBinaryName)
+		f := &fakeSystem{
+			owners: map[string]OwnedEntry{work: {Path: work, Kind: EntrySymlink}},
+			files:  map[string][]byte{zot: []byte("zot")},
+		}
+		if err := Install(context.Background(), f, cfg); err != nil {
+			t.Fatalf("Install: %v", err)
+		}
+		if _, ok := f.files[zot]; !ok {
+			t.Error("the removal went through a symlink")
+		}
+	})
 }
 
 // TestInstallStagesTheHelmMarker: the work-dir seed replaces a helm whose marker

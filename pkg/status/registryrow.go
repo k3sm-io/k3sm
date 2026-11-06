@@ -246,11 +246,11 @@ func probeRegistry(ctx context.Context, url string) error {
 	return registryAnswered(url, resp.StatusCode, resp.Status)
 }
 
-// registryAnswered decides whether a /v2/ status is a registry serving. The
-// distribution spec answers /v2/ with 200, or 401 where it wants a credential;
-// any other status is not a registry serving.
+// registryAnswered decides whether a /v2/ status is the registry serving. The
+// registry answers an anonymous /v2/ with 200, and anything else, a 401 included,
+// is something else or a registry not serving.
 func registryAnswered(url string, code int, status string) error {
-	if code != http.StatusOK && code != http.StatusUnauthorized {
+	if code != http.StatusOK {
 		return fmt.Errorf("GET %s: %s", url, status)
 	}
 	return nil
