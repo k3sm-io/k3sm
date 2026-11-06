@@ -91,6 +91,7 @@ type rig struct {
 
 	mu     sync.Mutex
 	events []string // "cordon w1", "handover w1", "uncordon w1"
+	bell   bell     // rung on every appended event
 
 	// failNodes report Failed with this message instead of Done.
 	failNodes map[string]string
@@ -119,6 +120,7 @@ func newRig(t *testing.T, nodes ...*corev1.Node) *rig {
 	}
 	r := &rig{
 		t:         t,
+		bell:      newBell(),
 		cs:        fake.NewSimpleClientset(objs...),
 		resolver:  &fakeResolver{},
 		now:       rigStart,
@@ -154,6 +156,7 @@ func newRig(t *testing.T, nodes ...*corev1.Node) *rig {
 		case body.Metadata.Annotations[updatesv1alpha1.AnnotationUpdateVersion] != nil:
 			r.events = append(r.events, "handover "+p.GetName())
 		}
+		r.bell.ring()
 		return false, nil, nil // fall through to the tracker
 	})
 	r.cs.PrependReactor("create", "pods", func(a k8stesting.Action) (bool, runtime.Object, error) {
@@ -617,12 +620,13 @@ type crdFake struct {
 	*apiextensionsfake.Clientset
 	mu      sync.Mutex
 	applied []string
+	bell    bell // rung on every applied CRD
 	// unestablished names a CRD whose Established condition never comes.
 	unestablished string
 }
 
 func newCRDFake(answer func(name string, attempt int) error) *crdFake {
-	f := &crdFake{Clientset: apiextensionsfake.NewSimpleClientset()}
+	f := &crdFake{Clientset: apiextensionsfake.NewSimpleClientset(), bell: newBell()}
 	attempts := map[string]int{}
 	f.PrependReactor("patch", "customresourcedefinitions", func(a k8stesting.Action) (bool, runtime.Object, error) {
 		name := a.(k8stesting.PatchAction).GetName()
@@ -634,8 +638,9 @@ func newCRDFake(answer func(name string, attempt int) error) *crdFake {
 			return true, nil, err
 		}
 		f.mu.Lock()
-		defer f.mu.Unlock()
 		f.applied = append(f.applied, name)
+		f.mu.Unlock()
+		f.bell.ring()
 		return true, &apiextensionsv1.CustomResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: name}}, nil
 	})
 	f.PrependReactor("get", "customresourcedefinitions", func(a k8stesting.Action) (bool, runtime.Object, error) {
@@ -654,23 +659,38 @@ func (f *crdFake) appliedNames() []string {
 	return append([]string(nil), f.applied...)
 }
 
-// runUntil runs c until cond holds, failing the test if it does not within the
-// bound, then stops it and waits for Run to return.
-func runUntil(t *testing.T, c *Controller, what string, cond func() bool) {
+// bell wakes a waiter when the state it watches has changed. A ring while the
+// waiter is busy is kept, so a change is never missed.
+type bell chan struct{}
+
+func newBell() bell { return make(bell, 1) }
+
+func (b bell) ring() {
+	select {
+	case b <- struct{}{}:
+	default:
+	}
+}
+
+// runUntil runs c until cond holds, re-checking it each time b rings and failing
+// the test if it does not hold within the bound, then stops c and waits for Run
+// to return.
+func runUntil(t *testing.T, c *Controller, what string, b bell, cond func() bool) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- c.Run(ctx) }()
-	deadline := time.After(20 * time.Second)
+	bound, stop := context.WithTimeout(ctx, 20*time.Second)
+	defer stop()
 	for !cond() {
 		select {
-		case <-deadline:
+		case <-bound.Done():
 			t.Errorf("%s never happened", what)
 			cancel()
 			<-done
 			return
-		case <-time.After(5 * time.Millisecond):
+		case <-b:
 		}
 	}
 	cancel()
@@ -700,7 +720,7 @@ func TestRollsDoNotDependOnTheUpdatePolicyCRD(t *testing.T) {
 			return nil
 		})
 		c.cfg.CRD = f
-		runUntil(t, c, "the roll's first cordon", rolled(r))
+		runUntil(t, c, "the roll's first cordon", r.bell, rolled(r))
 		if got := f.appliedNames(); !slices.Equal(got, []string{updateCRDName}) {
 			t.Errorf("applied %v", got)
 		}
@@ -713,7 +733,7 @@ func TestRollsDoNotDependOnTheUpdatePolicyCRD(t *testing.T) {
 		f := newCRDFake(func(string, int) error { return nil })
 		f.unestablished = crdconfig.UpdatePolicyCRDName
 		c.cfg.CRD = f
-		runUntil(t, c, "the roll's first cordon", rolled(r))
+		runUntil(t, c, "the roll's first cordon", r.bell, rolled(r))
 	})
 
 	t.Run("a refused CRD is retried until it takes, and says so", func(t *testing.T) {
@@ -730,7 +750,7 @@ func TestRollsDoNotDependOnTheUpdatePolicyCRD(t *testing.T) {
 			return nil
 		})
 		c.cfg.CRD = f
-		runUntil(t, c, "the UpdatePolicy CRD applying", func() bool {
+		runUntil(t, c, "the UpdatePolicy CRD applying", f.bell, func() bool {
 			return slices.Contains(f.appliedNames(), crdconfig.UpdatePolicyCRDName)
 		})
 		logMu.Lock()
@@ -750,7 +770,7 @@ func TestRollsDoNotDependOnTheUpdatePolicyCRD(t *testing.T) {
 			return nil
 		})
 		c.cfg.CRD = f
-		runUntil(t, c, "the UpdatePolicy CRD applying", func() bool {
+		runUntil(t, c, "the UpdatePolicy CRD applying", f.bell, func() bool {
 			return slices.Contains(f.appliedNames(), crdconfig.UpdatePolicyCRDName)
 		})
 		leases, err := r.cs.CoordinationV1().Leases(LeaseNamespace).List(context.Background(), metav1.ListOptions{})
