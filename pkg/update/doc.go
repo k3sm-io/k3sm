@@ -70,6 +70,14 @@ limitations under the License.
 // update abort` as the recovery, and the download directory stays for diagnosis
 // until the next attempt or the next start removes it. Nothing downloaded is opened or run by this package.
 //
+// A phase write lost to the apiserver, as a server restart loses one, is tried
+// again on a bounded backoff while the attempt holds its place, so a roll goes
+// on without fetching or installing anything twice. A write that uses its whole
+// budget leaves the last phase on the Node and the Watcher looks again every few
+// seconds: an attempt that never reached the root helper starts over, and a
+// Failed verdict is written once the apiserver takes it. If no write ever lands
+// the root helper is not called, and the controller's node timeout ends the roll.
+//
 // The phase annotation reads "<phase>" or "<phase>: <message>", the message
 // at most MaxMessageBytes with control characters removed.
 package update
