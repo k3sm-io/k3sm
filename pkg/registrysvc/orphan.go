@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"slices"
 	"syscall"
 	"time"
@@ -73,6 +74,19 @@ func (s *Service) isOrphanedChild(p procEntry) bool {
 	return p.ppid == launchdPID && p.uid == s.geteuid() &&
 		(slices.Equal(p.argv, s.childArgv()) || slices.Equal(p.argv, s.legacyChildArgv()))
 }
+
+// The zot child an earlier release staged. Nothing here builds, stages or runs
+// one; these name the leftover the reclaim below, the executor's reap tier and the
+// install's cleanup recognise for the one release that moves off it.
+const (
+	// ZotBinaryName is that binary's basename in a work dir bin or a payload.
+	ZotBinaryName = "zot"
+	// ZotMarkerName is the basename of the version marker beside it.
+	ZotMarkerName = "zot.version"
+)
+
+// ZotPath names that binary in a bin dir.
+func ZotPath(bd string) string { return filepath.Join(bd, ZotBinaryName) }
 
 // legacyChildArgv is the argv the previous release spawned its zot child with.
 func (s *Service) legacyChildArgv() []string {

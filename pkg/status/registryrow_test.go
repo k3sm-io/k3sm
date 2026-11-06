@@ -83,7 +83,7 @@ func TestIngestRegistryRow(t *testing.T) {
 		{
 			name: "disabled warns with the reason", role: dataroot.RoleServer,
 			state: record(registrysvc.State{State: registrysvc.StateDisabled,
-				Reason: "bring up the ingest registry on 127.0.0.1:5000 after 3 attempts: registry port already held\nzot log tail"}),
+				Reason: "bring up the ingest registry on 127.0.0.1:5000 after 3 attempts: registry port already held\nregistry log tail"}),
 			probe:   answers,
 			wantRow: true, wantState: StateDisabled, wantSev: SeverityWarn,
 			wantDetail: []string{"after 3 attempts: registry port already held"}, wantRemedy: true,

@@ -125,7 +125,8 @@ func newGate(cfg gateConfig) *gate {
 }
 
 // rewrite points the outbound request at the loopback registry. Every client
-// credential is dropped, and so is zot's UI session header, so a forwarded
+// credential is dropped, and so is the legacy zot UI session header, kept for the
+// one release a reclaimed zot child may still answer, so a forwarded
 // request authenticates as exactly what the gate decided: nothing for a read,
 // the gate's credential for an authorized write. The path and query are left
 // as the handler set them, and the Host header as the client sent it.

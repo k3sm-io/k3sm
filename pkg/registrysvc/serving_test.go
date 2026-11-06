@@ -177,7 +177,7 @@ func TestRelayServesTLSOnly(t *testing.T) {
 	}
 	var upstreamHits int
 	var hmu sync.Mutex
-	upstream := &fakeZot{h: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	upstream := &fakeRegistry{h: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		hmu.Lock()
 		upstreamHits++
 		hmu.Unlock()
@@ -196,7 +196,7 @@ func TestRelayServesTLSOnly(t *testing.T) {
 	}
 	// The registry is the in-process fake: the gate's upstream round trip is
 	// answered without a socket.
-	r.handler = newGate(gateConfig{Upstream: fakeZotHost, Transport: upstream, Logger: quietLogger()})
+	r.handler = newGate(gateConfig{Upstream: fakeRegistryHost, Transport: upstream, Logger: quietLogger()})
 	done := make(chan struct{})
 	ctx, cancel := context.WithCancel(t.Context())
 	go func() { defer close(done); r.Run(ctx) }()

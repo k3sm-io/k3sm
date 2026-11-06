@@ -172,7 +172,9 @@ func VerifyPayloadSet(dir string) error {
 	// digest-verified and signed, and it is what lets the workdir seed replace a stale
 	// set. Allowed, not required, for the same back-compat reason.
 	allowed[KubeMarkerName] = true
-	// zot's version marker rides beside the registry binary on kine's terms.
+	// An archive an earlier release packed may still carry the zot child and its
+	// marker. Tolerated, not required, for the one release that moves off zot.
+	allowed[registrysvc.ZotBinaryName] = true
 	allowed[registrysvc.ZotMarkerName] = true
 	// helm's version marker rides beside the helm binary on the same terms.
 	allowed[helmchart.HelmMarkerName] = true

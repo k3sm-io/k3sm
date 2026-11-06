@@ -494,7 +494,7 @@ func TestBinaryStagingNeverRewritesALiveInode(t *testing.T) {
 func TestReapStagingTemps(t *testing.T) {
 	bd := t.TempDir()
 	orphans := []string{".kube-apiserver.tmp-123", ".kine.tmp-9", "." + binsign.HealMarkerName + ".tmp-77"}
-	keep := []string{"kube-apiserver", ".zot.tmp-5", ".kube-apiserver.tmp-x", KubeMarkerName}
+	keep := []string{"kube-apiserver", ".unrelated.tmp-5", ".kube-apiserver.tmp-x", KubeMarkerName}
 	for _, n := range append(append([]string{}, orphans...), keep...) {
 		writeBin(t, filepath.Join(bd, n), n)
 	}

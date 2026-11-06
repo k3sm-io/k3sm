@@ -43,7 +43,7 @@ const pushUser = "k3sm"
 const gateUser = "k3sm-gate"
 
 // pushSecretBytes is the entropy behind the generated password. 32 bytes of
-// crypto/rand is far past any brute-force reachable through zot's authentication
+// crypto/rand is far past any brute-force reachable through the registry's authentication
 // path, which is rate-limited by a fail delay and by bcrypt's own cost.
 const pushSecretBytes = 32
 
@@ -70,10 +70,11 @@ type Credential struct {
 // StateDir returns the registry state root for a control-plane work dir.
 func StateDir(workDir string) string { return filepath.Join(workDir, "registry") }
 
-// ConfigPath returns the rendered zot config path for a work dir.
+// ConfigPath returns the config path an earlier release gave its registry child,
+// which the orphan reclaim still matches, for a work dir.
 func ConfigPath(workDir string) string { return filepath.Join(StateDir(workDir), "config.json") }
 
-// HTPasswdPath returns the bcrypt credential file zot authenticates against.
+// HTPasswdPath returns the bcrypt credential file the registry authenticates against.
 func HTPasswdPath(workDir string) string { return filepath.Join(StateDir(workDir), "htpasswd") }
 
 // CredentialPath returns the plaintext push credential for a work dir —
@@ -118,9 +119,8 @@ func generateCredentialFor(addr, user string) (Credential, error) {
 	}, nil
 }
 
-// htpasswdLine renders the bcrypt htpasswd entry zot loads. zot accepts $2a/$2b/
-// $2y bcrypt and $5$/$6$ SHA-crypt; bcrypt is what x/crypto can produce without a
-// C library, so it is what k3sm writes.
+// htpasswdLine renders the bcrypt htpasswd entry the registry loads. bcrypt is what
+// x/crypto can produce without a C library, so it is what k3sm writes.
 func htpasswdLine(c Credential) (string, error) {
 	hash, err := bcrypt.GenerateFromPassword([]byte(c.Password), bcrypt.DefaultCost)
 	if err != nil {
@@ -130,7 +130,7 @@ func htpasswdLine(c Credential) (string, error) {
 }
 
 // WriteCredential writes both halves of the credential for workDir: the bcrypt
-// htpasswd file zot authenticates against, and the plaintext file `k3sm image
+// htpasswd file the registry authenticates against, and the plaintext file `k3sm image
 // push` reads. Both are 0600. Each of extra adds its bcrypt line to the
 // htpasswd file and nothing else: an extra credential's plaintext stays with
 // its caller.

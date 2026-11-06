@@ -62,7 +62,7 @@ import (
 // Either way the connection is HTTPS, verified against the cluster CA from the
 // kubeconfig with the name registry-k3sm, which both gates' certificates carry.
 // The registry's per-boot credential is not used: it stays the gate's own
-// upstream credential to zot.
+// upstream credential to the registry.
 
 // defaultGatePort is the loopback gate's port on a server started with the
 // default --registry-port.

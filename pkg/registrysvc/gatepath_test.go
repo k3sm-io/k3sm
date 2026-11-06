@@ -81,7 +81,7 @@ func classifyCorpus() []classifyCase {
 		{"POST", "/v2/a/blobs/uploads/x", "", opRefused, "", "", ""},
 		{"POST", "/v2/blobs/uploads/", "", opRefused, "", "", ""},
 		{"POST", "/v3/a/blobs/uploads/", "", opRefused, "", "", ""},
-		{"POST", "/v2/_zot/ext/mgmt", "", opRefused, "", "", ""},
+		{"POST", "/v2/_oci/ext/mgmt", "", opRefused, "", "", ""},
 		{"PATCH", "/v2/a/blobs/uploads/u-1", "", opUploadChunk, "a", "", ""},
 		{"PATCH", "/v2/a/blobs/uploads/U-1", "", opInvalid, "", "", ""},
 		{"PATCH", "/v2/a/manifests/v1", "", opRefused, "", "", ""},

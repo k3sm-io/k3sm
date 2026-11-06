@@ -43,7 +43,7 @@ import (
 // and the image bytes alike are encrypted on every hop a caller can see, whether
 // it arrived over the mesh, over a vm guest's NAT segment or through a Service
 // VIP. A plain-HTTP request to a relay address is answered with 400 and never
-// reaches the gate. zot behind it stays plain HTTP on loopback.
+// reaches the gate. The registry behind it stays plain HTTP on loopback.
 //
 // WHY A RELAY AND NOT A SECOND BIND. The ingest registry binds 127.0.0.1 and New
 // refuses anything else, because that single fact is what makes anonymous pull

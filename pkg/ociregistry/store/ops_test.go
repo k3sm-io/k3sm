@@ -192,7 +192,7 @@ func TestDeleteRows(t *testing.T) {
 
 // TestDeleteTagKeepsTheDigestAddressable pins the row a tag delete leaves: the
 // digest's last tag becomes an untagged row, with the row's other fields and
-// annotations, at the end of the index as zot writes it, and a digest with
+// annotations, at the end of the index as the on-disk layout orders it, and a digest with
 // another row loses only the tag's.
 func TestDeleteTagKeepsTheDigestAddressable(t *testing.T) {
 	const mt = "application/vnd.oci.image.manifest.v1+json"

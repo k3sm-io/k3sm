@@ -2,7 +2,7 @@
 #
 # gochild.sh: the toolchain pin and the build checks for every binary k3sm builds
 # from a pinned Go module OUTSIDE its own go.mod. Sourced, never run. Its callers
-# are hack/release/stage.sh (kine, etcd, etcdutl, zot and helm, which `k3sm payload`
+# are hack/release/stage.sh (kine, etcd, etcdutl and helm, which `k3sm payload`
 # builds), hack/release/build-cp.sh (the control-plane binaries, which take
 # PAYLOAD_GO_VERSION from here) and hack/images/metrics-server/build.sh (the native
 # metrics-server image). One home, so a recipe cannot drift from the payload's discipline:
@@ -11,7 +11,7 @@
 #   toolchain_problems   the go on PATH, under GOTOOLCHAIN=local, is that release
 #   buildinfo_problems   the build info Go records in the binary names the pinned
 #                        toolchain, main package, module version, no replace,
-#                        the pinned build settings, and (kine, zot) the raised
+#                        the pinned build settings, and (kine) the raised
 #                        golang.org/x/net at XNET_FLOOR or newer
 #   buildinfo_settings   the `build` lines, as one line, for a record
 #   marker_problems      the version marker beside a binary names its pin
@@ -36,10 +36,10 @@ toolchain_problems() {
 	[ "$got" = "$want" ] || { echo "the go on PATH is $got; k3sm's out-of-module builds pin $want (PAYLOAD_GO_VERSION): put $want first on PATH"; return 1; }
 }
 
-# XNET_FLOOR is the lowest golang.org/x/net a staged kine or zot may link: the
-# version both are built against (internal/childreq XNetVersion). The caller sets
+# XNET_FLOOR is the lowest golang.org/x/net a staged kine may link: the
+# version it is built against (internal/childreq XNetVersion). The caller sets
 # it from that source after sourcing this file; an unset floor is itself a
-# problem for kine and zot. It starts empty, never from the environment, so an
+# problem for kine. It starts empty, never from the environment, so an
 # ambient XNET_FLOOR cannot lower the floor a caller forgot to set.
 XNET_FLOOR=""
 
@@ -58,10 +58,10 @@ release_less() {
 # buildinfo_problems <kind> <want-version> <go-pin>  (stdin: `go version -m` text)
 # The build stamp of one out-of-module binary, from the build info Go records in
 # it (read, never executed): the toolchain, the main package, the pinned module
-# version (etcd: the server module; etcdutl, zot and metrics-server: their own;
+# version (etcd: the server module; etcdutl and metrics-server: their own;
 # kine: built from patched source, so its version is the marker's and the
 # stamped string's), no replaced module, the build settings: CGO_ENABLED=0,
-# darwin/arm64 and -trimpath, and for kine and zot the raised golang.org/x/net,
+# darwin/arm64 and -trimpath, and for kine the raised golang.org/x/net,
 # at XNET_FLOOR or newer. Prints one line per problem; returns 0 only when there
 # are none.
 buildinfo_problems() {
@@ -71,7 +71,6 @@ buildinfo_problems() {
 	kine) path="github.com/k3s-io/kine"; mod="" ;;
 	etcd) path="k3sm.io/etcd-child"; mod="go.etcd.io/etcd/server/v3" ;;
 	etcdutl) path="go.etcd.io/etcd/etcdutl/v3"; mod="go.etcd.io/etcd/etcdutl/v3" ;;
-	zot) path="zotregistry.dev/zot/v2/cmd/zot"; mod="zotregistry.dev/zot/v2" ;;
 	metrics-server) path="sigs.k8s.io/metrics-server/cmd/metrics-server"; mod="sigs.k8s.io/metrics-server" ;;
 	*) echo "unknown child $kind"; return 1 ;;
 	esac
@@ -86,7 +85,7 @@ buildinfo_problems() {
 	# Every child, kine included (it names no module version to check).
 	grep -Eq "^[[:space:]]*=>" <<<"$text" && problem "a module is replaced"
 	case "$kind" in
-	kine | zot)
+	kine)
 		xnet="$(awk '$1 == "dep" && $2 == "golang.org/x/net" { print $3; exit }' <<<"$text")"
 		if [ -z "$XNET_FLOOR" ]; then
 			problem "no golang.org/x/net floor is set (XNET_FLOOR)"

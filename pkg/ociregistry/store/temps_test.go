@@ -34,7 +34,8 @@ import (
 )
 
 // wantOnlyDigests fails unless every name in the directory of blob path p is a
-// digest. zot's GC reads every name there and fails on one that is not.
+// digest. A registry GC over the on-disk layout reads every name there and
+// fails on one that is not.
 func wantOnlyDigests(t *testing.T, p string) {
 	t.Helper()
 	ents, err := os.ReadDir(filepath.Dir(p))

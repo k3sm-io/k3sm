@@ -59,7 +59,7 @@ const (
 
 // MaxConcurrentReads is how many requests a caller should keep in flight to
 // one registry, and how many idle connections the client keeps for it. The
-// cluster registry is a local zot behind a TLS relay: each request is a short
+// cluster registry is local, behind a TLS relay: each request is a short
 // round trip, so a listing is bound by latency, not by the registry's work,
 // and 16 in flight hides that latency without queueing the relay.
 const MaxConcurrentReads = 16

@@ -47,7 +47,7 @@ const (
 	// path): 400, never forwarded.
 	opInvalid gateOp = iota
 	// opRefused is a method or write shape the gate never forwards, DELETE and
-	// zot's extension endpoints among them: 405.
+	// extension endpoints among them: 405.
 	opRefused
 	// opRead is an anonymous read (GET or HEAD off an upload path), forwarded
 	// as received with no credential.

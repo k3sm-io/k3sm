@@ -144,6 +144,10 @@ pin, its date, and the tarball's sha256.
 
 ### Changed
 
+- The cluster registry no longer runs or ships a zot child. It is k3sm's own, served by the `k3sm` binary
+  itself, so a release payload and `k3sm payload` carry no `zot` or `zot.version`, and a build from
+  source no longer fetches zot's modules. An install still removes a `zot` an earlier release left in
+  the work dir, and images already in the store keep serving.
 - A node refuses a GPU pod with a `FailedGPUFit` Event when the units held under `mlx.k3sm.io/gpu` and
   `k3sm.io/gpu` together, plus the pod's own, pass the node's GPU slot count. This now holds for pods that
   name only `mlx.k3sm.io/gpu`, and on a node whose GPU memory ceiling is unknown: a pod bound past the
