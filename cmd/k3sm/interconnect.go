@@ -147,8 +147,10 @@ func startInterconnectResolver(ctx context.Context, plan serverPlan, restCfg *re
 		// The interconnect-using MLXModels, read with the same admin client the
 		// MLX operator uses; the desired annotation carries their references.
 		MLXModels: interconnect.MLXModelLister(dyn),
-		Metrics:   plan.interconnectMetrics,
-		Log:       logger,
+		// A change to any MLXModel brings the next reconcile forward.
+		MLXModelWatch: dyn,
+		Metrics:       plan.interconnectMetrics,
+		Log:           logger,
 	})
 	rCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
