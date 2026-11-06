@@ -94,6 +94,7 @@ IC_REMOTE_DIR="/tmp/k3sm-m17-lab"
 NS="k3sm-m17-lab"
 IC_NAME="thunderbolt"
 NETD_SOCK="/var/lib/k3sm/run/netd.sock"
+SERVICE_USER="_k3sm"
 NETD_LEDGER="/var/lib/k3sm/keys/interconnect-aliases"
 NODE_KUBECONFIG="/var/lib/k3sm/agent/node.kubeconfig"
 K3SM_BIN="/usr/local/bin/k3sm"
@@ -128,7 +129,7 @@ prereq_what() {
 	crd) echo "the net.k3sm.io Interconnect CRD is not served (BI6)" ;;
 	verbs) echo "k3sm interconnect enable/disable are not in the installed binary (BI6)" ;;
 	doctor) echo "k3sm doctor has no ic-* rows (BI9)" ;;
-	netd) echo "the netd helper does not report MinorInterconnect >= 2 on both Macs (BI3)" ;;
+	netd) echo "a netd helper confirmed at MinorInterconnect >= 2 on both Macs (BI3)" ;;
 	attach) echo "the provider has no k3sm.io/InterconnectAttached condition (BI7)" ;;
 	mlxhosts) echo "the binary does not render K3SM_MLX_HOSTS (BI8)" ;;
 	nodirectlink) echo "a DirectLink CRD is still served (BI5/BI11)" ;;
@@ -247,16 +248,28 @@ halves_empty_on() {
 	on "$1" "ifconfig bridge0" >"$RUNG_DIR/.he-$1.txt" 2>&1
 	icp_halves_empty "$RUNG_DIR/.he-$1.txt"
 }
-# netd_hello <side> — the helper's reply to a Hello, as root, into RUNG_DIR.
+# netd_hello <side> — the helper's reply to a Hello, sent as the service user,
+# into RUNG_DIR.
 netd_hello() {
 	# The frame is icp_netd_hello_frame's (darwin-net pkg/netd/wire/protocol.go
 	# ReadFrame: a 4-byte big-endian length, then JSON; minor 2 is the wire
 	# package's MinorInterconnect), pinned by the self-test. It is deliberately
 	# not the k3sm client: the probe must not trust the code under test.
-	priv "$1" netd-hello SOCK="$NETD_SOCK" FRAME="$(icp_netd_hello_frame)" <<'EOF'
-python3 -I - "$SOCK" "$FRAME" <<'PY'
-import socket, struct, sys
+	#
+	# No k3sm surface prints the helper's minor: doctor's ic-netd only dials the
+	# socket and closes it (cmd/k3sm/doctorinterconnectprobe.go dialNetd), and the
+	# peer check runs after the accept, so that row reads ok for any uid. The one
+	# product read is the node's own Hello on its service-uid connection, so this
+	# probe stands where the node stands: root drops to the service user before it
+	# connects, because the helper closes any other uid unanswered, root included.
+	priv "$1" netd-hello SOCK="$NETD_SOCK" FRAME="$(icp_netd_hello_frame)" SVC_USER="$SERVICE_USER" <<'EOF'
+python3 -I - "$SOCK" "$FRAME" "$SVC_USER" <<'PY'
+import os, pwd, socket, struct, sys
 try:
+    pw = pwd.getpwnam(sys.argv[3])
+    os.setgroups([])
+    os.setgid(pw.pw_gid)
+    os.setuid(pw.pw_uid)
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(5)
     s.connect(sys.argv[1])
@@ -280,6 +293,22 @@ except Exception as e:
 PY
 EOF
 	cp "$PAYLOAD_LOG" "$RUNG_DIR/netd-hello-$1.json"
+}
+# helper_version <Hello reply file> — "<major>.<minor>", or nothing without a version.
+helper_version() {
+	local major minor
+	major="$(grep -o '"major":[0-9]*' "$1" 2>/dev/null | sed -n 1p | cut -d: -f2)"
+	minor="$(grep -o '"minor":[0-9]*' "$1" 2>/dev/null | sed -n 1p | cut -d: -f2)"
+	[ -n "$major" ] && [ -n "$minor" ] && echo "$major.$minor"
+}
+# netd_probe_detail <side> <Hello reply file> — what the probe learned, in words:
+# a reply with no version is "cannot read" and says nothing about the helper's age.
+netd_probe_detail() {
+	case "$(icp_helper_verdict "$2")" in
+	minor2) echo "the $1 Mac's helper speaks $(helper_version "$2")" ;;
+	HelperTooOld) echo "TOO OLD: the $1 Mac's helper speaks $(helper_version "$2"), below minor 2 (a HelperTooOld is a refusal, never a pass)" ;;
+	*) echo "CANNOT READ: no version from the $1 Mac's helper as $SERVICE_USER, which says nothing about its age; netd logs a rejected peer in /var/log/k3sm/netd.log: $(head -c 200 "$2" | tr '\n' ' ')" ;;
+	esac
 }
 read_ledger() {
 	priv "$1" ledger LEDGER="$NETD_LEDGER" <<'EOF'
@@ -1026,9 +1055,9 @@ assert_r9_downgrade() {
 	netd_hello "$first"
 	v="$(icp_helper_verdict "$RUNG_DIR/netd-hello-$first.json")"
 	case "$v" in
-	HelperTooOld) pass "mixed leg: the downgraded helper answers a minor-2 Hello as HelperTooOld, not an error" ;;
+	HelperTooOld) pass "mixed leg: the downgraded helper answers a minor-2 Hello as HelperTooOld, not an error ($(netd_probe_detail "$first" "$RUNG_DIR/netd-hello-$first.json"))" ;;
 	minor2) rec "mixed leg: the previous helper already speaks minor 2, so HelperTooOld is not exercised by this binary pair" ;;
-	*) fail "mixed leg: the downgraded helper's reply is an error, not HelperTooOld ($(head -c 200 "$RUNG_DIR/netd-hello-$first.json"))" ;;
+	*) fail "mixed leg: not a HelperTooOld verdict ($(netd_probe_detail "$first" "$RUNG_DIR/netd-hello-$first.json"))" ;;
 	esac
 	reinstall "$second" "$prev" prev || fail "the previous binary did not install cleanly on the $second Mac, or the nodes did not return Ready"
 	for s in local peer; do
@@ -1144,6 +1173,26 @@ runlog_missing_refuses() {
 		echo "the evidence directory was created"
 		return 1
 	}
+}
+
+# st_hello_payload — the composed netd_hello payload, with nothing executed.
+st_hello_payload() {
+	local d
+	d="$(mktemp -d -t m17-hello.XXXXXX)"
+	EVIDENCE_DIR="$d" RUNG_DIR="$d"
+	payload_exec() { :; }
+	netd_hello local >/dev/null 2>&1
+	cat "$PAYLOAD_PATH"
+	rm -rf "$d"
+}
+# hello_drops_before_connect — the probe sheds root before it reaches the socket;
+# the helper closes a root peer unanswered, which is the failure this pins.
+hello_drops_before_connect() {
+	local out u c
+	out="$(st_hello_payload)"
+	u="$(grep -n 'os.setuid(pw.pw_uid)' <<<"$out" | cut -d: -f1)"
+	c="$(grep -n 's.connect(' <<<"$out" | cut -d: -f1)"
+	[ -n "$u" ] && [ -n "$c" ] && [ "$u" -lt "$c" ] && grep -qF "SVC_USER=$SERVICE_USER" <<<"$out"
 }
 
 # st_driver_run <rung> <profile> — the body st_driver runs in a subshell: the
@@ -1295,6 +1344,14 @@ self_test_body() {
 	st_eq "helper: minor 2" "$(icp_helper_verdict "$F/hello-minor2.json")" minor2
 	st_eq "helper red: an old helper is HelperTooOld" "$(icp_helper_verdict "$F/hello-minor1.json")" HelperTooOld
 	st_eq "helper red: no reply is an error" "$(icp_helper_verdict "$F/hello-error.txt")" error
+	st_eq "helper red: a peer the helper closed is an error, not too old" "$(icp_helper_verdict "$F/hello-rejected.txt")" error
+	st_eq "helper version of a current reply" "$(helper_version "$F/hello-minor2.json")" 1.2
+	st_eq "helper version of a closed connection is empty" "$(helper_version "$F/hello-rejected.txt")" ""
+	st_out "helper detail: the minor it speaks" "helper speaks 1.2" netd_probe_detail local "$F/hello-minor2.json"
+	st_out "helper detail red: too old names the real minor" "TOO OLD: the local Mac's helper speaks 1.1" netd_probe_detail local "$F/hello-minor1.json"
+	st_out "helper detail red: a closed connection is cannot read" "CANNOT READ" netd_probe_detail peer "$F/hello-rejected.txt"
+	st_eq "helper detail red: a closed connection never says too old" "$(netd_probe_detail peer "$F/hello-rejected.txt" | grep -c 'TOO OLD')" 0
+	st "the Hello payload drops to the service user before it connects" 0 hello_drops_before_connect
 	st "ledger: no aliases" 0 icp_ledger_empty "$F/ledger-empty.json"
 	st "ledger: absent" 0 icp_ledger_empty "$F/no-such-ledger.json"
 	st "ledger red: one alias" 1 icp_ledger_empty "$F/ledger-one.json"
@@ -1562,7 +1619,8 @@ for side in local peer; do
 		esac
 	done
 	netd_hello "$side"
-	v="$(icp_helper_verdict "$BASE_DIR/netd-hello-$side.json")" || probe_miss netd preflight "the $side Mac's helper answers '$v' (a HelperTooOld is a refusal, never a pass)"
+	icp_helper_verdict "$BASE_DIR/netd-hello-$side.json" >/dev/null || probe_miss netd preflight "$(netd_probe_detail "$side" "$BASE_DIR/netd-hello-$side.json")"
+	echo "      [$side] $(netd_probe_detail "$side" "$BASE_DIR/netd-hello-$side.json")"
 done
 # Node names: by mesh address unless named.
 mesh_node() { kc get meshpeers.net.k3sm.io -o jsonpath='{range .items[*]}{.metadata.name} {.spec.meshIP}{"\n"}{end}' 2>/dev/null | awk -v ip="$1" '$2==ip{print $1; exit}'; }
