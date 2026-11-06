@@ -417,14 +417,14 @@ Push the layout with the registry token from the environment, as your own user:
 
 ```sh
 K3SM_REGISTRY_TOKEN=<ghcr-token> \
-  k3sm image push ~/.cache/k3sm/mlx-serve/oci ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.3
+  k3sm image push ~/.cache/k3sm/mlx-serve/oci ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.5
 ```
 
 The credential is read from the environment or the docker config chain — never
 from argv — and is not stored. `push` prints the digest and the pin:
 
 ```
-pushed ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.3
+pushed ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.5
   digest: sha256:…
   pin:    ghcr.io/k3sm-io/mlx-serve@sha256:…
 ```

@@ -145,6 +145,8 @@ pin, its date, and the tarball's sha256.
   it runs from cannot be read, the message now says what to check: that the directory and each of its parents are owned by
   root and not writable by group or others (an I/O error means the disk needs checking), and how
   to stop the helper's process group by hand if it is still the helper.
+- The default mlx-serve image is now `0.5.0-k3sm.5`. The example `MLXModel` and the spike scripts pin
+  its digest.
 - The `mlx-serve` image's `mlx-lm` moves from 0.32.0 to 0.32.2. The next image tag carries it; no other package in the closure moves. Sharded ranks refuse chat requests whose images are not inline `data:` URLs, since mlx-lm 0.32.2 would otherwise fetch any `http(s)` image URL a client names.
 - The embedded runtime takes an exclusive lock on its root (`runtimed.lock`). A second runtime
   started on a root already in use waits up to 15 seconds for the lock and is then refused,
