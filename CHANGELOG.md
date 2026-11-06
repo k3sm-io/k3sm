@@ -145,6 +145,9 @@ pin, its date, and the tarball's sha256.
   it runs from cannot be read, the message now says what to check: that the directory and each of its parents are owned by
   root and not writable by group or others (an I/O error means the disk needs checking), and how
   to stop the helper's process group by hand if it is still the helper.
+- The default mlx-serve image is now `0.5.0-k3sm.5`. The example `MLXModel` and the spike scripts pin
+  its digest. A sharded `MLXModel` pod now checks at start that the engine's run body matches its pin,
+  and the entrypoint exits with the engine's status.
 - The `mlx-serve` image's `mlx-lm` moves from 0.32.0 to 0.32.2. The next image tag carries it; no other package in the closure moves. Sharded ranks refuse chat requests whose images are not inline `data:` URLs, since mlx-lm 0.32.2 would otherwise fetch any `http(s)` image URL a client names.
 - The embedded runtime takes an exclusive lock on its root (`runtimed.lock`). A second runtime
   started on a root already in use waits up to 15 seconds for the lock and is then refused,
@@ -300,6 +303,18 @@ pin, its date, and the tarball's sha256.
   writer is not running (before it starts, after it stops, or once it has exited): the kill
   intent is written at once. A symlink or a FIFO at the budget history path in the node's work
   dir is refused as unreadable and moved aside, never read through or waited on.
+- A sharded MLXModel whose ranks mount a cache now starts. Each rank Pod was bound to its node
+  directly, so the scheduler never saw it and its cache claim, which waits for the first consumer,
+  was never bound; the ranks sat in `ContainerCreating`. Ranks are now pinned to their placed node
+  with a required node affinity on `kubernetes.io/hostname`, and the scheduler binds the claim there.
+  A sharded model already stuck waiting on its cache before the upgrade is not replaced on its own;
+  delete its rank Pods once with `kubectl delete pod -n <namespace> -l app.kubernetes.io/instance=<model>,k3sm.io/mlx-rank`
+  (or delete the model) and the operator recreates them through the scheduler.
+- A sharded MLXModel with a pinned `revision` now downloads that revision. Each rank fetches it
+  into its own cache volume before the engine starts, as a single-node model does; before, the
+  ranks started on empty caches and rank 0 exited on the missing snapshot path. The fetch is in
+  the `mlx-serve` image's sharded entrypoint, so it needs an image built from this source: an
+  already published tag does not have it.
 - A k3sm.app update that finds the installed `k3sm` link broken (pointing at a version
   directory that is gone, or out of `/Library/k3sm`) is still refused, and the refusal now says
   how to repair the install: re-run the install script, `curl -fsSL https://k3sm.io/install.sh | sh`,

@@ -146,8 +146,8 @@ func TestRenderShardedContract(t *testing.T) {
 		if pod.Spec.Subdomain != HeadlessServiceName(m.Name) {
 			t.Errorf("rank %d subdomain = %q, want the headless Service %q", i, pod.Spec.Subdomain, HeadlessServiceName(m.Name))
 		}
-		if pod.Spec.NodeName != jacclPlacement().Ranks[i].Node {
-			t.Errorf("rank %d nodeName = %q, want %q", i, pod.Spec.NodeName, jacclPlacement().Ranks[i].Node)
+		if got := RankPodNode(pod); got != jacclPlacement().Ranks[i].Node {
+			t.Errorf("rank %d placed node = %q, want %q", i, got, jacclPlacement().Ranks[i].Node)
 		}
 		if len(pod.OwnerReferences) != 1 || pod.OwnerReferences[0].UID != m.UID || !ptr.Deref(pod.OwnerReferences[0].Controller, false) {
 			t.Errorf("rank %d ownerReferences = %v, want one controller reference to the model", i, pod.OwnerReferences)
@@ -308,5 +308,73 @@ func TestSpecHashSurvivesTheInterconnectDefault(t *testing.T) {
 		if got, _ := SpecHash(m, testOptions()); got == preField {
 			t.Errorf("SpecHash(interconnect=%q) did not move; an explicit path request must re-render", path)
 		}
+	}
+}
+
+// TestShardedRankPodsScheduleThroughAffinity: a rank Pod is placed through the
+// scheduler, never bound by spec.nodeName, because a nodeName Pod leaves its
+// WaitForFirstConsumer cache claim unprovisioned forever. Each rank carries
+// exactly one required hostname term naming its placed node, and mounts the
+// cache claim rendered for that node.
+func TestShardedRankPodsScheduleThroughAffinity(t *testing.T) {
+	cases := []struct {
+		name      string
+		model     *mlxv1alpha1.MLXModel
+		placement Placement
+	}{
+		{"ring-2", shardedModel(2, mlxv1alpha1.MLXDistributedBackendRing, mlxv1alpha1.MLXParallelismPipeline), ringPlacement()},
+		{"jaccl-3", shardedModel(3, mlxv1alpha1.MLXDistributedBackendJACCL, mlxv1alpha1.MLXParallelismTensor), jacclPlacement()},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			objs, err := RenderSharded(tc.model, testOptions(), tc.placement)
+			if err != nil {
+				t.Fatalf("RenderSharded() error = %v", err)
+			}
+			if len(objs.Pods) != len(tc.placement.Ranks) || len(objs.Claims) != len(tc.placement.Ranks) {
+				t.Fatalf("rendered %d pods and %d claims, want %d of each", len(objs.Pods), len(objs.Claims), len(tc.placement.Ranks))
+			}
+			claims := map[string]string{}
+			for _, c := range objs.Claims {
+				claims[c.Name] = c.Name
+			}
+			for i, pod := range objs.Pods {
+				node := tc.placement.Ranks[i].Node
+				if pod.Spec.NodeName != "" {
+					t.Errorf("rank %d sets nodeName %q, which bypasses the scheduler", i, pod.Spec.NodeName)
+				}
+				a := pod.Spec.Affinity
+				if a == nil || a.NodeAffinity == nil || a.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+					t.Fatalf("rank %d has no required node affinity", i)
+				}
+				terms := a.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
+				if len(terms) != 1 || len(terms[0].MatchExpressions) != 1 || len(terms[0].MatchFields) != 0 {
+					t.Fatalf("rank %d required terms = %+v, want exactly one hostname expression", i, terms)
+				}
+				e := terms[0].MatchExpressions[0]
+				if e.Key != corev1.LabelHostname || e.Operator != corev1.NodeSelectorOpIn || !reflect.DeepEqual(e.Values, []string{node}) {
+					t.Errorf("rank %d term = %+v, want %s In [%s]", i, e, corev1.LabelHostname, node)
+				}
+				if got := RankPodNode(pod); got != node {
+					t.Errorf("RankPodNode(rank %d) = %q, want %q", i, got, node)
+				}
+				if a.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution != nil || a.PodAffinity != nil || a.PodAntiAffinity != nil {
+					t.Errorf("rank %d carries affinity beyond the hostname term: %+v", i, a)
+				}
+				want := RankCacheClaimName(tc.model.Name, node)
+				if _, ok := claims[want]; !ok {
+					t.Errorf("no cache claim %s rendered for rank %d's node %s", want, i, node)
+				}
+				var mounted []string
+				for _, v := range pod.Spec.Volumes {
+					if v.PersistentVolumeClaim != nil {
+						mounted = append(mounted, v.PersistentVolumeClaim.ClaimName)
+					}
+				}
+				if !reflect.DeepEqual(mounted, []string{want}) {
+					t.Errorf("rank %d mounts claims %v, want [%s] (the claim rendered for its node)", i, mounted, want)
+				}
+			}
+		})
 	}
 }

@@ -141,6 +141,7 @@ snapshot if the volume already holds it, and otherwise exits 2 naming the
 revision; a revision the Hub resolves to another commit (a branch or tag name)
 exits 2 too. A model reference that is not such a path is left to the engine.
 `TestRenderSeedsPinnedRevision` in `pkg/mlx` runs the rendered argv through it.
+A rank of a sharded model runs the same fetch from `k3sm_shard` (see below).
 
 ## The serving port
 
@@ -210,6 +211,17 @@ writable path under the pod's sandbox profile):
 It then runs `mlx_lm.server --host 0.0.0.0 --port <serve port>` in the same
 process, adding `--pipeline` for pipeline parallelism, with its own arguments
 last.
+
+A pinned model's `--model` is its snapshot path in the rank's own cache volume,
+and `mlx_lm.server` only loads that path. So once a rank's plan is made,
+`k3sm_shard` calls the same `seed_pinned_revision` as `k3sm_serve`, with the same
+outcomes, except that a refusal exits 1, not 2, because the operator reads exit 2
+on the thunderbolt path as a refusal to start on the interconnect. The fetch runs
+in the rank's own container, so a rank still downloading is a running Pod with
+no listener, which rank 0's liveness probe passes.
+`TestShardedRanksFetchPinnedSnapshotBeforeEngine` in `pkg/mlx` runs each rank's
+rendered command through it. Each rank downloads on its own, so the ranks can
+finish at different times.
 
 `mlx_lm.server` has no `--served-model-name`, so `k3sm_shard` takes that option
 itself and does not pass it on. Without it a pinned model, whose `--model` is
@@ -299,6 +311,12 @@ verbatim, and the Job. The Job's pod is a native pod that:
   against the sha256 its release publishes, failing closed on a mismatch;
 - runs `build.sh --stage-only`, which is every check and step below up to the
   context ceiling, into the claim.
+
+If a wheel download stays below 1 MB/s for 60 seconds, `build.sh` kills uv and runs
+it again, up to 25 times, because a stalled connection stays stalled while bytes
+keep arriving and a fresh one usually gets the normal rate. Finished wheels stay
+in uv's cache, and uv still checks them against the lockfile's hashes. Running out
+of restarts fails the stage with `uv download stalled`.
 
 It carries **no credential**: no Secret, no service-account token, no pull
 secret. The registry credential never leaves the operator's user on the host.
@@ -399,19 +417,19 @@ Push the layout with the registry token from the environment, as your own user:
 
 ```sh
 K3SM_REGISTRY_TOKEN=<ghcr-token> \
-  k3sm image push ~/.cache/k3sm/mlx-serve/oci ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.3
+  k3sm image push ~/.cache/k3sm/mlx-serve/oci ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.5
 ```
 
 The credential is read from the environment or the docker config chain — never
 from argv — and is not stored. `push` prints the digest and the pin:
 
 ```
-pushed ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.3
+pushed ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.5
   digest: sha256:…
   pin:    ghcr.io/k3sm-io/mlx-serve@sha256:…
 ```
 
-The tag is the engine version, with a `-k3sm.N` suffix when k3sm rebuilds the same engine with changes of its own (the context-length guard is `0.5.0-k3sm.1`; the attention-sink mask fix and the guard on `/v1/messages` and `/v1/responses` are `0.5.0-k3sm.2`; mlx and mlx-metal 0.32.4, staged with uv 0.13.1 on the python-build-standalone 20260929 build of CPython 3.12.14 (was 20260825), and the sharded entrypoint's `--served-model-name` are `0.5.0-k3sm.3`), so a tag never changes what it names.
+The tag is the engine version, with a `-k3sm.N` suffix when k3sm rebuilds the same engine with changes of its own (the context-length guard is `0.5.0-k3sm.1`; the attention-sink mask fix and the guard on `/v1/messages` and `/v1/responses` are `0.5.0-k3sm.2`; mlx and mlx-metal 0.32.4, staged with uv 0.13.1 on the python-build-standalone 20260929 build of CPython 3.12.14 (was 20260825), and the sharded entrypoint's `--served-model-name` are `0.5.0-k3sm.3`; the sharded entrypoint's check that the engine's run body matches its pin at pod start, and its exit with the engine's status, are `0.5.0-k3sm.4`; a sharded rank's fetch of its pinned revision into its cache, and the stage's uv settings and stalled-download restart, are `0.5.0-k3sm.5`), so a tag never changes what it names.
 
 Record that pin. The operator resolves the image **by digest**; the tag is
 display-only and the next push moves it.

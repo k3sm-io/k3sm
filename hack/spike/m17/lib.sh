@@ -86,7 +86,7 @@ CABLE_DESC="${K3SM_M17_CABLE:-undeclared}"
 # The S5 pins. The model and revision are the ones the M16 spike and the M17-lab
 # ladder pin, so the single-Mac figure is comparable across all three; the image is
 # the one the M17-lab ladder runs, and the digest it resolves to is recorded.
-MLX_IMAGE="${K3SM_M17_MLX_IMAGE:-ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.3@sha256:975989ca2872cf4b763c8a4a1fd18afb31cbd9e6a0f88f9fd36e5db7650357e5}"
+MLX_IMAGE="${K3SM_M17_MLX_IMAGE:-ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.5@sha256:a225253effc92f5f5ff8ec2ec2e2f8894aa690a3d6a908bb879439de6733d0e8}"
 MODEL_REPO="${K3SM_M17_MODEL:-mlx-community/Qwen3-0.6B-4bit}"
 MODEL_REV="${K3SM_M17_MODEL_REV:-73e3e38d981303bc594367cd910ea6eb48349da8}"
 RANK_MEMORY="${K3SM_M17_RANK_MEMORY:-3Gi}"

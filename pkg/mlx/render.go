@@ -538,6 +538,8 @@ func podResources(memory resource.Quantity) corev1.ResourceRequirements {
 //     revision resolves to a different commit (a branch or tag name). The
 //     path's shape is therefore a contract with that entrypoint, not only with
 //     the engine: TestRenderSeedsPinnedRevision runs the rendered argv through it.
+//     A sharded rank's entrypoint (k3sm_shard.py) runs the same fetch, and
+//     TestShardedRanksFetchPinnedSnapshotBeforeEngine holds it to the same path.
 func modelReference(spec mlxv1alpha1.MLXModelSpec) (string, error) {
 	if spec.Revision == "" {
 		return spec.Model, nil

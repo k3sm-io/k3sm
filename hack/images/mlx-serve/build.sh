@@ -80,7 +80,7 @@ SERVE_MODULE="k3sm_serve"
 # The tag this script builds under (the publish step, `k3sm image push`, is the
 # operator's; see README.md). A build output has no digest until it is built,
 # so it stays a tag here; consumers pin the digest the registry reports for it.
-DEFAULT_TAG="ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.3"
+DEFAULT_TAG="ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.5"
 
 # ---- options ----------------------------------------------------------------
 WORK="${K3SM_MLX_WORK:-$HOME/.cache/k3sm/mlx-serve}"
@@ -260,6 +260,68 @@ stage_want() {
 	echo "$PY_KEY $(shasum -a 256 "$HERE/requirements.lock" | awk '{print $1}')"
 }
 
+# A connection to the wheel host can stall at a trickle and stay there. Bytes keep
+# arriving, so uv's read timeout never fires, and every download sharing that
+# connection stalls with it. A fresh connection usually gets the normal rate.
+# uv keeps each finished wheel in its cache across a kill, so restarting it costs
+# only the wheels in flight, and it still checks each cached wheel against the
+# lockfile's hashes. The rate is the growth of the cache, and it is judged only
+# while a download is unpacking into one of uv's .tmp* directories there, so the
+# link step that follows the downloads is never mistaken for a stall.
+UV_STALL_MIN_KB_S="${K3SM_MLX_UV_STALL_MIN_KB_S:-1024}"
+UV_STALL_SECONDS="${K3SM_MLX_UV_STALL_SECONDS:-60}"
+UV_STALL_POLL="${K3SM_MLX_UV_STALL_POLL:-10}"
+UV_STALL_RESTARTS="${K3SM_MLX_UV_STALL_RESTARTS:-25}"
+UV_STALLED=75
+
+uv_cache_kb() {
+	du -sk "$UV_CACHE_DIR" 2>/dev/null | awk '{print $1}' || true
+}
+
+# install_closure_once runs uv once and returns its status, or UV_STALLED after
+# killing a uv whose download stayed below the rate for the whole window.
+install_closure_once() {
+	local pid last now slow=0 rc=0
+	rm -rf "$UV_CACHE_DIR"/.tmp*
+	"$UV" pip install --python "$STAGE/$PY_BIN" --require-hashes -r "$HERE/requirements.lock" &
+	pid=$!
+	last="$(uv_cache_kb)"
+	while kill -0 "$pid" 2>/dev/null; do
+		sleep "$UV_STALL_POLL"
+		now="$(uv_cache_kb)"
+		if compgen -G "$UV_CACHE_DIR/.tmp*" >/dev/null &&
+			[ "$(( ${now:-0} - ${last:-0} ))" -lt "$(( UV_STALL_MIN_KB_S * UV_STALL_POLL ))" ]; then
+			slow=$(( slow + UV_STALL_POLL ))
+		else
+			slow=0
+		fi
+		last="$now"
+		if [ "$slow" -ge "$UV_STALL_SECONDS" ]; then
+			kill -KILL "$pid" 2>/dev/null || true
+			wait "$pid" 2>/dev/null || true
+			return "$UV_STALLED"
+		fi
+	done
+	wait "$pid" || rc=$?
+	return "$rc"
+}
+
+# install_closure restarts a stalled uv a bounded number of times. Any other
+# failure, a hash mismatch among them, is uv's verdict and is never retried.
+install_closure() {
+	local restarts=0 rc
+	while :; do
+		rc=0
+		install_closure_once || rc=$?
+		[ "$rc" -eq "$UV_STALLED" ] || break
+		restarts=$(( restarts + 1 ))
+		[ "$restarts" -le "$UV_STALL_RESTARTS" ] ||
+			die "uv download stalled: below $UV_STALL_MIN_KB_S KB/s for ${UV_STALL_SECONDS}s, and $UV_STALL_RESTARTS restarts did not clear it"
+		echo "  uv below $UV_STALL_MIN_KB_S KB/s for ${UV_STALL_SECONDS}s: restart $restarts of $UV_STALL_RESTARTS (finished wheels stay in the cache)"
+	done
+	[ "$rc" -eq 0 ] || die "uv pip install failed (exit $rc)"
+}
+
 stage_tree() {
 	export UV_PYTHON_INSTALL_DIR="$WORK/python"
 	export UV_CACHE_DIR="${UV_CACHE_DIR:-$WORK/uv-cache}"
@@ -295,7 +357,7 @@ stage_tree() {
 	find "$STAGE" -name EXTERNALLY-MANAGED -delete
 
 	echo "==> install the engine closure (--require-hashes)"
-	"$UV" pip install --python "$STAGE/$PY_BIN" --require-hashes -r "$HERE/requirements.lock"
+	install_closure
 
 	# The mount point for the weights volume, so HF_HOME resolves even before
 	# anything is mounted there.

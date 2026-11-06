@@ -350,7 +350,9 @@ func gpuSlotFree(node *corev1.Node, held int64) bool {
 // its slot. The model's OWN rank Pods are excluded too: placement runs only once
 // they are gone or going, and a gang restart re-placing onto the nodes its own
 // terminating ranks still occupy must not refuse itself. An unbound pod holds no
-// node's slot yet.
+// node's slot yet, unless a required hostname affinity pins it to one node (a
+// rank Pod of another model waiting on the scheduler): it counts against that
+// node.
 func HeldGPUSlots(model *mlxv1alpha1.MLXModel, pods []corev1.Pod) map[string]int64 {
 	own, err := labels.Parse(mlx.ShardedSelector(model.Name))
 	if err != nil {
@@ -359,14 +361,21 @@ func HeldGPUSlots(model *mlxv1alpha1.MLXModel, pods []corev1.Pod) map[string]int
 	held := map[string]int64{}
 	for i := range pods {
 		pod := &pods[i]
-		if pod.Spec.NodeName == "" || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+		// The node the pod runs on once bound (spec.nodeName), else the one
+		// node a required hostname affinity pins it to: another model's rank
+		// Pod waiting on the scheduler already claims its placed node's slot.
+		node := pod.Spec.NodeName
+		if node == "" {
+			node = mlx.RankPodNode(pod)
+		}
+		if node == "" || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
 			continue
 		}
 		if pod.Namespace == model.Namespace && own.Matches(labels.Set(pod.Labels)) {
 			continue
 		}
 		if units := gpucapacity.PodUnits(pod); units > 0 {
-			held[pod.Spec.NodeName] += units
+			held[node] += units
 		}
 	}
 	return held

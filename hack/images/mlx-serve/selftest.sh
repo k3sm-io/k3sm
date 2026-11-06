@@ -2874,6 +2874,73 @@ else
 	ladder no "10.failclosed  a lockfile that does not match LOCK_SHA256 stops the Job before any download (exit $rc)"
 fi
 
+# A stalled uv is restarted, a bounded number of times, and uv's own failure is
+# not retried. The functions run as build.sh defines them, against a fake uv.
+STALLD="$WORK/stall"; mkdir -p "$STALLD"
+cat > "$STALLD/uv" <<'FAKE'
+#!/bin/bash
+# One line of $FAKE_PLAN per run: stall holds a download open with no growth.
+n="$(( $(cat "$FAKE_COUNT" 2>/dev/null || echo 0) + 1 ))"
+echo "$n" > "$FAKE_COUNT"
+step="$(sed -n "${n}p" "$FAKE_PLAN")"
+case "$step" in
+	stall) mkdir -p "$UV_CACHE_DIR/.tmpfake"; exec sleep 60 ;;
+	quiet) exec sleep 3 ;;
+	fail) exit 7 ;;
+	*) exit 0 ;;
+esac
+FAKE
+chmod +x "$STALLD/uv"
+stall_case() {
+	# stall_case <plan, space separated>: prints "<status> <uv runs>" and the output.
+	local d rc=0
+	d="$(mktemp -d "$STALLD/case.XXXXXX")"
+	tr ' ' '\n' <<< "$1" > "$d/plan"
+	(
+		{ sed -n '/^UV_STALL_MIN_KB_S=/,/^UV_STALLED=/p' "$BUILD"
+		  sed -n '/^die() /p' "$BUILD"
+		  sed -n '/^uv_cache_kb() {$/,/^}$/p;/^install_closure_once() {$/,/^}$/p;/^install_closure() {$/,/^}$/p' "$BUILD"; } > "$d/fns.sh"
+		export K3SM_MLX_UV_STALL_POLL=1 K3SM_MLX_UV_STALL_SECONDS=2 K3SM_MLX_UV_STALL_RESTARTS=2
+		export UV_CACHE_DIR="$d/cache" FAKE_PLAN="$d/plan" FAKE_COUNT="$d/count"
+		mkdir -p "$UV_CACHE_DIR"
+		printf 'UV=%q STAGE=%q PY_BIN=py HERE=%q\n' "$STALLD/uv" "$d" "$d" >> "$d/fns.sh"
+		# shellcheck disable=SC1091 # generated from build.sh just above
+		. "$d/fns.sh"
+		install_closure
+	) > "$d/out" 2>&1 || rc=$?
+	echo "$rc $(cat "$d/count" 2>/dev/null) $d/out"
+}
+read -r rc runs out <<< "$(stall_case "stall ok")"
+if [ "$rc" -eq 0 ] && [ "$runs" -eq 2 ] && grep -q 'restart 1 of 2' "$out"; then
+	ladder ok "10.stall.restart  a stalled uv is killed and run again, and the stage goes on"
+else
+	ladder no "10.stall.restart  a stalled uv is killed and run again, and the stage goes on (exit $rc, $runs runs)"
+fi
+read -r rc runs out <<< "$(stall_case "stall stall stall ok")"
+if [ "$rc" -eq 2 ] && [ "$runs" -eq 3 ] && grep -q 'uv download stalled' "$out"; then
+	ladder ok "10.stall.bound  restarts are bounded, and running out is a named failure"
+else
+	ladder no "10.stall.bound  restarts are bounded, and running out is a named failure (exit $rc, $runs runs)"
+fi
+read -r rc runs out <<< "$(stall_case "fail ok")"
+if [ "$rc" -eq 2 ] && [ "$runs" -eq 1 ] && grep -q 'uv pip install failed (exit 7)' "$out"; then
+	ladder ok "10.stall.verdict  uv's own failure is not retried"
+else
+	ladder no "10.stall.verdict  uv's own failure is not retried (exit $rc, $runs runs)"
+fi
+read -r rc runs out <<< "$(stall_case "quiet")"
+if [ "$rc" -eq 0 ] && [ "$runs" -eq 1 ]; then
+	ladder ok "10.stall.idle  no download in progress, no growth: uv is left alone"
+else
+	ladder no "10.stall.idle  no download in progress, no growth: uv is left alone (exit $rc, $runs runs)"
+fi
+# shellcheck disable=SC2016 # the literal line in build.sh
+if grep -qF '"$UV" pip install --python "$STAGE/$PY_BIN" --require-hashes -r "$HERE/requirements.lock" &' "$BUILD"; then
+	ladder ok "10.stall.hashes  the watched install keeps --require-hashes and the lockfile"
+else
+	ladder no "10.stall.hashes  the watched install keeps --require-hashes and the lockfile"
+fi
+
 # No credential reaches the pod: no Secret, no token, no pull secret.
 if ! grep -qiE 'secret|serviceAccountName|imagePullSecrets|envFrom|token|password|credential|registry|docker' \
 	<(grep -vE '^  (build\.sh|requirements\.lock|k3sm_shard\.py|k3sm_serve\.py|stage-entry\.sh): ' "$RJ" |

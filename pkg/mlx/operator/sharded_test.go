@@ -149,8 +149,8 @@ func TestShardedReconcilePlacesRankPods(t *testing.T) {
 		t.Fatalf("%d rank pods, want 2", len(pods))
 	}
 	for i, pod := range pods {
-		if pod.Name != mlx.RankPodName(testModelName, i) || pod.Spec.NodeName != []string{"mac-a", "mac-b"}[i] {
-			t.Errorf("rank %d = %s on %s", i, pod.Name, pod.Spec.NodeName)
+		if pod.Name != mlx.RankPodName(testModelName, i) || mlx.RankPodNode(&pod) != []string{"mac-a", "mac-b"}[i] {
+			t.Errorf("rank %d = %s placed on %s", i, pod.Name, mlx.RankPodNode(&pod))
 		}
 		assertOwnedByModel(t, "rank pod", pod.OwnerReferences)
 	}
@@ -287,7 +287,7 @@ func TestShardedGangRestart(t *testing.T) {
 				if first[p.Name] == string(p.UID)+p.Annotations[mlx.AnnotationSpecHash] && tc.name == "spec_changed" {
 					t.Errorf("rank pod %s was not re-rendered from the new spec", p.Name)
 				}
-				if p.Spec.NodeName == "mac-b" && tc.name == "node_not_ready" {
+				if mlx.RankPodNode(&p) == "mac-b" && tc.name == "node_not_ready" {
 					t.Errorf("rank pod %s was re-placed onto the NotReady node", p.Name)
 				}
 			}

@@ -6,7 +6,8 @@ The k3sm MLX operator renders one Pod per rank and runs this module in each:
 
     /bin/python3.12 -m k3sm_shard --model <ref> --served-model-name <name> [caller args...]
 
-It does DNS resolution, then runs the engine in this process:
+It does DNS resolution, fetches a pinned revision, then runs the engine in this
+process:
 
   1. reads the environment the operator rendered (MLX_RANK, MLX_WORLD_SIZE,
      K3SM_MLX_BACKEND, K3SM_MLX_PARALLELISM, K3SM_MLX_RANKS, K3SM_MLX_PORT,
@@ -26,7 +27,12 @@ It does DNS resolution, then runs the engine in this process:
               (the K3SM_MLX_HOSTS entries on the thunderbolt path)
        jaccl: MLX_IBV_DEVICES -> the per-rank RDMA device matrix, plus
               MLX_JACCL_COORDINATOR=<rank 0 podIP>:<port>;
-  4. runs mlx_lm.server's own main() in this process with --host 0.0.0.0,
+  4. when --model is k3sm's pinned snapshot path, fetches that revision into
+     this rank's cache volume with k3sm_serve.seed_pinned_revision, the step the
+     single-node entrypoint runs, because the engine only loads that path. A
+     fetch that fails on a cache without the snapshot, or a revision that
+     resolves to another commit, ends the rank with SEED_FAILED_STATUS;
+  5. runs mlx_lm.server's own main() in this process with --host 0.0.0.0,
      --port <serve port>, --pipeline for pipeline parallelism, and its own
      arguments passed through last, minus --served-model-name.
 
@@ -64,9 +70,12 @@ judges a serving gang, never a starting one, so a long first download is not a
 kill loop. Anything else (a hung collective, a timeout, an error status)
 exits 1.
 
-Standard library only: the image carries the engine's closure and nothing else.
+Standard library and the image's own k3sm_serve only: the image carries the
+engine's closure and nothing else.
 """
 
+import argparse
+import contextlib
 import hashlib
 import importlib
 import inspect
@@ -80,6 +89,8 @@ import time
 import tokenize
 import urllib.error
 import urllib.request
+
+from k3sm_serve import SeedError, seed_pinned_revision
 
 # The rendezvous and serving contract with the operator's render
 # (k3sm/pkg/mlx/render_sharded.go). A rename there is a rename here.
@@ -113,9 +124,16 @@ PROBE_TIMEOUT_SECONDS = 25.0
 
 STATE_SUBDIR = "k3sm-shard"
 
+# The exit status of a rank whose pinned revision could not be fetched. It is
+# not 2: on the thunderbolt path the operator reads a rank's exit 2 as a refusal
+# to start on the interconnect (pkg/mlx/operator lostRanks), and a Hub failure is
+# not an interconnect loss. Status 1 is the generic gang fault.
+SEED_FAILED_STATUS = 1
+
 # The option the operator renders for the name the engine serves under, and the
 # key mlx_lm.server's ModelProvider maps to its --model.
 SERVED_NAME_FLAG = "--served-model-name"
+MODEL_FLAG = "--model"
 ENGINE_MODULE = "mlx_lm.server"
 ENGINE_DEFAULT_MODEL = "default_model"
 HOSTFILE_NAME = "mlx-hostfile.json"
@@ -341,6 +359,24 @@ def split_served_name(argv):
         rest.append(arg)
         i += 1
     return name, rest
+
+
+def engine_model(argv):
+    """(model, None) as mlx_lm.server's parser reads --model from argv.
+
+    The second value is the one seed_pinned_revision's parse returns beside the
+    model and does not read. The last occurrence and an abbreviation count, as
+    argparse has them. A parse error is left for the engine's own parse to
+    report.
+    """
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(MODEL_FLAG)
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            args, _ = parser.parse_known_args(argv)
+    except SystemExit:
+        return None, None
+    return args.model, None
 
 
 # The hooks install_alias relies on, with the parameters mlx-lm 0.32.2 gives
@@ -588,6 +624,12 @@ def main(argv=None):
     except ShardError as e:
         print(f"k3sm-shard: {e}", file=sys.stderr, flush=True)
         return 2
+    # After the plan, so a rank that cannot start refuses before a long download.
+    try:
+        seed_pinned_revision(argv, env, parse=engine_model)
+    except SeedError as e:
+        print(f"k3sm-shard: {e}", file=sys.stderr, flush=True)
+        return SEED_FAILED_STATUS
     try:
         result = serve(child_env, child_argv, served)
     except ShardError as e:
