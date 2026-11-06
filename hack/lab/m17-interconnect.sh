@@ -990,14 +990,15 @@ image_pull_failed() { grep -Eq 'ErrImagePull|ImagePullBackOff' <<<"$(kc get pods
 # tokens_per_s <model> <file> — one completion against the endpoint; prints
 # "<tokens/s> <request+response bytes>" or nothing.
 tokens_per_s() {
-	local ep
+	local ep mdl
+	mdl="$(kc get mlxmodel -n "$NS" "$1" -o jsonpath='{.spec.model}' 2>/dev/null)"
 	ep="$(kc get mlxmodel -n "$NS" "$1" -o jsonpath='{.status.endpoint}' 2>/dev/null)"
 	[ -n "$ep" ] || return 1
 	case "$ep" in http*) ;; *) ep="http://$ep" ;; esac
 	# unpinned: a POST to the model's in-cluster endpoint; the response is a completion, never an artifact that runs
 	curl -sS -m 300 -o "$2" -w '%{time_total} %{size_upload} %{size_download}\n' "$ep/v1/completions" \
 		-H 'Content-Type: application/json' \
-		-d '{"prompt":"Write a long story about two computers joined by a cable.","max_tokens":256}' >"$2.timing" 2>&1 || return 1
+		-d "$(python3 -I -c 'import json,sys; print(json.dumps({"model":sys.argv[1],"prompt":"Write a long story about two computers joined by a cable.","max_tokens":256}))' "$mdl")" >"$2.timing" 2>&1 || return 1
 	python3 -I -c 'import json,sys
 t,u,d=open(sys.argv[2]).read().split()[:3]
 n=json.load(open(sys.argv[1])).get("usage",{}).get("completion_tokens",0)
