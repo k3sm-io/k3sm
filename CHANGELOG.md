@@ -167,6 +167,12 @@ pin, its date, and the tarball's sha256.
 
 ### Fixed
 
+- `k3sm install` with a new `--mesh-ip` on a control-plane node no longer leaves the server refused its new
+  address at every start. The install removes the pod range netd recorded when it names another range than
+  the new address's, and removes the interconnect aliases of the old range from `bridge0`. A failed removal
+  of those aliases is logged and does not stop the install. The old mesh address and the old range's pod
+  aliases stay on `lo0` until `k3sm stop`, `k3sm uninstall` or a reboot. A reinstall that keeps its
+  `--mesh-ip`, and any worker reinstall, keeps the recorded range.
 - `k3sm image untag` of an image's last tag no longer makes the image unreadable by digest in the
   cluster registry. The manifest stays readable at `repository@sha256:...`, and `k3sm image prune` sees
   it as untagged, until prune or the registry's garbage collection removes it.

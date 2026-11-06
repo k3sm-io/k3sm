@@ -2072,6 +2072,9 @@ func TestInstallOrchestration(t *testing.T) {
 		// instruction assumes, so the link is still a hard install failure when
 		// it cannot be laid down.
 		"EnsureSymlink:/Library/k3sm/k3sm->/usr/local/bin/k3sm",
+		// The recorded node pod range is read before the plist that seeds the range
+		// (retireStaleNodeIdentity); absent here, so nothing is removed.
+		"ReadRegularFile:/var/lib/k3sm/keys/node-pod-cidr",
 		"WriteLaunchDaemon:/Library/LaunchDaemons/io.k3sm.netd.plist",
 		// The server plist is the one that requests an open-file limit, so the
 		// plist it replaces is read first to compare the two: a changed limit
