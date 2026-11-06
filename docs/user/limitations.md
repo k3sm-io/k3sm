@@ -969,9 +969,8 @@ headless-Service and per-pod DNS names reach the Pod on them too. What it does n
   dial of a native Pod's pod IP skips it.
 - **The relay forwards only to the guest the node attributes to that Pod.** It never forwards a
   connection to any other address.
-- **The relay closes when the Pod's stop begins.** Once any `preStop` hook has finished, the node closes
-  the relay and every connection through it, before the guest gets `SIGTERM`. A connection through the
-  relay cannot drain during the termination grace period, and a new dial to the pod IP is refused.
+- **The relay does not follow an address change during a Pod's stop.** It stays up until the guest has
+  stopped, and if the guest's own address changes after the delete starts, it keeps dialing the old one.
 
 Traffic a `vm` Pod opens toward another node is out of scope for this release.
 

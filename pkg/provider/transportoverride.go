@@ -126,7 +126,9 @@ func DeclaredTCPPorts(pod *corev1.Pod) []uint16 {
 // a stale override dials an address that now belongs to a DIFFERENT guest — a
 // cross-pod misdelivery, not a failed dial. The feed therefore REPLACES an entry
 // the moment a pod's reported lease changes and DROPS it the moment the pod dies
-// or reports no lease.
+// or reports no lease. The one exception is a pod whose stop is in flight (see
+// stopping): its guest is still serving, and the runtime's reports no longer say
+// so.
 //
 // Locking discipline: mu guards leases AND serializes the sink push, which is
 // deliberately made UNDER the lock. The sink is a leaf (an atomic map swap that
@@ -145,10 +147,17 @@ type transportFeed struct {
 
 	mu     sync.Mutex
 	leases map[string]transportLease // pod id -> its two addresses
-	// releasing holds the pods whose stop or network release has begun
-	// (beginRelease .. endRelease). observe refuses them, so a status observation
-	// that races either cannot reinstall an override, and so the relay, onto a
-	// guest being stopped or over the alias being removed.
+	// stopping holds the pods whose stop has no outcome yet (beginStop .. the stop
+	// methods). Observation neither installs, changes nor drops their override, so the
+	// relay serves until the guest has stopped: the runtime forgets the pod before it
+	// stops the guest, so a report from this window with no lease says nothing about
+	// the guest, and it is what closed the relay mid-grace.
+	stopping map[string]struct{}
+	// releasing holds the pods whose guest may be gone or whose network release has
+	// begun (stopSucceeded or stopUncertain or beginRelease .. endRelease). observe
+	// refuses them, so a status observation that races either cannot reinstall an
+	// override, and so the relay, onto a lease that can go to another guest or over
+	// the alias being removed. A retraction still lands.
 	releasing map[string]struct{}
 }
 
@@ -161,7 +170,7 @@ func newTransportFeed(sink TransportOverrideSink, log *slog.Logger) *transportFe
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	return &transportFeed{sink: sink, log: log, leases: map[string]transportLease{}, releasing: map[string]struct{}{}}
+	return &transportFeed{sink: sink, log: log, leases: map[string]transportLease{}, stopping: map[string]struct{}{}, releasing: map[string]struct{}{}}
 }
 
 // observe records podID's published/live pair and its declared TCP ports (in the
@@ -183,6 +192,9 @@ func (f *transportFeed) observe(podID string, published, live netip.Addr, ports 
 	next := transportLease{published: published, live: live, ports: slices.Clone(ports)}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if _, ok := f.stopping[podID]; ok {
+		return
+	}
 	if _, ok := f.releasing[podID]; ok {
 		return
 	}
@@ -199,12 +211,26 @@ func (f *transportFeed) observe(podID string, published, live netip.Addr, ports 
 	f.republishLocked()
 }
 
+// retract is drop for a status observation, which an in-flight stop outranks: the
+// check shares drop's critical section, so an observation that races beginStop
+// cannot close the relay after the stop has begun.
+func (f *transportFeed) retract(podID string) {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.stopping[podID]; ok {
+		return
+	}
+	f.dropLocked(podID)
+}
+
 // drop removes podID's override and republishes, if it had one. It is the
-// death/lease-loss half of the liveness obligation and is idempotent, so every
-// path that can end a pod may call it unconditionally. When it returns, the sink
-// has taken the generation without the pod, which closes the pod's relay
-// listeners and every connection they were relaying; that is what lets a caller
-// remove the published alias right after it (releasePodNetwork).
+// death half of the liveness obligation and is idempotent, so a path that knows the
+// pod's guest is gone may call it unconditionally, in-flight stop or not. When it
+// returns, the sink has taken the generation without the pod, which closes the pod's
+// relay listeners and every connection they were relaying.
 func (f *transportFeed) drop(podID string) {
 	if f == nil {
 		return
@@ -224,11 +250,66 @@ func (f *transportFeed) dropLocked(podID string) {
 	f.republishLocked()
 }
 
-// beginRelease marks podID's stop or network release as begun and drops its
-// override in the same critical section, so no observation can reinstall it until
-// endRelease. Marking a pod already marked is a no-op. teardownPod sets the mark
-// before its runtime call, and releasePodNetwork ends it, or teardownPod does when
-// the runtime refused the stop.
+// beginStop freezes podID's override until the stop has an outcome, which one of
+// stopSucceeded, stopRefused and stopUncertain reports. Freezing a pod already frozen
+// is a no-op, and the mark of a stop that failed uncertainly stays.
+func (f *transportFeed) beginStop(podID string) {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stopping[podID] = struct{}{}
+}
+
+// stopSucceeded ends podID's stop: the guest is gone, so its override drops, and the
+// release mark goes on in the same critical section, so the DELETED status that still
+// carries the lease cannot reinstall it. releasePodNetwork ends the mark.
+func (f *transportFeed) stopSucceeded(podID string) {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.stopping, podID)
+	f.releasing[podID] = struct{}{}
+	f.dropLocked(podID)
+}
+
+// stopRefused ends podID's stop the way a definitive refusal does: the guest is still
+// serving at its lease, so the override stays and observation resumes. It also lifts
+// the mark an earlier uncertain failure left, as the runtime's refusal, where a
+// finished stop answers success, says that stop did not happen either.
+func (f *transportFeed) stopRefused(podID string) {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.stopping, podID)
+	delete(f.releasing, podID)
+}
+
+// stopUncertain ends podID's stop the way any other failure does, which leaves open
+// whether the guest stopped. The failure alone is no evidence that it did, so the
+// override stays and serves. The release mark goes on, since a lease that may have no
+// guest behind it must not be installed. Retractions land again, so a report that the
+// runtime no longer holds the pod closes the relay without waiting for the retry that
+// settles the delete and ends the mark.
+func (f *transportFeed) stopUncertain(podID string) {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.stopping, podID)
+	f.releasing[podID] = struct{}{}
+}
+
+// beginRelease marks podID's network release as begun and drops its override in the
+// same critical section, so no observation can reinstall it until endRelease. An
+// in-flight stop does not hold it up, as the alias the relay listens on is going.
+// Paired with endRelease by releasePodNetwork.
 func (f *transportFeed) beginRelease(podID string) {
 	if f == nil {
 		return
@@ -239,11 +320,11 @@ func (f *transportFeed) beginRelease(podID string) {
 	f.dropLocked(podID)
 }
 
-// endRelease clears podID's release mark. After a network release the pod's guest
-// record is gone (the adapter's Teardown deletes it), so observe's under-lock
-// stillGuest check keeps refusing a late observation without the mark, and the set
-// stays bounded by the stops and releases in flight. A later create of the same pod
-// records a new guest and is observed normally.
+// endRelease clears podID's release mark. By then the pod's guest record is gone
+// (the adapter's Teardown deletes it), so observe's under-lock stillGuest check
+// keeps refusing a late observation without the mark, and the set stays bounded
+// by the releases in flight. A later create of the same pod records a new guest
+// and is observed normally.
 func (f *transportFeed) endRelease(podID string) {
 	if f == nil {
 		return
@@ -353,6 +434,11 @@ func (r *runtimedRuntime) guestNetwork(podID string) (sandbox.GuestNetworkConfig
 // override (the next status reinstalls it), never resurrect a dead one, because
 // the reinstall path requires a currently-recorded guest and a currently-reported
 // lease.
+//
+// DURING A STOP IT DOES NOTHING. runtimed forgets a pod before it stops the guest
+// (runtime.DeletePod), so a status read in that window is the NotFound that
+// GetPodStatus and podWithStatus turn into a synthesized status with no lease, and
+// the retract below would close the relay mid-grace. See transportFeed.stopping.
 func (r *runtimedRuntime) observeTransport(pod *corev1.Pod, rs *runtimev1.PodStatus) {
 	if r.transport == nil || pod == nil {
 		return
@@ -360,7 +446,7 @@ func (r *runtimedRuntime) observeTransport(pod *corev1.Pod, rs *runtimev1.PodSta
 	podID := string(pod.UID)
 	gn, ok := r.guestNetwork(podID)
 	if !ok || !gn.PodIP.IsValid() {
-		r.transport.drop(podID)
+		r.transport.retract(podID)
 		return
 	}
 	reported := rs.GetGuestTransportAddress()
@@ -368,21 +454,21 @@ func (r *runtimedRuntime) observeTransport(pod *corev1.Pod, rs *runtimev1.PodSta
 		// No lease yet, or the guest lost the one it had: the pod is UNDIALABLE
 		// rather than dialed at some substitute address (the table's no-fallback
 		// contract), so the override must go.
-		r.transport.drop(podID)
+		r.transport.retract(podID)
 		return
 	}
 	live, err := netip.ParseAddr(reported)
 	if err != nil || !live.IsValid() {
 		r.log.Warn("vm pod reported an unparsable guest transport address; dropping its override",
 			"pod", podID, "reported", reported, "err", err)
-		r.transport.drop(podID)
+		r.transport.retract(podID)
 		return
 	}
 	live = live.Unmap()
 	if live == gn.PodIP.Unmap() {
 		// An override onto the published address itself is a no-op that would only
 		// disguise the missing lease as a working one.
-		r.transport.drop(podID)
+		r.transport.retract(podID)
 		return
 	}
 	published := gn.PodIP.Unmap()

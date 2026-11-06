@@ -18,6 +18,7 @@ package provider
 
 import (
 	"context"
+	"maps"
 	"net/http"
 	"sync"
 	"testing"
@@ -124,49 +125,90 @@ func (n *leaseNode) readStatus(t *testing.T, pod *corev1.Pod) *corev1.PodStatus 
 	return st
 }
 
-// pushDeleted delivers the runtime's DELETED event carrying lease, which is what
-// a real runtimed publishes as its stop ends: the guest is gone, its lease is not
-// yet blanked.
+// deletedStatus is what a real runtimed publishes as its stop ends: the DELETED
+// status of a guest that is gone, its lease not yet blanked.
+func (s *leaseRuntimeServer) deletedStatus(podID, lease string) *runtimev1.PodStatus {
+	st := leaseStatus(podID, s.reportedPodIP(podID), lease)
+	st.Phase = runtimev1.PodPhase_POD_PHASE_SUCCEEDED
+	return st
+}
+
+// pushDeleted delivers the runtime's DELETED event carrying lease down the stream.
 func (s *leaseRuntimeServer) pushDeleted(t *testing.T, podID, lease string) {
 	t.Helper()
 	timer := time.NewTimer(stopBound)
 	defer timer.Stop()
-	st := leaseStatus(podID, s.reportedPodIP(podID), lease)
-	st.Phase = runtimev1.PodPhase_POD_PHASE_SUCCEEDED
 	select {
-	case s.events <- &runtimev1.PodStatusEvent{Type: runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_DELETED, Status: st}:
+	case s.events <- &runtimev1.PodStatusEvent{Type: runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_DELETED, Status: s.deletedStatus(podID, lease)}:
 	case <-timer.C:
 		t.Fatalf("push DELETED for %s: the provider is not consuming the stream", podID)
 	}
 }
 
-// releaseMarks is how many pods the transport feed still refuses observations for.
+// releaseMarks is how many stop freezes and release marks the transport feed holds.
 func (n *leaseNode) releaseMarks() int {
 	n.r.transport.mu.Lock()
 	defer n.r.transport.mu.Unlock()
-	return len(n.r.transport.releasing)
+	return len(n.r.transport.stopping) + len(n.r.transport.releasing)
 }
 
-// TestDeletingVMPodStopsProbesAndKeepsItsOverrideDown pins what a vm pod's stop does
-// to the two things that act on its lease. Its probes end before the runtime is
-// asked to stop it, so no check runs against a guest that is shutting down. Its
-// override goes down at the same point, after preStop, and stays down through every
-// status the runtime reports during the stop, the DELETED that still carries the
-// lease above all: the override is what keeps the relay up, and a reinstall opens a
-// relay onto a lease macOS may have handed to the next guest.
+// checkOverrides fails unless the sink holds want and has taken exactly sets
+// generations, which catches an override that left and came back between two reads.
+func (n *leaseNode) checkOverrides(t *testing.T, when string, sets int, want map[string]string) {
+	t.Helper()
+	got, live := n.sink.snapshot()
+	if rendered := renderOverrides(live); got != sets || !maps.Equal(rendered, want) {
+		t.Errorf("%s: %d generations (want %d), overrides %v (want %v)", when, got, sets, rendered, want)
+	}
+}
+
+// pushAndWait delivers one status down the stream and waits for its publish.
+func (n *leaseNode) pushAndWait(t *testing.T, podID, lease string) {
+	t.Helper()
+	seen := n.seenCount(podID)
+	n.rt.push(t, podID, lease)
+	n.awaitStatus(t, podID, seen+1)
+}
+
+// releaseNetwork runs onRelease at the first Teardown, while the pod's release mark
+// is set and its guest record still exists: only the mark can refuse an observation
+// there, which is the reinstall guard the case wants to see alone.
+type releaseNetwork struct {
+	*PodNetAdapter
+	once      sync.Once
+	onRelease func()
+}
+
+func (w *releaseNetwork) Teardown(podID string) error {
+	w.once.Do(w.onRelease)
+	return w.PodNetAdapter.Teardown(podID)
+}
+
+// TestDeletingVMPodStopsProbesAndKeepsItsRelayUntilTheGuestStops pins what a vm pod's
+// stop does to the two things that act on its lease. Its probes end before preStop,
+// so no check runs against a guest that is shutting down. Its override, which is what
+// keeps the relay up, stays through preStop and the runtime's stop whatever the
+// runtime reports meanwhile, as a terminating pod keeps serving until its process
+// exits. It drops once when the stop succeeds, and the DELETED status that still
+// carries the lease cannot put it back: the address can go to another guest.
 //
 // WHY IT IS NOT VACUOUS. The probes are real loops that are first seen dialing the
-// lease and the override is first seen installed, each observation is delivered down
-// the provider's own status paths with the lease in it, and the sink's generation
-// count catches an override that came back and left again between two reads.
-func TestDeletingVMPodStopsProbesAndKeepsItsOverrideDown(t *testing.T) {
+// lease and the override is first seen installed, each observation goes down the
+// provider's own status paths, the NotFound takes the synthesized status a real
+// runtimed's early forget leads to, and the sink's generation count catches an
+// override that left and came back between two reads.
+func TestDeletingVMPodStopsProbesAndKeepsItsRelayUntilTheGuestStops(t *testing.T) {
 	t.Parallel()
 
 	// servingVMPod runs a probed vm pod to the point where its probes are passing
-	// against its lease through an installed override.
-	servingVMPod := func(t *testing.T, pod *corev1.Pod) (*probeNode, string, string) {
+	// against its lease through an installed override. onRelease, if any, runs at the
+	// pod's network release.
+	servingVMPod := func(t *testing.T, pod *corev1.Pod, onRelease func(n *probeNode)) (*probeNode, string, string) {
 		t.Helper()
 		n := newProbeNode(t)
+		if onRelease != nil {
+			n.r.network = &releaseNetwork{PodNetAdapter: n.adapt, onRelease: func() { onRelease(n) }}
+		}
 		id := n.start(t, withGateProbes(pod))
 		pub := n.published(t, id)
 		n.tgt.serve(leaseFirst)
@@ -176,22 +218,37 @@ func TestDeletingVMPodStopsProbesAndKeepsItsOverrideDown(t *testing.T) {
 		return n, id, pub
 	}
 
-	for _, tc := range []struct {
+	stopPaths := []struct {
 		name string
-		stop func(n *probeNode, pod *corev1.Pod) error
+		// surfaces is whether the path returns a failed stop to its caller.
+		surfaces bool
+		stop     func(n *probeNode, pod *corev1.Pod) error
 	}{
-		{"DeletePod", func(n *probeNode, pod *corev1.Pod) error {
+		{"DeletePod", true, func(n *probeNode, pod *corev1.Pod) error {
 			return n.r.DeletePod(context.Background(), pod)
 		}},
-		{"the orphan reaper", func(n *probeNode, pod *corev1.Pod) error {
+		{"the orphan reaper", false, func(n *probeNode, pod *corev1.Pod) error {
 			n.r.reapOrphan(context.Background(), pod, n.r.trackByID(string(pod.UID)))
 			return nil
 		}},
-	} {
+	}
+
+	for _, tc := range stopPaths {
 		t.Run("through "+tc.name, func(t *testing.T) {
 			t.Parallel()
 			pod := portedVMPod("team-a", "stopping")
-			n, id, _ := servingVMPod(t, pod)
+			id := string(pod.UID)
+			var inRelease struct {
+				sets     int
+				live     map[string]string
+				recorded bool
+			}
+			n, _, pub := servingVMPod(t, pod, func(n *probeNode) {
+				_, inRelease.recorded = n.adapt.GuestNetwork(id)
+				n.r.emit(n.rt.deletedStatus(id, leaseFirst))
+				sets, live := n.sink.snapshot()
+				inRelease.sets, inRelease.live = sets, renderOverrides(live)
+			})
 			pp := n.proberOf(t, id)
 			held := n.holdNextStop()
 			done := make(chan error, 1)
@@ -202,33 +259,48 @@ func TestDeletingVMPodStopsProbesAndKeepsItsOverrideDown(t *testing.T) {
 				t.Error("the pod's probes are still running while the runtime stops it")
 			}
 			dials := n.tgt.count()
-			sets, live := n.sink.snapshot()
-			if len(live) != 0 {
-				t.Errorf("overrides during the stop = %v, want none", renderOverrides(live))
-			}
+			frozen := map[string]string{pub: leaseFirst}
+			sets, _ := n.sink.snapshot()
+			n.checkOverrides(t, "as the stop begins", sets, frozen)
 
-			// Every path a status arrives by, each carrying the lease.
+			// Every path a status arrives by, none of which may move the override.
 			n.readStatus(t, pod)
-			seen := n.seenCount(id)
-			n.rt.push(t, id, leaseFirst)
-			n.awaitStatus(t, id, seen+1)
-			n.rt.pushDeleted(t, id, leaseFirst)
-			n.awaitStatus(t, id, seen+2)
-			if got, live := n.sink.snapshot(); got != sets || len(live) != 0 {
-				t.Errorf("after the stop's statuses: %d generations (want %d), overrides %v (want none)",
-					got, sets, renderOverrides(live))
+			n.checkOverrides(t, "after a direct status with the lease", sets, frozen)
+			n.pushAndWait(t, id, "")
+			n.checkOverrides(t, "after a stream status with no lease", sets, frozen)
+			n.readStatus(t, pod)
+			n.checkOverrides(t, "after a direct status with no lease", sets, frozen)
+			n.pushAndWait(t, id, leaseSecond)
+			n.checkOverrides(t, "after a stream status with another lease", sets, frozen)
+			n.rt.forget(id)
+			n.readStatus(t, pod)
+			n.checkOverrides(t, "after a direct NotFound", sets, frozen)
+			if _, err := n.r.GetPods(context.Background()); err != nil {
+				t.Fatalf("GetPods: %v", err)
 			}
+			n.checkOverrides(t, "after a backstop NotFound", sets, frozen)
+			seen := n.seenCount(id)
+			n.rt.pushDeleted(t, id, leaseFirst)
+			n.awaitStatus(t, id, seen+1)
+			n.checkOverrides(t, "after a DELETED ahead of the stop's answer", sets, frozen)
 
 			close(held.release)
 			if err := <-done; err != nil {
 				t.Fatalf("stop: %v", err)
 			}
+			n.checkOverrides(t, "after the stop", sets+1, map[string]string{})
+			if !inRelease.recorded {
+				t.Error("the guest record was gone during the release, so the mark was not what refused")
+			}
+			if inRelease.sets != sets+1 || len(inRelease.live) != 0 {
+				t.Errorf("a DELETED with the old lease during the release: %d generations (want %d), overrides %v (want none)",
+					inRelease.sets, sets+1, inRelease.live)
+			}
+			n.r.observeTransport(pod, n.rt.deletedStatus(id, leaseFirst))
+			n.checkOverrides(t, "after a DELETED past the release", sets+1, map[string]string{})
+
 			if got := n.tgt.count(); got != dials {
 				t.Errorf("probe dials went from %d to %d during the stop", dials, got)
-			}
-			if got, live := n.sink.snapshot(); got != sets || len(live) != 0 {
-				t.Errorf("after the stop: %d generations (want %d), overrides %v (want none)",
-					got, sets, renderOverrides(live))
 			}
 			if n.r.proberFor(id) != nil {
 				t.Error("the pod's prober outlived its teardown")
@@ -237,7 +309,137 @@ func TestDeletingVMPodStopsProbesAndKeepsItsOverrideDown(t *testing.T) {
 				t.Errorf("%d release marks left after the teardown, want none", got)
 			}
 		})
+
+		t.Run("through "+tc.name+", a refused stop leaves the override and normal observation", func(t *testing.T) {
+			t.Parallel()
+			pod := portedVMPod("team-a", "refused")
+			n, id, pub := servingVMPod(t, pod, nil)
+			sets, _ := n.sink.snapshot()
+			n.answerStops(status.Error(codes.FailedPrecondition, "stop refused"))
+			if err := tc.stop(n, pod); tc.surfaces && err == nil {
+				t.Fatal("the stop returned nil for one the runtime refused")
+			}
+			n.checkOverrides(t, "after the refusal", sets, map[string]string{pub: leaseFirst})
+			if got := n.releaseMarks(); got != 0 {
+				t.Errorf("%d release marks left after the refusal, want none", got)
+			}
+
+			// The guest is still serving, so its reports count again, both ways.
+			n.rt.push(t, id, leaseSecond)
+			n.awaitOverrides(t, map[string]string{pub: leaseSecond})
+			n.rt.push(t, id, "")
+			n.awaitOverrides(t, map[string]string{})
+			n.rt.push(t, id, leaseFirst)
+			n.awaitOverrides(t, map[string]string{pub: leaseFirst})
+
+			n.answerStops(nil)
+			if err := tc.stop(n, pod); err != nil {
+				t.Fatalf("retried stop: %v", err)
+			}
+			n.awaitOverrides(t, map[string]string{})
+			if _, recorded := n.adapt.GuestNetwork(id); recorded {
+				t.Error("the guest record outlived the retried teardown")
+			}
+		})
+
+		t.Run("through "+tc.name+", a stop that may have happened keeps the override until a report or a retry", func(t *testing.T) {
+			t.Parallel()
+			pod := portedVMPod("team-a", "uncertain")
+			n, id, pub := servingVMPod(t, pod, nil)
+			sets, _ := n.sink.snapshot()
+			n.answerStops(status.Error(codes.Unavailable, "stop lost"))
+			if err := tc.stop(n, pod); tc.surfaces && err == nil {
+				t.Fatal("the stop returned nil for one that failed")
+			}
+			held := map[string]string{pub: leaseFirst}
+			n.checkOverrides(t, "after the failure alone", sets, held)
+			n.pushAndWait(t, id, leaseSecond)
+			n.checkOverrides(t, "after a status with another lease", sets, held)
+
+			// The stop's call has answered, so nothing freezes the override now, and a
+			// runtime that no longer knows the pod is what takes it down.
+			n.rt.forget(id)
+			n.readStatus(t, pod)
+			n.checkOverrides(t, "after a NotFound", sets+1, map[string]string{})
+			n.pushAndWait(t, id, leaseFirst)
+			n.checkOverrides(t, "after a status with the lease", sets+1, map[string]string{})
+
+			n.answerStops(nil)
+			if err := tc.stop(n, pod); err != nil {
+				t.Fatalf("retried stop: %v", err)
+			}
+			n.checkOverrides(t, "after the retried stop", sets+1, map[string]string{})
+			if got := n.releaseMarks(); got != 0 {
+				t.Errorf("%d release marks left after the retried teardown, want none", got)
+			}
+			if _, recorded := n.adapt.GuestNetwork(id); recorded {
+				t.Error("the guest record outlived the retried teardown")
+			}
+		})
 	}
+
+	t.Run("a NotFound on the backstop path alone leaves the override", func(t *testing.T) {
+		t.Parallel()
+		// The path that closed the relay mid-grace: the next resync tick after the
+		// runtime forgets the pod reads NotFound, which becomes a synthesized status
+		// with no lease, while the guest is still working through its grace.
+		pod := portedVMPod("team-a", "backstop")
+		n, id, pub := servingVMPod(t, pod, nil)
+		sets, _ := n.sink.snapshot()
+		held := n.holdNextStop()
+		done := make(chan error, 1)
+		go func() { done <- n.r.DeletePod(context.Background(), pod) }()
+		await(t, "the runtime to be asked to stop the pod", held.entered)
+		n.rt.forget(id)
+		if _, err := n.r.GetPods(context.Background()); err != nil {
+			t.Fatalf("GetPods: %v", err)
+		}
+		n.checkOverrides(t, "after the backstop's NotFound", sets, map[string]string{pub: leaseFirst})
+		close(held.release)
+		if err := <-done; err != nil {
+			t.Fatalf("DeletePod: %v", err)
+		}
+		n.checkOverrides(t, "after the stop", sets+1, map[string]string{})
+	})
+
+	t.Run("a retry that succeeds drops an override the failed stop left", func(t *testing.T) {
+		t.Parallel()
+		pod := portedVMPod("team-a", "retried")
+		n, _, pub := servingVMPod(t, pod, nil)
+		sets, _ := n.sink.snapshot()
+		n.answerStops(status.Error(codes.DeadlineExceeded, "stop lost"))
+		if err := n.r.DeletePod(context.Background(), pod); err == nil {
+			t.Fatal("DeletePod returned nil for a stop that failed")
+		}
+		n.checkOverrides(t, "after the failure", sets, map[string]string{pub: leaseFirst})
+		n.answerStops(nil)
+		if err := n.r.DeletePod(context.Background(), pod); err != nil {
+			t.Fatalf("retried DeletePod: %v", err)
+		}
+		n.checkOverrides(t, "after the retried stop", sets+1, map[string]string{})
+	})
+
+	t.Run("the guard holds until a release a call in flight owes", func(t *testing.T) {
+		t.Parallel()
+		pod := portedVMPod("team-a", "owed")
+		n, id, _ := servingVMPod(t, pod, nil)
+		sets, _ := n.sink.snapshot()
+		n.r.beginUpdate(id)
+		if err := n.r.DeletePod(context.Background(), pod); err != nil {
+			t.Fatalf("DeletePod: %v", err)
+		}
+		n.checkOverrides(t, "after the stop", sets+1, map[string]string{})
+		if _, recorded := n.adapt.GuestNetwork(id); !recorded {
+			t.Fatal("the guest record went before the call in flight ended, so the mark is not what refuses")
+		}
+		n.r.emit(n.rt.deletedStatus(id, leaseFirst))
+		n.checkOverrides(t, "after a DELETED with the old lease", sets+1, map[string]string{})
+		n.r.updateDone(pod)
+		n.checkOverrides(t, "after the owed release", sets+1, map[string]string{})
+		if got := n.releaseMarks(); got != 0 {
+			t.Errorf("%d release marks left after the owed release, want none", got)
+		}
+	})
 
 	t.Run("a container that was not ready stays not ready during the stop", func(t *testing.T) {
 		t.Parallel()
@@ -277,80 +479,60 @@ func TestDeletingVMPodStopsProbesAndKeepsItsOverrideDown(t *testing.T) {
 	t.Run("preStop still reaches the pod through its relay, with the probes already ended", func(t *testing.T) {
 		t.Parallel()
 		// A preStop httpGet dials the pod's published address, and for a vm pod only
-		// the relay answers there, so the override must outlast the hook.
+		// the relay answers there, so the override must outlast the hook and whatever
+		// the runtime reports while the hook runs.
 		pod := portedVMPod("team-a", "prestop")
 		pod.Spec.Containers[0].Lifecycle = &corev1.Lifecycle{PreStop: &corev1.LifecycleHandler{
 			HTTPGet: &corev1.HTTPGetAction{Path: "/drain", Port: intstr.FromInt32(probeHTTPPort)},
 		}}
-		n, id, pub := servingVMPod(t, pod)
+		n, id, pub := servingVMPod(t, pod, nil)
 		pod.Status.PodIP = pub
 		pp := n.proberOf(t, id)
+		sets, _ := n.sink.snapshot()
+		var setsInHook int
 		var overrides map[string]string
 		var ended bool
+		var statusErrs []error
 		hookRan := make(chan struct{})
 		var once sync.Once
 		n.r.probeTransport = roundTripFunc(func(*http.Request) (*http.Response, error) {
 			once.Do(func() {
-				_, live := n.sink.snapshot()
-				overrides = renderOverrides(live)
 				ended = closesWithin(probeLoopsEnded(pp), time.Second)
+				n.rt.setLease(id, "")
+				_, noLeaseErr := n.r.GetPodStatus(context.Background(), pod.Namespace, pod.Name)
+				n.rt.forget(id)
+				_, notFoundErr := n.r.GetPodStatus(context.Background(), pod.Namespace, pod.Name)
+				statusErrs = []error{noLeaseErr, notFoundErr}
+				got, live := n.sink.snapshot()
+				setsInHook, overrides = got, renderOverrides(live)
 				close(hookRan)
 			})
 			return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
 		})
-		if err := n.r.DeletePod(context.Background(), pod); err != nil {
-			t.Fatalf("DeletePod: %v", err)
-		}
+		held := n.holdNextStop()
+		done := make(chan error, 1)
+		go func() { done <- n.r.DeletePod(context.Background(), pod) }()
 		await(t, "the preStop hook to run", hookRan)
-		if overrides[pub] != leaseFirst {
-			t.Errorf("overrides while preStop ran = %v, want %s -> %s", overrides, pub, leaseFirst)
+		await(t, "the runtime to be asked to stop the pod", held.entered)
+		for _, err := range statusErrs {
+			if err != nil {
+				t.Errorf("status during preStop: %v", err)
+			}
+		}
+		if setsInHook != sets || overrides[pub] != leaseFirst {
+			t.Errorf("while preStop ran: %d generations (want %d), overrides %v (want %s -> %s)",
+				setsInHook, sets, overrides, pub, leaseFirst)
 		}
 		if !ended {
 			t.Error("the pod's probes were still running while its preStop hook ran")
 		}
-		n.awaitOverrides(t, map[string]string{})
+		n.checkOverrides(t, "as the stop begins after preStop", sets, map[string]string{pub: leaseFirst})
+		close(held.release)
+		if err := <-done; err != nil {
+			t.Fatalf("DeletePod: %v", err)
+		}
+		n.checkOverrides(t, "after the stop", sets+1, map[string]string{})
 	})
-
-	for _, tc := range []struct {
-		name     string
-		code     codes.Code
-		wantBack bool
-	}{
-		// The runtime refused, so the guest is still serving at its lease and the
-		// next status restores the way to it.
-		{"a refused stop gives the override back", codes.FailedPrecondition, true},
-		// The stop may have happened, and a lease with no guest behind it is one
-		// macOS can hand on, so the override stays down until a retry settles it.
-		{"a stop that may have happened keeps the override down", codes.Unavailable, false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			pod := portedVMPod("team-a", "refused")
-			n, id, pub := servingVMPod(t, pod)
-			n.answerStops(status.Error(tc.code, "stop failed"))
-			if err := n.r.DeletePod(context.Background(), pod); err == nil {
-				t.Fatal("DeletePod returned nil for a stop the runtime failed")
-			}
-			n.readStatus(t, pod)
-			want := map[string]string{}
-			if tc.wantBack {
-				want[pub] = leaseFirst
-			}
-			n.awaitOverrides(t, want)
-
-			n.answerStops(nil)
-			if err := n.r.DeletePod(context.Background(), pod); err != nil {
-				t.Fatalf("retried DeletePod: %v", err)
-			}
-			n.awaitOverrides(t, map[string]string{})
-			if got := n.releaseMarks(); got != 0 {
-				t.Errorf("%d release marks left after the retried teardown, want none", got)
-			}
-			if _, recorded := n.adapt.GuestNetwork(id); recorded {
-				t.Error("the guest record outlived the retried teardown")
-			}
-		})
-	}
 
 	t.Run("a native pod's probes keep running through its stop", func(t *testing.T) {
 		t.Parallel()

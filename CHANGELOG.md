@@ -169,6 +169,7 @@ pin, its date, and the tarball's sha256.
 
 - A `vm` image with paths differing only by case now gets a refusal naming both paths and the fix on a case-insensitive data root, and is refused rather than merged when cloned into a case-insensitive pod rootfs.
 - A `vm` Pod's probes now end when its delete starts, so none runs during `preStop` or while the guest stops. Its relay closes before the guest gets `SIGTERM` and stays closed. It used to close part-way through the grace period and could reopen briefly once the guest had stopped, onto an address macOS may give to another guest. A connection through the relay no longer drains during the grace period. A native Pod's probes are unchanged.
+- A `vm` Pod's probes now end when its delete starts, so none runs during `preStop` or while the guest stops. Its relay now stays up until the guest has stopped, so connections through it can drain and new dials still land during the grace period, then closes once and cannot reopen. It used to close part-way through the grace period and could reopen briefly once the guest had stopped, onto an address macOS may give to another guest. A native Pod's probes are unchanged.
 - The registry now checks a caller's access before it reads the digest or upload id in the request, so
   a caller who may not read or write a repository gets the same 401 or 403 for a malformed digest or
   upload id as for a well-formed one, where it used to get a 400 or 404. A mount whose source the
