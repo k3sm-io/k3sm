@@ -272,11 +272,12 @@ type runtimedRuntime struct {
 	// claimFenceReleaseLocked). Guarded by mu; created on first use.
 	updating map[string]int
 	// held is the set of pods a create or update has begun acquiring for with no
-	// release since: what a refusal has to free, because a refused pod's delete
-	// frees nothing. An address reserved by a startup re-attachment is not in it
-	// (attachPod). Set before the acquiring, cleared by releasePodNetwork. Guarded
-	// by mu; created on first use.
-	held map[string]struct{}
+	// release since, by UID: what a refusal has to free, because a refused pod's
+	// delete frees nothing, and what the orphan reaper frees for a pod with no track.
+	// An address reserved by a startup re-attachment is not in it (attachPod). Set
+	// before the acquiring, cleared by releasePodNetwork. Guarded by mu; created on
+	// first use.
+	held map[string]*corev1.Pod
 	// deleteOwed holds, per pod id, a delete that landed behind a create or an
 	// UpdatePod in flight, or a create's refusal beside an UpdatePod in flight. The
 	// release and the track delete are the last call out's
@@ -2023,7 +2024,7 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	// resolver refuses an unreferenced object. The create deadline bounds the
 	// Forbidden retry of every read this create makes, together.
 	r.mu.Lock()
-	r.noteHeldLocked(string(pod.UID))
+	r.noteHeldLocked(pod)
 	r.mu.Unlock()
 	r.refs.RegisterPod(pod)
 	ctx = r.refs.withCreateFetchBudget(ctx)
@@ -2045,8 +2046,8 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	// Ordering: allocate the pod's /32 BEFORE translation/env
 	// resolution so box.PodIp and the status.podIP downward-API env carry it. A
 	// translate failure below does NOT release it here (an idempotent retry, a
-	// later refusal or a DeletePod reclaims it, though Virtual Kubelet may send no
-	// DeletePod for such a pod: claimFenceReleaseLocked names that gap;
+	// later refusal or a DeletePod reclaims it, or the orphan reaper once the object
+	// is gone, since Virtual Kubelet may send no DeletePod for such a pod;
 	// auto-releasing would also rip a live pod's alias away on an UpdatePod
 	// translate error).
 	podIP, err := r.podIP(ctx, pod)
@@ -2546,7 +2547,7 @@ func (r *runtimedRuntime) checkUpdate(ctx context.Context, pod *corev1.Pod) (t *
 	}
 	// A spec change (an ephemeral container added) can add references; the
 	// registration is replaced, so a removed reference stops being fetchable.
-	r.noteHeldLocked(id)
+	r.noteHeldLocked(pod)
 	r.refs.RegisterPod(pod)
 	if tracked {
 		previous = t.pod

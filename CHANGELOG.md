@@ -144,6 +144,7 @@ pin, its date, and the tarball's sha256.
   blobs now has to push the blobs first. A descriptor's inline `data` is not honoured: the blob must be in
   the repository, the empty descriptor's included. An index's children and a manifest's subject still need
   not be present; the PUT restarts the garbage collection grace of those that are, on a best-effort basis.
+- A pod whose create failed and which was then deleted no longer keeps its address and references until the node restarts. The orphan reaper releases them once the apiserver has stopped holding the pod.
 - `k3sm` and the etcd, kine and zot it builds now link `github.com/klauspost/compress` v1.20.2, which fixes GO-2026-6865, a panic on two-block frames. Every node re-stages kine and zot on upgrade.
 - Turning Spotlight indexing off for the data volume no longer waits indefinitely on `mdutil`. The
   `.metadata_never_index` marker is what excludes the volume and is written first, so the `mdutil`

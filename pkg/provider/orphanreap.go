@@ -55,6 +55,12 @@ import (
 //     UID) is still installed — the identity re-check untrackRejectedCreate
 //     makes — and then runs the full DeletePod teardown (runtime RPC, /32
 //     release, log tree, transport override, apiserver delete) minus preStop.
+//  5. A pod that holds a /32 or references and has no track is judged the same way
+//     (held UIDs with no call out): the track-keyed steps above never see it. It is
+//     what a failed create leaves, whose pod Virtual Kubelet then removes from the
+//     apiserver without a DeletePod. What it holds goes through the release a refused
+//     pod's takes (claimUntrackedHoldLocked). A pod still listed costs no Get, so a
+//     create retrying on its back-off keeps its address.
 
 const (
 	// orphanReapInterval is the reaper's cadence. It is deliberately SLOWER than
@@ -137,8 +143,9 @@ func (r *runtimedRuntime) runOrphanReaper(ctx context.Context) {
 	}
 }
 
-// orphanCandidate is a tracked pod as snapshotted under r.mu at the start of a
-// tick: the track (whose pointer identity the reap re-checks) and its pod.
+// orphanCandidate is a pod as snapshotted under r.mu at the start of a tick: the
+// track (whose pointer identity the reap re-checks) and its pod. A nil track is a
+// UID that holds something with no track and no call out.
 type orphanCandidate struct {
 	t   *podTrack
 	pod *corev1.Pod
@@ -177,6 +184,11 @@ func (r *runtimedRuntime) reapOrphans(ctx context.Context) {
 	for id, t := range r.track {
 		tracked[id] = orphanCandidate{t: t, pod: t.pod} // the pointer only; see GetPods
 	}
+	for id, pod := range r.held {
+		if _, ok := r.track[id]; !ok && !r.inFlightLocked(id) {
+			tracked[id] = orphanCandidate{pod: pod}
+		}
+	}
 	r.mu.Unlock()
 
 	r.pruneOrphanGauges(tracked)
@@ -191,8 +203,33 @@ func (r *runtimedRuntime) reapOrphans(ctx context.Context) {
 		if !r.recordOrphanVerdict(id, v) {
 			continue
 		}
+		if c.t == nil {
+			r.reapUntrackedHold(id)
+			continue
+		}
 		r.reapOrphan(ctx, c.pod, c.t)
 	}
+}
+
+// reapUntrackedHold frees what a pod with no track holds, once the apiserver has been
+// seen not to hold it orphanReapThreshold ticks in a row. The decision is taken again
+// under r.mu, as a create or an update of the UID may have started since the verdict;
+// the gauge goes either way, and that call's outcome decides what the next tick sees.
+func (r *runtimedRuntime) reapUntrackedHold(id string) {
+	r.mu.Lock()
+	pod := r.held[id]
+	claim := r.claimUntrackedHoldLocked(id)
+	r.mu.Unlock()
+	r.orphanMu.Lock()
+	delete(r.orphanGauges, id)
+	r.orphanMu.Unlock()
+	if claim == nil {
+		return
+	}
+	r.log.Info("orphan reaper: the apiserver no longer holds a pod that holds an address or references with no track; releasing them",
+		"namespace", pod.Namespace, "name", pod.Name, "uid", id,
+		"consecutiveNotFound", orphanReapThreshold)
+	r.fenceRelease(pod, claim)
 }
 
 // liveVerdict confirms, with a direct apiserver Get, whether a pod the List did
@@ -242,8 +279,9 @@ func (r *runtimedRuntime) recordOrphanVerdict(id string, v orphanVerdict) bool {
 	return g.record(raw) == outcomeFailure
 }
 
-// pruneOrphanGauges drops the gauge of every pod id no longer tracked, so a
-// pod forgotten by any path leaves no counter behind.
+// pruneOrphanGauges drops the gauge of every pod id no longer a candidate, so a
+// pod forgotten by any path leaves no counter behind, and a call out for a UID that
+// holds with no track starts its count again.
 func (r *runtimedRuntime) pruneOrphanGauges(tracked map[string]orphanCandidate) {
 	r.orphanMu.Lock()
 	defer r.orphanMu.Unlock()

@@ -389,13 +389,16 @@ func (r *runtimedRuntime) updateWaitLocked(id string) <-chan struct{} {
 	return ch
 }
 
-// noteHeldLocked records that a create or update of pod id is about to acquire.
-// The caller holds r.mu.
-func (r *runtimedRuntime) noteHeldLocked(id string) {
+// noteHeldLocked records that a create or update of pod is about to acquire, with
+// what a release and the orphan reaper's live read need of the pod: its namespace,
+// name and UID. The caller holds r.mu.
+func (r *runtimedRuntime) noteHeldLocked(pod *corev1.Pod) {
 	if r.held == nil {
-		r.held = map[string]struct{}{}
+		r.held = map[string]*corev1.Pod{}
 	}
-	r.held[id] = struct{}{}
+	r.held[string(pod.UID)] = &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Namespace: pod.Namespace, Name: pod.Name, UID: pod.UID,
+	}}
 }
 
 // updateStoppedNow reports whether an update past its check has to stop acquiring:
@@ -527,17 +530,18 @@ func (r *runtimedRuntime) inFlightLocked(id string) bool {
 // release in progress has none in flight beside it. The caller holds r.mu.
 //
 // "Once" covers what reaches this decision. Still open:
-//   - A create that failed and left no track, whose pod is then deleted with no
-//     container running, whether the delete came during the create or after it.
-//     Virtual Kubelet runs one call per pod key, removes such a pod from the apiserver
-//     without calling DeletePod (syncPodInProvider, node/podcontroller.go), and finds
-//     no track when the object goes, and the orphan reaper keys on tracks. What the
-//     create took stays until the daemon restarts or a refusal of the same UID.
 //   - A create whose RPC succeeds behind a delete: the guest the runtime built is not
 //     deleted again, unlike a parked retry's (commitParkedCreate). Its /32 is released.
 //   - An untracked update with no deletion stamp that is not behind a delete of its
 //     UID, or is behind one uidTombstones has evicted: it allocates as it always did,
-//     and only a later create, delete or refusal of the UID frees that.
+//     and a later create, delete or refusal of the UID frees that, or the orphan
+//     reaper once the object is gone.
+//
+// A create that failed and left no track, whose pod is then deleted with no container
+// running, reaches no decision here at all: Virtual Kubelet removes such a pod from
+// the apiserver without calling DeletePod (syncPodInProvider, node/podcontroller.go)
+// and finds no track when the object goes. The orphan reaper frees what it took
+// (claimUntrackedHoldLocked).
 func (r *runtimedRuntime) claimFenceReleaseLocked(id string) *fenceClaim {
 	if r.inFlightLocked(id) || r.fenceReleasing[id] != nil {
 		return nil
@@ -560,8 +564,28 @@ func (r *runtimedRuntime) claimFenceReleaseLocked(id string) *fenceClaim {
 	default:
 		return nil
 	}
-	// Consumed here, not when the release runs: a release that panics is not
-	// claimed a second time.
+	return r.publishFenceReleaseLocked(id, del)
+}
+
+// claimUntrackedHoldLocked decides, under r.mu, that the orphan reaper releases what
+// a pod with no track holds, once the apiserver has been seen not to hold the UID. It
+// returns nil when a call of the pod is out or a release is running, as either owns
+// the decision, and when a track has appeared or nothing is held. A create that starts
+// behind the claim waits for the release on fenceReleasing, and what it takes is held
+// again, for a later sweep. The UID's tombstone stops a stale update of it. The caller
+// holds r.mu.
+func (r *runtimedRuntime) claimUntrackedHoldLocked(id string) *fenceClaim {
+	if r.inFlightLocked(id) || r.fenceReleasing[id] != nil || r.track[id] != nil || r.held[id] == nil {
+		return nil
+	}
+	r.tombstones.add(id)
+	return r.publishFenceReleaseLocked(id, nil)
+}
+
+// publishFenceReleaseLocked consumes pod id's hold and publishes the release that is
+// about to run. Consumed here, not when the release runs: a release that panics is
+// not claimed a second time. The caller holds r.mu.
+func (r *runtimedRuntime) publishFenceReleaseLocked(id string, del *owedDelete) *fenceClaim {
 	delete(r.held, id)
 	released := make(chan struct{})
 	if r.fenceReleasing == nil {
