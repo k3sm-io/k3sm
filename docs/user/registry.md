@@ -575,7 +575,10 @@ Nothing is deleted in any of these cases. Each shows on every sweep in the
 - **`manifest unreadable`.** A stored manifest cannot be read, so the sweep of that repository
   stops and the others go on. The server now refuses such a manifest at push, but one pushed
   earlier stays until you delete it: delete its tag, or its digest if it has no tag, and sweeps of
-  that repository run again. The error names the digest.
+  that repository run again. The error names the digest. An index's child that has no row of its
+  own stops the sweep the same way only when it is over the 4 MiB manifest limit or its bytes do
+  not hash to its digest: delete the index that names it. Any other blob named as a child does not
+  stop the sweep. It is kept, along with every digest its JSON contains.
 - **`would delete more than half`.** The half-repository brake stopped the sweep of that repository,
   and a `registry gc: sweep stopped` line says how many blobs it held back. Check that the
   repository's tags are the ones you expect.

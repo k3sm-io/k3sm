@@ -48,7 +48,8 @@ limitations under the License.
 // only reports on any other, listing what it would reap. A repository joins the
 // marker from a sweep that planned it with no brake stopping it, so one that
 // is braked or fails, for any reason and for however long, holds no other
-// repository, and once it can be planned it reports before it deletes. A name
+// repository, and once it can be planned it reports before it deletes. One the
+// marker already names stays named through a brake or a failure. A name
 // that leaves the store leaves the marker. A sweep that reviews nothing writes
 // no marker over a store with none. The marker records the store id, a random
 // 128-bit id the store keeps in its root (store.IDFile) and writes with the
@@ -76,6 +77,8 @@ limitations under the License.
 // list, such as a Docker schema1 manifest or any body with a schema1 fsLayers
 // field) stops that repository's sweep: it never deletes on a guess. The server
 // refuses at PUT whatever Readable refuses, so a pusher cannot store such a row.
-// A blob an index merely names as a child is not such a body: without a row it
-// was never accepted as a manifest, so it is kept and not followed (see makePlan).
+// A blob an index names as a child, with no row, stops the sweep too when it is
+// over the size cap or fails its hash. If it verifies but the strict read refuses
+// it, it does not stop the sweep: it may be a blob or an older manifest, so it is
+// kept along with every digest its JSON holds (see makePlan).
 package gc

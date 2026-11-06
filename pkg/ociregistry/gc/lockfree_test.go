@@ -212,6 +212,8 @@ func TestLockedPassAnswersOnlyFromAnUnchangedRead(t *testing.T) {
 		{"appeared since", manifestRead{err: gone}, []store.Blob{{Digest: d, Size: 8}}, true},
 		{"size changed", manifestRead{present: true, size: 8}, []store.Blob{{Digest: d, Size: 9}}, true},
 		{"never read", manifestRead{}, []store.Blob{{Digest: d, Size: 8}}, true},
+		{"refused by the strict read, unchanged", manifestRead{present: true, size: 8, err: &unparsedError{d: d}}, []store.Blob{{Digest: d, Size: 8}}, false},
+		{"refused by the strict read, size changed", manifestRead{present: true, size: 8, err: &unparsedError{d: d}}, []store.Blob{{Digest: d, Size: 9}}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := reads{}

@@ -22,6 +22,8 @@ import (
 	"testing"
 
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
+
+	"k3sm.io/k3sm/pkg/ociregistry/ref"
 )
 
 // FuzzParseRefs holds parseRefs to its fail-closed contract over arbitrary
@@ -59,6 +61,22 @@ func FuzzParseRefs(f *testing.F) {
 			}
 		default:
 			t.Fatalf("accepted mediaType %q: %q", r.MediaType, b)
+		}
+	})
+}
+
+// FuzzScanDigests holds the scan an unreadable child goes through to its
+// contract over arbitrary bodies: it never panics, and it returns only digests
+// ref.ParseDigest accepts.
+func FuzzScanDigests(f *testing.F) {
+	f.Add([]byte(`{"config":{"digest":"` + dgA + `"},"config":null,"n":1e999}`))
+	f.Add([]byte(`[[[[{"a":"` + dgA + `",}`))
+	f.Add([]byte("\x1f\x8bnot json"))
+	f.Fuzz(func(t *testing.T, b []byte) {
+		for _, d := range scanDigests(b) {
+			if _, err := ref.ParseDigest(d.String()); err != nil {
+				t.Fatalf("returned %q from %q: %v", d, b, err)
+			}
 		}
 	})
 }

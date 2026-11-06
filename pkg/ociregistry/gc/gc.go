@@ -17,6 +17,7 @@ limitations under the License.
 package gc
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -207,11 +208,13 @@ func New(s *store.Store, o Options) (*Collector, error) {
 // Review is per repository. The marker, bound to the store id, names the
 // repositories a report-only sweep has reviewed, and only those are swept for
 // deletion. Any other repository is reported on, and the sweep adds it to the
-// marker when its plan was made and no brake stopped it. A repository that is
-// braked or failed, for any reason and however long, stays out of the marker:
-// it holds no other repository, and the first sweep that can plan it without a
-// brake reports what it would reap before a later one reaps it. A name that has
-// left the store leaves the marker, so a repository that comes back is new.
+// marker when its plan was made and no brake stopped it. A repository not yet
+// reviewed that is braked or failed, for any reason and however long, stays out
+// of the marker: it holds no other repository, and the first sweep that can plan
+// it without a brake reports what it would reap before a later one reaps it. A
+// reviewed repository stays in the marker when it is braked or fails, so a
+// failure that passes does not send it back to report-only. A name that has left
+// the store leaves the marker, so a repository that comes back is new.
 // A sweep that reviewed nothing writes no marker over a store that has none,
 // so content restored into it later still gets a report-only sweep.
 func (c *Collector) Sweep(ctx context.Context) (Report, error) {
@@ -394,6 +397,13 @@ type manifestRead struct {
 	err     error
 }
 
+// verified reports whether the mark read a body that hashed to its digest and
+// was within the size cap, whether or not the strict read accepted it.
+func (e manifestRead) verified() bool {
+	var u *unparsedError
+	return e.err == nil || errors.As(e.err, &u)
+}
+
 // reads holds a mark's manifest reads by digest.
 type reads map[digest.Digest]manifestRead
 
@@ -425,7 +435,9 @@ func (r reads) unlocked(read func(digest.Digest) ([]byte, error)) func(digest.Di
 // locked returns the locked pass's refsOf over the re-stated contents cont.
 // It reads nothing: it answers from the mark's read when the blob is still
 // there, or still absent, and has the size the mark read, and otherwise
-// returns errStale. A digest the mark never read is errStale too.
+// returns errStale. A digest the mark never read is errStale too. The size is
+// compared for every body the mark verified, one the strict read refused
+// included, since a plan can go on from that read.
 //
 // A body is the content its digest names (the mark verified it, and the
 // store writes a blob only under the digest of its bytes), so a present blob
@@ -441,7 +453,7 @@ func (r reads) locked(cont store.Contents) func(digest.Digest) (refs, error) {
 			return refs{}, errStale
 		}
 		size, present := sizes[d]
-		if present != e.present || (present && e.err == nil && size != e.size) {
+		if present != e.present || (present && e.verified() && size != e.size) {
 			return refs{}, errStale
 		}
 		return e.refs, e.err
@@ -736,13 +748,59 @@ type refs struct {
 // when it has a manifests array; anything else, Docker schema1 included, is
 // unreadable. An image manifest without a config is unreadable too, and so is
 // any body with a Docker schema1 fsLayers field, even at schemaVersion 2, so
-// a schema1-shaped body never reads as one that references nothing.
+// a schema1-shaped body never reads as one that references nothing. A refusal
+// is an *unparsedError, which carries every digest the body might name.
 func parseRefs(d digest.Digest, b []byte) (refs, error) {
 	r, err := parseBody(b)
 	if err != nil {
-		return refs{}, fmt.Errorf("%w: %s: %v", ErrUnreadable, d, err)
+		return refs{}, &unparsedError{d: d, cause: err, named: scanDigests(b)}
 	}
 	return r, nil
+}
+
+// unparsedError is a body that hashed to its digest and was within the size cap
+// but that the strict read refused. It is ErrUnreadable, and unlike a body too
+// large or failing its hash, its bytes are known, so named holds all a reader
+// could take it to reference.
+type unparsedError struct {
+	d     digest.Digest
+	cause error
+	named []digest.Digest
+}
+
+func (e *unparsedError) Error() string {
+	return fmt.Sprintf("%v: %s: %v", ErrUnreadable, e.d, e.cause)
+}
+
+func (e *unparsedError) Unwrap() error { return ErrUnreadable }
+
+// scanDigests returns every string in the JSON body b that ref.ParseDigest
+// accepts, at any depth and at every occurrence of a repeated key. It stops at
+// the first thing that is not JSON and returns what it found before it. Object
+// keys count too: the decoder's tokens do not tell them from values, and keeping
+// too much is the safe side.
+//
+// b is at most store.MaxManifestSize, every token consumes input, and the decoder
+// does not recurse per level, so a hostile body costs time and memory linear in
+// its size. Nesting past the decoder's depth limit, which json.Unmarshal shares,
+// ends the scan like any other break: no reader could take such a body for a
+// manifest. UseNumber keeps a number no float64 can hold, valid JSON the strict
+// read skips, from ending the scan early.
+func scanDigests(b []byte) []digest.Digest {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.UseNumber()
+	var out []digest.Digest
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return out
+		}
+		if s, ok := tok.(string); ok {
+			if d, err := ref.ParseDigest(s); err == nil {
+				out = append(out, d)
+			}
+		}
+	}
 }
 
 // Readable returns why the collector could not read body as a manifest, or nil.
@@ -800,18 +858,23 @@ func parseBody(b []byte) (refs, error) {
 // A kept manifest whose body is missing (other than an index child, which the
 // spec does not require) or does not parse fails the plan. refsOf returns what
 // manifest d references: an error wrapping store.ErrBlobUnknown for a missing
-// body, ErrUnreadable for one that does not verify or parse, or errStale,
-// which fails the plan unwrapped.
+// body, ErrUnreadable for one that does not verify or parse (an *unparsedError
+// for one that verified), or errStale, which fails the plan unwrapped.
 //
-// An index child with no row in idx is the exception. A child is not required
-// to exist at PUT and its descriptor says what the pusher likes, so any blob
-// can be named as one, and failing the plan on it would let a pusher stop the
-// repository's sweeps for good. A manifest this store accepted has a row until
-// a delete or a sweep removes it, and the server stores only what parseBody
-// reads, so a body with no row that is unreadable was pushed as a blob: the
-// blob is kept, and nothing is followed from it. A body with no row that does
-// read is followed, and a child with a row that is unreadable fails the plan. A
-// child digest that is not a digest is skipped: no blob can have it.
+// An index child with no row in idx is the one exception, and only for a body
+// that hashes to its digest and is within the size cap. A child is not required
+// to exist at PUT and its descriptor says what the pusher likes, so any blob can
+// be named as one, and failing the plan on it would let a pusher stop the
+// repository's sweeps. But a body the strict read refuses may still be a real
+// manifest, stored before the read grew stricter, so it says nothing about what
+// is safe to delete. The child is kept, and every digest scanDigests finds in its
+// body stays referenced. Those digests are referenced only: none is read as a
+// manifest, so what they name in turn is not followed.
+//
+// A child with no row that is too large or fails its hash fails the plan, since
+// its bytes cannot be told from a manifest damaged in the store. So does a child
+// with a row that is unreadable. A body with no row that does read is followed.
+// A child digest that is not a digest is skipped: no blob can have it.
 func makePlan(idx ispec.Index, cont store.Contents, cutoff time.Time, refsOf func(digest.Digest) (refs, error)) (plan, error) {
 	mtime := make(map[digest.Digest]time.Time, len(cont.Blobs))
 	for _, b := range cont.Blobs {
@@ -864,7 +927,11 @@ func makePlan(idx ispec.Index, cont store.Contents, cutoff time.Time, refsOf fun
 		if errors.Is(err, store.ErrBlobUnknown) && !it.required {
 			continue
 		}
-		if errors.Is(err, ErrUnreadable) && !it.required && !hasRow[it.d] {
+		var u *unparsedError
+		if errors.As(err, &u) && !it.required && !hasRow[it.d] {
+			for _, d := range u.named {
+				referenced[d] = true
+			}
 			continue
 		}
 		if err != nil {
