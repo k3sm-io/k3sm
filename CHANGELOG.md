@@ -459,6 +459,10 @@ pin, its date, and the tarball's sha256.
   empty). It used to give no remedy, and the `sudo rm` the lock file message suggests fails on a
   directory. A directory, a hard-linked file and any other non-regular entry are still refused.
 
+- A pod's address is no longer released from under a new create of the pod when the create that was
+  held for its volume claims is refused. The new create now waits for the release, then allocates its
+  own address. Before, the pod could run with no address reserved for it.
+
 ## v0.2.3 — 2026-10-29
 
 ### Added

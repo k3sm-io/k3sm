@@ -2344,8 +2344,12 @@ func (r *runtimedRuntime) createBehindDelete(id string, t *podTrack) bool {
 // Another create in its RPC is not read here, as none can be beside this removal:
 // a create in its RPC holds a track GetPod answers with, so Virtual Kubelet's next
 // call is UpdatePod, and a parked pod's retry counts as an update
-// (TestRefusedRecreateBesideCreateKeepsTheAddress). Still open: a create that begins
-// behind this removal and allocates before the release below runs.
+// (TestRefusedRecreateBesideCreateKeepsTheAddress). A create that begins behind this
+// removal has GetPod's NotFound, so the release's fence goes up with the removal and
+// holds it until what the UID holds is free; the refused create in flight here acquires
+// nothing more (TestRefusedClaimCreateFencesTheAddressRelease). A release already out
+// keeps its fence, and it or the last call out frees this refusal's too. The fence ends
+// in a defer, past the workers and the log tree, so a panic cannot leave a create waiting.
 func (r *runtimedRuntime) untrackRejectedCreate(pod *corev1.Pod, t *podTrack) {
 	id := string(pod.UID)
 	r.mu.Lock()
@@ -2353,7 +2357,7 @@ func (r *runtimedRuntime) untrackRejectedCreate(pod *corev1.Pod, t *podTrack) {
 	replaced := live != nil && live != t
 	removed := live == t
 	_, owed := r.deleteOwed[id]
-	left := owed || r.updating[id] != 0
+	left := owed || r.updating[id] != 0 || r.fenceReleasing[id] != nil
 	switch {
 	case replaced || owed:
 	case left:
@@ -2361,18 +2365,20 @@ func (r *runtimedRuntime) untrackRejectedCreate(pod *corev1.Pod, t *podTrack) {
 	case removed:
 		delete(r.track, id)
 	}
+	var claim *fenceClaim
+	if !replaced && !left {
+		claim = r.publishFenceReleaseLocked(id, nil)
+	}
 	r.mu.Unlock()
-	if removed && !left {
-		r.refs.UnregisterPod(pod.UID)
+	if claim != nil {
+		defer r.fenceRelease(pod, claim)
 	}
 	t.cancelRestarts()
 	t.cancelPulls()
 	t.cancelPostStart()
-	if replaced || left {
-		return
+	if claim != nil {
+		r.removePodLogs(pod)
 	}
-	r.releasePodNetwork(pod)
-	r.removePodLogs(pod)
 }
 
 // runtimeHoldsPod reports whether runtimed knows the pod, the question a refused
