@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -413,4 +414,123 @@ func (l *Locked) RemoveLayout(idleBefore time.Time) (bool, error) {
 		}
 	}
 	return true, syncDir(l.dir)
+}
+
+// ReapHalfRemovedLayouts removes the layout a stopped RemoveLayout left: a
+// directory holding oci-layout and no index.json, so no longer listed as a
+// repository. It returns the names it reaped. Each candidate is found without
+// the lock, then re-read under its repository lock, and reaped only when it
+// still holds oci-layout, no index.json, no blob, no upload and no entry the
+// store does not recognise: blobs/ may hold only empty algorithm directories
+// and .uploads/ must be empty. Directories of nested names are left alone.
+//
+// A push builds a layout under the same lock (initLocked): directories,
+// oci-layout, then an index.json staged in .uploads and renamed in. The state
+// "oci-layout and no index.json" therefore exists for a live push only while
+// it holds the lock, which this method needs to look; and the staged file sits
+// in .uploads, which keeps the layout from being reaped even then.
+func (s *Store) ReapHalfRemovedLayouts(ctx context.Context) ([]ref.Name, error) {
+	var cands []ref.Name
+	err := filepath.WalkDir(s.root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if p == s.root || !d.IsDir() {
+			return nil
+		}
+		base := d.Name()
+		if base == blobsDir || strings.HasPrefix(base, ".") || strings.HasPrefix(base, "_") {
+			return fs.SkipDir
+		}
+		n, err := ref.NameFromDir(s.root, p)
+		if err != nil {
+			return fs.SkipDir
+		}
+		if halfRemoved(p) {
+			cands = append(cands, n)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list half-removed layouts: %w", err)
+	}
+	var out []ref.Name
+	for _, n := range cands {
+		if s.halfFound != nil {
+			s.halfFound(n)
+		}
+		ok, err := s.reapHalfRemoved(ctx, n)
+		if err != nil {
+			return out, fmt.Errorf("reap half-removed layout %s: %w", n, err)
+		}
+		if ok {
+			out = append(out, n)
+		}
+	}
+	return out, nil
+}
+
+// halfRemoved reports whether dir holds a regular oci-layout and no index.json.
+func halfRemoved(dir string) bool {
+	fi, err := os.Lstat(filepath.Join(dir, layoutFile))
+	if err != nil || !fi.Mode().IsRegular() {
+		return false
+	}
+	_, err = os.Lstat(filepath.Join(dir, indexFile))
+	return errors.Is(err, os.ErrNotExist)
+}
+
+func (s *Store) reapHalfRemoved(ctx context.Context, n ref.Name) (bool, error) {
+	dir, err := s.repoDir(n)
+	if err != nil {
+		return false, err
+	}
+	unlock, err := s.lock(ctx, n)
+	if err != nil {
+		return false, err
+	}
+	defer unlock()
+	if !halfRemoved(dir) {
+		return false, nil
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return false, err
+	}
+	rm := []string{filepath.Join(dir, layoutFile)}
+	var algs []string
+	for _, e := range ents {
+		switch {
+		case e.Name() == layoutFile, e.IsDir() && e.Name() != blobsDir && e.Name() != uploadsDir:
+			// oci-layout, or a nested repository name's directory
+		case e.Name() == uploadsDir && e.IsDir():
+			sub, err := os.ReadDir(filepath.Join(dir, uploadsDir))
+			if err != nil || len(sub) > 0 {
+				return false, err
+			}
+			rm = append(rm, filepath.Join(dir, uploadsDir))
+		case e.Name() == blobsDir && e.IsDir():
+			sub, err := os.ReadDir(filepath.Join(dir, blobsDir))
+			if err != nil {
+				return false, err
+			}
+			for _, a := range sub {
+				ae, err := os.ReadDir(filepath.Join(dir, blobsDir, a.Name()))
+				if !a.IsDir() || err != nil || len(ae) > 0 {
+					return false, nil
+				}
+				algs = append(algs, filepath.Join(dir, blobsDir, a.Name()))
+			}
+			algs = append(algs, filepath.Join(dir, blobsDir))
+		default:
+			return false, nil // a file or kind the store does not recognise
+		}
+	}
+	rm = append(rm, algs...)
+	for _, d := range rm {
+		if err := os.Remove(d); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return false, err
+		}
+	}
+	return true, syncDir(dir)
 }

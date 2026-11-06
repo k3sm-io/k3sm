@@ -105,6 +105,9 @@ type Store struct {
 	// indexRemoved, when set, runs in RemoveLayout right after index.json is
 	// removed; an error stops the removal there (a seam for crash tests).
 	indexRemoved func() error
+	// halfFound, when set, runs in ReapHalfRemovedLayouts after a candidate is
+	// found and before its lock is taken (a seam for race tests).
+	halfFound func(n ref.Name)
 	// dirRead, when set, runs before WalkRepositories reads a directory (a
 	// seam for tests that count the walk's work).
 	dirRead func(dir string)

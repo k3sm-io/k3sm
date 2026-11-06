@@ -16,6 +16,12 @@ limitations under the License.
 
 package store
 
+import "k3sm.io/k3sm/pkg/ociregistry/ref"
+
 // SetIndexRemoved sets the seam RemoveLayout runs right after index.json is
 // removed, for the external crash test that drives it through a GC sweep.
 func SetIndexRemoved(s *Store, fn func() error) { s.indexRemoved = fn }
+
+// SetHalfFound sets the seam ReapHalfRemovedLayouts runs between finding a
+// candidate and locking it.
+func SetHalfFound(s *Store, fn func(n ref.Name)) { s.halfFound = fn }
