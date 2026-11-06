@@ -53,6 +53,7 @@ import (
 	"k3sm.io/k3sm/pkg/install/order"
 	"k3sm.io/k3sm/pkg/netdsvc"
 	"k3sm.io/k3sm/pkg/provider/podlogs"
+	"k3sm.io/k3sm/pkg/registrysvc"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 	"k3sm.io/runtimed/pkg/sandbox"
 )
@@ -1831,6 +1832,19 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	return err
 }
 
+// removeLeftoverZot removes the zot an earlier release staged in the server's work
+// dir, with its version marker, once the install can no longer be rolled back. The
+// new server never runs it, and a later rollback reinstall seeds its own from its
+// own payload. A file left behind costs nothing, so a failure is logged and survived.
+func removeLeftoverZot(sys System, cfg Config) {
+	bin := filepath.Join(cfg.serverWorkDir(), "bin")
+	for _, name := range []string{registrysvc.ZotBinaryName, registrysvc.ZotMarkerName} {
+		if err := sys.RemoveEntry(bin, name); err != nil {
+			cfg.Logger.Warn("could not remove the zot an earlier release left in the work dir", "dir", bin, "name", name, "err", err)
+		}
+	}
+}
+
 func install(ctx context.Context, sys System, cfg Config, res *Result) (err error) {
 	cfg = cfg.withDefaults()
 	// Taken before anything is written. The post-restart verification counts a
@@ -2453,6 +2467,7 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	if previous {
 		reapPreviousRoot(sys, cfg)
 	}
+	removeLeftoverZot(sys, cfg)
 
 	// 5. Write the admin kubeconfig to the human's home (owned by them, not root)
 	//    — on a CONTROL PLANE only. A worker has no apiserver of its own and no
