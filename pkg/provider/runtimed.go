@@ -382,6 +382,10 @@ func (r *runtimedRuntime) Close() error {
 type podTrack struct {
 	pod       *corev1.Pod
 	startTime metav1.Time
+	// landedBehindDelete says this track's create landed behind a delete of its UID
+	// (createBehindDelete): the create removes its guest, and the delete forgets the
+	// track, whichever track that delete claimed. Guarded by r.mu.
+	landedBehindDelete bool
 
 	// readyMu guards lastReady, the last PodReady condition buildStatus computed for
 	// this pod. It is a STABLE prior for readyTransitionTime so PodReady's
@@ -2314,9 +2318,11 @@ func (r *runtimedRuntime) createBehindDelete(id string, t *podTrack) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if del := r.deleteOwed[id]; (del != nil && !del.refusal) || trackDeleting(t) || r.deleteInRPC[id] != 0 {
+		t.landedBehindDelete = true
 		return true
 	}
 	if live := r.track[id]; live != nil && trackDeleting(live) {
+		t.landedBehindDelete = true
 		return true
 	}
 	r.withdrawRefusalLocked(id, t)
@@ -3091,12 +3097,13 @@ func (r *runtimedRuntime) forgetTorndown(pod *corev1.Pod, owned *podTrack) {
 	t := r.track[id]
 	forget := false
 	switch {
-	case owned == nil, t == owned:
+	case owned == nil, t == owned, t != nil && t.landedBehindDelete:
 		delete(r.track, id)
 		forget = true
 	default:
 		// A track replaced since the reaper claimed its own is someone
-		// else's to forget (see owned above).
+		// else's to forget (see owned above), unless its create landed behind
+		// this delete: that guest is stopped, and the track describes nothing.
 		t = nil
 	}
 	r.mu.Unlock()
