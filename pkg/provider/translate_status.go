@@ -45,9 +45,9 @@ func protoTime(ts *timestamppb.Timestamp) metav1.Time {
 //   - a stable StartTime (passed in from CreatePod, not the per-snapshot value
 //     runtimed regenerates),
 //   - per-container Started (*bool) and Ready,
-//   - terminated Reason/ExitCode/Signal carried verbatim (not the HostProcess
-//     "Error"
-//     heuristic) — this is the path the runtimed OOMKilled reason surfaces on,
+//   - terminated Reason/Signal carried verbatim and ExitCode normalized by
+//     terminatedExitCode (not the HostProcess "Error" heuristic) — this is the
+//     path the runtimed OOMKilled reason surfaces on,
 //   - the ContainerStatus mirror (volume_mounts, user),
 //   - the ephemeral container statuses, which are reported but never decide
 //     the phase or any condition,
@@ -636,7 +636,8 @@ func holdForRunningSidecars(pod *corev1.Pod, phase corev1.PodPhase, initCS []cor
 //
 // The rule mirrors the kubelet:
 //   - a pod with no init containers is Initialized (nothing to wait for);
-//   - a plain init container satisfies it by terminating with exit code 0;
+//   - a plain init container satisfies it by terminating with exit code 0 and
+//     no signal;
 //   - a native sidecar (init container with restartPolicy: Always, KEP-753)
 //     satisfies it by having started — it is long-running by design and never
 //     terminates before the mains;
@@ -662,7 +663,7 @@ func computeInitialized(pod *corev1.Pod, initCS []corev1.ContainerStatus) corev1
 			// no status yet
 		case sidecar && st.Started != nil && *st.Started:
 			continue
-		case !sidecar && st.State.Terminated != nil && st.State.Terminated.ExitCode == 0:
+		case !sidecar && st.State.Terminated != nil && st.State.Terminated.ExitCode == 0 && st.State.Terminated.Signal == 0:
 			continue
 		}
 		cond.Status = corev1.ConditionFalse
@@ -698,9 +699,10 @@ func qualifyContainerID(id string) string {
 }
 
 // toContainerStatuses maps runtime container statuses to corev1, carrying the
-// terminated Reason/ExitCode/Signal verbatim (so the runtimed OOMKilled reason
-// surfaces) and deriving Ready/Started, plus the mirror fields (volume_mounts
-// + user) so kubectl describe / get -o yaml stays a lossless mirror.
+// terminated Reason/Signal verbatim (so the runtimed OOMKilled reason surfaces)
+// and ExitCode through terminatedExitCode, and deriving Ready/Started, plus the
+// mirror fields (volume_mounts + user) so kubectl describe / get -o yaml stays a
+// lossless mirror.
 func toContainerStatuses(rcs []*runtimev1.ContainerStatus) []corev1.ContainerStatus {
 	if len(rcs) == 0 {
 		return nil
@@ -771,8 +773,6 @@ func toContainerUser(u *runtimev1.ContainerUser) *corev1.ContainerUser {
 	}
 }
 
-// toContainerState maps a runtime ContainerState to corev1, preserving the
-// terminated fields exactly (ExitCode, Signal, Reason, Message, timestamps).
 // waitingReasonFor renders the kubelet's waiting reason for a runtimed waiting
 // entry, switching on its TYPED failure_reason rather than on any text: runtimed
 // owns the cause, the provider owns the vocabulary the kubelet's consumers read
@@ -806,6 +806,23 @@ func waitingReasonFor(w *runtimev1.ContainerStateWaiting) string {
 	}
 }
 
+// terminatedExitCode is the exit code a terminated container publishes: 128+signal
+// when a signal killed it and the runtime reported exit code 0, otherwise the
+// code as reported. A guest reports a signal death as signal n with exit code 0,
+// where the host reaper reports it as signal n with 128+n, and upstream consumers
+// read only the code: 137 is what they know as a SIGKILL, and 0 reads as success.
+func terminatedExitCode(code, signal int32) int32 {
+	if code == 0 && signal > 0 {
+		return 128 + signal
+	}
+	return code
+}
+
+// toContainerState maps a runtime ContainerState to corev1, preserving the
+// terminated fields (Signal, Reason, Message, timestamps) exactly and rendering
+// ExitCode through terminatedExitCode. Every reader of a termination comes through
+// here, so the status, the restart decision, the termination message and the budget
+// history see one exit code.
 func toContainerState(rstate *runtimev1.ContainerState) corev1.ContainerState {
 	if rstate == nil {
 		return corev1.ContainerState{}
@@ -818,7 +835,7 @@ func toContainerState(rstate *runtimev1.ContainerState) corev1.ContainerState {
 	case rstate.GetTerminated() != nil:
 		t := rstate.GetTerminated()
 		return corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
-			ExitCode:    t.GetExitCode(),
+			ExitCode:    terminatedExitCode(t.GetExitCode(), t.GetSignal()),
 			Signal:      t.GetSignal(),
 			Reason:      t.GetReason(),
 			Message:     t.GetMessage(),
