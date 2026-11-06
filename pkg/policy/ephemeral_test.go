@@ -181,10 +181,12 @@ func TestPodPoliciesHaveEphemeralContainersVerdict(t *testing.T) {
 		"EnsureUDPServiceWarn":                 func(cs kubernetes.Interface) error { return EnsureUDPServiceWarn(ctx, cs) },
 		"EnsureProviderTolerationWarn":         func(cs kubernetes.Interface) error { return EnsureProviderTolerationWarn(ctx, cs) },
 		"EnsureDefaultLimitRange":              func(cs kubernetes.Interface) error { return EnsureDefaultLimitRange(ctx, cs) },
+		"EnsureRejectUnrunnableVMPod":          func(cs kubernetes.Interface) error { return EnsureRejectUnrunnableVMPod(ctx, cs) },
 	}
 
 	verdicts := map[string]ephemeralVerdict{
 		foreignUserPolicyName: {covers: true},
+		vmPodFitPolicyName:    {covers: true},
 		darwinPolicyName: {exemptFields: []string{"spec.nodeSelector"},
 			why: subresourceWritesOnly + " (and nodeSelector is immutable after create)"},
 		providerTolerationPolicyName: {exemptFields: []string{"spec.tolerations"},
