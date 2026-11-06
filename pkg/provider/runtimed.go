@@ -2420,7 +2420,10 @@ func (r *runtimedRuntime) completeCreate(pod *corev1.Pod, t *podTrack, rs *runti
 // containers (the only changes runtimed applies in place); other changes need a
 // recreate and are reported by the runtime as a typed precondition failure,
 // surfaced here as an error. A refused ephemeral append is the exception: it is
-// reported on the debug container, never as the pod's failure.
+// reported on the debug container, never as the pod's failure. A changed image on
+// a pod the runtime holds is not refused and not applied: runtimed answers OK and
+// the container stays on its image. A vm pod reports that as a Warning Event
+// (imageEditsNotApplied), and a native pod does not report it.
 //
 // A pod refused at admission or evicted is terminal and gets no update, as it
 // gets no create: nothing is registered, allocated or sent to the runtime. That
@@ -2438,7 +2441,8 @@ func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error 
 	// Identity binding kept for the SAME in-process seam CreatePod uses, but
 	// UpdatePod itself never mints a token or re-reads a ConfigMap/Secret
 	// through it: runtimed's UpdatePod applies labels/annotations only (its
-	// updatableOnly check rejects any other field change as NOT_UPDATABLE;
+	// updatableOnly check refuses a change of identity or container count as
+	// NOT_UPDATABLE, and answers OK to a changed image without applying it;
 	// pinned there by TestUpdatePodNeverMaterializes in pkg/runtime) and never
 	// materializes. Projected data is re-resolved on a separate path: the
 	// provider's 60 s refresh loop (projectedrefresh.go) calls the runtime's
@@ -2465,6 +2469,7 @@ func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error 
 		return nil
 	}
 	tracked := t != nil
+	guestHeld := false
 	if hook := r.updateCheckedHook; hook != nil {
 		hook(id)
 	}
@@ -2476,8 +2481,14 @@ func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error 
 	if tracked {
 		// A container whose image reference changed is a different pull: retire
 		// the old reference's schedule and attempt the new one now. This is the
-		// only recovery an InvalidImageName container has (runtimed_pull.go).
-		r.retryPullsForChangedImages(t, previous, pod)
+		// only recovery an InvalidImageName container has (runtimed_pull.go). A
+		// guest the runtime holds has no such recovery to run: it pulls nothing for
+		// the edit, and the attempt would only record a Pulling and a Pulled for
+		// an image that was not fetched.
+		guestHeld = guestHoldsImages(t, pod)
+		if !guestHeld {
+			r.retryPullsForChangedImages(t, previous, pod)
+		}
 		if t.claimWaiting() {
 			// A pod held for its claims has nothing in the runtime to update,
 			// exactly as a parked one: the replaced spec above is the update,
@@ -2541,8 +2552,61 @@ func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error 
 		return nil
 	}
 	r.recordEphemeralRejections(previous, pod, "")
+	if guestHeld {
+		for _, e := range imageEditsNotApplied(previous, pod, resp.GetStatus()) {
+			r.recorder.Event(pod, e.eventtype, e.reason, e.message)
+		}
+	}
 	r.dispatch(id, resp.GetStatus())
 	return nil
+}
+
+// guestHoldsImages reports whether pod is a vm pod the runtime holds a guest for,
+// so one whose containers cannot change image: not one parked or waiting on its
+// claims, whose next create is built from the edited spec.
+func guestHoldsImages(t *podTrack, pod *corev1.Pod) bool {
+	backend, err := podSandboxBackend(pod)
+	return err == nil && backend == runtimev1.SandboxBackend_SANDBOX_BACKEND_VM &&
+		t.parkedFailure() == nil && !t.claimWaiting()
+}
+
+// imageEditsNotApplied returns one Warning per container this update moved to an
+// image other than the one it stays on. The old image is read from the runtime's
+// status and not from previous, so a second edit names what runs rather than what
+// the first edit asked for, and an edit back to what runs warns about nothing. A
+// container the status does not report yet is on the image it was last given.
+//
+// The edit is reported and not refused: an error here is what virtual-kubelet
+// turns into a ProviderFailed pod, Failed outright under restartPolicy Never, for
+// a pod that is running fine. The tracked spec keeps the edit, as virtual-kubelet
+// would otherwise send it again on every sync.
+func imageEditsNotApplied(previous, pod *corev1.Pod, rs *runtimev1.PodStatus) []podEvent {
+	was := imagesByContainer(previous)
+	running := make(map[string]string, len(was))
+	for _, css := range [][]*runtimev1.ContainerStatus{rs.GetInitContainerStatuses(), rs.GetContainerStatuses()} {
+		for _, cs := range css {
+			running[cs.GetName()] = cs.GetImage()
+		}
+	}
+	var out []podEvent
+	for _, cs := range [][]corev1.Container{pod.Spec.InitContainers, pod.Spec.Containers} {
+		for i := range cs {
+			c := &cs[i]
+			old, known := was[c.Name]
+			if !known || old == c.Image {
+				continue
+			}
+			runs := running[c.Name]
+			if runs == "" {
+				runs = old
+			}
+			if runs != c.Image {
+				out = append(out, podEvent{corev1.EventTypeWarning, reasonImageEditNotApplied,
+					msgImageEditNotApplied(c.Name, runs, c.Image)})
+			}
+		}
+	}
+	return out
 }
 
 // beginUpdate counts one UpdatePod in flight for pod id; updateDone ends the count.

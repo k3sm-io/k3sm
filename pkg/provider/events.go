@@ -161,7 +161,21 @@ const (
 	// instances, and a container whose shim died loses its exit status and
 	// exec.
 	reasonPodReattached = "PodReattached"
+	// reasonImageEditNotApplied is recorded when spec.containers[].image changes
+	// on a vm pod the runtime holds. The kubelet would restart the container on the
+	// new image. Here the container stays on the old one: the runtime's UpdatePod
+	// applies labels and annotations only, its RestartContainer re-spawns from the
+	// same spec, and a guest's rootfs is shared to it once, at boot. The reason has
+	// no upstream analogue, because upstream the edit always applies.
+	reasonImageEditNotApplied = "ImageEditNotApplied"
 )
+
+// msgImageEditNotApplied is the reasonImageEditNotApplied message. running is
+// what the runtime reports the container on, and edited is what the spec names.
+func msgImageEditNotApplied(container, running, edited string) string {
+	return fmt.Sprintf("Container %q stays on image %q: the spec now names %q, which a running vm pod "+
+		"cannot apply in place. Recreate the pod to run the new image.", container, running, edited)
+}
 
 // msgPodReattached is the PodReattached Event message: what survived the node
 // daemon's restart and what did not, in the terms an operator acts on.
