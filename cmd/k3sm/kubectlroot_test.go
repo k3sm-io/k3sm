@@ -235,6 +235,8 @@ func asRoot(t *testing.T) {
 	prevDir := kubeconfigHandoffDir
 	kubeconfigHandoffDir = t.TempDir()
 	t.Cleanup(func() { kubeconfigHandoffDir = prevDir })
+	anchor := regular(0, 0o644, string(fixtureCA(t)))
+	withClusterAnchor(t, func(string) (sudoKubeconfigFile, error) { return anchor, nil })
 }
 
 // TestKubectlAsRootRunsOnlyARootOwnedBinary runs the whole verb as root over

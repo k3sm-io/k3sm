@@ -258,7 +258,10 @@ func TestRootKubeconfigChoice(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var reads []string
-			files := map[string]sudoKubeconfigFile{filepath.Join(envHome, ".kube", "config"): regular(0, 0o600, inline)}
+			files := map[string]sudoKubeconfigFile{
+				filepath.Join(envHome, ".kube", "config"): regular(0, 0o600, inline),
+				install.AgentClusterCAPath:                regular(0, 0o644, string(fixtureCA(t))),
+			}
 			for p, f := range tt.files {
 				files[p] = f
 			}

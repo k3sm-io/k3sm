@@ -68,7 +68,10 @@ func TestStatusAsRootReadsCheckedBytes(t *testing.T) {
 	t.Run("default server", func(t *testing.T) {
 		in := statusKubeInputs{
 			role: install.RoleServer, workDir: statusWorkDirFixture, exists: func(string) bool { return false },
-			root: fakeRootSources("", map[string]sudoKubeconfigFile{adminKubeconfig: regular(501, 0o600, kubeconfigWithUser(`{token: admin-token}`))}, nil),
+			root: fakeRootSources("", map[string]sudoKubeconfigFile{
+				adminKubeconfig:            regular(501, 0o600, kubeconfigWithUser(`{token: admin-token}`)),
+				install.AgentClusterCAPath: regular(0, 0o644, string(anchor)),
+			}, nil),
 		}
 		kube, source, err := newStatusKube(in)
 		if err != nil {

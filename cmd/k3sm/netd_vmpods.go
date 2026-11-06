@@ -172,7 +172,7 @@ func activateVMPodSet(ctx context.Context, kube authorizerKube, logger *slog.Log
 				"kubeconfig", kube.kubeconfig)
 		case isClusterAnchorError(err):
 			lastWarned = err.Error()
-			logger.Warn("vm pod set cannot start: this worker's root-only cluster CA is missing or unusable; privileged relay ports on vm pod addresses stay refused",
+			logger.Warn("vm pod set cannot start: this node's root-only cluster CA is missing or unusable; privileged relay ports on vm pod addresses stay refused",
 				"kubeconfig", kube.kubeconfig, "remedy", clusterAnchorRemedy)
 		default:
 			logger.Debug("vm pod set not ready; privileged relay binds on vm pod addresses denied until it is",

@@ -48,7 +48,9 @@ import (
 	"k3sm.io/darwin-net/pkg/dns"
 	"k3sm.io/darwin-net/pkg/netd"
 
+	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/dataroot"
+	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/ingresshost"
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/kubeclient"
@@ -101,7 +103,7 @@ func netdFlags(opts *netdOptions) *flag.FlagSet {
 	fs.StringVar(&opts.serviceCIDR, "service-cidr", install.DefaultServiceCIDR, "cluster Service CIDR (REQUIRED so the proxy's ClusterIP VIP aliases are admitted)")
 	fs.IntVar(&opts.serviceUID, "service-uid", -1, "the _k3sm uid the daemon admits as a peer (default: look up _k3sm)")
 	fs.StringVar(&opts.meshKeyDir, "mesh-key-dir", install.MeshKeyDir, "root-only directory the mesh key resolver reads (empty disables ConfigureMesh)")
-	fs.StringVar(&opts.clusterCA, "cluster-ca", "", "the cluster CA certificate a managed update's signer must chain to, and on a worker the CA its Service and Pod informers accept the apiserver by; empty refuses every managed update")
+	fs.StringVar(&opts.clusterCA, "cluster-ca", "", "the root-owned cluster CA certificate a managed update's signer must chain to, and the CA its Service and Pod informers accept the apiserver with")
 	fs.StringVar(&opts.kubeconfig, "kubeconfig", "", "kubeconfig the privileged-port authorizer reads with: Services (VIP and ingress binds), and this node's Pods and EndpointSlices (relay binds on published vm pod addresses) — the control plane's admin kubeconfig on a server, the node credential the join wrote on a worker (empty denies every <1024 bind)")
 	fs.StringVar(&opts.dnsVIP, "dns-vip", dns.DefaultDNSVIP, "cluster DNS VIP the node resolver entry routes svc and the cluster domain to")
 	fs.StringVar(&opts.clusterDomain, "cluster-domain", dns.DefaultClusterDomain, "cluster DNS domain the node resolver entry registers as a match domain")
@@ -352,28 +354,66 @@ type authorizerKube struct {
 	// kubeconfig is --kubeconfig: the server's admin kubeconfig, or a worker's
 	// node credential. "" denies every <1024 bind.
 	kubeconfig string
-	// clusterCA, on a worker, is the root-only cluster CA that decides which
-	// apiserver the informers accept; the kubeconfig then gives only the address
-	// and the credential. It is "" on a server, whose kubeconfig is the one its
-	// own control plane wrote and whose apiserver is its own.
+	// clusterCA is the root-owned cluster CA that decides which apiserver the
+	// informers accept; the kubeconfig then gives only the address and the
+	// credential. It is "" only for an account other than root that names no CA.
 	clusterCA string
 	// readFile reads clusterCA with its owner and mode (readOwnedFile when nil).
 	readFile func(path string) (sudoKubeconfigFile, error)
+	// refuseUnpinned is root holding a kubeconfig with no CA to check it against:
+	// no client is built from it.
+	refuseUnpinned bool
 }
 
-// authorizerKube is the informers' source for these flags. A worker is recognised
-// by either flag, so a plist without --cluster-ca is treated the same way.
+// errNoClusterCAFlag marks a root helper given a kubeconfig that is not one an
+// install wrote, with no --cluster-ca.
+var errNoClusterCAFlag = errors.New("this kubeconfig is not one an install wrote and netd was given no --cluster-ca")
+
+// authorizerKube is the informers' source for these flags. The helper knows its
+// role from its own argv, which only root can write, in a plist or on a command
+// line:
+//
+//   - --cluster-ca names the root-only copy: every plist from this release, and a
+//     worker's from earlier ones.
+//   - --kubeconfig is the default data root's worker credential or server
+//     kubeconfig: an older plist with no --cluster-ca.
+//   - --kubeconfig and --cluster-ca are one server work dir's pair: a server plist
+//     from an earlier release, on any data root. That PKI copy is the service
+//     user's, so it is never the CA used.
+//
+// Otherwise, as root, --cluster-ca is taken as a CA the person holds (readClusterAnchor
+// requires root to own it), and with none the helper refuses. Another account has
+// no privilege to protect and keeps the file's own trust.
 func (o netdOptions) authorizerKube() authorizerKube {
 	k := authorizerKube{kubeconfig: o.kubeconfig}
-	if o.clusterCA == install.AgentClusterCAPath || (o.kubeconfig != "" && o.kubeconfig == install.AgentCredentialPath(install.DefaultDataRoot)) {
+	switch {
+	case o.kubeconfig == "":
+	case o.installedHelper():
 		k.clusterCA = install.AgentClusterCAPath
+	case processEuid() != 0:
+	case o.clusterCA != "":
+		k.clusterCA = o.clusterCA
+	default:
+		k.refuseUnpinned = true
 	}
 	return k
+}
+
+// installedHelper reports flags only an install renders.
+func (o netdOptions) installedHelper() bool {
+	workDir := filepath.Dir(o.kubeconfig)
+	return o.clusterCA == install.AgentClusterCAPath ||
+		o.kubeconfig == install.AgentCredentialPath(install.DefaultDataRoot) ||
+		o.kubeconfig == executor.KubeconfigPath(executor.DefaultWorkDir) ||
+		(o.kubeconfig == executor.KubeconfigPath(workDir) && o.clusterCA == certs.ClusterCACertPath(workDir))
 }
 
 // load checks that the kubeconfig is there and builds the informers' client. Each
 // attempt reads the files again, so a corrected one is picked up on the next retry.
 func (k authorizerKube) load() (*rest.Config, kubernetes.Interface, error) {
+	if k.refuseUnpinned {
+		return nil, nil, errNoClusterCAFlag
+	}
 	if _, err := os.Stat(k.kubeconfig); err != nil {
 		return nil, nil, fmt.Errorf("stat kubeconfig: %w", kubeconfigUnusableError{err: err, missing: errors.Is(err, fs.ErrNotExist)})
 	}
@@ -515,10 +555,15 @@ const authorizerRoleRemedy = "if this Mac changed role, netd still holds the pre
 // without a restart.
 const authorizerInlineRemedy = "give every user and cluster in the file inline credentials (token, client-certificate-data, client-key-data, certificate-authority-data), or restore the file k3sm wrote: on a server `sudo k3sm restart` writes it again; on a worker run `sudo k3sm uninstall`, then `sudo k3sm install` with its join arguments"
 
+// authorizerClusterCARemedy is the remedy named beside errNoClusterCAFlag.
+const authorizerClusterCARemedy = "pass --cluster-ca with a root-owned copy of that cluster's CA, or leave out --kubeconfig to deny every privileged bind; an installed helper needs neither, so if this is one, run `sudo k3sm install` to write its plist again"
+
 // authorizerRemedy picks the remedy for a failure authorizerFailureReason
 // classified as worth a WARN.
 func authorizerRemedy(err error) string {
 	switch {
+	case errors.Is(err, errNoClusterCAFlag):
+		return authorizerClusterCARemedy
 	case isClusterAnchorError(err), isServerNotTrusted(err):
 		return clusterAnchorRemedy
 	case errors.Is(err, kubeclient.ErrCredentialsNotInline):
@@ -662,10 +707,16 @@ func authorizerFailureReason(err error) (reason string, class authorizerFailureC
 	}
 	var unusable kubeconfigUnusableError
 	switch {
+	case errors.Is(err, errNoClusterCAFlag):
+		return "netd is root and has no cluster CA to check this kubeconfig's server against, so it starts no informers", failImmediate, 0
+	case isClusterAnchorError(err) && errors.Is(err, fs.ErrNotExist):
+		// A first install writes the copy seconds after the control plane's CA
+		// appears, so a missing one is the boot race until it has held.
+		return "this node's root-only cluster CA is missing or unusable, and netd starts its informers only with it", failWindowed, missingKubeconfigWarnAfter
 	case isClusterAnchorError(err):
-		return "this worker's root-only cluster CA is missing or unusable, and netd starts its informers only with it", failImmediate, 0
+		return "this node's root-only cluster CA is missing or unusable, and netd starts its informers only with it", failImmediate, 0
 	case isServerNotTrusted(err):
-		return "the apiserver's certificate does not chain to this worker's root-only cluster CA", failWindowed, credentialRejectedWarnAfter
+		return "the apiserver's certificate does not chain to this node's root-only cluster CA", failWindowed, credentialRejectedWarnAfter
 	case !errors.As(err, &unusable):
 		return "", failDebug, 0
 	case errors.Is(err, kubeclient.ErrCredentialsNotInline):
@@ -684,7 +735,7 @@ const serviceInformerSyncTimeout = 10 * time.Second
 
 // startServiceInformer loads the kube source, builds a client, and hands off to
 // runServiceInformer. It returns a retryable error if the kubeconfig is
-// absent/unreadable, holds credentials that are not inline, a worker's root-only
+// absent/unreadable, holds credentials that are not inline, a node's root-only
 // cluster CA is missing or unusable, the client can't be built, or the cache
 // doesn't sync in time.
 func startServiceInformer(ctx context.Context, kube authorizerKube) (corev1listers.ServiceLister, error) {

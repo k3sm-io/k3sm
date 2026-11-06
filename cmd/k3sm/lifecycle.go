@@ -267,10 +267,18 @@ func nodeMarker(sys install.System, dataRoot string) func(ctx context.Context, s
 }
 
 // lifecycleClient builds the client for the kubeconfig lifecycleNodeIdentity chose.
-// A worker's node credential verifies the apiserver by kubeclient.APIServerName; a
-// server's admin kubeconfig is the one its own control plane wrote for its own
-// apiserver.
+// As root, on either role, the file gives the address and the credential, and the
+// root-only cluster CA and kubeclient.APIServerName the trust. A copy that cannot be
+// read is install.ErrNodeIdentity, since retrying cannot fix a local file. Another
+// account uses the file's own CA, a worker's credential with that name.
 func lifecycleClient(dataRoot, kubeconfig string) (*rest.Config, kubernetes.Interface, error) {
+	if processEuid() == 0 {
+		caPEM, err := readClusterAnchor(install.AgentClusterCAPath, clusterAnchorFile)
+		if err != nil {
+			return nil, nil, fmt.Errorf("%w: %w; %s", install.ErrNodeIdentity, err, clusterAnchorRemedy)
+		}
+		return kubeclient.FromCheckedPathWithCA(kubeconfig, caPEM)
+	}
 	if kubeconfig == install.AgentCredentialPath(dataRoot) {
 		return kubeclient.FromCheckedWorkerPath(kubeconfig)
 	}

@@ -57,6 +57,9 @@ type rootKubeSources struct {
 	// readFile reads a file and reports its owner and mode (readOwnedFile in
 	// production).
 	readFile func(path string) (sudoKubeconfigFile, error)
+	// readAnchor reads the root-only cluster CA (clusterAnchorFile in production);
+	// nil means readFile.
+	readAnchor func(path string) (sudoKubeconfigFile, error)
 }
 
 // rootKubeSourcesFromEnv gathers the production inputs, or nil when this process
@@ -66,10 +69,11 @@ func rootKubeSourcesFromEnv() *rootKubeSources {
 		return nil
 	}
 	return &rootKubeSources{
-		sudoUser: os.Getenv("SUDO_USER"),
-		lookup:   user.Lookup,
-		lookupID: user.LookupId,
-		readFile: readOwnedFile,
+		sudoUser:   os.Getenv("SUDO_USER"),
+		lookup:     user.Lookup,
+		lookupID:   user.LookupId,
+		readFile:   readOwnedFile,
+		readAnchor: clusterAnchorFile,
 	}
 }
 
@@ -237,14 +241,19 @@ func rootKubectlEnv(env []string, kubeconfig, home string) []string {
 	return append(out, "KUBECONFIG="+kubeconfig)
 }
 
-// errClusterAnchor marks a worker whose root-only cluster CA cannot be used.
-var errClusterAnchor = errors.New("this worker's root-only cluster CA cannot be used")
+// errClusterAnchor marks a node whose root-only cluster CA cannot be used.
+var errClusterAnchor = errors.New("this node's root-only cluster CA cannot be used")
 
-// clusterAnchorRemedy says how a worker gets its root-only cluster CA back, the
-// same install in each case.
-var clusterAnchorRemedy = "run `sudo k3sm install --agent --server <server> --token-file <file>` to pin it from a join token, or leave out --token-file to take it from the node credential; first remove a copy with the wrong owner or mode: `sudo rm " + install.AgentClusterCAPath + "`"
+// clusterAnchorRemedy says how a node gets its root-only cluster CA back. The same
+// install fixes every case, including a node whose binary was replaced before an
+// install wrote the copy.
+var clusterAnchorRemedy = "on a server run `sudo k3sm install`, which copies it from the control plane's CA; on a worker run `sudo k3sm install --agent --server <server> --token-file <file>` to pin it from a join token, or leave out --token-file to take it from the node credential; first remove a copy with the wrong owner or mode, or from another cluster: `sudo rm " + install.AgentClusterCAPath + "`"
 
-// readClusterAnchor reads a worker's root-only cluster CA with its owner and mode
+// clusterAnchorFile reads the root-only cluster CA for the lifecycle verbs and root's
+// choice of kubeconfig. It is a variable so a test can describe the file.
+var clusterAnchorFile = readOwnedFile
+
+// readClusterAnchor reads a node's root-only cluster CA with its owner and mode
 // from the open descriptor. A nil readFile means readOwnedFile. Every refusal
 // wraps errClusterAnchor.
 func readClusterAnchor(path string, readFile func(string) (sudoKubeconfigFile, error)) ([]byte, error) {
@@ -332,7 +341,8 @@ func (s *rootKubeSources) loadNamed(path, contextName string) (*checkedKubeconfi
 
 // loadWorkDir reads the work dir's admin kubeconfig. It takes any owner, because
 // which account that is depends on how the server was installed. It still has to
-// be inline, so it is used the way any other file is.
+// be inline, and the file gives only the address and the credential: the trust is
+// the root-only cluster CA and the Service address (kubeclient.PinCA).
 func (s *rootKubeSources) loadWorkDir(path string, f sudoKubeconfigFile) (*checkedKubeconfig, error) {
 	remedy := "`sudo k3sm restart` makes a server write this file again"
 	if err := checkFileShape(path, f, nil); err != nil {
@@ -341,6 +351,13 @@ func (s *rootKubeSources) loadWorkDir(path string, f sudoKubeconfigFile) (*check
 	c, err := checkKubeconfig(f.data, path, "")
 	if err != nil {
 		return nil, fmt.Errorf("kubeconfig %s: %w; %s", path, err, remedy)
+	}
+	read := s.readAnchor
+	if read == nil {
+		read = s.readFile
+	}
+	if c.caPEM, err = readClusterAnchor(install.AgentClusterCAPath, read); err != nil {
+		return nil, fmt.Errorf("%w; %s; or run the command without sudo to use your own kubeconfig", err, clusterAnchorRemedy)
 	}
 	return c, nil
 }

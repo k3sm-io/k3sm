@@ -33,7 +33,6 @@ import (
 	"k8s.io/client-go/rest"
 
 	"k3sm.io/k3sm/pkg/certs"
-	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/kubeclient"
 )
 
@@ -50,30 +49,6 @@ func fixtureCA(t *testing.T) []byte {
 // anchorReader reads one described file.
 func anchorReader(f sudoKubeconfigFile, err error) func(string) (sudoKubeconfigFile, error) {
 	return func(string) (sudoKubeconfigFile, error) { return f, err }
-}
-
-func TestNetdPinsTheInformersOnAWorkerOnly(t *testing.T) {
-	workerCredential := install.AgentCredentialPath(install.DefaultDataRoot)
-	tests := []struct {
-		name string
-		opts netdOptions
-		want string
-	}{
-		{name: "worker", opts: netdOptions{kubeconfig: workerCredential, clusterCA: install.AgentClusterCAPath}, want: install.AgentClusterCAPath},
-		{name: "worker on a data root of its own", opts: netdOptions{kubeconfig: "/Volumes/k3sm/agent/kubeconfig", clusterCA: install.AgentClusterCAPath}, want: install.AgentClusterCAPath},
-		{name: "worker whose plist has no --cluster-ca", opts: netdOptions{kubeconfig: workerCredential}, want: install.AgentClusterCAPath},
-		{name: "server", opts: netdOptions{kubeconfig: "/var/lib/k3sm/server/k3sm.kubeconfig", clusterCA: "/var/lib/k3sm/server/pki/cluster-ca.crt"}},
-		{name: "server whose plist has no --cluster-ca", opts: netdOptions{kubeconfig: "/var/lib/k3sm/server/k3sm.kubeconfig"}},
-		{name: "no kubeconfig"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := tt.opts.authorizerKube()
-			if got.clusterCA != tt.want || got.kubeconfig != tt.opts.kubeconfig {
-				t.Errorf("authorizerKube() = %+v, want clusterCA %q", got, tt.want)
-			}
-		})
-	}
 }
 
 // TestWorkerInformerTakesItsCAFromTheRootCopy reads a node kubeconfig that names
@@ -99,9 +74,9 @@ func TestWorkerInformerTakesItsCAFromTheRootCopy(t *testing.T) {
 			t.Error("the node's client credential did not come from the kubeconfig")
 		}
 	})
-	t.Run("server", func(t *testing.T) {
+	t.Run("an account with no CA of its own", func(t *testing.T) {
 		k := authorizerKube{kubeconfig: path, readFile: func(string) (sudoKubeconfigFile, error) {
-			t.Error("a server read a root CA copy")
+			t.Error("a client with no CA read a root CA copy")
 			return sudoKubeconfigFile{}, nil
 		}}
 		cfg, _, err := k.load()
@@ -109,7 +84,7 @@ func TestWorkerInformerTakesItsCAFromTheRootCopy(t *testing.T) {
 			t.Fatalf("load: %v", err)
 		}
 		if !bytes.Equal(cfg.CAData, res.ClusterCAPEM) {
-			t.Error("a server's informers no longer take their CA from its kubeconfig")
+			t.Error("informers with no CA no longer take it from the kubeconfig")
 		}
 	})
 }
@@ -123,7 +98,6 @@ func TestWorkerInformerRefusesAnUnusableCA(t *testing.T) {
 		read func(string) (sudoKubeconfigFile, error)
 		want string
 	}{
-		{name: "missing", read: anchorReader(sudoKubeconfigFile{}, fmt.Errorf("open: %w", fs.ErrNotExist)), want: "does not exist"},
 		{name: "another owner", read: anchorReader(regular(501, 0o644, anchor), nil), want: "owned by uid 501, not root"},
 		{name: "group-writable", read: anchorReader(regular(0, 0o664, anchor), nil), want: "group- or world-writable"},
 		{name: "not a regular file", read: anchorReader(sudoKubeconfigFile{uid: 0, mode: fs.ModeNamedPipe}, nil), want: "not a regular file"},
