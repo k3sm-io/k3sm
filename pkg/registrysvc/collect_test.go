@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -552,5 +553,29 @@ func TestCollectPrunedSanitisesAndBoundsTheAnswer(t *testing.T) {
 	}
 	if res.Error != "badnews]0;title" {
 		t.Errorf("error %q; want the controls stripped", res.Error)
+	}
+}
+
+// TestCollectPrunedStaysOnLoopback proves the client sends the push
+// credential nowhere but this host's loopback.
+func TestCollectPrunedStaysOnLoopback(t *testing.T) {
+	deleted := []StoredManifest{{Repository: "app", Digest: "sha256:aa"}}
+	sent := 0
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		sent++
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader(`{}`)), Header: http.Header{}, Request: r}, nil
+	})
+	for _, a := range []string{"registry.example.com:5000", "10.0.0.1:6450", "localhost", "[::2]:6450"} {
+		if _, err := CollectPruned(context.Background(), a, deleted, Credential{Username: "k3sm", Password: "pw"}, rt); !errors.Is(err, ErrNotLoopback) {
+			t.Errorf("authority %q: err %v; want ErrNotLoopback", a, err)
+		}
+	}
+	if sent != 0 {
+		t.Fatalf("%d requests left loopback", sent)
+	}
+	for _, a := range []string{"localhost:6450", "127.0.0.1:6450", "[::1]:6450"} {
+		if _, err := CollectPruned(context.Background(), a, deleted, Credential{Username: "k3sm", Password: "pw"}, rt); err != nil {
+			t.Errorf("authority %q: %v", a, err)
+		}
 	}
 }

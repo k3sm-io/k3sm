@@ -12,6 +12,7 @@ TestClassify rewritten the gate reads names through the shared validator
 TestCloseInheritedDescriptors added new with the child switch
 TestClusterEndpointAddress kept the relay and cluster publication do not touch the child
 TestCollectPrunedSanitisesAndBoundsTheAnswer added the collect client strips controls and bounds its wait
+TestCollectPrunedStaysOnLoopback added the collect client sends the push credential only to loopback
 TestCollectRouteAdmitsOneAtATime added one collect at a time, a minute apart, never queued
 TestCollectRouteAnswersFixedErrors added the collect answer carries fixed error texts
 TestCollectRouteChecksTheCredentialBeforeTheBody added the collect route checks the credential before the body

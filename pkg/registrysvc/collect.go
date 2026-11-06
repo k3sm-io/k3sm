@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"slices"
 	"strconv"
@@ -297,13 +298,33 @@ func prunedRepositories(deleted []StoredManifest) []string {
 	return slices.Compact(repos)
 }
 
+// ErrNotLoopback is a collect request for a registry that is not on this
+// host's loopback: the request carries the push credential, which never leaves
+// the host.
+var ErrNotLoopback = errors.New("the registry to collect is not on loopback")
+
+// loopbackAuthority reports whether authority is host:port with host
+// "localhost" or a loopback IP.
+func loopbackAuthority(authority string) bool {
+	host, _, err := net.SplitHostPort(authority)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 // CollectPruned asks the registry at authority (host:port, on loopback) to
 // sweep the repositories deleted names a manifest in, as the push credential
 // cred, and returns what the sweep did. It sends nothing when deleted is
 // empty. The returned result names the repositories even when the request
 // fails.
 //
-// The request has CollectTimeout to be answered, whatever ctx allows. Every
+// An authority off loopback is refused with ErrNotLoopback and nothing is
+// sent. The request has CollectTimeout to be answered, whatever ctx allows. Every
 // string the registry answers with is passed through Printable, so a reply
 // cannot write terminal controls into the operator's report.
 //
@@ -312,6 +333,9 @@ func CollectPruned(ctx context.Context, authority string, deleted []StoredManife
 	res := CollectResult{Repositories: prunedRepositories(deleted)}
 	if len(res.Repositories) == 0 {
 		return res, nil
+	}
+	if !loopbackAuthority(authority) {
+		return res, fmt.Errorf("collect the pruned repositories: %w: %q", ErrNotLoopback, authority)
 	}
 	ctx, cancel := context.WithTimeout(ctx, CollectTimeout)
 	defer cancel()
