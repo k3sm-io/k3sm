@@ -45,7 +45,6 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/record"
 
 	"k3sm.io/darwin-net/pkg/dns"
@@ -775,8 +774,8 @@ func runtimePreflight(ctx context.Context, opts nodeOptions) error {
 // a loopback apiserver watching one node's pods.
 const nodeAPIRequestTimeout = 90 * time.Second
 
-// nodeRESTConfig loads the node's kubeconfig and applies nodeAPIRequestTimeout
-// and the kubelet's client-side request budget. It exists as a named seam so the
+// nodeRESTConfig loads the node's kubeconfig through agentRESTConfig and applies
+// nodeAPIRequestTimeout and the kubelet's client-side request budget. It exists as a named seam so the
 // values on the config the node's clientset is built from are unit-testable —
 // startNode itself needs a live apiserver.
 //
@@ -794,7 +793,7 @@ const nodeAPIRequestTimeout = 90 * time.Second
 // the writes, so a smaller embedded-only budget would buy nothing but a second
 // code path.
 func nodeRESTConfig(kubeconfig string) (*rest.Config, error) {
-	cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	cfg, err := agentRESTConfig(kubeconfig)
 	if err != nil {
 		return nil, fmt.Errorf("load kubeconfig: %w", err)
 	}

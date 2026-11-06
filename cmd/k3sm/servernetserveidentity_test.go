@@ -39,7 +39,7 @@ import (
 //   - set Client from a variable assigned exactly once, as the first result of
 //     serverNetserveClient (the in-memory netserve mint);
 //   - set DNSServiceClient from a variable assigned exactly once, as the second
-//     result of kubeclient.FromPath(exec.Kubeconfig()) (the admin kubeconfig).
+//     result of rootCheckedClient(exec.Kubeconfig()) (the admin kubeconfig).
 //
 // A Client swapped back to the admin identity would pass every functional test
 // and silently hold system:masters again; a DNSServiceClient on the netserve
@@ -142,14 +142,14 @@ func TestServerNetserveRunsAsNetserveIdentity(t *testing.T) {
 		t.Errorf("%s, the server datapath's Client, is assigned %d times and from serverNetserveClient=%v; want exactly once, from the netserve mint", clientVar, assigns, fromNetserve)
 	}
 	assigns, fromAdmin := origin(dnsVar, 1, func(call *ast.CallExpr) bool {
-		if !isSelector(call.Fun, "kubeclient", "FromPath") || len(call.Args) != 1 {
+		if id, ok := call.Fun.(*ast.Ident); !ok || id.Name != "rootCheckedClient" || len(call.Args) != 1 {
 			return false
 		}
 		arg, ok := call.Args[0].(*ast.CallExpr)
 		return ok && isSelector(arg.Fun, "exec", "Kubeconfig") && len(arg.Args) == 0
 	})
 	if assigns != 1 || !fromAdmin {
-		t.Errorf("%s, the server datapath's DNSServiceClient, is assigned %d times and from the admin kubeconfig=%v; want exactly once, as the second result of kubeclient.FromPath(exec.Kubeconfig())", dnsVar, assigns, fromAdmin)
+		t.Errorf("%s, the server datapath's DNSServiceClient, is assigned %d times and from the admin kubeconfig=%v; want exactly once, as the second result of rootCheckedClient(exec.Kubeconfig())", dnsVar, assigns, fromAdmin)
 	}
 }
 

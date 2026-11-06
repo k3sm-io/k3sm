@@ -51,7 +51,6 @@ import (
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/hostnet"
 	"k3sm.io/k3sm/pkg/install"
-	"k3sm.io/k3sm/pkg/kubeclient"
 	"k3sm.io/k3sm/pkg/mlx/operator"
 	"k3sm.io/k3sm/pkg/netserve"
 	"k3sm.io/k3sm/pkg/nodecred"
@@ -603,7 +602,7 @@ func runServer(args []string) (err error) {
 	defer healthyReset.Stop()
 
 	// 2. Client for the post-bring-up provisioning + Service watch.
-	restCfg, cs, err := kubeclient.FromPath(exec.Kubeconfig())
+	restCfg, cs, err := rootCheckedClient(exec.Kubeconfig())
 	if err != nil {
 		return fmt.Errorf("load kubeconfig: %w", err)
 	}

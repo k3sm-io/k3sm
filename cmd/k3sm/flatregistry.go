@@ -31,7 +31,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"k3sm.io/k3sm/pkg/bootstrap"
-	"k3sm.io/k3sm/pkg/kubeclient"
 	"k3sm.io/k3sm/pkg/registrysvc"
 	"k3sm.io/runtimed/pkg/image"
 )
@@ -216,7 +215,7 @@ func agentFlatRegistry(ctx context.Context, kubeconfigPath string, res *bootstra
 	if res == nil || len(res.ClusterCAPEM) == 0 {
 		return flatRegistryEndpoint{}
 	}
-	_, cs, err := kubeclient.FromPath(kubeconfigPath)
+	_, cs, err := rootCheckedClient(kubeconfigPath)
 	if err != nil {
 		logger.Warn("the flat registry name maps nothing on this node: its kubeconfig cannot be loaded", "err", err)
 		return flatRegistryEndpoint{}

@@ -145,7 +145,7 @@ func TestSingleServerStoreBuiltAfterAPIServerHealthy(t *testing.T) {
 
 	// exec.Start returns only once the control plane is healthy (the "control
 	// plane healthy" line follows it), so it anchors the health wait.
-	order := []string{"exec.Start", "kubeclient.FromPath", "serverNodePasswordStore", "enrollSelfAndBringUpMesh", "bootstrapServerDeps{}"}
+	order := []string{"exec.Start", "rootCheckedClient", "serverNodePasswordStore", "enrollSelfAndBringUpMesh", "bootstrapServerDeps{}"}
 	for _, name := range order {
 		if _, ok := first[name]; !ok {
 			t.Fatalf("runServer never calls %s", name)

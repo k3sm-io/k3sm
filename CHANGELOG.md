@@ -238,8 +238,10 @@ pin, its date, and the tarball's sha256.
   before and logs it as unverified.
 - `k3sm netd` as root with a `--kubeconfig` an install did not write now needs `--cluster-ca` naming a root-owned
   CA. Without one it starts no informers, denies privileged binds, and logs what to pass.
-- An agent run as root accepts only inline credentials in the kubeconfigs its mesh watcher, MeshPeer list and
-  node-local datapath read.
+- An agent run as root accepts only inline credentials in the kubeconfigs its mesh watcher, MeshPeer list,
+  node-local datapath, node client and flat registry lookup read, and so does `k3sm node` run as root. A server run
+  as root does the same for its admin client. `sudo k3sm server` and `sudo k3sm agent` are not affected: the
+  kubeconfigs k3sm writes are all inline.
 - A kubeconfig that a root command loads with the inline-credentials check is also refused when a cluster entry
   sets `proxy-url`.
 - A worker's root helper, `sudo k3sm kubectl` and the other root verbs on a worker, and `k3sm stop` and `k3sm start`

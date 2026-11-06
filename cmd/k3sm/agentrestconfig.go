@@ -17,18 +17,31 @@ limitations under the License.
 package main
 
 import (
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
 	"k3sm.io/k3sm/pkg/kubeclient"
 )
 
-// agentRESTConfig loads a kubeconfig an agent's own loop reads: the mesh watcher,
-// the MeshPeer list and the node-local datapath. As root it takes only inline
-// credentials; any other account keeps kubeconfig's full loader.
+// agentRESTConfig loads a kubeconfig a node's own loop reads: the mesh watcher, the
+// MeshPeer list, the node-local datapath and the node's client. As root it takes only
+// inline credentials, which is what every kubeconfig k3sm writes holds, so `sudo k3sm
+// server` and `sudo k3sm agent` run on their own files as they do under launchd; any
+// other account keeps kubeconfig's full loader.
 func agentRESTConfig(path string) (*rest.Config, error) {
 	if processEuid() == 0 {
 		return kubeclient.CheckedConfig(path)
 	}
 	return clientcmd.BuildConfigFromFlags("", path)
+}
+
+// rootCheckedClient is agentRESTConfig for a site that also needs the clientset: the
+// flat registry lookup and the server's admin client. A failure comes back as the
+// loader produced it, for the site to wrap.
+func rootCheckedClient(path string) (*rest.Config, kubernetes.Interface, error) {
+	if processEuid() == 0 {
+		return kubeclient.FromCheckedPath(path)
+	}
+	return kubeclient.FromPath(path)
 }

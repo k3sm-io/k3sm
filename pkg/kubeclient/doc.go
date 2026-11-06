@@ -52,9 +52,9 @@ limitations under the License.
 // decides alone which server the client accepts. FromCheckedWorkerPath requires that
 // name with the file's own CA. CheckedConfig is the checked load with no clientset.
 //
-// FromPath always builds a clientset, so two sites keep clientcmd directly when not
-// root: cmd/k3sm's nodeRESTConfig, which pins a request timeout on the config before
-// anything is built from it, and the mesh watcher, which needs only a
-// *rest.Config and would otherwise construct and discard a client it never
-// dials with.
+// FromPath always builds a clientset, so cmd/k3sm's agentRESTConfig keeps clientcmd
+// directly when not root, for its two kinds of site: nodeRESTConfig, which pins a
+// request timeout on the config before anything is built from it, and the mesh
+// watcher, which needs only a *rest.Config and would otherwise construct and discard
+// a client it never dials with.
 package kubeclient
