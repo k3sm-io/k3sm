@@ -844,7 +844,7 @@ type System interface {
 	//
 	// It is WriteServiceUserFile's opposite number and exists for the files root
 	// alone may place: the root-only copy of this node's wireguard private key in
-	// MeshKeyDir, the worker's cluster CA copy, the LAN network record and the
+	// MeshKeyDir, a node's cluster CA copy, the LAN network record and the
 	// shadow manifest. The service-user seam cannot be reused for it, because handing
 	// that copy to _k3sm would erase the only difference between the two copies —
 	// see MeshKeyDirMode.
@@ -2244,9 +2244,9 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	if err := provisionMeshKey(sys, cfg, uid); err != nil {
 		return err
 	}
-	// 1g′. On a worker, the root-only copy of the cluster CA its netd checks a
-	//      managed update's signer against (--cluster-ca), beside the mesh key
-	//      in the root-only directory 1g has just ensured.
+	// 1g′. On a worker or a joining server, the root-only copy of the cluster CA
+	//      its netd checks a managed update's signer against (--cluster-ca), beside
+	//      the mesh key in the root-only directory 1g has just ensured.
 	if err := provisionAgentClusterCA(sys, cfg, joinCA); err != nil {
 		return err
 	}
@@ -2406,12 +2406,18 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	//     upgrade it is already on disk. On a first install the control plane has not
 	//     booted yet, so it is absent here and step 5 waits for the daemon to mint it.
 	//     A worker writes no admin kubeconfig and reads nothing.
+	//
+	//     The CA found here also gives an upgraded server its root-only copy, before
+	//     the publish below, so no helper restarted on the new tree goes without it.
 	if cfg.Role != RoleAgent {
 		caPath := certs.ClusterCACertPath(cfg.serverWorkDir())
 		ca, err := sys.ReadFile(caPath)
 		switch {
 		case err == nil:
 			cfg.ClusterCA = ca
+			if err := provisionServerClusterCA(sys, cfg, ca, false); err != nil {
+				return err
+			}
 		case errors.Is(err, fs.ErrNotExist):
 			cfg.Logger.Info("cluster CA not on disk yet; the admin kubeconfig is written once the control plane has minted it", "path", caPath)
 		default:
@@ -2525,7 +2531,7 @@ func writeAdminKubeconfig(ctx context.Context, sys System, cfg *Config) error {
 	if cfg.Role == RoleAgent {
 		return nil
 	}
-	if err := awaitClusterCA(ctx, sys, cfg, clusterCAWaitBudget); err != nil {
+	if err := awaitServerClusterCA(ctx, sys, cfg, clusterCAWaitBudget); err != nil {
 		return err
 	}
 	kubeconfig, err := AdminKubeconfig(*cfg)

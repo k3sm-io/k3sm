@@ -19,6 +19,8 @@ package install
 import (
 	"bytes"
 	"context"
+	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 
@@ -29,8 +31,7 @@ import (
 // the anchor its netd checks a managed update's signer against: an install
 // with a token writes the CA the token pinned, a later install without one
 // keeps that copy (the service user can change neither it nor its directory),
-// a node joined before the copy existed gets it once from its credential, and
-// a server writes none.
+// a node joined before the copy existed gets it once from its credential.
 func TestProvisionAgentClusterCA(t *testing.T) {
 	t.Run("an agent install with a token writes the pinned CA before netd starts", func(t *testing.T) {
 		shrinkRestartBudgets(t)
@@ -94,15 +95,6 @@ func TestProvisionAgentClusterCA(t *testing.T) {
 			t.Error("the copy is not the credential's cluster CA")
 		}
 	})
-	t.Run("a server writes no worker copy", func(t *testing.T) {
-		f := &fakeSystem{}
-		if err := provisionAgentClusterCA(f, testConfig(t).withDefaults(), []byte("x")); err != nil {
-			t.Fatal(err)
-		}
-		if _, ok := f.files[AgentClusterCAPath]; ok {
-			t.Error("a server wrote the worker's cluster CA copy")
-		}
-	})
 	t.Run("a served CA that is not a CA refuses", func(t *testing.T) {
 		f := &fakeSystem{}
 		if err := provisionAgentClusterCA(f, agentCfg(t).withDefaults(), []byte("not pem")); err == nil {
@@ -119,4 +111,140 @@ func theTokenPinOf(f *fakeSystem) string {
 		return tok[:i]
 	}
 	return tok
+}
+
+// mintCA returns a fresh cluster CA certificate as PEM.
+func mintCA(t *testing.T) []byte {
+	t.Helper()
+	ca, err := certs.NewCA("k3sm-cluster-ca")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ca.CertPEM
+}
+
+// anchorCallAt is the index of the first recorded call with prefix, or -1.
+func anchorCallAt(f *fakeSystem, prefix string) int {
+	return slices.IndexFunc(f.calls, func(c string) bool { return strings.HasPrefix(c, prefix) })
+}
+
+// TestProvisionServerClusterCA pins a server's root-held cluster CA copy.
+func TestProvisionServerClusterCA(t *testing.T) {
+	anchorWrite := "WriteRootOnlyFile:" + AgentClusterCAPath + ":0644"
+	t.Run("an upgraded server gets the copy before the swap and before netd restarts", func(t *testing.T) {
+		shrinkRestartBudgets(t)
+		f := &fakeSystem{}
+		ca := mintCA(t)
+		cfg := testConfig(t)
+		f.putFile(certs.ClusterCACertPath(cfg.withDefaults().serverWorkDir()), ca)
+		if err := Install(context.Background(), f, cfg); err != nil {
+			t.Fatalf("Install: %v", err)
+		}
+		if !bytes.Equal(f.files[AgentClusterCAPath], ca) {
+			t.Fatalf("the copy is %q", f.files[AgentClusterCAPath])
+		}
+		write := anchorCallAt(f, anchorWrite)
+		swap, boot := anchorCallAt(f, "SwapInstallRoot:"), anchorCallAt(f, "Bootstrap:"+NetdLabel)
+		bootout := anchorCallAt(f, "Bootout:"+NetdLabel)
+		if write < 0 || swap < 0 || boot < 0 || write > swap || write > boot || (bootout >= 0 && write > bootout) {
+			t.Errorf("copy at call %d, swap at %d, netd bootout at %d, bootstrap at %d", write, swap, bootout, boot)
+		}
+	})
+	t.Run("a first install gets the copy once the control plane has minted its CA", func(t *testing.T) {
+		shrinkRestartBudgets(t)
+		ca := mintCA(t)
+		f := &fakeSystem{bootCA: ca}
+		if err := Install(context.Background(), f, testConfig(t)); err != nil {
+			t.Fatalf("Install: %v", err)
+		}
+		if !bytes.Equal(f.files[AgentClusterCAPath], ca) {
+			t.Fatalf("the copy is %q", f.files[AgentClusterCAPath])
+		}
+		write, boot := anchorCallAt(f, anchorWrite), anchorCallAt(f, "Bootstrap:"+ServerLabel)
+		if write < boot {
+			t.Errorf("copy at call %d, before the server bootstrap at %d", write, boot)
+		}
+	})
+	t.Run("a copy left by another cluster goes when this install's boot mints a new CA", func(t *testing.T) {
+		shrinkRestartBudgets(t)
+		ca, stale := mintCA(t), mintCA(t)
+		f := &fakeSystem{bootCA: ca}
+		f.putFile(AgentClusterCAPath, stale)
+		if err := Install(context.Background(), f, testConfig(t)); err != nil {
+			t.Fatalf("Install: %v", err)
+		}
+		if !bytes.Equal(f.files[AgentClusterCAPath], ca) {
+			t.Error("the copy still names a CA this cluster does not have")
+		}
+	})
+	t.Run("a copy that differs from the CA on disk is kept and named", func(t *testing.T) {
+		held, onDisk := mintCA(t), mintCA(t)
+		f := &fakeSystem{}
+		f.putFile(AgentClusterCAPath, held)
+		var logged bytes.Buffer
+		cfg := testConfig(t).withDefaults()
+		cfg.Logger = slog.New(slog.NewTextHandler(&logged, nil))
+		if err := provisionServerClusterCA(f, cfg, onDisk, false); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(f.files[AgentClusterCAPath], held) {
+			t.Error("the copy was replaced from a file the service user owns")
+		}
+		for _, want := range []string{AgentClusterCAPath, "sudo k3sm install", "differs"} {
+			if !strings.Contains(logged.String(), want) {
+				t.Errorf("log lacks %q:\n%s", want, logged.String())
+			}
+		}
+	})
+	t.Run("an equal copy is not rewritten", func(t *testing.T) {
+		ca := mintCA(t)
+		f := &fakeSystem{}
+		f.putFile(AgentClusterCAPath, ca)
+		if err := provisionServerClusterCA(f, testConfig(t).withDefaults(), ca, false); err != nil {
+			t.Fatal(err)
+		}
+		if anchorCallAt(f, anchorWrite) >= 0 {
+			t.Error("an equal copy was rewritten")
+		}
+	})
+	t.Run("a copy that is not a CA is replaced", func(t *testing.T) {
+		ca := mintCA(t)
+		f := &fakeSystem{}
+		f.putFile(AgentClusterCAPath, []byte("not pem"))
+		if err := provisionServerClusterCA(f, testConfig(t).withDefaults(), ca, false); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(f.files[AgentClusterCAPath], ca) {
+			t.Error("an unusable copy was kept")
+		}
+	})
+	t.Run("a control plane CA that is not a CA writes nothing", func(t *testing.T) {
+		f := &fakeSystem{}
+		if err := provisionServerClusterCA(f, testConfig(t).withDefaults(), []byte("not pem"), true); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := f.files[AgentClusterCAPath]; ok {
+			t.Error("a certificate that is not a CA was copied")
+		}
+	})
+	t.Run("a joining server writes the CA its token pinned", func(t *testing.T) {
+		ca, held := mintCA(t), mintCA(t)
+		f := &fakeSystem{}
+		f.putFile(AgentClusterCAPath, held)
+		if err := provisionAgentClusterCA(f, testConfig(t).withDefaults(), ca); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(f.files[AgentClusterCAPath], ca) {
+			t.Error("the pinned CA was not written")
+		}
+	})
+	t.Run("a server with nothing pinned leaves the copy to step 2e", func(t *testing.T) {
+		f := &fakeSystem{}
+		if err := provisionAgentClusterCA(f, testConfig(t).withDefaults(), nil); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := f.files[AgentClusterCAPath]; ok {
+			t.Error("a copy was written with nothing to write")
+		}
+	})
 }

@@ -82,6 +82,9 @@ type fakeSystem struct {
 	// file absent instead (a control plane that never mints it).
 	serverBooted bool
 	noBootCA     bool
+	// bootCA, when set, is what the fake control plane mints in place of
+	// fakeBootClusterCA.
+	bootCA []byte
 	// flushInterconnect, when set, is FlushInterconnectAliases' body after the
 	// call is recorded: a test runs the real sweep over a ledger and bridge it
 	// controls. Nil sweeps nothing and succeeds.
@@ -823,6 +826,9 @@ func (f *fakeSystem) ReadFile(path string) ([]byte, error) {
 		return content, nil
 	}
 	if f.serverBooted && !f.noBootCA && strings.HasSuffix(path, "/tls/cluster-ca.crt") {
+		if f.bootCA != nil {
+			return f.bootCA, nil
+		}
 		return fakeBootClusterCA, nil
 	}
 	return nil, fmt.Errorf("open %s: %w", path, fs.ErrNotExist)
@@ -2544,7 +2550,7 @@ func TestAgentInstallRendersNetdWithTheNodeIdentity(t *testing.T) {
 		// carry; forbid, when non-empty, is a substring no argv element may hold.
 		wantKubeconfig string
 		// wantClusterCA is the --cluster-ca a managed update's signer must
-		// chain to: the server's own PKI copy, a worker's root-only copy.
+		// chain to: the root-held copy, on either role.
 		wantClusterCA string
 		forbid        string
 	}{
@@ -2559,13 +2565,13 @@ func TestAgentInstallRendersNetdWithTheNodeIdentity(t *testing.T) {
 			name:           "server keeps the control-plane kubeconfig",
 			cfg:            Config{Role: RoleServer, DataRoot: dataRoot},
 			wantKubeconfig: filepath.Join(serverWork, "k3sm.kubeconfig"),
-			wantClusterCA:  filepath.Join(serverWork, "tls", "cluster-ca.crt"),
+			wantClusterCA:  AgentClusterCAPath,
 		},
 		{
 			name:           "the zero-value role is the server",
 			cfg:            Config{DataRoot: dataRoot},
 			wantKubeconfig: filepath.Join(serverWork, "k3sm.kubeconfig"),
-			wantClusterCA:  filepath.Join(serverWork, "tls", "cluster-ca.crt"),
+			wantClusterCA:  AgentClusterCAPath,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
