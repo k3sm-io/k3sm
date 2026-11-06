@@ -1,0 +1,1 @@
+{"apiVersion":"net.k3sm.io/v1alpha1","kind":"Interconnect","metadata":{"name":"thunderbolt"},"spec":{"medium":"thunderbolt","enabled":false},"status":{}}

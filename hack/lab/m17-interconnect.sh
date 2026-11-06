@@ -28,7 +28,8 @@
 # LAN interface, the default route or a packet filter, and never reboots.
 #
 # Rungs (the table below is the one declaration --plan and the runner read):
-#   r0-disarmed      after the join the Interconnect exists disabled, nothing on bridge0
+#   r0-disarmed      after the join the Interconnect exists disabled, nothing on bridge0,
+#                    no member up
 #   r1-arm           k3sm interconnect enable: armedBy, the Event, slot-0 aliases, peers up
 #   r2-attach        an annotated pod gets a slot, its env, a bound listener, the peer's MAC
 #   r3-cable-path    a fixed transfer to the peer slot address crosses the cable
@@ -102,7 +103,7 @@ SELFTEST_WATCHDOG="${K3SM_M17_SELFTEST_WATCHDOG:-120}"
 
 # ── The rung table: id | summary | prerequisites | assertion | evidence | owning BI ──
 read -r -d '' RUNG_TABLE <<'RUNGS' || true
-r0-disarmed|after the join the Interconnect exists with enabled false, no k3sm alias on bridge0, no desired annotation, no members|crd,bridge,index,unarmed|assert_r0_disarmed|r0-disarmed/|BI6
+r0-disarmed|after the join the Interconnect exists with enabled false, no k3sm alias on bridge0, no desired annotation, no member up, no segment, no armedBy, no attached pod|crd,bridge,index,unarmed|assert_r0_disarmed|r0-disarmed/|BI6
 r1-arm|k3sm interconnect enable: armedBy is the caller, the InterconnectArmed Warning Event, the slot-0 alias on exactly the cabled nodes, ic-peers up on both|crd,verbs,doctor,netd,armable|assert_r1_arm|r1-arm/|BI6
 r2-attach|an annotated pod gets a slot: K3SM_INTERCONNECT_IP is its alias, the listener's lsof address is the slot not *, the peer's ARP entry is the peer's MAC|armed,attach,tools|assert_r2_attach|r2-attach/|BI7
 r3-cable-path|a fixed transfer to the peer slot address: route bridge0, peer MAC, the Thunderbolt member counters rise by the payload, the LAN stays flat; RTT slot vs mesh RECORDED|armed,attached,tools|assert_r3_cable_path|r3-cable-path/|BI10
@@ -110,7 +111,7 @@ r4-mesh-traffic|pod-to-pod and ClusterIP flows ride a utun and the LAN with the 
 r5-ring|a sharded MLXModel with interconnect thunderbolt serves through rank 0: ranks on slot-1 addresses, the ring on the cable, LinksHealthy True, the endpoint on the pod IP; tokens/s RECORDED beside network and single-Mac|armed,mlxhosts,gpu,mlximage|assert_r5_ring|r5-ring/|BI8
 r6-unplug|a pulled cable: member down <= 20 s and the MLX re-render <= 30 s after the carrier drop, the mesh loses at most one reply, UpHold 60 s on replug, one transition per direction, no second gang restart inside 5 min|armed,ring,operator|assert_r6_unplug|r6-unplug/|BI6
 r7-desired-forge|no-address-channel smoke test: the desired annotation carries no address or slot, so values the node forges with its own credential (unknown address/slot fields, a foreign interconnect name, schema 99) can only hold or drop slot 0: no out-of-policy alias or route, only the two netd verbs; an in-policy rewrite restores slot 0|armed,nodecred|assert_r7_desired_forge|r7-desired-forge/|BI3
-r8-killswitch|k3sm interconnect disable: no reserved-half address, route, permanent ARP or ledger entry on either Mac, membership, lo0 and the mesh unchanged, the annotation, members and attached pods gone, the ring on the mesh|armed|assert_r8_killswitch|r8-killswitch/|BI6
+r8-killswitch|k3sm interconnect disable: no reserved-half address, route, permanent ARP or ledger entry on either Mac, membership, lo0 and the mesh unchanged, the annotation and attached pods gone, no member up, no segment, no armedBy, the ring on the mesh|armed|assert_r8_killswitch|r8-killswitch/|BI6
 r9-downgrade|disable, then the previous binary node by node: every r8 host assertion again, doctor ic-stray and ic-residue clean, HelperTooOld on the mixed leg, no reboot; then the artifact under test is reinstalled|disarmed,prevbin|assert_r9_downgrade|r9-downgrade/|BI3
 RUNGS
 REQUIRED_IDS="r0-disarmed r1-arm r2-attach r3-cable-path r4-mesh-traffic r5-ring r6-unplug r7-desired-forge r8-killswitch r9-downgrade"
@@ -235,6 +236,42 @@ d=json.load(sys.stdin); $1"; }
 desired_of() { kc get node "$1" -o jsonpath='{.metadata.annotations.k3sm\.io/interconnect-desired}' 2>/dev/null; }
 member_state() { ic_field "print(next((m.get('state','') for m in (d.get('status') or {}).get('members') or [] if m.get('node')=='$1'), ''))"; }
 members_count() { ic_field "print(len((d.get('status') or {}).get('members') or []))"; }
+# ic_disarmed_verdict <Interconnect JSON file> — what "disarmed" means to a person:
+# nothing is on the cable. It does NOT ask for an empty status.members, because
+# that is not the product's contract: a member is a node that reported a cabled
+# peer, or was already a member and still exists, whatever spec.enabled says, and
+# only the desired annotation depends on enabled (pkg/interconnect/resolve.go
+# Resolve). So a disabled object keeps its cabled nodes, listed down, and neither
+# disable nor anything else clears them. Those members stay visible: the rungs
+# record them, and any member up, segment, armedBy or attached pod is a red here.
+ic_disarmed_verdict() {
+	python3 -I -c 'import json,sys
+st=json.load(open(sys.argv[1])).get("status") or {}
+bad=["member %s is up" % m.get("node") for m in st.get("members") or [] if m.get("state")=="up"]
+if st.get("segments"): bad.append("%d segment(s)" % len(st["segments"]))
+if st.get("armedBy"): bad.append("armedBy is %s" % st["armedBy"])
+if st.get("attachedPods"): bad.append("%d attached pod(s)" % st["attachedPods"])
+print("; ".join(bad))
+sys.exit(1 if bad else 0)' "$1"
+}
+# ic_members_line <Interconnect JSON file> — the members, for the record.
+ic_members_line() {
+	python3 -I -c 'import json,sys
+ms=(json.load(open(sys.argv[1])).get("status") or {}).get("members") or []
+print(", ".join("%s %s since %s" % (m.get("node"), m.get("state"), m.get("lastTransition","?")) for m in ms) or "none")' "$1"
+}
+# ic_settled_disarmed — a fresh read of the object satisfies the verdict; a node's
+# report takes a probe round to drop a peer whose address has just gone.
+ic_settled_disarmed() {
+	ic_json >"$RUNG_DIR/interconnect.json" && ic_disarmed_verdict "$RUNG_DIR/interconnect.json"
+}
+# check_disarmed — the shared r0/r8 status check, bounded, with the members on record.
+check_disarmed() {
+	wait_until 120 ic_settled_disarmed || true
+	check "nothing on the cable by the object's status: no member up, no segment, no armedBy, no attached pod" \
+		ic_disarmed_verdict "$RUNG_DIR/interconnect.json"
+	rec "status.members on the disabled object (kept by design, not cleared by disable): $(ic_members_line "$RUNG_DIR/interconnect.json")"
+}
 # scrape_metrics <tag> — every node's interconnect metrics endpoint.
 scrape_metrics() {
 	local n
@@ -387,7 +424,7 @@ assert_r0_disarmed() {
 	ic_json >"$RUNG_DIR/interconnect.json"
 	check "spec.enabled is false (auto-created disarmed, I1)" \
 		test "$(ic_field "print(str((d.get('spec') or {}).get('enabled', False)).lower())")" = false
-	check "status.members is empty" test "$(members_count)" = 0
+	check_disarmed
 	local s
 	for s in local peer; do
 		snap "$s" r0
@@ -998,7 +1035,7 @@ assert_r8_killswitch() {
 	check "MeshPeer specs (wireguard peers and AllowedIPs) unchanged" cmp -s "$RUNG_DIR/meshpeers-pre.txt" "$RUNG_DIR/meshpeers-post.txt"
 	mp0="$(on_local "ping -c 3 -t 6 $peer_MESH" | awk '/packets received/{print $4}')"
 	check "the mesh ping still answers ($mp0/3)" test "${mp0:-0}" -gt 0
-	check "status.members is empty" test "$(members_count)" = 0
+	check_disarmed
 	for p in ic-l-local ic-l-peer; do
 		mp1="$(pod_attached "$p")"
 		check "pod $p: k3sm.io/InterconnectAttached is False ('$mp1')" test "$mp1" = False
@@ -1355,6 +1392,14 @@ self_test_body() {
 	st "ledger: no aliases" 0 icp_ledger_empty "$F/ledger-empty.json"
 	st "ledger: absent" 0 icp_ledger_empty "$F/no-such-ledger.json"
 	st "ledger red: one alias" 1 icp_ledger_empty "$F/ledger-one.json"
+	st "disarmed: cabled members listed down on a disabled object" 0 ic_disarmed_verdict "$F/interconnect-disarmed-members-down.json"
+	st "disarmed: no members at all" 0 ic_disarmed_verdict "$F/interconnect-disarmed-no-members.json"
+	st "disarmed red: a member up" 1 ic_disarmed_verdict "$F/interconnect-disarmed-member-up.json"
+	st_out "disarmed red: the member up is named" "member node-b is up" ic_disarmed_verdict "$F/interconnect-disarmed-member-up.json"
+	st_out "disarmed red: a segment is named" "1 segment(s)" ic_disarmed_verdict "$F/interconnect-disarmed-member-up.json"
+	st "disarmed red: an armedBy record" 1 ic_disarmed_verdict "$F/interconnect-disarmed-armedby.json"
+	st "disarmed red: an attached pod" 1 ic_disarmed_verdict "$F/interconnect-disarmed-attached.json"
+	st_eq "the members stay on the record" "$(ic_members_line "$F/interconnect-disarmed-members-down.json")" "node-a down since 2026-10-15T09:00:00Z, node-b down since 2026-10-30T09:00:00Z"
 	st_eq "doctor: ic-residue clean" "$(icp_doctor_row_state "$F/doctor-clean.json" ic-residue)" ok
 	st_eq "doctor red: ic-stray warns" "$(icp_doctor_row_state "$F/doctor-residue.json" ic-stray)" warn
 	st_eq "doctor: a missing row" "$(icp_doctor_row_state "$F/doctor-clean.json" ic-peers)" absent
