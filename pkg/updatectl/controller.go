@@ -317,19 +317,29 @@ func (c *Controller) lead(ctx context.Context) {
 	}
 }
 
-// reconcile is one pass over every Update. It returns when the next pass is
-// due.
+// reconcile is one pass over every Update, then over the nodes none of them
+// accounts for. It returns when the next pass is due.
 func (c *Controller) reconcile(ctx context.Context) (time.Duration, error) {
 	list, err := c.cfg.Dynamic.Resource(updateResource).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return 0, fmt.Errorf("list updates: %w", err)
 	}
 	next := idleResync
+	var current *updatesv1alpha1.Update
+	// settled is whether this pass knows the singleton's state: one it cannot
+	// decode, or whose status write it lost, may still be holding its nodes.
+	settled := true
 	for i := range list.Items {
 		u, err := decodeUpdate(&list.Items[i])
 		if err != nil {
 			c.log.Error("update controller: decode update", "name", list.Items[i].GetName(), "err", err)
+			if list.Items[i].GetName() == updatesv1alpha1.UpdateName {
+				settled = false
+			}
 			continue
+		}
+		if u.Name == updatesv1alpha1.UpdateName {
+			current = u
 		}
 		before := u.Status.DeepCopy()
 		if u.Name != updatesv1alpha1.UpdateName {
@@ -345,8 +355,14 @@ func (c *Controller) reconcile(ctx context.Context) (time.Duration, error) {
 		if err := c.writeStatus(ctx, u); err != nil {
 			if apierrors.IsConflict(err) {
 				next = 0 // re-read and redo; every step is idempotent
+				settled = false
 				continue
 			}
+			return 0, err
+		}
+	}
+	if settled {
+		if err := c.releaseOrphans(ctx, current); err != nil {
 			return 0, err
 		}
 	}

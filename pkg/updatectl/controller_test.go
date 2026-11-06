@@ -343,7 +343,13 @@ func TestRollingOrderWorkersThenServer(t *testing.T) {
 	t.Run("workers by name then the server, each cordoned and uncordoned", func(t *testing.T) {
 		r := newRig(t, threeNodes()...)
 		r.createUpdate(updatesv1alpha1.UpdateName, updatesv1alpha1.UpdateSpec{Version: target})
-		r.drive(r.controller(), nil)
+		var handedOver map[string]string // w1's annotations at its handover; a finished node keeps no signature
+		r.drive(r.controller(), func() bool {
+			if ann := r.node("w1").Annotations; handedOver == nil && ann[updatesv1alpha1.AnnotationUpdateVersion] == target {
+				handedOver = ann
+			}
+			return false
+		})
 
 		want := []string{
 			"cordon w1", "handover w1", "uncordon w1",
@@ -391,9 +397,8 @@ func TestRollingOrderWorkersThenServer(t *testing.T) {
 			t.Fatalf("payload %+v, want %+v", p, wantP)
 		}
 		// The handover is signed: the node verifies it against the cluster CA.
-		ann := r.node("w1").Annotations
-		signed, err := update.VerifySignedPayload(update.CAPool(testSigning().ca.CertPEM), []byte(ann[update.AnnotationUpdatePayload]),
-			ann[update.AnnotationUpdatePayloadSig], ann[update.AnnotationUpdateSigner], r.now)
+		signed, err := update.VerifySignedPayload(update.CAPool(testSigning().ca.CertPEM), []byte(handedOver[update.AnnotationUpdatePayload]),
+			handedOver[update.AnnotationUpdatePayloadSig], handedOver[update.AnnotationUpdateSigner], r.now)
 		if err != nil || signed.Payload != wantP {
 			t.Fatalf("the handed-over payload does not verify: %v (%+v)", err, signed.Payload)
 		}
