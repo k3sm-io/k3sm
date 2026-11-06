@@ -51,6 +51,23 @@ pkg/install/install.go
 pkg/install/install_test.go
 pkg/install/removezot_darwin_test.go
 hack/acceptance/B1022.sh
+# Resolutions 4 and 5: the store stays in zot's on-disk layout, keeps zot's
+# databases, and is tested against a capture of a real zot.
+pkg/ociregistry/ref/ref.go
+pkg/ociregistry/store/doc.go
+pkg/ociregistry/store/id.go
+pkg/ociregistry/store/rows.go
+pkg/ociregistry/store/store.go
+pkg/ociregistry/store/store_test.go
+pkg/ociregistry/store/testdata/zot-v2.1.22.tar.gz
+pkg/ociregistry/store/testdata/zot-v2.1.22.txt
+pkg/registrysvc/servicechild_integration_test.go
+hack/capture-zot-layout.sh
+hack/acceptance/B1017.sh
+# Resolution 20: the baseline measured zot against the k3sm registry.
+hack/acceptance/B1028.sh
+# The record of every test that left pkg/registrysvc, and why.
+pkg/registrysvc/testdata/test-manifest.txt
 "
 
 fails=0

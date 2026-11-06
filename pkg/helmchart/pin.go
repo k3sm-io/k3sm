@@ -32,7 +32,7 @@ import (
 // payload beside kubectl and seeded into the work dir's bin at boot.
 //
 // PROVENANCE. helm is BUILT from its module source at the pin, the way k3sm
-// builds kine, etcd and zot, rather than taken from the upstream release
+// builds kine and etcd, rather than taken from the upstream release
 // tarball: the tarball is compiled with whatever Go release helm's maintainers
 // used and links the dependency versions helm's go.mod names, so a standard
 // library or golang.org/x fix reaches it only when helm cuts a release. The

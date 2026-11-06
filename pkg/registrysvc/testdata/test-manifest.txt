@@ -27,9 +27,9 @@ TestConvergeRearmsWhileBudgetLeavesWork added new with the dedupe loop
 TestCredentialMatchesRegistry kept the relay and cluster publication do not touch the child
 TestCredentialWithoutAddressMatchesNothing kept the credential files are unchanged
 TestDeleteManifestRefusesNoState kept prune works on the store, which is unchanged
-TestEnsureZotBuildsThenIsANoOp kept zot staging stays until zot leaves the build
-TestEnsureZotFailureLeavesNoMarker kept zot staging stays until zot leaves the build
-TestEnsureZotSeedsFromAPayload kept zot staging stays until zot leaves the build
+TestEnsureZotBuildsThenIsANoOp deleted the zot child left the build, and its staging with it
+TestEnsureZotFailureLeavesNoMarker deleted the zot child left the build, and its staging with it
+TestEnsureZotSeedsFromAPayload deleted the zot child left the build, and its staging with it
 TestFlatEndpointSlice kept the relay and cluster publication do not touch the child
 TestFlatService kept the relay and cluster publication do not touch the child
 TestFlatServingSANs kept the relay and cluster publication do not touch the child
@@ -52,7 +52,7 @@ TestNodePortServingSANs kept the relay and cluster publication do not touch the 
 TestNodePortServingSANsRefuseClusterNames kept the relay and cluster publication do not touch the child
 TestParseAdvertisement kept the relay and cluster publication do not touch the child
 TestParseStateRejectsGarbage kept the behaviour it pins is unchanged by the child switch
-TestPayloadBinaries kept zot staging stays until zot leaves the build
+TestPayloadBinaries deleted the zot child left the build, and its staging with it
 TestPlanRepositoryFailsClosed kept prune works on the store, which is unchanged
 TestPreflightPortRefusesAHeldPort kept the behaviour it pins is unchanged by the child switch
 TestProcargsArgv kept the behaviour it pins is unchanged by the child switch
@@ -130,14 +130,14 @@ TestWriteCredentialGateUser kept the push gate is unchanged
 TestWriteCredentialRefusesStaleWideTemp kept the credential files are unchanged
 TestWriteState kept the behaviour it pins is unchanged by the child switch
 TestWriteStatePublishesACopy kept the relay and cluster publication do not touch the child
-TestWriteZotMarker kept zot staging stays until zot leaves the build
-TestZotBuildArgs kept zot staging stays until zot leaves the build
-TestZotBuildEnv kept zot staging stays until zot leaves the build
-TestZotInstallEnvPinsVerification kept zot staging stays until zot leaves the build
-TestZotStaged kept zot staging stays until zot leaves the build
-TestZotStagingNeverRewritesALiveInode kept zot staging stays until zot leaves the build
-TestZotVariantNamesRaises kept zot staging stays until zot leaves the build
-TestZotWrapperGraphMatchesPinnedZot kept zot staging stays until zot leaves the build
-TestZotWrapperGraphProblems kept zot staging stays until zot leaves the build
-TestZotWrapperPins kept zot staging stays until zot leaves the build
-TestZotWrapperRefusesAnotherVersion kept zot staging stays until zot leaves the build
+TestWriteZotMarker deleted the zot child left the build, and its staging with it
+TestZotBuildArgs deleted the zot child left the build, and its staging with it
+TestZotBuildEnv deleted the zot child left the build, and its staging with it
+TestZotInstallEnvPinsVerification deleted the zot child left the build, and its staging with it
+TestZotStaged deleted the zot child left the build, and its staging with it
+TestZotStagingNeverRewritesALiveInode deleted the zot child left the build, and its staging with it
+TestZotVariantNamesRaises deleted the zot child left the build, and its staging with it
+TestZotWrapperGraphMatchesPinnedZot deleted the zot child left the build, and its staging with it
+TestZotWrapperGraphProblems deleted the zot child left the build, and its staging with it
+TestZotWrapperPins deleted the zot child left the build, and its staging with it
+TestZotWrapperRefusesAnotherVersion deleted the zot child left the build, and its staging with it

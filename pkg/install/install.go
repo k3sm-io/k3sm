@@ -1260,7 +1260,7 @@ type Config struct {
 	ExecShimSource string
 	// PayloadSource is a directory holding the control-plane payload
 	// (executor.PayloadBinaries: kube-apiserver, kube-scheduler,
-	// kube-controller-manager, kubectl, kine, etcd, etcdutl, helm and zot) staged by `k3sm payload <dir>`. Install copies it to
+	// kube-controller-manager, kubectl, kine, etcd, etcdutl and helm) staged by `k3sm payload <dir>`. Install copies it to
 	// InstallDir/bin, from which the daemon boot seeds its workdir — the launchd
 	// _k3sm daemon has neither gh nor a Go toolchain to acquire them itself.
 	// Defaults to the cp-payload sibling dir of BinarySource.
@@ -2334,7 +2334,7 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	//     The control-plane version marker is staged the same way and for the same
 	//     reasons: without it the seed cannot tell this release's kube binaries from
 	//     the ones an earlier release left in the work dir, and an absent marker only
-	//     means the seed leaves the present set alone. The zot and helm markers ride along: without them the server cannot take the payload zot, and the seed keeps an older helm build.
+	//     means the seed leaves the present set alone. helm's marker rides along: without it the seed keeps an older helm build.
 	for _, m := range payloadSetMarkers {
 		_ = sys.CopyToRootOwned(filepath.Join(cfg.PayloadSource, m), cfg.stagedPayloadFile(m))
 	}

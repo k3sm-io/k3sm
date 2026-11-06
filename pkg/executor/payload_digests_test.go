@@ -126,11 +126,9 @@ func TestVerifyPayloadSetRejectsExtraFiles(t *testing.T) {
 // verifies whether it still carries zot and its marker or not, and anything else
 // beside them is still refused.
 func TestVerifyPayloadSetToleratesZot(t *testing.T) {
-	var without []string
-	for _, b := range PayloadBinaries() {
-		if b != registrysvc.ZotBinaryName {
-			without = append(without, b)
-		}
+	without := PayloadBinaries()
+	if slices.Contains(without, registrysvc.ZotBinaryName) {
+		t.Fatalf("PayloadBinaries() = %v still names zot", without)
 	}
 	for _, tc := range []struct {
 		name  string

@@ -30,7 +30,6 @@ import (
 	"testing"
 
 	"k3sm.io/k3sm/pkg/helmchart"
-	"k3sm.io/k3sm/pkg/registrysvc"
 )
 
 // The control-plane version marker. The four kwok-ci/k8s binaries used to be
@@ -372,7 +371,7 @@ func TestEnsureControlPlaneBinariesReportsStagedVersion(t *testing.T) {
 // TestStagePayloadWritesKubeMarker is the end-to-end producer check: StagePayload's
 // output carries the control-plane, kine and etcd markers and passes
 // VerifyPayloadSet, which it runs last. The go tool, the release download, the kine,
-// etcd and helm builds and the zot staging are faked, and the pin table is pointed at the fake bytes' digests for the
+// etcd and helm builds are faked, and the pin table is pointed at the fake bytes' digests for the
 // duration — the real digests would need a sha256 preimage.
 func TestStagePayloadWritesKubeMarker(t *testing.T) {
 	fakeTool(t, "go")
@@ -403,14 +402,6 @@ func TestStagePayloadWritesKubeMarker(t *testing.T) {
 	}
 
 	fakeHelmBuild(t, "pretend-helm")
-	origZot := stageZot
-	t.Cleanup(func() { stageZot = origZot })
-	stageZot = func(_ context.Context, dir string) error {
-		if err := os.WriteFile(registrysvc.ZotPath(dir), []byte("pretend-zot"), 0o755); err != nil {
-			return err
-		}
-		return os.WriteFile(filepath.Join(dir, registrysvc.ZotMarkerName), []byte(registrysvc.DefaultZotVersion+" minimal+r2\n"), 0o644)
-	}
 
 	dest := filepath.Join(t.TempDir(), "payload")
 	if err := StagePayload(t.Context(), dest); err != nil {

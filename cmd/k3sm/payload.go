@@ -30,7 +30,7 @@ import (
 
 // runPayload is `k3sm payload <dir>`: stage the control-plane payload
 // (executor.PayloadBinaries: kube-apiserver/scheduler/controller-manager/kubectl,
-// kine, etcd and etcdutl, helm and the registry's zot) into <dir> using
+// kine, etcd and etcdutl, and helm) into <dir> using
 // the executor's own pinned versions and acquisition code. `--kine-only` stages just
 // kine (executor.StageKine), for the test harnesses that run kine themselves. It is the
 // packaging-side PRODUCER — run it in a shell that has `gh` and the Go toolchain

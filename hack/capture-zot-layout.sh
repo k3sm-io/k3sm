@@ -6,8 +6,8 @@
 # pkg/ociregistry/store is tested against what zot really writes rather than
 # against a reading of its source.
 #
-# It starts the pinned zot (the version pkg/registrysvc pins, checked from the
-# binary's Go build info) on a fresh root with k3sm's storage settings (dedupe
+# It starts zot at the version the fixture was captured at (PIN below, checked from
+# the binary's Go build info) on a fresh root with k3sm's storage settings (dedupe
 # on, GC off for the duration of the capture so nothing is reaped mid-run, basic
 # authentication on, which is what makes zot create meta.db), and drives it over
 # the distribution API with curl through a fixed push set:
@@ -29,11 +29,10 @@
 # every entry with its mode, size and link group.
 #
 # Usage:
-#   hack/capture-zot-layout.sh [--zot <path>] [--out <dir>]
-#       --zot  a zot binary built at the pin (default: build one from the
-#              pkg/registrysvc/zotchild wrapper module, the way k3sm stages it)
+#   hack/capture-zot-layout.sh --zot <path> [--out <dir>]
+#       --zot  a zot binary built at PIN; k3sm no longer builds or ships one
 #       --out  where the fixture goes (default pkg/ociregistry/store/testdata)
-#   hack/capture-zot-layout.sh --serve-check <root> [--zot <path>]
+#   hack/capture-zot-layout.sh --serve-check <root> --zot <path>
 #       serve an existing store root (a copy of it) with the pinned zot and read
 #       every repository, tag, manifest and referenced blob back through the API,
 #       checking each digest; exit 0 iff zot serves all of it
@@ -49,7 +48,7 @@ while [ $# -gt 0 ]; do
 	--zot) ZOT="$2"; shift 2 ;;
 	--out) OUT="$2"; shift 2 ;;
 	--serve-check) CHECK="$2"; shift 2 ;;
-	*) echo "usage: $0 [--zot <path>] [--out <dir>] | --serve-check <root> [--zot <path>]" >&2; exit 2 ;;
+	*) echo "usage: $0 --zot <path> [--out <dir>] | --serve-check <root> --zot <path>" >&2; exit 2 ;;
 	esac
 done
 
@@ -57,8 +56,8 @@ for t in curl shasum bsdtar jq go; do
 	command -v "$t" >/dev/null || { echo "FAIL: $t not on PATH" >&2; exit 1; }
 done
 
-PIN="$(sed -n 's/^[[:space:]]*DefaultZotVersion = "\(v[^"]*\)"$/\1/p' "$ROOT/pkg/registrysvc/pin.go")"
-[ -n "$PIN" ] || { echo "FAIL: cannot read DefaultZotVersion from pkg/registrysvc/pin.go" >&2; exit 1; }
+PIN=v2.1.22
+[ -n "$ZOT" ] || { echo "FAIL: --zot <path> is required: a zot binary built at $PIN" >&2; exit 2; }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/zot-capture.XXXXXX")"
 ZOT_PID=""
@@ -68,14 +67,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [ -z "$ZOT" ]; then
-	echo "building zot $PIN from the zotchild wrapper module"
-	mkdir -p "$WORK/build"
-	cp "$ROOT/pkg/registrysvc/zotchild/go.mod.txt" "$WORK/build/go.mod"
-	cp "$ROOT/pkg/registrysvc/zotchild/go.sum.txt" "$WORK/build/go.sum"
-	(cd "$WORK/build" && GOWORK=off CGO_ENABLED=0 GOFLAGS=-mod=readonly go build -trimpath -o "$WORK/zot" zotregistry.dev/zot/v2/cmd/zot)
-	ZOT="$WORK/zot"
-fi
 [ -x "$ZOT" ] || { echo "FAIL: $ZOT is not an executable" >&2; exit 1; }
 got="$(go version -m "$ZOT" | awk '$1 == "mod" && $2 == "zotregistry.dev/zot/v2" {print $3}')"
 [ "$got" = "$PIN" ] || { echo "FAIL: $ZOT is zot ${got:-<unknown>}; the pin is $PIN" >&2; exit 1; }
