@@ -25,12 +25,14 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
 
 	mlxv1alpha1 "k3sm.io/apis/mlx/v1alpha1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
 
 	"k3sm.io/k3sm/pkg/gpucapacity"
+	"k3sm.io/k3sm/pkg/mlx/operator"
 )
 
 const (
@@ -354,6 +356,24 @@ func TestUnitsCountBothNames(t *testing.T) {
 		}
 		if _, creates := f.counts(); refused != 1 || creates != 1 {
 			t.Errorf("refused = %d, RPC calls = %d; want exactly one of each", refused, creates)
+		}
+	})
+
+	// Sharded placement reads the same count, so a pod under either name takes a
+	// slot from a rank asking under the other.
+	t.Run("placement_holds_units_under_either_name", func(t *testing.T) {
+		t.Parallel()
+		model := &mlxv1alpha1.MLXModel{ObjectMeta: metav1.ObjectMeta{Namespace: "models", Name: "m"}}
+		pods := []corev1.Pod{
+			*namedGPUPod("old", unitsOldName),
+			*namedGPUPod("new", unitsNewName),
+			*namedGPUPod("both", unitsOldName, unitsNewName),
+			*requestsOnlyGPUPod("requests", unitsNewName),
+			*gpuFitPod("cpu", testGiB, false),
+		}
+		pods[4].Spec.NodeName = "n"
+		if got, want := operator.HeldGPUSlots(model, pods)["n"], int64(4); got != want {
+			t.Errorf("HeldGPUSlots = %d, want %d", got, want)
 		}
 	})
 
