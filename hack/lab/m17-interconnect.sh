@@ -66,7 +66,12 @@
 #                              copied to the peer (default /tmp/k3sm-conformance-bin);
 #                              the login must own it. The run's own directory under it
 #                              is removed on exit. Needs go and codesign on the local Mac
-#   K3SM_M17_MLX_MODEL, K3SM_M17_MLX_MEMORY, K3SM_M17_MLX_READY_TIMEOUT  r5's model
+#   K3SM_M17_MLX_MODEL, K3SM_M17_MLX_REVISION   r5's model and its pinned revision
+#                              (default examples/mlxmodel.yaml's; a model named without
+#                              a revision is refused, because r6 and r8 restart ranks
+#                              and a moving branch could load other weights)
+#   K3SM_M17_MLX_IMAGE         r5's serving image (default examples/mlxmodel.yaml's)
+#   K3SM_M17_MLX_MEMORY, K3SM_M17_MLX_READY_TIMEOUT
 #   K3SM_M17_PREVIOUS_ARTIFACT the previous k3sm binary for r9, beside its build set
 #                              (`k3sm install --print-required-artifacts` names the set),
 #                              whose helper speaks a minor below 2: a build whose
@@ -878,19 +883,76 @@ EOF
 	kc delete pod -n "$NS" ic-pin --wait=false >/dev/null 2>&1
 }
 
-# mlx_model <name> <interconnect|-> — apply the r5 model (- = single-Mac).
-mlx_model() {
+# examples/mlxmodel.yaml's serving fields; the self-test fails when they part.
+MLX_DEFAULT_MODEL="mlx-community/Qwen3-0.6B-4bit"
+MLX_DEFAULT_REVISION="73e3e38d981303bc594367cd910ea6eb48349da8"
+MLX_DEFAULT_IMAGE="ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.5@sha256:a225253effc92f5f5ff8ec2ec2e2f8894aa690a3d6a908bb879439de6733d0e8"
+MLX_PORT=8000
+MLX_CACHE_SIZE=5Gi
+MLX_CACHE_CLASS=local-path
+# mlx_knob_problem <model knob> <revision knob> — a revision pins one model's history,
+# so naming a model means naming its revision too.
+mlx_knob_problem() {
+	if [ -n "$1" ] && [ -z "$2" ]; then
+		echo "K3SM_M17_MLX_MODEL=$1 needs K3SM_M17_MLX_REVISION: the default revision pins another model, and an unpinned one moves between rank restarts"
+		return 1
+	fi
+	if [ -z "$1" ] && [ -n "$2" ]; then
+		echo "K3SM_M17_MLX_REVISION=$2 needs K3SM_M17_MLX_MODEL: it would pin the default model to a revision chosen for another"
+		return 1
+	fi
+}
+# st_example_field <key> — a top-level or nested scalar from examples/mlxmodel.yaml.
+st_example_field() { awk -v k="$1:" '$1==k{print $2; exit}' "$REPO_ROOT/examples/mlxmodel.yaml"; }
+
+# mlx_model_manifest <name> <interconnect|-> — the r5 model (- = single-Mac). The
+# operator ships no default image or port (pkg/mlx/render.go ErrNoImage, ErrNoPort),
+# and a pinned revision requires a cache (ErrRevisionNeedsCache), so the serving
+# fields are examples/mlxmodel.yaml's, which the self-test holds them to.
+mlx_model_manifest() {
 	local dist=""
 	[ "$2" != - ] && dist="distributed: {ranks: 2, backend: ring, interconnect: $2}"
-	kc apply -f - >/dev/null <<EOF
+	cat <<EOF
 apiVersion: mlx.k3sm.io/v1alpha1
 kind: MLXModel
 metadata: {name: $1, namespace: $NS}
 spec:
   model: $MLX_MODEL
+  revision: $MLX_REVISION
   memory: $MLX_MEMORY
+  port: $MLX_PORT
+  runtime: {image: "$MLX_IMAGE"}
+  cache: {size: $MLX_CACHE_SIZE, storageClassName: $MLX_CACHE_CLASS}
   $dist
 EOF
+}
+mlx_model() { mlx_model_manifest "$@" | kc apply -f - >/dev/null; }
+# mlx_invalid_spec <name> — the message of a spec the operator cannot render: it
+# stays that way until the spec changes (pkg/mlx/operator ReasonInvalidSpec).
+mlx_invalid_spec() { kc get mlxmodel -n "$NS" "$1" -o jsonpath='{.status.conditions[?(@.reason=="InvalidSpec")].message}' 2>/dev/null; }
+# model_wait <name> <seconds> <command...> — poll like wait_until, but return 3 at
+# once on an InvalidSpec, which no amount of waiting can change.
+model_wait() {
+	local m="$1" deadline=$((SECONDS + $2))
+	shift 2
+	while [ "$SECONDS" -lt "$deadline" ]; do
+		"$@" >/dev/null 2>&1 && return 0
+		[ -z "$(mlx_invalid_spec "$m")" ] || return 3
+		sleep 2
+	done
+	"$@" >/dev/null 2>&1
+}
+# mlx_status_save <name> — the model's status and conditions, for a failing r5.
+mlx_status_save() { kc get mlxmodel -n "$NS" "$1" -o json >"$RUNG_DIR/mlxmodel-$1.json" 2>&1; }
+# model_wait_failed <name> <rc> <what it waited for> — the verdict of a wait that did
+# not succeed, with the status on record.
+model_wait_failed() {
+	mlx_status_save "$1"
+	if [ "$2" = 3 ]; then
+		fail "MLXModel $1 was rejected with InvalidSpec: $(mlx_invalid_spec "$1")"
+	else
+		fail "MLXModel $1 $3"
+	fi
 }
 model_ready() { grep -qx True <<<"$(kc get mlxmodel -n "$NS" "$1" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)"; }
 # ring_on <path> — ic-ring is Ready with both rank pods on that path.
@@ -919,7 +981,7 @@ print("%.2f %d" % (n/float(t), int(float(u))+int(float(d))))' "$2" "$2.timing"
 }
 
 assert_r5_ring() {
-	local alloc s m out line http r0l r0p fig_net fig_single fig_tb tbd utd ip
+	local alloc s m out line http r0l r0p fig_net fig_single fig_tb tbd utd ip rc
 	for s in local peer; do
 		alloc="$(kc get node "$(node_of "$s")" -o jsonpath='{.status.allocatable.mlx\.k3sm\.io/gpu}' 2>/dev/null)"
 		if [ "${alloc:-0}" -lt 1 ] 2>/dev/null || [ -z "$alloc" ]; then
@@ -929,25 +991,38 @@ assert_r5_ring() {
 	done
 	# Control figures first (RECORDED): the same model over the network, and one Mac.
 	mlx_model ic-ring network
-	if ! wait_until "$MLX_READY_TIMEOUT" model_ready ic-ring; then
-		if image_pull_failed; then
+	rc=0
+	model_wait ic-ring "$MLX_READY_TIMEOUT" model_ready ic-ring || rc=$?
+	if [ "$rc" != 0 ]; then
+		mlx_status_save ic-ring
+		if [ "$rc" != 3 ] && image_pull_failed; then
 			refuse_rung "$(prereq_what mlximage): a rank pod cannot pull it" BI8
 			return 2
 		fi
-		fail "MLXModel ic-ring (interconnect network) never became Ready within ${MLX_READY_TIMEOUT}s"
+		model_wait_failed ic-ring "$rc" "(interconnect network) never became Ready within ${MLX_READY_TIMEOUT}s"
 		return 1
 	fi
 	fig_net="$(tokens_per_s ic-ring "$RUNG_DIR/completion-network.json")" || fig_net=""
 	mlx_model ic-single -
-	if wait_until "$MLX_READY_TIMEOUT" model_ready ic-single; then
+	rc=0
+	model_wait ic-single "$MLX_READY_TIMEOUT" model_ready ic-single || rc=$?
+	if [ "$rc" = 0 ]; then
 		fig_single="$(tokens_per_s ic-single "$RUNG_DIR/completion-single.json")" || fig_single=""
+	elif [ "$rc" = 3 ]; then
+		model_wait_failed ic-single "$rc" ""
+		return 1
+	else
+		mlx_status_save ic-single
+		rec "the single-Mac control never became Ready within ${MLX_READY_TIMEOUT}s; its figure is missing, which gates nothing"
 	fi
 	kc delete mlxmodel -n "$NS" ic-single --wait=false >/dev/null 2>&1
 	# The interconnect run.
 	kc patch mlxmodel -n "$NS" ic-ring --type merge -p '{"spec":{"distributed":{"interconnect":"thunderbolt"}}}' >/dev/null
 	sleep 5
-	if ! wait_until "$MLX_READY_TIMEOUT" ring_on thunderbolt; then
-		fail "MLXModel ic-ring did not become Ready with both ranks on the thunderbolt path"
+	rc=0
+	model_wait ic-ring "$MLX_READY_TIMEOUT" ring_on thunderbolt || rc=$?
+	if [ "$rc" != 0 ]; then
+		model_wait_failed ic-ring "$rc" "did not become Ready with both ranks on the thunderbolt path"
 		rank_pods ic-ring >"$RUNG_DIR/ranks.txt"
 		return 1
 	fi
@@ -2049,6 +2124,51 @@ st_driver_red() {
 	fi
 }
 
+# st_mlx_manifest <name> <interconnect|-> — the rendered manifest carries every field
+# the operator refuses a model without, as YAML a parser reads back.
+st_mlx_manifest() {
+	local out
+	MLX_MODEL="$MLX_DEFAULT_MODEL" MLX_REVISION="$MLX_DEFAULT_REVISION" MLX_IMAGE="$MLX_DEFAULT_IMAGE" MLX_MEMORY=4Gi NS=stub
+	out="$(mlx_model_manifest "$1" "$2")"
+	st_eq "$1 manifest: port" "$(awk '$1=="port:"{print $2}' <<<"$out")" 8000
+	st_eq "$1 manifest: the digest-pinned image" "$(sed -n 's/.*runtime: {image: "\(.*\)"}/\1/p' <<<"$out")" "$MLX_DEFAULT_IMAGE"
+	st_eq "$1 manifest: revision" "$(awk '$1=="revision:"{print $2}' <<<"$out")" "$MLX_DEFAULT_REVISION"
+	st_eq "$1 manifest: cache" "$(grep -c 'cache: {size: 5Gi, storageClassName: local-path}' <<<"$out")" 1
+	if [ "$2" = - ]; then
+		st_eq "$1 manifest: no distributed block" "$(grep -c distributed <<<"$out")" 0
+	else
+		st_eq "$1 manifest: two ranks on the path" "$(grep -c "distributed: {ranks: 2, backend: ring, interconnect: $2}" <<<"$out")" 1
+	fi
+}
+
+# st_r5_run <invalid|slow> — the real r5 assertion to its first wait, the cluster
+# stubbed: an InvalidSpec model, or one that never reports anything.
+st_r5_run() {
+	local prof="$1" r5_dir
+	r5_dir="$(mktemp -d -t m17-r5.XXXXXX)"
+	RUNG_DIR="$r5_dir" RUNG=r5 R_PASS=0 R_FAIL=0 NS=stub MLX_READY_TIMEOUT=2 MLX_MEMORY=4Gi
+	MLX_MODEL=m MLX_REVISION=r MLX_IMAGE=i
+	# shellcheck disable=SC2034 # read through node_of
+	local_NODE=node-a peer_NODE=node-b
+	sleep() { :; }
+	image_pull_failed() { return 1; }
+	model_ready() {
+		echo POLL
+		return 1
+	} >>"$r5_dir/.polls"
+	kc() {
+		case "$*" in
+		"get node "*) echo 1 ;;
+		*'@.reason=="InvalidSpec"'*) [ "$prof" != invalid ] || echo "no serving image" ;;
+		"get mlxmodel -n stub ic-ring -o json") echo '{"status":{}}' ;;
+		esac
+	}
+	assert_r5_ring
+	cat "$r5_dir/.polls"
+	[ -s "$r5_dir/mlxmodel-ic-ring.json" ] && echo "SAVED mlxmodel-ic-ring.json"
+	rm -rf "$r5_dir"
+}
+
 # st_r8_run <profile> — the real r8 assertion with the host and cluster stubbed: bridge0
 # reads armed until the pods are deleted, so the green profile passes only when the
 # hold is read before the delete and the empty halves after it. Each other profile
@@ -2328,6 +2448,24 @@ self_test_body() {
 			st "the m11 header emitted over a fixture carries '$r'" 0 grep -qF -- "$r" "$tmp/header.txt"
 		done
 	fi
+	for r in ic-ring:thunderbolt ic-single:-; do
+		st_mlx_manifest "${r%%:*}" "${r##*:}"
+	done
+	st_eq "the r5 model is the example's" "$MLX_DEFAULT_MODEL" "$(st_example_field model)"
+	st_eq "the r5 revision is the example's" "$MLX_DEFAULT_REVISION" "$(st_example_field revision)"
+	st_eq "the r5 image is the example's" "$MLX_DEFAULT_IMAGE" "$(st_example_field image)"
+	st_eq "the r5 port is the example's" "$MLX_PORT" "$(st_example_field port)"
+	st_eq "the r5 cache size is the example's" "$MLX_CACHE_SIZE" "$(st_example_field size)"
+	st_eq "the r5 cache class is the example's" "$MLX_CACHE_CLASS" "$(st_example_field storageClassName)"
+	st "the mlx knobs: neither named" 0 mlx_knob_problem "" ""
+	st "the mlx knobs: both named" 0 mlx_knob_problem a/b abc
+	st_out "the mlx knobs red: a model without its revision" "needs K3SM_M17_MLX_REVISION" mlx_knob_problem a/b ""
+	st "the mlx knobs red: a revision without its model" 1 mlx_knob_problem "" abc
+	st_out "r5 stops at once on InvalidSpec, naming it" "rejected with InvalidSpec: no serving image" st_r5_run invalid
+	st_eq "r5 polled once before it stopped on InvalidSpec" "$(st_r5_run invalid | grep -c '^POLL')" 1
+	st_out "r5 saves the status of an InvalidSpec model" "SAVED mlxmodel-ic-ring.json" st_r5_run invalid
+	st_out "r5 still runs out its budget for a model that is only slow" "never became Ready within 2s" st_r5_run slow
+	st_out "r5 saves the status of a model that timed out" "SAVED mlxmodel-ic-ring.json" st_r5_run slow
 	st_driver r3 cable 0
 	st_driver r3 cable-red 1
 	st_driver r3 cable-captured 1
@@ -2487,7 +2625,10 @@ PAYLOAD_MB="${K3SM_M17_PAYLOAD_MB:-128}"
 LAN_SLACK="${K3SM_M17_LAN_SLACK_BYTES:-8388608}"
 DESIRED_INTERVAL="${K3SM_M17_DESIRED_INTERVAL:-60}"
 CLUSTER_CIDR="${K3SM_M17_CLUSTER_CIDR:-100.64.0.0/10}"
-MLX_MODEL="${K3SM_M17_MLX_MODEL:-mlx-community/Qwen2.5-0.5B-Instruct-4bit}"
+why="$(mlx_knob_problem "${K3SM_M17_MLX_MODEL:-}" "${K3SM_M17_MLX_REVISION:-}")" || refuse_run preflight "$why (BI8)"
+MLX_MODEL="${K3SM_M17_MLX_MODEL:-$MLX_DEFAULT_MODEL}"
+MLX_REVISION="${K3SM_M17_MLX_REVISION:-$MLX_DEFAULT_REVISION}"
+MLX_IMAGE="${K3SM_M17_MLX_IMAGE:-$MLX_DEFAULT_IMAGE}"
 MLX_MEMORY="${K3SM_M17_MLX_MEMORY:-4Gi}"
 MLX_READY_TIMEOUT="${K3SM_M17_MLX_READY_TIMEOUT:-1800}"
 REINSTALL_ARGS="${K3SM_M17_REINSTALL_ARGS:-}"
