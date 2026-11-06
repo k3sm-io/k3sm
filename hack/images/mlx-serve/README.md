@@ -142,6 +142,24 @@ revision; a revision the Hub resolves to another commit (a branch or tag name)
 exits 2 too. A model reference that is not such a path is left to the engine.
 `TestRenderSeedsPinnedRevision` in `pkg/mlx` runs the rendered argv through it.
 
+## The serving port
+
+The single-node port has **no API key**. k3sm renders no `--api-key`, the image's
+ENTRYPOINT passes none, and with none set vllm-mlx answers every route with no
+credential, so any non-empty key a client sends is ignored. The engine binds the
+wildcard, which the default runtime rewrites onto the Pod's own address. The port
+is behind a `ClusterIP` Service, so every Pod in the cluster and every process on
+a node can call it, including the routes that spend GPU time. NetworkPolicy does
+not close this: it is a hint, enforced only for connections through the Service VIP
+(see the Limitations guide). Nothing publishes the port on the LAN unless you add a
+NodePort, LoadBalancer or Ingress in front of it. Keep it to trusted tenants, or
+isolate the clients.
+
+`--api-key <key>` in `spec.runtime.args` does make the engine check a key on every
+route but `/health`, with two costs: the key is in plain text in the Pod spec, and
+the operator's status probe sends no key, so `/v1/models` answers it 401 and the
+model never reports that it is serving.
+
 ## Files
 
 | file | what it is |
@@ -202,7 +220,14 @@ naming `spec.model` or no model is served by the model already loaded, and a
 request naming any other `model`, `draft_model` or `adapters` is answered HTTP
 404. The engine would otherwise hand a model or draft model, which any client of
 the port sets, to its loader, which downloads the repository and drops the model
-being served. The selftest checks the status through the real handler. The operator always renders the
+being served. A refused request still costs the batch in progress: `mlx_lm.server`
+checks the model in its generation loop, so a request naming another model while a
+batch runs stops new requests joining that batch, waits for it to finish, and only
+then gets its 404. Requests behind it wait too. Any client of the port can cause
+that, one batch at a time; it loses no output and loads nothing. The check is not
+moved ahead of the queue because the handler's own validation hook answers 400, and
+the 404 is the documented status. The single-node engine has no such cost: it
+checks the name before it reaches the engine. The selftest checks the status through the real handler. The operator always renders the
 option on a rank. This hooks four
 `mlx_lm.server` internals (`ModelProvider.load`,
 `APIHandler.handle_models_request`, `run` and `_run_http_server`). The rank

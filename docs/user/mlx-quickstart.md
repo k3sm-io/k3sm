@@ -120,7 +120,7 @@ curl -sS "http://$VIP:8000/v1/chat/completions" \
 ```
 
 Any client of that API works. Point its base URL at `http://$VIP:8000/v1` and give it any
-non-empty API key. Concurrent requests are batched by the server; the number it will batch is derived
+non-empty API key; the server does not check it (see [Things to Know](#things-to-know)). Concurrent requests are batched by the server; the number it will batch is derived
 from `memory`.
 
 ## 5. Delete It
@@ -138,6 +138,18 @@ That removes the serving workload, both Services, and the cache PVC. The underly
   The serving process needs direct access to the Mac's GPU, and the [`vm` RuntimeClass](vm-runtimeclass.md) isolates a workload from exactly that.
 - Because it runs natively, a served model shares the `_k3sm` trust domain with the other native Pods on
   that Mac. Serve **models and code you trust**; see [Limitations](limitations.md).
+- **The serving port has no API key.** Every Pod in the cluster and every process on a node can call
+  it, and [NetworkPolicy is a hint](limitations.md#networkpolicy-is-a-policy-hint-not-a-security-boundary)
+  that does not close it. Nothing publishes it on the LAN unless you add a NodePort, LoadBalancer or
+  Ingress. Setting `--api-key` in `runtime.args` makes the server check a key, but the key is then in
+  plain text in the Pod spec, and the model's status never reports serving because the status probe
+  sends no key.
+- **A request cannot load another model.** The server answers HTTP 400 on `/v1/audio/transcriptions`
+  and `/v1/audio/speech`, and on `/v1/embeddings` unless you pin an embedding model with
+  `--embedding-model <repo>` in `runtime.args`. A pinned model loads at start, beside the served one,
+  and `memory` does not account for it.
+- Send images, video and audio inline as `data:image/`, `data:video/` or `data:audio/` URLs. Remote URLs
+  and other `data:` types are refused with HTTP 400.
 - Weights never live in the image. They are downloaded on first start into the cache volume, so give
   that volume room for the model you are serving. A pinned `revision` is downloaded into that volume
   the same way, once (see step 2).
