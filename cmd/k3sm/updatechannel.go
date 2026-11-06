@@ -50,14 +50,15 @@ var updatePolicyGVR = updatesv1alpha1.SchemeGroupVersion.WithResource("updatepol
 // fails rather than resolving on a channel nobody chose.
 var errChannelUnreadable = errors.New("the update channel could not be read")
 
-// errChannelUnsupported is a write the server has no resource for, still so when
-// the wait for the CRD ended: an older server, or one whose update controller has
-// not ensured the CRD. It never reads as a set channel.
-var errChannelUnsupported = errors.New("this server does not support update channels")
+// errChannelNotEstablished is a write the server has no resource for, still so when
+// the wait for the CRD ended. It never reads as a set channel. It does not say why:
+// an older server, and this release's whose controller is still retrying the CRD,
+// answer alike, and the controller no longer holds rolls back for it.
+var errChannelNotEstablished = errors.New("the update channel setting is not established on this server yet")
 
-// channelCRDWait bounds how long a write waits for the UpdatePolicy CRD. The
-// update controller ensures it as the server starts and establishment trails that
-// by seconds, so a server that has none by then is an older one.
+// channelCRDWait bounds how long a write waits for the UpdatePolicy CRD. The update
+// controller ensures it as the server starts and establishment trails that by
+// seconds, so this covers an ordinary start; a retry costs less than a longer block.
 const channelCRDWait = 15 * time.Second
 
 // exitChannelCheckFailed is `k3sm update channel <value>` when the write took and
@@ -389,7 +390,7 @@ func setUpdateChannel(ctx context.Context, value string, env updateEnv) int {
 // Patch answers NotFound both for no object and for no resource; only create
 // tells them apart, because creating a cluster-scoped object can be NotFound only
 // when the resource itself is missing. That case retries until bound, then returns
-// errChannelUnsupported, so a missing CRD never reads as a written channel. A lost
+// errChannelNotEstablished, so a missing CRD never reads as a written channel. A lost
 // race with another writer (the object appears or goes between the two calls) also
 // retries.
 func writeUpdateChannel(ctx context.Context, dyn dynamic.Interface, channel updatesv1alpha1.UpdateChannel, bound time.Duration) error {
@@ -425,7 +426,7 @@ func writeUpdateChannel(ctx context.Context, dyn dynamic.Interface, channel upda
 	case err == nil:
 		return nil
 	case noCRD && ctx.Err() == nil:
-		return fmt.Errorf("%w: the %s CRD is not established after %s", errChannelUnsupported, crdconfig.UpdatePolicyCRDName, bound)
+		return fmt.Errorf("%w: the server has not served the %s CRD after %s; retry in a minute, and if this persists check the server's k3sm version and log", errChannelNotEstablished, crdconfig.UpdatePolicyCRDName, bound)
 	}
 	return fmt.Errorf("write the UpdatePolicy %s: %w", updatesv1alpha1.UpdatePolicyName, err)
 }

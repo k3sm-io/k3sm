@@ -1052,8 +1052,15 @@ func TestUpdateChannelVerb(t *testing.T) {
 			shortWait(env)
 			env.inputs.HTTP = x.client()
 		}, "channel", "rc")
-		if code != exitInternalError || !strings.Contains(errOut, "this server does not support update channels") {
+		if code != exitInternalError || !strings.Contains(errOut, "not established") || !strings.Contains(errOut, "retry") {
 			t.Fatalf("exit %d, stderr %q", code, errOut)
+		}
+		// A missing CRD looks the same on an older server and on this release's
+		// while its controller is still ensuring it, so the words assert neither.
+		for _, claim := range []string{"does not support", "older"} {
+			if strings.Contains(errOut, claim) {
+				t.Errorf("stderr %q asserts %q", errOut, claim)
+			}
 		}
 		if strings.Contains(out, "now rc") || x.redirects.Load() != 0 || x.lists.Load() != 0 {
 			t.Errorf("a refused write read as set: out %q, %d redirects, %d listings", out, x.redirects.Load(), x.lists.Load())
@@ -1062,8 +1069,8 @@ func TestUpdateChannelVerb(t *testing.T) {
 			t.Errorf("%d creates: the write did not wait for the CRD", c.policyCalls("create"))
 		}
 		err := writeUpdateChannel(context.Background(), c.dyn, updatesv1alpha1.UpdateChannelRC, 50*time.Millisecond)
-		if !errors.Is(err, errChannelUnsupported) {
-			t.Errorf("err = %v, want errChannelUnsupported", err)
+		if !errors.Is(err, errChannelNotEstablished) {
+			t.Errorf("err = %v, want errChannelNotEstablished", err)
 		}
 	})
 
@@ -1095,7 +1102,7 @@ func TestUpdateChannelVerb(t *testing.T) {
 		c := newUpdateCluster()
 		c.policyVerbAnswers("patch", -1, apierrors.NewInternalError(errors.New("etcd down")))
 		err := writeUpdateChannel(context.Background(), c.dyn, updatesv1alpha1.UpdateChannelRC, time.Second)
-		if err == nil || errors.Is(err, errChannelUnsupported) || !strings.Contains(err.Error(), "etcd down") {
+		if err == nil || errors.Is(err, errChannelNotEstablished) || !strings.Contains(err.Error(), "etcd down") {
 			t.Errorf("err = %v", err)
 		}
 	})
@@ -1111,7 +1118,7 @@ func TestUpdateChannelVerb(t *testing.T) {
 		})
 		c.policyVerbAnswers("create", -1, noResource)
 		err := writeUpdateChannel(context.Background(), c.dyn, updatesv1alpha1.UpdateChannelRC, time.Second)
-		if err == nil || errors.Is(err, errChannelUnsupported) || !strings.Contains(err.Error(), "etcd down") {
+		if err == nil || errors.Is(err, errChannelNotEstablished) || !strings.Contains(err.Error(), "etcd down") {
 			t.Errorf("err = %v", err)
 		}
 	})
@@ -1126,7 +1133,7 @@ func TestUpdateChannelVerb(t *testing.T) {
 			return true, nil, noResource
 		})
 		err := writeUpdateChannel(ctx, c.dyn, updatesv1alpha1.UpdateChannelRC, time.Minute)
-		if !errors.Is(err, context.Canceled) || errors.Is(err, errChannelUnsupported) {
+		if !errors.Is(err, context.Canceled) || errors.Is(err, errChannelNotEstablished) {
 			t.Errorf("err = %v", err)
 		}
 	})
