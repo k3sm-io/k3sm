@@ -186,7 +186,7 @@ func startVMPodInformers(ctx context.Context, kubeconfig string) (pods, eps cach
 	if _, err := os.Stat(kubeconfig); err != nil {
 		return nil, nil, fmt.Errorf("stat kubeconfig: %w", kubeconfigUnusableError{err: err, missing: errors.Is(err, fs.ErrNotExist)})
 	}
-	cfg, cs, err := kubeclient.FromPath(kubeconfig)
+	cfg, cs, err := kubeclient.FromCheckedPath(kubeconfig)
 	if err != nil {
 		return nil, nil, fmt.Errorf("load kubeconfig: %w", kubeconfigUnusableError{err: err})
 	}

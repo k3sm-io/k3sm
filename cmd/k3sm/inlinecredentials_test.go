@@ -125,6 +125,22 @@ func TestStartServiceInformerAcceptsOnlyInlineCredentials(t *testing.T) {
 	}
 }
 
+// TestStartVMPodInformersAcceptsOnlyInlineCredentials pins netd's second load of
+// the same file to the same check.
+func TestStartVMPodInformersAcceptsOnlyInlineCredentials(t *testing.T) {
+	path := writeServiceKubeconfig(t)
+	ran := saveExecEntry(t, path)
+
+	_, _, err := startVMPodInformers(context.Background(), path)
+	if !errors.Is(err, kubeclient.ErrCredentialsNotInline) {
+		t.Fatalf("err = %v, want ErrCredentialsNotInline", err)
+	}
+	if !strings.HasPrefix(err.Error(), "load kubeconfig: ") {
+		t.Errorf("err = %q, want netd's own `load kubeconfig: ` wrap", err)
+	}
+	assertNeverRan(t, ran)
+}
+
 // attemptCounter is a slog handler that signals once it has seen want records.
 // activateServiceAuthorizer logs once per failed attempt, so records count attempts.
 type attemptCounter struct {
