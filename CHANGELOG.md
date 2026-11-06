@@ -12,6 +12,12 @@ pin, its date, and the tarball's sha256.
 
 ### Added
 
+- `k3sm update channel` prints the cluster's update channel, and fails rather than guess when the
+  cluster gives no answer. `k3sm update channel stable|rc` sets it and runs a check, and exits 3 when
+  the channel was set but the check failed. A channel changes what is offered and never starts a roll.
+  Setting it takes cluster-admin, as `k3sm update apply` does, and a write fails with a retry message
+  when the server has no `UpdatePolicy` CRD established. The update controller now ensures that CRD,
+  and rolls do not wait on it. No RBAC changes.
 - A node publishes its budget as the `budget.k3sm.io/status` annotation on its own Node, in a coarse
   form, only when that form changes and at most once a minute at every level. It reads
   `budget.k3sm.io/policy` from the same Node, keeps the last valid policy when one is refused and

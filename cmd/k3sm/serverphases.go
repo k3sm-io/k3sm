@@ -674,7 +674,7 @@ func updateResolver(rawBase string) updatectl.HTTPResolver {
 }
 
 // startUpdateController is the update step: the update controller (pkg/updatectl),
-// which ensures the Update CRD and rolls the cluster to the release the
+// which ensures the Update and UpdatePolicy CRDs and rolls the cluster to the release the
 // singleton Update names, workers first and this server last. It runs under
 // the in-process admin client, as the other server operators do, and under its
 // own Lease, so one server of an HA control plane rolls at a time. Same

@@ -18,16 +18,22 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 
+	crdconfig "k3sm.io/apis/config/crd"
 	updatesv1alpha1 "k3sm.io/apis/updates/v1alpha1"
 
 	"k3sm.io/k3sm/pkg/status"
@@ -44,6 +50,22 @@ var updatePolicyGVR = updatesv1alpha1.SchemeGroupVersion.WithResource("updatepol
 // fails rather than resolving on a channel nobody chose.
 var errChannelUnreadable = errors.New("the update channel could not be read")
 
+// errChannelNotEstablished is a write the server has no resource for, still so when
+// the wait for the CRD ended. It never reads as a set channel. It does not say why:
+// an older server, and this release's whose controller is still retrying the CRD,
+// answer alike, and the controller no longer holds rolls back for it.
+var errChannelNotEstablished = errors.New("the update channel setting is not established on this server yet")
+
+// channelCRDWait bounds how long a write waits for the UpdatePolicy CRD. The update
+// controller ensures it as the server starts and establishment trails that by
+// seconds, so this covers an ordinary start; a retry costs less than a longer block.
+const channelCRDWait = 15 * time.Second
+
+// exitChannelCheckFailed is `k3sm update channel <value>` when the write took and
+// the check after it failed: the channel is set and nothing has verified it. It is
+// not exitInternalError, which is a write that did not happen.
+const exitChannelCheckFailed = 3
+
 // channelReading is what a channelSource found.
 type channelReading struct {
 	// channel is the channel to resolve on, stable or rc.
@@ -53,6 +75,12 @@ type channelReading struct {
 	// note says why this reader runs as stable when it does so on anything but
 	// the cluster's plain answer; empty otherwise.
 	note string
+	// publishedBy names the server whose published pair gave this answer; empty
+	// when it came from the object.
+	publishedBy string
+	// unreached says why the cluster gave no answer at all, so the channel is only
+	// the fallback a check runs on, and is not one to print as the cluster's.
+	unreached string
 }
 
 // channelSource reads the release channel with the credentials a check already
@@ -82,7 +110,7 @@ func (s channelSource) read(ctx context.Context) (channelReading, error) {
 		return s.readPair(ctx), nil
 	}
 	if s.dyn == nil {
-		return channelReading{channel: updatesv1alpha1.UpdateChannelStable, note: "no cluster to read the update channel from; checking as stable"}, nil
+		return channelReading{channel: updatesv1alpha1.UpdateChannelStable, note: "no cluster to read the update channel from; checking as stable", unreached: "no cluster client"}, nil
 	}
 	obj, err := s.dyn.Resource(updatePolicyGVR).Get(ctx, updatesv1alpha1.UpdatePolicyName, metav1.GetOptions{})
 	switch {
@@ -91,7 +119,7 @@ func (s channelSource) read(ctx context.Context) (channelReading, error) {
 	case apierrors.IsForbidden(err) && !s.objectOnly:
 		return s.readPair(ctx), nil
 	case err != nil:
-		return channelReading{}, fmt.Errorf("%w: %w", errChannelUnreadable, err)
+		return channelReading{unreached: err.Error()}, fmt.Errorf("%w: %w", errChannelUnreadable, err)
 	}
 	var policy updatesv1alpha1.UpdatePolicy
 	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.Object, &policy); err != nil {
@@ -118,24 +146,28 @@ func (s channelSource) readPair(ctx context.Context) channelReading {
 		}
 	}
 	if s.kube == nil {
-		return cannot("no cluster client")
+		r := cannot("no cluster client")
+		r.unreached = "no cluster client"
+		return r
 	}
 	nodes, err := s.kube.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return cannot(err.Error())
+		r := cannot(err.Error())
+		r.unreached = err.Error()
+		return r
 	}
-	rec, _, ok := status.PublishedUpdateRecord(nodes.Items)
+	rec, server, ok := status.PublishedUpdateRecord(nodes.Items)
 	if !ok {
-		return channelReading{channel: updatesv1alpha1.UpdateChannelStable, note: "no server has published a channel yet; checking as stable"}
+		return channelReading{channel: updatesv1alpha1.UpdateChannelStable, note: "no server has published a channel yet; checking as stable", unreached: "no server has published a channel yet"}
 	}
 	switch rec.Channel {
 	case "", updatesv1alpha1.UpdateChannelStable:
-		return channelReading{channel: updatesv1alpha1.UpdateChannelStable}
+		return channelReading{channel: updatesv1alpha1.UpdateChannelStable, publishedBy: server}
 	case updatesv1alpha1.UpdateChannelRC:
 		if !version.CanonicalTag(rec.Latest) {
 			return cannot(fmt.Sprintf("the release published with it, %q, is not a release tag", rec.Latest))
 		}
-		return channelReading{channel: updatesv1alpha1.UpdateChannelRC, published: rec.Latest}
+		return channelReading{channel: updatesv1alpha1.UpdateChannelRC, published: rec.Latest, publishedBy: server}
 	}
 	return cannot(fmt.Sprintf("%v %q", update.ErrUnknownChannel, rec.Channel))
 }
@@ -268,4 +300,133 @@ func planPin(env updateEnv, target string, pinning bool, sha string) (string, bo
 		return "none for this release; the pin on this Mac names " + status.ClipText(pin.Version, 128), false
 	}
 	return "sha256:" + pin.SHA256 + ", set on this Mac", true
+}
+
+// runUpdateChannel is `k3sm update channel [stable|rc]`: bare it prints the
+// cluster's channel, and with a value it writes the UpdatePolicy and
+// runs a check. A channel changes what is offered and never starts a roll.
+func runUpdateChannel(ctx context.Context, args []string, env updateEnv) int {
+	switch len(args) {
+	case 0:
+		return showUpdateChannel(ctx, env)
+	case 1:
+		return setUpdateChannel(ctx, args[0], env)
+	}
+	fmt.Fprint(env.errOut, updateUsage)
+	return exitUsage
+}
+
+// showUpdateChannel prints the channel, from the same source a check reads. The
+// stable a check falls back on is the check's own: with no answer from the cluster
+// this prints no channel and fails, because a script reading stdout could not tell
+// that stable from the cluster's. Only stdout carries the channel; where a published
+// answer came from goes to stderr.
+func showUpdateChannel(ctx context.Context, env updateEnv) int {
+	reading, err := channelSource{dyn: env.dyn, kube: env.inputs.Kube, pairOnly: env.worker}.read(ctx)
+	if reading.unreached != "" {
+		why := reading.unreached
+		if env.kubeErr != nil {
+			why = env.kubeErr.Error()
+		}
+		fmt.Fprintln(env.errOut, "k3sm update channel: cannot reach the cluster:", why)
+		return exitInternalError
+	}
+	if err != nil {
+		fmt.Fprintln(env.errOut, "k3sm update channel:", err)
+		return exitInternalError
+	}
+	if reading.note != "" {
+		fmt.Fprintln(env.errOut, "k3sm update:", reading.note)
+	}
+	if reading.publishedBy != "" {
+		fmt.Fprintf(env.errOut, "k3sm update: this is the channel published by the server %q, which can lag a change\n", status.ClipText(reading.publishedBy, 253))
+	}
+	fmt.Fprintln(env.out, reading.channel)
+	return 0
+}
+
+// setUpdateChannel writes value, then runs a check on it. A check that fails after
+// the write, as one with no route to the release host does, exits with its own code
+// and says both: a script must not take the channel for verified, and must not take
+// a write that happened for one that was refused.
+func setUpdateChannel(ctx context.Context, value string, env updateEnv) int {
+	channel := updatesv1alpha1.UpdateChannel(value)
+	if channel != updatesv1alpha1.UpdateChannelStable && channel != updatesv1alpha1.UpdateChannelRC {
+		fmt.Fprintf(env.errOut, "k3sm update channel: unknown channel %q: the channels are stable and rc\n\n%s", value, updateUsage)
+		return exitUsage
+	}
+	_, dyn, err := updateClients(env)
+	if err != nil {
+		fmt.Fprintln(env.errOut, "k3sm update channel: cannot reach the cluster:", err)
+		return exitInternalError
+	}
+	bound := env.channelWait
+	if bound <= 0 {
+		bound = channelCRDWait
+	}
+	if err := writeUpdateChannel(ctx, dyn, channel, bound); err != nil {
+		if apierrors.IsForbidden(err) {
+			fmt.Fprintf(env.errOut, "k3sm update channel: setting the channel takes cluster-admin, which these credentials do not have: %v\n", err)
+			return exitInternalError
+		}
+		fmt.Fprintln(env.errOut, "k3sm update channel:", err)
+		return exitInternalError
+	}
+	fmt.Fprintf(env.out, "The update channel is now %s. This changes what is offered and starts no roll.\n", channel)
+	if env.worker {
+		fmt.Fprintln(env.out, "This Mac reads the channel its server publishes, so this check can name the old one until the server has checked.")
+	}
+	fmt.Fprintln(env.out)
+	if code := runUpdateCheck(ctx, nil, env); code != 0 {
+		fmt.Fprintf(env.errOut, "k3sm update channel: the write is done and the channel is %s, but the check failed; run `k3sm update check` again\n", channel)
+		return exitChannelCheckFailed
+	}
+	return 0
+}
+
+// writeUpdateChannel sets the channel on the singleton, making it if need be. A
+// merge patch names only the field this verb owns, and it needs no read first.
+//
+// Patch answers NotFound both for no object and for no resource; only create
+// tells them apart, because creating a cluster-scoped object can be NotFound only
+// when the resource itself is missing. That case retries until bound, then returns
+// errChannelNotEstablished, so a missing CRD never reads as a written channel. A lost
+// race with another writer (the object appears or goes between the two calls) also
+// retries.
+func writeUpdateChannel(ctx context.Context, dyn dynamic.Interface, channel updatesv1alpha1.UpdateChannel, bound time.Duration) error {
+	policies := dyn.Resource(updatePolicyGVR)
+	patch, err := json.Marshal(map[string]any{"spec": map[string]any{"channel": channel}})
+	if err != nil {
+		return fmt.Errorf("encode the channel: %w", err)
+	}
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": updatesv1alpha1.SchemeGroupVersion.String(),
+		"kind":       "UpdatePolicy",
+		"metadata":   map[string]any{"name": updatesv1alpha1.UpdatePolicyName},
+		"spec":       map[string]any{"channel": string(channel)},
+	}}
+	noCRD := false
+	err = wait.PollUntilContextTimeout(ctx, bound/30, bound, true, func(ctx context.Context) (bool, error) {
+		noCRD = false
+		_, err := policies.Patch(ctx, updatesv1alpha1.UpdatePolicyName, types.MergePatchType, patch, metav1.PatchOptions{})
+		if !apierrors.IsNotFound(err) {
+			return err == nil, err
+		}
+		_, err = policies.Create(ctx, obj, metav1.CreateOptions{})
+		noCRD = apierrors.IsNotFound(err)
+		switch {
+		case err == nil:
+			return true, nil
+		case noCRD, apierrors.IsAlreadyExists(err):
+			return false, nil
+		}
+		return false, err
+	})
+	switch {
+	case err == nil:
+		return nil
+	case noCRD && ctx.Err() == nil:
+		return fmt.Errorf("%w: the server has not served the %s CRD after %s; retry in a minute, and if this persists check the server's k3sm version and log", errChannelNotEstablished, crdconfig.UpdatePolicyCRDName, bound)
+	}
+	return fmt.Errorf("write the UpdatePolicy %s: %w", updatesv1alpha1.UpdatePolicyName, err)
 }
