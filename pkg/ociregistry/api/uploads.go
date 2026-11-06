@@ -34,12 +34,12 @@ import (
 // getBlob serves a blob GET or HEAD through http.ServeContent: Range, 206,
 // 416 and Accept-Ranges are the standard library's.
 func (s *Server) getBlob(w http.ResponseWriter, r *http.Request, n ref.Name) {
+	if !s.allow(w, r, VerbRead, n) {
+		return
+	}
 	d, err := ref.ParseDigest(mux.Vars(r)["digest"])
 	if err != nil {
 		s.fail(w, r, err)
-		return
-	}
-	if !s.allow(w, r, VerbRead, n) {
 		return
 	}
 	f, err := s.st.OpenBlob(n, d)
@@ -215,25 +215,36 @@ func (s *Server) startUpload(w http.ResponseWriter, r *http.Request, n ref.Name)
 // mounted blob is trusted as it stands: the store verified it against its
 // digest when it was committed and never writes a blob file in place.
 func (s *Server) mount(w http.ResponseWriter, r *http.Request, n ref.Name, mount string) bool {
-	d, err := ref.ParseDigest(mount)
+	// The caller may write n already. The source is authorized before the
+	// digest is judged, so a caller who may not read it cannot tell a
+	// malformed digest from a well-formed one. The source name has to be
+	// parsed to ask, so a malformed source name is answered first.
+	d, derr := ref.ParseDigest(mount)
+	fromS, hasFrom, err := one(r, "from")
 	if err != nil {
+		if derr != nil {
+			err = derr
+		}
 		s.fail(w, r, err)
 		return true
 	}
-	fromS, hasFrom, err := one(r, "from")
-	if err != nil {
-		s.fail(w, r, err)
+	var from ref.Name
+	var nerr error
+	if hasFrom {
+		from, nerr = ref.ParseName(fromS)
+		if nerr == nil && !s.allow(w, r, VerbRead, from) {
+			return true
+		}
+	}
+	if derr != nil {
+		s.fail(w, r, derr)
 		return true
 	}
 	if !hasFrom {
 		return false
 	}
-	from, err := ref.ParseName(fromS)
-	if err != nil {
-		s.fail(w, r, err)
-		return true
-	}
-	if !s.allow(w, r, VerbRead, from) {
+	if nerr != nil {
+		s.fail(w, r, nerr)
 		return true
 	}
 	err = s.st.MountBlob(r.Context(), n, from, d)
@@ -492,12 +503,12 @@ func uploadID(r *http.Request) (string, error) {
 
 // uploadStatus is GET on a session: 204 with its Range.
 func (s *Server) uploadStatus(w http.ResponseWriter, r *http.Request, n ref.Name) {
+	if !s.allow(w, r, VerbRead, n) {
+		return
+	}
 	id, err := uploadID(r)
 	if err != nil {
 		s.fail(w, r, err)
-		return
-	}
-	if !s.allow(w, r, VerbRead, n) {
 		return
 	}
 	size, err := s.st.UploadSize(r.Context(), n, id)
@@ -579,12 +590,12 @@ func (s *Server) commit(r *http.Request, n ref.Name, id string, e *session, d di
 // patchUpload is PATCH on a session: a chunk, at the Content-Range start when
 // both Content-Range and Content-Length are sent, else appended.
 func (s *Server) patchUpload(w http.ResponseWriter, r *http.Request, n ref.Name) {
+	if !s.allow(w, r, VerbWrite, n) {
+		return
+	}
 	id, err := uploadID(r)
 	if err != nil {
 		s.fail(w, r, err)
-		return
-	}
-	if !s.allow(w, r, VerbWrite, n) {
 		return
 	}
 	offset, err := chunkOffset(r)
@@ -614,12 +625,12 @@ func (s *Server) patchUpload(w http.ResponseWriter, r *http.Request, n ref.Name)
 // finishUpload is PUT on a session with ?digest=: an optional final chunk,
 // then the commit.
 func (s *Server) finishUpload(w http.ResponseWriter, r *http.Request, n ref.Name) {
+	if !s.allow(w, r, VerbWrite, n) {
+		return
+	}
 	id, err := uploadID(r)
 	if err != nil {
 		s.fail(w, r, err)
-		return
-	}
-	if !s.allow(w, r, VerbWrite, n) {
 		return
 	}
 	dg, ok, err := one(r, "digest")
@@ -682,12 +693,12 @@ func (s *Server) finishUpload(w http.ResponseWriter, r *http.Request, n ref.Name
 
 // cancelUpload is DELETE on a session. It needs the delete permission.
 func (s *Server) cancelUpload(w http.ResponseWriter, r *http.Request, n ref.Name) {
+	if !s.allow(w, r, VerbDelete, n) {
+		return
+	}
 	id, err := uploadID(r)
 	if err != nil {
 		s.fail(w, r, err)
-		return
-	}
-	if !s.allow(w, r, VerbDelete, n) {
 		return
 	}
 	key := sessionKey(n, id)

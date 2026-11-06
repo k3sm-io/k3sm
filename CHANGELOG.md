@@ -164,6 +164,10 @@ pin, its date, and the tarball's sha256.
 
 ### Fixed
 
+- The registry now checks a caller's access before it reads the digest or upload id in the request, so
+  a caller who may not read or write a repository gets the same 401 or 403 for a malformed digest or
+  upload id as for a well-formed one, where it used to get a 400 or 404. A mount whose source the
+  caller may not read answers the same way. Callers with access see no change.
 - An image edit on a running vm Pod is no longer silent. The container stays on its image, as it did, and the Pod now records a `Warning` `ImageEditNotApplied` Event naming the container and both images, and no longer records `Pulling` and `Pulled` for an image nothing fetched. `containerStatuses[].image` keeps naming what runs. The native path is unchanged.
 - A vm Pod's container killed by a signal in the guest, including an OOM kill, reports exit code 128 plus the signal, so 137 for an OOM kill, as a native Pod does; it reported 0. Such an init container no longer reports `Initialized=True`, `FallbackToLogsOnError` now applies to it, and a `SIGKILL` nothing in k3sm sent now counts in `kernelKills`.
 - An exec on a pulled-image pod now resolves an absolute command inside the image and passes the same signature check as the pod's start. A host path the image lacks still runs the host's copy, and the image's copy wins when it has one. A symlink leaving the root filesystem is refused.
