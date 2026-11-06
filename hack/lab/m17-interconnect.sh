@@ -968,13 +968,24 @@ model_wait_failed() {
 	fi
 }
 model_ready() { grep -qx True <<<"$(kc get mlxmodel -n "$NS" "$1" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)"; }
-# ring_on <path> — ic-ring is Ready with both rank pods on that path.
-ring_on() { model_ready ic-ring && [ "$(rank_pods ic-ring | awk -v p="$1" '$4==p' | wc -l | tr -d ' ')" = 2 ]; }
+# ring_settled <path> — stdin is rank_pods output: exactly two rank pods, each on
+# that path, Ready=True, and (when RING_OLD_UIDS is set) none of the pre-patch pods.
+ring_settled() { awk -v p="$1" -v old=" ${RING_OLD_UIDS:-} " 'NF { n++; if ($4 == p && $5 == "True" && (old == "  " || index(old, " " $2 " ") == 0)) ok++ } END { exit !(n == 2 && ok == 2) }'; }
+# ring_on <path> — ic-ring is Ready with both rank pods on that path. The model's
+# Ready can be left over from the previous path, so it also needs the operator to
+# have observed the current spec, and the pods to be the recreated ones (RING_OLD_UIDS
+# lists the UIDs the patch replaces) and Ready themselves.
+ring_on() {
+	local g
+	g="$(kc get mlxmodel -n "$NS" ic-ring -o jsonpath='{.metadata.generation} {.status.observedGeneration}' 2>/dev/null)"
+	[ -n "${g%% *}" ] && [ "${g%% *}" = "${g##* }" ] || return 1
+	model_ready ic-ring && rank_pods ic-ring | ring_settled "$1"
+}
 model_cond() { kc get mlxmodel -n "$NS" "$1" -o jsonpath="{.status.conditions[?(@.type==\"$2\")].$3}" 2>/dev/null; }
 rank_pods() { kc get pods -n "$NS" -o json 2>/dev/null | python3 -I -c "import json,sys
 for p in json.load(sys.stdin)['items']:
     if any(o.get('kind')=='MLXModel' and o.get('name')=='$1' for o in p['metadata'].get('ownerReferences') or []):
-        print(p['metadata']['name'], p['metadata']['uid'], p['spec'].get('nodeName',''), (p['metadata'].get('annotations') or {}).get('k3sm.io/mlx-interconnect',''))"; }
+        print(p['metadata']['name'], p['metadata']['uid'], p['spec'].get('nodeName',''), (p['metadata'].get('annotations') or {}).get('k3sm.io/mlx-interconnect',''), next((c.get('status') for c in (p.get('status') or {}).get('conditions') or [] if c.get('type')=='Ready'), 'False'))"; }
 image_pull_failed() { grep -Eq 'ErrImagePull|ImagePullBackOff' <<<"$(kc get pods -n "$NS" -o jsonpath='{range .items[*]}{.status.containerStatuses[*].state.waiting.reason}{"\n"}{end}' 2>/dev/null)"; }
 # tokens_per_s <model> <file> — one completion against the endpoint; prints
 # "<tokens/s> <request+response bytes>" or nothing.
@@ -1030,6 +1041,7 @@ assert_r5_ring() {
 	fi
 	kc delete mlxmodel -n "$NS" ic-single --wait=false >/dev/null 2>&1
 	# The interconnect run.
+	RING_OLD_UIDS="$(rank_pods ic-ring | awk '{print $2}' | tr '\n' ' ')"
 	kc patch mlxmodel -n "$NS" ic-ring --type merge -p '{"spec":{"distributed":{"interconnect":"thunderbolt"}}}' >/dev/null
 	sleep 5
 	rc=0
@@ -1039,6 +1051,9 @@ assert_r5_ring() {
 		rank_pods ic-ring >"$RUNG_DIR/ranks.txt"
 		return 1
 	fi
+	RING_OLD_UIDS=""
+	# the recreated ranks are Ready; let the ring's sockets form before they are read
+	sleep 15
 	rank_pods ic-ring >"$RUNG_DIR/ranks.txt"
 	kc get mlxmodel -n "$NS" ic-ring -o json >"$RUNG_DIR/mlxmodel.json" 2>&1
 	check "both rank pods carry k3sm.io/mlx-interconnect thunderbolt" test "$(awk '$4=="thunderbolt"' "$RUNG_DIR/ranks.txt" | wc -l | tr -d ' ')" = 2
@@ -2218,6 +2233,24 @@ st_mlx_manifest() {
 	fi
 }
 
+# st_ring_settled — stale Ready plus pre-patch pod UIDs must not pass ring_on's pod test.
+st_ring_settled() {
+	local two_old two_new mixed notready
+	two_old=$'p0 u0 n thunderbolt True\np1 u1 n thunderbolt True'
+	two_new=$'p2 u2 n thunderbolt True\np3 u3 n thunderbolt True'
+	mixed=$'p0 u0 n thunderbolt True\np3 u3 n thunderbolt True'
+	notready=$'p2 u2 n thunderbolt False\np3 u3 n thunderbolt True'
+	RING_OLD_UIDS="u0 u1 "
+	st "ring_settled rejects the stale pods (old UIDs, Ready, annotated)" 1 ring_settled thunderbolt <<<"$two_old"
+	st "ring_settled rejects one old UID among the pair" 1 ring_settled thunderbolt <<<"$mixed"
+	st "ring_settled rejects recreated pods that are not Ready" 1 ring_settled thunderbolt <<<"$notready"
+	st "ring_settled rejects recreated pods on the wrong path" 1 ring_settled network <<<"$two_new"
+	st "ring_settled rejects old and new pods together (a rank still terminating)" 1 ring_settled thunderbolt <<<"$two_old"$'\n'"$two_new"
+	st "ring_settled accepts two recreated Ready pods on the path" 0 ring_settled thunderbolt <<<"$two_new"
+	RING_OLD_UIDS=""
+	st "ring_settled with no pre-patch set accepts two Ready pods on the path" 0 ring_settled thunderbolt <<<"$two_old"
+}
+
 # st_r5_run <invalid|slow> — the real r5 assertion to its first wait, the cluster
 # stubbed: an InvalidSpec model, or one that never reports anything.
 st_r5_run() {
@@ -2584,6 +2617,7 @@ self_test_body() {
 	st_out "r5 saves the status of an InvalidSpec model" "SAVED mlxmodel-ic-ring.json" st_r5_run invalid
 	st_out "r5 still runs out its budget for a model that is only slow" "never became Ready within 2s" st_r5_run slow
 	st_out "r5 saves the status of a model that timed out" "SAVED mlxmodel-ic-ring.json" st_r5_run slow
+	st_ring_settled
 	st "--until with no rung exits 2" 0 gate_run 2 - -- --until
 	st "--until with a rung and more exits 2" 0 gate_run 2 - -- --until r5 extra
 	for r in r r10 r5x ring r5-ringx 5; do st "--until red: '$r' names no rung" 0 gate_run 2 "names no rung" -- --until "$r"; done
