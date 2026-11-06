@@ -140,6 +140,7 @@ pin, its date, and the tarball's sha256.
 ### Fixed
 
 - A vm Pod's container killed by a signal in the guest, including an OOM kill, reports exit code 128 plus the signal, so 137 for an OOM kill, as a native Pod does; it reported 0. Such an init container no longer reports `Initialized=True`, `FallbackToLogsOnError` now applies to it, and a `SIGKILL` nothing in k3sm sent now counts in `kernelKills`.
+- An exec on a pulled-image pod now resolves an absolute command inside the image and passes the same signature check as the pod's start. A host path the image lacks still runs the host's copy, and the image's copy wins when it has one. A symlink leaving the root filesystem is refused.
 - `k3sm dev up` no longer reports an instance up over a server that has already exited. It used to
   rely on its own record of the exit, which could lag, and on a process check that counts an exited
   but unreaped process as running. `k3sm dev list` and `k3sm dev down` now treat that state as dead too.
