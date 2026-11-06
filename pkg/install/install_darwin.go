@@ -45,6 +45,7 @@ import (
 
 	"k3sm.io/darwin-net/pkg/mesh"
 	"k3sm.io/darwin-net/pkg/netd/wire"
+	"k3sm.io/darwin-net/pkg/tcpseg"
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/dataroot"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
@@ -968,9 +969,11 @@ func (darwinSystem) DialJoinServer(addr string, timeout time.Duration) error {
 	return nil
 }
 
-// DialAPIServer opens a TCP connection to this server's apiserver at addr.
+// DialAPIServer opens a TCP connection to this server's apiserver at addr, which
+// can be its mesh IP, so the dial is segment-clamped.
 func (darwinSystem) DialAPIServer(ctx context.Context, addr string) (net.Conn, error) {
-	return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	var d tcpseg.Dialer
+	return d.DialContext(ctx, "tcp", addr)
 }
 
 // FetchJoinCA reads the cluster CA PEM the bootstrap listener at addr serves.
