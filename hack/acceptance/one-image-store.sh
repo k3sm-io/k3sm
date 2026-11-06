@@ -1396,7 +1396,7 @@ leg_migrate() {
 		DETAIL="$REGISTRY_LOG shows no push of $APP_REPO:v1, so it cannot prove the re-run pushed nothing"
 		return 1
 	}
-	log_start="$(on_server "sudo -n wc -c <'$REGISTRY_LOG'" 2>/dev/null | tail -1 | tr -d ' ')"
+	log_start="$(on_server "sudo -n stat -f %z '$REGISTRY_LOG'" 2>/dev/null | tail -1 | tr -d ' ')"
 	[[ "$log_start" =~ ^[0-9]+$ ]] || {
 		DETAIL="could not size $REGISTRY_LOG before the re-run (got '$log_start')"
 		return 1
@@ -1405,7 +1405,7 @@ leg_migrate() {
 		DETAIL="the re-run of image migrate failed"
 		return 1
 	}
-	log_now="$(on_server "sudo -n wc -c <'$REGISTRY_LOG'" 2>/dev/null | tail -1 | tr -d ' ')"
+	log_now="$(on_server "sudo -n stat -f %z '$REGISTRY_LOG'" 2>/dev/null | tail -1 | tr -d ' ')"
 	[[ "$log_now" =~ ^[0-9]+$ ]] && [ "$log_now" -ge "$log_start" ] || {
 		DETAIL="$REGISTRY_LOG went from $log_start to '$log_now' bytes during the re-run, so it cannot say what was pushed"
 		return 1
