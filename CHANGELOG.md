@@ -83,6 +83,10 @@ pin, its date, and the tarball's sha256.
   `node.kubernetes.io/memory-pressure` are still admitted. A Pod annotated
   `budget.k3sm.io/band: batch` is also refused, with reason `NodeBudgetCritical`, while the
   node budget is at its critical level or above.
+- The registry store can dedupe a blob held as separate copies across repositories: a pass keeps the
+  newest copy, verifies it against its digest, and replaces each older copy with a hard link to it by an
+  atomic rename. A copy that fails its hash is logged, counted and replaced by the verified bytes; any
+  other failure keeps the copy. Nothing runs the pass yet, and the push path does not change.
 - The registry store k3sm is replacing zot with has an online garbage collector that runs
   while pushes continue. A blob's age counts from the last mount, link or upload that named it,
   recorded on disk so a restart keeps it, and a sweep re-reads the index and re-checks each
