@@ -933,7 +933,8 @@ func parseBody(b []byte) (refs, error) {
 //   - an untagged row that carries a subject (a referrer) is kept while its
 //     subject is live, transitively: kept, referenced by a kept manifest, or a
 //     blob younger than the grace. A referrer whose subject is absent or is
-//     itself reaped is an orphan and is reaped as any untagged row is;
+//     itself reaped is an orphan and is reaped as any untagged row is; one
+//     whose subject digest does not parse is kept;
 //   - every other untagged row is reaped;
 //   - a blob is kept when a kept manifest is it or references it, or when it
 //     is younger than the grace; the rest are reaped;
@@ -1025,7 +1026,14 @@ func makePlan(idx ispec.Index, cont store.Contents, cutoff time.Time, refsOf fun
 			return plan{}, planError("untagged "+r.Digest.String(), err)
 		}
 		if m.Subject != nil {
-			referrers = append(referrers, referrer{d: r.Digest, subject: m.Subject.Digest})
+			// A subject that is not a digest names nothing whose absence the
+			// sweep can judge: the referrer is kept, failing closed.
+			s, err := ref.ParseDigest(m.Subject.Digest.String())
+			if err != nil {
+				enqueue(item{d: r.Digest, required: true})
+				continue
+			}
+			referrers = append(referrers, referrer{d: r.Digest, subject: s})
 			continue
 		}
 		candidates[r.Digest] = true

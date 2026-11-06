@@ -186,3 +186,38 @@ func TestLiveSubjectKeepsItsReferrer(t *testing.T) {
 		})
 	}
 }
+
+// TestUnparsableSubjectKeepsItsReferrer: a referrer whose subject digest is not
+// a digest names nothing the collector can judge, so it fails closed: the row
+// and every blob it names are kept, as an untagged row with a subject was
+// before referrers could be orphaned.
+func TestUnparsableSubjectKeepsItsReferrer(t *testing.T) {
+	for _, bad := range []string{"", "sha256:not-hex", "md5:d41d8cd98f00b204e9800998ecf8427e", "nonsense"} {
+		t.Run(bad, func(t *testing.T) {
+			e := newEnv(t)
+			n := name(t, "app")
+			e.clk.set(-2 * time.Hour)
+			r := e.referrer(t, n, "sig", ispec.Descriptor{MediaType: ispec.MediaTypeImageManifest, Digest: digest.Digest(bad), Size: 2})
+			c := e.collector(t, -3*time.Hour)
+			e.ran(t)
+			e.clk.set(0)
+
+			rep := e.sweep(t, c)
+			if len(rep.Stopped) != 0 || len(rep.Failed) != 0 || len(rep.Objects) != 0 {
+				t.Fatalf("report %+v, want nothing reaped and no stop", rep)
+			}
+			for _, d := range r.blobs() {
+				if !e.has(n, d) {
+					t.Errorf("%s was reaped", d)
+				}
+			}
+			idx, err := e.s.Index(n)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(idx.Manifests) != 1 || idx.Manifests[0].Digest != r.manifest.Digest {
+				t.Errorf("rows %v, want the referrer's", idx.Manifests)
+			}
+		})
+	}
+}
