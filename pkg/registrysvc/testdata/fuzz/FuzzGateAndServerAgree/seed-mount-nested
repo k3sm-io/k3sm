@@ -1,0 +1,4 @@
+go test fuzz v1
+string("t/u")
+string("b/manifests")
+uint8(0)

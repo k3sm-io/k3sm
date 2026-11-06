@@ -2,6 +2,7 @@
 # `k3sm registry serve`: name, kept|rewritten|added|deleted, reason.
 # TestTestManifestIsComplete checks this file against the source.
 FuzzClassify rewritten the gate reads names through the shared validator
+FuzzGateAndServerAgree added the differential over arbitrary names and mount sources
 TestAdvertisement kept the relay and cluster publication do not touch the child
 TestApplyServeCredential added new with the child switch
 TestAwaitNeedsA200 added new with the child switch
