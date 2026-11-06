@@ -658,6 +658,16 @@ wait_ready() {
 installed_version() { rsh "$1" sudo "$K3SM_BIN" version 2>/dev/null | sed -n 1p; }
 # zot_running: a process on the server whose argv[0] is zot.
 zot_running() { rsh "$SERVER" /bin/ps -axo comm= | awk '{ n = $1; sub(/.*\//, "", n); if (n == "zot") f = 1 } END { exit !f }'; }
+# zot_started - the daemon starts zot some seconds after the install returns, so
+# wait for it, bounded by ZOT_START_WAIT, polling every 5 s.
+zot_started() {
+	local deadline=$((SECONDS + ZOT_START_WAIT))
+	while :; do
+		zot_running && return 0
+		[ "$SECONDS" -lt "$deadline" ] || return 1
+		sleep 5
+	done
+}
 
 ship_set() {
 	local h="$1" w="$2" name="$3"
@@ -818,7 +828,7 @@ s_a0() {
 		return 1
 	}
 	roll old a0 || return 1
-	zot_running || {
+	zot_started || {
 		why "no zot process on the server under the old set: it is not the zot-era build"
 		return 1
 	}
@@ -1132,7 +1142,7 @@ s_e1() {
 	# truncated is read whole (s_e3).
 	ZOT_SINCE_LINES="$(fetch "$SERVER" "$RLOG" | wc -l | tr -d ' ')"
 	roll old e1 || return 1
-	zot_running || {
+	zot_started || {
 		why "no zot process after the rollback"
 		return 1
 	}
@@ -1313,6 +1323,7 @@ lab_main() {
 	if [ -d "$EVIDENCE" ] && [ -n "$(ls -A "$EVIDENCE")" ]; then lab_refuse "the evidence directory $EVIDENCE is not empty"; fi
 	STEP_TIMEOUT="${K3SM_B1027_STEP_TIMEOUT:-120}"
 	INSTALL_TIMEOUT="${K3SM_B1027_INSTALL_TIMEOUT:-900}"
+	ZOT_START_WAIT="${K3SM_B1027_ZOT_START_WAIT:-180}"
 	READY_TIMEOUT="${K3SM_B1027_READY_TIMEOUT:-240}"
 	POD_TIMEOUT="${K3SM_B1027_POD_TIMEOUT:-240}"
 	POLL="${K3SM_B1027_POLL:-3}"
@@ -1711,7 +1722,7 @@ lab_fake_run() {
 		FAKE_GC_FAILED="${FAKE_GC_FAILED:-0}" FAKE_LEG_RC="${FAKE_LEG_RC:-0}" FAKE_ZOT_GC="${FAKE_ZOT_GC:-ok}" \
 		K3SM_B1027_K3SM="$d/bin/k3sm" K3SM_B1027_DATA_ROOT="$d/data" K3SM_B1027_HELLO="$d/hello" \
 		K3SM_B1027_ROLLBACK_LEG="$d/bin/rollback-leg" K3SM_B1027_POLL=0.05 K3SM_B1027_STEP_TIMEOUT=60 \
-		K3SM_B1027_READY_TIMEOUT=5 K3SM_B1027_POD_TIMEOUT=5 K3SM_LAB_TOLERATE_KEYS= \
+		K3SM_B1027_READY_TIMEOUT=5 K3SM_B1027_POD_TIMEOUT=5 K3SM_B1027_ZOT_START_WAIT=0 K3SM_LAB_TOLERATE_KEYS= \
 		"$SELF" --lab --old-set "$d/sets/old" --new-set "$d/sets/new" --server-ssh srv --worker-ssh wrk \
 		--server-lan 192.0.2.1 --evidence "$d/evidence" --server-work "$d/remote-server" --worker-work "$d/remote-worker" \
 		--gc-wait 30 --zot-gc-wait 5 >"$d/out" 2>&1 </dev/null || rc=$?
