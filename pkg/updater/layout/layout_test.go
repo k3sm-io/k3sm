@@ -210,18 +210,18 @@ func TestResolveActive(t *testing.T) {
 
 func TestPlanFlip(t *testing.T) {
 	l := New("/r")
-	t.Run("upgrade flips current then previous", func(t *testing.T) {
+	t.Run("upgrade flips previous then current", func(t *testing.T) {
 		got, err := l.PlanFlip("0.2.3", "0.3.0")
 		if err != nil {
 			t.Fatal(err)
 		}
 		want := []Step{
-			{OpRemoveStale, "/r/current.tmp", ""},
-			{OpSymlink, "/r/current.tmp", "versions/0.3.0"},
-			{OpRename, "/r/current.tmp", "/r/current"},
 			{OpRemoveStale, "/r/previous.tmp", ""},
 			{OpSymlink, "/r/previous.tmp", "versions/0.2.3"},
 			{OpRename, "/r/previous.tmp", "/r/previous"},
+			{OpRemoveStale, "/r/current.tmp", ""},
+			{OpSymlink, "/r/current.tmp", "versions/0.3.0"},
+			{OpRename, "/r/current.tmp", "/r/current"},
 		}
 		if !slices.Equal(got, want) {
 			t.Errorf("PlanFlip = %v\nwant %v", got, want)
@@ -258,5 +258,29 @@ func TestPlanFlip(t *testing.T) {
 	}
 	if OpRename.String() != "rename" || Op(9).String() != "Op(9)" {
 		t.Error("Op.String")
+	}
+}
+
+func TestPlanLinks(t *testing.T) {
+	l := New("/r")
+	for _, tc := range []struct {
+		name string
+		plan func(string) ([]Step, error)
+		link string
+		want string
+	}{
+		{"current", l.PlanCurrent, "/r/current", "versions/0.3.0"},
+		{"previous", l.PlanPrevious, "/r/previous", "versions/0.3.0"},
+		{"updater current", l.PlanUpdaterCurrent, "/r/updater/current", "../versions/0.3.0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := tc.plan("0.3.0")
+			if err != nil || len(got) != 3 || got[1].Target != tc.want || got[2].Target != tc.link {
+				t.Errorf("plan = %v, %v", got, err)
+			}
+			if _, err := tc.plan("../x"); !errors.Is(err, ErrBadVersion) {
+				t.Errorf("bad version: err = %v", err)
+			}
+		})
 	}
 }

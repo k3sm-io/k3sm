@@ -63,8 +63,9 @@ type Step struct {
 // previous one. Each link is replaced the same way: a stale temporary name is
 // removed, a new symlink is created under the temporary name, and it is
 // renamed over the live name, so a reader sees the old link or the new one,
-// never neither. current is flipped first; previous follows only when from is
-// not empty (a first activation has no previous). The links are relative
+// never neither. previous is flipped first, and only when from is not empty (a
+// first activation has no previous), so a crash between the two links never
+// leaves an older rollback target beside the new current. The links are relative
 // (versions/<ver>), so the tree keeps working when it is read under another
 // root. A flip to the version already current is ErrNoChange.
 func (l Layout) PlanFlip(from, to string) ([]Step, error) {
@@ -79,11 +80,36 @@ func (l Layout) PlanFlip(from, to string) ([]Step, error) {
 	if from == to {
 		return nil, fmt.Errorf("flip to %s: %w", to, ErrNoChange)
 	}
-	steps := replaceLink(l.Current(), filepath.Join(VersionsName, to))
+	var steps []Step
 	if from != "" {
-		steps = append(steps, replaceLink(l.Previous(), filepath.Join(VersionsName, from))...)
+		steps = replaceLink(l.Previous(), filepath.Join(VersionsName, from))
 	}
-	return steps, nil
+	return append(steps, replaceLink(l.Current(), filepath.Join(VersionsName, to))...), nil
+}
+
+// PlanCurrent returns the steps that point current at ver.
+func (l Layout) PlanCurrent(ver string) ([]Step, error) {
+	if err := ValidateVersion(ver); err != nil {
+		return nil, fmt.Errorf("current: %w", err)
+	}
+	return replaceLink(l.Current(), filepath.Join(VersionsName, ver)), nil
+}
+
+// PlanPrevious returns the steps that point previous at ver.
+func (l Layout) PlanPrevious(ver string) ([]Step, error) {
+	if err := ValidateVersion(ver); err != nil {
+		return nil, fmt.Errorf("previous: %w", err)
+	}
+	return replaceLink(l.Previous(), filepath.Join(VersionsName, ver)), nil
+}
+
+// PlanUpdaterCurrent returns the steps that point the updater's own current at
+// ver. The link sits one level down, so it reads ../versions/<ver>.
+func (l Layout) PlanUpdaterCurrent(ver string) ([]Step, error) {
+	if err := ValidateVersion(ver); err != nil {
+		return nil, fmt.Errorf("updater current: %w", err)
+	}
+	return replaceLink(l.UpdaterCurrent(), filepath.Join("..", VersionsName, ver)), nil
 }
 
 // replaceLink is the three steps that atomically point link at target.
