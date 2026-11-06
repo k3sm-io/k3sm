@@ -10,6 +10,7 @@ TestCheckDataVolume added new with the child switch
 TestChildCommand added new with the child switch
 TestClassify rewritten the gate reads names through the shared validator
 TestCloseInheritedDescriptors added new with the child switch
+TestCollectRouteRefusesWhatMayNotDelete added the collect route is the push credential's alone
 TestClusterEndpointAddress kept the relay and cluster publication do not touch the child
 TestConvergeCommitsCannotDriveFruitlessPasses added new with the dedupe loop
 TestConvergeDoesNotSpinOnPermanentSkips added new with the dedupe loop
@@ -58,6 +59,7 @@ TestPreflightPortRefusesAHeldPort kept the behaviour it pins is unchanged by the
 TestProcargsArgv kept the behaviour it pins is unchanged by the child switch
 TestProvisionWritesTheChildsConfig added new with the child switch
 TestPruneDeleteIsConditionalOnPlannedState kept prune works on the store, which is unchanged
+TestPruneForceCollectsThePrunedRepositories added a forced prune sweeps the repositories it deleted from
 TestPruneGraceIsTheGCDelay deleted gcDelay is gone; TestPruneGraceIsTheGCGrace holds the assertion
 TestPruneGraceIsTheGCGrace added prune keeps the grace the server collects with
 TestPruneThroughTheStore kept prune works on the store, which is unchanged
