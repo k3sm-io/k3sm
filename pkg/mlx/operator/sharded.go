@@ -238,6 +238,18 @@ func (c *Controller) reconcileSharded(ctx context.Context, key string, raw *unst
 	if err != nil {
 		return fmt.Errorf("place mlxmodel %s: %w", key, err)
 	}
+	if placement.Path() == mlxv1alpha1.MLXInterconnectThunderbolt {
+		if waiting := awaitingDesired(model, nodes.Items, placedNodes(placement)); len(waiting) > 0 {
+			msg := fmt.Sprintf("interconnect thunderbolt: the desired annotation of the nodes%s does not list this model yet, so the provider there would not give its rank the MLX interconnect slot; waiting for the interconnect resolver",
+				nameList(waiting))
+			c.log.Info("sharded mlxmodel waits for its nodes to list it as an interconnect model; no rank pod created",
+				"mlxmodel", key, "nodes", waiting)
+			c.queue.AddAfter(key, placementRetry)
+			return c.writeShardedStatus(ctx, raw, model, mlx.ShardObservation{
+				Desired: desired, PlacementReason: mlx.ReasonAwaitingInterconnectSlot, PlacementMessage: msg,
+			})
+		}
+	}
 	objs, err := mlx.RenderSharded(model, c.opts, placement)
 	if err != nil {
 		c.log.Warn("sharded mlxmodel spec cannot be rendered; no objects applied", "mlxmodel", key, "err", err)
@@ -628,6 +640,34 @@ func placedNode(pod *corev1.Pod) string {
 		return n
 	}
 	return pod.Spec.NodeName
+}
+
+// awaitingDesired returns the placed nodes whose desired annotation does not
+// list the model by namespace, name and UID: absent, unreadable, or written
+// before the interconnect resolver saw the model. The provider on such a node
+// gives a rank a general interconnect slot instead of the MLX slot that
+// K3SM_MLX_HOSTS names, so placing there would only start a rank that refuses.
+// It reads the annotation exactly as the provider does
+// (netv1alpha1.ParseInterconnectDesired and HasMLXModel).
+func awaitingDesired(model *mlxv1alpha1.MLXModel, nodes []corev1.Node, placed []string) []string {
+	byName := make(map[string]*corev1.Node, len(nodes))
+	for i := range nodes {
+		byName[nodes[i].Name] = &nodes[i]
+	}
+	var out []string
+	for _, name := range placed {
+		n := byName[name]
+		if n == nil {
+			out = append(out, name)
+			continue
+		}
+		d, err := netv1alpha1.ParseInterconnectDesired(n.Annotations[netv1alpha1.AnnotationInterconnectDesired])
+		if err != nil || !d.HasMLXModel(model.Namespace, model.Name, string(model.UID)) {
+			out = append(out, name)
+		}
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
 }
 
 // placedNodes lists a placement's nodes in rank order, for a log line.
