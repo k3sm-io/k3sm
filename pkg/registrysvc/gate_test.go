@@ -511,7 +511,10 @@ func TestPushAuthorizesServiceAccountTokenUnderNamespacePrefix(t *testing.T) {
 		{name: "a backslash", method: "PUT", target: `/v2/team\app/manifests/v1`, auth: basic(tokTeam), status: 400, reviews: 0, sars: 0},
 		{name: "an absolute-form target", method: "PUT", target: "http://registry.test/v2/team/app/manifests/v1", auth: basic(tokTeam), status: 400, reviews: 0, sars: 0},
 		{name: "an unknown query key", method: "PUT", target: "/v2/team/app/manifests/v1?tag=x", auth: basic(tokTeam), status: 400, reviews: 0, sars: 0},
-		{name: "a route word as a repository component", method: "PUT", target: "/v2/team/manifests/manifests/v1", auth: basic(tokTeam), status: 400, reviews: 0, sars: 0},
+		{name: "a route word as a repository component has one reading", method: "PUT", target: "/v2/team/manifests/manifests/v1", auth: basic(tokTeam),
+			status: 201, forward: "PUT /v2/team/manifests/manifests/v1", asWrite: true, reviews: 1, sars: 1},
+		{name: "a layout word as a repository component", method: "PUT", target: "/v2/team/blobs/manifests/v1", auth: basic(tokTeam), status: 400, reviews: 0, sars: 0},
+		{name: "a store word as a repository component", method: "PUT", target: "/v2/team/index.json/manifests/v1", auth: basic(tokTeam), status: 400, reviews: 0, sars: 0},
 
 		// Refused shapes.
 		{name: "DELETE is refused unauthenticated", method: "DELETE", target: "/v2/team/app/manifests/" + digestA, status: 405, reviews: 0, sars: 0},
