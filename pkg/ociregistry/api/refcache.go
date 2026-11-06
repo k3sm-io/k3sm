@@ -17,6 +17,7 @@ limitations under the License.
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -83,12 +84,11 @@ var errReferrersBusy = errors.New("referrers view still being built")
 
 // referrerDoc is what the referrers scan reads from each manifest.
 type referrerDoc struct {
-	MediaType    string             `json:"mediaType"`
-	ArtifactType string             `json:"artifactType"`
-	Config       *ispec.Descriptor  `json:"config"`
-	Subject      *ispec.Descriptor  `json:"subject"`
-	Annotations  map[string]string  `json:"annotations"`
-	Manifests    []ispec.Descriptor `json:"manifests"`
+	MediaType    string            `json:"mediaType"`
+	ArtifactType string            `json:"artifactType"`
+	Config       *ispec.Descriptor `json:"config"`
+	Subject      *ispec.Descriptor `json:"subject"`
+	Annotations  map[string]string `json:"annotations"`
 }
 
 // refEntry is what one manifest contributes to the view: its subject (empty
@@ -236,7 +236,7 @@ func (c *referrerCache) account(key string, v *refView, rows, bytes int64, parti
 // referrersOf returns n's manifests whose subject is d, sorted by digest. It
 // answers from the cached view while index.json is unchanged; otherwise it
 // rebuilds the view, reading at most the per-request budget of manifests it
-// has not read before.
+// has not read before, and none once the request's context is done.
 func (s *Server) referrersOf(r *http.Request, n ref.Name, d digest.Digest) ([]refEntry, error) {
 	key := n.String()
 	v := s.refs.view(key)
@@ -265,7 +265,7 @@ func (s *Server) referrersOf(r *http.Request, n ref.Name, d digest.Digest) ([]re
 	defer func() { <-s.refBuilds }()
 	s.refs.building(v, true)
 	defer s.refs.building(v, false)
-	if err := s.buildReferrers(key, n, v); err != nil {
+	if err := s.buildReferrers(r.Context(), key, n, v); err != nil {
 		if errors.Is(err, store.ErrRepositoryUnknown) {
 			s.refs.drop(key, v)
 			return nil, nil
@@ -283,8 +283,12 @@ func permanentReadError(err error) bool {
 }
 
 // buildReferrers rebuilds v from n's current index.json. The caller holds
-// v.sem and a build slot.
-func (s *Server) buildReferrers(key string, n ref.Name, v *refView) error {
+// v.sem and a build slot. Once ctx is done it reads no further manifest and
+// returns ctx's error: a client that went away must not keep the slot and the
+// semaphore for the rest of the read budget. Such a build ends like one out of
+// budget, walking the remaining rows without reading so that the entries of
+// rows it did not reach survive for the next request.
+func (s *Server) buildReferrers(ctx context.Context, key string, n ref.Name, v *refView) error {
 	idx, ver, err := s.st.IndexAt(n)
 	if err != nil {
 		return err
@@ -307,7 +311,7 @@ func (s *Server) buildReferrers(key string, n ref.Name, v *refView) error {
 			entries[row.Digest] = e
 			continue
 		}
-		if readRows >= int64(s.refScanRows) || readBytes >= s.refScanBytes {
+		if readRows >= int64(s.refScanRows) || readBytes >= s.refScanBytes || ctx.Err() != nil {
 			whole = false
 			continue
 		}
@@ -344,6 +348,9 @@ func (s *Server) buildReferrers(key string, n ref.Name, v *refView) error {
 	s.refs.account(key, v, rows, bytes, !whole)
 	if !whole {
 		v.bySubject = nil
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		return errReferrersBusy
 	}
 	for _, l := range bySubject {
@@ -354,7 +361,8 @@ func (s *Server) buildReferrers(key string, n ref.Name, v *refView) error {
 }
 
 // entryOf decodes what a manifest contributes to the view. A body that does
-// not decode, or names no subject, contributes nothing but its row.
+// not decode, names no subject, or names one that is not a canonical digest
+// contributes nothing but its row.
 func entryOf(row ispec.Descriptor, body []byte) refEntry {
 	e := refEntry{desc: ispec.Descriptor{MediaType: row.MediaType, Digest: row.Digest, Size: row.Size}}
 	var doc referrerDoc
@@ -362,11 +370,16 @@ func entryOf(row ispec.Descriptor, body []byte) refEntry {
 		e.size = 64
 		return e
 	}
+	subject, err := ref.ParseDigest(doc.Subject.Digest.String())
+	if err != nil {
+		e.size = 64
+		return e
+	}
 	at := doc.ArtifactType
 	if at == "" && doc.Config != nil {
 		at = doc.Config.MediaType
 	}
-	e.subject = doc.Subject.Digest
+	e.subject = subject
 	e.desc.ArtifactType, e.desc.Annotations = at, doc.Annotations
 	b, err := compactJSON(e.desc)
 	if err != nil {
