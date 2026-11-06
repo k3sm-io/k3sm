@@ -254,7 +254,12 @@ measure() {
 	R_TTFB="$(awk -v s="$sum" 'BEGIN{printf "%.4f", s/20}')"
 
 	gate_load "$name image ls over 200 tags"
-	for i in $(seq 1 200); do
+	# A manifest needs its blobs in its own repository, so bench/tags gets its own
+	# config and layer. The layer is not "small": that one is the store-size fact's.
+	local td; td="$(sha_of "$d/tag-layer")"
+	upload bench/tags "$d/tag-layer" "$td"
+	put_manifest bench/tags t1 "$td" "$(wc -c <"$d/tag-layer" | tr -d ' ')"
+	for i in $(seq 2 200); do
 		"${CURL[@]}" -o /dev/null -w '%{http_code}' -X PUT -H 'Content-Type: application/vnd.oci.image.manifest.v1+json' --data-binary "@$RUN/m.json" "$BASE/v2/bench/tags/manifests/t$i" | grep -q '^201$'
 	done
 	t0="$(now)"
@@ -289,6 +294,7 @@ log "building inputs under $RUN/data"
 mkdir -p "$RUN/data"
 mkblob "$RUN/data/layer" "$LAYER_MIB"
 mkblob "$RUN/data/small" 6
+mkblob "$RUN/data/tag-layer" 1
 for i in $(seq 1 $CONC); do mkblob "$RUN/data/c$i" $(( LAYER_MIB / 4 > 256 ? 256 : (LAYER_MIB / 4 > 0 ? LAYER_MIB / 4 : 1) )); done
 
 measure zot
