@@ -202,6 +202,38 @@ icp_cable_receiver_verdict() {
 	echo "PASS $got bytes on the slot; Thunderbolt member +$tb bytes of ACKs >= $floor; LAN +$lan and mesh +$mesh bytes <= slack $slack"
 }
 
+# icp_wild_bind_verdict <netstat -an -p tcp file> <pod IP> <port> — the positive proof
+# the shim loaded in a wildcard listener: the listener is on the pod IP, and nothing
+# holds the port on the wildcard. Without the shim, it is the wildcard.
+icp_wild_bind_verdict() {
+	local listeners
+	listeners="$(awk '$NF=="LISTEN"{print $4}' "$1" | grep "\.$3\$")"
+	if grep -qx "\*\.$3" <<<"$listeners"; then
+		echo "FAIL the port is held on the wildcard, so the shim did not rewrite the bind: $(tr '\n' ' ' <<<"$listeners")"
+		return 1
+	fi
+	if ! grep -qxF "$2.$3" <<<"$listeners"; then
+		echo "FAIL no listener on $2.$3: ${listeners:-nothing listens on that port}"
+		return 1
+	fi
+	echo "PASS listening on $2.$3"
+}
+
+# icp_shim_report_verdict <shim-inactive condition status> <ShimInactive Event types>
+# — red on any report the runtime made about this pod. A clean answer is necessary and
+# not sufficient: a pod gets a report only when something could be observed.
+icp_shim_report_verdict() {
+	if [ "$1" = True ]; then
+		echo "FAIL the pod carries k3sm.io/shim-inactive True"
+		return 1
+	fi
+	if [ -n "$2" ]; then
+		echo "FAIL the pod has a ShimInactive Event ($2)"
+		return 1
+	fi
+	echo "PASS no shim-inactive condition or Event"
+}
+
 # icp_flow_received_verdict <payload> <log lines before> <log lines after> <last count>
 # — a listener logs one line per stream: this flow added one, and it holds the payload.
 icp_flow_received_verdict() {

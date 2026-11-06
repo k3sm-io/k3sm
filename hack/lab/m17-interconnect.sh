@@ -62,6 +62,10 @@
 #   K3SM_M17_PAYLOAD_MB        r3/r4 payload in MiB (default 128, at least 100)
 #   K3SM_M17_LAN_SLACK_BYTES   bytes the flat interface may move (default 8388608)
 #   K3SM_M17_DESIRED_INTERVAL  seconds of the node's DesiredInterval (default 60)
+#   K3SM_M17_FIXTURE_ROOT      where r4's shim fixtures go on both Macs, the local build
+#                              copied to the peer (default /tmp/k3sm-conformance-bin);
+#                              the login must own it. The run's own directory under it
+#                              is removed on exit. Needs go and codesign on the local Mac
 #   K3SM_M17_MLX_MODEL, K3SM_M17_MLX_MEMORY, K3SM_M17_MLX_READY_TIMEOUT  r5's model
 #   K3SM_M17_PREVIOUS_ARTIFACT the previous k3sm binary for r9, beside its build set
 #                              (`k3sm install --print-required-artifacts` names the set),
@@ -123,7 +127,7 @@ r0-disarmed|after the join the Interconnect exists with enabled false, no k3sm a
 r1-arm|k3sm interconnect enable: armedBy is the caller, the InterconnectArmed Warning Event, the slot-0 alias on exactly the cabled nodes, ic-peers up on both|crd,verbs,doctor,netd,armable|assert_r1_arm|r1-arm/|BI6
 r2-attach|an annotated pod gets a slot: K3SM_INTERCONNECT_IP is its alias, the listener's lsof address is the slot not *, the peer's ARP entry is the peer's MAC|armed,attach,tools|assert_r2_attach|r2-attach/|BI7
 r3-cable-path|a fixed transfer to the peer slot address: route bridge0, peer MAC, the sender's Thunderbolt member rises by the payload, the receiver holds it on the slot with its ACKs on the cable and its LAN and mesh flat; RTT slot vs mesh RECORDED|armed,attached,tools|assert_r3_cable_path|r3-cable-path/|BI10
-r4-mesh-traffic|pod-to-pod and ClusterIP flows ride a utun and the LAN with the cable flat; a wildcard listener is unreachable on its slot; an unbound dial sources K3SM_INTERCONNECT_IP|armed,attached,tools|assert_r4_mesh_traffic|r4-mesh-traffic/|BI4
+r4-mesh-traffic|pod-to-pod and ClusterIP flows ride a utun and the LAN with the cable flat; in ad-hoc-signed fixtures the shim loads into, a wildcard listener binds the pod IP and is unreachable on its slot, and an unbound dial sources K3SM_INTERCONNECT_IP|armed,attached,tools|assert_r4_mesh_traffic|r4-mesh-traffic/|BI4
 r5-ring|a sharded MLXModel with interconnect thunderbolt serves through rank 0: ranks on slot-1 addresses, the ring on the cable, LinksHealthy True, the endpoint on the pod IP; tokens/s RECORDED beside network and single-Mac|armed,mlxhosts,gpu,mlximage|assert_r5_ring|r5-ring/|BI8
 r6-unplug|a pulled cable: member down <= 20 s and the MLX re-render <= 30 s after the carrier drop, the mesh loses at most one reply, UpHold 60 s on replug, one transition per direction, no second gang restart inside 5 min|armed,ring,operator|assert_r6_unplug|r6-unplug/|BI6
 r7-desired-forge|no-address-channel smoke test: the desired annotation carries no address or slot, so values the node forges with its own credential (unknown address/slot fields, a foreign interconnect name, schema 99) can only hold or drop slot 0: no out-of-policy alias or route, only the two netd verbs; an in-policy rewrite restores slot 0|armed,nodecred|assert_r7_desired_forge|r7-desired-forge/|BI3
@@ -500,6 +504,101 @@ if [ -n "${K3SM_INTERCONNECT_IP:-}" ]; then
 fi
 while :; do n=$(/usr/bin/nc -d -l 5401 | /usr/bin/wc -c); echo "RECV5401=$((n + 0))"; done'
 
+# The r4 shim legs run only in these two binaries, never in /usr/bin/nc: dyld drops
+# DYLD_INSERT_LIBRARIES for a platform binary, so nc holds no shim and its wildcard
+# bind and source address say nothing about the product. These are ad-hoc-signed Go
+# builds that call libSystem's bind and connect, so the shim interposes on them, and
+# what they run under is checked rather than assumed: a positive effect of the shim
+# (the pod IP bind, the pinned source) and no ShimInactive report for that pod.
+WILD_PORT=5403
+PIN_PORT=5402
+# The source-pin listener: it logs the accepted peer and answers the banner conftool
+# dial reads, so the dialer exits on the connection it was pinned on.
+PIN_LISTEN_PY='import socket,sys;a,p,t=sys.argv[1],int(sys.argv[2]),float(sys.argv[3]);s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind((a,p));s.listen(1);s.settimeout(t);print("LISTEN",a,p,flush=True);c,r=s.accept();print("ACCEPT",c.getsockname()[0],r[0],flush=True);c.sendall(b"BANNER=pin\n");c.close()'
+# fixture_root_problem <path> — why the path cannot hold the fixtures. It lands in
+# remote shell commands, so its alphabet is closed rather than quoted.
+fixture_root_problem() {
+	case "$1" in /*) ;; *)
+		echo "'$1' must be an absolute path"
+		return 1
+		;;
+	esac
+	[[ "$1" =~ ^/[A-Za-z0-9._/-]+$ ]] || {
+		echo "'$1' must hold only letters, digits and . _ - /"
+		return 1
+	}
+	case "$1/" in */../* | */./*)
+		echo "'$1' must not hold a . or .. component"
+		return 1
+		;;
+	esac
+}
+# fixture_dir_make_cmd — the shell command that makes this run's directory: pods run
+# as the service user, so it is world-readable, and mkdir without -p refuses a path
+# someone else already made in a shared parent.
+fixture_dir_make_cmd() { echo "mkdir -p $FIXTURE_ROOT && [ -O $FIXTURE_ROOT ] && chmod 755 $FIXTURE_ROOT && umask 022 && mkdir $FIXTURE_DIR"; }
+# fixtures_stage — hello-http and conftool built here, ad-hoc-signed, copied to the
+# peer and read back there by digest. Any miss prints why and returns non-zero.
+fixtures_stage() {
+	local b sum
+	on_local "$(fixture_dir_make_cmd)" || {
+		echo "cannot make $FIXTURE_DIR on the local Mac ($FIXTURE_ROOT must be a directory this login owns)"
+		return 1
+	}
+	(cd "$REPO_ROOT" && go build -o "$FIXTURE_DIR/conftool" ./e2e/testdata/cmd/conftool && CGO_ENABLED=0 go build -o "$FIXTURE_DIR/hello-http" ./e2e/testdata/cmd/hello-http) || {
+		echo "the fixtures do not build from $REPO_ROOT"
+		return 1
+	}
+	on_peer "$(fixture_dir_make_cmd)" || {
+		echo "cannot make $FIXTURE_DIR on the peer ($FIXTURE_ROOT must be a directory its login owns)"
+		return 1
+	}
+	for b in conftool hello-http; do
+		codesign -s - -f "$FIXTURE_DIR/$b" >/dev/null 2>&1 || {
+			echo "codesign refused $b"
+			return 1
+		}
+		scp -q -p -o BatchMode=yes -o ConnectTimeout=10 "$FIXTURE_DIR/$b" "$PEER_SSH:$FIXTURE_DIR/$b" </dev/null || {
+			echo "cannot copy $b to the peer"
+			return 1
+		}
+		sum="$(shasum -a 256 "$FIXTURE_DIR/$b" | cut -d' ' -f1)"
+		[ "$(on_peer "shasum -a 256 $FIXTURE_DIR/$b" | cut -d' ' -f1)" = "$sum" ] || {
+			echo "the peer's copy of $b does not match the local build"
+			return 1
+		}
+	done
+}
+# fixtures_remove — the exit trap's half: this run's directory on each Mac and nothing
+# else. A failure to remove it is said out loud and never changes the verdict.
+fixtures_remove() {
+	[ "${FIXTURES_MADE:-0}" = 1 ] || return 0
+	case "$FIXTURE_DIR" in
+	"$FIXTURE_ROOT/$REMOTE_RUN_PREFIX".*) ;;
+	*)
+		echo "cleanup: not removing '$FIXTURE_DIR': it is not this run's directory under $FIXTURE_ROOT"
+		return 0
+		;;
+	esac
+	rm -rf "$FIXTURE_DIR" || echo "cleanup: could not remove $FIXTURE_DIR on the local Mac"
+	on_peer "rm -rf $FIXTURE_DIR" >/dev/null 2>&1 || echo "cleanup: could not remove $FIXTURE_DIR on the peer; check by hand"
+}
+# shim_report_problem <pod> — the pod's own ShimInactive report, selected by uid so
+# nothing an earlier pod of that name recorded counts. An empty answer here is not
+# evidence the shim loaded, which is why each leg also asserts one of its effects.
+shim_report_problem() {
+	local uid
+	uid="$(kc get pod -n "$NS" "$1" -o jsonpath='{.metadata.uid}' 2>/dev/null)"
+	kc get pod -n "$NS" "$1" -o json >"$RUNG_DIR/$1.json" 2>&1
+	icp_shim_report_verdict "$(kc get pod -n "$NS" "$1" -o jsonpath='{.status.conditions[?(@.type=="k3sm.io/shim-inactive")].status}' 2>/dev/null)" \
+		"$(kc get events -n "$NS" --field-selector "involvedObject.uid=$uid,reason=ShimInactive" -o jsonpath='{.items[*].type}' 2>/dev/null)"
+}
+# wild_bound <pod IP> — the peer's listeners, kept; the shim moved the wildcard to the pod IP.
+wild_bound() {
+	on peer "netstat -an -p tcp" >"$RUNG_DIR/wild-netstat.txt" 2>&1
+	icp_wild_bind_verdict "$RUNG_DIR/wild-netstat.txt" "$1" "$WILD_PORT"
+}
+
 # remote_scratch_problem <path> — why the path cannot hold this run's scripts; silent
 # and 0 when it can. The value lands in remote shell commands, so its alphabet is
 # closed rather than quoted.
@@ -727,7 +826,7 @@ mesh_flow() {
 }
 
 assert_r4_mesh_traffic() {
-	local pip cip out rc=0 icd
+	local pip cip out rc=0 icd wip
 	pip="$(pod_ip ic-l-peer)"
 	MESH_UTUN="$(on_local "route -n get $peer_MESH" | awk '$1=="interface:"{print $2; exit}')"
 	mesh_flow pod "$pip" 5401
@@ -741,20 +840,41 @@ spec:
 EOF
 	cip="$(kc get svc -n "$NS" ic-svc -o jsonpath='{.spec.clusterIP}')"
 	mesh_flow clusterip "$cip" 5401
-	out="$(on_local "nc -z -G 3 -w 3 $peer_ICIP 5401" 2>&1)" || rc=$?
-	printf 'rc=%s %s\n' "$rc" "$out" >"$RUNG_DIR/wildcard-negative.txt"
-	check "wildcard negative: the peer pod's *:5401 listener does not answer on its slot address $peer_ICIP" test "$rc" != 0
+	# Wildcard: an attached pod's hello-http on the wildcard. The shim moves it to the
+	# pod IP, so the pod IP answers and the slot address does not. Without the shim it
+	# binds * and answers on both, so each half fails on its own. The shell only execs:
+	# a platform child would earn this pod a ShimInactive report of its own.
+	ic_pod ic-wild "$peer_NODE" 1 "exec $FIXTURE_DIR/hello-http --id ic-wild --addr :$WILD_PORT"
+	if wait_until 120 pod_ready ic-wild; then
+		wip="$(pod_ip ic-wild)"
+		wait_until 30 wild_bound "$wip" || true
+		check "wildcard: the shim bound the peer pod's listener to its pod IP $wip, not *" icp_wild_bind_verdict "$RUNG_DIR/wild-netstat.txt" "$wip" "$WILD_PORT"
+		# unpinned: a GET to the fixture this run just started; the body is compared, never run
+		out="$(on_local "curl -sS -m 5 http://$wip:$WILD_PORT/" 2>&1)" || true
+		printf '%s\n' "$out" >"$RUNG_DIR/wildcard-control.txt"
+		check "wildcard control: the listener answers on the pod IP, so the negative below is not vacuous" test "$out" = ic-wild
+		out="$(on_local "nc -z -G 3 -w 3 $peer_ICIP $WILD_PORT" 2>&1)" || rc=$?
+		printf 'rc=%s %s\n' "$rc" "$out" >"$RUNG_DIR/wildcard-negative.txt"
+		check "wildcard negative: the listener does not answer on the slot address $peer_ICIP" test "$rc" != 0
+		check "wildcard: no ShimInactive report for hello-http" shim_report_problem ic-wild
+	else
+		fail "the wildcard fixture pod ic-wild never became Ready within 120 s"
+	fi
+	kc delete pod -n "$NS" ic-wild --wait=false >/dev/null 2>&1
 	# Source pin: an unbound dial from an attached pod to the peer's slot-0 address,
-	# against a host listener there that reports the connection's source.
-	on_peer "python3 -c $(printf '%q' "$IC_LISTEN_PY") $peer_SLOT0 5402 120" >"$RUNG_DIR/pin-listener.txt" 2>&1 &
+	# against a host listener there that reports the connection's source. conftool
+	# retries until the listener is up, so no platform sleep sits before it.
+	on_peer "python3 -c $(printf '%q' "$PIN_LISTEN_PY") $peer_SLOT0 $PIN_PORT 120" >"$RUNG_DIR/pin-listener.txt" 2>&1 &
 	BG_PIDS="$BG_PIDS $!"
 	sleep 2
-	ic_pod ic-pin "$local_NODE" 1 "echo ICIP=\${K3SM_INTERCONNECT_IP:-}; sleep 3; /usr/bin/nc -z -G 5 -w 5 $peer_SLOT0 5402; echo RC=\$?"
+	ic_pod ic-pin "$local_NODE" 1 "echo ICIP=\${K3SM_INTERCONNECT_IP:-}; exec $FIXTURE_DIR/conftool dial -addr $peer_SLOT0:$PIN_PORT -expect BANNER=pin -for 60s"
 	wait_until 120 pod_done ic-pin || fail "the source-pin dialer pod did not finish within 120 s"
 	sleep 2
+	kc logs -n "$NS" ic-pin >"$RUNG_DIR/pin-dialer.txt" 2>&1
 	icd="$(pod_log_value ic-pin ICIP=)"
-	check "source pin: the peer saw the dial from the pod's K3SM_INTERCONNECT_IP '$icd'" \
+	check "source pin: the peer saw conftool's dial from the pod's K3SM_INTERCONNECT_IP '$icd'" \
 		test "$(awk '$1=="ACCEPT"{print $3; exit}' "$RUNG_DIR/pin-listener.txt")" = "${icd:-none}"
+	check "source pin: no ShimInactive report for conftool" shim_report_problem ic-pin
 	kc delete pod -n "$NS" ic-pin --wait=false >/dev/null 2>&1
 }
 
@@ -1818,7 +1938,7 @@ st_driver_run() {
 	# The interfaces of the captured r3 run, whose counters the cable profiles carry.
 	[ "$rung" != r3 ] || local_LAN=en1 peer_TB=en1
 	local_MACS="36:a1:5c:00:00:01" peer_MACS="36:a1:5c:00:00:02" local_ICIP=169.254.0.11 peer_ICIP=169.254.0.19
-	peer_MESH=100.64.1.1 peer_SLOT0=169.254.0.9 MESH_UTUN=utun3 BG_PIDS=""
+	peer_MESH=100.64.1.1 peer_SLOT0=169.254.0.9 MESH_UTUN=utun3 BG_PIDS="" FIXTURE_DIR=/fix
 	sleep() { :; }
 	wait_until() { shift; "$@"; }
 	retrans() { echo 10; }
@@ -1835,7 +1955,14 @@ st_driver_run() {
 		for p in $BG_PIDS; do wait "$p"; done
 	}
 	pod_ip() { echo 10.42.1.7; }
-	kc() { case "$*" in *clusterIP*) echo 10.43.0.10 ;; esac; }
+	pod_ready() { [ "$mutant" != wild-not-ready ]; }
+	kc() {
+		case "$*" in
+		*clusterIP*) echo 10.43.0.10 ;;
+		*shim-inactive*) [ "$mutant" != shim-condition ] || echo True ;;
+		*reason=ShimInactive*) [ "$mutant" != shim-event ] || echo Warning ;;
+		esac
+	}
 	pod_log_value() {
 		case "$2" in
 		RECV5400=) if [ -f "$D/recv5400" ]; then cat "$D/recv5400"; else echo $((PAYLOAD_MB * 1048576)); fi ;;
@@ -1870,12 +1997,23 @@ st_driver_run() {
 		"route -n get 10.42."* | "route -n get 100.64."*) cat "$F/route-get-utun.txt" ;;
 		"route -n get "*) cat "$F/route-get-bridge0.txt" ;;
 		"arp -n "*) if [ "$1" = local ]; then echo "? (x) at 36:a1:5c:0:0:2 on bridge0 ifscope [bridge]"; else echo "? (x) at 36:a1:5c:0:0:1 on bridge0 ifscope [bridge]"; fi ;;
-		"nc -z "*) return 1 ;;
+		"nc -z "*) [ "$mutant" = slot-answers ] && return 0 || return 1 ;;
+		"curl "*) [ "$mutant" = control-silent ] || echo ic-wild ;;
+		"netstat -an -p tcp") if [ "$mutant" = wild-star ]; then cat "$F/netstat-an-wild-star.txt"; else cat "$F/netstat-an-wild-podip.txt"; fi ;;
 		*) : ;;
 		esac
 	}
 	on_local() { on local "$1"; }
-	on_peer() { case "$1" in python3*) echo "LISTEN"; echo "ACCEPT 169.254.0.9 169.254.0.12" ;; *) on peer "$1" ;; esac; }
+	on_peer() {
+		case "$1" in
+		python3*)
+			echo "LISTEN"
+			# The source the captured r4 run saw: the Mac's self-assigned bridge address.
+			if [ "$mutant" = pin-unpinned ]; then echo "ACCEPT 169.254.0.9 169.254.10.114"; else echo "ACCEPT 169.254.0.9 169.254.0.12"; fi
+			;;
+		*) on peer "$1" ;;
+		esac
+	}
 	if [ "$rung" = r3 ]; then assert_r3_cable_path; else assert_r4_mesh_traffic; fi
 	wait
 	rm -rf "$RUNG_DIR"
@@ -1887,9 +2025,10 @@ st_driver_run() {
 # swapped argument between the rung glue and its predicates reds without a rig.
 # The stubs live only in the subshell.
 st_driver() {
-	local rung="$1" prof="$2" want="$3" out rc=0
+	local rung="$1" prof="$2" want="$3" out rc=0 greens=7
+	[ "$rung" = r3 ] || greens=11
 	out="$(st_driver_run "$rung" "$prof")" || rc=$?
-	if { [ "$want" = 0 ] && [[ "$out" == *"DRIVER passes=7 fails=0"* ]]; } || { [ "$want" = 1 ] && [[ "$out" == *"DRIVER passes="* ]] && [[ "$out" != *" fails=0"* ]]; }; then
+	if { [ "$want" = 0 ] && [[ "$out" == *"DRIVER passes=$greens fails=0"* ]]; } || { [ "$want" = 1 ] && [[ "$out" == *"DRIVER passes="* ]] && [[ "$out" != *" fails=0"* ]]; }; then
 		echo "ok    rung driver $rung over $prof (want $([ "$want" = 0 ] && echo green || echo red))"
 	else
 		echo "MISS  rung driver $rung over $prof: $(printf '%s' "$out" | grep -E '^(FAIL|DRIVER)' | sed -n 1,5p | tr '\n' ';')"
@@ -2206,6 +2345,24 @@ self_test_body() {
 	st_driver r4 mesh 0
 	st_driver r4 mesh-red 1
 	st_driver_red r4 mesh flow-lost "the peer pod's 5401 listener received the payload"
+	st_driver_red r4 mesh wild-star "the shim bound the peer pod's listener to its pod IP"
+	st_driver_red r4 mesh wild-not-ready "ic-wild never became Ready"
+	st_driver_red r4 mesh control-silent "the listener answers on the pod IP"
+	st_driver_red r4 mesh slot-answers "does not answer on the slot address"
+	st_driver_red r4 mesh shim-condition "no ShimInactive report for hello-http"
+	st_driver_red r4 mesh shim-event "no ShimInactive report for conftool"
+	st_driver_red r4 mesh pin-unpinned "the peer saw conftool's dial"
+	st_eq "r4 runs its shim legs in no platform binary" "$(declare -f assert_r4_mesh_traffic | grep -E 'ic_pod (ic-wild|ic-pin)' | grep -cE '/usr/bin|/bin/|sleep ')" 0
+	st "the bind verdict: the pod IP, no wildcard" 0 icp_wild_bind_verdict "$F/netstat-an-wild-podip.txt" 10.42.1.7 5403
+	st "the bind verdict red: the wildcard stayed" 1 icp_wild_bind_verdict "$F/netstat-an-wild-star.txt" 10.42.1.7 5403
+	st "the bind verdict red: another pod's IP" 1 icp_wild_bind_verdict "$F/netstat-an-wild-podip.txt" 10.42.1.8 5403
+	st "the shim report: nothing reported" 0 icp_shim_report_verdict "" ""
+	st "the shim report: a False condition" 0 icp_shim_report_verdict False ""
+	st "the shim report red: the condition" 1 icp_shim_report_verdict True ""
+	st "the shim report red: the Event" 1 icp_shim_report_verdict "" Warning
+	st "fixture root: the default" 0 fixture_root_problem /tmp/k3sm-conformance-bin
+	for r in "" rel/dir "/a b" '/a;b' /a/../b; do st "fixture root red: '$r'" 1 fixture_root_problem "$r"; done
+	st_eq "the fixture directory is made fresh, under a root this login owns" "$(FIXTURE_ROOT=/r FIXTURE_DIR=/r/d fixture_dir_make_cmd)" "mkdir -p /r && [ -O /r ] && chmod 755 /r && umask 022 && mkdir /r/d"
 	st "listener: a flow that adds a line with the whole payload" 0 icp_flow_received_verdict 134217728 1 2 134217728
 	st "listener red: a truncated stream" 1 icp_flow_received_verdict 134217728 0 1 72704
 	st "listener red: no new line, the last flow's count standing in" 1 icp_flow_received_verdict 134217728 1 1 134217728
@@ -2335,6 +2492,9 @@ MLX_MEMORY="${K3SM_M17_MLX_MEMORY:-4Gi}"
 MLX_READY_TIMEOUT="${K3SM_M17_MLX_READY_TIMEOUT:-1800}"
 REINSTALL_ARGS="${K3SM_M17_REINSTALL_ARGS:-}"
 JOIN_SERVER="${K3SM_M17_JOIN_SERVER:-}"
+FIXTURE_ROOT="${K3SM_M17_FIXTURE_ROOT:-/tmp/k3sm-conformance-bin}"
+why="$(fixture_root_problem "$FIXTURE_ROOT")" || refuse_run preflight "K3SM_M17_FIXTURE_ROOT $why (BI10)"
+FIXTURE_DIR="$FIXTURE_ROOT/${IC_REMOTE_DIR##*/}"
 mkdir -p "$EVIDENCE_DIR" || refuse_run preflight "cannot create $EVIDENCE_DIR (BI10)"
 
 RUN_LOG="$HERE/runs/m17-lab-${K3SM_RC_TAG:-local}-$(date -u +%Y-%m-%d).log"
@@ -2355,7 +2515,7 @@ echo "knobs: payload ${PAYLOAD_MB} MiB, LAN slack ${LAN_SLACK} B, DesiredInterva
 	local_SHA="" peer_SHA="" local_BOOT="" peer_BOOT="" local_OS="" peer_OS=""
 	local_MACS="" peer_MACS="" local_ICIP="" peer_ICIP="" WORKER_NODE=""
 }
-HAVE="" ARMED_BY_RUN=0 FORGED_SIDE="" FORGED_ORIG="" BG_PIDS="" PING_PIDS="" NS_CREATED=0 REMOTE_DIR_MADE=0 R9_DOWNGRADED=""
+FIXTURES_MADE=0 HAVE="" ARMED_BY_RUN=0 FORGED_SIDE="" FORGED_ORIG="" BG_PIDS="" PING_PIDS="" NS_CREATED=0 REMOTE_DIR_MADE=0 R9_DOWNGRADED=""
 N_PASS=0 N_FAIL=0 N_REFUSED=0
 MESH_UTUN="" PEER_UTUN=""
 on_exit() {
@@ -2380,6 +2540,7 @@ on_exit() {
 	[ "$NS_CREATED" = 1 ] && kc delete namespace "$NS" --wait=false >/dev/null 2>&1
 	# Never a reinstall from a trap: say which Macs an interrupted r9 left behind.
 	[ -z "$R9_DOWNGRADED" ] || echo "cleanup: r9 did not finish; these Macs may be on the previous build, so reinstall the artifact under test: $R9_DOWNGRADED"
+	fixtures_remove
 	remote_dir_remove
 	# Exit 0 only when every rung passed; an interrupted ladder is a FAIL.
 	if [ "$rc" = 0 ] && { [ "$N_FAIL" -gt 0 ] || [ "$N_REFUSED" -gt 0 ] || [ "$N_PASS" -lt 10 ]; }; then rc=1; fi
@@ -2397,7 +2558,7 @@ BASE_DIR="$EVIDENCE_DIR/baseline"
 RUNG_DIR="$BASE_DIR"
 mkdir -p "$BASE_DIR"
 probe_miss() { refuse_run "${2:-probe}" "$(prereq_what "$1")${3:+: $3}"; }
-for t in kubectl ssh scp python3 nc curl; do
+for t in kubectl ssh scp python3 nc curl go codesign; do
 	command -v "$t" >/dev/null 2>&1 || probe_miss tools preflight "the local Mac has no $t on PATH"
 done
 [ -x "$K3SM_BIN" ] || probe_miss tools preflight "no $K3SM_BIN on the local Mac"
@@ -2485,6 +2646,10 @@ for side in local peer; do
 done
 PEER_UTUN="$(on_peer "route -n get $local_MESH" | awk '$1=="interface:"{print $2; exit}')"
 MESH_UTUN="$(on_local "route -n get $peer_MESH" | awk '$1=="interface:"{print $2; exit}')"
+# The last preflight step and the only one that writes: nothing has probed red by now.
+FIXTURES_MADE=1 # set here, not in the subshell: a lost reply after the mkdir must still reach the trap, and the name is this run's own
+why="$(fixtures_stage)" || probe_miss tools preflight "the r4 fixtures: $why"
+echo "fixtures: hello-http and conftool in $FIXTURE_DIR on both Macs"
 HAVE="$PREREQ_STATIC"
 FINAL_RC=1
 why="$(r9_problem)" || echo "notice: r9-downgrade will be REFUSED when the ladder reaches it, so this run cannot exit 0: $why"
