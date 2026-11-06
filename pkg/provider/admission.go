@@ -389,13 +389,16 @@ func (r *runtimedRuntime) updateWaitLocked(id string) <-chan struct{} {
 	return ch
 }
 
-// noteHeldLocked records that a create or update of pod id is about to acquire.
-// The caller holds r.mu.
-func (r *runtimedRuntime) noteHeldLocked(id string) {
+// noteHeldLocked records that a create or update of pod is about to acquire, with
+// what a release and the orphan reaper's live read need of the pod: its namespace,
+// name and UID. The caller holds r.mu.
+func (r *runtimedRuntime) noteHeldLocked(pod *corev1.Pod) {
 	if r.held == nil {
-		r.held = map[string]struct{}{}
+		r.held = map[string]*corev1.Pod{}
 	}
-	r.held[id] = struct{}{}
+	r.held[string(pod.UID)] = &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Namespace: pod.Namespace, Name: pod.Name, UID: pod.UID,
+	}}
 }
 
 // updateStoppedNow reports whether an update past its check has to stop acquiring:
@@ -425,7 +428,7 @@ func (r *runtimedRuntime) createDone(pod *corev1.Pod, t *admitTicket) {
 	}
 }
 
-// updateDone ends one UpdatePod, or one parked retry's allocation (retryParkedBox).
+// updateDone ends one UpdatePod, or one parked pod's retry (retryParkedCreate).
 // A refusal may have landed behind it, with no create in flight to reach CreatePod's
 // fence, and a refused pod's delete frees nothing; or a delete may have, leaving the
 // rest of its teardown here. So the last call out releases. The release runs with
@@ -454,8 +457,11 @@ type fenceClaim struct {
 
 // owedDelete is the rest of a teardown left to the last UpdatePod out. owned
 // selects the track to forget, as in teardownPod; nil is whatever the id holds.
+// refusal says no delete began: a refused create left this beside an update, the pod
+// is still in the apiserver and a create of it can still land (withdrawRefusalLocked).
 type owedDelete struct {
-	owned *podTrack
+	owned   *podTrack
+	refusal bool
 }
 
 // oweDeleteLocked leaves the rest of a delete to the last call out. The caller
@@ -465,6 +471,31 @@ func (r *runtimedRuntime) oweDeleteLocked(id string, owned *podTrack) {
 		r.deleteOwed = map[string]*owedDelete{}
 	}
 	r.deleteOwed[id] = &owedDelete{owned: owned}
+}
+
+// oweRefusalLocked leaves the rest of a refused create to the last call out, with
+// the track it installed. A delete already owed stays one. The caller holds r.mu.
+func (r *runtimedRuntime) oweRefusalLocked(id string, owned *podTrack) {
+	if _, owed := r.deleteOwed[id]; owed {
+		return
+	}
+	r.oweDeleteLocked(id, owned)
+	r.deleteOwed[id].refusal = true
+}
+
+// withdrawRefusalLocked answers a create of pod id that has landed, when a refusal of
+// another create is what is owed. The runtime holds the pod, so nothing is left for
+// the refusal to free, and the track of the create that landed takes the refused
+// one's place. The caller holds r.mu.
+func (r *runtimedRuntime) withdrawRefusalLocked(id string, t *podTrack) {
+	del := r.deleteOwed[id]
+	if del == nil || !del.refusal {
+		return
+	}
+	delete(r.deleteOwed, id)
+	if r.track[id] == del.owned {
+		r.track[id] = t
+	}
 }
 
 // uidTombstoneCap bounds uidTombstones. An update is stale by the time between
@@ -507,10 +538,22 @@ func (u *uidTombstones) has(id string) bool {
 	return ok
 }
 
+// createIsStale reports whether a create of UID id arrives behind the pod's teardown,
+// or beside a compensating delete, which would take what the create builds. A refused
+// pod's delete is neither: it tore nothing down, and a create of it owns its guest.
+func (r *runtimedRuntime) createIsStale(id string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, compensating := r.compensating[id]
+	return compensating || r.tornDown.has(id)
+}
+
 // inFlightLocked reports whether a create or an update of pod id has not returned,
-// so it can still acquire by the pod's UID. The caller holds r.mu.
+// so it can still acquire by the pod's UID, or whether a guest a late create built
+// still stands, answering on the pod's /32 until its compensating delete lands
+// (runCompensatingDelete). A release waits for all of them. The caller holds r.mu.
 func (r *runtimedRuntime) inFlightLocked(id string) bool {
-	return r.admitting[id] != 0 || r.updating[id] != 0
+	return r.admitting[id] != 0 || r.updating[id] != 0 || r.compensating[id]
 }
 
 // claimFenceReleaseLocked decides, under r.mu, that the caller releases what pod
@@ -527,17 +570,16 @@ func (r *runtimedRuntime) inFlightLocked(id string) bool {
 // release in progress has none in flight beside it. The caller holds r.mu.
 //
 // "Once" covers what reaches this decision. Still open:
-//   - A create that failed and left no track, whose pod is then deleted with no
-//     container running, whether the delete came during the create or after it.
-//     Virtual Kubelet runs one call per pod key, removes such a pod from the apiserver
-//     without calling DeletePod (syncPodInProvider, node/podcontroller.go), and finds
-//     no track when the object goes, and the orphan reaper keys on tracks. What the
-//     create took stays until the daemon restarts or a refusal of the same UID.
-//   - A create whose RPC succeeds behind a delete: the guest the runtime built is not
-//     deleted again, unlike a parked retry's (commitParkedCreate). Its /32 is released.
 //   - An untracked update with no deletion stamp that is not behind a delete of its
 //     UID, or is behind one uidTombstones has evicted: it allocates as it always did,
-//     and only a later create, delete or refusal of the UID frees that.
+//     and a later create, delete or refusal of the UID frees that, or the orphan
+//     reaper once the object is gone.
+//
+// A create that failed and left no track, whose pod is then deleted with no container
+// running, reaches no decision here at all: Virtual Kubelet removes such a pod from
+// the apiserver without calling DeletePod (syncPodInProvider, node/podcontroller.go)
+// and finds no track when the object goes. The orphan reaper frees what it took
+// (claimUntrackedHoldLocked).
 func (r *runtimedRuntime) claimFenceReleaseLocked(id string) *fenceClaim {
 	if r.inFlightLocked(id) || r.fenceReleasing[id] != nil {
 		return nil
@@ -560,8 +602,27 @@ func (r *runtimedRuntime) claimFenceReleaseLocked(id string) *fenceClaim {
 	default:
 		return nil
 	}
-	// Consumed here, not when the release runs: a release that panics is not
-	// claimed a second time.
+	return r.publishFenceReleaseLocked(id, del)
+}
+
+// claimUntrackedHoldLocked decides, under r.mu, that the orphan reaper releases what
+// a pod with no track holds, once the apiserver has been seen not to hold the UID. It
+// returns nil when a call of the pod is out or a release is running, as either owns
+// the decision, and when a track has appeared or nothing is held. The UID's tombstone
+// stops a stale create or update of it. The caller holds r.mu.
+func (r *runtimedRuntime) claimUntrackedHoldLocked(id string) *fenceClaim {
+	if r.inFlightLocked(id) || r.fenceReleasing[id] != nil || r.track[id] != nil || r.held[id] == nil {
+		return nil
+	}
+	r.tombstones.add(id)
+	r.tornDown.add(id)
+	return r.publishFenceReleaseLocked(id, nil)
+}
+
+// publishFenceReleaseLocked consumes pod id's hold and publishes the release that is
+// about to run. Consumed here, not when the release runs: a release that panics is
+// not claimed a second time. The caller holds r.mu.
+func (r *runtimedRuntime) publishFenceReleaseLocked(id string, del *owedDelete) *fenceClaim {
 	delete(r.held, id)
 	released := make(chan struct{})
 	if r.fenceReleasing == nil {

@@ -267,16 +267,17 @@ type runtimedRuntime struct {
 	admitSettled map[string]chan struct{}
 	// updating counts, per pod id, the UpdatePods that have not returned, from
 	// before they wait for a verdict, and the parked-create retries that have not
-	// finished allocating (retryParkedBox). Each may still acquire the pod's /32, so
-	// a release cannot start while it is non-zero (admission.go,
+	// returned (retryParkedCreate). Each may still acquire the pod's /32, or build a
+	// guest on it, so a release cannot start while it is non-zero (admission.go,
 	// claimFenceReleaseLocked). Guarded by mu; created on first use.
 	updating map[string]int
 	// held is the set of pods a create or update has begun acquiring for with no
-	// release since: what a refusal has to free, because a refused pod's delete
-	// frees nothing. An address reserved by a startup re-attachment is not in it
-	// (attachPod). Set before the acquiring, cleared by releasePodNetwork. Guarded
-	// by mu; created on first use.
-	held map[string]struct{}
+	// release since, by UID: what a refusal has to free, because a refused pod's
+	// delete frees nothing, and what the orphan reaper frees for a pod with no track.
+	// An address reserved by a startup re-attachment is not in it (attachPod). Set
+	// before the acquiring, cleared by releasePodNetwork. Guarded by mu; created on
+	// first use.
+	held map[string]*corev1.Pod
 	// deleteOwed holds, per pod id, a delete that landed behind a create or an
 	// UpdatePod in flight, or a create's refusal beside an UpdatePod in flight. The
 	// release and the track delete are the last call out's
@@ -287,6 +288,10 @@ type runtimedRuntime struct {
 	// track and carries no deletion stamp (admission.go, uidTombstones). Guarded by
 	// mu; usable at its zero value.
 	tombstones uidTombstones
+	// tornDown remembers the UIDs of recent teardowns, for a create that arrives behind
+	// one (createIsStale). Unlike tombstones it leaves out a refused pod's delete, which
+	// tore nothing down. Guarded by mu; usable at its zero value.
+	tornDown uidTombstones
 	// admittedHook, when set, runs in CreatePod right after admission let the
 	// create through, before anything is registered: the seam a test uses to hold
 	// one create inside the admission window. Nil in production; set before any
@@ -316,7 +321,7 @@ type runtimedRuntime struct {
 	// track is gone by then, so there is nowhere else to hold it, and the pod id
 	// is what the delete is keyed on anyway. It is also the dedupe: one loop per
 	// pod id, however many late creates land for it.
-	compensating map[string]bool // pod id -> a compensating delete is in flight
+	compensating map[string]bool // pod id -> the delete is outstanding (true), or landed with its release running (false)
 
 	// lifetime is closed when the provider shuts down — the Watch context, which
 	// bounds every other provider-owned goroutine, ending. It bounds the ONE
@@ -1977,6 +1982,9 @@ func (r *runtimedRuntime) fenceRelease(pod *corev1.Pod, c *fenceClaim) {
 	}
 	r.releasePodNetwork(pod)
 	if c.del != nil {
+		if c.del.refusal {
+			r.removePodLogs(pod)
+		}
 		r.forgetTorndown(pod, c.del.owned)
 		return
 	}
@@ -1995,6 +2003,14 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	// filling memory.
 	if isEvictedPod(pod) || isBudgetRejectedPod(pod) {
 		r.log.Info("CreatePod: the pod was evicted from or rejected by this node; not creating it",
+			"namespace", pod.Namespace, "name", pod.Name, "uid", string(pod.UID))
+		return nil
+	}
+	// A UID this node has torn down is never created again, and a UID is never
+	// reused, so this create read a pod that is gone. Past this check, a delete behind
+	// the create is answered by its fence below and by createBehindDelete.
+	if r.createIsStale(string(pod.UID)) {
+		r.log.Info("CreatePod: this node has already deleted the pod; not creating it",
 			"namespace", pod.Namespace, "name", pod.Name, "uid", string(pod.UID))
 		return nil
 	}
@@ -2023,7 +2039,7 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	// resolver refuses an unreferenced object. The create deadline bounds the
 	// Forbidden retry of every read this create makes, together.
 	r.mu.Lock()
-	r.noteHeldLocked(string(pod.UID))
+	r.noteHeldLocked(pod)
 	r.mu.Unlock()
 	r.refs.RegisterPod(pod)
 	ctx = r.refs.withCreateFetchBudget(ctx)
@@ -2045,8 +2061,8 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	// Ordering: allocate the pod's /32 BEFORE translation/env
 	// resolution so box.PodIp and the status.podIP downward-API env carry it. A
 	// translate failure below does NOT release it here (an idempotent retry, a
-	// later refusal or a DeletePod reclaims it, though Virtual Kubelet may send no
-	// DeletePod for such a pod: claimFenceReleaseLocked names that gap;
+	// later refusal or a DeletePod reclaims it, or the orphan reaper once the object
+	// is gone, since Virtual Kubelet may send no DeletePod for such a pod;
 	// auto-releasing would also rip a live pod's alias away on an UpdatePod
 	// translate error).
 	podIP, err := r.podIP(ctx, pod)
@@ -2223,35 +2239,68 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 		}
 		return fmt.Errorf("runtimed create pod %s/%s rejected: %s (%s)", pod.Namespace, pod.Name, e.GetMessage(), resp.GetFailureReason().String())
 	}
+	if r.createBehindDelete(id, t) {
+		// runtimed registers a pod only when its create finishes, and its DeletePod
+		// answers success for an id it has not registered, so a delete inside this
+		// RPC stopped nothing and the guest is running. The delete has the rest of
+		// the pod: the release and the track are createDone's.
+		r.compensateLateCreate(pod)
+		return nil
+	}
 	r.completeCreate(pod, t, resp.GetStatus())
 	return nil
+}
+
+// createBehindDelete reports whether a delete of pod id has begun, which is what a
+// create that has just landed has to answer: quiesce marks the track before the
+// delete's RPC, so unmarked means that RPC is still to come and will reach what the
+// create built. A delete that began on a replacement of t marks only the replacement.
+// Deleting again when the first delete did reach it is a no-op.
+//
+// A refusal owed is no delete: the create that landed keeps its guest, and the refusal
+// is withdrawn in the same decision.
+func (r *runtimedRuntime) createBehindDelete(id string, t *podTrack) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if del := r.deleteOwed[id]; (del != nil && !del.refusal) || trackDeleting(t) {
+		return true
+	}
+	if live := r.track[id]; live != nil && trackDeleting(live) {
+		return true
+	}
+	r.withdrawRefusalLocked(id, t)
+	return false
 }
 
 // untrackRejectedCreate forgets a pod runtimed refused to create at the pod
 // level. It is the CreatePod-side mirror of DeletePod's bookkeeping for a pod
 // that never existed in the runtime: the track is removed so VK's retry reaches
 // CreatePod again, the goroutines the track could own are cancelled, and the
-// pod's /32 and log tree are released. Only the track this create installed is
-// removed — a track replaced since (a concurrent re-create) is left alone.
+// pod's /32 and log tree are released.
 //
-// A delete owed already has the release. So does an UpdatePod in flight, which can
-// still acquire by the pod's UID: it reads the refusal as a delete owed and stops,
-// and the last call out frees what the pod holds and forgets the track. A claim
-// worker's create can land here beside one, since it runs off VK's queue.
+// A track replaced since (a concurrent re-create of the UID) is left alone, with all
+// the UID holds: the address, the references and the log tree are keyed by the UID,
+// so they are the replacement's now, and its own attempt decides what becomes of them.
+// Only this create's workers go.
+//
+// A delete owed already has the release, and has removed the log tree. So does an
+// UpdatePod in flight, which can still acquire by the pod's UID: it reads the refusal
+// as a delete owed and stops, and the last call out frees what the pod holds, its log
+// tree too, and forgets the track. A claim worker's create can land here beside one,
+// since it runs off VK's queue, and another create that lands first withdraws this
+// refusal (withdrawRefusalLocked).
 func (r *runtimedRuntime) untrackRejectedCreate(pod *corev1.Pod, t *podTrack) {
 	id := string(pod.UID)
 	r.mu.Lock()
-	// Identity, not presence: a concurrent CreatePod for the same pod may have
-	// replaced this track between this create's RPC and its refusal, and that
-	// replacement is running its own attempt. Only the track this create
-	// installed is removed.
-	removed := r.track[id] == t
+	live := r.track[id]
+	replaced := live != nil && live != t
+	removed := live == t
 	_, owed := r.deleteOwed[id]
 	left := owed || r.updating[id] != 0
 	switch {
-	case owed:
+	case replaced || owed:
 	case left:
-		r.oweDeleteLocked(id, t)
+		r.oweRefusalLocked(id, t)
 	case removed:
 		delete(r.track, id)
 	}
@@ -2262,9 +2311,10 @@ func (r *runtimedRuntime) untrackRejectedCreate(pod *corev1.Pod, t *podTrack) {
 	t.cancelRestarts()
 	t.cancelPulls()
 	t.cancelPostStart()
-	if !left {
-		r.releasePodNetwork(pod)
+	if replaced || left {
+		return
 	}
+	r.releasePodNetwork(pod)
 	r.removePodLogs(pod)
 }
 
@@ -2546,7 +2596,7 @@ func (r *runtimedRuntime) checkUpdate(ctx context.Context, pod *corev1.Pod) (t *
 	}
 	// A spec change (an ephemeral container added) can add references; the
 	// registration is replaced, so a removed reference stops being fetchable.
-	r.noteHeldLocked(id)
+	r.noteHeldLocked(pod)
 	r.refs.RegisterPod(pod)
 	if tracked {
 		previous = t.pod
@@ -2765,6 +2815,7 @@ func (r *runtimedRuntime) teardownPod(ctx context.Context, pod *corev1.Pod, grac
 	r.stopProber(id)
 	r.mu.Lock()
 	r.tombstones.add(id)
+	r.tornDown.add(id)
 	if r.inFlightLocked(id) {
 		r.oweDeleteLocked(id, owned)
 		r.mu.Unlock()
@@ -3227,6 +3278,14 @@ func (r *runtimedRuntime) lookup(namespace, name string) (string, metav1.Time, *
 // to, or ("", nil) when no track carries that name. Every same-name candidate is
 // weighed through preferTrack, so the answer is independent of map iteration
 // order. The caller holds r.mu.
+//
+// A track whose delete is owed answers for no name, and a refusal owed is no delete.
+// The pod is stopped and gone from the apiserver, and the track stays only for the
+// call still out of the pod, which reads it by UID (claimFenceReleaseLocked). Answering
+// would make Virtual Kubelet's GetPod send
+// a same-name successor down UpdatePod instead of CreatePod (createOrUpdatePod,
+// node/pod.go). A delete only begun still answers: its RPC can fail, and the retry
+// rests on GetPod finding the pod.
 func (r *runtimedRuntime) lookupTrackLocked(namespace, name string) (string, *podTrack) {
 	var (
 		bestID string
@@ -3234,6 +3293,9 @@ func (r *runtimedRuntime) lookupTrackLocked(namespace, name string) (string, *po
 	)
 	for id, t := range r.track {
 		if t.pod.Namespace != namespace || t.pod.Name != name {
+			continue
+		}
+		if del := r.deleteOwed[id]; del != nil && !del.refusal && (del.owned == nil || del.owned == t) {
 			continue
 		}
 		if best == nil || preferTrack(t, best) == t {

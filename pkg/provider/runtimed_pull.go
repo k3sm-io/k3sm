@@ -1158,15 +1158,26 @@ func (r *runtimedRuntime) retryParkedCreate(ctx context.Context, pod *corev1.Pod
 	if pod == nil {
 		return runtimev1.FailureReason_FAILURE_REASON_NOT_FOUND, "", nil
 	}
-	ctx = withPodIdentity(ctx, pod)
-	box, proceed, err := r.retryParkedBox(ctx, pod, t)
-	if err != nil {
-		return runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, "", err
-	}
-	if !proceed {
+	// A delete behind this retry leaves its release here, and past the RPC to the
+	// compensating delete, as the guest the RPC may build answers on the /32. The
+	// check and the count share r.mu, and quiesce marks the track before teardownPod
+	// reads the count, so a delete either stops this retry here or waits for it.
+	if !r.beginParkedRetry(string(pod.UID), t) {
 		// NOT_FOUND ends the schedule (pullClassNone), as a create that lands behind
 		// the delete does.
 		return runtimev1.FailureReason_FAILURE_REASON_NOT_FOUND, "", nil
+	}
+	defer r.updateDone(pod)
+	ctx = withPodIdentity(ctx, pod)
+	podIP, err := r.podIP(ctx, pod)
+	if err != nil {
+		return runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, "",
+			fmt.Errorf("allocate pod ip %s/%s: %w", pod.Namespace, pod.Name, err)
+	}
+	box, err := r.buildBox(ctx, pod, podIP)
+	if err != nil {
+		return runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, "",
+			fmt.Errorf("translate pod %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
 	resp, err := r.rt.CreatePod(ctx, &runtimev1.CreatePodRequest{Pod: box})
 	if err != nil {
@@ -1195,30 +1206,6 @@ func (r *runtimedRuntime) retryParkedCreate(ctx context.Context, pod *corev1.Pod
 	}
 	r.completeCreate(pod, t, resp.GetStatus())
 	return runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, "", nil
-}
-
-// retryParkedBox allocates and translates for a parked pod's retry, or reports not
-// to proceed once the pod's delete has begun. The worker's context ending does not
-// stop an allocation, which is keyed by the pod's UID and has no owner behind the
-// release. So the retry counts as in flight while it allocates, as an UpdatePod does:
-// the check and the count share r.mu, and quiesce marks the track before teardownPod
-// reads the count, so a delete either stops this retry here or leaves its release to
-// the end of this call (updateDone). The count ends before the RPC, which acquires
-// nothing here; commitParkedCreate answers a create that lands behind the delete.
-func (r *runtimedRuntime) retryParkedBox(ctx context.Context, pod *corev1.Pod, t *podTrack) (*runtimev1.PodBox, bool, error) {
-	if !r.beginParkedRetry(string(pod.UID), t) {
-		return nil, false, nil
-	}
-	defer r.updateDone(pod)
-	podIP, err := r.podIP(ctx, pod)
-	if err != nil {
-		return nil, false, fmt.Errorf("allocate pod ip %s/%s: %w", pod.Namespace, pod.Name, err)
-	}
-	box, err := r.buildBox(ctx, pod, podIP)
-	if err != nil {
-		return nil, false, fmt.Errorf("translate pod %s/%s: %w", pod.Namespace, pod.Name, err)
-	}
-	return box, true, nil
 }
 
 // beginParkedRetry counts a parked pod's retry in flight and reports true, or counts
@@ -1276,8 +1263,15 @@ const (
 // tear down.
 //
 // Lock order is r.mu → restartMu, as everywhere else.
+//
+// A refusal owed of a re-create beside this retry is withdrawn when the delete has not
+// begun, as in createBehindDelete: the track that was refused would otherwise read as
+// a successor here, and the guest would lose its /32 to the refusal's release.
 func (r *runtimedRuntime) commitParkedCreate(t *podTrack, podID string) commitReason {
 	r.mu.Lock()
+	if !trackDeleting(t) {
+		r.withdrawRefusalLocked(podID, t)
+	}
 	live := r.track[podID]
 	r.mu.Unlock()
 	t.restartMu.Lock()
@@ -1298,8 +1292,8 @@ func (r *runtimedRuntime) commitParkedCreate(t *podTrack, podID string) commitRe
 	}
 }
 
-// compensateLateCreate deletes a pod the runtime created for a retry the
-// provider can no longer adopt, retrying until the delete lands.
+// compensateLateCreate deletes a pod the runtime created for a create or a retry
+// the provider can no longer adopt, retrying until the delete lands.
 //
 // Without it the create is a RESURRECTION: virtual-kubelet is long past its
 // DeletePod, the track is gone, and runtimed's DeletePod for a pod id it does
@@ -1320,10 +1314,14 @@ func (r *runtimedRuntime) commitParkedCreate(t *podTrack, podID string) commitRe
 // would make the compensating delete a no-op. Its LOOP is bounded by the
 // provider's lifetime instead (r.lifetime), so a shutdown mid-retry ends it with
 // an explicit error rather than a goroutine nobody can stop.
+//
+// The guest answers on the pod's /32 until the delete lands, so r.compensating counts
+// as in flight (inFlightLocked): the release a delete owes waits for it, and the
+// allocator cannot hand the address to a new pod beside a live guest.
 func (r *runtimedRuntime) compensateLateCreate(pod *corev1.Pod) {
 	podID := string(pod.UID)
 	r.mu.Lock()
-	already := r.compensating[podID]
+	_, already := r.compensating[podID]
 	if !already {
 		if r.compensating == nil {
 			r.compensating = map[string]bool{}
@@ -1334,7 +1332,7 @@ func (r *runtimedRuntime) compensateLateCreate(pod *corev1.Pod) {
 	if already {
 		return
 	}
-	r.log.Warn("a parked pod's create landed after the pod was deleted; deleting it again",
+	r.log.Warn("a pod's create landed after the pod was deleted; deleting it again",
 		"namespace", pod.Namespace, "name", pod.Name, "pod", podID)
 	go r.runCompensatingDelete(pod, podID)
 }
@@ -1342,8 +1340,24 @@ func (r *runtimedRuntime) compensateLateCreate(pod *corev1.Pod) {
 // runCompensatingDelete is compensateLateCreate's single retry loop for one pod
 // id. It returns only when the delete has landed or the provider is shutting
 // down, and clears the pod's entry in r.compensating either way.
+//
+// Once the delete lands, it is the last call out if nothing else is, so it runs the
+// release a delete owes; an entry at false is no longer in flight but still joins a
+// second late create. A shutdown releases nothing, as the guest was never confirmed
+// gone: the next daemon start decides it.
 func (r *runtimedRuntime) runCompensatingDelete(pod *corev1.Pod, podID string) {
+	landed := false
 	defer func() {
+		var claim *fenceClaim
+		r.mu.Lock()
+		if landed {
+			r.compensating[podID] = false
+			claim = r.claimFenceReleaseLocked(podID)
+		}
+		r.mu.Unlock()
+		if claim != nil {
+			r.fenceRelease(pod, claim)
+		}
 		r.mu.Lock()
 		delete(r.compensating, podID)
 		r.mu.Unlock()
@@ -1358,6 +1372,7 @@ func (r *runtimedRuntime) runCompensatingDelete(pod *corev1.Pod, podID string) {
 		_, err := r.rt.DeletePod(context.Background(),
 			&runtimev1.DeletePodRequest{PodId: podID, GracePeriodSeconds: grace})
 		if err == nil {
+			landed = true
 			return
 		}
 		r.log.Warn("could not delete the pod a late create left behind; retrying under the back-off",
