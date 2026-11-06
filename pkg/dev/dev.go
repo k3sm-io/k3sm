@@ -861,8 +861,9 @@ func (p *serverProc) exitError() error {
 // exitReportGrace bounds how long awaitOrExit waits for the reaper to publish an
 // exit it has already established from the kernel. The close is imminent by
 // construction (the child is gone; the reaper only needs a scheduling slot), so
-// this is a hang guard, not a budget — on expiry the stage's own verdict is
-// returned rather than nothing at all.
+// this is a hang guard, not a budget — on expiry a failed stage's own verdict is
+// returned rather than nothing at all, and a stage that succeeded still fails,
+// because the server is known to be dead.
 const exitReportGrace = 5 * time.Second
 
 // awaitOrExit decides which verdict a bring-up stage reports, and the server's
@@ -875,30 +876,44 @@ const exitReportGrace = 5 * time.Second
 // emitting it dies. So an exit the reaper has published beats err even when err
 // is nil.
 //
-// When the stage failed, the kernel is asked directly before a deadline is
-// allowed to author the error: exited is closed by a goroutine that may not have
-// been scheduled yet, so a dead server can otherwise come back as an opaque
-// timeout describing the symptom instead of the cause.
+// The kernel is asked directly whatever the stage returned: exited is closed by a
+// goroutine that may not have been scheduled yet, so a dead server could otherwise
+// be reported up on a stage's success, or come back from a failed stage as an
+// opaque timeout describing the symptom instead of the cause.
+//
+// A nil return means the server was alive when it was checked, nothing more. It
+// can still die just after this check, or any other, so no check here can promise
+// the server is still running by the time the caller acts on the answer.
 func (m *Manager) awaitOrExit(ctx context.Context, p *serverProc, err error) error {
 	select {
 	case <-p.exited:
 		return p.exitError()
 	default:
 	}
-	if err == nil {
-		return nil
+	if m.sys.ProcessLiveness(p.pid).Exists() {
+		return err
 	}
-	if !m.sys.ProcessLiveness(p.pid).Exists() {
-		select {
-		case <-p.exited:
-			return p.exitError()
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(exitReportGrace):
-			// The reaper never reported. Prefer the stage's own verdict to hanging.
-		}
+	return awaitPublishedExit(ctx, p, err, exitReportGrace)
+}
+
+// awaitPublishedExit waits up to grace for the reaper to publish the exit of a
+// server the kernel already reports dead, so the error carries the exit status.
+// If the reaper never reports, a failed stage's verdict stands rather than a hang;
+// a stage that succeeded gets ErrServerExited without the status, never nil.
+func awaitPublishedExit(ctx context.Context, p *serverProc, stageErr error, grace time.Duration) error {
+	select {
+	case <-p.exited:
+		return p.exitError()
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(grace):
 	}
-	return err
+	if stageErr != nil {
+		return stageErr
+	}
+	return fmt.Errorf("%w: instance %q server (pid %d): gone, exit status not collected within %s; last log lines (%s):\n%s",
+		ErrServerExited, p.name, p.pid, grace, p.logPath,
+		executor.RedactedLogTail(p.logPath))
 }
 
 // serverLogPath is where spawnServer redirects a detached server's output. One

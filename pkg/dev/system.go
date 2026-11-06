@@ -26,6 +26,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // System is the syscall seam the dev lifecycle isolates so the reclaim/lock/port
@@ -46,8 +48,9 @@ type System interface {
 	// set.
 	Lo0RemoveAlias(ip string) error
 	// ProcessLiveness reports whether pid is a live process, as a THREE-valued
-	// verdict (kill -0). A stale pid from a crashed prior run reads LivenessDead,
-	// so pre-flight reclaim reaps it; a pid this uid may not signal reads
+	// verdict (kill -0, plus the process state, since kill -0 succeeds on a
+	// zombie). A stale pid from a crashed prior run reads LivenessDead, so
+	// pre-flight reclaim reaps it; a pid this uid may not signal reads
 	// LivenessUnknown, which is NOT dead. See the Liveness doc for why the
 	// two-valued predicate this replaced was wrong.
 	ProcessLiveness(pid int) Liveness
@@ -160,12 +163,24 @@ func (realSystem) Lo0RemoveAlias(ip string) error {
 	return nil
 }
 
+// procStateZombie is SZOMB from <sys/proc.h>, the kinfo_proc p_stat of a process
+// that has exited and not been reaped. x/sys/unix does not export it.
+const procStateZombie = 5
+
+// isZombie reports whether pid is an exited process awaiting its parent's wait. An
+// unreadable state answers false, which leaves the verdict to kill(2).
+func isZombie(pid int) bool {
+	kp, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
+	return err == nil && int(kp.Proc.P_pid) == pid && kp.Proc.P_stat == procStateZombie
+}
+
 // ProcessLiveness sends signal 0 to pid and classifies the errno.
 //
 // kill(2) distinguishes the two failures this cares about: ESRCH says no such
 // process, EPERM says the process EXISTS but this uid may not signal it. Anything
 // else (an EINVAL that cannot arise for signal 0) is treated as dead, matching the
-// earlier posture for unclassifiable errors.
+// earlier posture for unclassifiable errors. Success is not enough on its own:
+// POSIX has kill succeed on a zombie, and a zombie runs nothing, so it reads dead.
 func (realSystem) ProcessLiveness(pid int) Liveness {
 	if pid <= 0 {
 		return LivenessDead
@@ -173,6 +188,9 @@ func (realSystem) ProcessLiveness(pid int) Liveness {
 	err := syscall.Kill(pid, 0)
 	switch {
 	case err == nil:
+		if isZombie(pid) {
+			return LivenessDead
+		}
 		return LivenessRunning
 	case errors.Is(err, syscall.EPERM):
 		return LivenessUnknown
