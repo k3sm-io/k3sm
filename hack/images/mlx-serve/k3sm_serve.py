@@ -583,6 +583,11 @@ def install_model_route_guard(server, http_exception):
     parameters so the guard can be exercised against fakes. Nothing is replaced
     unless every resolver is the pinned one. A refusal does not repeat the name
     the client sent.
+
+    The guard holds only because vllm_mlx.server calls the three resolvers
+    through its own module globals, so replacing them on the module reaches
+    every route. The staged selftest.sh --case serve.model.routes real-route
+    leg is what proves that, and it must be re-run on every engine pin bump.
     """
     resolvers = {name: _pinned_hook(server, name, params, sha256)
                  for name, (params, sha256) in MODEL_ROUTE_HOOKS.items()}
