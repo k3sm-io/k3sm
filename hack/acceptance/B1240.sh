@@ -58,6 +58,13 @@
 # set, so K3SM_B1240_KEEP_MANIFEST=1 packs publish.sh's shape, to see what a published
 # release does on this path.
 #
+# Records that predate the run. `k3sm update apply` replaces a finished Update named
+# current, and the run sets the channel, so neither an Update nor an UpdatePolicy already
+# there can survive it. Saving one and putting it back is no answer: an Update created
+# again has no status, so the controller would take it for a new roll. So the run refuses
+# them (exit 2, the rig untouched) and the operator decides; what it deletes at the end is
+# only what it created.
+#
 # When a withdrawal happens. Node phase Downloading does not say a GET has been made: the
 # controller writes it at the handover, before the node has read it. So w.1 and w.2
 # withdraw once the index has logged the worker's 200, which is when its file is open, and
@@ -477,8 +484,13 @@ SRV, WRK = NODES["srv"], NODES["wrk"]
 def load():
     if os.path.exists(path):
         return json.load(open(path))
-    return {"ver": {SRV: "main", WRK: "main"}, "cord": {SRV: False, WRK: False}, "base": {}, "channel": None,
-            "update": None, "stopped": {}, "ann": {}, "pods": {}, "ns": [], "pub": None, "dl": 0}
+    fresh = {"ver": {SRV: "main", WRK: "main"}, "cord": {SRV: False, WRK: False}, "base": {}, "channel": None,
+             "update": None, "stopped": {}, "ann": {}, "pods": {}, "ns": [], "pub": None, "dl": 0}
+    if brk == "old-update":
+        fresh["update"] = {"phase": "Succeeded", "version": "v0.2.3", "nodes": [], "finished": True, "cancel": False}
+    if brk == "old-policy":
+        fresh["channel"] = "stable"
+    return fresh
 s = load()
 def save():
     json.dump(s, open(path, "w"))
@@ -950,6 +962,18 @@ self_test() {
 	if grep -q 'delete namespace '"$NS" "$tmp/green/calls.log"; then check ok "green run deletes its namespace"; else check no "green run deletes its namespace"; fi
 	if pgrep -f "$tmp/green/server/index.py" >/dev/null 2>&1; then check no "green run stops its index"; else check ok "green run stops its index"; fi
 
+	f="$tmp/green/calls.log"
+	v="$(grep -n 'kubectl delete updates\.' "$f" | cut -d: -f1 | tr '\n' ' ')"
+	u="$(grep -n 'update apply --yes' "$f" | head -1 | cut -d: -f1)"
+	check "$([ -n "$u" ] && [ "${v%% *}" -gt "$u" ] && [ "${v#* }" = "" ] && echo ok)" "green run deletes the Update once, after it created one (deleted at line $v, created at $u)"
+	check "$([ "$(grep -c 'kubectl delete updatepolic' "$f")" = 1 ] && echo ok)" "green run deletes the UpdatePolicy once"
+	for brk in old-update old-policy; do
+		out="$(run_fake "$tmp/$brk" "$brk" 47998 "$tmp/$brk-ev")" && code=0 || code=$?
+		case "$out" in *"predate"*) ;; *) code="no reason given" ;; esac
+		check "$([ "$code" = 2 ] && [ ! -e "$tmp/$brk-ev" ] && echo ok)" "$brk: refused, exit 2, nothing created (got $code)"
+		if grep -Eq ' (stop|install|update apply|kubectl delete)( |$)' "$tmp/$brk/calls.log"; then check no "$brk: the rig untouched, nothing deleted"; else check ok "$brk: the rig untouched, nothing deleted"; fi
+	done
+
 	# The negative controls: each property broken alone reds its own leg, exit 1, and the
 	# rig is still put back on this tree's build. They run side by side: each is a full run.
 	port=47901
@@ -983,6 +1007,7 @@ self_test() {
 		cat "$f"
 		if grep -q '^FAIL' "$f"; then bad=1; fi
 	done
+	if grep -Eq 'kubectl delete (updates\.|updatepolic)' "$tmp/b-no-updates-row/calls.log"; then check no "a run stopped before any roll deletes no Update or UpdatePolicy"; else check ok "a run stopped before any roll deletes no Update or UpdatePolicy"; fi
 	rm -rf "$tmp"
 
 	if [ "$bad" = 0 ]; then echo "B1240 self-test: green"; else echo "B1240 self-test: RED"; fi
@@ -1105,6 +1130,10 @@ fi
 if kc get namespace "$NS" >/dev/null 2>&1 </dev/null; then
 	refuse "namespace $NS already exists: a leftover run, or someone else's; it is left alone"
 fi
+RECORDS="$(kc get updates.updates.k3sm.io,updatepolicies.updates.k3sm.io -o name </dev/null 2>/dev/null)" || refuse "cannot list the Updates and UpdatePolicies"
+if [ -n "$RECORDS" ]; then
+	refuse "these predate the run and a roll would replace them: $(tr '\n' ' ' <<<"$RECORDS")(see --help); remove them yourself if they can go"
+fi
 FOREIGN_BEFORE="$(printf '%s' "$DOC" | J '"; ".join(i["metadata"]["name"]+": "+foreign(i) for i in sorted(d["items"], key=lambda i: i["metadata"]["name"]))')"
 
 mkdir -p "$EVIDENCE/scripts" "$EVIDENCE/pods" "$EVIDENCE/manifests" "$SETS"
@@ -1146,6 +1175,9 @@ not_reached() {
 }
 
 RIG_TOUCHED=0
+# What this run may delete at the end: the preflight refused any that were already here.
+RUN_UPDATE=0
+RUN_POLICY=0
 INDEX_UP=0
 PUT_BACK=0
 
@@ -1364,6 +1396,7 @@ apply_roll() {
 		log "the forward to the worker's loopback is down"
 		return 1
 	}
+	RUN_UPDATE=1
 	k update apply --yes "$@" </dev/null >>"$EVIDENCE/apply.log" 2>&1
 }
 # wait_node_phase <node> <phase> <budget>: 0 once the node reports it. 1 when the roll ended
@@ -1456,8 +1489,6 @@ leg_clean() {
 		return 1
 	}
 	k update apply --clear-pin </dev/null >>"$RUNLOG" 2>&1 || true
-	kc delete updates.updates.k3sm.io current --ignore-not-found </dev/null >>"$RUNLOG" 2>&1 || true
-	kc delete updatepolicies.updates.k3sm.io cluster --ignore-not-found </dev/null >>"$RUNLOG" 2>&1 || true
 	now="$(kc get updates.updates.k3sm.io,updatepolicies.updates.k3sm.io -o name </dev/null 2>/dev/null || true)"
 	log "installed: server $(rsh "$SERVER" "$K3SM_BIN" version </dev/null | sed -n 1p); worker $(rsh "$WORKER" "$K3SM_BIN" version </dev/null | sed -n 1p)"
 	if both_on "$TAG_BASE" && [ -z "$now" ]; then
@@ -1533,6 +1564,7 @@ leg_stable() {
 
 leg_set_rc() {
 	local out ch deadline w
+	RUN_POLICY=1
 	if ! out="$(k update channel rc </dev/null 2>&1)"; then
 		leg r.1 no "k3sm update channel rc failed: $(cut -c1-200 <<<"$out")"
 		return 1
@@ -1938,8 +1970,8 @@ put_back() {
 		{
 			k update apply --clear-pin
 			kc delete namespace "$NS" --ignore-not-found --wait=true --timeout=120s
-			kc delete updates.updates.k3sm.io current --ignore-not-found
-			kc delete updatepolicies.updates.k3sm.io cluster --ignore-not-found
+			if [ "$RUN_UPDATE" = 1 ]; then kc delete updates.updates.k3sm.io current --ignore-not-found; fi
+			if [ "$RUN_POLICY" = 1 ]; then kc delete updatepolicies.updates.k3sm.io cluster --ignore-not-found; fi
 		} </dev/null >>"$RUNLOG" 2>&1
 		log "installed: server $(rsh "$SERVER" "$K3SM_BIN" version </dev/null | sed -n 1p); worker $(rsh "$WORKER" "$K3SM_BIN" version </dev/null | sed -n 1p)"
 	fi
