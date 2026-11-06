@@ -283,7 +283,7 @@ LAB_STEPS=(
 	"d.3|store diff, zot's store against the new release's: no file that is not zot-shaped, the databases untouched"
 	"e.1|rolled back to the old set: worker, then server; both Ready on it; zot serving"
 	"e.2|zot serves every recorded image by digest"
-	"e.3|zot GCs that store: a successful GC report on every run repository, none unsuccessful"
+	"e.3|zot GCs that store: a report in the window is judged (failed is red); none is recorded, and e.5 proves GC under zot"
 	"e.4|store diff, zot's store against the store after the rollback: no file that is not zot-shaped"
 	"e.5|the --rollback-leg (run beside the leg since p.0): zot takes back a deduped store"
 	"f.1|cleanup: the namespace, every run tag and repository, the remote and local scratch"
@@ -308,13 +308,18 @@ usage: K3SM_LAB=1 hack/acceptance/B1027.sh --lab \
                 absent (default /tmp/b1027-<run>-server and -worker); removed at the end
   --gc-wait     seconds from the new server's start to wait for its first GC sweep
                 (default 4500: the sweep comes one grace plus a sixtieth after start)
-  --zot-gc-wait seconds to wait, after the rollback, for zot's GC report (default 1800)
+  --zot-gc-wait seconds to wait, after the rollback, for zot's GC report (default 1800);
+                no report in it is not a failure (see e.3 below)
   --buildx-host where the buildx push goes (default localhost:6451, the push gate)
 
 The run installs the old set on both Macs (worker first), pushes under zot, rolls the
 new set (worker first, then the server: the item and docs/m23-plan.md resolution 21
 agree), checks the verbs, pods and a GC cycle, rolls back to the old set and has zot
-serve and GC the store. It cleans up everything it created, green or red, and LEAVES
+serve the store. A zot GC report that appears within --zot-gc-wait is judged
+(a failed GC or an error is red); the released zot collects every 6h, so when none
+appears the run records "no zot GC cycle in the window; GC under zot is proven by
+e.5" and e.3 passes on that basis. e.5 is the --rollback-leg, which runs zot's GC
+with short intervals over a k3sm-written store; a red e.5 fails the leg. It cleans up everything it created, green or red, and LEAVES
 THE RIG ON THE OLD SET (or wherever a red step stopped it). Restoring main is the
 caller's step: install main's set on the worker, poll the join port, mint a 5m token,
 rejoin, then the server, per .claude/rules/lab-rig.md.
@@ -1164,16 +1169,29 @@ s_e3() {
 		[ "$SECONDS" -lt "$deadline" ] || break
 		sleep "$POLL"
 	done
-	[ -z "$pending" ] || {
-		why "zot reported no GC within ${ZOT_GC_WAIT}s on:$pending"
-		return 1
-	}
-	for r in $RUN_REPOS; do [ "$(zot_gc_result "$EVIDENCE/e.3-registry.log" "$P/$r")" = ok ] || bad="$bad $r"; done
+	# The released zot collects every 6h, so a window may hold no cycle. A report
+	# that came is judged; none is recorded, and e.5 (short intervals) proves GC of a
+	# k3sm-written store under zot. A red e.5 still fails the leg.
+	local seen=""
+	for r in $RUN_REPOS; do
+		case "$(zot_gc_result "$EVIDENCE/e.3-registry.log" "$P/$r")" in
+		ok) seen="$seen $r" ;;
+		failed) bad="$bad $r" ;;
+		esac
+	done
 	[ -z "$bad" ] || {
 		why "zot's GC failed on:$bad"
 		return 1
 	}
-	DETAIL="zot GC ok on every run repository"
+	if grep -q '"level":"error"' "$EVIDENCE/e.3-registry.log"; then
+		why "zot logged an error after the rollback (e.3-registry.log)"
+		return 1
+	fi
+	if [ -z "$seen" ]; then
+		DETAIL="no zot GC cycle in the window; GC under zot is proven by e.5"
+		return 0
+	fi
+	DETAIL="zot GC ok on:$seen${pending:+; no report in the window on:$pending}"
 }
 s_e4() {
 	snapshot rollback || return 1
@@ -1521,8 +1539,9 @@ if [ -f "$S/gc-armed" ] && [ "$n" -ge "$(cat "$S/gc-armed")" ]; then
 fi
 if [ -f "$S/zot-armed" ]; then
 	rm -f "$S/zot-armed"
-	for r in $(sed 's/:.* .*//' "$S/tags" | sort -u); do
-		printf '{"level":"info","message":"gc successfully completed for %s/%s","module":"gc"}\n' "$FAKE_STORE" "$r" >>"$FAKE_RLOG"
+	case "${FAKE_ZOT_GC:-ok}" in ok) w=successfully ;; failed) w=unsuccessfully ;; *) w="" ;; esac
+	[ -z "$w" ] || for r in $(sed 's/:.* .*//' "$S/tags" | sort -u); do
+		printf '{"level":"info","message":"gc %s completed for %s/%s","module":"gc"}\n' "$w" "$FAKE_STORE" "$r" >>"$FAKE_RLOG"
 	done
 fi
 digest_of() { awk -v r="$1" '$1 == r { print $2 }' "$S/tags"; }
@@ -1689,7 +1708,7 @@ lab_fake_run() {
 	env PATH="$d/bin:$PATH" HOME="$d/home" TMPDIR="$d/tmp" K3SM_LAB="${FAKE_LAB-1}" \
 		FAKE_STATE="$d/state" FAKE_SERVER=srv FAKE_K3SM="$d/bin/k3sm" FAKE_KUBECTL="$d/bin/kubectl" \
 		FAKE_STORE="$d/data/server/registry" FAKE_RLOG="$d/data/server/registry.log" FAKE_MUTATE="$mut" \
-		FAKE_GC_FAILED="${FAKE_GC_FAILED:-0}" FAKE_LEG_RC="${FAKE_LEG_RC:-0}" \
+		FAKE_GC_FAILED="${FAKE_GC_FAILED:-0}" FAKE_LEG_RC="${FAKE_LEG_RC:-0}" FAKE_ZOT_GC="${FAKE_ZOT_GC:-ok}" \
 		K3SM_B1027_K3SM="$d/bin/k3sm" K3SM_B1027_DATA_ROOT="$d/data" K3SM_B1027_HELLO="$d/hello" \
 		K3SM_B1027_ROLLBACK_LEG="$d/bin/rollback-leg" K3SM_B1027_POLL=0.05 K3SM_B1027_STEP_TIMEOUT=60 \
 		K3SM_B1027_READY_TIMEOUT=5 K3SM_B1027_POD_TIMEOUT=5 K3SM_LAB_TOLERATE_KEYS= \
@@ -1795,6 +1814,7 @@ lab_self_test() {
 	lchk "lab clean: remote scratch removed" "$(find "$d" -maxdepth 1 -name 'remote-*' | grep -c .)" 0
 	lchk "lab clean: kubeconfig backups removed" "$(find "$d/home/.kube" -name 'config.b1027-*' | grep -c .)" 0
 	lchk "lab clean: IfNotPresent kept the cached digest" "$(grep -c 'IfNotPresent kept' "$d/evidence/run.log")" 1
+	lchk "lab clean: e.3 judged zot's reports" "$(grep -c '^PASS e.3 zot GC ok on:' "$d/evidence/run.log")" 1
 
 	d="$t/digest"
 	lab_fake_run "$d" digest
@@ -1816,6 +1836,16 @@ lab_self_test() {
 	FAKE_GC_FAILED=1 lab_fake_run "$d" ""
 	lchk "lab gc failed: exit" "$(cat "$d/rc")" 1
 	lchk "lab gc failed: d.2 fails" "$(grep -c '^FAIL d.2' "$d/evidence/run.log")" 1
+
+	d="$t/zotgc-failed"
+	FAKE_ZOT_GC=failed lab_fake_run "$d" ""
+	lchk "lab zot GC failed: exit" "$(cat "$d/rc")" 1
+	lchk "lab zot GC failed: e.3 fails" "$(grep -c "^FAIL e.3 zot's GC failed on:" "$d/evidence/run.log")" 1
+
+	d="$t/zotgc-none"
+	FAKE_ZOT_GC=none lab_fake_run "$d" ""
+	lchk "lab no zot GC in the window: exit" "$(cat "$d/rc")" 0
+	lchk "lab no zot GC in the window: recorded" "$(grep -c '^PASS e.3 no zot GC cycle in the window; GC under zot is proven by e.5' "$d/evidence/run.log")" 1
 
 	d="$t/leg"
 	FAKE_LEG_RC=1 lab_fake_run "$d" ""
