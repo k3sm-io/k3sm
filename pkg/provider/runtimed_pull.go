@@ -1159,15 +1159,14 @@ func (r *runtimedRuntime) retryParkedCreate(ctx context.Context, pod *corev1.Pod
 		return runtimev1.FailureReason_FAILURE_REASON_NOT_FOUND, "", nil
 	}
 	ctx = withPodIdentity(ctx, pod)
-	podIP, err := r.podIP(ctx, pod)
+	box, proceed, err := r.retryParkedBox(ctx, pod, t)
 	if err != nil {
-		return runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, "",
-			fmt.Errorf("allocate pod ip %s/%s: %w", pod.Namespace, pod.Name, err)
+		return runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, "", err
 	}
-	box, err := r.buildBox(ctx, pod, podIP)
-	if err != nil {
-		return runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, "",
-			fmt.Errorf("translate pod %s/%s: %w", pod.Namespace, pod.Name, err)
+	if !proceed {
+		// NOT_FOUND ends the schedule (pullClassNone), as a create that lands behind
+		// the delete does.
+		return runtimev1.FailureReason_FAILURE_REASON_NOT_FOUND, "", nil
 	}
 	resp, err := r.rt.CreatePod(ctx, &runtimev1.CreatePodRequest{Pod: box})
 	if err != nil {
@@ -1196,6 +1195,42 @@ func (r *runtimedRuntime) retryParkedCreate(ctx context.Context, pod *corev1.Pod
 	}
 	r.completeCreate(pod, t, resp.GetStatus())
 	return runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, "", nil
+}
+
+// retryParkedBox allocates and translates for a parked pod's retry, or reports not
+// to proceed once the pod's delete has begun. The worker's context ending does not
+// stop an allocation, which is keyed by the pod's UID and has no owner behind the
+// release. So the retry counts as in flight while it allocates, as an UpdatePod does:
+// the check and the count share r.mu, and quiesce marks the track before teardownPod
+// reads the count, so a delete either stops this retry here or leaves its release to
+// the end of this call (updateDone). The count ends before the RPC, which acquires
+// nothing here; commitParkedCreate answers a create that lands behind the delete.
+func (r *runtimedRuntime) retryParkedBox(ctx context.Context, pod *corev1.Pod, t *podTrack) (*runtimev1.PodBox, bool, error) {
+	if !r.beginParkedRetry(string(pod.UID), t) {
+		return nil, false, nil
+	}
+	defer r.updateDone(pod)
+	podIP, err := r.podIP(ctx, pod)
+	if err != nil {
+		return nil, false, fmt.Errorf("allocate pod ip %s/%s: %w", pod.Namespace, pod.Name, err)
+	}
+	box, err := r.buildBox(ctx, pod, podIP)
+	if err != nil {
+		return nil, false, fmt.Errorf("translate pod %s/%s: %w", pod.Namespace, pod.Name, err)
+	}
+	return box, true, nil
+}
+
+// beginParkedRetry counts a parked pod's retry in flight and reports true, or counts
+// nothing and reports false once the pod's delete has begun.
+func (r *runtimedRuntime) beginParkedRetry(id string, t *podTrack) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, deleted := r.deleteOwed[id]; deleted || trackDeleting(t) {
+		return false
+	}
+	r.beginUpdateLocked(id)
+	return true
 }
 
 // commitReason is WHY a create that has just landed could (or could not) be

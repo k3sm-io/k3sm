@@ -462,9 +462,9 @@ func TestUpdatePodWaitsOutFenceRelease(t *testing.T) {
 	x.r.fenceReleaseHook = func(string) {
 		once.Do(func() {
 			defer close(gotUpdate)
-			if err := x.r.DeletePod(ctx, x.pod.DeepCopy()); err != nil {
-				t.Errorf("DeletePod of the refused pod: %v", err)
-			}
+			x.r.mu.Lock()
+			delete(x.r.track, id)
+			x.r.mu.Unlock()
 			updated = startUpdate(ctx, x.r, x.pod.DeepCopy())
 			o.awaitParked(t, x.r, updated)
 		})

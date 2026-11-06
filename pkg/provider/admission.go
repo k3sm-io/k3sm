@@ -425,11 +425,11 @@ func (r *runtimedRuntime) createDone(pod *corev1.Pod, t *admitTicket) {
 	}
 }
 
-// updateDone ends one UpdatePod. A refusal may have landed behind it, with no
-// create in flight to reach CreatePod's fence, and a refused pod's delete frees
-// nothing; or a delete may have, leaving the rest of its teardown here. So the last
-// call out releases. The release runs with r.mu released and takes only its own
-// leaf locks.
+// updateDone ends one UpdatePod, or one parked retry's allocation (retryParkedBox).
+// A refusal may have landed behind it, with no create in flight to reach CreatePod's
+// fence, and a refused pod's delete frees nothing; or a delete may have, leaving the
+// rest of its teardown here. So the last call out releases. The release runs with
+// r.mu released and takes only its own leaf locks.
 func (r *runtimedRuntime) updateDone(pod *corev1.Pod) {
 	id := string(pod.UID)
 	r.mu.Lock()
@@ -467,6 +467,52 @@ func (r *runtimedRuntime) oweDeleteLocked(id string, owned *podTrack) {
 	r.deleteOwed[id] = &owedDelete{owned: owned}
 }
 
+// uidTombstoneCap bounds uidTombstones. An update is stale by the time between
+// Virtual Kubelet's GetPod and the update's check, a few provider calls at most,
+// while this many deletes on one node take far longer than that: a node runs on the
+// order of a hundred pods. At 36 bytes a UID it costs well under a megabyte.
+const uidTombstoneCap = 1024
+
+// uidTombstones is a bounded set of the UIDs of recent deletes, oldest evicted
+// first. A UID is never reused, so a hit is a fact about the pod for good, and an
+// eviction only returns that UID's update to the path it took before. The zero value
+// is usable. The owner guards it.
+type uidTombstones struct {
+	seen map[string]struct{}
+	ring []string
+	next int
+}
+
+// add records id, evicting the oldest entry once the set is at uidTombstoneCap.
+func (u *uidTombstones) add(id string) {
+	if _, ok := u.seen[id]; ok {
+		return
+	}
+	if u.seen == nil {
+		u.seen = map[string]struct{}{}
+	}
+	u.seen[id] = struct{}{}
+	if len(u.ring) < uidTombstoneCap {
+		u.ring = append(u.ring, id)
+		return
+	}
+	delete(u.seen, u.ring[u.next])
+	u.ring[u.next] = id
+	u.next = (u.next + 1) % uidTombstoneCap
+}
+
+// has reports whether id's delete is remembered.
+func (u *uidTombstones) has(id string) bool {
+	_, ok := u.seen[id]
+	return ok
+}
+
+// inFlightLocked reports whether a create or an update of pod id has not returned,
+// so it can still acquire by the pod's UID. The caller holds r.mu.
+func (r *runtimedRuntime) inFlightLocked(id string) bool {
+	return r.admitting[id] != 0 || r.updating[id] != 0
+}
+
 // claimFenceReleaseLocked decides, under r.mu, that the caller releases what pod
 // id's UID holds, and returns the claim to hand fenceRelease, or nil when it does
 // not. The call right after a claim is fenceRelease, with nothing between them that
@@ -474,13 +520,26 @@ func (r *runtimedRuntime) oweDeleteLocked(id string, owned *podTrack) {
 // release runs once.
 //
 // A release is owed by a refused pod something was acquired for, and by a delete
-// that landed behind an update. Everything released is keyed by the UID, so it
-// waits for the last in-flight create or update of the pod: an in-flight one still
-// acquires, and it reaches this decision itself when it ends. fenceReleasing,
+// that landed behind a create or an update. Everything released is keyed by the UID,
+// so it waits for the last in-flight create or update of the pod: an in-flight one
+// still acquires, and it reaches this decision itself when it ends. fenceReleasing,
 // published here, holds every new create and update until the release is over, so a
 // release in progress has none in flight beside it. The caller holds r.mu.
+//
+// "Once" covers what reaches this decision. Still open:
+//   - A create that failed and left no track, whose pod is then deleted with no
+//     container running, whether the delete came during the create or after it.
+//     Virtual Kubelet runs one call per pod key, removes such a pod from the apiserver
+//     without calling DeletePod (syncPodInProvider, node/podcontroller.go), and finds
+//     no track when the object goes, and the orphan reaper keys on tracks. What the
+//     create took stays until the daemon restarts or a refusal of the same UID.
+//   - A create whose RPC succeeds behind a delete: the guest the runtime built is not
+//     deleted again, unlike a parked retry's (commitParkedCreate). Its /32 is released.
+//   - An untracked update with no deletion stamp that is not behind a delete of its
+//     UID, or is behind one uidTombstones has evicted: it allocates as it always did,
+//     and only a later create, delete or refusal of the UID frees that.
 func (r *runtimedRuntime) claimFenceReleaseLocked(id string) *fenceClaim {
-	if r.admitting[id] != 0 || r.updating[id] != 0 || r.fenceReleasing[id] != nil {
+	if r.inFlightLocked(id) || r.fenceReleasing[id] != nil {
 		return nil
 	}
 	t := r.track[id]
@@ -521,6 +580,7 @@ func (r *runtimedRuntime) claimFenceReleaseLocked(id string) *fenceClaim {
 func (r *runtimedRuntime) forgetRejected(ctx context.Context, pod *corev1.Pod, t *podTrack) {
 	id := string(pod.UID)
 	r.mu.Lock()
+	r.tombstones.add(id)
 	switch {
 	case r.updating[id] != 0:
 		r.oweDeleteLocked(id, t)
