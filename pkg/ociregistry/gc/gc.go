@@ -201,6 +201,15 @@ func New(s *store.Store, o Options) (*Collector, error) {
 	return &Collector{s: s, grace: o.Grace, abandon: o.Abandon, now: o.Now, log: o.Log, start: o.Now()}, nil
 }
 
+// SetAfterMark sets fn to run between each repository's unlocked mark and its
+// locked sweep. It exists for callers outside this package that interleave a
+// request with a sweep (server tests); call it before Sweep.
+func (c *Collector) SetAfterMark(fn func(ref.Name)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.afterMark = fn
+}
+
 // Sweep runs one collection over every repository. A repository stopped by
 // a brake or an error is skipped, listed in the report's Stopped or Failed,
 // and named in the returned error; the others are still swept.

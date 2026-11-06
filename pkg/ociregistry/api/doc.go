@@ -79,7 +79,11 @@ limitations under the License.
 // answered from a stat. This does not stop a caller from keeping an untagged
 // object alive: one HEAD just past every half-grace does it. Knowing the
 // digest is the capability, as it is for the blob HEAD and as a push of the
-// same content would be. A touch that fails for any reason other than the
+// same content would be. Read access is therefore enough to write: a HEAD
+// takes the repository lock and sets the mtime of the object's inode, which
+// every repository linking the same content shares (a mount links it), so a
+// credential that may only pull keeps an object it can name alive in each of
+// those repositories. A touch that fails for any reason other than the
 // object being gone (a read-only or degraded store, a client that gave up
 // waiting for the lock) is logged and the HEAD answers 200: the read
 // succeeded, and the touch only protects a push that may follow. The object
@@ -90,7 +94,11 @@ limitations under the License.
 // grace before the PUT naming it, or HEADs on a store that cannot be written,
 // is not protected by that HEAD and can find the object reaped; a push that
 // fits in half the grace, the case the touch exists for, is protected as
-// before.
+// before. The protection is bounded the other way too: an object a HEAD
+// answered 200 for is kept for at least half the grace and at most one grace
+// after that HEAD (one grace when the HEAD touched it, what was left of its
+// grace when it did not), and a PUT later than that can find it reaped. The
+// HEAD narrows the window between itself and the PUT; it does not close it.
 //
 // GCGrace is required, as gc.Options.Grace is, and New refuses a server
 // without it. Whoever wires the server and the collector over one store must
