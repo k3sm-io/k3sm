@@ -25,9 +25,11 @@
 #                            and the run-as user must be able to traverse it.
 #   K3SM_LLAMA_PROFILE       required: the sandbox profile a GPU pod is rendered
 #                            with, as text, whose writable paths include the
-#                            work directory. It must contain the shipped two-rule
-#                            iokit-open grant byte for byte; if it does not, the
-#                            script stops before running anything.
+#                            work directory. Its GPU stanza (the ";; gpu:" comment
+#                            through the IOSurfaceRootUserClient line) must equal
+#                            the shipped one byte for byte; if it does not, the
+#                            script stops before running anything. Only that
+#                            stanza is compared, not the rest of the profile.
 #   K3SM_LLAMA_RUN_AS        optional: a user to run the engine as, through
 #                            sudo -n -u. Default: the current user.
 #   K3SM_LLAMA_ENGINE_ENV    optional: extra NAME=value words for the engine's
@@ -36,6 +38,16 @@
 #   K3SM_LLAMA_GGUF          optional: a local copy of the pinned GGUF, used
 #                            instead of a download. It is verified either way.
 #   K3SM_LLAMA_JOBS          optional: build parallelism. Default 8.
+#
+# Environment differs from the recorded run: the recorded Q1 and Q2 runs also
+# injected the pod's two DYLD shims (path rebasing, getaddrinfo) and set the
+# K3SM_* variables and the semaphore prefix. This script launches the engine
+# with only HOME, TMPDIR, PATH and K3SM_LLAMA_ENGINE_ENV, so it reproduces Q1
+# and Q2 under a different environment; supply the shims and variables through
+# K3SM_LLAMA_ENGINE_ENV to match. The plus-shadercache variants write to the
+# run-as user's per-user Metal cache (DARWIN_USER_CACHE_DIR), outside the work
+# directory; the script removes only what it finds new there after those two
+# runs and leaves anything that existed before.
 #
 # The source commit and the GGUF digest are pinned below. Neither is read from
 # the environment, and the run stops if either does not verify.
@@ -68,10 +80,27 @@ IOKIT_BLOCK='(allow iokit-open
   (iokit-registry-entry-class "AGXDeviceUserClient")
   (iokit-registry-entry-class "IOSurfaceRootUserClient"))'
 
+# The shipped GPU stanza as the profile writes it, comment block included. It
+# is the text the golden pod profile carries; only this stanza is compared, the
+# rest of a pod profile differs per node and per pod.
+GPU_STANZA=";; gpu: Metal device access (allow_gpu) $(printf '\342\200\224') the two exact IOKit
+;; user-client classes a Metal device open requires. Family-independent
+;; and lab-derived by ablation; no mach-lookup, no iokit-get-properties,
+;; no CVMS read, and NO shader-cache write are needed or granted.
+(allow iokit-open
+  (iokit-registry-entry-class \"AGXDeviceUserClient\")
+  (iokit-registry-entry-class \"IOSurfaceRootUserClient\"))"
+
 die() { echo "llamacpp-measure: FAIL: $*" >&2; exit 1; }
 note() { printf '\n==> %s\n' "$*"; }
 
 # ---- pure parts (exercised by --self-test) ---------------------------------
+
+# gpu_stanza FILE: the lines from the ";; gpu:" comment through the first
+# IOSurfaceRootUserClient line, or nothing when there is no such comment.
+gpu_stanza() {
+	awk '/^;; gpu:/ {f=1} f {print} f && /IOSurfaceRootUserClient/ {exit}' "$1"
+}
 
 # verify_sha FILE WANT: succeeds only when FILE's SHA-256 is WANT.
 verify_sha() {
@@ -109,6 +138,12 @@ self_test() {
 	printf 'abc' >"$t/f"
 	verify_sha "$t/f" ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad || die "self-test: a correct digest was refused"
 	verify_sha "$t/f" "$GGUF_SHA256" && die "self-test: a wrong digest was accepted"
+
+	printf '(version 1)\n%s\n(deny default)\n' "$GPU_STANZA" >"$t/p.sb"
+	[ "$(gpu_stanza "$t/p.sb")" = "$GPU_STANZA" ] || die "self-test: gpu_stanza did not return the stanza"
+	sed 's/AGXDeviceUserClient/AGXOther/' "$t/p.sb" >"$t/q.sb"
+	[ "$(gpu_stanza "$t/q.sb")" != "$GPU_STANZA" ] || die "self-test: an altered stanza compared equal"
+	[ -z "$(gpu_stanza "$t/f")" ] || die "self-test: a file with no stanza returned one"
 
 	printf 't_ms,footprint_mib,resident_mib\n0,519.6,945.2\n100,522.1,947.9\n200,521.0,947.0\n' >"$t/c.csv"
 	[ "$(peak_footprint "$t/c.csv")" = 522.1 ] || die "self-test: peak_footprint"
@@ -318,8 +353,15 @@ ablate() {
 	p="$(variant plus-cvms --add '(allow file-read* (subpath "/private/var/db/CVMS"))')"
 	serve_and_probe plus-cvms "$p"
 	p="$(variant plus-shadercache --add "(allow file-read* file-write* (subpath \"${cache%/}\"))")"
+	as_user find "${cache%/}" 2>/dev/null | LC_ALL=C sort >"$WORKDIR/cache.before" || true
 	serve_and_probe plus-shadercache "$p"
 	serve_and_probe plus-shadercache-warm "$p"
+	# Remove only what these two runs created in the per-user cache.
+	as_user find "${cache%/}" 2>/dev/null | LC_ALL=C sort >"$WORKDIR/cache.after" || true
+	LC_ALL=C comm -13 "$WORKDIR/cache.before" "$WORKDIR/cache.after" | LC_ALL=C sort -r |
+		while IFS= read -r created; do
+			case "$created" in "${cache%/}"/?*) as_user rm -rf -- "$created" ;; esac
+		done
 }
 
 memory() { # memory NAME ARGS...: footprint at ready and after a completion
@@ -409,7 +451,9 @@ measure() {
 	chmod 0644 "$PROFILE"
 	# Fail closed: the profile under test must carry the shipped grant, exactly.
 	python3 -I "$M25/variant.py" "$PROFILE" /dev/null --remove "$IOKIT_BLOCK" ||
-		die "K3SM_LLAMA_PROFILE does not contain the shipped iokit-open grant byte for byte"
+		die "K3SM_LLAMA_PROFILE does not contain the iokit-open grant text the variants remove"
+	[ "$(gpu_stanza "$PROFILE")" = "$GPU_STANZA" ] ||
+		die "K3SM_LLAMA_PROFILE's GPU stanza (comment block through the IOSurfaceRootUserClient line) differs from the shipped one"
 
 	pin_source
 	build

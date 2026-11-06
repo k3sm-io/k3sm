@@ -5,7 +5,11 @@ Run on 2026-11-06 against two Macs, called here the server (M1-family, macOS
 hand-delivered `llama-server` was run as a pod under the shipped profile, and
 under variants of that profile started with `sandbox-exec` as the same
 unprivileged user the pods run as, because a pod cannot be given a variant
-profile. The part of this that needs no cluster is reproduced by
+profile. Those rule removals therefore ran inside a gui launchd bootstrap,
+whereas a pod runs in the system domain; only the shipped profile and the
+no-GPU case ran in real pods. Results such as "`IOSurfaceRootUserClient` is not
+required" are from that proxy, since IOKit and Mach paths could differ by domain
+and by the injected shims. The part of this that needs no cluster is reproduced by
 `hack/acceptance/llamacpp-measure.sh --measure`; what it does not reproduce is
 listed at the end.
 
@@ -86,12 +90,14 @@ sha256 above and `x-repo-commit` equal to the revision.
   by removing those.
 - **Shipping note.** `IOSurfaceRootUserClient` not being needed here is a
   record, not a proposal. Removing it from the shipped stanza would affect the
-  other engine that stanza was measured for, and is a separate decision.
+  other engine that stanza was measured for, and is a separate decision;
+  narrowing the shared stanza would need an MLX re-measurement.
 
-The rendered profile was compared with the golden profile with `diff`. No hunk
-touches the `iokit-open` stanza; every difference is pod-specific (paths,
-network allowances, the DNS lookups, the semaphore prefix, socket denials). So
-the shipped stanza is identical to the golden's, as read from that diff.
+The Metal stanza (the comment block through the `IOSurfaceRootUserClient` line)
+was extracted from the golden `pod-gpu.golden.sb` and from the base profile
+rendered on each Mac, and the three extracts are byte-identical (same SHA-256).
+The whole files differ, as expected, in network and DNS lookups, the semaphore
+prefix, socket denies and pod paths.
 
 ### 2. What is the full denial list over cold load, first token, second slot and idle? Does any stop or degrade the engine?
 
@@ -343,7 +349,11 @@ the shipped stanza is identical to the golden's, as read from that diff.
   (Accelerate, Foundation, Metal, MetalKit, CoreFoundation, libc++, libobjc,
   libSystem). `GGML_BACKEND_DL` is `OFF` in the build cache, and the binary links no backend library.
 - **Inferred.** "Needs no entitlement" rests on the binary running without one
-  and on the empty `codesign` output.
+  and on the empty `codesign` output. It shows the engine runs with no
+  entitlement as an ad-hoc, linker-signed binary built outside the sandbox. It
+  does not show that the binary passes `require-signed` or `require-notarized`,
+  or that the plan's no-hardened-runtime assertion holds for what ships; that
+  falls to L2 and L6.
 
 ### 17. How much memory does the GGUF need to serve? What are the two ceilings?
 
@@ -411,3 +421,11 @@ question 7. It does not reproduce the pod-level memory limits (question 4's
 second half), the confined builds (question 3), real-pod denials by phase,
 the Go verifier (question 13), `-hf` (question 12), or the machine ceilings
 (question 17).
+
+It reproduces Q1 and Q2 under a different environment: the recorded runs also
+injected the pod's DYLD shims (path rebasing, getaddrinfo) and set the `K3SM_*`
+variables and the semaphore prefix, which the script omits unless they are
+passed in `K3SM_LLAMA_ENGINE_ENV`. Its profile check compares the GPU stanza
+against the shipped one, not the whole profile. The `plus-shadercache` variants
+write to the run-as user's per-user Metal cache outside the work directory; the
+script removes only the entries those two runs created there.
