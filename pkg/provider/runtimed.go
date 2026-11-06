@@ -1978,6 +1978,9 @@ func (r *runtimedRuntime) fenceRelease(pod *corev1.Pod, c *fenceClaim) {
 	}
 	r.releasePodNetwork(pod)
 	if c.del != nil {
+		if c.del.refusal {
+			r.removePodLogs(pod)
+		}
 		r.forgetTorndown(pod, c.del.owned)
 		return
 	}
@@ -2241,14 +2244,20 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 // delete's RPC, so unmarked means that RPC is still to come and will reach what the
 // create built. A delete that began on a replacement of t marks only the replacement.
 // Deleting again when the first delete did reach it is a no-op.
+//
+// A refusal owed is no delete: the create that landed keeps its guest, and the refusal
+// is withdrawn in the same decision.
 func (r *runtimedRuntime) createBehindDelete(id string, t *podTrack) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, owed := r.deleteOwed[id]; owed || trackDeleting(t) {
+	if del := r.deleteOwed[id]; (del != nil && !del.refusal) || trackDeleting(t) {
 		return true
 	}
-	live := r.track[id]
-	return live != nil && trackDeleting(live)
+	if live := r.track[id]; live != nil && trackDeleting(live) {
+		return true
+	}
+	r.withdrawRefusalLocked(id, t)
+	return false
 }
 
 // untrackRejectedCreate forgets a pod runtimed refused to create at the pod
@@ -2262,10 +2271,12 @@ func (r *runtimedRuntime) createBehindDelete(id string, t *podTrack) bool {
 // so they are the replacement's now, and its own attempt decides what becomes of them.
 // Only this create's workers go.
 //
-// A delete owed already has the release. So does an UpdatePod in flight, which can
-// still acquire by the pod's UID: it reads the refusal as a delete owed and stops,
-// and the last call out frees what the pod holds and forgets the track. A claim
-// worker's create can land here beside one, since it runs off VK's queue.
+// A delete owed already has the release, and has removed the log tree. So does an
+// UpdatePod in flight, which can still acquire by the pod's UID: it reads the refusal
+// as a delete owed and stops, and the last call out frees what the pod holds, its log
+// tree too, and forgets the track. A claim worker's create can land here beside one,
+// since it runs off VK's queue, and another create that lands first withdraws this
+// refusal (withdrawRefusalLocked).
 func (r *runtimedRuntime) untrackRejectedCreate(pod *corev1.Pod, t *podTrack) {
 	id := string(pod.UID)
 	r.mu.Lock()
@@ -2277,7 +2288,7 @@ func (r *runtimedRuntime) untrackRejectedCreate(pod *corev1.Pod, t *podTrack) {
 	switch {
 	case replaced || owed:
 	case left:
-		r.oweDeleteLocked(id, t)
+		r.oweRefusalLocked(id, t)
 	case removed:
 		delete(r.track, id)
 	}
@@ -2288,12 +2299,10 @@ func (r *runtimedRuntime) untrackRejectedCreate(pod *corev1.Pod, t *podTrack) {
 	t.cancelRestarts()
 	t.cancelPulls()
 	t.cancelPostStart()
-	if replaced {
+	if replaced || left {
 		return
 	}
-	if !left {
-		r.releasePodNetwork(pod)
-	}
+	r.releasePodNetwork(pod)
 	r.removePodLogs(pod)
 }
 
@@ -3257,9 +3266,10 @@ func (r *runtimedRuntime) lookup(namespace, name string) (string, metav1.Time, *
 // weighed through preferTrack, so the answer is independent of map iteration
 // order. The caller holds r.mu.
 //
-// A track whose delete is owed answers for no name. Its pod is stopped and gone from
-// the apiserver, and it stays only for the call still out of the pod, which reads it
-// by UID (claimFenceReleaseLocked). Answering would make Virtual Kubelet's GetPod send
+// A track whose delete is owed answers for no name, and a refusal owed is no delete.
+// The pod is stopped and gone from the apiserver, and the track stays only for the
+// call still out of the pod, which reads it by UID (claimFenceReleaseLocked). Answering
+// would make Virtual Kubelet's GetPod send
 // a same-name successor down UpdatePod instead of CreatePod (createOrUpdatePod,
 // node/pod.go). A delete only begun still answers: its RPC can fail, and the retry
 // rests on GetPod finding the pod.
@@ -3272,7 +3282,7 @@ func (r *runtimedRuntime) lookupTrackLocked(namespace, name string) (string, *po
 		if t.pod.Namespace != namespace || t.pod.Name != name {
 			continue
 		}
-		if del := r.deleteOwed[id]; del != nil && (del.owned == nil || del.owned == t) {
+		if del := r.deleteOwed[id]; del != nil && !del.refusal && (del.owned == nil || del.owned == t) {
 			continue
 		}
 		if best == nil || preferTrack(t, best) == t {

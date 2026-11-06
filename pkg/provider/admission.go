@@ -457,8 +457,11 @@ type fenceClaim struct {
 
 // owedDelete is the rest of a teardown left to the last UpdatePod out. owned
 // selects the track to forget, as in teardownPod; nil is whatever the id holds.
+// refusal says no delete began: a refused create left this beside an update, the pod
+// is still in the apiserver and a create of it can still land (withdrawRefusalLocked).
 type owedDelete struct {
-	owned *podTrack
+	owned   *podTrack
+	refusal bool
 }
 
 // oweDeleteLocked leaves the rest of a delete to the last call out. The caller
@@ -468,6 +471,31 @@ func (r *runtimedRuntime) oweDeleteLocked(id string, owned *podTrack) {
 		r.deleteOwed = map[string]*owedDelete{}
 	}
 	r.deleteOwed[id] = &owedDelete{owned: owned}
+}
+
+// oweRefusalLocked leaves the rest of a refused create to the last call out, with
+// the track it installed. A delete already owed stays one. The caller holds r.mu.
+func (r *runtimedRuntime) oweRefusalLocked(id string, owned *podTrack) {
+	if _, owed := r.deleteOwed[id]; owed {
+		return
+	}
+	r.oweDeleteLocked(id, owned)
+	r.deleteOwed[id].refusal = true
+}
+
+// withdrawRefusalLocked answers a create of pod id that has landed, when a refusal of
+// another create is what is owed. The runtime holds the pod, so nothing is left for
+// the refusal to free, and the track of the create that landed takes the refused
+// one's place. The caller holds r.mu.
+func (r *runtimedRuntime) withdrawRefusalLocked(id string, t *podTrack) {
+	del := r.deleteOwed[id]
+	if del == nil || !del.refusal {
+		return
+	}
+	delete(r.deleteOwed, id)
+	if r.track[id] == del.owned {
+		r.track[id] = t
+	}
 }
 
 // uidTombstoneCap bounds uidTombstones. An update is stale by the time between

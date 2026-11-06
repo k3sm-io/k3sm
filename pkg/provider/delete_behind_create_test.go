@@ -504,3 +504,116 @@ func TestCreateLandingBehindDeleteIsDeletedAgain(t *testing.T) {
 		}
 	})
 }
+
+// TestCreateLandingBehindRefusalKeepsItsGuest: a re-create the runtime refuses, with
+// an update out, owes the release to the last call out, and no delete has begun. A
+// first create of the same UID that then lands has built the pod nothing refused.
+// Fails when a landing create reads any owed entry as a delete: the guest is killed.
+// Fails too when the refusal is left standing: the guest loses its /32 to the release.
+func TestCreateLandingBehindRefusalKeepsItsGuest(t *testing.T) {
+	ctx := context.Background()
+	x := newTerminalUpdateFixture(t, compressorAt(10))
+	p := probeNetwork(x)
+	id := string(x.pod.UID)
+	release := x.f.holdCreate()
+	defer release()
+
+	created := make(chan error, 1)
+	go func() { created <- x.r.CreatePod(ctx, x.pod.DeepCopy()) }()
+	waitRestart(t, "the create's RPC to be entered", func() bool { return x.f.createCount() == 1 })
+	stopHoldingCreates(x.f)
+	first := x.r.trackByID(id)
+	o := overlapUpdates(t, x.r, true)
+	updated := startUpdate(ctx, x.r, x.pod.DeepCopy())
+	awaitClosed(t, o.checked, "the update to pass its check")
+
+	x.f.pushCreate(podLevelRefusal())
+	if err := x.r.CreatePod(ctx, x.pod.DeepCopy()); err == nil {
+		t.Fatal("the re-create succeeded; the test needs it refused")
+	}
+	x.r.mu.Lock()
+	del := x.r.deleteOwed[id]
+	x.r.mu.Unlock()
+	if del == nil {
+		t.Fatal("the refusal owed nothing, so the test proves nothing")
+	}
+	want := x.ipam.allocations()[id]
+	logs := podlogs.BuildPodLogsDirectory(x.r.logGC.PodLogsDir, x.pod.Namespace, x.pod.Name, id)
+
+	release()
+	if err := awaitErr(t, created, "the create"); err != nil {
+		t.Fatalf("the create = %v, want nil", err)
+	}
+	o.resume()
+	_ = awaitErr(t, updated, "the update") // the fake serves no UpdatePod; only the outcome below matters
+
+	if n := compensatingCount(x.r); n != 0 {
+		t.Errorf("compensating deletes = %d, want 0: nothing deleted this pod", n)
+	}
+	x.f.mu.Lock()
+	deletes, built := x.f.deleteCalls, x.f.created[id] != nil
+	x.f.mu.Unlock()
+	if deletes != 0 || !built {
+		t.Errorf("runtime DeletePod calls = %d, guest built = %v, want 0 and true", deletes, built)
+	}
+	if ip, ok := x.ipam.allocations()[id]; !ok || ip != want {
+		t.Errorf("the pod holds /32 %v (held %v), want %v", ip, ok, want)
+	}
+	if _, n := p.counts(); n != 0 {
+		t.Errorf("releases = %d, want 0 for a running pod", n)
+	}
+	if tr := x.r.trackByID(id); tr != first {
+		t.Errorf("the pod's track = %s, want the one whose create landed", trackState(tr))
+	}
+	if _, err := os.Stat(logs); err != nil {
+		t.Errorf("the running pod's log tree: %v", err)
+	}
+
+	if err := x.r.DeletePod(ctx, x.pod.DeepCopy()); err != nil {
+		t.Fatalf("DeletePod: %v", err)
+	}
+	x.assertForgotten(t)
+	if _, n := p.counts(); n != 1 {
+		t.Errorf("releases after the delete = %d, want 1", n)
+	}
+}
+
+// TestRefusedTrackBesideUpdateAnswersItsName: a refusal beside an update leaves its
+// track in place with its object still listed, and no successor can hold the name, so
+// it answers name reads as it did. Only a delete hides a track
+// (TestSuccessorReachesCreateBesideDeleteOwed).
+//
+// Virtual Kubelet does not read GetPodStatus by name to write a status for this
+// provider: syncProviderWrapper, whose NotFound marks a listed pod Failed, wraps only
+// a provider that is no PodNotifier, and VKProvider is one.
+func TestRefusedTrackBesideUpdateAnswersItsName(t *testing.T) {
+	var _ vkadapter.PodNotifier = (*VKProvider)(nil)
+
+	ctx := context.Background()
+	x := newTerminalUpdateFixture(t, compressorAt(10))
+	x.f.pushCreate(podLevelRefusal())
+	release := x.f.holdCreate()
+	defer release()
+
+	created := make(chan error, 1)
+	go func() { created <- x.r.CreatePod(ctx, x.pod.DeepCopy()) }()
+	waitRestart(t, "the create's RPC to be entered", func() bool { return x.f.createCount() == 1 })
+	o := overlapUpdates(t, x.r, true)
+	updated := startUpdate(ctx, x.r, x.pod.DeepCopy())
+	awaitClosed(t, o.checked, "the update to pass its check")
+	release()
+	if err := awaitErr(t, created, "the create"); err == nil {
+		t.Fatal("the create succeeded; the test needs it refused")
+	}
+	if got, err := x.r.GetPod(ctx, x.pod.Namespace, x.pod.Name); err != nil || got.UID != x.pod.UID {
+		t.Errorf("GetPod with a refusal owed = %v, %v, want the pod", got, err)
+	}
+	if _, err := x.r.GetPodStatus(ctx, x.pod.Namespace, x.pod.Name); err != nil {
+		t.Errorf("GetPodStatus with a refusal owed: %v", err)
+	}
+	o.resume()
+	if err := awaitErr(t, updated, "the update"); err != nil {
+		t.Errorf("the update: %v", err)
+	}
+	x.assertForgotten(t)
+}
