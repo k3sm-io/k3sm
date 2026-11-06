@@ -2232,8 +2232,12 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 // level. It is the CreatePod-side mirror of DeletePod's bookkeeping for a pod
 // that never existed in the runtime: the track is removed so VK's retry reaches
 // CreatePod again, the goroutines the track could own are cancelled, and the
-// pod's /32 and log tree are released. Only the track this create installed is
-// removed — a track replaced since (a concurrent re-create) is left alone.
+// pod's /32 and log tree are released.
+//
+// A track replaced since (a concurrent re-create of the UID) is left alone, with all
+// the UID holds: the address, the references and the log tree are keyed by the UID,
+// so they are the replacement's now, and its own attempt decides what becomes of them.
+// Only this create's workers go.
 //
 // A delete owed already has the release. So does an UpdatePod in flight, which can
 // still acquire by the pod's UID: it reads the refusal as a delete owed and stops,
@@ -2242,15 +2246,13 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 func (r *runtimedRuntime) untrackRejectedCreate(pod *corev1.Pod, t *podTrack) {
 	id := string(pod.UID)
 	r.mu.Lock()
-	// Identity, not presence: a concurrent CreatePod for the same pod may have
-	// replaced this track between this create's RPC and its refusal, and that
-	// replacement is running its own attempt. Only the track this create
-	// installed is removed.
-	removed := r.track[id] == t
+	live := r.track[id]
+	replaced := live != nil && live != t
+	removed := live == t
 	_, owed := r.deleteOwed[id]
 	left := owed || r.updating[id] != 0
 	switch {
-	case owed:
+	case replaced || owed:
 	case left:
 		r.oweDeleteLocked(id, t)
 	case removed:
@@ -2263,6 +2265,9 @@ func (r *runtimedRuntime) untrackRejectedCreate(pod *corev1.Pod, t *podTrack) {
 	t.cancelRestarts()
 	t.cancelPulls()
 	t.cancelPostStart()
+	if replaced {
+		return
+	}
 	if !left {
 		r.releasePodNetwork(pod)
 	}
