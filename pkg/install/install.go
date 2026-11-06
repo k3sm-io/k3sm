@@ -2481,6 +2481,9 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 		reapPreviousRoot(sys, cfg)
 	}
 	removeLeftoverZot(sys, cfg)
+	if cfg.Role == RoleAgent {
+		removeLeftoverServerKubeconfig(sys, cfg)
+	}
 
 	// 5. Write the admin kubeconfig to the human's home (owned by them, not root)
 	//    — on a CONTROL PLANE only. A worker has no apiserver of its own and no

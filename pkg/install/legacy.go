@@ -29,6 +29,7 @@ import (
 	"strings"
 
 	"k3sm.io/k3sm/pkg/bootstrap"
+	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/netdsvc"
 	"k3sm.io/k3sm/pkg/nodecred"
 )
@@ -513,4 +514,32 @@ func validateLegacyLeaf(leaf string, b []byte) error {
 		return fmt.Errorf("is not a usable wireguard private key: %w", err)
 	}
 	return nil
+}
+
+// removeLeftoverServerKubeconfig removes the admin kubeconfig an earlier server
+// role left in the server work dir of a Mac that is now a worker. A worker runs no
+// control plane, so the file is a cluster-admin credential nothing here uses.
+//
+// It removes that one file: the worker's migration journal lives beside it, in the
+// same work dir. It walks from the data root without following a symlink, as
+// removeLeftoverZot does and for the same reason. A failure does not fail an install
+// whose daemons are already up and verified, because no worker verb reads the file;
+// the warning names it so that an operator can remove it by hand.
+func removeLeftoverServerKubeconfig(sys System, cfg Config) {
+	removeLeftoverKubeconfigIn(sys, cfg, cfg.serverWorkDir())
+}
+
+// removeLeftoverKubeconfigIn removes workDir's admin kubeconfig. The walk names one
+// directory beneath the data root, so a work dir anywhere else is not removed from:
+// its base name would name a different directory there.
+func removeLeftoverKubeconfigIn(sys System, cfg Config, workDir string) {
+	path := executor.KubeconfigPath(workDir)
+	wd, root := filepath.Clean(workDir), filepath.Clean(cfg.DataRoot)
+	if wd == root || filepath.Dir(wd) != root {
+		cfg.Logger.Warn("not removing the admin kubeconfig an earlier server role may have left on this worker, because its work dir is not directly under the data root; remove it by hand if it is there", "path", path, "root", cfg.DataRoot)
+		return
+	}
+	if err := sys.RemoveEntryBeneath(cfg.DataRoot, []string{filepath.Base(wd)}, filepath.Base(path)); err != nil {
+		cfg.Logger.Warn("could not remove the admin kubeconfig an earlier server role left on this worker; remove it by hand", "path", path, "err", err)
+	}
 }

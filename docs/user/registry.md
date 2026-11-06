@@ -438,12 +438,19 @@ and a tool that does not verify the cluster CA would send it the token. On a sha
 ### On a worker
 
 A worker writes no user kubeconfig, so `k3sm build`, `image load`, `import` and `push`, and
-`registry token` and `login`, stop there with an error that names the fix. Copy the admin
-kubeconfig from the server and write one:
+`registry token` and `login`, stop there with an error that names the fix. `k3sm kubeconfig --write`
+is refused on a worker too. Run `k3sm kubeconfig > k3sm.yaml` on the server, copy the admin
+kubeconfig to the worker, save it as `~/.kube/config`, owned by you and not group- or
+world-writable, and run the verb with sudo. Under sudo the worker ignores `$KUBECONFIG` and reads
+that file. The file has to meet three requirements:
 
-```sh
-k3sm kubeconfig --server https://<server>:6444 --certificate-authority <ca> --write
-```
+- The server address is `https`, and the file does not skip TLS verification.
+- It carries an inline CA that matches the cluster this worker joined.
+- Its credentials are inline. A token file, a client certificate or key given by path, an `exec`
+  plugin or an auth provider is refused.
+
+Instead of the copy, an admin can bind the `k3sm:registry-builder-token` Role to you with a
+RoleBinding in `k3sm-registry`.
 
 The worker finds the server's registry address by getting the `registry-k3sm` EndpointSlice in
 `k3sm-registry` by name. The admin kubeconfig may, and so may a user bound to the

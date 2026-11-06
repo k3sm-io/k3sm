@@ -23,10 +23,12 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -44,6 +46,7 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 
+	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/install"
 )
 
@@ -593,6 +596,71 @@ func TestUserImageMigratePushesWithBuilderTokenAndJournals(t *testing.T) {
 				t.Errorf("--report:\n%s", out.String())
 			}
 		})
+	}
+}
+
+// writeKubeconfigWithCA writes a kubeconfig at path naming server and caPEM, the
+// one thing clusterRegistryAPI returns from the file it chose, so a test can see
+// which file that was without dialling the server.
+func writeKubeconfigWithCA(t *testing.T, path, server string, caPEM []byte) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body := fmt.Sprintf(`apiVersion: v1
+kind: Config
+clusters:
+- name: k3sm
+  cluster:
+    server: %s
+    certificate-authority-data: %s
+contexts:
+- name: k3sm
+  context:
+    cluster: k3sm
+    user: k3sm
+current-context: k3sm
+users:
+- name: k3sm
+  user: {}
+`, server, base64.StdEncoding.EncodeToString(caPEM))
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestImageMigrateOnAWorkerUsesTheAgentKubeconfig holds the client `k3sm image
+// migrate` reaches the cluster registry with (userMigrationRoute ends in
+// clusterRegistryClient) to the node's role: on a worker that still holds a
+// server-era admin kubeconfig naming an address that no longer answers, the
+// worker's own kubeconfig is the one read.
+func TestImageMigrateOnAWorkerUsesTheAgentKubeconfig(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("K3SM_WORK_DIR", "")
+	t.Setenv("KUBECONFIG", "")
+	workDir := workDirFromEnv()
+	if workDir != filepath.Join(home, "server") {
+		t.Skipf("the work dir %s is not under the test's home, so a leftover cannot be staged there", workDir)
+	}
+	leftoverCA, agentCA := testClusterCAPEM(t), testClusterCAPEM(t)
+	writeKubeconfigWithCA(t, executor.KubeconfigPath(workDir), "https://192.0.2.1:6444", leftoverCA)
+	agent := filepath.Join(t.TempDir(), "kubeconfig")
+	writeKubeconfigWithCA(t, agent, "https://100.64.0.1:6444", agentCA)
+
+	prev := installedNodeCredential
+	t.Cleanup(func() { installedNodeCredential = prev })
+	installedNodeCredential = func() (install.Role, string) { return install.RoleAgent, agent }
+
+	api, err := clusterRegistryClient()
+	if err != nil {
+		t.Fatalf("clusterRegistryClient: %v", err)
+	}
+	if bytes.Equal(api.caPEM, leftoverCA) {
+		t.Fatal("the client came from the leftover server kubeconfig, not the node's role")
+	}
+	if !bytes.Equal(api.caPEM, agentCA) {
+		t.Errorf("the client's CA = %q, want the agent kubeconfig's", api.caPEM)
 	}
 }
 
