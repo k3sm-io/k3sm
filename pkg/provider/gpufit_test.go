@@ -188,25 +188,31 @@ func TestCreatePodGPUCumulativeFit(t *testing.T) {
 		}
 	})
 
-	// AN UNKNOWN CEILING ADMITS EVERYTHING. A node whose Metal working set could
-	// not be read (and which carries no iogpu override) has no number to refuse
-	// against; refusing there would make it unschedulable for every GPU pod, which
-	// is strictly worse than the overcommit the check exists to prevent.
-	t.Run("unknown_ceiling_admits", func(t *testing.T) {
+	// AN UNKNOWN CEILING SKIPS THE MEMORY FIT, NOT THE SLOT CAP. A node whose
+	// Metal working set could not be read has no byte number to refuse against,
+	// but it still holds one slot, so pods past the count are refused.
+	t.Run("unknown_ceiling_admits_within_the_slot_count", func(t *testing.T) {
 		t.Parallel()
 		ctx := context.Background()
 		r, f, rec := gpuFitRuntime(t, 0)
 
-		for _, name := range []string{"a", "b", "c"} {
-			if err := r.CreatePod(ctx, gpuFitPod(name, 64*testGiB, true)); err != nil {
-				t.Fatalf("CreatePod(%s) = %v, want it admitted against an unknown ceiling", name, err)
-			}
-		}
-		if _, creates := f.counts(); creates != 3 {
-			t.Errorf("CreatePod RPC calls = %d, want 3", creates)
+		if err := r.CreatePod(ctx, gpuFitPod("a", 64*testGiB, true)); err != nil {
+			t.Fatalf("CreatePod(a) = %v, want it admitted against an unknown ceiling", err)
 		}
 		if ev := findEvent(rec.Events, reasonFailedGPUFit); ev != "" {
-			t.Errorf("recorded %q against an unknown ceiling, want no %s event", ev, reasonFailedGPUFit)
+			t.Errorf("recorded %q within the slot count, want no %s event", ev, reasonFailedGPUFit)
+		}
+		for _, name := range []string{"b", "c"} {
+			err := r.CreatePod(ctx, gpuFitPod(name, 64*testGiB, true))
+			if !errors.Is(err, gpucapacity.ErrGPUSlotsFull) {
+				t.Fatalf("CreatePod(%s) = %v, want gpucapacity.ErrGPUSlotsFull past the one slot", name, err)
+			}
+			if ev := findEvent(rec.Events, reasonFailedGPUFit); ev == "" {
+				t.Errorf("no %s event for %s past the slot count", reasonFailedGPUFit, name)
+			}
+		}
+		if _, creates := f.counts(); creates != 1 {
+			t.Errorf("CreatePod RPC calls = %d, want 1", creates)
 		}
 	})
 

@@ -91,12 +91,11 @@ func TestGrantResourceReadsLimitsOnly(t *testing.T) {
 		res       corev1.ResourceRequirements
 		wantGrant corev1.ResourceName
 		wantUnits int64
-		wantNew   bool
 	}{
 		{name: "old_limit", res: limit(oldName, 1), wantGrant: oldName, wantUnits: 1},
-		{name: "new_limit", res: limit(newName, 1), wantGrant: newName, wantUnits: 1, wantNew: true},
+		{name: "new_limit", res: limit(newName, 1), wantGrant: newName, wantUnits: 1},
 		{name: "old_request", res: request(oldName, 1), wantUnits: 1},
-		{name: "new_request", res: request(newName, 1), wantUnits: 1, wantNew: true},
+		{name: "new_request", res: request(newName, 1), wantUnits: 1},
 		{name: "neither"},
 	}
 	for _, tc := range cases {
@@ -108,9 +107,6 @@ func TestGrantResourceReadsLimitsOnly(t *testing.T) {
 			}
 			if got := PodUnits(pod); got != tc.wantUnits {
 				t.Errorf("PodUnits = %d, want %d", got, tc.wantUnits)
-			}
-			if got := PodNamesRenamedResource(pod); got != tc.wantNew {
-				t.Errorf("PodNamesRenamedResource = %v, want %v", got, tc.wantNew)
 			}
 		})
 	}

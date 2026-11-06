@@ -262,26 +262,28 @@ func TestUnitsCountBothNames(t *testing.T) {
 		})
 	})
 
-	// A pod naming only the old name, beside pods naming only the old name, is
-	// admitted as it was before the second name existed. The scheduler counts that
-	// population itself.
-	t.Run("old_name_alone_is_unchanged", func(t *testing.T) {
+	// Pods naming only the old name are capped too: the scheduler's own count
+	// is skipped by spec.nodeName, so a third pod on a two-slot node is refused.
+	// A one-slot node of unknown ceiling refuses the second.
+	t.Run("old_name_alone_is_capped", func(t *testing.T) {
 		t.Parallel()
 		ctx := context.Background()
-		r, f, rec := gpuFitRuntime(t, 0)
-		for _, name := range []string{"a", "b", "c"} {
+		r, f, rec := gpuFitRuntime(t, 3*testGiB)
+		for _, name := range []string{"a", "b"} {
 			if err := r.CreatePod(ctx, namedGPUPod(name, unitsOldName)); err != nil {
 				t.Fatalf("CreatePod(%s) = %v", name, err)
 			}
 		}
-		if _, creates := f.counts(); creates != 3 {
-			t.Errorf("CreatePod RPC calls = %d, want 3", creates)
-		}
 		if ev := findEvent(rec.Events, reasonFailedGPUFit); ev != "" {
-			t.Errorf("recorded %q, want no %s event", ev, reasonFailedGPUFit)
+			t.Errorf("recorded %q within the count, want no %s event", ev, reasonFailedGPUFit)
 		}
-		// One new-name pod makes it a two-name count, and the old pods are in it.
-		assertSlotRefusal(t, r, f, rec, namedGPUPod("new", unitsNewName), 3, "3 of")
+		assertSlotRefusal(t, r, f, rec, namedGPUPod("c", unitsOldName), 2, "2 of")
+
+		r, f, rec = gpuFitRuntime(t, 0)
+		if err := r.CreatePod(ctx, namedGPUPod("a", unitsOldName)); err != nil {
+			t.Fatalf("CreatePod(a) = %v", err)
+		}
+		assertSlotRefusal(t, r, f, rec, namedGPUPod("b", unitsOldName), 1, "1 of")
 	})
 
 	t.Run("idempotent_recreate_excludes_its_own_entry", func(t *testing.T) {

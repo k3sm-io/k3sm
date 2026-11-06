@@ -2184,20 +2184,15 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	// is the one place the node's real slot count is held. gpuSlots is 0 only when
 	// the probe failed, which says nothing about the count: admit, as the fit does.
 	if gpuUnits > 0 && gpuSlots > 0 {
-		held, heldRenamed := r.heldGPUUnitsLocked(id, gpuFinished)
-		// Pods naming only the old name, beside only such pods, are the count the
-		// scheduler already makes right, and their admission stays as it was. The
-		// second name is what makes this count necessary.
-		if heldRenamed || gpucapacity.PodNamesRenamedResource(pod) {
-			if err := gpucapacity.GPUSlotsFit(gpuSlots, held, gpuUnits); err != nil {
-				r.mu.Unlock()
-				r.log.Error("CreatePod: the pod does not fit in this node's GPU slots beside the pods already admitted",
-					"namespace", pod.Namespace, "name", pod.Name,
-					"want_units", gpuUnits, "held_units", held, "slots", gpuSlots,
-					"err", err)
-				r.recorder.Event(pod, corev1.EventTypeWarning, reasonFailedGPUFit, msgFailedGPUSlots(gpuUnits, held, gpuSlots))
-				return fmt.Errorf("create pod %s/%s: %w", pod.Namespace, pod.Name, err)
-			}
+		held := r.heldGPUUnitsLocked(id, gpuFinished)
+		if err := gpucapacity.GPUSlotsFit(gpuSlots, held, gpuUnits); err != nil {
+			r.mu.Unlock()
+			r.log.Error("CreatePod: the pod does not fit in this node's GPU slots beside the pods already admitted",
+				"namespace", pod.Namespace, "name", pod.Name,
+				"want_units", gpuUnits, "held_units", held, "slots", gpuSlots,
+				"err", err)
+			r.recorder.Event(pod, corev1.EventTypeWarning, reasonFailedGPUFit, msgFailedGPUSlots(gpuUnits, held, gpuSlots))
+			return fmt.Errorf("create pod %s/%s: %w", pod.Namespace, pod.Name, err)
 		}
 	}
 	if old != nil {
@@ -2421,14 +2416,13 @@ func (r *runtimedRuntime) finishedGPUPods(ctx context.Context) map[string]bool {
 }
 
 // heldGPUUnitsLocked sums the GPU units of every tracked pod that still holds them,
-// under either name, except excludeID, and reports whether any of them names the
-// new resource. r.mu MUST be held.
+// under either name, except excludeID. r.mu MUST be held.
 //
 // Like the memory total it is derived from r.track on every call, so a deleted pod
 // releases its share with no counter to drift, and excludeID keeps an idempotent
 // re-create from being charged for its own units. A pod refused at admission,
 // evicted, or named in finished holds nothing.
-func (r *runtimedRuntime) heldGPUUnitsLocked(excludeID string, finished map[string]bool) (held int64, renamed bool) {
+func (r *runtimedRuntime) heldGPUUnitsLocked(excludeID string, finished map[string]bool) (held int64) {
 	for trackedID, t := range r.track {
 		if trackedID == excludeID || t == nil || t.pod == nil || t.rejected || finished[trackedID] || t.evictedStatus() != nil {
 			continue
@@ -2438,9 +2432,8 @@ func (r *runtimedRuntime) heldGPUUnitsLocked(excludeID string, finished map[stri
 			continue
 		}
 		held = gpucapacity.AddUnits(held, units)
-		renamed = renamed || gpucapacity.PodNamesRenamedResource(t.pod)
 	}
-	return held, renamed
+	return held
 }
 
 // admittedGPUMemoryLocked sums the memory limits of every tracked GPU pod except

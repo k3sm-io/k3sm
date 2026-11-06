@@ -93,12 +93,6 @@ func PodUnits(pod *corev1.Pod) int64 {
 	return most
 }
 
-// PodNamesRenamedResource reports whether the pod holds any units under
-// runtimev1.ResourceGPU, as opposed to only the name it replaces.
-func PodNamesRenamedResource(pod *corev1.Pod) bool {
-	return unitsUnder(pod, corev1.ResourceName(runtimev1.ResourceGPU)) > 0
-}
-
 // unitsUnder is the pod's effective request under one name; see PodUnits for the
 // rule. The sum saturates, because a wrapped negative would read as holding nothing.
 func unitsUnder(pod *corev1.Pod, gpu corev1.ResourceName) int64 {
