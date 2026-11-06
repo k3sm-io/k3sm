@@ -389,8 +389,8 @@ func msgFailedProjectedSource(volume, kind string) string {
 func msgFailedGPUFit(want, admitted, ceiling int64) string {
 	return fmt.Sprintf("Error: this pod needs %s of GPU memory, but %s of the node's %s usable GPU memory "+
 		"is already committed to admitted GPU pods, so it cannot be started without overcommitting the GPU. "+
-		"Delete or shrink another pod requesting %s, or lower this pod's memory limit to fit in what is left.",
-		gpuFitGiB(want), gpuFitGiB(admitted), gpuFitGiB(ceiling), mlxv1alpha1.ResourceGPU)
+		"Delete or shrink another pod requesting %s or %s, or lower this pod's memory limit to fit in what is left.",
+		gpuFitGiB(want), gpuFitGiB(admitted), gpuFitGiB(ceiling), runtimev1.ResourceGPU, mlxv1alpha1.ResourceGPU)
 }
 
 // msgFailedGPUUnbounded is the FailedGPUFit-event message for a GPU pod that
@@ -401,12 +401,12 @@ func msgFailedGPUFit(want, admitted, ceiling int64) string {
 // memory budget), but the text is a different one: naming the three byte counts
 // would be misleading here, since the missing number is the pod's own. The way
 // out is stated as the field to set, because that is the whole fix, and every
-// MLXModel-rendered pod already carries it.
-func msgFailedGPUUnbounded(ceiling int64) string {
+// MLXModel-rendered pod already carries it. gpu is the name the pod asked under.
+func msgFailedGPUUnbounded(gpu corev1.ResourceName, ceiling int64) string {
 	return fmt.Sprintf("Error: this pod requests %s but declares no memory limit on every container, so the node "+
 		"cannot fit it against its %s of usable GPU memory and would be overcommitting the GPU by an amount "+
 		"nothing can measure. Set spec.containers[].resources.limits.memory on every container.",
-		mlxv1alpha1.ResourceGPU, gpuFitGiB(ceiling))
+		gpu, gpuFitGiB(ceiling))
 }
 
 // gpuFitGiB renders a byte count as the binary quantity a pod's memory limit is
