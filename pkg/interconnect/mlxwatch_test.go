@@ -54,19 +54,24 @@ func fakeMLXModels() *dynamicfake.FakeDynamicClient {
 // waitNudge waits for one signal on ch, failing after within.
 func waitNudge(t *testing.T, ch <-chan struct{}, within time.Duration, what string) {
 	t.Helper()
+	timer := time.NewTimer(within)
+	defer timer.Stop()
 	select {
 	case <-ch:
-	case <-time.After(within):
+	case <-timer.C:
 		t.Fatalf("no reconcile within %s of %s", within, what)
 	}
 }
 
 // drain discards signals until none arrives for quiet.
 func drain(ch <-chan struct{}, quiet time.Duration) {
+	timer := time.NewTimer(quiet)
+	defer timer.Stop()
 	for {
 		select {
 		case <-ch:
-		case <-time.After(quiet):
+			timer.Reset(quiet)
+		case <-timer.C:
 			return
 		}
 	}
@@ -170,9 +175,11 @@ func TestWatchMLXModelsNudgesOnSpecChangesOnly(t *testing.T) {
 	for i := range 3 {
 		waitNudge(t, nudges, 5*time.Second, fmt.Sprintf("event %d", i+1))
 	}
+	quiet := time.NewTimer(200 * time.Millisecond)
+	defer quiet.Stop()
 	select {
 	case <-nudges:
 		t.Error("a status-only update nudged the resolver")
-	case <-time.After(200 * time.Millisecond):
+	case <-quiet.C:
 	}
 }
