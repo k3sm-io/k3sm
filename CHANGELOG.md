@@ -115,6 +115,14 @@ pin, its date, and the tarball's sha256.
   untouched, so a rollback finds them. A server running as root, as a hand-run `sudo k3sm server`, has
   no ingest registry and reports that in `k3sm status`; an installed server runs as `_k3sm` and is
   unaffected.
+- The ingest registry and its push gate now read repository names, tags and digests with one
+  validator. A push to a name with a component `index.json` or `oci-layout`, or whose first component
+  is `cache.db`, `meta.db`, `config.json`, `htpasswd` or `push-credential.json`, is refused, as a name
+  with a `blobs` or dot component already was. A push to a name with a component `manifests` or
+  `uploads`, which the gate used to refuse, now works.
+- The ingest registry refuses a request path holding a percent escape with `NAME_INVALID`, reads
+  included: `a%2fb` and `%61` no longer reach the repositories `a/b` and `a`, and a digest must spell its
+  colon as `:`. A query value may still be escaped.
 - `k3sm image ls` and `k3sm image df` keep a cache of image descriptions by digest under
   `~/Library/Caches/k3sm/registry`, so a repeat listing of a large registry reads each tag's
   digest and describes only new content.
