@@ -2415,7 +2415,7 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 		switch {
 		case err == nil:
 			cfg.ClusterCA = ca
-			if err := provisionServerClusterCA(sys, cfg, ca, false); err != nil {
+			if err := provisionServerClusterCA(sys, cfg, ca); err != nil {
 				return err
 			}
 		case errors.Is(err, fs.ErrNotExist):

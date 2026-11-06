@@ -107,20 +107,19 @@ func provisionAgentClusterCA(sys System, cfg Config, verified []byte) error {
 // provisionServerClusterCA writes a server's root-only cluster CA copy from ca, its
 // control plane's certificate. An upgrade calls it with the CA already on disk,
 // before the swap and before netd restarts, so the new helper always finds the copy.
-// A first install calls it with minted set, once the control plane's first boot has
-// written its CA; netd retries until then.
+// A first install calls it once the control plane's first boot has written its CA;
+// netd retries until then.
 //
 //   - An equal copy is left alone.
 //   - No copy, or one that is not a CA certificate, is written.
-//   - A different copy is replaced only when minted: this boot made a new CA, so the
-//     copy describes a cluster this node no longer serves (it was a worker before an
-//     uninstall, or its work dir was removed). Otherwise it is kept and a warning
-//     names it: the source is a file the service user owns, so which of the two is
-//     right takes a person.
+//   - A different valid copy is kept and a warning gives the remedy: the source is a
+//     file the service user owns, so which of the two is right takes a person. On a
+//     node that is starting a new cluster, a former worker or one whose work dir was
+//     removed, that person removes the copy and installs again.
 //
 // A ca that is not a CA certificate writes nothing and is logged, as on a worker:
 // the helper keeps refusing with the remedy.
-func provisionServerClusterCA(sys System, cfg Config, ca []byte, minted bool) error {
+func provisionServerClusterCA(sys System, cfg Config, ca []byte) error {
 	if err := checkCAPEM(ca); err != nil {
 		cfg.Logger.Warn("the control plane's cluster CA is unusable: this server's root helper keeps refusing until an install finds a usable one", "err", err)
 		return nil
@@ -129,8 +128,8 @@ func provisionServerClusterCA(sys System, cfg Config, ca []byte, minted bool) er
 	switch {
 	case err == nil && bytes.Equal(existing, ca):
 		return nil
-	case err == nil && checkCAPEM(existing) == nil && !minted:
-		cfg.Logger.Warn("the root-only cluster CA copy differs from the control plane's and is kept; if the cluster's CA really changed, remove the copy and run `sudo k3sm install` to write it again",
+	case err == nil && checkCAPEM(existing) == nil:
+		cfg.Logger.Warn("the root-only cluster CA copy differs from the control plane's and is kept, and this node's root helper and root commands keep checking the apiserver against it; if this node really has a new cluster or a new CA, run `sudo rm "+AgentClusterCAPath+"` and then `sudo k3sm install` to write it again",
 			"path", AgentClusterCAPath, "control-plane-ca", certs.ClusterCACertPath(cfg.serverWorkDir()))
 		return nil
 	case err != nil && !errors.Is(err, fs.ErrNotExist):
@@ -142,14 +141,14 @@ func provisionServerClusterCA(sys System, cfg Config, ca []byte, minted bool) er
 // awaitServerClusterCA is awaitClusterCA, and a first install's root-only copy of
 // the CA it waited for.
 func awaitServerClusterCA(ctx context.Context, sys System, cfg *Config, b restartBudget) error {
-	minted := len(cfg.ClusterCA) == 0
+	waited := len(cfg.ClusterCA) == 0
 	if err := awaitClusterCA(ctx, sys, cfg, b); err != nil {
 		return err
 	}
-	if !minted {
+	if !waited {
 		return nil
 	}
-	return provisionServerClusterCA(sys, *cfg, cfg.ClusterCA, true)
+	return provisionServerClusterCA(sys, *cfg, cfg.ClusterCA)
 }
 
 func writeAgentClusterCA(sys System, caPEM []byte, cfg Config, from string) error {

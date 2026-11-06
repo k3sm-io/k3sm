@@ -165,18 +165,6 @@ func TestProvisionServerClusterCA(t *testing.T) {
 			t.Errorf("copy at call %d, before the server bootstrap at %d", write, boot)
 		}
 	})
-	t.Run("a copy left by another cluster goes when this install's boot mints a new CA", func(t *testing.T) {
-		shrinkRestartBudgets(t)
-		ca, stale := mintCA(t), mintCA(t)
-		f := &fakeSystem{bootCA: ca}
-		f.putFile(AgentClusterCAPath, stale)
-		if err := Install(context.Background(), f, testConfig(t)); err != nil {
-			t.Fatalf("Install: %v", err)
-		}
-		if !bytes.Equal(f.files[AgentClusterCAPath], ca) {
-			t.Error("the copy still names a CA this cluster does not have")
-		}
-	})
 	t.Run("a copy that differs from the CA on disk is kept and named", func(t *testing.T) {
 		held, onDisk := mintCA(t), mintCA(t)
 		f := &fakeSystem{}
@@ -184,7 +172,7 @@ func TestProvisionServerClusterCA(t *testing.T) {
 		var logged bytes.Buffer
 		cfg := testConfig(t).withDefaults()
 		cfg.Logger = slog.New(slog.NewTextHandler(&logged, nil))
-		if err := provisionServerClusterCA(f, cfg, onDisk, false); err != nil {
+		if err := provisionServerClusterCA(f, cfg, onDisk); err != nil {
 			t.Fatal(err)
 		}
 		if !bytes.Equal(f.files[AgentClusterCAPath], held) {
@@ -200,7 +188,7 @@ func TestProvisionServerClusterCA(t *testing.T) {
 		ca := mintCA(t)
 		f := &fakeSystem{}
 		f.putFile(AgentClusterCAPath, ca)
-		if err := provisionServerClusterCA(f, testConfig(t).withDefaults(), ca, false); err != nil {
+		if err := provisionServerClusterCA(f, testConfig(t).withDefaults(), ca); err != nil {
 			t.Fatal(err)
 		}
 		if anchorCallAt(f, anchorWrite) >= 0 {
@@ -211,7 +199,7 @@ func TestProvisionServerClusterCA(t *testing.T) {
 		ca := mintCA(t)
 		f := &fakeSystem{}
 		f.putFile(AgentClusterCAPath, []byte("not pem"))
-		if err := provisionServerClusterCA(f, testConfig(t).withDefaults(), ca, false); err != nil {
+		if err := provisionServerClusterCA(f, testConfig(t).withDefaults(), ca); err != nil {
 			t.Fatal(err)
 		}
 		if !bytes.Equal(f.files[AgentClusterCAPath], ca) {
@@ -220,7 +208,7 @@ func TestProvisionServerClusterCA(t *testing.T) {
 	})
 	t.Run("a control plane CA that is not a CA writes nothing", func(t *testing.T) {
 		f := &fakeSystem{}
-		if err := provisionServerClusterCA(f, testConfig(t).withDefaults(), []byte("not pem"), true); err != nil {
+		if err := provisionServerClusterCA(f, testConfig(t).withDefaults(), []byte("not pem")); err != nil {
 			t.Fatal(err)
 		}
 		if _, ok := f.files[AgentClusterCAPath]; ok {
@@ -245,6 +233,83 @@ func TestProvisionServerClusterCA(t *testing.T) {
 		}
 		if _, ok := f.files[AgentClusterCAPath]; ok {
 			t.Error("a copy was written with nothing to write")
+		}
+	})
+}
+
+// TestServerClusterCACopyAcrossNewClusters walks the installs that can follow a CA
+// appearing in the PKI dir: a valid copy is never replaced, and removing it is what
+// lets the next install write the current CA.
+func TestServerClusterCACopyAcrossNewClusters(t *testing.T) {
+	anchorWrite := "WriteRootOnlyFile:" + AgentClusterCAPath + ":0644"
+	loggedConfig := func(t *testing.T) (Config, *bytes.Buffer) {
+		t.Helper()
+		var logged bytes.Buffer
+		cfg := testConfig(t)
+		cfg.Logger = slog.New(slog.NewTextHandler(&logged, nil))
+		return cfg, &logged
+	}
+	t.Run("a new cluster with no copy gets one", func(t *testing.T) {
+		shrinkRestartBudgets(t)
+		ca := mintCA(t)
+		f := &fakeSystem{bootCA: ca}
+		if err := Install(context.Background(), f, testConfig(t)); err != nil {
+			t.Fatalf("Install: %v", err)
+		}
+		if !bytes.Equal(f.files[AgentClusterCAPath], ca) {
+			t.Errorf("the copy is %q", f.files[AgentClusterCAPath])
+		}
+	})
+	t.Run("an emptied work dir keeps the copy and names the way forward", func(t *testing.T) {
+		shrinkRestartBudgets(t)
+		held, minted := mintCA(t), mintCA(t)
+		f := &fakeSystem{bootCA: minted}
+		f.putFile(AgentClusterCAPath, held)
+		cfg, logged := loggedConfig(t)
+		if err := Install(context.Background(), f, cfg); err != nil {
+			t.Fatalf("Install: %v", err)
+		}
+		if !bytes.Equal(f.files[AgentClusterCAPath], held) {
+			t.Error("a valid copy was replaced")
+		}
+		for _, want := range []string{"level=WARN", "new cluster", "sudo rm " + AgentClusterCAPath, "sudo k3sm install"} {
+			if !strings.Contains(logged.String(), want) {
+				t.Errorf("log lacks %q:\n%s", want, logged.String())
+			}
+		}
+
+		// The remedy the warning gives.
+		delete(f.files, AgentClusterCAPath)
+		if err := Install(context.Background(), f, cfg); err != nil {
+			t.Fatalf("Install after removing the copy: %v", err)
+		}
+		if !bytes.Equal(f.files[AgentClusterCAPath], minted) {
+			t.Errorf("after removing the copy it is %q", f.files[AgentClusterCAPath])
+		}
+	})
+	t.Run("uninstall keeps the copy and the next install leaves it alone", func(t *testing.T) {
+		shrinkRestartBudgets(t)
+		ca := mintCA(t)
+		f := &fakeSystem{bootCA: ca}
+		cfg := testConfig(t)
+		if err := Install(context.Background(), f, cfg); err != nil {
+			t.Fatalf("Install: %v", err)
+		}
+		if err := Uninstall(context.Background(), f, cfg); err != nil {
+			t.Fatalf("Uninstall: %v", err)
+		}
+		if !bytes.Equal(f.files[AgentClusterCAPath], ca) {
+			t.Fatal("uninstall removed the copy")
+		}
+		f.calls = nil
+		if err := Install(context.Background(), f, cfg); err != nil {
+			t.Fatalf("Install: %v", err)
+		}
+		if anchorCallAt(f, anchorWrite) >= 0 {
+			t.Error("an equal copy was rewritten")
+		}
+		if !bytes.Equal(f.files[AgentClusterCAPath], ca) {
+			t.Errorf("the copy is %q", f.files[AgentClusterCAPath])
 		}
 	})
 }

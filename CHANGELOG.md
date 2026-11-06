@@ -228,8 +228,10 @@ pin, its date, and the tarball's sha256.
   `k3sm stop` and `k3sm start` use that copy and the `10.43.0.1` name on a server and on a worker, on either
   role connecting to the address in the kubeconfig. A node whose binary was replaced without an install has no
   copy: privileged binds stay denied, `sudo k3sm kubectl` refuses, and each says to run `sudo k3sm install`.
-  `k3sm kubectl` without sudo is not affected. A copy that differs from the server's CA on disk is kept and
-  install warns; remove it and run `sudo k3sm install` if the cluster's CA really changed.
+  `k3sm kubectl` without sudo is not affected. A valid copy that differs from the server's CA is kept and install
+  warns, also when the control plane has just made a new CA. To start a new cluster on a node that has a copy, a
+  former worker or one whose work dir was removed, run `sudo rm /var/lib/k3sm/keys/cluster-ca.crt` and then
+  `sudo k3sm install`; until then its root commands and `k3sm-netd` keep checking the apiserver against the old CA.
 - `k3sm netd` as root with a `--kubeconfig` an install did not write now needs `--cluster-ca` naming a root-owned
   CA. Without one it starts no informers, denies privileged binds, and logs what to pass.
 - An agent run as root accepts only inline credentials in the kubeconfigs its mesh watcher, MeshPeer list and
