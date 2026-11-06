@@ -312,9 +312,9 @@ func registryAuth(ref name.Reference, workDir string) (authn.Authenticator, erro
 //
 // Every failure mode returns nil rather than an error, and that is the whole
 // design of this seam: the credential is an OPTIONAL convenience for one target,
-// so a missing work dir, a disabled registry, an unreadable file (the invoking
-// user is not the one the control plane runs as) or a malformed one must all fall
-// through to the docker chain, which then produces the ordinary "unauthenticated"
+// so a missing work dir, a disabled registry, a worker's leftover, an unreadable
+// file (the invoking user is not the one the control plane runs as) or a malformed
+// one must all fall through to the docker chain, which then produces the ordinary "unauthenticated"
 // outcome. Failing the push here would break every push to every OTHER registry
 // on a host whose local registry happens to be off.
 //
@@ -326,7 +326,7 @@ func localRegistryAuth(ref name.Reference, workDir string) authn.Authenticator {
 	if workDir == "" {
 		return nil
 	}
-	cred, err := registrysvc.ReadCredential(workDir)
+	cred, err := ownPushCredential(workDir)
 	if err != nil {
 		return nil
 	}

@@ -47,18 +47,20 @@ var kubectlExec func(bin string, argv []string, env []string) error = syscall.Ex
 // `sudo k3sm install` merged there (`k3sm` unless --kubeconfig-name named
 // another), run through the kubectl the installer laid
 // down beside the daemon. K3SM_WORK_DIR pins a non-default `k3sm server
-// --work-dir` and, when set, is used verbatim with no fallback.
+// --work-dir` and, when set, is used verbatim with no fallback. On a worker,
+// root stops rather than run kubectl with the node credential
+// (kubectlVerbConfig).
 func runKubectl(args []string) error {
 	workDir := workDirFromEnv()
 	home, _ := os.UserHomeDir()
-	cfg, err := resolveKubectlConfig(kubectlInputs{
+	cfg, err := kubectlVerbConfig("k3sm kubectl", kubectlInputs{
 		workDirOverride: os.Getenv("K3SM_WORK_DIR"),
 		workDir:         workDir,
 		kubeconfigEnv:   os.Getenv("KUBECONFIG"),
 		home:            home,
 		contextName:     installedKubeconfigName(),
 		exists:          fileExists,
-	})
+	}.withInstalledRole())
 	if err != nil {
 		return err
 	}
@@ -129,6 +131,34 @@ type kubectlInputs struct {
 	contextName string
 	// exists reports whether a path is present (fileExists in production).
 	exists func(string) bool
+	// role is the node this Mac is installed as. On a worker the work dir's
+	// admin kubeconfig is never read unless K3SM_WORK_DIR names it.
+	role install.Role
+	// nodeKubeconfig is a worker's own credential, the kubeconfig a join wrote
+	// (install.AgentCredentialPath).
+	nodeKubeconfig string
+	// asRoot says this process runs as root. No verb uses the node credential
+	// then (builderKubeconfig, kubectlVerbConfig).
+	asRoot bool
+}
+
+// installedNodeCredential is the role this Mac is installed as and where a
+// worker's node credential lives. It is a variable so a test states the role
+// instead of reading /Library/LaunchDaemons.
+var installedNodeCredential = func() (install.Role, string) {
+	role, _ := installedRole()
+	return role, install.AgentCredentialPath(install.DefaultDataRoot)
+}
+
+// kubectlGeteuid is os.Geteuid, a seam so a test can state who runs the verb.
+var kubectlGeteuid = os.Geteuid
+
+// withInstalledRole returns in with this Mac's installed role and node
+// credential filled in.
+func (in kubectlInputs) withInstalledRole() kubectlInputs {
+	in.role, in.nodeKubeconfig = installedNodeCredential()
+	in.asRoot = kubectlGeteuid() == 0
+	return in
 }
 
 // kubectlConfig is how `k3sm kubectl` addresses the cluster: either an explicit
@@ -156,16 +186,29 @@ func (c kubectlConfig) argv(args []string) []string {
 //  1. K3SM_WORK_DIR set — that work dir's admin kubeconfig, or an error. The
 //     caller named a server, so there is no fallback to a different cluster.
 //  2. The resolved work dir's admin kubeconfig, when it is there — the root and
-//     _k3sm-service-user case, unchanged from before this fallback existed.
+//     _k3sm-service-user case, unchanged from before this fallback existed. Not
+//     on a worker: it runs no control plane, so a file there is left over from
+//     an earlier server install and names an apiserver this node may no longer
+//     reach, with an admin credential this node has no business using.
 //  3. Otherwise kubectl's own rules ($KUBECONFIG, else ~/.kube/config) with the
 //     installed context pinned — the ordinary-user case, where the work dir is
 //     the service user's mode-0700 home and is not readable at all.
+//  4. On a worker, its node credential, when this account can see it (root and
+//     the service user). It comes after the account's own kubeconfig because it
+//     is a system:node identity, which may read but may not mint a registry
+//     push token (see userMigrationRoute): an account that has a kubeconfig of
+//     its own means that one. Every verb refuses this choice as root
+//     (builderKubeconfig, kubectlVerbConfig), so a new caller must too.
 func resolveKubectlConfig(in kubectlInputs) (kubectlConfig, error) {
 	kc := executor.KubeconfigPath(in.workDir)
-	if in.workDirOverride != "" || in.exists(kc) {
+	if in.workDirOverride != "" {
 		if !in.exists(kc) {
 			return kubectlConfig{}, fmt.Errorf("kubeconfig %s not found — run `k3sm server` first (set K3SM_WORK_DIR if you used a non-default --work-dir)", kc)
 		}
+		return kubectlConfig{kubeconfig: kc}, nil
+	}
+	worker := in.role == install.RoleAgent
+	if !worker && in.exists(kc) {
 		return kubectlConfig{kubeconfig: kc}, nil
 	}
 	for _, p := range userKubeconfigCandidates(in.kubeconfigEnv, in.home) {
@@ -173,7 +216,45 @@ func resolveKubectlConfig(in kubectlInputs) (kubectlConfig, error) {
 			return kubectlConfig{context: in.contextName}, nil
 		}
 	}
+	if worker && in.nodeKubeconfig != "" && in.exists(in.nodeKubeconfig) {
+		return kubectlConfig{kubeconfig: in.nodeKubeconfig}, nil
+	}
 	return kubectlConfig{}, fmt.Errorf("no kubeconfig for k3sm kubectl: %s is not readable and ~/.kube/config does not exist — run `sudo k3sm install` (it merges the k3sm admin context into your ~/.kube/config), or set KUBECONFIG", kc)
+}
+
+// rootNodeCredentialFix is what root on a worker is told to do instead of loading
+// the node credential, on the verbs that need no root and read $KUBECONFIG:
+// `k3sm kubectl`, `k3sm interconnect` and the builder verbs. A verb that mints a
+// registry push token says workerMintRemedy instead.
+const rootNodeCredentialFix = "copy the admin kubeconfig from the server (`k3sm kubeconfig > k3sm.yaml` there), set KUBECONFIG and run this without sudo"
+
+// rootChoseNodeCredential reports whether cfg would have root load the node
+// credential.
+func rootChoseNodeCredential(in kubectlInputs, cfg kubectlConfig) bool {
+	return in.asRoot && in.nodeKubeconfig != "" && cfg.kubeconfig == in.nodeKubeconfig
+}
+
+// userKubeconfigNames is the account's own kubeconfig candidates, for a message.
+func userKubeconfigNames(in kubectlInputs) string {
+	if c := userKubeconfigCandidates(in.kubeconfigEnv, in.home); len(c) > 0 {
+		return strings.Join(c, " or ")
+	}
+	return "~/.kube/config"
+}
+
+// kubectlVerbConfig is resolveKubectlConfig for the verbs that use its choice as
+// it stands, named by verb in the refusal. Root stops rather than use a worker's
+// node credential: a node identity holds only what its kubelet needs, not what an
+// operator runs these verbs for. The service user still reads its own file.
+func kubectlVerbConfig(verb string, in kubectlInputs) (kubectlConfig, error) {
+	cfg, err := resolveKubectlConfig(in)
+	if err != nil {
+		return kubectlConfig{}, err
+	}
+	if rootChoseNodeCredential(in, cfg) {
+		return kubectlConfig{}, fmt.Errorf("no kubeconfig for %s on this worker: %s does not exist and root does not use the node credential %s, which is a node identity and holds only what its kubelet needs; %s", verb, userKubeconfigNames(in), in.nodeKubeconfig, rootNodeCredentialFix)
+	}
+	return cfg, nil
 }
 
 // userKubeconfigCandidates lists the files kubectl's default loading rules would

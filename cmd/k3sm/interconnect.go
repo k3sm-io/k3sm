@@ -291,14 +291,14 @@ func interconnectClients(kubeconfig string) (kubernetes.Interface, dynamic.Inter
 	} else {
 		home, _ := os.UserHomeDir()
 		var kc kubectlConfig
-		kc, err = resolveKubectlConfig(kubectlInputs{
+		kc, err = kubectlVerbConfig("k3sm interconnect", kubectlInputs{
 			workDirOverride: os.Getenv("K3SM_WORK_DIR"),
 			workDir:         workDirFromEnv(),
 			kubeconfigEnv:   os.Getenv("KUBECONFIG"),
 			home:            home,
 			contextName:     installedKubeconfigName(),
 			exists:          fileExists,
-		})
+		}.withInstalledRole())
 		if err != nil {
 			return nil, nil, err
 		}

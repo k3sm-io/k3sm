@@ -159,8 +159,8 @@ func imagePrune(ctx context.Context, client runtimev1.ImagesClient, o imageOptio
 	return nil
 }
 
-// pruneCredential reads this node's push credential. A node with none runs
-// no registry: the cluster registry is pruned on the server that runs it, so
+// pruneCredential reads this node's push credential. A node with none, or a
+// worker with only an earlier server's leftover, runs no registry: the cluster registry is pruned on the server that runs it, so
 // this node's prune skips that half and says so. Any other failure (most often
 // a caller who is not the control plane's user) is an error, not a skip: a
 // silent skip would read as "the registry had nothing to prune".
@@ -168,7 +168,7 @@ func pruneCredential(workDir string) (registrysvc.Credential, string, error) {
 	if workDir == "" {
 		return registrysvc.Credential{}, "no control-plane work dir: this node runs no registry", nil
 	}
-	cred, err := registrysvc.ReadCredential(workDir)
+	cred, err := ownPushCredential(workDir)
 	if errors.Is(err, registrysvc.ErrNoCredential) {
 		return registrysvc.Credential{}, "this node runs no registry; prune the cluster registry on the server that runs it", nil
 	}

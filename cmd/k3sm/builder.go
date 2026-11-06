@@ -31,6 +31,7 @@ import (
 
 	"k3sm.io/k3sm/pkg/builder"
 	"k3sm.io/k3sm/pkg/executor"
+	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/kubeclient"
 )
 
@@ -179,7 +180,7 @@ func builderKubeInputs(opts builderOptions) kubectlInputs {
 	if opts.workDirExplicit {
 		in.workDirOverride = opts.workDir
 	}
-	return in
+	return in.withInstalledRole()
 }
 
 // builderKubeconfig picks the credentials the builder verbs run with. The
@@ -189,18 +190,26 @@ func builderKubeInputs(opts builderOptions) kubectlInputs {
 // pinned to the installed context. Only the errors are the builder's own: an
 // explicit work dir keeps its `k3sm server` message, and the ordinary user with
 // neither kubeconfig is told both paths and both ways out.
+//
+// Root stops rather than use a worker's node credential here: a system:node
+// identity may not run the build engine, so nothing is lost by the refusal. These
+// verbs need no root, and read $KUBECONFIG, so the fix is rootNodeCredentialFix.
+// The service user still reads its own file.
 func builderKubeconfig(in kubectlInputs) (kubectlConfig, error) {
 	cfg, err := resolveKubectlConfig(in)
+	user := userKubeconfigNames(in)
 	if err == nil {
+		if rootChoseNodeCredential(in, cfg) {
+			return kubectlConfig{}, fmt.Errorf("no kubeconfig for the build engine on this worker: %s does not exist and root does not use the node credential %s, which is a node identity and may not run the build engine; %s", user, in.nodeKubeconfig, rootNodeCredentialFix)
+		}
 		return cfg, nil
 	}
 	kc := executor.KubeconfigPath(in.workDir)
 	if in.workDirOverride != "" {
 		return kubectlConfig{}, fmt.Errorf("kubeconfig %s not found — run `k3sm server` first (set --work-dir or K3SM_WORK_DIR if you used a non-default `k3sm server --work-dir`)", kc)
 	}
-	user := "~/.kube/config"
-	if c := userKubeconfigCandidates(in.kubeconfigEnv, in.home); len(c) > 0 {
-		user = strings.Join(c, " or ")
+	if in.role == install.RoleAgent {
+		return kubectlConfig{}, fmt.Errorf("no kubeconfig for the build engine on this worker: %s does not exist and its node credential %s is not readable by this account — copy the admin kubeconfig from the server (`k3sm kubeconfig > k3sm.yaml` there) and set KUBECONFIG", user, in.nodeKubeconfig)
 	}
 	return kubectlConfig{}, fmt.Errorf("no kubeconfig for the build engine: %s is not readable by this account and %s does not exist — run with sudo, or copy the admin kubeconfig into yours with `sudo k3sm kubeconfig --write`", kc, user)
 }

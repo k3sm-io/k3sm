@@ -179,7 +179,7 @@ func isClusterRegistryHost(reg, workDir string) bool {
 			return true
 		}
 	}
-	cred, err := registrysvc.ReadCredential(workDir)
+	cred, err := ownPushCredential(workDir)
 	return err == nil && cred.MatchesRegistry(reg)
 }
 
@@ -273,7 +273,7 @@ func resolvePushTarget(ctx context.Context, tag, workDir string) (name.Tag, push
 // one the node's puller resolves a bare name against and the one the discovery
 // ConfigMap publishes, so what an operator pushes to is what a Pod spec names.
 func nodeRegistryAuthority(workDir string) (string, error) {
-	cred, err := registrysvc.ReadCredential(workDir)
+	cred, err := ownPushCredential(workDir)
 	if err != nil {
 		return "", fmt.Errorf("%w: %w (the server runs its registry unless started with --registry-port 0; or give --tag a full registry reference such as registry.example.com/me/app:v1)", errNoNodeRegistry, err)
 	}

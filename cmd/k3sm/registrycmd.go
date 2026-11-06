@@ -114,7 +114,7 @@ func runRegistry(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	tok, err := mintBuilderToken(ctx, api.tokens, *d, time.Now)
+	tok, err := api.mintToken(ctx, *d, time.Now)
 	if err != nil {
 		return err
 	}

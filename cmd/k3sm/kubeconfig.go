@@ -44,7 +44,7 @@ import (
 // ordinary user — the service user's work dir is mode 0700 — so there the
 // --context-name context that `sudo k3sm install` merged into the caller's own
 // kubeconfig is used instead. Setting K3SM_WORK_DIR pins the work-dir file with
-// no fallback.
+// no fallback. A worker has no such file of its own (loadKubeconfigSource).
 func runKubeconfig(args []string) error {
 	fs := flag.NewFlagSet("kubeconfig", flag.ExitOnError)
 	var (
@@ -118,20 +118,34 @@ func runKubeconfig(args []string) error {
 // where `k3sm install` merged it. An explicit K3SM_WORK_DIR never falls back: the
 // caller named a server work dir, so reporting some other cluster's credentials
 // would be a lie.
+//
+// On a worker the work dir's file is not read unless K3SM_WORK_DIR names it: a
+// worker runs no control plane, so the file is left over from an earlier server
+// install, and printing or merging it would hand on an admin credential for an
+// address this Mac may no longer reach. The node credential is no substitute,
+// because this verb's output is an admin's kubeconfig.
 func loadKubeconfigSource(name string) (*clientcmdapi.Config, error) {
 	srcPath := executor.KubeconfigPath(workDirFromEnv())
-	src, err := clientcmd.LoadFromFile(srcPath)
-	if err == nil {
-		return src, nil
-	}
-	if os.Getenv("K3SM_WORK_DIR") != "" {
-		return nil, fmt.Errorf("load k3sm kubeconfig %s (run `k3sm server` first): %w", srcPath, err)
+	pinned := os.Getenv("K3SM_WORK_DIR") != ""
+	role, _ := installedNodeCredential()
+	worker := role == install.RoleAgent && !pinned
+	if !worker {
+		src, err := clientcmd.LoadFromFile(srcPath)
+		if err == nil {
+			return src, nil
+		}
+		if pinned {
+			return nil, fmt.Errorf("load k3sm kubeconfig %s (run `k3sm server` first): %w", srcPath, err)
+		}
 	}
 	raw, err := clientcmd.NewDefaultClientConfigLoadingRules().Load()
 	if err != nil {
 		return nil, fmt.Errorf("load your kubeconfig: %w", err)
 	}
 	out, err := extractContext(raw, name)
+	if worker && err != nil {
+		return nil, fmt.Errorf("no k3sm kubeconfig on this worker: a worker holds no admin kubeconfig and %w — copy it from the server (`k3sm kubeconfig > k3sm.yaml` there) and set KUBECONFIG, or set K3SM_WORK_DIR", err)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("no k3sm kubeconfig: %s is not readable and %w — run `sudo k3sm install`, or set K3SM_WORK_DIR", srcPath, err)
 	}

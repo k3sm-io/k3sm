@@ -31,6 +31,7 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/darwin-net/pkg/tcpseg"
 
+	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/registrysvc"
 )
 
@@ -125,15 +126,30 @@ func (a registryAccess) locate(c clusterImage) (clusterImage, error) {
 	return clusterImage{flat: c.flat, remote: rem}, nil
 }
 
+// ownPushCredential is the push credential under workDir, for a verb run by a
+// person. A worker serves no registry, so a credential in a server work dir is left
+// over from an earlier server install and reads as registrysvc.ErrNoCredential, as
+// localRegistryDirs treats the record beside it. There only a work dir the caller
+// named is read.
+//
+// The server's own migration reads registrysvc.ReadCredential directly: it runs
+// inside the server that minted the credential, whatever the installed role says.
+func ownPushCredential(workDir string) (registrysvc.Credential, error) {
+	if role, _ := installedNodeCredential(); role == install.RoleAgent && !callerNamedWorkDir(workDir) {
+		return registrysvc.Credential{}, fmt.Errorf("%w: this Mac is a worker, so one in %s is left over from an earlier server install", registrysvc.ErrNoCredential, workDir)
+	}
+	return registrysvc.ReadCredential(workDir)
+}
+
 // credentialAccess is the per-boot push credential's access, when this account
 // can read the credential under workDir. ok is false when it cannot, for any
-// reason (none was minted there, or the file is another account's 0600 one),
-// which is the caller's cue to use the account's own identity.
+// reason (none was minted there, it is a worker's leftover, or the file is another
+// account's 0600 one), which is the caller's cue to use the account's own identity.
 func credentialAccess(ctx context.Context, workDir string) (acc registryAccess, ok bool, err error) {
 	if workDir == "" {
 		return registryAccess{}, false, nil
 	}
-	if _, err := registrysvc.ReadCredential(workDir); err != nil {
+	if _, err := ownPushCredential(workDir); err != nil {
 		return registryAccess{}, false, nil
 	}
 	authority, err := nodeRegistryAuthority(workDir)
@@ -210,7 +226,7 @@ func registryDeleteAccess(ctx context.Context, workDir string) (registryAccess, 
 	if acc, ok, err := credentialAccess(ctx, workDir); ok {
 		return acc, err
 	}
-	return registryAccess{}, fmt.Errorf("%w: untag deletes, and the push gate a builder token writes through never forwards a delete, so untag needs the server's per-boot credential, which this account cannot read at %s; run it on the server as root: sudo k3sm image --work-dir %s untag <name>",
+	return registryAccess{}, fmt.Errorf("%w: untag deletes, and the push gate a builder token writes through never forwards a delete, so untag needs the server's per-boot credential, which this run cannot use at %s (it is another account's, or this Mac is a worker, where one left by an earlier server is not used); run it on the server as root: sudo k3sm image --work-dir %s untag <name>",
 		errNoNodeRegistry, registrysvc.CredentialPath(workDir), installedServerWorkDir)
 }
 
