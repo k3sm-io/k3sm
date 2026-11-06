@@ -22,8 +22,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -38,8 +40,47 @@ const maxServeConfigBytes = 64 << 10
 // daemon on every boot. It carries only the SHA-256 hashes of the two
 // per-boot secrets: the plaintext of the k3sm principal stays in
 // push-credential.json, and the gate's in the daemon's memory.
+//
+// The server's own settings sit beside them. `k3sm registry serve` needs Listen,
+// and takes everything else from the config's path (serveWorkDir), so a config
+// and the work dir it describes cannot disagree.
 type ServeConfig struct {
 	Principals []auth.Principal `json:"principals"`
+	// Listen is the loopback host:port the server binds.
+	Listen string `json:"listen,omitempty"`
+	// DataVolume is the mount point of the configured data volume; empty when
+	// the install has none. The server refuses to start when the store root is
+	// not on it, so a missed boot mount never creates an empty store on the
+	// system volume.
+	DataVolume string `json:"dataVolume,omitempty"`
+	// UID and GID are the service credential. A server started as root drops to
+	// it before the store opens, and one started as anyone else must already
+	// hold it. A zero UID names none, and then a server started as root refuses.
+	UID int `json:"uid,omitempty"`
+	GID int `json:"gid,omitempty"`
+}
+
+// validateForServing checks what only the server needs. ReadServeConfig does
+// not, so it stays able to read the principals alone.
+func (c ServeConfig) validateForServing() error {
+	host, port, err := net.SplitHostPort(c.Listen)
+	if err != nil {
+		return fmt.Errorf("registry serve config: listen %q: %w", c.Listen, err)
+	}
+	p, err := strconv.Atoi(port)
+	if err != nil {
+		return fmt.Errorf("registry serve config: listen %q: %w", c.Listen, err)
+	}
+	if err := validateBind(host, p); err != nil {
+		return fmt.Errorf("registry serve config: %w", err)
+	}
+	if c.UID < 0 || c.GID < 0 || c.UID == 0 && c.GID != 0 {
+		return fmt.Errorf("registry serve config: credential %d:%d is not a service user", c.UID, c.GID)
+	}
+	if c.DataVolume != "" && (!filepath.IsAbs(c.DataVolume) || filepath.Clean(c.DataVolume) != c.DataVolume) {
+		return fmt.Errorf("registry serve config: data volume %q is not a clean absolute path", c.DataVolume)
+	}
+	return nil
 }
 
 // ServeStateDir returns the registry server's state dir for a work dir:
@@ -58,10 +99,14 @@ func renderServeConfig(push, gate Credential) ([]byte, error) {
 	if push.Username != pushUser || gate.Username != gateUser || push.Password == "" || gate.Password == "" {
 		return nil, errors.New("render the registry serve config: the push and gate credentials are required")
 	}
-	cfg := ServeConfig{Principals: []auth.Principal{
+	return marshalServeConfig(ServeConfig{Principals: []auth.Principal{
 		{User: auth.UserPush, SecretSHA256: auth.HashSecret(push.Password)},
 		{User: auth.UserGate, SecretSHA256: auth.HashSecret(gate.Password)},
-	}}
+	}})
+}
+
+// marshalServeConfig encodes cfg as the file's body.
+func marshalServeConfig(cfg ServeConfig) ([]byte, error) {
 	b, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return nil, fmt.Errorf("render the registry serve config: %w", err)
@@ -192,6 +237,14 @@ func checkStateDir(dir string, fi os.FileInfo) error {
 // or other permission bits, one larger than 64 KiB, an unknown field or
 // trailing data, and principals auth.New would refuse.
 func ReadServeConfig(path string) (ServeConfig, error) {
+	return readServeConfigAs(path, os.Geteuid())
+}
+
+// readServeConfigAs is ReadServeConfig for a process of effective uid euid. A
+// root process may read a config owned by root or by the service user the
+// config itself names, since the daemon writing it runs as that user; root
+// reads it only to learn whom to drop to.
+func readServeConfigAs(path string, euid int) (ServeConfig, error) {
 	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return ServeConfig{}, fmt.Errorf("read the registry serve config: %w", err)
@@ -207,7 +260,7 @@ func ReadServeConfig(path string) (ServeConfig, error) {
 		return ServeConfig{}, fmt.Errorf("registry serve config %s is not a regular file", path)
 	case fi.Mode().Perm()&0o077 != 0:
 		return ServeConfig{}, fmt.Errorf("registry serve config %s has mode %#o, want 0600", path, fi.Mode().Perm())
-	case !ok || int(st.Uid) != os.Geteuid():
+	case !ok || euid != 0 && int(st.Uid) != euid:
 		return ServeConfig{}, fmt.Errorf("registry serve config %s is not owned by this user", path)
 	}
 	b, err := io.ReadAll(io.LimitReader(f, maxServeConfigBytes+1))
@@ -225,6 +278,9 @@ func ReadServeConfig(path string) (ServeConfig, error) {
 	}
 	if dec.More() {
 		return ServeConfig{}, fmt.Errorf("parse the registry serve config %s: trailing data", path)
+	}
+	if euid == 0 && st.Uid != 0 && int(st.Uid) != cfg.UID {
+		return ServeConfig{}, fmt.Errorf("registry serve config %s is owned by uid %d and names uid %d", path, st.Uid, cfg.UID)
 	}
 	if _, err := auth.New(auth.Config{Principals: cfg.Principals}); err != nil {
 		return ServeConfig{}, fmt.Errorf("registry serve config %s: %w", path, err)
