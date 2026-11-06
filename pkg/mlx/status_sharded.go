@@ -63,6 +63,12 @@ const (
 	// rank: too few fitting nodes are up in one segment with an interconnect
 	// address. It is the apis reason, re-exported beside the others.
 	ReasonNoInterconnectSegment = netv1alpha1.ReasonNoInterconnectSegment
+	// ReasonAwaitingInterconnectSlot means the gang resolved onto the
+	// thunderbolt path but a node it would place a rank on does not list the
+	// model in its desired annotation yet. That node's provider would not give
+	// the rank its MLX slot, so the operator waits for the interconnect
+	// resolver to publish the model before it creates any rank Pod.
+	ReasonAwaitingInterconnectSlot = "AwaitingInterconnectSlot"
 )
 
 // Reasons carried by LinksHealthy.

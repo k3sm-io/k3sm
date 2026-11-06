@@ -48,6 +48,12 @@ const (
 	// placementRetry is how soon a model that could not be placed tries again:
 	// a cable armed or a node joining should not wait for a resync.
 	placementRetry = 30 * time.Second
+	// interconnectSlotRetry is how soon a gang waiting for its nodes' desired
+	// annotation to list the model (AwaitingInterconnectSlot) tries again. The
+	// resolver republishes within about a second of an MLXModel change, so a
+	// placementRetry poll would add half a minute to every switch onto the
+	// thunderbolt path.
+	interconnectSlotRetry = 2 * time.Second
 	// gangRetry is how soon a gang restart re-checks whether the survivors are
 	// gone, so the re-placement follows the teardown promptly.
 	gangRetry = 2 * time.Second
@@ -177,6 +183,22 @@ func (c *Controller) reconcileSharded(ctx context.Context, key string, raw *unst
 			obs.LostRanks = lost
 			return c.interconnectLost(ctx, key, raw, model, ic, obs)
 		}
+		// A rank given the wrong interconnect address is a placement error, not
+		// an interconnect loss: the cable is up. The gang is re-placed with no
+		// restart record, and the re-placement waits for the nodes' desired
+		// annotations like any other. A real loss in the same gang is handled
+		// above, first.
+		if misplaced := misplacedRanks(pods); len(misplaced) > 0 {
+			fault := fmt.Sprintf("placement error: %s; re-placing the gang", strings.Join(misplaced, ", "))
+			if err := c.deleteRankPods(ctx, model, fault); err != nil {
+				return err
+			}
+			c.log.Warn("sharded mlxmodel rank was placed on the wrong interconnect slot; re-placing the gang", "mlxmodel", key, "ranks", misplaced)
+			c.queue.AddAfter(key, gangRetry)
+			return c.writeShardedStatus(ctx, raw, model, mlx.ShardObservation{
+				Desired: desired, GangRestart: fault, Pods: c.observeRanks(ctx, model, pods),
+			})
+		}
 		fault, err := c.gangFault(ctx, model, pods, hash)
 		if err != nil {
 			return err
@@ -237,6 +259,18 @@ func (c *Controller) reconcileSharded(ctx context.Context, key string, raw *unst
 	}
 	if err != nil {
 		return fmt.Errorf("place mlxmodel %s: %w", key, err)
+	}
+	if placement.Path() == mlxv1alpha1.MLXInterconnectThunderbolt {
+		if waiting := awaitingDesired(model, nodes.Items, placedNodes(placement)); len(waiting) > 0 {
+			msg := fmt.Sprintf("interconnect thunderbolt: the desired annotation of the nodes%s does not list this model yet, so the provider there would not give its rank the MLX interconnect slot; waiting for the interconnect resolver",
+				nameList(waiting))
+			c.log.Info("sharded mlxmodel waits for its nodes to list it as an interconnect model; no rank pod created",
+				"mlxmodel", key, "nodes", waiting)
+			c.queue.AddAfter(key, interconnectSlotRetry)
+			return c.writeShardedStatus(ctx, raw, model, mlx.ShardObservation{
+				Desired: desired, PlacementReason: mlx.ReasonAwaitingInterconnectSlot, PlacementMessage: msg,
+			})
+		}
 	}
 	objs, err := mlx.RenderSharded(model, c.opts, placement)
 	if err != nil {
@@ -370,11 +404,13 @@ func (c *Controller) forceNetwork(model *mlxv1alpha1.MLXModel) bool {
 //   - its k3sm.io/InterconnectAttached condition is False (the attach was
 //     refused);
 //   - it failed with exit status 2, k3sm-shard's refusal to start (no
-//     interconnect address, or its hostfile entry is not its address);
+//     interconnect address);
 //   - it failed before any attach was recorded.
 //
 // Every one is an interconnect loss with the loss's limit, never the generic
 // gang restart, which would re-resolve straight back onto the cable. A rank
+// that exited shardMisplacedExit is not listed: it held an interconnect
+// address, only not the one its hostfile entry names (misplacedRanks). A rank
 // that failed otherwise, after its attach succeeded, is the generic gang fault.
 // A gang on the network path lists nothing.
 func lostRanks(pods []corev1.Pod) []string {
@@ -394,6 +430,7 @@ func lostRanks(pods []corev1.Pod) []string {
 		case attach != nil && attach.Status == corev1.ConditionFalse:
 			out = append(out, fmt.Sprintf("%s (attach refused, %s: %s)", pod.Name, attach.Reason, attach.Message))
 		case pod.Status.Phase != corev1.PodFailed:
+		case exitedWith(pod, shardMisplacedExit):
 		case exitedWith(pod, shardRefusedExit):
 			out = append(out, fmt.Sprintf("%s (exited %d: k3sm-shard refused to start on the interconnect)", pod.Name, shardRefusedExit))
 		case attach == nil:
@@ -403,10 +440,34 @@ func lostRanks(pods []corev1.Pod) []string {
 	return out
 }
 
-// shardRefusedExit is the exit status of k3sm-shard refusing to start a rank
-// (hack/images/mlx-serve/k3sm_shard.py main): on the thunderbolt path, a rank
-// without its interconnect address or whose hostfile entry is not it.
-const shardRefusedExit = 2
+// The k3sm-shard exit statuses the operator reads
+// (hack/images/mlx-serve/k3sm_shard.py, REFUSED_STATUS and MISPLACED_STATUS;
+// TestShardExitStatusesMatchTheScript keeps them in sync).
+const (
+	// shardRefusedExit is k3sm-shard refusing to start a rank: on the
+	// thunderbolt path, a rank without its interconnect address.
+	shardRefusedExit = 2
+	// shardMisplacedExit is k3sm-shard refusing a rank on the thunderbolt path
+	// whose interconnect address is not the one its K3SM_MLX_HOSTS entry
+	// names: the node's provider gave it another slot.
+	shardMisplacedExit = 3
+)
+
+// misplacedRanks lists the rank Pods on the thunderbolt path that exited
+// shardMisplacedExit, as "pod (why)". Each is a placement error the operator
+// retries by re-placing the gang, never an interconnect loss.
+func misplacedRanks(pods []corev1.Pod) []string {
+	var out []string
+	for i := range pods {
+		pod := &pods[i]
+		if pod.Annotations[mlx.AnnotationInterconnect] != string(mlxv1alpha1.MLXInterconnectThunderbolt) ||
+			pod.Status.Phase != corev1.PodFailed || !exitedWith(pod, shardMisplacedExit) {
+			continue
+		}
+		out = append(out, fmt.Sprintf("%s (exited %d: its interconnect address is not the one K3SM_MLX_HOSTS names)", pod.Name, shardMisplacedExit))
+	}
+	return out
+}
 
 // exitedWith reports whether any of the pod's containers terminated with code.
 func exitedWith(pod *corev1.Pod, code int32) bool {
@@ -628,6 +689,34 @@ func placedNode(pod *corev1.Pod) string {
 		return n
 	}
 	return pod.Spec.NodeName
+}
+
+// awaitingDesired returns the placed nodes whose desired annotation does not
+// list the model by namespace, name and UID: absent, unreadable, or written
+// before the interconnect resolver saw the model. The provider on such a node
+// gives a rank a general interconnect slot instead of the MLX slot that
+// K3SM_MLX_HOSTS names, so placing there would only start a rank that refuses.
+// It reads the annotation exactly as the provider does
+// (netv1alpha1.ParseInterconnectDesired and HasMLXModel).
+func awaitingDesired(model *mlxv1alpha1.MLXModel, nodes []corev1.Node, placed []string) []string {
+	byName := make(map[string]*corev1.Node, len(nodes))
+	for i := range nodes {
+		byName[nodes[i].Name] = &nodes[i]
+	}
+	var out []string
+	for _, name := range placed {
+		n := byName[name]
+		if n == nil {
+			out = append(out, name)
+			continue
+		}
+		d, err := netv1alpha1.ParseInterconnectDesired(n.Annotations[netv1alpha1.AnnotationInterconnectDesired])
+		if err != nil || !d.HasMLXModel(model.Namespace, model.Name, string(model.UID)) {
+			out = append(out, name)
+		}
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
 }
 
 // placedNodes lists a placement's nodes in rank order, for a log line.

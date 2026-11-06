@@ -34,6 +34,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -123,6 +124,11 @@ type ResolverConfig struct {
 	// new or changed desired value (removals still apply), so a node never
 	// loses a model on missing information.
 	MLXModels func(ctx context.Context) ([]netv1alpha1.InterconnectModelRef, error)
+	// MLXModelWatch is the client the leader watches MLXModels through, so a
+	// model that moves onto (or off) the interconnect is published in the
+	// desired annotation at once, not at the next ResyncInterval. nil watches
+	// none.
+	MLXModelWatch dynamic.Interface
 	// Recorder records Node Events; nil builds one over Client.
 	Recorder record.EventRecorder
 	// Metrics receives member and rejection metrics; nil records none.
@@ -330,8 +336,9 @@ func (r *Resolver) campaign(ctx context.Context, lock resourcelock.Interface) er
 	return nil
 }
 
-// lead runs the Node and node-Lease informers and reconciles on every Node
-// change and every ResyncInterval until ctx ends.
+// lead runs the Node, node-Lease and (with MLXModelWatch) MLXModel informers
+// and reconciles on every Node change, every MLXModel add, delete or spec
+// change, and every ResyncInterval until ctx ends.
 func (r *Resolver) lead(ctx context.Context) {
 	nf := informers.NewSharedInformerFactory(r.cfg.Client, 0)
 	lf := informers.NewSharedInformerFactoryWithOptions(r.cfg.Client, 0, informers.WithNamespace(nodeLeaseNamespace))
@@ -349,6 +356,10 @@ func (r *Resolver) lead(ctx context.Context) {
 		UpdateFunc: func(_, _ any) { nudge() },
 		DeleteFunc: func(any) { nudge() },
 	})
+	if r.cfg.MLXModelWatch != nil {
+		shutdown, _ := watchMLXModels(r.cfg.MLXModelWatch, nudge, ctx.Done())
+		defer shutdown()
+	}
 	r.SetListers(nodeInf.Lister(), leaseInf.Lister(), func() bool {
 		return nodeInf.Informer().HasSynced() && leaseInf.Informer().HasSynced()
 	})

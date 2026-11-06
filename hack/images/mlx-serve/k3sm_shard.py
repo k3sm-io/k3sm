@@ -124,10 +124,21 @@ PROBE_TIMEOUT_SECONDS = 25.0
 
 STATE_SUBDIR = "k3sm-shard"
 
+# The exit status of a rank that refuses to start. On the thunderbolt path the
+# operator reads it as a refusal to start on the interconnect, an interconnect
+# loss (pkg/mlx/operator shardRefusedExit, lostRanks).
+REFUSED_STATUS = 2
+
+# The exit status of a rank on the thunderbolt path whose interconnect address
+# is not the one its K3SM_MLX_HOSTS entry names: the node's provider gave it
+# another slot. The cable is up, so it is not an interconnect loss; the operator
+# reads it as a placement error and re-places the gang (pkg/mlx/operator
+# shardMisplacedExit, misplacedRanks). Keep the two values in sync with Go.
+MISPLACED_STATUS = 3
+
 # The exit status of a rank whose pinned revision could not be fetched. It is
-# not 2: on the thunderbolt path the operator reads a rank's exit 2 as a refusal
-# to start on the interconnect (pkg/mlx/operator lostRanks), and a Hub failure is
-# not an interconnect loss. Status 1 is the generic gang fault.
+# not REFUSED_STATUS: a Hub failure is not an interconnect loss. Status 1 is the
+# generic gang fault.
 SEED_FAILED_STATUS = 1
 
 # The option the operator renders for the name the engine serves under, and the
@@ -142,6 +153,10 @@ IBV_DEVICES_NAME = "mlx-ibv-devices.json"
 
 class ShardError(Exception):
     """A rank cannot be started; the message says why."""
+
+
+class ShardMisplaced(ShardError):
+    """The rank's interconnect address is not the one its hostfile entry names."""
 
 
 def _require(env, name):
@@ -226,7 +241,7 @@ def interconnect_hosts(env, rank, world, port):
                          f"address to bind its hostfile entry {own!r} on; the interconnect attach was refused "
                          f"(see the Pod's k3sm.io/InterconnectAttached condition), exiting so the operator re-places the gang")
     if host != mine:
-        raise ShardError(f"{ENV_HOSTS} names {host} for rank {rank}, but this rank's interconnect address "
+        raise ShardMisplaced(f"{ENV_HOSTS} names {host} for rank {rank}, but this rank's interconnect address "
                          f"({ENV_INTERCONNECT_IP}) is {mine}: it would bind an address it does not hold")
     return hosts
 
@@ -621,9 +636,12 @@ def main(argv=None):
         print(f"k3sm-shard: rank {child_env['MLX_RANK']} of {child_env['MLX_WORLD_SIZE']}, "
               f"backend {env[ENV_BACKEND]}, {' '.join(child_argv[2:3])} serving as {served or 'its --model'}",
               file=sys.stderr, flush=True)
+    except ShardMisplaced as e:
+        print(f"k3sm-shard: {e}", file=sys.stderr, flush=True)
+        return MISPLACED_STATUS
     except ShardError as e:
         print(f"k3sm-shard: {e}", file=sys.stderr, flush=True)
-        return 2
+        return REFUSED_STATUS
     # After the plan, so a rank that cannot start refuses before a long download.
     try:
         seed_pinned_revision(argv, env, parse=engine_model)
@@ -634,7 +652,7 @@ def main(argv=None):
         result = serve(child_env, child_argv, served)
     except ShardError as e:
         print(f"k3sm-shard: {e}", file=sys.stderr, flush=True)
-        return 2
+        return REFUSED_STATUS
     return exit_status(result)
 
 
