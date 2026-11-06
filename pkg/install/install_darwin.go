@@ -257,7 +257,7 @@ func ensureFileOwnedByVia(ops fileOps, path string, uid, gid int, mode fs.FileMo
 	case err == nil && fi.Mode()&fs.ModeSymlink != 0:
 		return fmt.Errorf("%s: %w: %w", path, ErrNotRegularFile, errSymlinkRefused)
 	case err == nil && !fi.Mode().IsRegular():
-		return fmt.Errorf("%s is a %s: %w", path, fi.Mode().Type(), ErrNotRegularFile)
+		return fmt.Errorf("%s is %s: %w; %s", path, lockEntryKind(fi.Mode()), ErrNotRegularFile, lockRemedy(fi.Mode(), path))
 	case err != nil && !errors.Is(err, fs.ErrNotExist):
 		return fmt.Errorf("lstat %s: %w", path, err)
 	}
@@ -274,7 +274,11 @@ func ensureFileOwnedByVia(ops fileOps, path string, uid, gid int, mode fs.FileMo
 		return fmt.Errorf("stat %s: %w", path, err)
 	}
 	if st.Mode&unix.S_IFMT != unix.S_IFREG {
-		return fmt.Errorf("%s: %w", path, ErrNotRegularFile)
+		mode := fs.FileMode(0)
+		if st.Mode&unix.S_IFMT == unix.S_IFDIR {
+			mode = fs.ModeDir
+		}
+		return fmt.Errorf("%s: %w; %s", path, ErrNotRegularFile, lockRemedy(mode, path))
 	}
 	if st.Nlink != 1 {
 		return fmt.Errorf("%s has %d links: %w: %w; the lock file holds no state, so it is safe to remove: run `sudo rm %s` and re-run the install",
@@ -289,6 +293,24 @@ func ensureFileOwnedByVia(ops fileOps, path string, uid, gid int, mode fs.FileMo
 		return fmt.Errorf("chmod %s %#o: %w", path, mode, err)
 	}
 	return nil
+}
+
+// lockEntryKind names what a non-regular entry is, for an error message.
+func lockEntryKind(m fs.FileMode) string {
+	if m.IsDir() {
+		return "a directory"
+	}
+	return "a " + m.Type().String()
+}
+
+// lockRemedy words the removal of a non-regular entry standing in for the lock
+// file by what is at the path: `rm` fails on a directory. The lock file holds
+// no state, so removing the entry is safe.
+func lockRemedy(m fs.FileMode, path string) string {
+	if m.IsDir() {
+		return fmt.Sprintf("the lock file holds no state, so it is safe to remove the directory: run `sudo rmdir %s` (`sudo rm -rf %s` if it is not empty) and re-run the install", path, path)
+	}
+	return fmt.Sprintf("the lock file holds no state, so it is safe to remove the entry: run `sudo rm %s` and re-run the install", path)
 }
 
 // EnsureLogDir creates (or repairs) the log dir owned by the service uid, group
