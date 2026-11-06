@@ -2224,8 +2224,31 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 		}
 		return fmt.Errorf("runtimed create pod %s/%s rejected: %s (%s)", pod.Namespace, pod.Name, e.GetMessage(), resp.GetFailureReason().String())
 	}
+	if r.createBehindDelete(id, t) {
+		// runtimed registers a pod only when its create finishes, and its DeletePod
+		// answers success for an id it has not registered, so a delete inside this
+		// RPC stopped nothing and the guest is running. The delete has the rest of
+		// the pod: the release and the track are createDone's.
+		r.compensateLateCreate(pod)
+		return nil
+	}
 	r.completeCreate(pod, t, resp.GetStatus())
 	return nil
+}
+
+// createBehindDelete reports whether a delete of pod id has begun, which is what a
+// create that has just landed has to answer: quiesce marks the track before the
+// delete's RPC, so unmarked means that RPC is still to come and will reach what the
+// create built. A delete that began on a replacement of t marks only the replacement.
+// Deleting again when the first delete did reach it is a no-op.
+func (r *runtimedRuntime) createBehindDelete(id string, t *podTrack) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, owed := r.deleteOwed[id]; owed || trackDeleting(t) {
+		return true
+	}
+	live := r.track[id]
+	return live != nil && trackDeleting(live)
 }
 
 // untrackRejectedCreate forgets a pod runtimed refused to create at the pod

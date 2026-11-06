@@ -530,8 +530,6 @@ func (r *runtimedRuntime) inFlightLocked(id string) bool {
 // release in progress has none in flight beside it. The caller holds r.mu.
 //
 // "Once" covers what reaches this decision. Still open:
-//   - A create whose RPC succeeds behind a delete: the guest the runtime built is not
-//     deleted again, unlike a parked retry's (commitParkedCreate). Its /32 is released.
 //   - An untracked update with no deletion stamp that is not behind a delete of its
 //     UID, or is behind one uidTombstones has evicted: it allocates as it always did,
 //     and a later create, delete or refusal of the UID frees that, or the orphan

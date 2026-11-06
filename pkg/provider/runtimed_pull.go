@@ -1298,8 +1298,8 @@ func (r *runtimedRuntime) commitParkedCreate(t *podTrack, podID string) commitRe
 	}
 }
 
-// compensateLateCreate deletes a pod the runtime created for a retry the
-// provider can no longer adopt, retrying until the delete lands.
+// compensateLateCreate deletes a pod the runtime created for a create or a retry
+// the provider can no longer adopt, retrying until the delete lands.
 //
 // Without it the create is a RESURRECTION: virtual-kubelet is long past its
 // DeletePod, the track is gone, and runtimed's DeletePod for a pod id it does
@@ -1334,7 +1334,7 @@ func (r *runtimedRuntime) compensateLateCreate(pod *corev1.Pod) {
 	if already {
 		return
 	}
-	r.log.Warn("a parked pod's create landed after the pod was deleted; deleting it again",
+	r.log.Warn("a pod's create landed after the pod was deleted; deleting it again",
 		"namespace", pod.Namespace, "name", pod.Name, "pod", podID)
 	go r.runCompensatingDelete(pod, podID)
 }

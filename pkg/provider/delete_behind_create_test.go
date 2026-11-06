@@ -408,3 +408,99 @@ func TestRefusedCreateLeavesItsReplacement(t *testing.T) {
 		assertRunning(t, x, p, want)
 	})
 }
+
+// TestCreateLandingBehindDeleteIsDeletedAgain: runtimed registers a pod only when its
+// create finishes, and answers a DeletePod for a pod it has not registered as a
+// success that did nothing, so a delete inside a create's RPC does not stop what the
+// create builds. Fails when the create's way out assumes the delete did: a guest runs
+// with no track, on a /32 that can be issued again, and nothing ever deletes it.
+func TestCreateLandingBehindDeleteIsDeletedAgain(t *testing.T) {
+	ctx := context.Background()
+
+	// holdThenReap has a create inside the RPC with the reaper's delete behind it.
+	holdThenReap := func(t *testing.T, x *terminalUpdateFixture) (release func(), created <-chan error) {
+		t.Helper()
+		release = x.f.holdCreate()
+		t.Cleanup(release)
+		done := make(chan error, 1)
+		go func() { done <- x.r.CreatePod(ctx, x.pod.DeepCopy()) }()
+		waitRestart(t, "the create's RPC to be entered", func() bool { return x.f.createCount() == 1 })
+		tr := x.r.trackByID(string(x.pod.UID))
+		if tr == nil {
+			t.Fatal("the create published no track")
+		}
+		x.r.reapOrphan(ctx, x.pod.DeepCopy(), tr)
+		return release, done
+	}
+	deletes := func(x *terminalUpdateFixture) (calls int, built bool) {
+		x.f.mu.Lock()
+		defer x.f.mu.Unlock()
+		_, built = x.f.created[string(x.pod.UID)]
+		return x.f.deleteCalls, built
+	}
+
+	t.Run("the create lands", func(t *testing.T) {
+		x := newTerminalUpdateFixture(t, compressorAt(10))
+		p := probeNetwork(x)
+		release, created := holdThenReap(t, x)
+		if n, _ := deletes(x); n != 1 {
+			t.Fatalf("runtime DeletePod calls before the create lands = %d, want 1", n)
+		}
+		release()
+		if err := awaitErr(t, created, "the create"); err != nil {
+			t.Fatalf("the create = %v, want nil: the delete has the pod", err)
+		}
+		waitRestart(t, "the guest the create built to be deleted", func() bool {
+			_, built := deletes(x)
+			return !built && compensatingCount(x.r) == 0
+		})
+		if n, _ := deletes(x); n != 2 {
+			t.Errorf("runtime DeletePod calls = %d, want 2", n)
+		}
+		x.assertForgotten(t)
+		if _, n := p.counts(); n != 1 {
+			t.Errorf("releases = %d, want 1", n)
+		}
+		x.r.mu.Lock()
+		probers := len(x.r.probers)
+		x.r.mu.Unlock()
+		if probers != 0 {
+			t.Errorf("probers = %d, want 0 for a deleted pod", probers)
+		}
+	})
+
+	// A refused create built nothing, so there is nothing to delete again.
+	t.Run("the create is refused", func(t *testing.T) {
+		x := newTerminalUpdateFixture(t, compressorAt(10))
+		x.f.pushCreate(podLevelRefusal())
+		release, created := holdThenReap(t, x)
+		release()
+		if err := awaitErr(t, created, "the create"); err == nil {
+			t.Fatal("the create succeeded; the test needs it refused")
+		}
+		if n, _ := deletes(x); n != 1 {
+			t.Errorf("runtime DeletePod calls = %d, want 1", n)
+		}
+		if n := compensatingCount(x.r); n != 0 {
+			t.Errorf("compensating deletes = %d, want 0", n)
+		}
+		x.assertForgotten(t)
+	})
+
+	// A delete that begins after the create landed reaches what it built.
+	t.Run("the delete follows the create", func(t *testing.T) {
+		x := newTerminalUpdateFixture(t, compressorAt(10))
+		if err := x.r.CreatePod(ctx, x.pod.DeepCopy()); err != nil {
+			t.Fatalf("CreatePod: %v", err)
+		}
+		if err := x.r.DeletePod(ctx, x.pod.DeepCopy()); err != nil {
+			t.Fatalf("DeletePod: %v", err)
+		}
+		if n, built := deletes(x); n != 1 || built {
+			t.Errorf("runtime DeletePod calls = %d, guest built = %v, want 1 and false", n, built)
+		}
+		if n := compensatingCount(x.r); n != 0 {
+			t.Errorf("compensating deletes = %d, want 0", n)
+		}
+	})
+}
