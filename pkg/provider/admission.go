@@ -428,7 +428,7 @@ func (r *runtimedRuntime) createDone(pod *corev1.Pod, t *admitTicket) {
 	}
 }
 
-// updateDone ends one UpdatePod, or one parked retry's allocation (retryParkedBox).
+// updateDone ends one UpdatePod, or one parked pod's retry (retryParkedCreate).
 // A refusal may have landed behind it, with no create in flight to reach CreatePod's
 // fence, and a refused pod's delete frees nothing; or a delete may have, leaving the
 // rest of its teardown here. So the last call out releases. The release runs with
@@ -539,9 +539,11 @@ func (u *uidTombstones) has(id string) bool {
 }
 
 // inFlightLocked reports whether a create or an update of pod id has not returned,
-// so it can still acquire by the pod's UID. The caller holds r.mu.
+// so it can still acquire by the pod's UID, or whether a guest a late create built
+// still stands, answering on the pod's /32 until its compensating delete lands
+// (runCompensatingDelete). A release waits for all of them. The caller holds r.mu.
 func (r *runtimedRuntime) inFlightLocked(id string) bool {
-	return r.admitting[id] != 0 || r.updating[id] != 0
+	return r.admitting[id] != 0 || r.updating[id] != 0 || r.compensating[id]
 }
 
 // claimFenceReleaseLocked decides, under r.mu, that the caller releases what pod

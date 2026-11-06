@@ -18,11 +18,14 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"os"
 	"sync"
 	"testing"
+	"time"
 
 	"k8s.io/apimachinery/pkg/types"
+	testclock "k8s.io/utils/clock/testing"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/k3sm/pkg/provider/podlogs"
@@ -616,4 +619,133 @@ func TestRefusedTrackBesideUpdateAnswersItsName(t *testing.T) {
 		t.Errorf("the update: %v", err)
 	}
 	x.assertForgotten(t)
+}
+
+// TestCompensatingDeleteHoldsTheAddress: a guest a late create built answers on its
+// /32 until the compensating delete lands, and that delete retries for as long as the
+// runtime is down. The address goes only then, once, as teardownPod releases only
+// after the guest is confirmed gone. Fails when the create's way out releases at once:
+// the allocator can hand the address to a new pod beside a live guest.
+func TestCompensatingDeleteHoldsTheAddress(t *testing.T) {
+	ctx := context.Background()
+
+	// assertHeldUntilDeleted walks the compensating delete through two failures with
+	// the guest standing, then lets it land. deletesBefore is what preceded it.
+	assertHeldUntilDeleted := func(t *testing.T, x *terminalUpdateFixture, p *netProbe, clk *testclock.FakeClock, deletesBefore int) {
+		t.Helper()
+		id := string(x.pod.UID)
+		held := func(when string) {
+			t.Helper()
+			if _, ok := x.ipam.allocations()[id]; !ok {
+				t.Errorf("%s: the address was released with the guest standing", when)
+			}
+			if _, n := p.counts(); n != 0 {
+				t.Errorf("%s: releases = %d, want 0", when, n)
+			}
+		}
+		deletes := func() int {
+			x.f.mu.Lock()
+			defer x.f.mu.Unlock()
+			return x.f.deleteCalls
+		}
+		waitRestart(t, "the first compensating delete", func() bool { return deletes() == deletesBefore+1 })
+		waitRestart(t, "the compensating retry to arm", clk.HasWaiters)
+		held("after one failed delete")
+		clk.Step(11 * time.Second)
+		waitRestart(t, "the second compensating delete", func() bool { return deletes() == deletesBefore+2 })
+		waitRestart(t, "the compensating retry to re-arm", clk.HasWaiters)
+		held("after two failed deletes")
+		clk.Step(21 * time.Second)
+		waitRestart(t, "the compensating delete to land and retire", func() bool { return compensatingCount(x.r) == 0 })
+		x.assertForgotten(t)
+		if _, n := p.counts(); n != 1 {
+			t.Errorf("releases = %d, want 1", n)
+		}
+	}
+
+	t.Run("a create", func(t *testing.T) {
+		x := newTerminalUpdateFixture(t, compressorAt(10))
+		p := probeNetwork(x)
+		clk := testclock.NewFakeClock(time.Now())
+		x.r.clk = clk
+		release := x.f.holdCreate()
+		defer release()
+		created := make(chan error, 1)
+		go func() { created <- x.r.CreatePod(ctx, x.pod.DeepCopy()) }()
+		waitRestart(t, "the create's RPC to be entered", func() bool { return x.f.createCount() == 1 })
+		x.r.reapOrphan(ctx, x.pod.DeepCopy(), x.r.trackByID(string(x.pod.UID)))
+		x.f.pushDeleteErr(errors.New("runtimed unavailable"))
+		x.f.pushDeleteErr(errors.New("runtimed unavailable"))
+		release()
+		if err := awaitErr(t, created, "the create"); err != nil {
+			t.Fatalf("the create = %v, want nil", err)
+		}
+		assertHeldUntilDeleted(t, x, p, clk, 1)
+	})
+
+	// The retry's whole RPC counts: a delete behind it has to leave the release to it.
+	t.Run("a parked retry", func(t *testing.T) {
+		x := newTerminalUpdateFixture(t, compressorAt(10))
+		p := probeNetwork(x)
+		clk := testclock.NewFakeClock(time.Now())
+		x.r.clk = clk
+		x.f.pushCreate(imageRefusal())
+		if err := x.r.CreatePod(ctx, x.pod.DeepCopy()); err != nil {
+			t.Fatalf("CreatePod = %v, want the pod parked", err)
+		}
+		tr := x.r.trackByID(string(x.pod.UID))
+		if tr == nil || tr.parkedFailure() == nil {
+			t.Fatalf("the pod did not park (%s)", trackState(tr))
+		}
+		creates := x.f.createCount()
+		release := x.f.holdCreate()
+		defer release()
+		retried := make(chan error, 1)
+		go func() {
+			_, _, err := x.r.retryParkedCreate(ctx, x.pod.DeepCopy(), tr)
+			retried <- err
+		}()
+		waitRestart(t, "the retry's RPC to be entered", func() bool { return x.f.createCount() == creates+1 })
+		if err := x.r.DeletePod(ctx, x.pod.DeepCopy()); err != nil {
+			t.Fatalf("DeletePod: %v", err)
+		}
+		if _, n := p.counts(); n != 0 {
+			t.Errorf("releases with the retry's RPC out = %d, want 0", n)
+		}
+		x.f.pushDeleteErr(errors.New("runtimed unavailable"))
+		x.f.pushDeleteErr(errors.New("runtimed unavailable"))
+		release()
+		if err := awaitErr(t, retried, "the retry"); err != nil {
+			t.Fatalf("the retry = %v, want nil", err)
+		}
+		assertHeldUntilDeleted(t, x, p, clk, 1)
+	})
+
+	// The next daemon start decides a guest this one never confirmed gone: nothing
+	// here may hand on its address on the way down.
+	t.Run("the provider shuts down first", func(t *testing.T) {
+		x := newTerminalUpdateFixture(t, compressorAt(10))
+		p := probeNetwork(x)
+		clk := testclock.NewFakeClock(time.Now())
+		x.r.clk = clk
+		lifetime := make(chan struct{})
+		x.r.lifetime = lifetime
+		release := x.f.holdCreate()
+		defer release()
+		created := make(chan error, 1)
+		go func() { created <- x.r.CreatePod(ctx, x.pod.DeepCopy()) }()
+		waitRestart(t, "the create's RPC to be entered", func() bool { return x.f.createCount() == 1 })
+		x.r.reapOrphan(ctx, x.pod.DeepCopy(), x.r.trackByID(string(x.pod.UID)))
+		x.f.pushDeleteErr(errors.New("runtimed unavailable"))
+		release()
+		if err := awaitErr(t, created, "the create"); err != nil {
+			t.Fatalf("the create = %v, want nil", err)
+		}
+		waitRestart(t, "the compensating retry to arm", clk.HasWaiters)
+		close(lifetime)
+		waitRestart(t, "the compensating delete to give up", func() bool { return compensatingCount(x.r) == 0 })
+		if _, n := p.counts(); n != 0 {
+			t.Errorf("releases = %d, want 0", n)
+		}
+	})
 }

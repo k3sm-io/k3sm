@@ -147,7 +147,7 @@ pin, its date, and the tarball's sha256.
 - A pod whose create failed and which was then deleted no longer keeps its address and references until the node restarts. The orphan reaper releases them once the apiserver has stopped holding the pod.
 - A pod created under the name of one the node is still finishing a delete for now starts. It could be sent to update the old pod instead, and be left with an address nothing owned or fail for good.
 - A create the runtime refuses after a second create of the same pod took over no longer takes that pod's address and log directory while it runs.
-- A pod deleted while the runtime is still creating it no longer keeps running with no owner. The node deletes it again once the create lands.
+- A pod deleted while the runtime is still creating it no longer keeps running with no owner. The node deletes it again once the create lands, and keeps the pod's address until that delete has succeeded, so no new pod can be given it beside the running one.
 - `k3sm` and the etcd, kine and zot it builds now link `github.com/klauspost/compress` v1.20.2, which fixes GO-2026-6865, a panic on two-block frames. Every node re-stages kine and zot on upgrade.
 - Turning Spotlight indexing off for the data volume no longer waits indefinitely on `mdutil`. The
   `.metadata_never_index` marker is what excludes the volume and is written first, so the `mdutil`

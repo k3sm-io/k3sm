@@ -267,8 +267,8 @@ type runtimedRuntime struct {
 	admitSettled map[string]chan struct{}
 	// updating counts, per pod id, the UpdatePods that have not returned, from
 	// before they wait for a verdict, and the parked-create retries that have not
-	// finished allocating (retryParkedBox). Each may still acquire the pod's /32, so
-	// a release cannot start while it is non-zero (admission.go,
+	// returned (retryParkedCreate). Each may still acquire the pod's /32, or build a
+	// guest on it, so a release cannot start while it is non-zero (admission.go,
 	// claimFenceReleaseLocked). Guarded by mu; created on first use.
 	updating map[string]int
 	// held is the set of pods a create or update has begun acquiring for with no
@@ -317,7 +317,7 @@ type runtimedRuntime struct {
 	// track is gone by then, so there is nowhere else to hold it, and the pod id
 	// is what the delete is keyed on anyway. It is also the dedupe: one loop per
 	// pod id, however many late creates land for it.
-	compensating map[string]bool // pod id -> a compensating delete is in flight
+	compensating map[string]bool // pod id -> the delete is outstanding (true), or landed with its release running (false)
 
 	// lifetime is closed when the provider shuts down — the Watch context, which
 	// bounds every other provider-owned goroutine, ending. It bounds the ONE
