@@ -83,7 +83,7 @@ func (w *world) sweep(t *testing.T, c *Collector, hook func()) error {
 		t.Fatal(err)
 	}
 	for _, n := range repos {
-		m, err := c.mark(n, c.now().Add(-c.grace))
+		m, err := c.mark(w.ctx, n, c.now().Add(-c.grace))
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -532,6 +532,64 @@ with a delay long enough that a slow push is never collected out from under itse
 directory while the server is stopped resets the registry to empty; nothing else in the cluster
 depends on its contents.
 
+The first sweep that meets a repository only reports. The server log lists what it would remove as
+`registry gc: would reap` lines, and later sweeps delete. A repository stays in that state until a
+sweep can read it and the half-repository brake lets it through, and one in that state does not
+hold back any other. Each sweep ends with a `registry gc: sweep finished` line that counts the
+repositories stopped and failed and carries the error.
+
+### Restoring a Backup of the Registry
+
+Restore into an emptied `<work-dir>/registry/`, with the server stopped. Do not merge a backup over
+a live registry (`rsync` without `--delete`, or `tar -x` into the directory as it stands).
+
+A merge keeps the live `<work-dir>/registry/.k3sm-store-id`, and the collector cannot tell a
+restored `index.json` from a push. In a repository it has already reviewed, the next sweep can
+delete what the restored `index.json` no longer names, such as anything pushed after the backup was
+taken. A repository the merge adds is reported on first, like any new one.
+
+If you must merge, or already have, stop the server and remove the id file before you start it
+again:
+
+```sh
+sudo rm <work-dir>/registry/.k3sm-store-id
+```
+
+The server then treats the root as a new store: every repository gets one report-only sweep, so you
+can read what it would remove in the log before anything goes. A backup restored into an emptied
+root without the id file gets the same sweep.
+
+### When Garbage Collection Stops
+
+Nothing is deleted in any of these cases. Each shows on every sweep in the
+`registry gc: sweep finished` line.
+
+- **`malformed store id`, or the id file cannot be read.** The sweep runs no further. Remove
+  `<work-dir>/registry/.k3sm-store-id`, or fix its permissions if it should still be read. After a
+  removal the next sweep only reports, and the one after it deletes.
+- **`write store id`.** The sweep could not create the id file, which it does by making a hard
+  link, so a filesystem without hard links never succeeds and repositories stay report-only. Move
+  the registry to a volume with hard links, or write the id yourself, as the server's user, in
+  the form the server expects (32 lowercase hexadecimal digits and a newline):
+  `openssl rand -hex 16 > <work-dir>/registry/.k3sm-store-id`.
+- **`manifest unreadable`.** A stored manifest cannot be read, so the sweep of that repository
+  stops and the others go on. The server now refuses such a manifest at push, but one pushed
+  earlier stays until you delete it: delete its tag, or its digest if it has no tag, and sweeps of
+  that repository run again. The error names the digest. An index's child that has no row of its
+  own stops the sweep the same way only when it is over the 4 MiB manifest limit or its bytes do
+  not hash to its digest: delete the index that names it. Any other blob named as a child does not
+  stop the sweep. It is kept, along with every digest its JSON contains, and the sweep follows each
+  of those digests the repository holds a blob for. A manifest found this way keeps what it names,
+  as any manifest does, and if it is an index, a child of its own over the limit or failing its hash
+  stops the sweep too. A blob the strict read refuses is searched for digests in the same way. A
+  blob over the limit or failing its hash is kept and stops nothing. A sweep reads each blob at most
+  once per pass over a repository, and at most 4 MiB of it, so the extra reading is bounded by the
+  number of blobs the repository holds, and the memory by the digests those blobs name, each held
+  once however often a body repeats it. A cancelled sweep stops before its next read.
+- **`would delete more than half`.** The half-repository brake stopped the sweep of that repository,
+  and a `registry gc: sweep stopped` line says how many blobs it held back. Check that the
+  repository's tags are the ones you expect.
+
 ## Security Posture
 
 - The registry binds loopback only. Its own listener binds `127.0.0.1`, serves plain HTTP there, and

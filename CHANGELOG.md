@@ -180,6 +180,21 @@ pin, its date, and the tarball's sha256.
 - A guest no longer outlives its deleted pod when a create lands around the delete: a second late create of a
   pod whose image was edited while parked, a create inside the orphan reaper's delete, or a create the reaper's
   release overtakes. No RBAC changes.
+- The k3sm registry refuses at push any manifest its garbage collector could not read, such as an
+  index with no `manifests` array or a body that repeats `config` as null, with `MANIFEST_INVALID`.
+  An index that names a blob that is not a manifest as a child no longer stops garbage collection for
+  its repository, unless the blob is over the 4 MiB manifest limit or fails its hash. The blob is
+  kept, along with every digest its JSON contains, and the sweep follows those digests through the
+  blobs the repository holds, so a stored manifest the strict read refuses does not lose its config
+  or layers. A manifest of that kind pushed earlier with its own row still stops its repository's
+  sweep until you delete it.
+- The registry's garbage collector reviews each repository in its own report-only sweep. A repository
+  it cannot read or plan no longer keeps every other at report-only, and no longer deletes
+  unreviewed once the problem clears. A report-only sweep also lists what the half-repository brake
+  holds back. After an upgrade, or for a repository new to the store, the first sweep only reports.
+  [Restore a registry backup into an emptied root](docs/user/registry.md#restoring-a-backup-of-the-registry):
+  a merge over a live registry can delete what was pushed after the backup.
+
 - An image edit on a running vm Pod is no longer silent. The container stays on its image, as it did, and the Pod now records a `Warning` `ImageEditNotApplied` Event naming the container and both images, and no longer records `Pulling` and `Pulled` for an image nothing fetched. `containerStatuses[].image` keeps naming what runs. The native path is unchanged.
 - A vm Pod's container killed by a signal in the guest, including an OOM kill, reports exit code 128 plus the signal, so 137 for an OOM kill, as a native Pod does; it reported 0. Such an init container no longer reports `Initialized=True`, `FallbackToLogsOnError` now applies to it, and a `SIGKILL` nothing in k3sm sent now counts in `kernelKills`.
 - An exec on a pulled-image pod now resolves an absolute command inside the image and passes the same signature check as the pod's start. A host path the image lacks still runs the host's copy, and the image's copy wins when it has one. A symlink leaving the root filesystem is refused.

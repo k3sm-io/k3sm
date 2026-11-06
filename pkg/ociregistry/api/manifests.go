@@ -33,6 +33,7 @@ import (
 	"github.com/opencontainers/go-digest"
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 
+	"k3sm.io/k3sm/pkg/ociregistry/gc"
 	"k3sm.io/k3sm/pkg/ociregistry/ref"
 	"k3sm.io/k3sm/pkg/ociregistry/store"
 )
@@ -205,21 +206,17 @@ type checkedManifest struct {
 //     A child or subject the repository holds has its grace restarted
 //     (touchList).
 //
-// It also refuses any body with a Docker schema1 fsLayers field, whatever its
-// schemaVersion and media type: the garbage collector (pkg/ociregistry/gc)
-// cannot follow fsLayers and treats such a body as unreadable, so a stored
-// one would stop every sweep of the repository. The field is matched as
-// encoding/json matches it, the way the collector reads the body.
+// It first refuses any body the garbage collector (pkg/ociregistry/gc) cannot
+// read, whatever its media type: a stored one would stop every sweep of the
+// repository until its row was deleted. That covers a Docker schema1 fsLayers
+// field at any schemaVersion, an index with no mediaType and no manifests array,
+// and a field the collector decodes and the checks below do not, or decode
+// differently (a config followed by a null one). The collector's own reader
+// decides, so the two cannot accept different sets.
 func checkManifest(mt string, body []byte) (checkedManifest, error) {
 	var out checkedManifest
-	var schema1 struct {
-		FSLayers json.RawMessage `json:"fsLayers"`
-	}
-	if err := json.Unmarshal(body, &schema1); err != nil {
-		return out, manifestInvalid("manifest does not parse: %v", err)
-	}
-	if schema1.FSLayers != nil {
-		return out, manifestInvalid("a Docker schema1 fsLayers field")
+	if err := gc.Readable(body); err != nil {
+		return out, manifestInvalid("manifest cannot be read: %v", err)
 	}
 	if isIndexType(mt) {
 		var idx ispec.Index
