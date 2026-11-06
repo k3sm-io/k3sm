@@ -229,7 +229,7 @@ func (c *Collector) Sweep(ctx context.Context) (Report, error) {
 		return Report{ReportOnly: true}, fmt.Errorf("gc: %w: no sweep deletes until it is repaired; remove %s and the next sweep only reports",
 			err, filepath.Join(c.s.Root(), store.IDFile))
 	}
-	reviewed, err := c.readReviewed(marker, id)
+	reviewed, err := readReviewed(marker, id, c.s.Root(), c.log)
 	if err != nil {
 		return Report{ReportOnly: true}, err
 	}
@@ -1143,15 +1143,27 @@ type markerRecord struct {
 	Reviewed []string `json:"reviewed"`
 }
 
+// ReadReviewed returns the repositories the marker names as reviewed for s, on
+// the terms a sweep reads it: a missing marker, one written for another store or
+// in an older form, or a root with no id names none. A malformed id or an
+// unreadable marker is an error, so a caller rewrites nothing on it.
+func ReadReviewed(s *store.Store, log *slog.Logger) (map[string]bool, error) {
+	id, _, err := s.ID()
+	if err != nil {
+		return nil, fmt.Errorf("gc marker: %w", err)
+	}
+	return readReviewed(filepath.Join(s.StateDir(), MarkerName), id, s.Root(), log)
+}
+
 // readReviewed returns the repositories the marker at p names as reviewed for
-// the store with id id. A missing marker, one written for another store or in
-// an older form, or an empty id (the root has no id file) names none: those
-// repositories report only and the marker is written again.
+// the store with id id, whose root is root. A missing marker, one written for
+// another store or in an older form, or an empty id (the root has no id file)
+// names none: those repositories report only and the marker is written again.
 //
 // The read has no size bound. The set grows with the repositories, which a
 // pusher can create, so a bound would be a way to turn the collector off, and
 // the sweep already holds every repository's name in memory.
-func (c *Collector) readReviewed(p, id string) (map[string]bool, error) {
+func readReviewed(p, id, root string, log *slog.Logger) (map[string]bool, error) {
 	fi, err := os.Lstat(p)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -1173,8 +1185,8 @@ func (c *Collector) readReviewed(p, id string) (map[string]bool, error) {
 	}
 	var m markerRecord
 	if json.Unmarshal(b, &m) != nil || id == "" || m.Store != id {
-		c.log.Warn("registry gc: the gc-ran marker was not written for this store; the next sweep only reports",
-			"marker", p, "root", c.s.Root())
+		log.Warn("registry gc: the gc-ran marker was not written for this store; the next sweep only reports",
+			"marker", p, "root", root)
 		return nil, nil
 	}
 	reviewed := make(map[string]bool, len(m.Reviewed))
