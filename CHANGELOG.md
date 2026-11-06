@@ -83,6 +83,27 @@ pin, its date, and the tarball's sha256.
   `node.kubernetes.io/memory-pressure` are still admitted. A Pod annotated
   `budget.k3sm.io/band: batch` is also refused, with reason `NodeBudgetCritical`, while the
   node budget is at its critical level or above.
+- The registry store can dedupe a blob held as separate copies across repositories: a pass keeps the
+  newest copy, verifies it against its digest, and replaces each older copy with a hard link to it by an
+  atomic rename. A copy that fails its hash is logged, counted and replaced by the verified bytes; any
+  other failure keeps the copy. The push path does not change. The registry server runs the pass by
+  default, with no setting to turn it off: after 60 s with no commit and no live upload, plus up to 60 s
+  of jitter, and at most 15 minutes after the first commit it has not yet covered. Below 4 GiB free it
+  starts without that wait, but no sooner than 60 s after the last pass ended, and a pass there that merges
+  nothing counts toward the limit on passes below. An upload stops a pass between merges, unless the 15 minutes have passed or
+  space is low. No pass runs within an hour of start, or before the first garbage collection, and only
+  a repository garbage collection has reported is rewritten, so a new repository's copies wait for its
+  first sweep, at most 6 hours, and merge about 2 minutes after it. A pass stopped by its limit of
+  16 GiB hashed or 1,024 merges is followed by another after the same wait. After three passes in a row
+  that hash, fail, leave work or run on low space without merging, a pass no longer follows on its own,
+  and the next one, whatever commits arrive, starts no sooner than an hour after the last ended, until a
+  pass merges something. So past that point a client with push rights causes at most one pass an hour,
+  about 16 GiB of hashing, more only if a single blob is larger than that. Passes that merge are not held
+  to this, so a client pushing fresh copies to repositories already reviewed keeps them running a minute
+  or more apart. Any other copy a pass leaves waits for the next commit, mount or server start.
+  `registry.log` records each merge and each pass, and
+  `registry-state.json` gains a `dedupe` object with the last pass's counts. `du -sk` of the registry
+  root falls to one copy; `du` of a single repository still shows its full size.
 - The registry store k3sm is replacing zot with has an online garbage collector that runs
   while pushes continue. A blob's age counts from the last mount, link or upload that named it,
   recorded on disk so a restart keeps it, and a sweep re-reads the index and re-checks each
@@ -179,6 +200,12 @@ pin, its date, and the tarball's sha256.
   of those aliases is logged and does not stop the install. The old mesh address and the old range's pod
   aliases stay on `lo0` until `k3sm stop`, `k3sm uninstall` or a reboot. A reinstall that keeps its
   `--mesh-ip`, and any worker reinstall, keeps the recorded range.
+- A registry garbage collection no longer stops at the half-repository brake, and keeps a removed
+  image's blobs, because one blob of that image is newer than the repository's last row change, as a
+  blob shared with another repository is when that repository touches it after the delete. When a
+  sweep removes every row, it now reaps the blobs older than the last row change and leaves the newer
+  ones out; removing rows lets the next sweep reap those too. With no row to remove, a blob left out
+  waits for the abandon horizon, and a first push with no manifest yet still reaps nothing.
 - `k3sm image untag` of an image's last tag no longer makes the image unreadable by digest in the
   cluster registry. The manifest stays readable at `repository@sha256:...`, and `k3sm image prune` sees
   it as untagged, until prune or the registry's garbage collection removes it.

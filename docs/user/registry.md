@@ -596,6 +596,9 @@ Nothing is deleted in any of these cases. Each shows on every sweep in the
 - **`would delete more than half`.** The half-repository brake stopped the sweep of that repository,
   and a `registry gc: sweep stopped` line says how many blobs it held back. Check that the
   repository's tags are the ones you expect.
+- GC logs `registry gc: leaving out blobs not older than index.json` and a later sweep reaps the rest,
+  so a layer or child manifest finished longer than the grace before its index push must be uploaded
+  again, and re-running the push uploads only what was reaped.
 
 ## Security Posture
 
