@@ -41,7 +41,10 @@ limitations under the License.
 //     above), requires the blobs a manifest names to be in the repository and
 //     never requires an index's children. The exception to following that
 //     registry: it requires no blobs of a manifest whose config type is neither
-//     an OCI image config nor the empty descriptor, and this server does;
+//     an OCI image config nor the empty descriptor, and this server does. A PUT
+//     restarts the garbage-collection grace of each index child and subject the
+//     repository holds, under the repository lock and never while half that
+//     grace is left, and refuses, with nothing written, when a touch fails;
 //   - a blob GET goes through http.ServeContent, so Range, 206 and 416 are
 //     the standard library's; a blob HEAD restarts the blob's
 //     garbage-collection grace (store.TouchBlob, bounded as below), so a

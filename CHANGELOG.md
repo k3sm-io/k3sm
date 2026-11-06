@@ -135,7 +135,8 @@ pin, its date, and the tarball's sha256.
 - The built-in registry refuses an OCI artifact manifest whose config or layers are not in the repository,
   with `MANIFEST_BLOB_UNKNOWN`, as it already did for an image manifest. It could store an artifact naming
   a blob garbage collection had already removed. A client that pushes an artifact's manifest before its
-  blobs now has to push the blobs first.
+  blobs now has to push the blobs first. An index's children and a manifest's subject still need not be
+  present; each one that is gets its garbage collection grace restarted by the PUT.
 - `k3sm` and the etcd, kine and zot it builds now link `github.com/klauspost/compress` v1.20.2, which fixes GO-2026-6865, a panic on two-block frames. Every node re-stages kine and zot on upgrade.
 - Turning Spotlight indexing off for the data volume no longer waits indefinitely on `mdutil`. The
   `.metadata_never_index` marker is what excludes the volume and is written first, so the `mdutil`

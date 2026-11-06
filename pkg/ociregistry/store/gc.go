@@ -240,6 +240,28 @@ func (l *Locked) StatBlob(d digest.Digest) (Blob, error) {
 	return Blob{Digest: d, Size: fi.Size(), ModTime: fi.ModTime()}, nil
 }
 
+// TouchBlob sets blob d's mtime to now, and fails with ErrBlobUnknown when the
+// repository does not hold it. A sweep re-states a candidate under the same
+// lock before it deletes, so it sees the fresh mtime.
+func (l *Locked) TouchBlob(d digest.Digest) error {
+	p, err := l.s.blobPath(l.n, d)
+	if err != nil {
+		return err
+	}
+	f, err := openRegular(p, os.O_RDONLY)
+	if errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("%w: %s in %s", ErrBlobUnknown, d, l.n)
+	}
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := l.s.setTimes(f, l.s.now()); err != nil {
+		return fmt.Errorf("touch blob %s in %s: %w", d, l.n, err)
+	}
+	return nil
+}
+
 // RemoveBlob removes blob d's name from the repository. The inode stays
 // while another repository links it.
 func (l *Locked) RemoveBlob(d digest.Digest) error {
