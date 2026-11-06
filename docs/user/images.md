@@ -321,9 +321,11 @@ k3sm image pull ghcr.io/org/app:v1            # warm this node's cache ahead of 
 | `save <tag\|repository@digest> -o <file.tar>` | Exports the image as a tarred OCI image layout, the `docker save` analog and the exact inverse of `import`: the layout names the image `registry-k3sm:6450/<repository>:<tag>`, so importing the archive records it under the same name. An index is saved whole unless `--platform` picks one platform. The archive is written beside the target and renamed into place when complete, so a failed save leaves no file behind. |
 | `pull <reference>` | Fetches the reference into this node's cache through the daemon's own puller, the same code path a Pod's pull takes, so every blob is re-hashed against its digest before it is recorded. Prints the digest it resolved to. `--platform os/arch[/variant]` picks which manifest of a multi-platform index to fetch; `--policy always\|if-not-present\|never` carries the ordinary Kubernetes pull-policy meanings. |
 
-Untag removes a name, not bytes. The manifest and its blobs stay while another tag or index names
-them, and the registry's own garbage collection reclaims what nothing names. A node that already
-pulled the image keeps its cached copy, so a running Pod is unharmed.
+Untag removes a name, not bytes, and it is not a retraction. The manifest and its layers stay
+readable by digest to anyone who can reach the registry until `k3sm image prune` or the registry's
+own garbage collection removes them. To take an image out of reach, untag it and then prune it
+(see below). A node that already pulled the image keeps its cached copy, so a running Pod is
+unharmed.
 
 A pulled image is ordinary cache content: `pull` records no operator root, so `k3sm image prune`
 can reclaim it once no Pod uses it.
@@ -349,7 +351,7 @@ sudo k3sm image prune -o json         # the same report as one JSON document
 ```
 
 In the registry it deletes untagged manifests: what is left behind when a tag is pushed again
-and now names a newer image. It keeps every tagged manifest, and these untagged ones too:
+and now names a newer image, or when `untag` removes a tag. It keeps every tagged manifest, and these untagged ones too:
 
 - a manifest that a kept multi-platform index names;
 - a referrer, such as a signature, whose subject is kept;
