@@ -12,6 +12,11 @@ pin, its date, and the tarball's sha256.
 
 ### Added
 
+- A node advertises the GPU under hardware names beside the `mlx.k3sm.io` ones, which do not change: the
+  `k3sm.io/gpu` extended resource and the `k3sm.io/gpu.present` and `k3sm.io/gpu-memory-gb` labels on a
+  node that can grant a pod the GPU, and the `k3sm.io/chip`, `k3sm.io/chip-family` and `k3sm.io/memory-gb`
+  labels on any node with a usable Metal device, including one whose sandbox backend cannot grant it. A
+  chip label alone does not mean a pod can have the GPU; request `k3sm.io/gpu` for that. No RBAC changes.
 - `k3sm status` names the update channel: the update row carries `wide.channel`, on the rolling row too,
   and on `rc` its `detail` ends in `; channel rc`. A failed check on `rc` also names the last good
   release and when it was checked. A server publishes the channel beside the latest release as the

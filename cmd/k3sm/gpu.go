@@ -36,16 +36,20 @@ import (
 // that compiles perfectly while being wrong.
 const gpuResourceName = corev1.ResourceName(mlxv1alpha1.ResourceGPU)
 
-// bytesPerGiB converts GPUFacts.mem_bytes to the whole-gibibyte label value.
+// hardwareGPUResourceName is the k3sm.io/gpu extended resource, the hardware-named key
+// the node advertises beside gpuResourceName.
+const hardwareGPUResourceName = corev1.ResourceName(runtimev1.ResourceGPU)
+
+// bytesPerGiB converts a byte count to the whole-gibibyte label value.
 const bytesPerGiB = 1 << 30
 
 // applyGPUAdvertisement advertises — or REMOVES — this node's GPU: the
 // mlx.k3sm.io/gpu extended resource in both Capacity and Allocatable, plus the
-// mlx.k3sm.io presence/chip/chip-family/memory labels. It is the MLX counterpart of
-// applyVirtualizationLabel and follows the same delete-on-loss discipline: a node
-// that LOSES the capability across a restart must stop advertising it, in the
-// resource as well as the labels, or the scheduler keeps binding GPU pods to a node
-// that can no longer run them.
+// mlx.k3sm.io presence/chip/chip-family/memory labels, and the same under the k3sm.io
+// names beside them. It is the GPU counterpart of applyVirtualizationLabel and follows
+// the same delete-on-loss discipline: a node that LOSES the capability across a restart
+// must stop advertising it, in the resource as well as the labels, or the scheduler
+// keeps binding GPU pods to a node that can no longer run them.
 //
 // It is FAIL-CLOSED on a conjunction of two INDEPENDENT facts, and both are load
 // bearing:
@@ -57,6 +61,13 @@ const bytesPerGiB = 1 << 30
 // Neither implies the other (the same Mac supports GPU pods under one backend and not
 // another), so advertising on metal_available alone would attract MLX workloads to a
 // node whose sandbox denies every one of them at admission — a fail-OPEN mislabel.
+//
+// The k3sm.io chip, chip-family and memory-gb labels are the one exception. They
+// describe the hardware rather than offer it, so they ride metal_available alone: a
+// Mac with Metal whose sandbox backend grants no GPU still shows what chip it is.
+// They offer nothing, because k3sm.io/gpu, k3sm.io/gpu.present and
+// k3sm.io/gpu-memory-gb all stay on the conjunction and a pod that needs the GPU
+// requests the resource. The mlx.k3sm.io labels keep their existing behaviour.
 //
 // HOW MANY is a separate question from WHETHER, and it is not answered here: the
 // count comes from gpucapacity.GPUSlots over the same facts (N is 1 or 2, from the host's
@@ -74,13 +85,24 @@ func applyGPUAdvertisement(n *corev1.Node, facts *runtimev1.GPUFacts) {
 	slots := gpucapacity.GPUSlots(facts)
 	setGPUResource(n, present, slots)
 	setLabelPresence(n, mlxv1alpha1.LabelGPUPresent, present)
-	// The three descriptive labels ride the SAME verdict as the presence label rather
-	// than their own emptiness checks: a node that is not advertising a GPU must not
-	// carry a chip label either, or a selector on the chip alone would bind a pod to a
-	// node whose GPU was withheld.
-	setLabelValue(n, mlxv1alpha1.LabelChip, gpuLabelValue(present, runtimev1.ChipSlug(facts.GetChipBrand())))
-	setLabelValue(n, mlxv1alpha1.LabelChipFamily, gpuLabelValue(present, runtimev1.ChipSlug(facts.GetChipFamily())))
-	setLabelValue(n, mlxv1alpha1.LabelMemoryGB, gpuLabelValue(present, memoryGiBLabel(facts.GetMemBytes())))
+	setLabelPresence(n, runtimev1.LabelGPUPresent, present)
+	chip := runtimev1.ChipSlug(facts.GetChipBrand())
+	family := runtimev1.ChipSlug(facts.GetChipFamily())
+	memoryGB := memoryGiBLabel(facts.GetMemBytes())
+	// The three old descriptive labels ride the SAME verdict as the presence label
+	// rather than their own emptiness checks: a node that is not advertising a GPU must
+	// not carry an mlx.k3sm.io chip label either, or a selector on the chip alone would
+	// bind a pod to a node whose GPU was withheld.
+	setLabelValue(n, mlxv1alpha1.LabelChip, gpuLabelValue(present, chip))
+	setLabelValue(n, mlxv1alpha1.LabelChipFamily, gpuLabelValue(present, family))
+	setLabelValue(n, mlxv1alpha1.LabelMemoryGB, gpuLabelValue(present, memoryGB))
+	// The ceiling is what the GPU can use, so it follows the verdict; it is never
+	// negative, since GPUCeilingBytes clamps both of its inputs.
+	setLabelValue(n, runtimev1.LabelGPUMemoryGB, gpuLabelValue(present, memoryGiBLabel(uint64(gpucapacity.GPUCeilingBytes(facts)))))
+	metal := facts.GetMetalAvailable()
+	setLabelValue(n, runtimev1.LabelChip, gpuLabelValue(metal, chip))
+	setLabelValue(n, runtimev1.LabelChipFamily, gpuLabelValue(metal, family))
+	setLabelValue(n, runtimev1.LabelMemoryGB, gpuLabelValue(metal, memoryGB))
 	if present {
 		slog.Debug("node GPU advertised",
 			"resource", mlxv1alpha1.ResourceGPU, "count", slots,
@@ -107,17 +129,17 @@ func gpuAdvertisable(facts *runtimev1.GPUFacts) bool {
 	return gpucapacity.GPUAdvertisable(facts)
 }
 
-// gpuLabelValue gates a derived label value on the advertisement verdict, returning
-// "" (which setLabelValue deletes) whenever the GPU is not advertised.
-func gpuLabelValue(present bool, value string) string {
-	if !present {
+// gpuLabelValue gates a derived label value on the fact that label rides, returning
+// "" (which setLabelValue deletes) whenever that fact does not hold.
+func gpuLabelValue(gate bool, value string) string {
+	if !gate {
 		return ""
 	}
 	return value
 }
 
-// setGPUResource adds slots units of mlx.k3sm.io/gpu to the node's Capacity AND
-// Allocatable, or deletes it from both. Both lists matter: the scheduler fits pods
+// setGPUResource adds slots units of mlx.k3sm.io/gpu and of k3sm.io/gpu to the node's
+// Capacity AND Allocatable, or deletes both names from both. Both lists matter: the scheduler fits pods
 // against Allocatable, while Capacity is what an operator reads — advertising only
 // one makes `kubectl describe node` and the scheduler disagree.
 //
@@ -140,15 +162,17 @@ func gpuLabelValue(present bool, value string) string {
 // fitting new ones until the arithmetic works again. That is the same direction as the
 // delete-on-loss discipline above, one step short of it.
 func setGPUResource(n *corev1.Node, present bool, slots int64) {
-	if !present {
-		// delete on a nil map is a no-op, so this needs no guard — and it is what
-		// makes a node that LOST the capability stop advertising it.
-		delete(n.Status.Capacity, gpuResourceName)
-		delete(n.Status.Allocatable, gpuResourceName)
-		return
+	for _, name := range []corev1.ResourceName{gpuResourceName, hardwareGPUResourceName} {
+		if !present {
+			// delete on a nil map is a no-op, so this needs no guard — and it is what
+			// makes a node that LOST the capability stop advertising it.
+			delete(n.Status.Capacity, name)
+			delete(n.Status.Allocatable, name)
+			continue
+		}
+		n.Status.Capacity = withResource(n.Status.Capacity, name, slots)
+		n.Status.Allocatable = withResource(n.Status.Allocatable, name, slots)
 	}
-	n.Status.Capacity = withResource(n.Status.Capacity, gpuResourceName, slots)
-	n.Status.Allocatable = withResource(n.Status.Allocatable, gpuResourceName, slots)
 }
 
 // withResource sets name=count (DecimalSI, the form an integer extended resource is
@@ -177,13 +201,14 @@ func setLabelValue(n *corev1.Node, key, value string) {
 	labels[key] = value
 }
 
-// memoryGiBLabel renders mem_bytes as the whole-gibibyte decimal string the
-// mlx.k3sm.io/memory-gb label carries — no unit suffix and no fractional spelling, so
-// two nodes with identical memory cannot carry non-matching values. It returns "" for
-// anything under 1GiB (including 0, the unread-fact value), so the label is deleted
-// rather than advertising a "0" no selector should ever match.
-func memoryGiBLabel(memBytes uint64) string {
-	gib := memBytes / bytesPerGiB
+// memoryGiBLabel renders a byte count as the whole-gibibyte decimal string the
+// mlx.k3sm.io/memory-gb, k3sm.io/memory-gb and k3sm.io/gpu-memory-gb labels carry — no
+// unit suffix and no fractional spelling, so two nodes with identical memory cannot
+// carry non-matching values. It returns "" for anything under 1GiB (including 0, the
+// unread-fact value), so the label is deleted rather than advertising a "0" no selector
+// should ever match.
+func memoryGiBLabel(bytes uint64) string {
+	gib := bytes / bytesPerGiB
 	if gib == 0 {
 		return ""
 	}
