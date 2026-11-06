@@ -10,8 +10,12 @@ TestCheckDataVolume added new with the child switch
 TestChildCommand added new with the child switch
 TestClassify rewritten the gate reads names through the shared validator
 TestCloseInheritedDescriptors added new with the child switch
-TestCollectRouteRefusesWhatMayNotDelete added the collect route is the push credential's alone
 TestClusterEndpointAddress kept the relay and cluster publication do not touch the child
+TestCollectPrunedSanitisesAndBoundsTheAnswer added the collect client strips controls and bounds its wait
+TestCollectRouteAdmitsOneAtATime added one collect at a time, a minute apart, never queued
+TestCollectRouteAnswersFixedErrors added the collect answer carries fixed error texts
+TestCollectRouteChecksTheCredentialBeforeTheBody added the collect route checks the credential before the body
+TestCollectRouteRefusesWhatMayNotDelete added the collect route is the push credential's alone
 TestConvergeCommitsCannotDriveFruitlessPasses added new with the dedupe loop
 TestConvergeDoesNotSpinOnPermanentSkips added new with the dedupe loop
 TestConvergeLoopHoldsItsRotation added new with the dedupe loop

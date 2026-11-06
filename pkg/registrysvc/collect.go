@@ -26,6 +26,12 @@ import (
 	"log/slog"
 	"net/http"
 	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"k3sm.io/k3sm/pkg/ociregistry/api"
 	"k3sm.io/k3sm/pkg/ociregistry/gc"
@@ -57,6 +63,11 @@ const (
 	// maxCollectResponse is the largest collect answer the client reads.
 	maxCollectResponse = 4 << 20
 )
+
+// CollectTimeout bounds a collect request from the client's side: the sweep
+// of a few repositories reads their manifests and deletes under their locks,
+// which takes seconds, so ten minutes is a hung server, not a slow sweep.
+const CollectTimeout = 10 * time.Minute
 
 // collectRequest is the body of a collect request.
 type collectRequest struct {
@@ -91,16 +102,97 @@ type CollectResult struct {
 // collectAuthorizer is the part of auth.Access the collect route uses.
 type collectAuthorizer interface {
 	Authorize(r *http.Request, verb api.Verb, n ref.Name) error
+	Principal(r *http.Request) string
 }
 
 // repositorySweeper sweeps the named repositories (gc.Collector.SweepRepositories,
-// behind the server's sweep fence).
+// behind the server's sweep fence). It returns errSweepBusy, having swept
+// nothing, when a scheduled sweep or a dedupe pass holds the fence.
 type repositorySweeper func(ctx context.Context, names []ref.Name) (gc.RepositoriesReport, error)
 
+// errSweepBusy is a collect that found the fence held.
+var errSweepBusy = errors.New("a sweep or dedupe pass is running")
+
+// Limits of the collect route.
+const (
+	// collectBodyTimeout bounds the read of a collect request's body, so a
+	// body trickled in a byte at a time cannot hold the handler.
+	collectBodyTimeout = 10 * time.Second
+	// collectMinInterval is the least time between the starts of two collects.
+	collectMinInterval = time.Minute
+	// collectRetryBusy is the Retry-After, in seconds, of a collect refused
+	// because another collect, a sweep or a dedupe pass is running.
+	collectRetryBusy = 60
+)
+
+// The fixed texts a collect answers in CollectResult.Error. The detail is in
+// the server's log, never in the answer.
+const (
+	collectErrTooSoon    = "the registry started less than one grace period ago, so its garbage collection does not sweep yet"
+	collectErrIncomplete = "the sweep did not complete; the registry log has the detail"
+)
+
+// collectGate admits one collect at a time, and none within
+// collectMinInterval of the last one's start.
+type collectGate struct {
+	now func() time.Time
+	// mu guards busy and last.
+	mu   sync.Mutex
+	busy bool
+	last time.Time
+}
+
+// enter admits a collect, or returns how long to wait before another.
+func (g *collectGate) enter() (time.Duration, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.busy {
+		return collectRetryBusy * time.Second, false
+	}
+	if !g.last.IsZero() {
+		if wait := g.last.Add(collectMinInterval).Sub(g.now()); wait > 0 {
+			return wait, false
+		}
+	}
+	g.busy = true
+	return 0, true
+}
+
+// started records the start of an admitted collect that ran a sweep.
+func (g *collectGate) started(at time.Time) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.last = at
+}
+
+// leave ends an admitted collect.
+func (g *collectGate) leave() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.busy = false
+}
+
+// tooMany answers 429 with a Retry-After of at least one second.
+func tooMany(w http.ResponseWriter, wait time.Duration) {
+	secs := int((wait + time.Second - 1) / time.Second)
+	w.Header().Set("Retry-After", strconv.Itoa(max(secs, 1)))
+	http.Error(w, "a collect is running or ran less than a minute ago; retry later", http.StatusTooManyRequests)
+}
+
 // collectRoute serves CollectPath with sweep and passes every other request to
-// next. A request must name at least one repository, and its credential must be
-// allowed to delete in each.
-func collectRoute(next http.Handler, authz collectAuthorizer, sweep repositorySweeper, log *slog.Logger) http.Handler {
+// next. now is the clock of the minimum interval (time.Now when nil).
+//
+// The credential is checked once, before the body is read: the permission
+// matrix (auth.Access) is global, a principal may delete in every repository
+// or in none, so there is nothing per repository to check. Then one collect
+// runs at a time and none within collectMinInterval of the last one's start;
+// a refused one gets 429 and Retry-After, never a queued wait. The body has
+// collectBodyTimeout to arrive. The sweep takes the fence only if it is free.
+func collectRoute(next http.Handler, authz collectAuthorizer, sweep repositorySweeper, log *slog.Logger, now func() time.Time) http.Handler {
+	if now == nil {
+		now = time.Now
+	}
+	gate := &collectGate{now: now}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != CollectPath {
 			next.ServeHTTP(w, r)
@@ -111,11 +203,40 @@ func collectRoute(next http.Handler, authz collectAuthorizer, sweep repositorySw
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+		// The zero name: the matrix has no repository dimension.
+		if err := authz.Authorize(r, api.VerbDelete, ref.Name{}); err != nil {
+			switch {
+			case errors.Is(err, api.ErrUnauthenticated):
+				w.Header().Set("WWW-Authenticate", `Basic realm="k3sm"`)
+				http.Error(w, "authentication required", http.StatusUnauthorized)
+			case errors.Is(err, api.ErrRateLimited):
+				http.Error(w, "too many requests", http.StatusTooManyRequests)
+			default:
+				http.Error(w, "requested access to the resource is denied", http.StatusForbidden)
+			}
+			return
+		}
+		wait, ok := gate.enter()
+		if !ok {
+			tooMany(w, wait)
+			return
+		}
+		defer gate.leave()
+
+		rc := http.NewResponseController(w)
+		if err := rc.SetReadDeadline(time.Now().Add(collectBodyTimeout)); err != nil && !errors.Is(err, http.ErrNotSupported) {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
 		var req collectRequest
 		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxCollectBody))
 		dec.DisallowUnknownFields()
 		if err := dec.Decode(&req); err != nil {
 			http.Error(w, "the collect request is not a repository list", http.StatusBadRequest)
+			return
+		}
+		if err := rc.SetReadDeadline(time.Time{}); err != nil && !errors.Is(err, http.ErrNotSupported) {
+			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
 		if len(req.Repositories) == 0 || len(req.Repositories) > maxCollectRepositories {
@@ -129,21 +250,15 @@ func collectRoute(next http.Handler, authz collectAuthorizer, sweep repositorySw
 				http.Error(w, "the collect request names an invalid repository", http.StatusBadRequest)
 				return
 			}
-			if err := authz.Authorize(r, api.VerbDelete, n); err != nil {
-				switch {
-				case errors.Is(err, api.ErrUnauthenticated):
-					w.Header().Set("WWW-Authenticate", `Basic realm="k3sm"`)
-					http.Error(w, "authentication required", http.StatusUnauthorized)
-				case errors.Is(err, api.ErrRateLimited):
-					http.Error(w, "too many requests", http.StatusTooManyRequests)
-				default:
-					http.Error(w, "requested access to the resource is denied", http.StatusForbidden)
-				}
-				return
-			}
 			names = append(names, n)
 		}
+		at := now()
 		rep, err := sweep(r.Context(), names)
+		if errors.Is(err, errSweepBusy) {
+			tooMany(w, collectRetryBusy*time.Second)
+			return
+		}
+		gate.started(at)
 		res := CollectResult{
 			Repositories: req.Repositories,
 			Stopped:      rep.Stopped,
@@ -155,12 +270,15 @@ func collectRoute(next http.Handler, authz collectAuthorizer, sweep repositorySw
 			res.Blobs = rep.Count(gc.KindBlob)
 			res.Bytes = rep.BlobBytes
 		}
-		if err != nil {
-			res.Error = err.Error()
+		switch {
+		case errors.Is(err, gc.ErrTooSoon):
+			res.Error = collectErrTooSoon
+		case err != nil:
+			res.Error = collectErrIncomplete
 		}
-		log.Info("registry gc: swept the repositories a prune deleted from", "repositories", len(names),
-			"manifests", res.Manifests, "blobs", res.Blobs, "bytes", res.Bytes, "stopped", len(res.Stopped),
-			"failed", len(res.Failed), "reviewing", len(res.Reviewing), "err", err)
+		log.Info("registry gc: swept the repositories a prune deleted from", "principal", authz.Principal(r),
+			"source", r.RemoteAddr, "repositories", req.Repositories, "manifests", res.Manifests, "blobs", res.Blobs,
+			"bytes", res.Bytes, "stopped", res.Stopped, "failed", res.Failed, "reviewing", res.Reviewing, "err", err)
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(res); err != nil {
 			log.Debug("registry gc: the collect answer was not delivered", "err", err)
@@ -185,12 +303,18 @@ func prunedRepositories(deleted []StoredManifest) []string {
 // empty. The returned result names the repositories even when the request
 // fails.
 //
+// The request has CollectTimeout to be answered, whatever ctx allows. Every
+// string the registry answers with is passed through Printable, so a reply
+// cannot write terminal controls into the operator's report.
+//
 // rt carries the request (nil uses http.DefaultTransport).
 func CollectPruned(ctx context.Context, authority string, deleted []StoredManifest, cred Credential, rt http.RoundTripper) (CollectResult, error) {
 	res := CollectResult{Repositories: prunedRepositories(deleted)}
 	if len(res.Repositories) == 0 {
 		return res, nil
 	}
+	ctx, cancel := context.WithTimeout(ctx, CollectTimeout)
+	defer cancel()
 	if rt == nil {
 		rt = http.DefaultTransport
 	}
@@ -215,12 +339,36 @@ func CollectPruned(ctx context.Context, authority string, deleted []StoredManife
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return res, fmt.Errorf("collect the pruned repositories: the registry answered %s", resp.Status)
+		return res, fmt.Errorf("collect the pruned repositories: the registry answered %s", Printable(resp.Status))
 	}
 	var got CollectResult
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxCollectResponse)).Decode(&got); err != nil {
 		return res, fmt.Errorf("collect the pruned repositories: read the answer: %w", err)
 	}
 	got.Repositories = res.Repositories
+	got.Stopped = printables(got.Stopped)
+	got.Failed = printables(got.Failed)
+	got.Reviewing = printables(got.Reviewing)
+	got.Error = Printable(got.Error)
 	return got, nil
+}
+
+// Printable returns s without control or format characters (bidi overrides
+// among them) and without invalid UTF-8, for printing a string another
+// process supplied.
+func Printable(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == utf8.RuneError || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return -1
+		}
+		return r
+	}, s)
+}
+
+// printables is Printable over each string of ss.
+func printables(ss []string) []string {
+	for i, s := range ss {
+		ss[i] = Printable(s)
+	}
+	return ss
 }

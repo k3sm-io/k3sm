@@ -20,9 +20,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -88,7 +90,7 @@ func newCollectServer(t *testing.T, st *store.Store, c *gc.Collector) *collectSe
 		t.Fatal(err)
 	}
 	log := slog.New(slog.DiscardHandler)
-	h := collectRoute(srv, access, fencedSweep(c, newSweepFence()), log)
+	h := collectRoute(srv, access, fencedSweep(c, newSweepFence()), log, nil)
 	s.rt = handlerTransport{h: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == CollectPath {
 			s.collects.Add(1)
@@ -336,5 +338,219 @@ func TestCollectRouteRefusesWhatMayNotDelete(t *testing.T) {
 	}
 	if got := send(http.MethodGet, "/v2/", &srv.cred, ""); got != http.StatusOK {
 		t.Errorf("GET /v2/ through the route: %d; want the API's own 200", got)
+	}
+}
+
+// collectAccess is the real access check over the two test principals.
+func collectAccess(t *testing.T) (*auth.Access, Credential, Credential) {
+	t.Helper()
+	push := Credential{Username: auth.UserPush, Password: "collect-test-secret"}
+	gate := Credential{Username: auth.UserGate, Password: "collect-test-gate-secret"}
+	access, err := auth.New(auth.Config{Principals: []auth.Principal{
+		{User: auth.UserPush, SecretSHA256: auth.HashSecret(push.Password)},
+		{User: auth.UserGate, SecretSHA256: auth.HashSecret(gate.Password)},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return access, push, gate
+}
+
+// readCounter is a request body that counts the reads made of it.
+type readCounter struct {
+	r     io.Reader
+	reads atomic.Int32
+}
+
+func (c *readCounter) Read(p []byte) (int, error) {
+	c.reads.Add(1)
+	return c.r.Read(p)
+}
+
+// collectCall sends one collect through h and returns the status, the
+// Retry-After header and the decoded answer on 200.
+func collectCall(t *testing.T, h http.Handler, cred *Credential, body io.Reader) (int, string, CollectResult) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, "http://localhost:5000"+CollectPath, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cred != nil {
+		req.SetBasicAuth(cred.Username, cred.Password)
+	}
+	resp, err := handlerTransport{h: h}.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var res CollectResult
+	if resp.StatusCode == http.StatusOK {
+		if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return resp.StatusCode, resp.Header.Get("Retry-After"), res
+}
+
+// TestCollectRouteChecksTheCredentialBeforeTheBody proves a collect without a
+// credential that may delete is refused before a byte of its body is read.
+func TestCollectRouteChecksTheCredentialBeforeTheBody(t *testing.T) {
+	access, _, gate := collectAccess(t)
+	swept := false
+	h := collectRoute(http.NotFoundHandler(), access, func(context.Context, []ref.Name) (gc.RepositoriesReport, error) {
+		swept = true
+		return gc.RepositoriesReport{}, nil
+	}, slog.New(slog.DiscardHandler), nil)
+	for _, tc := range []struct {
+		name string
+		cred *Credential
+		want int
+	}{
+		{"anonymous", nil, http.StatusUnauthorized},
+		{"the push gate", &gate, http.StatusForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := &readCounter{r: strings.NewReader(`{"repositories":["app"]}`)}
+			if got, _, _ := collectCall(t, h, tc.cred, body); got != tc.want {
+				t.Errorf("status %d; want %d", got, tc.want)
+			}
+			if n := body.reads.Load(); n != 0 {
+				t.Errorf("the body was read %d times before the refusal", n)
+			}
+		})
+	}
+	if swept {
+		t.Error("a refused collect swept")
+	}
+}
+
+// TestCollectRouteAdmitsOneAtATime proves the route runs one collect at a
+// time, none within a minute of the last, and none while the fence is held,
+// answering each refusal with 429 and Retry-After rather than a queued wait.
+func TestCollectRouteAdmitsOneAtATime(t *testing.T) {
+	access, push, _ := collectAccess(t)
+	body := func() io.Reader { return strings.NewReader(`{"repositories":["app"]}`) }
+	log := slog.New(slog.DiscardHandler)
+
+	t.Run("a second collect while one runs", func(t *testing.T) {
+		entered, release := make(chan struct{}), make(chan struct{})
+		h := collectRoute(http.NotFoundHandler(), access, func(context.Context, []ref.Name) (gc.RepositoriesReport, error) {
+			close(entered)
+			<-release
+			return gc.RepositoriesReport{}, nil
+		}, log, nil)
+		first := make(chan int, 1)
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "http://localhost:5000"+CollectPath, body())
+		req.SetBasicAuth(push.Username, push.Password)
+		go func() {
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			first <- rec.Code
+		}()
+		<-entered
+		got, retry, _ := collectCall(t, h, &push, body())
+		close(release)
+		if got != http.StatusTooManyRequests || retry == "" {
+			t.Errorf("concurrent collect: status %d, Retry-After %q; want 429 with Retry-After", got, retry)
+		}
+		if got := <-first; got != http.StatusOK {
+			t.Errorf("first collect: status %d; want 200", got)
+		}
+	})
+
+	t.Run("a collect within a minute of the last", func(t *testing.T) {
+		clk := &testClock{now: time.Now()}
+		h := collectRoute(http.NotFoundHandler(), access, func(context.Context, []ref.Name) (gc.RepositoriesReport, error) {
+			return gc.RepositoriesReport{}, nil
+		}, log, clk.Now)
+		if got, _, _ := collectCall(t, h, &push, body()); got != http.StatusOK {
+			t.Fatalf("first collect: %d", got)
+		}
+		clk.set(clk.Now().Add(20 * time.Second))
+		if got, retry, _ := collectCall(t, h, &push, body()); got != http.StatusTooManyRequests || retry != "40" {
+			t.Errorf("20 s later: status %d, Retry-After %q; want 429, 40", got, retry)
+		}
+		clk.set(clk.Now().Add(41 * time.Second))
+		if got, _, _ := collectCall(t, h, &push, body()); got != http.StatusOK {
+			t.Errorf("61 s later: status %d; want 200", got)
+		}
+	})
+
+	t.Run("a collect while a sweep or pass holds the fence", func(t *testing.T) {
+		wd := t.TempDir()
+		st, err := store.OpenWorkDir(wd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, err := gc.New(st, gc.Options{Grace: serveGCGrace, Log: log})
+		if err != nil {
+			t.Fatal(err)
+		}
+		fence := newSweepFence()
+		h := collectRoute(http.NotFoundHandler(), access, fencedSweep(c, fence), log, nil)
+		fence.mu.Lock()
+		got, retry, _ := collectCall(t, h, &push, body())
+		fence.mu.Unlock()
+		if got != http.StatusTooManyRequests || retry == "" {
+			t.Errorf("fenced collect: status %d, Retry-After %q; want 429 with Retry-After", got, retry)
+		}
+		// A refusal for the fence is not a collect: the next one is admitted.
+		if got, _, _ := collectCall(t, h, &push, body()); got != http.StatusOK {
+			t.Errorf("after the fence: status %d; want 200", got)
+		}
+	})
+}
+
+// TestCollectRouteAnswersFixedErrors proves the answer carries one of two
+// fixed texts, never the collector's error, which names server paths.
+func TestCollectRouteAnswersFixedErrors(t *testing.T) {
+	access, push, _ := collectAccess(t)
+	for _, tc := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"too soon", fmt.Errorf("%w: started then", gc.ErrTooSoon), collectErrTooSoon},
+		{"a failure", fmt.Errorf("gc app: open /private/state/registry/app/index.json: %w", gc.ErrUnreadable), collectErrIncomplete},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := collectRoute(http.NotFoundHandler(), access, func(context.Context, []ref.Name) (gc.RepositoriesReport, error) {
+				return gc.RepositoriesReport{}, tc.err
+			}, slog.New(slog.DiscardHandler), nil)
+			got, _, res := collectCall(t, h, &push, strings.NewReader(`{"repositories":["app"]}`))
+			if got != http.StatusOK || res.Error != tc.want {
+				t.Errorf("status %d, error %q; want 200, %q", got, res.Error, tc.want)
+			}
+		})
+	}
+}
+
+// TestCollectPrunedSanitisesAndBoundsTheAnswer proves the client strips
+// control and format characters from what the registry answers, and gives
+// the request its own deadline.
+func TestCollectPrunedSanitisesAndBoundsTheAnswer(t *testing.T) {
+	deleted := []StoredManifest{{Repository: "app", Digest: "sha256:aa"}}
+	var deadline time.Time
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		deadline, _ = r.Context().Deadline()
+		body := `{"stopped":["ap\u001b[2Jp"],"reviewing":["x\u202ey"],"error":"bad\u0007\nnews\u001b]0;title\u0007"}`
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader(body)), Header: http.Header{}, Request: r}, nil
+	})
+	start := time.Now()
+	res, err := CollectPruned(context.Background(), "localhost:5000", deleted, Credential{Username: "k3sm", Password: "pw"}, rt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deadline.IsZero() || deadline.After(start.Add(CollectTimeout+time.Second)) {
+		t.Errorf("request deadline %v; want one within %s", deadline, CollectTimeout)
+	}
+	if got := strings.Join(res.Stopped, ","); got != "ap[2Jp" {
+		t.Errorf("stopped %q; want the escape stripped", got)
+	}
+	if got := strings.Join(res.Reviewing, ","); got != "xy" {
+		t.Errorf("reviewing %q; want the bidi override stripped", got)
+	}
+	if res.Error != "badnews]0;title" {
+		t.Errorf("error %q; want the controls stripped", res.Error)
 	}
 }
