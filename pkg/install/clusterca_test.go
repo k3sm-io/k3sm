@@ -27,6 +27,7 @@ import (
 	"net"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -325,16 +326,23 @@ func TestServerClusterCACopyAcrossNewClusters(t *testing.T) {
 // whole flight before it reads, and the client's alert would otherwise wait for it.
 type queuedWrites struct {
 	net.Conn
-	queue chan []byte
-	done  chan struct{}
+	queue  chan []byte
+	closed chan struct{}
+	done   chan struct{}
+	once   sync.Once
 }
 
 func newQueuedWrites(c net.Conn) *queuedWrites {
-	q := &queuedWrites{Conn: c, queue: make(chan []byte, 64), done: make(chan struct{})}
+	q := &queuedWrites{Conn: c, queue: make(chan []byte, 64), closed: make(chan struct{}), done: make(chan struct{})}
 	go func() {
 		defer close(q.done)
-		for b := range q.queue {
-			if _, err := c.Write(b); err != nil {
+		for {
+			select {
+			case b := <-q.queue:
+				if _, err := c.Write(b); err != nil {
+					return
+				}
+			case <-q.closed:
 				return
 			}
 		}
@@ -343,12 +351,18 @@ func newQueuedWrites(c net.Conn) *queuedWrites {
 }
 
 func (q *queuedWrites) Write(b []byte) (int, error) {
-	q.queue <- bytes.Clone(b)
-	return len(b), nil
+	select {
+	case q.queue <- bytes.Clone(b):
+		return len(b), nil
+	case <-q.closed:
+		return 0, net.ErrClosed
+	}
 }
 
+// Close is safe to call twice: the TLS server closes its transport on some
+// failed handshakes, and the helper closes it again on the way out.
 func (q *queuedWrites) Close() error {
-	close(q.queue)
+	q.once.Do(func() { close(q.closed) })
 	err := q.Conn.Close()
 	<-q.done
 	return err
