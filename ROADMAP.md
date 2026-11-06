@@ -245,8 +245,10 @@ v0.2.3 was released on 2026-10-29.
 - **A registry k3sm owns.** The cluster registry is a bundled third-party server run as a child
   process. k3sm is writing its own OCI registry server over the same on-disk store, with the same
   pushes, pulls, tags and cross-repository mounts, garbage collection that runs while pushes
-  continue, and an image prune that leaves alone anything a push changed in the meantime. The
-  pieces are built; the daemon does not run it yet.
+  continue, and an image prune that leaves alone anything a push changed in the meantime. A layer
+  pushed to several repositories is stored once, with or without a cross-repository mount, so moving
+  off the bundled server does not cost more disk. The pieces are built, apart from that dedupe; the
+  daemon does not run it yet.
 - **A dedicated root updater.** Managed updates are unpacked today by the root network helper. The
   planned updater is a separate small root program that checks every binary against the project's
   Developer ID requirement and the cluster's signing certificate before it activates a version,
