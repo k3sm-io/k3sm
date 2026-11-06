@@ -1,0 +1,2 @@
+	inet 100.64.3.7 netmask 0xffffffff
+	inet 127.0.0.1 netmask 0xff000000

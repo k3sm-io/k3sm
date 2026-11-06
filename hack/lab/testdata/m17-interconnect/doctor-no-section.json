@@ -1,0 +1,1 @@
+{"schemaVersion":1,"verdict":"running","rows":[{"name":"arch","state":"ok","severity":"ok","detail":"arm64 (Apple Silicon)"},{"name":"netd-helper","state":"ok","severity":"ok","detail":"io.k3sm.netd installed and running"}]}

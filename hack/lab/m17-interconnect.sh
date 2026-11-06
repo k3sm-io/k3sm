@@ -17,8 +17,17 @@
 #   hack/lab/m17-interconnect.sh --verify-twice <A> <B> # two run evidence dirs
 #   K3SM_LAB=1 PEER_SSH=<ssh target of the other Mac> \
 #     EVIDENCE_DIR=<absolute dir outside any git tree> \
-#     [K3SM_ARTIFACT=<the k3sm binary under test>] [K3SM_RC_TAG=<rc tag>] \
-#     hack/lab/m17-interconnect.sh
+#     K3SM_M17_REMOTE_SCRATCH=<absolute dir on the peer that its login owns> \
+#     [K3SM_ARTIFACT=<the k3sm binary under test, beside its build set for r9>] \
+#     [K3SM_RC_TAG=<rc tag>] \
+#     hack/lab/m17-interconnect.sh [--until r<n>]
+#
+# --until r<n> (or the full rung id) stops after that rung and exits as the contract
+# says. There is no way in at a later rung: a rung's prerequisites are what earlier
+# rungs of this same process passed, and the exit trap disarms the interconnect and
+# deletes the namespace. r6 needs r5's ring from the same run, so an attended run
+# starts from r0; `--until r5` is the unattended stretch (r6 is the first rung that
+# wants /dev/tty, and refuses without one), and `--until r8` chooses to skip r9.
 #
 # The driver runs on one of the two Macs (local) with the admin KUBECONFIG and
 # reaches the other (peer) over ssh. Every privileged step is a script file run
@@ -28,7 +37,8 @@
 # LAN interface, the default route or a packet filter, and never reboots.
 #
 # Rungs (the table below is the one declaration --plan and the runner read):
-#   r0-disarmed      after the join the Interconnect exists disabled, nothing on bridge0
+#   r0-disarmed      after the join the Interconnect exists disabled, nothing on bridge0,
+#                    no member up
 #   r1-arm           k3sm interconnect enable: armedBy, the Event, slot-0 aliases, peers up
 #   r2-attach        an annotated pod gets a slot, its env, a bound listener, the peer's MAC
 #   r3-cable-path    a fixed transfer to the peer slot address crosses the cable
@@ -37,7 +47,8 @@
 #   r5-ring          a sharded MLXModel on the interconnect serves through rank 0
 #   r6-unplug        the unplug budget measured from the carrier event; UpHold; one restart
 #   r7-desired-forge a node-forged desired annotation yields no out-of-policy alias
-#   r8-killswitch    k3sm interconnect disable leaves no reserved-half state anywhere
+#   r8-killswitch    k3sm interconnect disable: running attached pods keep their addresses and
+#                    new pods do not attach; deleting the pods leaves no reserved-half state
 #   r9-downgrade     the previous binary node by node leaves no state; HelperTooOld leg
 #
 # THE EXIT CONTRACT:
@@ -46,17 +57,42 @@
 #   2  REFUSED  a precondition or a missing mechanism, printed as
 #               REFUSED(<rung>): <what is absent> (BI<n>); also a bad argument.
 #   3  K3SM_LAB unset: "LAB-PENDING: not a pass".
+#   4  PARTIAL  --until stopped the ladder and every rung through it passed: not a pass.
+#               The later rungs read NOT-RUN in rungs.tsv, the log's result is FAIL
+#               (--verify-twice wants ten PASS), and --until r9 is a whole run, so 0.
 #
-# Required under K3SM_LAB=1: PEER_SSH, EVIDENCE_DIR (missing -> exit 2).
+# Required under K3SM_LAB=1: PEER_SSH, EVIDENCE_DIR, K3SM_M17_REMOTE_SCRATCH (missing
+# -> exit 2). The scratch directory must already exist on the peer, outside every
+# shared temporary directory: root runs the scripts copied there, so a location
+# another account can write to would be a privilege step. The run makes one private
+# directory per run under it and the exit trap removes that directory.
 # Optional knobs (each recorded in the log):
 #   K3SM_M17_LOCAL_NODE, K3SM_M17_PEER_NODE   node names (default: matched by mesh address)
-#   K3SM_M17_CLUSTER_CIDR      the cluster pod aggregate (default 10.42.0.0/16)
+#   K3SM_M17_CLUSTER_CIDR      the cluster pod aggregate (default 100.64.0.0/10)
 #   K3SM_M17_PAYLOAD_MB        r3/r4 payload in MiB (default 128, at least 100)
 #   K3SM_M17_LAN_SLACK_BYTES   bytes the flat interface may move (default 8388608)
 #   K3SM_M17_DESIRED_INTERVAL  seconds of the node's DesiredInterval (default 60)
-#   K3SM_M17_MLX_MODEL, K3SM_M17_MLX_MEMORY, K3SM_M17_MLX_READY_TIMEOUT  r5's model
-#   K3SM_M17_PREVIOUS_ARTIFACT the previous k3sm binary for r9 (absent -> REFUSED)
-#   K3SM_M17_REINSTALL_ARGS    extra arguments for the r9 `k3sm install` re-runs
+#   K3SM_M17_FIXTURE_ROOT      where r4's shim fixtures go on both Macs, the local build
+#                              copied to the peer (default /tmp/k3sm-conformance-bin);
+#                              the login must own it. The run's own directory under it
+#                              is removed on exit. Needs go and codesign on the local Mac
+#   K3SM_M17_MLX_MODEL, K3SM_M17_MLX_REVISION   r5's model and its pinned revision
+#                              (default examples/mlxmodel.yaml's; a model named without
+#                              a revision is refused, because r6 and r8 restart ranks
+#                              and a moving branch could load other weights)
+#   K3SM_M17_MLX_IMAGE         r5's serving image (default examples/mlxmodel.yaml's)
+#   K3SM_M17_MLX_MEMORY, K3SM_M17_MLX_READY_TIMEOUT
+#   K3SM_M17_PREVIOUS_ARTIFACT the previous k3sm binary for r9, beside its build set
+#                              (`k3sm install --print-required-artifacts` names the set),
+#                              whose helper speaks a minor below 2: a build whose
+#                              darwin-net predates the interconnect verbs. The newest
+#                              release that qualifies is v0.1.7 (helper 1.1); every later
+#                              one speaks minor 2 or more, and r9 refuses it
+#   K3SM_M17_JOIN_SERVER       the server's underlay address for r9's worker reinstall
+#                              (a LAN IP or DNS name, no scheme, no port)
+#   K3SM_M17_REINSTALL_ARGS    extra arguments for every r9 `k3sm install`, so they must
+#                              suit both roles; empty on a plain two-Mac cluster
+#                              Any r9 input missing or unusable -> REFUSED(r9-downgrade)
 #   K3SM_LAB_TOLERATE_KEYS     extra taint keys every lab pod tolerates, space-separated
 #                              (hack/lab/lib/tolerations.sh)
 #   K3SM_LAB_PRINT_MANIFESTS=1 print the pod manifests and exit; contacts nothing
@@ -64,7 +100,10 @@
 # Evidence: the run log is hack/lab/runs/m17-lab-<rc-tag>-<UTCdate>.log (gitignored;
 # hack/lab/runs/README.md) and EVIDENCE_DIR/run.log, with the M11 run-log header
 # (gate, artifact_sha256, git_sha.<repo>, result) emitted by hack/lab/lib/runlog.sh;
-# per-rung transcripts, counters and figures sit under EVIDENCE_DIR/<rung>/;
+# per-rung transcripts, counters and figures sit under EVIDENCE_DIR/<rung>/; a rung
+# that does not pass adds the test namespace's Events, pods and MLXModels as ns-*,
+# and a run that does not pass adds them to every rung directory as ns-at-exit-*,
+# read before the exit trap deletes the namespace;
 # EVIDENCE_DIR/rungs.tsv is the per-rung verdict --verify-twice reads.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -90,10 +129,11 @@ ROW="M17-lab"
 MODE="ladder"
 PENDING_TEXT="LAB-PENDING: not a pass"
 FIXTURES="$HERE/testdata/m17-interconnect"
-IC_REMOTE_DIR="/tmp/k3sm-m17-lab"
+REMOTE_RUN_PREFIX="k3sm-m17-lab"
 NS="k3sm-m17-lab"
 IC_NAME="thunderbolt"
 NETD_SOCK="/var/lib/k3sm/run/netd.sock"
+SERVICE_USER="_k3sm"
 NETD_LEDGER="/var/lib/k3sm/keys/interconnect-aliases"
 NODE_KUBECONFIG="/var/lib/k3sm/agent/node.kubeconfig"
 K3SM_BIN="/usr/local/bin/k3sm"
@@ -101,15 +141,15 @@ SELFTEST_WATCHDOG="${K3SM_M17_SELFTEST_WATCHDOG:-120}"
 
 # ── The rung table: id | summary | prerequisites | assertion | evidence | owning BI ──
 read -r -d '' RUNG_TABLE <<'RUNGS' || true
-r0-disarmed|after the join the Interconnect exists with enabled false, no k3sm alias on bridge0, no desired annotation, no members|crd,bridge,index,unarmed|assert_r0_disarmed|r0-disarmed/|BI6
+r0-disarmed|after the join the Interconnect exists with enabled false, no k3sm alias on bridge0, no desired annotation, no member up, no segment, no armedBy, no attached pod|crd,bridge,index,unarmed|assert_r0_disarmed|r0-disarmed/|BI6
 r1-arm|k3sm interconnect enable: armedBy is the caller, the InterconnectArmed Warning Event, the slot-0 alias on exactly the cabled nodes, ic-peers up on both|crd,verbs,doctor,netd,armable|assert_r1_arm|r1-arm/|BI6
 r2-attach|an annotated pod gets a slot: K3SM_INTERCONNECT_IP is its alias, the listener's lsof address is the slot not *, the peer's ARP entry is the peer's MAC|armed,attach,tools|assert_r2_attach|r2-attach/|BI7
-r3-cable-path|a fixed transfer to the peer slot address: route bridge0, peer MAC, the Thunderbolt member counters rise by the payload, the LAN stays flat; RTT slot vs mesh RECORDED|armed,attached,tools|assert_r3_cable_path|r3-cable-path/|BI10
-r4-mesh-traffic|pod-to-pod and ClusterIP flows ride a utun and the LAN with the cable flat; a wildcard listener is unreachable on its slot; an unbound dial sources K3SM_INTERCONNECT_IP|armed,attached,tools|assert_r4_mesh_traffic|r4-mesh-traffic/|BI4
+r3-cable-path|a fixed transfer to the peer slot address: route bridge0, peer MAC, the sender's Thunderbolt member rises by the payload, the receiver holds it on the slot with its ACKs on the cable and its LAN and mesh flat; RTT slot vs mesh RECORDED|armed,attached,tools|assert_r3_cable_path|r3-cable-path/|BI10
+r4-mesh-traffic|pod-to-pod and ClusterIP flows ride a utun and the LAN with the cable flat; in ad-hoc-signed fixtures the shim loads into, a wildcard listener binds the pod IP and is unreachable on its slot, and an unbound dial sources K3SM_INTERCONNECT_IP|armed,attached,tools|assert_r4_mesh_traffic|r4-mesh-traffic/|BI4
 r5-ring|a sharded MLXModel with interconnect thunderbolt serves through rank 0: ranks on slot-1 addresses, the ring on the cable, LinksHealthy True, the endpoint on the pod IP; tokens/s RECORDED beside network and single-Mac|armed,mlxhosts,gpu,mlximage|assert_r5_ring|r5-ring/|BI8
 r6-unplug|a pulled cable: member down <= 20 s and the MLX re-render <= 30 s after the carrier drop, the mesh loses at most one reply, UpHold 60 s on replug, one transition per direction, no second gang restart inside 5 min|armed,ring,operator|assert_r6_unplug|r6-unplug/|BI6
 r7-desired-forge|no-address-channel smoke test: the desired annotation carries no address or slot, so values the node forges with its own credential (unknown address/slot fields, a foreign interconnect name, schema 99) can only hold or drop slot 0: no out-of-policy alias or route, only the two netd verbs; an in-policy rewrite restores slot 0|armed,nodecred|assert_r7_desired_forge|r7-desired-forge/|BI3
-r8-killswitch|k3sm interconnect disable: no reserved-half address, route, permanent ARP or ledger entry on either Mac, membership, lo0 and the mesh unchanged, the annotation, members and attached pods gone, the ring on the mesh|armed|assert_r8_killswitch|r8-killswitch/|BI6
+r8-killswitch|k3sm interconnect disable: the annotation goes, a new pod does not attach, a running attached pod keeps its address, lo0 and the mesh unchanged, the ring on the mesh; once the pods are deleted no reserved-half address, route, permanent ARP or ledger entry on either Mac, membership unchanged, no member up, no segment, no armedBy|armed|assert_r8_killswitch|r8-killswitch/|BI6
 r9-downgrade|disable, then the previous binary node by node: every r8 host assertion again, doctor ic-stray and ic-residue clean, HelperTooOld on the mixed leg, no reboot; then the artifact under test is reinstalled|disarmed,prevbin|assert_r9_downgrade|r9-downgrade/|BI3
 RUNGS
 REQUIRED_IDS="r0-disarmed r1-arm r2-attach r3-cable-path r4-mesh-traffic r5-ring r6-unplug r7-desired-forge r8-killswitch r9-downgrade"
@@ -128,7 +168,7 @@ prereq_what() {
 	crd) echo "the net.k3sm.io Interconnect CRD is not served (BI6)" ;;
 	verbs) echo "k3sm interconnect enable/disable are not in the installed binary (BI6)" ;;
 	doctor) echo "k3sm doctor has no ic-* rows (BI9)" ;;
-	netd) echo "the netd helper does not report MinorInterconnect >= 2 on both Macs (BI3)" ;;
+	netd) echo "a netd helper confirmed at MinorInterconnect >= 2 on both Macs (BI3)" ;;
 	attach) echo "the provider has no k3sm.io/InterconnectAttached condition (BI7)" ;;
 	mlxhosts) echo "the binary does not render K3SM_MLX_HOSTS (BI8)" ;;
 	nodirectlink) echo "a DirectLink CRD is still served (BI5/BI11)" ;;
@@ -141,7 +181,7 @@ prereq_what() {
 	mlximage) echo "the mlx serving image (BI8)" ;;
 	operator) echo "an operator at /dev/tty to pull and replug the cable (BI10)" ;;
 	nodecred) echo "the worker's installed node kubeconfig (BI6)" ;;
-	prevbin) echo "K3SM_M17_PREVIOUS_ARTIFACT and K3SM_ARTIFACT, the previous and current binaries (BI10)" ;;
+	prevbin) echo "K3SM_M17_PREVIOUS_ARTIFACT and K3SM_ARTIFACT, each the k3sm binary of a complete build set (BI10)" ;;
 	armable) echo "r0-disarmed did not pass" ;;
 	armed) echo "r1-arm did not pass" ;;
 	attached) echo "r2-attach did not pass" ;;
@@ -234,10 +274,46 @@ d=json.load(sys.stdin); $1"; }
 desired_of() { kc get node "$1" -o jsonpath='{.metadata.annotations.k3sm\.io/interconnect-desired}' 2>/dev/null; }
 member_state() { ic_field "print(next((m.get('state','') for m in (d.get('status') or {}).get('members') or [] if m.get('node')=='$1'), ''))"; }
 members_count() { ic_field "print(len((d.get('status') or {}).get('members') or []))"; }
+# ic_disarmed_verdict <Interconnect JSON file> — what "disarmed" means to a person:
+# nothing is on the cable. It does NOT ask for an empty status.members, because
+# that is not the product's contract: a member is a node that reported a cabled
+# peer, or was already a member and still exists, whatever spec.enabled says, and
+# only the desired annotation depends on enabled (pkg/interconnect/resolve.go
+# Resolve). So a disabled object keeps its cabled nodes, listed down, and neither
+# disable nor anything else clears them. Those members stay visible: the rungs
+# record them, and any member up, segment, armedBy or attached pod is a red here.
+ic_disarmed_verdict() {
+	python3 -I -c 'import json,sys
+st=json.load(open(sys.argv[1])).get("status") or {}
+bad=["member %s is up" % m.get("node") for m in st.get("members") or [] if m.get("state")=="up"]
+if st.get("segments"): bad.append("%d segment(s)" % len(st["segments"]))
+if st.get("armedBy"): bad.append("armedBy is %s" % st["armedBy"])
+if st.get("attachedPods"): bad.append("%d attached pod(s)" % st["attachedPods"])
+print("; ".join(bad))
+sys.exit(1 if bad else 0)' "$1"
+}
+# ic_members_line <Interconnect JSON file> — the members, for the record.
+ic_members_line() {
+	python3 -I -c 'import json,sys
+ms=(json.load(open(sys.argv[1])).get("status") or {}).get("members") or []
+print(", ".join("%s %s since %s" % (m.get("node"), m.get("state"), m.get("lastTransition","?")) for m in ms) or "none")' "$1"
+}
+# ic_settled_disarmed — a fresh read of the object satisfies the verdict; a node's
+# report takes a probe round to drop a peer whose address has just gone.
+ic_settled_disarmed() {
+	ic_json >"$RUNG_DIR/interconnect.json" && ic_disarmed_verdict "$RUNG_DIR/interconnect.json"
+}
+# check_disarmed — the shared r0/r8 status check, bounded, with the members on record.
+check_disarmed() {
+	wait_until 120 ic_settled_disarmed || true
+	check "nothing on the cable by the object's status: no member up, no segment, no armedBy, no attached pod" \
+		ic_disarmed_verdict "$RUNG_DIR/interconnect.json"
+	rec "status.members on the disabled object (kept by design, not cleared by disable): $(ic_members_line "$RUNG_DIR/interconnect.json")"
+}
 # scrape_metrics <tag> — every node's interconnect metrics endpoint.
 scrape_metrics() {
 	local n
-	for n in $L_NODE $P_NODE; do
+	for n in $local_NODE $peer_NODE; do
 		kc get --raw "/api/v1/nodes/$n/proxy/metrics/interconnect" >"$RUNG_DIR/metrics-$1-$n.txt" 2>&1 || true
 	done
 	cat "$RUNG_DIR"/metrics-"$1"-*.txt >"$RUNG_DIR/metrics-$1.txt" 2>/dev/null
@@ -247,16 +323,28 @@ halves_empty_on() {
 	on "$1" "ifconfig bridge0" >"$RUNG_DIR/.he-$1.txt" 2>&1
 	icp_halves_empty "$RUNG_DIR/.he-$1.txt"
 }
-# netd_hello <side> — the helper's reply to a Hello, as root, into RUNG_DIR.
+# netd_hello <side> — the helper's reply to a Hello, sent as the service user,
+# into RUNG_DIR.
 netd_hello() {
 	# The frame is icp_netd_hello_frame's (darwin-net pkg/netd/wire/protocol.go
 	# ReadFrame: a 4-byte big-endian length, then JSON; minor 2 is the wire
 	# package's MinorInterconnect), pinned by the self-test. It is deliberately
 	# not the k3sm client: the probe must not trust the code under test.
-	priv "$1" netd-hello SOCK="$NETD_SOCK" FRAME="$(icp_netd_hello_frame)" <<'EOF'
-python3 -I - "$SOCK" "$FRAME" <<'PY'
-import socket, struct, sys
+	#
+	# No k3sm surface prints the helper's minor: doctor's ic-netd only dials the
+	# socket and closes it (cmd/k3sm/doctorinterconnectprobe.go dialNetd), and the
+	# peer check runs after the accept, so that row reads ok for any uid. The one
+	# product read is the node's own Hello on its service-uid connection, so this
+	# probe stands where the node stands: root drops to the service user before it
+	# connects, because the helper closes any other uid unanswered, root included.
+	priv "$1" netd-hello SOCK="$NETD_SOCK" FRAME="$(icp_netd_hello_frame)" SVC_USER="$SERVICE_USER" <<'EOF'
+python3 -I - "$SOCK" "$FRAME" "$SVC_USER" <<'PY'
+import os, pwd, socket, struct, sys
 try:
+    pw = pwd.getpwnam(sys.argv[3])
+    os.setgroups([])
+    os.setgid(pw.pw_gid)
+    os.setuid(pw.pw_uid)
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(5)
     s.connect(sys.argv[1])
@@ -281,6 +369,22 @@ PY
 EOF
 	cp "$PAYLOAD_LOG" "$RUNG_DIR/netd-hello-$1.json"
 }
+# helper_version <Hello reply file> — "<major>.<minor>", or nothing without a version.
+helper_version() {
+	local major minor
+	major="$(grep -o '"major":[0-9]*' "$1" 2>/dev/null | sed -n 1p | cut -d: -f2)"
+	minor="$(grep -o '"minor":[0-9]*' "$1" 2>/dev/null | sed -n 1p | cut -d: -f2)"
+	[ -n "$major" ] && [ -n "$minor" ] && echo "$major.$minor"
+}
+# netd_probe_detail <side> <Hello reply file> — what the probe learned, in words:
+# a reply with no version is "cannot read" and says nothing about the helper's age.
+netd_probe_detail() {
+	case "$(icp_helper_verdict "$2")" in
+	minor2) echo "the $1 Mac's helper speaks $(helper_version "$2")" ;;
+	HelperTooOld) echo "TOO OLD: the $1 Mac's helper speaks $(helper_version "$2"), below minor 2 (a HelperTooOld is a refusal, never a pass)" ;;
+	*) echo "CANNOT READ: no version from the $1 Mac's helper as $SERVICE_USER, which says nothing about its age; netd logs a rejected peer in /var/log/k3sm/netd.log: $(head -c 200 "$2" | tr '\n' ' ')" ;;
+	esac
+}
 read_ledger() {
 	priv "$1" ledger LEDGER="$NETD_LEDGER" <<'EOF'
 [ -f "$LEDGER" ] && cat "$LEDGER"
@@ -304,6 +408,71 @@ doctor_json() {
 exit 0
 EOF
 	cp "$PAYLOAD_LOG" "$RUNG_DIR/doctor-$1.json"
+}
+
+# doctor_mechanism_problem <doctor --json file> — why this report comes from a doctor
+# without the interconnect section; silent and 0 when it has one. Only ic-bridge and
+# ic-stray can say so (cmd/k3sm/doctorinterconnect.go interconnectChecks, which
+# doctor always runs): ic-bridge is on every path, ic-stray on every path but a Mac
+# with no Thunderbolt port, and the bridge probe has already refused that Mac. Every
+# other row depends on the host: ic-netd, ic-address, ic-peers and the rest only when
+# a cable or an address puts the Mac in use, ic-residue only when there is residue.
+# Both names arrived with the section, so an older binary has neither.
+doctor_mechanism_problem() {
+	local row
+	for row in ic-bridge ic-stray; do
+		case "$(icp_doctor_row_state "$1" "$row")" in
+		absent | unreadable)
+			echo "has no $row row"
+			return 1
+			;;
+		esac
+	done
+}
+# doctor_residue_verdict <baseline doctor --json> <doctor --json now> <own addresses> —
+# what the ic-residue row says this run left; non-zero when it names any. No row means
+# no residue. The product writes a present row with state ok, always, as harmless
+# (checkICResidue), so its state cannot be the test, and a row can exist before the run
+# because macOS will not delete those routes. So the routes are the test, under the
+# same rule as icp_route_residue: one in the baseline row is not this run's, and one
+# for this Mac's own slot is the clone macOS keeps of an alias it removed. Anything
+# else, a state other than ok, or wording this cannot read, is red.
+doctor_residue_verdict() {
+	python3 -I -c 'import json,re,sys
+def row(path):
+    for r in json.load(open(path)).get("rows") or []:
+        if r.get("name")=="ic-residue":
+            return r
+def routes(r):
+    m=re.match(r"harmless pre-existing state: (\S+(?:, \S+)*) on bridge0 ", r.get("detail",""))
+    return m.group(1).split(", ") if m else None
+try:
+    now=row(sys.argv[2])
+except Exception as e:
+    print("doctor report unreadable: %s" % e); sys.exit(1)
+if now is None:
+    print("no ic-residue row, so no residue"); sys.exit(0)
+if now.get("state")!="ok":
+    print("ic-residue is %s: %s" % (now.get("state"), now.get("detail"))); sys.exit(1)
+left=routes(now)
+if left is None:
+    print("ic-residue names no routes this can read: %s" % now.get("detail")); sys.exit(1)
+try:
+    base=row(sys.argv[1])
+except Exception:
+    base=None
+before=(routes(base) or []) if base else []
+own=sys.argv[3].split()
+new=[x for x in left if x not in before and x.split("/")[0] not in own]
+if new:
+    print("residue this run left: %s" % ", ".join(new)); sys.exit(1)
+print("only routes this run did not leave: %s" % ", ".join(left))' "$1" "$2" "$3"
+}
+# own_slot_addrs <side> — every interconnect address this Mac can hold.
+own_slot_addrs() {
+	local x idx
+	idx="$(side_var "$1" IDX)"
+	for x in 0 1 2 3 4 5 6 7; do icp_slot_addr "$idx" "$x"; done | tr '\n' ' '
 }
 
 # ic_pod_manifest <name> <node> <annotated 0|1> <shell command> — a native pod
@@ -335,18 +504,173 @@ ic_pod() { ic_pod_manifest "$@" | kc apply -f - >/dev/null; }
 pod_ready() { [ "$(kc get pod -n "$NS" "$1" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = True ]; }
 pod_done() { case "$(kc get pod -n "$NS" "$1" -o jsonpath='{.status.phase}' 2>/dev/null)" in Succeeded | Failed) return 0 ;; esac; return 1; }
 pod_log_value() { kc logs -n "$NS" "$1" 2>/dev/null | awk -v k="$2" 'index($0, k)==1{v=substr($0, length(k)+1)} END{print v}'; }
+pod_log_count() { kc logs -n "$NS" "$1" 2>/dev/null | awk -v k="$2" 'index($0, k)==1{n++} END{print n+0}'; }
 pod_ip() { kc get pod -n "$NS" "$1" -o jsonpath='{.status.podIP}' 2>/dev/null; }
 pod_attached() { kc get pod -n "$NS" "$1" -o jsonpath='{.status.conditions[?(@.type=="k3sm.io/InterconnectAttached")].status}' 2>/dev/null; }
 
 # The attached listener: 5400 bound explicitly to the interconnect address, 5401
-# on the wildcard (the shim rewrites it to the pod IP). Each received stream's
-# byte count is a log line. Single-quoted on purpose: it expands in the pod.
+# on the wildcard, in /usr/bin/nc, a platform binary the shim cannot load into, so
+# 5401 is only the byte counter for the mesh flows and proves nothing about the
+# shim (r4 proves that with its own fixtures). Each received stream's byte count
+# is a log line. Every listener takes -d: a pod's stdin is at EOF, and without -d
+# nc answers that EOF with a FIN, the sender quits, and the count stops near 64 KiB.
+# Single-quoted on purpose: it expands in the pod.
 # shellcheck disable=SC2016
 LISTENER_CMD='echo "ICIP=${K3SM_INTERCONNECT_IP:-}"; echo "PODIP=${K3SM_POD_IP:-}"
 if [ -n "${K3SM_INTERCONNECT_IP:-}" ]; then
-  ( while :; do n=$(/usr/bin/nc -l "$K3SM_INTERCONNECT_IP" 5400 | /usr/bin/wc -c); echo "RECV5400=$((n + 0))"; done ) &
+  ( while :; do n=$(/usr/bin/nc -d -l "$K3SM_INTERCONNECT_IP" 5400 | /usr/bin/wc -c); echo "RECV5400=$((n + 0))"; done ) &
 fi
-while :; do n=$(/usr/bin/nc -l 5401 | /usr/bin/wc -c); echo "RECV5401=$((n + 0))"; done'
+while :; do n=$(/usr/bin/nc -d -l 5401 | /usr/bin/wc -c); echo "RECV5401=$((n + 0))"; done'
+
+# The r4 shim legs run only in these two binaries, never in /usr/bin/nc: dyld drops
+# DYLD_INSERT_LIBRARIES for a platform binary, so nc holds no shim and its wildcard
+# bind and source address say nothing about the product. These are ad-hoc-signed Go
+# builds that call libSystem's bind and connect, so the shim interposes on them, and
+# what they run under is checked rather than assumed: a positive effect of the shim
+# (the pod IP bind, the pinned source) and no ShimInactive report for that pod.
+WILD_PORT=5403
+PIN_PORT=5402
+# The source-pin listener: it logs the accepted peer and answers the banner conftool
+# dial reads, so the dialer exits on the connection it was pinned on.
+PIN_LISTEN_PY='import socket,sys;a,p,t=sys.argv[1],int(sys.argv[2]),float(sys.argv[3]);s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind((a,p));s.listen(1);s.settimeout(t);print("LISTEN",a,p,flush=True);c,r=s.accept();print("ACCEPT",c.getsockname()[0],r[0],flush=True);c.sendall(b"BANNER=pin\n");c.close()'
+# fixture_root_problem <path> — why the path cannot hold the fixtures. It lands in
+# remote shell commands, so its alphabet is closed rather than quoted.
+fixture_root_problem() {
+	case "$1" in /*) ;; *)
+		echo "'$1' must be an absolute path"
+		return 1
+		;;
+	esac
+	[[ "$1" =~ ^/[A-Za-z0-9._/-]+$ ]] || {
+		echo "'$1' must hold only letters, digits and . _ - /"
+		return 1
+	}
+	case "$1/" in */../* | */./*)
+		echo "'$1' must not hold a . or .. component"
+		return 1
+		;;
+	esac
+}
+# fixture_dir_make_cmd — the shell command that makes this run's directory: pods run
+# as the service user, so it is world-readable, and mkdir without -p refuses a path
+# someone else already made in a shared parent.
+fixture_dir_make_cmd() { echo "mkdir -p $FIXTURE_ROOT && [ -O $FIXTURE_ROOT ] && chmod 755 $FIXTURE_ROOT && umask 022 && mkdir $FIXTURE_DIR"; }
+# fixtures_stage — hello-http and conftool built here, ad-hoc-signed, copied to the
+# peer and read back there by digest. Any miss prints why and returns non-zero.
+fixtures_stage() {
+	local b sum
+	on_local "$(fixture_dir_make_cmd)" || {
+		echo "cannot make $FIXTURE_DIR on the local Mac ($FIXTURE_ROOT must be a directory this login owns)"
+		return 1
+	}
+	(cd "$REPO_ROOT" && go build -o "$FIXTURE_DIR/conftool" ./e2e/testdata/cmd/conftool && CGO_ENABLED=0 go build -o "$FIXTURE_DIR/hello-http" ./e2e/testdata/cmd/hello-http) || {
+		echo "the fixtures do not build from $REPO_ROOT"
+		return 1
+	}
+	on_peer "$(fixture_dir_make_cmd)" || {
+		echo "cannot make $FIXTURE_DIR on the peer ($FIXTURE_ROOT must be a directory its login owns)"
+		return 1
+	}
+	for b in conftool hello-http; do
+		codesign -s - -f "$FIXTURE_DIR/$b" >/dev/null 2>&1 || {
+			echo "codesign refused $b"
+			return 1
+		}
+		scp -q -p -o BatchMode=yes -o ConnectTimeout=10 "$FIXTURE_DIR/$b" "$PEER_SSH:$FIXTURE_DIR/$b" </dev/null || {
+			echo "cannot copy $b to the peer"
+			return 1
+		}
+		sum="$(shasum -a 256 "$FIXTURE_DIR/$b" | cut -d' ' -f1)"
+		[ "$(on_peer "shasum -a 256 $FIXTURE_DIR/$b" | cut -d' ' -f1)" = "$sum" ] || {
+			echo "the peer's copy of $b does not match the local build"
+			return 1
+		}
+	done
+}
+# fixtures_remove — the exit trap's half: this run's directory on each Mac and nothing
+# else. A failure to remove it is said out loud and never changes the verdict.
+fixtures_remove() {
+	[ "${FIXTURES_MADE:-0}" = 1 ] || return 0
+	case "$FIXTURE_DIR" in
+	"$FIXTURE_ROOT/$REMOTE_RUN_PREFIX".*) ;;
+	*)
+		echo "cleanup: not removing '$FIXTURE_DIR': it is not this run's directory under $FIXTURE_ROOT"
+		return 0
+		;;
+	esac
+	rm -rf "$FIXTURE_DIR" || echo "cleanup: could not remove $FIXTURE_DIR on the local Mac"
+	on_peer "rm -rf $FIXTURE_DIR" >/dev/null 2>&1 || echo "cleanup: could not remove $FIXTURE_DIR on the peer; check by hand"
+}
+# shim_report_problem <pod> — the pod's own ShimInactive report, selected by uid so
+# nothing an earlier pod of that name recorded counts. An empty answer here is not
+# evidence the shim loaded, which is why each leg also asserts one of its effects.
+shim_report_problem() {
+	local uid
+	uid="$(kc get pod -n "$NS" "$1" -o jsonpath='{.metadata.uid}' 2>/dev/null)"
+	kc get pod -n "$NS" "$1" -o json >"$RUNG_DIR/$1.json" 2>&1
+	icp_shim_report_verdict "$(kc get pod -n "$NS" "$1" -o jsonpath='{.status.conditions[?(@.type=="k3sm.io/shim-inactive")].status}' 2>/dev/null)" \
+		"$(kc get events -n "$NS" --field-selector "involvedObject.uid=$uid,reason=ShimInactive" -o jsonpath='{.items[*].type}' 2>/dev/null)"
+}
+# wild_bound <pod IP> — the peer's listeners, kept; the shim moved the wildcard to the pod IP.
+wild_bound() {
+	on peer "netstat -an -p tcp" >"$RUNG_DIR/wild-netstat.txt" 2>&1
+	icp_wild_bind_verdict "$RUNG_DIR/wild-netstat.txt" "$1" "$WILD_PORT"
+}
+
+# remote_scratch_problem <path> — why the path cannot hold this run's scripts; silent
+# and 0 when it can. The value lands in remote shell commands, so its alphabet is
+# closed rather than quoted.
+remote_scratch_problem() {
+	local p="$1"
+	[ -n "$p" ] || {
+		echo "is unset (an absolute directory on the peer, which its login owns)"
+		return 1
+	}
+	case "$p" in /*) ;; *)
+		echo "'$p' must be an absolute path"
+		return 1
+		;;
+	esac
+	[[ "$p" =~ ^/[A-Za-z0-9._/-]+$ ]] || {
+		echo "'$p' must be a directory other than / with only letters, digits and . _ - /"
+		return 1
+	}
+	case "$p/" in */../* | */./*)
+		echo "'$p' must not hold a . or .. component"
+		return 1
+		;;
+	esac
+	case "$p/" in /tmp/* | /private/tmp/* | /var/tmp/* | /private/var/tmp/* | /var/folders/* | /private/var/folders/*)
+		echo "'$p' is a shared temporary directory; root runs the scripts copied there"
+		return 1
+		;;
+	esac
+}
+# remote_run_dir <scratch> — this run's directory under the scratch location.
+remote_run_dir() { printf '%s/%s.%s.%s.%s\n' "$1" "$REMOTE_RUN_PREFIX" "$(date -u +%Y%m%dT%H%M%SZ)" "$$" "$RANDOM"; }
+# remote_dir_make — the private directory on the peer, made last so that a peer
+# without passwordless sudo leaves nothing behind. mkdir without -p refuses a path
+# that already exists, and the umask makes it 0700 before it can hold anything.
+remote_dir_make() {
+	on_peer "sudo -n true && [ -d $REMOTE_SCRATCH ] && [ -O $REMOTE_SCRATCH ] && umask 077 && mkdir $IC_REMOTE_DIR"
+}
+# remote_dir_remove — the exit trap's half: this run's directory and nothing else.
+# A failure to remove it is said out loud and never changes the verdict.
+remote_dir_remove() {
+	[ "${REMOTE_DIR_MADE:-0}" = 1 ] || return 0
+	case "$IC_REMOTE_DIR" in
+	"$REMOTE_SCRATCH/$REMOTE_RUN_PREFIX".*) ;;
+	*)
+		echo "cleanup: not removing '$IC_REMOTE_DIR': it is not this run's directory under $REMOTE_SCRATCH"
+		return 0
+		;;
+	esac
+	if on_peer "rm -rf $IC_REMOTE_DIR" >/dev/null 2>&1; then
+		echo "cleanup: removed $IC_REMOTE_DIR on the peer"
+	else
+		echo "cleanup: could not remove $IC_REMOTE_DIR on the peer (unreachable, or never made); check by hand"
+	fi
+}
 
 # ── The assertions ──────────────────────────────────────────────────────────────
 
@@ -358,7 +682,7 @@ assert_r0_disarmed() {
 	ic_json >"$RUNG_DIR/interconnect.json"
 	check "spec.enabled is false (auto-created disarmed, I1)" \
 		test "$(ic_field "print(str((d.get('spec') or {}).get('enabled', False)).lower())")" = false
-	check "status.members is empty" test "$(members_count)" = 0
+	check_disarmed
 	local s
 	for s in local peer; do
 		snap "$s" r0
@@ -450,27 +774,39 @@ EOF
 # measure_rtt <label> <dst> — RECORDED RTT, five pings, average.
 measure_rtt() { on_local "ping -c 5 -q $2" 2>/dev/null | awk -F/ '/round-trip/{print $5; exit}'; }
 
+# A bridge member's Ibytes reads 0 on both Macs, whatever arrives, so the receiver's
+# member counter holds only the ACKs it sent and can never reach the payload. The
+# local Mac (the sender) still answers with its member's bytes; the peer answers
+# with what the listener on its slot received, its ACKs on the cable, and its LAN and
+# mesh counters flat, which is what a payload taking either path would move.
 assert_r3_cable_path() {
-	local bytes=$((PAYLOAD_MB * 1048576)) dst="$peer_ICIP" s got r0l r0p r1l r1p tbd land v rtt_ic rtt_mesh
+	local bytes=$((PAYLOAD_MB * 1048576)) dst="$peer_ICIP" s got r0l r0p r1l r1p tbd land utd v rtt_ic rtt_mesh
 	for s in local peer; do
 		on "$s" "route -n get $(side_var "$(other "$s")" ICIP)" >"$RUNG_DIR/$s-route.txt" 2>&1
 		check "$s Mac: route -n get $(side_var "$(other "$s")" ICIP) names bridge0" test "$(icp_route_iface "$RUNG_DIR/$s-route.txt")" = bridge0
 		counters "$s" before "$(side_var "$s" TB)" "$(side_var "$s" LAN)"
 		record_link_context "$s"
 	done
+	counters peer before "$PEER_UTUN"
 	r0l="$(retrans local)" r0p="$(retrans peer)"
 	on_local "dd if=/dev/zero bs=1048576 count=$PAYLOAD_MB 2>/dev/null | nc -G 5 -w 15 $dst 5400" >"$RUNG_DIR/transfer.txt" 2>&1
 	sleep 2
 	r1l="$(retrans local)" r1p="$(retrans peer)"
+	got="$(pod_log_value ic-l-peer RECV5400=)"
+	counters peer after "$PEER_UTUN"
 	for s in local peer; do
 		counters "$s" after "$(side_var "$s" TB)" "$(side_var "$s" LAN)"
 		tbd="$(icp_total_delta "$RUNG_DIR/$s-before-$(side_var "$s" TB).txt" "$RUNG_DIR/$s-after-$(side_var "$s" TB).txt")" || tbd=0
 		land="$(icp_total_delta "$RUNG_DIR/$s-before-$(side_var "$s" LAN).txt" "$RUNG_DIR/$s-after-$(side_var "$s" LAN).txt")" || land=999999999999
-		check "$s Mac: counters ($(side_var "$s" TB) vs LAN $(side_var "$s" LAN))" icp_cable_path_verdict "$bytes" "$tbd" "$land" "$LAN_SLACK"
+		if [ "$s" = local ]; then
+			check "local Mac (sender): counters ($local_TB vs LAN $local_LAN)" icp_cable_path_verdict "$bytes" "$tbd" "$land" "$LAN_SLACK"
+		else
+			utd="$(icp_total_delta "$RUNG_DIR/peer-before-$PEER_UTUN.txt" "$RUNG_DIR/peer-after-$PEER_UTUN.txt")" || utd=999999999999
+			check "peer Mac (receiver): slot bytes and counters ($peer_TB vs LAN $peer_LAN, mesh $PEER_UTUN)" icp_cable_receiver_verdict "$bytes" "${got:-0}" "$tbd" "$land" "$utd" "$LAN_SLACK"
+		fi
 		line="$(on "$s" "arp -n $(side_var "$(other "$s")" ICIP)" 2>&1)"
 		check "$s Mac: ARP for the peer slot address" icp_arp_verdict "$line" "$(side_var "$s" MACS)" "$(side_var "$(other "$s")" MACS)"
 	done
-	got="$(pod_log_value ic-l-peer RECV5400=)"
 	check "the peer pod received the whole payload on its slot address ($got of $bytes bytes)" test "${got:-0}" = "$bytes"
 	rec "tcp retransmits during the transfer: local +$((${r1l:-0} - ${r0l:-0})), peer +$((${r1p:-0} - ${r0p:-0}))"
 	rtt_ic="$(measure_rtt slot "$dst")" rtt_mesh="$(measure_rtt mesh "$peer_MESH")"
@@ -481,7 +817,7 @@ assert_r3_cable_path() {
 # mesh_flow <label> <destination> <port> — a sender pod on the local node streams
 # the payload to the destination; the local Mac's counters bracket it.
 mesh_flow() {
-	local label="$1" dst="$2" port="$3" bytes=$((PAYLOAD_MB * 1048576)) ut tbd land utd before got r0 p="ic-send-$1"
+	local label="$1" dst="$2" port="$3" bytes=$((PAYLOAD_MB * 1048576)) ut tbd land utd before after got r0 p="ic-send-$1"
 	on_local "route -n get $dst" >"$RUNG_DIR/route-$label.txt" 2>&1
 	ut="$(icp_route_iface "$RUNG_DIR/route-$label.txt")"
 	if [ "$label" = pod ]; then
@@ -489,7 +825,7 @@ mesh_flow() {
 	fi
 	case "$ut" in utun*) ;; *) ut="$MESH_UTUN" ;; esac
 	counters local "$label-before" "$ut" "$local_LAN" "$local_TB"
-	before="$(pod_log_value ic-l-peer RECV5401=)"
+	before="$(pod_log_count ic-l-peer RECV5401=)"
 	r0="$(retrans local)"
 	ic_pod "$p" "$local_NODE" 0 "/bin/dd if=/dev/zero bs=1048576 count=$PAYLOAD_MB 2>/dev/null | /usr/bin/nc -G 5 -w 15 $dst $port; echo SENT=\$?"
 	wait_until 300 pod_done "$p" || fail "sender pod $p did not finish within 300 s"
@@ -500,13 +836,15 @@ mesh_flow() {
 	land="$(icp_total_delta "$RUNG_DIR/local-$label-before-$local_LAN.txt" "$RUNG_DIR/local-$label-after-$local_LAN.txt")" || land=0
 	tbd="$(icp_total_delta "$RUNG_DIR/local-$label-before-$local_TB.txt" "$RUNG_DIR/local-$label-after-$local_TB.txt")" || tbd=999999999999
 	check "$label flow counters ($ut, LAN $local_LAN, cable $local_TB)" icp_mesh_path_verdict "$bytes" "$utd" "$land" "$tbd" "$LAN_SLACK"
-	got="$(pod_log_value ic-l-peer RECV5401=)"
-	check "$label flow: the peer pod's wildcard listener received the payload ($got bytes; before $before)" test "${got:-0}" = "$bytes"
+	# Two whole flows log the same number, so the last line alone would credit the
+	# second flow with the first one's bytes: this flow must add a line of its own.
+	got="$(pod_log_value ic-l-peer RECV5401=)" after="$(pod_log_count ic-l-peer RECV5401=)"
+	check "$label flow: the peer pod's 5401 listener received the payload" icp_flow_received_verdict "$bytes" "$before" "$after" "$got"
 	kc delete pod -n "$NS" "$p" --wait=false >/dev/null 2>&1
 }
 
 assert_r4_mesh_traffic() {
-	local pip cip out rc=0 icd
+	local pip cip out rc=0 icd wip
 	pip="$(pod_ip ic-l-peer)"
 	MESH_UTUN="$(on_local "route -n get $peer_MESH" | awk '$1=="interface:"{print $2; exit}')"
 	mesh_flow pod "$pip" 5401
@@ -520,57 +858,147 @@ spec:
 EOF
 	cip="$(kc get svc -n "$NS" ic-svc -o jsonpath='{.spec.clusterIP}')"
 	mesh_flow clusterip "$cip" 5401
-	out="$(on_local "nc -z -G 3 -w 3 $peer_ICIP 5401" 2>&1)" || rc=$?
-	printf 'rc=%s %s\n' "$rc" "$out" >"$RUNG_DIR/wildcard-negative.txt"
-	check "wildcard negative: the peer pod's *:5401 listener does not answer on its slot address $peer_ICIP" test "$rc" != 0
+	# Wildcard: an attached pod's hello-http on the wildcard. The shim moves it to the
+	# pod IP, so the pod IP answers and the slot address does not. Without the shim it
+	# binds * and answers on both, so each half fails on its own. The shell only execs:
+	# a platform child would earn this pod a ShimInactive report of its own.
+	ic_pod ic-wild "$peer_NODE" 1 "exec $FIXTURE_DIR/hello-http --id ic-wild --addr :$WILD_PORT"
+	if wait_until 120 pod_ready ic-wild; then
+		wip="$(pod_ip ic-wild)"
+		wait_until 30 wild_bound "$wip" || true
+		check "wildcard: the shim bound the peer pod's listener to its pod IP $wip, not *" icp_wild_bind_verdict "$RUNG_DIR/wild-netstat.txt" "$wip" "$WILD_PORT"
+		# unpinned: a GET to the fixture this run just started; the body is compared, never run
+		out="$(on_local "curl -sS -m 5 http://$wip:$WILD_PORT/" 2>&1)" || true
+		printf '%s\n' "$out" >"$RUNG_DIR/wildcard-control.txt"
+		check "wildcard control: the listener answers on the pod IP, so the negative below is not vacuous" test "$out" = ic-wild
+		out="$(on_local "nc -z -G 3 -w 3 $peer_ICIP $WILD_PORT" 2>&1)" || rc=$?
+		printf 'rc=%s %s\n' "$rc" "$out" >"$RUNG_DIR/wildcard-negative.txt"
+		check "wildcard negative: the listener does not answer on the slot address $peer_ICIP" test "$rc" != 0
+		check "wildcard: no ShimInactive report for hello-http" shim_report_problem ic-wild
+	else
+		fail "the wildcard fixture pod ic-wild never became Ready within 120 s"
+	fi
+	kc delete pod -n "$NS" ic-wild --wait=false >/dev/null 2>&1
 	# Source pin: an unbound dial from an attached pod to the peer's slot-0 address,
-	# against a host listener there that reports the connection's source.
-	on_peer "python3 -c $(printf '%q' "$IC_LISTEN_PY") $peer_SLOT0 5402 120" >"$RUNG_DIR/pin-listener.txt" 2>&1 &
+	# against a host listener there that reports the connection's source. conftool
+	# retries until the listener is up, so no platform sleep sits before it.
+	on_peer "python3 -c $(printf '%q' "$PIN_LISTEN_PY") $peer_SLOT0 $PIN_PORT 120" >"$RUNG_DIR/pin-listener.txt" 2>&1 &
 	BG_PIDS="$BG_PIDS $!"
 	sleep 2
-	ic_pod ic-pin "$local_NODE" 1 "echo ICIP=\${K3SM_INTERCONNECT_IP:-}; sleep 3; /usr/bin/nc -z -G 5 -w 5 $peer_SLOT0 5402; echo RC=\$?"
+	ic_pod ic-pin "$local_NODE" 1 "echo ICIP=\${K3SM_INTERCONNECT_IP:-}; exec $FIXTURE_DIR/conftool dial -addr $peer_SLOT0:$PIN_PORT -expect BANNER=pin -for 60s"
 	wait_until 120 pod_done ic-pin || fail "the source-pin dialer pod did not finish within 120 s"
 	sleep 2
+	kc logs -n "$NS" ic-pin >"$RUNG_DIR/pin-dialer.txt" 2>&1
 	icd="$(pod_log_value ic-pin ICIP=)"
-	check "source pin: the peer saw the dial from the pod's K3SM_INTERCONNECT_IP '$icd'" \
+	check "source pin: the peer saw conftool's dial from the pod's K3SM_INTERCONNECT_IP '$icd'" \
 		test "$(awk '$1=="ACCEPT"{print $3; exit}' "$RUNG_DIR/pin-listener.txt")" = "${icd:-none}"
+	check "source pin: no ShimInactive report for conftool" shim_report_problem ic-pin
 	kc delete pod -n "$NS" ic-pin --wait=false >/dev/null 2>&1
 }
 
-# mlx_model <name> <interconnect|-> — apply the r5 model (- = single-Mac).
-mlx_model() {
+# examples/mlxmodel.yaml's serving fields; the self-test fails when they part.
+MLX_DEFAULT_MODEL="mlx-community/Qwen3-0.6B-4bit"
+MLX_DEFAULT_REVISION="73e3e38d981303bc594367cd910ea6eb48349da8"
+MLX_DEFAULT_IMAGE="ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.5@sha256:a225253effc92f5f5ff8ec2ec2e2f8894aa690a3d6a908bb879439de6733d0e8"
+MLX_PORT=8000
+MLX_CACHE_SIZE=5Gi
+MLX_CACHE_CLASS=local-path
+# mlx_knob_problem <model knob> <revision knob> — a revision pins one model's history,
+# so naming a model means naming its revision too.
+mlx_knob_problem() {
+	if [ -n "$1" ] && [ -z "$2" ]; then
+		echo "K3SM_M17_MLX_MODEL=$1 needs K3SM_M17_MLX_REVISION: the default revision pins another model, and an unpinned one moves between rank restarts"
+		return 1
+	fi
+	if [ -z "$1" ] && [ -n "$2" ]; then
+		echo "K3SM_M17_MLX_REVISION=$2 needs K3SM_M17_MLX_MODEL: it would pin the default model to a revision chosen for another"
+		return 1
+	fi
+}
+# st_example_field <key> — a top-level or nested scalar from examples/mlxmodel.yaml.
+st_example_field() { awk -v k="$1:" '$1==k{print $2; exit}' "$REPO_ROOT/examples/mlxmodel.yaml"; }
+
+# mlx_model_manifest <name> <interconnect|-> — the r5 model (- = single-Mac). The
+# operator ships no default image or port (pkg/mlx/render.go ErrNoImage, ErrNoPort),
+# and a pinned revision requires a cache (ErrRevisionNeedsCache), so the serving
+# fields are examples/mlxmodel.yaml's, which the self-test holds them to.
+mlx_model_manifest() {
 	local dist=""
 	[ "$2" != - ] && dist="distributed: {ranks: 2, backend: ring, interconnect: $2}"
-	kc apply -f - >/dev/null <<EOF
+	cat <<EOF
 apiVersion: mlx.k3sm.io/v1alpha1
 kind: MLXModel
 metadata: {name: $1, namespace: $NS}
 spec:
   model: $MLX_MODEL
+  revision: $MLX_REVISION
   memory: $MLX_MEMORY
+  port: $MLX_PORT
+  runtime: {image: "$MLX_IMAGE"}
+  cache: {size: $MLX_CACHE_SIZE, storageClassName: $MLX_CACHE_CLASS}
   $dist
 EOF
 }
+mlx_model() { mlx_model_manifest "$@" | kc apply -f - >/dev/null; }
+# mlx_invalid_spec <name> — the message of a spec the operator cannot render: it
+# stays that way until the spec changes (pkg/mlx/operator ReasonInvalidSpec).
+mlx_invalid_spec() { kc get mlxmodel -n "$NS" "$1" -o jsonpath='{.status.conditions[?(@.reason=="InvalidSpec")].message}' 2>/dev/null; }
+# model_wait <name> <seconds> <command...> — poll like wait_until, but return 3 at
+# once on an InvalidSpec, which no amount of waiting can change.
+model_wait() {
+	local m="$1" deadline=$((SECONDS + $2))
+	shift 2
+	while [ "$SECONDS" -lt "$deadline" ]; do
+		"$@" >/dev/null 2>&1 && return 0
+		[ -z "$(mlx_invalid_spec "$m")" ] || return 3
+		sleep 2
+	done
+	"$@" >/dev/null 2>&1
+}
+# mlx_status_save <name> — the model's status and conditions, for a failing r5.
+mlx_status_save() { kc get mlxmodel -n "$NS" "$1" -o json >"$RUNG_DIR/mlxmodel-$1.json" 2>&1; }
+# model_wait_failed <name> <rc> <what it waited for> — the verdict of a wait that did
+# not succeed, with the status on record.
+model_wait_failed() {
+	mlx_status_save "$1"
+	if [ "$2" = 3 ]; then
+		fail "MLXModel $1 was rejected with InvalidSpec: $(mlx_invalid_spec "$1")"
+	else
+		fail "MLXModel $1 $3"
+	fi
+}
 model_ready() { grep -qx True <<<"$(kc get mlxmodel -n "$NS" "$1" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)"; }
-# ring_on <path> — ic-ring is Ready with both rank pods on that path.
-ring_on() { model_ready ic-ring && [ "$(rank_pods ic-ring | awk -v p="$1" '$4==p' | wc -l | tr -d ' ')" = 2 ]; }
+# ring_settled <path> — stdin is rank_pods output: exactly two rank pods, each on
+# that path, Ready=True, and (when RING_OLD_UIDS is set) none of the pre-patch pods.
+ring_settled() { awk -v p="$1" -v old=" ${RING_OLD_UIDS:-} " 'NF { n++; if ($4 == p && $5 == "True" && (old == "  " || index(old, " " $2 " ") == 0)) ok++ } END { exit !(n == 2 && ok == 2) }'; }
+# ring_on <path> — ic-ring is Ready with both rank pods on that path. The model's
+# Ready can be left over from the previous path, so it also needs the operator to
+# have observed the current spec, and the pods to be the recreated ones (RING_OLD_UIDS
+# lists the UIDs the patch replaces) and Ready themselves.
+ring_on() {
+	local g
+	g="$(kc get mlxmodel -n "$NS" ic-ring -o jsonpath='{.metadata.generation} {.status.observedGeneration}' 2>/dev/null)"
+	[ -n "${g%% *}" ] && [ "${g%% *}" = "${g##* }" ] || return 1
+	model_ready ic-ring && rank_pods ic-ring | ring_settled "$1"
+}
 model_cond() { kc get mlxmodel -n "$NS" "$1" -o jsonpath="{.status.conditions[?(@.type==\"$2\")].$3}" 2>/dev/null; }
 rank_pods() { kc get pods -n "$NS" -o json 2>/dev/null | python3 -I -c "import json,sys
 for p in json.load(sys.stdin)['items']:
     if any(o.get('kind')=='MLXModel' and o.get('name')=='$1' for o in p['metadata'].get('ownerReferences') or []):
-        print(p['metadata']['name'], p['metadata']['uid'], p['spec'].get('nodeName',''), (p['metadata'].get('annotations') or {}).get('k3sm.io/mlx-interconnect',''))"; }
+        print(p['metadata']['name'], p['metadata']['uid'], p['spec'].get('nodeName',''), (p['metadata'].get('annotations') or {}).get('k3sm.io/mlx-interconnect',''), next((c.get('status') for c in (p.get('status') or {}).get('conditions') or [] if c.get('type')=='Ready'), 'False'))"; }
 image_pull_failed() { grep -Eq 'ErrImagePull|ImagePullBackOff' <<<"$(kc get pods -n "$NS" -o jsonpath='{range .items[*]}{.status.containerStatuses[*].state.waiting.reason}{"\n"}{end}' 2>/dev/null)"; }
 # tokens_per_s <model> <file> — one completion against the endpoint; prints
 # "<tokens/s> <request+response bytes>" or nothing.
 tokens_per_s() {
-	local ep
+	local ep mdl
+	mdl="$(kc get mlxmodel -n "$NS" "$1" -o jsonpath='{.spec.model}' 2>/dev/null)"
 	ep="$(kc get mlxmodel -n "$NS" "$1" -o jsonpath='{.status.endpoint}' 2>/dev/null)"
 	[ -n "$ep" ] || return 1
 	case "$ep" in http*) ;; *) ep="http://$ep" ;; esac
 	# unpinned: a POST to the model's in-cluster endpoint; the response is a completion, never an artifact that runs
 	curl -sS -m 300 -o "$2" -w '%{time_total} %{size_upload} %{size_download}\n' "$ep/v1/completions" \
 		-H 'Content-Type: application/json' \
-		-d '{"prompt":"Write a long story about two computers joined by a cable.","max_tokens":256}' >"$2.timing" 2>&1 || return 1
+		-d "$(python3 -I -c 'import json,sys; print(json.dumps({"model":sys.argv[1],"prompt":"Write a long story about two computers joined by a cable.","max_tokens":256}))' "$mdl")" >"$2.timing" 2>&1 || return 1
 	python3 -I -c 'import json,sys
 t,u,d=open(sys.argv[2]).read().split()[:3]
 n=json.load(open(sys.argv[1])).get("usage",{}).get("completion_tokens",0)
@@ -578,7 +1006,7 @@ print("%.2f %d" % (n/float(t), int(float(u))+int(float(d))))' "$2" "$2.timing"
 }
 
 assert_r5_ring() {
-	local alloc s m out line http r0l r0p fig_net fig_single fig_tb tbd utd ip
+	local alloc s m out line http r0l r0p fig_net fig_single fig_tb tbd utd ip rc
 	for s in local peer; do
 		alloc="$(kc get node "$(node_of "$s")" -o jsonpath='{.status.allocatable.mlx\.k3sm\.io/gpu}' 2>/dev/null)"
 		if [ "${alloc:-0}" -lt 1 ] 2>/dev/null || [ -z "$alloc" ]; then
@@ -588,28 +1016,45 @@ assert_r5_ring() {
 	done
 	# Control figures first (RECORDED): the same model over the network, and one Mac.
 	mlx_model ic-ring network
-	if ! wait_until "$MLX_READY_TIMEOUT" model_ready ic-ring; then
-		if image_pull_failed; then
+	rc=0
+	model_wait ic-ring "$MLX_READY_TIMEOUT" model_ready ic-ring || rc=$?
+	if [ "$rc" != 0 ]; then
+		mlx_status_save ic-ring
+		if [ "$rc" != 3 ] && image_pull_failed; then
 			refuse_rung "$(prereq_what mlximage): a rank pod cannot pull it" BI8
 			return 2
 		fi
-		fail "MLXModel ic-ring (interconnect network) never became Ready within ${MLX_READY_TIMEOUT}s"
+		model_wait_failed ic-ring "$rc" "(interconnect network) never became Ready within ${MLX_READY_TIMEOUT}s"
 		return 1
 	fi
 	fig_net="$(tokens_per_s ic-ring "$RUNG_DIR/completion-network.json")" || fig_net=""
 	mlx_model ic-single -
-	if wait_until "$MLX_READY_TIMEOUT" model_ready ic-single; then
+	rc=0
+	model_wait ic-single "$MLX_READY_TIMEOUT" model_ready ic-single || rc=$?
+	if [ "$rc" = 0 ]; then
 		fig_single="$(tokens_per_s ic-single "$RUNG_DIR/completion-single.json")" || fig_single=""
+	elif [ "$rc" = 3 ]; then
+		model_wait_failed ic-single "$rc" ""
+		return 1
+	else
+		mlx_status_save ic-single
+		rec "the single-Mac control never became Ready within ${MLX_READY_TIMEOUT}s; its figure is missing, which gates nothing"
 	fi
 	kc delete mlxmodel -n "$NS" ic-single --wait=false >/dev/null 2>&1
 	# The interconnect run.
+	RING_OLD_UIDS="$(rank_pods ic-ring | awk '{print $2}' | tr '\n' ' ')"
 	kc patch mlxmodel -n "$NS" ic-ring --type merge -p '{"spec":{"distributed":{"interconnect":"thunderbolt"}}}' >/dev/null
 	sleep 5
-	if ! wait_until "$MLX_READY_TIMEOUT" ring_on thunderbolt; then
-		fail "MLXModel ic-ring did not become Ready with both ranks on the thunderbolt path"
+	rc=0
+	model_wait ic-ring "$MLX_READY_TIMEOUT" ring_on thunderbolt || rc=$?
+	if [ "$rc" != 0 ]; then
+		model_wait_failed ic-ring "$rc" "did not become Ready with both ranks on the thunderbolt path"
 		rank_pods ic-ring >"$RUNG_DIR/ranks.txt"
 		return 1
 	fi
+	RING_OLD_UIDS=""
+	# the recreated ranks are Ready; let the ring's sockets form before they are read
+	sleep 15
 	rank_pods ic-ring >"$RUNG_DIR/ranks.txt"
 	kc get mlxmodel -n "$NS" ic-ring -o json >"$RUNG_DIR/mlxmodel.json" 2>&1
 	check "both rank pods carry k3sm.io/mlx-interconnect thunderbolt" test "$(awk '$4=="thunderbolt"' "$RUNG_DIR/ranks.txt" | wc -l | tr -d ' ')" = 2
@@ -728,9 +1173,11 @@ rerender_after() {
 	return 1
 }
 
+operator_tty() { (: </dev/tty) 2>/dev/null; }
+
 assert_r6_unplug() {
-	if ! (: </dev/tty) 2>/dev/null; then
-		refuse_rung "$(prereq_what operator)" BI10
+	if ! operator_tty; then
+		refuse_rung "owed, not passed: no operator at /dev/tty to pull and replug the cable" BI10
 		return 2
 	fi
 	local stopf="$RUNG_DIR/poll.stop" mark t0 t1 t1p t2 r0 r1 gap s d before after n uids1 restarted1 pingn=6000
@@ -876,11 +1323,16 @@ EOF
 	# desired.go Reconcile over apis ParseInterconnectDesired): extra fields are
 	# ignored and a foreign interconnect name is still a valid object name, so both
 	# parse and the handler ENSURES slot 0 (held); schema 99 fails the schema read,
-	# is treated as absent, and the handler REMOVES slot 0 (the safe direction).
+	# is treated as absent, and the handler asks to REMOVE slot 0 (the safe direction);
+	# netd refuses that while pod slots are owned, so slot 0 then stays.
 	# The server's resolver rewrites the value on its next reconcile, so the
 	# forged value may be live only briefly; the samples record which value each
 	# one saw.
-	local fv held total seen rm0 rm1
+	local fv held total seen rm0 rm1 riders rs
+	riders=0
+	for rs in 1 2 3 4 5 6 7; do
+		grep -qF -- "$(icp_slot_addr "$idx" "$rs")" "$RUNG_DIR/$side-before-bridge0.txt" && riders=$((riders + 1))
+	done
 	for v in extra name schema; do
 		fv="$(forge_value "$orig" "$v")"
 		scrape_metrics "pre-$v"
@@ -906,6 +1358,11 @@ EOF
 		schema)
 			if [ "$seen" = 0 ] && [ "$rm1" = "$rm0" ]; then
 				rec "forge 'schema': the resolver restored the annotation before any sample or handler saw schema 99; the handler's removal is not observable in this run"
+			elif [ "$riders" -gt 0 ]; then
+				# netd refuses slot 0 while a pod slot is owned (ErrInterconnectTeardownOrder),
+				# so the handler's removal fails and slot 0 stays: the safe direction.
+				check "forge 'schema' reads as absent but netd refuses slot 0 while $riders pod slot(s) are held (held in $held of $total samples, RemoveInterconnectAlias ok +$((rm1 - rm0)))" \
+					test "$held" = "$total" -a $((rm1 - rm0)) -eq 0
 			else
 				check "forge 'schema' reads as absent, so the handler removed slot 0 (RemoveInterconnectAlias ok +$((rm1 - rm0)), slot 0 absent in $((total - held)) samples)" \
 					test $((rm1 - rm0)) -gt 0 -a "$held" -lt "$total"
@@ -934,9 +1391,8 @@ EOF
 
 # host_clean <side> <tag> — the r8/r9 host assertions on one Mac.
 host_clean() {
-	local s="$1" t="$2" idx own
-	idx="$(side_var "$s" IDX)"
-	own="$(for x in 0 1 2 3 4 5 6 7; do icp_slot_addr "$idx" "$x"; done | tr '\n' ' ')"
+	local s="$1" t="$2" own
+	own="$(own_slot_addrs "$s")"
 	snap "$s" "$t"
 	check "$s Mac: no inet in 169.254.0.0/24 or 169.254.255.0/24 on bridge0" icp_halves_empty "$RUNG_DIR/$s-$t-bridge0.txt"
 	check "$s Mac: no reserved-half route beyond the baseline and no cloned host route for a peer slot" \
@@ -951,32 +1407,108 @@ host_clean() {
 	done
 }
 
+# The pod started after the disarm: it reports the env it was given and stays up
+# until r8 deletes it. Single-quoted on purpose: it expands in the pod.
+# shellcheck disable=SC2016
+LATE_POD_CMD='echo "ICIP=${K3SM_INTERCONNECT_IP:-}"; exec /bin/sleep 3600'
+R8_POD_NAMES="ic-l-local ic-l-peer ic-late-local ic-late-peer"
+
+desired_gone_on() { [ -z "$(desired_of "$(node_of "$1")")" ]; }
+# late_pod_env_clear <pod> — the pod ran, and its env held no interconnect address.
+late_pod_env_clear() { [ "$(kc logs -n "$NS" "$1" 2>/dev/null | sed -n 1p)" = "ICIP=" ]; }
+# r8_pods_gone — none of r8's pods is left in the apiserver.
+# shellcheck disable=SC2086 # R8_POD_NAMES is a list of pod names
+r8_pods_gone() { [ -z "$(kc get pod -n "$NS" --ignore-not-found -o name $R8_POD_NAMES 2>/dev/null)" ]; }
+# lo0_lost <before file> <now file> [address...] — every inet of the before snapshot
+# is still on lo0, the named addresses aside; the ones that went are printed. New
+# addresses are not a loss: any pod started in between adds one.
+lo0_lost() {
+	local before="$1" now="$2" a lost=""
+	shift 2
+	while read -r _ a _; do
+		case " $* " in *" $a "*) continue ;; esac
+		awk -v a="$a" '$2==a{f=1} END{exit !f}' "$now" || lost="$lost $a"
+	done <"$before"
+	[ -z "$lost" ] || {
+		echo "gone from lo0:$lost"
+		return 1
+	}
+}
+# r8_no_new_attach <side> — the pod created after the disarm started without an address.
+r8_no_new_attach() {
+	local p="ic-late-$1" c
+	if ! wait_until 180 pod_ready "$p"; then
+		fail "$p, created after the disarm, never became Ready on $(node_of "$1")"
+		return 0
+	fi
+	c="$(pod_attached "$p")"
+	check "$p, created after the disarm: k3sm.io/InterconnectAttached is False ('$c')" test "$c" = False
+	check "$p, created after the disarm: its env holds no K3SM_INTERCONNECT_IP" late_pod_env_clear "$p"
+}
+# r8_keeps_address <side> — the pod attached before the disarm still holds its address,
+# and the node's own address it rides is still there.
+r8_keeps_address() {
+	local p="ic-l-$1" c ip slot0
+	c="$(pod_attached "$p")"
+	ip="$(side_var "$1" ICIP)" slot0="$(side_var "$1" SLOT0)"
+	check "pod $p, still running: it keeps k3sm.io/InterconnectAttached True ('$c')" test "$c" = True
+	check "$1 Mac: $p's address $ip is still a /32 on bridge0" alias_present "$1" "$ip" 0xffffffff
+	check "$1 Mac: the node's own address $slot0 stays while a pod on it holds one" alias_present "$1" "$slot0" 0xffffff00
+}
+
+# What a disarm promises (docs/user/interconnects.md, Arming): "No new Pod attaches.
+# A Pod that already holds an address keeps it until the Pod is deleted or restarted,
+# and each node removes its own address once no Pod on it holds one." So disable alone
+# does not empty bridge0 while ic-l-* run, and this rung does not ask it to. It asserts
+# both sides of the sentence, in order: the annotation goes, a new pod gets no address,
+# a running pod keeps its address and the node keeps its own; then the pods are
+# deleted, the documented way out, and only then is every address, route and ledger
+# entry required to be gone.
+#
+# The code behind each step: the pod's alias goes only in the release path
+# (pkg/provider/interconnect.go detach), netd refuses to remove slot 0 while a pod
+# slot is owned (darwin-net pkg/netd/interconnect.go handleRemoveInterconnectAlias),
+# and the node retries that removal on its DesiredInterval tick, which nothing
+# triggers early (pkg/interconnect/desired.go Run). A member's state does not read
+# spec.enabled (pkg/interconnect/resolve.go Resolve) and slot 0 keeps its peer
+# answering, so "no member up" is only owed once the pods are gone too.
 assert_r8_killswitch() {
-	local s out mp0 mp1 p
+	local s out mp0 p hold_until has_ring=0 rank_ips=""
 	for s in local peer; do snap "$s" pre; done
 	kc get meshpeers.net.k3sm.io -o jsonpath='{range .items[*]}{.metadata.name} {.spec}{"\n"}{end}' >"$RUNG_DIR/meshpeers-pre.txt" 2>&1
+	# The fallback restarts the rank pods, so their lo0 addresses change by design.
+	if kc get mlxmodel -n "$NS" ic-ring >/dev/null 2>&1; then
+		has_ring=1
+		for p in $(rank_pods ic-ring | awk '{print $1}'); do rank_ips="$rank_ips $(pod_ip "$p")"; done
+	fi
 	out="$(on_local "$K3SM_BIN interconnect disable" 2>&1)"
 	printf '%s\n' "$out" >"$RUNG_DIR/disable.txt"
 	info "$out"
 	for s in local peer; do
-		wait_until 180 halves_empty_on "$s" || true
-		host_clean "$s" post
-		check "$s Mac: lo0 pod aliases unchanged" cmp -s "$RUNG_DIR/$s-pre-lo0.txt" "$RUNG_DIR/$s-post-lo0.txt"
-		check "$s Mac: desired annotation gone from node $(node_of "$s")" test -z "$(desired_of "$(node_of "$s")")"
+		wait_until 120 desired_gone_on "$s" || true
+		check "$s Mac: desired annotation gone from node $(node_of "$s")" desired_gone_on "$s"
 	done
-	ARMED_BY_RUN=0
-	kc get meshpeers.net.k3sm.io -o jsonpath='{range .items[*]}{.metadata.name} {.spec}{"\n"}{end}' >"$RUNG_DIR/meshpeers-post.txt" 2>&1
-	check "MeshPeer specs (wireguard peers and AllowedIPs) unchanged" cmp -s "$RUNG_DIR/meshpeers-pre.txt" "$RUNG_DIR/meshpeers-post.txt"
-	mp0="$(on_local "ping -c 3 -t 6 $peer_MESH" | awk '/packets received/{print $4}')"
-	check "the mesh ping still answers ($mp0/3)" test "${mp0:-0}" -gt 0
-	check "status.members is empty" test "$(members_count)" = 0
-	for p in ic-l-local ic-l-peer; do
-		mp1="$(pod_attached "$p")"
-		check "pod $p: k3sm.io/InterconnectAttached is False ('$mp1')" test "$mp1" = False
+	# One whole tick of the node's handler, so its removal has been tried and refused
+	# before the hold is read; the first seconds also let each node's own informer
+	# see the annotation go before a new pod asks it.
+	hold_until=$((SECONDS + DESIRED_INTERVAL + 5))
+	sleep 5
+	kc create namespace "$NS" >/dev/null 2>&1 && NS_CREATED=1
+	for s in local peer; do ic_pod "ic-late-$s" "$(node_of "$s")" 1 "$LATE_POD_CMD"; done
+	for s in local peer; do r8_no_new_attach "$s"; done
+	[ "$SECONDS" -ge "$hold_until" ] || sleep $((hold_until - SECONDS))
+	for s in local peer; do
+		if need attached; then
+			r8_keeps_address "$s"
+		else
+			rec "$s Mac: no pod attached in r2, so 'a running pod keeps its address' is not exercised"
+		fi
+		snap "$s" held
+		# shellcheck disable=SC2086 # rank_ips is a list of addresses
+		check "$s Mac: lo0 lost no address to the disarm" lo0_lost "$RUNG_DIR/$s-pre-lo0.txt" "$RUNG_DIR/$s-held-lo0.txt" $rank_ips
 	done
-	scrape_metrics post
-	check "k3sm_interconnect_attached_pods is 0" test "$(icp_metric_sum "$RUNG_DIR/metrics-post.txt" k3sm_interconnect_attached_pods)" = 0
-	if kc get mlxmodel -n "$NS" ic-ring >/dev/null 2>&1; then
+	# The ranks hold slot 1, so they must be off the cable before slot 0 can go.
+	if [ "$has_ring" = 1 ]; then
 		if wait_until 180 ring_on network; then
 			pass "the ring fell back to the mesh (both ranks on the network path)"
 		else
@@ -985,21 +1517,155 @@ assert_r8_killswitch() {
 	else
 		rec "no ring model to fall back (r5 did not leave one); the ring half of the kill switch is not exercised"
 	fi
+	# shellcheck disable=SC2086 # R8_POD_NAMES is a list of pod names
+	kc delete pod -n "$NS" --ignore-not-found --wait=false $R8_POD_NAMES >/dev/null 2>&1
+	if wait_until 120 r8_pods_gone; then
+		pass "the attached pods are deleted ($R8_POD_NAMES)"
+	else
+		fail "the attached pods were not gone within 120 s of the delete ($R8_POD_NAMES)"
+	fi
+	for s in local peer; do
+		wait_until $((3 * DESIRED_INTERVAL)) halves_empty_on "$s" || true
+		host_clean "$s" post
+		check "$s Mac: desired annotation still gone from node $(node_of "$s")" desired_gone_on "$s"
+	done
+	ARMED_BY_RUN=0
+	kc get meshpeers.net.k3sm.io -o jsonpath='{range .items[*]}{.metadata.name} {.spec}{"\n"}{end}' >"$RUNG_DIR/meshpeers-post.txt" 2>&1
+	check "MeshPeer specs (wireguard peers and AllowedIPs) unchanged" cmp -s "$RUNG_DIR/meshpeers-pre.txt" "$RUNG_DIR/meshpeers-post.txt"
+	mp0="$(on_local "ping -c 3 -t 6 $peer_MESH" | awk '/packets received/{print $4}')"
+	check "the mesh ping still answers ($mp0/3)" test "${mp0:-0}" -gt 0
+	check_disarmed
+	scrape_metrics post
+	# k3sm_interconnect_attached_pods is not checked: status.attachedPods has no non-test writer, so 0 proves nothing.
 	[ "$R_FAIL" = 0 ] && HAVE="$HAVE disarmed"
 	return 0
 }
 
-# reinstall <side> <local binary> <tag> — copy a k3sm binary to a Mac and run its
-# own install there as a script file under sudo; wait for both nodes Ready.
-reinstall() {
-	local side="$1" bin="$2" dst="$IC_REMOTE_DIR/k3sm-$3"
-	if [ "$side" = local ]; then
-		mkdir -p "$IC_REMOTE_DIR" && cp "$bin" "$dst"
-	else
-		scp -q -o BatchMode=yes "$bin" "$PEER_SSH:$dst" || return 1
+# is_installed_tree <dir> — the directory is one an install writes to.
+is_installed_tree() { case "$1/" in /Library/k3sm/* | /Library/k3sm.*/* | /usr/local/bin/*) return 0 ;; esac; return 1; }
+# build_set_problem <k3sm binary> <name> — why the binary cannot be installed from
+# where it sits; silent and 0 when it can. `k3sm install` requires its build set
+# beside the binary, and the binary itself names that set. The installed tree is
+# refused as a source: the downgrade overwrites it, so it could not bring the
+# artifact under test back.
+build_set_problem() {
+	local bin="$1" name="$2" dir req rel missing=""
+	[ -f "$bin" ] && [ ! -L "$bin" ] && [ -x "$bin" ] && [ "$(basename "$bin")" = k3sm ] || {
+		echo "$name '$bin' is not an executable regular file named k3sm"
+		return 1
+	}
+	dir="$(cd "$(dirname "$bin")" && pwd -P)"
+	if is_installed_tree "$dir"; then
+		echo "$name '$bin' is in the installed tree, which the downgrade overwrites; point it at a build set elsewhere"
+		return 1
 	fi
-	priv "$side" "install-$3" BIN="$dst" ARGS="$REINSTALL_ARGS" <<'EOF'
-chmod 0755 "$BIN"
+	req="$("$bin" install --print-required-artifacts 2>/dev/null)" && [ -n "$req" ] || {
+		echo "$name '$bin' does not answer install --print-required-artifacts, so its build set cannot be checked"
+		return 1
+	}
+	while IFS= read -r rel; do
+		[ -f "$dir/$rel" ] || missing="$missing $rel"
+	done <<<"$req"
+	[ -z "$missing" ] || {
+		echo "$name '$bin' has no complete build set beside it; missing:$missing"
+		return 1
+	}
+}
+# prev_helper_problem <k3sm binary> — why this build cannot exercise HelperTooOld;
+# silent and 0 when it can. k3sm is its own helper (the netd job execs `k3sm netd`), so
+# the minor is darwin-net's wire.ProtocolVersionMinor at build time, which no flag
+# prints. The verb is the witness: it arrived with minor 2 (the one darwin-net commit
+# that added it also moved the minor from 1 to 2), and no build before it holds the
+# name, so a binary that holds it has a helper that answers Hello as current.
+#
+# What the leg proves: a helper below minor 2 answers Hello with its version and
+# "unknown verb", which icp_helper_verdict reads as wire.Client does. The client side
+# is not driven: a node's client dials only its own helper, and both come from one
+# binary, so a downgraded node holds no current client.
+prev_helper_problem() {
+	grep -aqF EnsureInterconnectAlias "$1" || return 0
+	echo "K3SM_M17_PREVIOUS_ARTIFACT '$1' cannot exercise HelperTooOld: it holds the interconnect verbs, so its helper speaks minor 2 or later and the mixed leg would prove nothing; use a build whose darwin-net predates them (the newest such release is v0.1.7, helper 1.1)"
+	return 1
+}
+# r9_problem — why a downgrade cannot be driven safely here; silent and 0 when it
+# can. Every leg is decided before either Mac changes.
+r9_problem() {
+	local prev="${K3SM_M17_PREVIOUS_ARTIFACT:-}" cur="${K3SM_ARTIFACT:-}"
+	[ -n "$prev" ] && [ -n "$cur" ] || {
+		prereq_what prevbin
+		return 1
+	}
+	build_set_problem "$prev" K3SM_M17_PREVIOUS_ARTIFACT || return 1
+	build_set_problem "$cur" K3SM_ARTIFACT || return 1
+	prev_helper_problem "$prev" || return 1
+	[ "$(shasum -a 256 "$prev" | cut -d' ' -f1)" != "$(shasum -a 256 "$cur" | cut -d' ' -f1)" ] || {
+		echo "K3SM_M17_PREVIOUS_ARTIFACT and K3SM_ARTIFACT are one build, so nothing would be downgraded"
+		return 1
+	}
+	[[ "${JOIN_SERVER:-}" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || {
+		echo "K3SM_M17_JOIN_SERVER '${JOIN_SERVER:-}' is not the server's underlay address, which a worker install needs as --server (a LAN IP or DNS name, no scheme, no port)"
+		return 1
+	}
+	# The server's install writes the admin kubeconfig to the invoking login's home
+	# and may rotate its token, so the driver's own credential survives only there.
+	[ "$local_NODE" != "$WORKER_NODE" ] && [ "$peer_NODE" = "$WORKER_NODE" ] || {
+		echo "the driver is not on the server (local $local_NODE, peer $peer_NODE, worker $WORKER_NODE); a server reinstall may rotate the admin token a copied kubeconfig holds, and this run would lose the cluster mid-rung"
+		return 1
+	}
+}
+# role_of <side> — agent on the worker, server otherwise.
+role_of() { if [ "$(node_of "$1")" = "$WORKER_NODE" ]; then echo agent; else echo server; fi; }
+# install_args <side> — the documented install for the side's role
+# (docs/user/multi-node.md). A server's plain re-run keeps its stored flags. A worker
+# names its role and server, and passes no token: this is an in-place reinstall of a
+# joined node, which presents the credential it stored, so no join token is minted
+# or carried (the rung has checked that the credential is there).
+install_args() {
+	local a=""
+	[ "$(role_of "$1")" = agent ] && a="--agent --server $JOIN_SERVER"
+	echo "$a${a:+${REINSTALL_ARGS:+ }}$REINSTALL_ARGS"
+}
+# wait_join_port <side> — the server's join port answers from that Mac, in 3 s steps
+# bounded by 2 minutes. A worker install before it opens is refused, and the old
+# worker would keep running while the legs test stale code.
+wait_join_port() {
+	local deadline=$((SECONDS + 120))
+	while [ "$SECONDS" -lt "$deadline" ]; do
+		on "$1" "nc -z -G 3 $JOIN_SERVER 9345" >/dev/null 2>&1 && return 0
+		sleep 3
+	done
+	return 1
+}
+# ship_set <side> <k3sm binary> <tag> — make the build set runnable on the side and
+# set SHIPPED_BIN. The driver's own Mac runs it where it sits; the peer gets exactly
+# the binary and the set it names, in this run's private directory.
+ship_set() {
+	local dir req dst
+	dir="$(cd "$(dirname "$2")" && pwd -P)"
+	SHIPPED_BIN="$dir/k3sm"
+	[ "$1" = peer ] || return 0
+	req="$("$dir/k3sm" install --print-required-artifacts)" || return 1
+	dst="$IC_REMOTE_DIR/set-$3"
+	# shellcheck disable=SC2086 # req is one relative path per line
+	(cd "$dir" && tar cf - k3sm $req) | ssh_peer "zsh -lc $(printf '%q' "rm -rf $dst && mkdir $dst && tar xpf - -C $dst")" || return 1
+	SHIPPED_BIN="$dst/k3sm"
+}
+# reinstall <side> <k3sm binary> <tag> — the build set's own install for the side's
+# role, as a script file under sudo; then both nodes Ready. No copy of the installed
+# tree is taken: git and the build set are the way back.
+reinstall() {
+	local side="$1" bin="$2" tag="$3" rc args
+	if [ "$(role_of "$side")" = agent ] && ! wait_join_port "$side"; then
+		echo "the join port $JOIN_SERVER:9345 did not answer from the $side Mac within 2 minutes; no install was attempted"
+		return 1
+	fi
+	ship_set "$side" "$bin" "$tag" || {
+		echo "could not put the $tag build set on the $side Mac; no install was attempted"
+		return 1
+	}
+	args="$(install_args "$side")"
+	info "$side Mac: k3sm install $args (the $tag build set)"
+	priv "$side" "install-$tag" BIN="$SHIPPED_BIN" ARGS="$args" <<'EOF'
 # shellcheck disable=SC2086
 "$BIN" install $ARGS
 rc=$?
@@ -1007,42 +1673,177 @@ echo "INSTALL-EXIT=$rc"
 /usr/local/bin/k3sm version 2>&1 | sed -n 1,3p
 exit "$rc"
 EOF
-	local rc=$?
-	cp "$PAYLOAD_LOG" "$RUNG_DIR/install-$3-$side.txt"
-	wait_until 300 bash -c "[ \"\$(kubectl --request-timeout=10s get nodes --no-headers 2>/dev/null | awk '\$2==\"Ready\"' | wc -l | tr -d ' ')\" -ge 2 ]" || return 1
-	return "$rc"
+	rc=$?
+	cp "$PAYLOAD_LOG" "$RUNG_DIR/install-$tag-$side.txt"
+	# The installed version goes in the run log, so a refused install is visible there.
+	info "$side Mac after install-$tag: $(tail -4 "$PAYLOAD_LOG" | tr '\n' ' ')"
+	[ "$rc" = 0 ] || return "$rc"
+	wait_until 300 two_nodes_ready
 }
+two_nodes_ready() { [ "$(kubectl --request-timeout=10s get nodes --no-headers 2>/dev/null | awk '$2=="Ready"' | wc -l | tr -d ' ')" -ge 2 ]; }
 
 assert_r9_downgrade() {
-	local prev="${K3SM_M17_PREVIOUS_ARTIFACT:-}" first second s v
-	if [ -z "$prev" ] || [ ! -f "$prev" ] || [ -z "${K3SM_ARTIFACT:-}" ] || [ ! -f "${K3SM_ARTIFACT:-}" ]; then
-		refuse_rung "$(prereq_what prevbin)" BI10
+	local prev="${K3SM_M17_PREVIOUS_ARTIFACT:-}" cur="${K3SM_ARTIFACT:-}" first second s v why
+	if ! why="$(r9_problem)"; then
+		refuse_rung "$why" BI10
 		return 2
 	fi
 	first=peer second=local
-	[ "$WORKER_NODE" = "$local_NODE" ] && first=local second=peer
+	priv "$first" nodecred KC="$NODE_KUBECONFIG" <<'EOF'
+[ -s "$KC" ] && echo PRESENT || echo ABSENT
+EOF
+	if ! grep -q PRESENT "$PAYLOAD_LOG"; then
+		refuse_rung "$(prereq_what nodecred): $NODE_KUBECONFIG on the $first Mac, without which its reinstall would need a join token" BI10
+		return 2
+	fi
 	rec "order: interconnect disabled in r8; previous binary on the worker ($(node_of "$first")) then the server ($(node_of "$second")); each install restarts io.k3sm.netd itself"
-	reinstall "$first" "$prev" prev || fail "the previous binary did not install cleanly on the $first Mac, or the nodes did not return Ready"
-	netd_hello "$first"
-	v="$(icp_helper_verdict "$RUNG_DIR/netd-hello-$first.json")"
-	case "$v" in
-	HelperTooOld) pass "mixed leg: the downgraded helper answers a minor-2 Hello as HelperTooOld, not an error" ;;
-	minor2) rec "mixed leg: the previous helper already speaks minor 2, so HelperTooOld is not exercised by this binary pair" ;;
-	*) fail "mixed leg: the downgraded helper's reply is an error, not HelperTooOld ($(head -c 200 "$RUNG_DIR/netd-hello-$first.json"))" ;;
-	esac
-	reinstall "$second" "$prev" prev || fail "the previous binary did not install cleanly on the $second Mac, or the nodes did not return Ready"
-	for s in local peer; do
-		host_clean "$s" downgraded
-		if [ "$s" = local ]; then cp "$K3SM_ARTIFACT" "$IC_REMOTE_DIR/k3sm-current"; else scp -q -o BatchMode=yes "$K3SM_ARTIFACT" "$PEER_SSH:$IC_REMOTE_DIR/k3sm-current"; fi
-		doctor_json "$s" "$IC_REMOTE_DIR/k3sm-current"
-		check "$s Mac: doctor ic-stray is clean" test "$(icp_doctor_row_state "$RUNG_DIR/doctor-$s.json" ic-stray)" = ok
-		check "$s Mac: doctor ic-residue is clean" test "$(icp_doctor_row_state "$RUNG_DIR/doctor-$s.json" ic-residue)" = ok
-		check "$s Mac: no reboot happened (kern.boottime unchanged; a reboot is never the cleanup)" \
-			test "$(on "$s" 'sysctl -n kern.boottime' 2>/dev/null)" = "$(side_var "$s" BOOT)"
+	R9_DOWNGRADED="$first"
+	if reinstall "$first" "$prev" prev; then
+		netd_hello "$first"
+		v="$(icp_helper_verdict "$RUNG_DIR/netd-hello-$first.json")"
+		case "$v" in
+		HelperTooOld) pass "mixed leg: the downgraded helper answers a minor-2 Hello as HelperTooOld, not an error ($(netd_probe_detail "$first" "$RUNG_DIR/netd-hello-$first.json"))" ;;
+		minor2) fail "mixed leg: the helper still speaks minor 2 or later after installing a build without the interconnect verbs, so the install did not replace it ($(netd_probe_detail "$first" "$RUNG_DIR/netd-hello-$first.json"))" ;;
+		*) fail "mixed leg: not a HelperTooOld verdict ($(netd_probe_detail "$first" "$RUNG_DIR/netd-hello-$first.json"))" ;;
+		esac
+		R9_DOWNGRADED="$first $second"
+		if reinstall "$second" "$prev" prev; then
+			for s in local peer; do
+				host_clean "$s" downgraded
+				if ship_set "$s" "$cur" current-doctor; then
+					doctor_json "$s" "$SHIPPED_BIN"
+				else
+					fail "$s Mac: the current build set could not be shipped for doctor"
+				fi
+				check "$s Mac: doctor ic-stray is clean" test "$(icp_doctor_row_state "$RUNG_DIR/doctor-$s.json" ic-stray)" = ok
+				check "$s Mac: doctor ic-residue names nothing this run left" \
+					doctor_residue_verdict "$BASE_DIR/doctor-$s.json" "$RUNG_DIR/doctor-$s.json" "$(own_slot_addrs "$s")"
+				check "$s Mac: no reboot happened (kern.boottime unchanged; a reboot is never the cleanup)" \
+					test "$(on "$s" 'sysctl -n kern.boottime' 2>/dev/null)" = "$(side_var "$s" BOOT)"
+			done
+		else
+			fail "the previous build did not install cleanly on the $second Mac, or the nodes did not return Ready"
+		fi
+	else
+		fail "the previous build did not install cleanly on the $first Mac, or the nodes did not return Ready; the server is left alone"
+	fi
+	# Back to the artifact under test, worker first; only the Macs this rung touched.
+	local left=""
+	for s in $R9_DOWNGRADED; do
+		if ! reinstall "$s" "$cur" current; then
+			fail "the artifact under test did not reinstall on the $s Mac"
+			left="${left:+$left }$s"
+		fi
 	done
-	# Leave the lab host on the artifact under test, worker first.
-	reinstall "$first" "$K3SM_ARTIFACT" current || fail "the artifact under test did not reinstall on the $first Mac (the lab hosts are left downgraded: fix by hand)"
-	reinstall "$second" "$K3SM_ARTIFACT" current || fail "the artifact under test did not reinstall on the $second Mac (the lab hosts are left downgraded: fix by hand)"
+	R9_DOWNGRADED="$left"
+	if [ -n "$left" ]; then
+		fail "these Macs may be left on the previous build: $left; reinstall the artifact under test by hand"
+	else
+		rec "both Macs are back on the artifact under test; a laptop's copied admin kubeconfig needs re-copying if the server's install rotated its token"
+	fi
+}
+
+# capture_ns_evidence <dir> <prefix> — what the namespace knows now. Events expire
+# and the namespace goes at exit, so this is the one chance to read them; a
+# failed read lands in the file and never changes a verdict.
+capture_ns_evidence() {
+	kc get events -n "$NS" --sort-by=.lastTimestamp -o wide >"$1/$2-events.txt" 2>&1
+	kc get events -n "$NS" -o json >"$1/$2-events.json" 2>&1
+	kc get pods -n "$NS" -o wide >"$1/$2-pods.txt" 2>&1
+	kc get mlxmodels -n "$NS" -o json >"$1/$2-mlxmodels.json" 2>&1
+	return 0
+}
+# capture_exit_evidence — one reading of the namespace, into every rung directory.
+capture_exit_evidence() {
+	local d f first=""
+	for d in "$EVIDENCE_DIR"/r[0-9]-*/; do
+		[ -d "$d" ] || continue
+		if [ -z "$first" ]; then
+			first="$d"
+			capture_ns_evidence "$d" ns-at-exit
+			continue
+		fi
+		for f in "$first"ns-at-exit-*; do cp "$f" "$d" 2>/dev/null; done
+	done
+	return 0
+}
+
+# until_rung <r<n>|rung id> — the full rung id, or non-zero when it names no rung.
+until_rung() {
+	local r
+	for r in $REQUIRED_IDS; do
+		case "$1" in "$r" | "${r%%-*}")
+			echo "$r"
+			return 0
+			;;
+		esac
+	done
+	return 1
+}
+# ladder_exit_status <trap rc> <pass> <fail> <refused> <stopped 0|1> — the contract's
+# code. Only a run that reached its last rung with nothing red earns 0 or 4.
+ladder_exit_status() {
+	case "$1" in
+	0)
+		if [ "$3" -gt 0 ] || [ "$4" -gt 0 ]; then
+			echo 1
+		elif [ "$2" -ge 10 ]; then
+			echo 0
+		elif [ "$5" = 1 ] && [ "$2" -gt 0 ]; then
+			echo 4
+		else
+			echo 1
+		fi
+		;;
+	1 | 2) echo "$1" ;;
+	*) echo 1 ;;
+	esac
+}
+
+# run_rungs — every rung in table order, one verdict line each in rungs.tsv. A
+# REFUSED rung is owed, not passed: the run goes on to the next rung, the exit is
+# never 0 (N_REFUSED), and --verify-twice wants exactly PASS.
+need() { grep -qw "$1" <<<"$HAVE"; }
+run_rungs() {
+	while IFS='|' read -r id summary prereqs fn ev bi; do
+		[ -n "$id" ] || continue
+		if [ "$LADDER_STOPPED" = 1 ]; then
+			printf '%s\tNOT-RUN\n' "$id" >>"$EVIDENCE_DIR/rungs.tsv"
+			N_NOT_RUN=$((N_NOT_RUN + 1))
+			continue
+		fi
+		RUNG="$id" RUNG_DIR="$EVIDENCE_DIR/${ev%/}" R_PASS=0 R_FAIL=0 R_REFUSED_MSG=""
+		mkdir -p "$RUNG_DIR"
+		printf '\n==> %s (%s): %s\n' "$id" "$bi" "$summary"
+		missing=""
+		for p in ${prereqs//,/ }; do
+			case " $PREREQ_STATIC $PREREQ_RUNTIME " in *" $p "*) need "$p" || missing="$p" ;; esac
+			[ -n "$missing" ] && break
+		done
+		verdict=""
+		if [ -n "$missing" ]; then
+			echo "REFUSED($id): $(prereq_what "$missing")"
+			verdict=REFUSED
+		else
+			rc=0
+			"$fn" </dev/null || rc=$?
+			if [ "$rc" = 2 ] || [ -n "$R_REFUSED_MSG" ]; then
+				echo "REFUSED($id): ${R_REFUSED_MSG:-the assertion refused}"
+				verdict=REFUSED
+			elif [ "$R_FAIL" = 0 ] && [ "$R_PASS" -gt 0 ]; then
+				verdict=PASS
+			else
+				verdict=FAIL
+			fi
+		fi
+		[ "$id" = r0-disarmed ] && [ "$verdict" = PASS ] && HAVE="$HAVE armable"
+		[ "$id" = r1-arm ] && [ "$verdict" = PASS ] && HAVE="$HAVE armed"
+		case "$verdict" in PASS) N_PASS=$((N_PASS + 1)) ;; FAIL) N_FAIL=$((N_FAIL + 1)) ;; REFUSED) N_REFUSED=$((N_REFUSED + 1)) ;; esac
+		printf '%s\t%s\n' "$id" "$verdict" >>"$EVIDENCE_DIR/rungs.tsv"
+		[ "$verdict" = PASS ] || capture_ns_evidence "$RUNG_DIR" ns
+		echo "RUNG $id $verdict ($R_PASS passed, $R_FAIL failed)"
+		[ "$id" != "$UNTIL" ] || LADDER_STOPPED=1
+	done <<<"$RUNG_TABLE"
 }
 
 # ── --plan ──────────────────────────────────────────────────────────────────────
@@ -1106,7 +1907,7 @@ gate_run() {
 		shift
 	done
 	shift
-	out="$(env -u K3SM_LAB -u PEER_SSH -u EVIDENCE_DIR -u K3SM_LAB_PRINT_MANIFESTS ${envs[@]+"${envs[@]}"} bash "$SELF" "$@" 2>&1)" || rc=$?
+	out="$(env -u K3SM_LAB -u PEER_SSH -u EVIDENCE_DIR -u K3SM_M17_REMOTE_SCRATCH -u K3SM_LAB_PRINT_MANIFESTS ${envs[@]+"${envs[@]}"} bash "$SELF" "$@" 2>&1)" || rc=$?
 	[ "$rc" = "$want" ] || {
 		echo "exit $rc, want $want: $(printf '%s' "$out" | tail -3)"
 		return 1
@@ -1146,16 +1947,166 @@ runlog_missing_refuses() {
 	}
 }
 
+# st_remote_remove <made> <scratch> <dir> — the command remote_dir_remove sends.
+st_remote_remove() {
+	local log
+	log="$(mktemp -t m17-remove.XXXXXX)"
+	REMOTE_DIR_MADE="$1" REMOTE_SCRATCH="$2" IC_REMOTE_DIR="$3"
+	on_peer() { echo "$1" >>"$log"; }
+	remote_dir_remove >/dev/null
+	cat "$log"
+	rm -f "$log"
+}
+# st_remote_make — the command remote_dir_make sends.
+st_remote_make() {
+	REMOTE_SCRATCH=/Users/x/scratch IC_REMOTE_DIR=/Users/x/scratch/run
+	on_peer() { echo "$1"; }
+	remote_dir_make
+}
+
+# st_build_set <dir> [missing artifact] — a stand-in build set: a k3sm that names its
+# set the way the real one does, and the set, less the named artifact.
+st_build_set() {
+	mkdir -p "$1/cp-payload"
+	cat >"$1/k3sm" <<'EOF'
+#!/bin/sh
+[ "$1 $2" = "install --print-required-artifacts" ] || exit 9
+printf 'k3sm-execshim\ncp-payload/kine\n'
+EOF
+	chmod 0755 "$1/k3sm"
+	: >"$1/k3sm-execshim"
+	: >"$1/cp-payload/kine"
+	[ -z "${2:-}" ] || rm -f "$1/$2"
+	printf '# %s\n' "$1" >>"$1/k3sm"
+}
+# st_r9_problem <prev> <cur> <join> <worker node> — r9_problem over stated inputs.
+st_r9_problem() {
+	K3SM_M17_PREVIOUS_ARTIFACT="$1" K3SM_ARTIFACT="$2" JOIN_SERVER="$3"
+	local_NODE=node-a peer_NODE=node-b WORKER_NODE="$4"
+	r9_problem
+}
+# st_r9_run <Hello reply fixture> <doctor fixture> — the real r9 assertion with the
+# host stubbed: the worker's helper answers with the first fixture, and both Macs'
+# doctors with the second, over a baseline with one pre-existing residue route.
+st_r9_run() {
+	local d hello="$1" doc="$2"
+	d="$(mktemp -d -t m17-r9.XXXXXX)"
+	RUNG=r9 RUNG_DIR="$d" BASE_DIR="$d/base" R_PASS=0 R_FAIL=0 R_REFUSED_MSG="" PAYLOAD_LOG="$d/payload.log"
+	local_NODE=node-a peer_NODE=node-b local_IDX=3 peer_IDX=1 local_BOOT=b peer_BOOT=b R9_DOWNGRADED=""
+	mkdir "$BASE_DIR"
+	cp "$F/doctor-residue-baseline.json" "$BASE_DIR/doctor-local.json"
+	cp "$F/doctor-residue-baseline.json" "$BASE_DIR/doctor-peer.json"
+	r9_problem() { :; }
+	priv() {
+		cat >/dev/null
+		echo PRESENT >"$PAYLOAD_LOG"
+	}
+	reinstall() { :; }
+	host_clean() { :; }
+	info() { :; }
+	on() { echo b; }
+	ship_set() { SHIPPED_BIN=/x/k3sm; }
+	netd_hello() { cp "$hello" "$RUNG_DIR/netd-hello-$1.json"; }
+	doctor_json() { cp "$doc" "$RUNG_DIR/doctor-$1.json"; }
+	K3SM_M17_PREVIOUS_ARTIFACT=/x/prev/k3sm K3SM_ARTIFACT=/x/cur/k3sm assert_r9_downgrade
+	echo "DRIVER passes=$R_PASS fails=$R_FAIL"
+	rm -rf "$d"
+}
+# st_reinstall <side> <join port rc> <install rc> — the real reinstall with the host
+# stubbed; prints the calls it made, in order, then its status.
+st_reinstall() {
+	local join_rc="$2" install_rc="$3" rc=0
+	RUNG_DIR="$(mktemp -d -t m17-reinstall.XXXXXX)" JOIN_SERVER=192.0.2.10 REINSTALL_ARGS=""
+	local_NODE=node-a peer_NODE=node-b WORKER_NODE=node-b
+	PAYLOAD_LOG="$RUNG_DIR/payload.log"
+	info() { :; }
+	wait_join_port() {
+		echo "join-port $1"
+		return "$join_rc"
+	}
+	ship_set() {
+		echo "ship $1 $3"
+		SHIPPED_BIN="/set/$3/k3sm"
+	}
+	priv() {
+		echo "install on $1:" "${@:3}"
+		cat >/dev/null
+		: >"$PAYLOAD_LOG"
+		return "$install_rc"
+	}
+	wait_until() {
+		echo "wait $2"
+		return 0
+	}
+	reinstall "$1" /x/k3sm prev || rc=$?
+	echo "status $rc"
+	rm -rf "$RUNG_DIR"
+}
+# st_reinstall_calls <side> <join rc> <install rc> — the calls, one line.
+st_reinstall_calls() { st_reinstall "$@" | tr '\n' ';'; }
+
+# st_scrape_metrics — the real scrape under the ladder's set -u, with the client
+# stubbed; prints the paths it asked for.
+st_scrape_metrics() {
+	local d
+	d="$(mktemp -d -t m17-scrape.XXXXXX)"
+	RUNG_DIR="$d" local_NODE=node-a peer_NODE=node-b
+	kc() { echo "$3" >>"$d/asked"; }
+	(
+		set -u
+		scrape_metrics before
+	) || echo "scrape exited $?"
+	cat "$d/asked" 2>/dev/null
+	rm -rf "$d"
+}
+
+# st_owed_rung — the real runner over r6 with no terminal and a following rung: r6
+# is recorded REFUSED and owed, and the next rung still runs.
+st_owed_rung() {
+	local d
+	d="$(mktemp -d -t m17-owed.XXXXXX)"
+	EVIDENCE_DIR="$d" HAVE="armed" N_PASS=0 N_FAIL=0 N_REFUSED=0
+	operator_tty() { return 1; }
+	assert_r7_desired_forge() { pass "stub"; }
+	RUNG_TABLE="$(printf 'r6-unplug|s|armed,operator|assert_r6_unplug|r6-unplug/|BI6\nr7-desired-forge|s|armed|assert_r7_desired_forge|r7/|BI3')"
+	run_rungs
+	cat "$d/rungs.tsv"
+	echo "counts pass=$N_PASS fail=$N_FAIL refused=$N_REFUSED"
+	rm -rf "$d"
+}
+
+# st_hello_payload — the composed netd_hello payload, with nothing executed.
+st_hello_payload() {
+	local d
+	d="$(mktemp -d -t m17-hello.XXXXXX)"
+	EVIDENCE_DIR="$d" RUNG_DIR="$d"
+	payload_exec() { :; }
+	netd_hello local >/dev/null 2>&1
+	cat "$PAYLOAD_PATH"
+	rm -rf "$d"
+}
+# hello_drops_before_connect — the probe sheds root before it reaches the socket;
+# the helper closes a root peer unanswered, which is the failure this pins.
+hello_drops_before_connect() {
+	local out u c
+	out="$(st_hello_payload)"
+	u="$(grep -n 'os.setuid(pw.pw_uid)' <<<"$out" | cut -d: -f1)"
+	c="$(grep -n 's.connect(' <<<"$out" | cut -d: -f1)"
+	[ -n "$u" ] && [ -n "$c" ] && [ "$u" -lt "$c" ] && grep -qF "SVC_USER=$SERVICE_USER" <<<"$out"
+}
+
 # st_driver_run <rung> <profile> — the body st_driver runs in a subshell: the
 # stubs below replace the host and cluster helpers there only.
 st_driver_run() {
-	local rung="$1" prof="$2"
+	local rung="$1" prof="$2" mutant="${3:-}"
 	D="$FIXTURES/driver/$prof" F="$FIXTURES"
 	RUNG_DIR="$(mktemp -d -t m17-driver.XXXXXX)" RUNG="$rung" R_PASS=0 R_FAIL=0
 	PAYLOAD_MB=128 LAN_SLACK=8388608 NS=stub
-	local_TB=en2 peer_TB=en2 local_LAN=en0 peer_LAN=en0 local_NODE=node-a peer_NODE=node-b
+	local_TB=en2 peer_TB=en2 local_LAN=en0 peer_LAN=en0 local_NODE=node-a peer_NODE=node-b PEER_UTUN=utun4
+	# The interfaces of the captured r3 run, whose counters the cable profiles carry.
+	[ "$rung" != r3 ] || local_LAN=en1 peer_TB=en1
 	local_MACS="36:a1:5c:00:00:01" peer_MACS="36:a1:5c:00:00:02" local_ICIP=169.254.0.11 peer_ICIP=169.254.0.19
-	peer_MESH=100.64.1.1 peer_SLOT0=169.254.0.9 MESH_UTUN=utun3 BG_PIDS=""
+	peer_MESH=100.64.1.1 peer_SLOT0=169.254.0.9 MESH_UTUN=utun3 BG_PIDS="" FIXTURE_DIR=/fix
 	sleep() { :; }
 	wait_until() { shift; "$@"; }
 	retrans() { echo 10; }
@@ -1172,20 +2123,65 @@ st_driver_run() {
 		for p in $BG_PIDS; do wait "$p"; done
 	}
 	pod_ip() { echo 10.42.1.7; }
-	kc() { case "$*" in *clusterIP*) echo 10.43.0.10 ;; esac; }
-	pod_log_value() { case "$2" in RECV*) echo $((PAYLOAD_MB * 1048576)) ;; ICIP=) echo 169.254.0.12 ;; esac; }
-	counters() { local side="$1" tag="$2" i; shift 2; for i in "$@"; do cp "$D/netstat-I-$i-${tag##*-}.txt" "$RUNG_DIR/$side-$tag-$i.txt"; done; }
+	pod_ready() { [ "$mutant" != wild-not-ready ]; }
+	kc() {
+		case "$*" in
+		*clusterIP*) echo 10.43.0.10 ;;
+		*shim-inactive*) [ "$mutant" != shim-condition ] || echo True ;;
+		*reason=ShimInactive*) [ "$mutant" != shim-event ] || echo Warning ;;
+		esac
+	}
+	pod_log_value() {
+		case "$2" in
+		RECV5400=) if [ -f "$D/recv5400" ]; then cat "$D/recv5400"; else echo $((PAYLOAD_MB * 1048576)); fi ;;
+		RECV*) echo $((PAYLOAD_MB * 1048576)) ;;
+		ICIP=) echo 169.254.0.12 ;;
+		esac
+	}
+	# Each read of the listener's log finds one line more, so each flow adds one;
+	# the flow-lost mutant's listener never logs a second stream.
+	: >"$RUNG_DIR/.recv-lines"
+	pod_log_count() {
+		echo x >>"$RUNG_DIR/.recv-lines"
+		if [ "$mutant" = flow-lost ]; then echo 1; else wc -l <"$RUNG_DIR/.recv-lines" | tr -d ' '; fi
+	}
+	# A profile's own file for this side, then its shared file, then the green cable
+	# reading, so a red cable profile holds only the counters it breaks.
+	counters() {
+		local side="$1" tag="$2" i f g
+		shift 2
+		for i in "$@"; do
+			f="netstat-I-$i-${tag##*-}.txt"
+			for g in "$D/$side-$f" "$D/$f" "$F/driver/cable/$side-$f"; do
+				if [ -f "$g" ]; then
+					cp "$g" "$RUNG_DIR/$side-$tag-$i.txt"
+					break
+				fi
+			done
+		done
+	}
 	on() {
 		case "$2" in
 		"route -n get 10.42."* | "route -n get 100.64."*) cat "$F/route-get-utun.txt" ;;
 		"route -n get "*) cat "$F/route-get-bridge0.txt" ;;
 		"arp -n "*) if [ "$1" = local ]; then echo "? (x) at 36:a1:5c:0:0:2 on bridge0 ifscope [bridge]"; else echo "? (x) at 36:a1:5c:0:0:1 on bridge0 ifscope [bridge]"; fi ;;
-		"nc -z "*) return 1 ;;
+		"nc -z "*) [ "$mutant" = slot-answers ] && return 0 || return 1 ;;
+		"curl "*) [ "$mutant" = control-silent ] || echo ic-wild ;;
+		"netstat -an -p tcp") if [ "$mutant" = wild-star ]; then cat "$F/netstat-an-wild-star.txt"; else cat "$F/netstat-an-wild-podip.txt"; fi ;;
 		*) : ;;
 		esac
 	}
 	on_local() { on local "$1"; }
-	on_peer() { case "$1" in python3*) echo "LISTEN"; echo "ACCEPT 169.254.0.9 169.254.0.12" ;; *) on peer "$1" ;; esac; }
+	on_peer() {
+		case "$1" in
+		python3*)
+			echo "LISTEN"
+			# The source the captured r4 run saw: the Mac's self-assigned bridge address.
+			if [ "$mutant" = pin-unpinned ]; then echo "ACCEPT 169.254.0.9 169.254.10.114"; else echo "ACCEPT 169.254.0.9 169.254.0.12"; fi
+			;;
+		*) on peer "$1" ;;
+		esac
+	}
 	if [ "$rung" = r3 ]; then assert_r3_cable_path; else assert_r4_mesh_traffic; fi
 	wait
 	rm -rf "$RUNG_DIR"
@@ -1197,14 +2193,204 @@ st_driver_run() {
 # swapped argument between the rung glue and its predicates reds without a rig.
 # The stubs live only in the subshell.
 st_driver() {
-	local rung="$1" prof="$2" want="$3" out rc=0
+	local rung="$1" prof="$2" want="$3" out rc=0 greens=7
+	[ "$rung" = r3 ] || greens=11
 	out="$(st_driver_run "$rung" "$prof")" || rc=$?
-	if { [ "$want" = 0 ] && [[ "$out" == *"DRIVER passes=7 fails=0"* ]]; } || { [ "$want" = 1 ] && [[ "$out" == *"DRIVER passes="* ]] && [[ "$out" != *" fails=0"* ]]; }; then
+	if { [ "$want" = 0 ] && [[ "$out" == *"DRIVER passes=$greens fails=0"* ]]; } || { [ "$want" = 1 ] && [[ "$out" == *"DRIVER passes="* ]] && [[ "$out" != *" fails=0"* ]]; }; then
 		echo "ok    rung driver $rung over $prof (want $([ "$want" = 0 ] && echo green || echo red))"
 	else
 		echo "MISS  rung driver $rung over $prof: $(printf '%s' "$out" | grep -E '^(FAIL|DRIVER)' | sed -n 1,5p | tr '\n' ';')"
 		ST_MISS=$((ST_MISS + 1))
 	fi
+}
+
+# st_driver_red <rung> <profile> <mutant> <text> — one broken promise on a green
+# profile: the named FAIL line must appear and the driver must count a failure.
+st_driver_red() {
+	local out
+	out="$(st_driver_run "$1" "$2" "$3")"
+	if [[ "$out" == *"FAIL"*"$4"* ]] && [[ "$out" == *"DRIVER passes="* ]] && [[ "$out" != *" fails=0"* ]]; then
+		echo "ok    rung driver $1 red: ${3:-$2}"
+	else
+		echo "MISS  rung driver $1 red: ${3:-$2}: $(printf '%s' "$out" | grep -E '^(FAIL|DRIVER)' | sed -n 1,5p | tr '\n' ';')"
+		ST_MISS=$((ST_MISS + 1))
+	fi
+}
+
+# st_mlx_manifest <name> <interconnect|-> — the rendered manifest carries every field
+# the operator refuses a model without, as YAML a parser reads back.
+st_mlx_manifest() {
+	local out
+	MLX_MODEL="$MLX_DEFAULT_MODEL" MLX_REVISION="$MLX_DEFAULT_REVISION" MLX_IMAGE="$MLX_DEFAULT_IMAGE" MLX_MEMORY=4Gi NS=stub
+	out="$(mlx_model_manifest "$1" "$2")"
+	st_eq "$1 manifest: port" "$(awk '$1=="port:"{print $2}' <<<"$out")" 8000
+	st_eq "$1 manifest: the digest-pinned image" "$(sed -n 's/.*runtime: {image: "\(.*\)"}/\1/p' <<<"$out")" "$MLX_DEFAULT_IMAGE"
+	st_eq "$1 manifest: revision" "$(awk '$1=="revision:"{print $2}' <<<"$out")" "$MLX_DEFAULT_REVISION"
+	st_eq "$1 manifest: cache" "$(grep -c 'cache: {size: 5Gi, storageClassName: local-path}' <<<"$out")" 1
+	if [ "$2" = - ]; then
+		st_eq "$1 manifest: no distributed block" "$(grep -c distributed <<<"$out")" 0
+	else
+		st_eq "$1 manifest: two ranks on the path" "$(grep -c "distributed: {ranks: 2, backend: ring, interconnect: $2}" <<<"$out")" 1
+	fi
+}
+
+# st_ring_settled — stale Ready plus pre-patch pod UIDs must not pass ring_on's pod test.
+st_ring_settled() {
+	local two_old two_new mixed notready
+	two_old=$'p0 u0 n thunderbolt True\np1 u1 n thunderbolt True'
+	two_new=$'p2 u2 n thunderbolt True\np3 u3 n thunderbolt True'
+	mixed=$'p0 u0 n thunderbolt True\np3 u3 n thunderbolt True'
+	notready=$'p2 u2 n thunderbolt False\np3 u3 n thunderbolt True'
+	RING_OLD_UIDS="u0 u1 "
+	st "ring_settled rejects the stale pods (old UIDs, Ready, annotated)" 1 ring_settled thunderbolt <<<"$two_old"
+	st "ring_settled rejects one old UID among the pair" 1 ring_settled thunderbolt <<<"$mixed"
+	st "ring_settled rejects recreated pods that are not Ready" 1 ring_settled thunderbolt <<<"$notready"
+	st "ring_settled rejects recreated pods on the wrong path" 1 ring_settled network <<<"$two_new"
+	st "ring_settled rejects old and new pods together (a rank still terminating)" 1 ring_settled thunderbolt <<<"$two_old"$'\n'"$two_new"
+	st "ring_settled accepts two recreated Ready pods on the path" 0 ring_settled thunderbolt <<<"$two_new"
+	RING_OLD_UIDS=""
+	st "ring_settled with no pre-patch set accepts two Ready pods on the path" 0 ring_settled thunderbolt <<<"$two_old"
+}
+
+# st_r5_run <invalid|slow> — the real r5 assertion to its first wait, the cluster
+# stubbed: an InvalidSpec model, or one that never reports anything.
+st_r5_run() {
+	local prof="$1" r5_dir
+	r5_dir="$(mktemp -d -t m17-r5.XXXXXX)"
+	RUNG_DIR="$r5_dir" RUNG=r5 R_PASS=0 R_FAIL=0 NS=stub MLX_READY_TIMEOUT=2 MLX_MEMORY=4Gi
+	MLX_MODEL=m MLX_REVISION=r MLX_IMAGE=i
+	# shellcheck disable=SC2034 # read through node_of
+	local_NODE=node-a peer_NODE=node-b
+	sleep() { :; }
+	image_pull_failed() { return 1; }
+	model_ready() {
+		echo POLL
+		return 1
+	} >>"$r5_dir/.polls"
+	kc() {
+		case "$*" in
+		"get node "*) echo 1 ;;
+		*'@.reason=="InvalidSpec"'*) [ "$prof" != invalid ] || echo "no serving image" ;;
+		"get mlxmodel -n stub ic-ring -o json") echo '{"status":{}}' ;;
+		esac
+	}
+	assert_r5_ring
+	cat "$r5_dir/.polls"
+	[ -s "$r5_dir/mlxmodel-ic-ring.json" ] && echo "SAVED mlxmodel-ic-ring.json"
+	rm -rf "$r5_dir"
+}
+
+# st_rungs_run <red rung id|-> [until rung id] — the real run_rungs over the real table with every
+# assertion stubbed to pass, one to fail; prints rungs.tsv and which ns files exist.
+st_rungs_run() {
+	local red="$1" id summary prereqs fn ev bi ev_dir
+	ev_dir="$(mktemp -d -t m17-rungs.XXXXXX)"
+	EVIDENCE_DIR="$ev_dir" NS=stub HAVE="$PREREQ_STATIC $PREREQ_RUNTIME" N_PASS=0 N_FAIL=0 N_REFUSED=0
+	UNTIL="${2:-}" LADDER_STOPPED=0 N_NOT_RUN=0
+	# A real r5 adds this token itself when it passes (assert_r5_ring).
+	[ "$red" != r5-ring ] || HAVE="${HAVE/ ring/}"
+	: >"$ev_dir/rungs.tsv"
+	while IFS='|' read -r id summary prereqs fn ev bi; do
+		[ -n "$id" ] || continue
+		if [ "$id" = "$red" ]; then
+			eval "$fn() { fail stubbed; }"
+		else
+			eval "$fn() { pass stubbed; echo \"RAN $id\"; }"
+		fi
+	done <<<"$RUNG_TABLE"
+	kc() { echo "kc $*"; }
+	run_rungs
+	echo "TSV $(tr '\t\n' ':;' <"$ev_dir/rungs.tsv")"
+	echo "EXIT $(ladder_exit_status 0 "$N_PASS" "$N_FAIL" "$N_REFUSED" "$LADDER_STOPPED")"
+	(cd "$ev_dir" && find . -name 'ns-*' | sort | sed 's/^/NSFILE /')
+	rm -rf "$ev_dir"
+}
+# st_exit_evidence — every rung directory gets the exit reading, from one read.
+st_exit_evidence() {
+	local ev_dir
+	ev_dir="$(mktemp -d -t m17-exit.XXXXXX)"
+	mkdir -p "$ev_dir/r0-disarmed" "$ev_dir/r5-ring" "$ev_dir/baseline"
+	EVIDENCE_DIR="$ev_dir" NS=stub
+	kc() {
+		echo "kc $*" >>"$ev_dir/.calls"
+		echo "kc $*"
+	}
+	capture_exit_evidence
+	(cd "$ev_dir" && find . -name 'ns-at-exit-events.txt' | sort | tr '\n' ' ')
+	echo "READS $(grep -c 'get events.*wide' "$ev_dir/.calls")"
+	rm -rf "$ev_dir"
+}
+
+# st_r8_run <profile> — the real r8 assertion with the host and cluster stubbed: bridge0
+# reads armed until the pods are deleted, so the green profile passes only when the
+# hold is read before the delete and the empty halves after it. Each other profile
+# breaks one promise. The stubs live only in the subshell st_out runs this in, and
+# they read r8_dir because check's own local d would shadow a d here.
+st_r8_run() {
+	local prof="$1" F="$FIXTURES" r8_dir s
+	r8_dir="$(mktemp -d -t m17-r8.XXXXXX)"
+	RUNG_DIR="$r8_dir" BASE_DIR="$r8_dir" RUNG=r8 R_PASS=0 R_FAIL=0 NS=stub DESIRED_INTERVAL=0 HAVE=attached NS_CREATED=0 ARMED_BY_RUN=1
+	# shellcheck disable=SC2034 # read through side_var and node_of
+	local_NODE=node-a peer_NODE=node-b local_IDX=3 peer_IDX=3 local_OS=x peer_OS=x
+	# shellcheck disable=SC2034 # read through side_var
+	local_SLOT0=169.254.0.25 peer_SLOT0=169.254.0.25 local_ICIP=169.254.0.26 peer_ICIP=169.254.0.27 peer_MESH=100.64.1.1
+	for s in local peer; do
+		cp "$F/netstat-rn-baseline.txt" "$r8_dir/$s-base-netstat.txt"
+		cp "$F/ifconfig-bridge0-disarmed.txt" "$r8_dir/$s-base-bridge0.txt"
+	done
+	[ "$prof" != no-attached ] || HAVE=""
+	sleep() { :; }
+	wait_until() { shift; "$@"; }
+	rec() { :; }
+	info() { :; }
+	ic_pod() { :; }
+	pod_ready() { :; }
+	pod_attached() {
+		case "$1" in
+		ic-late-*) if [ "$prof" = late-attached ]; then echo True; else echo False; fi ;;
+		*) if [ "$prof" = cond-false ]; then echo False; else echo True; fi ;;
+		esac
+	}
+	desired_of() { [ "$prof" != annotation-stays ] && [ -e "$r8_dir/.disabled" ] || echo '{"schema":1}'; }
+	ic_json() { cat "$F/interconnect-disarmed-members-down.json"; }
+	read_ledger() { cp "$F/ledger-empty.json" "$RUNG_DIR/ledger-$1.json"; }
+	scrape_metrics() { cp "$F/metrics-after.txt" "$RUNG_DIR/metrics-$1.txt"; }
+	kc() {
+		case "$*" in
+		"delete pod"*) [ "$prof" = pods-stuck ] || : >"$r8_dir/.deleted" ;;
+		"get pod -n stub --ignore-not-found"*) [ -e "$r8_dir/.deleted" ] || echo pod/ic-l-local ;;
+		"get meshpeers"*) echo "node-a {}" ;;
+		"logs "*) echo "ICIP=" ;;
+		*) return 1 ;;
+		esac
+	}
+	on() {
+		case "$2" in
+		"ifconfig bridge0")
+			if [ "$prof" = stuck ]; then
+				cat "$F/ifconfig-bridge0-armed.txt"
+			elif [ -e "$r8_dir/.deleted" ] || { [ "$prof" = dropped-early ] && [ -e "$r8_dir/.disabled" ]; }; then
+				cat "$F/ifconfig-bridge0-disarmed.txt"
+			else
+				cat "$F/ifconfig-bridge0-armed.txt"
+			fi
+			;;
+		"netstat -rn -f inet") cat "$F/netstat-rn-baseline.txt" ;;
+		"arp -an") cat "$F/arp-an-clean.txt" ;;
+		"ifconfig lo0"*)
+			if [ "$prof" = lo0-lost ] && [ -e "$r8_dir/.disabled" ]; then cat "$F/lo0-lost-egress.txt"; else cat "$F/lo0-before.txt"; fi
+			;;
+		esac
+	}
+	on_local() {
+		case "$1" in
+		*"interconnect disable") : >"$r8_dir/.disabled" ;;
+		"ping "*) echo "3 packets transmitted, 3 packets received, 0.0% packet loss" ;;
+		esac
+	}
+	assert_r8_killswitch
+	rm -rf "$r8_dir"
+	echo "DRIVER passes=$R_PASS fails=$R_FAIL"
 }
 
 self_test_body() {
@@ -1225,7 +2411,48 @@ self_test_body() {
 	st "K3SM_LAB unset exits 3 with the pending line" 0 gate_run 3 "$PENDING_TEXT" --
 	st "the watchdog fires on a hung check and maps to FAIL (exit 1)" 0 gate_run 1 "watchdog fired" K3SM_M17_SELFTEST_WATCHDOG=2 K3SM_M17_SELFTEST_HANG=1 -- --self-test
 	st "K3SM_LAB=1 without PEER_SSH/EVIDENCE_DIR exits 2 REFUSED" 0 gate_run 2 "REFUSED(preflight)" K3SM_LAB=1 --
-	st "K3SM_LAB=1 with a relative EVIDENCE_DIR exits 2" 0 gate_run 2 "REFUSED(preflight)" K3SM_LAB=1 PEER_SSH=x EVIDENCE_DIR=rel --
+	st "K3SM_LAB=1 with a relative EVIDENCE_DIR exits 2" 0 gate_run 2 "REFUSED(preflight)" K3SM_LAB=1 PEER_SSH=x EVIDENCE_DIR=rel K3SM_M17_REMOTE_SCRATCH=/Users/x/scratch --
+	st_build_set "$tmp/set-prev"
+	st_build_set "$tmp/set-cur"
+	st_build_set "$tmp/set-short" cp-payload/kine
+	st_build_set "$tmp/set-new"
+	printf '# wire verb EnsureInterconnectAlias\n' >>"$tmp/set-new/k3sm"
+	mkdir -p "$tmp/link" && ln -s "$tmp/set-cur/k3sm" "$tmp/link/k3sm"
+	st "r9 inputs: two complete sets, a join address, the driver on the server" 0 st_r9_problem "$tmp/set-prev/k3sm" "$tmp/set-cur/k3sm" 192.0.2.10 node-b
+	st_out "r9 refused: no previous artifact" "K3SM_M17_PREVIOUS_ARTIFACT and K3SM_ARTIFACT" st_r9_problem "" "$tmp/set-cur/k3sm" 192.0.2.10 node-b
+	st_out "r9 refused: an incomplete set names what is missing" "missing: cp-payload/kine" st_r9_problem "$tmp/set-short/k3sm" "$tmp/set-cur/k3sm" 192.0.2.10 node-b
+	for r in /Library/k3sm /usr/local/bin; do st "r9 refused: the installed tree $r as a source" 0 is_installed_tree "$r"; done
+	st "r9 inputs: a build set elsewhere is not the installed tree" 1 is_installed_tree /Users/x/set
+	st_out "r9 refused: a symlink, whose set cannot be read beside it" "not an executable regular file" build_set_problem "$tmp/link/k3sm" K3SM_ARTIFACT
+	st_out "r9 refused: a previous helper at minor 2 or later cannot exercise HelperTooOld" "cannot exercise HelperTooOld" st_r9_problem "$tmp/set-new/k3sm" "$tmp/set-cur/k3sm" 192.0.2.10 node-b
+	st "r9 refused: that previous helper exits non-zero" 1 st_r9_problem "$tmp/set-new/k3sm" "$tmp/set-cur/k3sm" 192.0.2.10 node-b
+	st_out "r9: a helper below minor 2 passes the mixed leg, with both doctors clean" "DRIVER passes=7 fails=0" st_r9_run "$F/hello-minor1.json" "$F/doctor-clean.json"
+	st_out "r9: a residue row the Mac already had stays green" "DRIVER passes=7 fails=0" st_r9_run "$F/hello-minor1.json" "$F/doctor-residue-baseline.json"
+	st_out "r9 red: a residue route this run left" "FAIL      [r9] local Mac: doctor ic-residue names nothing this run left: residue this run left: 169.254.0.10/32" st_r9_run "$F/hello-minor1.json" "$F/doctor-residue-new.json"
+	st_out "r9 red: a helper at minor 2 after the downgrade is never a pass" "FAIL      [r9] mixed leg: the helper still speaks minor 2" st_r9_run "$F/hello-minor2.json" "$F/doctor-clean.json"
+	st_out "r9 red: a helper that does not answer" "FAIL      [r9] mixed leg: not a HelperTooOld verdict" st_r9_run "$F/hello-rejected.txt" "$F/doctor-clean.json"
+	st_out "r9 refused: one build twice" "one build" st_r9_problem "$tmp/set-cur/k3sm" "$tmp/set-cur/k3sm" 192.0.2.10 node-b
+	st_out "r9 refused: no join address" "K3SM_M17_JOIN_SERVER" st_r9_problem "$tmp/set-prev/k3sm" "$tmp/set-cur/k3sm" "" node-b
+	st_out "r9 refused: a join address with a port" "K3SM_M17_JOIN_SERVER" st_r9_problem "$tmp/set-prev/k3sm" "$tmp/set-cur/k3sm" 192.0.2.10:9345 node-b
+	st_out "r9 refused: the driver on the worker" "not on the server" st_r9_problem "$tmp/set-prev/k3sm" "$tmp/set-cur/k3sm" 192.0.2.10 node-a
+	st_eq "reinstall: a worker polls the join port, then installs its role" "$(st_reinstall_calls peer 0 0)" "join-port peer;ship peer prev;install on peer: BIN=/set/prev/k3sm ARGS=--agent --server 192.0.2.10;wait two_nodes_ready;status 0;"
+	st_eq "reinstall: a server's plain re-run takes no role flag and no port poll" "$(st_reinstall_calls local 0 0)" "ship local prev;install on local: BIN=/set/prev/k3sm ARGS=;wait two_nodes_ready;status 0;"
+	st_out "reinstall red: a closed join port never reaches the install" "no install was attempted" st_reinstall peer 1 0
+	st_eq "reinstall red: a closed join port ships nothing" "$(st_reinstall peer 1 0 | grep -c '^ship\|^install')" 0
+	st_out "reinstall red: a refused install is the status" "status 7" st_reinstall local 0 7
+	st "K3SM_LAB=1 without a remote scratch exits 2" 0 gate_run 2 "K3SM_M17_REMOTE_SCRATCH is unset" K3SM_LAB=1 PEER_SSH=x EVIDENCE_DIR="$tmp/ev" --
+	st "K3SM_LAB=1 with a remote scratch in /tmp exits 2" 0 gate_run 2 "shared temporary directory" K3SM_LAB=1 PEER_SSH=x EVIDENCE_DIR="$tmp/ev" K3SM_M17_REMOTE_SCRATCH=/tmp/x --
+	st "remote scratch: a private absolute directory" 0 remote_scratch_problem /Users/x/scratch
+	# shellcheck disable=SC2016 # the $(x) is a literal value under test
+	for r in "" rel/dir / /tmp /tmp/x /private/tmp/x /var/tmp/x /var/folders/ab/x /private/var/folders/ab/x "/Users/a b" '/Users/a;b' '/Users/$(x)' /Users/a/../b /Users/a/./b; do
+		st "remote scratch red: '$r'" 1 remote_scratch_problem "$r"
+	done
+	st_out "remote run dir sits under the scratch with this run's name" "/Users/x/scratch/$REMOTE_RUN_PREFIX." remote_run_dir /Users/x/scratch
+	st "two remote run dirs differ" 1 test "$(remote_run_dir /s)" = "$(sleep 1; remote_run_dir /s)"
+	st_out "the remote dir is made private" "umask 077 && mkdir /Users/x/scratch/run" st_remote_make
+	st_out "the exit trap removes this run's dir" "rm -rf /s/$REMOTE_RUN_PREFIX.1" st_remote_remove 1 /s "/s/$REMOTE_RUN_PREFIX.1"
+	st_eq "the exit trap removes nothing when the dir was never made" "$(st_remote_remove 0 /s "/s/$REMOTE_RUN_PREFIX.1" | grep -c 'rm -rf')" 0
+	st_eq "the exit trap refuses a dir that is not this run's" "$(st_remote_remove 1 /s /s/other | grep -c 'rm -rf')" 0
 
 	st_eq "node index 10.42.3.0/24 in 10.42.0.0/16" "$(icp_node_index 10.42.0.0/16 10.42.3.0/24)" 3
 	st "node index outside the aggregate fails" 1 icp_node_index 10.42.0.0/16 10.43.0.0/24
@@ -1284,21 +2511,54 @@ self_test_body() {
 	st "UpHold red: 30 s" 1 icp_uphold_verdict 200.0 230.0
 	st "UpHold red: no replug timestamp" 1 icp_uphold_verdict 200.0 ""
 	st_eq "ping gap: none" "$(icp_ping_max_gap "$F/ping-gap0.txt")" 0
+	st_eq "metrics: every node is scraped by the names the run sets" "$(st_scrape_metrics | tr '\n' ' ')" "/api/v1/nodes/node-a/proxy/metrics/interconnect /api/v1/nodes/node-b/proxy/metrics/interconnect "
 	st_eq "ping gap: one" "$(icp_ping_max_gap "$F/ping-gap1.txt")" 1
 	st_eq "ping gap red: three" "$(icp_ping_max_gap "$F/ping-gap3.txt")" 3
 
 	st_eq "transitions delta node-a" "$(($(icp_metric_sum "$F/metrics-after.txt" k3sm_interconnect_member_transitions_total 'node="node-a"') - $(icp_metric_sum "$F/metrics-before.txt" k3sm_interconnect_member_transitions_total 'node="node-a"')))" 2
-	st_eq "attached pods" "$(icp_metric_sum "$F/metrics-after.txt" k3sm_interconnect_attached_pods)" 0
+	# attached pods: not checked (the gauge has no non-test writer, so 0 is vacuous)
 	st "netd verbs: the closed two" 0 icp_netd_verbs_closed "$F/metrics-after.txt"
 	st "netd verbs red: a foreign verb" 1 icp_netd_verbs_closed "$F/metrics-foreign-verb.txt"
 	st_eq "netd Hello frame bytes (4-byte big-endian length + JSON)" "$(icp_netd_hello_frame)" "$(cat "$F/netd-hello-frame.hex")"
 	st_eq "helper: minor 2" "$(icp_helper_verdict "$F/hello-minor2.json")" minor2
 	st_eq "helper red: an old helper is HelperTooOld" "$(icp_helper_verdict "$F/hello-minor1.json")" HelperTooOld
 	st_eq "helper red: no reply is an error" "$(icp_helper_verdict "$F/hello-error.txt")" error
+	st_eq "helper red: a peer the helper closed is an error, not too old" "$(icp_helper_verdict "$F/hello-rejected.txt")" error
+	st_eq "helper version of a current reply" "$(helper_version "$F/hello-minor2.json")" 1.2
+	st_eq "helper version of a closed connection is empty" "$(helper_version "$F/hello-rejected.txt")" ""
+	st_out "helper detail: the minor it speaks" "helper speaks 1.2" netd_probe_detail local "$F/hello-minor2.json"
+	st_out "helper detail red: too old names the real minor" "TOO OLD: the local Mac's helper speaks 1.1" netd_probe_detail local "$F/hello-minor1.json"
+	st_out "helper detail red: a closed connection is cannot read" "CANNOT READ" netd_probe_detail peer "$F/hello-rejected.txt"
+	st_eq "helper detail red: a closed connection never says too old" "$(netd_probe_detail peer "$F/hello-rejected.txt" | grep -c 'TOO OLD')" 0
+	st "the Hello payload drops to the service user before it connects" 0 hello_drops_before_connect
 	st "ledger: no aliases" 0 icp_ledger_empty "$F/ledger-empty.json"
 	st "ledger: absent" 0 icp_ledger_empty "$F/no-such-ledger.json"
 	st "ledger red: one alias" 1 icp_ledger_empty "$F/ledger-one.json"
-	st_eq "doctor: ic-residue clean" "$(icp_doctor_row_state "$F/doctor-clean.json" ic-residue)" ok
+	st "disarmed: cabled members listed down on a disabled object" 0 ic_disarmed_verdict "$F/interconnect-disarmed-members-down.json"
+	st "disarmed: no members at all" 0 ic_disarmed_verdict "$F/interconnect-disarmed-no-members.json"
+	st "disarmed red: a member up" 1 ic_disarmed_verdict "$F/interconnect-disarmed-member-up.json"
+	st_out "disarmed red: the member up is named" "member node-b is up" ic_disarmed_verdict "$F/interconnect-disarmed-member-up.json"
+	st_out "disarmed red: a segment is named" "1 segment(s)" ic_disarmed_verdict "$F/interconnect-disarmed-member-up.json"
+	st "disarmed red: an armedBy record" 1 ic_disarmed_verdict "$F/interconnect-disarmed-armedby.json"
+	st "disarmed red: an attached pod" 1 ic_disarmed_verdict "$F/interconnect-disarmed-attached.json"
+	st_eq "the members stay on the record" "$(ic_members_line "$F/interconnect-disarmed-members-down.json")" "node-a down since 2026-10-15T09:00:00Z, node-b down since 2026-10-30T09:00:00Z"
+	st_eq "doctor: a clean Mac has no ic-residue row at all" "$(icp_doctor_row_state "$F/doctor-clean.json" ic-residue)" absent
+	st "doctor mechanism: a clean Mac, no ic-residue row" 0 doctor_mechanism_problem "$F/doctor-clean.json"
+	st "doctor mechanism: a Mac not in use has only ic-bridge and ic-stray" 0 doctor_mechanism_problem "$F/doctor-not-in-use.json"
+	st "doctor mechanism: a real residue row does not hide the section" 0 doctor_mechanism_problem "$F/doctor-residue-baseline.json"
+	st_out "doctor mechanism red: a doctor with no section" "has no ic-bridge row" doctor_mechanism_problem "$F/doctor-no-section.json"
+	st_out "doctor mechanism red: no Thunderbolt port as the doctor sees it" "has no ic-stray row" doctor_mechanism_problem "$F/doctor-no-port.json"
+	st_out "doctor mechanism red: not a doctor report" "has no ic-bridge row" doctor_mechanism_problem "$F/hello-error.txt"
+	st "residue: no row on a Mac that had none" 0 doctor_residue_verdict "$F/doctor-clean.json" "$F/doctor-clean.json" "169.254.0.25"
+	st "residue: the row the Mac already had" 0 doctor_residue_verdict "$F/doctor-residue-baseline.json" "$F/doctor-residue-baseline.json" "169.254.0.25"
+	st "residue: the row gone since the baseline" 0 doctor_residue_verdict "$F/doctor-residue-baseline.json" "$F/doctor-clean.json" "169.254.0.25"
+	st "residue: this Mac's own removed alias, which macOS keeps" 0 doctor_residue_verdict "$F/doctor-residue-baseline.json" "$F/doctor-residue-own-clone.json" "169.254.0.25 169.254.0.26"
+	st_out "residue red: a route that was not in the baseline, state ok" "residue this run left: 169.254.0.10/32" doctor_residue_verdict "$F/doctor-residue-baseline.json" "$F/doctor-residue-new.json" "169.254.0.25 169.254.0.26"
+	st "residue red: that route exits non-zero" 1 doctor_residue_verdict "$F/doctor-residue-baseline.json" "$F/doctor-residue-new.json" "169.254.0.25 169.254.0.26"
+	st "residue red: a row where the Mac had none" 1 doctor_residue_verdict "$F/doctor-clean.json" "$F/doctor-residue-baseline.json" "169.254.0.25"
+	st "residue red: a state other than ok" 1 doctor_residue_verdict "$F/doctor-clean.json" "$F/doctor-residue.json" "169.254.0.25"
+	st "residue red: wording this cannot read" 1 doctor_residue_verdict "$F/doctor-clean.json" "$F/doctor-residue-unparsed.json" "169.254.0.25"
+	st "residue red: not a doctor report" 1 doctor_residue_verdict "$F/doctor-clean.json" "$F/hello-error.txt" "169.254.0.25"
 	st_eq "doctor red: ic-stray warns" "$(icp_doctor_row_state "$F/doctor-residue.json" ic-stray)" warn
 	st_eq "doctor: a missing row" "$(icp_doctor_row_state "$F/doctor-clean.json" ic-peers)" absent
 	st_eq "doctor red: not a doctor report" "$(icp_doctor_row_state "$F/hello-error.txt" ic-stray)" unreadable
@@ -1321,6 +2581,12 @@ self_test_body() {
 	st "verify-twice red: a rung REFUSED (exit 2)" 1 icp_verify_twice "$F/run-a" "$F/run-b-refused" "$REQUIRED_IDS"
 	st "verify-twice red: only rungs.tsv says REFUSED" 1 icp_verify_twice "$F/run-a" "$F/run-b-rung-refused" "$REQUIRED_IDS"
 	st_out "verify-twice red: the per-rung check names it" "rung r5-ring is 'REFUSED', not PASS" icp_verify_twice "$F/run-a" "$F/run-b-rung-refused" "$REQUIRED_IDS"
+	st "verify-twice red: r6 owed, with no operator" 1 icp_verify_twice "$F/run-a" "$F/run-b-r6-owed" "$REQUIRED_IDS"
+	st_out "verify-twice red: r6 owed is named" "rung r6-unplug is 'REFUSED', not PASS" icp_verify_twice "$F/run-a" "$F/run-b-r6-owed" "$REQUIRED_IDS"
+	st_out "no terminal: r6 is refused as owed" "REFUSED(r6-unplug): owed, not passed: no operator at /dev/tty" st_owed_rung
+	st_out "no terminal: rungs.tsv records r6 REFUSED" "r6-unplug	REFUSED" st_owed_rung
+	st_out "no terminal: the next rung still runs" "r7-desired-forge	PASS" st_owed_rung
+	st_out "no terminal: the counts leave the exit non-zero" "counts pass=1 fail=0 refused=1" st_owed_rung
 	st_out "verify-twice red: a copied log is one run (started_utc)" "started_utc is the same in both" icp_verify_twice "$F/run-a" "$F/run-a" "$REQUIRED_IDS"
 	st "--verify-twice mode exits 0 on the green pair" 0 gate_run 0 PASS -- --verify-twice "$F/run-a" "$F/run-b"
 	st "--verify-twice mode exits 1 on a copy" 0 gate_run 1 - -- --verify-twice "$F/run-a" "$F/run-a"
@@ -1334,10 +2600,111 @@ self_test_body() {
 			st "the m11 header emitted over a fixture carries '$r'" 0 grep -qF -- "$r" "$tmp/header.txt"
 		done
 	fi
+	for r in ic-ring:thunderbolt ic-single:-; do
+		st_mlx_manifest "${r%%:*}" "${r##*:}"
+	done
+	st_eq "the r5 model is the example's" "$MLX_DEFAULT_MODEL" "$(st_example_field model)"
+	st_eq "the r5 revision is the example's" "$MLX_DEFAULT_REVISION" "$(st_example_field revision)"
+	st_eq "the r5 image is the example's" "$MLX_DEFAULT_IMAGE" "$(st_example_field image)"
+	st_eq "the r5 port is the example's" "$MLX_PORT" "$(st_example_field port)"
+	st_eq "the r5 cache size is the example's" "$MLX_CACHE_SIZE" "$(st_example_field size)"
+	st_eq "the r5 cache class is the example's" "$MLX_CACHE_CLASS" "$(st_example_field storageClassName)"
+	st "the mlx knobs: neither named" 0 mlx_knob_problem "" ""
+	st "the mlx knobs: both named" 0 mlx_knob_problem a/b abc
+	st_out "the mlx knobs red: a model without its revision" "needs K3SM_M17_MLX_REVISION" mlx_knob_problem a/b ""
+	st "the mlx knobs red: a revision without its model" 1 mlx_knob_problem "" abc
+	st_out "r5 stops at once on InvalidSpec, naming it" "rejected with InvalidSpec: no serving image" st_r5_run invalid
+	st_eq "r5 polled once before it stopped on InvalidSpec" "$(st_r5_run invalid | grep -c '^POLL')" 1
+	st_out "r5 saves the status of an InvalidSpec model" "SAVED mlxmodel-ic-ring.json" st_r5_run invalid
+	st_out "r5 still runs out its budget for a model that is only slow" "never became Ready within 2s" st_r5_run slow
+	st_out "r5 saves the status of a model that timed out" "SAVED mlxmodel-ic-ring.json" st_r5_run slow
+	st_ring_settled
+	st "--until with no rung exits 2" 0 gate_run 2 - -- --until
+	st "--until with a rung and more exits 2" 0 gate_run 2 - -- --until r5 extra
+	for r in r r10 r5x ring r5-ringx 5; do st "--until red: '$r' names no rung" 0 gate_run 2 "names no rung" -- --until "$r"; done
+	st "--until r5 under no K3SM_LAB is still the pending line" 0 gate_run 3 "$PENDING_TEXT" -- --until r5
+	st "--until r5 under K3SM_LAB=1 still refuses a missing peer" 0 gate_run 2 "REFUSED(preflight)" K3SM_LAB=1 -- --until r5
+	st_eq "--until r5 is r5-ring" "$(until_rung r5)" r5-ring
+	st_eq "--until takes the full id" "$(until_rung r8-killswitch)" r8-killswitch
+	st_out "--until r5: r5 ran" "RAN r5-ring" st_rungs_run - r5-ring
+	st_eq "--until r5: r6 never ran" "$(st_rungs_run - r5-ring | grep -c 'RAN r6-unplug')" 0
+	st_out "--until r5: the later rungs read NOT-RUN" "r5-ring:PASS;r6-unplug:NOT-RUN;r7-desired-forge:NOT-RUN;r8-killswitch:NOT-RUN;r9-downgrade:NOT-RUN;" st_rungs_run - r5-ring
+	st_out "--until r5: a green stretch is PARTIAL" "EXIT 4" st_rungs_run - r5-ring
+	st_out "--until r5: a red rung before it stays FAIL" "EXIT 1" st_rungs_run r3-cable-path r5-ring
+	st_out "--until r9 runs the whole ladder and can exit 0" "EXIT 0" st_rungs_run - r9-downgrade
+	st_out "no --until runs the whole ladder and can exit 0" "EXIT 0" st_rungs_run -
+	st_eq "exit: a green stop" "$(ladder_exit_status 0 6 0 0 1)" 4
+	st_eq "exit: a refused rung" "$(ladder_exit_status 2 6 0 1 1)" 2
+	st_eq "exit: a stop with nothing passed" "$(ladder_exit_status 0 0 0 0 1)" 1
+	st_eq "exit: short of ten with no stop" "$(ladder_exit_status 0 9 0 0 0)" 1
+	st_eq "exit: an interrupt" "$(ladder_exit_status 130 6 0 0 1)" 1
+	st_eq "r6 needs r5's ring from the same process" "$(awk -F'|' '$1=="r6-unplug"{print $3}' <<<"$RUNG_TABLE")" armed,ring,operator
+	st_out "r6 refuses when r5 has not passed in this process" "REFUSED(r6-unplug): r5-ring did not pass" st_rungs_run r5-ring r6-unplug
+	mkdir -p "$tmp/partial"
+	cp "$F/run-b/run.log" "$tmp/partial/run.log"
+	sed 's/^\(r[6-9]-[a-z-]*\)\tPASS$/\1\tNOT-RUN/' "$F/run-b/rungs.tsv" >"$tmp/partial/rungs.tsv"
+	st_out "--verify-twice refuses a partial run, even with a forged result line" "rung r6-unplug is 'NOT-RUN'" icp_verify_twice "$F/run-a" "$tmp/partial" "$REQUIRED_IDS"
+	st_out "a failing rung is recorded" "r3-cable-path:FAIL;" st_rungs_run r3-cable-path
+	st_out "a failing rung saves the namespace's Events" "NSFILE ./r3-cable-path/ns-events.txt" st_rungs_run r3-cable-path
+	st_out "a failing rung saves the MLXModels" "NSFILE ./r3-cable-path/ns-mlxmodels.json" st_rungs_run r3-cable-path
+	st_eq "only the failing rung saves them" "$(st_rungs_run r3-cable-path | grep -c 'ns-events.txt')" 1
+	st_eq "a passing ladder saves none" "$(st_rungs_run - | grep -c '^NSFILE')" 0
+	st_out "the exit reading reaches every rung directory" "./r0-disarmed/ns-at-exit-events.txt ./r5-ring/ns-at-exit-events.txt READS 1" st_exit_evidence
 	st_driver r3 cable 0
 	st_driver r3 cable-red 1
+	st_driver r3 cable-captured 1
+	st_driver_red r3 cable-captured "" "received 72704 of 134217728 bytes on the slot"
+	st_driver_red r3 cable-peer-lan "" "the payload arrived by the LAN"
+	st_driver_red r3 cable-peer-mesh "" "the payload arrived by the mesh"
+	st_driver_red r3 cable-peer-noack "" "ACKs did not leave by the cable"
+	st_eq "the captured member shape: Ibytes 0, so the delta is the ACKs alone" "$(icp_total_delta "$F/driver/cable/peer-netstat-I-en1-before.txt" "$F/driver/cable-peer-noack/peer-netstat-I-en1-after.txt")" 4256
+	st "the receiver: the slot holds it, ACKs on the cable, LAN and mesh flat" 0 icp_cable_receiver_verdict 134217728 134217728 7800000 287301 2000 8388608
+	st "the receiver red: the slot holds less than the payload" 1 icp_cable_receiver_verdict 134217728 72704 7800000 287301 2000 8388608
+	st "the receiver red: the LAN moved the payload" 1 icp_cable_receiver_verdict 134217728 134217728 7800000 141000000 2000 8388608
+	st "the receiver red: the mesh moved the payload" 1 icp_cable_receiver_verdict 134217728 134217728 7800000 287301 141000000 8388608
+	st "the receiver red: only chatter on the cable" 1 icp_cable_receiver_verdict 134217728 134217728 4256 287301 2000 8388608
+	st "a counter reading with no link row is a failed read, never a flat counter" 1 icp_total_delta "$F/hello-error.txt" "$F/hello-error.txt"
 	st_driver r4 mesh 0
 	st_driver r4 mesh-red 1
+	st_driver_red r4 mesh flow-lost "the peer pod's 5401 listener received the payload"
+	st_driver_red r4 mesh wild-star "the shim bound the peer pod's listener to its pod IP"
+	st_driver_red r4 mesh wild-not-ready "ic-wild never became Ready"
+	st_driver_red r4 mesh control-silent "the listener answers on the pod IP"
+	st_driver_red r4 mesh slot-answers "does not answer on the slot address"
+	st_driver_red r4 mesh shim-condition "no ShimInactive report for hello-http"
+	st_driver_red r4 mesh shim-event "no ShimInactive report for conftool"
+	st_driver_red r4 mesh pin-unpinned "the peer saw conftool's dial"
+	st_eq "r4 runs its shim legs in no platform binary" "$(declare -f assert_r4_mesh_traffic | grep -E 'ic_pod (ic-wild|ic-pin)' | grep -cE '/usr/bin|/bin/|sleep ')" 0
+	st "the bind verdict: the pod IP, no wildcard" 0 icp_wild_bind_verdict "$F/netstat-an-wild-podip.txt" 10.42.1.7 5403
+	st "the bind verdict red: the wildcard stayed" 1 icp_wild_bind_verdict "$F/netstat-an-wild-star.txt" 10.42.1.7 5403
+	st "the bind verdict red: the wildcard held beside the pod IP" 1 icp_wild_bind_verdict "$F/netstat-an-wild-both.txt" 10.42.1.7 5403
+	st "the bind verdict red: another pod's IP" 1 icp_wild_bind_verdict "$F/netstat-an-wild-podip.txt" 10.42.1.8 5403
+	st "the shim report: nothing reported" 0 icp_shim_report_verdict "" ""
+	st "the shim report: a False condition" 0 icp_shim_report_verdict False ""
+	st "the shim report red: the condition" 1 icp_shim_report_verdict True ""
+	st "the shim report red: the Event" 1 icp_shim_report_verdict "" Warning
+	st "fixture root: the default" 0 fixture_root_problem /tmp/k3sm-conformance-bin
+	for r in "" rel/dir "/a b" '/a;b' /a/../b; do st "fixture root red: '$r'" 1 fixture_root_problem "$r"; done
+	st_eq "the fixture directory is made fresh, under a root this login owns" "$(FIXTURE_ROOT=/r FIXTURE_DIR=/r/d fixture_dir_make_cmd)" "mkdir -p /r && [ -O /r ] && chmod 755 /r && umask 022 && mkdir /r/d"
+	st "listener: a flow that adds a line with the whole payload" 0 icp_flow_received_verdict 134217728 1 2 134217728
+	st "listener red: a truncated stream" 1 icp_flow_received_verdict 134217728 0 1 72704
+	st "listener red: no new line, the last flow's count standing in" 1 icp_flow_received_verdict 134217728 1 1 134217728
+	st_eq "listener: every nc -l in the attached pod takes -d" "$(grep -c 'nc -d -l ' <<<"$LISTENER_CMD")" 2
+	st_eq "listener: no nc -l without -d" "$(grep -c 'nc -l ' <<<"$LISTENER_CMD")" 0
+	st "lo0: every address still there" 0 lo0_lost "$F/lo0-before.txt" "$F/lo0-before.txt"
+	st "lo0: a new address is no loss" 0 lo0_lost "$F/lo0-lost-egress.txt" "$F/lo0-before.txt"
+	st_out "lo0 red: the lost address is named" "gone from lo0: 100.64.3.1" lo0_lost "$F/lo0-before.txt" "$F/lo0-lost-egress.txt"
+	st "lo0: a rank pod's address may go" 0 lo0_lost "$F/lo0-before.txt" "$F/lo0-lost-egress.txt" 100.64.3.1
+	st_out "r8: the documented disarm, hold before the delete and empty after it" "DRIVER passes=30 fails=0" st_r8_run green
+	st_out "r8: no pod attached in r2 skips only the hold" "DRIVER passes=24 fails=0" st_r8_run no-attached
+	st_out "r8 red: an address dropped while its pod runs" "FAIL      [r8] local Mac: ic-l-local's address 169.254.0.26 is still a /32" st_r8_run dropped-early
+	st_out "r8 red: the node's own address dropped while a pod rides it" "FAIL      [r8] local Mac: the node's own address 169.254.0.25 stays" st_r8_run dropped-early
+	st_out "r8 red: a running pod's condition went False" "FAIL      [r8] pod ic-l-local, still running" st_r8_run cond-false
+	st_out "r8 red: a pod created after the disarm attached" "FAIL      [r8] ic-late-peer, created after the disarm" st_r8_run late-attached
+	st_out "r8 red: the annotation stays" "FAIL      [r8] peer Mac: desired annotation gone" st_r8_run annotation-stays
+	st_out "r8 red: the disarm took a lo0 address" "FAIL      [r8] local Mac: lo0 lost no address to the disarm: gone from lo0: 100.64.3.1" st_r8_run lo0-lost
+	st_out "r8 red: addresses left after the pods went" "FAIL      [r8] peer Mac: no inet in 169.254.0.0/24" st_r8_run stuck
+	st_out "r8 red: the pods never went" "FAIL      [r8] the attached pods were not gone" st_r8_run pods-stuck
 	rm -rf "$tmp"
 	if [ "$ST_MISS" -gt 0 ]; then
 		echo "$ROW self-test: FAIL ($ST_MISS miss(es))"
@@ -1369,8 +2736,19 @@ self_test() {
 }
 
 # ── Arguments ───────────────────────────────────────────────────────────────────
-usage() { echo "usage: $0 [--plan | --self-test | --verify-twice <run dir A> <run dir B>]   (K3SM_LAB=1 PEER_SSH=<ssh target> EVIDENCE_DIR=<dir> for a rig run)"; }
+usage() { echo "usage: $0 [--plan | --self-test | --verify-twice <run dir A> <run dir B> | --until r<n>]   (K3SM_LAB=1 PEER_SSH=<ssh target> EVIDENCE_DIR=<dir> for a rig run)"; }
+UNTIL="" LADDER_STOPPED=0 N_NOT_RUN=0
 case "${1:-}" in
+--until)
+	[ "$#" = 2 ] || {
+		usage >&2
+		exit 2
+	}
+	UNTIL="$(until_rung "$2")" || {
+		echo "$0: --until: '$2' names no rung (r0 to r9, or the full id)" >&2
+		exit 2
+	}
+	;;
 --plan)
 	[ "$#" = 1 ] || {
 		usage >&2
@@ -1430,6 +2808,10 @@ for v in PEER_SSH EVIDENCE_DIR; do
 	[ -n "${!v:-}" ] || refuse_run preflight "K3SM_LAB=1 but $v is unset (no defaults: the ssh target is the operator's own Mac, and evidence lives outside any repository) (BI10)"
 done
 case "$EVIDENCE_DIR" in /*) ;; *) refuse_run preflight "EVIDENCE_DIR must be an absolute path (BI10)" ;; esac
+REMOTE_SCRATCH="${K3SM_M17_REMOTE_SCRATCH:-}"
+why="$(remote_scratch_problem "$REMOTE_SCRATCH")" || refuse_run preflight "K3SM_M17_REMOTE_SCRATCH $why (BI10)"
+# Where payload scripts land on the peer (hack/spike/m17-interconnect/lib.sh reads it).
+IC_REMOTE_DIR="$(remote_run_dir "$REMOTE_SCRATCH")"
 probe="$EVIDENCE_DIR"
 while [ ! -d "$probe" ]; do probe="$(dirname "$probe")"; done
 git -C "$probe" rev-parse --is-inside-work-tree >/dev/null 2>&1 &&
@@ -1438,11 +2820,18 @@ PAYLOAD_MB="${K3SM_M17_PAYLOAD_MB:-128}"
 [ "$PAYLOAD_MB" -ge 100 ] 2>/dev/null || refuse_run preflight "K3SM_M17_PAYLOAD_MB=$PAYLOAD_MB; the transfer is at least 100 MiB (BI10)"
 LAN_SLACK="${K3SM_M17_LAN_SLACK_BYTES:-8388608}"
 DESIRED_INTERVAL="${K3SM_M17_DESIRED_INTERVAL:-60}"
-CLUSTER_CIDR="${K3SM_M17_CLUSTER_CIDR:-10.42.0.0/16}"
-MLX_MODEL="${K3SM_M17_MLX_MODEL:-mlx-community/Qwen2.5-0.5B-Instruct-4bit}"
+CLUSTER_CIDR="${K3SM_M17_CLUSTER_CIDR:-100.64.0.0/10}"
+why="$(mlx_knob_problem "${K3SM_M17_MLX_MODEL:-}" "${K3SM_M17_MLX_REVISION:-}")" || refuse_run preflight "$why (BI8)"
+MLX_MODEL="${K3SM_M17_MLX_MODEL:-$MLX_DEFAULT_MODEL}"
+MLX_REVISION="${K3SM_M17_MLX_REVISION:-$MLX_DEFAULT_REVISION}"
+MLX_IMAGE="${K3SM_M17_MLX_IMAGE:-$MLX_DEFAULT_IMAGE}"
 MLX_MEMORY="${K3SM_M17_MLX_MEMORY:-4Gi}"
 MLX_READY_TIMEOUT="${K3SM_M17_MLX_READY_TIMEOUT:-1800}"
 REINSTALL_ARGS="${K3SM_M17_REINSTALL_ARGS:-}"
+JOIN_SERVER="${K3SM_M17_JOIN_SERVER:-}"
+FIXTURE_ROOT="${K3SM_M17_FIXTURE_ROOT:-/tmp/k3sm-conformance-bin}"
+why="$(fixture_root_problem "$FIXTURE_ROOT")" || refuse_run preflight "K3SM_M17_FIXTURE_ROOT $why (BI10)"
+FIXTURE_DIR="$FIXTURE_ROOT/${IC_REMOTE_DIR##*/}"
 mkdir -p "$EVIDENCE_DIR" || refuse_run preflight "cannot create $EVIDENCE_DIR (BI10)"
 
 RUN_LOG="$HERE/runs/m17-lab-${K3SM_RC_TAG:-local}-$(date -u +%Y-%m-%d).log"
@@ -1450,6 +2839,7 @@ mkdir -p "$HERE/runs"
 exec > >(tee "$EVIDENCE_DIR/run.log" | tee -a "$RUN_LOG") 2>&1
 emit_run_log_header "FAIL (provisional; the final result line below is the verdict, and a log that ends here did not finish)"
 echo "evidence_dir: $EVIDENCE_DIR"
+echo "peer_run_dir: $IC_REMOTE_DIR"
 echo "knobs: payload ${PAYLOAD_MB} MiB, LAN slack ${LAN_SLACK} B, DesiredInterval ${DESIRED_INTERVAL}s, cluster CIDR $CLUSTER_CIDR, model $MLX_MODEL ($MLX_MEMORY)"
 : >"$EVIDENCE_DIR/rungs.tsv"
 
@@ -1462,7 +2852,7 @@ echo "knobs: payload ${PAYLOAD_MB} MiB, LAN slack ${LAN_SLACK} B, DesiredInterva
 	local_SHA="" peer_SHA="" local_BOOT="" peer_BOOT="" local_OS="" peer_OS=""
 	local_MACS="" peer_MACS="" local_ICIP="" peer_ICIP="" WORKER_NODE=""
 }
-HAVE="" ARMED_BY_RUN=0 FORGED_SIDE="" FORGED_ORIG="" BG_PIDS="" PING_PIDS="" NS_CREATED=0
+FIXTURES_MADE=0 HAVE="" ARMED_BY_RUN=0 FORGED_SIDE="" FORGED_ORIG="" BG_PIDS="" PING_PIDS="" NS_CREATED=0 REMOTE_DIR_MADE=0 R9_DOWNGRADED=""
 N_PASS=0 N_FAIL=0 N_REFUSED=0
 MESH_UTUN="" PEER_UTUN=""
 on_exit() {
@@ -1472,6 +2862,11 @@ on_exit() {
 	for p in $BG_PIDS; do kill "$p" 2>/dev/null; done
 	for p in $PING_PIDS; do sudo -n kill "$p" 2>/dev/null; done
 	[ -n "${RUNG_DIR:-}" ] && touch "$RUNG_DIR/poll.stop" 2>/dev/null
+	# Exit 0 only when every rung passed, and 4 when --until stopped a green ladder;
+	# an interrupted ladder is a FAIL.
+	rc="$(ladder_exit_status "$rc" "$N_PASS" "$N_FAIL" "$N_REFUSED" "$LADDER_STOPPED")"
+	# Before anything below deletes the namespace; no rung ran before HAVE is set.
+	[ "$rc" = 0 ] || [ -z "$HAVE" ] || capture_exit_evidence
 	if [ -n "$FORGED_SIDE" ]; then
 		echo "cleanup: restoring node $(node_of "$FORGED_SIDE")'s desired annotation"
 		if [ -n "$FORGED_ORIG" ]; then
@@ -1485,11 +2880,13 @@ on_exit() {
 		on_local "$K3SM_BIN interconnect disable" 2>&1 | sed 's/^/          /'
 	fi
 	[ "$NS_CREATED" = 1 ] && kc delete namespace "$NS" --wait=false >/dev/null 2>&1
-	# Exit 0 only when every rung passed; an interrupted ladder is a FAIL.
-	if [ "$rc" = 0 ] && { [ "$N_FAIL" -gt 0 ] || [ "$N_REFUSED" -gt 0 ] || [ "$N_PASS" -lt 10 ]; }; then rc=1; fi
-	case "$rc" in 0 | 1 | 2) ;; *) rc=1 ;; esac
+	# Never a reinstall from a trap: say which Macs an interrupted r9 left behind.
+	[ -z "$R9_DOWNGRADED" ] || echo "cleanup: r9 did not finish; these Macs may be on the previous build, so reinstall the artifact under test: $R9_DOWNGRADED"
+	fixtures_remove
+	remote_dir_remove
 	echo "----------------------------------------"
-	echo "$ROW: $N_PASS rung(s) PASS, $N_FAIL FAIL, $N_REFUSED REFUSED (evidence: $EVIDENCE_DIR)"
+	echo "$ROW: $N_PASS rung(s) PASS, $N_FAIL FAIL, $N_REFUSED REFUSED, $N_NOT_RUN NOT-RUN (evidence: $EVIDENCE_DIR)"
+	[ "$rc" != 4 ] || echo "PARTIAL: every rung through $UNTIL passed and --until stopped the ladder there; this is not a pass (exit 4)"
 	if [ "$rc" = 0 ]; then emit_run_log_verdict PASS; else emit_run_log_verdict FAIL; fi
 	exit "$rc"
 }
@@ -1500,14 +2897,14 @@ trap 'exit 130' INT TERM HUP
 BASE_DIR="$EVIDENCE_DIR/baseline"
 RUNG_DIR="$BASE_DIR"
 mkdir -p "$BASE_DIR"
-need() { grep -qw "$1" <<<"$HAVE"; }
 probe_miss() { refuse_run "${2:-probe}" "$(prereq_what "$1")${3:+: $3}"; }
-for t in kubectl ssh scp python3 nc curl; do
+for t in kubectl ssh scp python3 nc curl go codesign; do
 	command -v "$t" >/dev/null 2>&1 || probe_miss tools preflight "the local Mac has no $t on PATH"
 done
 [ -x "$K3SM_BIN" ] || probe_miss tools preflight "no $K3SM_BIN on the local Mac"
 sudo -n true 2>/dev/null || probe_miss tools preflight "sudo on the local Mac needs a password; run sudo -v first"
-on_peer "mkdir -p $IC_REMOTE_DIR && sudo -n true" >/dev/null 2>&1 || probe_miss tools preflight "the peer is unreachable as PEER_SSH or its sudo is not passwordless"
+REMOTE_DIR_MADE=1 # set first: a lost reply after the mkdir must still reach the trap, and the name is this run's own
+remote_dir_make >/dev/null 2>&1 || probe_miss tools preflight "the peer is unreachable as PEER_SSH, its sudo is not passwordless, or K3SM_M17_REMOTE_SCRATCH=$REMOTE_SCRATCH is not a directory its login owns"
 
 for side in local peer; do
 	payload "$side" info 0 K3SM_BIN="$K3SM_BIN" <<'EOF' || true
@@ -1556,13 +2953,10 @@ help="$(on_local "$K3SM_BIN interconnect --help" 2>&1)"
 [[ "$help" == *enable* ]] && [[ "$help" == *disable* ]] || probe_miss verbs preflight
 for side in local peer; do
 	doctor_json "$side"
-	for row in ic-bridge ic-netd ic-peers ic-stray ic-residue; do
-		case "$(icp_doctor_row_state "$BASE_DIR/doctor-$side.json" "$row")" in
-		absent | unreadable) probe_miss doctor preflight "the $side Mac's doctor --json has no $row row" ;;
-		esac
-	done
+	why="$(doctor_mechanism_problem "$BASE_DIR/doctor-$side.json")" || probe_miss doctor preflight "the $side Mac's doctor --json $why"
 	netd_hello "$side"
-	v="$(icp_helper_verdict "$BASE_DIR/netd-hello-$side.json")" || probe_miss netd preflight "the $side Mac's helper answers '$v' (a HelperTooOld is a refusal, never a pass)"
+	icp_helper_verdict "$BASE_DIR/netd-hello-$side.json" >/dev/null || probe_miss netd preflight "$(netd_probe_detail "$side" "$BASE_DIR/netd-hello-$side.json")"
+	echo "      [$side] $(netd_probe_detail "$side" "$BASE_DIR/netd-hello-$side.json")"
 done
 # Node names: by mesh address unless named.
 mesh_node() { kc get meshpeers.net.k3sm.io -o jsonpath='{range .items[*]}{.metadata.name} {.spec.meshIP}{"\n"}{end}' 2>/dev/null | awk -v ip="$1" '$2==ip{print $1; exit}'; }
@@ -1592,43 +2986,18 @@ for side in local peer; do
 done
 PEER_UTUN="$(on_peer "route -n get $local_MESH" | awk '$1=="interface:"{print $2; exit}')"
 MESH_UTUN="$(on_local "route -n get $peer_MESH" | awk '$1=="interface:"{print $2; exit}')"
+# The last preflight step and the only one that writes: nothing has probed red by now.
+FIXTURES_MADE=1 # set here, not in the subshell: a lost reply after the mkdir must still reach the trap, and the name is this run's own
+why="$(fixtures_stage)" || probe_miss tools preflight "the r4 fixtures: $why"
+echo "fixtures: hello-http and conftool in $FIXTURE_DIR on both Macs"
 HAVE="$PREREQ_STATIC"
 FINAL_RC=1
+[ -n "$UNTIL" ] && [ "$UNTIL" != r9-downgrade ] && echo "notice: --until stops the ladder after $UNTIL; the exit trap still disarms and deletes the namespace"
+[ -n "$UNTIL" ] && [ "$UNTIL" != r9-downgrade ] || why="$(r9_problem)" || echo "notice: r9-downgrade will be REFUSED when the ladder reaches it, so this run cannot exit 0: $why"
 echo "baseline: local $local_NODE (index $local_IDX, $local_TB, LAN $local_LAN, macOS $local_OS), peer $peer_NODE (index $peer_IDX, $peer_TB, LAN $peer_LAN, macOS $peer_OS); artifact $local_SHA; worker $WORKER_NODE"
 
 # ── The rungs, in table order ──────────────────────────────────────────────────
-while IFS='|' read -r id summary prereqs fn ev bi; do
-	[ -n "$id" ] || continue
-	RUNG="$id" RUNG_DIR="$EVIDENCE_DIR/${ev%/}" R_PASS=0 R_FAIL=0 R_REFUSED_MSG=""
-	mkdir -p "$RUNG_DIR"
-	printf '\n==> %s (%s): %s\n' "$id" "$bi" "$summary"
-	missing=""
-	for p in ${prereqs//,/ }; do
-		case " $PREREQ_STATIC $PREREQ_RUNTIME " in *" $p "*) need "$p" || missing="$p" ;; esac
-		[ -n "$missing" ] && break
-	done
-	verdict=""
-	if [ -n "$missing" ]; then
-		echo "REFUSED($id): $(prereq_what "$missing")"
-		verdict=REFUSED
-	else
-		rc=0
-		"$fn" </dev/null || rc=$?
-		if [ "$rc" = 2 ] || [ -n "$R_REFUSED_MSG" ]; then
-			echo "REFUSED($id): ${R_REFUSED_MSG:-the assertion refused}"
-			verdict=REFUSED
-		elif [ "$R_FAIL" = 0 ] && [ "$R_PASS" -gt 0 ]; then
-			verdict=PASS
-		else
-			verdict=FAIL
-		fi
-	fi
-	[ "$id" = r0-disarmed ] && [ "$verdict" = PASS ] && HAVE="$HAVE armable"
-	[ "$id" = r1-arm ] && [ "$verdict" = PASS ] && HAVE="$HAVE armed"
-	case "$verdict" in PASS) N_PASS=$((N_PASS + 1)) ;; FAIL) N_FAIL=$((N_FAIL + 1)) ;; REFUSED) N_REFUSED=$((N_REFUSED + 1)) ;; esac
-	printf '%s\t%s\n' "$id" "$verdict" >>"$EVIDENCE_DIR/rungs.tsv"
-	echo "RUNG $id $verdict ($R_PASS passed, $R_FAIL failed)"
-done <<<"$RUNG_TABLE"
+run_rungs
 
 if [ "$N_FAIL" -gt 0 ]; then
 	FINAL_RC=1
