@@ -231,27 +231,27 @@ func TestLatestOffersCandidateOnlyOnRcChannel(t *testing.T) {
 		} {
 			t.Run(tag, func(t *testing.T) {
 				offers(t, listing{pages: [][]map[string]any{{published(tag, 28), published("v0.3.0-rc.1", 10)}}}, "v0.3.0-rc.1")
-				refuses(t, listing{pages: [][]map[string]any{{published(tag, 28)}}}, errNoChannelRelease)
+				refuses(t, listing{pages: [][]map[string]any{{published(tag, 28)}}}, ErrNoChannelRelease)
 			})
 		}
 	})
 	t.Run("a failed list is a named error", func(t *testing.T) {
 		final := published("v0.2.4", 28)
 		t.Run("the first page", func(t *testing.T) {
-			refuses(t, listing{stable: "v0.2.4", failPage: 1, pages: [][]map[string]any{{final}}}, errChannelList)
+			refuses(t, listing{stable: "v0.2.4", failPage: 1, pages: [][]map[string]any{{final}}}, ErrChannelList)
 		})
 		t.Run("a later page, whatever the earlier ones held", func(t *testing.T) {
-			refuses(t, listing{stable: "v0.2.4", failPage: 2, pages: [][]map[string]any{{final}, {final}}}, errChannelList)
+			refuses(t, listing{stable: "v0.2.4", failPage: 2, pages: [][]map[string]any{{final}, {final}}}, ErrChannelList)
 		})
 		t.Run("a Link header it cannot read", func(t *testing.T) {
-			refuses(t, listing{stable: "v0.2.4", link: `<https://index.test/?page=2; rel="next"`, pages: [][]map[string]any{{final}}}, errChannelList)
+			refuses(t, listing{stable: "v0.2.4", link: `<https://index.test/?page=2; rel="next"`, pages: [][]map[string]any{{final}}}, ErrChannelList)
 		})
 		t.Run("the body is not a list", func(t *testing.T) {
 			c := handlerClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				_, _ = w.Write([]byte(`{"message":"API rate limit exceeded"}`))
 			}))
-			if _, err := Latest(context.Background(), Inputs{BaseURL: indexURL + indexPath, HTTP: c, Channel: rc}); !errors.Is(err, errChannelList) {
-				t.Errorf("err = %v, want %v", err, errChannelList)
+			if _, err := Latest(context.Background(), Inputs{BaseURL: indexURL + indexPath, HTTP: c, Channel: rc}); !errors.Is(err, ErrChannelList) {
+				t.Errorf("err = %v, want %v", err, ErrChannelList)
 			}
 		})
 		t.Run("the failure says what failed", func(t *testing.T) {
@@ -262,12 +262,12 @@ func TestLatestOffersCandidateOnlyOnRcChannel(t *testing.T) {
 		})
 	})
 	t.Run("no release on the channel is a named error", func(t *testing.T) {
-		refuses(t, listing{stable: "v0.2.4", pages: [][]map[string]any{{}}}, errNoChannelRelease)
+		refuses(t, listing{stable: "v0.2.4", pages: [][]map[string]any{{}}}, ErrNoChannelRelease)
 	})
 	t.Run("the five-page cap is a named failure", func(t *testing.T) {
 		page := []map[string]any{published("v0.3.0-rc.1", 10)}
 		l := listing{pages: [][]map[string]any{page, page, page, page, page}, more: true}
-		refuses(t, l, errChannelPageCap)
+		refuses(t, l, ErrChannelPageCap)
 		if _, _, _, read := latest(t, rc, l); len(read) != maxListPages || read[0] != 1 || read[maxListPages-1] != maxListPages {
 			t.Errorf("pages read = %v, want 1 through %d", read, maxListPages)
 		}
@@ -285,14 +285,14 @@ func TestLatestOffersCandidateOnlyOnRcChannel(t *testing.T) {
 			}
 			return base.RoundTrip(req)
 		})
-		if _, err := Latest(context.Background(), Inputs{BaseURL: indexURL + indexPath, HTTP: c, Channel: rc}); !errors.Is(err, errChannelPageCap) {
-			t.Errorf("err = %v, want %v", err, errChannelPageCap)
+		if _, err := Latest(context.Background(), Inputs{BaseURL: indexURL + indexPath, HTTP: c, Channel: rc}); !errors.Is(err, ErrChannelPageCap) {
+			t.Errorf("err = %v, want %v", err, ErrChannelPageCap)
 		}
 	})
 	t.Run("an unknown channel is a named failure", func(t *testing.T) {
 		for _, ch := range []updatesv1alpha1.UpdateChannel{"beta", "RC", "Stable", " rc"} {
 			got, err, latestReads, pagesRead := latest(t, ch, listing{stable: "v0.2.4", pages: [][]map[string]any{{published("v0.2.4", 28)}}})
-			if !errors.Is(err, errUnknownChannel) || got != (Release{}) {
+			if !errors.Is(err, ErrUnknownChannel) || got != (Release{}) {
 				t.Errorf("channel %q: Latest = %+v, %v", ch, got, err)
 			}
 			if latestReads != 0 || len(pagesRead) != 0 {

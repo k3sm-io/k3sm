@@ -31,6 +31,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
 
+	updatesv1alpha1 "k3sm.io/apis/updates/v1alpha1"
+
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/version"
 )
@@ -113,6 +115,10 @@ func UntaggedLabel(untaggedOf string) string {
 type UpdateRecord struct {
 	// CheckedAt is when the check ran.
 	CheckedAt time.Time `json:"checkedAt"`
+	// Channel is the release channel the check ran on, so a server sees that the
+	// live channel moved from under its record. Empty means stable: a record from
+	// an older k3sm, or a check that could not read the channel.
+	Channel updatesv1alpha1.UpdateChannel `json:"channel,omitempty"`
 	// Error is why the check could not finish (GitHub unreachable, the node
 	// list refused); empty when it did.
 	Error string `json:"error,omitempty"`
@@ -521,7 +527,9 @@ func UpdateAnnotations(rec UpdateRecord) map[string]string {
 // publishing Node's name, or false when no control-plane Node carries a usable
 // pair. Pure. The annotations are untrusted input like the record on disk:
 // UpdateRowFrom validates what this returns, and a value of the wrong shape is
-// skipped here.
+// skipped here. Channel is the annotation of that same Node, taken as it stands
+// and empty when an older server published none: the two are one pair, so it is
+// never read from another Node, and the reader judges its value.
 func PublishedUpdateRecord(nodes []corev1.Node) (UpdateRecord, string, bool) {
 	var rec UpdateRecord
 	server := ""
@@ -536,6 +544,7 @@ func PublishedUpdateRecord(nodes []corev1.Node) (UpdateRecord, string, bool) {
 		}
 		if server == "" || checked.After(rec.CheckedAt) {
 			rec.CheckedAt, rec.Latest, server = checked, latest, n.Name
+			rec.Channel = updatesv1alpha1.UpdateChannel(n.Annotations[updatesv1alpha1.AnnotationReleaseChannel])
 		}
 	}
 	if server == "" {

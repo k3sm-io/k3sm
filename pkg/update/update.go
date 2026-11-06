@@ -68,6 +68,11 @@ type Inputs struct {
 	// updatesv1alpha1.UpdateChannelStable; a value that is neither fails the
 	// check rather than resolving as either.
 	Channel updatesv1alpha1.UpdateChannel
+	// Published, on the rc channel, is the latest release a server published
+	// with that channel. Check answers from it and lists nothing, so several
+	// Macs behind one address do not spend the release host's unauthenticated
+	// limit; only a server lists. Latest does not read it.
+	Published string
 }
 
 // Release is the latest release as the index describes it.
@@ -94,7 +99,10 @@ type Node struct {
 // Report is the answer of one check. Its JSON is `k3sm update check -o json`.
 type Report struct {
 	CheckedAt time.Time `json:"checkedAt"`
-	Latest    Release   `json:"latest"`
+	// Channel is the release channel Latest was resolved on; empty only when
+	// the channel could not be read.
+	Channel updatesv1alpha1.UpdateChannel `json:"channel,omitempty"`
+	Latest  Release                       `json:"latest"`
 	// Installed is this binary's version, InstalledDirty whether it was built
 	// from a modified tree, and InstalledState how it compares.
 	Installed      string `json:"installed"`
@@ -110,6 +118,7 @@ type Report struct {
 func (r Report) Record(err error) status.UpdateRecord {
 	rec := status.UpdateRecord{
 		CheckedAt:      r.CheckedAt,
+		Channel:        r.Channel,
 		Latest:         r.Latest.Tag,
 		Published:      r.Latest.Published,
 		KubeVersion:    r.Latest.KubeVersion,
@@ -130,12 +139,14 @@ func (r Report) Record(err error) status.UpdateRecord {
 // with it. The error says why a step failed; the report carries what was
 // learned before it.
 func Check(ctx context.Context, in Inputs) (Report, error) {
-	now := time.Now
-	if in.Now != nil {
-		now = in.Now
+	rep := NewReport(in)
+	if checkChannel(in.Channel) == nil {
+		rep.Channel = in.Channel
+		if rep.Channel == "" {
+			rep.Channel = updatesv1alpha1.UpdateChannelStable
+		}
 	}
-	rep := Report{CheckedAt: now().UTC(), Installed: in.Installed.Version, InstalledDirty: in.Installed.Dirty, Nodes: []Node{}}
-	rel, err := Latest(ctx, in)
+	rel, err := checkedRelease(ctx, in)
 	if err != nil {
 		return rep, fmt.Errorf("resolve the latest release: %w", err)
 	}
@@ -154,6 +165,29 @@ func Check(ctx context.Context, in Inputs) (Report, error) {
 	}
 	sort.Slice(rep.Nodes, func(i, j int) bool { return rep.Nodes[i].Name < rep.Nodes[j].Name })
 	return rep, nil
+}
+
+// NewReport is the report of a check that has learned nothing yet: when it ran
+// and what is installed. A check that fails before it reads anything is recorded
+// as this report and its error.
+func NewReport(in Inputs) Report {
+	now := time.Now
+	if in.Now != nil {
+		now = in.Now
+	}
+	return Report{CheckedAt: now().UTC(), Installed: in.Installed.Version, InstalledDirty: in.Installed.Dirty, Nodes: []Node{}}
+}
+
+// checkedRelease is the release a check compares with: the one a server
+// published (Inputs.Published) on the rc channel, else Latest.
+func checkedRelease(ctx context.Context, in Inputs) (Release, error) {
+	if in.Channel != updatesv1alpha1.UpdateChannelRC || in.Published == "" {
+		return Latest(ctx, in)
+	}
+	if !version.CanonicalTag(in.Published) {
+		return Release{}, fmt.Errorf("the published release %q is not a release tag", status.ClipText(in.Published, 128))
+	}
+	return Release{Tag: in.Published}, nil
 }
 
 // Latest resolves the latest release the way install.sh does: the stable
