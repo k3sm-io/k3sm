@@ -144,6 +144,7 @@ pin, its date, and the tarball's sha256.
 
 ### Changed
 
+- The bundled buildx moves from v0.38.0 to v0.38.1, a patch release. The pinned checksums move with it.
 - The cluster registry no longer runs or ships a zot child. It is k3sm's own, served by the `k3sm` binary
   itself, so a release payload and `k3sm payload` carry no `zot` or `zot.version`, and a build from
   source no longer fetches zot's modules. An install still removes a `zot` an earlier release left in

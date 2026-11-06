@@ -40,13 +40,13 @@ import (
 // PROVENANCE. Upstream's checksums.txt covers only the linux and windows assets.
 // The darwin binaries are Developer-ID signed after the checksummed build, so the
 // released bytes match neither that file (which omits them) nor the SLSA
-// provenance subject digest (efe594…, which is the pre-signing artifact). The pin
+// provenance subject digest (efe594… at v0.38.0, which is the pre-signing artifact). The pin
 // below is therefore the sha256 of the RELEASED darwin-arm64 asset itself,
-// recorded 2026-10-10 from
+// recorded 2026-11-06 from
 //
-//	https://github.com/docker/buildx/releases/download/v0.38.0/buildx-v0.38.0.darwin-arm64
+//	https://github.com/docker/buildx/releases/download/v0.38.1/buildx-v0.38.1.darwin-arm64
 //
-// (Mach-O 64-bit arm64, 65462960 bytes, notarized, "Developer ID Application:
+// (Mach-O 64-bit arm64, 65479600 bytes, notarized, "Developer ID Application:
 // Docker Inc (9BNSXJN65R)"; the digest matches the release API's asset digest).
 // The signer is unchanged from v0.37.1, the bump that moved it off v0.17.1's
 // "Tonis Tiigi (F32M533787)".
@@ -62,7 +62,7 @@ const (
 	// HostBuildxAsset is the pinned host buildx asset name (the host is darwin/arm64).
 	HostBuildxAsset = "buildx-" + BuildxVersion + "." + hostBuildxPlatform
 	// HostBuildxSHA256 is the released darwin/arm64 asset's sha256.
-	HostBuildxSHA256 = "85989b895add5f119c1ccf8eada2f6892fc33ccf16bd8917638eae404ef26344"
+	HostBuildxSHA256 = "6f20ba2437865311ef99015bf5d1039c3c8e4d2177c1c64aa41b134b5ecd3012"
 	// HostBuildxTeamID is the Apple Developer Team ID the pinned darwin asset
 	// must be signed by: "Developer ID Application: Docker Inc". It is the ONE
 	// current expected signer, checked at re-pin time by
