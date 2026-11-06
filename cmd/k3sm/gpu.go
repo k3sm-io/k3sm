@@ -19,7 +19,6 @@ package main
 import (
 	"log/slog"
 	"strconv"
-	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -39,10 +38,6 @@ const gpuResourceName = corev1.ResourceName(mlxv1alpha1.ResourceGPU)
 
 // bytesPerGiB converts GPUFacts.mem_bytes to the whole-gibibyte label value.
 const bytesPerGiB = 1 << 30
-
-// maxLabelValueLen is the Kubernetes label-value length limit the chip slug is
-// truncated to (step 4 of the apis chip-slug rule).
-const maxLabelValueLen = 63
 
 // applyGPUAdvertisement advertises — or REMOVES — this node's GPU: the
 // mlx.k3sm.io/gpu extended resource in both Capacity and Allocatable, plus the
@@ -83,8 +78,8 @@ func applyGPUAdvertisement(n *corev1.Node, facts *runtimev1.GPUFacts) {
 	// than their own emptiness checks: a node that is not advertising a GPU must not
 	// carry a chip label either, or a selector on the chip alone would bind a pod to a
 	// node whose GPU was withheld.
-	setLabelValue(n, mlxv1alpha1.LabelChip, gpuLabelValue(present, chipSlug(facts.GetChipBrand())))
-	setLabelValue(n, mlxv1alpha1.LabelChipFamily, gpuLabelValue(present, chipSlug(facts.GetChipFamily())))
+	setLabelValue(n, mlxv1alpha1.LabelChip, gpuLabelValue(present, runtimev1.ChipSlug(facts.GetChipBrand())))
+	setLabelValue(n, mlxv1alpha1.LabelChipFamily, gpuLabelValue(present, runtimev1.ChipSlug(facts.GetChipFamily())))
 	setLabelValue(n, mlxv1alpha1.LabelMemoryGB, gpuLabelValue(present, memoryGiBLabel(facts.GetMemBytes())))
 	if present {
 		slog.Debug("node GPU advertised",
@@ -180,42 +175,6 @@ func setLabelValue(n *corev1.Node, key, value string) {
 		return
 	}
 	labels[key] = value
-}
-
-// chipSlug normalizes a raw GPUFacts chip fact ("Apple M4 Max") into the label-value
-// slug ("apple-m4-max") the mlx.k3sm.io/chip and /chip-family keys carry, implementing
-// the chip-slug rule documented on the apis label constants: lowercase, every run of
-// non-[a-z0-9] to a single "-", trim leading/trailing "-", truncate to 63 and re-trim.
-//
-// The derivation lives HERE, in the single consumer that both holds the raw host facts
-// and advertises the node, exactly as the apis rule prescribes — apis owns the KEY and
-// the value SHAPE, not the transformation. A caller must never compare a label value
-// against a raw chip_brand: the raw fact is not the slug and the comparison silently
-// never matches.
-func chipSlug(raw string) string {
-	var b strings.Builder
-	pendingDash := false
-	for _, r := range strings.ToLower(raw) {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
-			if pendingDash {
-				b.WriteByte('-')
-				pendingDash = false
-			}
-			b.WriteRune(r)
-			continue
-		}
-		// A run of non-alphanumerics collapses to ONE dash, and a dash is only
-		// emitted once an alphanumeric follows it — which trims the leading and
-		// trailing runs without a second pass.
-		if b.Len() > 0 {
-			pendingDash = true
-		}
-	}
-	s := b.String()
-	if len(s) > maxLabelValueLen {
-		s = strings.TrimRight(s[:maxLabelValueLen], "-")
-	}
-	return s
 }
 
 // memoryGiBLabel renders mem_bytes as the whole-gibibyte decimal string the
