@@ -54,6 +54,8 @@ type testFS struct {
 	acl     map[string]bool
 	onClose map[string]func()
 	syncs   []string
+	// events is every flush and rename in order: "sync <path>", "rename <new>".
+	events []string
 	// crashAt makes the nth WriteFileAtomic or Rename (1-based) fail
 	// before it happens; 0 never fails.
 	crashAt int
@@ -72,6 +74,7 @@ func newTestFS(t *testing.T) *testFS {
 	f.OSFS = &OSFS{FullSync: func(file *os.File) error {
 		f.mu.Lock()
 		f.syncs = append(f.syncs, file.Name())
+		f.events = append(f.events, "sync "+file.Name())
 		f.mu.Unlock()
 		return nil
 	}}
@@ -153,13 +156,27 @@ func (f *testFS) WriteFileAtomic(path string, data []byte, mode fs.FileMode) err
 	if err := f.step(); err != nil {
 		return err
 	}
+	f.mu.Lock()
+	f.events = append(f.events, "write "+path)
+	f.mu.Unlock()
 	return f.OSFS.WriteFileAtomic(path, data, mode)
+}
+
+// Unlink records the removal, so a marker removal shows in events too.
+func (f *testFS) Unlink(path string) error {
+	f.mu.Lock()
+	f.events = append(f.events, "unlink "+path)
+	f.mu.Unlock()
+	return f.OSFS.Unlink(path)
 }
 
 func (f *testFS) Rename(oldpath, newpath string) error {
 	if err := f.step(); err != nil {
 		return err
 	}
+	f.mu.Lock()
+	f.events = append(f.events, "rename "+newpath)
+	f.mu.Unlock()
 	return f.OSFS.Rename(oldpath, newpath)
 }
 
