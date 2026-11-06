@@ -19,6 +19,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 )
 
@@ -40,6 +41,9 @@ func rootKubectlChoice(in kubectlInputs, args []string) (kubectlConfig, []string
 	path, rest, err := splitNamedKubeconfig(args)
 	if err != nil {
 		return kubectlConfig{}, nil, err
+	}
+	if verb := configWriteVerb(rest); verb != "" {
+		return kubectlConfig{}, nil, fmt.Errorf("kubectl config %s changes nothing as root: kubectl reads a private copy of the checked kubeconfig, not the file; run `k3sm kubectl config %s ...` without sudo to edit your own kubeconfig", verb, verb)
 	}
 	if path == "" {
 		cfg, err := kubectlVerbConfig("k3sm kubectl", in)
@@ -111,6 +115,57 @@ scan:
 		return "", nil, fmt.Errorf("--kubeconfig %q is a list of files, and root checks one file, refused; %s", path, namedKubeconfigRemedy)
 	}
 	return path, rest, nil
+}
+
+// kubectlConfigWriteVerbs are the `kubectl config` verbs that edit a kubeconfig.
+var kubectlConfigWriteVerbs = []string{
+	"delete-cluster", "delete-context", "delete-user", "rename-context", "set", "set-cluster",
+	"set-context", "set-credentials", "unset", "use", "use-context",
+}
+
+// configWriteVerb returns the `kubectl config` verb args run if it is one that edits
+// a kubeconfig, or "". Asking for its help edits nothing. kubectl alone knows which
+// flags take a value, so a misreading here either refuses a command that could not
+// run or leaves kubectl to report the verb itself; neither changes a file.
+func configWriteVerb(args []string) string {
+	i := commandWord(args, func(a string) bool { return a == "config" })
+	if i < 0 {
+		return ""
+	}
+	sub := args[i+1:]
+	j := commandWord(sub, func(a string) bool { return slices.Contains(kubectlConfigWriteVerbs, a) })
+	if j < 0 {
+		return ""
+	}
+	for _, a := range sub {
+		switch a {
+		case "--":
+			return sub[j]
+		case "-h", "--help":
+			return ""
+		}
+	}
+	return sub[j]
+}
+
+// commandWord returns the index of the first word in args that want accepts, while
+// everything before it is a flag or may be a flag's value, or -1.
+func commandWord(args []string, want func(string) bool) int {
+	for i, a := range args {
+		switch {
+		case a == "--":
+			return -1
+		case strings.HasPrefix(a, "-") && a != "-":
+			continue
+		case want(a):
+			return i
+		case i > 0 && flagMayTakeNext(args[i-1]):
+			continue
+		default:
+			return -1
+		}
+	}
+	return -1
 }
 
 // flagMayTakeNext reports whether a is a flag that may take the next argument as

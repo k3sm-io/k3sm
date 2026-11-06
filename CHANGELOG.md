@@ -252,6 +252,9 @@ pin, its date, and the tarball's sha256.
   certificate or CA path, no `proxy-url`. kubectl gets the checked context, not the path. The file keeps its own
   CA, so it may name another cluster. `--kubeconfig` given twice, a path list, `-` and `--kuberc` are refused. To
   use such a file as it stands, run `kubectl` directly without sudo.
+- `sudo k3sm kubectl config set-context`, `use-context` and the other `kubectl config` verbs that edit a kubeconfig
+  now say they change nothing as root and to run them without sudo, in place of an error about a `/dev/fd` lock
+  file. `config view`, `current-context`, `get-contexts`, `get-clusters` and `get-users` keep working.
 - A worker's root helper, `sudo k3sm kubectl` and the other root verbs on a worker, and `k3sm stop` and `k3sm start`
   there, verify the apiserver's certificate against the kubernetes Service address, `10.43.0.1`, which
   every apiserver certificate carries and no other certificate of the cluster does. They still connect to the
