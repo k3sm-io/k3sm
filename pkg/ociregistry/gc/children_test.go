@@ -56,8 +56,9 @@ func (e *env) keeper(t *testing.T, n ref.Name) image {
 // a blob that was never pushed as a manifest. Anyone who can push can do this,
 // and a child need not exist at PUT, so the blob can arrive after the index and
 // the descriptor can claim any media type. The child has no row and verifies, so
-// the sweep keeps the blob and goes on. A child too large to verify is the plan
-// failure TestUnreadableChildNeverReleasesWhatItNames pins.
+// the sweep keeps the blob and goes on. A child that fails its hash is the plan
+// failure TestUnreadableChildNeverReleasesWhatItNames pins; one over the size cap
+// is TestIndexChildOverTheCapDoesNotStopTheSweep's.
 func TestIndexChildThatIsNoManifestDoesNotStopTheSweep(t *testing.T) {
 	for _, tc := range []struct {
 		name, mediaType string
@@ -199,10 +200,11 @@ func rawDesc(d digest.Digest) string {
 }
 
 // TestUnreadableChildNeverReleasesWhatItNames names, as an index's child with
-// no row, a body the strict read refuses. A body that is too large or does not
-// hash to its name may be anything, so the plan fails. Any other is kept along
-// with every digest its JSON holds, so a real manifest's blobs survive, and a
-// blob pushed as a child does not stop the sweep.
+// no row, a body the strict read refuses. A body that does not hash to its name
+// may be anything, so the plan fails. One over the size cap is no manifest the
+// server would store, so it is kept as a blob and not read. Any other is kept
+// along with every digest its JSON holds, so a real manifest's blobs survive, and
+// a blob pushed as a child does not stop the sweep.
 func TestUnreadableChildNeverReleasesWhatItNames(t *testing.T) {
 	const mt = `"mediaType":"` + ispec.MediaTypeImageManifest + `"`
 	for _, tc := range []struct {
@@ -224,12 +226,12 @@ func TestUnreadableChildNeverReleasesWhatItNames(t *testing.T) {
 			wantFail: true,
 		},
 		{
-			name: "oversized fails the plan",
+			// The config it names is not read, so it is not kept.
+			name: "oversized is a blob and does not stop the sweep",
 			body: func(t *testing.T, e *env, n ref.Name) ([]byte, []digest.Digest) {
 				cfg := e.blob(t, n, []byte(`{"seed":"cfg"}`))
-				return append(manifestBody(t, cfg, nil, nil), bytes.Repeat([]byte(" "), store.MaxManifestSize+1)...), []digest.Digest{cfg.Digest}
+				return append(manifestBody(t, cfg, nil, nil), bytes.Repeat([]byte(" "), store.MaxManifestSize+1)...), nil
 			},
-			wantFail: true,
 		},
 		{
 			name: "a duplicate config whose last value is null keeps both and the layers",
@@ -451,7 +453,7 @@ func TestScanFoundManifestIsFollowed(t *testing.T) {
 	})
 
 	// A digest named many times in a body, or in several, is read once, and one
-	// the store does not hold is not read at all.
+	// the store does not hold, or holds over the size cap, is not read at all.
 	t.Run("only a stored body is read, and once", func(t *testing.T) {
 		e := newEnv(t)
 		n := name(t, "app")
@@ -474,7 +476,10 @@ func TestScanFoundManifestIsFollowed(t *testing.T) {
 		if read[absent] != 0 {
 			t.Errorf("read %s, which the store does not hold", absent)
 		}
-		for _, d := range []digest.Digest{root.Digest, inner.Digest, m.Digest, big.Digest} {
+		if read[big.Digest] != 0 {
+			t.Errorf("read %s, which is over the size cap", big.Digest)
+		}
+		for _, d := range []digest.Digest{root.Digest, inner.Digest, m.Digest} {
 			if read[d] != 1 {
 				t.Errorf("%s was read %d times, want once", d, read[d])
 			}
@@ -512,10 +517,10 @@ func TestScanFoundManifestIsFollowed(t *testing.T) {
 		}
 	})
 
-	// What the scan finds is not what a readable index names: the same oversized
-	// digest reached both ways fails the plan, whichever is walked first. The row
-	// order decides that, and a pusher chooses the row order.
-	t.Run("an oversized child of a readable index fails the plan though the scan found it first", func(t *testing.T) {
+	// An oversized digest is a blob however the walk reaches it, by the scan or by
+	// a readable index, and whichever is walked first. The row order decides that,
+	// and a pusher chooses the row order.
+	t.Run("an oversized child stops nothing whichever way the walk reaches it first", func(t *testing.T) {
 		for _, scanFirst := range []bool{true, false} {
 			e := newEnv(t)
 			n := name(t, "app")
@@ -539,18 +544,21 @@ func TestScanFoundManifestIsFollowed(t *testing.T) {
 			e.clk.set(0)
 
 			rep, err := c.Sweep(e.ctx)
-			if !errors.Is(err, ErrUnreadable) || !slices.Equal(rep.Failed, []string{"app"}) {
-				t.Fatalf("scanFirst=%v: sweep: %+v, %v; want ErrUnreadable for app", scanFirst, rep, err)
+			if err != nil || len(rep.Failed) != 0 {
+				t.Fatalf("scanFirst=%v: sweep: %+v, %v; want no failure", scanFirst, rep, err)
 			}
-			if !e.has(n, orphan.Digest) {
-				t.Errorf("scanFirst=%v: a sweep that failed its plan reaped the orphan", scanFirst)
+			if e.has(n, orphan.Digest) {
+				t.Errorf("scanFirst=%v: the orphan survived", scanFirst)
+			}
+			if !e.has(n, big.Digest) {
+				t.Errorf("scanFirst=%v: the oversized blob was reaped", scanFirst)
 			}
 		}
 	})
 
 	// A readable index the scan finds is followed as any index is, so its oversized
-	// child fails the plan as a kept index's would.
-	t.Run("a scan-found index naming an oversized child fails the plan", func(t *testing.T) {
+	// child is kept as a blob as a kept index's would be.
+	t.Run("a scan-found index naming an oversized child keeps it", func(t *testing.T) {
 		e := newEnv(t)
 		n := name(t, "app")
 		e.clk.set(-2 * time.Hour)
@@ -565,8 +573,11 @@ func TestScanFoundManifestIsFollowed(t *testing.T) {
 		e.ran(t)
 		e.clk.set(0)
 
-		if _, err := c.Sweep(e.ctx); !errors.Is(err, ErrUnreadable) {
-			t.Fatalf("sweep: %v; want ErrUnreadable", err)
+		if _, err := c.Sweep(e.ctx); err != nil {
+			t.Fatalf("sweep: %v; want no failure", err)
+		}
+		if !e.has(n, big.Digest) {
+			t.Error("the oversized child was reaped")
 		}
 	})
 }
@@ -752,6 +763,68 @@ func TestReviewedRepositoryStaysReviewedAfterAFailure(t *testing.T) {
 			}
 			if !e.has(fresh, freshOrphan) {
 				t.Error("the unreviewed repository deleted before its review")
+			}
+		})
+	}
+}
+
+// TestIndexChildOverTheCapDoesNotStopTheSweep names, as an index's child with no
+// row, a real layer over the manifest size cap. No manifest this registry stores
+// or serves is that large, so the blob is kept as a blob, not read, and the sweep
+// goes on whatever media type the descriptor claims: a pusher cannot stop its
+// repository's sweeps that way. A child over the cap that has a row was stored as
+// a manifest and still fails the plan.
+func TestIndexChildOverTheCapDoesNotStopTheSweep(t *testing.T) {
+	for _, tc := range []struct {
+		name, mediaType string
+		row, wantFail   bool
+	}{
+		{name: "a layer media type", mediaType: ispec.MediaTypeImageLayerGzip},
+		{name: "a manifest media type", mediaType: ispec.MediaTypeImageManifest},
+		{name: "a row stays fail-closed", mediaType: ispec.MediaTypeImageManifest, row: true, wantFail: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			n := name(t, "app")
+			e.clk.set(-2 * time.Hour)
+			e.keeper(t, n)
+			body := bytes.Repeat([]byte("L"), store.MaxManifestSize+1)
+			var child ispec.Descriptor
+			if tc.row {
+				child = e.putManifest(t, n, "", tc.mediaType, body)
+			} else {
+				child = e.blob(t, n, body)
+			}
+			child.MediaType = tc.mediaType
+			idx := e.putManifest(t, n, "idx", ispec.MediaTypeImageIndex, indexBody(t, child))
+			orphan := e.blob(t, n, []byte("orphan"))
+			c := e.collector(t, -3*time.Hour)
+			e.ran(t)
+			e.clk.set(0)
+			read := map[digest.Digest]int{}
+			c.onRead = func(_ ref.Name, d digest.Digest) { read[d]++ }
+
+			rep, err := c.Sweep(e.ctx)
+			if tc.wantFail {
+				if !errors.Is(err, ErrUnreadable) || !slices.Equal(rep.Failed, []string{"app"}) {
+					t.Fatalf("sweep: %+v, %v; want ErrUnreadable for app", rep, err)
+				}
+				if !e.has(n, orphan.Digest) {
+					t.Error("a sweep that failed its plan reaped the orphan")
+				}
+				return
+			}
+			if err != nil || len(rep.Failed) != 0 {
+				t.Fatalf("sweep: %+v, %v; want no failure", rep, err)
+			}
+			if e.has(n, orphan.Digest) {
+				t.Error("the orphan survived")
+			}
+			if !e.has(n, child.Digest) || !e.has(n, idx.Digest) {
+				t.Error("the sweep reaped the index or the layer it names")
+			}
+			if read[child.Digest] != 0 {
+				t.Errorf("read the layer %d times; a blob over the cap is not a manifest to read", read[child.Digest])
 			}
 		})
 	}

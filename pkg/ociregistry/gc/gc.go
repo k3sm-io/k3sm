@@ -1035,9 +1035,16 @@ func parseBody(b []byte) (refs, error) {
 // name: only a body already in the store is read. A body that reads as a manifest
 // is followed as any manifest is, so its references are kept, and a readable index
 // found this way holds its own children to the rule below. A body the strict read
-// refuses is scanned the same way. A body too large or failing its hash is
-// referenced only: it follows nothing and does not fail the plan, since a layer is
-// usually too large and a pusher can name anything in a body.
+// refuses is scanned the same way. A body failing its hash is referenced only: it
+// follows nothing and does not fail the plan, since a pusher can name anything in
+// a body.
+//
+// A blob with no row over the size cap is no manifest: the server refuses one that
+// large at PUT and serves none, so it is a layer or other blob, whatever the
+// descriptor naming it claims, and whichever way the walk reached it. It is kept
+// and not read, so a pusher who names a real layer as an index's child does not
+// stop the sweep. Each pass decides it from its own contents: a blob the mark left
+// unread that the locked pass finds within the cap is errStale.
 //
 // The kept set bounds this. A body is followed once however often it is named, so
 // a cycle ends at its second visit, and a fan-out reads each blob at most once: a
@@ -1047,15 +1054,17 @@ func parseBody(b []byte) (refs, error) {
 // repository at most maxPlans times. The locked pass reads nothing, and a digest
 // it finds in the contents that the mark did not read is errStale.
 //
-// A child with no row that is too large or fails its hash fails the plan when a
-// readable body names it, since its bytes cannot be told from a manifest damaged
+// A child with no row within the size cap that fails its hash fails the plan when
+// a readable body names it, since its bytes cannot be told from a manifest damaged
 // in the store. That holds whichever way the walk reached the digest first. So
-// does a child with a row that is unreadable. A body with no row that does read is
+// does a child with a row that is unreadable, one over the cap included. A body with no row that does read is
 // followed. A child digest that is not a digest is skipped: no blob can have it.
 func makePlan(idx ispec.Index, cont store.Contents, cutoff time.Time, refsOf func(digest.Digest) (refs, error)) (plan, error) {
 	mtime := make(map[digest.Digest]time.Time, len(cont.Blobs))
+	size := make(map[digest.Digest]int64, len(cont.Blobs))
 	for _, b := range cont.Blobs {
 		mtime[b.Digest] = b.ModTime
+		size[b.Digest] = b.Size
 	}
 	old := func(t time.Time) bool { return !t.After(cutoff) }
 
@@ -1124,6 +1133,10 @@ func makePlan(idx ispec.Index, cont store.Contents, cutoff time.Time, refsOf fun
 				continue
 			}
 			referenced[it.d] = true
+			if !hasRow[it.d] && size[it.d] > store.MaxManifestSize {
+				kept[it.d] = true
+				continue
+			}
 			m, err := refsOf(it.d)
 			// Left unvisited: the same digest named by a readable body must still
 			// fail the plan, and which of the two is walked first is the row order's

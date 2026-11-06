@@ -210,6 +210,10 @@ pin, its date, and the tarball's sha256.
   keeps its blobs as before. When a tag moves, the old image's signatures are reaped with it after the grace,
   and a referrer pushed before its subject, as when an image is signed and then copied, is protected only by
   the grace period: push the subject within it.
+- A registry image index that names a layer, or any blob over 4 MiB, as one of its manifests no longer stops
+  garbage collection of its repository until the index is deleted. A blob that large is no manifest the
+  registry stores or serves, so collection keeps it as a blob without reading it, whatever media type the
+  index gives it. A manifest over 4 MiB that the repository's index holds a row for still stops the sweep.
 - Blobs pushed to a registry repository without any manifest naming them no longer stop its garbage
   collection while a tag stays. Enough of them beside a tagged image used to trip the brake that stops a
   sweep deleting more than half of a repository's blobs, on every sweep. While a repository keeps a

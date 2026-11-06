@@ -92,10 +92,13 @@ limitations under the License.
 // list, such as a Docker schema1 manifest or any body with a schema1 fsLayers
 // field) stops that repository's sweep: it never deletes on a guess. The server
 // refuses at PUT whatever Readable refuses, so a pusher cannot store such a row.
-// A blob an index names as a child, with no row, stops the sweep too when it is
-// over the size cap or fails its hash. If it verifies but the strict read refuses
-// it, it does not stop the sweep: it may be a blob or an older manifest, so it is
-// kept along with every digest its JSON holds, and those digests are followed
-// through whatever bodies the store has for them (see makePlan). One of those over
-// the size cap or failing its hash is kept and stops nothing.
+// A blob an index names as a child, with no row, stops the sweep too when it
+// fails its hash. One over the size cap is no manifest, since the server neither
+// stores nor serves one that large, so it is kept as a blob, not read, and stops
+// nothing, whatever media type the index gives it. If it verifies but the strict
+// read refuses it, it does not stop the sweep: it may be a blob or an older
+// manifest, so it is kept along with every digest its JSON holds, and those
+// digests are followed through whatever bodies the store has for them (see
+// makePlan). One of those over the size cap or failing its hash is kept and stops
+// nothing.
 package gc
