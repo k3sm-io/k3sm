@@ -274,23 +274,26 @@ rootless pod expecting an absolute mount path sees the unmounted host path inste
 ladder that depends on absolute volume mounts (e.g. the MLX acceptance gate's cache PVC) is a
 root-tier run. Rootless stops at mount resolution.
 
-### `hostPath` Volumes Are Silently Dropped, Not Refused
+### Unsupported Volume Kinds Are Refused When Mounted
 
-`hostPath` is **not modeled on any runtime path**, native or `vm`, and a Pod that declares one is
-**not** rejected. `toVolume`
-([`pkg/provider/translate.go`](https://github.com/k3sm-io/k3sm/blob/main/pkg/provider/translate.go))
-carries no `hostPath` case, so the source falls through its `default` and the volume is skipped.
-Admission does not stop it either. k3sm ships PodSecurity `enforce = privileged`, so a `hostPath` Pod
-is *admitted* with a PSA **warning**, not a rejection. What you see next depends only on whether a
-container mounts it.
+`hostPath` is **not modeled on any runtime path**, native or `vm`. Neither are `nfs`, `csi`, generic
+`ephemeral` volumes, `gitRepo` or the other in-tree network and cloud-disk kinds. A native Pod is a
+Darwin process with no mount namespace, so k3sm has nothing to bind such a volume into. Admission
+does not stop these Pods: k3sm ships PodSecurity `enforce = privileged`, so a `hostPath` Pod is
+*admitted* with only a PSA **warning**. What happens next depends only on whether a container mounts
+the volume.
 
-- If a container mounts it, the Pod fails with `volume_mount %q references undefined volume`, naming
-  the **mount** and never the missing `hostPath` source, so the error does not point at the cause.
-- If nothing mounts it, the Pod runs to completion with **no error and no warning at all**. Nothing
-  anywhere reports that the host path was ignored.
+- If a container mounts it, the Pod is **refused at creation**. A Warning Event with reason
+  `FailedVolumeSource` names the volume and its kind, and the Pod never starts.
+- If nothing mounts it, the volume is ignored and the Pod runs as if it were not declared. No Event
+  reports it, because nothing in the Pod can reach the volume.
 
-Treat a `hostPath` in a manifest as "will not be there", and use a PVC instead. An outright refusal at
-admission or translation time, and an allowlisted exception after it, are follow-ups.
+Use a PVC instead of a `hostPath`.
+
+An `image` volume is supported, and its reference must name the cluster registry
+(`registry-k3sm:6450/<repository>`). A mounted `image` volume that names any other registry is
+refused at creation with a Warning Event whose reason is `ArtifactPullRefused`, so a Pod cannot make
+the node fetch from a host of its choosing.
 
 ### `emptyDir` with `medium: Memory` Is Refused, Not Silently Disk-Backed
 
