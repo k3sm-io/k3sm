@@ -1146,5 +1146,3 @@ between Macs. It is alpha and off until an admin arms it.
 MLX and Apple-GPU workloads (the `MLXModel` CRD and the `mlx.k3sm.io/gpu` extended resource) have
 their own page; see [MLX quickstart](mlx-quickstart.md). They are not covered by these general
 user pages, and nothing here should be read as describing GPU behavior.
-
-While both `mlx.k3sm.io/gpu` and `k3sm.io/gpu` are advertised, the scheduler counts them separately and can bind up to twice a node's GPU slots. The provider refuses the extras with a `FailedGPUFit` Event; they report `ProviderFailed` and are retried on a back-off until another GPU pod ends (a pod with `restartPolicy: Never` stays `Failed`).
