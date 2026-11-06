@@ -228,6 +228,8 @@ pin, its date, and the tarball's sha256.
 - A rollback of `sudo k3sm install` no longer leaves `~/.kube/config` getting `Unauthorized`. It puts the
   previous admin token back, so every copy of the kubeconfig keeps working, or, when it cannot, writes the
   kubeconfig with the new token and says to copy it again.
+- netd's warning for a kubeconfig whose credentials are not inline says what to do about that, not about a
+  role change.
 - As root, `k3sm kubectl`, `k3sm interconnect` and the builder verbs use only inline credentials and no
   longer read `$HOME`: root takes the work dir's admin kubeconfig, then `$KUBECONFIG` or
   `interconnect --kubeconfig` when the file is owned by root or by the person who ran sudo, then that

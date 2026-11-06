@@ -457,6 +457,20 @@ func (e kubeconfigUnusableError) Unwrap() error { return e.err }
 // still names the previous role's credential, and only an install rewrites it.
 const authorizerRoleRemedy = "if this Mac changed role, netd still holds the previous role's credential: run `sudo k3sm uninstall`, then `sudo k3sm install` for the role this Mac should have"
 
+// authorizerInlineRemedy is the remedy named beside a kubeconfig refused for
+// credentials that are not inline. netd retries, so a corrected file is picked up
+// without a restart.
+const authorizerInlineRemedy = "give every user and cluster in the file inline credentials (token, client-certificate-data, client-key-data, certificate-authority-data), or restore the file k3sm wrote: on a server `sudo k3sm restart` writes it again; on a worker run `sudo k3sm uninstall`, then `sudo k3sm install` with its join arguments"
+
+// authorizerRemedy picks the remedy for a failure authorizerFailureReason
+// classified as worth a WARN.
+func authorizerRemedy(err error) string {
+	if errors.Is(err, kubeclient.ErrCredentialsNotInline) {
+		return authorizerInlineRemedy
+	}
+	return authorizerRoleRemedy
+}
+
 // missingKubeconfigWarnAfter is how many CONSECUTIVE failed attempts may find
 // the kubeconfig absent before that absence is logged at WARN. netd is started
 // before the server writes the kubeconfig, so a missing file is the normal
@@ -560,7 +574,7 @@ func (l *authorizerFailureLog) note(logger *slog.Logger, kubeconfig string, err 
 	if msg != l.lastWarned || l.sinceWarn >= authorizerRewarnEvery {
 		l.lastWarned, l.sinceWarn = msg, 0
 		logger.Warn("Service authorizer cannot start; <1024 binds stay denied until it does",
-			"kubeconfig", kubeconfig, "reason", reason, "remedy", authorizerRoleRemedy)
+			"kubeconfig", kubeconfig, "reason", reason, "remedy", authorizerRemedy(err))
 		return
 	}
 	logger.Debug("Service authorizer still cannot start", "kubeconfig", kubeconfig, "reason", reason)

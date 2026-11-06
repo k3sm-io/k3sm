@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -122,6 +123,23 @@ func TestStartServiceInformerAcceptsOnlyInlineCredentials(t *testing.T) {
 	}
 	if !strings.Contains(h.text.String(), "netd accepts only inline credentials") {
 		t.Errorf("log does not name the reason:\n%s", h.text.String())
+	}
+	if !strings.Contains(h.text.String(), "give every user and cluster in the file inline credentials") || !strings.Contains(h.text.String(), "sudo k3sm restart") {
+		t.Errorf("log does not say what to do:\n%s", h.text.String())
+	}
+	if strings.Contains(h.text.String(), "changed role") {
+		t.Errorf("log names a role change:\n%s", h.text.String())
+	}
+}
+
+// TestAuthorizerRemedyKeepsTheRoleRemedyForOtherFailures pins the split: only a
+// refusal for credentials that are not inline changes what the WARN says to do.
+func TestAuthorizerRemedyKeepsTheRoleRemedyForOtherFailures(t *testing.T) {
+	if got := authorizerRemedy(errors.New("parse failure")); got != authorizerRoleRemedy {
+		t.Errorf("remedy = %q, want the role remedy", got)
+	}
+	if got := authorizerRemedy(fmt.Errorf("load: %w", kubeclient.ErrCredentialsNotInline)); got != authorizerInlineRemedy {
+		t.Errorf("remedy = %q, want the inline remedy", got)
 	}
 }
 
