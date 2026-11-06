@@ -60,6 +60,11 @@ var errChannelUnsupported = errors.New("this server does not support update chan
 // by seconds, so a server that has none by then is an older one.
 const channelCRDWait = 15 * time.Second
 
+// exitChannelCheckFailed is `k3sm update channel <value>` when the write took and
+// the check after it failed: the channel is set and nothing has verified it. It is
+// not exitInternalError, which is a write that did not happen.
+const exitChannelCheckFailed = 3
+
 // channelReading is what a channelSource found.
 type channelReading struct {
 	// channel is the channel to resolve on, stable or rc.
@@ -314,9 +319,10 @@ func showUpdateChannel(ctx context.Context, env updateEnv) int {
 	return 0
 }
 
-// setUpdateChannel writes value, then runs a check on it. The write is what the
-// verb was asked for, so a check that fails after it, as one with no route to the
-// release host does, is a note and not a failed verb.
+// setUpdateChannel writes value, then runs a check on it. A check that fails after
+// the write, as one with no route to the release host does, exits with its own code
+// and says both: a script must not take the channel for verified, and must not take
+// a write that happened for one that was refused.
 func setUpdateChannel(ctx context.Context, value string, env updateEnv) int {
 	channel := updatesv1alpha1.UpdateChannel(value)
 	if channel != updatesv1alpha1.UpdateChannelStable && channel != updatesv1alpha1.UpdateChannelRC {
@@ -346,7 +352,8 @@ func setUpdateChannel(ctx context.Context, value string, env updateEnv) int {
 	}
 	fmt.Fprintln(env.out)
 	if code := runUpdateCheck(ctx, nil, env); code != 0 {
-		fmt.Fprintf(env.errOut, "k3sm update channel: the channel is set to %s, but the check after it failed; run `k3sm update check` again\n", channel)
+		fmt.Fprintf(env.errOut, "k3sm update channel: the write is done and the channel is %s, but the check failed; run `k3sm update check` again\n", channel)
+		return exitChannelCheckFailed
 	}
 	return 0
 }

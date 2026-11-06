@@ -122,7 +122,8 @@ channel also work with no reachable cluster: check then compares this Mac's
 k3sm alone with the latest release, and channel prints stable.
 
 Exit codes: 0 done, 1 it could not be done (the error says why), 2 usage, or
-apply without --yes on a stdin that is not a terminal.
+apply without --yes on a stdin that is not a terminal, 3 channel set the channel
+but the check after it failed.
 `
 
 // updateEnv is everything `k3sm update` reads and writes, injected so the verb

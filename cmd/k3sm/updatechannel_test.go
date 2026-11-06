@@ -1085,15 +1085,27 @@ func TestUpdateChannelVerb(t *testing.T) {
 		}
 	})
 
-	t.Run("a check that fails after the write keeps it and says so", func(t *testing.T) {
+	t.Run("a refused write and a check that fails after a write exit apart", func(t *testing.T) {
+		refused := newUpdateCluster()
+		refused.policyVerbAnswers("patch", -1, apierrors.NewForbidden(gr, updatesv1alpha1.UpdatePolicyName, errors.New("no rule")))
+		code, out, errOut := refused.run(t, "channel", "rc")
+		if code != 1 || strings.Contains(out, "now rc") || strings.Contains(errOut, "is done") {
+			t.Errorf("refused: exit %d, out %q, stderr %q", code, out, errOut)
+		}
+
 		c := newUpdateCluster()
 		x := &channelIndex{stable: "v0.2.3", listFails: true}
-		code, out, errOut := c.runWith(t, func(env *updateEnv) { env.inputs.HTTP = x.client() }, "channel", "rc")
-		if code != 0 || !strings.Contains(out, "now rc") || c.policyChannel(t) != "rc" {
-			t.Errorf("exit %d, out %q, stored %q", code, out, c.policyChannel(t))
+		code, out, errOut = c.runWith(t, func(env *updateEnv) { env.inputs.HTTP = x.client() }, "channel", "rc")
+		if code != exitChannelCheckFailed || exitChannelCheckFailed == 1 || exitChannelCheckFailed == exitUsage {
+			t.Errorf("check failed: exit %d", code)
 		}
-		if !strings.Contains(errOut, "the channel is set to rc") || x.lists.Load() == 0 {
-			t.Errorf("stderr %q, %d listings", errOut, x.lists.Load())
+		if !strings.Contains(out, "now rc") || c.policyChannel(t) != "rc" || x.lists.Load() == 0 {
+			t.Errorf("out %q, stored %q, %d listings", out, c.policyChannel(t), x.lists.Load())
+		}
+		for _, want := range []string{"the write is done", "the check failed"} {
+			if !strings.Contains(errOut, want) {
+				t.Errorf("stderr %q does not say %q", errOut, want)
+			}
 		}
 	})
 
