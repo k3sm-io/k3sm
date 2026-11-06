@@ -11,6 +11,14 @@ TestChildCommand added new with the child switch
 TestClassify rewritten the gate reads names through the shared validator
 TestCloseInheritedDescriptors added new with the child switch
 TestClusterEndpointAddress kept the relay and cluster publication do not touch the child
+TestConvergeLoopHoldsItsRotation added new with the dedupe loop
+TestConvergeLoopNeverBesideASweep added new with the dedupe loop
+TestConvergeLoopReadsFreeSpaceEvery30Seconds added new with the dedupe loop
+TestConvergeLoopReadsTheMarker added new with the dedupe loop
+TestConvergeLoopReportsItsPass added new with the dedupe loop
+TestConvergeLoopRunsWhenIdle added new with the dedupe loop
+TestConvergeLoopSchedule added new with the dedupe loop
+TestConvergeLoopStopsForAnUpload added new with the dedupe loop
 TestCredentialMatchesRegistry kept the relay and cluster publication do not touch the child
 TestCredentialWithoutAddressMatchesNothing kept the credential files are unchanged
 TestDeleteManifestRefusesNoState kept prune works on the store, which is unchanged
@@ -81,6 +89,7 @@ TestRestartRebindsTheIngestPort rewritten reclaim now runs the same cases over t
 TestServeAuthorizesAndReports added new with the child switch
 TestServeConfig rewritten renderServeConfig takes the server settings; the principal assertions are unchanged
 TestServeConfigServerFields added new with the child switch
+TestServeConvergeCadence added new with the dedupe loop
 TestServeDropsRootBeforeTheStoreOpens added new with the child switch
 TestServeExitsWhenItsParentDies added new with the child switch
 TestServeGCCadence added the cadence the zot config set, pinned on the server
@@ -104,9 +113,11 @@ TestStartRefusesARootDaemon added new with the child switch
 TestStateUpdatesDoNotLoseWrites added new with the child switch
 TestStoreLeavesZotsDatabasesAlone added new with the child switch
 TestStoreRootIsTheStateDir added the store root the zot config set, pinned on the server
+TestSweepWaitsForAPass added new with the dedupe loop
 TestTestManifestIsComplete added new with the child switch
 TestVMNetGateway kept the push gate is unchanged
 TestValidateForServingRefusesNonLoopback added moved from the zot renderer
+TestWatchCommits added new with the dedupe loop
 TestWatchParent added new with the child switch
 TestWorkDirLayout kept the behaviour it pins is unchanged by the child switch
 TestWriteCredential kept the credential files are unchanged

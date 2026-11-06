@@ -205,7 +205,7 @@ func TestProvisionWritesTheChildsConfig(t *testing.T) {
 func TestRecordKeepsTheServersFields(t *testing.T) {
 	s := childTestService(t, "/Library/k3sm/k3sm")
 	swept := time.Date(2026, 11, 5, 1, 2, 3, 0, time.UTC)
-	if err := WriteState(s.cfg.WorkDir, State{State: StateServing, GC: &GCStatus{LastSweep: swept, Blobs: 3}, UploadSessions: 2}); err != nil {
+	if err := WriteState(s.cfg.WorkDir, State{State: StateServing, GC: &GCStatus{LastSweep: swept, Blobs: 3}, UploadSessions: 2, Dedupe: &DedupeStatus{LastPass: swept, Merged: 4}}); err != nil {
 		t.Fatal(err)
 	}
 	s.record(StateStopped, "", 0)
@@ -217,7 +217,7 @@ func TestRecordKeepsTheServersFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.State != StateStopped || st.GC == nil || st.GC.Blobs != 3 || !st.GC.LastSweep.Equal(swept) || st.UploadSessions != 2 {
+	if st.State != StateStopped || st.GC == nil || st.GC.Blobs != 3 || !st.GC.LastSweep.Equal(swept) || st.UploadSessions != 2 || st.Dedupe == nil || st.Dedupe.Merged != 4 || !st.Dedupe.LastPass.Equal(swept) {
 		t.Errorf("record %+v", st)
 	}
 }

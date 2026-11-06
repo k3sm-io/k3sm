@@ -98,6 +98,10 @@ type State struct {
 	// after each sweep; a daemon's own transition carries them over.
 	GC             *GCStatus `json:"gc,omitempty"`
 	UploadSessions int       `json:"uploadSessions,omitempty"`
+	// Dedupe is the registry server's last dedupe pass; nil before its first.
+	// The server process writes it after each pass, and a daemon's own transition
+	// carries it over.
+	Dedupe *DedupeStatus `json:"dedupe,omitempty"`
 }
 
 // GCStatus is what the registry server's last sweep did. The counts are of that
@@ -117,6 +121,23 @@ type GCStatus struct {
 	// those that failed some other way. Nothing was reaped in either.
 	Stopped int `json:"stopped,omitempty"`
 	Failed  int `json:"failed,omitempty"`
+}
+
+// DedupeStatus is what the registry server's last dedupe pass did, for the whole
+// store. It holds no digest or repository name. The counts are of that pass alone.
+type DedupeStatus struct {
+	// LastPass is when the pass finished.
+	LastPass time.Time `json:"lastPass"`
+	// Merged is how many names now point at another repository's verified copy.
+	Merged int `json:"merged,omitempty"`
+	// ReclaimedBytes counts only the inodes whose last name went.
+	ReclaimedBytes int64 `json:"reclaimedBytes,omitempty"`
+	// Pending is how many names still hold a separate copy.
+	Pending int `json:"pending,omitempty"`
+	// CorruptReplaced is how many names of corrupt copies the pass replaced.
+	CorruptReplaced int `json:"corruptReplaced,omitempty"`
+	// Skipped counts what the pass left in place, by reason.
+	Skipped map[string]int `json:"skipped,omitempty"`
 }
 
 // ClusterFacing is what the server's bring-up learns about the registry's
@@ -315,7 +336,7 @@ func keepServerFields(workDir string, st State) error {
 	defer unlock()
 	if b, err := os.ReadFile(StatePath(workDir)); err == nil {
 		if prev, err := ParseState(b); err == nil {
-			st.GC, st.UploadSessions = prev.GC, prev.UploadSessions
+			st.GC, st.UploadSessions, st.Dedupe = prev.GC, prev.UploadSessions, prev.Dedupe
 		}
 	}
 	return writeStateFiles(workDir, st)

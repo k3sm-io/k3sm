@@ -109,6 +109,11 @@ type serveDeps struct {
 	freeSpace           func() (uint64, error)
 	gcGrace, gcInterval time.Duration
 	statusEvery         time.Duration
+	// now and jitter are the dedupe loop's clock and its draw of the idle wait's
+	// jitter, and convergeTick its ticks; nil takes the real ones.
+	now          func() time.Time
+	jitter       func() time.Duration
+	convergeTick <-chan time.Time
 	// addr, when set, receives the bound address once the server is serving.
 	addr func(net.Addr)
 }
@@ -185,16 +190,23 @@ func runServer(ctx context.Context, workDir string, cfg ServeConfig, d serveDeps
 		return fmt.Errorf("bind the registry listener: %w", err)
 	}
 	httpServer := server.HTTPServer(cfg.Listen)
+	fence := newSweepFence()
 	log.Info("registry server serving", "addr", ln.Addr().String(), "pid", os.Getpid(), "uid", d.ident.geteuid(), "root", st.Root())
 	if d.addr != nil {
 		d.addr(ln.Addr())
 	}
 
 	reports := statusReporter{workDir: workDir, log: log}
+	dedupe := newConvergeLoop(convergeLoopDeps{
+		store: st, sessions: server.UploadSessions, freeSpace: d.freeSpace, now: d.now, jitter: d.jitter,
+		tick: d.convergeTick, grace: d.gcGrace, fence: fence, reports: reports, log: log,
+	})
+	httpServer.Handler = watchCommits(httpServer.Handler, dedupe.commit)
 	bg, stopBG := context.WithCancel(ctx)
 	defer stopBG()
 	var wg sync.WaitGroup
-	wg.Go(func() { sweepLoop(bg, collector, d.gcGrace, d.gcInterval, reports, log) })
+	wg.Go(func() { sweepLoop(bg, collector, d.gcGrace, d.gcInterval, fence, reports, log) })
+	wg.Go(func() { dedupe.run(bg) })
 	wg.Go(func() { reportLoop(bg, server, d.statusEvery, reports) })
 
 	served := make(chan error, 1)
@@ -220,8 +232,9 @@ func runServer(ctx context.Context, workDir string, cfg ServeConfig, d serveDeps
 }
 
 // sweepLoop sweeps at the first moment the collector allows, a little past its
-// grace, and then every interval.
-func sweepLoop(ctx context.Context, c *gc.Collector, grace, interval time.Duration, reports statusReporter, log *slog.Logger) {
+// grace, and then every interval. A sweep holds fence, so it never runs beside a
+// dedupe pass.
+func sweepLoop(ctx context.Context, c *gc.Collector, grace, interval time.Duration, fence *sweepFence, reports statusReporter, log *slog.Logger) {
 	wait := time.NewTimer(grace + grace/60)
 	defer wait.Stop()
 	for {
@@ -230,7 +243,10 @@ func sweepLoop(ctx context.Context, c *gc.Collector, grace, interval time.Durati
 			return
 		case <-wait.C:
 		}
+		fence.mu.Lock()
 		sweepOnce(ctx, c, reports, log)
+		fence.mu.Unlock()
+		fence.swept()
 		wait.Reset(interval)
 	}
 }
@@ -291,6 +307,13 @@ type statusReporter struct {
 func (r statusReporter) gc(s GCStatus) {
 	r.update(func(st *State) bool {
 		st.GC = &s
+		return true
+	})
+}
+
+func (r statusReporter) dedupe(s DedupeStatus) {
+	r.update(func(st *State) bool {
+		st.Dedupe = &s
 		return true
 	})
 }

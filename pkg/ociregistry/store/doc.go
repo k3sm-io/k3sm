@@ -43,6 +43,12 @@ limitations under the License.
 // a single link; a session committed or cancelled meanwhile is gone, so a
 // late chunk can never reach a published blob.
 //
+// One path replaces a blob on purpose. Converge, a background pass that never
+// runs on a request, turns copies of a digest across repositories into hard links
+// to the newest copy it has verified, by a link and an atomic rename. It writes no
+// mtime and no index.json, and its table is in memory and rebuilt each pass. The
+// registry server drives it (pkg/registrysvc); commits and mounts do not change.
+//
 // Writes are durable in order: a blob is F_FULLFSYNCed before it is linked
 // into blobs/, and index.json is written to a temp file under .uploads,
 // F_FULLFSYNCed, renamed over and its directory synced, always after the blobs

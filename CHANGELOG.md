@@ -86,7 +86,15 @@ pin, its date, and the tarball's sha256.
 - The registry store can dedupe a blob held as separate copies across repositories: a pass keeps the
   newest copy, verifies it against its digest, and replaces each older copy with a hard link to it by an
   atomic rename. A copy that fails its hash is logged, counted and replaced by the verified bytes; any
-  other failure keeps the copy. Nothing runs the pass yet, and the push path does not change.
+  other failure keeps the copy. The push path does not change. The registry server runs the pass by
+  default, with no setting to turn it off: after 60 s with no commit and no live upload, plus up to 60 s
+  of jitter, and at most 15 minutes after the first commit it has not yet covered. Below 4 GiB free it
+  starts without the wait. An upload stops a pass between merges, unless the 15 minutes have passed or
+  space is low. No pass runs within an hour of start, or before the first garbage collection, and only
+  a repository garbage collection has reported is rewritten. A copy a pass leaves waits for the next
+  commit, mount or server start. `registry.log` records each merge and each pass, and
+  `registry-state.json` gains a `dedupe` object with the last pass's counts. `du -sk` of the registry
+  root falls to one copy; `du` of a single repository still shows its full size.
 - The registry store k3sm is replacing zot with has an online garbage collector that runs
   while pushes continue. A blob's age counts from the last mount, link or upload that named it,
   recorded on disk so a restart keeps it, and a sweep re-reads the index and re-checks each

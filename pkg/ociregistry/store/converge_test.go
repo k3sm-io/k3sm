@@ -300,6 +300,16 @@ func logBuffer() (*slog.Logger, *bytes.Buffer) {
 	return slog.New(slog.NewTextHandler(&b, nil)), &b
 }
 
+// TestConvergeLimitValues pins the limits of one pass: the scan's entries, the
+// merges, the bytes hashed and their rate, and the names on one inode.
+func TestConvergeLimitValues(t *testing.T) {
+	if convergeMaxEntries != 250_000 || convergeMaxMerges != 1024 || convergeMaxHashBytes != 16<<30 ||
+		convergeHashRate != 256<<20 || convergeMaxNames != 32_000 {
+		t.Errorf("entries %d, merges %d, hash bytes %d, rate %d, names %d", convergeMaxEntries, convergeMaxMerges,
+			int64(convergeMaxHashBytes), convergeHashRate, convergeMaxNames)
+	}
+}
+
 func TestConvergeChoosesTheNewestThenTheFirstRepository(t *testing.T) {
 	f := newConvergeFixture(t)
 	body := blobBytes(2, 4096)
