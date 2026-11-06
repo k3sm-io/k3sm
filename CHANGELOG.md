@@ -122,6 +122,7 @@ pin, its date, and the tarball's sha256.
 
 ### Fixed
 
+- The etcd k3sm builds now links `github.com/klauspost/compress` v1.20.2, which fixes GO-2026-6865, a panic on two-block frames.
 - Turning Spotlight indexing off for the data volume no longer waits indefinitely on `mdutil`. The
   `.metadata_never_index` marker is what excludes the volume and is written first, so the `mdutil`
   call now has a 15 second limit, after which it is stopped and the mount or migration carries on.
