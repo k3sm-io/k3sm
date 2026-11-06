@@ -327,7 +327,9 @@ func TestConvergeChoosesTheNewestThenTheFirstRepository(t *testing.T) {
 }
 
 // TestConvergeKeeperFaults takes the keeper's name away, or swaps it, between its
-// verification and the link. Every copy stays and no temp is left.
+// verification and the link. The link test sees it first, unless another link
+// keeps the count the same, and then the link and its inode check do. Every copy
+// stays and no temp is left.
 func TestConvergeKeeperFaults(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -338,8 +340,24 @@ func TestConvergeKeeperFaults(t *testing.T) {
 			if err := os.Remove(f.path("a", d)); err != nil {
 				f.t.Fatal(err)
 			}
-		}, SkipKeeperGone},
+		}, SkipKeeperFull},
 		{"swapped", func(f *convergeFixture, d digest.Digest) {
+			p := f.path("a", d)
+			if err := os.Remove(p); err != nil {
+				f.t.Fatal(err)
+			}
+			if err := os.WriteFile(p, blobBytes(2, 4096), fileMode); err != nil {
+				f.t.Fatal(err)
+			}
+		}, SkipKeeperFull},
+		{"gone, its count held by a new link", func(f *convergeFixture, d digest.Digest) {
+			f.linkSession("a", d)
+			if err := os.Remove(f.path("a", d)); err != nil {
+				f.t.Fatal(err)
+			}
+		}, SkipKeeperGone},
+		{"swapped, its count held by a new link", func(f *convergeFixture, d digest.Digest) {
+			f.linkSession("a", d)
 			p := f.path("a", d)
 			if err := os.Remove(p); err != nil {
 				f.t.Fatal(err)
@@ -676,6 +694,85 @@ func TestConvergeKeeperRefusedForAnUncountedLink(t *testing.T) {
 	})
 }
 
+// TestConvergeKeeperRefusedForACountedNameGone is a removal racing the scan, as GC
+// makes. Above all, two counted names gone hide one the scan did not count from a
+// test of only "more than counted".
+func TestConvergeKeeperRefusedForACountedNameGone(t *testing.T) {
+	setup := func(t *testing.T) (*convergeFixture, digest.Digest) {
+		t.Helper()
+		f := newConvergeFixture(t)
+		d := f.copies(blobBytes(15, 4096), "a", "b")
+		for _, r := range []string{"y", "z"} {
+			if err := f.s.MountBlob(f.ctx, f.name(r), f.name("a"), d); err != nil {
+				t.Fatal(err)
+			}
+		}
+		f.age("a", d, time.Hour)
+		return f, d
+	}
+	remove := func(f *convergeFixture, d digest.Digest, repos ...string) {
+		f.t.Helper()
+		for _, r := range repos {
+			if err := os.Remove(f.path(r, d)); err != nil {
+				f.t.Fatal(err)
+			}
+		}
+	}
+	t.Run("an uncounted link behind two removals", func(t *testing.T) {
+		f, d := setup(t)
+		rep := f.converge(func(o *ConvergeOptions) {
+			o.seams.scanned = func() {
+				remove(f, d, "y", "z")
+				f.linkSession("a", d)
+			}
+		})
+		if rep.Merged != 0 || f.same("a", "b", d) {
+			t.Errorf("merged into a keeper with an uncounted link: %+v", rep)
+		}
+		wantSkip(t, rep, SkipKeeperRefused, 1)
+		if rep.HashedBytes != 0 {
+			t.Errorf("hashed %d for a keeper refused by a stat", rep.HashedBytes)
+		}
+	})
+	t.Run("a removal alone costs one pass", func(t *testing.T) {
+		f, d := setup(t)
+		rep := f.converge(func(o *ConvergeOptions) {
+			o.seams.scanned = func() { remove(f, d, "z") }
+		})
+		if rep.Merged != 0 || f.same("a", "b", d) {
+			t.Errorf("merged on a count the removal made stale: %+v", rep)
+		}
+		wantSkip(t, rep, SkipKeeperRefused, 1)
+		rep = f.converge(nil)
+		if rep.Merged != 1 || !f.same("a", "b", d) {
+			t.Errorf("the next pass did not merge on its fresh count: %+v", rep)
+		}
+	})
+	t.Run("a removal after the keeper verified stops its merges", func(t *testing.T) {
+		f, d := setup(t)
+		c := f.copies(blobBytes(15, 4096), "c")
+		f.age("a", d, time.Hour)
+		f.age("b", d, 2*time.Hour)
+		f.age("c", c, 3*time.Hour)
+		cBefore := f.stat("c", d)
+		merges := 0
+		rep := f.converge(func(o *ConvergeOptions) {
+			o.seams.beforeMerge = func(ref.Name) {
+				if merges++; merges == 2 {
+					remove(f, d, "z")
+				}
+			}
+		})
+		if rep.Merged != 1 || !f.same("a", "b", d) {
+			t.Errorf("the first merge should have gone through: %+v", rep)
+		}
+		wantSkip(t, rep, SkipKeeperFull, 1)
+		if !os.SameFile(f.stat("c", d), cBefore) || !bytes.Equal(f.readBlob("c", d), blobBytes(15, 4096)) {
+			t.Errorf("c lost its copy: %+v", rep)
+		}
+	})
+}
+
 // pinnedAfter reads the pin from the nth read of a link count on.
 func pinnedAfter(n int) func(os.FileInfo) uint64 {
 	reads := 0
@@ -719,11 +816,12 @@ func TestConvergeLinkTest(t *testing.T) {
 		want           bool
 	}{
 		{"exact", 2, 2, 100, true},
-		{"fewer than counted", 1, 2, 100, true},
+		{"fewer than counted", 1, 2, 100, false},
 		{"uncounted", 3, 2, 100, false},
 		{"at the name limit", 100, 100, 100, false},
-		{"just under the pin", convergeNlinkPin - 1, 70_000, 1 << 20, true},
-		{"the pin", convergeNlinkPin, 70_000, 1 << 20, false},
+		{"just under the pin", convergeNlinkPin - 1, convergeNlinkPin - 1, 1 << 20, true},
+		{"the pin", convergeNlinkPin, convergeNlinkPin, 1 << 20, false},
+		{"the pin, counted past it", convergeNlinkPin, 70_000, 1 << 20, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p := &convergePass{lim: convergeLimits{names: tc.limit}}

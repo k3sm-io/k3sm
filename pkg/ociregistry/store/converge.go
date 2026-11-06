@@ -73,19 +73,20 @@ type SkipReason string
 // Reasons a pass leaves a copy in place. Each keeps the copy for a later pass.
 const (
 	// SkipKeeperRefused is a keeper candidate passed over: disqualified by its
-	// mtime, owner or mode, gone, swapped, or with a name the scan did not count.
+	// mtime, owner or mode, gone, swapped, or with other names than the scan counted.
 	// It counts candidates; every other reason counts names, except SkipSync,
 	// which counts failed syncs.
 	SkipKeeperRefused SkipReason = "keeper-refused"
 	// SkipNoKeeper is a target left because no candidate could be its keeper.
 	SkipNoKeeper SkipReason = "no-keeper"
 	// SkipKeeperFull is a target of a keeper that takes no more links this pass:
-	// it failed the link test after it was verified, or link(2) refused it with
+	// it failed the link test after it was verified, whichever way its count
+	// moved, or link(2) refused it with
 	// EMLINK, EPERM or ENOTSUP. Such a target spends no budget, past the one that
 	// found out.
 	SkipKeeperFull SkipReason = "keeper-full"
 	// SkipKeeperGone is a target whose keeper's name was gone or was another
-	// inode at the link.
+	// inode at the link, with its link count unmoved.
 	SkipKeeperGone SkipReason = "keeper-gone"
 	// SkipNewer is a target newer than its keeper.
 	SkipNewer SkipReason = "newer"
@@ -381,7 +382,8 @@ func (g *convergeGroup) pending() int {
 //     zot-written inode has no durability promise from us. A hash failure logs
 //     ErrStoreCorrupt and the next-newest is tried. A link the scan did not count
 //     (a crashed commit's session, a crashed merge's temp, a mount after the
-//     scan) or a pinned st_nlink refuses the keeper the same way.
+//     scan), a counted name since removed or a pinned st_nlink refuses the keeper
+//     the same way.
 //  4. Hash each target, no locks, once per inode. A mismatch or read error logs
 //     ErrStoreCorrupt and the merge goes ahead, since the replacement is the
 //     repair: the hash is evidence and gates nothing.
@@ -765,11 +767,16 @@ func (p *convergePass) verifyKeeper(ctx context.Context, g *convergeGroup, in *c
 	return &verifiedKeeper{inode: in, f: f, name: name, path: path, size: st.size}, nil
 }
 
-// nlinkOK is the keeper's link test: no name past those counted, not the pin, and
-// room for one more.
+// nlinkOK is the keeper's link test: exactly the names counted, not the pin, and
+// room for one more. A count below the scan's is a name removed since, and with
+// more removed than appeared it would otherwise hide an uncounted link. Refusing
+// only keeps the copy, and the next pass counts again. A removal and a link that
+// cancel out read the same as neither, which no count can see. That leaves the
+// merge's own checks: it links by path and compares the inode, and a session
+// sharing an inode with another name refuses an append at its open.
 func (p *convergePass) nlinkOK(fi os.FileInfo, counted uint64) bool {
 	n := p.o.seams.nlink(fi)
-	return n <= counted && n < convergeNlinkPin && n < p.lim.names
+	return n == counted && n < convergeNlinkPin && n < p.lim.names
 }
 
 // hashAllowed reports whether the budget covers a file of size bytes. The pass's
