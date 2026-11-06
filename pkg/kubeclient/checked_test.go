@@ -329,7 +329,7 @@ func TestPinCAReplacesEveryOtherTrustSetting(t *testing.T) {
 			if !bytes.Equal(cfg.CAData, pinned) {
 				t.Error("the config's CA is not the pinned one")
 			}
-			if cfg.CAFile != "" || cfg.Insecure || cfg.ServerName != "" {
+			if cfg.CAFile != "" || cfg.Insecure || cfg.ServerName != APIServerName() {
 				t.Errorf("trust left behind: %+v", cfg.TLSClientConfig)
 			}
 			if cfg.Host != "https://192.0.2.1:6443" {

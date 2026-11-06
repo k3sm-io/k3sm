@@ -20,6 +20,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"net/netip"
 	"slices"
 	"strings"
 
@@ -27,6 +28,8 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+
+	"k3sm.io/k3sm/pkg/defaults"
 )
 
 // ErrCredentialsNotInline marks a FromCheckedPath refusal: the kubeconfig has a
@@ -36,6 +39,22 @@ var ErrCredentialsNotInline = errors.New("only inline credentials are accepted")
 // ErrCAUnusable marks a PinCA refusal: the bytes it was given hold no PEM
 // certificate.
 var ErrCAUnusable = errors.New("holds no PEM certificate")
+
+// apiServerName is the first address of the cluster's Service range.
+var apiServerName = netip.MustParsePrefix(defaults.ServiceCIDR).Masked().Addr().Next().String()
+
+// APIServerName is the name a worker's client verifies the apiserver's serving
+// certificate against: the kubernetes Service IP, the first address of
+// defaults.ServiceCIDR. Every apiserver certificate k3sm has issued carries it, and
+// the apiserver's range is fixed (`--service-cluster-ip-range` in pkg/executor, which
+// no k3sm command changes), so it is a constant of the cluster. An address is used
+// because a node's serving certificate can carry a DNS name equal to the node's name
+// but only the IP address the join assigned, and that assignment never comes from
+// the Service range.
+//
+// Being an address, it goes out as no SNI, and it decides only what the certificate
+// must name: the connection still dials the kubeconfig's server.
+func APIServerName() string { return apiServerName }
 
 // FromPath loads the kubeconfig at path and returns both the rest.Config it
 // resolved and a typed clientset built from it. path is used verbatim, and
@@ -88,8 +107,8 @@ func FromCheckedPath(path string) (*rest.Config, kubernetes.Interface, error) {
 
 // FromCheckedPathWithCA is FromCheckedPath for a caller that holds the cluster's
 // CA itself: the kubeconfig gives the address and the client credential, and
-// caPEM alone decides which server certificate is accepted (PinCA). A refusal
-// from PinCA wraps ErrCAUnusable.
+// caPEM alone decides which CA, and APIServerName which name, a server certificate
+// is accepted for (PinCA). A refusal from PinCA wraps ErrCAUnusable.
 func FromCheckedPathWithCA(path string, caPEM []byte) (*rest.Config, kubernetes.Interface, error) {
 	cfg, err := checkedConfig(path)
 	if err != nil {
@@ -101,10 +120,24 @@ func FromCheckedPathWithCA(path string, caPEM []byte) (*rest.Config, kubernetes.
 	return clientFor(cfg)
 }
 
-// PinCA makes caPEM the only trust cfg has in its server: every other trust
-// setting a kubeconfig can carry is cleared, a CA file or inline CA,
+// FromCheckedWorkerPath is FromCheckedPath for a worker's node credential where
+// the caller holds no CA of its own: the file's CA stays, the certificate must name
+// APIServerName, and insecure-skip-tls-verify does not apply.
+func FromCheckedWorkerPath(path string) (*rest.Config, kubernetes.Interface, error) {
+	cfg, err := checkedConfig(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	cfg.Insecure = false
+	cfg.ServerName = apiServerName
+	return clientFor(cfg)
+}
+
+// PinCA makes caPEM and APIServerName the only trust cfg has in its server: every
+// other trust setting a kubeconfig can carry is replaced, a CA file or inline CA,
 // insecure-skip-tls-verify and tls-server-name. The address is left alone, since
-// it can legitimately differ from the one the CA was first seen at.
+// it can legitimately differ from the one the CA was first seen at. Its callers are
+// all on a worker, whose server is always a k3sm apiserver.
 func PinCA(cfg *rest.Config, caPEM []byte) error {
 	if !x509.NewCertPool().AppendCertsFromPEM(caPEM) {
 		return fmt.Errorf("cluster CA %w", ErrCAUnusable)
@@ -112,7 +145,7 @@ func PinCA(cfg *rest.Config, caPEM []byte) error {
 	cfg.CAData = caPEM
 	cfg.CAFile = ""
 	cfg.Insecure = false
-	cfg.ServerName = ""
+	cfg.ServerName = apiServerName
 	return nil
 }
 

@@ -40,52 +40,36 @@ import (
 	"k3sm.io/k3sm/pkg/certs"
 )
 
-const (
-	serverNameUnderTest = "kubernetes.default.svc"
-	// serverNameTestWait bounds a request that a broken server would leave hanging.
-	serverNameTestWait = 30 * time.Second
-)
+// serverNameTestWait bounds a request that a broken server would leave hanging.
+const serverNameTestWait = 30 * time.Second
 
 // TestServerNameWithAnIPAddressInServer dials a loopback server through client-go's
-// real TLS path with server: holding an IP. With ServerName set, the certificate
-// is verified against that name and not the dial address, and the name goes out as
-// SNI. With it unset, the dial address is what is verified.
+// real TLS path with server: holding an IP. A pinned config verifies the certificate
+// against APIServerName and not the dial address, and sends no SNI, the name being an
+// address. With the name cleared, the dial address is what is verified.
 func TestServerNameWithAnIPAddressInServer(t *testing.T) {
 	ca, err := certs.NewCA("test-cluster-ca")
 	if err != nil {
 		t.Fatalf("new CA: %v", err)
 	}
-	loopback := []net.IP{net.ParseIP("127.0.0.1")}
-	apiserverDNS := []string{"kubernetes", "kubernetes.default", serverNameUnderTest, "kubernetes.default.svc.cluster.local", "localhost"}
+	loopback := net.ParseIP("127.0.0.1")
+	apiserver := net.ParseIP(APIServerName())
+	apiserverDNS := []string{"kubernetes", "kubernetes.default", "kubernetes.default.svc", "kubernetes.default.svc.cluster.local", "localhost"}
 
 	for _, tc := range []struct {
-		name       string
-		cn         string
-		dns        []string
-		ips        []net.IP
-		serverName string
-		wantSNI    string
-		wantHost   bool // a hostname mismatch is the expected refusal
+		name      string
+		cn        string
+		dns       []string
+		ips       []net.IP
+		clearName bool
+		wantHost  bool // a hostname mismatch is the expected refusal
 	}{
-		{
-			name: "named leaf passes", cn: "kube-apiserver", dns: apiserverDNS, ips: loopback,
-			serverName: serverNameUnderTest, wantSNI: serverNameUnderTest,
-		},
-		{
-			name: "named leaf passes without the dial address in its SANs", cn: "kube-apiserver", dns: apiserverDNS,
-			serverName: serverNameUnderTest, wantSNI: serverNameUnderTest,
-		},
-		{
-			name: "same-CA leaf without the name is refused", cn: "worker-1", dns: []string{"worker-1", "localhost"}, ips: loopback,
-			serverName: serverNameUnderTest, wantHost: true,
-		},
-		{
-			name: "with no ServerName the dial address decides", cn: "worker-1", dns: []string{"worker-1", "localhost"}, ips: loopback,
-		},
-		{
-			name: "with no ServerName a leaf without the dial address is refused", cn: "kube-apiserver", dns: apiserverDNS,
-			wantHost: true,
-		},
+		{name: "the apiserver leaf passes", cn: "kube-apiserver", dns: apiserverDNS, ips: []net.IP{apiserver, loopback}},
+		{name: "the apiserver leaf passes without the dial address in its SANs", cn: "kube-apiserver", dns: apiserverDNS, ips: []net.IP{apiserver}},
+		{name: "a kubelet leaf of the same CA is refused", cn: "worker-1", dns: []string{"worker-1", "localhost"}, ips: []net.IP{loopback}, wantHost: true},
+		{name: "a leaf with the DNS form alone is refused", cn: "kubernetes.default.svc", dns: []string{"kubernetes.default.svc"}, ips: []net.IP{loopback}, wantHost: true},
+		{name: "with the name cleared the dial address decides", cn: "worker-1", dns: []string{"worker-1", "localhost"}, ips: []net.IP{loopback}, clearName: true},
+		{name: "with the name cleared a leaf without the dial address is refused", cn: "kube-apiserver", dns: apiserverDNS, ips: []net.IP{apiserver}, clearName: true, wantHost: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			certPEM, keyPEM, err := ca.IssueServing(tc.cn, tc.dns, tc.ips, time.Hour)
@@ -114,7 +98,9 @@ users:
 			if err != nil {
 				t.Fatalf("load: %v", err)
 			}
-			cfg.ServerName = tc.serverName
+			if tc.clearName {
+				cfg.ServerName = ""
+			}
 			cfg.Timeout = serverNameTestWait
 			cs, err := kubernetes.NewForConfig(cfg)
 			if err != nil {
@@ -134,8 +120,8 @@ users:
 			if err != nil {
 				t.Fatalf("request: %v", err)
 			}
-			if got, _ := sni.Load().(string); got != tc.wantSNI {
-				t.Errorf("SNI = %q, want %q", got, tc.wantSNI)
+			if got, _ := sni.Load().(string); got != "" {
+				t.Errorf("SNI = %q, want none", got)
 			}
 		})
 	}
