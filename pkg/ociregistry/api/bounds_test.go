@@ -214,7 +214,7 @@ func TestListingBounds(t *testing.T) {
 			if err := json.Unmarshal(w.Body.Bytes(), &cat); err != nil || cat.Repositories == nil {
 				t.Fatalf("catalog %s: %v", w.Body.String(), err)
 			}
-			if len(cat.Repositories) > defaultCatalogPage {
+			if len(cat.Repositories) > defaultPage {
 				t.Fatalf("a page of %d entries", len(cat.Repositories))
 			}
 			got = append(got, cat.Repositories...)
