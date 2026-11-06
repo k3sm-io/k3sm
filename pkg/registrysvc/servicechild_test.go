@@ -260,10 +260,19 @@ func TestIsOrphanedChild(t *testing.T) {
 // TestReclaimRechecksBeforeEachSignal: a process that stops matching is not
 // signalled, before the SIGTERM or before the SIGKILL.
 func TestReclaimRechecksBeforeEachSignal(t *testing.T) {
-	start := func(t *testing.T) *exec.Cmd {
+	// Each shell's first output says it has run everything before the echo.
+	const (
+		endedBySIGTERM = `echo; while :; do sleep 1; done`
+		// Ignoring SIGTERM, so only a SIGKILL would end it.
+		endedBySIGKILL = `trap "" TERM; echo; while :; do sleep 1; done`
+	)
+	start := func(t *testing.T, script string) *exec.Cmd {
 		t.Helper()
-		// A shell that ignores SIGTERM, so only a SIGKILL would end it.
-		cmd := exec.Command("/bin/sh", "-c", `trap "" TERM; while :; do sleep 1; done`)
+		cmd := exec.Command("/bin/sh", "-c", script)
+		out, err := cmd.StdoutPipe()
+		if err != nil {
+			t.Fatal(err)
+		}
 		if err := cmd.Start(); err != nil {
 			t.Fatal(err)
 		}
@@ -271,15 +280,16 @@ func TestReclaimRechecksBeforeEachSignal(t *testing.T) {
 			_ = cmd.Process.Kill()
 			_ = cmd.Wait()
 		})
-		// Give the shell time to install the trap.
-		time.Sleep(200 * time.Millisecond)
+		if _, err := io.ReadFull(out, make([]byte, 1)); err != nil {
+			t.Fatalf("the shell did not start: %v", err)
+		}
 		return cmd
 	}
 	alive := func(cmd *exec.Cmd) bool { return lookupAlive(cmd.Process.Pid) }
 
 	t.Run("reused before the SIGTERM", func(t *testing.T) {
 		s := childTestService(t, "/Library/k3sm/k3sm")
-		cmd := start(t)
+		cmd := start(t, endedBySIGTERM)
 		var reads int
 		s.lookupProc = func(pid int) (procEntry, bool) {
 			reads++
@@ -294,7 +304,7 @@ func TestReclaimRechecksBeforeEachSignal(t *testing.T) {
 	})
 	t.Run("reused before the SIGKILL", func(t *testing.T) {
 		s := childTestService(t, "/Library/k3sm/k3sm")
-		cmd := start(t)
+		cmd := start(t, endedBySIGKILL)
 		var reads int
 		s.lookupProc = func(pid int) (procEntry, bool) {
 			reads++

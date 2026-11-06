@@ -40,6 +40,10 @@ import (
 const (
 	testPushSecret = "push-secret-for-the-serve-tests"
 	testGateSecret = "gate-secret-for-the-serve-tests"
+
+	// serveAwaitBound fails a test whose awaited event never came. Nothing
+	// waits it out on a passing run.
+	serveAwaitBound = 30 * time.Second
 )
 
 // writeTestServeConfig writes a valid serve config for a fresh work dir, after
@@ -94,14 +98,31 @@ func runTestServe(t *testing.T, work string, d serveDeps) (<-chan error, context
 	result := make(chan error, 1)
 	go func() { result <- serve(ctx, ServeConfigPath(work), d) }()
 	t.Cleanup(cancel)
+	bound := time.NewTimer(serveAwaitBound)
+	defer bound.Stop()
 	select {
 	case <-ready:
 	case err := <-result:
 		t.Fatalf("serve returned before serving: %v", err)
-	case <-time.After(30 * time.Second):
+	case <-bound.C:
 		t.Fatal("serve did not come up")
 	}
 	return result, cancel
+}
+
+// awaitServeResult waits for serve to return, failing the test after
+// serveAwaitBound.
+func awaitServeResult(t *testing.T, result <-chan error, what string) error {
+	t.Helper()
+	bound := time.NewTimer(serveAwaitBound)
+	defer bound.Stop()
+	select {
+	case err := <-result:
+		return err
+	case <-bound.C:
+		t.Fatal(what)
+		return nil
+	}
 }
 
 // memClient is an HTTP client whose connections are the listener's.
@@ -130,15 +151,38 @@ func do(t *testing.T, c *http.Client, method, url, user, secret string) *http.Re
 	return resp
 }
 
-// eventually polls cond for up to 30 seconds.
-func eventually(t *testing.T, what string, cond func() bool) {
+// awaitDirChange checks cond now and again each time an entry of dir is created,
+// removed or renamed, which is how a record replaced by a rename lands, and fails
+// the test when cond still does not hold after serveAwaitBound. The watch is
+// registered before the first check, so a change between a check and the next
+// wait is still delivered.
+func awaitDirChange(t *testing.T, dir, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(30 * time.Second)
+	kq, err := unix.Kqueue()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(kq)
+	fd, err := unix.Open(dir, unix.O_EVTONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fd)
+	watch := []unix.Kevent_t{{Ident: uint64(fd), Filter: unix.EVFILT_VNODE, Flags: unix.EV_ADD | unix.EV_CLEAR, Fflags: unix.NOTE_WRITE}}
+	if _, err := unix.Kevent(kq, watch, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(serveAwaitBound)
+	events := make([]unix.Kevent_t, 1)
 	for !cond() {
-		if time.Now().After(deadline) {
+		left := time.Until(deadline)
+		if left <= 0 {
 			t.Fatalf("timed out waiting for %s", what)
 		}
-		time.Sleep(5 * time.Millisecond)
+		timeout := unix.NsecToTimespec(left.Nanoseconds())
+		if _, err := unix.Kevent(kq, nil, events, &timeout); err != nil && !errors.Is(err, unix.EINTR) {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -388,7 +432,7 @@ func TestServeAuthorizesAndReports(t *testing.T) {
 	}
 
 	var seen State
-	eventually(t, "the sweep and the sessions in the state record", func() bool {
+	awaitDirChange(t, filepath.Dir(StatePath(work)), "the sweep and the sessions in the state record", func() bool {
 		st, err := os.ReadFile(StatePath(work))
 		if err != nil {
 			t.Fatal(err)
@@ -530,34 +574,62 @@ func TestServeLogsAPush(t *testing.T) {
 // TestServeExitsWhenItsParentDies runs the watch against a real process, standing
 // in for the daemon.
 func TestServeExitsWhenItsParentDies(t *testing.T) {
-	parent := exec.Command("/bin/sleep", "60")
-	if err := parent.Start(); err != nil {
-		t.Fatal(err)
+	start := func(t *testing.T) (*exec.Cmd, serveDeps, *memListener) {
+		t.Helper()
+		parent := exec.Command("/bin/sleep", "60")
+		if err := parent.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_ = parent.Process.Kill()
+			_ = parent.Wait()
+		})
+		l := newMemListener()
+		d := testServeDeps(l)
+		d.getppid = func() int { return parent.Process.Pid }
+		return parent, d, l
 	}
-	t.Cleanup(func() {
-		_ = parent.Process.Kill()
-		_ = parent.Wait()
+	// A watch that fires on a live parent stops the server, which then never
+	// reports its first sweep, a grace after it started, and a stop reports
+	// ErrParentExited. So the sweep in the record, a served request and a clean
+	// stop mean the watch had not fired by then.
+	t.Run("a live parent leaves it serving", func(t *testing.T) {
+		_, d, l := start(t)
+		d.gcGrace = 100 * time.Millisecond
+		work := writeTestServeConfig(t, nil)
+		if err := WriteState(work, State{State: StateServing, Port: 6450, Addr: "127.0.0.1:6450"}); err != nil {
+			t.Fatal(err)
+		}
+		result, cancel := runTestServe(t, work, d)
+		awaitDirChange(t, filepath.Dir(StatePath(work)), "the first sweep with the parent alive", func() bool {
+			b, err := os.ReadFile(StatePath(work))
+			if err != nil {
+				t.Fatal(err)
+			}
+			st, err := ParseState(b)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return st.GC != nil
+		})
+		if resp := do(t, memClient(t, l), http.MethodGet, "http://registry.test/v2/", "", ""); resp.StatusCode != http.StatusOK {
+			t.Fatalf("/v2/ with the parent alive: %d, want 200", resp.StatusCode)
+		}
+		cancel()
+		if err := awaitServeResult(t, result, "serve did not stop on its context"); err != nil {
+			t.Fatalf("serve with its parent alive: %v, want a clean stop", err)
+		}
 	})
-	work := writeTestServeConfig(t, nil)
-	d := testServeDeps(newMemListener())
-	d.getppid = func() int { return parent.Process.Pid }
-	result, _ := runTestServe(t, work, d)
-	select {
-	case err := <-result:
-		t.Fatalf("serve returned with its parent alive: %v", err)
-	case <-time.After(50 * time.Millisecond):
-	}
-	if err := parent.Process.Kill(); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case err := <-result:
-		if !errors.Is(err, ErrParentExited) {
+	t.Run("a dead parent ends it", func(t *testing.T) {
+		parent, d, _ := start(t)
+		result, _ := runTestServe(t, writeTestServeConfig(t, nil), d)
+		if err := parent.Process.Kill(); err != nil {
+			t.Fatal(err)
+		}
+		if err := awaitServeResult(t, result, "serve outlived its parent"); !errors.Is(err, ErrParentExited) {
 			t.Fatalf("got %v, want ErrParentExited", err)
 		}
-	case <-time.After(30 * time.Second):
-		t.Fatal("serve outlived its parent")
-	}
+	})
 }
 
 // TestWatchParent covers the watch's two other ends: a pid already gone and a
