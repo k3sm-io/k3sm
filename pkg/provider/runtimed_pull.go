@@ -1181,6 +1181,7 @@ func (r *runtimedRuntime) retryParkedCreate(ctx context.Context, pod *corev1.Pod
 	}
 	resp, err := r.rt.CreatePod(ctx, &runtimev1.CreatePodRequest{Pod: box})
 	if err != nil {
+		// No guest to compensate for: see the same return in CreatePod.
 		return runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, "",
 			fmt.Errorf("runtimed create pod %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
