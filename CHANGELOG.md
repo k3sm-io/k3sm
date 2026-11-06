@@ -349,6 +349,11 @@ pin, its date, and the tarball's sha256.
   until the view is built. It is paged by digest with a `Link` header and takes at most 8
   `artifactType` filters.
 
+- When a directory stands where the install's lock file belongs, the refusal now says what is
+  there and gives a remedy that works on a directory (`sudo rmdir`, or `sudo rm -rf` if it is not
+  empty). It used to give no remedy, and the `sudo rm` the lock file message suggests fails on a
+  directory. A directory, a hard-linked file and any other non-regular entry are still refused.
+
 ## v0.2.3 — 2026-10-29
 
 ### Added

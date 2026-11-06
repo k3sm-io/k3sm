@@ -2047,3 +2047,28 @@ func TestEnsureFileOwnedRefusesNonRegular(t *testing.T) {
 		assertMode(t, path, 0o644)
 	})
 }
+
+// TestLockDirectoryRemedy pins that a directory standing in for the lock file is
+// refused as a non-regular entry, left as it was, with a remedy that works on a
+// directory: `sudo rm` fails on one.
+func TestLockDirectoryRemedy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "runtimed.lock")
+	if err := os.Mkdir(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	err := ensureFileOwnedBy(path, os.Getuid(), os.Getgid(), 0o600)
+	if !errors.Is(err, ErrNotRegularFile) || errors.Is(err, errHardlinkRefused) {
+		t.Fatalf("ensureFileOwnedBy = %v, want ErrNotRegularFile and not the hard link refusal", err)
+	}
+	for _, want := range []string{"directory", "sudo rmdir " + path, "sudo rm -rf " + path, "no state"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not contain %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), "sudo rm "+path) {
+		t.Errorf("error %q offers `sudo rm`, which fails on a directory", err)
+	}
+	if fi, statErr := os.Lstat(path); statErr != nil || !fi.IsDir() {
+		t.Errorf("entry = %v, %v; want the directory left in place", fi, statErr)
+	}
+}
