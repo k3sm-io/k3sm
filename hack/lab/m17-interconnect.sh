@@ -482,18 +482,23 @@ ic_pod() { ic_pod_manifest "$@" | kc apply -f - >/dev/null; }
 pod_ready() { [ "$(kc get pod -n "$NS" "$1" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = True ]; }
 pod_done() { case "$(kc get pod -n "$NS" "$1" -o jsonpath='{.status.phase}' 2>/dev/null)" in Succeeded | Failed) return 0 ;; esac; return 1; }
 pod_log_value() { kc logs -n "$NS" "$1" 2>/dev/null | awk -v k="$2" 'index($0, k)==1{v=substr($0, length(k)+1)} END{print v}'; }
+pod_log_count() { kc logs -n "$NS" "$1" 2>/dev/null | awk -v k="$2" 'index($0, k)==1{n++} END{print n+0}'; }
 pod_ip() { kc get pod -n "$NS" "$1" -o jsonpath='{.status.podIP}' 2>/dev/null; }
 pod_attached() { kc get pod -n "$NS" "$1" -o jsonpath='{.status.conditions[?(@.type=="k3sm.io/InterconnectAttached")].status}' 2>/dev/null; }
 
 # The attached listener: 5400 bound explicitly to the interconnect address, 5401
-# on the wildcard (the shim rewrites it to the pod IP). Each received stream's
-# byte count is a log line. Single-quoted on purpose: it expands in the pod.
+# on the wildcard, in /usr/bin/nc, a platform binary the shim cannot load into, so
+# 5401 is only the byte counter for the mesh flows and proves nothing about the
+# shim (r4 proves that with its own fixtures). Each received stream's byte count
+# is a log line. Every listener takes -d: a pod's stdin is at EOF, and without -d
+# nc answers that EOF with a FIN, the sender quits, and the count stops near 64 KiB.
+# Single-quoted on purpose: it expands in the pod.
 # shellcheck disable=SC2016
 LISTENER_CMD='echo "ICIP=${K3SM_INTERCONNECT_IP:-}"; echo "PODIP=${K3SM_POD_IP:-}"
 if [ -n "${K3SM_INTERCONNECT_IP:-}" ]; then
-  ( while :; do n=$(/usr/bin/nc -l "$K3SM_INTERCONNECT_IP" 5400 | /usr/bin/wc -c); echo "RECV5400=$((n + 0))"; done ) &
+  ( while :; do n=$(/usr/bin/nc -d -l "$K3SM_INTERCONNECT_IP" 5400 | /usr/bin/wc -c); echo "RECV5400=$((n + 0))"; done ) &
 fi
-while :; do n=$(/usr/bin/nc -l 5401 | /usr/bin/wc -c); echo "RECV5401=$((n + 0))"; done'
+while :; do n=$(/usr/bin/nc -d -l 5401 | /usr/bin/wc -c); echo "RECV5401=$((n + 0))"; done'
 
 # remote_scratch_problem <path> — why the path cannot hold this run's scripts; silent
 # and 0 when it can. The value lands in remote shell commands, so its alphabet is
@@ -683,7 +688,7 @@ assert_r3_cable_path() {
 # mesh_flow <label> <destination> <port> — a sender pod on the local node streams
 # the payload to the destination; the local Mac's counters bracket it.
 mesh_flow() {
-	local label="$1" dst="$2" port="$3" bytes=$((PAYLOAD_MB * 1048576)) ut tbd land utd before got r0 p="ic-send-$1"
+	local label="$1" dst="$2" port="$3" bytes=$((PAYLOAD_MB * 1048576)) ut tbd land utd before after got r0 p="ic-send-$1"
 	on_local "route -n get $dst" >"$RUNG_DIR/route-$label.txt" 2>&1
 	ut="$(icp_route_iface "$RUNG_DIR/route-$label.txt")"
 	if [ "$label" = pod ]; then
@@ -691,7 +696,7 @@ mesh_flow() {
 	fi
 	case "$ut" in utun*) ;; *) ut="$MESH_UTUN" ;; esac
 	counters local "$label-before" "$ut" "$local_LAN" "$local_TB"
-	before="$(pod_log_value ic-l-peer RECV5401=)"
+	before="$(pod_log_count ic-l-peer RECV5401=)"
 	r0="$(retrans local)"
 	ic_pod "$p" "$local_NODE" 0 "/bin/dd if=/dev/zero bs=1048576 count=$PAYLOAD_MB 2>/dev/null | /usr/bin/nc -G 5 -w 15 $dst $port; echo SENT=\$?"
 	wait_until 300 pod_done "$p" || fail "sender pod $p did not finish within 300 s"
@@ -702,8 +707,10 @@ mesh_flow() {
 	land="$(icp_total_delta "$RUNG_DIR/local-$label-before-$local_LAN.txt" "$RUNG_DIR/local-$label-after-$local_LAN.txt")" || land=0
 	tbd="$(icp_total_delta "$RUNG_DIR/local-$label-before-$local_TB.txt" "$RUNG_DIR/local-$label-after-$local_TB.txt")" || tbd=999999999999
 	check "$label flow counters ($ut, LAN $local_LAN, cable $local_TB)" icp_mesh_path_verdict "$bytes" "$utd" "$land" "$tbd" "$LAN_SLACK"
-	got="$(pod_log_value ic-l-peer RECV5401=)"
-	check "$label flow: the peer pod's wildcard listener received the payload ($got bytes; before $before)" test "${got:-0}" = "$bytes"
+	# Two whole flows log the same number, so the last line alone would credit the
+	# second flow with the first one's bytes: this flow must add a line of its own.
+	got="$(pod_log_value ic-l-peer RECV5401=)" after="$(pod_log_count ic-l-peer RECV5401=)"
+	check "$label flow: the peer pod's 5401 listener received the payload" icp_flow_received_verdict "$bytes" "$before" "$after" "$got"
 	kc delete pod -n "$NS" "$p" --wait=false >/dev/null 2>&1
 }
 
@@ -1791,7 +1798,7 @@ hello_drops_before_connect() {
 # st_driver_run <rung> <profile> — the body st_driver runs in a subshell: the
 # stubs below replace the host and cluster helpers there only.
 st_driver_run() {
-	local rung="$1" prof="$2"
+	local rung="$1" prof="$2" mutant="${3:-}"
 	D="$FIXTURES/driver/$prof" F="$FIXTURES"
 	RUNG_DIR="$(mktemp -d -t m17-driver.XXXXXX)" RUNG="$rung" R_PASS=0 R_FAIL=0
 	PAYLOAD_MB=128 LAN_SLACK=8388608 NS=stub
@@ -1816,6 +1823,13 @@ st_driver_run() {
 	pod_ip() { echo 10.42.1.7; }
 	kc() { case "$*" in *clusterIP*) echo 10.43.0.10 ;; esac; }
 	pod_log_value() { case "$2" in RECV*) echo $((PAYLOAD_MB * 1048576)) ;; ICIP=) echo 169.254.0.12 ;; esac; }
+	# Each read of the listener's log finds one line more, so each flow adds one;
+	# the flow-lost mutant's listener never logs a second stream.
+	: >"$RUNG_DIR/.recv-lines"
+	pod_log_count() {
+		echo x >>"$RUNG_DIR/.recv-lines"
+		if [ "$mutant" = flow-lost ]; then echo 1; else wc -l <"$RUNG_DIR/.recv-lines" | tr -d ' '; fi
+	}
 	counters() { local side="$1" tag="$2" i; shift 2; for i in "$@"; do cp "$D/netstat-I-$i-${tag##*-}.txt" "$RUNG_DIR/$side-$tag-$i.txt"; done; }
 	on() {
 		case "$2" in
@@ -1845,6 +1859,19 @@ st_driver() {
 		echo "ok    rung driver $rung over $prof (want $([ "$want" = 0 ] && echo green || echo red))"
 	else
 		echo "MISS  rung driver $rung over $prof: $(printf '%s' "$out" | grep -E '^(FAIL|DRIVER)' | sed -n 1,5p | tr '\n' ';')"
+		ST_MISS=$((ST_MISS + 1))
+	fi
+}
+
+# st_driver_red <rung> <profile> <mutant> <text> — one broken promise on a green
+# profile: the named FAIL line must appear and the driver must count a failure.
+st_driver_red() {
+	local out
+	out="$(st_driver_run "$1" "$2" "$3")"
+	if [[ "$out" == *"FAIL"*"$4"* ]] && [[ "$out" == *"DRIVER passes="* ]] && [[ "$out" != *" fails=0"* ]]; then
+		echo "ok    rung driver $1 red: $3"
+	else
+		echo "MISS  rung driver $1 red: $3: $(printf '%s' "$out" | grep -E '^(FAIL|DRIVER)' | sed -n 1,5p | tr '\n' ';')"
 		ST_MISS=$((ST_MISS + 1))
 	fi
 }
@@ -2132,6 +2159,12 @@ self_test_body() {
 	st_driver r3 cable-red 1
 	st_driver r4 mesh 0
 	st_driver r4 mesh-red 1
+	st_driver_red r4 mesh flow-lost "the peer pod's 5401 listener received the payload"
+	st "listener: a flow that adds a line with the whole payload" 0 icp_flow_received_verdict 134217728 1 2 134217728
+	st "listener red: a truncated stream" 1 icp_flow_received_verdict 134217728 0 1 72704
+	st "listener red: no new line, the last flow's count standing in" 1 icp_flow_received_verdict 134217728 1 1 134217728
+	st_eq "listener: every nc -l in the attached pod takes -d" "$(grep -c 'nc -d -l ' <<<"$LISTENER_CMD")" 2
+	st_eq "listener: no nc -l without -d" "$(grep -c 'nc -l ' <<<"$LISTENER_CMD")" 0
 	st "lo0: every address still there" 0 lo0_lost "$F/lo0-before.txt" "$F/lo0-before.txt"
 	st "lo0: a new address is no loss" 0 lo0_lost "$F/lo0-lost-egress.txt" "$F/lo0-before.txt"
 	st_out "lo0 red: the lost address is named" "gone from lo0: 100.64.3.1" lo0_lost "$F/lo0-before.txt" "$F/lo0-lost-egress.txt"

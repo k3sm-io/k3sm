@@ -171,6 +171,21 @@ icp_cable_path_verdict() {
 	echo "PASS Thunderbolt member +$tb bytes >= payload $p; LAN +$lan bytes <= slack $slack"
 }
 
+# icp_flow_received_verdict <payload> <log lines before> <log lines after> <last count>
+# — a listener logs one line per stream: this flow added one, and it holds the payload.
+icp_flow_received_verdict() {
+	local p="$1" before="$2" after="$3" got="$4"
+	if [ "${after:-0}" -le "${before:-0}" ]; then
+		echo "FAIL no new stream was logged (lines before ${before:-0}, after ${after:-0}); the last count, ${got:-none}, is an earlier flow's"
+		return 1
+	fi
+	if [ "${got:-0}" != "$p" ]; then
+		echo "FAIL received ${got:-0} of $p bytes"
+		return 1
+	fi
+	echo "PASS received $got bytes in a new stream"
+}
+
 # icp_mesh_path_verdict <payload> <utun delta> <LAN delta> <thunderbolt delta> <slack>
 # — the r4 counter half: the mesh flow rode the tunnel and the LAN, never the cable.
 icp_mesh_path_verdict() {
