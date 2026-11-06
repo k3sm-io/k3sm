@@ -145,6 +145,10 @@ func classify(err error) *apiError {
 		return e(http.StatusTooManyRequests, codeTooManyRequests, "the referrers list is still being read; retry")
 	case errors.Is(err, ErrRateLimited):
 		return e(http.StatusTooManyRequests, codeTooManyRequests, "too many requests")
+	case errors.Is(err, store.ErrIndexFull):
+		// The repository is at the store's index limit: retrying fails the
+		// same way until tags are deleted, so it is a refusal, not a fault.
+		return e(http.StatusForbidden, codeDenied, "the repository has too many tags; delete tags to free room")
 	case errors.Is(err, store.ErrUploadTooLarge):
 		return e(http.StatusRequestEntityTooLarge, codeSizeInvalid, "the upload is larger than the registry accepts")
 	case errors.Is(err, errInsufficientSpace):
