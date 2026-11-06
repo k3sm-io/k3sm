@@ -17,12 +17,20 @@ limitations under the License.
 package kubeclient
 
 import (
+	"errors"
 	"fmt"
+	"slices"
+	"strings"
 
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 )
+
+// ErrCredentialsNotInline marks a FromCheckedPath refusal: the kubeconfig has a
+// user or cluster entry that keeps its credentials anywhere but in the file.
+var ErrCredentialsNotInline = errors.New("only inline credentials are accepted")
 
 // FromPath loads the kubeconfig at path and returns both the rest.Config it
 // resolved and a typed clientset built from it. path is used verbatim, and
@@ -53,4 +61,100 @@ func FromPath(path string) (*rest.Config, kubernetes.Interface, error) {
 		return nil, nil, fmt.Errorf("build kubernetes client: %w", err)
 	}
 	return cfg, cs, nil
+}
+
+// FromCheckedPath is FromPath for a caller that accepts only inline credentials:
+// certificate-authority-data, client-certificate-data, client-key-data, token,
+// username and password. Every user and cluster entry in the file is checked, not
+// only the ones the current context names, and a refusal wraps
+// ErrCredentialsNotInline.
+//
+// The rest.Config is built from the checked object, and the path is read once,
+// so what was checked is exactly what is used.
+//
+// A load failure comes back as clientcmd produced it, as FromPath's does. A
+// refusal names the entry and its fields but no field's value, and leaves the
+// path to the caller, whose own wrap or log attribute already carries it. Entries
+// and fields are in a fixed order, so one file always gives the same message and
+// a caller can recognise a repeat.
+func FromCheckedPath(path string) (*rest.Config, kubernetes.Interface, error) {
+	raw, err := clientcmd.LoadFromFile(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := checkInline(raw); err != nil {
+		return nil, nil, err
+	}
+	cfg, err := restConfigFrom(raw)
+	if err != nil {
+		return nil, nil, err
+	}
+	cs, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return nil, nil, fmt.Errorf("build kubernetes client: %w", err)
+	}
+	return cfg, cs, nil
+}
+
+// restConfigFrom resolves raw's current context with no overrides. It reads no
+// file and no environment.
+func restConfigFrom(raw *clientcmdapi.Config) (*rest.Config, error) {
+	return clientcmd.NewDefaultClientConfig(*raw, &clientcmd.ConfigOverrides{}).ClientConfig()
+}
+
+// checkInline returns an error naming every user and cluster entry whose
+// credentials are not all inline.
+func checkInline(raw *clientcmdapi.Config) error {
+	var refused []string
+	for _, name := range sortedKeys(raw.AuthInfos) {
+		if fields := userFieldsNotInline(raw.AuthInfos[name]); len(fields) > 0 {
+			refused = append(refused, fmt.Sprintf("user %q sets %s", name, strings.Join(fields, ", ")))
+		}
+	}
+	for _, name := range sortedKeys(raw.Clusters) {
+		if c := raw.Clusters[name]; c != nil && c.CertificateAuthority != "" {
+			refused = append(refused, fmt.Sprintf("cluster %q sets certificate-authority", name))
+		}
+	}
+	if len(refused) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%s: %w", strings.Join(refused, "; "), ErrCredentialsNotInline)
+}
+
+// userFieldsNotInline returns the kubeconfig keys u sets that checkInline refuses.
+func userFieldsNotInline(u *clientcmdapi.AuthInfo) []string {
+	if u == nil {
+		return nil
+	}
+	var fields []string
+	for _, f := range []struct {
+		key string
+		set bool
+	}{
+		{"exec", u.Exec != nil},
+		{"auth-provider", u.AuthProvider != nil},
+		{"tokenFile", u.TokenFile != ""},
+		{"client-certificate", u.ClientCertificate != ""},
+		{"client-key", u.ClientKey != ""},
+		{"as", u.Impersonate != ""},
+		{"as-uid", u.ImpersonateUID != ""},
+		{"as-groups", len(u.ImpersonateGroups) > 0},
+		{"as-user-extra", len(u.ImpersonateUserExtra) > 0},
+	} {
+		if f.set {
+			fields = append(fields, f.key)
+		}
+	}
+	return fields
+}
+
+// sortedKeys returns m's keys in order.
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	return keys
 }
