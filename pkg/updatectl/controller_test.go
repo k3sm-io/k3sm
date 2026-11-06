@@ -17,15 +17,16 @@ limitations under the License.
 package updatectl
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -610,86 +611,163 @@ func TestUpdateSignerIsShortLived(t *testing.T) {
 	}
 }
 
-// TestEnsureCRDs: the controller applies both CRDs, the Update first, and is not
-// done with one until the API server reports it established. A refusal comes back
-// for Run's retry and leaves the Update CRD applied.
-func TestEnsureCRDs(t *testing.T) {
-	crdClient := func(refuse string, unestablishedGets int) (*apiextensionsfake.Clientset, *[]string, *atomic.Int32) {
-		var applied []string
-		var gets atomic.Int32
-		cs := apiextensionsfake.NewSimpleClientset()
-		cs.PrependReactor("patch", "customresourcedefinitions", func(a k8stesting.Action) (bool, runtime.Object, error) {
-			name := a.(k8stesting.PatchAction).GetName()
-			if name == refuse {
-				return true, nil, errors.New("refused")
-			}
-			applied = append(applied, name)
-			return true, &apiextensionsv1.CustomResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: name}}, nil
-		})
-		cs.PrependReactor("get", "customresourcedefinitions", func(a k8stesting.Action) (bool, runtime.Object, error) {
-			crd := &apiextensionsv1.CustomResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: a.(k8stesting.GetAction).GetName()}}
-			if int(gets.Add(1)) > unestablishedGets {
-				crd.Status.Conditions = []apiextensionsv1.CustomResourceDefinitionCondition{{Type: apiextensionsv1.Established, Status: apiextensionsv1.ConditionTrue}}
-			}
-			return true, crd, nil
-		})
-		return cs, &applied, &gets
+// crdFake is a CRD client whose patch of each CRD answers through answer, nil
+// applying it, and which reports whatever was applied as established.
+type crdFake struct {
+	*apiextensionsfake.Clientset
+	mu      sync.Mutex
+	applied []string
+	// unestablished names a CRD whose Established condition never comes.
+	unestablished string
+}
+
+func newCRDFake(answer func(name string, attempt int) error) *crdFake {
+	f := &crdFake{Clientset: apiextensionsfake.NewSimpleClientset()}
+	attempts := map[string]int{}
+	f.PrependReactor("patch", "customresourcedefinitions", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		name := a.(k8stesting.PatchAction).GetName()
+		f.mu.Lock()
+		attempts[name]++
+		n := attempts[name]
+		f.mu.Unlock()
+		if err := answer(name, n); err != nil {
+			return true, nil, err
+		}
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.applied = append(f.applied, name)
+		return true, &apiextensionsv1.CustomResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: name}}, nil
+	})
+	f.PrependReactor("get", "customresourcedefinitions", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		crd := &apiextensionsv1.CustomResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: a.(k8stesting.GetAction).GetName()}}
+		if crd.Name != f.unestablished {
+			crd.Status.Conditions = []apiextensionsv1.CustomResourceDefinitionCondition{{Type: apiextensionsv1.Established, Status: apiextensionsv1.ConditionTrue}}
+		}
+		return true, crd, nil
+	})
+	return f
+}
+
+func (f *crdFake) appliedNames() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.applied...)
+}
+
+// runUntil runs c until cond holds, failing the test if it does not within the
+// bound, then stops it and waits for Run to return.
+func runUntil(t *testing.T, c *Controller, what string, cond func() bool) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx) }()
+	deadline := time.After(20 * time.Second)
+	for !cond() {
+		select {
+		case <-deadline:
+			t.Errorf("%s never happened", what)
+			cancel()
+			<-done
+			return
+		case <-time.After(5 * time.Millisecond):
+		}
 	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Errorf("Run: %v", err)
+	}
+}
+
+// TestRollsDoNotDependOnTheUpdatePolicyCRD is why the two ensures are separate: an
+// Update for a security fix must roll whatever becomes of the channel setting, so
+// the Lease and the reconcile loop wait only on the Update CRD.
+func TestRollsDoNotDependOnTheUpdatePolicyCRD(t *testing.T) {
 	const updateCRDName = "updates.updates.k3sm.io"
+	rolled := func(r *rig) func() bool {
+		return func() bool { return slices.Contains(r.log(), "cordon w1") }
+	}
 
-	t.Run("both are applied and established", func(t *testing.T) {
-		c := newRig(t).controller()
-		cs, applied, gets := crdClient("", 2)
-		c.cfg.CRD = cs
-		if err := c.ensureCRDs(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-		if want := []string{updateCRDName, crdconfig.UpdatePolicyCRDName}; !reflect.DeepEqual(*applied, want) {
-			t.Errorf("applied %v, want %v", *applied, want)
-		}
-		if got := gets.Load(); got != 4 {
-			t.Errorf("%d reads, want the two unestablished and one for each CRD", got)
-		}
-	})
-
-	t.Run("a refused UpdatePolicy CRD is an error", func(t *testing.T) {
-		c := newRig(t).controller()
-		cs, applied, _ := crdClient(crdconfig.UpdatePolicyCRDName, 0)
-		c.cfg.CRD = cs
-		err := c.ensureCRDs(context.Background())
-		if err == nil || !strings.Contains(err.Error(), crdconfig.UpdatePolicyCRDName) {
-			t.Fatalf("err = %v", err)
-		}
-		if want := []string{updateCRDName}; !reflect.DeepEqual(*applied, want) {
-			t.Errorf("applied %v, want %v", *applied, want)
-		}
-	})
-
-	t.Run("Run ensures them before it leads", func(t *testing.T) {
-		c := newRig(t).controller()
-		cs, applied, _ := crdClient("", 0)
-		c.cfg.CRD = cs
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		done := make(chan error, 1)
-		go func() { done <- c.Run(ctx) }()
-		deadline := time.After(10 * time.Second)
-		for {
-			if leases, err := c.cfg.Client.CoordinationV1().Leases(LeaseNamespace).List(ctx, metav1.ListOptions{}); err == nil && len(leases.Items) > 0 {
-				break
+	t.Run("a CRD refused for good still leads and reconciles", func(t *testing.T) {
+		r := newRig(t, threeNodes()...)
+		r.createUpdate(updatesv1alpha1.UpdateName, updatesv1alpha1.UpdateSpec{Version: target})
+		c := r.controller()
+		c.policyRetry = time.Millisecond
+		f := newCRDFake(func(name string, _ int) error {
+			if name == crdconfig.UpdatePolicyCRDName {
+				return errors.New("refused")
 			}
-			select {
-			case <-deadline:
-				t.Fatal("the controller never campaigned")
-			case <-time.After(5 * time.Millisecond):
-			}
-		}
-		cancel()
-		if err := <-done; err != nil {
-			t.Fatal(err)
-		}
-		if want := []string{updateCRDName, crdconfig.UpdatePolicyCRDName}; !reflect.DeepEqual(*applied, want) {
-			t.Errorf("applied %v, want %v", *applied, want)
+			return nil
+		})
+		c.cfg.CRD = f
+		runUntil(t, c, "the roll's first cordon", rolled(r))
+		if got := f.appliedNames(); !slices.Equal(got, []string{updateCRDName}) {
+			t.Errorf("applied %v", got)
 		}
 	})
+
+	t.Run("a CRD never established still leads and reconciles", func(t *testing.T) {
+		r := newRig(t, threeNodes()...)
+		r.createUpdate(updatesv1alpha1.UpdateName, updatesv1alpha1.UpdateSpec{Version: target})
+		c := r.controller()
+		f := newCRDFake(func(string, int) error { return nil })
+		f.unestablished = crdconfig.UpdatePolicyCRDName
+		c.cfg.CRD = f
+		runUntil(t, c, "the roll's first cordon", rolled(r))
+	})
+
+	t.Run("a refused CRD is retried until it takes, and says so", func(t *testing.T) {
+		r := newRig(t, threeNodes()...)
+		c := r.controller()
+		var logged bytes.Buffer
+		var logMu sync.Mutex
+		c.log = slog.New(slog.NewTextHandler(lockedWriter{&logMu, &logged}, nil))
+		c.policyRetry = time.Millisecond
+		f := newCRDFake(func(name string, attempt int) error {
+			if name == crdconfig.UpdatePolicyCRDName && attempt < 3 {
+				return errors.New("not yet")
+			}
+			return nil
+		})
+		c.cfg.CRD = f
+		runUntil(t, c, "the UpdatePolicy CRD applying", func() bool {
+			return slices.Contains(f.appliedNames(), crdconfig.UpdatePolicyCRDName)
+		})
+		logMu.Lock()
+		defer logMu.Unlock()
+		if !strings.Contains(logged.String(), "level=WARN") || !strings.Contains(logged.String(), "UpdatePolicy") {
+			t.Errorf("log does not name the failure:\n%s", logged.String())
+		}
+	})
+
+	t.Run("a refused Update CRD still holds the Lease back", func(t *testing.T) {
+		r := newRig(t, threeNodes()...)
+		c := r.controller()
+		f := newCRDFake(func(name string, _ int) error {
+			if name == updateCRDName {
+				return errors.New("refused")
+			}
+			return nil
+		})
+		c.cfg.CRD = f
+		runUntil(t, c, "the UpdatePolicy CRD applying", func() bool {
+			return slices.Contains(f.appliedNames(), crdconfig.UpdatePolicyCRDName)
+		})
+		leases, err := r.cs.CoordinationV1().Leases(LeaseNamespace).List(context.Background(), metav1.ListOptions{})
+		if err != nil || len(leases.Items) != 0 {
+			t.Errorf("leases %+v, err %v: the controller campaigned without the Update CRD", leases, err)
+		}
+	})
+}
+
+// lockedWriter serialises a log handler's writes against the test reading them.
+type lockedWriter struct {
+	mu *sync.Mutex
+	w  io.Writer
+}
+
+func (l lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
 }
