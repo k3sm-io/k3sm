@@ -326,6 +326,9 @@ type runtimedRuntime struct {
 	// is what the delete is keyed on anyway. It is also the dedupe: one loop per
 	// pod id, however many late creates land for it.
 	compensating map[string]bool // pod id -> the delete is outstanding (true), or landed with its release running (false)
+	// compensateAgain marks a pod id whose running compensating delete owes one more
+	// attempt, for a late create that joined it. Guarded by mu; created on first use.
+	compensateAgain map[string]bool
 
 	// lifetime is closed when the provider shuts down — the Watch context, which
 	// bounds every other provider-owned goroutine, ending. It bounds the ONE

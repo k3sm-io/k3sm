@@ -20,6 +20,8 @@ import (
 	"context"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
+
 	"k3sm.io/k3sm/pkg/provider/vkadapter"
 )
 
@@ -42,9 +44,12 @@ func TestCreateOverlappingDeleteLeavesNoTrackOrGuest(t *testing.T) {
 		testCreateInsidePodDelete(t, true)
 	})
 	t.Run("a same-name successor lands inside its predecessor's delete, under its own UID", testSuccessorInsidePredecessorDelete)
+	t.Run("a second retry lands inside the compensating delete", testSecondRetryInsideCompensatingDelete)
+	t.Run("a second retry lands after the compensating delete retired", testSecondRetryAfterCompensatingDelete)
+	t.Run("nothing can land while a compensating entry is false", testNothingLandsBesideFalseEntry)
 }
 
-// holdRelease holds every fence release of x's provider at its start, and reports
+// holdRelease holds every fence release of r at its start, and reports
 // the releases entered and the creates waiting at the fence.
 func holdRelease(t *testing.T, r *runtimedRuntime) (entered, waiting <-chan struct{}, release func()) {
 	t.Helper()
@@ -313,4 +318,126 @@ func testSuccessorInsidePredecessorDelete(t *testing.T) {
 	if x.r.trackByID(string(successor.UID)) == nil {
 		t.Error("the successor lost its track")
 	}
+}
+
+// parkedWithTwoRetries has a parked pod with two retries inside the runtime's create:
+// `kubectl set image` retires the first retry's schedule, and its RPC runs on.
+func parkedWithTwoRetries(t *testing.T, name string) (x *twoRetries) {
+	t.Helper()
+	pod := probePullPod(name)
+	r, f, clk, landFirst := parkedWithHeldRetry(t, pod)
+	t.Cleanup(landFirst)
+	landSecond := f.holdCreate()
+	t.Cleanup(landSecond)
+	edited := pod.DeepCopy()
+	edited.Spec.Containers[0].Image = "registry.example/web:2"
+	if err := r.UpdatePod(context.Background(), edited); err != nil {
+		t.Fatalf("UpdatePod on a parked pod = %v, want nil", err)
+	}
+	waitRestart(t, "the second retry's CreatePod to be entered", func() bool { return f.createCount() == 3 })
+	return &twoRetries{pod: pod, r: r, f: f, hasWaiters: clk.HasWaiters, landFirst: landFirst, landSecond: landSecond}
+}
+
+// twoRetries is the state parkedWithTwoRetries leaves. Each land func lets one retry's
+// create finish.
+type twoRetries struct {
+	pod        *corev1.Pod
+	r          *runtimedRuntime
+	f          *fakeRuntimeServer
+	hasWaiters func() bool
+	landFirst  func()
+	landSecond func()
+}
+
+// The pod's own delete, the compensating delete of the first retry, and that of the
+// second, which must be a delete of its own.
+const ownThenTwoCompensating = 3
+
+// testSecondRetryInsideCompensatingDelete: runtimed forgets the pod first thing in its
+// DeletePod, so while that RPC stops the first guest, a second create registers a guest
+// the RPC will not touch. Fails when the second retry only joins the running loop: the
+// guest stands with nothing left to delete it.
+func testSecondRetryInsideCompensatingDelete(t *testing.T) {
+	ctx := context.Background()
+	x := parkedWithTwoRetries(t, "second-inside")
+	id := string(x.pod.UID)
+	if err := x.r.DeletePod(ctx, x.pod.DeepCopy()); err != nil {
+		t.Fatalf("DeletePod: %v", err)
+	}
+	releaseDelete := x.f.holdDelete()
+	defer releaseDelete()
+
+	x.landFirst()
+	waitRestart(t, "the compensating delete to be entered", func() bool { return len(x.f.deleteRecords()) == 2 })
+	stopHoldingDeletes(x.f)
+	x.landSecond()
+	waitRestart(t, "the second retry to land", func() bool { return x.f.hasCreated(id) && updatingCount(x.r, id) == 0 })
+	assertTracked(t, x.r, id, "the compensating delete is the last call out")
+
+	releaseDelete()
+	waitRestart(t, "the guest the second retry built to go", func() bool { return !x.f.hasCreated(id) })
+	assertNothingLeft(t, x.r, x.f, x.pod, x.hasWaiters)
+	if n := len(x.f.deleteRecords()); n != ownThenTwoCompensating {
+		t.Errorf("runtime DeletePod calls = %d, want %d", n, ownThenTwoCompensating)
+	}
+}
+
+// testSecondRetryAfterCompensatingDelete: with a retry still out the landed delete owes
+// no release, so its entry goes in the decision that says so and the second retry opens
+// a delete of its own. Fails when an entry stays behind that decision, as the second
+// retry can land there and join a loop that has finished.
+func testSecondRetryAfterCompensatingDelete(t *testing.T) {
+	ctx := context.Background()
+	x := parkedWithTwoRetries(t, "second-after")
+	id := string(x.pod.UID)
+	if err := x.r.DeletePod(ctx, x.pod.DeepCopy()); err != nil {
+		t.Fatalf("DeletePod: %v", err)
+	}
+	x.landFirst()
+	waitRestart(t, "the first compensating delete to retire", func() bool {
+		return len(x.f.deleteRecords()) == 2 && compensatingCount(x.r) == 0
+	})
+	if updatingCount(x.r, id) != 1 {
+		t.Fatalf("retries out = %d, want the second", updatingCount(x.r, id))
+	}
+	x.landSecond()
+	waitRestart(t, "the second compensating delete", func() bool { return len(x.f.deleteRecords()) == ownThenTwoCompensating })
+	assertNothingLeft(t, x.r, x.f, x.pod, x.hasWaiters)
+}
+
+// testNothingLandsBesideFalseEntry pins why compensateLateCreate needs no answer to an
+// entry at false: that entry stands only while a release runs, which only begins with
+// every create and retry returned, and nothing new gets past the entry. Fails when a
+// create or a retry can begin beside it.
+func testNothingLandsBesideFalseEntry(t *testing.T) {
+	ctx := context.Background()
+	pod := probePullPod("false-entry")
+	id := string(pod.UID)
+	r, f, clk, land := parkedWithHeldRetry(t, pod)
+	defer land()
+	tr := r.trackByID(id)
+	entered, _, release := holdRelease(t, r)
+	if err := r.DeletePod(ctx, pod.DeepCopy()); err != nil {
+		t.Fatalf("DeletePod: %v", err)
+	}
+	land()
+	waitRestart(t, "the release to begin", func() bool { return len(entered) == 1 })
+
+	r.mu.Lock()
+	outstanding, recorded := r.compensating[id]
+	counted := r.admitting[id] + r.updating[id]
+	r.mu.Unlock()
+	if !recorded || outstanding {
+		t.Fatalf("compensating entry = %v (recorded %v), want false", outstanding, recorded)
+	}
+	if counted != 0 {
+		t.Errorf("calls counted beside the release = %d, want 0", counted)
+	}
+	assertStaleCreateBuildsNothing(t, r, f, pod)
+	if r.beginParkedRetry(id, tr) {
+		r.updateDone(pod)
+		t.Error("a retry began beside the release")
+	}
+	release()
+	assertNothingLeft(t, r, f, pod, clk.HasWaiters)
 }
