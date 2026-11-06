@@ -16,8 +16,9 @@
 #   b1370.5  cmd/k3sm: model push round-trips through the registry over the
 #            push gate; a second push uploads no blob.
 #   b1370.6  pkg/mlx, pkg/mlx/operator: the render of spec.artifact (an image
-#            volume by digest, no cache PVC, no egress; the digest resolved once
-#            per generation).
+#            volume by digest, no cache PVC, no egress; an unresolved digest
+#            or a reference off the cluster registry refused; the digest
+#            resolved once per generation).
 #
 # Unit tests only, under -race: no cluster, no network, no privilege. A
 # listed test that does not exist yet is PENDING, not a pass.
@@ -67,7 +68,7 @@ ladder "$(run ./pkg/modelpack/ TestSplitSafetensorsIsNLayers TestSplitGGUFIsNLay
 ladder "$(run ./pkg/modelpack/ TestManifestIsDeterministic)" "b1370.3  modelpack: deterministic manifest"
 ladder "$(run ./pkg/modelpack/ TestRefusesCaseCollidingPaths TestRefusesCodeFilesBeforeReading)" "b1370.4  modelpack: case collisions and code files refused before reading"
 ladder "$(run ./cmd/k3sm/ TestModelPushRoundTripsThroughTheRegistry)" "b1370.5  model push round-trips through the registry; a second push uploads no blob"
-ladder "$(run ./pkg/mlx/ TestRenderArtifactModelAsImageVolume TestRenderArtifactModelHasNoCachePVCOrEgress)" "b1370.6a mlx: spec.artifact renders an image volume, no cache PVC, no egress"
+ladder "$(run ./pkg/mlx/ TestRenderArtifactModelAsImageVolume TestRenderArtifactModelHasNoCachePVCOrEgress TestRenderRefusesUnresolvedOrForeignArtifact)" "b1370.6a mlx: spec.artifact renders an image volume, no cache PVC, no egress; unresolved or foreign refused"
 ladder "$(run ./pkg/mlx/operator/ TestResolvesArtifactDigestOncePerGeneration)" "b1370.6b mlx operator: the artifact digest is resolved once per generation"
 
 echo "----------------------------------------"
