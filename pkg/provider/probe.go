@@ -491,7 +491,8 @@ type probeState interface {
 // CreatePod and stopped at DeletePod.
 //
 // Goroutine discipline: each (container, probeKind) is one goroutine bounded by
-// the ctx passed to start; stop cancels it and waits. monitors is built before
+// the ctx passed to start; stop cancels it and waits, and may be called again.
+// monitors is built before
 // start and never mutated, so its lookup needs no lock (each monitor guards its
 // own mutable state). onTransition (the status re-publish) and doRestart run
 // OUTSIDE any monitor lock, honoring the VK NotifyPods re-entrancy rule.

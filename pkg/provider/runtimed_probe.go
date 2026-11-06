@@ -469,6 +469,28 @@ func (r *runtimedRuntime) stopProber(id string) {
 	}
 }
 
+// stopVMProbes ends a vm pod's probe loops when its delete starts, so nothing checks
+// a guest that is shutting down. A pod on another backend keeps probing until its
+// runtime call returns, as a kubelet keeps a terminating container's readiness probe
+// running.
+//
+// The entry stays in r.probers until stopProber at the end of the teardown: its last
+// verdict is what the statuses published during the stop overlay. Without it a
+// container that was not ready would read as the runtime's own flag, which is true
+// for anything running, and PodReady could rise on a pod being deleted.
+func (r *runtimedRuntime) stopVMProbes(pod *corev1.Pod) {
+	backend, err := podSandboxBackend(pod)
+	if err != nil || backend != runtimev1.SandboxBackend_SANDBOX_BACKEND_VM {
+		return
+	}
+	r.mu.Lock()
+	pr := r.probers[string(pod.UID)]
+	r.mu.Unlock()
+	if pr != nil {
+		pr.stop()
+	}
+}
+
 // proberFor returns the pod's prober as a probeState for the status overlay, or a
 // nil interface (not a typed nil) when the pod has none — so toPodStatus's nil
 // check is correct.
