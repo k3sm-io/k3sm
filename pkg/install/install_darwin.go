@@ -1232,6 +1232,40 @@ func (darwinSystem) RemoveEntry(dir, name string) error {
 	return nil
 }
 
+// RemoveEntryBeneath walks from root through subdirs with openat(O_NOFOLLOW) and
+// unlinks name against the last descriptor. See the System interface for the
+// contract.
+func (darwinSystem) RemoveEntryBeneath(root string, subdirs []string, name string) error {
+	for _, s := range append([]string{name}, subdirs...) {
+		if s == "" || s != filepath.Base(s) || s == "." || s == ".." {
+			return fmt.Errorf("remove %q beneath %s: not a bare entry name", s, root)
+		}
+	}
+	fd, err := openDirNoFollow(root)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("remove %s beneath %s: %w", name, root, err)
+	}
+	defer func() { _ = unix.Close(fd) }()
+	for _, s := range subdirs {
+		next, err := unix.Openat(fd, s, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if errors.Is(err, unix.ENOENT) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("remove %s beneath %s: open %s: %w", name, root, s, err)
+		}
+		_ = unix.Close(fd)
+		fd = next
+	}
+	if err := unix.Unlinkat(fd, name, 0); err != nil && !errors.Is(err, unix.ENOENT) {
+		return fmt.Errorf("remove %s beneath %s: %w", name, root, err)
+	}
+	return nil
+}
+
 // OpenDirNoFollow opens dir O_NOFOLLOW|O_DIRECTORY and returns a handle that
 // reads and removes entries against that one descriptor. See the System
 // interface for the contract.

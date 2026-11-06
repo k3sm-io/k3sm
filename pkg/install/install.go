@@ -703,6 +703,12 @@ type System interface {
 	// symlink between the check and the unlink, and root would then delete a
 	// file of the service user's choosing.
 	RemoveEntry(dir, name string) error
+	// RemoveEntryBeneath unlinks the file name inside the directory reached from
+	// root through subdirs, opening root and each level descriptor-relative with
+	// O_NOFOLLOW, so a symlink at root or at any level is refused (an error that
+	// is not fs.ErrNotExist) and nothing is unlinked through it. A missing level
+	// or file is success.
+	RemoveEntryBeneath(root string, subdirs []string, name string) error
 	// OpenDirNoFollow opens dir and HOLDS it: a directory whose final component
 	// is a symlink is refused (an error that is not fs.ErrNotExist), and every
 	// read and removal through the returned handle is descriptor-relative, so a
@@ -1835,12 +1841,19 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 // removeLeftoverZot removes the zot an earlier release staged in the server's work
 // dir, with its version marker, once the install can no longer be rolled back. The
 // new server never runs it, and a later rollback reinstall seeds its own from its
-// own payload. A file left behind costs nothing, so a failure is logged and survived.
+// own payload. A file left behind costs nothing, so a failure or a refusal is
+// logged and survived.
+//
+// It runs as root over a tree the service user owns from server down, so it walks
+// from the data root without following a symlink at any level: the data root is
+// root's by now (ensureStateTree), but that step does not touch the server level,
+// so a link planted while an older build left the root service-user-owned survives
+// it.
 func removeLeftoverZot(sys System, cfg Config) {
-	bin := filepath.Join(cfg.serverWorkDir(), "bin")
+	subdirs := []string{filepath.Base(cfg.serverWorkDir()), "bin"}
 	for _, name := range []string{registrysvc.ZotBinaryName, registrysvc.ZotMarkerName} {
-		if err := sys.RemoveEntry(bin, name); err != nil {
-			cfg.Logger.Warn("could not remove the zot an earlier release left in the work dir", "dir", bin, "name", name, "err", err)
+		if err := sys.RemoveEntryBeneath(cfg.DataRoot, subdirs, name); err != nil {
+			cfg.Logger.Warn("could not remove the zot an earlier release left in the work dir", "root", cfg.DataRoot, "name", name, "err", err)
 		}
 	}
 }
