@@ -2338,6 +2338,12 @@ func (r *runtimedRuntime) createBehindDelete(id string, t *podTrack) bool {
 // tree too, and forgets the track. A claim worker's create can land here beside one,
 // since it runs off VK's queue, and another create that lands first withdraws this
 // refusal (withdrawRefusalLocked).
+//
+// Another create in its RPC is not read here, as none can be beside this removal:
+// a create in its RPC holds a track GetPod answers with, so Virtual Kubelet's next
+// call is UpdatePod, and a parked pod's retry counts as an update
+// (TestRefusedRecreateBesideCreateKeepsTheAddress). Still open: a create that begins
+// behind this removal and allocates before the release below runs.
 func (r *runtimedRuntime) untrackRejectedCreate(pod *corev1.Pod, t *podTrack) {
 	id := string(pod.UID)
 	r.mu.Lock()
