@@ -919,3 +919,28 @@ func TestRefusedTokenOnANodeCredentialSaysWhatToDo(t *testing.T) {
 		t.Errorf("mintToken = %q, %v; a node with the grant still mints", tok.value, err)
 	}
 }
+
+// TestRootSourcesDoNotBypassTheInvokersClusterCheck: with the root sources production
+// sets, the invoker's file still reaches a push token only through checkSudoUserCluster,
+// so a file holding another cluster's CA is refused rather than taken by root's choice.
+func TestRootSourcesDoNotBypassTheInvokersClusterCheck(t *testing.T) {
+	nodeCA, otherCA := testClusterCAPEM(t), testClusterCAPEM(t)
+	dir := t.TempDir()
+	node := filepath.Join(dir, "node.kubeconfig")
+	writeKubeconfigWithCA(t, node, "https://node.example:6443", nodeCA)
+	var warn bytes.Buffer
+	in, sudo := refusalWorker(t, node, "", inlineKubeconfig(otherCA, ""), &warn, nil)
+	sudo.readFile = anchoredAt(nodeCA, sudo.readFile)
+	in.root = &rootKubeSources{
+		sudoUser: sudo.sudoUser,
+		lookup:   sudo.lookup,
+		lookupID: func(string) (*user.User, error) { return sudo.lookup("root") },
+		readFile: sudo.readFile,
+	}
+	if _, _, _, err := registryClients(in, sudo); !errors.Is(err, errSudoKubeconfigRefused) {
+		t.Fatalf("err = %v, want the cluster check's refusal", err)
+	}
+	if in.root.sudoUser != sudo.sudoUser {
+		t.Errorf("the caller's root sources changed: sudoUser %q", in.root.sudoUser)
+	}
+}

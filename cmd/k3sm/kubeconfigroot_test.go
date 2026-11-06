@@ -24,6 +24,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -660,4 +661,65 @@ func TestRootHomeComesFromTheUserDatabase(t *testing.T) {
 	if got := kubeHome(); got == envHome || !filepath.IsAbs(got) {
 		t.Errorf("as root, kubeHome = %q, want root's home from the user database", got)
 	}
+}
+
+// TestRootOnAWorkerSkipsTheLeftoverWorkDir: a worker's work dir holds only what an
+// earlier server install left, so root reads it only when asked to by name, and
+// root's refusal there gives the fix that works on a worker.
+func TestRootOnAWorkerSkipsTheLeftoverWorkDir(t *testing.T) {
+	const nodeFile = "/var/lib/k3sm/node.kubeconfig"
+	workFile := executor.KubeconfigPath(rootTestWorkDir)
+	aliceFile := filepath.Join(aliceHome, ".kube", "config")
+	inline := kubeconfigWithUser("{token: inline-token}")
+	worker := func(files map[string]sudoKubeconfigFile, reads *[]string) kubectlInputs {
+		return kubectlInputs{
+			workDir:        rootTestWorkDir,
+			contextName:    "k3sm",
+			role:           install.RoleAgent,
+			nodeKubeconfig: nodeFile,
+			root:           fakeRootSources("alice", files, reads),
+		}
+	}
+	leftover := regular(0, 0o600, inline)
+	anchor := regular(0, 0o644, string(fixtureCA(t)))
+
+	t.Run("the invoker's file is used instead", func(t *testing.T) {
+		var reads []string
+		got, err := resolveKubectlConfig(worker(map[string]sudoKubeconfigFile{workFile: leftover, aliceFile: regular(aliceUID, 0o600, inline)}, &reads))
+		if err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		if got.kubeconfig == workFile || got.checked == nil {
+			t.Errorf("chose %+v", got)
+		}
+		if slices.Contains(reads, workFile) {
+			t.Errorf("read the leftover %s: %v", workFile, reads)
+		}
+	})
+	t.Run("named by K3SM_WORK_DIR it is read", func(t *testing.T) {
+		in := worker(map[string]sudoKubeconfigFile{workFile: leftover, install.AgentClusterCAPath: anchor}, nil)
+		in.workDirOverride = rootTestWorkDir
+		got, err := resolveKubectlConfig(in)
+		if err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		if got.kubeconfig != workFile {
+			t.Errorf("chose %q, want %q", got.kubeconfig, workFile)
+		}
+	})
+	t.Run("with nothing else root stops without the node credential", func(t *testing.T) {
+		var reads []string
+		_, err := resolveKubectlConfig(worker(map[string]sudoKubeconfigFile{workFile: leftover, nodeFile: regular(0, 0o600, inline)}, &reads))
+		if err == nil {
+			t.Fatal("resolve accepted a worker with no kubeconfig of root's or the invoker's")
+		}
+		for _, want := range []string{"root does not use the node credential", rootNodeCredentialFix} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("err = %v, want it to contain %q", err, want)
+			}
+		}
+		if slices.Contains(reads, workFile) || slices.Contains(reads, nodeFile) {
+			t.Errorf("read a file root does not use: %v", reads)
+		}
+	})
 }
