@@ -145,6 +145,7 @@ pin, its date, and the tarball's sha256.
   the repository, the empty descriptor's included. An index's children and a manifest's subject still need
   not be present; the PUT restarts the garbage collection grace of those that are, on a best-effort basis.
 - A pod whose create failed and which was then deleted no longer keeps its address and references until the node restarts. The orphan reaper releases them once the apiserver has stopped holding the pod.
+- A pod whose create failed and which was then deleted no longer keeps its address and references until the node restarts. The orphan reaper releases them, and removes the pod's log directory, once the apiserver has stopped holding the pod.
 - A pod created under the name of one the node is still finishing a delete for now starts. It could be sent to update the old pod instead, and be left with an address nothing owned or fail for good.
 - A create the runtime refuses after a second create of the same pod took over no longer takes that pod's address and log directory while it runs.
 - A pod deleted while the runtime is still creating it no longer keeps running with no owner. The node deletes it again once the create lands, and keeps the pod's address until that delete has succeeded, so no new pod can be given it beside the running one. A create of a pod the node has already torn down is ignored.

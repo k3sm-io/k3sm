@@ -230,6 +230,9 @@ func (r *runtimedRuntime) reapUntrackedHold(id string) {
 		"namespace", pod.Namespace, "name", pod.Name, "uid", id,
 		"consecutiveNotFound", orphanReapThreshold)
 	r.fenceRelease(pod, claim)
+	// Translation made the tree before the create failed. No guest ran, so nothing
+	// has it open, and the log GC would only take it later.
+	r.removePodLogs(pod)
 }
 
 // liveVerdict confirms, with a direct apiserver Get, whether a pod the List did

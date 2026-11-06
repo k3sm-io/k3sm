@@ -19,10 +19,14 @@ package provider
 import (
 	"context"
 	"errors"
+	"io/fs"
+	"os"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+
+	"k3sm.io/k3sm/pkg/provider/podlogs"
 )
 
 // failCreateForReap leaves x's pod in the state a failed create does: an address and
@@ -64,8 +68,15 @@ func TestReaperReleasesHeldUIDWithNoTrack(t *testing.T) {
 				t.Fatalf("releases after %d gone ticks = %d, want 0 below the threshold", i, n)
 			}
 		}
+		logs := podlogs.BuildPodLogsDirectory(x.r.logGC.PodLogsDir, x.pod.Namespace, x.pod.Name, string(x.pod.UID))
+		if _, err := os.Stat(logs); err != nil {
+			t.Fatalf("the failed create left no log tree, so the test proves nothing: %v", err)
+		}
 		x.r.reapOrphans(ctx)
 		x.assertForgotten(t)
+		if _, err := os.Stat(logs); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("the pod's log tree after the release: %v, want it gone", err)
+		}
 		x.r.reapOrphans(ctx)
 		if _, n := p.counts(); n != 1 {
 			t.Errorf("releases = %d, want 1", n)
