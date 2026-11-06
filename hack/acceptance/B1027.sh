@@ -19,8 +19,10 @@
 #      server's start, and no verb shortens that). The layer must then be one
 #      inode, served with the right bytes from both repositories.
 #   3. The server stops, and a .tmp-<uuid> link of that inode goes into the first
-#      repository's blob directory, which is what a crash between a merge's link
-#      and its rename leaves.
+#      repository's .temps directory, which is what a crash between a merge's link
+#      and its rename leaves. A temp in blobs/sha256, where earlier builds put it,
+#      fails zot's GC of that repository, so only the k3sm GC can clear one, and the
+#      leg does not plant one.
 #   4. zot serves that store, with GC on. Its delay and interval are 1s and 10s
 #      against the released 1h and 6h, so that a cycle fits in the leg.
 #   5. After zot's GC has reported on both repositories, zot must answer, serve the
@@ -48,20 +50,35 @@ PASSWORD="b1027-$$-leg"
 TEMP_REPO=rollback/one
 CONTROL_REPO=rollback/two
 
-# plant_temp <run dir> <blob path> - links the blob to .tmp-<uuid> beside it and
-# echoes the temp's path. Refuses a blob outside the run directory.
+# plant_temp <run dir> <blob path> - links the blob to .tmp-<uuid> in its repository's
+# .temps directory and echoes the temp's path. Refuses a blob outside the run directory.
 plant_temp() {
-	local run="$1" blob="$2" tmp
+	local run="$1" blob="$2" temps tmp
 	case "$blob" in "$run"/*) ;; *) echo "$GATE_NAME: refusing to plant a temp outside $run: $blob" >&2; return 1 ;; esac
-	tmp="$(dirname "$blob")/.tmp-$(python3 -I -c 'import uuid; print(uuid.uuid4())')"
+	temps="$(dirname "$(dirname "$(dirname "$blob")")")/.temps"
+	mkdir -p "$temps" || return 1
+	tmp="$temps/.tmp-$(python3 -I -c 'import uuid; print(uuid.uuid4())')"
 	ln "$blob" "$tmp" || return 1
 	echo "$tmp"
 }
 
-# temp_ok <temp path> <blob path> - the temp has a crashed merge's name and inode.
+# merge_went_through_temps <store> <repo...> - the pass's merges made .temps in some
+# repository and left no temp among the blobs of any, so what the leg plants is where
+# the store puts one.
+merge_went_through_temps() {
+	local store="$1" r seen=no
+	shift
+	for r in "$@"; do
+		[ ! -d "$store/$r/.temps" ] || seen=yes
+		[ -z "$(find "$store/$r/blobs" -name '.tmp-*' -print -quit)" ] || { echo "$GATE_NAME: a temp among the blobs of $r" >&2; return 1; }
+	done
+	[ "$seen" = yes ] || { echo "$GATE_NAME: no repository has a .temps directory after the pass" >&2; return 1; }
+}
+
+# temp_ok <temp path> <blob path> - the temp has a crashed merge's place, name and inode.
 temp_ok() {
 	local name; name="$(basename "$1")"
-	[ "${#name}" -eq 41 ] && case "$name" in .tmp-*-*-*-*-*) ;; *) false ;; esac && rd_same_inode "$1" "$2"
+	[ "$(basename "$(dirname "$1")")" = .temps ] && [ "${#name}" -eq 41 ] && case "$name" in .tmp-*-*-*-*-*) ;; *) false ;; esac && rd_same_inode "$1" "$2"
 }
 
 # zot_gc_result <zot log> <repo> - ok, failed or none: zot's latest report of GC on
@@ -149,7 +166,7 @@ self_test() {
 	fixture
 	exp ok "rollback: a clean store" checks
 
-	# Mutant, and the one zot v2.1.22 gives today: the temp fails GC of its repository.
+	# Mutant, and what zot v2.1.22 gives for a temp in blobs/sha256: GC of its repository fails.
 	fixture; bad_line "$TEMP_REPO" >>"$t/zot.log"
 	exp no "rollback: GC of the temp's repository failed" checks
 	fixture; bad_line "$CONTROL_REPO" >>"$t/zot.log"
@@ -198,11 +215,21 @@ self_test() {
 	tmp="$(plant_temp "$t" "$blob")"
 	exp ok "temp: a link with a temp's name" temp_ok "$tmp" "$blob"
 	exp no "temp: a copy is not a crashed merge's link" temp_ok "$t/layer" "$blob"
-	cp "$blob" "$(dirname "$blob")/.tmp-11111111-2222-3333-4444-555555555555"
-	exp no "temp: a copy with a temp's name" temp_ok "$(dirname "$blob")/.tmp-11111111-2222-3333-4444-555555555555" "$blob"
-	ln "$blob" "$(dirname "$blob")/.tmp-short"
-	exp no "temp: a link with a short name" temp_ok "$(dirname "$blob")/.tmp-short" "$blob"
+	exp ok "temp: planted in the repository's .temps" test "$(dirname "$tmp")" = "$root/$TEMP_REPO/.temps"
+	cp "$blob" "$(dirname "$tmp")/.tmp-11111111-2222-3333-4444-555555555555"
+	exp no "temp: a copy with a temp's name" temp_ok "$(dirname "$tmp")/.tmp-11111111-2222-3333-4444-555555555555" "$blob"
+	ln "$blob" "$(dirname "$tmp")/.tmp-short"
+	exp no "temp: a link with a short name" temp_ok "$(dirname "$tmp")/.tmp-short" "$blob"
+	ln "$blob" "$(dirname "$blob")/.tmp-22222222-3333-4444-5555-666666666666"
+	exp no "temp: a link beside the blob" temp_ok "$(dirname "$blob")/.tmp-22222222-3333-4444-5555-666666666666" "$blob"
 	exp no "temp: refused outside the run" plant_temp "$t/elsewhere" "$blob"
+	# The store's own merges must have used the place the leg plants in.
+	fixture; mkdir -p "$root/$CONTROL_REPO/.temps"
+	exp ok "merge: .temps in one repository" merge_went_through_temps "$root" "$TEMP_REPO" "$CONTROL_REPO"
+	fixture
+	exp no "merge: no .temps anywhere" merge_went_through_temps "$root" "$TEMP_REPO" "$CONTROL_REPO"
+	fixture; mkdir -p "$root/$CONTROL_REPO/.temps"; : >"$root/$TEMP_REPO/blobs/sha256/.tmp-22222222-3333-4444-5555-666666666666"
+	exp no "merge: a temp among the blobs" merge_went_through_temps "$root" "$TEMP_REPO" "$CONTROL_REPO"
 	[ -z "$(find "$t/elsewhere" -type f 2>/dev/null)" ] || { echo "self-test FAIL: a refused temp left a file"; bad=1; }
 
 	# --lab is not a pass while the rest of the gate is unbuilt, with or without K3SM_LAB.
@@ -325,6 +352,7 @@ log "pass finished: $(awk 'index($0, "\"msg\":\"registry dedupe: pass finished\"
 kill "$K3SM_PID" 2>/dev/null || true
 wait "$K3SM_PID" 2>/dev/null || true
 PIDS=()
+merge_went_through_temps "$STORE" "$TEMP_REPO" "$CONTROL_REPO" || { echo "result: FAIL (the pass did not use .temps)"; exit 1; }
 BLOB="$(rd_blob_path "$STORE" "$TEMP_REPO" "$LAYER")"
 TEMP="$(plant_temp "$RUN" "$BLOB")"
 temp_ok "$TEMP" "$BLOB" || { echo "result: FAIL (the planted temp is not a link of the layer)"; exit 1; }
@@ -353,6 +381,8 @@ if ! zot_wait_gc "$ZOT_LOG" "$(($(date +%s) + ZOT_GC_WAIT))" "$ZOT_PID" "$TEMP_R
 	exit 1
 fi
 if [ -e "$TEMP" ]; then log "fact: zot left the temp in place"; else log "fact: zot removed the temp"; fi
+log "fact: zot logged $(grep -c '"level":"error"' "$ZOT_LOG" || true) errors; its GC reports and errors:"
+grep -E '"level":"error"|gc (un)?successfully completed for ' "$ZOT_LOG" | tail -n 12 || true
 if rollback_checks "$ZOT_LOG" "$STORE" "$LAYER" "$MANIFEST" "$ORPHAN_TEMP" "$ORPHAN_CONTROL"; then
 	echo "result: PASS"
 else
