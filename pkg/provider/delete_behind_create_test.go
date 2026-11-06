@@ -21,7 +21,10 @@ import (
 	"sync"
 	"testing"
 
+	"k8s.io/apimachinery/pkg/types"
+
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	"k3sm.io/k3sm/pkg/provider/vkadapter"
 )
 
 // podLevelRefusal is a create runtimed refuses for the whole pod, the shape that
@@ -226,5 +229,81 @@ func TestRefusedCreateBesideUpdateHoldsNothing(t *testing.T) {
 	}
 	if n := x.f.updateCount(); n != 0 {
 		t.Errorf("runtime UpdatePod calls = %d, want 0", n)
+	}
+}
+
+// stopHoldingCreates leaves a create already inside the fake's RPC held, on the hold
+// it took on entry, and lets later creates through.
+func stopHoldingCreates(f *fakeRuntimeServer) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.createHold = nil
+}
+
+// TestSuccessorReachesCreateBesideDeleteOwed: a track whose delete is owed is gone from
+// the cluster, and stays only for the call still out. A same-name successor reaching
+// Virtual Kubelet then must find no pod of that name, since createOrUpdatePod sends
+// whatever GetPod answers down UpdatePod, or nowhere when the specs match. Fails when
+// the owed track still answers for the name: the successor never reaches CreatePod.
+func TestSuccessorReachesCreateBesideDeleteOwed(t *testing.T) {
+	ctx := context.Background()
+	x := newTerminalUpdateFixture(t, compressorAt(10))
+	p := probeNetwork(x)
+	id := string(x.pod.UID)
+	release := x.f.holdCreate()
+	defer release()
+
+	created := make(chan error, 1)
+	go func() { created <- x.r.CreatePod(ctx, x.pod.DeepCopy()) }()
+	waitRestart(t, "the create's RPC to be entered", func() bool { return x.f.createCount() == 1 })
+	stopHoldingCreates(x.f)
+	tr := x.r.trackByID(id)
+	if tr == nil {
+		t.Fatal("the create published no track")
+	}
+	if got, err := x.r.GetPod(ctx, x.pod.Namespace, x.pod.Name); err != nil || got.UID != x.pod.UID {
+		t.Fatalf("GetPod before the delete = %v, %v, want the pod", got, err)
+	}
+	x.r.reapOrphan(ctx, x.pod.DeepCopy(), tr)
+	x.assertGoneFromAPI(ctx, t)
+
+	if got, err := x.r.GetPod(ctx, x.pod.Namespace, x.pod.Name); !vkadapter.IsNotFound(err) {
+		t.Fatalf("GetPod with the delete owed = %v, %v, want NotFound", got, err)
+	}
+	if st, err := x.r.GetPodStatus(ctx, x.pod.Namespace, x.pod.Name); !vkadapter.IsNotFound(err) {
+		t.Errorf("GetPodStatus with the delete owed = %v, %v, want NotFound", st, err)
+	}
+
+	successor := x.pod.DeepCopy()
+	successor.UID = types.UID("successor")
+	successor.Annotations = nil
+	if err := x.r.CreatePod(ctx, successor); err != nil {
+		t.Fatalf("the successor's create: %v", err)
+	}
+	got, err := x.r.GetPod(ctx, x.pod.Namespace, x.pod.Name)
+	if err != nil || got.UID != successor.UID {
+		t.Fatalf("GetPod beside the successor = %v, %v, want the successor", got, err)
+	}
+	successorIP, ok := x.ipam.allocations()[string(successor.UID)]
+	if !ok {
+		t.Fatal("the successor holds no /32")
+	}
+
+	// The owed delete keeps its owner: the create's way out frees the predecessor,
+	// once, and nothing of the successor's.
+	x.f.pushCreate(podLevelRefusal())
+	release()
+	if err := awaitErr(t, created, "the create"); err == nil {
+		t.Fatal("the create succeeded; the test needs it refused")
+	}
+	x.assertForgotten(t)
+	if _, n := p.counts(); n != 1 {
+		t.Errorf("releases = %d, want 1", n)
+	}
+	if ip, ok := x.ipam.allocations()[string(successor.UID)]; !ok || ip != successorIP {
+		t.Errorf("the successor's /32 went from %s to %s (held %v)", successorIP, ip, ok)
+	}
+	if tr := x.r.trackByID(string(successor.UID)); tr == nil {
+		t.Error("the successor lost its track")
 	}
 }

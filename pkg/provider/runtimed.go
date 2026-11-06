@@ -3228,6 +3228,13 @@ func (r *runtimedRuntime) lookup(namespace, name string) (string, metav1.Time, *
 // to, or ("", nil) when no track carries that name. Every same-name candidate is
 // weighed through preferTrack, so the answer is independent of map iteration
 // order. The caller holds r.mu.
+//
+// A track whose delete is owed answers for no name. Its pod is stopped and gone from
+// the apiserver, and it stays only for the call still out of the pod, which reads it
+// by UID (claimFenceReleaseLocked). Answering would make Virtual Kubelet's GetPod send
+// a same-name successor down UpdatePod instead of CreatePod (createOrUpdatePod,
+// node/pod.go). A delete only begun still answers: its RPC can fail, and the retry
+// rests on GetPod finding the pod.
 func (r *runtimedRuntime) lookupTrackLocked(namespace, name string) (string, *podTrack) {
 	var (
 		bestID string
@@ -3235,6 +3242,9 @@ func (r *runtimedRuntime) lookupTrackLocked(namespace, name string) (string, *po
 	)
 	for id, t := range r.track {
 		if t.pod.Namespace != namespace || t.pod.Name != name {
+			continue
+		}
+		if del := r.deleteOwed[id]; del != nil && (del.owned == nil || del.owned == t) {
 			continue
 		}
 		if best == nil || preferTrack(t, best) == t {
