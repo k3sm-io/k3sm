@@ -425,3 +425,31 @@ func TestPutManifestSubjectIsNotRequiredAndIsFreshened(t *testing.T) {
 		})
 	}
 }
+
+// TestPutManifestDoesNotHonourInlineData pins that a config's inline data does
+// not stand in for its blob, for an artifact's config and for the empty
+// descriptor: the PUT is refused until the blob is pushed.
+func TestPutManifestDoesNotHonourInlineData(t *testing.T) {
+	inline := []byte("inline-config")
+	for _, tc := range []struct {
+		name   string
+		config ispec.Descriptor
+		blob   []byte
+	}{
+		{"an artifact config", ispec.Descriptor{MediaType: "application/vnd.example.config+json", Digest: dg(inline), Size: int64(len(inline)), Data: inline}, inline},
+		{"the empty descriptor", ispec.DescriptorEmptyJSON, ispec.DescriptorEmptyJSON.Data},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			m := ispec.Manifest{MediaType: ispec.MediaTypeImageManifest, Config: tc.config, Layers: []ispec.Descriptor{}}
+			m.SchemaVersion = 2
+			body, err := json.Marshal(m)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want(t, f.pushManifest(t, "app", "v1", ispec.MediaTypeImageManifest, body), http.StatusBadRequest, codeManifestBlobUnknown)
+			f.pushBlob(t, "app", tc.blob)
+			want(t, f.pushManifest(t, "app", "v1", ispec.MediaTypeImageManifest, body), http.StatusCreated, "")
+		})
+	}
+}

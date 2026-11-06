@@ -196,7 +196,8 @@ type checkedManifest struct {
 //     non-distributable layers, whatever its config type: the registry this
 //     replaces skips the check for a config type other than an OCI image
 //     config or the empty descriptor, which let an artifact be stored with
-//     a blob the collector had already reaped;
+//     a blob the collector had already reaped. A descriptor's inline data
+//     does not stand in for its blob;
 //   - an index or manifest list requires nothing: children need not exist,
 //     and neither need a subject on any manifest. The distribution spec lets a
 //     registry refuse a missing child but says it MUST accept a missing

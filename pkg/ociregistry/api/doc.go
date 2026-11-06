@@ -41,7 +41,9 @@ limitations under the License.
 //     above), requires the blobs a manifest names to be in the repository and
 //     never requires an index's children. The exception to following that
 //     registry: it requires no blobs of a manifest whose config type is neither
-//     an OCI image config nor the empty descriptor, and this server does. A PUT
+//     an OCI image config nor the empty descriptor, and this server does. A
+//     descriptor's inline data is not honoured: the blob must be in the
+//     repository, the empty descriptor's included. A PUT
 //     restarts the garbage-collection grace of each index child and subject the
 //     repository holds, under the repository lock, once per request, never
 //     while half that grace is left and for at most maxManifestTouches
