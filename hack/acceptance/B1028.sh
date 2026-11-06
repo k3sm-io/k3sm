@@ -2,7 +2,7 @@
 # Copyright The k3sm Authors.
 # SPDX-License-Identifier: Apache-2.0
 #
-# The registry baseline taken before zot leaves (docs/m23-plan.md resolution 20):
+# The registry baseline taken before zot leaves (the replacement must keep up with it):
 # zot and the k3sm registry measured on the SAME host, one at a time, each on a
 # loopback port with its own temp store under --work.
 #
