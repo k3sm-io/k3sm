@@ -105,6 +105,9 @@ const minimumGracePeriodSeconds int64 = 2
 // rootfsRoot is the per-pod-dir parent; dyldShim, when non-empty, is wired into
 // the annotation runtimed copies to DYLD_INSERT_LIBRARIES (the DNS shim).
 //
+// clusterRegistry is the cluster's one registry authority, the only host an
+// image volume may name; "" refuses every image volume (checkImageVolumeRegistry).
+//
 // Container env is carried structurally (literal value, valueFrom, envFrom);
 // resolvePodBoxEnv flattens it into literal values before the box reaches
 // runtimed, which reads only EnvVar.value and never talks to the apiserver.
@@ -128,7 +131,7 @@ const minimumGracePeriodSeconds int64 = 2
 // rewrites its wildcard binds onto that /32; hostNetwork/vm/no-network
 // pods (podIP == nodeIP) get nothing. log, when non-nil, receives the
 // host-binary-route warn — see injectBindDisciplineEnv.
-func toPodBox(pod *corev1.Pod, podIP, nodeIP, rootfsRoot, dyldShim string, dnsCfg netv1.DNSConfig, log *slog.Logger) (*runtimev1.PodBox, error) {
+func toPodBox(pod *corev1.Pod, podIP, nodeIP, rootfsRoot, dyldShim, clusterRegistry string, dnsCfg netv1.DNSConfig, log *slog.Logger) (*runtimev1.PodBox, error) {
 	box := &runtimev1.PodBox{
 		PodId:       string(pod.UID),
 		Namespace:   pod.Namespace,
@@ -197,7 +200,10 @@ func toPodBox(pod *corev1.Pod, podIP, nodeIP, rootfsRoot, dyldShim string, dnsCf
 	// — see injectBindDisciplineEnv.
 	injectBindDisciplineEnv(box, podIP, nodeIP, clusterCIDRs(dnsCfg.ClusterDNSIP), log)
 
-	box.Volumes = toVolumes(pod.Spec.Volumes)
+	box.Volumes, err = toVolumes(pod, clusterRegistry)
+	if err != nil {
+		return nil, err
+	}
 	box.PodSecurityContext = toPodSecurityContext(pod.Spec.SecurityContext)
 	// After every container list and the pod context are translated: the
 	// runAsNonRoot producer rule is a property of the whole pod.
@@ -1151,25 +1157,32 @@ func toLocalRefs(refs []corev1.LocalObjectReference) []*runtimev1.LocalObjectRef
 }
 
 // toVolumes maps the modeled corev1 volume subset (configMap / secret / emptyDir /
-// downwardAPI / projected / persistentVolumeClaim); volumes with an unmodeled
-// source are skipped (the
-// runtime materializes only the modeled set).
-func toVolumes(vols []corev1.Volume) []*runtimev1.Volume {
+// downwardAPI / projected / persistentVolumeClaim / image). A volume with an
+// unmodeled source is refused when a container mounts it and skipped when none
+// does (unmodeledVolume); an image volume off the cluster registry is refused
+// either way (checkImageVolumeRegistry).
+func toVolumes(pod *corev1.Pod, clusterRegistry string) ([]*runtimev1.Volume, error) {
+	vols := pod.Spec.Volumes
 	if len(vols) == 0 {
-		return nil
+		return nil, nil
 	}
+	mounted := mountedVolumes(pod)
 	out := make([]*runtimev1.Volume, 0, len(vols))
 	for i := range vols {
-		v := toVolume(&vols[i])
+		v, err := toVolume(&vols[i], mounted[vols[i].Name], clusterRegistry)
+		if err != nil {
+			return nil, err
+		}
 		if v != nil {
 			out = append(out, v)
 		}
 	}
-	return out
+	return out, nil
 }
 
-// toVolume maps one corev1.Volume's modeled source, or nil if none is modeled.
-func toVolume(v *corev1.Volume) *runtimev1.Volume {
+// toVolume maps one corev1.Volume's modeled source. An unmodeled source is a
+// *volumeRefusal when mounted, and nil when not.
+func toVolume(v *corev1.Volume, mounted bool, clusterRegistry string) (*runtimev1.Volume, error) {
 	rv := &runtimev1.Volume{Name: v.Name}
 	switch {
 	case v.ConfigMap != nil:
@@ -1184,10 +1197,27 @@ func toVolume(v *corev1.Volume) *runtimev1.Volume {
 		rv.Projected = toProjectedVolumeSource(v.Projected)
 	case v.PersistentVolumeClaim != nil:
 		rv.PersistentVolumeClaim = toPersistentVolumeClaimVolumeSource(v.PersistentVolumeClaim)
+	case v.Image != nil:
+		if err := checkImageVolumeRegistry(v, clusterRegistry); err != nil {
+			return nil, err
+		}
+		rv.Image = toImageVolumeSource(v.Image)
+	case mounted:
+		return nil, unmodeledVolume(v)
 	default:
-		return nil
+		return nil, nil
 	}
-	return rv
+	return rv, nil
+}
+
+// toImageVolumeSource maps a pod image volume (an OCI artifact mounted
+// read-only). paths stays empty: the provider never asks the runtime for a
+// subset of the artifact.
+func toImageVolumeSource(src *corev1.ImageVolumeSource) *runtimev1.ImageVolumeSource {
+	return &runtimev1.ImageVolumeSource{
+		Reference:  src.Reference,
+		PullPolicy: toImagePullPolicy(src.PullPolicy),
+	}
 }
 
 // toPersistentVolumeClaimVolumeSource maps the durable PVC source. Only the
@@ -1195,11 +1225,12 @@ func toVolume(v *corev1.Volume) *runtimev1.Volume {
 // (namespace, claim_name) through the shared storage contract, so the provider must
 // NOT resolve a path here.
 //
-// Dropping this case is not a benign omission. An unmodeled source returns nil and
-// the volume is silently skipped, so a container that mounts it fails downstream
-// with "volume_mount %q references undefined volume" — naming the MOUNT, never the
-// missing source. That is what made every StatefulSet with a volumeClaimTemplate
-// unschedulable while the PVC itself bound correctly.
+// Dropping this case is not a benign omission. A mounted unmodeled source is
+// refused (unmodeledVolume); before that it was silently skipped, and a container
+// that mounted it failed downstream with "volume_mount %q references undefined
+// volume", naming the MOUNT, never the missing source. That is what made every
+// StatefulSet with a volumeClaimTemplate unschedulable while the PVC itself bound
+// correctly.
 func toPersistentVolumeClaimVolumeSource(src *corev1.PersistentVolumeClaimVolumeSource) *runtimev1.PersistentVolumeClaimVolumeSource {
 	return &runtimev1.PersistentVolumeClaimVolumeSource{
 		ClaimName: src.ClaimName,

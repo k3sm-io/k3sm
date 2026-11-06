@@ -189,7 +189,7 @@ func TestVMPodFQDNWithoutClusterDomain(t *testing.T) {
 	}
 	logs := &syncBuffer{}
 	log := slog.New(slog.NewTextHandler(logs, nil))
-	box, err := toPodBox(pod, "10.42.0.7", "192.168.1.10", t.TempDir(), "", netv1.DNSConfig{}, log)
+	box, err := toPodBox(pod, "10.42.0.7", "192.168.1.10", t.TempDir(), "", "", netv1.DNSConfig{}, log)
 	if err != nil {
 		t.Fatalf("toPodBox: %v", err)
 	}
