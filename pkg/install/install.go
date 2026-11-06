@@ -2552,6 +2552,11 @@ func publishedWiring(ctx context.Context, sys System, cfg Config, m []artifact, 
 			return fmt.Errorf("install: link %s -> %s: %w", a.path, a.target, err)
 		}
 	}
+	// 3a′. A recorded node pod range this install no longer seeds goes before
+	//      the plist that seeds the new one: see retireStaleNodeIdentity.
+	if err := retireStaleNodeIdentity(sys, cfg); err != nil {
+		return err
+	}
 	// 3b. Render + write both plists, in manifest (install) order. Before each
 	//     write, the file limit the new plist requests is checked against the
 	//     kernel ceiling, and compared with the limit the plist being replaced
