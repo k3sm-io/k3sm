@@ -312,6 +312,12 @@ verbatim, and the Job. The Job's pod is a native pod that:
 - runs `build.sh --stage-only`, which is every check and step below up to the
   context ceiling, into the claim.
 
+If a wheel download stays below 1 MB/s for 60 seconds, `build.sh` kills uv and runs
+it again, up to 25 times, because a stalled connection stays stalled while bytes
+keep arriving and a fresh one usually gets the normal rate. Finished wheels stay
+in uv's cache, and uv still checks them against the lockfile's hashes. Running out
+of restarts fails the stage with `uv download stalled`.
+
 It carries **no credential**: no Secret, no service-account token, no pull
 secret. The registry credential never leaves the operator's user on the host.
 The node is chosen with a `nodeSelector`, so the scheduler places the pod and
