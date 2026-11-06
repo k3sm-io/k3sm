@@ -204,6 +204,13 @@ pin, its date, and the tarball's sha256.
 
 ### Fixed
 
+- A Pod whose `image` volume the node cannot fetch for want of store space is now kept `Pending` with
+  the waiting reason `ArtifactPullBackOff` and retried on the image pull back-off, where it used to fail
+  at creation. A volume whose reference the runtime refuses as naming another registry is kept with
+  `ArtifactPullRefused` and one Warning Event, and is not retried. An unresolvable `imagePullSecret` for
+  an `image` volume records one `Failed` Event and is re-checked quietly until the Secret is fixed,
+  instead of retrying with an Event per attempt. Pull-failure Events for an `image` volume now name the
+  volume's reference, not the Pod's first container image.
 - The registry's garbage collection no longer stops every sweep of a repository that holds only untagged
   manifests when one of them is a referrer, such as a signature, whose subject is gone. Such a referrer is now
   reaped once it is older than the grace period, with its subject's image, as `k3sm image prune` already

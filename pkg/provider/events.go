@@ -102,7 +102,10 @@ const (
 	// reasonArtifactPullRefused is recorded when a mounted image volume's reference
 	// does not name the cluster registry, or this node maps none, so the pod is
 	// refused BEFORE the CreatePod RPC and nothing is fetched (toVolume). It is
-	// one of the stable artifact reasons, shared with the runtime's own refusal.
+	// one of the stable artifact reasons, shared with the runtime's own refusal:
+	// runtimed's CreatePod error for an image volume begins with this text, and
+	// a pod parked on its foreign-registry refusal reports it as its waiting
+	// reason too (artifactWaitingReason).
 	reasonArtifactPullRefused = "ArtifactPullRefused"
 	// reasonFailedCreatePodSandBox is recorded when a vm pod is refused BEFORE
 	// the CreatePod RPC because its kernel hostname cannot be derived from the

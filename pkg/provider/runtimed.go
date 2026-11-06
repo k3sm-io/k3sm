@@ -2264,7 +2264,9 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 		// Pods at whatever is broken. So the pod is PARKED instead: kept tracked,
 		// reported Pending with the kubelet's waiting reason, and re-created on
 		// the same schedule a started pod's failed pull gets (createFailure).
-		if isContainerClassFailure(resp.GetFailureReason()) {
+		// An image volume whose pull runtimed refused parks the same way, except
+		// for the causes no retry can fix (failureClass decides the cadence).
+		if isParkableCreateFailure(resp.GetFailureReason(), e.GetMessage()) {
 			r.log.Warn("CreatePod: runtimed could not resolve an image; the pod is kept and retried",
 				"namespace", pod.Namespace, "name", pod.Name,
 				"message", e.GetMessage(), "reason", resp.GetFailureReason().String())
