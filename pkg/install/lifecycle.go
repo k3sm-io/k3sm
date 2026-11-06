@@ -333,7 +333,7 @@ var uncordonRestartGrace = 30 * time.Second
 var ErrNodeStillCordoned = errors.New("the daemons are up but the node is still cordoned; re-run `sudo k3sm start` to uncordon it")
 
 // StillCordonedMarker is the fixed token `k3sm start` (and `k3sm restart
-// --start`) writes to stderr, beside the human sentence, when it exits 1
+// --start`, and `k3sm install --start`) writes to stderr, beside the human sentence, when it exits 1
 // because the daemons are up but the node is still cordoned
 // (ErrNodeStillCordoned). A caller matches this token, never the sentence.
 const StillCordonedMarker = "k3sm: node is still cordoned"

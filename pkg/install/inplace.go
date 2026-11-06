@@ -17,8 +17,10 @@ limitations under the License.
 package install
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -232,6 +234,73 @@ const AdminTokenRotatedMarkerName = "admin-token-rotated-at"
 // root, and the daemon, which is told it, name one file.
 func AdminTokenRotatedMarkerPath(serverWorkDir string) string {
 	return filepath.Join(serverWorkDir, AdminTokenRotatedMarkerName)
+}
+
+// adminTokenRollback keeps the operator's kubeconfig working across a rollback.
+// The admin token file is not in the tree a rollback swaps back, and the daemons
+// the rollback restarts read it, so without this a rollback leaves the control
+// plane serving a token this install minted and the kubeconfig step never wrote:
+// the operator's kubeconfig is Unauthorized until the next install.
+//
+// Putting the old token back comes first, because it also keeps every copy of
+// the kubeconfig on another Mac working. A rollback that could not do that writes
+// the new kubeconfig instead. The token is never logged.
+type adminTokenRollback struct {
+	// prior is the token the file held before this install staged its own,
+	// empty when it held none this install would have carried.
+	prior string
+	uid   uint32
+	// settled says the kubeconfig the operator holds still matches the file.
+	settled bool
+}
+
+// captureAdminToken reads the installed admin token by carriedAdminToken's trust
+// rules, right before the install stages over it. The rules' warnings speak of an
+// update minting a token, which this read does not decide, so they stay unsaid. A
+// worker has neither a token nor an admin kubeconfig, so it has nothing to keep.
+func captureAdminToken(sys System, cfg Config, uid uint32) adminTokenRollback {
+	if cfg.Role != RoleServer {
+		return adminTokenRollback{settled: true}
+	}
+	quiet := cfg
+	quiet.Logger = slog.New(slog.DiscardHandler)
+	prior, ok := carriedAdminToken(sys, quiet, uid)
+	if !ok {
+		prior = ""
+	}
+	return adminTokenRollback{prior: prior, uid: uid, settled: prior == cfg.AdminToken}
+}
+
+// putBack stages the token captureAdminToken read. It runs after the reverse swap
+// and before the daemons restart, so they come back reading it. A failure is
+// survived: the rollback then writes the kubeconfig (keepKubeconfigWorking).
+func (r *adminTokenRollback) putBack(sys System, cfg Config) {
+	if r.settled || r.prior == "" {
+		return
+	}
+	if err := stageTokenFile(sys, r.uid, r.prior, cfg.serverTokenPath(), "admin token", ServerTokenFileMode, ServerTokenDirMode); err != nil {
+		cfg.Logger.Warn("could not put the previous admin token back after the rollback", "path", cfg.serverTokenPath(), "err", err)
+		return
+	}
+	r.settled = true
+	cfg.Logger.Info("put the previous admin token back: the admin kubeconfig already carries it", "path", cfg.serverTokenPath())
+}
+
+// keepKubeconfigWorking runs once a rollback returned err. When the old token did
+// not go back (none to restore, a failed write, a failed reverse swap), the
+// control plane serves this install's token, so the kubeconfig is written with it.
+// A first install has rolled nothing back and its failure asks for another
+// install, so it writes nothing. The result is err, plus what became of the
+// kubeconfig when that write failed.
+func (r *adminTokenRollback) keepKubeconfigWorking(ctx context.Context, sys System, cfg Config, previous bool, err error) error {
+	if r.settled || !previous {
+		return err
+	}
+	if kerr := writeAdminKubeconfig(ctx, sys, &cfg); kerr != nil {
+		return fmt.Errorf("%w; the admin token changed and the admin kubeconfig could not be rewritten, so it gets Unauthorized until `sudo k3sm install` succeeds: %v", err, kerr)
+	}
+	cfg.Logger.Warn("the previous admin token could not be put back, so the admin kubeconfig was rewritten with the new one: copy it again to every other Mac or tool that uses it", "kubeconfig-owner", cfg.TargetUser)
+	return err
 }
 
 // recordAdminTokenRotation leaves the rotation marker for the server daemon

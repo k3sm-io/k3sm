@@ -1976,6 +1976,8 @@ func TestInstallOrchestration(t *testing.T) {
 		// can read it and nothing else can. It needs the service uid, so it
 		// cannot precede EnsureServiceUser, and it precedes the plist that names
 		// it: the daemon must never be pointed at a file nobody has written.
+		// What it held is read first: a rollback puts that token back.
+		"ReadOwnedRegularFile:/var/lib/k3sm/server/token",
 		"WriteServiceUserFile:/var/lib/k3sm/server/token:0600:0700:271",
 		// This node's wireguard identity, provisioned by the party that can: the
 		// root-only key dir carved directly under the root-owned data root (and

@@ -58,7 +58,7 @@ The stop disables the daemons in launchd and writes a record at
 The record also governs the other commands:
 
 - `sudo k3sm install`, including an install that upgrades k3sm, updates the node and leaves it
-  stopped. Pass `--start` to start it as part of the install.
+  stopped. Pass `--start` to start it as part of the install. If the node cannot be uncordoned afterwards, the new release stays installed and running, the command exits 1, and `sudo k3sm start` finishes the job.
 - `sudo k3sm restart` refuses, unless you pass `--start`.
 - `sudo k3sm uninstall` enables the daemons again and removes the record.
 
