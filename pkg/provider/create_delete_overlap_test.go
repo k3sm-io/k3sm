@@ -19,6 +19,8 @@ package provider
 import (
 	"context"
 	"testing"
+
+	"k3sm.io/k3sm/pkg/provider/vkadapter"
 )
 
 // TestCreateOverlappingDeleteLeavesNoTrackOrGuest forces each order of a create of a
@@ -32,6 +34,14 @@ func TestCreateOverlappingDeleteLeavesNoTrackOrGuest(t *testing.T) {
 	t.Run("the reaper releases behind a create past its check, which waits at the fence", testCreateAtFenceBehindReaper)
 	t.Run("the reaper has released behind a create past its check", testCreateBehindFinishedReaper)
 	t.Run("a delete finishes behind a create at the fence (only an overlapping Virtual Kubelet)", testDeleteBehindCreateAtFence)
+	t.Run("a create lands inside the reaper's delete, behind a refused create", testCreateInsideReaperDelete)
+	t.Run("a create lands inside the delete of an untracked pod (only an overlapping Virtual Kubelet)", func(t *testing.T) {
+		testCreateInsidePodDelete(t, false)
+	})
+	t.Run("a create lands inside the delete of a tracked pod (only an overlapping Virtual Kubelet)", func(t *testing.T) {
+		testCreateInsidePodDelete(t, true)
+	})
+	t.Run("a same-name successor lands inside its predecessor's delete, under its own UID", testSuccessorInsidePredecessorDelete)
 }
 
 // holdRelease holds every fence release of x's provider at its start, and reports
@@ -164,4 +174,143 @@ func testDeleteBehindCreateAtFence(t *testing.T) {
 		t.Error("the runtime holds a guest for the deleted pod")
 	}
 	x.assertForgotten(t)
+}
+
+// stopHoldingDeletes keeps only the deletes already inside the RPC held.
+func stopHoldingDeletes(f *fakeRuntimeServer) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deleteHold = nil
+}
+
+// testCreateInsideReaperDelete is the order the off-queue reaper can reach: a create
+// running from a stale informer is refused while the reaper's delete is inside its
+// RPC, which takes the track, so GetPod answers NotFound and Virtual Kubelet's requeue
+// is a CreatePod. That one lands in the same RPC. The next ticks take the bare track.
+// Fails when a landing create reads only the track for a delete that has begun: the
+// guest stands with its /32 released behind it.
+func testCreateInsideReaperDelete(t *testing.T) {
+	ctx := context.Background()
+	x := newTerminalUpdateFixture(t, compressorAt(10))
+	id := string(x.pod.UID)
+	releaseCreate := x.f.holdCreate()
+	defer releaseCreate()
+	first := make(chan error, 1)
+	go func() { first <- x.r.CreatePod(ctx, x.pod.DeepCopy()) }()
+	waitRestart(t, "the create's RPC to be entered", func() bool { return x.f.createCount() == 1 })
+	tr := x.r.trackByID(id)
+	if tr == nil {
+		t.Fatal("the create published no track")
+	}
+	x.f.pushCreate(podLevelRefusal())
+
+	releaseDelete := x.f.holdDelete()
+	defer releaseDelete()
+	reaped := make(chan error, 1)
+	go func() {
+		x.r.reapOrphan(ctx, x.pod.DeepCopy(), tr)
+		reaped <- nil
+	}()
+	waitRestart(t, "the reaper's delete to be entered", func() bool { return x.f.deleteCount() == 1 })
+	stopHoldingDeletes(x.f)
+
+	releaseCreate()
+	if err := awaitErr(t, first, "the refused create"); err == nil {
+		t.Fatal("the create succeeded; the test needs it refused")
+	}
+	if got, err := x.r.GetPod(ctx, x.pod.Namespace, x.pod.Name); !vkadapter.IsNotFound(err) {
+		t.Fatalf("GetPod after the refusal = %v, %v, want NotFound: Virtual Kubelet would not create again", got, err)
+	}
+	if err := x.r.CreatePod(ctx, x.pod.DeepCopy()); err != nil {
+		t.Fatalf("the requeued create: %v", err)
+	}
+
+	releaseDelete()
+	if err := awaitErr(t, reaped, "the reaper"); err != nil {
+		t.Fatal(err)
+	}
+	waitRestart(t, "the compensating delete to retire", func() bool { return compensatingCount(x.r) == 0 })
+	if x.f.hasCreated(id) {
+		t.Error("the guest the requeued create built outlived the delete")
+	}
+	if late := x.r.trackByID(id); late != nil {
+		x.r.reapOrphan(ctx, x.pod.DeepCopy(), late)
+	}
+	x.assertForgotten(t)
+}
+
+// testCreateInsidePodDelete is a create landing inside DeletePod's own RPC: runtimed
+// registers a pod only when its create finishes, so that RPC stopped nothing. Fails
+// when the landing create reads only the track: an untracked pod's delete marked none,
+// and a re-create's track is not the one a tracked pod's delete marked.
+func testCreateInsidePodDelete(t *testing.T, tracked bool) {
+	ctx := context.Background()
+	x := newTerminalUpdateFixture(t, compressorAt(10))
+	id := string(x.pod.UID)
+	if tracked {
+		if err := x.r.CreatePod(ctx, x.pod.DeepCopy()); err != nil {
+			t.Fatalf("CreatePod: %v", err)
+		}
+	}
+	releaseDelete := x.f.holdDelete()
+	defer releaseDelete()
+	deleted := make(chan error, 1)
+	go func() { deleted <- x.r.DeletePod(ctx, x.pod.DeepCopy()) }()
+	waitRestart(t, "the delete to be entered", func() bool { return x.f.deleteCount() == 1 })
+	stopHoldingDeletes(x.f)
+
+	if err := x.r.CreatePod(ctx, x.pod.DeepCopy()); err != nil {
+		t.Fatalf("the create: %v", err)
+	}
+	releaseDelete()
+	if err := awaitErr(t, deleted, "the delete"); err != nil {
+		t.Fatalf("DeletePod: %v", err)
+	}
+	waitRestart(t, "the compensating delete to retire", func() bool { return compensatingCount(x.r) == 0 })
+	if x.f.hasCreated(id) {
+		t.Error("the runtime holds a guest for the deleted pod")
+	}
+	x.assertForgotten(t)
+}
+
+// testSuccessorInsidePredecessorDelete: a same-name re-create shares Virtual Kubelet's
+// key but no state here, which is keyed by UID throughout. The reaper can overlap the
+// two. Fails when a delete's RPC is read by anything but the UID: the successor's guest
+// is deleted as a late create of its predecessor.
+func testSuccessorInsidePredecessorDelete(t *testing.T) {
+	ctx := context.Background()
+	x := newTerminalUpdateFixture(t, compressorAt(10))
+	if err := x.r.CreatePod(ctx, x.pod.DeepCopy()); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	releaseDelete := x.f.holdDelete()
+	defer releaseDelete()
+	reaped := make(chan error, 1)
+	tr := x.r.trackByID(string(x.pod.UID))
+	go func() {
+		x.r.reapOrphan(ctx, x.pod.DeepCopy(), tr)
+		reaped <- nil
+	}()
+	waitRestart(t, "the reaper's delete to be entered", func() bool { return x.f.deleteCount() == 1 })
+
+	successor := x.pod.DeepCopy()
+	successor.UID = "same-name-successor"
+	successor.Annotations = nil
+	if err := x.r.CreatePod(ctx, successor); err != nil {
+		t.Fatalf("the successor's create: %v", err)
+	}
+	if n := compensatingCount(x.r); n != 0 {
+		t.Errorf("compensating deletes = %d, want none for another UID", n)
+	}
+	releaseDelete()
+	if err := awaitErr(t, reaped, "the reaper"); err != nil {
+		t.Fatal(err)
+	}
+	x.assertForgotten(t)
+	if !x.f.hasCreated(string(successor.UID)) {
+		t.Error("the successor's guest is gone")
+	}
+	if x.r.trackByID(string(successor.UID)) == nil {
+		t.Error("the successor lost its track")
+	}
 }
