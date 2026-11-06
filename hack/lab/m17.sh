@@ -10,8 +10,8 @@
 #            thunderbolt-cable, manual: true, skeleton: false
 #
 # Exit contract (the ladder's): 0 PASS, 1 FAIL, 2 REFUSED, 3 K3SM_LAB unset
-# ("LAB-PENDING: not a pass"). Arguments pass through (--plan, --self-test,
-# --verify-twice <A> <B>).
+# ("LAB-PENDING: not a pass"), 4 PARTIAL (--until stopped a green ladder; not a pass).
+# Arguments pass through (--plan, --self-test, --verify-twice <A> <B>, --until r<n>).
 #
 # K3SM-GATE-SHIM: hack/lab/m17-interconnect.sh
 exec "$(cd "$(dirname "$0")" && pwd)/m17-interconnect.sh" "$@"

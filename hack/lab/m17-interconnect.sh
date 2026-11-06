@@ -20,7 +20,14 @@
 #     K3SM_M17_REMOTE_SCRATCH=<absolute dir on the peer that its login owns> \
 #     [K3SM_ARTIFACT=<the k3sm binary under test, beside its build set for r9>] \
 #     [K3SM_RC_TAG=<rc tag>] \
-#     hack/lab/m17-interconnect.sh
+#     hack/lab/m17-interconnect.sh [--until r<n>]
+#
+# --until r<n> (or the full rung id) stops after that rung and exits as the contract
+# says. There is no way in at a later rung: a rung's prerequisites are what earlier
+# rungs of this same process passed, and the exit trap disarms the interconnect and
+# deletes the namespace. r6 needs r5's ring from the same run, so an attended run
+# starts from r0; `--until r5` is the unattended stretch (r6 is the first rung that
+# wants /dev/tty, and refuses without one), and `--until r8` chooses to skip r9.
 #
 # The driver runs on one of the two Macs (local) with the admin KUBECONFIG and
 # reaches the other (peer) over ssh. Every privileged step is a script file run
@@ -50,6 +57,9 @@
 #   2  REFUSED  a precondition or a missing mechanism, printed as
 #               REFUSED(<rung>): <what is absent> (BI<n>); also a bad argument.
 #   3  K3SM_LAB unset: "LAB-PENDING: not a pass".
+#   4  PARTIAL  --until stopped the ladder and every rung through it passed: not a pass.
+#               The later rungs read NOT-RUN in rungs.tsv, the log's result is FAIL
+#               (--verify-twice wants ten PASS), and --until r9 is a whole run, so 0.
 #
 # Required under K3SM_LAB=1: PEER_SSH, EVIDENCE_DIR, K3SM_M17_REMOTE_SCRATCH (missing
 # -> exit 2). The scratch directory must already exist on the peer, outside every
@@ -1742,6 +1752,38 @@ capture_exit_evidence() {
 	return 0
 }
 
+# until_rung <r<n>|rung id> — the full rung id, or non-zero when it names no rung.
+until_rung() {
+	local r
+	for r in $REQUIRED_IDS; do
+		case "$1" in "$r" | "${r%%-*}")
+			echo "$r"
+			return 0
+			;;
+		esac
+	done
+	return 1
+}
+# ladder_exit_status <trap rc> <pass> <fail> <refused> <stopped 0|1> — the contract's
+# code. Only a run that reached its last rung with nothing red earns 0 or 4.
+ladder_exit_status() {
+	case "$1" in
+	0)
+		if [ "$3" -gt 0 ] || [ "$4" -gt 0 ]; then
+			echo 1
+		elif [ "$2" -ge 10 ]; then
+			echo 0
+		elif [ "$5" = 1 ] && [ "$2" -gt 0 ]; then
+			echo 4
+		else
+			echo 1
+		fi
+		;;
+	1 | 2) echo "$1" ;;
+	*) echo 1 ;;
+	esac
+}
+
 # run_rungs — every rung in table order, one verdict line each in rungs.tsv. A
 # REFUSED rung is owed, not passed: the run goes on to the next rung, the exit is
 # never 0 (N_REFUSED), and --verify-twice wants exactly PASS.
@@ -1749,6 +1791,11 @@ need() { grep -qw "$1" <<<"$HAVE"; }
 run_rungs() {
 	while IFS='|' read -r id summary prereqs fn ev bi; do
 		[ -n "$id" ] || continue
+		if [ "$LADDER_STOPPED" = 1 ]; then
+			printf '%s\tNOT-RUN\n' "$id" >>"$EVIDENCE_DIR/rungs.tsv"
+			N_NOT_RUN=$((N_NOT_RUN + 1))
+			continue
+		fi
 		RUNG="$id" RUNG_DIR="$EVIDENCE_DIR/${ev%/}" R_PASS=0 R_FAIL=0 R_REFUSED_MSG=""
 		mkdir -p "$RUNG_DIR"
 		printf '\n==> %s (%s): %s\n' "$id" "$bi" "$summary"
@@ -1779,6 +1826,7 @@ run_rungs() {
 		printf '%s\t%s\n' "$id" "$verdict" >>"$EVIDENCE_DIR/rungs.tsv"
 		[ "$verdict" = PASS ] || capture_ns_evidence "$RUNG_DIR" ns
 		echo "RUNG $id $verdict ($R_PASS passed, $R_FAIL failed)"
+		[ "$id" != "$UNTIL" ] || LADDER_STOPPED=1
 	done <<<"$RUNG_TABLE"
 }
 
@@ -2198,12 +2246,15 @@ st_r5_run() {
 	rm -rf "$r5_dir"
 }
 
-# st_rungs_run <red rung id|-> — the real run_rungs over the real table with every
+# st_rungs_run <red rung id|-> [until rung id] — the real run_rungs over the real table with every
 # assertion stubbed to pass, one to fail; prints rungs.tsv and which ns files exist.
 st_rungs_run() {
 	local red="$1" id summary prereqs fn ev bi ev_dir
 	ev_dir="$(mktemp -d -t m17-rungs.XXXXXX)"
 	EVIDENCE_DIR="$ev_dir" NS=stub HAVE="$PREREQ_STATIC $PREREQ_RUNTIME" N_PASS=0 N_FAIL=0 N_REFUSED=0
+	UNTIL="${2:-}" LADDER_STOPPED=0 N_NOT_RUN=0
+	# A real r5 adds this token itself when it passes (assert_r5_ring).
+	[ "$red" != r5-ring ] || HAVE="${HAVE/ ring/}"
 	: >"$ev_dir/rungs.tsv"
 	while IFS='|' read -r id summary prereqs fn ev bi; do
 		[ -n "$id" ] || continue
@@ -2216,6 +2267,7 @@ st_rungs_run() {
 	kc() { echo "kc $*"; }
 	run_rungs
 	echo "TSV $(tr '\t\n' ':;' <"$ev_dir/rungs.tsv")"
+	echo "EXIT $(ladder_exit_status 0 "$N_PASS" "$N_FAIL" "$N_REFUSED" "$LADDER_STOPPED")"
 	(cd "$ev_dir" && find . -name 'ns-*' | sort | sed 's/^/NSFILE /')
 	rm -rf "$ev_dir"
 }
@@ -2532,6 +2584,31 @@ self_test_body() {
 	st_out "r5 saves the status of an InvalidSpec model" "SAVED mlxmodel-ic-ring.json" st_r5_run invalid
 	st_out "r5 still runs out its budget for a model that is only slow" "never became Ready within 2s" st_r5_run slow
 	st_out "r5 saves the status of a model that timed out" "SAVED mlxmodel-ic-ring.json" st_r5_run slow
+	st "--until with no rung exits 2" 0 gate_run 2 - -- --until
+	st "--until with a rung and more exits 2" 0 gate_run 2 - -- --until r5 extra
+	for r in r r10 r5x ring r5-ringx 5; do st "--until red: '$r' names no rung" 0 gate_run 2 "names no rung" -- --until "$r"; done
+	st "--until r5 under no K3SM_LAB is still the pending line" 0 gate_run 3 "$PENDING_TEXT" -- --until r5
+	st "--until r5 under K3SM_LAB=1 still refuses a missing peer" 0 gate_run 2 "REFUSED(preflight)" K3SM_LAB=1 -- --until r5
+	st_eq "--until r5 is r5-ring" "$(until_rung r5)" r5-ring
+	st_eq "--until takes the full id" "$(until_rung r8-killswitch)" r8-killswitch
+	st_out "--until r5: r5 ran" "RAN r5-ring" st_rungs_run - r5-ring
+	st_eq "--until r5: r6 never ran" "$(st_rungs_run - r5-ring | grep -c 'RAN r6-unplug')" 0
+	st_out "--until r5: the later rungs read NOT-RUN" "r5-ring:PASS;r6-unplug:NOT-RUN;r7-desired-forge:NOT-RUN;r8-killswitch:NOT-RUN;r9-downgrade:NOT-RUN;" st_rungs_run - r5-ring
+	st_out "--until r5: a green stretch is PARTIAL" "EXIT 4" st_rungs_run - r5-ring
+	st_out "--until r5: a red rung before it stays FAIL" "EXIT 1" st_rungs_run r3-cable-path r5-ring
+	st_out "--until r9 runs the whole ladder and can exit 0" "EXIT 0" st_rungs_run - r9-downgrade
+	st_out "no --until runs the whole ladder and can exit 0" "EXIT 0" st_rungs_run -
+	st_eq "exit: a green stop" "$(ladder_exit_status 0 6 0 0 1)" 4
+	st_eq "exit: a refused rung" "$(ladder_exit_status 2 6 0 1 1)" 2
+	st_eq "exit: a stop with nothing passed" "$(ladder_exit_status 0 0 0 0 1)" 1
+	st_eq "exit: short of ten with no stop" "$(ladder_exit_status 0 9 0 0 0)" 1
+	st_eq "exit: an interrupt" "$(ladder_exit_status 130 6 0 0 1)" 1
+	st_eq "r6 needs r5's ring from the same process" "$(awk -F'|' '$1=="r6-unplug"{print $3}' <<<"$RUNG_TABLE")" armed,ring,operator
+	st_out "r6 refuses when r5 has not passed in this process" "REFUSED(r6-unplug): r5-ring did not pass" st_rungs_run r5-ring r6-unplug
+	mkdir -p "$tmp/partial"
+	cp "$F/run-b/run.log" "$tmp/partial/run.log"
+	sed 's/^\(r[6-9]-[a-z-]*\)\tPASS$/\1\tNOT-RUN/' "$F/run-b/rungs.tsv" >"$tmp/partial/rungs.tsv"
+	st_out "--verify-twice refuses a partial run, even with a forged result line" "rung r6-unplug is 'NOT-RUN'" icp_verify_twice "$F/run-a" "$tmp/partial" "$REQUIRED_IDS"
 	st_out "a failing rung is recorded" "r3-cable-path:FAIL;" st_rungs_run r3-cable-path
 	st_out "a failing rung saves the namespace's Events" "NSFILE ./r3-cable-path/ns-events.txt" st_rungs_run r3-cable-path
 	st_out "a failing rung saves the MLXModels" "NSFILE ./r3-cable-path/ns-mlxmodels.json" st_rungs_run r3-cable-path
@@ -2565,6 +2642,7 @@ self_test_body() {
 	st_eq "r4 runs its shim legs in no platform binary" "$(declare -f assert_r4_mesh_traffic | grep -E 'ic_pod (ic-wild|ic-pin)' | grep -cE '/usr/bin|/bin/|sleep ')" 0
 	st "the bind verdict: the pod IP, no wildcard" 0 icp_wild_bind_verdict "$F/netstat-an-wild-podip.txt" 10.42.1.7 5403
 	st "the bind verdict red: the wildcard stayed" 1 icp_wild_bind_verdict "$F/netstat-an-wild-star.txt" 10.42.1.7 5403
+	st "the bind verdict red: the wildcard held beside the pod IP" 1 icp_wild_bind_verdict "$F/netstat-an-wild-both.txt" 10.42.1.7 5403
 	st "the bind verdict red: another pod's IP" 1 icp_wild_bind_verdict "$F/netstat-an-wild-podip.txt" 10.42.1.8 5403
 	st "the shim report: nothing reported" 0 icp_shim_report_verdict "" ""
 	st "the shim report: a False condition" 0 icp_shim_report_verdict False ""
@@ -2623,8 +2701,19 @@ self_test() {
 }
 
 # ── Arguments ───────────────────────────────────────────────────────────────────
-usage() { echo "usage: $0 [--plan | --self-test | --verify-twice <run dir A> <run dir B>]   (K3SM_LAB=1 PEER_SSH=<ssh target> EVIDENCE_DIR=<dir> for a rig run)"; }
+usage() { echo "usage: $0 [--plan | --self-test | --verify-twice <run dir A> <run dir B> | --until r<n>]   (K3SM_LAB=1 PEER_SSH=<ssh target> EVIDENCE_DIR=<dir> for a rig run)"; }
+UNTIL="" LADDER_STOPPED=0 N_NOT_RUN=0
 case "${1:-}" in
+--until)
+	[ "$#" = 2 ] || {
+		usage >&2
+		exit 2
+	}
+	UNTIL="$(until_rung "$2")" || {
+		echo "$0: --until: '$2' names no rung (r0 to r9, or the full id)" >&2
+		exit 2
+	}
+	;;
 --plan)
 	[ "$#" = 1 ] || {
 		usage >&2
@@ -2738,8 +2827,9 @@ on_exit() {
 	for p in $BG_PIDS; do kill "$p" 2>/dev/null; done
 	for p in $PING_PIDS; do sudo -n kill "$p" 2>/dev/null; done
 	[ -n "${RUNG_DIR:-}" ] && touch "$RUNG_DIR/poll.stop" 2>/dev/null
-	# Exit 0 only when every rung passed; an interrupted ladder is a FAIL.
-	if [ "$rc" = 0 ] && { [ "$N_FAIL" -gt 0 ] || [ "$N_REFUSED" -gt 0 ] || [ "$N_PASS" -lt 10 ]; }; then rc=1; fi
+	# Exit 0 only when every rung passed, and 4 when --until stopped a green ladder;
+	# an interrupted ladder is a FAIL.
+	rc="$(ladder_exit_status "$rc" "$N_PASS" "$N_FAIL" "$N_REFUSED" "$LADDER_STOPPED")"
 	# Before anything below deletes the namespace; no rung ran before HAVE is set.
 	[ "$rc" = 0 ] || [ -z "$HAVE" ] || capture_exit_evidence
 	if [ -n "$FORGED_SIDE" ]; then
@@ -2759,9 +2849,9 @@ on_exit() {
 	[ -z "$R9_DOWNGRADED" ] || echo "cleanup: r9 did not finish; these Macs may be on the previous build, so reinstall the artifact under test: $R9_DOWNGRADED"
 	fixtures_remove
 	remote_dir_remove
-	case "$rc" in 0 | 1 | 2) ;; *) rc=1 ;; esac
 	echo "----------------------------------------"
-	echo "$ROW: $N_PASS rung(s) PASS, $N_FAIL FAIL, $N_REFUSED REFUSED (evidence: $EVIDENCE_DIR)"
+	echo "$ROW: $N_PASS rung(s) PASS, $N_FAIL FAIL, $N_REFUSED REFUSED, $N_NOT_RUN NOT-RUN (evidence: $EVIDENCE_DIR)"
+	[ "$rc" != 4 ] || echo "PARTIAL: every rung through $UNTIL passed and --until stopped the ladder there; this is not a pass (exit 4)"
 	if [ "$rc" = 0 ]; then emit_run_log_verdict PASS; else emit_run_log_verdict FAIL; fi
 	exit "$rc"
 }
@@ -2867,7 +2957,8 @@ why="$(fixtures_stage)" || probe_miss tools preflight "the r4 fixtures: $why"
 echo "fixtures: hello-http and conftool in $FIXTURE_DIR on both Macs"
 HAVE="$PREREQ_STATIC"
 FINAL_RC=1
-why="$(r9_problem)" || echo "notice: r9-downgrade will be REFUSED when the ladder reaches it, so this run cannot exit 0: $why"
+[ -n "$UNTIL" ] && [ "$UNTIL" != r9-downgrade ] && echo "notice: --until stops the ladder after $UNTIL; the exit trap still disarms and deletes the namespace"
+[ -n "$UNTIL" ] && [ "$UNTIL" != r9-downgrade ] || why="$(r9_problem)" || echo "notice: r9-downgrade will be REFUSED when the ladder reaches it, so this run cannot exit 0: $why"
 echo "baseline: local $local_NODE (index $local_IDX, $local_TB, LAN $local_LAN, macOS $local_OS), peer $peer_NODE (index $peer_IDX, $peer_TB, LAN $peer_LAN, macOS $peer_OS); artifact $local_SHA; worker $WORKER_NODE"
 
 # ── The rungs, in table order ──────────────────────────────────────────────────
