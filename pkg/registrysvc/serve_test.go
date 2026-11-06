@@ -421,6 +421,52 @@ func TestServeAuthorizesAndReports(t *testing.T) {
 }
 
 // TestServeLogsAPush pins the push record of the log through the served stack.
+// TestServedRegistryRefusesEncodedPaths is a credentialed client that reaches the
+// served registry directly, past the gate: a percent escape in the path is refused
+// for each principal as it is for anyone else, and nothing lands in the repository
+// the path decodes to. The same requests spelled plainly are served.
+func TestServedRegistryRefusesEncodedPaths(t *testing.T) {
+	work := writeTestServeConfig(t, nil)
+	l := newMemListener()
+	result, cancel := runTestServe(t, work, testServeDeps(l))
+	c := memClient(t, l)
+	const base = "http://registry.test/v2/"
+
+	for _, cred := range []struct{ user, secret string }{
+		{auth.UserGate, testGateSecret},
+		{auth.UserPush, testPushSecret},
+	} {
+		for _, path := range []string{"a%2fb/blobs/uploads/", "a%2Fb/blobs/uploads/", "%61/blobs/uploads/", "a/b%2fblobs%2fuploads%2f"} {
+			if resp := do(t, c, http.MethodPost, base+path, cred.user, cred.secret); resp.StatusCode != http.StatusBadRequest {
+				t.Errorf("%s POST %s: %d, want 400", cred.user, path, resp.StatusCode)
+			}
+		}
+		for _, path := range []string{"a%2fb/tags/list", "%61/manifests/v1", "a%2fb/manifests/v1"} {
+			if resp := do(t, c, http.MethodGet, base+path, cred.user, cred.secret); resp.StatusCode != http.StatusBadRequest {
+				t.Errorf("%s GET %s: %d, want 400", cred.user, path, resp.StatusCode)
+			}
+		}
+	}
+	root := filepath.Join(work, "registry")
+	for _, dir := range []string{"a", "a%2fb"} {
+		if _, err := os.Lstat(filepath.Join(root, dir)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("a refused push left %s: %v", dir, err)
+		}
+	}
+	for _, cred := range []struct{ user, secret string }{
+		{auth.UserGate, testGateSecret},
+		{auth.UserPush, testPushSecret},
+	} {
+		if resp := do(t, c, http.MethodPost, base+"a/b/blobs/uploads/", cred.user, cred.secret); resp.StatusCode != http.StatusAccepted {
+			t.Errorf("%s POST a/b: %d, want 202", cred.user, resp.StatusCode)
+		}
+	}
+	cancel()
+	if err := <-result; err != nil {
+		t.Errorf("serve returned %v", err)
+	}
+}
+
 func TestServeLogsAPush(t *testing.T) {
 	work := writeTestServeConfig(t, nil)
 	l := newMemListener()
