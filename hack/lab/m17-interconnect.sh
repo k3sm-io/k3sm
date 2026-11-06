@@ -17,6 +17,7 @@
 #   hack/lab/m17-interconnect.sh --verify-twice <A> <B> # two run evidence dirs
 #   K3SM_LAB=1 PEER_SSH=<ssh target of the other Mac> \
 #     EVIDENCE_DIR=<absolute dir outside any git tree> \
+#     K3SM_M17_REMOTE_SCRATCH=<absolute dir on the peer that its login owns> \
 #     [K3SM_ARTIFACT=<the k3sm binary under test>] [K3SM_RC_TAG=<rc tag>] \
 #     hack/lab/m17-interconnect.sh
 #
@@ -48,7 +49,11 @@
 #               REFUSED(<rung>): <what is absent> (BI<n>); also a bad argument.
 #   3  K3SM_LAB unset: "LAB-PENDING: not a pass".
 #
-# Required under K3SM_LAB=1: PEER_SSH, EVIDENCE_DIR (missing -> exit 2).
+# Required under K3SM_LAB=1: PEER_SSH, EVIDENCE_DIR, K3SM_M17_REMOTE_SCRATCH (missing
+# -> exit 2). The scratch directory must already exist on the peer, outside every
+# shared temporary directory: root runs the scripts copied there, so a location
+# another account can write to would be a privilege step. The run makes one private
+# directory per run under it and the exit trap removes that directory.
 # Optional knobs (each recorded in the log):
 #   K3SM_M17_LOCAL_NODE, K3SM_M17_PEER_NODE   node names (default: matched by mesh address)
 #   K3SM_M17_CLUSTER_CIDR      the cluster pod aggregate (default 10.42.0.0/16)
@@ -91,7 +96,7 @@ ROW="M17-lab"
 MODE="ladder"
 PENDING_TEXT="LAB-PENDING: not a pass"
 FIXTURES="$HERE/testdata/m17-interconnect"
-IC_REMOTE_DIR="/tmp/k3sm-m17-lab"
+REMOTE_RUN_PREFIX="k3sm-m17-lab"
 NS="k3sm-m17-lab"
 IC_NAME="thunderbolt"
 NETD_SOCK="/var/lib/k3sm/run/netd.sock"
@@ -413,6 +418,61 @@ if [ -n "${K3SM_INTERCONNECT_IP:-}" ]; then
   ( while :; do n=$(/usr/bin/nc -l "$K3SM_INTERCONNECT_IP" 5400 | /usr/bin/wc -c); echo "RECV5400=$((n + 0))"; done ) &
 fi
 while :; do n=$(/usr/bin/nc -l 5401 | /usr/bin/wc -c); echo "RECV5401=$((n + 0))"; done'
+
+# remote_scratch_problem <path> — why the path cannot hold this run's scripts; silent
+# and 0 when it can. The value lands in remote shell commands, so its alphabet is
+# closed rather than quoted.
+remote_scratch_problem() {
+	local p="$1"
+	[ -n "$p" ] || {
+		echo "is unset (an absolute directory on the peer, which its login owns)"
+		return 1
+	}
+	case "$p" in /*) ;; *)
+		echo "'$p' must be an absolute path"
+		return 1
+		;;
+	esac
+	[[ "$p" =~ ^/[A-Za-z0-9._/-]+$ ]] || {
+		echo "'$p' must be a directory other than / with only letters, digits and . _ - /"
+		return 1
+	}
+	case "$p/" in */../* | */./*)
+		echo "'$p' must not hold a . or .. component"
+		return 1
+		;;
+	esac
+	case "$p/" in /tmp/* | /private/tmp/* | /var/tmp/* | /private/var/tmp/* | /var/folders/* | /private/var/folders/*)
+		echo "'$p' is a shared temporary directory; root runs the scripts copied there"
+		return 1
+		;;
+	esac
+}
+# remote_run_dir <scratch> — this run's directory under the scratch location.
+remote_run_dir() { printf '%s/%s.%s.%s.%s\n' "$1" "$REMOTE_RUN_PREFIX" "$(date -u +%Y%m%dT%H%M%SZ)" "$$" "$RANDOM"; }
+# remote_dir_make — the private directory on the peer, made last so that a peer
+# without passwordless sudo leaves nothing behind. mkdir without -p refuses a path
+# that already exists, and the umask makes it 0700 before it can hold anything.
+remote_dir_make() {
+	on_peer "sudo -n true && [ -d $REMOTE_SCRATCH ] && [ -O $REMOTE_SCRATCH ] && umask 077 && mkdir $IC_REMOTE_DIR"
+}
+# remote_dir_remove — the exit trap's half: this run's directory and nothing else.
+# A failure to remove it is said out loud and never changes the verdict.
+remote_dir_remove() {
+	[ "${REMOTE_DIR_MADE:-0}" = 1 ] || return 0
+	case "$IC_REMOTE_DIR" in
+	"$REMOTE_SCRATCH/$REMOTE_RUN_PREFIX".*) ;;
+	*)
+		echo "cleanup: not removing '$IC_REMOTE_DIR': it is not this run's directory under $REMOTE_SCRATCH"
+		return 0
+		;;
+	esac
+	if on_peer "rm -rf $IC_REMOTE_DIR" >/dev/null 2>&1; then
+		echo "cleanup: removed $IC_REMOTE_DIR on the peer"
+	else
+		echo "cleanup: could not remove $IC_REMOTE_DIR on the peer (unreachable, or never made); check by hand"
+	fi
+}
 
 # ── The assertions ──────────────────────────────────────────────────────────────
 
@@ -1172,7 +1232,7 @@ gate_run() {
 		shift
 	done
 	shift
-	out="$(env -u K3SM_LAB -u PEER_SSH -u EVIDENCE_DIR -u K3SM_LAB_PRINT_MANIFESTS ${envs[@]+"${envs[@]}"} bash "$SELF" "$@" 2>&1)" || rc=$?
+	out="$(env -u K3SM_LAB -u PEER_SSH -u EVIDENCE_DIR -u K3SM_M17_REMOTE_SCRATCH -u K3SM_LAB_PRINT_MANIFESTS ${envs[@]+"${envs[@]}"} bash "$SELF" "$@" 2>&1)" || rc=$?
 	[ "$rc" = "$want" ] || {
 		echo "exit $rc, want $want: $(printf '%s' "$out" | tail -3)"
 		return 1
@@ -1210,6 +1270,23 @@ runlog_missing_refuses() {
 		echo "the evidence directory was created"
 		return 1
 	}
+}
+
+# st_remote_remove <made> <scratch> <dir> — the command remote_dir_remove sends.
+st_remote_remove() {
+	local log
+	log="$(mktemp -t m17-remove.XXXXXX)"
+	REMOTE_DIR_MADE="$1" REMOTE_SCRATCH="$2" IC_REMOTE_DIR="$3"
+	on_peer() { echo "$1" >>"$log"; }
+	remote_dir_remove >/dev/null
+	cat "$log"
+	rm -f "$log"
+}
+# st_remote_make — the command remote_dir_make sends.
+st_remote_make() {
+	REMOTE_SCRATCH=/Users/x/scratch IC_REMOTE_DIR=/Users/x/scratch/run
+	on_peer() { echo "$1"; }
+	remote_dir_make
 }
 
 # st_hello_payload — the composed netd_hello payload, with nothing executed.
@@ -1311,7 +1388,20 @@ self_test_body() {
 	st "K3SM_LAB unset exits 3 with the pending line" 0 gate_run 3 "$PENDING_TEXT" --
 	st "the watchdog fires on a hung check and maps to FAIL (exit 1)" 0 gate_run 1 "watchdog fired" K3SM_M17_SELFTEST_WATCHDOG=2 K3SM_M17_SELFTEST_HANG=1 -- --self-test
 	st "K3SM_LAB=1 without PEER_SSH/EVIDENCE_DIR exits 2 REFUSED" 0 gate_run 2 "REFUSED(preflight)" K3SM_LAB=1 --
-	st "K3SM_LAB=1 with a relative EVIDENCE_DIR exits 2" 0 gate_run 2 "REFUSED(preflight)" K3SM_LAB=1 PEER_SSH=x EVIDENCE_DIR=rel --
+	st "K3SM_LAB=1 with a relative EVIDENCE_DIR exits 2" 0 gate_run 2 "REFUSED(preflight)" K3SM_LAB=1 PEER_SSH=x EVIDENCE_DIR=rel K3SM_M17_REMOTE_SCRATCH=/Users/x/scratch --
+	st "K3SM_LAB=1 without a remote scratch exits 2" 0 gate_run 2 "K3SM_M17_REMOTE_SCRATCH is unset" K3SM_LAB=1 PEER_SSH=x EVIDENCE_DIR="$tmp/ev" --
+	st "K3SM_LAB=1 with a remote scratch in /tmp exits 2" 0 gate_run 2 "shared temporary directory" K3SM_LAB=1 PEER_SSH=x EVIDENCE_DIR="$tmp/ev" K3SM_M17_REMOTE_SCRATCH=/tmp/x --
+	st "remote scratch: a private absolute directory" 0 remote_scratch_problem /Users/miko/Code/k3sm-io.scratch
+	# shellcheck disable=SC2016 # the $(x) is a literal value under test
+	for r in "" rel/dir / /tmp /tmp/x /private/tmp/x /var/tmp/x /var/folders/ab/x /private/var/folders/ab/x "/Users/a b" '/Users/a;b' '/Users/$(x)' /Users/a/../b /Users/a/./b; do
+		st "remote scratch red: '$r'" 1 remote_scratch_problem "$r"
+	done
+	st_out "remote run dir sits under the scratch with this run's name" "/Users/x/scratch/$REMOTE_RUN_PREFIX." remote_run_dir /Users/x/scratch
+	st "two remote run dirs differ" 1 test "$(remote_run_dir /s)" = "$(sleep 1; remote_run_dir /s)"
+	st_out "the remote dir is made private" "umask 077 && mkdir /Users/x/scratch/run" st_remote_make
+	st_out "the exit trap removes this run's dir" "rm -rf /s/$REMOTE_RUN_PREFIX.1" st_remote_remove 1 /s "/s/$REMOTE_RUN_PREFIX.1"
+	st_eq "the exit trap removes nothing when the dir was never made" "$(st_remote_remove 0 /s "/s/$REMOTE_RUN_PREFIX.1" | grep -c 'rm -rf')" 0
+	st_eq "the exit trap refuses a dir that is not this run's" "$(st_remote_remove 1 /s /s/other | grep -c 'rm -rf')" 0
 
 	st_eq "node index 10.42.3.0/24 in 10.42.0.0/16" "$(icp_node_index 10.42.0.0/16 10.42.3.0/24)" 3
 	st "node index outside the aggregate fails" 1 icp_node_index 10.42.0.0/16 10.43.0.0/24
@@ -1532,6 +1622,10 @@ for v in PEER_SSH EVIDENCE_DIR; do
 	[ -n "${!v:-}" ] || refuse_run preflight "K3SM_LAB=1 but $v is unset (no defaults: the ssh target is the operator's own Mac, and evidence lives outside any repository) (BI10)"
 done
 case "$EVIDENCE_DIR" in /*) ;; *) refuse_run preflight "EVIDENCE_DIR must be an absolute path (BI10)" ;; esac
+REMOTE_SCRATCH="${K3SM_M17_REMOTE_SCRATCH:-}"
+why="$(remote_scratch_problem "$REMOTE_SCRATCH")" || refuse_run preflight "K3SM_M17_REMOTE_SCRATCH $why (BI10)"
+# Where payload scripts land on the peer (hack/spike/m17-interconnect/lib.sh reads it).
+IC_REMOTE_DIR="$(remote_run_dir "$REMOTE_SCRATCH")"
 probe="$EVIDENCE_DIR"
 while [ ! -d "$probe" ]; do probe="$(dirname "$probe")"; done
 git -C "$probe" rev-parse --is-inside-work-tree >/dev/null 2>&1 &&
@@ -1552,6 +1646,7 @@ mkdir -p "$HERE/runs"
 exec > >(tee "$EVIDENCE_DIR/run.log" | tee -a "$RUN_LOG") 2>&1
 emit_run_log_header "FAIL (provisional; the final result line below is the verdict, and a log that ends here did not finish)"
 echo "evidence_dir: $EVIDENCE_DIR"
+echo "peer_run_dir: $IC_REMOTE_DIR"
 echo "knobs: payload ${PAYLOAD_MB} MiB, LAN slack ${LAN_SLACK} B, DesiredInterval ${DESIRED_INTERVAL}s, cluster CIDR $CLUSTER_CIDR, model $MLX_MODEL ($MLX_MEMORY)"
 : >"$EVIDENCE_DIR/rungs.tsv"
 
@@ -1564,7 +1659,7 @@ echo "knobs: payload ${PAYLOAD_MB} MiB, LAN slack ${LAN_SLACK} B, DesiredInterva
 	local_SHA="" peer_SHA="" local_BOOT="" peer_BOOT="" local_OS="" peer_OS=""
 	local_MACS="" peer_MACS="" local_ICIP="" peer_ICIP="" WORKER_NODE=""
 }
-HAVE="" ARMED_BY_RUN=0 FORGED_SIDE="" FORGED_ORIG="" BG_PIDS="" PING_PIDS="" NS_CREATED=0
+HAVE="" ARMED_BY_RUN=0 FORGED_SIDE="" FORGED_ORIG="" BG_PIDS="" PING_PIDS="" NS_CREATED=0 REMOTE_DIR_MADE=0
 N_PASS=0 N_FAIL=0 N_REFUSED=0
 MESH_UTUN="" PEER_UTUN=""
 on_exit() {
@@ -1587,6 +1682,7 @@ on_exit() {
 		on_local "$K3SM_BIN interconnect disable" 2>&1 | sed 's/^/          /'
 	fi
 	[ "$NS_CREATED" = 1 ] && kc delete namespace "$NS" --wait=false >/dev/null 2>&1
+	remote_dir_remove
 	# Exit 0 only when every rung passed; an interrupted ladder is a FAIL.
 	if [ "$rc" = 0 ] && { [ "$N_FAIL" -gt 0 ] || [ "$N_REFUSED" -gt 0 ] || [ "$N_PASS" -lt 10 ]; }; then rc=1; fi
 	case "$rc" in 0 | 1 | 2) ;; *) rc=1 ;; esac
@@ -1609,7 +1705,8 @@ for t in kubectl ssh scp python3 nc curl; do
 done
 [ -x "$K3SM_BIN" ] || probe_miss tools preflight "no $K3SM_BIN on the local Mac"
 sudo -n true 2>/dev/null || probe_miss tools preflight "sudo on the local Mac needs a password; run sudo -v first"
-on_peer "mkdir -p $IC_REMOTE_DIR && sudo -n true" >/dev/null 2>&1 || probe_miss tools preflight "the peer is unreachable as PEER_SSH or its sudo is not passwordless"
+REMOTE_DIR_MADE=1 # set first: a lost reply after the mkdir must still reach the trap, and the name is this run's own
+remote_dir_make >/dev/null 2>&1 || probe_miss tools preflight "the peer is unreachable as PEER_SSH, its sudo is not passwordless, or K3SM_M17_REMOTE_SCRATCH=$REMOTE_SCRATCH is not a directory its login owns"
 
 for side in local peer; do
 	payload "$side" info 0 K3SM_BIN="$K3SM_BIN" <<'EOF' || true
