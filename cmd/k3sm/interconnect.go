@@ -286,21 +286,32 @@ func interconnectClients(kubeconfig string) (kubernetes.Interface, dynamic.Inter
 		cfg *rest.Config
 		err error
 	)
-	if kubeconfig != "" {
+	root := rootKubeSourcesFromEnv()
+	switch {
+	case kubeconfig != "" && root != nil:
+		var c *checkedKubeconfig
+		if c, err = root.loadNamed(kubeconfig, ""); err == nil {
+			cfg, err = c.restConfig()
+		}
+	case kubeconfig != "":
 		cfg, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
-	} else {
-		home, _ := os.UserHomeDir()
+	default:
 		var kc kubectlConfig
 		kc, err = kubectlVerbConfig("k3sm interconnect", kubectlInputs{
 			workDirOverride: os.Getenv("K3SM_WORK_DIR"),
 			workDir:         workDirFromEnv(),
 			kubeconfigEnv:   os.Getenv("KUBECONFIG"),
-			home:            home,
+			home:            kubeHome(),
 			contextName:     installedKubeconfigName(),
 			exists:          fileExists,
+			root:            root,
 		}.withInstalledRole())
 		if err != nil {
 			return nil, nil, err
+		}
+		if kc.checked != nil {
+			cfg, err = kc.checked.restConfig()
+			break
 		}
 		rules := clientcmd.NewDefaultClientConfigLoadingRules()
 		if kc.kubeconfig != "" {

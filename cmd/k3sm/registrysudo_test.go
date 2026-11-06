@@ -493,9 +493,9 @@ users:
 	}
 }
 
-// checkedKubeconfig is an invoker's kubeconfig at server whose cluster entry holds
+// invokerKubeconfigAt is an invoker's kubeconfig at server whose cluster entry holds
 // clusterTLS, which passes parseSudoUserKubeconfig's own checks.
-func checkedKubeconfig(server, clusterTLS string) []byte {
+func invokerKubeconfigAt(server, clusterTLS string) []byte {
 	return fmt.Appendf(nil, `apiVersion: v1
 kind: Config
 clusters:
@@ -561,61 +561,61 @@ func TestWorkerUnderSudoPinsTheInvokersClusterByTheAnchor(t *testing.T) {
 	}{
 		{
 			name:       "the cluster's CA at another address is accepted",
-			alice:      checkedKubeconfig(checkedServer, caData(clusterCA)),
+			alice:      invokerKubeconfigAt(checkedServer, caData(clusterCA)),
 			node:       node,
 			wantServer: checkedServer,
 		},
 		{
 			name:       "the same CA spelled with other whitespace is the same CA",
-			alice:      checkedKubeconfig(checkedServer, caData(append([]byte("\n\n"), clusterCA...))),
+			alice:      invokerKubeconfigAt(checkedServer, caData(append([]byte("\n\n"), clusterCA...))),
 			node:       node,
 			wantServer: checkedServer,
 		},
 		{
 			name:       "the cluster's CA with the same address is accepted",
-			alice:      checkedKubeconfig(nodeServer, caData(clusterCA)),
+			alice:      invokerKubeconfigAt(nodeServer, caData(clusterCA)),
 			node:       node,
 			wantServer: nodeServer,
 		},
 		{
 			name:        "skipping TLS verification is refused",
-			alice:       checkedKubeconfig(checkedServer, skipVerify),
+			alice:       invokerKubeconfigAt(checkedServer, skipVerify),
 			node:        node,
 			wantRefused: "insecure-skip-tls-verify",
 		},
 		{
 			name:        "skipping TLS verification beside the right CA is refused",
-			alice:       checkedKubeconfig(checkedServer, caData(clusterCA)+"\n"+skipVerify),
+			alice:       invokerKubeconfigAt(checkedServer, caData(clusterCA)+"\n"+skipVerify),
 			node:        node,
 			wantRefused: "insecure-skip-tls-verify",
 		},
 		{
 			name:        "a plain http server with the right CA is refused",
-			alice:       checkedKubeconfig("http://100.64.0.1:6444", caData(clusterCA)),
+			alice:       invokerKubeconfigAt("http://100.64.0.1:6444", caData(clusterCA)),
 			node:        node,
 			wantRefused: "only over https",
 		},
 		{
 			name:        "another cluster's CA is refused",
-			alice:       checkedKubeconfig(checkedServer, caData(otherCA)),
+			alice:       invokerKubeconfigAt(checkedServer, caData(otherCA)),
 			node:        node,
 			wantRefused: "holds a different CA from this worker's cluster CA " + install.AgentClusterCAPath,
 		},
 		{
 			name:        "the cluster's CA with one more beside it is refused",
-			alice:       checkedKubeconfig(checkedServer, caData(append(slices.Clone(clusterCA), otherCA...))),
+			alice:       invokerKubeconfigAt(checkedServer, caData(append(slices.Clone(clusterCA), otherCA...))),
 			node:        node,
 			wantRefused: "holds a different CA from this worker's cluster CA",
 		},
 		{
 			name:        "no CA at all is refused",
-			alice:       checkedKubeconfig(checkedServer, ""),
+			alice:       invokerKubeconfigAt(checkedServer, ""),
 			node:        node,
 			wantRefused: "carries no inline CA",
 		},
 		{
 			name:        "a CA that holds no certificate is refused",
-			alice:       checkedKubeconfig(checkedServer, caData([]byte("not a certificate"))),
+			alice:       invokerKubeconfigAt(checkedServer, caData([]byte("not a certificate"))),
 			node:        node,
 			wantRefused: "carries no inline CA",
 		},
@@ -623,25 +623,25 @@ func TestWorkerUnderSudoPinsTheInvokersClusterByTheAnchor(t *testing.T) {
 		// A changed node credential does not move the pin, either way.
 		{
 			name:        "a node credential rewritten to the invoker's CA does not admit it",
-			alice:       checkedKubeconfig(checkedServer, caData(otherCA)),
+			alice:       invokerKubeconfigAt(checkedServer, caData(otherCA)),
 			node:        movedNode,
 			wantRefused: "holds a different CA from this worker's cluster CA",
 		},
 		{
 			name:       "a node credential rewritten to another CA does not refuse the cluster's",
-			alice:      checkedKubeconfig(checkedServer, caData(clusterCA)),
+			alice:      invokerKubeconfigAt(checkedServer, caData(clusterCA)),
 			node:       movedNode,
 			wantServer: checkedServer,
 		},
 		{
 			name:       "a node credential that does not parse does not matter",
-			alice:      checkedKubeconfig(checkedServer, caData(clusterCA)),
+			alice:      invokerKubeconfigAt(checkedServer, caData(clusterCA)),
 			node:       garbageNode,
 			wantServer: checkedServer,
 		},
 		{
 			name:       "a missing node credential does not matter",
-			alice:      checkedKubeconfig(checkedServer, caData(clusterCA)),
+			alice:      invokerKubeconfigAt(checkedServer, caData(clusterCA)),
 			node:       filepath.Join(dir, "absent"),
 			wantServer: checkedServer,
 		},
@@ -650,7 +650,7 @@ func TestWorkerUnderSudoPinsTheInvokersClusterByTheAnchor(t *testing.T) {
 		// is not asked instead, even when it holds the invoker's CA.
 		{
 			name:        "a missing anchor is refused with the node credential agreeing",
-			alice:       checkedKubeconfig(checkedServer, caData(clusterCA)),
+			alice:       invokerKubeconfigAt(checkedServer, caData(clusterCA)),
 			node:        node,
 			anchorErr:   fs.ErrNotExist,
 			wantRefused: "does not exist",
@@ -658,7 +658,7 @@ func TestWorkerUnderSudoPinsTheInvokersClusterByTheAnchor(t *testing.T) {
 		},
 		{
 			name:        "a missing anchor with no node credential leaves no client",
-			alice:       checkedKubeconfig(checkedServer, caData(clusterCA)),
+			alice:       invokerKubeconfigAt(checkedServer, caData(clusterCA)),
 			node:        filepath.Join(dir, "absent"),
 			anchorErr:   fs.ErrNotExist,
 			wantRefused: "does not exist",
@@ -666,7 +666,7 @@ func TestWorkerUnderSudoPinsTheInvokersClusterByTheAnchor(t *testing.T) {
 		},
 		{
 			name:        "an anchor that cannot be read is refused",
-			alice:       checkedKubeconfig(checkedServer, caData(clusterCA)),
+			alice:       invokerKubeconfigAt(checkedServer, caData(clusterCA)),
 			node:        node,
 			anchorErr:   fs.ErrPermission,
 			wantRefused: "permission denied",
@@ -674,7 +674,7 @@ func TestWorkerUnderSudoPinsTheInvokersClusterByTheAnchor(t *testing.T) {
 		},
 		{
 			name:        "an anchor owned by another user is refused",
-			alice:       checkedKubeconfig(checkedServer, caData(clusterCA)),
+			alice:       invokerKubeconfigAt(checkedServer, caData(clusterCA)),
 			node:        node,
 			anchor:      with(func(f *sudoKubeconfigFile) { f.uid = 501 }),
 			wantRefused: "is owned by uid 501, not by root",
@@ -682,7 +682,7 @@ func TestWorkerUnderSudoPinsTheInvokersClusterByTheAnchor(t *testing.T) {
 		},
 		{
 			name:        "a group-writable anchor is refused",
-			alice:       checkedKubeconfig(checkedServer, caData(clusterCA)),
+			alice:       invokerKubeconfigAt(checkedServer, caData(clusterCA)),
 			node:        node,
 			anchor:      with(func(f *sudoKubeconfigFile) { f.mode = 0o664 }),
 			wantRefused: "group- or world-writable (mode 0664)",
@@ -690,7 +690,7 @@ func TestWorkerUnderSudoPinsTheInvokersClusterByTheAnchor(t *testing.T) {
 		},
 		{
 			name:        "a world-writable anchor is refused",
-			alice:       checkedKubeconfig(checkedServer, caData(clusterCA)),
+			alice:       invokerKubeconfigAt(checkedServer, caData(clusterCA)),
 			node:        node,
 			anchor:      with(func(f *sudoKubeconfigFile) { f.mode = 0o646 }),
 			wantRefused: "group- or world-writable (mode 0646)",
@@ -698,7 +698,7 @@ func TestWorkerUnderSudoPinsTheInvokersClusterByTheAnchor(t *testing.T) {
 		},
 		{
 			name:        "an anchor that is not a regular file is refused",
-			alice:       checkedKubeconfig(checkedServer, caData(clusterCA)),
+			alice:       invokerKubeconfigAt(checkedServer, caData(clusterCA)),
 			node:        node,
 			anchor:      &sudoKubeconfigFile{uid: 0, mode: fs.ModeNamedPipe | 0o600},
 			wantRefused: "is not a regular file",
@@ -706,7 +706,7 @@ func TestWorkerUnderSudoPinsTheInvokersClusterByTheAnchor(t *testing.T) {
 		},
 		{
 			name:        "an anchor that holds no certificate is refused",
-			alice:       checkedKubeconfig(checkedServer, caData(clusterCA)),
+			alice:       invokerKubeconfigAt(checkedServer, caData(clusterCA)),
 			node:        node,
 			anchor:      with(func(f *sudoKubeconfigFile) { f.data = []byte("not a certificate") }),
 			wantRefused: "holds no certificate",

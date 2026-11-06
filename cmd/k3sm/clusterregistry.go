@@ -165,6 +165,13 @@ func registryClients(in kubectlInputs, sudo topSudoInputs) (*rest.Config, kubern
 		in.kubeconfigEnv = ""
 		in.home = sudo.rootHome()
 		in.nodeKubeconfig = ""
+		if in.root != nil {
+			// Root's own file only here: the invoking user's is read below,
+			// where checkSudoUserCluster holds it to this node's cluster.
+			own := *in.root
+			own.sudoUser = ""
+			in.root = &own
+		}
 		if _, err := resolveKubectlConfig(in); err == nil {
 			restCfg, cs, err := builderClients(in)
 			return restCfg, cs, "", err
@@ -203,6 +210,9 @@ func registryClients(in kubectlInputs, sudo topSudoInputs) (*rest.Config, kubern
 // fix is for the builder verbs; clusterRegistryAPIFrom adds workerMintRemedy.
 func workerMintRefusal(in kubectlInputs) error {
 	cfg, err := resolveKubectlConfig(in)
+	if err != nil && in.root != nil {
+		return fmt.Errorf("%w; a node identity may not mint a registry push token", err)
+	}
 	if err != nil {
 		return fmt.Errorf("%s does not exist and the node credential %s is not readable by this account", userKubeconfigNames(in), in.nodeKubeconfig)
 	}

@@ -228,6 +228,14 @@ pin, its date, and the tarball's sha256.
 - A rollback of `sudo k3sm install` no longer leaves `~/.kube/config` getting `Unauthorized`. It puts the
   previous admin token back, so every copy of the kubeconfig keeps working, or, when it cannot, writes the
   kubeconfig with the new token and says to copy it again.
+- As root, `k3sm kubectl`, `k3sm interconnect` and the builder verbs use only inline credentials and no
+  longer read `$HOME`: root takes the work dir's admin kubeconfig, then `$KUBECONFIG` or
+  `interconnect --kubeconfig` when the file is owned by root or by the person who ran sudo, then that
+  person's `~/.kube/config`, then root's, with both homes from the user database. A file with `exec`,
+  `auth-provider` or path entries in the context it would use is refused with the entry and the reason,
+  and each refusal says what to do. kubectl gets the checked context by descriptor, so under sudo
+  `k3sm kubectl config` writes do not persist; run `k3sm kubectl` without sudo for those. Other accounts
+  are unchanged.
 - As root, `k3sm kubectl` runs only a kubectl that is root-owned and not group- or world-writable, with
   every parent directory the same. It takes the first that passes of the work dir's kubectl, the one
   `k3sm install` lays down under `/Library/k3sm/bin`, and one on `PATH`. When none passes it says why for

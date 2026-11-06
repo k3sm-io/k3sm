@@ -38,9 +38,11 @@ var kubectlExec func(bin string, argv []string, env []string) error = syscall.Ex
 // `k3s kubectl`). There is no child process: a signal sent to `k3sm kubectl`
 // reaches kubectl itself, and the exit status is kubectl's own.
 //
-// Which credentials it uses depends on who runs it. Root and the _k3sm service
-// user get the control-plane work dir's admin kubeconfig (KUBECONFIG preset),
-// with the bundled kubectl the server downloaded into that work dir. An ordinary
+// Which credentials it uses depends on who runs it. The _k3sm service user gets
+// the control-plane work dir's admin kubeconfig (KUBECONFIG preset), with the
+// bundled kubectl the server downloaded into that work dir. Root makes the same
+// choice from checked files and a checked kubectl, and hands kubectl the bytes it
+// checked (rootKubeSources.resolve, resolveKubectlAsRoot). An ordinary
 // user cannot read that directory — it is mode 0700 and owned by the service
 // user — so for them k3sm falls back to kubectl's own kubeconfig loading rules
 // ($KUBECONFIG, else ~/.kube/config) pinned to the context
@@ -52,7 +54,7 @@ var kubectlExec func(bin string, argv []string, env []string) error = syscall.Ex
 // (kubectlVerbConfig).
 func runKubectl(args []string) error {
 	workDir := workDirFromEnv()
-	home, _ := os.UserHomeDir()
+	home := kubeHome()
 	cfg, err := kubectlVerbConfig("k3sm kubectl", kubectlInputs{
 		workDirOverride: os.Getenv("K3SM_WORK_DIR"),
 		workDir:         workDir,
@@ -60,6 +62,7 @@ func runKubectl(args []string) error {
 		home:            home,
 		contextName:     installedKubeconfigName(),
 		exists:          fileExists,
+		root:            rootKubeSourcesFromEnv(),
 	}.withInstalledRole())
 	if err != nil {
 		return err
@@ -69,9 +72,18 @@ func runKubectl(args []string) error {
 		return err
 	}
 	argv := append([]string{bin}, cfg.argv(args)...)
-	// Open files need no handling here: Go opens every descriptor O_CLOEXEC,
-	// so kubectl inherits only stdin, stdout and stderr.
-	if err := kubectlExec(bin, argv, envWithKubeconfig(os.Environ(), cfg.kubeconfig)); err != nil {
+	env := envWithKubeconfig(os.Environ(), cfg.kubeconfig)
+	if cfg.checked != nil {
+		f, path, err := cfg.checked.handoff()
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		env = rootKubectlEnv(os.Environ(), path, home)
+	}
+	// Go opens every descriptor O_CLOEXEC, so kubectl inherits only stdin,
+	// stdout and stderr, and the handoff file when root has one.
+	if err := kubectlExec(bin, argv, env); err != nil {
 		return fmt.Errorf("exec kubectl: %w", err)
 	}
 	return nil
@@ -140,6 +152,10 @@ type kubectlInputs struct {
 	// asRoot says this process runs as root. No verb uses the node credential
 	// then (builderKubeconfig, kubectlVerbConfig).
 	asRoot bool
+	// root, when set, replaces all of the above but the work dir, context name and
+	// role with root's own choice (rootKubeSources.resolve). Set only when this
+	// process is root.
+	root *rootKubeSources
 }
 
 // installedNodeCredential is the role this Mac is installed as and where a
@@ -169,6 +185,9 @@ type kubectlConfig struct {
 	kubeconfig string
 	// context, when non-empty, is prepended to kubectl's argv as --context.
 	context string
+	// checked, set as root, is what was read and accepted; a client or a kubectl
+	// takes these bytes and never reads a path again.
+	checked *checkedKubeconfig
 }
 
 // argv returns kubectl's arguments: the pinned context (when there is one)
@@ -199,7 +218,12 @@ func (c kubectlConfig) argv(args []string) []string {
 //     push token (see userMigrationRoute): an account that has a kubeconfig of
 //     its own means that one. Every verb refuses this choice as root
 //     (builderKubeconfig, kubectlVerbConfig), so a new caller must too.
+//
+// As root the choice and its checks are rootKubeSources.resolve's.
 func resolveKubectlConfig(in kubectlInputs) (kubectlConfig, error) {
+	if in.root != nil {
+		return in.root.resolve(in)
+	}
 	kc := executor.KubeconfigPath(in.workDir)
 	if in.workDirOverride != "" {
 		if !in.exists(kc) {

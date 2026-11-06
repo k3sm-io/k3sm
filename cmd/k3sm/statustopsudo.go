@@ -173,10 +173,24 @@ func (in topSudoInputs) userKube(ctx context.Context) (status.Kube, error) {
 }
 
 // userKubeconfig reads the sudo user's own ~/.kube/config and returns it
-// parsed, with its path, or why it may not be used. The file is found from the
-// user database, so SUDO_USER only ever names an account and never a path, and
-// it must be a regular file that account owns and nobody else can write.
+// parsed, with its path, or why it may not be used.
 func (in topSudoInputs) userKubeconfig() (*clientcmdapi.Config, string, error) {
+	data, path, err := in.userKubeconfigFile()
+	if err != nil {
+		return nil, "", err
+	}
+	cfg, err := parseSudoUserKubeconfig(data, path, in.contextName)
+	if err != nil {
+		return nil, "", fmt.Errorf("%s's kubeconfig %s: %w", in.sudoUser, path, err)
+	}
+	return cfg, path, nil
+}
+
+// userKubeconfigFile reads the sudo user's ~/.kube/config and returns its bytes and
+// path once its owner and mode pass. The file is found from the user database, so
+// SUDO_USER only ever names an account and never a path, and it must be a regular
+// file that account owns and nobody else can write.
+func (in topSudoInputs) userKubeconfigFile() ([]byte, string, error) {
 	u, err := in.lookup(in.sudoUser)
 	if err != nil {
 		return nil, "", fmt.Errorf("SUDO_USER %s is not a user on this Mac: %w", in.sudoUser, err)
@@ -202,11 +216,7 @@ func (in topSudoInputs) userKubeconfig() (*clientcmdapi.Config, string, error) {
 	if problem := f.ownershipProblem(uint32(uid), in.sudoUser); problem != "" {
 		return nil, "", fmt.Errorf("%s's kubeconfig %s %s, %w", in.sudoUser, path, problem, errSudoKubeconfigRefused)
 	}
-	cfg, err := parseSudoUserKubeconfig(f.data, path, in.contextName)
-	if err != nil {
-		return nil, "", fmt.Errorf("%s's kubeconfig %s: %w", in.sudoUser, path, err)
-	}
-	return cfg, path, nil
+	return f.data, path, nil
 }
 
 // parseSudoUserKubeconfig parses the user's kubeconfig and checks that the

@@ -239,6 +239,9 @@ func asRoot(t *testing.T) {
 	prev := processEuid
 	processEuid = func() int { return 0 }
 	t.Cleanup(func() { processEuid = prev })
+	prevDir := kubeconfigHandoffDir
+	kubeconfigHandoffDir = t.TempDir()
+	t.Cleanup(func() { kubeconfigHandoffDir = prevDir })
 }
 
 // TestKubectlAsRootNeverExecsAWrongOwnerBinary runs the whole verb as root over

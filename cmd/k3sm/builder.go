@@ -169,13 +169,13 @@ func newBuilderManager(opts builderOptions) (*builder.Manager, error) {
 // the builder's work dir (pinned when explicit), $KUBECONFIG, the home dir and
 // the installed context name.
 func builderKubeInputs(opts builderOptions) kubectlInputs {
-	home, _ := os.UserHomeDir()
 	in := kubectlInputs{
 		workDir:       opts.workDir,
 		kubeconfigEnv: os.Getenv("KUBECONFIG"),
-		home:          home,
+		home:          kubeHome(),
 		contextName:   installedKubeconfigName(),
 		exists:        fileExists,
+		root:          rootKubeSourcesFromEnv(),
 	}
 	if opts.workDirExplicit {
 		in.workDirOverride = opts.workDir
@@ -204,6 +204,9 @@ func builderKubeconfig(in kubectlInputs) (kubectlConfig, error) {
 		}
 		return cfg, nil
 	}
+	if in.root != nil {
+		return kubectlConfig{}, err
+	}
 	kc := executor.KubeconfigPath(in.workDir)
 	if in.workDirOverride != "" {
 		return kubectlConfig{}, fmt.Errorf("kubeconfig %s not found — run `k3sm server` first (set --work-dir or K3SM_WORK_DIR if you used a non-default `k3sm server --work-dir`)", kc)
@@ -223,6 +226,17 @@ func builderClients(in kubectlInputs) (*rest.Config, kubernetes.Interface, error
 	cfg, err := builderKubeconfig(in)
 	if err != nil {
 		return nil, nil, err
+	}
+	if cfg.checked != nil {
+		restCfg, err := cfg.checked.restConfig()
+		if err != nil {
+			return nil, nil, fmt.Errorf("build client config: %w", err)
+		}
+		cs, err := kubernetes.NewForConfig(restCfg)
+		if err != nil {
+			return nil, nil, fmt.Errorf("build kubernetes client: %w", err)
+		}
+		return restCfg, cs, nil
 	}
 	if cfg.kubeconfig != "" {
 		restCfg, cs, err := kubeclient.FromPath(cfg.kubeconfig)
