@@ -395,6 +395,42 @@ func TestRootKubectlEnv(t *testing.T) {
 	}
 }
 
+// TestRootKubectlEnvKeepsOnlyTheAllowList checks both directions: every listed
+// name survives with its value, in the order given, and a name not on the list
+// goes, whatever it is called.
+func TestRootKubectlEnvKeepsOnlyTheAllowList(t *testing.T) {
+	var env, want []string
+	for _, name := range rootKubectlEnvAllowed {
+		env = append(env, name+"=value-of-"+name)
+		want = append(want, name+"=value-of-"+name)
+	}
+	for _, name := range []string{
+		"EDITOR", "KUBE_EDITOR", "VISUAL", "KUBECTL_EXTERNAL_DIFF", "KUBECTL_COMMAND_HEADERS", "PAGER", "SHELL",
+		"TMPDIR", "TERMINFO", "TZ", "ZONEINFO", "GODEBUG", "GOTRACEBACK", "HTTPS_PROXY", "https_proxy",
+		"SSL_CERT_FILE", "SSL_CERT_DIR", "SUDO_USER", "DYLD_INSERT_LIBRARIES", "LC_K3SM_UNLISTED", "LANGX", "lang",
+	} {
+		env = append(env, name+"=/some/value")
+	}
+	env = append(env, "TERM", "=x", "")
+	want = append(want, "PATH="+rootKubectlPath, "HOME="+rootHome, "KUBECONFIG=/dev/fd/9")
+
+	if got := rootKubectlEnv(env, "/dev/fd/9", rootHome); !reflect.DeepEqual(got, want) {
+		t.Errorf("env = %q, want %q", got, want)
+	}
+}
+
+// TestRootKubectlEnvAllowListIsLocaleAndTerminal states the list, so adding a
+// name to it is a change this test has to be told about.
+func TestRootKubectlEnvAllowListIsLocaleAndTerminal(t *testing.T) {
+	want := []string{
+		"COLORTERM", "COLUMNS", "LANG", "LANGUAGE", "LC_ALL", "LC_COLLATE", "LC_CTYPE", "LC_MESSAGES",
+		"LC_MONETARY", "LC_NUMERIC", "LC_TIME", "LINES", "NO_COLOR", "TERM",
+	}
+	if !reflect.DeepEqual(rootKubectlEnvAllowed, want) {
+		t.Errorf("allow list = %q, want %q", rootKubectlEnvAllowed, want)
+	}
+}
+
 // TestRootKubectlPathIsSystemDirectoriesOnly pins the list against the check root
 // holds kubectl to, on this Mac's real directories.
 func TestRootKubectlPathIsSystemDirectoriesOnly(t *testing.T) {

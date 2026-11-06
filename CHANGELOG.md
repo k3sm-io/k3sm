@@ -224,7 +224,9 @@ pin, its date, and the tarball's sha256.
   kubeconfig with the new token and says to copy it again.
 - Hardening: as root, k3sm uses only checked, inline kubeconfigs and the installed kubectl, and netd on a
   worker trusts only its own copy of the cluster CA. A refusal says what to do. Under sudo, your kubectl
-  plugins and `k3sm kubectl config` writes do not work; run without sudo for those.
+  plugins and `k3sm kubectl config` writes do not work; run without sudo for those. As root, kubectl keeps
+  only locale and terminal settings from your environment, so `kubectl edit` and `kubectl diff` under sudo
+  ignore `EDITOR`, `KUBE_EDITOR` and `KUBECTL_EXTERNAL_DIFF`.
 - `k3sm install` with a new `--mesh-ip` on a control-plane node no longer leaves the server refused its new
   address at every start. The install removes the pod range netd recorded when it names another range than
   the new address's, and removes the interconnect aliases of the old range from `bridge0`. A failed removal

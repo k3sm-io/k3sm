@@ -193,18 +193,23 @@ func fillHandoff(f *os.File, data []byte) error {
 // sudo.
 const rootKubectlPath = "/usr/bin:/bin:/usr/sbin:/sbin"
 
-// rootKubectlEnv is kubectl's environment as root: KUBECONFIG is the handoff, HOME
-// is root's, since kubectl reads its preferences from there and a preference can
-// name another kubeconfig, and PATH is rootKubectlPath. KUBERC, which names that
-// file directly, and XDG_*, which name other places kubectl reads and caches, are
-// dropped.
+// rootKubectlEnvAllowed is everything kubectl keeps from the caller's environment
+// as root: locale and terminal settings, none of which names a program or a file.
+var rootKubectlEnvAllowed = []string{
+	"COLORTERM", "COLUMNS", "LANG", "LANGUAGE", "LC_ALL", "LC_COLLATE", "LC_CTYPE", "LC_MESSAGES",
+	"LC_MONETARY", "LC_NUMERIC", "LC_TIME", "LINES", "NO_COLOR", "TERM",
+}
+
+// rootKubectlEnv is kubectl's environment as root, built up rather than filtered
+// down: the names on rootKubectlEnvAllowed with the caller's values, PATH as
+// rootKubectlPath, HOME as root's, since kubectl reads its preferences from there
+// and a preference can name another kubeconfig, and KUBECONFIG as the handoff.
+// Nothing else is passed, so `kubectl edit` and `kubectl diff` run as root use their
+// built-in defaults.
 func rootKubectlEnv(env []string, kubeconfig, home string) []string {
-	out := make([]string, 0, len(env)+3)
+	out := make([]string, 0, len(rootKubectlEnvAllowed)+3)
 	for _, kv := range env {
-		switch {
-		case strings.HasPrefix(kv, "KUBECONFIG="), strings.HasPrefix(kv, "KUBERC="), strings.HasPrefix(kv, "HOME="),
-			strings.HasPrefix(kv, "PATH="), strings.HasPrefix(kv, "XDG_"):
-		default:
+		if name, _, ok := strings.Cut(kv, "="); ok && slices.Contains(rootKubectlEnvAllowed, name) {
 			out = append(out, kv)
 		}
 	}
