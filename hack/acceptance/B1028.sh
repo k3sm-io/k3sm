@@ -148,12 +148,13 @@ mkblob() { head -c "$(( $2 * 1048576 ))" /dev/urandom >"$1"; }
 CURL=(curl -sS -u "$USER_NAME:$PASSWORD")
 BASE=""
 # upload <repo> <file> <digest> - POST, one PATCH of the whole body, PUT to close.
+# The body is streamed with -T: --data-binary @file reads the file into memory first.
 upload() {
 	local repo="$1" file="$2" digest="$3" loc
 	loc="$("${CURL[@]}" -D - -o /dev/null -X POST "$BASE/v2/$repo/blobs/uploads/" | awk 'tolower($1)=="location:"{gsub(/\r/,""); print $2}')"
 	[ -n "$loc" ] || return 1
 	case "$loc" in http*) ;; *) loc="$BASE$loc" ;; esac
-	loc="$("${CURL[@]}" -D - -o /dev/null -X PATCH -H 'Content-Type: application/octet-stream' --data-binary "@$file" "$loc" | awk 'tolower($1)=="location:"{gsub(/\r/,""); print $2}')"
+	loc="$("${CURL[@]}" -D - -o /dev/null -X PATCH -H 'Content-Type: application/octet-stream' -T "$file" "$loc" | awk 'tolower($1)=="location:"{gsub(/\r/,""); print $2}')"
 	[ -n "$loc" ] || return 1
 	case "$loc" in http*) ;; *) loc="$BASE$loc" ;; esac
 	case "$loc" in *\?*) loc="$loc&digest=$digest" ;; *) loc="$loc?digest=$digest" ;; esac
