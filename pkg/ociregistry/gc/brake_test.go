@@ -20,6 +20,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -389,5 +390,43 @@ func testMissedReferenceStillBrakes(t *testing.T) {
 	}
 	if !e.hasAll(n, append(missed, orphans...)) {
 		t.Fatal("the stopped sweep deleted a blob")
+	}
+}
+
+// TestUnverifiedBodyCountsEveryBlob: a kept body that fails its hash names
+// nothing the brake can see, so the brake cannot tell what the rows describe and
+// counts every blob of the repository, as it did before it counted only described
+// ones. Here an unreadable index child names, through the scan, a blob whose
+// bytes no longer hash to its name, and orphans are more than half the blobs.
+func TestUnverifiedBodyCountsEveryBlob(t *testing.T) {
+	e := newEnv(t)
+	n := name(t, "app")
+	e.clk.set(-2 * time.Hour)
+	bad := e.blob(t, n, []byte("the bytes this digest names"))
+	root := e.blob(t, n, unreadableBody(bad.Digest))
+	root.MediaType = ispec.MediaTypeImageIndex
+	e.putManifest(t, n, "idx", ispec.MediaTypeImageIndex, indexBody(t, root))
+	var orphans []digest.Digest
+	for i := range 4 {
+		orphans = append(orphans, e.blob(t, n, []byte{'o', byte('0' + i)}).Digest)
+	}
+	p := e.blobFile(t, n, bad.Digest)
+	if err := os.Remove(p); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte("other bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e.backdate(t, p, -2*time.Hour)
+	c := e.collector(t, -3*time.Hour)
+	e.ran(t)
+	e.clk.set(0)
+
+	rep, err := c.Sweep(e.ctx)
+	if !errors.Is(err, ErrMassDelete) || !slices.Equal(rep.Stopped, []string{"app"}) {
+		t.Fatalf("sweep: %+v, %v; want ErrMassDelete for app (4 of 7 blobs)", rep, err)
+	}
+	if !e.hasAll(n, orphans) {
+		t.Fatal("the stopped sweep reaped an orphan")
 	}
 }

@@ -72,6 +72,8 @@ limitations under the License.
 // half: each row's manifest and every digest in a manifest body the sweep read.
 // A blob outside them is one no image in the repository uses, so blobs a pusher
 // uploads beside a tagged image cannot hold the brake; they go by the grace rule.
+// When a body the sweep read fails its hash, what it names is not known, and
+// every blob counts again.
 // The brake does not stop the sweep when it
 // empties the repository (it leaves no row and every blob it reaps is older
 // than the last change to the rows) or the repository is an abandoned first

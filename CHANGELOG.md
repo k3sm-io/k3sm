@@ -229,7 +229,8 @@ pin, its date, and the tarball's sha256.
   sweep deleting more than half of a repository's blobs, on every sweep. While a repository keeps a
   manifest, the brake now counts only the blobs its manifests are or name, so those blobs are collected
   once past the grace period, and a sweep that would delete more than half of what the images use still
-  stops.
+  stops. A repository holding a manifest whose stored bytes no longer match its digest counts every blob,
+  as before.
 - A managed update no longer stalls on a node when a phase write fails, as it does when the server restarts
   during that node's update. The node used to stop working on the update without saying so, until the update
   controller's 30-minute node timeout failed the roll. It now retries the write for up to 5 minutes of backoff,

@@ -531,8 +531,8 @@ func (r reads) locked(cont store.Contents) func(digest.Digest) (refs, error) {
 // an abandoned first push, or it can go on without the blobs the rule below does
 // not vouch for (see leaveNewerOut).
 //
-// While the plan leaves a row, only the blobs the rows describe count, on both
-// sides of the half (see described): a blob no row is and no manifest body the
+// While the plan leaves a row, and every body the mark read verified, only the
+// blobs the rows describe count, on both sides of the half (see described): a blob no row is and no manifest body the
 // mark read names anywhere is outside what any image in the repository uses,
 // and goes by the grace rule alone. Otherwise a pusher who uploads enough such
 // blobs next to a tagged image would stop every sweep for as long as the tag
@@ -578,13 +578,13 @@ func (c *Collector) brake(n ref.Name, p plan, idx ispec.Index, cont store.Conten
 }
 
 // counted returns how many blobs p reaps and how many cont holds, as the half
-// brake counts them: every blob when p leaves no row, otherwise only the blobs
-// the rows describe.
+// brake counts them: every blob when p leaves no row, or when a body the mark
+// read could not be verified, otherwise only the blobs the rows describe.
 func counted(p plan, idx ispec.Index, cont store.Contents, r reads) (reap, of int) {
-	if removesEveryRow(p, idx) {
+	in, whole := described(idx, r)
+	if removesEveryRow(p, idx) || !whole {
 		return len(p.blobs), len(cont.Blobs)
 	}
-	in := described(idx, r)
 	for _, b := range cont.Blobs {
 		if in[b.Digest] {
 			of++
@@ -602,23 +602,32 @@ func counted(p plan, idx ispec.Index, cont store.Contents, r reads) (reap, of in
 // one's to keep what it names), and so is every manifest a kept body leads to,
 // so what no row is and no body names is a blob no image in the repository
 // uses. The scan, not the parse, is what is counted, so a reference the parse
-// misses still counts. A body over the size cap or failing its hash adds only
-// its own digest.
-func described(idx ispec.Index, r reads) map[digest.Digest]bool {
-	out := make(map[digest.Digest]bool, len(idx.Manifests)+len(r))
+// misses still counts.
+//
+// whole is false when a body the mark read could not be verified (it failed
+// its hash, or was over the size cap): its bytes are not known, so what it
+// names is not known either, and the set is not the whole of what the rows
+// describe. The brake then counts every blob, failing closed.
+func described(idx ispec.Index, r reads) (in map[digest.Digest]bool, whole bool) {
+	in = make(map[digest.Digest]bool, len(idx.Manifests)+len(r))
 	for _, row := range idx.Manifests {
-		out[row.Digest] = true
+		in[row.Digest] = true
 	}
+	whole = true
 	for d, e := range r {
 		if !e.present {
 			continue
 		}
-		out[d] = true
+		var v *unverifiedError
+		if errors.As(e.err, &v) {
+			whole = false
+		}
+		in[d] = true
 		for _, x := range e.named {
-			out[x] = true
+			in[x] = true
 		}
 	}
-	return out
+	return in, whole
 }
 
 // emptyingRule is the rule brake applies (a seam for the test that proves
