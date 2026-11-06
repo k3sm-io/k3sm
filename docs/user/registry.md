@@ -578,7 +578,13 @@ Nothing is deleted in any of these cases. Each shows on every sweep in the
   that repository run again. The error names the digest. An index's child that has no row of its
   own stops the sweep the same way only when it is over the 4 MiB manifest limit or its bytes do
   not hash to its digest: delete the index that names it. Any other blob named as a child does not
-  stop the sweep. It is kept, along with every digest its JSON contains.
+  stop the sweep. It is kept, along with every digest its JSON contains, and the sweep follows each
+  of those digests the repository holds a blob for. A manifest found this way keeps what it names,
+  as any manifest does, and if it is an index, a child of its own over the limit or failing its hash
+  stops the sweep too. A blob the strict read refuses is searched for digests in the same way. A
+  blob over the limit or failing its hash is kept and stops nothing. A sweep reads each blob at most
+  once per pass over a repository, and at most 4 MiB of it, so the extra reading is bounded by the
+  number of blobs the repository holds.
 - **`would delete more than half`.** The half-repository brake stopped the sweep of that repository,
   and a `registry gc: sweep stopped` line says how many blobs it held back. Check that the
   repository's tags are the ones you expect.

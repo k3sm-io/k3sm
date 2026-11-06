@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -164,9 +165,8 @@ func TestChildWithARowStaysFailClosed(t *testing.T) {
 	}
 }
 
-// TestRowlessChildThatParsesIsStillFollowed pins that only an unreadable body
-// is a leaf: a blob that does read as a manifest keeps what it names, row or no
-// row.
+// TestRowlessChildThatParsesIsStillFollowed pins that a blob that does read as a
+// manifest keeps what it names, row or no row.
 func TestRowlessChildThatParsesIsStillFollowed(t *testing.T) {
 	e := newEnv(t)
 	n := name(t, "app")
@@ -312,6 +312,263 @@ func TestUnreadableChildNeverReleasesWhatItNames(t *testing.T) {
 			}
 		})
 	}
+}
+
+// unreadableBody is a body the strict read refuses that names ds as an index
+// would.
+func unreadableBody(ds ...digest.Digest) []byte {
+	descs := make([]string, 0, len(ds))
+	for _, d := range ds {
+		descs = append(descs, rawDesc(d))
+	}
+	return []byte(`{"schemaVersion":1,"manifests":[` + strings.Join(descs, ",") + `]}`)
+}
+
+// TestScanFoundManifestIsFollowed pins what a digest found by the scan is: a
+// candidate to follow through a body already in the store. A body that cannot be
+// verified is referenced only and stops nothing, a manifest is followed, and a
+// body the strict read refuses is scanned in turn.
+func TestScanFoundManifestIsFollowed(t *testing.T) {
+	// fixture is one repository past the grace, whose tagged index names as a
+	// child the body root returns, with what the sweep must leave.
+	type fixture struct {
+		root []byte
+		keep []digest.Digest
+		// after runs once every blob is stored, to damage one.
+		after func(t *testing.T, e *env, n ref.Name)
+	}
+	realManifest := func(t *testing.T, e *env, n ref.Name, seed string) (ispec.Descriptor, []digest.Digest) {
+		t.Helper()
+		cfg := e.blob(t, n, []byte(`{"seed":"`+seed+` config"}`))
+		l1, l2 := e.blob(t, n, []byte(seed+" layer 1")), e.blob(t, n, []byte(seed+" layer 2"))
+		m := e.blob(t, n, manifestBody(t, cfg, []ispec.Descriptor{l1, l2}, nil))
+		m.MediaType = ispec.MediaTypeImageManifest
+		return m, []digest.Digest{m.Digest, cfg.Digest, l1.Digest, l2.Digest}
+	}
+	for _, tc := range []struct {
+		name string
+		make func(t *testing.T, e *env, n ref.Name) fixture
+	}{
+		{"an unreadable index naming a real manifest keeps its config and layers", func(t *testing.T, e *env, n ref.Name) fixture {
+			m, keep := realManifest(t, e, n, "real")
+			return fixture{root: unreadableBody(m.Digest), keep: keep}
+		}},
+		{"a scan-found oversized blob is kept and does not fail the plan", func(t *testing.T, e *env, n ref.Name) fixture {
+			big := e.blob(t, n, bytes.Repeat([]byte("L"), store.MaxManifestSize+1))
+			m, keep := realManifest(t, e, n, "after the big one")
+			return fixture{root: unreadableBody(big.Digest, m.Digest), keep: append(keep, big.Digest)}
+		}},
+		{"a scan-found body with a bad hash is kept and does not fail the plan", func(t *testing.T, e *env, n ref.Name) fixture {
+			bad := e.blob(t, n, []byte("the bytes this digest names"))
+			m, keep := realManifest(t, e, n, "after the bad one")
+			return fixture{root: unreadableBody(bad.Digest, m.Digest), keep: append(keep, bad.Digest), after: func(t *testing.T, e *env, n ref.Name) {
+				p := e.blobFile(t, n, bad.Digest)
+				if err := os.Remove(p); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(p, []byte("other bytes"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				e.backdate(t, p, -2*time.Hour)
+			}}
+		}},
+		{"a scan-found unreadable body's digests are kept too", func(t *testing.T, e *env, n ref.Name) fixture {
+			m, keep := realManifest(t, e, n, "two scans down")
+			loose := e.blob(t, n, []byte("loose"))
+			inner := e.blob(t, n, unreadableBody(m.Digest, loose.Digest))
+			return fixture{root: unreadableBody(inner.Digest), keep: append(keep, inner.Digest, loose.Digest)}
+		}},
+		{"an index found by the scan has its children followed", func(t *testing.T, e *env, n ref.Name) fixture {
+			m, keep := realManifest(t, e, n, "under a readable index")
+			inner := e.blob(t, n, indexBody(t, m))
+			return fixture{root: unreadableBody(inner.Digest), keep: append(keep, inner.Digest)}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			n := name(t, "app")
+			e.clk.set(-2 * time.Hour)
+			e.keeper(t, n)
+			f := tc.make(t, e, n)
+			root := e.blob(t, n, f.root)
+			root.MediaType = ispec.MediaTypeImageIndex
+			idx := e.putManifest(t, n, "idx", ispec.MediaTypeImageIndex, indexBody(t, root))
+			orphan := e.blob(t, n, []byte("orphan"))
+			if f.after != nil {
+				f.after(t, e, n)
+			}
+			c := e.collector(t, -3*time.Hour)
+			e.ran(t)
+			e.clk.set(0)
+
+			rep, err := c.Sweep(e.ctx)
+			if err != nil || len(rep.Failed) != 0 {
+				t.Fatalf("sweep: %+v, %v; want no failure", rep, err)
+			}
+			if e.has(n, orphan.Digest) {
+				t.Error("the orphan survived")
+			}
+			for _, d := range append(f.keep, root.Digest, idx.Digest) {
+				if !e.has(n, d) {
+					t.Errorf("%s was reaped; the scan found its way to it", d)
+				}
+			}
+		})
+	}
+
+	// Two bodies cannot name each other's hash in a store, so the plan is given
+	// them through refsOf. The stub fails on a repeat read, so a walk with no
+	// visited set goes red instead of running out the test timeout.
+	t.Run("a cycle between two unreadable bodies terminates", func(t *testing.T) {
+		root, a, b := digest.FromString("root"), digest.FromString("a"), digest.FromString("b")
+		layer, orphan := digest.FromString("layer"), digest.FromString("orphan")
+		named := map[digest.Digest][]digest.Digest{a: {b}, b: {a, layer}}
+		read := map[digest.Digest]int{}
+		past := time.Now().Add(-time.Hour)
+		var cont store.Contents
+		for _, d := range []digest.Digest{root, a, b, layer, orphan} {
+			cont.Blobs = append(cont.Blobs, store.Blob{Digest: d, Size: 1, ModTime: past})
+		}
+		idx := ispec.Index{Manifests: []ispec.Descriptor{{Digest: root, Annotations: map[string]string{ispec.AnnotationRefName: "idx"}}}}
+		p, err := makePlan(idx, cont, time.Now(), func(d digest.Digest) (refs, error) {
+			if read[d]++; read[d] > 1 {
+				t.Fatalf("%s was read again", d)
+			}
+			if d == root {
+				return refs{SchemaVersion: 2, Manifests: []ispec.Descriptor{{Digest: a}}}, nil
+			}
+			return refs{}, &unparsedError{d: d, cause: errors.New("refused"), named: named[d]}
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := sortedKeys(p.blobs); !slices.Equal(got, []digest.Digest{orphan}) {
+			t.Fatalf("the plan reaps %v, want only the orphan", got)
+		}
+		if read[a] != 1 || read[b] != 1 {
+			t.Fatalf("reads %v: want one read of each body in the cycle", read)
+		}
+	})
+
+	// A digest named many times in a body, or in several, is read once, and one
+	// the store does not hold is not read at all.
+	t.Run("only a stored body is read, and once", func(t *testing.T) {
+		e := newEnv(t)
+		n := name(t, "app")
+		e.clk.set(-2 * time.Hour)
+		e.keeper(t, n)
+		m, keep := realManifest(t, e, n, "named twice")
+		big := e.blob(t, n, bytes.Repeat([]byte("L"), store.MaxManifestSize+1))
+		absent := digest.FromString("no such blob")
+		inner := e.blob(t, n, unreadableBody(m.Digest, big.Digest, big.Digest))
+		root := e.blob(t, n, unreadableBody(absent, m.Digest, inner.Digest, big.Digest, m.Digest))
+		root.MediaType = ispec.MediaTypeImageIndex
+		e.putManifest(t, n, "idx", ispec.MediaTypeImageIndex, indexBody(t, root))
+		c := e.collector(t, -3*time.Hour)
+		e.ran(t)
+		e.clk.set(0)
+		read := map[digest.Digest]int{}
+		c.onRead = func(_ ref.Name, d digest.Digest) { read[d]++ }
+
+		e.sweep(t, c)
+		if read[absent] != 0 {
+			t.Errorf("read %s, which the store does not hold", absent)
+		}
+		for _, d := range []digest.Digest{root.Digest, inner.Digest, m.Digest, big.Digest} {
+			if read[d] != 1 {
+				t.Errorf("%s was read %d times, want once", d, read[d])
+			}
+		}
+		for _, d := range append(keep, big.Digest) {
+			if !e.has(n, d) {
+				t.Errorf("%s was reaped", d)
+			}
+		}
+	})
+
+	// A manifest with an old untagged row is a candidate for reaping until
+	// something kept reaches it, and the scan reaching it counts.
+	t.Run("a scan-found manifest with an untagged row keeps its row", func(t *testing.T) {
+		e := newEnv(t)
+		n := name(t, "app")
+		e.clk.set(-2 * time.Hour)
+		e.keeper(t, n)
+		img := e.push(t, n, "", "an untagged image", []byte("untagged layer"))
+		root := e.blob(t, n, unreadableBody(img.manifest.Digest))
+		root.MediaType = ispec.MediaTypeImageIndex
+		e.putManifest(t, n, "idx", ispec.MediaTypeImageIndex, indexBody(t, root))
+		c := e.collector(t, -3*time.Hour)
+		e.ran(t)
+		e.clk.set(0)
+
+		rep := e.sweep(t, c)
+		if rep.Count(KindManifest) != 0 {
+			t.Errorf("reaped a row the scan reached: %+v", rep.Objects)
+		}
+		for _, d := range img.blobs() {
+			if !e.has(n, d) {
+				t.Errorf("%s was reaped", d)
+			}
+		}
+	})
+
+	// What the scan finds is not what a readable index names: the same oversized
+	// digest reached both ways fails the plan, whichever is walked first. The row
+	// order decides that, and a pusher chooses the row order.
+	t.Run("an oversized child of a readable index fails the plan though the scan found it first", func(t *testing.T) {
+		for _, scanFirst := range []bool{true, false} {
+			e := newEnv(t)
+			n := name(t, "app")
+			e.clk.set(-2 * time.Hour)
+			e.keeper(t, n)
+			big := e.blob(t, n, bytes.Repeat([]byte("L"), store.MaxManifestSize+1))
+			big.MediaType = ispec.MediaTypeImageManifest
+			scanner := e.blob(t, n, unreadableBody(big.Digest))
+			scanner.MediaType = ispec.MediaTypeImageIndex
+			strict := e.blob(t, n, indexBody(t, big))
+			strict.MediaType = ispec.MediaTypeImageIndex
+			first, second := scanner, strict
+			if !scanFirst {
+				first, second = strict, scanner
+			}
+			e.putManifest(t, n, "first", ispec.MediaTypeImageIndex, indexBody(t, first))
+			e.putManifest(t, n, "second", ispec.MediaTypeImageIndex, indexBody(t, second))
+			orphan := e.blob(t, n, []byte("orphan"))
+			c := e.collector(t, -3*time.Hour)
+			e.ran(t)
+			e.clk.set(0)
+
+			rep, err := c.Sweep(e.ctx)
+			if !errors.Is(err, ErrUnreadable) || !slices.Equal(rep.Failed, []string{"app"}) {
+				t.Fatalf("scanFirst=%v: sweep: %+v, %v; want ErrUnreadable for app", scanFirst, rep, err)
+			}
+			if !e.has(n, orphan.Digest) {
+				t.Errorf("scanFirst=%v: a sweep that failed its plan reaped the orphan", scanFirst)
+			}
+		}
+	})
+
+	// A readable index the scan finds is followed as any index is, so its oversized
+	// child fails the plan as a kept index's would.
+	t.Run("a scan-found index naming an oversized child fails the plan", func(t *testing.T) {
+		e := newEnv(t)
+		n := name(t, "app")
+		e.clk.set(-2 * time.Hour)
+		e.keeper(t, n)
+		big := e.blob(t, n, bytes.Repeat([]byte("L"), store.MaxManifestSize+1))
+		big.MediaType = ispec.MediaTypeImageManifest
+		inner := e.blob(t, n, indexBody(t, big))
+		root := e.blob(t, n, unreadableBody(inner.Digest))
+		root.MediaType = ispec.MediaTypeImageIndex
+		e.putManifest(t, n, "idx", ispec.MediaTypeImageIndex, indexBody(t, root))
+		c := e.collector(t, -3*time.Hour)
+		e.ran(t)
+		e.clk.set(0)
+
+		if _, err := c.Sweep(e.ctx); !errors.Is(err, ErrUnreadable) {
+			t.Fatalf("sweep: %v; want ErrUnreadable", err)
+		}
+	})
 }
 
 // TestScanDigests covers the token scan: what it finds, where it stops, and that

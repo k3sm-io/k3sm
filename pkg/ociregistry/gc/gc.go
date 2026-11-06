@@ -397,11 +397,12 @@ type manifestRead struct {
 	err     error
 }
 
-// verified reports whether the mark read a body that hashed to its digest and
-// was within the size cap, whether or not the strict read accepted it.
-func (e manifestRead) verified() bool {
+// sized reports whether the mark's read holds the size of the body: any read
+// that got as far as the body's bytes, whatever it made of them.
+func (e manifestRead) sized() bool {
 	var u *unparsedError
-	return e.err == nil || errors.As(e.err, &u)
+	var v *unverifiedError
+	return e.err == nil || errors.As(e.err, &u) || errors.As(e.err, &v)
 }
 
 // reads holds a mark's manifest reads by digest.
@@ -422,6 +423,10 @@ func (r reads) unlocked(read func(digest.Digest) ([]byte, error)) func(digest.Di
 			e.err = err
 		case err != nil:
 			e.present, e.err = true, err
+			var v *unverifiedError
+			if errors.As(err, &v) {
+				e.size = v.size
+			}
 		default:
 			e.present = true
 			e.size = int64(len(b))
@@ -436,12 +441,15 @@ func (r reads) unlocked(read func(digest.Digest) ([]byte, error)) func(digest.Di
 // It reads nothing: it answers from the mark's read when the blob is still
 // there, or still absent, and has the size the mark read, and otherwise
 // returns errStale. A digest the mark never read is errStale too. The size is
-// compared for every body the mark verified, one the strict read refused
-// included, since a plan can go on from that read.
+// compared for every body whose bytes the mark reached, one the strict read
+// refused or that could not be verified included, since a plan can go on from
+// those reads.
 //
 // A body is the content its digest names (the mark verified it, and the
 // store writes a blob only under the digest of its bytes), so a present blob
-// of the same size is the same body, and its references are the same.
+// of the same size is the same body, and its references are the same. A body the
+// mark could not verify is not known to be that content: a repair to the same
+// size looks unchanged here, and the next sweep's mark reads it.
 func (r reads) locked(cont store.Contents) func(digest.Digest) (refs, error) {
 	sizes := make(map[digest.Digest]int64, len(cont.Blobs))
 	for _, b := range cont.Blobs {
@@ -453,7 +461,7 @@ func (r reads) locked(cont store.Contents) func(digest.Digest) (refs, error) {
 			return refs{}, errStale
 		}
 		size, present := sizes[d]
-		if present != e.present || (present && e.verified() && size != e.size) {
+		if present != e.present || (present && e.sized() && size != e.size) {
 			return refs{}, errStale
 		}
 		return e.refs, e.err
@@ -627,10 +635,14 @@ func (c *Collector) reader(n ref.Name) func(digest.Digest) ([]byte, error) {
 			return nil, err
 		}
 		if len(b) > store.MaxManifestSize {
-			return nil, fmt.Errorf("%w: %s is larger than %d bytes", ErrUnreadable, d, store.MaxManifestSize)
+			fi, err := f.Stat()
+			if err != nil {
+				return nil, err
+			}
+			return nil, &unverifiedError{d: d, size: fi.Size(), why: fmt.Sprintf("is larger than %d bytes", store.MaxManifestSize)}
 		}
 		if d.Algorithm().FromBytes(b) != d {
-			return nil, fmt.Errorf("%w: %s does not hash to its name", ErrUnreadable, d)
+			return nil, &unverifiedError{d: d, size: int64(len(b)), why: "does not hash to its name"}
 		}
 		return b, nil
 	}
@@ -774,6 +786,20 @@ func (e *unparsedError) Error() string {
 
 func (e *unparsedError) Unwrap() error { return ErrUnreadable }
 
+// unverifiedError is a body over the size cap or failing its hash, so its bytes
+// are not known to be what d names. It is ErrUnreadable.
+type unverifiedError struct {
+	d    digest.Digest
+	size int64
+	why  string
+}
+
+func (e *unverifiedError) Error() string {
+	return fmt.Sprintf("%v: %s %s", ErrUnreadable, e.d, e.why)
+}
+
+func (e *unverifiedError) Unwrap() error { return ErrUnreadable }
+
 // scanDigests returns every string in the JSON body b that ref.ParseDigest
 // accepts, at any depth and at every occurrence of a repeated key. It stops at
 // the first thing that is not JSON and returns what it found before it. Object
@@ -868,13 +894,29 @@ func parseBody(b []byte) (refs, error) {
 // repository's sweeps. But a body the strict read refuses may still be a real
 // manifest, stored before the read grew stricter, so it says nothing about what
 // is safe to delete. The child is kept, and every digest scanDigests finds in its
-// body stays referenced. Those digests are referenced only: none is read as a
-// manifest, so what they name in turn is not followed.
+// body stays referenced.
 //
-// A child with no row that is too large or fails its hash fails the plan, since
-// its bytes cannot be told from a manifest damaged in the store. So does a child
-// with a row that is unreadable. A body with no row that does read is followed.
-// A child digest that is not a digest is skipped: no blob can have it.
+// A digest the scan finds is also followed, when the contents hold a blob of that
+// name: only a body already in the store is read. A body that reads as a manifest
+// is followed as any manifest is, so its references are kept, and a readable index
+// found this way holds its own children to the rule below. A body the strict read
+// refuses is scanned the same way. A body too large or failing its hash is
+// referenced only: it follows nothing and does not fail the plan, since a layer is
+// usually too large and a pusher can name anything in a body.
+//
+// The kept set bounds this. A body is followed once however often it is named, so
+// a cycle ends at its second visit, and a fan-out reads each blob at most once: a
+// repeat of a digest, however many a body holds (about 56000 fill the size cap),
+// costs a queue entry and no read. A mark so reads at most one body per blob the
+// repository holds, of at most store.MaxManifestSize+1 bytes, and a sweep marks a
+// repository at most maxPlans times. The locked pass reads nothing, and a digest
+// it finds in the contents that the mark did not read is errStale.
+//
+// A child with no row that is too large or fails its hash fails the plan when a
+// readable body names it, since its bytes cannot be told from a manifest damaged
+// in the store. That holds whichever way the walk reached the digest first. So
+// does a child with a row that is unreadable. A body with no row that does read is
+// followed. A child digest that is not a digest is skipped: no blob can have it.
 func makePlan(idx ispec.Index, cont store.Contents, cutoff time.Time, refsOf func(digest.Digest) (refs, error)) (plan, error) {
 	mtime := make(map[digest.Digest]time.Time, len(cont.Blobs))
 	for _, b := range cont.Blobs {
@@ -885,6 +927,7 @@ func makePlan(idx ispec.Index, cont store.Contents, cutoff time.Time, refsOf fun
 	type item struct {
 		d        digest.Digest
 		required bool // a missing body fails the plan
+		scanned  bool // found by scanDigests, not named by a readable body
 	}
 	var queue []item
 	candidates := map[digest.Digest]bool{}
@@ -894,12 +937,12 @@ func makePlan(idx ispec.Index, cont store.Contents, cutoff time.Time, refsOf fun
 	}
 	for _, r := range idx.Manifests {
 		if _, tagged := r.Annotations[ispec.AnnotationRefName]; tagged {
-			queue = append(queue, item{r.Digest, true})
+			queue = append(queue, item{d: r.Digest, required: true})
 			continue
 		}
 		t, ok := mtime[r.Digest]
 		if !ok || !old(t) {
-			queue = append(queue, item{r.Digest, false})
+			queue = append(queue, item{d: r.Digest})
 			continue
 		}
 		m, err := refsOf(r.Digest)
@@ -907,7 +950,7 @@ func makePlan(idx ispec.Index, cont store.Contents, cutoff time.Time, refsOf fun
 			return plan{}, planError("untagged "+r.Digest.String(), err)
 		}
 		if m.Subject != nil {
-			queue = append(queue, item{r.Digest, true})
+			queue = append(queue, item{d: r.Digest, required: true})
 			continue
 		}
 		candidates[r.Digest] = true
@@ -921,9 +964,16 @@ func makePlan(idx ispec.Index, cont store.Contents, cutoff time.Time, refsOf fun
 		if kept[it.d] {
 			continue
 		}
-		kept[it.d] = true
 		referenced[it.d] = true
 		m, err := refsOf(it.d)
+		// Left unvisited: the same digest named by a readable body must still
+		// fail the plan, and which of the two is walked first is the row order's
+		// choice. A repeat costs no read, since refsOf remembers.
+		var v *unverifiedError
+		if it.scanned && !hasRow[it.d] && errors.As(err, &v) {
+			continue
+		}
+		kept[it.d] = true
 		if errors.Is(err, store.ErrBlobUnknown) && !it.required {
 			continue
 		}
@@ -931,6 +981,9 @@ func makePlan(idx ispec.Index, cont store.Contents, cutoff time.Time, refsOf fun
 		if errors.As(err, &u) && !it.required && !hasRow[it.d] {
 			for _, d := range u.named {
 				referenced[d] = true
+				if _, stored := mtime[d]; stored && !kept[d] {
+					queue = append(queue, item{d: d, scanned: true})
+				}
 			}
 			continue
 		}
@@ -948,7 +1001,7 @@ func makePlan(idx ispec.Index, cont store.Contents, cutoff time.Time, refsOf fun
 				continue
 			}
 			referenced[ch.Digest] = true
-			queue = append(queue, item{ch.Digest, false})
+			queue = append(queue, item{d: ch.Digest})
 		}
 	}
 

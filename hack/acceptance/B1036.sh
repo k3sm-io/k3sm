@@ -10,8 +10,8 @@
 # repository has gone unwritten for the abandon horizon, and treats any body
 # with a Docker schema1 fsLayers field as unreadable, which the server
 # refuses at PUT. The marker names each reviewed repository, a pusher-named
-# child blob does not stop a sweep, and the server stores only what the
-# collector reads.
+# child blob within the size cap does not stop a sweep, and the server stores
+# only what the collector reads.
 #
 # --check runs, by name, with the race detector on, in pkg/ociregistry/gc:
 #   TestPushProceedsWhileTheSweepReadsManifests     the sweep pauses at every
@@ -50,7 +50,11 @@
 #                                                   says so on every sweep
 #   TestIndexChildThatIsNoManifestDoesNotStopTheSweep
 #                                                   a blob named as a child, with no
-#                                                   row, is kept and not followed
+#                                                   row, is kept and stops nothing
+#   TestScanFoundManifestIsFollowed                 a digest found in an unreadable child
+#                                                   is followed through a stored body, a
+#                                                   body it cannot verify stops nothing,
+#                                                   and a cycle ends
 #   TestChildDigestThatNamesNoBlobDoesNotStopTheSweep
 #                                                   a child digest no blob can have
 #                                                   does not fail the plan
@@ -116,6 +120,7 @@ TESTS=(
 	TestBadStoreIDSaysHowToRecover
 	TestUnwritableStoreIDSaysWhyNothingDeletes
 	TestIndexChildThatIsNoManifestDoesNotStopTheSweep
+	TestScanFoundManifestIsFollowed
 	TestChildDigestThatNamesNoBlobDoesNotStopTheSweep
 	TestChildWithARowStaysFailClosed
 	TestRowlessChildThatParsesIsStillFollowed

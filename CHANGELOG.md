@@ -183,8 +183,11 @@ pin, its date, and the tarball's sha256.
 - The k3sm registry refuses at push any manifest its garbage collector could not read, such as an
   index with no `manifests` array or a body that repeats `config` as null, with `MANIFEST_INVALID`.
   An index that names a blob that is not a manifest as a child no longer stops garbage collection for
-  its repository: the blob is kept and nothing is followed from it. A manifest of that kind pushed
-  earlier still stops its repository's sweep until you delete it.
+  its repository, unless the blob is over the 4 MiB manifest limit or fails its hash. The blob is
+  kept, along with every digest its JSON contains, and the sweep follows those digests through the
+  blobs the repository holds, so a stored manifest the strict read refuses does not lose its config
+  or layers. A manifest of that kind pushed earlier with its own row still stops its repository's
+  sweep until you delete it.
 - The registry's garbage collector reviews each repository in its own report-only sweep. A repository
   it cannot read or plan no longer keeps every other at report-only, and no longer deletes
   unreviewed once the problem clears. A report-only sweep also lists what the half-repository brake
