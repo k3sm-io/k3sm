@@ -66,6 +66,7 @@ Usage:
   k3sm update status [-o text|json] [--watch]
   k3sm update cancel
   k3sm update abort
+  k3sm update channel [stable|rc]
 
   check   resolve the latest release on the cluster's update channel (stable,
           the way install.sh does, when no channel is set), and compare this
@@ -86,6 +87,9 @@ Usage:
   abort   the recovery after a failed step: clear the k3sm.io/update-*
           annotations on every node, uncordon each node the controller
           cordoned (never one you cordoned), and mark the Update Cancelled
+  channel print the update channel; with stable or rc, set it (this takes
+          cluster-admin) and run a check. A channel changes what is offered
+          and never starts a roll
 
 Flags:
   -o text|json        output format (check, status; default text)
@@ -113,9 +117,9 @@ Flags:
 
 Every subcommand reaches the cluster with the credentials
 ` + "`k3sm status`" + ` uses: the server's admin kubeconfig as root or the service
-user, the k3sm context of ~/.kube/config otherwise. Only check also works
-with no reachable cluster: it then compares this Mac's k3sm alone with the
-latest release.
+user, the k3sm context of ~/.kube/config otherwise. Only check and a bare
+channel also work with no reachable cluster: check then compares this Mac's
+k3sm alone with the latest release, and channel prints stable.
 
 Exit codes: 0 done, 1 it could not be done (the error says why), 2 usage, or
 apply without --yes on a stdin that is not a terminal.
@@ -154,6 +158,9 @@ type updateEnv struct {
 	// readPin reads the release pin for apply's plan; nil means
 	// updatectl.ReadReleasePin.
 	readPin func(workDir string) (*updatectl.ReleasePin, error)
+	// channelWait bounds a channel write's wait for the UpdatePolicy CRD; zero
+	// is channelCRDWait.
+	channelWait time.Duration
 }
 
 // newUpdateEnv wires the production environment: the GitHub release index, the
@@ -223,6 +230,8 @@ func runUpdate(ctx context.Context, args []string, env updateEnv) int {
 		return runUpdateCancel(ctx, args[1:], env)
 	case "abort":
 		return runUpdateAbort(ctx, args[1:], env)
+	case "channel":
+		return runUpdateChannel(ctx, args[1:], env)
 	}
 	fmt.Fprintf(env.errOut, "k3sm update: unknown subcommand %q\n\n%s", args[0], updateUsage)
 	return exitUsage

@@ -18,16 +18,22 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 
+	crdconfig "k3sm.io/apis/config/crd"
 	updatesv1alpha1 "k3sm.io/apis/updates/v1alpha1"
 
 	"k3sm.io/k3sm/pkg/status"
@@ -43,6 +49,16 @@ var updatePolicyGVR = updatesv1alpha1.SchemeGroupVersion.WithResource("updatepol
 // read or decode, or one whose channel is neither stable nor rc. Such a check
 // fails rather than resolving on a channel nobody chose.
 var errChannelUnreadable = errors.New("the update channel could not be read")
+
+// errChannelUnsupported is a write the server has no resource for, still so when
+// the wait for the CRD ended: an older server, or one whose update controller has
+// not ensured the CRD. It never reads as a set channel.
+var errChannelUnsupported = errors.New("this server does not support update channels")
+
+// channelCRDWait bounds how long a write waits for the UpdatePolicy CRD. The
+// update controller ensures it as the server starts and establishment trails that
+// by seconds, so a server that has none by then is an older one.
+const channelCRDWait = 15 * time.Second
 
 // channelReading is what a channelSource found.
 type channelReading struct {
@@ -268,4 +284,116 @@ func planPin(env updateEnv, target string, pinning bool, sha string) (string, bo
 		return "none for this release; the pin on this Mac names " + status.ClipText(pin.Version, 128), false
 	}
 	return "sha256:" + pin.SHA256 + ", set on this Mac", true
+}
+
+// runUpdateChannel is `k3sm update channel [stable|rc]`: bare it prints the
+// channel this Mac would check on, and with a value it writes the UpdatePolicy and
+// runs a check. A channel changes what is offered and never starts a roll.
+func runUpdateChannel(ctx context.Context, args []string, env updateEnv) int {
+	switch len(args) {
+	case 0:
+		return showUpdateChannel(ctx, env)
+	case 1:
+		return setUpdateChannel(ctx, args[0], env)
+	}
+	fmt.Fprint(env.errOut, updateUsage)
+	return exitUsage
+}
+
+// showUpdateChannel prints the channel, from the same source a check reads.
+func showUpdateChannel(ctx context.Context, env updateEnv) int {
+	reading, err := channelSource{dyn: env.dyn, kube: env.inputs.Kube, pairOnly: env.worker}.read(ctx)
+	if err != nil {
+		fmt.Fprintln(env.errOut, "k3sm update channel:", err)
+		return exitInternalError
+	}
+	if reading.note != "" {
+		fmt.Fprintln(env.errOut, "k3sm update:", reading.note)
+	}
+	fmt.Fprintln(env.out, reading.channel)
+	return 0
+}
+
+// setUpdateChannel writes value, then runs a check on it. The write is what the
+// verb was asked for, so a check that fails after it, as one with no route to the
+// release host does, is a note and not a failed verb.
+func setUpdateChannel(ctx context.Context, value string, env updateEnv) int {
+	channel := updatesv1alpha1.UpdateChannel(value)
+	if channel != updatesv1alpha1.UpdateChannelStable && channel != updatesv1alpha1.UpdateChannelRC {
+		fmt.Fprintf(env.errOut, "k3sm update channel: unknown channel %q: the channels are stable and rc\n\n%s", value, updateUsage)
+		return exitUsage
+	}
+	_, dyn, err := updateClients(env)
+	if err != nil {
+		fmt.Fprintln(env.errOut, "k3sm update channel: cannot reach the cluster:", err)
+		return exitInternalError
+	}
+	bound := env.channelWait
+	if bound <= 0 {
+		bound = channelCRDWait
+	}
+	if err := writeUpdateChannel(ctx, dyn, channel, bound); err != nil {
+		if apierrors.IsForbidden(err) {
+			fmt.Fprintf(env.errOut, "k3sm update channel: setting the channel takes cluster-admin, which these credentials do not have: %v\n", err)
+			return exitInternalError
+		}
+		fmt.Fprintln(env.errOut, "k3sm update channel:", err)
+		return exitInternalError
+	}
+	fmt.Fprintf(env.out, "The update channel is now %s. This changes what is offered and starts no roll.\n", channel)
+	if env.worker {
+		fmt.Fprintln(env.out, "This Mac reads the channel its server publishes, so this check can name the old one until the server has checked.")
+	}
+	fmt.Fprintln(env.out)
+	if code := runUpdateCheck(ctx, nil, env); code != 0 {
+		fmt.Fprintf(env.errOut, "k3sm update channel: the channel is set to %s, but the check after it failed; run `k3sm update check` again\n", channel)
+	}
+	return 0
+}
+
+// writeUpdateChannel sets the channel on the singleton, making it if need be. A
+// merge patch names only the field this verb owns, and it needs no read first.
+//
+// Patch answers NotFound both for no object and for no resource; only create
+// tells them apart, because creating a cluster-scoped object can be NotFound only
+// when the resource itself is missing. That case retries until bound, then returns
+// errChannelUnsupported, so a missing CRD never reads as a written channel. A lost
+// race with another writer (the object appears or goes between the two calls) also
+// retries.
+func writeUpdateChannel(ctx context.Context, dyn dynamic.Interface, channel updatesv1alpha1.UpdateChannel, bound time.Duration) error {
+	policies := dyn.Resource(updatePolicyGVR)
+	patch, err := json.Marshal(map[string]any{"spec": map[string]any{"channel": channel}})
+	if err != nil {
+		return fmt.Errorf("encode the channel: %w", err)
+	}
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": updatesv1alpha1.SchemeGroupVersion.String(),
+		"kind":       "UpdatePolicy",
+		"metadata":   map[string]any{"name": updatesv1alpha1.UpdatePolicyName},
+		"spec":       map[string]any{"channel": string(channel)},
+	}}
+	noCRD := false
+	err = wait.PollUntilContextTimeout(ctx, bound/30, bound, true, func(ctx context.Context) (bool, error) {
+		noCRD = false
+		_, err := policies.Patch(ctx, updatesv1alpha1.UpdatePolicyName, types.MergePatchType, patch, metav1.PatchOptions{})
+		if !apierrors.IsNotFound(err) {
+			return err == nil, err
+		}
+		_, err = policies.Create(ctx, obj, metav1.CreateOptions{})
+		noCRD = apierrors.IsNotFound(err)
+		switch {
+		case err == nil:
+			return true, nil
+		case noCRD, apierrors.IsAlreadyExists(err):
+			return false, nil
+		}
+		return false, err
+	})
+	switch {
+	case err == nil:
+		return nil
+	case noCRD && ctx.Err() == nil:
+		return fmt.Errorf("%w: the %s CRD is not established after %s", errChannelUnsupported, crdconfig.UpdatePolicyCRDName, bound)
+	}
+	return fmt.Errorf("write the UpdatePolicy %s: %w", updatesv1alpha1.UpdatePolicyName, err)
 }

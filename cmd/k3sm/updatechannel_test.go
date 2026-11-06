@@ -834,3 +834,278 @@ func TestUpdateCheckReadsTheChannelFromItsSource(t *testing.T) {
 		}
 	})
 }
+
+// TestUpdateChannelSetThenCheckNamesChannel is the verb end to end: a write takes
+// effect on the check that follows it, on the object every later reader reads, and
+// a second write moves the object it made.
+func TestUpdateChannelSetThenCheckNamesChannel(t *testing.T) {
+	c := newUpdateCluster()
+	x := &channelIndex{stable: "v0.2.3", listed: []string{"v0.2.3", "v0.3.0-rc.1"}}
+	wd := installedWorkDir(t)
+	mutate := func(env *updateEnv) {
+		env.inputs.HTTP = x.client()
+		env.workDir = wd
+	}
+	for _, tc := range []struct {
+		channel updatesv1alpha1.UpdateChannel
+		latest  string
+	}{
+		{updatesv1alpha1.UpdateChannelRC, "v0.3.0-rc.1"},
+		{updatesv1alpha1.UpdateChannelStable, "v0.2.3"},
+	} {
+		code, out, errOut := c.runWith(t, mutate, "channel", string(tc.channel))
+		if code != 0 {
+			t.Fatalf("set %s: exit %d, stderr %q", tc.channel, code, errOut)
+		}
+		for _, want := range []string{"channel     " + string(tc.channel) + "\n", "latest      " + tc.latest + ","} {
+			if !strings.Contains(out, want) {
+				t.Errorf("set %s: the check does not say %q in\n%s", tc.channel, want, out)
+			}
+		}
+		obj, err := c.dyn.Resource(updatePolicyGVR).Get(context.Background(), updatesv1alpha1.UpdatePolicyName, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("set %s: read the policy: %v", tc.channel, err)
+		}
+		if got, _, _ := unstructured.NestedString(obj.Object, "spec", "channel"); got != string(tc.channel) {
+			t.Errorf("set %s: spec.channel = %q", tc.channel, got)
+		}
+		if rec := readUpdateRecord(wd); rec.Channel != tc.channel || rec.Latest != tc.latest {
+			t.Errorf("set %s: record = %+v", tc.channel, rec)
+		}
+		if code, got, _ := c.runWith(t, mutate, "channel"); code != 0 || got != string(tc.channel)+"\n" {
+			t.Errorf("after set %s: bare verb exit %d, printed %q", tc.channel, code, got)
+		}
+	}
+}
+
+// policyVerbAnswers makes the first n calls of verb on the UpdatePolicy answer err,
+// and the rest reach the fake's store. A negative n answers every call.
+func (c updateCluster) policyVerbAnswers(verb string, n int, err error) {
+	c.dyn.PrependReactor(verb, updatePolicyGVR.Resource, func(k8stesting.Action) (bool, runtime.Object, error) {
+		if n == 0 {
+			return false, nil, nil
+		}
+		n--
+		return true, nil, err
+	})
+}
+
+// policyCalls counts the calls of verb on the UpdatePolicy so far.
+func (c updateCluster) policyCalls(verb string) int {
+	n := 0
+	for _, a := range c.dyn.Actions() {
+		if a.GetVerb() == verb && a.GetResource().Resource == updatePolicyGVR.Resource {
+			n++
+		}
+	}
+	return n
+}
+
+// policyChannel is the stored spec.channel, or "" with no object.
+func (c updateCluster) policyChannel(t *testing.T) string {
+	t.Helper()
+	obj, err := c.dyn.Tracker().Get(updatePolicyGVR, "", updatesv1alpha1.UpdatePolicyName)
+	if apierrors.IsNotFound(err) {
+		return ""
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _, _ := unstructured.NestedString(obj.(*unstructured.Unstructured).Object, "spec", "channel")
+	return got
+}
+
+// TestUpdateChannelVerb is everything around the write itself: what a bare read
+// prints, which values are refused, and each way a write can fail.
+func TestUpdateChannelVerb(t *testing.T) {
+	gr := schema.GroupResource{Group: updatesv1alpha1.GroupName, Resource: updatePolicyGVR.Resource}
+	noResource := apierrors.NewGenericServerResponse(http.StatusNotFound, "create", gr, "", "the server could not find the requested resource", 0, true)
+	noObject := apierrors.NewNotFound(gr, updatesv1alpha1.UpdatePolicyName)
+	shortWait := func(env *updateEnv) { env.channelWait = 300 * time.Millisecond }
+
+	t.Run("bare with no object prints stable", func(t *testing.T) {
+		code, out, errOut := newUpdateCluster().run(t, "channel")
+		if code != 0 || out != "stable\n" || errOut != "" {
+			t.Errorf("exit %d, out %q, stderr %q", code, out, errOut)
+		}
+	})
+
+	t.Run("bare with no cluster prints stable and says so", func(t *testing.T) {
+		code, out, errOut := newUpdateCluster().runWith(t, func(env *updateEnv) {
+			env.dyn, env.inputs.Kube, env.kubeErr = nil, nil, errors.New("no kubeconfig")
+		}, "channel")
+		if code != 0 || out != "stable\n" || !strings.Contains(errOut, "no cluster to read the update channel from") {
+			t.Errorf("exit %d, out %q, stderr %q", code, out, errOut)
+		}
+	})
+
+	t.Run("bare on an unknown value fails", func(t *testing.T) {
+		c := newUpdateCluster()
+		c.setPolicy(t, "beta")
+		code, out, errOut := c.run(t, "channel")
+		if code != exitInternalError || out != "" || !strings.Contains(errOut, "beta") {
+			t.Errorf("exit %d, out %q, stderr %q", code, out, errOut)
+		}
+	})
+
+	t.Run("bare on a worker reads the published pair", func(t *testing.T) {
+		c := newUpdateCluster(publishingServer("server", "v0.3.0-rc.1", "rc"))
+		code, out, _ := c.runWith(t, func(env *updateEnv) { env.worker = true }, "channel")
+		if code != 0 || out != "rc\n" || c.policyReads() != 0 {
+			t.Errorf("exit %d, out %q, %d object reads", code, out, c.policyReads())
+		}
+	})
+
+	t.Run("only stable and rc are written", func(t *testing.T) {
+		for _, value := range []string{"beta", "RC", "Stable", "", "rc ", "--version"} {
+			c := newUpdateCluster()
+			code, _, errOut := c.run(t, "channel", value)
+			if code != exitUsage || !strings.Contains(errOut, "unknown channel") {
+				t.Errorf("value %q: exit %d, stderr %q", value, code, errOut)
+			}
+			if len(c.dyn.Actions()) != 0 {
+				t.Errorf("value %q reached the cluster: %v", value, c.dyn.Actions())
+			}
+		}
+	})
+
+	t.Run("two values are a usage error", func(t *testing.T) {
+		c := newUpdateCluster()
+		if code, _, _ := c.run(t, "channel", "rc", "stable"); code != exitUsage || len(c.dyn.Actions()) != 0 {
+			t.Errorf("exit %d, actions %v", code, c.dyn.Actions())
+		}
+	})
+
+	t.Run("a write on a server with no CRD returns its own error", func(t *testing.T) {
+		c := newUpdateCluster()
+		c.policyVerbAnswers("patch", -1, noObject)
+		c.policyVerbAnswers("create", -1, noResource)
+		x := &channelIndex{stable: "v0.2.3"}
+		code, out, errOut := c.runWith(t, func(env *updateEnv) {
+			shortWait(env)
+			env.inputs.HTTP = x.client()
+		}, "channel", "rc")
+		if code != exitInternalError || !strings.Contains(errOut, "this server does not support update channels") {
+			t.Fatalf("exit %d, stderr %q", code, errOut)
+		}
+		if strings.Contains(out, "now rc") || x.redirects.Load() != 0 || x.lists.Load() != 0 {
+			t.Errorf("a refused write read as set: out %q, %d redirects, %d listings", out, x.redirects.Load(), x.lists.Load())
+		}
+		if c.policyCalls("create") < 2 {
+			t.Errorf("%d creates: the write did not wait for the CRD", c.policyCalls("create"))
+		}
+		err := writeUpdateChannel(context.Background(), c.dyn, updatesv1alpha1.UpdateChannelRC, 50*time.Millisecond)
+		if !errors.Is(err, errChannelUnsupported) {
+			t.Errorf("err = %v, want errChannelUnsupported", err)
+		}
+	})
+
+	t.Run("a CRD established during the wait takes the write", func(t *testing.T) {
+		c := newUpdateCluster()
+		c.policyVerbAnswers("create", 3, noResource)
+		code, out, errOut := c.runWith(t, func(env *updateEnv) {
+			env.channelWait = 3 * time.Second
+			env.inputs.HTTP = (&channelIndex{stable: "v0.2.3", listed: []string{"v0.2.3"}}).client()
+		}, "channel", "rc")
+		if code != 0 || !strings.Contains(out, "now rc") || c.policyChannel(t) != "rc" {
+			t.Errorf("exit %d, out %q, stderr %q, stored %q", code, out, errOut, c.policyChannel(t))
+		}
+	})
+
+	t.Run("a forbidden write names cluster-admin and does not wait", func(t *testing.T) {
+		c := newUpdateCluster()
+		c.policyVerbAnswers("patch", -1, apierrors.NewForbidden(gr, updatesv1alpha1.UpdatePolicyName, errors.New("no rule")))
+		code, _, errOut := c.run(t, "channel", "rc")
+		if code != exitInternalError || !strings.Contains(errOut, "cluster-admin") {
+			t.Errorf("exit %d, stderr %q", code, errOut)
+		}
+		if c.policyCalls("patch") != 1 || c.policyCalls("create") != 0 {
+			t.Errorf("%d patches, %d creates, want one patch", c.policyCalls("patch"), c.policyCalls("create"))
+		}
+	})
+
+	t.Run("another write error is not a missing CRD", func(t *testing.T) {
+		c := newUpdateCluster()
+		c.policyVerbAnswers("patch", -1, apierrors.NewInternalError(errors.New("etcd down")))
+		err := writeUpdateChannel(context.Background(), c.dyn, updatesv1alpha1.UpdateChannelRC, time.Second)
+		if err == nil || errors.Is(err, errChannelUnsupported) || !strings.Contains(err.Error(), "etcd down") {
+			t.Errorf("err = %v", err)
+		}
+	})
+
+	t.Run("a missing CRD then another error reports the other error", func(t *testing.T) {
+		c := newUpdateCluster()
+		patches := 0
+		c.dyn.PrependReactor("patch", updatePolicyGVR.Resource, func(k8stesting.Action) (bool, runtime.Object, error) {
+			if patches++; patches == 1 {
+				return true, nil, noObject
+			}
+			return true, nil, apierrors.NewInternalError(errors.New("etcd down"))
+		})
+		c.policyVerbAnswers("create", -1, noResource)
+		err := writeUpdateChannel(context.Background(), c.dyn, updatesv1alpha1.UpdateChannelRC, time.Second)
+		if err == nil || errors.Is(err, errChannelUnsupported) || !strings.Contains(err.Error(), "etcd down") {
+			t.Errorf("err = %v", err)
+		}
+	})
+
+	t.Run("a cancelled wait is not a missing CRD", func(t *testing.T) {
+		c := newUpdateCluster()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		c.policyVerbAnswers("patch", -1, noObject)
+		c.dyn.PrependReactor("create", updatePolicyGVR.Resource, func(k8stesting.Action) (bool, runtime.Object, error) {
+			cancel()
+			return true, nil, noResource
+		})
+		err := writeUpdateChannel(ctx, c.dyn, updatesv1alpha1.UpdateChannelRC, time.Minute)
+		if !errors.Is(err, context.Canceled) || errors.Is(err, errChannelUnsupported) {
+			t.Errorf("err = %v", err)
+		}
+	})
+
+	t.Run("an object that appears between the calls is patched", func(t *testing.T) {
+		c := newUpdateCluster()
+		c.setPolicy(t, "stable")
+		c.policyVerbAnswers("patch", 1, noObject)
+		if err := writeUpdateChannel(context.Background(), c.dyn, updatesv1alpha1.UpdateChannelRC, 3*time.Second); err != nil {
+			t.Fatal(err)
+		}
+		if got := c.policyChannel(t); got != "rc" {
+			t.Errorf("stored %q", got)
+		}
+	})
+
+	t.Run("no cluster refuses a write", func(t *testing.T) {
+		code, _, errOut := newUpdateCluster().runWith(t, func(env *updateEnv) {
+			env.dyn, env.inputs.Kube, env.kubeErr = nil, nil, errors.New("no kubeconfig")
+		}, "channel", "rc")
+		if code != exitInternalError || !strings.Contains(errOut, "no kubeconfig") {
+			t.Errorf("exit %d, stderr %q", code, errOut)
+		}
+	})
+
+	t.Run("a check that fails after the write keeps it and says so", func(t *testing.T) {
+		c := newUpdateCluster()
+		x := &channelIndex{stable: "v0.2.3", listFails: true}
+		code, out, errOut := c.runWith(t, func(env *updateEnv) { env.inputs.HTTP = x.client() }, "channel", "rc")
+		if code != 0 || !strings.Contains(out, "now rc") || c.policyChannel(t) != "rc" {
+			t.Errorf("exit %d, out %q, stored %q", code, out, c.policyChannel(t))
+		}
+		if !strings.Contains(errOut, "the channel is set to rc") || x.lists.Load() == 0 {
+			t.Errorf("stderr %q, %d listings", errOut, x.lists.Load())
+		}
+	})
+
+	t.Run("a worker with admin credentials hears the check may lag", func(t *testing.T) {
+		c := newUpdateCluster(publishingServer("server", "v0.2.3", "stable"))
+		x := &channelIndex{stable: "v0.2.3"}
+		code, out, _ := c.runWith(t, func(env *updateEnv) {
+			env.worker = true
+			env.inputs.HTTP = x.client()
+		}, "channel", "rc")
+		if code != 0 || !strings.Contains(out, "can name the old one") || c.policyChannel(t) != "rc" || x.lists.Load() != 0 {
+			t.Errorf("exit %d, out %q, stored %q, %d listings", code, out, c.policyChannel(t), x.lists.Load())
+		}
+	})
+}
