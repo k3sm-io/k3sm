@@ -247,6 +247,11 @@ pin, its date, and the tarball's sha256.
 - `sudo k3sm kubectl`, `sudo k3sm status` and the other root verbs that read a person's kubeconfig use that same list
   for the context they select, so `proxy-url`, `as`, `as-uid`, `as-groups` and `as-user-extra` are refused there too.
   Other contexts in the file are not checked or used.
+- `sudo k3sm kubectl --kubeconfig <file>` now reads the file as root and applies the same checks as any other
+  kubeconfig root reads: one regular file owned by root or the person who ran sudo, no credential plugin, no token,
+  certificate or CA path, no `proxy-url`. kubectl gets the checked context, not the path. The file keeps its own
+  CA, so it may name another cluster. `--kubeconfig` given twice, a path list, `-` and `--kuberc` are refused. To
+  use such a file as it stands, run `kubectl` directly without sudo.
 - A worker's root helper, `sudo k3sm kubectl` and the other root verbs on a worker, and `k3sm stop` and `k3sm start`
   there, verify the apiserver's certificate against the kubernetes Service address, `10.43.0.1`, which
   every apiserver certificate carries and no other certificate of the cluster does. They still connect to the

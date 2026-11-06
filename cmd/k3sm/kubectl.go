@@ -43,8 +43,9 @@ var kubectlExec func(bin string, argv []string, env []string) error = syscall.Ex
 // bundled kubectl the server downloaded into that work dir. Root makes the same
 // choice from checked files and a checked kubectl, and hands kubectl the bytes it
 // checked, on a fixed PATH and an environment built from an allow list
-// (rootKubeSources.resolve, resolveKubectlAsRoot, rootKubectlEnv). An ordinary
-// user cannot read that directory — it is mode 0700 and owned by the service
+// (rootKubeSources.resolve, resolveKubectlAsRoot, rootKubectlEnv), and a file named
+// by --kubeconfig goes through the same checks and handoff (rootKubectlChoice). An
+// ordinary user cannot read that directory — it is mode 0700 and owned by the service
 // user — so for them k3sm falls back to kubectl's own kubeconfig loading rules
 // ($KUBECONFIG, else ~/.kube/config) pinned to the context
 // `sudo k3sm install` merged there (`k3sm` unless --kubeconfig-name named
@@ -56,7 +57,7 @@ var kubectlExec func(bin string, argv []string, env []string) error = syscall.Ex
 func runKubectl(args []string) error {
 	workDir := workDirFromEnv()
 	home := kubeHome()
-	cfg, err := kubectlVerbConfig("k3sm kubectl", kubectlInputs{
+	in := kubectlInputs{
 		workDirOverride: os.Getenv("K3SM_WORK_DIR"),
 		workDir:         workDir,
 		kubeconfigEnv:   os.Getenv("KUBECONFIG"),
@@ -64,7 +65,16 @@ func runKubectl(args []string) error {
 		contextName:     installedKubeconfigName(),
 		exists:          fileExists,
 		root:            rootKubeSourcesFromEnv(),
-	}.withInstalledRole())
+	}.withInstalledRole()
+	var (
+		cfg kubectlConfig
+		err error
+	)
+	if in.root != nil {
+		cfg, args, err = rootKubectlChoice(in, args)
+	} else {
+		cfg, err = kubectlVerbConfig("k3sm kubectl", in)
+	}
 	if err != nil {
 		return err
 	}

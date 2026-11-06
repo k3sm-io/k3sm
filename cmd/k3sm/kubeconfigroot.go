@@ -325,16 +325,21 @@ func (s *rootKubeSources) namedOwners() map[uint32]string {
 // loadNamed reads a file root was pointed at by $KUBECONFIG or --kubeconfig.
 // contextName "" takes the file's current context.
 func (s *rootKubeSources) loadNamed(path, contextName string) (*checkedKubeconfig, error) {
+	return s.loadNamedWith(path, contextName, rootKubeconfigRemedy)
+}
+
+// loadNamedWith is loadNamed with the remedy a refusal ends in.
+func (s *rootKubeSources) loadNamedWith(path, contextName, remedy string) (*checkedKubeconfig, error) {
 	f, err := s.readFile(path)
 	if err != nil {
 		return nil, err
 	}
 	if err := checkFileShape(path, f, s.namedOwners()); err != nil {
-		return nil, fmt.Errorf("%w; %s", err, rootKubeconfigRemedy)
+		return nil, fmt.Errorf("%w; %s", err, remedy)
 	}
 	c, err := checkKubeconfig(f.data, path, contextName)
 	if err != nil {
-		return nil, fmt.Errorf("kubeconfig %s: %w; %s", path, err, rootKubeconfigRemedy)
+		return nil, fmt.Errorf("kubeconfig %s: %w; %s", path, err, remedy)
 	}
 	return c, nil
 }
