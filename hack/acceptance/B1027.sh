@@ -2,8 +2,7 @@
 # Copyright The k3sm Authors.
 # SPDX-License-Identifier: Apache-2.0
 #
-# The registry's upgrade over a zot store and its rollback (docs/m23-plan.md
-# resolutions 4 and 21).
+# The registry's upgrade over a zot store and its rollback.
 #
 # --lab is the gate: the rig leg against a live two-node cluster, through kubectl,
 # k3sm, Pods and a buildx push only. `--plan` prints its steps and `--lab --help` its
@@ -313,8 +312,7 @@ usage: K3SM_LAB=1 hack/acceptance/B1027.sh --lab \
   --buildx-host where the buildx push goes (default localhost:6451, the push gate)
 
 The run installs the old set on both Macs (worker first), pushes under zot, rolls the
-new set (worker first, then the server: the item and docs/m23-plan.md resolution 21
-agree), checks the verbs, pods and a GC cycle, rolls back to the old set and has zot
+new set (worker first, then the server), checks the verbs, pods and a GC cycle, rolls back to the old set and has zot
 serve the store. A zot GC report that appears within --zot-gc-wait is judged
 (a failed GC or an error is red); the released zot collects every 6h, so when none
 appears the run records "no zot GC cycle in the window; GC under zot is proven by
@@ -533,7 +531,7 @@ digests_hold() {
 		END { exit bad }' "$2" "$1"
 }
 
-# store_verdict <before> <after> <k3sm|zot>: resolution 4 over two snapshots.
+# store_verdict <before> <after> <k3sm|zot>: judge the store over two snapshots.
 store_verdict() { lab_py store-verdict "$1" "$2" "$3"; }
 
 # snapshot_script <store>: the remote shell that lists the store, one S line per path
@@ -735,7 +733,7 @@ copy_kubeconfig() {
 	printf '%s\n' "$cfg" | bounded "$STEP_TIMEOUT" rsh_raw "$WORKER" "umask 077; mkdir -p ~/.kube; if [ -f ~/.kube/config ]; then cp ~/.kube/config ~/.kube/config.b1027-$RUN-$KUBE_COPIES; fi; cat >~/.kube/config" ||
 		echo "note: could not copy the admin kubeconfig to the worker"
 }
-# roll <set> <label>: the worker, then the server (resolution 21: workers first); both
+# roll <set> <label>: the worker, then the server (workers first); both
 # Ready, both reporting the set's version.
 roll() {
 	local set="$1" want got
@@ -1415,7 +1413,7 @@ lab_main() {
 		echo "old_set: $OLD_SET ($OLD_VER), zot $ZOT_BIN"
 		echo "new_set: $NEW_SET ($NEW_VER)"
 		echo "server: $SERVER ($SERVER_NODE, $SERVER_LAN), worker: $WORKER ($WORKER_NODE)"
-		echo "roll order: worker, then server (the item and m23-plan resolution 21 agree)"
+		echo "roll order: worker, then server"
 		echo "roll path: k3sm install in place from each set"
 	} >>"$RUNLOG"
 	lab_log "PASS p.0"
@@ -1796,7 +1794,7 @@ lab_self_test() {
 	printf 'r/a:v1 sha256:aa\n' >"$t/obs"
 	lchk "digests: a missing tag is named" "$(digests_hold "$t/rec" "$t/obs" || true)" "MISSING r/b:v1"
 
-	# store_verdict: resolution 4 over snapshots.
+	# store_verdict: judge the store over snapshots.
 	local h64 o
 	h64="$(printf 'x' | shasum -a 256 | cut -d' ' -f1)"
 	o="_k3sm:_k3sm"
