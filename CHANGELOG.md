@@ -110,6 +110,13 @@ pin, its date, and the tarball's sha256.
 
 ### Changed
 
+- A node refuses a GPU pod with a `FailedGPUFit` Event when the units held under `mlx.k3sm.io/gpu` and
+  `k3sm.io/gpu` together, plus the pod's own, pass the node's GPU slot count. This now holds for pods that
+  name only `mlx.k3sm.io/gpu`, and on a node whose GPU memory ceiling is unknown: a pod bound past the
+  node's slots, for example through `spec.nodeName`, is refused. The scheduler counts the two names
+  separately, so it can bind more pods than the node has slots. A refused pod reports `ProviderFailed`
+  and is retried on a back-off, so it starts once a slot frees; with `restartPolicy: Never` it stays
+  `Failed`.
 - The ingest registry is served by k3sm itself, as a `k3sm registry serve` child process, in place of
   zot. Images already in the registry stay where they are, and zot's `cache.db` and `meta.db` are left
   untouched, so a rollback finds them. A server running as root, as a hand-run `sudo k3sm server`, has

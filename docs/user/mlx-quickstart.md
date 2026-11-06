@@ -166,3 +166,4 @@ That removes the serving workload, both Services, and the cache PVC. The underly
   API for scheduling ANE work, so k3sm has no ANE path planned.
 - Memory accounting covers the serving process group; the context window is pinned from `memory` so the
   cache cannot grow past the limit mid-generation.
+- While both `mlx.k3sm.io/gpu` and `k3sm.io/gpu` are advertised, the scheduler counts them separately and can bind up to twice a node's GPU slots. The provider refuses the extras with a `FailedGPUFit` Event; they report `ProviderFailed` and are retried on a back-off until another GPU pod ends (a pod with `restartPolicy: Never` stays `Failed`).

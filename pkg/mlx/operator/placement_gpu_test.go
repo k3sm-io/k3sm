@@ -27,6 +27,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	mlxv1alpha1 "k3sm.io/apis/mlx/v1alpha1"
+	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/k3sm/pkg/mlx"
 )
 
@@ -61,6 +62,19 @@ func ownRank(m *mlxv1alpha1.MLXModel, rank int) func(*corev1.Pod) {
 			mlx.LabelRank:                "0",
 		}
 	}
+}
+
+// underNewName moves p's GPU ask to the new resource name.
+func underNewName(p *corev1.Pod) {
+	r := &p.Spec.Containers[0].Resources
+	r.Limits[corev1.ResourceName(runtimev1.ResourceGPU)] = r.Limits[corev1.ResourceName(mlxv1alpha1.ResourceGPU)]
+	delete(r.Limits, corev1.ResourceName(mlxv1alpha1.ResourceGPU))
+}
+
+// alsoNewName adds the new resource name beside p's old-name GPU ask.
+func alsoNewName(p *corev1.Pod) {
+	r := &p.Spec.Containers[0].Resources
+	r.Limits[corev1.ResourceName(runtimev1.ResourceGPU)] = r.Limits[corev1.ResourceName(mlxv1alpha1.ResourceGPU)]
 }
 
 // TestPlaceRefusesHeldGPU: a node whose mlx.k3sm.io/gpu slots are all held by
@@ -110,6 +124,23 @@ func TestPlaceRefusesHeldGPU(t *testing.T) {
 		}(),
 			pods:      []corev1.Pod{gpuPod("other", "serve-0", "a", 1)},
 			wantNodes: []string{"a", "b"}},
+		{name: "held_under_the_new_name_refused", nodes: two,
+			pods:       []corev1.Pod{gpuPod("other", "serve-0", "a", 1, underNewName)},
+			wantReason: mlx.ReasonInsufficientGPU, wantMsg: "(a)"},
+		{name: "held_under_both_names_on_one_pod_takes_one_slot", nodes: func() []corev1.Node {
+			ns := []corev1.Node{gpuNode("a", "64Gi", false), gpuNode("b", "64Gi", false)}
+			ns[0].Status.Allocatable[corev1.ResourceName(mlxv1alpha1.ResourceGPU)] = resource.MustParse("2")
+			return ns
+		}(),
+			pods:      []corev1.Pod{gpuPod("other", "serve-0", "a", 1, alsoNewName)},
+			wantNodes: []string{"a", "b"}},
+		{name: "one_pod_under_each_name_fills_two_slots", nodes: func() []corev1.Node {
+			ns := []corev1.Node{gpuNode("a", "64Gi", false), gpuNode("b", "64Gi", false)}
+			ns[0].Status.Allocatable[corev1.ResourceName(mlxv1alpha1.ResourceGPU)] = resource.MustParse("2")
+			return ns
+		}(),
+			pods:       []corev1.Pod{gpuPod("other", "old", "a", 1), gpuPod("other", "new", "a", 1, underNewName)},
+			wantReason: mlx.ReasonInsufficientGPU, wantMsg: "(a)"},
 		{name: "every_slot_held_on_both", nodes: two,
 			pods:       []corev1.Pod{gpuPod("other", "x", "a", 1), gpuPod("other", "y", "b", 1)},
 			wantReason: mlx.ReasonInsufficientGPU, wantMsg: "(a, b)"},

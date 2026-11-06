@@ -2107,14 +2107,26 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	// on the pod, once, at create. Degrade-not-fail, unlike the preflight above.
 	r.warnXcodeToolchainUngranted(ctx, pod, box)
 
-	// The GPU memory fit is sized BEFORE the lock, because the ceiling costs an RPC
-	// and a blocking call inside r.mu would stall every other pod operation on this
-	// node. Only the comparison and the insert need to be atomic, and they are.
+	// The GPU memory fit and the slot cap are sized BEFORE the lock, because the
+	// node's GPU facts and each held pod's phase cost an RPC and a blocking call
+	// inside r.mu would stall every other pod operation on this node. Only the
+	// comparison and the insert need to be atomic, and they are.
+	//
+	// The two asks differ on purpose. wantsGPU is the grant, limits only, and it
+	// alone drives the memory fit. gpuUnits is the count, which falls back to
+	// requests, and it drives the cap.
 	wantsGPU := podRequestsGPU(pod)
-	var gpuCeiling, gpuWant int64
-	if wantsGPU {
-		gpuCeiling = r.gpuCeilingBytes(ctx)
+	gpuUnits := gpucapacity.PodUnits(pod)
+	var gpuCeiling, gpuWant, gpuSlots int64
+	var gpuFinished map[string]bool
+	if wantsGPU || gpuUnits > 0 {
+		gpuFacts, known := r.gpuFacts(ctx)
+		gpuCeiling = gpucapacity.GPUCeilingBytes(gpuFacts)
+		if known {
+			gpuSlots = gpucapacity.GPUSlots(gpuFacts)
+		}
 		gpuWant = podMemoryLimitBytes(pod)
+		gpuFinished = r.finishedGPUPods(ctx)
 	}
 
 	r.mu.Lock()
@@ -2160,9 +2172,26 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 			// would be misleading when the missing number is the pod's own.
 			msg := msgFailedGPUFit(gpuWant, admitted, gpuCeiling)
 			if errors.Is(err, gpucapacity.ErrGPUMemoryUnbounded) {
-				msg = msgFailedGPUUnbounded(podGPUResource(pod), gpuCeiling)
+				msg = msgFailedGPUUnbounded(gpucapacity.GrantResource(pod), gpuCeiling)
 			}
 			r.recorder.Event(pod, corev1.EventTypeWarning, reasonFailedGPUFit, msg)
+			return fmt.Errorf("create pod %s/%s: %w", pod.Namespace, pod.Name, err)
+		}
+	}
+	// The cap over both names, in the same critical section, and after the memory
+	// fit so a pod that is too big hears about its memory. The scheduler counts
+	// each name on its own and a pod with spec.nodeName skips it altogether, so this
+	// is the one place the node's real slot count is held. gpuSlots is 0 only when
+	// the probe failed, which says nothing about the count: admit, as the fit does.
+	if gpuUnits > 0 && gpuSlots > 0 {
+		held := r.heldGPUUnitsLocked(id, gpuFinished)
+		if err := gpucapacity.GPUSlotsFit(gpuSlots, held, gpuUnits); err != nil {
+			r.mu.Unlock()
+			r.log.Error("CreatePod: the pod does not fit in this node's GPU slots beside the pods already admitted",
+				"namespace", pod.Namespace, "name", pod.Name,
+				"want_units", gpuUnits, "held_units", held, "slots", gpuSlots,
+				"err", err)
+			r.recorder.Event(pod, corev1.EventTypeWarning, reasonFailedGPUFit, msgFailedGPUSlots(gpuUnits, held, gpuSlots))
 			return fmt.Errorf("create pod %s/%s: %w", pod.Namespace, pod.Name, err)
 		}
 	}
@@ -2331,29 +2360,80 @@ func (r *runtimedRuntime) runtimeHoldsPod(ctx context.Context, id string) bool {
 	return e == nil || e.GetCode() == 0
 }
 
-// gpuCeilingBytes reports this node's usable GPU memory ceiling in bytes, or 0
-// when it is not known — the number the cumulative admission fit compares against.
+// gpuFacts reads this node's GPU facts, reporting false when the probe failed. The
+// usable ceiling is 0 on those nil facts, the number the cumulative admission fit
+// compares against when it is not known.
 //
 // It reads the facts off the SAME GetRuntimeInfo RPC every other node fact comes
 // from, freshly, rather than caching a copy: the ceiling moves with the host's
 // iogpu configuration and with which sandbox backend the daemon selected, and a
 // cached value would keep admitting pods against a ceiling the node no longer has.
-// The interpretation of the two fact fields is gpucapacity.GPUCeilingBytes's, never
-// re-derived here — the node advertiser sizes its slot count with that same
-// function, and a second reading would let the advertised count and the admission
-// check disagree.
+// The interpretation of the fact fields is gpucapacity's, never re-derived here: the
+// node advertiser sizes its slot count with the same functions, and a second reading
+// would let the advertised count and the admission check disagree.
 //
-// A failed probe reports 0, which ADMITS: 0 is the unknown-ceiling sentinel, and
-// refusing every GPU pod because one RPC did not answer would turn a transient
-// daemon hiccup into an unschedulable node. The pod still faces every other
-// preflight, and runtimed still enforces the pod's own memory limit.
-func (r *runtimedRuntime) gpuCeilingBytes(ctx context.Context) int64 {
+// A failed probe ADMITS: 0 is the unknown-ceiling sentinel, and refusing every GPU
+// pod because one RPC did not answer would turn a transient daemon hiccup into an
+// unschedulable node. The pod still faces every other preflight, and runtimed still
+// enforces the pod's own memory limit.
+func (r *runtimedRuntime) gpuFacts(ctx context.Context) (*runtimev1.GPUFacts, bool) {
 	info, err := r.rt.GetRuntimeInfo(ctx, &runtimev1.GetRuntimeInfoRequest{})
 	if err != nil {
-		r.log.Warn("GPU-ceiling probe failed; admitting the pod against an unknown ceiling", "err", err)
-		return 0
+		r.log.Warn("GPU probe failed; admitting the pod against an unknown ceiling and slot count", "err", err)
+		return nil, false
 	}
-	return gpucapacity.GPUCeilingBytes(info.GetGpu())
+	return info.GetGpu(), true
+}
+
+// finishedGPUPods names the tracked pods holding GPU units whose phase is Succeeded
+// or Failed. A finished pod stays tracked until its object is deleted, and the
+// scheduler released its slot when it ended, so counting it would refuse a pod the
+// scheduler rightly bound. It runs OUTSIDE r.mu, since each phase costs an RPC; a
+// pod finishing after this read is still counted, which errs toward the refusal.
+func (r *runtimedRuntime) finishedGPUPods(ctx context.Context) map[string]bool {
+	type gpuTrack struct {
+		id string
+		t  *podTrack
+		p  *corev1.Pod
+	}
+	var tracks []gpuTrack
+	r.mu.Lock()
+	for id, t := range r.track {
+		if t != nil && t.pod != nil && gpucapacity.PodUnits(t.pod) > 0 {
+			tracks = append(tracks, gpuTrack{id: id, t: t, p: t.pod})
+		}
+	}
+	r.mu.Unlock()
+
+	finished := map[string]bool{}
+	for _, g := range tracks {
+		switch r.podWithStatus(ctx, g.p, g.t).Status.Phase {
+		case corev1.PodSucceeded, corev1.PodFailed:
+			finished[g.id] = true
+		}
+	}
+	return finished
+}
+
+// heldGPUUnitsLocked sums the GPU units of every tracked pod that still holds them,
+// under either name, except excludeID. r.mu MUST be held.
+//
+// Like the memory total it is derived from r.track on every call, so a deleted pod
+// releases its share with no counter to drift, and excludeID keeps an idempotent
+// re-create from being charged for its own units. A pod refused at admission,
+// evicted, or named in finished holds nothing.
+func (r *runtimedRuntime) heldGPUUnitsLocked(excludeID string, finished map[string]bool) (held int64) {
+	for trackedID, t := range r.track {
+		if trackedID == excludeID || t == nil || t.pod == nil || t.rejected || finished[trackedID] || t.evictedStatus() != nil {
+			continue
+		}
+		units := gpucapacity.PodUnits(t.pod)
+		if units <= 0 {
+			continue
+		}
+		held = gpucapacity.AddUnits(held, units)
+	}
+	return held
 }
 
 // admittedGPUMemoryLocked sums the memory limits of every tracked GPU pod except

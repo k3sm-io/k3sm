@@ -28,7 +28,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 
-	mlxv1alpha1 "k3sm.io/apis/mlx/v1alpha1"
 	netv1 "k3sm.io/apis/net/v1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/darwin-net/pkg/dns"
@@ -36,6 +35,8 @@ import (
 	"k3sm.io/runtimed/pkg/image"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 	"k3sm.io/runtimed/pkg/sandbox"
+
+	"k3sm.io/k3sm/pkg/gpucapacity"
 )
 
 // dyldInsertAnnotation is the PodBox annotation runtimed reads to inject the
@@ -280,44 +281,10 @@ func toPodBox(pod *corev1.Pod, podIP, nodeIP, rootfsRoot, dyldShim string, dnsCf
 	return box, nil
 }
 
-// gpuResourceNames are the two names a pod can ask for the GPU under, in the order
-// podGPUResource prefers them: runtimev1.ResourceGPU, then the engine-named
-// mlxv1alpha1.ResourceGPU it replaces. A running pod's spec is immutable and an
-// install recreates native pods from it, so the old name stays readable for as long
-// as a pod can carry it.
-var gpuResourceNames = [...]corev1.ResourceName{
-	corev1.ResourceName(runtimev1.ResourceGPU),
-	corev1.ResourceName(mlxv1alpha1.ResourceGPU),
-}
-
-// podGPUResource returns the name the pod asks for the GPU under, or "" when it
-// does not ask: the first of gpuResourceNames with a nonzero quantity in a
-// container's limits, not requests. That matches how podMemoryLimitBytes and
-// effectiveResource already treat limits as the authoritative ceiling; a
-// requests-only GPU ask is not a grant. Checked across init and regular containers:
-// an init container that needs GPU access (e.g. a model-fetch step) is as real a
-// request as a regular one. A pod naming both gets the first name back, so it holds
-// one grant, not one per name.
-func podGPUResource(pod *corev1.Pod) corev1.ResourceName {
-	for _, gpu := range gpuResourceNames {
-		for i := range pod.Spec.InitContainers {
-			if q, ok := pod.Spec.InitContainers[i].Resources.Limits[gpu]; ok && !q.IsZero() {
-				return gpu
-			}
-		}
-		for i := range pod.Spec.Containers {
-			if q, ok := pod.Spec.Containers[i].Resources.Limits[gpu]; ok && !q.IsZero() {
-				return gpu
-			}
-		}
-	}
-	return ""
-}
-
-// podRequestsGPU reports whether the pod asks for the GPU under either name; see
-// podGPUResource for the read.
+// podRequestsGPU reports whether the pod asks for the GPU under either name, by
+// limits alone; see gpucapacity.GrantResource for the read.
 func podRequestsGPU(pod *corev1.Pod) bool {
-	return podGPUResource(pod) != ""
+	return gpucapacity.GrantResource(pod) != ""
 }
 
 // podRequestsInternetEgress reports whether the pod carries the
