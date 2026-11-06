@@ -208,6 +208,56 @@ func TestEnsureSymlink(t *testing.T) {
 	}
 }
 
+// TestLauncherSymlinkReadableUnderRestrictiveUmask pins B1384: a symlink takes
+// the process umask, so an install run under umask 077 used to leave the
+// launcher link lrwx------ and the login user could not resolve `k3sm`. The
+// already-correct early return kept such a link as it was. Both the fresh link
+// and a pre-existing correct one made under 077 must come out with 0755 on the
+// link itself.
+//
+// Not parallel: the umask is process-wide.
+func TestLauncherSymlinkReadableUnderRestrictiveUmask(t *testing.T) {
+	old := unix.Umask(0o077)
+	defer unix.Umask(old)
+
+	sys := darwinSystem{}
+	for _, tc := range []struct {
+		name     string
+		existing bool
+	}{
+		{name: "no link yet"},
+		{name: "already-correct link made under 077", existing: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			mkdir(t, filepath.Join(root, "bin"), 0o755)
+			link, target := filepath.Join(root, "bin", "k3sm"), filepath.Join(root, "Library", "k3sm")
+			if tc.existing {
+				if err := os.Symlink(target, link); err != nil {
+					t.Fatal(err)
+				}
+				fi, err := os.Lstat(link)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if perm := fi.Mode().Perm(); perm != 0o700 {
+					t.Fatalf("precondition: link made under umask 077 has mode %04o, want 0700", perm)
+				}
+			}
+			if err := sys.EnsureSymlink(target, link); err != nil {
+				t.Fatalf("EnsureSymlink(%q, %q): %v", target, link, err)
+			}
+			fi, err := os.Lstat(link)
+			if err != nil {
+				t.Fatalf("lstat %s: %v", link, err)
+			}
+			if perm := fi.Mode().Perm(); perm != 0o755 {
+				t.Errorf("launcher link mode = %04o, want 0755", perm)
+			}
+		})
+	}
+}
+
 // TestEnsureDataRoot exercises the data-root row of the ownership table
 // against a REAL temp directory, unprivileged. The owner is the test process's
 // own uid and gid (chowning to root needs privilege these tests never take), so

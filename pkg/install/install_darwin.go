@@ -1069,7 +1069,7 @@ func (darwinSystem) EnsureSymlink(target, link string) error {
 		if err := os.Symlink(target, link); err != nil {
 			return fmt.Errorf("symlink %s -> %s: %w", link, target, err)
 		}
-		return nil
+		return chmodLauncherLink(link)
 	case err != nil:
 		return fmt.Errorf("stat %s: %w", link, err)
 	case fi.Mode()&fs.ModeSymlink == 0:
@@ -1078,7 +1078,9 @@ func (darwinSystem) EnsureSymlink(target, link string) error {
 		return fmt.Errorf("refusing to replace non-symlink %s; move it aside and re-run", link)
 	}
 	if got, err := os.Readlink(link); err == nil && got == target {
-		return nil // already correct
+		// Already correct, but a link made under a restrictive umask by an
+		// earlier install still needs its mode repaired.
+		return chmodLauncherLink(link)
 	}
 
 	// Stale (points elsewhere) or dangling: replace atomically.
@@ -1086,6 +1088,10 @@ func (darwinSystem) EnsureSymlink(target, link string) error {
 	_ = os.Remove(tmp) // a temp left by an interrupted earlier run
 	if err := os.Symlink(target, tmp); err != nil {
 		return fmt.Errorf("symlink %s -> %s: %w", tmp, target, err)
+	}
+	if err := chmodLauncherLink(tmp); err != nil {
+		_ = os.Remove(tmp)
+		return err
 	}
 	again, err := os.Lstat(link)
 	if err != nil || again.Mode()&fs.ModeSymlink == 0 {
@@ -1098,6 +1104,17 @@ func (darwinSystem) EnsureSymlink(target, link string) error {
 	if err := os.Rename(tmp, link); err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("rename %s -> %s: %w", tmp, link, err)
+	}
+	return nil
+}
+
+// chmodLauncherLink sets the launcher link's own mode to 0755 without following
+// it. A symlink takes the process umask, and macOS resolves a link only for
+// callers its mode admits, so a link made under umask 077 (lrwx------, root)
+// left the login user unable to run `k3sm` (B1384).
+func chmodLauncherLink(link string) error {
+	if err := unix.Fchmodat(unix.AT_FDCWD, link, 0o755, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return fmt.Errorf("chmod launcher link %s 0755: %w", link, err)
 	}
 	return nil
 }
