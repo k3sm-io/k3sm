@@ -1157,10 +1157,11 @@ func toLocalRefs(refs []corev1.LocalObjectReference) []*runtimev1.LocalObjectRef
 }
 
 // toVolumes maps the modeled corev1 volume subset (configMap / secret / emptyDir /
-// downwardAPI / projected / persistentVolumeClaim / image). A volume with an
-// unmodeled source is refused when a container mounts it and skipped when none
-// does (unmodeledVolume); an image volume off the cluster registry is refused
-// either way (checkImageVolumeRegistry).
+// downwardAPI / projected / persistentVolumeClaim, and image when mounted). A
+// volume with an unmodeled source is refused when a container mounts it and
+// skipped when none does (unmodeledVolume). A mounted image volume off the
+// cluster registry is refused (checkImageVolumeRegistry); an unmounted image
+// volume is skipped like any other unmounted unmodeled source.
 func toVolumes(pod *corev1.Pod, clusterRegistry string) ([]*runtimev1.Volume, error) {
 	vols := pod.Spec.Volumes
 	if len(vols) == 0 {
@@ -1182,6 +1183,10 @@ func toVolumes(pod *corev1.Pod, clusterRegistry string) ([]*runtimev1.Volume, er
 
 // toVolume maps one corev1.Volume's modeled source. An unmodeled source is a
 // *volumeRefusal when mounted, and nil when not.
+//
+// An image volume is mapped only when mounted. Unmounted, it is skipped rather
+// than fetched or refused: a pod that runs today with one it never uses must
+// not be refused, nor torn down by a startup re-attach, and nothing reads it.
 func toVolume(v *corev1.Volume, mounted bool, clusterRegistry string) (*runtimev1.Volume, error) {
 	rv := &runtimev1.Volume{Name: v.Name}
 	switch {
@@ -1197,7 +1202,7 @@ func toVolume(v *corev1.Volume, mounted bool, clusterRegistry string) (*runtimev
 		rv.Projected = toProjectedVolumeSource(v.Projected)
 	case v.PersistentVolumeClaim != nil:
 		rv.PersistentVolumeClaim = toPersistentVolumeClaimVolumeSource(v.PersistentVolumeClaim)
-	case v.Image != nil:
+	case v.Image != nil && mounted:
 		if err := checkImageVolumeRegistry(v, clusterRegistry); err != nil {
 			return nil, err
 		}

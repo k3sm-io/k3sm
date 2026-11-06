@@ -99,7 +99,7 @@ const (
 	// generic ephemeral volume, ...), so the pod is refused BEFORE the CreatePod
 	// RPC (toVolume). No upstream analogue, for the FailedEmptyDirMedium reason.
 	reasonFailedVolumeSource = "FailedVolumeSource"
-	// reasonArtifactPullRefused is recorded when an image volume's reference
+	// reasonArtifactPullRefused is recorded when a mounted image volume's reference
 	// does not name the cluster registry, or this node maps none, so the pod is
 	// refused BEFORE the CreatePod RPC and nothing is fetched (toVolume). It is
 	// one of the stable artifact reasons, shared with the runtime's own refusal.

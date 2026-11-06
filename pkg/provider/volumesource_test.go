@@ -72,10 +72,12 @@ func boxVolume(box *runtimev1.PodBox, name string) *runtimev1.Volume {
 	return nil
 }
 
-// TestToPodBoxMapsImageVolume pins the translation of a corev1 image volume
-// onto the runtime's image source: the reference verbatim, the pull policy
-// through the container pull-policy mapping, and no paths (reserved: a
+// TestToPodBoxMapsImageVolume pins the translation of a mounted corev1 image
+// volume onto the runtime's image source: the reference verbatim, the pull
+// policy through the container pull-policy mapping, and no paths (reserved: a
 // non-empty set asks the runtime for a subset this provider never requests).
+// An image volume no container mounts is skipped, like every unmounted
+// unmodeled source.
 func TestToPodBoxMapsImageVolume(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
@@ -83,19 +85,15 @@ func TestToPodBoxMapsImageVolume(t *testing.T) {
 		reference string
 		policy    corev1.PullPolicy
 		want      runtimev1.ImagePullPolicy
-		mounted   bool
 	}{
-		{"digest_if_not_present", testClusterRegistry + "/models/qwen3@" + testArtifactDigest, corev1.PullIfNotPresent, runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_IF_NOT_PRESENT, true},
-		{"tag_always", testClusterRegistry + "/models/qwen3:v1", corev1.PullAlways, runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS, true},
-		{"never", testClusterRegistry + "/wasm/hello:v1", corev1.PullNever, runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_NEVER, true},
-		{"policy_unset", testClusterRegistry + "/models/qwen3:v1", "", runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_UNSPECIFIED, true},
-		// An image volume is a source the node serves whether or not a
-		// container mounts it, as a kubelet pulls it either way.
-		{"unmounted", testClusterRegistry + "/models/qwen3:v1", corev1.PullIfNotPresent, runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_IF_NOT_PRESENT, false},
+		{"digest_if_not_present", testClusterRegistry + "/models/qwen3@" + testArtifactDigest, corev1.PullIfNotPresent, runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_IF_NOT_PRESENT},
+		{"tag_always", testClusterRegistry + "/models/qwen3:v1", corev1.PullAlways, runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS},
+		{"never", testClusterRegistry + "/wasm/hello:v1", corev1.PullNever, runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_NEVER},
+		{"policy_unset", testClusterRegistry + "/models/qwen3:v1", "", runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_UNSPECIFIED},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			pod := volumePod("img", imageVolume("model", tc.reference, tc.policy), tc.mounted)
+			pod := volumePod("img", imageVolume("model", tc.reference, tc.policy), true)
 			box, err := toPodBox(pod, "10.42.0.5", "192.168.1.10", t.TempDir(), "", testClusterRegistry, netv1.DNSConfig{}, nil)
 			if err != nil {
 				t.Fatalf("toPodBox: %v", err)
@@ -119,16 +117,31 @@ func TestToPodBoxMapsImageVolume(t *testing.T) {
 			}
 		})
 	}
+	t.Run("unmounted_is_skipped", func(t *testing.T) {
+		t.Parallel()
+		pod := volumePod("img", imageVolume("model", testClusterRegistry+"/models/qwen3:v1", corev1.PullIfNotPresent), false)
+		box, err := toPodBox(pod, "10.42.0.5", "192.168.1.10", t.TempDir(), "", testClusterRegistry, netv1.DNSConfig{}, nil)
+		if err != nil {
+			t.Fatalf("toPodBox: %v", err)
+		}
+		if v := boxVolume(box, "model"); v != nil {
+			t.Errorf("an unmounted image volume reached the box: %v", v)
+		}
+	})
 }
 
 // TestToPodBoxRefusesForeignImageVolume pins that an image volume must name
 // the cluster registry authority exactly: any other host, a bare name that
 // would default to a public registry, a loopback spelling of a registry, a
 // near-miss of the cluster name, a reference that does not parse, and any image
-// volume at all on a node that maps no cluster registry are refused, mounted or
-// not, with ErrImageVolumeRegistry. The CreatePod leg asserts the refusal lands
-// before the runtime call, as a Warning Event with the stable reason, on both
-// backends.
+// volume at all on a node that maps no cluster registry are refused, when a
+// container mounts the volume, with ErrImageVolumeRegistry. The CreatePod leg
+// asserts the refusal lands before the runtime call, as a Warning Event with the
+// stable reason, on both backends.
+//
+// The unmounted leg pins the other direction: the same foreign volume that no
+// container mounts is dropped and the pod is not refused, so a pod that runs
+// today with a volume it never uses keeps running.
 func TestToPodBoxRefusesForeignImageVolume(t *testing.T) {
 	t.Parallel()
 	const repo = "/models/qwen3:v1"
@@ -150,28 +163,57 @@ func TestToPodBoxRefusesForeignImageVolume(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		for _, mounted := range []bool{true, false} {
-			name := tc.name + "/unmounted"
-			if mounted {
-				name = tc.name + "/mounted"
+		t.Run("toPodBox/"+tc.name, func(t *testing.T) {
+			t.Parallel()
+			pod := volumePod("img", imageVolume("model", tc.reference, corev1.PullIfNotPresent), true)
+			box, err := toPodBox(pod, "10.42.0.5", "192.168.1.10", t.TempDir(), "", tc.cluster, netv1.DNSConfig{}, nil)
+			if !errors.Is(err, ErrImageVolumeRegistry) {
+				t.Fatalf("toPodBox = (%v, %v), want an error wrapping ErrImageVolumeRegistry", box.GetVolumes(), err)
 			}
-			t.Run("toPodBox/"+name, func(t *testing.T) {
-				t.Parallel()
-				pod := volumePod("img", imageVolume("model", tc.reference, corev1.PullIfNotPresent), mounted)
-				box, err := toPodBox(pod, "10.42.0.5", "192.168.1.10", t.TempDir(), "", tc.cluster, netv1.DNSConfig{}, nil)
-				if !errors.Is(err, ErrImageVolumeRegistry) {
-					t.Fatalf("toPodBox = (%v, %v), want an error wrapping ErrImageVolumeRegistry", box.GetVolumes(), err)
-				}
-				var vr *volumeRefusal
-				if !errors.As(err, &vr) {
-					t.Fatalf("error %v is not a *volumeRefusal", err)
-				}
-				if vr.reason != reasonArtifactPullRefused || vr.volume != "model" {
-					t.Errorf("refusal = {reason %q, volume %q}, want {%q, %q}", vr.reason, vr.volume, reasonArtifactPullRefused, "model")
-				}
-			})
-		}
+			var vr *volumeRefusal
+			if !errors.As(err, &vr) {
+				t.Fatalf("error %v is not a *volumeRefusal", err)
+			}
+			if vr.reason != reasonArtifactPullRefused || vr.volume != "model" {
+				t.Errorf("refusal = {reason %q, volume %q}, want {%q, %q}", vr.reason, vr.volume, reasonArtifactPullRefused, "model")
+			}
+		})
+		t.Run("toPodBox/unmounted_dropped/"+tc.name, func(t *testing.T) {
+			t.Parallel()
+			pod := volumePod("img", imageVolume("model", tc.reference, corev1.PullIfNotPresent), false)
+			box, err := toPodBox(pod, "10.42.0.5", "192.168.1.10", t.TempDir(), "", tc.cluster, netv1.DNSConfig{}, nil)
+			if err != nil {
+				t.Fatalf("toPodBox = %v, want an unmounted image volume dropped and the pod not refused", err)
+			}
+			if v := boxVolume(box, "model"); v != nil {
+				t.Errorf("an unmounted image volume reached the box: %v", v)
+			}
+		})
 	}
+
+	// The unmounted leg through CreatePod: no refusal, no Event, and the pod
+	// reaches the runtime without the volume.
+	t.Run("CreatePod/unmounted_foreign_dropped", func(t *testing.T) {
+		t.Parallel()
+		f := &platformFake{fakeRuntimeServer: newFakeRuntimeServer(), info: capabilityInfo(NodeCapabilities{VMBackend: true})}
+		rec := record.NewFakeRecorder(8)
+		r := newRuntimedWith(f, RuntimedConfig{
+			NodeName: "n", NodeIP: "192.168.1.10", Root: t.TempDir(), PodLogsDir: t.TempDir(), Recorder: rec,
+			FlatRegistry: image.FlatRegistry{Host: testClusterRegistry},
+		}, nil, nil)
+		pod := volumePod("img", imageVolume("model", "ghcr.io/acme/qwen3:v1", corev1.PullIfNotPresent), false)
+		if err := r.CreatePod(context.Background(), pod); err != nil {
+			t.Fatalf("CreatePod = %v, want the pod admitted: an unmounted image volume is dropped, not refused", err)
+		}
+		if _, creates := f.counts(); creates != 1 {
+			t.Errorf("CreatePod RPC calls = %d, want 1", creates)
+		}
+		for _, ev := range pendingEvents(rec.Events) {
+			if strings.Contains(ev, reasonArtifactPullRefused) {
+				t.Errorf("unmounted image volume recorded %q", ev)
+			}
+		}
+	})
 
 	for _, be := range []struct{ name, runtimeClass string }{{"native", ""}, {"vm", runtimeclass.Name}} {
 		t.Run("CreatePod/"+be.name, func(t *testing.T) {

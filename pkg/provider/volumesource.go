@@ -114,8 +114,9 @@ func mountedVolumes(pod *corev1.Pod) map[string]bool {
 	return out
 }
 
-// checkImageVolumeRegistry refuses an image volume whose reference does not
-// name clusterRegistry, the cluster's one registry authority, exactly.
+// checkImageVolumeRegistry refuses a mounted image volume whose reference does
+// not name clusterRegistry, the cluster's one registry authority, exactly. An
+// unmounted image volume never reaches it (toVolume skips it).
 //
 // WHY THE PROVIDER REFUSES: the root runtime daemon fetches the artifact, so a
 // reference the pod author chose would otherwise make it contact any host. The
