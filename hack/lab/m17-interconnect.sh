@@ -64,7 +64,11 @@
 #   K3SM_M17_DESIRED_INTERVAL  seconds of the node's DesiredInterval (default 60)
 #   K3SM_M17_MLX_MODEL, K3SM_M17_MLX_MEMORY, K3SM_M17_MLX_READY_TIMEOUT  r5's model
 #   K3SM_M17_PREVIOUS_ARTIFACT the previous k3sm binary for r9, beside its build set
-#                              (`k3sm install --print-required-artifacts` names the set)
+#                              (`k3sm install --print-required-artifacts` names the set),
+#                              whose helper speaks a minor below 2: a build whose
+#                              darwin-net predates the interconnect verbs. The newest
+#                              release that qualifies is v0.1.7 (helper 1.1); every later
+#                              one speaks minor 2 or more, and r9 refuses it
 #   K3SM_M17_JOIN_SERVER       the server's underlay address for r9's worker reinstall
 #                              (a LAN IP or DNS name, no scheme, no port)
 #   K3SM_M17_REINSTALL_ARGS    extra arguments for every r9 `k3sm install`, so they must
@@ -1324,6 +1328,22 @@ build_set_problem() {
 		return 1
 	}
 }
+# prev_helper_problem <k3sm binary> — why this build cannot exercise HelperTooOld;
+# silent and 0 when it can. k3sm is its own helper (the netd job execs `k3sm netd`), so
+# the minor is darwin-net's wire.ProtocolVersionMinor at build time, which no flag
+# prints. The verb is the witness: it arrived with minor 2 (the one darwin-net commit
+# that added it also moved the minor from 1 to 2), and no build before it holds the
+# name, so a binary that holds it has a helper that answers Hello as current.
+#
+# What the leg proves: a helper below minor 2 answers Hello with its version and
+# "unknown verb", which icp_helper_verdict reads as wire.Client does. The client side
+# is not driven: a node's client dials only its own helper, and both come from one
+# binary, so a downgraded node holds no current client.
+prev_helper_problem() {
+	grep -aqF EnsureInterconnectAlias "$1" || return 0
+	echo "K3SM_M17_PREVIOUS_ARTIFACT '$1' cannot exercise HelperTooOld: it holds the interconnect verbs, so its helper speaks minor 2 or later and the mixed leg would prove nothing; use a build whose darwin-net predates them (the newest such release is v0.1.7, helper 1.1)"
+	return 1
+}
 # r9_problem — why a downgrade cannot be driven safely here; silent and 0 when it
 # can. Every leg is decided before either Mac changes.
 r9_problem() {
@@ -1334,6 +1354,7 @@ r9_problem() {
 	}
 	build_set_problem "$prev" K3SM_M17_PREVIOUS_ARTIFACT || return 1
 	build_set_problem "$cur" K3SM_ARTIFACT || return 1
+	prev_helper_problem "$prev" || return 1
 	[ "$(shasum -a 256 "$prev" | cut -d' ' -f1)" != "$(shasum -a 256 "$cur" | cut -d' ' -f1)" ] || {
 		echo "K3SM_M17_PREVIOUS_ARTIFACT and K3SM_ARTIFACT are one build, so nothing would be downgraded"
 		return 1
@@ -1439,7 +1460,7 @@ EOF
 		v="$(icp_helper_verdict "$RUNG_DIR/netd-hello-$first.json")"
 		case "$v" in
 		HelperTooOld) pass "mixed leg: the downgraded helper answers a minor-2 Hello as HelperTooOld, not an error ($(netd_probe_detail "$first" "$RUNG_DIR/netd-hello-$first.json"))" ;;
-		minor2) rec "mixed leg: the previous helper already speaks minor 2, so HelperTooOld is not exercised by this binary pair" ;;
+		minor2) fail "mixed leg: the helper still speaks minor 2 or later after installing a build without the interconnect verbs, so the install did not replace it ($(netd_probe_detail "$first" "$RUNG_DIR/netd-hello-$first.json"))" ;;
 		*) fail "mixed leg: not a HelperTooOld verdict ($(netd_probe_detail "$first" "$RUNG_DIR/netd-hello-$first.json"))" ;;
 		esac
 		R9_DOWNGRADED="$first $second"
@@ -1656,6 +1677,33 @@ st_r9_problem() {
 	K3SM_M17_PREVIOUS_ARTIFACT="$1" K3SM_ARTIFACT="$2" JOIN_SERVER="$3"
 	local_NODE=node-a peer_NODE=node-b WORKER_NODE="$4"
 	r9_problem
+}
+# st_r9_run <Hello reply fixture> <doctor fixture> — the real r9 assertion with the
+# host stubbed: the worker's helper answers with the first fixture, and both Macs'
+# doctors with the second, over a baseline with one pre-existing residue route.
+st_r9_run() {
+	local d hello="$1" doc="$2"
+	d="$(mktemp -d -t m17-r9.XXXXXX)"
+	RUNG=r9 RUNG_DIR="$d" BASE_DIR="$d/base" R_PASS=0 R_FAIL=0 R_REFUSED_MSG="" PAYLOAD_LOG="$d/payload.log"
+	local_NODE=node-a peer_NODE=node-b local_IDX=3 peer_IDX=1 local_BOOT=b peer_BOOT=b R9_DOWNGRADED=""
+	mkdir "$BASE_DIR"
+	cp "$F/doctor-residue-baseline.json" "$BASE_DIR/doctor-local.json"
+	cp "$F/doctor-residue-baseline.json" "$BASE_DIR/doctor-peer.json"
+	r9_problem() { :; }
+	priv() {
+		cat >/dev/null
+		echo PRESENT >"$PAYLOAD_LOG"
+	}
+	reinstall() { :; }
+	host_clean() { :; }
+	info() { :; }
+	on() { echo b; }
+	ship_set() { SHIPPED_BIN=/x/k3sm; }
+	netd_hello() { cp "$hello" "$RUNG_DIR/netd-hello-$1.json"; }
+	doctor_json() { cp "$doc" "$RUNG_DIR/doctor-$1.json"; }
+	K3SM_M17_PREVIOUS_ARTIFACT=/x/prev/k3sm K3SM_ARTIFACT=/x/cur/k3sm assert_r9_downgrade
+	echo "DRIVER passes=$R_PASS fails=$R_FAIL"
+	rm -rf "$d"
 }
 # st_reinstall <side> <join port rc> <install rc> — the real reinstall with the host
 # stubbed; prints the calls it made, in order, then its status.
@@ -1895,6 +1943,8 @@ self_test_body() {
 	st_build_set "$tmp/set-prev"
 	st_build_set "$tmp/set-cur"
 	st_build_set "$tmp/set-short" cp-payload/kine
+	st_build_set "$tmp/set-new"
+	printf '# wire verb EnsureInterconnectAlias\n' >>"$tmp/set-new/k3sm"
 	mkdir -p "$tmp/link" && ln -s "$tmp/set-cur/k3sm" "$tmp/link/k3sm"
 	st "r9 inputs: two complete sets, a join address, the driver on the server" 0 st_r9_problem "$tmp/set-prev/k3sm" "$tmp/set-cur/k3sm" 192.0.2.10 node-b
 	st_out "r9 refused: no previous artifact" "K3SM_M17_PREVIOUS_ARTIFACT and K3SM_ARTIFACT" st_r9_problem "" "$tmp/set-cur/k3sm" 192.0.2.10 node-b
@@ -1902,6 +1952,13 @@ self_test_body() {
 	for r in /Library/k3sm /usr/local/bin; do st "r9 refused: the installed tree $r as a source" 0 is_installed_tree "$r"; done
 	st "r9 inputs: a build set elsewhere is not the installed tree" 1 is_installed_tree /Users/x/set
 	st_out "r9 refused: a symlink, whose set cannot be read beside it" "not an executable regular file" build_set_problem "$tmp/link/k3sm" K3SM_ARTIFACT
+	st_out "r9 refused: a previous helper at minor 2 or later cannot exercise HelperTooOld" "cannot exercise HelperTooOld" st_r9_problem "$tmp/set-new/k3sm" "$tmp/set-cur/k3sm" 192.0.2.10 node-b
+	st "r9 refused: that previous helper exits non-zero" 1 st_r9_problem "$tmp/set-new/k3sm" "$tmp/set-cur/k3sm" 192.0.2.10 node-b
+	st_out "r9: a helper below minor 2 passes the mixed leg, with both doctors clean" "DRIVER passes=7 fails=0" st_r9_run "$F/hello-minor1.json" "$F/doctor-clean.json"
+	st_out "r9: a residue row the Mac already had stays green" "DRIVER passes=7 fails=0" st_r9_run "$F/hello-minor1.json" "$F/doctor-residue-baseline.json"
+	st_out "r9 red: a residue route this run left" "FAIL      [r9] local Mac: doctor ic-residue names nothing this run left: residue this run left: 169.254.0.10/32" st_r9_run "$F/hello-minor1.json" "$F/doctor-residue-new.json"
+	st_out "r9 red: a helper at minor 2 after the downgrade is never a pass" "FAIL      [r9] mixed leg: the helper still speaks minor 2" st_r9_run "$F/hello-minor2.json" "$F/doctor-clean.json"
+	st_out "r9 red: a helper that does not answer" "FAIL      [r9] mixed leg: not a HelperTooOld verdict" st_r9_run "$F/hello-rejected.txt" "$F/doctor-clean.json"
 	st_out "r9 refused: one build twice" "one build" st_r9_problem "$tmp/set-cur/k3sm" "$tmp/set-cur/k3sm" 192.0.2.10 node-b
 	st_out "r9 refused: no join address" "K3SM_M17_JOIN_SERVER" st_r9_problem "$tmp/set-prev/k3sm" "$tmp/set-cur/k3sm" "" node-b
 	st_out "r9 refused: a join address with a port" "K3SM_M17_JOIN_SERVER" st_r9_problem "$tmp/set-prev/k3sm" "$tmp/set-cur/k3sm" 192.0.2.10:9345 node-b
@@ -2351,6 +2408,7 @@ PEER_UTUN="$(on_peer "route -n get $local_MESH" | awk '$1=="interface:"{print $2
 MESH_UTUN="$(on_local "route -n get $peer_MESH" | awk '$1=="interface:"{print $2; exit}')"
 HAVE="$PREREQ_STATIC"
 FINAL_RC=1
+why="$(r9_problem)" || echo "notice: r9-downgrade will be REFUSED when the ladder reaches it, so this run cannot exit 0: $why"
 echo "baseline: local $local_NODE (index $local_IDX, $local_TB, LAN $local_LAN, macOS $local_OS), peer $peer_NODE (index $peer_IDX, $peer_TB, LAN $peer_LAN, macOS $peer_OS); artifact $local_SHA; worker $WORKER_NODE"
 
 # ── The rungs, in table order ──────────────────────────────────────────────────
