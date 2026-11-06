@@ -41,7 +41,7 @@ limitations under the License.
 // executes nothing: it creates no file, renames nothing and restarts no job. The
 // caller carries out a plan.
 //
-// It is a leaf that imports only the standard library, so the updater can use
-// it without the installer's launchd renderer or client-go, and the installer
-// can import it too.
+// It is a leaf that imports only the standard library and the order leaf, so
+// the updater can use it without the installer's launchd renderer or
+// client-go, and the installer can import it too.
 package layout

@@ -18,11 +18,17 @@ package layout
 
 import (
 	"fmt"
-	"regexp"
+	"slices"
+
+	"k3sm.io/k3sm/pkg/install/order"
 )
 
-// labelPattern is a k3sm launchd label: io.k3sm. and a lowercase name.
-var labelPattern = regexp.MustCompile(`^io\.k3sm\.[a-z0-9][a-z0-9.-]*$`)
+// daemonLabels is the closed set of labels a job runs current/<bin> daemon
+// <label> under: the jobs the restart order names.
+var daemonLabels = []string{order.NetdLabel, order.ServerLabel, order.AgentLabel, order.DatavolLabel}
+
+// daemonBinaries is the closed set of binaries such a job runs.
+var daemonBinaries = []string{K3smBinary}
 
 // DaemonArguments returns the frozen program arguments of a k3sm launchd job:
 // current/<bin> daemon <label>. Every argument the job needs lives in the
@@ -33,7 +39,10 @@ func (l Layout) DaemonArguments(bin, label string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !labelPattern.MatchString(label) {
+	if !slices.Contains(daemonBinaries, bin) {
+		return nil, fmt.Errorf("binary %q: %w", bin, ErrBadName)
+	}
+	if !slices.Contains(daemonLabels, label) {
 		return nil, fmt.Errorf("label %q: %w", label, ErrBadName)
 	}
 	return []string{path, "daemon", label}, nil

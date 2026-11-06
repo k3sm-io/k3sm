@@ -173,7 +173,7 @@ func TestLeafContract(t *testing.T) {
 			if got, want := l.GuardArguments(), []string{"/Library/k3sm/updater/guard/k3sm-updater", "guard"}; !slices.Equal(got, want) {
 				t.Errorf("GuardArguments = %v, want %v", got, want)
 			}
-			for _, bad := range [][2]string{{"../k3sm", order.NetdLabel}, {"", order.NetdLabel}, {"k3sm", "com.example.x"}, {"k3sm", "io.k3sm.Netd"}, {"k3sm", ""}} {
+			for _, bad := range [][2]string{{"../k3sm", order.NetdLabel}, {"", order.NetdLabel}, {"k3sm", "com.example.x"}, {"k3sm", "io.k3sm.Netd"}, {"k3sm", ""}, {"k3sm", "io.k3sm.other"}, {"k3sm-vmhost", order.NetdLabel}} {
 				if _, err := l.DaemonArguments(bad[0], bad[1]); !errors.Is(err, layout.ErrBadName) {
 					t.Errorf("DaemonArguments(%q, %q) err = %v, want ErrBadName", bad[0], bad[1], err)
 				}
