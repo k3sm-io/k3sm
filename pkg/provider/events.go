@@ -102,8 +102,9 @@ const (
 	// upstream does.
 	reasonFailedCreatePodSandBox = "FailedCreatePodSandBox"
 	// reasonFailedGPUFit is recorded when a pod requesting the GPU extended
-	// resource does not fit in this node's GPU memory beside the GPU pods already
-	// admitted, so the pod is refused BEFORE the CreatePod RPC.
+	// resource does not fit in this node's GPU memory, or in its GPU slots counted
+	// over both resource names, beside the GPU pods already admitted, so the pod is
+	// refused BEFORE the CreatePod RPC.
 	//
 	// Like FailedImagePlatform it has no upstream analogue: the GPU slot count is a
 	// memory-derived co-tenancy budget, not a device count, so there is no kubelet
@@ -421,6 +422,17 @@ func msgFailedGPUUnbounded(gpu corev1.ResourceName, ceiling int64) string {
 		"cannot fit it against its %s of usable GPU memory and would be overcommitting the GPU by an amount "+
 		"nothing can measure. Set spec.containers[].resources.limits.memory on every container.",
 		gpu, gpuFitGiB(ceiling))
+}
+
+// msgFailedGPUSlots is the FailedGPUFit-event message for a pod refused by the cap
+// over both resource names. It says why the scheduler bound a pod the node will not
+// run, since the Pod reads as scheduled, and both ways out name both resources
+// because the holder may be under either.
+func msgFailedGPUSlots(want, held, slots int64) string {
+	return fmt.Sprintf("Error: this pod needs %d GPU slot(s), but %d of the node's %d are already held by admitted pods. "+
+		"The scheduler counts %s and %s separately and does not count a pod that sets spec.nodeName, so it can place "+
+		"more pods on a node than it has slots. Delete another pod requesting %s or %s, or wait for one to finish.",
+		want, held, slots, runtimev1.ResourceGPU, mlxv1alpha1.ResourceGPU, runtimev1.ResourceGPU, mlxv1alpha1.ResourceGPU)
 }
 
 // gpuFitGiB renders a byte count as the binary quantity a pod's memory limit is
