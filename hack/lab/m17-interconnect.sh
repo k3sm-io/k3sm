@@ -18,7 +18,8 @@
 #   K3SM_LAB=1 PEER_SSH=<ssh target of the other Mac> \
 #     EVIDENCE_DIR=<absolute dir outside any git tree> \
 #     K3SM_M17_REMOTE_SCRATCH=<absolute dir on the peer that its login owns> \
-#     [K3SM_ARTIFACT=<the k3sm binary under test>] [K3SM_RC_TAG=<rc tag>] \
+#     [K3SM_ARTIFACT=<the k3sm binary under test, beside its build set for r9>] \
+#     [K3SM_RC_TAG=<rc tag>] \
 #     hack/lab/m17-interconnect.sh
 #
 # The driver runs on one of the two Macs (local) with the admin KUBECONFIG and
@@ -61,8 +62,13 @@
 #   K3SM_M17_LAN_SLACK_BYTES   bytes the flat interface may move (default 8388608)
 #   K3SM_M17_DESIRED_INTERVAL  seconds of the node's DesiredInterval (default 60)
 #   K3SM_M17_MLX_MODEL, K3SM_M17_MLX_MEMORY, K3SM_M17_MLX_READY_TIMEOUT  r5's model
-#   K3SM_M17_PREVIOUS_ARTIFACT the previous k3sm binary for r9 (absent -> REFUSED)
-#   K3SM_M17_REINSTALL_ARGS    extra arguments for the r9 `k3sm install` re-runs
+#   K3SM_M17_PREVIOUS_ARTIFACT the previous k3sm binary for r9, beside its build set
+#                              (`k3sm install --print-required-artifacts` names the set)
+#   K3SM_M17_JOIN_SERVER       the server's underlay address for r9's worker reinstall
+#                              (a LAN IP or DNS name, no scheme, no port)
+#   K3SM_M17_REINSTALL_ARGS    extra arguments for every r9 `k3sm install`, so they must
+#                              suit both roles; empty on a plain two-Mac cluster
+#                              Any r9 input missing or unusable -> REFUSED(r9-downgrade)
 #   K3SM_LAB_TOLERATE_KEYS     extra taint keys every lab pod tolerates, space-separated
 #                              (hack/lab/lib/tolerations.sh)
 #   K3SM_LAB_PRINT_MANIFESTS=1 print the pod manifests and exit; contacts nothing
@@ -148,7 +154,7 @@ prereq_what() {
 	mlximage) echo "the mlx serving image (BI8)" ;;
 	operator) echo "an operator at /dev/tty to pull and replug the cable (BI10)" ;;
 	nodecred) echo "the worker's installed node kubeconfig (BI6)" ;;
-	prevbin) echo "K3SM_M17_PREVIOUS_ARTIFACT and K3SM_ARTIFACT, the previous and current binaries (BI10)" ;;
+	prevbin) echo "K3SM_M17_PREVIOUS_ARTIFACT and K3SM_ARTIFACT, each the k3sm binary of a complete build set (BI10)" ;;
 	armable) echo "r0-disarmed did not pass" ;;
 	armed) echo "r1-arm did not pass" ;;
 	attached) echo "r2-attach did not pass" ;;
@@ -1115,17 +1121,114 @@ assert_r8_killswitch() {
 	return 0
 }
 
-# reinstall <side> <local binary> <tag> — copy a k3sm binary to a Mac and run its
-# own install there as a script file under sudo; wait for both nodes Ready.
-reinstall() {
-	local side="$1" bin="$2" dst="$IC_REMOTE_DIR/k3sm-$3"
-	if [ "$side" = local ]; then
-		mkdir -p "$IC_REMOTE_DIR" && cp "$bin" "$dst"
-	else
-		scp -q -o BatchMode=yes "$bin" "$PEER_SSH:$dst" || return 1
+# is_installed_tree <dir> — the directory is one an install writes to.
+is_installed_tree() { case "$1/" in /Library/k3sm/* | /Library/k3sm.*/* | /usr/local/bin/*) return 0 ;; esac; return 1; }
+# build_set_problem <k3sm binary> <name> — why the binary cannot be installed from
+# where it sits; silent and 0 when it can. `k3sm install` requires its build set
+# beside the binary, and the binary itself names that set. The installed tree is
+# refused as a source: the downgrade overwrites it, so it could not bring the
+# artifact under test back.
+build_set_problem() {
+	local bin="$1" name="$2" dir req rel missing=""
+	[ -f "$bin" ] && [ ! -L "$bin" ] && [ -x "$bin" ] && [ "$(basename "$bin")" = k3sm ] || {
+		echo "$name '$bin' is not an executable regular file named k3sm"
+		return 1
+	}
+	dir="$(cd "$(dirname "$bin")" && pwd -P)"
+	if is_installed_tree "$dir"; then
+		echo "$name '$bin' is in the installed tree, which the downgrade overwrites; point it at a build set elsewhere"
+		return 1
 	fi
-	priv "$side" "install-$3" BIN="$dst" ARGS="$REINSTALL_ARGS" <<'EOF'
-chmod 0755 "$BIN"
+	req="$("$bin" install --print-required-artifacts 2>/dev/null)" && [ -n "$req" ] || {
+		echo "$name '$bin' does not answer install --print-required-artifacts, so its build set cannot be checked"
+		return 1
+	}
+	while IFS= read -r rel; do
+		[ -f "$dir/$rel" ] || missing="$missing $rel"
+	done <<<"$req"
+	[ -z "$missing" ] || {
+		echo "$name '$bin' has no complete build set beside it; missing:$missing"
+		return 1
+	}
+}
+# r9_problem — why a downgrade cannot be driven safely here; silent and 0 when it
+# can. Every leg is decided before either Mac changes.
+r9_problem() {
+	local prev="${K3SM_M17_PREVIOUS_ARTIFACT:-}" cur="${K3SM_ARTIFACT:-}"
+	[ -n "$prev" ] && [ -n "$cur" ] || {
+		prereq_what prevbin
+		return 1
+	}
+	build_set_problem "$prev" K3SM_M17_PREVIOUS_ARTIFACT || return 1
+	build_set_problem "$cur" K3SM_ARTIFACT || return 1
+	[ "$(shasum -a 256 "$prev" | cut -d' ' -f1)" != "$(shasum -a 256 "$cur" | cut -d' ' -f1)" ] || {
+		echo "K3SM_M17_PREVIOUS_ARTIFACT and K3SM_ARTIFACT are one build, so nothing would be downgraded"
+		return 1
+	}
+	[[ "${JOIN_SERVER:-}" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || {
+		echo "K3SM_M17_JOIN_SERVER '${JOIN_SERVER:-}' is not the server's underlay address, which a worker install needs as --server (a LAN IP or DNS name, no scheme, no port)"
+		return 1
+	}
+	# The server's install writes the admin kubeconfig to the invoking login's home
+	# and may rotate its token, so the driver's own credential survives only there.
+	[ "$local_NODE" != "$WORKER_NODE" ] && [ "$peer_NODE" = "$WORKER_NODE" ] || {
+		echo "the driver is not on the server (local $local_NODE, peer $peer_NODE, worker $WORKER_NODE); a server reinstall may rotate the admin token a copied kubeconfig holds, and this run would lose the cluster mid-rung"
+		return 1
+	}
+}
+# role_of <side> — agent on the worker, server otherwise.
+role_of() { if [ "$(node_of "$1")" = "$WORKER_NODE" ]; then echo agent; else echo server; fi; }
+# install_args <side> — the documented install for the side's role
+# (docs/user/multi-node.md). A server's plain re-run keeps its stored flags. A worker
+# names its role and server, and passes no token: this is an in-place reinstall of a
+# joined node, which presents the credential it stored, so no join token is minted
+# or carried (the rung has checked that the credential is there).
+install_args() {
+	local a=""
+	[ "$(role_of "$1")" = agent ] && a="--agent --server $JOIN_SERVER"
+	echo "$a${a:+${REINSTALL_ARGS:+ }}$REINSTALL_ARGS"
+}
+# wait_join_port <side> — the server's join port answers from that Mac, in 3 s steps
+# bounded by 2 minutes. A worker install before it opens is refused, and the old
+# worker would keep running while the legs test stale code.
+wait_join_port() {
+	local deadline=$((SECONDS + 120))
+	while [ "$SECONDS" -lt "$deadline" ]; do
+		on "$1" "nc -z -G 3 $JOIN_SERVER 9345" >/dev/null 2>&1 && return 0
+		sleep 3
+	done
+	return 1
+}
+# ship_set <side> <k3sm binary> <tag> — make the build set runnable on the side and
+# set SHIPPED_BIN. The driver's own Mac runs it where it sits; the peer gets exactly
+# the binary and the set it names, in this run's private directory.
+ship_set() {
+	local dir req dst
+	dir="$(cd "$(dirname "$2")" && pwd -P)"
+	SHIPPED_BIN="$dir/k3sm"
+	[ "$1" = peer ] || return 0
+	req="$("$dir/k3sm" install --print-required-artifacts)" || return 1
+	dst="$IC_REMOTE_DIR/set-$3"
+	# shellcheck disable=SC2086 # req is one relative path per line
+	(cd "$dir" && tar cf - k3sm $req) | ssh_peer "zsh -lc $(printf '%q' "rm -rf $dst && mkdir $dst && tar xpf - -C $dst")" || return 1
+	SHIPPED_BIN="$dst/k3sm"
+}
+# reinstall <side> <k3sm binary> <tag> — the build set's own install for the side's
+# role, as a script file under sudo; then both nodes Ready. No copy of the installed
+# tree is taken: git and the build set are the way back.
+reinstall() {
+	local side="$1" bin="$2" tag="$3" rc args
+	if [ "$(role_of "$side")" = agent ] && ! wait_join_port "$side"; then
+		echo "the join port $JOIN_SERVER:9345 did not answer from the $side Mac within 2 minutes; no install was attempted"
+		return 1
+	fi
+	ship_set "$side" "$bin" "$tag" || {
+		echo "could not put the $tag build set on the $side Mac; no install was attempted"
+		return 1
+	}
+	args="$(install_args "$side")"
+	info "$side Mac: k3sm install $args (the $tag build set)"
+	priv "$side" "install-$tag" BIN="$SHIPPED_BIN" ARGS="$args" <<'EOF'
 # shellcheck disable=SC2086
 "$BIN" install $ARGS
 rc=$?
@@ -1133,42 +1236,73 @@ echo "INSTALL-EXIT=$rc"
 /usr/local/bin/k3sm version 2>&1 | sed -n 1,3p
 exit "$rc"
 EOF
-	local rc=$?
-	cp "$PAYLOAD_LOG" "$RUNG_DIR/install-$3-$side.txt"
-	wait_until 300 bash -c "[ \"\$(kubectl --request-timeout=10s get nodes --no-headers 2>/dev/null | awk '\$2==\"Ready\"' | wc -l | tr -d ' ')\" -ge 2 ]" || return 1
-	return "$rc"
+	rc=$?
+	cp "$PAYLOAD_LOG" "$RUNG_DIR/install-$tag-$side.txt"
+	# The installed version goes in the run log, so a refused install is visible there.
+	info "$side Mac after install-$tag: $(tail -4 "$PAYLOAD_LOG" | tr '\n' ' ')"
+	[ "$rc" = 0 ] || return "$rc"
+	wait_until 300 two_nodes_ready
 }
+two_nodes_ready() { [ "$(kubectl --request-timeout=10s get nodes --no-headers 2>/dev/null | awk '$2=="Ready"' | wc -l | tr -d ' ')" -ge 2 ]; }
 
 assert_r9_downgrade() {
-	local prev="${K3SM_M17_PREVIOUS_ARTIFACT:-}" first second s v
-	if [ -z "$prev" ] || [ ! -f "$prev" ] || [ -z "${K3SM_ARTIFACT:-}" ] || [ ! -f "${K3SM_ARTIFACT:-}" ]; then
-		refuse_rung "$(prereq_what prevbin)" BI10
+	local prev="${K3SM_M17_PREVIOUS_ARTIFACT:-}" cur="${K3SM_ARTIFACT:-}" first second s v why
+	if ! why="$(r9_problem)"; then
+		refuse_rung "$why" BI10
 		return 2
 	fi
 	first=peer second=local
-	[ "$WORKER_NODE" = "$local_NODE" ] && first=local second=peer
+	priv "$first" nodecred KC="$NODE_KUBECONFIG" <<'EOF'
+[ -s "$KC" ] && echo PRESENT || echo ABSENT
+EOF
+	if ! grep -q PRESENT "$PAYLOAD_LOG"; then
+		refuse_rung "$(prereq_what nodecred): $NODE_KUBECONFIG on the $first Mac, without which its reinstall would need a join token" BI10
+		return 2
+	fi
 	rec "order: interconnect disabled in r8; previous binary on the worker ($(node_of "$first")) then the server ($(node_of "$second")); each install restarts io.k3sm.netd itself"
-	reinstall "$first" "$prev" prev || fail "the previous binary did not install cleanly on the $first Mac, or the nodes did not return Ready"
-	netd_hello "$first"
-	v="$(icp_helper_verdict "$RUNG_DIR/netd-hello-$first.json")"
-	case "$v" in
-	HelperTooOld) pass "mixed leg: the downgraded helper answers a minor-2 Hello as HelperTooOld, not an error ($(netd_probe_detail "$first" "$RUNG_DIR/netd-hello-$first.json"))" ;;
-	minor2) rec "mixed leg: the previous helper already speaks minor 2, so HelperTooOld is not exercised by this binary pair" ;;
-	*) fail "mixed leg: not a HelperTooOld verdict ($(netd_probe_detail "$first" "$RUNG_DIR/netd-hello-$first.json"))" ;;
-	esac
-	reinstall "$second" "$prev" prev || fail "the previous binary did not install cleanly on the $second Mac, or the nodes did not return Ready"
-	for s in local peer; do
-		host_clean "$s" downgraded
-		if [ "$s" = local ]; then cp "$K3SM_ARTIFACT" "$IC_REMOTE_DIR/k3sm-current"; else scp -q -o BatchMode=yes "$K3SM_ARTIFACT" "$PEER_SSH:$IC_REMOTE_DIR/k3sm-current"; fi
-		doctor_json "$s" "$IC_REMOTE_DIR/k3sm-current"
-		check "$s Mac: doctor ic-stray is clean" test "$(icp_doctor_row_state "$RUNG_DIR/doctor-$s.json" ic-stray)" = ok
-		check "$s Mac: doctor ic-residue is clean" test "$(icp_doctor_row_state "$RUNG_DIR/doctor-$s.json" ic-residue)" = ok
-		check "$s Mac: no reboot happened (kern.boottime unchanged; a reboot is never the cleanup)" \
-			test "$(on "$s" 'sysctl -n kern.boottime' 2>/dev/null)" = "$(side_var "$s" BOOT)"
+	R9_DOWNGRADED="$first"
+	if reinstall "$first" "$prev" prev; then
+		netd_hello "$first"
+		v="$(icp_helper_verdict "$RUNG_DIR/netd-hello-$first.json")"
+		case "$v" in
+		HelperTooOld) pass "mixed leg: the downgraded helper answers a minor-2 Hello as HelperTooOld, not an error ($(netd_probe_detail "$first" "$RUNG_DIR/netd-hello-$first.json"))" ;;
+		minor2) rec "mixed leg: the previous helper already speaks minor 2, so HelperTooOld is not exercised by this binary pair" ;;
+		*) fail "mixed leg: not a HelperTooOld verdict ($(netd_probe_detail "$first" "$RUNG_DIR/netd-hello-$first.json"))" ;;
+		esac
+		R9_DOWNGRADED="$first $second"
+		if reinstall "$second" "$prev" prev; then
+			for s in local peer; do
+				host_clean "$s" downgraded
+				if ship_set "$s" "$cur" current-doctor; then
+					doctor_json "$s" "$SHIPPED_BIN"
+				else
+					fail "$s Mac: the current build set could not be shipped for doctor"
+				fi
+				check "$s Mac: doctor ic-stray is clean" test "$(icp_doctor_row_state "$RUNG_DIR/doctor-$s.json" ic-stray)" = ok
+				check "$s Mac: doctor ic-residue is clean" test "$(icp_doctor_row_state "$RUNG_DIR/doctor-$s.json" ic-residue)" = ok
+				check "$s Mac: no reboot happened (kern.boottime unchanged; a reboot is never the cleanup)" \
+					test "$(on "$s" 'sysctl -n kern.boottime' 2>/dev/null)" = "$(side_var "$s" BOOT)"
+			done
+		else
+			fail "the previous build did not install cleanly on the $second Mac, or the nodes did not return Ready"
+		fi
+	else
+		fail "the previous build did not install cleanly on the $first Mac, or the nodes did not return Ready; the server is left alone"
+	fi
+	# Back to the artifact under test, worker first; only the Macs this rung touched.
+	local left=""
+	for s in $R9_DOWNGRADED; do
+		if ! reinstall "$s" "$cur" current; then
+			fail "the artifact under test did not reinstall on the $s Mac"
+			left="${left:+$left }$s"
+		fi
 	done
-	# Leave the lab host on the artifact under test, worker first.
-	reinstall "$first" "$K3SM_ARTIFACT" current || fail "the artifact under test did not reinstall on the $first Mac (the lab hosts are left downgraded: fix by hand)"
-	reinstall "$second" "$K3SM_ARTIFACT" current || fail "the artifact under test did not reinstall on the $second Mac (the lab hosts are left downgraded: fix by hand)"
+	R9_DOWNGRADED="$left"
+	if [ -n "$left" ]; then
+		fail "these Macs may be left on the previous build: $left; reinstall the artifact under test by hand"
+	else
+		rec "both Macs are back on the artifact under test; a laptop's copied admin kubeconfig needs re-copying if the server's install rotated its token"
+	fi
 }
 
 # ── --plan ──────────────────────────────────────────────────────────────────────
@@ -1289,6 +1423,60 @@ st_remote_make() {
 	remote_dir_make
 }
 
+# st_build_set <dir> [missing artifact] — a stand-in build set: a k3sm that names its
+# set the way the real one does, and the set, less the named artifact.
+st_build_set() {
+	mkdir -p "$1/cp-payload"
+	cat >"$1/k3sm" <<'EOF'
+#!/bin/sh
+[ "$1 $2" = "install --print-required-artifacts" ] || exit 9
+printf 'k3sm-execshim\ncp-payload/kine\n'
+EOF
+	chmod 0755 "$1/k3sm"
+	: >"$1/k3sm-execshim"
+	: >"$1/cp-payload/kine"
+	[ -z "${2:-}" ] || rm -f "$1/$2"
+	printf '# %s\n' "$1" >>"$1/k3sm"
+}
+# st_r9_problem <prev> <cur> <join> <worker node> — r9_problem over stated inputs.
+st_r9_problem() {
+	K3SM_M17_PREVIOUS_ARTIFACT="$1" K3SM_ARTIFACT="$2" JOIN_SERVER="$3"
+	local_NODE=node-a peer_NODE=node-b WORKER_NODE="$4"
+	r9_problem
+}
+# st_reinstall <side> <join port rc> <install rc> — the real reinstall with the host
+# stubbed; prints the calls it made, in order, then its status.
+st_reinstall() {
+	local join_rc="$2" install_rc="$3" rc=0
+	RUNG_DIR="$(mktemp -d -t m17-reinstall.XXXXXX)" JOIN_SERVER=192.0.2.10 REINSTALL_ARGS=""
+	local_NODE=node-a peer_NODE=node-b WORKER_NODE=node-b
+	PAYLOAD_LOG="$RUNG_DIR/payload.log"
+	info() { :; }
+	wait_join_port() {
+		echo "join-port $1"
+		return "$join_rc"
+	}
+	ship_set() {
+		echo "ship $1 $3"
+		SHIPPED_BIN="/set/$3/k3sm"
+	}
+	priv() {
+		echo "install on $1:" "${@:3}"
+		cat >/dev/null
+		: >"$PAYLOAD_LOG"
+		return "$install_rc"
+	}
+	wait_until() {
+		echo "wait $2"
+		return 0
+	}
+	reinstall "$1" /x/k3sm prev || rc=$?
+	echo "status $rc"
+	rm -rf "$RUNG_DIR"
+}
+# st_reinstall_calls <side> <join rc> <install rc> — the calls, one line.
+st_reinstall_calls() { st_reinstall "$@" | tr '\n' ';'; }
+
 # st_hello_payload — the composed netd_hello payload, with nothing executed.
 st_hello_payload() {
 	local d
@@ -1389,6 +1577,25 @@ self_test_body() {
 	st "the watchdog fires on a hung check and maps to FAIL (exit 1)" 0 gate_run 1 "watchdog fired" K3SM_M17_SELFTEST_WATCHDOG=2 K3SM_M17_SELFTEST_HANG=1 -- --self-test
 	st "K3SM_LAB=1 without PEER_SSH/EVIDENCE_DIR exits 2 REFUSED" 0 gate_run 2 "REFUSED(preflight)" K3SM_LAB=1 --
 	st "K3SM_LAB=1 with a relative EVIDENCE_DIR exits 2" 0 gate_run 2 "REFUSED(preflight)" K3SM_LAB=1 PEER_SSH=x EVIDENCE_DIR=rel K3SM_M17_REMOTE_SCRATCH=/Users/x/scratch --
+	st_build_set "$tmp/set-prev"
+	st_build_set "$tmp/set-cur"
+	st_build_set "$tmp/set-short" cp-payload/kine
+	mkdir -p "$tmp/link" && ln -s "$tmp/set-cur/k3sm" "$tmp/link/k3sm"
+	st "r9 inputs: two complete sets, a join address, the driver on the server" 0 st_r9_problem "$tmp/set-prev/k3sm" "$tmp/set-cur/k3sm" 192.0.2.10 node-b
+	st_out "r9 refused: no previous artifact" "K3SM_M17_PREVIOUS_ARTIFACT and K3SM_ARTIFACT" st_r9_problem "" "$tmp/set-cur/k3sm" 192.0.2.10 node-b
+	st_out "r9 refused: an incomplete set names what is missing" "missing: cp-payload/kine" st_r9_problem "$tmp/set-short/k3sm" "$tmp/set-cur/k3sm" 192.0.2.10 node-b
+	for r in /Library/k3sm /usr/local/bin; do st "r9 refused: the installed tree $r as a source" 0 is_installed_tree "$r"; done
+	st "r9 inputs: a build set elsewhere is not the installed tree" 1 is_installed_tree /Users/x/set
+	st_out "r9 refused: a symlink, whose set cannot be read beside it" "not an executable regular file" build_set_problem "$tmp/link/k3sm" K3SM_ARTIFACT
+	st_out "r9 refused: one build twice" "one build" st_r9_problem "$tmp/set-cur/k3sm" "$tmp/set-cur/k3sm" 192.0.2.10 node-b
+	st_out "r9 refused: no join address" "K3SM_M17_JOIN_SERVER" st_r9_problem "$tmp/set-prev/k3sm" "$tmp/set-cur/k3sm" "" node-b
+	st_out "r9 refused: a join address with a port" "K3SM_M17_JOIN_SERVER" st_r9_problem "$tmp/set-prev/k3sm" "$tmp/set-cur/k3sm" 192.0.2.10:9345 node-b
+	st_out "r9 refused: the driver on the worker" "not on the server" st_r9_problem "$tmp/set-prev/k3sm" "$tmp/set-cur/k3sm" 192.0.2.10 node-a
+	st_eq "reinstall: a worker polls the join port, then installs its role" "$(st_reinstall_calls peer 0 0)" "join-port peer;ship peer prev;install on peer: BIN=/set/prev/k3sm ARGS=--agent --server 192.0.2.10;wait two_nodes_ready;status 0;"
+	st_eq "reinstall: a server's plain re-run takes no role flag and no port poll" "$(st_reinstall_calls local 0 0)" "ship local prev;install on local: BIN=/set/prev/k3sm ARGS=;wait two_nodes_ready;status 0;"
+	st_out "reinstall red: a closed join port never reaches the install" "no install was attempted" st_reinstall peer 1 0
+	st_eq "reinstall red: a closed join port ships nothing" "$(st_reinstall peer 1 0 | grep -c '^ship\|^install')" 0
+	st_out "reinstall red: a refused install is the status" "status 7" st_reinstall local 0 7
 	st "K3SM_LAB=1 without a remote scratch exits 2" 0 gate_run 2 "K3SM_M17_REMOTE_SCRATCH is unset" K3SM_LAB=1 PEER_SSH=x EVIDENCE_DIR="$tmp/ev" --
 	st "K3SM_LAB=1 with a remote scratch in /tmp exits 2" 0 gate_run 2 "shared temporary directory" K3SM_LAB=1 PEER_SSH=x EVIDENCE_DIR="$tmp/ev" K3SM_M17_REMOTE_SCRATCH=/tmp/x --
 	st "remote scratch: a private absolute directory" 0 remote_scratch_problem /Users/miko/Code/k3sm-io.scratch
@@ -1639,6 +1846,7 @@ MLX_MODEL="${K3SM_M17_MLX_MODEL:-mlx-community/Qwen2.5-0.5B-Instruct-4bit}"
 MLX_MEMORY="${K3SM_M17_MLX_MEMORY:-4Gi}"
 MLX_READY_TIMEOUT="${K3SM_M17_MLX_READY_TIMEOUT:-1800}"
 REINSTALL_ARGS="${K3SM_M17_REINSTALL_ARGS:-}"
+JOIN_SERVER="${K3SM_M17_JOIN_SERVER:-}"
 mkdir -p "$EVIDENCE_DIR" || refuse_run preflight "cannot create $EVIDENCE_DIR (BI10)"
 
 RUN_LOG="$HERE/runs/m17-lab-${K3SM_RC_TAG:-local}-$(date -u +%Y-%m-%d).log"
@@ -1659,7 +1867,7 @@ echo "knobs: payload ${PAYLOAD_MB} MiB, LAN slack ${LAN_SLACK} B, DesiredInterva
 	local_SHA="" peer_SHA="" local_BOOT="" peer_BOOT="" local_OS="" peer_OS=""
 	local_MACS="" peer_MACS="" local_ICIP="" peer_ICIP="" WORKER_NODE=""
 }
-HAVE="" ARMED_BY_RUN=0 FORGED_SIDE="" FORGED_ORIG="" BG_PIDS="" PING_PIDS="" NS_CREATED=0 REMOTE_DIR_MADE=0
+HAVE="" ARMED_BY_RUN=0 FORGED_SIDE="" FORGED_ORIG="" BG_PIDS="" PING_PIDS="" NS_CREATED=0 REMOTE_DIR_MADE=0 R9_DOWNGRADED=""
 N_PASS=0 N_FAIL=0 N_REFUSED=0
 MESH_UTUN="" PEER_UTUN=""
 on_exit() {
@@ -1682,6 +1890,8 @@ on_exit() {
 		on_local "$K3SM_BIN interconnect disable" 2>&1 | sed 's/^/          /'
 	fi
 	[ "$NS_CREATED" = 1 ] && kc delete namespace "$NS" --wait=false >/dev/null 2>&1
+	# Never a reinstall from a trap: say which Macs an interrupted r9 left behind.
+	[ -z "$R9_DOWNGRADED" ] || echo "cleanup: r9 did not finish; these Macs may be on the previous build, so reinstall the artifact under test: $R9_DOWNGRADED"
 	remote_dir_remove
 	# Exit 0 only when every rung passed; an interrupted ladder is a FAIL.
 	if [ "$rc" = 0 ] && { [ "$N_FAIL" -gt 0 ] || [ "$N_REFUSED" -gt 0 ] || [ "$N_PASS" -lt 10 ]; }; then rc=1; fi
