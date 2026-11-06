@@ -218,6 +218,13 @@ func (r *runtimedRuntime) setAdmissionSource(src admissionPressure) {
 // the release frees is keyed by the pod's UID, so a create admitted inside the
 // release would lose its own.
 //
+// A create that this node has deleted since CreatePod's first check is refused too,
+// in the section that would count it: teardownPod remembers the UID and reads the
+// count under one r.mu, so either the delete sees this create and leaves the rest to
+// it, or this create sees the delete. A wait at the fence is uncounted, and the
+// orphan reaper's release (claimUntrackedHoldLocked) reaches a create that Virtual
+// Kubelet runs from an informer that still holds a pod the apiserver has lost.
+//
 // A refusal does not wait for an UpdatePod past its check: the update is judged
 // again before its runtime call and frees what it took (UpdatePod, updateDone).
 //
@@ -244,6 +251,12 @@ func (r *runtimedRuntime) admitOnCreate(ctx context.Context, pod *corev1.Pod) (r
 			return true, nil
 		}
 		r.mu.Lock()
+	}
+	if r.createIsStaleLocked(id) {
+		r.mu.Unlock()
+		r.log.Info("CreatePod: this node deleted the pod while the create was being admitted; not creating it",
+			"namespace", pod.Namespace, "name", pod.Name, "uid", id)
+		return true, nil
 	}
 	if prior := r.track[id]; prior != nil {
 		// Admitted (or refused) at its first create; a refused or evicted pod
@@ -544,6 +557,11 @@ func (u *uidTombstones) has(id string) bool {
 func (r *runtimedRuntime) createIsStale(id string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.createIsStaleLocked(id)
+}
+
+// createIsStaleLocked is createIsStale for a caller that holds r.mu.
+func (r *runtimedRuntime) createIsStaleLocked(id string) bool {
 	_, compensating := r.compensating[id]
 	return compensating || r.tornDown.has(id)
 }

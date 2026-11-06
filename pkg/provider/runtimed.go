@@ -2011,8 +2011,9 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 		return nil
 	}
 	// A UID this node has torn down is never created again, and a UID is never
-	// reused, so this create read a pod that is gone. Past this check, a delete behind
-	// the create is answered by its fence below and by createBehindDelete.
+	// reused, so this create read a pod that is gone. admitOnCreate reads it again
+	// where it counts the create; past that, a delete behind the create is answered by
+	// its fence below and by createBehindDelete.
 	if r.createIsStale(string(pod.UID)) {
 		r.log.Info("CreatePod: this node has already deleted the pod; not creating it",
 			"namespace", pod.Namespace, "name", pod.Name, "uid", string(pod.UID))
