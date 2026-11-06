@@ -489,7 +489,10 @@ pin, its date, and the tarball's sha256.
   manifest, and takes the repository lock only for that write, so repeated HEADs no longer queue
   behind pushes and sweeps. A touch that fails on a read-only or degraded store is logged once
   and the HEAD still answers `200`; that object is not touched again for half the grace. The
-  server now requires the garbage collector's grace in its configuration.
+  server now requires the garbage collector's grace in its configuration. A HEAD keeps the object
+  for at least half the grace and at most one grace after it, so a manifest PUT that comes later
+  can still find the object reaped. A HEAD is a read but it writes: a credential that may only
+  pull keeps an object it can name alive, in every repository that links the same content.
 
 - `k3sm stop` and `k3sm uninstall` recognise a vm pod's `k3sm-vmhost` helper when it runs from
   a versioned install directory or through a symlinked install path, not only from the flat
