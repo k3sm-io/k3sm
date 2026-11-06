@@ -749,3 +749,102 @@ func TestCompensatingDeleteHoldsTheAddress(t *testing.T) {
 		}
 	})
 }
+
+// TestDeletedUIDIsNotCreatedAgain: a UID is never reused, so a create of one this node
+// has deleted is stale whatever it read. While a compensating delete retries, nothing
+// may be acquired or built that the delete, or the release behind it, could take; and
+// once it has landed, nothing would ever delete a guest built behind it. Fails when
+// CreatePod does not read the tombstone: the create allocates in the first case, and
+// in the second builds a guest and takes a /32 that nothing owns.
+func TestDeletedUIDIsNotCreatedAgain(t *testing.T) {
+	ctx := context.Background()
+
+	// The delete's own RPC failed too, as it does in the outage that makes the
+	// compensating delete retry, so no teardown has finished to remember.
+	t.Run("while the compensating delete retries behind a failed teardown", func(t *testing.T) {
+		x := newTerminalUpdateFixture(t, compressorAt(10))
+		p := probeNetwork(x)
+		clk := testclock.NewFakeClock(time.Now())
+		x.r.clk = clk
+		release := x.f.holdCreate()
+		defer release()
+		created := make(chan error, 1)
+		go func() { created <- x.r.CreatePod(ctx, x.pod.DeepCopy()) }()
+		waitRestart(t, "the create's RPC to be entered", func() bool { return x.f.createCount() == 1 })
+		stopHoldingCreates(x.f)
+		tr := x.r.trackByID(string(x.pod.UID))
+		x.f.pushDeleteErr(errors.New("runtimed unavailable"))
+		x.r.reapOrphan(ctx, x.pod.DeepCopy(), tr)
+		x.f.pushDeleteErr(errors.New("runtimed unavailable"))
+		release()
+		if err := awaitErr(t, created, "the create"); err != nil {
+			t.Fatalf("the create = %v, want nil", err)
+		}
+		waitRestart(t, "the compensating retry to arm", clk.HasWaiters)
+
+		setups, _ := p.counts()
+		if err := x.r.CreatePod(ctx, x.pod.DeepCopy()); err != nil {
+			t.Errorf("the create during the retries = %v, want nil", err)
+		}
+		if after, _ := p.counts(); after != setups {
+			t.Errorf("pod network setups during the retries %d -> %d, want no new one", setups, after)
+		}
+		if n := x.f.createCount(); n != 1 {
+			t.Errorf("runtime CreatePod calls during the retries = %d, want 1", n)
+		}
+
+		clk.Step(11 * time.Second)
+		waitRestart(t, "the compensating delete to land and retire", func() bool { return compensatingCount(x.r) == 0 })
+		x.r.reapOrphan(ctx, x.pod.DeepCopy(), tr)
+		x.assertForgotten(t)
+		if _, n := p.counts(); n != 1 {
+			t.Errorf("releases = %d, want 1", n)
+		}
+	})
+
+	t.Run("while the compensating delete retries, and after it lands", func(t *testing.T) {
+		x := newTerminalUpdateFixture(t, compressorAt(10))
+		p := probeNetwork(x)
+		clk := testclock.NewFakeClock(time.Now())
+		x.r.clk = clk
+		release := x.f.holdCreate()
+		defer release()
+		created := make(chan error, 1)
+		go func() { created <- x.r.CreatePod(ctx, x.pod.DeepCopy()) }()
+		waitRestart(t, "the create's RPC to be entered", func() bool { return x.f.createCount() == 1 })
+		stopHoldingCreates(x.f)
+		x.r.reapOrphan(ctx, x.pod.DeepCopy(), x.r.trackByID(string(x.pod.UID)))
+		x.f.pushDeleteErr(errors.New("runtimed unavailable"))
+		release()
+		if err := awaitErr(t, created, "the create"); err != nil {
+			t.Fatalf("the create = %v, want nil", err)
+		}
+		waitRestart(t, "the compensating retry to arm", clk.HasWaiters)
+
+		setups, _ := p.counts()
+		if err := x.r.CreatePod(ctx, x.pod.DeepCopy()); err != nil {
+			t.Errorf("the create during the retries = %v, want nil", err)
+		}
+		if after, _ := p.counts(); after != setups {
+			t.Errorf("pod network setups during the retries %d -> %d, want no new one", setups, after)
+		}
+		if n := x.f.createCount(); n != 1 {
+			t.Errorf("runtime CreatePod calls during the retries = %d, want 1", n)
+		}
+
+		clk.Step(11 * time.Second)
+		waitRestart(t, "the compensating delete to land and retire", func() bool { return compensatingCount(x.r) == 0 })
+		x.assertForgotten(t)
+
+		if err := x.r.CreatePod(ctx, x.pod.DeepCopy()); err != nil {
+			t.Errorf("the create behind the delete = %v, want nil", err)
+		}
+		if n := x.f.createCount(); n != 1 {
+			t.Errorf("runtime CreatePod calls behind the delete = %d, want 1", n)
+		}
+		x.assertForgotten(t)
+		if _, n := p.counts(); n != 1 {
+			t.Errorf("releases = %d, want 1", n)
+		}
+	})
+}

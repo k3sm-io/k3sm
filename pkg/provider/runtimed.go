@@ -288,6 +288,10 @@ type runtimedRuntime struct {
 	// track and carries no deletion stamp (admission.go, uidTombstones). Guarded by
 	// mu; usable at its zero value.
 	tombstones uidTombstones
+	// tornDown remembers the UIDs of recent teardowns, for a create that arrives behind
+	// one (createIsStale). Unlike tombstones it leaves out a refused pod's delete, which
+	// tore nothing down. Guarded by mu; usable at its zero value.
+	tornDown uidTombstones
 	// admittedHook, when set, runs in CreatePod right after admission let the
 	// create through, before anything is registered: the seam a test uses to hold
 	// one create inside the admission window. Nil in production; set before any
@@ -2002,6 +2006,14 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 			"namespace", pod.Namespace, "name", pod.Name, "uid", string(pod.UID))
 		return nil
 	}
+	// A UID this node has torn down is never created again, and a UID is never
+	// reused, so this create read a pod that is gone. Past this check, a delete behind
+	// the create is answered by its fence below and by createBehindDelete.
+	if r.createIsStale(string(pod.UID)) {
+		r.log.Info("CreatePod: this node has already deleted the pod; not creating it",
+			"namespace", pod.Namespace, "name", pod.Name, "uid", string(pod.UID))
+		return nil
+	}
 	// Node-side admission under pressure (admission.go), before anything is
 	// registered or allocated: a refused pod holds no address, no references and
 	// no sandbox, only its terminal status.
@@ -2803,6 +2815,7 @@ func (r *runtimedRuntime) teardownPod(ctx context.Context, pod *corev1.Pod, grac
 	r.stopProber(id)
 	r.mu.Lock()
 	r.tombstones.add(id)
+	r.tornDown.add(id)
 	if r.inFlightLocked(id) {
 		r.oweDeleteLocked(id, owned)
 		r.mu.Unlock()

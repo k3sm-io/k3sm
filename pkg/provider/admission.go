@@ -538,6 +538,16 @@ func (u *uidTombstones) has(id string) bool {
 	return ok
 }
 
+// createIsStale reports whether a create of UID id arrives behind the pod's teardown,
+// or beside a compensating delete, which would take what the create builds. A refused
+// pod's delete is neither: it tore nothing down, and a create of it owns its guest.
+func (r *runtimedRuntime) createIsStale(id string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, compensating := r.compensating[id]
+	return compensating || r.tornDown.has(id)
+}
+
 // inFlightLocked reports whether a create or an update of pod id has not returned,
 // so it can still acquire by the pod's UID, or whether a guest a late create built
 // still stands, answering on the pod's /32 until its compensating delete lands
@@ -598,15 +608,14 @@ func (r *runtimedRuntime) claimFenceReleaseLocked(id string) *fenceClaim {
 // claimUntrackedHoldLocked decides, under r.mu, that the orphan reaper releases what
 // a pod with no track holds, once the apiserver has been seen not to hold the UID. It
 // returns nil when a call of the pod is out or a release is running, as either owns
-// the decision, and when a track has appeared or nothing is held. A create that starts
-// behind the claim waits for the release on fenceReleasing, and what it takes is held
-// again, for a later sweep. The UID's tombstone stops a stale update of it. The caller
-// holds r.mu.
+// the decision, and when a track has appeared or nothing is held. The UID's tombstone
+// stops a stale create or update of it. The caller holds r.mu.
 func (r *runtimedRuntime) claimUntrackedHoldLocked(id string) *fenceClaim {
 	if r.inFlightLocked(id) || r.fenceReleasing[id] != nil || r.track[id] != nil || r.held[id] == nil {
 		return nil
 	}
 	r.tombstones.add(id)
+	r.tornDown.add(id)
 	return r.publishFenceReleaseLocked(id, nil)
 }
 
