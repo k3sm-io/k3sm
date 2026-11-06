@@ -385,17 +385,32 @@ take part. A worker that joined before this release has no root-owned CA copy un
 installed again (`sudo k3sm install --agent --server <server>`), and until then its helper refuses
 every managed update.
 
-A node installed by a release that did not lay down `/var/lib/k3sm/updates` cannot make that
-directory, so a managed update fails on it at the first step, and the managed update cannot bring
-the fix to it. To check a node, run `ls -ld /var/lib/k3sm/updates`: it needs nothing if that shows
-`drwx------` and the `_k3sm` user. Otherwise it needs one install of a release that has the
-directory, by any install path. On a worker this is the same install the note above asks for,
-`sudo k3sm install --agent --server <server>`, and it needs no token, because a joined worker
-resumes from its stored credential. On a server it is `sudo k3sm install`, which mints a new admin
-token, so copy the admin kubeconfig again with `k3sm kubeconfig`; on a one-node server, the k3sm
-app's install keeps the token. Either way the install restarts the node's daemons and recreates
-its Pods, as any upgrade does. If a roll has already failed on the node, run `k3sm update abort`
-first.
+A node on v0.2.x cannot take a managed update to a published release. Those builds did not lay down
+`/var/lib/k3sm/updates`, the daemon cannot make it (the data root belongs to root), and the managed
+update cannot bring the fix to the node it fails on. The node needs one ordinary install of a release
+that has the directory, the first release after v0.2.x or a later one, after which managed updates
+work. To check a node, run `ls -ld /var/lib/k3sm/updates`: it needs nothing if that shows `drwx------`
+and the `_k3sm` user.
+
+- **A server.** Run `curl -fsSL https://k3sm.io/install.sh | sh` or `sudo k3sm install`. Either mints
+  a new admin token, so copy the admin kubeconfig again with `k3sm kubeconfig` to every other Mac and
+  tool that uses it. The k3sm app's install of the release it carries on a one-node server runs
+  `k3sm install --from-staging`, which keeps the stored admin token unless that token is missing or
+  corrupt.
+- **A worker.** Run `sudo k3sm install --agent --server <server>`. It needs no token, because a joined
+  worker resumes from its stored credential. `install.sh` runs a bare install, which is not a worker
+  install, so download only: `curl -fsSL https://k3sm.io/install.sh | K3SM_INSTALL_DOWNLOAD_ONLY=1 sh`
+  leaves the verified archive in the current directory. Unpack it with `tar -xzf` and run
+  `sudo ./k3sm install --agent --server <server>` from the unpacked directory.
+
+Either way the install restarts the node's daemons and recreates its Pods, as any upgrade does.
+
+If you start a managed update anyway, the first step on that node fails. Its phase reads `Failed`
+with the reason, which names `k3sm update abort` as the recovery (see
+[On Each Node](#on-each-node)), and the roll stops there. Run `k3sm update status` to see which node
+failed, then `k3sm update abort`: it marks the update `Cancelled` and clears the `k3sm.io/update-*`
+annotations, and lifts the cordon where the update controller set it. Install on the node as above
+before the next `apply`.
 
 On a node that already runs such a release, a missing directory needs no install: `k3sm-netd`
 recreates it when it starts, so `sudo k3sm restart` is enough.

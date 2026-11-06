@@ -45,6 +45,7 @@ pin, its date, and the tarball's sha256.
   set `stable`, then `k3sm update apply --version <tag> --allow-downgrade`, and an uninstall and fresh
   install when a candidate breaks the updater), what the signature policy checks on an ad-hoc install, and
   how channels differ from k3s.
+- [Upgrade](docs/user/upgrade.md#on-each-node) says a node on v0.2.x needs one ordinary install of the first release after v0.2.x before managed updates work, how to do it on a server and a worker, and `k3sm update abort` as the recovery if an update is tried first.
 - `k3sm status -o json` carries this node's budget as an optional `budget` object (pressure level,
   admission, each signal against its rungs, and the headroom recommendation), in the schema of
   `NodeBudget.status`. `schemaVersion` stays `1`. [Status JSON](docs/user/status-json.md#budget)
