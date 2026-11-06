@@ -201,6 +201,9 @@ pin, its date, and the tarball's sha256.
   For 30 seconds after the first rejection they retry and read the admin kubeconfig again, within the
   existing 90-second limit for the uncordon. A credential still rejected after that fails as before, and a
   start that restarted nothing, or one on a worker, still fails on the first rejection.
+- A rollback of `sudo k3sm install` no longer leaves `~/.kube/config` getting `Unauthorized`. It puts the
+  previous admin token back, so every copy of the kubeconfig keeps working, or, when it cannot, writes the
+  kubeconfig with the new token and says to copy it again.
 - `k3sm install` with a new `--mesh-ip` on a control-plane node no longer leaves the server refused its new
   address at every start. The install removes the pod range netd recorded when it names another range than
   the new address's, and removes the interconnect aliases of the old range from `bridge0`. A failed removal

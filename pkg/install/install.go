@@ -2208,6 +2208,7 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	//     optional input: it is minted (or carried) by this install and has to be
 	//     the same value the admin kubeconfig written below carries, or every
 	//     admin request is Unauthorized.
+	tokenRollback := captureAdminToken(sys, cfg, uid) // what a rollback puts back
 	if cfg.Role == RoleServer {
 		if err := stageTokenFile(sys, uid, cfg.AdminToken, cfg.serverTokenPath(), "admin token", ServerTokenFileMode, ServerTokenDirMode); err != nil {
 			return err
@@ -2451,7 +2452,7 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	//      root and stops before anything is wired (refuseBesideStuckMarker).
 	if removeMarker.stillOn() {
 		restartOwned = previous // a revert restarts, and reports, every daemon
-		return refuseBesideStuckMarker(ctx, sys, cfg, m, previous, dropErr)
+		return tokenRollback.keepKubeconfigWorking(ctx, sys, cfg, previous, refuseBesideStuckMarker(ctx, sys, cfg, m, previous, dropErr, func() { tokenRollback.putBack(sys, cfg) }))
 	}
 
 	// 3. The launcher link and the plists, in that order, and BOTH after the
@@ -2465,7 +2466,11 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	//    target mean the new tree the moment it is live.
 	restartOwned = true // step 4 restarts, and on failure reports, every daemon
 	if err := publishedWiring(ctx, sys, cfg, m, startedAt); err != nil {
-		return revertInstallRoot(ctx, sys, cfg, m, previous, err, false, func() { removeMarker.restore(sys, cfg) })
+		err = revertInstallRoot(ctx, sys, cfg, m, previous, err, false, func() {
+			removeMarker.restore(sys, cfg)
+			tokenRollback.putBack(sys, cfg)
+		})
+		return tokenRollback.keepKubeconfigWorking(ctx, sys, cfg, previous, err)
 	}
 
 	// 4c. REAP, and not one step earlier. The previous install root is still
