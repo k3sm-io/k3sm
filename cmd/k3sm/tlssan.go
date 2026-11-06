@@ -114,6 +114,18 @@ func kubernetesServiceIP(serviceCIDR netip.Prefix) net.IP {
 	return ip
 }
 
+// tlsSANDNSNames is the DNS names of a --tls-san list. The list is judged by
+// validateTLSSANs when the server starts; this only leaves out its addresses.
+func tlsSANDNSNames(raw []string) []string {
+	var names []string
+	for _, san := range raw {
+		if net.ParseIP(san) == nil {
+			names = append(names, san)
+		}
+	}
+	return names
+}
+
 // parseServiceCIDR parses the configured --service-cidr for validateTLSSANs.
 func parseServiceCIDR(serviceCIDR string) (netip.Prefix, error) {
 	p, err := netip.ParsePrefix(serviceCIDR)

@@ -410,6 +410,7 @@ func agentStart(ctx context.Context, opts agentOptions, breaker *crashBreaker, l
 	}
 	logStartPlan(logger, plan, status, tokenPresent, tokenParses, tokenCAHash, storedCAHash)
 	warnCredentialAddressMismatch(logger, plan, status, cred, opts.server, opts.tokenFile)
+	warnReservedNodeName(logger, plan, opts.nodeName)
 
 	// node-password: mint once, persist 0600, reuse across restarts so the
 	// first-write-wins binding keeps matching.
@@ -451,6 +452,9 @@ func agentStart(ctx context.Context, opts agentOptions, breaker *crashBreaker, l
 	}
 	if plan == startModeTokenJoin {
 		res, meshEndpoint, err = agentTokenJoin(ctx, opts, password, meshPriv, joinHost, logger)
+		if errors.Is(err, bootstrap.ErrReservedNodeName) {
+			return agentTerminal(ctx, breaker, logger, err)
+		}
 		if err != nil {
 			return err
 		}
@@ -644,6 +648,19 @@ func agentTokenJoin(ctx context.Context, opts agentOptions, password, meshPriv, 
 	}
 	logger.Info("joined", "nodeIP", res.NodeIP, "podCIDR", res.PodCIDR, "meshIP", res.MeshIP, "peers", len(res.Peers))
 	return res, meshEndpoint, nil
+}
+
+// warnReservedNodeName tells the operator of a node already running under a name
+// the join now refuses. Such a node keeps its identity: a restart reuses the stored
+// credential and no join runs. Only a new join under the name is refused, so this
+// says so while there is time to act.
+func warnReservedNodeName(logger *slog.Logger, plan startMode, nodeName string) {
+	if plan != startModeReuseCredential {
+		return
+	}
+	if err := bootstrap.CheckReservedNodeName(nodeName, nil); err != nil {
+		logger.Warn("this node keeps running on its stored credential, but a new join under this name will be refused; rejoin under another name before the credential expires", "node", nodeName, "err", err)
+	}
 }
 
 // joinRateLimitGrace bounds how long ONE agent start keeps re-trying a join the

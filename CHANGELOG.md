@@ -222,6 +222,11 @@ pin, its date, and the tarball's sha256.
 - A rollback of `sudo k3sm install` no longer leaves `~/.kube/config` getting `Unauthorized`. It puts the
   previous admin token back, so every copy of the kubeconfig keeps working, or, when it cannot, writes the
   kubeconfig with the new token and says to copy it again.
+- A join is refused, with a message naming the name and `--node-name`, for a node named `kubernetes`, a
+  `kubernetes.default` form, `localhost`, or a DNS name in the server's `--tls-san`. A node already running
+  under such a name keeps its credential across restarts and logs a warning each start; only a new join
+  under that name is refused. A join request listing one of those names as a SAN is refused too, and a joined
+  node's kubelet certificate no longer carries `localhost`. Released agents can still join.
 - Hardening: as root, k3sm uses only checked, inline kubeconfigs and the installed kubectl, and netd on a
   worker trusts only its own copy of the cluster CA. A refusal says what to do. Under sudo, your kubectl
   plugins and `k3sm kubectl config` writes do not work; run without sudo for those. As root, kubectl keeps

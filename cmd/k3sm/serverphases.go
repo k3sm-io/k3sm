@@ -547,8 +547,9 @@ func startJoinSupervisor(ctx context.Context, plan serverPlan, cs kubernetes.Int
 		// in HA every server protects its own name here, and its siblings'
 		// names are protected by their own processes plus the shared
 		// node-password bindings step 2b takes.
-		selfNodeName: opts.nodeName,
-		tokens:       tokens,
+		selfNodeName:      opts.nodeName,
+		reservedNodeNames: tlsSANDNSNames(opts.tlsSANs),
+		tokens:            tokens,
 		// The store step 2b already bound this node's own name in.
 		nodePasswords: sm.nodePasswords,
 		enroller:      sm.enroller,

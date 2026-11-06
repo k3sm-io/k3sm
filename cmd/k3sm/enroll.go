@@ -803,12 +803,15 @@ type bootstrapServerDeps struct {
 	// issue anything for (bootstrap.ServerConfig.SelfNodeName). It is carried
 	// per-process, from the supervisor's own options, so an HA sibling protects
 	// its own name and no server needs a list of the others'.
-	selfNodeName  string
-	tokens        bootstrap.TokenVerifier
-	nodePasswords bootstrap.NodePasswordStore
-	enroller      bootstrap.Enroller
-	serverAuth    bootstrap.ServerAuthorizer
-	bundle        bootstrap.BundleSource
+	selfNodeName string
+	// reservedNodeNames are this server's --tls-san DNS names, which the join
+	// handler refuses as node names and as requested SANs.
+	reservedNodeNames []string
+	tokens            bootstrap.TokenVerifier
+	nodePasswords     bootstrap.NodePasswordStore
+	enroller          bootstrap.Enroller
+	serverAuth        bootstrap.ServerAuthorizer
+	bundle            bootstrap.BundleSource
 	// members drives the server-class etcd member routes (the etcd posture only).
 	members    bootstrap.MemberJoiner
 	apiServers []string
@@ -911,19 +914,20 @@ func startBootstrapServer(ctx context.Context, deps bootstrapServerDeps, log *sl
 	h := deps.hierarchy
 	meshIP := deps.meshIP
 	srv, err := bootstrap.NewServer(bootstrap.ServerConfig{
-		ClusterCA:      h.Cluster,
-		SigningCA:      h.Signing,
-		Tokens:         deps.tokens,
-		NodePasswords:  deps.nodePasswords,
-		SelfNodeName:   deps.selfNodeName,
-		Enroller:       deps.enroller,
-		APIServers:     deps.apiServers,
-		APIServersFunc: deps.apiServersFunc,
-		ServerMesh:     deps.serverMesh,
-		ServerAuth:     deps.serverAuth,
-		Bundle:         deps.bundle,
-		Members:        deps.members,
-		Logger:         log,
+		ClusterCA:         h.Cluster,
+		SigningCA:         h.Signing,
+		Tokens:            deps.tokens,
+		NodePasswords:     deps.nodePasswords,
+		SelfNodeName:      deps.selfNodeName,
+		ReservedNodeNames: deps.reservedNodeNames,
+		Enroller:          deps.enroller,
+		APIServers:        deps.apiServers,
+		APIServersFunc:    deps.apiServersFunc,
+		ServerMesh:        deps.serverMesh,
+		ServerAuth:        deps.serverAuth,
+		Bundle:            deps.bundle,
+		Members:           deps.members,
+		Logger:            log,
 	})
 	if err != nil {
 		return fmt.Errorf("build bootstrap server: %w", err)
