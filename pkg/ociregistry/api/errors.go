@@ -94,7 +94,10 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, e *apiError)
 	}
 	b, _ := json.Marshal(errorBody{Errors: []errorEntry{{Code: e.code, Message: e.msg, Detail: e.detail}}}) // a struct of strings always encodes
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Del("Content-Length")
+	// A refusal delivers no manifest: whatever named one, or its length, is stale.
+	for _, h := range []string{"Content-Length", "Docker-Content-Digest", "ETag"} {
+		w.Header().Del(h)
+	}
 	w.WriteHeader(e.status)
 	if r.Method != http.MethodHead {
 		_, _ = w.Write(b) // the client went away; nothing else to tell it
