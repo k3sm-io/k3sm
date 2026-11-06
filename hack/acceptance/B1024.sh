@@ -51,6 +51,10 @@ pkg/install/install.go
 pkg/install/install_test.go
 pkg/install/removezot_darwin_test.go
 hack/acceptance/B1022.sh
+# Cites removeLeftoverZot, the legacy reclaim, by name.
+pkg/install/legacy.go
+# The rollback leg drives a real zot over the k3sm store.
+hack/acceptance/B1027.sh
 # Resolutions 4 and 5: the store stays in zot's on-disk layout, keeps zot's
 # databases, and is tested against a capture of a real zot.
 pkg/ociregistry/ref/ref.go

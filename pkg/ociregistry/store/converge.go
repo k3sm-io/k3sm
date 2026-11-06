@@ -388,8 +388,8 @@ func (g *convergeGroup) pending() int {
 //     and count the names each inode has.
 //  2. Choose the keeper: newest mtime, ties to the first repository. A future
 //     mtime, a wrong owner or a mode other than 0600 disqualifies it.
-//  3. Verify, no locks: hash through a descriptor, then F_FULLFSYNC, because a
-//     zot-written inode has no durability promise from us. A hash failure logs
+//  3. Verify, no locks: hash through a descriptor, then F_FULLFSYNC, because an
+//     inode another writer of the layout left has no durability promise from us. A hash failure logs
 //     ErrStoreCorrupt and the next-newest is tried. A link the scan did not count
 //     (a crashed commit's session, a crashed merge's temp, a mount after the
 //     scan), a counted name since removed or a pinned st_nlink refuses the keeper
