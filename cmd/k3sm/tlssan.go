@@ -27,6 +27,7 @@ import (
 
 	"k3sm.io/darwin-net/pkg/podnet"
 	"k3sm.io/k3sm/pkg/install"
+	"k3sm.io/k3sm/pkg/kubeclient"
 )
 
 // maxTLSSANs is the most --tls-san names one server takes. Each rides the
@@ -112,6 +113,15 @@ func kubernetesServiceIP(serviceCIDR netip.Prefix) net.IP {
 		return ip4
 	}
 	return ip
+}
+
+// withoutKubernetesServiceIP is the IP SAN list of a cluster-CA leaf other than the
+// apiserver's. That address is how a worker recognises its apiserver
+// (kubeclient.APIServerName), so no other leaf may carry it, whatever a Node or a
+// flag says the host's address is.
+func withoutKubernetesServiceIP(ips []net.IP) []net.IP {
+	reserved := net.ParseIP(kubeclient.APIServerName())
+	return slices.DeleteFunc(slices.Clone(ips), reserved.Equal)
 }
 
 // tlsSANDNSNames is the DNS names of a --tls-san list. The list is judged by

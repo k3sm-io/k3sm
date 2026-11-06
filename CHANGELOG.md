@@ -222,6 +222,10 @@ pin, its date, and the tarball's sha256.
 - A rollback of `sudo k3sm install` no longer leaves `~/.kube/config` getting `Unauthorized`. It puts the
   previous admin token back, so every copy of the kubeconfig keeps working, or, when it cannot, writes the
   kubeconfig with the new token and says to copy it again.
+- A worker's root helper, `sudo k3sm kubectl` and the other root verbs on a worker, and `k3sm stop` and `k3sm start`
+  there, verify the apiserver's certificate against the kubernetes Service address, `10.43.0.1`, which
+  every apiserver certificate carries and no other certificate of the cluster does. They still connect to the
+  address in the kubeconfig. `sudo k3sm kubectl` on a worker also uses the root-held cluster CA for that check.
 - A join is refused, with a message naming the name and `--node-name`, for a node named `kubernetes`, a
   `kubernetes.default` form, `localhost`, or a DNS name in the server's `--tls-san`. A node already running
   under such a name keeps its credential across restarts and logs a warning each start; only a new join

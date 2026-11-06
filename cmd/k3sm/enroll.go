@@ -934,7 +934,7 @@ func startBootstrapServer(ctx context.Context, deps bootstrapServerDeps, log *sl
 	}
 
 	servingChain, err := h.Cluster.ServingChainTLS("k3sm-supervisor",
-		[]string{"localhost"}, []net.IP{net.ParseIP(meshIP), net.ParseIP("127.0.0.1")}, 365*24*time.Hour)
+		[]string{"localhost"}, withoutKubernetesServiceIP([]net.IP{net.ParseIP(meshIP), net.ParseIP("127.0.0.1")}), 365*24*time.Hour)
 	if err != nil {
 		return fmt.Errorf("supervisor serving cert: %w", err)
 	}

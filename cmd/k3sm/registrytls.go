@@ -59,7 +59,7 @@ func serverRegistryServingMinter(opts serverOptions, logger *slog.Logger) func(d
 	}
 	ca := h.Cluster
 	return func(dnsNames []string, ips []net.IP) (tls.Certificate, error) {
-		return ca.IssueRegistryServing(registrysvc.FlatServiceName, dnsNames, ips, registryServingValidity)
+		return ca.IssueRegistryServing(registrysvc.FlatServiceName, dnsNames, withoutKubernetesServiceIP(ips), registryServingValidity)
 	}
 }
 

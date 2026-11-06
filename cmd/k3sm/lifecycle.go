@@ -37,6 +37,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/util/retry"
 
 	"k3sm.io/darwin-net/pkg/netd/wire"
@@ -209,7 +210,7 @@ func joinedWorkers(sys install.System, dataRoot string) func(ctx context.Context
 		if err != nil {
 			return 0, err
 		}
-		_, cs, err := kubeclient.FromCheckedPath(kubeconfig)
+		_, cs, err := lifecycleClient(dataRoot, kubeconfig)
 		if err != nil {
 			return 0, fmt.Errorf("load kubeconfig %s: %w", kubeconfig, err)
 		}
@@ -258,14 +259,22 @@ func nodeMarker(sys install.System, dataRoot string) func(ctx context.Context, s
 			// Read from local files, so a start's uncordon does not retry it.
 			return fmt.Errorf("%w: %w", install.ErrNodeIdentity, err)
 		}
-		return markNodeThroughKubeconfig(ctx, kubeconfigClient, kubeconfig, name, stopped, actor, reason)
+		return markNodeThroughKubeconfig(ctx, func(path string) (kubernetes.Interface, error) {
+			_, cs, err := lifecycleClient(dataRoot, path)
+			return cs, err
+		}, kubeconfig, name, stopped, actor, reason)
 	}
 }
 
-// kubeconfigClient is the client a kubeconfig file gives.
-func kubeconfigClient(path string) (kubernetes.Interface, error) {
-	_, cs, err := kubeclient.FromCheckedPath(path)
-	return cs, err
+// lifecycleClient builds the client for the kubeconfig lifecycleNodeIdentity chose.
+// A worker's node credential verifies the apiserver by kubeclient.APIServerName; a
+// server's admin kubeconfig is the one its own control plane wrote for its own
+// apiserver.
+func lifecycleClient(dataRoot, kubeconfig string) (*rest.Config, kubernetes.Interface, error) {
+	if kubeconfig == install.AgentCredentialPath(dataRoot) {
+		return kubeclient.FromCheckedWorkerPath(kubeconfig)
+	}
+	return kubeclient.FromCheckedPath(kubeconfig)
 }
 
 // markNodeThroughKubeconfig is one MarkNode attempt. It loads the kubeconfig

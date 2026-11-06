@@ -94,7 +94,8 @@ type checkedKubeconfig struct {
 	cfg *clientcmdapi.Config
 	// path is the file the bytes came from, for a report to name.
 	path string
-	// caPEM, when set, replaces the file's trust in its server (kubeclient.PinCA).
+	// caPEM, when set, replaces the file's trust in its server (kubeclient.PinCA),
+	// for the client restConfig builds and the file handoff gives kubectl alike.
 	caPEM []byte
 }
 
@@ -143,6 +144,22 @@ func (c *checkedKubeconfig) restConfig() (*rest.Config, error) {
 	return cfg, nil
 }
 
+// pinned returns the checked entries with caPEM's trust in their cluster, the same
+// trust kubeclient.PinCA gives restConfig's client, or the entries themselves when
+// there is no caPEM.
+func (c *checkedKubeconfig) pinned() *clientcmdapi.Config {
+	if c.caPEM == nil {
+		return c.cfg
+	}
+	out := c.cfg.DeepCopy()
+	cluster := out.Clusters[out.Contexts[out.CurrentContext].Cluster]
+	cluster.CertificateAuthority = ""
+	cluster.CertificateAuthorityData = c.caPEM
+	cluster.InsecureSkipTLSVerify = false
+	cluster.TLSServerName = kubeclient.APIServerName()
+	return out
+}
+
 // source names the file and context for a report.
 func (c *checkedKubeconfig) source() string {
 	return fmt.Sprintf("%s context %q", c.path, c.cfg.CurrentContext)
@@ -158,7 +175,7 @@ var kubeconfigHandoffDir = "/private/tmp"
 // credentials never have a name and go when kubectl exits, however it exits. The
 // caller keeps the file open until the exec.
 func (c *checkedKubeconfig) handoff() (*os.File, string, error) {
-	data, err := clientcmd.Write(*c.cfg)
+	data, err := clientcmd.Write(*c.pinned())
 	if err != nil {
 		return nil, "", fmt.Errorf("encode the checked kubeconfig: %w", err)
 	}

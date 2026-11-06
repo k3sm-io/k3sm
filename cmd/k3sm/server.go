@@ -1211,7 +1211,7 @@ func serverKubeletServingIPs(nodeOpts nodeOptions, meshIP string) []net.IP {
 		}
 		ips = append(ips, ip)
 	}
-	return ips
+	return withoutKubernetesServiceIP(ips)
 }
 
 // writeAPIServerServingCert issues the apiserver's serving cert from the cluster CA
