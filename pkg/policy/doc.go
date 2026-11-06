@@ -44,6 +44,11 @@ limitations under the License.
 //     scope: the sandbox denies by port number whatever address the pod dials, so
 //     a ClusterIP and a headless Service are as unreachable as a LoadBalancer.
 //
+// A fifth Deny guard is defined here and not yet provisioned by server bring-up:
+//   - unrunnable vm pod: a Pod on the vm RuntimeClass whose spec the provider cannot
+//     run, or would run wrong, is refused with the reason for its own shape. See
+//     EnsureRejectUnrunnableVMPod.
+//
 // Five are Warn advisories that surface an honest k3sm divergence to kubectl
 // WITHOUT rejecting the object (failurePolicy Ignore so they can only ever warn).
 // Two are on Services, for datapath divergences:
