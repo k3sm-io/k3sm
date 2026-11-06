@@ -132,6 +132,12 @@ pin, its date, and the tarball's sha256.
   but unreaped process as running. `k3sm dev list` and `k3sm dev down` now treat that state as dead too.
 - A referrers request on the k3sm registry server stops reading manifests when its client goes away, and gives its build slot back for the next request, which carries on from what was read. A request with a malformed digest and credentials the server refuses answers 401, not 400.
 - A delete, the orphan reaper or a refused create that lands beside another call of the same pod no longer leaves the pod's address and references held until the node restarts, and releases them once. An update that arrives after a pod's delete no longer allocates an address nothing owns, and a retry of a pod whose create is parked for its image stops once the delete has begun.
+- The built-in registry refuses an OCI artifact manifest whose config or layers are not in the repository,
+  with `MANIFEST_BLOB_UNKNOWN`, as it already did for an image manifest. It could store an artifact naming
+  a blob garbage collection had already removed. A client that pushes an artifact's manifest before its
+  blobs now has to push the blobs first. A descriptor's inline `data` is not honoured: the blob must be in
+  the repository, the empty descriptor's included. An index's children and a manifest's subject still need
+  not be present; the PUT restarts the garbage collection grace of those that are, on a best-effort basis.
 - `k3sm` and the etcd, kine and zot it builds now link `github.com/klauspost/compress` v1.20.2, which fixes GO-2026-6865, a panic on two-block frames. Every node re-stages kine and zot on upgrade.
 - Turning Spotlight indexing off for the data volume no longer waits indefinitely on `mdutil`. The
   `.metadata_never_index` marker is what excludes the volume and is written first, so the `mdutil`

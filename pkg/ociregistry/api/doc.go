@@ -38,8 +38,17 @@ limitations under the License.
 //     tag, a HEAD of a tagged row and every GET write nothing;
 //   - a manifest PUT accepts the OCI manifest and index and the Docker v2
 //     manifest and manifest list (415 otherwise), reads at most 4 MiB (413
-//     above), requires the blobs an image manifest names to be in the
-//     repository and never requires an index's children;
+//     above), requires the blobs a manifest names to be in the repository and
+//     never requires an index's children. The exception to following that
+//     registry: it requires no blobs of a manifest whose config type is neither
+//     an OCI image config nor the empty descriptor, and this server does. A
+//     descriptor's inline data is not honoured: the blob must be in the
+//     repository, the empty descriptor's included. A PUT
+//     restarts the garbage-collection grace of each index child and subject the
+//     repository holds, under the repository lock, once per request, never
+//     while half that grace is left and for at most maxManifestTouches
+//     distinct objects. That touch is best-effort: a failure is logged and the
+//     PUT answered;
 //   - a blob GET goes through http.ServeContent, so Range, 206 and 416 are
 //     the standard library's; a blob HEAD restarts the blob's
 //     garbage-collection grace (store.TouchBlob, bounded as below), so a

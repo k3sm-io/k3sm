@@ -69,24 +69,7 @@ func (s *Store) TouchBlob(ctx context.Context, n ref.Name, d digest.Digest) erro
 	if _, err := s.StatBlob(n, d); err != nil {
 		return err
 	}
-	err := s.WithLock(ctx, n, func(l *Locked) error {
-		p, err := s.blobPath(n, d)
-		if err != nil {
-			return err
-		}
-		f, err := openRegular(p, os.O_RDONLY)
-		if errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("%w: %s in %s", ErrBlobUnknown, d, n)
-		}
-		if err != nil {
-			return err
-		}
-		defer f.Close()
-		if err := s.setTimes(f, s.now()); err != nil {
-			return fmt.Errorf("touch blob %s in %s: %w", d, n, err)
-		}
-		return nil
-	})
+	err := s.WithLock(ctx, n, func(l *Locked) error { return l.TouchBlob(d) })
 	if errors.Is(err, ErrRepositoryUnknown) {
 		// GC removed the layout between the stat and the lock.
 		return fmt.Errorf("%w: %s in %s", ErrBlobUnknown, d, n)

@@ -171,10 +171,18 @@ func descriptorDigest(what string, d ispec.Descriptor) (digest.Digest, error) {
 	return d.Digest, nil
 }
 
+// maxManifestTouches is the most distinct objects one manifest PUT touches
+// under the repository lock. A 4 MiB index can name tens of thousands. The touch
+// is best-effort, so the rest are skipped rather than held under the lock.
+const maxManifestTouches = 4096
+
 // checkedManifest is what a PUT needs from a validated body.
 type checkedManifest struct {
 	// needs are the blobs that must already be in the repository.
 	needs []digest.Digest
+	// children are an index's children, which the manifest names without
+	// requiring them.
+	children []digest.Digest
 	// subject is the subject's digest, when the manifest has one.
 	subject digest.Digest
 }
@@ -184,10 +192,18 @@ type checkedManifest struct {
 //   - schemaVersion is 2, and a mediaType field, when present, is mt;
 //   - every descriptor carries a valid digest and a non-negative size;
 //   - a Docker v2 manifest needs its config and every layer present;
-//   - an OCI manifest needs its config and layers present when the config is
-//     an OCI image config or the empty descriptor, except non-distributable
-//     layers; with any other config type nothing is required;
-//   - an index or manifest list requires nothing: children need not exist.
+//   - an OCI manifest needs its config and every layer present, except
+//     non-distributable layers, whatever its config type: the registry this
+//     replaces skips the check for a config type other than an OCI image
+//     config or the empty descriptor, which let an artifact be stored with
+//     a blob the collector had already reaped. A descriptor's inline data
+//     does not stand in for its blob;
+//   - an index or manifest list requires nothing: children need not exist,
+//     and neither need a subject on any manifest. The distribution spec lets a
+//     registry refuse a missing child but says it MUST accept a missing
+//     subject, so that a manifest and its referrers arrive in either order.
+//     A child or subject the repository holds has its grace restarted
+//     (touchList).
 //
 // It also refuses any body with a Docker schema1 fsLayers field, whatever its
 // schemaVersion and media type: the garbage collector (pkg/ociregistry/gc)
@@ -217,9 +233,11 @@ func checkManifest(mt string, body []byte) (checkedManifest, error) {
 			return out, manifestInvalid("mediaType %q is not the Content-Type %q", idx.MediaType, mt)
 		}
 		for _, m := range idx.Manifests {
-			if _, err := descriptorDigest("child", m); err != nil {
+			d, err := descriptorDigest("child", m)
+			if err != nil {
 				return out, err
 			}
+			out.children = append(out.children, d)
 		}
 		return out, subjectOf(idx.Subject, &out)
 	}
@@ -247,12 +265,7 @@ func checkManifest(mt string, body []byte) (checkedManifest, error) {
 			layers = append(layers, d)
 		}
 	}
-	switch {
-	case mt == mediaTypeDockerManifest:
-		out.needs = append([]digest.Digest{cfg}, layers...)
-	case m.Config.MediaType == ispec.MediaTypeImageConfig || m.Config.MediaType == ispec.MediaTypeEmptyJSON:
-		out.needs = append([]digest.Digest{cfg}, layers...)
-	}
+	out.needs = append([]digest.Digest{cfg}, layers...)
 	return out, subjectOf(m.Subject, &out)
 }
 
@@ -324,24 +337,38 @@ func (s *Server) putManifest(w http.ResponseWriter, r *http.Request, n ref.Name)
 		s.fail(w, r, err)
 		return
 	}
-	// The blobs are checked under the repository lock, just before the
-	// index is written, so a garbage-collection sweep (which deletes under
-	// the same lock) cannot remove one between the check and the write.
-	needs := func() error { return s.blobsPresent(n, checked.needs) }
-	if err := needs(); err != nil {
+	if err := s.blobsPresent(n, checked.needs); err != nil {
 		s.fail(w, r, err)
 		return
 	}
 	if s.manifestChecked != nil {
 		s.manifestChecked()
 	}
-	desc, err := s.st.PutManifestChecked(r.Context(), n, rf, mt, body, needs)
+	// The blobs are checked under the repository lock, just before the
+	// index is written, so a garbage-collection sweep (which deletes under
+	// the same lock) cannot remove one between the check and the write, which
+	// is why the check repeats for each tag. A child or subject still there
+	// gets its grace restarted under the same lock, once per request. Nothing
+	// requires those objects, so a failed touch is logged and the PUT answered.
+	touch, skipped := touchList(checked.subject, checked.children)
+	if skipped > 0 {
+		s.log.Warn("registry manifest put: grace touch skipped past the cap", "repository", n.String(), "cap", maxManifestTouches, "skipped", skipped)
+	}
+	underLock := func(l *store.Locked) error {
+		if err := s.blobsPresent(n, checked.needs); err != nil {
+			return err
+		}
+		s.freshen(l, n, touch)
+		touch = nil
+		return nil
+	}
+	desc, err := s.st.PutManifestChecked(r.Context(), n, rf, mt, body, underLock)
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
 	for _, t := range tags {
-		if _, err := s.st.PutManifestChecked(r.Context(), n, ref.Reference{Tag: t}, mt, body, needs); err != nil {
+		if _, err := s.st.PutManifestChecked(r.Context(), n, ref.Reference{Tag: t}, mt, body, underLock); err != nil {
 			s.fail(w, r, err)
 			return
 		}
@@ -372,6 +399,71 @@ func (s *Server) blobsPresent(n ref.Name, needs []digest.Digest) error {
 		}
 	}
 	return nil
+}
+
+// touchList is the objects a PUT restarts the grace of, each once and at most
+// maxManifestTouches, and how many distinct objects the cap left out. The
+// subject comes first: a kept index protects its children, while the collector
+// does not follow a subject, so nothing else keeps it young.
+func touchList(subject digest.Digest, children []digest.Digest) ([]digest.Digest, int) {
+	seen := make(map[digest.Digest]bool, len(children)+1)
+	var list []digest.Digest
+	skipped := 0
+	add := func(d digest.Digest) {
+		if seen[d] {
+			return
+		}
+		seen[d] = true
+		if len(list) == maxManifestTouches {
+			skipped++
+			return
+		}
+		list = append(list, d)
+	}
+	if subject != "" {
+		add(subject)
+	}
+	for _, d := range children {
+		add(d)
+	}
+	return list, skipped
+}
+
+// freshen restarts the GC grace of every object in ds that n holds, under the
+// lock l holds. Nothing in ds is required, so an object n does not hold is
+// skipped and a failure is not the PUT's: as for a HEAD (headTouch), an object
+// that fails is logged and not tried again for half the grace, and one with
+// more than half its grace left is not written. One PUT logs one line, however
+// many objects failed.
+func (s *Server) freshen(l *store.Locked, n ref.Name, ds []digest.Digest) {
+	failed := 0
+	var firstDigest digest.Digest
+	var firstErr error
+	for _, d := range ds {
+		k := touchKey{repo: n.String(), digest: d}
+		if s.touchFails.suppressed(k, s.now()) {
+			continue
+		}
+		b, err := l.StatBlob(d)
+		if err == nil {
+			if s.graceFresh(b.ModTime) {
+				continue
+			}
+			err = l.TouchBlob(d)
+		}
+		if err == nil || errors.Is(err, store.ErrBlobUnknown) {
+			continue
+		}
+		s.touchFails.add(k, s.now().Add(s.gcGrace/2))
+		if failed == 0 {
+			firstDigest, firstErr = d, err
+		}
+		failed++
+	}
+	if failed > 0 {
+		s.log.Warn("registry manifest put: grace touch failed, answering the PUT; no touch of these objects for half the grace",
+			"repository", n.String(), "failed", failed, "digest", firstDigest.String(), "suppress_for", s.gcGrace/2, "err", firstErr)
+	}
 }
 
 // errNamedByIndex is a digest DELETE of a manifest an index in the repository

@@ -102,8 +102,8 @@ func (s *Store) PutManifest(ctx context.Context, n ref.Name, r ref.Reference, me
 // nothing to the index when it fails. The server checks there that every blob
 // the manifest names is still in the repository: a sweep deletes only under
 // the same lock, so a blob present at the check stays until the index names
-// it. check must not take the repository lock.
-func (s *Store) PutManifestChecked(ctx context.Context, n ref.Name, r ref.Reference, mediaType string, body []byte, check func() error) (ispec.Descriptor, error) {
+// it. check holds the lock through its Locked value and must not take it again.
+func (s *Store) PutManifestChecked(ctx context.Context, n ref.Name, r ref.Reference, mediaType string, body []byte, check func(*Locked) error) (ispec.Descriptor, error) {
 	if mediaType == "" {
 		return ispec.Descriptor{}, fmt.Errorf("put manifest in %s: no media type", n)
 	}
@@ -119,9 +119,13 @@ func (s *Store) PutManifestChecked(ctx context.Context, n ref.Name, r ref.Refere
 		return ispec.Descriptor{}, fmt.Errorf("put manifest in %s: %w", n, err)
 	}
 	desc := ispec.Descriptor{MediaType: mediaType, Digest: d, Size: int64(len(body))}
-	err := s.updateIndex(ctx, n, func(rows []ispec.Descriptor) ([]ispec.Descriptor, bool, error) {
+	dir, err := s.repoDir(n)
+	if err != nil {
+		return ispec.Descriptor{}, fmt.Errorf("put manifest in %s: %w", n, err)
+	}
+	err = s.updateIndex(ctx, n, func(rows []ispec.Descriptor) ([]ispec.Descriptor, bool, error) {
 		if check != nil {
-			if err := check(); err != nil {
+			if err := check(&Locked{s: s, n: n, dir: dir}); err != nil {
 				return nil, false, err
 			}
 		}
