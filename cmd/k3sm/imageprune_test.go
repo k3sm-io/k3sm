@@ -28,6 +28,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -171,6 +172,10 @@ type fakePruneRegistry struct {
 	requests  []string
 	users     []string
 	authority []string
+	// collects records each sweep asked for: authority, user, repositories.
+	collects []string
+	sweep    registrysvc.CollectResult
+	sweepErr error
 }
 
 func (z *fakePruneRegistry) delete(_ context.Context, ref name.Digest, _ string, auth authn.Authenticator) error {
@@ -184,6 +189,27 @@ func (z *fakePruneRegistry) delete(_ context.Context, ref name.Digest, _ string,
 	z.users = append(z.users, cfg.Username)
 	z.authority = append(z.authority, ref.Context().RegistryStr())
 	return nil
+}
+
+// collect is the registry's prunedCollector seam: it records each sweep the
+// prune asks for and answers with z.sweep, or z.sweepErr.
+func (z *fakePruneRegistry) collect(_ context.Context, authority string, deleted []registrysvc.StoredManifest, cred registrysvc.Credential) (registrysvc.CollectResult, error) {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	res := z.sweep
+	res.Repositories = nil
+	for _, m := range deleted {
+		if !slices.Contains(res.Repositories, m.Repository) {
+			res.Repositories = append(res.Repositories, m.Repository)
+		}
+	}
+	z.collects = append(z.collects, fmt.Sprintf("%s %s %v", authority, cred.Username, res.Repositories))
+	return res, z.sweepErr
+}
+
+// acceptCollect is a prunedCollector that sweeps nothing and fails nothing.
+func acceptCollect(_ context.Context, _ string, deleted []registrysvc.StoredManifest, _ registrysvc.Credential) (registrysvc.CollectResult, error) {
+	return registrysvc.CollectResult{Repositories: []string{deleted[0].Repository}}, nil
 }
 
 // fakePruneRegistryPort is the port the fake registry's credential names.
@@ -214,7 +240,7 @@ func runPruneCmd(t *testing.T, z *fakePruneRegistry, args []string) (string, err
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	var out bytes.Buffer
-	err = imageCommandWith(ctx, opts, &out, dialRuntimed, z.delete)
+	err = imageCommandWith(ctx, opts, &out, dialRuntimed, z.delete, z.collect)
 	return out.String(), err
 }
 
@@ -246,6 +272,16 @@ type pruneJSON struct {
 			Size       int64  `json:"size"`
 			Error      string `json:"error"`
 		} `json:"failed"`
+		Sweep *struct {
+			Repositories []string `json:"repositories"`
+			Manifests    int      `json:"manifests"`
+			Blobs        int      `json:"blobs"`
+			Bytes        int64    `json:"bytes"`
+			Stopped      []string `json:"stopped"`
+			Failed       []string `json:"failed"`
+			Reviewing    []string `json:"reviewing"`
+			Error        string   `json:"error"`
+		} `json:"sweep"`
 	} `json:"registry"`
 	Cache struct {
 		Blobs          []string       `json:"blobs"`
@@ -351,6 +387,84 @@ func TestImagePruneDryRunReportsRegistryAndCache(t *testing.T) {
 	})
 }
 
+// TestImagePruneForceSweepsThePrunedRepositories proves a forced prune that
+// deleted manifests asks the registry, on loopback and as this node's push
+// user, to sweep exactly the repositories it deleted from, reports what that
+// freed in the table and in -o json, and reports a sweep the brake stopped or
+// that could not run without failing the command. A dry run asks for no sweep.
+func TestImagePruneForceSweepsThePrunedRepositories(t *testing.T) {
+	newPrune := func(t *testing.T) (string, string, *fakePruneRegistry) {
+		t.Helper()
+		workDir := t.TempDir()
+		reg := serveFakePruneRegistry(t, workDir)
+		buildPruneFixture(t, workDir)
+		sock := serveFakeImages(t, &fakeImagesDaemon{pruneResp: &runtimev1.PruneImagesResponse{}})
+		return workDir, sock, reg
+	}
+	wantCollect := registrysvc.LoopbackAuthority(fakePruneRegistryPort) + " k3sm [app multi]"
+
+	t.Run("a dry run asks for no sweep", func(t *testing.T) {
+		workDir, sock, reg := newPrune(t)
+		out, err := runPruneCmd(t, reg, []string{"--socket", sock, "--work-dir", workDir, "prune", "-o", "json"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if doc := decodePrune(t, out); doc.Registry.Sweep != nil || len(reg.collects) != 0 {
+			t.Errorf("dry run: sweep %+v, collects %v; want none", doc.Registry.Sweep, reg.collects)
+		}
+	})
+
+	t.Run("the sweep's frees are reported in json and the table", func(t *testing.T) {
+		workDir, sock, reg := newPrune(t)
+		reg.sweep = registrysvc.CollectResult{Blobs: 4, Bytes: 3 << 20}
+		out, err := runPruneCmd(t, reg, []string{"--socket", sock, "--work-dir", workDir, "prune", "--force", "-o", "json"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Join(reg.collects, ";") != wantCollect {
+			t.Errorf("collects %v; want one, %q", reg.collects, wantCollect)
+		}
+		doc := decodePrune(t, out)
+		if sw := doc.Registry.Sweep; sw == nil || sw.Blobs != 4 || sw.Bytes != 3<<20 || strings.Join(sw.Repositories, ",") != "app,multi" {
+			t.Errorf("json sweep %+v; want app and multi, 4 blobs, %d bytes", sw, 3<<20)
+		}
+		out, err = runPruneCmd(t, reg, []string{"--socket", sock, "--work-dir", workDir, "prune", "--force"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(out, "  swept app, multi: freed 4 blob(s), "+humanBytes(3<<20)+"\n") {
+			t.Errorf("table does not report the sweep:\n%s", out)
+		}
+	})
+
+	t.Run("a braked or failed sweep is reported and the prune still succeeds", func(t *testing.T) {
+		workDir, sock, reg := newPrune(t)
+		reg.sweep = registrysvc.CollectResult{Stopped: []string{"multi"}, Error: "gc multi: mass delete"}
+		out, err := runPruneCmd(t, reg, []string{"--socket", sock, "--work-dir", workDir, "prune", "--force"})
+		if err != nil {
+			t.Fatalf("a braked sweep failed the prune: %v", err)
+		}
+		for _, w := range []string{"sweep stopped by the mass-delete brake, nothing freed: multi", "sweep: gc multi: mass delete"} {
+			if !strings.Contains(out, w) {
+				t.Errorf("table missing %q:\n%s", w, out)
+			}
+		}
+		if len(reg.collects) != 1 {
+			t.Errorf("collects %v; a braked sweep is not retried", reg.collects)
+		}
+
+		workDir, sock, reg = newPrune(t)
+		reg.sweepErr = errors.New("connection refused")
+		out, err = runPruneCmd(t, reg, []string{"--socket", sock, "--work-dir", workDir, "prune", "--force", "-o", "json"})
+		if err != nil {
+			t.Fatalf("an unreachable sweep failed the prune: %v", err)
+		}
+		if sw := decodePrune(t, out).Registry.Sweep; sw == nil || sw.Error != "connection refused" {
+			t.Errorf("json sweep %+v; want the request's error", sw)
+		}
+	})
+}
+
 // TestImagePruneForceDeletesUntaggedThroughTheRegistry proves --force deletes
 // through the registry's API on loopback, as this node's push user, index before child,
 // and never a tagged manifest.
@@ -413,7 +527,7 @@ func TestImagePruneReportsARefusedDeletion(t *testing.T) {
 		return nil
 	}
 	var out bytes.Buffer
-	err = imageCommandWith(context.Background(), opts, &out, dialRuntimed, refuse)
+	err = imageCommandWith(context.Background(), opts, &out, dialRuntimed, refuse, acceptCollect)
 	if !errors.Is(err, errPruneIncomplete) {
 		t.Fatalf("err = %v; want errPruneIncomplete", err)
 	}
@@ -512,7 +626,7 @@ func TestImagePruneRechecksEachPlannedDigestBeforeItsDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
-	if err := imageCommandWith(ctx, opts, &out, dialRuntimed, del); err != nil {
+	if err := imageCommandWith(ctx, opts, &out, dialRuntimed, del, acceptCollect); err != nil {
 		t.Fatalf("image prune --force: %v\n%s", err, out.String())
 	}
 
@@ -608,7 +722,7 @@ func TestImagePruneRecheckAppliesTheKeepClosure(t *testing.T) {
 		t.Fatal(err)
 	}
 	var buf bytes.Buffer
-	if err := imageCommandWith(ctx, opts, &buf, dialRuntimed, del); err != nil {
+	if err := imageCommandWith(ctx, opts, &buf, dialRuntimed, del, acceptCollect); err != nil {
 		t.Fatalf("image prune --force: %v\n%s", err, buf.String())
 	}
 	out := buf.String()
@@ -731,7 +845,7 @@ func TestImagePruneReportsRecheckSkips(t *testing.T) {
 					t.Fatal(err)
 				}
 				var out bytes.Buffer
-				if err := imageCommandWith(ctx, opts, &out, dialRuntimed, del); err != nil {
+				if err := imageCommandWith(ctx, opts, &out, dialRuntimed, del, acceptCollect); err != nil {
 					t.Fatalf("image prune --force: %v\n%s", err, out.String())
 				}
 
