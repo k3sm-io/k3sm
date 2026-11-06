@@ -215,7 +215,8 @@ pin, its date, and the tarball's sha256.
   backup merged over a live registry. Before, the images whose rows went were deleted at the next sweep.
   The registry records each repository's row count under `<work-dir>/registry-state/rows/`, and the
   sweep's log line names the record to remove once the index is as it should be. A registry from an
-  earlier build records its counts at the first sweep and is never stopped by a missing record.
+  earlier build records its counts at the first sweep and is never stopped by a missing record. The
+  registry guide's section on restoring a backup says how to check the rows and clear the stop.
 - A push to the registry that would take a repository's `index.json` past 64 MiB, the most the registry
   reads, now fails and changes nothing. With very many tags such a push used to succeed and leave the
   repository unreadable, its tags undeletable included. The refused push answers `403 DENIED` saying the

@@ -554,10 +554,36 @@ repositories stopped and failed and carries the error.
 Restore into an emptied `<work-dir>/registry/`, with the server stopped. Do not merge a backup over
 a live registry (`rsync` without `--delete`, or `tar -x` into the directory as it stands).
 
-A merge keeps the live `<work-dir>/registry/.k3sm-store-id`, and the collector cannot tell a
-restored `index.json` from a push. In a repository it has already reviewed, the next sweep can
-delete what the restored `index.json` no longer names, such as anything pushed after the backup was
-taken. A repository the merge adds is reported on first, like any new one.
+A merge keeps the live `<work-dir>/registry/.k3sm-store-id`, and the collector cannot always tell a
+restored `index.json` from a push. A repository the merge adds is reported on first, like any new one.
+
+The registry records how many rows it last wrote to each repository's `index.json`, in a file under
+`<work-dir>/registry-state/rows/`. When a merge leaves an `index.json` with fewer rows than that, for
+example because tags were pushed after the backup was taken, every sweep of that repository stops
+and deletes nothing in it, so the blobs of the rows the merge dropped are kept. The other
+repositories are swept as usual. The `registry gc: sweep finished` line carries the error,
+`index.json holds fewer rows than the store recorded`, with the repository's name, both row counts
+and the path of its record.
+
+To let sweeps of that repository run again:
+
+1. Check that its tags are the ones you intend to keep, for example with
+   `curl -s http://localhost:6450/v2/<repository>/tags/list` on the Mac. Push or tag again
+   anything the merge dropped that you still want. A push alone does not clear the stop.
+2. Remove the repository's record. The error prints its path. The file name is also the SHA-256 of
+   the repository's name, so for `team/app`:
+
+   ```sh
+   sudo rm <work-dir>/registry-state/rows/$(printf '%s' team/app | shasum -a 256 | cut -d' ' -f1)
+   ```
+
+The next sweep records the rows `index.json` holds now and sweeps the repository. Anything the
+remaining rows no longer name is then deleted once it is past the grace period, so do the check in
+step 1 first.
+
+A merge that leaves an `index.json` with as many rows as before, or more, is not detected. In a
+repository the collector has already reviewed, the next sweep can delete what that `index.json` no
+longer names.
 
 If you must merge, or already have, stop the server and remove the id file before you start it
 again:
@@ -604,6 +630,11 @@ Nothing is deleted in any of these cases. Each shows on every sweep in the
   once per pass over a repository, and at most 4 MiB of it, so the extra reading is bounded by the
   number of blobs the repository holds, and the memory by the digests those blobs name, each held
   once however often a body repeats it. A cancelled sweep stops before its next read.
+- **`index.json holds fewer rows than the store recorded`.** Rows went from that repository's
+  `index.json` without the registry removing them, as after a backup merged over a live registry.
+  The sweep of that repository stops and the others go on. See
+  [Restoring a Backup of the Registry](#restoring-a-backup-of-the-registry) for how to check the
+  rows and clear the stop.
 - **`would delete more than half`.** The half-repository brake stopped the sweep of that repository,
   and a `registry gc: sweep stopped` line says how many blobs it held back. Check that the
   repository's tags are the ones you expect.
