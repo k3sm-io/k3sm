@@ -68,7 +68,10 @@
 #           turns into `present`. So the journal cannot show a second push, and the
 #           leg reads the registry's own log: no `registry manifest pushed` line for a
 #           repository the journal names since the re-run began. The node still reports
-#           the source digest in status.images (nothing was deleted)
+#           the source digest in status.images (nothing was deleted). The trap untags
+#           every tag this run's migrate created under an ois- prefix, which the
+#           worker's cached images of earlier runs bring back, and reports the others
+#           (one left by a digest-only cached image is expected) and any older ois- tag
 #   ois.10  server down: with io.k3sm.server booted out, both worker app pods still
 #           answer HTTP on their pod IPs, and a worker `image pull` of app:uncached
 #           fails, while the same pull of app:control succeeded just before; the
@@ -162,7 +165,7 @@ LEGS=(
 # documents are `k3sm image ls -o json`, `k3sm image prune -o json` and the
 # `k3sm image migrate -o json` journal. The log-* ops read registry.log lines instead.
 OIS_PY='
-import json, sys
+import json, re, sys
 op, a = sys.argv[1], sys.argv[2:]
 d = {}
 if op.startswith("log-"):
@@ -242,6 +245,21 @@ elif op == "mig-finished":
         names.add(repo + "@" + tag)
         names.add(repo + "@" + p.get("digest", ""))
     print("\n".join(sorted(names)))
+elif op == "mig-tags":
+    # What a migrate left in the registry, from the journal and the image ls taken
+    # before it: test, a tag it created under an ois- prefix; other, a tag it created
+    # elsewhere; older, an ois- tag already there that is not this run (a[1], a[2]).
+    # a[3] is the seed target the trap already untags.
+    reg, run, ns, seed = a[0:4]
+    with open(a[4]) as f:
+        before = {i.get("reference") for i in json.load(f).get("images") or []}
+    prefixed = re.compile(re.escape(reg) + r"/ois-[a-z0-9._/-]*:[A-Za-z0-9_][A-Za-z0-9._-]*$")
+    created = {r.get("target") for r in d.get("images") or [] if r.get("target")} - before - {seed}
+    for t in sorted(created):
+        print(("test" if prefixed.match(t) else "other") + "\t" + t)
+    for t in sorted(before):
+        if prefixed.match(t) and t != seed and not t.startswith((reg + "/" + run + "/", reg + "/" + ns + "/")):
+            print("older\t" + t)
 elif op == "log-pushes":
     for r in log_records():
         name = str(r.get("repository")) + "@" + str(r.get("reference"))
@@ -528,12 +546,12 @@ plan() {
 
 # ---- --self-test --------------------------------------------------------------------------
 
-# self_test_rerun: the re-run's verdict, on fixtures. The first
+# self_test_rerun: the re-run's verdict and the trap's tag plan, on fixtures. The first
 # row is the shape a real re-run leaves, which an assertion of `present` calls red. The
 # rows named mutant are what a re-run that re-pushes would leave: the journal alone
 # cannot tell the first of them from the good one.
 self_test_rerun() {
-	local dir rec_m rec_p line_alpine line_other f want first second window expect out verdict
+	local dir rec_m rec_p line_alpine line_other f want got first second window expect out verdict
 	dir="$(mktemp -d "${TMPDIR:-/tmp}/ois-rerun.XXXXXX")"
 	rec_m='{"reference":"alpine:3.20","sources":["sha256:0a"],"outcome":"migrated","target":"registry-k3sm:6450/alpine:3.20","digest":"sha256:0a"}'
 	rec_p='{"reference":"alpine:3.20","sources":["sha256:0a"],"outcome":"present","target":"registry-k3sm:6450/alpine:3.20","digest":"sha256:0a"}'
@@ -573,6 +591,17 @@ migrated|migrated|restarted|restarted:a registry restart leaves the log unable t
 migrated|noseed|quiet|no record:the seed gone from the re-run's journal
 ROWS
 	check "$(grep -q '"registry manifest pushed"' "$REPO_ROOT/pkg/ociregistry/api/manifests.go" && grep -q '"registry server serving"' "$REPO_ROOT/pkg/registrysvc/serve.go" && echo ok)" "the registry still logs the two lines rerun_verdict reads"
+
+	line_other='{"images":[{"reference":"registry-k3sm:6450/ois-1/app:v1"},{"reference":"registry-k3sm:6450/ois-9/app:v1"},{"reference":"registry-k3sm:6450/ois-9-lab/vm:v1"},{"reference":"registry-k3sm:6450/lib/kept:v1"},{"reference":"registry-k3sm:6450/ois-2/app:v1"}]}'
+	printf '%s' "$line_other" >"$dir/before.json"
+	line_alpine='{"images":['
+	for f in ois-3/app:v1 ois-3/pusher:v1 ois-premig:v2 ois-2/app:v1 ois-9/app:v1 k3sm-io/metrics-server:k3sm-migrated-fb27ce1da560 lib/kept:v1 xois-3/app:v1 k3sm-io/ois-3/app:v1 alpine:3.20; do
+		line_alpine="$line_alpine{\"reference\":\"r\",\"target\":\"registry-k3sm:6450/$f\"},"
+	done
+	line_alpine="$line_alpine{\"reference\":\"c\",\"outcome\":\"cached\"}]}"
+	got="$(printf '%s' "$line_alpine" | ojson mig-tags registry-k3sm:6450 ois-9 ois-9-lab registry-k3sm:6450/alpine:3.20 "$dir/before.json" | tr '\t\n' '= ')"
+	want="other=registry-k3sm:6450/k3sm-io/metrics-server:k3sm-migrated-fb27ce1da560 other=registry-k3sm:6450/k3sm-io/ois-3/app:v1 test=registry-k3sm:6450/ois-3/app:v1 test=registry-k3sm:6450/ois-3/pusher:v1 test=registry-k3sm:6450/ois-premig:v2 other=registry-k3sm:6450/xois-3/app:v1 older=registry-k3sm:6450/ois-1/app:v1 older=registry-k3sm:6450/ois-2/app:v1 "
+	check "$([ "$got" = "$want" ] && echo ok)" "mig-tags: only a tag this migrate created under ois- is test; the run's, the seed's and a pre-existing tag are not (got $got)"
 	rm -rf "$dir"
 }
 
@@ -832,6 +861,7 @@ log() { printf '%s\n' "$*" | tee -a "$RUNLOG"; }
 # Everything the trap undoes is recorded as it is created.
 TAGS_CREATED=""
 MIGRATED_TARGET=""
+MIGRATE_RAN=""
 REMOTE_DIR=""
 LOCAL_DIR=""
 SERVER_DOWN=0
@@ -852,6 +882,35 @@ server_up() {
 	return 1
 }
 
+# reap_migrate_tags: untag what this run's migrate created under an ois- prefix and
+# report what it created elsewhere. A worker's cache keeps the images of earlier runs
+# and no verb evicts one entry, so its journal's re-check finds their tags gone and
+# pushes them again on every run. The journal is read here, not in the leg, so a leg
+# that stops short still has its tags removed.
+# shellcheck disable=SC2329 # invoked by the EXIT trap
+reap_migrate_tags() {
+	[ -n "$MIGRATE_RAN" ] || return 0
+	local report="$EVIDENCE/ois.9-final-report.json" plan ref removed=0 failed="" other older
+	if ! on "$(ssh_of "$SEED_NODE")" 'sudo -n k3sm image migrate --report -o json' >"$report" 2>"$EVIDENCE/ois.9-final-report.err" ||
+		! plan="$(ojson mig-tags "$REG" "$RUN" "$NS" "$MIGRATED_TARGET" "$EVIDENCE/ois.9-image-ls-before.json" <"$report")"; then
+		log "cleanup: could not read $SEED_NODE's migration journal; tags its migrate created under ois- may remain"
+		return 0
+	fi
+	printf '%s\n' "$plan" >"$EVIDENCE/ois.9-migrate-tags.txt"
+	for ref in $(printf '%s\n' "$plan" | awk -F'\t' '$1 == "test" { print $2 }'); do
+		if on_server "sudo -n k3sm image untag '$ref'" >>"$EVIDENCE/cleanup-untag.txt" 2>&1; then
+			removed=$((removed + 1))
+		else
+			failed="$failed $ref"
+		fi
+	done
+	log "cleanup: untagged $removed tag(s) this run's migrate created under ois-${failed:+; could not untag:$failed}"
+	other="$(printf '%s\n' "$plan" | awk -F'\t' '$1 == "other" { print $2 }' | tr '\n' ' ')"
+	[ -z "$other" ] || log "cleanup: left, not test tags, created by this run's migrate: $other"
+	older="$(printf '%s\n' "$plan" | grep -c '^older' || true)"
+	[ "$older" = 0 ] || log "cleanup: $older ois- tag(s) from earlier runs are in the registry, not touched (ois.9-migrate-tags.txt)"
+}
+
 # shellcheck disable=SC2329 # invoked by the EXIT trap
 cleanup() {
 	set +e
@@ -866,6 +925,7 @@ cleanup() {
 	for ref in $TAGS_CREATED $MIGRATED_TARGET; do
 		on_server "sudo -n k3sm image untag '$ref'" >>"$EVIDENCE/cleanup-untag.txt" 2>&1
 	done
+	reap_migrate_tags
 	stop_prune_stub
 	# The tags are gone, the pods that pulled and pushed are gone, and these names are
 	# unique to this run, so nothing writes here now. A blob another repository shares
@@ -1306,6 +1366,7 @@ leg_migrate() {
 		return 1
 	}
 	seed_ssh="$(ssh_of "$SEED_NODE")"
+	MIGRATE_RAN=1
 	first="$(on "$seed_ssh" 'sudo -n k3sm image migrate -o json' 2>"$EVIDENCE/ois.9-first.err" | tee "$EVIDENCE/ois.9-first.json")" || {
 		DETAIL="image migrate on $SEED_NODE failed"
 		return 1
