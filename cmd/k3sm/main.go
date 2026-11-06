@@ -53,7 +53,7 @@ Commands ("server", "agent", "node", "netd", "install", "uninstall", "stop", "st
   builder     manage the in-cluster buildkitd engine (builder up|down|delete|status|buildx)
   image       ingest, publish and reclaim this node's images (image load|import|push|pull|tag|untag|inspect|save|prune|ls|df|migrate)
   registry    mint the cluster registry's push token for any OCI tool, through your kubeconfig (registry token|login)
-  kubectl     run the bundled kubectl against this cluster (KUBECONFIG preset)
+  kubectl     run the bundled kubectl against this cluster (KUBECONFIG preset); under sudo your own kubectl plugins do not run
   kubeconfig  print the admin kubeconfig, or --write/merge it into ~/.kube/config
   status      show what is running (daemons, apiserver, node, workloads, data root; status top for CPU and memory) — the exit code is the verdict, see k3sm status --help
   alerts      only what needs attention, each with its cause, fix steps and docs page (-o json)

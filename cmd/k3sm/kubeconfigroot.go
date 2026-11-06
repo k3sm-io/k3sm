@@ -188,18 +188,27 @@ func fillHandoff(f *os.File, data []byte) error {
 	return err
 }
 
-// rootKubectlEnv is kubectl's environment as root: KUBECONFIG is the handoff, and
-// HOME is root's, since kubectl reads its preferences from there and a preference
-// can name another kubeconfig. KUBERC, which names that file directly, is dropped.
+// rootKubectlPath is kubectl's PATH as root: system directories, each root-owned.
+// A person's own kubectl plugins, which kubectl finds on PATH, run only without
+// sudo.
+const rootKubectlPath = "/usr/bin:/bin:/usr/sbin:/sbin"
+
+// rootKubectlEnv is kubectl's environment as root: KUBECONFIG is the handoff, HOME
+// is root's, since kubectl reads its preferences from there and a preference can
+// name another kubeconfig, and PATH is rootKubectlPath. KUBERC, which names that
+// file directly, and XDG_*, which name other places kubectl reads and caches, are
+// dropped.
 func rootKubectlEnv(env []string, kubeconfig, home string) []string {
-	out := make([]string, 0, len(env)+2)
+	out := make([]string, 0, len(env)+3)
 	for _, kv := range env {
 		switch {
-		case strings.HasPrefix(kv, "KUBECONFIG="), strings.HasPrefix(kv, "KUBERC="), strings.HasPrefix(kv, "HOME="):
+		case strings.HasPrefix(kv, "KUBECONFIG="), strings.HasPrefix(kv, "KUBERC="), strings.HasPrefix(kv, "HOME="),
+			strings.HasPrefix(kv, "PATH="), strings.HasPrefix(kv, "XDG_"):
 		default:
 			out = append(out, kv)
 		}
 	}
+	out = append(out, "PATH="+rootKubectlPath)
 	if home != "" {
 		out = append(out, "HOME="+home)
 	}

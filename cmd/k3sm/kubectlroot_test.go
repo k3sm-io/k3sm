@@ -17,7 +17,6 @@ limitations under the License.
 package main
 
 import (
-	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -151,8 +150,7 @@ func TestResolveKubectlAsRootDefaultInstall(t *testing.T) {
 	tree["/private/var/lib/k3sm/server/bin/kubectl"] = fakeNode{serviceUID, 0o755}
 	check := fakeExecCheck(tree, map[string]string{"/var": "/private/var"})
 
-	noPath := func(string) (string, error) { return "", errors.New("not on PATH") }
-	got, err := resolveKubectlAsRoot(workDir, install.DefaultInstallDir, check, noPath)
+	got, err := resolveKubectlAsRoot(workDir, install.DefaultInstallDir, check)
 	if err != nil {
 		t.Fatalf("resolveKubectlAsRoot: %v", err)
 	}
@@ -165,7 +163,6 @@ func TestResolveKubectlAsRootCandidates(t *testing.T) {
 	const (
 		workDir    = "/custom/work"
 		installDir = "/Library/k3sm"
-		pathBin    = "/usr/local/bin/kubectl"
 	)
 	workBin := executor.KubectlPath(workDir)
 	installedBin := installedKubectl(installDir)
@@ -183,36 +180,31 @@ func TestResolveKubectlAsRootCandidates(t *testing.T) {
 		tree[bin] = fakeNode{501, 0o755}
 		return tree
 	}
-	onPath := func(string) (string, error) { return pathBin, nil }
-	noPath := func(string) (string, error) { return "", errors.New("not on PATH") }
 
 	tests := []struct {
-		name     string
-		tree     map[string]fakeNode
-		lookPath func(string) (string, error)
-		want     string
-		wantErr  []string
+		name    string
+		tree    map[string]fakeNode
+		want    string
+		wantErr []string
 	}{
-		{name: "a root-owned work dir kubectl comes first", tree: merge(rootTree(workBin), rootTree(installedBin)), lookPath: noPath, want: workBin},
-		{name: "a work dir kubectl with another owner falls to the installed one", tree: merge(owned(workBin), rootTree(installedBin)), lookPath: noPath, want: installedBin},
-		{name: "PATH is the last candidate and is checked", tree: merge(owned(workBin), rootTree(pathBin)), lookPath: onPath, want: pathBin},
+		{name: "a root-owned work dir kubectl comes first", tree: merge(rootTree(workBin), rootTree(installedBin)), want: workBin},
+		{name: "a work dir kubectl with another owner falls to the installed one", tree: merge(owned(workBin), rootTree(installedBin)), want: installedBin},
 		{
-			name:     "no candidate passes: each reason and what to do",
-			tree:     merge(owned(workBin), owned(pathBin)),
-			lookPath: onPath,
+			name: "no candidate passes: each reason and what to do",
+			tree: owned(workBin),
 			wantErr: []string{
 				"no kubectl to run as root",
 				workBin + " is owned by uid 501, not root",
 				installedBin + ": does not exist",
-				pathBin + " is owned by uid 501, not root",
 				"run `sudo k3sm install` to restore " + installedBin,
 				"or run `k3sm kubectl` without sudo",
+				"your own kubectl plugins",
 			},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := resolveKubectlAsRoot(workDir, installDir, fakeExecCheck(tt.tree, nil), tt.lookPath)
+			got, err := resolveKubectlAsRoot(workDir, installDir, fakeExecCheck(tt.tree, nil))
 			if tt.wantErr != nil {
 				if err == nil {
 					t.Fatalf("resolveKubectlAsRoot = %q, want an error", got)
@@ -245,9 +237,9 @@ func asRoot(t *testing.T) {
 	t.Cleanup(func() { kubeconfigHandoffDir = prevDir })
 }
 
-// TestKubectlAsRootNeverExecsAWrongOwnerBinary runs the whole verb as root over
+// TestKubectlAsRootRunsOnlyARootOwnedBinary runs the whole verb as root over
 // a work dir this test account owns, whose kubectl fails the check on its owner.
-func TestKubectlAsRootNeverExecsAWrongOwnerBinary(t *testing.T) {
+func TestKubectlAsRootRunsOnlyARootOwnedBinary(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("the fixture's owner is the test account, which must not be root")
 	}
@@ -307,6 +299,40 @@ func TestKubectlAsRootNeverExecsAWrongOwnerBinary(t *testing.T) {
 			t.Errorf("exec'd %q, want nothing", execed)
 		}
 	})
+}
+
+// TestKubectlAsRootDoesNotTakeOneFromPATH puts a kubectl that would pass the check
+// on the caller's PATH, and nothing else.
+func TestKubectlAsRootDoesNotTakeOneFromPATH(t *testing.T) {
+	asRoot(t)
+	workDir := t.TempDir()
+	writeInlineKubeconfig(t, executor.KubeconfigPath(workDir))
+	t.Setenv("K3SM_WORK_DIR", workDir)
+	t.Setenv("SUDO_USER", "")
+	dir := t.TempDir()
+	onPath := filepath.Join(dir, "kubectl")
+	if err := os.WriteFile(onPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+
+	prevCheck := kubectlExecCheck
+	t.Cleanup(func() { kubectlExecCheck = prevCheck })
+	kubectlExecCheck = fakeExecCheck(rootTree(onPath), nil)
+	prevExec := kubectlExec
+	t.Cleanup(func() { kubectlExec = prevExec })
+	kubectlExec = func(bin string, _, _ []string) error {
+		t.Errorf("exec'd %s", bin)
+		return nil
+	}
+
+	err := runKubectl([]string{"get", "pods"})
+	if err == nil || !strings.Contains(err.Error(), "no kubectl to run as root") {
+		t.Fatalf("runKubectl = %v, want the refusal", err)
+	}
+	if strings.Contains(err.Error(), onPath) {
+		t.Errorf("the refusal names %s as a candidate: %v", onPath, err)
+	}
 }
 
 // writeInlineKubeconfig writes a kubeconfig whose only credential is inline.

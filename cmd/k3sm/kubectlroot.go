@@ -66,7 +66,7 @@ func lstatOwner(path string) (uint32, fs.FileMode, error) {
 //
 // darwin has no fexecve, so the exec is by path. That path has no link left in
 // it, and it and each of its parents is root-owned with no group or other write
-// bit, so only root can replace any of them between this check and the exec.
+// bit, so the check still holds at the exec.
 func (c rootExecCheck) resolve(path string) (string, error) {
 	if !filepath.IsAbs(path) {
 		return "", errors.New("is not an absolute path")
@@ -127,16 +127,14 @@ func describeLookupError(err error) error {
 	return err
 }
 
-// resolveKubectlAsRoot picks the kubectl root runs: the same candidates in the
-// same order as resolveKubectlIn, each one checked. A candidate that fails is
-// skipped, so a default install lands on the root-owned tree `k3sm install`
-// stages (<install dir>/bin/kubectl), whichever account owns the work dir.
-// K3SM_WORK_DIR only names a candidate, which is checked like the others.
-func resolveKubectlAsRoot(workDir, installDir string, check rootExecCheck, lookPath func(string) (string, error)) (string, error) {
+// resolveKubectlAsRoot picks the kubectl root runs: the two install locations of
+// resolveKubectlIn, in its order, each one checked, and nothing from the caller's
+// PATH. A candidate that fails is skipped, so a default install lands on the
+// root-owned tree `k3sm install` stages (<install dir>/bin/kubectl), whichever
+// account owns the work dir. K3SM_WORK_DIR only names a candidate, which is checked
+// like the others.
+func resolveKubectlAsRoot(workDir, installDir string, check rootExecCheck) (string, error) {
 	candidates := []string{executor.KubectlPath(workDir), installedKubectl(installDir)}
-	if p, err := lookPath("kubectl"); err == nil {
-		candidates = append(candidates, p)
-	}
 	reasons := make([]string, 0, len(candidates))
 	for _, p := range candidates {
 		resolved, err := check.resolve(p)
@@ -145,6 +143,6 @@ func resolveKubectlAsRoot(workDir, installDir string, check rootExecCheck, lookP
 		}
 		reasons = append(reasons, fmt.Sprintf("%s: %v", p, err))
 	}
-	return "", fmt.Errorf("no kubectl to run as root: it must be root-owned and not group- or world-writable, with every parent directory the same (%s); run `sudo k3sm install` to restore %s, or run `k3sm kubectl` without sudo",
+	return "", fmt.Errorf("no kubectl to run as root: it must be root-owned and not group- or world-writable, with every parent directory the same (%s); run `sudo k3sm install` to restore %s, or run `k3sm kubectl` without sudo, which also runs your own kubectl plugins",
 		strings.Join(reasons, "; "), installedKubectl(installDir))
 }

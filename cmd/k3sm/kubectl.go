@@ -42,7 +42,8 @@ var kubectlExec func(bin string, argv []string, env []string) error = syscall.Ex
 // the control-plane work dir's admin kubeconfig (KUBECONFIG preset), with the
 // bundled kubectl the server downloaded into that work dir. Root makes the same
 // choice from checked files and a checked kubectl, and hands kubectl the bytes it
-// checked (rootKubeSources.resolve, resolveKubectlAsRoot). An ordinary
+// checked, on a fixed PATH and with no XDG_* (rootKubeSources.resolve,
+// resolveKubectlAsRoot, rootKubectlEnv). An ordinary
 // user cannot read that directory — it is mode 0700 and owned by the service
 // user — so for them k3sm falls back to kubectl's own kubeconfig loading rules
 // ($KUBECONFIG, else ~/.kube/config) pinned to the context
@@ -303,7 +304,7 @@ func userKubeconfigCandidates(kubeconfigEnv, home string) []string {
 // the first candidate that exists.
 func resolveKubectl(workDir string) (string, error) {
 	if processEuid() == 0 {
-		return resolveKubectlAsRoot(workDir, install.DefaultInstallDir, kubectlExecCheck, exec.LookPath)
+		return resolveKubectlAsRoot(workDir, install.DefaultInstallDir, kubectlExecCheck)
 	}
 	return resolveKubectlIn(workDir, install.DefaultInstallDir, fileExists, exec.LookPath)
 }

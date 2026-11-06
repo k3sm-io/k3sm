@@ -385,10 +385,41 @@ func TestKubeconfigHandoff(t *testing.T) {
 }
 
 func TestRootKubectlEnv(t *testing.T) {
-	got := rootKubectlEnv([]string{"PATH=/bin", "HOME=" + envHome, "KUBECONFIG=/a", "KUBERC=/b", "KUBECONFIG=/c"}, "/dev/fd/9", rootHome)
-	want := []string{"PATH=/bin", "HOME=" + rootHome, "KUBECONFIG=/dev/fd/9"}
+	got := rootKubectlEnv([]string{
+		"PATH=/Users/alice/bin:/usr/bin", "LANG=C", "HOME=" + envHome, "KUBECONFIG=/a", "KUBERC=/b", "KUBECONFIG=/c",
+		"XDG_CONFIG_HOME=/Users/alice/.config", "XDG_CACHE_HOME=/Users/alice/.cache", "XDG_RUNTIME_DIR=/x",
+	}, "/dev/fd/9", rootHome)
+	want := []string{"LANG=C", "PATH=" + rootKubectlPath, "HOME=" + rootHome, "KUBECONFIG=/dev/fd/9"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("env = %q, want %q", got, want)
+	}
+}
+
+// TestRootKubectlPathIsSystemDirectoriesOnly pins the list against the check root
+// holds kubectl to, on this Mac's real directories.
+func TestRootKubectlPathIsSystemDirectoriesOnly(t *testing.T) {
+	for _, dir := range filepath.SplitList(rootKubectlPath) {
+		if !filepath.IsAbs(dir) {
+			t.Errorf("%q is not absolute", dir)
+		}
+		resolved, err := filepath.EvalSymlinks(dir)
+		if err != nil {
+			t.Errorf("%s: %v", dir, err)
+			continue
+		}
+		for d := resolved; ; d = filepath.Dir(d) {
+			uid, mode, err := lstatOwner(d)
+			if err != nil {
+				t.Errorf("%s: %v", d, err)
+				break
+			}
+			if err := rootOwnedNotWritable(d, uid, mode); err != nil {
+				t.Errorf("%s: %v", dir, err)
+			}
+			if d == filepath.Dir(d) {
+				break
+			}
+		}
 	}
 }
 
@@ -398,6 +429,50 @@ func useInstalledKubectl(t *testing.T) {
 	prev := kubectlExecCheck
 	kubectlExecCheck = fakeExecCheck(rootTree(installedKubectl(install.DefaultInstallDir)), nil)
 	t.Cleanup(func() { kubectlExecCheck = prev })
+}
+
+// TestKubeconfigHandoffServesOneLoader reads the handoff through client-go's loader
+// the way kubectl does, repeatedly, and pins why that has to be one loader: the
+// descriptor's offset is shared, so a second loader finds nothing left to read.
+func TestKubeconfigHandoffServesOneLoader(t *testing.T) {
+	prev := kubeconfigHandoffDir
+	kubeconfigHandoffDir = t.TempDir()
+	t.Cleanup(func() { kubeconfigHandoffDir = prev })
+	c, err := checkKubeconfig([]byte(inlineKubeconfigText), "/f", "k3sm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, path, err := c.handoff()
+	if err != nil {
+		t.Fatalf("handoff: %v", err)
+	}
+	defer f.Close()
+
+	rules := &clientcmd.ClientConfigLoadingRules{ExplicitPath: path}
+	loader := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, &clientcmd.ConfigOverrides{})
+	for i := range 3 {
+		cfg, err := loader.ClientConfig()
+		if err != nil {
+			t.Fatalf("ClientConfig %d: %v", i, err)
+		}
+		if cfg.Host != "https://192.0.2.1:6443" || cfg.BearerToken != "inline-token" {
+			t.Errorf("ClientConfig %d = host %q, token %q", i, cfg.Host, cfg.BearerToken)
+		}
+		raw, err := loader.RawConfig()
+		if err != nil {
+			t.Fatalf("RawConfig %d: %v", i, err)
+		}
+		if raw.CurrentContext != "k3sm" {
+			t.Errorf("RawConfig %d current context = %q", i, raw.CurrentContext)
+		}
+	}
+	second, err := clientcmd.LoadFromFile(path)
+	if err != nil {
+		t.Fatalf("second load: %v", err)
+	}
+	if len(second.Clusters) != 0 {
+		t.Errorf("a second loader read %d clusters, want none: the offset is shared", len(second.Clusters))
+	}
 }
 
 // TestKubectlAsRootHandsOverTheCheckedBytes runs the verb as root and reads what
@@ -410,6 +485,8 @@ func TestKubectlAsRootHandsOverTheCheckedBytes(t *testing.T) {
 	t.Setenv("K3SM_WORK_DIR", workDir)
 	t.Setenv("SUDO_USER", "")
 	t.Setenv("KUBERC", "/elsewhere/kuberc")
+	t.Setenv("PATH", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", "/elsewhere/config")
 
 	var (
 		calls  int
@@ -440,15 +517,18 @@ func TestKubectlAsRootHandsOverTheCheckedBytes(t *testing.T) {
 		t.Errorf("exec calls = %d, token through the handoff = %q", calls, loaded)
 	}
 	for _, kv := range gotEnv {
-		if strings.HasPrefix(kv, "KUBERC=") || kv == "KUBECONFIG="+executor.KubeconfigPath(workDir) {
+		if strings.HasPrefix(kv, "KUBERC=") || strings.HasPrefix(kv, "XDG_") || kv == "KUBECONFIG="+executor.KubeconfigPath(workDir) {
 			t.Errorf("exec env carries %q", kv)
+		}
+		if path, ok := strings.CutPrefix(kv, "PATH="); ok && path != rootKubectlPath {
+			t.Errorf("exec PATH = %q, want %q", path, rootKubectlPath)
 		}
 	}
 }
 
-// TestExecEntryNeverRunsAsRoot loads a kubeconfig with an exec entry through each
-// verb as root: a refusal each time, and the entry's program never starts.
-func TestExecEntryNeverRunsAsRoot(t *testing.T) {
+// TestRootAcceptsOnlyInlineCredentials loads a kubeconfig with an exec entry through each
+// verb as root: a refusal each time, and the entry's program does not start.
+func TestRootAcceptsOnlyInlineCredentials(t *testing.T) {
 	asRoot(t)
 	useInstalledKubectl(t)
 	t.Setenv("SUDO_USER", "")
