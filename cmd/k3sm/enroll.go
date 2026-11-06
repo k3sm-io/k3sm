@@ -40,7 +40,6 @@ import (
 	coordinationv1client "k8s.io/client-go/kubernetes/typed/coordination/v1"
 	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
 
 	netv1 "k3sm.io/apis/net/v1"
 	"k3sm.io/darwin-net/pkg/podnet"
@@ -657,7 +656,7 @@ func listMeshPeers(ctx context.Context, client rest.Interface) ([]netv1.MeshPeer
 // refuse to bring the mesh up.
 func meshPeerLister(kubeconfig string) func(context.Context) ([]netv1.MeshPeerSpec, error) {
 	var client rest.Interface
-	cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	cfg, err := agentRESTConfig(kubeconfig)
 	if err != nil {
 		err = fmt.Errorf("load kubeconfig for the MeshPeer list: %w", err)
 	} else {

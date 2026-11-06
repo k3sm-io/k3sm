@@ -232,6 +232,8 @@ pin, its date, and the tarball's sha256.
   install warns; remove it and run `sudo k3sm install` if the cluster's CA really changed.
 - `k3sm netd` as root with a `--kubeconfig` an install did not write now needs `--cluster-ca` naming a root-owned
   CA. Without one it starts no informers, denies privileged binds, and logs what to pass.
+- An agent run as root accepts only inline credentials in the kubeconfigs its mesh watcher, MeshPeer list and
+  node-local datapath read.
 - A worker's root helper, `sudo k3sm kubectl` and the other root verbs on a worker, and `k3sm stop` and `k3sm start`
   there, verify the apiserver's certificate against the kubernetes Service address, `10.43.0.1`, which
   every apiserver certificate carries and no other certificate of the cluster does. They still connect to the

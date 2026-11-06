@@ -37,7 +37,6 @@ import (
 	"time"
 
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
 
 	netv1 "k3sm.io/apis/net/v1"
 	"k3sm.io/darwin-net/pkg/dns"
@@ -49,7 +48,6 @@ import (
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/hostnet"
 	"k3sm.io/k3sm/pkg/install"
-	"k3sm.io/k3sm/pkg/kubeclient"
 	"k3sm.io/k3sm/pkg/netserve"
 	"k3sm.io/k3sm/pkg/ports"
 	"k3sm.io/k3sm/pkg/update"
@@ -1164,7 +1162,7 @@ func bringUpMesh(ctx context.Context, in meshBringUp, mode hostnet.Mode, logger 
 	// peer out of the seed. Its error is CARRIED rather than returned here: on the
 	// join path the initial program has always run before a bad kubeconfig ends the
 	// bring-up, and that order is preserved exactly.
-	restCfg, restErr := clientcmd.BuildConfigFromFlags("", in.kubeconfig)
+	restCfg, restErr := agentRESTConfig(in.kubeconfig)
 	if in.resume {
 		// The resume path reports it IMMEDIATELY. A kubeconfig that will not load is
 		// a bring-up that cannot list peers and cannot start a watcher, so spending
@@ -1461,7 +1459,7 @@ func restConfigHost(cfg *rest.Config) string {
 // process (rot.start): the datapath is never restarted for a
 // renewal, its connections are.
 func startWorkerNetserve(ctx context.Context, opts agentOptions, res *bootstrap.JoinResult, mode hostnet.Mode, netserveKubeconfig string, rot workerNetserveRotation, logger *slog.Logger) (*netserve.Server, error) {
-	restCfg, _, err := kubeclient.FromPath(netserveKubeconfig)
+	restCfg, err := agentRESTConfig(netserveKubeconfig)
 	if err != nil {
 		return nil, fmt.Errorf("load the netserve kubeconfig for the node-local datapath: %w", err)
 	}
