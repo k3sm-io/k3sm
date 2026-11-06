@@ -43,6 +43,8 @@
 #        finishes, the Update ends Cancelled, the cluster stays mixed
 #   w.2  a candidate withdrawn with no cancel: the server fails at download and the roll
 #        stops; cancel has nothing to cancel, and abort clears the cordon and annotations
+#   w.3  a candidate withdrawn before the first node's GET is answered: that node fails on
+#        the 404, the server is never started, no node moves, abort clears
 #   e.1  the namespace, the Update and the UpdatePolicy are gone
 #   e.2  both Macs are back on this tree's build, Ready, with the test index forgotten
 #   e.3  no label or taint another workload owns was lost (reported, never repaired)
@@ -55,6 +57,11 @@
 # release's tarball, and darwin-net's extractUpdateArchive refuses a member outside its
 # set, so K3SM_B1240_KEEP_MANIFEST=1 packs publish.sh's shape, to see what a published
 # release does on this path.
+#
+# When a withdrawal happens. Node phase Downloading does not say a GET has been made: the
+# controller writes it at the handover, before the node has read it. So w.1 and w.2
+# withdraw once the index has logged the worker's 200, which is when its file is open, and
+# w.3 holds the worker's GET at the index, withdraws, then lets the GET be answered.
 #
 # Run it detached: it takes over an hour. One poll or remote step is bounded, and the
 # legs poll until their own budgets end. It takes the rig for the run; one rig run at a
@@ -117,7 +124,8 @@ TAG_RC2="v0.91.0-rc.2"
 TAG_FINAL="v0.91.0"
 TAG_W1="v0.92.0-rc.1"
 TAG_W2="v0.92.0-rc.2"
-ALL_TAGS="$TAG_BASE $TAG_RC1 $TAG_RC2 $TAG_FINAL $TAG_W1 $TAG_W2"
+TAG_W3="v0.92.0-rc.3"
+ALL_TAGS="$TAG_BASE $TAG_RC1 $TAG_RC2 $TAG_FINAL $TAG_W1 $TAG_W2 $TAG_W3"
 INDEX_PATH="/k3sm/releases"
 GITHUB_BASE="https://github.com/k3sm-io/k3sm/releases"
 
@@ -162,6 +170,7 @@ LEGS=(
 	"z.1|the final published: rc offers it, and rc.2 rolls to it"
 	"w.1|a candidate withdrawn mid-roll, then cancel: mixed, Cancelled, nothing cordoned"
 	"w.2|withdrawn with no cancel: the server fails at download, the roll stops, abort clears"
+	"w.3|withdrawn before the first node's GET: it fails on the 404, the roll stops, abort clears"
 	"e.1|the namespace, the Update and the UpdatePolicy are gone"
 	"e.2|both Macs on this tree's build, Ready, the test index forgotten"
 	"e.3|no label or taint another workload owns was lost"
@@ -264,9 +273,11 @@ EOF
 
 # index_py: the test release index, in GitHub's layout under one base path. It serves
 # what sits in <root>/published/<tag>/, so publishing and withdrawing a release are one
-# rename, and a download in flight keeps its open file across a withdrawal. <root>/throttle
-# holds how many seconds one archive should take, read again as it streams, so a leg can
-# hold a node in Downloading and then let it go. It binds loopback only.
+# rename, and a download in flight keeps its open file across a withdrawal: the 200 is
+# logged only once the file is open. <root>/throttle holds how many seconds one archive
+# should take, read again as it streams, so a leg can hold a node in Downloading and then
+# let it go. While <root>/gate exists an archive GET is logged as 102 and waits, and is
+# answered from what is published when the gate goes. It binds loopback only.
 index_py() {
 	cat <<'PY'
 import http.server, json, os, re, socketserver, sys, time, urllib.parse
@@ -312,16 +323,25 @@ class H(http.server.BaseHTTPRequestHandler):
         self.reply(200, json.dumps(v).encode(), "application/json")
     def download(self, tag, name):
         path = os.path.join(root, "published", tag, name)
-        if not (TAG.match(tag) and FILE.match(name) and os.path.isfile(path)):
+        if not (TAG.match(tag) and FILE.match(name)):
             return self.reply(404, b"not found")
-        self.note(200)
-        size = os.path.getsize(path)
-        self.send_response(200)
-        self.send_header("Content-Length", str(size))
-        self.end_headers()
-        if self.command == "HEAD":
-            return
-        with open(path, "rb") as f:
+        gate = os.path.join(root, "gate")
+        if name.endswith(".tar.gz") and os.path.exists(gate):
+            self.note(102)
+            while os.path.exists(gate):
+                time.sleep(0.2)
+        try:
+            f = open(path, "rb")
+        except OSError:
+            return self.reply(404, b"not found")
+        with f:
+            self.note(200)
+            size = os.fstat(f.fileno()).st_size
+            self.send_response(200)
+            self.send_header("Content-Length", str(size))
+            self.end_headers()
+            if self.command == "HEAD":
+                return
             sent = 0
             while sent < size:
                 block = f.read(1 << 20)
@@ -434,7 +454,7 @@ kw() { rsh "$WORKER" sudo "$K3SM_BIN" "$@"; }
 plan() {
 	local row
 	echo "B1240 managed-updates tracer: what a K3SM_LAB=1 run does, in order."
-	echo "tags: stable $TAG_BASE; candidates $TAG_RC1, $TAG_RC2; final $TAG_FINAL; withdrawn $TAG_W1, $TAG_W2"
+	echo "tags: stable $TAG_BASE; candidates $TAG_RC1, $TAG_RC2; final $TAG_FINAL; withdrawn $TAG_W1, $TAG_W2, $TAG_W3"
 	echo "index: http://127.0.0.1:$PORT$INDEX_PATH on the server, forwarded to the worker's loopback"
 	echo "clean start: sudo k3sm stop on each Mac, remove <data root>/updates, assert absent, install, assert recreated"
 	for row in "${LEGS[@]}"; do
@@ -449,7 +469,7 @@ plan() {
 fake_k3sm() {
 	cat <<'FAKE'
 #!/usr/bin/env python3
-import json, os, re, shlex, sys, urllib.request, urllib.error
+import json, os, re, shlex, subprocess, sys, urllib.request, urllib.error
 st_dir, brk, host = os.environ["FAKE_STATE"], os.environ.get("FAKE_BREAK", ""), os.environ.get("FAKE_HOST", "srv")
 argv, path = sys.argv[1:], os.path.join(os.environ["FAKE_STATE"], "cluster.json")
 NODES = {"srv": "node-s", "wrk": "node-w"}
@@ -511,6 +531,18 @@ def fetch(n, tag):
         return True
     except urllib.error.HTTPError:
         return False
+# The withdrawal legs' tags move as a real node does: Downloading comes first, and the GET
+# reaches the index a moment later, from another process. A withdrawal timed on the phase
+# alone turns that GET into a 404. (a.1 and b.1 still read the count at Downloading.)
+def async_fetch(tag):
+    return tag.startswith("v0.92.")
+def fetch_file(n, tag):
+    return os.path.join(st_dir, "fetch-%s-%s" % (n, tag))
+def fetch_later(n, tag):
+    url = s["base"].get(n) + "/download/" + tag + "/k3sm_" + tag[1:] + "_darwin_arm64.tar.gz"
+    sh = 'sleep 0.5; /usr/bin/curl -s -o /dev/null --max-time 20 -w "%{http_code}" "$1" >"$2.tmp"; mv "$2.tmp" "$2"'
+    subprocess.Popen(["/bin/sh", "-c", sh, "sh", url, fetch_file(n, tag)], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 def tick():
     u = s["update"]
     if u is None or u["finished"]:
@@ -532,6 +564,11 @@ def tick():
                 return
             s["cord"][name] = True
             row["phase"] = "Downloading"
+            if async_fetch(u["version"]):
+                row["held"] = 0
+                if not (brk == "no-get" and u["version"] == "v0.92.0-rc.1"):
+                    fetch_later(name, u["version"])
+                return
             if not fetch(name, u["version"]):
                 row.update(phase="Failed", message="fetch the archive: http 404 Not Found")
                 u.update(phase="Failed", finished=True)
@@ -539,6 +576,16 @@ def tick():
             row["held"] = 0
             return
         if row["phase"] == "Downloading":
+            if async_fetch(u["version"]):
+                if not os.path.exists(fetch_file(name, u["version"])):
+                    return
+                if open(fetch_file(name, u["version"])).read() != "200":
+                    row.update(phase="Failed", message="fetch the archive: http 404 Not Found")
+                    u.update(phase="Failed", finished=True)
+                    if brk == "past-failure":
+                        s["cord"][SRV] = True
+                        u["nodes"][-1]["phase"] = "Downloading"
+                    return
             row["held"] += 1
             if row["held"] < 4 or (brk == "no-resume" and s.get("bounced")):
                 return
@@ -807,6 +854,22 @@ self_test() {
 	check "$([ "$out" = "$u" ] && echo ok)" "index: with no final, latest lands on the base ($out)"
 	grep -q ' GET /k3sm/releases/download/v0.90.0/k3sm_0.90.0_darwin_arm64.tar.gz 200 ' "$dir/access.log" && sum=ok || sum=no
 	check "$sum" "index: a download is in the access log"
+	mv "$dir/withdrawn/v0.90.0" "$dir/published/"
+	: >"$dir/gate"
+	curl -s -o /dev/null -w '%{http_code}' "$u/download/v0.90.0/k3sm_0.90.0_darwin_arm64.tar.gz" >"$tmp/held.code" &
+	code=$!
+	for _ in 1 2 3 4 5 6 7 8 9 10; do
+		if grep -q ' GET /k3sm/releases/download/v0.90.0/k3sm_0.90.0_darwin_arm64.tar.gz 102 ' "$dir/access.log"; then break; fi
+		sleep 0.3
+	done
+	grep -q ' GET /k3sm/releases/download/v0.90.0/k3sm_0.90.0_darwin_arm64.tar.gz 102 ' "$dir/access.log" && sum=ok || sum=no
+	check "$sum" "index: a gated GET is logged as 102"
+	check "$([ ! -s "$tmp/held.code" ] && echo ok)" "index: a gated GET is not answered"
+	mv "$dir/published/v0.90.0" "$dir/withdrawn/"
+	rm -f "$dir/gate"
+	wait "$code" || true
+	out="$(cat "$tmp/held.code")"
+	check "$([ "$out" = 404 ] && echo ok)" "index: a GET gated across a withdrawal answers 404 ($out)"
 	if lsof -nP -a -p "$pid" -iTCP -sTCP:LISTEN 2>/dev/null | grep -q "127.0.0.1:$port"; then check ok "index: binds loopback only"; else check no "index: binds loopback only"; fi
 	kill "$pid" 2>/dev/null || true
 	wait "$pid" 2>/dev/null || true
@@ -893,7 +956,7 @@ self_test() {
 	for row in no-updates-row:c.1 forward-dead:f.1 cel-name:p.1 cel-value:p.2 stable-rc:s.1 \
 		roll-on-set:r.1 worker-row:r.2 server-first:a.1 stays-cordoned:a.2 no-resume:b.1 \
 		server-restart-fails:b.2 pod-fails:b.3 no-refuse:l.2 mid-channel:m.1 no-fallback:w.1 \
-		cancel-ignored:w.1 abort-keeps-cordon:w.2 leftover:e.1 base-left:e.2 label-lost:e.3; do
+		cancel-ignored:w.1 no-get:w.1 abort-keeps-cordon:w.2 past-failure:w.3 leftover:e.1 base-left:e.2 label-lost:e.3; do
 		(
 			brk="${row%%:*}"
 			want="${row#*:}"
@@ -1158,6 +1221,22 @@ hold_downloads() { idx "printf '%s' $1 >$INDEX_DIR/throttle"; }
 fetches_of() {
 	idx "grep -c ' GET $INDEX_PATH/download/$1/$(archive_name "$1") ' $INDEX_DIR/access.log || true"
 }
+# archive_answers <tag> <code>: the archive GETs the index logged with this code for tag.
+archive_answers() {
+	idx "grep -c ' GET $INDEX_PATH/download/$1/$(archive_name "$1") $2 ' $INDEX_DIR/access.log || true"
+}
+# wait_archive <tag> <code>: 0 once the index has logged an archive GET with this code.
+wait_archive() {
+	local deadline=$((SECONDS + READY_TIMEOUT)) n
+	while [ "$SECONDS" -lt "$deadline" ]; do
+		n="$(archive_answers "$1" "$2")"
+		[ "${n:-0}" -ge 1 ] && return 0
+		sleep "$POLL"
+	done
+	return 1
+}
+gate_downloads() { idx ": >$INDEX_DIR/gate"; }
+open_gate() { idx "rm -f $INDEX_DIR/gate"; }
 forward_up() {
 	rsh "$WORKER" curl -fsS --max-time 10 -o /dev/null "$TEST_BASE" </dev/null >/dev/null 2>&1
 }
@@ -1699,6 +1778,10 @@ leg_withdraw_cancel() {
 		leg w.1 no "the worker never reported Downloading"
 		return 1
 	fi
+	if ! wait_archive "$TAG_W1" 200; then
+		leg w.1 no "the index served the worker no archive within ${READY_TIMEOUT}s"
+		return 1
+	fi
 	withdraw "$TAG_W1" || return 1
 	offers "$TAG_FINAL" && listed=1 || listed=0
 	detail="after the withdrawal: $CHECK"
@@ -1730,6 +1813,10 @@ leg_withdraw_fail() {
 		leg w.2 no "the worker never reported Downloading"
 		return 1
 	fi
+	if ! wait_archive "$TAG_W2" 200; then
+		leg w.2 no "the index served the worker no archive within ${READY_TIMEOUT}s"
+		return 1
+	fi
 	withdraw "$TAG_W2" || return 1
 	hold_downloads 0
 	wait_roll "$ROLL_TIMEOUT" || true
@@ -1755,6 +1842,58 @@ leg_withdraw_fail() {
 	if [ "$ok" = 1 ]; then leg w.2 ok "$detail"; else leg w.2 no "$detail"; fi
 }
 
+# The first node of a roll meets the 404 itself. The GET is held at the index across the
+# withdrawal, so this is the node's own fetch failing, not a race for one.
+leg_withdraw_first() {
+	local detail ok=1 before msg phase server_phase got gone out ann
+	read_nodes || true
+	before="$SERVER_VER $WORKER_VER"
+	publish "$TAG_W3" || return 1
+	offers "$TAG_W3" || log "note: $CHECK (want $TAG_W3 offered)"
+	gate_downloads
+	apply_roll || {
+		leg w.3 no "apply failed ($EVIDENCE/apply.log)"
+		return 1
+	}
+	if ! wait_node_phase "$WORKER_NODE" Downloading "$ROLL_TIMEOUT"; then
+		leg w.3 no "the worker never reported Downloading"
+		return 1
+	fi
+	if ! wait_archive "$TAG_W3" 102; then
+		leg w.3 no "the worker's GET did not reach the index within ${READY_TIMEOUT}s"
+		return 1
+	fi
+	withdraw "$TAG_W3" || return 1
+	open_gate
+	wait_roll "$ROLL_TIMEOUT" || true
+	read_nodes || true
+	phase="$(st 'node("'"$WORKER_NODE"'").get("phase","")')"
+	msg="$(st 'node("'"$WORKER_NODE"'").get("message","")')"
+	server_phase="$(st 'node("'"$SERVER_NODE"'").get("phase","")')"
+	got="$(archive_answers "$TAG_W3" 200)"
+	gone="$(archive_answers "$TAG_W3" 404)"
+	[ "$ROLL_END" = Failed ] && [ "$phase" = Failed ] && [ "$server_phase" = Pending ] || ok=0
+	case "$msg" in *404*) ;; *) ok=0 ;; esac
+	[ "$SERVER_VER $WORKER_VER" = "$before" ] && [ "$CORDONED" = "$WORKER_NODE" ] || ok=0
+	[ "${got:-0}" = 0 ] && [ "${gone:-0}" = 1 ] || ok=0
+	detail="ended '$ROLL_END'; the worker $phase: '$(cut -c1-120 <<<"$msg")'; the server $server_phase; archive answers 200:${got:-0} 404:${gone:-0}; nodes '$SERVER_VER $WORKER_VER', were '$before'; cordoned '${CORDONED:-none}'"
+	out="$(k update cancel </dev/null 2>&1)" || ok=0
+	case "$out" in *"nothing to cancel"*) detail="$detail; cancel: nothing to cancel" ;; *)
+		ok=0
+		detail="$detail; cancel said '$(cut -c1-120 <<<"$out")'"
+		;;
+	esac
+	k update abort </dev/null >>"$RUNLOG" 2>&1 || {
+		ok=0
+		detail="$detail; abort failed"
+	}
+	read_nodes || true
+	ann="$(nodes_doc 2>/dev/null | J '" ".join(k for i in d["items"] for k in i["metadata"].get("annotations",{}) if k.startswith("k3sm.io/update-"))')" || ann="unreadable"
+	[ -z "$CORDONED" ] && [ -z "$ann" ] || ok=0
+	detail="$detail; after abort cordoned '${CORDONED:-none}', annotations '${ann:-none}'"
+	if [ "$ok" = 1 ]; then leg w.3 ok "$detail"; else leg w.3 no "$detail"; fi
+}
+
 run_legs() {
 	leg_clean || return 0
 	leg_forward || return 0
@@ -1769,6 +1908,7 @@ run_legs() {
 	leg_final || return 0
 	leg_withdraw_cancel || return 0
 	leg_withdraw_fail || return 0
+	leg_withdraw_first || return 0
 }
 
 # ---- putting the rig back ---------------------------------------------------------------------
@@ -1781,7 +1921,10 @@ put_back() {
 	set +e
 	exec 3</dev/null
 	log "==> putting the rig back"
-	if [ "$INDEX_UP" = 1 ]; then hold_downloads 0; fi
+	if [ "$INDEX_UP" = 1 ]; then
+		hold_downloads 0
+		open_gate
+	fi
 	if [ "$RIG_TOUCHED" = 1 ]; then
 		if read_status && [ -n "$(st 'd.get("version","")')" ] && [ "$(st 'd.get("finished",False)')" != True ]; then
 			k update abort </dev/null >>"$RUNLOG" 2>&1
