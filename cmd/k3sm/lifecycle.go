@@ -209,7 +209,7 @@ func joinedWorkers(sys install.System, dataRoot string) func(ctx context.Context
 		if err != nil {
 			return 0, err
 		}
-		_, cs, err := kubeclient.FromPath(kubeconfig)
+		_, cs, err := kubeclient.FromCheckedPath(kubeconfig)
 		if err != nil {
 			return 0, fmt.Errorf("load kubeconfig %s: %w", kubeconfig, err)
 		}
@@ -264,7 +264,7 @@ func nodeMarker(sys install.System, dataRoot string) func(ctx context.Context, s
 
 // kubeconfigClient is the client a kubeconfig file gives.
 func kubeconfigClient(path string) (kubernetes.Interface, error) {
-	_, cs, err := kubeclient.FromPath(path)
+	_, cs, err := kubeclient.FromCheckedPath(path)
 	return cs, err
 }
 

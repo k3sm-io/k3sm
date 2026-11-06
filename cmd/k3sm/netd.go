@@ -582,6 +582,8 @@ func authorizerFailureReason(err error) (reason string, class authorizerFailureC
 	switch {
 	case !errors.As(err, &unusable):
 		return "", failDebug, 0
+	case errors.Is(err, kubeclient.ErrCredentialsNotInline):
+		return "the kubeconfig netd was handed has credentials that are not inline, and netd accepts only inline credentials", failImmediate, 0
 	case unusable.missing:
 		return "the kubeconfig netd was handed still does not exist, long after a server boot would have written it", failWindowed, missingKubeconfigWarnAfter
 	default:
@@ -596,12 +598,13 @@ const serviceInformerSyncTimeout = 10 * time.Second
 
 // startServiceInformer loads kubeconfig, builds a client, and hands off to
 // runServiceInformer. It returns a retryable error if the kubeconfig is
-// absent/unreadable, the client can't be built, or the cache doesn't sync in time.
+// absent/unreadable, holds credentials that are not inline, the client can't be
+// built, or the cache doesn't sync in time.
 func startServiceInformer(ctx context.Context, kubeconfig string) (corev1listers.ServiceLister, error) {
 	if _, err := os.Stat(kubeconfig); err != nil {
 		return nil, fmt.Errorf("stat kubeconfig: %w", kubeconfigUnusableError{err: err, missing: errors.Is(err, fs.ErrNotExist)})
 	}
-	_, cs, err := kubeclient.FromPath(kubeconfig)
+	_, cs, err := kubeclient.FromCheckedPath(kubeconfig)
 	if err != nil {
 		return nil, fmt.Errorf("load kubeconfig: %w", kubeconfigUnusableError{err: err})
 	}

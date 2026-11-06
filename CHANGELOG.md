@@ -144,6 +144,12 @@ pin, its date, and the tarball's sha256.
 
 ### Changed
 
+- `k3sm netd`, and the node marking and worker count around `k3sm stop`, `start` and `restart`, accept
+  only inline credentials in the kubeconfig they load. A user with `exec`, `auth-provider`, `tokenFile`,
+  `client-certificate`, `client-key` or an `as` impersonation key, or a cluster with `certificate-authority`,
+  is refused. The kubeconfigs k3sm writes already hold everything inline, so an installed node sees no
+  change. For a refused file, netd logs a warning naming the file and the reason, denies binds below 1024
+  and keeps retrying, and the lifecycle verbs report the refusal in their load error.
 - A node refuses a GPU pod with a `FailedGPUFit` Event when the units held under `mlx.k3sm.io/gpu` and
   `k3sm.io/gpu` together, plus the pod's own, pass the node's GPU slot count. This now holds for pods that
   name only `mlx.k3sm.io/gpu`, and on a node whose GPU memory ceiling is unknown: a pod bound past the
