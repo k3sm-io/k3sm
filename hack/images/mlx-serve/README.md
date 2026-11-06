@@ -54,7 +54,9 @@ processor adds after the template are not counted.
 
 **Remote media URLs are refused.** `k3sm_serve` refuses every image, video or
 audio URL that is not a `data:` URL, including a local path; a client sends media
-inline as a base64 `data:` URL. vllm-mlx 0.5.0 would otherwise fetch an `http(s)`
+inline as a base64 `data:image/`, `data:video/` or `data:audio/` URL, the prefixes
+the engine's own classifiers take, and any other `data:` URL is refused too.
+vllm-mlx 0.5.0 would otherwise fetch an `http(s)`
 URL through `vllm_mlx/models/mllm.py`'s `download_image`, `download_video` and
 `download_audio`. Its `_validate_url_safety` rejects a name that resolves to a
 non-global address, but `requests` resolves the name again to connect, so a name

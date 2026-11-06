@@ -648,6 +648,11 @@ server._validate_remote_media_urls(data)
 check("data  a data: URL of each kind passes, and upstream's validator still runs",
       len(SEEN) == 1 and SEEN[0] is data)
 
+check("data.kinds  a data: URL that is not image, video or audio is refused, as the engine's classifiers would not take it",
+      all(refused(typed(k, u)) for k in KINDS for u in (
+          "data:text/html;base64,AAAA", "data:application/pdf;base64,AAAA", "data:,hello", "data:",
+          "data:image", "data:;base64,AAAA", "DATA:image/png;base64,AAAA", " data:image/png;base64,AAAA")))
+
 def fetch_moved(url, timeout=30, max_size=MAX_IMAGE_SIZE):
     return url
 def check_moved(messages):
@@ -868,6 +873,10 @@ for rname, path, shape in (("chat", "/v1/chat/completions", chat), ("responses",
             r = post(path, shape(p), stream)
             verdict("real.%s.raw.%s  the shape answers 400 with no lookup, request or engine call" % (tag, name),
                     r.status_code == 400 and ks.MEDIA_REFUSAL in r.text and LOOKUPS == [] and FETCHES == [] and RAN == [], r)
+        for kind in KINDS:
+            r = post(path, shape(part(kind, "data:text/html;base64,AAAA")), stream)
+            verdict("real.%s.%s.datakind  a data: URL of another media type answers 400 before the engine" % (tag, kind),
+                    r.status_code == 400 and ks.MEDIA_REFUSAL in r.text and RAN == [], r)
         r = post(path, shape(raw({"type": "audio_url", "audio_url": {"url": "/etc/passwd"}})), stream)
         verdict("real.%s.localpath  an audio local path answers 400" % tag,
                 r.status_code == 400 and ks.MEDIA_REFUSAL in r.text and RAN == [], r)
@@ -902,10 +911,10 @@ PY
 			*)  ladder no "serve.image.remote.driver  $verdict $name" ;;
 		esac
 	done <<< "$out"
-	if [ "$checks" -ge 113 ]; then
+	if [ "$checks" -ge 125 ]; then
 		ladder ok "serve.image.remote.real.count  all $checks real-engine checks reported"
 	else
-		ladder no "serve.image.remote.real.count  only $checks of 113 real-engine checks reported (the driver crashed?)"
+		ladder no "serve.image.remote.real.count  only $checks of 125 real-engine checks reported (the driver crashed?)"
 		tail -15 "$WORK/serve-image-real.err"
 	fi
 }

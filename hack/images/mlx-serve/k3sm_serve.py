@@ -11,7 +11,8 @@ plus completion would not fit the engine's context window is refused with HTTP
 400, the way vLLM enforces max_model_len, instead of being served. It also
 patches the prefill mask of mlx-lm's rotating cache so the cache's attention
 sinks stay attended (see The attention sinks, below). It refuses every image,
-video or audio URL that is not a data: URL (see Remote media URLs, below).
+video or audio URL that is not an inline data: URL of that family (see Remote
+media URLs, below).
 
 Why the guard exists. vllm-mlx 0.5.0 has no max-model-len option and does no
 prompt-length validation: its only per-sequence bound is --max-kv-size, which
@@ -118,7 +119,10 @@ non-global address, but requests resolves the name again for the connection, so 
 name that answers differently the second time (DNS rebinding) reaches an internal
 address, and any global address is still a blind GET from the pod. An audio input
 that is a local path is taken as it is. The image has no use for any of this: a
-client sends media inline as a data: URL. install_media_guard wraps
+client sends media inline as a data:image/, data:video/ or data:audio/ URL, the
+prefixes the engine's own is_base64_image, is_base64_video and is_base64_audio
+take; any other data: URL has no reader in the engine and is refused too.
+install_media_guard wraps
 server._validate_remote_media_urls, so each route refuses such a request with its
 own HTTP 400 before a response starts, and replaces the three download functions,
 the only ones that fetch a request's media, so no other path reaches the network
@@ -446,7 +450,12 @@ MEDIA_CHECK_SHA256 = "f437b299963f5cbd461ebe4ea6128f8f4e86a2b43522f1bd331fd709fb
 # in the package reads input_image, input_audio or input_file.
 MEDIA_KEYS = ("image_url", "image", "video_url", "video", "audio_url", "audio")
 MEDIA_URL_TYPES = ("image", "video", "audio")
-MEDIA_REFUSAL = "remote media URLs are not fetched by this server; send the media inline as a data: URL"
+MEDIA_REFUSAL = ("remote media URLs are not fetched by this server; send the media inline as a data:image/, "
+                 "data:video/ or data:audio/ URL")
+# What vllm-mlx 0.5.0's is_base64_image, is_base64_video and is_base64_audio
+# (models/mllm.py) recognize as inline media. str.startswith is their test too, so
+# the check has the same case and whitespace behaviour as the engine's.
+MEDIA_DATA_PREFIXES = ("data:image/", "data:video/", "data:audio/")
 
 
 def source_shape(func):
@@ -501,7 +510,7 @@ def media_values(messages):
 
 
 def install_media_guard(server, mllm):
-    """Refuse every media URL that is not a data: URL, on a vllm-mlx engine.
+    """Refuse every media URL that is not an inline media data: URL, on a vllm-mlx engine.
 
     server is vllm_mlx.server and mllm is vllm_mlx.models.mllm, parameters so the
     guard can be exercised against fakes. Nothing is replaced unless every
@@ -523,7 +532,7 @@ def install_media_guard(server, mllm):
     def check_media_guarded(messages):
         for value in media_values(messages):
             url = value.get("url") if isinstance(value, dict) else value
-            if not isinstance(url, str) or not url.startswith("data:"):
+            if not isinstance(url, str) or not url.startswith(MEDIA_DATA_PREFIXES):
                 raise refusal(MEDIA_REFUSAL, public_message=MEDIA_REFUSAL)
         check_media(messages)
 
