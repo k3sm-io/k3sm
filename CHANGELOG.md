@@ -130,6 +130,7 @@ pin, its date, and the tarball's sha256.
 - `k3sm dev up` no longer reports an instance up over a server that has already exited. It used to
   rely on its own record of the exit, which could lag, and on a process check that counts an exited
   but unreaped process as running. `k3sm dev list` and `k3sm dev down` now treat that state as dead too.
+- A referrers request on the k3sm registry server stops reading manifests when its client goes away, and gives its build slot back for the next request, which carries on from what was read.
 - `k3sm` and the etcd, kine and zot it builds now link `github.com/klauspost/compress` v1.20.2, which fixes GO-2026-6865, a panic on two-block frames. Every node re-stages kine and zot on upgrade.
 - Turning Spotlight indexing off for the data volume no longer waits indefinitely on `mdutil`. The
   `.metadata_never_index` marker is what excludes the volume and is written first, so the `mdutil`
