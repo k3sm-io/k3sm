@@ -44,8 +44,8 @@ import (
 // index under its own lock, and its GC reclaims the blobs.
 
 // PruneGrace is how old an untagged manifest must be before prune deletes it.
-// It equals zot's own GC delay (gcDelay, pinned equal by a test), for the same
-// reason: a multi-platform push uploads its per-platform manifests untagged
+// It equals the server's GC grace (serveGCGrace, pinned equal by a test), for
+// the same reason: a multi-platform push uploads its per-platform manifests untagged
 // BEFORE the index that names them, and a prune that deleted them in that
 // window would fail the push.
 const PruneGrace = time.Hour

@@ -53,7 +53,11 @@ import (
 // Timings of the server process.
 const (
 	// serveGCGrace and serveGCInterval are the store's garbage-collection
-	// cadence, the values of gcDelay and gcInterval; a test pins that they agree.
+	// cadence; a test pins both. The grace protects a just-uploaded blob that
+	// nothing references yet, and shortening it would let a sweep race a slow
+	// push. The interval is six hours because an ingest registry's write pattern
+	// is a person pushing a handful of images, not a fleet churning tags, and an
+	// hourly walk of the store buys nothing on that pattern.
 	serveGCGrace    = time.Hour
 	serveGCInterval = 6 * time.Hour
 	// serveStatusEvery is how often the server reports its live upload sessions

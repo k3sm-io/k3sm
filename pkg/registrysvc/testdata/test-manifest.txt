@@ -45,7 +45,8 @@ TestPreflightPortRefusesAHeldPort kept the behaviour it pins is unchanged by the
 TestProcargsArgv kept the behaviour it pins is unchanged by the child switch
 TestProvisionWritesTheChildsConfig added new with the child switch
 TestPruneDeleteIsConditionalOnPlannedState kept prune works on the store, which is unchanged
-TestPruneGraceIsTheGCDelay kept prune works on the store, which is unchanged
+TestPruneGraceIsTheGCDelay deleted gcDelay is gone; TestPruneGraceIsTheGCGrace holds the assertion
+TestPruneGraceIsTheGCGrace added prune keeps the grace the server collects with
 TestPruneThroughTheStore kept prune works on the store, which is unchanged
 TestPublishAdvertisement kept the relay and cluster publication do not touch the child
 TestPublishFlatService kept the relay and cluster publication do not touch the child
@@ -70,10 +71,11 @@ TestRelayStopsOnContextCancel kept the relay and cluster publication do not touc
 TestRelayVerifiesAtTheNodePortAddress kept the relay and cluster publication do not touch the child
 TestRemoveAdvertisement kept the relay and cluster publication do not touch the child
 TestRemoveServices kept the relay and cluster publication do not touch the child
-TestRenderConfigDisablesWholeTransferTimeouts kept the zot config renderer stays until zot leaves the build
-TestRenderConfigIsDeterministic kept the zot config renderer stays until zot leaves the build
-TestRenderConfigRefusesNonLoopback kept the zot config renderer stays until zot leaves the build
-TestRenderConfigShape kept the zot config renderer stays until zot leaves the build
+TestRenderConfigDisablesWholeTransferTimeouts deleted the zot renderer is gone; the server has no whole-transfer timeout, pinned in pkg/ociregistry/api
+TestRenderConfigIsDeterministic deleted the zot renderer is gone; TestRenderServeConfigIsDeterministic holds the assertion
+TestRenderConfigRefusesNonLoopback deleted the zot renderer is gone; TestValidateForServingRefusesNonLoopback holds the assertion
+TestRenderConfigShape deleted the zot renderer is gone; TestStoreRootIsTheStateDir and TestServeGCCadence hold what the server keeps, and pkg/ociregistry pins access and Docker media types
+TestRenderServeConfigIsDeterministic added moved from the zot renderer
 TestRepositoriesFindsNestedLayoutsOnly kept prune works on the store, which is unchanged
 TestRestartRebindsTheIngestPort rewritten reclaim now runs the same cases over the k3sm child argv as well as the zot argv
 TestServeAuthorizesAndReports added new with the child switch
@@ -81,7 +83,8 @@ TestServeConfig rewritten renderServeConfig takes the server settings; the princ
 TestServeConfigServerFields added new with the child switch
 TestServeDropsRootBeforeTheStoreOpens added new with the child switch
 TestServeExitsWhenItsParentDies added new with the child switch
-TestServeGCCadenceMatchesTheChild added new with the child switch
+TestServeGCCadence added the cadence the zot config set, pinned on the server
+TestServeGCCadenceMatchesTheChild deleted the child config is gone; TestServeGCCadence holds the assertion
 TestServeLogsAPush added new with the child switch
 TestServeRefusesBeforeTheStoreOpens added new with the child switch
 TestServeStateDirHardening kept the behaviour it pins is unchanged by the child switch
@@ -100,8 +103,10 @@ TestSpawnRefusesAnUnsafeLog added the spawn opens registry.log as the server doe
 TestStartRefusesARootDaemon added new with the child switch
 TestStateUpdatesDoNotLoseWrites added new with the child switch
 TestStoreLeavesZotsDatabasesAlone added new with the child switch
+TestStoreRootIsTheStateDir added the store root the zot config set, pinned on the server
 TestTestManifestIsComplete added new with the child switch
 TestVMNetGateway kept the push gate is unchanged
+TestValidateForServingRefusesNonLoopback added moved from the zot renderer
 TestWatchParent added new with the child switch
 TestWorkDirLayout kept the behaviour it pins is unchanged by the child switch
 TestWriteCredential kept the credential files are unchanged

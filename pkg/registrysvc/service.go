@@ -176,9 +176,9 @@ func resolvedExecutable() (string, error) {
 }
 
 // validateBind rejects any bind that is not a loopback address, and any port
-// outside the usable range. It is shared by New and renderConfig so the address
-// written into the child's config cannot differ from the one the service claims
-// to have validated.
+// outside the usable range. It is shared by New and validateForServing so the
+// address the server binds cannot differ from the one the service claims to have
+// validated.
 func validateBind(address string, port int) error {
 	addr, err := netip.ParseAddr(strings.Trim(address, "[]"))
 	if err != nil {

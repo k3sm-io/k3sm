@@ -769,20 +769,11 @@ func TestServeConfigServerFields(t *testing.T) {
 	})
 }
 
-// TestServeGCCadenceMatchesTheChild pins that the server collects on the cadence
-// the child it replaces is configured with.
-func TestServeGCCadenceMatchesTheChild(t *testing.T) {
-	for _, tc := range []struct {
-		spelled string
-		value   time.Duration
-	}{{gcDelay, serveGCGrace}, {gcInterval, serveGCInterval}} {
-		d, err := time.ParseDuration(tc.spelled)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if d != tc.value {
-			t.Errorf("%s != %s", tc.spelled, tc.value)
-		}
+// TestServeGCCadence pins the server's collection cadence: a one-hour grace and a
+// six-hour interval.
+func TestServeGCCadence(t *testing.T) {
+	if serveGCGrace != time.Hour || serveGCInterval != 6*time.Hour {
+		t.Errorf("gc cadence = (%v, %v), want (1h, 6h)", serveGCGrace, serveGCInterval)
 	}
 }
 
