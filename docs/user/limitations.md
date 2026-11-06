@@ -691,6 +691,8 @@ in place, the Pod does not proceed, and a controller replacing the Pod is what u
 once and never respawned, whatever the Pod or container policy says. If you are on that opt-out, a
 process that exits stays exited until a `Deployment`/`Job` controller replaces the Pod.
 
+**An image edit on a running Pod does not restart its container, as it does upstream.** The container stays on its image and `containerStatuses[].image` keeps naming it until the Pod is recreated: a `vm` Pod records a `Warning` `ImageEditNotApplied` Event, while a native Pod on the default runtime records no warning and can report `Pulling` and `Pulled` for the new image though nothing runs it. A `vm` Pod parked on an image failure takes the edit at its next retry.
+
 ### What Survives a Node-Daemon Restart
 
 A Pod's processes outlive the node daemon, on the default runtime and in the `vm` RuntimeClass
