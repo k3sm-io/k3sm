@@ -94,6 +94,16 @@ const (
 	// No upstream analogue, for the FailedEmptyDirMedium reason: a kubelet that
 	// cannot serve a projected source is not a state upstream models.
 	reasonFailedProjectedSource = "FailedProjectedSource"
+	// reasonFailedVolumeSource is recorded when a container mounts a volume
+	// whose source the translation does not model (hostPath, nfs, csi, a
+	// generic ephemeral volume, ...), so the pod is refused BEFORE the CreatePod
+	// RPC (toVolume). No upstream analogue, for the FailedEmptyDirMedium reason.
+	reasonFailedVolumeSource = "FailedVolumeSource"
+	// reasonArtifactPullRefused is recorded when a mounted image volume's reference
+	// does not name the cluster registry, or this node maps none, so the pod is
+	// refused BEFORE the CreatePod RPC and nothing is fetched (toVolume). It is
+	// one of the stable artifact reasons, shared with the runtime's own refusal.
+	reasonArtifactPullRefused = "ArtifactPullRefused"
 	// reasonFailedCreatePodSandBox is recorded when a vm pod is refused BEFORE
 	// the CreatePod RPC because its kernel hostname cannot be derived from the
 	// spec (podHostname): an invalid hostnameOverride, hostname or subdomain, or
@@ -387,6 +397,26 @@ func msgFailedProjectedSource(volume, kind string) string {
 		"cannot provide: the file would be missing from the volume with no notice. Remove the source "+
 		"from spec.volumes[].projected.sources, or deliver its content through a configMap or "+
 		"secret source.", volume, kind)
+}
+
+// msgFailedVolumeSource is the FailedVolumeSource-event message for a pod
+// that mounts a volume whose source this node does not model. It carries the
+// volume name, the pod's own spec, and a fixed kind token; never a host path, a
+// server or a driver name.
+func msgFailedVolumeSource(volume, kind string) string {
+	return fmt.Sprintf("Error: volume %q has a source of kind %s, which this node cannot provide, and a "+
+		"container mounts it. Use a persistentVolumeClaim, or remove the volume and its mounts.", volume, kind)
+}
+
+// msgArtifactPullRefused is the ArtifactPullRefused-event message for a pod
+// whose image volume does not name the cluster registry. It names the volume
+// and the registry the node accepts, never the pod's reference.
+func msgArtifactPullRefused(volume, clusterRegistry string) string {
+	if clusterRegistry == "" {
+		return fmt.Sprintf("Error: image volume %q cannot be served: this node maps no cluster registry.", volume)
+	}
+	return fmt.Sprintf("Error: image volume %q does not name the cluster registry. Push the artifact to "+
+		"the cluster registry and reference it as %s/<repository>.", volume, clusterRegistry)
 }
 
 // msgFailedGPUFit is the FailedGPUFit-event message for a GPU pod refused for

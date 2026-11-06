@@ -50,7 +50,7 @@ func TestM3_3_ToPodBoxAllowsClusterNetwork(t *testing.T) {
 			Containers: []corev1.Container{{Name: "c0", Image: "registry/web:latest"}},
 		},
 	}
-	box, err := toPodBox(pod, "10.42.0.5", "10.42.0.5", "/var/lib/k3sm/pods/uid-web", "", netv1.DNSConfig{}, nil)
+	box, err := toPodBox(pod, "10.42.0.5", "10.42.0.5", "/var/lib/k3sm/pods/uid-web", "", "", netv1.DNSConfig{}, nil)
 	if err != nil {
 		t.Fatalf("toPodBox: %v", err)
 	}
@@ -76,7 +76,7 @@ func TestToPodBoxFillsGate(t *testing.T) {
 			}},
 		},
 	}
-	box, err := toPodBox(pod, "10.0.0.5", "10.0.0.5", "/var/lib/k3sm/pods/uid-web", "/lib/shim.dylib", netv1.DNSConfig{}, nil)
+	box, err := toPodBox(pod, "10.0.0.5", "10.0.0.5", "/var/lib/k3sm/pods/uid-web", "/lib/shim.dylib", "", netv1.DNSConfig{}, nil)
 	if err != nil {
 		t.Fatalf("toPodBox: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestToPodBoxDefaultBackendUnspecified(t *testing.T) {
 			Containers: []corev1.Container{{Name: "c0", Image: "registry/web:latest"}},
 		},
 	}
-	box, err := toPodBox(pod, "10.0.0.5", "10.0.0.5", "/var/lib/k3sm/pods/uid-native", "", netv1.DNSConfig{}, nil)
+	box, err := toPodBox(pod, "10.0.0.5", "10.0.0.5", "/var/lib/k3sm/pods/uid-native", "", "", netv1.DNSConfig{}, nil)
 	if err != nil {
 		t.Fatalf("toPodBox: %v", err)
 	}
@@ -202,7 +202,7 @@ func TestToPodBoxVMRuntimeClass(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Namespace: "db", Name: "pg", UID: types.UID("uid-pg")},
 				Spec:       corev1.PodSpec{RuntimeClassName: &vm, Containers: tt.containers},
 			}
-			box, err := toPodBox(pod, "10.0.0.9", "10.0.0.9", "/var/lib/k3sm/pods/uid-pg", "", netv1.DNSConfig{}, nil)
+			box, err := toPodBox(pod, "10.0.0.9", "10.0.0.9", "/var/lib/k3sm/pods/uid-pg", "", "", netv1.DNSConfig{}, nil)
 			if err != nil {
 				t.Fatalf("toPodBox: %v", err)
 			}
@@ -278,7 +278,7 @@ func TestToPodBoxUnknownRuntimeClassFailsClosed(t *testing.T) {
 			Containers:       []corev1.Container{{Name: "c0", Image: "img"}},
 		},
 	}
-	box, err := toPodBox(pod, "10.0.0.1", "10.0.0.1", "/var/lib/k3sm/pods/uid-x", "", netv1.DNSConfig{}, nil)
+	box, err := toPodBox(pod, "10.0.0.1", "10.0.0.1", "/var/lib/k3sm/pods/uid-x", "", "", netv1.DNSConfig{}, nil)
 	if err == nil {
 		t.Fatal("toPodBox must FAIL CLOSED on an unknown RuntimeClass, got nil (would silently downgrade to host-process)")
 	}
@@ -342,7 +342,7 @@ func TestToPodBoxInjectsClusterDNSEnv(t *testing.T) {
 				name = "empty(default ClusterFirst)"
 			}
 			t.Run(name, func(t *testing.T) {
-				box, err := toPodBox(dnsPod(policy), "10.0.0.5", "10.0.0.5", "/var/lib/k3sm/pods/uid-web", "/lib/shim.dylib", validCfg, nil)
+				box, err := toPodBox(dnsPod(policy), "10.0.0.5", "10.0.0.5", "/var/lib/k3sm/pods/uid-web", "/lib/shim.dylib", "", validCfg, nil)
 				if err != nil {
 					t.Fatalf("toPodBox: %v", err)
 				}
@@ -376,7 +376,7 @@ func TestToPodBoxInjectsClusterDNSEnv(t *testing.T) {
 	t.Run("opt-out policies inject nothing", func(t *testing.T) {
 		for _, policy := range []corev1.DNSPolicy{corev1.DNSDefault, corev1.DNSNone} {
 			t.Run(string(policy), func(t *testing.T) {
-				box, err := toPodBox(dnsPod(policy), "10.0.0.5", "10.0.0.5", "/var/lib/k3sm/pods/uid-web", "/lib/shim.dylib", validCfg, nil)
+				box, err := toPodBox(dnsPod(policy), "10.0.0.5", "10.0.0.5", "/var/lib/k3sm/pods/uid-web", "/lib/shim.dylib", "", validCfg, nil)
 				if err != nil {
 					t.Fatalf("toPodBox: %v", err)
 				}
@@ -391,7 +391,7 @@ func TestToPodBoxInjectsClusterDNSEnv(t *testing.T) {
 	// injects nothing even under ClusterFirst; the shim defers to the host resolver
 	// rather than blackholing every lookup.
 	t.Run("invalid cfg injects nothing", func(t *testing.T) {
-		box, err := toPodBox(dnsPod(corev1.DNSClusterFirst), "10.0.0.5", "10.0.0.5", "/var/lib/k3sm/pods/uid-web", "", netv1.DNSConfig{ClusterDomain: wantDomain}, nil)
+		box, err := toPodBox(dnsPod(corev1.DNSClusterFirst), "10.0.0.5", "10.0.0.5", "/var/lib/k3sm/pods/uid-web", "", "", netv1.DNSConfig{ClusterDomain: wantDomain}, nil)
 		if err != nil {
 			t.Fatalf("toPodBox: %v", err)
 		}
@@ -406,7 +406,7 @@ func TestToPodBoxInjectsClusterDNSEnv(t *testing.T) {
 	// literal) and assert the resolved value is the cluster VIP.
 	t.Run("infra wins over a workload K3SM_DNS_SERVER", func(t *testing.T) {
 		pod := dnsPod(corev1.DNSClusterFirst, corev1.EnvVar{Name: dns.EnvDNSServer, Value: "1.2.3.4"})
-		box, err := toPodBox(pod, "10.0.0.5", "10.0.0.5", "/var/lib/k3sm/pods/uid-web", "", validCfg, nil)
+		box, err := toPodBox(pod, "10.0.0.5", "10.0.0.5", "/var/lib/k3sm/pods/uid-web", "", "", validCfg, nil)
 		if err != nil {
 			t.Fatalf("toPodBox: %v", err)
 		}
@@ -635,7 +635,7 @@ func TestToPodBoxInjectsBindDisciplineEnv(t *testing.T) {
 	discardLog := slog.New(slog.DiscardHandler)
 
 	t.Run("distinct /32 injects K3SM_POD_IP into every container", func(t *testing.T) {
-		box, err := toPodBox(bindPod(), podIP, nodeIP, rootfs, "", netv1.DNSConfig{}, discardLog)
+		box, err := toPodBox(bindPod(), podIP, nodeIP, rootfs, "", "", netv1.DNSConfig{}, discardLog)
 		if err != nil {
 			t.Fatalf("toPodBox: %v", err)
 		}
@@ -659,7 +659,7 @@ func TestToPodBoxInjectsBindDisciplineEnv(t *testing.T) {
 	// CIDR alone, proving the derivation degrades gracefully rather than failing.
 	t.Run("K3SM_CLUSTER_CIDRS carries the pod CIDR and the derived Service CIDR", func(t *testing.T) {
 		dnsCfg := netv1.DNSConfig{ClusterDNSIP: "10.43.0.10"}
-		box, err := toPodBox(bindPod(), podIP, nodeIP, rootfs, "", dnsCfg, discardLog)
+		box, err := toPodBox(bindPod(), podIP, nodeIP, rootfs, "", "", dnsCfg, discardLog)
 		if err != nil {
 			t.Fatalf("toPodBox: %v", err)
 		}
@@ -677,7 +677,7 @@ func TestToPodBoxInjectsBindDisciplineEnv(t *testing.T) {
 	// standalone node) still gets the pod CIDR — clusterCIDRs never lets a
 	// missing Service VIP suppress the whole rung.
 	t.Run("K3SM_CLUSTER_CIDRS carries only the pod CIDR when no DNS VIP is configured", func(t *testing.T) {
-		box, err := toPodBox(bindPod(), podIP, nodeIP, rootfs, "", netv1.DNSConfig{}, discardLog)
+		box, err := toPodBox(bindPod(), podIP, nodeIP, rootfs, "", "", netv1.DNSConfig{}, discardLog)
 		if err != nil {
 			t.Fatalf("toPodBox: %v", err)
 		}
@@ -690,7 +690,7 @@ func TestToPodBoxInjectsBindDisciplineEnv(t *testing.T) {
 	})
 
 	t.Run("infra wins over a workload-set K3SM_POD_IP", func(t *testing.T) {
-		box, err := toPodBox(bindPod(corev1.EnvVar{Name: podnet.EnvPodIP, Value: "1.2.3.4"}), podIP, nodeIP, rootfs, "", netv1.DNSConfig{}, discardLog)
+		box, err := toPodBox(bindPod(corev1.EnvVar{Name: podnet.EnvPodIP, Value: "1.2.3.4"}), podIP, nodeIP, rootfs, "", "", netv1.DNSConfig{}, discardLog)
 		if err != nil {
 			t.Fatalf("toPodBox: %v", err)
 		}
@@ -708,7 +708,7 @@ func TestToPodBoxInjectsBindDisciplineEnv(t *testing.T) {
 		// A DNS VIP is set here too — the K3SM_CLUSTER_CIDRS absence must come from
 		// the podIP == nodeIP gate, not from clusterCIDRs having nothing to derive.
 		dnsCfg := netv1.DNSConfig{ClusterDNSIP: "10.43.0.10"}
-		box, err := toPodBox(bindPod(), nodeIP, nodeIP, rootfs, "", dnsCfg, discardLog)
+		box, err := toPodBox(bindPod(), nodeIP, nodeIP, rootfs, "", "", dnsCfg, discardLog)
 		if err != nil {
 			t.Fatalf("toPodBox: %v", err)
 		}
@@ -731,7 +731,7 @@ func TestToPodBoxInjectsBindDisciplineEnv(t *testing.T) {
 		{"ipv6 podIP", "fd00::7"},
 	} {
 		t.Run("no injection for "+tc.name, func(t *testing.T) {
-			box, err := toPodBox(bindPod(), tc.podIP, nodeIP, rootfs, "", netv1.DNSConfig{}, discardLog)
+			box, err := toPodBox(bindPod(), tc.podIP, nodeIP, rootfs, "", "", netv1.DNSConfig{}, discardLog)
 			if err != nil {
 				t.Fatalf("toPodBox: %v", err)
 			}
@@ -752,7 +752,7 @@ func TestToPodBoxInjectsBindDisciplineEnv(t *testing.T) {
 		pod := bindPod()
 		pod.Spec.Containers[0].Image = runtimed.NativeImage
 		pod.Spec.Containers[0].Command = []string{"/usr/local/bin/app"}
-		box, err := toPodBox(pod, podIP, nodeIP, rootfs, "", netv1.DNSConfig{}, log)
+		box, err := toPodBox(pod, podIP, nodeIP, rootfs, "", "", netv1.DNSConfig{}, log)
 		if err != nil {
 			t.Fatalf("toPodBox: %v", err)
 		}
@@ -771,7 +771,7 @@ func TestToPodBoxInjectsBindDisciplineEnv(t *testing.T) {
 		log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
 		pod := bindPod()
 		pod.Spec.Containers[0].Command = []string{"/bin/app"} // pulled image WITH a command
-		if _, err := toPodBox(pod, podIP, nodeIP, rootfs, "", netv1.DNSConfig{}, log); err != nil {
+		if _, err := toPodBox(pod, podIP, nodeIP, rootfs, "", "", netv1.DNSConfig{}, log); err != nil {
 			t.Fatalf("toPodBox: %v", err)
 		}
 		if strings.Contains(buf.String(), "host-binary route") {
@@ -943,7 +943,7 @@ func TestToPodBoxM2Fields(t *testing.T) {
 			}},
 		},
 	}
-	box, err := toPodBox(pod, "10.0.0.7", "10.0.0.7", "/var/lib/k3sm/pods/uid-api", "", netv1.DNSConfig{}, nil)
+	box, err := toPodBox(pod, "10.0.0.7", "10.0.0.7", "/var/lib/k3sm/pods/uid-api", "", "", netv1.DNSConfig{}, nil)
 	if err != nil {
 		t.Fatalf("toPodBox: %v", err)
 	}
@@ -1046,7 +1046,7 @@ func TestToPodBoxMemoryLimitAnnotation(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "p", UID: types.UID("uid-p")},
 				Spec:       corev1.PodSpec{Containers: tt.containers},
 			}
-			box, err := toPodBox(pod, "10.0.0.1", "10.0.0.1", "/var/lib/k3sm/pods/uid-p", "", netv1.DNSConfig{}, nil)
+			box, err := toPodBox(pod, "10.0.0.1", "10.0.0.1", "/var/lib/k3sm/pods/uid-p", "", "", netv1.DNSConfig{}, nil)
 			if err != nil {
 				t.Fatalf("toPodBox: %v", err)
 			}
@@ -1120,7 +1120,7 @@ func TestTypedMemoryLimitWritten(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "p", UID: types.UID("uid-p")},
 				Spec:       corev1.PodSpec{Containers: tt.containers},
 			}
-			box, err := toPodBox(pod, "10.0.0.1", "10.0.0.1", "/var/lib/k3sm/pods/uid-p", "", netv1.DNSConfig{}, nil)
+			box, err := toPodBox(pod, "10.0.0.1", "10.0.0.1", "/var/lib/k3sm/pods/uid-p", "", "", netv1.DNSConfig{}, nil)
 			if err != nil {
 				t.Fatalf("toPodBox: %v", err)
 			}
@@ -1555,7 +1555,7 @@ func TestRlimitSourceAndQoSClass(t *testing.T) {
 				},
 				Spec: corev1.PodSpec{Containers: containers},
 			}
-			box, err := toPodBox(pod, "10.0.0.1", "10.0.0.1", "/var/lib/k3sm/pods/uid-p", "", netv1.DNSConfig{}, nil)
+			box, err := toPodBox(pod, "10.0.0.1", "10.0.0.1", "/var/lib/k3sm/pods/uid-p", "", "", netv1.DNSConfig{}, nil)
 			if tt.wantErrContains != "" {
 				if err == nil {
 					t.Fatalf("toPodBox = nil error, want an error naming annotation %q (fail-fast reject, not silent skip)", tt.wantErrContains)
@@ -1624,7 +1624,7 @@ func TestRlimitSourceAndQoSClass(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "p", UID: types.UID("uid-p")},
 				Spec:       corev1.PodSpec{Containers: tt.containers},
 			}
-			box, err := toPodBox(pod, "10.0.0.1", "10.0.0.1", "/var/lib/k3sm/pods/uid-p", "", netv1.DNSConfig{}, nil)
+			box, err := toPodBox(pod, "10.0.0.1", "10.0.0.1", "/var/lib/k3sm/pods/uid-p", "", "", netv1.DNSConfig{}, nil)
 			if err != nil {
 				t.Fatalf("toPodBox: %v", err)
 			}
@@ -1737,7 +1737,7 @@ func TestToPodBoxPersistentVolumeClaimVolume(t *testing.T) {
 		},
 	}
 
-	box, err := toPodBox(pod, "10.0.0.7", "10.0.0.7", "/var/lib/k3sm/pods/uid-db-0", "", netv1.DNSConfig{}, nil)
+	box, err := toPodBox(pod, "10.0.0.7", "10.0.0.7", "/var/lib/k3sm/pods/uid-db-0", "", "", netv1.DNSConfig{}, nil)
 	if err != nil {
 		t.Fatalf("toPodBox: %v", err)
 	}
@@ -1850,7 +1850,7 @@ func TestToPodBoxForwardsImagePullPolicyVerbatim(t *testing.T) {
 					}},
 				},
 			}
-			box, err := toPodBox(pod, "10.0.0.5", "10.0.0.5", "/var/lib/k3sm/pods/uid-web", "", netv1.DNSConfig{}, nil)
+			box, err := toPodBox(pod, "10.0.0.5", "10.0.0.5", "/var/lib/k3sm/pods/uid-web", "", "", netv1.DNSConfig{}, nil)
 			if err != nil {
 				t.Fatalf("toPodBox: %v", err)
 			}
@@ -1880,7 +1880,7 @@ func TestToPodBoxForwardsImagePullPolicyVerbatim(t *testing.T) {
 				}},
 			},
 		}
-		box, err := toPodBox(pod, "10.0.0.5", "10.0.0.5", "/var/lib/k3sm/pods/uid-web", "", netv1.DNSConfig{}, nil)
+		box, err := toPodBox(pod, "10.0.0.5", "10.0.0.5", "/var/lib/k3sm/pods/uid-web", "", "", netv1.DNSConfig{}, nil)
 		if err != nil {
 			t.Fatalf("toPodBox: %v", err)
 		}

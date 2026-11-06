@@ -250,7 +250,7 @@ func TestPreflightEmptyDirMediumReadsTheBoxBackend(t *testing.T) {
 		pod := emptyDirPod("mixed", "Memory")
 		rc := runtimeclass.Name
 		pod.Spec.RuntimeClassName = &rc
-		nativeBox, err := toPodBox(emptyDirPod("mixed", "Memory"), "10.42.0.7", "192.168.1.10", t.TempDir(), "", netv1.DNSConfig{}, nil)
+		nativeBox, err := toPodBox(emptyDirPod("mixed", "Memory"), "10.42.0.7", "192.168.1.10", t.TempDir(), "", "", netv1.DNSConfig{}, nil)
 		if err != nil {
 			t.Fatalf("toPodBox: %v", err)
 		}
@@ -267,7 +267,7 @@ func TestPreflightEmptyDirMediumReadsTheBoxBackend(t *testing.T) {
 		vmPod := emptyDirPod("guest", "Memory")
 		rc := runtimeclass.Name
 		vmPod.Spec.RuntimeClassName = &rc
-		vmBox, err := toPodBox(vmPod, "10.42.0.7", "192.168.1.10", t.TempDir(), "", netv1.DNSConfig{}, nil)
+		vmBox, err := toPodBox(vmPod, "10.42.0.7", "192.168.1.10", t.TempDir(), "", "", netv1.DNSConfig{}, nil)
 		if err != nil {
 			t.Fatalf("toPodBox: %v", err)
 		}

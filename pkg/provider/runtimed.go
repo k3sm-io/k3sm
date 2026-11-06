@@ -79,6 +79,11 @@ type runtimedRuntime struct {
 	nodeIP      string
 	rootfs      string
 	dyldShim    string
+	// clusterRegistry is the cluster's one registry authority
+	// (RuntimedConfig.FlatRegistry.Host), the only host an image volume may
+	// name. "" when this node maps no cluster registry, which refuses every
+	// image volume.
+	clusterRegistry string
 	// pathShim is the path-rebase DYLD shim runtimed injects into every pod
 	// (RuntimedConfig.PathShim). The provider does not inject it itself — it
 	// keeps it only to name the file in each pod's Seatbelt read allow alongside
@@ -940,15 +945,16 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 		log.Error("denied local ports config invalid, denying none", "err", err)
 	}
 	r := &runtimedRuntime{
-		rt:            rt,
-		nodeName:      cfg.NodeName,
-		nodeIP:        cfg.NodeIP,
-		rootfs:        cfg.Root,
-		dyldShim:      cfg.DyldShim,
-		pathShim:      cfg.PathShim,
-		resolverVIP:   cfg.ResolverVIP,
-		clusterDomain: cfg.ClusterDomain,
-		apiServerVIP:  cfg.APIServerVIP,
+		rt:              rt,
+		nodeName:        cfg.NodeName,
+		nodeIP:          cfg.NodeIP,
+		rootfs:          cfg.Root,
+		dyldShim:        cfg.DyldShim,
+		clusterRegistry: cfg.FlatRegistry.Host,
+		pathShim:        cfg.PathShim,
+		resolverVIP:     cfg.ResolverVIP,
+		clusterDomain:   cfg.ClusterDomain,
+		apiServerVIP:    cfg.APIServerVIP,
 		// Derived HERE, in the one constructor production and the fake-injected
 		// tests share, so no caller can construct a provider whose pods are missing
 		// the base deny-set.
@@ -1893,7 +1899,7 @@ func (r *runtimedRuntime) buildBox(ctx context.Context, pod *corev1.Pod, podIP s
 	if _, err := r.setupGuestNetwork(ctx, pod, dnsCfg); err != nil {
 		return nil, err
 	}
-	box, err := toPodBox(pod, podIP, r.nodeIP, r.podRoot(string(pod.UID)), r.dyldShim, dnsCfg, r.log)
+	box, err := toPodBox(pod, podIP, r.nodeIP, r.podRoot(string(pod.UID)), r.dyldShim, r.clusterRegistry, dnsCfg, r.log)
 	if err != nil {
 		return nil, err
 	}
@@ -2102,6 +2108,7 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	if err != nil {
 		r.log.Error("CreatePod: translate/buildBox", "namespace", pod.Namespace, "name", pod.Name, "err", err)
 		r.recordPodHostnameRefusal(pod, err)
+		r.recordVolumeRefusal(pod, err)
 		return fmt.Errorf("translate pod %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
 	// Refuse a pod this node cannot honestly run BEFORE the RPC, and before any
