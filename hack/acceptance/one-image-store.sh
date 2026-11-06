@@ -10,8 +10,13 @@
 # kubeconfig. Every Kubernetes object it creates lives in one namespace minted per
 # run; every registry tag it creates is named under the run's own repositories. The
 # exit trap brings the server back if a leg stopped it, deletes the namespace, untags
-# every tag, prunes the registry and both node caches, and removes the build context
-# it copied to the worker, green or red.
+# every tag the run created, removes the run's own repositories from the registry
+# root, and removes the build context it copied to the worker, green or red.
+#
+# It touches no image it did not push. It never runs the node cache's prune, which
+# has no filter and evicts every image no pod uses at that moment, another workload's
+# included. No verb evicts one image, so the run's own images stay in the node caches
+# as ordinary unreferenced content, a few MiB per run, until an operator prunes.
 #
 # Legs (`--plan` prints them; the first red leg ends the run, exit 1, naming the leg):
 #   ois.1   build on the worker: `k3sm build --tag registry-k3sm:6450/<run>/app:v1 .`
@@ -48,7 +53,12 @@
 #           manifest as younger than the grace period, and names no tagged digest;
 #           `--force` deletes the aged manifest (inspect by digest then fails), keeps
 #           the young one (inspect still answers) and reports no failed deletion;
-#           every app pod is still Ready
+#           every app pod is still Ready. The dry run asks the real daemon. `--force`
+#           dials testdata/ois-prunestub instead, which answers the cache half with
+#           nothing, so this leg proves the registry half and evicts no node cache. A
+#           dry run that plans to delete a manifest outside the run's repositories
+#           ends the leg red before `--force`, because the registry half has no filter
+#           either
 #   ois.9   the upgrade migration: the server's own journal (`image migrate --report
 #           -o json`) is complete; `sudo k3sm image migrate -o json` on the seeded node
 #           records $K3SM_OIS_PREMIGRATE_REF as migrated, present or renamed with a
@@ -104,7 +114,8 @@
 # Usage:  hack/acceptance/one-image-store.sh --plan        # the legs; contacts nothing
 #         hack/acceptance/one-image-store.sh --self-test   # offline checks of this script
 #         K3SM_LAB=1 ... hack/acceptance/one-image-store.sh [<evidence-dir>]
-#             (default evidence dir: a new mktemp directory)
+#         ... hack/acceptance/one-image-store.sh --lab [<evidence-dir>]
+#             (--lab is the same as K3SM_LAB=1; default evidence dir: a new mktemp directory)
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
@@ -171,6 +182,12 @@ elif op == "prune-digests":
     print(" ".join(m.get("digest", "") for k in ("manifests", "kept") for m in (r.get(k) or [])))
 elif op == "prune-failed":
     print(len((d.get("registry") or {}).get("failed") or []))
+elif op == "prune-foreign":
+    for m in (d.get("registry") or {}).get("manifests") or []:
+        if not m.get("repository", "").startswith(tuple(a)):
+            print(m.get("repository", "") + "@" + m.get("digest", ""))
+elif op == "prune-cache-blobs":
+    print(len((d.get("cache") or {}).get("blobs") or []))
 elif op == "mig-complete":
     print("true" if d.get("complete") else "false")
 elif op == "mig-record":
@@ -195,6 +212,21 @@ manifest_blob() {
 	[ -n "$repo" ] && [ -n "$root" ] || return 1
 	case "$repo" in /* | *..*) return 1 ;; esac
 	echo "$root/$repo/blobs/sha256/${dg#sha256:}"
+}
+
+# run_repo_dirs <registry-root> <name>...: the registry root's directory of each of
+# the run's top-level repository names, one per line; prints nothing and fails unless
+# every name is one this script mints (ois-<10 digits>, optionally -lab).
+run_repo_dirs() {
+	local root="$1" n
+	shift
+	[ -n "$root" ] && [ "$#" -gt 0 ] || return 1
+	for n in "$@"; do
+		[[ "$n" =~ ^ois-[0-9]{10}(-lab)?$ ]] || return 1
+	done
+	for n in "$@"; do
+		echo "$root/$n"
+	done
 }
 
 # probe_field <log> <key>: the last value a pod reported for key (`OIS key=value`).
@@ -461,6 +493,17 @@ self_test() {
 	check "$(if manifest_blob /r x "sha256:abc" >/dev/null; then echo no; else echo ok; fi)" "manifest_blob: a short digest is refused"
 	check "$(if manifest_blob /r ../x "$t" >/dev/null; then echo no; else echo ok; fi)" "manifest_blob: a repository escaping the root is refused"
 	check "$(if manifest_blob /r "" "$t" >/dev/null; then echo no; else echo ok; fi)" "manifest_blob: no repository is refused"
+	check "$([ "$(run_repo_dirs /r ois-1106074116 ois-1106074116-lab | tr '\n' ' ')" = "/r/ois-1106074116 /r/ois-1106074116-lab " ] && echo ok)" "run_repo_dirs: the run's two names"
+	for t in library ois-aged ois-1106074116/app ../ois-1106074116 ois-110607411 ""; do
+		check "$(if run_repo_dirs /r ois-1106074116 "$t" >/dev/null; then echo no; else echo ok; fi)" "run_repo_dirs: '$t' is refused, and so is the whole list"
+	done
+	check "$(if run_repo_dirs /r >/dev/null; then echo no; else echo ok; fi)" "run_repo_dirs: no name is refused"
+	t='{"registry":{"manifests":[{"repository":"ois-1-lab/aged","digest":"sha256:01"},{"repository":"ois-1/app","digest":"sha256:02"},{"repository":"ois-1-labx/y","digest":"sha256:03"},{"repository":"library/x","digest":"sha256:04"}]},"cache":{"blobs":["sha256:05","sha256:06"]}}'
+	check "$([ "$(printf '%s' "$t" | ojson prune-foreign ois-1/ ois-1-lab/ | tr '\n' ' ')" = "ois-1-labx/y@sha256:03 library/x@sha256:04 " ] && echo ok)" "prune-foreign: every planned manifest outside the run"
+	check "$([ "$(printf '%s' "$t" | ojson prune-cache-blobs)" = 2 ] && echo ok)" "prune-cache-blobs: the count"
+	t="$(grep -E 'image prune +--force' "$SELF" | grep -Ev '^[[:space:]]*#|--socket' || true)"
+	check "$([ -z "$t" ] && echo ok)" "no forced prune reaches a node's real cache: ${t:-none}"
+	check "$([ -f "$REPO_ROOT/hack/acceptance/testdata/ois-prunestub/main.go" ] && echo ok)" "the forced prune's cache stub is present"
 	case "$src" in *$'leg_push_native() {\n\tbuild_pusher || return 1'*) check ok "ois.4 builds the push client image before its push" ;; *) check no "ois.4 builds the push client image before its push" ;; esac
 	case "$src" in *K3SM_OIS_PRUNE""_AGED*) check no "no operator-made aged seed is read" ;; *) check ok "no operator-made aged seed is read" ;; esac
 	case "$src" in *$'leg_prune() {\n'*'seed_aged || return 1'*'ojson prune-dry'*) check ok "ois.8 makes its aged seed before the dry run" ;; *) check no "ois.8 makes its aged seed before the dry run" ;; esac
@@ -521,6 +564,13 @@ self_test() {
 	out="$(env -i "$t" HOME="$tmp" K3SM_LAB=1 /bin/bash "$SELF" "$tmp/evidence" 2>&1)" && code=0 || code=$?
 	case "$out" in *"K3SM_OIS_SERVER_NODE"*"K3SM_OIS_PREMIGRATE_REF"*) ;; *) code=97 ;; esac
 	check "$([ "$code" = 2 ] && [ ! -e "$tmp/evidence" ] && echo ok)" "K3SM_LAB=1, required variables unset: refused, exit 2, names them, no evidence dir (got $code)"
+	out="$(env -i "$t" HOME="$tmp" /bin/bash "$SELF" --lab "$tmp/evidence" 2>&1)" && code=0 || code=$?
+	case "$out" in *SKIP*) code=96 ;; *"K3SM_OIS_SERVER_NODE"*"K3SM_OIS_PREMIGRATE_REF"*) ;; *) code=97 ;; esac
+	check "$([ "$code" = 2 ] && [ ! -e "$tmp/evidence" ] && echo ok)" "--lab with K3SM_LAB unset: past the guard, refused on the required variables, exit 2 (got $code)"
+	out="$(env -i "$t" HOME="$tmp" /bin/bash "$SELF" --lab --bogus 2>&1)" && code=0 || code=$?
+	check "$([ "$code" = 2 ] && echo ok)" "--lab with an unknown option: exit 2 (got $code)"
+	out="$(env -i "$t" HOME="$tmp" /bin/bash "$SELF" --lab a b 2>&1)" && code=0 || code=$?
+	check "$([ "$code" = 2 ] && echo ok)" "--lab with two positional arguments: exit 2 (got $code)"
 	out="$(env -i "$t" HOME="$tmp" K3SM_LAB=1 KUBECONFIG=/nonexistent K3SM_OIS_SERVER_NODE=a K3SM_OIS_WORKER_NODE=a \
 		K3SM_OIS_SERVER_SSH=local K3SM_OIS_WORKER_SSH=local K3SM_OIS_PREMIGRATE_REF=x:v1 \
 		/bin/bash "$SELF" "$tmp/evidence" 2>&1)" && code=0 || code=$?
@@ -540,6 +590,10 @@ self_test() {
 	return "$bad"
 }
 
+if [ "${1:-}" = --lab ]; then
+	export K3SM_LAB=1
+	shift
+fi
 case "${1:-}" in
 --plan)
 	plan
@@ -554,14 +608,14 @@ case "${1:-}" in
 	exit 0
 	;;
 -*)
-	echo "one-image-store.sh: unknown option $1 (try --plan, --self-test)" >&2
+	echo "one-image-store.sh: unknown option $1 (try --lab, --plan, --self-test)" >&2
 	exit 2
 	;;
 esac
 
 # ---- lab guard ---------------------------------------------------------------------------
 if [ "${K3SM_LAB:-}" != "1" ]; then
-	echo "one-image-store lab gate: SKIP (two Macs). Set K3SM_LAB=1 against the running two-node cluster to run it; this is NOT a pass."
+	echo "one-image-store lab gate: SKIP (two Macs). Pass --lab or set K3SM_LAB=1 against the running two-node cluster to run it; this is NOT a pass."
 	exit 2
 fi
 
@@ -650,6 +704,8 @@ MIGRATED_TARGET=""
 REMOTE_DIR=""
 LOCAL_DIR=""
 SERVER_DOWN=0
+PRUNE_STUB_DIR=""
+PRUNE_STUB_PID=""
 note_tag() { TAGS_CREATED="$TAGS_CREATED $1"; }
 
 server_up() {
@@ -679,10 +735,15 @@ cleanup() {
 	for ref in $TAGS_CREATED $MIGRATED_TARGET; do
 		on_server "sudo -n k3sm image untag '$ref'" >>"$EVIDENCE/cleanup-untag.txt" 2>&1
 	done
-	# The prune deletes only untagged manifests past the grace period and evicts only
-	# cache entries no pod uses; the run's own manifests go on a later prune.
-	on_server 'sudo -n k3sm image prune --force' >>"$EVIDENCE/cleanup-prune-server.txt" 2>&1
-	on_worker 'sudo -n k3sm image prune --force' >>"$EVIDENCE/cleanup-prune-worker.txt" 2>&1
+	stop_prune_stub
+	# The tags are gone, the pods that pulled and pushed are gone, and these names are
+	# unique to this run, so nothing writes here now. A blob another repository shares
+	# is a hardlink, so its other names keep it.
+	local dir
+	for dir in $(run_repo_dirs "$REGISTRY_ROOT" "$RUN" "$NS"); do
+		on_server "sudo -n rm -rf -- '$dir'" >>"$EVIDENCE/cleanup-registry.txt" 2>&1 &&
+			echo "removed $dir" >>"$EVIDENCE/cleanup-registry.txt"
+	done
 	[ -n "$REMOTE_DIR" ] && on_worker "rm -rf '$REMOTE_DIR'" >/dev/null 2>&1
 	[ -n "$LOCAL_DIR" ] && rm -rf "$LOCAL_DIR"
 	kc get ns >"$EVIDENCE/final-namespaces.txt" 2>&1
@@ -981,8 +1042,8 @@ leg_pass
 # pushes a one-layer image carrying the run id (unique content per run) to
 # <run>-lab/aged:v1, the server untags it, and the manifest blob's mtime, which
 # prune reads as the manifest's age, is set two hours back as root. The ref is
-# recorded for the trap like every run tag; a seed left behind is untagged and past
-# the grace, so the trap's prune deletes it.
+# recorded for the trap like every run tag; a seed left behind goes with the run's
+# repositories.
 AGED_DIGEST=""
 seed_aged() {
 	local blob
@@ -1009,8 +1070,36 @@ seed_aged() {
 		return 1
 	fi
 }
+# start_prune_stub: build the ois-prunestub fixture here, copy it to the server and
+# serve it on a socket in its own directory. Sets PRUNE_STUB_DIR and PRUNE_STUB_PID.
+# The stub exits on its own after ten minutes if the trap never reaches it.
+start_prune_stub() {
+	(cd "$REPO_ROOT" && env GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -o "$LOCAL_DIR/ois-prunestub" ./hack/acceptance/testdata/ois-prunestub) || return 1
+	# shellcheck disable=SC2016 # expanded by the server's shell
+	PRUNE_STUB_DIR="$(on_server 'mktemp -d "${TMPDIR:-/tmp}/ois-stub.XXXXXX"' 2>/dev/null | tail -1)"
+	[ -n "$PRUNE_STUB_DIR" ] || return 1
+	if [ "$K3SM_OIS_SERVER_SSH" = local ]; then
+		cp "$LOCAL_DIR/ois-prunestub" "$PRUNE_STUB_DIR/" || return 1
+	else
+		scp -q "$LOCAL_DIR/ois-prunestub" "$K3SM_OIS_SERVER_SSH:$PRUNE_STUB_DIR/" || return 1
+	fi
+	PRUNE_STUB_PID="$(on_server "nohup '$PRUNE_STUB_DIR/ois-prunestub' '$PRUNE_STUB_DIR/s' 10m >'$PRUNE_STUB_DIR/log' 2>&1 </dev/null & echo \$!" 2>/dev/null | tail -1)"
+	for _ in 1 2 3 4 5 6 7 8 9 10; do
+		on_server "test -S '$PRUNE_STUB_DIR/s'" >/dev/null 2>&1 && return 0
+		sleep 1
+	done
+	return 1
+}
+stop_prune_stub() {
+	[ -n "$PRUNE_STUB_PID" ] && on_server "kill '$PRUNE_STUB_PID'" >/dev/null 2>&1
+	[ -n "$PRUNE_STUB_DIR" ] && on_server "cat '$PRUNE_STUB_DIR/log'" >>"$EVIDENCE/ois.8-stub.log" 2>&1
+	[ -n "$PRUNE_STUB_DIR" ] && on_server "rm -rf '$PRUNE_STUB_DIR'" >/dev/null 2>&1
+	PRUNE_STUB_PID=""
+	PRUNE_STUB_DIR=""
+	return 0
+}
 leg_prune() {
-	local dry force d digests p aged_after young_after
+	local dry force d digests p aged_after young_after foreign
 	seed_aged || return 1
 	dry="$(on_server 'sudo -n k3sm image prune -o json' 2>"$EVIDENCE/ois.8-dry.err" | tee "$EVIDENCE/ois.8-dry.json")" || {
 		DETAIL="the dry run failed"
@@ -1037,8 +1126,22 @@ leg_prune() {
 			;;
 		esac
 	done
-	force="$(on_server 'sudo -n k3sm image prune --force -o json' 2>"$EVIDENCE/ois.8-force.err" | tee "$EVIDENCE/ois.8-force.json")" || {
+	foreign="$(printf '%s' "$dry" | ojson prune-foreign "$RUN/" "$NS/" | tr '\n' ' ')"
+	[ -z "$foreign" ] || {
+		DETAIL="not forcing: the prune would delete manifests this run did not push: $foreign"
+		return 1
+	}
+	start_prune_stub || {
+		DETAIL="could not start the prune stub on the server"
+		return 1
+	}
+	force="$(on_server "sudo -n k3sm image prune --force --socket '$PRUNE_STUB_DIR/s' -o json" 2>"$EVIDENCE/ois.8-force.err" | tee "$EVIDENCE/ois.8-force.json")" || {
 		DETAIL="prune --force failed"
+		return 1
+	}
+	stop_prune_stub
+	[ "$(printf '%s' "$force" | ojson prune-cache-blobs)" = 0 ] || {
+		DETAIL="prune --force reported evicted cache blobs through the stub"
 		return 1
 	}
 	[ "$(printf '%s' "$force" | ojson prune-dry)" = false ] && [ "$(printf '%s' "$force" | ojson prune-failed)" = 0 ] || {
@@ -1062,7 +1165,11 @@ leg_pass
 
 # ---- ois.9 the upgrade migration --------------------------------------------------------
 leg_migrate() {
-	local seed_ssh first second rec outcome target digest sources listed images src found=""
+	local seed_ssh first second rec outcome target digest sources listed images src found="" before
+	before="$(image_ls ois.9-image-ls-before)" || {
+		DETAIL="image ls failed before the migration"
+		return 1
+	}
 	[ "$(on_server 'sudo -n k3sm image migrate --report -o json' 2>"$EVIDENCE/ois.9-server-report.err" | tee "$EVIDENCE/ois.9-server-report.json" | ojson mig-complete)" = true ] || {
 		DETAIL="the server's own migration journal is not complete"
 		return 1
@@ -1083,7 +1190,9 @@ leg_migrate() {
 		DETAIL="the record has no target or digest ($rec)"
 		return 1
 	}
-	MIGRATED_TARGET="$target"
+	# Only a tag this run's migration created is the trap's to untag; one that was
+	# already there belongs to whoever put it there.
+	[ -n "$(printf '%s' "$before" | ojson ls-digest "$target")" ] || MIGRATED_TARGET="$target"
 	listed="$(image_ls ois.9-image-ls | ojson ls-digest "$target" || true)"
 	[ "$listed" = "$digest" ] || {
 		DETAIL="image ls lists $target at '${listed:-absent}', the record says $digest"
