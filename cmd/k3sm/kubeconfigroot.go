@@ -34,6 +34,8 @@ import (
 
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/install"
+	"k3sm.io/k3sm/pkg/kubeclient"
+	"k3sm.io/k3sm/pkg/status"
 )
 
 // rootUID is root's uid in the form the user database takes.
@@ -90,6 +92,10 @@ func kubeHome() string {
 // reading the file again.
 type checkedKubeconfig struct {
 	cfg *clientcmdapi.Config
+	// path is the file the bytes came from, for a report to name.
+	path string
+	// caPEM, when set, replaces the file's trust in its server (kubeclient.PinCA).
+	caPEM []byte
 }
 
 // checkKubeconfig parses data and keeps only the entries contextName selects
@@ -120,12 +126,26 @@ func checkKubeconfig(data []byte, path, contextName string) (*checkedKubeconfig,
 	if auth, ok := parsed.AuthInfos[kctx.AuthInfo]; ok {
 		out.AuthInfos[kctx.AuthInfo] = auth
 	}
-	return &checkedKubeconfig{cfg: out}, nil
+	return &checkedKubeconfig{cfg: out, path: path}, nil
 }
 
 // restConfig builds the client config from the checked entries. It reads no file.
 func (c *checkedKubeconfig) restConfig() (*rest.Config, error) {
-	return clientcmd.NewNonInteractiveClientConfig(*c.cfg, c.cfg.CurrentContext, &clientcmd.ConfigOverrides{}, nil).ClientConfig()
+	cfg, err := clientcmd.NewNonInteractiveClientConfig(*c.cfg, c.cfg.CurrentContext, &clientcmd.ConfigOverrides{}, nil).ClientConfig()
+	if err != nil {
+		return nil, err
+	}
+	if c.caPEM != nil {
+		if err := kubeclient.PinCA(cfg, c.caPEM); err != nil {
+			return nil, err
+		}
+	}
+	return cfg, nil
+}
+
+// source names the file and context for a report.
+func (c *checkedKubeconfig) source() string {
+	return fmt.Sprintf("%s context %q", c.path, c.cfg.CurrentContext)
 }
 
 // kubeconfigHandoffDir is where the handoff file is created and at once removed.
@@ -312,7 +332,7 @@ func (s *rootKubeSources) loadWorkDir(path string, f sudoKubeconfigFile) (*check
 func (s *rootKubeSources) resolve(in kubectlInputs) (kubectlConfig, error) {
 	kc := executor.KubeconfigPath(in.workDir)
 	worker := in.role == install.RoleAgent
-	reasons := []string{}
+	var reasons []string
 	if !worker || in.workDirOverride != "" {
 		f, err := s.readFile(kc)
 		switch {
@@ -329,6 +349,11 @@ func (s *rootKubeSources) resolve(in kubectlInputs) (kubectlConfig, error) {
 		}
 		reasons = append(reasons, fmt.Sprintf("%s does not exist", kc))
 	}
+	return s.resolveUser(in, reasons)
+}
+
+// resolveUser is steps 3 to 5 of resolve. reasons starts the list a refusal gives.
+func (s *rootKubeSources) resolveUser(in kubectlInputs, reasons []string) (kubectlConfig, error) {
 	if in.kubeconfigEnv != "" {
 		return s.resolveEnv(in)
 	}
@@ -349,10 +374,54 @@ func (s *rootKubeSources) resolve(in kubectlInputs) (kubectlConfig, error) {
 		return kubectlConfig{context: in.contextName, checked: c}, nil
 	}
 	reasons = append(reasons, err.Error())
-	if worker {
+	if in.role == install.RoleAgent {
 		return kubectlConfig{}, fmt.Errorf("no kubeconfig to use as root on this worker: %s; root does not use the node credential %s, which is a node identity and holds only what its kubelet needs; %s", strings.Join(reasons, "; "), in.nodeKubeconfig, rootNodeCredentialFix)
 	}
 	return kubectlConfig{}, fmt.Errorf("no kubeconfig to use as root: %s; %s", strings.Join(reasons, "; "), rootKubeconfigRemedy)
+}
+
+// loadNodeCredential reads a worker's node kubeconfig for a read-only report. It
+// takes any owner, since that account depends on how the worker was installed, and
+// it has to be inline with its CA pinned to the root-only copy.
+func (s *rootKubeSources) loadNodeCredential(path, clusterCA string) (kubectlConfig, error) {
+	f, err := s.readFile(path)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return kubectlConfig{}, fmt.Errorf("no node credential at %s", path)
+	case err != nil:
+		return kubectlConfig{}, fmt.Errorf("read node credential %s: %w", path, err)
+	}
+	const remedy = "run `sudo k3sm uninstall`, then `sudo k3sm install` with its join arguments, to write this file again"
+	if err := checkFileShape(path, f, nil); err != nil {
+		return kubectlConfig{}, fmt.Errorf("%w; %s", err, remedy)
+	}
+	c, err := checkKubeconfig(f.data, path, "")
+	if err != nil {
+		return kubectlConfig{}, fmt.Errorf("node credential %s: %w; %s", path, err, remedy)
+	}
+	if c.caPEM, err = readClusterAnchor(clusterCA, s.readFile); err != nil {
+		return kubectlConfig{}, fmt.Errorf("%w; %s", err, clusterAnchorRemedy)
+	}
+	return kubectlConfig{kubeconfig: path, checked: c}, nil
+}
+
+// userContext is the context of the file resolveUser takes that accepts says is
+// the cluster this Mac joined: the context named name, else the file's current one.
+func (s *rootKubeSources) userContext(kubeconfigEnv, name string, accepts status.Anchor) (kubectlConfig, error) {
+	var first error
+	for _, contextName := range []string{name, ""} {
+		cfg, err := s.resolveUser(kubectlInputs{kubeconfigEnv: kubeconfigEnv, contextName: contextName}, nil)
+		if err == nil {
+			if _, ok := status.UserKubeContext(cfg.checked.cfg, cfg.checked.cfg.CurrentContext, accepts); ok {
+				return cfg, nil
+			}
+			err = fmt.Errorf("neither the %q context nor the current one points at the server this Mac joined", name)
+		}
+		if first == nil {
+			first = err
+		}
+	}
+	return kubectlConfig{}, first
 }
 
 // resolveEnv takes the first entry of $KUBECONFIG that exists.

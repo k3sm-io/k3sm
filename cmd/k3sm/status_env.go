@@ -42,6 +42,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 
 	budgetv1alpha1 "k3sm.io/apis/budget/v1alpha1"
 	netv1alpha1 "k3sm.io/apis/net/v1alpha1"
@@ -719,6 +720,11 @@ type statusKubeInputs struct {
 	// would tell an operator to re-join a worker that is perfectly joined.
 	// A nil stat means os.Stat.
 	stat func(string) error
+	// root, set only when this process is root, replaces the choice with checked
+	// files (rootKubeSources). clusterCA is the root-only CA a worker's node
+	// credential is then pinned to.
+	root      *rootKubeSources
+	clusterCA string
 }
 
 // statPath reports why a path is unusable, or nil when it is there and
@@ -734,15 +740,16 @@ func (in statusKubeInputs) statPath(path string) error {
 // statusKubeInputsFor gathers the credential choice's inputs for the role this
 // Mac is installed as.
 func statusKubeInputsFor(role install.Role, paths status.Paths) statusKubeInputs {
-	home, _ := os.UserHomeDir()
 	return statusKubeInputs{
 		role:            role,
 		nodeKubeconfig:  install.AgentCredentialPath(paths.DataRoot),
 		workDir:         paths.WorkDir,
 		workDirOverride: os.Getenv("K3SM_WORK_DIR"),
 		kubeconfigEnv:   os.Getenv("KUBECONFIG"),
-		home:            home,
+		home:            kubeHome(),
 		exists:          fileExists,
+		root:            rootKubeSourcesFromEnv(),
+		clusterCA:       install.AgentClusterCAPath,
 	}
 }
 
@@ -766,10 +773,16 @@ func statusKubeInputsFor(role install.Role, paths status.Paths) statusKubeInputs
 // APIServers list: that is every advertised endpoint of an HA control plane,
 // and this row names ONE probe target and says whether it answered. Aggregating
 // several endpoints into one row is a different shape than the row has.
+//
+// As root both roles read checked bytes: a server takes the same choice as the
+// other root verbs, and a worker its node credential with the CA pinned.
 func statusKubeconfig(in statusKubeInputs) (kubectlConfig, error) {
 	if in.role == install.RoleAgent {
 		if in.nodeKubeconfig == "" {
 			return kubectlConfig{}, errors.New("no node credential path for this Mac")
+		}
+		if in.root != nil {
+			return in.root.loadNodeCredential(in.nodeKubeconfig, in.clusterCA)
 		}
 		switch err := in.statPath(in.nodeKubeconfig); {
 		case err == nil:
@@ -787,6 +800,7 @@ func statusKubeconfig(in statusKubeInputs) (kubectlConfig, error) {
 		home:            in.home,
 		contextName:     installedKubeconfigName(),
 		exists:          in.exists,
+		root:            in.root,
 	})
 }
 
@@ -845,17 +859,32 @@ func statusUserKubeFor(role install.Role, joinServer func() (string, error), sta
 		return nil
 	}
 	return func() (status.Kube, string, error) {
-		rules := clientcmd.NewDefaultClientConfigLoadingRules()
-		raw, err := rules.Load()
-		if err != nil {
-			return nil, "", err
+		root := rootKubeSourcesFromEnv()
+		var (
+			rules *clientcmd.ClientConfigLoadingRules
+			raw   *clientcmdapi.Config
+			err   error
+		)
+		if root == nil {
+			rules = clientcmd.NewDefaultClientConfigLoadingRules()
+			if raw, err = rules.Load(); err != nil {
+				return nil, "", err
+			}
 		}
 		join, err := joinServer()
 		if err != nil {
 			return nil, "", fmt.Errorf("the server this Mac joined is unknown, so no context can be shown to point at it: %w", err)
 		}
 		name := installedKubeconfigName()
-		ctxName, ok := status.UserKubeContext(raw, name, status.NodeAnchor(statusEndpoints(statusDir), status.JoinAnchor(join)))
+		anchor := status.NodeAnchor(statusEndpoints(statusDir), status.JoinAnchor(join))
+		if root != nil {
+			cfg, err := root.userContext(os.Getenv("KUBECONFIG"), name, anchor)
+			if err != nil {
+				return nil, "", err
+			}
+			return buildStatusKube(cfg)
+		}
+		ctxName, ok := status.UserKubeContext(raw, name, anchor)
 		if !ok {
 			return nil, "", fmt.Errorf("neither the %q context nor the current one points at the server this Mac joined", name)
 		}
@@ -866,6 +895,9 @@ func statusUserKubeFor(role install.Role, joinServer func() (string, error), sta
 // buildStatusKube builds the report's apiserver client for one resolved
 // kubeconfig and context, with the probe timeout.
 func buildStatusKube(cfg kubectlConfig) (status.Kube, string, error) {
+	if cfg.checked != nil {
+		return buildCheckedStatusKube(cfg)
+	}
 	rules := clientcmd.NewDefaultClientConfigLoadingRules()
 	if cfg.kubeconfig != "" {
 		rules.ExplicitPath = cfg.kubeconfig
@@ -886,6 +918,25 @@ func buildStatusKube(cfg kubectlConfig) (status.Kube, string, error) {
 		return nil, "", err
 	}
 	return restKube{client: cs, server: restCfg.Host, tls: tlsPosture(restCfg), cfg: restCfg}, kubeSource(cfg, rules), nil
+}
+
+// buildCheckedStatusKube is buildStatusKube for bytes root already read and
+// checked. It reads no file and no environment.
+func buildCheckedStatusKube(cfg kubectlConfig) (status.Kube, string, error) {
+	restCfg, err := cfg.checked.restConfig()
+	if err != nil {
+		return nil, "", err
+	}
+	restCfg.Timeout = statusAPITimeout
+	cs, err := kubernetes.NewForConfig(restCfg)
+	if err != nil {
+		return nil, "", err
+	}
+	source := cfg.kubeconfig
+	if source == "" {
+		source = cfg.checked.source()
+	}
+	return restKube{client: cs, server: restCfg.Host, tls: tlsPosture(restCfg), cfg: restCfg}, source, nil
 }
 
 // tlsPosture describes how a rest config trusts the apiserver, in the two words
