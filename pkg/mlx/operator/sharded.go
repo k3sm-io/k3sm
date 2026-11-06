@@ -336,10 +336,12 @@ func (c *Controller) interconnectLost(ctx context.Context, key string, raw *unst
 		return c.writeShardedStatus(ctx, raw, model, obs)
 	}
 	now := c.now()
+	resolved := model.Status.ResolvedArtifact
 	raw, model, err := c.recordInterconnectRestart(ctx, model, now)
 	if err != nil {
 		return err
 	}
+	model.Status.ResolvedArtifact = resolved // resolved in this pass, not yet written
 	fault := fmt.Sprintf("interconnect lost (%s); re-rendering the gang on pod IPs (fallback network)", strings.Join(lost, ", "))
 	if err := c.deleteRankPods(ctx, model, fault); err != nil {
 		return err
