@@ -117,7 +117,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 SELF="$HERE/B1240.sh"
-# shellcheck source-path=SCRIPTDIR/../lab source=../lab/lib/tolerations.sh
+# shellcheck source-path=SCRIPTDIR/../lab source=../lab/lib/tolerations.sh disable=SC1091
 . "$REPO_ROOT/hack/lab/lib/tolerations.sh"
 
 GATE_NAME="B1240"
@@ -1169,7 +1169,7 @@ mkdir -p "$EVIDENCE/scripts" "$EVIDENCE/pods" "$EVIDENCE/manifests" "$SETS"
 exec 3</dev/null
 
 # ---- the run ---------------------------------------------------------------------------------
-# shellcheck source-path=SCRIPTDIR/../lab source=../lab/lib/runlog.sh
+# shellcheck source-path=SCRIPTDIR/../lab source=../lab/lib/runlog.sh disable=SC1091
 . "$REPO_ROOT/hack/lab/lib/runlog.sh"
 RUNLOG="$EVIDENCE/run.log"
 RESULTS="$EVIDENCE/results.tsv"
