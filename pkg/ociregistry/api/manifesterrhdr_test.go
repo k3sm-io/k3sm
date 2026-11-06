@@ -17,7 +17,6 @@ limitations under the License.
 package api
 
 import (
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -26,10 +25,10 @@ import (
 )
 
 // TestManifestErrorAnswersCarryNoManifestHeaders tables the manifest read
-// errors (404, 400 and 5xx) over a real HTTP server and asserts that none
+// errors (404, 400 and 5xx) in process and asserts that none
 // carries Docker-Content-Digest or ETag, which name a manifest the answer does
-// not deliver, and that Content-Length is absent or exactly the error body's
-// length. The server is fronted by a handler that sets all three before the
+// not deliver, and that Content-Length, as the handler wrote it, is absent or exactly the
+// error body's length (a recorder does not frame the answer as net/http would). The server is fronted by a handler that sets all three before the
 // registry runs, as a header set ahead of the store call would, so a refusal
 // that failed to clear them shows.
 func TestManifestErrorAnswersCarryNoManifestHeaders(t *testing.T) {
@@ -41,14 +40,13 @@ func TestManifestErrorAnswersCarryNoManifestHeaders(t *testing.T) {
 		t.Fatal(err)
 	}
 	other := dg([]byte("never pushed"))
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	front := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
 		h.Set("Docker-Content-Digest", d.String())
 		h.Set("ETag", `"`+d.String()+`"`)
 		h.Set("Content-Length", strconv.Itoa(len(body)))
 		f.srv.ServeHTTP(w, r)
-	}))
-	t.Cleanup(srv.Close)
+	})
 
 	for _, tc := range []struct {
 		name, reference string
@@ -62,28 +60,18 @@ func TestManifestErrorAnswersCarryNoManifestHeaders(t *testing.T) {
 	} {
 		for _, method := range []string{http.MethodGet, http.MethodHead} {
 			t.Run(tc.name+"/"+method, func(t *testing.T) {
-				req, err := http.NewRequest(method, srv.URL+"/v2/app/manifests/"+tc.reference, nil)
-				if err != nil {
-					t.Fatal(err)
-				}
-				resp, err := srv.Client().Do(req)
-				if err != nil {
-					t.Fatal(err)
-				}
-				defer resp.Body.Close()
-				got, err := io.ReadAll(resp.Body)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if resp.StatusCode != tc.status {
-					t.Fatalf("status %d, want %d; body %s", resp.StatusCode, tc.status, got)
+				rec := httptest.NewRecorder()
+				front.ServeHTTP(rec, httptest.NewRequest(method, "/v2/app/manifests/"+tc.reference, nil))
+				got, hdr := rec.Body.Bytes(), rec.Result().Header
+				if rec.Code != tc.status {
+					t.Fatalf("status %d, want %d; body %s", rec.Code, tc.status, got)
 				}
 				for _, h := range []string{"Docker-Content-Digest", "ETag"} {
-					if v := resp.Header.Get(h); v != "" {
+					if v := hdr.Get(h); v != "" {
 						t.Errorf("%s %q on a %d", h, v, tc.status)
 					}
 				}
-				if v := resp.Header.Get("Content-Length"); v != "" && v != strconv.Itoa(len(got)) {
+				if v := hdr.Get("Content-Length"); v != "" && v != strconv.Itoa(len(got)) {
 					t.Errorf("Content-Length %s with a %d byte body", v, len(got))
 				}
 				if method == http.MethodHead && len(got) != 0 {
