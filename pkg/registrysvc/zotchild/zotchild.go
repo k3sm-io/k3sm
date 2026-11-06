@@ -21,7 +21,8 @@ limitations under the License.
 // zotregistry.dev/zot/v2/cmd/zot as a `tool` at DefaultZotVersion, so `go build
 // zotregistry.dev/zot/v2/cmd/zot` inside it builds zot's own main package from
 // zot's own module graph, with one change: the requirement raises of
-// internal/childreq (golang.org/x/net v0.60.0) are required here too, and MVS
+// internal/childreq (golang.org/x/net v0.60.0, github.com/klauspost/compress
+// v1.20.2) are required here too, and MVS
 // selects them over the versions zot's tag pins. Nothing else moves; the
 // registrysvc tests hold both facts against this go.mod.
 //

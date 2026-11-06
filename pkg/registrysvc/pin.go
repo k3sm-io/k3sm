@@ -60,10 +60,11 @@ const (
 	ZotMarkerName = "zot.version"
 	// zotBuildVariant records HOW the pinned child was built. "minimal" is the
 	// plain `cmd/zot` build with NO build tags, which is zot's dist-spec-only
-	// flavor: no search, metrics, scrub, sync, UI, or image-trust extensions. "+r1"
-	// is the first set of requirement raises the build carries (internal/childreq:
-	// golang.org/x/net v0.60.0, required by the zotchild wrapper module); the bare
-	// "minimal" was zot's tag graph unchanged. It is part of the marker because
+	// flavor: no search, metrics, scrub, sync, UI, or image-trust extensions. "+r2"
+	// is the set of requirement raises the build carries (internal/childreq:
+	// golang.org/x/net v0.60.0 and github.com/klauspost/compress v1.20.2, required by
+	// the zotchild wrapper module); "+r1" was x/net alone and the bare "minimal" was
+	// zot's tag graph unchanged. It is part of the marker because
 	// version alone does not identify the binary: the same zot tag builds a much
 	// larger registry when its extension tags are passed, and links different
 	// dependencies with and without the raises. Changing the raises changes the
@@ -75,7 +76,7 @@ const (
 	// 439 (3,376), among them trivy and its databases, containerd, helm and
 	// client-go, and it serves a GraphQL endpoint over every repository to the
 	// same anonymous readers the catalog has.
-	zotBuildVariant = "minimal+r1"
+	zotBuildVariant = "minimal+r2"
 	// zotModulePath is the main package the wrapper module builds.
 	zotModulePath = "zotregistry.dev/zot/v2/cmd/zot"
 )

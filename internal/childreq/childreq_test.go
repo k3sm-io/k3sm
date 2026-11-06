@@ -87,10 +87,13 @@ func TestApply(t *testing.T) {
 	}
 }
 
-// TestRaises pins the raise set: x/net at XNetVersion, with both hashes present.
+// TestRaises pins the raise set: x/net at XNetVersion and compress at
+// CompressVersion, each with both hashes present.
 func TestRaises(t *testing.T) {
-	if len(Raises) != 1 || Raises[0].Path != "golang.org/x/net" || Raises[0].Version != XNetVersion {
-		t.Fatalf("Raises = %+v, want golang.org/x/net at %s alone", Raises, XNetVersion)
+	if len(Raises) != 2 ||
+		Raises[0].Path != "golang.org/x/net" || Raises[0].Version != XNetVersion ||
+		Raises[1].Path != "github.com/klauspost/compress" || Raises[1].Version != CompressVersion {
+		t.Fatalf("Raises = %+v, want golang.org/x/net at %s and github.com/klauspost/compress at %s", Raises, XNetVersion, CompressVersion)
 	}
 	for _, r := range Raises {
 		if !strings.HasPrefix(r.Sum, "h1:") || !strings.HasPrefix(r.GoModSum, "h1:") {
