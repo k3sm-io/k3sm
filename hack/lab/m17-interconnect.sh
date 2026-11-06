@@ -384,6 +384,71 @@ EOF
 	cp "$PAYLOAD_LOG" "$RUNG_DIR/doctor-$1.json"
 }
 
+# doctor_mechanism_problem <doctor --json file> — why this report comes from a doctor
+# without the interconnect section; silent and 0 when it has one. Only ic-bridge and
+# ic-stray can say so (cmd/k3sm/doctorinterconnect.go interconnectChecks, which
+# doctor always runs): ic-bridge is on every path, ic-stray on every path but a Mac
+# with no Thunderbolt port, and the bridge probe has already refused that Mac. Every
+# other row depends on the host: ic-netd, ic-address, ic-peers and the rest only when
+# a cable or an address puts the Mac in use, ic-residue only when there is residue.
+# Both names arrived with the section, so an older binary has neither.
+doctor_mechanism_problem() {
+	local row
+	for row in ic-bridge ic-stray; do
+		case "$(icp_doctor_row_state "$1" "$row")" in
+		absent | unreadable)
+			echo "has no $row row"
+			return 1
+			;;
+		esac
+	done
+}
+# doctor_residue_verdict <baseline doctor --json> <doctor --json now> <own addresses> —
+# what the ic-residue row says this run left; non-zero when it names any. No row means
+# no residue. The product writes a present row with state ok, always, as harmless
+# (checkICResidue), so its state cannot be the test, and a row can exist before the run
+# because macOS will not delete those routes. So the routes are the test, under the
+# same rule as icp_route_residue: one in the baseline row is not this run's, and one
+# for this Mac's own slot is the clone macOS keeps of an alias it removed. Anything
+# else, a state other than ok, or wording this cannot read, is red.
+doctor_residue_verdict() {
+	python3 -I -c 'import json,re,sys
+def row(path):
+    for r in json.load(open(path)).get("rows") or []:
+        if r.get("name")=="ic-residue":
+            return r
+def routes(r):
+    m=re.match(r"harmless pre-existing state: (\S+(?:, \S+)*) on bridge0 ", r.get("detail",""))
+    return m.group(1).split(", ") if m else None
+try:
+    now=row(sys.argv[2])
+except Exception as e:
+    print("doctor report unreadable: %s" % e); sys.exit(1)
+if now is None:
+    print("no ic-residue row, so no residue"); sys.exit(0)
+if now.get("state")!="ok":
+    print("ic-residue is %s: %s" % (now.get("state"), now.get("detail"))); sys.exit(1)
+left=routes(now)
+if left is None:
+    print("ic-residue names no routes this can read: %s" % now.get("detail")); sys.exit(1)
+try:
+    base=row(sys.argv[1])
+except Exception:
+    base=None
+before=(routes(base) or []) if base else []
+own=sys.argv[3].split()
+new=[x for x in left if x not in before and x.split("/")[0] not in own]
+if new:
+    print("residue this run left: %s" % ", ".join(new)); sys.exit(1)
+print("only routes this run did not leave: %s" % ", ".join(left))' "$1" "$2" "$3"
+}
+# own_slot_addrs <side> — every interconnect address this Mac can hold.
+own_slot_addrs() {
+	local x idx
+	idx="$(side_var "$1" IDX)"
+	for x in 0 1 2 3 4 5 6 7; do icp_slot_addr "$idx" "$x"; done | tr '\n' ' '
+}
+
 # ic_pod_manifest <name> <node> <annotated 0|1> <shell command> — a native pod
 # pinned to a node (nodeName AND the darwin selector; the provider toleration plus
 # K3SM_LAB_TOLERATE_KEYS, never a blanket one). ic_pod applies it.
@@ -1079,9 +1144,8 @@ EOF
 
 # host_clean <side> <tag> — the r8/r9 host assertions on one Mac.
 host_clean() {
-	local s="$1" t="$2" idx own
-	idx="$(side_var "$s" IDX)"
-	own="$(for x in 0 1 2 3 4 5 6 7; do icp_slot_addr "$idx" "$x"; done | tr '\n' ' ')"
+	local s="$1" t="$2" own
+	own="$(own_slot_addrs "$s")"
 	snap "$s" "$t"
 	check "$s Mac: no inet in 169.254.0.0/24 or 169.254.255.0/24 on bridge0" icp_halves_empty "$RUNG_DIR/$s-$t-bridge0.txt"
 	check "$s Mac: no reserved-half route beyond the baseline and no cloned host route for a peer slot" \
@@ -1388,7 +1452,8 @@ EOF
 					fail "$s Mac: the current build set could not be shipped for doctor"
 				fi
 				check "$s Mac: doctor ic-stray is clean" test "$(icp_doctor_row_state "$RUNG_DIR/doctor-$s.json" ic-stray)" = ok
-				check "$s Mac: doctor ic-residue is clean" test "$(icp_doctor_row_state "$RUNG_DIR/doctor-$s.json" ic-residue)" = ok
+				check "$s Mac: doctor ic-residue names nothing this run left" \
+					doctor_residue_verdict "$BASE_DIR/doctor-$s.json" "$RUNG_DIR/doctor-$s.json" "$(own_slot_addrs "$s")"
 				check "$s Mac: no reboot happened (kern.boottime unchanged; a reboot is never the cleanup)" \
 					test "$(on "$s" 'sysctl -n kern.boottime' 2>/dev/null)" = "$(side_var "$s" BOOT)"
 			done
@@ -1948,7 +2013,23 @@ self_test_body() {
 	st "disarmed red: an armedBy record" 1 ic_disarmed_verdict "$F/interconnect-disarmed-armedby.json"
 	st "disarmed red: an attached pod" 1 ic_disarmed_verdict "$F/interconnect-disarmed-attached.json"
 	st_eq "the members stay on the record" "$(ic_members_line "$F/interconnect-disarmed-members-down.json")" "node-a down since 2026-10-15T09:00:00Z, node-b down since 2026-10-30T09:00:00Z"
-	st_eq "doctor: ic-residue clean" "$(icp_doctor_row_state "$F/doctor-clean.json" ic-residue)" ok
+	st_eq "doctor: a clean Mac has no ic-residue row at all" "$(icp_doctor_row_state "$F/doctor-clean.json" ic-residue)" absent
+	st "doctor mechanism: a clean Mac, no ic-residue row" 0 doctor_mechanism_problem "$F/doctor-clean.json"
+	st "doctor mechanism: a Mac not in use has only ic-bridge and ic-stray" 0 doctor_mechanism_problem "$F/doctor-not-in-use.json"
+	st "doctor mechanism: a real residue row does not hide the section" 0 doctor_mechanism_problem "$F/doctor-residue-baseline.json"
+	st_out "doctor mechanism red: a doctor with no section" "has no ic-bridge row" doctor_mechanism_problem "$F/doctor-no-section.json"
+	st_out "doctor mechanism red: no Thunderbolt port as the doctor sees it" "has no ic-stray row" doctor_mechanism_problem "$F/doctor-no-port.json"
+	st_out "doctor mechanism red: not a doctor report" "has no ic-bridge row" doctor_mechanism_problem "$F/hello-error.txt"
+	st "residue: no row on a Mac that had none" 0 doctor_residue_verdict "$F/doctor-clean.json" "$F/doctor-clean.json" "169.254.0.25"
+	st "residue: the row the Mac already had" 0 doctor_residue_verdict "$F/doctor-residue-baseline.json" "$F/doctor-residue-baseline.json" "169.254.0.25"
+	st "residue: the row gone since the baseline" 0 doctor_residue_verdict "$F/doctor-residue-baseline.json" "$F/doctor-clean.json" "169.254.0.25"
+	st "residue: this Mac's own removed alias, which macOS keeps" 0 doctor_residue_verdict "$F/doctor-residue-baseline.json" "$F/doctor-residue-own-clone.json" "169.254.0.25 169.254.0.26"
+	st_out "residue red: a route that was not in the baseline, state ok" "residue this run left: 169.254.0.10/32" doctor_residue_verdict "$F/doctor-residue-baseline.json" "$F/doctor-residue-new.json" "169.254.0.25 169.254.0.26"
+	st "residue red: that route exits non-zero" 1 doctor_residue_verdict "$F/doctor-residue-baseline.json" "$F/doctor-residue-new.json" "169.254.0.25 169.254.0.26"
+	st "residue red: a row where the Mac had none" 1 doctor_residue_verdict "$F/doctor-clean.json" "$F/doctor-residue-baseline.json" "169.254.0.25"
+	st "residue red: a state other than ok" 1 doctor_residue_verdict "$F/doctor-clean.json" "$F/doctor-residue.json" "169.254.0.25"
+	st "residue red: wording this cannot read" 1 doctor_residue_verdict "$F/doctor-clean.json" "$F/doctor-residue-unparsed.json" "169.254.0.25"
+	st "residue red: not a doctor report" 1 doctor_residue_verdict "$F/doctor-clean.json" "$F/hello-error.txt" "169.254.0.25"
 	st_eq "doctor red: ic-stray warns" "$(icp_doctor_row_state "$F/doctor-residue.json" ic-stray)" warn
 	st_eq "doctor: a missing row" "$(icp_doctor_row_state "$F/doctor-clean.json" ic-peers)" absent
 	st_eq "doctor red: not a doctor report" "$(icp_doctor_row_state "$F/hello-error.txt" ic-stray)" unreadable
@@ -2235,11 +2316,7 @@ help="$(on_local "$K3SM_BIN interconnect --help" 2>&1)"
 [[ "$help" == *enable* ]] && [[ "$help" == *disable* ]] || probe_miss verbs preflight
 for side in local peer; do
 	doctor_json "$side"
-	for row in ic-bridge ic-netd ic-peers ic-stray ic-residue; do
-		case "$(icp_doctor_row_state "$BASE_DIR/doctor-$side.json" "$row")" in
-		absent | unreadable) probe_miss doctor preflight "the $side Mac's doctor --json has no $row row" ;;
-		esac
-	done
+	why="$(doctor_mechanism_problem "$BASE_DIR/doctor-$side.json")" || probe_miss doctor preflight "the $side Mac's doctor --json $why"
 	netd_hello "$side"
 	icp_helper_verdict "$BASE_DIR/netd-hello-$side.json" >/dev/null || probe_miss netd preflight "$(netd_probe_detail "$side" "$BASE_DIR/netd-hello-$side.json")"
 	echo "      [$side] $(netd_probe_detail "$side" "$BASE_DIR/netd-hello-$side.json")"

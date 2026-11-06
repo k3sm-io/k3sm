@@ -1,0 +1,1 @@
+{"schemaVersion":1,"verdict":"running","rows":[{"name":"ic-bridge","state":"skip","severity":"skip","detail":"this Mac has no Thunderbolt network port, so there is no interconnect to check"}]}
