@@ -258,12 +258,12 @@ func (s *Server) tags(w http.ResponseWriter, r *http.Request, n ref.Name) {
 // rebuilt when index.json changes. An unknown repository or subject is an
 // empty index. No referrers tag is ever written.
 func (s *Server) referrers(w http.ResponseWriter, r *http.Request, n ref.Name) {
+	if !s.allow(w, r, VerbRead, n) {
+		return
+	}
 	d, err := ref.ParseDigest(mux.Vars(r)["digest"])
 	if err != nil {
 		s.fail(w, r, err)
-		return
-	}
-	if !s.allow(w, r, VerbRead, n) {
 		return
 	}
 	q := r.URL.Query()
