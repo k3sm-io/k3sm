@@ -24,6 +24,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/opencontainers/go-digest"
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -109,6 +110,46 @@ type refEntry struct {
 	size       int
 	unreadable bool
 	fileState  bool
+	// seen is the blob's stat identity when a fileState negative was
+	// recorded; a different identity later means the file was repaired.
+	seen blobIdent
+}
+
+// blobIdent is a blob file's stat identity; the zero value is a blob that is
+// absent or not a regular file.
+type blobIdent struct {
+	ino     uint64
+	size    int64
+	modTime int64
+}
+
+// blobIdentOf stats blob d of n without reading it.
+func (s *Server) blobIdentOf(n ref.Name, d digest.Digest) blobIdent {
+	f, err := s.st.OpenBlob(n, d)
+	if err != nil {
+		return blobIdent{}
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return blobIdent{}
+	}
+	id := blobIdent{size: fi.Size(), modTime: fi.ModTime().UnixNano()}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		id.ino = st.Ino
+	}
+	return id
+}
+
+// repaired reports whether v holds a file-state negative whose blob changed
+// on disk since it was recorded. It runs only for views with negatives.
+func (s *Server) repaired(n ref.Name, v *refView) bool {
+	for d, e := range v.entries {
+		if e.unreadable && e.fileState && s.blobIdentOf(n, d) != e.seen {
+			return true
+		}
+	}
+	return false
 }
 
 // refView is the referrers view of one repository.
@@ -254,7 +295,7 @@ func (s *Server) referrersOf(r *http.Request, n ref.Name, d digest.Digest) ([]re
 	if err != nil {
 		return nil, err
 	}
-	if v.ready && v.version == ver {
+	if v.ready && v.version == ver && !s.repaired(n, v) {
 		return v.bySubject[d], nil
 	}
 	select {
@@ -307,7 +348,7 @@ func (s *Server) buildReferrers(ctx context.Context, key string, n ref.Name, v *
 		if _, ok := entries[row.Digest]; ok {
 			continue
 		}
-		if e, ok := v.entries[row.Digest]; ok && e.desc.MediaType == row.MediaType && e.desc.Size == row.Size && !(reread && e.unreadable && e.fileState) {
+		if e, ok := v.entries[row.Digest]; ok && e.desc.MediaType == row.MediaType && e.desc.Size == row.Size && !(e.unreadable && e.fileState && (reread || s.blobIdentOf(n, row.Digest) != e.seen)) {
 			entries[row.Digest] = e
 			continue
 		}
@@ -319,6 +360,7 @@ func (s *Server) buildReferrers(ctx context.Context, key string, n ref.Name, v *
 		if s.referrerRead != nil {
 			s.referrerRead(row.Digest)
 		}
+		seen := s.blobIdentOf(n, row.Digest)
 		body, err := s.readManifestBlob(n, row)
 		if err != nil {
 			if !permanentReadError(err) {
@@ -329,7 +371,7 @@ func (s *Server) buildReferrers(ctx context.Context, key string, n ref.Name, v *
 				continue
 			}
 			s.log.Warn("registry referrers scan skipped an unreadable manifest", "repository", key, "digest", row.Digest.String(), "err", err)
-			entries[row.Digest] = refEntry{desc: ispec.Descriptor{MediaType: row.MediaType, Digest: row.Digest, Size: row.Size}, size: 64, unreadable: true, fileState: !errors.Is(err, errManifestSize)}
+			entries[row.Digest] = refEntry{desc: ispec.Descriptor{MediaType: row.MediaType, Digest: row.Digest, Size: row.Size}, size: 64, unreadable: true, fileState: !errors.Is(err, errManifestSize), seen: seen}
 			continue
 		}
 		readBytes += int64(len(body))

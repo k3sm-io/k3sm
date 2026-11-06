@@ -632,17 +632,15 @@ func TestReferrersRereadNegatives(t *testing.T) {
 	if n := count(f.do(http.MethodGet, path, nil)); n != 3 {
 		t.Fatalf("with three blobs missing: %d referrers", n)
 	}
-	// The blobs come back, but index.json is unchanged: nothing is re-read.
+	// The blobs come back and index.json changes before the next request (a
+	// repair with an unchanged index is read at once; see
+	// TestReferrersRecoverAfterCorruptManifestRepair).
 	for i, b := range saved {
 		if err := os.WriteFile(blob(bodies[i]), b, 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
-	reads = 0
-	if n := count(f.do(http.MethodGet, path, nil)); n != 3 || reads != 0 {
-		t.Fatalf("an unchanged index: %d referrers, %d reads", n, reads)
-	}
-	// index.json changes: the three negatives and the new manifest are read
+	// The three negatives and the new manifest are read
 	// within a budget of two a request, so the first request is busy.
 	f.addRows(t, "app", [][]byte{referrerBody(subject, "application/vnd.example.sig", 6)})
 	f.srv.refScanRows = 2
