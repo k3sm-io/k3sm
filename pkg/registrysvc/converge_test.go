@@ -660,6 +660,164 @@ func TestConvergeLowSpaceKeepsItsSpacing(t *testing.T) {
 	})
 }
 
+// TestConvergeCommitsCannotDriveFruitlessPasses: past the cap, how much a pusher can
+// make the loop hash is bounded by time, however many commits it sends, until a
+// pass merges something.
+func TestConvergeCommitsCannotDriveFruitlessPasses(t *testing.T) {
+	const span = 6 * time.Hour
+	// bound is one pass per spacing.
+	bound := int(span / serveConvergeFruitlessSpacing)
+	spent := store.ConvergeReport{Pending: 4, CorruptKeepers: 1, HashedBytes: 16 << 30, Skipped: map[store.SkipReason]int{store.SkipHashBudget: 4}}
+	// atCap runs the passes that reach the cap and returns the last look's time.
+	atCap := func(r *loopRig) time.Duration {
+		r.t.Helper()
+		r.fence.swept()
+		r.rep = spent
+		got, at := r.passesFrom(0)
+		if got != serveConvergeMaxFruitless {
+			r.t.Fatalf("%d passes, want the cap of %d", got, serveConvergeMaxFruitless)
+		}
+		return at
+	}
+	wantSpaced := func(t *testing.T, starts []time.Duration, limit int) {
+		t.Helper()
+		if len(starts) > limit {
+			t.Fatalf("%d passes in %v, want at most %d", len(starts), span, limit)
+		}
+		if len(starts) == 0 {
+			t.Fatal("no pass: a commit past the cap must still get one")
+		}
+	}
+	tests := []struct {
+		name  string
+		every time.Duration
+		low   bool
+	}{
+		{"a commit every 2 minutes, each followed by an idle store", 2 * time.Minute, false},
+		{"a commit every tick, so that only the bound starts a pass", serveConvergeTick, false},
+		{"a commit every tick on low space", serveConvergeTick, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := newLoopRig(t)
+			at := atCap(r)
+			if tt.low {
+				r.free.Store(1)
+			}
+			starts := r.drip(at, span, tt.every)
+			wantSpaced(t, starts, bound)
+			for i := 1; i < len(starts); i++ {
+				if gap := starts[i] - starts[i-1]; gap < serveConvergeFruitlessSpacing {
+					t.Errorf("pass %d started %v after the last, inside the spacing", i, gap)
+				}
+			}
+		})
+	}
+	t.Run("a pass that hashes under the budget and leaves no work counts", func(t *testing.T) {
+		r := newLoopRig(t)
+		r.fence.swept()
+		r.rep = store.ConvergeReport{Pending: 2, CorruptKeepers: 1, HashedBytes: 15 << 30, Skipped: map[store.SkipReason]int{store.SkipNoKeeper: 2}}
+		starts := r.drip(2*time.Hour, span, 2*time.Minute)
+		wantSpaced(t, starts, serveConvergeMaxFruitless+bound)
+	})
+	t.Run("a failure that leaves no work counts", func(t *testing.T) {
+		r := newLoopRig(t)
+		r.fence.swept()
+		r.passErr = errors.New("sync failed")
+		starts := r.drip(2*time.Hour, span, 2*time.Minute)
+		wantSpaced(t, starts, serveConvergeMaxFruitless+bound)
+	})
+	t.Run("a pass an upload stops after hashing counts", func(t *testing.T) {
+		r := newLoopRig(t)
+		r.fence.swept()
+		r.hold = true
+		r.rep = store.ConvergeReport{HashedBytes: 1 << 30}
+		from := 2 * time.Hour
+		passes := 0
+		for d := time.Duration(0); d < span; d += serveConvergeTick {
+			if d%(2*time.Minute) == 0 {
+				r.commitAt(from + d)
+			}
+			r.at(from + d)
+			if r.l.cur == nil {
+				continue
+			}
+			passes++
+			r.sessions.Store(1)
+			r.l.step(r.ctx, r.t0.Add(from+d))
+			r.sessions.Store(0)
+			if !r.l.cur.stopped {
+				r.l.cur.cancel() // past its bound, which no upload stops
+			}
+			r.finish()
+			r.lastPass()
+		}
+		if limit := serveConvergeMaxFruitless + bound; passes > limit {
+			t.Fatalf("%d passes in %v, want at most %d", passes, span, limit)
+		}
+	})
+	t.Run("a sweep's re-arm does not shorten the spacing", func(t *testing.T) {
+		r := newLoopRig(t)
+		at := atCap(r)
+		r.commitAt(at)
+		r.at(at + rigWait)
+		r.wantPass("a commit past the cap", convergeWhyIdle)
+		ended := at + rigWait
+		r.finish()
+		r.lastPass()
+		r.l.rearm(r.t0.Add(ended))
+		r.at(ended + serveConvergeFruitlessSpacing - time.Second)
+		r.wantNoPass("a second short of the spacing")
+		r.at(ended + serveConvergeFruitlessSpacing)
+		r.wantPass("past the spacing", convergeWhyIdle)
+	})
+	t.Run("the spacing runs from the end of the pass", func(t *testing.T) {
+		r := newLoopRig(t)
+		at := atCap(r)
+		r.commitAt(at)
+		r.at(at + rigWait)
+		r.wantPass("a commit past the cap", convergeWhyIdle)
+		ended := at + rigWait + 10*time.Minute
+		r.set(ended)
+		r.finish()
+		r.lastPass()
+		r.commitAt(ended)
+		r.at(ended + serveConvergeFruitlessSpacing - time.Second)
+		r.wantNoPass("a second short of the spacing")
+		r.at(ended + serveConvergeFruitlessSpacing)
+		r.wantPass("the commit's bound, past the spacing", convergeWhyBound)
+	})
+	t.Run("a pass that merges ends the spacing", func(t *testing.T) {
+		for name, stopped := range map[string]bool{"finished": false, "stopped by an upload": true} {
+			t.Run(name, func(t *testing.T) {
+				r := newLoopRig(t)
+				at := atCap(r)
+				r.rep = store.ConvergeReport{Merged: 1}
+				r.hold = stopped
+				r.commitAt(at)
+				r.at(at + rigWait)
+				r.wantPass("a commit past the cap", convergeWhyIdle)
+				ended := at + rigWait
+				if stopped {
+					r.sessions.Store(1)
+					r.l.step(r.ctx, r.t0.Add(ended))
+					r.sessions.Store(0)
+				}
+				r.finish()
+				r.lastPass()
+				if r.l.fruitless != 0 {
+					t.Fatalf("a merge left the count at %d", r.l.fruitless)
+				}
+				r.hold = false
+				r.rep = store.ConvergeReport{}
+				r.commitAt(ended)
+				r.at(ended + rigWait + time.Second)
+				r.wantPass("the next commit, one idle wait on", convergeWhyIdle)
+			})
+		}
+	})
+}
+
 // TestConvergeLoopStopsForAnUpload pins which passes an upload stops.
 func TestConvergeLoopStopsForAnUpload(t *testing.T) {
 	const after = 2 * time.Hour
@@ -1091,8 +1249,8 @@ func TestServeConvergeCadence(t *testing.T) {
 		t.Errorf("idle %v, jitter %v, bound %v, free every %v, low free %d", serveConvergeIdle, serveConvergeJitter,
 			serveConvergeBound, serveConvergeFreeEvery, uint64(serveConvergeLowFree))
 	}
-	if serveConvergeMaxFruitless != 3 {
-		t.Errorf("max fruitless passes %d", serveConvergeMaxFruitless)
+	if serveConvergeMaxFruitless != 3 || serveConvergeFruitlessSpacing != time.Hour {
+		t.Errorf("max fruitless passes %d, spacing %v", serveConvergeMaxFruitless, serveConvergeFruitlessSpacing)
 	}
 }
 

@@ -61,14 +61,28 @@ const (
 	// serveConvergeTick is how often the loop looks at its conditions. It reads
 	// only memory, except for the free space above.
 	serveConvergeTick = 5 * time.Second
-	// serveConvergeMaxFruitless is how many passes in a row may leave work and merge
-	// nothing, or fail, before a pass stops setting its own trigger. A merge is what
-	// a further pass is for, and copies are finite, so passes that merge always end.
-	// One with no merge may still be worth it, as the hash budget's rotation hands
-	// the next pass another digest, but a corrupt keeper or a failing volume would
-	// repeat forever. So at most this many passes, about 48 GiB of hashing, follow
-	// from one commit, mount, reviewing sweep or start.
+	// serveConvergeMaxFruitless is how many passes in a row may get nowhere before a
+	// pass stops setting its own trigger and serveConvergeFruitlessSpacing starts to
+	// apply: see settle for what counts. A merge is what a further pass is for, and
+	// copies are finite, so passes that merge always end. One with no merge may still
+	// be worth it, as the hash budget's rotation hands the next pass another digest,
+	// but a corrupt keeper or a failing volume would repeat forever.
 	serveConvergeMaxFruitless = 3
+	// serveConvergeFruitlessSpacing is the least time from the end of a pass that
+	// reached serveConvergeMaxFruitless to the start of the next, whatever set the
+	// trigger, until a pass merges something. Commits do not reset the count or
+	// shorten this, so past the cap a client with push rights causes at most one pass
+	// an hour, about 16 GiB of hashing against the 900 GiB an hour the hash rate would
+	// allow. An hour is much longer than the 64 s a full budget takes to hash, and the
+	// cost of waiting is only that a copy stays on disk a little longer on a store
+	// whose last passes have merged nothing. A pass that keeps the trigger past the
+	// bound still starts when the spacing ends, and no upload stops it. The budget
+	// exempts a pass's first digest, so one blob larger than 16 GiB costs twice its
+	// size. A merge clears the count, and a client can cause one by pushing a blob to
+	// two reviewed repositories, so this limits only passes that merge nothing:
+	// passes that merge run one rest apart, up to about 450 GiB an hour if each
+	// spends its budget.
+	serveConvergeFruitlessSpacing = time.Hour
 )
 
 // Why a pass started, as registry.log says it.
@@ -426,7 +440,7 @@ func (l *convergeLoop) finish(ctx context.Context, res convergeResult) {
 		attrs = append(attrs, "err", res.err)
 	}
 	l.log.Log(ctx, level, "registry dedupe: pass finished", attrs...)
-	l.settle(run, res)
+	l.settle(run, res, failed)
 	if !run.stopped {
 		l.rearmForWork(res)
 	}
@@ -441,34 +455,38 @@ func (l *convergeLoop) finish(ctx context.Context, res convergeResult) {
 }
 
 // settle counts a finished pass against serveConvergeMaxFruitless and starts the rest
-// after it. A low-space pass that merged nothing counts even with no work left: it
-// stands in the way of uploads, and a commit is all it takes to start another.
-func (l *convergeLoop) settle(run *convergeRun, res convergeResult) {
+// after it, which at the cap is serveConvergeFruitlessSpacing. A pass that merged and
+// did not fail clears the count, even one an upload stopped. Any other pass counts
+// when it cost something a commit could ask for again: it failed, hashed, stood in
+// the way of uploads on low space, or ran to the end and left work. A pass that did
+// none of that found nothing to do, which clears the count, unless an upload stopped
+// it, which says nothing either way.
+func (l *convergeLoop) settle(run *convergeRun, res convergeResult, failed bool) {
 	switch {
-	case run.stopped:
-	case !res.rep.LeftWork() && run.why != convergeWhyLowSpace:
+	case res.rep.Merged > 0 && !failed:
 		l.fruitless = 0
-	case res.err != nil || res.rep.Merged == 0:
+	case failed, res.rep.HashedBytes > 0, run.why == convergeWhyLowSpace, !run.stopped && res.rep.LeftWork():
 		l.fruitless++
-	default:
+	case !run.stopped:
 		l.fruitless = 0
+	}
+	spacing := serveConvergeIdle
+	if l.fruitless >= serveConvergeMaxFruitless {
+		spacing = serveConvergeFruitlessSpacing
+		l.log.Warn("registry dedupe: passes in a row got nowhere; the next waits, whatever commits arrive, until a pass merges something",
+			"passes", l.fruitless, "spacing", spacing.String())
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.rest = l.now().Add(serveConvergeIdle)
+	l.rest = l.now().Add(spacing)
 }
 
 // rearmForWork sets the trigger when res left work a later pass could do, until
 // serveConvergeMaxFruitless passes in a row have got nowhere.
 func (l *convergeLoop) rearmForWork(res convergeResult) {
-	if !res.rep.LeftWork() {
-		return
+	if res.rep.LeftWork() && l.fruitless < serveConvergeMaxFruitless {
+		l.rearm(l.now())
 	}
-	if l.fruitless >= serveConvergeMaxFruitless {
-		l.log.Warn("registry dedupe: passes left copies and merged nothing; the next commit, mount or start runs another", "passes", l.fruitless)
-		return
-	}
-	l.rearm(l.now())
 }
 
 // watchCommits calls committed after each POST or PUT answered 201, which is how

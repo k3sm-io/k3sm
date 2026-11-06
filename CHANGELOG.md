@@ -90,12 +90,17 @@ pin, its date, and the tarball's sha256.
   default, with no setting to turn it off: after 60 s with no commit and no live upload, plus up to 60 s
   of jitter, and at most 15 minutes after the first commit it has not yet covered. Below 4 GiB free it
   starts without that wait, but no sooner than 60 s after the last pass ended, and a pass there that merges
-  nothing counts toward the limit below. An upload stops a pass between merges, unless the 15 minutes have passed or
+  nothing counts toward the limit on passes below. An upload stops a pass between merges, unless the 15 minutes have passed or
   space is low. No pass runs within an hour of start, or before the first garbage collection, and only
   a repository garbage collection has reported is rewritten, so a new repository's copies wait for its
   first sweep, at most 6 hours, and merge about 2 minutes after it. A pass stopped by its limit of
-  16 GiB hashed or 1,024 merges is followed by another after the same wait, until three in a row merge
-  nothing or fail. Any other copy a pass leaves waits for the next commit, mount or server start.
+  16 GiB hashed or 1,024 merges is followed by another after the same wait. After three passes in a row
+  that hash, fail, leave work or run on low space without merging, a pass no longer follows on its own,
+  and the next one, whatever commits arrive, starts no sooner than an hour after the last ended, until a
+  pass merges something. So past that point a client with push rights causes at most one pass an hour,
+  about 16 GiB of hashing, more only if a single blob is larger than that. Passes that merge are not held
+  to this, so a client pushing fresh copies to repositories already reviewed keeps them running a minute
+  or more apart. Any other copy a pass leaves waits for the next commit, mount or server start.
   `registry.log` records each merge and each pass, and
   `registry-state.json` gains a `dedupe` object with the last pass's counts. `du -sk` of the registry
   root falls to one copy; `du` of a single repository still shows its full size.
