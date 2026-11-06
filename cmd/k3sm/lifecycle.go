@@ -277,7 +277,11 @@ func lifecycleClient(dataRoot, kubeconfig string) (*rest.Config, kubernetes.Inte
 		if err != nil {
 			return nil, nil, fmt.Errorf("%w: %w; %s", install.ErrNodeIdentity, err, clusterAnchorRemedy)
 		}
-		return kubeclient.FromCheckedPathWithCA(kubeconfig, caPEM)
+		cfg, cs, err := kubeclient.FromCheckedPathWithCA(kubeconfig, caPEM)
+		if errors.Is(err, kubeclient.ErrCAUnusable) {
+			return nil, nil, fmt.Errorf("%w: %w; %s", install.ErrNodeIdentity, err, clusterAnchorRemedy)
+		}
+		return cfg, cs, err
 	}
 	if kubeconfig == install.AgentCredentialPath(dataRoot) {
 		return kubeclient.FromCheckedWorkerPath(kubeconfig)

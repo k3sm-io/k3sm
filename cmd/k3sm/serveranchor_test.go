@@ -30,6 +30,7 @@ import (
 	"strings"
 	"testing"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/tools/clientcmd"
 
 	"k3sm.io/k3sm/pkg/certs"
@@ -373,3 +374,63 @@ func checkClusterCAIssuer(leaf, ca *x509.Certificate) error {
 
 // fileRef is a pointer to a described file, for a table row where none means absent.
 func fileRef(f sudoKubeconfigFile) *sudoKubeconfigFile { return &f }
+
+// TestRootNodeMarkerLoadsThroughTheRootCopyEveryAttempt pins what a start's uncordon
+// relies on: each MarkNode attempt goes through the pinned load again, and a missing
+// or unusable copy is an identity failure the retry stops on, never a 401.
+func TestRootNodeMarkerLoadsThroughTheRootCopyEveryAttempt(t *testing.T) {
+	dataRoot := t.TempDir()
+	store := nodeCredentialStore{dir: filepath.Dir(install.AgentCredentialPath(dataRoot))}
+	if err := os.MkdirAll(store.dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	res, _, _ := nodeCredFixture(t, nodeCredClientTTL, nodeCredClientTTL)
+	if err := store.Save("https://127.0.0.1:1", nodeCredTestNode, res); err != nil {
+		t.Fatalf("save credential: %v", err)
+	}
+	mark := nodeMarker(plistPresentSystem{}, dataRoot)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // No attempt below needs the apiserver.
+
+	t.Run("every attempt reads the copy", func(t *testing.T) {
+		asRoot(t)
+		anchor := fixtureCA(t)
+		reads := 0
+		withClusterAnchor(t, func(string) (sudoKubeconfigFile, error) {
+			reads++
+			return regular(0, 0o644, string(anchor)), nil
+		})
+		for attempt := 1; attempt <= 2; attempt++ {
+			if err := mark(ctx, false, "actor", "reason"); errors.Is(err, install.ErrNodeIdentity) {
+				t.Fatalf("attempt %d: %v", attempt, err)
+			}
+			if reads != attempt {
+				t.Fatalf("after attempt %d the copy was read %d times", attempt, reads)
+			}
+		}
+	})
+	for name, read := range map[string]func(string) (sudoKubeconfigFile, error){
+		"missing": absentFile,
+		"wrong owner": func(string) (sudoKubeconfigFile, error) {
+			return regular(501, 0o644, string(fixtureCA(t))), nil
+		},
+		"not a CA": func(string) (sudoKubeconfigFile, error) {
+			return regular(0, 0o644, "not a certificate"), nil
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			asRoot(t)
+			withClusterAnchor(t, read)
+			err := mark(context.Background(), false, "actor", "reason")
+			if !errors.Is(err, install.ErrNodeIdentity) {
+				t.Fatalf("err = %v, want install.ErrNodeIdentity", err)
+			}
+			if apierrors.IsUnauthorized(err) {
+				t.Errorf("err = %v reads as a 401, which a start's uncordon retries", err)
+			}
+			if !strings.Contains(err.Error(), "sudo k3sm install") {
+				t.Errorf("err names no remedy: %v", err)
+			}
+		})
+	}
+}
