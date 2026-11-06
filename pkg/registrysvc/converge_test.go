@@ -567,6 +567,99 @@ func TestConvergeDoesNotSpinOnPermanentSkips(t *testing.T) {
 	})
 }
 
+// drip commits every every and looks at the loop each tick for span from from,
+// ending each pass as it starts. It returns when the passes started.
+func (r *loopRig) drip(from, span, every time.Duration) []time.Duration {
+	r.t.Helper()
+	var starts []time.Duration
+	for t := time.Duration(0); t < span; t += serveConvergeTick {
+		if t%every == 0 {
+			r.commitAt(from + t)
+		}
+		r.at(from + t)
+		if r.l.cur != nil {
+			starts = append(starts, from+t)
+			r.finish()
+			r.lastPass()
+		}
+	}
+	return starts
+}
+
+// TestConvergeLowSpaceKeepsItsSpacing: with space low a commit starts a pass with
+// no idle wait, and no upload stops that pass, so a commit must not also shorten
+// the rest after the last one.
+func TestConvergeLowSpaceKeepsItsSpacing(t *testing.T) {
+	const after = 2 * time.Hour
+	const span = 5 * time.Minute
+	budget := map[store.SkipReason]int{store.SkipHashBudget: 4}
+	// bound is what the rest allows: one pass per rest.
+	bound := int(span / serveConvergeIdle)
+	tests := []struct {
+		name string
+		rep  store.ConvergeReport
+	}{
+		{"nothing to merge", store.ConvergeReport{}},
+		{"a hash budget spent for nothing", store.ConvergeReport{Pending: 4, HashedBytes: 16 << 30, Skipped: budget}},
+	}
+	for _, tt := range tests {
+		t.Run("a commit each tick does not shorten the rest: "+tt.name, func(t *testing.T) {
+			r := newLoopRig(t)
+			r.fence.swept()
+			r.free.Store(1)
+			r.rep = tt.rep
+			starts := r.drip(after, span, serveConvergeTick)
+			if len(starts) > bound {
+				t.Fatalf("%d low-space passes in %v, want at most %d: %v", len(starts), span, bound, starts)
+			}
+			for i := 1; i < len(starts); i++ {
+				if gap := starts[i] - starts[i-1]; gap < serveConvergeIdle {
+					t.Errorf("pass %d started %v after the last, inside the rest", i, gap)
+				}
+			}
+			if r.l.fruitless < serveConvergeMaxFruitless {
+				t.Errorf("%d low-space passes that merged nothing counted %d, want the cap of %d", len(starts), r.l.fruitless, serveConvergeMaxFruitless)
+			}
+		})
+	}
+	for name, rep := range map[string]store.ConvergeReport{
+		"with work left":    {Merged: 8, ReclaimedBytes: 1 << 30, Pending: 4, Skipped: budget},
+		"with no work left": {Merged: 8, ReclaimedBytes: 1 << 30},
+	} {
+		t.Run("a pass that frees space keeps going, one rest apart, "+name, func(t *testing.T) {
+			r := newLoopRig(t)
+			r.fence.swept()
+			r.free.Store(1)
+			r.rep = rep
+			starts := r.drip(after, span, serveConvergeTick)
+			if len(starts) != bound {
+				t.Fatalf("%d low-space passes in %v, want %d: %v", len(starts), span, bound, starts)
+			}
+			if r.l.fruitless != 0 {
+				t.Errorf("passes that merged counted %d", r.l.fruitless)
+			}
+		})
+	}
+	t.Run("a merge after passes that got nowhere clears the count", func(t *testing.T) {
+		r := newLoopRig(t)
+		r.fence.swept()
+		r.free.Store(1)
+		r.drip(after, serveConvergeIdle, serveConvergeTick)
+		if r.l.fruitless == 0 {
+			t.Fatal("a low-space pass that merged nothing did not count")
+		}
+		r.rep = store.ConvergeReport{Merged: 1}
+		r.commitAt(after + serveConvergeIdle)
+		r.at(after + serveConvergeIdle)
+		r.wantPass("past the rest", convergeWhyLowSpace)
+		r.finish()
+		r.lastPass()
+		if r.l.fruitless != 0 {
+			t.Errorf("a merge left the count at %d", r.l.fruitless)
+		}
+	})
+}
+
 // TestConvergeLoopStopsForAnUpload pins which passes an upload stops.
 func TestConvergeLoopStopsForAnUpload(t *testing.T) {
 	const after = 2 * time.Hour

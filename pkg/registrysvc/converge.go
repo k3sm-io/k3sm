@@ -54,8 +54,9 @@ const (
 	// serveConvergeFreeEvery is how often the loop reads the volume's free space.
 	serveConvergeFreeEvery = 30 * time.Second
 	// serveConvergeLowFree is the free space below which a pass starts with the
-	// trigger set, without the idle wait or jitter, and no upload stops it: twice
-	// the floor where the server starts refusing uploads.
+	// trigger set, without the idle wait or jitter but after the rest since the last
+	// pass, and no upload stops it: twice the floor where the server starts refusing
+	// uploads.
 	serveConvergeLowFree = 2 * api.DefaultMinFreeSpace
 	// serveConvergeTick is how often the loop looks at its conditions. It reads
 	// only memory, except for the free space above.
@@ -137,8 +138,9 @@ type convergeLoop struct {
 	// commit did, and last the latest commit or re-arm, which outlives the trigger.
 	armed       bool
 	first, last time.Time
-	// rest is the end of a re-arm's spacing, which low space does not skip. A commit
-	// clears it, since low space with a commit starts a pass at once.
+	// rest is the end of the spacing after the last pass or a re-arm. Low space does
+	// not skip it and a commit does not clear it, since no upload stops a low-space
+	// pass and a client with push rights chooses when it commits.
 	rest time.Time
 	// reviewed is the set the last pass or sweep read from the marker.
 	reviewed map[string]bool
@@ -153,8 +155,8 @@ type convergeLoop struct {
 	// freeRead is when that read was.
 	low      bool
 	freeRead time.Time
-	// fruitless counts the passes in a row that left work and merged nothing or
-	// failed, against serveConvergeMaxFruitless.
+	// fruitless counts the passes in a row that got nowhere, against
+	// serveConvergeMaxFruitless: see settle.
 	fruitless int
 	// cur is the pass running.
 	cur *convergeRun
@@ -218,7 +220,6 @@ func (l *convergeLoop) commit() {
 		l.first = now
 	}
 	l.last = now
-	l.rest = time.Time{}
 }
 
 // rearm sets the trigger with no commit behind it: the idle wait runs from now, and
@@ -229,7 +230,10 @@ func (l *convergeLoop) rearm(now time.Time) {
 	if l.armed {
 		return
 	}
-	l.armed, l.last, l.rest = true, now, now.Add(serveConvergeIdle)
+	l.armed, l.last = true, now
+	if end := now.Add(serveConvergeIdle); l.rest.Before(end) {
+		l.rest = end
+	}
 }
 
 // sweepFinished re-arms the loop when the sweep's marker names a repository the
@@ -383,8 +387,9 @@ func (l *convergeLoop) pass(ctx context.Context) (store.ConvergeReport, error) {
 	})
 }
 
-// finish takes a pass's result: it restores the trigger of a stopped pass, re-arms
-// after one that left work, logs the outcome and reports it. A pass the server's stop ended reports nothing, as
+// finish takes a pass's result: it restores the trigger of a stopped pass, counts the
+// pass and sets the rest after it, re-arms after one that left work, logs the
+// outcome and reports it. A pass the server's stop ended reports nothing, as
 // a sweep the stop ended does not; its merges were each logged. The store logs
 // each merge and each corrupt file itself.
 func (l *convergeLoop) finish(ctx context.Context, res convergeResult) {
@@ -421,6 +426,7 @@ func (l *convergeLoop) finish(ctx context.Context, res convergeResult) {
 		attrs = append(attrs, "err", res.err)
 	}
 	l.log.Log(ctx, level, "registry dedupe: pass finished", attrs...)
+	l.settle(run, res)
 	if !run.stopped {
 		l.rearmForWork(res)
 	}
@@ -434,17 +440,29 @@ func (l *convergeLoop) finish(ctx context.Context, res convergeResult) {
 	})
 }
 
-// rearmForWork sets the trigger when res left work a later pass could do, until
-// serveConvergeMaxFruitless passes in a row have got nowhere with it.
-func (l *convergeLoop) rearmForWork(res convergeResult) {
+// settle counts a finished pass against serveConvergeMaxFruitless and starts the rest
+// after it. A low-space pass that merged nothing counts even with no work left: it
+// stands in the way of uploads, and a commit is all it takes to start another.
+func (l *convergeLoop) settle(run *convergeRun, res convergeResult) {
 	switch {
-	case !res.rep.LeftWork():
+	case run.stopped:
+	case !res.rep.LeftWork() && run.why != convergeWhyLowSpace:
 		l.fruitless = 0
-		return
 	case res.err != nil || res.rep.Merged == 0:
 		l.fruitless++
 	default:
 		l.fruitless = 0
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.rest = l.now().Add(serveConvergeIdle)
+}
+
+// rearmForWork sets the trigger when res left work a later pass could do, until
+// serveConvergeMaxFruitless passes in a row have got nowhere.
+func (l *convergeLoop) rearmForWork(res convergeResult) {
+	if !res.rep.LeftWork() {
+		return
 	}
 	if l.fruitless >= serveConvergeMaxFruitless {
 		l.log.Warn("registry dedupe: passes left copies and merged nothing; the next commit, mount or start runs another", "passes", l.fruitless)

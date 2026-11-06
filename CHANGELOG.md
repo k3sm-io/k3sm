@@ -89,7 +89,8 @@ pin, its date, and the tarball's sha256.
   other failure keeps the copy. The push path does not change. The registry server runs the pass by
   default, with no setting to turn it off: after 60 s with no commit and no live upload, plus up to 60 s
   of jitter, and at most 15 minutes after the first commit it has not yet covered. Below 4 GiB free it
-  starts without the wait. An upload stops a pass between merges, unless the 15 minutes have passed or
+  starts without that wait, but no sooner than 60 s after the last pass ended, and a pass there that merges
+  nothing counts toward the limit below. An upload stops a pass between merges, unless the 15 minutes have passed or
   space is low. No pass runs within an hour of start, or before the first garbage collection, and only
   a repository garbage collection has reported is rewritten, so a new repository's copies wait for its
   first sweep, at most 6 hours, and merge about 2 minutes after it. A pass stopped by its limit of

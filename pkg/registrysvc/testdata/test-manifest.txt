@@ -20,6 +20,7 @@ TestConvergeLoopReportsItsPass added new with the dedupe loop
 TestConvergeLoopRunsWhenIdle added new with the dedupe loop
 TestConvergeLoopSchedule added new with the dedupe loop
 TestConvergeLoopStopsForAnUpload added new with the dedupe loop
+TestConvergeLowSpaceKeepsItsSpacing added new with the dedupe loop
 TestConvergeRearmsAfterASweepReviewsARepository added new with the dedupe loop
 TestConvergeRearmsWhileBudgetLeavesWork added new with the dedupe loop
 TestCredentialMatchesRegistry kept the relay and cluster publication do not touch the child
