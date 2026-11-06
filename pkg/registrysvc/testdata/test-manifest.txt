@@ -60,6 +60,7 @@ TestRecheckReasonWording kept prune works on the store, which is unchanged
 TestReclaimRechecksBeforeEachSignal added new with the child switch
 TestRecordKeepsTheServersFields added new with the child switch
 TestRegistryNodePortIsOptInAndGated kept the push gate is unchanged
+TestRegistryReadyFollowsNoRedirect added the readiness probe stays on the loopback address it was given
 TestRelayLimitsArePerSource kept the relay and cluster publication do not touch the child
 TestRelayServesTLSOnly kept the relay and cluster publication do not touch the child
 TestRelayServesTheGate kept the push gate is unchanged

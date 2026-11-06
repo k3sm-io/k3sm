@@ -29,6 +29,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -161,5 +162,22 @@ func TestAwaitNeedsA200(t *testing.T) {
 	close(exited)
 	if err := s.await(t.Context(), exited); err == nil {
 		t.Error("await took a 200 from an incumbent after the child exited")
+	}
+}
+
+// TestRegistryReadyFollowsNoRedirect: the readiness probe stays on the address it
+// was given. Whatever holds the port cannot send it elsewhere, or borrow another
+// server's 200.
+func TestRegistryReadyFollowsNoRedirect(t *testing.T) {
+	var followed atomic.Bool
+	other := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { followed.Store(true) }))
+	defer other.Close()
+	holder := httptest.NewServer(http.RedirectHandler(other.URL+"/v2/", http.StatusFound))
+	defer holder.Close()
+	if err := registryReady(t.Context(), holder.Listener.Addr().String()); err == nil {
+		t.Error("a redirect to a 200 counted as the registry answering")
+	}
+	if followed.Load() {
+		t.Error("the probe followed the redirect")
 	}
 }

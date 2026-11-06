@@ -425,7 +425,8 @@ func (s *Service) spawn() (chan struct{}, error) {
 
 // registryReady reports whether the registry at addr answers GET /v2/ with 200.
 // A connect alone says nothing: anything holding the port accepts one. It reads
-// no proxy setting, since addr is loopback.
+// no proxy setting, since addr is loopback, and follows no redirect, so it opens
+// no connection but the one to addr.
 func registryReady(ctx context.Context, addr string) error {
 	ctx, cancel := context.WithTimeout(ctx, readyProbeTimeout)
 	defer cancel()
@@ -433,7 +434,10 @@ func registryReady(ctx context.Context, addr string) error {
 	if err != nil {
 		return err
 	}
-	client := http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+	client := http.Client{
+		Transport:     &http.Transport{DisableKeepAlives: true},
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
