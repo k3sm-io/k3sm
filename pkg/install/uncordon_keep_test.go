@@ -19,8 +19,12 @@ package install
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
 
 // servedAdminToken is the admin token the control plane reads when it starts.
@@ -33,11 +37,61 @@ func servedAdminToken(t *testing.T, f *fakeSystem, cfg Config) string {
 	return strings.TrimSpace(string(raw))
 }
 
-// TestFailedUncordonKeepsTheInstallAndItsKubeconfig is the gate for the kubeconfig
-// across a failed install: a rollback leaves the operator one the control plane
-// accepts.
+// TestFailedUncordonKeepsTheInstallAndItsKubeconfig is the gate for what an
+// install --start does when its daemons are verified up and the uncordon fails:
+// the release stays, the remaining steps run, the repair is recorded and the
+// exit says so. Beside it, a rollback for a genuine failure leaves the operator
+// a kubeconfig the control plane accepts.
 func TestFailedUncordonKeepsTheInstallAndItsKubeconfig(t *testing.T) {
 	ctx := context.Background()
+	failures := map[string]error{
+		"out of budget":    fmt.Errorf("patch node: %w", context.DeadlineExceeded),
+		"not retried, 401": apierrors.NewUnauthorized("Unauthorized"),
+	}
+	for name, cause := range failures {
+		for _, role := range []Role{RoleServer, RoleAgent} {
+			t.Run(fmt.Sprintf("%s/%s", role, name), func(t *testing.T) {
+				f, cfg, logs := stoppedNodeOfRole(t, role)
+				uncordonBudget = restartBudget{running: 20 * time.Millisecond, poll: time.Millisecond}
+				cfg.MarkNode = func(context.Context, bool, string, string) error { return cause }
+				cfg.Start = true
+				logs.Reset()
+
+				err := Install(ctx, f, cfg)
+
+				if !errors.Is(err, ErrNodeStillCordoned) {
+					t.Fatalf("Install --start = %v, want ErrNodeStillCordoned", err)
+				}
+				for _, want := range []string{"nothing was rolled back", "`sudo k3sm start`"} {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("the error lacks %q: %v", want, err)
+					}
+				}
+				if strings.Contains(err.Error(), "rolled back to the previous") || strings.Contains(logs.String(), "rolled the install root back") {
+					t.Errorf("the install rolled back: %v\n%s", err, logs.String())
+				}
+				d := cfg.withDefaults()
+				swap := fmt.Sprintf("SwapInstallRoot:%s<->%s:swap", d.swapDir(), d.InstallDir)
+				if n := countCalls(f, swap); n != 1 {
+					t.Errorf("the install root was swapped %d times, want the publish alone", n)
+				}
+				if countCalls(f, "RemoveTree:"+d.swapDir()) == 0 {
+					t.Error("the previous tree was not reaped")
+				}
+				if !uncordonPendingPresent(f, d) {
+					t.Error("the uncordon-pending marker is missing, so `k3sm start` would not insist on the repair")
+				}
+				if role != RoleServer {
+					return
+				}
+				token, _ := adminCredential(t, f)
+				if served := servedAdminToken(t, f, cfg); token != served {
+					t.Error("the admin kubeconfig does not carry the token the control plane serves")
+				}
+			})
+		}
+	}
+
 	t.Run("a rollback puts back the token the old kubeconfig carries", func(t *testing.T) {
 		f, cfg, logs := stoppableNode(t)
 		before, _ := adminCredential(t, f)

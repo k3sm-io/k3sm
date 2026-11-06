@@ -163,6 +163,33 @@ func uncordonAfterStart(ctx context.Context, sys System, cfg Config, actor, reas
 	return err
 }
 
+// uncordonInstalledNode is the uncordon of an install --start over a stopped
+// node, after the install has kept its new tree and written the kubeconfig. The
+// daemons are verified up, and a cordon is what `k3sm start` repairs, so a failure
+// discards nothing: the node keeps the new release, the uncordon-pending marker
+// makes that start insist on the repair whatever the failure's class, and the
+// install reports ErrNodeStillCordoned, which exits non-zero as a start does
+// because a script must not take the node as schedulable.
+func uncordonInstalledNode(ctx context.Context, sys System, cfg Config) error {
+	if cfg.userStop == nil || cfg.stayStopped {
+		return nil
+	}
+	err := uncordonAfterStart(ctx, sys, cfg, ActorUser, "k3sm install --start", true)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, ErrNodeStillCordoned) {
+		// Out of budget wrote the marker already. A class that was not retried,
+		// a rejected credential say, did not.
+		if werr := writeUncordonPending(sys, cfg, ActorUser, time.Now()); werr != nil {
+			err = errors.Join(err, werr)
+		}
+		err = fmt.Errorf("%w: %w", ErrNodeStillCordoned, err)
+	}
+	cfg.Logger.Warn("k3sm installed, but the node is still cordoned; run `sudo k3sm start` to uncordon it", "install-dir", cfg.InstallDir, "uncordon-pending", cfg.UncordonPendingMarker)
+	return fmt.Errorf("install: --start: the new release is installed and running, nothing was rolled back: %w", err)
+}
+
 // Restart is `k3sm restart`: the daemons are restarted through the restart
 // sequence and pods keep running (a node daemon restart re-attaches to them).
 // On a node the user stopped it refuses with ErrUserStopped, unless cfg.Start,
