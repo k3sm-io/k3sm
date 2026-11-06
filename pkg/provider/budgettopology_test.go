@@ -21,7 +21,7 @@ import (
 
 	budgetv1alpha1 "k3sm.io/apis/budget/v1alpha1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
-	"k3sm.io/k3sm/pkg/mlx"
+	"k3sm.io/k3sm/pkg/gpucapacity"
 )
 
 func TestBudgetCapacityTopology(t *testing.T) {
@@ -41,9 +41,9 @@ func TestBudgetCapacityTopology(t *testing.T) {
 		wantCount         *int64
 	}{
 		{name: "split and an advertised GPU", cores: split, gpu: usable,
-			wantPerf: ptr(int64(8)), wantEff: ptr(int64(4)), wantPresent: ptr(true), wantCount: ptr(mlx.GPUSlots(usable))},
+			wantPerf: ptr(int64(8)), wantEff: ptr(int64(4)), wantPresent: ptr(true), wantCount: ptr(gpucapacity.GPUSlots(usable))},
 		{name: "no split leaves the core counts unknown", cores: cpuCoreSplit{}, gpu: usable,
-			wantPresent: ptr(true), wantCount: ptr(mlx.GPUSlots(usable))},
+			wantPresent: ptr(true), wantCount: ptr(gpucapacity.GPUSlots(usable))},
 		{name: "no GPU facts leaves presence unknown", cores: split,
 			wantPerf: ptr(int64(8)), wantEff: ptr(int64(4))},
 		{name: "metal without a GPU sandbox advertises none", cores: split,
@@ -67,7 +67,7 @@ func TestBudgetCapacityTopology(t *testing.T) {
 			if (c.GPUPresent == nil) != (tc.wantPresent == nil) || (c.GPUPresent != nil && *c.GPUPresent != *tc.wantPresent) {
 				t.Errorf("GPUPresent = %v, want %v", c.GPUPresent, tc.wantPresent)
 			}
-			if c.GPUPresent != nil && *c.GPUPresent != mlx.GPUAdvertisable(tc.gpu) {
+			if c.GPUPresent != nil && *c.GPUPresent != gpucapacity.GPUAdvertisable(tc.gpu) {
 				t.Error("GPUPresent disagrees with the node advertiser's verdict")
 			}
 		})

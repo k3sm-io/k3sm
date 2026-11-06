@@ -46,7 +46,7 @@ import (
 	"k3sm.io/darwin-net/pkg/netd"
 	"k3sm.io/darwin-net/pkg/podnet"
 	"k3sm.io/darwin-net/pkg/tcpseg"
-	"k3sm.io/k3sm/pkg/mlx"
+	"k3sm.io/k3sm/pkg/gpucapacity"
 	"k3sm.io/k3sm/pkg/provider/podlogs"
 	"k3sm.io/k3sm/pkg/provider/vkadapter"
 	"k3sm.io/k3sm/pkg/version"
@@ -2149,7 +2149,7 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 		// old entry (by id), or the pod would be refused for the memory it already
 		// holds.
 		admitted := r.admittedGPUMemoryLocked(id)
-		if err := mlx.GPUFits(gpuCeiling, admitted, gpuWant); err != nil {
+		if err := gpucapacity.GPUFits(gpuCeiling, admitted, gpuWant); err != nil {
 			r.mu.Unlock()
 			r.log.Error("CreatePod: the pod does not fit in this node's GPU memory beside the pods already admitted",
 				"namespace", pod.Namespace, "name", pod.Name,
@@ -2159,7 +2159,7 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 			// same refusal from the operator's side, but the three byte counts
 			// would be misleading when the missing number is the pod's own.
 			msg := msgFailedGPUFit(gpuWant, admitted, gpuCeiling)
-			if errors.Is(err, mlx.ErrGPUMemoryUnbounded) {
+			if errors.Is(err, gpucapacity.ErrGPUMemoryUnbounded) {
 				msg = msgFailedGPUUnbounded(gpuCeiling)
 			}
 			r.recorder.Event(pod, corev1.EventTypeWarning, reasonFailedGPUFit, msg)
@@ -2338,7 +2338,7 @@ func (r *runtimedRuntime) runtimeHoldsPod(ctx context.Context, id string) bool {
 // from, freshly, rather than caching a copy: the ceiling moves with the host's
 // iogpu configuration and with which sandbox backend the daemon selected, and a
 // cached value would keep admitting pods against a ceiling the node no longer has.
-// The interpretation of the two fact fields is mlx.GPUCeilingBytes's, never
+// The interpretation of the two fact fields is gpucapacity.GPUCeilingBytes's, never
 // re-derived here — the node advertiser sizes its slot count with that same
 // function, and a second reading would let the advertised count and the admission
 // check disagree.
@@ -2353,7 +2353,7 @@ func (r *runtimedRuntime) gpuCeilingBytes(ctx context.Context) int64 {
 		r.log.Warn("GPU-ceiling probe failed; admitting the pod against an unknown ceiling", "err", err)
 		return 0
 	}
-	return mlx.GPUCeilingBytes(info.GetGpu())
+	return gpucapacity.GPUCeilingBytes(info.GetGpu())
 }
 
 // admittedGPUMemoryLocked sums the memory limits of every tracked GPU pod except

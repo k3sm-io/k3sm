@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package mlx
+package gpucapacity
 
 import (
 	"errors"
@@ -30,13 +30,11 @@ import (
 // mlx.k3sm.io/gpu extended resource a node advertises, and whether one more GPU
 // pod still fits in GPU memory beside the ones already admitted.
 //
-// It is a deliberate exception to this package's MLXModel-render framing (see
-// doc.go). Nothing here renders or reads an MLXModel: the advertiser is the node
-// command and the fit check is the pod provider, neither of which knows what an
-// MLXModel is. It lives here anyway because the two consumers must agree on one
-// arithmetic — a node that advertises two slots while the provider sizes one, or
-// the reverse, is a scheduler that binds pods the node then refuses — and this
-// package is the one place both already depend on for the GPU vocabulary.
+// The advertiser (the node command) and the fit check (the pod provider) must
+// agree on one arithmetic — a node that advertises two slots while the provider
+// sizes one, or the reverse, is a scheduler that binds pods the node then
+// refuses — so both import it from here, engine-neutral, and neither needs an
+// MLXModel renderer to size a GPU pod.
 //
 // Everything in this file is PURE: facts in, numbers out. No IO, no clock, no
 // cluster reads, so the whole policy is decided by a table test rather than by a

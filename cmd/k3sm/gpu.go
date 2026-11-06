@@ -27,7 +27,7 @@ import (
 	mlxv1alpha1 "k3sm.io/apis/mlx/v1alpha1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
 
-	"k3sm.io/k3sm/pkg/mlx"
+	"k3sm.io/k3sm/pkg/gpucapacity"
 )
 
 // gpuResourceName is the mlx.k3sm.io/gpu extended resource as a corev1.ResourceName.
@@ -64,7 +64,7 @@ const maxLabelValueLen = 63
 // node whose sandbox denies every one of them at admission — a fail-OPEN mislabel.
 //
 // HOW MANY is a separate question from WHETHER, and it is not answered here: the
-// count comes from mlx.GPUSlots over the same facts (N is 1 or 2, from the host's
+// count comes from gpucapacity.GPUSlots over the same facts (N is 1 or 2, from the host's
 // usable GPU memory ceiling). The one arithmetic serves both this advertiser and the
 // provider's admission-time fit check, which is what keeps the scheduler from binding
 // a pod the node then refuses.
@@ -76,7 +76,7 @@ const maxLabelValueLen = 63
 // the two is fixed by upgrading the daemon.
 func applyGPUAdvertisement(n *corev1.Node, facts *runtimev1.GPUFacts) {
 	present := gpuAdvertisable(facts)
-	slots := mlx.GPUSlots(facts)
+	slots := gpucapacity.GPUSlots(facts)
 	setGPUResource(n, present, slots)
 	setLabelPresence(n, mlxv1alpha1.LabelGPUPresent, present)
 	// The three descriptive labels ride the SAME verdict as the presence label rather
@@ -89,7 +89,7 @@ func applyGPUAdvertisement(n *corev1.Node, facts *runtimev1.GPUFacts) {
 	if present {
 		slog.Debug("node GPU advertised",
 			"resource", mlxv1alpha1.ResourceGPU, "count", slots,
-			"gpu_ceiling_bytes", mlx.GPUCeilingBytes(facts),
+			"gpu_ceiling_bytes", gpucapacity.GPUCeilingBytes(facts),
 			"chip_brand", facts.GetChipBrand(), "chip_family", facts.GetChipFamily())
 		return
 	}
@@ -109,7 +109,7 @@ func applyGPUAdvertisement(n *corev1.Node, facts *runtimev1.GPUFacts) {
 // pure and nil-safe (the proto getters are), so the fail-closed verdict is unit-tested
 // without a live runtimed.
 func gpuAdvertisable(facts *runtimev1.GPUFacts) bool {
-	return mlx.GPUAdvertisable(facts)
+	return gpucapacity.GPUAdvertisable(facts)
 }
 
 // gpuLabelValue gates a derived label value on the advertisement verdict, returning
@@ -126,7 +126,7 @@ func gpuLabelValue(present bool, value string) string {
 // against Allocatable, while Capacity is what an operator reads — advertising only
 // one makes `kubectl describe node` and the scheduler disagree.
 //
-// SLOTS ARE CO-TENANTS, NOT DEVICES. N (1 or 2, see mlx.GPUSlots) says this node's
+// SLOTS ARE CO-TENANTS, NOT DEVICES. N (1 or 2, see gpucapacity.GPUSlots) says this node's
 // GPU memory holds N floor-sized workloads under benign co-tenancy; it does not say
 // the workloads are isolated from each other, because there is one integrated GPU and
 // they share it. That is the same distinction DESIGN §5a draws for CPU, and it is why
