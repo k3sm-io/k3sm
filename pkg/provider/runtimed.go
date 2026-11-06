@@ -1760,7 +1760,8 @@ func (r *runtimedRuntime) allocError(pod *corev1.Pod, err error) error {
 // is a no-op. The one path that drops an override WITHOUT releasing the /32 is
 // eviction (evictPod): the evicted pod stays in the apiserver, its guest is
 // stopped, its override and relay go, and its /32 is released by the DeletePod
-// that follows, through here.
+// that follows, through here. teardownPod takes the override down earlier still,
+// before its runtime call, and this call finds it gone and clears the mark.
 func (r *runtimedRuntime) releasePodNetwork(pod *corev1.Pod) {
 	id := string(pod.UID)
 	// Before the release, so a mark an overlapping call sets after this survives it.
@@ -2832,6 +2833,11 @@ func (r *runtimedRuntime) DeletePod(ctx context.Context, pod *corev1.Pod) error 
 	// the RESIDUAL grace (the budget minus the hook's wall-time, floored at
 	// minimumGracePeriodSeconds, 2s).
 	// best-effort — a failed hook is logged inside runPreStop, the delete proceeds.
+	//
+	// A vm pod's probes end first, so a hook that starts draining cannot fail them.
+	// Its override stays up until teardownPod: an httpGet hook dials the published
+	// address, and only the relay answers there.
+	r.stopVMProbes(pod)
 	grace := r.runPreStop(ctx, pod)
 	return r.teardownPod(ctx, pod, grace, nil)
 }
@@ -2946,10 +2952,21 @@ func (t *podTrack) quiesce() {
 	t.cancelPulls()
 }
 
-// teardownPod is the delete path after preStop: the runtime RPC with grace, the
-// probe runner, the pod's transport override and then its /32 (in that order,
-// see releasePodNetwork), its log tree, the track, and the apiserver object. DeletePod and the orphan reaper (orphanreap.go) share
-// it, so a reaped pod is torn down exactly as a deleted one is.
+// teardownPod is the delete path after preStop: a vm pod's probes and the pod's
+// transport override, the runtime RPC with grace, the remaining probe runner, the
+// pod's /32 (see releasePodNetwork), its log tree, the track, and the apiserver
+// object. DeletePod and the orphan reaper (orphanreap.go) share it, so a reaped pod
+// is torn down exactly as a deleted one is.
+//
+// THE OVERRIDE GOES DOWN BEFORE THE RPC AND STAYS DOWN. The runtime keeps reporting
+// the guest's lease until its stop ends, on the DELETED event too, so without the
+// release mark a status during the stop reinstalls the override, and with it the
+// relay, onto a lease that outlives its guest. The mark holds until releasePodNetwork
+// clears it, which on the in-flight branch below is the last call out. Only a
+// definitive refusal lifts it early: the guest is still serving, and the next status
+// restores the way to it. After any other failure the stop may have happened, so it
+// holds until a retry settles the delete; the caller retries, as the track is still
+// installed.
 //
 // owned selects how the track is forgotten. nil forgets whatever track the pod
 // id holds (DeletePod's contract). Non-nil forgets the track only if it is still
@@ -2964,6 +2981,8 @@ func (t *podTrack) quiesce() {
 // since owing the delete is what they read.
 func (r *runtimedRuntime) teardownPod(ctx context.Context, pod *corev1.Pod, grace int64, owned *podTrack) error {
 	id := string(pod.UID)
+	r.stopVMProbes(pod)
+	r.transport.beginRelease(id)
 	intent := r.recordStopIntent(pod, "")
 	t := r.trackByID(id)
 	t.beginRuntimeStop()
@@ -2979,6 +2998,7 @@ func (r *runtimedRuntime) teardownPod(ctx context.Context, pod *corev1.Pod, grac
 		// Only a definitive refusal proves the stop did not happen.
 		if stopNotIssued(err) {
 			r.history.dropIntent(intent)
+			r.transport.endRelease(id)
 		}
 		return fmt.Errorf("runtimed delete pod %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
@@ -2999,14 +3019,12 @@ func (r *runtimedRuntime) teardownPod(ctx context.Context, pod *corev1.Pod, grac
 		return nil
 	}
 	r.mu.Unlock()
-	// Drop any Service-proxy transport override for the pod, THEN release its /32
-	// (log-and-continue; idempotent after runtimed's own delete-path teardown) so
-	// pod churn never leaks a node pool address. releasePodNetwork does both, in
-	// that order (see its doc): the drop closes the pod's relay before the alias
-	// it listens on goes. No further status will ever arrive to retract the
-	// override, and one that outlives its guest points at a lease macOS is free to
-	// hand to the NEXT guest — a cross-pod misdelivery, not a failed dial (see
-	// transportFeed).
+	// Release the pod's /32 (log-and-continue; idempotent after runtimed's own
+	// delete-path teardown) so pod churn never leaks a node pool address. The override
+	// is already down, which closed the pod's relay before the alias it listens on
+	// goes (see releasePodNetwork's doc). An override that outlives its guest points
+	// at a lease macOS is free to hand to the NEXT guest — a cross-pod misdelivery,
+	// not a failed dial (see transportFeed).
 	r.releasePodNetwork(pod)
 	// Remove the pod's log tree, now that runtimed has confirmed every container
 	// is gone (the RPC above is synchronous). Deleting it while a container still

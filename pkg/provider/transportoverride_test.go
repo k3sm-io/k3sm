@@ -75,6 +75,10 @@ type leaseRuntimeServer struct {
 	boxIPs     map[string]string // pod id -> the PodBox.pod_ip the provider sent
 	transports map[string]string // pod id -> the LAST lease pushed for it
 	restarts   int               // RestartContainer RPCs received
+	// onDelete, when set, runs inside DeletePod before the pod is forgotten, and
+	// its error is the RPC's answer: how a test holds a stop open, or refuses it.
+	// Guarded by mu.
+	onDelete func(podID string) error
 }
 
 func newLeaseRuntimeServer(echoPodIP bool) *leaseRuntimeServer {
@@ -136,6 +140,14 @@ func (s *leaseRuntimeServer) reportedPodIP(podID string) string {
 }
 
 func (s *leaseRuntimeServer) DeletePod(_ context.Context, req *runtimev1.DeletePodRequest) (*runtimev1.DeletePodResponse, error) {
+	s.mu.Lock()
+	hook := s.onDelete
+	s.mu.Unlock()
+	if hook != nil {
+		if err := hook(req.GetPodId()); err != nil {
+			return nil, err
+		}
+	}
 	s.mu.Lock()
 	delete(s.live, req.GetPodId())
 	s.mu.Unlock()

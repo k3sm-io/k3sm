@@ -145,10 +145,10 @@ type transportFeed struct {
 
 	mu     sync.Mutex
 	leases map[string]transportLease // pod id -> its two addresses
-	// releasing holds the pods whose network release has begun
-	// (beginRelease .. endRelease). observe refuses them, so a status
-	// observation that races the release cannot reinstall an override, and so
-	// the relay, over the alias being removed.
+	// releasing holds the pods whose stop or network release has begun
+	// (beginRelease .. endRelease). observe refuses them, so a status observation
+	// that races either cannot reinstall an override, and so the relay, onto a
+	// guest being stopped or over the alias being removed.
 	releasing map[string]struct{}
 }
 
@@ -224,9 +224,11 @@ func (f *transportFeed) dropLocked(podID string) {
 	f.republishLocked()
 }
 
-// beginRelease marks podID's network release as begun and drops its override in
-// the same critical section, so no observation can reinstall it until
-// endRelease. Paired with endRelease by releasePodNetwork.
+// beginRelease marks podID's stop or network release as begun and drops its
+// override in the same critical section, so no observation can reinstall it until
+// endRelease. Marking a pod already marked is a no-op. teardownPod sets the mark
+// before its runtime call, and releasePodNetwork ends it, or teardownPod does when
+// the runtime refused the stop.
 func (f *transportFeed) beginRelease(podID string) {
 	if f == nil {
 		return
@@ -237,11 +239,11 @@ func (f *transportFeed) beginRelease(podID string) {
 	f.dropLocked(podID)
 }
 
-// endRelease clears podID's release mark. By then the pod's guest record is gone
-// (the adapter's Teardown deletes it), so observe's under-lock stillGuest check
-// keeps refusing a late observation without the mark, and the set stays bounded
-// by the releases in flight. A later create of the same pod records a new guest
-// and is observed normally.
+// endRelease clears podID's release mark. After a network release the pod's guest
+// record is gone (the adapter's Teardown deletes it), so observe's under-lock
+// stillGuest check keeps refusing a late observation without the mark, and the set
+// stays bounded by the stops and releases in flight. A later create of the same pod
+// records a new guest and is observed normally.
 func (f *transportFeed) endRelease(podID string) {
 	if f == nil {
 		return
