@@ -672,6 +672,66 @@ remote_dir_remove() {
 	fi
 }
 
+# ── Namespace cleanup: PVs and storage directories ──────────────────────────────
+STORAGE_ROOT="/var/lib/k3sm/storage"
+PVC_WAIT_SECS=120
+PVC_WAIT_STEP=5
+# ns_is_ladders <ns> — the ladder's own namespace name, and nothing else: a guard
+# against an empty or foreign value reaching a PV delete or an rm -rf as root.
+ns_is_ladders() {
+	case "$1" in
+	k3sm-m17-lab | k3sm-m17-lab-[a-z0-9]*) [[ "$1" =~ ^[a-z0-9-]+$ ]] ;;
+	*) return 1 ;;
+	esac
+}
+# pvs_claimed_by <ns> — stdin is "<pv>\t<claim namespace>" lines; prints the PVs
+# whose claim is in <ns> (bound or released), exact match, never another.
+pvs_claimed_by() {
+	[ -n "$1" ] || return 0
+	awk -F'\t' -v ns="$1" '$2 == ns && $1 != "" { print $1 }'
+}
+pvcs_gone() { [ -z "$(kc get pvc -n "$NS" -o name 2>/dev/null)" ]; }
+# storage_remove_cmd — the root command that removes this run's storage directory.
+storage_remove_cmd() { printf 'sudo -n rm -rf %s/%s' "$STORAGE_ROOT" "$NS"; }
+# ns_storage_cleanup — after the namespace delete: wait for the PVCs, delete the
+# PVs claimed from this namespace, then remove the storage directory on both Macs.
+# Every failure is printed and none changes the exit status.
+ns_storage_cleanup() {
+	if ! ns_is_ladders "$NS"; then
+		echo "cleanup: not touching PVs or storage: '$NS' is not this ladder's namespace"
+		return 0
+	fi
+	local deadline=$((SECONDS + PVC_WAIT_SECS)) pv pvs
+	echo "cleanup: waiting up to ${PVC_WAIT_SECS}s for the PVCs in $NS to go"
+	until pvcs_gone; do
+		if [ "$SECONDS" -ge "$deadline" ]; then
+			echo "cleanup: PVCs in $NS are still present after ${PVC_WAIT_SECS}s; continuing"
+			break
+		fi
+		sleep "$PVC_WAIT_STEP"
+	done
+	pvs="$(kc get pv -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.claimRef.namespace}{"\n"}{end}' 2>/dev/null | pvs_claimed_by "$NS")"
+	for pv in $pvs; do
+		if kc delete pv "$pv" --wait=false >/dev/null 2>&1; then
+			echo "cleanup: deleted PV $pv (claimed from $NS)"
+		else
+			echo "cleanup: could not delete PV $pv; remove it by hand"
+		fi
+	done
+	[ -n "$pvs" ] || echo "cleanup: no PVs claimed from $NS"
+	if on_local "$(storage_remove_cmd)" >/dev/null 2>&1; then
+		echo "cleanup: removed $STORAGE_ROOT/$NS on the local Mac"
+	else
+		echo "cleanup: could not remove $STORAGE_ROOT/$NS on the local Mac; remove it by hand as root"
+	fi
+	if on_peer "$(storage_remove_cmd)" >/dev/null 2>&1; then
+		echo "cleanup: removed $STORAGE_ROOT/$NS on the peer"
+	else
+		echo "cleanup: could not remove $STORAGE_ROOT/$NS on the peer; remove it by hand as root"
+	fi
+	return 0
+}
+
 # ── The assertions ──────────────────────────────────────────────────────────────
 
 assert_r0_disarmed() {
@@ -2095,6 +2155,27 @@ hello_drops_before_connect() {
 	[ -n "$u" ] && [ -n "$c" ] && [ "$u" -lt "$c" ] && grep -qF "SVC_USER=$SERVICE_USER" <<<"$out"
 }
 
+# st_cleanup_run <ns> — ns_storage_cleanup with every cluster and host call
+# stubbed; prints the calls in the order made.
+st_cleanup_run() (
+	NS="$1" PVC_WAIT_SECS=0
+	local log
+	log="$(mktemp -t m17-cleanup.XXXXXX)"
+	sleep() { :; }
+	kc() {
+		case "$*" in
+		"get pvc"*) ;;
+		"get pv -o"*) printf 'pv-a\tk3sm-m17-lab\npv-b\tother-ns\npv-c\tk3sm-m17-lab-x\npv-d\tk3sm-m17-lab\n\t\n' ;;
+		"delete pv"*) echo "kc $*" >>"$log" ;;
+		esac
+	}
+	on_local() { echo "local $1" >>"$log"; }
+	on_peer() { echo "peer $1" >>"$log"; }
+	ns_storage_cleanup
+	cat "$log"
+	rm -f "$log"
+)
+
 # st_driver_run <rung> <profile> — the body st_driver runs in a subshell: the
 # stubs below replace the host and cluster helpers there only.
 st_driver_run() {
@@ -2705,6 +2786,15 @@ self_test_body() {
 	st_out "r8 red: the disarm took a lo0 address" "FAIL      [r8] local Mac: lo0 lost no address to the disarm: gone from lo0: 100.64.3.1" st_r8_run lo0-lost
 	st_out "r8 red: addresses left after the pods went" "FAIL      [r8] peer Mac: no inet in 169.254.0.0/24" st_r8_run stuck
 	st_out "r8 red: the pods never went" "FAIL      [r8] the attached pods were not gone" st_r8_run pods-stuck
+	st "cleanup guard: the ladder's namespace" 0 ns_is_ladders k3sm-m17-lab
+	for r in "" default kube-system k3sm-m17-lab/../x "k3sm-m17-lab x" k3sm-m17-labx "other-k3sm-m17-lab"; do st "cleanup guard red: '$r'" 1 ns_is_ladders "$r"; done
+	st_eq "cleanup: only PVs claimed from the namespace are selected" "$(printf 'pv-a\tk3sm-m17-lab\npv-b\tother-ns\npv-c\tk3sm-m17-lab-x\npv-d\tk3sm-m17-lab\n' | pvs_claimed_by k3sm-m17-lab | tr '\n' ' ')" "pv-a pv-d "
+	st_eq "cleanup: an empty namespace selects no PV" "$(printf 'pv-a\t\n\t\n' | pvs_claimed_by "")" ""
+	st_eq "cleanup: the storage path is under the storage root" "$(NS=k3sm-m17-lab storage_remove_cmd)" "sudo -n rm -rf /var/lib/k3sm/storage/k3sm-m17-lab"
+	st_eq "cleanup: PV deletes, then the local Mac, then the peer" "$(st_cleanup_run k3sm-m17-lab | grep -v '^cleanup: ' | tr '\n' '|')" "kc delete pv pv-a --wait=false|kc delete pv pv-d --wait=false|local sudo -n rm -rf /var/lib/k3sm/storage/k3sm-m17-lab|peer sudo -n rm -rf /var/lib/k3sm/storage/k3sm-m17-lab|"
+	st_out "cleanup: the PVC wait is logged before the PV deletes" "waiting up to 0s for the PVCs" st_cleanup_run k3sm-m17-lab
+	st_eq "cleanup red: a foreign namespace touches nothing" "$(st_cleanup_run default | grep -c 'rm -rf\|kc delete')" 0
+	st_eq "cleanup red: an empty namespace touches nothing" "$(st_cleanup_run "" | grep -c 'rm -rf\|kc delete')" 0
 	rm -rf "$tmp"
 	if [ "$ST_MISS" -gt 0 ]; then
 		echo "$ROW self-test: FAIL ($ST_MISS miss(es))"
@@ -2879,7 +2969,10 @@ on_exit() {
 		echo "cleanup: disarming the interconnect this run armed"
 		on_local "$K3SM_BIN interconnect disable" 2>&1 | sed 's/^/          /'
 	fi
-	[ "$NS_CREATED" = 1 ] && kc delete namespace "$NS" --wait=false >/dev/null 2>&1
+	if [ "$NS_CREATED" = 1 ]; then
+		kc delete namespace "$NS" --wait=false >/dev/null 2>&1
+		ns_storage_cleanup
+	fi
 	# Never a reinstall from a trap: say which Macs an interrupted r9 left behind.
 	[ -z "$R9_DOWNGRADED" ] || echo "cleanup: r9 did not finish; these Macs may be on the previous build, so reinstall the artifact under test: $R9_DOWNGRADED"
 	fixtures_remove
