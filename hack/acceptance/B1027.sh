@@ -669,6 +669,18 @@ zot_started() {
 	done
 }
 
+# registry_settled - the registry starts listening some seconds after the install
+# returns. Wait, bounded by REGISTRY_WAIT, until `image ls` answers. It never
+# fails a step: the step that reads the registry next judges it.
+registry_settled() {
+	local deadline=$((SECONDS + REGISTRY_WAIT))
+	while :; do
+		ku image ls -o json 2>/dev/null | lab_py ls-reachable 2>/dev/null | grep -qx yes && return 0
+		[ "$SECONDS" -lt "$deadline" ] || return 0
+		sleep 5
+	done
+}
+
 ship_set() {
 	local h="$1" w="$2" name="$3"
 	put "$h" "$LOCAL_WORK/$name.tar.gz" "$w/$name.tar.gz" </dev/null || return 1
@@ -832,6 +844,7 @@ s_a0() {
 		why "no zot process on the server under the old set: it is not the zot-era build"
 		return 1
 	}
+	registry_settled
 	kc create namespace "$NS" || {
 		why "could not create $NS"
 		return 1
@@ -881,6 +894,7 @@ s_b1() {
 		why "a zot process still runs on the server under the new set"
 		return 1
 	fi
+	registry_settled
 	DETAIL="both on $NEW_VER, no zot"
 }
 s_c1() {
@@ -1146,6 +1160,7 @@ s_e1() {
 		why "no zot process after the rollback"
 		return 1
 	}
+	registry_settled
 	DETAIL="both on $OLD_VER, zot serving"
 }
 s_e2() {
@@ -1324,6 +1339,7 @@ lab_main() {
 	STEP_TIMEOUT="${K3SM_B1027_STEP_TIMEOUT:-120}"
 	INSTALL_TIMEOUT="${K3SM_B1027_INSTALL_TIMEOUT:-900}"
 	ZOT_START_WAIT="${K3SM_B1027_ZOT_START_WAIT:-180}"
+	REGISTRY_WAIT="${K3SM_B1027_REGISTRY_WAIT:-180}"
 	READY_TIMEOUT="${K3SM_B1027_READY_TIMEOUT:-240}"
 	POD_TIMEOUT="${K3SM_B1027_POD_TIMEOUT:-240}"
 	POLL="${K3SM_B1027_POLL:-3}"
@@ -1722,7 +1738,7 @@ lab_fake_run() {
 		FAKE_GC_FAILED="${FAKE_GC_FAILED:-0}" FAKE_LEG_RC="${FAKE_LEG_RC:-0}" FAKE_ZOT_GC="${FAKE_ZOT_GC:-ok}" \
 		K3SM_B1027_K3SM="$d/bin/k3sm" K3SM_B1027_DATA_ROOT="$d/data" K3SM_B1027_HELLO="$d/hello" \
 		K3SM_B1027_ROLLBACK_LEG="$d/bin/rollback-leg" K3SM_B1027_POLL=0.05 K3SM_B1027_STEP_TIMEOUT=60 \
-		K3SM_B1027_READY_TIMEOUT=5 K3SM_B1027_POD_TIMEOUT=5 K3SM_B1027_ZOT_START_WAIT=0 K3SM_LAB_TOLERATE_KEYS= \
+		K3SM_B1027_READY_TIMEOUT=5 K3SM_B1027_POD_TIMEOUT=5 K3SM_B1027_ZOT_START_WAIT=0 K3SM_B1027_REGISTRY_WAIT=0 K3SM_LAB_TOLERATE_KEYS= \
 		"$SELF" --lab --old-set "$d/sets/old" --new-set "$d/sets/new" --server-ssh srv --worker-ssh wrk \
 		--server-lan 192.0.2.1 --evidence "$d/evidence" --server-work "$d/remote-server" --worker-work "$d/remote-worker" \
 		--gc-wait 30 --zot-gc-wait 5 >"$d/out" 2>&1 </dev/null || rc=$?
