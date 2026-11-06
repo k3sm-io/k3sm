@@ -29,7 +29,7 @@ limitations under the License.
 //
 // zot is NOT linked in. It is a pinned CHILD PROCESS built on demand
 // (`go build zotregistry.dev/zot/v2/cmd/zot` inside the embedded zotchild wrapper
-// module, which requires zot at the pin plus the raised golang.org/x/net of
+// module, which requires zot at the pin plus the raised modules of
 // internal/childreq; CGO_ENABLED=0, out of this module) or seeded from a packaged install's staged payload — exactly the
 // treatment pkg/executor gives kine, and for the same two reasons: the registry's
 // dependency tree never enters any k3sm.io go.mod, and the binary that runs is

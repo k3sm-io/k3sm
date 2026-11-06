@@ -452,7 +452,8 @@ GV_ALLOW="$HERE/govulncheck.allow"
 # (the patch-set id, "none" without one), ZOT_VERSION and ZOT_VARIANT,
 # HELM_VERSION, HELM_VARIANT, HELM_RAISED (the raised modules, space-separated
 # path@version), HELM_COMMIT (the tag's commit the build stamps) and HELM_BINARY,
-# and XNET_FLOOR (the golang.org/x/net kine and zot are built against), read from
+# XNET_FLOOR (the golang.org/x/net kine and zot are built against) and
+# COMPRESS_RAISED (the github.com/klauspost/compress they are built against), read from
 # the source the staged k3sm is built from, so the checks below compare against
 # that build's own pins.
 read_pins() {
@@ -480,6 +481,8 @@ read_pins() {
 	HELM_BINARY="helm-$HELM_VERSION"
 	XNET_FLOOR="$(sed -n 's/^[[:space:]]*const XNetVersion[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$cr")"
 	[ -n "$XNET_FLOOR" ] || die "cannot read the raised golang.org/x/net (XNetVersion) from $cr"
+	COMPRESS_RAISED="$(sed -n 's/^[[:space:]]*const CompressVersion[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$cr")"
+	[ -n "$COMPRESS_RAISED" ] || die "cannot read the raised github.com/klauspost/compress (CompressVersion) from $cr"
 }
 
 # helm_buildinfo_problems <want-version> <go-pin> <raised>  (stdin: `go version -m`)
@@ -578,17 +581,17 @@ unbang() {
 # manifest_comments [stub]: the manifest's header lines. The toolchain pin, then,
 # per source-built child, its module version, patch-set id, build variant and the
 # build settings its own build info records, and for kine and zot the raised
-# golang.org/x/net they are built against (kine's -ldflags stamp is added
+# golang.org/x/net and github.com/klauspost/compress they are built against (kine's -ldflags stamp is added
 # explicitly: -trimpath keeps ldflags out of Go's build info). With "stub" the
 # children were not built, and the header says so.
 manifest_comments() {
 	local stub="${1:-}" dir="$PAYLOAD_DIR" kind
 	printf 'k3sm payload manifest; verify inside the tree with: shasum -a 256 -c %s\n' "$MANIFEST_NAME"
 	printf 'toolchain: %s %s/%s (pinned: PAYLOAD_GO_VERSION %s)\n' "$("$GO" env GOVERSION)" "$GOOS" "$GOARCH" "$PAYLOAD_GO_VERSION"
-	printf 'kine: github.com/k3s-io/kine %s patch-set %s variant %s (stamped %s+%s) raises golang.org/x/net %s\n' "$KINE_VERSION" "$KINE_PATCH" "$KINE_VARIANT" "$KINE_VERSION" "$KINE_PATCH" "$XNET_FLOOR"
+	printf 'kine: github.com/k3s-io/kine %s patch-set %s variant %s (stamped %s+%s) raises golang.org/x/net %s github.com/klauspost/compress %s\n' "$KINE_VERSION" "$KINE_PATCH" "$KINE_VARIANT" "$KINE_VERSION" "$KINE_PATCH" "$XNET_FLOOR" "$COMPRESS_RAISED"
 	printf 'etcd: go.etcd.io/etcd/server/v3 %s patch-set none variant %s\n' "$ETCD_VERSION" "$ETCD_VARIANT"
 	printf 'etcdutl: go.etcd.io/etcd/etcdutl/v3 %s patch-set none variant %s\n' "$ETCD_VERSION" "$ETCD_VARIANT"
-	printf 'zot: zotregistry.dev/zot/v2 %s patch-set none variant %s raises golang.org/x/net %s\n' "$ZOT_VERSION" "$ZOT_VARIANT" "$XNET_FLOOR"
+	printf 'zot: zotregistry.dev/zot/v2 %s patch-set none variant %s raises golang.org/x/net %s github.com/klauspost/compress %s\n' "$ZOT_VERSION" "$ZOT_VARIANT" "$XNET_FLOOR" "$COMPRESS_RAISED"
 	printf 'helm: helm.sh/helm/v4 %s patch-set none variant %s raises %s (staged as %s)\n' "$HELM_VERSION" "$HELM_VARIANT" "$HELM_RAISED" "$HELM_BINARY"
 	if [ "$stub" = stub ]; then
 		echo "control plane: STUB payload, not built"
@@ -1955,7 +1958,7 @@ FAILCP
 		else
 			echo "  FAIL  read_pins: kine '$KINE_VERSION' '$KINE_VARIANT' '$KINE_PATCH', etcd '$ETCD_VERSION' '$ETCD_VARIANT'"; exit 1
 		fi
-		if grep_text "$ZOT_VERSION" -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' && [ "$ZOT_VARIANT" = "minimal+r1" ] && [ "$HELM_BINARY" = "helm-$HELM_VERSION" ] &&
+		if grep_text "$ZOT_VERSION" -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' && [ "$ZOT_VARIANT" = "minimal+r2" ] && [ "$HELM_BINARY" = "helm-$HELM_VERSION" ] &&
 			grep_text "$HELM_VARIANT" -Eq '^nocgo\+deps[0-9]+$' && ! grep_text "$(printf '%s' "$HELM_RAISED" | tr ' ' '\n')" -vqx '[a-z0-9./-]*@v[0-9.]*' && grep_text "$(printf '%s' "$HELM_RAISED" | tr ' ' '\n')" -qx 'golang.org/x/net@v[0-9.]*'; then
 			echo "  ok    read_pins: zot $ZOT_VERSION $ZOT_VARIANT, $HELM_BINARY $HELM_VARIANT raised $HELM_RAISED"
 		else
@@ -2047,28 +2050,28 @@ FAKE
 	local cpd="$tmp/children"
 	mkdir -p "$cpd"
 	(
-		KINE_VERSION=v0.17.2 KINE_VARIANT=nocgo+p2 KINE_PATCH=p2 ETCD_VERSION=v3.6.15 ETCD_VARIANT=nocgo GO="$fgo"
-		ZOT_VERSION=v2.1.22 ZOT_VARIANT=minimal+r1 HELM_BINARY=helm-v4.3.1 HELM_VERSION=v4.3.1 HELM_VARIANT=nocgo+deps3 XNET_FLOOR=v0.60.0
+		KINE_VERSION=v0.17.2 KINE_VARIANT=nocgo+p3 KINE_PATCH=p3 ETCD_VERSION=v3.6.15 ETCD_VARIANT=nocgo GO="$fgo"
+		ZOT_VERSION=v2.1.22 ZOT_VARIANT=minimal+r2 HELM_BINARY=helm-v4.3.1 HELM_VERSION=v4.3.1 HELM_VARIANT=nocgo+deps3 XNET_FLOOR=v0.60.0 COMPRESS_RAISED=v1.20.2
 		HELM_RAISED="golang.org/x/net@v0.62.0" HELM_COMMIT=c0d08d0d6d9424d4a14febb5e8a3e51b0dd00dff
-		printf 'zot\n' >"$cpd/zot"; echo "v2.1.22 minimal+r1" >"$cpd/zot.version"
+		printf 'zot\n' >"$cpd/zot"; echo "v2.1.22 minimal+r2" >"$cpd/zot.version"
 		printf 'mach-o...v4.3.1...c0d08d0d6d9424d4a14febb5e8a3e51b0dd00dff...\n' >"$cpd/helm-v4.3.1"; echo "v4.3.1 nocgo+deps3" >"$cpd/helm.version"
-		printf 'mach-o...v0.17.2+p2...\n' >"$cpd/kine"; echo "v0.17.2 nocgo+p2" >"$cpd/kine.version"
+		printf 'mach-o...v0.17.2+p3...\n' >"$cpd/kine"; echo "v0.17.2 nocgo+p3" >"$cpd/kine.version"
 		printf 'etcd\n' >"$cpd/etcd"; echo "v3.6.15 nocgo" >"$cpd/etcd.version"
 		printf 'etcdutl\n' >"$cpd/etcdutl"; echo "v3.6.15 nocgo" >"$cpd/etcdutl.version"
 		r=0
 		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  ok    the pinned children pass"; else echo "  FAIL  the pinned children were refused: $o"; r=1; fi
 		echo "v0.17.2 nocgo+p0" >"$cpd/kine.version"
 		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a patch-set mismatch passed"; r=1; elif grep_text "$o" -q "kine.version"; then echo "  ok    a marker naming another patch set is refused"; else echo "  FAIL  marker not named: $o"; r=1; fi
-		echo "v0.17.2 nocgo+p2" >"$cpd/kine.version"
+		echo "v0.17.2 nocgo+p3" >"$cpd/kine.version"
 		printf 'mach-o...v0.17.2...\n' >"$cpd/kine"
 		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a kine without the stamped version passed"; r=1; elif grep_text "$o" -q "stamped version"; then echo "  ok    a kine without its stamp is refused"; else echo "  FAIL  stamp not named: $o"; r=1; fi
-		printf 'mach-o...v0.17.2+p2...\n' >"$cpd/kine"
+		printf 'mach-o...v0.17.2+p3...\n' >"$cpd/kine"
 		rm "$cpd/etcdutl"
 		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a payload without etcdutl passed"; r=1; elif grep_text "$o" -q "etcdutl: not staged"; then echo "  ok    a missing etcdutl is refused"; else echo "  FAIL  missing etcdutl not named: $o"; r=1; fi
 		printf 'etcdutl\n' >"$cpd/etcdutl"
-		echo "v2.1.20 minimal+r1" >"$cpd/zot.version"
+		echo "v2.1.20 minimal+r2" >"$cpd/zot.version"
 		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a zot marker at another pin passed"; r=1; elif grep_text "$o" -q "zot.version"; then echo "  ok    a zot marker naming another pin is refused"; else echo "  FAIL  zot marker not named: $o"; r=1; fi
-		echo "v2.1.22 minimal+r1" >"$cpd/zot.version"
+		echo "v2.1.22 minimal+r2" >"$cpd/zot.version"
 		echo "v4.3.1 tarball" >"$cpd/helm.version"
 		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a helm marker naming another variant passed"; r=1; elif grep_text "$o" -q "helm.version is not 'v4.3.1 nocgo+deps3'"; then echo "  ok    a helm marker naming another build variant is refused"; else echo "  FAIL  helm marker not named: $o"; r=1; fi
 		echo "v4.3.1 nocgo+deps3" >"$cpd/helm.version"

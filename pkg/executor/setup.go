@@ -599,9 +599,10 @@ const (
 	KineMarkerName = "kine.version"
 	// kineBuildVariant records HOW the pinned kine child was built. "nocgo" is
 	// CGO_ENABLED=0 against kine's pure-Go modernc.org/sqlite backend
-	// (pkg/drivers/sqlite/sqlite_nocgo.go, //go:build !cgo); "+p2" is the carried
+	// (pkg/drivers/sqlite/sqlite_nocgo.go, //go:build !cgo); "+p3" is the carried
 	// patch set: kinePatches (kinepatch.go) plus the requirement raises of
-	// internal/childreq (golang.org/x/net v0.60.0); p1 was the source patch alone.
+	// internal/childreq (golang.org/x/net v0.60.0, github.com/klauspost/compress
+	// v1.20.2); p2 raised x/net alone and p1 was the source patch alone.
 	// It is part of the marker because version alone does not identify the binary:
 	// the same kine tag builds two different SQLite implementations depending on
 	// CGO_ENABLED, and only this one keeps the unmaintained mattn/go-sqlite3 out of
@@ -609,7 +610,7 @@ const (
 	// behaves differently on disk and links different dependencies. Changing the
 	// patch set changes the "+p" suffix, which is what makes every already-staged kine
 	// (and every node seeding from an older payload) re-stage the patched build.
-	kineBuildVariant = "nocgo+p2"
+	kineBuildVariant = "nocgo+p3"
 )
 
 // kinePath / kineMarkerPath name the staged kine binary and its version marker in a

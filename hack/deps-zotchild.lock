@@ -389,7 +389,7 @@ github.com/json-iterator/go v1.1.12 # 2021-09-11T02:17:26Z
 github.com/jtolds/gls v4.20.0+incompatible # 2018-11-10T20:30:27Z
 github.com/kevinburke/ssh_config v1.6.0 # 2026-02-16T11:10:38Z
 github.com/keybase/go-keychain v0.0.1 # 2025-02-27T17:52:03Z
-github.com/klauspost/compress v1.20.0 # 2026-09-02T12:08:18Z
+github.com/klauspost/compress v1.20.2 # 2026-10-12T09:34:06Z
 github.com/klauspost/cpuid/v2 v2.4.0 # 2026-06-17T09:04:27Z
 github.com/knqyf263/go-apk-version v0.0.0-20200609155635-041fdbb8563f # 2020-06-09T15:56:35Z
 github.com/knqyf263/go-deb-version v0.0.0-20241115132648-6f4aee6ccd23 # 2024-11-15T13:26:48Z

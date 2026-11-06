@@ -95,6 +95,7 @@ func TestZotWrapperPins(t *testing.T) {
 // another graph.
 var zotRaiseHistory = map[string]string{
 	"minimal+r1": "118badbd2badbebcd23b7c427288073c0f3820e006593d19c09e7a7ab0d5d80e",
+	"minimal+r2": "bcf4c02a45243236b67537585387eefee5a57fdce76676286d299b68d95fcba3",
 }
 
 // zotRaiseDigest is the sha256 of childreq.Raises' content.

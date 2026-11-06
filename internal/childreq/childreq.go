@@ -49,6 +49,12 @@ import (
 // reads this line as the floor a staged kine or zot must link.
 const XNetVersion = "v0.60.0"
 
+// CompressVersion is the github.com/klauspost/compress version kine and zot are
+// built against. v1.20.2 fixes GO-2026-6865, a panic on two-block frames in its fse
+// and huff0 packages; kine's tag selects v1.20.1 and zot's v1.20.0. It requires no
+// module of its own, so raising it moves no other module.
+const CompressVersion = "v1.20.2"
+
 // Requirement is one raised module requirement and its go.sum hashes.
 type Requirement struct {
 	// Path is the module path.
@@ -68,6 +74,11 @@ var Raises = []Requirement{{
 	Version:  XNetVersion,
 	Sum:      "h1:79p50tfZlm0J9YfoDsSi639qSXNGVwEzOPLCxM2FsYU=",
 	GoModSum: "h1:2DA/G1UfVbCpQPeWTmMPGY7Cs2PkBkwu743bVX5PIVg=",
+}, {
+	Path:     "github.com/klauspost/compress",
+	Version:  CompressVersion,
+	Sum:      "h1:v5tiZvm1KGLyg5d5oXdXe3lsSPrbEUiKoXGia//I7Qo=",
+	GoModSum: "h1:LUdAzn7YLVvxLpc7y3V1m40wESHTgc1422pwwBSKYuI=",
 }}
 
 // ErrNotARaise marks a requirement the tree already meets or exceeds: the pin
