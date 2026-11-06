@@ -221,3 +221,106 @@ func TestUnparsableSubjectKeepsItsReferrer(t *testing.T) {
 		})
 	}
 }
+
+// TestSubjectPushedBetweenMarkAndLock: the mark finds a referrer whose subject
+// is absent and plans to reap it, then the subject is pushed before the locked
+// pass. The rows changed, so the locked pass deletes nothing and the sweep
+// marks again, finds the subject live, and keeps the referrer and its blobs.
+func TestSubjectPushedBetweenMarkAndLock(t *testing.T) {
+	e := newEnv(t)
+	n := name(t, "app")
+	cfgBody, layerBody := []byte(`{"seed":"late subject"}`), []byte("late layer")
+	cfg := ispec.Descriptor{Digest: digest.FromBytes(cfgBody), Size: int64(len(cfgBody))}
+	layer := ispec.Descriptor{MediaType: ispec.MediaTypeImageLayer, Digest: digest.FromBytes(layerBody), Size: int64(len(layerBody))}
+	subjectBody := manifestBody(t, cfg, []ispec.Descriptor{layer}, nil)
+	subject := ispec.Descriptor{MediaType: ispec.MediaTypeImageManifest, Digest: digest.FromBytes(subjectBody), Size: int64(len(subjectBody))}
+
+	e.clk.set(-2 * time.Hour)
+	r := e.referrer(t, n, "sig", subject)
+	c := e.collector(t, -3*time.Hour)
+	e.ran(t)
+	e.clk.set(0)
+
+	// Each mark reads the referrer's body once, so two reads are a replan.
+	marks := 0
+	c.onRead = func(m ref.Name, d digest.Digest) {
+		if m == n && d == r.manifest.Digest {
+			marks++
+		}
+	}
+	var pushed bool
+	c.afterMark = func(m ref.Name) {
+		if m != n || pushed {
+			return
+		}
+		pushed = true
+		e.blob(t, n, cfgBody)
+		e.blob(t, n, layerBody)
+		e.putManifest(t, n, "", ispec.MediaTypeImageManifest, subjectBody)
+	}
+	rep := e.sweep(t, c)
+	if marks != 2 {
+		t.Errorf("the referrer was read by %d marks, want 2 (a replan after the push)", marks)
+	}
+	if len(rep.Objects) != 0 || len(rep.Stopped) != 0 || len(rep.Failed) != 0 {
+		t.Errorf("report %+v, want nothing reaped and no stop", rep)
+	}
+	for _, d := range slices.Concat(r.blobs(), []digest.Digest{subject.Digest, cfg.Digest, layer.Digest}) {
+		if !e.has(n, d) {
+			t.Errorf("%s was reaped", d)
+		}
+	}
+	idx, err := e.s.Index(n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.ContainsFunc(idx.Manifests, func(row ispec.Descriptor) bool { return row.Digest == r.manifest.Digest }) {
+		t.Error("the referrer row was removed")
+	}
+}
+
+// TestSubjectTouchedBetweenMarkAndLock: the mark finds an untagged subject past
+// the grace, plans to reap it and so its referrer, then a write touches the
+// subject before the locked pass. The rows did not change, so there is no
+// replan: the locked pass re-states the blobs, finds the subject inside the
+// grace, keeps it and its referrer, and only what both passes reap goes.
+func TestSubjectTouchedBetweenMarkAndLock(t *testing.T) {
+	e := newEnv(t)
+	n := name(t, "app")
+	e.clk.set(-2 * time.Hour)
+	subject := e.push(t, n, "", "subject", []byte("layer"))
+	r := e.referrer(t, n, "sig", subject.manifest)
+	c := e.collector(t, -3*time.Hour)
+	e.ran(t)
+	e.clk.set(0)
+
+	marks := 0
+	c.afterMark = func(m ref.Name) {
+		if m != n {
+			return
+		}
+		marks++
+		if err := e.s.TouchBlob(e.ctx, n, subject.manifest.Digest); err != nil {
+			t.Error(err)
+		}
+	}
+	rep := e.sweep(t, c)
+	if marks != 1 {
+		t.Errorf("the repository was marked %d times, want 1", marks)
+	}
+	if len(rep.Objects) != 0 || len(rep.Stopped) != 0 || len(rep.Failed) != 0 {
+		t.Errorf("report %+v, want nothing reaped and no stop", rep)
+	}
+	for _, d := range slices.Concat(subject.blobs(), r.blobs()) {
+		if !e.has(n, d) {
+			t.Errorf("%s was reaped", d)
+		}
+	}
+	idx, err := e.s.Index(n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(idx.Manifests) != 2 {
+		t.Errorf("index has %d rows, want the subject's and the referrer's", len(idx.Manifests))
+	}
+}
