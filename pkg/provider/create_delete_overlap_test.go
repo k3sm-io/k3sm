@@ -418,7 +418,15 @@ func testNothingLandsBesideFalseEntry(t *testing.T) {
 	if err := r.DeletePod(ctx, pod.DeepCopy()); err != nil {
 		t.Fatalf("DeletePod: %v", err)
 	}
+	// Held until the retry has returned: landing before that retires the entry
+	// (compensatingDeleteLanded), and the retry's updateDone runs the release with none.
+	releaseDelete := f.holdDelete()
+	defer releaseDelete()
 	land()
+	waitRestart(t, "the retry to return behind the compensating delete", func() bool {
+		return len(f.deleteRecords()) == 2 && updatingCount(r, id) == 0
+	})
+	releaseDelete()
 	waitRestart(t, "the release to begin", func() bool { return len(entered) == 1 })
 
 	r.mu.Lock()
