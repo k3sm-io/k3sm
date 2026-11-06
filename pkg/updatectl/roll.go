@@ -794,14 +794,22 @@ func (c *Controller) cordon(ctx context.Context, n *corev1.Node) (*corev1.Node, 
 }
 
 // release ends the controller's hold on a node: it removes the controller's
-// own annotations and lifts the cordon if the controller made it (an
-// operator's cordon stays). The update-version, -payload and -phase
-// annotations stay: they record what the node was asked for and reported. So
-// does a rotation mark: the status that records it is written after this
-// patch, and a failed status write must find the mark again on the next pass;
-// the next handover clears it.
+// own annotations and the handover's signature and signer, which nothing reads
+// once the node has reported, and lifts the cordon if the controller made it
+// (an operator's cordon stays). The update-version, -payload and -phase
+// annotations stay while the Update does: they record what the node was asked
+// for and reported. So does a rotation mark: the status that records it is
+// written after this patch, and a failed status write must find the mark again
+// on the next pass. The next handover clears it, and releaseOrphans clears the
+// record once its Update is gone.
 func (c *Controller) release(ctx context.Context, n *corev1.Node) (*corev1.Node, error) {
-	patch := annotations(map[string]any{CordonedAnnotation: nil, HandedOverAnnotation: nil, ReadyAtAnnotation: nil})
+	patch := annotations(map[string]any{
+		CordonedAnnotation:                nil,
+		HandedOverAnnotation:              nil,
+		ReadyAtAnnotation:                 nil,
+		update.AnnotationUpdatePayloadSig: nil,
+		update.AnnotationUpdateSigner:     nil,
+	})
 	if n.Annotations[CordonedAnnotation] == "true" {
 		patch["spec"] = map[string]any{"unschedulable": false}
 	}

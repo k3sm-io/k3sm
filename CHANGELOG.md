@@ -202,6 +202,14 @@ pin, its date, and the tarball's sha256.
   logging each try, and carries on from the step it reached without fetching or installing anything twice. If
   the write still fails, the node keeps the last phase it wrote and tries again from the start of the download,
   and the node timeout remains the limit. No RBAC changes.
+- A deleted `Update` no longer leaves its node cordoned. Deleting a failed roll's `Update`, or finding one
+  gone when the server starts, left the node `SchedulingDisabled` with its `k3sm.io/update-*` annotations.
+  The update controller now clears those annotations when no `Update` accounts for them, and lifts the cordon
+  only where it made the cordon: a node you cordoned yourself stays cordoned. It records an
+  `UpdateOrphanReleased` Event on the Node. A live roll is not touched, and a failed roll keeps its node as it
+  was until `k3sm update abort` or a delete of the `Update`. A node that finished a roll keeps
+  `k3sm.io/update-version`, `-payload` and `-phase` only while its `Update` stands, and no longer keeps the
+  signature and signer certificate. No RBAC changes.
 - `sudo k3sm start` and `sudo k3sm install --start` on a stopped server no longer fail with `Unauthorized`
   when they reach the apiserver as it comes back, which rolled the install back and left the node cordoned.
   For 30 seconds after the first rejection they retry and read the admin kubeconfig again, within the
