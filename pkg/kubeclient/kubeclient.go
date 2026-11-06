@@ -17,6 +17,7 @@ limitations under the License.
 package kubeclient
 
 import (
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"slices"
@@ -31,6 +32,10 @@ import (
 // ErrCredentialsNotInline marks a FromCheckedPath refusal: the kubeconfig has a
 // user or cluster entry that keeps its credentials anywhere but in the file.
 var ErrCredentialsNotInline = errors.New("only inline credentials are accepted")
+
+// ErrCAUnusable marks a PinCA refusal: the bytes it was given hold no PEM
+// certificate.
+var ErrCAUnusable = errors.New("holds no PEM certificate")
 
 // FromPath loads the kubeconfig at path and returns both the rest.Config it
 // resolved and a typed clientset built from it. path is used verbatim, and
@@ -56,11 +61,7 @@ func FromPath(path string) (*rest.Config, kubernetes.Interface, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	cs, err := kubernetes.NewForConfig(cfg)
-	if err != nil {
-		return nil, nil, fmt.Errorf("build kubernetes client: %w", err)
-	}
-	return cfg, cs, nil
+	return clientFor(cfg)
 }
 
 // FromCheckedPath is FromPath for a caller that accepts only inline credentials:
@@ -78,17 +79,57 @@ func FromPath(path string) (*rest.Config, kubernetes.Interface, error) {
 // and fields are in a fixed order, so one file always gives the same message and
 // a caller can recognise a repeat.
 func FromCheckedPath(path string) (*rest.Config, kubernetes.Interface, error) {
+	cfg, err := checkedConfig(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	return clientFor(cfg)
+}
+
+// FromCheckedPathWithCA is FromCheckedPath for a caller that holds the cluster's
+// CA itself: the kubeconfig gives the address and the client credential, and
+// caPEM alone decides which server certificate is accepted (PinCA). A refusal
+// from PinCA wraps ErrCAUnusable.
+func FromCheckedPathWithCA(path string, caPEM []byte) (*rest.Config, kubernetes.Interface, error) {
+	cfg, err := checkedConfig(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := PinCA(cfg, caPEM); err != nil {
+		return nil, nil, err
+	}
+	return clientFor(cfg)
+}
+
+// PinCA makes caPEM the only trust cfg has in its server: every other trust
+// setting a kubeconfig can carry is cleared, a CA file or inline CA,
+// insecure-skip-tls-verify and tls-server-name. The address is left alone, since
+// it can legitimately differ from the one the CA was first seen at.
+func PinCA(cfg *rest.Config, caPEM []byte) error {
+	if !x509.NewCertPool().AppendCertsFromPEM(caPEM) {
+		return fmt.Errorf("cluster CA %w", ErrCAUnusable)
+	}
+	cfg.CAData = caPEM
+	cfg.CAFile = ""
+	cfg.Insecure = false
+	cfg.ServerName = ""
+	return nil
+}
+
+// checkedConfig reads path once, checks it, and resolves its current context.
+func checkedConfig(path string) (*rest.Config, error) {
 	raw, err := clientcmd.LoadFromFile(path)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if err := checkInline(raw); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	cfg, err := restConfigFrom(raw)
-	if err != nil {
-		return nil, nil, err
-	}
+	return restConfigFrom(raw)
+}
+
+// clientFor builds the clientset of a config this package resolved.
+func clientFor(cfg *rest.Config) (*rest.Config, kubernetes.Interface, error) {
 	cs, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
 		return nil, nil, fmt.Errorf("build kubernetes client: %w", err)

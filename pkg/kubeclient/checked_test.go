@@ -35,6 +35,7 @@ import (
 	"testing"
 	"time"
 
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
@@ -301,6 +302,95 @@ func TestFromCheckedPathReturnsTheLoaderError(t *testing.T) {
 		t.Setenv("KUBECONFIG", writeKubeconfig(t, "https://198.51.100.1:6443"))
 		if cfg, _, err := FromCheckedPath(""); err == nil {
 			t.Fatalf("FromCheckedPath(\"\") resolved to %q; it must not consult the environment", cfg.Host)
+		}
+	})
+}
+
+// TestPinCAReplacesEveryOtherTrustSetting starts from each trust setting a
+// kubeconfig can carry and pins that only the given CA remains.
+func TestPinCAReplacesEveryOtherTrustSetting(t *testing.T) {
+	pinned, _ := fixturePair(t)
+	other, _ := fixturePair(t)
+	tests := []struct {
+		name string
+		tls  rest.TLSClientConfig
+	}{
+		{name: "an inline CA", tls: rest.TLSClientConfig{CAData: other}},
+		{name: "a CA file", tls: rest.TLSClientConfig{CAFile: "/elsewhere/ca.crt"}},
+		{name: "insecure-skip-tls-verify", tls: rest.TLSClientConfig{Insecure: true}},
+		{name: "tls-server-name", tls: rest.TLSClientConfig{CAData: other, ServerName: "elsewhere.example"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &rest.Config{Host: "https://192.0.2.1:6443", TLSClientConfig: tt.tls}
+			if err := PinCA(cfg, pinned); err != nil {
+				t.Fatalf("PinCA: %v", err)
+			}
+			if !bytes.Equal(cfg.CAData, pinned) {
+				t.Error("the config's CA is not the pinned one")
+			}
+			if cfg.CAFile != "" || cfg.Insecure || cfg.ServerName != "" {
+				t.Errorf("trust left behind: %+v", cfg.TLSClientConfig)
+			}
+			if cfg.Host != "https://192.0.2.1:6443" {
+				t.Errorf("host = %q, want it untouched", cfg.Host)
+			}
+			if _, err := rest.TLSConfigFor(cfg); err != nil {
+				t.Errorf("the pinned config does not build a TLS config: %v", err)
+			}
+		})
+	}
+	for _, bad := range [][]byte{nil, []byte("not pem")} {
+		cfg := &rest.Config{TLSClientConfig: rest.TLSClientConfig{CAData: other}}
+		if err := PinCA(cfg, bad); !errors.Is(err, ErrCAUnusable) {
+			t.Errorf("PinCA(%q) = %v, want ErrCAUnusable", bad, err)
+		}
+		if !bytes.Equal(cfg.CAData, other) {
+			t.Errorf("PinCA(%q) changed the config it refused", bad)
+		}
+	}
+}
+
+// TestFromCheckedPathWithCA pins what a caller holding the CA gets from the file:
+// the address and the client credential, never the trust.
+func TestFromCheckedPathWithCA(t *testing.T) {
+	fileCA, _ := fixturePair(t)
+	pinned, _ := fixturePair(t)
+	clientCert, clientKey := fixturePair(t)
+	user := fmt.Sprintf("    client-certificate-data: %s\n    client-key-data: %s",
+		base64.StdEncoding.EncodeToString(clientCert), base64.StdEncoding.EncodeToString(clientKey))
+
+	t.Run("the given CA replaces the file's", func(t *testing.T) {
+		cfg, cs, err := FromCheckedPathWithCA(writeCheckedFixture(t, inlineCluster(fileCA), user, ""), pinned)
+		if err != nil {
+			t.Fatalf("FromCheckedPathWithCA: %v", err)
+		}
+		if cs == nil || !bytes.Equal(cfg.CAData, pinned) {
+			t.Errorf("clientset = %v, CA is the pinned one = %t", cs, bytes.Equal(cfg.CAData, pinned))
+		}
+		if cfg.Host != "https://127.0.0.1:6443" || !bytes.Equal(cfg.CertData, clientCert) {
+			t.Errorf("host %q and the client certificate must come from the file", cfg.Host)
+		}
+	})
+	t.Run("insecure-skip-tls-verify in the file does not apply", func(t *testing.T) {
+		cfg, _, err := FromCheckedPathWithCA(writeCheckedFixture(t, "    insecure-skip-tls-verify: true", user, ""), pinned)
+		if err != nil {
+			t.Fatalf("FromCheckedPathWithCA: %v", err)
+		}
+		if cfg.Insecure || !bytes.Equal(cfg.CAData, pinned) {
+			t.Errorf("insecure = %t, want the pinned CA only", cfg.Insecure)
+		}
+	})
+	t.Run("the inline check still applies", func(t *testing.T) {
+		path := writeCheckedFixture(t, inlineCluster(fileCA), "    tokenFile: /elsewhere/token", "")
+		if _, _, err := FromCheckedPathWithCA(path, pinned); !errors.Is(err, ErrCredentialsNotInline) {
+			t.Errorf("err = %v, want ErrCredentialsNotInline", err)
+		}
+	})
+	t.Run("an unusable CA is refused", func(t *testing.T) {
+		_, cs, err := FromCheckedPathWithCA(writeCheckedFixture(t, inlineCluster(fileCA), user, ""), []byte("not pem"))
+		if !errors.Is(err, ErrCAUnusable) || cs != nil {
+			t.Errorf("err = %v, clientset = %v, want ErrCAUnusable and none", err, cs)
 		}
 	})
 }

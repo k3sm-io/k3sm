@@ -48,6 +48,8 @@ limitations under the License.
 //
 // FromCheckedPath is the same one-file load for a caller that accepts only inline
 // credentials, so the file alone says everything the client will use.
+// FromCheckedPathWithCA adds a CA the caller holds, which then decides alone which
+// server the client accepts.
 //
 // It also always builds a clientset, so two sites keep clientcmd directly:
 // cmd/k3sm's nodeRESTConfig, which pins a request timeout on the config before
