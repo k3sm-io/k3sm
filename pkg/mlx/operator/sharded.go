@@ -48,6 +48,12 @@ const (
 	// placementRetry is how soon a model that could not be placed tries again:
 	// a cable armed or a node joining should not wait for a resync.
 	placementRetry = 30 * time.Second
+	// interconnectSlotRetry is how soon a gang waiting for its nodes' desired
+	// annotation to list the model (AwaitingInterconnectSlot) tries again. The
+	// resolver republishes within about a second of an MLXModel change, so a
+	// placementRetry poll would add half a minute to every switch onto the
+	// thunderbolt path.
+	interconnectSlotRetry = 2 * time.Second
 	// gangRetry is how soon a gang restart re-checks whether the survivors are
 	// gone, so the re-placement follows the teardown promptly.
 	gangRetry = 2 * time.Second
@@ -260,7 +266,7 @@ func (c *Controller) reconcileSharded(ctx context.Context, key string, raw *unst
 				nameList(waiting))
 			c.log.Info("sharded mlxmodel waits for its nodes to list it as an interconnect model; no rank pod created",
 				"mlxmodel", key, "nodes", waiting)
-			c.queue.AddAfter(key, placementRetry)
+			c.queue.AddAfter(key, interconnectSlotRetry)
 			return c.writeShardedStatus(ctx, raw, model, mlx.ShardObservation{
 				Desired: desired, PlacementReason: mlx.ReasonAwaitingInterconnectSlot, PlacementMessage: msg,
 			})

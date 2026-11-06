@@ -157,8 +157,11 @@ func TestThunderboltFlipWaitsForDesiredAnnotation(t *testing.T) {
 	if n := len(h.rankPods(t)); n != 0 {
 		t.Fatalf("%d rank pods created before the nodes' desired annotation lists the model, want none", n)
 	}
-	if got := q.take(); !containsRequeue(got, requeue{key(), placementRetry}) {
-		t.Errorf("requeues = %v, want %s after %s", got, key(), placementRetry)
+	if got := q.take(); len(got) != 1 || got[0] != (requeue{key(), interconnectSlotRetry}) {
+		t.Errorf("requeues = %v, want only %s after %s", got, key(), interconnectSlotRetry)
+	}
+	if interconnectSlotRetry != 2*time.Second {
+		t.Errorf("interconnectSlotRetry = %s, want 2s", interconnectSlotRetry)
 	}
 	s := h.status(t)
 	placed := condition(t, s, mlx.ConditionShardsPlaced)
@@ -174,6 +177,9 @@ func TestThunderboltFlipWaitsForDesiredAnnotation(t *testing.T) {
 	// One node caught up is not enough: the gang is all or nothing.
 	h.setDesired(t, "mac-a", desiredListing(t, model()))
 	h.reconcile(t)
+	if got := q.take(); len(got) != 1 || got[0] != (requeue{key(), interconnectSlotRetry}) {
+		t.Errorf("requeues while mac-b lags = %v, want only %s after %s", got, key(), interconnectSlotRetry)
+	}
 	if n := len(h.rankPods(t)); n != 0 {
 		t.Fatalf("%d rank pods created while mac-b's desired annotation lacks the model, want none", n)
 	}
@@ -187,13 +193,4 @@ func TestThunderboltFlipWaitsForDesiredAnnotation(t *testing.T) {
 	if got := h.gangPath(t); got != tb {
 		t.Fatalf("gang path %q once the annotation lists the model, want thunderbolt", got)
 	}
-}
-
-func containsRequeue(got []requeue, want requeue) bool {
-	for _, r := range got {
-		if r == want {
-			return true
-		}
-	}
-	return false
 }
