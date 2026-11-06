@@ -85,9 +85,9 @@ func FromPath(path string) (*rest.Config, kubernetes.Interface, error) {
 
 // FromCheckedPath is FromPath for a caller that accepts only inline credentials:
 // certificate-authority-data, client-certificate-data, client-key-data, token,
-// username and password. Every user and cluster entry in the file is checked, not
-// only the ones the current context names, and a refusal wraps
-// ErrCredentialsNotInline.
+// username and password. A cluster entry may not set proxy-url either. Every user
+// and cluster entry in the file is checked, not only the ones the current context
+// names, and a refusal wraps ErrCredentialsNotInline.
 //
 // The rest.Config is built from the checked object, and the path is read once,
 // so what was checked is exactly what is used.
@@ -192,14 +192,30 @@ func checkInline(raw *clientcmdapi.Config) error {
 		}
 	}
 	for _, name := range sortedKeys(raw.Clusters) {
-		if c := raw.Clusters[name]; c != nil && c.CertificateAuthority != "" {
-			refused = append(refused, fmt.Sprintf("cluster %q sets certificate-authority", name))
+		if fields := clusterFieldsNotInline(raw.Clusters[name]); len(fields) > 0 {
+			refused = append(refused, fmt.Sprintf("cluster %q sets %s", name, strings.Join(fields, ", ")))
 		}
 	}
 	if len(refused) == 0 {
 		return nil
 	}
 	return fmt.Errorf("%s: %w", strings.Join(refused, "; "), ErrCredentialsNotInline)
+}
+
+// clusterFieldsNotInline returns the kubeconfig keys c sets that checkInline refuses.
+// proxy-url is one of them: a checked client connects to the file's server directly.
+func clusterFieldsNotInline(c *clientcmdapi.Cluster) []string {
+	if c == nil {
+		return nil
+	}
+	var fields []string
+	if c.CertificateAuthority != "" {
+		fields = append(fields, "certificate-authority")
+	}
+	if c.ProxyURL != "" {
+		fields = append(fields, "proxy-url")
+	}
+	return fields
 }
 
 // userFieldsNotInline returns the kubeconfig keys u sets that checkInline refuses.

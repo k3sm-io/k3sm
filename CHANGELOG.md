@@ -234,6 +234,8 @@ pin, its date, and the tarball's sha256.
   CA. Without one it starts no informers, denies privileged binds, and logs what to pass.
 - An agent run as root accepts only inline credentials in the kubeconfigs its mesh watcher, MeshPeer list and
   node-local datapath read.
+- A kubeconfig that a root command loads with the inline-credentials check is also refused when a cluster entry
+  sets `proxy-url`.
 - A worker's root helper, `sudo k3sm kubectl` and the other root verbs on a worker, and `k3sm stop` and `k3sm start`
   there, verify the apiserver's certificate against the kubernetes Service address, `10.43.0.1`, which
   every apiserver certificate carries and no other certificate of the cluster does. They still connect to the

@@ -164,6 +164,8 @@ func TestFromCheckedPathRefusesEveryFieldNotInline(t *testing.T) {
 		{"impersonated extra", cluster, "    as-user-extra: {fixture: [fixture]}", `user "admin" sets as-user-extra`},
 		{"certificate authority path", "    certificate-authority: " + fixturePath, inlineUser, `cluster "k3sm" sets certificate-authority`},
 		{"path beside inline data", cluster, "    client-certificate-data: Y2VydA==\n    client-certificate: " + fixturePath, `user "admin" sets client-certificate`},
+		{"proxy url", cluster + "\n    proxy-url: http://" + fixturePath, inlineUser, `cluster "k3sm" sets proxy-url`},
+		{"proxy url beside a certificate authority path", "    certificate-authority: " + fixturePath + "\n    proxy-url: http://" + fixturePath, inlineUser, `cluster "k3sm" sets certificate-authority, proxy-url`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
