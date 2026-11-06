@@ -263,7 +263,7 @@ func ServerPlist(cfg Config) []byte {
 // different package — so a hand-picked literal here is wrong the first time any of
 // them moves, and the failure is silent and bad: a SIGKILL mid-stop orphans
 // exactly the children the stop exists to reap (kine and the apiserver on the
-// server path, the ingest registry's zot child on a server with one).
+// server path, the ingest registry's child on a server with one).
 //
 // A stopping server runs its deferred steps on two lanes at once:
 //
@@ -309,7 +309,7 @@ func ServerPlist(cfg Config) []byte {
 //	                        apiserver writes before anything below begins.
 //	registry teardown  25s  the ingest registry's teardown, cmd/k3sm/registry.go:
 //	                        two best-effort retractions at registryRetractGrace (5s)
-//	                        each, then the zot child's stop at registryShutdownGrace
+//	                        each, then the child's stop at registryShutdownGrace
 //	                        (10s), within registryTeardownBound, which adds
 //	                        registryTeardownMargin (5s). It runs HERE, before the control plane goes, so
 //	                        the child is stopped in the first seconds of the exit

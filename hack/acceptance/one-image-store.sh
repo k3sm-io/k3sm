@@ -84,12 +84,12 @@
 #     `sudo k3sm image load <tar>`), so it lives only in that node's store. After the
 #     upgrade the node store is a pull cache and no verb can put a user image there.
 #   The aged prune seed is NOT seeded by the driver: ois.8 makes it inside the run.
-#   The cluster registry runs its own garbage collection (zot: gc on, gcDelay 1h,
-#   gcInterval 6h; pkg/registrysvc/config.go), which deletes untagged manifests older
+#   The cluster registry runs its own garbage collection (grace 1h, sweep 6h;
+#   pkg/registrysvc/serve.go), which deletes untagged manifests older
 #   than an hour on its own sweeps, so a seed untagged an hour before the run is
 #   usually gone by ois.8. `k3sm image prune` judges age by the manifest blob's
 #   mtime (pkg/registrysvc/prune.go, PruneGrace one hour), so backdating that blob
-#   right before the dry run gives prune an aged manifest zot has not swept. If the
+#   right before the dry run gives prune an aged manifest the registry has not swept. If the
 #   seed is absent anyway, ois.8 fails naming the registry's garbage collection.
 #
 # Pods follow the lab rules: nodeName AND the darwin nodeSelector; tolerations are
@@ -303,7 +303,7 @@ rerun_verdict() {
 	}
 }
 
-# manifest_blob <registry-root> <repository> <sha256:hex>: the path zot stores the
+# manifest_blob <registry-root> <repository> <sha256:hex>: the path the registry stores the
 # manifest blob at (<root>/<repository>/blobs/sha256/<hex>, as prune.go's blobPath);
 # fails on a digest of any other shape.
 manifest_blob() {
@@ -1228,7 +1228,7 @@ leg_pass
 
 # ---- ois.8 prune -------------------------------------------------------------------------
 # seed_aged: the aged untagged manifest the prune must delete, made in the run because
-# the registry's own garbage collection (zot, gcDelay 1h) sweeps untagged manifests
+# the registry's own garbage collection (grace 1h) sweeps untagged manifests
 # older than an hour, so a seed made an hour ahead is usually gone. A native pod
 # pushes a one-layer image carrying the run id (unique content per run) to
 # <run>-lab/aged:v1, the server untags it, and the manifest blob's mtime, which

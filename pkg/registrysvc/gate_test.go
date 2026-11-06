@@ -44,25 +44,25 @@ import (
 
 // --- fixture ---------------------------------------------------------------
 
-// zotRequest is what the fake registry saw.
-type zotRequest struct {
+// registryRequest is what the fake registry saw.
+type registryRequest struct {
 	method, uri, auth, cookie, rng string
 	body                           string
 }
 
-// fakeZot stands in for the loopback registry and records every request.
-type fakeZot struct {
+// fakeRegistry stands in for the loopback registry and records every request.
+type fakeRegistry struct {
 	mu   sync.Mutex
-	seen []zotRequest
+	seen []registryRequest
 	h    http.Handler
 }
 
-// fakeZotHost is the upstream address the gate under test is pointed at. It is
+// fakeRegistryHost is the upstream address the gate under test is pointed at. It is
 // never dialled: the gate's Transport is the fake's RoundTrip.
-const fakeZotHost = "zot.test:5000"
+const fakeRegistryHost = "registry.test:5000"
 
 // RoundTrip serves a request on the fake registry in-process, without a socket.
-func (z *fakeZot) RoundTrip(req *http.Request) (*http.Response, error) {
+func (z *fakeRegistry) RoundTrip(req *http.Request) (*http.Response, error) {
 	in := req.Clone(req.Context())
 	in.RequestURI = req.URL.RequestURI()
 	if in.Body == nil {
@@ -126,21 +126,21 @@ func serveMem(t *testing.T, h http.Handler) *memListener {
 	return l
 }
 
-func newFakeZot(t *testing.T) *fakeZot {
+func newFakeRegistry(t *testing.T) *fakeRegistry {
 	t.Helper()
-	z := &fakeZot{}
+	z := &fakeRegistry{}
 	z.h = (http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
 		z.mu.Lock()
-		z.seen = append(z.seen, zotRequest{
+		z.seen = append(z.seen, registryRequest{
 			method: r.Method, uri: r.RequestURI, auth: r.Header.Get("Authorization"),
 			cookie: r.Header.Get("Cookie"), rng: r.Header.Get("Range"), body: string(b),
 		})
 		z.mu.Unlock()
-		w.Header().Set("Set-Cookie", "session=zot")
+		w.Header().Set("Set-Cookie", "session=registry")
 		switch r.Method {
 		case "POST", "PATCH":
-			w.Header().Set("Location", "http://"+fakeZotHost+"/v2/x/blobs/uploads/abc")
+			w.Header().Set("Location", "http://"+fakeRegistryHost+"/v2/x/blobs/uploads/abc")
 			w.WriteHeader(http.StatusAccepted)
 		case "PUT":
 			w.WriteHeader(http.StatusCreated)
@@ -152,10 +152,10 @@ func newFakeZot(t *testing.T) *fakeZot {
 	return z
 }
 
-func (z *fakeZot) requests() []zotRequest {
+func (z *fakeRegistry) requests() []registryRequest {
 	z.mu.Lock()
 	defer z.mu.Unlock()
-	return append([]zotRequest(nil), z.seen...)
+	return append([]registryRequest(nil), z.seen...)
 }
 
 // fakeTokens is a TokenReviewer over a table of tokens.
@@ -238,13 +238,13 @@ func (c *fakeClock) advance(d time.Duration) { c.mu.Lock(); c.t = c.t.Add(d); c.
 // gateCred is the gate's registry credential in every test.
 var gateCred = Credential{Address: "127.0.0.1:6450", Username: gateUser, Password: "gate-secret"}
 
-// wantGateAuth is the Authorization header zot must see on a forwarded write.
+// wantGateAuth is the Authorization header the registry must see on a forwarded write.
 var wantGateAuth = "Basic " + base64.StdEncoding.EncodeToString([]byte(gateUser+":gate-secret"))
 
 // The default world: namespace team opts in with prefix team, its builder
 // ServiceAccount is bound to push, and tokTeam is that ServiceAccount's token.
 type gateFixture struct {
-	zot        *fakeZot
+	registry   *fakeRegistry
 	tokens     *fakeTokens
 	access     *fakeAccess
 	namespaces *fakeNamespaces
@@ -309,7 +309,7 @@ func saStatus(ns, sa string) authnv1.TokenReviewStatus {
 func newGateFixture(t *testing.T) *gateFixture {
 	t.Helper()
 	f := &gateFixture{
-		zot: newFakeZot(t),
+		registry: newFakeRegistry(t),
 		tokens: &fakeTokens{statuses: map[string]authnv1.TokenReviewStatus{
 			tokTeam:    saStatus("team", "builder"),
 			tokShort:   saStatus("team", "builder"),
@@ -328,8 +328,8 @@ func newGateFixture(t *testing.T) *gateFixture {
 		clock: &fakeClock{t: testEpoch},
 	}
 	f.gate = newGate(gateConfig{
-		Upstream:   fakeZotHost,
-		Transport:  f.zot,
+		Upstream:   fakeRegistryHost,
+		Transport:  f.registry,
 		Auth:       GateAuth{Tokens: f.tokens, Access: f.access, Namespaces: f.namespaces},
 		Credential: gateCred,
 		Logger:     quietLogger(),
@@ -420,7 +420,7 @@ func TestPushAuthorizesServiceAccountTokenUnderNamespacePrefix(t *testing.T) {
 		header map[string]string
 		setup  func(*gateFixture)
 		status int
-		// forward is the request zot must see, or "" for none.
+		// forward is the request the registry must see, or "" for none.
 		forward string
 		// asWrite: the forwarded request carries the gate credential (else none).
 		asWrite     bool
@@ -520,7 +520,7 @@ func TestPushAuthorizesServiceAccountTokenUnderNamespacePrefix(t *testing.T) {
 		{name: "DELETE is refused unauthenticated", method: "DELETE", target: "/v2/team/app/manifests/" + digestA, status: 405, reviews: 0, sars: 0},
 		{name: "DELETE is refused authenticated", method: "DELETE", target: "/v2/team/app/manifests/" + digestA, auth: basic(tokTeam), status: 405, reviews: 0, sars: 0},
 		{name: "DELETE of an upload is refused", method: "DELETE", target: "/v2/team/app/blobs/uploads/abc", auth: basic(tokTeam), status: 405, reviews: 0, sars: 0},
-		{name: "a zot extension write is refused", method: "POST", target: "/v2/_zot/ext/userprefs?action=toggleStar&repo=team/app", auth: basic(tokTeam), status: 405, reviews: 0, sars: 0},
+		{name: "an extension write is refused", method: "POST", target: "/v2/_oci/ext/userprefs?action=toggleStar&repo=team/app", auth: basic(tokTeam), status: 405, reviews: 0, sars: 0},
 		{name: "a tags PUT is refused", method: "PUT", target: "/v2/team/app/tags/list", auth: basic(tokTeam), status: 405, reviews: 0, sars: 0},
 		{name: "OPTIONS is refused", method: "OPTIONS", target: "/v2/team/app/manifests/v1", status: 405, reviews: 0, sars: 0},
 
@@ -555,7 +555,7 @@ func TestPushAuthorizesServiceAccountTokenUnderNamespacePrefix(t *testing.T) {
 		{name: "a blob read with a Range is forwarded with no credential", method: "GET", target: "/v2/team/app/blobs/" + digestA,
 			header: map[string]string{"Range": "bytes=0-99"}, status: 200, forward: "GET /v2/team/app/blobs/" + digestA, reviews: 0, sars: 0,
 			check: func(t *testing.T, f *gateFixture, r rawResponse) {
-				if got := f.zot.requests()[0].rng; got != "bytes=0-99" {
+				if got := f.registry.requests()[0].rng; got != "bytes=0-99" {
 					t.Errorf("Range reached the registry as %q", got)
 				}
 				if r.body != "content" {
@@ -565,11 +565,11 @@ func TestPushAuthorizesServiceAccountTokenUnderNamespacePrefix(t *testing.T) {
 		{name: "a read carrying Authorization has it stripped", method: "GET", target: "/v2/team/app/manifests/v1?x=1", auth: basic(tokTeam),
 			header: map[string]string{"Cookie": "session=stolen"}, status: 200, forward: "GET /v2/team/app/manifests/v1?x=1", reviews: 0, sars: 0,
 			check: func(t *testing.T, f *gateFixture, _ rawResponse) {
-				if c := f.zot.requests()[0].cookie; c != "" {
+				if c := f.registry.requests()[0].cookie; c != "" {
 					t.Errorf("a client cookie reached the registry: %q", c)
 				}
 			}},
-		{name: "a zot extension read passes through", method: "GET", target: "/v2/_zot/ext/search?query=x", status: 200, forward: "GET /v2/_zot/ext/search?query=x", reviews: 0, sars: 0},
+		{name: "an extension read passes through", method: "GET", target: "/v2/_oci/ext/search?query=x", status: 200, forward: "GET /v2/_oci/ext/search?query=x", reviews: 0, sars: 0},
 		{name: "a HEAD of a manifest passes through", method: "HEAD", target: "/v2/other/app/manifests/v1", status: 200, forward: "HEAD /v2/other/app/manifests/v1", reviews: 0, sars: 0},
 	}
 	for _, row := range rows {
@@ -582,7 +582,7 @@ func TestPushAuthorizesServiceAccountTokenUnderNamespacePrefix(t *testing.T) {
 			if resp.status != row.status {
 				t.Fatalf("status = %d, want %d (body %s)", resp.status, row.status, resp.body)
 			}
-			seen := f.zot.requests()
+			seen := f.registry.requests()
 			if row.forward == "" {
 				if len(seen) != 0 {
 					t.Fatalf("the registry saw %+v; nothing must be forwarded", seen)
@@ -784,14 +784,14 @@ func TestPushAuthorizesServiceAccountTokenUnderNamespacePrefix(t *testing.T) {
 		if !strings.HasPrefix(line, "HTTP/1.1 202") {
 			t.Errorf("final response line = %q, want 202", line)
 		}
-		if seen := f.zot.requests(); len(seen) != 1 || seen[0].body != "0123456789" {
+		if seen := f.registry.requests(); len(seen) != 1 || seen[0].body != "0123456789" {
 			t.Errorf("the registry saw %+v, want the 10-byte body", seen)
 		}
 	})
 
 	t.Run("a gate with no apiserver identity serves reads and refuses writes", func(t *testing.T) {
-		z := newFakeZot(t)
-		g := newGate(gateConfig{Upstream: fakeZotHost, Transport: z, Credential: gateCred, Logger: quietLogger()})
+		z := newFakeRegistry(t)
+		g := newGate(gateConfig{Upstream: fakeRegistryHost, Transport: z, Credential: gateCred, Logger: quietLogger()})
 		addr := serveMem(t, g)
 		if r := rawDo(t, addr, "GET", "/v2/team/app/manifests/v1", nil, ""); r.status != 200 {
 			t.Errorf("read = %d, want 200", r.status)
@@ -894,7 +894,7 @@ func TestPushPrefixHeldByOneNamespace(t *testing.T) {
 				if f.access.count() != 0 {
 					t.Errorf("access reviews = %d for a refused label, want 0", f.access.count())
 				}
-				if n := len(f.zot.requests()); n != 0 {
+				if n := len(f.registry.requests()); n != 0 {
 					t.Errorf("%d requests reached the registry", n)
 				}
 			}
@@ -937,23 +937,23 @@ func TestPushAuthorizesBuilderClusterWide(t *testing.T) {
 		if ra.Namespace != "" || ra.Verb != PushVerb || ra.Group != PushAPIGroup || ra.Resource != PushResource || ra.Name != "app" {
 			t.Errorf("access review attributes = %+v, want a cluster-wide push on app", ra)
 		}
-		reqs := f.zot.requests()
+		reqs := f.registry.requests()
 		if len(reqs) != 1 || reqs[0].auth != wantGateAuth {
-			t.Errorf("zot saw %+v, want one write with the gate credential", reqs)
+			t.Errorf("the registry saw %+v, want one write with the gate credential", reqs)
 		}
 	})
 	t.Run("a builder the cluster-wide review refuses is denied", func(t *testing.T) {
 		f := setup(t, false)
 		r := f.do(t, "PUT", "/v2/app/manifests/v1", basic(tokBuilder), "{}", nil)
-		if r.status != 403 || len(f.zot.requests()) != 0 {
-			t.Fatalf("status = %d, zot saw %d requests; want 403 and nothing forwarded", r.status, len(f.zot.requests()))
+		if r.status != 403 || len(f.registry.requests()) != 0 {
+			t.Fatalf("status = %d, the registry saw %d requests; want 403 and nothing forwarded", r.status, len(f.registry.requests()))
 		}
 	})
 	t.Run("a builder ServiceAccount in another namespace is held to its namespace", func(t *testing.T) {
 		f := setup(t, true)
 		r := f.do(t, "PUT", "/v2/app/manifests/v1", basic(tokImpostor), "{}", nil)
-		if r.status != 403 || len(f.zot.requests()) != 0 || f.access.count() != 0 {
-			t.Fatalf("status = %d, forwarded %d, reviews %d; want 403, none, none", r.status, len(f.zot.requests()), f.access.count())
+		if r.status != 403 || len(f.registry.requests()) != 0 || f.access.count() != 0 {
+			t.Fatalf("status = %d, forwarded %d, reviews %d; want 403, none, none", r.status, len(f.registry.requests()), f.access.count())
 		}
 	})
 }
@@ -1011,8 +1011,8 @@ func TestGateRefusesLongLivedBuilderToken(t *testing.T) {
 			f.access.allow = func(*authzv1.SubjectAccessReview) bool { return true }
 			r := f.do(t, "PUT", "/v2/app/manifests/v1", basic(tok), "{}", nil)
 			if tc.refused == "" {
-				if r.status != 201 || len(f.zot.requests()) != 1 {
-					t.Fatalf("status = %d (%s), forwarded %d; want 201 and one forward", r.status, r.body, len(f.zot.requests()))
+				if r.status != 201 || len(f.registry.requests()) != 1 {
+					t.Fatalf("status = %d (%s), forwarded %d; want 201 and one forward", r.status, r.body, len(f.registry.requests()))
 				}
 				return
 			}
@@ -1025,8 +1025,8 @@ func TestGateRefusesLongLivedBuilderToken(t *testing.T) {
 			if !strings.Contains(r.body, "k3sm registry token") {
 				t.Errorf("body = %s, want the remedy", r.body)
 			}
-			if len(f.zot.requests()) != 0 || f.access.count() != 0 {
-				t.Errorf("forwarded %d, access reviews %d; want none: a refused token reaches neither", len(f.zot.requests()), f.access.count())
+			if len(f.registry.requests()) != 0 || f.access.count() != 0 {
+				t.Errorf("forwarded %d, access reviews %d; want none: a refused token reaches neither", len(f.registry.requests()), f.access.count())
 			}
 		})
 	}
@@ -1089,8 +1089,8 @@ func TestGateRefusesLongLivedBuilderToken(t *testing.T) {
 		tok := mkRawToken("forged-builder", lifetime(3600))
 		f.tokens.statuses[tok] = authnv1.TokenReviewStatus{Authenticated: false, Error: "invalid signature"}
 		r := f.do(t, "PUT", "/v2/app/manifests/v1", basic(tok), "{}", nil)
-		if r.status != 401 || !strings.Contains(r.body, "the token is not valid") || len(f.zot.requests()) != 0 {
-			t.Fatalf("status = %d (%s), forwarded %d; want 401 not valid, none", r.status, r.body, len(f.zot.requests()))
+		if r.status != 401 || !strings.Contains(r.body, "the token is not valid") || len(f.registry.requests()) != 0 {
+			t.Fatalf("status = %d (%s), forwarded %d; want 401 not valid, none", r.status, r.body, len(f.registry.requests()))
 		}
 	})
 
@@ -1112,8 +1112,8 @@ func TestGateRefusesLongLivedBuilderToken(t *testing.T) {
 			f.namespaces.labels[tc.ns] = map[string]string{PushLabel: tc.ns}
 			f.access.allow = func(*authzv1.SubjectAccessReview) bool { return true }
 			r := f.do(t, "PUT", "/v2/"+tc.ns+"/app/manifests/v1", basic(tok), "{}", nil)
-			if r.status != 201 || len(f.zot.requests()) != 1 {
-				t.Fatalf("status = %d (%s), forwarded %d; want 201 and one forward", r.status, r.body, len(f.zot.requests()))
+			if r.status != 201 || len(f.registry.requests()) != 1 {
+				t.Fatalf("status = %d (%s), forwarded %d; want 201 and one forward", r.status, r.body, len(f.registry.requests()))
 			}
 		})
 	}
@@ -1176,7 +1176,7 @@ func TestPushGateAcceptsMountWithOrigin(t *testing.T) {
 			if resp.status != row.status {
 				t.Fatalf("status = %d, want %d (body %s)", resp.status, row.status, resp.body)
 			}
-			seen := f.zot.requests()
+			seen := f.registry.requests()
 			switch {
 			case row.forward == "" && len(seen) != 0:
 				t.Errorf("the registry saw %+v; nothing must be forwarded", seen)

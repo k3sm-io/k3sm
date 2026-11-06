@@ -100,10 +100,10 @@ var errPruneIncomplete = errors.New("some untagged manifests were not deleted")
 // this node's cache, dry run unless --force.
 //
 // The registry half runs only on the server whose registry it is: it reads
-// zot's storage under the work dir to find untagged manifests, and deletes
-// each through zot's API on loopback with this node's push credential, the
-// one identity zot lets delete. The in-pod push gate still refuses DELETE;
-// nothing about who may delete changes. zot's GC reclaims the blobs a
+// the store under the work dir to find untagged manifests, and deletes
+// each through the registry's API on loopback with this node's push credential, the
+// one identity the registry lets delete. The in-pod push gate still refuses DELETE;
+// nothing about who may delete changes. The registry's GC reclaims the blobs a
 // deleted manifest held on its next sweep.
 //
 // The cache half is runtimed's PruneImages, which keeps everything a pod
@@ -192,7 +192,7 @@ func pruneCredential(workDir string) (registrysvc.Credential, string, error) {
 // DELETE then names the repository state the re-check read as If-Match, and
 // the k3sm registry refuses it under its own index lock when a push changed
 // the repository in between; that refusal is a keep too, not a failure. A
-// registry that ignores If-Match (zot) deletes unconditionally, so for it the
+// registry that ignores If-Match deletes unconditionally, so for it the
 // window of the request round-trip stays open.
 func pruneRegistry(ctx context.Context, o imageOptions, cred registrysvc.Credential, res *registryPruneResult, del manifestDeleter, now time.Time) (int, error) {
 	repos, err := registrysvc.Repositories(o.workDir)

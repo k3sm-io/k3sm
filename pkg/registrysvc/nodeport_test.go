@@ -109,7 +109,7 @@ func TestRegistryNodePortIsOptInAndGated(t *testing.T) {
 	})
 
 	t.Run("an anonymous PUT through it is refused", func(t *testing.T) {
-		z, zaddr := socketZot(t)
+		z, zaddr := socketRegistry(t)
 		registryPort := portOf(t, zaddr)
 		svcs, slices := &fakeServices{}, &fakeSlices{}
 		if _, err := PublishFlatService(t.Context(), svcs, slices, "mac-a", registryPort, 30650, mesh); err != nil {

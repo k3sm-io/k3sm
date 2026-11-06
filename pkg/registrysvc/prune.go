@@ -98,8 +98,8 @@ type KeptManifest struct {
 // PrunePlan is what a prune would delete from the registry and which untagged
 // manifests it keeps. Tagged manifests are never in either list.
 type PrunePlan struct {
-	// Delete lists, per repository, image indexes before plain manifests: zot
-	// refuses to delete a manifest an index in the same repository still names.
+	// Delete lists, per repository, image indexes before plain manifests: the
+	// registry refuses to delete a manifest an index in the same repository still names.
 	Delete []StoredManifest
 	Kept   []KeptManifest
 	// Unreadable lists the repositories whose index.json could not be read, so

@@ -423,7 +423,7 @@ func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	fs.IntVar(&opts.ingressHTTPPort, "ingress-http-port", 80, "ingress HTTP listener port, bound on ALL interfaces (80 = production; an explicit high port is the integration-tier mode; 0 disables the HTTP listener)")
 	fs.IntVar(&opts.ingressHTTPSPort, "ingress-https-port", 443, "ingress HTTPS listener port, bound on ALL interfaces (443 = production; an explicit high port is the integration-tier mode; 0 disables the HTTPS listener)")
 	// The server's OCI image registry (pkg/registrysvc), ON by default: it is
-	// the cluster's one image store. zot binds LOOPBACK ONLY and that is not
+	// the cluster's one image store. It binds LOOPBACK ONLY and that is not
 	// configurable; the cluster reaches it through the HTTPS relay as
 	// registry-k3sm:6450. `k3sm dev` runs it on a per-instance allocated port.
 	fs.IntVar(&opts.registryPort, "registry-port", executor.DefaultRegistryPort, "the cluster's OCI image registry port on 127.0.0.1, also served over HTTPS to the cluster as registry-k3sm:"+strconv.Itoa(registrysvc.FlatServicePort)+" (0 disables)")

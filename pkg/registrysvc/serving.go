@@ -32,7 +32,7 @@ import (
 // nothing else. The certificate is issued by the cluster CA (the anchor every
 // Pod already trusts through its service-account ca.crt), minted in this
 // process's memory and never written to disk, and re-minted before it expires,
-// the way the push gate's own apiserver identity is. zot itself stays plain
+// the way the push gate's own apiserver identity is. The registry itself stays plain
 // HTTP on loopback: TLS terminates here, in front of it.
 
 // ErrNoServingIdentity reports a relay configured without a serving identity.

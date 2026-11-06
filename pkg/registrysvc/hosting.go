@@ -94,7 +94,7 @@ type ConfigMapClient interface {
 //
 // The loopback address is "localhost:<port>" rather than "127.0.0.1:<port>",
 // because the docker/OCI toolchain special-cases the literal name `localhost`
-// as a plain-HTTP registry, and zot on loopback serves plain HTTP.
+// as a plain-HTTP registry, and the registry on loopback serves plain HTTP.
 func HostingDocument(port int, clusterNetworkHost string) ([]byte, error) {
 	local := "localhost:" + strconv.Itoa(port)
 	host := local
