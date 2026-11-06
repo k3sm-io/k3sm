@@ -20,10 +20,49 @@ import (
 	"context"
 	"errors"
 	"io"
+	"io/fs"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
+
+	"k3sm.io/k3sm/pkg/dataroot"
 )
+
+// fstabFS is the real filesystem with its fstab replaced.
+type fstabFS struct {
+	dataroot.OSFS
+	fstab string
+}
+
+func (f fstabFS) ReadFile(path string) ([]byte, error) {
+	if path == dataroot.FstabPath {
+		return []byte(f.fstab), nil
+	}
+	return nil, fs.ErrNotExist
+}
+
+// TestRegistryDataVolume: the store must be on the data root exactly when the data
+// root above the work dir is declared as a mount point.
+func TestRegistryDataVolume(t *testing.T) {
+	root := t.TempDir()
+	work := filepath.Join(root, "server")
+	for _, tc := range []struct{ name, fstab, want string }{
+		{name: "an ordinary directory", fstab: ""},
+		{name: "declared by fstab", fstab: "UUID=A1 " + root + " apfs rw\n", want: root},
+		{name: "another path declared", fstab: "UUID=A1 /Volumes/other apfs rw\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := registryDataVolume(fstabFS{fstab: tc.fstab}, work)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
 
 // TestRegistryServeVerb pins the hidden verb's command line and that it stays
 // hidden: the usage and the unknown-verb hint never name it.

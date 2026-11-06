@@ -93,16 +93,17 @@ func ServeConfigPath(workDir string) string {
 	return filepath.Join(ServeStateDir(workDir), "serve.json")
 }
 
-// renderServeConfig renders the serve config for the push and gate
-// credentials. It is pure.
-func renderServeConfig(push, gate Credential) ([]byte, error) {
+// renderServeConfig renders the serve config for the push and gate credentials
+// over settings, which carries the server's own fields. It is pure.
+func renderServeConfig(push, gate Credential, settings ServeConfig) ([]byte, error) {
 	if push.Username != pushUser || gate.Username != gateUser || push.Password == "" || gate.Password == "" {
 		return nil, errors.New("render the registry serve config: the push and gate credentials are required")
 	}
-	return marshalServeConfig(ServeConfig{Principals: []auth.Principal{
+	settings.Principals = []auth.Principal{
 		{User: auth.UserPush, SecretSHA256: auth.HashSecret(push.Password)},
 		{User: auth.UserGate, SecretSHA256: auth.HashSecret(gate.Password)},
-	}})
+	}
+	return marshalServeConfig(settings)
 }
 
 // marshalServeConfig encodes cfg as the file's body.

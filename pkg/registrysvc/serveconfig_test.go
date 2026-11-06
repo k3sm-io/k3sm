@@ -135,10 +135,10 @@ func TestServeConfig(t *testing.T) {
 		})
 	}
 	t.Run("refuses credentials of the wrong users", func(t *testing.T) {
-		if _, err := renderServeConfig(gate, push); err == nil {
+		if _, err := renderServeConfig(gate, push, ServeConfig{}); err == nil {
 			t.Fatal("renderServeConfig accepted swapped credentials")
 		}
-		if _, err := renderServeConfig(push, Credential{Username: gateUser}); err == nil {
+		if _, err := renderServeConfig(push, Credential{Username: gateUser}, ServeConfig{}); err == nil {
 			t.Fatal("renderServeConfig accepted an empty secret")
 		}
 	})

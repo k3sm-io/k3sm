@@ -25,6 +25,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
@@ -33,6 +34,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/nodecred"
 	"k3sm.io/k3sm/pkg/registrysvc"
 )
@@ -85,16 +87,32 @@ type registryService interface {
 }
 
 // registryConfig renders the ingest registry's configuration from the parsed
-// server flags. It is PURE, so the flag-to-config mapping — most of all "0 means
-// disabled", which is checked by the caller, and the payload dir a packaged
-// install seeds the binary from — is assertable without a bring-up.
-func registryConfig(opts serverOptions, payloadBinDir string, logger *slog.Logger) registrysvc.Config {
+// server flags and the data volume registryDataVolume found. It is PURE, so the
+// flag-to-config mapping, most of all "0 means disabled", which is checked by the
+// caller, is assertable without a bring-up.
+func registryConfig(opts serverOptions, dataVolume string, logger *slog.Logger) registrysvc.Config {
 	return registrysvc.Config{
-		WorkDir:       opts.workDir,
-		PayloadBinDir: payloadBinDir,
-		Port:          opts.registryPort,
-		Logger:        logger,
+		WorkDir:    opts.workDir,
+		Port:       opts.registryPort,
+		DataVolume: dataVolume,
+		Logger:     logger,
 	}
+}
+
+// registryDataVolume returns the mount point the registry's store must be on: the
+// data root above the work dir when it is declared as a mount point, by fstab or
+// by k3sm's record, the same declarations the server's shadow guard reads. It
+// returns "" when the data root is an ordinary directory.
+func registryDataVolume(fsys dataroot.FS, workDir string) (string, error) {
+	root := filepath.Dir(workDir)
+	st, err := dataroot.Read(fsys, root)
+	if err != nil {
+		return "", err
+	}
+	if !st.DeclaredMount {
+		return "", nil
+	}
+	return root, nil
 }
 
 // recordRegistryDisabled writes the registry's state record for a registry the

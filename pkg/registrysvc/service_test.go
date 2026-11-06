@@ -96,7 +96,7 @@ func TestNewRejectsUnusableConfig(t *testing.T) {
 
 // TestNewDerivesPaths pins the defaults New fills in, because every one of them
 // is a path another part of k3sm joins independently — the bin dir the control
-// plane's own binaries live in, and the pinned zot version.
+// plane's own binaries live in.
 func TestNewDerivesPaths(t *testing.T) {
 	work := t.TempDir()
 	s, err := New(Config{WorkDir: work, Port: 6450})
@@ -105,9 +105,6 @@ func TestNewDerivesPaths(t *testing.T) {
 	}
 	if want := filepath.Join(work, "bin"); s.cfg.BinDir != want {
 		t.Errorf("BinDir = %q, want %q", s.cfg.BinDir, want)
-	}
-	if s.cfg.ZotVersion != DefaultZotVersion {
-		t.Errorf("ZotVersion = %q, want %q", s.cfg.ZotVersion, DefaultZotVersion)
 	}
 	if s.cfg.Logger == nil {
 		t.Error("Logger is nil; a Service must never log through a nil handler")

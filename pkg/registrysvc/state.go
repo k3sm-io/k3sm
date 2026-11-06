@@ -45,7 +45,7 @@ import (
 
 // The registry states the record carries.
 const (
-	// StateServing: the child is up and answered its readiness dial.
+	// StateServing: the child is up and answered its readiness probe.
 	StateServing = "serving"
 	// StateDisabled: every bring-up attempt failed; Reason says why.
 	StateDisabled = "disabled"
@@ -95,8 +95,7 @@ type State struct {
 	// GC is the registry server's last garbage-collection sweep; nil before
 	// its first. UploadSessions is how many upload sessions it holds, as of its
 	// last report. The server process writes both, every serveStatusEvery and
-	// after each sweep, and a daemon's transition drops them until the next
-	// report.
+	// after each sweep; a daemon's own transition carries them over.
 	GC             *GCStatus `json:"gc,omitempty"`
 	UploadSessions int       `json:"uploadSessions,omitempty"`
 }
@@ -240,7 +239,7 @@ func ReadLocalState(workDir string) (State, error) {
 }
 
 // stateName is the record's basename. It sits in the work dir beside
-// registry.log rather than in StateDir, which is zot's storage root.
+// registry.log rather than in StateDir, which is the registry's storage root.
 const stateName = "registry-state.json"
 
 // statusSubdir is the server's world-readable status directory, a sibling of
@@ -306,6 +305,22 @@ func ParseState(b []byte) (State, error) {
 	return st, nil
 }
 
+// keepServerFields writes st over the record, carrying over the fields the
+// registry server process owns.
+func keepServerFields(workDir string, st State) error {
+	unlock, err := lockState(workDir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if b, err := os.ReadFile(StatePath(workDir)); err == nil {
+		if prev, err := ParseState(b); err == nil {
+			st.GC, st.UploadSessions = prev.GC, prev.UploadSessions
+		}
+	}
+	return writeStateFiles(workDir, st)
+}
+
 // record writes this service's state, logging a failure rather than returning
 // it: the record reports the registry and is never a reason to change what the
 // registry does.
@@ -318,7 +333,7 @@ func (s *Service) record(state, reason string, reclaimedPID int) {
 		ReclaimedPID: reclaimedPID,
 		Since:        time.Now().UTC(),
 	}
-	if err := WriteState(s.cfg.WorkDir, st); err != nil {
+	if err := keepServerFields(s.cfg.WorkDir, st); err != nil {
 		s.cfg.Logger.Warn("could not record the ingest registry state for `k3sm status`",
 			"path", StatePath(s.cfg.WorkDir), "state", state, "err", err)
 	}
