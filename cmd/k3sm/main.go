@@ -30,7 +30,7 @@ const usage = `k3sm %s — Kubernetes for macOS, natively
 
 Usage: k3sm <command> [flags]
 
-Commands ("server", "agent", "node", "netd", "install", "uninstall", "stop", "start", "restart", "network", "datavol", "token", "certificate", "snapshot", "secrets-encrypt", "interconnect", "build", "builder", "image", "registry", "kubectl", "kubeconfig", "status", "alerts", "update", "doctor", "dev" are implemented):
+Commands ("server", "agent", "node", "netd", "install", "uninstall", "stop", "start", "restart", "network", "datavol", "token", "certificate", "snapshot", "secrets-encrypt", "interconnect", "build", "builder", "image", "model", "registry", "kubectl", "kubeconfig", "status", "alerts", "update", "doctor", "dev" are implemented):
   server      run the control plane + a node on this Mac (--mesh-ip enables multi-node join)
   agent       join this Mac to an existing cluster as a worker node
   node        run a Virtual Kubelet node here (HostProcess or runtimed runtime)
@@ -52,6 +52,7 @@ Commands ("server", "agent", "node", "netd", "install", "uninstall", "stop", "st
   build       build an image from a Dockerfile (COPY-only natively; RUN via the build engine)
   builder     manage the in-cluster buildkitd engine (builder up|down|delete|status|buildx)
   image       ingest, publish and reclaim this node's images (image load|import|push|pull|tag|untag|inspect|save|prune|ls|df|migrate)
+  model       store models in the cluster registry as ModelPack OCI artifacts (model push|rm)
   registry    mint the cluster registry's push token for any OCI tool, through your kubeconfig (registry token|login)
   kubectl     run the bundled kubectl against this cluster (KUBECONFIG preset)
   kubeconfig  print the admin kubeconfig, or --write/merge it into ~/.kube/config
@@ -213,6 +214,11 @@ func main() {
 	case "image":
 		if err := runImage(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "k3sm image:", err)
+			os.Exit(1)
+		}
+	case "model":
+		if err := runModel(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "k3sm model:", err)
 			os.Exit(1)
 		}
 	case "registry":
