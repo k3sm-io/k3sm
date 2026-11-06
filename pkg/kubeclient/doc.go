@@ -50,10 +50,10 @@ limitations under the License.
 // credentials, so the file alone says everything the client will use.
 // FromCheckedPathWithCA adds a CA the caller holds, which with APIServerName then
 // decides alone which server the client accepts. FromCheckedWorkerPath requires that
-// name with the file's own CA.
+// name with the file's own CA. CheckedConfig is the checked load with no clientset.
 //
-// It also always builds a clientset, so two sites keep clientcmd directly:
-// cmd/k3sm's nodeRESTConfig, which pins a request timeout on the config before
+// FromPath always builds a clientset, so two sites keep clientcmd directly when not
+// root: cmd/k3sm's nodeRESTConfig, which pins a request timeout on the config before
 // anything is built from it, and the mesh watcher, which needs only a
 // *rest.Config and would otherwise construct and discard a client it never
 // dials with.

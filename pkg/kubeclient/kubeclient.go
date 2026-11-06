@@ -43,8 +43,8 @@ var ErrCAUnusable = errors.New("holds no PEM certificate")
 // apiServerName is the first address of the cluster's Service range.
 var apiServerName = netip.MustParsePrefix(defaults.ServiceCIDR).Masked().Addr().Next().String()
 
-// APIServerName is the name a worker's client verifies the apiserver's serving
-// certificate against: the kubernetes Service IP, the first address of
+// APIServerName is the name a client holding the cluster CA verifies the apiserver's
+// serving certificate against: the kubernetes Service IP, the first address of
 // defaults.ServiceCIDR. Every apiserver certificate k3sm has issued carries it, and
 // the apiserver's range is fixed (`--service-cluster-ip-range` in pkg/executor, which
 // no k3sm command changes), so it is a constant of the cluster. An address is used
@@ -137,7 +137,7 @@ func FromCheckedWorkerPath(path string) (*rest.Config, kubernetes.Interface, err
 // other trust setting a kubeconfig can carry is replaced, a CA file or inline CA,
 // insecure-skip-tls-verify and tls-server-name. The address is left alone, since
 // it can legitimately differ from the one the CA was first seen at. Its callers are
-// all on a worker, whose server is always a k3sm apiserver.
+// all root on a k3sm node, whose server is always a k3sm apiserver.
 func PinCA(cfg *rest.Config, caPEM []byte) error {
 	if !x509.NewCertPool().AppendCertsFromPEM(caPEM) {
 		return fmt.Errorf("cluster CA %w", ErrCAUnusable)
@@ -147,6 +147,12 @@ func PinCA(cfg *rest.Config, caPEM []byte) error {
 	cfg.Insecure = false
 	cfg.ServerName = apiServerName
 	return nil
+}
+
+// CheckedConfig is FromCheckedPath for a caller that sets its own client up from
+// the config: the same refusals, and no clientset built.
+func CheckedConfig(path string) (*rest.Config, error) {
+	return checkedConfig(path)
 }
 
 // checkedConfig reads path once, checks it, and resolves its current context.

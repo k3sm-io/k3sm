@@ -394,3 +394,28 @@ func TestFromCheckedPathWithCA(t *testing.T) {
 		}
 	})
 }
+
+// TestCheckedConfigAcceptsOnlyInlineCredentials pins the config-only form of the
+// checked load: the same refusal, and the file's address and credential otherwise.
+func TestCheckedConfigAcceptsOnlyInlineCredentials(t *testing.T) {
+	t.Run("a user with an exec entry is refused", func(t *testing.T) {
+		path := writeCheckedFixture(t, "", "    exec:\n      apiVersion: client.authentication.k8s.io/v1\n      command: /elsewhere/plugin\n      interactiveMode: Never", "")
+		if cfg, err := CheckedConfig(path); !errors.Is(err, ErrCredentialsNotInline) {
+			t.Fatalf("CheckedConfig = %v, %v, want ErrCredentialsNotInline", cfg, err)
+		}
+	})
+	t.Run("an inline token loads", func(t *testing.T) {
+		cfg, err := CheckedConfig(writeCheckedFixture(t, "", "    token: inline-token", ""))
+		if err != nil {
+			t.Fatalf("CheckedConfig: %v", err)
+		}
+		if cfg.BearerToken != "inline-token" {
+			t.Errorf("BearerToken = %q", cfg.BearerToken)
+		}
+	})
+	t.Run("no path is refused rather than resolved", func(t *testing.T) {
+		if cfg, err := CheckedConfig(""); err == nil {
+			t.Fatalf("CheckedConfig(\"\") resolved to %q", cfg.Host)
+		}
+	})
+}
