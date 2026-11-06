@@ -61,6 +61,9 @@ const (
 	// convergeMinPace is the shortest wait the hash rate is held with; a shorter
 	// debt is carried to the next chunk.
 	convergeMinPace = 10 * time.Millisecond
+	// convergeMaxSyncFailures is how many digests in a row may fail a sync before
+	// the pass stops: one bad inode costs its digest, a failing volume the pass.
+	convergeMaxSyncFailures = 3
 )
 
 // SkipReason says why a pass left a copy or passed over a keeper.
@@ -107,7 +110,8 @@ const (
 	SkipNoSpace SkipReason = "no-space"
 	// SkipLinkFailed is a link or rename that failed any other way.
 	SkipLinkFailed SkipReason = "link-failed"
-	// SkipSync is a keeper or directory F_FULLFSYNC that failed. It ends the pass.
+	// SkipSync is a keeper or directory F_FULLFSYNC that failed. It costs the rest
+	// of that digest for this pass; see Converge for when it ends the pass.
 	SkipSync SkipReason = "sync"
 )
 
@@ -331,10 +335,13 @@ func (g *convergeGroup) pending() int {
 //
 // The keeper is at least as new as its target and target touches take the lock
 // the merge holds, so a merge never makes a blob look older to GC, and the pass
-// writes no mtime. A keeper's fsync failing, which is how a volume without
-// F_FULLFSYNC answers, merges nothing and ends the pass with the error; so does
-// a directory sync failing after a rename, which cannot be undone and where
-// either name is good. The report is valid alongside any error.
+// writes no mtime. A keeper's sync or a directory's after a rename, which cannot
+// be undone and where either name is good, may fail. ENOTSUP or ENOTTY is how a
+// volume without F_FULLFSYNC answers, so nothing on it can merge and the pass ends
+// with the error. Any other failure is one inode's: the pass counts it, leaves
+// the rest of that digest and goes on, and ends with the error only after
+// convergeMaxSyncFailures digests in a row. The report is valid alongside any
+// error.
 func (s *Store) Converge(ctx context.Context, o ConvergeOptions) (ConvergeReport, error) {
 	p := newConvergePass(s, o)
 	table, err := p.scan(ctx)
@@ -351,7 +358,7 @@ func (s *Store) Converge(ctx context.Context, o ConvergeOptions) (ConvergeReport
 		if runErr = ctx.Err(); runErr != nil || p.mergesLeft() == 0 {
 			break
 		}
-		if runErr = p.converge(ctx, g); runErr != nil {
+		if runErr = p.afterGroup(p.converge(ctx, g)); runErr != nil {
 			break
 		}
 	}
@@ -374,6 +381,8 @@ type convergePass struct {
 	first bool
 	// hashStart is when the first byte was hashed, for the rate.
 	hashStart time.Time
+	// syncFailures is how many digests in a row have failed a sync.
+	syncFailures int
 	// tagged caches whether a repository has a tagged row. It only saves hashing
 	// a target the lock's re-read would refuse.
 	tagged map[string]bool
@@ -439,6 +448,18 @@ func paceWait(ctx context.Context, d time.Duration) error {
 func (p *convergePass) mergesLeft() int { return p.lim.merges - p.rep.Merged }
 
 func (p *convergePass) skip(r SkipReason, n int) { p.rep.Skipped[r] += n }
+
+// afterGroup returns the error that ends the pass, given what one group returned.
+func (p *convergePass) afterGroup(err error) error {
+	if !errors.Is(err, errSyncFailed) || errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.ENOTTY) {
+		return err
+	}
+	p.syncFailures++
+	if p.syncFailures < convergeMaxSyncFailures {
+		return nil
+	}
+	return fmt.Errorf("%d digests in a row: %w", p.syncFailures, err)
+}
 
 // scan is step 1. A repository or directory it cannot read is passed over: its
 // names go uncounted, which at worst refuses a keeper.
@@ -559,7 +580,11 @@ func (p *convergePass) converge(ctx context.Context, g *convergeGroup) error {
 	}
 	defer k.f.Close()
 	g.keeper = k.inode
-	return p.mergeInto(ctx, g, k)
+	if err := p.mergeInto(ctx, g, k); err != nil {
+		return err
+	}
+	p.syncFailures = 0 // the keeper synced, and so did every directory it merged into
+	return nil
 }
 
 // verifiedKeeper is a keeper that passed step 3, with the descriptor that
@@ -578,9 +603,14 @@ type verifiedKeeper struct {
 // the next candidate.
 var errNoBudget = errors.New("the pass's hash budget is spent")
 
+// errSyncFailed marks an error as a failed keeper or directory sync, which costs
+// its digest and need not end the pass: see afterGroup.
+var errSyncFailed = errors.New("sync failed")
+
 // chooseKeeper returns the newest inode that passes steps 2 and 3, or nil. An
-// error ends the pass. A candidate with nothing it could merge is not hashed;
-// neither is one that fails a cheaper test first.
+// error ends this digest's work, and the pass as afterGroup says. A candidate with
+// nothing it could merge is not hashed; neither is one that fails a cheaper test
+// first.
 func (p *convergePass) chooseKeeper(ctx context.Context, g *convergeGroup) (*verifiedKeeper, error) {
 	tried := false
 	for _, in := range g.order {
@@ -666,7 +696,8 @@ func (p *convergePass) verifyKeeper(ctx context.Context, g *convergeGroup, in *c
 	}
 	if err := p.o.seams.sync(f); err != nil {
 		p.skip(SkipSync, 1)
-		return nil, fmt.Errorf("sync keeper %s in %s: %w", g.digest, name, err)
+		p.log.Error("dedupe could not sync a keeper", "repository", name.String(), "digest", g.digest.String(), "cause", err)
+		return nil, fmt.Errorf("%w: keeper %s in %s: %w", errSyncFailed, g.digest, name, err)
 	}
 	keep = true
 	return &verifiedKeeper{inode: in, f: f, name: name, path: path, size: st.size}, nil
@@ -855,7 +886,8 @@ func (p *convergePass) openInode(n ref.Name, d digest.Digest, in *convergeInode)
 }
 
 // mergeOne is step 5 for one name. Only ctx ending or a directory sync failing
-// return an error; any other miss counts a reason and keeps the copy.
+// return an error, and the latter ends only this digest's work unless afterGroup
+// says otherwise; any other miss counts a reason and keeps the copy.
 func (p *convergePass) mergeOne(ctx context.Context, g *convergeGroup, k *verifiedKeeper, in *convergeInode, n ref.Name, corrupt bool) error {
 	if hook := p.o.seams.beforeMerge; hook != nil {
 		hook(n)
@@ -871,7 +903,7 @@ func (p *convergePass) mergeOne(ctx context.Context, g *convergeGroup, k *verifi
 			if reason == SkipSync {
 				// The rename cannot be undone, and either name is good.
 				p.log.Error("dedupe could not sync a directory after a merge", "repository", n.String(), "digest", g.digest.String(), "cause", err)
-				stop = fmt.Errorf("sync blobs of %s after merging %s: %w", n, g.digest, err)
+				stop = fmt.Errorf("%w: blobs of %s after merging %s: %w", errSyncFailed, n, g.digest, err)
 			} else {
 				if err != nil {
 					p.log.Warn("dedupe kept a copy", "reason", string(reason), "repository", n.String(), "digest", g.digest.String(), "cause", err)

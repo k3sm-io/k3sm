@@ -25,6 +25,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -1148,7 +1149,7 @@ func TestConvergeHoldsTheHashRate(t *testing.T) {
 }
 
 // TestConvergeSyncFailures: without F_FULLFSYNC nothing merges, and a directory
-// that will not sync after a rename ends the pass with both names good.
+// that will not sync after a rename costs its digest with both names good.
 func TestConvergeSyncFailures(t *testing.T) {
 	t.Run("keeper", func(t *testing.T) {
 		f := newConvergeFixture(t)
@@ -1185,18 +1186,18 @@ func TestConvergeSyncFailures(t *testing.T) {
 				return fullSync(file)
 			}
 		})
-		if !errors.Is(err, unix.EIO) {
-			t.Fatalf("err = %v", err)
+		if err != nil {
+			t.Fatalf("err = %v: one failed directory is not three digests in a row", err)
 		}
 		if dirs != 1 || rep.Merged != 1 {
-			t.Errorf("dirs = %d, report = %+v, want the pass stopped at its first merge", dirs, rep)
+			t.Errorf("dirs = %d, report = %+v, want the digest left at its first merge", dirs, rep)
 		}
 		wantSkip(t, rep, SkipSync, 1)
 		if !f.same("a", "b", d) || !bytes.Equal(f.readBlob("b", d), body) {
 			t.Error("b does not read the keeper")
 		}
 		if !os.SameFile(f.stat("c", d), c) {
-			t.Error("the pass went on after the failed sync")
+			t.Error("the digest went on after the failed sync")
 		}
 		if !strings.Contains(buf.String(), "sync") {
 			t.Errorf("no record of the failed sync in %q", buf)
@@ -1217,6 +1218,163 @@ func TestConvergeSyncFailures(t *testing.T) {
 		})
 		if dirs != 2 || !f.same("a", "c", d) {
 			t.Errorf("synced %d directories, want one for each of two merges", dirs)
+		}
+	})
+}
+
+// syncFailsFor is a sync seam that fails with err for a file match accepts.
+func (f *convergeFixture) syncFailsFor(err error, match func(os.FileInfo) bool) func(*os.File) error {
+	return func(file *os.File) error {
+		fi, serr := file.Stat()
+		if serr != nil {
+			return serr
+		}
+		if match(fi) {
+			return err
+		}
+		return fullSync(file)
+	}
+}
+
+// inodeOf matches the inode repo's blob d names now.
+func (f *convergeFixture) inodeOf(repo string, ds ...digest.Digest) func(os.FileInfo) bool {
+	f.t.Helper()
+	var held []os.FileInfo
+	for _, d := range ds {
+		held = append(held, f.stat(repo, d))
+	}
+	return func(fi os.FileInfo) bool {
+		return slices.ContainsFunc(held, func(h os.FileInfo) bool { return os.SameFile(h, fi) })
+	}
+}
+
+// groupsOf pushes count blobs to a, b and c, each a size larger than the last
+// from size up, and returns their digests, largest first.
+func (f *convergeFixture) groupsOf(seed uint64, size, count int) []digest.Digest {
+	f.t.Helper()
+	out := make([]digest.Digest, count)
+	for i := range count {
+		out[count-1-i] = f.three(blobBytes(seed+uint64(i), size+i*512))
+	}
+	return out
+}
+
+// TestConvergeSyncFailureCostsItsDigest is the bad inode that used to stop every
+// pass: the largest group runs first, so nothing after it ever merged.
+func TestConvergeSyncFailureCostsItsDigest(t *testing.T) {
+	t.Run("a keeper's failure leaves the others to merge", func(t *testing.T) {
+		f := newConvergeFixture(t)
+		ds := f.groupsOf(50, 4096, 2)
+		rep, err := f.convergeErr(func(o *ConvergeOptions) {
+			o.seams.sync = f.syncFailsFor(unix.EIO, f.inodeOf("a", ds[0]))
+		})
+		if err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		wantSkip(t, rep, SkipSync, 1)
+		if f.same("a", "b", ds[0]) {
+			t.Error("merged into a keeper that would not sync")
+		}
+		if rep.Merged != 2 || !f.same("a", "b", ds[1]) || !f.same("a", "c", ds[1]) {
+			t.Errorf("the smaller digest did not merge: %+v", rep)
+		}
+		if rep.Pending != 2 {
+			t.Errorf("pending = %d, want the bad digest's 2", rep.Pending)
+		}
+	})
+	t.Run("a directory's failure leaves the others to merge", func(t *testing.T) {
+		f := newConvergeFixture(t)
+		ds := f.groupsOf(52, 4096, 2)
+		c := f.stat("c", ds[0])
+		dirs := 0
+		rep, err := f.convergeErr(func(o *ConvergeOptions) {
+			o.seams.sync = f.syncFailsFor(unix.EIO, func(fi os.FileInfo) bool {
+				if fi.IsDir() {
+					dirs++
+				}
+				return dirs == 1 && fi.IsDir()
+			})
+		})
+		if err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		wantSkip(t, rep, SkipSync, 1)
+		if !f.same("a", "b", ds[0]) || !os.SameFile(f.stat("c", ds[0]), c) {
+			t.Errorf("the digest did not stop at its failed merge: %+v", rep)
+		}
+		if rep.Merged != 3 || !f.same("a", "c", ds[1]) {
+			t.Errorf("the smaller digest did not merge: %+v", rep)
+		}
+	})
+	for _, tc := range []struct {
+		name string
+		err  error
+		dir  bool
+	}{
+		{"a keeper's ENOTSUP ends the pass", unix.ENOTSUP, false},
+		{"a keeper's ENOTTY ends the pass", unix.ENOTTY, false},
+		{"a directory's ENOTSUP ends the pass", unix.ENOTSUP, true},
+		{"a directory's ENOTTY ends the pass", unix.ENOTTY, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newConvergeFixture(t)
+			ds := f.groupsOf(54, 4096, 2)
+			rep, err := f.convergeErr(func(o *ConvergeOptions) {
+				o.seams.sync = f.syncFailsFor(tc.err, func(fi os.FileInfo) bool { return fi.IsDir() == tc.dir })
+			})
+			if !errors.Is(err, tc.err) {
+				t.Fatalf("err = %v, want %v", err, tc.err)
+			}
+			wantSkip(t, rep, SkipSync, 1)
+			if f.same("a", "b", ds[1]) {
+				t.Errorf("the pass went on to another digest: %+v", rep)
+			}
+		})
+	}
+	t.Run("three digests in a row end the pass", func(t *testing.T) {
+		f := newConvergeFixture(t)
+		f.groupsOf(56, 4096, 4)
+		rep, err := f.convergeErr(func(o *ConvergeOptions) {
+			o.seams.sync = f.syncFailsFor(unix.EIO, func(fi os.FileInfo) bool { return !fi.IsDir() })
+		})
+		if !errors.Is(err, unix.EIO) {
+			t.Fatalf("err = %v", err)
+		}
+		wantSkip(t, rep, SkipSync, convergeMaxSyncFailures)
+		if want := int64(4096+3*512) + 4096 + 2*512 + 4096 + 512; rep.HashedBytes != want {
+			t.Errorf("hashed %d, want %d: the fourth digest should go unread", rep.HashedBytes, want)
+		}
+		if rep.Pending != 8 {
+			t.Errorf("pending = %d, want all of the four digests' 8", rep.Pending)
+		}
+	})
+	t.Run("a digest that syncs restarts the count", func(t *testing.T) {
+		f := newConvergeFixture(t)
+		ds := f.groupsOf(60, 4096, 5)
+		bad := f.inodeOf("a", ds[0], ds[1], ds[3], ds[4])
+		rep, err := f.convergeErr(func(o *ConvergeOptions) {
+			o.seams.sync = f.syncFailsFor(unix.EIO, bad)
+		})
+		if err != nil {
+			t.Fatalf("err = %v: no three failures were in a row", err)
+		}
+		wantSkip(t, rep, SkipSync, 4)
+		if rep.Merged != 2 || !f.same("a", "b", ds[2]) {
+			t.Errorf("the good digest did not merge: %+v", rep)
+		}
+	})
+	t.Run("a directory failure after a keeper's sync still counts", func(t *testing.T) {
+		f := newConvergeFixture(t)
+		f.groupsOf(66, 4096, 4)
+		rep, err := f.convergeErr(func(o *ConvergeOptions) {
+			o.seams.sync = f.syncFailsFor(unix.EIO, os.FileInfo.IsDir)
+		})
+		if !errors.Is(err, unix.EIO) {
+			t.Fatalf("err = %v: every keeper synced and every directory failed", err)
+		}
+		wantSkip(t, rep, SkipSync, convergeMaxSyncFailures)
+		if rep.Merged != convergeMaxSyncFailures {
+			t.Errorf("merged %d, want one a digest", rep.Merged)
 		}
 	})
 }
