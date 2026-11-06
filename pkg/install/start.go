@@ -94,7 +94,7 @@ func Start(ctx context.Context, sys System, cfg Config, actor, reason string) er
 		// node no stop annotated it changes nothing, and an apiserver that is
 		// down must not turn a harmless re-run into a failure.
 		if uncordonPendingPresent(sys, cfg) {
-			if err := uncordonAfterStart(ctx, sys, cfg, actor, reason); err != nil {
+			if err := uncordonAfterStart(ctx, sys, cfg, actor, reason, false); err != nil {
 				return fmt.Errorf("start: %w", err)
 			}
 		} else {
@@ -125,7 +125,7 @@ func Start(ctx context.Context, sys System, cfg Config, actor, reason string) er
 			return fmt.Errorf("start: the daemons are running but the stop marker %s could not be removed (re-run `sudo k3sm start`): %w", cfg.StopMarker, err)
 		}
 	}
-	if err := uncordonAfterStart(ctx, sys, cfg, actor, reason); err != nil {
+	if err := uncordonAfterStart(ctx, sys, cfg, actor, reason, true); err != nil {
 		return fmt.Errorf("start: %w", err)
 	}
 	lifecycleLog(ctx, sys, cfg, slog.LevelInfo, "k3sm start: started", "actor", actor, "reason", reason, "result", "started")
@@ -138,9 +138,15 @@ func Start(ctx context.Context, sys System, cfg Config, actor, reason string) er
 // uncordon-pending marker. Running out of budget writes it, so a later
 // `k3sm start` on the running node repairs the cordon. A failure is one Error
 // line naming the last error's class, and is returned: the daemons are up,
-// but a node left cordoned is not started.
-func uncordonAfterStart(ctx context.Context, sys System, cfg Config, actor, reason string) error {
-	err := awaitMarkNode(ctx, cfg, false, actor, reason, uncordonBudget)
+// but a node left cordoned is not started. restarted says this command has just
+// restarted the daemons: on a control plane that gives a 401 uncordonRestartGrace,
+// and a worker's restart restarted no apiserver, so its 401 stays definitive.
+func uncordonAfterStart(ctx context.Context, sys System, cfg Config, actor, reason string, restarted bool) error {
+	var authGrace time.Duration
+	if restarted && cfg.Role != RoleAgent {
+		authGrace = uncordonRestartGrace
+	}
+	err := awaitMarkNode(ctx, cfg, false, actor, reason, uncordonBudget, authGrace)
 	if err == nil {
 		if cerr := clearUncordonPending(sys, cfg); cerr != nil {
 			cfg.Logger.Warn("the node is uncordoned, but the uncordon-pending marker stays; the next start retries an uncordon that is already done", "err", cerr)

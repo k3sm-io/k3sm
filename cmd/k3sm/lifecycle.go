@@ -252,12 +252,26 @@ func nodeMarker(sys install.System, dataRoot string) func(ctx context.Context, s
 			// Read from local files, so a start's uncordon does not retry it.
 			return fmt.Errorf("%w: %w", install.ErrNodeIdentity, err)
 		}
-		_, cs, err := kubeclient.FromPath(kubeconfig)
-		if err != nil {
-			return fmt.Errorf("load kubeconfig %s: %w", kubeconfig, err)
-		}
-		return markNodeObject(ctx, cs, name, stopped, actor, reason, time.Now())
+		return markNodeThroughKubeconfig(ctx, kubeconfigClient, kubeconfig, name, stopped, actor, reason)
 	}
+}
+
+// kubeconfigClient is the client a kubeconfig file gives.
+func kubeconfigClient(path string) (kubernetes.Interface, error) {
+	_, cs, err := kubeclient.FromPath(path)
+	return cs, err
+}
+
+// markNodeThroughKubeconfig is one MarkNode attempt. It loads the kubeconfig
+// afresh every time because a start's uncordon retries a 401 while the server
+// restarts, and the server rewrites this file during that window: a client kept
+// from the first attempt would hold the old token for the whole retry.
+func markNodeThroughKubeconfig(ctx context.Context, load func(string) (kubernetes.Interface, error), kubeconfig, name string, stopped bool, actor, reason string) error {
+	cs, err := load(kubeconfig)
+	if err != nil {
+		return fmt.Errorf("load kubeconfig %s: %w", kubeconfig, err)
+	}
+	return markNodeObject(ctx, cs, name, stopped, actor, reason, time.Now())
 }
 
 // lifecycleNodeIdentity returns the kubeconfig and node name nodeMarker uses.

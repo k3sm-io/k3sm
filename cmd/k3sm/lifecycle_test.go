@@ -23,6 +23,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -32,6 +34,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
@@ -246,6 +249,43 @@ func TestMarkNodeObject(t *testing.T) {
 // TestServiceCredentialDropsRootGroups pins the RemoveMesh child's identity:
 // the service uid and gid, and a supplementary list of only that gid, set
 // explicitly so none of root's groups is inherited.
+// TestMarkNodeReadsTheKubeconfigOnEveryAttempt pins what a start's retry of a
+// 401 rests on: the second attempt sees the token the server wrote after the
+// first attempt read the file.
+func TestMarkNodeReadsTheKubeconfigOnEveryAttempt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "k3sm.kubeconfig")
+	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name:        "n",
+		Annotations: map[string]string{StoppedByUserAnnotation: `{"cordoned":true}`},
+	}}
+	load := func(p string) (kubernetes.Interface, error) {
+		token, err := os.ReadFile(p)
+		if err != nil {
+			return nil, err
+		}
+		cs := fake.NewClientset(node)
+		if string(token) == "old" {
+			cs.PrependReactor("get", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) {
+				return true, nil, apierrors.NewUnauthorized("Unauthorized")
+			})
+		}
+		return cs, nil
+	}
+	ctx := context.Background()
+	if err := markNodeThroughKubeconfig(ctx, load, path, "n", false, "user", "test"); !apierrors.IsUnauthorized(err) {
+		t.Fatalf("attempt with the old token = %v, want the 401", err)
+	}
+	if err := os.WriteFile(path, []byte("new"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := markNodeThroughKubeconfig(ctx, load, path, "n", false, "user", "test"); err != nil {
+		t.Fatalf("attempt after the server rewrote the file: %v", err)
+	}
+}
+
 func TestServiceCredentialDropsRootGroups(t *testing.T) {
 	c := serviceCredential(271, 20)
 	if c.Uid != 271 || c.Gid != 20 || c.NoSetGroups || len(c.Groups) != 1 || c.Groups[0] != 20 {

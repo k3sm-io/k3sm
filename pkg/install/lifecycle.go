@@ -316,6 +316,17 @@ func markNode(ctx context.Context, cfg Config, stopped bool, actor, reason strin
 // attempt. A var so a test can shrink it.
 var uncordonBudget = restartBudget{running: 90 * time.Second, poll: 2 * time.Second}
 
+// uncordonRestartGrace is how long after the first 401 an uncordon keeps
+// retrying when this command has just restarted the control plane on this Mac.
+// A 401 there is not yet a verdict on the credential: the apiserver rejects a
+// valid admin token for its first seconds (about 2s observed), and an attempt
+// can carry the token of a kubeconfig read before the server rewrote it, which
+// the install's new token makes stale. Each attempt reads the file again. It
+// counts from the first 401, not from the restart, because a slow boot delays
+// the race rather than ending it. uncordonBudget still caps the whole wait. A
+// var so a test can shrink it.
+var uncordonRestartGrace = 30 * time.Second
+
 // ErrNodeStillCordoned is returned by Start when the daemons are up but the
 // uncordon did not land within uncordonBudget. Re-running `k3sm start`
 // repairs it: a start on a running node still runs the uncordon.
@@ -338,14 +349,16 @@ var ErrNodeIdentity = errors.New("cannot determine this node's cluster identity"
 // by b.running on top of ctx, so a caller holding context.Background (`k3sm
 // restart --start`) is bounded too; each attempt is bounded by
 // markNodeTimeout. Exhausting the budget returns ErrNodeStillCordoned
-// wrapping the last error. It logs nothing above Debug: the caller owns the
-// one line that reports the outcome.
-func awaitMarkNode(ctx context.Context, cfg Config, stopped bool, actor, reason string, b restartBudget) error {
+// wrapping the last error. A positive authGrace retries a 401 too, for that
+// long after the first one (uncordonRestartGrace). It logs nothing above Debug:
+// the caller owns the one line that reports the outcome.
+func awaitMarkNode(ctx context.Context, cfg Config, stopped bool, actor, reason string, b restartBudget, authGrace time.Duration) error {
 	if cfg.MarkNode == nil {
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, b.running)
 	defer cancel()
+	var firstRejected time.Time
 	for attempt := 1; ; attempt++ {
 		actx, acancel := context.WithTimeout(ctx, markNodeTimeout)
 		err := cfg.MarkNode(actx, stopped, actor, reason)
@@ -354,6 +367,15 @@ func awaitMarkNode(ctx context.Context, cfg Config, stopped bool, actor, reason 
 			return nil
 		}
 		class, retry := markNodeErrorClass(err)
+		if authGrace > 0 && apierrors.IsUnauthorized(err) {
+			if firstRejected.IsZero() {
+				firstRejected = time.Now()
+			}
+			if time.Since(firstRejected) >= authGrace {
+				return fmt.Errorf("the node was not uncordoned (%s for %s after this command restarted the control plane): %w", class, authGrace, err)
+			}
+			retry = true
+		}
 		if !retry {
 			return fmt.Errorf("the node was not uncordoned (%s, not retried): %w", class, err)
 		}
@@ -399,7 +421,8 @@ func clearUncordonPending(sys System, cfg Config) error {
 
 // markNodeErrorClass names the class of a Config.MarkNode error and says
 // whether a retry can fix it. A rejected identity (Forbidden, Unauthorized,
-// ErrNodeIdentity) cannot. The classes that mean the apiserver is not ready
+// ErrNodeIdentity) cannot, apart from the 401 awaitMarkNode gives a grace right
+// after a control plane restart. The classes that mean the apiserver is not ready
 // yet are retried: a timeout or deadline, a refused or reset connection, a
 // DNS failure (the mesh name is not up), NotFound (the Node's registration is
 // still pending), ServiceUnavailable, TooManyRequests, and Conflict (a
