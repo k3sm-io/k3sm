@@ -84,12 +84,11 @@ var errReferrersBusy = errors.New("referrers view still being built")
 
 // referrerDoc is what the referrers scan reads from each manifest.
 type referrerDoc struct {
-	MediaType    string             `json:"mediaType"`
-	ArtifactType string             `json:"artifactType"`
-	Config       *ispec.Descriptor  `json:"config"`
-	Subject      *ispec.Descriptor  `json:"subject"`
-	Annotations  map[string]string  `json:"annotations"`
-	Manifests    []ispec.Descriptor `json:"manifests"`
+	MediaType    string            `json:"mediaType"`
+	ArtifactType string            `json:"artifactType"`
+	Config       *ispec.Descriptor `json:"config"`
+	Subject      *ispec.Descriptor `json:"subject"`
+	Annotations  map[string]string `json:"annotations"`
 }
 
 // refEntry is what one manifest contributes to the view: its subject (empty
@@ -362,7 +361,8 @@ func (s *Server) buildReferrers(ctx context.Context, key string, n ref.Name, v *
 }
 
 // entryOf decodes what a manifest contributes to the view. A body that does
-// not decode, or names no subject, contributes nothing but its row.
+// not decode, names no subject, or names one that is not a canonical digest
+// contributes nothing but its row.
 func entryOf(row ispec.Descriptor, body []byte) refEntry {
 	e := refEntry{desc: ispec.Descriptor{MediaType: row.MediaType, Digest: row.Digest, Size: row.Size}}
 	var doc referrerDoc
@@ -370,11 +370,16 @@ func entryOf(row ispec.Descriptor, body []byte) refEntry {
 		e.size = 64
 		return e
 	}
+	subject, err := ref.ParseDigest(doc.Subject.Digest.String())
+	if err != nil {
+		e.size = 64
+		return e
+	}
 	at := doc.ArtifactType
 	if at == "" && doc.Config != nil {
 		at = doc.Config.MediaType
 	}
-	e.subject = doc.Subject.Digest
+	e.subject = subject
 	e.desc.ArtifactType, e.desc.Annotations = at, doc.Annotations
 	b, err := compactJSON(e.desc)
 	if err != nil {
