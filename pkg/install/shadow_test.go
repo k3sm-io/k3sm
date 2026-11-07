@@ -84,7 +84,7 @@ func TestShadowSetIsMadeAtInstall(t *testing.T) {
 				t.Fatalf("Install: %v", err)
 			}
 
-			dir := "/Library/k3sm.swap/shadow"
+			dir := cfg.swapDir() + "/shadow"
 			want := []string{"EnsureRootDir:" + dir}
 			want = append(want, shadowSetCalls(dir, missing)...)
 			want = append(want, fmt.Sprintf("WriteRootOnlyFile:%s/%s:%#o", dir, shadow.ManifestName, 0o644))
@@ -108,7 +108,7 @@ func TestShadowSetIsMadeAtInstall(t *testing.T) {
 				t.Errorf("shadowOwnership = %+v, want root:wheel 0755", shadowOwnership)
 			}
 			// Staged, then published with the rest of the tree.
-			if idx(f.calls, want[len(want)-1]) > idx(f.calls, "SwapInstallRoot:/Library/k3sm.swap<->/Library/k3sm:rename") {
+			if idx(f.calls, want[len(want)-1]) > idx(f.calls, "SwapInstallRoot:"+cfg.swapDir()+"<->"+cfg.InstallDir+":rename") {
 				t.Errorf("the manifest was written after the publish")
 			}
 
@@ -149,7 +149,7 @@ func TestShadowSetSharesTheOneList(t *testing.T) {
 	if err := Install(context.Background(), f, cfg); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
-	const dir = "/Library/k3sm.swap/shadow"
+	dir := cfg.swapDir() + "/shadow"
 	var clones []string
 	for _, c := range recorded(f.calls, "CloneToOwned:") {
 		clones = append(clones, strings.SplitN(c, ":", 2)[0])
@@ -177,16 +177,16 @@ func TestShadowSetSharesTheOneList(t *testing.T) {
 // the property, before anything is published.
 func TestShadowCopyVerificationFailsTheInstall(t *testing.T) {
 	shrinkRestartBudgets(t)
-	const dir = "/Library/k3sm.swap/shadow"
+	cfg := serverCfg(t)
+	dir := cfg.swapDir() + "/shadow"
 	bad := fmt.Errorf("%w: signature carries entitlements", shadow.ErrUnsafeCopy)
 	f := (&fakeSystem{verifyErrs: map[string]error{dir + "/tar": bad}}).rootedIn(t)
-	cfg := serverCfg(t)
 	cfg.Logger = slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
 	err := Install(context.Background(), f, cfg)
 	if !errors.Is(err, shadow.ErrUnsafeCopy) || !strings.Contains(err.Error(), "tar") || !strings.Contains(err.Error(), "entitlements") {
 		t.Fatalf("Install err = %v, want the unsafe-copy error naming tar and the property", err)
 	}
-	if idx(f.calls, "SwapInstallRoot:/Library/k3sm.swap<->/Library/k3sm:rename") >= 0 {
+	if idx(f.calls, "SwapInstallRoot:"+cfg.swapDir()+"<->"+cfg.InstallDir+":rename") >= 0 {
 		t.Errorf("the tree was published after a failed verification")
 	}
 	if idx(f.calls, "WriteRootOnlyFile:"+dir+"/"+shadow.ManifestName+":0644") >= 0 {

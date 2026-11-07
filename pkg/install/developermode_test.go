@@ -288,7 +288,7 @@ func TestDeveloperModeMarkerOnInstall(t *testing.T) {
 				if !markerContent.Match(f.files[DeveloperModeMarkerPath]) {
 					t.Errorf("marker content %q is not the one fixed line", f.files[DeveloperModeMarkerPath])
 				}
-				if lock := slices.Index(f.calls, "LockInstall:/Library/k3sm.lock"); lock < 0 || lock > wrote {
+				if lock := slices.Index(f.calls, "LockInstall:"+cfg.installLockPath()); lock < 0 || lock > wrote {
 					t.Errorf("the marker was written before the install lock was taken: %v", f.calls)
 				}
 			}

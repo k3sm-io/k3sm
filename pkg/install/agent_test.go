@@ -526,14 +526,14 @@ func TestInstallRendersAgentDaemonWhenJoining(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read the server plist golden: %v", err)
 		}
-		got := ServerPlist(Config{InstallDir: testInstallDir(t), BinarySource: "/tmp/k3sm", TargetUser: "alice", AdminToken: "k3sm-fixed"})
+		got := ServerPlist(Config{BinarySource: "/tmp/k3sm", TargetUser: "alice", AdminToken: "k3sm-fixed"})
 		if !bytes.Equal(got, want) {
 			t.Errorf("ServerPlist bytes moved:\n--- got ---\n%s\n--- want ---\n%s", got, want)
 		}
 
 		// And the server manifest still names the control plane, no agent entry.
 		var labels []string
-		for _, a := range artifactManifest(Config{InstallDir: testInstallDir(t), BinarySource: "/tmp/k3sm", TargetUser: "alice"}) {
+		for _, a := range artifactManifest(Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"}) {
 			if a.kind == kindDaemon {
 				labels = append(labels, a.label)
 			}

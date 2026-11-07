@@ -90,7 +90,8 @@ func TestReinstallRelinksIdempotently(t *testing.T) {
 			t.Fatalf("Install %d: %v", i, err)
 		}
 	}
-	want := "EnsureSymlink:/Library/k3sm/k3sm->/usr/local/bin/k3sm"
+	target := cfg.withDefaults().installedBinary()
+	want := "EnsureSymlink:" + target + "->/usr/local/bin/k3sm"
 	n := 0
 	for _, c := range f.calls {
 		if c == want {
@@ -100,8 +101,8 @@ func TestReinstallRelinksIdempotently(t *testing.T) {
 	if n != 2 {
 		t.Errorf("recorded %d %q calls across two installs, want 2 (the same link, asked for again)", n, want)
 	}
-	if got := f.links["/usr/local/bin/k3sm"]; got != "/Library/k3sm/k3sm" {
-		t.Errorf("link target after reinstall = %q, want %q", got, "/Library/k3sm/k3sm")
+	if got := f.links["/usr/local/bin/k3sm"]; got != target {
+		t.Errorf("link target after reinstall = %q, want %q", got, target)
 	}
 }
 

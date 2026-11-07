@@ -1912,11 +1912,11 @@ func TestInstallOrchestration(t *testing.T) {
 		// second copy of the install root? Staging means the new tree and the
 		// old one coexist until the reap. It is a courtesy, not a correctness
 		// gate — a seam failure here never refuses an install.
-		"InstallSpace:/Library",
+		"InstallSpace:" + filepath.Dir(cfg.InstallDir),
 		// NOTHING BELOW THIS LINE RUNS IN TWO INSTALLS AT ONCE. The lock is
 		// taken after every refusal (so a refusal never takes it) and before
 		// the first write, and it is released at the very end, past the reap.
-		"LockInstall:/Library/k3sm.lock",
+		"LockInstall:" + cfg.installLockPath(),
 		// The installed server plist, read here for the SAME reason and to
 		// answer a different refusal: does the argument set this install would
 		// carry over name a retired external-datastore flag? (See
@@ -2018,47 +2018,47 @@ func TestInstallOrchestration(t *testing.T) {
 		// a first install, so nothing is removed) and created, and every
 		// artifact below lands in it rather than in the tree the daemons are
 		// executing out of.
-		"Owner:/Library/k3sm.swap",
-		"EnsureRootDir:/Library/k3sm.swap",
-		"CopyToRootOwned:/Library/k3sm.swap/k3sm",
-		"CopyToRootOwned:/Library/k3sm.swap/k3sm-execshim",
-		"CopyToRootOwned:/Library/k3sm.swap/libk3sm_pathrebase_shim.dylib",
-		"CopyToRootOwned:/Library/k3sm.swap/libk3sm_getaddrinfo_shim.dylib",
+		"Owner:" + cfg.swapDir(),
+		"EnsureRootDir:" + cfg.swapDir(),
+		"CopyToRootOwned:" + cfg.swapDir() + "/k3sm",
+		"CopyToRootOwned:" + cfg.swapDir() + "/k3sm-execshim",
+		"CopyToRootOwned:" + cfg.swapDir() + "/libk3sm_pathrebase_shim.dylib",
+		"CopyToRootOwned:" + cfg.swapDir() + "/libk3sm_getaddrinfo_shim.dylib",
 		// The helper's entitlement was already verified, in the preflight block
 		// before any of these copies ran (see above) — this copy can now only
 		// fail on an I/O error.
-		"CopyToRootOwned:/Library/k3sm.swap/k3sm-vmhost",
-		"CopyToRootOwned:/Library/k3sm.swap/bin/kube-apiserver",
-		"CopyToRootOwned:/Library/k3sm.swap/bin/kube-scheduler",
-		"CopyToRootOwned:/Library/k3sm.swap/bin/kube-controller-manager",
-		"CopyToRootOwned:/Library/k3sm.swap/bin/kubectl",
-		"CopyToRootOwned:/Library/k3sm.swap/bin/kine",
-		"CopyToRootOwned:/Library/k3sm.swap/bin/etcd",
+		"CopyToRootOwned:" + cfg.swapDir() + "/k3sm-vmhost",
+		"CopyToRootOwned:" + cfg.swapDir() + "/bin/kube-apiserver",
+		"CopyToRootOwned:" + cfg.swapDir() + "/bin/kube-scheduler",
+		"CopyToRootOwned:" + cfg.swapDir() + "/bin/kube-controller-manager",
+		"CopyToRootOwned:" + cfg.swapDir() + "/bin/kubectl",
+		"CopyToRootOwned:" + cfg.swapDir() + "/bin/kine",
+		"CopyToRootOwned:" + cfg.swapDir() + "/bin/etcd",
 		// etcdutl, built from the etcd wrapper: `k3sm snapshot restore` runs it
 		// offline on an etcd server.
-		"CopyToRootOwned:/Library/k3sm.swap/bin/etcdutl",
+		"CopyToRootOwned:" + cfg.swapDir() + "/bin/etcdutl",
 		// The pinned helm the helm controller's Jobs run, a payload binary like
 		// kubectl.
-		"CopyToRootOwned:/Library/k3sm.swap/bin/" + helmchart.HelmBinaryName,
+		"CopyToRootOwned:" + cfg.swapDir() + "/bin/" + helmchart.HelmBinaryName,
 		// The kine version marker rides beside the kine binary it describes, staged
 		// best-effort (a pre-marker archive has none and must still install).
-		"CopyToRootOwned:/Library/k3sm.swap/bin/" + executor.KineMarkerName,
+		"CopyToRootOwned:" + cfg.swapDir() + "/bin/" + executor.KineMarkerName,
 		// The etcd version marker, staged the same best-effort way.
-		"CopyToRootOwned:/Library/k3sm.swap/bin/" + executor.EtcdMarkerName,
+		"CopyToRootOwned:" + cfg.swapDir() + "/bin/" + executor.EtcdMarkerName,
 		// The etcdutl version marker, staged the same best-effort way.
-		"CopyToRootOwned:/Library/k3sm.swap/bin/" + executor.EtcdutlMarkerName,
+		"CopyToRootOwned:" + cfg.swapDir() + "/bin/" + executor.EtcdutlMarkerName,
 		// The control-plane version marker, staged the same best-effort way beside the
 		// four kube binaries it describes.
-		"CopyToRootOwned:/Library/k3sm.swap/bin/" + executor.KubeMarkerName,
+		"CopyToRootOwned:" + cfg.swapDir() + "/bin/" + executor.KubeMarkerName,
 		// The helm version marker, staged the same best-effort way beside helm.
-		"CopyToRootOwned:/Library/k3sm.swap/bin/" + helmchart.HelmMarkerName,
+		"CopyToRootOwned:" + cfg.swapDir() + "/bin/" + helmchart.HelmMarkerName,
 		// The shadow binary set, staged with the binary that uses it: each copy
 		// in the shared list cloned root:wheel 0755, re-signed ad hoc, verified,
 		// its source's cdhash read, then the manifest (TestShadowSetIsMadeAtInstall
 		// owns the detail).
-		"EnsureRootDir:/Library/k3sm.swap/shadow",
-	}, shadowSetCalls("/Library/k3sm.swap/shadow", nil), []string{
-		"WriteRootOnlyFile:/Library/k3sm.swap/shadow/sources.json:0644",
+		"EnsureRootDir:" + cfg.swapDir() + "/shadow",
+	}, shadowSetCalls(cfg.swapDir()+"/shadow", nil), []string{
+		"WriteRootOnlyFile:" + cfg.swapDir() + "/shadow/sources.json:0644",
 		// The installed server plist and args record were already read, in the
 		// preflight block before any of these copies ran (see above); the carry-
 		// over below reuses that answer — nothing, on a first install — rather
@@ -2077,14 +2077,14 @@ func TestInstallOrchestration(t *testing.T) {
 		// PUBLISH. One operation makes the whole staged tree live; `:rename` is
 		// the first-install branch (there was no tree at /Library/k3sm to
 		// exchange with), so there is nothing to reap afterwards.
-		"SwapInstallRoot:/Library/k3sm.swap<->/Library/k3sm:rename",
+		"SwapInstallRoot:" + cfg.swapDir() + "<->" + cfg.InstallDir + ":rename",
 		// The launcher link and the plists come AFTER it, and only after it:
 		// each names a fixed absolute path inside the install root, and that
 		// path holds this install's binary only now. Copying into /Library/k3sm
 		// never put `k3sm` on a shell's PATH, which every post-install
 		// instruction assumes, so the link is still a hard install failure when
 		// it cannot be laid down.
-		"EnsureSymlink:/Library/k3sm/k3sm->/usr/local/bin/k3sm",
+		"EnsureSymlink:" + cfg.InstallDir + "/k3sm->/usr/local/bin/k3sm",
 		// The recorded node pod range is read before the plist that seeds the range
 		// (retireStaleNodeIdentity); absent here, so nothing is removed.
 		"ReadRegularFile:/var/lib/k3sm/keys/node-pod-cidr",
@@ -2140,7 +2140,7 @@ func TestInstallOrchestration(t *testing.T) {
 		"WriteUserKubeconfig:alice",
 		// The path it wrote, recorded for a root `k3sm status` anchor check.
 		"WriteServerArgsRecord:" + dataroot.DefaultServerArgsRecordPath,
-		"UnlockInstall:/Library/k3sm.lock",
+		"UnlockInstall:" + cfg.installLockPath(),
 	})
 	if len(f.calls) != len(want) {
 		t.Fatalf("call sequence = %v, want %v", f.calls, want)
@@ -2247,7 +2247,7 @@ func TestInstallBinaryLandsAtFixedPath(t *testing.T) {
 	// `k3sm-m2` would arrive under the live root under that same wrong name.
 	// The head is therefore stated as the staged counterpart of each fixed
 	// installed path, which is exactly what the swap then republishes.
-	stage := "/Library/k3sm" + installSwapSuffix
+	stage := cfg.swapDir()
 	fixedHead := []string{stage + "/k3sm", stage + "/k3sm-execshim", stage + "/" + PathShimName, stage + "/" + DNSShimName, stage + "/" + VMHostName}
 	if len(dsts) < len(fixedHead) {
 		t.Fatalf("only %d copies %v, want at least the fixed head %v (never the source basename)", len(dsts), dsts, fixedHead)
@@ -2301,6 +2301,23 @@ func TestInstallBinaryLandsAtFixedPath(t *testing.T) {
 	}
 	if got := cfg.withDefaults().VMHostSource; got != "/tmp/build/"+VMHostName {
 		t.Errorf("VMHostSource default = %q, want the BinarySource sibling /tmp/build/%s", got, VMHostName)
+	}
+}
+
+// TestDefaultBinaryPathsAreFixed pins, on the default config alone and without
+// running an install, the production paths TestInstallBinaryLandsAtFixedPath
+// checks under a temp root: the binary lands at /Library/k3sm/k3sm and is
+// staged at /Library/k3sm.swap/k3sm, whatever the source is called.
+func TestDefaultBinaryPathsAreFixed(t *testing.T) {
+	cfg := Config{BinarySource: "/tmp/build/k3sm-m2"}.withDefaults()
+	for _, tc := range []struct{ name, got, want string }{
+		{"installed binary", cfg.installedBinary(), "/Library/k3sm/k3sm"},
+		{"staged binary", cfg.stagedBinary(), "/Library/k3sm.swap/k3sm"},
+		{"staged payload", cfg.stagedPayloadFile("kube-apiserver"), "/Library/k3sm.swap/bin/kube-apiserver"},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s = %q, want %q", tc.name, tc.got, tc.want)
+		}
 	}
 }
 
@@ -3142,11 +3159,12 @@ func TestUninstallManifestCoversInstall(t *testing.T) {
 // deletes what it points at.
 func TestInstallLinksK3smOntoPath(t *testing.T) {
 	cfg := Config{InstallDir: testInstallDir(t), BinarySource: "/tmp/build/k3sm-m2", TargetUser: "alice"}
-	dc := cfg.withDefaults()
 
 	t.Run("the manifest carries exactly one launcher link", func(t *testing.T) {
+		// A pure check of the default config: no install runs.
+		def := Config{BinarySource: cfg.BinarySource, TargetUser: cfg.TargetUser}.withDefaults()
 		var links []artifact
-		for _, a := range artifactManifest(dc) {
+		for _, a := range artifactManifest(def) {
 			if a.kind == kindSymlink {
 				links = append(links, a)
 			}
@@ -3155,11 +3173,14 @@ func TestInstallLinksK3smOntoPath(t *testing.T) {
 			t.Fatalf("manifest has %d kindSymlink entries, want exactly 1: %+v", len(links), links)
 		}
 		a := links[0]
-		if a.path != dc.installedLink() {
-			t.Errorf("link path = %q, want installedLink() %q", a.path, dc.installedLink())
+		if a.path != def.installedLink() {
+			t.Errorf("link path = %q, want installedLink() %q", a.path, def.installedLink())
 		}
-		if a.target != dc.installedBinary() {
-			t.Errorf("link target = %q, want installedBinary() %q", a.target, dc.installedBinary())
+		if a.target != def.installedBinary() {
+			t.Errorf("link target = %q, want installedBinary() %q", a.target, def.installedBinary())
+		}
+		if a.target != "/Library/k3sm/k3sm" {
+			t.Errorf("link target = %q, want the default installed binary %q", a.target, "/Library/k3sm/k3sm")
 		}
 		if a.path != "/usr/local/bin/k3sm" {
 			t.Errorf("link path = %q, want the /etc/paths-covered launcher %q", a.path, "/usr/local/bin/k3sm")
@@ -3175,7 +3196,7 @@ func TestInstallLinksK3smOntoPath(t *testing.T) {
 		if err := Install(context.Background(), f, cfg); err != nil {
 			t.Fatalf("Install: %v", err)
 		}
-		link := idx(f.calls, "EnsureSymlink:/Library/k3sm/k3sm->/usr/local/bin/k3sm")
+		link := idx(f.calls, "EnsureSymlink:"+cfg.InstallDir+"/k3sm->/usr/local/bin/k3sm")
 		if link < 0 {
 			t.Fatalf("install never linked k3sm onto PATH; calls = %v", f.calls)
 		}
@@ -3183,8 +3204,8 @@ func TestInstallLinksK3smOntoPath(t *testing.T) {
 		// Under staging that means after the PUBLISH, not merely after the copy:
 		// the copy puts the binary in the sibling tree, and /Library/k3sm/k3sm
 		// (the path this link names) exists only once the publish has run.
-		publish := idx(f.calls, "SwapInstallRoot:/Library/k3sm.swap<->/Library/k3sm:rename")
-		if binary := idx(f.calls, "CopyToRootOwned:/Library/k3sm.swap/k3sm"); binary < 0 || link < binary {
+		publish := idx(f.calls, "SwapInstallRoot:"+cfg.swapDir()+"<->"+cfg.InstallDir+":rename")
+		if binary := idx(f.calls, "CopyToRootOwned:"+cfg.swapDir()+"/k3sm"); binary < 0 || link < binary {
 			t.Errorf("link (%d) must be laid down after the binary copy (%d)", link, binary)
 		}
 		if publish < 0 || link < publish {
@@ -3208,7 +3229,7 @@ func TestInstallLinksK3smOntoPath(t *testing.T) {
 		if unlink < 0 {
 			t.Fatalf("uninstall never removed the launcher link; calls = %v", f.calls)
 		}
-		sweep := idx(f.calls, "RemoveAll:/Library/k3sm")
+		sweep := idx(f.calls, "RemoveAll:"+cfg.InstallDir)
 		if sweep < 0 {
 			t.Fatalf("uninstall never swept InstallDir; calls = %v", f.calls)
 		}
@@ -3437,7 +3458,7 @@ func TestEnsureSymlinkNamesTheRemedyForAnUntrustedLinkDir(t *testing.T) {
 			if user < 0 || probe >= user {
 				t.Errorf("%s asked about the launcher directory at %d, after the first write at %d; the refusal must precede every write", run, probe, user)
 			}
-			if link := idx(calls, "EnsureSymlink:/Library/k3sm/k3sm->/usr/local/bin/k3sm"); link < 0 {
+			if link := idx(calls, "EnsureSymlink:"+cfg.InstallDir+"/k3sm->/usr/local/bin/k3sm"); link < 0 {
 				t.Errorf("%s never laid down the launcher; calls = %v", run, calls)
 			}
 		}
