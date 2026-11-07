@@ -72,7 +72,7 @@ func protoTime(ts *timestamppb.Timestamp) metav1.Time {
 func toPodStatus(pod *corev1.Pod, rs *runtimev1.PodStatus, nodeIP string, startTime metav1.Time, probes probeState, transport transportGate) *corev1.PodStatus {
 	cs := toContainerStatuses(rs.GetContainerStatuses())
 	initCS := toContainerStatuses(rs.GetInitContainerStatuses())
-	applyProbeOverlay(cs, probes)
+	applyProbeOverlay(pod, cs, probes)
 
 	containersReady := containersReadyFrom(cs)
 
@@ -493,9 +493,19 @@ func carryForwardExternalConditions(pod *corev1.Pod) []corev1.PodCondition {
 // ContainerStatus.restart_count on the RestartContainer RPC — the same RPC the
 // probe runner's doRestart drives — so the runtime count already includes every
 // liveness-driven restart; adding the monitor's tally on top would double-count.
-// A nil probes is a no-op.
-func applyProbeOverlay(cs []corev1.ContainerStatus, probes probeState) {
+//
+// A nil probes means no prober is registered for the pod. For a pod with no
+// probes that is the whole story and the runtime's status stands. For a pod that
+// DOES declare probes it is the window before the prober starts (the runtime has
+// started the container and its status stream or the resync backstop can publish
+// before CreatePod registers the prober) or after it stops (teardown). The
+// runtime's Ready only means "running", so passing it through there would publish
+// a container Ready before its readiness probe ever succeeded, which upstream
+// never does. Such a container is seeded the way the prober seeds it:
+// see seedUnprobedContainers.
+func applyProbeOverlay(pod *corev1.Pod, cs []corev1.ContainerStatus, probes probeState) {
 	if probes == nil {
+		seedUnprobedContainers(pod, cs)
 		return
 	}
 	for i := range cs {
@@ -512,6 +522,35 @@ func applyProbeOverlay(cs []corev1.ContainerStatus, probes probeState) {
 		if v.hasStartup {
 			started := v.started
 			cs[i].Started = &started
+		}
+	}
+}
+
+// seedUnprobedContainers applies the prober's initial verdict to every running
+// container whose spec declares a readiness or startup probe, for a status built
+// with no prober registered: a readiness probe starts at failure (not Ready until
+// it first succeeds) and a startup probe at unknown (not Started, and so not
+// Ready). It is the kubelet's seeding: a container with a readiness probe is not
+// ready until the probe's first success. A container with only a liveness probe,
+// or none, keeps the runtime's verdict, as applyProbeOverlay leaves it. A nil pod
+// (the pod-less path) has no spec to read and is a no-op.
+func seedUnprobedContainers(pod *corev1.Pod, cs []corev1.ContainerStatus) {
+	if pod == nil {
+		return
+	}
+	for i := range cs {
+		if cs[i].State.Running == nil {
+			continue
+		}
+		c := specContainer(pod, cs[i].Name)
+		if c == nil {
+			continue
+		}
+		if c.ReadinessProbe != nil || c.StartupProbe != nil {
+			cs[i].Ready = false
+		}
+		if c.StartupProbe != nil {
+			cs[i].Started = ptr(false)
 		}
 	}
 }
