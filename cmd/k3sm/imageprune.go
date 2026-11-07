@@ -24,6 +24,7 @@ import (
 	"io"
 	"slices"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
@@ -66,6 +67,10 @@ type registryPruneResult struct {
 	Unreadable []string `json:"unreadable,omitempty"`
 	// Failed are deletions the registry refused, under --force.
 	Failed []failedManifest `json:"failed,omitempty"`
+	// Sweep is the garbage-collection sweep of the repositories a forced
+	// prune deleted from, and what it freed. It is absent from a dry run and
+	// from a forced prune that deleted nothing.
+	Sweep *registrysvc.CollectResult `json:"sweep,omitempty"`
 }
 
 // failedManifest is a deletion the registry refused.
@@ -92,6 +97,17 @@ var deleteManifest manifestDeleter = func(ctx context.Context, ref name.Digest, 
 	return registrysvc.DeleteManifest(ctx, ref, state, auth, nil)
 }
 
+// prunedCollector asks the registry at authority to sweep the repositories
+// deleted names a manifest in, as cred (registrysvc.CollectPruned). It is the
+// seam the force path's sweep is proved through without a registry.
+type prunedCollector func(ctx context.Context, authority string, deleted []registrysvc.StoredManifest, cred registrysvc.Credential) (registrysvc.CollectResult, error)
+
+// collectPruned is the production prunedCollector: a request to the
+// registry's collect route on loopback.
+var collectPruned prunedCollector = func(ctx context.Context, authority string, deleted []registrysvc.StoredManifest, cred registrysvc.Credential) (registrysvc.CollectResult, error) {
+	return registrysvc.CollectPruned(ctx, authority, deleted, cred, nil)
+}
+
 // errPruneIncomplete reports that some registry deletions failed. Everything
 // else the prune did stands, and the report lists what failed.
 var errPruneIncomplete = errors.New("some untagged manifests were not deleted")
@@ -103,13 +119,19 @@ var errPruneIncomplete = errors.New("some untagged manifests were not deleted")
 // the store under the work dir to find untagged manifests, and deletes
 // each through the registry's API on loopback with this node's push credential, the
 // one identity the registry lets delete. The in-pod push gate still refuses DELETE;
-// nothing about who may delete changes. The registry's GC reclaims the blobs a
-// deleted manifest held on its next sweep.
+// nothing about who may delete changes. Once a forced prune has deleted at least
+// one manifest it asks the registry, with the same credential, to sweep the
+// repositories it deleted from, so the layers those manifests held go now
+// rather than at the next scheduled sweep. The server's own collector runs that
+// sweep under its grace, repository locks, brakes and review marker. What the
+// sweep freed, or why it freed nothing, is in the report; it never changes the
+// exit status, because the deletions stand either way and a scheduled sweep
+// reclaims what this one did not.
 //
 // The cache half is runtimed's PruneImages, which keeps everything a pod
 // uses. It runs FIRST, so a daemon that cannot be reached or refuses fails the
 // command before any registry manifest is deleted.
-func imagePrune(ctx context.Context, client runtimev1.ImagesClient, o imageOptions, out io.Writer, del manifestDeleter, now time.Time) error {
+func imagePrune(ctx context.Context, client runtimev1.ImagesClient, o imageOptions, out io.Writer, del manifestDeleter, collect prunedCollector, now time.Time) error {
 	report := pruneReport{
 		DryRun: !o.force,
 		Registry: registryPruneResult{
@@ -138,7 +160,7 @@ func imagePrune(ctx context.Context, client runtimev1.ImagesClient, o imageOptio
 
 	var failed int
 	if skipped == "" {
-		failed, err = pruneRegistry(ctx, o, cred, &report.Registry, del, now)
+		failed, err = pruneRegistry(ctx, o, cred, &report.Registry, del, collect, now)
 		if err != nil {
 			return err
 		}
@@ -179,7 +201,8 @@ func pruneCredential(workDir string) (registrysvc.Credential, string, error) {
 }
 
 // pruneRegistry plans each repository and, under --force, deletes its
-// untagged manifests. It returns how many deletions failed.
+// untagged manifests and then has the registry sweep the repositories it
+// deleted from. It returns how many deletions failed.
 //
 // The registry's delete by digest drops every row with that digest, tags
 // included, so a tag pushed onto a planned manifest after the plan was read
@@ -194,7 +217,7 @@ func pruneCredential(workDir string) (registrysvc.Credential, string, error) {
 // the repository in between; that refusal is a keep too, not a failure. A
 // registry that ignores If-Match deletes unconditionally, so for it the
 // window of the request round-trip stays open.
-func pruneRegistry(ctx context.Context, o imageOptions, cred registrysvc.Credential, res *registryPruneResult, del manifestDeleter, now time.Time) (int, error) {
+func pruneRegistry(ctx context.Context, o imageOptions, cred registrysvc.Credential, res *registryPruneResult, del manifestDeleter, collect prunedCollector, now time.Time) (int, error) {
 	repos, err := registrysvc.Repositories(o.workDir)
 	if err != nil {
 		return 0, fmt.Errorf("prune %s: %w", flatRegistryHost, err)
@@ -242,6 +265,13 @@ func pruneRegistry(ctx context.Context, o imageOptions, cred registrysvc.Credent
 			res.Manifests = append(res.Manifests, m)
 		}
 	}
+	if o.force && len(res.Manifests) > 0 {
+		sweep, err := collect(ctx, authority, res.Manifests, cred)
+		if err != nil {
+			sweep.Error = err.Error()
+		}
+		res.Sweep = &sweep
+	}
 	return failed, nil
 }
 
@@ -264,6 +294,7 @@ func renderPrune(out io.Writer, r pruneReport) {
 			fmt.Fprintf(out, "  could not delete %s@%s: %s\n", m.Repository, m.Digest, m.Error)
 		}
 		fmt.Fprintf(out, "  %s %d untagged manifest(s); the registry's garbage collection reclaims their layers on its next sweep\n", verb, len(reg.Manifests))
+		renderSweep(out, reg.Sweep)
 		if len(reg.Kept) > 0 {
 			counts := map[string]int{}
 			for _, k := range reg.Kept {
@@ -306,5 +337,36 @@ func renderCounts(out io.Writer, counts map[string]int, indent string) {
 	sort.Strings(reasons)
 	for _, r := range reasons {
 		fmt.Fprintf(out, "%s%-28s %d\n", indent, r, counts[r])
+	}
+}
+
+// renderSweep renders the sweep after a forced prune, when there was one:
+// what it freed, and each reason it freed less than it might have. It prints
+// below renderPrune's summary line, whose "next sweep" still holds for a dry
+// run and for whatever this sweep leaves; that line's text is a contract with
+// the app, so this one adds lines rather than change it. Every string is printed
+// through registrysvc.Printable, whichever path it came by, so neither the
+// registry's answer nor an error text can write terminal controls.
+func renderSweep(out io.Writer, s *registrysvc.CollectResult) {
+	if s == nil {
+		return
+	}
+	p := registrysvc.Printable
+	repos := make([]string, len(s.Repositories))
+	for i, r := range s.Repositories {
+		repos[i] = p(r)
+	}
+	fmt.Fprintf(out, "  swept %s: freed %d blob(s), %s\n", strings.Join(repos, ", "), s.Blobs, humanBytes(uint64(max(s.Bytes, 0))))
+	for _, repo := range s.Stopped {
+		fmt.Fprintf(out, "  sweep stopped by the mass-delete brake, nothing freed: %s\n", p(repo))
+	}
+	for _, repo := range s.Reviewing {
+		fmt.Fprintf(out, "  not yet reviewed by the registry's garbage collection, only reported on: %s\n", p(repo))
+	}
+	for _, repo := range s.Failed {
+		fmt.Fprintf(out, "  sweep failed, nothing freed: %s\n", p(repo))
+	}
+	if s.Error != "" {
+		fmt.Fprintf(out, "  sweep: %s; the registry's scheduled garbage collection reclaims what this sweep did not\n", p(s.Error))
 	}
 }

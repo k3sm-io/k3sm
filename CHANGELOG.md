@@ -145,6 +145,15 @@ pin, its date, and the tarball's sha256.
 ### Changed
 
 - The bundled buildx moves from v0.38.0 to v0.38.1, a patch release. The pinned checksums move with it.
+- `k3sm image prune --force` frees the layers of the untagged manifests it deleted at once, instead
+  of leaving them for the registry's next scheduled garbage collection (every 6 hours). After it
+  deletes at least one manifest it asks the registry, with the node's push credential, to sweep
+  exactly the repositories it deleted from; the registry's own collector runs that sweep with its
+  usual one-hour grace, repository locks and mass-delete brake. The table and the `-o json` document
+  (`registry.sweep`) report the blobs and bytes the sweep freed, and any repository the brake
+  stopped, that no scheduled sweep has reviewed yet, or whose sweep failed. A sweep that stops or
+  cannot run is reported and not retried, and does not change the exit status. A dry run sweeps
+  nothing.
 - The cluster registry no longer runs or ships a zot child. It is k3sm's own, served by the `k3sm` binary
   itself, so a release payload and `k3sm payload` carry no `zot` or `zot.version`, and a build from
   source no longer fetches zot's modules. An install still removes a `zot` an earlier release left in

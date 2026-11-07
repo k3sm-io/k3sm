@@ -36,6 +36,7 @@ import (
 	"k3sm.io/k3sm/pkg/ociregistry/api"
 	"k3sm.io/k3sm/pkg/ociregistry/auth"
 	"k3sm.io/k3sm/pkg/ociregistry/gc"
+	"k3sm.io/k3sm/pkg/ociregistry/ref"
 	"k3sm.io/k3sm/pkg/ociregistry/store"
 )
 
@@ -202,6 +203,7 @@ func runServer(ctx context.Context, workDir string, cfg ServeConfig, d serveDeps
 		tick: d.convergeTick, grace: d.gcGrace, fence: fence, reports: reports, log: log,
 	})
 	httpServer.Handler = watchCommits(httpServer.Handler, dedupe.commit)
+	httpServer.Handler = collectRoute(httpServer.Handler, access, fencedSweep(collector, fence), log, nil)
 	bg, stopBG := context.WithCancel(ctx)
 	defer stopBG()
 	var wg sync.WaitGroup
@@ -252,6 +254,21 @@ func sweepLoop(ctx context.Context, c *gc.Collector, grace, interval time.Durati
 		fence.mu.Unlock()
 		fence.swept()
 		wait.Reset(interval)
+	}
+}
+
+// fencedSweep is the sweep a forced prune asks for: the collector's
+// per-repository sweep, holding fence as a scheduled sweep does, so it never
+// runs beside a dedupe pass. It takes the fence only if it is free and
+// otherwise returns errSweepBusy at once, so a request never waits in line
+// behind a sweep or a pass.
+func fencedSweep(c *gc.Collector, fence *sweepFence) repositorySweeper {
+	return func(ctx context.Context, names []ref.Name) (gc.RepositoriesReport, error) {
+		if !fence.mu.TryLock() {
+			return gc.RepositoriesReport{}, errSweepBusy
+		}
+		defer fence.mu.Unlock()
+		return c.SweepRepositories(ctx, names)
 	}
 }
 
