@@ -22,14 +22,14 @@ import (
 	"testing"
 
 	"k3sm.io/k3sm/pkg/defaults"
-	"k3sm.io/k3sm/pkg/executor"
 )
 
 // TestServiceCIDRFlagAgreesWithTheAPIServer pins the one Service range netd
 // and the apiserver share. --service-cidr reaches only netd's plist; the
 // apiserver's --service-cluster-ip-range (and the DNS VIP, the API VIP and the
-// serving SANs) are fixed to defaults.ServiceCIDR. A different value would
-// leave the two disagreeing, so install refuses it before anything is written.
+// serving SANs) are fixed to defaults.ServiceCIDR, which pkg/executor's
+// TestAPIServerServiceRangeIsTheDefault pins. A different value would leave
+// the two disagreeing, so install refuses it before anything is written.
 func TestServiceCIDRFlagAgreesWithTheAPIServer(t *testing.T) {
 	base := func() Config { return Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"} }
 
@@ -79,23 +79,6 @@ func TestServiceCIDRFlagAgreesWithTheAPIServer(t *testing.T) {
 			if got := flagValue(args, "service-cidr"); got != defaults.ServiceCIDR {
 				t.Errorf("netd --service-cidr = %q, want %q", got, defaults.ServiceCIDR)
 			}
-		}
-	})
-
-	t.Run("netd's range is the apiserver's range", func(t *testing.T) {
-		netd, err := parseProgramArguments(NetdPlist(Config{}))
-		if err != nil {
-			t.Fatalf("NetdPlist: %v", err)
-		}
-		apiserver := executor.APIServerArgs(executor.Config{
-			WorkDir: "/var/lib/k3sm/server", KinePort: 2379, APIServerPort: 6444, NodeIP: "127.0.0.1",
-		})
-		got := flagValue(apiserver, "service-cluster-ip-range")
-		if got != defaults.ServiceCIDR {
-			t.Errorf("apiserver --service-cluster-ip-range = %q, want defaults.ServiceCIDR %q", got, defaults.ServiceCIDR)
-		}
-		if want := flagValue(netd, "service-cidr"); got != want {
-			t.Errorf("apiserver --service-cluster-ip-range = %q, netd --service-cidr = %q: they must agree", got, want)
 		}
 	})
 

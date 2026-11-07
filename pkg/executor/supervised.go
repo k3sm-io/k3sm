@@ -837,12 +837,6 @@ func (s *Supervised) startAPIServer(ctx context.Context) (*component, error) {
 	return s.spawn(ctx, "kube-apiserver", apiServerArgs(s.cfg)...)
 }
 
-// APIServerArgs is the kube-apiserver argv the supervisor spawns for cfg (see
-// apiServerArgs). It is exported so a package that renders configuration the
-// apiserver must agree with, such as the installer's netd arguments, can
-// assert that agreement against the real renderer.
-func APIServerArgs(cfg Config) []string { return apiServerArgs(cfg) }
-
 // apiServerArgs renders the kube-apiserver argv from cfg. It is a pure function so
 // the trust posture is table-tested without booting the apiserver: the mesh
 // BindAddress (never 0.0.0.0), --anonymous-auth=false, --client-ca-file (always set —
