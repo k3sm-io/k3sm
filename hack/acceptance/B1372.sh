@@ -91,6 +91,8 @@
 #   K3SM_MST_LOCAL_K3SM          k3sm on this host, for the push (default k3sm)
 #   K3SM_MST_WORKER_LABEL        the worker's node daemon (default io.k3sm.agent)
 #   K3SM_MST_MEMORY              spec.memory (default 4Gi)
+#   K3SM_MST_IMAGE               spec.runtime.image (default: the examples/mlxmodel.yaml pin)
+#   K3SM_MST_PORT                spec.port, matching the image (default 8000)
 #   K3SM_MST_PYTHON              python in the serving image (default python3)
 #   K3SM_MST_STEP_TIMEOUT        seconds for one remote or kubectl step (default 120, <=240)
 #   K3SM_MST_READY_TIMEOUT       seconds for a model to come Ready (default 900)
@@ -300,7 +302,9 @@ def t(s):
 cond = {c["type"]: c for c in p.get("status", {}).get("conditions", [])}
 created = t(p["metadata"]["creationTimestamp"])
 ready = t(cond["Ready"]["lastTransitionTime"])
-sched = t(cond["PodScheduled"]["lastTransitionTime"])
+# The node provider may publish PodScheduled without a transition time; then
+# status.startTime (when the node accepted it) is that instant, then creation.
+sched = t(cond.get("PodScheduled", {}).get("lastTransitionTime") or p["status"].get("startTime") or p["metadata"]["creationTimestamp"])
 cs = p["status"]["containerStatuses"][0]
 st = (cs.get("state", {}).get("running") or {}).get("startedAt") or (cs.get("lastState", {}).get("terminated") or {}).get("startedAt")
 print(int(ready - created), int(t(st) - sched))
@@ -367,7 +371,14 @@ K3SM_BIN="${K3SM_MST_K3SM:-/Library/k3sm/k3sm}"
 LOCAL_K3SM="${K3SM_MST_LOCAL_K3SM:-k3sm}"
 WORKER_LABEL="${K3SM_MST_WORKER_LABEL:-io.k3sm.agent}"
 MEMORY="${K3SM_MST_MEMORY:-4Gi}"
-PYBIN="${K3SM_MST_PYTHON:-python3}"
+# The operator ships no default serving image, so the run names one; the default is the
+# pin examples/mlxmodel.yaml carries, and the port must agree with it.
+IMAGE="${K3SM_MST_IMAGE:-ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.5@sha256:a225253effc92f5f5ff8ec2ec2e2f8894aa690a3d6a908bb879439de6733d0e8}"
+PORT="${K3SM_MST_PORT:-8000}"
+# The serving image's interpreter is the Mach-O itself: a native pod runs argv[0] as a
+# path inside the image root (no PATH search), and the runtime signs only a regular file,
+# never the /bin/python3 symlink.
+PYBIN="${K3SM_MST_PYTHON:-/bin/python3.12}"
 VIEW_UID="${K3SM_MST_VIEW_UID:-0}"
 REG_ROOT="${K3SM_MST_REGISTRY_ROOT:-/var/lib/k3sm/server/registry}"
 KUBECTL="${KUBECTL:-kubectl}"
@@ -599,7 +610,10 @@ t1() {
 	ls2="$(rroot "$SERVER" "$STEP_TIMEOUT" "$REPO_LS" "$REG_ROOT" "models/$REPO")" || { bad "registry listing after the second push"; return 1; }
 	printf '%s\n' "$ls1" >"$EV/t.1.registry-before"
 	printf '%s\n' "$ls2" >"$EV/t.1.registry-after"
-	[ "$ls1" = "$ls2" ] || { bad "the second push changed the registry's blob files for models/$REPO (it wrote bytes)"; return 1; }
+	# Name, inode and size: the registry refreshes a blob's mtime on access to keep it inside
+	# the GC grace, so a changed mtime is not a write. A rewrite shows as a new inode or size.
+	[ "$(awk '{print $1, $2, $3}' <<<"$ls1")" = "$(awk '{print $1, $2, $3}' <<<"$ls2")" ] ||
+		{ bad "the second push changed the registry's blob files for models/$REPO (it wrote bytes)"; return 1; }
 	measure t1_digest "$DIGEST"
 	measure model_bytes "$MODEL_BYTES"
 }
@@ -608,6 +622,7 @@ mlxmodel_json() { # <name> <hostname-label> <replicas>
 	cat <<JSON
 {"apiVersion":"mlx.k3sm.io/v1alpha1","kind":"MLXModel","metadata":{"name":"$1","namespace":"$NS"},
  "spec":{"artifact":{"reference":"$REG_HOST/models/$REPO:v1"},"memory":"$MEMORY","replicas":$3,
+  "port":$PORT,"runtime":{"image":"$IMAGE"},
   "nodeSelector":{"kubernetes.io/hostname":"$2","kubernetes.io/os":"darwin"}}}
 JSON
 }
@@ -639,11 +654,12 @@ sample_fp() {
 
 # wait_ready <model> <replicas> [sample]: the model Ready with that many replicas.
 wait_ready() {
-	local m="$1" want="$2" end i=0 st
+	local m="$1" want="$2" end i=0 st last=""
 	end=$(($(date +%s) + READY_TIMEOUT))
 	while :; do
 		st="$(kc get mlxmodel "$m" -n "$NS" -o json 2>/dev/null | py 'import json,sys; s=json.loads(sys.stdin.read()).get("status",{}); print(s.get("phase",""), s.get("readyReplicas",0))' 2>/dev/null || true)"
 		[ -z "${3:-}" ] || sample_fp "$i"
+		[ "$st" = "${last:-}" ] || { printf '%s %s\n' "$(date +%s)" "${st:-none}" >>"$EV/wait.$m.trail"; last="$st"; }
 		[ "$st" != "Ready $want" ] || return 0
 		[ "$(date +%s)" -lt "$end" ] || { bad "$m not Ready with $want replicas in ${READY_TIMEOUT}s (last: ${st:-none})"; return 1; }
 		i=$((i + 1))
@@ -662,7 +678,12 @@ t3() {
 		node="$SNODE"
 		[ "$m" = "$MA" ] || node="$WNODE"
 		kc get pods -n "$NS" -l "app.kubernetes.io/instance=$m" -o json >"$EV/t.3.$m.pods.json" || { bad "read $m pods"; return 1; }
-		why="$(pod_checks "$EV/t.3.$m.pods.json" "$DIGEST" "$node" 1)" || { bad "$m: $why"; return 1; }
+		why="$(pod_checks "$EV/t.3.$m.pods.json" "$DIGEST" "$node" 1)" || {
+			kc logs -n "$NS" -l "app.kubernetes.io/instance=$m" --tail=200 >"$EV/t.3.$m.logs" 2>&1 || true
+			kc get events -n "$NS" -o wide >"$EV/t.3.events" 2>&1 || true
+			bad "$m: $why"
+			return 1
+		}
 	done
 	[ -z "$(kc get pvc -n "$NS" -o name 2>/dev/null)" ] || { bad "the namespace holds a PVC"; return 1; }
 	p="$(py 'import json,sys; print(json.load(open(sys.argv[1]))["items"][0]["metadata"]["name"])' "$EV/t.3.$MA.pods.json")"
