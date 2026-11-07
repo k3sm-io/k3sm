@@ -203,6 +203,11 @@ func TestStoreContract(t *testing.T) {
 				if got[0].Current.Version != 2 || len(got[0].Versions) != 2 {
 					t.Fatalf("List a = %+v", got[0])
 				}
+				for _, e := range got {
+					if e.Err != nil {
+						t.Fatalf("List %s: Err = %v, want nil for a healthy entry", e.Name, e.Err)
+					}
+				}
 			},
 		},
 		{
