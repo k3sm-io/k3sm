@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -32,26 +33,41 @@ import (
 	"k3sm.io/k3sm/pkg/registryclient/registrytest"
 )
 
-// variantRegistry serves a writable in-process registry and returns the tag
-// models/tiny:latest on it.
-func variantRegistry(t *testing.T) (*registrytest.Registry, name.Tag) {
+// variantRegistry is a writable in-process registry, the tag
+// models/tiny:latest on it, and the option that reaches it.
+func variantRegistry(t *testing.T) (*registrytest.Registry, name.Tag, remote.Option) {
 	t.Helper()
 	reg := registrytest.New()
 	reg.AcceptWrites = true
-	srv := httptest.NewServer(reg.Handler())
-	t.Cleanup(srv.Close)
-	tag, err := name.NewTag(strings.TrimPrefix(srv.URL, "http://")+"/models/tiny:latest", name.Insecure)
+	tag, err := name.NewTag("registry.test/models/tiny:latest")
 	if err != nil {
 		t.Fatal(err)
 	}
-	return reg, tag
+	return reg, tag, remote.WithTransport(handlerTransport{reg.Handler()})
+}
+
+// handlerTransport serves every request with h in process, through a
+// response recorder: no socket is opened.
+type handlerTransport struct{ h http.Handler }
+
+func (t handlerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	in := req.Clone(req.Context())
+	in.RequestURI = req.URL.RequestURI()
+	if in.Body == nil {
+		in.Body = http.NoBody
+	}
+	rec := httptest.NewRecorder()
+	t.h.ServeHTTP(rec, in)
+	resp := rec.Result()
+	resp.Request = req
+	return resp, nil
 }
 
 // readIndex reads the index tag names: its media type and its entries as
 // variant -> manifest digest, in index order.
-func readIndex(t *testing.T, tag name.Tag) (string, []string, map[string]string) {
+func readIndex(t *testing.T, tag name.Tag, opt remote.Option) (string, []string, map[string]string) {
 	t.Helper()
-	got, err := remote.Get(tag)
+	got, err := remote.Get(tag, opt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +96,7 @@ func readIndex(t *testing.T, tag name.Tag) (string, []string, map[string]string)
 func TestPushVariantUpdatesIndex(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	reg, tag := variantRegistry(t)
+	reg, tag, opt := variantRegistry(t)
 
 	q4 := build(t, writeTree(t, map[string]string{"config.json": `{"q":4}`, "model.safetensors": "four"}))
 	q8 := build(t, writeTree(t, map[string]string{"config.json": `{"q":8}`, "model.safetensors": "eight"}))
@@ -91,7 +107,7 @@ func TestPushVariantUpdatesIndex(t *testing.T) {
 		variant string
 		a       *Artifact
 	}{{"8bit", q8}, {"4bit", q4}, {"4bit", q4b}} {
-		d, err := PushVariant(ctx, tag, step.a, step.variant)
+		d, err := PushVariant(ctx, tag, step.a, step.variant, opt)
 		if err != nil {
 			t.Fatalf("PushVariant(%s): %v", step.variant, err)
 		}
@@ -100,7 +116,7 @@ func TestPushVariantUpdatesIndex(t *testing.T) {
 			t.Errorf("%s: config blob not pushed", step.variant)
 		}
 	}
-	mt, order, byVariant := readIndex(t, tag)
+	mt, order, byVariant := readIndex(t, tag, opt)
 	if mt != ispec.MediaTypeImageIndex {
 		t.Errorf("tag media type %q, want %q", mt, ispec.MediaTypeImageIndex)
 	}
@@ -114,14 +130,14 @@ func TestPushVariantUpdatesIndex(t *testing.T) {
 		t.Errorf("tag names %s, PushVariant returned %s", d, digests[2])
 	}
 	for _, a := range []*Artifact{q4, q8, q4b} {
-		if _, err := remote.Head(tag.Context().Digest(a.Digest.String())); err != nil {
+		if _, err := remote.Head(tag.Context().Digest(a.Digest.String()), opt); err != nil {
 			t.Errorf("manifest %s not in the repository by digest: %v", a.Digest, err)
 		}
 	}
 
 	// The same push again changes nothing: the same digest, no new write.
 	before := len(reg.Writes())
-	if d, err := PushVariant(ctx, tag, q4b, "4bit"); err != nil || d != digests[2] {
+	if d, err := PushVariant(ctx, tag, q4b, "4bit", opt); err != nil || d != digests[2] {
 		t.Errorf("re-push = %s, %v; want %s", d, err, digests[2])
 	}
 	if n := len(reg.Writes()) - before; n != 0 {
@@ -129,25 +145,25 @@ func TestPushVariantUpdatesIndex(t *testing.T) {
 	}
 
 	// The same set of variants pushed in the other order makes the same index.
-	_, other := variantRegistry(t)
+	_, other, otherOpt := variantRegistry(t)
 	for _, step := range []struct {
 		variant string
 		a       *Artifact
 	}{{"4bit", q4b}, {"8bit", q8}} {
-		if _, err := PushVariant(ctx, other, step.a, step.variant); err != nil {
+		if _, err := PushVariant(ctx, other, step.a, step.variant, otherOpt); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if d, err := remote.Head(other); err != nil || d.Digest.String() != digests[2] {
+	if d, err := remote.Head(other, otherOpt); err != nil || d.Digest.String() != digests[2] {
 		t.Errorf("index from the other order = %v, %v; want %s", d, err, digests[2])
 	}
 
 	// A plain manifest at the tag is refused, and stays a plain manifest.
-	plainReg, plain := variantRegistry(t)
-	if err := Push(ctx, plain, q4); err != nil {
+	plainReg, plain, plainOpt := variantRegistry(t)
+	if err := Push(ctx, plain, q4, plainOpt); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := PushVariant(ctx, plain, q8, "8bit"); !errors.Is(err, ErrTagIsManifest) {
+	if _, err := PushVariant(ctx, plain, q8, "8bit", plainOpt); !errors.Is(err, ErrTagIsManifest) {
 		t.Errorf("variant over a plain manifest: err = %v, want ErrTagIsManifest", err)
 	}
 	if d, ok := plainReg.Manifest("models/tiny", "latest"); !ok || d != q4.Digest.String() {
