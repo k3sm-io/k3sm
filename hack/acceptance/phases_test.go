@@ -532,6 +532,7 @@ func TestM17InterconnectLadderContract(t *testing.T) {
 		script string
 		lab    *string // nil: K3SM_LAB absent from the environment
 		args   []string
+		env    []string // extra KEY=VAL defaults, applied only when the environment does not already set KEY
 		code   int
 		check  func(t *testing.T, out string)
 	}{
@@ -551,7 +552,7 @@ func TestM17InterconnectLadderContract(t *testing.T) {
 				}
 			}
 		}},
-		{name: "self-test", script: gate, args: []string{"--self-test"}, code: 0, check: hasLine("M17-lab self-test: PASS")},
+		{name: "self-test", script: gate, args: []string{"--self-test"}, env: []string{"K3SM_M17_SELFTEST_WATCHDOG=600"}, code: 0, check: hasLine("M17-lab self-test: PASS")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cmd := exec.Command("bash", append([]string{filepath.Join(root, filepath.FromSlash(tc.script))}, tc.args...)...)
@@ -564,6 +565,15 @@ func TestM17InterconnectLadderContract(t *testing.T) {
 			}
 			if tc.lab != nil {
 				cmd.Env = append(cmd.Env, "K3SM_LAB="+*tc.lab)
+			}
+			// A loaded gate runs the self-test in ~250 s, past the script's 120 s hand-run
+			// watchdog default, so a live run would read as a hang: give it a larger budget
+			// unless the caller already chose one.
+			for _, def := range tc.env {
+				name, _, _ := strings.Cut(def, "=")
+				if _, set := os.LookupEnv(name); !set {
+					cmd.Env = append(cmd.Env, def)
+				}
 			}
 			raw, err := cmd.CombinedOutput()
 			out, code := string(raw), 0
