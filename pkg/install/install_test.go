@@ -1948,6 +1948,9 @@ func TestInstallOrchestration(t *testing.T) {
 		"EnsureOwnedDir:/var/lib/k3sm/sbpl:271:20:0700",
 		"EnsureOwnedDir:/var/lib/k3sm/podreap:271:20:0700",
 		"EnsureOwnedDir:/var/lib/k3sm/vmreap:271:20:0700",
+		"EnsureOwnedDir:/var/lib/k3sm/artifact-partial:271:20:0700",
+		"EnsureOwnedDir:/var/lib/k3sm/vmboot-failures:271:20:0700",
+		"EnsureOwnedDir:/var/lib/k3sm/artifacts:271:20:0711",
 		"EnsureOwnedFile:/var/lib/k3sm/runtimed.lock:271:20:0600",
 		"EnsureLogDir:/var/log/k3sm",
 		// The purge markers, once both trees exist: `uninstall --purge` refuses

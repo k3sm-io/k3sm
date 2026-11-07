@@ -31,6 +31,7 @@ import (
 
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/netdsvc"
+	"k3sm.io/runtimed/pkg/sandbox"
 )
 
 // indexFrom returns the index of the first call equal to want at or after
@@ -789,4 +790,65 @@ func TestEnsureStateTreeHandsUpdateRootToServiceUser(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestStateTreeCoversRuntimedTrees pins the state tree to the runtime's own
+// list of the trees it writes directly under its work dir, which on a stock
+// install IS the data root. That root is root:wheel 0755, so the runtime,
+// running as the service user, cannot create a top-level directory there: a
+// tree it names that the table does not pre-create fails with "permission
+// denied" the first time the runtime reaches for it. Every entry of
+// sandbox.DaemonTreeSubdirs and sandbox.ReapStoreSubdirs must therefore be a
+// service-user row of the table (so the install creates it and netd repairs
+// it), or be named in createdElsewhere with who creates it.
+func TestStateTreeCoversRuntimedTrees(t *testing.T) {
+	// createdElsewhere lists the runtime trees the table deliberately does not
+	// name, each with the code that creates it under the root-owned root
+	// instead. It is empty today: every runtime tree is a table row. An entry
+	// belongs here only when something running as root creates that directory
+	// for the service user by another path; "the runtime makes it" never
+	// qualifies, because the runtime cannot.
+	createdElsewhere := map[string]string{}
+
+	names := append(sandbox.DaemonTreeSubdirs(), sandbox.ReapStoreSubdirs()...)
+	service := ServiceLevels()
+	for _, name := range names {
+		if who, ok := createdElsewhere[name]; ok {
+			t.Logf("%s is created by %s, not by the state tree", name, who)
+			continue
+		}
+		level := StateLevel(name)
+		own, ok := OwnershipOf(level)
+		if !ok {
+			t.Errorf("runtime tree %q is not in the state tree: the service user cannot create it under the root-owned data root", name)
+			continue
+		}
+		if own.Principal != PrincipalServiceUser || !slices.Contains(service, level) {
+			t.Errorf("runtime tree %q is in the state tree as %+v; want a service-user row", name, own)
+		}
+	}
+}
+
+// TestStateTreeRuntimeTreeModes pins the artifact trees and the failed-boot
+// console dir to the modes the runtime itself creates and checks them at. The
+// views root is refused by the
+// runtime unless it is exactly 0711 and owned by the daemon (it never repairs
+// one), and netd re-applies the table's mode at every start, so any other mode
+// here would make every model image volume fail. The partial-download dir is
+// refused when it is writable by group or other; the runtime makes it 0700, as
+// it does the failed-boot console dir.
+func TestStateTreeRuntimeTreeModes(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mode fs.FileMode
+	}{
+		{sandbox.ArtifactViewsSubdir, 0o711},
+		{sandbox.ArtifactPartialSubdir, 0o700},
+		{sandbox.VMBootFailureSubdir, 0o700},
+	} {
+		own, ok := OwnershipOf(StateLevel(tc.name))
+		if !ok || own.Principal != PrincipalServiceUser || own.GID != ServiceTreeGID || own.Mode != tc.mode {
+			t.Errorf("OwnershipOf(%s) = %+v, %v; want the service user, gid %d, mode %#o", tc.name, own, ok, ServiceTreeGID, tc.mode)
+		}
+	}
 }
