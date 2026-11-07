@@ -94,7 +94,8 @@ type Options struct {
 	// https with no path, query or user.
 	Endpoint string
 	// Transport carries the requests; DefaultTransport() when nil. The
-	// client never lets it follow a redirect: it follows them itself.
+	// client sends each request with RoundTrip and follows redirects itself,
+	// so every Location, however malformed, meets its checks.
 	Transport http.RoundTripper
 	// RedirectHosts are the hosts (host or host:port) a request may be
 	// redirected to besides the endpoint's own; DefaultRedirectHosts when
@@ -107,7 +108,7 @@ type Options struct {
 // Client is an anonymous Hub client.
 type Client struct {
 	base          *url.URL
-	hc            *http.Client
+	rt            http.RoundTripper
 	redirectHosts []string
 	userAgent     string
 }
@@ -156,11 +157,8 @@ func NewClient(o Options) (*Client, error) {
 		ua = "k3sm"
 	}
 	return &Client{
-		base: base,
-		hc: &http.Client{
-			Transport:     t,
-			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-		},
+		base:          base,
+		rt:            t,
 		redirectHosts: slices.Clone(hosts),
 		userAgent:     ua,
 	}, nil
@@ -213,9 +211,9 @@ func (c *Client) get(ctx context.Context, u *url.URL, header http.Header) (*http
 			req.Header[k] = slices.Clone(v)
 		}
 		req.Header.Set("User-Agent", c.userAgent)
-		resp, err := c.hc.Do(req)
+		resp, err := c.rt.RoundTrip(req)
 		if err != nil {
-			return nil, first, err
+			return nil, first, fmt.Errorf("GET %s: %w", u.Redacted(), err)
 		}
 		switch resp.StatusCode {
 		case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
@@ -232,10 +230,10 @@ func (c *Client) get(ctx context.Context, u *url.URL, header http.Header) (*http
 		}
 		next, err := u.Parse(loc)
 		if err != nil || loc == "" {
-			return nil, first, fmt.Errorf("%s: redirect to %q: %w", u.Redacted(), loc, ErrRedirectRefused)
+			return nil, first, fmt.Errorf("%s: redirect to %q: %w", u.Redacted(), cleanMessage(loc), ErrRedirectRefused)
 		}
 		if !c.redirectAllowed(next) {
-			return nil, first, fmt.Errorf("%s: redirect to %s://%s, which is neither https on the Hub nor a listed CDN host: %w", u.Redacted(), next.Scheme, next.Host, ErrRedirectRefused)
+			return nil, first, fmt.Errorf("%s: redirect to %q, which is neither https on the Hub nor a listed CDN host: %w", u.Redacted(), cleanMessage(next.Scheme+"://"+next.Host), ErrRedirectRefused)
 		}
 		u = next
 	}

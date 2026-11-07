@@ -210,9 +210,10 @@ func (h *fakeHub) serveAPI(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("X-Linked-Size", strconv.Itoa(len(f.data)))
 				to := "https://" + cdnHost + "/blobs/" + sum
 				if h.redirectTo != "" {
-					to = h.redirectTo
+					to = h.redirectTo // sent verbatim, hostile bytes and all
 				}
-				http.Redirect(w, r, to, http.StatusFound)
+				w.Header().Set("Location", to)
+				w.WriteHeader(http.StatusFound)
 				return
 			}
 			w.Header().Set("ETag", `"`+gitBlobID(f.data)+`"`)

@@ -54,7 +54,7 @@ func TestDownloadResumesWithRange(t *testing.T) {
 // host that is neither the Hub nor a listed CDN host, is refused and not
 // retried.
 func TestDownloadRefusesRedirectOffTheHub(t *testing.T) {
-	for _, to := range []string{"http://127.0.0.1:1/blobs/x", "https://attacker.example/blobs/x"} {
+	for _, to := range []string{"http://127.0.0.1:1/blobs/x", "https://attacker.example/blobs/x", "https://attacker.example/\x1b]0;owned\x07x", "ht\x1btp://attacker.example/x"} {
 		t.Run(to, func(t *testing.T) {
 			hub := newFakeHub(t)
 			hub.addCommit("main", commitA, tinyModel("a")...)
@@ -62,6 +62,11 @@ func TestDownloadRefusesRedirectOffTheHub(t *testing.T) {
 			_, err := hub.client(t).Import(testContext(t), mustRef(t, "hf://acme/tiny-model"), ImportOptions{ScratchDir: t.TempDir()})
 			if !errors.Is(err, ErrRedirectRefused) {
 				t.Fatalf("Import = %v, want ErrRedirectRefused", err)
+			}
+			for _, c := range err.Error() {
+				if c < 0x20 || c == 0x7f {
+					t.Fatalf("refusal %q carries a control byte from the redirect target", err)
+				}
 			}
 		})
 	}
