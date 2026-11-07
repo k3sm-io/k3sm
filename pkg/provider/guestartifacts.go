@@ -22,8 +22,10 @@ import (
 	"path/filepath"
 	"time"
 
+	"k3sm.io/runtimed/pkg/artifact"
 	"k3sm.io/runtimed/pkg/guestartifacts"
 	"k3sm.io/runtimed/pkg/image"
+	runtimed "k3sm.io/runtimed/pkg/runtime"
 	"k3sm.io/runtimed/pkg/sandbox"
 )
 
@@ -44,8 +46,8 @@ const GuestArtifactsSubdir = guestartifacts.GuestArtifactsSubdir
 // runtime.New does.
 //
 // The resolution is DUPLICATED here rather than read back off a constructed
-// runtime for one reason: ensure runs BEFORE the runtime exists (its result is a
-// construction input), so there is no runtime to ask. Keeping the fallback
+// runtime for one reason: the release-host ensure runs BEFORE the runtime exists
+// (its result is a construction input), so there is no runtime to ask. Keeping the fallback
 // spelled as image.DefaultRoot — the same constant runtime.New defaults to — is
 // what stops a daemon started with no --pod-root from caching artifacts in one
 // tree while its runtime reads another.
@@ -91,6 +93,11 @@ type GuestArtifactSource struct {
 	// Timeout bounds the WHOLE ensure — pin lookup, both fetches, both digest
 	// passes. Zero or negative selects guestartifacts.DefaultFetchTimeout.
 	Timeout time.Duration
+	// Store is the cluster store the worker-side ensure (ensureFromStore) pulls
+	// from. nil selects the in-process runtime's own (Runtime.GuestClusterStore),
+	// which pulls through the node's artifact puller and blob cache. The
+	// release-host Ensure never reads it.
+	Store guestartifacts.ClusterStore
 }
 
 // Ensure materialises this node's pinned guest boot artifacts under root and
@@ -144,6 +151,68 @@ func (s GuestArtifactSource) Ensure(ctx context.Context, root string, log *slog.
 	}
 	log.Info("guest boot artifacts verified",
 		"dir", dir, "guest_kernel", guestartifacts.ActiveGuestKernel,
+		"kernel", art.KernelPath, "initramfs", art.InitramfsPath)
+	return EnsuredGuestArtifacts{Pin: pin, Artifacts: art}, true
+}
+
+// guestStoreRuntime is the slice of the in-process runtime the worker-side
+// ensure needs: the cluster store to fetch from, and the late install into the
+// vm backend. *runtimed.Runtime satisfies it.
+type guestStoreRuntime interface {
+	GuestClusterStore(cred *image.RegistryCredential) *artifact.GuestStore
+	RefreshGuestArtifacts(pin guestartifacts.GuestKernelPin, art sandbox.GuestArtifacts) error
+}
+
+var _ guestStoreRuntime = (*runtimed.Runtime)(nil)
+
+// ensureFromStore is Ensure for a worker: it materialises the pinned guest boot
+// artifacts from the cluster registry at registryHost, never from the release
+// host, and installs them into rt's vm backend.
+//
+// It runs AFTER the runtime is built, because the store is the runtime's own
+// (its artifact puller, its blob cache and index), so the vm backend starts
+// without a locator and RefreshGuestArtifacts gives it one. The caller contract
+// is Ensure's: it never returns an error, and false means the vm capability is
+// off on this node while every native pod still runs. A set that ensured but
+// that the backend refused is reported false as well, because the capability
+// must mirror exactly what CreateVM can boot.
+//
+// The store pulls with no credential: the cluster registry serves reads
+// anonymously, exactly as it does for this node's image pulls.
+func (s GuestArtifactSource) ensureFromStore(ctx context.Context, root, registryHost string, rt guestStoreRuntime, log *slog.Logger) (EnsuredGuestArtifacts, bool) {
+	if log == nil {
+		log = slog.Default()
+	}
+	var zero EnsuredGuestArtifacts
+
+	pin, err := s.pin()
+	if err != nil {
+		log.Info("guest boot artifacts unavailable: no usable pin, so this node advertises no vm-artifact capability and every vm pod will fail closed",
+			"guest_kernel", guestartifacts.ActiveGuestKernel, "err", err)
+		return zero, false
+	}
+
+	store := s.Store
+	if store == nil {
+		store = rt.GuestClusterStore(nil)
+	}
+	dir := GuestArtifactsDir(root)
+	ctx, cancel := context.WithTimeout(ctx, s.timeout())
+	defer cancel()
+
+	art, err := guestartifacts.EnsureGuestArtifactsFromStore(ctx, dir, guestartifacts.ActiveGuestKernel, pin, registryHost, store)
+	if err != nil {
+		log.Warn("guest boot artifacts could not be ensured from the cluster store; the vm capability is OFF on this node (native pods are unaffected, vm pods fail closed)",
+			"dir", dir, "registry", registryHost, "guest_kernel", guestartifacts.ActiveGuestKernel, "err", err)
+		return zero, false
+	}
+	if err := rt.RefreshGuestArtifacts(pin, art); err != nil {
+		log.Warn("guest boot artifacts were ensured from the cluster store but the vm backend did not take them; the vm capability is OFF on this node (native pods are unaffected, vm pods fail closed)",
+			"dir", dir, "registry", registryHost, "guest_kernel", guestartifacts.ActiveGuestKernel, "err", err)
+		return zero, false
+	}
+	log.Info("guest boot artifacts verified from the cluster store",
+		"dir", dir, "registry", registryHost, "guest_kernel", guestartifacts.ActiveGuestKernel,
 		"kernel", art.KernelPath, "initramfs", art.InitramfsPath)
 	return EnsuredGuestArtifacts{Pin: pin, Artifacts: art}, true
 }
