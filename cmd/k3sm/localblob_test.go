@@ -19,14 +19,17 @@ package main
 import (
 	"log/slog"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"k8s.io/client-go/rest"
 
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/certs"
+	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/hostnet"
 	"k3sm.io/k3sm/pkg/registrysvc"
+	"k3sm.io/runtimed/pkg/sandbox"
 )
 
 // TestRegistryStoreRootReachesOnlyTheServerRuntime pins the wiring through
@@ -67,5 +70,34 @@ func TestRegistryStoreRootReachesOnlyTheServerRuntime(t *testing.T) {
 	agent := agentNodeOptions(agentOptions{workDir: filepath.Join(t.TempDir(), "agent")}, join, "", hostnet.Mode{Backend: hostnet.BackendHelper}, nil)
 	if got := runtimedConfig(agent, nil).RegistryStoreRoot; got != "" {
 		t.Errorf("agent RegistryStoreRoot = %q, want empty", got)
+	}
+}
+
+// TestRegistryStoreSitsUnderDeniedServerTree pins the one control that keeps a
+// pod out of the registry store. In the shipped layout the registry child,
+// the runtime and native pods run as the same uid, so file modes do not; the
+// pod sandbox's deny on <runtime root>/server (sandbox.ServerSubdir, one of
+// sandbox.DaemonTreeSubdirs) does. The store must stay inside that tree for
+// the server work dirs k3sm picks itself: a move out of it goes red here.
+func TestRegistryStoreSitsUnderDeniedServerTree(t *testing.T) {
+	if !slices.Contains(sandbox.DaemonTreeSubdirs(), sandbox.ServerSubdir) {
+		t.Fatalf("sandbox.DaemonTreeSubdirs() = %v does not deny %q", sandbox.DaemonTreeSubdirs(), sandbox.ServerSubdir)
+	}
+	resolved, err := executor.ResolveWorkDir()
+	if err != nil {
+		t.Fatalf("ResolveWorkDir: %v", err)
+	}
+	for name, workDir := range map[string]string{
+		"root posture default": executor.DefaultWorkDir,
+		"this process":         resolved,
+	} {
+		t.Run(name, func(t *testing.T) {
+			store := registrysvc.StateDir(workDir)
+			denied := filepath.Join(executor.RuntimeRoot(workDir), sandbox.ServerSubdir)
+			rel, err := filepath.Rel(denied, store)
+			if err != nil || !filepath.IsLocal(rel) {
+				t.Fatalf("registry store %s is not inside the denied server tree %s", store, denied)
+			}
+		})
 	}
 }

@@ -39,8 +39,14 @@ import (
 //
 // The store keeps one blob file per repository (shared by hard link when the
 // same digest is in several), so a digest is looked up in each repository in
-// name order and the first regular file found is returned. The cache trusts
-// none of it: it clones the descriptor and re-hashes its own clone.
+// name order and the first regular file found is returned.
+//
+// In the shipped layout the registry, the runtime that calls this and native
+// pods all run as the same uid, so file ownership protects nothing here. Two
+// other controls do. The clone's re-hash is the integrity control: the cache
+// trusts nothing this source returns, clones the descriptor, and commits only
+// a clone whose bytes hash to the digest. The pod sandbox's deny on the
+// server work dir, which holds the store, keeps pods out of the store.
 type LocalBlobSource struct {
 	root string
 	// resolved, when set, runs between resolving a blob's path and opening

@@ -26,6 +26,9 @@
 #   .9  pkg/install: the state tree creates the image cache's clone staging
 #       dir for the service user at 0700, which the runtime cannot create
 #       under the root-owned data root and refuses at any other mode.
+#   .10 cmd/k3sm: the registry store is inside <runtime root>/server, the
+#       tree the pod sandbox denies; with registry, runtime and pods on one
+#       uid, that deny is what keeps pods out of the store.
 #
 # Unit tests only, under -race: no cluster, no network, no privilege. A
 # listed test that does not exist yet is PENDING, not a pass. The runtimed
@@ -107,6 +110,7 @@ check() {
 	ladder "$(run "$K3SM_ROOT" ./pkg/provider/ TestServerRuntimedConfigCarriesLocalBlobSource TestAgentRuntimedConfigHasNoLocalBlobSource)" "$GATE.7  provider: the server config carries the source, an agent's does not"
 	ladder "$(run "$K3SM_ROOT" ./cmd/k3sm/ TestRegistryStoreRootReachesOnlyTheServerRuntime)" "$GATE.8  cmd/k3sm: the store root reaches only the server's runtime"
 	ladder "$(run "$K3SM_ROOT" ./pkg/install/ TestStateTreeCoversRuntimedTrees TestStateTreeRuntimeTreeModes)" "$GATE.9  install: the clone staging dir is a service-user 0700 state-tree row"
+	ladder "$(run "$K3SM_ROOT" ./cmd/k3sm/ TestRegistryStoreSitsUnderDeniedServerTree)" "$GATE.10 cmd/k3sm: the registry store sits under the pod-denied server tree"
 
 	echo "----------------------------------------"
 	echo "$GATE: $PASS passed, $FAIL failed, $PENDING pending"
