@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"quantization\":\"Q4_K_M\",\"paramSize\":\"8.03B\"}")

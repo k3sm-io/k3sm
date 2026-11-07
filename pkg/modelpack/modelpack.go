@@ -49,10 +49,6 @@ const (
 // manifest's layers, in order.
 const modelFSLayers = "layers"
 
-// maxConfigJSONBytes bounds the config.json read for the config's
-// quantization and paramSize. A model's config.json is a few KiB.
-const maxConfigJSONBytes = 1 << 20
-
 // Sentinel errors a caller can branch on with errors.Is. A path the
 // artifact/v1 rules refuse is reported with that package's sentinel.
 var (
@@ -66,8 +62,6 @@ var (
 	// ErrIncompleteSplit is a split weight set missing a split, or a split
 	// safetensors set missing its index.
 	ErrIncompleteSplit = errors.New("incomplete split weight set")
-	// ErrBadConfigJSON is a config.json that is not a bounded JSON object.
-	ErrBadConfigJSON = errors.New("config.json is not a JSON object of at most 1 MiB")
 	// ErrContentChanged is a file whose bytes no longer match the digest the
 	// manifest records for it.
 	ErrContentChanged = errors.New("file changed since the manifest was built")
@@ -150,12 +144,19 @@ func BuildFS(ctx context.Context, fsys fs.FS) (*Artifact, error) {
 	if err != nil {
 		return nil, err
 	}
-	fields := ConfigFields{Format: format}
+	fields := ConfigFields{}
 	if slices.Contains(paths, "config.json") {
-		if err := readModelConfig(fsys, &fields); err != nil {
+		f, err := openRegular(fsys, "config.json")
+		if err != nil {
+			return nil, err
+		}
+		fields, err = readModelConfig(f)
+		f.Close()
+		if err != nil {
 			return nil, err
 		}
 	}
+	fields.Format = format
 
 	a := &Artifact{fsys: fsys}
 	cfg := Config{Config: fields, ModelFS: ModelFS{Type: modelFSLayers, DiffIDs: []digest.Digest{}}}
@@ -306,52 +307,6 @@ func mediaTypeFor(p string) string {
 		}
 	}
 	return artifactv1.MediaTypeModelWeightConfig
-}
-
-// readModelConfig copies the quantization and parameter size from the
-// model's own config.json into fields: a string "quantization" (else the
-// Hugging Face quantization_config.quant_method) and a string "paramSize".
-func readModelConfig(fsys fs.FS, fields *ConfigFields) error {
-	f, err := fsys.Open("config.json")
-	if err != nil {
-		return fmt.Errorf("read config.json: %w", err)
-	}
-	defer f.Close()
-	b, err := io.ReadAll(io.LimitReader(f, maxConfigJSONBytes+1))
-	if err != nil {
-		return fmt.Errorf("read config.json: %w", err)
-	}
-	if len(b) > maxConfigJSONBytes {
-		return ErrBadConfigJSON
-	}
-	var raw struct {
-		Quantization       json.RawMessage `json:"quantization"`
-		QuantizationConfig json.RawMessage `json:"quantization_config"`
-		ParamSize          json.RawMessage `json:"paramSize"`
-	}
-	if err := json.Unmarshal(b, &raw); err != nil {
-		return fmt.Errorf("%w: %v", ErrBadConfigJSON, err)
-	}
-	fields.Quantization = jsonString(raw.Quantization)
-	if fields.Quantization == "" && len(raw.QuantizationConfig) > 0 {
-		var qc struct {
-			QuantMethod json.RawMessage `json:"quant_method"`
-		}
-		if json.Unmarshal(raw.QuantizationConfig, &qc) == nil {
-			fields.Quantization = jsonString(qc.QuantMethod)
-		}
-	}
-	fields.ParamSize = jsonString(raw.ParamSize)
-	return nil
-}
-
-// jsonString is raw decoded as a JSON string, or "" when it is not one.
-func jsonString(raw json.RawMessage) string {
-	var s string
-	if len(raw) == 0 || json.Unmarshal(raw, &s) != nil {
-		return ""
-	}
-	return s
 }
 
 // hashFile returns the digest and size of the regular file at p.
