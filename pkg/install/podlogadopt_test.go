@@ -283,7 +283,7 @@ func TestAgentInstallAdoptsThePodLogTree(t *testing.T) {
 			cfg := agentCfg(t)
 			cfg.TokenFile = ""
 			if tc.server {
-				cfg = Config{Role: RoleServer, BinarySource: "/tmp/k3sm", TargetUser: "alice"}
+				cfg = Config{Role: RoleServer, BinarySource: "/tmp/k3sm", TargetUser: "alice", InstallDir: testInstallDir(t)}
 			}
 			var log bytes.Buffer
 			cfg.Logger = testLogger(&log)

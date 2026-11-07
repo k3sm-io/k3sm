@@ -33,6 +33,7 @@ func testConfig(t *testing.T) Config {
 	t.Helper()
 	dir := t.TempDir()
 	return Config{
+		InstallDir:       testInstallDir(t),
 		BinarySource:     "/tmp/k3sm",
 		TargetUser:       "alice",
 		DataRoot:         filepath.Join(dir, "data"),

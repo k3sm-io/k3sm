@@ -328,7 +328,7 @@ func TestVerifyAgentJoinedIsScopedToAStagedToken(t *testing.T) {
 		name string
 		cfg  Config
 	}{
-		{"a server install has no agent to verify", installCfg().withDefaults()},
+		{"a server install has no agent to verify", installCfg(t).withDefaults()},
 		{"an agent install that staged no token asked for no join", func() Config {
 			c := agentCfg(t).withDefaults()
 			c.TokenFile = ""

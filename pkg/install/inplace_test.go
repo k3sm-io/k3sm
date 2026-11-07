@@ -27,8 +27,8 @@ import (
 // inPlaceRequest is the Config the root helper's argv describes: an install
 // from a staging directory naming no role, no join target, no token and no
 // user.
-func inPlaceRequest() Config {
-	return Config{BinarySource: "/tmp/k3sm"}
+func inPlaceRequest(t testing.TB) Config {
+	return Config{BinarySource: "/tmp/k3sm", InstallDir: testInstallDir(t)}
 }
 
 func installedArgs(t *testing.T, f *fakeSystem, label string) []string {
@@ -59,7 +59,7 @@ func TestResolveInPlace(t *testing.T) {
 		if err := Install(context.Background(), f, first); err != nil {
 			t.Fatalf("the first agent install: %v", err)
 		}
-		cfg, err := ResolveInPlace(f, inPlaceRequest(), nil)
+		cfg, err := ResolveInPlace(f, inPlaceRequest(t), nil)
 		if err != nil {
 			t.Fatalf("ResolveInPlace = %v", err)
 		}
@@ -70,7 +70,7 @@ func TestResolveInPlace(t *testing.T) {
 			t.Fatalf("the in-place agent install: %v", err)
 		}
 		inPlace := installedArgs(t, f, AgentLabel)
-		explicit := Config{Role: RoleAgent, JoinServer: first.JoinServer, BinarySource: "/tmp/k3sm", TargetUser: "alice"}
+		explicit := Config{Role: RoleAgent, JoinServer: first.JoinServer, BinarySource: "/tmp/k3sm", TargetUser: "alice", InstallDir: first.InstallDir}
 		if err := Install(context.Background(), f, explicit); err != nil {
 			t.Fatalf("the explicit agent reinstall: %v", err)
 		}
@@ -91,7 +91,7 @@ func TestResolveInPlace(t *testing.T) {
 		if err := Install(context.Background(), f, first); err != nil {
 			t.Fatalf("the first server install: %v", err)
 		}
-		req := inPlaceRequest()
+		req := inPlaceRequest(t)
 		req.DataRoot, req.ServerArgsRecord = first.DataRoot, first.ServerArgsRecord
 		var asked string
 		cfg, err := ResolveInPlace(f, req, func(p string) (string, error) { asked = p; return "alice", nil })
@@ -124,13 +124,13 @@ func TestResolveInPlace(t *testing.T) {
 	})
 
 	t.Run("nothing installed refuses", func(t *testing.T) {
-		if _, err := ResolveInPlace(newFakeSystem(t), inPlaceRequest(), nil); !errors.Is(err, ErrNothingToUpdate) {
+		if _, err := ResolveInPlace(newFakeSystem(t), inPlaceRequest(t), nil); !errors.Is(err, ErrNothingToUpdate) {
 			t.Fatalf("ResolveInPlace = %v, want ErrNothingToUpdate", err)
 		}
 	})
 
 	t.Run("nothing installed with --user is the app's first install, unchanged", func(t *testing.T) {
-		req := inPlaceRequest()
+		req := inPlaceRequest(t)
 		req.TargetUser = "alice"
 		cfg, err := ResolveInPlace(newFakeSystem(t), req, nil)
 		if err != nil || cfg.Role != RoleServer || cfg.TargetUser != "alice" {
@@ -141,7 +141,7 @@ func TestResolveInPlace(t *testing.T) {
 	t.Run("an agent without a node credential refuses", func(t *testing.T) {
 		f := newFakeSystem(t)
 		f.putFile(Config{}.withDefaults().plistPath(AgentLabel), AgentPlist(agentCfg(t).withDefaults()))
-		if _, err := ResolveInPlace(f, inPlaceRequest(), nil); err == nil || !strings.Contains(err.Error(), "node credential") {
+		if _, err := ResolveInPlace(f, inPlaceRequest(t), nil); err == nil || !strings.Contains(err.Error(), "node credential") {
 			t.Fatalf("ResolveInPlace = %v, want the missing credential named", err)
 		}
 	})
@@ -150,7 +150,7 @@ func TestResolveInPlace(t *testing.T) {
 		f := newFakeSystem(t)
 		cfg := testConfig(t)
 		configureServerArgs(f, cfg)
-		req := inPlaceRequest()
+		req := inPlaceRequest(t)
 		req.DataRoot, req.ServerArgsRecord = cfg.DataRoot, cfg.ServerArgsRecord
 		if _, err := ResolveInPlace(f, req, func(string) (string, error) { return "alice", nil }); err == nil || !strings.Contains(err.Error(), "--user") {
 			t.Fatalf("ResolveInPlace = %v, want a refusal naming --user", err)
@@ -161,7 +161,7 @@ func TestResolveInPlace(t *testing.T) {
 		f := newFakeSystem(t)
 		configureServerArgs(f, testConfig(t))
 		f.putFile(Config{}.withDefaults().plistPath(AgentLabel), AgentPlist(agentCfg(t).withDefaults()))
-		if _, err := ResolveInPlace(f, inPlaceRequest(), nil); err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		if _, err := ResolveInPlace(f, inPlaceRequest(t), nil); err == nil || !strings.Contains(err.Error(), "ambiguous") {
 			t.Fatalf("ResolveInPlace = %v, want the ambiguous role refused", err)
 		}
 	})
@@ -187,7 +187,7 @@ func TestUpdateReleaseBaseIsRecordedAndCarried(t *testing.T) {
 		if err := Install(context.Background(), f, second); err != nil {
 			t.Fatalf("second install: %v", err)
 		}
-		req := inPlaceRequest()
+		req := inPlaceRequest(t)
 		req.DataRoot, req.ServerArgsRecord = first.DataRoot, first.ServerArgsRecord
 		cfg, err := ResolveInPlace(f, req, func(string) (string, error) { return "alice", nil })
 		if err != nil {
@@ -210,7 +210,7 @@ func TestUpdateReleaseBaseIsRecordedAndCarried(t *testing.T) {
 		if err := Install(context.Background(), f, first); err != nil {
 			t.Fatalf("first agent install: %v", err)
 		}
-		cfg, err := ResolveInPlace(f, inPlaceRequest(), nil)
+		cfg, err := ResolveInPlace(f, inPlaceRequest(t), nil)
 		if err != nil {
 			t.Fatalf("ResolveInPlace = %v", err)
 		}

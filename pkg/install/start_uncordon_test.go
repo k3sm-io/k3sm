@@ -362,7 +362,7 @@ func TestUncordonPendingMarkerLifecycle(t *testing.T) {
 		if err := writeUncordonPending(f, cfg.withDefaults(), ActorUser, time.Now()); err != nil {
 			t.Fatal(err)
 		}
-		if err := Uninstall(ctx, f, Config{Logger: cfg.Logger}); err != nil {
+		if err := Uninstall(ctx, f, Config{Logger: cfg.Logger, InstallDir: cfg.InstallDir}); err != nil {
 			t.Fatalf("Uninstall: %v", err)
 		}
 		if uncordonPendingPresent(f, cfg.withDefaults()) {

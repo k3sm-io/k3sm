@@ -125,7 +125,7 @@ func TestInstallHonoursUserStop(t *testing.T) {
 		if err := Stop(ctx, f, cfg, ActorUser, "test"); err != nil {
 			t.Fatalf("Stop: %v", err)
 		}
-		if err := Uninstall(ctx, f, Config{Logger: cfg.Logger}); err != nil {
+		if err := Uninstall(ctx, f, Config{Logger: cfg.Logger, InstallDir: cfg.InstallDir}); err != nil {
 			t.Fatalf("Uninstall: %v", err)
 		}
 		for _, l := range []string{ServerLabel, NetdLabel} {
@@ -142,7 +142,7 @@ func TestInstallHonoursUserStop(t *testing.T) {
 		f, cfg, _ := stoppableNode(t)
 		f.disabled = map[string]bool{NetdLabel: true} // the operator's own disable
 		f.calls = nil
-		if err := Uninstall(ctx, f, Config{Logger: cfg.Logger}); err != nil {
+		if err := Uninstall(ctx, f, Config{Logger: cfg.Logger, InstallDir: cfg.InstallDir}); err != nil {
 			t.Fatalf("Uninstall: %v", err)
 		}
 		if got := enableOrBootstrap(f.calls); len(got) != 0 {

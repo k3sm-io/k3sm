@@ -78,7 +78,7 @@ func TestShadowSetIsMadeAtInstall(t *testing.T) {
 				missing[tc.missing] = true
 			}
 			var logs bytes.Buffer
-			cfg := serverCfg()
+			cfg := serverCfg(t)
 			cfg.Logger = slog.New(slog.NewTextHandler(&logs, nil))
 			if err := Install(context.Background(), f, cfg); err != nil {
 				t.Fatalf("Install: %v", err)
@@ -144,7 +144,7 @@ func TestShadowSetIsMadeAtInstall(t *testing.T) {
 func TestShadowSetSharesTheOneList(t *testing.T) {
 	shrinkRestartBudgets(t)
 	f := newFakeSystem(t)
-	cfg := serverCfg()
+	cfg := serverCfg(t)
 	cfg.Logger = slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
 	if err := Install(context.Background(), f, cfg); err != nil {
 		t.Fatalf("Install: %v", err)
@@ -180,7 +180,7 @@ func TestShadowCopyVerificationFailsTheInstall(t *testing.T) {
 	const dir = "/Library/k3sm.swap/shadow"
 	bad := fmt.Errorf("%w: signature carries entitlements", shadow.ErrUnsafeCopy)
 	f := (&fakeSystem{verifyErrs: map[string]error{dir + "/tar": bad}}).rootedIn(t)
-	cfg := serverCfg()
+	cfg := serverCfg(t)
 	cfg.Logger = slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
 	err := Install(context.Background(), f, cfg)
 	if !errors.Is(err, shadow.ErrUnsafeCopy) || !strings.Contains(err.Error(), "tar") || !strings.Contains(err.Error(), "entitlements") {
@@ -202,7 +202,7 @@ func TestShadowSetBudget(t *testing.T) {
 	shadowSetBudget = -1
 	t.Cleanup(func() { shadowSetBudget = prev })
 	f := newFakeSystem(t)
-	cfg := serverCfg()
+	cfg := serverCfg(t)
 	cfg.Logger = slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
 	err := Install(context.Background(), f, cfg)
 	if err == nil || !strings.Contains(err.Error(), "took longer than") {

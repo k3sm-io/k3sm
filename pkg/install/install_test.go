@@ -1869,7 +1869,7 @@ func TestLogDirIsNotWorldReadable(t *testing.T) {
 
 	t.Run("install ensures the log dir", func(t *testing.T) {
 		f := newFakeSystem(t)
-		if err := Install(context.Background(), f, Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"}); err != nil {
+		if err := Install(context.Background(), f, Config{InstallDir: testInstallDir(t), BinarySource: "/tmp/k3sm", TargetUser: "alice"}); err != nil {
 			t.Fatalf("Install: %v", err)
 		}
 		if !slices.Contains(f.calls, "EnsureLogDir:"+LogDir) {
@@ -1882,7 +1882,7 @@ func TestLogDirIsNotWorldReadable(t *testing.T) {
 // netd BEFORE server → write the admin kubeconfig to the HUMAN (not root).
 func TestInstallOrchestration(t *testing.T) {
 	f := newFakeSystem(t)
-	cfg := Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"}
+	cfg := Config{InstallDir: testInstallDir(t), BinarySource: "/tmp/k3sm", TargetUser: "alice"}
 	if err := Install(context.Background(), f, cfg); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
@@ -2194,7 +2194,7 @@ func TestEnsureServiceUserCreatesTheConfiguredDataRoot(t *testing.T) {
 				want = tc.dataRoot
 			}
 			f := newFakeSystem(t)
-			cfg := Config{BinarySource: "/tmp/k3sm", TargetUser: "alice", DataRoot: tc.dataRoot}
+			cfg := Config{InstallDir: testInstallDir(t), BinarySource: "/tmp/k3sm", TargetUser: "alice", DataRoot: tc.dataRoot}
 			if err := Install(context.Background(), f, cfg); err != nil {
 				t.Fatalf("Install: %v", err)
 			}
@@ -2232,7 +2232,7 @@ func TestEnsureServiceUserCreatesTheConfiguredDataRoot(t *testing.T) {
 // EXACT installedBinary() destination regardless of the artifact's name.
 func TestInstallBinaryLandsAtFixedPath(t *testing.T) {
 	f := newFakeSystem(t)
-	cfg := Config{BinarySource: "/tmp/build/k3sm-m2", TargetUser: "alice"}
+	cfg := Config{InstallDir: testInstallDir(t), BinarySource: "/tmp/build/k3sm-m2", TargetUser: "alice"}
 	if err := Install(context.Background(), f, cfg); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
@@ -2953,7 +2953,7 @@ func uninstallGaps(cfg Config, installCalls, uninstallCalls []string) []string {
 // off-manifest install line, the exact bug): forward coverage, bidirectional
 // no-over-broad-removal, the preserve set untouched, and idempotency.
 func TestUninstallManifestCoversInstall(t *testing.T) {
-	cfg := Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"}
+	cfg := Config{InstallDir: testInstallDir(t), BinarySource: "/tmp/k3sm", TargetUser: "alice"}
 	dc := cfg.withDefaults()
 
 	inst := newFakeSystem(t)
@@ -3141,7 +3141,7 @@ func TestUninstallManifestCoversInstall(t *testing.T) {
 // down after its target and torn down by identity before the InstallDir sweep
 // deletes what it points at.
 func TestInstallLinksK3smOntoPath(t *testing.T) {
-	cfg := Config{BinarySource: "/tmp/build/k3sm-m2", TargetUser: "alice"}
+	cfg := Config{InstallDir: testInstallDir(t), BinarySource: "/tmp/build/k3sm-m2", TargetUser: "alice"}
 	dc := cfg.withDefaults()
 
 	t.Run("the manifest carries exactly one launcher link", func(t *testing.T) {
@@ -3402,7 +3402,7 @@ func TestEnsureSymlinkNamesTheRemedyForAnUntrustedLinkDir(t *testing.T) {
 	t.Run("a refused launcher dir leaves nothing on disk", func(t *testing.T) {
 		f := newFakeSystem(t)
 		f.putLinkDirTrust("/usr/local/bin/k3sm", fmt.Errorf("refusing to link the k3sm launcher into /usr/local/bin: it is owned by uid 501, not root"))
-		err := Install(context.Background(), f, Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"})
+		err := Install(context.Background(), f, Config{InstallDir: testInstallDir(t), BinarySource: "/tmp/k3sm", TargetUser: "alice"})
 		if err == nil {
 			t.Fatal("Install accepted an untrusted launcher directory")
 		}
@@ -3422,7 +3422,7 @@ func TestEnsureSymlinkNamesTheRemedyForAnUntrustedLinkDir(t *testing.T) {
 	// reinstalled over — passes it and proceeds, twice.
 	t.Run("a healthy install records the read and proceeds", func(t *testing.T) {
 		f := newFakeSystem(t)
-		cfg := Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"}
+		cfg := Config{InstallDir: testInstallDir(t), BinarySource: "/tmp/k3sm", TargetUser: "alice"}
 		for _, run := range []string{"install", "reinstall"} {
 			before := len(f.calls)
 			if err := Install(context.Background(), f, cfg); err != nil {
@@ -3471,7 +3471,7 @@ func TestInstallRemovesTheLeftoverZot(t *testing.T) {
 	}{{"present", true}, {"absent", false}} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFakeSystem(t)
-			cfg := Config{BinarySource: "/tmp/build/k3sm", TargetUser: "alice"}
+			cfg := Config{InstallDir: testInstallDir(t), BinarySource: "/tmp/build/k3sm", TargetUser: "alice"}
 			bin := filepath.Join(cfg.withDefaults().serverWorkDir(), "bin")
 			if tc.present {
 				f.files = map[string][]byte{
@@ -3493,7 +3493,7 @@ func TestInstallRemovesTheLeftoverZot(t *testing.T) {
 		})
 	}
 	t.Run("an install that fails keeps it for the release it reverts to", func(t *testing.T) {
-		cfg := Config{BinarySource: "/tmp/build/k3sm", TargetUser: "alice"}
+		cfg := Config{InstallDir: testInstallDir(t), BinarySource: "/tmp/build/k3sm", TargetUser: "alice"}
 		f := (&fakeSystem{bootstrapAlways: map[string]error{"io.k3sm.server": errors.New("refused")}}).rootedIn(t)
 		if err := Install(context.Background(), f, cfg); err == nil {
 			t.Fatal("Install succeeded with the server refusing to bootstrap")
@@ -3503,7 +3503,7 @@ func TestInstallRemovesTheLeftoverZot(t *testing.T) {
 		}
 	})
 	t.Run("a failed removal does not fail the install", func(t *testing.T) {
-		cfg := Config{BinarySource: "/tmp/build/k3sm", TargetUser: "alice"}
+		cfg := Config{InstallDir: testInstallDir(t), BinarySource: "/tmp/build/k3sm", TargetUser: "alice"}
 		bin := filepath.Join(cfg.withDefaults().serverWorkDir(), "bin")
 		f := (&fakeSystem{removeEntryErrs: map[string]error{filepath.Join(bin, registrysvc.ZotBinaryName): errors.New("busy")}}).rootedIn(t)
 		if err := Install(context.Background(), f, cfg); err != nil {
@@ -3511,7 +3511,7 @@ func TestInstallRemovesTheLeftoverZot(t *testing.T) {
 		}
 	})
 	t.Run("a refused removal does not fail the install", func(t *testing.T) {
-		cfg := Config{BinarySource: "/tmp/build/k3sm", TargetUser: "alice"}
+		cfg := Config{InstallDir: testInstallDir(t), BinarySource: "/tmp/build/k3sm", TargetUser: "alice"}
 		work := cfg.withDefaults().serverWorkDir()
 		bin := filepath.Join(work, "bin")
 		zot := filepath.Join(bin, registrysvc.ZotBinaryName)
@@ -3543,7 +3543,7 @@ func TestInstallStagesTheHelmMarker(t *testing.T) {
 		t.Fatal(err)
 	}
 	f := newFakeSystem(t)
-	cfg := Config{BinarySource: "/tmp/build/k3sm", TargetUser: "alice", PayloadSource: payload}
+	cfg := Config{InstallDir: testInstallDir(t), BinarySource: "/tmp/build/k3sm", TargetUser: "alice", PayloadSource: payload}
 	if err := Install(context.Background(), f, cfg); err != nil {
 		t.Fatalf("Install: %v", err)
 	}

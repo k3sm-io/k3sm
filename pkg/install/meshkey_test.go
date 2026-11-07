@@ -55,8 +55,9 @@ func wantCall(t *testing.T, f *fakeSystem, call string) {
 
 // serverCfg is the control-plane Config the role half of this gate installs —
 // agentCfg's sibling, with nothing about joining.
-func serverCfg() Config {
+func serverCfg(t testing.TB) Config {
 	return Config{
+		InstallDir:   testInstallDir(t),
 		Role:         RoleServer,
 		BinarySource: "/tmp/k3sm",
 		TargetUser:   "alice",
@@ -225,7 +226,7 @@ func TestAgentInstallProvisionsTheMeshHelperKey(t *testing.T) {
 	t.Run("the server role provisions its own ref the same way", func(t *testing.T) {
 		shrinkRestartBudgets(t)
 		f := newFakeSystem(t)
-		if err := Install(context.Background(), f, serverCfg()); err != nil {
+		if err := Install(context.Background(), f, serverCfg(t)); err != nil {
 			t.Fatalf("Install: %v", err)
 		}
 		work, ok := f.files[serverWork]

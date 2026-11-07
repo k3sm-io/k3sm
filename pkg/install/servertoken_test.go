@@ -55,7 +55,7 @@ func legacyServerPlist(cfg Config, token string) []byte {
 // service user, which is the same shape the agent role already used for its
 // join token.
 func TestServerPlistCarriesNoToken(t *testing.T) {
-	cfg := Config{BinarySource: "/tmp/k3sm", TargetUser: "alice", AdminToken: theAdminToken}
+	cfg := Config{InstallDir: testInstallDir(t), BinarySource: "/tmp/k3sm", TargetUser: "alice", AdminToken: theAdminToken}
 	dc := cfg.withDefaults()
 
 	t.Run("the render names the staged path and carries no token value", func(t *testing.T) {

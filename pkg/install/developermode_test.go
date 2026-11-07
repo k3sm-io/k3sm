@@ -269,7 +269,7 @@ func TestDeveloperModeMarkerOnInstall(t *testing.T) {
 				}
 			}
 			var logs strings.Builder
-			cfg := Config{BinarySource: src, TargetUser: "alice", Logger: slog.New(slog.NewTextHandler(&logs, nil))}
+			cfg := Config{InstallDir: testInstallDir(t), BinarySource: src, TargetUser: "alice", Logger: slog.New(slog.NewTextHandler(&logs, nil))}
 			cfg.DeveloperMode = tc.mode
 			cfg.Signer = tc.signer
 			err := Install(context.Background(), f, cfg)
@@ -336,7 +336,7 @@ func TestDeveloperModeMarkerOnInstall(t *testing.T) {
 	t.Run("a plain install with no flag and no Signer never looks at the marker", func(t *testing.T) {
 		t.Parallel()
 		f := newFakeSystem(t)
-		if err := Install(context.Background(), f, Config{BinarySource: src, TargetUser: "alice"}); err != nil {
+		if err := Install(context.Background(), f, Config{InstallDir: testInstallDir(t), BinarySource: src, TargetUser: "alice"}); err != nil {
 			t.Fatal(err)
 		}
 		for _, c := range f.calls {
@@ -349,7 +349,7 @@ func TestDeveloperModeMarkerOnInstall(t *testing.T) {
 	t.Run("an unknown mode is refused before any system call", func(t *testing.T) {
 		t.Parallel()
 		f := newFakeSystem(t)
-		cfg := Config{BinarySource: src, TargetUser: "alice"}
+		cfg := Config{InstallDir: testInstallDir(t), BinarySource: src, TargetUser: "alice"}
 		cfg.DeveloperMode = "maybe"
 		if err := Install(context.Background(), f, cfg); err == nil {
 			t.Fatal("Install accepted DeveloperMode \"maybe\"")
@@ -443,7 +443,7 @@ func TestDeveloperModeClearedByAnyDeveloperIDTeam(t *testing.T) {
 			f.putFile(DeveloperModeMarkerPath, []byte("developer mode enabled by k3sm install on 2026-10-31T00:00:00Z\n"))
 			requireMarkerOn(t, f)
 			var logs strings.Builder
-			cfg := Config{BinarySource: src, TargetUser: "alice", Logger: slog.New(slog.NewTextHandler(&logs, nil))}
+			cfg := Config{InstallDir: testInstallDir(t), BinarySource: src, TargetUser: "alice", Logger: slog.New(slog.NewTextHandler(&logs, nil))}
 			cfg.Signer = tc.signer
 			if err := Install(context.Background(), f, cfg); err != nil {
 				t.Fatalf("Install = %v", err)
@@ -490,7 +490,7 @@ func TestDeveloperModeKeptWhenDeveloperIDVerificationFails(t *testing.T) {
 			f.putFile(DeveloperModeMarkerPath, []byte("developer mode enabled by k3sm install on 2026-10-31T00:00:00Z\n"))
 			requireMarkerOn(t, f)
 			var logs strings.Builder
-			cfg := Config{BinarySource: src, TargetUser: "alice", Logger: slog.New(slog.NewTextHandler(&logs, nil))}
+			cfg := Config{InstallDir: testInstallDir(t), BinarySource: src, TargetUser: "alice", Logger: slog.New(slog.NewTextHandler(&logs, nil))}
 			cfg.Signer = tc.signer
 			if err := Install(context.Background(), f, cfg); err != nil {
 				t.Fatalf("Install = %v", err)

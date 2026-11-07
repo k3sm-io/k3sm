@@ -59,6 +59,7 @@ func stoppableNode(t *testing.T) (*fakeSystem, Config, *bytes.Buffer) {
 	f.now = func() time.Time { return pinned }
 	var logs bytes.Buffer
 	cfg := Config{
+		InstallDir:   testInstallDir(t),
 		BinarySource: "/tmp/k3sm", TargetUser: "alice",
 		Logger: slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	}
@@ -69,7 +70,7 @@ func stoppableNode(t *testing.T) (*fakeSystem, Config, *bytes.Buffer) {
 	f.podReap = []runtimed.PodReapRecord{{PodID: "web", Container: "app", Pgid: stopTestPodPgid, StartUnixNano: 11}}
 	f.podLeaders = map[int]int64{stopTestPodPgid: 11, stopTestVMPgid: 22}
 	f.life.vmhosts = []VMHostRecord{{Schema: 1, PodID: "linux", Pgid: stopTestVMPgid, StartUnixNano: 22, StopGraceNanos: int64(stopTestVMGrace)}}
-	f.life.procs = map[int]fakeProc{stopTestVMPgid: {exe: DefaultInstallDir + "/" + VMHostName, uid: fakeServiceUID}}
+	f.life.procs = map[int]fakeProc{stopTestVMPgid: {exe: cfg.InstallDir + "/" + VMHostName, uid: fakeServiceUID}}
 	f.putFile(netdsvc.NodeIdentityPath(MeshKeyDir), []byte("100.64.3.0/24\n"))
 	cfg.MarkNode = func(_ context.Context, stopped bool, actor, _ string) error {
 		f.calls = append(f.calls, fmt.Sprintf("MarkNode:%t:%s", stopped, actor))
@@ -217,9 +218,12 @@ func TestStopTearsDownPodsAndKeepsPlists(t *testing.T) {
 	t.Run("a forged vm record is never signalled", func(t *testing.T) {
 		for name, proc := range map[string]fakeProc{
 			"wrong executable": {exe: "/usr/sbin/sshd", uid: fakeServiceUID},
-			"wrong uid":        {exe: DefaultInstallDir + "/" + VMHostName, uid: 0},
+			"wrong uid":        {uid: 0}, // the real helper path, filled in below
 		} {
 			f, cfg, _ := stoppableNode(t)
+			if proc.exe == "" {
+				proc.exe = cfg.InstallDir + "/" + VMHostName
+			}
 			f.life.procs[stopTestVMPgid] = proc
 			err := Stop(ctx, f, cfg, ActorUser, "test")
 			var serr *StopIncompleteError
@@ -318,7 +322,7 @@ func TestStopTearsDownPodsAndKeepsPlists(t *testing.T) {
 		{"a vm record names another executable", LeftoverVMHelpers,
 			func(f *fakeSystem) { f.life.procs[stopTestVMPgid] = fakeProc{exe: "/usr/sbin/sshd", uid: 0} },
 			func(f *fakeSystem) {
-				f.life.procs[stopTestVMPgid] = fakeProc{exe: DefaultInstallDir + "/" + VMHostName, uid: fakeServiceUID}
+				f.life.procs[stopTestVMPgid] = fakeProc{exe: f.installDir() + "/" + VMHostName, uid: fakeServiceUID}
 			}},
 		{"a vm record is untrusted", LeftoverVMHelpers,
 			func(f *fakeSystem) { f.life.vmRejected = []string{"666.json"} },

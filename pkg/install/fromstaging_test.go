@@ -901,18 +901,25 @@ func TestSwapDirIsNotTheStagingRoot(t *testing.T) {
 		t.Errorf("stagedBinary = %s, want /Library/k3sm.swap/k3sm", got)
 	}
 	// A tree an older build left at the old swap name is not touched by an
-	// install: prepareStagingDir judges and empties only the swap dir.
+	// install: prepareStagingDir judges and empties only the swap dir. The
+	// same layout is rebuilt under the test's temp root, because the fake
+	// really creates the swap dir.
+	root := testRoot(t)
+	rooted := Config{
+		InstallDir:     installDirUnder(root),
+		StagingOptions: StagingOptions{StagingRoot: filepath.Join(root, "Library", "k3sm.staging")},
+	}.withDefaults()
 	f := newFakeSystem(t)
-	f.putOwned(DefaultStagingRoot, 0, 0, fs.ModeDir|0o755, EntryDir)
-	if err := prepareStagingDir(f, cfg); err != nil {
+	f.putOwned(rooted.stagingRoot(), 0, 0, fs.ModeDir|0o755, EntryDir)
+	if err := prepareStagingDir(f, rooted); err != nil {
 		t.Fatalf("prepareStagingDir: %v", err)
 	}
 	for _, c := range f.calls {
-		if strings.Contains(c, DefaultStagingRoot) {
+		if strings.Contains(c, rooted.stagingRoot()) {
 			t.Errorf("an install touched the staging root: %s", c)
 		}
 	}
-	if !slices.Contains(f.calls, "EnsureRootDir:/Library/k3sm.swap") {
+	if !slices.Contains(f.calls, "EnsureRootDir:"+rooted.swapDir()) {
 		t.Errorf("the swap dir was not prepared: %v", f.calls)
 	}
 }

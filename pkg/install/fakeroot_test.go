@@ -40,7 +40,12 @@ import (
 // fakeFSGuard is the root a fake's real-filesystem seams are confined to, and
 // the violations they were refused for.
 type fakeFSGuard struct {
-	root       string
+	root string
+	// test is the name of the test the fake was rooted in. A path under the
+	// root of that test's parent (or any ancestor) is also inside: a test
+	// that builds one config and runs it in several subtests hands each
+	// subtest's fake the parent's install root.
+	test       string
 	mu         sync.Mutex
 	violations []string
 }
@@ -53,6 +58,9 @@ var errOutsideFakeRoot = errors.New("outside the test's temp root")
 // built.
 var testRoots sync.Map // testing.TB -> string
 
+// testRootsByName is testRoots keyed by test name, for the ancestor lookup.
+var testRootsByName sync.Map // string -> string
+
 // testRoot is this test's scratch system root: one t.TempDir(), the same string
 // on every call within the test. A test builds every system path it hands the
 // installer under it.
@@ -63,9 +71,27 @@ func testRoot(t testing.TB) string {
 	}
 	r := t.TempDir()
 	testRoots.Store(t, r)
-	t.Cleanup(func() { testRoots.Delete(t) })
+	testRootsByName.Store(t.Name(), r)
+	t.Cleanup(func() {
+		testRoots.Delete(t)
+		testRootsByName.Delete(t.Name())
+	})
 	return r
 }
+
+// testInstallDir is this test's install root, under testRoot(t). Every config
+// a test installs with names it, so the staging tree the fake really creates
+// and removes (InstallDir + ".swap") stays inside the temp root.
+func testInstallDir(t testing.TB) string {
+	t.Helper()
+	return installDirUnder(testRoot(t))
+}
+
+func installDirUnder(root string) string { return filepath.Join(root, "Library", "k3sm") }
+
+// installDir is the testInstallDir of the test f is rooted in, for a closure
+// that holds the fake but not the test.
+func (f *fakeSystem) installDir() string { return installDirUnder(f.fsGuard.root) }
 
 // newFakeSystem is a fakeSystem whose real-filesystem seams are confined to
 // testRoot(t).
@@ -79,7 +105,7 @@ func newFakeSystem(t testing.TB) *fakeSystem {
 // fake built with fields can be rooted where it is built.
 func (f *fakeSystem) rootedIn(t testing.TB) *fakeSystem {
 	t.Helper()
-	g := &fakeFSGuard{root: filepath.Clean(testRoot(t))}
+	g := &fakeFSGuard{root: filepath.Clean(testRoot(t)), test: t.Name()}
 	f.fsGuard = g
 	t.Cleanup(func() {
 		g.mu.Lock()
@@ -101,8 +127,7 @@ func (f *fakeSystem) inFakeRoot(op string, paths ...string) error {
 		if g == nil {
 			panic(fmt.Sprintf("fakeSystem: %s(%s) would touch the real filesystem, and this fake has no root: build it with newFakeSystem(t)", op, p))
 		}
-		c := filepath.Clean(p)
-		if c == g.root || strings.HasPrefix(c, g.root+string(filepath.Separator)) {
+		if g.contains(filepath.Clean(p)) {
 			continue
 		}
 		msg := fmt.Sprintf("%s(%s) is outside the test root %s", op, p, g.root)
@@ -112,6 +137,27 @@ func (f *fakeSystem) inFakeRoot(op string, paths ...string) error {
 		return fmt.Errorf("%s: %w", msg, errOutsideFakeRoot)
 	}
 	return nil
+}
+
+// contains reports whether the cleaned path c is the root, or under it, of
+// the fake's test or one of that test's ancestors.
+func (g *fakeFSGuard) contains(c string) bool {
+	under := func(root string) bool {
+		return c == root || strings.HasPrefix(c, root+string(filepath.Separator))
+	}
+	if under(g.root) {
+		return true
+	}
+	for name := g.test; ; {
+		i := strings.LastIndex(name, "/")
+		if i < 0 {
+			return false
+		}
+		name = name[:i]
+		if r, ok := testRootsByName.Load(name); ok && under(filepath.Clean(r.(string))) {
+			return true
+		}
+	}
 }
 
 // TestFakeSystemRefusesPathsOutsideItsRoot pins the guard itself: a path in the
@@ -136,4 +182,21 @@ func TestFakeSystemRefusesPathsOutsideItsRoot(t *testing.T) {
 	if got := len(f.fsGuard.violations); got != 4 {
 		t.Errorf("recorded %d violations, want 4", got)
 	}
+}
+
+// TestFakeSystemAcceptsItsParentTestsRoot pins the one widening: a subtest's
+// fake may touch its parent test's root, and never a sibling subtest's.
+func TestFakeSystemAcceptsItsParentTestsRoot(t *testing.T) {
+	parent := testInstallDir(t)
+	var sibling string
+	t.Run("sibling", func(t *testing.T) { sibling = testInstallDir(t) })
+	t.Run("child", func(t *testing.T) {
+		f := &fakeSystem{fsGuard: &fakeFSGuard{root: filepath.Clean(testRoot(t)), test: t.Name()}}
+		if err := f.inFakeRoot("RemoveTree", parent+installSwapSuffix); err != nil {
+			t.Errorf("the parent test's root was refused: %v", err)
+		}
+		if err := f.inFakeRoot("RemoveTree", sibling+installSwapSuffix); !errors.Is(err, errOutsideFakeRoot) {
+			t.Errorf("a sibling subtest's root = %v, want errOutsideFakeRoot", err)
+		}
+	})
 }

@@ -50,7 +50,7 @@ func TestServerFileLimitDeploymentUX(t *testing.T) {
 		cfg   func(t *testing.T) Config
 		seed  func(t *testing.T, f *fakeSystem)
 	}{
-		{name: "server", label: ServerLabel, cfg: func(*testing.T) Config { return installCfg() }, seed: func(*testing.T, *fakeSystem) {}},
+		{name: "server", label: ServerLabel, cfg: func(*testing.T) Config { return installCfg(t) }, seed: func(*testing.T, *fakeSystem) {}},
 		{name: "agent", label: AgentLabel, cfg: agentCfg, seed: func(t *testing.T, f *fakeSystem) { seedJoinedAgent(t, f) }},
 	}
 	install := func(t *testing.T, f *fakeSystem, cfg Config, level slog.Level) string {
@@ -175,7 +175,7 @@ func TestServerFileLimitDeploymentUX(t *testing.T) {
 	// such an error, so the file-limit check is exercised directly: it must
 	// neither report a change nor fail.
 	t.Run("unreadable installed plist: no notice, no failure", func(t *testing.T) {
-		cfg := installCfg().withDefaults()
+		cfg := installCfg(t).withDefaults()
 		path := cfg.plistPath(ServerLabel)
 		f := (&fakeSystem{readErrs: map[string]error{path: errors.New("read: input/output error")}}).rootedIn(t)
 		var buf bytes.Buffer

@@ -77,8 +77,9 @@ func TestServerRollKeepsTheAdminCredentialValid(t *testing.T) {
 		return f, first, staged
 	}
 	inPlace := func(first Config) Config {
-		req := inPlaceRequest()
+		req := inPlaceRequest(t)
 		req.DataRoot, req.ServerArgsRecord = first.DataRoot, first.ServerArgsRecord
+		req.InstallDir = first.InstallDir
 		return req
 	}
 	alice := func(string) (string, error) { return "alice", nil }
@@ -201,8 +202,9 @@ func TestAdminTokenRotationLeavesAMarker(t *testing.T) {
 	}
 	update := func(t *testing.T, f *fakeSystem, first Config) Result {
 		t.Helper()
-		req := inPlaceRequest()
+		req := inPlaceRequest(t)
 		req.DataRoot, req.ServerArgsRecord = first.DataRoot, first.ServerArgsRecord
+		req.InstallDir = first.InstallDir
 		cfg, err := ResolveInPlace(f, req, alice)
 		if err != nil {
 			t.Fatalf("ResolveInPlace = %v", err)

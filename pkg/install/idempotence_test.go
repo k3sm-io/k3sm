@@ -54,7 +54,7 @@ func TestInstallEnsuresRunDir(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFakeSystem(t)
-			cfg := Config{BinarySource: "/tmp/k3sm", TargetUser: "alice", DataRoot: tc.dataRoot}
+			cfg := Config{InstallDir: testInstallDir(t), BinarySource: "/tmp/k3sm", TargetUser: "alice", DataRoot: tc.dataRoot}
 			if err := Install(context.Background(), f, cfg); err != nil {
 				t.Fatalf("Install: %v", err)
 			}
@@ -84,7 +84,7 @@ func TestInstallEnsuresRunDir(t *testing.T) {
 // implementation's no-op, not a case the orchestration has to know about.
 func TestReinstallRelinksIdempotently(t *testing.T) {
 	f := newFakeSystem(t)
-	cfg := Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"}
+	cfg := Config{InstallDir: testInstallDir(t), BinarySource: "/tmp/k3sm", TargetUser: "alice"}
 	for i := 1; i <= 2; i++ {
 		if err := Install(context.Background(), f, cfg); err != nil {
 			t.Fatalf("Install %d: %v", i, err)
@@ -189,7 +189,7 @@ func TestPreservedServerArgs(t *testing.T) {
 // trip rather than against a hand-written argv.
 func TestInstallPreservesServerArgsAcrossReinstall(t *testing.T) {
 	f := newFakeSystem(t)
-	cfg := Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"}
+	cfg := Config{InstallDir: testInstallDir(t), BinarySource: "/tmp/k3sm", TargetUser: "alice"}
 	plist := cfg.withDefaults().plistPath(ServerLabel)
 
 	// (1) FRESH: no plist on disk, so the render is exactly the stock template.
@@ -360,7 +360,7 @@ func TestAdminKubeconfigServerURL(t *testing.T) {
 // editing it afterwards — on a mesh and a single-node server alike.
 func TestInstallKubeconfigFollowsThePreservedMeshIP(t *testing.T) {
 	shrinkRestartBudgets(t)
-	cfg := Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"}
+	cfg := Config{InstallDir: testInstallDir(t), BinarySource: "/tmp/k3sm", TargetUser: "alice"}
 	dc := cfg.withDefaults()
 	caPath := certs.ClusterCACertPath(dc.serverWorkDir())
 	ca := []byte("-----BEGIN CERTIFICATE-----\nclusterca\n-----END CERTIFICATE-----\n")
@@ -409,7 +409,7 @@ func TestInstallKubeconfigFollowsThePreservedMeshIP(t *testing.T) {
 // never read.
 func TestAdminKubeconfigPinsServingCA(t *testing.T) {
 	shrinkRestartBudgets(t)
-	cfg := Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"}
+	cfg := Config{InstallDir: testInstallDir(t), BinarySource: "/tmp/k3sm", TargetUser: "alice"}
 	legacyPath := filepath.Join(executor.APIServerCertDir(cfg.withDefaults().serverWorkDir()), "apiserver.crt")
 	caPath := certs.ClusterCACertPath(cfg.withDefaults().serverWorkDir())
 

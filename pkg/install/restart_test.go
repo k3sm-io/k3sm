@@ -42,8 +42,8 @@ func reinstallFake(t testing.TB) *fakeSystem {
 	return f
 }
 
-func installCfg() Config {
-	return Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"}
+func installCfg(t testing.TB) Config {
+	return Config{BinarySource: "/tmp/k3sm", TargetUser: "alice", InstallDir: testInstallDir(t)}
 }
 
 func countCalls(f *fakeSystem, want string) int {
@@ -74,7 +74,7 @@ func TestInstallRetriesTransientBootstrapFailure(t *testing.T) {
 		f.putDrain(NetdLabel, 2)
 		f.putBootstrapErrs(NetdLabel, transientBootstrapErr())
 
-		if err := Install(context.Background(), f, installCfg()); err != nil {
+		if err := Install(context.Background(), f, installCfg(t)); err != nil {
 			t.Fatalf("Install must survive the bootout/bootstrap race: %v", err)
 		}
 		if n := countCalls(f, "Bootstrap:"+NetdLabel); n != 2 {
@@ -97,7 +97,7 @@ func TestInstallRetriesTransientBootstrapFailure(t *testing.T) {
 		f := reinstallFake(t)
 		f.putBootstrapAlways(NetdLabel, transientBootstrapErr())
 
-		err := Install(context.Background(), f, installCfg())
+		err := Install(context.Background(), f, installCfg(t))
 		if err == nil {
 			t.Fatal("Install must fail when launchd never accepts the bootstrap")
 		}
@@ -122,7 +122,7 @@ func TestInstallRetriesTransientBootstrapFailure(t *testing.T) {
 		f := reinstallFake(t)
 		f.putBootstrapAlways(NetdLabel, errors.New("Load failed: 5: Input/output erro")) // deliberately NOT the sentinel
 
-		if err := Install(context.Background(), f, installCfg()); err == nil {
+		if err := Install(context.Background(), f, installCfg(t)); err == nil {
 			t.Fatal("Install must fail on a bootstrap launchd will never accept")
 		}
 		// Two calls total: the ONE attempt (no retry — only ErrLaunchctlTransient is
@@ -145,7 +145,7 @@ func TestInstallReportsWhichDaemonIsDown(t *testing.T) {
 		f := reinstallFake(t)
 		f.putBootstrapAlways(ServerLabel, errors.New("Load failed: 122: Path had bad ownership/permissions"))
 
-		err := Install(context.Background(), f, installCfg())
+		err := Install(context.Background(), f, installCfg(t))
 		if err == nil {
 			t.Fatal("Install must fail when the server never bootstraps")
 		}
@@ -171,7 +171,7 @@ func TestInstallReportsWhichDaemonIsDown(t *testing.T) {
 		// rollback's attempt is the one that succeeds.)
 		f.putBootstrapErrs(ServerLabel, errors.New("Load failed: 122: Path had bad ownership/permissions"))
 
-		err := Install(context.Background(), f, installCfg())
+		err := Install(context.Background(), f, installCfg(t))
 		if err == nil {
 			t.Fatal("Install must fail when a daemon's bootstrap is rejected")
 		}
@@ -194,7 +194,7 @@ func TestInstallReportsWhichDaemonIsDown(t *testing.T) {
 		shrinkRestartBudgets(t)
 		f := newFakeSystem(t)
 		f.putLoaded(NetdLabel) // the server never came up
-		cfg := installCfg().withDefaults()
+		cfg := installCfg(t).withDefaults()
 		err := verifyDaemons(context.Background(), f, cfg, artifactManifest(cfg), bringUpWindow{startedAt: time.Now()})
 		if err == nil {
 			t.Fatal("verifyDaemons must fail when a daemon is down")
@@ -214,7 +214,7 @@ func TestInstallVerifiesDaemonsAfterRestart(t *testing.T) {
 	t.Run("a healthy pair verifies", func(t *testing.T) {
 		shrinkRestartBudgets(t)
 		f := reinstallFake(t)
-		if err := Install(context.Background(), f, installCfg()); err != nil {
+		if err := Install(context.Background(), f, installCfg(t)); err != nil {
 			t.Fatalf("Install: %v", err)
 		}
 		if countCalls(f, "PathExists:"+DefaultNetdSocket) == 0 {
@@ -227,7 +227,7 @@ func TestInstallVerifiesDaemonsAfterRestart(t *testing.T) {
 		f := reinstallFake(t)
 		f.putMissingPath(DefaultNetdSocket)
 
-		err := Install(context.Background(), f, installCfg())
+		err := Install(context.Background(), f, installCfg(t))
 		if err == nil {
 			t.Fatal("install must fail when netd never binds the helper socket the control plane dials")
 		}
@@ -324,7 +324,7 @@ func TestAgentRestartWaitsForTheNetdSocket(t *testing.T) {
 		cfg   func(t *testing.T) Config
 		label string
 	}{
-		{"the control plane", func(*testing.T) Config { return installCfg() }, ServerLabel},
+		{"the control plane", func(*testing.T) Config { return installCfg(t) }, ServerLabel},
 		{"a worker", func(t *testing.T) Config { return agentCfg(t) }, AgentLabel},
 	}
 

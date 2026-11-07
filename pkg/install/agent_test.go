@@ -38,6 +38,7 @@ import (
 func agentCfg(t *testing.T) Config {
 	t.Helper()
 	return Config{
+		InstallDir:       testInstallDir(t),
 		Role:             RoleAgent,
 		JoinServer:       "192.0.2.10",
 		NodeIP:           "100.64.0.7",
@@ -424,7 +425,7 @@ func TestInstallRendersAgentDaemonWhenJoining(t *testing.T) {
 		}{
 			{"agent over a server", ServerLabel, agentCfg, "server"},
 			{"server over an agent", AgentLabel, func(t *testing.T) Config {
-				return Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"}
+				return Config{InstallDir: testInstallDir(t), BinarySource: "/tmp/k3sm", TargetUser: "alice"}
 			}, "agent"},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
@@ -525,14 +526,14 @@ func TestInstallRendersAgentDaemonWhenJoining(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read the server plist golden: %v", err)
 		}
-		got := ServerPlist(Config{BinarySource: "/tmp/k3sm", TargetUser: "alice", AdminToken: "k3sm-fixed"})
+		got := ServerPlist(Config{InstallDir: testInstallDir(t), BinarySource: "/tmp/k3sm", TargetUser: "alice", AdminToken: "k3sm-fixed"})
 		if !bytes.Equal(got, want) {
 			t.Errorf("ServerPlist bytes moved:\n--- got ---\n%s\n--- want ---\n%s", got, want)
 		}
 
 		// And the server manifest still names the control plane, no agent entry.
 		var labels []string
-		for _, a := range artifactManifest(Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"}) {
+		for _, a := range artifactManifest(Config{InstallDir: testInstallDir(t), BinarySource: "/tmp/k3sm", TargetUser: "alice"}) {
 			if a.kind == kindDaemon {
 				labels = append(labels, a.label)
 			}

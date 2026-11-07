@@ -277,7 +277,7 @@ func TestAgentInstallPreflightsTheJoinEndpoint(t *testing.T) {
 	// a Mac with no network at all must still install.
 	t.Run("a server install runs no join preflight", func(t *testing.T) {
 		f := newFakeSystem(t)
-		if err := Install(context.Background(), f, Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"}); err != nil {
+		if err := Install(context.Background(), f, Config{InstallDir: testInstallDir(t), BinarySource: "/tmp/k3sm", TargetUser: "alice"}); err != nil {
 			t.Fatalf("Install: %v", err)
 		}
 		for _, c := range f.calls {
