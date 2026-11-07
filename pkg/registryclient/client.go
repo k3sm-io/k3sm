@@ -220,6 +220,11 @@ func ValidRepository(name string) bool {
 	return len(name) <= 255 && repositoryPattern.MatchString(name)
 }
 
+// ValidDigest reports whether d is a sha256 digest this client can verify.
+// A digest read from a manifest is checked with it before it is printed or
+// put in a URL path.
+func ValidDigest(d string) bool { return digestPattern.MatchString(d) }
+
 // ValidTag reports whether tag is a well-formed tag.
 func ValidTag(tag string) bool { return tagPattern.MatchString(tag) }
 
@@ -286,7 +291,7 @@ func (c *Client) Manifest(ctx context.Context, repository, reference string) (Ma
 		return Manifest{}, fmt.Errorf("manifest %s@%s hashes to %s: %w", repository, reference, digest, ErrDigestMismatch)
 	}
 	if reported := resp.Header.Get(contentDigestHeader); reported != "" && reported != digest {
-		return Manifest{}, fmt.Errorf("manifest %s:%s is reported as %s but hashes to %s: %w", repository, reference, reported, digest, ErrDigestMismatch)
+		return Manifest{}, fmt.Errorf("manifest %s:%s is reported as %q but hashes to %s: %w", repository, reference, reported, digest, ErrDigestMismatch)
 	}
 	var raw struct {
 		MediaType    string       `json:"mediaType"`
@@ -729,7 +734,7 @@ func (c *Client) do(ctx context.Context, method string, u *url.URL, accept strin
 	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
 		return nil, nil, ErrUnauthorized
 	case resp.StatusCode != http.StatusOK:
-		return nil, nil, fmt.Errorf("registry answered %s", resp.Status)
+		return nil, nil, fmt.Errorf("registry answered %q", resp.Status)
 	}
 	if method == http.MethodHead {
 		return resp, nil, nil
