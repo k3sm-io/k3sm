@@ -599,7 +599,10 @@ t1() {
 	ls2="$(rroot "$SERVER" "$STEP_TIMEOUT" "$REPO_LS" "$REG_ROOT" "models/$REPO")" || { bad "registry listing after the second push"; return 1; }
 	printf '%s\n' "$ls1" >"$EV/t.1.registry-before"
 	printf '%s\n' "$ls2" >"$EV/t.1.registry-after"
-	[ "$ls1" = "$ls2" ] || { bad "the second push changed the registry's blob files for models/$REPO (it wrote bytes)"; return 1; }
+	# Name, inode and size: the registry refreshes a blob's mtime on access to keep it inside
+	# the GC grace, so a changed mtime is not a write. A rewrite shows as a new inode or size.
+	[ "$(awk '{print $1, $2, $3}' <<<"$ls1")" = "$(awk '{print $1, $2, $3}' <<<"$ls2")" ] ||
+		{ bad "the second push changed the registry's blob files for models/$REPO (it wrote bytes)"; return 1; }
 	measure t1_digest "$DIGEST"
 	measure model_bytes "$MODEL_BYTES"
 }
