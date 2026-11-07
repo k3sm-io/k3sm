@@ -1365,21 +1365,54 @@ func ensureRootOwnedDir(dir string, mode fs.FileMode) error {
 // ensureDirOwnedBy is ensureRootOwnedDir with the owner taken explicitly, for
 // ensureLogDir's reason: an unprivileged test cannot chown to root, so without
 // the split a chown EPERM would mask whether the symlink guard ran at all.
+//
+// Owner and mode go through one descriptor opened with O_NOFOLLOW|O_DIRECTORY,
+// the shape ensureFileOwnedByVia uses for a file: MkdirAll is a no-op against a
+// path that already exists (a symlink included), and a check by lstat followed
+// by a chown/chmod by path leaves a window in which the directory can be swapped
+// for a symlink whose target root would then chmod. Bound to the descriptor, the
+// fchown and fchmod land on the inode the fstat checked, or nowhere.
 func ensureDirOwnedBy(dir string, uid, gid int, mode fs.FileMode) error {
 	if err := os.MkdirAll(dir, mode); err != nil {
 		return fmt.Errorf("create %s: %w", dir, err)
 	}
-	if err := refuseSymlinkAt(dir); err != nil {
-		return fmt.Errorf("%s: %w", dir, err)
+	afterDirCreate(dir)
+	fd, err := unix.Open(dir, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		if errors.Is(err, unix.ELOOP) || isSymlinkAt(dir) {
+			return fmt.Errorf("%s: %w", dir, errSymlinkRefused)
+		}
+		return fmt.Errorf("open %s: %w", dir, err)
 	}
-	if err := os.Lchown(dir, uid, gid); err != nil {
+	defer func() { _ = unix.Close(fd) }() // read-only descriptor; nothing to flush
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return fmt.Errorf("stat %s: %w", dir, err)
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFDIR {
+		return fmt.Errorf("%s: not a directory", dir)
+	}
+	if err := unix.Fchown(fd, uid, gid); err != nil {
 		return fmt.Errorf("chown %s to %d:%d: %w", dir, uid, gid, err)
 	}
-	// MkdirAll skips an existing directory, so the chmod is what repairs one.
-	if err := os.Chmod(dir, mode); err != nil {
+	// MkdirAll skips an existing directory, so the fchmod is what repairs one.
+	if err := unix.Fchmod(fd, uint32(mode.Perm())); err != nil {
 		return fmt.Errorf("chmod %s %#o: %w", dir, mode, err)
 	}
 	return nil
+}
+
+// afterDirCreate runs between ensureDirOwnedBy's MkdirAll and its open. It is a
+// no-op in production; a test sets it to swap the directory for a symlink in
+// exactly the window a path-based chmod would follow one through.
+var afterDirCreate = func(string) {}
+
+// isSymlinkAt reports whether path is itself a symlink. It only words an open
+// failure: whether O_NOFOLLOW|O_DIRECTORY refuses a symlink with ELOOP or
+// ENOTDIR, the refusal is the same, and the error should say so.
+func isSymlinkAt(path string) bool {
+	fi, err := os.Lstat(path)
+	return err == nil && fi.Mode()&fs.ModeSymlink != 0
 }
 
 // CopyTree copies src into dst with ditto(1), the same tool CopyToRootOwned
