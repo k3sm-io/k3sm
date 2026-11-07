@@ -94,7 +94,7 @@ grep -q 'Sleep: *sleepReporter' cmd/k3sm/node.go && grep -q 'sleepReporter.Run(c
 	echo "B1044: FAIL: cmd/k3sm/node.go does not run the sleep reporter"; exit 1; }
 
 if [ "${K3SM_LAB:-}" = 1 ]; then
-	: "${NODE:?K3SM_LAB=1 needs NODE=<this node's name>}"
+	: "${NODE:?K3SM_LAB=1 needs NODE=<the node name>}"
 	pmset -g assertions | grep 'PreventSystemSleep' | grep -q 'k3sm node: pods are scheduled on this Mac' || {
 		echo "B1044: FAIL: the joined node holds no PreventSystemSleep assertion"; exit 1; }
 	st="$(kubectl get node "$NODE" -o jsonpath='{.status.conditions[?(@.type=="Sleeping")].status}')"
