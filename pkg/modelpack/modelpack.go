@@ -111,8 +111,34 @@ type Artifact struct {
 	fsys fs.FS
 }
 
+// Option changes what Build and BuildFS write.
+type Option func(*buildOptions)
+
+type buildOptions struct {
+	annotations map[string]string
+}
+
+// WithSource records where the files came from on the manifest:
+// org.opencontainers.image.source is source and
+// org.opencontainers.image.revision is revision, each only when non-empty.
+// The annotations are part of the manifest, so the same files from the same
+// source and revision still make the same digest.
+func WithSource(source, revision string) Option {
+	return func(o *buildOptions) {
+		if o.annotations == nil {
+			o.annotations = map[string]string{}
+		}
+		if source != "" {
+			o.annotations[ispec.AnnotationSource] = source
+		}
+		if revision != "" {
+			o.annotations[ispec.AnnotationRevision] = revision
+		}
+	}
+}
+
 // Build builds the artifact for the model directory dir.
-func Build(ctx context.Context, dir string) (*Artifact, error) {
+func Build(ctx context.Context, dir string, opts ...Option) (*Artifact, error) {
 	st, err := os.Stat(dir)
 	if err != nil {
 		return nil, fmt.Errorf("model directory: %w", err)
@@ -120,7 +146,7 @@ func Build(ctx context.Context, dir string) (*Artifact, error) {
 	if !st.IsDir() {
 		return nil, fmt.Errorf("model directory %s is not a directory", dir)
 	}
-	a, err := BuildFS(ctx, os.DirFS(dir))
+	a, err := BuildFS(ctx, os.DirFS(dir), opts...)
 	if err != nil {
 		return nil, fmt.Errorf("model directory %s: %w", dir, err)
 	}
@@ -131,16 +157,17 @@ func Build(ctx context.Context, dir string) (*Artifact, error) {
 // the files, validates every path and the profile's rules on the names alone,
 // and only then reads: config.json for the config, and each file once to hash
 // it.
-func BuildFS(ctx context.Context, fsys fs.FS) (*Artifact, error) {
+func BuildFS(ctx context.Context, fsys fs.FS, opts ...Option) (*Artifact, error) {
+	var bo buildOptions
+	for _, o := range opts {
+		o(&bo)
+	}
 	paths, err := listFiles(fsys)
 	if err != nil {
 		return nil, err
 	}
-	if err := artifactv1.ValidatePathSet(paths); err != nil {
-		return nil, err
-	}
 	slices.Sort(paths)
-	format, err := checkProfile(paths)
+	format, err := CheckPaths(paths)
 	if err != nil {
 		return nil, err
 	}
@@ -192,6 +219,9 @@ func BuildFS(ctx context.Context, fsys fs.FS) (*Artifact, error) {
 		Config:       a.ConfigDescriptor,
 		Layers:       make([]ispec.Descriptor, 0, len(a.Layers)),
 	}
+	if len(bo.annotations) > 0 {
+		m.Annotations = bo.annotations
+	}
 	for _, l := range a.Layers {
 		m.Layers = append(m.Layers, l.Descriptor)
 	}
@@ -233,6 +263,18 @@ func listFiles(fsys fs.FS) ([]string, error) {
 		return nil, err
 	}
 	return paths, nil
+}
+
+// CheckPaths applies every rule a model's file names must pass, on the names
+// alone: the artifact/v1 path rules (so a code or pickle file is refused by
+// name) and the profile's (one weight format, every split set complete). It
+// returns the weight format. Build runs it before reading any file; a caller
+// that lists files from elsewhere runs it before fetching any.
+func CheckPaths(paths []string) (string, error) {
+	if err := artifactv1.ValidatePathSet(paths); err != nil {
+		return "", err
+	}
+	return checkProfile(paths)
 }
 
 // splitPattern matches a split weight file: <prefix>-<i>-of-<n>.<ext>, five
