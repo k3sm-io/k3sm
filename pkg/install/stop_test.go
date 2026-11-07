@@ -32,10 +32,13 @@ import (
 	"k3sm.io/runtimed/pkg/sandbox"
 )
 
-// The stop scenario every lifecycle test starts from: a server installed with a
-// NON-default Service CIDR (so a flush of the default range would be visibly
-// wrong), one recorded pod process group alive, one vm pod's k3sm-vmhost helper
-// alive (spawned with a 5s grace), and this node's cluster identity on disk.
+// The stop scenario every lifecycle test starts from: a server whose installed
+// netd plist records a NON-default Service CIDR (so a flush of the default range
+// would be visibly wrong), one recorded pod process group alive, one vm pod's
+// k3sm-vmhost helper alive (spawned with a 5s grace), and this node's cluster
+// identity on disk. Install now refuses that --service-cidr, so the fixture
+// installs with the default and rewrites the plist the way an earlier release,
+// which took the flag, left it: the teardown flush reads the plist, not cfg.
 const (
 	stopTestServiceCIDR = "10.96.0.0/16"
 	stopTestPodPgid     = 501
@@ -56,12 +59,13 @@ func stoppableNode(t *testing.T) (*fakeSystem, Config, *bytes.Buffer) {
 	f.now = func() time.Time { return pinned }
 	var logs bytes.Buffer
 	cfg := Config{
-		BinarySource: "/tmp/k3sm", TargetUser: "alice", ServiceCIDR: stopTestServiceCIDR,
+		BinarySource: "/tmp/k3sm", TargetUser: "alice",
 		Logger: slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	}
 	if err := Install(context.Background(), f, cfg); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
+	recordServiceCIDR(t, f, cfg, stopTestServiceCIDR)
 	f.podReap = []runtimed.PodReapRecord{{PodID: "web", Container: "app", Pgid: stopTestPodPgid, StartUnixNano: 11}}
 	f.podLeaders = map[int]int64{stopTestPodPgid: 11, stopTestVMPgid: 22}
 	f.life.vmhosts = []VMHostRecord{{Schema: 1, PodID: "linux", Pgid: stopTestVMPgid, StartUnixNano: 22, StopGraceNanos: int64(stopTestVMGrace)}}
@@ -77,6 +81,18 @@ func stoppableNode(t *testing.T) (*fakeSystem, Config, *bytes.Buffer) {
 	}
 	f.calls = nil
 	return f, cfg, &logs
+}
+
+// recordServiceCIDR rewrites the installed netd plist's --service-cidr to cidr,
+// the plist an earlier release that accepted a non-default flag wrote.
+func recordServiceCIDR(t *testing.T, f *fakeSystem, cfg Config, cidr string) {
+	t.Helper()
+	path := cfg.withDefaults().plistPath(NetdLabel)
+	from := []byte("<string>" + DefaultServiceCIDR + "</string>")
+	if !bytes.Contains(f.files[path], from) {
+		t.Fatalf("the installed netd plist %s carries no %s", path, from)
+	}
+	f.files[path] = bytes.ReplaceAll(f.files[path], from, []byte("<string>"+cidr+"</string>"))
 }
 
 // lifecycleCalls drops the read-only probes (launchd pid reads, file reads)

@@ -102,8 +102,10 @@ func TestInstallHonoursUserStop(t *testing.T) {
 		if err := Install(ctx, f, cfg); err != nil {
 			t.Fatalf("Install --start: %v", err)
 		}
+		// The start precondition flushes the range the reinstall just
+		// rendered into netd's plist: the default, the only one install takes.
 		before(t, f.calls,
-			"FlushLo0Aliases:100.64.0.0/10,"+stopTestServiceCIDR, // the start precondition
+			"FlushLo0Aliases:100.64.0.0/10,"+DefaultServiceCIDR,
 			"Enable:"+NetdLabel, "Bootstrap:"+NetdLabel,
 			"Enable:"+ServerLabel, "Bootstrap:"+ServerLabel,
 			"RemoveStopMarker", // only once the daemons are up

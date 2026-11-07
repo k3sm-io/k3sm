@@ -251,6 +251,10 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
 
 ### Fixed
 
+- `sudo k3sm install --service-cidr` refuses any range other than the default `10.43.0.0/16`, before it
+  changes anything. The flag only ever reached netd: the apiserver, the cluster DNS address and the serving
+  certificates always use `10.43.0.0/16`, so another value left netd and the apiserver disagreeing about
+  which addresses are Service IPs.
 - A Pod with an `image` volume no longer fails with `mkdir /var/lib/k3sm/artifacts: permission denied`.
   `k3sm install` now creates the runtime's artifact views and partial-download directories under the
   data root for the service user, and the directory that keeps the console of a failed vm boot. A

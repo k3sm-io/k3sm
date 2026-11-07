@@ -1247,7 +1247,7 @@ type Config struct {
 	LaunchDaemonDir string // /Library/LaunchDaemons
 	DataRoot        string // /var/lib/k3sm
 	NetdSocket      string // /var/lib/k3sm/run/netd.sock
-	ServiceCIDR     string // 10.43.0.0/16
+	ServiceCIDR     string // 10.43.0.0/16, the only value accepted (ValidateServiceCIDR)
 	APIServerPort   int    // 6444
 	// BinarySource is the k3sm binary to install (typically the running
 	// executable). Required.
@@ -1897,9 +1897,9 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 			return fmt.Errorf("install: %w", err)
 		}
 	}
-	// The HA request's own shape, from the Config alone: the same validator
-	// the CLI ran at parse time.
-	if err := ValidateHARequest(cfg); err != nil {
+	// The request's own shape, from the Config alone (validateShape): the
+	// same validators the CLI ran at parse time.
+	if err := validateShape(cfg); err != nil {
 		return fmt.Errorf("install: %w", err)
 	}
 	// An explicit --mesh-ip must name this server's own node pod range (see
