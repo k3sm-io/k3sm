@@ -250,3 +250,64 @@ func TestModelImportArgs(t *testing.T) {
 		t.Errorf("import to a foreign registry = %v, want a refusal that asks for a model name", err)
 	}
 }
+
+// TestModelPushVariant: `model push --variant` records the manifest in an OCI
+// image index at the tag through the push gate, a variant push over a tag that
+// names a plain manifest is refused naming the reason, and a bad variant is
+// refused at parse time.
+func TestModelPushVariant(t *testing.T) {
+	empty := t.TempDir()
+	t.Setenv("HOME", empty)
+	t.Setenv("DOCKER_CONFIG", empty)
+	t.Setenv(registryTokenEnv, "")
+
+	reg := registrytest.New()
+	reg.AcceptWrites = true
+	g := startGateRegistryWith(t, reg.Handler())
+	g.probe.require = "Basic " + base64.StdEncoding.EncodeToString([]byte(builderTokenUser+":"+fakeBuilderTokenToken))
+	clusterAPIFor(t, g)
+	workDir := asServer(t, g.port)
+
+	dir := t.TempDir()
+	for p, body := range map[string]string{"config.json": "{}", "model.safetensors": "weights"} {
+		if err := os.WriteFile(filepath.Join(dir, p), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	built, err := modelpack.Build(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := runModelCmd(t, []string{"push", "--work-dir", workDir, "--variant", "4bit", dir, "llama:v1"})
+	if err != nil {
+		t.Fatalf("model push --variant: %v", err)
+	}
+	if !strings.Contains(out, "variant 4bit") || !strings.Contains(out, built.Digest.String()) {
+		t.Errorf("push output = %q, want the variant and the digest %s", out, built.Digest)
+	}
+	rec := httptest.NewRecorder()
+	reg.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v2/models/llama/manifests/v1", nil))
+	if ct := rec.Header().Get("Content-Type"); ct != ispec.MediaTypeImageIndex {
+		t.Fatalf("tag Content-Type = %q, want %q", ct, ispec.MediaTypeImageIndex)
+	}
+	var idx ispec.Index
+	if err := json.Unmarshal(rec.Body.Bytes(), &idx); err != nil {
+		t.Fatal(err)
+	}
+	if len(idx.Manifests) != 1 || idx.Manifests[0].Digest != built.Digest || idx.Manifests[0].Annotations[modelpack.AnnotationVariant] != "4bit" {
+		t.Errorf("index = %+v, want one 4bit entry naming %s", idx.Manifests, built.Digest)
+	}
+
+	if _, err := runModelCmd(t, []string{"push", "--work-dir", workDir, dir, "llama:plain"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runModelCmd(t, []string{"push", "--work-dir", workDir, "--variant", "8bit", dir, "llama:plain"}); !errors.Is(err, modelpack.ErrTagIsManifest) {
+		t.Errorf("variant over a plain manifest: err = %v, want ErrTagIsManifest", err)
+	}
+	for _, bad := range []string{"4 bit", "a/b", strings.Repeat("x", 129)} {
+		if _, err := parseModelArgs([]string{"push", "--variant", bad, dir, "llama:v1"}, io.Discard); !errors.Is(err, modelpack.ErrInvalidVariant) {
+			t.Errorf("--variant %q: err = %v, want ErrInvalidVariant", bad, err)
+		}
+	}
+}

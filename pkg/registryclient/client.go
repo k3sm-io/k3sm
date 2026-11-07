@@ -165,6 +165,8 @@ type Descriptor struct {
 	Digest    string    `json:"digest"`
 	Size      int64     `json:"size"`
 	Platform  *Platform `json:"platform,omitempty"`
+	// Annotations are the descriptor's annotations, nil when it has none.
+	Annotations map[string]string `json:"annotations,omitempty"`
 }
 
 // Platform is an OCI platform.
@@ -197,6 +199,11 @@ type Manifest struct {
 	Config       *Descriptor
 	Layers       []Descriptor
 	Manifests    []Descriptor
+	// Raw is the body read, the bytes Digest names.
+	Raw []byte
+	// Served is the media type the registry's Content-Type named, "" when
+	// it named none or only application/json.
+	Served string
 }
 
 // IsIndex reports whether m is an image index (a manifest list).
@@ -274,6 +281,23 @@ func (c *Client) Tags(ctx context.Context, repository string) ([]string, error) 
 // must match the digest asked for (a digest reference) and the digest the
 // registry reported (Docker-Content-Digest), whichever are present.
 func (c *Client) Manifest(ctx context.Context, repository, reference string) (Manifest, error) {
+	return c.readManifest(ctx, repository, reference, 0)
+}
+
+// ErrIndexTooLarge is a body over ManifestIndexBounded's index limit that
+// was not served as a single manifest.
+var ErrIndexTooLarge = errors.New("index exceeds its size cap")
+
+// ManifestIndexBounded is Manifest with a tighter cap on an index: a body
+// over indexLimit bytes is refused with ErrIndexTooLarge, before it is
+// decoded, unless the registry served it as a single manifest (an OCI or
+// Docker image manifest), which keeps Manifest's own cap.
+func (c *Client) ManifestIndexBounded(ctx context.Context, repository, reference string, indexLimit int64) (Manifest, error) {
+	return c.readManifest(ctx, repository, reference, indexLimit)
+}
+
+// readManifest is Manifest; indexLimit > 0 is ManifestIndexBounded's cap.
+func (c *Client) readManifest(ctx context.Context, repository, reference string, indexLimit int64) (Manifest, error) {
 	if !ValidRepository(repository) {
 		return Manifest{}, fmt.Errorf("invalid repository name %q", repository)
 	}
@@ -293,6 +317,13 @@ func (c *Client) Manifest(ctx context.Context, repository, reference string) (Ma
 	if reported := resp.Header.Get(contentDigestHeader); reported != "" && reported != digest {
 		return Manifest{}, fmt.Errorf("manifest %s:%s is reported as %q but hashes to %s: %w", repository, reference, reported, digest, ErrDigestMismatch)
 	}
+	if indexLimit > 0 && int64(len(body)) > indexLimit {
+		switch mediaTypeOf(resp.Header.Get("Content-Type")) {
+		case MediaTypeOCIManifest, MediaTypeDockerManifest:
+		default:
+			return Manifest{}, fmt.Errorf("manifest %s:%s is %d bytes and not served as a single manifest, at most %d for an index: %w", repository, reference, len(body), indexLimit, ErrIndexTooLarge)
+		}
+	}
 	var raw struct {
 		MediaType    string       `json:"mediaType"`
 		ArtifactType string       `json:"artifactType"`
@@ -304,8 +335,9 @@ func (c *Client) Manifest(ctx context.Context, repository, reference string) (Ma
 		return Manifest{}, fmt.Errorf("decode manifest %s:%s: %w", repository, reference, err)
 	}
 	mt := mediaTypeOf(resp.Header.Get("Content-Type"))
+	served := mt
 	if mt == "" || mt == "application/json" {
-		mt = raw.MediaType
+		mt, served = raw.MediaType, ""
 	}
 	if mt == "" {
 		// An OCI document may omit mediaType; its shape is then the answer.
@@ -314,7 +346,7 @@ func (c *Client) Manifest(ctx context.Context, repository, reference string) (Ma
 			mt = MediaTypeOCIIndex
 		}
 	}
-	m := Manifest{Digest: digest, MediaType: mt, Size: int64(len(body)), ArtifactType: raw.ArtifactType}
+	m := Manifest{Digest: digest, MediaType: mt, Size: int64(len(body)), ArtifactType: raw.ArtifactType, Raw: body, Served: served}
 	switch mt {
 	case MediaTypeOCIIndex, MediaTypeDockerList:
 		m.Manifests = raw.Manifests

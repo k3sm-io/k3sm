@@ -33,6 +33,7 @@ import (
 
 	"k3sm.io/k3sm/pkg/modelpack"
 	"k3sm.io/k3sm/pkg/registryclient"
+	"k3sm.io/runtimed/pkg/artifact"
 )
 
 // modelReportSchemaVersion versions `k3sm model ls -o json`. The document
@@ -61,6 +62,12 @@ type modelRow struct {
 	Shards       int    `json:"shards"`
 	Quantization string `json:"quantization"`
 	ParamSize    string `json:"paramSize"`
+	// Variant is the io.k3sm.model.variant annotation of the index entry
+	// this row describes, and Index the digest of that index, when the tag
+	// names a variant index; both omitted for a tag naming one manifest.
+	// Digest is then the variant's own manifest.
+	Variant string `json:"variant,omitempty"`
+	Index   string `json:"index,omitempty"`
 	// Error is why the row carries no metadata: its manifest or config
 	// could not be read. Omitted when there is none.
 	Error string `json:"error,omitempty"`
@@ -78,7 +85,8 @@ type modelListReport struct {
 
 // modelLs lists the models in the cluster registry: every tag of a
 // repository under models/ whose manifest carries the ModelPack artifactType,
-// with the metadata its manifest and config record. It reads one manifest
+// or whose index lists model variants (one row per variant), with the
+// metadata its manifest and config record. It reads one manifest
 // and one config blob per tag and never a file of the model. A registry that
 // does not answer is reported, not an error, as `k3sm image ls` does.
 func modelLs(ctx context.Context, o modelOptions, out io.Writer, env imageRegistryEnv) error {
@@ -123,20 +131,18 @@ func listModels(ctx context.Context, env imageRegistryEnv) (rows []modelRow, tru
 				return rows, true, nil
 			}
 			walked++
-			row, ok := describeModel(ctx, reg.c, repo, tag)
-			if ok {
-				rows = append(rows, row)
-			}
+			rows = append(rows, describeTag(ctx, reg.c, repo, tag)...)
 		}
 	}
 	return rows, false, nil
 }
 
-// describeModel reads repo:tag's manifest and, when it is a ModelPack
-// manifest, its config. ok is false for anything that is not a model (an
-// image, an index). A model whose manifest or config cannot be read is a row
-// with Error set and no metadata, never a failed listing.
-func describeModel(ctx context.Context, c *registryclient.Client, repo, tag string) (modelRow, bool) {
+// describeTag is the rows of repo:tag: one for a ModelPack manifest, one
+// per variant entry for an OCI image index of model variants (entries
+// carrying the io.k3sm.model.variant annotation, in index order), none for
+// anything else (an image, an index of images). An index over the runtime's
+// size or entry caps is one row with Error set, and its entries are not read.
+func describeTag(ctx context.Context, c *registryclient.Client, repo, tag string) []modelRow {
 	row := modelRow{
 		Name:       strings.TrimPrefix(repo, modelRepositoryPrefix),
 		Repository: repo,
@@ -146,9 +152,63 @@ func describeModel(ctx context.Context, c *registryclient.Client, repo, tag stri
 	m, err := c.Manifest(ctx, repo, tag)
 	if err != nil {
 		row.Error = err.Error()
-		return row, true
+		return []modelRow{row}
 	}
-	if m.IsIndex() || m.Config == nil || artifactv1.ArtifactType(m.ArtifactType, m.Config.MediaType) != artifactv1.ArtifactTypeModel {
+	if !m.IsIndex() {
+		if r, ok := describeModel(ctx, c, m, row); ok {
+			return []modelRow{r}
+		}
+		return nil
+	}
+	if m.MediaType != registryclient.MediaTypeOCIIndex {
+		return nil
+	}
+	if len(m.Raw) > artifact.MaxIndexBytes || len(m.Manifests) > artifact.MaxIndexEntries {
+		row.Index = m.Digest
+		row.Error = fmt.Sprintf("model %s:%s: index of %d bytes and %d entries, at most %d and %d", repo, tag, len(m.Raw), len(m.Manifests), artifact.MaxIndexBytes, artifact.MaxIndexEntries)
+		return []modelRow{row}
+	}
+	var rows []modelRow
+	for i, e := range m.Manifests {
+		variant, ok := e.Annotations[artifact.AnnotationVariant]
+		if !ok {
+			continue
+		}
+		vr := row
+		vr.Index = m.Digest
+		// The variant and the entry digest are registry content: checked
+		// before either can reach a row, and a bad one is named by index.
+		if modelpack.ValidateVariant(variant) != nil || e.MediaType != registryclient.MediaTypeOCIManifest || !registryclient.ValidDigest(e.Digest) {
+			vr.Error = fmt.Sprintf("model %s:%s: index entry %d is not a valid variant entry", repo, tag, i)
+			rows = append(rows, vr)
+			continue
+		}
+		vr.Variant = variant
+		vm, err := c.Manifest(ctx, repo, e.Digest)
+		if err != nil {
+			vr.Error = err.Error()
+			rows = append(rows, vr)
+			continue
+		}
+		if vm.IsIndex() {
+			vr.Error = fmt.Sprintf("model %s:%s: variant %s names an index, not a manifest", repo, tag, variant)
+			rows = append(rows, vr)
+			continue
+		}
+		if r, ok := describeModel(ctx, c, vm, vr); ok {
+			rows = append(rows, r)
+		}
+	}
+	return rows
+}
+
+// describeModel fills row from manifest m and, when it is a ModelPack
+// manifest, its config. ok is false for anything that is not a model. A
+// model whose config cannot be read is a row with Error set and no metadata,
+// never a failed listing.
+func describeModel(ctx context.Context, c *registryclient.Client, m registryclient.Manifest, row modelRow) (modelRow, bool) {
+	repo, tag := row.Repository, row.Tag
+	if m.Config == nil || artifactv1.ArtifactType(m.ArtifactType, m.Config.MediaType) != artifactv1.ArtifactTypeModel {
 		return modelRow{}, false
 	}
 	row.Digest = m.Digest
@@ -212,15 +272,15 @@ func renderModelList(out io.Writer, rep modelListReport) error {
 		return p(s)
 	}
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "NAME\tFORMAT\tQUANT\tPARAMS\tSIZE\tFILES\tSHARDS\tDIGEST")
+	fmt.Fprintln(tw, "NAME\tVARIANT\tFORMAT\tQUANT\tPARAMS\tSIZE\tFILES\tSHARDS\tDIGEST")
 	var failed []modelRow
 	for _, r := range rep.Models {
 		if r.Error != "" {
 			failed = append(failed, r)
-			fmt.Fprintf(tw, "%s:%s\t-\t-\t-\t-\t-\t-\t%s\n", p(r.Name), p(r.Tag), dash(shortDigest(r.Digest)))
+			fmt.Fprintf(tw, "%s:%s\t%s\t-\t-\t-\t-\t-\t-\t%s\n", p(r.Name), p(r.Tag), dash(r.Variant), dash(shortDigest(r.Digest)))
 			continue
 		}
-		fmt.Fprintf(tw, "%s:%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", p(r.Name), p(r.Tag), dash(r.Format), dash(r.Quantization),
+		fmt.Fprintf(tw, "%s:%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", p(r.Name), p(r.Tag), dash(r.Variant), dash(r.Format), dash(r.Quantization),
 			dash(r.ParamSize), humanBytes(uint64(max(r.SizeBytes, 0))), strconv.Itoa(r.Files), strconv.Itoa(r.Shards), dash(shortDigest(r.Digest)))
 	}
 	if err := tw.Flush(); err != nil {
