@@ -280,6 +280,12 @@ type nodeOptions struct {
 	// runtime, which has no runtimed to ask.
 	attachRuntimeInfo func(operator.RuntimeInfoSource)
 
+	// onGuestArtifacts, when non-nil, is called ONCE with this node's guest boot
+	// pair after the runtimed path has ensured it. `k3sm server` sets it to
+	// publish the pair to its own registry, where workers fetch it; nothing
+	// else sets it. It is not called when the ensure failed.
+	onGuestArtifacts func(provider.EnsuredGuestArtifacts)
+
 	// onExitBegin, when non-nil, is called ONCE at the very start of this node's
 	// teardown — before the embedded runtime close, on both of startNode's exit
 	// paths and on the early returns the deferred close covers.
@@ -1558,6 +1564,9 @@ func buildProvider(ctx context.Context, opts nodeOptions, cs kubernetes.Interfac
 		// pod reap follows, and for the same reason.
 		if art, ok := (provider.GuestArtifactSource{}).Ensure(ctx, cfg.Root, slog.Default()); ok {
 			cfg.GuestArtifacts = &art
+			if opts.onGuestArtifacts != nil {
+				opts.onGuestArtifacts(art)
+			}
 		}
 		adapter, err := buildPodNetAdapter(opts)
 		if err != nil {

@@ -36,6 +36,7 @@ import (
 
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/nodecred"
+	"k3sm.io/k3sm/pkg/provider"
 	"k3sm.io/k3sm/pkg/registrysvc"
 )
 
@@ -254,6 +255,10 @@ type registryPullerWiring struct {
 	// (clusterFlatRegistry), so the cluster keeps one image store. Zero on a node
 	// with no registry.
 	Flat flatRegistryEndpoint
+	// PublishGuest is handed this node's verified guest boot pair once it is
+	// ensured, and publishes it to this server's registry in the background
+	// (startGuestPublication). nil on a node with no registry.
+	PublishGuest func(provider.EnsuredGuestArtifacts)
 }
 
 // startIngestRegistry brings the registry up, publishes the flat registry-k3sm

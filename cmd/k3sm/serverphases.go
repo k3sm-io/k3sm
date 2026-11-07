@@ -306,6 +306,15 @@ func startServerRegistry(ctx context.Context, plan serverPlan, restCfg *rest.Con
 	// a no-op once its journal is complete. It stops before the registry does.
 	stopRegistry, stopMigration := stop, startImageMigration(ctx, opts, logger)
 	stop = func() { stopMigration(); stopRegistry() }
+	// 3d''. The publication of this server's verified guest boot pair into the
+	// registry, started by the node once it has ensured the pair. Only a
+	// registry that came up gets it; it stops before the registry does.
+	if puller.LocalHost != "" {
+		publishGuest, stopGuest := startGuestPublication(ctx, opts.workDir, logger)
+		puller.PublishGuest = publishGuest
+		stopWithoutGuest := stop
+		stop = func() { stopGuest(); stopWithoutGuest() }
+	}
 	// The early run, on the control-plane stop's lane, and runServer's deferred
 	// backstop share one stage: whichever comes first runs the teardown, and the
 	// other waits for it within its bound.

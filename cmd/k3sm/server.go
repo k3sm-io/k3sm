@@ -898,6 +898,9 @@ func serverNodeOptions(plan serverPlan, restCfg *rest.Config, nodeAddressing nod
 		// The cluster's one registry name, fetched from this server's own
 		// registry on loopback; zero when it runs none.
 		flatRegistry: w.registryPuller.Flat,
+		// The verified guest boot pair goes to this server's own registry,
+		// where a worker fetches it by the pin's digests. nil with no registry.
+		onGuestArtifacts: w.registryPuller.PublishGuest,
 		// The loopback ports this server's datastore listens on (deniedLocalPorts:
 		// the --kine-port value that reaches executor.Config.KinePort, plus the etcd
 		// metrics port in the etcd posture), so every pod's SBPL denies connect() to
