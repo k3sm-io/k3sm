@@ -12,6 +12,12 @@ pin, its date, and the tarball's sha256.
 
 ### Added
 
+- `k3sm model ls [-o json]` lists the models in the cluster registry with their weight format,
+  quantization, parameter size, total size, file count and weight shard count, read from each model's
+  manifest and config without fetching its files. `k3sm model push` copies the quantization and
+  parameter size from the model's `config.json` when it records them, including MLX's
+  `quantization.bits`; a `config.json` over 1 MiB or not a JSON object gives no metadata, and the
+  push goes ahead. See [the cluster registry](docs/user/registry.md#models).
 - A node advertises the GPU under hardware names beside the `mlx.k3sm.io` ones, which do not change: the
   `k3sm.io/gpu` extended resource and the `k3sm.io/gpu.present` and `k3sm.io/gpu-memory-gb` labels on a
   node that can grant a pod the GPU, and the `k3sm.io/chip`, `k3sm.io/chip-family` and `k3sm.io/memory-gb`
