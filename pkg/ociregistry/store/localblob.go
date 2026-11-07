@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/opencontainers/go-digest"
 	"golang.org/x/sys/unix"
@@ -42,6 +43,9 @@ import (
 // none of it: it clones the descriptor and re-hashes its own clone.
 type LocalBlobSource struct {
 	root string
+	// resolved, when set, runs between resolving a blob's path and opening
+	// it: a test seam for a path component swapped after the walk.
+	resolved func(path string)
 }
 
 var _ image.LocalBlobSource = (*LocalBlobSource)(nil)
@@ -80,7 +84,7 @@ func (l *LocalBlobSource) OpenBlob(dgst string) (*os.File, int64, error) {
 	}
 	var refused error
 	for _, n := range repos {
-		f, size, err := openLocalBlob(r, n, d)
+		f, size, err := openLocalBlob(r, n, d, l.resolved)
 		if err == nil {
 			return f, size, nil
 		}
@@ -102,12 +106,33 @@ func (l *LocalBlobSource) OpenBlob(dgst string) (*os.File, int64, error) {
 // its fstat size. The open adds O_NONBLOCK to O_RDONLY|O_NOFOLLOW|O_CLOEXEC so
 // a FIFO planted where the blob should be cannot block it waiting for a
 // writer; the flag is cleared once fstat shows a regular file.
-func openLocalBlob(r *Reader, n ref.Name, d digest.Digest) (*os.File, int64, error) {
+//
+// The open is an openat relative to a descriptor of the store root, so only
+// the components below the root are checked (the root's own parents may be
+// symlinks: /var is one on macOS). On darwin it uses O_NOFOLLOW_ANY in place
+// of O_NOFOLLOW, so a directory component swapped for a symlink after the walk
+// is refused at the open, the same way as a symlinked blob.
+func openLocalBlob(r *Reader, n ref.Name, d digest.Digest, resolved func(string)) (*os.File, int64, error) {
 	p, err := r.s.blobPath(n, d)
 	if err != nil {
 		return nil, 0, err
 	}
-	fd, err := unix.Open(p, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
+	if resolved != nil {
+		resolved(p)
+	}
+	rel, err := filepath.Rel(r.s.root, p)
+	if err != nil || !filepath.IsLocal(rel) {
+		return nil, 0, fmt.Errorf("local blob %s in %s: path %s is outside the store root", d, n, p)
+	}
+	rootFD, err := unix.Open(r.s.root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if errors.Is(err, unix.ELOOP) {
+		return nil, 0, fmt.Errorf("%w: %s", ref.ErrSymlink, r.s.root)
+	}
+	if err != nil {
+		return nil, 0, &os.PathError{Op: "open", Path: r.s.root, Err: err}
+	}
+	fd, err := unix.Openat(rootFD, rel, unix.O_RDONLY|noFollow|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
+	unix.Close(rootFD)
 	if errors.Is(err, unix.ELOOP) {
 		return nil, 0, fmt.Errorf("%w: %s", ref.ErrSymlink, p)
 	}

@@ -24,6 +24,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -220,6 +221,90 @@ func TestLocalBlobSourceRefusesBadDigestAndSymlink(t *testing.T) {
 		if !os.SameFile(fi, want) {
 			t.Fatal("returned a file other than the regular copy")
 		}
+	})
+
+	t.Run("directory component swapped for a symlink", func(t *testing.T) {
+		// A decoy directory outside the store holds a file under the blob's
+		// own name with the blob's own bytes. The store's sha256 directory is
+		// replaced by a symlink to it: before the call, which the path walk
+		// refuses, and after the walk, which only the open can refuse.
+		b := []byte("swapped component\n")
+		bd := putLocalBlob(t, s, "apps/swap", b)
+		p := blobFile(t, s, "apps/swap", bd)
+		algDir := filepath.Dir(p)
+		decoy := filepath.Join(t.TempDir(), "decoy")
+		if err := os.Mkdir(decoy, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(decoy, filepath.Base(p)), b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		decoyInfo, err := os.Stat(filepath.Join(decoy, filepath.Base(p)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		real := filepath.Join(t.TempDir(), "real-sha256")
+		swap := func() {
+			if err := os.Rename(algDir, real); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(decoy, algDir); err != nil {
+				t.Fatal(err)
+			}
+		}
+		restore := func() {
+			if err := os.Remove(algDir); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(real, algDir); err != nil {
+				t.Fatal(err)
+			}
+		}
+		refused := func(t *testing.T, src *LocalBlobSource) {
+			t.Helper()
+			f, _, err := src.OpenBlob(bd.String())
+			if f != nil {
+				defer f.Close()
+				if fi, serr := f.Stat(); serr == nil && os.SameFile(fi, decoyInfo) {
+					t.Fatal("returned the decoy behind the swapped directory")
+				}
+				t.Fatal("returned a file through a symlinked directory component")
+			}
+			if !errors.Is(err, ref.ErrSymlink) {
+				t.Fatalf("err = %v, want ErrSymlink", err)
+			}
+			if errors.Is(err, image.ErrBlobNotLocal) {
+				t.Fatalf("err = %v: a refusal must not read as \"not held\"", err)
+			}
+		}
+
+		t.Run("before the walk", func(t *testing.T) {
+			swap()
+			defer restore()
+			refused(t, NewLocalBlobSource(root))
+		})
+		t.Run("after the walk", func(t *testing.T) {
+			if runtime.GOOS != "darwin" {
+				t.Skip("O_NOFOLLOW_ANY is darwin's")
+			}
+			src := NewLocalBlobSource(root)
+			swapped := false
+			setLocalBlobResolved(src, func(path string) {
+				if path == p && !swapped {
+					swapped = true
+					swap()
+				}
+			})
+			defer func() {
+				if swapped {
+					restore()
+				}
+			}()
+			refused(t, src)
+			if !swapped {
+				t.Fatal("the seam never ran for the blob's path")
+			}
+		})
 	})
 
 	t.Run("non-regular blob", func(t *testing.T) {

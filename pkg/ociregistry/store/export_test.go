@@ -25,3 +25,7 @@ func SetIndexRemoved(s *Store, fn func() error) { s.indexRemoved = fn }
 // SetHalfFound sets the seam ReapHalfRemovedLayouts runs between finding a
 // candidate and locking it.
 func SetHalfFound(s *Store, fn func(n ref.Name)) { s.halfFound = fn }
+
+// setLocalBlobResolved sets the seam LocalBlobSource.OpenBlob runs between
+// resolving a blob's path and opening it.
+func setLocalBlobResolved(l *LocalBlobSource, fn func(path string)) { l.resolved = fn }
