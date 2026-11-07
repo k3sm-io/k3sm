@@ -32,6 +32,14 @@ import (
 // MaxTotalBytes is the most an import downloads in all.
 const MaxTotalBytes = 1 << 40
 
+// Free space an import keeps in reserve beyond the files it plans to
+// download: a twentieth of their size, and at least this much.
+const minFreeMarginBytes = 1 << 30
+
+// ErrNoSpace is a scratch directory whose file system cannot hold the
+// files an import plans to download, with the margin.
+var ErrNoSpace = errors.New("not enough free space for the download")
+
 // ErrUnknownSHA256Path is a caller's sha256 for a path the repository does
 // not have at the commit.
 var ErrUnknownSHA256Path = errors.New("--sha256 names a file the repository does not have")
@@ -95,6 +103,9 @@ func (c *Client) Import(ctx context.Context, ref Ref, o ImportOptions) (*Result,
 		return nil, fmt.Errorf("scratch directory: %w", err)
 	}
 	defer root.Close()
+	if err := c.checkSpace(dir, total); err != nil {
+		return nil, fmt.Errorf("import %s@%s: %w", Scheme+ref.Repo, commit, err)
+	}
 	for _, f := range files {
 		if err := c.download(ctx, root, ref.Repo, commit, f); err != nil {
 			return nil, fmt.Errorf("import %s@%s: %w", Scheme+ref.Repo, commit, err)
@@ -117,6 +128,21 @@ func (c *Client) Import(ctx context.Context, ref Ref, o ImportOptions) (*Result,
 		}
 	}
 	return &Result{Commit: commit, Artifact: a, Bytes: total}, nil
+}
+
+// checkSpace refuses a download of total bytes into dir unless the file
+// system has room for it plus the margin. It runs before the first byte is
+// fetched, so a model that cannot fit costs no transfer.
+func (c *Client) checkSpace(dir string, total int64) error {
+	free, err := c.freeSpace(dir)
+	if err != nil {
+		return fmt.Errorf("measure free space for the download: %w", err)
+	}
+	need := uint64(total) + max(uint64(total)/20, minFreeMarginBytes)
+	if free < need {
+		return fmt.Errorf("%s has %d bytes free; the files need %d bytes and %d are kept in reserve (choose another directory with --scratch-dir): %w", dir, free, total, need-uint64(total), ErrNoSpace)
+	}
+	return nil
 }
 
 // planFiles picks the files out of the listing, checks their names and

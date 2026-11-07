@@ -111,6 +111,9 @@ type Client struct {
 	rt            http.RoundTripper
 	redirectHosts []string
 	userAgent     string
+	// freeSpace measures the space left on the file system holding a
+	// directory; statfsFree, or a test's fake.
+	freeSpace func(dir string) (uint64, error)
 }
 
 // DefaultTransport is a transport with every phase before the body bounded:
@@ -161,6 +164,7 @@ func NewClient(o Options) (*Client, error) {
 		rt:            t,
 		redirectHosts: slices.Clone(hosts),
 		userAgent:     ua,
+		freeSpace:     statfsFree,
 	}, nil
 }
 

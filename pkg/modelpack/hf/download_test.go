@@ -115,3 +115,59 @@ func TestNewClientRefusesNonHTTPSEndpoint(t *testing.T) {
 		}
 	}
 }
+
+// TestImportRefusesWhenScratchCannotHoldIt: before the first download the
+// scratch file system must hold every planned byte plus the margin; when it
+// cannot, the import refuses with ErrNoSpace and fetches nothing.
+func TestImportRefusesWhenScratchCannotHoldIt(t *testing.T) {
+	var total int64
+	for _, f := range tinyModel("a") {
+		total += int64(len(f.data))
+	}
+	for _, tc := range []struct {
+		name string
+		free uint64
+		ok   bool
+	}{
+		{"the files alone fit, not the margin", uint64(total) + minFreeMarginBytes - 1, false},
+		{"the files and the margin fit", uint64(total) + minFreeMarginBytes, true},
+		{"nothing free", 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hub := newFakeHub(t)
+			hub.addCommit("main", commitA, tinyModel("a")...)
+			c := hub.client(t)
+			c.freeSpace = func(string) (uint64, error) { return tc.free, nil }
+			_, err := c.Import(testContext(t), mustRef(t, "hf://acme/tiny-model"), ImportOptions{ScratchDir: t.TempDir()})
+			if tc.ok {
+				if err != nil {
+					t.Fatalf("Import = %v, want success", err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrNoSpace) || !strings.Contains(err.Error(), "--scratch-dir") {
+				t.Fatalf("Import = %v, want ErrNoSpace naming --scratch-dir", err)
+			}
+			for _, p := range hub.paths() {
+				if strings.Contains(p, "/resolve/") {
+					t.Errorf("downloaded %s after the space check refused", p)
+				}
+			}
+		})
+	}
+	t.Run("an unmeasurable file system refuses", func(t *testing.T) {
+		hub := newFakeHub(t)
+		hub.addCommit("main", commitA, tinyModel("a")...)
+		c := hub.client(t)
+		c.freeSpace = func(string) (uint64, error) { return 0, errors.New("statfs: boom") }
+		if _, err := c.Import(testContext(t), mustRef(t, "hf://acme/tiny-model"), ImportOptions{ScratchDir: t.TempDir()}); err == nil {
+			t.Fatal("Import succeeded without a free-space measure")
+		}
+	})
+	t.Run("the real statfs measures the scratch directory", func(t *testing.T) {
+		free, err := statfsFree(t.TempDir())
+		if err != nil || free == 0 {
+			t.Fatalf("statfsFree = %d, %v", free, err)
+		}
+	})
+}

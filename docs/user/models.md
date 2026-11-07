@@ -71,8 +71,9 @@ The import runs on your Mac, not in a pod, and only that Mac needs internet acce
 Run the same import again and it uploads nothing and prints the same digest.
 
 Files are downloaded into a new subdirectory of the system temporary directory, which is removed when the
-import ends. That directory needs room for the whole model. Choose another parent with
-`--scratch-dir <dir>`.
+import ends. Before the first download, the import checks that the directory's volume has room for the
+whole model plus a reserve of 5% (at least 1 GiB). If it does not, the import stops before fetching
+anything. Choose another parent with `--scratch-dir <dir>`.
 
 ### What the Import Trusts
 
