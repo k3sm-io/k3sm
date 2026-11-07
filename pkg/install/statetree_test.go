@@ -811,6 +811,10 @@ func TestStateTreeCoversRuntimedTrees(t *testing.T) {
 	createdElsewhere := map[string]string{}
 
 	names := append(sandbox.DaemonTreeSubdirs(), sandbox.ReapStoreSubdirs()...)
+	// The image cache's clone staging dir (runtimed pkg/image localStageDir,
+	// unexported): the runtime requires it to exist, 0700 and its own, and
+	// never creates or repairs it under the root-owned root.
+	names = append(names, ".local-stage")
 	service := ServiceLevels()
 	for _, name := range names {
 		if who, ok := createdElsewhere[name]; ok {
@@ -845,6 +849,7 @@ func TestStateTreeRuntimeTreeModes(t *testing.T) {
 		{sandbox.ArtifactViewsSubdir, 0o711},
 		{sandbox.ArtifactPartialSubdir, 0o700},
 		{sandbox.VMBootFailureSubdir, 0o700},
+		{".local-stage", 0o700},
 	} {
 		own, ok := OwnershipOf(StateLevel(tc.name))
 		if !ok || own.Principal != PrincipalServiceUser || own.GID != ServiceTreeGID || own.Mode != tc.mode {
