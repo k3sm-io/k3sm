@@ -59,12 +59,19 @@ var errNoResolver = errors.New("the mlx operator has no cluster registry client 
 // Without a variant an index is refused (spec.quantization selects one of its
 // entries). With one, a single manifest is refused, and the index goes
 // through the runtime's own selection (artifact.SelectVariant: its size and
-// entry caps, and a refusal of no match or of several). The selected manifest is then read by digest and must hash to the entry's
+// entry caps, and a refusal of no match or of several); an index body over
+// artifact.MaxIndexBytes is refused before its descriptors are decoded. The
+// selected manifest is then read by digest and must hash to the entry's
 // digest, have its size, and be served as an OCI image manifest.
 func RegistryResolver(c *registryclient.Client) ArtifactResolver {
 	return ArtifactResolverFunc(func(ctx context.Context, repository, reference, variant string) (string, error) {
-		m, err := c.Manifest(ctx, repository, reference)
+		// An index body over the runtime's cap is refused before its
+		// descriptors are decoded; a single manifest keeps the client's cap.
+		m, err := c.ManifestIndexBounded(ctx, repository, reference, artifact.MaxIndexBytes)
 		if err != nil {
+			if errors.Is(err, registryclient.ErrIndexTooLarge) {
+				return "", fmt.Errorf("%w: %w", err, artifact.ErrManifestTooLarge)
+			}
 			return "", err
 		}
 		if variant == "" {

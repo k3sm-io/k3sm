@@ -281,6 +281,23 @@ func (c *Client) Tags(ctx context.Context, repository string) ([]string, error) 
 // must match the digest asked for (a digest reference) and the digest the
 // registry reported (Docker-Content-Digest), whichever are present.
 func (c *Client) Manifest(ctx context.Context, repository, reference string) (Manifest, error) {
+	return c.readManifest(ctx, repository, reference, 0)
+}
+
+// ErrIndexTooLarge is a body over ManifestIndexBounded's index limit that
+// was not served as a single manifest.
+var ErrIndexTooLarge = errors.New("index exceeds its size cap")
+
+// ManifestIndexBounded is Manifest with a tighter cap on an index: a body
+// over indexLimit bytes is refused with ErrIndexTooLarge, before it is
+// decoded, unless the registry served it as a single manifest (an OCI or
+// Docker image manifest), which keeps Manifest's own cap.
+func (c *Client) ManifestIndexBounded(ctx context.Context, repository, reference string, indexLimit int64) (Manifest, error) {
+	return c.readManifest(ctx, repository, reference, indexLimit)
+}
+
+// readManifest is Manifest; indexLimit > 0 is ManifestIndexBounded's cap.
+func (c *Client) readManifest(ctx context.Context, repository, reference string, indexLimit int64) (Manifest, error) {
 	if !ValidRepository(repository) {
 		return Manifest{}, fmt.Errorf("invalid repository name %q", repository)
 	}
@@ -299,6 +316,13 @@ func (c *Client) Manifest(ctx context.Context, repository, reference string) (Ma
 	}
 	if reported := resp.Header.Get(contentDigestHeader); reported != "" && reported != digest {
 		return Manifest{}, fmt.Errorf("manifest %s:%s is reported as %q but hashes to %s: %w", repository, reference, reported, digest, ErrDigestMismatch)
+	}
+	if indexLimit > 0 && int64(len(body)) > indexLimit {
+		switch mediaTypeOf(resp.Header.Get("Content-Type")) {
+		case MediaTypeOCIManifest, MediaTypeDockerManifest:
+		default:
+			return Manifest{}, fmt.Errorf("manifest %s:%s is %d bytes and not served as a single manifest, at most %d for an index: %w", repository, reference, len(body), indexLimit, ErrIndexTooLarge)
+		}
 	}
 	var raw struct {
 		MediaType    string       `json:"mediaType"`

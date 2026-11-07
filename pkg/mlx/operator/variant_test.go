@@ -25,6 +25,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	mlxv1alpha1 "k3sm.io/apis/mlx/v1alpha1"
@@ -124,7 +125,8 @@ func q4config(t *testing.T, reg *registrytest.Registry, repository string) regis
 // two matching entries, a single manifest with quantization set and an index
 // without quantization are each refused as InvalidSpec naming the reason,
 // with no digest recorded and nothing applied.
-// It also refuses an entry whose digest holds a Docker manifest.
+// It also refuses an entry whose digest holds a Docker manifest and an index
+// body over the runtime's size cap.
 func TestResolveArtifactVariant(t *testing.T) {
 	const repo = "models/qwen3"
 	reg := registrytest.New()
@@ -150,6 +152,17 @@ func TestResolveArtifactVariant(t *testing.T) {
 	}
 	docker := registryclient.Descriptor{MediaType: registryclient.MediaTypeOCIManifest, Digest: putManifest(t, reg, repo, registryclient.MediaTypeDockerManifest, dockerBody), Size: int64(len(dockerBody))}
 	putIndex(t, reg, repo, "docker", variantEntry{docker, "4bit"})
+	// An index whose body is over the runtime's index cap.
+	pad := strings.Repeat("p", artifact.MaxIndexBytes)
+	hugeBody, err := json.Marshal(map[string]any{
+		"schemaVersion": 2, "mediaType": registryclient.MediaTypeOCIIndex,
+		"manifests":   []any{map[string]any{"mediaType": registryclient.MediaTypeOCIManifest, "digest": q4.Digest, "size": q4.Size, "annotations": map[string]string{artifact.AnnotationVariant: "4bit"}}},
+		"annotations": map[string]string{"pad": pad},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	putManifestAt(t, reg, repo, "huge", registryclient.MediaTypeOCIIndex, hugeBody)
 
 	harnessFor := func(t *testing.T, reference, quantization string) *harness {
 		t.Helper()
@@ -193,6 +206,7 @@ func TestResolveArtifactVariant(t *testing.T) {
 		{"a single manifest with quantization", ":plain", "4bit", artifact.ErrVariantOnManifest},
 		{"an index without quantization", ":v1", "", artifact.ErrVariantRequired},
 		{"a docker manifest at the selected digest", ":docker", "4bit", artifact.ErrManifestInvalid},
+		{"an index over the size cap", ":huge", "4bit", artifact.ErrManifestTooLarge},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := harnessFor(t, tc.reference, tc.quantization)
