@@ -83,6 +83,9 @@ fi
 ladder "$(run "$runtimed" ./pkg/guestartifacts/ TestEnsureFromClusterStoreByPinnedDigest)" "$GATE.1  runtimed guestartifacts: ensured from the cluster store by the pinned digests"
 ladder "$(run "$runtimed" ./pkg/guestartifacts/ TestWrongDigestFromStoreRefused)" "$GATE.2  runtimed guestartifacts: a wrong digest from the store is refused"
 ladder "$(run "$K3SM_ROOT" ./pkg/registrysvc/ TestServerPublishesGuestArtifacts)" "$GATE.3  registrysvc: the server publishes the pair, idempotently"
+ladder "$(run "$runtimed" ./pkg/runtime/ TestGuestClusterStorePullsThroughTheRuntimeCache)" "$GATE.4  runtimed runtime: the guest store pulls through the runtime's own cache"
+ladder "$(run "$K3SM_ROOT" ./pkg/provider/ TestEnsureGuestArtifactsFromClusterStore)" "$GATE.5  provider: a worker ensures the pair from the cluster store, no release-host fetch"
+ladder "$(run "$K3SM_ROOT" ./pkg/provider/ TestNewRuntimedGuestFromClusterStore)" "$GATE.6  provider: the real runtime takes the store's pair after start"
 
 echo "----------------------------------------"
 echo "$GATE: $PASS passed, $FAIL failed, $PENDING pending"
