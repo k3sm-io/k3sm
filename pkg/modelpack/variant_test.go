@@ -200,3 +200,80 @@ func TestValidateVariant(t *testing.T) {
 		}
 	}
 }
+
+// hookTransport runs before once, ahead of the first request that matches,
+// then serves every request through next.
+type hookTransport struct {
+	next   http.RoundTripper
+	match  func(*http.Request) bool
+	before func()
+	done   bool
+}
+
+func (h *hookTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if !h.done && h.match(req) {
+		h.done = true
+		h.before()
+	}
+	return h.next.RoundTrip(req)
+}
+
+// TestPushVariantMergesIntoTheIndexAtPut: the variant is merged into the
+// index the tag names just before the write, not the one read before the
+// upload, so an entry another writer added during the upload survives; and a
+// tag turned into a plain manifest during the upload is still refused.
+func TestPushVariantMergesIntoTheIndexAtPut(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	q4 := build(t, writeTree(t, map[string]string{"config.json": `{"q":4}`, "model.safetensors": "four"}))
+	q8 := build(t, writeTree(t, map[string]string{"config.json": `{"q":8}`, "model.safetensors": "eight"}))
+	bf := build(t, writeTree(t, map[string]string{"config.json": `{"q":16}`, "model.safetensors": "bf16"}))
+	// The upload of the variant manifest by digest: after the first read of
+	// the tag, before the second.
+	manifestByDigest := func(req *http.Request) bool {
+		return req.Method == http.MethodPut && strings.Contains(req.URL.Path, "/manifests/sha256:")
+	}
+
+	t.Run("an entry added during the upload survives", func(t *testing.T) {
+		reg, tag, opt := variantRegistry(t)
+		if _, err := PushVariant(ctx, tag, q4, "4bit", opt); err != nil {
+			t.Fatal(err)
+		}
+		hook := &hookTransport{next: handlerTransport{reg.Handler()}, match: manifestByDigest, before: func() {
+			if _, err := PushVariant(ctx, tag, bf, "bf16", opt); err != nil {
+				t.Errorf("the other writer: %v", err)
+			}
+		}}
+		if _, err := PushVariant(ctx, tag, q8, "8bit", remote.WithTransport(hook)); err != nil {
+			t.Fatal(err)
+		}
+		if !hook.done {
+			t.Fatal("the other writer never ran")
+		}
+		_, order, byVariant := readIndex(t, tag, opt)
+		if strings.Join(order, ",") != "4bit,8bit,bf16" {
+			t.Errorf("index entries %v, want [4bit 8bit bf16]", order)
+		}
+		if byVariant["bf16"] != bf.Digest.String() || byVariant["8bit"] != q8.Digest.String() || byVariant["4bit"] != q4.Digest.String() {
+			t.Errorf("index = %v", byVariant)
+		}
+	})
+
+	t.Run("a plain manifest written during the upload is refused", func(t *testing.T) {
+		reg, tag, opt := variantRegistry(t)
+		if _, err := PushVariant(ctx, tag, q4, "4bit", opt); err != nil {
+			t.Fatal(err)
+		}
+		hook := &hookTransport{next: handlerTransport{reg.Handler()}, match: manifestByDigest, before: func() {
+			if err := Push(ctx, tag, bf, opt); err != nil {
+				t.Errorf("the other writer: %v", err)
+			}
+		}}
+		if _, err := PushVariant(ctx, tag, q8, "8bit", remote.WithTransport(hook)); !errors.Is(err, ErrTagIsManifest) {
+			t.Errorf("err = %v, want ErrTagIsManifest", err)
+		}
+		if d, ok := reg.Manifest("models/tiny", "latest"); !ok || d != bf.Digest.String() {
+			t.Errorf("tag names %s, want the plain manifest %s left alone", d, bf.Digest)
+		}
+	})
+}

@@ -70,22 +70,28 @@ func ValidateVariant(v string) error {
 // every other entry it held. Entries are sorted by variant, so the same set
 // of variants always makes the same index digest. It returns that digest.
 //
-// The tag is read before any byte is uploaded: a tag that names a single
-// manifest is refused with ErrTagIsManifest, and an index that is not an OCI
-// image index within the caps the runtime reads it under is refused with
-// ErrIndexInvalid. The update is a read then a write, so two pushes of
-// different variants racing on one tag can lose one entry; pushing it again
-// restores it.
+// The tag is read before any byte is uploaded, and read again after the
+// upload, immediately before the index is written; the variant is merged into
+// the index that second read returns. Each read refuses a tag that names a
+// single manifest with ErrTagIsManifest, and an index that is not an OCI
+// image index within the caps the runtime reads it under with
+// ErrIndexInvalid. A registry offers no compare-and-swap on a tag, so two
+// pushes of different variants that both re-read before either writes can
+// still lose one entry; the window is that one round trip, not the upload,
+// and pushing the lost variant again restores it.
 func PushVariant(ctx context.Context, ref name.Tag, a *Artifact, variant string, opts ...remote.Option) (string, error) {
 	if err := ValidateVariant(variant); err != nil {
 		return "", err
 	}
 	opts = append(opts[:len(opts):len(opts)], remote.WithContext(ctx))
-	idx, err := currentIndex(ref, opts)
-	if err != nil {
+	if _, err := currentIndex(ref, opts); err != nil {
 		return "", err
 	}
 	if err := Push(ctx, ref.Context().Digest(a.Digest.String()), a, opts...); err != nil {
+		return "", err
+	}
+	idx, err := currentIndex(ref, opts)
+	if err != nil {
 		return "", err
 	}
 	entry := ispec.Descriptor{
