@@ -71,10 +71,10 @@ type Metadata struct {
 // quantization_config.quant_method, else MLX's integer quantization.bits as
 // "<bits>bit"; and a string "paramSize". Every other field is ignored.
 //
-// It fails closed on content and never on it: more than
-// MaxModelConfigJSONBytes, anything but one JSON object, or a value outside
-// the closed set gives that value (or all of them) empty, so a model with an
-// odd config.json still pushes, without metadata. Only a read failure is an
+// It fails closed on content, and content never makes it fail: a file over
+// MaxModelConfigJSONBytes or anything but one JSON object gives no metadata,
+// and a value outside the closed set is dropped, so a model with an odd
+// config.json still pushes, without that metadata. Only a read failure is an
 // error.
 func readModelConfig(r io.Reader) (ConfigFields, error) {
 	b, err := io.ReadAll(io.LimitReader(r, MaxModelConfigJSONBytes+1))
