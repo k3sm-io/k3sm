@@ -41,7 +41,7 @@ type countingResolver struct {
 	asked  []string
 }
 
-func (r *countingResolver) ResolveArtifact(_ context.Context, repository, tag string) (string, error) {
+func (r *countingResolver) ResolveArtifact(_ context.Context, repository, tag, _ string) (string, error) {
 	r.calls++
 	r.asked = append(r.asked, repository+":"+tag)
 	return r.digest, nil

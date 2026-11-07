@@ -26,20 +26,24 @@ import (
 	mlxv1alpha1 "k3sm.io/apis/mlx/v1alpha1"
 	"k3sm.io/k3sm/pkg/mlx"
 	"k3sm.io/k3sm/pkg/registryclient"
+	"k3sm.io/runtimed/pkg/artifact"
 )
 
-// ArtifactResolver resolves a tag in the cluster registry to the manifest
-// digest ("sha256:<hex>") it names now.
+// ArtifactResolver resolves a reference in the cluster registry, a tag or a
+// digest, to the manifest digest ("sha256:<hex>") a replica renders. With an
+// empty variant the reference must name a single manifest. With a variant it
+// must name an OCI image index, and the digest returned is that of the one
+// entry whose io.k3sm.model.variant annotation equals variant.
 type ArtifactResolver interface {
-	ResolveArtifact(ctx context.Context, repository, tag string) (string, error)
+	ResolveArtifact(ctx context.Context, repository, reference, variant string) (string, error)
 }
 
 // ArtifactResolverFunc adapts a function to ArtifactResolver.
-type ArtifactResolverFunc func(ctx context.Context, repository, tag string) (string, error)
+type ArtifactResolverFunc func(ctx context.Context, repository, reference, variant string) (string, error)
 
 // ResolveArtifact calls f.
-func (f ArtifactResolverFunc) ResolveArtifact(ctx context.Context, repository, tag string) (string, error) {
-	return f(ctx, repository, tag)
+func (f ArtifactResolverFunc) ResolveArtifact(ctx context.Context, repository, reference, variant string) (string, error) {
+	return f(ctx, repository, reference, variant)
 }
 
 // errNoResolver is the resolution failure of an operator built without a
@@ -47,21 +51,44 @@ func (f ArtifactResolverFunc) ResolveArtifact(ctx context.Context, repository, t
 // reported and not retried.
 var errNoResolver = errors.New("the mlx operator has no cluster registry client to resolve a tag; name the artifact by digest")
 
-// RegistryResolver resolves tags by reading the manifest from the cluster
-// registry through c. The manifest bytes are hashed, so the digest returned is
-// the one the content has, not only the one the registry reported. An index is
-// refused: selecting one of its entries needs spec.artifact.variant, which is
-// not supported yet.
+// RegistryResolver resolves references by reading the manifest from the
+// cluster registry through c. The manifest bytes are hashed, so the digest
+// returned is the one the content has, not only the one the registry
+// reported.
+//
+// Without a variant an index is refused (spec.quantization selects one of its
+// entries). With one, a single manifest is refused, and the index goes
+// through the runtime's own selection (artifact.SelectVariant: its size and
+// entry caps, and a refusal of no match or of several); the selected manifest
+// is then read by digest and must match the entry's digest and size, and be
+// a manifest, not an index.
 func RegistryResolver(c *registryclient.Client) ArtifactResolver {
-	return ArtifactResolverFunc(func(ctx context.Context, repository, tag string) (string, error) {
-		m, err := c.Manifest(ctx, repository, tag)
+	return ArtifactResolverFunc(func(ctx context.Context, repository, reference, variant string) (string, error) {
+		m, err := c.Manifest(ctx, repository, reference)
 		if err != nil {
 			return "", err
 		}
-		if m.IsIndex() {
-			return "", fmt.Errorf("%s:%s is an index (%s), not a single model manifest", repository, tag, m.MediaType)
+		if variant == "" {
+			if m.IsIndex() {
+				return "", fmt.Errorf("%s:%s is an index (%s), not a single model manifest; set spec.quantization to select a variant: %w", repository, reference, m.MediaType, artifact.ErrVariantRequired)
+			}
+			return m.Digest, nil
 		}
-		return m.Digest, nil
+		if !m.IsIndex() {
+			return "", fmt.Errorf("%s:%s is a single manifest: %w", repository, reference, artifact.ErrVariantOnManifest)
+		}
+		entry, err := artifact.SelectVariant(m.Raw, m.Served, variant)
+		if err != nil {
+			return "", fmt.Errorf("%s:%s: %w", repository, reference, err)
+		}
+		v, err := c.Manifest(ctx, repository, entry.Digest)
+		if err != nil {
+			return "", err
+		}
+		if v.IsIndex() || v.Size != entry.Size {
+			return "", fmt.Errorf("%s@%s is %s of %d bytes, the index names a manifest of %d bytes: %w", repository, entry.Digest, v.MediaType, v.Size, entry.Size, artifact.ErrManifestInvalid)
+		}
+		return entry.Digest, nil
 	})
 }
 
@@ -77,9 +104,16 @@ func RegistryResolver(c *registryclient.Client) ArtifactResolver {
 // sound key for it.
 //
 // A reference by digest is used as is, and a reference the render will refuse
-// (malformed, off the cluster registry, a variant) is never sent to the
-// registry: the digest stays empty and the render names the refusal. A Hub
-// model's digest is cleared.
+// (malformed, off the cluster registry, spec.artifact.variant) is never sent
+// to the registry: the digest stays empty and the render names the refusal. A
+// Hub model's digest is cleared.
+//
+// spec.quantization selects a variant: the reference, by tag or by digest,
+// must name an OCI image index, and the digest recorded is that of the entry
+// whose io.k3sm.model.variant annotation equals it, so every replica renders
+// the selected manifest by digest. A refusal (no such entry, several, a
+// single manifest with quantization set, an index without it) names the
+// variant and is reported as InvalidSpec.
 func (c *Controller) resolveArtifact(ctx context.Context, model *mlxv1alpha1.MLXModel) error {
 	a := model.Spec.Artifact
 	if a == nil {
@@ -94,15 +128,23 @@ func (c *Controller) resolveArtifact(ctx context.Context, model *mlxv1alpha1.MLX
 	if err != nil || a.Variant != "" {
 		return nil
 	}
-	if ref.Digest != "" {
+	variant := model.Spec.Quantization
+	if ref.Digest != "" && variant == "" {
 		model.Status.ResolvedArtifact = ref.Digest
 		return nil
 	}
 	if c.artifacts == nil {
 		return errNoResolver
 	}
-	digest, err := c.artifacts.ResolveArtifact(ctx, ref.Repository, ref.Tag)
+	reference := ref.Tag
+	if ref.Digest != "" {
+		reference = ref.Digest
+	}
+	digest, err := c.artifacts.ResolveArtifact(ctx, ref.Repository, reference, variant)
 	if err != nil {
+		if variant != "" {
+			return fmt.Errorf("resolve %s variant %q (spec.quantization): %w", a.Reference, variant, err)
+		}
 		return fmt.Errorf("resolve %s: %w", a.Reference, err)
 	}
 	model.Status.ResolvedArtifact = digest
