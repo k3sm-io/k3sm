@@ -58,6 +58,9 @@ type ServeConfig struct {
 	// hold it. A zero UID names none, and then a server started as root refuses.
 	UID int `json:"uid,omitempty"`
 	GID int `json:"gid,omitempty"`
+	// Quota is the byte quota per artifactType (--registry-quota): a manifest
+	// push that would take its type past it is refused with DENIED.
+	Quota map[string]int64 `json:"quota,omitempty"`
 }
 
 // validateForServing checks what only the server needs. ReadServeConfig does
@@ -79,6 +82,9 @@ func (c ServeConfig) validateForServing() error {
 	}
 	if c.DataVolume != "" && (!filepath.IsAbs(c.DataVolume) || filepath.Clean(c.DataVolume) != c.DataVolume) {
 		return fmt.Errorf("registry serve config: data volume %q is not a clean absolute path", c.DataVolume)
+	}
+	if err := validQuotas(c.Quota); err != nil {
+		return fmt.Errorf("registry serve config: %w", err)
 	}
 	return nil
 }

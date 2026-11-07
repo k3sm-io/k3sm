@@ -432,7 +432,7 @@ func TestScanFoundManifestIsFollowed(t *testing.T) {
 			cont.Blobs = append(cont.Blobs, store.Blob{Digest: d, Size: 1, ModTime: past})
 		}
 		idx := ispec.Index{Manifests: []ispec.Descriptor{{Digest: root, Annotations: map[string]string{ispec.AnnotationRefName: "idx"}}}}
-		p, err := makePlan(idx, cont, time.Now(), func(d digest.Digest) (refs, error) {
+		p, err := makePlan(idx, cont, time.Now(), nil, func(d digest.Digest) (refs, error) {
 			if read[d]++; read[d] > 1 {
 				t.Fatalf("%s was read again", d)
 			}

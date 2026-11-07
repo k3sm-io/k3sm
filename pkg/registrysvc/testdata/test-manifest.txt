@@ -75,6 +75,7 @@ TestPushAuthorizesBuilderClusterWide kept the push gate is unchanged
 TestPushAuthorizesServiceAccountTokenUnderNamespacePrefix kept the push gate is unchanged
 TestPushGateAcceptsMountWithOrigin kept the push gate is unchanged
 TestPushPrefixHeldByOneNamespace kept the push gate is unchanged
+TestQuotaFlag added the --registry-quota grammar
 TestReadCredentialFailures kept the credential files are unchanged
 TestRecheckFailsClosed kept prune works on the store, which is unchanged
 TestRecheckReasonWording kept prune works on the store, which is unchanged
@@ -100,6 +101,7 @@ TestRepositoriesFindsNestedLayoutsOnly kept prune works on the store, which is u
 TestRestartRebindsTheIngestPort rewritten reclaim now runs the same cases over the k3sm child argv as well as the zot argv
 TestServeAuthorizesAndReports added new with the child switch
 TestServeConfig rewritten renderServeConfig takes the server settings; the principal assertions are unchanged
+TestServeConfigRendersQuota added the quota is rendered into the serve config and checked
 TestServeConfigServerFields added new with the child switch
 TestServeConvergeCadence added new with the dedupe loop
 TestServeDropsRootBeforeTheStoreOpens added new with the child switch

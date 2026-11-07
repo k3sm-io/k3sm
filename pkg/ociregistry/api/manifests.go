@@ -33,6 +33,8 @@ import (
 	"github.com/opencontainers/go-digest"
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 
+	artifactv1 "k3sm.io/apis/artifact/v1"
+
 	"k3sm.io/k3sm/pkg/ociregistry/gc"
 	"k3sm.io/k3sm/pkg/ociregistry/ref"
 	"k3sm.io/k3sm/pkg/ociregistry/store"
@@ -186,6 +188,11 @@ type checkedManifest struct {
 	children []digest.Digest
 	// subject is the subject's digest, when the manifest has one.
 	subject digest.Digest
+	// artifactType is an image manifest's artifact type (its artifactType,
+	// else its config media type), and layers every layer it names; an index
+	// has neither. The quota counts them.
+	artifactType string
+	layers       []digest.Digest
 }
 
 // checkManifest validates body as a manifest of media type mt, following the
@@ -258,10 +265,12 @@ func checkManifest(mt string, body []byte) (checkedManifest, error) {
 		if err != nil {
 			return out, err
 		}
+		out.layers = append(out.layers, d)
 		if mt == mediaTypeDockerManifest || !nonDistributable[l.MediaType] {
 			layers = append(layers, d)
 		}
 	}
+	out.artifactType = artifactv1.ArtifactType(m.ArtifactType, m.Config.MediaType)
 	out.needs = append([]digest.Digest{cfg}, layers...)
 	return out, subjectOf(m.Subject, &out)
 }
@@ -338,6 +347,23 @@ func (s *Server) putManifest(w http.ResponseWriter, r *http.Request, n ref.Name)
 		s.fail(w, r, err)
 		return
 	}
+	// The quota admits the manifest before its row is written, so two PUTs
+	// cannot both take the same room. The hold ends however the handler does:
+	// counted once the row is written, given back if it never is.
+	finish := func(bool) {}
+	if checked.artifactType != "" {
+		d := rf.Digest
+		if d == "" {
+			d = digest.FromBytes(body)
+		}
+		finish, err = s.admitQuota(n, d, checked.artifactType, checked.layers)
+		if err != nil {
+			s.fail(w, r, err)
+			return
+		}
+	}
+	wrote := false
+	defer func() { finish(wrote) }()
 	if s.manifestChecked != nil {
 		s.manifestChecked()
 	}
@@ -364,6 +390,7 @@ func (s *Server) putManifest(w http.ResponseWriter, r *http.Request, n ref.Name)
 		s.fail(w, r, err)
 		return
 	}
+	wrote = true
 	for _, t := range tags {
 		if _, err := s.st.PutManifestChecked(r.Context(), n, ref.Reference{Tag: t}, mt, body, underLock); err != nil {
 			s.fail(w, r, err)
@@ -534,6 +561,8 @@ func (s *Server) deleteManifest(w http.ResponseWriter, r *http.Request, n ref.Na
 		s.fail(w, r, err)
 		return
 	}
+	// The rows are gone: the quota counts again from the store at its next check.
+	s.quota.invalidate()
 	s.log.Info("registry manifest deleted", "repository", n.String(), "reference", rf.String())
 	w.WriteHeader(http.StatusAccepted)
 }

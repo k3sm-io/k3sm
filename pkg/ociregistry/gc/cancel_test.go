@@ -61,7 +61,7 @@ func TestScanDedupesDigestsAndHonoursCancel(t *testing.T) {
 			}
 			return refs{}, &unverifiedError{d: d, size: 1}
 		}
-		if _, err := makePlan(idx, cont, time.Time{}, refsOf); err != nil {
+		if _, err := makePlan(idx, cont, time.Time{}, nil, refsOf); err != nil {
 			t.Fatal(err)
 		}
 		if reads[x] != 1 {
@@ -84,7 +84,7 @@ func TestScanDedupesDigestsAndHonoursCancel(t *testing.T) {
 			}
 			return refs{}, &unverifiedError{d: d, size: 1}
 		}
-		if _, err := makePlan(idx, cont, time.Time{}, refsOf); !errors.Is(err, ErrUnreadable) {
+		if _, err := makePlan(idx, cont, time.Time{}, nil, refsOf); !errors.Is(err, ErrUnreadable) {
 			t.Fatalf("got %v, want ErrUnreadable", err)
 		}
 	})

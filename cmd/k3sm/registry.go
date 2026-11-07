@@ -97,6 +97,7 @@ func registryConfig(opts serverOptions, dataVolume string, logger *slog.Logger) 
 		Port:       opts.registryPort,
 		DataVolume: dataVolume,
 		Logger:     logger,
+		Quota:      opts.registryQuota,
 	}
 }
 

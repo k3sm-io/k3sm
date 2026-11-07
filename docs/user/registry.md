@@ -603,6 +603,42 @@ sweep can read it and the half-repository brake lets it through, and one in that
 hold back any other. Each sweep ends with a `registry gc: sweep finished` line that counts the
 repositories stopped and failed and carries the error.
 
+### Quotas
+
+A server can cap the bytes one artifact type takes in the registry. Give `k3sm server` one
+`--registry-quota <artifactType>=<bytes>` per type, for example:
+
+```
+k3sm server --registry-quota application/vnd.cncf.model.manifest.v1+json=500000000000
+```
+
+A manifest's type is its `artifactType`, or its config media type when it has none, so an
+ordinary image counts as `application/vnd.oci.image.config.v1+json`. Types without a quota are not
+limited, and there are no quotas by default. The server writes the quotas into
+`<work-dir>/registry-state/serve.json` at each start, so a change takes effect when the server
+restarts.
+
+A type's usage is the size of the distinct layers its stored manifests name, across every
+repository. A layer that two manifests share, in one repository or several, counts once, and the
+size is the stored blob's, not the size the manifest claims. A push of a manifest that would take
+its type past the quota is refused with `403 DENIED`, the message
+`the push would exceed the registry's storage quota for its artifact type`, and a detail naming the
+type and the quota in bytes. The refused manifest is not stored; its blobs stay until garbage
+collection takes them. Pushing a manifest the registry already holds under another tag costs
+nothing.
+
+The quota is cooperative accounting, not isolation. It is kept per artifact type across the whole
+store, never per repository, namespace or user, and the type is whatever the pushing client
+declares in its manifest. A client that labels a push with another type is charged to that type,
+and one that pushes blobs without a manifest is charged nothing. Use it to keep one kind of
+content from crowding out the rest, not to keep tenants apart. What keeps the registry from filling
+the disk is the free-space check: uploads are refused with `507` once the volume falls below the
+registry's free-space floor, whatever the quotas say.
+
+To make room, delete tags or digests of that type. A digest delete gives its layers back at once.
+A tag delete leaves the manifest stored by digest until garbage collection removes it, and the
+room comes back after that sweep.
+
 ### Restoring a Backup of the Registry
 
 Restore into an emptied `<work-dir>/registry/`, with the server stopped. Do not merge a backup over

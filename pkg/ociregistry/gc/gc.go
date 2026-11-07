@@ -35,6 +35,8 @@ import (
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"golang.org/x/sys/unix"
 
+	artifactv1 "k3sm.io/apis/artifact/v1"
+
 	"k3sm.io/k3sm/internal/atomicfile"
 	"k3sm.io/k3sm/pkg/ociregistry/ref"
 	"k3sm.io/k3sm/pkg/ociregistry/store"
@@ -141,6 +143,14 @@ type Options struct {
 	// then go through the ordinary grace rule. Zero means AbandonFactor times
 	// Grace; otherwise it must be longer than Grace.
 	Abandon time.Duration
+	// Retention is a retention class per artifactType: an untagged manifest
+	// whose artifact type (its artifactType, else its config media type) is
+	// listed is kept, with everything it names, until it is that old rather
+	// than Grace old. Each value must be at least Grace, so a class only ever
+	// keeps more: a tagged manifest is kept at any age whatever its class, and
+	// every brake applies to what a class leaves to reap. An unlisted type, and
+	// a body the collector cannot type, has the grace.
+	Retention map[string]time.Duration
 	// Now is the clock (time.Now when nil).
 	Now func() time.Time
 	// Log receives a record per reaped object and per stopped repository
@@ -153,6 +163,7 @@ type Collector struct {
 	s       *store.Store
 	grace   time.Duration
 	abandon time.Duration
+	retain  retention
 	now     func() time.Time
 	log     *slog.Logger
 	start   time.Time
@@ -197,14 +208,28 @@ func New(s *store.Store, o Options) (*Collector, error) {
 	case o.Abandon <= o.Grace:
 		return nil, fmt.Errorf("gc: abandon horizon %s must be longer than the grace %s", o.Abandon, o.Grace)
 	}
+	retain := make(retention, len(o.Retention))
+	for t, keep := range o.Retention {
+		if t == "" {
+			return nil, errors.New("gc: a retention class names no artifact type")
+		}
+		if keep < o.Grace {
+			return nil, fmt.Errorf("gc: retention %s for %q is shorter than the grace %s", keep, t, o.Grace)
+		}
+		retain[t] = keep - o.Grace
+	}
 	if o.Now == nil {
 		o.Now = time.Now
 	}
 	if o.Log == nil {
 		o.Log = slog.Default()
 	}
-	return &Collector{s: s, grace: o.Grace, abandon: o.Abandon, now: o.Now, log: o.Log, start: o.Now()}, nil
+	return &Collector{s: s, grace: o.Grace, abandon: o.Abandon, retain: retain, now: o.Now, log: o.Log, start: o.Now()}, nil
 }
+
+// retention maps an artifact type to how much longer than the grace an
+// untagged manifest of that type is kept. Every value is at least zero.
+type retention map[string]time.Duration
 
 // SetAfterMark sets fn to run between each repository's unlocked mark and its
 // locked sweep. It exists for callers outside this package that interleave a
@@ -390,7 +415,7 @@ func (c *Collector) sweepLocked(ctx context.Context, n ref.Name, m marked) ([]Ob
 		if err != nil {
 			return err
 		}
-		q, err := makePlan(idx, cont, cutoff, m.reads.locked(cont))
+		q, err := makePlan(idx, cont, cutoff, c.retain, m.reads.locked(cont))
 		if err != nil {
 			return err
 		}
@@ -427,7 +452,7 @@ func (c *Collector) mark(ctx context.Context, n ref.Name, cutoff time.Time) (mar
 	}
 	m := marked{idx: idx, cont: cont, reads: reads{}}
 	read := c.reader(n)
-	m.p, err = makePlan(idx, cont, cutoff, m.reads.unlocked(func(d digest.Digest) ([]byte, error) {
+	m.p, err = makePlan(idx, cont, cutoff, c.retain, m.reads.unlocked(func(d digest.Digest) ([]byte, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -910,11 +935,30 @@ type refs struct {
 	Layers        []ispec.Descriptor `json:"layers"`
 	Manifests     []ispec.Descriptor `json:"manifests"`
 	Subject       *ispec.Descriptor  `json:"subject"`
+	// ArtifactType is held raw so that a value the server would not have
+	// stored (not a string) types nothing rather than failing the read, which
+	// would stop the repository's sweeps.
+	ArtifactType json.RawMessage `json:"artifactType"`
 	// FSLayers is the Docker schema1 layer list (fsLayers[].blobSum). The
 	// server refuses schema1, and any body with this field, at PUT, and the
 	// collector does not follow it: a body that carries the field is
 	// unreadable, whatever else it says.
 	FSLayers json.RawMessage `json:"fsLayers"`
+}
+
+// artifactType returns the body's artifact type under the OCI 1.1 rule (its
+// artifactType, else its config media type), or "" when it has neither or its
+// artifactType is not a string.
+func (r refs) artifactType() string {
+	var at string
+	if len(r.ArtifactType) > 0 && json.Unmarshal(r.ArtifactType, &at) != nil {
+		return ""
+	}
+	cfg := ""
+	if r.Config != nil {
+		cfg = r.Config.MediaType
+	}
+	return artifactv1.ArtifactType(at, cfg)
 }
 
 // parseRefs reads what the manifest body b, stored as d, references. It
@@ -1039,7 +1083,9 @@ func parseBody(b []byte) (refs, error) {
 // before cutoff):
 //
 //   - a tagged row is kept; so is an untagged row whose manifest is younger
-//     than the grace or has no body to judge by;
+//     than the grace or has no body to judge by, and one whose artifact type
+//     has a retention class in keep and is younger than the grace plus that
+//     class's extra time;
 //   - every manifest a kept index names is kept, transitively;
 //   - an untagged row that carries a subject (a referrer) is kept while its
 //     subject is live, transitively: kept, referenced by a kept manifest, or a
@@ -1097,7 +1143,7 @@ func parseBody(b []byte) (refs, error) {
 // in the store. That holds whichever way the walk reached the digest first. So
 // does a child with a row that is unreadable, one over the cap included. A body with no row that does read is
 // followed. A child digest that is not a digest is skipped: no blob can have it.
-func makePlan(idx ispec.Index, cont store.Contents, cutoff time.Time, refsOf func(digest.Digest) (refs, error)) (plan, error) {
+func makePlan(idx ispec.Index, cont store.Contents, cutoff time.Time, keep retention, refsOf func(digest.Digest) (refs, error)) (plan, error) {
 	mtime := make(map[digest.Digest]time.Time, len(cont.Blobs))
 	size := make(map[digest.Digest]int64, len(cont.Blobs))
 	for _, b := range cont.Blobs {
@@ -1144,6 +1190,12 @@ func makePlan(idx ispec.Index, cont store.Contents, cutoff time.Time, refsOf fun
 		m, err := refsOf(r.Digest)
 		if err != nil {
 			return plan{}, planError("untagged "+r.Digest.String(), err)
+		}
+		// A retention class only keeps: a row it holds is kept as a young row
+		// is, whatever its subject, and is still walked for what it names.
+		if extra := keep[m.artifactType()]; extra > 0 && t.After(cutoff.Add(-extra)) {
+			enqueue(item{d: r.Digest, required: true})
+			continue
 		}
 		if m.Subject != nil {
 			// A subject that is not a digest names nothing whose absence the
