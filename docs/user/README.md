@@ -43,25 +43,27 @@ run on hardware, that is an added caveat: nobody has exercised it on real Macs y
     workloads; it boots `linux/arm64` images per Pod today.
 16. [MLX serving](mlx-quickstart.md) walks through serving a model on the Mac's GPU through an
     `/v1/chat/completions` endpoint.
-17. [A Linux server under the vm RuntimeClass](temporal-example.md) runs a durable-execution
+17. [Models in the cluster registry](models.md) covers `k3sm model push`, `import` and `rm`: a model
+    stored once as an OCI artifact, from a directory or a Hugging Face repository at a pinned commit.
+18. [A Linux server under the vm RuntimeClass](temporal-example.md) runs a durable-execution
     server's `linux/arm64` images in per-Pod micro-VMs and talks to it from a native client.
-18. [Interconnects](interconnects.md) covers a Thunderbolt cable between Macs as an opt-in network
+19. [Interconnects](interconnects.md) covers a Thunderbolt cable between Macs as an opt-in network
     for Pods that ask for it, the MLX ranks of a sharded model above all.
-19. [Limitations](limitations.md) lists the gaps.
-20. [Conformance profile](../conformance-profile.md) is the self-assessment of what k3sm targets and why it
+20. [Limitations](limitations.md) lists the gaps.
+21. [Conformance profile](../conformance-profile.md) is the self-assessment of what k3sm targets and why it
     is not a CNCF `[Conformance]` pass.
-21. [Troubleshooting](troubleshooting.md) covers the node's own daemon logs, common failures, and
+22. [Troubleshooting](troubleshooting.md) covers the node's own daemon logs, common failures, and
     recovery.
-22. [Status JSON](status-json.md) is the contract for `k3sm status -o json` and the cheap
+23. [Status JSON](status-json.md) is the contract for `k3sm status -o json` and the cheap
     `k3sm status daemons -o json` probe: fields, enums, versioning and exit codes.
-23. [Container logs](logs.md) covers where a Pod's output is written, `kubectl logs` and its
+24. [Container logs](logs.md) covers where a Pod's output is written, `kubectl logs` and its
     options, rotation, and how to ship logs off a node.
-24. [Stopping and starting](stop-start.md) covers `k3sm stop`, `start` and `restart`, what a stop does
+25. [Stopping and starting](stop-start.md) covers `k3sm stop`, `start` and `restart`, what a stop does
     to pods and the cluster, and how a stop survives a reboot.
-25. [Building images](builder.md) covers `k3sm build` and the in-cluster build engine.
-26. [Helm charts](helm.md) covers installing releases with the `HelmChart` object.
-27. [FAQ](faq.md) gives short answers to the common questions.
-28. [Privacy](privacy.md) lists what the k3sm app's update check sends and what it still reveals.
+26. [Building images](builder.md) covers `k3sm build` and the in-cluster build engine.
+27. [Helm charts](helm.md) covers installing releases with the `HelmChart` object.
+28. [FAQ](faq.md) gives short answers to the common questions.
+29. [Privacy](privacy.md) lists what the k3sm app's update check sends and what it still reveals.
 
 ## Before You Build Anything Real
 

@@ -53,6 +53,8 @@ cmd/k3sm/meshrefresh.go - net.Dialer{} # controlPlaneSourceIP: route probe towar
 
 # Internet downloads, digest-verified, over the default route.
 pkg/builder/buildxhost.go downloadTo http.DefaultClient # buildx release asset download
+pkg/modelpack/hf/client.go DefaultTransport net.Dialer{} # Hub download by `k3sm model import` on the operator's Mac toward the internet (https, the Hub and its CDN hosts only); connect, TLS and header timeouts set; every file hash-verified
+pkg/modelpack/hf/client.go DefaultTransport http.Transport{} # Hub download by `k3sm model import` toward the internet through the dialer above; https only, redirects limited to the Hub and its CDN hosts
 
 # Embedded etcd: its client and metrics listeners are loopback-only by argv (etcdArgs), never a pod address.
 pkg/executor/etcdsupervise.go tcpDial net.Dialer{} # readiness probe of the etcd child's 127.0.0.1 client port
