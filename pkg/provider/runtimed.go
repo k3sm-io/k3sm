@@ -537,9 +537,10 @@ type RuntimedConfig struct {
 	// leaf. The DataRoot denies name only the server and agent children, so a work
 	// dir such as <data root>/cp is denied only through this value
 	// (runtime.Config.StateDir). Empty (the standalone `k3sm node`) renders no
-	// extra deny. NewRuntimed refuses a value the deny would not match
-	// (ErrDataRootNotCanonical), unless it is the runtime's own server or agent
-	// directory, which the profile denies already.
+	// extra deny. The value is made absolute and cleaned. NewRuntimed refuses a
+	// value the deny would not match (ErrDataRootNotCanonical), except the
+	// runtime's own server or agent directory behind a symlink, whose resolved
+	// target is denied instead.
 	StateDir string
 	// DyldShim, when set, is the getaddrinfo DNS shim dylib injected into each
 	// pod via the PodBox annotation runtimed maps to DYLD_INSERT_LIBRARIES. The
@@ -1150,14 +1151,15 @@ var ErrDataRootNotCanonical = errors.New("data root is not its own resolved path
 // dataRootOf returns the data root and the state directory the Seatbelt denies
 // are written from, or an error when a deny could not match. A relative value (a
 // relative --work-dir) is made absolute, because that is where the state it names
-// is written, and runtime.New refuses a relative one.
+// is written, and runtime.New refuses a relative one. The state directory is also
+// cleaned, so a spelling such as a trailing slash, "//" or "/./" that the role
+// accepts is not refused by runtime.New as unclean.
 //
 // A data root that is the runtime's own root returns in the runtime's spelling and
 // is not checked. The profile adds no deny for it, so there is no new deny that could
 // fail to match, and refusing a node that starts today would change a default node
-// for nothing. The state directory is checked on that path too, unless it is the
-// runtime's own server or agent directory, for the same reason: any other leaf
-// renders a deny of its own.
+// for nothing. The state directory is checked on that path too
+// (ownRootStateDir).
 func dataRootOf(cfg RuntimedConfig) (dataRoot, stateDir string, err error) {
 	dir, err := absDenyDir(cfg.DataRoot, ErrDataRootNotCanonical)
 	if err != nil {
@@ -1167,9 +1169,13 @@ func dataRootOf(cfg RuntimedConfig) (dataRoot, stateDir string, err error) {
 	if err != nil {
 		return "", "", err
 	}
+	if stateDir != "" {
+		stateDir = filepath.Clean(stateDir)
+	}
 	root := runtimeRoot(cfg.Root)
 	if dir != "" && withoutFirmlink(dir) == withoutFirmlink(root) {
-		if err := checkOwnRootStateDir(root, stateDir); err != nil {
+		stateDir, err = ownRootStateDir(root, stateDir)
+		if err != nil {
 			return "", "", err
 		}
 		return root, stateDir, nil
@@ -1180,19 +1186,37 @@ func dataRootOf(cfg RuntimedConfig) (dataRoot, stateDir string, err error) {
 	return dir, stateDir, nil
 }
 
-// checkOwnRootStateDir checks the state directory of a node whose data root is the
-// runtime's own root. One of that root's server or agent directories is denied by
-// the profile already and is not checked, as dataRootOf says; any other is.
-func checkOwnRootStateDir(root, stateDir string) error {
+// ownRootStateDir returns the state directory to deny on a node whose data root is
+// the runtime's own root. Any leaf but that root's server or agent directory must
+// be its own resolved path, as under a custom pod root. One of those two is denied
+// by the profile in its configured spelling already, so a node whose work dir is
+// one, or sits, behind a symlink is not refused, because it starts today; the
+// resolved target is returned instead, so the state dir deny names the real files.
+// A target that cannot be resolved, or that runtime.New would refuse
+// (sandbox.ValidateStateDir), is refused with ErrDataRootNotCanonical.
+func ownRootStateDir(root, stateDir string) (string, error) {
 	if stateDir == "" {
-		return nil
+		return "", nil
 	}
-	for _, own := range sandbox.DataRootDenyTrees(root, "") {
-		if withoutFirmlink(stateDir) == withoutFirmlink(own) {
-			return nil
-		}
+	if !slices.ContainsFunc(sandbox.DataRootDenyTrees(root, ""), func(own string) bool {
+		return withoutFirmlink(stateDir) == withoutFirmlink(own)
+	}) {
+		return stateDir, checkResolvedDir(stateDir, ErrDataRootNotCanonical)
 	}
-	return checkResolvedDir(stateDir, ErrDataRootNotCanonical)
+	if _, err := os.Lstat(stateDir); errors.Is(err, fs.ErrNotExist) {
+		return stateDir, nil
+	}
+	resolved, err := filepath.EvalSymlinks(stateDir)
+	if err != nil {
+		return "", fmt.Errorf("%w: %q: %w", ErrDataRootNotCanonical, stateDir, err)
+	}
+	if withoutFirmlink(resolved) == withoutFirmlink(stateDir) {
+		return stateDir, nil
+	}
+	if err := sandbox.ValidateStateDir(resolved, root); err != nil {
+		return "", fmt.Errorf("%w: %q resolves to %q: %w", ErrDataRootNotCanonical, stateDir, resolved, err)
+	}
+	return resolved, nil
 }
 
 // checkDataRoot refuses a data root whose resolved path is not the configured

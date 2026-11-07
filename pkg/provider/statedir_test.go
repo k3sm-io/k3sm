@@ -166,7 +166,18 @@ func TestStateDirSymlinkIsRefused(t *testing.T) {
 			return "", state
 		}, customRoot, true},
 		{"a symlinked default leaf under a custom pod root", linkedLeaf("server"), customRoot, true},
-		{"a symlinked default leaf of the runtime's own root starts", linkedLeaf("server"), ownRoot, false},
+		{"a default leaf of the runtime's own root linked to that root", func(t *testing.T, base string) (string, string) {
+			data := filepath.Join(base, "data")
+			mkdir(t, data)
+			link(t, data, filepath.Join(data, "server"))
+			return data, filepath.Join(data, "server")
+		}, ownRoot, true},
+		{"a dangling default leaf of the runtime's own root", func(t *testing.T, base string) (string, string) {
+			data := filepath.Join(base, "data")
+			mkdir(t, data)
+			link(t, filepath.Join(base, "gone"), filepath.Join(data, "server"))
+			return data, filepath.Join(data, "server")
+		}, ownRoot, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -225,5 +236,96 @@ func TestNewRuntimedRefusesAStateDirItCannotDeny(t *testing.T) {
 				t.Errorf("the refusal is not logged by name:\n%s", logged.String())
 			}
 		})
+	}
+}
+
+// TestStateDirIsCleaned pins that a work dir spelling the role accepts reaches the
+// runtime clean: a default leaf in any spelling keeps the profile byte for byte, and
+// a custom leaf is denied under its clean path.
+func TestStateDirIsCleaned(t *testing.T) {
+	t.Parallel()
+	root := resolvedTempDir(t)
+	for _, leaf := range []string{"server", "agent", "cp"} {
+		if err := os.MkdirAll(filepath.Join(root, leaf), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	profile := func(t *testing.T, stateDir string) string {
+		t.Helper()
+		out, err := sandbox.Generate(&runtimev1.SandboxProfile{DataVolumePath: filepath.Join(root, "pods", "p1", "rootfs")}, sandbox.GenerateOptions{
+			Posture: sandbox.Posture{WorkDir: root, DataRoot: root, StateDir: stateDir},
+		})
+		if err != nil {
+			t.Fatalf("sandbox.Generate(StateDir %q): %v", stateDir, err)
+		}
+		return out
+	}
+	unset := profile(t, "")
+	for _, leaf := range []string{"server", "agent", "cp"} {
+		want := root + "/" + leaf
+		for _, spelling := range []string{want + "/", root + "//" + leaf, root + "/./" + leaf, "/" + want} {
+			t.Run(spelling, func(t *testing.T) {
+				t.Parallel()
+				cfg := RuntimedConfig{Root: root, DataRoot: root, StateDir: spelling}
+				dataRoot, stateDir, err := dataRootOf(cfg)
+				if err != nil {
+					t.Fatalf("dataRootOf: %v", err)
+				}
+				got := runtimedConfigOf(cfg, slog.New(slog.DiscardHandler), "", dataRoot, stateDir).StateDir
+				if got != want {
+					t.Errorf("runtime.Config.StateDir = %q, want %q", got, want)
+				}
+				if err := sandbox.ValidateStateDir(got, root); err != nil {
+					t.Errorf("runtime.New would refuse %q: %v", got, err)
+				}
+				switch prof := profile(t, got); {
+				case leaf != "cp" && prof != unset:
+					t.Errorf("the spelling %q changed a default node's profile", spelling)
+				case leaf == "cp" && !strings.Contains(prof, `(subpath "`+want+`")`):
+					t.Errorf("the spelling %q does not deny %q", spelling, want)
+				}
+			})
+		}
+	}
+}
+
+// TestSymlinkedDefaultLeafDeniesItsTarget pins the default-leaf symlink case: a
+// node whose <root>/server is a symlink keeps starting, and its profile denies the
+// resolved target, where the files are, beside the fixed <root>/server child.
+func TestSymlinkedDefaultLeafDeniesItsTarget(t *testing.T) {
+	base := resolvedTempDir(t)
+	data, target := filepath.Join(base, "data"), filepath.Join(base, "elsewhere")
+	for _, dir := range []string{data, target} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	leaf := filepath.Join(data, "server")
+	if err := os.Symlink(target, leaf); err != nil {
+		t.Fatal(err)
+	}
+	cfg := RuntimedConfig{NodeName: "n1", Root: data, DataRoot: data, StateDir: leaf, PodLogsDir: filepath.Join(base, "podlogs"), Logger: slog.New(slog.DiscardHandler)}
+	dataRoot, stateDir, err := dataRootOf(cfg)
+	if err != nil {
+		t.Fatalf("dataRootOf: %v", err)
+	}
+	if stateDir != target {
+		t.Errorf("state dir = %q, want the resolved target %q", stateDir, target)
+	}
+	rc := runtimedConfigOf(cfg, slog.New(slog.DiscardHandler), "", dataRoot, stateDir)
+	prof, err := sandbox.Generate(&runtimev1.SandboxProfile{DataVolumePath: filepath.Join(data, "pods", "p1", "rootfs")}, sandbox.GenerateOptions{
+		Posture: sandbox.Posture{WorkDir: rc.Root, DataRoot: rc.DataRoot, StateDir: rc.StateDir},
+	})
+	if err != nil {
+		t.Fatalf("sandbox.Generate: %v", err)
+	}
+	for _, dir := range []string{target, leaf} {
+		if !strings.Contains(prof, `(subpath "`+dir+`")`) {
+			t.Errorf("the profile does not deny %q:\n%s", dir, prof)
+		}
+	}
+	stageExecShim(t)
+	if _, err := NewRuntimed(context.Background(), cfg); err != nil {
+		t.Errorf("NewRuntimed: %v", err)
 	}
 }
