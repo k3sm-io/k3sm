@@ -39,6 +39,7 @@ downloading when the scratch volume cannot hold the model plus a reserve. Its `k
 directory is removed when the import ends or is interrupted, and a later import sweeps one a killed process
 left behind after 24 hours. See [Models in the cluster registry](docs/user/models.md). `k3sm model push` no longer
   re-sends a manifest the tag already names. No RBAC changes.
+- A node under disk pressure evicts cached artifacts no pod or pin holds, least recently released first, before unreferenced images.
 - `k3sm server --registry-quota <artifactType>=<bytes>`, repeatable, caps the bytes one artifact type
   takes in the cluster registry. A push that would pass it is refused with `403 DENIED`; a layer
   shared between manifests counts once. See the Quotas section of `docs/user/registry.md`.
