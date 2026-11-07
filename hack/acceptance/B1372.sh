@@ -302,7 +302,9 @@ def t(s):
 cond = {c["type"]: c for c in p.get("status", {}).get("conditions", [])}
 created = t(p["metadata"]["creationTimestamp"])
 ready = t(cond["Ready"]["lastTransitionTime"])
-sched = t(cond["PodScheduled"]["lastTransitionTime"])
+# The node provider may publish PodScheduled without a transition time; then
+# status.startTime (when the node accepted it) is that instant, then creation.
+sched = t(cond.get("PodScheduled", {}).get("lastTransitionTime") or p["status"].get("startTime") or p["metadata"]["creationTimestamp"])
 cs = p["status"]["containerStatuses"][0]
 st = (cs.get("state", {}).get("running") or {}).get("startedAt") or (cs.get("lastState", {}).get("terminated") or {}).get("startedAt")
 print(int(ready - created), int(t(st) - sched))
