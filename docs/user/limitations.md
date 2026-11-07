@@ -1110,6 +1110,19 @@ PVC under that default root is therefore refused with `ErrProtectedPath`. The re
 which relocates the runtimed on-disk root off `/Users`. `--work-dir` alone only moves control-plane
 state (kine DB, certs, kubeconfig) and does not change the pods root.
 
+### `--work-dir` Must End in `server` or `agent`
+
+A server's `--work-dir` must be a directory named `server`, and an agent's a directory named
+`agent`: `--work-dir <data root>/server` or `--work-dir <data root>/agent`, for example
+`/data/k3sm/server`. The parent directory is the data root. Pods run under a sandbox that denies
+`<data root>/server` and `<data root>/agent`, and that deny is what keeps a pod out of the
+datastore, the cluster CA keys, the registry store and the node credentials. A work dir under any
+other name, such as `/data/k3sm/srv`, would sit outside the deny, so `k3sm server` and
+`k3sm agent` refuse to start with it and the error names the path to use instead. The defaults
+and every layout `k3sm install` and `k3sm dev` create already follow this rule. To move an
+existing work dir, stop the daemon, rename the directory to `server` (or `agent`) under the same
+parent, and start it again with the new path.
+
 ### Single-Node Datastore Consistency
 
 k3sm embeds **kine** over **SQLite (WAL)**. On a single node the datastore serves a **consistent LIST**;

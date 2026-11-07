@@ -46,7 +46,7 @@ func (f *failingTransport) RoundTrip(*http.Request) (*http.Response, error) {
 // etcd member rebuilt on disk.
 func restoredJoinedServer(t *testing.T) serverOptions {
 	t.Helper()
-	wd := t.TempDir()
+	wd := tempServerWorkDir(t)
 	h, err := certs.EnsureHierarchy(wd, certs.RoleMintAuthority, certs.PostureEtcd)
 	if err != nil {
 		t.Fatal(err)

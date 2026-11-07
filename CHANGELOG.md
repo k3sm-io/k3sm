@@ -175,6 +175,12 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
 
 ### Changed
 
+- `k3sm server` and `k3sm agent` refuse a `--work-dir` that is not named `server` or `agent`
+  respectively. Pods are denied `<data root>/server` and `<data root>/agent`, where the data root is
+  the work dir's parent, so a work dir under another name, such as `/data/k3sm/srv`, left the
+  datastore, the CA keys and the registry store open to pods. The error names the layout to use:
+  `--work-dir <data root>/server`. The defaults and installed layouts are unaffected. See
+  [limitations](docs/user/limitations.md#--work-dir-must-end-in-server-or-agent).
 - The bundled buildx moves from v0.38.0 to v0.38.1, a patch release. The pinned checksums move with it.
 - `k3sm image prune --force` frees the layers of the untagged manifests it deleted at once, instead
   of leaving them for the registry's next scheduled garbage collection (every 6 hours). After it

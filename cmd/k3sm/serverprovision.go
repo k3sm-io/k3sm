@@ -36,6 +36,7 @@ import (
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/interconnect"
 	"k3sm.io/k3sm/pkg/registrysvc"
+	"k3sm.io/runtimed/pkg/sandbox"
 )
 
 // serverPKI is the mesh path's provisioned trust material; zero single-node.
@@ -180,6 +181,12 @@ func validateServerOptions(opts *serverOptions, workDirErr error, logger *slog.L
 			return fmt.Errorf("resolve control-plane work-dir: %w (pass --work-dir)", workDirErr)
 		}
 		return fmt.Errorf("control-plane work-dir is empty (pass --work-dir)")
+	}
+	// The work dir's name, before anything is created in it: the pod sandbox
+	// denies <data root>/server only, so a server work dir under another name
+	// would leave the datastore, the CA keys and the registry store open to pods.
+	if err := checkWorkDirLayout(opts.workDir, sandbox.ServerSubdir); err != nil {
+		return err
 	}
 	// Refuse a shadowed data root before touching it: writing the work-dir into
 	// a declared-but-unmounted mountpoint would build a fresh, empty datastore

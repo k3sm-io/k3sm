@@ -53,6 +53,7 @@ import (
 	"k3sm.io/k3sm/pkg/netserve"
 	"k3sm.io/k3sm/pkg/ports"
 	"k3sm.io/k3sm/pkg/update"
+	"k3sm.io/runtimed/pkg/sandbox"
 )
 
 // meshKeyRef is the file name (under both this node's work dir and the root-only
@@ -211,6 +212,12 @@ func runAgent(args []string) error {
 	// allocator knows.
 	if opts.server == "" {
 		return fmt.Errorf("--server is required")
+	}
+	// The work dir's name, before anything is joined or written: the pod
+	// sandbox denies <data root>/agent only, so an agent work dir under another
+	// name would leave the node password and kubeconfig open to pods.
+	if err := checkWorkDirLayout(opts.workDir, sandbox.AgentSubdir); err != nil {
+		return err
 	}
 	if err := checkNodePortAddresses(&opts.nodePortAddresses, opts.network); err != nil {
 		return err

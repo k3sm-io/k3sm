@@ -413,7 +413,7 @@ func TestTLSSANNeverBlocksMaintenanceExits(t *testing.T) {
 		var opts serverOptions
 		fsys := flag.NewFlagSet("server", flag.ContinueOnError)
 		_ = registerServerFlags(fsys, &opts)
-		args := append([]string{"--work-dir", t.TempDir(), "--node-name", "server-a", "--mesh-ip", tlsSANTestMesh, "--tls-san=*.bad.example.com"}, extra...)
+		args := append([]string{"--work-dir", tempServerWorkDir(t), "--node-name", "server-a", "--mesh-ip", tlsSANTestMesh, "--tls-san=*.bad.example.com"}, extra...)
 		if err := fsys.Parse(args); err != nil {
 			t.Fatal(err)
 		}

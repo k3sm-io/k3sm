@@ -138,7 +138,7 @@ func TestServerTokenFile(t *testing.T) {
 			joinServer: "192.0.2.10",
 			etcdPeerIP: "192.0.2.20",
 			nodeName:   "server-b",
-			workDir:    t.TempDir(),
+			workDir:    tempServerWorkDir(t),
 			tokenFile:  write(t, joinToken+"\n", 0o600),
 		}
 		logger := slog.New(slog.DiscardHandler)
@@ -170,7 +170,7 @@ func TestServerTokenFile(t *testing.T) {
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				opts := tc.opts
-				opts.nodeName, opts.workDir = "server-a", t.TempDir()
+				opts.nodeName, opts.workDir = "server-a", tempServerWorkDir(t)
 				err := validateServerOptions(&opts, nil, logger)
 				if !errors.Is(err, errServerTokenAsAdmin) {
 					t.Fatalf("validateServerOptions = %v, want errServerTokenAsAdmin", err)
@@ -182,7 +182,7 @@ func TestServerTokenFile(t *testing.T) {
 		}
 		// An ordinary admin token and a worker token are not refused by this.
 		for _, tok := range []string{"k3sm-adm1n-s3cr3t", "K10abc::node:w0rker"} {
-			opts := serverOptions{token: tok, nodeName: "server-a", workDir: t.TempDir()}
+			opts := serverOptions{token: tok, nodeName: "server-a", workDir: tempServerWorkDir(t)}
 			if err := validateServerOptions(&opts, nil, logger); err != nil {
 				t.Errorf("validateServerOptions with %q = %v, want nil", tok, err)
 			}
