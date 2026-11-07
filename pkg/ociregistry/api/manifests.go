@@ -348,21 +348,22 @@ func (s *Server) putManifest(w http.ResponseWriter, r *http.Request, n ref.Name)
 		return
 	}
 	// The quota admits the manifest before its row is written, so two PUTs
-	// cannot both take the same room; a write that fails gives it back.
-	var release, admitted func()
+	// cannot both take the same room. The hold ends however the handler does:
+	// counted once the row is written, given back if it never is.
+	finish := func(bool) {}
 	if checked.artifactType != "" {
 		d := rf.Digest
 		if d == "" {
 			d = digest.FromBytes(body)
 		}
-		release, admitted, err = s.admitQuota(n, d, checked.artifactType, checked.layers)
+		finish, err = s.admitQuota(n, d, checked.artifactType, checked.layers)
 		if err != nil {
 			s.fail(w, r, err)
 			return
 		}
-	} else {
-		release, admitted = func() {}, func() {}
 	}
+	wrote := false
+	defer func() { finish(wrote) }()
 	if s.manifestChecked != nil {
 		s.manifestChecked()
 	}
@@ -386,11 +387,10 @@ func (s *Server) putManifest(w http.ResponseWriter, r *http.Request, n ref.Name)
 	}
 	desc, err := s.st.PutManifestChecked(r.Context(), n, rf, mt, body, underLock)
 	if err != nil {
-		release()
 		s.fail(w, r, err)
 		return
 	}
-	admitted()
+	wrote = true
 	for _, t := range tags {
 		if _, err := s.st.PutManifestChecked(r.Context(), n, ref.Reference{Tag: t}, mt, body, underLock); err != nil {
 			s.fail(w, r, err)

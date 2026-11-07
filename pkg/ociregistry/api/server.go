@@ -266,6 +266,9 @@ type Server struct {
 	// manifestChecked, when set, runs between a manifest PUT's first blob
 	// check and the index write (a seam for tests that race a sweep).
 	manifestChecked func()
+	// quotaRead, when set, runs between a quota rebuild's read of the store
+	// and its install (a seam for tests that write while it reads).
+	quotaRead func()
 	// manifestRead, when set, runs between a manifest HEAD's read and its
 	// touch (a seam for tests that reap the manifest in between).
 	manifestRead func()
