@@ -1153,7 +1153,8 @@ var ErrDataRootNotCanonical = errors.New("data root is not its own resolved path
 // relative --work-dir) is made absolute, because that is where the state it names
 // is written, and runtime.New refuses a relative one. The state directory is also
 // cleaned, so a spelling such as a trailing slash, "//" or "/./" that the role
-// accepts is not refused by runtime.New as unclean.
+// accepts is not refused by runtime.New as unclean. One with a ".." element is
+// refused with sandbox.ErrInvalidStateDir before it is cleaned.
 //
 // A data root that is the runtime's own root returns in the runtime's spelling and
 // is not checked. The profile adds no deny for it, so there is no new deny that could
@@ -1164,6 +1165,11 @@ func dataRootOf(cfg RuntimedConfig) (dataRoot, stateDir string, err error) {
 	dir, err := absDenyDir(cfg.DataRoot, ErrDataRootNotCanonical)
 	if err != nil {
 		return "", "", err
+	}
+	// Clean folds "link/.." lexically while the OS resolves it to the parent of the
+	// link's target, so the deny would name another directory: refuse it first.
+	if slices.Contains(strings.Split(cfg.StateDir, "/"), "..") {
+		return "", "", fmt.Errorf("%w: %q has a .. element", sandbox.ErrInvalidStateDir, cfg.StateDir)
 	}
 	stateDir, err = absDenyDir(cfg.StateDir, ErrDataRootNotCanonical)
 	if err != nil {
@@ -1194,6 +1200,7 @@ func dataRootOf(cfg RuntimedConfig) (dataRoot, stateDir string, err error) {
 // resolved target is returned instead, so the state dir deny names the real files.
 // A target that cannot be resolved, or that runtime.New would refuse
 // (sandbox.ValidateStateDir), is refused with ErrDataRootNotCanonical.
+// The symlink is resolved once, at startup; a later retarget is not followed.
 func ownRootStateDir(root, stateDir string) (string, error) {
 	if stateDir == "" {
 		return "", nil

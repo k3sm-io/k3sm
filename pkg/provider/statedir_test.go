@@ -329,3 +329,29 @@ func TestSymlinkedDefaultLeafDeniesItsTarget(t *testing.T) {
 		t.Errorf("NewRuntimed: %v", err)
 	}
 }
+
+// TestStateDirWithADotDotElementIsRefused pins that a ".." element is refused
+// before the state dir is cleaned: Clean folds "link/.." lexically, while the OS
+// resolves it to the parent of the link's target, so the deny would name another
+// directory.
+func TestStateDirWithADotDotElementIsRefused(t *testing.T) {
+	t.Parallel()
+	root := resolvedTempDir(t)
+	for _, dir := range []string{filepath.Join(root, "x"), filepath.Join(root, "cp"), filepath.Join(root, "server"), filepath.Join(root, "target", "deep")} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(filepath.Join(root, "target", "deep"), filepath.Join(root, "link")); err != nil {
+		t.Fatal(err)
+	}
+	for _, spelling := range []string{root + "/x/../cp", root + "/link/../server"} {
+		t.Run(spelling, func(t *testing.T) {
+			t.Parallel()
+			_, got, err := dataRootOf(RuntimedConfig{Root: root, DataRoot: root, StateDir: spelling})
+			if !errors.Is(err, sandbox.ErrInvalidStateDir) {
+				t.Errorf("dataRootOf(StateDir %q) = %q, %v; want sandbox.ErrInvalidStateDir", spelling, got, err)
+			}
+		})
+	}
+}
