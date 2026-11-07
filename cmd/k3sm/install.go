@@ -414,7 +414,7 @@ func parseInstallFlags(args []string) (installFlags, error) {
 	var o installFlags
 	fs := flag.NewFlagSet("install", flag.ContinueOnError)
 	fs.StringVar(&o.targetUser, "user", os.Getenv("SUDO_USER"), "the human whose ~/.kube/config receives the admin kubeconfig (default $SUDO_USER)")
-	fs.StringVar(&o.serviceCIDR, "service-cidr", install.DefaultServiceCIDR, "cluster Service CIDR")
+	fs.StringVar(&o.serviceCIDR, install.ServiceCIDRFlag, install.DefaultServiceCIDR, "cluster Service CIDR. The range is fixed: any value other than the default is refused, because the apiserver, the cluster DNS address and the serving certificates all use "+install.DefaultServiceCIDR)
 	fs.BoolVar(&o.agent, "agent", false, "install this Mac as a WORKER that joins an existing cluster (the io.k3sm.agent daemon) instead of as the control plane; needs --server")
 	fs.BoolVar(&o.clusterInit, "cluster-init", false, "form a new embedded etcd HA control plane on this server; needs --node-ip")
 	fs.BoolVar(&o.serverJoin, "server-join", false, "join this server to an existing embedded etcd HA control plane; needs --server, --token-file and --node-ip")
@@ -614,10 +614,15 @@ func (o installFlags) validateRole() error {
 }
 
 // validateServerRole is validateRole for a control-plane install. It is the
-// install package's ValidateHARequest over the Config these flags become, the
-// same validator install.Install runs before it writes anything, so the CLI
-// and the installer refuse exactly one set of HA shapes.
+// install package's ValidateServiceCIDR and ValidateHARequest over the Config
+// these flags become, the same validators install.Install runs before it
+// writes anything, so the CLI and the installer refuse exactly one set of
+// Service ranges and HA shapes. A worker never reaches it: --service-cidr
+// with --agent is refused by name above.
 func (o installFlags) validateServerRole() error {
+	if err := install.ValidateServiceCIDR(o.serviceCIDR); err != nil {
+		return err
+	}
 	return install.ValidateHARequest(o.installConfig("", nil, nil))
 }
 
