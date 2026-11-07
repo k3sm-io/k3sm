@@ -255,6 +255,13 @@ type nodeOptions struct {
 	// value (a standalone `k3sm node`, a server with no registry) maps nothing.
 	flatRegistry flatRegistryEndpoint
 
+	// guestFromClusterStore makes this node fetch its guest boot pair from the
+	// cluster registry flatRegistry names, never from the release host. `k3sm
+	// agent` sets it: its server publishes the pair there (onGuestArtifacts).
+	// With no cluster registry mapped there is no fallback: the vm capability
+	// is withheld and the reason logged.
+	guestFromClusterStore bool
+
 	// deniedLocalPorts are loopback-only TCP ports every pod's SBPL denies
 	// connect() to — this node's EFFECTIVE kine (etcd shim) port, so a networked
 	// native pod sharing the node's _k3sm uid cannot dial the plaintext
@@ -279,6 +286,12 @@ type nodeOptions struct {
 	// paths keep their exact current shape. It is never called on the hostprocess
 	// runtime, which has no runtimed to ask.
 	attachRuntimeInfo func(operator.RuntimeInfoSource)
+
+	// onGuestArtifacts, when non-nil, is called ONCE with this node's guest boot
+	// pair after the runtimed path has ensured it. `k3sm server` sets it to
+	// publish the pair to its own registry, where workers fetch it; nothing
+	// else sets it. It is not called when the ensure failed.
+	onGuestArtifacts func(provider.EnsuredGuestArtifacts)
 
 	// onExitBegin, when non-nil, is called ONCE at the very start of this node's
 	// teardown — before the embedded runtime close, on both of startNode's exit
@@ -1556,8 +1569,21 @@ func buildProvider(ctx context.Context, opts nodeOptions, cs kubernetes.Interfac
 		// has, advertises VMArtifactsAvailable=false, and fails vm pods closed. Do
 		// NOT "harden" this into a startup error — it is the same rule the startup
 		// pod reap follows, and for the same reason.
-		if art, ok := (provider.GuestArtifactSource{}).Ensure(ctx, cfg.Root, slog.Default()); ok {
-			cfg.GuestArtifacts = &art
+		//
+		// A worker is the exception to "before": its pair comes only from the
+		// cluster store, which is the runtime's own, so NewRuntimed ensures it
+		// once the runtime exists (RuntimedConfig.GuestStore) under the same
+		// never-fail contract, and never from the release host.
+		if opts.guestFromClusterStore {
+			cfg.GuestStore = &provider.GuestArtifactSource{}
+		}
+		if !cfg.GuestFromClusterStore() {
+			if art, ok := (provider.GuestArtifactSource{}).Ensure(ctx, cfg.Root, slog.Default()); ok {
+				cfg.GuestArtifacts = &art
+				if opts.onGuestArtifacts != nil {
+					opts.onGuestArtifacts(art)
+				}
+			}
 		}
 		adapter, err := buildPodNetAdapter(opts)
 		if err != nil {

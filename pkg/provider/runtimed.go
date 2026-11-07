@@ -667,13 +667,26 @@ type RuntimedConfig struct {
 	// set — the kernel, the initramfs and the cmdline a vm pod boots from.
 	// It is DATA, already materialised by GuestArtifactSource.Ensure before this
 	// config is built, never a directory this constructor would fetch into: daemon
-	// start is not a place to discover that a hundred megabytes are missing.
+	// start is not a place to discover that a hundred megabytes are missing. The
+	// one exception is GuestStore below, whose fetch needs the runtime this
+	// constructor builds.
 	//
 	// nil is the FAIL-CLOSED posture and the shipped one on any node whose ensure
 	// did not succeed (an unminted pin, no network, a digest mismatch). It leaves
 	// the vm backend's artifact locator unset, so CreateVM fails every vm pod with
 	// sandbox.ErrGuestArtifactsUnavailable while every native pod is untouched.
 	GuestArtifacts *EnsuredGuestArtifacts
+	// GuestStore makes this node a consumer of the cluster store for its guest
+	// boot artifacts (a worker): when it is non-nil and GuestArtifacts is nil,
+	// NewRuntimed ensures the pinned set from the cluster registry FlatRegistry
+	// names, AFTER runtimed.New (the store is the runtime's own), and installs it
+	// with Runtime.RefreshGuestArtifacts. The release host is never contacted on
+	// that path, not even when FlatRegistry maps nothing: the vm capability is
+	// then withheld with errGuestStoreUnavailable. A failure degrades exactly as
+	// GuestArtifacts nil does.
+	//
+	// nil leaves guest artifacts to GuestArtifacts.
+	GuestStore *GuestArtifactSource
 	// PodLogsDir is the root of the CRI container-log tree, the kubelet's
 	// --pod-logs-dir. Empty defaults to podlogs.DefaultPodLogsDir
 	// (/var/log/pods) — the same default and the same layout a kubelet uses, so
@@ -709,6 +722,14 @@ type RuntimedConfig struct {
 	// another runtime to let go of Root. Zero is runtimed's default; it is a
 	// test seam, so a test whose runtime was not closed fails at once.
 	rootLockWait time.Duration
+}
+
+// GuestFromClusterStore reports whether this node takes its guest boot
+// artifacts only from the cluster store (see GuestStore), so the caller must
+// not run its own release-host ensure. It holds with or without a cluster
+// registry mapped: a worker has no release-host fallback.
+func (c RuntimedConfig) GuestFromClusterStore() bool {
+	return c.GuestStore != nil
 }
 
 // NewRuntimed builds a runtimedRuntime, constructing the in-process runtime with
@@ -848,6 +869,17 @@ func NewRuntimed(ctx context.Context, cfg RuntimedConfig) (*runtimedRuntime, err
 			log.Error("refusing to start: the sandbox could not deny the control-plane state", "err", err)
 		}
 		return nil, fmt.Errorf("init runtimed: %w", err)
+	}
+	// The worker-side guest ensure, HERE and not before runtimed.New: its store
+	// is the runtime's own artifact puller and blob cache, so the vm backend
+	// above was built without a locator and takes one late. It runs before
+	// newRuntimedWith so the VMArtifactsAvailable fact is settled before the
+	// provider exists, and before adoptNodePods so no pod is served first. Like
+	// the release-host ensure it cannot fail construction.
+	if cfg.GuestArtifacts == nil && cfg.GuestFromClusterStore() {
+		if ga, ok := cfg.GuestStore.ensureFromStore(ctx, cfg.Root, cfg.FlatRegistry.Host, rt, log); ok {
+			cfg.GuestArtifacts = &ga
+		}
 	}
 	r := newRuntimedWith(rt, cfg, resolver, log)
 	r.history = history

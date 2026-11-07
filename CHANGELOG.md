@@ -12,6 +12,11 @@ pin, its date, and the tarball's sha256.
 
 ### Added
 
+- The server publishes the pinned guest kernel and initramfs it verified at start to its own cluster
+  registry as `k3sm-system/guest:<pin>` (artifactType `application/vnd.k3sm.guest.v1`, one raw layer
+  each, the layer digests the pin's). A re-publish uploads nothing already present and leaves a tag
+  that already names the manifest alone; a failed publish is logged and retried with backoff and never
+  delays the server's start. See [the `vm` RuntimeClass](docs/user/vm-runtimeclass.md#using-it).
 - `k3sm model ls [-o json]` lists the models in the cluster registry with their weight format,
   quantization, parameter size, total size, file count and weight shard count, read from each model's
   manifest and config without fetching its files. `k3sm model push` copies the quantization and

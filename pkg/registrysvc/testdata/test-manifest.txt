@@ -111,6 +111,7 @@ TestServeRefusesBeforeTheStoreOpens added new with the child switch
 TestServeStateDirHardening kept the behaviour it pins is unchanged by the child switch
 TestServedRegistryRefusesAnonymousPush added new with the child switch
 TestServedRegistryRefusesEncodedPaths added new: a credentialed client past the gate gets the refusal
+TestServerPublishesGuestArtifacts added the server publishes its verified guest boot pair to its own registry
 TestServiceRecord kept the behaviour it pins is unchanged by the child switch
 TestServiceRecordSurvivesAnUnwritableWorkDir kept the behaviour it pins is unchanged by the child switch
 TestServiceRunsTheK3smRegistry added new with the child switch
