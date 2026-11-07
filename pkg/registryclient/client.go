@@ -197,6 +197,11 @@ type Manifest struct {
 	Config       *Descriptor
 	Layers       []Descriptor
 	Manifests    []Descriptor
+	// Raw is the body read, the bytes Digest names.
+	Raw []byte
+	// Served is the media type the registry's Content-Type named, "" when
+	// it named none or only application/json.
+	Served string
 }
 
 // IsIndex reports whether m is an image index (a manifest list).
@@ -304,8 +309,9 @@ func (c *Client) Manifest(ctx context.Context, repository, reference string) (Ma
 		return Manifest{}, fmt.Errorf("decode manifest %s:%s: %w", repository, reference, err)
 	}
 	mt := mediaTypeOf(resp.Header.Get("Content-Type"))
+	served := mt
 	if mt == "" || mt == "application/json" {
-		mt = raw.MediaType
+		mt, served = raw.MediaType, ""
 	}
 	if mt == "" {
 		// An OCI document may omit mediaType; its shape is then the answer.
@@ -314,7 +320,7 @@ func (c *Client) Manifest(ctx context.Context, repository, reference string) (Ma
 			mt = MediaTypeOCIIndex
 		}
 	}
-	m := Manifest{Digest: digest, MediaType: mt, Size: int64(len(body)), ArtifactType: raw.ArtifactType}
+	m := Manifest{Digest: digest, MediaType: mt, Size: int64(len(body)), ArtifactType: raw.ArtifactType, Raw: body, Served: served}
 	switch mt {
 	case MediaTypeOCIIndex, MediaTypeDockerList:
 		m.Manifests = raw.Manifests
