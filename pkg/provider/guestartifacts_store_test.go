@@ -211,32 +211,42 @@ func TestEnsureGuestArtifactsFromClusterStore(t *testing.T) {
 }
 
 // TestNewRuntimedGuestFromClusterStore asserts the store ensure through the
-// production constructor: it runs only when a cluster registry is configured,
-// and the real runtime's vm backend takes the set late.
+// production constructor: a worker ensures from the store once the runtime
+// exists, a worker with no cluster registry gets no release-host fallback, and a
+// node that is not a worker keeps the release-host set wired at construction.
 func TestNewRuntimedGuestFromClusterStore(t *testing.T) {
 	pin, fetcher := mintedPin()
 	flat := image.FlatRegistry{Host: testRegistryHost, Endpoint: image.RegistryEndpoint{Addr: "127.0.0.1:1"}}
 
 	tests := []struct {
 		name      string
+		worker    bool
 		flat      image.FlatRegistry
 		preEnsure bool
 		wantPull  bool
 		wantCaps  bool
+		wantLog   string
 	}{
 		{
-			name:     "a configured cluster registry ensures from the store after construction",
+			name:     "a worker with a cluster registry ensures from the store after construction",
+			worker:   true,
 			flat:     flat,
 			wantPull: true,
 			wantCaps: true,
 		},
 		{
-			name: "no cluster registry leaves the store unused and the capability withheld",
+			name:    "a worker with no cluster registry withholds the capability with no release-host fallback",
+			worker:  true,
+			wantLog: errGuestStoreUnavailable.Error(),
 		},
 		{
-			name:      "no cluster registry keeps the release-host set wired at construction",
+			name:      "a node that is not a worker keeps the release-host set wired at construction",
 			preEnsure: true,
 			wantCaps:  true,
+		},
+		{
+			name: "a node that is not a worker never touches the store, registry or not",
+			flat: flat,
 		},
 	}
 	for _, tc := range tests {
@@ -244,15 +254,20 @@ func TestNewRuntimedGuestFromClusterStore(t *testing.T) {
 			stageExecShim(t)
 			root := t.TempDir()
 			store := newFakeClusterStore(t, pin, fetcher)
+			var logs syncBuffer
 			cfg := RuntimedConfig{
 				NodeName: "n1",
 				Root:     root, PodLogsDir: root,
 				FlatRegistry: tc.flat,
-				GuestStore:   &GuestArtifactSource{Pin: pinFunc(pin, nil), Store: store, Timeout: 30 * time.Second},
-				Logger:       slog.New(slog.DiscardHandler),
+				Logger:       slog.New(slog.NewTextHandler(&logs, nil)),
 			}
-			if got, want := cfg.GuestFromClusterStore(), tc.flat.Host != ""; got != want {
-				t.Fatalf("GuestFromClusterStore() = %v, want %v", got, want)
+			if tc.worker {
+				cfg.GuestStore = &GuestArtifactSource{Pin: pinFunc(pin, nil), Store: store, Timeout: 30 * time.Second}
+			}
+			// The caller (cmd/k3sm) runs the release-host ensure iff this is false,
+			// so a worker must report true even with no registry mapped.
+			if got := cfg.GuestFromClusterStore(); got != tc.worker {
+				t.Fatalf("GuestFromClusterStore() = %v, want %v", got, tc.worker)
 			}
 			if tc.preEnsure {
 				ga, ok := GuestArtifactSource{Pin: pinFunc(pin, nil), Fetcher: fetcher, Timeout: 30 * time.Second}.
@@ -271,6 +286,12 @@ func TestNewRuntimedGuestFromClusterStore(t *testing.T) {
 			}
 			if caps := rt.Capabilities(t.Context()); caps.VMArtifacts != tc.wantCaps {
 				t.Errorf("Capabilities().VMArtifacts = %v, want %v", caps.VMArtifacts, tc.wantCaps)
+			}
+			if tc.wantLog != "" && !strings.Contains(logs.String(), tc.wantLog) {
+				t.Errorf("log does not name %q:\n%s", tc.wantLog, logs.String())
+			}
+			if !tc.wantCaps && !artifactDirEmpty(t, root) {
+				t.Errorf("a withheld ensure left a guest-artifact set in %s", GuestArtifactsDir(root))
 			}
 			assertRuntimeStillServes(t, rt)
 		})

@@ -258,8 +258,8 @@ type nodeOptions struct {
 	// guestFromClusterStore makes this node fetch its guest boot pair from the
 	// cluster registry flatRegistry names, never from the release host. `k3sm
 	// agent` sets it: its server publishes the pair there (onGuestArtifacts).
-	// With no cluster registry mapped it has no effect and the release-host
-	// ensure runs as on every other node.
+	// With no cluster registry mapped there is no fallback: the vm capability
+	// is withheld and the reason logged.
 	guestFromClusterStore bool
 
 	// deniedLocalPorts are loopback-only TCP ports every pod's SBPL denies
@@ -1570,10 +1570,10 @@ func buildProvider(ctx context.Context, opts nodeOptions, cs kubernetes.Interfac
 		// NOT "harden" this into a startup error — it is the same rule the startup
 		// pod reap follows, and for the same reason.
 		//
-		// A worker with a cluster registry is the exception to "before": its
-		// pair comes from the cluster store, which is the runtime's own, so
-		// NewRuntimed ensures it once the runtime exists (RuntimedConfig.GuestStore)
-		// under the same never-fail contract.
+		// A worker is the exception to "before": its pair comes only from the
+		// cluster store, which is the runtime's own, so NewRuntimed ensures it
+		// once the runtime exists (RuntimedConfig.GuestStore) under the same
+		// never-fail contract, and never from the release host.
 		if opts.guestFromClusterStore {
 			cfg.GuestStore = &provider.GuestArtifactSource{}
 		}

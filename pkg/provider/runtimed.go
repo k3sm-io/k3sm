@@ -677,13 +677,15 @@ type RuntimedConfig struct {
 	// sandbox.ErrGuestArtifactsUnavailable while every native pod is untouched.
 	GuestArtifacts *EnsuredGuestArtifacts
 	// GuestStore makes this node a consumer of the cluster store for its guest
-	// boot artifacts: when it is non-nil, FlatRegistry names a cluster registry
-	// and GuestArtifacts is nil, NewRuntimed ensures the pinned set from that
-	// registry AFTER runtimed.New (the store is the runtime's own) and installs
-	// it with Runtime.RefreshGuestArtifacts. The release host is never contacted
-	// on that path. A failure degrades exactly as GuestArtifacts nil does.
+	// boot artifacts (a worker): when it is non-nil and GuestArtifacts is nil,
+	// NewRuntimed ensures the pinned set from the cluster registry FlatRegistry
+	// names, AFTER runtimed.New (the store is the runtime's own), and installs it
+	// with Runtime.RefreshGuestArtifacts. The release host is never contacted on
+	// that path, not even when FlatRegistry maps nothing: the vm capability is
+	// then withheld with errGuestStoreUnavailable. A failure degrades exactly as
+	// GuestArtifacts nil does.
 	//
-	// nil, or no cluster registry, leaves guest artifacts to GuestArtifacts.
+	// nil leaves guest artifacts to GuestArtifacts.
 	GuestStore *GuestArtifactSource
 	// PodLogsDir is the root of the CRI container-log tree, the kubelet's
 	// --pod-logs-dir. Empty defaults to podlogs.DefaultPodLogsDir
@@ -722,11 +724,12 @@ type RuntimedConfig struct {
 	rootLockWait time.Duration
 }
 
-// GuestFromClusterStore reports whether NewRuntimed ensures this node's guest
-// boot artifacts from the cluster store (see GuestStore), so the caller must not
-// run its own release-host ensure.
+// GuestFromClusterStore reports whether this node takes its guest boot
+// artifacts only from the cluster store (see GuestStore), so the caller must
+// not run its own release-host ensure. It holds with or without a cluster
+// registry mapped: a worker has no release-host fallback.
 func (c RuntimedConfig) GuestFromClusterStore() bool {
-	return c.GuestStore != nil && c.FlatRegistry.Host != ""
+	return c.GuestStore != nil
 }
 
 // NewRuntimed builds a runtimedRuntime, constructing the in-process runtime with

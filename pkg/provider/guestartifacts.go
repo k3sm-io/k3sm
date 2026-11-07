@@ -18,6 +18,7 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"path/filepath"
 	"time"
@@ -155,6 +156,11 @@ func (s GuestArtifactSource) Ensure(ctx context.Context, root string, log *slog.
 	return EnsuredGuestArtifacts{Pin: pin, Artifacts: art}, true
 }
 
+// errGuestStoreUnavailable reports that a worker has no cluster registry to
+// fetch its guest boot artifacts from. A worker has no release-host fallback, so
+// this withholds the vm capability rather than fetching from anywhere else.
+var errGuestStoreUnavailable = errors.New("guest artifacts: no cluster registry for this agent; vm pods unavailable (no release-host fallback on a worker)")
+
 // guestStoreRuntime is the slice of the in-process runtime the worker-side
 // ensure needs: the cluster store to fetch from, and the late install into the
 // vm backend. *runtimed.Runtime satisfies it.
@@ -177,6 +183,10 @@ var _ guestStoreRuntime = (*runtimed.Runtime)(nil)
 // that the backend refused is reported false as well, because the capability
 // must mirror exactly what CreateVM can boot.
 //
+// An empty registryHost (the worker could not map its server's registry) is
+// refused with errGuestStoreUnavailable before anything is pulled: a worker
+// never falls back to the release host.
+//
 // The store pulls with no credential: the cluster registry serves reads
 // anonymously, exactly as it does for this node's image pulls.
 func (s GuestArtifactSource) ensureFromStore(ctx context.Context, root, registryHost string, rt guestStoreRuntime, log *slog.Logger) (EnsuredGuestArtifacts, bool) {
@@ -185,6 +195,11 @@ func (s GuestArtifactSource) ensureFromStore(ctx context.Context, root, registry
 	}
 	var zero EnsuredGuestArtifacts
 
+	if registryHost == "" {
+		log.Warn("guest boot artifacts unavailable; the vm capability is OFF on this node (native pods are unaffected, vm pods fail closed)",
+			"guest_kernel", guestartifacts.ActiveGuestKernel, "err", errGuestStoreUnavailable)
+		return zero, false
+	}
 	pin, err := s.pin()
 	if err != nil {
 		log.Info("guest boot artifacts unavailable: no usable pin, so this node advertises no vm-artifact capability and every vm pod will fail closed",
