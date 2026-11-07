@@ -295,6 +295,21 @@ An `image` volume is supported, and its reference must name the cluster registry
 refused at creation with a Warning Event whose reason is `ArtifactPullRefused`, so a Pod cannot make
 the node fetch from a host of its choosing.
 
+When the node cannot fetch a mounted `image` volume, the Pod is kept `Pending` instead of failed, and
+the reason it reports says what happens next:
+
+- A transfer or registry failure reads `ErrImagePull`, then `ImagePullBackOff`, and is retried on the
+  image pull back-off (10s, doubling to a 300s ceiling), with a `Failed` Warning Event per attempt.
+- A store that would drop below its free-space floor reads `ArtifactPullBackOff` and is retried on the
+  same back-off, with a `Failed` Warning Event per attempt. Free space on the node and the next attempt
+  creates the Pod.
+- An `imagePullSecret` that cannot be resolved reads `ErrImagePull` and records one `Failed` Warning
+  Event. It is not retried on a back-off: the node re-checks it quietly, so fixing the Secret starts
+  the Pod within about 20s.
+- A reference the runtime refuses because it names another registry reads `ArtifactPullRefused`,
+  records one Warning Event with that reason, and is never retried. Fix the reference and recreate the
+  Pod.
+
 ### `emptyDir` with `medium: Memory` Is Refused, Not Silently Disk-Backed
 
 On the default (native) runtime, a Pod that declares an `emptyDir` with a non-empty `medium` is
