@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io/fs"
 	"maps"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -34,8 +35,19 @@ import (
 // stagingRoot is its sibling. The whole feature is the claim that nothing lands
 // in the first until everything has landed in the second.
 
-func stageCfg() Config {
-	return Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"}
+// stageCfg is the install these tests stage. Its install root and staging
+// root live under testRoot(t), the same directory a newFakeSystem(t) is
+// confined to, because the fake really creates, renames and removes the
+// staging tree.
+func stageCfg(t testing.TB) Config {
+	t.Helper()
+	root := testRoot(t)
+	return Config{
+		BinarySource:   "/tmp/k3sm",
+		TargetUser:     "alice",
+		InstallDir:     filepath.Join(root, "Library", "k3sm"),
+		StagingOptions: StagingOptions{StagingRoot: filepath.Join(root, "Library", "k3sm.staging")},
+	}
 }
 
 // liveWrites are the copies this install made INTO the live install root — the
@@ -71,18 +83,18 @@ func stagedWrites(calls []string, cfg Config) []string {
 // only after the daemons have been verified.
 func TestInstallStagesTheRootAndPublishesItOnce(t *testing.T) {
 	shrinkRestartBudgets(t)
-	cfg := stageCfg().withDefaults()
+	cfg := stageCfg(t).withDefaults()
 	f := newFakeSystem(t)
 
 	// Run 1 is the first install (nothing at the live path); run 2 is the
 	// upgrade this item exists for — a live tree being replaced under running
 	// daemons.
-	if err := Install(context.Background(), f, stageCfg()); err != nil {
+	if err := Install(context.Background(), f, stageCfg(t)); err != nil {
 		t.Fatalf("first Install: %v", err)
 	}
 	firstTree := f.treeUnder(cfg.InstallDir)
 	f.calls = nil
-	if err := Install(context.Background(), f, stageCfg()); err != nil {
+	if err := Install(context.Background(), f, stageCfg(t)); err != nil {
 		t.Fatalf("reinstall: %v", err)
 	}
 	calls := f.calls
@@ -190,9 +202,9 @@ func TestInstallStagesTheRootAndPublishesItOnce(t *testing.T) {
 // — the new binary beside the old helpers, with launchd free to re-exec either.
 func TestInstallStagingFailureLeavesTheLiveRootUntouched(t *testing.T) {
 	shrinkRestartBudgets(t)
-	cfg := stageCfg().withDefaults()
+	cfg := stageCfg(t).withDefaults()
 	f := newFakeSystem(t)
-	if err := Install(context.Background(), f, stageCfg()); err != nil {
+	if err := Install(context.Background(), f, stageCfg(t)); err != nil {
 		t.Fatalf("first Install: %v", err)
 	}
 	before := f.treeUnder(cfg.InstallDir)
@@ -202,7 +214,7 @@ func TestInstallStagingFailureLeavesTheLiveRootUntouched(t *testing.T) {
 	// shims, before the payload.
 	full := errors.New("ditto: No space left on device")
 	f.putCopyErr(cfg.stagedVMHost(), full)
-	err := Install(context.Background(), f, stageCfg())
+	err := Install(context.Background(), f, stageCfg(t))
 	if err == nil {
 		t.Fatal("Install succeeded with a copy that could not be made")
 	}
@@ -236,9 +248,9 @@ func TestInstallStagingFailureLeavesTheLiveRootUntouched(t *testing.T) {
 // there is no reap.
 func TestInstallFirstInstallRenamesTheStagedRootIntoPlace(t *testing.T) {
 	shrinkRestartBudgets(t)
-	cfg := stageCfg().withDefaults()
+	cfg := stageCfg(t).withDefaults()
 	f := newFakeSystem(t)
-	if err := Install(context.Background(), f, stageCfg()); err != nil {
+	if err := Install(context.Background(), f, stageCfg(t)); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
 	if at := idx(f.calls, fmt.Sprintf("SwapInstallRoot:%s<->%s:rename", cfg.swapDir(), cfg.InstallDir)); at < 0 {
@@ -258,9 +270,9 @@ func TestInstallFirstInstallRenamesTheStagedRootIntoPlace(t *testing.T) {
 // of that in one sentence.
 func TestInstallRevertsTheSwapWhenTheWiringFails(t *testing.T) {
 	shrinkRestartBudgets(t)
-	cfg := stageCfg().withDefaults()
+	cfg := stageCfg(t).withDefaults()
 	f := newFakeSystem(t)
-	if err := Install(context.Background(), f, stageCfg()); err != nil {
+	if err := Install(context.Background(), f, stageCfg(t)); err != nil {
 		t.Fatalf("first Install: %v", err)
 	}
 	before := f.treeUnder(cfg.InstallDir)
@@ -270,7 +282,7 @@ func TestInstallRevertsTheSwapWhenTheWiringFails(t *testing.T) {
 	// The new netd will not bootstrap. The publish has already happened by the
 	// time the restart runs, which is exactly the window the revert exists for.
 	f.putBootstrapAlways(NetdLabel, errors.New("Bootstrap failed: 125: Domain does not support specified action"))
-	err := Install(context.Background(), f, stageCfg())
+	err := Install(context.Background(), f, stageCfg(t))
 	if err == nil {
 		t.Fatal("Install succeeded with a daemon that never came up")
 	}
@@ -299,7 +311,7 @@ func TestInstallRevertsTheSwapWhenTheWiringFails(t *testing.T) {
 // publish a mixture of two builds — complete-looking and never tested — so the
 // second one is refused before it writes anything at all.
 func TestInstallRefusesASecondConcurrentInstall(t *testing.T) {
-	cfg := stageCfg().withDefaults()
+	cfg := stageCfg(t).withDefaults()
 	f := newFakeSystem(t)
 	// The lock another install is holding.
 	release, err := f.LockInstall(cfg.installLockPath())
@@ -308,7 +320,7 @@ func TestInstallRefusesASecondConcurrentInstall(t *testing.T) {
 	}
 	f.calls = nil
 
-	err = Install(context.Background(), f, stageCfg())
+	err = Install(context.Background(), f, stageCfg(t))
 	if !errors.Is(err, ErrInstallInProgress) {
 		t.Fatalf("Install error = %v, want ErrInstallInProgress", err)
 	}
@@ -324,7 +336,7 @@ func TestInstallRefusesASecondConcurrentInstall(t *testing.T) {
 	}
 	// ...and once the other install finishes, this one proceeds.
 	shrinkRestartBudgets(t)
-	if err := Install(context.Background(), f, stageCfg()); err != nil {
+	if err := Install(context.Background(), f, stageCfg(t)); err != nil {
 		t.Fatalf("Install after the lock was released: %v", err)
 	}
 }
@@ -333,39 +345,39 @@ func TestInstallRefusesASecondConcurrentInstall(t *testing.T) {
 // "clean up after a crashed install" and "root deletes whatever is at this
 // path". A symlink at the staging path is refused, and nothing is removed.
 func TestInstallRefusesAnUntrustedStagingPath(t *testing.T) {
-	cfg := stageCfg().withDefaults()
 	for _, tc := range []struct {
 		name string
-		seed func(f *fakeSystem)
+		seed func(f *fakeSystem, cfg Config)
 		want string
 	}{
 		{
 			name: "a symlink",
-			seed: func(f *fakeSystem) {
+			seed: func(f *fakeSystem, cfg Config) {
 				f.putOwned(cfg.swapDir(), 0, 0, 0o755|fs.ModeSymlink, EntrySymlink)
 			},
 			want: "is a symlink",
 		},
 		{
 			name: "a regular file",
-			seed: func(f *fakeSystem) { f.putOwned(cfg.swapDir(), 0, 0, 0o644, EntryRegular) },
+			seed: func(f *fakeSystem, cfg Config) { f.putOwned(cfg.swapDir(), 0, 0, 0o644, EntryRegular) },
 			want: "not a directory",
 		},
 		{
 			name: "owned by somebody else",
-			seed: func(f *fakeSystem) { f.putOwned(cfg.swapDir(), 501, 0, 0o755|fs.ModeDir, EntryDir) },
+			seed: func(f *fakeSystem, cfg Config) { f.putOwned(cfg.swapDir(), 501, 0, 0o755|fs.ModeDir, EntryDir) },
 			want: "owned by uid 501, not root",
 		},
 		{
 			name: "group-writable",
-			seed: func(f *fakeSystem) { f.putOwned(cfg.swapDir(), 0, 0, 0o775|fs.ModeDir, EntryDir) },
+			seed: func(f *fakeSystem, cfg Config) { f.putOwned(cfg.swapDir(), 0, 0, 0o775|fs.ModeDir, EntryDir) },
 			want: "group- or world-writable",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			f := &fakeSystem{}
-			tc.seed(f)
-			err := Install(context.Background(), f, stageCfg())
+			cfg := stageCfg(t).withDefaults()
+			f := newFakeSystem(t)
+			tc.seed(f, cfg)
+			err := Install(context.Background(), f, stageCfg(t))
 			if err == nil {
 				t.Fatal("Install accepted an untrusted staging path")
 			}
@@ -388,11 +400,11 @@ func TestInstallRefusesAnUntrustedStagingPath(t *testing.T) {
 // mixture the staging exists to prevent.
 func TestStaleStagingTreeIsRemovedBeforeStaging(t *testing.T) {
 	shrinkRestartBudgets(t)
-	cfg := stageCfg().withDefaults()
+	cfg := stageCfg(t).withDefaults()
 	f := newFakeSystem(t)
 	f.putOwned(cfg.swapDir(), 0, 0, 0o755|fs.ModeDir, EntryDir)
 	f.putTree(cfg.stagedBinary(), "/tmp/an-older-run/k3sm")
-	if err := Install(context.Background(), f, stageCfg()); err != nil {
+	if err := Install(context.Background(), f, stageCfg(t)); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
 	remove := idx(f.calls, "RemoveTree:"+cfg.swapDir())
@@ -411,15 +423,15 @@ func TestStaleStagingTreeIsRemovedBeforeStaging(t *testing.T) {
 // migration mounted inside <InstallDir>.swap would be published into the
 // install root by the swap, or unmounted out from under itself.
 func TestDataVolumeStagingIsNeverRedirected(t *testing.T) {
-	cfg := stageCfg().withDefaults()
+	cfg := stageCfg(t).withDefaults()
 	// The path is under the install root, so the redirection WOULD move it...
 	if got := cfg.stagedPath(cfg.datavolStaging()); got == cfg.datavolStaging() {
 		t.Fatalf("stagedPath(%s) = %s: the pin is vacuous unless the datavol mount point is under the install root", cfg.datavolStaging(), got)
 	}
 	// ...and nothing in the product asks it to. The one call site takes the
 	// nested path verbatim; see datavol.go's migrateDataRoot.
-	if cfg.datavolStaging() != DefaultInstallDir+"/"+datavolStagingName {
-		t.Errorf("datavolStaging() = %s, want the nested mount point %s", cfg.datavolStaging(), DatavolStagingDir)
+	if want := filepath.Join(cfg.InstallDir, datavolStagingName); cfg.datavolStaging() != want {
+		t.Errorf("datavolStaging() = %s, want the nested mount point %s", cfg.datavolStaging(), want)
 	}
 	if strings.HasPrefix(cfg.datavolStaging(), cfg.swapDir()) {
 		t.Error("the data-volume mount point lives inside the install root's staging tree")
@@ -525,7 +537,7 @@ func TestFreeSpacePreflight(t *testing.T) {
 	t.Run("a short volume refuses before the first write", func(t *testing.T) {
 		f := newFakeSystem(t)
 		f.putSpace(1<<20, 4<<30)
-		err := Install(context.Background(), f, stageCfg())
+		err := Install(context.Background(), f, stageCfg(t))
 		if err == nil {
 			t.Fatal("Install proceeded onto a volume that cannot hold the staged tree")
 		}
@@ -543,7 +555,7 @@ func TestFreeSpacePreflight(t *testing.T) {
 		shrinkRestartBudgets(t)
 		f := newFakeSystem(t)
 		f.putSpaceErr(errors.New("statfs: operation not permitted"))
-		if err := Install(context.Background(), f, stageCfg()); err != nil {
+		if err := Install(context.Background(), f, stageCfg(t)); err != nil {
 			t.Fatalf("Install: %v", err)
 		}
 	})

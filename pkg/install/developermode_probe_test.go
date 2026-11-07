@@ -95,7 +95,7 @@ func TestDeveloperModeInvalidMarkerNotRestoredOnRevert(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFakeSystem(t)
-			if err := Install(context.Background(), f, stageCfg()); err != nil {
+			if err := Install(context.Background(), f, stageCfg(t)); err != nil {
 				t.Fatalf("first Install: %v", err)
 			}
 			seedMarkerAncestors(f)
@@ -111,7 +111,7 @@ func TestDeveloperModeInvalidMarkerNotRestoredOnRevert(t *testing.T) {
 			// A bootstrap error that is not transient fails on the first
 			// attempt, so the revert runs without waiting on any budget.
 			f.putBootstrapAlways(NetdLabel, errors.New("Bootstrap failed: 125: Domain does not support specified action"))
-			cfg := stageCfg()
+			cfg := stageCfg(t)
 			cfg.Signer = fakeSigner{ids: map[string]string{"/tmp/k3sm": testTeamID}}
 			err := Install(context.Background(), f, cfg)
 			if err == nil || !strings.Contains(err.Error(), "rolled back to the previous install root") {
@@ -141,7 +141,7 @@ func TestDeveloperModeValidMarkerRestoredOnPlainInstallRevert(t *testing.T) {
 	removeCall := "RemoveEntry:/Library:k3sm.developer-mode"
 	restoreCall := "WriteRootOnlyFile:" + DeveloperModeMarkerPath + ":0644"
 	f := newFakeSystem(t)
-	if err := Install(context.Background(), f, stageCfg()); err != nil {
+	if err := Install(context.Background(), f, stageCfg(t)); err != nil {
 		t.Fatalf("first Install: %v", err)
 	}
 	seedMarkerAncestors(f)
@@ -154,7 +154,7 @@ func TestDeveloperModeValidMarkerRestoredOnPlainInstallRevert(t *testing.T) {
 	// A bootstrap error that is not transient fails on the first attempt, so
 	// the revert runs without waiting on any budget.
 	f.putBootstrapAlways(NetdLabel, errors.New("Bootstrap failed: 125: Domain does not support specified action"))
-	cfg := stageCfg()
+	cfg := stageCfg(t)
 	cfg.Signer = fakeSigner{ids: map[string]string{"/tmp/k3sm": testTeamID}}
 	err := Install(context.Background(), f, cfg)
 	if err == nil || !strings.Contains(err.Error(), "rolled back to the previous install root") {

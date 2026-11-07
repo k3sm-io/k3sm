@@ -546,7 +546,7 @@ func TestDeveloperModeMarkerDroppedAsTheSwapCommits(t *testing.T) {
 		t.Run(tc.name+" removes it before the wiring", func(t *testing.T) {
 			f := (&fakeSystem{owners: map[string]OwnedEntry{}}).rootedIn(t)
 			putMarker(t, f, 0o644)
-			cfg := stageCfg()
+			cfg := stageCfg(t)
 			cfg.DeveloperMode, cfg.Signer = tc.mode, tc.sign
 			if err := Install(context.Background(), f, cfg); err != nil {
 				t.Fatal(err)
@@ -566,14 +566,14 @@ func TestDeveloperModeMarkerDroppedAsTheSwapCommits(t *testing.T) {
 
 	t.Run("a revert restores the marker as it was", func(t *testing.T) {
 		f := newFakeSystem(t)
-		if err := Install(context.Background(), f, stageCfg()); err != nil {
+		if err := Install(context.Background(), f, stageCfg(t)); err != nil {
 			t.Fatalf("first Install: %v", err)
 		}
 		putMarker(t, f, 0o600)
 		f.putLoaded(NetdLabel, ServerLabel)
 		f.calls = nil
 		f.putBootstrapAlways(NetdLabel, errors.New("Bootstrap failed: 125: Domain does not support specified action"))
-		cfg := stageCfg()
+		cfg := stageCfg(t)
 		cfg.DeveloperMode = DeveloperModeOff
 		err := Install(context.Background(), f, cfg)
 		if err == nil || !strings.Contains(err.Error(), "rolled back to the previous install root") {
@@ -594,7 +594,7 @@ func TestDeveloperModeMarkerDroppedAsTheSwapCommits(t *testing.T) {
 
 	t.Run("an unreadable marker is removed and not restored on a revert", func(t *testing.T) {
 		f := newFakeSystem(t)
-		if err := Install(context.Background(), f, stageCfg()); err != nil {
+		if err := Install(context.Background(), f, stageCfg(t)); err != nil {
 			t.Fatalf("first Install: %v", err)
 		}
 		putMarker(t, f, 0o644)
@@ -603,7 +603,7 @@ func TestDeveloperModeMarkerDroppedAsTheSwapCommits(t *testing.T) {
 		f.calls = nil
 		f.putBootstrapAlways(NetdLabel, errors.New("Bootstrap failed: 125: Domain does not support specified action"))
 		var logs strings.Builder
-		cfg := stageCfg()
+		cfg := stageCfg(t)
 		cfg.DeveloperMode = DeveloperModeOff
 		cfg.Logger = slog.New(slog.NewTextHandler(&logs, nil))
 		err := Install(context.Background(), f, cfg)
@@ -627,7 +627,7 @@ func TestDeveloperModeMarkerDroppedAsTheSwapCommits(t *testing.T) {
 	t.Run("an unreadable marker on a successful install returns the read error", func(t *testing.T) {
 		f := (&fakeSystem{owners: map[string]OwnedEntry{}, readModeErrs: map[string]error{DeveloperModeMarkerPath: errors.New("EIO")}}).rootedIn(t)
 		putMarker(t, f, 0o644)
-		cfg := stageCfg()
+		cfg := stageCfg(t)
 		cfg.DeveloperMode = DeveloperModeOff
 		err := Install(context.Background(), f, cfg)
 		if err == nil || !strings.Contains(err.Error(), "EIO") {
@@ -641,7 +641,7 @@ func TestDeveloperModeMarkerDroppedAsTheSwapCommits(t *testing.T) {
 	t.Run("a removal that fails twice leaves the marker invalid", func(t *testing.T) {
 		f := (&fakeSystem{owners: map[string]OwnedEntry{}, removeEntryErrs: map[string]error{DeveloperModeMarkerPath: errors.New("EPERM")}}).rootedIn(t)
 		putMarker(t, f, 0o644)
-		cfg := stageCfg()
+		cfg := stageCfg(t)
 		cfg.DeveloperMode = DeveloperModeOff
 		if err := Install(context.Background(), f, cfg); err != nil {
 			t.Fatalf("Install = %v, want success with the marker disowned", err)
