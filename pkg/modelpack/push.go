@@ -45,7 +45,8 @@ func (e *BlobError) Unwrap() error { return e.Err }
 // (go-containerregistry HEADs it first), and each layer is re-verified as it
 // is read (Artifact.Open), so the bytes sent are the bytes the manifest
 // names. The manifest goes last, so a tag never names a manifest whose blobs
-// are not all there. A blob upload that fails is a *BlobError; a manifest put
+// are not all there, and is not sent at all when the tag already names this
+// digest, so pushing the same files again uploads nothing. A blob upload that fails is a *BlobError; a manifest put
 // that fails is the registry's error as is.
 func Push(ctx context.Context, ref name.Reference, a *Artifact, opts ...remote.Option) error {
 	opts = append(opts[:len(opts):len(opts)], remote.WithContext(ctx))
@@ -60,6 +61,9 @@ func Push(ctx context.Context, ref name.Reference, a *Artifact, opts ...remote.O
 		if err := remote.WriteLayer(repo, b, opts...); err != nil {
 			return &BlobError{Digest: b.desc.Digest.String(), Err: err}
 		}
+	}
+	if d, err := remote.Head(ref, opts...); err == nil && d.Digest.String() == a.Digest.String() {
+		return nil // the tag already names this manifest
 	}
 	if err := remote.Put(ref, rawManifest{body: a.Manifest, mediaType: ispec.MediaTypeImageManifest}, opts...); err != nil {
 		return fmt.Errorf("put manifest: %w", err)
