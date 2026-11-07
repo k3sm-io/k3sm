@@ -256,7 +256,9 @@ func TestDeletingVMPodStopsProbesAndKeepsItsRelayUntilTheGuestStops(t *testing.T
 			await(t, "the runtime to be asked to stop the pod", held.entered)
 
 			if !closesWithin(probeLoopsEnded(pp), 2*time.Second) {
-				t.Error("the pod's probes are still running while the runtime stops it")
+				// Fatal: every dial count below is only meaningful once the loops have
+				// ended, so a run that goes on would report a second, misleading failure.
+				t.Fatal("the pod's probes are still running while the runtime stops it")
 			}
 			dials := n.tgt.count()
 			frozen := map[string]string{pub: leaseFirst}
