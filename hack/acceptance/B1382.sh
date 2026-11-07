@@ -18,6 +18,10 @@
 #            listing's metadata comes from the manifest and config.
 #   b1382.4  pkg/modelpack: the config.json reader's fuzz target over its
 #            committed seed corpus.
+#   b1382.5  cmd/k3sm: registry text cannot drive the terminal (a bad layer
+#            digest is refused by index, every printed string is stripped of
+#            control characters), and the listing stops at its tag cap,
+#            saying so.
 #
 # Unit tests only, under -race: no cluster, no network, no privilege. A
 # listed test that does not exist yet is PENDING, not a pass.
@@ -67,6 +71,7 @@ ladder "$(run ./cmd/k3sm/ TestModelLsReadsManifestAndConfig)" "b1382.1  model ls
 ladder "$(run ./cmd/k3sm/ TestModelLsJSONShape)" "b1382.2  model ls -o json shape"
 ladder "$(run ./pkg/modelpack/ TestModelConfigJSONMetadata TestMalformedConfigJSONGivesNoMetadata TestDescribeReadsManifestAndConfig)" "b1382.3  modelpack: bounded, fail-closed config.json; metadata from manifest and config"
 ladder "$(run ./pkg/modelpack/ FuzzReadModelConfig)" "b1382.4  modelpack: config.json reader fuzz seeds"
+ladder "$(run ./cmd/k3sm/ TestModelLsPrintsNoControlBytes TestModelLsStopsAtTheCap)" "b1382.5  model ls: no control bytes printed; the listing is bounded"
 
 echo "----------------------------------------"
 echo "B1382: $PASS passed, $FAIL failed, $PENDING pending"

@@ -121,9 +121,7 @@ func newModelLsFixture(t *testing.T, reachable bool) modelLsFixture {
 	// A ModelPack manifest whose config blob is not JSON: listed, without
 	// metadata, never a failed listing.
 	bad := []byte("not json")
-	rec := httptest.NewRecorder()
-	badDigest := "sha256:" + sha256Hex(bad)
-	reg.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v2/models/broken/blobs/uploads/?digest="+badDigest, bytes.NewReader(bad)))
+	badDigest := uploadBlob(t, reg, "models/broken", bad)
 	broken, _ := json.Marshal(map[string]any{
 		"schemaVersion": 2, "mediaType": registryclient.MediaTypeOCIManifest, "artifactType": artifactv1.ArtifactTypeModel,
 		"config": map[string]any{"mediaType": artifactv1.MediaTypeModelConfig, "digest": badDigest, "size": len(bad)},
@@ -134,6 +132,14 @@ func newModelLsFixture(t *testing.T, reachable bool) modelLsFixture {
 	reg.Image("models/notamodel", "v1", registryclient.Platform{OS: "linux", Architecture: "arm64"}, []byte("layer"))
 	reg.Image("app", "v1", registryclient.Platform{OS: "linux", Architecture: "arm64"}, []byte("layer"))
 
+	f.env = modelLsEnv(t, reg, reachable)
+	return f
+}
+
+// modelLsEnv is the cluster a listing reads: the hosting document, and reg
+// served in process, or nothing answering when not reachable.
+func modelLsEnv(t *testing.T, reg *registrytest.Registry, reachable bool) imageRegistryEnv {
+	t.Helper()
 	var transport http.RoundTripper = handlerTransport{reg.Handler()}
 	if !reachable {
 		transport = refusedTransport{}
@@ -146,8 +152,118 @@ func newModelLsFixture(t *testing.T, reachable bool) modelLsFixture {
 		ObjectMeta: metav1.ObjectMeta{Namespace: registrysvc.HostingNamespace, Name: registrysvc.HostingConfigMapName},
 		Data:       map[string]string{registrysvc.HostingDataKey: string(doc)},
 	}
-	f.env = imageRegistryEnv{kube: fake.NewSimpleClientset(hosting), apiHost: "127.0.0.1", transport: transport}
-	return f
+	return imageRegistryEnv{kube: fake.NewSimpleClientset(hosting), apiHost: "127.0.0.1", transport: transport}
+}
+
+// uploadBlob writes body into reg as a blob of repository.
+func uploadBlob(t *testing.T, reg *registrytest.Registry, repository string, body []byte) string {
+	t.Helper()
+	d := "sha256:" + sha256Hex(body)
+	rec := httptest.NewRecorder()
+	reg.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v2/"+repository+"/blobs/uploads/?digest="+d, bytes.NewReader(body)))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("upload %s: HTTP %d", d, rec.Code)
+	}
+	return d
+}
+
+// assertPrintable fails when out holds a control character other than a
+// newline: a C0 or C1 control or DEL.
+func assertPrintable(t *testing.T, out string) {
+	t.Helper()
+	for _, r := range out {
+		if (r < 0x20 && r != '\n') || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
+			t.Fatalf("output holds control character %U:\n%q", r, out)
+		}
+	}
+}
+
+// TestModelLsPrintsNoControlBytes pins that registry content cannot drive
+// the terminal: a layer digest carrying an escape sequence is refused by
+// index, never echoed, and every string the table prints is filtered of C0
+// and C1 controls and DEL.
+func TestModelLsPrintsNoControlBytes(t *testing.T) {
+	reg := registrytest.New()
+	reg.AcceptWrites = true
+	cfg := uploadBlob(t, reg, "models/evil", []byte(`{"config":{"format":"gguf"},"modelfs":{"type":"layers","diffIds":[]}}`))
+	m, _ := json.Marshal(map[string]any{
+		"schemaVersion": 2, "mediaType": registryclient.MediaTypeOCIManifest, "artifactType": artifactv1.ArtifactTypeModel,
+		"config": map[string]any{"mediaType": artifactv1.MediaTypeModelConfig, "digest": cfg, "size": 70},
+		"layers": []any{map[string]any{"mediaType": artifactv1.MediaTypeModelWeight, "digest": "sha256:\x1b]0;owned\x07\x1b[31m", "size": 1}},
+	})
+	storeManifest(t, reg, "models/evil", "v1", m)
+	env := modelLsEnv(t, reg, true)
+
+	var rep modelListReport
+	if err := json.Unmarshal([]byte(runModelLs(t, env, "-o", "json")), &rep); err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.Models) != 1 || rep.Models[0].Error != "model models/evil:v1: layer 0 has an invalid digest" {
+		t.Fatalf("models = %+v, want the one row refusing layer 0 by index", rep.Models)
+	}
+	out := runModelLs(t, env)
+	assertPrintable(t, out)
+	if !strings.Contains(out, "layer 0 has an invalid digest") || strings.Contains(out, "owned") {
+		t.Errorf("table = %q, want the refusal by index and no echoed digest", out)
+	}
+
+	t.Run("every printed string is filtered", func(t *testing.T) {
+		evil := "a\x1b[2J\x07\u009b31m\x7fb\xff"
+		for _, rep := range []modelListReport{
+			{Registry: registryReport{Name: canonicalRegistry, Error: evil}},
+			{Registry: registryReport{Name: canonicalRegistry, Reachable: true}, Models: []modelRow{
+				{Name: evil, Tag: evil, Digest: evil, Format: evil, Quantization: evil, ParamSize: evil},
+				{Name: evil, Tag: evil, Digest: evil, Error: evil},
+			}},
+		} {
+			var b bytes.Buffer
+			if err := renderModelList(&b, rep); err != nil {
+				t.Fatal(err)
+			}
+			assertPrintable(t, b.String())
+			if !strings.Contains(b.String(), "a[2J31mb") {
+				t.Errorf("table = %q, want the text with its controls stripped", b.String())
+			}
+		}
+	})
+}
+
+// TestModelLsStopsAtTheCap pins the listing's bound: it walks at most
+// maxModelTags tags and then stops, saying so with "truncated": true in the
+// JSON and a last line in the table. Under the cap the key is absent.
+func TestModelLsStopsAtTheCap(t *testing.T) {
+	f := newModelLsFixture(t, true)
+	old := maxModelTags
+	maxModelTags = 2
+	t.Cleanup(func() { maxModelTags = old })
+
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(runModelLs(t, f.env, "-o", "json")), &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc["truncated"] != true {
+		t.Errorf("truncated = %v, want true", doc["truncated"])
+	}
+	if models, _ := doc["models"].([]any); len(models) != 2 {
+		t.Errorf("%d models, want 2 (the cap)", len(models))
+	}
+	out := runModelLs(t, f.env)
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if last := lines[len(lines)-1]; !strings.Contains(last, "stopped after 2 tags") {
+		t.Errorf("table's last line = %q, want the truncation note", last)
+	}
+	if strings.Contains(out, "qwen") {
+		t.Errorf("table lists a model past the cap:\n%s", out)
+	}
+
+	maxModelTags = 10
+	doc = nil
+	if err := json.Unmarshal([]byte(runModelLs(t, f.env, "-o", "json")), &doc); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := doc["truncated"]; ok {
+		t.Error("truncated is present under the cap")
+	}
 }
 
 func runModelLs(t *testing.T, env imageRegistryEnv, args ...string) string {

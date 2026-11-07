@@ -186,7 +186,8 @@ is pushed again.
 Every key on a model is always present, `""` or `0` when the model does not record it. A model whose
 manifest or config cannot be read is still listed, with an `error` key (present only then) and no
 metadata. A registry that does not answer gives `"reachable": false`, an `error` on `registry`, an
-empty `models` list, and exit status 0. New keys may be added under the same `schemaVersion`; an
+empty `models` list, and exit status 0. A listing walks at most 10000 tags; one that stops there
+adds `"truncated": true` (absent otherwise) and ends the table with a line saying so. New keys may be added under the same `schemaVersion`; an
 existing key never changes meaning.
 
 ## One Store for the Cluster
