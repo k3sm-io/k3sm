@@ -178,7 +178,7 @@ func runServer(ctx context.Context, workDir string, cfg ServeConfig, d serveDeps
 	if err != nil {
 		return err
 	}
-	server, err := auth.NewServer(access, api.Config{Store: st, Logger: log, GCGrace: d.gcGrace, FreeSpace: d.freeSpace})
+	server, err := auth.NewServer(access, api.Config{Store: st, Logger: log, GCGrace: d.gcGrace, FreeSpace: d.freeSpace, Quota: cfg.Quota})
 	if err != nil {
 		return err
 	}
@@ -203,11 +203,15 @@ func runServer(ctx context.Context, workDir string, cfg ServeConfig, d serveDeps
 		tick: d.convergeTick, grace: d.gcGrace, fence: fence, reports: reports, log: log,
 	})
 	httpServer.Handler = watchCommits(httpServer.Handler, dedupe.commit)
-	httpServer.Handler = collectRoute(httpServer.Handler, access, fencedSweep(collector, fence), log, nil)
+	httpServer.Handler = collectRoute(httpServer.Handler, access, quotaAfter(server, fencedSweep(collector, fence)), log, nil)
 	bg, stopBG := context.WithCancel(ctx)
 	defer stopBG()
 	var wg sync.WaitGroup
-	wg.Go(func() { sweepLoop(bg, collector, d.gcGrace, d.gcInterval, fence, dedupe.sweepFinished, reports, log) })
+	swept := func() {
+		server.InvalidateQuota() // a sweep removes rows behind the server
+		dedupe.sweepFinished()
+	}
+	wg.Go(func() { sweepLoop(bg, collector, d.gcGrace, d.gcInterval, fence, swept, reports, log) })
 	wg.Go(func() { dedupe.run(bg) })
 	wg.Go(func() { reportLoop(bg, server, d.statusEvery, reports) })
 
@@ -269,6 +273,15 @@ func fencedSweep(c *gc.Collector, fence *sweepFence) repositorySweeper {
 		}
 		defer fence.mu.Unlock()
 		return c.SweepRepositories(ctx, names)
+	}
+}
+
+// quotaAfter has server's quota count again from the store after each sweep
+// sweep runs, since a sweep removes rows the server did not.
+func quotaAfter(server *api.Server, sweep repositorySweeper) repositorySweeper {
+	return func(ctx context.Context, names []ref.Name) (gc.RepositoriesReport, error) {
+		defer server.InvalidateQuota()
+		return sweep(ctx, names)
 	}
 }
 

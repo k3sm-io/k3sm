@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"net/netip"
@@ -97,6 +98,10 @@ type Config struct {
 	Executable func() (string, error)
 	// Logger receives bring-up and teardown events. Empty means slog.Default.
 	Logger *slog.Logger
+	// Quota is the byte quota per artifactType the server enforces at manifest
+	// PUT (--registry-quota), rendered into the serve config. New refuses one
+	// that is not a media type mapped to a positive count.
+	Quota map[string]int64
 }
 
 // Service is the node-local OCI ingest registry: a `k3sm registry serve` child
@@ -152,6 +157,10 @@ func New(cfg Config) (*Service, error) {
 	if err := validateBind(cfg.BindAddress, cfg.Port); err != nil {
 		return nil, err
 	}
+	if err := validQuotas(cfg.Quota); err != nil {
+		return nil, fmt.Errorf("registry: %w", err)
+	}
+	cfg.Quota = maps.Clone(cfg.Quota)
 	if cfg.BinDir == "" {
 		cfg.BinDir = filepath.Join(cfg.WorkDir, "bin")
 	}
@@ -330,6 +339,7 @@ func (s *Service) provision() error {
 		DataVolume: s.cfg.DataVolume,
 		UID:        s.geteuid(),
 		GID:        os.Getegid(),
+		Quota:      s.cfg.Quota,
 	})
 	if err != nil {
 		return err
