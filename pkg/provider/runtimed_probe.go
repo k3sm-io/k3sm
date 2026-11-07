@@ -275,6 +275,10 @@ func (r *runtimedRuntime) startProber(pod *corev1.Pod, podIP string) {
 	// DeletePod) rather than a request context.
 	ctx, cancel := context.WithCancel(context.Background())
 	pr.cancel = cancel
+	// The transport is the pod's own, so the prober closes it at stop.
+	if idle, ok := seams.transport.(interface{ CloseIdleConnections() }); ok {
+		pr.idle = idle
+	}
 	pr.onTransition = func() { r.publishStatusUpdate(ctx, id) }
 	// restartFunc connects the restart DECISION (the prober owns the gate reset) to
 	// the SHARED restart authority: a committed liveness failure routes through the

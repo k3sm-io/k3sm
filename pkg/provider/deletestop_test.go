@@ -260,7 +260,9 @@ func TestDeletingVMPodStopsProbesAndKeepsItsRelayUntilTheGuestStops(t *testing.T
 				// ended, so a run that goes on would report a second, misleading failure.
 				t.Fatal("the pod's probes are still running while the runtime stops it")
 			}
-			dials := n.tgt.count()
+			// The baseline is taken once no dial is in flight: one begun before the
+			// stop is counted in it, and one arriving after is refused uncounted.
+			dials := n.tgt.settled(t)
 			frozen := map[string]string{pub: leaseFirst}
 			sets, _ := n.sink.snapshot()
 			n.checkOverrides(t, "as the stop begins", sets, frozen)

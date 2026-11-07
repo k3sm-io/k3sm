@@ -63,6 +63,9 @@ type probeTarget struct {
 	mu        sync.Mutex
 	dials     []string
 	reachable map[string]bool
+	// began and returned count the calls into dial and their returns, refused
+	// ones included, so a baseline can wait until no dial is in flight.
+	began, returned int
 }
 
 // newProbeTarget starts an in-memory HTTP server (no real network) that answers
@@ -89,7 +92,22 @@ func (p *probeTarget) serve(host string) {
 
 // dial is the runtime's r.dial seam — the one place every probe dial converges,
 // tcp and httpGet alike, once the prober's transport is built on it.
+//
+// A dial whose context is already cancelled is refused and not recorded: no
+// connection is ever made for it, and net/http runs a dial on its own goroutine,
+// so one cancelled by the prober's stop can still arrive here after it.
 func (p *probeTarget) dial(ctx context.Context, _, address string) (net.Conn, error) {
+	p.mu.Lock()
+	p.began++
+	p.mu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		p.returned++
+		p.mu.Unlock()
+	}()
+	if cerr := ctx.Err(); cerr != nil {
+		return nil, fmt.Errorf("dial %s: %w", address, cerr)
+	}
 	host, _, err := net.SplitHostPort(address)
 	p.mu.Lock()
 	p.dials = append(p.dials, address)
@@ -113,6 +131,21 @@ func (p *probeTarget) count() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return len(p.dials)
+}
+
+// settled waits until every dial that has entered the seam has returned, then
+// returns how many were recorded: a baseline that a dial begun before it cannot
+// move afterwards.
+func (p *probeTarget) settled(t *testing.T) int {
+	t.Helper()
+	var n int
+	waitCond(t, "the probe dials in flight to settle", func() bool {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		n = len(p.dials)
+		return p.began == p.returned
+	})
+	return n
 }
 
 // hostsAt is the set of hosts dialed on the given port.
@@ -374,7 +407,7 @@ func TestVMPodProbesDialTheLiveGuestAddress(t *testing.T) {
 			t.Error("the readiness verdict was reverted by the lease loss; a frozen verdict is the last thing this node observed")
 		}
 
-		before := n.tgt.count()
+		before := n.tgt.settled(t)
 		time.Sleep(3 * probePeriod)
 		if got := n.tgt.count(); got != before {
 			t.Errorf("%d further dials after the lease was dropped: %v", got-before, n.tgt.dialed()[before:])
