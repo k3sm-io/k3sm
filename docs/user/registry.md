@@ -627,6 +627,14 @@ type and the quota in bytes. The refused manifest is not stored; its blobs stay 
 collection takes them. Pushing a manifest the registry already holds under another tag costs
 nothing.
 
+The quota is cooperative accounting, not isolation. It is kept per artifact type across the whole
+store, never per repository, namespace or user, and the type is whatever the pushing client
+declares in its manifest. A client that labels a push with another type is charged to that type,
+and one that pushes blobs without a manifest is charged nothing. Use it to keep one kind of
+content from crowding out the rest, not to keep tenants apart. What keeps the registry from filling
+the disk is the free-space check: uploads are refused with `507` once the volume falls below the
+registry's free-space floor, whatever the quotas say.
+
 To make room, delete tags or digests of that type. A digest delete gives its layers back at once.
 A tag delete leaves the manifest stored by digest until garbage collection removes it, and the
 room comes back after that sweep.
