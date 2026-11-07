@@ -24,6 +24,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -32,14 +33,16 @@ import (
 
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/modelpack"
+	"k3sm.io/k3sm/pkg/modelpack/hf"
 	"k3sm.io/k3sm/pkg/registryclient"
+	"k3sm.io/k3sm/pkg/version"
 )
 
 // modelRepositoryPrefix is where every model lives in the cluster registry.
 const modelRepositoryPrefix = "models/"
 
 // modelUsage is `k3sm model`'s help.
-const modelUsage = `Usage: k3sm model <push|ls|rm> [flags] <args>
+const modelUsage = `Usage: k3sm model <push|import|ls|rm> [flags] <args>
 
 Store models in the cluster registry as ModelPack OCI artifacts, under
 registry-k3sm:6450/models/<name>.
@@ -56,6 +59,21 @@ registry-k3sm:6450/models/<name>.
         Writes as 'k3sm image push' does: the server's push credential when
         this account can read it, else a builder token through your
         kubeconfig.
+  import hf://<org>/<repo>[@<revision>] [<name>[:tag]]
+        import a Hugging Face model repository at a pinned commit and push
+        it as models/<name>:<tag> (name defaults to <org>/<repo> lowercased,
+        tag to latest). A branch or tag revision (default main) is resolved
+        to its 40-hex commit first, and every file is fetched at that commit.
+        Every name is checked as push checks it before any byte is fetched,
+        then each file is downloaded to a scratch directory (resumed with a
+        Range request if a transfer breaks) and verified before anything is
+        pushed: an LFS file by the sha256 the Hub lists, which becomes its
+        layer digest, a small file by its git blob id. The manifest records
+        the source (hf://<org>/<repo>) and the commit, so importing the same
+        commit again uploads nothing and prints the same digest. Access is
+        anonymous: a gated repository is refused. The Hub's hashes catch
+        corruption in transit, not a compromised Hub; pass --sha256 for a
+        file whose hash you know from elsewhere.
   ls [-o json]
         list the models in the cluster registry: every tag under models/
         whose manifest is a ModelPack artifact, with its weight format,
@@ -83,6 +101,11 @@ type modelOptions struct {
 	timeout time.Duration
 	// output is ls's -o: "" for the table, or json.
 	output string
+
+	// import only
+	source     hf.Ref
+	sha256     map[string]string
+	scratchDir string
 }
 
 // runModel runs `k3sm model`.
@@ -109,19 +132,21 @@ func runModel(args []string) error {
 // a bad flag is an error the caller reports, never an os.Exit in a test.
 func parseModelArgs(args []string, errOut io.Writer) (modelOptions, error) {
 	if len(args) == 0 {
-		return modelOptions{}, errors.New("model: name a verb (push, ls or rm)")
+		return modelOptions{}, errors.New("model: name a verb (push, import, ls or rm)")
 	}
 	o := modelOptions{verb: args[0]}
-	var want int
+	var want, most int
 	switch o.verb {
 	case "push":
-		want = 2
+		want, most = 2, 2
+	case "import":
+		want, most = 1, 2
 	case "rm":
-		want = 1
+		want, most = 1, 1
 	case "ls":
-		want = 0
+		want, most = 0, 0
 	default:
-		return modelOptions{}, fmt.Errorf("unknown model verb %q (want push, ls or rm)", o.verb)
+		return modelOptions{}, fmt.Errorf("unknown model verb %q (want push, import, ls or rm)", o.verb)
 	}
 	fs := flag.NewFlagSet("model "+o.verb, flag.ContinueOnError)
 	fs.SetOutput(errOut)
@@ -140,11 +165,32 @@ func parseModelArgs(args []string, errOut io.Writer) (modelOptions, error) {
 		fs.StringVar(&o.output, "output", "", "alias for -o")
 	}
 	fs.DurationVar(&o.timeout, "timeout", defaultTimeout, "overall deadline; push has none by default, and abandons a request only when it moves no byte for "+requestIdleTimeout.String())
+	if o.verb == "import" {
+		fs.StringVar(&o.scratchDir, "scratch-dir", "", "directory to download into before the push (a fresh subdirectory, removed afterwards); default the system temporary directory")
+		fs.Func("sha256", "<path>=<sha256 hex>: a file's sha256 known from elsewhere, checked as well as the Hub's hash (repeatable)", func(v string) error {
+			p, sum, ok := strings.Cut(v, "=")
+			if !ok || p == "" || sum == "" {
+				return fmt.Errorf("want <path>=<sha256 hex>, got %q", v)
+			}
+			if o.sha256 == nil {
+				o.sha256 = map[string]string{}
+			}
+			if _, dup := o.sha256[p]; dup {
+				return fmt.Errorf("%s named twice", p)
+			}
+			o.sha256[p] = strings.ToLower(sum)
+			return nil
+		})
+	}
 	if err := fs.Parse(args[1:]); err != nil {
 		return modelOptions{}, err
 	}
-	if fs.NArg() != want {
-		return modelOptions{}, fmt.Errorf("model %s takes %d argument(s), got %q", o.verb, want, fs.Args())
+	if fs.NArg() < want || fs.NArg() > most {
+		n := strconv.Itoa(want)
+		if most != want {
+			n += " or " + strconv.Itoa(most)
+		}
+		return modelOptions{}, fmt.Errorf("model %s takes %s argument(s), got %q", o.verb, n, fs.Args())
 	}
 	if o.output != "" && o.output != "json" {
 		return modelOptions{}, fmt.Errorf("-o %q: ls renders a table by default and `json` on request", o.output)
@@ -152,6 +198,15 @@ func parseModelArgs(args []string, errOut io.Writer) (modelOptions, error) {
 	switch o.verb {
 	case "push":
 		o.dir, o.name = fs.Arg(0), fs.Arg(1)
+	case "import":
+		src, err := hf.ParseRef(fs.Arg(0))
+		if err != nil {
+			return modelOptions{}, err
+		}
+		o.source, o.name = src, strings.ToLower(src.Repo)
+		if fs.NArg() == 2 {
+			o.name = fs.Arg(1)
+		}
 	case "rm":
 		o.name = fs.Arg(0)
 	}
@@ -163,6 +218,8 @@ func modelCommand(ctx context.Context, o modelOptions, out io.Writer) error {
 	switch o.verb {
 	case "push":
 		return modelPush(withRequestIdle(ctx, requestIdleTimeout), o, out)
+	case "import":
+		return modelImport(withRequestIdle(ctx, requestIdleTimeout), o, out)
 	case "rm":
 		return modelRm(ctx, o, out)
 	case "ls":
@@ -238,6 +295,46 @@ func pushModel(ctx context.Context, workDir string, ref clusterImage, a *modelpa
 		return registryError("push "+ref.flat.String(), errors.Unwrap(err))
 	}
 	fmt.Fprintf(out, "pushed %s (%d files)\n  digest: %s\n  pin:    %s@%s\n", ref.flat, len(a.Layers), a.Digest, ref.flat.Context().Name(), a.Digest)
+	return nil
+}
+
+// hubOptions configures the Hub client `model import` uses; a test points
+// it at an in-process Hub. Every request is abandoned when it moves no byte
+// for the context's idle window, on top of the client's own connect, TLS
+// and header timeouts.
+var hubOptions = func() hf.Options {
+	return hf.Options{Transport: boundRequests(hf.DefaultTransport()), UserAgent: "k3sm/" + version.Version}
+}
+
+// modelImport imports o.source at a pinned commit and pushes it as o.name.
+//
+// The name is checked first, so a bad one costs no download. The Hub
+// client verifies every file before it calls the push, which is
+// `model push`'s own: the push gate, the same credential, a blob uploaded
+// only when the registry lacks it, and the manifest last.
+func modelImport(ctx context.Context, o modelOptions, out io.Writer) error {
+	ref, err := modelReference(o.name)
+	if err != nil {
+		return fmt.Errorf("%w (name the model: k3sm model import %s <name>[:tag])", err, o.source)
+	}
+	c, err := hf.NewClient(hubOptions())
+	if err != nil {
+		return err
+	}
+	res, err := c.Import(ctx, o.source, hf.ImportOptions{
+		ScratchDir: o.scratchDir,
+		SHA256:     o.sha256,
+		Fetched: func(p string, size int64) {
+			fmt.Fprintf(out, "fetched %s (%d bytes, verified)\n", p, size)
+		},
+		Push: func(ctx context.Context, a *modelpack.Artifact) error {
+			return pushModel(ctx, o.workDir, ref, a, out)
+		},
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "imported %s%s@%s (%d bytes fetched)\n", hf.Scheme, o.source.Repo, res.Commit, res.Bytes)
 	return nil
 }
 

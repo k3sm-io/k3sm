@@ -217,3 +217,36 @@ func TestModelArgs(t *testing.T) {
 		}
 	}
 }
+
+// TestModelImportArgs: `model import` takes an hf:// reference and an
+// optional model name, defaulting to the repository id lowercased, and
+// repeatable --sha256 path=hex; anything else is refused at parse time,
+// before the Hub or the registry is contacted.
+func TestModelImportArgs(t *testing.T) {
+	sum := strings.Repeat("ab", 32)
+	o, err := parseModelArgs([]string{"import", "--sha256", "config.json=" + strings.ToUpper(sum), "hf://Acme/Tiny-Model@main"}, io.Discard)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if o.source.Repo != "Acme/Tiny-Model" || o.source.Revision != "main" || o.name != "acme/tiny-model" || o.sha256["config.json"] != sum {
+		t.Errorf("parsed %+v; want the reference, the lowercased default name and the lowercased sha256", o)
+	}
+	o, err = parseModelArgs([]string{"import", "hf://acme/m", "llama:v1"}, io.Discard)
+	if err != nil || o.name != "llama:v1" || o.source.Revision != "main" {
+		t.Errorf("parse with a name = %+v, %v", o, err)
+	}
+	for _, args := range [][]string{
+		{"import"},
+		{"import", "acme/m"},
+		{"import", "hf://acme/m", "a", "b"},
+		{"import", "--sha256", "config.json", "hf://acme/m"},
+		{"import", "--sha256", "a=" + sum, "--sha256", "a=" + sum, "hf://acme/m"},
+	} {
+		if _, err := parseModelArgs(args, io.Discard); err == nil {
+			t.Errorf("parseModelArgs(%q) accepted", args)
+		}
+	}
+	if _, err := runModelCmd(t, []string{"import", "hf://acme/m", "registry.example.com/m"}); err == nil || !strings.Contains(err.Error(), "name the model") {
+		t.Errorf("import to a foreign registry = %v, want a refusal that asks for a model name", err)
+	}
+}

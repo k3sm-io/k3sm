@@ -18,6 +18,14 @@ pin, its date, and the tarball's sha256.
   parameter size from the model's `config.json` when it records them, including MLX's
   `quantization.bits`; a `config.json` over 1 MiB or not a JSON object gives no metadata, and the
   push goes ahead. See [the cluster registry](docs/user/registry.md#models).
+- `k3sm model import hf://<org>/<repo>[@<revision>] [<name>[:tag]]` imports a Hugging Face model repository
+  into the cluster registry as a ModelPack artifact. The revision is resolved to its commit, every file is
+  fetched at that commit, and the manifest records the commit and the source. Each file is verified before
+  anything is pushed: an LFS file by the Hub's sha256 and a small file by its git blob id. A broken transfer
+  resumes with a range request. Importing the same commit again uploads nothing and gives the same digest.
+  Access is anonymous, so a gated repository is refused by name. `--sha256 <path>=<hex>` adds a hash you know
+  from elsewhere. See [Models in the cluster registry](docs/user/models.md). `k3sm model push` no longer
+  re-sends a manifest the tag already names. No RBAC changes.
 - A node advertises the GPU under hardware names beside the `mlx.k3sm.io` ones, which do not change: the
   `k3sm.io/gpu` extended resource and the `k3sm.io/gpu.present` and `k3sm.io/gpu-memory-gb` labels on a
   node that can grant a pod the GPU, and the `k3sm.io/chip`, `k3sm.io/chip-family` and `k3sm.io/memory-gb`

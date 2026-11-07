@@ -52,7 +52,7 @@ Commands ("server", "agent", "node", "netd", "install", "uninstall", "stop", "st
   build       build an image from a Dockerfile (COPY-only natively; RUN via the build engine)
   builder     manage the in-cluster buildkitd engine (builder up|down|delete|status|buildx)
   image       ingest, publish and reclaim this node's images (image load|import|push|pull|tag|untag|inspect|save|prune|ls|df|migrate)
-  model       store models in the cluster registry as ModelPack OCI artifacts (model push|rm)
+  model       store models in the cluster registry as ModelPack OCI artifacts (model push|import|rm)
   registry    mint the cluster registry's push token for any OCI tool, through your kubeconfig (registry token|login)
   kubectl     run the bundled kubectl against this cluster (KUBECONFIG preset)
   kubeconfig  print the admin kubeconfig, or --write/merge it into ~/.kube/config
