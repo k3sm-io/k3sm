@@ -137,6 +137,7 @@ SERVICE_USER="_k3sm"
 NETD_LEDGER="/var/lib/k3sm/keys/interconnect-aliases"
 NODE_KUBECONFIG="/var/lib/k3sm/agent/node.kubeconfig"
 K3SM_BIN="/usr/local/bin/k3sm"
+# The Go ladder-contract test passes K3SM_M17_SELFTEST_WATCHDOG=600 for a loaded gate.
 SELFTEST_WATCHDOG="${K3SM_M17_SELFTEST_WATCHDOG:-120}"
 
 # ── The rung table: id | summary | prerequisites | assertion | evidence | owning BI ──
