@@ -375,7 +375,10 @@ MEMORY="${K3SM_MST_MEMORY:-4Gi}"
 # pin examples/mlxmodel.yaml carries, and the port must agree with it.
 IMAGE="${K3SM_MST_IMAGE:-ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.5@sha256:a225253effc92f5f5ff8ec2ec2e2f8894aa690a3d6a908bb879439de6733d0e8}"
 PORT="${K3SM_MST_PORT:-8000}"
-PYBIN="${K3SM_MST_PYTHON:-python3}"
+# The serving image's interpreter is the Mach-O itself: a native pod runs argv[0] as a
+# path inside the image root (no PATH search), and the runtime signs only a regular file,
+# never the /bin/python3 symlink.
+PYBIN="${K3SM_MST_PYTHON:-/bin/python3.12}"
 VIEW_UID="${K3SM_MST_VIEW_UID:-0}"
 REG_ROOT="${K3SM_MST_REGISTRY_ROOT:-/var/lib/k3sm/server/registry}"
 KUBECTL="${KUBECTL:-kubectl}"
