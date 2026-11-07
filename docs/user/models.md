@@ -8,7 +8,7 @@ Three verbs manage these artifacts:
 
 | Verb | What it does |
 |---|---|
-| `k3sm model push <dir> <name>[:tag]` | Builds an artifact from the files in a directory and pushes it. |
+| `k3sm model push [--variant <value>] <dir> <name>[:tag]` | Builds an artifact from the files in a directory and pushes it, optionally as one variant of the model. |
 | `k3sm model import hf://<org>/<repo>[@<revision>] [<name>[:tag]]` | Imports a Hugging Face repository at a pinned commit and pushes it. |
 | `k3sm model rm <name>[:tag]` | Removes a tag. |
 
@@ -42,6 +42,40 @@ k3sm model push ./Qwen3-0.6B-4bit qwen3-0.6b:4bit
 A push writes the way `k3sm image push` does. It uses the server's push credential when your account can read
 it, and otherwise a builder token through your kubeconfig. A blob the registry already holds is not uploaded
 again. When the tag already names the same manifest, nothing is uploaded at all.
+
+## Variants of One Model
+
+One model often comes in several quantizations. Push each one under the same name and tag with `--variant`:
+
+```sh
+k3sm model push --variant 4bit ./Qwen3-0.6B-4bit qwen3-0.6b
+k3sm model push --variant 8bit ./Qwen3-0.6B-8bit qwen3-0.6b
+```
+
+Each variant is its own artifact manifest, pushed by digest. The tag then names an OCI image index with one
+entry per variant, and each entry carries the annotation `io.k3sm.model.variant` with the variant's value.
+Pushing a variant that is already there replaces its entry and keeps the others. The entries are sorted by
+variant, so the same set of variants always gives the same index digest. A variant is 1 to 128 characters of
+`[A-Za-z0-9._-]`, for example `4bit`, `8bit` or `bf16`.
+
+A tag that already names a single model manifest is refused, so it is never turned into an index behind the
+back of whoever reads it. Push the variants under another tag, or remove the tag first. Two pushes of
+different variants to one tag at the same moment can lose one entry; push that variant again to restore it.
+
+An `MLXModel` selects a variant with `spec.quantization`:
+
+```yaml
+spec:
+  artifact:
+    reference: registry-k3sm:6450/models/qwen3-0.6b:latest
+  quantization: 4bit
+```
+
+The operator reads the index once per generation, picks the entry whose variant equals `quantization`, and
+records that manifest's digest in `status.resolvedArtifact`, so every replica serves the same bytes. It
+reports `InvalidSpec`, naming the variant, when no entry or more than one entry matches, when `quantization`
+is set but the reference names a single manifest, and when the reference names an index but `quantization`
+is not set.
 
 ## Import From Hugging Face
 
