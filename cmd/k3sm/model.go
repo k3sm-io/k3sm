@@ -29,6 +29,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 
 	"k3sm.io/k3sm/pkg/executor"
@@ -58,7 +59,12 @@ registry-k3sm:6450/models/<name>.
         digest, and a blob the registry already holds is not uploaded again.
         Writes as 'k3sm image push' does: the server's push credential when
         this account can read it, else a builder token through your
-        kubeconfig.
+        kubeconfig. With --variant <value> (for example 4bit, 8bit or bf16:
+        1 to 128 characters of [A-Za-z0-9._-]) the manifest is pushed by
+        digest and recorded in an OCI image index at the tag, one entry per
+        variant: a new variant is added, the same variant is replaced, the
+        others are kept. An MLXModel selects one with spec.quantization. A
+        tag that names a single manifest is refused, never converted.
   import hf://<org>/<repo>[@<revision>] [<name>[:tag]]
         import a Hugging Face model repository at a pinned commit and push
         it as models/<name>:<tag> (name defaults to <org>/<repo> lowercased,
@@ -105,6 +111,8 @@ type modelOptions struct {
 	timeout time.Duration
 	// output is ls's -o: "" for the table, or json.
 	output string
+	// variant is push's --variant: the index entry the push records.
+	variant string
 
 	// import only
 	source     hf.Ref
@@ -169,6 +177,9 @@ func parseModelArgs(args []string, errOut io.Writer) (modelOptions, error) {
 		fs.StringVar(&o.output, "output", "", "alias for -o")
 	}
 	fs.DurationVar(&o.timeout, "timeout", defaultTimeout, "overall deadline; push has none by default, and abandons a request only when it moves no byte for "+requestIdleTimeout.String())
+	if o.verb == "push" {
+		fs.StringVar(&o.variant, "variant", "", "record the model in an OCI image index at the tag under this variant (4bit, 8bit, bf16...)")
+	}
 	if o.verb == "import" {
 		fs.StringVar(&o.scratchDir, "scratch-dir", "", "directory to download into before the push (a fresh subdirectory, removed afterwards); default the system temporary directory")
 		fs.Func("sha256", "<path>=<sha256 hex>: a file's sha256 known from elsewhere, checked as well as the Hub's hash (repeatable)", func(v string) error {
@@ -202,6 +213,11 @@ func parseModelArgs(args []string, errOut io.Writer) (modelOptions, error) {
 	switch o.verb {
 	case "push":
 		o.dir, o.name = fs.Arg(0), fs.Arg(1)
+		if o.variant != "" {
+			if err := modelpack.ValidateVariant(o.variant); err != nil {
+				return modelOptions{}, err
+			}
+		}
 	case "import":
 		src, err := hf.ParseRef(fs.Arg(0))
 		if err != nil {
@@ -278,7 +294,40 @@ func modelPush(ctx context.Context, o modelOptions, out io.Writer) error {
 	if err != nil {
 		return err
 	}
+	if o.variant != "" {
+		return pushModelVariant(ctx, o.workDir, ref, a, o.variant, out)
+	}
 	return pushModel(ctx, o.workDir, ref, a, out)
+}
+
+// pushModelVariant pushes the built artifact a by digest and records it in
+// the OCI image index at ref's tag under variant, through the same gate and
+// credential as pushModel, and prints both digests.
+func pushModelVariant(ctx context.Context, workDir string, ref clusterImage, a *modelpack.Artifact, variant string, out io.Writer) error {
+	acc, err := registryWriteAccess(ctx, workDir)
+	if err != nil {
+		return fmt.Errorf("push %s: %w", ref.flat, err)
+	}
+	if ref, err = acc.locate(ref); err != nil {
+		return err
+	}
+	tag, ok := ref.remote.(name.Tag)
+	if !ok {
+		return fmt.Errorf("push %s: a variant is recorded at a tag", ref.flat)
+	}
+	index, err := modelpack.PushVariant(ctx, tag, a, variant, acc.opts...)
+	if err != nil {
+		if be, ok := errors.AsType[*modelpack.BlobError](err); ok {
+			return registryError("push "+ref.flat.String()+": upload "+be.Digest, be.Err)
+		}
+		if errors.Is(err, modelpack.ErrTagIsManifest) || errors.Is(err, modelpack.ErrIndexInvalid) || errors.Is(err, modelpack.ErrInvalidVariant) {
+			return fmt.Errorf("push %s --variant %s: %w", ref.flat, variant, err)
+		}
+		return registryError("push "+ref.flat.String(), errors.Unwrap(err))
+	}
+	fmt.Fprintf(out, "pushed %s variant %s (%d files)\n  digest: %s\n  index:  %s\n  pin:    %s@%s\n",
+		ref.flat, variant, len(a.Layers), a.Digest, index, ref.flat.Context().Name(), a.Digest)
+	return nil
 }
 
 // pushModel pushes the built artifact a as ref, through the push gate with
