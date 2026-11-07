@@ -513,9 +513,10 @@ type podProber struct {
 	// means bookkeeping only.
 	restartFunc func(ctx context.Context, podID, container string) error
 
-	// idle is the pod's own probe transport, closed once its loops have ended;
-	// nil when the pod has none. See stop.
-	idle interface{ CloseIdleConnections() }
+	// closeIdle closes the pod's own probe transport's idle connections and
+	// cancels its abandoned dials once the loops have ended; nil when the pod has
+	// no transport of its own. See stop.
+	closeIdle func()
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -645,8 +646,9 @@ func (pp *podProber) stop() {
 		pp.cancel()
 	}
 	pp.wg.Wait()
-	if pp.idle != nil {
-		pp.idle.CloseIdleConnections()
+	if pp.closeIdle != nil {
+		// After wg.Wait: CloseIdleConnections cancels only dials whose request has returned.
+		pp.closeIdle()
 	}
 }
 

@@ -56,6 +56,9 @@ type probeSeams struct {
 	// pending, when non-nil, reports the NOT-EVALUATED window ahead of a check
 	// whose transport would swallow the dial's sentinel. nil for a native pod.
 	pending func() error
+	// closeIdle closes transport's idle connections and cancels its abandoned
+	// dials; the prober calls it at stop. nil is allowed (a fake transport).
+	closeIdle func()
 }
 
 // probeSeamsFor builds the seams for one pod's prober. vmBacked selects the
@@ -75,7 +78,7 @@ func (r *runtimedRuntime) probeSeamsFor(podID string, vmBacked bool) probeSeams 
 	// with the prober that holds it.
 	tr := newProbeTransport()
 	tr.DialContext = dial
-	seams := probeSeams{dial: dial, transport: tr}
+	seams := probeSeams{dial: dial, transport: tr, closeIdle: tr.CloseIdleConnections}
 	if !vmBacked || r.transport == nil {
 		return seams
 	}
@@ -275,10 +278,7 @@ func (r *runtimedRuntime) startProber(pod *corev1.Pod, podIP string) {
 	// DeletePod) rather than a request context.
 	ctx, cancel := context.WithCancel(context.Background())
 	pr.cancel = cancel
-	// The transport is the pod's own, so the prober closes it at stop.
-	if idle, ok := seams.transport.(interface{ CloseIdleConnections() }); ok {
-		pr.idle = idle
-	}
+	pr.closeIdle = seams.closeIdle
 	pr.onTransition = func() { r.publishStatusUpdate(ctx, id) }
 	// restartFunc connects the restart DECISION (the prober owns the gate reset) to
 	// the SHARED restart authority: a committed liveness failure routes through the

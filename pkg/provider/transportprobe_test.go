@@ -507,3 +507,24 @@ func TestVMPodProbesDialTheLiveGuestAddress(t *testing.T) {
 		}
 	})
 }
+
+// TestStartedProberClosesItsOwnTransport pins the handover stop depends on: a
+// prober started through startProber carries its pod's transport close, so the
+// dials net/http still has in flight at stop are cancelled, for a vm pod and a
+// native one alike (both get a per-pod transport).
+func TestStartedProberClosesItsOwnTransport(t *testing.T) {
+	t.Parallel()
+	for _, pod := range []*corev1.Pod{
+		withGateProbes(vmPod("team-a", "vm-close")),
+		withGateProbes(hostPod("team-a", "native-close")),
+	} {
+		t.Run(pod.Name, func(t *testing.T) {
+			t.Parallel()
+			n := newProbeNode(t)
+			id := n.start(t, pod)
+			if n.proberOf(t, id).closeIdle == nil {
+				t.Error("the started prober has no transport close; its abandoned dials would outlive stop")
+			}
+		})
+	}
+}
