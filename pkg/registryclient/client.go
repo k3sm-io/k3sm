@@ -191,10 +191,12 @@ type Manifest struct {
 	// MediaType is the manifest's own media type.
 	MediaType string
 	// Size is the byte length of the manifest body.
-	Size      int64
-	Config    *Descriptor
-	Layers    []Descriptor
-	Manifests []Descriptor
+	Size int64
+	// ArtifactType is the manifest's artifactType (OCI 1.1), "" when unset.
+	ArtifactType string
+	Config       *Descriptor
+	Layers       []Descriptor
+	Manifests    []Descriptor
 }
 
 // IsIndex reports whether m is an image index (a manifest list).
@@ -287,10 +289,11 @@ func (c *Client) Manifest(ctx context.Context, repository, reference string) (Ma
 		return Manifest{}, fmt.Errorf("manifest %s:%s is reported as %s but hashes to %s: %w", repository, reference, reported, digest, ErrDigestMismatch)
 	}
 	var raw struct {
-		MediaType string       `json:"mediaType"`
-		Config    *Descriptor  `json:"config"`
-		Layers    []Descriptor `json:"layers"`
-		Manifests []Descriptor `json:"manifests"`
+		MediaType    string       `json:"mediaType"`
+		ArtifactType string       `json:"artifactType"`
+		Config       *Descriptor  `json:"config"`
+		Layers       []Descriptor `json:"layers"`
+		Manifests    []Descriptor `json:"manifests"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return Manifest{}, fmt.Errorf("decode manifest %s:%s: %w", repository, reference, err)
@@ -306,7 +309,7 @@ func (c *Client) Manifest(ctx context.Context, repository, reference string) (Ma
 			mt = MediaTypeOCIIndex
 		}
 	}
-	m := Manifest{Digest: digest, MediaType: mt, Size: int64(len(body))}
+	m := Manifest{Digest: digest, MediaType: mt, Size: int64(len(body)), ArtifactType: raw.ArtifactType}
 	switch mt {
 	case MediaTypeOCIIndex, MediaTypeDockerList:
 		m.Manifests = raw.Manifests
@@ -342,6 +345,27 @@ func (c *Client) ManifestDigest(ctx context.Context, repository, tag string) (st
 		return d, nil
 	}
 	return "", nil
+}
+
+// Blob reads the blob desc names, at most limit bytes, and re-hashes it
+// against its digest. It is for small documents (a config); a blob larger
+// than limit is an error, never truncated.
+func (c *Client) Blob(ctx context.Context, repository string, desc Descriptor, limit int64) ([]byte, error) {
+	if !ValidRepository(repository) {
+		return nil, fmt.Errorf("invalid repository name %q", repository)
+	}
+	if !digestPattern.MatchString(desc.Digest) {
+		return nil, fmt.Errorf("blob of %s has an unverifiable digest %q", repository, desc.Digest)
+	}
+	_, body, err := c.get(ctx, c.endpoint("/v2/"+repository+"/blobs/"+desc.Digest), "", limit)
+	if err != nil {
+		return nil, fmt.Errorf("read blob %s@%s: %w", repository, desc.Digest, err)
+	}
+	sum := sha256.Sum256(body)
+	if got := "sha256:" + hex.EncodeToString(sum[:]); got != desc.Digest {
+		return nil, fmt.Errorf("blob %s@%s hashes to %s: %w", repository, desc.Digest, got, ErrDigestMismatch)
+	}
+	return body, nil
 }
 
 // ConfigPlatform reads an image config blob and returns the platform it
