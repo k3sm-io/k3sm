@@ -64,6 +64,23 @@ func putIndex(t *testing.T, reg *registrytest.Registry, repository, tag string, 
 	return rec.Header().Get("Docker-Content-Digest")
 }
 
+// handlerTransport serves every request with h in process, through a
+// response recorder: no socket is opened.
+type handlerTransport struct{ h http.Handler }
+
+func (t handlerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	in := req.Clone(req.Context())
+	in.RequestURI = req.URL.RequestURI()
+	if in.Body == nil {
+		in.Body = http.NoBody
+	}
+	rec := httptest.NewRecorder()
+	t.h.ServeHTTP(rec, in)
+	resp := rec.Result()
+	resp.Request = req
+	return resp, nil
+}
+
 // TestResolveArtifactVariant: spec.quantization selects the index entry whose
 // variant annotation equals it, by tag or by the index's digest, and the
 // selected manifest's digest is recorded and rendered. No matching entry,
@@ -74,9 +91,7 @@ func TestResolveArtifactVariant(t *testing.T) {
 	const repo = "models/qwen3"
 	reg := registrytest.New()
 	reg.AcceptWrites = true
-	srv := httptest.NewServer(reg.Handler())
-	t.Cleanup(srv.Close)
-	client, err := registryclient.New(srv.URL, registryclient.Options{})
+	client, err := registryclient.New("https://"+testRegistryHost, registryclient.Options{Transport: handlerTransport{reg.Handler()}})
 	if err != nil {
 		t.Fatal(err)
 	}
