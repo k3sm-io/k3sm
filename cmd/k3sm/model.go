@@ -89,9 +89,10 @@ registry-k3sm:6450/models/<name>.
         whose manifest is a ModelPack artifact, with its weight format,
         quantization and parameter size (copied from the model's
         config.json at push, when it records them), total size, file count
-        and weight shard count. Reads each model's manifest and config,
-        never its files, over your own credentials. -o json writes a
-        versioned document instead of the table.
+        and weight shard count. A tag that names an index of variants
+        (pushed with --variant) is one row per variant. Reads each model's
+        manifest and config, never its files, over your own credentials.
+        -o json writes a versioned document instead of the table.
   rm <name>[:tag]
         remove the tag models/<name>:<tag> (tag defaults to latest). It
         removes a name, not bytes: the registry reclaims content no tag names

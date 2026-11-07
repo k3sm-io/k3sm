@@ -165,6 +165,8 @@ type Descriptor struct {
 	Digest    string    `json:"digest"`
 	Size      int64     `json:"size"`
 	Platform  *Platform `json:"platform,omitempty"`
+	// Annotations are the descriptor's annotations, nil when it has none.
+	Annotations map[string]string `json:"annotations,omitempty"`
 }
 
 // Platform is an OCI platform.

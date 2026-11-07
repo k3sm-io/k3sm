@@ -28,9 +28,12 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
@@ -41,6 +44,7 @@ import (
 	"k3sm.io/k3sm/pkg/registryclient"
 	"k3sm.io/k3sm/pkg/registryclient/registrytest"
 	"k3sm.io/k3sm/pkg/registrysvc"
+	"k3sm.io/runtimed/pkg/artifact"
 )
 
 // storeModel builds the model whose files are files and writes it into reg as
@@ -427,5 +431,97 @@ func TestModelLsJSONShape(t *testing.T) {
 	}
 	if _, err := parseModelArgs([]string{"ls", "extra"}, io.Discard); err == nil {
 		t.Error("ls with an argument accepted")
+	}
+}
+
+// TestModelLsListsVariants: a tag naming an OCI image index of model
+// variants is listed as one row per variant, each with the variant, the
+// index digest, and the metadata of the variant's own manifest; an index of
+// images is not listed; and an index over the runtime's entry cap is one row
+// naming the cap, its entries never read.
+func TestModelLsListsVariants(t *testing.T) {
+	reg := registrytest.New()
+	reg.AcceptWrites = true
+	tag, err := name.NewTag("registry.test/models/qwen3:latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	opt := remote.WithTransport(handlerTransport{reg.Handler()})
+	ctx := context.Background()
+	built := map[string]*modelpack.Artifact{}
+	var index string
+	for _, v := range []string{"8bit", "4bit"} {
+		dir := t.TempDir()
+		for p, body := range map[string]string{"config.json": `{"quantization":"` + v + `"}`, "model.safetensors": "weights " + v} {
+			if err := os.WriteFile(filepath.Join(dir, p), []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		a, err := modelpack.Build(ctx, dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if index, err = modelpack.PushVariant(ctx, tag, a, v, opt); err != nil {
+			t.Fatal(err)
+		}
+		built[v] = a
+	}
+	plat := registryclient.Platform{OS: "linux", Architecture: "arm64"}
+	reg.Index("models/images", "v1", reg.Image("models/images", "", plat, []byte("layer")))
+	big := make([]map[string]any, artifact.MaxIndexEntries+1)
+	for i := range big {
+		big[i] = map[string]any{
+			"mediaType": registryclient.MediaTypeOCIManifest, "size": 100,
+			"digest":      "sha256:" + sha256Hex([]byte{byte(i), byte(i >> 8)}),
+			"annotations": map[string]string{artifact.AnnotationVariant: "v" + strconv.Itoa(i)},
+		}
+	}
+	body, _ := json.Marshal(map[string]any{"schemaVersion": 2, "mediaType": registryclient.MediaTypeOCIIndex, "manifests": big})
+	req := httptest.NewRequest(http.MethodPut, "/v2/models/huge/manifests/v1", bytes.NewReader(body))
+	req.Header.Set("Content-Type", registryclient.MediaTypeOCIIndex)
+	rec := httptest.NewRecorder()
+	reg.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("put huge index: HTTP %d", rec.Code)
+	}
+
+	env := modelLsEnv(t, reg, true)
+	reg.ResetRequests()
+	var rep modelListReport
+	if err := json.Unmarshal([]byte(runModelLs(t, env, "-o", "json")), &rep); err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.Models) != 3 {
+		t.Fatalf("models = %+v, want the huge index row and two variant rows", rep.Models)
+	}
+	huge := rep.Models[0]
+	if huge.Name != "huge" || huge.Error == "" || !strings.Contains(huge.Error, strconv.Itoa(artifact.MaxIndexEntries)) || huge.Variant != "" {
+		t.Errorf("huge index row = %+v, want an error naming the entry cap", huge)
+	}
+	for i, v := range []string{"4bit", "8bit"} {
+		a := built[v]
+		want := modelRow{
+			Name: "qwen3", Repository: "models/qwen3", Tag: "latest",
+			Reference: "registry-k3sm:6450/models/qwen3:latest", Digest: a.Digest.String(),
+			Format: "safetensors", SizeBytes: layersSize(a), Files: 2, Shards: 1, Quantization: v,
+			Variant: v, Index: index,
+		}
+		if got := rep.Models[1+i]; got != want {
+			t.Errorf("variant row %d =\n%+v\nwant\n%+v", i, got, want)
+		}
+	}
+	// Two variants: one config blob each. The huge index's entries are never read.
+	if got := reg.Requests(http.MethodGet, registrytest.ClassBlob); got != 2 {
+		t.Errorf("fetched %d blobs, want 2 (one config per variant)", got)
+	}
+
+	out := runModelLs(t, env)
+	for _, s := range []string{"VARIANT", "qwen3:latest", "4bit", "8bit", "huge:v1"} {
+		if !strings.Contains(out, s) {
+			t.Errorf("table lacks %q:\n%s", s, out)
+		}
+	}
+	if strings.Contains(out, "images") {
+		t.Errorf("table lists an index of images:\n%s", out)
 	}
 }
