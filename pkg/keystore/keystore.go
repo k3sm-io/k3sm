@@ -86,9 +86,9 @@ type Entry struct {
 	// file, its current pointer or any version the pointer covers is missing,
 	// fails authentication or does not parse, or the pointer is older than the
 	// recorded floor (once Rotate brings the floor). A directory with no current
-	// pointer is an entry with an Err when it holds any file besides generation
-	// and v1; one holding only those is an interrupted Put, which is not an
-	// entry and is not listed. Current and Versions are zero then. List reports
+	// pointer is an entry with an Err when it holds any record file besides
+	// generation and v1; one holding only those, and temporary files, is an
+	// interrupted Put, which is not an entry and is not listed. Current and Versions are zero then. List reports
 	// such an entry here, not as an error for the whole call, so one bad entry
 	// does not hide the healthy ones.
 	Err error

@@ -28,6 +28,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -37,6 +38,18 @@ const (
 	currentName    = "current"
 	// generationFileSize is the generation file's size: hex and a newline.
 	generationFileSize = 2*generationSize + 1
+)
+
+var (
+	// errInterruptedPut is an entry directory with no current pointer that
+	// holds only what a crashed Put leaves: generation and at most v1. It is not
+	// an entry, so it matches ErrNotFound, and only a Put touches it.
+	errInterruptedPut = fmt.Errorf("%w: an interrupted put left a directory with no current pointer", ErrNotFound)
+	// errNoPointer is an entry directory with no current pointer that holds
+	// more than a crashed Put leaves. Put never writes that before the pointer,
+	// so it is damage, or an interrupted Delete: List reports it, Put refuses
+	// it, and Delete clears it.
+	errNoPointer = fmt.Errorf("%w: the current pointer is missing and the directory holds more than an interrupted put leaves", ErrCorrupt)
 )
 
 // Config locates a FileStore and names the user it belongs to.
@@ -125,15 +138,21 @@ func (s *FileStore) put(ctx context.Context, name string, kind Kind, value []byt
 }
 
 // createEntry makes name's directory with a fresh generation. A directory
-// with a current pointer is ErrExists; one without is an interrupted Put and
-// is discarded first.
+// with a current pointer is ErrExists, and so is one without a pointer that
+// holds more than an interrupted Put leaves, which is damage for rm to clear
+// and is left untouched. An interrupted Put is discarded first.
 func (s *FileStore) createEntry(root *os.Root, name string) (*entry, error) {
 	err := s.mkdirAt(root, name)
 	if errors.Is(err, fs.ErrExist) {
-		if _, serr := root.Lstat(name + "/" + currentName); serr == nil {
+		old, oerr := openEntryDir(root, name)
+		switch {
+		case oerr == nil:
+			old.close()
 			return nil, ErrExists
-		} else if !errors.Is(serr, fs.ErrNotExist) {
-			return nil, serr
+		case errors.Is(oerr, errNoPointer):
+			return nil, fmt.Errorf("%w: the entry is damaged, so rm it first: %w", ErrExists, oerr)
+		case !errors.Is(oerr, errInterruptedPut):
+			return nil, oerr
 		}
 		if err := root.RemoveAll(name); err != nil {
 			return nil, fmt.Errorf("discard an interrupted put: %w", err)
@@ -328,8 +347,10 @@ func listEntry(e *entry, k keys) Entry {
 }
 
 // Delete removes name and every version of it. The pointer is removed first,
-// so an interrupted Delete leaves an interrupted Put: not an entry, and
-// discarded by the next Put of the name. Delete reads nothing inside the
+// so an interrupted Delete leaves a directory with no pointer. One holding only
+// generation and v1 is an interrupted Put, which is not an entry and is
+// discarded by the next Put of the name; one holding more is damage that List
+// reports, and Delete, called again, clears it. Delete reads nothing inside the
 // entry, so it removes one List reports as corrupt.
 func (s *FileStore) Delete(ctx context.Context, name string) error {
 	if err := s.delete(ctx, name); err != nil {
@@ -351,18 +372,21 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	}
 	defer done()
 	e, err := openEntryDir(root, name)
-	if err != nil {
+	damaged := errors.Is(err, errNoPointer)
+	if err != nil && !damaged {
 		return err
 	}
-	defer e.close()
-	if err := e.root.Remove(currentName); err != nil {
-		return err
-	}
-	if err := syncDir(e.root); err != nil {
-		return err
-	}
-	if err := s.step("delete " + name); err != nil {
-		return err
+	if !damaged {
+		defer e.close()
+		if err := e.root.Remove(currentName); err != nil {
+			return err
+		}
+		if err := syncDir(e.root); err != nil {
+			return err
+		}
+		if err := s.step("delete " + name); err != nil {
+			return err
+		}
 	}
 	if err := root.RemoveAll(name); err != nil {
 		return err
@@ -399,10 +423,59 @@ func openEntry(root *os.Root, name string) (*entry, error) {
 	return e, nil
 }
 
-// openEntryDir opens name's directory. A missing directory, or one without a
-// current pointer, is ErrNotFound; one that is not a real directory is
+// openEntryDir opens name's directory. A missing directory is ErrNotFound, a
+// real directory without a current pointer is errInterruptedPut or errNoPointer
+// as interruptedPut tells them apart, and one that is not a real directory is
 // ErrCorrupt.
 func openEntryDir(root *os.Root, name string) (*entry, error) {
+	e, err := openEntryDirRaw(root, name)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := e.root.Lstat(currentName); err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			e.close()
+			return nil, err
+		}
+		interrupted, ierr := interruptedPut(e.root)
+		e.close()
+		if ierr != nil {
+			return nil, ierr
+		}
+		if interrupted {
+			return nil, errInterruptedPut
+		}
+		return nil, errNoPointer
+	}
+	return e, nil
+}
+
+// interruptedPut reports whether dir holds only what a crashed Put leaves
+// before its pointer: nothing, generation, or generation and v1, plus temporary
+// files, which no reader opens. Put writes generation before v1, so v1 without
+// generation cannot come from a crash.
+func interruptedPut(dir *os.Root) (bool, error) {
+	names, err := readDirNames(dir)
+	if err != nil {
+		return false, err
+	}
+	var generation, v1 bool
+	for _, n := range names {
+		switch {
+		case n == generationName:
+			generation = true
+		case n == versionName(1):
+			v1 = true
+		case strings.HasPrefix(n, ".") && strings.HasSuffix(n, ".tmp"):
+		default:
+			return false, nil
+		}
+	}
+	return generation || !v1, nil
+}
+
+// openEntryDirRaw opens name's directory without asking for a current pointer.
+func openEntryDirRaw(root *os.Root, name string) (*entry, error) {
 	fi, err := root.Lstat(name)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, ErrNotFound
@@ -423,13 +496,6 @@ func openEntryDir(root *os.Root, name string) (*entry, error) {
 	if opened, err := sub.Stat("."); err != nil || !os.SameFile(fi, opened) {
 		e.close()
 		return nil, fmt.Errorf("%w: the entry directory was replaced while it was opened", ErrCorrupt)
-	}
-	if _, err := sub.Lstat(currentName); err != nil {
-		e.close()
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil, ErrNotFound
-		}
-		return nil, err
 	}
 	return e, nil
 }
