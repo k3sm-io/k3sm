@@ -1118,7 +1118,7 @@ A server's `--work-dir` must be a directory named `server`, and an agent's a dir
 `<data root>/server` and `<data root>/agent`, and that deny is what keeps a pod out of the
 datastore, the cluster CA keys, the registry store and the node credentials. A work dir under any
 other name, such as `/data/k3sm/srv`, would sit outside the deny, so `k3sm server` and
-`k3sm agent` refuse to start with it and the error names the path to use instead. The defaults
+`k3sm agent` refuse to start with it and the error names the path to use instead. An existing work dir must also be a real directory, not a symlink, with exactly that name on disk, so `Server` is refused behind `--work-dir .../server`. Symlinks higher in the path, such as macOS's `/var`, are fine. The defaults
 and every layout `k3sm install` and `k3sm dev` create already follow this rule. To move an
 existing work dir, stop the daemon, rename the directory to `server` (or `agent`) under the same
 parent, and start it again with the new path.

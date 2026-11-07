@@ -213,12 +213,14 @@ func runAgent(args []string) error {
 	if opts.server == "" {
 		return fmt.Errorf("--server is required")
 	}
-	// The work dir's name, before anything is joined or written: the pod
-	// sandbox denies <data root>/agent only, so an agent work dir under another
-	// name would leave the node password and kubeconfig open to pods.
-	if err := checkWorkDirLayout(opts.workDir, sandbox.AgentSubdir); err != nil {
+	// The work dir, normalised and checked before any use of it: the pod
+	// sandbox denies <data root>/agent only, so an agent work dir anywhere else
+	// would leave the node password and kubeconfig open to pods.
+	workDir, err := resolveWorkDirLayout(opts.workDir, sandbox.AgentSubdir)
+	if err != nil {
 		return err
 	}
+	opts.workDir = workDir
 	if err := checkNodePortAddresses(&opts.nodePortAddresses, opts.network); err != nil {
 		return err
 	}
@@ -238,7 +240,7 @@ func runAgent(args []string) error {
 
 	breaker := newCrashBreaker(opts.workDir, logger)
 	opts.lan = startDaemonLAN(ctx, opts.workDir, logger)
-	err := agentStart(ctx, opts, breaker, logger)
+	err = agentStart(ctx, opts, breaker, logger)
 	// The terminal paths record BEFORE they back off (agentTerminal), so an
 	// installer polling the record sees the reason within its own join budget
 	// rather than half a minute later; everything else — a node-password that

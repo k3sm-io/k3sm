@@ -106,6 +106,16 @@ func refuseServerTokenAsAdmin(opts serverOptions) error {
 // work-dir guards. It canonicalizes opts.nodeName and resolves opts.token in
 // place.
 func validateServerOptions(opts *serverOptions, workDirErr error, logger *slog.Logger) error {
+	// The work dir, normalised and checked before any other use of it: the pod
+	// sandbox denies <data root>/server only, so a server work dir anywhere else
+	// would leave the datastore, the CA keys and the registry store open to pods.
+	if opts.workDir != "" {
+		workDir, err := resolveWorkDirLayout(opts.workDir, sandbox.ServerSubdir)
+		if err != nil {
+			return err
+		}
+		opts.workDir = workDir
+	}
 	// The token, from the file the installed daemon is pointed at: the static
 	// admin token, or on an HA server-join the server-class JOIN token. Resolved
 	// BEFORE any state is touched, because a token file that is there and cannot
@@ -181,12 +191,6 @@ func validateServerOptions(opts *serverOptions, workDirErr error, logger *slog.L
 			return fmt.Errorf("resolve control-plane work-dir: %w (pass --work-dir)", workDirErr)
 		}
 		return fmt.Errorf("control-plane work-dir is empty (pass --work-dir)")
-	}
-	// The work dir's name, before anything is created in it: the pod sandbox
-	// denies <data root>/server only, so a server work dir under another name
-	// would leave the datastore, the CA keys and the registry store open to pods.
-	if err := checkWorkDirLayout(opts.workDir, sandbox.ServerSubdir); err != nil {
-		return err
 	}
 	// Refuse a shadowed data root before touching it: writing the work-dir into
 	// a declared-but-unmounted mountpoint would build a fresh, empty datastore
