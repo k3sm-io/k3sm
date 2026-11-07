@@ -91,6 +91,8 @@
 #   K3SM_MST_LOCAL_K3SM          k3sm on this host, for the push (default k3sm)
 #   K3SM_MST_WORKER_LABEL        the worker's node daemon (default io.k3sm.agent)
 #   K3SM_MST_MEMORY              spec.memory (default 4Gi)
+#   K3SM_MST_IMAGE               spec.runtime.image (default: the examples/mlxmodel.yaml pin)
+#   K3SM_MST_PORT                spec.port, matching the image (default 8000)
 #   K3SM_MST_PYTHON              python in the serving image (default python3)
 #   K3SM_MST_STEP_TIMEOUT        seconds for one remote or kubectl step (default 120, <=240)
 #   K3SM_MST_READY_TIMEOUT       seconds for a model to come Ready (default 900)
@@ -367,6 +369,10 @@ K3SM_BIN="${K3SM_MST_K3SM:-/Library/k3sm/k3sm}"
 LOCAL_K3SM="${K3SM_MST_LOCAL_K3SM:-k3sm}"
 WORKER_LABEL="${K3SM_MST_WORKER_LABEL:-io.k3sm.agent}"
 MEMORY="${K3SM_MST_MEMORY:-4Gi}"
+# The operator ships no default serving image, so the run names one; the default is the
+# pin examples/mlxmodel.yaml carries, and the port must agree with it.
+IMAGE="${K3SM_MST_IMAGE:-ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.5@sha256:a225253effc92f5f5ff8ec2ec2e2f8894aa690a3d6a908bb879439de6733d0e8}"
+PORT="${K3SM_MST_PORT:-8000}"
 PYBIN="${K3SM_MST_PYTHON:-python3}"
 VIEW_UID="${K3SM_MST_VIEW_UID:-0}"
 REG_ROOT="${K3SM_MST_REGISTRY_ROOT:-/var/lib/k3sm/server/registry}"
@@ -611,6 +617,7 @@ mlxmodel_json() { # <name> <hostname-label> <replicas>
 	cat <<JSON
 {"apiVersion":"mlx.k3sm.io/v1alpha1","kind":"MLXModel","metadata":{"name":"$1","namespace":"$NS"},
  "spec":{"artifact":{"reference":"$REG_HOST/models/$REPO:v1"},"memory":"$MEMORY","replicas":$3,
+  "port":$PORT,"runtime":{"image":"$IMAGE"},
   "nodeSelector":{"kubernetes.io/hostname":"$2","kubernetes.io/os":"darwin"}}}
 JSON
 }
