@@ -1,0 +1,17 @@
+{"Action":"start","Package":"k3sm.io/apis/net/v1"}
+{"Action":"run","Package":"k3sm.io/apis/net/v1","Test":"TestParent"}
+{"Action":"output","Package":"k3sm.io/apis/net/v1","Test":"TestParent","Output":"=== RUN   TestParent\n"}
+{"Action":"run","Package":"k3sm.io/apis/net/v1","Test":"TestParent/a"}
+{"Action":"output","Package":"k3sm.io/apis/net/v1","Test":"TestParent/a","Output":"=== RUN   TestParent/a\n"}
+{"Action":"output","Package":"k3sm.io/apis/net/v1","Test":"TestParent/a","Output":"    x_test.go:9: read udp 127.0.0.1: i/o timeout\n"}
+{"Action":"run","Package":"k3sm.io/apis/net/v1","Test":"TestParent/b"}
+{"Action":"output","Package":"k3sm.io/apis/net/v1","Test":"TestParent/b","Output":"=== RUN   TestParent/b\n"}
+{"Action":"output","Package":"k3sm.io/apis/net/v1","Test":"TestParent","Output":"--- FAIL: TestParent (0.01s)\n"}
+{"Action":"output","Package":"k3sm.io/apis/net/v1","Test":"TestParent/a","Output":"    --- FAIL: TestParent/a (0.01s)\n"}
+{"Action":"fail","Package":"k3sm.io/apis/net/v1","Test":"TestParent/a","Elapsed":0.01}
+{"Action":"output","Package":"k3sm.io/apis/net/v1","Test":"TestParent/b","Output":"    --- PASS: TestParent/b (0.00s)\n"}
+{"Action":"pass","Package":"k3sm.io/apis/net/v1","Test":"TestParent/b","Elapsed":0}
+{"Action":"fail","Package":"k3sm.io/apis/net/v1","Test":"TestParent","Elapsed":0.01}
+{"Action":"output","Package":"k3sm.io/apis/net/v1","Output":"FAIL\n"}
+{"Action":"output","Package":"k3sm.io/apis/net/v1","Output":"FAIL\tk3sm.io/apis/net/v1\t0.1s\n"}
+{"Action":"fail","Package":"k3sm.io/apis/net/v1","Elapsed":0.1}

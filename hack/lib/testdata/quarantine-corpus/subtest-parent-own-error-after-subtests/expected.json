@@ -1,0 +1,12 @@
+{
+  "description": "The leaf is listed and fails with its signature; its unlisted parent then calls t.Error after its subtests have run. go test attributes that line to the parent (the Test field), so the parent failed on its own and reds.",
+  "edited": [],
+  "tests": {
+    "k3sm.io/apis/net/v1::TestParent": "failed",
+    "k3sm.io/apis/net/v1::TestParent/a": "excused",
+    "k3sm.io/apis/net/v1::TestParent/b": "passed"
+  },
+  "tier": "affected",
+  "today": "2026-10-30",
+  "verdict": "red"
+}

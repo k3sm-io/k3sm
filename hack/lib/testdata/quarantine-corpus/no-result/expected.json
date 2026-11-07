@@ -1,0 +1,10 @@
+{
+  "description": "A test starts and emits output but never reports a result: red.",
+  "edited": [],
+  "tests": {
+    "k3sm.io/apis/net/v1::TestHang": "failed"
+  },
+  "tier": "affected",
+  "today": "2026-10-30",
+  "verdict": "red"
+}
