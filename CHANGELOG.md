@@ -182,6 +182,7 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
   `--work-dir <data root>/server`. The defaults and installed layouts are unaffected. See
   [limitations](docs/user/limitations.md#--work-dir-must-end-in-server-or-agent).
 - The bundled buildx moves from v0.38.0 to v0.38.1, a patch release. The pinned checksums move with it.
+- The bundled etcd and etcdutl move from v3.6.15 to v3.6.16, a patch release. The pinned checksums move with it.
 - `k3sm image prune --force` frees the layers of the untagged manifests it deleted at once, instead
   of leaving them for the registry's next scheduled garbage collection (every 6 hours). After it
   deletes at least one manifest it asks the registry, with the node's push credential, to sweep
