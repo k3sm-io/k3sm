@@ -85,7 +85,9 @@ type Entry struct {
 	Versions []Version
 	// Err is non-nil exactly when the entry could not be opened: its current
 	// pointer failed authentication, is older than the recorded floor, or does
-	// not parse. Current and Versions are zero then. List reports such an entry
+	// not parse, or it is missing while the directory holds more than an
+	// incomplete Put leaves behind (generation and at most v1, which is not an
+	// entry and is not listed). Current and Versions are zero then. List reports such an entry
 	// here, not as an error for the whole call, so one bad entry does not hide
 	// the healthy ones.
 	Err error

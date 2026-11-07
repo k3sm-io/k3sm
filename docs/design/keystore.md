@@ -367,6 +367,21 @@ non-nil exactly when the entry could not be opened, and `Current` and `Versions`
 zero. `List` returns a non-nil error for the whole call only for a failure that is not
 about one entry: the master missing or untrusted, or the lock timing out.
 
+**An entry directory with no `current`.** Put writes `generation`, then `v1`, then
+`current`, so a crash before the pointer leaves a directory holding `generation` and at most
+`v1`, with no other file. That shape, and only that shape, is an incomplete Put. It is not an
+entry: `List` does not return it, `Current`, `Get` and `Delete` answer `ErrNotFound`, and the
+next Put of the name discards it and starts over. A directory with no `current` that holds
+anything more cannot be an incomplete Put, because Put writes nothing else before `current`.
+That is a pointer lost to damage or to an interrupted Delete, with sealed records still on
+disk. `List` returns it with `Err` set, wrapping `ErrCorrupt`, and `rm` removes the directory
+and its floor entry, since `rm` reads nothing inside an entry. Put of that name answers
+`ErrExists` and touches nothing, so no Put silently deletes versions an operator can still
+see. One case cannot be told apart: a one-version entry that lost `current` is `generation`
+and `v1`, the same as an incomplete Put, so the next Put discards it without saying so. The
+loss is that one version, and the restore procedure under "Backup and snapshots" is what
+recovers it.
+
 The reason is what an operator running `list` needs: the truth about every entry,
 including which one is wrong, not a refusal that hides the healthy ones. A consumer that
 must not skip a corrupt entry checks `Err`; the `list` verb prints `corrupt` for that entry
@@ -387,8 +402,10 @@ serializes Rewrap, Rotate and Put against each other and against the reconciler'
 - Each file write is still temp-and-rename, so a process that dies releases the lock and
   leaves a state the next operation can finish or discard. The lock is for serialization,
   not for crash safety.
-- An entry directory with no `current` is an incomplete Put. Put under the lock discards
-  it and starts over, so one crash does not leave a name that can never be reused.
+- An entry directory with no `current` is an incomplete Put only in the one shape a crashed
+  Put can leave; any other directory with no `current` is damage. "An entry directory with no
+  `current`" under "List, when one entry is corrupt" is the rule, and Put discards only the
+  first shape, so one crash does not leave a name that can never be reused.
 
 ### Ownership of what root writes
 
@@ -699,7 +716,7 @@ last pull request lands and no row is pending.
 | G13 | A crash between the two master renames leaves a master that passes its trust check, and the next verb completes the swap | unit: stop after the first rename |
 | G14 | One lock serializes Rewrap, Rotate, Put and reads, with a bounded wait | unit: a held lock gives a timeout error within the bound, not a hang |
 | G15 | Files a root-run verb writes under `server/` are owned by the service user at the layout's modes | unit with a fake owner seam |
-| G16 | `list` returns every entry, marks an unreadable one with `Err`, and exits 1 | unit plus a CLI exit-code test |
+| G16 | `list` returns every entry, marks an unreadable one with `Err`, and exits 1. A directory holding only `generation` and at most `v1` is an incomplete Put: not listed, `ErrNotFound` from `Current`, `Get` and `Delete`, discarded by the next Put. A directory with no `current` and any other file is damage: listed with `Err` wrapping `ErrCorrupt`, removed by `rm` with its floor entry, and `ErrExists` from Put with every file left in place | unit: both shapes, plus a `v1`-only directory standing in for the one-version entry that lost `current`, and a `v1`-and-`v2` directory with `current` removed; a CLI exit-code test for `list` and `rm` |
 | G17 | `show` prints a value only with `--reveal`, and then writes exactly the stored bytes with no trailing newline; no verb takes a value as an argument | CLI test over the usage strings; a `--reveal` test comparing stdout to the stored bytes for an opaque value and for 32- and 64-byte Ed25519 values |
 | G18 | Delivery is refused while encryption is off unless the override flag was set at server start; a delivered target stays when the override is removed | unit over the reconciler with a fake client |
 | G19 | The delivery declaration is root-owned and not shared-writable, and is refused otherwise | unit, the same cases as the manifest directory |
