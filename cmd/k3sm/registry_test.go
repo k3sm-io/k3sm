@@ -74,6 +74,22 @@ func TestRegistryPortFlagParses(t *testing.T) {
 	}
 }
 
+// TestRegistryQuotaFlagReachesConfig pins that each --registry-quota reaches
+// the registry's config.
+func TestRegistryQuotaFlagReachesConfig(t *testing.T) {
+	fs := flag.NewFlagSet("server", flag.ContinueOnError)
+	var opts serverOptions
+	_ = registerServerFlags(fs, &opts)
+	model := "application/vnd.cncf.model.manifest.v1+json"
+	if err := fs.Parse([]string{"--registry-quota", model + "=1000", "--registry-quota", "application/wasm=10"}); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	cfg := registryConfig(opts, "", slog.Default())
+	if len(cfg.Quota) != 2 || cfg.Quota[model] != 1000 || cfg.Quota["application/wasm"] != 10 {
+		t.Fatalf("Quota = %v, want both quotas", cfg.Quota)
+	}
+}
+
 // TestRegistryConfig pins the flag-to-config mapping, including the data volume
 // the child must find the store on.
 func TestRegistryConfig(t *testing.T) {

@@ -164,6 +164,9 @@ func validateServerOptions(opts *serverOptions, workDirErr error, logger *slog.L
 	if opts.registryNodePort != 0 && opts.registryPort == 0 {
 		return fmt.Errorf("--registry-node-port %d needs the registry, which --registry-port 0 turns off", opts.registryNodePort)
 	}
+	if len(opts.registryQuota) != 0 && opts.registryPort == 0 {
+		return errors.New("--registry-quota needs the registry, which --registry-port 0 turns off")
+	}
 	// The node name is checked ONCE, here, before anything keys on it: from this
 	// point opts.nodeName is canonical for the self-name guard, this node's own
 	// node-password binding, its certificates and its Node object alike.

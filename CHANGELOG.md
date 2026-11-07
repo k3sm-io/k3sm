@@ -39,6 +39,9 @@ downloading when the scratch volume cannot hold the model plus a reserve. Its `k
 directory is removed when the import ends or is interrupted, and a later import sweeps one a killed process
 left behind after 24 hours. See [Models in the cluster registry](docs/user/models.md). `k3sm model push` no longer
   re-sends a manifest the tag already names. No RBAC changes.
+- `k3sm server --registry-quota <artifactType>=<bytes>`, repeatable, caps the bytes one artifact type
+  takes in the cluster registry. A push that would pass it is refused with `403 DENIED`; a layer
+  shared between manifests counts once. See the Quotas section of `docs/user/registry.md`.
 - A node advertises the GPU under hardware names beside the `mlx.k3sm.io` ones, which do not change: the
   `k3sm.io/gpu` extended resource and the `k3sm.io/gpu.present` and `k3sm.io/gpu-memory-gb` labels on a
   node that can grant a pod the GPU, and the `k3sm.io/chip`, `k3sm.io/chip-family` and `k3sm.io/memory-gb`
