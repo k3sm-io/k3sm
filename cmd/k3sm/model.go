@@ -43,7 +43,7 @@ import (
 const modelRepositoryPrefix = "models/"
 
 // modelUsage is `k3sm model`'s help.
-const modelUsage = `Usage: k3sm model <push|rm> [flags] <args>
+const modelUsage = `Usage: k3sm model <push|ls|rm> [flags] <args>
 
 Store models in the cluster registry as ModelPack OCI artifacts, under
 registry-k3sm:6450/models/<name>.
@@ -60,6 +60,14 @@ registry-k3sm:6450/models/<name>.
         Writes as 'k3sm image push' does: the server's push credential when
         this account can read it, else a builder token through your
         kubeconfig.
+  ls [-o json]
+        list the models in the cluster registry: every tag under models/
+        whose manifest is a ModelPack artifact, with its weight format,
+        quantization and parameter size (copied from the model's
+        config.json at push, when it records them), total size, file count
+        and weight shard count. Reads each model's manifest and config,
+        never its files, over your own credentials. -o json writes a
+        versioned document instead of the table.
   rm <name>[:tag]
         remove the tag models/<name>:<tag> (tag defaults to latest). It
         removes a name, not bytes: the registry reclaims content no tag names
@@ -77,6 +85,8 @@ type modelOptions struct {
 	name    string
 	workDir string
 	timeout time.Duration
+	// output is ls's -o: "" for the table, or json.
+	output string
 }
 
 // runModel runs `k3sm model`.
@@ -103,7 +113,7 @@ func runModel(args []string) error {
 // a bad flag is an error the caller reports, never an os.Exit in a test.
 func parseModelArgs(args []string, errOut io.Writer) (modelOptions, error) {
 	if len(args) == 0 {
-		return modelOptions{}, errors.New("model: name a verb (push or rm)")
+		return modelOptions{}, errors.New("model: name a verb (push, ls or rm)")
 	}
 	o := modelOptions{verb: args[0]}
 	var want int
@@ -112,8 +122,10 @@ func parseModelArgs(args []string, errOut io.Writer) (modelOptions, error) {
 		want = 2
 	case "rm":
 		want = 1
+	case "ls":
+		want = 0
 	default:
-		return modelOptions{}, fmt.Errorf("unknown model verb %q (want push or rm)", o.verb)
+		return modelOptions{}, fmt.Errorf("unknown model verb %q (want push, ls or rm)", o.verb)
 	}
 	fs := flag.NewFlagSet("model "+o.verb, flag.ContinueOnError)
 	fs.SetOutput(errOut)
@@ -124,8 +136,12 @@ func parseModelArgs(args []string, errOut io.Writer) (modelOptions, error) {
 	defaultWorkDir, _ := executor.ResolveWorkDir()
 	fs.StringVar(&o.workDir, "work-dir", defaultWorkDir, "control-plane state root to read this node's registry push credential from")
 	defaultTimeout := time.Duration(0)
-	if o.verb == "rm" {
+	if o.verb == "rm" || o.verb == "ls" {
 		defaultTimeout = metadataTimeout
+	}
+	if o.verb == "ls" {
+		fs.StringVar(&o.output, "o", "", "json, for a versioned document instead of the table")
+		fs.StringVar(&o.output, "output", "", "alias for -o")
 	}
 	fs.DurationVar(&o.timeout, "timeout", defaultTimeout, "overall deadline; push has none by default, and abandons a request only when it moves no byte for "+requestIdleTimeout.String())
 	if err := fs.Parse(args[1:]); err != nil {
@@ -134,9 +150,13 @@ func parseModelArgs(args []string, errOut io.Writer) (modelOptions, error) {
 	if fs.NArg() != want {
 		return modelOptions{}, fmt.Errorf("model %s takes %d argument(s), got %q", o.verb, want, fs.Args())
 	}
-	if o.verb == "push" {
+	if o.output != "" && o.output != "json" {
+		return modelOptions{}, fmt.Errorf("-o %q: ls renders a table by default and `json` on request", o.output)
+	}
+	switch o.verb {
+	case "push":
 		o.dir, o.name = fs.Arg(0), fs.Arg(1)
-	} else {
+	case "rm":
 		o.name = fs.Arg(0)
 	}
 	return o, nil
@@ -149,6 +169,12 @@ func modelCommand(ctx context.Context, o modelOptions, out io.Writer) error {
 		return modelPush(withRequestIdle(ctx, requestIdleTimeout), o, out)
 	case "rm":
 		return modelRm(ctx, o, out)
+	case "ls":
+		env, err := newImageRegistryEnv()
+		if err != nil {
+			return err
+		}
+		return modelLs(ctx, o, out, env)
 	}
 	return fmt.Errorf("unknown model verb %q", o.verb)
 }

@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"quantization\":{\"bits\":99999999999999999999999}}")

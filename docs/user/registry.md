@@ -136,6 +136,60 @@ registry can read the images this cluster runs, and only a user holding a builde
 [Pushing With Other Tools](#pushing-with-other-tools)), or a Pod the cluster's RBAC allows to push (see [Pushing From Inside a Pod](#pushing-from-inside-a-pod)),
 can put a new one there.
 
+## Models
+
+`k3sm model push <dir> <name>[:tag]` stores a model directory in the registry as a
+[ModelPack](https://github.com/modelpack/model-spec) artifact under `registry-k3sm:6450/models/<name>`,
+one uncompressed layer per file, and `k3sm model rm <name>[:tag]` removes the tag. Run
+`k3sm model --help` for the files push refuses.
+
+`k3sm model ls` lists every tag under `models/` whose manifest is a ModelPack artifact:
+
+```sh
+k3sm model ls             # a table
+k3sm model ls -o json     # the same, as a versioned document
+```
+
+```text
+NAME      FORMAT       QUANT   PARAMS  SIZE     FILES  SHARDS  DIGEST
+llama:v1  safetensors  4bit    -       4.2 GiB  9      2       sha256:54f859a80552
+qwen:q4   gguf         Q4_K_M  7B      4.4 GiB  2      1       sha256:fd6616d87d32
+```
+
+The listing reads each model's manifest and its small config document, never the model's files, and
+over your own credentials, as `k3sm image ls` does. **SHARDS** is the number of weight files: 1 for a
+single file, N for a split safetensors or GGUF set. **QUANT** and **PARAMS** are copied from the
+model's own `config.json` when it is pushed, and only when it records them: a string `quantization`,
+the Hugging Face `quantization_config.quant_method`, or MLX's `quantization.bits` (shown as `4bit`),
+and a string `paramSize`. A value is kept only when it is at most 64 characters of letters, digits and
+`. _ + -`. A `config.json` larger than 1 MiB, or one that is not a JSON object, gives no metadata and
+the push still succeeds. A model whose MLX quantization was pushed by an earlier k3sm shows `-` until it
+is pushed again.
+
+`-o json` writes:
+
+```json
+{
+  "schemaVersion": 1,
+  "registry": { "name": "registry-k3sm:6450", "reachable": true },
+  "models": [
+    {
+      "name": "qwen", "repository": "models/qwen", "tag": "q4",
+      "reference": "registry-k3sm:6450/models/qwen:q4", "digest": "sha256:fd66...",
+      "format": "gguf", "sizeBytes": 4718592000, "files": 2, "shards": 1,
+      "quantization": "Q4_K_M", "paramSize": "7B"
+    }
+  ]
+}
+```
+
+Every key on a model is always present, `""` or `0` when the model does not record it. A model whose
+manifest or config cannot be read is still listed, with an `error` key (present only then) and no
+metadata. A registry that does not answer gives `"reachable": false`, an `error` on `registry`, an
+empty `models` list, and exit status 0. A listing walks at most 10000 tags; one that stops there
+adds `"truncated": true` (absent otherwise) and ends the table with a line saying so. New keys may be added under the same `schemaVersion`; an
+existing key never changes meaning.
+
 ## One Store for the Cluster
 
 The registry runs on the **server**. With several servers, the first server, the one the others
