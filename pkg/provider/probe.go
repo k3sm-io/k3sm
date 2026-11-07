@@ -513,6 +513,11 @@ type podProber struct {
 	// means bookkeeping only.
 	restartFunc func(ctx context.Context, podID, container string) error
 
+	// closeIdle closes the pod's own probe transport's idle connections and
+	// cancels its abandoned dials once the loops have ended; nil when the pod has
+	// no transport of its own. See stop.
+	closeIdle func()
+
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 }
@@ -629,11 +634,22 @@ func (pp *podProber) start(ctx context.Context) {
 // stop cancels every probe loop and waits for them to exit. It must NOT be called
 // while holding any lock onTransition takes (the runtimedRuntime calls it after
 // releasing its mutex) so the wait cannot deadlock against a re-publish in flight.
+//
+// Ending the loops does not end every dial they started: net/http dials on its
+// own goroutine under a context detached from the request's cancellation, so an
+// httpGet dial begun before the cancel can still reach the pod's dial seam after
+// stop returns. Closing the transport's idle connections once the loops have
+// ended cancels every such dial that no request waits on any more, so none
+// outlives the stop.
 func (pp *podProber) stop() {
 	if pp.cancel != nil {
 		pp.cancel()
 	}
 	pp.wg.Wait()
+	if pp.closeIdle != nil {
+		// After wg.Wait: CloseIdleConnections cancels only dials whose request has returned.
+		pp.closeIdle()
+	}
 }
 
 // loop drives one probe: wait the initial delay, then probe every period until
