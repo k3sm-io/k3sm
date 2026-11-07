@@ -70,8 +70,10 @@ The import runs on your Mac, not in a pod, and only that Mac needs internet acce
 
 Run the same import again and it uploads nothing and prints the same digest.
 
-Files are downloaded into a new subdirectory of the system temporary directory, which is removed when the
-import ends. Before the first download, the import checks that the directory's volume has room for the
+Files are downloaded into a new `k3sm-hf-import-*` subdirectory of the system temporary directory, and the
+import prints its path. The directory is removed when the import ends, including when Ctrl-C stops it. If the
+process is killed outright, the directory stays behind. The next import removes any of your
+`k3sm-hf-import-*` directories in the same parent in which nothing has changed for 24 hours, and says so. Before the first download, the import checks that the directory's volume has room for the
 whole model plus a reserve of 5% (at least 1 GiB). If it does not, the import stops before fetching
 anything. Choose another parent with `--scratch-dir <dir>`.
 

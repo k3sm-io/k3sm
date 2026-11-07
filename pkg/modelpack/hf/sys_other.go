@@ -18,10 +18,16 @@ limitations under the License.
 
 package hf
 
-import "errors"
+import (
+	"errors"
+	"io/fs"
+)
 
 // statfsFree cannot measure free space here, so the import refuses rather
 // than guess.
 func statfsFree(string) (uint64, error) {
 	return 0, errors.New("free space is not measurable on this platform")
 }
+
+// fileOwner cannot read an owner here, so no leftover is swept.
+func fileOwner(fs.FileInfo) (int, bool) { return 0, false }

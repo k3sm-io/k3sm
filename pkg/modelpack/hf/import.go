@@ -21,8 +21,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"sort"
+	"time"
 
 	"github.com/opencontainers/go-digest"
 
@@ -46,9 +48,11 @@ var ErrUnknownSHA256Path = errors.New("--sha256 names a file the repository does
 
 // ImportOptions configures one Import.
 type ImportOptions struct {
-	// ScratchDir is the directory the import's own scratch directory is
-	// created in; os.TempDir() when empty. The scratch directory is removed
-	// when Import returns.
+	// ScratchDir is the directory the import's own scratch directory
+	// (ScratchPrefix*) is created in; os.TempDir() when empty. The scratch
+	// directory is removed when Import returns, cancelled or not; one a
+	// killed process left behind is swept by a later import once it has
+	// been quiet for StaleScratchAge.
 	ScratchDir string
 	// SHA256 maps a file's path to the sha256 (64 lowercase hex digits) its
 	// content must also have, beyond the Hub's own hash.
@@ -57,6 +61,10 @@ type ImportOptions struct {
 	// called at most once, and never after a refusal. A nil Push builds and
 	// verifies only.
 	Push func(ctx context.Context, a *modelpack.Artifact) error
+	// Note, when set, receives what the import does to the file system:
+	// where it downloads, and each leftover scratch directory it removes or
+	// fails to.
+	Note func(msg string)
 	// Fetched, when set, is called after each file is downloaded and
 	// verified.
 	Fetched func(path string, size int64)
@@ -93,11 +101,27 @@ func (c *Client) Import(ctx context.Context, ref Ref, o ImportOptions) (*Result,
 		return nil, fmt.Errorf("import %s@%s: %w", Scheme+ref.Repo, commit, err)
 	}
 
-	dir, err := os.MkdirTemp(o.ScratchDir, "k3sm-hf-import-")
+	note := o.Note
+	if note == nil {
+		note = func(string) {}
+	}
+	parent := o.ScratchDir
+	if parent == "" {
+		parent = os.TempDir()
+	}
+	removed, errs := sweepScratch(parent, time.Now(), os.Getuid())
+	for _, name := range removed {
+		note("removed leftover scratch directory " + filepath.Join(parent, name))
+	}
+	for _, err := range errs {
+		note("could not sweep " + parent + ": " + err.Error())
+	}
+	dir, err := os.MkdirTemp(parent, ScratchPrefix)
 	if err != nil {
 		return nil, fmt.Errorf("scratch directory: %w", err)
 	}
 	defer os.RemoveAll(dir)
+	note("downloading into " + dir)
 	root, err := os.OpenRoot(dir)
 	if err != nil {
 		return nil, fmt.Errorf("scratch directory: %w", err)

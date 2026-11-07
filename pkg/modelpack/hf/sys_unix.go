@@ -20,6 +20,7 @@ package hf
 
 import (
 	"fmt"
+	"io/fs"
 	"syscall"
 )
 
@@ -32,4 +33,13 @@ func statfsFree(dir string) (uint64, error) {
 	}
 	// Bsize is uint32 on darwin and int64 on linux; both convert.
 	return uint64(st.Bavail) * uint64(st.Bsize), nil
+}
+
+// fileOwner is the uid that owns fi.
+func fileOwner(fi fs.FileInfo) (int, bool) {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, false
+	}
+	return int(st.Uid), true
 }

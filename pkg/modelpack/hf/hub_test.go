@@ -72,8 +72,10 @@ type fakeHub struct {
 	cutOnce map[string]int64
 	// redirectTo, when set, is where every LFS resolve redirects.
 	redirectTo string
-	pageSize   int
-	requests   []string
+	// onCDN runs at the start of every CDN request, outside the lock.
+	onCDN    func()
+	pageSize int
+	requests []string
 }
 
 func newFakeHub(t *testing.T) *fakeHub {
@@ -248,6 +250,12 @@ func (h *fakeHub) entries(files []hubFile) []map[string]any {
 
 func (h *fakeHub) serveCDN(w http.ResponseWriter, r *http.Request) {
 	h.record(r)
+	h.mu.Lock()
+	hook := h.onCDN
+	h.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	h.mu.Lock()
 	sum := strings.TrimPrefix(r.URL.Path, "/blobs/")
 	var found *hubFile
