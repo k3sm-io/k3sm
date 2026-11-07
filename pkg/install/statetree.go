@@ -305,8 +305,17 @@ var stateTree = func() []stateLevel {
 		{StateLevel(sandbox.VMBootFailureSubdir), svc(serviceTreePrivateMode)},
 		// The read-only artifact views root (ArtifactViewsMode).
 		{StateLevel(sandbox.ArtifactViewsSubdir), svc(ArtifactViewsMode)},
+		// The image cache's private staging dir for blobs cloned from the
+		// node's registry store: daemon-private, 0700, which the runtime
+		// requires exactly and does not repair.
+		{StateLevel(imageLocalStageSubdir), svc(serviceTreePrivateMode)},
 	}
 }()
+
+// imageLocalStageSubdir is the image cache's clone staging dir under the cache
+// root, which is the data root on a stock install. It is runtimed's unexported
+// pkg/image localStageDir, spelled here because nothing exports it.
+const imageLocalStageSubdir = ".local-stage"
 
 // podsSubdir and storageSubdir are the runtime's per-pod rootfs parent and
 // PersistentVolume parent. runtimed spells both as literals rather than

@@ -901,6 +901,9 @@ func serverNodeOptions(plan serverPlan, restCfg *rest.Config, nodeAddressing nod
 		// The verified guest boot pair goes to this server's own registry,
 		// where a worker fetches it by the pin's digests. nil with no registry.
 		onGuestArtifacts: w.registryPuller.PublishGuest,
+		// The store that registry serves, on this machine: the runtime clones
+		// a blob it already holds instead of fetching it. Empty when it runs none.
+		registryStoreRoot: w.registryPuller.StoreRoot,
 		// The loopback ports this server's datastore listens on (deniedLocalPorts:
 		// the --kine-port value that reaches executor.Config.KinePort, plus the etcd
 		// metrics port in the etcd posture), so every pod's SBPL denies connect() to
