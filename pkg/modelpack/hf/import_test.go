@@ -352,3 +352,29 @@ func TestImportRefusesGatedRepoLegibly(t *testing.T) {
 		})
 	}
 }
+
+// TestImportReportsEachFileSha256: every verified file is reported with its
+// sha256, small files included, so an operator can record it and pin it
+// with --sha256 on the next import, and pinning every reported hash imports.
+func TestImportReportsEachFileSha256(t *testing.T) {
+	hub := newFakeHub(t)
+	hub.addCommit("main", commitA, tinyModel("a")...)
+	got := map[string]string{}
+	if _, err := hub.client(t).Import(testContext(t), mustRef(t, "hf://acme/tiny-model"), ImportOptions{
+		ScratchDir: t.TempDir(),
+		Fetched:    func(p string, _ int64, sum string) { got[p] = sum },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range tinyModel("a") {
+		if want := sha256Hex(f.data); got[f.path] != want {
+			t.Errorf("%s reported sha256 %q, want %s", f.path, got[f.path], want)
+		}
+	}
+	if _, err := hub.client(t).Import(testContext(t), mustRef(t, "hf://acme/tiny-model@"+commitA), ImportOptions{
+		ScratchDir: t.TempDir(),
+		SHA256:     got,
+	}); err != nil {
+		t.Fatalf("import pinned by the reported hashes: %v", err)
+	}
+}

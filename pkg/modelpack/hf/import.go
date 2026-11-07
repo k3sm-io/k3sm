@@ -66,8 +66,9 @@ type ImportOptions struct {
 	// fails to.
 	Note func(msg string)
 	// Fetched, when set, is called after each file is downloaded and
-	// verified.
-	Fetched func(path string, size int64)
+	// verified, with its sha256 in hex: what a later import can pin in
+	// SHA256.
+	Fetched func(path string, size int64, sha256 string)
 }
 
 // Result is a finished import.
@@ -131,11 +132,12 @@ func (c *Client) Import(ctx context.Context, ref Ref, o ImportOptions) (*Result,
 		return nil, fmt.Errorf("import %s@%s: %w", Scheme+ref.Repo, commit, err)
 	}
 	for _, f := range files {
-		if err := c.download(ctx, root, ref.Repo, commit, f); err != nil {
+		sum, err := c.download(ctx, root, ref.Repo, commit, f)
+		if err != nil {
 			return nil, fmt.Errorf("import %s@%s: %w", Scheme+ref.Repo, commit, err)
 		}
 		if o.Fetched != nil {
-			o.Fetched(f.Path, f.Size)
+			o.Fetched(f.Path, f.Size, sum)
 		}
 	}
 

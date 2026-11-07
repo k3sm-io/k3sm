@@ -87,7 +87,9 @@ and it is checked as well:
 k3sm model import --sha256 model.safetensors=<64 hex digits> hf://<org>/<repo>@<commit>
 ```
 
-Pass `--sha256` once for each file you want to check.
+Pass `--sha256` once for each file you want to check. Every `fetched` line the import prints ends with the
+`--sha256 <path>=<hex>` that pins that file, small files included. Record those lines, and a later import of
+the same commit can be held to the bytes you got the first time.
 
 Downloads use https only. Redirects are followed only to the Hub's own host and its published CDN hosts.
 

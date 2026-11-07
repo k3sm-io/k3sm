@@ -24,7 +24,10 @@ pin, its date, and the tarball's sha256.
   anything is pushed: an LFS file by the Hub's sha256 and a small file by its git blob id. A broken transfer
   resumes with a range request. Importing the same commit again uploads nothing and gives the same digest.
   Access is anonymous, so a gated repository is refused by name. `--sha256 <path>=<hex>` adds a hash you know
-  from elsewhere. See [Models in the cluster registry](docs/user/models.md). `k3sm model push` no longer
+  from elsewhere, and each fetched file prints the `--sha256` that pins it next time. The import refuses before
+downloading when the scratch volume cannot hold the model plus a reserve. Its `k3sm-hf-import-*` scratch
+directory is removed when the import ends or is interrupted, and a later import sweeps one a killed process
+left behind after 24 hours. See [Models in the cluster registry](docs/user/models.md). `k3sm model push` no longer
   re-sends a manifest the tag already names. No RBAC changes.
 - A node advertises the GPU under hardware names beside the `mlx.k3sm.io` ones, which do not change: the
   `k3sm.io/gpu` extended resource and the `k3sm.io/gpu.present` and `k3sm.io/gpu-memory-gb` labels on a

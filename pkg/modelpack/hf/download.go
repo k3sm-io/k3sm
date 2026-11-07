@@ -90,36 +90,38 @@ func (v *verifier) Write(p []byte) (int, error) {
 }
 
 // check compares the hashes with the listing: the LFS sha256, or the git
-// blob id, and the caller's sha256 when given.
-func (v *verifier) check() error {
+// blob id, and the caller's sha256 when given. It returns the content's
+// sha256 in hex.
+func (v *verifier) check() (string, error) {
 	got := hex.EncodeToString(v.sum.Sum(nil))
 	if v.f.LFS != nil && got != v.f.LFS.OID {
-		return fmt.Errorf("%s: sha256 %s, the Hub names %s: %w", v.f.Path, got, v.f.LFS.OID, ErrHashMismatch)
+		return "", fmt.Errorf("%s: sha256 %s, the Hub names %s: %w", v.f.Path, got, v.f.LFS.OID, ErrHashMismatch)
 	}
 	if v.blob != nil {
 		if blob := hex.EncodeToString(v.blob.Sum(nil)); blob != v.f.OID {
-			return fmt.Errorf("%s: git blob id %s, the Hub names %s: %w", v.f.Path, blob, v.f.OID, ErrHashMismatch)
+			return "", fmt.Errorf("%s: git blob id %s, the Hub names %s: %w", v.f.Path, blob, v.f.OID, ErrHashMismatch)
 		}
 	}
 	if v.f.sha256 != "" && got != v.f.sha256 {
-		return fmt.Errorf("%s: sha256 %s, --sha256 names %s: %w", v.f.Path, got, v.f.sha256, ErrHashMismatch)
+		return "", fmt.Errorf("%s: sha256 %s, --sha256 names %s: %w", v.f.Path, got, v.f.sha256, ErrHashMismatch)
 	}
-	return nil
+	return got, nil
 }
 
-// download fetches f at commit into root, at f.Path, and verifies it. The
+// download fetches f at commit into root, at f.Path, verifies it, and
+// returns its sha256 in hex. The
 // file is created new (O_EXCL, O_NOFOLLOW) under root, which no path can
 // leave. A transfer that breaks is resumed with a Range request, up to
 // maxAttempts in all; a response that contradicts the listing ends it.
-func (c *Client) download(ctx context.Context, root *os.Root, repo, commit string, f file) error {
+func (c *Client) download(ctx context.Context, root *os.Root, repo, commit string, f file) (string, error) {
 	if dir := path.Dir(f.Path); dir != "." {
 		if err := root.MkdirAll(dir, 0o700); err != nil {
-			return fmt.Errorf("create %s: %w", dir, err)
+			return "", fmt.Errorf("create %s: %w", dir, err)
 		}
 	}
 	out, err := root.OpenFile(f.Path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
-		return fmt.Errorf("create %s: %w", f.Path, err)
+		return "", fmt.Errorf("create %s: %w", f.Path, err)
 	}
 	defer out.Close()
 
@@ -134,17 +136,17 @@ func (c *Client) download(ctx context.Context, root *os.Root, repo, commit strin
 			break
 		}
 		if !retry || ctx.Err() != nil {
-			return err
+			return "", err
 		}
 		if attempt == maxAttempts {
-			return fmt.Errorf("%s: gave up after %d attempts: %w", f.Path, maxAttempts, err)
+			return "", fmt.Errorf("%s: gave up after %d attempts: %w", f.Path, maxAttempts, err)
 		}
 	}
 	if written != f.Size {
-		return fmt.Errorf("%s: %d bytes, the Hub lists %d: %w", f.Path, written, f.Size, ErrSizeMismatch)
+		return "", fmt.Errorf("%s: %d bytes, the Hub lists %d: %w", f.Path, written, f.Size, ErrSizeMismatch)
 	}
 	if err := out.Close(); err != nil {
-		return fmt.Errorf("write %s: %w", f.Path, err)
+		return "", fmt.Errorf("write %s: %w", f.Path, err)
 	}
 	return v.check()
 }

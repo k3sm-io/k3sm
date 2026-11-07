@@ -73,7 +73,8 @@ registry-k3sm:6450/models/<name>.
         commit again uploads nothing and prints the same digest. Access is
         anonymous: a gated repository is refused. The Hub's hashes catch
         corruption in transit, not a compromised Hub; pass --sha256 for a
-        file whose hash you know from elsewhere. Files are downloaded into
+        file whose hash you know from elsewhere (each fetched line prints
+        the --sha256 that pins that file next time). Files are downloaded into
         a k3sm-hf-import-* directory under --scratch-dir, removed when the
         import ends or is interrupted; a later import sweeps one a killed
         process left behind after 24 hours without change.
@@ -328,8 +329,8 @@ func modelImport(ctx context.Context, o modelOptions, out io.Writer) error {
 		ScratchDir: o.scratchDir,
 		SHA256:     o.sha256,
 		Note:       func(msg string) { fmt.Fprintln(out, msg) },
-		Fetched: func(p string, size int64) {
-			fmt.Fprintf(out, "fetched %s (%d bytes, verified)\n", p, size)
+		Fetched: func(p string, size int64, sum string) {
+			fmt.Fprintf(out, "fetched %s (%d bytes, verified)\n  pin: --sha256 %s=%s\n", p, size, p, sum)
 		},
 		Push: func(ctx context.Context, a *modelpack.Artifact) error {
 			return pushModel(ctx, o.workDir, ref, a, out)
