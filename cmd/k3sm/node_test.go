@@ -215,6 +215,9 @@ func TestRuntimedConfigDeniesTheDataRootSecrets(t *testing.T) {
 				if cfg.DataRoot != dataRoot {
 					t.Errorf("%s: DataRoot = %q, want the work dir's parent %q", name, cfg.DataRoot, dataRoot)
 				}
+				if want := filepath.Join(dataRoot, role); cfg.StateDir != want {
+					t.Errorf("%s: StateDir = %q, want the work dir %q", name, cfg.StateDir, want)
+				}
 				if got := filepath.Dir(cfg.StatusRecordDir); got != cfg.DataRoot {
 					t.Errorf("%s: the status records sit in %q and the denies name %q", name, got, cfg.DataRoot)
 				}
@@ -224,6 +227,9 @@ func TestRuntimedConfigDeniesTheDataRootSecrets(t *testing.T) {
 	// The standalone `k3sm node` keeps no control-plane state, so it names no root.
 	if got := runtimedConfig(nodeOptions{standalone: true}, nil).DataRoot; got != "" {
 		t.Errorf("standalone DataRoot = %q, want empty", got)
+	}
+	if got := runtimedConfig(nodeOptions{standalone: true}, nil).StateDir; got != "" {
+		t.Errorf("standalone StateDir = %q, want empty", got)
 	}
 }
 

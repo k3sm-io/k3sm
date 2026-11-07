@@ -53,7 +53,7 @@ func TestServerRuntimedConfigCarriesLocalBlobSource(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfg := runtimedConfigOf(RuntimedConfig{RegistryStoreRoot: root}, slog.New(slog.DiscardHandler), "", "")
+	cfg := runtimedConfigOf(RuntimedConfig{RegistryStoreRoot: root}, slog.New(slog.DiscardHandler), "", "", "")
 	if cfg.LocalBlobSource == nil {
 		t.Fatal("a server's runtimed config carries no local blob source")
 	}
@@ -86,7 +86,7 @@ func TestServerRuntimedConfigCarriesLocalBlobSource(t *testing.T) {
 // registry did not start) leaves runtimed with no source at all — a nil
 // interface, not a typed nil the puller would call.
 func TestAgentRuntimedConfigHasNoLocalBlobSource(t *testing.T) {
-	cfg := runtimedConfigOf(RuntimedConfig{}, slog.New(slog.DiscardHandler), "", "")
+	cfg := runtimedConfigOf(RuntimedConfig{}, slog.New(slog.DiscardHandler), "", "", "")
 	if cfg.LocalBlobSource != nil {
 		t.Fatalf("an agent's runtimed config carries a local blob source: %#v", cfg.LocalBlobSource)
 	}
