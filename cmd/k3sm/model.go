@@ -17,7 +17,6 @@ limitations under the License.
 package main
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -29,10 +28,7 @@ import (
 	"syscall"
 	"time"
 
-	ggcrv1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
-	"github.com/google/go-containerregistry/pkg/v1/types"
-	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/modelpack"
@@ -221,27 +217,25 @@ func modelPush(ctx context.Context, o modelOptions, out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	acc, err := registryWriteAccess(ctx, o.workDir)
+	return pushModel(ctx, o.workDir, ref, a, out)
+}
+
+// pushModel pushes the built artifact a as ref, through the push gate with
+// the credential `k3sm image push` uses, and prints its digest. The caller
+// has built and verified a before the registry is contacted.
+func pushModel(ctx context.Context, workDir string, ref clusterImage, a *modelpack.Artifact, out io.Writer) error {
+	acc, err := registryWriteAccess(ctx, workDir)
 	if err != nil {
 		return fmt.Errorf("push %s: %w", ref.flat, err)
 	}
 	if ref, err = acc.locate(ref); err != nil {
 		return err
 	}
-	repo := ref.remote.Context()
-	blobs := []modelBlob{{desc: a.ConfigDescriptor, open: func() (io.ReadCloser, error) {
-		return io.NopCloser(bytes.NewReader(a.Config)), nil
-	}}}
-	for _, l := range a.Layers {
-		blobs = append(blobs, modelBlob{desc: l.Descriptor, open: func() (io.ReadCloser, error) { return a.Open(l) }})
-	}
-	for _, b := range blobs {
-		if err := remote.WriteLayer(repo, b, acc.opts...); err != nil {
-			return registryError("push "+ref.flat.String()+": upload "+b.desc.Digest.String(), err)
+	if err := modelpack.Push(ctx, ref.remote, a, acc.opts...); err != nil {
+		if be, ok := errors.AsType[*modelpack.BlobError](err); ok {
+			return registryError("push "+ref.flat.String()+": upload "+be.Digest, be.Err)
 		}
-	}
-	if err := remote.Put(ref.remote, rawManifest{body: a.Manifest, mediaType: ispec.MediaTypeImageManifest}, acc.opts...); err != nil {
-		return registryError("push "+ref.flat.String(), err)
+		return registryError("push "+ref.flat.String(), errors.Unwrap(err))
 	}
 	fmt.Fprintf(out, "pushed %s (%d files)\n  digest: %s\n  pin:    %s@%s\n", ref.flat, len(a.Layers), a.Digest, ref.flat.Context().Name(), a.Digest)
 	return nil
@@ -272,28 +266,3 @@ func modelRm(ctx context.Context, o modelOptions, out io.Writer) error {
 	fmt.Fprintln(out, "(the registry reclaims content no tag names at its next garbage collection)")
 	return nil
 }
-
-// modelBlob is one blob of a model artifact as go-containerregistry uploads
-// it: raw, so its compressed and uncompressed forms are the same bytes.
-type modelBlob struct {
-	desc ispec.Descriptor
-	open func() (io.ReadCloser, error)
-}
-
-func (b modelBlob) Digest() (ggcrv1.Hash, error)         { return ggcrv1.NewHash(b.desc.Digest.String()) }
-func (b modelBlob) DiffID() (ggcrv1.Hash, error)         { return b.Digest() }
-func (b modelBlob) Compressed() (io.ReadCloser, error)   { return b.open() }
-func (b modelBlob) Uncompressed() (io.ReadCloser, error) { return b.open() }
-func (b modelBlob) Size() (int64, error)                 { return b.desc.Size, nil }
-func (b modelBlob) MediaType() (types.MediaType, error) {
-	return types.MediaType(b.desc.MediaType), nil
-}
-
-// rawManifest is manifest bytes remote.Put sends verbatim under mediaType.
-type rawManifest struct {
-	body      []byte
-	mediaType string
-}
-
-func (m rawManifest) RawManifest() ([]byte, error)        { return m.body, nil }
-func (m rawManifest) MediaType() (types.MediaType, error) { return types.MediaType(m.mediaType), nil }
