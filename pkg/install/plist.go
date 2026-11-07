@@ -263,7 +263,7 @@ func ServerPlist(cfg Config) []byte {
 // different package — so a hand-picked literal here is wrong the first time any of
 // them moves, and the failure is silent and bad: a SIGKILL mid-stop orphans
 // exactly the children the stop exists to reap (kine and the apiserver on the
-// server path, the ingest registry's zot child on a server with one).
+// server path, the ingest registry's child on a server with one).
 //
 // A stopping server runs its deferred steps on two lanes at once:
 //
@@ -289,7 +289,8 @@ func ServerPlist(cfg Config) []byte {
 //	update controller  30s  updateControllerStopWait, cmd/k3sm/serverphases.go —
 //	                        SERVER ONLY, inside the operators' stop.
 //	(drains)            0s  every other deferred stop of startNode and runServer
-//	                        (the interconnect handlers, the heartbeat watch, the
+//	                        (the budget publisher, the interconnect handlers, the
+//	                        heartbeat watch, the
 //	                        svclb hoster, the event broadcaster, the interconnect
 //	                        resolver, the MLX operator, the provisioner, the etcd
 //	                        admin client, the manifest directory, the helm
@@ -308,7 +309,7 @@ func ServerPlist(cfg Config) []byte {
 //	                        apiserver writes before anything below begins.
 //	registry teardown  25s  the ingest registry's teardown, cmd/k3sm/registry.go:
 //	                        two best-effort retractions at registryRetractGrace (5s)
-//	                        each, then the zot child's stop at registryShutdownGrace
+//	                        each, then the child's stop at registryShutdownGrace
 //	                        (10s), within registryTeardownBound, which adds
 //	                        registryTeardownMargin (5s). It runs HERE, before the control plane goes, so
 //	                        the child is stopped in the first seconds of the exit
@@ -414,6 +415,7 @@ var serverTeardownSteps = []teardownStep{
 	{"eviction loop stop (provider.EvictionStopTimeout)", teardownEvictionStop, laneNode},
 	{"budget history stop (provider.BudgetHistoryStopBound)", teardownBudgetHistoryStop, laneNode},
 	{"runtimed close (defaultCloseGrace)", teardownRuntimedClose, laneNode},
+	{"budget publisher stop (context drain)", 0, laneNode},
 	{"node update watcher stop (nodeUpdateStopGrace)", teardownNodeUpdate, laneNode},
 	{"node interconnect handlers stop (context drain)", 0, laneNode},
 	{"heartbeat watch stop (context drain)", 0, laneNode},
@@ -448,6 +450,7 @@ var agentTeardownSteps = []teardownStep{
 	{"eviction loop stop (provider.EvictionStopTimeout)", teardownEvictionStop, laneNode},
 	{"budget history stop (provider.BudgetHistoryStopBound)", teardownBudgetHistoryStop, laneNode},
 	{"runtimed close (defaultCloseGrace)", teardownRuntimedClose, laneNode},
+	{"budget publisher stop (context drain)", 0, laneNode},
 	{"node update watcher stop (nodeUpdateStopGrace)", teardownNodeUpdate, laneNode},
 	{"node interconnect handlers stop (context drain)", 0, laneNode},
 	{"heartbeat watch stop (context drain)", 0, laneNode},

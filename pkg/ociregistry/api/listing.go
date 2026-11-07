@@ -35,10 +35,10 @@ import (
 // n is answered with maxPage entries and a Link to the rest.
 const maxPage = 10000
 
-// defaultCatalogPage is the catalog page size when the request names no n.
-// The distribution spec lets a registry page an unbounded catalog request, and
-// a client follows the Link.
-const defaultCatalogPage = 1000
+// defaultPage is the catalog and tag-list page size when the request names no
+// n. The distribution spec lets a registry page an unbounded request, and a
+// client follows the Link.
+const defaultPage = 1000
 
 // catalogVisits is the visit budget of a catalog page of n entries: four
 // visits an entry, and at least 1,000.
@@ -84,10 +84,10 @@ func parsePage(q url.Values, def, most int, validLast func(string) error) (n int
 
 // pageOf applies n and last to sorted, unique items: the entries after last
 // (an exclusive cursor, so it survives the deletion of the entry it names), at
-// most n of them. It reports whether more remain and the page size used.
-// validLast checks the cursor's grammar.
-func pageOf(items []string, q url.Values, validLast func(string) error) (page []string, more bool, n int, err error) {
-	n, last, err := parsePage(q, -1, maxPage, validLast)
+// most n of them, n being def when the request names none. It reports whether
+// more remain and the page size used. validLast checks the cursor's grammar.
+func pageOf(items []string, q url.Values, def int, validLast func(string) error) (page []string, more bool, n int, err error) {
+	n, last, err := parsePage(q, def, maxPage, validLast)
 	if err != nil {
 		return nil, false, 0, err
 	}
@@ -140,7 +140,7 @@ func writeJSON(w http.ResponseWriter, r *http.Request, contentType string, v any
 }
 
 // catalog is GET /v2/_catalog: the repositories the caller may read, sorted,
-// one page at a time. A request without n gets defaultCatalogPage entries and
+// one page at a time. A request without n gets defaultPage entries and
 // n is capped at maxPage. The store walk stops once the page is full and skips
 // every subtree before the cursor, so a page never costs the whole root.
 //
@@ -231,7 +231,7 @@ func (s *Server) tags(w http.ResponseWriter, r *http.Request, n ref.Name) {
 		s.fail(w, r, err)
 		return
 	}
-	page, more, size, err := pageOf(all, r.URL.Query(), func(v string) error {
+	page, more, size, err := pageOf(all, r.URL.Query(), defaultPage, func(v string) error {
 		_, err := ref.ParseTag(v)
 		return err
 	})
@@ -258,12 +258,12 @@ func (s *Server) tags(w http.ResponseWriter, r *http.Request, n ref.Name) {
 // rebuilt when index.json changes. An unknown repository or subject is an
 // empty index. No referrers tag is ever written.
 func (s *Server) referrers(w http.ResponseWriter, r *http.Request, n ref.Name) {
+	if !s.allow(w, r, VerbRead, n) {
+		return
+	}
 	d, err := ref.ParseDigest(mux.Vars(r)["digest"])
 	if err != nil {
 		s.fail(w, r, err)
-		return
-	}
-	if !s.allow(w, r, VerbRead, n) {
 		return
 	}
 	q := r.URL.Query()

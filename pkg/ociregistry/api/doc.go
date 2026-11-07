@@ -20,7 +20,9 @@ limitations under the License.
 //
 // Every repository name, tag, digest and session id in a path or a query is
 // validated through pkg/ociregistry/ref before the store is touched, reads
-// included. Routing is github.com/gorilla/mux, manifests decode with
+// included, and a path holding a percent escape is refused before it is routed,
+// so the repository is the one the path spells and the push gate reads.
+// Routing is github.com/gorilla/mux, manifests decode with
 // encoding/json into the image-spec types, and digests verify with go-digest.
 // Two pieces are written here because no maintained library implements them:
 // the upload session state machine (session.go) and the parsing of the OCI
@@ -38,8 +40,17 @@ limitations under the License.
 //     tag, a HEAD of a tagged row and every GET write nothing;
 //   - a manifest PUT accepts the OCI manifest and index and the Docker v2
 //     manifest and manifest list (415 otherwise), reads at most 4 MiB (413
-//     above), requires the blobs an image manifest names to be in the
-//     repository and never requires an index's children;
+//     above), requires the blobs a manifest names to be in the repository and
+//     never requires an index's children. The exception to following that
+//     registry: it requires no blobs of a manifest whose config type is neither
+//     an OCI image config nor the empty descriptor, and this server does. A
+//     descriptor's inline data is not honoured: the blob must be in the
+//     repository, the empty descriptor's included. A PUT
+//     restarts the garbage-collection grace of each index child and subject the
+//     repository holds, under the repository lock, once per request, never
+//     while half that grace is left and for at most maxManifestTouches
+//     distinct objects. That touch is best-effort: a failure is logged and the
+//     PUT answered;
 //   - a blob GET goes through http.ServeContent, so Range, 206 and 416 are
 //     the standard library's; a blob HEAD restarts the blob's
 //     garbage-collection grace (store.TouchBlob, bounded as below), so a
@@ -54,7 +65,10 @@ limitations under the License.
 //   - a DELETE with If-Match is conditional on the repository's index state
 //     (store.IndexState of its rows, as a quoted entity tag), compared under
 //     the repository lock; a state that no longer holds is 412 and deletes
-//     nothing. The registry this replaces ignores If-Match;
+//     nothing, and so is a conditional DELETE by digest of a digest any row
+//     tags. That refusal protects only a client that sends If-Match: a DELETE
+//     by digest without it removes every row of the digest, tags included, as
+//     above. The registry this replaces ignores If-Match;
 //   - blobs are never deleted through the API; garbage collection removes
 //     them.
 //
@@ -65,7 +79,11 @@ limitations under the License.
 // answered from a stat. This does not stop a caller from keeping an untagged
 // object alive: one HEAD just past every half-grace does it. Knowing the
 // digest is the capability, as it is for the blob HEAD and as a push of the
-// same content would be. A touch that fails for any reason other than the
+// same content would be. Read access is therefore enough to write: a HEAD
+// takes the repository lock and sets the mtime of the object's inode, which
+// every repository linking the same content shares (a mount links it), so a
+// credential that may only pull keeps an object it can name alive in each of
+// those repositories. A touch that fails for any reason other than the
 // object being gone (a read-only or degraded store, a client that gave up
 // waiting for the lock) is logged and the HEAD answers 200: the read
 // succeeded, and the touch only protects a push that may follow. The object
@@ -76,7 +94,11 @@ limitations under the License.
 // grace before the PUT naming it, or HEADs on a store that cannot be written,
 // is not protected by that HEAD and can find the object reaped; a push that
 // fits in half the grace, the case the touch exists for, is protected as
-// before.
+// before. The protection is bounded the other way too: an object a HEAD
+// answered 200 for is kept for at least half the grace and at most one grace
+// after that HEAD (one grace when the HEAD touched it, what was left of its
+// grace when it did not), and a PUT later than that can find it reaped. The
+// HEAD narrows the window between itself and the PUT; it does not close it.
 //
 // GCGrace is required, as gc.Options.Grace is, and New refuses a server
 // without it. Whoever wires the server and the collector over one store must
@@ -87,20 +109,44 @@ limitations under the License.
 //
 //   - at most MaxSessions upload sessions in use at once (503 beyond); only a
 //     session the server created or the store confirmed counts, so an id a
-//     client makes up takes no slot. There is no per-principal cap: one
-//     client may use every slot;
+//     client makes up takes no slot. Where Config.Principal is set, one
+//     principal holds at most MaxSessionsPerPrincipal of them, three quarters
+//     by default, so the push gate's relayed writers cannot shut out the local
+//     CLI, or the reverse. Two gaps remain. A session the server finds on disk
+//     rather than creates (one from before a restart) has no owner and counts
+//     only against the total. And the gate is one principal, so the writers
+//     behind it get no isolation from each other: one of them can spend the
+//     whole of the gate's share, of sessions and of reserved space alike;
 //   - an upload session holds at most MaxUploadSize bytes: a known length over
 //     it is refused before a write, and a chunk of unknown length that would
 //     pass it is refused with 413 and cut back, so no byte past the cap stays;
 //   - an upload is refused with 507 when the store volume would keep less than
-//     MinFreeSpace free, checked against a known length before the first write
-//     and again every 64 MiB while a body streams;
-//   - a request body must bring BodyMinBytes in every BodyWindow, may not go
-//     BodyIdle without a byte, and may not run past UploadTimeout (408);
+//     MinFreeSpace free. Bodies in flight are counted together: each reserves
+//     its known length, or 64 MiB at a time, and gives bytes back as the store
+//     writes them, so N sessions cannot undershoot the floor by N times 64 MiB.
+//     Free space itself is read again every 64 MiB. A chunk and a monolithic
+//     upload reserve this way; a mount reads no body and adds no bytes, and a
+//     manifest PUT reads at most 4 MiB and reserves nothing. Other writers on
+//     the volume are seen only through statfs. Where Config.Principal is set,
+//     one principal may hold at most three quarters of the room above
+//     MinFreeSpace, so a writer that declares a large Content-Length and
+//     trickles cannot answer every other principal 507 until the body floor
+//     cuts it. The trade is that a principal's single upload needing more than
+//     that share of the room is refused 507 although it would fit;
+//   - a request body must bring BodyMinBytes in each BodyWindow, may not go
+//     BodyIdle without a byte, and may not run past UploadTimeout (408). The
+//     first window opens at the first read, after any wait for the session's
+//     lock. The windows are consecutive, so a body that has its BodyMinBytes
+//     may then stay silent for up to BodyIdle (progressBody);
 //   - a header read timeout of 30 s, and a write deadline set per request
 //     (ResponseTimeout, plus UploadTimeout for a request with a body, plus a
 //     blob's size at MinWriteRate for a blob GET) instead of a server-wide
-//     write timeout, so a large blob GET is not cut;
+//     write timeout, so a large blob GET is not cut while it moves. A blob GET
+//     larger than a ResponseTimeout at MinWriteRate must deliver that much in
+//     each ResponseTimeout, so a reader that stalls gives back its descriptor
+//     within ResponseTimeout rather than after the whole size's time. Such a
+//     client finds the connection cut and resumes with a Range request. There
+//     is no cap on concurrent GETs beyond MaxConns;
 //   - HTTPServer serves at most MaxConns connections at once and closes one
 //     past that before a request is read; it reports each connection's end
 //     (closed or hijacked) to ConnClosed, so an Authorizer that keys state on
@@ -124,4 +170,12 @@ limitations under the License.
 // Access decisions belong to the Authorizer the caller supplies, which New
 // requires (AllowAll is the explicit open registry); the package classifies
 // each request as a read, a write or a delete (an upload cancel is a delete).
+// A request Config.Principal names no principal for takes neither share. The
+// registry's own access check allows no write without a verified credential,
+// so every session and reservation it admits is a named principal's; only a
+// server built with an open Authorizer has unnamed writers.
+// The catalog asks it once per repository it visits, and the hook has no list
+// form on purpose: the visit budget and ceiling already bound the calls, and
+// the access model the registry runs with decides by verb and principal, at
+// the cost of one hash and one compare per visit.
 package api

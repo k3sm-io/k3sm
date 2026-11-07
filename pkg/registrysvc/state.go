@@ -23,8 +23,10 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"sync"
+	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"k3sm.io/k3sm/internal/atomicfile"
 )
@@ -43,7 +45,7 @@ import (
 
 // The registry states the record carries.
 const (
-	// StateServing: the child is up and answered its readiness dial.
+	// StateServing: the child is up and answered its readiness probe.
 	StateServing = "serving"
 	// StateDisabled: every bring-up attempt failed; Reason says why.
 	StateDisabled = "disabled"
@@ -89,6 +91,53 @@ type State struct {
 	// Service only; empty when the NodePort is published or not asked for. The
 	// server retries the NodePort on every refresh and clears this on success.
 	NodePortError string `json:"nodePortError,omitempty"`
+
+	// GC is the registry server's last garbage-collection sweep; nil before
+	// its first. UploadSessions is how many upload sessions it holds, as of its
+	// last report. The server process writes both, every serveStatusEvery and
+	// after each sweep; a daemon's own transition carries them over.
+	GC             *GCStatus `json:"gc,omitempty"`
+	UploadSessions int       `json:"uploadSessions,omitempty"`
+	// Dedupe is the registry server's last dedupe pass; nil before its first.
+	// The server process writes it after each pass, and a daemon's own transition
+	// carries it over.
+	Dedupe *DedupeStatus `json:"dedupe,omitempty"`
+}
+
+// GCStatus is what the registry server's last sweep did. The counts are of that
+// sweep alone. A report-only first sweep deletes nothing, so it counts nothing.
+type GCStatus struct {
+	// LastSweep is when the sweep finished.
+	LastSweep time.Time `json:"lastSweep"`
+	// ReportOnly is a first sweep, which logs what it would reap.
+	ReportOnly bool `json:"reportOnly,omitempty"`
+	// The objects reaped, by kind.
+	Manifests    int `json:"manifests,omitempty"`
+	Blobs        int `json:"blobs,omitempty"`
+	Uploads      int `json:"uploads,omitempty"`
+	Temps        int `json:"temps,omitempty"`
+	Repositories int `json:"repositories,omitempty"`
+	// Stopped counts the repositories the mass-delete brake stopped, and Failed
+	// those that failed some other way. Nothing was reaped in either.
+	Stopped int `json:"stopped,omitempty"`
+	Failed  int `json:"failed,omitempty"`
+}
+
+// DedupeStatus is what the registry server's last dedupe pass did, for the whole
+// store. It holds no digest or repository name. The counts are of that pass alone.
+type DedupeStatus struct {
+	// LastPass is when the pass finished.
+	LastPass time.Time `json:"lastPass"`
+	// Merged is how many names now point at another repository's verified copy.
+	Merged int `json:"merged,omitempty"`
+	// ReclaimedBytes counts only the inodes whose last name went.
+	ReclaimedBytes int64 `json:"reclaimedBytes,omitempty"`
+	// Pending is how many names still hold a separate copy.
+	Pending int `json:"pending,omitempty"`
+	// CorruptReplaced is how many names of corrupt copies the pass replaced.
+	CorruptReplaced int `json:"corruptReplaced,omitempty"`
+	// Skipped counts what the pass left in place, by reason.
+	Skipped map[string]int `json:"skipped,omitempty"`
 }
 
 // ClusterFacing is what the server's bring-up learns about the registry's
@@ -140,8 +189,11 @@ func UpdateNodePortError(workDir, reason string) error {
 // updateState reads workDir's record, applies edit, and writes it back when
 // edit reports a change.
 func updateState(workDir string, edit func(*State) bool) error {
-	stateUpdate.Lock()
-	defer stateUpdate.Unlock()
+	unlock, err := lockState(workDir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	b, err := os.ReadFile(StatePath(workDir))
 	if err != nil {
 		return fmt.Errorf("read the registry state: %w", err)
@@ -153,15 +205,35 @@ func updateState(workDir string, edit func(*State) bool) error {
 	if !edit(&st) {
 		return nil
 	}
-	return WriteState(workDir, st)
+	return writeStateFiles(workDir, st)
 }
 
-// stateUpdate serialises this process's read-modify-write updates of the
-// record: a serving certificate's rotation (from a TLS handshake), the loopback
-// gate's bind and the NodePort error from the refresh loop can all land while
-// the server runs, and two updates could otherwise each read the record before
-// the other wrote it and lose one field.
-var stateUpdate sync.Mutex
+// lockState takes the record's lock and returns its release. It serialises
+// every write of the record: a serving certificate's rotation (from a TLS
+// handshake), the loopback gate's bind and the NodePort error from the refresh
+// loop can all land while the server runs, and the registry server is a second
+// process writing the same record, so two updates could otherwise each read the
+// record before the other wrote it and lose one field. It is a flock, on a file
+// of its own because the record is replaced by a rename; each call opens the
+// file, so the lock excludes goroutines as well as processes, and a dead
+// holder's lock is released by the kernel.
+func lockState(workDir string) (func(), error) {
+	f, err := os.OpenFile(StatePath(workDir)+".lock", os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("lock the registry state: %w", err)
+	}
+	for {
+		err = unix.Flock(int(f.Fd()), unix.LOCK_EX)
+		if !errors.Is(err, unix.EINTR) {
+			break
+		}
+	}
+	if err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("lock the registry state: %w", err)
+	}
+	return func() { _ = f.Close() }, nil // closing the only descriptor releases the flock
+}
 
 // RecordGatePort records the loopback push gate's port in workDir's state
 // record, keeping every other field. A missing record is an error, as for
@@ -188,7 +260,7 @@ func ReadLocalState(workDir string) (State, error) {
 }
 
 // stateName is the record's basename. It sits in the work dir beside
-// registry.log rather than in StateDir, which is zot's storage root.
+// registry.log rather than in StateDir, which is the registry's storage root.
 const stateName = "registry-state.json"
 
 // statusSubdir is the server's world-readable status directory, a sibling of
@@ -217,6 +289,16 @@ func PublishedStatePath(workDir string) string {
 // server with no status directory (a hand-run server, an older data root)
 // writes the original only.
 func WriteState(workDir string, st State) error {
+	unlock, err := lockState(workDir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return writeStateFiles(workDir, st)
+}
+
+// writeStateFiles is WriteState with the record's lock held.
+func writeStateFiles(workDir string, st State) error {
 	b, err := json.Marshal(st)
 	if err != nil {
 		return fmt.Errorf("encode the registry state: %w", err)
@@ -244,6 +326,22 @@ func ParseState(b []byte) (State, error) {
 	return st, nil
 }
 
+// keepServerFields writes st over the record, carrying over the fields the
+// registry server process owns.
+func keepServerFields(workDir string, st State) error {
+	unlock, err := lockState(workDir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if b, err := os.ReadFile(StatePath(workDir)); err == nil {
+		if prev, err := ParseState(b); err == nil {
+			st.GC, st.UploadSessions, st.Dedupe = prev.GC, prev.UploadSessions, prev.Dedupe
+		}
+	}
+	return writeStateFiles(workDir, st)
+}
+
 // record writes this service's state, logging a failure rather than returning
 // it: the record reports the registry and is never a reason to change what the
 // registry does.
@@ -256,7 +354,7 @@ func (s *Service) record(state, reason string, reclaimedPID int) {
 		ReclaimedPID: reclaimedPID,
 		Since:        time.Now().UTC(),
 	}
-	if err := WriteState(s.cfg.WorkDir, st); err != nil {
+	if err := keepServerFields(s.cfg.WorkDir, st); err != nil {
 		s.cfg.Logger.Warn("could not record the ingest registry state for `k3sm status`",
 			"path", StatePath(s.cfg.WorkDir), "state", state, "err", err)
 	}

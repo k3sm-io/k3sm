@@ -20,30 +20,33 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"slices"
 	"syscall"
 	"time"
 )
 
 // Reclaiming a previous server's registry child.
 //
-// The zot child runs in its own process group (spawn), so launchd's kill of
-// the daemon's job does not reach it, and its only teardown is Shutdown, which
-// runs from the server's deferred stop. A daemon that never reaches that defer,
+// The child runs in its own process group (spawn), so launchd's kill of the
+// daemon's job does not reach it, and its only teardown is Shutdown, which runs
+// from the server's deferred stop. A daemon that never reaches that defer,
 // because launchd SIGKILLed it at ExitTimeOut, it crashed, or it was killed by
-// hand, leaves the child running under launchd (ppid 1) and still LISTENING on
-// the registry port. Nothing exits it after that: every later server finds the
-// port held, preflightPort refuses, and the registry stays disabled on every
-// restart until a human kills the survivor. The retry bound cannot help,
-// because the holder is not on its way out.
+// hand, leaves the child under launchd (ppid 1). The current child watches its
+// parent and exits by itself, but that is a promise of the child's, and the
+// child an earlier release left is zot, which makes no such promise and stays
+// LISTENING on the registry port. Every later server would then find the port
+// held, preflightPort would refuse, and the registry would stay disabled until
+// a human killed the survivor.
 //
-// So before the preflight, Start reclaims exactly such a survivor: a process
-// of this uid whose parent is gone (ppid 1) and whose argv is the one spawn
-// gives this service's child, byte for byte (ZotPath(BinDir) serve
-// ConfigPath(WorkDir)). The config path lives under this server's own work
-// dir, so a process matching it is a previous instance of this service and
-// nothing else. A zot whose parent is alive is somebody's live child and is
-// never touched, and any other holder still gets preflightPort's fail-closed
-// refusal.
+// So before the preflight, Start reclaims exactly such a survivor: a process of
+// this uid whose parent is gone (ppid 1) and whose argv is, byte for byte, the
+// one spawn gives this service's child or the one the previous release gave its
+// zot child. Both name a config path under this server's own work dir, so a
+// match is a previous instance of this service and nothing else. The match is
+// read again before each signal, because a pid can be reused during the wait. A
+// child whose parent is alive is somebody's live child and is never touched, and
+// any other holder still gets preflightPort's fail-closed refusal.
 
 // reclaimKillWait bounds the wait for the kernel to reap a survivor after the
 // SIGKILL escalation. A SIGKILLed process exits at once; the bound only stops a
@@ -59,6 +62,8 @@ const launchdPID = 1
 // procEntry is one process as the reclaim sees it.
 type procEntry struct {
 	pid, ppid, pgid int
+	// uid is the process's effective uid.
+	uid int
 	// argv is the process's argument vector, argv[0] included.
 	argv []string
 }
@@ -66,11 +71,26 @@ type procEntry struct {
 // isOrphanedChild reports whether p is a previous instance of this service's
 // child that its parent left behind.
 func (s *Service) isOrphanedChild(p procEntry) bool {
-	return p.ppid == launchdPID &&
-		len(p.argv) == 3 &&
-		p.argv[0] == ZotPath(s.cfg.BinDir) &&
-		p.argv[1] == "serve" &&
-		p.argv[2] == ConfigPath(s.cfg.WorkDir)
+	return p.ppid == launchdPID && p.uid == s.geteuid() &&
+		(slices.Equal(p.argv, s.childArgv()) || slices.Equal(p.argv, s.legacyChildArgv()))
+}
+
+// The zot child an earlier release staged. Nothing here builds, stages or runs
+// one; these name the leftover the reclaim below, the executor's reap tier and the
+// install's cleanup recognise for the one release that moves off it.
+const (
+	// ZotBinaryName is that binary's basename in a work dir bin or a payload.
+	ZotBinaryName = "zot"
+	// ZotMarkerName is the basename of the version marker beside it.
+	ZotMarkerName = "zot.version"
+)
+
+// ZotPath names that binary in a bin dir.
+func ZotPath(bd string) string { return filepath.Join(bd, ZotBinaryName) }
+
+// legacyChildArgv is the argv the previous release spawned its zot child with.
+func (s *Service) legacyChildArgv() []string {
+	return []string{ZotPath(s.cfg.BinDir), "serve", ConfigPath(s.cfg.WorkDir)}
 }
 
 // claimPort makes the registry port this service's to bind: it reclaims a
@@ -99,7 +119,7 @@ func (s *Service) reclaimOrphans(ctx context.Context) error {
 		if !s.isOrphanedChild(p) {
 			continue
 		}
-		if err := reclaim(ctx, p); err != nil {
+		if err := s.reclaim(ctx, p); err != nil {
 			return fmt.Errorf("reclaim the orphaned ingest registry child pid %d: %w", p.pid, err)
 		}
 		s.cfg.Logger.Warn("reclaimed an ingest registry child a previous server left running on the registry port",
@@ -112,14 +132,28 @@ func (s *Service) reclaimOrphans(ctx context.Context) error {
 	return nil
 }
 
-// reclaim stops p and waits for it to be gone.
-func reclaim(ctx context.Context, p procEntry) error {
-	// spawn makes the child its own process-group leader; signalling the group
-	// also reaches anything it started. A leader that is not one any more gets
-	// the signal alone.
-	target := p.pid
+// signalTarget re-reads pid and returns what to signal, or false when it is gone
+// or is no longer this service's orphan. spawn makes the child its own
+// process-group leader; signalling the group also reaches anything it started. A
+// leader that is not one any more gets the signal alone.
+func (s *Service) signalTarget(pid int) (int, bool) {
+	p, ok := s.lookupProc(pid)
+	if !ok || !s.isOrphanedChild(p) {
+		return 0, false
+	}
 	if p.pgid == p.pid {
-		target = -p.pid
+		return -p.pid, true
+	}
+	return p.pid, true
+}
+
+// reclaim stops p and waits for it to be gone. A pid that stops matching between
+// two signals has been reused or re-parented, so it is left alone, and the
+// preflight decides about the port.
+func (s *Service) reclaim(ctx context.Context, p procEntry) error {
+	target, ok := s.signalTarget(p.pid)
+	if !ok {
+		return nil
 	}
 	if err := syscall.Kill(target, syscall.SIGTERM); err != nil {
 		if errors.Is(err, syscall.ESRCH) {
@@ -128,6 +162,10 @@ func reclaim(ctx context.Context, p procEntry) error {
 		return fmt.Errorf("SIGTERM: %w", err)
 	}
 	if gone(ctx, p.pid, drainGrace) {
+		return nil
+	}
+	target, ok = s.signalTarget(p.pid)
+	if !ok {
 		return nil
 	}
 	if err := syscall.Kill(target, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {

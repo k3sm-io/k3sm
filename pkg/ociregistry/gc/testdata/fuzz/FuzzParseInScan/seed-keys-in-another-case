@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"SchemaVersion\":2,\"MEDIATYPE\":\"application/vnd.oci.image.manifest.v1+json\",\"Config\":{\"DIGEST\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"Layers\":[{\"Digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}]}")

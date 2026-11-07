@@ -1,6 +1,6 @@
 # The cluster registry
 
-Every k3sm server runs a small **OCI registry**, the cluster's one image store. You push a locally
+Every k3sm server runs its own small **OCI registry**, the cluster's one image store. It is k3sm's own, built into the server, with no separate registry program to install or run. It serves the OCI distribution API, collects its own garbage, and takes writes through the push gate. You push a locally
 built image to it and a Pod pulls it back through the ordinary Kubernetes image path, including
 `imagePullPolicy: Always`, the digest index, and real pull failures.
 
@@ -359,6 +359,10 @@ rather than adjusted. The command makes the same call as:
 kubectl create token builder -n k3sm-registry --audience k3sm-registry
 ```
 
+The registry holds every `builder` token to the same 24 hours, however it was minted. `kubectl create
+token` will issue a longer one, and pushing with it gets a 401 that says to mint a new one. Other
+ServiceAccounts' tokens keep their own lifetime.
+
 To let docker, buildx, crane and oras push with nothing else in the loop, write the token into your
 docker config:
 
@@ -434,12 +438,19 @@ and a tool that does not verify the cluster CA would send it the token. On a sha
 ### On a worker
 
 A worker writes no user kubeconfig, so `k3sm build`, `image load`, `import` and `push`, and
-`registry token` and `login`, stop there with an error that names the fix. Copy the admin
-kubeconfig from the server and write one:
+`registry token` and `login`, stop there with an error that names the fix. `k3sm kubeconfig --write`
+is refused on a worker too. Run `k3sm kubeconfig > k3sm.yaml` on the server, copy the admin
+kubeconfig to the worker, save it as `~/.kube/config`, owned by you and not group- or
+world-writable, and run the verb with sudo. Under sudo the worker ignores `$KUBECONFIG` and reads
+that file. The file has to meet three requirements:
 
-```sh
-k3sm kubeconfig --server https://<server>:6444 --certificate-authority <ca> --write
-```
+- The server address is `https`, and the file does not skip TLS verification.
+- It carries an inline CA that matches the cluster this worker joined.
+- Its credentials are inline. A token file, a client certificate or key given by path, an `exec`
+  plugin or an auth provider is refused.
+
+Instead of the copy, an admin can bind the `k3sm:registry-builder-token` Role to you with a
+RoleBinding in `k3sm-registry`.
 
 The worker finds the server's registry address by getting the `registry-k3sm` EndpointSlice in
 `k3sm-registry` by name. The admin kubeconfig may, and so may a user bound to the
@@ -527,6 +538,111 @@ Garbage collection is on. Blobs that no manifest references are collected on a p
 with a delay long enough that a slow push is never collected out from under itself. Deleting the
 directory while the server is stopped resets the registry to empty; nothing else in the cluster
 depends on its contents.
+
+A signature or other referrer is kept while the image it names as its subject is. When a tag moves,
+the old image's signatures are collected with it after the delay, and a referrer pushed before its
+image (signed, then copied) is protected only by that delay, so push the image within it.
+
+The first sweep that meets a repository only reports. The server log lists what it would remove as
+`registry gc: would reap` lines, and later sweeps delete. A repository stays in that state until a
+sweep can read it and the half-repository brake lets it through, and one in that state does not
+hold back any other. Each sweep ends with a `registry gc: sweep finished` line that counts the
+repositories stopped and failed and carries the error.
+
+### Restoring a Backup of the Registry
+
+Restore into an emptied `<work-dir>/registry/`, with the server stopped. Do not merge a backup over
+a live registry (`rsync` without `--delete`, or `tar -x` into the directory as it stands).
+
+A merge keeps the live `<work-dir>/registry/.k3sm-store-id`, and the collector cannot always tell a
+restored `index.json` from a push. A repository the merge adds is reported on first, like any new one.
+
+The registry records how many rows it last wrote to each repository's `index.json`, in a file under
+`<work-dir>/registry-state/rows/`. When a merge leaves an `index.json` with fewer rows than that, for
+example because tags were pushed after the backup was taken, every sweep of that repository stops
+and deletes nothing in it, so the blobs of the rows the merge dropped are kept. The other
+repositories are swept as usual. The `registry gc: sweep finished` line carries the error,
+`index.json holds fewer rows than the store recorded`, with the repository's name, both row counts
+and the path of its record.
+
+To let sweeps of that repository run again:
+
+1. Check that its tags are the ones you intend to keep, for example with
+   `curl -s http://localhost:6450/v2/<repository>/tags/list` on the Mac. Push or tag again
+   anything the merge dropped that you still want. A push alone does not clear the stop.
+2. Remove the repository's record. The error prints its path. The file name is also the SHA-256 of
+   the repository's name, so for `team/app`:
+
+   ```sh
+   sudo rm <work-dir>/registry-state/rows/$(printf '%s' team/app | shasum -a 256 | cut -d' ' -f1)
+   ```
+
+The next sweep records the rows `index.json` holds now and sweeps the repository. Anything the
+remaining rows no longer name is then deleted once it is past the grace period, so do the check in
+step 1 first.
+
+A merge that leaves an `index.json` with as many rows as before, or more, is not detected. In a
+repository the collector has already reviewed, the next sweep can delete what that `index.json` no
+longer names.
+
+If you must merge, or already have, stop the server and remove the id file before you start it
+again:
+
+```sh
+sudo rm <work-dir>/registry/.k3sm-store-id
+```
+
+The server then treats the root as a new store: every repository gets one report-only sweep, so you
+can read what it would remove in the log before anything goes. A backup restored into an emptied
+root without the id file gets the same sweep.
+
+### When Garbage Collection Stops
+
+Nothing is deleted in any of these cases. Each shows on every sweep in the
+`registry gc: sweep finished` line.
+
+- **`malformed store id`, or the id file cannot be read.** The sweep runs no further. Remove
+  `<work-dir>/registry/.k3sm-store-id`, or fix its permissions if it should still be read. After a
+  removal the next sweep only reports, and the one after it deletes.
+- **`write store id`.** The sweep could not create the id file, which it does by making a hard
+  link, so a filesystem without hard links never succeeds and repositories stay report-only. Move
+  the registry to a volume with hard links, or write the id yourself, as the server's user, in
+  the form the server expects (32 lowercase hexadecimal digits and a newline):
+  `openssl rand -hex 16 > <work-dir>/registry/.k3sm-store-id`.
+- **`manifest unreadable`.** A stored manifest cannot be read, so the sweep of that repository
+  stops and the others go on. The server now refuses such a manifest at push, but one pushed
+  earlier stays until you delete it: delete its tag, or its digest if it has no tag, and sweeps of
+  that repository run again. The error names the digest. Deleting a tag clears the row when the
+  read failed because the manifest is over the size limit, fails its hash, has no blob, or is not a
+  regular file or is a symlink. Any other read error, such as a permission or I/O fault, makes the
+  tag delete answer 500 and change nothing. Deleting by digest does not read the manifest's own
+  body, so it clears the row whatever the fault, unless another index in the repository is also
+  unreadable, which refuses it the same way. On a fault that persists, fix the permissions or the
+  disk under `<work-dir>/registry`, or delete the digest; if the digest delete is refused too,
+  repair the other index's file first. An index's child that has no row of its
+  own stops the sweep the same way only when its bytes do not hash to its digest: delete the index
+  that names it. A child with no row over the 4 MiB manifest limit is no manifest the registry would
+  store or serve, so it is kept as a blob, is not read, and stops nothing, whatever media type the
+  index gives it. Any other blob named as a child does not stop the sweep either. It is kept, along
+  with every digest its JSON contains, and the sweep follows each of those digests the repository
+  holds a blob for. A manifest found this way keeps what it names, as any manifest does, and if it
+  is an index, a child of its own failing its hash stops the sweep too. A blob the strict read
+  refuses is searched for digests in the same way. A blob found this way that is over the limit or
+  fails its hash is kept and stops nothing. A sweep reads each blob at most
+  once per pass over a repository, and at most 4 MiB of it, so the extra reading is bounded by the
+  number of blobs the repository holds, and the memory by the digests those blobs name, each held
+  once however often a body repeats it. A cancelled sweep stops before its next read.
+- **`index.json holds fewer rows than the store recorded`.** Rows went from that repository's
+  `index.json` without the registry removing them, as after a backup merged over a live registry.
+  The sweep of that repository stops and the others go on. See
+  [Restoring a Backup of the Registry](#restoring-a-backup-of-the-registry) for how to check the
+  rows and clear the stop.
+- **`would delete more than half`.** The half-repository brake stopped the sweep of that repository,
+  and a `registry gc: sweep stopped` line says how many blobs it held back. Check that the
+  repository's tags are the ones you expect.
+- GC logs `registry gc: leaving out blobs not older than index.json` and a later sweep reaps the rest,
+  so a layer or child manifest finished longer than the grace before its index push must be uploaded
+  again, and re-running the push uploads only what was reaped.
 
 ## Security Posture
 

@@ -41,7 +41,9 @@ import (
 var testIndices = map[string]int{"mac-a": 0, "mac-b": 1, "mac-c": 2}
 
 // shardedHarness wires a controller over a sharded model, the given nodes, the
-// thunderbolt Interconnect ic (nil: none exists) and testIndices.
+// thunderbolt Interconnect ic (nil: none exists) and testIndices. Every node
+// carries a desired annotation that lists m, the state once the interconnect
+// resolver has caught up; a test of the wait before that rewrites it.
 func shardedHarness(t *testing.T, m *mlxv1alpha1.MLXModel, nodes []corev1.Node, ic *netv1alpha1.Interconnect) *harness {
 	t.Helper()
 	h := newHarness(t, m, func(c *Config) {
@@ -50,6 +52,9 @@ func shardedHarness(t *testing.T, m *mlxv1alpha1.MLXModel, nodes []corev1.Node, 
 		}
 	})
 	for i := range nodes {
+		if m != nil {
+			metav1.SetMetaDataAnnotation(&nodes[i].ObjectMeta, netv1alpha1.AnnotationInterconnectDesired, desiredListing(t, m))
+		}
 		if _, err := h.kube.CoreV1().Nodes().Create(context.Background(), &nodes[i], metav1.CreateOptions{}); err != nil {
 			t.Fatalf("seed node: %v", err)
 		}
@@ -149,8 +154,8 @@ func TestShardedReconcilePlacesRankPods(t *testing.T) {
 		t.Fatalf("%d rank pods, want 2", len(pods))
 	}
 	for i, pod := range pods {
-		if pod.Name != mlx.RankPodName(testModelName, i) || pod.Spec.NodeName != []string{"mac-a", "mac-b"}[i] {
-			t.Errorf("rank %d = %s on %s", i, pod.Name, pod.Spec.NodeName)
+		if pod.Name != mlx.RankPodName(testModelName, i) || mlx.RankPodNode(&pod) != []string{"mac-a", "mac-b"}[i] {
+			t.Errorf("rank %d = %s placed on %s", i, pod.Name, mlx.RankPodNode(&pod))
 		}
 		assertOwnedByModel(t, "rank pod", pod.OwnerReferences)
 	}
@@ -287,7 +292,7 @@ func TestShardedGangRestart(t *testing.T) {
 				if first[p.Name] == string(p.UID)+p.Annotations[mlx.AnnotationSpecHash] && tc.name == "spec_changed" {
 					t.Errorf("rank pod %s was not re-rendered from the new spec", p.Name)
 				}
-				if p.Spec.NodeName == "mac-b" && tc.name == "node_not_ready" {
+				if mlx.RankPodNode(&p) == "mac-b" && tc.name == "node_not_ready" {
 					t.Errorf("rank pod %s was re-placed onto the NotReady node", p.Name)
 				}
 			}

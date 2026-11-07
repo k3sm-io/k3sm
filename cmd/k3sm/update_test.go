@@ -777,9 +777,10 @@ func TestUpdateRecorderPublishesTheLatestOnItsNode(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	want := map[string]string{
-		"k3sm.io/update-phase":              "Done",
-		status.NodeReleaseLatestAnnotation:  "v0.2.0",
-		status.NodeReleaseCheckedAnnotation: "2026-10-15T12:00:00Z",
+		"k3sm.io/update-phase":                   "Done",
+		status.NodeReleaseLatestAnnotation:       "v0.2.0",
+		status.NodeReleaseCheckedAnnotation:      "2026-10-15T12:00:00Z",
+		updatesv1alpha1.AnnotationReleaseChannel: "stable",
 	}
 	if !sameAnnotations(got.Annotations, want) {
 		t.Errorf("annotations = %v, want %v", got.Annotations, want)

@@ -12,6 +12,40 @@ pin, its date, and the tarball's sha256.
 
 ### Added
 
+- A node advertises the GPU under hardware names beside the `mlx.k3sm.io` ones, which do not change: the
+  `k3sm.io/gpu` extended resource and the `k3sm.io/gpu.present` and `k3sm.io/gpu-memory-gb` labels on a
+  node that can grant a pod the GPU, and the `k3sm.io/chip`, `k3sm.io/chip-family` and `k3sm.io/memory-gb`
+  labels on any node with a usable Metal device, including one whose sandbox backend cannot grant it. A
+  chip label alone does not mean a pod can have the GPU; request `k3sm.io/gpu` for that. No RBAC changes.
+- `k3sm status` names the update channel: the update row carries `wide.channel`, on the rolling row too,
+  and on `rc` its `detail` ends in `; channel rc`. A failed check on `rc` also names the last good
+  release and when it was checked. A server publishes the channel beside the latest release as the
+  `k3sm.io/release-channel` annotation on its own Node, where a worker's row reads it, and a failed
+  check publishes neither. A worker's row reads `stable` from a server that publishes no channel. On
+  `stable` the row's `detail` does not change. No RBAC changes.
+- `k3sm update channel` prints the cluster's update channel, and fails rather than guess when the
+  cluster gives no answer. `k3sm update channel stable|rc` sets it and runs a check, and exits 3 when
+  the channel was set but the check failed. A channel changes what is offered and never starts a roll.
+  Setting it takes cluster-admin, as `k3sm update apply` does, and a write fails with a retry message
+  when the server has no `UpdatePolicy` CRD established. The update controller now ensures that CRD,
+  and rolls do not wait on it. No RBAC changes.
+- A node publishes its budget as the `budget.k3sm.io/status` annotation on its own Node, in a coarse
+  form, only when that form changes and at most once a minute at every level. It reads
+  `budget.k3sm.io/policy` from the same Node, keeps the last valid policy when one is refused and
+  reports that as `rejected`, and reports `clamped` when it clamps a reserve above the measured value
+  or a tier-1 timer past its floor. No RBAC changes. Nothing writes the policy annotation yet, and a
+  policy's values are held but not yet acted on.
+- `k3sm update check` and `k3sm update apply` follow the cluster's update channel: the `UpdatePolicy`
+  named `cluster` where the credentials may read it, otherwise the channel a server publishes on its
+  Node, and `stable` when neither exists. `check` names the channel on its first line and as `channel`
+  in `-o json`, and a server rechecks when the channel changes. `apply` refuses to choose a release on a
+  channel it cannot read, and its plan names the channel and whether a release pin is set.
+- [Upgrade](docs/user/upgrade.md#update-channels) documents the `stable` and `rc` update channels, how to
+  switch with `k3sm update channel`, what going back costs, the way off a bad release candidate (cancel,
+  set `stable`, then `k3sm update apply --version <tag> --allow-downgrade`, and an uninstall and fresh
+  install when a candidate breaks the updater), what the signature policy checks on an ad-hoc install, and
+  how channels differ from k3s.
+- [Upgrade](docs/user/upgrade.md#on-each-node) says a node on v0.2.x needs one ordinary install of the first release after v0.2.x before managed updates work, how to do it on a server and a worker, and `k3sm update abort` as the recovery if an update is tried first.
 - `k3sm status -o json` carries this node's budget as an optional `budget` object (pressure level,
   admission, each signal against its rungs, and the headroom recommendation), in the schema of
   `NodeBudget.status`. `schemaVersion` stays `1`. [Status JSON](docs/user/status-json.md#budget)
@@ -49,6 +83,29 @@ pin, its date, and the tarball's sha256.
   `node.kubernetes.io/memory-pressure` are still admitted. A Pod annotated
   `budget.k3sm.io/band: batch` is also refused, with reason `NodeBudgetCritical`, while the
   node budget is at its critical level or above.
+- The registry store can dedupe a blob held as separate copies across repositories: a pass keeps the
+  newest copy, verifies it against its digest, and replaces each older copy with a hard link to it by an
+  atomic rename. A copy that fails its hash is logged, counted and replaced by the verified bytes; any
+  other failure keeps the copy. The push path does not change. The registry server runs the pass by
+  default, with no setting to turn it off: after 60 s with no commit and no live upload, plus up to 60 s
+  of jitter, and at most 15 minutes after the first commit it has not yet covered. Below 4 GiB free it
+  starts without that wait, but no sooner than 60 s after the last pass ended, and a pass there that merges
+  nothing counts toward the limit on passes below. An upload stops a pass between merges, unless the 15 minutes have passed or
+  space is low. No pass runs within an hour of start, or before the first garbage collection, and only
+  a repository garbage collection has reported is rewritten, so a new repository's copies wait for its
+  first sweep, at most 6 hours, and merge about 2 minutes after it. A pass stopped by its limit of
+  16 GiB hashed or 1,024 merges is followed by another after the same wait. After three passes in a row
+  that hash, fail, leave work or run on low space without merging, a pass no longer follows on its own,
+  and the next one, whatever commits arrive, starts no sooner than an hour after the last ended, until a
+  pass merges something. So past that point a client with push rights causes at most one pass an hour,
+  about 16 GiB of hashing, more only if a single blob is larger than that. Passes that merge are not held
+  to this, so a client pushing fresh copies to repositories already reviewed keeps them running a minute
+  or more apart. Any other copy a pass leaves waits for the next commit, mount or server start.
+  `registry.log` records each merge and each pass, and
+  `registry-state.json` gains a `dedupe` object with the last pass's counts. `du -sk` of the registry
+  root falls to one copy; `du` of a single repository still shows its full size. A crash during a
+  merge can leave a link in the repository's `.temps` directory, which garbage collection removes and
+  zot ignores, so a rollback to zot still collects that repository.
 - The registry store k3sm is replacing zot with has an online garbage collector that runs
   while pushes continue. A blob's age counts from the last mount, link or upload that named it,
   recorded on disk so a restart keeps it, and a sweep re-reads the index and re-checks each
@@ -87,6 +144,43 @@ pin, its date, and the tarball's sha256.
 
 ### Changed
 
+- The bundled buildx moves from v0.38.0 to v0.38.1, a patch release. The pinned checksums move with it.
+- `k3sm image prune --force` frees the layers of the untagged manifests it deleted at once, instead
+  of leaving them for the registry's next scheduled garbage collection (every 6 hours). After it
+  deletes at least one manifest it asks the registry, with the node's push credential, to sweep
+  exactly the repositories it deleted from; the registry's own collector runs that sweep with its
+  usual one-hour grace, repository locks and mass-delete brake. The table and the `-o json` document
+  (`registry.sweep`) report the blobs and bytes the sweep freed, and any repository the brake
+  stopped, that no scheduled sweep has reviewed yet, or whose sweep failed. A sweep that stops or
+  cannot run is reported and not retried, and does not change the exit status. A dry run sweeps
+  nothing.
+- The cluster registry no longer runs or ships a zot child. It is k3sm's own, served by the `k3sm` binary
+  itself, so a release payload and `k3sm payload` carry no `zot` or `zot.version`, and a build from
+  source no longer fetches zot's modules. An install still removes a `zot` an earlier release left in
+  the work dir, and images already in the store keep serving.
+- The cluster registry is k3sm's own, built into the server, and no separate registry program ships or runs.
+  It serves the same address, `registry-k3sm:6450`, over HTTPS under the cluster CA, collects its own
+  garbage, and takes writes through the same push gate. Images you pushed stay where they are.
+- A node refuses a GPU pod with a `FailedGPUFit` Event when the units held under `mlx.k3sm.io/gpu` and
+  `k3sm.io/gpu` together, plus the pod's own, pass the node's GPU slot count. This now holds for pods that
+  name only `mlx.k3sm.io/gpu`, and on a node whose GPU memory ceiling is unknown: a pod bound past the
+  node's slots, for example through `spec.nodeName`, is refused. The scheduler counts the two names
+  separately, so it can bind more pods than the node has slots. A refused pod reports `ProviderFailed`
+  and is retried on a back-off, so it starts once a slot frees; with `restartPolicy: Never` it stays
+  `Failed`.
+- The ingest registry is served by k3sm itself, as a `k3sm registry serve` child process, in place of
+  zot. Images already in the registry stay where they are, and zot's `cache.db` and `meta.db` are left
+  untouched, so a rollback finds them. A server running as root, as a hand-run `sudo k3sm server`, has
+  no ingest registry and reports that in `k3sm status`; an installed server runs as `_k3sm` and is
+  unaffected.
+- The ingest registry and its push gate now read repository names, tags and digests with one
+  validator. A push to a name with a component `index.json` or `oci-layout`, or whose first component
+  is `cache.db`, `meta.db`, `config.json`, `htpasswd` or `push-credential.json`, is refused, as a name
+  with a `blobs` or dot component already was. A push to a name with a component `manifests` or
+  `uploads`, which the gate used to refuse, now works.
+- The ingest registry refuses a request path holding a percent escape with `NAME_INVALID`, reads
+  included: `a%2fb` and `%61` no longer reach the repositories `a/b` and `a`, and a digest must spell its
+  colon as `:`. A query value may still be escaped.
 - `k3sm image ls` and `k3sm image df` keep a cache of image descriptions by digest under
   `~/Library/Caches/k3sm/registry`, so a repeat listing of a large registry reads each tag's
   digest and describes only new content.
@@ -97,6 +191,9 @@ pin, its date, and the tarball's sha256.
   it runs from cannot be read, the message now says what to check: that the directory and each of its parents are owned by
   root and not writable by group or others (an I/O error means the disk needs checking), and how
   to stop the helper's process group by hand if it is still the helper.
+- The default mlx-serve image is now `0.5.0-k3sm.5`. The example `MLXModel` and the spike scripts pin
+  its digest. A sharded `MLXModel` pod now checks at start that the engine's run body matches its pin,
+  and the entrypoint exits with the engine's status.
 - The `mlx-serve` image's `mlx-lm` moves from 0.32.0 to 0.32.2. The next image tag carries it; no other package in the closure moves. Sharded ranks refuse chat requests whose images are not inline `data:` URLs, since mlx-lm 0.32.2 would otherwise fetch any `http(s)` image URL a client names.
 - The embedded runtime takes an exclusive lock on its root (`runtimed.lock`). A second runtime
   started on a root already in use waits up to 15 seconds for the lock and is then refused,
@@ -105,9 +202,226 @@ pin, its date, and the tarball's sha256.
   `MANIFEST_UNKNOWN` (it was 400 `MANIFEST_INVALID`), as the OCI conformance suite expects. PUT
   and DELETE still answer 400, and an anonymous request is answered 401 before the reference
   is parsed.
+- The node budget's default warn rungs move. Available memory warns at the larger of 1 GiB and 11%
+  of memory (was 12%), the memory compressor at 56% of its limit (was 50%), and swap growth at a
+  512 MiB rise within 60 s, with admit-stop at 1 GiB and critical at 2 GiB (were 256 MiB, 512 MiB
+  and 1 GiB). This does not change when a Pod is evicted: eviction does not read these rungs, and
+  the evict-soft and evict-hard rungs stay where they were. `SoftPressure` goes True later, except
+  on available memory on an 8 GiB Mac, where the 1 GiB floor still sets the rung, and a Pod
+  annotated `budget.k3sm.io/band: batch` is refused for swap growth only from the higher critical
+  rung.
 
 ### Fixed
 
+- A Pod whose `image` volume the node cannot fetch for want of store space is now kept `Pending` with
+  the waiting reason `ArtifactPullBackOff` and retried on the image pull back-off, where it used to fail
+  at creation. A volume whose reference the runtime refuses as naming another registry is kept with
+  `ArtifactPullRefused` and one Warning Event, and is not retried. An unresolvable `imagePullSecret` for
+  an `image` volume records one `Failed` Event and is re-checked quietly until the Secret is fixed,
+  instead of retrying with an Event per attempt. Pull-failure Events for an `image` volume now name the
+  volume's reference, not the Pod's first container image.
+- The registry's garbage collection no longer stops every sweep of a repository that holds only untagged
+  manifests when one of them is a referrer, such as a signature, whose subject is gone. Such a referrer is now
+  reaped once it is older than the grace period, with its subject's image, as `k3sm image prune` already
+  treats it. A referrer whose subject is kept, by a tag, by a kept index or by being younger than the grace,
+  keeps its blobs as before. When a tag moves, the old image's signatures are reaped with it after the grace,
+  and a referrer pushed before its subject, as when an image is signed and then copied, is protected only by
+  the grace period: push the subject within it.
+- Registry garbage collection stops a repository's sweep, and deletes nothing in it, when its `index.json`
+  holds fewer rows than the registry last wrote, as after a rolled-back or hand-edited `index.json` or a
+  backup merged over a live registry. Before, the images whose rows went were deleted at the next sweep.
+  The registry records each repository's row count under `<work-dir>/registry-state/rows/`, and the
+  sweep's log line names the record to remove once the index is as it should be. A registry from an
+  earlier build records its counts at the first sweep and is never stopped by a missing record. The
+  registry guide's section on restoring a backup says how to check the rows and clear the stop.
+- A push to the registry that would take a repository's `index.json` past 64 MiB, the most the registry
+  reads, now fails and changes nothing. With very many tags such a push used to succeed and leave the
+  repository unreadable, its tags undeletable included. The refused push answers `403 DENIED` saying the
+  repository has too many tags. Deleting tags makes room for the next push.
+- A registry image index that names a layer, or any blob over 4 MiB, as one of its manifests no longer stops
+  garbage collection of its repository until the index is deleted. A blob that large is no manifest the
+  registry stores or serves, so collection keeps it as a blob without reading it, whatever media type the
+  index gives it. A manifest over 4 MiB that the repository's index holds a row for still stops the sweep.
+- Blobs pushed to a registry repository without any manifest naming them no longer stop its garbage
+  collection while a tag stays. Enough of them beside a tagged image used to trip the brake that stops a
+  sweep deleting more than half of a repository's blobs, on every sweep. While a repository keeps a
+  manifest, the brake now counts only the blobs its manifests are or name, so those blobs are collected
+  once past the grace period, and a sweep that would delete more than half of what the images use still
+  stops. A repository holding a manifest whose stored bytes no longer match its digest counts every blob,
+  as before.
+- A managed update no longer stalls on a node when a phase write fails, as it does when the server restarts
+  during that node's update. The node used to stop working on the update without saying so, until the update
+  controller's 30-minute node timeout failed the roll. It now retries the write for up to 5 minutes of backoff,
+  logging each try, and carries on from the step it reached without fetching or installing anything twice. If
+  the write still fails, the node keeps the last phase it wrote and tries again from the start of the download,
+  and the node timeout remains the limit. No RBAC changes.
+- A deleted `Update` no longer leaves its node cordoned. Deleting a failed roll's `Update`, or finding one
+  gone when the server starts, left the node `SchedulingDisabled` with its `k3sm.io/update-*` annotations.
+  The update controller now clears those annotations when no `Update` accounts for them, and lifts the cordon
+  only where it made the cordon: a node you cordoned yourself stays cordoned. It records an
+  `UpdateOrphanReleased` Event on the Node when it lifts a cordon, and none when there was none to lift. A live roll is not touched, and a failed roll keeps its node as it
+  was until `k3sm update abort` or a delete of the `Update`. A node that finished a roll keeps
+  `k3sm.io/update-version`, `-payload` and `-phase` only while its `Update` stands, and no longer keeps the
+  signature and signer certificate. No RBAC changes.
+- `sudo k3sm start` and `sudo k3sm install --start` on a stopped server no longer fail with `Unauthorized`
+  when they reach the apiserver as it comes back, which rolled the install back and left the node cordoned.
+  For 30 seconds after the first rejection they retry and read the admin kubeconfig again, within the
+  existing 90-second limit for the uncordon. A credential still rejected after that fails as before, and a
+  start that restarted nothing, or one on a worker, still fails on the first rejection.
+- `sudo k3sm install --start` no longer rolls a good release back when it cannot uncordon the node. With the
+  daemons verified up, the install keeps the new release, writes the admin kubeconfig and exits 1 with
+  `k3sm: node is still cordoned` on standard error, as `k3sm start` does. Run `sudo k3sm start` to uncordon the
+  node.
+- A rollback of `sudo k3sm install` no longer leaves `~/.kube/config` getting `Unauthorized`. It puts the
+  previous admin token back, so every copy of the kubeconfig keeps working, or, when it cannot, writes the
+  kubeconfig with the new token and says to copy it again.
+- `k3sm install` with a new `--mesh-ip` on a control-plane node no longer leaves the server refused its new
+  address at every start. The install removes the pod range netd recorded when it names another range than
+  the new address's, and removes the interconnect aliases of the old range from `bridge0`. A failed removal
+  of those aliases is logged and does not stop the install. The old mesh address and the old range's pod
+  aliases stay on `lo0` until `k3sm stop`, `k3sm uninstall` or a reboot. A reinstall that keeps its
+  `--mesh-ip`, and any worker reinstall, keeps the recorded range.
+- A registry garbage collection no longer stops at the half-repository brake, and keeps a removed
+  image's blobs, because one blob of that image is newer than the repository's last row change, as a
+  blob shared with another repository is when that repository touches it after the delete. When a
+  sweep removes every row, it now reaps the blobs older than the last row change and leaves the newer
+  ones out; removing rows lets the next sweep reap those too. With no row to remove, a blob left out
+  waits for the abandon horizon, and a first push with no manifest yet still reaps nothing.
+- On a worker, verbs that reach the cluster no longer use a `k3sm.kubeconfig` left in the server work dir by an earlier server install, which could time out dialling an address that no longer answers. This covers `sudo k3sm image migrate`, `image push`, `load` and `import`, `build --push`, `registry`, `builder`, `interconnect` and `kubectl`. They now use your own kubeconfig. With none, the service user's `kubectl` and `interconnect` use the node's own credential. Run as root, `kubectl`, `interconnect`, `builder` and the verbs that mint a registry push token stop instead, because a node identity may not mint a registry push token or run the build engine. `kubectl`, `interconnect` and `builder` say to copy the admin kubeconfig from the server, set `KUBECONFIG` and run without sudo. The verbs that mint a token say to save the copied admin kubeconfig as `~/.kube/config`, owned by you and not group- or world-writable, and run with sudo. A copy from a worker needs the kubeconfig described in the registry docs. `K3SM_WORK_DIR` still names a work dir explicitly.
+- On a worker, `sudo k3sm image migrate` and the other verbs that mint a registry push token now read the invoking user's `~/.kube/config`. Root reads it only if that user owns it, nobody else can write to it, and it carries its CA and credentials inline. Root also uses it only if its cluster has TLS verification on, an `https` server, and exactly the CA in the worker's root-only copy, `/var/lib/k3sm/keys/cluster-ca.crt`, so the file's server address can differ from the node's but its cluster cannot. If that copy is missing, can't be read, or isn't a root-owned file only root can write, the file is refused and the notice names the fix: remove the copy and run `sudo k3sm install --agent --server <server> --token-file <file>`. If it can't be used, the run stops and says why and how to save one. These verbs ignore `$KUBECONFIG` under sudo on a worker, with a one-line notice, and read only that file; `K3SM_WORK_DIR` still names a work dir explicitly.
+- `k3sm kubeconfig` on a worker no longer prints or merges a `k3sm.kubeconfig` left in the server work dir, and says to copy the kubeconfig from the server. `K3SM_WORK_DIR` still names a work dir explicitly.
+- A worker no longer sends a push to a loopback registry gate because of a registry record left by an earlier server install, and `k3sm image tag`, `untag`, `inspect`, `save` and `prune` no longer use a push credential left the same way. A push or build naming that credential's loopback port no longer sends it there or treats the port as the cluster registry: on a worker, that port is another registry on the Mac. `K3SM_WORK_DIR` or a `--work-dir` naming another directory still reads that directory's.
+- `k3sm install --agent` removes `k3sm.kubeconfig`, an admin credential left in the server work dir by an earlier server install. Everything else in that directory stays, and `k3sm uninstall` doesn't remove the file.
+- `k3sm image untag` of an image's last tag no longer makes the image unreadable by digest in the
+  cluster registry. The manifest stays readable at `repository@sha256:...`, and `k3sm image prune` sees
+  it as untagged, until prune or the registry's garbage collection removes it.
+- A Pod force-deleted and re-created under the same name before the node synced the delete is now replaced at once: the old Pod stops first, with its preStop hooks and grace period, then the new one starts. Before, the old Pod ran on until the orphan reaper removed it, up to about three minutes, and a new Pod with an identical spec could stay Pending.
+- A `vm` image with paths differing only by case now gets a refusal naming both paths and the fix on a case-insensitive data root, and is refused rather than merged when cloned into a case-insensitive pod rootfs.
+- A `vm` Pod's probes now end when its delete starts, so none runs during `preStop` or while the guest stops. Its relay closes before the guest gets `SIGTERM` and stays closed. It used to close part-way through the grace period and could reopen briefly once the guest had stopped, onto an address macOS may give to another guest. A connection through the relay no longer drains during the grace period. A native Pod's probes are unchanged.
+- A `vm` Pod's probes now end when its delete starts, so none runs during `preStop` or while the guest stops. Its relay now stays up until the guest has stopped, so connections through it can drain and new dials still land during the grace period, then closes once and cannot reopen. It used to close part-way through the grace period and could reopen briefly once the guest had stopped, onto an address macOS may give to another guest. A native Pod's probes are unchanged.
+- The registry now checks a caller's access before it reads the digest or upload id in the request, so
+  a caller who may not read or write a repository gets the same 401 or 403 for a malformed digest or
+  upload id as for a well-formed one, where it used to get a 400 or 404. A mount whose source the
+  caller may not read answers the same way. Callers with access see no change.
+- Output a `vm` pod's containers print while terminating now reaches their log files instead of being
+  lost when the pod is deleted.
+- `kubectl logs -f` keeps following a Pod through its delete, on both the vm and native paths, and ends cleanly once the container's output ends and the last line is delivered. It ended with `container "..." in pod "..." is not available` as soon as the delete started. A stream also no longer stays open on a deleted Pod because a new Pod took its name.
+- A guest no longer outlives its deleted pod when a create lands around the delete: a second late create of a
+  pod whose image was edited while parked, a create inside the orphan reaper's delete, or a create the reaper's
+  release overtakes. No RBAC changes.
+- The k3sm registry refuses at push any manifest its garbage collector could not read, such as an
+  index with no `manifests` array or a body that repeats `config` as null, with `MANIFEST_INVALID`.
+  An index that names a blob that is not a manifest as a child no longer stops garbage collection for
+  its repository, unless the blob is over the 4 MiB manifest limit or fails its hash. The blob is
+  kept, along with every digest its JSON contains, and the sweep follows those digests through the
+  blobs the repository holds, so a stored manifest the strict read refuses does not lose its config
+  or layers. A manifest of that kind pushed earlier with its own row still stops its repository's
+  sweep until you delete it.
+- The registry's garbage collector reviews each repository in its own report-only sweep. A repository
+  it cannot read or plan no longer keeps every other at report-only, and no longer deletes
+  unreviewed once the problem clears. A report-only sweep also lists what the half-repository brake
+  holds back. After an upgrade, or for a repository new to the store, the first sweep only reports.
+  [Restore a registry backup into an emptied root](docs/user/registry.md#restoring-a-backup-of-the-registry):
+  a merge over a live registry can delete what was pushed after the backup.
+
+- An image edit on a running vm Pod is no longer silent. The container stays on its image, as it did, and the Pod now records a `Warning` `ImageEditNotApplied` Event naming the container and both images, and no longer records `Pulling` and `Pulled` for an image nothing fetched. `containerStatuses[].image` keeps naming what runs. The native path is unchanged.
+- A vm Pod's container killed by a signal in the guest, including an OOM kill, reports exit code 128 plus the signal, so 137 for an OOM kill, as a native Pod does; it reported 0. Such an init container no longer reports `Initialized=True`, `FallbackToLogsOnError` now applies to it, and a `SIGKILL` nothing in k3sm sent now counts in `kernelKills`.
+- An exec on a pulled-image pod now resolves an absolute command inside the image and passes the same signature check as the pod's start. A host path the image lacks still runs the host's copy, and the image's copy wins when it has one. A symlink leaving the root filesystem is refused.
+- `k3sm dev up` no longer reports an instance up over a server that has already exited. It used to
+  rely on its own record of the exit, which could lag, and on a process check that counts an exited
+  but unreaped process as running. `k3sm dev list` and `k3sm dev down` now treat that state as dead too.
+- A referrers request on the k3sm registry server stops reading manifests when its client goes away, and gives its build slot back for the next request, which carries on from what was read. A request with a malformed digest and credentials the server refuses answers 401, not 400.
+- A delete, the orphan reaper or a refused create that lands beside another call of the same pod no longer leaves the pod's address and references held until the node restarts, and releases them once. An update that arrives after a pod's delete no longer allocates an address nothing owns, and a retry of a pod whose create is parked for its image stops once the delete has begun.
+- The built-in registry refuses an OCI artifact manifest whose config or layers are not in the repository,
+  with `MANIFEST_BLOB_UNKNOWN`, as it already did for an image manifest. It could store an artifact naming
+  a blob garbage collection had already removed. A client that pushes an artifact's manifest before its
+  blobs now has to push the blobs first. A descriptor's inline `data` is not honoured: the blob must be in
+  the repository, the empty descriptor's included. An index's children and a manifest's subject still need
+  not be present; the PUT restarts the garbage collection grace of those that are, on a best-effort basis.
+- A pod whose create failed and which was then deleted no longer keeps its address and references until the node restarts. The orphan reaper releases them once the apiserver has stopped holding the pod.
+- A pod whose create failed and which was then deleted no longer keeps its address and references until the node restarts. The orphan reaper releases them, and removes the pod's log directory, once the apiserver has stopped holding the pod.
+- A pod created under the name of one the node is still finishing a delete for now starts. It could be sent to update the old pod instead, and be left with an address nothing owned or fail for good.
+- A create the runtime refuses after a second create of the same pod took over no longer takes that pod's address and log directory while it runs.
+- A pod deleted while the runtime is still creating it no longer keeps running with no owner. The node deletes it again once the create lands, and keeps the pod's address until that delete has succeeded, so no new pod can be given it beside the running one. A create of a pod the node has already torn down is ignored.
+- `k3sm` and the etcd, kine and zot it builds now link `github.com/klauspost/compress` v1.20.2, which fixes GO-2026-6865, a panic on two-block frames. Every node re-stages kine and zot on upgrade.
+- Turning Spotlight indexing off for the data volume no longer waits indefinitely on `mdutil`. The
+  `.metadata_never_index` marker is what excludes the volume and is written first, so the `mdutil`
+  call now has a 15 second limit, after which it is stopped and the mount or migration carries on.
+
+- A refused pod ends holding no address, lo0 alias or reference entry even when an update overlaps its
+  admission: the update waits for the admission verdict, and one already under way when the refusal
+  lands stops before the runtime call and frees what it took.
+- The registry refuses a push with a `k3sm-registry/builder` token valid for more than 24 hours, or
+  one whose `iat` and `exp` cannot be read. `k3sm registry token` already stopped at 24 hours, but
+  `kubectl create token` issued any lifetime under the same grant. A push with a longer token now
+  gets a 401: run `k3sm registry login` again, or mint a new token with `k3sm registry token`. Other
+  ServiceAccounts' tokens are not affected.
+- The built-in registry pages a tag list that names no `n`: it answers the first 1,000 tags with a
+  `Link` to the next page, as the catalog does, instead of every tag in one response. An explicit
+  `n` is unchanged.
+- The by-hand stop hint printed when an uninstall leaves a vm pod's helper running now names that pod's own
+  command-line argument, so a group running the same helper for another pod does not pass the check.
+- A pod whose create failed partway and was then refused at admission no longer keeps the address, lo0
+  alias, interconnect slot and reference entry the failed create took: the refusal frees them.
+- A delete that overlaps an update no longer leaves the pod holding an address with nothing to free it:
+  the update stops, and the last call out finishes the release once. A panic while a create is being
+  stopped no longer holds every later create and update of the pod.
+- `k3sm stop` and `k3sm uninstall` stop a `vm` helper whose path spells its version in a different
+  case than the versions directory. It was reported as no longer retained and left running. A
+  stray file or symlink named like a version no longer counts as a retained version.
+- The sandbox's explicit deny now follows the status records `k3sm status` reports on a node started
+  with a non-default `--pod-root`, naming the data root's status directory. A node with
+  a non-default pod root recreates its pods once on upgrade, and a node whose status directory is
+  reached through a symlink refuses to start, naming the path. A node on the default pod root is unchanged,
+  whatever its status directory resolves to, and a status directory behind a symlink logs a warning
+  because the sandbox deny does not follow the link.
+- `sudo k3sm uninstall` no longer fails with a staging sweep error, on that run and every re-run,
+  when a leftover staging tree holds a file or directory with the `uchg`, `uappnd` or `uunlnk` flag,
+  or is deeper than the process's open-file limit. The sweep clears those flags inside the tree and
+  moves on past the limit. It follows no symlink, and it reports a volume mounted inside the tree
+  and leaves it alone. A file with a system flag, or a hard-linked file with a locking flag, is still
+  refused and named, and uninstall fails until it is dealt with.
+- A sharded `MLXModel` answers HTTP 404 to a request naming any model but `spec.model`, or any
+  `draft_model` or `adapters`; before, a model named in a request body made every rank download that
+  repository and drop the model it was serving. The fix is in the `mlx-serve` sharded entrypoint, so it ships with the next image tag.
+- A single-node `MLXModel` refuses every image, video or audio URL that is not a `data:` URL with
+  HTTP 400, before a name is resolved; before, vllm-mlx fetched `http(s)` media URLs from the pod,
+  and a name that resolved differently the second time could reach an internal address. Send media
+  inline as base64 `data:` URLs. The fix is in the `mlx-serve` entrypoint, so it ships with the next
+  image tag: an already published tag does not have it.
+- A single-node `MLXModel` no longer downloads and loads a model a request names. `/v1/audio/transcriptions`
+  and `/v1/audio/speech` answer HTTP 400, and `/v1/embeddings` answers HTTP 400 unless an operator pins
+  a model with `--embedding-model` in `spec.runtime.args`. A media `data:` URL must now be
+  `data:image/`, `data:video/` or `data:audio/`. Both fixes are in the `mlx-serve` entrypoint, so they
+  ship with the next image tag. The docs now state that the serving port has no API key and who can
+  reach it. [MLX quickstart](docs/user/mlx-quickstart.md#things-to-know) has the details.
+- The sandbox's explicit denies now follow the CA keys, the datastore and the node password on a node
+  started with a non-default `--pod-root`, naming the `server` and `agent` directories at the data
+  root. Such a node recreates its pods once on upgrade, and refuses to start, naming the path, when
+  the data root or either directory is reached through a symlink, or when `--pod-root` is inside either
+  directory. A node on the default paths is unchanged.
+- `k3sm status` names the cause of an invalid developer-mode row: when `/` or `/Library` is the
+  problem, the detail and remedy name that directory instead of suggesting `sudo rm` of the marker,
+  which does not fix it. [Status JSON](docs/user/status-json.md) describes the row.
+- `k3sm status` no longer tells you to `sudo rm` a developer-mode marker it could not read. When the
+  path cannot be read, for example under a directory the account running it cannot search, the
+  `developer-mode` row is `unknown` and says it cannot tell whether the mode is on, with
+  `sudo k3sm status` as the remedy. A directory at the marker path gets `sudo rm -r`, which `rm`
+  accepts, unless a directory above it is unsound, and the remedy for a bad `/` or `/Library` now
+  says removing the marker clears the row but leaves that directory as it is. An install that cannot
+  read the marker runs the signature checks, and one that cannot clear an unread marker rolls back,
+  because the mode may still be on.
+- `k3sm update apply` failed on a node at its first step and left it cordoned, because the daemon
+  cannot create `/var/lib/k3sm/updates` under the root-owned data root. `k3sm install`
+  now creates that directory for the service user, mode 0700, on both roles, `k3sm-netd` repairs it,
+  and uninstall removes it. A node's `Failed` message now names `k3sm update abort` as the recovery.
+  A node installed by an earlier release gets the directory from one install of this release by any
+  install path, because a managed update cannot bring it; on a release with this fix, `sudo k3sm
+  restart` recreates a missing one. See [Upgrade](docs/user/upgrade.md).
+- An edit to a Pod's labels, annotations, images or tolerations that reached the node while the
+  Pod was being evicted, before its `Failed` status reached the API server, no longer replaces the
+  eviction with a `ProviderFailed` status. The node drops the update, since the evicted Pod no
+  longer exists in the runtime.
 - A component that crashes during start-up on a busy host is now reported with its exit status
   instead of as a health timeout.
 - A server or agent installed from a build of main exited at every start with `open runtime root
@@ -115,6 +429,14 @@ pin, its date, and the tarball's sha256.
   file in the data root, which belongs to root. `k3sm install` now creates that one file for the
   service user, mode 0600, and repairs one left owned by root; the data root keeps its mode.
 - The server and agent no longer warn about the mesh key on every start under the service user.
+- The new registry server, which no k3sm command starts yet, holds its clients to more of its limits.
+  A `DELETE` by digest that sends `If-Match` answers 412 and removes nothing when any tag names the digest; without `If-Match` it
+  still removes the tags too. Each principal is limited to its share of the upload sessions and
+  answers 503 past it, so the push gate's writers cannot shut out the local CLI, or the reverse.
+  Uploads in flight share one free-space reservation, and a principal may hold at most three
+  quarters of it, so past that an upload answers 507, even one that would fit on the volume by
+  itself. A blob `GET` whose reader stalls is cut after the response timeout, 2 minutes by default,
+  rather than after the time the blob's size allows, and the client resumes with a `Range` request.
 - The k3sm registry server answers a manifest whose stored bytes no longer match its digest or
   size with a 500 that sends nothing of the manifest, logged at Error with the digest, instead of
   a 400 `DIGEST_INVALID` that blamed the client. A blob mount from a corrupt source answers the
@@ -130,6 +452,18 @@ pin, its date, and the tarball's sha256.
   writer is not running (before it starts, after it stops, or once it has exited): the kill
   intent is written at once. A symlink or a FIFO at the budget history path in the node's work
   dir is refused as unreadable and moved aside, never read through or waited on.
+- A sharded MLXModel whose ranks mount a cache now starts. Each rank Pod was bound to its node
+  directly, so the scheduler never saw it and its cache claim, which waits for the first consumer,
+  was never bound; the ranks sat in `ContainerCreating`. Ranks are now pinned to their placed node
+  with a required node affinity on `kubernetes.io/hostname`, and the scheduler binds the claim there.
+  A sharded model already stuck waiting on its cache before the upgrade is not replaced on its own;
+  delete its rank Pods once with `kubectl delete pod -n <namespace> -l app.kubernetes.io/instance=<model>,k3sm.io/mlx-rank`
+  (or delete the model) and the operator recreates them through the scheduler.
+- A sharded MLXModel with a pinned `revision` now downloads that revision. Each rank fetches it
+  into its own cache volume before the engine starts, as a single-node model does; before, the
+  ranks started on empty caches and rank 0 exited on the missing snapshot path. The fetch is in
+  the `mlx-serve` image's sharded entrypoint, so it needs an image built from this source: an
+  already published tag does not have it.
 - A k3sm.app update that finds the installed `k3sm` link broken (pointing at a version
   directory that is gone, or out of `/Library/k3sm`) is still refused, and the refusal now says
   how to repair the install: re-run the install script, `curl -fsSL https://k3sm.io/install.sh | sh`,
@@ -201,7 +535,10 @@ pin, its date, and the tarball's sha256.
   manifest, and takes the repository lock only for that write, so repeated HEADs no longer queue
   behind pushes and sweeps. A touch that fails on a read-only or degraded store is logged once
   and the HEAD still answers `200`; that object is not touched again for half the grace. The
-  server now requires the garbage collector's grace in its configuration.
+  server now requires the garbage collector's grace in its configuration. A HEAD keeps the object
+  for at least half the grace and at most one grace after it, so a manifest PUT that comes later
+  can still find the object reaped. A HEAD is a read but it writes: a credential that may only
+  pull keeps an object it can name alive, in every repository that links the same content.
 
 - `k3sm stop` and `k3sm uninstall` recognise a vm pod's `k3sm-vmhost` helper when it runs from
   a versioned install directory or through a symlinked install path, not only from the flat
@@ -248,6 +585,15 @@ pin, its date, and the tarball's sha256.
   larger one is read over several requests the first time, each answering 429 with `Retry-After`
   until the view is built. It is paged by digest with a `Link` header and takes at most 8
   `artifactType` filters.
+
+- When a directory stands where the install's lock file belongs, the refusal now says what is
+  there and gives a remedy that works on a directory (`sudo rmdir`, or `sudo rm -rf` if it is not
+  empty). It used to give no remedy, and the `sudo rm` the lock file message suggests fails on a
+  directory. A directory, a hard-linked file and any other non-regular entry are still refused.
+
+- A pod's address is no longer released from under a new create of the pod when the create that was
+  held for its volume claims is refused. The new create now waits for the release, then allocates its
+  own address. Before, the pod could run with no address reserved for it.
 
 ## v0.2.3 — 2026-10-29
 

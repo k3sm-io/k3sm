@@ -31,6 +31,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
 
+	updatesv1alpha1 "k3sm.io/apis/updates/v1alpha1"
+
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/version"
 )
@@ -113,6 +115,12 @@ func UntaggedLabel(untaggedOf string) string {
 type UpdateRecord struct {
 	// CheckedAt is when the check ran.
 	CheckedAt time.Time `json:"checkedAt"`
+	// Channel is the release channel the check ran on, so a server sees that the
+	// live channel moved from under its record, and the channel the row and the
+	// Node name beside Latest. Empty means stable: a record from an older k3sm, or
+	// a check that could not read the channel, whose row names none since it has
+	// no result to name one for (updateRowChannel).
+	Channel updatesv1alpha1.UpdateChannel `json:"channel,omitempty"`
 	// Error is why the check could not finish (GitHub unreachable, the node
 	// list refused); empty when it did.
 	Error string `json:"error,omitempty"`
@@ -324,7 +332,7 @@ func (c Collector) updateRow(now time.Time, live []corev1.Node, liveOK bool) (Ro
 		row.Detail, row.Remedy = "the update record does not parse: "+path, c.updateCheckRemedy()
 		return row, true
 	}
-	r := UpdateRowFrom(c.rederive(rec, live, liveOK), now)
+	r := updateRowWith(c.rederive(rec, live, liveOK), now, lastGoodPair(rec, live, liveOK))
 	r.Wide["record"] = path
 	if r.Remedy == UpdateCheckRemedy {
 		r.Remedy = c.updateCheckRemedy()
@@ -336,8 +344,8 @@ func (c Collector) updateRow(now time.Time, live []corev1.Node, liveOK bool) (Ro
 // runs now: this binary's version and dirty flag (when the report knows it),
 // and every node's kubelet version from the live node list (when it was read).
 // The stored state words are cleared; UpdateRowFrom recomputes every state
-// from the versions and rec.Latest. Latest, Published, KubeVersion, CheckedAt,
-// Error and Roll are what the check found and stay as recorded.
+// from the versions and rec.Latest. Latest, Channel, Published, KubeVersion,
+// CheckedAt, Error and Roll are what the check found and stay as recorded.
 func (c Collector) rederive(rec UpdateRecord, live []corev1.Node, liveOK bool) UpdateRecord {
 	if c.Version.Version != "" {
 		rec.Installed, rec.InstalledDirty, rec.InstalledState = c.Version.Version, c.Version.Dirty, ""
@@ -362,6 +370,48 @@ func (c Collector) updateCheckRemedy() string {
 	return UpdateCheckRemedy
 }
 
+// lastGoodPair is what a server's row adds to a failed check on rc: the pair the
+// Nodes still publish and when it was checked, read from the node list this report
+// already took, since the failed check overwrote the record that held it. Empty
+// on anything but a failure on rc, so a stable detail stays what it was.
+func lastGoodPair(rec UpdateRecord, live []corev1.Node, liveOK bool) string {
+	if rec.Error == "" || rec.Channel != updatesv1alpha1.UpdateChannelRC || !liveOK {
+		return ""
+	}
+	pair, _, ok := PublishedUpdateRecord(live)
+	if !ok {
+		return ""
+	}
+	channel, _ := updateRowChannel(pair)
+	return fmt.Sprintf("; the last good check found k3sm %s on channel %s, checked %s", pair.Latest, channel, pair.CheckedAt.UTC().Format(time.RFC3339))
+}
+
+// updateChannelNoteMax bounds how much of an unknown channel value a row repeats.
+const updateChannelNoteMax = 64
+
+// updateRowChannel is the channel a row names for rec, and what its detail gains
+// for it. An empty channel beside a latest release is an older server's pair and
+// reads as stable; with no latest there is no result to name a channel for, so
+// the row names none rather than claim stable for a check that could not read it.
+// A value that is neither channel never reads as rc: it degrades to stable and the
+// detail says why. stable adds nothing to the detail, which stays byte-identical to
+// a report from before there were channels.
+func updateRowChannel(rec UpdateRecord) (channel, note string) {
+	switch rec.Channel {
+	case updatesv1alpha1.UpdateChannelStable:
+		return string(updatesv1alpha1.UpdateChannelStable), ""
+	case updatesv1alpha1.UpdateChannelRC:
+		return string(updatesv1alpha1.UpdateChannelRC), "; channel rc"
+	case "":
+		if rec.Latest == "" {
+			return "", ""
+		}
+		return string(updatesv1alpha1.UpdateChannelStable), ""
+	}
+	return string(updatesv1alpha1.UpdateChannelStable),
+		fmt.Sprintf("; the server's channel could not be read (%q), so this reads as stable", ClipText(string(rec.Channel), updateChannelNoteMax))
+}
+
 // updateMissingDetail is the row's detail when no usable check is recorded.
 const updateMissingDetail = "no update check is recorded yet (the server checks once an hour)"
 
@@ -369,8 +419,14 @@ const updateMissingDetail = "no update check is recorded yet (the server checks 
 // untrusted input: it is validated, every string is control-stripped and
 // clipped before it reaches Detail or Wide, a CheckedAt beyond the clock slack
 // in the future reads as no record, and each node's state is recomputed from
-// its recorded version rather than read from the stored word.
+// its recorded version rather than read from the stored word. wide.channel is
+// the channel the record's result was computed under, on the rolling row too.
 func UpdateRowFrom(rec UpdateRecord, now time.Time) Row {
+	return updateRowWith(rec, now, "")
+}
+
+// updateRowWith is UpdateRowFrom with lastGood added to a failed check's detail.
+func updateRowWith(rec UpdateRecord, now time.Time, lastGood string) Row {
 	row := Row{Name: RowUpdate, State: StateUnknown, Severity: SeverityUnknown, Wide: map[string]string{}, Remedy: UpdateCheckRemedy}
 	if rec.CheckedAt.After(now.Add(updateClockSlack)) {
 		row.Detail = updateMissingDetail
@@ -380,9 +436,21 @@ func UpdateRowFrom(rec UpdateRecord, now time.Time) Row {
 		row.Detail = err.Error()
 		return row
 	}
-	if r := rec.Roll; r != nil && !r.ObservedAt.After(now.Add(updateClockSlack)) && now.Sub(r.ObservedAt) <= UpdateRollStaleAfter {
-		return updateRollRow(row, *r, rec.Latest)
+	channel, note := updateRowChannel(rec)
+	if channel != "" {
+		row.Wide["channel"] = channel
 	}
+	if r := rec.Roll; r != nil && !r.ObservedAt.After(now.Add(updateClockSlack)) && now.Sub(r.ObservedAt) <= UpdateRollStaleAfter {
+		row = updateRollRow(row, *r, rec.Latest)
+	} else {
+		row = updateCheckRow(row, rec, now, lastGood)
+	}
+	row.Detail += note
+	return row
+}
+
+// updateCheckRow is the update row from what the last check found.
+func updateCheckRow(row Row, rec UpdateRecord, now time.Time, lastGood string) Row {
 	row.Wide["checked"] = rec.CheckedAt.UTC().Format(time.RFC3339)
 	if rec.Latest != "" {
 		row.Wide["latest"] = rec.Latest
@@ -395,7 +463,7 @@ func UpdateRowFrom(rec UpdateRecord, now time.Time) Row {
 		return row
 	}
 	if rec.Error != "" {
-		row.Detail = "could not check for an update: " + ClipText(Redact(firstLine(rec.Error)), updateTextMax)
+		row.Detail = "could not check for an update: " + ClipText(Redact(firstLine(rec.Error)), updateTextMax) + lastGood
 		return row
 	}
 	if rec.Latest == "" {
@@ -493,7 +561,8 @@ func updateRollRow(row Row, r UpdateRoll, latest string) Row {
 // on its own Node, so a worker Mac's report can name it: the record itself
 // sits in the server's status directory, which no worker can read, while
 // every node identity may already read Node objects. Nothing beyond the latest
-// tag and when it was checked is published.
+// tag, when it was checked and the channel it was computed under is published.
+// The channel's key is updatesv1alpha1.AnnotationReleaseChannel.
 const (
 	// NodeReleaseLatestAnnotation is the latest release tag the server's last
 	// successful check found.
@@ -504,14 +573,28 @@ const (
 
 // UpdateAnnotations is what a server publishes on its own Node for rec, or nil
 // when rec names no usable latest release (a failed check publishes nothing,
-// so the last good one stays).
+// so the last good one stays). The channel and the latest release are one pair,
+// taken from the record and never from the live UpdatePolicy, so after a failed
+// check they stay stale together and never disagree. A record with no channel
+// publishes stable, because a merge patch removes nothing and an older rc would
+// otherwise stay beside the new release; one with an unknown channel publishes
+// nothing.
 func UpdateAnnotations(rec UpdateRecord) map[string]string {
 	if rec.Error != "" || rec.Latest == "" || !version.ValidTag(rec.Latest) || rec.CheckedAt.IsZero() {
 		return nil
 	}
+	channel := rec.Channel
+	switch channel {
+	case "":
+		channel = updatesv1alpha1.UpdateChannelStable
+	case updatesv1alpha1.UpdateChannelStable, updatesv1alpha1.UpdateChannelRC:
+	default:
+		return nil
+	}
 	return map[string]string{
-		NodeReleaseLatestAnnotation:  rec.Latest,
-		NodeReleaseCheckedAnnotation: rec.CheckedAt.UTC().Format(time.RFC3339),
+		NodeReleaseLatestAnnotation:              rec.Latest,
+		NodeReleaseCheckedAnnotation:             rec.CheckedAt.UTC().Format(time.RFC3339),
+		updatesv1alpha1.AnnotationReleaseChannel: string(channel),
 	}
 }
 
@@ -521,7 +604,9 @@ func UpdateAnnotations(rec UpdateRecord) map[string]string {
 // publishing Node's name, or false when no control-plane Node carries a usable
 // pair. Pure. The annotations are untrusted input like the record on disk:
 // UpdateRowFrom validates what this returns, and a value of the wrong shape is
-// skipped here.
+// skipped here. Channel is the annotation of that same Node, taken as it stands
+// and empty when an older server published none: the two are one pair, so it is
+// never read from another Node, and the reader judges its value.
 func PublishedUpdateRecord(nodes []corev1.Node) (UpdateRecord, string, bool) {
 	var rec UpdateRecord
 	server := ""
@@ -536,6 +621,7 @@ func PublishedUpdateRecord(nodes []corev1.Node) (UpdateRecord, string, bool) {
 		}
 		if server == "" || checked.After(rec.CheckedAt) {
 			rec.CheckedAt, rec.Latest, server = checked, latest, n.Name
+			rec.Channel = updatesv1alpha1.UpdateChannel(n.Annotations[updatesv1alpha1.AnnotationReleaseChannel])
 		}
 	}
 	if server == "" {

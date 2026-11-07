@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 // Package binsign is k3sm's one code-signing entry point for the binaries it
-// stages: the control plane, kine, etcd, helm and zot, and the dev pod and exec
+// stages: the control plane, kine, etcd and helm, and the dev pod and exec
 // shims. Its rule: a binary that is, or may be, mapped by a running process is
 // never written in place. macOS caches a Mach-O's signature per vnode, so
 // `codesign -f` on a live file (or any in-place rewrite) leaves the kernel holding

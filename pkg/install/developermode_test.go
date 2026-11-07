@@ -62,7 +62,7 @@ func TestDeveloperModeMarkerState(t *testing.T) {
 		{name: "0664", facts: with(func(e *OwnedEntry) { e.Mode = 0o664 }), want: DeveloperModeInvalid},
 		{name: "0646", facts: with(func(e *OwnedEntry) { e.Mode = 0o646 }), want: DeveloperModeInvalid},
 		{name: "an ACL", facts: DeveloperModeFacts{Exists: true, Entry: good, HasACL: true, Ancestors: ancestors}, want: DeveloperModeInvalid},
-		{name: "a probe that failed", facts: DeveloperModeFacts{Exists: true, Entry: good, Err: errors.New("EIO"), Ancestors: ancestors}, want: DeveloperModeInvalid},
+		{name: "a probe that failed", facts: DeveloperModeFacts{Exists: true, Entry: good, Err: errors.New("EIO"), Ancestors: ancestors}, want: DeveloperModeUnknown},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

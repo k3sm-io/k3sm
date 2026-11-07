@@ -321,9 +321,11 @@ k3sm image pull ghcr.io/org/app:v1            # warm this node's cache ahead of 
 | `save <tag\|repository@digest> -o <file.tar>` | Exports the image as a tarred OCI image layout, the `docker save` analog and the exact inverse of `import`: the layout names the image `registry-k3sm:6450/<repository>:<tag>`, so importing the archive records it under the same name. An index is saved whole unless `--platform` picks one platform. The archive is written beside the target and renamed into place when complete, so a failed save leaves no file behind. |
 | `pull <reference>` | Fetches the reference into this node's cache through the daemon's own puller, the same code path a Pod's pull takes, so every blob is re-hashed against its digest before it is recorded. Prints the digest it resolved to. `--platform os/arch[/variant]` picks which manifest of a multi-platform index to fetch; `--policy always\|if-not-present\|never` carries the ordinary Kubernetes pull-policy meanings. |
 
-Untag removes a name, not bytes. The manifest and its blobs stay while another tag or index names
-them, and the registry's own garbage collection reclaims what nothing names. A node that already
-pulled the image keeps its cached copy, so a running Pod is unharmed.
+Untag removes a name, not bytes, and it is not a retraction. The manifest and its layers stay
+readable by digest to anyone who can reach the registry until `k3sm image prune` or the registry's
+own garbage collection removes them. To take an image out of reach, untag it and then prune it
+(see below). A node that already pulled the image keeps its cached copy, so a running Pod is
+unharmed.
 
 A pulled image is ordinary cache content: `pull` records no operator root, so `k3sm image prune`
 can reclaim it once no Pod uses it.
@@ -349,15 +351,19 @@ sudo k3sm image prune -o json         # the same report as one JSON document
 ```
 
 In the registry it deletes untagged manifests: what is left behind when a tag is pushed again
-and now names a newer image. It keeps every tagged manifest, and these untagged ones too:
+and now names a newer image, or when `untag` removes a tag. It keeps every tagged manifest, and these untagged ones too:
 
 - a manifest that a kept multi-platform index names;
 - a referrer, such as a signature, whose subject is kept;
 - a manifest younger than an hour, since a multi-platform push uploads its per-platform
   manifests before the index that names them.
 
-A deleted manifest's layers are reclaimed by the registry's own garbage collection on its next
-sweep, so disk usage drops some time after the prune. An untagged manifest that a Pod names by
+A forced prune that deletes any manifest then has the registry's own garbage collection sweep
+the repositories it deleted from at once, under the same one-hour grace and mass-delete brake as
+every sweep, and the report says how many blobs and bytes that freed. A layer that sweep leaves,
+and the layers of manifests deleted any other way, are reclaimed on the registry's next scheduled
+sweep, every six hours. A sweep the brake stops, or that cannot run, is reported and does not
+change the exit status. An untagged manifest that a Pod names by
 digest is deleted too, so give anything you run by digest a tag. The registry half runs on the
 server that holds the registry, as the control plane's user. It reads the registry's storage
 and deletes through the registry's API with that server's own push credential. On a node with
@@ -372,7 +378,9 @@ anywhere.
 The `-o json` document has three keys. `dryRun` is true without `--force`. `registry` holds
 `name`, `skipped` (set only on a node without a registry), `manifests` (each with `repository`,
 `digest`, `mediaType` and `size`, deleted or to be deleted), `kept` (the untagged manifests kept,
-each with its `reason`), and, when present, `unreadable` repositories and `failed` deletions.
+each with its `reason`), and, when present, `unreadable` repositories, `failed` deletions and
+the `sweep` a forced prune ran (`repositories`, `blobs`, `bytes`, and any `stopped`, `failed` or
+`reviewing` repositories and `error`).
 `cache` holds `blobs`, `reclaimedBytes` and `kept` (counts by reason). The command exits non-zero
 when any deletion fails, after printing the report.
 

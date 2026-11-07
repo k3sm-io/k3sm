@@ -1223,11 +1223,11 @@ func longRunningDaemonLabels(m []artifact) []string {
 // refuseBesideStuckMarker ends an install whose marker still reads on after
 // the publish (markerRemoval.stillOn): an upgrade reverts the swap, and a
 // first install, with nothing to revert to, withdraws the new tree.
-func refuseBesideStuckMarker(ctx context.Context, sys System, cfg Config, m []artifact, previous bool, cause error) error {
+func refuseBesideStuckMarker(ctx context.Context, sys System, cfg Config, m []artifact, previous bool, cause error, swappedBack func()) error {
 	if !previous {
 		return withdrawFirstInstallTree(sys, cfg, cause)
 	}
-	return revertInstallRoot(ctx, sys, cfg, m, previous, cause, true, nil)
+	return revertInstallRoot(ctx, sys, cfg, m, previous, cause, true, swappedBack)
 }
 
 // withdrawFirstInstallTree is the first-install refusal beside a marker that

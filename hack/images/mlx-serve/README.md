@@ -52,6 +52,60 @@ an engine bump fails loudly rather than serving unguarded; selftest rung 9
 checks the hooks against a staged tree. Image and audio tokens a multimodal
 processor adds after the template are not counted.
 
+**Remote media URLs are refused.** `k3sm_serve` refuses every image, video or
+audio URL that is not a `data:` URL, including a local path; a client sends media
+inline as a base64 `data:image/`, `data:video/` or `data:audio/` URL, the prefixes
+the engine's own classifiers take, and any other `data:` URL is refused too.
+vllm-mlx 0.5.0 would otherwise fetch an `http(s)`
+URL through `vllm_mlx/models/mllm.py`'s `download_image`, `download_video` and
+`download_audio`. Its `_validate_url_safety` rejects a name that resolves to a
+non-global address, but `requests` resolves the name again to connect, so a name
+that answers differently the second time (DNS rebinding) reaches an internal
+address, and any global address is still a blind GET from the pod.
+
+The refusal looks at the parts `image_url`, `video_url` and `audio_url` under the
+key of that name, and `image`, `video` and `audio` under that key or `url`. The
+entrypoint wraps `server._validate_remote_media_urls`, so a request is answered
+HTTP 400 before a response starts and before a name is resolved, and it replaces
+the three download functions, so no other path reaches the network for a request's
+media. Each original's signature and normalized body hash (`FETCH_HOOKS`,
+`MEDIA_CHECK_SHA256`) are checked first, and the process exits naming the hook if
+one moved. `/v1/messages` has nothing to refuse: vllm-mlx's Anthropic adapter drops
+an image block, so the request is served without the image. A Responses `message`
+item is the same: its content keeps text parts only, and nothing in vllm-mlx reads
+`input_image`. Its `function_call_output` keeps its parts and is refused.
+
+`selftest.sh --case serve.image.remote` runs the check alone: http, https, a
+rebinding-shaped name and a `data:` pass for each kind, against fixtures carrying
+the functions verbatim and, on a staged tree, on the real routes with name lookups
+and requests recorded.
+
+**A request cannot load another model.** vllm-mlx 0.5.0's `/v1/embeddings`,
+`/v1/audio/transcriptions` and `/v1/audio/speech` resolve a model named in the
+request against fixed lists in `endpoint_model_policies.py`, and download and load
+a listed model that is not loaded, beside the served one. `k3sm_serve` replaces
+those three resolvers, after checking each one's signature and normalized body
+hash (`MODEL_ROUTE_HOOKS`); the process exits naming the hook if one moved.
+
+- `/v1/embeddings` answers HTTP 400 until an operator pins a model with
+  `--embedding-model <repo>` in `spec.runtime.args`. The engine then loads that
+  model at start and locks the route to its name. k3sm does not render the option
+  itself: `spec.model` is the only model it could name, and the option loads
+  through `mlx-embeddings` before the server starts, so a chat architecture
+  `mlx-embeddings` does not know exits the pod and one it does know takes a second
+  copy of the weights. A pinned model is not counted in the `memory` a pod is sized
+  for, and it downloads into the cache volume at start, so a pod that pins one
+  needs room for both.
+- `/v1/audio/transcriptions` and `/v1/audio/speech` answer HTTP 400. The engine has
+  no option that pins a model for them, so there is nothing to allow. A multipart
+  upload to the transcription route is read by the HTTP framework before the
+  refusal.
+- `/v1/rerank` already answers 404 unless `--rerank-model` was given.
+
+`selftest.sh --case serve.model.routes` runs the check alone, against fixtures
+carrying the resolvers verbatim and, on a staged tree, on the real routes with
+the loaders recorded.
+
 `k3sm_serve` also patches the prefill mask of mlx-lm's `RotatingKVCache`. The
 cache keeps its first four tokens as attention sinks, but mlx-lm (0.32.0 and 0.32.2) builds
 the multi-token mask as a plain sliding window, so after a chunked prefill
@@ -87,6 +141,25 @@ snapshot if the volume already holds it, and otherwise exits 2 naming the
 revision; a revision the Hub resolves to another commit (a branch or tag name)
 exits 2 too. A model reference that is not such a path is left to the engine.
 `TestRenderSeedsPinnedRevision` in `pkg/mlx` runs the rendered argv through it.
+A rank of a sharded model runs the same fetch from `k3sm_shard` (see below).
+
+## The serving port
+
+The single-node port has **no API key**. k3sm renders no `--api-key`, the image's
+ENTRYPOINT passes none, and with none set vllm-mlx answers every route with no
+credential, so any non-empty key a client sends is ignored. The engine binds the
+wildcard, which the default runtime rewrites onto the Pod's own address. The port
+is behind a `ClusterIP` Service, so every Pod in the cluster and every process on
+a node can call it, including the routes that spend GPU time. NetworkPolicy does
+not close this: it is a hint, enforced only for connections through the Service VIP
+(see the Limitations guide). Nothing publishes the port on the LAN unless you add a
+NodePort, LoadBalancer or Ingress in front of it. Keep it to trusted tenants, or
+isolate the clients.
+
+`--api-key <key>` in `spec.runtime.args` does make the engine check a key on every
+route but `/health`, with two costs: the key is in plain text in the Pod spec, and
+the operator's status probe sends no key, so `/v1/models` answers it 401 and the
+model never reports that it is serving.
 
 ## Files
 
@@ -139,12 +212,35 @@ It then runs `mlx_lm.server --host 0.0.0.0 --port <serve port>` in the same
 process, adding `--pipeline` for pipeline parallelism, with its own arguments
 last.
 
+A pinned model's `--model` is its snapshot path in the rank's own cache volume,
+and `mlx_lm.server` only loads that path. So once a rank's plan is made,
+`k3sm_shard` calls the same `seed_pinned_revision` as `k3sm_serve`, with the same
+outcomes, except that a refusal exits 1, not 2, because the operator reads exit 2
+on the thunderbolt path as a refusal to start on the interconnect. The fetch runs
+in the rank's own container, so a rank still downloading is a running Pod with
+no listener, which rank 0's liveness probe passes.
+`TestShardedRanksFetchPinnedSnapshotBeforeEngine` in `pkg/mlx` runs each rank's
+rendered command through it. Each rank downloads on its own, so the ranks can
+finish at different times.
+
 `mlx_lm.server` has no `--served-model-name`, so `k3sm_shard` takes that option
 itself and does not pass it on. Without it a pinned model, whose `--model` is
 the snapshot path in the cache volume, would list that path on `/v1/models`,
 and a request naming `spec.model` would make every rank load the model again
-from the Hub cache. With it, `/v1/models` lists `spec.model` alone and a request
-naming `spec.model` is served by the model already loaded. This hooks four
+from the Hub cache. With it, `/v1/models` lists `spec.model` alone, a request
+naming `spec.model` or no model is served by the model already loaded, and a
+request naming any other `model`, `draft_model` or `adapters` is answered HTTP
+404. The engine would otherwise hand a model or draft model, which any client of
+the port sets, to its loader, which downloads the repository and drops the model
+being served. A refused request still costs the batch in progress: `mlx_lm.server`
+checks the model in its generation loop, so a request naming another model while a
+batch runs stops new requests joining that batch, waits for it to finish, and only
+then gets its 404. Requests behind it wait too. Any client of the port can cause
+that, one batch at a time; it loses no output and loads nothing. The check is not
+moved ahead of the queue because the handler's own validation hook answers 400, and
+the 404 is the documented status. The single-node engine has no such cost: it
+checks the name before it reaches the engine. The selftest checks the status through the real handler. The operator always renders the
+option on a rank. This hooks four
 `mlx_lm.server` internals (`ModelProvider.load`,
 `APIHandler.handle_models_request`, `run` and `_run_http_server`). The rank
 checks each one against the shape mlx-lm 0.32.2 gives it (the same as 0.32.0) and exits, naming the
@@ -175,10 +271,8 @@ fail-closed: the original's signature and normalized body hash
 either moved. The selftest drives the guard against a fake engine (a remote URL
 is refused with no request reaching a local listener, a `data:` URL passes, a
 changed body, another signature or a missing function fails the check) and, on
-a staged tree, checks the real function. The single-node entrypoint
-(`k3sm_serve`) runs `vllm_mlx.cli`, which does not import `mlx_lm.server`, so
-this guard does not cover it; whether vllm-mlx or mlx-vlm fetch remote image
-URLs on that path has not been examined here.
+a staged tree, checks the real function. The single-node entrypoint has a guard
+of its own, described under [Context length](#context-length).
 
 `k3sm_shard --probe` is the rank-0 liveness probe: a one-token completion
 against the local server every 60 seconds, to catch a collective that hung
@@ -217,6 +311,12 @@ verbatim, and the Job. The Job's pod is a native pod that:
   against the sha256 its release publishes, failing closed on a mismatch;
 - runs `build.sh --stage-only`, which is every check and step below up to the
   context ceiling, into the claim.
+
+If a wheel download stays below 1 MB/s for 60 seconds, `build.sh` kills uv and runs
+it again, up to 25 times, because a stalled connection stays stalled while bytes
+keep arriving and a fresh one usually gets the normal rate. Finished wheels stay
+in uv's cache, and uv still checks them against the lockfile's hashes. Running out
+of restarts fails the stage with `uv download stalled`.
 
 It carries **no credential**: no Secret, no service-account token, no pull
 secret. The registry credential never leaves the operator's user on the host.
@@ -317,19 +417,19 @@ Push the layout with the registry token from the environment, as your own user:
 
 ```sh
 K3SM_REGISTRY_TOKEN=<ghcr-token> \
-  k3sm image push ~/.cache/k3sm/mlx-serve/oci ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.3
+  k3sm image push ~/.cache/k3sm/mlx-serve/oci ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.5
 ```
 
 The credential is read from the environment or the docker config chain — never
 from argv — and is not stored. `push` prints the digest and the pin:
 
 ```
-pushed ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.3
+pushed ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.5
   digest: sha256:…
   pin:    ghcr.io/k3sm-io/mlx-serve@sha256:…
 ```
 
-The tag is the engine version, with a `-k3sm.N` suffix when k3sm rebuilds the same engine with changes of its own (the context-length guard is `0.5.0-k3sm.1`; the attention-sink mask fix and the guard on `/v1/messages` and `/v1/responses` are `0.5.0-k3sm.2`; mlx and mlx-metal 0.32.4, staged with uv 0.13.1 on the python-build-standalone 20260929 build of CPython 3.12.14 (was 20260825), and the sharded entrypoint's `--served-model-name` are `0.5.0-k3sm.3`), so a tag never changes what it names.
+The tag is the engine version, with a `-k3sm.N` suffix when k3sm rebuilds the same engine with changes of its own (the context-length guard is `0.5.0-k3sm.1`; the attention-sink mask fix and the guard on `/v1/messages` and `/v1/responses` are `0.5.0-k3sm.2`; mlx and mlx-metal 0.32.4, staged with uv 0.13.1 on the python-build-standalone 20260929 build of CPython 3.12.14 (was 20260825), and the sharded entrypoint's `--served-model-name` are `0.5.0-k3sm.3`; the sharded entrypoint's check that the engine's run body matches its pin at pod start, and its exit with the engine's status, are `0.5.0-k3sm.4`; a sharded rank's fetch of its pinned revision into its cache, and the stage's uv settings and stalled-download restart, are `0.5.0-k3sm.5`), so a tag never changes what it names.
 
 Record that pin. The operator resolves the image **by digest**; the tag is
 display-only and the next push moves it.
@@ -338,6 +438,8 @@ display-only and the next push moves it.
 
 ```sh
 hack/images/mlx-serve/selftest.sh
+hack/images/mlx-serve/selftest.sh --case serve.image.remote   # one check alone
+hack/images/mlx-serve/selftest.sh --case serve.model.routes   # one check alone
 ```
 
 Runs in seconds on any Mac and needs neither uv nor a `k3sm` binary: it checks

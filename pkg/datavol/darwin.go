@@ -20,11 +20,13 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -215,15 +217,41 @@ func (Darwin) Delete(ctx context.Context, uuid string) error {
 // expected answer described above and counts as success; any other failure is
 // returned, and the caller logs it without failing the mount.
 func (Darwin) SpotlightOff(ctx context.Context, mountpoint string) error {
+	return spotlightOff(ctx, mountpoint, mdutilDeadline, "mdutil", "-i", "off", mountpoint)
+}
+
+// mdutilDeadline bounds the mdutil call in SpotlightOff. mdutil normally
+// answers in well under a second, so 15 s leaves a heavily loaded machine
+// (a mount during install, with the disk busy) room to answer, while keeping a
+// stuck call from holding a mount or a migration for long. The marker file is
+// already written when the call starts, so running out of time costs nothing.
+const mdutilDeadline = 15 * time.Second
+
+// mdutilWaitDelay is how long run waits for a killed mdutil's pipes to close
+// before it abandons them, so a descendant that inherited them cannot keep the
+// call blocked past its deadline.
+const mdutilWaitDelay = 2 * time.Second
+
+// spotlightOff writes the marker, then runs the given mdutil command under its
+// own deadline. It is separate from SpotlightOff so a test can stand in a
+// different command and a short deadline.
+func spotlightOff(ctx context.Context, mountpoint string, deadline time.Duration, name string, args ...string) error {
 	marker := filepath.Join(mountpoint, spotlightMarkerName)
 	if err := os.WriteFile(marker, nil, 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", marker, err)
 	}
-	if _, err := run(ctx, "", "mdutil", "-i", "off", mountpoint); err != nil {
+	mctx, cancel := context.WithTimeout(ctx, deadline)
+	defer cancel()
+	if _, err := runCmd(mctx, mdutilWaitDelay, "", name, args...); err != nil {
+		if mctx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
+			slog.Default().Warn("mdutil did not answer in time; the marker file already excludes the volume",
+				"mountpoint", mountpoint, "deadline", deadline)
+			return nil
+		}
 		if strings.Contains(err.Error(), "unknown indexing state") {
 			return nil
 		}
-		return fmt.Errorf("mdutil -i off %s: %w", mountpoint, err)
+		return fmt.Errorf("%s -i off %s: %w", name, mountpoint, err)
 	}
 	return nil
 }
@@ -286,7 +314,15 @@ func lastLine(s string) string {
 // operator needs verbatim; stdout is returned alongside so a caller can read it
 // too. Nothing is passed through a shell.
 func run(ctx context.Context, stdin, name string, args ...string) (string, error) {
+	return runCmd(ctx, 0, stdin, name, args...)
+}
+
+// runCmd is run with a WaitDelay: when ctx ends and the child is killed, Run
+// stops waiting for the child's output pipes after waitDelay, so a descendant
+// that inherited them cannot hold the call open. Zero keeps the exec default.
+func runCmd(ctx context.Context, waitDelay time.Duration, stdin, name string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.WaitDelay = waitDelay
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
 	}

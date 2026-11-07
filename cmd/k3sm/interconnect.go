@@ -147,8 +147,10 @@ func startInterconnectResolver(ctx context.Context, plan serverPlan, restCfg *re
 		// The interconnect-using MLXModels, read with the same admin client the
 		// MLX operator uses; the desired annotation carries their references.
 		MLXModels: interconnect.MLXModelLister(dyn),
-		Metrics:   plan.interconnectMetrics,
-		Log:       logger,
+		// A change to any MLXModel brings the next reconcile forward.
+		MLXModelWatch: dyn,
+		Metrics:       plan.interconnectMetrics,
+		Log:           logger,
 	})
 	rCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
@@ -291,14 +293,14 @@ func interconnectClients(kubeconfig string) (kubernetes.Interface, dynamic.Inter
 	} else {
 		home, _ := os.UserHomeDir()
 		var kc kubectlConfig
-		kc, err = resolveKubectlConfig(kubectlInputs{
+		kc, err = kubectlVerbConfig("k3sm interconnect", kubectlInputs{
 			workDirOverride: os.Getenv("K3SM_WORK_DIR"),
 			workDir:         workDirFromEnv(),
 			kubeconfigEnv:   os.Getenv("KUBECONFIG"),
 			home:            home,
 			contextName:     installedKubeconfigName(),
 			exists:          fileExists,
-		})
+		}.withInstalledRole())
 		if err != nil {
 			return nil, nil, err
 		}

@@ -398,6 +398,13 @@ func renameAside(parent int) (string, error) {
 	return "", errors.New("no free aside name")
 }
 
+// ReadReleasePin reads the release pin under workDir with the checks the
+// controller holds it to: root owned and writable by no one else. No pin is
+// (nil, nil); a pin it cannot trust or read is an error.
+func ReadReleasePin(workDir string) (*ReleasePin, error) {
+	return readReleasePin(workDir, 0)
+}
+
 // readReleasePin reads the pin under workDir, held to the checks the pin
 // needs: a real directory and a regular file, both owned by owner and writable
 // by no one else. A missing work dir, directory or file is (nil, nil). The

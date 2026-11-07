@@ -36,7 +36,7 @@ import (
 // The helm binary in the payload.
 //
 // helm is the helm controller's Job command[0]. It is a source-built child like
-// kine, etcd and zot: `k3sm payload` builds it from the pinned helm module inside
+// kine and etcd: `k3sm payload` builds it from the pinned helm module inside
 // the wrapper module pkg/helmchart/helmchild (helmchart.HelmBuildArgs, under the
 // stagedChild protocol, so it lands signed beside its helmchart.HelmMarkerName
 // marker); `k3sm install` stages the payload; seedBinDir copies it into the work

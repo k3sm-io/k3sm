@@ -94,6 +94,19 @@ const (
 	// No upstream analogue, for the FailedEmptyDirMedium reason: a kubelet that
 	// cannot serve a projected source is not a state upstream models.
 	reasonFailedProjectedSource = "FailedProjectedSource"
+	// reasonFailedVolumeSource is recorded when a container mounts a volume
+	// whose source the translation does not model (hostPath, nfs, csi, a
+	// generic ephemeral volume, ...), so the pod is refused BEFORE the CreatePod
+	// RPC (toVolume). No upstream analogue, for the FailedEmptyDirMedium reason.
+	reasonFailedVolumeSource = "FailedVolumeSource"
+	// reasonArtifactPullRefused is recorded when a mounted image volume's reference
+	// does not name the cluster registry, or this node maps none, so the pod is
+	// refused BEFORE the CreatePod RPC and nothing is fetched (toVolume). It is
+	// one of the stable artifact reasons, shared with the runtime's own refusal:
+	// runtimed's CreatePod error for an image volume begins with this text, and
+	// a pod parked on its foreign-registry refusal reports it as its waiting
+	// reason too (artifactWaitingReason).
+	reasonArtifactPullRefused = "ArtifactPullRefused"
 	// reasonFailedCreatePodSandBox is recorded when a vm pod is refused BEFORE
 	// the CreatePod RPC because its kernel hostname cannot be derived from the
 	// spec (podHostname): an invalid hostnameOverride, hostname or subdomain, or
@@ -102,8 +115,9 @@ const (
 	// upstream does.
 	reasonFailedCreatePodSandBox = "FailedCreatePodSandBox"
 	// reasonFailedGPUFit is recorded when a pod requesting the GPU extended
-	// resource does not fit in this node's GPU memory beside the GPU pods already
-	// admitted, so the pod is refused BEFORE the CreatePod RPC.
+	// resource does not fit in this node's GPU memory, or in its GPU slots counted
+	// over both resource names, beside the GPU pods already admitted, so the pod is
+	// refused BEFORE the CreatePod RPC.
 	//
 	// Like FailedImagePlatform it has no upstream analogue: the GPU slot count is a
 	// memory-derived co-tenancy budget, not a device count, so there is no kubelet
@@ -161,7 +175,21 @@ const (
 	// instances, and a container whose shim died loses its exit status and
 	// exec.
 	reasonPodReattached = "PodReattached"
+	// reasonImageEditNotApplied is recorded when spec.containers[].image changes
+	// on a vm pod the runtime holds. The kubelet would restart the container on the
+	// new image. Here the container stays on the old one: the runtime's UpdatePod
+	// applies labels and annotations only, its RestartContainer re-spawns from the
+	// same spec, and a guest's rootfs is shared to it once, at boot. The reason has
+	// no upstream analogue, because upstream the edit always applies.
+	reasonImageEditNotApplied = "ImageEditNotApplied"
 )
+
+// msgImageEditNotApplied is the reasonImageEditNotApplied message. running is
+// what the runtime reports the container on, and edited is what the spec names.
+func msgImageEditNotApplied(container, running, edited string) string {
+	return fmt.Sprintf("Container %q stays on image %q: the spec now names %q, which a running vm pod "+
+		"cannot apply in place. Recreate the pod to run the new image.", container, running, edited)
+}
 
 // msgPodReattached is the PodReattached Event message: what survived the node
 // daemon's restart and what did not, in the terms an operator acts on.
@@ -374,6 +402,26 @@ func msgFailedProjectedSource(volume, kind string) string {
 		"secret source.", volume, kind)
 }
 
+// msgFailedVolumeSource is the FailedVolumeSource-event message for a pod
+// that mounts a volume whose source this node does not model. It carries the
+// volume name, the pod's own spec, and a fixed kind token; never a host path, a
+// server or a driver name.
+func msgFailedVolumeSource(volume, kind string) string {
+	return fmt.Sprintf("Error: volume %q has a source of kind %s, which this node cannot provide, and a "+
+		"container mounts it. Use a persistentVolumeClaim, or remove the volume and its mounts.", volume, kind)
+}
+
+// msgArtifactPullRefused is the ArtifactPullRefused-event message for a pod
+// whose image volume does not name the cluster registry. It names the volume
+// and the registry the node accepts, never the pod's reference.
+func msgArtifactPullRefused(volume, clusterRegistry string) string {
+	if clusterRegistry == "" {
+		return fmt.Sprintf("Error: image volume %q cannot be served: this node maps no cluster registry.", volume)
+	}
+	return fmt.Sprintf("Error: image volume %q does not name the cluster registry. Push the artifact to "+
+		"the cluster registry and reference it as %s/<repository>.", volume, clusterRegistry)
+}
+
 // msgFailedGPUFit is the FailedGPUFit-event message for a GPU pod refused for
 // want of GPU memory beside the pods already admitted.
 //
@@ -389,8 +437,8 @@ func msgFailedProjectedSource(volume, kind string) string {
 func msgFailedGPUFit(want, admitted, ceiling int64) string {
 	return fmt.Sprintf("Error: this pod needs %s of GPU memory, but %s of the node's %s usable GPU memory "+
 		"is already committed to admitted GPU pods, so it cannot be started without overcommitting the GPU. "+
-		"Delete or shrink another pod requesting %s, or lower this pod's memory limit to fit in what is left.",
-		gpuFitGiB(want), gpuFitGiB(admitted), gpuFitGiB(ceiling), mlxv1alpha1.ResourceGPU)
+		"Delete or shrink another pod requesting %s or %s, or lower this pod's memory limit to fit in what is left.",
+		gpuFitGiB(want), gpuFitGiB(admitted), gpuFitGiB(ceiling), runtimev1.ResourceGPU, mlxv1alpha1.ResourceGPU)
 }
 
 // msgFailedGPUUnbounded is the FailedGPUFit-event message for a GPU pod that
@@ -401,12 +449,23 @@ func msgFailedGPUFit(want, admitted, ceiling int64) string {
 // memory budget), but the text is a different one: naming the three byte counts
 // would be misleading here, since the missing number is the pod's own. The way
 // out is stated as the field to set, because that is the whole fix, and every
-// MLXModel-rendered pod already carries it.
-func msgFailedGPUUnbounded(ceiling int64) string {
+// MLXModel-rendered pod already carries it. gpu is the name the pod asked under.
+func msgFailedGPUUnbounded(gpu corev1.ResourceName, ceiling int64) string {
 	return fmt.Sprintf("Error: this pod requests %s but declares no memory limit on every container, so the node "+
 		"cannot fit it against its %s of usable GPU memory and would be overcommitting the GPU by an amount "+
 		"nothing can measure. Set spec.containers[].resources.limits.memory on every container.",
-		mlxv1alpha1.ResourceGPU, gpuFitGiB(ceiling))
+		gpu, gpuFitGiB(ceiling))
+}
+
+// msgFailedGPUSlots is the FailedGPUFit-event message for a pod refused by the cap
+// over both resource names. It says why the scheduler bound a pod the node will not
+// run, since the Pod reads as scheduled, and both ways out name both resources
+// because the holder may be under either.
+func msgFailedGPUSlots(want, held, slots int64) string {
+	return fmt.Sprintf("Error: this pod needs %d GPU slot(s), but %d of the node's %d are already held by admitted pods. "+
+		"The scheduler counts %s and %s separately and does not count a pod that sets spec.nodeName, so it can place "+
+		"more pods on a node than it has slots. Delete another pod requesting %s or %s, or wait for one to finish.",
+		want, held, slots, runtimev1.ResourceGPU, mlxv1alpha1.ResourceGPU, runtimev1.ResourceGPU, mlxv1alpha1.ResourceGPU)
 }
 
 // gpuFitGiB renders a byte count as the binary quantity a pod's memory limit is

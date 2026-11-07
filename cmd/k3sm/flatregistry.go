@@ -47,7 +47,7 @@ const flatRegistryHost = "registry-k3sm:6450"
 // flatRegistryEndpoint is where this node's runtime fetches the flat registry
 // name from. The zero value maps nothing.
 //
-// The server side provides: the registry on the server, serving zot on loopback
+// The server side provides: the registry on the server, serving on loopback
 // at the server's --registry-port, and a TLS listener on the server's mesh
 // address at the same port whose certificate is issued by the cluster CA and
 // names registry-k3sm, published as the flat Service's EndpointSlice. This file depends on neither being up: an
@@ -72,7 +72,7 @@ type flatRegistryEndpoint struct {
 //
 // Loopback HTTP rather than the TLS listener, deliberately: the TLS listener is
 // the cluster-facing door and is reached by name from Pods and by mesh address
-// from agents, but the server's own runtime is on the same Mac as zot, and a
+// from agents, but the server's own runtime is on the same Mac as the registry, and a
 // loopback hop never leaves it. TLS there would protect nothing a local root
 // could not already read, and content integrity never rested on the transport:
 // every blob is re-hashed against its manifest digest before it is committed.

@@ -20,8 +20,10 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -114,7 +116,7 @@ func TestEmptying(t *testing.T) {
 }
 
 // TestBrakeBoundary: the brake stops a plan over more than half of the
-// blobs, and lets exactly half through.
+// blobs the rows describe, and lets exactly half through.
 func TestBrakeBoundary(t *testing.T) {
 	c := &Collector{log: slog.New(slog.NewTextHandler(io.Discard, nil)), now: time.Now, abandon: AbandonFactor * grace}
 	at := time.Now()
@@ -127,12 +129,13 @@ func TestBrakeBoundary(t *testing.T) {
 	}
 	idx := ispec.Index{Manifests: []ispec.Descriptor{{Digest: ds[0], Annotations: map[string]string{ispec.AnnotationRefName: "v1"}}}}
 	cont := store.Contents{Blobs: blobs, IndexModTime: at}
+	r := reads{ds[0]: {present: true, named: ds[1:]}}
 	for reap, stop := range map[int]bool{0: false, 1: false, 3: false, 4: true, 6: true} {
 		p := plan{blobs: map[digest.Digest]bool{}}
 		for _, d := range ds[:reap] {
 			p.blobs[d] = true
 		}
-		err := c.brake(name(t, "app"), p, idx, cont)
+		_, err := c.brake(name(t, "app"), p, idx, cont, r)
 		if got := errors.Is(err, ErrMassDelete); got != stop {
 			t.Errorf("%d of 6: stopped %v (%v), want %v", reap, got, err, stop)
 		}
@@ -306,4 +309,124 @@ func objectsOf(rep Report, k Kind, repo string) []string {
 		}
 	}
 	return out
+}
+
+// TestPusherCannotHoldTheBrakeForGood: blobs no row names and no manifest body
+// mentions do not count against the half brake while a row stays, so a pusher
+// who uploads them next to a tagged image cannot stop the repository's sweeps.
+// The orphans go by the grace rule, and the image stays whole. The brake still
+// stops a plan that would reap more than half of what the rows describe, the
+// orphans neither diluting it nor tipping it.
+func TestPusherCannotHoldTheBrakeForGood(t *testing.T) {
+	t.Run("orphans next to a tagged image are reaped", testOrphansNextToATag)
+	t.Run("a reference the parse misses still counts", testMissedReferenceStillBrakes)
+}
+
+func testOrphansNextToATag(t *testing.T) {
+	e := newEnv(t)
+	n := name(t, "app")
+	e.clk.set(-2 * time.Hour)
+	img := e.push(t, n, "v1", "app", []byte("layer"))
+	var orphans []digest.Digest
+	for i := range 10 {
+		orphans = append(orphans, e.blob(t, n, []byte{'o', byte('0' + i)}).Digest)
+	}
+	c := e.collector(t, -3*time.Hour)
+	e.ran(t)
+	e.clk.set(0)
+
+	for i := range 2 {
+		rep, err := c.Sweep(e.ctx)
+		if err != nil || len(rep.Stopped) != 0 {
+			t.Fatalf("sweep %d: %+v, %v; want no stop", i, rep, err)
+		}
+	}
+	for _, d := range orphans {
+		if e.has(n, d) {
+			t.Errorf("orphan %s survived", d)
+		}
+	}
+	if err := e.whole(n, img); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// testMissedReferenceStillBrakes stands in for a parse that misses a reference:
+// a tagged manifest names four blobs in a field the collector does not follow,
+// so its plan reaps them. They are four of the seven blobs the rows describe, so
+// the brake stops it, however many orphans sit beside them.
+func testMissedReferenceStillBrakes(t *testing.T) {
+	e := newEnv(t)
+	n := name(t, "app")
+	e.clk.set(-2 * time.Hour)
+	cfg, layer := e.blob(t, n, []byte(`{"seed":"cfg"}`)), e.blob(t, n, []byte("layer"))
+	var skipped []string
+	var missed []digest.Digest
+	for _, b := range []string{"m1", "m2", "m3", "m4"} {
+		d := e.blob(t, n, []byte(b)).Digest
+		missed = append(missed, d)
+		skipped = append(skipped, rawDesc(d))
+	}
+	body := manifestBody(t, cfg, []ispec.Descriptor{layer}, nil)
+	body = append(body[:len(body)-1], []byte(`,"blobsTheParseSkips":[`+strings.Join(skipped, ",")+`]}`)...)
+	if err := Readable(body); err != nil {
+		t.Fatal(err)
+	}
+	e.putManifest(t, n, "v1", ispec.MediaTypeImageManifest, body)
+	var orphans []digest.Digest
+	for i := range 10 {
+		orphans = append(orphans, e.blob(t, n, []byte{'o', byte('0' + i)}).Digest)
+	}
+	c := e.collector(t, -3*time.Hour)
+	e.ran(t)
+	e.clk.set(0)
+
+	rep, err := c.Sweep(e.ctx)
+	if !errors.Is(err, ErrMassDelete) || !slices.Equal(rep.Stopped, []string{"app"}) {
+		t.Fatalf("sweep: %+v, %v; want ErrMassDelete for app", rep, err)
+	}
+	if !strings.Contains(err.Error(), "4 of 7") {
+		t.Errorf("sweep: %v; want the brake to count 4 of 7 described blobs", err)
+	}
+	if !e.hasAll(n, append(missed, orphans...)) {
+		t.Fatal("the stopped sweep deleted a blob")
+	}
+}
+
+// TestUnverifiedBodyCountsEveryBlob: a kept body that fails its hash names
+// nothing the brake can see, so the brake cannot tell what the rows describe and
+// counts every blob of the repository, as it did before it counted only described
+// ones. Here an unreadable index child names, through the scan, a blob whose
+// bytes no longer hash to its name, and orphans are more than half the blobs.
+func TestUnverifiedBodyCountsEveryBlob(t *testing.T) {
+	e := newEnv(t)
+	n := name(t, "app")
+	e.clk.set(-2 * time.Hour)
+	bad := e.blob(t, n, []byte("the bytes this digest names"))
+	root := e.blob(t, n, unreadableBody(bad.Digest))
+	root.MediaType = ispec.MediaTypeImageIndex
+	e.putManifest(t, n, "idx", ispec.MediaTypeImageIndex, indexBody(t, root))
+	var orphans []digest.Digest
+	for i := range 4 {
+		orphans = append(orphans, e.blob(t, n, []byte{'o', byte('0' + i)}).Digest)
+	}
+	p := e.blobFile(t, n, bad.Digest)
+	if err := os.Remove(p); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte("other bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e.backdate(t, p, -2*time.Hour)
+	c := e.collector(t, -3*time.Hour)
+	e.ran(t)
+	e.clk.set(0)
+
+	rep, err := c.Sweep(e.ctx)
+	if !errors.Is(err, ErrMassDelete) || !slices.Equal(rep.Stopped, []string{"app"}) {
+		t.Fatalf("sweep: %+v, %v; want ErrMassDelete for app (4 of 7 blobs)", rep, err)
+	}
+	if !e.hasAll(n, orphans) {
+		t.Fatal("the stopped sweep reaped an orphan")
+	}
 }

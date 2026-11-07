@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -33,9 +34,36 @@ import (
 	"k3sm.io/k3sm/pkg/ociregistry/ref"
 )
 
-// tempPrefix starts the name replaceBlob links a verified source under before
-// renaming it over a blob. A file with it is never a blob.
+// tempPrefix starts the name a verified source is linked under, in tempsDir,
+// before it is renamed over a blob. A file with it is never a blob.
 const tempPrefix = ".tmp-"
+
+// tempName returns a new temp path in repo's tempsDir,
+// making the directory when it is missing. The caller holds repo's lock and
+// removes the name when it does not rename it. A tempsDir that is not a directory,
+// a symlink included, fails it.
+func (s *Store) tempName(repo string) (string, error) {
+	id, err := newID()
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(repo, tempsDir)
+	fi, err := os.Lstat(dir)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		if err := s.mkdirs(dir); err != nil {
+			return "", err
+		}
+		if err := syncDir(repo); err != nil {
+			return "", err
+		}
+	case err != nil:
+		return "", err
+	case !fi.IsDir():
+		return "", fmt.Errorf("%w: %s is not a directory", ErrNotRegular, dir)
+	}
+	return filepath.Join(dir, tempPrefix+id), nil
+}
 
 // SetClock replaces the clock blob mtimes are touched with. It exists for
 // callers that inject a clock (GC tests); call it before the store is in use.
@@ -56,12 +84,21 @@ type Blob struct {
 	ModTime time.Time
 }
 
-// Temp is a .tmp-<uuid> file in blobs/<algorithm>/: a link replaceBlob made
-// and a crash left before its rename.
+// Temp is a .tmp-<uuid> file: a link a blob replacement made and a crash left
+// before its rename. It is in tempsDir, with no Algorithm, or, from a build that
+// linked beside the blob, in blobs/<Algorithm>/.
 type Temp struct {
 	Algorithm string
 	Name      string
 	ModTime   time.Time
+}
+
+// Path is the temp's path inside its repository.
+func (t Temp) Path() string {
+	if t.Algorithm == "" {
+		return filepath.Join(tempsDir, t.Name)
+	}
+	return filepath.Join(blobsDir, t.Algorithm, t.Name)
 }
 
 // Session is an upload session file with its link count. A count above one is
@@ -140,6 +177,9 @@ func contents(dir string) (Contents, error) {
 			}
 		}
 	}
+	if err := tempContents(dir, &c); err != nil {
+		return Contents{}, err
+	}
 	ents, err := os.ReadDir(filepath.Join(dir, uploadsDir))
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return Contents{}, fmt.Errorf("list uploads: %w", err)
@@ -160,6 +200,42 @@ func contents(dir string) (Contents, error) {
 	}
 	slices.SortFunc(c.Blobs, func(a, b Blob) int { return strings.Compare(a.Digest.String(), b.Digest.String()) })
 	return c, nil
+}
+
+// tempContents adds what tempsDir holds to c. A tempsDir that is not a directory
+// is one unknown entry and is not followed.
+func tempContents(dir string, c *Contents) error {
+	temps := filepath.Join(dir, tempsDir)
+	fi, err := os.Lstat(temps)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("list temps: %w", err)
+	}
+	if !fi.IsDir() {
+		c.Unknown++
+		return nil
+	}
+	ents, err := os.ReadDir(temps)
+	if err != nil {
+		return fmt.Errorf("list temps: %w", err)
+	}
+	for _, e := range ents {
+		fi, err := e.Info()
+		if errors.Is(err, os.ErrNotExist) {
+			continue // removed meanwhile
+		}
+		if err != nil {
+			return err
+		}
+		if !fi.Mode().IsRegular() || !isTempName(e.Name()) {
+			c.Unknown++
+			continue
+		}
+		c.Temps = append(c.Temps, Temp{Name: e.Name(), ModTime: fi.ModTime()})
+	}
+	return nil
 }
 
 // isAlgorithm reports whether name is a digest algorithm the store holds.
@@ -217,8 +293,9 @@ func (l *Locked) SetRows(rows []ispec.Descriptor) error {
 	if err != nil {
 		return err
 	}
+	prev := len(idx.Manifests)
 	idx.Manifests = rows
-	return l.s.writeIndex(l.dir, idx)
+	return l.s.writeIndex(l.dir, idx, prev)
 }
 
 // StatBlob re-states blob d.
@@ -240,6 +317,28 @@ func (l *Locked) StatBlob(d digest.Digest) (Blob, error) {
 	return Blob{Digest: d, Size: fi.Size(), ModTime: fi.ModTime()}, nil
 }
 
+// TouchBlob sets blob d's mtime to now, and fails with ErrBlobUnknown when the
+// repository does not hold it. A sweep re-states a candidate under the same
+// lock before it deletes, so it sees the fresh mtime.
+func (l *Locked) TouchBlob(d digest.Digest) error {
+	p, err := l.s.blobPath(l.n, d)
+	if err != nil {
+		return err
+	}
+	f, err := openRegular(p, os.O_RDONLY)
+	if errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("%w: %s in %s", ErrBlobUnknown, d, l.n)
+	}
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := l.s.setTimes(f, l.s.now()); err != nil {
+		return fmt.Errorf("touch blob %s in %s: %w", d, l.n, err)
+	}
+	return nil
+}
+
 // RemoveBlob removes blob d's name from the repository. The inode stays
 // while another repository links it.
 func (l *Locked) RemoveBlob(d digest.Digest) error {
@@ -253,13 +352,13 @@ func (l *Locked) RemoveBlob(d digest.Digest) error {
 	return os.Remove(p)
 }
 
-// RemoveTemp removes a .tmp-<uuid> link. Under the lock no replaceBlob of
+// RemoveTemp removes a .tmp-<uuid> link. Under the lock no blob replacement of
 // this repository is in flight, so any temp link found is a crash's.
 func (l *Locked) RemoveTemp(t Temp) error {
-	if !isTempName(t.Name) || !isAlgorithm(t.Algorithm) {
+	if !isTempName(t.Name) || (t.Algorithm != "" && !isAlgorithm(t.Algorithm)) {
 		return fmt.Errorf("remove temp %s/%s: not a temp link", t.Algorithm, t.Name)
 	}
-	p, err := l.s.path(l.n, blobsDir, t.Algorithm, t.Name)
+	p, err := l.s.path(l.n, t.Path())
 	if err != nil {
 		return err
 	}
@@ -349,7 +448,7 @@ func (l *Locked) ReapSession(id string, idleBefore time.Time) (SessionVerdict, e
 }
 
 // RemoveLayout removes an empty repository's layout: oci-layout, index.json,
-// blobs/ and .uploads/. It removes nothing and reports false unless
+// blobs/, .uploads/ and .temps/. It removes nothing and reports false unless
 // index.json has no rows, was last written at or before idleBefore, and the
 // directory holds no blob, temp link, session or unknown entry. The directory
 // itself stays, since another repository's name may nest under it.
@@ -380,7 +479,12 @@ func (l *Locked) RemoveLayout(idleBefore time.Time) (bool, error) {
 			}
 		}
 	}
-	dirs := []string{filepath.Join(l.dir, uploadsDir)}
+	// The record goes after index.json: a layout recreated over a record left
+	// by a crash here starts its count again (writeIndex, prev -1).
+	if err := l.s.removeRowCount(l.dir); err != nil {
+		return false, err
+	}
+	dirs := []string{filepath.Join(l.dir, uploadsDir), filepath.Join(l.dir, tempsDir)}
 	for _, a := range algs {
 		dirs = append(dirs, filepath.Join(l.dir, blobsDir, a.Name()))
 	}
@@ -391,4 +495,133 @@ func (l *Locked) RemoveLayout(idleBefore time.Time) (bool, error) {
 		}
 	}
 	return true, syncDir(l.dir)
+}
+
+// ReapHalfRemovedLayouts removes the layout a stopped RemoveLayout left: a
+// directory holding oci-layout and no index.json, so no longer listed as a
+// repository. It returns the names it reaped. Each candidate is found without
+// the lock, then re-read under its repository lock, and reaped only when it
+// still holds oci-layout, no index.json, no blob, no upload and no entry the
+// store does not recognise: blobs/ may hold only empty algorithm directories
+// and .uploads/ and .temps/ must be empty. Directories of nested names are left
+// alone.
+//
+// A push builds a layout under the same lock (initLocked): directories,
+// oci-layout, then an index.json staged in .uploads and renamed in. The state
+// "oci-layout and no index.json" therefore exists for a live push only while
+// it holds the lock, which this method needs to look; and the staged file sits
+// in .uploads, which keeps the layout from being reaped even then.
+func (s *Store) ReapHalfRemovedLayouts(ctx context.Context) ([]ref.Name, error) {
+	var cands []ref.Name
+	err := filepath.WalkDir(s.root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if p == s.root || !d.IsDir() {
+			return nil
+		}
+		base := d.Name()
+		if base == blobsDir || strings.HasPrefix(base, ".") || strings.HasPrefix(base, "_") {
+			return fs.SkipDir
+		}
+		n, err := ref.NameFromDir(s.root, p)
+		if err != nil {
+			return fs.SkipDir
+		}
+		if halfRemoved(p) {
+			cands = append(cands, n)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list half-removed layouts: %w", err)
+	}
+	var out []ref.Name
+	for _, n := range cands {
+		if s.halfFound != nil {
+			s.halfFound(n)
+		}
+		ok, err := s.reapHalfRemoved(ctx, n)
+		if err != nil {
+			return out, fmt.Errorf("reap half-removed layout %s: %w", n, err)
+		}
+		if ok {
+			out = append(out, n)
+		}
+	}
+	return out, nil
+}
+
+// halfRemoved reports whether dir holds a regular oci-layout and no index.json.
+func halfRemoved(dir string) bool {
+	fi, err := os.Lstat(filepath.Join(dir, layoutFile))
+	if err != nil || !fi.Mode().IsRegular() {
+		return false
+	}
+	_, err = os.Lstat(filepath.Join(dir, indexFile))
+	return errors.Is(err, os.ErrNotExist)
+}
+
+func (s *Store) reapHalfRemoved(ctx context.Context, n ref.Name) (bool, error) {
+	dir, err := s.repoDir(n)
+	if err != nil {
+		return false, err
+	}
+	unlock, err := s.lock(ctx, n)
+	if err != nil {
+		return false, err
+	}
+	defer unlock()
+	if !halfRemoved(dir) {
+		return false, nil
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return false, err
+	}
+	rm := []string{filepath.Join(dir, layoutFile)}
+	var algs []string
+	for _, e := range ents {
+		switch {
+		case e.Name() == layoutFile, e.IsDir() && e.Name() != blobsDir && e.Name() != uploadsDir && e.Name() != tempsDir:
+			// oci-layout, or a nested repository name's directory
+		case e.Name() == tempsDir && e.IsDir():
+			sub, err := os.ReadDir(filepath.Join(dir, tempsDir))
+			if err != nil || len(sub) > 0 {
+				return false, err
+			}
+			rm = append(rm, filepath.Join(dir, tempsDir))
+		case e.Name() == uploadsDir && e.IsDir():
+			sub, err := os.ReadDir(filepath.Join(dir, uploadsDir))
+			if err != nil || len(sub) > 0 {
+				return false, err
+			}
+			rm = append(rm, filepath.Join(dir, uploadsDir))
+		case e.Name() == blobsDir && e.IsDir():
+			sub, err := os.ReadDir(filepath.Join(dir, blobsDir))
+			if err != nil {
+				return false, err
+			}
+			for _, a := range sub {
+				ae, err := os.ReadDir(filepath.Join(dir, blobsDir, a.Name()))
+				if !a.IsDir() || err != nil || len(ae) > 0 {
+					return false, nil
+				}
+				algs = append(algs, filepath.Join(dir, blobsDir, a.Name()))
+			}
+			algs = append(algs, filepath.Join(dir, blobsDir))
+		default:
+			return false, nil // a file or kind the store does not recognise
+		}
+	}
+	rm = append(rm, algs...)
+	for _, d := range rm {
+		if err := os.Remove(d); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return false, err
+		}
+	}
+	if err := s.removeRowCount(dir); err != nil {
+		return false, err
+	}
+	return true, syncDir(dir)
 }

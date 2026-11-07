@@ -44,8 +44,8 @@ import (
 // index under its own lock, and its GC reclaims the blobs.
 
 // PruneGrace is how old an untagged manifest must be before prune deletes it.
-// It equals zot's own GC delay (gcDelay, pinned equal by a test), for the same
-// reason: a multi-platform push uploads its per-platform manifests untagged
+// It equals the server's GC grace (serveGCGrace, pinned equal by a test), for
+// the same reason: a multi-platform push uploads its per-platform manifests untagged
 // BEFORE the index that names them, and a prune that deleted them in that
 // window would fail the push.
 const PruneGrace = time.Hour
@@ -98,8 +98,8 @@ type KeptManifest struct {
 // PrunePlan is what a prune would delete from the registry and which untagged
 // manifests it keeps. Tagged manifests are never in either list.
 type PrunePlan struct {
-	// Delete lists, per repository, image indexes before plain manifests: zot
-	// refuses to delete a manifest an index in the same repository still names.
+	// Delete lists, per repository, image indexes before plain manifests: the
+	// registry refuses to delete a manifest an index in the same repository still names.
 	Delete []StoredManifest
 	Kept   []KeptManifest
 	// Unreadable lists the repositories whose index.json could not be read, so

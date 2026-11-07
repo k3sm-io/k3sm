@@ -69,24 +69,7 @@ func (s *Store) TouchBlob(ctx context.Context, n ref.Name, d digest.Digest) erro
 	if _, err := s.StatBlob(n, d); err != nil {
 		return err
 	}
-	err := s.WithLock(ctx, n, func(l *Locked) error {
-		p, err := s.blobPath(n, d)
-		if err != nil {
-			return err
-		}
-		f, err := openRegular(p, os.O_RDONLY)
-		if errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("%w: %s in %s", ErrBlobUnknown, d, n)
-		}
-		if err != nil {
-			return err
-		}
-		defer f.Close()
-		if err := s.setTimes(f, s.now()); err != nil {
-			return fmt.Errorf("touch blob %s in %s: %w", d, n, err)
-		}
-		return nil
-	})
+	err := s.WithLock(ctx, n, func(l *Locked) error { return l.TouchBlob(d) })
 	if errors.Is(err, ErrRepositoryUnknown) {
 		// GC removed the layout between the stat and the lock.
 		return fmt.Errorf("%w: %s in %s", ErrBlobUnknown, d, n)
@@ -467,8 +450,8 @@ func (s *Store) MountBlob(ctx context.Context, n, from ref.Name, d digest.Digest
 //   - it is another inode (the blob existed, or src was swapped between the
 //     caller's check and the link): its content is hashed, and it is kept only
 //     when it is d. A destination that is not d is replaced atomically by a
-//     link of the verified source under a temp name in the same directory and
-//     a rename over it; no blob file is ever written in place, so every other
+//     link of the verified source under a temp name in .temps and a rename
+//     over it; no blob file is ever written in place, so every other
 //     repository sharing the bad inode keeps exactly what it had.
 //
 // It then touches the blob inode's mtime (futimes on the descriptor), so GC's
@@ -519,7 +502,7 @@ func (s *Store) linkBlob(ctx context.Context, n ref.Name, src string, srcFi os.F
 			return fmt.Errorf("verify blob %s in %s: %w", d, n, err)
 		}
 		if !ok {
-			if err := s.replaceBlob(src, srcFi, srcVerified, dst, d); err != nil {
+			if err := s.replaceBlob(repo, src, srcFi, srcVerified, dst, d); err != nil {
 				return fmt.Errorf("replace corrupt blob %s in %s: %w", d, n, err)
 			}
 			f.Close()
@@ -551,14 +534,13 @@ func verifyFile(f *os.File, d digest.Digest) (bool, error) {
 }
 
 // replaceBlob points dst at the source inode: a link under a temp name
-// (.tmp-<uuid>) in dst's directory, checked to be that inode (and, when the caller has not
-// hashed it, hashed now), then renamed over dst.
-func (s *Store) replaceBlob(src string, srcFi os.FileInfo, srcVerified bool, dst string, d digest.Digest) error {
-	id, err := newID()
+// (.tmp-<uuid>) in repo's .temps, checked to be that inode (and, when the caller has
+// not hashed it, hashed now), then renamed over dst, and both directories synced.
+func (s *Store) replaceBlob(repo, src string, srcFi os.FileInfo, srcVerified bool, dst string, d digest.Digest) error {
+	tmp, err := s.tempName(repo)
 	if err != nil {
 		return err
 	}
-	tmp := filepath.Join(filepath.Dir(dst), ".tmp-"+id)
 	if err := os.Link(src, tmp); err != nil {
 		return err
 	}
@@ -584,5 +566,11 @@ func (s *Store) replaceBlob(src string, srcFi os.FileInfo, srcVerified bool, dst
 			return fmt.Errorf("%w: the source does not hash to %s either", ErrStoreCorrupt, d)
 		}
 	}
-	return os.Rename(tmp, dst)
+	if err := os.Rename(tmp, dst); err != nil {
+		return err
+	}
+	if err := syncDir(filepath.Dir(dst)); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(tmp))
 }

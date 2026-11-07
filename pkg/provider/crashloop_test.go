@@ -285,7 +285,10 @@ func TestRestartOnExitCrashLoopSurface(t *testing.T) {
 		waitRestart(t, "the retried RestartContainer call", func() bool { n, _ := f.restartState(); return n >= 2 })
 
 		// Once the RPC succeeds the loop stops.
+		// The call above is counted before the worker re-arms, so wait for the
+		// timer: a step taken first fires nothing and the retry never comes.
 		f.setRestartErr(nil)
+		waitRestart(t, "the last retry timer armed", clk.HasWaiters)
 		clk.Step(60 * time.Second)
 		waitRestart(t, "the successful RestartContainer call", func() bool {
 			tr.restartMu.Lock()
@@ -870,6 +873,7 @@ func TestRefusedRestartIsVisible(t *testing.T) {
 
 			// Once runtimed restarts it, the refusal text is gone from the surface.
 			f.setRestartResp(nil)
+			waitRestart(t, "the retry timer re-armed after the second refusal", clk.HasWaiters)
 			clk.Step(60 * time.Second)
 			waitRestart(t, "the successful RestartContainer call", func() bool {
 				tr.restartMu.Lock()

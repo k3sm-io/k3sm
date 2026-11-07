@@ -1,0 +1,379 @@
+/*
+Copyright The k3sm Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package api
+
+import (
+	"bytes"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"k3sm.io/k3sm/pkg/ociregistry/ref"
+)
+
+// parkedBody brings first, then blocks until release, then brings rest. parked
+// closes when the first read has happened: the server's reservation precedes
+// that read.
+type parkedBody struct {
+	first, rest []byte
+	parked      chan struct{}
+	release     chan struct{}
+	once        sync.Once
+	failWith    error
+	panicWith   any
+}
+
+func newParked(first, rest int) *parkedBody {
+	return &parkedBody{first: bytes.Repeat([]byte("p"), first), rest: bytes.Repeat([]byte("q"), rest), parked: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (b *parkedBody) Read(p []byte) (int, error) {
+	if len(b.first) > 0 {
+		n := copy(p, b.first)
+		b.first = b.first[n:]
+		b.once.Do(func() { close(b.parked) })
+		return n, nil
+	}
+	<-b.release
+	if b.panicWith != nil {
+		panic(b.panicWith)
+	}
+	if b.failWith != nil {
+		return 0, b.failWith
+	}
+	if len(b.rest) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, b.rest)
+	b.rest = b.rest[n:]
+	return n, nil
+}
+
+// TestUploadSpaceIsHeldInAggregate proves bodies in flight reserve free space
+// together, where each used to be checked alone and N of them could undershoot
+// the floor by N times the check interval. FreeSpace is constant here, as it
+// is while the writers have not yet delivered their bytes.
+func TestUploadSpaceIsHeldInAggregate(t *testing.T) {
+	const kept, spare = 1000, 100
+	newF := func(t *testing.T) *fixture {
+		f := newFixture(t, func(c *Config) {
+			c.MinFreeSpace = kept
+			c.FreeSpace = func() (uint64, error) { return kept + spare, nil }
+		})
+		f.srv.spaceEvery = 60
+		return f
+	}
+	// park starts a PATCH of body on a new session and waits for its first
+	// read; the returned channel gives its answer.
+	park := func(t *testing.T, f *fixture, body *parkedBody, length int64) <-chan *httptest.ResponseRecorder {
+		t.Helper()
+		loc := f.newSessionLoc(t)
+		r := chunked(http.MethodPatch, loc, body)
+		r.ContentLength = length
+		answer := make(chan *httptest.ResponseRecorder, 1)
+		go func() { answer <- f.serve(r) }()
+		<-body.parked
+		return answer
+	}
+	small := func(t *testing.T, f *fixture) *httptest.ResponseRecorder {
+		t.Helper()
+		return f.serve(chunked(http.MethodPatch, f.newSessionLoc(t), strings.NewReader("tiny")))
+	}
+
+	t.Run("bodies of unknown length share the room", func(t *testing.T) {
+		f := newF(t)
+		body := newParked(10, 0)
+		answer := park(t, f, body, -1)
+		// 60 are held of the 100 to spare, so a second body cannot take 60.
+		want(t, small(t, f), http.StatusInsufficientStorage, codeSizeInvalid)
+		close(body.release)
+		want(t, <-answer, http.StatusAccepted, "")
+		want(t, small(t, f), http.StatusAccepted, "")
+	})
+	t.Run("a known length is held whole and refused before a byte is written", func(t *testing.T) {
+		f := newF(t)
+		body := newParked(10, 50)
+		answer := park(t, f, body, 60)
+		loc := f.newSessionLoc(t)
+		want(t, f.do(http.MethodPatch, loc, bytes.Repeat([]byte("k"), 60)), http.StatusInsufficientStorage, codeSizeInvalid)
+		if got := f.sessionSize(t, loc); got != 0 {
+			t.Fatalf("the refused chunk left %d bytes", got)
+		}
+		// What is left of the room still fits.
+		want(t, f.do(http.MethodPatch, loc, bytes.Repeat([]byte("k"), 40)), http.StatusAccepted, "")
+		close(body.release)
+		want(t, <-answer, http.StatusAccepted, "")
+	})
+	t.Run("a finished body holds nothing", func(t *testing.T) {
+		f := newF(t)
+		body := newParked(50, 10)
+		answer := park(t, f, body, 60)
+		close(body.release)
+		want(t, <-answer, http.StatusAccepted, "")
+		want(t, f.do(http.MethodPatch, f.newSessionLoc(t), bytes.Repeat([]byte("k"), spare)), http.StatusAccepted, "")
+	})
+	t.Run("a body of exactly the room finishes, across a re-check and its EOF", func(t *testing.T) {
+		f := newF(t)
+		want(t, f.do(http.MethodPatch, f.newSessionLoc(t), bytes.Repeat([]byte("k"), spare)), http.StatusAccepted, "")
+	})
+	for _, tc := range []struct {
+		name string
+		arm  func(*parkedBody)
+	}{
+		{"a body that fails gives its share back", func(b *parkedBody) { b.failWith = fmt.Errorf("client gone") }},
+		{"a body that panics gives its share back", func(b *parkedBody) { b.panicWith = "reader bug" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newF(t)
+			body := newParked(10, 0)
+			tc.arm(body)
+			answer := park(t, f, body, -1)
+			close(body.release)
+			if w := <-answer; w.Code < 400 {
+				t.Fatalf("status %d", w.Code)
+			}
+			want(t, small(t, f), http.StatusAccepted, "")
+		})
+	}
+}
+
+// TestSpaceSharePerPrincipal proves one principal cannot hold the whole shared
+// reservation: a writer that declares a large Content-Length and trickles would
+// otherwise answer every other principal 507 until the body floor cut it. It
+// covers both paths a body takes, a chunk and a monolithic upload, and pins
+// that a mount, which reads no body, needs no room.
+func TestSpaceSharePerPrincipal(t *testing.T) {
+	const kept, spare = 1000, 100
+	const who = "X-Test-Principal"
+	newF := func(t *testing.T) (*fixture, *atomic.Uint64) {
+		free := &atomic.Uint64{}
+		free.Store(kept + spare)
+		f := newFixture(t, func(c *Config) {
+			c.MinFreeSpace = kept
+			c.FreeSpace = func() (uint64, error) { return free.Load(), nil }
+			c.Principal = func(r *http.Request) string { return r.Header.Get(who) }
+		})
+		f.srv.spaceEvery = 60
+		return f, free
+	}
+	// start serves r with body and returns once its first read happened or
+	// its answer is in, whichever comes first.
+	start := func(t *testing.T, f *fixture, r *http.Request, body *parkedBody, length int64, principal string) <-chan *httptest.ResponseRecorder {
+		t.Helper()
+		r.ContentLength = length
+		r.Header.Set(who, principal)
+		answer := make(chan *httptest.ResponseRecorder, 1)
+		t.Cleanup(func() {
+			select {
+			case <-body.release:
+			default:
+				close(body.release)
+			}
+		})
+		go func() { answer <- f.serve(r) }()
+		select {
+		case <-body.parked:
+		case w := <-answer:
+			answer <- w
+		}
+		return answer
+	}
+	patch := func(t *testing.T, f *fixture, n int, principal string) *httptest.ResponseRecorder {
+		t.Helper()
+		return f.do(http.MethodPatch, f.newSessionLoc(t), bytes.Repeat([]byte("k"), n), who, principal)
+	}
+
+	t.Run("a declared length past the share is refused and leaves the others their room", func(t *testing.T) {
+		f, _ := newF(t)
+		body := newParked(1, spare-1)
+		answer := start(t, f, chunked(http.MethodPatch, f.newSessionLoc(t), body), body, spare, "gate")
+		select {
+		case <-body.parked:
+			t.Errorf("a %d-byte declaration holds the whole room of %d", spare, spare)
+		default:
+			want(t, <-answer, http.StatusInsufficientStorage, codeSizeInvalid)
+		}
+		want(t, patch(t, f, 25, "k3sm"), http.StatusAccepted, "")
+	})
+	t.Run("a chunk trickling at its share leaves the others the rest", func(t *testing.T) {
+		f, _ := newF(t)
+		body := newParked(1, 74)
+		answer := start(t, f, chunked(http.MethodPatch, f.newSessionLoc(t), body), body, 75, "gate")
+		<-body.parked
+		// A second body of the same principal shares its share. The parked
+		// body may have given back the one byte it delivered, so ask for two.
+		want(t, patch(t, f, 2, "gate"), http.StatusInsufficientStorage, codeSizeInvalid)
+		want(t, patch(t, f, 25, "k3sm"), http.StatusAccepted, "")
+		close(body.release)
+		want(t, <-answer, http.StatusAccepted, "")
+		want(t, patch(t, f, 75, "gate"), http.StatusAccepted, "")
+	})
+	t.Run("a monolithic upload holds the share through the same reader", func(t *testing.T) {
+		f, _ := newF(t)
+		body := newParked(1, 74)
+		whole := append(bytes.Clone(body.first), body.rest...)
+		answer := start(t, f, chunked(http.MethodPost, "/v2/app/blobs/uploads/?digest="+dg(whole).String(), body), body, 75, "gate")
+		<-body.parked
+		two := []byte("xy")
+		want(t, f.do(http.MethodPost, "/v2/app/blobs/uploads/?digest="+dg(two).String(), two, who, "gate"), http.StatusInsufficientStorage, codeSizeInvalid)
+		want(t, patch(t, f, 25, "k3sm"), http.StatusAccepted, "")
+		close(body.release)
+		want(t, <-answer, http.StatusCreated, "")
+		// Refused past the share, a monolithic upload leaves no session.
+		big := bytes.Repeat([]byte("b"), 76)
+		f2, _ := newF(t)
+		want(t, f2.do(http.MethodPost, "/v2/app/blobs/uploads/?digest="+dg(big).String(), big, who, "gate"), http.StatusInsufficientStorage, codeSizeInvalid)
+		f2.noUploads(t)
+	})
+	t.Run("a mount reads no body and needs no room", func(t *testing.T) {
+		f, free := newF(t)
+		d := f.pushBlob(t, "src", []byte("mount me"))
+		free.Store(kept)
+		w := f.do(http.MethodPost, "/v2/app/blobs/uploads/?mount="+d.String()+"&from=src", nil, who, "gate")
+		want(t, w, http.StatusCreated, "")
+	})
+	t.Run("a share is given back when the body ends", func(t *testing.T) {
+		f, _ := newF(t)
+		for range 3 {
+			want(t, patch(t, f, 75, "gate"), http.StatusAccepted, "")
+		}
+		f.srv.spaceMu.Lock()
+		defer f.srv.spaceMu.Unlock()
+		if f.srv.spaceHeld != 0 || len(f.srv.spaceHeldBy) != 0 {
+			t.Fatalf("held %d, by principal %v", f.srv.spaceHeld, f.srv.spaceHeldBy)
+		}
+	})
+}
+
+// TestBodyFloorWindow pins what the request body floor counts: a wait before
+// the first read (the session's lock) is not the client's, the overall deadline
+// still runs through it, and windows are consecutive, as the doc now says.
+func TestBodyFloorWindow(t *testing.T) {
+	setup := func(t *testing.T) (*clock, *Server) {
+		c := &clock{t: time.Unix(1000, 0)}
+		f := newFixture(t, func(cfg *Config) {
+			cfg.Now = c.now
+			cfg.BodyWindow = time.Minute
+			cfg.BodyMinBytes = 4
+			cfg.UploadTimeout = time.Hour
+		})
+		return c, f.srv
+	}
+	body := func(s *Server, data string) io.Reader {
+		return s.body(httptest.NewRecorder(), httptest.NewRequest(http.MethodPatch, "/", strings.NewReader(data)))
+	}
+	t.Run("a wait before the first read is not charged to the window", func(t *testing.T) {
+		c, s := setup(t)
+		b := body(s, "abcdef")
+		c.advance(10 * time.Minute)
+		if _, err := b.Read(make([]byte, 4)); err != nil {
+			t.Fatalf("first read after a lock wait = %v", err)
+		}
+	})
+	t.Run("the overall deadline still runs through that wait", func(t *testing.T) {
+		c, s := setup(t)
+		b := body(s, "abcdef")
+		c.advance(time.Hour)
+		if _, err := b.Read(make([]byte, 4)); err != errRequestTooLong {
+			t.Fatalf("read past the upload timeout = %v", err)
+		}
+	})
+	t.Run("a window short of its minimum fails", func(t *testing.T) {
+		c, s := setup(t)
+		b := body(s, "abcdef")
+		if _, err := b.Read(make([]byte, 1)); err != nil {
+			t.Fatal(err)
+		}
+		c.advance(time.Minute)
+		if _, err := b.Read(make([]byte, 1)); err != errBodyTooSlow {
+			t.Fatalf("read after a short window = %v", err)
+		}
+	})
+	t.Run("a burst then silence is the documented slack", func(t *testing.T) {
+		c, s := setup(t)
+		b := body(s, "abcdefgh")
+		if _, err := b.Read(make([]byte, 4)); err != nil {
+			t.Fatal(err)
+		}
+		c.advance(5 * time.Minute) // BodyIdle's read deadline needs a real connection
+		if _, err := b.Read(make([]byte, 1)); err != nil {
+			t.Fatalf("read after a satisfied window = %v", err)
+		}
+		c.advance(time.Minute)
+		if _, err := b.Read(make([]byte, 1)); err != errBodyTooSlow {
+			t.Fatalf("the window after the slack is not held to its minimum: %v", err)
+		}
+	})
+}
+
+// TestCommitForgetsTheSessionOnAPanic proves a commit that panics leaves no
+// entry holding a session slot, whether or not the blob made it in, and that a
+// commit that fails keeps the session's entry for the retry.
+func TestCommitForgetsTheSessionOnAPanic(t *testing.T) {
+	f := newFixture(t, func(c *Config) { c.MaxSessions = 1 })
+	loc := f.newSessionLoc(t)
+	blob := []byte("committed")
+	f.srv.uploadCommitting = func() { panic("commit bug") }
+	want(t, f.do(http.MethodPut, loc+"?digest="+dg(blob).String(), blob), http.StatusInternalServerError, codeUnavailable)
+	f.srv.uploadCommitting = nil
+	if ent := f.srv.sessions.entries(); ent != 0 {
+		t.Fatalf("%d entries after the panic", ent)
+	}
+	want(t, f.do(http.MethodHead, "/v2/app/blobs/"+dg(blob).String(), nil), http.StatusOK, "")
+
+	retry := f.newSessionLoc(t) // the one slot is free
+	wrong := dg([]byte("something else"))
+	want(t, f.do(http.MethodPut, retry+"?digest="+wrong.String(), blob), http.StatusBadRequest, codeDigestInvalid)
+	if ent := f.srv.sessions.entries(); ent != 1 {
+		t.Fatalf("%d entries after a failed commit, want the session's one", ent)
+	}
+}
+
+// TestCatalogAsksOncePerVisit pins the choice that the Authorizer hook keeps no
+// list form: the catalog asks once for the catalog itself and once for each
+// repository it visits, so the visit budget bounds the hook's calls.
+func TestCatalogAsksOncePerVisit(t *testing.T) {
+	var asks, visits atomic.Int64
+	f := newFixture(t, func(c *Config) {
+		c.Authorize = func(_ *http.Request, _ Verb, _ ref.Name) error {
+			asks.Add(1)
+			return nil
+		}
+	})
+	f.srv.catalogVisited = func() { visits.Add(1) }
+	names := make([]string, 0, 2000)
+	for i := range 2000 {
+		names = append(names, fmt.Sprintf("r%04d", i))
+	}
+	layRepos(t, f.root, names)
+	want(t, f.do(http.MethodGet, "/v2/_catalog", nil), http.StatusOK, "")
+	if visits.Load() == 0 {
+		t.Fatal("the catalog visited nothing, so the count below proves nothing")
+	}
+	if asks.Load() != visits.Load()+1 {
+		t.Fatalf("%d asks for %d visits; want one per visit and one for the catalog", asks.Load(), visits.Load())
+	}
+	if visits.Load() > int64(catalogVisits(defaultPage)) {
+		t.Fatalf("%d visits, over the budget of a default page", visits.Load())
+	}
+}

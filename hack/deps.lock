@@ -387,7 +387,7 @@ github.com/keybase/go-keychain v0.0.1 # 2025-02-27T17:52:03Z
 github.com/kisielk/errcheck v1.5.0 # 2021-01-05T19:12:31Z
 github.com/kisielk/gotool v1.0.0 # 2018-02-21T18:54:26Z
 github.com/klauspost/asmfmt v1.3.2 # 2022-03-30T12:04:09Z
-github.com/klauspost/compress v1.19.0 # 2026-06-30T13:21:42Z
+github.com/klauspost/compress v1.20.2 # 2026-10-12T09:34:06Z
 github.com/klauspost/cpuid/v2 v2.2.5 # 2023-06-02T15:11:24Z
 github.com/konsorten/go-windows-terminal-sequences v1.0.3 # 2020-04-28T12:16:39Z
 github.com/kr/fs v0.1.0 # 2018-05-06T03:17:01Z

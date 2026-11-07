@@ -4,8 +4,6 @@
 #
 #   <name> <go.sum> hack/deps-<name>.lock
 #
-# zotchild: the registry's zot child (pkg/registrysvc).
-zotchild pkg/registrysvc/zotchild/go.sum.txt hack/deps-zotchild.lock
 # helmchild: the helm binary the daemon builds (pkg/helmchart).
 helmchild pkg/helmchart/helmchild/go.sum.txt hack/deps-helmchild.lock
 # ociconformance: the OCI distribution-spec conformance suite

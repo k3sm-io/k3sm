@@ -113,6 +113,14 @@ const (
 	// reasonPodInitializing is the non-failure wait of a container held behind
 	// an init sequence that has not finished.
 	reasonPodInitializing = "PodInitializing"
+	// reasonArtifactPullBackOff is a pod whose image volume the runtime could not
+	// fetch because the node's store would drop below its free-space floor. The
+	// create is retried on the pull back-off, and the reason stays the same
+	// through every attempt and every sleep. No kubelet reason means "the node,
+	// not the image, is short". Its refusal twin, ArtifactPullRefused, is
+	// reasonArtifactPullRefused (events.go), one string for the Event and the
+	// waiting reason.
+	reasonArtifactPullBackOff = "ArtifactPullBackOff"
 )
 
 // The reasons recorded on the RestartContainer RPC, one per trigger. Both

@@ -53,6 +53,7 @@ import (
 	"k3sm.io/k3sm/pkg/install/order"
 	"k3sm.io/k3sm/pkg/netdsvc"
 	"k3sm.io/k3sm/pkg/provider/podlogs"
+	"k3sm.io/k3sm/pkg/registrysvc"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 	"k3sm.io/runtimed/pkg/sandbox"
 )
@@ -702,6 +703,12 @@ type System interface {
 	// symlink between the check and the unlink, and root would then delete a
 	// file of the service user's choosing.
 	RemoveEntry(dir, name string) error
+	// RemoveEntryBeneath unlinks the file name inside the directory reached from
+	// root through subdirs, opening root and each level descriptor-relative with
+	// O_NOFOLLOW, so a symlink at root or at any level is refused (an error that
+	// is not fs.ErrNotExist) and nothing is unlinked through it. A missing level
+	// or file is success.
+	RemoveEntryBeneath(root string, subdirs []string, name string) error
 	// OpenDirNoFollow opens dir and HOLDS it: a directory whose final component
 	// is a symlink is refused (an error that is not fs.ErrNotExist), and every
 	// read and removal through the returned handle is descriptor-relative, so a
@@ -731,11 +738,13 @@ type System interface {
 	Rename(old, new string) error
 	// RemoveTree deletes path and everything under it. It is deliberately
 	// separate from RemoveAll, which uninstall drives through its own
-	// unsafe-path guard: this one is reached only by the data-volume paths (the
-	// emptied staging mount point, and the .pre-volume copy under
-	// --remove-old-data-root) and by the install root's staging tree (which
-	// carries its own root-owned-real-directory check, stagingTrustVerdict), so
-	// a future change to any caller's guarding cannot silently widen another's.
+	// unsafe-path guard: this one is reached only by the data-volume path's
+	// emptied staging mount point (the .pre-volume copy under
+	// --remove-old-data-root goes through RemoveAll) and by the install root's
+	// staging tree (which carries its own root-owned-real-directory check,
+	// stagingTrustVerdict), so a future change to any caller's guarding cannot silently widen another's.
+	// It clears user locking flags inside the tree, follows no symlink, stops at
+	// a mount point, and goes on past the descriptor limit (removeTreeFlagged).
 	RemoveTree(path string) error
 	// LockInstall takes the exclusive, install-wide lock at path and returns the
 	// release. A lock another install already holds is refused IMMEDIATELY with
@@ -1251,7 +1260,7 @@ type Config struct {
 	ExecShimSource string
 	// PayloadSource is a directory holding the control-plane payload
 	// (executor.PayloadBinaries: kube-apiserver, kube-scheduler,
-	// kube-controller-manager, kubectl, kine, etcd, etcdutl, helm and zot) staged by `k3sm payload <dir>`. Install copies it to
+	// kube-controller-manager, kubectl, kine, etcd, etcdutl and helm) staged by `k3sm payload <dir>`. Install copies it to
 	// InstallDir/bin, from which the daemon boot seeds its workdir — the launchd
 	// _k3sm daemon has neither gh nor a Go toolchain to acquire them itself.
 	// Defaults to the cp-payload sibling dir of BinarySource.
@@ -1829,6 +1838,26 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	return err
 }
 
+// removeLeftoverZot removes the zot an earlier release staged in the server's work
+// dir, with its version marker, once the install can no longer be rolled back. The
+// new server never runs it, and a later rollback reinstall seeds its own from its
+// own payload. A file left behind costs nothing, so a failure or a refusal is
+// logged and survived.
+//
+// It runs as root over a tree the service user owns from server down, so it walks
+// from the data root without following a symlink at any level: the data root is
+// root's by now (ensureStateTree), but that step does not touch the server level,
+// so a link planted while an older build left the root service-user-owned survives
+// it.
+func removeLeftoverZot(sys System, cfg Config) {
+	subdirs := []string{filepath.Base(cfg.serverWorkDir()), "bin"}
+	for _, name := range []string{registrysvc.ZotBinaryName, registrysvc.ZotMarkerName} {
+		if err := sys.RemoveEntryBeneath(cfg.DataRoot, subdirs, name); err != nil {
+			cfg.Logger.Warn("could not remove the zot an earlier release left in the work dir", "root", cfg.DataRoot, "name", name, "err", err)
+		}
+	}
+}
+
 func install(ctx context.Context, sys System, cfg Config, res *Result) (err error) {
 	cfg = cfg.withDefaults()
 	// Taken before anything is written. The post-restart verification counts a
@@ -2179,6 +2208,7 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	//     optional input: it is minted (or carried) by this install and has to be
 	//     the same value the admin kubeconfig written below carries, or every
 	//     admin request is Unauthorized.
+	tokenRollback := captureAdminToken(sys, cfg, uid) // what a rollback puts back
 	if cfg.Role == RoleServer {
 		if err := stageTokenFile(sys, uid, cfg.AdminToken, cfg.serverTokenPath(), "admin token", ServerTokenFileMode, ServerTokenDirMode); err != nil {
 			return err
@@ -2304,7 +2334,7 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	//     The control-plane version marker is staged the same way and for the same
 	//     reasons: without it the seed cannot tell this release's kube binaries from
 	//     the ones an earlier release left in the work dir, and an absent marker only
-	//     means the seed leaves the present set alone. The zot and helm markers ride along: without them the server cannot take the payload zot, and the seed keeps an older helm build.
+	//     means the seed leaves the present set alone. helm's marker rides along: without it the seed keeps an older helm build.
 	for _, m := range payloadSetMarkers {
 		_ = sys.CopyToRootOwned(filepath.Join(cfg.PayloadSource, m), cfg.stagedPayloadFile(m))
 	}
@@ -2422,7 +2452,7 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	//      root and stops before anything is wired (refuseBesideStuckMarker).
 	if removeMarker.stillOn() {
 		restartOwned = previous // a revert restarts, and reports, every daemon
-		return refuseBesideStuckMarker(ctx, sys, cfg, m, previous, dropErr)
+		return tokenRollback.keepKubeconfigWorking(ctx, sys, cfg, previous, refuseBesideStuckMarker(ctx, sys, cfg, m, previous, dropErr, func() { tokenRollback.putBack(sys, cfg) }))
 	}
 
 	// 3. The launcher link and the plists, in that order, and BOTH after the
@@ -2436,7 +2466,11 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	//    target mean the new tree the moment it is live.
 	restartOwned = true // step 4 restarts, and on failure reports, every daemon
 	if err := publishedWiring(ctx, sys, cfg, m, startedAt); err != nil {
-		return revertInstallRoot(ctx, sys, cfg, m, previous, err, false, func() { removeMarker.restore(sys, cfg) })
+		err = revertInstallRoot(ctx, sys, cfg, m, previous, err, false, func() {
+			removeMarker.restore(sys, cfg)
+			tokenRollback.putBack(sys, cfg)
+		})
+		return tokenRollback.keepKubeconfigWorking(ctx, sys, cfg, previous, err)
 	}
 
 	// 4c. REAP, and not one step earlier. The previous install root is still
@@ -2450,6 +2484,10 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	//     wrong trade.
 	if previous {
 		reapPreviousRoot(sys, cfg)
+	}
+	removeLeftoverZot(sys, cfg)
+	if cfg.Role == RoleAgent {
+		removeLeftoverServerKubeconfig(sys, cfg)
 	}
 
 	// 5. Write the admin kubeconfig to the human's home (owned by them, not root)
@@ -2467,10 +2505,13 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	//    because one that skipped verification would look like success. The merge
 	//    replaces the whole k3sm cluster entry, so a kubeconfig an earlier release
 	//    wrote (a self-signed pin, or skip-verify) is rewritten.
-	if err := writeAdminKubeconfig(ctx, sys, &cfg); err != nil {
-		// A marker removal or read that failed at 2f′ is reported beside it,
-		// so neither is lost behind the kubeconfig error.
-		return errors.Join(err, dropErr)
+	kubeconfigErr := writeAdminKubeconfig(ctx, sys, &cfg)
+
+	// 6. Last, so an interrupted wait leaves the kubeconfig written, and it undoes nothing.
+	cordonErr := uncordonInstalledNode(ctx, sys, cfg)
+	if kubeconfigErr != nil || cordonErr != nil {
+		// A marker removal or read that failed at 2f′ is reported beside them.
+		return errors.Join(kubeconfigErr, cordonErr, dropErr)
 	}
 	cfg.Logger.Info("k3sm installed", "install-dir", cfg.InstallDir, "link", cfg.installedLink(), "kubeconfig-owner", cfg.TargetUser)
 	// The marker removal that failed at 2f′, now that the install is done.
@@ -2506,7 +2547,7 @@ func writeAdminKubeconfig(ctx context.Context, sys System, cfg *Config) error {
 // daemons came back. It is one function rather than four statements in Install
 // so that the caller has exactly one error path to route through
 // revertInstallRoot — the window in which a rollback is both possible and
-// correct is precisely this function's extent.
+// correct is precisely this function's extent. It ends at verified daemons.
 func publishedWiring(ctx context.Context, sys System, cfg Config, m []artifact, startedAt time.Time) error {
 	// 3a. Put `k3sm` on PATH, from the manifest's kindSymlink entries. Copying
 	//     the binary into /Library/k3sm never made `k3sm` a command a shell
@@ -2521,6 +2562,11 @@ func publishedWiring(ctx context.Context, sys System, cfg Config, m []artifact, 
 		if err := sys.EnsureSymlink(a.target, a.path); err != nil {
 			return fmt.Errorf("install: link %s -> %s: %w", a.path, a.target, err)
 		}
+	}
+	// 3a′. A recorded node pod range this install no longer seeds goes before
+	//      the plist that seeds the new one: see retireStaleNodeIdentity.
+	if err := retireStaleNodeIdentity(sys, cfg); err != nil {
+		return err
 	}
 	// 3b. Render + write both plists, in manifest (install) order. Before each
 	//     write, the file limit the new plist requests is checked against the
@@ -2591,9 +2637,6 @@ func publishedWiring(ctx context.Context, sys System, cfg Config, m []artifact, 
 	if cfg.userStop != nil {
 		if err := sys.RemoveStopMarker(cfg.StopMarker); err != nil {
 			return fmt.Errorf("install: --start: the daemons are running but the stop marker %s could not be removed (run `sudo k3sm start`): %w", cfg.StopMarker, err)
-		}
-		if err := uncordonAfterStart(ctx, sys, cfg, ActorUser, "k3sm install --start"); err != nil {
-			return fmt.Errorf("install: --start: %w", err)
 		}
 	}
 	return nil

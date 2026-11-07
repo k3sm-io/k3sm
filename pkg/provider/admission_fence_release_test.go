@@ -36,9 +36,10 @@ var errFenceReleasePanic = errors.New("fence release panicked")
 
 // TestCreatePodFencedByRejectionReleasesNetworkAndRefs: a BestEffort pod with
 // an interconnect runs on a calm node. A repeat create of it is admitted (the
-// pod has a live track) and held inside the admission window; the pod is then
-// deleted, which forgets its track, and pressure rises before a third create
-// decides.
+// pod has a live track) and held inside the admission window; what it holds is
+// then released and its track forgotten by hand, as a delete now leaves that to the
+// re-create's way out (TestDeleteDuringFailedCreateHoldsNothing), and pressure rises
+// before a third create decides.
 //
 // "a re-create's in-flight count keeps the refusal off": the held re-create
 // holds an in-flight count like a first create does, so the third create
@@ -108,7 +109,7 @@ func TestCreatePodFencedByRejectionReleasesNetworkAndRefs(t *testing.T) {
 				t.Fatalf("create 1 attached no interconnect slot (%+v)", rec)
 			}
 
-			entered, release := holdFirstAdmitted(r)
+			entered, release := holdFirstAdmitted(t, r)
 			// The successor create starts from the fence's release window and
 			// is waited for there until it has either finished or parked
 			// behind the release, so its interleaving is chosen, not raced.
@@ -151,12 +152,8 @@ func TestCreatePodFencedByRejectionReleasesNetworkAndRefs(t *testing.T) {
 			}()
 			awaitClosed(t, entered, "the re-create to reach the admission window")
 
-			if err := r.DeletePod(ctx, pod.DeepCopy()); err != nil {
-				t.Fatalf("DeletePod: %v", err)
-			}
-			if tr := r.trackByID(id); tr != nil {
-				t.Fatalf("the delete left a track (%s)", trackState(tr))
-			}
+			r.releasePodNetwork(pod)
+			r.forgetTorndown(pod, nil)
 			if tc.dropInFlight {
 				r.admitDone(id)
 			}
@@ -169,7 +166,7 @@ func TestCreatePodFencedByRejectionReleasesNetworkAndRefs(t *testing.T) {
 				if tr != nil && (tr.rejected || tr.evictedStatus() != nil) {
 					t.Fatalf("create 3 refused the pod while the re-create was in flight (%s)", trackState(tr))
 				}
-				close(release)
+				release()
 				if err := awaitErr(t, held, "the re-create"); err != nil {
 					t.Fatalf("re-create: %v", err)
 				}
@@ -178,7 +175,7 @@ func TestCreatePodFencedByRejectionReleasesNetworkAndRefs(t *testing.T) {
 			if tr == nil || !tr.rejected {
 				t.Fatalf("create 3 under pressure did not refuse the pod (%s)", trackState(tr))
 			}
-			close(release)
+			release()
 			if tc.panicRelease {
 				if err := awaitErr(t, held, "the re-create"); err != errFenceReleasePanic {
 					t.Fatalf("re-create = %v, want the release's panic", err)

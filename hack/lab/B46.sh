@@ -54,7 +54,7 @@
 #                               (default 1200)
 #   K3SM_B46_CP_PROCS           control-plane process names to pin by pid
 #                               (default "kine kube-apiserver kube-controller-manager
-#                               kube-scheduler zot")
+#                               kube-scheduler")
 #   K3SM_ARTIFACT, K3SM_RC_TAG  the binary under test, for the run-log header
 #   K3SM_LAB_TOLERATE_KEYS      extra taint keys every lab pod tolerates, space-separated
 #                               (hack/lab/lib/tolerations.sh)
@@ -169,7 +169,7 @@ RDIR="${K3SM_B46_REMOTE_DIR:-/var/tmp/k3sm-b46}"
 EV="${K3SM_B46_EVIDENCE:-}"
 RATE_MIB="${K3SM_B46_RATE_MIB:-256}"
 WALL="${K3SM_B46_WALL_SECONDS:-1200}"
-CP_PROCS="${K3SM_B46_CP_PROCS:-kine kube-apiserver kube-controller-manager kube-scheduler zot}"
+CP_PROCS="${K3SM_B46_CP_PROCS:-kine kube-apiserver kube-controller-manager kube-scheduler}"
 NS1="${K3SM_B46_NAMESPACE:-default}"
 NS2="kube-system"
 RUN_TOKEN="b46-$(date -u +%Y%m%dT%H%M%SZ)-$$"

@@ -2,7 +2,8 @@
 # Copyright The k3sm Authors.
 # SPDX-License-Identifier: Apache-2.0
 #
-# The registry's read listings are bounded, and its handlers are fuzzed.
+# The registry's read listings are bounded, its handlers are fuzzed, and its
+# upload, blob GET and delete limits hold as documented.
 #
 # --check runs, under -race:
 #   TestListingBounds     (pkg/ociregistry/api) the catalog's default page and
@@ -24,6 +25,31 @@
 #   TestStrayEntries      (pkg/ociregistry/api) that layout check is not vacuous
 #   TestWalkRepositories, TestIndexVersion (pkg/ociregistry/store) the lexical
 #                         walk that stops at the page and the index version
+#   FuzzConditionalDelete (pkg/ociregistry/api) every committed seed: any
+#                         If-Match on a DELETE, by digest above all: no 5xx, no
+#                         panic, nothing outside the store, no tagged or
+#                         index-named row removed
+#   TestSpaceSharePerPrincipal (pkg/ociregistry/api) one principal cannot hold
+#                         the whole shared space reservation
+#   TestCatalogAsksOncePerVisit (pkg/ociregistry/api) the Authorizer hook needs
+#                         no list form: the visit budget bounds its calls
+#   TestSessionShare      (pkg/ociregistry/auth) one principal cannot take the
+#                         upload slots another needs
+#   TestBlobFloor, TestFloorWriter (pkg/ociregistry/api) a blob GET that stalls
+#                         is cut within ResponseTimeout over a real socket, and
+#                         the floor keeps the sendfile path
+#   TestBodyFloorWindow   (pkg/ociregistry/api) a lock wait is not charged to
+#                         the body floor; the floor's slack is what the doc says
+#   TestUploadSpaceIsHeldInAggregate (pkg/ociregistry/api) bodies in flight
+#                         reserve free space together
+#   TestCommitForgetsTheSessionOnAPanic (pkg/ociregistry/api) a panic after a
+#                         commit holds no session slot
+#   TestConditionalDelete (pkg/ociregistry/api) a conditional digest DELETE
+#                         refuses a digest a row tags
+#   TestPruneThroughTheStore (pkg/registrysvc) prune concurrent with a push,
+#                         against the real API server and access check
+#   TestImagePruneReportsRecheckSkips (cmd/k3sm) a re-check that cannot read a
+#                         repository lists it as unreadable in the report
 #
 # Usage: hack/acceptance/B1038.sh --check
 set -euo pipefail
@@ -38,13 +64,19 @@ corpus=pkg/ociregistry/api/testdata/fuzz/FuzzHandlers
 [ -d "$corpus" ] || { echo "B1038: FAIL: $corpus is missing"; exit 1; }
 seeds="$(find "$corpus" -type f -name 'seed-*' | wc -l | tr -d ' ')"
 [ "$seeds" -ge 30 ] || { echo "B1038: FAIL: only $seeds committed FuzzHandlers seeds"; exit 1; }
+delcorpus=pkg/ociregistry/api/testdata/fuzz/FuzzConditionalDelete
+[ -d "$delcorpus" ] || { echo "B1038: FAIL: $delcorpus is missing"; exit 1; }
+delseeds="$(find "$delcorpus" -type f -name 'seed-*' | wc -l | tr -d ' ')"
+[ "$delseeds" -ge 20 ] || { echo "B1038: FAIL: only $delseeds committed FuzzConditionalDelete seeds"; exit 1; }
 
 # run <package> <regexp> <test>... runs the tests and requires each to pass by name.
+# run_tags names a build tag for the tests that need a real socket.
 out=""
+run_tags=""
 run() {
 	local pkg="$1" re="$2"
 	shift 2
-	out="$(go test -race -count=1 -v -run "$re" "$pkg" 2>&1)" || {
+	out="$(go test -race -count=1 -v ${run_tags:+-tags "$run_tags"} -run "$re" "$pkg" 2>&1)" || {
 		printf '%s\n' "$out"; echo "B1038: FAIL: $pkg"; exit 1; }
 	printf '%s\n' "$out" | grep -E '^(--- |ok)'
 	# A test that does not run is not a pass.
@@ -66,4 +98,18 @@ for sub in 'catalog/2,000_repositories' 'catalog/denied_repositories' 'referrers
 done
 ran="$(printf '%s\n' "$out" | grep -c -- '--- PASS: FuzzHandlers/seed-')"
 [ "$ran" -eq "$seeds" ] || { echo "B1038: FAIL: $ran of $seeds FuzzHandlers seeds ran"; exit 1; }
+
+run ./pkg/ociregistry/api/ '^(FuzzConditionalDelete|TestSpaceSharePerPrincipal|TestCatalogAsksOncePerVisit|TestFloorWriter|TestBodyFloorWindow|TestUploadSpaceIsHeldInAggregate|TestCommitForgetsTheSessionOnAPanic|TestConditionalDelete)$' \
+	FuzzConditionalDelete TestSpaceSharePerPrincipal TestCatalogAsksOncePerVisit TestFloorWriter TestBodyFloorWindow TestUploadSpaceIsHeldInAggregate TestCommitForgetsTheSessionOnAPanic TestConditionalDelete
+printf '%s\n' "$out" | grep -q -- '--- PASS: TestConditionalDelete/a_conditional_digest_DELETE_refuses_a_digest_a_row_tags' || { echo "B1038: FAIL: the tagged-digest refusal did not pass"; exit 1; }
+ran="$(printf '%s\n' "$out" | grep -c -- '--- PASS: FuzzConditionalDelete/seed-')"
+[ "$ran" -eq "$delseeds" ] || { echo "B1038: FAIL: $ran of $delseeds FuzzConditionalDelete seeds ran"; exit 1; }
+# TestBlobFloor stalls a reader on a real socket, so it lives in the integration tier.
+run_tags=integration
+run ./pkg/ociregistry/api/ '^TestBlobFloor$' TestBlobFloor
+run_tags=""
+run ./pkg/ociregistry/auth/ '^TestSessionShare$' TestSessionShare
+run ./pkg/registrysvc/ '^TestPruneThroughTheStore$' TestPruneThroughTheStore
+printf '%s\n' "$out" | grep -q -- '--- PASS: TestPruneThroughTheStore/a_prune_concurrent_with_a_push_does_not_lose_the_pushed_tag' || { echo "B1038: FAIL: the concurrent prune did not pass"; exit 1; }
+run ./cmd/k3sm/ '^TestImagePruneReportsRecheckSkips$' TestImagePruneReportsRecheckSkips
 echo "B1038: PASS"

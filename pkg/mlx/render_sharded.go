@@ -173,7 +173,10 @@ const (
 type RankPlacement struct {
 	// Rank is the rank index, 0..ranks-1.
 	Rank int
-	// Node is the node the rank Pod is bound to (spec.nodeName).
+	// Node is the node the rank is placed on. The rank Pod names it in a
+	// required node affinity on kubernetes.io/hostname (RankPodNode reads it
+	// back), never in spec.nodeName, so the scheduler binds the Pod and its
+	// WaitForFirstConsumer cache claim on that node.
 	Node string
 	// RDMADevices is, for the jaccl backend, the local RDMA device this rank
 	// uses to reach each peer, indexed by PEER rank: entry j is the local
@@ -440,6 +443,10 @@ func shardedServices(m *mlxv1alpha1.MLXModel, p prepared) (headless, clusterIP *
 // mean the same thing, so they hash the same, exactly as the field's absence
 // hashed before. An explicit thunderbolt or network still moves the hash: like
 // any other spec edit, a changed path request re-renders the gang.
+//
+// An artifact model's resolved digest (status.resolvedArtifact) is hashed too,
+// so a gang whose ranks run another digest is restarted onto the recorded one.
+// It is omitted when empty, so a Hub model hashes exactly as it always has.
 func SpecHash(m *mlxv1alpha1.MLXModel, opts Options) (string, error) {
 	spec := m.Spec
 	if d := spec.Distributed; d != nil && d.Interconnect == mlxv1alpha1.MLXInterconnectAuto {
@@ -447,10 +454,15 @@ func SpecHash(m *mlxv1alpha1.MLXModel, opts Options) (string, error) {
 		norm.Interconnect = ""
 		spec.Distributed = &norm
 	}
+	var resolved string
+	if spec.Artifact != nil {
+		resolved = m.Status.ResolvedArtifact
+	}
 	raw, err := json.Marshal(struct {
-		Spec    mlxv1alpha1.MLXModelSpec `json:"spec"`
-		Options Options                  `json:"options"`
-	}{spec, opts})
+		Spec             mlxv1alpha1.MLXModelSpec `json:"spec"`
+		Options          Options                  `json:"options"`
+		ResolvedArtifact string                   `json:"resolvedArtifact,omitempty"`
+	}{spec, opts, resolved})
 	if err != nil {
 		return "", fmt.Errorf("hash spec: %w", err)
 	}
@@ -530,12 +542,13 @@ func rankPod(m *mlxv1alpha1.MLXModel, p prepared, placement Placement, r RankPla
 		Command: []string{shardInterpreter, "-m", shardModule},
 		// The model leads, then the name it serves under, then the caller's
 		// own arguments LAST: the override seam the single-node engineArgs
-		// keeps. The served name is spec.model, as on the single-node path: a
-		// pinned modelRef is the snapshot path, which no client names. The
+		// keeps. The served name is spec.model (metadata.name for an artifact
+		// model), as on the single-node path: a pinned modelRef is the
+		// snapshot path and an artifact's is its mount, which no client names. The
 		// entrypoint takes --served-model-name itself (mlx_lm.server has no
 		// such option) and adds --host, --port and --pipeline from the
 		// environment.
-		Args: append([]string{shardModelFlag, p.modelRef, argServedModelName, m.Spec.Model}, m.Spec.Runtime.Args...),
+		Args: append([]string{shardModelFlag, p.modelRef, argServedModelName, p.servedName}, m.Spec.Runtime.Args...),
 		Ports: []corev1.ContainerPort{{
 			Name:          collectivePortName,
 			ContainerPort: CollectivePort,
@@ -581,6 +594,10 @@ func rankPod(m *mlxv1alpha1.MLXModel, p prepared, placement Placement, r RankPla
 			},
 		})
 	}
+	if p.artifact != nil {
+		container.VolumeMounts = append(container.VolumeMounts, artifactMount())
+		volumes = append(volumes, *p.artifact)
+	}
 
 	return &corev1.Pod{
 		TypeMeta: metav1.TypeMeta{APIVersion: corev1.SchemeGroupVersion.String(), Kind: "Pod"},
@@ -592,10 +609,15 @@ func rankPod(m *mlxv1alpha1.MLXModel, p prepared, placement Placement, r RankPla
 			OwnerReferences: []metav1.OwnerReference{p.owner},
 		},
 		Spec: corev1.PodSpec{
-			NodeName: r.Node,
+			// A required hostname affinity, not spec.nodeName: a Pod bound by
+			// nodeName skips the scheduler, so nothing stamps the selected-node
+			// annotation on its WaitForFirstConsumer cache claim and the claim is
+			// never provisioned. The affinity keeps placement exact and lets the
+			// scheduler bind the claim on the placed node.
+			Affinity: rankNodeAffinity(r.Node),
 			// The same guarded selector and toleration the StatefulSet template
-			// carries: nodeName bypasses the scheduler, not admission, and the
-			// admission policy checks both.
+			// carries, beside the hostname affinity above; the admission policy
+			// checks the selector and the toleration.
 			NodeSelector: maps.Clone(p.nodeSelector),
 			Tolerations:  providerTolerations(),
 			Hostname:     RankPodName(m.Name, r.Rank),
@@ -609,6 +631,48 @@ func rankPod(m *mlxv1alpha1.MLXModel, p prepared, placement Placement, r RankPla
 			Volumes:       volumes,
 		},
 	}
+}
+
+// rankNodeAffinity pins a rank Pod to node through the scheduler: one required
+// node selector term holding one kubernetes.io/hostname In expression.
+func rankNodeAffinity(node string) *corev1.Affinity {
+	return &corev1.Affinity{
+		NodeAffinity: &corev1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+				NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+					MatchExpressions: []corev1.NodeSelectorRequirement{{
+						Key:      corev1.LabelHostname,
+						Operator: corev1.NodeSelectorOpIn,
+						Values:   []string{node},
+					}},
+				}},
+			},
+		},
+	}
+}
+
+// RankPodNode returns the node a Pod is pinned to by a required node affinity
+// of exactly one term holding exactly one kubernetes.io/hostname In expression
+// with one value (the shape rank Pods carry), or "" for any other shape. It is
+// the node the Pod was placed for, known before the scheduler binds it; the
+// node it runs on once bound is spec.nodeName.
+func RankPodNode(pod *corev1.Pod) string {
+	if pod.Spec.Affinity == nil || pod.Spec.Affinity.NodeAffinity == nil {
+		return ""
+	}
+	req := pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+	if req == nil || len(req.NodeSelectorTerms) != 1 {
+		return ""
+	}
+	term := req.NodeSelectorTerms[0]
+	if len(term.MatchFields) != 0 || len(term.MatchExpressions) != 1 {
+		return ""
+	}
+	e := term.MatchExpressions[0]
+	if e.Key != corev1.LabelHostname || e.Operator != corev1.NodeSelectorOpIn || len(e.Values) != 1 {
+		return ""
+	}
+	return e.Values[0]
 }
 
 // rankAnnotations builds a rank Pod's annotations. On the thunderbolt path the

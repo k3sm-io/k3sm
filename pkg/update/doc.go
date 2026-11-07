@@ -15,9 +15,10 @@ limitations under the License.
 */
 
 // Package update answers "is there a newer k3sm, and which nodes are not on
-// it?". Check resolves the latest release exactly the way install.sh does,
-// reads the version of this binary and of every Node, and compares them.
-// Check only reads; the Watcher (below) is the half that installs a release.
+// it?". Check resolves the latest release, on the stable channel exactly the
+// way install.sh does and on the rc channel from the release listing, reads the
+// version of this binary and of every Node, and compares them. Check only
+// reads; the Watcher (below) is the half that installs a release.
 //
 // The tag a release index answers with is data. It is validated to the
 // characters a git version tag carries and is never handed to a shell or a
@@ -65,9 +66,17 @@ limitations under the License.
 // condition to hold. Only the phase annotation is ever written here; the
 // controller owns, and clears, every other update annotation.
 //
-// A refusal or a failed install writes Failed with the reason, and the
-// download directory stays for diagnosis until the next attempt or the next
-// start removes it. Nothing downloaded is opened or run by this package.
+// A refusal or a failed install writes Failed with the reason and names `k3sm
+// update abort` as the recovery, and the download directory stays for diagnosis
+// until the next attempt or the next start removes it. Nothing downloaded is opened or run by this package.
+//
+// A phase write lost to the apiserver, as a server restart loses one, is tried
+// again on a bounded backoff while the attempt holds its place, so a roll goes
+// on without fetching or installing anything twice. A write that uses its whole
+// budget leaves the last phase on the Node and the Watcher looks again every few
+// seconds: an attempt that never reached the root helper starts over, and a
+// Failed verdict is written once the apiserver takes it. If no write ever lands
+// the root helper is not called, and the controller's node timeout ends the roll.
 //
 // The phase annotation reads "<phase>" or "<phase>: <message>", the message
 // at most MaxMessageBytes with control characters removed.

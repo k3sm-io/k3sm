@@ -61,7 +61,7 @@ func TestServerMLXOperatorConfigWiresALiveGPUSource(t *testing.T) {
 	indices := meshPeerIndexSet(func(context.Context) ([]netv1.MeshPeerSpec, error) {
 		return []netv1.MeshPeerSpec{{NodeName: "mac-b", PodCIDR: "100.64.1.0/24"}}, nil
 	})
-	cfg := mlxOperatorConfig(fake.NewClientset(), dyn, nil, gpu, indices, "cluster.local", log)
+	cfg := mlxOperatorConfig(fake.NewClientset(), dyn, nil, gpu, indices, 6450, "cluster.local", log)
 
 	if cfg.GPU == nil {
 		t.Fatal("the server path's MLX operator Config carries no GPU source; the pre-render fit check would be skipped in production")
@@ -74,6 +74,10 @@ func TestServerMLXOperatorConfigWiresALiveGPUSource(t *testing.T) {
 	}
 	if cfg.Client == nil || cfg.Dynamic == nil {
 		t.Fatal("the Config is missing a required client")
+	}
+	if cfg.Artifacts == nil || cfg.Options.RegistryHost != flatRegistryHost {
+		t.Errorf("artifact wiring: resolver set %v, registry host %q; want a resolver and %q",
+			cfg.Artifacts != nil, cfg.Options.RegistryHost, flatRegistryHost)
 	}
 	if cfg.ClusterDomain != "cluster.local" {
 		t.Errorf("ClusterDomain = %q, want cluster.local", cfg.ClusterDomain)

@@ -238,16 +238,30 @@ func (darwinSystem) EnsureOwnedFile(path string, uid, gid int, mode fs.FileMode)
 // the data root writable by the service user, so such a link can be waiting on
 // an upgraded node. A refused file is left exactly as it was.
 func ensureFileOwnedBy(path string, uid, gid int, mode fs.FileMode) error {
+	return ensureFileOwnedByVia(fileOps{open: unix.Open, fchown: unix.Fchown}, path, uid, gid, mode)
+}
+
+// fileOps is the two syscalls ensureFileOwnedByVia makes by descriptor, taken as
+// a seam so a test can swap the entry for a symlink between the lstat and the
+// open, and can assert the chown landed on the opened descriptor with an owner
+// an unprivileged process could not really apply.
+type fileOps struct {
+	open   func(path string, mode int, perm uint32) (int, error)
+	fchown func(fd, uid, gid int) error
+}
+
+// ensureFileOwnedByVia is ensureFileOwnedBy over the given syscalls.
+func ensureFileOwnedByVia(ops fileOps, path string, uid, gid int, mode fs.FileMode) error {
 	fi, err := os.Lstat(path)
 	switch {
 	case err == nil && fi.Mode()&fs.ModeSymlink != 0:
 		return fmt.Errorf("%s: %w: %w", path, ErrNotRegularFile, errSymlinkRefused)
 	case err == nil && !fi.Mode().IsRegular():
-		return fmt.Errorf("%s is a %s: %w", path, fi.Mode().Type(), ErrNotRegularFile)
+		return fmt.Errorf("%s is %s: %w; %s", path, lockEntryKind(fi.Mode()), ErrNotRegularFile, lockRemedy(fi.Mode(), path))
 	case err != nil && !errors.Is(err, fs.ErrNotExist):
 		return fmt.Errorf("lstat %s: %w", path, err)
 	}
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CREAT|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, uint32(mode.Perm()))
+	fd, err := ops.open(path, unix.O_RDONLY|unix.O_CREAT|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, uint32(mode.Perm()))
 	if err != nil {
 		if errors.Is(err, unix.ELOOP) {
 			return fmt.Errorf("%s: %w: %w", path, ErrNotRegularFile, errSymlinkRefused)
@@ -260,12 +274,17 @@ func ensureFileOwnedBy(path string, uid, gid int, mode fs.FileMode) error {
 		return fmt.Errorf("stat %s: %w", path, err)
 	}
 	if st.Mode&unix.S_IFMT != unix.S_IFREG {
-		return fmt.Errorf("%s: %w", path, ErrNotRegularFile)
+		mode := fs.FileMode(0)
+		if st.Mode&unix.S_IFMT == unix.S_IFDIR {
+			mode = fs.ModeDir
+		}
+		return fmt.Errorf("%s: %w; %s", path, ErrNotRegularFile, lockRemedy(mode, path))
 	}
 	if st.Nlink != 1 {
-		return fmt.Errorf("%s has %d links: %w: %w", path, st.Nlink, ErrNotRegularFile, errHardlinkRefused)
+		return fmt.Errorf("%s has %d links: %w: %w; the lock file holds no state, so it is safe to remove: run `sudo rm %s` and re-run the install",
+			path, st.Nlink, ErrNotRegularFile, errHardlinkRefused, path)
 	}
-	if err := unix.Fchown(fd, uid, gid); err != nil {
+	if err := ops.fchown(fd, uid, gid); err != nil {
 		return fmt.Errorf("chown %s to %d:%d: %w", path, uid, gid, err)
 	}
 	// The create mode is masked by the umask and an existing file keeps its
@@ -274,6 +293,24 @@ func ensureFileOwnedBy(path string, uid, gid int, mode fs.FileMode) error {
 		return fmt.Errorf("chmod %s %#o: %w", path, mode, err)
 	}
 	return nil
+}
+
+// lockEntryKind names what a non-regular entry is, for an error message.
+func lockEntryKind(m fs.FileMode) string {
+	if m.IsDir() {
+		return "a directory"
+	}
+	return "a " + m.Type().String()
+}
+
+// lockRemedy words the removal of a non-regular entry standing in for the lock
+// file by what is at the path: `rm` fails on a directory. The lock file holds
+// no state, so removing the entry is safe.
+func lockRemedy(m fs.FileMode, path string) string {
+	if m.IsDir() {
+		return fmt.Sprintf("the lock file holds no state, so it is safe to remove the directory: run `sudo rmdir %s` (`sudo rm -rf %s` if it is not empty) and re-run the install", path, path)
+	}
+	return fmt.Sprintf("the lock file holds no state, so it is safe to remove the entry: run `sudo rm %s` and re-run the install", path)
 }
 
 // EnsureLogDir creates (or repairs) the log dir owned by the service uid, group
@@ -1032,7 +1069,7 @@ func (darwinSystem) EnsureSymlink(target, link string) error {
 		if err := os.Symlink(target, link); err != nil {
 			return fmt.Errorf("symlink %s -> %s: %w", link, target, err)
 		}
-		return nil
+		return chmodLauncherLink(link)
 	case err != nil:
 		return fmt.Errorf("stat %s: %w", link, err)
 	case fi.Mode()&fs.ModeSymlink == 0:
@@ -1041,7 +1078,9 @@ func (darwinSystem) EnsureSymlink(target, link string) error {
 		return fmt.Errorf("refusing to replace non-symlink %s; move it aside and re-run", link)
 	}
 	if got, err := os.Readlink(link); err == nil && got == target {
-		return nil // already correct
+		// Already correct, but a link made under a restrictive umask by an
+		// earlier install still needs its mode repaired.
+		return chmodLauncherLink(link)
 	}
 
 	// Stale (points elsewhere) or dangling: replace atomically.
@@ -1049,6 +1088,10 @@ func (darwinSystem) EnsureSymlink(target, link string) error {
 	_ = os.Remove(tmp) // a temp left by an interrupted earlier run
 	if err := os.Symlink(target, tmp); err != nil {
 		return fmt.Errorf("symlink %s -> %s: %w", tmp, target, err)
+	}
+	if err := chmodLauncherLink(tmp); err != nil {
+		_ = os.Remove(tmp)
+		return err
 	}
 	again, err := os.Lstat(link)
 	if err != nil || again.Mode()&fs.ModeSymlink == 0 {
@@ -1061,6 +1104,17 @@ func (darwinSystem) EnsureSymlink(target, link string) error {
 	if err := os.Rename(tmp, link); err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("rename %s -> %s: %w", tmp, link, err)
+	}
+	return nil
+}
+
+// chmodLauncherLink sets the launcher link's own mode to 0755 without following
+// it. A symlink takes the process umask, and macOS resolves a link only for
+// callers its mode admits, so a link made under umask 077 (lrwx------, root)
+// left the login user unable to run `k3sm` (B1384).
+func chmodLauncherLink(link string) error {
+	if err := unix.Fchmodat(unix.AT_FDCWD, link, 0o755, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return fmt.Errorf("chmod launcher link %s 0755: %w", link, err)
 	}
 	return nil
 }
@@ -1195,6 +1249,40 @@ func (darwinSystem) RemoveEntry(dir, name string) error {
 	return nil
 }
 
+// RemoveEntryBeneath walks from root through subdirs with openat(O_NOFOLLOW) and
+// unlinks name against the last descriptor. See the System interface for the
+// contract.
+func (darwinSystem) RemoveEntryBeneath(root string, subdirs []string, name string) error {
+	for _, s := range append([]string{name}, subdirs...) {
+		if s == "" || s != filepath.Base(s) || s == "." || s == ".." {
+			return fmt.Errorf("remove %q beneath %s: not a bare entry name", s, root)
+		}
+	}
+	fd, err := openDirNoFollow(root)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("remove %s beneath %s: %w", name, root, err)
+	}
+	defer func() { _ = unix.Close(fd) }()
+	for _, s := range subdirs {
+		next, err := unix.Openat(fd, s, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if errors.Is(err, unix.ENOENT) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("remove %s beneath %s: open %s: %w", name, root, s, err)
+		}
+		_ = unix.Close(fd)
+		fd = next
+	}
+	if err := unix.Unlinkat(fd, name, 0); err != nil && !errors.Is(err, unix.ENOENT) {
+		return fmt.Errorf("remove %s beneath %s: %w", name, root, err)
+	}
+	return nil
+}
+
 // OpenDirNoFollow opens dir O_NOFOLLOW|O_DIRECTORY and returns a handle that
 // reads and removes entries against that one descriptor. See the System
 // interface for the contract.
@@ -1319,7 +1407,7 @@ func (darwinSystem) Rename(old, new string) error {
 // RemoveTree deletes path and everything under it. See the System interface for
 // why it is separate from RemoveAll.
 func (darwinSystem) RemoveTree(path string) error {
-	if err := os.RemoveAll(path); err != nil {
+	if err := removeTreeFlagged(path); err != nil {
 		return fmt.Errorf("remove %s: %w", path, err)
 	}
 	return nil

@@ -37,7 +37,7 @@
 #   TestWithLock, TestReapSession, TestRemoveTemp, TestContents, TestRemoveLayout,
 #   TestRemoveLayoutStoppedAfterTheIndex, TestSweepStoppedInsideRemoveLayout
 # then the whole gc and store packages, also under -race: the report-only first
-# sweep, the start delay, zot's retention rules, and the reaping of
+# sweep, the start delay, the retention rules, and the reaping of
 # committed-but-not-removed upload sessions and .tmp-<uuid> links.
 #
 # Usage: hack/acceptance/B1020.sh --check

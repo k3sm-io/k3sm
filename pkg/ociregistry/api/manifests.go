@@ -25,6 +25,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -32,6 +33,7 @@ import (
 	"github.com/opencontainers/go-digest"
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 
+	"k3sm.io/k3sm/pkg/ociregistry/gc"
 	"k3sm.io/k3sm/pkg/ociregistry/ref"
 	"k3sm.io/k3sm/pkg/ociregistry/store"
 )
@@ -170,10 +172,18 @@ func descriptorDigest(what string, d ispec.Descriptor) (digest.Digest, error) {
 	return d.Digest, nil
 }
 
+// maxManifestTouches is the most distinct objects one manifest PUT touches
+// under the repository lock. A 4 MiB index can name tens of thousands. The touch
+// is best-effort, so the rest are skipped rather than held under the lock.
+const maxManifestTouches = 4096
+
 // checkedManifest is what a PUT needs from a validated body.
 type checkedManifest struct {
 	// needs are the blobs that must already be in the repository.
 	needs []digest.Digest
+	// children are an index's children, which the manifest names without
+	// requiring them.
+	children []digest.Digest
 	// subject is the subject's digest, when the manifest has one.
 	subject digest.Digest
 }
@@ -183,26 +193,30 @@ type checkedManifest struct {
 //   - schemaVersion is 2, and a mediaType field, when present, is mt;
 //   - every descriptor carries a valid digest and a non-negative size;
 //   - a Docker v2 manifest needs its config and every layer present;
-//   - an OCI manifest needs its config and layers present when the config is
-//     an OCI image config or the empty descriptor, except non-distributable
-//     layers; with any other config type nothing is required;
-//   - an index or manifest list requires nothing: children need not exist.
+//   - an OCI manifest needs its config and every layer present, except
+//     non-distributable layers, whatever its config type: the registry this
+//     replaces skips the check for a config type other than an OCI image
+//     config or the empty descriptor, which let an artifact be stored with
+//     a blob the collector had already reaped. A descriptor's inline data
+//     does not stand in for its blob;
+//   - an index or manifest list requires nothing: children need not exist,
+//     and neither need a subject on any manifest. The distribution spec lets a
+//     registry refuse a missing child but says it MUST accept a missing
+//     subject, so that a manifest and its referrers arrive in either order.
+//     A child or subject the repository holds has its grace restarted
+//     (touchList).
 //
-// It also refuses any body with a Docker schema1 fsLayers field, whatever its
-// schemaVersion and media type: the garbage collector (pkg/ociregistry/gc)
-// cannot follow fsLayers and treats such a body as unreadable, so a stored
-// one would stop every sweep of the repository. The field is matched as
-// encoding/json matches it, the way the collector reads the body.
+// It first refuses any body the garbage collector (pkg/ociregistry/gc) cannot
+// read, whatever its media type: a stored one would stop every sweep of the
+// repository until its row was deleted. That covers a Docker schema1 fsLayers
+// field at any schemaVersion, an index with no mediaType and no manifests array,
+// and a field the collector decodes and the checks below do not, or decode
+// differently (a config followed by a null one). The collector's own reader
+// decides, so the two cannot accept different sets.
 func checkManifest(mt string, body []byte) (checkedManifest, error) {
 	var out checkedManifest
-	var schema1 struct {
-		FSLayers json.RawMessage `json:"fsLayers"`
-	}
-	if err := json.Unmarshal(body, &schema1); err != nil {
-		return out, manifestInvalid("manifest does not parse: %v", err)
-	}
-	if schema1.FSLayers != nil {
-		return out, manifestInvalid("a Docker schema1 fsLayers field")
+	if err := gc.Readable(body); err != nil {
+		return out, manifestInvalid("manifest cannot be read: %v", err)
 	}
 	if isIndexType(mt) {
 		var idx ispec.Index
@@ -216,9 +230,11 @@ func checkManifest(mt string, body []byte) (checkedManifest, error) {
 			return out, manifestInvalid("mediaType %q is not the Content-Type %q", idx.MediaType, mt)
 		}
 		for _, m := range idx.Manifests {
-			if _, err := descriptorDigest("child", m); err != nil {
+			d, err := descriptorDigest("child", m)
+			if err != nil {
 				return out, err
 			}
+			out.children = append(out.children, d)
 		}
 		return out, subjectOf(idx.Subject, &out)
 	}
@@ -246,12 +262,7 @@ func checkManifest(mt string, body []byte) (checkedManifest, error) {
 			layers = append(layers, d)
 		}
 	}
-	switch {
-	case mt == mediaTypeDockerManifest:
-		out.needs = append([]digest.Digest{cfg}, layers...)
-	case m.Config.MediaType == ispec.MediaTypeImageConfig || m.Config.MediaType == ispec.MediaTypeEmptyJSON:
-		out.needs = append([]digest.Digest{cfg}, layers...)
-	}
+	out.needs = append([]digest.Digest{cfg}, layers...)
 	return out, subjectOf(m.Subject, &out)
 }
 
@@ -323,24 +334,38 @@ func (s *Server) putManifest(w http.ResponseWriter, r *http.Request, n ref.Name)
 		s.fail(w, r, err)
 		return
 	}
-	// The blobs are checked under the repository lock, just before the
-	// index is written, so a garbage-collection sweep (which deletes under
-	// the same lock) cannot remove one between the check and the write.
-	needs := func() error { return s.blobsPresent(n, checked.needs) }
-	if err := needs(); err != nil {
+	if err := s.blobsPresent(n, checked.needs); err != nil {
 		s.fail(w, r, err)
 		return
 	}
 	if s.manifestChecked != nil {
 		s.manifestChecked()
 	}
-	desc, err := s.st.PutManifestChecked(r.Context(), n, rf, mt, body, needs)
+	// The blobs are checked under the repository lock, just before the
+	// index is written, so a garbage-collection sweep (which deletes under
+	// the same lock) cannot remove one between the check and the write, which
+	// is why the check repeats for each tag. A child or subject still there
+	// gets its grace restarted under the same lock, once per request. Nothing
+	// requires those objects, so a failed touch is logged and the PUT answered.
+	touch, skipped := touchList(checked.subject, checked.children)
+	if skipped > 0 {
+		s.log.Warn("registry manifest put: grace touch skipped past the cap", "repository", n.String(), "cap", maxManifestTouches, "skipped", skipped)
+	}
+	underLock := func(l *store.Locked) error {
+		if err := s.blobsPresent(n, checked.needs); err != nil {
+			return err
+		}
+		s.freshen(l, n, touch)
+		touch = nil
+		return nil
+	}
+	desc, err := s.st.PutManifestChecked(r.Context(), n, rf, mt, body, underLock)
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
 	for _, t := range tags {
-		if _, err := s.st.PutManifestChecked(r.Context(), n, ref.Reference{Tag: t}, mt, body, needs); err != nil {
+		if _, err := s.st.PutManifestChecked(r.Context(), n, ref.Reference{Tag: t}, mt, body, underLock); err != nil {
 			s.fail(w, r, err)
 			return
 		}
@@ -373,9 +398,77 @@ func (s *Server) blobsPresent(n ref.Name, needs []digest.Digest) error {
 	return nil
 }
 
+// touchList is the objects a PUT restarts the grace of, each once and at most
+// maxManifestTouches, and how many distinct objects the cap left out. The
+// subject comes first: a kept index protects its children, while the collector
+// does not follow a subject, so nothing else keeps it young.
+func touchList(subject digest.Digest, children []digest.Digest) ([]digest.Digest, int) {
+	seen := make(map[digest.Digest]bool, len(children)+1)
+	var list []digest.Digest
+	skipped := 0
+	add := func(d digest.Digest) {
+		if seen[d] {
+			return
+		}
+		seen[d] = true
+		if len(list) == maxManifestTouches {
+			skipped++
+			return
+		}
+		list = append(list, d)
+	}
+	if subject != "" {
+		add(subject)
+	}
+	for _, d := range children {
+		add(d)
+	}
+	return list, skipped
+}
+
+// freshen restarts the GC grace of every object in ds that n holds, under the
+// lock l holds. Nothing in ds is required, so an object n does not hold is
+// skipped and a failure is not the PUT's: as for a HEAD (headTouch), an object
+// that fails is logged and not tried again for half the grace, and one with
+// more than half its grace left is not written. One PUT logs one line, however
+// many objects failed.
+func (s *Server) freshen(l *store.Locked, n ref.Name, ds []digest.Digest) {
+	failed := 0
+	var firstDigest digest.Digest
+	var firstErr error
+	for _, d := range ds {
+		k := touchKey{repo: n.String(), digest: d}
+		if s.touchFails.suppressed(k, s.now()) {
+			continue
+		}
+		b, err := l.StatBlob(d)
+		if err == nil {
+			if s.graceFresh(b.ModTime) {
+				continue
+			}
+			err = l.TouchBlob(d)
+		}
+		if err == nil || errors.Is(err, store.ErrBlobUnknown) {
+			continue
+		}
+		s.touchFails.add(k, s.now().Add(s.gcGrace/2))
+		if failed == 0 {
+			firstDigest, firstErr = d, err
+		}
+		failed++
+	}
+	if failed > 0 {
+		s.log.Warn("registry manifest put: grace touch failed, answering the PUT; no touch of these objects for half the grace",
+			"repository", n.String(), "failed", failed, "digest", firstDigest.String(), "suppress_for", s.gcGrace/2, "err", firstErr)
+	}
+}
+
 // errNamedByIndex is a digest DELETE of a manifest an index in the repository
 // still names.
 var errNamedByIndex = errorf(http.StatusMethodNotAllowed, codeDenied, "the manifest is named by an index in the repository")
+
+// errTaggedDigest is a conditional digest DELETE of a digest a row tags.
+var errTaggedDigest = errorf(http.StatusPreconditionFailed, codeDenied, "the digest is tagged; delete the tag")
 
 // errPreconditionFailed is a DELETE whose If-Match names no state the
 // repository is in.
@@ -391,6 +484,13 @@ var errPreconditionFailed = errorf(http.StatusPreconditionFailed, codeDenied, "t
 // nothing. A request without If-Match is unconditional. Presence is any
 // If-Match field line, so a request whose If-Match lines are empty or hold no
 // well-formed tag is a 412, never unconditional (RFC 9110 section 13.1.1).
+//
+// A conditional DELETE by digest also refuses, with 412, a digest any row
+// tags, whatever state it names: the caller is removing what it believes is an
+// untagged manifest, and an entity tag read after the tag landed would not say
+// otherwise. Only a DELETE naming the tag removes a tagged row conditionally.
+// An unconditional DELETE by digest removes every row of the digest, as the
+// registry this replaces does.
 func (s *Server) deleteManifest(w http.ResponseWriter, r *http.Request, n ref.Name) {
 	if !s.allow(w, r, VerbDelete, n) {
 		return
@@ -416,11 +516,16 @@ func (s *Server) deleteManifest(w http.ResponseWriter, r *http.Request, n ref.Na
 		return nil
 	}
 	if rf.Tag != "" {
-		err = s.st.DeleteTagChecked(r.Context(), n, rf.Tag, precondition)
+		err = s.st.DeleteTagChecked(r.Context(), n, rf.Tag, precondition, func(row ispec.Descriptor) (bool, error) {
+			return s.keepsUntaggedRow(n, row)
+		})
 	} else {
 		err = s.st.DeleteDigestChecked(r.Context(), n, rf.Digest, func(rows []ispec.Descriptor) error {
 			if err := precondition(rows); err != nil {
 				return err
+			}
+			if conditional && digestTagged(rows, rf.Digest) {
+				return errTaggedDigest
 			}
 			return s.notNamedByIndex(n, rows, rf.Digest)
 		})
@@ -431,6 +536,31 @@ func (s *Server) deleteManifest(w http.ResponseWriter, r *http.Request, n ref.Na
 	}
 	s.log.Info("registry manifest deleted", "repository", n.String(), "reference", rf.String())
 	w.WriteHeader(http.StatusAccepted)
+}
+
+// keepsUntaggedRow reports whether a manifest losing its last tag keeps an
+// untagged row, which is what leaves it readable by digest until a digest
+// DELETE or GC. One whose body the collector cannot read does not: the row would
+// stop every sweep of the repository, and deleting the tag is the documented way
+// to clear it. A read failure that may pass deletes nothing.
+func (s *Server) keepsUntaggedRow(n ref.Name, row ispec.Descriptor) (bool, error) {
+	body, err := s.readManifestBlob(n, row)
+	switch {
+	case err == nil:
+		return gc.Readable(body) == nil, nil
+	case errors.Is(err, errManifestSize), errors.Is(err, store.ErrStoreCorrupt), errors.Is(err, store.ErrBlobUnknown),
+		errors.Is(err, store.ErrNotRegular), errors.Is(err, ref.ErrSymlink):
+		return false, nil
+	default:
+		return false, fmt.Errorf("read manifest %s: %w", row.Digest, err)
+	}
+}
+
+// digestTagged reports whether a row of rows tags d.
+func digestTagged(rows []ispec.Descriptor, d digest.Digest) bool {
+	return slices.ContainsFunc(rows, func(r ispec.Descriptor) bool {
+		return r.Digest == d && r.Annotations[ispec.AnnotationRefName] != ""
+	})
 }
 
 // matchesEntityTag reports whether the If-Match field values match state:

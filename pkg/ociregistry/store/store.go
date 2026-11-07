@@ -41,18 +41,25 @@ import (
 // Layout names inside a repository directory, and the state directory's lock
 // subdirectory.
 const (
-	layoutFile  = "oci-layout"
-	indexFile   = "index.json"
-	blobsDir    = "blobs"
-	uploadsDir  = ".uploads"
-	locksDir    = "locks"
-	fileMode    = 0o600
-	dirMode     = 0o700
-	maxIndexLen = 64 << 20
+	layoutFile = "oci-layout"
+	indexFile  = "index.json"
+	blobsDir   = "blobs"
+	uploadsDir = ".uploads"
+	// tempsDir holds the link a blob replacement renames over a blob. It is beside
+	// blobs/ because the rename must stay on one volume, and not inside it because
+	// zot's GC fails a repository on any name in blobs/<algorithm>/ that is no digest.
+	tempsDir = ".temps"
+	locksDir = "locks"
+	fileMode = 0o600
+	dirMode  = 0o700
 	// MaxManifestSize is the largest manifest body the store reads: the
 	// registry's 4 MiB manifest cap.
 	MaxManifestSize = 4 << 20
 )
+
+// maxIndexLen is the largest index.json the store reads, and so the largest it
+// writes. A variable so a test can lower it.
+var maxIndexLen int64 = 64 << 20
 
 // layoutBody is oci-layout's content, as zot writes it.
 var layoutBody = []byte(`{"imageLayoutVersion":"1.0.0"}`)
@@ -86,6 +93,10 @@ var (
 	// ErrNotRegular is a store entry that should be a regular file or a
 	// directory and is not.
 	ErrNotRegular = errors.New("unexpected file type in the store")
+	// ErrIndexFull is a change to a repository's index.json that would take it
+	// past the size the store reads. The change is refused, so the repository
+	// stays readable; deleting tags makes room.
+	ErrIndexFull = errors.New("repository index full")
 )
 
 // Store is the on-disk registry store. Its methods are safe for concurrent use
@@ -105,6 +116,12 @@ type Store struct {
 	// indexRemoved, when set, runs in RemoveLayout right after index.json is
 	// removed; an error stops the removal there (a seam for crash tests).
 	indexRemoved func() error
+	// rowsBetween, when set, runs between writeIndex's row count write and
+	// its index write, in whichever order they run (a seam for crash tests).
+	rowsBetween func() error
+	// halfFound, when set, runs in ReapHalfRemovedLayouts after a candidate is
+	// found and before its lock is taken (a seam for race tests).
+	halfFound func(n ref.Name)
 	// dirRead, when set, runs before WalkRepositories reads a directory (a
 	// seam for tests that count the walk's work).
 	dirRead func(dir string)
@@ -122,7 +139,7 @@ func Open(root, state string) (*Store, error) {
 	if rel, err := filepath.Rel(root, state); err == nil && !strings.HasPrefix(rel, "..") {
 		return nil, fmt.Errorf("open store: state dir %s is inside the store root %s", state, root)
 	}
-	for _, d := range []string{root, filepath.Join(state, locksDir)} {
+	for _, d := range []string{root, filepath.Join(state, locksDir), filepath.Join(state, rowsDir)} {
 		if err := os.MkdirAll(d, dirMode); err != nil {
 			return nil, fmt.Errorf("open store: %w", err)
 		}
@@ -247,7 +264,7 @@ func decodeIndex(r io.Reader, p string) (ispec.Index, error) {
 		return ispec.Index{}, fmt.Errorf("read index: read %s: %w", p, err)
 	}
 	if int64(len(b)) > maxIndexLen {
-		return ispec.Index{}, fmt.Errorf("read index: read %s: larger than %d bytes", p, int64(maxIndexLen))
+		return ispec.Index{}, fmt.Errorf("read index: read %s: larger than %d bytes", p, maxIndexLen)
 	}
 	var idx ispec.Index
 	if err := json.Unmarshal(b, &idx); err != nil {
@@ -487,7 +504,7 @@ func (s *Store) initLocked(dir string) error {
 		return err
 	}
 	if _, err := os.Lstat(filepath.Join(dir, indexFile)); errors.Is(err, os.ErrNotExist) {
-		if err := s.writeIndex(dir, ispec.Index{Versioned: specsVersioned}); err != nil {
+		if err := s.writeIndex(dir, ispec.Index{Versioned: specsVersioned}, -1); err != nil {
 			return err
 		}
 	} else if err != nil {
@@ -518,11 +535,70 @@ func (s *Store) createFile(p string, body []byte) error {
 
 // writeIndex replaces dir's index.json: a temp file under .uploads,
 // F_FULLFSYNC, rename, directory sync. The caller holds the repository lock.
-func (s *Store) writeIndex(dir string, idx ispec.Index) error {
+// An index longer than the store reads is ErrIndexFull, and nothing is
+// written: a write that crossed the limit would leave the repository
+// unreadable, its tags undeletable included. Removing rows shrinks an index
+// the store wrote, so a delete makes room rather than being refused.
+//
+// It keeps the repository's row count record (see rowsDir) in step. prev is
+// how many rows the index held when the caller read it, or -1 when it wrote
+// none before. The record moves by the change, new rows minus prev, so a loss
+// it has already recorded against the index stays visible through later
+// writes, until the rows are restored or the record is removed; with no
+// record, or for a new index, it records the new count. It is crash-safe in
+// the direction that matters: the record never says more rows than index.json
+// holds unless rows were lost. A write that lowers the record writes it, and
+// syncs it, before the index's rename; one that raises it writes it after the
+// index's directory sync. A crash between the two leaves the record at or
+// below the index's rows.
+func (s *Store) writeIndex(dir string, idx ispec.Index, prev int) error {
 	b, err := json.Marshal(idx)
 	if err != nil {
 		return fmt.Errorf("encode index: %w", err)
 	}
+	if int64(len(b)) > maxIndexLen {
+		return fmt.Errorf("%w: %d rows would take index.json to %d bytes, past %d", ErrIndexFull, len(idx.Manifests), len(b), maxIndexLen)
+	}
+	rc, recorded, rp, err := s.recordedRows(dir)
+	if err != nil {
+		return err
+	}
+	was := rc.Rows
+	rc.Rows = len(idx.Manifests)
+	if recorded && prev >= 0 {
+		rc.Rows = max(0, was+len(idx.Manifests)-prev)
+	}
+	lower := recorded && rc.Rows < was
+	if lower {
+		if err := s.writeRowCount(rp, rc); err != nil {
+			return err
+		}
+		if err := s.betweenRows(); err != nil {
+			return err
+		}
+	}
+	if err := s.renameIndex(dir, b); err != nil {
+		return err
+	}
+	if lower || (recorded && rc.Rows == was) {
+		return nil
+	}
+	if err := s.betweenRows(); err != nil {
+		return err
+	}
+	return s.writeRowCount(rp, rc)
+}
+
+// betweenRows runs the seam between writeIndex's two writes.
+func (s *Store) betweenRows() error {
+	if s.rowsBetween == nil {
+		return nil
+	}
+	return s.rowsBetween()
+}
+
+// renameIndex stages b as dir's index.json and renames it in, durably.
+func (s *Store) renameIndex(dir string, b []byte) error {
 	id, err := newID()
 	if err != nil {
 		return err
@@ -575,6 +651,7 @@ func (s *Store) updateIndex(ctx context.Context, n ref.Name, change func([]ispec
 	if err != nil || !changed {
 		return err
 	}
+	prev := len(idx.Manifests)
 	idx.Manifests = rows
-	return s.writeIndex(dir, idx)
+	return s.writeIndex(dir, idx, prev)
 }

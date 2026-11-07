@@ -44,24 +44,29 @@ func requireMarkerOn(t *testing.T, f *fakeSystem) {
 
 // TestDeveloperModeMarkerAncestorACLProbeFails pins the fail-closed reading of
 // an ACL probe that cannot run: when / or /Library, or the marker itself,
-// cannot be probed, the marker reads invalid, so a probe error never leaves
-// the signature checks off.
+// cannot be probed, the marker does not read on, so a probe error never leaves
+// the signature checks off: a directory that cannot be probed makes it invalid,
+// and a marker that cannot be probed makes it unknown.
 func TestDeveloperModeMarkerAncestorACLProbeFails(t *testing.T) {
 	t.Parallel()
-	for name, path := range map[string]string{
-		"the root directory":    "/",
-		"the Library directory": "/Library",
-		"the marker itself":     DeveloperModeMarkerPath,
+	for _, tc := range []struct {
+		name, path string
+		want       DeveloperModeState
+	}{
+		{"the root directory", "/", DeveloperModeInvalid},
+		{"the Library directory", "/Library", DeveloperModeInvalid},
+		{"the marker itself", DeveloperModeMarkerPath, DeveloperModeUnknown},
 	} {
-		t.Run(name, func(t *testing.T) {
+		path := tc.path
+		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			f := &fakeSystem{owners: map[string]OwnedEntry{}, acls: map[string]bool{}}
 			seedMarkerAncestors(f)
 			f.owners[DeveloperModeMarkerPath] = OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: 0o644}
 			requireMarkerOn(t, f)
 			f.hasACLErrs = map[string]error{path: errors.New("acl_get_link_np: EIO")}
-			if got := ReadDeveloperModeState(f, DeveloperModeMarkerPath); got != DeveloperModeInvalid {
-				t.Errorf("ReadDeveloperModeState = %s, want %s (calls %v)", got, DeveloperModeInvalid, f.calls)
+			if got := ReadDeveloperModeState(f, DeveloperModeMarkerPath); got != tc.want {
+				t.Errorf("ReadDeveloperModeState = %s, want %s (calls %v)", got, tc.want, f.calls)
 			}
 			if !slices.Contains(f.calls, "HasACL:"+path) {
 				t.Errorf("the ACL of %s was never probed: %v", path, f.calls)
@@ -194,7 +199,7 @@ func TestDeveloperModeValidMarkerRestoredOnPlainInstallRevert(t *testing.T) {
 // TestDeveloperModeMarkerAncestorsGuards pins the refusals of markerAncestors
 // and how they read: a root that is not absolute, a marker whose parent is
 // not under the root (above it, beside it, or reached through ..) is an
-// error, and the facts built on it make the marker invalid, never on.
+// error, and the facts built on it make the marker unknown, never on.
 func TestDeveloperModeMarkerAncestorsGuards(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
@@ -231,8 +236,8 @@ func TestDeveloperModeMarkerAncestorsGuards(t *testing.T) {
 			if facts.Err == nil || len(facts.Ancestors) != 0 {
 				t.Errorf("facts = %+v, want the refusal and no ancestor read", facts)
 			}
-			if st := developerModeState(facts, 0); st != DeveloperModeInvalid {
-				t.Errorf("the marker reads %s, want %s", st, DeveloperModeInvalid)
+			if st := developerModeState(facts, 0); st != DeveloperModeUnknown {
+				t.Errorf("the marker reads %s, want %s", st, DeveloperModeUnknown)
 			}
 		})
 	}

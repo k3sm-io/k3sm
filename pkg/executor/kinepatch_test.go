@@ -97,6 +97,7 @@ func kinePatchSetDigest() string {
 var kinePatchSetHistory = map[string]string{
 	"nocgo+p1": "d6c6334601320bd1bc3c88c5e97144f0df8c38e41ede21f225bdff71ff19af24",
 	"nocgo+p2": "4056b8ca92fa544e024153ec01765ff84468be118b516dd5b2e02052a93397ea",
+	"nocgo+p3": "b5c727f93e5e3acbd30118700fe6b46aa3677123ed632841ceff4a694fbac1a1",
 }
 
 // TestKinePatchSetIsMarked pins the link between the carried patches and the staging

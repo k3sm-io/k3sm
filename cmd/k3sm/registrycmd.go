@@ -27,9 +27,11 @@ import (
 	"io/fs"
 	"net"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"k3sm.io/k3sm/internal/atomicfile"
@@ -61,11 +63,36 @@ A worker writes no user kubeconfig. On one, first run
 with the admin kubeconfig copied from the server.
 `
 
+// runRegistryServe parses `k3sm registry serve --config <path>` and calls serve
+// until SIGTERM or SIGINT.
+func runRegistryServe(args []string, stderr io.Writer, serve func(context.Context, string) error) error {
+	fs := flag.NewFlagSet("k3sm registry serve", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	config := fs.String("config", "", "the serve config, <work-dir>/registry-state/serve.json")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("registry serve takes no arguments, got %q", fs.Args())
+	}
+	if *config == "" {
+		return errors.New("registry serve: --config is required")
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+	return serve(ctx, *config)
+}
+
 // runRegistry dispatches `k3sm registry <verb>`.
 func runRegistry(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
 		fmt.Fprint(stdout, registryUsage)
 		return nil
+	}
+	// serve is the registry server the daemon spawns: internal and unstable, so
+	// it is in neither the usage nor the unknown-verb hint.
+	if args[0] == "serve" {
+		return runRegistryServe(args[1:], stderr, registrysvc.Serve)
 	}
 	fs := flag.NewFlagSet("k3sm registry "+args[0], flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -87,7 +114,7 @@ func runRegistry(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	tok, err := mintBuilderToken(ctx, api.tokens, *d, time.Now)
+	tok, err := api.mintToken(ctx, *d, time.Now)
 	if err != nil {
 		return err
 	}

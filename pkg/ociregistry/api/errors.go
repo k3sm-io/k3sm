@@ -94,7 +94,10 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, e *apiError)
 	}
 	b, _ := json.Marshal(errorBody{Errors: []errorEntry{{Code: e.code, Message: e.msg, Detail: e.detail}}}) // a struct of strings always encodes
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Del("Content-Length")
+	// A refusal delivers no manifest: whatever named one, or its length, is stale.
+	for _, h := range []string{"Content-Length", "Docker-Content-Digest", "ETag"} {
+		w.Header().Del(h)
+	}
 	w.WriteHeader(e.status)
 	if r.Method != http.MethodHead {
 		_, _ = w.Write(b) // the client went away; nothing else to tell it
@@ -142,6 +145,10 @@ func classify(err error) *apiError {
 		return e(http.StatusTooManyRequests, codeTooManyRequests, "the referrers list is still being read; retry")
 	case errors.Is(err, ErrRateLimited):
 		return e(http.StatusTooManyRequests, codeTooManyRequests, "too many requests")
+	case errors.Is(err, store.ErrIndexFull):
+		// The repository is at the store's index limit: retrying fails the
+		// same way until tags are deleted, so it is a refusal, not a fault.
+		return e(http.StatusForbidden, codeDenied, "the repository has too many tags; delete tags to free room")
 	case errors.Is(err, store.ErrUploadTooLarge):
 		return e(http.StatusRequestEntityTooLarge, codeSizeInvalid, "the upload is larger than the registry accepts")
 	case errors.Is(err, errInsufficientSpace):

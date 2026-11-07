@@ -274,23 +274,41 @@ rootless pod expecting an absolute mount path sees the unmounted host path inste
 ladder that depends on absolute volume mounts (e.g. the MLX acceptance gate's cache PVC) is a
 root-tier run. Rootless stops at mount resolution.
 
-### `hostPath` Volumes Are Silently Dropped, Not Refused
+### Unsupported Volume Kinds Are Refused When Mounted
 
-`hostPath` is **not modeled on any runtime path**, native or `vm`, and a Pod that declares one is
-**not** rejected. `toVolume`
-([`pkg/provider/translate.go`](https://github.com/k3sm-io/k3sm/blob/main/pkg/provider/translate.go))
-carries no `hostPath` case, so the source falls through its `default` and the volume is skipped.
-Admission does not stop it either. k3sm ships PodSecurity `enforce = privileged`, so a `hostPath` Pod
-is *admitted* with a PSA **warning**, not a rejection. What you see next depends only on whether a
-container mounts it.
+`hostPath` is **not modeled on any runtime path**, native or `vm`. Neither are `nfs`, `csi`, generic
+`ephemeral` volumes, `gitRepo` or the other in-tree network and cloud-disk kinds. A native Pod is a
+Darwin process with no mount namespace, so k3sm has nothing to bind such a volume into. Admission
+does not stop these Pods: k3sm ships PodSecurity `enforce = privileged`, so a `hostPath` Pod is
+*admitted* with only a PSA **warning**. What happens next depends only on whether a container mounts
+the volume.
 
-- If a container mounts it, the Pod fails with `volume_mount %q references undefined volume`, naming
-  the **mount** and never the missing `hostPath` source, so the error does not point at the cause.
-- If nothing mounts it, the Pod runs to completion with **no error and no warning at all**. Nothing
-  anywhere reports that the host path was ignored.
+- If a container mounts it, the Pod is **refused at creation**. A Warning Event with reason
+  `FailedVolumeSource` names the volume and its kind, and the Pod never starts.
+- If nothing mounts it, the volume is ignored and the Pod runs as if it were not declared. No Event
+  reports it, because nothing in the Pod can reach the volume.
 
-Treat a `hostPath` in a manifest as "will not be there", and use a PVC instead. An outright refusal at
-admission or translation time, and an allowlisted exception after it, are follow-ups.
+Use a PVC instead of a `hostPath`.
+
+An `image` volume is supported, and its reference must name the cluster registry
+(`registry-k3sm:6450/<repository>`). A mounted `image` volume that names any other registry is
+refused at creation with a Warning Event whose reason is `ArtifactPullRefused`, so a Pod cannot make
+the node fetch from a host of its choosing.
+
+When the node cannot fetch a mounted `image` volume, the Pod is kept `Pending` instead of failed, and
+the reason it reports says what happens next:
+
+- A transfer or registry failure reads `ErrImagePull`, then `ImagePullBackOff`, and is retried on the
+  image pull back-off (10s, doubling to a 300s ceiling), with a `Failed` Warning Event per attempt.
+- A store that would drop below its free-space floor reads `ArtifactPullBackOff` and is retried on the
+  same back-off, with a `Failed` Warning Event per attempt. Free space on the node and the next attempt
+  creates the Pod.
+- An `imagePullSecret` that cannot be resolved reads `ErrImagePull` and records one `Failed` Warning
+  Event. It is not retried on a back-off: the node re-checks it quietly, so fixing the Secret starts
+  the Pod within about 20s.
+- A reference the runtime refuses because it names another registry reads `ArtifactPullRefused`,
+  records one Warning Event with that reason, and is never retried. Fix the reference and recreate the
+  Pod.
 
 ### `emptyDir` with `medium: Memory` Is Refused, Not Silently Disk-Backed
 
@@ -691,6 +709,8 @@ in place, the Pod does not proceed, and a controller replacing the Pod is what u
 once and never respawned, whatever the Pod or container policy says. If you are on that opt-out, a
 process that exits stays exited until a `Deployment`/`Job` controller replaces the Pod.
 
+**An image edit on a running Pod does not restart its container, as it does upstream.** The container stays on its image and `containerStatuses[].image` keeps naming it until the Pod is recreated: a `vm` Pod records a `Warning` `ImageEditNotApplied` Event, while a native Pod on the default runtime records no warning and can report `Pulling` and `Pulled` for the new image though nothing runs it. A `vm` Pod parked on an image failure takes the edit at its next retry.
+
 ### What Survives a Node-Daemon Restart
 
 A Pod's processes outlive the node daemon, on the default runtime and in the `vm` RuntimeClass
@@ -934,11 +954,7 @@ tested rig and both a property of the shared-filesystem transport, not of PVC st
 - **Sequential throughput is transport-bound, not disk-bound.** Sequential IO over the
   shared filesystem reached roughly 1.2 GB/s write and 2.8 GB/s read on the tested rig. Those figures
   describe the transport's ceiling on that rig, not a durable-media benchmark.
-- **The host volume is case-insensitive, and a case-colliding pair of names collapses silently inside
-  the guest.** Creating `File` and then `file` inside the guest does not produce two files. It produces
-  one, with no error returned to either write. Image layers are checked for this kind of collision when
-  they are unpacked, but a workload's own runtime writes are not, so a workload that itself creates
-  case-colliding filenames on this path will lose data silently.
+- **A plain-directory data root is case-insensitive; a `--data-volume` root is not.** On a plain directory, an image holding a case-only pair is refused, naming both paths and the fix, and a pair a workload creates itself in the guest (`File`, then `file`) collapses to one file with no error. Behaviour inside the guest on a data volume has not been measured.
 
 ### `vm` Pods: Services and Direct Pod IPs
 
@@ -971,6 +987,8 @@ headless-Service and per-pod DNS names reach the Pod on them too. What it does n
   dial of a native Pod's pod IP skips it.
 - **The relay forwards only to the guest the node attributes to that Pod.** It never forwards a
   connection to any other address.
+- **The relay does not follow an address change during a Pod's stop.** It stays up until the guest has
+  stopped, and if the guest's own address changes after the delete starts, it keeps dialing the old one.
 
 Traffic a `vm` Pod opens toward another node is out of scope for this release.
 

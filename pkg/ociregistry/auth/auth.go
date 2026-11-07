@@ -206,6 +206,21 @@ func (a *Access) Authorize(r *http.Request, verb api.Verb, n ref.Name) error {
 	return api.ErrDenied
 }
 
+// Principal names r's verified principal, "" for a request without a
+// credential that verifies. It is the api.Config Principal hook, asked after
+// Authorize has allowed r, so it neither reads nor charges the failure bucket.
+func (a *Access) Principal(r *http.Request) string {
+	hdr, present := r.Header["Authorization"]
+	if !present {
+		return ""
+	}
+	user, ok := a.verify(hdr)
+	if !ok {
+		return ""
+	}
+	return user
+}
+
 // reasonOf names a refusal for the log.
 func reasonOf(err error) string {
 	if errors.Is(err, api.ErrRateLimited) {
@@ -318,19 +333,21 @@ func (a *Access) forgetFull(t time.Time) {
 func source(r *http.Request) string { return r.RemoteAddr }
 
 // NewServer returns the registry API server over cfg with a as its access
-// check: it sets both cfg.Authorize and cfg.ConnClosed, so a server built
-// here never keeps a closed connection's bucket. It refuses a cfg that
-// already names either, so a caller cannot half-wire them. It lives here
+// check: it sets cfg.Authorize, cfg.ConnClosed and cfg.Principal, so a server
+// built here never keeps a closed connection's bucket and holds each principal
+// to its share of the upload sessions. It refuses a cfg that already names any
+// of them, so a caller cannot half-wire them. It lives here
 // rather than in package api because this package imports api.
 func NewServer(a *Access, cfg api.Config) (*api.Server, error) {
 	if a == nil {
 		return nil, errors.New("registry auth: no access check")
 	}
-	if cfg.Authorize != nil || cfg.ConnClosed != nil {
-		return nil, errors.New("registry auth: the server config already names an authorizer or a connection hook")
+	if cfg.Authorize != nil || cfg.ConnClosed != nil || cfg.Principal != nil {
+		return nil, errors.New("registry auth: the server config already names an authorizer, a connection hook or a principal hook")
 	}
 	cfg.Authorize = a.Authorize
 	cfg.ConnClosed = a.ConnClosed
+	cfg.Principal = a.Principal
 	return api.New(cfg)
 }
 

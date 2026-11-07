@@ -24,7 +24,6 @@ import (
 	"k3sm.io/k3sm/pkg/helmchart"
 	"k3sm.io/k3sm/pkg/install/order"
 	"k3sm.io/k3sm/pkg/netdsvc"
-	"k3sm.io/k3sm/pkg/registrysvc"
 )
 
 // artifactKind classifies a manifest entry so install/uninstall can perform the
@@ -155,9 +154,6 @@ func artifactManifest(cfg Config) []artifact {
 	// terms: it is what lets the work-dir seed replace a stale control-plane set after a
 	// binary-only upgrade, and a pre-marker archive has none, so it is not asserted.
 	items = append(items, artifact{kind: kindFile, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin", executor.KubeMarkerName), assertExists: false})
-	// The zot version marker rides beside the zot binary on the same terms: the server
-	// seeds its registry from the payload zot only when this marker vouches for the pin.
-	items = append(items, artifact{kind: kindFile, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin", registrysvc.ZotMarkerName), assertExists: false})
 	// helm's version marker rides beside the helm binary on the same terms: the work-dir
 	// seed replaces a helm whose marker does not vouch for the pin and variant only from
 	// a payload whose marker does.
@@ -214,6 +210,11 @@ func artifactManifest(cfg Config) []artifact {
 	// `sudo k3sm update check` writes it wherever it runs. assertExists is
 	// false: no check may have run.
 	items = append(items, artifact{kind: kindFile, disp: dispRemove, path: filepath.Join(StateStatus.Path(cfg.DataRoot), UpdateRecordName), assertExists: false})
+	// The managed update's working directory (StateUpdates), REMOVED after the
+	// node daemon that downloads into it is booted out: it holds only release
+	// archives an attempt left for diagnosis. assertExists is false: an
+	// install that predates the tree has none.
+	items = append(items, artifact{kind: kindDir, disp: dispRemove, path: StateUpdates.Path(cfg.DataRoot), assertExists: false})
 	if cfg.Role == RoleServer {
 		// The control plane's staged admin token, the counterpart of the agent's
 		// join token above: it is a system:masters bearer token with no use once
@@ -410,6 +411,6 @@ func keptArtifacts(cfg Config, m []artifact) []string {
 }
 
 // payloadSetMarkers are the version markers Install stages best-effort beside the
-// payload binaries after kine's, etcd's and etcdutl's: the control-plane set's,
-// zot's and helm's, in that order.
-var payloadSetMarkers = []string{executor.KubeMarkerName, registrysvc.ZotMarkerName, helmchart.HelmMarkerName}
+// payload binaries after kine's, etcd's and etcdutl's: the control-plane set's and
+// helm's, in that order.
+var payloadSetMarkers = []string{executor.KubeMarkerName, helmchart.HelmMarkerName}

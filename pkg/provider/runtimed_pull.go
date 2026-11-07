@@ -64,6 +64,12 @@ import (
 //     or a fixed Secret heals the pod without touching it.
 //   - INVALID_IMAGE_NAME is re-attempted only when the pod spec changes the
 //     container's image, because parsing an unchanged reference is deterministic.
+//   - An IMAGE VOLUME whose pull runtimed refused (a CreatePod error beginning
+//     with ArtifactPullRefused) is classed by failureClass: IMAGE_PULL and
+//     RESOURCE_EXHAUSTED get the exponential schedule, INVALID_POD_BOX (a
+//     registry other than the cluster's) is never re-attempted, and
+//     IMAGE_PULL_CREDENTIAL is re-checked quietly once per resync, so a fixed
+//     Secret heals the pod without an Event per attempt.
 //
 // Keying: podTrack.pulls is keyed by IMAGE REFERENCE and the track is already
 // per pod UID, so the schedule is per (pod UID × image) — the kubelet's own key.
@@ -96,6 +102,11 @@ const (
 	pullClassResync
 	// pullClassSpecChange is "only a new pod spec can help".
 	pullClassSpecChange
+	// pullClassRecheck is one QUIET re-attempt per backstop resync: the cause is
+	// a configuration outside the pod (an unresolvable imagePullSecret) that the
+	// operator fixes, so the pod is parked with the one Event its failure
+	// recorded, and the resync only notices when the fix has landed.
+	pullClassRecheck
 )
 
 // pullClassFor maps a typed failure to its re-attempt cadence.
@@ -119,6 +130,63 @@ func pullClassFor(fr runtimev1.FailureReason) pullRetryClass {
 		return pullClassResync
 	default:
 		return pullClassBackoff
+	}
+}
+
+// isArtifactPullRefusal reports whether a CreatePod refusal is runtimed's
+// refusal of an image volume's pull. runtimed's contract for these is the
+// message PREFIX (the stable reason its error wraps first) together with the
+// typed reason; the prefix is the only thing that tells an artifact's
+// INVALID_POD_BOX or RESOURCE_EXHAUSTED apart from the pod-level failures that
+// share those reasons, so it is matched exactly and nothing else in the message
+// is read.
+func isArtifactPullRefusal(message string) bool {
+	return strings.HasPrefix(message, reasonArtifactPullRefused)
+}
+
+// failureClass is pullClassFor with the image-volume refusals added: the cause
+// and its message are both needed, because an artifact refusal reuses reasons
+// whose pod-level meaning earns a different cadence.
+//
+//   - IMAGE_PULL (a transfer or registry failure, a stall, a cancel) and
+//     RESOURCE_EXHAUSTED (the store would drop below its free-space floor) may
+//     heal on their own: the image path's exponential schedule.
+//   - INVALID_POD_BOX (a registry other than the cluster's) never heals for an
+//     unchanged pod: no re-attempt at all. Volumes are immutable, so the fix is
+//     a new pod.
+//   - IMAGE_PULL_CREDENTIAL heals when the Secret is fixed, which nothing in
+//     the pod announces: a quiet re-check once per resync.
+func failureClass(fr runtimev1.FailureReason, message string) pullRetryClass {
+	if isArtifactPullRefusal(message) {
+		switch fr {
+		case runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL,
+			runtimev1.FailureReason_FAILURE_REASON_RESOURCE_EXHAUSTED:
+			return pullClassBackoff
+		case runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX:
+			return pullClassSpecChange
+		case runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL_CREDENTIAL:
+			return pullClassRecheck
+		}
+	}
+	return pullClassFor(fr)
+}
+
+// artifactWaitingReason is the waiting reason an image-volume refusal renders
+// when the image path has no reason with its meaning, or "" when it renders as
+// an image's pull does (IMAGE_PULL and IMAGE_PULL_CREDENTIAL read ErrImagePull,
+// and IMAGE_PULL alternates with ImagePullBackOff on its schedule). One reason
+// per cause, and it does not change between attempts.
+func artifactWaitingReason(fr runtimev1.FailureReason, message string) string {
+	if !isArtifactPullRefusal(message) {
+		return ""
+	}
+	switch fr {
+	case runtimev1.FailureReason_FAILURE_REASON_RESOURCE_EXHAUSTED:
+		return reasonArtifactPullBackOff
+	case runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX:
+		return reasonArtifactPullRefused
+	default:
+		return ""
 	}
 }
 
@@ -460,7 +528,7 @@ func (r *runtimedRuntime) runPullRetry(ctx context.Context, t *podTrack, pr *ima
 		case reason == runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED:
 			r.dropPull(t, pr, gen, image)
 			return
-		case pullClassFor(reason) != pullClassBackoff:
+		case failureClass(reason, message) != pullClassBackoff:
 			r.log.Warn("image pull retry failed for a cause with no exponential schedule; dropping it",
 				"pod", podID, "image", image, "reason", reason.String())
 			r.dropPull(t, pr, gen, image)
@@ -860,6 +928,9 @@ type createFailure struct {
 	// the pod then reports ContainerCreating. Empty means the failure is
 	// attributed pod-wide and every container reports it.
 	container string
+	// volume is the image volume an artifact refusal named, and image is then
+	// that volume's reference. Empty for an image refusal.
+	volume string
 }
 
 // isContainerClassFailure reports whether a CreatePod refusal is about a
@@ -881,6 +952,27 @@ func isContainerClassFailure(fr runtimev1.FailureReason) bool {
 		runtimev1.FailureReason_FAILURE_REASON_IMAGE_NEVER_PULL,
 		runtimev1.FailureReason_FAILURE_REASON_CONTAINER_CONFIG,
 		runtimev1.FailureReason_FAILURE_REASON_SIGNATURE_REJECTED:
+		return true
+	default:
+		return false
+	}
+}
+
+// isParkableCreateFailure is isContainerClassFailure plus the image-volume
+// refusals whose typed reason is otherwise a pod-level one: RESOURCE_EXHAUSTED
+// and INVALID_POD_BOX park the pod only when the message says runtimed refused
+// an image volume's pull. Still a closed list, for isContainerClassFailure's
+// reason.
+func isParkableCreateFailure(fr runtimev1.FailureReason, message string) bool {
+	if isContainerClassFailure(fr) {
+		return true
+	}
+	if !isArtifactPullRefusal(message) {
+		return false
+	}
+	switch fr {
+	case runtimev1.FailureReason_FAILURE_REASON_RESOURCE_EXHAUSTED,
+		runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX:
 		return true
 	default:
 		return false
@@ -921,11 +1013,14 @@ func (t *podTrack) markDeleting() {
 // the failure with the same Events the started-pod path emits.
 func (r *runtimedRuntime) parkCreate(pod *corev1.Pod, t *podTrack, reason runtimev1.FailureReason, message string) {
 	cf := &createFailure{reason: reason, message: message}
-	cf.image, cf.container = attributeCreateFailure(pod, message)
+	if isArtifactPullRefusal(message) {
+		cf.volume, cf.image = attributeArtifactFailure(pod, message)
+	}
+	if cf.image == "" {
+		cf.image, cf.container = attributeCreateFailure(pod, message)
+	}
 	podID := string(pod.UID)
-	events := []podEvent{pullEventFor(pullObservation{
-		container: cf.container, image: cf.image, message: message, reason: reason,
-	})}
+	events := []podEvent{r.parkEventFor(cf)}
 
 	t.restartMu.Lock()
 	t.parked = cf
@@ -946,8 +1041,14 @@ func (r *runtimedRuntime) parkCreate(pod *corev1.Pod, t *podTrack, reason runtim
 // Caller holds t.restartMu and t.parked is non-nil.
 func (r *runtimedRuntime) observeParkedLocked(t *podTrack, podID string) []podEvent {
 	cf := t.parked
-	cls := pullClassFor(cf.reason)
+	cls := failureClass(cf.reason, cf.message)
 	pr, fresh := t.pullFor(cf.image, cls, r.clk)
+	// A one-shot re-attempt that failed for a cause of another class leaves its
+	// schedule behind with no worker (runPullOnce keeps the entry, so a resync
+	// cause is paced by lastAttempt). Nothing would ever re-arm it, so it is
+	// re-filed as if fresh: a fixed Secret that uncovers a registry outage gets
+	// the back-off the outage earns, not a pod parked for good.
+	refile := !fresh && !pr.attempt && pr.class != cls
 	pr.class, pr.reason, pr.message = cls, cf.reason, cf.message
 	// One pod, one create, one schedule: drop anything a previous life of this
 	// track filed under another reference.
@@ -957,7 +1058,7 @@ func (r *runtimedRuntime) observeParkedLocked(t *podTrack, podID string) []podEv
 		}
 	}
 	switch {
-	case fresh:
+	case fresh || refile:
 		pr.lastAttempt = r.clk.Now()
 		pr.firstReport = true
 		if cls == pullClassBackoff {
@@ -966,11 +1067,14 @@ func (r *runtimedRuntime) observeParkedLocked(t *podTrack, podID string) []podEv
 		// The refusal's own Events belong to the caller that observed it
 		// (parkCreate, or the worker whose attempt failed), not to this filing.
 		return nil
-	case cls == pullClassResync && !pr.attempt && !r.clk.Now().Before(pr.lastAttempt.Add(resyncInterval)):
+	case (cls == pullClassResync || cls == pullClassRecheck) && !pr.attempt && !r.clk.Now().Before(pr.lastAttempt.Add(resyncInterval)):
 		pr.lastAttempt = r.clk.Now()
-		events := []podEvent{pullEventFor(pullObservation{
-			container: cf.container, image: cf.image, message: cf.message, reason: cf.reason,
-		})}
+		var events []podEvent
+		if cls == pullClassResync {
+			// Upstream records one per sync that re-derives the failure. A
+			// re-check is quiet: its cause's one Event was recorded at the park.
+			events = append(events, r.parkEventFor(cf))
+		}
 		// The attempt's own Pulling belongs to the worker that makes the call
 		// (attemptPull), exactly as on the started-pod resync branch above.
 		r.startPullOnceLocked(t, pr, podID, cf.image)
@@ -978,6 +1082,46 @@ func (r *runtimedRuntime) observeParkedLocked(t *podTrack, podID string) []podEv
 	default:
 		return nil
 	}
+}
+
+// parkEventFor is the Warning Event a parked create's cause records: the image
+// path's pullEventFor, except for an image volume refused for naming a foreign
+// registry, which records ArtifactPullRefused with the message the provider's
+// own pre-RPC refusal uses (it names the volume and the registry the node
+// accepts, never the pod's reference). An artifact's other refusals read as an
+// image pull of the artifact's reference, which is what they are.
+func (r *runtimedRuntime) parkEventFor(cf *createFailure) podEvent {
+	if cf.volume != "" && cf.reason == runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX && isArtifactPullRefusal(cf.message) {
+		return podEvent{corev1.EventTypeWarning, reasonArtifactPullRefused, msgArtifactPullRefused(cf.volume, r.clusterRegistry)}
+	}
+	return pullEventFor(pullObservation{
+		container: cf.container, image: cf.image, message: cf.message, reason: cf.reason,
+	})
+}
+
+// attributeArtifactFailure decides which image volume an ArtifactPullRefused
+// refusal is about, returning its name and reference. runtimed shapes the
+// message `ArtifactPullRefused: pod <id> image volume <name>: …`; as in
+// attributeCreateFailure the message is only MATCHED against names the pod
+// declares, and the volume whose token comes first wins. A message that names
+// none (no cluster registry on the node) falls to the first declared image
+// volume, which is the one the runtime fetches first. A pod with no image
+// volume returns "", "".
+func attributeArtifactFailure(pod *corev1.Pod, message string) (string, string) {
+	volume, ref, at := "", "", -1
+	for i := range pod.Spec.Volumes {
+		v := &pod.Spec.Volumes[i]
+		if v.Image == nil {
+			continue
+		}
+		if volume == "" {
+			volume, ref = v.Name, v.Image.Reference
+		}
+		if j := tokenIndex(message, "image volume "+v.Name+":"); j >= 0 && (at < 0 || j < at) {
+			volume, ref, at = v.Name, v.Image.Reference, j
+		}
+	}
+	return volume, ref
 }
 
 // attributeCreateFailure decides which image a wholesale refusal is about, and
@@ -1042,7 +1186,12 @@ func attributeCreateFailure(pod *corev1.Pod, message string) (string, string) {
 // token in message that starts at a word boundary, or -1. The boundary keeps a
 // longer word ending in "container" (say "subcontainer app:") from matching.
 func containerTokenIndex(message, name string) int {
-	token := "container " + name + ":"
+	return tokenIndex(message, "container "+name+":")
+}
+
+// tokenIndex returns the byte offset of the first occurrence of token in
+// message that starts at a word boundary, or -1.
+func tokenIndex(message, token string) int {
 	for from := 0; from <= len(message); {
 		i := strings.Index(message[from:], token)
 		if i < 0 {
@@ -1065,15 +1214,32 @@ func isWordByte(b byte) bool {
 // parkedRuntimeStatus synthesizes the runtime status of a parked pod: Pending,
 // with the refusal rendered as each container's waiting entry. It carries the
 // TYPED failure_reason, so translate.go maps it to the kubelet's waiting reason
-// through the one table both paths use.
+// through the one table both paths use; an image-volume refusal with no
+// image-path meaning carries its own reason instead (artifactWaitingReason).
 //
 // Each container reports its OWN image, never the failing one, because
 // ContainerStatus.image is what `kubectl get pod -o yaml` prints for it.
 func parkedRuntimeStatus(pod *corev1.Pod, cf *createFailure) *runtimev1.PodStatus {
 	rs := &runtimev1.PodStatus{PodId: string(pod.UID), Phase: runtimev1.PodPhase_POD_PHASE_PENDING}
+	// An image-volume refusal with no image-path meaning carries the provider's
+	// own waiting reason, untyped, so translate.go passes it through as it does
+	// any non-typed reason: this status is the provider's fabrication, and the
+	// reason is decided by the cause and the message together, which the
+	// translation of a runtime report never sees.
+	artifactReason := artifactWaitingReason(cf.reason, cf.message)
 	entry := func(c *corev1.Container) *runtimev1.ContainerStatus {
 		if cf.container != "" && c.Name != cf.container {
 			return creatingContainerStatus(c, reasonContainerCreating)
+		}
+		if artifactReason != "" {
+			return &runtimev1.ContainerStatus{
+				Name:  c.Name,
+				Image: c.Image,
+				State: &runtimev1.ContainerState{Waiting: &runtimev1.ContainerStateWaiting{
+					Reason:  artifactReason,
+					Message: cf.message,
+				}},
+			}
 		}
 		return &runtimev1.ContainerStatus{
 			Name:  c.Name,
@@ -1158,6 +1324,16 @@ func (r *runtimedRuntime) retryParkedCreate(ctx context.Context, pod *corev1.Pod
 	if pod == nil {
 		return runtimev1.FailureReason_FAILURE_REASON_NOT_FOUND, "", nil
 	}
+	// A delete behind this retry leaves its release here, and past the RPC to the
+	// compensating delete, as the guest the RPC may build answers on the /32. The
+	// check and the count share r.mu, and quiesce marks the track before teardownPod
+	// reads the count, so a delete either stops this retry here or waits for it.
+	if !r.beginParkedRetry(string(pod.UID), t) {
+		// NOT_FOUND ends the schedule (pullClassNone), as a create that lands behind
+		// the delete does.
+		return runtimev1.FailureReason_FAILURE_REASON_NOT_FOUND, "", nil
+	}
+	defer r.updateDone(pod)
 	ctx = withPodIdentity(ctx, pod)
 	podIP, err := r.podIP(ctx, pod)
 	if err != nil {
@@ -1171,6 +1347,7 @@ func (r *runtimedRuntime) retryParkedCreate(ctx context.Context, pod *corev1.Pod
 	}
 	resp, err := r.rt.CreatePod(ctx, &runtimev1.CreatePodRequest{Pod: box})
 	if err != nil {
+		// No guest to compensate for: see the same return in CreatePod.
 		return runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, "",
 			fmt.Errorf("runtimed create pod %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
@@ -1196,6 +1373,18 @@ func (r *runtimedRuntime) retryParkedCreate(ctx context.Context, pod *corev1.Pod
 	}
 	r.completeCreate(pod, t, resp.GetStatus())
 	return runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, "", nil
+}
+
+// beginParkedRetry counts a parked pod's retry in flight and reports true, or counts
+// nothing and reports false once the pod's delete has begun.
+func (r *runtimedRuntime) beginParkedRetry(id string, t *podTrack) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, deleted := r.deleteOwed[id]; deleted || trackDeleting(t) {
+		return false
+	}
+	r.beginUpdateLocked(id)
+	return true
 }
 
 // commitReason is WHY a create that has just landed could (or could not) be
@@ -1241,8 +1430,15 @@ const (
 // tear down.
 //
 // Lock order is r.mu → restartMu, as everywhere else.
+//
+// A refusal owed of a re-create beside this retry is withdrawn when the delete has not
+// begun, as in createBehindDelete: the track that was refused would otherwise read as
+// a successor here, and the guest would lose its /32 to the refusal's release.
 func (r *runtimedRuntime) commitParkedCreate(t *podTrack, podID string) commitReason {
 	r.mu.Lock()
+	if !trackDeleting(t) {
+		r.withdrawRefusalLocked(podID, t)
+	}
 	live := r.track[podID]
 	r.mu.Unlock()
 	t.restartMu.Lock()
@@ -1263,8 +1459,8 @@ func (r *runtimedRuntime) commitParkedCreate(t *podTrack, podID string) commitRe
 	}
 }
 
-// compensateLateCreate deletes a pod the runtime created for a retry the
-// provider can no longer adopt, retrying until the delete lands.
+// compensateLateCreate deletes a pod the runtime created for a create or a retry
+// the provider can no longer adopt, retrying until the delete lands.
 //
 // Without it the create is a RESURRECTION: virtual-kubelet is long past its
 // DeletePod, the track is gone, and runtimed's DeletePod for a pod id it does
@@ -1278,18 +1474,31 @@ func (r *runtimedRuntime) commitParkedCreate(t *podTrack, podID string) commitRe
 // nothing re-arms it. The retry runs on the shared crashLoopBackoff primitive
 // (never a second schedule) against the provider clock, and is recorded in
 // r.compensating so a second late create for the same id joins the loop already
-// running instead of starting a rival one.
+// running instead of starting a rival one. Joining asks that loop for one more delete
+// (r.compensateAgain): runtimed forgets the pod first thing in its DeletePod, so the
+// attempt under way can already be past a guest this create has just registered. Two
+// creates can be out together because an image edit of a parked pod retires its retry's
+// schedule while that retry's RPC runs on (retryPullsForChangedImages).
 //
 // It roots its own delete calls at context.Background: the worker's context was
 // cancelled by the very delete being compensated for, and a cancelled context
 // would make the compensating delete a no-op. Its LOOP is bounded by the
 // provider's lifetime instead (r.lifetime), so a shutdown mid-retry ends it with
 // an explicit error rather than a goroutine nobody can stop.
+//
+// The guest answers on the pod's /32 until the delete lands, so r.compensating counts
+// as in flight (inFlightLocked): the release a delete owes waits for it, and the
+// allocator cannot hand the address to a new pod beside a live guest.
 func (r *runtimedRuntime) compensateLateCreate(pod *corev1.Pod) {
 	podID := string(pod.UID)
 	r.mu.Lock()
-	already := r.compensating[podID]
-	if !already {
+	_, already := r.compensating[podID]
+	if already {
+		if r.compensateAgain == nil {
+			r.compensateAgain = map[string]bool{}
+		}
+		r.compensateAgain[podID] = true
+	} else {
 		if r.compensating == nil {
 			r.compensating = map[string]bool{}
 		}
@@ -1299,7 +1508,7 @@ func (r *runtimedRuntime) compensateLateCreate(pod *corev1.Pod) {
 	if already {
 		return
 	}
-	r.log.Warn("a parked pod's create landed after the pod was deleted; deleting it again",
+	r.log.Warn("a pod's create landed after the pod was deleted; deleting it again",
 		"namespace", pod.Namespace, "name", pod.Name, "pod", podID)
 	go r.runCompensatingDelete(pod, podID)
 }
@@ -1307,10 +1516,23 @@ func (r *runtimedRuntime) compensateLateCreate(pod *corev1.Pod) {
 // runCompensatingDelete is compensateLateCreate's single retry loop for one pod
 // id. It returns only when the delete has landed or the provider is shutting
 // down, and clears the pod's entry in r.compensating either way.
+//
+// Once the delete lands, it is the last call out if nothing else is, so it runs the
+// release a delete owes; the entry stays at false while that runs. A shutdown releases
+// nothing, as the guest was never confirmed gone: the next daemon start decides it.
 func (r *runtimedRuntime) runCompensatingDelete(pod *corev1.Pod, podID string) {
+	var claim *fenceClaim
+	retired := false
 	defer func() {
+		if claim != nil {
+			r.fenceRelease(pod, claim)
+		}
+		if retired {
+			return
+		}
 		r.mu.Lock()
 		delete(r.compensating, podID)
+		delete(r.compensateAgain, podID)
 		r.mu.Unlock()
 	}()
 	// The pod's own grace, floored, as an ordinary delete resolves it. Wire 0
@@ -1323,6 +1545,11 @@ func (r *runtimedRuntime) runCompensatingDelete(pod *corev1.Pod, podID string) {
 		_, err := r.rt.DeletePod(context.Background(),
 			&runtimev1.DeletePodRequest{PodId: podID, GracePeriodSeconds: grace})
 		if err == nil {
+			var again bool
+			again, claim, retired = r.compensatingDeleteLanded(podID)
+			if again {
+				continue
+			}
 			return
 		}
 		r.log.Warn("could not delete the pod a late create left behind; retrying under the back-off",
@@ -1336,6 +1563,29 @@ func (r *runtimedRuntime) runCompensatingDelete(pod *corev1.Pod, podID string) {
 		case <-r.clk.After(backoff.Next()):
 		}
 	}
+}
+
+// compensatingDeleteLanded decides, in one r.mu section with the late creates that
+// join, what a landed compensating delete of pod id does next: again if a create joined
+// behind this attempt, else the release if it is the last call out, else nothing. With
+// no release to run the entry goes here (retired), and a late create still out opens a
+// delete of its own. With one, the entry stays at false until the release is over, and
+// no late create can reach it: the claim needs every create and retry returned, a new
+// create reads the entry as stale, and a new retry reads the track's delete.
+func (r *runtimedRuntime) compensatingDeleteLanded(id string) (again bool, claim *fenceClaim, retired bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.compensateAgain[id] {
+		delete(r.compensateAgain, id)
+		return true, nil, false
+	}
+	r.compensating[id] = false
+	claim = r.claimFenceReleaseLocked(id)
+	if claim == nil {
+		delete(r.compensating, id)
+		return false, nil, true
+	}
+	return false, claim, false
 }
 
 // retryPullsForChangedImages is the UpdatePod half of the cadence rules: a

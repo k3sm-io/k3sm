@@ -20,8 +20,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -593,6 +596,11 @@ func TestDevUpSurfacesColdCacheBootTimeout(t *testing.T) {
 // emitting it dies. So the fixture here is exactly that shape: a server that
 // writes its readiness file and then exits. Both directions are asserted, because
 // a check that only ever fails is as useless as one that only ever passes.
+//
+// The last stage of the failing case returns only once the kernel reports the
+// server dead, so the verdict never depends on whether the fixture's shell or the
+// reaper got a CPU first: a server alive at the final check is correctly reported
+// up, and that outcome would say nothing about the defect.
 func TestDevUpFailsWhenServerDies(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -617,7 +625,7 @@ func TestDevUpFailsWhenServerDies(t *testing.T) {
 			sys := newFakeSystem()
 			// The spawned server is a REAL process, so the liveness seam must answer
 			// about it truthfully — the in-memory pid table cannot.
-			sys.aliveProbe = func(pid int) bool { return syscall.Kill(pid, 0) == nil }
+			sys.aliveProbe = func(pid int) bool { return NewSystem().ProcessLiveness(pid) == LivenessRunning }
 			m := newTestManager(t, sys, testEUID(t))
 			out := &bytes.Buffer{}
 			m.out = out
@@ -627,7 +635,12 @@ func TestDevUpFailsWhenServerDies(t *testing.T) {
 			// The two cluster-shaped waits have no cluster here; the defect under
 			// test is upstream of both, in what `up` concludes from them.
 			m.awaitNamespaceBootstrap = func(context.Context, string) error { return nil }
-			m.awaitNodeRegistration = func(context.Context, string) error { return nil }
+			m.awaitNodeRegistration = func(ctx context.Context, kc string) error {
+				if tc.wantFail {
+					return awaitFakeServerGone(ctx, kc)
+				}
+				return nil
+			}
 
 			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 			defer cancel()
@@ -670,9 +683,182 @@ func TestDevUpFailsWhenServerDies(t *testing.T) {
 	}
 }
 
-// writeFakeServer writes an executable stand-in for `k3sm server` that writes the
-// admin kubeconfig into $K3SM_WORK_DIR — the readiness signal `up` waits on — and
-// then runs after. Its argv is ignored: what is under test is what `up` concludes
+// awaitFakeServerGone blocks until the kernel reports the writeFakeServer process
+// beside kubeconfig dead. It does not wait for Up's reaper, whose publication is
+// the thing under test.
+func awaitFakeServerGone(ctx context.Context, kubeconfig string) error {
+	raw, err := os.ReadFile(filepath.Join(filepath.Dir(kubeconfig), fakeServerPIDFile))
+	if err != nil {
+		return err
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil {
+		return err
+	}
+	if err := awaitProcessExitEvent(ctx, pid); err != nil {
+		return err
+	}
+	for NewSystem().ProcessLiveness(pid) != LivenessDead {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("fake server pid %d exited but reads live: %w", pid, err)
+		}
+		runtime.Gosched()
+	}
+	return nil
+}
+
+// awaitProcessExitEvent blocks on the kernel's NOTE_EXIT for pid, bounded by ctx's
+// deadline. A process already exited refuses the registration with ESRCH, which
+// answers the same question. The event can precede the process's move to the zombie
+// state, so a caller that needs that state still has to confirm it.
+func awaitProcessExitEvent(ctx context.Context, pid int) error {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return errors.New("awaitProcessExitEvent needs a context with a deadline")
+	}
+	kq, err := unix.Kqueue()
+	if err != nil {
+		return fmt.Errorf("kqueue: %w", err)
+	}
+	defer func() { _ = unix.Close(kq) }()
+	watch := []unix.Kevent_t{{
+		Ident:  uint64(pid),
+		Filter: unix.EVFILT_PROC,
+		Flags:  unix.EV_ADD | unix.EV_ONESHOT,
+		Fflags: unix.NOTE_EXIT,
+	}}
+	if _, err := unix.Kevent(kq, watch, nil, nil); err != nil {
+		if errors.Is(err, unix.ESRCH) {
+			return nil
+		}
+		return fmt.Errorf("watch pid %d: %w", pid, err)
+	}
+	timeout := unix.NsecToTimespec(time.Until(deadline).Nanoseconds())
+	events := make([]unix.Kevent_t, 1)
+	for {
+		n, err := unix.Kevent(kq, nil, events, &timeout)
+		switch {
+		case errors.Is(err, unix.EINTR):
+			continue
+		case err != nil:
+			return fmt.Errorf("wait for pid %d: %w", pid, err)
+		case n == 0:
+			return fmt.Errorf("pid %d did not exit before the deadline", pid)
+		}
+		return nil
+	}
+}
+
+// TestProcessLivenessZombieIsDead pins the state between a child's exit and its
+// parent's wait: kill -0 succeeds there, so a server that had already exited read
+// as running to the last check before `up` reported it.
+func TestProcessLivenessZombieIsDead(t *testing.T) {
+	cmd := exec.Command("/bin/sh", "-c", "exit 0")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	// Nothing waits until the verdict is in, so the child cannot leave the zombie
+	// state and read dead through ESRCH.
+	defer func() { _ = cmd.Wait() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	pid := cmd.Process.Pid
+	if err := awaitProcessExitEvent(ctx, pid); err != nil {
+		t.Fatal(err)
+	}
+	for !isZombie(pid) {
+		if err := ctx.Err(); err != nil {
+			t.Fatalf("pid %d exited and unreaped, but never read as a zombie: %v", pid, err)
+		}
+		runtime.Gosched()
+	}
+	if err := syscall.Kill(pid, 0); err != nil {
+		t.Fatalf("kill -0 = %v; the child was reaped, so this did not exercise a zombie", err)
+	}
+	if got := NewSystem().ProcessLiveness(pid); got != LivenessDead {
+		t.Errorf("ProcessLiveness of a zombie = %v, want dead", got)
+	}
+}
+
+// TestAwaitOrExitOnAStageResult pins the verdict for every liveness answer while
+// the reaper has not yet published an exit.
+func TestAwaitOrExitOnAStageResult(t *testing.T) {
+	const pid = 4242
+	stageErr := errors.New("stage timed out")
+	for _, tc := range []struct {
+		name     string
+		alive    bool
+		eperm    bool
+		publish  bool // the reaper publishes after the first look at exited, and the kernel says dead
+		stage    error
+		wantErr  error
+		wantText string
+	}{
+		{name: "a stage that passed over a running server", alive: true},
+		{name: "a stage that passed over an unprobeable server", eperm: true},
+		{name: "a stage that failed over a running server", alive: true, stage: stageErr, wantErr: stageErr},
+		{
+			name:    "a stage that passed over a dead server, exit not yet published",
+			publish: true, wantErr: ErrServerExited, wantText: "exit status 7",
+		},
+		{
+			name:    "a stage that failed over a dead server, exit not yet published",
+			publish: true, stage: stageErr, wantErr: ErrServerExited, wantText: "exit status 7",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sys := newFakeSystem()
+			sys.alivePIDs[pid] = tc.alive
+			sys.unprobeable[pid] = tc.eperm
+			m := newTestManager(t, sys, testEUID(t))
+			p := &serverProc{name: "b", pid: pid, logPath: filepath.Join(t.TempDir(), "server.log"), exited: make(chan struct{})}
+			if tc.publish {
+				// The liveness probe runs only once awaitOrExit has found exited still
+				// open, so publishing from it lands exactly in the window under test.
+				sys.aliveProbe = func(int) bool {
+					p.waitErr = errors.New("exit status 7")
+					close(p.exited)
+					return false
+				}
+			}
+			err := m.awaitOrExit(context.Background(), p, tc.stage)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("awaitOrExit = %v, want %v", err, tc.wantErr)
+			}
+			if tc.wantText != "" && !strings.Contains(err.Error(), tc.wantText) {
+				t.Errorf("error %q must carry %q", err, tc.wantText)
+			}
+		})
+	}
+}
+
+// TestAwaitPublishedExitWhenTheReaperNeverReports pins the hang guard: a failed
+// stage keeps its verdict, and a stage that passed never turns a server known to
+// be dead into a nil.
+func TestAwaitPublishedExitWhenTheReaperNeverReports(t *testing.T) {
+	stageErr := errors.New("stage timed out")
+	p := &serverProc{name: "b", pid: 4242, logPath: filepath.Join(t.TempDir(), "server.log"), exited: make(chan struct{})}
+
+	if err := awaitPublishedExit(context.Background(), p, stageErr, time.Millisecond); !errors.Is(err, stageErr) {
+		t.Errorf("failed stage = %v, want its own verdict", err)
+	}
+	if err := awaitPublishedExit(context.Background(), p, nil, time.Millisecond); !errors.Is(err, ErrServerExited) {
+		t.Errorf("passed stage = %v, want ErrServerExited", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := awaitPublishedExit(ctx, p, nil, time.Minute); !errors.Is(err, context.Canceled) {
+		t.Errorf("cancelled = %v, want context.Canceled", err)
+	}
+}
+
+// fakeServerPIDFile is where writeFakeServer records its pid, beside the kubeconfig.
+const fakeServerPIDFile = "fake-server.pid"
+
+// writeFakeServer writes an executable stand-in for `k3sm server` that records its
+// pid, writes the admin kubeconfig into $K3SM_WORK_DIR — the readiness signal `up`
+// waits on — and then runs after. Its argv is ignored: what is under test is what `up` concludes
 // from the signal, not what the server does with its flags.
 func writeFakeServer(t *testing.T, after string) string {
 	t.Helper()
@@ -680,7 +866,8 @@ func writeFakeServer(t *testing.T, after string) string {
 	// Written temp-then-rename, as the real server writes it: a reader polling for
 	// the file must never observe a half-written one, or this fixture would fail
 	// bring-up at the kubeconfig PARSE and stop exercising the defect.
-	script := "#!/bin/sh\nset -e\ncat > \"$K3SM_WORK_DIR/.kubeconfig.tmp\" <<'KC'\n" +
+	script := "#!/bin/sh\nset -e\necho $$ > \"$K3SM_WORK_DIR/" + fakeServerPIDFile + "\"\n" +
+		"cat > \"$K3SM_WORK_DIR/.kubeconfig.tmp\" <<'KC'\n" +
 		fakeKubeconfig + "KC\n" +
 		"mv \"$K3SM_WORK_DIR/.kubeconfig.tmp\" \"$K3SM_WORK_DIR/k3sm.kubeconfig\"\n" + after
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {

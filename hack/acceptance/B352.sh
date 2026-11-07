@@ -146,7 +146,7 @@ done
 # The payload loop and the version markers reach the staged path through a
 # `dst` binding and wrapped calls, so they are asserted by their own accessor:
 # one use in the payload loop, one per named marker (kine, etcd, etcdutl) and
-# one in the loop over payloadSetMarkers (control plane, zot, helm). The
+# one in the loop over payloadSetMarkers (control plane, helm). The
 # etcdutl marker and the marker loop arrived after this gate was written; the
 # loop replaced the single control-plane marker copy.
 # Counted across every non-test file in pkg/install, so a copy moved into a

@@ -311,6 +311,25 @@ func TestReapLeftoversStopsInShutdownOrder(t *testing.T) {
 	}
 }
 
+// TestReapTiersKeepZotAndNeverListK3sm: the name-based tiers still stop a zot an
+// earlier release left, and never name k3sm. The registry server is a k3sm
+// process, as the daemon's own helpers are, and a name match would reach them;
+// its own service reclaims it by exact argv.
+func TestReapTiersKeepZotAndNeverListK3sm(t *testing.T) {
+	var zot bool
+	for _, tier := range reapTiers {
+		for _, name := range tier {
+			zot = zot || name == registrysvc.ZotBinaryName
+			if strings.Contains(name, "k3sm") {
+				t.Errorf("reapTiers lists %q", name)
+			}
+		}
+	}
+	if !zot {
+		t.Error("reapTiers no longer lists zot")
+	}
+}
+
 // TestTierGraceDatastoreGetsStopsBudget: the kine tier's SIGTERM grace is the
 // budget Stop gives kine; the other tiers keep reapTierGrace.
 func TestTierGraceDatastoreGetsStopsBudget(t *testing.T) {

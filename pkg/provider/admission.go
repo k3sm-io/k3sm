@@ -200,8 +200,8 @@ func (r *runtimedRuntime) setAdmissionSource(src admissionPressure) {
 // is recorded, the status is written to the apiserver and pushed through the
 // watch callback, and the caller creates nothing.
 //
-// When refused is false the caller must call the ticket's done when its
-// create returns; CreatePod's fence ends it with doneLocked while it holds r.mu.
+// When refused is false the caller must end the ticket when its create returns,
+// with createDone.
 //
 // Locking: the decision and the publication of its result happen in one r.mu
 // critical section. A refusal is published as the rejected track; an admission
@@ -217,6 +217,20 @@ func (r *runtimedRuntime) setAdmissionSource(src admissionPressure) {
 // for that release first (or refuses, if ctx ends meanwhile): every resource
 // the release frees is keyed by the pod's UID, so a create admitted inside the
 // release would lose its own.
+//
+// A create that this node has deleted since CreatePod's first check is refused too,
+// in the section that would count it: teardownPod remembers the UID and reads the
+// count under one r.mu, so either the delete sees this create and leaves the rest to
+// it, or this create sees the delete. A wait at the fence is uncounted, and the
+// orphan reaper's release (claimUntrackedHoldLocked) reaches a create that Virtual
+// Kubelet runs from an informer that still holds a pod the apiserver has lost.
+//
+// A refusal does not wait for an UpdatePod past its check: the update is judged
+// again before its runtime call and frees what it took (UpdatePod, updateDone).
+//
+// A refusal does free what an earlier create or update of the pod left behind with
+// no track, such as a create that failed after its window, as the refused pod's
+// delete frees nothing. An address no call took (attachPod) is left alone.
 func (r *runtimedRuntime) admitOnCreate(ctx context.Context, pod *corev1.Pod) (refused bool, t *admitTicket) {
 	id := string(pod.UID)
 	r.mu.Lock()
@@ -237,6 +251,12 @@ func (r *runtimedRuntime) admitOnCreate(ctx context.Context, pod *corev1.Pod) (r
 			return true, nil
 		}
 		r.mu.Lock()
+	}
+	if r.createIsStaleLocked(id) {
+		r.mu.Unlock()
+		r.log.Info("CreatePod: this node deleted the pod while the create was being admitted; not creating it",
+			"namespace", pod.Namespace, "name", pod.Name, "uid", id)
+		return true, nil
 	}
 	if prior := r.track[id]; prior != nil {
 		// Admitted (or refused) at its first create; a refused or evicted pod
@@ -262,7 +282,11 @@ func (r *runtimedRuntime) admitOnCreate(ctx context.Context, pod *corev1.Pod) (r
 	}
 	st := rejectedPodStatus(pod, res, metav1.Now())
 	r.track[id] = &podTrack{pod: pod.DeepCopy(), startTime: *st.StartTime, evicted: st, rejected: true}
+	claim := r.claimFenceReleaseLocked(id)
 	r.mu.Unlock()
+	if claim != nil {
+		r.fenceRelease(pod, claim)
+	}
 
 	r.log.Warn("CreatePod: the pod was rejected at admission",
 		"namespace", pod.Namespace, "name", pod.Name, "uid", id,
@@ -280,16 +304,13 @@ func (r *runtimedRuntime) admitOnCreate(ctx context.Context, pod *corev1.Pod) (r
 	return true, nil
 }
 
-// admitTicket is one admitted create's in-flight count. It ends once, by done
-// or by doneLocked, however often either is called.
+// admitTicket is one admitted create's in-flight count. It ends once, however
+// often doneLocked is called.
 type admitTicket struct {
 	r    *runtimedRuntime
 	id   string
 	once sync.Once
 }
-
-// done ends the count; the caller does not hold r.mu.
-func (t *admitTicket) done() { t.once.Do(func() { t.r.admitDone(t.id) }) }
 
 // doneLocked ends the count; the caller holds r.mu.
 func (t *admitTicket) doneLocked() { t.once.Do(func() { t.r.admitDoneLocked(t.id) }) }
@@ -305,30 +326,344 @@ func (r *runtimedRuntime) admitLocked(id string) *admitTicket {
 	return &admitTicket{r: r, id: id}
 }
 
-// admitDone ends one admitted create of pod id.
-func (r *runtimedRuntime) admitDone(id string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.admitDoneLocked(id)
-}
-
-// admitDoneLocked is admitDone for a caller holding r.mu.
+// admitDoneLocked ends one admitted create of pod id. The caller holds r.mu.
 func (r *runtimedRuntime) admitDoneLocked(id string) {
-	if r.admitting[id] <= 1 {
-		delete(r.admitting, id)
+	if r.admitting[id] > 1 {
+		r.admitting[id]--
 		return
 	}
-	r.admitting[id]--
+	delete(r.admitting, id)
+	if ch := r.admitSettled[id]; ch != nil {
+		delete(r.admitSettled, id)
+		close(ch)
+	}
+}
+
+// awaitUpdateVerdictLocked holds an UpdatePod until the pod's admission has a
+// verdict the update can read from the track. It waits while a create admission let
+// through has no track yet when the update looks, and while a fence release frees
+// what the pod's UID holds. A waiter is woken only when the last admitted create
+// returns, not when that create publishes its track, so a slow runtime call delays
+// it by the same amount. It returns ctx's error if ctx ends first. The caller holds
+// r.mu on entry and on every return, a panic included; the wait itself runs with
+// r.mu released.
+func (r *runtimedRuntime) awaitUpdateVerdictLocked(ctx context.Context, pod *corev1.Pod) error {
+	id := string(pod.UID)
+	for {
+		ch := r.updateWaitLocked(id)
+		if ch == nil {
+			return nil
+		}
+		if err := r.waitForUpdateVerdict(ctx, id, ch); err != nil {
+			return err
+		}
+	}
+}
+
+// waitForUpdateVerdict waits on ch with r.mu released. The relock is deferred, so a
+// panic in the wait still returns the lock to a caller that unlocks in a defer.
+func (r *runtimedRuntime) waitForUpdateVerdict(ctx context.Context, id string, ch <-chan struct{}) error {
+	r.mu.Unlock()
+	defer r.mu.Lock()
+	if hook := r.updateWaitHook; hook != nil {
+		hook(id)
+	}
+	select {
+	case <-ch:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// updateWaitLocked returns what an update of pod id has to wait on, nil when
+// nothing. A terminal or live track is the verdict, so an update reads it with no
+// wait; only an admitted create yet to publish a track leaves the verdict open.
+// The caller holds r.mu.
+func (r *runtimedRuntime) updateWaitLocked(id string) <-chan struct{} {
+	t := r.track[id]
+	if t != nil && (t.rejected || t.evictedStatus() != nil) {
+		return nil
+	}
+	if ch := r.fenceReleasing[id]; ch != nil {
+		return ch
+	}
+	if t != nil || r.admitting[id] == 0 {
+		return nil
+	}
+	ch := r.admitSettled[id]
+	if ch == nil {
+		ch = make(chan struct{})
+		if r.admitSettled == nil {
+			r.admitSettled = map[string]chan struct{}{}
+		}
+		r.admitSettled[id] = ch
+	}
+	return ch
+}
+
+// noteHeldLocked records that a create or update of pod is about to acquire, with
+// what a release and the orphan reaper's live read need of the pod: its namespace,
+// name and UID. The caller holds r.mu.
+func (r *runtimedRuntime) noteHeldLocked(pod *corev1.Pod) {
+	if r.held == nil {
+		r.held = map[string]*corev1.Pod{}
+	}
+	r.held[string(pod.UID)] = &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Namespace: pod.Namespace, Name: pod.Name, UID: pod.UID,
+	}}
+}
+
+// updateStoppedNow reports whether an update past its check has to stop acquiring:
+// the pod has been refused, or its delete has begun.
+func (r *runtimedRuntime) updateStoppedNow(id string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, deleted := r.deleteOwed[id]; deleted {
+		return true
+	}
+	t := r.track[id]
+	return t != nil && (t.rejected || trackDeleting(t))
+}
+
+// createDone ends one admitted create. It is CreatePod's only exit once admitted,
+// in a defer, so a fence, a failure and a panic all reach the same decision under
+// the same r.mu section. The release runs with r.mu released and takes only its
+// own leaf locks.
+func (r *runtimedRuntime) createDone(pod *corev1.Pod, t *admitTicket) {
+	id := string(pod.UID)
+	r.mu.Lock()
+	t.doneLocked()
+	claim := r.claimFenceReleaseLocked(id)
+	r.mu.Unlock()
+	if claim != nil {
+		r.fenceRelease(pod, claim)
+	}
+}
+
+// updateDone ends one UpdatePod, or one parked pod's retry (retryParkedCreate).
+// A refusal may have landed behind it, with no create in flight to reach CreatePod's
+// fence, and a refused pod's delete frees nothing; or a delete may have, leaving the
+// rest of its teardown here. So the last call out releases. The release runs with
+// r.mu released and takes only its own leaf locks.
+func (r *runtimedRuntime) updateDone(pod *corev1.Pod) {
+	id := string(pod.UID)
+	r.mu.Lock()
+	if r.updating[id] <= 1 {
+		delete(r.updating, id)
+	} else {
+		r.updating[id]--
+	}
+	claim := r.claimFenceReleaseLocked(id)
+	r.mu.Unlock()
+	if claim != nil {
+		r.fenceRelease(pod, claim)
+	}
+}
+
+// fenceClaim is one decided release, carried out by fenceRelease: released is
+// closed when it is over, and del is set when a delete is owed with it.
+type fenceClaim struct {
+	released chan struct{}
+	del      *owedDelete
+}
+
+// owedDelete is the rest of a teardown left to the last UpdatePod out. owned
+// selects the track to forget, as in teardownPod; nil is whatever the id holds.
+// refusal says no delete began: a refused create left this beside an update, the pod
+// is still in the apiserver and a create of it can still land (withdrawRefusalLocked).
+type owedDelete struct {
+	owned   *podTrack
+	refusal bool
+}
+
+// oweDeleteLocked leaves the rest of a delete to the last call out. The caller
+// holds r.mu.
+func (r *runtimedRuntime) oweDeleteLocked(id string, owned *podTrack) {
+	if r.deleteOwed == nil {
+		r.deleteOwed = map[string]*owedDelete{}
+	}
+	r.deleteOwed[id] = &owedDelete{owned: owned}
+}
+
+// oweRefusalLocked leaves the rest of a refused create to the last call out, with
+// the track it installed. A delete already owed stays one. The caller holds r.mu.
+func (r *runtimedRuntime) oweRefusalLocked(id string, owned *podTrack) {
+	if _, owed := r.deleteOwed[id]; owed {
+		return
+	}
+	r.oweDeleteLocked(id, owned)
+	r.deleteOwed[id].refusal = true
+}
+
+// withdrawRefusalLocked answers a create of pod id that has landed, when a refusal of
+// another create is what is owed. The runtime holds the pod, so nothing is left for
+// the refusal to free, and the track of the create that landed takes the refused
+// one's place. The caller holds r.mu.
+func (r *runtimedRuntime) withdrawRefusalLocked(id string, t *podTrack) {
+	del := r.deleteOwed[id]
+	if del == nil || !del.refusal {
+		return
+	}
+	delete(r.deleteOwed, id)
+	if r.track[id] == del.owned {
+		r.track[id] = t
+	}
+}
+
+// uidTombstoneCap bounds uidTombstones. An update is stale by the time between
+// Virtual Kubelet's GetPod and the update's check, a few provider calls at most,
+// while this many deletes on one node take far longer than that: a node runs on the
+// order of a hundred pods. At 36 bytes a UID it costs well under a megabyte.
+const uidTombstoneCap = 1024
+
+// uidTombstones is a bounded set of the UIDs of recent deletes, oldest evicted
+// first. A UID is never reused, so a hit is a fact about the pod for good, and an
+// eviction only returns that UID's update to the path it took before. The zero value
+// is usable. The owner guards it.
+type uidTombstones struct {
+	seen map[string]struct{}
+	ring []string
+	next int
+}
+
+// add records id, evicting the oldest entry once the set is at uidTombstoneCap.
+func (u *uidTombstones) add(id string) {
+	if _, ok := u.seen[id]; ok {
+		return
+	}
+	if u.seen == nil {
+		u.seen = map[string]struct{}{}
+	}
+	u.seen[id] = struct{}{}
+	if len(u.ring) < uidTombstoneCap {
+		u.ring = append(u.ring, id)
+		return
+	}
+	delete(u.seen, u.ring[u.next])
+	u.ring[u.next] = id
+	u.next = (u.next + 1) % uidTombstoneCap
+}
+
+// has reports whether id's delete is remembered.
+func (u *uidTombstones) has(id string) bool {
+	_, ok := u.seen[id]
+	return ok
+}
+
+// createIsStale reports whether a create of UID id arrives behind the pod's teardown,
+// or beside a compensating delete, which would take what the create builds. A refused
+// pod's delete is neither: it tore nothing down, and a create of it owns its guest.
+func (r *runtimedRuntime) createIsStale(id string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.createIsStaleLocked(id)
+}
+
+// createIsStaleLocked is createIsStale for a caller that holds r.mu.
+func (r *runtimedRuntime) createIsStaleLocked(id string) bool {
+	_, compensating := r.compensating[id]
+	return compensating || r.tornDown.has(id)
+}
+
+// inFlightLocked reports whether a create or an update of pod id has not returned,
+// so it can still acquire by the pod's UID, or whether a guest a late create built
+// still stands, answering on the pod's /32 until its compensating delete lands
+// (runCompensatingDelete). A release waits for all of them. The caller holds r.mu.
+func (r *runtimedRuntime) inFlightLocked(id string) bool {
+	return r.admitting[id] != 0 || r.updating[id] != 0 || r.compensating[id]
+}
+
+// claimFenceReleaseLocked decides, under r.mu, that the caller releases what pod
+// id's UID holds, and returns the claim to hand fenceRelease, or nil when it does
+// not. The call right after a claim is fenceRelease, with nothing between them that
+// can panic, and a claim consumes held and deleteOwed in this same decision, so a
+// release runs once.
+//
+// A release is owed by a refused pod something was acquired for, and by a delete
+// that landed behind a create or an update. Everything released is keyed by the UID,
+// so it waits for the last in-flight create or update of the pod: an in-flight one
+// still acquires, and it reaches this decision itself when it ends. fenceReleasing,
+// published here, holds every new create and update until the release is over, so a
+// release in progress has none in flight beside it. The caller holds r.mu.
+//
+// "Once" covers what reaches this decision. Still open:
+//   - An untracked update with no deletion stamp that is not behind a delete of its
+//     UID, or is behind one uidTombstones has evicted: it allocates as it always did,
+//     and a later create, delete or refusal of the UID frees that, or the orphan
+//     reaper once the object is gone.
+//
+// A create that failed and left no track, whose pod is then deleted with no container
+// running, reaches no decision here at all: Virtual Kubelet removes such a pod from
+// the apiserver without calling DeletePod (syncPodInProvider, node/podcontroller.go)
+// and finds no track when the object goes. The orphan reaper frees what it took
+// (claimUntrackedHoldLocked).
+func (r *runtimedRuntime) claimFenceReleaseLocked(id string) *fenceClaim {
+	if r.inFlightLocked(id) || r.fenceReleasing[id] != nil {
+		return nil
+	}
+	t := r.track[id]
+	refused := t != nil && t.rejected
+	_, held := r.held[id]
+	del := r.deleteOwed[id]
+	switch {
+	case del != nil && refused && !held:
+		// Deleted, and nothing was acquired to free: only the track is owed.
+		delete(r.deleteOwed, id)
+		if del.owned == nil || del.owned == t {
+			delete(r.track, id)
+		}
+		return nil
+	case del != nil:
+		delete(r.deleteOwed, id)
+	case refused && held:
+	default:
+		return nil
+	}
+	return r.publishFenceReleaseLocked(id, del)
+}
+
+// claimUntrackedHoldLocked decides, under r.mu, that the orphan reaper releases what
+// a pod with no track holds, once the apiserver has been seen not to hold the UID. It
+// returns nil when a call of the pod is out or a release is running, as either owns
+// the decision, and when a track has appeared or nothing is held. The UID's tombstone
+// stops a stale create or update of it. The caller holds r.mu.
+func (r *runtimedRuntime) claimUntrackedHoldLocked(id string) *fenceClaim {
+	if r.inFlightLocked(id) || r.fenceReleasing[id] != nil || r.track[id] != nil || r.held[id] == nil {
+		return nil
+	}
+	r.tombstones.add(id)
+	r.tornDown.add(id)
+	return r.publishFenceReleaseLocked(id, nil)
+}
+
+// publishFenceReleaseLocked consumes pod id's hold and publishes the release that is
+// about to run. Consumed here, not when the release runs: a release that panics is
+// not claimed a second time. The caller holds r.mu.
+func (r *runtimedRuntime) publishFenceReleaseLocked(id string, del *owedDelete) *fenceClaim {
+	delete(r.held, id)
+	released := make(chan struct{})
+	if r.fenceReleasing == nil {
+		r.fenceReleasing = map[string]chan struct{}{}
+	}
+	r.fenceReleasing[id] = released
+	return &fenceClaim{released: released, del: del}
 }
 
 // forgetRejected is DeletePod for a pod refused at admission. The runtime never
 // heard of it and it holds no address, references or logs, so there is no
 // teardown: the track is forgotten (if it is still t) and the apiserver object
-// removed, as teardownPod ends.
+// removed, as teardownPod ends. With an UpdatePod in flight the track stays, so the
+// update reads the refusal and stops, and the last call out frees what the update
+// took and forgets it.
 func (r *runtimedRuntime) forgetRejected(ctx context.Context, pod *corev1.Pod, t *podTrack) {
 	id := string(pod.UID)
 	r.mu.Lock()
-	if r.track[id] == t {
+	r.tombstones.add(id)
+	switch {
+	case r.updating[id] != 0:
+		r.oweDeleteLocked(id, t)
+	case r.track[id] == t:
 		delete(r.track, id)
 	}
 	r.mu.Unlock()

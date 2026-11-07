@@ -83,7 +83,7 @@ func TestIngestRegistryRow(t *testing.T) {
 		{
 			name: "disabled warns with the reason", role: dataroot.RoleServer,
 			state: record(registrysvc.State{State: registrysvc.StateDisabled,
-				Reason: "bring up the ingest registry on 127.0.0.1:5000 after 3 attempts: registry port already held\nzot log tail"}),
+				Reason: "bring up the ingest registry on 127.0.0.1:5000 after 3 attempts: registry port already held\nregistry log tail"}),
 			probe:   answers,
 			wantRow: true, wantState: StateDisabled, wantSev: SeverityWarn,
 			wantDetail: []string{"after 3 attempts: registry port already held"}, wantRemedy: true,
@@ -252,8 +252,8 @@ func TestIngestRegistryRow(t *testing.T) {
 	}
 }
 
-// TestRegistryAnswered pins what counts as a registry answering /v2/: the
-// distribution spec's 200, or its 401 where it wants a credential.
+// TestRegistryAnswered pins what counts as the registry answering /v2/: a 200 and
+// nothing else, since this registry answers an anonymous /v2/ with it.
 func TestRegistryAnswered(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -261,7 +261,7 @@ func TestRegistryAnswered(t *testing.T) {
 		wantOK bool
 	}{
 		{name: "200 answers", code: http.StatusOK, wantOK: true},
-		{name: "401 answers", code: http.StatusUnauthorized, wantOK: true},
+		{name: "401 is not this registry", code: http.StatusUnauthorized},
 		{name: "404 is not a registry", code: http.StatusNotFound},
 		{name: "500 is not serving", code: http.StatusInternalServerError},
 	}

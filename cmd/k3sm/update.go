@@ -66,15 +66,18 @@ Usage:
   k3sm update status [-o text|json] [--watch]
   k3sm update cancel
   k3sm update abort
+  k3sm update channel [stable|rc]
 
-  check   resolve the latest release the way install.sh does, and compare this
+  check   resolve the latest release on the cluster's update channel (stable,
+          the way install.sh does, when no channel is set), and compare this
           Mac's k3sm and every node's with it; the result is also recorded
           for the update row of ` + "`k3sm status`" + ` (as root or the service user)
   apply   print the plan (the nodes in roll order, workers first and the
-          server last, with their versions; the target; drain; the signature
-          policy), ask for confirmation, then create the Update named
-          "current" that the server's update controller rolls; the target is
-          the latest release unless --version names one. It refuses while an
+          server last, with their versions; the target; the channel; drain; the
+          signature policy; the release pin), ask for confirmation, then create
+          the Update named "current" that the server's update controller rolls;
+          the target is the latest release on the channel unless --version
+          names one. It refuses while an
           Update is still in progress, and replaces a finished one
   status  the Update's phase, the resolved release, each node's progress and
           the conditions; --watch re-prints on every change until it finishes
@@ -84,6 +87,10 @@ Usage:
   abort   the recovery after a failed step: clear the k3sm.io/update-*
           annotations on every node, uncordon each node the controller
           cordoned (never one you cordoned), and mark the Update Cancelled
+  channel print the cluster's update channel, or fail if the cluster gives no
+          answer (a worker prints the channel its server published and says so
+          on stderr); with stable or rc, set it (this takes cluster-admin) and
+          run a check. A channel changes what is offered and never starts a roll
 
 Flags:
   -o text|json        output format (check, status; default text)
@@ -116,7 +123,8 @@ with no reachable cluster: it then compares this Mac's k3sm alone with the
 latest release.
 
 Exit codes: 0 done, 1 it could not be done (the error says why), 2 usage, or
-apply without --yes on a stdin that is not a terminal.
+apply without --yes on a stdin that is not a terminal, 3 the channel was set but
+the check after it failed.
 `
 
 // updateEnv is everything `k3sm update` reads and writes, injected so the verb
@@ -127,6 +135,9 @@ type updateEnv struct {
 	// no cluster could be asked.
 	inputs  update.Inputs
 	kubeErr error
+	// worker is whether this Mac is installed as a worker, which reads the
+	// channel a server published on its Node.
+	worker bool
 	// workDir is the server work dir; the check refreshes the record in the
 	// status directory beside it (status.Dir).
 	workDir string
@@ -146,6 +157,12 @@ type updateEnv struct {
 	// nil means updatectl.WriteReleasePin and updatectl.ClearReleasePin.
 	writePin func(workDir string, pin updatectl.ReleasePin) error
 	clearPin func(workDir string) (updatectl.Cleared, error)
+	// readPin reads the release pin for apply's plan; nil means
+	// updatectl.ReadReleasePin.
+	readPin func(workDir string) (*updatectl.ReleasePin, error)
+	// channelWait bounds a channel write's wait for the UpdatePolicy CRD; zero
+	// is channelCRDWait.
+	channelWait time.Duration
 }
 
 // newUpdateEnv wires the production environment: the GitHub release index, the
@@ -158,6 +175,7 @@ func newUpdateEnv() updateEnv {
 		out:     os.Stdout,
 		errOut:  os.Stderr,
 		inputs:  update.Inputs{BaseURL: checkBase(installedReleaseBase(role)), Installed: version.Get()},
+		worker:  role == install.RoleAgent,
 		workDir: workDir,
 		in:      os.Stdin,
 		root:    euid == 0,
@@ -214,6 +232,8 @@ func runUpdate(ctx context.Context, args []string, env updateEnv) int {
 		return runUpdateCancel(ctx, args[1:], env)
 	case "abort":
 		return runUpdateAbort(ctx, args[1:], env)
+	case "channel":
+		return runUpdateChannel(ctx, args[1:], env)
 	}
 	fmt.Fprintf(env.errOut, "k3sm update: unknown subcommand %q\n\n%s", args[0], updateUsage)
 	return exitUsage
@@ -236,7 +256,11 @@ func runUpdateCheck(ctx context.Context, args []string, env updateEnv) int {
 	if env.kubeErr != nil {
 		fmt.Fprintf(env.errOut, "k3sm update: not comparing the cluster's nodes: %v\n", env.kubeErr)
 	}
-	rep, checkErr := update.Check(ctx, env.inputs)
+	src := channelSource{dyn: env.dyn, kube: env.inputs.Kube, pairOnly: env.worker}
+	rep, reading, checkErr := checkOnChannel(ctx, env.inputs, src)
+	if reading.note != "" {
+		fmt.Fprintln(env.errOut, "k3sm update:", reading.note)
+	}
 	if env.workDir != "" {
 		if err := writeUpdateRecord(env.workDir, rep.Record(checkErr)); err != nil {
 			fmt.Fprintln(env.errOut, updateNotRecorded(err))
@@ -262,6 +286,9 @@ func runUpdateCheck(ctx context.Context, args []string, env updateEnv) int {
 // renderUpdate prints the report for a person.
 func renderUpdate(w io.Writer, rep update.Report) {
 	tw := tabwriter.NewWriter(w, 0, 0, 3, ' ', 0)
+	if rep.Channel != "" {
+		fmt.Fprintf(tw, "channel\t%s\n", rep.Channel)
+	}
 	latest := rep.Latest.Tag
 	if rep.Latest.Published != "" {
 		latest += ", published " + rep.Latest.Published
@@ -401,6 +428,9 @@ type updateRecorder struct {
 	interval, rollEvery time.Duration
 	now                 func() time.Time
 	logger              *slog.Logger
+	// readChannel reads the live channel on every poll, so a change forces a
+	// check inside the interval; nil never does.
+	readChannel func(ctx context.Context) (channelReading, error)
 	// publish puts the record's latest release on this server's Node
 	// (status.UpdateAnnotations), where a worker's `k3sm status` reads it;
 	// nil publishes nothing.
@@ -434,18 +464,27 @@ func installedReleaseBase(role install.Role) string {
 // against the release index (baseURL, the recorded --update-release-base, or
 // GitHub's when empty) and the Update poll over dyn.
 func runUpdateRecorder(ctx context.Context, workDir, nodeName, baseURL string, cs kubernetes.Interface, dyn dynamic.Interface, logger *slog.Logger) {
-	updateRecorder{
+	newUpdateRecorder(workDir, nodeName, baseURL, cs, dyn, logger).run(ctx)
+}
+
+// newUpdateRecorder wires a server's recorder: its checks and its polls read the
+// channel from one source, with the server's own clients.
+func newUpdateRecorder(workDir, nodeName, baseURL string, cs kubernetes.Interface, dyn dynamic.Interface, logger *slog.Logger) updateRecorder {
+	src := channelSource{dyn: dyn, kube: cs}
+	return updateRecorder{
 		publish: nodeAnnotationPublisher(cs, nodeName),
 		workDir: workDir,
 		check: func(ctx context.Context) (update.Report, error) {
-			return update.Check(ctx, update.Inputs{BaseURL: checkBase(baseURL), Kube: cs, Installed: version.Get()})
+			rep, _, err := checkOnChannel(ctx, update.Inputs{BaseURL: checkBase(baseURL), Kube: cs, Installed: version.Get()}, src)
+			return rep, err
 		},
-		dyn:       dyn,
-		interval:  status.UpdateRecordInterval,
-		rollEvery: status.UpdateRollEvery,
-		now:       time.Now,
-		logger:    logger,
-	}.run(ctx)
+		readChannel: src.read,
+		dyn:         dyn,
+		interval:    status.UpdateRecordInterval,
+		rollEvery:   status.UpdateRollEvery,
+		now:         time.Now,
+		logger:      logger,
+	}
 }
 
 // run refreshes the record until ctx ends. Every failure is logged and
@@ -460,6 +499,7 @@ func (r updateRecorder) run(ctx context.Context) {
 	defer poll.Stop()
 	var roll *status.UpdateRoll
 	var published map[string]string
+	watch := channelWatch{attempted: effectiveChannel(readUpdateRecord(r.workDir).Channel)}
 	for {
 		select {
 		case <-ctx.Done():
@@ -469,9 +509,8 @@ func (r updateRecorder) run(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			if err != nil {
-				r.logger.Info("could not check for a k3sm update", "err", err)
-			}
+			r.logCheck(err, watch.unread)
+			watch.checked(rep, err)
 			rec := rep.Record(err)
 			rec.Roll = roll
 			r.write(rec)
@@ -482,6 +521,12 @@ func (r updateRecorder) run(ctx context.Context) {
 			// Also on the poll: the Node may not be registered at the first
 			// check, and `k3sm update check` rewrites the record on its own.
 			published = r.publishRecord(ctx, published)
+			if r.pollChannel(ctx, &watch) {
+				check.Reset(0)
+			}
+			if ctx.Err() != nil {
+				return
+			}
 			if r.dyn == nil {
 				continue
 			}
@@ -768,9 +813,19 @@ func runUpdateApply(ctx context.Context, args []string, env updateEnv) int {
 			updatesv1alpha1.UpdateName, status.ClipText(existing.Spec.Version, 128), updatePhase(existing))
 		return exitInternalError
 	}
+	// Apply reads only the object, whatever role this Mac has: the target is
+	// computed on the channel as it stands now, never chosen by what a Node
+	// publishes, and --yes means nobody may see the plan before the roll starts.
+	reading, channelErr := channelSource{dyn: dyn, objectOnly: true}.read(ctx)
+	if *tag == "" && channelErr != nil {
+		fmt.Fprintf(env.errOut, "k3sm update apply: %v; name a release with --version\n", channelErr)
+		return exitInternalError
+	}
+	in := env.inputs
+	in.Channel = reading.channel
 	target := *tag
 	if target == "" {
-		rel, err := update.Latest(ctx, env.inputs)
+		rel, err := update.Latest(ctx, in)
 		if err != nil {
 			fmt.Fprintln(env.errOut, "k3sm update apply: resolve the latest release:", err)
 			return exitInternalError
@@ -783,6 +838,8 @@ func runUpdateApply(ctx context.Context, args []string, env updateEnv) int {
 		return exitInternalError
 	}
 	plan := update.NewPlan(target, nodes.Items, controllerNode(ctx, cs), *drain, string(sig), *allowDowngrade)
+	plan.Channel = planChannel(reading, channelErr)
+	plan.Pin, plan.Pinned = planPin(env, target, pinning, *pinSHA)
 	plan.Render(env.out)
 	if !*yes {
 		fmt.Fprintf(env.out, "\nStart the update to %s? [y/N] ", status.ClipText(target, 128))

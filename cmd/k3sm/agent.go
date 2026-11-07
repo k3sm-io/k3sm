@@ -810,6 +810,7 @@ func agentNodeOptions(opts agentOptions, res *bootstrap.JoinResult, kubeconfigPa
 		updateRoot:  updateRootFor(opts.workDir),
 		budgetDir:   budgetDirFor(opts.workDir),
 		statusDir:   agentStatusDir(opts.workDir),
+		dataRoot:    executor.RuntimeRoot(opts.workDir),
 		// The recorded release base, which the update watcher's pin admits.
 		updateReleaseBase: opts.updateReleaseBase,
 		// The cluster CA this worker's credential pins: an update's signer

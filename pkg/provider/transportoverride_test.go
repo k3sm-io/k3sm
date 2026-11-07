@@ -26,7 +26,9 @@ import (
 	"testing"
 	"time"
 
+	rpcstatus "google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	corev1 "k8s.io/api/core/v1"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
@@ -75,6 +77,13 @@ type leaseRuntimeServer struct {
 	boxIPs     map[string]string // pod id -> the PodBox.pod_ip the provider sent
 	transports map[string]string // pod id -> the LAST lease pushed for it
 	restarts   int               // RestartContainer RPCs received
+	// onDelete, when set, runs inside DeletePod before the pod is forgotten, and
+	// its error is the RPC's answer: how a test holds a stop open, or refuses it.
+	// Guarded by mu.
+	onDelete func(podID string) error
+	// forgotten holds the pods GetPodStatus answers NotFound for, as a real runtimed
+	// does from the moment its DeletePod begins, ahead of the guest's stop.
+	forgotten map[string]struct{}
 }
 
 func newLeaseRuntimeServer(echoPodIP bool) *leaseRuntimeServer {
@@ -84,6 +93,7 @@ func newLeaseRuntimeServer(echoPodIP bool) *leaseRuntimeServer {
 		live:       map[string]struct{}{},
 		boxIPs:     map[string]string{},
 		transports: map[string]string{},
+		forgotten:  map[string]struct{}{},
 	}
 }
 
@@ -137,6 +147,14 @@ func (s *leaseRuntimeServer) reportedPodIP(podID string) string {
 
 func (s *leaseRuntimeServer) DeletePod(_ context.Context, req *runtimev1.DeletePodRequest) (*runtimev1.DeletePodResponse, error) {
 	s.mu.Lock()
+	hook := s.onDelete
+	s.mu.Unlock()
+	if hook != nil {
+		if err := hook(req.GetPodId()); err != nil {
+			return nil, err
+		}
+	}
+	s.mu.Lock()
 	delete(s.live, req.GetPodId())
 	s.mu.Unlock()
 	return &runtimev1.DeletePodResponse{}, nil
@@ -151,8 +169,26 @@ func (s *leaseRuntimeServer) GetPodStatus(_ context.Context, req *runtimev1.GetP
 	id := req.GetPodId()
 	s.mu.Lock()
 	transport := s.transports[id]
+	_, forgotten := s.forgotten[id]
 	s.mu.Unlock()
+	if forgotten {
+		return &runtimev1.GetPodStatusResponse{Error: &rpcstatus.Status{Code: int32(codes.NotFound), Message: "not found"}}, nil
+	}
 	return &runtimev1.GetPodStatusResponse{Status: leaseStatus(id, s.reportedPodIP(id), transport)}, nil
+}
+
+// forget makes GetPodStatus answer NotFound for podID from now on.
+func (s *leaseRuntimeServer) forget(podID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.forgotten[podID] = struct{}{}
+}
+
+// setLease changes the lease GetPodStatus answers with, without an event.
+func (s *leaseRuntimeServer) setLease(podID, lease string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.transports[podID] = lease
 }
 
 // WatchPodStatus forwards pushed events until the stream ends.

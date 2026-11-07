@@ -123,8 +123,11 @@ prune   delete the cluster registry's untagged manifests and evict what no
         pod uses from this node's cache. DRY RUN BY DEFAULT — pass --force to
         delete. The registry half runs on the server that holds the registry:
         a manifest a tag, a tagged index or a kept referrer still needs stays,
-        and so does one younger than an hour (a push may be in flight); the
-        registry's garbage collection then reclaims the layers. The cache half
+        and so does one younger than an hour (a push may be in flight). After
+        --force deletes any, the registry's garbage collection sweeps the
+        repositories it deleted from at once, with its usual grace and brakes,
+        and the report says what that freed (blobs, bytes) or what stopped it;
+        a layer it leaves goes at a later scheduled sweep. The cache half
         is the runtimed Images service's own prune: a pod's content is never
         deleted, and if the daemon cannot enumerate every pod's references it
         refuses the whole prune. -o json prints both halves as one document.
@@ -505,12 +508,12 @@ func dialRuntimed(_ context.Context, socket string) (grpc.ClientConnInterface, i
 // correct by locking, because no lock it holds is also held across the daemon's
 // own pull commit, so it would race the very writer it is trying to reason about.
 func imageCommand(ctx context.Context, o imageOptions, out io.Writer, dial imagesDialer) error {
-	return imageCommandWith(ctx, o, out, dial, deleteManifest)
+	return imageCommandWith(ctx, o, out, dial, deleteManifest, collectPruned)
 }
 
-// imageCommandWith is imageCommand with the registry's manifest deleter as a
-// seam, which only prune uses.
-func imageCommandWith(ctx context.Context, o imageOptions, out io.Writer, dial imagesDialer, del manifestDeleter) error {
+// imageCommandWith is imageCommand with the registry's manifest deleter and
+// its sweep after a forced prune as seams, which only prune uses.
+func imageCommandWith(ctx context.Context, o imageOptions, out io.Writer, dial imagesDialer, del manifestDeleter, collect prunedCollector) error {
 	// push is the one subcommand whose ordinary form is not a daemon client: it
 	// reads a layout the invoking user owns and uploads it to a registry as that
 	// user. Dialing first would fail a perfectly valid push on a node whose
@@ -562,7 +565,7 @@ func imageCommandWith(ctx context.Context, o imageOptions, out io.Writer, dial i
 		}
 		return nil
 	case "prune":
-		return imagePrune(ctx, client, o, out, del, time.Now())
+		return imagePrune(ctx, client, o, out, del, collect, time.Now())
 	}
 	return fmt.Errorf("unknown subcommand %q", o.subcommand)
 }

@@ -407,7 +407,7 @@ func newNode(nodeName string, cfg NodeConfig, timings nodeTimings) (*Node, error
 	pc, err := vknode.NewPodController(vknode.PodControllerConfig{
 		PodClient:         cfg.Client.CoreV1(),
 		EventRecorder:     recorder,
-		Provider:          p,
+		Provider:          ReplaceRecreatedPods(p, podLister),
 		PodInformer:       podInformer,
 		SecretInformer:    scopedSecretInformer{s: scm},
 		ConfigMapInformer: scopedConfigMapInformer{s: scm},

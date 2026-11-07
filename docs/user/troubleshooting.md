@@ -223,6 +223,19 @@ sudo launchctl kickstart -k system/io.k3sm.netd
 sudo k3sm install                               # the authoritative repair, and idempotent
 ```
 
+### The Install Refuses The Runtime Lock File
+
+If `sudo k3sm install` stops with `has 2 links` (or more) on `/var/lib/k3sm/runtimed.lock`,
+another name was hard-linked to that file, which older releases made possible while the data
+root was writable by the service user. The install refuses to change ownership of a file that
+another name shares. The lock file holds no state, so it is safe to remove. Remove the path the
+error names and re-run the install:
+
+```sh
+sudo rm /var/lib/k3sm/runtimed.lock
+sudo k3sm install
+```
+
 ## Stuck or Crash-Looping Pods
 
 On the **default runtime** (what every installed cluster runs), `restartPolicy` **is** honored. The
@@ -265,6 +278,8 @@ Read the reason first, because each one has a different recovery:
 | `ErrImageNeverPull` | `imagePullPolicy: Never` and the image is not in this node's store. Nothing is pulled and no registry is contacted. | Load it (`k3sm image load`), then wait for the node to re-check: up to two resync intervals, about 20s. |
 | `CreateContainerConfigError` | The container's run spec could not be built: a missing ConfigMap or Secret key, an env reference that does not resolve, an entrypoint the image config does not supply. | Fix the referenced object, then wait for the node to re-check: up to two resync intervals, about 20s. |
 | `InvalidImageName` | The reference does not parse. | Only a spec change helps: `kubectl set image`, or delete and recreate. Parsing the same string again cannot give a different answer. |
+| `ArtifactPullBackOff` | An `image` volume could not be fetched because the node's store would drop below its free-space floor. The node, not the artifact, is short. | Free space on the node's disk. The create is retried automatically on the same back-off, 10s doubling to a 300s ceiling. |
+| `ArtifactPullRefused` | An `image` volume's reference names a registry other than the cluster registry, which the node never fetches from. | Not retried. Point the volume at the cluster registry (`registry-k3sm:6450/<repository>`) and recreate the Pod; volumes cannot be edited in place. |
 
 `kubectl describe pod` carries the same story as Events. `Pulling` opens every attempt and names
 the image; `Pulled` closes a successful one, saying either how long the fetch took or that the image

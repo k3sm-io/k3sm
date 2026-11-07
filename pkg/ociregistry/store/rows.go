@@ -42,12 +42,25 @@ func ispecVersioned() specs.Versioned { return specs.Versioned{SchemaVersion: 2}
 //     carrying the tag; re-putting a tag at the digest it already names
 //     changes nothing;
 //   - a PUT by digest appends an untagged row unless a row for that digest
-//     exists.
+//     exists;
+//   - a tag delete removes the tag's row; when that was the digest's last row,
+//     an untagged row goes at the end of the index, so the manifest is still
+//     addressable by digest until a digest delete or GC.
 
 // tagRow is a tagged row for desc.
 func tagRow(desc ispec.Descriptor, tag string) ispec.Descriptor {
 	row := ispec.Descriptor{MediaType: desc.MediaType, Digest: desc.Digest, Size: desc.Size}
 	row.Annotations = map[string]string{ispec.AnnotationRefName: tag}
+	return row
+}
+
+// untaggedRow is row without its tag, its other annotations kept.
+func untaggedRow(row ispec.Descriptor) ispec.Descriptor {
+	row.Annotations = maps.Clone(row.Annotations)
+	delete(row.Annotations, ispec.AnnotationRefName)
+	if len(row.Annotations) == 0 {
+		row.Annotations = nil
+	}
 	return row
 }
 
@@ -66,12 +79,7 @@ func putTagged(rows []ispec.Descriptor, desc ispec.Descriptor, tag string) ([]is
 		if others {
 			rows = slices.Delete(rows, i, i+1)
 		} else {
-			old.Annotations = maps.Clone(old.Annotations)
-			delete(old.Annotations, ispec.AnnotationRefName)
-			if len(old.Annotations) == 0 {
-				old.Annotations = nil
-			}
-			rows[i] = old
+			rows[i] = untaggedRow(old)
 		}
 	}
 	rows = slices.DeleteFunc(rows, func(r ispec.Descriptor) bool {
@@ -102,8 +110,8 @@ func (s *Store) PutManifest(ctx context.Context, n ref.Name, r ref.Reference, me
 // nothing to the index when it fails. The server checks there that every blob
 // the manifest names is still in the repository: a sweep deletes only under
 // the same lock, so a blob present at the check stays until the index names
-// it. check must not take the repository lock.
-func (s *Store) PutManifestChecked(ctx context.Context, n ref.Name, r ref.Reference, mediaType string, body []byte, check func() error) (ispec.Descriptor, error) {
+// it. check holds the lock through its Locked value and must not take it again.
+func (s *Store) PutManifestChecked(ctx context.Context, n ref.Name, r ref.Reference, mediaType string, body []byte, check func(*Locked) error) (ispec.Descriptor, error) {
 	if mediaType == "" {
 		return ispec.Descriptor{}, fmt.Errorf("put manifest in %s: no media type", n)
 	}
@@ -119,9 +127,13 @@ func (s *Store) PutManifestChecked(ctx context.Context, n ref.Name, r ref.Refere
 		return ispec.Descriptor{}, fmt.Errorf("put manifest in %s: %w", n, err)
 	}
 	desc := ispec.Descriptor{MediaType: mediaType, Digest: d, Size: int64(len(body))}
-	err := s.updateIndex(ctx, n, func(rows []ispec.Descriptor) ([]ispec.Descriptor, bool, error) {
+	dir, err := s.repoDir(n)
+	if err != nil {
+		return ispec.Descriptor{}, fmt.Errorf("put manifest in %s: %w", n, err)
+	}
+	err = s.updateIndex(ctx, n, func(rows []ispec.Descriptor) ([]ispec.Descriptor, bool, error) {
 		if check != nil {
-			if err := check(); err != nil {
+			if err := check(&Locked{s: s, n: n, dir: dir}); err != nil {
 				return nil, false, err
 			}
 		}
@@ -156,15 +168,38 @@ func IndexState(rows []ispec.Descriptor) (string, error) {
 	return d.Digest().String(), nil
 }
 
-// DeleteTag removes the one row carrying tag.
+// deleteTagRow applies a tag delete of the row at i to rows. keep, when it is
+// set, decides whether a manifest losing its last row gets the untagged one.
+func deleteTagRow(rows []ispec.Descriptor, i int, keep func(ispec.Descriptor) (bool, error)) ([]ispec.Descriptor, error) {
+	old := rows[i]
+	rows = slices.Delete(rows, i, i+1)
+	if slices.ContainsFunc(rows, func(r ispec.Descriptor) bool { return r.Digest == old.Digest }) {
+		return rows, nil
+	}
+	if keep != nil {
+		ok, err := keep(old)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return rows, nil
+		}
+	}
+	return append(rows, untaggedRow(old)), nil
+}
+
+// DeleteTag removes tag and nothing it names: the row carrying it goes, and a
+// manifest with no other row keeps an untagged one (see the row rules above).
 func (s *Store) DeleteTag(ctx context.Context, n ref.Name, tag string) error {
-	return s.DeleteTagChecked(ctx, n, tag, func([]ispec.Descriptor) error { return nil })
+	return s.DeleteTagChecked(ctx, n, tag, func([]ispec.Descriptor) error { return nil }, nil)
 }
 
 // DeleteTagChecked is DeleteTag that first runs check over the rows under the
-// repository lock and deletes nothing when it fails. check must not take the
-// repository lock.
-func (s *Store) DeleteTagChecked(ctx context.Context, n ref.Name, tag string, check func([]ispec.Descriptor) error) error {
+// repository lock and deletes nothing when it fails. keep, when it is set, runs
+// under the lock too, for a manifest losing its last row: it reports whether
+// the manifest keeps an untagged row, and an error deletes nothing. Neither may
+// take the repository lock.
+func (s *Store) DeleteTagChecked(ctx context.Context, n ref.Name, tag string, check func([]ispec.Descriptor) error, keep func(ispec.Descriptor) (bool, error)) error {
 	return s.updateIndex(ctx, n, func(rows []ispec.Descriptor) ([]ispec.Descriptor, bool, error) {
 		i := slices.IndexFunc(rows, func(r ispec.Descriptor) bool { return r.Annotations[ispec.AnnotationRefName] == tag })
 		if i < 0 {
@@ -173,7 +208,11 @@ func (s *Store) DeleteTagChecked(ctx context.Context, n ref.Name, tag string, ch
 		if err := check(rows); err != nil {
 			return nil, false, err
 		}
-		return slices.Delete(rows, i, i+1), true, nil
+		rows, err := deleteTagRow(rows, i, keep)
+		if err != nil {
+			return nil, false, err
+		}
+		return rows, true, nil
 	})
 }
 

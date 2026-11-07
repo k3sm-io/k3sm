@@ -24,6 +24,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/dynamic/dynamicinformer"
+	"k8s.io/client-go/tools/cache"
 
 	mlxv1alpha1 "k3sm.io/apis/mlx/v1alpha1"
 	netv1alpha1 "k3sm.io/apis/net/v1alpha1"
@@ -71,4 +73,30 @@ func usesInterconnect(u *unstructured.Unstructured) bool {
 		return false
 	}
 	return path != string(mlxv1alpha1.MLXInterconnectNetwork)
+}
+
+// watchMLXModels starts an MLXModel informer over dyn that calls nudge on
+// every add and delete, and on every update that changes the generation (a
+// spec change, such as a new spec.distributed.interconnect): the desired
+// annotation must list a model that moves onto the interconnect before the
+// operator places its ranks. A status-only update nudges nothing. The returned
+// shutdown waits for the informer to stop, which happens once stop closes. It
+// does not wait for the informer to sync: the nudges only bring forward a
+// reconcile that lists the MLXModels itself.
+func watchMLXModels(dyn dynamic.Interface, nudge func(), stop <-chan struct{}) (shutdown func(), synced cache.InformerSynced) {
+	f := dynamicinformer.NewDynamicSharedInformerFactory(dyn, 0)
+	inf := f.ForResource(mlxModelGVR).Informer()
+	_, _ = inf.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(any) { nudge() },
+		UpdateFunc: func(oldObj, newObj any) {
+			o, ok1 := oldObj.(*unstructured.Unstructured)
+			n, ok2 := newObj.(*unstructured.Unstructured)
+			if !ok1 || !ok2 || o.GetGeneration() != n.GetGeneration() || o.GetUID() != n.GetUID() {
+				nudge()
+			}
+		},
+		DeleteFunc: func(any) { nudge() },
+	})
+	f.Start(stop)
+	return f.Shutdown, inf.HasSynced
 }

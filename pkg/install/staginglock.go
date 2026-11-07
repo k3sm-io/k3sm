@@ -172,9 +172,10 @@ const legacySwapSuffix = ".staging"
 // name. It runs under both locks, judges each path
 // with an lstat first (a symlink, a non-directory, a non-root owner or a
 // group- or other-writable directory is refused, never followed), and removes
-// a trusted tree without following any symlink inside it. A tree an older
-// build left at the staging root under the old swap name is removed here, and
-// only here.
+// a trusted tree without following any symlink inside it, clearing any user
+// locking flag it meets (see removeTreeFlagged for what that does with entries
+// not owned by root). A tree an older build left at the staging root under the
+// old swap name is removed here, and only here.
 func sweepStaging(sys System, cfg Config) error {
 	var firstErr error
 	paths := []string{cfg.stagingRoot(), cfg.swapDir()}

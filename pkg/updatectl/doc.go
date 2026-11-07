@@ -81,6 +81,18 @@ limitations under the License.
 // Cancelled) is never resumed: Spec.Version is immutable, so a retry is a new
 // "current".
 //
+// # When an Update is gone
+//
+// The update annotations on a Node are the controller's to clean up once no
+// Update accounts for them, so a deleted Update does not leave its node
+// cordoned. Every reconcile that finds no live roll clears them, and lifts a
+// cordon only where the CordonedAnnotation says the controller made it; the
+// first pass of a new leader does the same, so a restart finds an orphan. A
+// finished Update still accounts for its failed node, whole, and for the record
+// on a node it moved (update-version, -payload, -phase and a late rotation
+// mark); anything else a finished Update's nodes carry goes. A live roll is
+// never touched.
+//
 // # Restart safety
 //
 // Every step is idempotent over the persisted status and the Node objects, so a

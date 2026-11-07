@@ -25,12 +25,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"k3sm.io/k3sm/pkg/ociregistry/ref"
-	"k3sm.io/k3sm/pkg/ociregistry/store"
 )
 
 // Bounds of one FuzzHandlers input. They keep each input to one short request,
@@ -58,6 +56,14 @@ var (
 // and its state directory, and that inside them every entry is one the store
 // layout names and none is a symlink.
 func FuzzHandlers(f *testing.F) {
+	// The store every input starts from, pushed once and cloned per input.
+	seeded := newFixture(f)
+	subject := seeded.image(f, "app", "v1", "layer")
+	seeded.pushBlob(f, "app", ispec.DescriptorEmptyJSON.Data)
+	sig := referrerBody(subject, "application/vnd.example.sig", 0)
+	want(f, seeded.pushManifest(f, "app", dg(sig).String(), ispec.MediaTypeImageManifest, sig), http.StatusCreated, "")
+	seeded.image(f, "team/app", "v1", "nested")
+
 	f.Fuzz(func(t *testing.T, method uint8, path, query, contentRange string, ctype uint8, body []byte) {
 		if len(path) > fuzzMaxPath || len(query) > fuzzMaxQuery || len(body) > fuzzMaxBody || len(contentRange) > 128 {
 			t.Skip("over the input bounds")
@@ -68,20 +74,9 @@ func FuzzHandlers(f *testing.F) {
 		if err := os.Mkdir(outside, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		st, err := store.OpenWorkDir(work)
-		if err != nil {
-			t.Fatal(err)
-		}
-		srv, err := New(Config{Store: st, GCGrace: time.Hour, Authorize: AllowAll, FreeSpace: func() (uint64, error) { return 1 << 40, nil }})
-		if err != nil {
-			t.Fatal(err)
-		}
-		fx := &fixture{srv: srv, st: st, root: st.Root()}
-		subject := fx.image(t, "app", "v1", "layer")
-		fx.pushBlob(t, "app", ispec.DescriptorEmptyJSON.Data)
-		sig := referrerBody(subject, "application/vnd.example.sig", 0)
-		want(t, fx.pushManifest(t, "app", dg(sig).String(), ispec.MediaTypeImageManifest, sig), http.StatusCreated, "")
-		fx.image(t, "team/app", "v1", "nested")
+		cloneWork(t, seeded.workDir(), work)
+		fx := fixtureOver(t, work)
+		srv, st := fx.srv, fx.st
 		w := fx.do(http.MethodPost, "/v2/app/blobs/uploads/", nil)
 		want(t, w, http.StatusAccepted, "")
 		upload := strings.TrimPrefix(w.Header().Get("Location"), "/v2/app/blobs/uploads/")
@@ -117,7 +112,7 @@ func FuzzHandlers(f *testing.F) {
 // one of: a directory in dirs, the store root and state directory, a
 // directory whose path below root is a repository name (or a name's parent),
 // a repository's oci-layout, index.json, blobs/<algorithm>/<hex> and
-// .uploads/<id>, and the state directory's locks/<hex>.
+// .uploads/<id>, and the state directory's locks/<hex> and rows/<hex>.
 func strayEntries(t *testing.T, base string, dirs map[string]bool, root, state string) []string {
 	t.Helper()
 	var bad []string
@@ -160,7 +155,8 @@ func storeEntry(p string, isDir bool, root, state string) bool {
 	}
 	if rel, err := filepath.Rel(state, p); err == nil && !strings.HasPrefix(rel, "..") {
 		e := strings.Split(rel, string(filepath.Separator))
-		return (len(e) == 1 && e[0] == "locks" && isDir) || (len(e) == 2 && e[0] == "locks" && !isDir && hex(e[1]))
+		stateDir := e[0] == "locks" || e[0] == "rows"
+		return (len(e) == 1 && stateDir && isDir) || (len(e) == 2 && stateDir && !isDir && hex(e[1]))
 	}
 	rel, err := filepath.Rel(root, p)
 	if err != nil || strings.HasPrefix(rel, "..") {

@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -228,4 +229,40 @@ func (e *env) sweep(t *testing.T, c *Collector) Report {
 		t.Fatal(err)
 	}
 	return rep
+}
+
+// converge runs one dedupe pass over every repository.
+func (e *env) converge() (store.ConvergeReport, error) {
+	return e.s.Converge(e.ctx, store.ConvergeOptions{
+		Reviewed: func(ref.Name) bool { return true },
+		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+}
+
+// whole returns why img is not readable in n: a blob that is gone, or whose
+// bytes do not hash to its name.
+func (e *env) whole(n ref.Name, img image) error {
+	for _, d := range img.blobs() {
+		b, err := readAll(e, n, d)
+		if err != nil {
+			return fmt.Errorf("%s lost %s: %w", n, d, err)
+		}
+		if got := d.Algorithm().FromBytes(b); got != d {
+			return fmt.Errorf("%s holds %s with the bytes of %s", n, d, got)
+		}
+	}
+	return nil
+}
+
+func (e *env) sameInode(t *testing.T, a, b ref.Name, d digest.Digest) bool {
+	t.Helper()
+	fa, err := os.Stat(e.blobFile(t, a, d))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fb, err := os.Stat(e.blobFile(t, b, d))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return os.SameFile(fa, fb)
 }

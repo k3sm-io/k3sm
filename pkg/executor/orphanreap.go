@@ -33,8 +33,8 @@ import (
 //
 // Every control-plane child runs in its own process group (spawnEnv), so a
 // SIGKILL of the server reaches none of them: kine, the apiserver, the scheduler,
-// the controller-manager and the registry's zot keep running under launchd
-// (ppid 1), still holding their ports. The server launchd starts next then finds
+// the controller-manager and a zot registry child an earlier release started keep
+// running under launchd (ppid 1), still holding their ports. The server launchd starts next then finds
 // the datastore port held and refuses, correctly for a foreign holder, and parks
 // on the crash-loop breaker after five refusals.
 //
@@ -83,11 +83,13 @@ const reapPortWait = 2 * time.Second
 const launchdPPID = 1
 
 // reapTiers is the order the leftovers are stopped in: the apiserver drains first,
-// then the controllers, as Stop does (shutdownOrder), then the registry's zot (which
-// an ordinary shutdown stops before the control plane, outside Stop), and the
-// datastore last so nothing loses it mid-shutdown. helm and
-// kubectl are deliberately absent: they are not long-running server children
-// (helm runs inside pods, which the node re-attaches).
+// then the controllers, as Stop does (shutdownOrder), then a zot an earlier release
+// left (an ordinary shutdown stops the registry before the control plane, outside
+// Stop), and the datastore last so nothing loses it mid-shutdown. helm and kubectl
+// are deliberately absent: they are not long-running server children (helm runs
+// inside pods, which the node re-attaches). k3sm is never listed: these tiers match
+// by name, and the registry child, itself a k3sm process, exits when its parent dies
+// and is reclaimed by exact argv in registrysvc.
 var reapTiers = [][]string{
 	{"kube-apiserver"},
 	{"kube-scheduler", "kube-controller-manager"},

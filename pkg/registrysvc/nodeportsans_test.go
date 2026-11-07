@@ -188,7 +188,7 @@ func TestRelayVerifiesAtTheNodePortAddress(t *testing.T) {
 
 	start := func(t *testing.T, ext NodePortSANs) *memListener {
 		t.Helper()
-		_, zaddr := socketZot(t)
+		_, zaddr := socketRegistry(t)
 		registryPort := portOf(t, zaddr)
 		serving, err := NewServingIdentity(ServingConfig{
 			Mint: func() (tls.Certificate, error) {

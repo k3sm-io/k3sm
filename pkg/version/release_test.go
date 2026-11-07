@@ -16,7 +16,11 @@ limitations under the License.
 
 package version
 
-import "testing"
+import (
+	"os"
+	"strings"
+	"testing"
+)
 
 func TestValidTag(t *testing.T) {
 	for tag, want := range map[string]bool{
@@ -26,6 +30,54 @@ func TestValidTag(t *testing.T) {
 	} {
 		if got := ValidTag(tag); got != want {
 			t.Errorf("ValidTag(%q) = %v, want %v", tag, got, want)
+		}
+	}
+}
+
+// TestCanonicalTagCorpus holds the grammar to testdata/release-tags.txt: every
+// verdict matches, every refused tag is one ValidTag would let through (so the
+// grammar is what refuses it), and every canonical tag orders under
+// CompareReleases, which is how a channel ranks them.
+func TestCanonicalTagCorpus(t *testing.T) {
+	data, err := os.ReadFile("testdata/release-tags.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	counts := map[string]int{}
+	for line := range strings.Lines(string(data)) {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) != 2 || (fields[0] != "canonical" && fields[0] != "refused") {
+			t.Fatalf("malformed corpus line %q", line)
+		}
+		verdict, tag := fields[0], fields[1]
+		counts[verdict]++
+		if got := CanonicalTag(tag); got != (verdict == "canonical") {
+			t.Errorf("CanonicalTag(%q) = %v, corpus says %s", tag, got, verdict)
+		}
+		if !ValidTag(tag) {
+			t.Errorf("corpus tag %q fails ValidTag, so it proves nothing about the grammar", tag)
+		}
+		if verdict == "canonical" {
+			if _, ok := CompareReleases(tag, "v0.0.0"); !ok {
+				t.Errorf("canonical tag %q does not order under CompareReleases", tag)
+			}
+		}
+	}
+	if counts["canonical"] == 0 || counts["refused"] == 0 {
+		t.Fatalf("corpus verdicts = %v, want both kinds", counts)
+	}
+}
+
+// TestCanonicalTagWholeString pins what a line-based corpus cannot carry: a tag
+// with a line break or a space around it is not canonical.
+func TestCanonicalTagWholeString(t *testing.T) {
+	for _, tag := range []string{"", "v0.3.0\n", "\nv0.3.0", "v0.3.0\nv0.3.1", " v0.3.0", "v0.3.0 "} {
+		if CanonicalTag(tag) {
+			t.Errorf("CanonicalTag(%q) = true", tag)
 		}
 	}
 }

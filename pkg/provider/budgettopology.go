@@ -21,7 +21,7 @@ import (
 
 	budgetv1alpha1 "k3sm.io/apis/budget/v1alpha1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
-	"k3sm.io/k3sm/pkg/mlx"
+	"k3sm.io/k3sm/pkg/gpucapacity"
 )
 
 // cpuCoreSplit is the host's logical CPUs by performance level. split is
@@ -50,10 +50,10 @@ func applyBudgetTopology(c *budgetv1alpha1.BudgetCapacity, cores cpuCoreSplit, g
 	if gpu == nil {
 		return
 	}
-	present := mlx.GPUAdvertisable(gpu)
+	present := gpucapacity.GPUAdvertisable(gpu)
 	var count int64
 	if present {
-		count = mlx.GPUSlots(gpu)
+		count = gpucapacity.GPUSlots(gpu)
 	}
 	c.GPUPresent, c.GPUCount = &present, &count
 }

@@ -26,6 +26,8 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // The launcher-link half of the production darwin System, exercised against a
@@ -201,6 +203,56 @@ func TestEnsureSymlink(t *testing.T) {
 			// Idempotent: asking again for the same link is a no-op success.
 			if err := sys.EnsureSymlink(target, link); err != nil {
 				t.Errorf("second EnsureSymlink must be a no-op success, got %v", err)
+			}
+		})
+	}
+}
+
+// TestLauncherSymlinkReadableUnderRestrictiveUmask pins B1384: a symlink takes
+// the process umask, so an install run under umask 077 used to leave the
+// launcher link lrwx------ and the login user could not resolve `k3sm`. The
+// already-correct early return kept such a link as it was. Both the fresh link
+// and a pre-existing correct one made under 077 must come out with 0755 on the
+// link itself.
+//
+// Not parallel: the umask is process-wide.
+func TestLauncherSymlinkReadableUnderRestrictiveUmask(t *testing.T) {
+	old := unix.Umask(0o077)
+	defer unix.Umask(old)
+
+	sys := darwinSystem{}
+	for _, tc := range []struct {
+		name     string
+		existing bool
+	}{
+		{name: "no link yet"},
+		{name: "already-correct link made under 077", existing: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			mkdir(t, filepath.Join(root, "bin"), 0o755)
+			link, target := filepath.Join(root, "bin", "k3sm"), filepath.Join(root, "Library", "k3sm")
+			if tc.existing {
+				if err := os.Symlink(target, link); err != nil {
+					t.Fatal(err)
+				}
+				fi, err := os.Lstat(link)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if perm := fi.Mode().Perm(); perm != 0o700 {
+					t.Fatalf("precondition: link made under umask 077 has mode %04o, want 0700", perm)
+				}
+			}
+			if err := sys.EnsureSymlink(target, link); err != nil {
+				t.Fatalf("EnsureSymlink(%q, %q): %v", target, link, err)
+			}
+			fi, err := os.Lstat(link)
+			if err != nil {
+				t.Fatalf("lstat %s: %v", link, err)
+			}
+			if perm := fi.Mode().Perm(); perm != 0o755 {
+				t.Errorf("launcher link mode = %04o, want 0755", perm)
 			}
 		})
 	}
@@ -1791,4 +1843,282 @@ func TestEnsureFileOwnedBy(t *testing.T) {
 			t.Fatalf("ensureFileOwnedBy = %v, want ErrNotRegularFile", err)
 		}
 	})
+}
+
+// TestEnsureFileOwnedByRefusesHardlinkWithRemedy pins that the hard link refusal
+// names the file to remove and that removing it is safe.
+func TestEnsureFileOwnedByRefusesHardlinkWithRemedy(t *testing.T) {
+	root := t.TempDir()
+	other := filepath.Join(root, "elsewhere")
+	if err := os.WriteFile(other, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "runtimed.lock")
+	if err := os.Link(other, path); err != nil {
+		t.Fatal(err)
+	}
+	err := ensureFileOwnedBy(path, os.Getuid(), os.Getgid(), 0o600)
+	if !errors.Is(err, errHardlinkRefused) || !errors.Is(err, ErrNotRegularFile) {
+		t.Fatalf("ensureFileOwnedBy = %v, want the hard link refusal", err)
+	}
+	for _, want := range []string{"sudo rm " + path, "safe to remove", "no state"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not contain %q", err, want)
+		}
+	}
+}
+
+// TestEnsureFileOwnedByViaSeams proves the ownership is applied through the
+// opened descriptor with the requested owner, and that an entry swapped to a
+// symlink between the lstat and the open is refused.
+func TestEnsureFileOwnedByViaSeams(t *testing.T) {
+	t.Run("fchown is issued on the opened fd with a different owner", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "runtimed.lock")
+		var openedFD, gotFD, gotUID, gotGID int
+		calls := 0
+		ops := fileOps{
+			open: func(p string, m int, perm uint32) (int, error) {
+				fd, err := unix.Open(p, m, perm)
+				openedFD = fd
+				return fd, err
+			},
+			fchown: func(fd, uid, gid int) error {
+				calls++
+				gotFD, gotUID, gotGID = fd, uid, gid
+				return nil
+			},
+		}
+		wantUID, wantGID := os.Getuid()+1, os.Getgid()+1
+		if err := ensureFileOwnedByVia(ops, path, wantUID, wantGID, 0o600); err != nil {
+			t.Fatalf("ensureFileOwnedByVia: %v", err)
+		}
+		if calls != 1 || gotFD != openedFD || gotUID != wantUID || gotGID != wantGID {
+			t.Errorf("fchown calls=%d fd=%d owner=%d:%d, want 1 call on fd %d as %d:%d", calls, gotFD, gotUID, gotGID, openedFD, wantUID, wantGID)
+		}
+		assertMode(t, path, 0o600)
+	})
+
+	t.Run("a symlink swapped in after the lstat is refused", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "runtimed.lock")
+		ops := fileOps{
+			open: func(p string, m int, perm uint32) (int, error) {
+				if m&unix.O_NOFOLLOW == 0 {
+					t.Errorf("open flags %#x lack O_NOFOLLOW", m)
+				}
+				return -1, unix.ELOOP
+			},
+			fchown: func(fd, uid, gid int) error {
+				t.Error("fchown was called after a refused open")
+				return nil
+			},
+		}
+		err := ensureFileOwnedByVia(ops, path, os.Getuid(), os.Getgid(), 0o600)
+		if !errors.Is(err, ErrNotRegularFile) || !errors.Is(err, errSymlinkRefused) {
+			t.Fatalf("ensureFileOwnedByVia = %v, want the symlink refusal", err)
+		}
+	})
+}
+
+// TestEnsureFileOwnedRefusalsNeverChown proves every refusal leaves the owner
+// alone: the open carries O_NOFOLLOW, so a symlink swapped in after the lstat
+// fails the open, and a hard link is refused on its link count. A fchown on
+// either would hand another file to the service user.
+func TestEnsureFileOwnedRefusalsNeverChown(t *testing.T) {
+	failChown := func(t *testing.T) func(fd, uid, gid int) error {
+		return func(fd, uid, gid int) error {
+			t.Errorf("fchown(%d, %d, %d) was called on a refused entry", fd, uid, gid)
+			return nil
+		}
+	}
+
+	t.Run("the open carries O_NOFOLLOW so a swapped-in symlink is refused", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "runtimed.lock")
+		target := filepath.Join(dir, "target")
+		if err := os.WriteFile(target, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		ops := fileOps{
+			open: func(p string, m int, perm uint32) (int, error) {
+				// The swap lands between the lstat and the open.
+				if err := os.Remove(p); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(target, p); err != nil {
+					t.Fatal(err)
+				}
+				if m&unix.O_NOFOLLOW == 0 {
+					t.Errorf("open flags %#x lack O_NOFOLLOW", m)
+				}
+				return unix.Open(p, m, perm)
+			},
+			fchown: failChown(t),
+		}
+		err := ensureFileOwnedByVia(ops, path, os.Getuid()+1, os.Getgid()+1, 0o600)
+		if !errors.Is(err, ErrNotRegularFile) || !errors.Is(err, errSymlinkRefused) {
+			t.Fatalf("ensureFileOwnedByVia = %v, want the symlink refusal", err)
+		}
+	})
+
+	t.Run("a hard link is refused before any fchown", func(t *testing.T) {
+		dir := t.TempDir()
+		other := filepath.Join(dir, "other")
+		path := filepath.Join(dir, "runtimed.lock")
+		if err := os.WriteFile(other, []byte("keep"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Link(other, path); err != nil {
+			t.Fatal(err)
+		}
+		ops := fileOps{open: unix.Open, fchown: failChown(t)}
+		err := ensureFileOwnedByVia(ops, path, os.Getuid()+1, os.Getgid()+1, 0o644)
+		if !errors.Is(err, ErrNotRegularFile) || !errors.Is(err, errHardlinkRefused) {
+			t.Fatalf("ensureFileOwnedByVia = %v, want the hard-link refusal", err)
+		}
+	})
+}
+
+// TestEnsureFileOwnedRefusesNonRegular pins the two checks that keep a root
+// fchown off anything but a regular file. A fifo or a directory swapped in
+// between the lstat and the open opens read-only without error, so the fstat is
+// what refuses it: the only guard for a fifo, whose link count is 1, and the one
+// that names a directory correctly. The lstat refuses one already there before
+// any open, which the fstat alone would hide if only the error were asserted.
+func TestEnsureFileOwnedRefusesNonRegular(t *testing.T) {
+	failChown := func(t *testing.T) func(fd, uid, gid int) error {
+		return func(fd, uid, gid int) error {
+			t.Errorf("fchown(%d, %d, %d) was called on a non-regular entry", fd, uid, gid)
+			return nil
+		}
+	}
+
+	swaps := []struct {
+		name  string
+		plant func(t *testing.T, path string)
+		mode  fs.FileMode
+		kind  fs.FileMode
+	}{
+		{
+			name: "a fifo swapped in after the lstat",
+			plant: func(t *testing.T, path string) {
+				if err := syscall.Mkfifo(path, 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(path, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+			mode: 0o644,
+			kind: fs.ModeNamedPipe,
+		},
+		{
+			name:  "a directory swapped in after the lstat",
+			plant: func(t *testing.T, path string) { mkdir(t, path, 0o755) },
+			mode:  0o755,
+			kind:  fs.ModeDir,
+		},
+	}
+	for _, tc := range swaps {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "runtimed.lock")
+			if err := os.WriteFile(path, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			swapped := false
+			ops := fileOps{
+				open: func(p string, m int, perm uint32) (int, error) {
+					// Without O_NONBLOCK a fifo with no writer blocks this open
+					// forever, so its absence fails here and opens nothing.
+					if m&unix.O_NONBLOCK == 0 {
+						t.Errorf("open flags %#x lack O_NONBLOCK", m)
+						return -1, unix.EINVAL
+					}
+					if err := os.Remove(p); err != nil {
+						t.Fatal(err)
+					}
+					tc.plant(t, p)
+					swapped = true
+					return unix.Open(p, m, perm)
+				},
+				fchown: failChown(t),
+			}
+			err := ensureFileOwnedByVia(ops, path, os.Getuid()+1, os.Getgid()+1, 0o600)
+			if !swapped {
+				t.Fatal("the open seam never ran, so nothing was swapped in")
+			}
+			if !errors.Is(err, ErrNotRegularFile) {
+				t.Errorf("ensureFileOwnedByVia = %v, want ErrNotRegularFile", err)
+			}
+			// A directory has a link count above 1 on APFS, so without the type
+			// check it is still refused, as a hard link with a wrong remedy.
+			if errors.Is(err, errHardlinkRefused) {
+				t.Errorf("ensureFileOwnedByVia = %v, want the type refusal, not the link count one", err)
+			}
+			fi, err := os.Lstat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if fi.Mode().Type() != tc.kind {
+				t.Errorf("entry is now %v, want it left as %v", fi.Mode().Type(), tc.kind)
+			}
+			assertMode(t, path, tc.mode)
+		})
+	}
+
+	t.Run("a fifo already there is refused before any open", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "runtimed.lock")
+		if err := syscall.Mkfifo(path, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		ops := fileOps{
+			open: func(p string, m int, perm uint32) (int, error) {
+				t.Errorf("open(%s) was called on an entry the lstat should refuse", p)
+				return -1, unix.EACCES
+			},
+			fchown: failChown(t),
+		}
+		err := ensureFileOwnedByVia(ops, path, os.Getuid()+1, os.Getgid()+1, 0o600)
+		if !errors.Is(err, ErrNotRegularFile) {
+			t.Errorf("ensureFileOwnedByVia = %v, want ErrNotRegularFile", err)
+		}
+		fi, err := os.Lstat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Mode().Type() != fs.ModeNamedPipe {
+			t.Errorf("entry is now %v, want the fifo left in place", fi.Mode().Type())
+		}
+		assertMode(t, path, 0o644)
+	})
+}
+
+// TestLockDirectoryRemedy pins that a directory standing in for the lock file is
+// refused as a non-regular entry, left as it was, with a remedy that works on a
+// directory: `sudo rm` fails on one.
+func TestLockDirectoryRemedy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "runtimed.lock")
+	if err := os.Mkdir(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	err := ensureFileOwnedBy(path, os.Getuid(), os.Getgid(), 0o600)
+	if !errors.Is(err, ErrNotRegularFile) || errors.Is(err, errHardlinkRefused) {
+		t.Fatalf("ensureFileOwnedBy = %v, want ErrNotRegularFile and not the hard link refusal", err)
+	}
+	for _, want := range []string{"directory", "sudo rmdir " + path, "sudo rm -rf " + path, "no state"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not contain %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), "sudo rm "+path) {
+		t.Errorf("error %q offers `sudo rm`, which fails on a directory", err)
+	}
+	if fi, statErr := os.Lstat(path); statErr != nil || !fi.IsDir() {
+		t.Errorf("entry = %v, %v; want the directory left in place", fi, statErr)
+	}
 }

@@ -28,7 +28,7 @@ import (
 //
 // The digest is a HARD PIN, taken from the release's own checksums.txt:
 //
-//	https://github.com/docker/buildx/releases/download/v0.38.0/checksums.txt
+//	https://github.com/docker/buildx/releases/download/v0.38.1/checksums.txt
 //
 // It is verified in-pod on EVERY run, not only on download: the binary lives on
 // a PVC that outlives any single pod, so "we fetched it correctly once" is not
@@ -50,11 +50,11 @@ import (
 // pin (version + tag) stays the single source of truth for both.
 const (
 	// BuildxVersion is the pinned buildx release tag.
-	BuildxVersion = "v0.38.0"
+	BuildxVersion = "v0.38.1"
 	// BuildxAsset is the pinned buildx asset name (the guest is linux/arm64).
 	BuildxAsset = "buildx-" + BuildxVersion + "." + guestBuildxPlatform
 	// BuildxSHA256 is the pinned asset's sha256, from the release checksums.txt.
-	BuildxSHA256 = "38e890e1a162bfdbf32fbe91404991dc4fc28e55b0de901b34374a061bab4d2c"
+	BuildxSHA256 = "3b83b3731916ba433feccaaa689fe5bcdc81c641d92c8e6c2ea865dfa141c97a"
 
 	// guestBuildxPlatform is the in-pod asset's platform suffix (the guest arch).
 	guestBuildxPlatform = "linux-arm64"

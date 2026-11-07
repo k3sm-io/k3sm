@@ -17,14 +17,12 @@ limitations under the License.
 // Package childreq names the module requirements k3sm raises above what a pinned
 // child's own go.mod selects, and applies them to a module tree.
 //
-// kine and zot are built from pinned upstream module source, out of k3sm's go.mod.
-// Their dependency graphs are the ones the upstream tags pin, except where a
-// dependency carries a fix the tag predates: then the child is built with that one
-// requirement raised, and nothing else moves. kine is built from a patched copy of
-// its own module, so Apply raises the requirement in that copy's go.mod and adds
-// the hashes to its go.sum; zot is built from a wrapper module
-// (pkg/registrysvc/zotchild) whose go.mod requires zot at its pin and each raise
-// below, which the registrysvc tests check against this list.
+// kine is built from pinned upstream module source, out of k3sm's go.mod. Its
+// dependency graph is the one the upstream tag pins, except where a dependency
+// carries a fix the tag predates: then it is built with that one requirement
+// raised, and nothing else moves. kine is built from a patched copy of its own
+// module, so Apply raises the requirement in that copy's go.mod and adds the hashes
+// to its go.sum.
 //
 // A raise is a build-time requirement only. The go.sum hashes are the checksum
 // database's, recorded here so the build runs -mod=readonly: every module is
@@ -41,13 +39,19 @@ import (
 	"strings"
 )
 
-// XNetVersion is the golang.org/x/net version kine and zot are built against.
+// XNetVersion is the golang.org/x/net version kine is built against.
 // v0.60.0 fixes GO-2026-6603, GO-2026-6610, GO-2026-6611, GO-2026-6612 and
-// GO-2026-6617 in its HTTP/2 code; both pinned tags select v0.59.0. Its own
-// requirements (x/crypto, x/sys, x/term, x/text) are the versions both tags
-// already select, so raising it moves no other module. hack/release/stage.sh
-// reads this line as the floor a staged kine or zot must link.
+// GO-2026-6617 in its HTTP/2 code; kine's pinned tag selects v0.59.0. Its own
+// requirements (x/crypto, x/sys, x/term, x/text) are the versions that tag
+// already selects, so raising it moves no other module. hack/release/stage.sh
+// reads this line as the floor a staged kine must link.
 const XNetVersion = "v0.60.0"
+
+// CompressVersion is the github.com/klauspost/compress version kine is
+// built against. v1.20.2 fixes GO-2026-6865, a panic on two-block frames in its fse
+// and huff0 packages; kine's tag selects v1.20.1. It requires no
+// module of its own, so raising it moves no other module.
+const CompressVersion = "v1.20.2"
 
 // Requirement is one raised module requirement and its go.sum hashes.
 type Requirement struct {
@@ -59,15 +63,19 @@ type Requirement struct {
 	Sum, GoModSum string
 }
 
-// Raises is the set of raised requirements both children are built with.
-// Changing it changes what the children link, so it changes kine's patch-set id
-// (pkg/executor kineBuildVariant) and zot's build variant (pkg/registrysvc
-// zotBuildVariant) too; each package's tests hold that link.
+// Raises is the set of raised requirements kine is built with. Changing it changes
+// what kine links, so it changes kine's patch-set id (pkg/executor kineBuildVariant)
+// too; that package's tests hold the link.
 var Raises = []Requirement{{
 	Path:     "golang.org/x/net",
 	Version:  XNetVersion,
 	Sum:      "h1:79p50tfZlm0J9YfoDsSi639qSXNGVwEzOPLCxM2FsYU=",
 	GoModSum: "h1:2DA/G1UfVbCpQPeWTmMPGY7Cs2PkBkwu743bVX5PIVg=",
+}, {
+	Path:     "github.com/klauspost/compress",
+	Version:  CompressVersion,
+	Sum:      "h1:v5tiZvm1KGLyg5d5oXdXe3lsSPrbEUiKoXGia//I7Qo=",
+	GoModSum: "h1:LUdAzn7YLVvxLpc7y3V1m40wESHTgc1422pwwBSKYuI=",
 }}
 
 // ErrNotARaise marks a requirement the tree already meets or exceeds: the pin

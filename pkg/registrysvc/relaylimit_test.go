@@ -92,18 +92,18 @@ func (l *srcListener) dial(src string, wait time.Duration) (net.Conn, error) {
 // relayLimitFixture is a relay built by newRelay, served by its own accept on a
 // srcListener, in front of a socket fake registry and fake apiserver clients.
 type relayLimitFixture struct {
-	zot    *fakeZot
-	tokens *fakeTokens
-	front  *srcListener
+	registry *fakeRegistry
+	tokens   *fakeTokens
+	front    *srcListener
 }
 
 func newRelayLimitFixture(t *testing.T) *relayLimitFixture {
 	t.Helper()
-	z, zaddr := socketZot(t)
+	z, zaddr := socketRegistry(t)
 	f := &relayLimitFixture{
-		zot:    z,
-		tokens: &fakeTokens{statuses: map[string]authnv1.TokenReviewStatus{}},
-		front:  newSrcListener(),
+		registry: z,
+		tokens:   &fakeTokens{statuses: map[string]authnv1.TokenReviewStatus{}},
+		front:    newSrcListener(),
 	}
 	auth := GateAuth{
 		Tokens: f.tokens,

@@ -17,6 +17,8 @@ limitations under the License.
 package registrysvc
 
 import (
+	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -31,10 +33,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-containerregistry/pkg/authn"
+	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/image-spec/specs-go"
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 
+	"k3sm.io/k3sm/pkg/ociregistry/api"
+	"k3sm.io/k3sm/pkg/ociregistry/auth"
 	"k3sm.io/k3sm/pkg/ociregistry/ref"
 	"k3sm.io/k3sm/pkg/ociregistry/store"
 )
@@ -136,10 +142,9 @@ func digests(ms []StoredManifest) []string {
 	return out
 }
 
-func TestPruneGraceIsTheGCDelay(t *testing.T) {
-	d, err := time.ParseDuration(gcDelay)
-	if err != nil || d != PruneGrace {
-		t.Errorf("PruneGrace = %v, gcDelay = %q (%v): they must agree", PruneGrace, gcDelay, err)
+func TestPruneGraceIsTheGCGrace(t *testing.T) {
+	if PruneGrace != serveGCGrace {
+		t.Errorf("PruneGrace = %v, serveGCGrace = %v: they must agree", PruneGrace, serveGCGrace)
 	}
 }
 
@@ -247,6 +252,35 @@ func TestPruneThroughTheStore(t *testing.T) {
 		want := []string{digestOf(ix), digestOf(c1), digestOf(lone), digestOf(c2)}
 		if strings.Join(got, ",") != strings.Join(want, ",") {
 			t.Errorf("delete = %v; want the index first, then the manifests in index order: %v", got, want)
+		}
+	})
+
+	t.Run("a manifest whose last tag was deleted is planned, once it is aged", func(t *testing.T) {
+		wd := t.TempDir()
+		st, err := store.OpenWorkDir(wd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n, err := ref.ParseName("r")
+		if err != nil {
+			t.Fatal(err)
+		}
+		a := manifestBody("a")
+		ctx := context.Background()
+		if _, err := st.PutManifest(ctx, n, ref.Reference{Tag: "v1"}, manifestType, a); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.DeleteTag(ctx, n, "v1"); err != nil {
+			t.Fatal(err)
+		}
+		p := PlanRepository(wd, "r", time.Now())
+		if len(p.Delete) != 0 || len(p.Kept) != 1 || p.Kept[0].Digest != digestOf(a) || p.Kept[0].Reason != KeepRecent {
+			t.Errorf("just untagged: delete = %v, kept = %+v; want it kept as recent", digests(p.Delete), p.Kept)
+		}
+		ageBlobs(t, wd, "r", old, digestOf(a))
+		p = PlanRepository(wd, "r", time.Now())
+		if got := digests(p.Delete); len(got) != 1 || got[0] != digestOf(a) {
+			t.Errorf("aged: delete = %v, kept = %+v; want %s planned", got, p.Kept, digestOf(a))
 		}
 	})
 
@@ -363,11 +397,11 @@ func TestPruneThroughTheStore(t *testing.T) {
 	})
 }
 
-// pruneConcurrentWithPush runs prune rounds (plan, then a DELETE per planned
-// manifest through a fake registry API backed by the store) while a pusher
-// writes multi-platform images through the same store: each push puts its
-// child untagged, then the index that names it under a new tag. Both index.json
-// writers are the server's own operations under the store's lock; prune only
+// pruneConcurrentWithPush runs prune rounds (plan, then a re-check and a
+// conditional DELETE per planned manifest, through the registry's real API
+// server and access check) while a pusher writes multi-platform images through
+// the same server: each push puts its child untagged, then the index that names
+// it under a new tag. The server is index.json's only writer; prune only
 // reads. At the end every pushed tag must resolve to the index pushed under it,
 // every child must still be held, and the old untagged manifests must be gone.
 func pruneConcurrentWithPush(t *testing.T, old time.Duration) {
@@ -400,30 +434,70 @@ func pruneConcurrentWithPush(t *testing.T, old time.Duration) {
 	}
 	ageBlobs(t, wd, "app", old, append([]string{digestOf(base)}, stale...)...)
 
-	cred := Credential{Username: "k3sm", Password: "prune-test-secret"}
-	client := &http.Client{Transport: handlerTransport{h: fakeDeleteAPI(t, st, cred)}}
-	apiDelete := func(m StoredManifest, c Credential) error {
-		req, err := http.NewRequestWithContext(ctx, http.MethodDelete, "http://registry.test/v2/"+m.Repository+"/manifests/"+m.Digest, nil)
+	cred := Credential{Username: auth.UserPush, Password: "prune-test-secret"}
+	access, err := auth.New(auth.Config{Principals: []auth.Principal{
+		{User: auth.UserPush, SecretSHA256: auth.HashSecret(cred.Password)},
+		{User: auth.UserGate, SecretSHA256: auth.HashSecret("the-gate-secret")},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := auth.NewServer(access, api.Config{Store: st, GCGrace: time.Hour, FreeSpace: func() (uint64, error) { return 1 << 40, nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := handlerTransport{h: srv}
+	client := &http.Client{Transport: rt}
+	send := func(method, path, contentType string, body []byte, wantStatus int) error {
+		req, err := http.NewRequestWithContext(ctx, method, "http://registry.test"+path, bytes.NewReader(body))
 		if err != nil {
 			return err
 		}
-		req.SetBasicAuth(c.Username, c.Password)
+		req.SetBasicAuth(cred.Username, cred.Password)
+		req.Header.Set("Content-Type", contentType)
 		resp, err := client.Do(req)
 		if err != nil {
 			return err
 		}
 		resp.Body.Close()
-		switch resp.StatusCode {
-		case http.StatusAccepted, http.StatusNotFound: // NotFound: an earlier round took it
-			return nil
-		default:
-			return fmt.Errorf("DELETE %s: %s", m.Digest, resp.Status)
+		if resp.StatusCode != wantStatus {
+			return fmt.Errorf("%s %s: %s", method, path, resp.Status)
 		}
+		return nil
+	}
+	// One round's delete, as `k3sm image prune` makes it: re-check, then a
+	// DELETE conditional on the state the re-check read. A repository a push
+	// moved on in between keeps the manifest for a later round.
+	pruneOne := func(m StoredManifest, c authn.Authenticator) error {
+		reason, state := Recheck(wd, m, time.Now())
+		if reason != "" {
+			return nil
+		}
+		r, err := name.NewDigest("127.0.0.1:6450/" + m.Repository + "@" + m.Digest)
+		if err != nil {
+			return err
+		}
+		if err := DeleteManifest(ctx, r, state, c, rt); err != nil && !errors.Is(err, ErrChangedSincePlan) {
+			return err
+		}
+		return nil
+	}
+	pushAuth := authn.FromConfig(authn.AuthConfig{Username: cred.Username, Password: cred.Password})
+
+	// The server answers only the push credential.
+	wrongAuth := authn.FromConfig(authn.AuthConfig{Username: cred.Username, Password: "wrong"})
+	if err := pruneOne(StoredManifest{Repository: "app", Digest: stale[0]}, wrongAuth); err == nil {
+		t.Fatal("the server took a DELETE without the push credential")
 	}
 
-	// The fake API answers only the push credential.
-	if err := apiDelete(StoredManifest{Repository: "app", Digest: stale[0]}, Credential{Username: "k3sm", Password: "wrong"}); err == nil {
-		t.Fatal("the fake API took a DELETE without the push credential")
+	// A real push names a config the server holds.
+	config := []byte(`{"architecture":"arm64","os":"linux"}`)
+	if err := send(http.MethodPost, "/v2/app/blobs/uploads/?digest="+digestOf(config), "application/octet-stream", config, http.StatusCreated); err != nil {
+		t.Fatal(err)
+	}
+	pushable := func(seed string) []byte {
+		return fmt.Appendf(nil, `{"schemaVersion":2,"mediaType":%q,"config":{"mediaType":%q,"digest":%q,"size":%d},"layers":[],"annotations":{"seed":%q}}`,
+			manifestType, ispec.MediaTypeImageConfig, digestOf(config), len(config), seed)
 	}
 
 	const pushes = 40
@@ -433,20 +507,20 @@ func pruneConcurrentWithPush(t *testing.T, old time.Duration) {
 	done := make(chan struct{})
 	children, indexes := make([][]byte, pushes), make([][]byte, pushes)
 	for i := range pushes {
-		children[i] = manifestBody(fmt.Sprintf("child-%d", i))
+		children[i] = pushable(fmt.Sprintf("child-%d", i))
 		indexes[i] = indexBody(t, children[i])
 	}
 	go func() {
 		defer close(done)
 		for i := range pushes {
 			child := children[i]
-			if _, err := st.PutManifest(ctx, repo, ref.Reference{Digest: digest.FromBytes(child)}, manifestType, child); err != nil {
+			if err := send(http.MethodPut, "/v2/app/manifests/"+digestOf(child), manifestType, child, http.StatusCreated); err != nil {
 				pushErr <- err
 				return
 			}
 			ix := indexes[i]
 			tag := fmt.Sprintf("v%d", i)
-			if _, err := st.PutManifest(ctx, repo, ref.Reference{Tag: tag}, indexType, ix); err != nil {
+			if err := send(http.MethodPut, "/v2/app/manifests/"+tag, indexType, ix, http.StatusCreated); err != nil {
 				pushErr <- err
 				return
 			}
@@ -472,7 +546,7 @@ func pruneConcurrentWithPush(t *testing.T, old time.Duration) {
 				return
 			}
 			for _, m := range plan.Delete {
-				if err := apiDelete(m, cred); err != nil {
+				if err := pruneOne(m, pushAuth); err != nil {
 					pruneErrs = append(pruneErrs, err)
 				}
 			}
@@ -497,7 +571,7 @@ func pruneConcurrentWithPush(t *testing.T, old time.Duration) {
 		t.Fatal(err)
 	}
 	for _, m := range plan.Delete {
-		if err := apiDelete(m, cred); err != nil {
+		if err := pruneOne(m, pushAuth); err != nil {
 			t.Fatal(err)
 		}
 	}

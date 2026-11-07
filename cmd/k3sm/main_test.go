@@ -30,6 +30,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"k3sm.io/k3sm/pkg/bootstrap"
+	"k3sm.io/k3sm/pkg/install"
 )
 
 // The bootstrap package's two deliberate work factors: the bcrypt cost every
@@ -80,6 +81,10 @@ func TestMain(m *testing.M) {
 	// No test reads this Mac's installed server: a server Mac's published
 	// registry record would otherwise steer every push test to its gate.
 	installedServerWorkDir = filepath.Join(os.TempDir(), fmt.Sprintf("k3sm-test-no-install-%d", os.Getpid()), "server")
+	// No test takes its role from this Mac's LaunchDaemons: on a worker Mac the
+	// registry and kubeconfig choices would otherwise change under every test.
+	// A test about a worker states the role itself.
+	installedNodeCredential = func() (install.Role, string) { return install.RoleServer, "" }
 	// No pull test copies an image to a real cluster registry: one that is
 	// about the copy installs its own fake.
 	pullMirrorer = func(context.Context, name.Reference, name.Reference, string) error {

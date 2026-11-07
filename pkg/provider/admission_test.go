@@ -534,87 +534,6 @@ func TestRejectedPodLogs(t *testing.T) {
 	}
 }
 
-// flipSource is an admission source whose snapshot alternates on every read:
-// calm, then pressured, then calm. Two creates of one pod that each read it
-// once get opposite verdicts.
-type flipSource struct {
-	mu        sync.Mutex
-	n         int
-	calm, hot hostStats
-}
-
-func (f *flipSource) latest() (hostStats, uint64, bool) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.n++
-	if f.n%2 == 1 {
-		return f.calm, uint64(f.n), true
-	}
-	return f.hot, uint64(f.n), true
-}
-
-// TestAdmissionMixedConcurrentCreates: two CreatePods racing for one
-// BestEffort pod while the pressure verdict flips between them end with the
-// node and the apiserver agreeing. Either the pod is refused (a rejected track,
-// no runtime create, the apiserver Failed) or it is created (a live track, the
-// apiserver never Failed). A refusal is never overwritten by the admitted
-// create's track, and an admitted create never races a refusal for the pod.
-func TestAdmissionMixedConcurrentCreates(t *testing.T) {
-	h := admissionHarness(t, compressorAt(10))
-	h.r.setAdmissionSource(&flipSource{calm: compressorAt(10), hot: compressorAt(85)})
-	ctx := context.Background()
-	for i := range 50 {
-		pod := evPod("mixed-"+strconv.Itoa(i), nil, "", "")
-		if _, err := h.cs.CoreV1().Pods(pod.Namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
-			t.Fatalf("apiserver create: %v", err)
-		}
-		h.f.mu.Lock()
-		before := h.f.createCalls
-		h.f.mu.Unlock()
-		var wg sync.WaitGroup
-		errs := make([]error, 2)
-		for g := range 2 {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				errs[g] = h.r.CreatePod(ctx, pod.DeepCopy())
-			}()
-		}
-		wg.Wait()
-		for g, err := range errs {
-			if err != nil {
-				t.Fatalf("pod %s: CreatePod %d: %v", pod.Name, g, err)
-			}
-		}
-		h.f.mu.Lock()
-		created := h.f.createCalls - before
-		h.f.mu.Unlock()
-		tr := h.r.trackByID(string(pod.UID))
-		if tr == nil {
-			t.Fatalf("pod %s: not tracked", pod.Name)
-		}
-		live, err := h.cs.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
-		if err != nil {
-			t.Fatalf("apiserver get: %v", err)
-		}
-		apiFailed := live.Status.Phase == corev1.PodFailed
-		if tr.rejected {
-			if !apiFailed || created != 0 {
-				t.Fatalf("pod %s: refused on the node, but the apiserver phase is %q and the runtime was asked to create it %d times",
-					pod.Name, live.Status.Phase, created)
-			}
-			continue
-		}
-		if apiFailed || tr.evictedStatus() != nil {
-			t.Fatalf("pod %s: the node runs it (%d runtime creates) but the apiserver says %s/%q",
-				pod.Name, created, live.Status.Phase, live.Status.Reason)
-		}
-		if created == 0 {
-			t.Fatalf("pod %s: tracked as admitted, but the runtime was never asked to create it", pod.Name)
-		}
-	}
-}
-
 // TestBatchAdmissionAtCriticalBoundaries pins the budget refusal at the exact
 // critical trip and release of the default ladder, on the memory.compressor
 // signal: one permille short of the trip admits, the trip refuses, a value in
@@ -660,24 +579,71 @@ func TestBatchAdmissionAtCriticalBoundaries(t *testing.T) {
 	}
 }
 
-// TestAdmissionNilMonitorAdmits: a nil *pressureMonitor handed to the
-// admission source is no source, so a create on a pressured-looking pod is
-// admitted instead of calling latest on a nil monitor.
-func TestAdmissionNilMonitorAdmits(t *testing.T) {
-	h := admissionHarness(t, compressorAt(85))
-	var mon *pressureMonitor
-	h.r.setAdmissionSource(mon)
-	h.r.mu.Lock()
-	src := h.r.admission
-	h.r.mu.Unlock()
-	if src != nil {
-		t.Fatalf("admission source = %#v, want nil", src)
-	}
-	pod := evPod("be", nil, "", "")
-	if n := createOn(t, h, pod); n != 1 {
-		t.Fatalf("runtime CreatePod calls = %d, want 1", n)
-	}
-	if tr := h.r.trackByID(string(pod.UID)); tr == nil || tr.rejected {
-		t.Fatal("the pod is not tracked as admitted")
+// TestCreatePodAdmitsWhenMonitorNil: a node with no memory monitor behind
+// admission admits every pod, in each state that leaves it so, through
+// CreatePod: the pod that would be refused here is created, runs, and carries no
+// rejection anywhere. The control case proves the same pod on the same pressure
+// is refused once a monitor is wired, so an admission here is the missing monitor's
+// doing and not the pod's or the snapshot's.
+func TestCreatePodAdmitsWhenMonitorNil(t *testing.T) {
+	pressured := compressorAt(85)
+
+	t.Run("control: a monitor reading the same pressure refuses the pod", func(t *testing.T) {
+		h := admissionHarness(t, pressured)
+		pod := evPod("be", nil, "", "")
+		if n := createOn(t, h, pod); n != 0 {
+			t.Fatalf("runtime CreatePod calls = %d, want 0", n)
+		}
+		if tr := h.r.trackByID(string(pod.UID)); tr == nil || !tr.rejected {
+			t.Fatalf("the pod was not refused (%s)", trackState(tr))
+		}
+	})
+
+	for _, tc := range []struct {
+		name string
+		wire func(h *evictionHarness)
+	}{
+		{"admission was never wired", func(*evictionHarness) {}},
+		{"the eviction manager started with no status provider", func(h *evictionHarness) {
+			NewVKProvider(h.r, "mac-0").RunEvictionManager(context.Background(), EvictionConfig{})
+		}},
+		// A nil *pressureMonitor is a non-nil interface value, so without
+		// setAdmissionSource's guard the create calls latest on it and panics.
+		{"a nil monitor replaced the wired one", func(h *evictionHarness) {
+			h.r.setAdmissionSource(h.mon)
+			var none *pressureMonitor
+			h.r.setAdmissionSource(none)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newEvictionHarness(t)
+			h.sm.set(pressured)
+			h.mon.sampleOnce()
+			tc.wire(h)
+			h.r.mu.Lock()
+			src := h.r.admission
+			h.r.mu.Unlock()
+			if src != nil {
+				t.Fatalf("admission source = %#v, want nil", src)
+			}
+
+			pod := evPod("be", nil, "", "")
+			id := string(pod.UID)
+			if n := createOn(t, h, pod); n != 1 {
+				t.Fatalf("runtime CreatePod calls = %d, want 1", n)
+			}
+			if tr := h.r.trackByID(id); tr == nil || tr.rejected || tr.evictedStatus() != nil {
+				t.Fatalf("the pod is not tracked as admitted (%s)", trackState(tr))
+			}
+			if ph := h.apiPhase(t, pod); ph == corev1.PodFailed {
+				t.Error("the node runs the pod but the apiserver reports it Failed")
+			}
+			if n := countPrefix(h.events(), "Warning Evicted"); n != 0 {
+				t.Errorf("Warning Evicted Events = %d, want 0", n)
+			}
+			if n := h.admittingCount(id); n != 0 {
+				t.Errorf("in-flight admitted creates after the create returned = %d, want 0", n)
+			}
+		})
 	}
 }

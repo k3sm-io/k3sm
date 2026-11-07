@@ -32,7 +32,7 @@ import (
 	mlxv1alpha1 "k3sm.io/apis/mlx/v1alpha1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
 
-	"k3sm.io/k3sm/pkg/mlx"
+	"k3sm.io/k3sm/pkg/gpucapacity"
 )
 
 const testGiB = int64(1) << 30
@@ -108,7 +108,7 @@ func findEvent(ch <-chan string, reason string) string {
 // already admitted.
 //
 // WHY THE EXTENDED RESOURCE IS NOT ENOUGH ON ITS OWN: the advertised slot count
-// is derived from the ceiling at a FIXED per-slot floor (mlx.GPUSlotFloorBytes),
+// is derived from the ceiling at a FIXED per-slot floor (gpucapacity.GPUSlotFloorBytes),
 // so two pods that each hold a slot can still ask for more memory between them
 // than the GPU has. The scheduler counts slots and cannot see that; nothing below
 // it reports the overcommit either — the second model simply fails to allocate
@@ -142,8 +142,8 @@ func TestCreatePodGPUCumulativeFit(t *testing.T) {
 		if err == nil {
 			t.Fatal("CreatePod(second) = nil, want a refusal — 3GiB + 1.5GiB does not fit a 4GiB ceiling")
 		}
-		if !errors.Is(err, mlx.ErrGPUMemoryOverCeiling) {
-			t.Errorf("CreatePod error %v does not wrap mlx.ErrGPUMemoryOverCeiling; a caller cannot tell it from a transient failure", err)
+		if !errors.Is(err, gpucapacity.ErrGPUMemoryOverCeiling) {
+			t.Errorf("CreatePod error %v does not wrap gpucapacity.ErrGPUMemoryOverCeiling; a caller cannot tell it from a transient failure", err)
 		}
 		if _, creates := f.counts(); creates != 1 {
 			t.Errorf("CreatePod RPC calls = %d, want 1 — the refusal must land BEFORE the RPC", creates)
@@ -188,25 +188,31 @@ func TestCreatePodGPUCumulativeFit(t *testing.T) {
 		}
 	})
 
-	// AN UNKNOWN CEILING ADMITS EVERYTHING. A node whose Metal working set could
-	// not be read (and which carries no iogpu override) has no number to refuse
-	// against; refusing there would make it unschedulable for every GPU pod, which
-	// is strictly worse than the overcommit the check exists to prevent.
-	t.Run("unknown_ceiling_admits", func(t *testing.T) {
+	// AN UNKNOWN CEILING SKIPS THE MEMORY FIT, NOT THE SLOT CAP. A node whose
+	// Metal working set could not be read has no byte number to refuse against,
+	// but it still holds one slot, so pods past the count are refused.
+	t.Run("unknown_ceiling_admits_within_the_slot_count", func(t *testing.T) {
 		t.Parallel()
 		ctx := context.Background()
 		r, f, rec := gpuFitRuntime(t, 0)
 
-		for _, name := range []string{"a", "b", "c"} {
-			if err := r.CreatePod(ctx, gpuFitPod(name, 64*testGiB, true)); err != nil {
-				t.Fatalf("CreatePod(%s) = %v, want it admitted against an unknown ceiling", name, err)
-			}
-		}
-		if _, creates := f.counts(); creates != 3 {
-			t.Errorf("CreatePod RPC calls = %d, want 3", creates)
+		if err := r.CreatePod(ctx, gpuFitPod("a", 64*testGiB, true)); err != nil {
+			t.Fatalf("CreatePod(a) = %v, want it admitted against an unknown ceiling", err)
 		}
 		if ev := findEvent(rec.Events, reasonFailedGPUFit); ev != "" {
-			t.Errorf("recorded %q against an unknown ceiling, want no %s event", ev, reasonFailedGPUFit)
+			t.Errorf("recorded %q within the slot count, want no %s event", ev, reasonFailedGPUFit)
+		}
+		for _, name := range []string{"b", "c"} {
+			err := r.CreatePod(ctx, gpuFitPod(name, 64*testGiB, true))
+			if !errors.Is(err, gpucapacity.ErrGPUSlotsFull) {
+				t.Fatalf("CreatePod(%s) = %v, want gpucapacity.ErrGPUSlotsFull past the one slot", name, err)
+			}
+			if ev := findEvent(rec.Events, reasonFailedGPUFit); ev == "" {
+				t.Errorf("no %s event for %s past the slot count", reasonFailedGPUFit, name)
+			}
+		}
+		if _, creates := f.counts(); creates != 1 {
+			t.Errorf("CreatePod RPC calls = %d, want 1", creates)
 		}
 	})
 
@@ -275,8 +281,8 @@ func TestCreatePodGPUCumulativeFit(t *testing.T) {
 		if err == nil {
 			t.Fatal("CreatePod(unlimited) = nil, want a refusal — an unmeasurable GPU pod defeats every later fit")
 		}
-		if !errors.Is(err, mlx.ErrGPUMemoryUnbounded) {
-			t.Errorf("CreatePod error %v does not wrap mlx.ErrGPUMemoryUnbounded", err)
+		if !errors.Is(err, gpucapacity.ErrGPUMemoryUnbounded) {
+			t.Errorf("CreatePod error %v does not wrap gpucapacity.ErrGPUMemoryUnbounded", err)
 		}
 		if _, creates := f.counts(); creates != 0 {
 			t.Errorf("CreatePod RPC calls = %d, want 0 — the refusal must land BEFORE the RPC", creates)
@@ -341,8 +347,8 @@ func TestCreatePodGPUCumulativeFit(t *testing.T) {
 		if err == nil {
 			t.Fatal("CreatePod(next) = nil, want a refusal — an overflowed admitted total must not read as free capacity")
 		}
-		if !errors.Is(err, mlx.ErrGPUMemoryOverCeiling) {
-			t.Errorf("CreatePod error %v does not wrap mlx.ErrGPUMemoryOverCeiling", err)
+		if !errors.Is(err, gpucapacity.ErrGPUMemoryOverCeiling) {
+			t.Errorf("CreatePod error %v does not wrap gpucapacity.ErrGPUMemoryOverCeiling", err)
 		}
 		if _, creates := f.counts(); creates != 0 {
 			t.Errorf("CreatePod RPC calls = %d, want 0", creates)

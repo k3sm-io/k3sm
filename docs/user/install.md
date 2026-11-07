@@ -55,6 +55,8 @@ and one residual limitation remains (no per-pod uid isolation).
   arguments row as unreadable as this user, which never changes the verdict, and `sudo k3sm status`
   shows it.
 - The kine/SQLite datastore under the server work directory (see [Backup & restore](backup-restore.md)).
+- The managed update's working directory, **`/var/lib/k3sm/updates`**, owned by `_k3sm`, mode `0700`,
+  on both roles (see [Upgrade](upgrade.md#on-each-node)).
 - An empty auto-deploy manifest directory, **`/var/lib/k3sm/manifests`**, owned by `root:wheel`,
   mode `0755` (see below).
 
@@ -220,8 +222,14 @@ update, stop and start it.
   `warn` while it is there, with the state `on` for a valid marker and `invalid` for anything else
   at that path (a symlink, a file that is not root-owned, a file others can write, or one with an
   ACL), or for a marker under a `/` or `/Library` that is not a root-owned real directory that
-  neither group nor others can write, with no ACL. An invalid marker is ignored and the checks stay on. The status `verdict` stays `ok` while
-  the mode is on, and only the `developer-mode` row warns, so automation that audits a Mac reads
+  neither group nor others can write, with no ACL.
+  An invalid marker is ignored and the checks stay on. The row's `detail` says whether the marker
+  file or a directory above it is the cause and names the directory. Removing the marker clears the
+  row either way, and in the second case leaves that directory as it is. The state is `unknown` when
+  the path cannot be read: the report cannot say whether the mode is on, and when the account running
+  `k3sm status` is the reason, `sudo k3sm status` reads it. `--developer-mode off` removes the marker once the install root's swap has
+  committed, and if the install is then rolled back, a valid marker it removed is put back. The status `verdict` stays `ok`
+  while the mode is on, and only the `developer-mode` row warns, so automation that audits a Mac reads
   that row rather than the verdict. A release build of the app never uses the mode.
   `k3sm uninstall` removes the marker.
 - **How long it lasts.** The marker sits outside the install root, so it survives reboots and
@@ -418,7 +426,8 @@ loads no pf rule). Your cluster data, the `_k3sm` user, and your kubeconfig are 
 reinstall picks up where you left off; to remove those too, see
 [Remove Everything](#remove-everything). The server's admin token is removed, because a reinstall
 mints a new one, and so are the records the node writes for `k3sm status` (in the server's work directory
-and in `/var/lib/k3sm/status/`), because they describe a node that no longer runs. The command prints the full list of what it kept. If you
+and in `/var/lib/k3sm/status/`), because they describe a node that no longer runs. The managed update's working directory
+`/var/lib/k3sm/updates` goes too, with any download a failed update left in it. The command prints the full list of what it kept. If you
 installed a data volume, it stays mounted and declared; the command prints `sudo k3sm install
 --data-volume` to reinstall onto it and `sudo k3sm datavol delete --yes` to remove it for good.
 

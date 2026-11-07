@@ -55,7 +55,7 @@ func TestGenerateCredential(t *testing.T) {
 }
 
 // TestWriteCredential pins the whole on-disk credential contract: the bcrypt hash
-// zot will verify against, the plaintext file `k3sm image push` reads back, and
+// the registry will verify against, the plaintext file `k3sm image push` reads back, and
 // 0600 on both — a world-readable push credential is a world-writable image store.
 func TestWriteCredential(t *testing.T) {
 	work := t.TempDir()
@@ -82,9 +82,9 @@ func TestWriteCredential(t *testing.T) {
 		if user != cred.Username {
 			t.Errorf("htpasswd user = %q, want %q", user, cred.Username)
 		}
-		// zot accepts $2a/$2b/$2y bcrypt; anything else is silently unauthenticable.
+		// the registry accepts $2a/$2b/$2y bcrypt; anything else is silently unauthenticable.
 		if !strings.HasPrefix(hash, "$2a$") && !strings.HasPrefix(hash, "$2b$") && !strings.HasPrefix(hash, "$2y$") {
-			t.Fatalf("htpasswd hash %q is not a bcrypt hash zot accepts", hash)
+			t.Fatalf("htpasswd hash %q is not a bcrypt hash the registry accepts", hash)
 		}
 		if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(cred.Password)); err != nil {
 			t.Fatalf("the htpasswd hash does not verify the password it was minted from: %v", err)

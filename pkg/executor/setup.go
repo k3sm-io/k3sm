@@ -38,7 +38,6 @@ import (
 	"k3sm.io/k3sm/internal/binsign"
 	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/helmchart"
-	"k3sm.io/k3sm/pkg/registrysvc"
 )
 
 // ComponentCertValidity is the lifetime of a per-component client cert (the scheduler /
@@ -599,9 +598,10 @@ const (
 	KineMarkerName = "kine.version"
 	// kineBuildVariant records HOW the pinned kine child was built. "nocgo" is
 	// CGO_ENABLED=0 against kine's pure-Go modernc.org/sqlite backend
-	// (pkg/drivers/sqlite/sqlite_nocgo.go, //go:build !cgo); "+p2" is the carried
+	// (pkg/drivers/sqlite/sqlite_nocgo.go, //go:build !cgo); "+p3" is the carried
 	// patch set: kinePatches (kinepatch.go) plus the requirement raises of
-	// internal/childreq (golang.org/x/net v0.60.0); p1 was the source patch alone.
+	// internal/childreq (golang.org/x/net v0.60.0, github.com/klauspost/compress
+	// v1.20.2); p2 raised x/net alone and p1 was the source patch alone.
 	// It is part of the marker because version alone does not identify the binary:
 	// the same kine tag builds two different SQLite implementations depending on
 	// CGO_ENABLED, and only this one keeps the unmaintained mattn/go-sqlite3 out of
@@ -609,7 +609,7 @@ const (
 	// behaves differently on disk and links different dependencies. Changing the
 	// patch set changes the "+p" suffix, which is what makes every already-staged kine
 	// (and every node seeding from an older payload) re-stage the patched build.
-	kineBuildVariant = "nocgo+p2"
+	kineBuildVariant = "nocgo+p3"
 )
 
 // kinePath / kineMarkerPath name the staged kine binary and its version marker in a
@@ -859,10 +859,10 @@ func copyFile(src, dst string, mode os.FileMode) error {
 // dev-shell tools a launchd daemon does not have): the kwok-ci/k8s prebuilt
 // binaries plus kine, etcd and etcdutl (the offline tool `k3sm snapshot restore` runs
 // on an etcd server), the pinned helm the helm controller's Jobs run (see
-// helm.go), and the ingest registry's zot (pkg/registrysvc). The single source for `k3sm payload`, `k3sm install`, and
+// helm.go). The single source for `k3sm payload`, `k3sm install`, and
 // the boot-time seed, so the three can never disagree on the set.
 func PayloadBinaries() []string {
-	return append(append([]string{}, cpBinaries...), kineBinaryName, etcdBinaryName, etcdutlBinaryName, helmchart.HelmBinaryName, registrysvc.ZotBinaryName)
+	return append(append([]string{}, cpBinaries...), kineBinaryName, etcdBinaryName, etcdutlBinaryName, helmchart.HelmBinaryName)
 }
 
 // StagePayload acquires the full control-plane payload into destDir using the
@@ -901,7 +901,7 @@ func StagePayload(ctx context.Context, destDir string) error {
 	if err := ensureEtcdutlInto(ctx, destDir, DefaultEtcdVersion); err != nil {
 		return err
 	}
-	// helm is built from its pinned module with its marker, exactly as zot is: a
+	// helm is built from its pinned module with its marker: a
 	// copy whose marker does not vouch for this pin and variant (an earlier
 	// release's download above all) is rebuilt. The packaging producer runs no
 	// signing decision: what it stages is ad-hoc signed, and the attended pipeline
@@ -909,18 +909,7 @@ func StagePayload(ctx context.Context, destDir string) error {
 	if err := stageHelmBuild(ctx, destDir); err != nil {
 		return err
 	}
-	// The ingest registry's zot, built from its pinned module with its marker, so a
-	// packaged install never builds it (pkg/registrysvc stages it from the payload).
-	if err := stageZot(ctx, destDir); err != nil {
-		return err
-	}
 	return VerifyPayloadSet(destDir)
-}
-
-// stageZot builds the pinned zot and its version marker into a payload dir. A var
-// so a test of StagePayload stands in for the build.
-var stageZot = func(ctx context.Context, destDir string) error {
-	return registrysvc.EnsureZot(ctx, destDir, "", registrysvc.DefaultZotVersion)
 }
 
 // StageKine stages the pinned, patched kine (and its version marker) into destDir
@@ -957,7 +946,7 @@ func StageKine(ctx context.Context, destDir string) error {
 // stamping the new pin onto bytes nothing verified — and a payload OLDER than the
 // control-plane set already staged is refused, as is any re-seed over a
 // present-but-malformed marker (see below). Every other file is
-// unversioned and is only ever filled in when absent (etcdutl and zot are never
+// unversioned and is only ever filled in when absent (etcdutl is never
 // seeded here: `k3sm snapshot restore` and the registry use them from the payload
 // directory itself). kineVersion and kubeVersion are
 // the targets the caller resolved (Config.KineVersion, Config.KubeVersion).
@@ -1063,11 +1052,6 @@ func seedBinDir(ctx context.Context, logger *slog.Logger, workDir, payloadDir, k
 		if policy.release && (name == kineBinaryName || name == etcdBinaryName) {
 			continue
 		}
-		// zot is staged by the registry (pkg/registrysvc) from the payload directory
-		// itself, under its own version marker, on both paths.
-		if name == registrysvc.ZotBinaryName {
-			continue
-		}
 		dst := filepath.Join(bd, name)
 		versioned := (name == kineBinaryName && restageKine) || (name == etcdBinaryName && restageEtcd) ||
 			(name == helmchart.HelmBinaryName && restageHelm) || (restageKube && isCPBinary(name))
@@ -1142,7 +1126,7 @@ func seedBinDir(ctx context.Context, logger *slog.Logger, workDir, payloadDir, k
 
 // ensureReleaseControlPlane makes a release-path work dir, whose valid marker names
 // kubeVersion, hold exactly the control-plane set the payload vouches for at that
-// version. It mirrors the release path for zot (registrysvc) and the source-built
+// version. It mirrors the release path for the source-built
 // children (stagedChild.ensureShipped), over the whole set at once:
 //
 //  1. every payload copy is verified against the Developer ID requirement first;
@@ -1297,11 +1281,6 @@ func signBinaries(ctx context.Context, dir, stamp string, names []string) error 
 // live install's temp is removed.
 func reapStagingTemps(bd string) error {
 	for _, name := range append(PayloadBinaries(), binsign.HealMarkerName) {
-		// zot's temps belong to the registry, which reaps them itself before it
-		// stages (registrysvc.EnsureZotWith); it may be staging one now.
-		if name == registrysvc.ZotBinaryName {
-			continue
-		}
 		if err := atomicfile.ReapOrphans(bd, name); err != nil {
 			return err
 		}

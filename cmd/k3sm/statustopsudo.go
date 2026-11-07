@@ -44,12 +44,28 @@ const sudoKubeconfigMaxBytes = 1 << 20
 // credential it could pick may list nodes.
 const topWithoutSudoHint = "run `k3sm status top` without sudo to read with your own kubeconfig"
 
-// sudoKubeconfigFile is the invoking user's kubeconfig as root read it: the
-// bytes, and the owner and mode of the file those bytes came from.
+// sudoKubeconfigFile is a file root checks before it uses it:
+// the invoking user's kubeconfig, or a worker's root-only cluster CA copy. It holds
+// the bytes, and the owner and mode of the file those bytes came from.
 type sudoKubeconfigFile struct {
 	data []byte
 	uid  uint32
 	mode fs.FileMode
+}
+
+// ownershipProblem says why root may not trust f, as what follows the file's name,
+// or "" when it may: it must be a regular file that the account uid, named owner,
+// owns and nobody else can write. It reads the owner and mode of what was read.
+func (f sudoKubeconfigFile) ownershipProblem(uid uint32, owner string) string {
+	switch {
+	case !f.mode.IsRegular():
+		return "is not a regular file"
+	case f.uid != uid:
+		return fmt.Sprintf("is owned by uid %d, not by %s", f.uid, owner)
+	case f.mode.Perm()&0o022 != 0:
+		return fmt.Sprintf("is group- or world-writable (mode %04o)", f.mode.Perm())
+	}
+	return ""
 }
 
 // topSudoInputs is everything the top view's sudo-aware client choice reads,
@@ -94,6 +110,16 @@ func (in topSudoInputs) underSudo() bool {
 	return in.euid == 0 && in.sudoUser != "" && in.sudoUser != "root"
 }
 
+// rootHome is root's home as the user database records it, or "" when it has
+// none to offer. $HOME under sudo may still be the invoker's.
+func (in topSudoInputs) rootHome() string {
+	u, err := in.lookup("root")
+	if err != nil || !filepath.IsAbs(u.HomeDir) {
+		return ""
+	}
+	return u.HomeDir
+}
+
 // errSudoKubeconfigRefused marks a user kubeconfig root found and would not use.
 var errSudoKubeconfigRefused = errors.New("refused")
 
@@ -132,39 +158,9 @@ func chooseTopKube(ctx context.Context, in topSudoInputs, fallback func() (statu
 // userKube returns a client from the sudo user's kubeconfig that can list
 // nodes, or nil and why not.
 func (in topSudoInputs) userKube(ctx context.Context) (status.Kube, error) {
-	u, err := in.lookup(in.sudoUser)
+	cfg, path, err := in.userKubeconfig()
 	if err != nil {
-		return nil, fmt.Errorf("SUDO_USER %s is not a user on this Mac: %w", in.sudoUser, err)
-	}
-	uid, err := strconv.ParseUint(u.Uid, 10, 32)
-	if err != nil {
-		return nil, fmt.Errorf("SUDO_USER %s has a uid %q that is not a number", in.sudoUser, u.Uid)
-	}
-	if uid == 0 {
-		return nil, fmt.Errorf("SUDO_USER %s is root", in.sudoUser)
-	}
-	if !filepath.IsAbs(u.HomeDir) {
-		return nil, fmt.Errorf("SUDO_USER %s has no home directory", in.sudoUser)
-	}
-	path := filepath.Join(u.HomeDir, ".kube", "config")
-	f, err := in.readFile(path)
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil, fmt.Errorf("%s's kubeconfig %s does not exist", in.sudoUser, path)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("read %s's kubeconfig: %w", in.sudoUser, err)
-	}
-	switch {
-	case !f.mode.IsRegular():
-		return nil, fmt.Errorf("%s's kubeconfig %s is not a regular file, %w", in.sudoUser, path, errSudoKubeconfigRefused)
-	case f.uid != uint32(uid):
-		return nil, fmt.Errorf("%s's kubeconfig %s is owned by uid %d, not by %s, %w", in.sudoUser, path, f.uid, in.sudoUser, errSudoKubeconfigRefused)
-	case f.mode.Perm()&0o022 != 0:
-		return nil, fmt.Errorf("%s's kubeconfig %s is group- or world-writable (mode %04o), %w", in.sudoUser, path, f.mode.Perm(), errSudoKubeconfigRefused)
-	}
-	cfg, err := parseSudoUserKubeconfig(f.data, path, in.contextName)
-	if err != nil {
-		return nil, fmt.Errorf("%s's kubeconfig %s: %w", in.sudoUser, path, err)
+		return nil, err
 	}
 	kube, err := in.build(cfg, in.contextName)
 	if err != nil {
@@ -174,6 +170,43 @@ func (in topSudoInputs) userKube(ctx context.Context) (status.Kube, error) {
 		return nil, fmt.Errorf("%s's kubeconfig %s context %q cannot list nodes: %w", in.sudoUser, path, in.contextName, err)
 	}
 	return kube, nil
+}
+
+// userKubeconfig reads the sudo user's own ~/.kube/config and returns it
+// parsed, with its path, or why it may not be used. The file is found from the
+// user database, so SUDO_USER only ever names an account and never a path, and
+// it must be a regular file that account owns and nobody else can write.
+func (in topSudoInputs) userKubeconfig() (*clientcmdapi.Config, string, error) {
+	u, err := in.lookup(in.sudoUser)
+	if err != nil {
+		return nil, "", fmt.Errorf("SUDO_USER %s is not a user on this Mac: %w", in.sudoUser, err)
+	}
+	uid, err := strconv.ParseUint(u.Uid, 10, 32)
+	if err != nil {
+		return nil, "", fmt.Errorf("SUDO_USER %s has a uid %q that is not a number", in.sudoUser, u.Uid)
+	}
+	if uid == 0 {
+		return nil, "", fmt.Errorf("SUDO_USER %s is root", in.sudoUser)
+	}
+	if !filepath.IsAbs(u.HomeDir) {
+		return nil, "", fmt.Errorf("SUDO_USER %s has no home directory", in.sudoUser)
+	}
+	path := filepath.Join(u.HomeDir, ".kube", "config")
+	f, err := in.readFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, "", fmt.Errorf("%s's kubeconfig %s does not exist", in.sudoUser, path)
+	}
+	if err != nil {
+		return nil, "", fmt.Errorf("read %s's kubeconfig: %w", in.sudoUser, err)
+	}
+	if problem := f.ownershipProblem(uint32(uid), in.sudoUser); problem != "" {
+		return nil, "", fmt.Errorf("%s's kubeconfig %s %s, %w", in.sudoUser, path, problem, errSudoKubeconfigRefused)
+	}
+	cfg, err := parseSudoUserKubeconfig(f.data, path, in.contextName)
+	if err != nil {
+		return nil, "", fmt.Errorf("%s's kubeconfig %s: %w", in.sudoUser, path, err)
+	}
+	return cfg, path, nil
 }
 
 // parseSudoUserKubeconfig parses the user's kubeconfig and checks that the

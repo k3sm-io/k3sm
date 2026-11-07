@@ -134,6 +134,15 @@ metadata:
     name: qwen3
     uid: 6f0d5c2a-1f37-4a4e-9a2f-0b3f2a7d5c11
 spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: kubernetes.io/hostname
+            operator: In
+            values:
+            - mac-a
   containers:
   - args:
     - --model
@@ -204,7 +213,6 @@ spec:
     - mountPath: /var/lib/mlx/cache
       name: cache
   hostname: qwen3-rank-0
-  nodeName: mac-a
   nodeSelector:
     kubernetes.io/os: darwin
     mlx.k3sm.io/chip-family: m4
@@ -244,6 +252,15 @@ metadata:
     name: qwen3
     uid: 6f0d5c2a-1f37-4a4e-9a2f-0b3f2a7d5c11
 spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: kubernetes.io/hostname
+            operator: In
+            values:
+            - mac-b
   containers:
   - args:
     - --model
@@ -292,7 +309,6 @@ spec:
     - mountPath: /var/lib/mlx/cache
       name: cache
   hostname: qwen3-rank-1
-  nodeName: mac-b
   nodeSelector:
     kubernetes.io/os: darwin
     mlx.k3sm.io/chip-family: m4

@@ -40,7 +40,7 @@ service user, so a check run without `sudo` prints its result but cannot record 
 ## Managed Update
 
 A server can roll the whole cluster to a release for you, one node at a time, workers first and
-the server last. Five subcommands drive it; every one but `check` reaches the cluster with the
+the server last. Five subcommands drive it, and a sixth, `channel`, sets which releases it offers; every one but `check` reaches the cluster with the
 credentials `k3sm status` uses (the server's admin kubeconfig under `sudo`, the `k3sm` context of
 `~/.kube/config` otherwise), so run them on a server or from a Mac with the cluster's admin
 kubeconfig. A worker's own node credential may not create an update.
@@ -51,6 +51,7 @@ k3sm update apply                       # plan, confirm, start
 k3sm update status --watch              # follow it
 k3sm update cancel                      # stop after the current node
 k3sm update abort                       # recover from a failed step
+k3sm update channel [stable|rc]         # the releases offered; see Update Channels
 ```
 
 `k3sm update apply [--version <tag>] [--drain] [--allow-downgrade] [--signature if-signed|required] [--yes] [--pin-sha256 <digest>]`
@@ -104,6 +105,124 @@ update status` to see which node failed and why before you abort, and fix that n
 next `apply`.
 
 The k3sm app offers the same updates; see [Updating From k3sm.app](#updating-from-k3smapp).
+
+## Update Channels
+
+A cluster follows one update channel, `stable` or `rc`. The channel decides which release `k3sm update
+check` offers, and so which release `k3sm update apply` targets when you give no `--version`. It never
+starts a roll: nothing moves until someone runs `k3sm update apply`, and `apply --version <tag>` works on
+either channel.
+
+- `stable` is the default, and what a cluster follows when no channel is set. It offers the newest stable
+  release, the way [Checking for an Update](#checking-for-an-update) describes. It adds no waiting period:
+  the newest published final is offered at once.
+- `rc` offers the highest release of any kind, finals and release candidates together, by version
+  precedence and never by publication date. A release candidate is a tag such as `v0.3.0-rc.1`. A final
+  outranks its own candidates, so a cluster on `rc` moves from `v0.3.0-rc.2` to `v0.3.0` when it publishes.
+  A candidate is a build to try before the final, and may change or be withdrawn.
+
+These commands are in builds from this tree. No release candidate has been published yet, so on `rc` today
+you are offered the newest stable release.
+
+```sh
+k3sm update channel          # print the cluster's channel
+sudo k3sm update channel rc  # set it, then run a check
+k3sm update channel stable
+```
+
+`k3sm update channel` with no argument prints the channel, and fails rather than guess when the cluster
+gives no answer: with no reachable cluster it exits 1 with "cannot reach the cluster". On a worker it prints
+the channel its server published and says so on stderr. With `stable` or `rc` it sets the channel, which
+takes cluster-admin as `k3sm update apply` does, then runs a check. The write needs the `UpdatePolicy` CRD
+the server's update controller ensures; when the server has not established it yet, the command waits 15
+seconds and then says to retry. It exits 0 when the channel was set and checked, 1 when the write was
+refused, and 3 when the channel was set but the check failed; run `k3sm update check` again.
+
+The channel is one `UpdatePolicy` object named `cluster`, so `kubectl edit updatepolicy cluster` sets it too.
+A server reads it on each check, and a check that finds a different channel from the recorded one runs at
+once instead of waiting out the hour. A cluster with no such object follows `stable`. Any value other than
+`stable` or `rc` fails the check by name on a server, and reads as `stable` on a worker with a note.
+
+The channel is named where you look for it:
+
+- `k3sm update check` prints `channel  stable` or `channel  rc` as its first line, and `-o json` carries a
+  `channel` field. `latest` means the newest release on that channel.
+- The `update` row of `k3sm status` carries `wide.channel`. On `rc` its `detail` ends in `; channel rc`; on
+  `stable` it does not change. See [Status JSON](status-json.md).
+- The `apply` plan prints `channel` beside the target, and writes `(release candidate)` after a candidate
+  target.
+
+On `rc`, only a server lists releases. A worker's `k3sm update check` reads the pair of channel and latest
+release its server published on its own Node, so several Macs behind one address do not each spend GitHub's
+unauthenticated limit. A failed listing on the server keeps the last good pair published, and the row names
+the failure and when that pair was checked.
+
+### Leaving a Release Candidate
+
+Setting the channel back to `stable` moves nothing. A node that runs a candidate, or any release newer than
+the newest stable, reads `ahead`, and nothing is offered in the CLI or the app until a higher final
+publishes. If the cluster is on `v0.3.0-rc.2` and the newest stable is `v0.2.3`, setting `stable` leaves
+every node on `v0.3.0-rc.2`, `ahead`. When `v0.3.0` publishes the row reads `behind` and it is offered. Moving
+from a candidate to its final is an ordinary forward update on either channel.
+
+A cluster only moves down when you say so. Nothing offers a lower release, and `k3sm update apply` refuses a
+target older than a node runs unless you pass `--allow-downgrade`. That also holds after a candidate is
+withdrawn: a node on `rc.2` does not fall back to `rc.1` by itself. A cluster partly moved, say one node on a
+candidate and one on the older stable, reads `behind` with the detail `newer than the latest release`, and
+the roll is refused for the newer node until downgrade is allowed.
+
+The way off a bad candidate, under the update chain as it is today:
+
+1. If a roll is in progress, run `k3sm update cancel`. The node being updated finishes, nodes not yet started
+   stay where they are, and the update ends `Cancelled`. If a step failed, run `k3sm update status` to see
+   why, then `k3sm update abort`. A withdrawn candidate fails the download on every node not yet moved, so a
+   cluster rolling to one can be left mixed until you cancel.
+2. Set the channel back so nothing else is offered: `sudo k3sm update channel stable`.
+3. Roll back to a named older release. Pick a stable tag from the [releases page](https://k3sm.io/releases/),
+   take a snapshot, and run
+   `k3sm update apply --version <older-stable-tag> --allow-downgrade`. `--pin-sha256` binds it to one archive.
+
+What going back costs:
+
+- Every node moves down one at a time, and each node's Pods are recreated, `vm` Pods included, whose guests
+  stop without their grace period. See [Rollback](#rollback) and
+  [what survives a restart](limitations.md#what-survives-a-node-daemon-restart).
+- A candidate that changed the datastore engine has already migrated the database in place. Reverting the
+  binary is then half the job: restore the backup the upgrade left, or your own snapshot, as
+  [Rollback](#rollback) shows. Take the snapshot before you opt in.
+- A downgrade needs the server to be able to run the update. A candidate that breaks the updater itself cannot
+  be left by updating. The recovery is by hand on each Mac: `sudo k3sm uninstall`, then a fresh install of the
+  stable release with `K3SM_INSTALL_VERSION=<tag>`, as [Install](install.md) describes. Without `--purge`, uninstall keeps your cluster data.
+- On a node installed from a Developer ID build, the downgrade must be to a release signed by that same team.
+
+### Signatures on a Channel
+
+A channel changes which release is offered. Every node verifies the same
+chain on either channel, described in [Chain of Trust](#chain-of-trust): the archive digest comes from the
+release's checksums file over TLS, the server signs the payload, and the node's root helper checks the
+signature policy before it unpacks anything. The `latest` redirect and the release listing are not signed,
+and can hide a newer release from a cluster but cannot change what a node accepts.
+
+The default `--signature if-signed` policy holds a release to the installed build's signer. On an install
+from a build signed by a Developer ID team, a release must carry that team on every program. On an ad-hoc
+build, which has no team, the policy accepts a tree with no team or one signed throughout by a single team.
+It does not require a team signature, so on an ad-hoc install the release host and its checksums file are
+what vouch for the bytes, on `stable` as on `rc`. For a candidate that matters more, pass
+`--signature required` to refuse any release without a Developer ID signature, and `--pin-sha256 <digest>`
+with `--version` to bind the roll to one archive. `k3sm update apply` prints the signature policy beside the
+target, and says so when a candidate roll carries no pin.
+
+### How This Differs From k3s
+
+The idea of named channels is the same. These parts are different:
+
+| | k3s | k3sm |
+|---|---|---|
+| `stable` | releases held back for a period of community testing | the newest published final, with no hold; k3s's `latest` is the nearer match |
+| Candidates | a `testing` channel in its channel server | `rc`, the highest of finals and candidates |
+| What a channel does | system-upgrade-controller polls it and starts the upgrade itself | offers only; nothing rolls without `k3sm update apply` |
+| Scope | a field on each `Plan`, and `INSTALL_K3S_CHANNEL` on one install | one setting for the cluster; the install script has no channel, and `K3SM_INSTALL_VERSION` installs a named tag |
+| Build suffix | `+k3s1`, `-rc2+k3s1` | no build suffix; `vX.Y.Z-rc.N` |
 
 ## Updating From k3sm.app
 
@@ -237,7 +356,8 @@ node:
    (following redirects only to `objects.githubusercontent.com` and
    `release-assets.githubusercontent.com`, each one checked), at most 512 MiB and within 10
    minutes, into a fresh directory under `/var/lib/k3sm/updates` that only the `_k3sm` user can
-   read. A node installed with `--update-release-base` also accepts that base's own host (below).
+   read. `k3sm install` creates `/var/lib/k3sm/updates` on both roles; the daemon cannot, because
+   the data root belongs to root. A node installed with `--update-release-base` also accepts that base's own host (below).
 3. Writes `Verifying` and checks the archive's sha256 against the signed payload.
 4. Writes `Installing` and hands the archive, the payload, its signature and the signer to the
    `k3sm-netd` root helper. The helper verifies them again (above), unpacks only the build set
@@ -257,12 +377,43 @@ node:
    version reports it.
 
 The node never runs a downloaded binary itself. A refusal or a failed install writes `Failed`
-with the reason (`kubectl get node <name> -o jsonpath='{.metadata.annotations.k3sm\.io/update-phase}'`),
+with the reason and names `k3sm update abort` as the recovery
+(`kubectl get node <name> -o jsonpath='{.metadata.annotations.k3sm\.io/update-phase}'`),
 and the download directory stays for diagnosis until the next update attempt or the next daemon
 start removes it. A node without the `k3sm-netd` helper, such as a standalone `k3sm node`, does not
 take part. A worker that joined before this release has no root-owned CA copy until it is
 installed again (`sudo k3sm install --agent --server <server>`), and until then its helper refuses
 every managed update.
+
+A node on v0.2.x cannot take a managed update to a published release. Those builds did not lay down
+`/var/lib/k3sm/updates`, the daemon cannot make it (the data root belongs to root), and the managed
+update cannot bring the fix to the node it fails on. The node needs one ordinary install of a release
+that has the directory, the first release after v0.2.x or a later one, after which managed updates
+work. To check a node, run `ls -ld /var/lib/k3sm/updates`: it needs nothing if that shows `drwx------`
+and the `_k3sm` user.
+
+- **A server.** Run `curl -fsSL https://k3sm.io/install.sh | sh` or `sudo k3sm install`. Either mints
+  a new admin token, so copy the admin kubeconfig again with `k3sm kubeconfig` to every other Mac and
+  tool that uses it. The k3sm app's install of the release it carries on a one-node server runs
+  `k3sm install --from-staging`, which keeps the stored admin token unless that token is missing or
+  corrupt.
+- **A worker.** Run `sudo k3sm install --agent --server <server>`. It needs no token, because a joined
+  worker resumes from its stored credential. `install.sh` runs a bare install, which is not a worker
+  install, so download only: `curl -fsSL https://k3sm.io/install.sh | K3SM_INSTALL_DOWNLOAD_ONLY=1 sh`
+  leaves the verified archive in the current directory. Unpack it with `tar -xzf` and run
+  `sudo ./k3sm install --agent --server <server>` from the unpacked directory.
+
+Either way the install restarts the node's daemons and recreates its Pods, as any upgrade does.
+
+If you start a managed update anyway, the first step on that node fails. Its phase reads `Failed`
+with the reason, which names `k3sm update abort` as the recovery (see
+[On Each Node](#on-each-node)), and the roll stops there. Run `k3sm update status` to see which node
+failed, then `k3sm update abort`: it marks the update `Cancelled` and clears the `k3sm.io/update-*`
+annotations, and lifts the cordon where the update controller set it. Install on the node as above
+before the next `apply`.
+
+On a node that already runs such a release, a missing directory needs no install: `k3sm-netd`
+recreates it when it starts, so `sudo k3sm restart` is enough.
 
 ### Release Base for a Mirror or a Lab
 
@@ -294,7 +445,8 @@ install again with another `--update-release-base` to change it.
   release changes the datastore engine (below), but that copy lives on the same disk as the cluster it
   protects, so it is not a substitute for yours.
 - Know your rollback path. On the script channel, prior releases stay downloadable, so rollback is
-  `K3SM_INSTALL_VERSION=<prior-tag>` and a re-run.
+  `K3SM_INSTALL_VERSION=<prior-tag>` and a re-run. If you follow `rc`, read
+  [Leaving a Release Candidate](#leaving-a-release-candidate) first.
 - Check the version skew. Confirm the target Kubernetes pin with `k3sm version`; see
   [Versions](versions.md).
 - Plan for `vm` Pods. Every upgrade, every rollback, and the first upgrade to a release in which `vm`

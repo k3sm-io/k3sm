@@ -47,7 +47,8 @@ type kineSourcePatch struct {
 
 // kinePatches is the source half of the patch set the kine child is built with; the
 // other half is childreq.Raises, the module requirements raised in the copied tree's
-// go.mod (p2 added golang.org/x/net v0.60.0 to p1's source patch). kineBuildVariant
+// go.mod (p2 added golang.org/x/net v0.60.0 to p1's source patch, p3 added
+// github.com/klauspost/compress v1.20.2). kineBuildVariant
 // names the whole set: any change to either changes that variant, so every staged
 // kine re-stages. TestKinePatchSetIsMarked enforces that, against an append-only
 // history of digests.
@@ -184,14 +185,14 @@ func kineBuildArgs(version, out string) []string {
 		"-o", out, "."}
 }
 
-// kinePatchSetID is the patch-set suffix of kineBuildVariant ("p2" of "nocgo+p2").
+// kinePatchSetID is the patch-set suffix of kineBuildVariant ("p3" of "nocgo+p3").
 func kinePatchSetID() string {
 	_, id, _ := strings.Cut(kineBuildVariant, "+")
 	return id
 }
 
 // kineStampedVersion is the version a patched kine build reports: the upstream pin
-// plus the patch set, "v0.17.2+p2" (the bare pin with no patch set). `kine --version`
+// plus the patch set, "v0.17.2+p3" (the bare pin with no patch set). `kine --version`
 // prints it.
 func kineStampedVersion(version string) string {
 	if id := kinePatchSetID(); id != "" {

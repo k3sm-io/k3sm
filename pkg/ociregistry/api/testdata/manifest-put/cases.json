@@ -41,8 +41,22 @@
       "code": ""
     },
     {
-      "name": "oci-manifest-artifact-config-skips-checks",
-      "file": "oci-manifest-artifact-config-skips-checks.json",
+      "name": "oci-manifest-artifact-config-missing",
+      "file": "oci-manifest-artifact-config-missing.json",
+      "contentType": "application/vnd.oci.image.manifest.v1+json",
+      "status": 400,
+      "code": "MANIFEST_BLOB_UNKNOWN"
+    },
+    {
+      "name": "oci-manifest-artifact-layer-missing",
+      "file": "oci-manifest-artifact-layer-missing.json",
+      "contentType": "application/vnd.oci.image.manifest.v1+json",
+      "status": 400,
+      "code": "MANIFEST_BLOB_UNKNOWN"
+    },
+    {
+      "name": "oci-manifest-artifact-present",
+      "file": "oci-manifest-artifact-present.json",
       "contentType": "application/vnd.oci.image.manifest.v1+json",
       "status": 201,
       "code": ""

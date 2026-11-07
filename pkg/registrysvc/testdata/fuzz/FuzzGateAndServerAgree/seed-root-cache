@@ -1,0 +1,4 @@
+go test fuzz v1
+string("cache.db")
+string("")
+uint8(3)

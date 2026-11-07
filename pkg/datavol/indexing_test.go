@@ -20,7 +20,10 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -36,7 +39,7 @@ func TestIndexingMarkers(t *testing.T) {
 
 	t.Run("Spotlight is refused with a marker file at the volume root", func(t *testing.T) {
 		dir := t.TempDir()
-		if err := (Darwin{}).SpotlightOff(ctx, dir); err != nil {
+		if err := spotlightOff(ctx, dir, time.Minute, "true"); err != nil {
 			t.Fatalf("SpotlightOff: %v", err)
 		}
 		marker := filepath.Join(dir, ".metadata_never_index")
@@ -52,7 +55,7 @@ func TestIndexingMarkers(t *testing.T) {
 		}
 		// mdutil's answer for a directory it does not track must not turn a
 		// successful exclusion into a failure, and a second run is a no-op.
-		if err := (Darwin{}).SpotlightOff(ctx, dir); err != nil {
+		if err := spotlightOff(ctx, dir, time.Minute, "true"); err != nil {
 			t.Fatalf("SpotlightOff (second): %v", err)
 		}
 	})
@@ -84,4 +87,61 @@ func TestIndexingMarkers(t *testing.T) {
 			t.Fatal("TimeMachineExclude reported success with nothing to exclude")
 		}
 	})
+}
+
+// TestSpotlightOffBoundsMdutil stands in an mdutil that never answers and
+// proves SpotlightOff gives up at its own deadline, reports success because
+// the marker is already written, and leaves no child behind. A loaded host
+// can fire a short deadline before the shell records its pid, so the attempt
+// repeats under a longer deadline until the stand-in is known to have run.
+func TestSpotlightOffBoundsMdutil(t *testing.T) {
+	deadlines := []time.Duration{200 * time.Millisecond, time.Second, 5 * time.Second, 25 * time.Second}
+	for i, deadline := range deadlines {
+		dir := t.TempDir()
+		pidFile := filepath.Join(t.TempDir(), "pid")
+		// The shell records its pid, then becomes a blocking sleep.
+		script := "echo $$ > " + pidFile + "; exec sleep 600"
+
+		done := make(chan error, 1)
+		go func() {
+			done <- spotlightOff(context.Background(), dir, deadline, "sh", "-c", script)
+		}()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("spotlightOff with a hung mdutil: %v", err)
+			}
+		case <-t.Context().Done():
+			t.Fatal("test ended before spotlightOff returned")
+		}
+
+		if _, err := os.Stat(filepath.Join(dir, ".metadata_never_index")); err != nil {
+			t.Fatalf("the marker was not written: %v", err)
+		}
+		pid := recordedPID(pidFile)
+		if pid == 0 {
+			if i == len(deadlines)-1 {
+				t.Fatalf("the stand-in never recorded its pid within %v", deadline)
+			}
+			continue
+		}
+		if err := unix.Kill(pid, 0); err == nil {
+			t.Fatalf("child %d is still alive after the deadline", pid)
+		}
+		return
+	}
+}
+
+// recordedPID returns the pid the stand-in wrote, or 0 when it has not
+// written a complete one.
+func recordedPID(path string) int {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || pid <= 0 {
+		return 0
+	}
+	return pid
 }

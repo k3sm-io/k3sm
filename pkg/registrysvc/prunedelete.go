@@ -47,8 +47,7 @@ var ErrNoState = errors.New("no repository state to condition the delete on")
 // than drop the push's rows. An empty state is refused with ErrNoState and
 // sends nothing: the delete is never unconditional by omission.
 //
-// A registry that does not implement If-Match on DELETE, zot among them,
-// ignores the field and deletes unconditionally; for it the window between
+// A registry that does not implement If-Match on DELETE ignores the field and deletes unconditionally; for it the window between
 // Recheck and this request stays open, as it was before.
 //
 // rt is the transport under go-containerregistry's own (nil uses

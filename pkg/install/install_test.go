@@ -1588,6 +1588,29 @@ func (f *fakeSystem) RemoveEntry(dir, name string) error {
 	return nil
 }
 
+// RemoveEntryBeneath records the removal and removes the file. A symlink in the
+// ownership table at the root or any level below it is refused, as O_NOFOLLOW
+// refuses it, and removeEntryErrs answers as it does for RemoveEntry.
+func (f *fakeSystem) RemoveEntryBeneath(root string, subdirs []string, name string) error {
+	f.calls = append(f.calls, "RemoveEntryBeneath:"+root+":"+strings.Join(subdirs, "/")+":"+name)
+	dir := root
+	for i := -1; i < len(subdirs); i++ {
+		if i >= 0 {
+			dir = filepath.Join(dir, subdirs[i])
+		}
+		if f.owners[dir].Kind == EntrySymlink {
+			return fmt.Errorf("remove %s beneath %s: open %s: too many levels of symbolic links (O_NOFOLLOW)", name, root, dir)
+		}
+	}
+	p := filepath.Join(dir, name)
+	if err, ok := f.removeEntryErrs[p]; ok {
+		return fmt.Errorf("remove %s beneath %s: %w", name, root, err)
+	}
+	delete(f.files, p)
+	delete(f.owners, p)
+	return nil
+}
+
 // OpenDirNoFollow records the open and hands out a numbered handle. A symlink
 // (in the ownership table) at dir is refused, as O_NOFOLLOW refuses it; a dir
 // with no ownership entry is absent. The handle keeps reading the directory it
@@ -1912,6 +1935,7 @@ func TestInstallOrchestration(t *testing.T) {
 		"EnsureOwnedDir:/var/lib/k3sm/run:271:20:0700",
 		"EnsureOwnedDir:/var/lib/k3sm/Library:271:20:0700",
 		"EnsureOwnedDir:/var/lib/k3sm/status:271:20:0755",
+		"EnsureOwnedDir:/var/lib/k3sm/updates:271:20:0700",
 		"EnsureOwnedDir:/var/lib/k3sm/pods:271:20:0750",
 		"EnsureOwnedDir:/var/lib/k3sm/storage:271:20:0750",
 		"EnsureOwnedDir:/var/lib/k3sm/blobs:271:20:0750",
@@ -1952,6 +1976,8 @@ func TestInstallOrchestration(t *testing.T) {
 		// can read it and nothing else can. It needs the service uid, so it
 		// cannot precede EnsureServiceUser, and it precedes the plist that names
 		// it: the daemon must never be pointed at a file nobody has written.
+		// What it held is read first: a rollback puts that token back.
+		"ReadOwnedRegularFile:/var/lib/k3sm/server/token",
 		"WriteServiceUserFile:/var/lib/k3sm/server/token:0600:0700:271",
 		// This node's wireguard identity, provisioned by the party that can: the
 		// root-only key dir carved directly under the root-owned data root (and
@@ -2000,7 +2026,6 @@ func TestInstallOrchestration(t *testing.T) {
 		// The pinned helm the helm controller's Jobs run, a payload binary like
 		// kubectl.
 		"CopyToRootOwned:/Library/k3sm.swap/bin/" + helmchart.HelmBinaryName,
-		"CopyToRootOwned:/Library/k3sm.swap/bin/zot",
 		// The kine version marker rides beside the kine binary it describes, staged
 		// best-effort (a pre-marker archive has none and must still install).
 		"CopyToRootOwned:/Library/k3sm.swap/bin/" + executor.KineMarkerName,
@@ -2011,8 +2036,6 @@ func TestInstallOrchestration(t *testing.T) {
 		// The control-plane version marker, staged the same best-effort way beside the
 		// four kube binaries it describes.
 		"CopyToRootOwned:/Library/k3sm.swap/bin/" + executor.KubeMarkerName,
-		// The zot version marker, staged the same best-effort way beside zot.
-		"CopyToRootOwned:/Library/k3sm.swap/bin/" + registrysvc.ZotMarkerName,
 		// The helm version marker, staged the same best-effort way beside helm.
 		"CopyToRootOwned:/Library/k3sm.swap/bin/" + helmchart.HelmMarkerName,
 		// The shadow binary set, staged with the binary that uses it: each copy
@@ -2048,6 +2071,9 @@ func TestInstallOrchestration(t *testing.T) {
 		// instruction assumes, so the link is still a hard install failure when
 		// it cannot be laid down.
 		"EnsureSymlink:/Library/k3sm/k3sm->/usr/local/bin/k3sm",
+		// The recorded node pod range is read before the plist that seeds the range
+		// (retireStaleNodeIdentity); absent here, so nothing is removed.
+		"ReadRegularFile:/var/lib/k3sm/keys/node-pod-cidr",
 		"WriteLaunchDaemon:/Library/LaunchDaemons/io.k3sm.netd.plist",
 		// The server plist is the one that requests an open-file limit, so the
 		// plist it replaces is read first to compare the two: a changed limit
@@ -2090,6 +2116,10 @@ func TestInstallOrchestration(t *testing.T) {
 		// one, and removes it HERE and not a step earlier
 		// (TestInstallStagesTheRootAndPublishesItOnce).
 		//
+		// The zot an earlier release staged goes at the same point: past it, the
+		// install is not rolled back.
+		"RemoveEntryBeneath:/var/lib/k3sm:server/bin:zot",
+		"RemoveEntryBeneath:/var/lib/k3sm:server/bin:zot.version",
 		// The cluster CA the first boot minted, waited for AFTER the bootstrap and
 		// outside the publish, then pinned in the admin kubeconfig.
 		"ReadFile:/var/lib/k3sm/server/tls/cluster-ca.crt",
@@ -2216,10 +2246,10 @@ func TestInstallBinaryLandsAtFixedPath(t *testing.T) {
 	// The payload set lands at InstallDir/bin/<name> — one copy per
 	// executor.PayloadBinaries entry, in order, after the binary + exec-shim + shims + vmhost.
 	head := len(fixedHead)
-	// +6 for the six version markers (kine, etcd, etcdutl, the control-plane
-	// set, zot, then helm), staged beside the binaries they describe.
-	if want := head + len(executor.PayloadBinaries()) + 6; len(dsts) != want {
-		t.Errorf("%d copies, want %d (binary + exec-shim + path-shim + dns-shim + vmhost + the payload set + the six markers)", len(dsts), want)
+	// +5 for the five version markers (kine, etcd, etcdutl, the control-plane
+	// set, then helm), staged beside the binaries they describe.
+	if want := head + len(executor.PayloadBinaries()) + 5; len(dsts) != want {
+		t.Errorf("%d copies, want %d (binary + exec-shim + path-shim + dns-shim + vmhost + the payload set + the five markers)", len(dsts), want)
 	}
 	for i, name := range executor.PayloadBinaries() {
 		if got, want := dsts[head+i], stage+"/bin/"+name; got != want {
@@ -2324,6 +2354,7 @@ func TestUninstallIdempotent(t *testing.T) {
 		// no use on a Mac that is no longer a k3sm server, and it goes AFTER the
 		// daemon that reads it has been booted out.
 		"RemoveAll:/var/lib/k3sm/server/token",
+		"RemoveAll:/var/lib/k3sm/updates",
 		"RemoveAll:/var/lib/k3sm/status/update.json",
 		"RemoveAll:/var/lib/k3sm/status/budget.json",
 		"RemoveAll:/var/lib/k3sm/status/endpoints.json",
@@ -3005,6 +3036,11 @@ func TestUninstallManifestCoversInstall(t *testing.T) {
 		if dc.Role == RoleServer {
 			created[dc.serverJoinTokenPath()] = true
 		}
+		// The managed update's working directory: a state-tree row install
+		// lays down on both roles (EnsureOwnedDir), removed with its contents.
+		if slices.Contains(installCalls, fmt.Sprintf("EnsureOwnedDir:%s:%d:%d:%#o", StateUpdates.Path(dc.DataRoot), 271, ServiceTreeGID, UpdatesDirMode)) {
+			created[StateUpdates.Path(dc.DataRoot)] = true
+		}
 		// The `k3sm status` records are written by the server daemon this
 		// install bootstrapped, in its work dir and in the status directory, so
 		// they are created only when that daemon was, and admitted by their
@@ -3410,48 +3446,72 @@ func mustContain(t *testing.T, haystack, needle string) {
 	}
 }
 
-// TestInstallStagesTheZotMarker is the gate for the bundled registry: the server
-// seeds zot from the payload only when zot.version beside it vouches for the
-// pin, and without it falls back to a build a launchd daemon cannot run. So an
-// install must stage the marker from the payload, publish it into the live
-// bin dir, and what it stages must satisfy the server's own predicate.
-func TestInstallStagesTheZotMarker(t *testing.T) {
-	payload := t.TempDir()
-	if err := os.WriteFile(filepath.Join(payload, registrysvc.ZotBinaryName), []byte("zot\n"), 0o755); err != nil {
-		t.Fatal(err)
+// TestInstallRemovesTheLeftoverZot: an install removes the zot an earlier release
+// staged in the work dir, and its marker, whether or not they are there. Where it
+// does so among the other steps is pinned by TestInstallOrchestration: past the
+// point a failed install reverts to the previous release.
+func TestInstallRemovesTheLeftoverZot(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		present bool
+	}{{"present", true}, {"absent", false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeSystem{}
+			cfg := Config{BinarySource: "/tmp/build/k3sm", TargetUser: "alice"}
+			bin := filepath.Join(cfg.withDefaults().serverWorkDir(), "bin")
+			if tc.present {
+				f.files = map[string][]byte{
+					filepath.Join(bin, registrysvc.ZotBinaryName): []byte("zot"),
+					filepath.Join(bin, registrysvc.ZotMarkerName): []byte("v2 minimal"),
+				}
+			}
+			if err := Install(context.Background(), f, cfg); err != nil {
+				t.Fatalf("Install: %v", err)
+			}
+			for _, name := range []string{registrysvc.ZotBinaryName, registrysvc.ZotMarkerName} {
+				if !slices.Contains(f.calls, "RemoveEntryBeneath:/var/lib/k3sm:server/bin:"+name) {
+					t.Errorf("no removal of %s: %v", name, f.calls)
+				}
+				if _, ok := f.files[filepath.Join(bin, name)]; ok {
+					t.Errorf("%s survived the install", name)
+				}
+			}
+		})
 	}
-	marker := registrysvc.DefaultZotVersion + " minimal+r1\n"
-	if err := os.WriteFile(filepath.Join(payload, registrysvc.ZotMarkerName), []byte(marker), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	f := &fakeSystem{}
-	cfg := Config{BinarySource: "/tmp/build/k3sm", TargetUser: "alice", PayloadSource: payload}
-	if err := Install(context.Background(), f, cfg); err != nil {
-		t.Fatalf("Install: %v", err)
-	}
-	live := f.treeUnder(cfg.withDefaults().InstallDir)
-	src, ok := live["bin/"+registrysvc.ZotMarkerName]
-	if !ok {
-		t.Fatalf("%s is not in the published install root %v", registrysvc.ZotMarkerName, live)
-	}
-	if want := filepath.Join(payload, registrysvc.ZotMarkerName); src != want {
-		t.Errorf("zot marker came from %q, want the payload's %q", src, want)
-	}
-	// Reproduce the staged bin dir from what the install copied and ask the
-	// server's predicate about it.
-	bin := t.TempDir()
-	for _, name := range []string{registrysvc.ZotBinaryName, registrysvc.ZotMarkerName} {
-		b, err := os.ReadFile(live["bin/"+name])
-		if err != nil {
-			t.Fatalf("read the staged source of %s: %v", name, err)
+	t.Run("an install that fails keeps it for the release it reverts to", func(t *testing.T) {
+		cfg := Config{BinarySource: "/tmp/build/k3sm", TargetUser: "alice"}
+		f := &fakeSystem{bootstrapAlways: map[string]error{"io.k3sm.server": errors.New("refused")}}
+		if err := Install(context.Background(), f, cfg); err == nil {
+			t.Fatal("Install succeeded with the server refusing to bootstrap")
 		}
-		if err := os.WriteFile(filepath.Join(bin, name), b, 0o644); err != nil {
-			t.Fatal(err)
+		if slices.Contains(f.calls, "RemoveEntryBeneath:/var/lib/k3sm:server/bin:"+registrysvc.ZotBinaryName) {
+			t.Errorf("a failed install removed zot: %v", f.calls)
 		}
-	}
-	if !registrysvc.PayloadVouchesZot(bin, registrysvc.DefaultZotVersion) {
-		t.Errorf("the staged zot set is not one the server would use (marker %q, pin %s)", marker, registrysvc.DefaultZotVersion)
-	}
+	})
+	t.Run("a failed removal does not fail the install", func(t *testing.T) {
+		cfg := Config{BinarySource: "/tmp/build/k3sm", TargetUser: "alice"}
+		bin := filepath.Join(cfg.withDefaults().serverWorkDir(), "bin")
+		f := &fakeSystem{removeEntryErrs: map[string]error{filepath.Join(bin, registrysvc.ZotBinaryName): errors.New("busy")}}
+		if err := Install(context.Background(), f, cfg); err != nil {
+			t.Fatalf("Install: %v", err)
+		}
+	})
+	t.Run("a refused removal does not fail the install", func(t *testing.T) {
+		cfg := Config{BinarySource: "/tmp/build/k3sm", TargetUser: "alice"}
+		work := cfg.withDefaults().serverWorkDir()
+		bin := filepath.Join(work, "bin")
+		zot := filepath.Join(bin, registrysvc.ZotBinaryName)
+		f := &fakeSystem{
+			owners: map[string]OwnedEntry{work: {Path: work, Kind: EntrySymlink}},
+			files:  map[string][]byte{zot: []byte("zot")},
+		}
+		if err := Install(context.Background(), f, cfg); err != nil {
+			t.Fatalf("Install: %v", err)
+		}
+		if _, ok := f.files[zot]; !ok {
+			t.Error("the removal went through a symlink")
+		}
+	})
 }
 
 // TestInstallStagesTheHelmMarker: the work-dir seed replaces a helm whose marker

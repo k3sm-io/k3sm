@@ -1,0 +1,1 @@
+{"schemaVersion":1,"verdict":"running","rows":[{"name":"ic-bridge","state":"skip","severity":"skip","detail":"no Thunderbolt cable to another Mac is plugged in and this node holds no interconnect address, so only stray state is checked"},{"name":"ic-stray","state":"ok","severity":"ok","detail":"no stray reserved-range alias or route on bridge0"}]}

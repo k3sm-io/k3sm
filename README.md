@@ -99,7 +99,7 @@ Line Tools, a signed-in GitHub CLI (`gh`), and the exact Go release the script p
 
 Before it signs anything, the staging script scans the bundled Go binaries for known
 vulnerabilities: every Go binary in the control-plane payload (the Kubernetes binaries, kine,
-etcd, etcdutl, zot and helm), with `govulncheck -mode=binary` at the version `hack/ci.sh` pins. It
+etcd, etcdutl and helm), with `govulncheck -mode=binary` at the version `hack/ci.sh` pins. It
 needs that govulncheck installed and the Go vulnerability database reachable. A finding whose
 trace reaches a vulnerable symbol in a binary stops the staging unless
 `hack/release/govulncheck.allow` names it by vulnerability id, child and the child's pinned

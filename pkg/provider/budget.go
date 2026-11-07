@@ -178,7 +178,7 @@ func defaultLadder(memCapacity, pidMax int64) budgetLadder {
 
 	mem := signalLadder{id: budgetv1alpha1.SignalMemoryAvailable, limiting: budgetv1alpha1.ResourceMemory}
 	mem.rungs = [numBudgetRungs]*int64{
-		i64(max(gi, memCapacity*12/100)),
+		i64(max(gi, memCapacity*11/100)),
 		i64(max(768*mi, memCapacity*8/100)),
 		i64(max(512*mi, memCapacity*5/100)),
 		i64(max(256*mi, memCapacity*25/1000)),
@@ -190,13 +190,14 @@ func defaultLadder(memCapacity, pidMax int64) budgetLadder {
 	mem.minReclaimBytes = i64(*mem.releases[rungEvictSoft] - *mem.rungs[rungEvictSoft])
 
 	comp := signalLadder{id: budgetv1alpha1.SignalMemoryCompressor, limiting: budgetv1alpha1.ResourceMemory}
-	comp.rungs = [numBudgetRungs]*int64{i64(500), i64(600), i64(700), i64(750), i64(compressorTripPercent * 10)}
+	// In permille of the compressor limit: 560 is the ruled 56% warn.
+	comp.rungs = [numBudgetRungs]*int64{i64(560), i64(600), i64(700), i64(750), i64(compressorTripPercent * 10)}
 	comp.releases[rungEvictHard] = i64(compressorReleasePercent * 10)
 	halfGapReleases(&comp)
 	comp.graceSeconds = i64(compressorEvictSoftGraceSeconds)
 
 	swap := signalLadder{id: budgetv1alpha1.SignalMemorySwap, limiting: budgetv1alpha1.ResourceMemory}
-	swap.rungs = [numBudgetRungs]*int64{i64(256 * mi), i64(512 * mi), i64(gi), nil, nil}
+	swap.rungs = [numBudgetRungs]*int64{i64(512 * mi), i64(gi), i64(2 * gi), nil, nil}
 	halfGapReleases(&swap)
 	swap.windowSeconds = i64(int64(memorySwapWindow / time.Second))
 

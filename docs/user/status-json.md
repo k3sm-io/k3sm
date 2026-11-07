@@ -328,14 +328,15 @@ the row's `state` when that source is the node daemon's arguments. No value is a
 password: the row names a fixed set of settings, none of which is a credential. `detail` gives the
 same values in one line.
 
-The `developer-mode` row appears only while something is at `/Library/k3sm.developer-mode`, and it
-never changes the `verdict`. Its `severity` is `warn`. The verdict stays `ok` while developer mode is
+The `developer-mode` row appears only while something is at `/Library/k3sm.developer-mode` or that
+path cannot be read, and it never changes the `verdict`. Its `severity` is `warn`. The verdict stays `ok` while developer mode is
 on, so automation that needs to know reads this row. See [Developer mode](install.md#developer-mode).
 
 | `state` | meaning |
 |---|---|
 | `on` | a valid marker is there: the signature of the k3sm that runs as root is not checked. `remedy` is `sudo k3sm install --developer-mode off`; installing a Developer ID signed k3sm also turns developer mode off, and reinstalling an ad-hoc signed build from source does not |
-| `invalid` | something is at the path that is not a root-owned file nobody else can write, with no ACL, or `/` or `/Library` is not a root-owned real directory that neither group nor others can write, with no ACL. It is ignored and the signature checks stay on. `remedy` is `sudo rm /Library/k3sm.developer-mode` |
+| `invalid` | something is at the path that is not a root-owned file nobody else can write, with no ACL, or `/` or `/Library` is not a root-owned real directory that neither group nor others can write, with no ACL. It is ignored and the signature checks stay on. When the marker file is the cause, `remedy` is `sudo rm /Library/k3sm.developer-mode`, or `sudo rm -r /Library/k3sm.developer-mode` when a directory is at the path. When a directory above it is the cause, or is unsound above a marker that is not a regular file, `detail` and `remedy` name that directory (`/` or `/Library`) and the remedy is to make it root-owned, not writable by group or others, with no ACL; removing the marker clears the row and leaves that directory as it is |
+| `unknown` | the path could not be read, for example because the account cannot search a directory above it, or because a build without cgo cannot read an ACL. The report cannot say whether developer mode is on, so treat the mode as unverified. `remedy` is `sudo k3sm status`; as root, it is to check the path and the directories above it by hand |
 
 `wide.signing` names how the installed k3sm is signed, `ad-hoc` or `team <ID>`; it is omitted when
 that cannot be read. `detail` and `remedy` are sentences for a person; do not parse them.
@@ -383,9 +384,19 @@ kubelet version from the node list the report reads (the recorded node versions 
 nodes). A build of an untagged commit (a Go pseudo-version) ranks by the release it leads up to, and
 `detail` calls it an untagged build, for example `a (untagged build of 0.2.1)`.
 
-On a worker the row is read-only. After each check a server publishes the latest release and when it
-checked on its own Node (the `k3sm.io/release-latest` and `k3sm.io/release-checked` annotations),
-and the worker's report reads them from the node list, so it compares every node with the same
+`wide.channel` is the update channel that result was computed under, `stable` or `rc`, on the rolling
+row too. A check on `stable` leaves `detail` as described above, and one on `rc` adds a trailing
+`; channel rc`. A failed check on `rc` also names the last good release, its channel and when it was
+checked, from what the Nodes still publish, when the report could list them. `wide.channel` is absent
+when there is no result to name a channel for: no check is recorded, the record fails validation, or
+the check could not read the channel. An older server's result, which names no channel, reads as
+`stable`. A value that is neither channel also reads as `stable`, and `detail` says the server's channel
+could not be read.
+
+On a worker the row is read-only. After each check a server publishes the latest release, when it
+checked and the channel it checked on, on its own Node (the `k3sm.io/release-latest`,
+`k3sm.io/release-checked` and `k3sm.io/release-channel` annotations). A failed check publishes
+none of them, so the three stay together. The worker's report reads them from the node list, so it compares every node with the same
 release the server does; `wide.record` is `node/<server>`. Only a control-plane Node's annotations
 count, and with more than one server the most recent check wins. The row offers no check remedy,
 since a worker cannot refresh the server's record. When the report cannot list nodes (the apiserver

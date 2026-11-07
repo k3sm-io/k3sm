@@ -20,13 +20,17 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
+	stdmaps "maps"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 
@@ -35,9 +39,14 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 
 	"k3sm.io/darwin-net/pkg/tcpseg"
 	"k3sm.io/k3sm/pkg/executor"
+	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/registrysvc"
 )
 
@@ -53,7 +62,7 @@ import (
 // Either way the connection is HTTPS, verified against the cluster CA from the
 // kubeconfig with the name registry-k3sm, which both gates' certificates carry.
 // The registry's per-boot credential is not used: it stays the gate's own
-// upstream credential to zot.
+// upstream credential to the registry.
 
 // defaultGatePort is the loopback gate's port on a server started with the
 // default --registry-port.
@@ -76,15 +85,38 @@ type clusterRegistryAPI struct {
 	tokens serviceAccountTokens
 	slices endpointSliceGetter
 	caPEM  []byte
+	// nodeHint, when set, says the kubeconfig is this worker's node credential
+	// and what to do about a refused token (nodeCredentialHint).
+	nodeHint string
+}
+
+// mintToken mints a builder token, and a refusal says what to do when the
+// identity asking is a node's.
+func (a clusterRegistryAPI) mintToken(ctx context.Context, d time.Duration, now func() time.Time) (builderToken, error) {
+	tok, err := mintBuilderToken(ctx, a.tokens, d, now)
+	if a.nodeHint != "" && errors.Is(err, errBuilderTokenRefused) {
+		return builderToken{}, fmt.Errorf("%w; %s", err, a.nodeHint)
+	}
+	return tok, err
 }
 
 // clusterRegistryClient resolves the caller's kubeconfig the way `k3sm kubectl`
-// and the builder verbs do. It is a variable so a test points it at a fake.
+// and the builder verbs do, except for a worker under sudo (registryClients). It
+// is a variable so a test points it at a fake.
 var clusterRegistryClient = func() (clusterRegistryAPI, error) {
 	in := builderKubeInputs(builderOptions{workDir: workDirFromEnv(), workDirExplicit: os.Getenv("K3SM_WORK_DIR") != ""})
-	restCfg, cs, err := builderClients(in)
+	return clusterRegistryAPIFrom(in, topSudoInputsFromEnv())
+}
+
+// clusterRegistryAPIFrom is clusterRegistryClient over injected inputs.
+func clusterRegistryAPIFrom(in kubectlInputs, sudo topSudoInputs) (clusterRegistryAPI, error) {
+	restCfg, cs, nodeHint, err := registryClients(in, sudo)
 	if err != nil {
-		return clusterRegistryAPI{}, fmt.Errorf("%w (%v); %s", errNoUserKubeconfig, err, builderTokenRemedy)
+		remedy := builderTokenRemedy
+		if in.role == install.RoleAgent {
+			remedy = workerMintRemedy
+		}
+		return clusterRegistryAPI{}, fmt.Errorf("%w (%v); %s", errNoUserKubeconfig, err, remedy)
 	}
 	ca := restCfg.CAData
 	if len(ca) == 0 && restCfg.CAFile != "" {
@@ -93,10 +125,192 @@ var clusterRegistryClient = func() (clusterRegistryAPI, error) {
 		}
 	}
 	return clusterRegistryAPI{
-		tokens: cs.CoreV1().ServiceAccounts(registrysvc.BuilderNamespace),
-		slices: cs.DiscoveryV1().EndpointSlices(registrysvc.FlatServiceNamespace),
-		caPEM:  ca,
+		tokens:   cs.CoreV1().ServiceAccounts(registrysvc.BuilderNamespace),
+		slices:   cs.DiscoveryV1().EndpointSlices(registrysvc.FlatServiceNamespace),
+		caPEM:    ca,
+		nodeHint: nodeHint,
 	}, nil
+}
+
+// workerMintRemedy is the fix for a worker with no kubeconfig to mint a registry
+// push token with. A worker writes no user kubeconfig, so the copy is saved by hand,
+// where registryClients reads it under sudo: `image migrate`, `push` and `load` need
+// root or the service user, and $KUBECONFIG is ignored under sudo.
+const workerMintRemedy = "run `k3sm kubeconfig > k3sm.yaml` on the server, save the copied admin kubeconfig as `~/.kube/config`, owned by you and not group- or world-writable, and run with sudo; or have an admin bind the k3sm:registry-builder-token Role to you with a RoleBinding in " + registrysvc.BuilderNamespace
+
+// registryClients picks the kubeconfig a builder token is minted through.
+//
+// Everywhere but a worker under sudo it is the builder verbs' choice. Under sudo
+// a worker's order is K3SM_WORK_DIR, then the account's own kubeconfig, but the
+// account has two owners: root's own comes first, then the invoking user's. That
+// user's file is read only through topSudoInputs.userKubeconfig, with its checks
+// on ownership and credentials, and $HOME is not consulted at all, because sudo
+// may have kept the invoker's and that would read the same file without those
+// checks. $KUBECONFIG is dropped for the same reason: under sudo it may name a
+// file root has not checked, and the invoker's own file is already read through
+// the checked path. That file also picks where root pushes, so checkSudoUserCluster
+// holds it to the cluster this node joined.
+//
+// With neither, the run stops: root never falls back to the node credential, under
+// sudo or not (workerMintRefusal). The service user reads its own node credential
+// and gets nodeHint for the refusal that follows.
+func registryClients(in kubectlInputs, sudo topSudoInputs) (*rest.Config, kubernetes.Interface, string, error) {
+	in.asRoot = sudo.euid == 0
+	worker := in.role == install.RoleAgent && in.workDirOverride == ""
+	if worker && sudo.underSudo() {
+		if in.kubeconfigEnv != "" && sudo.warn != nil {
+			fmt.Fprintf(sudo.warn, "k3sm: ignoring $KUBECONFIG under sudo on this worker: reading %s's ~/.kube/config instead, after checking its owner, mode and cluster\n", sudo.sudoUser)
+		}
+		node := in.nodeKubeconfig
+		in.kubeconfigEnv = ""
+		in.home = sudo.rootHome()
+		in.nodeKubeconfig = ""
+		if _, err := resolveKubectlConfig(in); err == nil {
+			restCfg, cs, err := builderClients(in)
+			return restCfg, cs, "", err
+		}
+		cfg, path, err := sudo.userKubeconfig()
+		if err == nil {
+			err = checkSudoUserCluster(cfg, path, sudo)
+		}
+		if err != nil {
+			if errors.Is(err, errSudoKubeconfigRefused) && sudo.warn != nil {
+				fmt.Fprintf(sudo.warn, "k3sm: %v\n", err)
+			}
+			return nil, nil, "", fmt.Errorf("%w; and root does not use the node credential %s, which is a node identity and may not mint a registry push token", err, node)
+		}
+		restCfg, cs, err := sudoUserClients(cfg, sudo.contextName)
+		return restCfg, cs, "", err
+	}
+	if worker {
+		if err := workerMintRefusal(in); err != nil {
+			return nil, nil, "", err
+		}
+	}
+	restCfg, cs, err := builderClients(in)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	hint := ""
+	if chosen, err := builderKubeconfig(in); worker && err == nil && in.nodeKubeconfig != "" && chosen.kubeconfig == in.nodeKubeconfig {
+		hint = nodeCredentialHint(in.nodeKubeconfig)
+	}
+	return restCfg, cs, hint, nil
+}
+
+// workerMintRefusal says why this account has nothing to mint a push token with on
+// a worker, or nil when it has. It stops before builderKubeconfig's refusals, whose
+// fix is for the builder verbs; clusterRegistryAPIFrom adds workerMintRemedy.
+func workerMintRefusal(in kubectlInputs) error {
+	cfg, err := resolveKubectlConfig(in)
+	if err != nil {
+		return fmt.Errorf("%s does not exist and the node credential %s is not readable by this account", userKubeconfigNames(in), in.nodeKubeconfig)
+	}
+	if rootChoseNodeCredential(in, cfg) {
+		return fmt.Errorf("%s does not exist and root does not use the node credential %s, which is a node identity and may not mint a registry push token", userKubeconfigNames(in), in.nodeKubeconfig)
+	}
+	return nil
+}
+
+// checkSudoUserCluster refuses a sudo user's kubeconfig that would have root talk
+// to anything but the cluster this node joined. The file chooses the apiserver, and
+// the apiserver's EndpointSlice chooses where root pushes, so its cluster must be
+// reached over verified TLS and hold exactly the CA in this worker's root-only copy
+// (agentClusterCA). The pin is the CA and not the address, because a person's file
+// can legitimately use a different address from the node's. A copy that cannot be
+// trusted leaves nothing to compare with, which is a refusal too, and the node
+// credential is not used instead: a node identity may not mint a registry push
+// token.
+func checkSudoUserCluster(cfg *clientcmdapi.Config, path string, sudo topSudoInputs) error {
+	name := cfg.Contexts[sudo.contextName].Cluster
+	cluster := cfg.Clusters[name]
+	refuse := func(format string, args ...any) error {
+		return fmt.Errorf("%s's kubeconfig %s: cluster %q %s, %w", sudo.sudoUser, path, name, fmt.Sprintf(format, args...), errSudoKubeconfigRefused)
+	}
+	if cluster.InsecureSkipTLSVerify {
+		return refuse("sets insecure-skip-tls-verify, and root does not reach a cluster unverified on a user's behalf")
+	}
+	if u, err := url.Parse(cluster.Server); err != nil || u.Scheme != "https" {
+		return refuse("names the server %q, and root reaches a cluster only over https on a user's behalf", cluster.Server)
+	}
+	clusterCA, err := agentClusterCA(sudo.readFile)
+	if err != nil {
+		return refuse("cannot be checked, because %v; to fix this worker's copy, run %s", err, agentClusterCARemedy)
+	}
+	ca := pemCertificates(cluster.CertificateAuthorityData)
+	if len(ca) == 0 {
+		return refuse("carries no inline CA to compare with this worker's cluster CA %s", install.AgentClusterCAPath)
+	}
+	if !stdmaps.Equal(ca, clusterCA) {
+		return refuse("holds a different CA from this worker's cluster CA %s, so it is not the cluster this node joined", install.AgentClusterCAPath)
+	}
+	return nil
+}
+
+// agentClusterCARemedy repairs the worker's root-only cluster CA copy. The removal
+// comes first because an install keeps a copy that holds the CA it would write,
+// whoever owns it, and the token because an install with none would take a missing
+// copy from the node credential.
+var agentClusterCARemedy = fmt.Sprintf("`sudo rm -f %s` and then `sudo k3sm install --agent --server <server> --token-file <file>`, with a fresh token from `k3sm token create` on the server",
+	install.AgentClusterCAPath)
+
+// agentClusterCA is the set of certificates in this worker's root-only copy of the
+// cluster CA, which `k3sm install` writes pinned by the join token. The checks are
+// on what was read: root must own it and nobody else may write to it.
+func agentClusterCA(read func(path string) (sudoKubeconfigFile, error)) (map[string]struct{}, error) {
+	path := install.AgentClusterCAPath
+	f, err := read(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("this worker's cluster CA %s does not exist", path)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("this worker's cluster CA %s cannot be read: %w", path, err)
+	}
+	if problem := f.ownershipProblem(0, "root"); problem != "" {
+		return nil, fmt.Errorf("this worker's cluster CA %s %s", path, problem)
+	}
+	ca := pemCertificates(f.data)
+	if len(ca) == 0 {
+		return nil, fmt.Errorf("this worker's cluster CA %s holds no certificate", path)
+	}
+	return ca, nil
+}
+
+// pemCertificates is the set of certificates in a PEM bundle, by DER, so two
+// spellings of one CA compare equal and a bundle with one more does not. It reads
+// the blocks x509.CertPool.AppendCertsFromPEM reads, which is what the bundle would
+// be trusted for.
+func pemCertificates(data []byte) map[string]struct{} {
+	out := map[string]struct{}{}
+	for {
+		var block *pem.Block
+		block, data = pem.Decode(data)
+		if block == nil {
+			return out
+		}
+		if block.Type == "CERTIFICATE" && len(block.Headers) == 0 {
+			out[string(block.Bytes)] = struct{}{}
+		}
+	}
+}
+
+// sudoUserClients builds the clients from the sudo user's checked kubeconfig.
+func sudoUserClients(cfg *clientcmdapi.Config, contextName string) (*rest.Config, kubernetes.Interface, error) {
+	restCfg, err := clientcmd.NewNonInteractiveClientConfig(*cfg, contextName, &clientcmd.ConfigOverrides{}, nil).ClientConfig()
+	if err != nil {
+		return nil, nil, fmt.Errorf("load the sudo user's kubeconfig context %q: %w", contextName, err)
+	}
+	cs, err := kubernetes.NewForConfig(restCfg)
+	if err != nil {
+		return nil, nil, fmt.Errorf("build kubernetes client: %w", err)
+	}
+	return restCfg, cs, nil
+}
+
+// nodeCredentialHint is what a refused token adds when the identity asking was
+// this worker's node credential: the fix.
+func nodeCredentialHint(path string) string {
+	return fmt.Sprintf("this ran with the worker's node credential %s, which may not mint a registry push token and is not meant to; give your account a kubeconfig: %s", path, workerMintRemedy)
 }
 
 // gateEndpoint is where this Mac sends a write to the cluster registry, and
@@ -133,7 +347,7 @@ func clusterRegistryFrom(ctx context.Context, workDir string, api clusterRegistr
 	if err != nil {
 		return gateEndpoint{}, err
 	}
-	tok, err := mintBuilderToken(ctx, api.tokens, pushTokenDuration, now)
+	tok, err := api.mintToken(ctx, pushTokenDuration, now)
 	if err != nil {
 		return gateEndpoint{}, err
 	}
@@ -190,11 +404,7 @@ func localRegistryPort(workDir string) int {
 // way of finding none is logged at debug, so a fallback to the cluster address
 // says why.
 func localRegistryState(workDir string) (registrysvc.State, bool) {
-	dirs := []string{workDir}
-	if workDir != installedServerWorkDir {
-		dirs = append(dirs, installedServerWorkDir)
-	}
-	for _, dir := range dirs {
+	for _, dir := range localRegistryDirs(workDir) {
 		if dir == "" {
 			continue
 		}
@@ -216,6 +426,36 @@ func localRegistryState(workDir string) (registrysvc.State, bool) {
 	}
 	slog.Debug("this Mac serves no registry; the push goes to the server's cluster address")
 	return registrysvc.State{}, false
+}
+
+// localRegistryDirs is where this Mac's serving registry record may be. A worker
+// serves no registry, so a record in the server work dir, or published beside it,
+// is left over from an earlier server install: a "serving" one would send the
+// push to a loopback gate nothing listens on, the same stale address as the work
+// dir's kubeconfig. There only a work dir the caller named is read, by
+// K3SM_WORK_DIR or by a --work-dir that is not this default.
+func localRegistryDirs(workDir string) []string {
+	if role, _ := installedNodeCredential(); role == install.RoleAgent {
+		if !callerNamedWorkDir(workDir) {
+			slog.Debug("this Mac is a worker; a registry record in the server work dir is not its own", "workDir", workDir)
+			return nil
+		}
+		return []string{workDir}
+	}
+	dirs := []string{workDir}
+	if workDir != installedServerWorkDir {
+		dirs = append(dirs, installedServerWorkDir)
+	}
+	return dirs
+}
+
+// callerNamedWorkDir reports whether workDir is one the caller chose, by
+// K3SM_WORK_DIR or by a --work-dir that is not this Mac's default server work dir.
+// On a worker, anything else in a server work dir is left over from an earlier
+// server install.
+func callerNamedWorkDir(workDir string) bool {
+	clean := filepath.Clean(workDir)
+	return os.Getenv("K3SM_WORK_DIR") != "" || (clean != filepath.Clean(workDirFromEnv()) && clean != filepath.Clean(installedServerWorkDir))
 }
 
 // clusterEndpointAuthority reads the flat registry-k3sm Service's EndpointSlice,

@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -37,8 +38,15 @@ import (
 
 	"k3sm.io/darwin-net/pkg/dns"
 
+	"k3sm.io/k3sm/pkg/bootstrap"
+	"k3sm.io/k3sm/pkg/certs"
+	"k3sm.io/k3sm/pkg/executor"
+	"k3sm.io/k3sm/pkg/hostnet"
+	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/provider"
 	"k3sm.io/k3sm/pkg/runtimeclass"
+	"k3sm.io/k3sm/pkg/status"
+	"k3sm.io/runtimed/pkg/sandbox"
 )
 
 // TestNodeInternalIP pins the globally-unicast NodeInternalIP derivation the VK
@@ -118,6 +126,104 @@ func TestRuntimedConfiguresPostureVIPs(t *testing.T) {
 	// 10.43.0.1), so it tracks the CIDR rather than a second hardcoded literal.
 	if got := apiServerVIP(); got != "10.43.0.1" {
 		t.Errorf("apiServerVIP() = %q, want 10.43.0.1 (first host of the cluster service CIDR)", got)
+	}
+}
+
+// TestRuntimedConfigDeniesTheDataRootStatusDir pins which directory the status
+// record deny names on each role: the data root's, whichever root the runtime uses.
+// A default node's value is the runtime's own <WorkDir>/status, so its profile does
+// not move; a custom --pod-root leaves it at the data root, which is the case the
+// deny used to miss. The server builds its statusDir in serverNodeOptions from the
+// same status.Dir the agent's comes from.
+func TestRuntimedConfigDeniesTheDataRootStatusDir(t *testing.T) {
+	t.Parallel()
+	const custom = "/opt/k3sm-pods"
+	serverDir := filepath.Join(install.DefaultDataRoot, "server")
+	agentDir := filepath.Join(install.DefaultDataRoot, "agent")
+	want := install.StateStatus.Path(install.DefaultDataRoot)
+	join := &bootstrap.JoinResult{PodCIDR: "100.64.2.0/24", MeshIP: "100.64.2.1"}
+	agent := func(podRoot string) nodeOptions {
+		return agentNodeOptions(agentOptions{workDir: agentDir, podRoot: podRoot}, join, "", hostnet.Mode{Backend: hostnet.BackendHelper}, nil)
+	}
+	cases := []struct {
+		name     string
+		opts     nodeOptions
+		wantRoot string
+	}{
+		{"default server", nodeOptions{podRoot: executor.RuntimeRoot(serverDir), statusDir: status.Dir(serverDir)}, install.DefaultDataRoot},
+		{"custom pod root server", nodeOptions{podRoot: custom, statusDir: status.Dir(serverDir)}, custom},
+		{"default agent", agent(executor.RuntimeRoot(agentDir)), install.DefaultDataRoot},
+		{"custom pod root agent", agent(custom), custom},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := runtimedConfig(tc.opts, nil)
+			if cfg.Root != tc.wantRoot {
+				t.Fatalf("Root = %q, want %q", cfg.Root, tc.wantRoot)
+			}
+			if cfg.StatusRecordDir != want {
+				t.Errorf("StatusRecordDir = %q, want the data root's %q", cfg.StatusRecordDir, want)
+			}
+			if tc.wantRoot == install.DefaultDataRoot {
+				if joined := filepath.Join(cfg.Root, sandbox.StatusSubdir); cfg.StatusRecordDir != joined {
+					t.Errorf("StatusRecordDir = %q, want the runtime's own %q on a default node", cfg.StatusRecordDir, joined)
+				}
+			}
+		})
+	}
+	// The standalone `k3sm node` publishes no records, so it names no directory.
+	if got := runtimedConfig(nodeOptions{standalone: true}, nil).StatusRecordDir; got != "" {
+		t.Errorf("standalone StatusRecordDir = %q, want empty", got)
+	}
+}
+
+// TestRuntimedConfigDeniesTheDataRootSecrets pins which root the server and agent
+// denies name on each role: the parent of the role's work dir, the same directory
+// the status records sit in, whichever root the runtime uses. Both roles are built
+// by their real option builders, so dropping either assignment fails here. A default
+// node's value is the runtime's own root, so its profile does not move.
+func TestRuntimedConfigDeniesTheDataRootSecrets(t *testing.T) {
+	t.Parallel()
+	const custom = "/opt/k3sm-pods"
+	serverOpts := func(t *testing.T, dataRoot, podRoot string) nodeOptions {
+		t.Helper()
+		workDir := filepath.Join(dataRoot, "server")
+		base := serverOptions{workDir: workDir, podRoot: podRoot, nodeName: "n1"}
+		if _, err := certs.EnsureHierarchy(workDir, base.role(), base.posture()); err != nil {
+			t.Fatalf("EnsureHierarchy: %v", err)
+		}
+		opts, err := serverNodeOptions(serverPlan{opts: base}, &rest.Config{Host: "https://127.0.0.1:6443"}, nodeOptions{}, serverNodeWiring{}, slog.New(slog.DiscardHandler))
+		if err != nil {
+			t.Fatalf("serverNodeOptions: %v", err)
+		}
+		return opts
+	}
+	agentOpts := func(_ *testing.T, dataRoot, podRoot string) nodeOptions {
+		join := &bootstrap.JoinResult{PodCIDR: "100.64.2.0/24", MeshIP: "100.64.2.1"}
+		return agentNodeOptions(agentOptions{workDir: filepath.Join(dataRoot, "agent"), podRoot: podRoot}, join, "", hostnet.Mode{Backend: hostnet.BackendHelper}, nil)
+	}
+	for role, build := range map[string]func(*testing.T, string, string) nodeOptions{"server": serverOpts, "agent": agentOpts} {
+		t.Run(role, func(t *testing.T) {
+			t.Parallel()
+			dataRoot := filepath.Join(t.TempDir(), "data")
+			for name, podRoot := range map[string]string{"default pod root": dataRoot, "custom pod root": custom} {
+				cfg := runtimedConfig(build(t, dataRoot, podRoot), nil)
+				if cfg.Root != podRoot {
+					t.Errorf("%s: Root = %q, want %q", name, cfg.Root, podRoot)
+				}
+				if cfg.DataRoot != dataRoot {
+					t.Errorf("%s: DataRoot = %q, want the work dir's parent %q", name, cfg.DataRoot, dataRoot)
+				}
+				if got := filepath.Dir(cfg.StatusRecordDir); got != cfg.DataRoot {
+					t.Errorf("%s: the status records sit in %q and the denies name %q", name, got, cfg.DataRoot)
+				}
+			}
+		})
+	}
+	// The standalone `k3sm node` keeps no control-plane state, so it names no root.
+	if got := runtimedConfig(nodeOptions{standalone: true}, nil).DataRoot; got != "" {
+		t.Errorf("standalone DataRoot = %q, want empty", got)
 	}
 }
 

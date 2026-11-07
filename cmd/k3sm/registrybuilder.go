@@ -51,9 +51,10 @@ const minBuilderTokenDuration = 10 * time.Minute
 
 // maxBuilderTokenDuration is the longest lifetime a builder token is minted
 // for. The apiserver runs with no --service-account-max-token-expiration, so
-// it would issue a push credential for any lifetime asked; this ceiling is the
-// bound, and a longer request is refused here rather than sent.
-const maxBuilderTokenDuration = 24 * time.Hour
+// it would issue a push credential for any lifetime asked. The push gate
+// refuses a longer token to push, and a longer request is refused here rather
+// than sent, so it never mints a token the gate would refuse.
+const maxBuilderTokenDuration = registrysvc.MaxBuilderTokenLifetime
 
 // builderTokenUser is the username a builder token is presented with. The push
 // gate ignores it: the token is the whole credential.

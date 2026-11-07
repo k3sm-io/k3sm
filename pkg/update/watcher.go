@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/types"
@@ -67,6 +68,27 @@ const ownNodeResync = 5 * time.Minute
 // release but is not yet fully up, so its Done is written soon after it is.
 const readyRetry = 5 * time.Second
 
+// A phase write lost to the apiserver (a server restarting takes its apiserver
+// away for as long as the restart runs) is tried again on a capped doubling
+// backoff, until the waits add up to phaseWriteBudget: 24 tries, 23 waits. Each
+// try is bounded by phaseWriteTryTimeout, so one write gives up after about 11
+// minutes at worst, well inside the controller's 30-minute node timeout.
+const (
+	phaseWriteFirstDelay = time.Second
+	phaseWriteMaxDelay   = 15 * time.Second
+	phaseWriteBudget     = 5 * time.Minute
+	phaseWriteTryTimeout = 15 * time.Second
+)
+
+var (
+	// errPhaseWriteLost is a phase write that used its whole budget.
+	errPhaseWriteLost = errors.New("the phase write did not land within its retry budget")
+	// errHandoverMoved stops a retry: while the write was failing the request
+	// on this Node changed (an abort, a new roll, the Node deleted), so the
+	// attempt it belonged to is over.
+	errHandoverMoved = errors.New("the update request on this node changed")
+)
+
 // Netd is the root helper's ApplyUpdate verb (darwin-net's *wire.Client).
 type Netd interface {
 	ApplyUpdate(ctx context.Context, args wire.ApplyUpdateArgs, progress func(wire.UpdatePhase)) (wire.UpdateResult, error)
@@ -82,8 +104,9 @@ type Config struct {
 	// Running is the running build's version provenance.
 	Running version.Info
 	// Root is the directory, under the data root and owned by the service
-	// user, the attempt directories are made in. It is created (0700) when
-	// absent.
+	// user, the attempt directories are made in (install.StateUpdates). The
+	// installer creates it and the root helper repairs it; the Watcher never
+	// creates it, because the data root is root-owned.
 	Root string
 	// Fetcher downloads the release archive.
 	Fetcher Fetcher
@@ -116,9 +139,22 @@ type Watcher struct {
 	// a Downloading or Verifying phase is resumed only when an earlier process
 	// left it. Sync is not called concurrently, so it needs no lock.
 	tried map[string]bool
-	// donePending is set by Sync when the node runs the requested release but
-	// Ready said no, so Run re-syncs on readyRetry until Done is written.
-	donePending bool
+	// resync is set by Sync when it owes another look soon: the node runs the
+	// requested release but Ready said no, or a phase write used its budget.
+	// Run re-syncs on syncRetry until a Sync clears it, and only a Sync that
+	// read the Node does, so an outage keeps it set.
+	resync bool
+	// syncRetry is how often Run looks again while resync is set.
+	syncRetry time.Duration
+	// handover is the key of the request Sync is acting on, which a phase write
+	// checks before it tries again.
+	handover string
+	// owedFailed holds, by handover, the Failed message a write could not
+	// deliver. The verdict stands, so the next Sync writes it and repeats none
+	// of the steps that led to it.
+	owedFailed map[string]string
+	// wait sleeps between phase-write tries; a test replaces it.
+	wait func(ctx context.Context, d time.Duration) error
 }
 
 // New checks cfg and returns a Watcher.
@@ -139,7 +175,26 @@ func New(cfg Config) (*Watcher, error) {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Watcher{cfg: cfg, log: log.With("node", cfg.Node), tried: map[string]bool{}}, nil
+	return &Watcher{
+		cfg:        cfg,
+		log:        log.With("node", cfg.Node),
+		tried:      map[string]bool{},
+		owedFailed: map[string]string{},
+		syncRetry:  readyRetry,
+		wait:       waitContext,
+	}, nil
+}
+
+// waitContext sleeps for d or until ctx ends.
+func waitContext(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 // Run removes the attempt directories an earlier process left, then watches
@@ -164,7 +219,7 @@ func (w *Watcher) Run(ctx context.Context) {
 		UpdateFunc: func(_, _ any) { signal() },
 	})
 	go inf.Run(ctx.Done())
-	retry := time.NewTimer(readyRetry)
+	retry := time.NewTimer(w.syncRetry)
 	defer retry.Stop()
 	for {
 		select {
@@ -172,13 +227,16 @@ func (w *Watcher) Run(ctx context.Context) {
 			return
 		case <-changed:
 		case <-retry.C:
-			retry.Reset(readyRetry)
-			if !w.donePending {
+			retry.Reset(w.syncRetry)
+			if !w.resync {
 				continue
 			}
 		}
 		if err := w.Sync(ctx); err != nil && ctx.Err() == nil {
 			w.log.Warn("update: reconciling this node's update failed", "err", err)
+			if errors.Is(err, errPhaseWriteLost) {
+				w.resync = true
+			}
 		}
 	}
 }
@@ -194,29 +252,58 @@ func (w *Watcher) Run(ctx context.Context) {
 //   - any other phase: nothing. Installing and Restarting belong to an
 //     installer the root helper may still be running, which restarts this
 //     daemon; Failed and Done are the controller's to act on.
+//
+// A phase write that fails is retried inside Sync (writePhase), so the attempt
+// carries on from the step it reached. One that uses its budget returns an
+// error wrapping errPhaseWriteLost, and the next Sync picks up: a Failed verdict
+// is written again, and an attempt that never reached the root helper starts
+// over. An attempt that reached it is never started again, because the helper
+// runs only after Installing is on the Node, and Installing is not resumed.
 func (w *Watcher) Sync(ctx context.Context) error {
+	err := w.sync(ctx)
+	if errors.Is(err, errHandoverMoved) {
+		w.log.Info("update: the update request on this node changed while a phase write was failing; dropping the attempt")
+		return nil
+	}
+	return err
+}
+
+func (w *Watcher) sync(ctx context.Context) error {
 	n, err := w.cfg.Client.CoreV1().Nodes().Get(ctx, w.cfg.Node, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("get node %s: %w", w.cfg.Node, err)
 	}
+	w.resync = false
 	tag := n.Annotations[updatesv1alpha1.AnnotationUpdateVersion]
 	if tag == "" {
 		return nil
 	}
 	phase, _ := ParsePhase(n.Annotations[updatesv1alpha1.AnnotationUpdatePhase])
-	w.donePending = false
+	key := handoverKey(n.Annotations)
+	w.handover = key
 	if w.onTarget(tag) {
 		if phase == updatesv1alpha1.UpdateNodePhaseDone {
 			return nil
 		}
 		if w.cfg.Ready != nil && !w.cfg.Ready(ctx) {
-			w.donePending = true
+			w.resync = true
 			return nil
 		}
 		w.log.Info("update: this node runs the requested release", "version", tag)
-		return w.setPhase(ctx, updatesv1alpha1.UpdateNodePhaseDone, "")
+		return w.writePhase(ctx, updatesv1alpha1.UpdateNodePhaseDone, "")
 	}
-	key := tag + "\n" + n.Annotations[AnnotationUpdatePayload] + "\n" + n.Annotations[AnnotationUpdatePayloadSig]
+	if msg, owed := w.owedFailed[key]; owed {
+		// An empty phase is the controller handing the same request over again,
+		// which earns a new attempt.
+		if phase != "" && phase != updatesv1alpha1.UpdateNodePhaseFailed {
+			if err := w.writePhase(ctx, updatesv1alpha1.UpdateNodePhaseFailed, msg); err != nil {
+				return err
+			}
+			delete(w.owedFailed, key)
+			return nil
+		}
+		delete(w.owedFailed, key)
+	}
 	switch phase {
 	case "":
 	case updatesv1alpha1.UpdateNodePhaseDownloading, updatesv1alpha1.UpdateNodePhaseVerifying:
@@ -228,7 +315,18 @@ func (w *Watcher) Sync(ctx context.Context) error {
 		return nil
 	}
 	w.tried[key] = true
-	return w.attempt(ctx, tag, n.Annotations)
+	err = w.attempt(ctx, tag, n.Annotations)
+	if errors.Is(err, errPhaseWriteLost) {
+		// Without this the phase left on the Node reads as this process's own
+		// attempt in progress, and every later Sync stands aside for it.
+		delete(w.tried, key)
+	}
+	return err
+}
+
+// handoverKey identifies one handover: the tag, the payload and its signature.
+func handoverKey(ann map[string]string) string {
+	return ann[updatesv1alpha1.AnnotationUpdateVersion] + "\n" + ann[AnnotationUpdatePayload] + "\n" + ann[AnnotationUpdatePayloadSig]
 }
 
 // onTarget reports whether the running build is tag, by the measure the
@@ -265,7 +363,7 @@ func (w *Watcher) attempt(ctx context.Context, tag string, ann map[string]string
 	}
 	log = log.With("dir", dir)
 
-	if err := w.setPhase(ctx, updatesv1alpha1.UpdateNodePhaseDownloading, ""); err != nil {
+	if err := w.writePhase(ctx, updatesv1alpha1.UpdateNodePhaseDownloading, ""); err != nil {
 		return err
 	}
 	archive := filepath.Join(dir, archiveName)
@@ -279,14 +377,14 @@ func (w *Watcher) attempt(ctx context.Context, tag string, ann map[string]string
 
 	// The root helper re-checks the digest on its own copy; checking it here
 	// too fails a bad download without a root round trip.
-	if err := w.setPhase(ctx, updatesv1alpha1.UpdateNodePhaseVerifying, ""); err != nil {
+	if err := w.writePhase(ctx, updatesv1alpha1.UpdateNodePhaseVerifying, ""); err != nil {
 		return err
 	}
 	if sum != p.SHA256 {
 		return w.fail(ctx, log, fmt.Errorf("%w: the archive's sha256 is %s, the signed payload says %s", ErrRefused, sum, p.SHA256), "")
 	}
 
-	if err := w.setPhase(ctx, updatesv1alpha1.UpdateNodePhaseInstalling, ""); err != nil {
+	if err := w.writePhase(ctx, updatesv1alpha1.UpdateNodePhaseInstalling, ""); err != nil {
 		return err
 	}
 	log.Info("update: handing the signed payload and the archive to the root helper")
@@ -298,7 +396,7 @@ func (w *Watcher) attempt(ctx context.Context, tag string, ann map[string]string
 		SignerCert:  signed.SignerPEM,
 	}, func(ph wire.UpdatePhase) {
 		if next, ok := m.advance(ph); ok {
-			if err := w.setPhase(ctx, next, ""); err != nil {
+			if err := w.writePhase(ctx, next, ""); err != nil {
 				log.Warn("update: writing the phase failed", "phase", next, "err", err)
 			}
 		}
@@ -311,7 +409,7 @@ func (w *Watcher) attempt(ctx context.Context, tag string, ann map[string]string
 		return w.fail(ctx, log, err, res.Log)
 	}
 	if next, ok := m.advance(res.Phase); ok {
-		return w.setPhase(ctx, next, "")
+		return w.writePhase(ctx, next, "")
 	}
 	return nil
 }
@@ -357,20 +455,81 @@ func (m *phaseMirror) advance(ph wire.UpdatePhase) (updatesv1alpha1.UpdateNodePh
 	return "", false
 }
 
+// failRecovery ends every Failed message, because the annotation is where an
+// operator reads why. It does not claim the node is cordoned: the controller
+// cordons before it hands over, but the attempt reads only the annotations, and
+// a payload refused here may never have come from the controller.
+const failRecovery = "; recover with `k3sm update abort`"
+
 // fail writes Failed with err's message and, when the installer's log tail is
-// known, its last line.
+// known, its last line, then the recovery. The reason is the part that gives
+// way to the annotation's bound, so a long one cannot clip the recovery off.
 func (w *Watcher) fail(ctx context.Context, log *slog.Logger, err error, tail string) error {
 	msg := err.Error()
 	if last := lastLine(tail); last != "" {
 		msg += " (installer: " + last + ")"
 	}
 	log.Error("update: this node's update failed", "err", err, "installer-log", tail)
-	return w.setPhase(ctx, updatesv1alpha1.UpdateNodePhaseFailed, msg)
+	verdict := clipMessage(msg, MaxMessageBytes-len(failRecovery)) + failRecovery
+	werr := w.writePhase(ctx, updatesv1alpha1.UpdateNodePhaseFailed, verdict)
+	if errors.Is(werr, errPhaseWriteLost) {
+		w.owedFailed[w.handover] = verdict
+	}
+	return werr
 }
 
 func lastLine(s string) string {
 	lines := strings.Split(strings.TrimSpace(s), "\n")
 	return strings.TrimSpace(lines[len(lines)-1])
+}
+
+// writePhase writes a phase and tries again while the write fails, until ctx
+// ends or the budget is used. A write can land with only its response lost, so
+// every further try reads the Node first (retryPhase). The attempt waits here,
+// holding its place: nothing before the write runs again.
+func (w *Watcher) writePhase(ctx context.Context, phase updatesv1alpha1.UpdateNodePhase, msg string) error {
+	err := w.setPhase(ctx, phase, msg)
+	delay := phaseWriteFirstDelay
+	var waited time.Duration
+	for err != nil {
+		if ctx.Err() != nil || errors.Is(err, errHandoverMoved) {
+			return err
+		}
+		if waited >= phaseWriteBudget {
+			w.log.Error("update: giving up on this phase write for now; the phase on the Node is out of date", "phase", phase, "budget", phaseWriteBudget, "err", err)
+			return fmt.Errorf("%w: %w", errPhaseWriteLost, err)
+		}
+		w.log.Warn("update: a phase write was lost; trying again", "phase", phase, "after", delay, "err", err)
+		if werr := w.wait(ctx, delay); werr != nil {
+			return err
+		}
+		waited += delay
+		delay = min(delay*2, phaseWriteMaxDelay)
+		err = w.retryPhase(ctx, phase, msg)
+	}
+	return nil
+}
+
+// retryPhase is one further try of a failed write. It stops with
+// errHandoverMoved when the request on the Node is no longer the one the write
+// belongs to, and succeeds without a patch when the phase is already there.
+func (w *Watcher) retryPhase(ctx context.Context, phase updatesv1alpha1.UpdateNodePhase, msg string) error {
+	tryCtx, cancel := context.WithTimeout(ctx, phaseWriteTryTimeout)
+	defer cancel()
+	n, err := w.cfg.Client.CoreV1().Nodes().Get(tryCtx, w.cfg.Node, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return errHandoverMoved
+	}
+	if err != nil {
+		return fmt.Errorf("get node %s: %w", w.cfg.Node, err)
+	}
+	if handoverKey(n.Annotations) != w.handover {
+		return errHandoverMoved
+	}
+	if n.Annotations[updatesv1alpha1.AnnotationUpdatePhase] == FormatPhase(phase, msg) {
+		return nil
+	}
+	return w.setPhase(tryCtx, phase, msg)
 }
 
 // setPhase merge-patches the phase annotation on this node's own Node, and
@@ -384,6 +543,8 @@ func (w *Watcher) setPhase(ctx context.Context, phase updatesv1alpha1.UpdateNode
 	if err != nil {
 		return fmt.Errorf("encode the phase patch: %w", err)
 	}
+	ctx, cancel := context.WithTimeout(ctx, phaseWriteTryTimeout)
+	defer cancel()
 	if _, err := w.cfg.Client.CoreV1().Nodes().Patch(ctx, w.cfg.Node, types.MergePatchType, patch, metav1.PatchOptions{FieldManager: FieldManager}); err != nil {
 		return fmt.Errorf("write phase %s on node %s: %w", phase, w.cfg.Node, err)
 	}
@@ -438,14 +599,16 @@ func (w *Watcher) newAttemptDir() (string, error) {
 	return dir, nil
 }
 
-// ensureRoot creates Root (0700) when it is absent and otherwise requires a
-// real directory owned by this process's uid, which it sets to mode 0700.
+// ensureRoot requires Root to be a real directory owned by this process's uid,
+// and sets it to mode 0700. It never creates Root: the data root it sits in is
+// root-owned, and the root helper of this same build recreates the tree at its
+// next start.
 func (w *Watcher) ensureRoot() error {
 	root := w.cfg.Root
-	if err := os.Mkdir(root, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
-		return fmt.Errorf("create the update root %s: %w", root, err)
-	}
 	fi, err := os.Lstat(root)
+	if errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("%w: the update root does not exist; `sudo k3sm restart` on this node recreates %s", ErrRefused, root)
+	}
 	if err != nil {
 		return fmt.Errorf("inspect the update root %s: %w", root, err)
 	}

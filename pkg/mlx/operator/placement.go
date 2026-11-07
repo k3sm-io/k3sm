@@ -28,6 +28,7 @@ import (
 
 	mlxv1alpha1 "k3sm.io/apis/mlx/v1alpha1"
 	netv1alpha1 "k3sm.io/apis/net/v1alpha1"
+	"k3sm.io/k3sm/pkg/gpucapacity"
 	"k3sm.io/k3sm/pkg/mlx"
 	"k3sm.io/k3sm/pkg/mlx/topology"
 )
@@ -331,23 +332,27 @@ func hasGPU(node *corev1.Node) bool {
 
 // gpuSlotFree reports whether one more rank's GPU slot fits on node beside the
 // held units. This is the scheduler's extended-resource rule over slot units:
-// the node's allocatable mlx.k3sm.io/gpu count (what mlx.GPUSlots advertised)
-// minus the slots already requested on it. A node advertising no slot is never
-// free. The provider's byte-level admission (mlx.GPUFits) still runs later and
+// the node's allocatable mlx.k3sm.io/gpu count (what gpucapacity.GPUSlots advertised)
+// minus the slots already requested on it under either name. A node advertising no slot is never
+// free. The provider's byte-level admission (gpucapacity.GPUFits) still runs later and
 // is not mirrored here.
 func gpuSlotFree(node *corev1.Node, held int64) bool {
 	slots := node.Status.Allocatable[corev1.ResourceName(mlxv1alpha1.ResourceGPU)]
 	return slots.Value()-held >= 1
 }
 
-// HeldGPUSlots sums, per node, the mlx.k3sm.io/gpu units requested by the pods
-// bound there: the extended-resource total the scheduler counts a new GPU pod against.
+// HeldGPUSlots sums, per node, the GPU units requested by the pods bound there under
+// either resource name (gpucapacity.PodUnits). That is the number of slots really
+// taken, which the scheduler cannot see while it counts the two names separately: a
+// pod holding k3sm.io/gpu takes a slot from a rank asking under mlx.k3sm.io/gpu.
 //
 // Two kinds of pod hold nothing. An ended pod (Succeeded or Failed) has released
 // its slot. The model's OWN rank Pods are excluded too: placement runs only once
 // they are gone or going, and a gang restart re-placing onto the nodes its own
 // terminating ranks still occupy must not refuse itself. An unbound pod holds no
-// node's slot yet.
+// node's slot yet, unless a required hostname affinity pins it to one node (a
+// rank Pod of another model waiting on the scheduler): it counts against that
+// node.
 func HeldGPUSlots(model *mlxv1alpha1.MLXModel, pods []corev1.Pod) map[string]int64 {
 	own, err := labels.Parse(mlx.ShardedSelector(model.Name))
 	if err != nil {
@@ -356,46 +361,24 @@ func HeldGPUSlots(model *mlxv1alpha1.MLXModel, pods []corev1.Pod) map[string]int
 	held := map[string]int64{}
 	for i := range pods {
 		pod := &pods[i]
-		if pod.Spec.NodeName == "" || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+		// The node the pod runs on once bound (spec.nodeName), else the one
+		// node a required hostname affinity pins it to: another model's rank
+		// Pod waiting on the scheduler already claims its placed node's slot.
+		node := pod.Spec.NodeName
+		if node == "" {
+			node = mlx.RankPodNode(pod)
+		}
+		if node == "" || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
 			continue
 		}
 		if pod.Namespace == model.Namespace && own.Matches(labels.Set(pod.Labels)) {
 			continue
 		}
-		if units := podGPUUnits(pod); units > 0 {
-			held[pod.Spec.NodeName] += units
+		if units := gpucapacity.PodUnits(pod); units > 0 {
+			held[node] += units
 		}
 	}
 	return held
-}
-
-// podGPUUnits is a pod's effective mlx.k3sm.io/gpu request, by the scheduler's
-// rule: the app containers plus the restartable (sidecar) init containers run
-// together, and each ordinary init container runs alone, so the pod needs the
-// larger of the two. A container's limit is read first, since an extended
-// resource's request defaults to (and must equal) its limit.
-func podGPUUnits(pod *corev1.Pod) int64 {
-	gpu := corev1.ResourceName(mlxv1alpha1.ResourceGPU)
-	units := func(c *corev1.Container) int64 {
-		if q, ok := c.Resources.Limits[gpu]; ok {
-			return q.Value()
-		}
-		q := c.Resources.Requests[gpu]
-		return q.Value()
-	}
-	var running, initPeak int64
-	for i := range pod.Spec.Containers {
-		running += units(&pod.Spec.Containers[i])
-	}
-	for i := range pod.Spec.InitContainers {
-		c := &pod.Spec.InitContainers[i]
-		if c.RestartPolicy != nil && *c.RestartPolicy == corev1.ContainerRestartPolicyAlways {
-			running += units(c)
-			continue
-		}
-		initPeak = max(initPeak, units(c))
-	}
-	return max(running, initPeak)
 }
 
 // subset reports whether every element of a is in b.

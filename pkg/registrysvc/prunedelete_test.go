@@ -145,7 +145,7 @@ func TestPruneDeleteIsConditionalOnPlannedState(t *testing.T) {
 	})
 
 	t.Run("a registry that ignores If-Match deletes unconditionally", func(t *testing.T) {
-		// zot implements no conditional DELETE: for it the window stays open,
+		// With no conditional DELETE the window stays open,
 		// and this is the loss the k3sm server refuses above.
 		a := manifestBody("a")
 		s := newRepo(t, a)

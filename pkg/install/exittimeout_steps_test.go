@@ -48,6 +48,7 @@ var expectedServerTeardown = []expectedTeardownStep{
 	{"eviction loop stop (provider.EvictionStopTimeout)", 10, expectNodeLane},
 	{"budget history stop (provider.BudgetHistoryStopBound)", 3, expectNodeLane},
 	{"runtimed close (defaultCloseGrace)", 2, expectNodeLane},
+	{"budget publisher stop (context drain)", 0, expectNodeLane},
 	{"node update watcher stop (nodeUpdateStopGrace)", 2, expectNodeLane},
 	{"node interconnect handlers stop (context drain)", 0, expectNodeLane},
 	{"heartbeat watch stop (context drain)", 0, expectNodeLane},
@@ -83,6 +84,7 @@ var expectedAgentTeardown = []expectedTeardownStep{
 	{"eviction loop stop (provider.EvictionStopTimeout)", 10, expectNodeLane},
 	{"budget history stop (provider.BudgetHistoryStopBound)", 3, expectNodeLane},
 	{"runtimed close (defaultCloseGrace)", 2, expectNodeLane},
+	{"budget publisher stop (context drain)", 0, expectNodeLane},
 	{"node update watcher stop (nodeUpdateStopGrace)", 2, expectNodeLane},
 	{"node interconnect handlers stop (context drain)", 0, expectNodeLane},
 	{"heartbeat watch stop (context drain)", 0, expectNodeLane},
@@ -121,7 +123,7 @@ func expectedBudget(steps []expectedTeardownStep) (int, string) {
 // server's teardown ran past its 60s ExitTimeOut: the runtime close took its
 // 30s, the managed-update watcher's stop then waited on a root-helper stream
 // that could not end before the daemon did, and launchd's SIGKILL landed before
-// the ingest registry's teardown (two retractions and the zot child's stop),
+// the ingest registry's teardown (two retractions and the child's stop),
 // which ran last. The registry child, in its own process group, kept serving.
 // None of the registry's steps, the watcher's stop or the update controller's
 // 30s stop wait was in the table.

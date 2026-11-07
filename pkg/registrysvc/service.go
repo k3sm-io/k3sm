@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -48,7 +49,9 @@ const LoopbackAddress = "127.0.0.1"
 const (
 	readyTimeout = 60 * time.Second
 	readyPoll    = 200 * time.Millisecond
-	drainGrace   = 5 * time.Second
+	// readyProbeTimeout bounds one /v2/ readiness probe.
+	readyProbeTimeout = time.Second
+	drainGrace        = 5 * time.Second
 	// startAttempts bounds the retry. The registry is an ancillary service: a
 	// transient failure deserves another try, and a persistent one deserves a
 	// logged refusal rather than an unbounded retry loop holding a boot open.
@@ -64,6 +67,10 @@ var (
 	ErrNonLoopbackBind = errors.New("the ingest registry binds loopback only")
 	// ErrPortHeld: the configured port is already held by another process.
 	ErrPortHeld = errors.New("registry port already held")
+	// ErrExecutableMoved: this binary no longer resolves to the path recorded when
+	// the daemon started, so the spawn would run something the release path did
+	// not verify.
+	ErrExecutableMoved = errors.New("this binary is not the one the daemon started from")
 )
 
 // Config configures a Service.
@@ -71,12 +78,9 @@ type Config struct {
 	// WorkDir is the control-plane work dir. Every registry path derives from it
 	// (StateDir, ConfigPath, HTPasswdPath, CredentialPath, LogPath).
 	WorkDir string
-	// BinDir is where the zot binary is staged. Empty derives <WorkDir>/bin, the
-	// same directory the control-plane binaries live in.
+	// BinDir is where an earlier release staged its zot binary, which the orphan
+	// reclaim still recognises. Empty derives <WorkDir>/bin.
 	BinDir string
-	// PayloadBinDir is a packaged install's staged payload directory. Empty means
-	// none is staged, and the binary is built on demand.
-	PayloadBinDir string
 	// Port is the loopback TCP port to serve on. Required; there is no default
 	// here on purpose, because "the registry is enabled" is the caller's decision
 	// and a defaulted port would make it this package's.
@@ -84,25 +88,34 @@ type Config struct {
 	// BindAddress is the address to bind. Empty means LoopbackAddress; anything
 	// that is not a loopback address is refused by New.
 	BindAddress string
-	// ZotVersion is the zot module version to stage. Empty means DefaultZotVersion.
-	ZotVersion string
-	// ReleaseVerifier is the boot's release signing decision (pkg/executor's
-	// ReleaseVerifier, set only when the daemon is on the release path). Nil is the
-	// dev path: zot is seeded or built and ad-hoc signed. Non-nil, zot is the
-	// payload's copy, verified and never built or signed (EnsureZotWith).
-	ReleaseVerifier PayloadVerifier
+	// DataVolume is the mount point of the data volume the work dir is on, or
+	// empty when the install has none. The child refuses to start when the store
+	// root is not on it.
+	DataVolume string
+	// Executable resolves the running binary; nil is os.Executable through
+	// symlinks. New records its answer, and every spawn compares against that.
+	Executable func() (string, error)
 	// Logger receives bring-up and teardown events. Empty means slog.Default.
 	Logger *slog.Logger
 }
 
-// Service is the node-local OCI ingest registry: a pinned zot child process on
-// loopback, with its state, config and per-boot push credential under the work
-// dir.
+// Service is the node-local OCI ingest registry: a `k3sm registry serve` child
+// process on loopback, with its state, config and per-boot push credential under
+// the work dir.
 //
 // The zero value is not usable — construct one with New, which is where the
 // loopback-only bind is enforced.
 type Service struct {
 	cfg Config
+	// exe and exeErr are Config.Executable's answer at New: the binary the
+	// release path verified before this daemon started.
+	exe    string
+	exeErr error
+	// geteuid is the process's effective uid (a seam for tests).
+	geteuid func() int
+	// lookupProc re-reads one process before each reclaim signal (a seam for
+	// tests).
+	lookupProc func(pid int) (procEntry, bool)
 
 	// mu guards every field below it. It is held across the process-state
 	// mutations (start, stop) and released before any wait, so a Shutdown racing
@@ -142,19 +155,30 @@ func New(cfg Config) (*Service, error) {
 	if cfg.BinDir == "" {
 		cfg.BinDir = filepath.Join(cfg.WorkDir, "bin")
 	}
-	if cfg.ZotVersion == "" {
-		cfg.ZotVersion = DefaultZotVersion
-	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	return &Service{cfg: cfg}, nil
+	if cfg.Executable == nil {
+		cfg.Executable = resolvedExecutable
+	}
+	exe, exeErr := cfg.Executable()
+	return &Service{cfg: cfg, exe: exe, exeErr: exeErr, geteuid: os.Geteuid, lookupProc: lookupOwnProcess}, nil
+}
+
+// resolvedExecutable is os.Executable through symlinks. On Darwin os.Executable
+// reports the path as invoked, which for an install is the /usr/local/bin link.
+func resolvedExecutable() (string, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	return filepath.EvalSymlinks(exe)
 }
 
 // validateBind rejects any bind that is not a loopback address, and any port
-// outside the usable range. It is shared by New and renderConfig so the address
-// written into the child's config cannot differ from the one the service claims
-// to have validated.
+// outside the usable range. It is shared by New and validateForServing so the
+// address the server binds cannot differ from the one the service claims to have
+// validated.
 func validateBind(address string, port int) error {
 	addr, err := netip.ParseAddr(strings.Trim(address, "[]"))
 	if err != nil {
@@ -200,6 +224,14 @@ func (s *Service) Start(ctx context.Context) error {
 	s.mu.Lock()
 	s.reclaimedPID = 0
 	s.mu.Unlock()
+	// A root daemon is not retried: the child refuses root, and the state a root
+	// daemon writes is root's own, which a child dropped to the service user
+	// could not open. An installed server runs as the service user.
+	if s.geteuid() == 0 {
+		err := fmt.Errorf("%w: a server running as root has no ingest registry", ErrServeAsRoot)
+		s.record(StateDisabled, err.Error(), 0)
+		return err
+	}
 	var err error
 	for attempt := 1; attempt <= startAttempts; attempt++ {
 		err = s.startOnce(ctx)
@@ -237,12 +269,9 @@ func (s *Service) Start(ctx context.Context) error {
 	return err
 }
 
-// startOnce is one bring-up attempt: stage the binary, write the state, preflight
-// the port, spawn, and wait for the listener.
+// startOnce is one bring-up attempt: write the state, preflight the port, spawn,
+// and wait for the registry to answer.
 func (s *Service) startOnce(ctx context.Context) error {
-	if err := EnsureZotWith(ctx, s.cfg.ReleaseVerifier, s.cfg.BinDir, s.cfg.PayloadBinDir, s.cfg.ZotVersion); err != nil {
-		return err
-	}
 	if err := s.provision(); err != nil {
 		return err
 	}
@@ -296,23 +325,16 @@ func (s *Service) provision() error {
 	// The k3sm registry server authenticates against the serve config, which
 	// carries the two principals' secret hashes; it is rewritten with the
 	// credentials on every attempt so the two never disagree.
-	serve, err := renderServeConfig(cred, gate)
+	serve, err := renderServeConfig(cred, gate, ServeConfig{
+		Listen:     addr,
+		DataVolume: s.cfg.DataVolume,
+		UID:        s.geteuid(),
+		GID:        os.Getegid(),
+	})
 	if err != nil {
 		return err
 	}
-	if err := writeServeConfig(s.cfg.WorkDir, serve); err != nil {
-		return err
-	}
-	body, err := renderConfig(s.cfg.WorkDir, s.cfg.BindAddress, s.cfg.Port)
-	if err != nil {
-		return err
-	}
-	// 0600 like the credential: the config names the htpasswd path and the storage
-	// root, which is inventory nothing else on the host needs.
-	if err := writeSecretFile(ConfigPath(s.cfg.WorkDir), body); err != nil {
-		return fmt.Errorf("write the registry config: %w", err)
-	}
-	return nil
+	return writeServeConfig(s.cfg.WorkDir, serve)
 }
 
 // preflightPort reports ErrPortHeld when something already holds the bind. The
@@ -330,26 +352,58 @@ func preflightPort(address string, port int) error {
 		ErrPortHeld, addr, err)
 }
 
-// spawn starts the zot child in its own process group with its output redirected
-// to the 0600 registry log, and starts the single reaper goroutine that closes
-// the exited channel when the child dies. The reaper's lifetime is the child's;
-// it parks in wait4 and ends exactly when the child does.
+// childCommand builds the child: exactly <exe> registry serve --config
+// <work-dir>/registry-state/serve.json, with the executable resolved again and
+// compared with the one New recorded, an empty environment, and no descriptor
+// beyond stdio (exec.Cmd passes only what ExtraFiles names).
+func (s *Service) childCommand() (*exec.Cmd, error) {
+	if s.exeErr != nil {
+		return nil, fmt.Errorf("locate this binary: %w", s.exeErr)
+	}
+	now, err := s.cfg.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("locate this binary: %w", err)
+	}
+	if now != s.exe {
+		return nil, fmt.Errorf("%w: %s at start, %s now", ErrExecutableMoved, s.exe, now)
+	}
+	argv := s.childArgv()
+	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.Env = []string{}
+	// Its own process group, so teardown signals the child and anything it started
+	// rather than this process's whole group.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	return cmd, nil
+}
+
+// childArgv is the child's exact argument vector, which the reclaim also matches.
+func (s *Service) childArgv() []string {
+	return []string{s.exe, "registry", "serve", "--config", ServeConfigPath(s.cfg.WorkDir)}
+}
+
+// spawn starts the child in its own process group with its output redirected to
+// the 0600 registry log, and starts the single reaper goroutine that closes the
+// exited channel when the child dies. The reaper's lifetime is the child's; it
+// parks in wait4 and ends exactly when the child does.
+//
+// The log is opened O_APPEND because the child opens it too, for its slog
+// records; its own stderr keeps the refusals it makes before that open and any
+// runtime crash. Each spawn truncates it, as a bound on its size.
 //
 // The child is deliberately NOT attached to a context (exec.Command, not
 // CommandContext): its lifetime is owned by Shutdown, which tears it down in the
 // signal order a registry holding a port needs, and a context kill would race
 // that with a bare SIGKILL and leave the log file open.
 func (s *Service) spawn() (chan struct{}, error) {
-	lf, err := os.OpenFile(LogPath(s.cfg.WorkDir), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	cmd, err := s.childCommand()
+	if err != nil {
+		return nil, err
+	}
+	lf, err := openRegistryLog(s.cfg.WorkDir, os.O_TRUNC)
 	if err != nil {
 		return nil, fmt.Errorf("create the registry log: %w", err)
 	}
-	//nolint:gosec // the binary is the one this package staged and marked, at a path it owns.
-	cmd := exec.Command(ZotPath(s.cfg.BinDir), "serve", ConfigPath(s.cfg.WorkDir))
 	cmd.Stdout, cmd.Stderr = lf, lf
-	// Its own process group, so teardown signals the child and anything it started
-	// rather than this process's whole group.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		_ = lf.Close()
 		return nil, fmt.Errorf("start the registry: %w", err)
@@ -365,31 +419,55 @@ func (s *Service) spawn() (chan struct{}, error) {
 	s.mu.Unlock()
 
 	s.cfg.Logger.Info("started the ingest registry child",
-		"pid", cmd.Process.Pid, "version", s.cfg.ZotVersion, "log", LogPath(s.cfg.WorkDir))
+		"pid", cmd.Process.Pid, "exe", s.exe, "log", LogPath(s.cfg.WorkDir))
 	return exited, nil
 }
 
-// await blocks until the child's listener accepts a connection, the child exits,
-// the deadline passes, or ctx is cancelled. A closed exited channel WINS over a
-// concurrently-ready port: a dead child is never "serving", and the incumbent
-// that would answer instead is exactly the confusion preflightPort exists to stop.
+// registryReady reports whether the registry at addr answers GET /v2/ with 200.
+// A connect alone says nothing: anything holding the port accepts one. It reads
+// no proxy setting, since addr is loopback, and follows no redirect, so it opens
+// no connection but the one to addr.
+func registryReady(ctx context.Context, addr string) error {
+	ctx, cancel := context.WithTimeout(ctx, readyProbeTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+addr+"/v2/", nil)
+	if err != nil {
+		return err
+	}
+	client := http.Client{
+		Transport:     &http.Transport{DisableKeepAlives: true},
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("GET /v2/: %s", resp.Status)
+	}
+	return nil
+}
+
+// await blocks until the child answers /v2/ with 200, the child exits, the
+// deadline passes, or ctx is cancelled. A closed exited channel WINS over a
+// concurrent answer: a dead child is never "serving", and the incumbent that
+// would answer instead is exactly the confusion preflightPort exists to stop.
 func (s *Service) await(ctx context.Context, exited <-chan struct{}) error {
 	addr := net.JoinHostPort(s.cfg.BindAddress, strconv.Itoa(s.cfg.Port))
 	deadline := time.Now().Add(readyTimeout)
-	dialer := &net.Dialer{Timeout: time.Second}
 	for {
 		select {
 		case <-exited:
 			return fmt.Errorf("the registry exited during bring-up: %s", s.logTail())
 		default:
 		}
-		conn, err := dialer.DialContext(ctx, "tcp", addr)
+		err := registryReady(ctx, addr)
 		if err == nil {
-			_ = conn.Close()
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("the registry was not serving on %s within %s: %s", addr, readyTimeout, s.logTail())
+			return fmt.Errorf("the registry was not serving on %s within %s: %w: %s", addr, readyTimeout, err, s.logTail())
 		}
 		select {
 		case <-ctx.Done():
@@ -402,8 +480,7 @@ func (s *Service) await(ctx context.Context, exited <-chan struct{}) error {
 }
 
 // logTailLines is how much of the child's log a bring-up failure carries. Enough
-// to show zot's own refusal (a bad config names the offending key), short enough
-// to stay a log line.
+// to show the child's own refusal, short enough to stay a log line.
 const logTailLines = 20
 
 // logTail returns the last logTailLines lines of the child's log, best-effort: an

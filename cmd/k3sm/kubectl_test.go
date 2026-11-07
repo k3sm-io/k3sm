@@ -25,6 +25,7 @@ import (
 	"testing"
 
 	"k3sm.io/k3sm/pkg/executor"
+	"k3sm.io/k3sm/pkg/install"
 )
 
 // setOf turns a path list into a membership test for the injected exists seam,
@@ -48,6 +49,7 @@ func TestResolveKubectlConfig(t *testing.T) {
 		altKubeconfig     = executor.KubeconfigPath(altWorkDir)
 		userKubeconfig    = filepath.Join(userHome, ".kube", "config")
 		envKubeconfig     = "/Users/alice/work/kubeconfig.yaml"
+		nodeKubeconfig    = install.AgentCredentialPath(install.DefaultDataRoot)
 	)
 
 	tests := []struct {
@@ -108,6 +110,79 @@ func TestResolveKubectlConfig(t *testing.T) {
 				exists:        setOf(envKubeconfig),
 			},
 			want: kubectlConfig{context: "k3sm"},
+		},
+		{
+			name: "a server's work-dir kubeconfig wins over its node credential path",
+			in: kubectlInputs{
+				workDir:        serviceWorkDir,
+				home:           "/var/root",
+				contextName:    "k3sm",
+				role:           install.RoleServer,
+				nodeKubeconfig: nodeKubeconfig,
+				exists:         setOf(serviceKubeconfig, nodeKubeconfig),
+			},
+			want: kubectlConfig{kubeconfig: serviceKubeconfig},
+		},
+		{
+			name: "a worker skips a leftover work-dir kubeconfig for its node credential",
+			in: kubectlInputs{
+				workDir:        serviceWorkDir,
+				home:           "/var/root",
+				contextName:    "k3sm",
+				role:           install.RoleAgent,
+				nodeKubeconfig: nodeKubeconfig,
+				exists:         setOf(serviceKubeconfig, nodeKubeconfig),
+			},
+			want: kubectlConfig{kubeconfig: nodeKubeconfig},
+		},
+		{
+			name: "an account's own kubeconfig on a worker beats the leftover and the node credential",
+			in: kubectlInputs{
+				workDir:        serviceWorkDir,
+				home:           userHome,
+				contextName:    "k3sm",
+				role:           install.RoleAgent,
+				nodeKubeconfig: nodeKubeconfig,
+				exists:         setOf(serviceKubeconfig, nodeKubeconfig, userKubeconfig),
+			},
+			want: kubectlConfig{context: "k3sm"},
+		},
+		{
+			name: "K3SM_WORK_DIR still pins that work dir on a worker",
+			in: kubectlInputs{
+				workDirOverride: altWorkDir,
+				workDir:         altWorkDir,
+				home:            userHome,
+				contextName:     "k3sm",
+				role:            install.RoleAgent,
+				nodeKubeconfig:  nodeKubeconfig,
+				exists:          setOf(altKubeconfig, nodeKubeconfig),
+			},
+			want: kubectlConfig{kubeconfig: altKubeconfig},
+		},
+		{
+			name: "a worker with only a leftover work-dir kubeconfig does not fall back to it",
+			in: kubectlInputs{
+				workDir:        serviceWorkDir,
+				home:           "/var/root",
+				contextName:    "k3sm",
+				role:           install.RoleAgent,
+				nodeKubeconfig: nodeKubeconfig,
+				exists:         setOf(serviceKubeconfig),
+			},
+			wantErr: "no kubeconfig for k3sm kubectl",
+		},
+		{
+			name: "an account that cannot see the node credential gets the install fix",
+			in: kubectlInputs{
+				workDir:        filepath.Join(userHome, "server"),
+				home:           userHome,
+				contextName:    "k3sm",
+				role:           install.RoleAgent,
+				nodeKubeconfig: nodeKubeconfig,
+				exists:         setOf(),
+			},
+			wantErr: "run `sudo k3sm install`",
 		},
 		{
 			name: "no kubeconfig anywhere names the install fix",

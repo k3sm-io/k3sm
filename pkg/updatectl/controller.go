@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -62,6 +63,7 @@ const (
 	idleResync          = time.Minute
 	errorBackoff        = 10 * time.Second
 	crdRetry            = 5 * time.Second
+	policyCRDRetryMax   = 5 * time.Minute
 )
 
 // eventComponent is the Event source the controller records under.
@@ -80,7 +82,8 @@ type Config struct {
 	// Dynamic reads and writes the Update objects (apis publishes the types,
 	// no generated clientset). Required.
 	Dynamic dynamic.Interface
-	// CRD applies and establishes the Update CRD before the controller starts.
+	// CRD applies and establishes the Update CRD before the controller starts,
+	// and the UpdatePolicy CRD beside it, which the controller does not wait for.
 	// nil skips the ensure.
 	CRD crdensure.CRDClient
 	// Resolver resolves the target release. nil means HTTPResolver{}.
@@ -125,6 +128,8 @@ type Controller struct {
 	// signer is the update signer the last handover used, replaced by
 	// currentSigner when it nears its end. Only the loop goroutine touches it.
 	signer *certs.UpdateSigner
+	// policyRetry is the first wait between attempts at the UpdatePolicy CRD.
+	policyRetry time.Duration
 }
 
 // New builds a Controller from cfg. Call Run to start it.
@@ -163,14 +168,52 @@ func New(cfg Config) (*Controller, error) {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Controller{cfg: cfg, log: log, kick: make(chan struct{}, 1)}, nil
+	return &Controller{cfg: cfg, log: log, kick: make(chan struct{}, 1), policyRetry: crdRetry}, nil
+}
+
+// ensurePolicyCRD applies the UpdatePolicy CRD, retrying with a growing wait until
+// it takes or ctx ends. Nothing about a roll waits on it: only `k3sm update channel`
+// needs this CRD, and that verb says so when it is missing, so a CRD the server
+// refuses costs the setting and never a security fix's Update.
+func (c *Controller) ensurePolicyCRD(ctx context.Context) {
+	delay, failed := c.policyRetry, false
+	for {
+		_, err := crdensure.Ensure(ctx, c.cfg.CRD, crdconfig.UpdatePolicyCRD(), crdensure.Options{Log: c.log})
+		if ctx.Err() != nil {
+			return
+		}
+		if err == nil {
+			if failed {
+				c.log.Info("update controller: the UpdatePolicy crd is established")
+			}
+			return
+		}
+		failed = true
+		c.log.Warn("update controller: ensure the UpdatePolicy crd; rolls are unaffected, and the update channel cannot be set until it takes", "err", err, "retry", delay)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+		delay = min(2*delay, policyCRDRetryMax)
+	}
 }
 
 // Run ensures the Update CRD (retrying until it takes), then campaigns for the
 // Lease and reconciles while it leads, until ctx ends. Start it only once the
 // apiserver is healthy, and drain it before the control plane stops.
+//
+// The UpdatePolicy CRD is ensured beside that on its own goroutine, which neither
+// the Lease nor lead waits for and which Run stops before it returns.
 func (c *Controller) Run(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	var policy sync.WaitGroup
+	defer func() {
+		cancel()
+		policy.Wait()
+	}()
 	if c.cfg.CRD != nil {
+		policy.Go(func() { c.ensurePolicyCRD(ctx) })
 		for {
 			_, err := crdensure.Ensure(ctx, c.cfg.CRD, crdconfig.UpdateCRD(), crdensure.Options{Log: c.log})
 			if err == nil {
@@ -274,19 +317,29 @@ func (c *Controller) lead(ctx context.Context) {
 	}
 }
 
-// reconcile is one pass over every Update. It returns when the next pass is
-// due.
+// reconcile is one pass over every Update, then over the nodes none of them
+// accounts for. It returns when the next pass is due.
 func (c *Controller) reconcile(ctx context.Context) (time.Duration, error) {
 	list, err := c.cfg.Dynamic.Resource(updateResource).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return 0, fmt.Errorf("list updates: %w", err)
 	}
 	next := idleResync
+	var current *updatesv1alpha1.Update
+	// settled is whether this pass knows the singleton's state: one it cannot
+	// decode, or whose status write it lost, may still be holding its nodes.
+	settled := true
 	for i := range list.Items {
 		u, err := decodeUpdate(&list.Items[i])
 		if err != nil {
 			c.log.Error("update controller: decode update", "name", list.Items[i].GetName(), "err", err)
+			if list.Items[i].GetName() == updatesv1alpha1.UpdateName {
+				settled = false
+			}
 			continue
+		}
+		if u.Name == updatesv1alpha1.UpdateName {
+			current = u
 		}
 		before := u.Status.DeepCopy()
 		if u.Name != updatesv1alpha1.UpdateName {
@@ -302,8 +355,14 @@ func (c *Controller) reconcile(ctx context.Context) (time.Duration, error) {
 		if err := c.writeStatus(ctx, u); err != nil {
 			if apierrors.IsConflict(err) {
 				next = 0 // re-read and redo; every step is idempotent
+				settled = false
 				continue
 			}
+			return 0, err
+		}
+	}
+	if settled {
+		if err := c.releaseOrphans(ctx, current); err != nil {
 			return 0, err
 		}
 	}

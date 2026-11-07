@@ -22,10 +22,13 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/opencontainers/go-digest"
+	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"k3sm.io/k3sm/pkg/ociregistry/ref"
 )
@@ -184,6 +187,44 @@ func TestDeleteRows(t *testing.T) {
 	}
 	if err := s.DeleteTag(ctx, n, "a"); !errors.Is(err, ErrManifestUnknown) {
 		t.Fatalf("DeleteTag of a missing tag = %v", err)
+	}
+}
+
+// TestDeleteTagKeepsTheDigestAddressable pins the row a tag delete leaves: the
+// digest's last tag becomes an untagged row, with the row's other fields and
+// annotations, at the end of the index as the on-disk layout orders it, and a digest with
+// another row loses only the tag's.
+func TestDeleteTagKeepsTheDigestAddressable(t *testing.T) {
+	const mt = "application/vnd.oci.image.manifest.v1+json"
+	a, b := digest.FromString("a"), digest.FromString("b")
+	row := func(d digest.Digest, ann map[string]string) ispec.Descriptor {
+		return ispec.Descriptor{MediaType: mt, Digest: d, Size: 1, Annotations: ann}
+	}
+	tag := func(t string) map[string]string { return map[string]string{ispec.AnnotationRefName: t} }
+	for _, tc := range []struct {
+		name string
+		in   []ispec.Descriptor
+		want []ispec.Descriptor
+	}{
+		{"the last tag becomes an untagged row", []ispec.Descriptor{row(a, tag("x"))}, []ispec.Descriptor{row(a, nil)}},
+		{"a sibling tag keeps the digest", []ispec.Descriptor{row(a, tag("x")), row(a, tag("y"))}, []ispec.Descriptor{row(a, tag("y"))}},
+		{"an untagged row keeps the digest", []ispec.Descriptor{row(a, tag("x")), row(a, nil)}, []ispec.Descriptor{row(a, nil)}},
+		{"the untagged row goes last", []ispec.Descriptor{row(a, tag("x")), row(b, tag("y"))}, []ispec.Descriptor{row(b, tag("y")), row(a, nil)}},
+		{
+			"other annotations stay",
+			[]ispec.Descriptor{row(a, map[string]string{ispec.AnnotationRefName: "x", "k": "v"})},
+			[]ispec.Descriptor{row(a, map[string]string{"k": "v"})},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := deleteTagRow(slices.Clone(tc.in), 0, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("rows = %+v, want %+v", got, tc.want)
+			}
+		})
 	}
 }
 

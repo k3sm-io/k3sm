@@ -88,7 +88,7 @@ func TestRunAsNonRootEffectivePerContainer(t *testing.T) {
 	for _, row := range table.Rows {
 		t.Run(row.Name, func(t *testing.T) {
 			pod := runAsNonRootPod(t, row)
-			box, err := toPodBox(pod, "10.0.0.5", "10.0.0.5", "/var/lib/k3sm/pods/uid-rnr", "", netv1.DNSConfig{}, nil)
+			box, err := toPodBox(pod, "10.0.0.5", "10.0.0.5", "/var/lib/k3sm/pods/uid-rnr", "", "", netv1.DNSConfig{}, nil)
 			if err != nil {
 				t.Fatalf("toPodBox: %v", err)
 			}

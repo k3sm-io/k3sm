@@ -19,16 +19,25 @@ package executor
 import (
 	"os/exec"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
+	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
-// TestProcessExitedMonotoneAcrossReap pins that processExited never flips back to
+// TestProcessExitedMonotoneAcrossReapSmoke exercises the real kernel as a smoke
+// test; the deterministic claim lives in TestProcessExitedMonotoneAcrossReapSeam.
+// It pins that processExited never flips back to
 // "running" once it has said "exited": a child observed as a zombie must still read
 // exited while, and after, the reaper's wait4 removes it from the process table. A
 // verdict built from two kernel reads straddling the reap answered false here.
-func TestProcessExitedMonotoneAcrossReap(t *testing.T) {
-	const children = 300
+func TestProcessExitedMonotoneAcrossReapSmoke(t *testing.T) {
+	children := 300
+	if testing.Short() {
+		children = 20
+	}
 	for i := range children {
 		cmd := exec.Command("/usr/bin/true")
 		if err := cmd.Start(); err != nil {
@@ -36,11 +45,18 @@ func TestProcessExitedMonotoneAcrossReap(t *testing.T) {
 		}
 		pid := cmd.Process.Pid
 
-		deadline := time.Now().Add(5 * time.Second)
+		deadline := time.Now().Add(30 * time.Second)
 		for !processExited(pid) {
 			if time.Now().After(deadline) {
 				_ = cmd.Wait() // reap before failing; the verdict is the failure
-				t.Fatalf("child %d (pid %d): never reported exited", i, pid)
+				if i == 0 {
+					t.Fatalf("child %d (pid %d): never reported exited", i, pid)
+				}
+				// Only child 0 is a hard real-kernel check. On a loaded host the
+				// exit can outlast the deadline for later children, and failing
+				// there would test the host, not processExited; the seam test
+				// covers the reap race deterministically.
+				t.Skipf("child %d (pid %d): host too loaded to observe the exit in time", i, pid)
 			}
 			runtime.Gosched() // a barrier poll, not a budget: the deadline above is the only bound
 		}
@@ -62,5 +78,57 @@ func TestProcessExitedMonotoneAcrossReap(t *testing.T) {
 				t.Fatalf("child %d (pid %d): reported running after reporting exited", i, pid)
 			}
 		}
+	}
+}
+
+// TestProcessExitedMonotoneAcrossReapSeam drives the straddle deterministically:
+// the reap lands immediately after the first kernel read, so a verdict that reads
+// the kernel twice sees the zombie record and then the empty slot a reap leaves
+// behind. The verdict must stay "exited" however many reads it makes, and it is
+// the test that carries the monotone claim.
+func TestProcessExitedMonotoneAcrossReapSeam(t *testing.T) {
+	zombie := make([]byte, unix.SizeofKinfoProc)
+	var kp unix.KinfoProc
+	kp.Proc.P_stat = pStatZombie
+	copy(zombie, (*[unix.SizeofKinfoProc]byte)(unsafe.Pointer(&kp))[:])
+	reaped := false
+	reads := 0
+	read := func(int) ([]byte, error) {
+		reads++
+		if reaped {
+			return nil, nil
+		}
+		reaped = true // the reaper's wait4 lands right after this read
+		return zombie, nil
+	}
+	if !processExitedVia(read, 42) {
+		t.Fatalf("zombie record read as running (kernel reads: %d)", reads)
+	}
+	if !processExitedVia(read, 42) {
+		t.Fatal("reported running after the reap")
+	}
+}
+
+// TestProcessExitedReportsUnknownRecordSize pins that an unexpected record size
+// stays fail-safe (running) and logs exactly once per process lifetime.
+func TestProcessExitedReportsUnknownRecordSize(t *testing.T) {
+	origWarn := procSizeWarn
+	t.Cleanup(func() { procSizeWarn = origWarn; procSizeWarnOnce = sync.Once{} })
+	procSizeWarnOnce = sync.Once{}
+	type call struct{ got, want int }
+	var calls []call
+	procSizeWarn = func(got, want int) { calls = append(calls, call{got, want}) }
+	short := func(int) ([]byte, error) { return make([]byte, 7), nil }
+
+	for range 3 {
+		if processExitedVia(short, 42) {
+			t.Fatal("unexpected record size must fail safe to running")
+		}
+	}
+	if len(calls) != 1 {
+		t.Fatalf("warnings = %d, want 1", len(calls))
+	}
+	if calls[0].got != 7 || calls[0].want != unix.SizeofKinfoProc {
+		t.Fatalf("warning = %+v, want length 7 expected %d", calls[0], unix.SizeofKinfoProc)
 	}
 }

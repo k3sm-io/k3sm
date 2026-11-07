@@ -1160,6 +1160,23 @@ func TestParkedCreateForAnUnresolvableImage(t *testing.T) {
 	})
 }
 
+// parkedWithHeldRetry parks pod's create, then parks its RETRY inside the
+// CreatePod RPC, returning the clock and the release func.
+func parkedWithHeldRetry(t *testing.T, pod *corev1.Pod) (*runtimedRuntime, *fakeRuntimeServer, *testclock.FakeClock, func()) {
+	t.Helper()
+	r, f, clk, _ := newPullProvider(t)
+	f.pushCreate(createRefusal(runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL,
+		`container c0: pull image "`+pullImage+`": unexpected status 500 Internal Server Error`))
+	if err := r.CreatePod(context.Background(), pod); err != nil {
+		t.Fatalf("CreatePod = %v, want the pod parked rather than failed", err)
+	}
+	release := f.holdCreate()
+	waitRestart(t, "the pull back-off timer to arm", clk.HasWaiters)
+	clk.Step(11 * time.Second)
+	waitRestart(t, "the retry's CreatePod to be entered", func() bool { return f.createCount() == 2 })
+	return r, f, clk, release
+}
+
 // TestParkedCreateFencedAgainstDelete pins what a parked pod's retry does with a
 // create that LANDS too late to be committed the ordinary way, and the answer is
 // decided by WHY it could not: the pod was deleted (undo the create), a fresh
@@ -1184,23 +1201,6 @@ func TestParkedCreateForAnUnresolvableImage(t *testing.T) {
 // deleted — the replace destroying the guest the successor had just been handed,
 // the re-key destroying a live pod outright.
 func TestParkedCreateFencedAgainstDelete(t *testing.T) {
-	// parkedWithHeldRetry parks pod's create, then parks its RETRY inside the
-	// CreatePod RPC, returning the clock and the release func.
-	parkedWithHeldRetry := func(t *testing.T, pod *corev1.Pod) (*runtimedRuntime, *fakeRuntimeServer, *testclock.FakeClock, func()) {
-		t.Helper()
-		r, f, clk, _ := newPullProvider(t)
-		f.pushCreate(createRefusal(runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL,
-			`container c0: pull image "`+pullImage+`": unexpected status 500 Internal Server Error`))
-		if err := r.CreatePod(context.Background(), pod); err != nil {
-			t.Fatalf("CreatePod = %v, want the pod parked rather than failed", err)
-		}
-		release := f.holdCreate()
-		waitRestart(t, "the pull back-off timer to arm", clk.HasWaiters)
-		clk.Step(11 * time.Second)
-		waitRestart(t, "the retry's CreatePod to be entered", func() bool { return f.createCount() == 2 })
-		return r, f, clk, release
-	}
-
 	t.Run("a create that lands after the delete is compensated, never adopted", func(t *testing.T) {
 		pod := probePullPod("late-create")
 		id := string(pod.UID)
@@ -1222,6 +1222,9 @@ func TestParkedCreateFencedAgainstDelete(t *testing.T) {
 		if f.hasCreated(id) {
 			t.Error("the runtime still holds the pod: the late create resurrected a deleted pod, and nothing can reach it")
 		}
+		// The fake records the delete inside the RPC, and the track goes with the last
+		// call out, after that RPC has returned (TestParkedCreateLeavesNoTrackAfterCompensation).
+		waitRestart(t, "the pod's calls to return", func() bool { return parkedCallsOut(r, id) })
 		if tr := r.trackByID(id); tr != nil {
 			t.Error("the deleted pod is tracked again")
 		}

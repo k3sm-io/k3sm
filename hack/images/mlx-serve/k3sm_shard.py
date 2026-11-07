@@ -6,7 +6,8 @@ The k3sm MLX operator renders one Pod per rank and runs this module in each:
 
     /bin/python3.12 -m k3sm_shard --model <ref> --served-model-name <name> [caller args...]
 
-It does DNS resolution, then runs the engine in this process:
+It does DNS resolution, fetches a pinned revision, then runs the engine in this
+process:
 
   1. reads the environment the operator rendered (MLX_RANK, MLX_WORLD_SIZE,
      K3SM_MLX_BACKEND, K3SM_MLX_PARALLELISM, K3SM_MLX_RANKS, K3SM_MLX_PORT,
@@ -26,7 +27,12 @@ It does DNS resolution, then runs the engine in this process:
               (the K3SM_MLX_HOSTS entries on the thunderbolt path)
        jaccl: MLX_IBV_DEVICES -> the per-rank RDMA device matrix, plus
               MLX_JACCL_COORDINATOR=<rank 0 podIP>:<port>;
-  4. runs mlx_lm.server's own main() in this process with --host 0.0.0.0,
+  4. when --model is k3sm's pinned snapshot path, fetches that revision into
+     this rank's cache volume with k3sm_serve.seed_pinned_revision, the step the
+     single-node entrypoint runs, because the engine only loads that path. A
+     fetch that fails on a cache without the snapshot, or a revision that
+     resolves to another commit, ends the rank with SEED_FAILED_STATUS;
+  5. runs mlx_lm.server's own main() in this process with --host 0.0.0.0,
      --port <serve port>, --pipeline for pipeline parallelism, and its own
      arguments passed through last, minus --served-model-name.
 
@@ -41,8 +47,10 @@ value, so a pinned model (whose --model is the snapshot path in the cache
 volume) would list that path on /v1/models, and a request naming the model's
 repository id would make every rank load that id afresh. The entrypoint takes
 the option itself and makes the engine answer to that one name: a request
-whose model is the name is served by the model already loaded, and
-/v1/models lists the name alone. That needs four hooks in mlx_lm.server
+whose model is the name, or that names none, is served by the model already
+loaded, a request naming any other model, draft_model or adapters is refused
+(HTTP 404) rather than made a repository to fetch and load, and /v1/models lists
+the name alone. That needs four hooks in mlx_lm.server
 (ModelProvider.load, APIHandler.handle_models_request, run and
 _run_http_server), none of them a published API. install_alias checks each
 against the shape it was written for, mlx-lm 0.32.2, and the source of run
@@ -62,9 +70,12 @@ judges a serving gang, never a starting one, so a long first download is not a
 kill loop. Anything else (a hung collective, a timeout, an error status)
 exits 1.
 
-Standard library only: the image carries the engine's closure and nothing else.
+Standard library and the image's own k3sm_serve only: the image carries the
+engine's closure and nothing else.
 """
 
+import argparse
+import contextlib
 import hashlib
 import importlib
 import inspect
@@ -78,6 +89,8 @@ import time
 import tokenize
 import urllib.error
 import urllib.request
+
+from k3sm_serve import SeedError, seed_pinned_revision
 
 # The rendezvous and serving contract with the operator's render
 # (k3sm/pkg/mlx/render_sharded.go). A rename there is a rename here.
@@ -111,9 +124,27 @@ PROBE_TIMEOUT_SECONDS = 25.0
 
 STATE_SUBDIR = "k3sm-shard"
 
+# The exit status of a rank that refuses to start. On the thunderbolt path the
+# operator reads it as a refusal to start on the interconnect, an interconnect
+# loss (pkg/mlx/operator shardRefusedExit, lostRanks).
+REFUSED_STATUS = 2
+
+# The exit status of a rank on the thunderbolt path whose interconnect address
+# is not the one its K3SM_MLX_HOSTS entry names: the node's provider gave it
+# another slot. The cable is up, so it is not an interconnect loss; the operator
+# reads it as a placement error and re-places the gang (pkg/mlx/operator
+# shardMisplacedExit, misplacedRanks). Keep the two values in sync with Go.
+MISPLACED_STATUS = 3
+
+# The exit status of a rank whose pinned revision could not be fetched. It is
+# not REFUSED_STATUS: a Hub failure is not an interconnect loss. Status 1 is the
+# generic gang fault.
+SEED_FAILED_STATUS = 1
+
 # The option the operator renders for the name the engine serves under, and the
 # key mlx_lm.server's ModelProvider maps to its --model.
 SERVED_NAME_FLAG = "--served-model-name"
+MODEL_FLAG = "--model"
 ENGINE_MODULE = "mlx_lm.server"
 ENGINE_DEFAULT_MODEL = "default_model"
 HOSTFILE_NAME = "mlx-hostfile.json"
@@ -122,6 +153,10 @@ IBV_DEVICES_NAME = "mlx-ibv-devices.json"
 
 class ShardError(Exception):
     """A rank cannot be started; the message says why."""
+
+
+class ShardMisplaced(ShardError):
+    """The rank's interconnect address is not the one its hostfile entry names."""
 
 
 def _require(env, name):
@@ -206,7 +241,7 @@ def interconnect_hosts(env, rank, world, port):
                          f"address to bind its hostfile entry {own!r} on; the interconnect attach was refused "
                          f"(see the Pod's k3sm.io/InterconnectAttached condition), exiting so the operator re-places the gang")
     if host != mine:
-        raise ShardError(f"{ENV_HOSTS} names {host} for rank {rank}, but this rank's interconnect address "
+        raise ShardMisplaced(f"{ENV_HOSTS} names {host} for rank {rank}, but this rank's interconnect address "
                          f"({ENV_INTERCONNECT_IP}) is {mine}: it would bind an address it does not hold")
     return hosts
 
@@ -341,6 +376,24 @@ def split_served_name(argv):
     return name, rest
 
 
+def engine_model(argv):
+    """(model, None) as mlx_lm.server's parser reads --model from argv.
+
+    The second value is the one seed_pinned_revision's parse returns beside the
+    model and does not read. The last occurrence and an abbreviation count, as
+    argparse has them. A parse error is left for the engine's own parse to
+    report.
+    """
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(MODEL_FLAG)
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            args, _ = parser.parse_known_args(argv)
+    except SystemExit:
+        return None, None
+    return args.model, None
+
+
 # The hooks install_alias relies on, with the parameters mlx-lm 0.32.2 gives
 # them (unchanged from 0.32.0). A hook that is missing or takes other parameters ends the rank.
 ENGINE_HOOKS = (
@@ -413,6 +466,10 @@ def check_engine_hooks(server):
     check_run_shape(server)
 
 
+class ModelRefused(ValueError):
+    """A request named a model other than the one this rank serves."""
+
+
 def install_alias(server, served):
     """Make the engine module serve its --model under the name served.
 
@@ -425,11 +482,22 @@ def install_alias(server, served):
     check_engine_hooks(server)
 
     class AliasedModelProvider(server.ModelProvider):
-        """Maps the served name to the model already loaded."""
+        """Serves the model already loaded under the served name, and nothing else.
+
+        A request body sets all three arguments (model, adapters, draft_model).
+        The engine would hand any other model or draft model to its loader, which
+        downloads it from the Hub and drops the loaded model.
+        """
 
         def load(self, model_path, adapter_path=None, draft_model_path=None):
             if model_path == served:
                 model_path = ENGINE_DEFAULT_MODEL
+            elif model_path != ENGINE_DEFAULT_MODEL:
+                raise ModelRefused(f"this server serves {served!r} only, not {model_path!r}")
+            if adapter_path not in (None, self.cli_args.adapter_path):
+                raise ModelRefused(f"this server serves {served!r} only, with no adapter {adapter_path!r}")
+            if draft_model_path not in (None, ENGINE_DEFAULT_MODEL, self.cli_args.draft_model):
+                raise ModelRefused(f"this server serves {served!r} only, with no draft model {draft_model_path!r}")
             return super().load(model_path, adapter_path, draft_model_path)
 
     class AliasedAPIHandler(server.APIHandler):
@@ -568,14 +636,23 @@ def main(argv=None):
         print(f"k3sm-shard: rank {child_env['MLX_RANK']} of {child_env['MLX_WORLD_SIZE']}, "
               f"backend {env[ENV_BACKEND]}, {' '.join(child_argv[2:3])} serving as {served or 'its --model'}",
               file=sys.stderr, flush=True)
+    except ShardMisplaced as e:
+        print(f"k3sm-shard: {e}", file=sys.stderr, flush=True)
+        return MISPLACED_STATUS
     except ShardError as e:
         print(f"k3sm-shard: {e}", file=sys.stderr, flush=True)
-        return 2
+        return REFUSED_STATUS
+    # After the plan, so a rank that cannot start refuses before a long download.
+    try:
+        seed_pinned_revision(argv, env, parse=engine_model)
+    except SeedError as e:
+        print(f"k3sm-shard: {e}", file=sys.stderr, flush=True)
+        return SEED_FAILED_STATUS
     try:
         result = serve(child_env, child_argv, served)
     except ShardError as e:
         print(f"k3sm-shard: {e}", file=sys.stderr, flush=True)
-        return 2
+        return REFUSED_STATUS
     return exit_status(result)
 
 
