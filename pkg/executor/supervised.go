@@ -37,6 +37,7 @@ import (
 
 	"k3sm.io/darwin-net/pkg/tcpseg"
 	"k3sm.io/k3sm/pkg/certs"
+	"k3sm.io/k3sm/pkg/defaults"
 	"k3sm.io/k3sm/pkg/ports"
 )
 
@@ -836,6 +837,12 @@ func (s *Supervised) startAPIServer(ctx context.Context) (*component, error) {
 	return s.spawn(ctx, "kube-apiserver", apiServerArgs(s.cfg)...)
 }
 
+// APIServerArgs is the kube-apiserver argv the supervisor spawns for cfg (see
+// apiServerArgs). It is exported so a package that renders configuration the
+// apiserver must agree with, such as the installer's netd arguments, can
+// assert that agreement against the real renderer.
+func APIServerArgs(cfg Config) []string { return apiServerArgs(cfg) }
+
 // apiServerArgs renders the kube-apiserver argv from cfg. It is a pure function so
 // the trust posture is table-tested without booting the apiserver: the mesh
 // BindAddress (never 0.0.0.0), --anonymous-auth=false, --client-ca-file (always set —
@@ -856,7 +863,9 @@ func apiServerArgs(cfg Config) []string {
 		authzMode = DefaultAuthorizationMode
 	}
 	args := append(apiServerDatastoreArgs(cfg),
-		"--service-cluster-ip-range", "10.43.0.0/16",
+		// The one cluster Service range, the same constant the installer renders
+		// into netd's --service-cidr (pkg/install refuses any other value).
+		"--service-cluster-ip-range", defaults.ServiceCIDR,
 		// Pin the NodePort range to the standard 30000-32767 (the kube-apiserver
 		// default). k3sm's userspace Service proxy binds *:NodePort directly and
 		// in-process as the unprivileged _k3sm user (NOT via the root netd helper,
