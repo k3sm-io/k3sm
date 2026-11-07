@@ -36,6 +36,7 @@ import (
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/interconnect"
 	"k3sm.io/k3sm/pkg/registrysvc"
+	"k3sm.io/runtimed/pkg/sandbox"
 )
 
 // serverPKI is the mesh path's provisioned trust material; zero single-node.
@@ -105,6 +106,16 @@ func refuseServerTokenAsAdmin(opts serverOptions) error {
 // work-dir guards. It canonicalizes opts.nodeName and resolves opts.token in
 // place.
 func validateServerOptions(opts *serverOptions, workDirErr error, logger *slog.Logger) error {
+	// The work dir, normalised and checked before any other use of it: the pod
+	// sandbox denies <data root>/server only, so a server work dir anywhere else
+	// would leave the datastore, the CA keys and the registry store open to pods.
+	if opts.workDir != "" {
+		workDir, err := resolveWorkDirLayout(opts.workDir, sandbox.ServerSubdir)
+		if err != nil {
+			return err
+		}
+		opts.workDir = workDir
+	}
 	// The token, from the file the installed daemon is pointed at: the static
 	// admin token, or on an HA server-join the server-class JOIN token. Resolved
 	// BEFORE any state is touched, because a token file that is there and cannot
