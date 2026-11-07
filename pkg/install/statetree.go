@@ -89,9 +89,19 @@ const LibraryMode fs.FileMode = 0o700
 
 // serviceTreePrivateMode is the mode of the daemon-private stores the runtime
 // already creates 0700 (the image index, the operator record, the ingest
-// staging dir, the SBPL staging dir and the two reap stores). Pre-creating them
+// staging dir, the SBPL staging dir, the two reap stores, the artifact
+// download staging dir and the failed-boot console dir). Pre-creating them
 // at the same mode means the installer changes their owner and nothing else.
 const serviceTreePrivateMode fs.FileMode = 0o700
+
+// ArtifactViewsMode is the mode of the runtime's artifact views root
+// (sandbox.ArtifactViewsSubdir): traversable but not listable by anyone but
+// the service user, so a pod can reach the one view it is granted and cannot
+// list the others. The runtime creates the root at exactly this mode and
+// refuses one at any other mode or owner without repairing it, and netd
+// re-applies the table at every start, so this must equal the runtime's value:
+// 0700 here would refuse every pod that mounts a model image volume.
+const ArtifactViewsMode fs.FileMode = 0o711
 
 // ManifestDirMode is the auto-deploy manifest directory's mode: root:wheel
 // 0755. World-readable because nothing in it is secret by contract, and
@@ -289,6 +299,12 @@ var stateTree = func() []stateLevel {
 		{StateLevel(sandbox.ProfileSubdir), svc(serviceTreePrivateMode)},
 		{StateLevel(sandbox.PodReapSubdir), svc(serviceTreePrivateMode)},
 		{StateLevel(sandbox.VMReapSubdir), svc(serviceTreePrivateMode)},
+		// The resumable artifact downloads, and the retained consoles of
+		// failed vm boots: daemon-private, 0700 as the runtime makes them.
+		{StateLevel(sandbox.ArtifactPartialSubdir), svc(serviceTreePrivateMode)},
+		{StateLevel(sandbox.VMBootFailureSubdir), svc(serviceTreePrivateMode)},
+		// The read-only artifact views root (ArtifactViewsMode).
+		{StateLevel(sandbox.ArtifactViewsSubdir), svc(ArtifactViewsMode)},
 	}
 }()
 

@@ -219,6 +219,10 @@ pin, its date, and the tarball's sha256.
 
 ### Fixed
 
+- A Pod with an `image` volume no longer fails with `mkdir /var/lib/k3sm/artifacts: permission denied`.
+  `k3sm install` now creates the runtime's artifact views and partial-download directories under the
+  data root for the service user, and the directory that keeps the console of a failed vm boot. A
+  reinstall over an existing node creates them too, and netd recreates them at start.
 - A Pod whose `image` volume the node cannot fetch for want of store space is now kept `Pending` with
   the waiting reason `ArtifactPullBackOff` and retried on the image pull back-off, where it used to fail
   at creation. A volume whose reference the runtime refuses as naming another registry is kept with
