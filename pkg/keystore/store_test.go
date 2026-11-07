@@ -714,6 +714,112 @@ func TestListMarksCorruptEntry(t *testing.T) {
 	}
 }
 
+// TestEntryWithNoPointer: a directory with no current pointer is an
+// interrupted Put only when it holds generation and at most v1 (temporary
+// files aside). Anything more is damage: List reports it, Put refuses it and
+// touches nothing, and Delete clears it.
+func TestEntryWithNoPointer(t *testing.T) {
+	ctx := context.Background()
+	// setup stores "a" and then leaves its directory in the shape under test.
+	setup := func(t *testing.T, shape func(dir string)) (*FileStore, string) {
+		t.Helper()
+		s, server := newTestStore(t)
+		mustPut(t, s, "a", KindOpaque, []byte("old"))
+		dir := filepath.Join(server, "keystore", "a")
+		remove(t, filepath.Join(dir, currentName))
+		shape(dir)
+		return s, dir
+	}
+	files := func(t *testing.T, dir string) string {
+		t.Helper()
+		des, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var names []string
+		for _, de := range des {
+			names = append(names, de.Name())
+		}
+		return strings.Join(names, ",")
+	}
+
+	for name, shape := range map[string]func(dir string){
+		"generation and v1": func(string) {},
+		"generation only":   func(dir string) { remove(t, filepath.Join(dir, "v1")) },
+		"a leftover temporary file": func(dir string) {
+			writeFile(t, filepath.Join(dir, "."+currentName+".0123abcd.tmp"), "half a write")
+		},
+	} {
+		t.Run("interrupted put: "+name, func(t *testing.T) {
+			s, dir := setup(t, shape)
+			if got, err := s.List(ctx); err != nil || len(got) != 0 {
+				t.Fatalf("List = %+v %v, want no entry", got, err)
+			}
+			if _, _, err := s.Current(ctx, "a"); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("Current: %v, want ErrNotFound", err)
+			}
+			if _, _, err := s.Get(ctx, "a", 1); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("Get: %v, want ErrNotFound", err)
+			}
+			before := files(t, dir)
+			if err := s.Delete(ctx, "a"); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("Delete: %v, want ErrNotFound", err)
+			}
+			if after := files(t, dir); after != before {
+				t.Fatalf("Delete changed the directory: %s, was %s", after, before)
+			}
+			mustPut(t, s, "a", KindOpaque, []byte("new"))
+			if _, val, err := s.Current(ctx, "a"); err != nil || string(val) != "new" {
+				t.Fatalf("Current after the Put = %q %v, want the new value", val, err)
+			}
+		})
+	}
+
+	for name, shape := range map[string]func(dir string){
+		"v1 and v2": func(dir string) { copyFile(t, filepath.Join(dir, "v1"), filepath.Join(dir, "v2")) },
+		"v1 without generation": func(dir string) {
+			remove(t, filepath.Join(dir, generationName))
+		},
+		"v2 without v1": func(dir string) {
+			copyFile(t, filepath.Join(dir, "v1"), filepath.Join(dir, "v2"))
+			remove(t, filepath.Join(dir, "v1"))
+		},
+	} {
+		t.Run("damage: "+name, func(t *testing.T) {
+			s, dir := setup(t, shape)
+			before := files(t, dir)
+
+			got, err := s.List(ctx)
+			if err != nil || len(got) != 1 || got[0].Name != "a" {
+				t.Fatalf("List = %+v %v, want the entry returned", got, err)
+			}
+			if e := got[0]; !errors.Is(e.Err, ErrCorrupt) || e.Current != (Version{}) || e.Versions != nil {
+				t.Fatalf("entry = %+v, want only Err (ErrCorrupt)", e)
+			}
+			if _, _, err := s.Current(ctx, "a"); !errors.Is(err, ErrCorrupt) {
+				t.Fatalf("Current: %v, want ErrCorrupt", err)
+			}
+			if _, _, err := s.Get(ctx, "a", 1); !errors.Is(err, ErrCorrupt) {
+				t.Fatalf("Get: %v, want ErrCorrupt", err)
+			}
+			if _, err := s.Put(ctx, "a", KindOpaque, []byte("new")); !errors.Is(err, ErrExists) {
+				t.Fatalf("Put: %v, want ErrExists", err)
+			}
+			if after := files(t, dir); after != before {
+				t.Fatalf("Put changed the directory: %s, was %s", after, before)
+			}
+
+			if err := s.Delete(ctx, "a"); err != nil {
+				t.Fatalf("Delete: %v", err)
+			}
+			if _, err := os.Stat(dir); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("directory after Delete: %v, want it gone", err)
+			}
+			mustPut(t, s, "a", KindOpaque, []byte("new"))
+		})
+	}
+}
+
 // TestPutCrashAtEveryStep injects a crash at each durable step of a Put, then
 // checks the name is not an entry and a retried Put stores the retried value.
 func TestPutCrashAtEveryStep(t *testing.T) {
