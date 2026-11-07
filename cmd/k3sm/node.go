@@ -255,6 +255,13 @@ type nodeOptions struct {
 	// value (a standalone `k3sm node`, a server with no registry) maps nothing.
 	flatRegistry flatRegistryEndpoint
 
+	// guestFromClusterStore makes this node fetch its guest boot pair from the
+	// cluster registry flatRegistry names, never from the release host. `k3sm
+	// agent` sets it: its server publishes the pair there (onGuestArtifacts).
+	// With no cluster registry mapped it has no effect and the release-host
+	// ensure runs as on every other node.
+	guestFromClusterStore bool
+
 	// deniedLocalPorts are loopback-only TCP ports every pod's SBPL denies
 	// connect() to — this node's EFFECTIVE kine (etcd shim) port, so a networked
 	// native pod sharing the node's _k3sm uid cannot dial the plaintext
@@ -1562,10 +1569,20 @@ func buildProvider(ctx context.Context, opts nodeOptions, cs kubernetes.Interfac
 		// has, advertises VMArtifactsAvailable=false, and fails vm pods closed. Do
 		// NOT "harden" this into a startup error — it is the same rule the startup
 		// pod reap follows, and for the same reason.
-		if art, ok := (provider.GuestArtifactSource{}).Ensure(ctx, cfg.Root, slog.Default()); ok {
-			cfg.GuestArtifacts = &art
-			if opts.onGuestArtifacts != nil {
-				opts.onGuestArtifacts(art)
+		//
+		// A worker with a cluster registry is the exception to "before": its
+		// pair comes from the cluster store, which is the runtime's own, so
+		// NewRuntimed ensures it once the runtime exists (RuntimedConfig.GuestStore)
+		// under the same never-fail contract.
+		if opts.guestFromClusterStore {
+			cfg.GuestStore = &provider.GuestArtifactSource{}
+		}
+		if !cfg.GuestFromClusterStore() {
+			if art, ok := (provider.GuestArtifactSource{}).Ensure(ctx, cfg.Root, slog.Default()); ok {
+				cfg.GuestArtifacts = &art
+				if opts.onGuestArtifacts != nil {
+					opts.onGuestArtifacts(art)
+				}
 			}
 		}
 		adapter, err := buildPodNetAdapter(opts)

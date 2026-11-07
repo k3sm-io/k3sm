@@ -593,6 +593,9 @@ func agentStart(ctx context.Context, opts agentOptions, breaker *crashBreaker, l
 	// EndpointSlice says the server's relay listens, over TLS verified against
 	// the cluster CA this join pinned.
 	nodeOpts.flatRegistry = agentFlatRegistry(ctx, kubeconfigPath, res, logger)
+	// The guest boot pair comes from that registry too, where the server
+	// published it, never from the release host.
+	nodeOpts.guestFromClusterStore = true
 	return startNode(ctx, nodeOpts)
 }
 
