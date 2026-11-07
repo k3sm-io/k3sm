@@ -94,7 +94,7 @@ func TestDeveloperModeInvalidMarkerNotRestoredOnRevert(t *testing.T) {
 		{name: "a file with an ACL", kind: EntryRegular, mode: 0o644, acl: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			f := &fakeSystem{}
+			f := newFakeSystem(t)
 			if err := Install(context.Background(), f, stageCfg()); err != nil {
 				t.Fatalf("first Install: %v", err)
 			}
@@ -140,7 +140,7 @@ func TestDeveloperModeValidMarkerRestoredOnPlainInstallRevert(t *testing.T) {
 	const content = "developer mode enabled by k3sm install on 2026-10-31T00:00:00Z\n"
 	removeCall := "RemoveEntry:/Library:k3sm.developer-mode"
 	restoreCall := "WriteRootOnlyFile:" + DeveloperModeMarkerPath + ":0644"
-	f := &fakeSystem{}
+	f := newFakeSystem(t)
 	if err := Install(context.Background(), f, stageCfg()); err != nil {
 		t.Fatalf("first Install: %v", err)
 	}
@@ -271,7 +271,7 @@ func (s *restoreWriteFails) WriteRootOnlyFile(path string, _ []byte, mode fs.Fil
 // validMarkerFake is a fake holding a valid marker, asserted to read on.
 func validMarkerFake(t *testing.T) *fakeSystem {
 	t.Helper()
-	f := &fakeSystem{owners: map[string]OwnedEntry{}, acls: map[string]bool{}}
+	f := (&fakeSystem{owners: map[string]OwnedEntry{}, acls: map[string]bool{}}).rootedIn(t)
 	seedMarkerAncestors(f)
 	f.owners[DeveloperModeMarkerPath] = OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: 0o644}
 	f.putFile(DeveloperModeMarkerPath, []byte("developer mode enabled by k3sm install on 2026-11-01T00:00:00Z\n"))

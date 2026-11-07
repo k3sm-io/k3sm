@@ -109,7 +109,7 @@ func TestVerifyDaemonsFailsWhenTheServerIsParked(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			shrinkRestartBudgets(t)
-			f := reinstallFake()
+			f := reinstallFake(t)
 			cfg := installCfg().withDefaults()
 			path := seedCrashRecord(t, f, cfg, tc.rec)
 
@@ -164,7 +164,7 @@ func TestVerifyDaemonsPassesWithoutAFreshFailure(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			shrinkRestartBudgets(t)
-			f := reinstallFake()
+			f := reinstallFake(t)
 			cfg := installCfg().withDefaults()
 			tc.seed(t, f, cfg)
 			if err := verifyDaemons(context.Background(), f, cfg, artifactManifest(cfg), bringUpWindow{fences: bootstrapFences{ServerLabel: installStart}}); err != nil {
@@ -180,7 +180,7 @@ func TestVerifyDaemonsPassesWithoutAFreshFailure(t *testing.T) {
 // which is what a daemon failing during THIS install produces.
 func TestInstallFailsWhenTheServerIsNotComingUp(t *testing.T) {
 	shrinkRestartBudgets(t)
-	f := reinstallFake()
+	f := reinstallFake(t)
 	cfg := installCfg()
 	seedCrashRecord(t, f, cfg.withDefaults(), executor.CrashRecord{Crashes: []executor.Crash{{
 		At: time.Now().Add(time.Second), Origin: executor.CrashOriginBringUp, Component: "provision/kine",
@@ -203,7 +203,7 @@ func TestInstallFailsWhenTheServerIsNotComingUp(t *testing.T) {
 // is parked right now.
 func TestInstallFailsWhenTheServerIsParked(t *testing.T) {
 	shrinkRestartBudgets(t)
-	f := reinstallFake()
+	f := reinstallFake(t)
 	cfg := installCfg()
 	trippedAt := time.Now().Add(-time.Hour)
 	seedCrashRecord(t, f, cfg.withDefaults(), executor.CrashRecord{

@@ -60,7 +60,7 @@ func TestServerRollKeepsTheAdminCredentialValid(t *testing.T) {
 	firstServer := func(t *testing.T) (*fakeSystem, Config, []byte) {
 		t.Helper()
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		first := testConfig(t)
 		first.MeshIP = "100.64.0.1"
 		res, err := InstallWithResult(context.Background(), f, first)
@@ -187,7 +187,7 @@ func TestAdminTokenRotationLeavesAMarker(t *testing.T) {
 	setup := func(t *testing.T) (*fakeSystem, Config, string) {
 		t.Helper()
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		first := testConfig(t)
 		first.MeshIP = "100.64.0.1"
 		if _, err := InstallWithResult(context.Background(), f, first); err != nil {

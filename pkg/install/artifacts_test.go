@@ -192,7 +192,7 @@ func TestManifestDataVolumeEntries(t *testing.T) {
 		if err := Install(context.Background(), r.sys, r.cfg); err != nil {
 			t.Fatalf("Install: %v", err)
 		}
-		un := &fakeSystem{}
+		un := newFakeSystem(t)
 		if err := Uninstall(context.Background(), un, r.cfg); err != nil {
 			t.Fatalf("Uninstall: %v", err)
 		}

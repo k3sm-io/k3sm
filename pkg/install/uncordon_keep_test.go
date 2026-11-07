@@ -113,7 +113,7 @@ func TestFailedUncordonKeepsTheInstallAndItsKubeconfig(t *testing.T) {
 	})
 
 	t.Run("the rollback beside a stuck developer-mode marker puts the token back too", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		if err := Install(ctx, f, stageCfg()); err != nil {
 			t.Fatalf("first Install: %v", err)
 		}

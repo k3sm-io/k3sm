@@ -93,7 +93,7 @@ func TestDeveloperModeMarkerUnclearableRevertsTheSwap(t *testing.T) {
 	}
 
 	t.Run("an upgrade reverts the swap and restarts nothing on the new tree", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		if err := Install(context.Background(), f, stageCfg()); err != nil {
 			t.Fatalf("first Install: %v", err)
 		}
@@ -134,7 +134,7 @@ func TestDeveloperModeMarkerUnclearableRevertsTheSwap(t *testing.T) {
 	})
 
 	t.Run("a first install stops before anything is wired or restarted", func(t *testing.T) {
-		f := &fakeSystem{owners: map[string]OwnedEntry{}}
+		f := (&fakeSystem{owners: map[string]OwnedEntry{}}).rootedIn(t)
 		putUnclearableMarker(t, f, EntryRegular)
 		stuck(f)
 		cfg := stageCfg()
@@ -211,7 +211,7 @@ func TestDeveloperModeMarkerUnclearableEdgeCases(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			f := &fakeSystem{owners: map[string]OwnedEntry{}}
+			f := (&fakeSystem{owners: map[string]OwnedEntry{}}).rootedIn(t)
 			putUnclearableMarker(t, f, tc.kind)
 			f.removeEntryErrs = map[string]error{DeveloperModeMarkerPath: errors.New("EPERM")}
 			cfg := stageCfg()

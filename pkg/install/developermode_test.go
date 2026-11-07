@@ -259,7 +259,7 @@ func TestDeveloperModeMarkerOnInstall(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			f := &fakeSystem{owners: map[string]OwnedEntry{}, swapErr: tc.swapErr}
+			f := (&fakeSystem{owners: map[string]OwnedEntry{}, swapErr: tc.swapErr}).rootedIn(t)
 			if tc.onDisk != nil {
 				seedMarkerAncestors(f)
 				f.owners[DeveloperModeMarkerPath] = *tc.onDisk
@@ -335,7 +335,7 @@ func TestDeveloperModeMarkerOnInstall(t *testing.T) {
 
 	t.Run("a plain install with no flag and no Signer never looks at the marker", func(t *testing.T) {
 		t.Parallel()
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		if err := Install(context.Background(), f, Config{BinarySource: src, TargetUser: "alice"}); err != nil {
 			t.Fatal(err)
 		}
@@ -348,7 +348,7 @@ func TestDeveloperModeMarkerOnInstall(t *testing.T) {
 
 	t.Run("an unknown mode is refused before any system call", func(t *testing.T) {
 		t.Parallel()
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		cfg := Config{BinarySource: src, TargetUser: "alice"}
 		cfg.DeveloperMode = "maybe"
 		if err := Install(context.Background(), f, cfg); err == nil {
@@ -437,7 +437,7 @@ func TestDeveloperModeClearedByAnyDeveloperIDTeam(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			f := &fakeSystem{owners: map[string]OwnedEntry{}}
+			f := (&fakeSystem{owners: map[string]OwnedEntry{}}).rootedIn(t)
 			seedMarkerAncestors(f)
 			f.owners[DeveloperModeMarkerPath] = OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: 0o644}
 			f.putFile(DeveloperModeMarkerPath, []byte("developer mode enabled by k3sm install on 2026-10-31T00:00:00Z\n"))
@@ -484,7 +484,7 @@ func TestDeveloperModeKeptWhenDeveloperIDVerificationFails(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			f := &fakeSystem{owners: map[string]OwnedEntry{}}
+			f := (&fakeSystem{owners: map[string]OwnedEntry{}}).rootedIn(t)
 			seedMarkerAncestors(f)
 			f.owners[DeveloperModeMarkerPath] = OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: 0o644}
 			f.putFile(DeveloperModeMarkerPath, []byte("developer mode enabled by k3sm install on 2026-10-31T00:00:00Z\n"))
@@ -544,7 +544,7 @@ func TestDeveloperModeMarkerDroppedAsTheSwapCommits(t *testing.T) {
 		{name: "a team-signed install", sign: fakeSigner{ids: map[string]string{"/tmp/k3sm": testTeamID}}},
 	} {
 		t.Run(tc.name+" removes it before the wiring", func(t *testing.T) {
-			f := &fakeSystem{owners: map[string]OwnedEntry{}}
+			f := (&fakeSystem{owners: map[string]OwnedEntry{}}).rootedIn(t)
 			putMarker(t, f, 0o644)
 			cfg := stageCfg()
 			cfg.DeveloperMode, cfg.Signer = tc.mode, tc.sign
@@ -565,7 +565,7 @@ func TestDeveloperModeMarkerDroppedAsTheSwapCommits(t *testing.T) {
 	}
 
 	t.Run("a revert restores the marker as it was", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		if err := Install(context.Background(), f, stageCfg()); err != nil {
 			t.Fatalf("first Install: %v", err)
 		}
@@ -593,7 +593,7 @@ func TestDeveloperModeMarkerDroppedAsTheSwapCommits(t *testing.T) {
 	})
 
 	t.Run("an unreadable marker is removed and not restored on a revert", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		if err := Install(context.Background(), f, stageCfg()); err != nil {
 			t.Fatalf("first Install: %v", err)
 		}
@@ -625,7 +625,7 @@ func TestDeveloperModeMarkerDroppedAsTheSwapCommits(t *testing.T) {
 	})
 
 	t.Run("an unreadable marker on a successful install returns the read error", func(t *testing.T) {
-		f := &fakeSystem{owners: map[string]OwnedEntry{}, readModeErrs: map[string]error{DeveloperModeMarkerPath: errors.New("EIO")}}
+		f := (&fakeSystem{owners: map[string]OwnedEntry{}, readModeErrs: map[string]error{DeveloperModeMarkerPath: errors.New("EIO")}}).rootedIn(t)
 		putMarker(t, f, 0o644)
 		cfg := stageCfg()
 		cfg.DeveloperMode = DeveloperModeOff
@@ -639,7 +639,7 @@ func TestDeveloperModeMarkerDroppedAsTheSwapCommits(t *testing.T) {
 	})
 
 	t.Run("a removal that fails twice leaves the marker invalid", func(t *testing.T) {
-		f := &fakeSystem{owners: map[string]OwnedEntry{}, removeEntryErrs: map[string]error{DeveloperModeMarkerPath: errors.New("EPERM")}}
+		f := (&fakeSystem{owners: map[string]OwnedEntry{}, removeEntryErrs: map[string]error{DeveloperModeMarkerPath: errors.New("EPERM")}}).rootedIn(t)
 		putMarker(t, f, 0o644)
 		cfg := stageCfg()
 		cfg.DeveloperMode = DeveloperModeOff

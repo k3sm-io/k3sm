@@ -71,7 +71,7 @@ func TestShadowSetIsMadeAtInstall(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			shrinkRestartBudgets(t)
-			f := &fakeSystem{}
+			f := newFakeSystem(t)
 			missing := map[string]bool{}
 			if tc.missing != "" {
 				f.missingPaths = map[string]bool{tc.missing: true}
@@ -143,7 +143,7 @@ func TestShadowSetIsMadeAtInstall(t *testing.T) {
 // pkg/status.)
 func TestShadowSetSharesTheOneList(t *testing.T) {
 	shrinkRestartBudgets(t)
-	f := &fakeSystem{}
+	f := newFakeSystem(t)
 	cfg := serverCfg()
 	cfg.Logger = slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
 	if err := Install(context.Background(), f, cfg); err != nil {
@@ -179,7 +179,7 @@ func TestShadowCopyVerificationFailsTheInstall(t *testing.T) {
 	shrinkRestartBudgets(t)
 	const dir = "/Library/k3sm.swap/shadow"
 	bad := fmt.Errorf("%w: signature carries entitlements", shadow.ErrUnsafeCopy)
-	f := &fakeSystem{verifyErrs: map[string]error{dir + "/tar": bad}}
+	f := (&fakeSystem{verifyErrs: map[string]error{dir + "/tar": bad}}).rootedIn(t)
 	cfg := serverCfg()
 	cfg.Logger = slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
 	err := Install(context.Background(), f, cfg)
@@ -201,7 +201,7 @@ func TestShadowSetBudget(t *testing.T) {
 	prev := shadowSetBudget
 	shadowSetBudget = -1
 	t.Cleanup(func() { shadowSetBudget = prev })
-	f := &fakeSystem{}
+	f := newFakeSystem(t)
 	cfg := serverCfg()
 	cfg.Logger = slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
 	err := Install(context.Background(), f, cfg)

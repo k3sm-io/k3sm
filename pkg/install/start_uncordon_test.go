@@ -43,7 +43,7 @@ func stoppedNodeOfRole(t *testing.T, role Role) (*fakeSystem, Config, *bytes.Buf
 		return f, cfg, logs
 	}
 	shrinkRestartBudgets(t)
-	f := &fakeSystem{}
+	f := newFakeSystem(t)
 	seedJoinedAgent(t, f)
 	var logs bytes.Buffer
 	cfg := agentCfg(t)

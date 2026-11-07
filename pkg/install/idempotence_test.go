@@ -53,7 +53,7 @@ func TestInstallEnsuresRunDir(t *testing.T) {
 		{name: "custom data root", dataRoot: "/opt/k3sm-lab", want: "/opt/k3sm-lab/run"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			f := &fakeSystem{}
+			f := newFakeSystem(t)
 			cfg := Config{BinarySource: "/tmp/k3sm", TargetUser: "alice", DataRoot: tc.dataRoot}
 			if err := Install(context.Background(), f, cfg); err != nil {
 				t.Fatalf("Install: %v", err)
@@ -83,7 +83,7 @@ func TestInstallEnsuresRunDir(t *testing.T) {
 // install prefix must re-point the launcher, and "already correct" is the real
 // implementation's no-op, not a case the orchestration has to know about.
 func TestReinstallRelinksIdempotently(t *testing.T) {
-	f := &fakeSystem{}
+	f := newFakeSystem(t)
 	cfg := Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"}
 	for i := 1; i <= 2; i++ {
 		if err := Install(context.Background(), f, cfg); err != nil {
@@ -188,7 +188,7 @@ func TestPreservedServerArgs(t *testing.T) {
 // Install again — so the carry-over is proven through the real render/parse round
 // trip rather than against a hand-written argv.
 func TestInstallPreservesServerArgsAcrossReinstall(t *testing.T) {
-	f := &fakeSystem{}
+	f := newFakeSystem(t)
 	cfg := Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"}
 	plist := cfg.withDefaults().plistPath(ServerLabel)
 
@@ -367,7 +367,7 @@ func TestInstallKubeconfigFollowsThePreservedMeshIP(t *testing.T) {
 	pinned := "certificate-authority-data: " + base64.StdEncoding.EncodeToString(ca)
 
 	t.Run("single-node reinstall stays on loopback and pins the cluster CA", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		f.putFile(caPath, ca)
 		if err := Install(context.Background(), f, cfg); err != nil {
 			t.Fatalf("Install: %v", err)
@@ -381,7 +381,7 @@ func TestInstallKubeconfigFollowsThePreservedMeshIP(t *testing.T) {
 	})
 
 	t.Run("mesh reinstall addresses the mesh IP and pins the cluster CA", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		f.putFile(dc.plistPath(ServerLabel), ServerPlist(Config{
 			AdminToken:      "k3sm-old",
 			ExtraServerArgs: []string{"--mesh-ip", "100.64.0.1"},
@@ -414,7 +414,7 @@ func TestAdminKubeconfigPinsServingCA(t *testing.T) {
 	caPath := certs.ClusterCACertPath(cfg.withDefaults().serverWorkDir())
 
 	t.Run("a first install waits for the cluster CA the boot mints and pins it", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		if err := Install(context.Background(), f, cfg); err != nil {
 			t.Fatalf("Install: %v", err)
 		}
@@ -441,7 +441,7 @@ func TestAdminKubeconfigPinsServingCA(t *testing.T) {
 	})
 
 	t.Run("a CA that never appears fails the install and writes no kubeconfig", func(t *testing.T) {
-		f := &fakeSystem{noBootCA: true}
+		f := (&fakeSystem{noBootCA: true}).rootedIn(t)
 		err := Install(context.Background(), f, cfg)
 		if !errors.Is(err, ErrClusterCATimeout) {
 			t.Fatalf("Install = %v, want %v", err, ErrClusterCATimeout)
@@ -455,7 +455,7 @@ func TestAdminKubeconfigPinsServingCA(t *testing.T) {
 	})
 
 	t.Run("the legacy self-signed file is never read", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		f.putFile(legacyPath, []byte("-----BEGIN CERTIFICATE-----\nselfsigned\n-----END CERTIFICATE-----\n"))
 		if err := Install(context.Background(), f, cfg); err != nil {
 			t.Fatalf("Install: %v", err)

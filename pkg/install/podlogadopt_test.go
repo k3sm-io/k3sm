@@ -260,7 +260,7 @@ func TestAgentInstallAdoptsThePodLogTree(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			shrinkRestartBudgets(t)
-			f := &fakeSystem{}
+			f := newFakeSystem(t)
 			seedOperatorToken(f)
 			seed := func(root string, entries []podLogEntry) {
 				for _, e := range entries {

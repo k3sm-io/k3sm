@@ -88,7 +88,7 @@ func TestServerFileLimitDeploymentUX(t *testing.T) {
 				{name: "probe error is skipped at DEBUG", probeErr: errors.New("sysctl: boom")},
 			} {
 				t.Run(tc.name, func(t *testing.T) {
-					f := &fakeSystem{maxFilesPerProc: tc.kmax, maxFilesPerProcErr: tc.probeErr}
+					f := (&fakeSystem{maxFilesPerProc: tc.kmax, maxFilesPerProcErr: tc.probeErr}).rootedIn(t)
 					role.seed(t, f)
 					log := install(t, f, role.cfg(t), slog.LevelDebug)
 					if got := capWarned(log); got != tc.wantWarn {
@@ -137,7 +137,7 @@ func TestServerFileLimitDeploymentUX(t *testing.T) {
 				{name: "malformed limit on disk: no notice, no failure", onDisk: strings.Replace(stock, limitXML, "<integer>lots</integer>", 1)},
 			} {
 				t.Run(tc.name, func(t *testing.T) {
-					f := &fakeSystem{}
+					f := newFakeSystem(t)
 					role.seed(t, f)
 					cfg := role.cfg(t)
 					if tc.onDisk != "" {
@@ -177,7 +177,7 @@ func TestServerFileLimitDeploymentUX(t *testing.T) {
 	t.Run("unreadable installed plist: no notice, no failure", func(t *testing.T) {
 		cfg := installCfg().withDefaults()
 		path := cfg.plistPath(ServerLabel)
-		f := &fakeSystem{readErrs: map[string]error{path: errors.New("read: input/output error")}}
+		f := (&fakeSystem{readErrs: map[string]error{path: errors.New("read: input/output error")}}).rootedIn(t)
 		var buf bytes.Buffer
 		log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 		if n, ok := checkFileLimit(f, log, ServerLabel, path, ServerPlist(cfg)); ok {

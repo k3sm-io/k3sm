@@ -72,7 +72,7 @@ func stagedWrites(calls []string, cfg Config) []string {
 func TestInstallStagesTheRootAndPublishesItOnce(t *testing.T) {
 	shrinkRestartBudgets(t)
 	cfg := stageCfg().withDefaults()
-	f := &fakeSystem{}
+	f := newFakeSystem(t)
 
 	// Run 1 is the first install (nothing at the live path); run 2 is the
 	// upgrade this item exists for — a live tree being replaced under running
@@ -191,7 +191,7 @@ func TestInstallStagesTheRootAndPublishesItOnce(t *testing.T) {
 func TestInstallStagingFailureLeavesTheLiveRootUntouched(t *testing.T) {
 	shrinkRestartBudgets(t)
 	cfg := stageCfg().withDefaults()
-	f := &fakeSystem{}
+	f := newFakeSystem(t)
 	if err := Install(context.Background(), f, stageCfg()); err != nil {
 		t.Fatalf("first Install: %v", err)
 	}
@@ -237,7 +237,7 @@ func TestInstallStagingFailureLeavesTheLiveRootUntouched(t *testing.T) {
 func TestInstallFirstInstallRenamesTheStagedRootIntoPlace(t *testing.T) {
 	shrinkRestartBudgets(t)
 	cfg := stageCfg().withDefaults()
-	f := &fakeSystem{}
+	f := newFakeSystem(t)
 	if err := Install(context.Background(), f, stageCfg()); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
@@ -259,7 +259,7 @@ func TestInstallFirstInstallRenamesTheStagedRootIntoPlace(t *testing.T) {
 func TestInstallRevertsTheSwapWhenTheWiringFails(t *testing.T) {
 	shrinkRestartBudgets(t)
 	cfg := stageCfg().withDefaults()
-	f := &fakeSystem{}
+	f := newFakeSystem(t)
 	if err := Install(context.Background(), f, stageCfg()); err != nil {
 		t.Fatalf("first Install: %v", err)
 	}
@@ -300,7 +300,7 @@ func TestInstallRevertsTheSwapWhenTheWiringFails(t *testing.T) {
 // second one is refused before it writes anything at all.
 func TestInstallRefusesASecondConcurrentInstall(t *testing.T) {
 	cfg := stageCfg().withDefaults()
-	f := &fakeSystem{}
+	f := newFakeSystem(t)
 	// The lock another install is holding.
 	release, err := f.LockInstall(cfg.installLockPath())
 	if err != nil {
@@ -389,7 +389,7 @@ func TestInstallRefusesAnUntrustedStagingPath(t *testing.T) {
 func TestStaleStagingTreeIsRemovedBeforeStaging(t *testing.T) {
 	shrinkRestartBudgets(t)
 	cfg := stageCfg().withDefaults()
-	f := &fakeSystem{}
+	f := newFakeSystem(t)
 	f.putOwned(cfg.swapDir(), 0, 0, 0o755|fs.ModeDir, EntryDir)
 	f.putTree(cfg.stagedBinary(), "/tmp/an-older-run/k3sm")
 	if err := Install(context.Background(), f, stageCfg()); err != nil {
@@ -523,7 +523,7 @@ func TestFreeSpacePreflight(t *testing.T) {
 	})
 
 	t.Run("a short volume refuses before the first write", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		f.putSpace(1<<20, 4<<30)
 		err := Install(context.Background(), f, stageCfg())
 		if err == nil {
@@ -541,7 +541,7 @@ func TestFreeSpacePreflight(t *testing.T) {
 
 	t.Run("an estimate that cannot be taken never blocks the install", func(t *testing.T) {
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		f.putSpaceErr(errors.New("statfs: operation not permitted"))
 		if err := Install(context.Background(), f, stageCfg()); err != nil {
 			t.Fatalf("Install: %v", err)

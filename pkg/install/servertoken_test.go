@@ -76,7 +76,7 @@ func TestServerPlistCarriesNoToken(t *testing.T) {
 	})
 
 	t.Run("install writes the server plist 0600 and the others 0644", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		if err := Install(context.Background(), f, cfg); err != nil {
 			t.Fatalf("Install: %v", err)
 		}
@@ -93,7 +93,7 @@ func TestServerPlistCarriesNoToken(t *testing.T) {
 	})
 
 	t.Run("install stages the token 0600, owned by the service uid", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		if err := Install(context.Background(), f, cfg); err != nil {
 			t.Fatalf("Install: %v", err)
 		}
@@ -112,7 +112,7 @@ func TestServerPlistCarriesNoToken(t *testing.T) {
 	})
 
 	t.Run("a reinstall replaces an argv-token plist and its mode", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		plistPath := dc.plistPath(ServerLabel)
 		// The Mac as an earlier build left it: the token on the argv, 0644.
 		f.putFile(plistPath, legacyServerPlist(cfg, "k3sm-the-old-admin-token"))

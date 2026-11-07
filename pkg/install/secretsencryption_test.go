@@ -74,7 +74,7 @@ func TestInstallSecretsEncryption(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			f := &fakeSystem{}
+			f := newFakeSystem(t)
 			cfg := testConfig(t)
 			cfg.SecretsEncryption = true
 			cfg.KeyEntropy = placeholderEntropy()
@@ -149,7 +149,7 @@ func TestReinstallLeavesSecretsEncryptionPairAlone(t *testing.T) {
 			name = "with the option and no datastore"
 		}
 		t.Run(name, func(t *testing.T) {
-			f := &fakeSystem{}
+			f := newFakeSystem(t)
 			cfg := testConfig(t)
 			cfg.SecretsEncryption = true
 			cfg.KeyEntropy = placeholderEntropy()
@@ -185,7 +185,7 @@ func TestReinstallLeavesSecretsEncryptionPairAlone(t *testing.T) {
 // TestInstallWithoutSecretsEncryptionNeverTouchesCred asserts the default
 // install neither reads nor writes the credential directory.
 func TestInstallWithoutSecretsEncryptionNeverTouchesCred(t *testing.T) {
-	f := &fakeSystem{}
+	f := newFakeSystem(t)
 	cfg := testConfig(t)
 	if err := Install(context.Background(), f, cfg); err != nil {
 		t.Fatalf("Install: %v", err)

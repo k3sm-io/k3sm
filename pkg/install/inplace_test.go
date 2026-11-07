@@ -51,7 +51,7 @@ func installedArgs(t *testing.T, f *fakeSystem, label string) []string {
 func TestResolveInPlace(t *testing.T) {
 	t.Run("an installed agent is reinstalled with its --server and arguments, as the explicit reinstall", func(t *testing.T) {
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		seedJoinedAgent(t, f)
 		first := agentCfg(t)
 		local := "local"
@@ -84,7 +84,7 @@ func TestResolveInPlace(t *testing.T) {
 
 	t.Run("an installed server is reinstalled for the recorded kubeconfig's owner, as the explicit reinstall", func(t *testing.T) {
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		first := testConfig(t)
 		first.MeshIP = "100.64.0.1"
 		first.TLSSANs = []string{"api.example.com"}
@@ -124,7 +124,7 @@ func TestResolveInPlace(t *testing.T) {
 	})
 
 	t.Run("nothing installed refuses", func(t *testing.T) {
-		if _, err := ResolveInPlace(&fakeSystem{}, inPlaceRequest(), nil); !errors.Is(err, ErrNothingToUpdate) {
+		if _, err := ResolveInPlace(newFakeSystem(t), inPlaceRequest(), nil); !errors.Is(err, ErrNothingToUpdate) {
 			t.Fatalf("ResolveInPlace = %v, want ErrNothingToUpdate", err)
 		}
 	})
@@ -132,14 +132,14 @@ func TestResolveInPlace(t *testing.T) {
 	t.Run("nothing installed with --user is the app's first install, unchanged", func(t *testing.T) {
 		req := inPlaceRequest()
 		req.TargetUser = "alice"
-		cfg, err := ResolveInPlace(&fakeSystem{}, req, nil)
+		cfg, err := ResolveInPlace(newFakeSystem(t), req, nil)
 		if err != nil || cfg.Role != RoleServer || cfg.TargetUser != "alice" {
 			t.Fatalf("ResolveInPlace = %+v, %v; want the request back as a server install", cfg.Role, err)
 		}
 	})
 
 	t.Run("an agent without a node credential refuses", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		f.putFile(Config{}.withDefaults().plistPath(AgentLabel), AgentPlist(agentCfg(t).withDefaults()))
 		if _, err := ResolveInPlace(f, inPlaceRequest(), nil); err == nil || !strings.Contains(err.Error(), "node credential") {
 			t.Fatalf("ResolveInPlace = %v, want the missing credential named", err)
@@ -147,7 +147,7 @@ func TestResolveInPlace(t *testing.T) {
 	})
 
 	t.Run("a server with no recorded kubeconfig and no --user refuses", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		cfg := testConfig(t)
 		configureServerArgs(f, cfg)
 		req := inPlaceRequest()
@@ -158,7 +158,7 @@ func TestResolveInPlace(t *testing.T) {
 	})
 
 	t.Run("both roles on disk refuses", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		configureServerArgs(f, testConfig(t))
 		f.putFile(Config{}.withDefaults().plistPath(AgentLabel), AgentPlist(agentCfg(t).withDefaults()))
 		if _, err := ResolveInPlace(f, inPlaceRequest(), nil); err == nil || !strings.Contains(err.Error(), "ambiguous") {
@@ -175,7 +175,7 @@ func TestUpdateReleaseBaseIsRecordedAndCarried(t *testing.T) {
 	want := "--" + UpdateReleaseBaseFlag + "=" + base
 	t.Run("server", func(t *testing.T) {
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		first := testConfig(t)
 		first.UpdateReleaseBase = "https://192.0.2.9/old"
 		if err := Install(context.Background(), f, first); err != nil {
@@ -203,7 +203,7 @@ func TestUpdateReleaseBaseIsRecordedAndCarried(t *testing.T) {
 	})
 	t.Run("agent", func(t *testing.T) {
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		seedJoinedAgent(t, f)
 		first := agentCfg(t)
 		first.UpdateReleaseBase = base

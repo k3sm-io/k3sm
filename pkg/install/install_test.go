@@ -307,6 +307,10 @@ type fakeSystem struct {
 	// recorded ("ReapOrphans:<prefix>" is keyed "ReapOrphans"; see each
 	// method). The zero value fails nothing.
 	failures map[string]error
+	// fsGuard confines the real-filesystem seams (EnsureRootDir, CopyTree,
+	// Rename, RemoveTree) to the test's temp root; see fakeroot_test.go. Nil
+	// (a fake not built by newFakeSystem or rootedIn) makes those seams panic.
+	fsGuard *fakeFSGuard
 }
 
 // delayedFile is one file of the fake root filesystem that CHANGES part-way
@@ -1427,35 +1431,38 @@ func (f *fakeSystem) RemoveAll(path string) error {
 // filesystem and hashing the datastore, so a seam that only remembered "a copy
 // was requested" would leave the verification comparing an empty directory
 // against a full one and the test would assert nothing about the sequence it
-// exists to pin. The paths are the test's own t.TempDir()s, so nothing
-// privileged happens.
+// exists to pin. The paths must be inside the test's temp root, and the fake
+// refuses any that is not (see fakeroot_test.go), so nothing privileged
+// happens.
 
 // EnsureRootDir records the call, REGISTERS the directory in the ownership
 // table as root:wheel at mode (what the real seam leaves behind, and what the
 // staging path's trust check then reads), and really creates it.
 //
-// A permission error from the real mkdir is tolerated, and only that one: an
-// unprivileged unit test legitimately asks for /Library/k3sm.swap, which it
-// cannot create and does not need to — the ownership table above is the model
-// those tests assert against. A test that needs a real directory (the data-root
-// migration, which really copies trees) names one under its own t.TempDir(),
-// where permission is never the answer.
+// The directory must lie inside the test's temp root (fakeroot_test.go), so
+// the mkdir is never privileged and every error it returns is a real one.
 func (f *fakeSystem) EnsureRootDir(dir string, mode fs.FileMode) error {
 	f.calls = append(f.calls, "EnsureRootDir:"+dir)
 	f.putOwned(dir, 0, 0, mode|fs.ModeDir, EntryDir)
-	if err := os.MkdirAll(dir, mode); err != nil && !errors.Is(err, fs.ErrPermission) {
+	if err := f.inFakeRoot("EnsureRootDir", dir); err != nil {
 		return err
 	}
-	return nil
+	return os.MkdirAll(dir, mode)
 }
 
 func (f *fakeSystem) CopyTree(src, dst string) error {
 	f.calls = append(f.calls, "CopyTree:"+src+"->"+dst)
+	if err := f.inFakeRoot("CopyTree", dst); err != nil {
+		return err
+	}
 	return copyTreeForTest(src, dst)
 }
 
 func (f *fakeSystem) Rename(old, new string) error {
 	f.calls = append(f.calls, "Rename:"+old+"->"+new)
+	if err := f.inFakeRoot("Rename", old, new); err != nil {
+		return err
+	}
 	return os.Rename(old, new)
 }
 
@@ -1477,6 +1484,9 @@ func (f *fakeSystem) RemoveTree(path string) error {
 		if under(p) {
 			delete(f.owners, p)
 		}
+	}
+	if err := f.inFakeRoot("RemoveTree", path); err != nil {
+		return err
 	}
 	return os.RemoveAll(path)
 }
@@ -1858,7 +1868,7 @@ func TestLogDirIsNotWorldReadable(t *testing.T) {
 	})
 
 	t.Run("install ensures the log dir", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		if err := Install(context.Background(), f, Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"}); err != nil {
 			t.Fatalf("Install: %v", err)
 		}
@@ -1871,7 +1881,7 @@ func TestLogDirIsNotWorldReadable(t *testing.T) {
 // ORDER: ensure _k3sm → copy binary root-owned → write both plists → bootstrap
 // netd BEFORE server → write the admin kubeconfig to the HUMAN (not root).
 func TestInstallOrchestration(t *testing.T) {
-	f := &fakeSystem{}
+	f := newFakeSystem(t)
 	cfg := Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"}
 	if err := Install(context.Background(), f, cfg); err != nil {
 		t.Fatalf("Install: %v", err)
@@ -2183,7 +2193,7 @@ func TestEnsureServiceUserCreatesTheConfiguredDataRoot(t *testing.T) {
 			if want == "" {
 				want = tc.dataRoot
 			}
-			f := &fakeSystem{}
+			f := newFakeSystem(t)
 			cfg := Config{BinarySource: "/tmp/k3sm", TargetUser: "alice", DataRoot: tc.dataRoot}
 			if err := Install(context.Background(), f, cfg); err != nil {
 				t.Fatalf("Install: %v", err)
@@ -2221,7 +2231,7 @@ func TestEnsureServiceUserCreatesTheConfiguredDataRoot(t *testing.T) {
 // with the unrecoverable "Missing executable". The installer must request the
 // EXACT installedBinary() destination regardless of the artifact's name.
 func TestInstallBinaryLandsAtFixedPath(t *testing.T) {
-	f := &fakeSystem{}
+	f := newFakeSystem(t)
 	cfg := Config{BinarySource: "/tmp/build/k3sm-m2", TargetUser: "alice"}
 	if err := Install(context.Background(), f, cfg); err != nil {
 		t.Fatalf("Install: %v", err)
@@ -2946,11 +2956,11 @@ func TestUninstallManifestCoversInstall(t *testing.T) {
 	cfg := Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"}
 	dc := cfg.withDefaults()
 
-	inst := &fakeSystem{}
+	inst := newFakeSystem(t)
 	if err := Install(context.Background(), inst, cfg); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
-	uninst := &fakeSystem{}
+	uninst := newFakeSystem(t)
 	if err := Uninstall(context.Background(), uninst, cfg); err != nil {
 		t.Fatalf("Uninstall: %v", err)
 	}
@@ -3106,7 +3116,7 @@ func TestUninstallManifestCoversInstall(t *testing.T) {
 	})
 
 	t.Run("idempotency: a second uninstall over removed state returns nil", func(t *testing.T) {
-		second := &fakeSystem{}
+		second := newFakeSystem(t)
 		if err := Uninstall(context.Background(), second, cfg); err != nil {
 			t.Errorf("second Uninstall must be a no-op success (partial-install recovery), got %v", err)
 		}
@@ -3161,7 +3171,7 @@ func TestInstallLinksK3smOntoPath(t *testing.T) {
 	})
 
 	t.Run("install links after the binary lands and before any daemon starts", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		if err := Install(context.Background(), f, cfg); err != nil {
 			t.Fatalf("Install: %v", err)
 		}
@@ -3190,7 +3200,7 @@ func TestInstallLinksK3smOntoPath(t *testing.T) {
 	})
 
 	t.Run("uninstall unlinks before the InstallDir sweep removes the target", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		if err := Uninstall(context.Background(), f, cfg); err != nil {
 			t.Fatalf("Uninstall: %v", err)
 		}
@@ -3390,7 +3400,7 @@ func TestEnsureSymlinkNamesTheRemedyForAnUntrustedLinkDir(t *testing.T) {
 	// The ordering half: a refused launcher directory must stop the install
 	// before it has written anything at all.
 	t.Run("a refused launcher dir leaves nothing on disk", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		f.putLinkDirTrust("/usr/local/bin/k3sm", fmt.Errorf("refusing to link the k3sm launcher into /usr/local/bin: it is owned by uid 501, not root"))
 		err := Install(context.Background(), f, Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"})
 		if err == nil {
@@ -3411,7 +3421,7 @@ func TestEnsureSymlinkNamesTheRemedyForAnUntrustedLinkDir(t *testing.T) {
 	// ...and the preflight is a READ, so a healthy Mac — including one being
 	// reinstalled over — passes it and proceeds, twice.
 	t.Run("a healthy install records the read and proceeds", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		cfg := Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"}
 		for _, run := range []string{"install", "reinstall"} {
 			before := len(f.calls)
@@ -3460,7 +3470,7 @@ func TestInstallRemovesTheLeftoverZot(t *testing.T) {
 		present bool
 	}{{"present", true}, {"absent", false}} {
 		t.Run(tc.name, func(t *testing.T) {
-			f := &fakeSystem{}
+			f := newFakeSystem(t)
 			cfg := Config{BinarySource: "/tmp/build/k3sm", TargetUser: "alice"}
 			bin := filepath.Join(cfg.withDefaults().serverWorkDir(), "bin")
 			if tc.present {
@@ -3484,7 +3494,7 @@ func TestInstallRemovesTheLeftoverZot(t *testing.T) {
 	}
 	t.Run("an install that fails keeps it for the release it reverts to", func(t *testing.T) {
 		cfg := Config{BinarySource: "/tmp/build/k3sm", TargetUser: "alice"}
-		f := &fakeSystem{bootstrapAlways: map[string]error{"io.k3sm.server": errors.New("refused")}}
+		f := (&fakeSystem{bootstrapAlways: map[string]error{"io.k3sm.server": errors.New("refused")}}).rootedIn(t)
 		if err := Install(context.Background(), f, cfg); err == nil {
 			t.Fatal("Install succeeded with the server refusing to bootstrap")
 		}
@@ -3495,7 +3505,7 @@ func TestInstallRemovesTheLeftoverZot(t *testing.T) {
 	t.Run("a failed removal does not fail the install", func(t *testing.T) {
 		cfg := Config{BinarySource: "/tmp/build/k3sm", TargetUser: "alice"}
 		bin := filepath.Join(cfg.withDefaults().serverWorkDir(), "bin")
-		f := &fakeSystem{removeEntryErrs: map[string]error{filepath.Join(bin, registrysvc.ZotBinaryName): errors.New("busy")}}
+		f := (&fakeSystem{removeEntryErrs: map[string]error{filepath.Join(bin, registrysvc.ZotBinaryName): errors.New("busy")}}).rootedIn(t)
 		if err := Install(context.Background(), f, cfg); err != nil {
 			t.Fatalf("Install: %v", err)
 		}
@@ -3505,10 +3515,10 @@ func TestInstallRemovesTheLeftoverZot(t *testing.T) {
 		work := cfg.withDefaults().serverWorkDir()
 		bin := filepath.Join(work, "bin")
 		zot := filepath.Join(bin, registrysvc.ZotBinaryName)
-		f := &fakeSystem{
+		f := (&fakeSystem{
 			owners: map[string]OwnedEntry{work: {Path: work, Kind: EntrySymlink}},
 			files:  map[string][]byte{zot: []byte("zot")},
-		}
+		}).rootedIn(t)
 		if err := Install(context.Background(), f, cfg); err != nil {
 			t.Fatalf("Install: %v", err)
 		}
@@ -3532,7 +3542,7 @@ func TestInstallStagesTheHelmMarker(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(payload, helmchart.HelmMarkerName), []byte(marker), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	f := &fakeSystem{}
+	f := newFakeSystem(t)
 	cfg := Config{BinarySource: "/tmp/build/k3sm", TargetUser: "alice", PayloadSource: payload}
 	if err := Install(context.Background(), f, cfg); err != nil {
 		t.Fatalf("Install: %v", err)

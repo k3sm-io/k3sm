@@ -129,7 +129,7 @@ func TestServerInstallSeedsNetdNodePodCIDRFromMeshIP(t *testing.T) {
 	for _, tc := range refused[:4] {
 		for _, source := range []string{"explicit", "carried"} {
 			t.Run("Install refuses "+source+" "+tc.name, func(t *testing.T) {
-				f := &fakeSystem{}
+				f := newFakeSystem(t)
 				cfg := testConfig(t)
 				if source == "explicit" {
 					cfg.MeshIP = tc.mesh
@@ -148,7 +148,7 @@ func TestServerInstallSeedsNetdNodePodCIDRFromMeshIP(t *testing.T) {
 	}
 
 	t.Run("an install with a valid --mesh-ip writes the seeded netd plist", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		cfg := testConfig(t)
 		cfg.MeshIP = "100.64.1.1"
 		if err := Install(context.Background(), f, cfg); err != nil {

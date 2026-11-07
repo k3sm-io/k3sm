@@ -42,7 +42,7 @@ func TestAgentInstallRemovesOnlyTheLeftoverServerKubeconfig(t *testing.T) {
 	}
 	shrinkRestartBudgets(t)
 	stage := func() *fakeSystem {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		seedJoinedAgent(t, f)
 		f.putFile(leftover, []byte("admin"))
 		for _, p := range neighbours {
@@ -73,7 +73,7 @@ func TestAgentInstallRemovesOnlyTheLeftoverServerKubeconfig(t *testing.T) {
 		}
 	})
 	t.Run("an agent install with nothing left over succeeds", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		seedJoinedAgent(t, f)
 		if err := Install(context.Background(), f, agentCfg(t)); err != nil {
 			t.Fatalf("Install: %v", err)

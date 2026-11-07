@@ -74,7 +74,7 @@ func TestDeveloperModeStuckMarkerLeavesNoSignedTree(t *testing.T) {
 	live, staging := DefaultInstallDir, DefaultInstallDir+installSwapSuffix
 
 	t.Run("a first install moves the new tree out of the install root", func(t *testing.T) {
-		f := &fakeSystem{owners: map[string]OwnedEntry{}}
+		f := (&fakeSystem{owners: map[string]OwnedEntry{}}).rootedIn(t)
 		stuckMarker(t, f)
 		err := Install(context.Background(), f, offCfg())
 		if err == nil {
@@ -97,7 +97,7 @@ func TestDeveloperModeStuckMarkerLeavesNoSignedTree(t *testing.T) {
 	})
 
 	t.Run("a first install whose move aside fails says the tree is still there", func(t *testing.T) {
-		f := &fakeSystem{owners: map[string]OwnedEntry{}}
+		f := (&fakeSystem{owners: map[string]OwnedEntry{}}).rootedIn(t)
 		stuckMarker(t, f)
 		err := Install(context.Background(), &failingSwap{fakeSystem: f, n: 1}, offCfg())
 		if err == nil {
@@ -111,7 +111,7 @@ func TestDeveloperModeStuckMarkerLeavesNoSignedTree(t *testing.T) {
 	})
 
 	t.Run("a failed rollback says developer mode is still on", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		if err := Install(context.Background(), f, stageCfg()); err != nil {
 			t.Fatalf("first Install: %v", err)
 		}
@@ -150,7 +150,7 @@ func TestDeveloperModeStuckMarkerLeavesNoSignedTree(t *testing.T) {
 // both reported.
 func TestInstallReportsUnreadableMarkerBesideKubeconfigError(t *testing.T) {
 	shrinkRestartBudgets(t)
-	f := &fakeSystem{owners: map[string]OwnedEntry{}}
+	f := (&fakeSystem{owners: map[string]OwnedEntry{}}).rootedIn(t)
 	putUnclearableMarker(t, f, EntryRegular)
 	f.readModeErrs = map[string]error{DeveloperModeMarkerPath: errors.New("EIO reading the marker")}
 	f.kubeconfigErr = errors.New("home directory is read-only")
@@ -178,7 +178,7 @@ func TestDeveloperModeStuckMarkerWithdrawIsOneWay(t *testing.T) {
 	shrinkRestartBudgets(t)
 	live, staging := DefaultInstallDir, DefaultInstallDir+installSwapSuffix
 	planted := staging + "/planted"
-	f := &fakeSystem{owners: map[string]OwnedEntry{}}
+	f := (&fakeSystem{owners: map[string]OwnedEntry{}}).rootedIn(t)
 	stuckMarker(t, f)
 	f.calls = nil
 	occupy := &occupyAfterPublish{fakeSystem: f, path: planted}

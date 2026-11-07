@@ -52,7 +52,7 @@ const (
 func stoppableNode(t *testing.T) (*fakeSystem, Config, *bytes.Buffer) {
 	t.Helper()
 	shrinkRestartBudgets(t)
-	f := &fakeSystem{}
+	f := newFakeSystem(t)
 	// A pinned clock: the vm helper stop measures its waits from one start, so
 	// the asserted waits are exact only on a clock that does not move.
 	pinned := time.Unix(1_700_000_000, 0)

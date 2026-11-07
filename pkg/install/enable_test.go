@@ -150,7 +150,7 @@ func TestInstallEnablesADisabledService(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			shrinkRestartBudgets(t)
-			f := reinstallFake()
+			f := reinstallFake(t)
 			tc.setup(f)
 			tc.check(t, f, Install(context.Background(), f, installCfg()))
 		})

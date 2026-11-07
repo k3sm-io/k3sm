@@ -75,7 +75,7 @@ func TestInstallGatesOnVMHostEntitlement(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			f := &fakeSystem{}
+			f := newFakeSystem(t)
 			f.putEntitlement(src, tc.probe)
 			err := Install(context.Background(), f, Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"})
 
@@ -145,7 +145,7 @@ func TestInstallVerifiesTheVMHostBeforeWritingTheRoot(t *testing.T) {
 	}
 
 	t.Run("an entitlement refusal writes nothing", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		f.putEntitlement(src, fmt.Errorf("signature grants no %s", VirtualizationEntitlement))
 		err := Install(context.Background(), f, Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"})
 		if err == nil {
@@ -162,7 +162,7 @@ func TestInstallVerifiesTheVMHostBeforeWritingTheRoot(t *testing.T) {
 	})
 
 	t.Run("no override still installs", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		if err := Install(context.Background(), f, Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"}); err != nil {
 			t.Fatalf("Install: %v", err)
 		}
@@ -172,7 +172,7 @@ func TestInstallVerifiesTheVMHostBeforeWritingTheRoot(t *testing.T) {
 	})
 
 	t.Run("a missing helper still installs", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		f.putEntitlement(src, fmt.Errorf("stat %s: %w", src, fs.ErrNotExist))
 		if err := Install(context.Background(), f, Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"}); err != nil {
 			t.Fatalf("Install: %v, want success (a missing helper is not this gate's business)", err)
@@ -183,7 +183,7 @@ func TestInstallVerifiesTheVMHostBeforeWritingTheRoot(t *testing.T) {
 	})
 
 	t.Run("a carried retired datastore flag refuses with zero copies", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		cfg := testConfig(t)
 
 		configureServerArgs(f, cfg, "--datastore-endpoint-file", "/var/lib/k3sm/server/datastore-endpoint")
