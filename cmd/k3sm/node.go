@@ -261,6 +261,11 @@ type nodeOptions struct {
 	// With no cluster registry mapped there is no fallback: the vm capability
 	// is withheld and the reason logged.
 	guestFromClusterStore bool
+	// registryStoreRoot is the root of the registry store this machine serves,
+	// set by `k3sm server` when its registry started; the runtime's puller
+	// clones a blob already there instead of fetching it. Empty on an agent
+	// and a standalone `k3sm node`, which fetch every blob.
+	registryStoreRoot string
 
 	// deniedLocalPorts are loopback-only TCP ports every pod's SBPL denies
 	// connect() to — this node's EFFECTIVE kine (etcd shim) port, so a networked
@@ -1916,6 +1921,8 @@ func runtimedConfig(opts nodeOptions, cs kubernetes.Interface) provider.Runtimed
 		LocalRegistryHost: opts.localRegistryHost,
 		// The cluster's one registry name, mapped to where this node reaches it.
 		FlatRegistry: opts.flatRegistry.mapping(),
+		// This server's own registry store, offered blob by blob before a fetch.
+		RegistryStoreRoot: opts.registryStoreRoot,
 		// Wire the process default logger so the runtimed provider is not SILENT: it
 		// otherwise falls back to a DiscardHandler, dropping pod-lifecycle + cluster-DNS
 		// wiring logs the operator needs (server.log had no provider lines at all).

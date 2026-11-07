@@ -17,6 +17,11 @@ pin, its date, and the tarball's sha256.
   each, the layer digests the pin's). A re-publish uploads nothing already present and leaves a tag
   that already names the manifest alone; a failed publish is logged and retried with backoff and never
   delays the server's start. See [the `vm` RuntimeClass](docs/user/vm-runtimeclass.md#using-it).
+- On the server, an image pull now copies a layer the cluster registry already holds from the
+  registry's own store, as a copy-on-write clone on the same volume, instead of fetching it over the
+  network. The runtime re-hashes the clone and falls back to the normal pull when the store is on
+  another volume, does not hold the layer, or holds a copy whose bytes do not match. Agents fetch as
+  before. `k3sm install` creates the runtime's clone staging directory, `/var/lib/k3sm/.local-stage`.
 - `k3sm model ls [-o json]` lists the models in the cluster registry with their weight format,
   quantization, parameter size, total size, file count and weight shard count, read from each model's
   manifest and config without fetching its files. `k3sm model push` copies the quantization and

@@ -47,6 +47,7 @@ import (
 	"k3sm.io/darwin-net/pkg/podnet"
 	"k3sm.io/darwin-net/pkg/tcpseg"
 	"k3sm.io/k3sm/pkg/gpucapacity"
+	"k3sm.io/k3sm/pkg/ociregistry/store"
 	"k3sm.io/k3sm/pkg/provider/podlogs"
 	"k3sm.io/k3sm/pkg/provider/vkadapter"
 	"k3sm.io/k3sm/pkg/version"
@@ -663,6 +664,13 @@ type RuntimedConfig struct {
 	// contract is runtimed/pkg/image's FlatRegistry; the zero value maps nothing,
 	// and runtimed refuses an invalid mapping at construction.
 	FlatRegistry image.FlatRegistry
+	// RegistryStoreRoot is the root of the registry store this node serves the
+	// cluster registry from, set only by a server whose registry started. The
+	// image puller then offers each blob to that store before fetching it
+	// (store.LocalBlobSource): a blob already there is cloned and re-hashed
+	// instead of copied over the network. "" (an agent, a standalone node, a
+	// server with no registry) fetches every blob, as before.
+	RegistryStoreRoot string
 	// GuestArtifacts is this node's ENSURED, digest-verified guest boot artifact
 	// set — the kernel, the initramfs and the cmdline a vm pod boots from.
 	// It is DATA, already materialised by GuestArtifactSource.Ensure before this
@@ -833,34 +841,7 @@ func NewRuntimed(ctx context.Context, cfg RuntimedConfig) (*runtimedRuntime, err
 	deps.ClusterRegistries = cfg.ClusterRegistries
 	deps.LocalRegistryHost = cfg.LocalRegistryHost
 	deps.FlatRegistry = cfg.FlatRegistry
-	rt, err := runtimed.New(runtimed.Config{
-		Root:           cfg.Root,
-		RuntimeVersion: version.Get().Version,
-		Logger:         log,
-		// Scope each pod's Seatbelt egress to the cluster DNS + API VIPs so a
-		// confined pod's DNS and in-pod client-go reach the node-local resolver /
-		// API VIP. runtimed threads these into its per-pod sandbox.Posture.
-		ResolverVIP:  cfg.ResolverVIP,
-		APIServerVIP: cfg.APIServerVIP,
-		// The container-log root, threaded so runtimed's Seatbelt profile denies
-		// every confined pod read AND write access to the tree its own output is
-		// written into. It is REQUIRED by runtimed and deliberately has no default
-		// there: a deny rendered for /var/log/pods on a node whose logs actually
-		// live under a `k3sm dev` instance directory protects nothing while
-		// reading like protection. Resolved here through the same expression the
-		// provider's own tree uses, so the denied path and the written path are
-		// one value.
-		PodLogsDir: podLogsDirOf(cfg),
-		// The status records' real location, denied beside <Root>/status. On a
-		// default node the two are one path and the profile does not change.
-		StatusRecordDir: statusRecordDir,
-		// The control-plane state's real location, denied beside <Root>/server
-		// and <Root>/agent. On a default node the two are one path and the profile
-		// does not change.
-		DataRoot:     dataRoot,
-		PathShimPath: cfg.PathShim,
-		ShadowBinDir: cfg.ShadowBinDir,
-	}, deps)
+	rt, err := runtimed.New(runtimedConfigOf(cfg, log, statusRecordDir, dataRoot), deps)
 	if err != nil {
 		if errors.Is(err, sandbox.ErrInvalidStatusRecordDir) {
 			log.Error("refusing to start: pods could write the status records", "err", err)
@@ -912,6 +893,53 @@ func NewRuntimed(ctx context.Context, cfg RuntimedConfig) (*runtimedRuntime, err
 	// the pod is created again.
 	r.adoptNodePods(ctx, rt)
 	return r, nil
+}
+
+// runtimedConfigOf is the runtimed.Config NewRuntimed builds the runtime with,
+// from cfg, its logger and the two directories NewRuntimed has already
+// validated.
+func runtimedConfigOf(cfg RuntimedConfig, log *slog.Logger, statusRecordDir, dataRoot string) runtimed.Config {
+	return runtimed.Config{
+		Root:           cfg.Root,
+		RuntimeVersion: version.Get().Version,
+		Logger:         log,
+		// Scope each pod's Seatbelt egress to the cluster DNS + API VIPs so a
+		// confined pod's DNS and in-pod client-go reach the node-local resolver /
+		// API VIP. runtimed threads these into its per-pod sandbox.Posture.
+		ResolverVIP:  cfg.ResolverVIP,
+		APIServerVIP: cfg.APIServerVIP,
+		// The container-log root, threaded so runtimed's Seatbelt profile denies
+		// every confined pod read AND write access to the tree its own output is
+		// written into. It is REQUIRED by runtimed and deliberately has no default
+		// there: a deny rendered for /var/log/pods on a node whose logs actually
+		// live under a `k3sm dev` instance directory protects nothing while
+		// reading like protection. Resolved here through the same expression the
+		// provider's own tree uses, so the denied path and the written path are
+		// one value.
+		PodLogsDir: podLogsDirOf(cfg),
+		// The status records' real location, denied beside <Root>/status. On a
+		// default node the two are one path and the profile does not change.
+		StatusRecordDir: statusRecordDir,
+		// The control-plane state's real location, denied beside <Root>/server
+		// and <Root>/agent. On a default node the two are one path and the profile
+		// does not change.
+		DataRoot:     dataRoot,
+		PathShimPath: cfg.PathShim,
+		ShadowBinDir: cfg.ShadowBinDir,
+		// The node's own registry store, offered to the puller blob by blob. Set
+		// on a server that runs the registry; nil everywhere else.
+		LocalBlobSource: localBlobSourceOf(cfg),
+	}
+}
+
+// localBlobSourceOf returns the registry store cfg names as a local blob
+// source, or nil (an untyped nil, so runtimed sees no source at all) when cfg
+// names none.
+func localBlobSourceOf(cfg RuntimedConfig) image.LocalBlobSource {
+	if cfg.RegistryStoreRoot == "" {
+		return nil
+	}
+	return store.NewLocalBlobSource(cfg.RegistryStoreRoot)
 }
 
 // refsOf returns the podRefManager resolver reads Secrets and ConfigMaps
