@@ -902,67 +902,101 @@ func TestEnsureOwnedDirRefusesASymlink(t *testing.T) {
 }
 
 // TestEnsureDirOwnedRefusesSwappedSymlink drives ensureDirOwnedBy against a real
-// filesystem, including a symlink swapped in after MkdirAll (through the
-// afterDirCreate hook) — the window a check-then-chmod-by-path leaves open and
-// the descriptor-bound fchown/fchmod closes. Every case owns to the test
-// process's own uid/gid, a permitted no-op chown, so a refusal is the guard's
-// and never an EPERM; every refusal must leave the decoy directory's mode as it
-// was.
+// filesystem, including a symlink swapped in after MkdirAll (the afterDirCreate
+// hook) — the window a check-then-chmod-by-path leaves open — and one swapped in
+// after the open (the afterDirOpen hook), which must not redirect the fchmod:
+// it lands on the opened directory, now renamed away. Every case owns to the
+// test process's own uid/gid, a permitted no-op chown, so a refusal is the
+// guard's and never an EPERM; every case must leave the decoy's mode as it was.
 func TestEnsureDirOwnedRefusesSwappedSymlink(t *testing.T) {
-	const want, decoyMode = 0o710, 0o755
+	const decoyMode = 0o755
+	setHook := func(t *testing.T, hook *func(string), f func(string)) {
+		prev := *hook
+		*hook = f
+		t.Cleanup(func() { *hook = prev })
+	}
+	swapForSymlink := func(t *testing.T, dir, decoy, movedTo string) func(string) {
+		return func(string) {
+			var err error
+			if movedTo == "" {
+				err = os.Remove(dir)
+			} else {
+				err = os.Rename(dir, movedTo)
+			}
+			if err != nil {
+				t.Error(err)
+			}
+			if err := os.Symlink(decoy, dir); err != nil {
+				t.Error(err)
+			}
+		}
+	}
 	cases := []struct {
 		name string
-		// setup prepares the tree under root and returns the path to ensure; it
-		// may set swap to run between MkdirAll and the open.
-		setup   func(t *testing.T, root, decoy string) (dir string, swap func(string))
-		wantErr bool
+		mode fs.FileMode
+		// setup prepares the tree under root, may install hooks, and returns the
+		// path to ensure and the directory that must end up with mode (empty
+		// when the call must be refused).
+		setup       func(t *testing.T, root, decoy string) (dir, applied string)
+		wantErr     bool
+		wantSymlink bool
 	}{
-		{"fresh dir is created with the mode", func(t *testing.T, root, _ string) (string, func(string)) {
-			return filepath.Join(root, "fresh"), nil
-		}, false},
-		{"existing dir with a wrong mode is repaired", func(t *testing.T, root, _ string) (string, func(string)) {
-			dir := filepath.Join(root, "existing")
-			mkdir(t, dir, 0o777)
-			return dir, nil
-		}, false},
-		{"final component a symlink to another dir", func(t *testing.T, root, decoy string) (string, func(string)) {
-			dir := filepath.Join(root, "link")
-			if err := os.Symlink(decoy, dir); err != nil {
-				t.Fatal(err)
-			}
-			return dir, nil
-		}, true},
-		{"symlink swapped in after MkdirAll", func(t *testing.T, root, decoy string) (string, func(string)) {
-			return filepath.Join(root, "swapped"), func(dir string) {
-				if err := os.Remove(dir); err != nil {
-					t.Error(err)
-				}
+		{name: "fresh dir is created with the mode", mode: 0o710,
+			setup: func(t *testing.T, root, _ string) (string, string) {
+				dir := filepath.Join(root, "fresh")
+				return dir, dir
+			}},
+		{name: "existing dir with a wrong mode is repaired", mode: 0o710,
+			setup: func(t *testing.T, root, _ string) (string, string) {
+				dir := filepath.Join(root, "existing")
+				mkdir(t, dir, 0o777)
+				return dir, dir
+			}},
+		{name: "setgid bit lands on the directory", mode: fs.ModeSetgid | 0o2750,
+			setup: func(t *testing.T, root, _ string) (string, string) {
+				dir := filepath.Join(root, "setgid")
+				mkdir(t, dir, 0o700)
+				return dir, dir
+			}},
+		{name: "final component a symlink to another dir", mode: 0o710, wantErr: true, wantSymlink: true,
+			setup: func(t *testing.T, root, decoy string) (string, string) {
+				dir := filepath.Join(root, "link")
 				if err := os.Symlink(decoy, dir); err != nil {
-					t.Error(err)
+					t.Fatal(err)
 				}
-			}
-		}, true},
-		{"regular file at the path", func(t *testing.T, root, _ string) (string, func(string)) {
-			path := filepath.Join(root, "file")
-			if err := os.WriteFile(path, nil, 0o644); err != nil {
-				t.Fatal(err)
-			}
-			return path, nil
-		}, true},
+				return dir, ""
+			}},
+		{name: "symlink swapped in after MkdirAll", mode: 0o710, wantErr: true, wantSymlink: true,
+			setup: func(t *testing.T, root, decoy string) (string, string) {
+				dir := filepath.Join(root, "swapped")
+				setHook(t, &afterDirCreate, swapForSymlink(t, dir, decoy, ""))
+				return dir, ""
+			}},
+		{name: "symlink swapped in after the open", mode: 0o710,
+			setup: func(t *testing.T, root, decoy string) (string, string) {
+				dir := filepath.Join(root, "opened")
+				moved := filepath.Join(root, "opened-moved")
+				mkdir(t, dir, 0o777)
+				setHook(t, &afterDirOpen, swapForSymlink(t, dir, decoy, moved))
+				return dir, moved
+			}},
+		{name: "regular file at the path", mode: 0o710, wantErr: true,
+			setup: func(t *testing.T, root, _ string) (string, string) {
+				path := filepath.Join(root, "file")
+				if err := os.WriteFile(path, nil, 0o644); err != nil {
+					t.Fatal(err)
+				}
+				return path, ""
+			}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
 			decoy := filepath.Join(root, "decoy")
 			mkdir(t, decoy, decoyMode)
-			dir, swap := tc.setup(t, root, decoy)
-			if swap != nil {
-				prev := afterDirCreate
-				afterDirCreate = swap
-				t.Cleanup(func() { afterDirCreate = prev })
-			}
+			dir, applied := tc.setup(t, root, decoy)
 
-			err := ensureDirOwnedBy(dir, os.Getuid(), os.Getgid(), want)
+			err := ensureDirOwnedBy(dir, os.Getuid(), os.Getgid(), tc.mode)
 			assertMode(t, decoy, decoyMode)
 			if tc.wantErr {
 				if err == nil {
@@ -971,19 +1005,25 @@ func TestEnsureDirOwnedRefusesSwappedSymlink(t *testing.T) {
 				if !strings.Contains(err.Error(), dir) {
 					t.Errorf("error %q does not name %s", err, dir)
 				}
+				if tc.wantSymlink && !errors.Is(err, errSymlinkRefused) {
+					t.Errorf("error %q is not the symlink refusal", err)
+				}
 				return
 			}
 			if err != nil {
 				t.Fatalf("ensureDirOwnedBy(%s): %v", dir, err)
 			}
-			fi, err := os.Lstat(dir)
+			fi, err := os.Lstat(applied)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if !fi.IsDir() {
-				t.Fatalf("%s is %v, want a directory", dir, fi.Mode())
+				t.Fatalf("%s is %v, want a directory", applied, fi.Mode())
 			}
-			assertMode(t, dir, want)
+			const bits = fs.ModePerm | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky
+			if got := fi.Mode() & bits; got != tc.mode&bits {
+				t.Errorf("%s mode = %v, want %v", applied, got, tc.mode&bits)
+			}
 		})
 	}
 }

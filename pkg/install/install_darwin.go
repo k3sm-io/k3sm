@@ -1371,7 +1371,9 @@ func ensureRootOwnedDir(dir string, mode fs.FileMode) error {
 // path that already exists (a symlink included), and a check by lstat followed
 // by a chown/chmod by path leaves a window in which the directory can be swapped
 // for a symlink whose target root would then chmod. Bound to the descriptor, the
-// fchown and fchmod land on the inode the fstat checked, or nowhere.
+// fchown and fchmod land on the inode the fstat checked, or nowhere. Only the
+// final component is guarded: the parent components are trusted, as they are
+// root-owned on every path this is called with.
 func ensureDirOwnedBy(dir string, uid, gid int, mode fs.FileMode) error {
 	if err := os.MkdirAll(dir, mode); err != nil {
 		return fmt.Errorf("create %s: %w", dir, err)
@@ -1385,6 +1387,7 @@ func ensureDirOwnedBy(dir string, uid, gid int, mode fs.FileMode) error {
 		return fmt.Errorf("open %s: %w", dir, err)
 	}
 	defer func() { _ = unix.Close(fd) }() // read-only descriptor; nothing to flush
+	afterDirOpen(dir)
 	var st unix.Stat_t
 	if err := unix.Fstat(fd, &st); err != nil {
 		return fmt.Errorf("stat %s: %w", dir, err)
@@ -1396,16 +1399,38 @@ func ensureDirOwnedBy(dir string, uid, gid int, mode fs.FileMode) error {
 		return fmt.Errorf("chown %s to %d:%d: %w", dir, uid, gid, err)
 	}
 	// MkdirAll skips an existing directory, so the fchmod is what repairs one.
-	if err := unix.Fchmod(fd, uint32(mode.Perm())); err != nil {
+	if err := unix.Fchmod(fd, syscallMode(mode)); err != nil {
 		return fmt.Errorf("chmod %s %#o: %w", dir, mode, err)
 	}
 	return nil
+}
+
+// syscallMode converts an fs.FileMode to the chmod(2) bits the way os.Chmod
+// does: the permission bits plus setuid, setgid and sticky, which Perm() drops.
+func syscallMode(mode fs.FileMode) uint32 {
+	m := uint32(mode.Perm())
+	if mode&fs.ModeSetuid != 0 {
+		m |= unix.S_ISUID
+	}
+	if mode&fs.ModeSetgid != 0 {
+		m |= unix.S_ISGID
+	}
+	if mode&fs.ModeSticky != 0 {
+		m |= unix.S_ISVTX
+	}
+	return m
 }
 
 // afterDirCreate runs between ensureDirOwnedBy's MkdirAll and its open. It is a
 // no-op in production; a test sets it to swap the directory for a symlink in
 // exactly the window a path-based chmod would follow one through.
 var afterDirCreate = func(string) {}
+
+// afterDirOpen runs between ensureDirOwnedBy's open and its fchown. It is a
+// no-op in production; a test sets it to swap the path after the open, proving
+// the owner and mode land on the opened directory and not on what the path
+// names by then.
+var afterDirOpen = func(string) {}
 
 // isSymlinkAt reports whether path is itself a symlink. It only words an open
 // failure: whether O_NOFOLLOW|O_DIRECTORY refuses a symlink with ELOOP or
