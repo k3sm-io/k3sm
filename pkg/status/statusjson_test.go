@@ -58,7 +58,7 @@ var (
 	// networkRequired are the keys of the optional network object.
 	networkRequired = []string{"lan", "recorded", "covers", "alwaysOn"}
 	// networkOptional are the optional keys of the network object.
-	networkOptional = []string{"recordState", "applied", "appliedReadable"}
+	networkOptional = []string{"recordState", "expiresAt", "applied", "appliedReadable"}
 	// networkAppliedRequired / Optional are the keys of network.applied.
 	networkAppliedRequired = []string{"lan", "serial"}
 	networkAppliedOptional = []string{"error"}
