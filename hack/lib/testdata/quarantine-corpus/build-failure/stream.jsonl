@@ -1,0 +1,6 @@
+{"ImportPath":"k3sm.io/apis/net/v1 [k3sm.io/apis/net/v1.test]","Action":"build-output","Output":"# k3sm.io/apis/net/v1 [k3sm.io/apis/net/v1.test]\n"}
+{"ImportPath":"k3sm.io/apis/net/v1 [k3sm.io/apis/net/v1.test]","Action":"build-output","Output":"net/v1/x.go:1:1: syntax error\n"}
+{"ImportPath":"k3sm.io/apis/net/v1 [k3sm.io/apis/net/v1.test]","Action":"build-fail"}
+{"Action":"start","Package":"k3sm.io/apis/net/v1"}
+{"Action":"output","Package":"k3sm.io/apis/net/v1","Output":"FAIL\tk3sm.io/apis/net/v1 [build failed]\n"}
+{"Action":"fail","Package":"k3sm.io/apis/net/v1","Elapsed":0,"FailedBuild":"k3sm.io/apis/net/v1 [k3sm.io/apis/net/v1.test]"}

@@ -1,0 +1,2 @@
+# quarantine registry for this corpus case
+just some words

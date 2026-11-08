@@ -1,0 +1,10 @@
+{
+  "description": "A Test field that is an empty array is malformed, not a package-level event: red.",
+  "edited": [],
+  "tests": {
+    "k3sm.io/apis/net/v1::TestA": "passed"
+  },
+  "tier": "affected",
+  "today": "2026-10-30",
+  "verdict": "red"
+}

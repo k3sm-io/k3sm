@@ -1,0 +1,10 @@
+{
+  "description": "go test -count=2: the first run passes and only logs text equal to the recorded signature, the second fails for another reason. A passing run's output is not the recorded failure, so it reds.",
+  "edited": [],
+  "tests": {
+    "k3sm.io/apis/net/v1::TestFlake": "failed"
+  },
+  "tier": "affected",
+  "today": "2026-10-30",
+  "verdict": "red"
+}

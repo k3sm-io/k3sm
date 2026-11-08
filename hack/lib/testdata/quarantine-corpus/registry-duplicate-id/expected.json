@@ -1,0 +1,10 @@
+{
+  "description": "The same test listed twice: red.",
+  "edited": [],
+  "tests": {
+    "k3sm.io/apis/net/v1::TestA": "passed"
+  },
+  "tier": "affected",
+  "today": "2026-10-30",
+  "verdict": "red"
+}

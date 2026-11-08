@@ -1,0 +1,12 @@
+{
+  "description": "The leaf is listed and fails with its signature; its unlisted parent writes nothing but the harness's framing, so it fails only through the leaf and both are excused.",
+  "edited": [],
+  "tests": {
+    "k3sm.io/apis/net/v1::TestParent": "excused",
+    "k3sm.io/apis/net/v1::TestParent/a": "excused",
+    "k3sm.io/apis/net/v1::TestParent/b": "passed"
+  },
+  "tier": "affected",
+  "today": "2026-10-30",
+  "verdict": "excused"
+}

@@ -1,0 +1,11 @@
+{
+  "description": "An unlisted test fails; another listed test passes: red.",
+  "edited": [],
+  "tests": {
+    "k3sm.io/apis/net/v1::TestBroken": "failed",
+    "k3sm.io/apis/net/v1::TestFlake": "passed"
+  },
+  "tier": "affected",
+  "today": "2026-10-30",
+  "verdict": "red"
+}
