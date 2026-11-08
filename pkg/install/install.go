@@ -2760,6 +2760,9 @@ func uninstall(ctx context.Context, sys System, cfg Config, preflight func(m []a
 	// scope stands in: uninstall is the last chance to clear these aliases.
 	flush := recordedFlushPrefixes(sys, cfg)
 	if flush.err != nil {
+		if flush.refused != "" {
+			cfg.Logger.Warn("the installed netd plist records a refused Service range; the uninstall configuration's range is flushed instead", "source", flush.source, "refused", flush.refused, "err", flush.err)
+		}
 		flush = configFlushPrefixes(cfg)
 	}
 	for i := len(m) - 1; i >= 0; i-- {

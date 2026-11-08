@@ -2425,7 +2425,7 @@ func (darwinSystem) RemoveAll(path string) error {
 // the flush continues, so one stuck alias never strands the rest; removing an
 // address that vanished between list and remove is tolerated.
 func (darwinSystem) FlushLo0Aliases(prefixes []netip.Prefix) error {
-	out, err := exec.Command("ifconfig", "lo0").CombinedOutput()
+	out, err := exec.Command(ifconfigPath, "lo0").CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("ifconfig lo0: %w\n%s", err, out)
 	}
@@ -2450,7 +2450,7 @@ func (darwinSystem) FlushLo0Aliases(prefixes []netip.Prefix) error {
 		if !owned {
 			continue
 		}
-		if rmOut, err := exec.Command("ifconfig", "lo0", "-alias", ip.String()).CombinedOutput(); err != nil {
+		if rmOut, err := exec.Command(ifconfigPath, "lo0", "-alias", ip.String()).CombinedOutput(); err != nil {
 			errs = append(errs, fmt.Errorf("ifconfig lo0 -alias %s: %w\n%s", ip, err, rmOut))
 		}
 	}
