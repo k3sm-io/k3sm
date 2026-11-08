@@ -22,6 +22,7 @@ import (
 	"errors"
 	"net/netip"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -108,6 +109,12 @@ func TestLanStatusReportsLANReachableListeners(t *testing.T) {
 			err:     errors.New("lsof exploded"),
 			want:    []string{"LAN listeners: unknown, the check failed (list this Mac's listening sockets: lsof exploded)."},
 			notWant: []string{otherHeading, k3smHeading},
+		},
+		{
+			name:    "the failure text is sanitized and capped",
+			err:     errors.New("bad\x1b[31m" + strings.Repeat("x", 300)),
+			want:    []string{"LAN listeners: unknown, the check failed (list this Mac's listening sockets: bad?[31m" + strings.Repeat("x", errorMaxLen-len("list this Mac's listening sockets: bad?[31m")) + ")."},
+			notWant: []string{"\x1b", otherHeading},
 		},
 		{
 			name:    "an over-cap table yields the named line",
@@ -203,6 +210,9 @@ func TestLsofSocketTableExposureParse(t *testing.T) {
 		{"bad port", "p1\nf3\nPTCP\nn*:http\n"},
 		{"bad address", "p1\nf3\nPTCP\nnlocalhost:80\n"},
 		{"empty line", "p1\n\n"},
+		{"unknown protocol", "p1\nf3\nPSCTP\nn*:80\n"},
+		{"lowercase protocol", "p1\nf3\nPtcp\nn*:80\n"},
+		{"name without a protocol", "p1\nf3\nn*:80\n"},
 	}
 	for _, tc := range bad {
 		t.Run(tc.name, func(t *testing.T) {
@@ -215,6 +225,22 @@ func TestLsofSocketTableExposureParse(t *testing.T) {
 		in := "p1\n" + strings.Repeat("f3\nPTCP\nn*:80\n", lsofMaxLines/3+1)
 		if _, err := parseLsofSocketTable([]byte(in)); !errors.Is(err, errLsofTooLarge) {
 			t.Errorf("err = %v, want %v", err, errLsofTooLarge)
+		}
+	})
+	t.Run("exit 1 is an empty table only with nothing on stdout or stderr", func(t *testing.T) {
+		exit1 := exec.Command("/usr/bin/false").Run()
+		var ee *exec.ExitError
+		if !errors.As(exit1, &ee) || ee.ExitCode() != 1 {
+			t.Fatalf("/usr/bin/false: %v, want exit 1", exit1)
+		}
+		if socks, err := lsofResult(nil, nil, exit1); err != nil || socks != nil {
+			t.Errorf("silent exit 1 = %v, %v; want an empty table", socks, err)
+		}
+		if _, err := lsofResult(nil, []byte("lsof: WARNING: can't stat()"), exit1); err == nil {
+			t.Error("exit 1 with stderr text read as a clean empty table")
+		}
+		if _, err := lsofResult([]byte("p1\n"), nil, exit1); err == nil {
+			t.Error("exit 1 with stdout read as a clean table")
 		}
 	})
 	t.Run("capped buffer flags overflow", func(t *testing.T) {

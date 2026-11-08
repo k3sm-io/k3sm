@@ -56,8 +56,16 @@ const (
 	lanClassOther = "other"
 )
 
-// commandMaxLen bounds a command name in the text report.
-const commandMaxLen = 32
+// commandMaxLen bounds a command name in the text report; errorMaxLen bounds
+// the failure text of the check.
+const (
+	commandMaxLen = 32
+	errorMaxLen   = 200
+)
+
+// lsofWaitDelay bounds how long lsof's output pipes may stay open after it
+// exits or is killed.
+const lsofWaitDelay = time.Second
 
 // lanSocket is one row of this Mac's socket table: a TCP listening socket or
 // a bound UDP socket, its owning process (and that process's parent) and its
@@ -106,7 +114,7 @@ func lanExposureFor(ctx context.Context, env networkEnv, role install.Role) lanE
 		return e
 	}
 	fail := func(err error) lanExposure {
-		e.Error = err.Error()
+		e.Error = sanitizePrintable(err.Error(), errorMaxLen)
 		return e
 	}
 	pid, err := env.Sys.LaunchctlServicePID(nodeLabel(role))
@@ -199,12 +207,15 @@ func lanReachable(socks []lanSocket, owned []int, excluded []netip.Prefix) []lan
 	return out
 }
 
-// sanitizeCommand makes a process-chosen command name safe to print: bytes
-// outside printable ASCII become '?', and it is cut to commandMaxLen.
-func sanitizeCommand(c string) string {
+// sanitizeCommand makes a process-chosen command name safe to print.
+func sanitizeCommand(c string) string { return sanitizePrintable(c, commandMaxLen) }
+
+// sanitizePrintable makes text from outside this program safe to print:
+// bytes outside printable ASCII become '?', and it is cut to max bytes.
+func sanitizePrintable(c string, max int) string {
 	b := []byte(c)
-	if len(b) > commandMaxLen {
-		b = b[:commandMaxLen]
+	if len(b) > max {
+		b = b[:max]
 	}
 	for i, ch := range b {
 		if ch < 0x20 || ch > 0x7e {
@@ -221,7 +232,7 @@ func (e lanExposure) lines() []string {
 	case e.NeedsRoot:
 		return []string{"LAN listeners: unknown to this user (the check needs root: run 'sudo k3sm network lan status')."}
 	case e.Error != "":
-		return []string{fmt.Sprintf("LAN listeners: unknown, the check failed (%s).", e.Error)}
+		return []string{fmt.Sprintf("LAN listeners: unknown, the check failed (%s).", sanitizePrintable(e.Error, errorMaxLen))}
 	}
 	var out []string
 	for _, b := range []struct{ class, heading string }{
@@ -265,8 +276,7 @@ func (c *cappedBuffer) Write(p []byte) (int, error) {
 // lsofSocketTable is the production socket table: every TCP listening socket
 // and bound UDP socket on this Mac with its pid, parent pid, command and
 // protocol, read with lsof as root by absolute path, with an empty
-// environment, a time bound and an output cap. lsof exiting 1 with no output
-// means none.
+// environment, a time bound and an output cap.
 func lsofSocketTable(ctx context.Context) ([]lanSocket, error) {
 	ctx, cancel := context.WithTimeout(ctx, lsofTimeout)
 	defer cancel()
@@ -275,25 +285,34 @@ func lsofSocketTable(ctx context.Context) ([]lanSocket, error) {
 	stdout := &cappedBuffer{max: lsofMaxBytes}
 	stderr := &cappedBuffer{max: 4096}
 	cmd.Stdout, cmd.Stderr = stdout, stderr
+	cmd.WaitDelay = lsofWaitDelay
 	err := cmd.Run()
 	if stdout.over {
 		return nil, fmt.Errorf("%w (%d bytes)", errLsofTooLarge, lsofMaxBytes)
 	}
+	return lsofResult(stdout.buf.Bytes(), stderr.buf.Bytes(), err)
+}
+
+// lsofResult turns one lsof run (its stdout, stderr and exit error) into the
+// socket table. lsof exiting 1 with no output and nothing on stderr means no
+// sockets; any other failure, or any stderr text with exit 1, is an error.
+func lsofResult(stdout, stderr []byte, err error) ([]lanSocket, error) {
 	if err != nil {
 		var ee *exec.ExitError
-		if errors.As(err, &ee) && ee.ExitCode() == 1 && stdout.buf.Len() == 0 {
+		if errors.As(err, &ee) && ee.ExitCode() == 1 && len(stdout) == 0 && len(stderr) == 0 {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("%s: %w: %s", lsofPath, err, strings.TrimSpace(stderr.buf.String()))
+		return nil, fmt.Errorf("%s: %w: %s", lsofPath, err, strings.TrimSpace(string(stderr)))
 	}
-	return parseLsofSocketTable(stdout.buf.Bytes())
+	return parseLsofSocketTable(stdout)
 }
 
 // parseLsofSocketTable parses lsof -F pRcPn output: a "p<pid>" line opens a
 // process set, "R<ppid>" and "c<command>" describe it, and each file in it is
 // an "f<fd>" line, a "P<protocol>" line and an "n<name>" line. A name is
 // "<host>:<port>", "*" being the wildcard and an IPv6 host in brackets; a
-// connected UDP socket's "->peer" is dropped, and a UDP socket with no port
+// connected UDP socket's "->peer" is dropped. The protocol must be TCP or
+// UDP and precede the name, and a UDP socket with no port
 // yet ("*:*") is skipped. Any other line, or more than
 // lsofMaxLines lines, is an error, so a format change never reads as a clean
 // table.
@@ -329,10 +348,15 @@ func parseLsofSocketTable(out []byte) ([]lanSocket, error) {
 		case 'f':
 			proto = ""
 		case 'P':
-			proto = line[1:]
+			if proto = line[1:]; proto != "TCP" && proto != "UDP" {
+				return nil, fmt.Errorf("lsof: unexpected protocol line %q", line)
+			}
 		case 'n':
 			if cur.PID == 0 {
 				return nil, fmt.Errorf("lsof: socket %q before any process", line[1:])
+			}
+			if proto == "" {
+				return nil, fmt.Errorf("lsof: socket %q without a protocol", line[1:])
 			}
 			local, bound, err := parseLsofName(line[1:])
 			if err != nil {
