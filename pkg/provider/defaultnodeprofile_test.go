@@ -84,6 +84,14 @@ func TestDefaultNodeProfileGolden(t *testing.T) {
 		DeniedLocalPorts:      []int{executor.DefaultKinePort},
 	}
 
+	// dataRootOf resolves the default work dir on disk when it exists, so a host
+	// where it is a symlink renders a different, still valid, state dir deny. The
+	// golden pins the host where it is absent or a plain directory.
+	if resolved, err := filepath.EvalSymlinks(workDir); err == nil && resolved != workDir &&
+		filepath.Join("/private", workDir) != resolved {
+		t.Skipf("%s resolves to %s on this host; the golden pins an unlinked work dir", workDir, resolved)
+	}
+
 	statusDir, err := statusRecordDirOf(cfg)
 	if err != nil {
 		t.Fatalf("statusRecordDirOf: %v", err)
