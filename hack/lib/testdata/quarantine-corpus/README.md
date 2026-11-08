@@ -25,3 +25,11 @@ Each case is a directory holding:
     disagreement is resolved, so a fix there reds until the entry is removed.
 
 A new case needs no code change: add the directory and every copy picks it up.
+
+Most streams are hand-built. The cases listed in `../gen/main.go` are real
+`go test -json -count=N` output of the fixtures in `../gen/fixtures`, with
+durations zeroed and only the fields the readers parse kept. Regenerate them
+with `(cd hack/lib && go run ./testdata/gen)`; `TestGeneratedCorpusStreams`
+reds when a committed stream differs from what the generator writes. A real
+stream carries `=== PAUSE` and `=== CONT` lines (and `pause` and `cont`
+events) but never an `=== NAME` line, which test2json consumes.

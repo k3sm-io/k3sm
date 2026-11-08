@@ -1,0 +1,37 @@
+{"Action":"start","Package":"k3sm.io/apis/net/v1"}
+{"Action":"run","Package":"k3sm.io/apis/net/v1","Test":"TestParent"}
+{"Action":"output","Package":"k3sm.io/apis/net/v1","Test":"TestParent","Output":"=== RUN   TestParent\n"}
+{"Action":"run","Package":"k3sm.io/apis/net/v1","Test":"TestParent/a"}
+{"Action":"output","Package":"k3sm.io/apis/net/v1","Test":"TestParent/a","Output":"=== RUN   TestParent/a\n"}
+{"Action":"output","Package":"k3sm.io/apis/net/v1","Test":"TestParent/a","Output":"=== PAUSE TestParent/a\n"}
+{"Action":"pause","Package":"k3sm.io/apis/net/v1","Test":"TestParent/a"}
+{"Action":"run","Package":"k3sm.io/apis/net/v1","Test":"TestParent/b"}
+{"Action":"output","Package":"k3sm.io/apis/net/v1","Test":"TestParent/b","Output":"=== RUN   TestParent/b\n"}
+{"Action":"output","Package":"k3sm.io/apis/net/v1","Test":"TestParent/b","Output":"--- PASS: TestParent/b (0.00s)\n"}
+{"Action":"pass","Package":"k3sm.io/apis/net/v1","Test":"TestParent/b"}
+{"Action":"cont","Package":"k3sm.io/apis/net/v1","Test":"TestParent/a"}
+{"Action":"output","Package":"k3sm.io/apis/net/v1","Test":"TestParent/a","Output":"=== CONT  TestParent/a\n"}
+{"Action":"output","Package":"k3sm.io/apis/net/v1","Test":"TestParent/a","Output":"    x_test.go:33: read udp 127.0.0.1: i/o timeout\n"}
+{"Action":"output","Package":"k3sm.io/apis/net/v1","Test":"TestParent/a","Output":"--- FAIL: TestParent/a (0.00s)\n"}
+{"Action":"fail","Package":"k3sm.io/apis/net/v1","Test":"TestParent/a"}
+{"Action":"output","Package":"k3sm.io/apis/net/v1","Test":"TestParent","Output":"--- FAIL: TestParent (0.00s)\n"}
+{"Action":"fail","Package":"k3sm.io/apis/net/v1","Test":"TestParent"}
+{"Action":"run","Package":"k3sm.io/apis/net/v1","Test":"TestParent"}
+{"Action":"output","Package":"k3sm.io/apis/net/v1","Test":"TestParent","Output":"=== RUN   TestParent\n"}
+{"Action":"run","Package":"k3sm.io/apis/net/v1","Test":"TestParent/a"}
+{"Action":"output","Package":"k3sm.io/apis/net/v1","Test":"TestParent/a","Output":"=== RUN   TestParent/a\n"}
+{"Action":"output","Package":"k3sm.io/apis/net/v1","Test":"TestParent/a","Output":"=== PAUSE TestParent/a\n"}
+{"Action":"pause","Package":"k3sm.io/apis/net/v1","Test":"TestParent/a"}
+{"Action":"run","Package":"k3sm.io/apis/net/v1","Test":"TestParent/b"}
+{"Action":"output","Package":"k3sm.io/apis/net/v1","Test":"TestParent/b","Output":"=== RUN   TestParent/b\n"}
+{"Action":"output","Package":"k3sm.io/apis/net/v1","Test":"TestParent/b","Output":"--- PASS: TestParent/b (0.00s)\n"}
+{"Action":"pass","Package":"k3sm.io/apis/net/v1","Test":"TestParent/b"}
+{"Action":"cont","Package":"k3sm.io/apis/net/v1","Test":"TestParent/a"}
+{"Action":"output","Package":"k3sm.io/apis/net/v1","Test":"TestParent/a","Output":"=== CONT  TestParent/a\n"}
+{"Action":"output","Package":"k3sm.io/apis/net/v1","Test":"TestParent/a","Output":"--- PASS: TestParent/a (0.00s)\n"}
+{"Action":"pass","Package":"k3sm.io/apis/net/v1","Test":"TestParent/a"}
+{"Action":"output","Package":"k3sm.io/apis/net/v1","Test":"TestParent","Output":"--- PASS: TestParent (0.00s)\n"}
+{"Action":"pass","Package":"k3sm.io/apis/net/v1","Test":"TestParent"}
+{"Action":"output","Package":"k3sm.io/apis/net/v1","Output":"FAIL\n"}
+{"Action":"output","Package":"k3sm.io/apis/net/v1","Output":"FAIL\tk3sm.io/apis/net/v1\t0.00s\n"}
+{"Action":"fail","Package":"k3sm.io/apis/net/v1"}
