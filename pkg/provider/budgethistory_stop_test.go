@@ -19,7 +19,9 @@ package provider
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -30,6 +32,8 @@ import (
 
 	budgetv1alpha1 "k3sm.io/apis/budget/v1alpha1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
+
+	"k3sm.io/k3sm/internal/atomicfile"
 )
 
 // fileEvictions reads the history file in dir and returns band's eviction total.
@@ -117,6 +121,98 @@ func TestBudgetHistoryStopOutwaitsTheFinalFlush(t *testing.T) {
 	if BudgetHistoryStopBound <= budgetHistoryFinalFlushBound {
 		t.Fatalf("BudgetHistoryStopBound %v must exceed budgetHistoryFinalFlushBound %v",
 			BudgetHistoryStopBound, budgetHistoryFinalFlushBound)
+	}
+}
+
+// TestBudgetHistoryStopJoinsAnAbandonedWrite: a write left running past its
+// bound is joined before the stop path returns, so nothing writes the work dir
+// once the teardown (or a test's TempDir cleanup) may remove it. Two paths
+// abandon a write: stop's own catch-up write with no writer (stop still
+// reports false at its bound), and the writer's final flush when its context
+// ends (joined by openHistory's cleanup, which is what flaked). The fake write
+// blocks until released, then writes for real and notes whether the join had
+// returned.
+//
+// The writer case ends the context rather than calling stop: stop would then
+// queue its own catch-up write on wmu behind the held one, and a goroutine
+// parked on a mutex is not durably blocked, so the bubble's clock would stall.
+//
+// Fails-before: stop returned at its bound, and the cleanup as soon as the
+// writer had exited, with the write still in flight; it then wrote the file
+// after the join had returned ("unlinkat ...: directory not empty" in
+// TestBudgetHistoryNeverPodCountedOnce under load).
+func TestBudgetHistoryStopJoinsAnAbandonedWrite(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		writer bool
+	}{
+		{name: "stop's catch-up write"},
+		{name: "the writer's final flush", writer: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				dir := t.TempDir()
+				h := OpenBudgetHistory(dir, "fp", discardLog())
+				var armed, returned, late atomic.Bool
+				release := make(chan struct{})
+				setWrite(h, func(path string, data []byte, mode os.FileMode) error {
+					if armed.Load() {
+						<-release
+						late.Store(returned.Load())
+					}
+					return atomicfile.Replace(path, data, mode)
+				})
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				if tc.writer {
+					h.start(ctx)
+					// The first write goes through at once; the next change is
+					// then held by the rate limit, so only the final flush
+					// writes it.
+					h.record("", budgetv1alpha1.BandBatch, budgetv1alpha1.CounterEviction, time.Now())
+					synctest.Wait()
+				}
+				armed.Store(true)
+				h.record("", budgetv1alpha1.BandBatch, budgetv1alpha1.CounterEviction, time.Now())
+				done := make(chan bool, 1)
+				bound := BudgetHistoryStopBound
+				go func() {
+					ok := false
+					if tc.writer {
+						cancel()
+						h.joinWrites()
+					} else {
+						ok = h.stop(bound)
+					}
+					returned.Store(true)
+					done <- ok
+				}()
+				// Past the bound every goroutine is parked: the write on
+				// release, and the join either on that write or returned.
+				advanceBubble(bound)
+				synctest.Wait()
+				early := returned.Load()
+				close(release)
+				ok := <-done
+				synctest.Wait()
+				if early {
+					t.Error("the stop path returned while the write it abandoned was still in flight")
+				}
+				if late.Load() {
+					t.Error("a write ran after the stop path had returned")
+				}
+				if ok {
+					t.Error("stop reported success with its write held past the bound")
+				}
+				want := int64(1)
+				if tc.writer {
+					want = 2
+				}
+				if got := fileEvictions(t, dir, budgetv1alpha1.BandBatch); got != want {
+					t.Errorf("the file holds evictions=%d after the stop path, want %d", got, want)
+				}
+			})
+		})
 	}
 }
 

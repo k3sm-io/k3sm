@@ -62,12 +62,14 @@ func openHistory(t *testing.T, dir, fingerprint string) *BudgetHistory {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	h.start(ctx)
-	// The writer's exit is bounded by its own final-flush bound, so the join
-	// needs no timer of its own: a writer that never stops hangs the test, a
-	// deadlock synctest reports inside a bubble and -timeout reports outside one.
+	// The join needs no timer of its own: a writer or write that never stops
+	// hangs the test, a deadlock synctest reports inside a bubble and -timeout
+	// reports outside one.
 	t.Cleanup(func() {
 		cancel()
-		<-h.stopped
+		// Join a final flush left running past its bound too, so it does not
+		// write into dir while TempDir's cleanup removes it.
+		h.joinWrites()
 	})
 	return h
 }
