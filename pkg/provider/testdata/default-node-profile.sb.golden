@@ -1,0 +1,157 @@
+;; k3sm per-pod Seatbelt profile — GENERATED, do not edit.
+;; Default-deny; runs a native pod process at host paths (no chroot).
+;; Rule order is last-match-wins: OS/extra allows, THEN protected
+;; denies (so extra paths can't override them), THEN narrow re-allows.
+(version 1)
+(deny default)
+(import "system.sb")
+(allow process-exec*)
+(allow process-fork)
+(allow signal (target children))
+(allow signal (target pgrp))
+;; read: OS + frameworks + validated extra read paths.
+(allow file-read*
+  (subpath "/Library")
+  (subpath "/Library/k3sm/libk3sm_getaddrinfo_shim.dylib")
+  (subpath "/Library/k3sm/libk3sm_pathrebase_shim.dylib")
+  (subpath "/System")
+  (subpath "/bin")
+  (subpath "/usr")
+  (literal "/dev/null") (literal "/dev/zero")
+  (literal "/dev/random") (literal "/dev/urandom"))
+;; read: the node's re-signed shell copies (also under the /Library
+;; baseline above; explicit so narrowing that cannot break them).
+(allow file-read* (subpath "/Library/k3sm/shadow"))
+;; metadata: the /bin/sh dispatcher's readlink of its selection link.
+(allow file-read-metadata (literal "/private/var/select/sh"))
+;; read: the system TLS configuration (openssl.cnf, the CA bundle,
+;; certs/) — public, world-readable; read-only.
+(allow file-read*
+  (subpath "/etc/ssl")
+  (subpath "/private/etc/ssl")
+  )
+;; write: validated extra write paths (+ /dev/null); the pod's own
+;; data volume is re-allowed below, after the protected denies.
+(allow file-write*
+  (literal "/dev/null"))
+;; network: ALLOWED — unfiltered outbound+bind+inbound under (deny default).
+;; macOS 26 Seatbelt accepts only localhost/* hosts in network filters;
+;; per-IP scoping (VIP egress, per-pod-IP bind) does NOT compile.
+(allow network-outbound)
+(allow network-bind)
+(allow network-inbound)
+;; mach-lookup the DNS resolver path (mDNSResponder) needs.
+(allow mach-lookup
+  (global-name "com.apple.dnssd.service")
+  (global-name "com.apple.mDNSResponder"))
+;; POSIX semaphores: this pod's own names only (one host-wide namespace;
+;; the prefix filter is the whole isolation).
+(allow ipc-posix-sem (ipc-posix-name-prefix "/k3sm.02134b3f."))
+;; AF_UNIX: deny connect() to every container's resident shim.
+(deny network-outbound
+  (remote unix-socket (subpath "/var/lib/k3sm/run/shim"))
+  (remote unix-socket (subpath "/private/var/lib/k3sm/run/shim"))
+  )
+;; AF_UNIX: explicitly deny connect() to the privileged helper
+;; socket(s) — same-uid pods can't be kept off them any other way.
+(deny network-outbound
+  (remote unix-socket (literal "/var/lib/k3sm/run/netd.sock"))
+  (remote unix-socket (literal "/private/var/lib/k3sm/run/netd.sock"))
+  (remote unix-socket (literal "/var/lib/k3sm/run/runtimed.sock"))
+  (remote unix-socket (literal "/private/var/lib/k3sm/run/runtimed.sock"))
+  )
+;; loopback: deny outbound dials to the local listener port(s)
+;; the caller named — same-uid pods can't be kept off them
+;; any other way. `localhost` matches every host-owned address.
+(deny network-outbound (remote ip "localhost:2379"))
+;; PROTECTED: deny user homes, the secrets/state store, the shared
+;; pods root, the daemon-private reap stores and the control-plane
+;; and daemon-private trees (sibling dirs under the work-dir, named
+;; below) AND the node's container-log tree (every pod's output plus
+;; the symlink dir) — read+write, AFTER the allows so a caller's
+;; extra path (even an ancestor work-dir grant) can't win.
+;;   reap stores: podreap, vmreap
+;;   daemon trees: server, agent, run, blobs, status, sbpl, index,
+;;     operator, unpacked, snapshots, ingest, guest-artifacts,
+;;     artifact-partial, artifacts, vmboot-failures
+(deny file-read* file-write*
+  (subpath "/Users"))
+(deny file-read* file-write*
+  (subpath "/private/var/db"))
+;; TLS private-key dir: never readable, whatever the allows name.
+(deny file-read* file-write*
+  (subpath "/etc/ssl/private")
+  (subpath "/private/etc/ssl/private")
+  )
+(deny file-read* file-write*
+  (subpath "/var/lib/k3sm/pods")
+  (subpath "/private/var/lib/k3sm/pods")
+  (subpath "/var/lib/k3sm/podreap")
+  (subpath "/private/var/lib/k3sm/podreap")
+  (subpath "/var/lib/k3sm/vmreap")
+  (subpath "/private/var/lib/k3sm/vmreap")
+  (subpath "/var/lib/k3sm/server")
+  (subpath "/private/var/lib/k3sm/server")
+  (subpath "/var/lib/k3sm/agent")
+  (subpath "/private/var/lib/k3sm/agent")
+  (subpath "/var/lib/k3sm/run")
+  (subpath "/private/var/lib/k3sm/run")
+  (subpath "/var/lib/k3sm/blobs")
+  (subpath "/private/var/lib/k3sm/blobs")
+  (subpath "/var/lib/k3sm/status")
+  (subpath "/private/var/lib/k3sm/status")
+  (subpath "/var/lib/k3sm/sbpl")
+  (subpath "/private/var/lib/k3sm/sbpl")
+  (subpath "/var/lib/k3sm/index")
+  (subpath "/private/var/lib/k3sm/index")
+  (subpath "/var/lib/k3sm/operator")
+  (subpath "/private/var/lib/k3sm/operator")
+  (subpath "/var/lib/k3sm/unpacked")
+  (subpath "/private/var/lib/k3sm/unpacked")
+  (subpath "/var/lib/k3sm/snapshots")
+  (subpath "/private/var/lib/k3sm/snapshots")
+  (subpath "/var/lib/k3sm/ingest")
+  (subpath "/private/var/lib/k3sm/ingest")
+  (subpath "/var/lib/k3sm/guest-artifacts")
+  (subpath "/private/var/lib/k3sm/guest-artifacts")
+  (subpath "/var/lib/k3sm/artifact-partial")
+  (subpath "/private/var/lib/k3sm/artifact-partial")
+  (subpath "/var/lib/k3sm/artifacts")
+  (subpath "/private/var/lib/k3sm/artifacts")
+  (subpath "/var/lib/k3sm/vmboot-failures")
+  (subpath "/private/var/lib/k3sm/vmboot-failures")
+  (subpath "/var/log/pods")
+  (subpath "/private/var/log/pods")
+  (subpath "/var/log/containers")
+  (subpath "/private/var/log/containers")
+  )
+;; dyld cryptex: deny WRITE only (read is needed at link time).
+(deny file-write*
+  (subpath "/System/Volumes/Preboot/Cryptexes")
+  (subpath "/System/Cryptexes"))
+;; re-allow the dyld closure cache read the /private/var/db deny clobbers.
+(allow file-read*
+  (subpath "/private/var/db/dyld"))
+;; re-allow THIS pod's own data volume (under the denied pods root).
+(allow file-read* file-write*
+  (subpath "/var/lib/k3sm/pods/uid-web/rootfs")
+  (subpath "/private/var/lib/k3sm/pods/uid-web/rootfs")
+  )
+;; existence only: the strict ancestors of every re-allowed subtree, so a
+;; stat-walk (chdir/realpath canonicalization — swift-driver, swift-frontend)
+;; can descend to it. Metadata on directories, one literal per node: never a
+;; subpath (a subpath on the pods root would reach every sibling pod), never
+;; file-read-data (no listing).
+(allow file-read-metadata
+  (literal "/var")
+  (literal "/var/lib")
+  (literal "/var/lib/k3sm")
+  (literal "/var/lib/k3sm/pods")
+  (literal "/var/lib/k3sm/pods/uid-web")
+  (literal "/private")
+  (literal "/private/var")
+  (literal "/private/var/lib")
+  (literal "/private/var/lib/k3sm")
+  (literal "/private/var/lib/k3sm/pods")
+  (literal "/private/var/lib/k3sm/pods/uid-web")
+  )
