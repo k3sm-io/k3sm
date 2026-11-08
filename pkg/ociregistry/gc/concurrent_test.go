@@ -159,6 +159,12 @@ func run(fns ...func() error) error {
 // tag of an old untagged manifest) in goroutines while sweeps run in
 // another, many times over. Every tagged image stays whole and no row
 // dangles, and the sweeps do reap old garbage meanwhile.
+//
+// That a sweep reaps during the pushes is made sure of, not hoped for: in even
+// iterations the pushes start only once the first sweep has marked src's
+// garbage (as TestRemoveLayoutRacesAPush does), so they contend with a locked
+// pass that holds a plan to reap, and the test runs further iterations, up to
+// maxIterations, until some sweep has reaped a blob.
 func TestConcurrentPushesAndSweeps(t *testing.T) {
 	e := newEnv(t)
 	s2 := e.secondStore(t)
@@ -171,7 +177,7 @@ func TestConcurrentPushesAndSweeps(t *testing.T) {
 	c := e.collector(t, -3*time.Hour)
 	e.ran(t)
 
-	const iterations = 6
+	const iterations, maxIterations = 6, 60
 	var tagged []struct {
 		n   ref.Name
 		tag string
@@ -186,7 +192,8 @@ func TestConcurrentPushesAndSweeps(t *testing.T) {
 	}
 	var mu sync.Mutex
 	reapedBlobs := 0
-	for i := range iterations {
+	i := 0
+	for ; i < iterations || (reapedBlobs == 0 && i < maxIterations); i++ {
 		is := strconv.Itoa(i)
 		// Old garbage the sweeps will want: two orphan blobs and an
 		// untagged image, all past the grace.
@@ -196,11 +203,38 @@ func TestConcurrentPushesAndSweeps(t *testing.T) {
 		u := e.push(t, src, "", "untagged "+is, []byte("untagged layer "+is))
 		e.clk.set(0)
 
+		// In even iterations the pushes wait for the first sweep to mark
+		// src (or to end, should it plan nothing there); in odd ones they
+		// start with the sweeps.
+		even := i%2 == 0
+		marked, swept := make(chan struct{}), make(chan struct{})
+		if !even {
+			close(marked)
+		}
+		var once sync.Once
+		c.afterMark = func(m ref.Name) {
+			if m == src && even {
+				once.Do(func() { close(marked) })
+			}
+		}
+		gated := func(fn func() error) func() error {
+			return func() error {
+				select {
+				case <-marked:
+				case <-swept:
+				}
+				return fn()
+			}
+		}
+
 		results := make([]image, 4)
 		err := run(
 			func() error { // sweeps
-				for range 3 {
+				for j := range 3 {
 					rep, err := c.Sweep(e.ctx)
+					if j == 0 {
+						close(swept)
+					}
 					mu.Lock()
 					reapedBlobs += rep.Count(KindBlob)
 					mu.Unlock()
@@ -210,15 +244,15 @@ func TestConcurrentPushesAndSweeps(t *testing.T) {
 				}
 				return nil
 			},
-			func() error { // re-upload an old orphan and name it
+			gated(func() error { // re-upload an old orphan and name it
 				ls, err := pushWith(e, e.s, src, []byte("orphan a "+is), []byte(`{"cfg":"a`+is+`"}`))
 				if err != nil {
 					return err
 				}
 				results[0], err = tagImage(e, e.s, src, "a"+is, ls[1], []ispec.Descriptor{oa})
 				return err
-			},
-			func() error { // mount an old orphan from the second store and name it
+			}),
+			gated(func() error { // mount an old orphan from the second store and name it
 				if err := mountOrPush(e, s2, dst, src, ob, []byte("orphan b "+is)); err != nil {
 					return err
 				}
@@ -228,16 +262,16 @@ func TestConcurrentPushesAndSweeps(t *testing.T) {
 				}
 				results[1], err = tagImage(e, s2, dst, "b"+is, ls[0], []ispec.Descriptor{ob})
 				return err
-			},
-			func() error { // tag the old untagged image, its blobs uploaded again
+			}),
+			gated(func() error { // tag the old untagged image, its blobs uploaded again
 				if _, err := pushWith(e, s2, src, []byte(`{"seed":"untagged `+is+`"}`), []byte("untagged layer "+is)); err != nil {
 					return err
 				}
 				var err error
 				results[2], err = tagImage(e, s2, src, "u"+is, u.config, u.layers)
 				return err
-			},
-			func() error { // mount the tagged base into dst and name it
+			}),
+			gated(func() error { // mount the tagged base into dst and name it
 				for _, d := range append([]ispec.Descriptor{base.config}, base.layers...) {
 					if err := mountOrPush(e, e.s, dst, src, d, nil); err != nil {
 						return err
@@ -246,7 +280,7 @@ func TestConcurrentPushesAndSweeps(t *testing.T) {
 				var err error
 				results[3], err = tagImage(e, e.s, dst, "base"+is, base.config, base.layers)
 				return err
-			},
+			}),
 		)
 		if err != nil {
 			t.Fatalf("iteration %d: %v", i, err)
@@ -260,6 +294,7 @@ func TestConcurrentPushesAndSweeps(t *testing.T) {
 			t.Fatalf("iteration %d left a dangling row", i)
 		}
 	}
+	c.afterMark = nil
 	// Settle: the pushes are past the grace now; tags keep them.
 	e.clk.set(2 * time.Hour)
 	for range 2 {
@@ -283,9 +318,9 @@ func TestConcurrentPushesAndSweeps(t *testing.T) {
 		}
 	}
 	if reapedBlobs == 0 {
-		t.Fatal("no sweep reaped a blob: the sweeps never contended with garbage")
+		t.Fatalf("no sweep reaped a blob in %d iterations: the sweeps never contended with garbage", i)
 	}
-	t.Logf("%d iterations, %d blobs reaped during the pushes", iterations, reapedBlobs)
+	t.Logf("%d iterations, %d blobs reaped during the pushes", i, reapedBlobs)
 }
 
 // TestRemoveLayoutRacesAPush races a sweep that would remove an empty
