@@ -31,12 +31,14 @@ import (
 // TestAPIServerServiceRangeIsTheDefault pins. A different value would leave
 // the two disagreeing, so install refuses it before anything is written.
 func TestServiceCIDRFlagAgreesWithTheAPIServer(t *testing.T) {
-	base := func() Config { return Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"} }
+	base := func(t *testing.T) Config {
+		return Config{InstallDir: testInstallDir(t), BinarySource: "/tmp/k3sm", TargetUser: "alice"}
+	}
 
 	t.Run("a non-default range is refused before anything is written", func(t *testing.T) {
 		for _, role := range []Role{RoleServer, RoleAgent} {
-			f := &fakeSystem{}
-			cfg := base()
+			f := newFakeSystem(t)
+			cfg := base(t)
 			cfg.Role = role
 			if role == RoleAgent {
 				cfg.JoinServer = "192.168.1.10"
@@ -65,8 +67,8 @@ func TestServiceCIDRFlagAgreesWithTheAPIServer(t *testing.T) {
 
 	t.Run("the default range is accepted and reaches netd", func(t *testing.T) {
 		for _, svc := range []string{"", defaults.ServiceCIDR} {
-			f := &fakeSystem{}
-			cfg := base()
+			f := newFakeSystem(t)
+			cfg := base(t)
 			cfg.ServiceCIDR = svc
 			if err := Install(context.Background(), f, cfg); err != nil {
 				t.Fatalf("Install with --service-cidr %q: %v", svc, err)
@@ -83,8 +85,8 @@ func TestServiceCIDRFlagAgreesWithTheAPIServer(t *testing.T) {
 	})
 
 	t.Run("a worker still refuses the control-plane flags", func(t *testing.T) {
-		f := &fakeSystem{}
-		cfg := base()
+		f := newFakeSystem(t)
+		cfg := base(t)
 		cfg.Role = RoleAgent
 		cfg.JoinServer = "192.168.1.10"
 		cfg.ClusterInit = true

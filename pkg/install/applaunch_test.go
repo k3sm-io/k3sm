@@ -279,10 +279,10 @@ func TestInstallLaunchesTheAppHidden(t *testing.T) {
 
 	t.Run("launcher error: a server install still succeeds", func(t *testing.T) {
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		var logs bytes.Buffer
 		rec := &recordingLauncher{err: errors.New("open failed")}
-		cfg := Config{BinarySource: "/tmp/k3sm", TargetUser: "alice", AppLauncher: rec,
+		cfg := Config{InstallDir: testInstallDir(t), BinarySource: "/tmp/k3sm", TargetUser: "alice", AppLauncher: rec,
 			Logger: slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))}
 		if err := Install(context.Background(), f, cfg); err != nil {
 			t.Fatalf("Install: %v", err)
@@ -297,7 +297,7 @@ func TestInstallLaunchesTheAppHidden(t *testing.T) {
 
 	t.Run("an agent install (a join) opens the app", func(t *testing.T) {
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		seedJoinedAgent(t, f)
 		rec := &recordingLauncher{}
 		cfg := agentCfg(t)

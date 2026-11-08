@@ -259,7 +259,7 @@ func TestDeveloperModeMarkerOnInstall(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			f := &fakeSystem{owners: map[string]OwnedEntry{}, swapErr: tc.swapErr}
+			f := (&fakeSystem{owners: map[string]OwnedEntry{}, swapErr: tc.swapErr}).rootedIn(t)
 			if tc.onDisk != nil {
 				seedMarkerAncestors(f)
 				f.owners[DeveloperModeMarkerPath] = *tc.onDisk
@@ -269,7 +269,7 @@ func TestDeveloperModeMarkerOnInstall(t *testing.T) {
 				}
 			}
 			var logs strings.Builder
-			cfg := Config{BinarySource: src, TargetUser: "alice", Logger: slog.New(slog.NewTextHandler(&logs, nil))}
+			cfg := Config{InstallDir: testInstallDir(t), BinarySource: src, TargetUser: "alice", Logger: slog.New(slog.NewTextHandler(&logs, nil))}
 			cfg.DeveloperMode = tc.mode
 			cfg.Signer = tc.signer
 			err := Install(context.Background(), f, cfg)
@@ -288,7 +288,7 @@ func TestDeveloperModeMarkerOnInstall(t *testing.T) {
 				if !markerContent.Match(f.files[DeveloperModeMarkerPath]) {
 					t.Errorf("marker content %q is not the one fixed line", f.files[DeveloperModeMarkerPath])
 				}
-				if lock := slices.Index(f.calls, "LockInstall:/Library/k3sm.lock"); lock < 0 || lock > wrote {
+				if lock := slices.Index(f.calls, "LockInstall:"+cfg.installLockPath()); lock < 0 || lock > wrote {
 					t.Errorf("the marker was written before the install lock was taken: %v", f.calls)
 				}
 			}
@@ -335,8 +335,8 @@ func TestDeveloperModeMarkerOnInstall(t *testing.T) {
 
 	t.Run("a plain install with no flag and no Signer never looks at the marker", func(t *testing.T) {
 		t.Parallel()
-		f := &fakeSystem{}
-		if err := Install(context.Background(), f, Config{BinarySource: src, TargetUser: "alice"}); err != nil {
+		f := newFakeSystem(t)
+		if err := Install(context.Background(), f, Config{InstallDir: testInstallDir(t), BinarySource: src, TargetUser: "alice"}); err != nil {
 			t.Fatal(err)
 		}
 		for _, c := range f.calls {
@@ -348,8 +348,8 @@ func TestDeveloperModeMarkerOnInstall(t *testing.T) {
 
 	t.Run("an unknown mode is refused before any system call", func(t *testing.T) {
 		t.Parallel()
-		f := &fakeSystem{}
-		cfg := Config{BinarySource: src, TargetUser: "alice"}
+		f := newFakeSystem(t)
+		cfg := Config{InstallDir: testInstallDir(t), BinarySource: src, TargetUser: "alice"}
 		cfg.DeveloperMode = "maybe"
 		if err := Install(context.Background(), f, cfg); err == nil {
 			t.Fatal("Install accepted DeveloperMode \"maybe\"")
@@ -437,13 +437,13 @@ func TestDeveloperModeClearedByAnyDeveloperIDTeam(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			f := &fakeSystem{owners: map[string]OwnedEntry{}}
+			f := (&fakeSystem{owners: map[string]OwnedEntry{}}).rootedIn(t)
 			seedMarkerAncestors(f)
 			f.owners[DeveloperModeMarkerPath] = OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: 0o644}
 			f.putFile(DeveloperModeMarkerPath, []byte("developer mode enabled by k3sm install on 2026-10-31T00:00:00Z\n"))
 			requireMarkerOn(t, f)
 			var logs strings.Builder
-			cfg := Config{BinarySource: src, TargetUser: "alice", Logger: slog.New(slog.NewTextHandler(&logs, nil))}
+			cfg := Config{InstallDir: testInstallDir(t), BinarySource: src, TargetUser: "alice", Logger: slog.New(slog.NewTextHandler(&logs, nil))}
 			cfg.Signer = tc.signer
 			if err := Install(context.Background(), f, cfg); err != nil {
 				t.Fatalf("Install = %v", err)
@@ -484,13 +484,13 @@ func TestDeveloperModeKeptWhenDeveloperIDVerificationFails(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			f := &fakeSystem{owners: map[string]OwnedEntry{}}
+			f := (&fakeSystem{owners: map[string]OwnedEntry{}}).rootedIn(t)
 			seedMarkerAncestors(f)
 			f.owners[DeveloperModeMarkerPath] = OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: 0o644}
 			f.putFile(DeveloperModeMarkerPath, []byte("developer mode enabled by k3sm install on 2026-10-31T00:00:00Z\n"))
 			requireMarkerOn(t, f)
 			var logs strings.Builder
-			cfg := Config{BinarySource: src, TargetUser: "alice", Logger: slog.New(slog.NewTextHandler(&logs, nil))}
+			cfg := Config{InstallDir: testInstallDir(t), BinarySource: src, TargetUser: "alice", Logger: slog.New(slog.NewTextHandler(&logs, nil))}
 			cfg.Signer = tc.signer
 			if err := Install(context.Background(), f, cfg); err != nil {
 				t.Fatalf("Install = %v", err)
@@ -544,9 +544,9 @@ func TestDeveloperModeMarkerDroppedAsTheSwapCommits(t *testing.T) {
 		{name: "a team-signed install", sign: fakeSigner{ids: map[string]string{"/tmp/k3sm": testTeamID}}},
 	} {
 		t.Run(tc.name+" removes it before the wiring", func(t *testing.T) {
-			f := &fakeSystem{owners: map[string]OwnedEntry{}}
+			f := (&fakeSystem{owners: map[string]OwnedEntry{}}).rootedIn(t)
 			putMarker(t, f, 0o644)
-			cfg := stageCfg()
+			cfg := stageCfg(t)
 			cfg.DeveloperMode, cfg.Signer = tc.mode, tc.sign
 			if err := Install(context.Background(), f, cfg); err != nil {
 				t.Fatal(err)
@@ -565,15 +565,15 @@ func TestDeveloperModeMarkerDroppedAsTheSwapCommits(t *testing.T) {
 	}
 
 	t.Run("a revert restores the marker as it was", func(t *testing.T) {
-		f := &fakeSystem{}
-		if err := Install(context.Background(), f, stageCfg()); err != nil {
+		f := newFakeSystem(t)
+		if err := Install(context.Background(), f, stageCfg(t)); err != nil {
 			t.Fatalf("first Install: %v", err)
 		}
 		putMarker(t, f, 0o600)
 		f.putLoaded(NetdLabel, ServerLabel)
 		f.calls = nil
 		f.putBootstrapAlways(NetdLabel, errors.New("Bootstrap failed: 125: Domain does not support specified action"))
-		cfg := stageCfg()
+		cfg := stageCfg(t)
 		cfg.DeveloperMode = DeveloperModeOff
 		err := Install(context.Background(), f, cfg)
 		if err == nil || !strings.Contains(err.Error(), "rolled back to the previous install root") {
@@ -593,8 +593,8 @@ func TestDeveloperModeMarkerDroppedAsTheSwapCommits(t *testing.T) {
 	})
 
 	t.Run("an unreadable marker is removed and not restored on a revert", func(t *testing.T) {
-		f := &fakeSystem{}
-		if err := Install(context.Background(), f, stageCfg()); err != nil {
+		f := newFakeSystem(t)
+		if err := Install(context.Background(), f, stageCfg(t)); err != nil {
 			t.Fatalf("first Install: %v", err)
 		}
 		putMarker(t, f, 0o644)
@@ -603,7 +603,7 @@ func TestDeveloperModeMarkerDroppedAsTheSwapCommits(t *testing.T) {
 		f.calls = nil
 		f.putBootstrapAlways(NetdLabel, errors.New("Bootstrap failed: 125: Domain does not support specified action"))
 		var logs strings.Builder
-		cfg := stageCfg()
+		cfg := stageCfg(t)
 		cfg.DeveloperMode = DeveloperModeOff
 		cfg.Logger = slog.New(slog.NewTextHandler(&logs, nil))
 		err := Install(context.Background(), f, cfg)
@@ -625,9 +625,9 @@ func TestDeveloperModeMarkerDroppedAsTheSwapCommits(t *testing.T) {
 	})
 
 	t.Run("an unreadable marker on a successful install returns the read error", func(t *testing.T) {
-		f := &fakeSystem{owners: map[string]OwnedEntry{}, readModeErrs: map[string]error{DeveloperModeMarkerPath: errors.New("EIO")}}
+		f := (&fakeSystem{owners: map[string]OwnedEntry{}, readModeErrs: map[string]error{DeveloperModeMarkerPath: errors.New("EIO")}}).rootedIn(t)
 		putMarker(t, f, 0o644)
-		cfg := stageCfg()
+		cfg := stageCfg(t)
 		cfg.DeveloperMode = DeveloperModeOff
 		err := Install(context.Background(), f, cfg)
 		if err == nil || !strings.Contains(err.Error(), "EIO") {
@@ -639,9 +639,9 @@ func TestDeveloperModeMarkerDroppedAsTheSwapCommits(t *testing.T) {
 	})
 
 	t.Run("a removal that fails twice leaves the marker invalid", func(t *testing.T) {
-		f := &fakeSystem{owners: map[string]OwnedEntry{}, removeEntryErrs: map[string]error{DeveloperModeMarkerPath: errors.New("EPERM")}}
+		f := (&fakeSystem{owners: map[string]OwnedEntry{}, removeEntryErrs: map[string]error{DeveloperModeMarkerPath: errors.New("EPERM")}}).rootedIn(t)
 		putMarker(t, f, 0o644)
-		cfg := stageCfg()
+		cfg := stageCfg(t)
 		cfg.DeveloperMode = DeveloperModeOff
 		if err := Install(context.Background(), f, cfg); err != nil {
 			t.Fatalf("Install = %v, want success with the marker disowned", err)

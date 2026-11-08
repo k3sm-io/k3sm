@@ -43,7 +43,7 @@ func stoppedNodeOfRole(t *testing.T, role Role) (*fakeSystem, Config, *bytes.Buf
 		return f, cfg, logs
 	}
 	shrinkRestartBudgets(t)
-	f := &fakeSystem{}
+	f := newFakeSystem(t)
 	seedJoinedAgent(t, f)
 	var logs bytes.Buffer
 	cfg := agentCfg(t)
@@ -362,7 +362,7 @@ func TestUncordonPendingMarkerLifecycle(t *testing.T) {
 		if err := writeUncordonPending(f, cfg.withDefaults(), ActorUser, time.Now()); err != nil {
 			t.Fatal(err)
 		}
-		if err := Uninstall(ctx, f, Config{Logger: cfg.Logger}); err != nil {
+		if err := Uninstall(ctx, f, Config{Logger: cfg.Logger, InstallDir: cfg.InstallDir}); err != nil {
 			t.Fatalf("Uninstall: %v", err)
 		}
 		if uncordonPendingPresent(f, cfg.withDefaults()) {

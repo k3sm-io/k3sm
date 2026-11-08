@@ -38,6 +38,7 @@ import (
 func agentCfg(t *testing.T) Config {
 	t.Helper()
 	return Config{
+		InstallDir:       testInstallDir(t),
 		Role:             RoleAgent,
 		JoinServer:       "192.0.2.10",
 		NodeIP:           "100.64.0.7",
@@ -126,7 +127,7 @@ func seedJoinedAgent(t *testing.T, f *fakeSystem) string {
 func TestInstallRendersAgentDaemonWhenJoining(t *testing.T) {
 	t.Run("an agent install renders netd and io.k3sm.agent, never the server", func(t *testing.T) {
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		seedJoinedAgent(t, f)
 		cfg := agentCfg(t)
 		if err := Install(context.Background(), f, cfg); err != nil {
@@ -199,7 +200,7 @@ func TestInstallRendersAgentDaemonWhenJoining(t *testing.T) {
 
 	t.Run("the token is staged where the unprivileged daemon can read it", func(t *testing.T) {
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		joinToken := seedJoinedAgent(t, f)
 		cfg := agentCfg(t)
 		if err := Install(context.Background(), f, cfg); err != nil {
@@ -228,7 +229,7 @@ func TestInstallRendersAgentDaemonWhenJoining(t *testing.T) {
 
 	t.Run("an install with no token file stages nothing", func(t *testing.T) {
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		cfg := agentCfg(t)
 		cfg.TokenFile = ""
 		// A joined node reinstalling: it presents its stored credential, so
@@ -258,7 +259,7 @@ func TestInstallRendersAgentDaemonWhenJoining(t *testing.T) {
 
 	t.Run("an empty operator token file is refused", func(t *testing.T) {
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		f.putFile(operatorTokenFile, []byte("  \n"))
 		err := Install(context.Background(), f, agentCfg(t))
 		if err == nil {
@@ -271,7 +272,7 @@ func TestInstallRendersAgentDaemonWhenJoining(t *testing.T) {
 
 	t.Run("a token file that is not a join token is refused before anything is staged", func(t *testing.T) {
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		// A plausible mistake: the operator pasted the node-password, a
 		// kubeconfig line, or half a token. It can never complete a join, and
 		// it carries no cluster-CA pin — which is what the installer compares
@@ -300,7 +301,7 @@ func TestInstallRendersAgentDaemonWhenJoining(t *testing.T) {
 
 	t.Run("an operator token file anyone can read is refused", func(t *testing.T) {
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		seedOperatorToken(f)
 		// The same refusal `k3sm agent` applies to the file it is pointed at,
 		// applied to the source: copying a world-readable token into a 0600
@@ -322,7 +323,7 @@ func TestInstallRendersAgentDaemonWhenJoining(t *testing.T) {
 
 	t.Run("a staged token that never becomes a credential fails the install", func(t *testing.T) {
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		seedOperatorToken(f)
 		cfg := agentCfg(t)
 		// The daemon is up and the join never completes: a rejected token puts
@@ -342,7 +343,7 @@ func TestInstallRendersAgentDaemonWhenJoining(t *testing.T) {
 
 	t.Run("a join that produces a credential is a success", func(t *testing.T) {
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		seedJoinedAgent(t, f)
 		// The healthy first join: the node holds a credential for the cluster
 		// the staged token pins, and nothing was recorded against this install.
@@ -359,7 +360,7 @@ func TestInstallRendersAgentDaemonWhenJoining(t *testing.T) {
 
 	t.Run("the plist carries a token PATH and no token", func(t *testing.T) {
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		seedJoinedAgent(t, f)
 		cfg := agentCfg(t)
 		// The token exists on this Mac, in the operator's file and in the
@@ -383,7 +384,7 @@ func TestInstallRendersAgentDaemonWhenJoining(t *testing.T) {
 
 	t.Run("uninstall removes the agent daemon and keeps the record", func(t *testing.T) {
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		seedJoinedAgent(t, f)
 		cfg := agentCfg(t)
 		if err := Install(context.Background(), f, cfg); err != nil {
@@ -424,11 +425,11 @@ func TestInstallRendersAgentDaemonWhenJoining(t *testing.T) {
 		}{
 			{"agent over a server", ServerLabel, agentCfg, "server"},
 			{"server over an agent", AgentLabel, func(t *testing.T) Config {
-				return Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"}
+				return Config{InstallDir: testInstallDir(t), BinarySource: "/tmp/k3sm", TargetUser: "alice"}
 			}, "agent"},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
-				f := &fakeSystem{}
+				f := newFakeSystem(t)
 				cfg := tc.cfg(t)
 				f.putFile(cfg.withDefaults().plistPath(tc.onDisk), []byte("<plist/>"))
 				err := Install(context.Background(), f, cfg)
@@ -450,7 +451,7 @@ func TestInstallRendersAgentDaemonWhenJoining(t *testing.T) {
 
 	t.Run("the agent record round-trips across uninstall then install", func(t *testing.T) {
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		seedJoinedAgent(t, f)
 		cfg := agentCfg(t)
 		// An operator's own flag, arriving the only way one can: on the agent
@@ -480,7 +481,7 @@ func TestInstallRendersAgentDaemonWhenJoining(t *testing.T) {
 			if err := dataroot.ValidateAgentArgs([]string{"--token", theJoinToken}); err == nil {
 				t.Fatal("an agent-arguments record carrying --token was accepted")
 			}
-			bad := &fakeSystem{}
+			bad := newFakeSystem(t)
 			data, err := dataroot.EncodeAgentArgsRecord(dataroot.AgentArgsRecord{Args: []string{"--mesh-port", "51821"}})
 			if err != nil {
 				t.Fatalf("encode: %v", err)
@@ -750,7 +751,7 @@ func TestAgentInstallAdoptsLegacyRootOwnedFiles(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			shrinkRestartBudgets(t)
-			f := &fakeSystem{}
+			f := newFakeSystem(t)
 			seedOperatorToken(f)
 			for _, e := range tc.seed {
 				path := workDir

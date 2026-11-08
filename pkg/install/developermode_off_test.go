@@ -35,7 +35,7 @@ func devModeStagedInstall(t *testing.T, signer fakeSigner) (*fakeSystem, Config,
 	cfg.Signer = signer
 	var logs strings.Builder
 	cfg.Logger = slog.New(slog.NewTextHandler(&logs, nil))
-	f := &fakeSystem{owners: map[string]OwnedEntry{}}
+	f := (&fakeSystem{owners: map[string]OwnedEntry{}}).rootedIn(t)
 	seedMarkerAncestors(f)
 	f.owners[DeveloperModeMarkerPath] = OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: 0o644}
 	f.putFile(DeveloperModeMarkerPath, []byte("developer mode enabled by k3sm install on 2026-10-31T00:00:00Z\n"))

@@ -125,8 +125,8 @@ func TestMeshKeyDirLivesOutsideTheServiceUserRunDir(t *testing.T) {
 		}
 		// And the live install applies exactly those two rows.
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
-		if err := Install(context.Background(), f, serverCfg()); err != nil {
+		f := newFakeSystem(t)
+		if err := Install(context.Background(), f, serverCfg(t)); err != nil {
 			t.Fatalf("Install: %v", err)
 		}
 		wantCall(t, f, fmt.Sprintf("EnsureOwnedDir:%s:0:0:%#o", DefaultDataRoot, StateRootMode))
@@ -136,8 +136,8 @@ func TestMeshKeyDirLivesOutsideTheServiceUserRunDir(t *testing.T) {
 
 	t.Run("b: a fresh install hands the subtrees over explicitly and never the root", func(t *testing.T) {
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
-		if err := Install(context.Background(), f, serverCfg()); err != nil {
+		f := newFakeSystem(t)
+		if err := Install(context.Background(), f, serverCfg(t)); err != nil {
 			t.Fatalf("Install: %v", err)
 		}
 		rootCall := fmt.Sprintf("EnsureOwnedDir:%s:0:0:%#o", DefaultDataRoot, StateRootMode)
@@ -172,12 +172,12 @@ func TestMeshKeyDirLivesOutsideTheServiceUserRunDir(t *testing.T) {
 	t.Run("c: an upgrade copies, verifies, THEN removes the legacy keys", func(t *testing.T) {
 		shrinkRestartBudgets(t)
 		key := mintKey(t)
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		seedLegacyKeyTree(f)
 		f.putFile(serverWork, []byte(key))
 		f.putFile(legacyServer, []byte(key))
 		f.putFile(legacyIdentity, []byte("10.42.3.0/24\n"))
-		if err := Install(context.Background(), f, serverCfg()); err != nil {
+		if err := Install(context.Background(), f, serverCfg(t)); err != nil {
 			t.Fatalf("Install: %v", err)
 		}
 		if got := string(f.files[serverHelper]); got != key {
@@ -213,12 +213,12 @@ func TestMeshKeyDirLivesOutsideTheServiceUserRunDir(t *testing.T) {
 		// A legacy copy that DIFFERS from the new one is refused instead: d2.
 		shrinkRestartBudgets(t)
 		current := mintKey(t)
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		seedLegacyKeyTree(f)
 		f.putFile(serverWork, []byte(current))
 		f.putFile(serverHelper, []byte(current))
 		f.putFile(legacyServer, []byte(current))
-		if err := Install(context.Background(), f, serverCfg()); err != nil {
+		if err := Install(context.Background(), f, serverCfg(t)); err != nil {
 			t.Fatalf("Install: %v", err)
 		}
 		if got := string(f.files[serverHelper]); got != current {
@@ -252,10 +252,10 @@ func TestMeshKeyDirLivesOutsideTheServiceUserRunDir(t *testing.T) {
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				shrinkRestartBudgets(t)
-				f := &fakeSystem{}
+				f := newFakeSystem(t)
 				tc.seed(f)
 				f.putFile(legacyServer, []byte(mintKey(t)))
-				err := Install(context.Background(), f, serverCfg())
+				err := Install(context.Background(), f, serverCfg(t))
 				if err == nil {
 					t.Fatal("Install moved keys through a symlink the service user could have planted")
 				}
@@ -272,7 +272,7 @@ func TestMeshKeyDirLivesOutsideTheServiceUserRunDir(t *testing.T) {
 	})
 
 	t.Run("f: the netd plist renders the new --mesh-key-dir", func(t *testing.T) {
-		plist := string(NetdPlist(serverCfg()))
+		plist := string(NetdPlist(serverCfg(t)))
 		want := "<string>--mesh-key-dir</string>\n    <string>" + MeshKeyDir + "</string>"
 		if !strings.Contains(plist, want) {
 			t.Errorf("netd plist does not pass --mesh-key-dir %s:\n%s", MeshKeyDir, plist)
@@ -283,7 +283,7 @@ func TestMeshKeyDirLivesOutsideTheServiceUserRunDir(t *testing.T) {
 	})
 
 	t.Run("g: uninstall preserves the key dir and its keys", func(t *testing.T) {
-		m := artifactManifest(serverCfg())
+		m := artifactManifest(serverCfg(t))
 		var sawDir bool
 		for _, a := range m {
 			if a.path == MeshKeyDir {
@@ -296,8 +296,8 @@ func TestMeshKeyDirLivesOutsideTheServiceUserRunDir(t *testing.T) {
 		if !sawDir {
 			t.Error("the manifest does not record MeshKeyDir at all")
 		}
-		f := &fakeSystem{}
-		if err := Uninstall(context.Background(), f, serverCfg()); err != nil {
+		f := newFakeSystem(t)
+		if err := Uninstall(context.Background(), f, serverCfg(t)); err != nil {
 			t.Fatalf("Uninstall: %v", err)
 		}
 		for _, c := range f.calls {
@@ -327,7 +327,7 @@ func TestMeshKeyDirLivesOutsideTheServiceUserRunDir(t *testing.T) {
 			plist   []byte
 			workDir string
 		}{
-			{"server", ServerPlist(serverCfg()), filepath.Join(DefaultDataRoot, "server")},
+			{"server", ServerPlist(serverCfg(t)), filepath.Join(DefaultDataRoot, "server")},
 			{"agent", AgentPlist(Config{Role: RoleAgent, JoinServer: "cp.example", BinarySource: "/tmp/k3sm", TargetUser: "alice"}), filepath.Join(DefaultDataRoot, agentWorkSubdir)},
 		} {
 			for key, want := range map[string]string{
@@ -346,7 +346,7 @@ func TestMeshKeyDirLivesOutsideTheServiceUserRunDir(t *testing.T) {
 		t.Run("the path swapped after the open is not followed", func(t *testing.T) {
 			shrinkRestartBudgets(t)
 			key := mintKey(t)
-			f := &fakeSystem{}
+			f := newFakeSystem(t)
 			seedLegacyKeyTree(f)
 			f.putFile(serverWork, []byte(key))
 			f.putFile(legacyServer, []byte(key))
@@ -358,7 +358,7 @@ func TestMeshKeyDirLivesOutsideTheServiceUserRunDir(t *testing.T) {
 					f.putOwned(LegacyMeshKeyDir, 271, ServiceTreeGID, 0o777, EntrySymlink)
 				}
 			}
-			if err := Install(context.Background(), f, serverCfg()); err != nil {
+			if err := Install(context.Background(), f, serverCfg(t)); err != nil {
 				t.Fatalf("Install: %v", err)
 			}
 			if n := len(meshKeyCalls(f, "OpenDirNoFollow:"+LegacyMeshKeyDir)); n != 1 {
@@ -392,11 +392,11 @@ func TestMeshKeyDirLivesOutsideTheServiceUserRunDir(t *testing.T) {
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				shrinkRestartBudgets(t)
-				f := &fakeSystem{}
+				f := newFakeSystem(t)
 				seedLegacyKeyTree(f)
 				f.putFile(legacyServer, []byte(mintKey(t)))
 				tc.race(f)
-				if err := Install(context.Background(), f, serverCfg()); err == nil {
+				if err := Install(context.Background(), f, serverCfg(t)); err == nil {
 					t.Fatal("Install promoted a legacy file it should have refused")
 				}
 				for _, c := range f.calls {
@@ -413,8 +413,8 @@ func TestMeshKeyDirLivesOutsideTheServiceUserRunDir(t *testing.T) {
 
 	t.Run("j: an upgrade stops the running daemons before the first ownership apply", func(t *testing.T) {
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
-		if err := Install(context.Background(), f, serverCfg()); err != nil {
+		f := newFakeSystem(t)
+		if err := Install(context.Background(), f, serverCfg(t)); err != nil {
 			t.Fatalf("first Install: %v", err)
 		}
 		firstApply := idx(f.calls, fmt.Sprintf("EnsureOwnedDir:%s:0:0:%#o", DefaultDataRoot, StateRootMode))
@@ -426,7 +426,7 @@ func TestMeshKeyDirLivesOutsideTheServiceUserRunDir(t *testing.T) {
 		// The daemons the first install bootstrapped are loaded now: this is the
 		// upgrade the stop exists for.
 		f.calls = nil
-		if err := Install(context.Background(), f, serverCfg()); err != nil {
+		if err := Install(context.Background(), f, serverCfg(t)); err != nil {
 			t.Fatalf("upgrade Install: %v", err)
 		}
 		server, netd := idx(f.calls, "Bootout:"+ServerLabel), idx(f.calls, "Bootout:"+NetdLabel)
@@ -471,7 +471,7 @@ func TestMeshKeyDirLivesOutsideTheServiceUserRunDir(t *testing.T) {
 		shrinkRestartBudgets(t)
 		server, node := mintKey(t), mintKey(t)
 		unknown := filepath.Join(LegacyMeshKeyDir, "node-pod-cidr.sep24-stale")
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		seedLegacyKeyTree(f)
 		f.putFile(serverWork, []byte(server))
 		f.putFile(legacyServer, []byte(server))
@@ -479,7 +479,7 @@ func TestMeshKeyDirLivesOutsideTheServiceUserRunDir(t *testing.T) {
 		f.putFile(legacyIdentity, []byte("10.42.3.0/24\n"))
 		f.putFile(unknown, []byte("10.42.9.0/24\n"))
 		var logs bytes.Buffer
-		cfg := serverCfg()
+		cfg := serverCfg(t)
 		cfg.Logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
 		if err := Install(context.Background(), f, cfg); err != nil {
 			t.Fatalf("Install failed over an unknown file in the legacy dir: %v", err)
@@ -511,14 +511,14 @@ func TestMeshKeyDirLivesOutsideTheServiceUserRunDir(t *testing.T) {
 		// leaf is at MeshKeyDir, the legacy dir holds a hand-left file only.
 		shrinkRestartBudgets(t)
 		key := mintKey(t)
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		seedLegacyKeyTree(f)
 		f.putFile(serverWork, []byte(key))
 		f.putFile(serverHelper, []byte(key))
 		f.putFile(newIdentity, []byte("10.42.3.0/24\n"))
 		f.putFile(filepath.Join(LegacyMeshKeyDir, "node-pod-cidr.sep24-stale"), []byte("10.42.9.0/24\n"))
 		var logs bytes.Buffer
-		cfg := serverCfg()
+		cfg := serverCfg(t)
 		cfg.Logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
 		if err := Install(context.Background(), f, cfg); err != nil {
 			t.Fatalf("Install failed with nothing left to migrate: %v", err)
@@ -531,23 +531,23 @@ func TestMeshKeyDirLivesOutsideTheServiceUserRunDir(t *testing.T) {
 	t.Run("d2: a leaf in BOTH places is dropped when identical and refused when not", func(t *testing.T) {
 		shrinkRestartBudgets(t)
 		current, other := mintKey(t), mintKey(t)
-		same := &fakeSystem{}
+		same := newFakeSystem(t)
 		seedLegacyKeyTree(same)
 		same.putFile(serverWork, []byte(current))
 		same.putFile(serverHelper, []byte(current))
 		same.putFile(legacyServer, []byte(current))
-		if err := Install(context.Background(), same, serverCfg()); err != nil {
+		if err := Install(context.Background(), same, serverCfg(t)); err != nil {
 			t.Fatalf("an identical legacy copy failed the install: %v", err)
 		}
 		if _, ok := same.files[legacyServer]; ok {
 			t.Error("the identical legacy copy was kept")
 		}
-		differ := &fakeSystem{}
+		differ := newFakeSystem(t)
 		seedLegacyKeyTree(differ)
 		differ.putFile(serverWork, []byte(current))
 		differ.putFile(serverHelper, []byte(current))
 		differ.putFile(legacyServer, []byte(other))
-		err := Install(context.Background(), differ, serverCfg())
+		err := Install(context.Background(), differ, serverCfg(t))
 		if err == nil || !strings.Contains(err.Error(), legacyServer) || !strings.Contains(err.Error(), serverHelper) {
 			t.Fatalf("a differing legacy copy must be refused naming both paths, got %v", err)
 		}
@@ -571,8 +571,8 @@ func TestMeshKeyDirLivesOutsideTheServiceUserRunDir(t *testing.T) {
 			t.Errorf("the manifests level resolves to %q, ManifestDir = %q, want /var/lib/k3sm/manifests", got, ManifestDir)
 		}
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
-		if err := Install(context.Background(), f, serverCfg()); err != nil {
+		f := newFakeSystem(t)
+		if err := Install(context.Background(), f, serverCfg(t)); err != nil {
 			t.Fatalf("Install: %v", err)
 		}
 		call := fmt.Sprintf("EnsureOwnedDir:%s:0:0:%#o", ManifestDir, ManifestDirMode)
@@ -642,7 +642,7 @@ func TestEnsureStateTreeHandsRuntimeRootLockToServiceUser(t *testing.T) {
 			if tc.hardlinked {
 				f.hardlinked = map[string]bool{lock: true}
 			}
-			cfg := serverCfg()
+			cfg := serverCfg(t)
 			cfg.Logger = slog.New(slog.DiscardHandler)
 			cfg.DataRoot = DefaultDataRoot
 			err := ensureStateTree(f, cfg, svcUID)
@@ -708,8 +708,8 @@ func TestEnsureStateTreeHandsUpdateRootToServiceUser(t *testing.T) {
 		if r, u := slices.Index(levels, StateRoot), slices.Index(levels, level); r != 0 || u <= r {
 			t.Errorf("StateLevels() puts the root at %d and %s at %d; want the root first", r, level, u)
 		}
-		f := &fakeSystem{}
-		cfg := serverCfg()
+		f := newFakeSystem(t)
+		cfg := serverCfg(t)
 		cfg.Logger = slog.New(slog.DiscardHandler)
 		cfg.DataRoot = DefaultDataRoot
 		if err := ensureStateTree(f, cfg, svcUID); err != nil {
@@ -743,11 +743,11 @@ func TestEnsureStateTreeHandsUpdateRootToServiceUser(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			f := &fakeSystem{}
+			f := newFakeSystem(t)
 			if tc.seed != nil {
 				f.putOwnedEntry(dir, *tc.seed)
 			}
-			cfg := serverCfg()
+			cfg := serverCfg(t)
 			cfg.Logger = slog.New(slog.DiscardHandler)
 			cfg.DataRoot = DefaultDataRoot
 			err := ensureStateTree(f, cfg, svcUID)
@@ -764,7 +764,7 @@ func TestEnsureStateTreeHandsUpdateRootToServiceUser(t *testing.T) {
 	t.Run("both roles lay it down and their manifests remove it", func(t *testing.T) {
 		shrinkRestartBudgets(t)
 		for _, role := range []Role{RoleServer, RoleAgent} {
-			f := &fakeSystem{}
+			f := newFakeSystem(t)
 			cfg := testConfig(t)
 			if role == RoleAgent {
 				seedJoinedAgent(t, f)

@@ -34,7 +34,7 @@ import (
 func TestProvisionAgentClusterCA(t *testing.T) {
 	t.Run("an agent install with a token writes the pinned CA before netd starts", func(t *testing.T) {
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		seedJoinedAgent(t, f)
 		if err := Install(context.Background(), f, agentCfg(t)); err != nil {
 			t.Fatalf("Install: %v", err)
@@ -67,7 +67,7 @@ func TestProvisionAgentClusterCA(t *testing.T) {
 		}
 	})
 	t.Run("an agent reinstall without a token keeps the existing copy", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		seedJoinedAgent(t, f)
 		other, err := certs.NewCA("k3sm-cluster-ca")
 		if err != nil {
@@ -83,7 +83,7 @@ func TestProvisionAgentClusterCA(t *testing.T) {
 		}
 	})
 	t.Run("a node joined before the copy existed gets it from its credential", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		cred := mintNodeCredential(t, Config{}.withDefaults().agentWorkDir())
 		cred.seed(f)
 		cfg := agentCfg(t).withDefaults()
@@ -95,7 +95,7 @@ func TestProvisionAgentClusterCA(t *testing.T) {
 		}
 	})
 	t.Run("a server writes no worker copy", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		if err := provisionAgentClusterCA(f, testConfig(t).withDefaults(), []byte("x")); err != nil {
 			t.Fatal(err)
 		}
@@ -104,7 +104,7 @@ func TestProvisionAgentClusterCA(t *testing.T) {
 		}
 	})
 	t.Run("a served CA that is not a CA refuses", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		if err := provisionAgentClusterCA(f, agentCfg(t).withDefaults(), []byte("not pem")); err == nil {
 			t.Fatal("provisionAgentClusterCA accepted a non-CA")
 		}

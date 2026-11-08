@@ -120,7 +120,7 @@ func TestDeveloperModeKeptOnEveryPlainVerificationError(t *testing.T) {
 			t.Parallel()
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			f := &fakeSystem{owners: map[string]OwnedEntry{}}
+			f := (&fakeSystem{owners: map[string]OwnedEntry{}}).rootedIn(t)
 			seedMarkerAncestors(f)
 			f.owners[DeveloperModeMarkerPath] = OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: 0o644}
 			f.putFile(DeveloperModeMarkerPath, []byte("developer mode enabled by k3sm install on 2026-10-31T00:00:00Z\n"))
@@ -128,7 +128,7 @@ func TestDeveloperModeKeptOnEveryPlainVerificationError(t *testing.T) {
 				t.Fatal("the marker is not On before the install")
 			}
 			var logs strings.Builder
-			cfg := Config{BinarySource: tc.src, TargetUser: "alice", Logger: slog.New(slog.NewTextHandler(&logs, nil))}
+			cfg := Config{InstallDir: testInstallDir(t), BinarySource: tc.src, TargetUser: "alice", Logger: slog.New(slog.NewTextHandler(&logs, nil))}
 			cfg.Signer = tc.signer(cancel)
 			if err := Install(ctx, f, cfg); err != nil {
 				t.Fatalf("Install = %v", err)

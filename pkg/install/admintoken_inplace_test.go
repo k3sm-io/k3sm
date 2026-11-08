@@ -60,7 +60,7 @@ func TestServerRollKeepsTheAdminCredentialValid(t *testing.T) {
 	firstServer := func(t *testing.T) (*fakeSystem, Config, []byte) {
 		t.Helper()
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		first := testConfig(t)
 		first.MeshIP = "100.64.0.1"
 		res, err := InstallWithResult(context.Background(), f, first)
@@ -77,8 +77,9 @@ func TestServerRollKeepsTheAdminCredentialValid(t *testing.T) {
 		return f, first, staged
 	}
 	inPlace := func(first Config) Config {
-		req := inPlaceRequest()
+		req := inPlaceRequest(t)
 		req.DataRoot, req.ServerArgsRecord = first.DataRoot, first.ServerArgsRecord
+		req.InstallDir = first.InstallDir
 		return req
 	}
 	alice := func(string) (string, error) { return "alice", nil }
@@ -187,7 +188,7 @@ func TestAdminTokenRotationLeavesAMarker(t *testing.T) {
 	setup := func(t *testing.T) (*fakeSystem, Config, string) {
 		t.Helper()
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		first := testConfig(t)
 		first.MeshIP = "100.64.0.1"
 		if _, err := InstallWithResult(context.Background(), f, first); err != nil {
@@ -201,8 +202,9 @@ func TestAdminTokenRotationLeavesAMarker(t *testing.T) {
 	}
 	update := func(t *testing.T, f *fakeSystem, first Config) Result {
 		t.Helper()
-		req := inPlaceRequest()
+		req := inPlaceRequest(t)
 		req.DataRoot, req.ServerArgsRecord = first.DataRoot, first.ServerArgsRecord
+		req.InstallDir = first.InstallDir
 		cfg, err := ResolveInPlace(f, req, alice)
 		if err != nil {
 			t.Fatalf("ResolveInPlace = %v", err)

@@ -55,8 +55,9 @@ func wantCall(t *testing.T, f *fakeSystem, call string) {
 
 // serverCfg is the control-plane Config the role half of this gate installs —
 // agentCfg's sibling, with nothing about joining.
-func serverCfg() Config {
+func serverCfg(t testing.TB) Config {
 	return Config{
+		InstallDir:   testInstallDir(t),
 		Role:         RoleServer,
 		BinarySource: "/tmp/k3sm",
 		TargetUser:   "alice",
@@ -100,7 +101,7 @@ func TestAgentInstallProvisionsTheMeshHelperKey(t *testing.T) {
 
 	t.Run("a fresh agent install mints one key and writes both copies", func(t *testing.T) {
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		seedJoinedAgent(t, f)
 		if err := Install(context.Background(), f, agentCfg(t)); err != nil {
 			t.Fatalf("Install: %v", err)
@@ -153,7 +154,7 @@ func TestAgentInstallProvisionsTheMeshHelperKey(t *testing.T) {
 		if err != nil {
 			t.Fatalf("mint a key for the fixture: %v", err)
 		}
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		seedJoinedAgent(t, f)
 		f.putFile(agentWork, []byte(priv))
 		if err := Install(context.Background(), f, agentCfg(t)); err != nil {
@@ -180,7 +181,7 @@ func TestAgentInstallProvisionsTheMeshHelperKey(t *testing.T) {
 		if err != nil {
 			t.Fatalf("mint the stale key for the fixture: %v", err)
 		}
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		seedJoinedAgent(t, f)
 		f.putFile(agentWork, []byte(priv))
 		f.putFile(agentHelper, []byte(stale))
@@ -195,7 +196,7 @@ func TestAgentInstallProvisionsTheMeshHelperKey(t *testing.T) {
 
 	t.Run("a second install changes neither copy", func(t *testing.T) {
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		seedJoinedAgent(t, f)
 		cfg := agentCfg(t)
 		if err := Install(context.Background(), f, cfg); err != nil {
@@ -224,8 +225,8 @@ func TestAgentInstallProvisionsTheMeshHelperKey(t *testing.T) {
 
 	t.Run("the server role provisions its own ref the same way", func(t *testing.T) {
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
-		if err := Install(context.Background(), f, serverCfg()); err != nil {
+		f := newFakeSystem(t)
+		if err := Install(context.Background(), f, serverCfg(t)); err != nil {
 			t.Fatalf("Install: %v", err)
 		}
 		work, ok := f.files[serverWork]
@@ -257,7 +258,7 @@ func TestAgentInstallProvisionsTheMeshHelperKey(t *testing.T) {
 		if err != nil {
 			t.Fatalf("mint a key for the fixture: %v", err)
 		}
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		seedJoinedAgent(t, f)
 		// The identity every peer knows this node by survives only in the key
 		// dir: the work dir was wiped (a data-root repair, a hand-deleted file).
@@ -279,7 +280,7 @@ func TestAgentInstallProvisionsTheMeshHelperKey(t *testing.T) {
 
 	t.Run("a symlinked work-dir key is refused, never followed", func(t *testing.T) {
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		seedOperatorToken(f)
 		// What a service-uid writer plants in its own work dir: a link whose
 		// target root can read. The target holds a PERFECTLY VALID key — somebody
@@ -307,7 +308,7 @@ func TestAgentInstallProvisionsTheMeshHelperKey(t *testing.T) {
 
 	t.Run("undecodable work-dir bytes are refused, never minted over", func(t *testing.T) {
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		seedOperatorToken(f)
 		f.putFile(agentWork, []byte("not a wireguard key at all"))
 		err := Install(context.Background(), f, agentCfg(t))
@@ -326,7 +327,7 @@ func TestAgentInstallProvisionsTheMeshHelperKey(t *testing.T) {
 
 	t.Run("an unusable root-only copy with no work dir to repair from is refused", func(t *testing.T) {
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		seedOperatorToken(f)
 		f.putFile(agentHelper, []byte("not a wireguard key at all"))
 		err := Install(context.Background(), f, agentCfg(t))
@@ -344,7 +345,7 @@ func TestAgentInstallProvisionsTheMeshHelperKey(t *testing.T) {
 		if err != nil {
 			t.Fatalf("mint a key for the fixture: %v", err)
 		}
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		seedJoinedAgent(t, f)
 		f.putFile(agentWork, []byte(priv))
 		f.putFile(agentHelper, []byte("not a wireguard key at all"))

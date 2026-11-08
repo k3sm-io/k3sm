@@ -260,7 +260,7 @@ func TestAgentInstallAdoptsThePodLogTree(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			shrinkRestartBudgets(t)
-			f := &fakeSystem{}
+			f := newFakeSystem(t)
 			seedOperatorToken(f)
 			seed := func(root string, entries []podLogEntry) {
 				for _, e := range entries {
@@ -283,7 +283,7 @@ func TestAgentInstallAdoptsThePodLogTree(t *testing.T) {
 			cfg := agentCfg(t)
 			cfg.TokenFile = ""
 			if tc.server {
-				cfg = Config{Role: RoleServer, BinarySource: "/tmp/k3sm", TargetUser: "alice"}
+				cfg = Config{Role: RoleServer, BinarySource: "/tmp/k3sm", TargetUser: "alice", InstallDir: testInstallDir(t)}
 			}
 			var log bytes.Buffer
 			cfg.Logger = testLogger(&log)
