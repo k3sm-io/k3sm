@@ -174,10 +174,6 @@ const (
 	// budgetHistoryFinalFlushBound bounds the writer's final flush on shutdown,
 	// and the node teardown's wait for it (StopBudgetHistory).
 	budgetHistoryFinalFlushBound = 2 * time.Second
-	// budgetHistoryStopJoinGrace is how long past its bound stop keeps waiting
-	// for a write left running (joinWritesUntil) before it gives up on it, so
-	// a stuck disk write never hangs the node teardown.
-	budgetHistoryStopJoinGrace = 5 * time.Second
 	// budgetHistoryMinWriteInterval is the least time between two writes the
 	// writer makes on a change signal. The emergency eviction's flush and the
 	// shutdown paths are not held by it.
@@ -586,47 +582,37 @@ func (h *BudgetHistory) start(ctx context.Context) {
 // within bound. It reports whether everything recorded before the call reached
 // disk in time. It is idempotent; an in-memory history reports true.
 //
-// Before returning it joins the writer and every write a bounded caller left
-// running past its bound, so no write touches the work dir once stop has
-// returned (a teardown may remove it). That join is itself bounded: stop
-// waits at most budgetHistoryStopJoinGrace past bound, so a stuck write never
-// hangs the teardown; if the writes are still running then, stop logs it and
-// reports false, and such a write may still land after stop has returned.
-func (h *BudgetHistory) stop(bound time.Duration) (ok bool) {
+// Before writing, stop joins the writer and every write a bounded caller
+// (flush, the writer's final flush) left running past its own bound, so that
+// write lands, and is not raced by stop's own, before stop returns; a teardown
+// may remove the work dir once it has. The join shares stop's one deadline,
+// so a stuck write never holds stop past bound: stop then logs it and reports
+// false, and that write may still land after stop has returned.
+func (h *BudgetHistory) stop(bound time.Duration) bool {
 	if h == nil || h.path == "" {
 		return true
 	}
-	t := time.NewTimer(bound)
-	defer t.Stop()
-	j := time.NewTimer(bound + budgetHistoryStopJoinGrace)
-	defer j.Stop()
-	defer func() {
-		if !h.joinWritesUntil(j.C) {
-			h.log.Warn("budget history: a write is still running after stop's bound; it may still write the history",
-				"bound", bound+budgetHistoryStopJoinGrace)
-			ok = false
-		}
-	}()
+	ctx, cancel := context.WithTimeout(context.Background(), bound)
+	defer cancel()
 	// Consume the start once: a start racing this call either launched its
 	// writer already (started is then set, Do waits for it) or never will.
 	h.once.Do(func() {})
 	h.quitOnce.Do(func() { close(h.quit) })
-	if h.started.Load() {
-		select {
-		case <-h.stopped:
-		case <-t.C:
-			return false
-		}
+	ok := h.joinWritesUntil(ctx.Done()) && h.flushPending(ctx.Done())
+	if !h.joinWritesUntil(ctx.Done()) {
+		h.log.Warn("budget history: a write is still running at stop's bound; it may still write the history",
+			"bound", bound)
+		return false
 	}
-	return h.flushPending(t.C)
+	return ok
 }
 
 // flushPending writes until the file holds every change recorded before the
-// call, or until expired fires. It runs only once the writer has exited (or
-// never ran), from stop or from flush; wmu keeps its write ordered against any
-// other. A write past the deadline is left to finish on its own goroutine,
-// which stop joins.
-func (h *BudgetHistory) flushPending(expired <-chan time.Time) bool {
+// call, or until expired is closed. It runs only once the writer has exited
+// (or never ran), from stop or from flush; wmu keeps its write ordered against
+// any other. A write past the deadline is left to finish on its own goroutine,
+// which a later stop joins within its bound.
+func (h *BudgetHistory) flushPending(expired <-chan struct{}) bool {
 	h.mu.Lock()
 	target := h.gen
 	h.mu.Unlock()
@@ -712,7 +698,8 @@ func (h *BudgetHistory) run(ctx context.Context) {
 
 // finalFlush writes a pending state, waiting at most
 // budgetHistoryFinalFlushBound. A write past the bound is left to finish on its
-// own goroutine, which ends with the write and which stop joins.
+// own goroutine, which ends with the write and which stop joins within its
+// bound.
 func (h *BudgetHistory) finalFlush() {
 	if !h.pending() {
 		return
@@ -760,10 +747,10 @@ func (h *BudgetHistory) joinWrites() {
 	h.joinWritesUntil(nil)
 }
 
-// joinWritesUntil is joinWrites, giving up when expired fires (a nil expired
-// never does). It reports whether everything was joined. The writer goes first
+// joinWritesUntil is joinWrites, giving up once expired is closed (a nil
+// expired never is). It reports whether everything was joined. The writer goes first
 // because its final flush may start a write.
-func (h *BudgetHistory) joinWritesUntil(expired <-chan time.Time) bool {
+func (h *BudgetHistory) joinWritesUntil(expired <-chan struct{}) bool {
 	if h.started.Load() {
 		select {
 		case <-h.stopped:
@@ -845,10 +832,10 @@ func (h *BudgetHistory) flush(bound time.Duration) bool {
 	if h == nil || h.path == "" {
 		return true
 	}
-	t := time.NewTimer(bound)
-	defer t.Stop()
+	ctx, cancel := context.WithTimeout(context.Background(), bound)
+	defer cancel()
 	if !h.writerRunning() {
-		return h.flushPending(t.C)
+		return h.flushPending(ctx.Done())
 	}
 	h.mu.Lock()
 	target := h.gen
@@ -870,8 +857,8 @@ func (h *BudgetHistory) flush(bound time.Duration) bool {
 		case <-h.stopped:
 			// The writer exited before writing target (its final flush may
 			// have run before this change); write it here.
-			return h.flushPending(t.C)
-		case <-t.C:
+			return h.flushPending(ctx.Done())
+		case <-ctx.Done():
 			return false
 		}
 	}

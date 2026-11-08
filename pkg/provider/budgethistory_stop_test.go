@@ -124,30 +124,23 @@ func TestBudgetHistoryStopOutwaitsTheFinalFlush(t *testing.T) {
 	}
 }
 
-// TestBudgetHistoryStopJoinsAnAbandonedWrite: a write left running past its
-// bound, that finishes within stop's join grace, is joined before the stop
-// path returns, so nothing writes the work dir
-// once the teardown (or a test's TempDir cleanup) may remove it. Two paths
-// abandon a write: stop's own catch-up write with no writer (stop still
-// reports false at its bound), and the writer's final flush when its context
-// ends (joined by openHistory's cleanup, which is what flaked). The fake write
-// blocks until released, then writes for real and notes whether the join had
-// returned.
+// TestBudgetHistoryStopJoinsAnAbandonedWrite: a write another bounded caller
+// left running past its own bound (a flush's inline write, the writer's final
+// flush) is joined by stop, within stop's bound, before stop returns; so it
+// lands before the teardown (or a test's TempDir cleanup) may remove the work
+// dir, and the write it made counts. The fake write blocks until released,
+// then writes for real and notes whether stop had returned.
 //
-// The writer case ends the context rather than calling stop: stop would then
-// queue its own catch-up write on wmu behind the held one, and a goroutine
-// parked on a mutex is not durably blocked, so the bubble's clock would stall.
-//
-// Fails-before: stop returned at its bound, and the cleanup as soon as the
-// writer had exited, with the write still in flight; it then wrote the file
-// after the join had returned ("unlinkat ...: directory not empty" in
+// Fails-before: stop never joined the abandoned write; it queued its own
+// write behind it on wmu, or returned with it still in flight, so the write
+// could land after stop had returned ("unlinkat ...: directory not empty" in
 // TestBudgetHistoryNeverPodCountedOnce under load).
 func TestBudgetHistoryStopJoinsAnAbandonedWrite(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		writer bool
 	}{
-		{name: "stop's catch-up write"},
+		{name: "a flush's inline write"},
 		{name: "the writer's final flush", writer: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -163,10 +156,8 @@ func TestBudgetHistoryStopJoinsAnAbandonedWrite(t *testing.T) {
 					}
 					return atomicfile.Replace(path, data, mode)
 				})
-				ctx, cancel := context.WithCancel(context.Background())
-				defer cancel()
 				if tc.writer {
-					h.start(ctx)
+					h.start(context.Background())
 					// The first write goes through at once; the next change is
 					// then held by the rate limit, so only the final flush
 					// writes it.
@@ -175,51 +166,47 @@ func TestBudgetHistoryStopJoinsAnAbandonedWrite(t *testing.T) {
 				}
 				armed.Store(true)
 				h.record("", budgetv1alpha1.BandBatch, budgetv1alpha1.CounterEviction, time.Now())
+				if !tc.writer && h.flush(budgetIntentWriteBound) {
+					t.Fatal("flush reported success with its write blocked")
+				}
 				done := make(chan bool, 1)
-				bound := BudgetHistoryStopBound
 				go func() {
-					ok := false
-					if tc.writer {
-						cancel()
-						h.joinWrites()
-					} else {
-						ok = h.stop(bound)
-					}
+					ok := h.stop(BudgetHistoryStopBound)
 					returned.Store(true)
 					done <- ok
 				}()
-				// Past the bound every goroutine is parked: the write on
-				// release, and the join either on that write or returned.
-				advanceBubble(bound)
+				// Past the final flush's bound, within stop's: the write was
+				// abandoned and stop is either joining it or has returned.
+				advanceBubble(budgetHistoryFinalFlushBound + (BudgetHistoryStopBound-budgetHistoryFinalFlushBound)/2)
 				synctest.Wait()
 				early := returned.Load()
 				close(release)
 				ok := <-done
 				synctest.Wait()
 				if early {
-					t.Error("the stop path returned while the write it abandoned was still in flight")
+					t.Error("stop returned while the abandoned write was still in flight")
 				}
 				if late.Load() {
-					t.Error("a write ran after the stop path had returned")
+					t.Error("a write ran after stop had returned")
 				}
-				if ok {
-					t.Error("stop reported success with its write held past the bound")
+				if !ok {
+					t.Error("stop reported failure with the abandoned write finished within its bound")
 				}
 				want := int64(1)
 				if tc.writer {
 					want = 2
 				}
 				if got := fileEvictions(t, dir, budgetv1alpha1.BandBatch); got != want {
-					t.Errorf("the file holds evictions=%d after the stop path, want %d", got, want)
+					t.Errorf("the file holds evictions=%d after stop, want %d", got, want)
 				}
 			})
 		})
 	}
 }
 
-// TestBudgetHistoryStopIsBoundedByAStuckWrite: a catch-up write that never
-// finishes holds stop only until budgetHistoryStopJoinGrace past its bound;
-// stop then reports false, so a stuck disk never hangs the node teardown.
+// TestBudgetHistoryStopIsBoundedByAStuckWrite: a write that never finishes
+// holds stop only to BudgetHistoryStopBound, the node teardown's budget for
+// it; stop then reports false, so a stuck disk never hangs the teardown.
 //
 // Fails-before: stop joined the write without a bound and never returned.
 func TestBudgetHistoryStopIsBoundedByAStuckWrite(t *testing.T) {
@@ -237,8 +224,8 @@ func TestBudgetHistoryStopIsBoundedByAStuckWrite(t *testing.T) {
 		if h.stop(BudgetHistoryStopBound) {
 			t.Error("stop reported success with its write stuck")
 		}
-		if took, want := time.Since(start), BudgetHistoryStopBound+budgetHistoryStopJoinGrace; took != want {
-			t.Errorf("stop returned after %v, want its join bound %v", took, want)
+		if took := time.Since(start); took != BudgetHistoryStopBound {
+			t.Errorf("stop returned after %v, want its bound %v", took, BudgetHistoryStopBound)
 		}
 	})
 }
