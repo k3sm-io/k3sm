@@ -1539,13 +1539,6 @@ type Config struct {
 	userStop *userStopState
 }
 
-// userStopState is a stop marker as Install read it: the content, or the
-// error that made it unreadable (an unreadable marker still means stopped).
-type userStopState struct {
-	marker StopMarker
-	err    error
-}
-
 func (c Config) withDefaults() Config {
 	if c.StopMarker == "" {
 		c.StopMarker = DefaultStopMarkerPath
@@ -2063,6 +2056,9 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	//     and step 4 honours it (see restartDaemons and publishedWiring).
 	if marker, present, merr := readStopMarker(sys, cfg); present {
 		cfg.userStop = &userStopState{marker: marker, err: merr}
+		if cfg.Start {
+			cfg.userStop.flush = recordedFlushPrefixes(sys, cfg)
+		}
 		if merr != nil {
 			cfg.Logger.Warn("the stop marker is unreadable; treating this node as stopped by the user", "err", merr)
 		}
@@ -2605,13 +2601,14 @@ func publishedWiring(ctx context.Context, sys System, cfg Config, m []artifact, 
 	//    On a node the user stopped, with --start, the start's precondition
 	//    runs first and the marker goes once the daemons are verified, exactly
 	//    as `k3sm start` does it; without --start restartDaemons leaves every
-	//    long-running label alone.
+	//    long-running label alone. The precondition flushes the range the
+	//    plist step 3b replaced recorded, read at step 0c.
 	if cfg.userStop != nil && cfg.Start {
 		d, err := readInstalledDaemons(sys, cfg)
 		if err != nil {
 			return fmt.Errorf("install: %w", err)
 		}
-		startPrecondition(ctx, sys, cfg, d, cfg.userStop.marker, cfg.userStop.err)
+		startPrecondition(ctx, sys, cfg, d, cfg.userStop.marker, cfg.userStop.err, cfg.userStop.flush)
 	}
 	fences, err := restartDaemons(ctx, sys, cfg, m)
 	if err != nil {
