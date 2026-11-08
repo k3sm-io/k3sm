@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -41,6 +42,9 @@ import (
 // recorded arguments) the way any reinstall carries it. The result is the
 // same reinstall an operator performs with explicit flags, with one
 // difference: a control plane keeps its admin token (carriedAdminToken).
+// --service-cidr is the one argument not carried: netd is rewritten to the
+// range the apiserver uses, and a different recorded range is reported
+// (serviceRangeReset).
 
 // Result is what an install reports beyond success.
 type Result struct {
@@ -112,7 +116,7 @@ func resolveAgentInPlace(sys System, cfg, d Config) (Config, error) {
 	cfg.Role = RoleAgent
 	cfg.JoinServer = host
 	cfg.Logger = d.Logger
-	cfg.Logger.Info("updating the installed agent in place", "server", host)
+	cfg.Logger.Info("updating the installed agent in place", append([]any{"server", host}, serviceRangeReset(sys, d)...)...)
 	return cfg, nil
 }
 
@@ -121,7 +125,7 @@ func resolveServerInPlace(sys System, cfg, d Config, owner FileOwner) (Config, e
 	cfg.Logger = d.Logger
 	cfg.keepAdminToken = true
 	if cfg.TargetUser != "" {
-		cfg.Logger.Info("updating the installed server in place", "kubeconfig-owner", cfg.TargetUser)
+		cfg.Logger.Info("updating the installed server in place", append([]any{"kubeconfig-owner", cfg.TargetUser}, serviceRangeReset(sys, d)...)...)
 		return cfg, nil
 	}
 	rec, err := dataroot.ReadServerArgsRecord(systemFiles{sys}, d.ServerArgsRecord)
@@ -139,8 +143,39 @@ func resolveServerInPlace(sys System, cfg, d Config, owner FileOwner) (Config, e
 		return cfg, fmt.Errorf("install: update the server in place: the owner of the recorded admin kubeconfig %s is unusable (%q, %v); run the install again with --user", rec.AdminKubeconfig, u, err)
 	}
 	cfg.TargetUser = u
-	cfg.Logger.Info("updating the installed server in place", "kubeconfig-owner", u, "kubeconfig", rec.AdminKubeconfig)
+	cfg.Logger.Info("updating the installed server in place", append([]any{"kubeconfig-owner", u, "kubeconfig", rec.AdminKubeconfig}, serviceRangeReset(sys, d)...)...)
 	return cfg, nil
+}
+
+// serviceRangeReset reports an in-place update that resets netd's Service
+// range: the installed netd plist records a --service-cidr (an earlier
+// release took the flag) other than d.ServiceCIDR, the range this update
+// renders and the apiserver uses. The reset is right, since it ends netd and
+// the apiserver disagreeing, so it is not refused: it is logged as one Warn
+// naming the old and new range, and the returned attribute names it on the
+// update's own "updating ... in place" line. No netd plist, or one with no
+// parsable --service-cidr, reports nothing.
+func serviceRangeReset(sys System, d Config) []any {
+	path := d.plistPath(NetdLabel)
+	raw, err := sys.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	args, err := parseProgramArguments(raw)
+	if err != nil {
+		return nil
+	}
+	old, err := netip.ParsePrefix(flagValue(args, "service-cidr"))
+	if err != nil {
+		return nil
+	}
+	cur, err := netip.ParsePrefix(d.ServiceCIDR)
+	if err != nil || old.Masked() == cur.Masked() {
+		return nil
+	}
+	d.Logger.Warn("the in-place update resets netd's Service range to the one the apiserver uses; the installed netd plist recorded another --service-cidr, so netd admitted one range while the apiserver allocated ClusterIPs from the other",
+		"old", old.Masked(), "new", cur.Masked(), "plist", path)
+	return []any{"service-cidr-reset", old.Masked().String() + " -> " + cur.Masked().String()}
 }
 
 // adminTokenPattern is the shape generateToken mints. A staged value of any
