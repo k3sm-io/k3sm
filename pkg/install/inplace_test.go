@@ -17,8 +17,10 @@ limitations under the License.
 package install
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"slices"
 	"strings"
 	"testing"
@@ -221,4 +223,76 @@ func TestUpdateReleaseBaseIsRecordedAndCarried(t *testing.T) {
 			t.Errorf("agent arguments %v, want %s carried over", args, want)
 		}
 	})
+}
+
+// TestInPlaceUpdateReportsAServiceRangeReset is the B1404 gate: an in-place
+// update over a node whose netd plist records a non-default Service range (as
+// an earlier release that took --service-cidr wrote it) still rewrites netd to
+// the default, the range the apiserver uses, and says so: one Warn naming the
+// old and the new range, and the update's own "updating ... in place" line
+// names the reset. An update over the default range says nothing about it.
+func TestInPlaceUpdateReportsAServiceRangeReset(t *testing.T) {
+	const old = "10.96.0.0/16"
+	for _, tc := range []struct {
+		name     string
+		recorded string
+	}{
+		{name: "a non-default range is reset and reported", recorded: old},
+		{name: "the default range is updated silently", recorded: DefaultServiceCIDR},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			shrinkRestartBudgets(t)
+			f := newFakeSystem(t)
+			first := testConfig(t)
+			if err := Install(context.Background(), f, first); err != nil {
+				t.Fatalf("the first server install: %v", err)
+			}
+			if tc.recorded != DefaultServiceCIDR {
+				recordServiceCIDR(t, f, first, tc.recorded)
+			}
+			var logs bytes.Buffer
+			req := inPlaceRequest(t)
+			req.DataRoot, req.ServerArgsRecord = first.DataRoot, first.ServerArgsRecord
+			req.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+			cfg, err := ResolveInPlace(f, req, func(string) (string, error) { return "alice", nil })
+			if err != nil {
+				t.Fatalf("ResolveInPlace = %v", err)
+			}
+			if err := Install(context.Background(), f, cfg); err != nil {
+				t.Fatalf("the in-place server install: %v", err)
+			}
+			if got := flagValue(installedArgs(t, f, NetdLabel), "service-cidr"); got != DefaultServiceCIDR {
+				t.Errorf("netd's --service-cidr after the in-place update = %q, want the default %s", got, DefaultServiceCIDR)
+			}
+			var warns, updating []string
+			for _, l := range strings.Split(logs.String(), "\n") {
+				if strings.Contains(l, "level=WARN") && strings.Contains(l, "Service range") {
+					warns = append(warns, l)
+				}
+				if strings.Contains(l, "updating the installed server in place") {
+					updating = append(updating, l)
+				}
+			}
+			if len(updating) != 1 {
+				t.Fatalf("want one \"updating the installed server in place\" line, got %q:\n%s", updating, logs.String())
+			}
+			if tc.recorded == DefaultServiceCIDR {
+				if len(warns) != 0 || strings.Contains(updating[0], "service-cidr") {
+					t.Errorf("an update over the default range reported a reset: %q %q", warns, updating)
+				}
+				return
+			}
+			if len(warns) != 1 {
+				t.Fatalf("want one Warn naming the Service range reset, got %q:\n%s", warns, logs.String())
+			}
+			for _, want := range []string{"old=" + old, "new=" + DefaultServiceCIDR} {
+				if !strings.Contains(warns[0], want) {
+					t.Errorf("the reset Warn lacks %q: %s", want, warns[0])
+				}
+			}
+			if !strings.Contains(updating[0], "service-cidr-reset=\""+old+" -> "+DefaultServiceCIDR+"\"") {
+				t.Errorf("the update's output does not name the reset: %s", updating[0])
+			}
+		})
+	}
 }
