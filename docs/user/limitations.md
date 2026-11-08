@@ -1123,6 +1123,19 @@ and every layout `k3sm install` and `k3sm dev` create already follow this rule. 
 existing work dir, stop the daemon, rename the directory to `server` (or `agent`) under the same
 parent, and start it again with the new path.
 
+### Node State the Sandbox Does Not Deny
+
+The sandbox denies pods the `server` and `agent` directories of their own node's data root. Two
+cases fall outside that deny:
+
+- **`k3sm node`.** The standalone node has no work dir and names no state directory to the sandbox.
+  The files it is given, such as its `--kubeconfig`, are covered only by the sandbox's fixed denies,
+  such as `/Users`, and by their own file permissions.
+- **A second role on the same Mac.** A node's pods are denied only their own node's data root. A
+  second `k3sm server` or `k3sm agent` on the same Mac with another data root is not among the paths
+  they are denied, and the same holds the other way round. Its state is then kept from them only by
+  the sandbox's default deny and its file permissions.
+
 ### Single-Node Datastore Consistency
 
 k3sm embeds **kine** over **SQLite (WAL)**. On a single node the datastore serves a **consistent LIST**;
