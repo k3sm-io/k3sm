@@ -385,6 +385,18 @@ func TestFailEchoesOnlyTheFailingRun(t *testing.T) {
 	}
 }
 
+// TestGeneratedCorpusStreams keeps the generated corpus streams honest: it reruns
+// the generator under testdata/gen against real go test -json and reds when a
+// committed stream.jsonl differs from what the generator writes.
+func TestGeneratedCorpusStreams(t *testing.T) {
+	cmd := exec.Command("go", "run", "./testdata/gen", "-check")
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("generated corpus streams drifted (%v):\n%s", err, out)
+	}
+}
+
 // TestQuarantineCorpusParity runs every shared corpus case through this copy of
 // the rules and checks the overall verdict and each test's verdict.
 func TestQuarantineCorpusParity(t *testing.T) {
