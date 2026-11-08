@@ -110,9 +110,10 @@ type flushPrefixes struct {
 // with, read from the --service-cidr of the installed netd plist. The plist is
 // the record: it is what install rendered from the operator's --service-cidr,
 // what launchd hands netd, and it stays on disk across a stop. A missing or
-// unreadable plist, or one with no parsable --service-cidr, is an error and no
-// prefixes: the caller skips the flush rather than flush a default range the
-// node may never have used.
+// unreadable plist, or one whose --service-cidr does not parse or fails
+// recordedServiceRangeSafe (a range no working Service range could have, which
+// would widen the root sweep to the host's own addresses), is an error and no
+// prefixes: the caller skips the flush rather than flush a guessed range.
 func recordedFlushPrefixes(sys System, cfg Config) flushPrefixes {
 	path := cfg.plistPath(NetdLabel)
 	fp := flushPrefixes{source: path}
@@ -126,23 +127,29 @@ func recordedFlushPrefixes(sys System, cfg Config) flushPrefixes {
 		fp.err = fmt.Errorf("parse the installed netd plist %s: %w", path, err)
 		return fp
 	}
-	svc, err := netip.ParsePrefix(flagValue(args, "service-cidr"))
+	svc, err := recordedServiceRangeSafe(flagValue(args, "service-cidr"))
 	if err != nil {
 		fp.err = fmt.Errorf("the installed netd plist %s carries no usable --service-cidr: %w", path, err)
 		return fp
 	}
-	fp.prefixes = []netip.Prefix{podnet.ClusterPodCIDR, svc.Masked()}
+	fp.prefixes = []netip.Prefix{podnet.ClusterPodCIDR, svc}
 	return fp
 }
 
 // configFlushPrefixes is the lo0 flush scope taken from cfg alone, for the one
 // caller that may not skip the flush: uninstall on a Mac whose netd plist is
-// already gone (a partial earlier uninstall).
+// already gone (a partial earlier uninstall). An empty range flushes the pod
+// aggregate alone; one that fails recordedServiceRangeSafe flushes nothing.
 func configFlushPrefixes(cfg Config) flushPrefixes {
 	fp := flushPrefixes{prefixes: []netip.Prefix{podnet.ClusterPodCIDR}, source: "the uninstall configuration (no installed netd plist)"}
-	if svc, err := netip.ParsePrefix(cfg.ServiceCIDR); err == nil {
-		fp.prefixes = append(fp.prefixes, svc)
+	if cfg.ServiceCIDR == "" {
+		return fp
 	}
+	svc, err := recordedServiceRangeSafe(cfg.ServiceCIDR)
+	if err != nil {
+		return flushPrefixes{source: fp.source, err: fmt.Errorf("the uninstall configuration carries no usable Service range: %w", err)}
+	}
+	fp.prefixes = append(fp.prefixes, svc)
 	return fp
 }
 
