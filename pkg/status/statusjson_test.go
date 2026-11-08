@@ -360,6 +360,16 @@ func contractScenarios() map[string]contractScenario {
 				return []byte(`{"lan":"off","serial":"","error":"read the network record: network record unusable"}`), nil
 			})
 		}},
+		// A timed `lan on --for` whose window is still open: lan on with its
+		// expiresAt, and the daemon's applied report agreeing.
+		"network-timed": {verdict: VerdictRunning, collector: func(t *testing.T) Collector {
+			exp := goldenTime.Add(30 * time.Minute)
+			return contractNetwork(t, func() (install.NetworkRecord, bool, error) {
+				return install.NetworkRecord{Version: install.NetworkRecordVersionExpiry, LAN: install.LANOn, ExpiresAt: &exp, Serial: "9a1e3c7b5d2f4086"}, true, nil
+			}, func(install.Role) ([]byte, error) {
+				return []byte(`{"lan":"on","serial":"9a1e3c7b5d2f4086"}`), nil
+			})
+		}},
 		"network-applied-unreadable": {verdict: VerdictRunning, collector: func(t *testing.T) Collector {
 			return contractNetwork(t, contractRecordOff, func(install.Role) ([]byte, error) { return nil, os.ErrPermission })
 		}},
