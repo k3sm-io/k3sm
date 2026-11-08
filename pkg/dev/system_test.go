@@ -17,6 +17,7 @@ limitations under the License.
 package dev
 
 import (
+	"os/exec"
 	"reflect"
 	"testing"
 )
@@ -43,5 +44,35 @@ func TestParseLo0Inet(t *testing.T) {
 func TestParseLo0InetEmpty(t *testing.T) {
 	if got := parseLo0Inet("lo0: flags=8049\n\tinet6 ::1 prefixlen 128\n"); len(got) != 0 {
 		t.Errorf("parseLo0Inet with no inet lines = %v, want empty", got)
+	}
+}
+
+// TestRealSystemRunsIfconfigByAbsolutePath proves Lo0Aliases and Lo0RemoveAlias
+// build their command from the absolute ifconfig path, without running ifconfig.
+func TestRealSystemRunsIfconfigByAbsolutePath(t *testing.T) {
+	if ifconfigPath != "/sbin/ifconfig" {
+		t.Fatalf("ifconfigPath = %q, want /sbin/ifconfig", ifconfigPath)
+	}
+	var got [][]string
+	orig := ifconfigCommand
+	t.Cleanup(func() { ifconfigCommand = orig })
+	ifconfigCommand = func(args ...string) *exec.Cmd {
+		c := orig(args...)
+		got = append(got, c.Args)
+		return exec.Command("/usr/bin/true")
+	}
+	s := realSystem{}
+	if _, err := s.Lo0Aliases(); err != nil {
+		t.Fatalf("Lo0Aliases: %v", err)
+	}
+	if err := s.Lo0RemoveAlias("100.64.0.2"); err != nil {
+		t.Fatalf("Lo0RemoveAlias: %v", err)
+	}
+	want := [][]string{
+		{"/sbin/ifconfig", "lo0"},
+		{"/sbin/ifconfig", "lo0", "-alias", "100.64.0.2"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("argv = %v, want %v", got, want)
 	}
 }
