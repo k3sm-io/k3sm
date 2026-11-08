@@ -20,6 +20,7 @@ limitations under the License.
 package acceptance
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,7 +32,9 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 // gateRow is one milestone row in hack/acceptance/phases.json: the single command
@@ -331,19 +334,50 @@ func TestNonManualSkeletonsAlwaysRed(t *testing.T) {
 // over any value already in the environment.
 func runGate(t *testing.T, path, k3smLab string) int {
 	t.Helper()
-	cmd := exec.Command("bash", path)
-	cmd.Env = append(os.Environ(), "K3SM_LAB="+k3smLab)
-	switch err := cmd.Run(); {
-	case err == nil:
-		return 0
-	default:
-		var ee *exec.ExitError
-		if errors.As(err, &ee) {
-			return ee.ExitCode()
-		}
-		t.Fatalf("run %s (K3SM_LAB=%q): %v", path, k3smLab, err)
-		return -1
+	code, _ := runBounded(t, append(os.Environ(), "K3SM_LAB="+k3smLab), path)
+	return code
+}
+
+// deadlineMargin is how long before the test binary's own deadline a gate script is
+// killed, so the run fails with a named message rather than the package timeout's
+// panic, and with time left to report.
+const deadlineMargin = 30 * time.Second
+
+// runBounded runs "bash script args..." with env, returning its exit code and combined
+// output. The script runs in its own process group, and a context ending deadlineMargin
+// before t.Deadline() kills the whole group: a gate's bash subshells (watchdogs,
+// backgrounded bodies) die with it instead of outliving a timed-out test binary.
+// Reaching that deadline fails the test, naming the script.
+func runBounded(t *testing.T, env []string, script string, args ...string) (int, string) {
+	t.Helper()
+	ctx, cancel := context.Background(), context.CancelFunc(func() {})
+	if dl, ok := t.Deadline(); ok {
+		ctx, cancel = context.WithDeadline(ctx, dl.Add(-deadlineMargin))
 	}
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "bash", append([]string{script}, args...)...)
+	cmd.Env = env
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	cmd.WaitDelay = 5 * time.Second
+	start := time.Now()
+	raw, err := cmd.CombinedOutput()
+	if cmd.Process != nil {
+		// Reap any stragglers the script left in its group, even on a clean exit.
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	out := string(raw)
+	if ctx.Err() != nil {
+		t.Fatalf("%s %v: killed its process group after %s, %s before the test deadline; output:\n%s", script, args, time.Since(start).Round(time.Second), deadlineMargin, out)
+	}
+	if err != nil {
+		var ee *exec.ExitError
+		if !errors.As(err, &ee) {
+			t.Fatalf("run %s %v: %v", script, args, err)
+		}
+		return ee.ExitCode(), out
+	}
+	return 0, out
 }
 
 // TestM11CoreGateDeclaresCoreMode is the core-mode gate: it pins, STATICALLY and hermetically,
@@ -481,20 +515,7 @@ func TestM11CoreGateDeclaresCoreMode(t *testing.T) {
 // code). The trailing K3SM_LAB entry wins over any value already in the environment.
 func runGateArgs(t *testing.T, path, k3smLab string, args ...string) (int, string) {
 	t.Helper()
-	cmd := exec.Command("bash", append([]string{path}, args...)...)
-	cmd.Env = append(os.Environ(), "K3SM_LAB="+k3smLab)
-	out, err := cmd.CombinedOutput()
-	switch {
-	case err == nil:
-		return 0, string(out)
-	default:
-		var ee *exec.ExitError
-		if errors.As(err, &ee) {
-			return ee.ExitCode(), string(out)
-		}
-		t.Fatalf("run %s %v (K3SM_LAB=%q): %v", path, args, k3smLab, err)
-		return -1, string(out)
-	}
+	return runBounded(t, append(os.Environ(), "K3SM_LAB="+k3smLab), path, args...)
 }
 
 // TestM17InterconnectLadderContract pins the M17-lab row now that its gate is the
@@ -555,35 +576,29 @@ func TestM17InterconnectLadderContract(t *testing.T) {
 		{name: "self-test", script: gate, args: []string{"--self-test"}, env: []string{"K3SM_M17_SELFTEST_WATCHDOG=600"}, code: 0, check: hasLine("M17-lab self-test: PASS")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			cmd := exec.Command("bash", append([]string{filepath.Join(root, filepath.FromSlash(tc.script))}, tc.args...)...)
+			var env []string
 			for _, kv := range os.Environ() {
 				switch k, _, _ := strings.Cut(kv, "="); k {
 				case "K3SM_LAB", "PEER_SSH", "EVIDENCE_DIR":
 				default:
-					cmd.Env = append(cmd.Env, kv)
+					env = append(env, kv)
 				}
 			}
 			if tc.lab != nil {
-				cmd.Env = append(cmd.Env, "K3SM_LAB="+*tc.lab)
+				env = append(env, "K3SM_LAB="+*tc.lab)
 			}
-			// A loaded gate runs the self-test in ~250 s, past the script's 120 s hand-run
-			// watchdog default, so a live run would read as a hang: give it a larger budget
-			// unless the caller already chose one.
+			// The self-test's own watchdog defaults to 120 s for a hand run; a loaded gate
+			// can run slower, so give it a larger budget unless the caller already chose one.
+			// runBounded still kills the run before the package deadline.
 			for _, def := range tc.env {
 				name, _, _ := strings.Cut(def, "=")
 				if _, set := os.LookupEnv(name); !set {
-					cmd.Env = append(cmd.Env, def)
+					env = append(env, def)
 				}
 			}
-			raw, err := cmd.CombinedOutput()
-			out, code := string(raw), 0
-			if err != nil {
-				var ee *exec.ExitError
-				if !errors.As(err, &ee) {
-					t.Fatalf("run %s %v: %v", tc.script, tc.args, err)
-				}
-				code = ee.ExitCode()
-			}
+			start := time.Now()
+			code, out := runBounded(t, env, filepath.Join(root, filepath.FromSlash(tc.script)), tc.args...)
+			t.Logf("%s %v: exit %d in %s", tc.script, tc.args, code, time.Since(start).Round(time.Millisecond))
 			if code != tc.code {
 				t.Fatalf("%s %v: exit %d, want %d; output:\n%s", tc.script, tc.args, code, tc.code, out)
 			}
