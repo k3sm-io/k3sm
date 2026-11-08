@@ -385,3 +385,9 @@ func TestDefinitiveStopRefusalDropsItsIntent(t *testing.T) {
 		})
 	}
 }
+
+// joinWrites is joinWritesUntil without a bound. It ends with the slowest
+// write, so only a test's cleanup, which may wait as long as it takes, uses it.
+func (h *BudgetHistory) joinWrites() {
+	h.joinWritesUntil(nil)
+}

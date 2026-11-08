@@ -739,16 +739,9 @@ func (h *BudgetHistory) writeAsync() <-chan bool {
 	return result
 }
 
-// joinWrites waits for the writer, if one was started, to return, and then
-// for every write writeAsync started to finish. Unbounded: it ends with the
-// slowest write, so only a caller that may wait forever (a test's cleanup)
-// uses it; stop uses joinWritesUntil.
-func (h *BudgetHistory) joinWrites() {
-	h.joinWritesUntil(nil)
-}
-
-// joinWritesUntil is joinWrites, giving up once expired is closed (a nil
-// expired never is). It reports whether everything was joined. The writer goes first
+// joinWritesUntil waits for the writer, if one was started, to return, and then
+// for every write writeAsync started to finish, giving up once expired is
+// closed (a nil expired never is). It reports whether everything was joined. The writer goes first
 // because its final flush may start a write.
 func (h *BudgetHistory) joinWritesUntil(expired <-chan struct{}) bool {
 	if h.started.Load() {
