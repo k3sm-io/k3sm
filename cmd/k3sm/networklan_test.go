@@ -58,6 +58,8 @@ type lanFakeSys struct {
 	files   map[string][]byte
 	modes   map[string]fs.FileMode
 	running bool
+	// pids overrides the pid LaunchctlServicePID reports for a label.
+	pids map[string]int
 }
 
 func newLANFakeSys() *lanFakeSys {
@@ -111,9 +113,12 @@ func (f *lanFakeSys) Owner(path string) (install.OwnedEntry, error) {
 	return install.OwnedEntry{Path: path, Mode: mode, Kind: install.EntryRegular}, nil
 }
 
-func (f *lanFakeSys) LaunchctlServicePID(string) (int, error) {
+func (f *lanFakeSys) LaunchctlServicePID(label string) (int, error) {
 	if !f.running {
 		return 0, errors.New("not loaded")
+	}
+	if pid, ok := f.pids[label]; ok {
+		return pid, nil
 	}
 	return 4242, nil
 }

@@ -34,6 +34,7 @@ import (
 // as root over a fake socket table and checks the exposure section.
 func TestLanStatusReportsLANReachableListeners(t *testing.T) {
 	const daemon = 4242 // the rig's node daemon pid
+	const netd = 4100   // the netd daemon's pid
 	ap := netip.MustParseAddrPort
 	sock := func(pid, ppid int, cmd, proto, addr string) lanSocket {
 		return lanSocket{PID: pid, PPID: ppid, Command: cmd, Protocol: proto, Local: ap(addr)}
@@ -80,6 +81,14 @@ func TestLanStatusReportsLANReachableListeners(t *testing.T) {
 			want: []string{k3smHeading, "  pid 4242 k3sm tcp *:9345", "  pid 5000 kine tcp 192.168.1.23:2379", otherHeading + " none."},
 		},
 		{
+			name: "the netd daemon's sockets are k3sm, found by its launchd pid",
+			socks: []lanSocket{
+				sock(netd, 1, "k3sm", "UDP", "0.0.0.0:51820"),
+				sock(netd+1, netd, "child", "TCP", "0.0.0.0:7443"),
+			},
+			want: []string{k3smHeading, "  pid 4100 k3sm udp *:51820", "  pid 4101 child tcp *:7443", otherHeading + " none."},
+		},
+		{
 			name:  "a spoofed command name k3sm from another pid is listed as other",
 			socks: []lanSocket{sock(777, 1, "k3sm", "TCP", "0.0.0.0:8443")},
 			want:  []string{otherHeading, "  pid 777 k3sm tcp *:8443", k3smHeading + " none."},
@@ -110,6 +119,7 @@ func TestLanStatusReportsLANReachableListeners(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			rig := newLANRig(t, install.RoleServer)
+			rig.sys.pids = map[string]int{install.NetdLabel: netd}
 			rig.env.SocketTable = func(context.Context) ([]lanSocket, error) { return tc.socks, tc.err }
 			if code := rig.run("lan", "status"); code != 0 {
 				t.Fatalf("exit %d: %s", code, rig.errOut)
@@ -148,7 +158,7 @@ func TestLanStatusReportsLANReachableListeners(t *testing.T) {
 		e := lanExposure{Listeners: lanReachable([]lanSocket{
 			sock(daemon, 1, "k3sm", "TCP", "0.0.0.0:9345"),
 			sock(900, 1, "secret-name", "UDP", "192.168.1.23:5353"),
-		}, daemon, nil), Counts: map[string]int{lanClassK3sm: 1, lanClassOther: 1}}
+		}, []int{daemon}, nil), Counts: map[string]int{lanClassK3sm: 1, lanClassOther: 1}}
 		data, err := json.Marshal(e)
 		if err != nil {
 			t.Fatal(err)

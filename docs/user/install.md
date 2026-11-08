@@ -360,8 +360,9 @@ nothing on your Wi-Fi or Ethernet does. With it on, they bind every interface.
   listening socket and bound UDP socket on this Mac whose address is not loopback, not in the
   cluster pod and mesh range, not in the Service range and not on the vm NAT segment. A pod on the
   host network, or a pod process that binds an explicit address, can listen on your Wi-Fi this way
-  even with LAN access off. The node daemon's own sockets and those of its child processes (chosen
-  by process id, never by name), such as the join port `9345` on a server, are listed under
+  even with LAN access off. The sockets of the node daemon, of the root network helper `k3sm netd`,
+  and of their child processes (chosen by process id, never by name), such as the join port `9345`
+  on a server and the wireguard port `51820`, are listed under
   "k3sm control-plane ports (not moved by LAN access):". Everything else, macOS services such as
   AirPlay included, is listed under "Listening on a LAN-reachable address (not moved by LAN
   access):", each with its pid, command, protocol and address. As a user it says the check needs

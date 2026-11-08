@@ -95,8 +95,10 @@ type lanExposure struct {
 
 // lanExposureFor builds the exposure section for role: as root it lists the
 // socket table through env.SocketTable and keeps the sockets a LAN peer can
-// reach, classed k3sm by pid (the node daemon and its children), never by
-// command name.
+// reach, classed k3sm by pid (the node daemon, the root network helper netd,
+// and their children), never by command name. netd's pid is best effort: a
+// netd that is not running owns no socket, and one whose pid cannot be read
+// has its sockets listed as other rather than hidden.
 func lanExposureFor(ctx context.Context, env networkEnv, role install.Role) lanExposure {
 	var e lanExposure
 	if env.Geteuid() != 0 {
@@ -110,6 +112,10 @@ func lanExposureFor(ctx context.Context, env networkEnv, role install.Role) lanE
 	pid, err := env.Sys.LaunchctlServicePID(nodeLabel(role))
 	if err != nil {
 		return fail(fmt.Errorf("find the node daemon's pid: %w", err))
+	}
+	owned := []int{pid}
+	if npid, err := env.Sys.LaunchctlServicePID(install.NetdLabel); err == nil {
+		owned = append(owned, npid)
 	}
 	if env.NodeArgs == nil {
 		return fail(errors.New("no reader for the node daemon's arguments"))
@@ -129,7 +135,7 @@ func lanExposureFor(ctx context.Context, env networkEnv, role install.Role) lanE
 	if err != nil {
 		return fail(fmt.Errorf("list this Mac's listening sockets: %w", err))
 	}
-	e.Listeners = lanReachable(socks, pid, excluded)
+	e.Listeners = lanReachable(socks, owned, excluded)
 	e.Counts = map[string]int{lanClassK3sm: 0, lanClassOther: 0}
 	for _, l := range e.Listeners {
 		e.Counts[l.Class]++
@@ -158,10 +164,11 @@ func lanInternalPrefixes(args []string) ([]netip.Prefix, error) {
 }
 
 // lanReachable keeps the sockets of socks that a LAN peer can reach: not on
-// loopback and not inside excluded. A socket of daemonPID or of a process
-// whose parent is daemonPID is classed k3sm; every other one, whatever its
-// command name, is other. Duplicates are listed once.
-func lanReachable(socks []lanSocket, daemonPID int, excluded []netip.Prefix) []lanListener {
+// loopback and not inside excluded. A socket of a pid in owned (the k3sm
+// daemons) or of a process whose parent is one is classed k3sm; every other
+// one, whatever its command name, is other. Duplicates are listed once.
+func lanReachable(socks []lanSocket, owned []int, excluded []netip.Prefix) []lanListener {
+	isOwned := func(pid int) bool { return pid > 0 && slices.Contains(owned, pid) }
 	out := []lanListener{}
 	for _, s := range socks {
 		a := s.Local.Addr().Unmap()
@@ -172,7 +179,7 @@ func lanReachable(socks []lanSocket, daemonPID int, excluded []netip.Prefix) []l
 			continue
 		}
 		class := lanClassOther
-		if daemonPID > 0 && (s.PID == daemonPID || s.PPID == daemonPID) {
+		if isOwned(s.PID) || isOwned(s.PPID) {
 			class = lanClassK3sm
 		}
 		addr := a.String()
