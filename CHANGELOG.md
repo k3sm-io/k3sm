@@ -251,6 +251,12 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
 
 ### Fixed
 
+- The sandbox now also denies pods the role's own work dir, by the path `k3sm server` or `k3sm agent`
+  was started with, beside the data root's `server` and `agent` directories. Pods created before the
+  upgrade keep their old profile until they are recreated. On the default paths, and in every layout
+  `k3sm server` and `k3sm agent` accept, the profile does not change. `k3sm node` and a second role on
+  the same Mac with another data root are not covered; see
+  [limitations](docs/user/limitations.md#node-state-the-sandbox-does-not-deny).
 - `sudo k3sm install --service-cidr` refuses any range other than the default `10.43.0.0/16`, before it
   changes anything. The flag only ever reached netd: the apiserver, the cluster DNS address and the serving
   certificates always use `10.43.0.0/16`, so another value left netd and the apiserver disagreeing about
