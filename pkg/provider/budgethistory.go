@@ -174,6 +174,10 @@ const (
 	// budgetHistoryFinalFlushBound bounds the writer's final flush on shutdown,
 	// and the node teardown's wait for it (StopBudgetHistory).
 	budgetHistoryFinalFlushBound = 2 * time.Second
+	// budgetHistoryStopJoinGrace is how long past its bound stop keeps waiting
+	// for a write left running (joinWritesUntil) before it gives up on it, so
+	// a stuck disk write never hangs the node teardown.
+	budgetHistoryStopJoinGrace = 5 * time.Second
 	// budgetHistoryMinWriteInterval is the least time between two writes the
 	// writer makes on a change signal. The emergency eviction's flush and the
 	// shutdown paths are not held by it.
@@ -582,17 +586,27 @@ func (h *BudgetHistory) start(ctx context.Context) {
 // within bound. It reports whether everything recorded before the call reached
 // disk in time. It is idempotent; an in-memory history reports true.
 //
-// The bound limits what stop reports, not when it returns: before returning it
-// joins the writer and every write a bounded caller left running past its
-// bound, so no write touches the work dir once stop has returned (a teardown
-// may remove it). A write that never returns therefore holds stop.
-func (h *BudgetHistory) stop(bound time.Duration) bool {
+// Before returning it joins the writer and every write a bounded caller left
+// running past its bound, so no write touches the work dir once stop has
+// returned (a teardown may remove it). That join is itself bounded: stop
+// waits at most budgetHistoryStopJoinGrace past bound, so a stuck write never
+// hangs the teardown; if the writes are still running then, stop logs it and
+// reports false, and such a write may still land after stop has returned.
+func (h *BudgetHistory) stop(bound time.Duration) (ok bool) {
 	if h == nil || h.path == "" {
 		return true
 	}
 	t := time.NewTimer(bound)
 	defer t.Stop()
-	defer h.joinWrites()
+	j := time.NewTimer(bound + budgetHistoryStopJoinGrace)
+	defer j.Stop()
+	defer func() {
+		if !h.joinWritesUntil(j.C) {
+			h.log.Warn("budget history: a write is still running after stop's bound; it may still write the history",
+				"bound", bound+budgetHistoryStopJoinGrace)
+			ok = false
+		}
+	}()
 	// Consume the start once: a start racing this call either launched its
 	// writer already (started is then set, Do waits for it) or never will.
 	h.once.Do(func() {})
@@ -739,21 +753,37 @@ func (h *BudgetHistory) writeAsync() <-chan bool {
 }
 
 // joinWrites waits for the writer, if one was started, to return, and then
-// for every write writeAsync started to finish. The writer goes first because
-// its final flush may start one. Unbounded: it ends with the slowest write.
+// for every write writeAsync started to finish. Unbounded: it ends with the
+// slowest write, so only a caller that may wait forever (a test's cleanup)
+// uses it; stop uses joinWritesUntil.
 func (h *BudgetHistory) joinWrites() {
+	h.joinWritesUntil(nil)
+}
+
+// joinWritesUntil is joinWrites, giving up when expired fires (a nil expired
+// never does). It reports whether everything was joined. The writer goes first
+// because its final flush may start a write.
+func (h *BudgetHistory) joinWritesUntil(expired <-chan time.Time) bool {
 	if h.started.Load() {
-		<-h.stopped
+		select {
+		case <-h.stopped:
+		case <-expired:
+			return false
+		}
 	}
 	for {
 		h.amu.Lock()
 		if h.async == 0 {
 			h.amu.Unlock()
-			return
+			return true
 		}
 		idle := h.idle
 		h.amu.Unlock()
-		<-idle
+		select {
+		case <-idle:
+		case <-expired:
+			return false
+		}
 	}
 }
 

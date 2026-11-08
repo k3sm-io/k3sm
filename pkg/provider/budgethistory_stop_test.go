@@ -125,7 +125,8 @@ func TestBudgetHistoryStopOutwaitsTheFinalFlush(t *testing.T) {
 }
 
 // TestBudgetHistoryStopJoinsAnAbandonedWrite: a write left running past its
-// bound is joined before the stop path returns, so nothing writes the work dir
+// bound, that finishes within stop's join grace, is joined before the stop
+// path returns, so nothing writes the work dir
 // once the teardown (or a test's TempDir cleanup) may remove it. Two paths
 // abandon a write: stop's own catch-up write with no writer (stop still
 // reports false at its bound), and the writer's final flush when its context
@@ -214,6 +215,32 @@ func TestBudgetHistoryStopJoinsAnAbandonedWrite(t *testing.T) {
 			})
 		})
 	}
+}
+
+// TestBudgetHistoryStopIsBoundedByAStuckWrite: a catch-up write that never
+// finishes holds stop only until budgetHistoryStopJoinGrace past its bound;
+// stop then reports false, so a stuck disk never hangs the node teardown.
+//
+// Fails-before: stop joined the write without a bound and never returned.
+func TestBudgetHistoryStopIsBoundedByAStuckWrite(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := OpenBudgetHistory(t.TempDir(), "fp", discardLog())
+		release := make(chan struct{})
+		// Released before TempDir's cleanup, so the write ends in the bubble.
+		defer func() {
+			close(release)
+			synctest.Wait()
+		}()
+		blockWrites(h, release)
+		h.record("", budgetv1alpha1.BandBatch, budgetv1alpha1.CounterEviction, time.Now())
+		start := time.Now()
+		if h.stop(BudgetHistoryStopBound) {
+			t.Error("stop reported success with its write stuck")
+		}
+		if took, want := time.Since(start), BudgetHistoryStopBound+budgetHistoryStopJoinGrace; took != want {
+			t.Errorf("stop returned after %v, want its join bound %v", took, want)
+		}
+	})
 }
 
 // TestInconclusiveStopKeepsItsIntent: a stop RPC that may have reached
