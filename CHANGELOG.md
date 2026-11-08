@@ -12,6 +12,10 @@ pin, its date, and the tarball's sha256.
 
 ### Added
 
+- `sudo k3sm network lan status` lists the sockets on this Mac a LAN peer can reach that LAN access
+  does not move: host-network pods, pod processes that bind an explicit address, macOS services, and
+  the node daemon's own control-plane ports in a block of their own. See
+  [LAN access](docs/user/install.md#lan-access).
 - The server publishes the pinned guest kernel and initramfs it verified at start to its own cluster
   registry as `k3sm-system/guest:<pin>` (artifactType `application/vnd.k3sm.guest.v1`, one raw layer
   each, the layer digests the pin's). A re-publish uploads nothing already present and leaves a tag

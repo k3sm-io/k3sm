@@ -356,6 +356,18 @@ nothing on your Wi-Fi or Ethernet does. With it on, they bind every interface.
 - `k3sm network lan status` and `k3sm status` show the recorded setting and, run as root, the state
   the node daemon reports serving, and say when the two differ. With no setting recorded they say
   that LAN access is on because nothing is recorded.
+- Run as root, `k3sm network lan status` also lists what LAN access does not move: every TCP
+  listening socket and bound UDP socket on this Mac whose address is not loopback, not in the
+  cluster pod and mesh range, not in the Service range and not on the vm NAT segment. A pod on the
+  host network, or a pod process that binds an explicit address, can listen on your Wi-Fi this way
+  even with LAN access off. The sockets of the node daemon, of the root network helper `k3sm netd`,
+  and of their child processes (chosen by process id, never by name), such as the join port `9345`
+  on a server and the wireguard port `51820`, are listed under
+  "k3sm control-plane ports (not moved by LAN access):". Everything else, macOS services such as
+  AirPlay included, is listed under "Listening on a LAN-reachable address (not moved by LAN
+  access):", each with its pid, command, protocol and address. As a user it says the check needs
+  root. If `lsof` fails, or prints anything the check does not recognise, it prints one line saying
+  the check failed instead of a list.
 - The record must be a regular file owned by root and writable by no one else. Anything else is
   treated as unusable, and the node daemon serves LAN access off until it is set again.
 - On a stopped node the setting is recorded and applies at `sudo k3sm start`.
