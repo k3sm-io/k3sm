@@ -98,10 +98,13 @@ var vmHostKillWait = 5 * time.Second
 
 // flushPrefixes is what the lo0 flush removes, and where that came from. A nil
 // prefixes with a non-nil err means the source could not be read, and the
-// flush is skipped rather than guessed.
+// flush is skipped rather than guessed. A non-nil err with prefixes means the
+// Service range was refused (refused names the value) and only the pinned pod
+// aggregate is flushed: it is a constant, never the refused input.
 type flushPrefixes struct {
 	prefixes []netip.Prefix
 	source   string
+	refused  string
 	err      error
 }
 
@@ -110,10 +113,13 @@ type flushPrefixes struct {
 // with, read from the --service-cidr of the installed netd plist. The plist is
 // the record: it is what install rendered from the operator's --service-cidr,
 // what launchd hands netd, and it stays on disk across a stop. A missing or
-// unreadable plist, or one whose --service-cidr does not parse or fails
-// recordedServiceRangeSafe (a range no working Service range could have, which
-// would widen the root sweep to the host's own addresses), is an error and no
-// prefixes: the caller skips the flush rather than flush a guessed range.
+// unreadable plist, one with no --service-cidr, or one whose --service-cidr
+// fails recordedServiceRangeSafe (a range no working Service range could have,
+// which would widen the root sweep to the host's own addresses), is an error.
+// A missing or unparsable plist, or no --service-cidr, yields no prefixes, so
+// the caller skips the flush rather than act on a record it cannot read; a
+// recorded --service-cidr that is refused keeps the pinned pod aggregate and
+// drops only the Service range.
 func recordedFlushPrefixes(sys System, cfg Config) flushPrefixes {
 	path := cfg.plistPath(NetdLabel)
 	fp := flushPrefixes{source: path}
@@ -127,8 +133,15 @@ func recordedFlushPrefixes(sys System, cfg Config) flushPrefixes {
 		fp.err = fmt.Errorf("parse the installed netd plist %s: %w", path, err)
 		return fp
 	}
-	svc, err := recordedServiceRangeSafe(flagValue(args, "service-cidr"))
+	recorded := flagValue(args, "service-cidr")
+	if recorded == "" {
+		fp.err = fmt.Errorf("the installed netd plist %s carries no --service-cidr", path)
+		return fp
+	}
+	svc, err := recordedServiceRangeSafe(recorded)
 	if err != nil {
+		fp.prefixes = []netip.Prefix{podnet.ClusterPodCIDR}
+		fp.refused = recorded
 		fp.err = fmt.Errorf("the installed netd plist %s carries no usable --service-cidr: %w", path, err)
 		return fp
 	}
@@ -139,7 +152,8 @@ func recordedFlushPrefixes(sys System, cfg Config) flushPrefixes {
 // configFlushPrefixes is the lo0 flush scope taken from cfg alone, for the one
 // caller that may not skip the flush: uninstall on a Mac whose netd plist is
 // already gone (a partial earlier uninstall). An empty range flushes the pod
-// aggregate alone; one that fails recordedServiceRangeSafe flushes nothing.
+// aggregate alone; so does one that fails recordedServiceRangeSafe, which is
+// also returned as the error.
 func configFlushPrefixes(cfg Config) flushPrefixes {
 	fp := flushPrefixes{prefixes: []netip.Prefix{podnet.ClusterPodCIDR}, source: "the uninstall configuration (no installed netd plist)"}
 	if cfg.ServiceCIDR == "" {
@@ -147,7 +161,9 @@ func configFlushPrefixes(cfg Config) flushPrefixes {
 	}
 	svc, err := recordedServiceRangeSafe(cfg.ServiceCIDR)
 	if err != nil {
-		return flushPrefixes{source: fp.source, err: fmt.Errorf("the uninstall configuration carries no usable Service range: %w", err)}
+		fp.refused = cfg.ServiceCIDR
+		fp.err = fmt.Errorf("the uninstall configuration carries no usable Service range: %w", err)
+		return fp
 	}
 	fp.prefixes = append(fp.prefixes, svc)
 	return fp
@@ -252,10 +268,15 @@ func flushHostNetwork(sys System, cfg Config, fp flushPrefixes, icIndex int) ([]
 	// stale-sweep range. Scope: the pinned cluster pod aggregate + the Service
 	// CIDR — exactly the address space k3sm ever aliases (never the host's own
 	// addresses). This runs as root, so it is direct ifconfig, no helper.
-	if fp.err != nil {
+	switch {
+	case fp.err != nil && fp.refused != "":
+		cfg.Logger.Warn("lo0 aliases not flushed for the Service range: the recorded range is refused, and only the pinned pod aggregate is flushed", "source", fp.source, "refused", fp.refused, "err", fp.err)
+		add(LeftoverLo0, fp.err)
+	case fp.err != nil:
 		cfg.Logger.Warn("lo0 aliases not flushed: the range k3sm aliased on this Mac is not known, and a guessed range is never flushed", "source", fp.source, "err", fp.err)
 		add(LeftoverLo0, fp.err)
-	} else {
+	}
+	if len(fp.prefixes) > 0 {
 		add(LeftoverLo0, sys.FlushLo0Aliases(fp.prefixes))
 	}
 	// Backstop: the interconnect aliases on bridge0 that netd's ledger owns, and
