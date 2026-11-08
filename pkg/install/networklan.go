@@ -104,10 +104,17 @@ func ParseLAN(s string) (LAN, error) {
 	return "", fmt.Errorf("%w: LAN access is %q, want on or off", ErrNetworkRecord, s)
 }
 
-// NetworkRecordVersion is the schema version EncodeNetworkRecord stamps and
-// DecodeNetworkRecord accepts; a record from a newer k3sm is refused rather
-// than guessed at.
+// NetworkRecordVersion is the schema version EncodeNetworkRecord stamps on a
+// permanent record; a record from a newer k3sm is refused rather than guessed
+// at.
 const NetworkRecordVersion = 1
+
+// NetworkRecordVersionExpiry is the schema version of a record that carries
+// an expiry (`k3sm network lan on --for`). It is a separate version so a
+// daemon from before expiries refuses the record, and its refusal serves off;
+// that daemon's decoder ignores unknown fields, so a version 1 record with an
+// expiry would read as on for good.
+const NetworkRecordVersionExpiry = 2
 
 // DefaultNetworkRecordPath is where the LAN switch is recorded: beside the
 // arguments records in root-owned /Library/Preferences, so only root can
@@ -123,7 +130,8 @@ const networkRecordMode fs.FileMode = 0o644
 
 // NetworkRecord is the recorded LAN switch.
 type NetworkRecord struct {
-	// Version is the schema version; always NetworkRecordVersion on write.
+	// Version is the schema version: NetworkRecordVersion on write, or
+	// NetworkRecordVersionExpiry when the record carries ExpiresAt.
 	Version int `json:"version"`
 	// LAN is on or off.
 	LAN LAN `json:"lan"`
@@ -134,6 +142,35 @@ type NetworkRecord struct {
 	UpdatedBy string `json:"updatedBy"`
 	// UpdatedAt is when it was written.
 	UpdatedAt time.Time `json:"updatedAt"`
+	// ExpiresAt, when set, is the absolute UTC time at which LAN access on
+	// lapses back to off by itself. Only an on record carries one.
+	ExpiresAt *time.Time `json:"expiresAt,omitempty"`
+}
+
+// Effective is the LAN state the record puts in force at now: on only when
+// the record says on and it has no expiry or now is before it; off otherwise.
+func (r NetworkRecord) Effective(now time.Time) LAN {
+	if r.LAN != LANOn {
+		return LANOff
+	}
+	if r.ExpiresAt != nil && !now.Before(*r.ExpiresAt) {
+		return LANOff
+	}
+	return LANOn
+}
+
+// Lapsed reports whether the record was on with an expiry that has passed at
+// now, so it now reads as off.
+func (r NetworkRecord) Lapsed(now time.Time) bool {
+	return r.LAN == LANOn && r.ExpiresAt != nil && !now.Before(*r.ExpiresAt)
+}
+
+// recordVersion is the schema version a record of this shape is written as.
+func (r NetworkRecord) recordVersion() int {
+	if r.ExpiresAt != nil {
+		return NetworkRecordVersionExpiry
+	}
+	return NetworkRecordVersion
 }
 
 // NewNetworkRecord returns a record of lan with a fresh serial, stamped by
@@ -152,9 +189,17 @@ func NewNetworkRecord(lan LAN, verb string) NetworkRecord {
 
 // EncodeNetworkRecord returns the bytes a record is written as.
 func EncodeNetworkRecord(r NetworkRecord) ([]byte, error) {
-	r.Version = NetworkRecordVersion
-	if _, err := ParseLAN(string(r.LAN)); err != nil {
+	r.Version = r.recordVersion()
+	lan, err := ParseLAN(string(r.LAN))
+	if err != nil {
 		return nil, err
+	}
+	if r.ExpiresAt != nil {
+		if lan != LANOn {
+			return nil, fmt.Errorf("%w: only LAN access on can carry an expiry", ErrNetworkRecord)
+		}
+		t := r.ExpiresAt.UTC()
+		r.ExpiresAt = &t
 	}
 	data, err := json.MarshalIndent(r, "", "  ")
 	if err != nil {
@@ -168,8 +213,9 @@ func EncodeNetworkRecord(r NetworkRecord) ([]byte, error) {
 const MaxNetworkRecordBytes = 4096
 
 // DecodeNetworkRecord parses a record, refusing an unknown version or value,
-// an oversized record, and anything after the one JSON value, with
-// ErrNetworkRecord.
+// an oversized record, anything after the one JSON value, and an expiry that
+// does not match its version (version 2 carries one on an on record, version
+// 1 never does), with ErrNetworkRecord.
 func DecodeNetworkRecord(data []byte) (NetworkRecord, error) {
 	if len(data) > MaxNetworkRecordBytes {
 		return NetworkRecord{}, fmt.Errorf("%w: larger than %d bytes", ErrNetworkRecord, MaxNetworkRecordBytes)
@@ -182,14 +228,22 @@ func DecodeNetworkRecord(data []byte) (NetworkRecord, error) {
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		return NetworkRecord{}, fmt.Errorf("%w: data after the record", ErrNetworkRecord)
 	}
-	if r.Version != NetworkRecordVersion {
-		return NetworkRecord{}, fmt.Errorf("%w: unknown version %d, this k3sm understands %d", ErrNetworkRecord, r.Version, NetworkRecordVersion)
+	if r.Version != NetworkRecordVersion && r.Version != NetworkRecordVersionExpiry {
+		return NetworkRecord{}, fmt.Errorf("%w: unknown version %d, this k3sm understands %d and %d", ErrNetworkRecord, r.Version, NetworkRecordVersion, NetworkRecordVersionExpiry)
 	}
 	lan, err := ParseLAN(string(r.LAN))
 	if err != nil {
 		return NetworkRecord{}, err
 	}
 	r.LAN = lan
+	switch {
+	case r.Version == NetworkRecordVersion && r.ExpiresAt != nil:
+		return NetworkRecord{}, fmt.Errorf("%w: a version %d record carries no expiry", ErrNetworkRecord, NetworkRecordVersion)
+	case r.Version == NetworkRecordVersionExpiry && r.ExpiresAt == nil:
+		return NetworkRecord{}, fmt.Errorf("%w: a version %d record carries an expiry", ErrNetworkRecord, NetworkRecordVersionExpiry)
+	case r.ExpiresAt != nil && lan != LANOn:
+		return NetworkRecord{}, fmt.Errorf("%w: only LAN access on can carry an expiry", ErrNetworkRecord)
+	}
 	return r, nil
 }
 
