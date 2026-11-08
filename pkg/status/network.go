@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io/fs"
 	"strings"
+	"time"
 
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/install"
@@ -31,11 +32,15 @@ import (
 // state the node daemon reports applying. It is additive and carries no
 // verdict or state word.
 type Network struct {
-	// LAN is the RECORDED setting: "on" (workload listeners answer on every
-	// interface) or "off" (only on this Mac and the cluster mesh). When the
-	// record exists but cannot be used it is "off", which is what the node
-	// daemon serves in that case.
+	// LAN is the EFFECTIVE recorded setting: "on" (workload listeners answer
+	// on every interface) or "off" (only on this Mac and the cluster mesh). A
+	// timed "on" whose expiry has passed is "off", and so is a record that
+	// exists but cannot be used, which is what the node daemon serves in both
+	// cases.
 	LAN string `json:"lan"`
+	// ExpiresAt is when a timed "on" (`lan on --for`) reverts to off. It is
+	// set only while that window is still open; omitted otherwise.
+	ExpiresAt *time.Time `json:"expiresAt,omitempty"`
 	// Recorded is false when no setting is recorded (an install from before
 	// the switch), which reads as on.
 	Recorded bool `json:"recorded"`
@@ -80,7 +85,15 @@ func (c Collector) network(role dataroot.Role, installed bool) *Network {
 	if rec, present, err := c.Network(); err != nil {
 		n.LAN, n.Recorded, n.RecordState = string(install.LANOff), true, NetworkRecordUnreadable
 	} else {
-		n.LAN, n.Recorded = string(rec.LAN), present
+		now := time.Now()
+		if c.Now != nil {
+			now = c.Now()
+		}
+		n.LAN, n.Recorded = string(rec.Effective(now)), present
+		if rec.Effective(now) == install.LANOn && rec.ExpiresAt != nil {
+			exp := rec.ExpiresAt.UTC()
+			n.ExpiresAt = &exp
+		}
 	}
 	if c.NetworkApplied != nil {
 		data, err := c.NetworkApplied(role)
@@ -103,7 +116,11 @@ func networkLine(r Report) string {
 	if n == nil {
 		return ""
 	}
-	line := fmt.Sprintf("LAN access %s (%s); always on: %s", n.LAN, strings.Join(n.Covers, ", "), strings.Join(n.AlwaysOn, ", "))
+	state := n.LAN
+	if n.ExpiresAt != nil {
+		state += " until " + n.ExpiresAt.Local().Format(time.RFC3339)
+	}
+	line := fmt.Sprintf("LAN access %s (%s); always on: %s", state, strings.Join(n.Covers, ", "), strings.Join(n.AlwaysOn, ", "))
 	switch {
 	case n.RecordState == NetworkRecordUnreadable:
 		line += "\nthe LAN access record cannot be used, so the node daemon serves LAN access off until it is fixed (sudo k3sm network lan on|off)"
