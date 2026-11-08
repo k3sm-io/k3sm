@@ -2806,12 +2806,18 @@ self_test_body() {
 
 # self_test — the body under a watchdog: a hung check is a FAIL, never a pass.
 self_test() {
-	local pid wd rc
+	local pid wd rc kids
 	self_test_body &
 	pid=$!
 	(
 		sleep "$SELFTEST_WATCHDOG"
+		# TERM to the body alone would leave its foreground child (the hung check)
+		# running as an orphan: note the children, kill the body (so its exit status
+		# is the signal, never the check's return), then the children.
+		kids="$(pgrep -P "$pid" 2>/dev/null)"
 		kill -TERM "$pid" 2>/dev/null
+		# shellcheck disable=SC2086 # a whitespace-separated pid list
+		[ -z "$kids" ] || kill -TERM $kids 2>/dev/null
 	) >/dev/null 2>&1 &
 	wd=$!
 	wait "$pid"
