@@ -160,7 +160,8 @@ func onUntil(exp time.Time) install.NetworkRecord {
 // the node daemon turns LAN access off by itself on the first tick past the
 // expiry (moving the families to the local set), a start past the expiry
 // reads off, a later permanent on is not reverted, a failed revert retries on
-// the next tick, Effective judges nil, future and past expiries, and the
+// the next tick, a clock stepped back after a revert does not reopen it,
+// Effective judges nil, future and past expiries, and the
 // record schema is version 2 with an expiry and version 1 without.
 func TestLanOnForRevertsAtExpiry(t *testing.T) {
 	exp := lanT0.Add(10 * time.Minute)
@@ -266,6 +267,28 @@ func TestLanOnForRevertsAtExpiry(t *testing.T) {
 			if s.lan != install.LANOn {
 				t.Errorf("family moved to %s, want only on", s.lan)
 			}
+		}
+	})
+
+	t.Run("a clock stepped back after the revert does not reopen the window", func(t *testing.T) {
+		r := newExpiryRig(t, ptr(onUntil(exp)), lanT0)
+		r.clock.set(exp)
+		if did, err := r.sw.expireTick(context.Background()); !did || err != nil {
+			t.Fatalf("tick at the expiry = (%v, %v), want a revert", did, err)
+		}
+		r.clock.set(exp.Add(-5 * time.Minute)) // an NTP correction steps the wall clock back
+		if did, err := r.sw.expireTick(context.Background()); did || err != nil {
+			t.Fatalf("tick after the step back = (%v, %v), want nothing done", did, err)
+		}
+		if got := r.sw.state(); got != install.LANOff {
+			t.Errorf("state = %s, want off (the lapse is latched)", got)
+		}
+		r.write(t, onUntil(exp.Add(time.Hour))) // a fresh --for is a new serial and opens again
+		if err := r.sw.apply(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if got := r.sw.state(); got != install.LANOn {
+			t.Errorf("state after a new timed on = %s, want on", got)
 		}
 	})
 

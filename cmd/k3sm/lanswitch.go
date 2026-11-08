@@ -99,8 +99,14 @@ type lanSwitch struct {
 	tick func() (<-chan time.Time, func())
 	log  *slog.Logger
 
-	mu       sync.Mutex
-	lan      install.LAN
+	mu  sync.Mutex
+	lan install.LAN
+	// lapsed is the serial of a timed record this daemon has already seen
+	// past its expiry. That record stays off even if the wall clock later
+	// steps back before the expiry, so a clock correction cannot reopen an
+	// expired window. Guarded by mu, except in load, which runs before any
+	// concurrent use.
+	lapsed   string
 	serial   string
 	spec     string
 	node     netip.Addr
@@ -138,7 +144,20 @@ func (s *lanSwitch) load() {
 		s.lan = install.LANOff
 		return
 	}
-	s.lan, s.serial = rec.Effective(s.clock()), rec.Serial
+	s.lan, s.serial = s.effective(rec), rec.Serial
+}
+
+// effective is the LAN access a record grants now, latching a timed record
+// off once this daemon has seen it lapse (see lapsed).
+func (s *lanSwitch) effective(rec install.NetworkRecord) install.LAN {
+	now := s.clock()
+	if rec.Lapsed(now) {
+		s.lapsed = rec.Serial
+	}
+	if rec.ExpiresAt != nil && rec.Serial != "" && rec.Serial == s.lapsed {
+		return install.LANOff
+	}
+	return rec.Effective(now)
 }
 
 // clock is the switch's time now.
@@ -227,7 +246,7 @@ func (s *lanSwitch) apply(ctx context.Context) error {
 		s.report(rec.Serial, err)
 		return err
 	}
-	lan := rec.Effective(s.clock())
+	lan := s.effective(rec)
 	sets, err := s.resolve(lan)
 	if err != nil {
 		err = fmt.Errorf("resolve LAN access %s: %w", lan, err)
@@ -343,7 +362,7 @@ func (s *lanSwitch) expiryDue() bool {
 	if err != nil {
 		return false
 	}
-	return rec.Effective(s.clock()) != s.lan
+	return s.effective(rec) != s.lan
 }
 
 // state returns the LAN state in force.

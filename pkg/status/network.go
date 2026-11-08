@@ -89,8 +89,9 @@ func (c Collector) network(role dataroot.Role, installed bool) *Network {
 		if c.Now != nil {
 			now = c.Now()
 		}
-		n.LAN, n.Recorded = string(rec.Effective(now)), present
-		if rec.Effective(now) == install.LANOn && rec.ExpiresAt != nil {
+		eff := rec.Effective(now)
+		n.LAN, n.Recorded = string(eff), present
+		if eff == install.LANOn && rec.ExpiresAt != nil {
 			exp := rec.ExpiresAt.UTC()
 			n.ExpiresAt = &exp
 		}

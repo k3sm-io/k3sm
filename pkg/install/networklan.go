@@ -450,7 +450,7 @@ func writeInstallNetworkRecord(sys System, cfg Config, prior bool) error {
 	}
 	lan, write := DecideInstallLAN(cfg.LAN, present && err == nil, rec.LAN, prior)
 	if !write {
-		cfg.Logger.Info("LAN access kept as recorded", "lan", string(lan), "record", cfg.NetworkRecord)
+		cfg.Logger.Info("LAN access kept as recorded", "lan", string(rec.Effective(time.Now())), "record", cfg.NetworkRecord)
 		return nil
 	}
 	if err := WriteNetworkRecord(sys, cfg.NetworkRecord, NewNetworkRecord(lan, "k3sm install")); err != nil {
