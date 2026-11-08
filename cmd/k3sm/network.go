@@ -89,6 +89,9 @@ type networkEnv struct {
 	// root (lsof). It is the proof an apply took effect; the daemon's own
 	// report is only a progress signal.
 	Sockets func(ctx context.Context, pid int) ([]netip.AddrPort, error)
+	// SocketTable lists every TCP listening and bound UDP socket on this
+	// Mac with its process, as root (lsof): the exposure section of status.
+	SocketTable func(ctx context.Context) ([]lanSocket, error)
 	// HostAddrs is this Mac's interface addresses.
 	HostAddrs func() ([]netip.Addr, error)
 	// NodeArgs reads the installed node daemon's operator arguments.
@@ -105,16 +108,17 @@ type networkEnv struct {
 func defaultNetworkEnv(stdout, stderr io.Writer) networkEnv {
 	sys := install.NewDarwinSystem()
 	return networkEnv{
-		Sys:        sys,
-		RecordPath: install.DefaultNetworkRecordPath,
-		DataRoot:   install.DefaultDataRoot,
-		StopMarker: install.DefaultStopMarkerPath,
-		Geteuid:    os.Geteuid,
-		Signal:     launchctlHUP,
-		ReadRecord: install.ReadNetworkRecordFile,
-		Sockets:    lsofListeners,
-		HostAddrs:  nodePortHostAddrs,
-		NodeArgs:   func(role install.Role) ([]string, error) { return install.InstalledNodeArgs(sys, role) },
+		Sys:         sys,
+		RecordPath:  install.DefaultNetworkRecordPath,
+		DataRoot:    install.DefaultDataRoot,
+		StopMarker:  install.DefaultStopMarkerPath,
+		Geteuid:     os.Geteuid,
+		Signal:      launchctlHUP,
+		ReadRecord:  install.ReadNetworkRecordFile,
+		Sockets:     lsofListeners,
+		SocketTable: lsofSocketTable,
+		HostAddrs:   nodePortHostAddrs,
+		NodeArgs:    func(role install.Role) ([]string, error) { return install.InstalledNodeArgs(sys, role) },
 		Restart: func(ctx context.Context) error {
 			return install.Restart(ctx, sys, lifecycleConfig(sys, nil, stderr), install.ActorUser, "k3sm network lan")
 		},
@@ -151,7 +155,7 @@ func runNetworkEnv(ctx context.Context, args []string, env networkEnv) int {
 	}
 	switch args[1] {
 	case "status":
-		return networkLANStatus(env)
+		return networkLANStatus(ctx, env)
 	case string(install.LANOn), string(install.LANOff):
 		if env.Geteuid() != 0 {
 			fmt.Fprintf(env.Stderr, "k3sm network lan %s must run as root: use 'sudo k3sm network lan %s' (nothing was done)\n", args[1], args[1])
@@ -373,8 +377,8 @@ func waitNetworkApplied(ctx context.Context, env networkEnv, role install.Role, 
 // networkLANStatus is `k3sm network lan status`: the recorded setting (and
 // that it is the no-record default when it is), what it covers and what it
 // does not, and the state the node daemon reports applying, which only root
-// can read.
-func networkLANStatus(env networkEnv) int {
+// can read, then the sockets a LAN peer can reach (root only).
+func networkLANStatus(ctx context.Context, env networkEnv) int {
 	role, err := installedNodeRole(env.Sys)
 	if err != nil {
 		fmt.Fprintf(env.Stderr, "k3sm network lan status: %v\n", err)
@@ -392,6 +396,9 @@ func networkLANStatus(env networkEnv) int {
 	fmt.Fprintf(env.Stdout, "Covers: %s\n", strings.Join(install.LANCovers(role), ", "))
 	fmt.Fprintf(env.Stdout, "Always on: %s\n", strings.Join(install.LANAlwaysOn(role), ", "))
 	fmt.Fprintln(env.Stdout, appliedLine(env.Sys.ReadFile(install.NetworkAppliedPath(env.DataRoot, role))))
+	for _, line := range lanExposureFor(ctx, env, role).lines() {
+		fmt.Fprintln(env.Stdout, line)
+	}
 	return 0
 }
 
