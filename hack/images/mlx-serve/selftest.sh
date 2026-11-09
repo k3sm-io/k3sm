@@ -2790,8 +2790,8 @@ rung_9a
 # here, independently of stage-job.sh, so an edited pin goes red until it is
 # re-checked against the release's published sha256 and edited here too.
 STAGEJOB="$HERE/stage-job.sh"
-GOLD_UV_VERSION="0.13.1"
-GOLD_UV_SHA256="cfe454573412ff7380d15fc7dae5997ab53ffce72fce0a78e91ddbc84001acd2"
+GOLD_UV_VERSION="0.13.5"
+GOLD_UV_SHA256="743f85035a1996ecb350659e01cd9faea9709829be09b1b4b03c73eaf3c9cd73"
 GOLD_UV_URL="https://github.com/astral-sh/uv/releases/download/$GOLD_UV_VERSION/uv-aarch64-apple-darwin.tar.gz"
 GOLD_NODE="k3sm-golden"
 RJ="$WORK/stage-job.yaml"

@@ -48,12 +48,12 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # is not a pin — a later uv ships a newer python-build-standalone build of the
 # same CPython patch version — so the URL is asserted before staging.
 PY_KEY="cpython-3.12.15-macos-aarch64-none"
-PY_URL="https://releases.astral.sh/github/python-build-standalone/releases/download/20261013/cpython-3.12.15%2B20261013-aarch64-apple-darwin-install_only_stripped.tar.gz"
+PY_URL="https://releases.astral.sh/github/python-build-standalone/releases/download/20261021/cpython-3.12.15%2B20261021-aarch64-apple-darwin-install_only_stripped.tar.gz"
 PY_BIN="bin/python3.12"
 # The uv that generated requirements.lock. Older uv is refused rather than
 # tried: the JSON interpreter listing this script pins against is not in every
 # release, and a silent skip of the URL assertion would un-pin the interpreter.
-UV_MIN="0.13.1"
+UV_MIN="0.13.5"
 
 # The serving contract, and the one flag the engine will not work without.
 # At its defaults this engine serves ONE request at a time and answers HTTP 503
