@@ -25,11 +25,8 @@ import (
 	"strconv"
 	"strings"
 
-	"k3sm.io/darwin-net/pkg/podnet"
-
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/install"
-	"k3sm.io/k3sm/pkg/netserve"
 	"k3sm.io/k3sm/pkg/ports"
 )
 
@@ -43,8 +40,7 @@ var errLANMismatch = errors.New("the node daemon's listening sockets do not matc
 type lanSocketPolicy struct {
 	want install.LAN
 	// lanAddrs are this Mac's network-facing addresses: its interface
-	// addresses other than loopback, the cluster pod/mesh range and the vm
-	// NAT segment.
+	// addresses other than loopback and lanInternalPrefixes.
 	lanAddrs []netip.Addr
 	// alwaysOn are the ports allowed on every interface whatever the switch
 	// says (the worker join port on a server).
@@ -129,14 +125,16 @@ func addrsString(addrs []netip.Addr) string {
 }
 
 // lanFacingAddrs filters this Mac's interface addresses to the ones a LAN
-// peer can reach: not loopback, not the cluster pod and mesh range, not the vm
-// NAT segment.
-func lanFacingAddrs(host []netip.Addr) []netip.Addr {
-	vmnet, _ := netip.ParsePrefix(netserve.DefaultVMNetSubnet)
+// peer can reach: not loopback, not inside lanInternalPrefixes(args) (the
+// cluster pod and mesh range, the Service range, the vm NAT segment). A
+// Service range that does not parse excludes nothing, which only widens the
+// set the off check guards.
+func lanFacingAddrs(args []string, host []netip.Addr) []netip.Addr {
+	internal, _ := lanInternalPrefixes(args)
 	var out []netip.Addr
 	for _, a := range host {
 		a = a.Unmap()
-		if !a.IsValid() || a.IsLoopback() || a.IsUnspecified() || podnet.ClusterPodCIDR.Contains(a) || (vmnet.IsValid() && vmnet.Contains(a)) {
+		if !a.IsValid() || a.IsLoopback() || a.IsUnspecified() || slices.ContainsFunc(internal, func(p netip.Prefix) bool { return p.Contains(a) }) {
 			continue
 		}
 		out = append(out, a)
@@ -149,7 +147,7 @@ func lanFacingAddrs(host []netip.Addr) []netip.Addr {
 func lanPolicyFor(want install.LAN, role install.Role, args []string, host []netip.Addr) lanSocketPolicy {
 	p := lanSocketPolicy{
 		want:         want,
-		lanAddrs:     lanFacingAddrs(host),
+		lanAddrs:     lanFacingAddrs(args, host),
 		alwaysOn:     map[uint16]bool{},
 		exempt:       map[uint16]bool{uint16(ports.KubeletAPIPort): true},
 		nodePortSpec: strings.TrimSpace(install.ServerArgValue(args, nodePortAddressesFlag)) != "",

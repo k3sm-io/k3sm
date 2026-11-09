@@ -25,6 +25,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"k3sm.io/k3sm/pkg/install"
 )
 
 // fakeExit is a process exit status as the lsof runner sees one.
@@ -46,7 +48,8 @@ func fakeLsof(stdout, stderr string, err error, gotArgs *[]string) lsofExec {
 
 // TestLanVerifyUsesHardenedLsofReader proves the post-apply socket proof reads
 // the node daemon's listeners through the same hardened, fail-closed lsof
-// runner and parser as the exposure check, per pid.
+// runner and parser as the exposure check, per pid, and that the LAN-facing
+// address set excludes the one internal-range list.
 func TestLanVerifyUsesHardenedLsofReader(t *testing.T) {
 	const pid = 4242
 	ap := netip.MustParseAddrPort
@@ -113,4 +116,31 @@ func TestLanVerifyUsesHardenedLsofReader(t *testing.T) {
 		})
 	}
 
+	lan := netip.MustParseAddr("192.0.2.20")
+	facing := []struct {
+		name string
+		args []string
+		host string
+		keep bool
+	}{
+		{"a LAN address is kept", nil, "192.0.2.20", true},
+		{"a pod-range address is dropped", nil, "100.64.0.1", false},
+		{"a default Service-range address is dropped", nil, "10.43.0.10", false},
+		{"an overridden Service-range address is dropped", []string{"--" + install.ServiceCIDRFlag, "10.96.0.0/12"}, "10.96.0.1", false},
+		{"the default Service range no longer applies once overridden", []string{"--" + install.ServiceCIDRFlag, "10.96.0.0/12"}, "10.43.0.10", true},
+		{"a vm NAT address is dropped", nil, "192.168.64.1", false},
+		{"loopback is dropped", nil, "127.0.0.1", false},
+	}
+	for _, tc := range facing {
+		t.Run("lanFacingAddrs: "+tc.name, func(t *testing.T) {
+			a := netip.MustParseAddr(tc.host)
+			got := lanFacingAddrs(tc.args, []netip.Addr{a, lan})
+			if !slices.Contains(got, lan) {
+				t.Errorf("lanFacingAddrs dropped the LAN address %s: %v", lan, got)
+			}
+			if slices.Contains(got, a) != tc.keep {
+				t.Errorf("lanFacingAddrs(%q) = %v, want %s kept=%v", tc.args, got, a, tc.keep)
+			}
+		})
+	}
 }

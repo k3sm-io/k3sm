@@ -257,6 +257,8 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
 
 ### Fixed
 
+- After `sudo k3sm network lan on|off`, the check of the node daemon's sockets no longer counts a
+  host address inside the Service range (`--service-cidr`, default `10.43.0.0/16`) as LAN-facing.
 - The sandbox now also denies pods the role's own work dir, by the path `k3sm server` or `k3sm agent`
   was started with, beside the data root's `server` and `agent` directories. Pods created before the
   upgrade keep their old profile until they are recreated. On the default paths, and in every layout

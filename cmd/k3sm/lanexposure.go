@@ -146,24 +146,28 @@ func lanExposureFor(ctx context.Context, env networkEnv, role install.Role) lanE
 	return e
 }
 
-// lanInternalPrefixes are the ranges no LAN peer routes to: the cluster pod
-// range (which holds the node's mesh address and its pod-range address), the
-// Service range from the node daemon's arguments (the default when absent)
-// and the vm NAT segment.
+// lanInternalPrefixes is the one list of the ranges no LAN peer routes to:
+// the cluster pod range (which holds the node's mesh address and its
+// pod-range address), the Service range from the node daemon's arguments
+// (install.DefaultServiceCIDR when absent) and the vm NAT segment. A range
+// that does not parse is left out and named in the error, so a caller that
+// must fail closed can, and one that only narrows a set can use the rest.
 func lanInternalPrefixes(args []string) ([]netip.Prefix, error) {
 	svc := strings.TrimSpace(install.ServerArgValue(args, install.ServiceCIDRFlag))
 	if svc == "" {
 		svc = install.DefaultServiceCIDR
 	}
 	out := []netip.Prefix{podnet.ClusterPodCIDR}
+	var errs []error
 	for _, s := range []string{svc, netserve.DefaultVMNetSubnet} {
 		p, err := netip.ParsePrefix(s)
 		if err != nil {
-			return nil, fmt.Errorf("parse the range %q: %w", s, err)
+			errs = append(errs, fmt.Errorf("parse the range %q: %w", s, err))
+			continue
 		}
 		out = append(out, p.Masked())
 	}
-	return out, nil
+	return out, errors.Join(errs...)
 }
 
 // lanReachable keeps the sockets of socks that a LAN peer can reach: not on
