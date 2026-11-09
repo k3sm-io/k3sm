@@ -618,11 +618,12 @@ bind/connect discipline that gives a Pod its own source address and port space. 
   with its own `searches` and `ndots`, natively and in a `vm` guest, and never falls back to the
   host resolver, with these exceptions and limits:
   - Numeric addresses, `localhost` and `*.localhost` resolve without a nameserver.
-  - Only IPv4 nameservers are used, up to three. IPv6 ones are skipped and the Pod gets a
-    `DNSConfigPartial` Warning Event. A Pod whose nameservers are all IPv6 does not start: its
-    containers wait in `CreateContainerConfigError`.
-  - `ndots: 0` is read as `ndots: 1`.
-  - At most 8 search domains are used; upstream allows 32.
+  - Only IPv4 nameservers are used. IPv6 ones are skipped and the Pod gets a `DNSConfigPartial`
+    Warning Event. A Pod whose nameservers are all IPv6 does not start: its containers wait in
+    `CreateContainerConfigError`.
+  - Up to three nameservers and 8 search domains are used; upstream allows 32 search domains. The
+    rest are dropped with a `DNSConfigForming` Warning Event naming them.
+  - `ndots: 0` is read as `ndots: 1`, with a `DNSConfigForming` Warning Event.
   - Options other than `ndots` reach a `vm` guest's `/etc/resolv.conf` only.
   - A process that loses the shim (above) resolves through the host.
   - After a downgrade to a release without this, a `None` Pod resolves through the host until it

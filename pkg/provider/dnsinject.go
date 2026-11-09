@@ -141,3 +141,29 @@ func injectPodDNSEnv(box *runtimev1.PodBox, policy corev1.DNSPolicy, dnsCfg netv
 	}
 	return nil
 }
+
+// clusterDNSPolicy reports whether the pod's DNSPolicy selects cluster DNS. An empty
+// policy is the upstream default (ClusterFirst). ClusterFirstWithHostNet MUST match
+// too: k3sm pods share the host network by construction, so that value is reachable —
+// matching only DNSClusterFirst would silently drop cluster DNS for those pods.
+// Default and None do NOT select cluster DNS: Default injects nothing, and None
+// injects its own config (injectPodDNSEnv).
+func clusterDNSPolicy(policy corev1.DNSPolicy) bool {
+	return policy == "" ||
+		policy == corev1.DNSClusterFirst ||
+		policy == corev1.DNSClusterFirstWithHostNet
+}
+
+// dnsNoneForming records what dnsPolicyNoneConfig altered in a pod's dnsConfig to
+// make it fit, so the pod can be told (warnDNSConfigForming, kubelet's
+// DNSConfigForming). The zero value means nothing was altered.
+type dnsNoneForming struct {
+	// droppedNameservers are the nameservers beyond netv1.MaxNameservers, after
+	// duplicates were removed. A repeated nameserver is removed silently: it
+	// changes nothing about resolution.
+	droppedNameservers []string
+	// droppedSearches are the search domains beyond dns.MaxSearchDomains.
+	droppedSearches []string
+	// ndotsZero is set when an explicit ndots:0 was applied as ndots 1.
+	ndotsZero bool
+}

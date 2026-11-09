@@ -22,15 +22,18 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	testclock "k8s.io/utils/clock/testing"
 
 	netv1 "k3sm.io/apis/net/v1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/darwin-net/pkg/dns"
+	"k3sm.io/darwin-net/pkg/podnet"
 	"k3sm.io/runtimed/pkg/sandbox"
 )
 
@@ -230,13 +233,23 @@ func TestToPodBoxDNSPolicyNoneInjectsCustomConfig(t *testing.T) {
 	})
 
 	t.Run("(v) all IPv6 fails closed as CreateContainerConfigError", func(t *testing.T) {
-		r, f, rec := noneTestProvider(t, nil)
+		g := newGuestDNSRecorder(t)
+		r, f, rec := noneTestProvider(t, g)
+		clk := testclock.NewFakeClock(time.Unix(10000, 0))
+		r.clk = clk
 		pod := nonePod("v6only", corev1.DNSNone, &corev1.PodDNSConfig{
 			Nameservers: []string{"2606:4700:4700::1111", "2001:4860:4860::8888"},
 		})
 		pod.Spec.InitContainers = nil
 		if err := r.CreatePod(ctx, pod); err != nil {
 			t.Fatalf("CreatePod = %v, want the pod parked (an error lands it ProviderFailed)", err)
+		}
+		// Refused from the spec alone, before anything was allocated for it.
+		if n := g.setupCount(); n != 0 {
+			t.Errorf("pod network Setup calls = %d, want 0 (no /32 drawn for a refused pod)", n)
+		}
+		if ip, ok := g.ipam.allocations()[string(pod.UID)]; ok {
+			t.Errorf("the refused pod holds address %s, want none", ip)
 		}
 		if box := liveBox(f, pod); box != nil {
 			t.Fatalf("the runtime received a box for an all-IPv6 None pod; it must never start (env %v)", dnsEnvKeys(box.GetContainers()[0]))
@@ -261,19 +274,169 @@ func TestToPodBoxDNSPolicyNoneInjectsCustomConfig(t *testing.T) {
 		if w.Message != msgDNSNoneIPv6Only {
 			t.Errorf("c0 waiting message = %q, want %q", w.Message, msgDNSNoneIPv6Only)
 		}
+		// The cause cannot change (spec.dnsConfig is immutable), so resyncs neither
+		// retry it nor repeat its Event: one Failed Warning, at the park.
+		for range 3 {
+			clk.Step(resyncInterval + time.Second)
+			if _, err := r.GetPodStatus(ctx, pod.Namespace, pod.Name); err != nil {
+				t.Fatalf("GetPodStatus after a resync: %v", err)
+			}
+		}
 		events := recordedEvents(rec.Events)
-		if !containsEvent(events, "Warning "+reasonFailed+" "+msgContainerConfigError(msgDNSNoneIPv6Only)) {
-			t.Errorf("events = %v, want the Warning Failed Event carrying %q", events, msgDNSNoneIPv6Only)
+		want := "Warning " + reasonFailed + " " + msgContainerConfigError(msgDNSNoneIPv6Only)
+		if n := countEvents(events, want); n != 1 {
+			t.Errorf("Failed Warning Events = %d, want exactly 1 (at the park, never per resync); events: %q", n, events)
+		}
+		if n := countEvents(events, " "+reasonPulling+" "); n != 0 {
+			t.Errorf("Pulling Events = %d for a pod that is never retried; events: %q", n, events)
+		}
+		f.mu.Lock()
+		calls = f.createCalls
+		f.mu.Unlock()
+		if calls != 0 {
+			t.Errorf("runtime CreatePod calls after resyncs = %d, want 0", calls)
+		}
+	})
+
+	t.Run("a None pod's bind discipline keeps the cluster Service CIDR", func(t *testing.T) {
+		r, _, _ := noneTestProvider(t, nil)
+		pod := nonePod("cidr", corev1.DNSNone, &corev1.PodDNSConfig{Nameservers: []string{"1.1.1.1"}})
+		// A distinct /32, so the bind discipline applies; buildBox is the
+		// production translation path.
+		box, err := r.buildBox(ctx, pod, "100.64.0.7")
+		if err != nil {
+			t.Fatalf("buildBox: %v", err)
+		}
+		want := podnet.ClusterPodCIDR.String() + ",10.43.0.0/16"
+		for _, c := range allContainers(box) {
+			if got := containerEnv(c)[podnet.EnvClusterCIDRs]; got != want {
+				t.Errorf("container %s: %s = %q, want %q (the Service CIDR from the node's DNS VIP, not the pod's resolver)", c.GetName(), podnet.EnvClusterCIDRs, got, want)
+			}
+		}
+	})
+
+	t.Run("DNSConfigPartial is recorded at create only", func(t *testing.T) {
+		r, _, rec := noneTestProvider(t, nil)
+		pod := nonePod("partial-once", corev1.DNSNone, &corev1.PodDNSConfig{
+			Nameservers: []string{"2606:4700:4700::1111", "1.1.1.1"},
+		})
+		if err := r.CreatePod(ctx, pod); err != nil {
+			t.Fatalf("CreatePod: %v", err)
+		}
+		// Every later translation (update, re-attach, parked retry) runs buildBox.
+		for range 2 {
+			if _, err := r.buildBox(ctx, pod, "100.64.0.7"); err != nil {
+				t.Fatalf("buildBox: %v", err)
+			}
+		}
+		events := recordedEvents(rec.Events)
+		if n := countEvents(events, " "+reasonDNSConfigPartial+" "); n != 1 {
+			t.Errorf("DNSConfigPartial Events = %d, want 1 (create only); events: %q", n, events)
+		}
+	})
+
+	t.Run("ndots 0 is applied as 1 with a DNSConfigForming Event", func(t *testing.T) {
+		r, f, rec := noneTestProvider(t, nil)
+		pod := nonePod("ndots0", corev1.DNSNone, &corev1.PodDNSConfig{
+			Nameservers: []string{"1.1.1.1"},
+			Options:     []corev1.PodDNSConfigOption{{Name: "ndots", Value: ptr("0")}},
+		})
+		if err := r.CreatePod(ctx, pod); err != nil {
+			t.Fatalf("CreatePod: %v", err)
+		}
+		box := liveBox(f, pod)
+		if box == nil {
+			t.Fatal("the runtime received no box")
+		}
+		if got := containerEnv(box.GetContainers()[0])[dns.EnvDNSNdots]; got != "1" {
+			t.Errorf("%s = %q, want %q", dns.EnvDNSNdots, got, "1")
+		}
+		events := recordedEvents(rec.Events)
+		if n := countEvents(events, "Warning "+reasonDNSConfigForming+" "+msgDNSNdotsZero); n != 1 {
+			t.Errorf("DNSConfigForming ndots Events = %d, want 1; events: %q", n, events)
+		}
+	})
+
+	t.Run("nameservers and search domains beyond the caps are dropped with DNSConfigForming", func(t *testing.T) {
+		r, f, rec := noneTestProvider(t, nil)
+		searches := []string{"s1.example", "s2.example", "s3.example", "s4.example", "s5.example",
+			"s6.example", "s7.example", "s8.example", "s9.example", "s10.example"}
+		pod := nonePod("caps", corev1.DNSNone, &corev1.PodDNSConfig{
+			Nameservers: []string{"1.1.1.1", "8.8.8.8", "9.9.9.9", "8.8.4.4"},
+			Searches:    searches,
+		})
+		if err := r.CreatePod(ctx, pod); err != nil {
+			t.Fatalf("CreatePod: %v", err)
+		}
+		box := liveBox(f, pod)
+		if box == nil {
+			t.Fatal("the runtime received no box: a pod over the caps must run on the first entries")
+		}
+		env := containerEnv(box.GetContainers()[0])
+		if got := env[dns.EnvDNSServers]; got != "1.1.1.1 8.8.8.8 9.9.9.9" {
+			t.Errorf("%s = %q, want the first three", dns.EnvDNSServers, got)
+		}
+		if got := env[dns.EnvDNSSearch]; got != strings.Join(searches[:dns.MaxSearchDomains], " ") {
+			t.Errorf("%s = %q, want the first %d", dns.EnvDNSSearch, got, dns.MaxSearchDomains)
+		}
+		events := recordedEvents(rec.Events)
+		if n := countEvents(events, "Warning "+reasonDNSConfigForming+" "+msgDNSNameserversCapped([]string{"8.8.4.4"})); n != 1 {
+			t.Errorf("nameserver DNSConfigForming Events = %d, want 1 naming 8.8.4.4; events: %q", n, events)
+		}
+		if n := countEvents(events, "Warning "+reasonDNSConfigForming+" "+msgDNSSearchesCapped([]string{"s9.example", "s10.example"})); n != 1 {
+			t.Errorf("search DNSConfigForming Events = %d, want 1 naming s9.example s10.example; events: %q", n, events)
+		}
+	})
+
+	t.Run("repeated nameservers are merged and the pod runs", func(t *testing.T) {
+		r, f, rec := noneTestProvider(t, nil)
+		pod := nonePod("dups", corev1.DNSNone, &corev1.PodDNSConfig{
+			Nameservers: []string{"1.1.1.1", "1.1.1.1", "::ffff:1.1.1.1", "9.9.9.9"},
+		})
+		if err := r.CreatePod(ctx, pod); err != nil {
+			t.Fatalf("CreatePod: %v", err)
+		}
+		box := liveBox(f, pod)
+		if box == nil {
+			t.Fatal("the runtime received no box: a pod with repeated nameservers must run")
+		}
+		if got := containerEnv(box.GetContainers()[0])[dns.EnvDNSServers]; got != "1.1.1.1 9.9.9.9" {
+			t.Errorf("%s = %q, want %q (first seen order, repeats merged)", dns.EnvDNSServers, got, "1.1.1.1 9.9.9.9")
+		}
+		if n := countEvents(recordedEvents(rec.Events), " "+reasonDNSConfigForming+" "); n != 0 {
+			t.Errorf("DNSConfigForming Events = %d, want 0: merging a repeat changes nothing", n)
 		}
 	})
 }
 
 // guestDNSRecorder is the real PodNetAdapter with every SetupGuest's dnsCfg
-// recorded, so a test sees the config the vm guest's resolv.conf is derived from.
+// recorded, so a test sees the config the vm guest's resolv.conf is derived from,
+// and every host-process Setup counted, so a test sees whether a /32 was drawn.
 type guestDNSRecorder struct {
 	*PodNetAdapter
-	mu   sync.Mutex
-	cfgs []netv1.DNSConfig
+	ipam   *fakeIPAM
+	mu     sync.Mutex
+	cfgs   []netv1.DNSConfig
+	setups int
+}
+
+func newGuestDNSRecorder(t *testing.T) *guestDNSRecorder {
+	t.Helper()
+	ipam := newFakeIPAM(t, "100.64.0.0/24")
+	return &guestDNSRecorder{PodNetAdapter: NewPodNetAdapter(ipam, testNodeIP, nil), ipam: ipam}
+}
+
+func (g *guestDNSRecorder) Setup(ctx context.Context, podID string) (string, error) {
+	g.mu.Lock()
+	g.setups++
+	g.mu.Unlock()
+	return g.PodNetAdapter.Setup(ctx, podID)
+}
+
+func (g *guestDNSRecorder) setupCount() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.setups
 }
 
 func (g *guestDNSRecorder) SetupGuest(ctx context.Context, podID string, dnsCfg netv1.DNSConfig) (sandbox.GuestNetworkConfig, error) {
@@ -311,7 +474,7 @@ func TestPodDNSConfigNoneFeedsGuestResolvConf(t *testing.T) {
 	}
 
 	t.Run("SetupGuest receives the pod's nameservers and no ClusterDNSIP", func(t *testing.T) {
-		g := &guestDNSRecorder{PodNetAdapter: NewPodNetAdapter(newFakeIPAM(t, "100.64.0.0/24"), testNodeIP, nil)}
+		g := newGuestDNSRecorder(t)
 		r, _, _ := noneTestProvider(t, g)
 		pod := vmNonePod("vmnone", "1.1.1.1", "9.9.9.9")
 		// The create's outcome past the guest network (the vm boot) is not what
@@ -351,7 +514,7 @@ func TestPodDNSConfigNoneFeedsGuestResolvConf(t *testing.T) {
 	})
 
 	t.Run("an all-IPv6 None vm pod is refused before an address is drawn", func(t *testing.T) {
-		g := &guestDNSRecorder{PodNetAdapter: NewPodNetAdapter(newFakeIPAM(t, "100.64.0.0/24"), testNodeIP, nil)}
+		g := newGuestDNSRecorder(t)
 		r, f, _ := noneTestProvider(t, g)
 		pod := vmNonePod("vmv6", "2606:4700:4700::1111")
 		if err := r.CreatePod(ctx, pod); err != nil {

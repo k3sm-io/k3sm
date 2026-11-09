@@ -932,6 +932,12 @@ type createFailure struct {
 	// volume is the image volume an artifact refusal named, and image is then
 	// that volume's reference. Empty for an image refusal.
 	volume string
+	// specOnly marks a refusal decided by the pod spec alone, which no retry can
+	// change: a dnsPolicy None config the in-pod resolver cannot honor
+	// (podDNSRefusal; spec.dnsConfig is immutable). It is filed under
+	// pullClassSpecChange, so it is never re-attempted and its one Warning Event,
+	// recorded at the park, is never repeated on a resync.
+	specOnly bool
 }
 
 // isContainerClassFailure reports whether a CreatePod refusal is about a
@@ -1013,7 +1019,24 @@ func (t *podTrack) markDeleting() {
 // parkCreate records a refused create, files its retry schedule, and announces
 // the failure with the same Events the started-pod path emits.
 func (r *runtimedRuntime) parkCreate(pod *corev1.Pod, t *podTrack, reason runtimev1.FailureReason, message string) {
-	cf := &createFailure{reason: reason, message: message}
+	r.park(pod, t, &createFailure{reason: reason, message: message})
+}
+
+// parkDNSRefusal parks a dnsPolicy None pod the in-pod resolver cannot honor, as
+// a CONTAINER_CONFIG refusal that is never retried (createFailure.specOnly): its
+// Failed Warning Event is recorded once, here.
+func (r *runtimedRuntime) parkDNSRefusal(pod *corev1.Pod, t *podTrack, refusal *podDNSRefusal) {
+	r.park(pod, t, &createFailure{
+		reason:   runtimev1.FailureReason_FAILURE_REASON_CONTAINER_CONFIG,
+		message:  refusal.Error(),
+		specOnly: true,
+	})
+}
+
+// park records cf as the track's refused create, files its schedule and records
+// its Events.
+func (r *runtimedRuntime) park(pod *corev1.Pod, t *podTrack, cf *createFailure) {
+	message := cf.message
 	if isArtifactPullRefusal(message) {
 		cf.volume, cf.image = attributeArtifactFailure(pod, message)
 	}
@@ -1043,6 +1066,9 @@ func (r *runtimedRuntime) parkCreate(pod *corev1.Pod, t *podTrack, reason runtim
 func (r *runtimedRuntime) observeParkedLocked(t *podTrack, podID string) []podEvent {
 	cf := t.parked
 	cls := failureClass(cf.reason, cf.message)
+	if cf.specOnly {
+		cls = pullClassSpecChange
+	}
 	pr, fresh := t.pullFor(cf.image, cls, r.clk)
 	// A one-shot re-attempt that failed for a cause of another class leaves its
 	// schedule behind with no worker (runPullOnce keeps the entry, so a resync
@@ -1338,12 +1364,14 @@ func (r *runtimedRuntime) retryParkedCreate(ctx context.Context, pod *corev1.Pod
 	ctx = withPodIdentity(ctx, pod)
 	// A dnsPolicy None refusal (podDNSRefusal) is the parked cause re-derived, not
 	// an RPC failure: it is answered as the CONTAINER_CONFIG refusal it was parked
-	// with, so the pod stays parked on the same cause.
+	// with, before anything is allocated, so the pod stays parked on the same
+	// cause. Such a pod is never scheduled for a retry (createFailure.specOnly);
+	// this answers a retry that reaches it by another path.
+	if refusal := r.dnsNoneRefusal(pod); refusal != nil {
+		return runtimev1.FailureReason_FAILURE_REASON_CONTAINER_CONFIG, refusal.Error(), nil
+	}
 	var dnsRefusal *podDNSRefusal
 	podIP, err := r.podIP(ctx, pod)
-	if errors.As(err, &dnsRefusal) {
-		return runtimev1.FailureReason_FAILURE_REASON_CONTAINER_CONFIG, dnsRefusal.Error(), nil
-	}
 	if err != nil {
 		return runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, "",
 			fmt.Errorf("allocate pod ip %s/%s: %w", pod.Namespace, pod.Name, err)
