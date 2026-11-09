@@ -291,11 +291,12 @@ func TestToPodBoxUnknownRuntimeClassFailsClosed(t *testing.T) {
 }
 
 // TestToPodBoxInjectsClusterDNSEnv pins the DNS keystone: toPodBox injects the
-// K3SM_DNS_* env the DYLD getaddrinfo shim reads (serialized by dns.ConfigToEnv) into
+// K3SM_DNS_* env the DYLD getaddrinfo shim reads (serialized by dns.ConfigToEnvChecked) into
 // EVERY container — init AND regular — for a cluster-first DNSPolicy, and injects
-// NOTHING for Default/None or an unusable config. Without it the shim defers to the
-// host resolver and in-pod cluster Service names never resolve. The NEGATIVE Default/
-// None cases are mandatory: without them an unconditional-injection regression would
+// NOTHING for Default or an unusable config (None injects its own config, pinned by
+// TestToPodBoxDNSPolicyNoneInjectsCustomConfig). Without it the shim defers to the
+// host resolver and in-pod cluster Service names never resolve. The NEGATIVE Default
+// case is mandatory: without them an unconditional-injection regression would
 // pass green (it would inject for a Default pod that opted out of cluster DNS). The
 // env references the dns.EnvDNS* consts (never bare string literals) so a rename of
 // the shim ABI can't silently desync the test from the encoder.
@@ -370,11 +371,12 @@ func TestToPodBoxInjectsClusterDNSEnv(t *testing.T) {
 		}
 	})
 
-	// Negative — Default and None opt out of cluster DNS: NO K3SM_DNS_* on any
-	// container (no env ⇒ the shim falls back to the host resolver, which is correct
-	// Default semantics; None custom-nameserver passthrough is handled elsewhere).
+	// Negative — Default opts out of cluster DNS: NO K3SM_DNS_* on any container (no
+	// env ⇒ the shim falls back to the host resolver, which is correct Default
+	// semantics). None is no longer an opt-out: it injects its own config, pinned by
+	// TestToPodBoxDNSPolicyNoneInjectsCustomConfig.
 	t.Run("opt-out policies inject nothing", func(t *testing.T) {
-		for _, policy := range []corev1.DNSPolicy{corev1.DNSDefault, corev1.DNSNone} {
+		for _, policy := range []corev1.DNSPolicy{corev1.DNSDefault} {
 			t.Run(string(policy), func(t *testing.T) {
 				box, err := toPodBox(dnsPod(policy), "10.0.0.5", "10.0.0.5", "/var/lib/k3sm/pods/uid-web", "/lib/shim.dylib", "", validCfg, nil)
 				if err != nil {
@@ -387,7 +389,7 @@ func TestToPodBoxInjectsClusterDNSEnv(t *testing.T) {
 		}
 	})
 
-	// Negative — an unusable cfg (no cluster DNS VIP ⇒ dns.ConfigToEnv returns nil)
+	// Negative — an unusable cfg (no cluster DNS VIP ⇒ dns.ConfigToEnvChecked errors)
 	// injects nothing even under ClusterFirst; the shim defers to the host resolver
 	// rather than blackholing every lookup.
 	t.Run("invalid cfg injects nothing", func(t *testing.T) {
@@ -424,8 +426,9 @@ func TestToPodBoxInjectsClusterDNSEnv(t *testing.T) {
 // override) into the cluster DNS base BEFORE toPodBox injects the K3SM_DNS_* env the
 // DYLD getaddrinfo shim reads — so it asserts on the LIVE box env (every container,
 // init + regular), not the pure dns.MergeDNSConfig primitive. The merge is gated
-// structurally in buildBox on the cluster-DNS policy, so a None/Default pod gets the
-// UNMERGED base and NO injection at all — pinning the ClusterFirst/None seam.
+// structurally in buildBox on the cluster-DNS policy, so a Default pod gets the
+// UNMERGED base and NO injection at all; a None pod's own config is pinned by
+// TestToPodBoxDNSPolicyNoneInjectsCustomConfig.
 // Fails-before (buildBox ignored spec.dnsConfig → the plain cluster defaults),
 // passes-after.
 func TestToPodBoxClusterFirstMergesDNSConfig(t *testing.T) {
@@ -527,15 +530,15 @@ func TestToPodBoxClusterFirstMergesDNSConfig(t *testing.T) {
 		}
 	})
 
-	// Case 3 — NEGATIVE: None and Default get the UNMERGED base and NO injection at
-	// all even WITH a dnsConfig. This pins the ClusterFirst/None seam: a None pod's
-	// own dnsConfig is NOT merged into a cluster base here; None is handled elsewhere.
-	t.Run("None and Default inject nothing even with dnsConfig", func(t *testing.T) {
+	// Case 3 — NEGATIVE: Default gets the UNMERGED base and NO injection at all even
+	// WITH a dnsConfig. None is no longer negative: its own dnsConfig is injected,
+	// never merged into a cluster base (TestToPodBoxDNSPolicyNoneInjectsCustomConfig).
+	t.Run("Default injects nothing even with dnsConfig", func(t *testing.T) {
 		cfg := &corev1.PodDNSConfig{
 			Searches: []string{"corp.internal"},
 			Options:  []corev1.PodDNSConfigOption{{Name: "ndots", Value: ptr("2")}},
 		}
-		for _, policy := range []corev1.DNSPolicy{corev1.DNSNone, corev1.DNSDefault} {
+		for _, policy := range []corev1.DNSPolicy{corev1.DNSDefault} {
 			t.Run(string(policy), func(t *testing.T) {
 				box, err := newR(t).buildBox(context.Background(), dnsPod(policy, cfg), "10.0.0.5")
 				if err != nil {

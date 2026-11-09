@@ -18,6 +18,7 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -1335,12 +1336,22 @@ func (r *runtimedRuntime) retryParkedCreate(ctx context.Context, pod *corev1.Pod
 	}
 	defer r.updateDone(pod)
 	ctx = withPodIdentity(ctx, pod)
+	// A dnsPolicy None refusal (podDNSRefusal) is the parked cause re-derived, not
+	// an RPC failure: it is answered as the CONTAINER_CONFIG refusal it was parked
+	// with, so the pod stays parked on the same cause.
+	var dnsRefusal *podDNSRefusal
 	podIP, err := r.podIP(ctx, pod)
+	if errors.As(err, &dnsRefusal) {
+		return runtimev1.FailureReason_FAILURE_REASON_CONTAINER_CONFIG, dnsRefusal.Error(), nil
+	}
 	if err != nil {
 		return runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, "",
 			fmt.Errorf("allocate pod ip %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
 	box, err := r.buildBox(ctx, pod, podIP)
+	if errors.As(err, &dnsRefusal) {
+		return runtimev1.FailureReason_FAILURE_REASON_CONTAINER_CONFIG, dnsRefusal.Error(), nil
+	}
 	if err != nil {
 		return runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, "",
 			fmt.Errorf("translate pod %s/%s: %w", pod.Namespace, pod.Name, err)

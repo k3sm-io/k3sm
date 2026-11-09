@@ -612,12 +612,21 @@ bind/connect discipline that gives a Pod its own source address and port space. 
   FQDNs and `<svc>.<ns>.svc` through the node resolver. Use fully qualified names, or a compiled
   binary as the entrypoint. The same holds for a platform binary outside the re-signed set that a
   Pod's shell script spawns, as described under volume mounts above.
-- **`dnsPolicy: Default` and `dnsPolicy: None` inject nothing**, so those Pods use the host resolver,
-  which now answers cluster-shaped names (`*.svc`, `*.<domain>`) from the node resolver entry. For
-  `None`, k3sm does not read the Pod's `dnsConfig` at all: its `nameservers`, `searches` and
-  `options` are ignored, and the Pod resolves through the host. The `getaddrinfo` shim can serve a
-  `None` Pod's IPv4 nameservers exclusively (up to three) and apply its `ndots`, but the provider
-  does not pass that configuration to it yet.
+- **`dnsPolicy: Default` injects nothing**, so the Pod uses the host resolver, which answers
+  cluster-shaped names (`*.svc`, `*.<domain>`) from the node resolver entry.
+- **`dnsPolicy: None` is honored.** The Pod resolves only through its own `dnsConfig.nameservers`,
+  with its own `searches` and `ndots`, natively and in a `vm` guest, and never falls back to the
+  host resolver, with these exceptions and limits:
+  - Numeric addresses, `localhost` and `*.localhost` resolve without a nameserver.
+  - Only IPv4 nameservers are used, up to three. IPv6 ones are skipped and the Pod gets a
+    `DNSConfigPartial` Warning Event. A Pod whose nameservers are all IPv6 does not start: its
+    containers wait in `CreateContainerConfigError`.
+  - `ndots: 0` is read as `ndots: 1`.
+  - At most 8 search domains are used; upstream allows 32.
+  - Options other than `ndots` reach a `vm` guest's `/etc/resolv.conf` only.
+  - A process that loses the shim (above) resolves through the host.
+  - After a downgrade to a release without this, a `None` Pod resolves through the host until it
+    is recreated.
 - **Under `ClusterFirst`, `dnsConfig` is merged additively**, so extra `searches` are appended and
   `ndots` is overridden. Not yet honored are `dnsConfig.nameservers`, an explicit `ndots: 0`, and
   options other than `ndots`.
