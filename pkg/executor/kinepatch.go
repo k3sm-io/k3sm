@@ -49,7 +49,7 @@ type kineSourcePatch struct {
 // other half is childreq.Raises, the module requirements raised in the copied tree's
 // go.mod (p2 added golang.org/x/net v0.60.0 to p1's source patch, p3 added
 // github.com/klauspost/compress v1.20.2, p4 added the compact-commit-returns-error
-// source patch). kineBuildVariant
+// source patch, p5 added compact-rollback-logs-error). kineBuildVariant
 // names the whole set: any change to either changes that variant, so every staged
 // kine re-stages. TestKinePatchSetIsMarked enforces that, against an append-only
 // history of digests.
@@ -107,7 +107,6 @@ var kinePatches = []kineSourcePatch{{
 	// instead; compactIter already logs "Compact failed" and retries on the next
 	// interval, and the deferred t.MustRollback() tolerates sql.ErrTxDone, which a
 	// rolled-back tx returns. Upstream: unfixed at v0.17.2 through v0.17.5.
-	// Follow-up (open): MustRollback is still fatal on any rollback error other than ErrTxDone.
 	name: "compact-commit-returns-error",
 	file: "pkg/logstructured/sqllog/sql.go",
 	old: `	// Commit the transaction if we make it all the way through deleting without any
@@ -120,6 +119,31 @@ var kinePatches = []kineSourcePatch{{
 	if err := t.Commit(); err != nil {
 		return 0, 0, fmt.Errorf("failed to commit compaction: %w", err)
 	}
+`,
+}, {
+	// compact-rollback-logs-error: compact() defers t.MustRollback(), which is
+	// logrus.Fatalf on any rollback error other than sql.ErrTxDone, so a rollback that
+	// fails after a failed or timed-out compaction still exits kine and takes the
+	// control plane down with it. The fix defers Rollback and logs that error instead;
+	// the compaction is retried on the next interval either way. Only compact() changes:
+	// MustRollback itself and its other caller (compactStart, run once at startup) keep
+	// upstream behaviour, and generic.(*Tx).Compact defers no rollback. The anchor
+	// carries the BeginTx error return because "defer t.MustRollback()" alone occurs
+	// twice in the file. Upstream: unfixed at v0.17.2 through v0.17.5.
+	name: "compact-rollback-logs-error",
+	file: "pkg/logstructured/sqllog/sql.go",
+	old: `		return 0, 0, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer t.MustRollback()
+`,
+	new: `		return 0, 0, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	// A failed rollback is logged, not fatal: MustRollback would exit kine.
+	defer func() {
+		if err := t.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			logrus.Errorf("COMPACT transaction rollback failed: %v", err)
+		}
+	}()
 `,
 }}
 
@@ -208,14 +232,14 @@ func kineBuildArgs(version, out string) []string {
 		"-o", out, "."}
 }
 
-// kinePatchSetID is the patch-set suffix of kineBuildVariant ("p3" of "nocgo+p3").
+// kinePatchSetID is the patch-set suffix of kineBuildVariant ("p5" of "nocgo+p5").
 func kinePatchSetID() string {
 	_, id, _ := strings.Cut(kineBuildVariant, "+")
 	return id
 }
 
 // kineStampedVersion is the version a patched kine build reports: the upstream pin
-// plus the patch set, "v0.17.2+p3" (the bare pin with no patch set). `kine --version`
+// plus the patch set, "v0.17.2+p5" (the bare pin with no patch set). `kine --version`
 // prints it.
 func kineStampedVersion(version string) string {
 	if id := kinePatchSetID(); id != "" {
