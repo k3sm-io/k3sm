@@ -102,6 +102,7 @@ var kinePatchSetHistory = map[string]string{
 	"nocgo+p2": "4056b8ca92fa544e024153ec01765ff84468be118b516dd5b2e02052a93397ea",
 	"nocgo+p3": "b5c727f93e5e3acbd30118700fe6b46aa3677123ed632841ceff4a694fbac1a1",
 	"nocgo+p4": "b116e0d06b6453fcd929a4bc62da794ad957ea3895b51f192c652e7f01115cc9",
+	"nocgo+p5": "14db0c216afa353618c5548f54f1df1161e7559ba6748b44af811bdbe17e7f56",
 }
 
 // TestKinePatchSetIsMarked pins the link between the carried patches and the staging
@@ -151,8 +152,10 @@ func TestKineBuildArgs(t *testing.T) {
 }
 
 // kineV0172SQLLogCompact is pkg/logstructured/sqllog/sql.go of kine v0.17.2 cut to
-// its package clause, imports and compact(), verbatim, so the patch is tested against
-// the upstream text without the module cache or the network.
+// its package clause, imports, compactStart() and compact(), verbatim, so the patches
+// are tested against the upstream text without the module cache or the network.
+// compactStart() is kept because it also defers t.MustRollback(): the rollback patch's
+// anchor must still occur once, and compactStart must keep upstream behaviour.
 const kineV0172SQLLogCompact = `package sqllog
 
 import (
@@ -170,6 +173,64 @@ import (
 	"github.com/k3s-io/kine/pkg/server"
 	"github.com/sirupsen/logrus"
 )
+
+func (s *SQLLog) compactStart(ctx context.Context) error {
+	logrus.Tracef("COMPACTSTART")
+
+	rows, err := s.d.After(ctx, "compact_rev_key", "", 0, 0)
+	if err != nil {
+		return err
+	}
+
+	batch, _, err := RowsToEvents(rows, true, true)
+	if err != nil {
+		return err
+	}
+
+	logrus.Tracef("COMPACTSTART len(events)=%v", len(batch.Events))
+
+	if len(batch.Events) == 0 {
+		_, err := s.Append(ctx, &server.Event{
+			Create: true,
+			KV: &server.KeyValue{
+				Key:   "compact_rev_key",
+				Value: []byte(""),
+			},
+		})
+		return err
+	} else if len(batch.Events) == 1 {
+		return nil
+	}
+
+	t, err := s.d.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	if err != nil {
+		return err
+	}
+	defer t.MustRollback()
+
+	// this is to work around a bug in which we ended up with two compact_rev_key rows
+	maxRev := int64(0)
+	maxID := int64(0)
+	for _, event := range batch.Events {
+		if event.PrevKV != nil && event.PrevKV.ModRevision > maxRev {
+			maxRev = event.PrevKV.ModRevision
+			maxID = event.KV.ModRevision
+		}
+		logrus.Tracef("COMPACTSTART maxRev=%v maxID=%v", maxRev, maxID)
+	}
+
+	for _, event := range batch.Events {
+		logrus.Tracef("COMPACTSTART event.KV.ModRevision=%v maxID=%v", event.KV.ModRevision, maxID)
+		if event.KV.ModRevision == maxID {
+			continue
+		}
+		if err := t.DeleteRevision(ctx, event.KV.ModRevision); err != nil {
+			return err
+		}
+	}
+
+	return t.Commit()
+}
 
 func (s *SQLLog) compact(compactRev int64, targetCompactRev int64) (int64, int64, error) {
 	ctx, cancel := context.WithTimeout(s.ctx, s.compactTimeout)
@@ -321,5 +382,146 @@ func TestKineCompactCommitFailureIsReturnedNotFatal(t *testing.T) {
 	})
 	if !commitReturned {
 		t.Error("compact() does not call t.Commit() and return its error")
+	}
+}
+
+// TestKineCompactRollbackFailureIsNotFatal pins compact-rollback-logs-error: after
+// kinePatches, kine's compact() must not defer t.MustRollback() (logrus.Fatalf on any
+// rollback error but sql.ErrTxDone, which takes the whole control plane down) and must
+// defer a closure that calls t.Rollback() instead. compactStart() keeps its deferred
+// t.MustRollback(): the patch is scoped to the compaction interval's path.
+func TestKineCompactRollbackFailureIsNotFatal(t *testing.T) {
+	const file = "pkg/logstructured/sqllog/sql.go"
+	root := t.TempDir()
+	path := filepath.Join(root, filepath.FromSlash(file))
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(kineV0172SQLLogCompact), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var patches []kineSourcePatch
+	for _, p := range kinePatches {
+		if p.file == file {
+			patches = append(patches, p)
+		}
+	}
+	if err := applyKinePatches(root, patches); err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+	if err != nil {
+		t.Fatalf("patched %s does not parse: %v", file, err)
+	}
+	for _, imp := range []string{`"errors"`, `"database/sql"`, `"github.com/sirupsen/logrus"`} {
+		if !slices.ContainsFunc(f.Imports, func(is *ast.ImportSpec) bool { return is.Path.Value == imp }) {
+			t.Errorf("patched %s does not import %s, which the deferred rollback uses", file, imp)
+		}
+	}
+	methods := map[string]*ast.FuncDecl{}
+	for _, d := range f.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Recv != nil {
+			methods[fd.Name.Name] = fd
+		}
+	}
+
+	// selectorCall reports whether e is t.<name>().
+	selectorCall := func(e ast.Expr, name string) bool {
+		call, ok := e.(*ast.CallExpr)
+		if !ok {
+			return false
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != name {
+			return false
+		}
+		x, ok := sel.X.(*ast.Ident)
+		return ok && x.Name == "t"
+	}
+	// deferred reports whether fn defers t.MustRollback() directly, and whether it
+	// defers a closure whose body calls t.Rollback().
+	deferred := func(fn *ast.FuncDecl) (mustRollback, rollbackClosure bool) {
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			ds, ok := n.(*ast.DeferStmt)
+			if !ok {
+				return true
+			}
+			if selectorCall(ds.Call, "MustRollback") {
+				mustRollback = true
+			}
+			if lit, ok := ds.Call.Fun.(*ast.FuncLit); ok {
+				ast.Inspect(lit.Body, func(m ast.Node) bool {
+					if e, ok := m.(ast.Expr); ok && selectorCall(e, "Rollback") {
+						rollbackClosure = true
+					}
+					return true
+				})
+			}
+			return true
+		})
+		return mustRollback, rollbackClosure
+	}
+
+	compact, ok := methods["compact"]
+	if !ok {
+		t.Fatalf("patched %s has no compact method", file)
+	}
+	must, closure := deferred(compact)
+	if must {
+		t.Error("compact() still defers t.MustRollback(), which is fatal when the rollback fails")
+	}
+	if !closure {
+		t.Error("compact() does not defer a closure that calls t.Rollback()")
+	}
+
+	// The deferred closures themselves must not exit kine either, and must tolerate
+	// the sql.ErrTxDone a committed or already rolled-back tx returns.
+	ast.Inspect(compact.Body, func(n ast.Node) bool {
+		ds, ok := n.(*ast.DeferStmt)
+		if !ok {
+			return true
+		}
+		lit, ok := ds.Call.Fun.(*ast.FuncLit)
+		if !ok {
+			return true
+		}
+		txDoneChecked := false
+		ast.Inspect(lit.Body, func(m ast.Node) bool {
+			call, ok := m.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			pkg, _ := sel.X.(*ast.Ident)
+			switch {
+			case strings.HasPrefix(sel.Sel.Name, "Fatal"), strings.HasPrefix(sel.Sel.Name, "Panic"):
+				t.Errorf("compact()'s deferred closure calls %s, which exits kine", sel.Sel.Name)
+			case pkg != nil && pkg.Name == "os" && sel.Sel.Name == "Exit":
+				t.Error("compact()'s deferred closure calls os.Exit")
+			case pkg != nil && pkg.Name == "errors" && sel.Sel.Name == "Is" && len(call.Args) == 2:
+				if target, ok := call.Args[1].(*ast.SelectorExpr); ok && target.Sel.Name == "ErrTxDone" {
+					if x, ok := target.X.(*ast.Ident); ok && x.Name == "sql" {
+						txDoneChecked = true
+					}
+				}
+			}
+			return true
+		})
+		if !txDoneChecked {
+			t.Error("compact()'s deferred closure does not check errors.Is(err, sql.ErrTxDone)")
+		}
+		return true
+	})
+
+	compactStart, ok := methods["compactStart"]
+	if !ok {
+		t.Fatalf("patched %s has no compactStart method", file)
+	}
+	if must, _ := deferred(compactStart); !must {
+		t.Error("compactStart() no longer defers t.MustRollback(): the rollback patch must change compact() only")
 	}
 }
