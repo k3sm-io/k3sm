@@ -368,11 +368,16 @@ zero. `List` returns a non-nil error for the whole call only for a failure that 
 about one entry: the master missing or untrusted, or the lock timing out.
 
 **An entry directory with no `current`.** Put writes `generation`, then `v1`, then
-`current`, so a crash before the pointer leaves a directory holding `generation` and at most
-`v1`, with no other file. That shape, and only that shape, is an incomplete Put. It is not an
-entry: `List` does not return it, `Current`, `Get` and `Delete` answer `ErrNotFound`, and the
+`current`, and writes each file through a temporary file renamed into place, so a crash
+before the pointer leaves a directory holding `generation` and at most `v1`, plus possibly a
+leftover temporary file (a dot-prefixed name ending in `.tmp`). Temporary files do not count
+against the shape: a crash while writing `v1` leaves `generation` and a half-written `.tmp`,
+and that is an incomplete Put, not damage, or one crash would strand the name. So an empty
+directory, `generation` alone, and `generation` and `v1`, each with or without temporary
+files, are incomplete Puts, and only those shapes. `v1` without `generation` is damage, since
+Put cannot leave it. An incomplete Put is not an entry: `List` does not return it, `Current`, `Get` and `Delete` answer `ErrNotFound`, and the
 next Put of the name discards it and starts over. A directory with no `current` that holds
-anything more cannot be an incomplete Put, because Put writes nothing else before `current`.
+any other file cannot be an incomplete Put, because Put writes nothing else before `current`.
 That is a pointer lost to damage or to an interrupted Delete, with sealed records still on
 disk. `List` returns it with `Err` set, wrapping `ErrCorrupt`, and `rm` removes the directory
 and its floor entry, since `rm` reads nothing inside an entry. Put of that name answers
@@ -403,7 +408,8 @@ serializes Rewrap, Rotate and Put against each other and against the reconciler'
   leaves a state the next operation can finish or discard. The lock is for serialization,
   not for crash safety.
 - An entry directory with no `current` is an incomplete Put only in the one shape a crashed
-  Put can leave; any other directory with no `current` is damage. "An entry directory with no
+  Put can leave, ignoring leftover `.tmp` files; any other directory with no `current` is
+  damage. "An entry directory with no
   `current`" under "List, when one entry is corrupt" is the rule, and Put discards only the
   first shape, so one crash does not leave a name that can never be reused.
 
@@ -716,7 +722,7 @@ last pull request lands and no row is pending.
 | G13 | A crash between the two master renames leaves a master that passes its trust check, and the next verb completes the swap | unit: stop after the first rename |
 | G14 | One lock serializes Rewrap, Rotate, Put and reads, with a bounded wait | unit: a held lock gives a timeout error within the bound, not a hang |
 | G15 | Files a root-run verb writes under `server/` are owned by the service user at the layout's modes | unit with a fake owner seam |
-| G16 | `list` returns every entry, marks an unreadable one with `Err`, and exits 1. A directory holding only `generation` and at most `v1` is an incomplete Put: not listed, `ErrNotFound` from `Current`, `Get` and `Delete`, discarded by the next Put. A directory with no `current` and any other file is damage: listed with `Err` wrapping `ErrCorrupt`, removed by `rm` with its floor entry, and `ErrExists` from Put with every file left in place | unit: both shapes, plus a `v1`-only directory standing in for the one-version entry that lost `current`, and a `v1`-and-`v2` directory with `current` removed; a CLI exit-code test for `list` and `rm` |
+| G16 | `list` returns every entry, marks an unreadable one with `Err`, and exits 1. A directory holding nothing, `generation`, or `generation` and `v1`, with or without leftover `.tmp` files, is an incomplete Put: not listed, `ErrNotFound` from `Current`, `Get` and `Delete`, discarded by the next Put. A directory with no `current` and any other file (`v1` without `generation` included) is damage: listed with `Err` wrapping `ErrCorrupt`, removed by `rm` with its floor entry, and `ErrExists` from Put with every file left in place | unit: both shapes, an empty directory, a `generation`-and-`.tmp` directory standing in for a crash while writing `v1`, a `v1`-without-`generation` directory, a `v1`-only directory standing in for the one-version entry that lost `current`, and a `v1`-and-`v2` directory with `current` removed; a CLI exit-code test for `list` and `rm` |
 | G17 | `show` prints a value only with `--reveal`, and then writes exactly the stored bytes with no trailing newline; no verb takes a value as an argument | CLI test over the usage strings; a `--reveal` test comparing stdout to the stored bytes for an opaque value and for 32- and 64-byte Ed25519 values |
 | G18 | Delivery is refused while encryption is off unless the override flag was set at server start; a delivered target stays when the override is removed | unit over the reconciler with a fake client |
 | G19 | The delivery declaration is root-owned and not shared-writable, and is refused otherwise | unit, the same cases as the manifest directory |
