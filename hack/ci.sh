@@ -84,6 +84,8 @@ ci_json_str() {
 }
 ci_record_last() {
 	local rc=$1 result=green failed="" sha at tmpf
+	# Record only where .ci/ is gitignored: a fixture tree that runs this script (hack/verify-affected-modes.sh) must stay clean.
+	git -C "$ci_root" check-ignore -q .ci/last.json 2>/dev/null || return 0
 	if [ "$rc" != 0 ]; then
 		result=red
 		[ -z "$ci_last_stage" ] || failed="\"$(ci_json_str "$ci_last_stage")\""
