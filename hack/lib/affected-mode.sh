@@ -1,4 +1,5 @@
 # shellcheck shell=bash
+# shellcheck disable=SC2154  # sourced: gate_repo, pkg_file and the rest are the caller's
 # hack/lib/affected-mode.sh -- the gate's --packages mode: the strict k3sm-affected/v1
 # reader and the mode resolution it feeds. The k3sm repositories carry this file
 # byte-identical; change it in all of them together. Everything specific to a repository
@@ -9,7 +10,9 @@
 #
 # The caller sets:
 #   gate_repo      the repository name in log lines and in @full and @check lines
-#   gate_module    the Go module path; a list narrows the gate to this module's packages
+#   gate_lang      go (the default when unset) or swift
+#   gate_module    the Go module path; a list narrows the gate to this module's packages.
+#                  Empty for a Swift gate.
 #   pkg_file_set   1 when --packages was given, else 0
 #   pkg_file       the --packages file
 #   diff_base      the --base sha, or empty for the merge base with origin/main
@@ -17,6 +20,13 @@
 #   ci_tmp         a scratch directory the caller removes
 #
 # resolve_gate_mode sets mode, mode_reason, vet_set and test_set.
+#
+# A Swift gate (gate_lang=swift) has no selector to narrow it: no k3sm-affected/v1 line
+# names a Swift target. It validates the list all the same and runs its full suite for
+# every list, with one exception it shares with a Go gate whose list names none of its
+# packages: when the diff holds only doc files, vet and test are skipped. vet_set and
+# test_set are then empty; otherwise they stay ./..., which a Swift gate reads as its
+# whole `swift test`. Any other gate_lang answers full.
 
 # read_packages <file>: the strict k3sm-affected/v1 reader. Line 1 is exactly
 # k3sm-affected/v1; then sorted, unique import paths; then `@full <repo> <reason>`
@@ -97,16 +107,42 @@ resolve_gate_mode() {
 	mode=full mode_reason="no mode flag (the default)"
 	vet_set=(./...) test_set=(./...)
 	if [ "$pkg_file_set" = 1 ]; then
-		if ! read_packages "$pkg_file"; then
+		if [ "${gate_lang:-go}" != go ] && [ "${gate_lang:-go}" != swift ]; then
+			mode_reason="--packages: unknown gate_lang '$gate_lang'; full gate"
+		elif ! read_packages "$pkg_file"; then
 			mode_reason="--packages: $pf_reason; full gate"
 		elif [ -n "$pf_full" ]; then
 			mode_reason="--packages: @full $gate_repo $pf_full"
 		else
 			own=()
-			for p in ${pf_pkgs[@]+"${pf_pkgs[@]}"}; do
-				case "$p" in "$gate_module"|"$gate_module"/*) own+=("$p") ;; esac
-			done
-			if [ ${#own[@]} -gt 0 ]; then
+			if [ "${gate_lang:-go}" = go ]; then
+				for p in ${pf_pkgs[@]+"${pf_pkgs[@]}"}; do
+					case "$p" in "$gate_module"|"$gate_module"/*) own+=("$p") ;; esac
+				done
+			fi
+			if [ "${gate_lang:-go}" = swift ]; then
+				# No package line can name a Swift target, so the list never narrows the
+				# suite; only a doc-only diff skips it, as for a Go gate's empty list.
+				base="$diff_base"
+				[ -n "$base" ] || base="$(git merge-base HEAD origin/main 2>/dev/null || true)"
+				if [ -z "$base" ] || ! git rev-parse -q --verify "$base^{commit}" >/dev/null 2>&1; then
+					mode_reason="--packages: no Swift selector and the diff base does not resolve; full gate"
+				# --no-renames lists both sides of a rename, so a Swift file moved into docs/
+				# still counts as changed.
+				elif changed="$( { git diff --no-renames --name-only "$base" -- && git ls-files --others --exclude-standard; } 2>"$ci_tmp/diff.err")"; then
+					# Markdown under Sources/ or Tests/, or anything in a .docc catalog, can be a
+					# SwiftPM resource, fixture or documentation catalog the build reads: not a doc.
+					unmapped="$(printf '%s\n' "$changed" | awk '/^$/ { next } /^(Sources|Tests)\// || /\.docc\// { print; next } /\.md$/ || /^docs\// || /^(LICENSE|NOTICE|DCO)$/ { next } { print }')"
+					if [ -n "$unmapped" ]; then
+						mode_reason="--packages: no Swift selector; full gate (the diff against $base changes $(printf '%s\n' "$unmapped" | head -1))"
+					else
+						mode=packages mode_reason="--packages: no Swift selector and only doc files changed against $base; vet and test skipped"
+						vet_set=() test_set=()
+					fi
+				else
+					mode_reason="--packages: git diff against $base failed; full gate"
+				fi
+			elif [ ${#own[@]} -gt 0 ]; then
 				mode=packages mode_reason="--packages: ${#own[@]} $gate_module package(s) from $pkg_file"
 				vet_set=("${own[@]}") test_set=("${own[@]}")
 			else
