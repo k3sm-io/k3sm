@@ -60,7 +60,54 @@ STATICCHECK_VERSION=2026.2.2   # keep equal to the install pin in docs/GO-STANDA
 GOVULNCHECK_VERSION=v1.9.0   # the govulncheck the gate requires; keep equal across the k3sm repos (hack/lib/govulncheck.sh reads this line)
 
 ci_tmp="$(mktemp -d)"
-trap 'rm -rf "$ci_tmp"' EXIT
+# Record this run in the gitignored .ci/last.json (read by the workspace hack/ci-last.sh), best effort,
+# never changing the exit status. A stage is the text of the last `echo "==> ..."` run;
+# on a red run that stage is the one that failed. ci_cleanup is the cleanup the EXIT
+# handler runs first; a stage that owns a temp dir sets it instead of calling trap.
+ci_root=$PWD
+ci_cleanup=""
+ci_last_stage=""
+set -T
+ci_note() {
+	case $1 in
+	'echo "==> '*'"')
+		ci_last_stage=${1#'echo "==> '}
+		ci_last_stage=${ci_last_stage%'"'}
+		ci_last_stage=${ci_last_stage#\[*\] } ;;
+	esac
+}
+ci_json_str() {
+	local s
+	s=$(printf '%s' "$1" | tr -d '[:cntrl:]')
+	s=${s//\\/\\\\}
+	printf '%s' "${s//\"/\\\"}"
+}
+ci_record_last() {
+	local rc=$1 result=green failed="" sha at tmpf
+	if [ "$rc" != 0 ]; then
+		result=red
+		[ -z "$ci_last_stage" ] || failed="\"$(ci_json_str "$ci_last_stage")\""
+	elif [ "${dry_run:-0}" = 1 ]; then
+		result=skipped
+	fi
+	sha=$(git -C "$ci_root" rev-parse HEAD 2>/dev/null) || sha=""
+	at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+	mkdir -p "$ci_root/.ci" && tmpf=$(mktemp "$ci_root/.ci/last.XXXXXX") || return 0
+	printf '{"repo":"%s","sha":"%s","result":"%s","at":"%s","failed":[%s]}\n' \
+		"$(ci_json_str "$(basename "$ci_root")")" "$sha" "$result" "$at" "$failed" >"$tmpf"
+	mv -f "$tmpf" "$ci_root/.ci/last.json" || rm -f "$tmpf"
+}
+ci_on_exit() {
+	local rc=$1
+	trap - DEBUG
+	if [ -n "$ci_cleanup" ]; then eval "$ci_cleanup" || true; fi
+	ci_record_last "$rc" || true
+	exit "$rc"
+}
+trap 'ci_note "$BASH_COMMAND"' DEBUG
+trap 'ci_on_exit $?' EXIT
+# shellcheck disable=SC2016 # the EXIT handler evals this string
+ci_cleanup='rm -rf "$ci_tmp"'
 
 # The --packages mode lives in hack/lib/affected-mode.sh, which defines read_packages
 # and resolve_gate_mode and carries the k3sm-affected/v1 grammar; these two are the

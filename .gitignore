@@ -56,3 +56,5 @@ hack/lab/runs/*.log
 __pycache__/
 # hack/ociconformance.sh build output and run directories (removed on exit; the bin dir is rebuilt on demand).
 /hack/.ociconformance/
+
+/.ci/
