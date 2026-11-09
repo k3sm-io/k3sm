@@ -475,6 +475,48 @@ func TestKineCompactRollbackFailureIsNotFatal(t *testing.T) {
 		t.Error("compact() does not defer a closure that calls t.Rollback()")
 	}
 
+	// The deferred closures themselves must not exit kine either, and must tolerate
+	// the sql.ErrTxDone a committed or already rolled-back tx returns.
+	ast.Inspect(compact.Body, func(n ast.Node) bool {
+		ds, ok := n.(*ast.DeferStmt)
+		if !ok {
+			return true
+		}
+		lit, ok := ds.Call.Fun.(*ast.FuncLit)
+		if !ok {
+			return true
+		}
+		txDoneChecked := false
+		ast.Inspect(lit.Body, func(m ast.Node) bool {
+			call, ok := m.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			pkg, _ := sel.X.(*ast.Ident)
+			switch {
+			case strings.HasPrefix(sel.Sel.Name, "Fatal"), strings.HasPrefix(sel.Sel.Name, "Panic"):
+				t.Errorf("compact()'s deferred closure calls %s, which exits kine", sel.Sel.Name)
+			case pkg != nil && pkg.Name == "os" && sel.Sel.Name == "Exit":
+				t.Error("compact()'s deferred closure calls os.Exit")
+			case pkg != nil && pkg.Name == "errors" && sel.Sel.Name == "Is" && len(call.Args) == 2:
+				if target, ok := call.Args[1].(*ast.SelectorExpr); ok && target.Sel.Name == "ErrTxDone" {
+					if x, ok := target.X.(*ast.Ident); ok && x.Name == "sql" {
+						txDoneChecked = true
+					}
+				}
+			}
+			return true
+		})
+		if !txDoneChecked {
+			t.Error("compact()'s deferred closure does not check errors.Is(err, sql.ErrTxDone)")
+		}
+		return true
+	})
+
 	compactStart, ok := methods["compactStart"]
 	if !ok {
 		t.Fatalf("patched %s has no compactStart method", file)
