@@ -77,7 +77,9 @@ be restored either (check 'sudo k3sm network lan status').
 
 // networkEnv is what the network verb touches, so a test can fake every
 // seam: the install's files and launchd (Sys), the daemon signal, the
-// in-place restart, and the clock.
+// in-place restart, and the clock. Sockets, SocketTable, HostAddrs and
+// NodeArgs are always set (defaultNetworkEnv sets them, a test fakes them);
+// only Now may be nil.
 type networkEnv struct {
 	Sys        install.System
 	RecordPath string

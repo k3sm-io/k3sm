@@ -17,13 +17,10 @@ limitations under the License.
 package main
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"net/netip"
-	"os/exec"
 	"slices"
 	"strconv"
 	"strings"
@@ -183,49 +180,29 @@ func lanPolicyFor(want install.LAN, role install.Role, args []string, host []net
 }
 
 // lsofListeners is the production socket lister: the TCP listening sockets
-// of pid, read with lsof as root. lsof exiting 1 with no output means none.
+// of pid itself (not its children), read through the hardened runLsof.
 func lsofListeners(ctx context.Context, pid int) ([]netip.AddrPort, error) {
-	cmd := exec.CommandContext(ctx, "/usr/sbin/lsof", "-nP", "-a", "-p", strconv.Itoa(pid), "-iTCP", "-sTCP:LISTEN", "-Fn")
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
-	if err != nil {
-		var ee *exec.ExitError
-		if errors.As(err, &ee) && ee.ExitCode() == 1 && len(out) == 0 {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("lsof -p %d: %w: %s", pid, err, strings.TrimSpace(stderr.String()))
-	}
-	return parseLsofListeners(out)
+	return lsofListenersWith(ctx, execLsof, pid)
 }
 
-// parseLsofListeners parses lsof -F n output: one "n<host>:<port>" line per
-// socket, "*" being the wildcard.
-func parseLsofListeners(out []byte) ([]netip.AddrPort, error) {
-	var socks []netip.AddrPort
-	sc := bufio.NewScanner(bytes.NewReader(out))
-	for sc.Scan() {
-		line := sc.Text()
-		if !strings.HasPrefix(line, "n") {
-			continue
-		}
-		name := strings.TrimPrefix(line, "n")
-		i := strings.LastIndex(name, ":")
-		if i < 0 {
-			return nil, fmt.Errorf("lsof: unparseable socket name %q", name)
-		}
-		host, portStr := strings.Trim(name[:i], "[]"), name[i+1:]
-		port, err := strconv.ParseUint(portStr, 10, 16)
-		if err != nil {
-			return nil, fmt.Errorf("lsof: unparseable port in %q", name)
-		}
-		addr := netip.IPv4Unspecified()
-		if host != "*" {
-			if addr, err = netip.ParseAddr(host); err != nil {
-				return nil, fmt.Errorf("lsof: unparseable address in %q", name)
-			}
-		}
-		socks = append(socks, netip.AddrPortFrom(addr, uint16(port)))
+// lsofListenersWith reads pid's TCP listeners through run, per pid so a busy
+// Mac's whole table never meets the line cap, and parses them with the
+// fail-closed parseLsofSocketTable. A wildcard bind is the unspecified
+// address.
+func lsofListenersWith(ctx context.Context, run lsofExec, pid int) ([]netip.AddrPort, error) {
+	out, err := runLsofWith(ctx, run, "-nP", "-a", "-p", strconv.Itoa(pid), "-iTCP", "-sTCP:LISTEN", "-F", "pRcPn")
+	if err != nil {
+		return nil, fmt.Errorf("lsof -p %d: %w", pid, err)
 	}
-	return socks, sc.Err()
+	table, err := parseLsofSocketTable(out)
+	if err != nil {
+		return nil, fmt.Errorf("lsof -p %d: %w", pid, err)
+	}
+	var socks []netip.AddrPort
+	for _, s := range table {
+		if s.PID == pid && s.Protocol == "TCP" {
+			socks = append(socks, s.Local)
+		}
+	}
+	return socks, nil
 }

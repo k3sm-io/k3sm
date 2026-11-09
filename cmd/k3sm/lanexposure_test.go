@@ -233,13 +233,13 @@ func TestLsofSocketTableExposureParse(t *testing.T) {
 		if !errors.As(exit1, &ee) || ee.ExitCode() != 1 {
 			t.Fatalf("/usr/bin/false: %v, want exit 1", exit1)
 		}
-		if socks, err := lsofResult(nil, nil, exit1); err != nil || socks != nil {
-			t.Errorf("silent exit 1 = %v, %v; want an empty table", socks, err)
+		if out, err := lsofOutput(nil, nil, exit1); err != nil || out != nil {
+			t.Errorf("silent exit 1 = %q, %v; want an empty table", out, err)
 		}
-		if _, err := lsofResult(nil, []byte("lsof: WARNING: can't stat()"), exit1); err == nil {
+		if _, err := lsofOutput(nil, []byte("lsof: WARNING: can't stat()"), exit1); err == nil {
 			t.Error("exit 1 with stderr text read as a clean empty table")
 		}
-		if _, err := lsofResult([]byte("p1\n"), nil, exit1); err == nil {
+		if _, err := lsofOutput([]byte("p1\n"), nil, exit1); err == nil {
 			t.Error("exit 1 with stdout read as a clean table")
 		}
 	})
