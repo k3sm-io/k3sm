@@ -1844,8 +1844,9 @@ func budgetDirFor(workDir string) string {
 // opts.standalone (set ONLY by runNode) skips the empty-dnsVIP default-fill
 // below, leaving ResolverVIP "". dns.PodDNSConfig then builds a DNSConfig with an
 // empty ClusterDNSIP, which Validate() rejects — the SAME "dnsCfg not usable"
-// path injectClusterDNSEnv already documents (dns.ConfigToEnv returns nil, no
-// K3SM_DNS_* env is appended, the shim defers to the host resolver) — rather than
+// path pkg/provider's injectPodDNSEnv already documents for a cluster-first pod
+// (dns.ConfigToEnvChecked returns an error, no K3SM_DNS_* env is appended, the
+// shim defers to the host resolver) — rather than
 // inventing a second no-DNS fallback. server.go/agent.go never set opts.standalone,
 // so their nodeOptions are unaffected and keep injecting exactly as before.
 func runtimedConfig(opts nodeOptions, cs kubernetes.Interface) provider.RuntimedConfig {
