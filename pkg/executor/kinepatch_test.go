@@ -20,6 +20,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"go/ast"
+	"go/build"
 	"go/parser"
 	"go/token"
 	"os"
@@ -96,7 +97,9 @@ func kinePatchSetDigest() string {
 // kinePatchSetHistory records every carried patch set by the variant that named it.
 // It is APPEND-ONLY: a variant is never reused for different patches, because a node
 // whose marker names that variant would never re-stage onto the new ones. Changing
-// kinePatches means a new "+p<n>" in kineBuildVariant and a new line here.
+// kinePatches means a new "+p<n>" in kineBuildVariant and a new line here, unless
+// the change returns to a set already recorded, as the p5 revert returned to p4: the
+// variant then names that set again, and every other variant's marker re-stages.
 var kinePatchSetHistory = map[string]string{
 	"nocgo+p1": "d6c6334601320bd1bc3c88c5e97144f0df8c38e41ede21f225bdff71ff19af24",
 	"nocgo+p2": "4056b8ca92fa544e024153ec01765ff84468be118b516dd5b2e02052a93397ea",
@@ -154,8 +157,8 @@ func TestKineBuildArgs(t *testing.T) {
 // kineV0172SQLLogCompact is pkg/logstructured/sqllog/sql.go of kine v0.17.2 cut to
 // its package clause, imports, compactStart() and compact(), verbatim, so the patches
 // are tested against the upstream text without the module cache or the network.
-// compactStart() is kept because it also defers t.MustRollback(): the rollback patch's
-// anchor must still occur once, and compactStart must keep upstream behaviour.
+// compactStart() is kept because it also defers t.MustRollback(), so a patch aimed
+// at compact()'s deferred rollback has a second occurrence to avoid.
 const kineV0172SQLLogCompact = `package sqllog
 
 import (
@@ -385,50 +388,98 @@ func TestKineCompactCommitFailureIsReturnedNotFatal(t *testing.T) {
 	}
 }
 
-// TestKineCompactRollbackFailureIsNotFatal pins compact-rollback-logs-error: after
-// kinePatches, kine's compact() must not defer t.MustRollback() (logrus.Fatalf on any
-// rollback error but sql.ErrTxDone, which takes the whole control plane down) and must
-// defer a closure that calls t.Rollback() instead. compactStart() keeps its deferred
-// t.MustRollback(): the patch is scoped to the compaction interval's path.
-func TestKineCompactRollbackFailureIsNotFatal(t *testing.T) {
-	const file = "pkg/logstructured/sqllog/sql.go"
-	root := t.TempDir()
-	path := filepath.Join(root, filepath.FromSlash(file))
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, []byte(kineV0172SQLLogCompact), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	var patches []kineSourcePatch
-	for _, p := range kinePatches {
-		if p.file == file {
-			patches = append(patches, p)
-		}
-	}
-	if err := applyKinePatches(root, patches); err != nil {
-		t.Fatal(err)
-	}
+// kineV0172GenericTx is pkg/drivers/generic/tx.go of kine v0.17.2 cut to its package
+// clause, imports, the Tx type, Rollback() and MustRollback(), verbatim.
+// TestKineCompactRollbackFailureDiscardsConn checks MustRollback against it, and
+// against the module cache's copy of the pinned version when that is present.
+const kineV0172GenericTx = `package generic
 
-	f, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
-	if err != nil {
-		t.Fatalf("patched %s does not parse: %v", file, err)
-	}
-	for _, imp := range []string{`"errors"`, `"database/sql"`, `"github.com/sirupsen/logrus"`} {
-		if !slices.ContainsFunc(f.Imports, func(is *ast.ImportSpec) bool { return is.Path.Value == imp }) {
-			t.Errorf("patched %s does not import %s, which the deferred rollback uses", file, imp)
-		}
-	}
-	methods := map[string]*ast.FuncDecl{}
-	for _, d := range f.Decls {
-		if fd, ok := d.(*ast.FuncDecl); ok && fd.Recv != nil {
-			methods[fd.Name.Name] = fd
-		}
-	}
+import (
+	"context"
+	"database/sql"
+	"time"
 
-	// selectorCall reports whether e is t.<name>().
-	selectorCall := func(e ast.Expr, name string) bool {
-		call, ok := e.(*ast.CallExpr)
+	"github.com/k3s-io/kine/pkg/metrics"
+	"github.com/k3s-io/kine/pkg/query"
+	"github.com/k3s-io/kine/pkg/server"
+	"github.com/sirupsen/logrus"
+)
+
+// explicit interface check
+var _ server.Transaction = (*Tx)(nil)
+
+type Tx struct {
+	x *sql.Tx
+	d *Generic
+}
+
+func (t *Tx) Rollback() error {
+	logrus.Tracef("TX ROLLBACK")
+	return t.x.Rollback()
+}
+
+func (t *Tx) MustRollback() {
+	if err := t.Rollback(); err != nil {
+		if err != sql.ErrTxDone {
+			logrus.Fatalf("Transaction rollback failed: %v", err)
+		}
+	}
+}
+`
+
+// TestKineCompactRollbackFailureDiscardsConn pins why a failed compaction rollback
+// still exits kine. A ROLLBACK that fails with anything but sql.ErrTxDone can return
+// its connection to the pool still inside the transaction and holding the WAL write
+// lock: database/sql discards a connection only on driver.ErrBadConn, which
+// modernc.org/sqlite's tx.Rollback never returns. kine cannot drop that one
+// connection, so it exits and restarts with a clean pool. That rests on two facts,
+// both pinned here: after kinePatches, compact() still defers t.MustRollback() and
+// never handles a rollback error itself, and the pinned kine's MustRollback calls
+// logrus.Fatalf for any rollback error other than sql.ErrTxDone. A failed commit does
+// not trip it: database/sql marks the tx done before the driver commits, so the
+// deferred rollback returns sql.ErrTxDone. This is a structural test of the source;
+// exercising the real driver would need modernc.org/sqlite in this module's graph.
+func TestKineCompactRollbackFailureDiscardsConn(t *testing.T) {
+	// patched writes the fixture for file under a temp root, applies every patch in
+	// kinePatches aimed at it, and parses the result.
+	patched := func(file, src string) *ast.File {
+		t.Helper()
+		root := t.TempDir()
+		path := filepath.Join(root, filepath.FromSlash(file))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		var patches []kineSourcePatch
+		for _, p := range kinePatches {
+			if p.file == file {
+				patches = append(patches, p)
+			}
+		}
+		if err := applyKinePatches(root, patches); err != nil {
+			t.Fatal(err)
+		}
+		f, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+		if err != nil {
+			t.Fatalf("patched %s does not parse: %v", file, err)
+		}
+		return f
+	}
+	method := func(f *ast.File, name string) *ast.FuncDecl {
+		t.Helper()
+		for _, d := range f.Decls {
+			if fd, ok := d.(*ast.FuncDecl); ok && fd.Recv != nil && fd.Name.Name == name {
+				return fd
+			}
+		}
+		t.Fatalf("no %s method", name)
+		return nil
+	}
+	// selectorCall reports whether n is <x>.<name>(...).
+	selectorCall := func(n ast.Node, x, name string) bool {
+		call, ok := n.(*ast.CallExpr)
 		if !ok {
 			return false
 		}
@@ -436,92 +487,89 @@ func TestKineCompactRollbackFailureIsNotFatal(t *testing.T) {
 		if !ok || sel.Sel.Name != name {
 			return false
 		}
-		x, ok := sel.X.(*ast.Ident)
-		return ok && x.Name == "t"
+		id, ok := sel.X.(*ast.Ident)
+		return ok && id.Name == x
 	}
-	// deferred reports whether fn defers t.MustRollback() directly, and whether it
-	// defers a closure whose body calls t.Rollback().
-	deferred := func(fn *ast.FuncDecl) (mustRollback, rollbackClosure bool) {
-		ast.Inspect(fn.Body, func(n ast.Node) bool {
-			ds, ok := n.(*ast.DeferStmt)
-			if !ok {
-				return true
+
+	t.Run("compact keeps upstream's deferred MustRollback", func(t *testing.T) {
+		compact := method(patched("pkg/logstructured/sqllog/sql.go", kineV0172SQLLogCompact), "compact")
+		mustRollback := 0
+		for _, s := range compact.Body.List {
+			if ds, ok := s.(*ast.DeferStmt); ok && selectorCall(ds.Call, "t", "MustRollback") && len(ds.Call.Args) == 0 {
+				mustRollback++
 			}
-			if selectorCall(ds.Call, "MustRollback") {
-				mustRollback = true
+		}
+		if mustRollback != 1 {
+			t.Errorf("compact() defers t.MustRollback() %d times at top level, want once: a failed rollback must exit kine", mustRollback)
+		}
+		ast.Inspect(compact.Body, func(n ast.Node) bool {
+			if ds, ok := n.(*ast.DeferStmt); ok {
+				if _, lit := ds.Call.Fun.(*ast.FuncLit); lit {
+					t.Error("compact() defers a closure; a closure that handles the rollback error itself keeps kine up on a connection that may hold the write lock")
+				}
 			}
-			if lit, ok := ds.Call.Fun.(*ast.FuncLit); ok {
-				ast.Inspect(lit.Body, func(m ast.Node) bool {
-					if e, ok := m.(ast.Expr); ok && selectorCall(e, "Rollback") {
-						rollbackClosure = true
-					}
-					return true
-				})
+			if selectorCall(n, "t", "Rollback") {
+				t.Error("compact() calls t.Rollback() itself; only t.MustRollback() may handle the compaction's rollback")
 			}
 			return true
 		})
-		return mustRollback, rollbackClosure
-	}
+	})
 
-	compact, ok := methods["compact"]
-	if !ok {
-		t.Fatalf("patched %s has no compact method", file)
-	}
-	must, closure := deferred(compact)
-	if must {
-		t.Error("compact() still defers t.MustRollback(), which is fatal when the rollback fails")
-	}
-	if !closure {
-		t.Error("compact() does not defer a closure that calls t.Rollback()")
-	}
-
-	// The deferred closures themselves must not exit kine either, and must tolerate
-	// the sql.ErrTxDone a committed or already rolled-back tx returns.
-	ast.Inspect(compact.Body, func(n ast.Node) bool {
-		ds, ok := n.(*ast.DeferStmt)
-		if !ok {
-			return true
-		}
-		lit, ok := ds.Call.Fun.(*ast.FuncLit)
-		if !ok {
-			return true
-		}
-		txDoneChecked := false
-		ast.Inspect(lit.Body, func(m ast.Node) bool {
-			call, ok := m.(*ast.CallExpr)
+	t.Run("MustRollback exits on a rollback error other than ErrTxDone", func(t *testing.T) {
+		mr := method(patched("pkg/drivers/generic/tx.go", kineV0172GenericTx), "MustRollback")
+		// if err := t.Rollback(); err != nil { if err != sql.ErrTxDone { logrus.Fatalf(...) } }
+		guarded := false
+		ast.Inspect(mr.Body, func(n ast.Node) bool {
+			outer, ok := n.(*ast.IfStmt)
 			if !ok {
 				return true
 			}
-			sel, ok := call.Fun.(*ast.SelectorExpr)
-			if !ok {
+			as, ok := outer.Init.(*ast.AssignStmt)
+			if !ok || len(as.Rhs) != 1 || !selectorCall(as.Rhs[0], "t", "Rollback") {
 				return true
 			}
-			pkg, _ := sel.X.(*ast.Ident)
-			switch {
-			case strings.HasPrefix(sel.Sel.Name, "Fatal"), strings.HasPrefix(sel.Sel.Name, "Panic"):
-				t.Errorf("compact()'s deferred closure calls %s, which exits kine", sel.Sel.Name)
-			case pkg != nil && pkg.Name == "os" && sel.Sel.Name == "Exit":
-				t.Error("compact()'s deferred closure calls os.Exit")
-			case pkg != nil && pkg.Name == "errors" && sel.Sel.Name == "Is" && len(call.Args) == 2:
-				if target, ok := call.Args[1].(*ast.SelectorExpr); ok && target.Sel.Name == "ErrTxDone" {
-					if x, ok := target.X.(*ast.Ident); ok && x.Name == "sql" {
-						txDoneChecked = true
+			for _, s := range outer.Body.List {
+				inner, ok := s.(*ast.IfStmt)
+				if !ok {
+					continue
+				}
+				be, ok := inner.Cond.(*ast.BinaryExpr)
+				if !ok || be.Op != token.NEQ {
+					continue
+				}
+				y, ok := be.Y.(*ast.SelectorExpr)
+				if !ok || y.Sel.Name != "ErrTxDone" {
+					continue
+				}
+				if pkg, ok := y.X.(*ast.Ident); !ok || pkg.Name != "sql" {
+					continue
+				}
+				for _, s := range inner.Body.List {
+					if es, ok := s.(*ast.ExprStmt); ok && selectorCall(es.X, "logrus", "Fatalf") {
+						guarded = true
 					}
 				}
 			}
-			return true
+			return false
 		})
-		if !txDoneChecked {
-			t.Error("compact()'s deferred closure does not check errors.Is(err, sql.ErrTxDone)")
+		if !guarded {
+			t.Error("the pinned kine's MustRollback no longer calls logrus.Fatalf for a rollback error other than sql.ErrTxDone; compact() relies on it to exit")
 		}
-		return true
 	})
 
-	compactStart, ok := methods["compactStart"]
-	if !ok {
-		t.Fatalf("patched %s has no compactStart method", file)
-	}
-	if must, _ := deferred(compactStart); !must {
-		t.Error("compactStart() no longer defers t.MustRollback(): the rollback patch must change compact() only")
-	}
+	t.Run("fixture matches the pinned module source", func(t *testing.T) {
+		cache := os.Getenv("GOMODCACHE")
+		if cache == "" {
+			cache = filepath.Join(build.Default.GOPATH, "pkg", "mod")
+		}
+		path := filepath.Join(cache, filepath.FromSlash(kineModulePath)+"@"+DefaultKineVersion, "pkg", "drivers", "generic", "tx.go")
+		src, err := os.ReadFile(path)
+		if err != nil {
+			t.Skipf("kine %s is not in the module cache (%v); the fixture is checked where it is", DefaultKineVersion, err)
+		}
+		_, fns, _ := strings.Cut(kineV0172GenericTx, "\n}\n\n")
+		if fns == "" || !strings.Contains(string(src), fns) {
+			t.Errorf("Rollback/MustRollback in %s differ from kineV0172GenericTx: the pin moved or upstream changed, so re-check that a failed rollback still exits kine", path)
+		}
+	})
 }

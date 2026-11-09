@@ -49,10 +49,20 @@ type kineSourcePatch struct {
 // other half is childreq.Raises, the module requirements raised in the copied tree's
 // go.mod (p2 added golang.org/x/net v0.60.0 to p1's source patch, p3 added
 // github.com/klauspost/compress v1.20.2, p4 added the compact-commit-returns-error
-// source patch, p5 added compact-rollback-logs-error). kineBuildVariant
-// names the whole set: any change to either changes that variant, so every staged
-// kine re-stages. TestKinePatchSetIsMarked enforces that, against an append-only
-// history of digests.
+// source patch, p5 added compact-rollback-logs-error). kineBuildVariant names the
+// whole set: any change to either changes that variant, so every staged kine
+// re-stages. TestKinePatchSetIsMarked enforces that, against an append-only history
+// of digests.
+//
+// The set is p4's again. p5 also replaced compact()'s deferred t.MustRollback() with
+// a closure that only logged a failed rollback. That was reverted: a ROLLBACK that
+// fails with anything but sql.ErrTxDone can return its connection to the pool still
+// inside the transaction and holding the WAL write lock (database/sql discards a
+// connection only on driver.ErrBadConn, and modernc.org/sqlite's tx.Rollback never
+// returns it), and nothing later detects that reliably. Exiting there, as upstream's
+// MustRollback does (pkg/drivers/generic/tx.go:50-56), lets kine restart with a clean
+// pool. A failed commit is unaffected: its rollback returns sql.ErrTxDone, which
+// MustRollback ignores. TestKineCompactRollbackFailureDiscardsConn pins both halves.
 //
 // migrate-scan-in-order: generic.(*Generic).Migrate issues BOTH of its COUNT(*)
 // queries before scanning either, then returns after the first Scan (the legacy
@@ -119,31 +129,6 @@ var kinePatches = []kineSourcePatch{{
 	if err := t.Commit(); err != nil {
 		return 0, 0, fmt.Errorf("failed to commit compaction: %w", err)
 	}
-`,
-}, {
-	// compact-rollback-logs-error: compact() defers t.MustRollback(), which is
-	// logrus.Fatalf on any rollback error other than sql.ErrTxDone, so a rollback that
-	// fails after a failed or timed-out compaction still exits kine and takes the
-	// control plane down with it. The fix defers Rollback and logs that error instead;
-	// the compaction is retried on the next interval either way. Only compact() changes:
-	// MustRollback itself and its other caller (compactStart, run once at startup) keep
-	// upstream behaviour, and generic.(*Tx).Compact defers no rollback. The anchor
-	// carries the BeginTx error return because "defer t.MustRollback()" alone occurs
-	// twice in the file. Upstream: unfixed at v0.17.2 through v0.17.5.
-	name: "compact-rollback-logs-error",
-	file: "pkg/logstructured/sqllog/sql.go",
-	old: `		return 0, 0, fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer t.MustRollback()
-`,
-	new: `		return 0, 0, fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	// A failed rollback is logged, not fatal: MustRollback would exit kine.
-	defer func() {
-		if err := t.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
-			logrus.Errorf("COMPACT transaction rollback failed: %v", err)
-		}
-	}()
 `,
 }}
 
@@ -232,14 +217,14 @@ func kineBuildArgs(version, out string) []string {
 		"-o", out, "."}
 }
 
-// kinePatchSetID is the patch-set suffix of kineBuildVariant ("p5" of "nocgo+p5").
+// kinePatchSetID is the patch-set suffix of kineBuildVariant ("p4" of "nocgo+p4").
 func kinePatchSetID() string {
 	_, id, _ := strings.Cut(kineBuildVariant, "+")
 	return id
 }
 
 // kineStampedVersion is the version a patched kine build reports: the upstream pin
-// plus the patch set, "v0.17.2+p5" (the bare pin with no patch set). `kine --version`
+// plus the patch set, "v0.17.2+p4" (the bare pin with no patch set). `kine --version`
 // prints it.
 func kineStampedVersion(version string) string {
 	if id := kinePatchSetID(); id != "" {
