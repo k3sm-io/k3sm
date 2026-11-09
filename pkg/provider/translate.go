@@ -112,26 +112,37 @@ const minimumGracePeriodSeconds int64 = 2
 // resolvePodBoxEnv flattens it into literal values before the box reaches
 // runtimed, which reads only EnvVar.value and never talks to the apiserver.
 //
-// dnsCfg is the pod's cluster DNS configuration. For a cluster-first DNSPolicy,
-// toPodBox injects the K3SM_DNS_* env the DYLD getaddrinfo shim reads (via
-// dns.ConfigToEnv) into every container so in-pod Service names resolve against
-// the cluster DNS VIP (see injectClusterDNSEnv) — without this env the shim
-// only loads and falls back to the host resolver.
+// dnsCfg is the pod's DNS configuration (runtimedRuntime.podDNSConfig). toPodBox
+// injects the K3SM_DNS_* env the DYLD getaddrinfo shim reads (via
+// dns.ConfigToEnvChecked) into every container, gated on the pod's DNSPolicy (see
+// injectPodDNSEnv): a cluster-first pod gets the cluster DNS VIP, a dnsPolicy None
+// pod gets its own nameservers in the shim's exclusive mode, and a Default pod
+// gets nothing — without this env the shim only loads and falls back to the host
+// resolver.
 //
 // A cluster-first pod's spec.dnsConfig is additively merged into the cluster
 // base (extra search domains appended+deduped, ndots override) before this
-// injection; a None/Default pod keeps the unmerged base. Still deferred, pending
-// an apis/shim-ABI change:
-// dnsPolicy: None's own nameservers, an explicit ndots: 0 (indistinguishable
-// from unset in this int32 path), spec.dnsConfig.nameservers under ClusterFirst
-// (the shim ABI carries one server), and non-ndots options.
+// injection; a None pod's spec.dnsConfig IS its config (dnsPolicyNoneConfig); a
+// Default pod keeps the unmerged base. Still not honored: an explicit ndots: 0
+// (indistinguishable from unset in this int32 path), spec.dnsConfig.nameservers
+// under ClusterFirst (the cluster resolver is never repointed), and non-ndots
+// options on a native pod (the shim reads none; a vm guest's resolv.conf carries
+// them). A None pod the shim cannot honor (no IPv4 nameserver) is refused with a
+// *podDNSRefusal, never sent to the host resolver.
 //
 // nodeIP discriminates the bind-discipline env: a pod with a distinct /32
 // (podIP != nodeIP) gets K3SM_POD_IP injected so the DYLD bind() interpose
 // rewrites its wildcard binds onto that /32; hostNetwork/vm/no-network
 // pods (podIP == nodeIP) get nothing. log, when non-nil, receives the
 // host-binary-route warn — see injectBindDisciplineEnv.
-func toPodBox(pod *corev1.Pod, podIP, nodeIP, rootfsRoot, dyldShim, clusterRegistry string, dnsCfg netv1.DNSConfig, log *slog.Logger) (*runtimev1.PodBox, error) {
+//
+// serviceVIP is the node's cluster DNS Service VIP (buildBox passes
+// r.resolverVIP), and it scopes the bind discipline's connect() rung
+// (clusterCIDRs). It is passed on its own, never read from dnsCfg, because it is
+// a fact of the node's Service network rather than of the pod's resolver: a
+// dnsPolicy None config carries no ClusterDNSIP by construction, and reading the
+// VIP from it would silently narrow a None pod's connect-rung scope.
+func toPodBox(pod *corev1.Pod, podIP, nodeIP, rootfsRoot, dyldShim, clusterRegistry string, dnsCfg netv1.DNSConfig, serviceVIP string, log *slog.Logger) (*runtimev1.PodBox, error) {
 	box := &runtimev1.PodBox{
 		PodId:       string(pod.UID),
 		Namespace:   pod.Namespace,
@@ -192,13 +203,15 @@ func toPodBox(pod *corev1.Pod, podIP, nodeIP, rootfsRoot, dyldShim, clusterRegis
 	}
 	stampImagePlatform(box, imagePlatform)
 
-	// Inject cluster DNS env for the DYLD shim, gated on DNSPolicy — see
-	// injectClusterDNSEnv.
-	injectClusterDNSEnv(box, pod.Spec.DNSPolicy, dnsCfg)
+	// Inject the pod's DNS env for the DYLD shim, gated on DNSPolicy — see
+	// injectPodDNSEnv. A None pod the shim cannot honor fails closed here.
+	if err := injectPodDNSEnv(box, pod.Spec.DNSPolicy, dnsCfg); err != nil {
+		return nil, err
+	}
 
 	// Inject K3SM_POD_IP for the DYLD bind() interpose, gated on a distinct /32
 	// — see injectBindDisciplineEnv.
-	injectBindDisciplineEnv(box, podIP, nodeIP, clusterCIDRs(dnsCfg.ClusterDNSIP), log)
+	injectBindDisciplineEnv(box, podIP, nodeIP, clusterCIDRs(serviceVIP), log)
 
 	box.Volumes, err = toVolumes(pod, clusterRegistry)
 	if err != nil {
@@ -377,56 +390,6 @@ func applyXcodeToolchain(profile *runtimev1.SandboxProfile, pod *corev1.Pod, dev
 	profile.XcodeToolchainDir = dir
 }
 
-// injectClusterDNSEnv appends the K3SM_DNS_* environment the DYLD getaddrinfo shim
-// reads (serialized by the single pinned dns.ConfigToEnv encoder, never
-// hand-rolled here — a wrong separator would break in-pod cluster DNS) to every
-// container so a pod's unqualified Service lookups expand against the cluster
-// DNS VIP.
-//
-// DNSPolicy-gated to the cluster-first policies (clusterDNSPolicy): Default and
-// None inject nothing, falling back to the host resolver — Default semantics for
-// a Default pod; for None (custom spec.dnsConfig nameservers) this is deferred
-// pending an apis/shim-ABI change.
-//
-// Scope parity: appended to InitContainers, Containers and EphemeralContainers, matching the
-// box-wide DYLD shim annotation.
-//
-// Precedence (infra-wins): appended after each container's user env, so
-// resolveContainerEnv's later-wins upsert makes the cluster value authoritative
-// — a workload cannot override cluster DNS under ClusterFirst. Keys are sorted
-// for deterministic output.
-//
-// When dnsCfg is not usable (no cluster DNS VIP / invalid), dns.ConfigToEnv
-// returns nil and nothing is injected.
-func injectClusterDNSEnv(box *runtimev1.PodBox, policy corev1.DNSPolicy, dnsCfg netv1.DNSConfig) {
-	if !clusterDNSPolicy(policy) {
-		return
-	}
-	env := dns.ConfigToEnv(dnsCfg)
-	if env == nil {
-		return
-	}
-	keys := make([]string, 0, len(env))
-	for k := range env {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	appendEnv := func(c *runtimev1.Container) {
-		for _, k := range keys {
-			c.Env = append(c.Env, &runtimev1.EnvVar{Name: k, Value: env[k]})
-		}
-	}
-	for _, c := range box.GetInitContainers() {
-		appendEnv(c)
-	}
-	for _, c := range box.GetContainers() {
-		appendEnv(c)
-	}
-	for _, c := range box.GetEphemeralContainers() {
-		appendEnv(c)
-	}
-}
-
 // clusterCIDRs returns the connect() rung's destination scope: the cluster pod
 // CIDR (podnet.ClusterPodCIDR, the lo0-alias /10 every pod /32 is allocated from) and,
 // when derivable, the cluster Service CIDR — the two ranges whose destinations may be
@@ -476,7 +439,7 @@ func clusterCIDRs(dnsVIP string) []netip.Prefix {
 // nil return injects nothing, and an unparseable podIP is likewise a no-op — the
 // discipline stays off rather than mis-binds.
 //
-// Precedence (infra-wins) mirrors injectClusterDNSEnv: appended after each
+// Precedence (infra-wins) mirrors injectPodDNSEnv: appended after each
 // container's user env to init, regular and ephemeral containers, so a workload cannot
 // override the allocated /32.
 //
@@ -550,17 +513,6 @@ func isHostBinaryRoute(c *runtimev1.Container) bool {
 	return len(c.GetCommand()) == 0 && len(c.GetArgs()) == 0 && image.IsHostPathReference(c.GetImage())
 }
 
-// clusterDNSPolicy reports whether the pod's DNSPolicy selects cluster DNS. An empty
-// policy is the upstream default (ClusterFirst). ClusterFirstWithHostNet MUST match
-// too: k3sm pods share the host network by construction, so that value is reachable —
-// matching only DNSClusterFirst would silently drop cluster DNS for those pods.
-// Default and None do NOT select cluster DNS (no injection).
-func clusterDNSPolicy(policy corev1.DNSPolicy) bool {
-	return policy == "" ||
-		policy == corev1.DNSClusterFirst ||
-		policy == corev1.DNSClusterFirstWithHostNet
-}
-
 // dnsConfigOverride reduces a pod's corev1 spec.dnsConfig to the DISCRETE
 // search/ndots inputs darwin-net's netv1-only dns.MergeDNSConfig consumes. k3sm is
 // the corev1-aware layer, so this corev1→params extraction lives HERE (never in
@@ -576,11 +528,12 @@ func clusterDNSPolicy(policy corev1.DNSPolicy) bool {
 // keep-base; anything else — absent, nil/empty, unparseable, or negative — yields 0,
 // which dns.MergeDNSConfig reads as "keep base".
 //
-// DEFERRED to a future apis wave: c.Nameservers (the single-server shim ABI carries
-// exactly one server — the cluster VIP), an explicit `ndots: 0` (the int32 path cannot
-// distinguish it from unset), and every non-"ndots" option (no shim consumer). They
-// are intentionally dropped so a ClusterFirst pod can only ADD to its cluster
-// search/ndots, never repoint the cluster resolver.
+// Dropped under ClusterFirst, on purpose: c.Nameservers (the cluster resolver is never
+// repointed; netv1.DNSConfig.Validate forbids nameservers under ClusterFirst), an
+// explicit `ndots: 0` (the int32 path cannot distinguish it from unset), and every
+// non-"ndots" option (Validate forbids options under ClusterFirst). A ClusterFirst pod
+// can only ADD to its cluster search/ndots. A dnsPolicy None pod's dnsConfig is mapped
+// whole by dnsPolicyNoneConfig instead.
 func dnsConfigOverride(c *corev1.PodDNSConfig) (searches []string, ndots int32) {
 	if c == nil {
 		return nil, 0
@@ -605,6 +558,85 @@ func dnsConfigOverride(c *corev1.PodDNSConfig) (searches []string, ndots int32) 
 		break
 	}
 	return searches, ndots
+}
+
+// dnsPolicyNoneConfig maps a dnsPolicy None pod's corev1 spec.dnsConfig to the
+// netv1 DNSConfig the shim and the vm guest consume, and reports what it altered.
+// It is the corev1→netv1 half of None, beside dnsConfigOverride (ClusterFirst's):
+// k3sm is the corev1-aware layer.
+//
+//   - Policy is netv1.DNSPolicyNone.
+//   - Nameservers are c.Nameservers in order with repeats removed (first seen
+//     wins, compared as parsed addresses so "1.1.1.1" and "::ffff:1.1.1.1" are one
+//     server; netv1 Validate rejects a repeat, and resolving through a server twice
+//     is resolving through it once), then capped at netv1.MaxNameservers, as the
+//     kubelet caps them.
+//   - SearchDomains are c.Searches capped at dns.MaxSearchDomains (the shim's
+//     limit; upstream allows 32). dns.ConfigToEnvChecked and
+//     dns.GuestResolvConfFields then sanitize them, as for every policy.
+//   - ClusterDNSIP and ClusterDomain stay empty: None takes nothing from the cluster.
+//   - The FIRST "ndots" option becomes NDots, clamped to [1, dns.MaxNDots]: NDots 0
+//     means "default" (netv1.DefaultNDots), so an explicit ndots:0 cannot be
+//     expressed and is raised to 1, the nearest value that is (a recorded ceiling).
+//     A missing, unparseable or negative value leaves NDots 0, the default. Every
+//     later "ndots" option is dropped (Validate forbids ndots in Options).
+//   - Every other option becomes a netv1.DNSOption; a nil Value is a bare flag.
+//     netv1.DNSOption cannot tell a nil Value from an empty one, so both are flags.
+//
+// A nil c yields a None config with no nameservers, which Validate refuses; the
+// API server requires at least one nameserver under None, so that only fails
+// closed (podDNSNoneEnv) and is never sent to the host resolver.
+func dnsPolicyNoneConfig(c *corev1.PodDNSConfig) (netv1.DNSConfig, dnsNoneForming) {
+	cfg := netv1.DNSConfig{Policy: netv1.DNSPolicyNone}
+	var forming dnsNoneForming
+	if c == nil {
+		return cfg, forming
+	}
+	seen := make(map[string]struct{}, len(c.Nameservers))
+	for _, ns := range c.Nameservers {
+		key := ns
+		if addr, err := netip.ParseAddr(ns); err == nil {
+			key = addr.Unmap().String()
+		}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		if len(cfg.Nameservers) == netv1.MaxNameservers {
+			forming.droppedNameservers = append(forming.droppedNameservers, ns)
+			continue
+		}
+		cfg.Nameservers = append(cfg.Nameservers, ns)
+	}
+	cfg.SearchDomains = c.Searches
+	if len(c.Searches) > dns.MaxSearchDomains {
+		cfg.SearchDomains = c.Searches[:dns.MaxSearchDomains:dns.MaxSearchDomains]
+		forming.droppedSearches = c.Searches[dns.MaxSearchDomains:]
+	}
+	sawNdots := false
+	for i := range c.Options {
+		o := c.Options[i]
+		if o.Name == "ndots" {
+			if sawNdots {
+				continue
+			}
+			sawNdots = true
+			if o.Value != nil {
+				if n, err := strconv.Atoi(*o.Value); err == nil && n >= 0 {
+					forming.ndotsZero = n == 0
+					n = min(max(n, 1), dns.MaxNDots)
+					cfg.NDots = int32(n)
+				}
+			}
+			continue
+		}
+		opt := netv1.DNSOption{Name: o.Name}
+		if o.Value != nil {
+			opt.Value = *o.Value
+		}
+		cfg.Options = append(cfg.Options, opt)
+	}
+	return cfg, forming
 }
 
 // podSandboxBackend resolves the pod's RuntimeClass (spec.runtimeClassName) to the

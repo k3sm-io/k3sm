@@ -1964,6 +1964,16 @@ func (r *runtimedRuntime) setupGuestNetwork(ctx context.Context, pod *corev1.Pod
 	if err != nil || backend != runtimev1.SandboxBackend_SANDBOX_BACKEND_VM {
 		return sandbox.GuestNetworkConfig{}, nil
 	}
+	// A None pod whose config the guest cannot honor (no IPv4 nameserver: the
+	// guest's NAT segment is IPv4) is refused BEFORE an address is drawn, with the
+	// same *podDNSRefusal the native path returns, so both read as one
+	// CreateContainerConfigError and neither boots on a resolver the pod did not ask
+	// for.
+	if pod.Spec.DNSPolicy == corev1.DNSNone {
+		if _, err := podDNSNoneEnv(dnsCfg); err != nil {
+			return sandbox.GuestNetworkConfig{}, err
+		}
+	}
 	gn, err := r.network.SetupGuest(ctx, string(pod.UID), dnsCfg)
 	if err != nil {
 		return sandbox.GuestNetworkConfig{}, r.allocError(pod, err)
@@ -1971,15 +1981,21 @@ func (r *runtimedRuntime) setupGuestNetwork(ctx context.Context, pod *corev1.Pod
 	return gn, nil
 }
 
-// podDNSConfig derives one pod's cluster DNS config: the namespace-scoped cluster
-// base (dns.PodDNSConfig), additively merged with a ClusterFirst pod's
-// spec.dnsConfig (extra search domains appended+deduped, an ndots override).
-// The merge is GATED on the cluster-DNS policy — NOT left to injectClusterDNSEnv's
-// downstream gate — so the seam is structural: a None/Default pod gets the
-// UNMERGED base, so when a later change makes None inject its own config it cannot
-// inherit a cluster-base merge. dnsConfigOverride does the corev1→discrete-params extraction
-// (k3sm is the corev1-aware layer); dns.MergeDNSConfig can only ADD search/ndots,
-// never repoint the cluster server VIP.
+// podDNSConfig derives one pod's DNS config, branching three ways on its policy:
+//
+//   - cluster-first: the namespace-scoped cluster base (dns.PodDNSConfig),
+//     additively merged with the pod's spec.dnsConfig (extra search domains
+//     appended+deduped, an ndots override). dnsConfigOverride does the
+//     corev1→discrete-params extraction (k3sm is the corev1-aware layer);
+//     dns.MergeDNSConfig can only ADD search/ndots, never repoint the cluster
+//     server VIP.
+//   - None: the pod's own spec.dnsConfig, mapped whole by dnsPolicyNoneConfig. It
+//     takes nothing from the cluster base: no VIP, no domain, no search list.
+//   - Default (and any other value): the UNMERGED base, which injectPodDNSEnv
+//     does not inject; a vm guest still gets its resolv.conf from it.
+//
+// The branch is HERE, not left to injectPodDNSEnv's downstream gate, so the seam
+// is structural: a None pod can never inherit a cluster-base merge.
 //
 // It returns the config and the number of search domains the in-pod cap DROPPED,
 // and logs nothing: the create path calls it twice for a vm pod (podIP, to learn
@@ -1990,12 +2006,81 @@ func (r *runtimedRuntime) setupGuestNetwork(ctx context.Context, pod *corev1.Pod
 // /etc/resolv.conf and its containers' injected K3SM_DNS_* env are derived from
 // this value, and a second derivation is how the two would come to disagree.
 func (r *runtimedRuntime) podDNSConfig(pod *corev1.Pod) (netv1.DNSConfig, int) {
+	if pod.Spec.DNSPolicy == corev1.DNSNone {
+		// What the mapping altered is warnDNSConfigForming's to report, once, at
+		// create; this function is called on every translation.
+		cfg, _ := dnsPolicyNoneConfig(pod.Spec.DNSConfig)
+		return cfg, 0
+	}
 	dnsCfg := dns.PodDNSConfig(r.resolverVIP, r.clusterDomain, pod.Namespace)
 	if !clusterDNSPolicy(pod.Spec.DNSPolicy) || pod.Spec.DNSConfig == nil {
 		return dnsCfg, 0
 	}
 	searches, ndots := dnsConfigOverride(pod.Spec.DNSConfig)
 	return dns.MergeDNSConfig(dnsCfg, searches, ndots)
+}
+
+// dnsNoneRefusal returns the refusal of a dnsPolicy None pod the in-pod
+// resolver cannot honor (podDNSNoneEnv), or nil. It reads the pod's spec only, so
+// CreatePod decides it before anything is allocated for the pod.
+func (r *runtimedRuntime) dnsNoneRefusal(pod *corev1.Pod) *podDNSRefusal {
+	if pod.Spec.DNSPolicy != corev1.DNSNone {
+		return nil
+	}
+	dnsCfg, _ := r.podDNSConfig(pod)
+	var refusal *podDNSRefusal
+	if _, err := podDNSNoneEnv(dnsCfg); errors.As(err, &refusal) {
+		return refusal
+	}
+	return nil
+}
+
+// warnDNSConfigPartial records a DNSConfigPartial Warning Event when a dnsPolicy
+// None pod lists IPv6 nameservers beside IPv4 ones: the in-pod resolver (the
+// native shim, and the vm guest's IPv4 NAT segment) serves only the IPv4 subset,
+// so the pod runs on fewer nameservers than it asked for. The drop is not a
+// refusal (an all-IPv6 pod is refused instead, podDNSNoneEnv); the Event is the
+// only place it is visible. CreatePod calls it once, at create, as it does
+// warnXcodeToolchainUngranted: an update, a re-attach or a retry rebuilds the same
+// box from the same immutable dnsConfig and has nothing new to say.
+func (r *runtimedRuntime) warnDNSConfigPartial(ctx context.Context, pod *corev1.Pod) {
+	if pod.Spec.DNSPolicy != corev1.DNSNone {
+		return
+	}
+	dnsCfg, _ := r.podDNSConfig(pod)
+	_, err := dns.ConfigToEnvChecked(dnsCfg)
+	if !errors.Is(err, dns.ErrNameserversDropped) {
+		return
+	}
+	r.log.WarnContext(ctx, "dnsPolicy None pod lists IPv6 nameservers the in-pod resolver does not use",
+		"namespace", pod.Namespace, "name", pod.Name, "err", err)
+	r.recorder.Event(pod, corev1.EventTypeWarning, reasonDNSConfigPartial, msgDNSConfigPartial(err))
+}
+
+// warnDNSConfigForming records one DNSConfigForming Warning Event per alteration
+// dnsPolicyNoneConfig made to a dnsPolicy None pod's dnsConfig to fit it:
+// nameservers beyond the cap, search domains beyond the cap, and ndots 0 applied
+// as 1. The reason is the kubelet's for a DNS config it altered; CreatePod calls
+// it once, at create.
+func (r *runtimedRuntime) warnDNSConfigForming(ctx context.Context, pod *corev1.Pod) {
+	if pod.Spec.DNSPolicy != corev1.DNSNone {
+		return
+	}
+	_, forming := dnsPolicyNoneConfig(pod.Spec.DNSConfig)
+	var msgs []string
+	if len(forming.droppedNameservers) > 0 {
+		msgs = append(msgs, msgDNSNameserversCapped(forming.droppedNameservers))
+	}
+	if len(forming.droppedSearches) > 0 {
+		msgs = append(msgs, msgDNSSearchesCapped(forming.droppedSearches))
+	}
+	if forming.ndotsZero {
+		msgs = append(msgs, msgDNSNdotsZero)
+	}
+	for _, m := range msgs {
+		r.log.WarnContext(ctx, "dnsPolicy None pod dnsConfig altered", "namespace", pod.Namespace, "name", pod.Name, "detail", m)
+		r.recorder.Event(pod, corev1.EventTypeWarning, reasonDNSConfigForming, m)
+	}
 }
 
 // buildBox translates pod to a PodBox and resolves its env into LITERAL values —
@@ -2005,9 +2090,10 @@ func (r *runtimedRuntime) podDNSConfig(pod *corev1.Pod) (netv1.DNSConfig, int) {
 // podIP is the pod's already-resolved IP (see podIP — allocated BEFORE this
 // translation so the box and its resolved env carry the real /32).
 func (r *runtimedRuntime) buildBox(ctx context.Context, pod *corev1.Pod, podIP string) (*runtimev1.PodBox, error) {
-	// Per-pod cluster DNS config: the search list is namespace-scoped
-	// (<ns>.svc.<domain>, …) so an unqualified Service name in this pod's namespace
-	// resolves first. toPodBox injects it (DNSPolicy-gated) into the containers.
+	// Per-pod DNS config (podDNSConfig): for a cluster-first pod the search list is
+	// namespace-scoped (<ns>.svc.<domain>, …) so an unqualified Service name in this
+	// pod's namespace resolves first; a None pod's is its own. toPodBox
+	// injects it (DNSPolicy-gated) into the containers.
 	dnsCfg, dropped := r.podDNSConfig(pod)
 	if dropped > 0 {
 		// The pod's merged search list exceeded the in-pod cap (MaxSearchDomains, a
@@ -2026,7 +2112,10 @@ func (r *runtimedRuntime) buildBox(ctx context.Context, pod *corev1.Pod, podIP s
 	if _, err := r.setupGuestNetwork(ctx, pod, dnsCfg); err != nil {
 		return nil, err
 	}
-	box, err := toPodBox(pod, podIP, r.nodeIP, r.podRoot(string(pod.UID)), r.dyldShim, r.clusterRegistry, dnsCfg, r.log)
+	// The cluster DNS VIP is passed beside dnsCfg because a None config carries
+	// none, and the bind discipline's Service-CIDR scope must not depend on the
+	// pod's resolver (toPodBox).
+	box, err := toPodBox(pod, podIP, r.nodeIP, r.podRoot(string(pod.UID)), r.dyldShim, r.clusterRegistry, dnsCfg, r.resolverVIP, r.log)
 	if err != nil {
 		return nil, err
 	}
@@ -2215,28 +2304,40 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	// is gone, since Virtual Kubelet may send no DeletePod for such a pod;
 	// auto-releasing would also rip a live pod's alias away on an UpdatePod
 	// translate error).
-	podIP, err := r.podIP(ctx, pod)
-	if err != nil {
-		// Log here (not just return) so the failure reaches server.log — VK's own
-		// create-error log does not, so a pod stuck Pending is otherwise invisible.
-		r.log.Error("CreatePod: allocate podIP", "namespace", pod.Namespace, "name", pod.Name, "err", err)
-		return fmt.Errorf("create pod %s/%s: %w", pod.Namespace, pod.Name, err)
-	}
-	// The interconnect attach (k3sm.io/interconnects) runs once per pod, here
-	// at create and before translation, so the box carries its env. Under
-	// fallback none, or before this node's desired annotation is known, it holds
-	// the create; the slot of a held or refused create is freed with the /32 by
-	// releasePodNetwork.
-	if err := r.interconnect.attach(ctx, pod); err != nil {
-		r.log.Error("CreatePod: interconnect attach", "namespace", pod.Namespace, "name", pod.Name, "err", err)
-		return fmt.Errorf("create pod %s/%s: %w", pod.Namespace, pod.Name, err)
-	}
-	box, err := r.buildBox(ctx, pod, podIP)
-	if err != nil {
-		r.log.Error("CreatePod: translate/buildBox", "namespace", pod.Namespace, "name", pod.Name, "err", err)
-		r.recordPodHostnameRefusal(pod, err)
-		r.recordVolumeRefusal(pod, err)
-		return fmt.Errorf("translate pod %s/%s: %w", pod.Namespace, pod.Name, err)
+	//
+	// A dnsPolicy None pod the in-pod resolver cannot honor (podDNSRefusal) is
+	// decided from its spec alone, so it is decided FIRST, before an address is
+	// drawn or an interconnect slot attached: it holds nothing. It is not an error
+	// return either: it is PARKED below, once its track exists, as the kubelet's
+	// CreateContainerConfigError, and is never sent to the runtime.
+	dnsRefusal := r.dnsNoneRefusal(pod)
+	var podIP string
+	var box *runtimev1.PodBox
+	if dnsRefusal == nil {
+		var err error
+		podIP, err = r.podIP(ctx, pod)
+		if err != nil {
+			// Log here (not just return) so the failure reaches server.log — VK's own
+			// create-error log does not, so a pod stuck Pending is otherwise invisible.
+			r.log.Error("CreatePod: allocate podIP", "namespace", pod.Namespace, "name", pod.Name, "err", err)
+			return fmt.Errorf("create pod %s/%s: %w", pod.Namespace, pod.Name, err)
+		}
+		// The interconnect attach (k3sm.io/interconnects) runs once per pod, here
+		// at create and before translation, so the box carries its env. Under
+		// fallback none, or before this node's desired annotation is known, it holds
+		// the create; the slot of a held or refused create is freed with the /32 by
+		// releasePodNetwork.
+		if err := r.interconnect.attach(ctx, pod); err != nil {
+			r.log.Error("CreatePod: interconnect attach", "namespace", pod.Namespace, "name", pod.Name, "err", err)
+			return fmt.Errorf("create pod %s/%s: %w", pod.Namespace, pod.Name, err)
+		}
+		box, err = r.buildBox(ctx, pod, podIP)
+		if err != nil {
+			r.log.Error("CreatePod: translate/buildBox", "namespace", pod.Namespace, "name", pod.Name, "err", err)
+			r.recordPodHostnameRefusal(pod, err)
+			r.recordVolumeRefusal(pod, err)
+			return fmt.Errorf("translate pod %s/%s: %w", pod.Namespace, pod.Name, err)
+		}
 	}
 	// Refuse a pod this node cannot honestly run BEFORE the RPC, and before any
 	// bookkeeping — a pod refused here leaves no track and no prober, exactly as if
@@ -2245,18 +2346,29 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	//
 	// The emptyDir-medium and projected-source checks run first because they are
 	// pure spec inspection, while the platform check may cost a node-capability RPC.
-	if err := r.preflightEmptyDirMedium(pod, box); err != nil {
-		return err
+	// A DNS-refused pod has no box: it is parked below and never reaches the RPC,
+	// so only the spec-only preflight runs for it.
+	if box != nil {
+		if err := r.preflightEmptyDirMedium(pod, box); err != nil {
+			return err
+		}
 	}
 	if err := r.preflightProjectedSources(pod); err != nil {
 		return err
 	}
-	if err := r.preflightImagePlatform(ctx, pod, box); err != nil {
-		return err
+	if box != nil {
+		if err := r.preflightImagePlatform(ctx, pod, box); err != nil {
+			return err
+		}
+		// A pod that asked for the developer toolchain and got none still runs; say so
+		// on the pod, once, at create. Degrade-not-fail, unlike the preflight above.
+		r.warnXcodeToolchainUngranted(ctx, pod, box)
+		// Likewise a None pod running on fewer nameservers than it listed.
+		r.warnDNSConfigPartial(ctx, pod)
 	}
-	// A pod that asked for the developer toolchain and got none still runs; say so
-	// on the pod, once, at create. Degrade-not-fail, unlike the preflight above.
-	r.warnXcodeToolchainUngranted(ctx, pod, box)
+	// A None pod whose dnsConfig was altered to fit (ndots 0, the search or
+	// nameserver caps) hears it once, at create, refused or not.
+	r.warnDNSConfigForming(ctx, pod)
 
 	// The GPU memory fit and the slot cap are sized BEFORE the lock, because the
 	// node's GPU facts and each held pod's phase cost an RPC and a blocking call
@@ -2365,6 +2477,17 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 		old.cancelRestarts()
 		old.cancelPulls()
 		old.cancelPostStart()
+	}
+
+	// A refused dnsPolicy None pod is kept, reported Pending with every container
+	// Waiting CreateContainerConfigError and the refusal's text, and re-derived once
+	// per resync (pullClassResync), as a runtimed CONTAINER_CONFIG refusal is. It
+	// never reaches the runtime, so it never starts on the host resolver.
+	if dnsRefusal != nil {
+		r.log.Warn("CreatePod: the pod's dnsPolicy None config cannot be honored; the pod is kept and not started",
+			"namespace", pod.Namespace, "name", pod.Name, "err", dnsRefusal.Unwrap())
+		r.parkDNSRefusal(pod, t, dnsRefusal)
+		return nil
 	}
 
 	// Announce the attempt before it is made: every container whose image the

@@ -19,6 +19,7 @@ package provider
 import (
 	"fmt"
 	goruntime "runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -30,7 +31,9 @@ import (
 	"k8s.io/client-go/tools/reference"
 
 	mlxv1alpha1 "k3sm.io/apis/mlx/v1alpha1"
+	netv1 "k3sm.io/apis/net/v1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	"k3sm.io/darwin-net/pkg/dns"
 	"k3sm.io/k3sm/pkg/runtimeclass"
 )
 
@@ -124,6 +127,18 @@ const (
 	// reason to mirror, and `OutOfmlx.k3sm.io/gpu` (the scheduler's own out-of-resource
 	// reason) would be a lie — the slot was available, the memory beside it was not.
 	reasonFailedGPUFit = "FailedGPUFit"
+	// reasonDNSConfigPartial is recorded when a dnsPolicy None pod lists IPv6
+	// nameservers beside IPv4 ones and the in-pod resolver, which serves IPv4
+	// nameservers only, runs it on the IPv4 subset (warnDNSConfigPartial). The pod
+	// is NOT refused; an all-IPv6 None pod is, as a CreateContainerConfigError.
+	//
+	// No upstream analogue: a kubelet writes every nameserver into resolv.conf.
+	reasonDNSConfigPartial = "DNSConfigPartial"
+	// reasonDNSConfigForming is recorded when a dnsPolicy None pod's dnsConfig is
+	// altered to fit (warnDNSConfigForming): nameservers or search domains beyond
+	// the cap dropped, or ndots 0 applied as 1. It is the kubelet's own reason for
+	// a DNS config it altered.
+	reasonDNSConfigForming = "DNSConfigForming"
 	// reasonXcodeToolchainUngranted is recorded when a pod carries the
 	// k3sm.io/xcode-toolchain annotation but this node's developer-directory
 	// selection yields no grant — the node has none, or the one it has is not a
@@ -386,6 +401,31 @@ func msgFailedEmptyDirMedium(volume, medium string) string {
 // text and names the spec field and the length of the offending value.
 func msgFailedPodHostname(e *podHostnameError) string {
 	return fmt.Sprintf("Failed to create pod sandbox: %s (%d characters): %v", e.field, e.length, e.err)
+}
+
+// msgDNSConfigPartial is the DNSConfigPartial-event message. cause is
+// dns.ConfigToEnvChecked's dns.ErrNameserversDropped error, which names the
+// dropped nameservers; they are the pod's own spec, so nothing beyond what the
+// pod's reader can already see is disclosed.
+func msgDNSConfigPartial(cause error) string {
+	return "k3sm: dnsPolicy None uses only the IPv4 nameservers (the in-pod resolver serves IPv4 nameservers only): " + cause.Error()
+}
+
+// msgDNSNdotsZero is the DNSConfigForming message for an ndots:0 applied as 1.
+const msgDNSNdotsZero = "k3sm: dnsPolicy None ndots 0 is applied as ndots 1 (the in-pod resolver cannot express ndots 0)"
+
+// msgDNSNameserversCapped is the DNSConfigForming message for the nameservers
+// beyond the cap, which are the pod's own spec.
+func msgDNSNameserversCapped(dropped []string) string {
+	return fmt.Sprintf("k3sm: dnsPolicy None nameserver limits were exceeded, so only the first %d are used; dropped: %s",
+		netv1.MaxNameservers, strings.Join(dropped, " "))
+}
+
+// msgDNSSearchesCapped is the DNSConfigForming message for the search domains
+// beyond the cap, which are the pod's own spec.
+func msgDNSSearchesCapped(dropped []string) string {
+	return fmt.Sprintf("k3sm: dnsPolicy None search line limits were exceeded, so only the first %d domains are used; dropped: %s",
+		dns.MaxSearchDomains, strings.Join(dropped, " "))
 }
 
 // msgFailedProjectedSource is the FailedProjectedSource-event message for a pod

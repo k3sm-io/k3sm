@@ -181,6 +181,14 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
 
 ### Changed
 
+- A Pod with `dnsPolicy: None` now resolves through its own `dnsConfig`: its IPv4 nameservers
+  (up to three), `searches` and `ndots`, natively and in a `vm` guest, with no fallback to the host
+  resolver. It used to resolve through the host and ignore its `dnsConfig`. IPv6 nameservers are
+  skipped with a `DNSConfigPartial` Warning Event, and a Pod whose nameservers are all IPv6 does not
+  start: its containers wait in `CreateContainerConfigError`. Nameservers beyond three, search
+  domains beyond 8 and `ndots: 0` (read as 1) are reported with a `DNSConfigForming` Warning Event.
+  Repeated nameservers are merged. See
+  [limitations](docs/user/limitations.md#dns-what-resolves-and-on-which-runtime-path).
 - `k3sm server` and `k3sm agent` refuse a `--work-dir` that is not named `server` or `agent`
   respectively. Pods are denied `<data root>/server` and `<data root>/agent`, where the data root is
   the work dir's parent, so a work dir under another name, such as `/data/k3sm/srv`, left the

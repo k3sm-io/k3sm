@@ -35,9 +35,12 @@ import (
 //
 // (a) standalone node -> no K3SM_DNS_* in the pod env wiring: asserted at the
 //
-//	shared seam runtimedConfig feeds — dns.PodDNSConfig + dns.ConfigToEnv, the
-//	SAME two calls pkg/provider's buildBox/injectClusterDNSEnv make with
+//	shared seam runtimedConfig feeds — dns.PodDNSConfig + the shim-env
+//	encoder, the calls pkg/provider's buildBox/injectPodDNSEnv make with
 //	ResolverVIP/ClusterDomain — rather than duplicating that translation.
+//	It calls dns.ConfigToEnv, the nil-on-error ClusterFirst form of the
+//	dns.ConfigToEnvChecked encoder injectPodDNSEnv calls: for a cluster-first
+//	config both inject nothing on exactly the same inputs.
 //
 // (b) an explicit --dns-vip in standalone mode -> a loud error, not injection.
 //
