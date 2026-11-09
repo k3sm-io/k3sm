@@ -17,10 +17,13 @@ limitations under the License.
 package executor
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"go/ast"
 	"go/parser"
+	"go/printer"
 	"go/token"
 	"os"
 	"path/filepath"
@@ -103,7 +106,7 @@ var kinePatchSetHistory = map[string]string{
 	"nocgo+p3": "b5c727f93e5e3acbd30118700fe6b46aa3677123ed632841ceff4a694fbac1a1",
 	"nocgo+p4": "b116e0d06b6453fcd929a4bc62da794ad957ea3895b51f192c652e7f01115cc9",
 	"nocgo+p5": "14db0c216afa353618c5548f54f1df1161e7559ba6748b44af811bdbe17e7f56",
-	"nocgo+p6": "1486cdaeb3dafca24d9b684260ebcbc5507ba1265eade5fa0e8b5a7e21a557ee",
+	"nocgo+p6": "011c441ad91f4f24f79382bdcd354e4e98f2e5a68ab9e353597286cafa04097c",
 }
 
 // TestKinePatchSetIsMarked pins the link between the carried patches and the staging
@@ -153,8 +156,10 @@ func TestKineBuildArgs(t *testing.T) {
 }
 
 // kineV0172SQLLogCompact is pkg/logstructured/sqllog/sql.go of kine v0.17.2 cut to
-// its package clause, imports, compactStart() and compact(), verbatim, so the patches
-// are tested against the upstream text without the module cache or the network.
+// its package clause, imports, compactStart(), compactIter() and compact() with its
+// doc comment, verbatim, so the patches are tested against the upstream text without
+// the module cache or the network. compactIter() and the doc comment are kept because
+// compact-rollback-failures-bounded's anchor starts at the end of compactIter().
 // compactStart() is kept because it also defers t.MustRollback(): the rollback patch's
 // anchor must still occur once, and compactStart must keep upstream behaviour.
 const kineV0172SQLLogCompact = `package sqllog
@@ -233,6 +238,93 @@ func (s *SQLLog) compactStart(ctx context.Context) error {
 	return t.Commit()
 }
 
+func (s *SQLLog) compactIter(compactRev, targetCompactRev int64) (int64, int64) {
+	logrus.Tracef("COMPACT running compactRev=%d targetCompactRev=%d", compactRev, targetCompactRev)
+	// Break up the compaction into smaller batches to avoid locking the database with excessively
+	// long transactions. When things are working normally deletes should proceed quite quickly, but if
+	// run against a database where compaction has stalled (see rancher/k3s#1311) it may take a long time
+	// (several hundred ms) just for the database to execute the subquery to select the revisions to delete.
+
+	var (
+		resultLabel    string
+		iterCompactRev int64
+		iterStart      time.Time
+		iterCount      int64
+		compactedRev   int64
+		currentRev     int64
+		err            error
+	)
+
+	resultLabel = metrics.ResultSuccess
+	iterCompactRev = compactRev
+	compactedRev = compactRev
+	iterStart = time.Now()
+	iterCount = 0
+
+	for iterCompactRev < targetCompactRev {
+		// Set move iteration target compactBatchSize revisions forward, or
+		// just as far as we need to hit the compaction target if that would
+		// overshoot it.
+		iterCompactRev += s.compactBatchSize
+		if iterCompactRev > targetCompactRev {
+			iterCompactRev = targetCompactRev
+		}
+
+		// only update the compacted and current revisions if they are valid,
+		// but break out of the loop on any error.
+		compacted, current, cerr := s.compact(compactedRev, iterCompactRev)
+		if compacted != 0 && current != 0 {
+			compactedRev = compacted
+			currentRev = current
+		}
+		if cerr != nil {
+			err = cerr
+			break
+		}
+		iterCount++
+	}
+
+	if iterCount > 0 {
+		logrus.Infof("COMPACT compacted from %d to %d in %d transactions over %s", compactRev, compactedRev, iterCount, time.Since(iterStart).Round(time.Millisecond))
+
+		// post-compact operation errors are not critical, but should be reported
+		if perr := s.postCompact(); perr != nil {
+			logrus.Errorf("Post-compact operations failed: %v", perr)
+		}
+	}
+
+	// Only store the final results for this compact interval if currentRev is
+	// updated to the current compact revision.
+	//
+	// Note that one or more of the small-batch compact transactions may have
+	// succeeded and moved the compact revision forward, even if err is non-nil.
+	if currentRev > 0 {
+		compactRev = compactedRev
+		targetCompactRev = currentRev
+	}
+
+	// ErrCompacted indicates that no further work is necessary - either compactRev changed since the
+	// last iteration because another client has compacted, or the requested revision has already been compacted.
+	if err != nil && err != server.ErrCompacted {
+		logrus.Errorf("Compact failed: %v", err)
+		resultLabel = metrics.ResultError
+	}
+	metrics.CompactTotal.WithLabelValues(resultLabel).Inc()
+
+	return compactRev, targetCompactRev
+}
+
+// compact removes deleted or replaced rows from the database, and updates the compact rev key.
+// compactRev is the current compact revision; targetCompactRev is the revision to compact to.
+// If compactRev does not match what's in the database, we know that someone else has compacted and we don't need to do it.
+// Deletion of rows and update of the compact rev key is done within a single transaction. The transaction is rolled back on any error.
+//
+// On success, the function returns the revision compacted to, and the revision that we should try to compact to next time (the current revision).
+// ErrCompacted is returned if the current revision is stale, or the target revision has already been compacted.
+// In this case the compact and current revisions from the database are returned.
+// On any other error, the returned compact and current revisions should not be used.
+//
+// This logic is cribbed from k8s.io/apiserver/pkg/storage/etcd3/compact.go
 func (s *SQLLog) compact(compactRev int64, targetCompactRev int64) (int64, int64, error) {
 	ctx, cancel := context.WithTimeout(s.ctx, s.compactTimeout)
 	defer cancel()
@@ -530,247 +622,222 @@ func TestKineCompactRollbackFailureIsNotFatal(t *testing.T) {
 // TestKineCompactRollbackFailureDiscardsConn pins compact-rollback-failures-bounded.
 // modernc.org/sqlite's tx.Rollback returns a plain *Error, never driver.ErrBadConn,
 // and its IsValid does not check for an open transaction, so database/sql can pool
-// a connection a failed ROLLBACK left inside its transaction, and every later
-// compaction BEGIN on it fails. The patch discards that connection the only way kine
-// can, by exiting so the supervisor restarts it with a clean pool. After kinePatches,
-// kine's sql.go must declare the bound of 3; compact() must check it before BEGIN,
-// count a failed rollback in its deferred closure and a failed BEGIN once a rollback
-// has failed, and reset the count only after a successful commit; and the exit must
-// sit in the top-level helper, never in the deferred closure.
+// a connection a failed ROLLBACK left inside its transaction; every later BEGIN on it
+// fails with "cannot start a transaction within a transaction". kine can discard that
+// connection only by exiting, so the patch exits when compact()'s BEGIN fails with
+// exactly that message, and on no other error: never on SQLITE_BUSY or a deadline.
+// The test compares the file patched through compact-rollback-failures-bounded with
+// the same file patched without it: the only new declarations are the message and
+// the helper, the helper's one Fatalf is guarded by the message match, compact()
+// gains only the helper call at the head of its BEGIN error branch, and the deferred
+// rollback closure is the one compact-rollback-logs-error wrote.
 func TestKineCompactRollbackFailureDiscardsConn(t *testing.T) {
-	const file = "pkg/logstructured/sqllog/sql.go"
-	root := t.TempDir()
-	path := filepath.Join(root, filepath.FromSlash(file))
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, []byte(kineV0172SQLLogCompact), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	var patches []kineSourcePatch
-	for _, p := range kinePatches {
-		if p.file == file {
-			patches = append(patches, p)
-		}
-	}
-	if err := applyKinePatches(root, patches); err != nil {
-		t.Fatal(err)
-	}
-
-	f, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
-	if err != nil {
-		t.Fatalf("patched %s does not parse: %v", file, err)
-	}
-	if !slices.ContainsFunc(f.Imports, func(is *ast.ImportSpec) bool { return is.Path.Value == `"sync/atomic"` }) {
-		t.Errorf("patched %s does not import sync/atomic, which the failure count uses", file)
-	}
-
 	const (
-		counter = "compactRollbackFailures"
-		limit   = "compactRollbackFailureLimit"
-		exit    = "exitOnCompactRollbackFailures"
+		file    = "pkg/logstructured/sqllog/sql.go"
+		name    = "compact-rollback-failures-bounded"
+		message = "compactBeginStuckMessage"
+		helper  = "exitIfCompactBeginStuck"
 	)
-	// The bound: const compactRollbackFailureLimit = 3, and an atomic.Int64 counter.
-	var limitValue string
-	counterTyped := false
-	funcs := map[string]*ast.FuncDecl{}
-	for _, d := range f.Decls {
-		switch d := d.(type) {
-		case *ast.GenDecl:
-			for _, s := range d.Specs {
-				vs, ok := s.(*ast.ValueSpec)
-				if !ok || len(vs.Names) != 1 {
-					continue
-				}
-				switch vs.Names[0].Name {
-				case limit:
-					if len(vs.Values) == 1 {
-						if lit, ok := vs.Values[0].(*ast.BasicLit); ok {
-							limitValue = lit.Value
-						}
-					}
-				case counter:
-					if sel, ok := vs.Type.(*ast.SelectorExpr); ok && sel.Sel.Name == "Int64" {
-						if x, ok := sel.X.(*ast.Ident); ok && x.Name == "atomic" {
-							counterTyped = true
-						}
-					}
-				}
-			}
-		case *ast.FuncDecl:
-			if d.Recv == nil {
-				funcs[d.Name.Name] = d
-			} else {
-				funcs["(*SQLLog)."+d.Name.Name] = d
-			}
+	var before, after []kineSourcePatch
+	for _, p := range kinePatches {
+		if p.file != file {
+			continue
 		}
+		if p.name != name {
+			before = append(before, p)
+		}
+		after = append(after, p)
 	}
-	if limitValue != "3" {
-		t.Errorf("patched %s: %s = %q, want 3", file, limit, limitValue)
+	if len(after) == len(before) {
+		t.Fatalf("kinePatches carries no %s patch for %s", name, file)
 	}
-	if !counterTyped {
-		t.Errorf("patched %s does not declare %s as an atomic.Int64", file, counter)
+	if after[len(after)-1].name != name {
+		t.Fatalf("%s must be the last patch to %s: its anchor is the text the earlier ones leave", name, file)
 	}
 
-	// isCall reports whether e is <x>.<name>() (x == "" for a plain call to name).
-	isCall := func(e ast.Node, x, name string) bool {
-		call, ok := e.(*ast.CallExpr)
-		if !ok {
-			return false
+	parse := func(patches []kineSourcePatch) (*token.FileSet, *ast.File) {
+		t.Helper()
+		root := t.TempDir()
+		path := filepath.Join(root, filepath.FromSlash(file))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
 		}
-		if x == "" {
-			id, ok := call.Fun.(*ast.Ident)
-			return ok && id.Name == name
+		if err := os.WriteFile(path, []byte(kineV0172SQLLogCompact), 0o644); err != nil {
+			t.Fatal(err)
 		}
-		sel, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok || sel.Sel.Name != name {
-			return false
+		if err := applyKinePatches(root, patches); err != nil {
+			t.Fatal(err)
 		}
-		id, ok := sel.X.(*ast.Ident)
-		return ok && id.Name == x
+		fset := token.NewFileSet()
+		f, err := parser.ParseFile(fset, path, nil, 0)
+		if err != nil {
+			t.Fatalf("patched %s does not parse: %v", file, err)
+		}
+		return fset, f
 	}
-	// contains reports whether n holds a call matching x.name.
-	contains := func(n ast.Node, x, name string) bool {
-		found := false
+	// render prints n against an empty FileSet, so layout comes from the syntax alone
+	// and a removed statement leaves no blank line behind.
+	render := func(_ *token.FileSet, n ast.Node) string {
+		t.Helper()
+		var b bytes.Buffer
+		if err := printer.Fprint(&b, token.NewFileSet(), n); err != nil {
+			t.Fatal(err)
+		}
+		return b.String()
+	}
+	// decls renders each top-level declaration by name ("(*SQLLog).m" for a method).
+	decls := func(fset *token.FileSet, f *ast.File) map[string]ast.Decl {
+		out := map[string]ast.Decl{}
+		for i, d := range f.Decls {
+			key := fmt.Sprintf("decl#%d", i)
+			switch d := d.(type) {
+			case *ast.FuncDecl:
+				key = d.Name.Name
+				if d.Recv != nil {
+					key = "(*SQLLog)." + key
+				}
+			case *ast.GenDecl:
+				if d.Tok == token.IMPORT {
+					key = "import"
+				} else if vs, ok := d.Specs[0].(*ast.ValueSpec); ok && len(d.Specs) == 1 {
+					key = vs.Names[0].Name
+				} else if ts, ok := d.Specs[0].(*ast.TypeSpec); ok && len(d.Specs) == 1 {
+					key = ts.Name.Name
+				}
+			}
+			out[key] = d
+		}
+		return out
+	}
+	// exits returns the calls in n that end the process: Fatal*, Panic*, os.Exit.
+	exits := func(n ast.Node) []*ast.CallExpr {
+		var out []*ast.CallExpr
 		ast.Inspect(n, func(m ast.Node) bool {
-			if isCall(m, x, name) {
-				found = true
-			}
-			return !found
-		})
-		return found
-	}
-
-	// The exit: the helper calls logrus.Fatalf under "if n > compactRollbackFailureLimit".
-	helper, ok := funcs[exit]
-	if !ok {
-		t.Fatalf("patched %s has no %s function", file, exit)
-	}
-	guardedFatal := false
-	ast.Inspect(helper.Body, func(n ast.Node) bool {
-		is, ok := n.(*ast.IfStmt)
-		if !ok {
-			return true
-		}
-		be, ok := is.Cond.(*ast.BinaryExpr)
-		if !ok || be.Op != token.GTR {
-			return true
-		}
-		if id, ok := be.Y.(*ast.Ident); ok && id.Name == limit && contains(is.Body, "logrus", "Fatalf") {
-			guardedFatal = true
-		}
-		return true
-	})
-	if !guardedFatal {
-		t.Errorf("%s does not call logrus.Fatalf once the count passes %s", exit, limit)
-	}
-
-	compact, ok := funcs["(*SQLLog).compact"]
-	if !ok {
-		t.Fatalf("patched %s has no compact method", file)
-	}
-	body := compact.Body.List
-
-	// Before BEGIN: the bound is checked at the top level of compact().
-	beginAt, commitAt, checkAt, resetAt := -1, -1, -1, -1
-	for i, s := range body {
-		switch s := s.(type) {
-		case *ast.AssignStmt:
-			if len(s.Rhs) == 1 && isBeginTx(s.Rhs[0]) {
-				beginAt = i
-			}
-		case *ast.ExprStmt:
-			if isCall(s.X, "", exit) {
-				checkAt = i
-			}
-			if isCall(s.X, counter, "Store") {
-				resetAt = i
-				if lit, ok := s.X.(*ast.CallExpr).Args[0].(*ast.BasicLit); !ok || lit.Value != "0" {
-					t.Errorf("compact() stores a non-zero value into %s", counter)
-				}
-			}
-		case *ast.IfStmt:
-			if as, ok := s.Init.(*ast.AssignStmt); ok && len(as.Rhs) == 1 && isCall(as.Rhs[0], "t", "Commit") {
-				commitAt = i
-			}
-		}
-	}
-	switch {
-	case beginAt < 0:
-		t.Fatal("compact() has no BeginTx assignment")
-	case checkAt < 0 || checkAt > beginAt:
-		t.Errorf("compact() does not call %s() before BeginTx", exit)
-	}
-	// The reset: only after the commit has succeeded.
-	switch {
-	case commitAt < 0:
-		t.Error("compact() has no if-err-Commit statement")
-	case resetAt < 0:
-		t.Errorf("compact() never resets %s", counter)
-	case resetAt < commitAt:
-		t.Errorf("compact() resets %s before the commit succeeds", counter)
-	}
-	resets := 0
-	ast.Inspect(compact.Body, func(n ast.Node) bool {
-		if isCall(n, counter, "Store") {
-			resets++
-		}
-		return true
-	})
-	if resets != 1 {
-		t.Errorf("compact() resets %s %d times, want once, after the commit", counter, resets)
-	}
-
-	// A failed BEGIN after a failed rollback counts and is checked against the bound.
-	if beginAt+1 >= len(body) {
-		t.Fatal("compact() ends at BeginTx")
-	}
-	beginErr, ok := body[beginAt+1].(*ast.IfStmt)
-	if !ok {
-		t.Fatal("compact() does not check the BeginTx error right after it")
-	}
-	if !contains(beginErr.Body, counter, "Add") || !contains(beginErr.Body, "", exit) {
-		t.Errorf("compact()'s BeginTx error branch does not count the failure and call %s()", exit)
-	}
-
-	// A failed rollback counts in the deferred closure, which still never exits.
-	counted := false
-	ast.Inspect(compact.Body, func(n ast.Node) bool {
-		ds, ok := n.(*ast.DeferStmt)
-		if !ok {
-			return true
-		}
-		lit, ok := ds.Call.Fun.(*ast.FuncLit)
-		if !ok {
-			return true
-		}
-		ast.Inspect(lit.Body, func(m ast.Node) bool {
-			is, ok := m.(*ast.IfStmt)
+			call, ok := m.(*ast.CallExpr)
 			if !ok {
 				return true
 			}
-			as, ok := is.Init.(*ast.AssignStmt)
-			if ok && len(as.Rhs) == 1 && isCall(as.Rhs[0], "t", "Rollback") && contains(is.Body, counter, "Add") {
-				counted = true
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			pkg, _ := sel.X.(*ast.Ident)
+			if strings.HasPrefix(sel.Sel.Name, "Fatal") || strings.HasPrefix(sel.Sel.Name, "Panic") ||
+				pkg != nil && pkg.Name == "os" && sel.Sel.Name == "Exit" {
+				out = append(out, call)
 			}
 			return true
 		})
-		if contains(lit.Body, "", exit) || contains(lit.Body, "logrus", "Fatalf") {
-			t.Error("compact()'s deferred closure can exit kine; only the counted paths outside it may")
+		return out
+	}
+
+	bset, bf := parse(before)
+	aset, af := parse(after)
+	bd, ad := decls(bset, bf), decls(aset, af)
+
+	// Only two declarations are new: the message and the helper.
+	for key := range ad {
+		if _, ok := bd[key]; !ok && key != message && key != helper {
+			t.Errorf("%s adds declaration %s; only %s and %s are expected", name, key, message, helper)
+		}
+	}
+	// Every declaration but compact() is unchanged, so no exit path appears elsewhere.
+	for key, d := range bd {
+		a, ok := ad[key]
+		switch {
+		case !ok:
+			t.Errorf("%s removes declaration %s", name, key)
+		case key == "(*SQLLog).compact":
+		case render(bset, d) != render(aset, a):
+			t.Errorf("%s changes %s; it may change only compact()", name, key)
+		}
+	}
+
+	// The message is SQLite's text for a BEGIN inside an open transaction.
+	msgDecl, ok := ad[message].(*ast.GenDecl)
+	if !ok || msgDecl.Tok != token.CONST {
+		t.Fatalf("patched %s has no const %s", file, message)
+	}
+	vs := msgDecl.Specs[0].(*ast.ValueSpec)
+	if lit, ok := vs.Values[0].(*ast.BasicLit); !ok || lit.Value != `"cannot start a transaction within a transaction"` {
+		t.Errorf("%s = %s, want SQLite's \"cannot start a transaction within a transaction\"", message, render(aset, vs.Values[0]))
+	}
+
+	// The helper's only exit is one logrus.Fatalf inside an if, in a body that reads the message.
+	fn, ok := ad[helper].(*ast.FuncDecl)
+	if !ok {
+		t.Fatalf("patched %s has no func %s", file, helper)
+	}
+	readsMessage := false
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		if id, ok := n.(*ast.Ident); ok && id.Name == message {
+			readsMessage = true
 		}
 		return true
 	})
-	if !counted {
-		t.Errorf("compact()'s deferred closure does not count a failed t.Rollback() in %s", counter)
+	if !readsMessage {
+		t.Errorf("%s does not match against %s", helper, message)
 	}
-}
+	if got := exits(fn.Body); len(got) != 1 || render(aset, got[0].Fun) != "logrus.Fatalf" {
+		t.Errorf("%s has %d exit calls, want exactly one logrus.Fatalf", helper, len(got))
+	}
+	guarded := 0
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		if is, ok := n.(*ast.IfStmt); ok {
+			guarded += len(exits(is.Body))
+			return false
+		}
+		return true
+	})
+	if guarded != 1 {
+		t.Errorf("%s's Fatalf is not guarded by the message match", helper)
+	}
 
-// isBeginTx reports whether e is s.d.BeginTx(...).
-func isBeginTx(e ast.Expr) bool {
-	call, ok := e.(*ast.CallExpr)
-	if !ok {
-		return false
+	// compact() differs only by "<helper>(err)" heading its BEGIN error branch.
+	bc, _ := bd["(*SQLLog).compact"].(*ast.FuncDecl)
+	ac, _ := ad["(*SQLLog).compact"].(*ast.FuncDecl)
+	if bc == nil || ac == nil {
+		t.Fatalf("patched %s has no compact method", file)
 	}
-	sel, ok := call.Fun.(*ast.SelectorExpr)
-	return ok && sel.Sel.Name == "BeginTx"
+	if n := len(exits(ac.Body)); n != 0 {
+		t.Errorf("compact() calls %d exit functions itself; the exit belongs in %s", n, helper)
+	}
+	calls := 0
+	ast.Inspect(af, func(n ast.Node) bool {
+		if call, ok := n.(*ast.CallExpr); ok {
+			if id, ok := call.Fun.(*ast.Ident); ok && id.Name == helper {
+				calls++
+			}
+		}
+		return true
+	})
+	if calls != 1 {
+		t.Errorf("%s is called %d times in %s, want once, from compact()'s BEGIN error branch", helper, calls, file)
+	}
+	beginAt := slices.IndexFunc(ac.Body.List, func(s ast.Stmt) bool {
+		as, ok := s.(*ast.AssignStmt)
+		if !ok || len(as.Rhs) != 1 {
+			return false
+		}
+		call, ok := as.Rhs[0].(*ast.CallExpr)
+		if !ok {
+			return false
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		return ok && sel.Sel.Name == "BeginTx"
+	})
+	if beginAt < 0 || beginAt+1 >= len(ac.Body.List) {
+		t.Fatal("compact() has no BeginTx followed by its error check")
+	}
+	branch, ok := ac.Body.List[beginAt+1].(*ast.IfStmt)
+	if !ok || render(aset, branch.Cond) != "err != nil" || len(branch.Body.List) == 0 {
+		t.Fatal("compact() does not check the BeginTx error right after it")
+	}
+	if got := render(aset, branch.Body.List[0]); got != helper+"(err)" {
+		t.Errorf("compact()'s BEGIN error branch starts with %q, want %q", got, helper+"(err)")
+	}
+	branch.Body.List = branch.Body.List[1:]
+	if render(aset, ac) != render(bset, bc) {
+		t.Errorf("%s changes compact() beyond the %s call in its BEGIN error branch; the deferred rollback closure must stay as compact-rollback-logs-error wrote it", name, helper)
+	}
 }

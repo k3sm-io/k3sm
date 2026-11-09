@@ -148,180 +148,98 @@ var kinePatches = []kineSourcePatch{{
 `,
 }, {
 	// compact-rollback-failures-bounded: with compact-rollback-logs-error a failed
-	// ROLLBACK no longer exits kine, but database/sql discards the connection only when
-	// the driver returns driver.ErrBadConn (Tx.rollback, then putConn). modernc.org/sqlite
-	// v1.60.1's tx.Rollback returns its plain *Error and, unlike its Commit, never checks
-	// sqlite3_get_autocommit, and its IsValid checks only that the handle is open and
-	// not interrupted. So the connection can go back to the pool still inside the
-	// transaction, and every BEGIN on it then fails until kine restarts. That BEGIN
-	// failure happens before any deferred rollback, so after a rollback failure a
-	// failed BEGIN counts too. Once the count passes compactRollbackFailureLimit (3),
-	// kine exits on purpose (logrus.Fatalf); k3sm server exits with it and launchd
-	// restarts both, so kine comes back with a clean pool. A committed compaction
-	// resets the count. The Fatalf sits in a top-level
-	// helper and the deferred closure only counts, so the closure itself still never
-	// exits. The anchor runs from BeginTx to the end of compact(), the text left by
-	// the two patches above, which it applies after.
+	// ROLLBACK no longer exits kine, but it can return its connection to the pool still
+	// inside the transaction. database/sql discards a connection only when the driver
+	// returns driver.ErrBadConn (Tx.rollback, then putConn). modernc.org/sqlite v1.60.1's
+	// tx.Rollback (tx.go:57-59) returns its plain *Error and, unlike its Commit
+	// (tx.go:41-51), never checks sqlite3_get_autocommit; its IsValid (conn.go:1056,
+	// through usable at :1060-1072) checks only that the handle is open and not
+	// interrupted. Every later BEGIN on that connection fails with SQLite's error
+	// "cannot start a transaction within a transaction", raised by vdbe.c's
+	// OP_AutoCommit, which v1.60.1 embeds transpiled for darwin amd64 and arm64 as
+	// lib/sqlite_g_0000000000000003.go:84535 (__ccgo_ts+6455, string table at :10301).
+	// errstrForDB (conn.go:958-983) keeps that message in the error text, and kine's
+	// generic.(*Generic).BeginTx (pkg/drivers/generic/tx.go:22-27) returns the error
+	// unwrapped. The message names exactly this state; SQLITE_BUSY and a deadline give
+	// other errors. So when compact()'s BEGIN fails with it, kine exits on purpose
+	// (logrus.Fatalf, in a top-level helper); k3sm server exits with it and launchd
+	// restarts both, so kine comes back with a clean pool. The deferred rollback closure
+	// is left exactly as compact-rollback-logs-error wrote it. sql.go imports no strings
+	// package, so the helper matches by hand, and one anchor (the end of compactIter
+	// through compact()'s BEGIN error branch) carries both edits.
+	//
+	// Remaining gap, tracked as a follow-up: until a compaction's BEGIN lands on the
+	// stuck connection, that connection can still serve kine's other writes, which then
+	// run inside a transaction that never commits.
 	name: "compact-rollback-failures-bounded",
 	file: "pkg/logstructured/sqllog/sql.go",
-	old: `	t, err := s.d.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	old: `	metrics.CompactTotal.WithLabelValues(resultLabel).Inc()
+
+	return compactRev, targetCompactRev
+}
+
+// compact removes deleted or replaced rows from the database, and updates the compact rev key.
+// compactRev is the current compact revision; targetCompactRev is the revision to compact to.
+// If compactRev does not match what's in the database, we know that someone else has compacted and we don't need to do it.
+// Deletion of rows and update of the compact rev key is done within a single transaction. The transaction is rolled back on any error.
+//
+// On success, the function returns the revision compacted to, and the revision that we should try to compact to next time (the current revision).
+// ErrCompacted is returned if the current revision is stale, or the target revision has already been compacted.
+// In this case the compact and current revisions from the database are returned.
+// On any other error, the returned compact and current revisions should not be used.
+//
+// This logic is cribbed from k8s.io/apiserver/pkg/storage/etcd3/compact.go
+func (s *SQLLog) compact(compactRev int64, targetCompactRev int64) (int64, int64, error) {
+	ctx, cancel := context.WithTimeout(s.ctx, s.compactTimeout)
+	defer cancel()
+
+	t, err := s.d.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	// A failed rollback is logged, not fatal: MustRollback would exit kine.
-	defer func() {
-		if err := t.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
-			logrus.Errorf("COMPACT transaction rollback failed: %v", err)
-		}
-	}()
-
-	currentRev, err := t.CurrentRevision(s.ctx)
-	if err != nil {
-		return 0, 0, fmt.Errorf("failed to get current revision: %w", err)
-	}
-
-	dbCompactRev, err := t.GetCompactRevision(s.ctx)
-	if err != nil {
-		return 0, 0, fmt.Errorf("failed to get compact revision: %w", err)
-	}
-
-	// Check to see if another node already compacted. This is normal on a multi-server cluster.
-	if compactRev != dbCompactRev {
-		logrus.Infof("COMPACT compact revision changed since last iteration: %d => %d", compactRev, dbCompactRev)
-		return dbCompactRev, currentRev, server.ErrCompacted
-	}
-
-	// Ensure that we never compact the most recent 1000 revisions
-	targetCompactRev = safeCompactRev(targetCompactRev, currentRev, s.compactMinRetain)
-
-	// Don't bother compacting to a revision that has already been compacted
-	if targetCompactRev <= compactRev {
-		logrus.Tracef("COMPACT revision %d has already been compacted", targetCompactRev)
-		return dbCompactRev, currentRev, server.ErrCompacted
-	}
-
-	logrus.Infof("COMPACT compactRev=%d targetCompactRev=%d currentRev=%d", compactRev, targetCompactRev, currentRev)
-
-	start := time.Now()
-
-	// Set compact revision before compacting - if the compact transaction times
-	// out this will get rolled back. Otherwise it is possible for Compact to
-	// succeed within the time limit, but SetCompactRevision occurs too late, and
-	// the work is wasted.
-	if err := t.SetCompactRevision(s.ctx, targetCompactRev); err != nil {
-		return 0, 0, fmt.Errorf("failed to record compact revision: %w", err)
-	}
-
-	// compact revisions from old compact revision to new target
-	deletedRows, err := t.Compact(s.ctx, compactRev, targetCompactRev)
-	if err != nil {
-		return 0, 0, fmt.Errorf("failed to compact to revision %d: %w", targetCompactRev, err)
-	}
-
-	// Commit the transaction if we make it all the way through deleting without any
-	// errors. The deferred rollback becomes a no-op if the transaction is committed.
-	// A failed commit is returned, not fatal: the caller logs it and retries.
-	if err := t.Commit(); err != nil {
-		return 0, 0, fmt.Errorf("failed to commit compaction: %w", err)
-	}
-	logrus.Infof("COMPACT deleted %d rows from %d revisions in %s - compacted to %d/%d", deletedRows, (targetCompactRev - compactRev), time.Since(start), targetCompactRev, currentRev)
-
-	return targetCompactRev, currentRev, nil
-}
 `,
-	new: `	// A failed rollback can leave a pooled connection inside its transaction, and
-	// only a restart clears it: exit once the failures pass the bound.
-	exitOnCompactRollbackFailures()
+	new: `	metrics.CompactTotal.WithLabelValues(resultLabel).Inc()
+
+	return compactRev, targetCompactRev
+}
+
+// compactBeginStuckMessage is SQLite's error for a BEGIN on a connection that is
+// already inside a transaction, which a failed ROLLBACK can leave in the pool.
+const compactBeginStuckMessage = "cannot start a transaction within a transaction"
+
+// exitIfCompactBeginStuck exits kine when a compaction BEGIN failed because its
+// pooled connection is still inside a transaction: only a restart clears it.
+func exitIfCompactBeginStuck(err error) {
+	s, m := err.Error(), compactBeginStuckMessage
+	for i := 0; i+len(m) <= len(s); i++ {
+		if s[i:i+len(m)] == m {
+			logrus.Fatalf("COMPACT cannot begin on a connection left inside a transaction (%v); exiting to restart with a clean connection pool", err)
+		}
+	}
+}
+
+// compact removes deleted or replaced rows from the database, and updates the compact rev key.
+// compactRev is the current compact revision; targetCompactRev is the revision to compact to.
+// If compactRev does not match what's in the database, we know that someone else has compacted and we don't need to do it.
+// Deletion of rows and update of the compact rev key is done within a single transaction. The transaction is rolled back on any error.
+//
+// On success, the function returns the revision compacted to, and the revision that we should try to compact to next time (the current revision).
+// ErrCompacted is returned if the current revision is stale, or the target revision has already been compacted.
+// In this case the compact and current revisions from the database are returned.
+// On any other error, the returned compact and current revisions should not be used.
+//
+// This logic is cribbed from k8s.io/apiserver/pkg/storage/etcd3/compact.go
+func (s *SQLLog) compact(compactRev int64, targetCompactRev int64) (int64, int64, error) {
+	ctx, cancel := context.WithTimeout(s.ctx, s.compactTimeout)
+	defer cancel()
 
 	t, err := s.d.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
-		// After a failed rollback, a failed BEGIN is how a connection left inside
-		// that transaction shows, so it counts toward the bound too.
-		if compactRollbackFailures.Load() > 0 {
-			compactRollbackFailures.Add(1)
-			exitOnCompactRollbackFailures()
-		}
+		exitIfCompactBeginStuck(err)
 		return 0, 0, fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	// A failed rollback is logged, not fatal: MustRollback would exit kine. It is
-	// counted, and exitOnCompactRollbackFailures bounds the count.
-	defer func() {
-		if err := t.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
-			compactRollbackFailures.Add(1)
-			logrus.Errorf("COMPACT transaction rollback failed: %v", err)
-		}
-	}()
-
-	currentRev, err := t.CurrentRevision(s.ctx)
-	if err != nil {
-		return 0, 0, fmt.Errorf("failed to get current revision: %w", err)
-	}
-
-	dbCompactRev, err := t.GetCompactRevision(s.ctx)
-	if err != nil {
-		return 0, 0, fmt.Errorf("failed to get compact revision: %w", err)
-	}
-
-	// Check to see if another node already compacted. This is normal on a multi-server cluster.
-	if compactRev != dbCompactRev {
-		logrus.Infof("COMPACT compact revision changed since last iteration: %d => %d", compactRev, dbCompactRev)
-		return dbCompactRev, currentRev, server.ErrCompacted
-	}
-
-	// Ensure that we never compact the most recent 1000 revisions
-	targetCompactRev = safeCompactRev(targetCompactRev, currentRev, s.compactMinRetain)
-
-	// Don't bother compacting to a revision that has already been compacted
-	if targetCompactRev <= compactRev {
-		logrus.Tracef("COMPACT revision %d has already been compacted", targetCompactRev)
-		return dbCompactRev, currentRev, server.ErrCompacted
-	}
-
-	logrus.Infof("COMPACT compactRev=%d targetCompactRev=%d currentRev=%d", compactRev, targetCompactRev, currentRev)
-
-	start := time.Now()
-
-	// Set compact revision before compacting - if the compact transaction times
-	// out this will get rolled back. Otherwise it is possible for Compact to
-	// succeed within the time limit, but SetCompactRevision occurs too late, and
-	// the work is wasted.
-	if err := t.SetCompactRevision(s.ctx, targetCompactRev); err != nil {
-		return 0, 0, fmt.Errorf("failed to record compact revision: %w", err)
-	}
-
-	// compact revisions from old compact revision to new target
-	deletedRows, err := t.Compact(s.ctx, compactRev, targetCompactRev)
-	if err != nil {
-		return 0, 0, fmt.Errorf("failed to compact to revision %d: %w", targetCompactRev, err)
-	}
-
-	// Commit the transaction if we make it all the way through deleting without any
-	// errors. The deferred rollback becomes a no-op if the transaction is committed.
-	// A failed commit is returned, not fatal: the caller logs it and retries.
-	if err := t.Commit(); err != nil {
-		return 0, 0, fmt.Errorf("failed to commit compaction: %w", err)
-	}
-	// A committed compaction resets the rollback failure count.
-	compactRollbackFailures.Store(0)
-	logrus.Infof("COMPACT deleted %d rows from %d revisions in %s - compacted to %d/%d", deletedRows, (targetCompactRev - compactRev), time.Since(start), targetCompactRev, currentRev)
-
-	return targetCompactRev, currentRev, nil
-}
-
-// compactRollbackFailureLimit is how many compaction rollback failures in a row,
-// counting the failed BEGINs that follow one, kine tolerates before it exits.
-const compactRollbackFailureLimit = 3
-
-// compactRollbackFailures counts them. A committed compaction resets it.
-var compactRollbackFailures atomic.Int64
-
-// exitOnCompactRollbackFailures exits kine once compactRollbackFailures passes
-// compactRollbackFailureLimit, so it restarts with a clean connection pool.
-func exitOnCompactRollbackFailures() {
-	if n := compactRollbackFailures.Load(); n > compactRollbackFailureLimit {
-		logrus.Fatalf("COMPACT failed %d times in a row since a transaction rollback failed; exiting to restart with a clean connection pool", n)
-	}
-}
+	// A failed rollback is logged, not fatal: MustRollback would exit kine.
 `,
 }}
 
