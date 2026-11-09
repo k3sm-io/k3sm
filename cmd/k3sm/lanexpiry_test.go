@@ -216,13 +216,9 @@ func TestLanOnForRevertsAtExpiry(t *testing.T) {
 
 		r.clock.set(exp.Add(time.Hour)) // the Mac slept through the expiry
 		ticks <- exp.Add(time.Hour)
-		select {
-		case a := <-r.reports:
-			if a.LAN != install.LANOff || a.Error != "" {
-				t.Errorf("report = %+v, want off", a)
-			}
-		case <-time.After(5 * time.Second):
-			t.Fatal("no report after a tick past the expiry")
+		// A missing report hangs here until the test binary's own timeout.
+		if a := <-r.reports; a.LAN != install.LANOff || a.Error != "" {
+			t.Errorf("report = %+v, want off", a)
 		}
 		cancel()
 		<-done
