@@ -40,7 +40,7 @@ var errLANMismatch = errors.New("the node daemon's listening sockets do not matc
 type lanSocketPolicy struct {
 	want install.LAN
 	// lanAddrs are this Mac's network-facing addresses: its interface
-	// addresses other than loopback and lanInternalPrefixes.
+	// addresses other than loopback and lanAliasPrefixes.
 	lanAddrs []netip.Addr
 	// alwaysOn are the ports allowed on every interface whatever the switch
 	// says (the worker join port on a server).
@@ -125,16 +125,16 @@ func addrsString(addrs []netip.Addr) string {
 }
 
 // lanFacingAddrs filters this Mac's interface addresses to the ones a LAN
-// peer can reach: not loopback, not inside lanInternalPrefixes(args) (the
-// cluster pod and mesh range, the Service range, the vm NAT segment). A
-// Service range that does not parse excludes nothing, which only widens the
-// set the off check guards.
-func lanFacingAddrs(args []string, host []netip.Addr) []netip.Addr {
-	internal, _ := lanInternalPrefixes(args)
+// peer can reach: not loopback, not inside lanAliasPrefixes (the cluster pod
+// and mesh range, the vm NAT segment). The Service range is deliberately not
+// excluded: it is operator-set, and a host whose LAN address falls inside it
+// must still have that address guarded by the off check.
+func lanFacingAddrs(host []netip.Addr) []netip.Addr {
+	alias := lanAliasPrefixes()
 	var out []netip.Addr
 	for _, a := range host {
 		a = a.Unmap()
-		if !a.IsValid() || a.IsLoopback() || a.IsUnspecified() || slices.ContainsFunc(internal, func(p netip.Prefix) bool { return p.Contains(a) }) {
+		if !a.IsValid() || a.IsLoopback() || a.IsUnspecified() || slices.ContainsFunc(alias, func(p netip.Prefix) bool { return p.Contains(a) }) {
 			continue
 		}
 		out = append(out, a)
@@ -147,7 +147,7 @@ func lanFacingAddrs(args []string, host []netip.Addr) []netip.Addr {
 func lanPolicyFor(want install.LAN, role install.Role, args []string, host []netip.Addr) lanSocketPolicy {
 	p := lanSocketPolicy{
 		want:         want,
-		lanAddrs:     lanFacingAddrs(args, host),
+		lanAddrs:     lanFacingAddrs(host),
 		alwaysOn:     map[uint16]bool{},
 		exempt:       map[uint16]bool{uint16(ports.KubeletAPIPort): true},
 		nodePortSpec: strings.TrimSpace(install.ServerArgValue(args, nodePortAddressesFlag)) != "",

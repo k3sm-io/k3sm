@@ -146,28 +146,34 @@ func lanExposureFor(ctx context.Context, env networkEnv, role install.Role) lanE
 	return e
 }
 
-// lanInternalPrefixes is the one list of the ranges no LAN peer routes to:
-// the cluster pod range (which holds the node's mesh address and its
-// pod-range address), the Service range from the node daemon's arguments
-// (install.DefaultServiceCIDR when absent) and the vm NAT segment. A range
-// that does not parse is left out and named in the error, so a caller that
-// must fail closed can, and one that only narrows a set can use the rest.
+// lanAliasPrefixes are the ranges k3sm itself places on this Mac and no LAN
+// peer routes to: the cluster pod range (which holds the node's mesh address
+// and its pod-range address) and the vm NAT segment. It is the base of
+// lanInternalPrefixes, and it is all lanFacingAddrs excludes.
+func lanAliasPrefixes() []netip.Prefix {
+	out := []netip.Prefix{podnet.ClusterPodCIDR}
+	if p, err := netip.ParsePrefix(netserve.DefaultVMNetSubnet); err == nil {
+		out = append(out, p.Masked())
+	}
+	return out
+}
+
+// lanInternalPrefixes is lanAliasPrefixes plus the Service range from the node
+// daemon's arguments (install.DefaultServiceCIDR when absent): the ranges a
+// listener can bind that no LAN peer routes to. A Service range that does not
+// parse is left out and named in the error, so the exposure check fails
+// closed on it.
 func lanInternalPrefixes(args []string) ([]netip.Prefix, error) {
 	svc := strings.TrimSpace(install.ServerArgValue(args, install.ServiceCIDRFlag))
 	if svc == "" {
 		svc = install.DefaultServiceCIDR
 	}
-	out := []netip.Prefix{podnet.ClusterPodCIDR}
-	var errs []error
-	for _, s := range []string{svc, netserve.DefaultVMNetSubnet} {
-		p, err := netip.ParsePrefix(s)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("parse the range %q: %w", s, err))
-			continue
-		}
-		out = append(out, p.Masked())
+	out := lanAliasPrefixes()
+	p, err := netip.ParsePrefix(svc)
+	if err != nil {
+		return out, fmt.Errorf("parse the range %q: %w", svc, err)
 	}
-	return out, errors.Join(errs...)
+	return append(out, p.Masked()), nil
 }
 
 // lanReachable keeps the sockets of socks that a LAN peer can reach: not on
