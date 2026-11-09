@@ -68,26 +68,7 @@ trap 'rm -rf "$ci_tmp"' EXIT
 gate_repo=k3sm
 gate_module=k3sm.io/k3sm
 . hack/lib/affected-mode.sh
-# resolve_gate_mode prints the --dry-run plan and exits; that is held back until the
-# testdata filter below has run, so the plan shows the sets the stages are handed.
-want_plan=$dry_run dry_run=0
 resolve_gate_mode
-# go's ./... never matches a testdata directory, and a list must not reach one
-# either: hack/testdata/racewitness holds the planted race the race witness stage
-# below expects, and in the test stage it would red every run.
-keep=()
-for p in ${vet_set[@]+"${vet_set[@]}"}; do case "/$p/" in */testdata/*) ;; *) keep+=("$p") ;; esac; done
-vet_set=(${keep[@]+"${keep[@]}"})
-keep=()
-for p in ${test_set[@]+"${test_set[@]}"}; do case "/$p/" in */testdata/*) ;; *) keep+=("$p") ;; esac; done
-test_set=(${keep[@]+"${keep[@]}"})
-if [ "$want_plan" = 1 ]; then
-	echo "mode: $mode"
-	echo "reason: $mode_reason"
-	echo "vet: ${vet_set[*]+${vet_set[*]}}"
-	echo "test: ${test_set[*]+${test_set[*]}}"
-	exit 0
-fi
 
 echo "==> [k3sm] gofmt"
 fmt=$(gofmt -l .) || true
