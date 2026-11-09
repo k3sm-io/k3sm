@@ -247,6 +247,7 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
   its digest. A sharded `MLXModel` pod now checks at start that the engine's run body matches its pin,
   and the entrypoint exits with the engine's status.
 - The `mlx-serve` image's `mlx-lm` moves from 0.32.0 to 0.32.2. The next image tag carries it; no other package in the closure moves. Sharded ranks refuse chat requests whose images are not inline `data:` URLs, since mlx-lm 0.32.2 would otherwise fetch any `http(s)` image URL a client names.
+- The `mlx-serve` image's interpreter moves from the python-build-standalone 20260929 build of CPython 3.12.14 to the 20261013 build of CPython 3.12.15, the newest build the pinned uv 0.13.1 offers. The next image tag carries it; the package closure does not move.
 - The embedded runtime takes an exclusive lock on its root (`runtimed.lock`). A second runtime
   started on a root already in use waits up to 15 seconds for the lock and is then refused,
   instead of running beside the first.

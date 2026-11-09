@@ -13,7 +13,7 @@ concern: `HF_HOME` points at `/models`, which the operator mounts.
 | | |
 |---|---|
 | engine | `vllm-mlx==0.5.0` (Apache-2.0), pinned in `requirements.in`; `mlx-lm==0.32.2` in `requirements.lock` |
-| interpreter | CPython 3.12.14, python-build-standalone, macos-aarch64 |
+| interpreter | CPython 3.12.15, python-build-standalone, macos-aarch64 |
 | entrypoint | `/bin/python3.12 -m k3sm_serve serve --continuous-batching --host 0.0.0.0 --port 8000` (the engine's own CLI, run in-process with the context guard below) |
 | args | the model — a repo id or a path under `/models` — supplied by the pod |
 | port | 8000; readiness at `GET /health`, which reports `model_loaded` |
@@ -474,10 +474,10 @@ Change `requirements.in`, then regenerate in the same commit — on a Mac,
 **natively**:
 
 ```sh
-uv python install cpython-3.12.14-macos-aarch64-none
+uv python install cpython-3.12.15-macos-aarch64-none
 uv pip compile --generate-hashes --no-header \
     --exclude-newer "$(date -u -v-14d +%Y-%m-%dT00:00:00Z)" \
-    --python "${UV_PYTHON_INSTALL_DIR:-$HOME/.local/share/uv/python}/cpython-3.12.14-macos-aarch64-none/bin/python3.12" \
+    --python "${UV_PYTHON_INSTALL_DIR:-$HOME/.local/share/uv/python}/cpython-3.12.15-macos-aarch64-none/bin/python3.12" \
     requirements.in -o requirements.lock
 ```
 

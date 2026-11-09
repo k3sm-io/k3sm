@@ -47,8 +47,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # python-build-standalone artifact URL that key must resolve to. The key alone
 # is not a pin — a later uv ships a newer python-build-standalone build of the
 # same CPython patch version — so the URL is asserted before staging.
-PY_KEY="cpython-3.12.14-macos-aarch64-none"
-PY_URL="https://releases.astral.sh/github/python-build-standalone/releases/download/20260929/cpython-3.12.14%2B20260929-aarch64-apple-darwin-install_only_stripped.tar.gz"
+PY_KEY="cpython-3.12.15-macos-aarch64-none"
+PY_URL="https://releases.astral.sh/github/python-build-standalone/releases/download/20261013/cpython-3.12.15%2B20261013-aarch64-apple-darwin-install_only_stripped.tar.gz"
 PY_BIN="bin/python3.12"
 # The uv that generated requirements.lock. Older uv is refused rather than
 # tried: the JSON interpreter listing this script pins against is not in every
@@ -339,7 +339,7 @@ stage_tree() {
 	"$UV" python install "$PY_KEY" >/dev/null
 
 	# uv keeps a version ALIAS symlink beside the dist whose target is ABSOLUTE
-	# (cpython-3.12-macos-aarch64-none -> /abs/.../cpython-3.12.14-...). The
+	# (cpython-3.12-macos-aarch64-none -> /abs/.../cpython-3.12.15-...). The
 	# builder refuses absolute symlinks, so the RESOLVED versioned directory is
 	# what gets staged — never the install dir that holds the alias.
 	local dist="$UV_PYTHON_INSTALL_DIR/$PY_KEY"
