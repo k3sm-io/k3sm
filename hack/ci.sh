@@ -61,21 +61,21 @@ GOVULNCHECK_VERSION=v1.9.0   # the govulncheck the gate requires; keep equal acr
 
 ci_tmp="$(mktemp -d)"
 # Record this run in the gitignored .ci/last.json (read by the workspace hack/ci-last.sh), best effort,
-# never changing the exit status. A stage is the text of the last `echo "==> ..."` run;
+# never changing the exit status. A stage is the text of the last `echo "==> ..."` printed;
 # on a red run that stage is the one that failed. ci_cleanup is the cleanup the EXIT
 # handler runs first; a stage that owns a temp dir sets it instead of calling trap.
 ci_root=$PWD
 ci_cleanup=""
 ci_last_stage=""
-set -T
-ci_note() {
-	case $1 in
-	'echo "==> '*'"')
-		ci_last_stage=${1#'echo "==> '}
-		ci_last_stage=${ci_last_stage%'"'}
+ci_note_stage() {
+	case ${1:-} in
+	"==> "*)
+		ci_last_stage=${1#"==> "}
 		ci_last_stage=${ci_last_stage#\[*\] } ;;
 	esac
 }
+# echo is wrapped (not a DEBUG trap) so PIPESTATUS survives for the stages that read it.
+echo() { ci_note_stage "${1:-}"; builtin echo "$@"; }
 ci_json_str() {
 	local s
 	s=$(printf '%s' "$1" | tr -d '[:cntrl:]')
@@ -99,12 +99,10 @@ ci_record_last() {
 }
 ci_on_exit() {
 	local rc=$1
-	trap - DEBUG
 	if [ -n "$ci_cleanup" ]; then eval "$ci_cleanup" || true; fi
 	ci_record_last "$rc" || true
 	exit "$rc"
 }
-trap 'ci_note "$BASH_COMMAND"' DEBUG
 trap 'ci_on_exit $?' EXIT
 # shellcheck disable=SC2016 # the EXIT handler evals this string
 ci_cleanup='rm -rf "$ci_tmp"'
