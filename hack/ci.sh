@@ -3,23 +3,49 @@
 # command. Run from anywhere.
 #
 #   hack/ci.sh [--tier fast|full] [--edited <file>]
+#              [--packages <file> [--base <sha>]] [--dry-run]
 #
 # --tier picks how the test stage applies hack/quarantine.txt: full (the default)
 # reds on every failing test; fast excuses a listed flake outside the packages the
 # change edits. --edited names a file with one edited import path per line.
+#
+# With no mode flag the gate is the full gate, unchanged. One explicit mode narrows
+# only the go vet and go test package sets; every other stage still runs:
+#   --packages <file>  read a k3sm-affected/v1 package list (the format the affected-set
+#                      selector writes; its grammar is restated in hack/lib/affected-mode.sh).
+#                      A missing, unreadable, malformed or unknown-version file, or an
+#                      @full line for k3sm, runs the full gate. A list holding no k3sm
+#                      package is red when the diff against --base (default: the merge
+#                      base with origin/main) holds a .go file, runs the full gate when it
+#                      holds any other non-doc file (the gate cannot map it to a package)
+#                      or the base does not resolve, and skips vet and test when only doc
+#                      files (*.md, docs/, LICENSE, NOTICE, DCO) changed.
+# --dry-run resolves the mode, prints the plan (mode, reason, vet and test sets) and
+# exits before any stage runs: 0 for a plan, 1 for a red verdict.
 set -euo pipefail
 cd "$(dirname "$0")/.."   # repo root
 
+usage() {
+	echo "usage: hack/ci.sh [--tier fast|full] [--edited <file>] [--packages <file> [--base <sha>]] [--dry-run]" >&2
+	exit 2
+}
 test_tier=full
 edited_file=""
+pkg_file="" pkg_file_set=0 diff_base="" dry_run=0
 while [ $# -gt 0 ]; do
 	case "$1" in
-		--tier) [ $# -ge 2 ] || { echo "usage: hack/ci.sh [--tier fast|full] [--edited <file>]" >&2; exit 2; }; test_tier="$2"; shift 2 ;;
-		--edited) [ $# -ge 2 ] || { echo "usage: hack/ci.sh [--tier fast|full] [--edited <file>]" >&2; exit 2; }; edited_file="$2"; shift 2 ;;
-		*) echo "usage: hack/ci.sh [--tier fast|full] [--edited <file>]" >&2; exit 2 ;;
+		--tier) [ $# -ge 2 ] || usage; test_tier="$2"; shift 2 ;;
+		--edited) [ $# -ge 2 ] || usage; edited_file="$2"; shift 2 ;;
+		--packages) [ $# -ge 2 ] || usage; pkg_file="$2"; pkg_file_set=1; shift 2 ;;
+		--base) [ $# -ge 2 ] && [ -n "$2" ] || usage; diff_base="$2"; shift 2 ;;
+		--dry-run) dry_run=1; shift ;;
+		*) usage ;;
 	esac
 done
 case "$test_tier" in fast|full) ;; *) echo "hack/ci.sh: --tier must be fast or full" >&2; exit 2 ;; esac
+if [ -n "$diff_base" ] && [ "$pkg_file_set" = 0 ]; then
+	echo "hack/ci.sh: --base goes with --packages" >&2; exit 2
+fi
 edited_pkgs=()
 if [ -n "$edited_file" ]; then
 	[ -r "$edited_file" ] || { echo "hack/ci.sh: --edited $edited_file is not readable" >&2; exit 2; }
@@ -32,6 +58,36 @@ fi
 CGO=1   # k3sm is CGO_ENABLED=1 — it imports runtimed (cgo syscall shims). kine is a child process, not a dependency.
 STATICCHECK_VERSION=2026.2.2   # keep equal to the install pin in docs/GO-STANDARDS.md §Commit gates
 GOVULNCHECK_VERSION=v1.9.0   # the govulncheck the gate requires; keep equal across the k3sm repos (hack/lib/govulncheck.sh reads this line)
+
+ci_tmp="$(mktemp -d)"
+trap 'rm -rf "$ci_tmp"' EXIT
+
+# The --packages mode lives in hack/lib/affected-mode.sh, which defines read_packages
+# and resolve_gate_mode and carries the k3sm-affected/v1 grammar; these two are the
+# variables that make it this repository's.
+gate_repo=k3sm
+gate_module=k3sm.io/k3sm
+. hack/lib/affected-mode.sh
+# resolve_gate_mode prints the --dry-run plan and exits; that is held back until the
+# testdata filter below has run, so the plan shows the sets the stages are handed.
+want_plan=$dry_run dry_run=0
+resolve_gate_mode
+# go's ./... never matches a testdata directory, and a list must not reach one
+# either: hack/testdata/racewitness holds the planted race the race witness stage
+# below expects, and in the test stage it would red every run.
+keep=()
+for p in ${vet_set[@]+"${vet_set[@]}"}; do case "/$p/" in */testdata/*) ;; *) keep+=("$p") ;; esac; done
+vet_set=(${keep[@]+"${keep[@]}"})
+keep=()
+for p in ${test_set[@]+"${test_set[@]}"}; do case "/$p/" in */testdata/*) ;; *) keep+=("$p") ;; esac; done
+test_set=(${keep[@]+"${keep[@]}"})
+if [ "$want_plan" = 1 ]; then
+	echo "mode: $mode"
+	echo "reason: $mode_reason"
+	echo "vet: ${vet_set[*]+${vet_set[*]}}"
+	echo "test: ${test_set[*]+${test_set[*]}}"
+	exit 0
+fi
 
 echo "==> [k3sm] gofmt"
 fmt=$(gofmt -l .) || true
@@ -86,8 +142,6 @@ fi
 # toolchain) is a HARD ERROR: the old `[ -n "$(go list ./... 2>/dev/null)" ]` could
 # not tell the two apart, so it silently skipped vet/build/test and still reported
 # green — a gate that cannot even enumerate its packages must go RED.
-ci_tmp="$(mktemp -d)"
-trap 'rm -rf "$ci_tmp"' EXIT
 golist_err="$ci_tmp/golist.err"
 if ! go_pkgs="$(CGO_ENABLED=$CGO go list ./... 2>"$golist_err")"; then
 	echo "FAIL: [k3sm] go list ./... failed — cannot enumerate packages; refusing to skip vet/build/test:" >&2
@@ -96,7 +150,11 @@ if ! go_pkgs="$(CGO_ENABLED=$CGO go list ./... 2>"$golist_err")"; then
 fi
 
 if [ -n "$go_pkgs" ]; then
-	echo "==> [k3sm] go vet";   CGO_ENABLED=$CGO go vet ./...
+	if [ ${#vet_set[@]} -gt 0 ]; then
+		echo "==> [k3sm] go vet";   CGO_ENABLED=$CGO go vet "${vet_set[@]}"
+	else
+		echo "==> [k3sm] go vet: skipped (no affected package)"
+	fi
 	echo "==> [k3sm] go build"; CGO_ENABLED=$CGO go build ./...
 	# -race, because docs/GO-STANDARDS.md promises it three times ("CI runs
 	# -race", "CI adds -race") and this gate did not deliver it. The A1 and A2
@@ -111,25 +169,34 @@ if [ -n "$go_pkgs" ]; then
 	# failures), so the two statuses are checked against each other: neither can
 	# turn the other green. The gate runs under a minimal PATH (the staticcheck
 	# acceptance test); the stage needs nothing beyond go and cat.
-	echo "==> [k3sm] go test -race (quarantine tier: $test_tier)"
-	CGO_ENABLED=$CGO go build -o "$ci_tmp/testresults" hack/lib/testresults.go
-	set +e
-	CGO_ENABLED=$CGO go test -race -count=1 -json ./... 2>"$ci_tmp/gotest.err" \
-		| "$ci_tmp/testresults" -registry hack/quarantine.txt -tier "$test_tier" ${edited_pkgs[@]+"${edited_pkgs[@]}"}   # e2e/ is //go:build e2e — excluded here
-	st=("${PIPESTATUS[@]}")
-	set -e
-	go_rc="${st[0]}" tr_rc="${st[1]}"
-	if [ -s "$ci_tmp/gotest.err" ]; then
-		echo "==> [k3sm] go test stderr:" >&2
-		cat "$ci_tmp/gotest.err" >&2
+	if [ ${#test_set[@]} -gt 0 ]; then
+		echo "==> [k3sm] go test -race (quarantine tier: $test_tier)"
+		CGO_ENABLED=$CGO go build -o "$ci_tmp/testresults" hack/lib/testresults.go
+		set +e
+		CGO_ENABLED=$CGO go test -race -count=1 -json "${test_set[@]}" 2>"$ci_tmp/gotest.err" \
+			| "$ci_tmp/testresults" -registry hack/quarantine.txt -tier "$test_tier" ${edited_pkgs[@]+"${edited_pkgs[@]}"}   # e2e/ is //go:build e2e — excluded here
+		st=("${PIPESTATUS[@]}")
+		set -e
+		go_rc="${st[0]}" tr_rc="${st[1]}"
+		if [ -s "$ci_tmp/gotest.err" ]; then
+			echo "==> [k3sm] go test stderr:" >&2
+			cat "$ci_tmp/gotest.err" >&2
+		fi
+		case "$go_rc:$tr_rc" in
+			0:0) ;;
+			1:3) echo "==> [k3sm] go test failed only on quarantined tests (see QUARANTINED above)" ;;
+			*:1) echo "==> [k3sm] test stage RED (go test exit $go_rc); the RED lines above say why" >&2; exit 1 ;;
+			*:0) echo "FAIL: [k3sm] go test exited $go_rc but its stream holds no failure; read the stderr above" >&2; exit 1 ;;
+			*) echo "FAIL: [k3sm] go test exit $go_rc and testresults exit $tr_rc disagree" >&2; exit 1 ;;
+		esac
+	else
+		echo "==> [k3sm] go test: skipped (no affected package)"
+		# The test stage is also where hack/quarantine.txt is validated: a malformed
+		# or expired entry reds every run. With no test to stream, the committed
+		# registry is checked by the test that runs hack/lib/testresults.go on it.
+		echo "==> [k3sm] quarantine registry (format, expiry)"
+		CGO_ENABLED=$CGO go test -count=1 -run '^TestCommittedRegistryIsValid$' ./hack/lib
 	fi
-	case "$go_rc:$tr_rc" in
-		0:0) ;;
-		1:3) echo "==> [k3sm] go test failed only on quarantined tests (see QUARANTINED above)" ;;
-		*:1) echo "==> [k3sm] test stage RED (go test exit $go_rc); the RED lines above say why" >&2; exit 1 ;;
-		*:0) echo "FAIL: [k3sm] go test exited $go_rc but its stream holds no failure; read the stderr above" >&2; exit 1 ;;
-		*) echo "FAIL: [k3sm] go test exit $go_rc and testresults exit $tr_rc disagree" >&2; exit 1 ;;
-	esac
 
 	# The race witness: a planted race that go test -race must catch. If the
 	# toolchain's race detector is not live, this goes red instead of the gate

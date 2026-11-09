@@ -106,8 +106,9 @@ func sandboxCI(t *testing.T, realScript, goMod string, extra map[string]string) 
 
 // sandboxCIEnv is sandboxCI with the script's environment given in full: env
 // REPLACES the inherited one rather than extending it, so a caller controls
-// exactly which PATH, GOPATH and toolchain the script sees.
-func sandboxCIEnv(t *testing.T, realScript, goMod string, extra map[string]string, env []string) (out string, ok bool) {
+// exactly which PATH, GOPATH and toolchain the script sees. args are passed to the
+// script; a fixture path in them is relative to the sandbox root, the script's cwd.
+func sandboxCIEnv(t *testing.T, realScript, goMod string, extra map[string]string, env []string, args ...string) (out string, ok bool) {
 	t.Helper()
 	realHack := filepath.Dir(realScript)
 
@@ -150,7 +151,7 @@ func sandboxCIEnv(t *testing.T, realScript, goMod string, extra map[string]strin
 
 	// The script must be invoked by its SANDBOX path — ci.sh derives its repo root
 	// from $0, and dirname does not resolve the symlink.
-	cmd := exec.Command("/usr/bin/env", "bash", filepath.Join(hack, "ci.sh"))
+	cmd := exec.Command("/usr/bin/env", append([]string{"bash", filepath.Join(hack, "ci.sh")}, args...)...)
 	cmd.Dir = sandbox
 	cmd.Env = env
 	done := make(chan struct{})
@@ -310,5 +311,57 @@ func TestCIGuardRunsWhenPackagesExist(t *testing.T) {
 				t.Errorf("%s reported a go list failure for a healthy module:\n%s", script, out)
 			}
 		})
+	}
+}
+
+// TestCIGuardPackagesModeFallsBackToFull pins the --packages mode in the place a
+// lone clone or a fresh sandbox puts it: a module with no git history. A list that
+// names none of the gate's packages may skip vet and test only when the diff
+// against the base holds nothing but docs, and with no repository the base cannot
+// resolve, so the gate must answer full. A missing list must answer full too. A
+// crash in the reader (a tool it shells out to, an unset variable under set -u)
+// would exit non-zero instead of printing the plan.
+//
+// The script inherits this process's PATH, so the reader's tools (git, od, tr,
+// iconv, tail, wc) are the host's. GIT_CEILING_DIRECTORIES stops git from finding a
+// repository above the temporary directory. Only gates that carry the shared
+// reader are run.
+func TestCIGuardPackagesModeFallsBackToFull(t *testing.T) {
+	cases := []struct {
+		name       string
+		list       string // the --packages file's content; empty writes no file
+		wantReason string
+	}{
+		{name: "empty list without git", list: "k3sm-affected/v1\n@end\n", wantReason: "diff base does not resolve; full gate"},
+		{name: "missing list", wantReason: "does not exist; full gate"},
+	}
+	env := append(os.Environ(), "GOWORK=off", "GOFLAGS=", "GIT_CEILING_DIRECTORIES="+os.TempDir())
+	for name, script := range ciScripts(t) {
+		b, err := os.ReadFile(script)
+		if err != nil {
+			t.Fatalf("read %s: %v", script, err)
+		}
+		if !strings.Contains(string(b), "hack/lib/affected-mode.sh") {
+			continue
+		}
+		for _, tc := range cases {
+			t.Run(name+"/"+tc.name, func(t *testing.T) {
+				extra := map[string]string{
+					"zzpkg/zz.go": licensed(t, script, "package zzpkg\n"),
+				}
+				if tc.list != "" {
+					extra["affected.txt"] = tc.list
+				}
+				out, ok := sandboxCIEnv(t, script, goModOK, extra, env, "--packages", "affected.txt", "--dry-run")
+				if !ok {
+					t.Fatalf("%s --packages --dry-run exited non-zero in a module without git:\n%s", script, out)
+				}
+				for _, want := range []string{"mode: full\n", tc.wantReason, "vet: ./...\n", "test: ./...\n"} {
+					if !strings.Contains(out, want) {
+						t.Errorf("%s did not plan the full gate (want %q):\n%s", script, want, out)
+					}
+				}
+			})
+		}
 	}
 }
