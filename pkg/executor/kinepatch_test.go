@@ -19,6 +19,9 @@ package executor
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"slices"
@@ -98,6 +101,7 @@ var kinePatchSetHistory = map[string]string{
 	"nocgo+p1": "d6c6334601320bd1bc3c88c5e97144f0df8c38e41ede21f225bdff71ff19af24",
 	"nocgo+p2": "4056b8ca92fa544e024153ec01765ff84468be118b516dd5b2e02052a93397ea",
 	"nocgo+p3": "b5c727f93e5e3acbd30118700fe6b46aa3677123ed632841ceff4a694fbac1a1",
+	"nocgo+p4": "b116e0d06b6453fcd929a4bc62da794ad957ea3895b51f192c652e7f01115cc9",
 }
 
 // TestKinePatchSetIsMarked pins the link between the carried patches and the staging
@@ -143,5 +147,179 @@ func TestKineBuildArgs(t *testing.T) {
 		if !slices.Contains(args, want) {
 			t.Errorf("kineBuildArgs = %q, missing %q", args, want)
 		}
+	}
+}
+
+// kineV0172SQLLogCompact is pkg/logstructured/sqllog/sql.go of kine v0.17.2 cut to
+// its package clause, imports and compact(), verbatim, so the patch is tested against
+// the upstream text without the module cache or the network.
+const kineV0172SQLLogCompact = `package sqllog
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"math/rand/v2"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/k3s-io/kine/pkg/broadcaster"
+	"github.com/k3s-io/kine/pkg/metrics"
+	"github.com/k3s-io/kine/pkg/server"
+	"github.com/sirupsen/logrus"
+)
+
+func (s *SQLLog) compact(compactRev int64, targetCompactRev int64) (int64, int64, error) {
+	ctx, cancel := context.WithTimeout(s.ctx, s.compactTimeout)
+	defer cancel()
+
+	t, err := s.d.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer t.MustRollback()
+
+	currentRev, err := t.CurrentRevision(s.ctx)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to get current revision: %w", err)
+	}
+
+	dbCompactRev, err := t.GetCompactRevision(s.ctx)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to get compact revision: %w", err)
+	}
+
+	// Check to see if another node already compacted. This is normal on a multi-server cluster.
+	if compactRev != dbCompactRev {
+		logrus.Infof("COMPACT compact revision changed since last iteration: %d => %d", compactRev, dbCompactRev)
+		return dbCompactRev, currentRev, server.ErrCompacted
+	}
+
+	// Ensure that we never compact the most recent 1000 revisions
+	targetCompactRev = safeCompactRev(targetCompactRev, currentRev, s.compactMinRetain)
+
+	// Don't bother compacting to a revision that has already been compacted
+	if targetCompactRev <= compactRev {
+		logrus.Tracef("COMPACT revision %d has already been compacted", targetCompactRev)
+		return dbCompactRev, currentRev, server.ErrCompacted
+	}
+
+	logrus.Infof("COMPACT compactRev=%d targetCompactRev=%d currentRev=%d", compactRev, targetCompactRev, currentRev)
+
+	start := time.Now()
+
+	// Set compact revision before compacting - if the compact transaction times
+	// out this will get rolled back. Otherwise it is possible for Compact to
+	// succeed within the time limit, but SetCompactRevision occurs too late, and
+	// the work is wasted.
+	if err := t.SetCompactRevision(s.ctx, targetCompactRev); err != nil {
+		return 0, 0, fmt.Errorf("failed to record compact revision: %w", err)
+	}
+
+	// compact revisions from old compact revision to new target
+	deletedRows, err := t.Compact(s.ctx, compactRev, targetCompactRev)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to compact to revision %d: %w", targetCompactRev, err)
+	}
+
+	// Commit the transaction if we make it all the way through deleting without any
+	// errors. The deferred rollback becomes a no-op if the transaction is committed.
+	t.MustCommit()
+	logrus.Infof("COMPACT deleted %d rows from %d revisions in %s - compacted to %d/%d", deletedRows, (targetCompactRev - compactRev), time.Since(start), targetCompactRev, currentRev)
+
+	return targetCompactRev, currentRev, nil
+}
+`
+
+// TestKineCompactCommitFailureIsReturnedNotFatal pins compact-commit-returns-error:
+// after kinePatches, kine's compact() must not call MustCommit (logrus.Fatalf on a
+// failed commit, which takes the whole control plane down) and must call Commit and
+// return its error, which compactIter logs and retries on the next interval.
+func TestKineCompactCommitFailureIsReturnedNotFatal(t *testing.T) {
+	const file = "pkg/logstructured/sqllog/sql.go"
+	root := t.TempDir()
+	path := filepath.Join(root, filepath.FromSlash(file))
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(kineV0172SQLLogCompact), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var patches []kineSourcePatch
+	for _, p := range kinePatches {
+		if p.file == file {
+			patches = append(patches, p)
+		}
+	}
+	if err := applyKinePatches(root, patches); err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+	if err != nil {
+		t.Fatalf("patched %s does not parse: %v", file, err)
+	}
+	if !slices.ContainsFunc(f.Imports, func(is *ast.ImportSpec) bool { return is.Path.Value == `"fmt"` }) {
+		t.Errorf("patched %s does not import fmt, which the returned commit error is wrapped with", file)
+	}
+	var compact *ast.FuncDecl
+	for _, d := range f.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Name.Name == "compact" && fd.Recv != nil {
+			compact = fd
+		}
+	}
+	if compact == nil {
+		t.Fatalf("patched %s has no compact method", file)
+	}
+
+	// selectorCall reports whether call is t.<name>().
+	selectorCall := func(e ast.Expr, name string) bool {
+		call, ok := e.(*ast.CallExpr)
+		if !ok {
+			return false
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != name {
+			return false
+		}
+		x, ok := sel.X.(*ast.Ident)
+		return ok && x.Name == "t"
+	}
+	commitReturned := false
+	ast.Inspect(compact.Body, func(n ast.Node) bool {
+		switch n := n.(type) {
+		case *ast.CallExpr:
+			if selectorCall(n, "MustCommit") {
+				t.Error("compact() still calls t.MustCommit(), which is fatal when the commit fails")
+			}
+		case *ast.IfStmt:
+			// if err := t.Commit(); err != nil { return ..., <expr using err> }
+			as, ok := n.Init.(*ast.AssignStmt)
+			if !ok || len(as.Lhs) != 1 || len(as.Rhs) != 1 || !selectorCall(as.Rhs[0], "Commit") {
+				return true
+			}
+			errVar, ok := as.Lhs[0].(*ast.Ident)
+			if !ok {
+				return true
+			}
+			for _, s := range n.Body.List {
+				ret, ok := s.(*ast.ReturnStmt)
+				if !ok || len(ret.Results) != 3 {
+					continue
+				}
+				ast.Inspect(ret.Results[2], func(m ast.Node) bool {
+					if id, ok := m.(*ast.Ident); ok && id.Name == errVar.Name {
+						commitReturned = true
+					}
+					return true
+				})
+			}
+		}
+		return true
+	})
+	if !commitReturned {
+		t.Error("compact() does not call t.Commit() and return its error")
 	}
 }
