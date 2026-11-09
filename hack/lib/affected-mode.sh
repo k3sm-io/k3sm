@@ -184,6 +184,7 @@ resolve_gate_mode() {
 		echo "vet: ${vet_set[*]+${vet_set[*]}}"
 		echo "test: ${test_set[*]+${test_set[*]}}"
 		# A deliberate success: tell the caller's EXIT handler (hack/ci.sh ci_done) so it is not read as a crash.
+		# shellcheck disable=SC2034  # read by the caller's EXIT handler
 		ci_done=1
 		exit 0
 	fi
