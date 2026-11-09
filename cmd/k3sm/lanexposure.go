@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/netip"
 	"os/exec"
 	"slices"
@@ -125,9 +126,6 @@ func lanExposureFor(ctx context.Context, env networkEnv, role install.Role) lanE
 	if npid, err := env.Sys.LaunchctlServicePID(install.NetdLabel); err == nil {
 		owned = append(owned, npid)
 	}
-	if env.NodeArgs == nil {
-		return fail(errors.New("no reader for the node daemon's arguments"))
-	}
 	args, err := env.NodeArgs(role)
 	if err != nil {
 		return fail(fmt.Errorf("read the node daemon's arguments: %w", err))
@@ -135,9 +133,6 @@ func lanExposureFor(ctx context.Context, env networkEnv, role install.Role) lanE
 	excluded, err := lanInternalPrefixes(args)
 	if err != nil {
 		return fail(err)
-	}
-	if env.SocketTable == nil {
-		return fail(errors.New("no socket table reader"))
 	}
 	socks, err := env.SocketTable(ctx)
 	if err != nil {
@@ -151,24 +146,34 @@ func lanExposureFor(ctx context.Context, env networkEnv, role install.Role) lanE
 	return e
 }
 
-// lanInternalPrefixes are the ranges no LAN peer routes to: the cluster pod
-// range (which holds the node's mesh address and its pod-range address), the
-// Service range from the node daemon's arguments (the default when absent)
-// and the vm NAT segment.
+// lanAliasPrefixes are the ranges k3sm itself places on this Mac and no LAN
+// peer routes to: the cluster pod range (which holds the node's mesh address
+// and its pod-range address) and the vm NAT segment. It is the base of
+// lanInternalPrefixes, and it is all lanFacingAddrs excludes.
+func lanAliasPrefixes() []netip.Prefix {
+	out := []netip.Prefix{podnet.ClusterPodCIDR}
+	if p, err := netip.ParsePrefix(netserve.DefaultVMNetSubnet); err == nil {
+		out = append(out, p.Masked())
+	}
+	return out
+}
+
+// lanInternalPrefixes is lanAliasPrefixes plus the Service range from the node
+// daemon's arguments (install.DefaultServiceCIDR when absent): the ranges a
+// listener can bind that no LAN peer routes to. A Service range that does not
+// parse is left out and named in the error, so the exposure check fails
+// closed on it.
 func lanInternalPrefixes(args []string) ([]netip.Prefix, error) {
 	svc := strings.TrimSpace(install.ServerArgValue(args, install.ServiceCIDRFlag))
 	if svc == "" {
 		svc = install.DefaultServiceCIDR
 	}
-	out := []netip.Prefix{podnet.ClusterPodCIDR}
-	for _, s := range []string{svc, netserve.DefaultVMNetSubnet} {
-		p, err := netip.ParsePrefix(s)
-		if err != nil {
-			return nil, fmt.Errorf("parse the range %q: %w", s, err)
-		}
-		out = append(out, p.Masked())
+	out := lanAliasPrefixes()
+	p, err := netip.ParsePrefix(svc)
+	if err != nil {
+		return out, fmt.Errorf("parse the range %q: %w", svc, err)
 	}
-	return out, nil
+	return append(out, p.Masked()), nil
 }
 
 // lanReachable keeps the sockets of socks that a LAN peer can reach: not on
@@ -273,38 +278,64 @@ func (c *cappedBuffer) Write(p []byte) (int, error) {
 	return c.buf.Write(p)
 }
 
-// lsofSocketTable is the production socket table: every TCP listening socket
-// and bound UDP socket on this Mac with its pid, parent pid, command and
-// protocol, read with lsof as root by absolute path, with an empty
-// environment, a time bound and an output cap.
-func lsofSocketTable(ctx context.Context) ([]lanSocket, error) {
-	ctx, cancel := context.WithTimeout(ctx, lsofTimeout)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, lsofPath, "-nP", "-iTCP", "-sTCP:LISTEN", "-iUDP", "-F", "pRcPn")
+// lsofExec runs lsof with args, writing its output to stdout and stderr: the
+// seam under runLsof, so a test can stand in for the process.
+type lsofExec func(ctx context.Context, stdout, stderr io.Writer, args ...string) error
+
+// execLsof is the production lsofExec: lsof as root by absolute path, with an
+// empty environment and a bound on how long its pipes outlive it.
+func execLsof(ctx context.Context, stdout, stderr io.Writer, args ...string) error {
+	cmd := exec.CommandContext(ctx, lsofPath, args...)
 	cmd.Env = []string{}
-	stdout := &cappedBuffer{max: lsofMaxBytes}
-	stderr := &cappedBuffer{max: 4096}
 	cmd.Stdout, cmd.Stderr = stdout, stderr
 	cmd.WaitDelay = lsofWaitDelay
-	err := cmd.Run()
+	return cmd.Run()
+}
+
+// runLsof is the one hardened lsof runner: execLsof under runLsofWith.
+func runLsof(ctx context.Context, args ...string) ([]byte, error) {
+	return runLsofWith(ctx, execLsof, args...)
+}
+
+// runLsofWith runs lsof through run with a time bound and an output cap and
+// returns its stdout. lsof exiting 1 with no output and nothing on stderr
+// means no sockets (nil, nil); any other failure, any stderr text with exit
+// 1, or output over the cap is an error.
+func runLsofWith(ctx context.Context, run lsofExec, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, lsofTimeout)
+	defer cancel()
+	stdout := &cappedBuffer{max: lsofMaxBytes}
+	stderr := &cappedBuffer{max: 4096}
+	err := run(ctx, stdout, stderr, args...)
 	if stdout.over {
 		return nil, fmt.Errorf("%w (%d bytes)", errLsofTooLarge, lsofMaxBytes)
 	}
-	return lsofResult(stdout.buf.Bytes(), stderr.buf.Bytes(), err)
+	return lsofOutput(stdout.buf.Bytes(), stderr.buf.Bytes(), err)
 }
 
-// lsofResult turns one lsof run (its stdout, stderr and exit error) into the
-// socket table. lsof exiting 1 with no output and nothing on stderr means no
-// sockets; any other failure, or any stderr text with exit 1, is an error.
-func lsofResult(stdout, stderr []byte, err error) ([]lanSocket, error) {
+// lsofOutput judges one lsof run (its stdout, stderr and exit error). lsof
+// exiting 1 with no output and nothing on stderr means no sockets (nil, nil);
+// any other failure, or any stderr text with exit 1, is an error.
+func lsofOutput(stdout, stderr []byte, err error) ([]byte, error) {
 	if err != nil {
-		var ee *exec.ExitError
+		var ee interface{ ExitCode() int }
 		if errors.As(err, &ee) && ee.ExitCode() == 1 && len(stdout) == 0 && len(stderr) == 0 {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("%s: %w: %s", lsofPath, err, strings.TrimSpace(string(stderr)))
 	}
-	return parseLsofSocketTable(stdout)
+	return stdout, nil
+}
+
+// lsofSocketTable is the production socket table: every TCP listening socket
+// and bound UDP socket on this Mac with its pid, parent pid, command and
+// protocol, read through runLsof.
+func lsofSocketTable(ctx context.Context) ([]lanSocket, error) {
+	out, err := runLsof(ctx, "-nP", "-iTCP", "-sTCP:LISTEN", "-iUDP", "-F", "pRcPn")
+	if err != nil || out == nil {
+		return nil, err
+	}
+	return parseLsofSocketTable(out)
 }
 
 // parseLsofSocketTable parses lsof -F pRcPn output: a "p<pid>" line opens a

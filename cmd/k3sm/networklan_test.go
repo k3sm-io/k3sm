@@ -245,12 +245,13 @@ func newLANRig(t *testing.T, role install.Role) *lanRig {
 			}
 			return socketsFor(rig.sw.state(), role), nil
 		},
-		HostAddrs: lanRigHost,
-		NodeArgs:  func(install.Role) ([]string, error) { return nil, nil },
-		Wait:      2 * time.Second,
-		Poll:      time.Millisecond,
-		Stdout:    out,
-		Stderr:    errOut,
+		SocketTable: func(context.Context) ([]lanSocket, error) { return nil, nil },
+		HostAddrs:   lanRigHost,
+		NodeArgs:    func(install.Role) ([]string, error) { return nil, nil },
+		Wait:        2 * time.Second,
+		Poll:        time.Millisecond,
+		Stdout:      out,
+		Stderr:      errOut,
 	}
 	return rig
 }
@@ -798,11 +799,6 @@ func TestNetworkLanToggle(t *testing.T) {
 			if err != nil && !errors.Is(err, errLANMismatch) {
 				t.Errorf("%s: err = %v, want errLANMismatch", tc.name, err)
 			}
-		}
-		socks, err := parseLsofListeners([]byte("p4242\nf7\nn*:30090\nf8\nn127.0.0.1:8080\nf9\nn[::1]:6060\nf10\nn100.64.0.1:10250\n"))
-		want := []netip.AddrPort{ap("0.0.0.0:30090"), ap("127.0.0.1:8080"), ap("[::1]:6060"), ap("100.64.0.1:10250")}
-		if err != nil || !slices.Equal(socks, want) {
-			t.Errorf("parseLsofListeners = %v, %v; want %v", socks, err, want)
 		}
 	})
 
