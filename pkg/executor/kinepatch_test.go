@@ -103,6 +103,7 @@ var kinePatchSetHistory = map[string]string{
 	"nocgo+p3": "b5c727f93e5e3acbd30118700fe6b46aa3677123ed632841ceff4a694fbac1a1",
 	"nocgo+p4": "b116e0d06b6453fcd929a4bc62da794ad957ea3895b51f192c652e7f01115cc9",
 	"nocgo+p5": "14db0c216afa353618c5548f54f1df1161e7559ba6748b44af811bdbe17e7f56",
+	"nocgo+p6": "1486cdaeb3dafca24d9b684260ebcbc5507ba1265eade5fa0e8b5a7e21a557ee",
 }
 
 // TestKinePatchSetIsMarked pins the link between the carried patches and the staging
@@ -524,4 +525,252 @@ func TestKineCompactRollbackFailureIsNotFatal(t *testing.T) {
 	if must, _ := deferred(compactStart); !must {
 		t.Error("compactStart() no longer defers t.MustRollback(): the rollback patch must change compact() only")
 	}
+}
+
+// TestKineCompactRollbackFailureDiscardsConn pins compact-rollback-failures-bounded.
+// modernc.org/sqlite's tx.Rollback returns a plain *Error, never driver.ErrBadConn,
+// and its IsValid does not check for an open transaction, so database/sql can pool
+// a connection a failed ROLLBACK left inside its transaction, and every later
+// compaction BEGIN on it fails. The patch discards that connection the only way kine
+// can, by exiting so the supervisor restarts it with a clean pool. After kinePatches,
+// kine's sql.go must declare the bound of 3; compact() must check it before BEGIN,
+// count a failed rollback in its deferred closure and a failed BEGIN once a rollback
+// has failed, and reset the count only after a successful commit; and the exit must
+// sit in the top-level helper, never in the deferred closure.
+func TestKineCompactRollbackFailureDiscardsConn(t *testing.T) {
+	const file = "pkg/logstructured/sqllog/sql.go"
+	root := t.TempDir()
+	path := filepath.Join(root, filepath.FromSlash(file))
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(kineV0172SQLLogCompact), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var patches []kineSourcePatch
+	for _, p := range kinePatches {
+		if p.file == file {
+			patches = append(patches, p)
+		}
+	}
+	if err := applyKinePatches(root, patches); err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+	if err != nil {
+		t.Fatalf("patched %s does not parse: %v", file, err)
+	}
+	if !slices.ContainsFunc(f.Imports, func(is *ast.ImportSpec) bool { return is.Path.Value == `"sync/atomic"` }) {
+		t.Errorf("patched %s does not import sync/atomic, which the failure count uses", file)
+	}
+
+	const (
+		counter = "compactRollbackFailures"
+		limit   = "compactRollbackFailureLimit"
+		exit    = "exitOnCompactRollbackFailures"
+	)
+	// The bound: const compactRollbackFailureLimit = 3, and an atomic.Int64 counter.
+	var limitValue string
+	counterTyped := false
+	funcs := map[string]*ast.FuncDecl{}
+	for _, d := range f.Decls {
+		switch d := d.(type) {
+		case *ast.GenDecl:
+			for _, s := range d.Specs {
+				vs, ok := s.(*ast.ValueSpec)
+				if !ok || len(vs.Names) != 1 {
+					continue
+				}
+				switch vs.Names[0].Name {
+				case limit:
+					if len(vs.Values) == 1 {
+						if lit, ok := vs.Values[0].(*ast.BasicLit); ok {
+							limitValue = lit.Value
+						}
+					}
+				case counter:
+					if sel, ok := vs.Type.(*ast.SelectorExpr); ok && sel.Sel.Name == "Int64" {
+						if x, ok := sel.X.(*ast.Ident); ok && x.Name == "atomic" {
+							counterTyped = true
+						}
+					}
+				}
+			}
+		case *ast.FuncDecl:
+			if d.Recv == nil {
+				funcs[d.Name.Name] = d
+			} else {
+				funcs["(*SQLLog)."+d.Name.Name] = d
+			}
+		}
+	}
+	if limitValue != "3" {
+		t.Errorf("patched %s: %s = %q, want 3", file, limit, limitValue)
+	}
+	if !counterTyped {
+		t.Errorf("patched %s does not declare %s as an atomic.Int64", file, counter)
+	}
+
+	// isCall reports whether e is <x>.<name>() (x == "" for a plain call to name).
+	isCall := func(e ast.Node, x, name string) bool {
+		call, ok := e.(*ast.CallExpr)
+		if !ok {
+			return false
+		}
+		if x == "" {
+			id, ok := call.Fun.(*ast.Ident)
+			return ok && id.Name == name
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != name {
+			return false
+		}
+		id, ok := sel.X.(*ast.Ident)
+		return ok && id.Name == x
+	}
+	// contains reports whether n holds a call matching x.name.
+	contains := func(n ast.Node, x, name string) bool {
+		found := false
+		ast.Inspect(n, func(m ast.Node) bool {
+			if isCall(m, x, name) {
+				found = true
+			}
+			return !found
+		})
+		return found
+	}
+
+	// The exit: the helper calls logrus.Fatalf under "if n > compactRollbackFailureLimit".
+	helper, ok := funcs[exit]
+	if !ok {
+		t.Fatalf("patched %s has no %s function", file, exit)
+	}
+	guardedFatal := false
+	ast.Inspect(helper.Body, func(n ast.Node) bool {
+		is, ok := n.(*ast.IfStmt)
+		if !ok {
+			return true
+		}
+		be, ok := is.Cond.(*ast.BinaryExpr)
+		if !ok || be.Op != token.GTR {
+			return true
+		}
+		if id, ok := be.Y.(*ast.Ident); ok && id.Name == limit && contains(is.Body, "logrus", "Fatalf") {
+			guardedFatal = true
+		}
+		return true
+	})
+	if !guardedFatal {
+		t.Errorf("%s does not call logrus.Fatalf once the count passes %s", exit, limit)
+	}
+
+	compact, ok := funcs["(*SQLLog).compact"]
+	if !ok {
+		t.Fatalf("patched %s has no compact method", file)
+	}
+	body := compact.Body.List
+
+	// Before BEGIN: the bound is checked at the top level of compact().
+	beginAt, commitAt, checkAt, resetAt := -1, -1, -1, -1
+	for i, s := range body {
+		switch s := s.(type) {
+		case *ast.AssignStmt:
+			if len(s.Rhs) == 1 && isBeginTx(s.Rhs[0]) {
+				beginAt = i
+			}
+		case *ast.ExprStmt:
+			if isCall(s.X, "", exit) {
+				checkAt = i
+			}
+			if isCall(s.X, counter, "Store") {
+				resetAt = i
+				if lit, ok := s.X.(*ast.CallExpr).Args[0].(*ast.BasicLit); !ok || lit.Value != "0" {
+					t.Errorf("compact() stores a non-zero value into %s", counter)
+				}
+			}
+		case *ast.IfStmt:
+			if as, ok := s.Init.(*ast.AssignStmt); ok && len(as.Rhs) == 1 && isCall(as.Rhs[0], "t", "Commit") {
+				commitAt = i
+			}
+		}
+	}
+	switch {
+	case beginAt < 0:
+		t.Fatal("compact() has no BeginTx assignment")
+	case checkAt < 0 || checkAt > beginAt:
+		t.Errorf("compact() does not call %s() before BeginTx", exit)
+	}
+	// The reset: only after the commit has succeeded.
+	switch {
+	case commitAt < 0:
+		t.Error("compact() has no if-err-Commit statement")
+	case resetAt < 0:
+		t.Errorf("compact() never resets %s", counter)
+	case resetAt < commitAt:
+		t.Errorf("compact() resets %s before the commit succeeds", counter)
+	}
+	resets := 0
+	ast.Inspect(compact.Body, func(n ast.Node) bool {
+		if isCall(n, counter, "Store") {
+			resets++
+		}
+		return true
+	})
+	if resets != 1 {
+		t.Errorf("compact() resets %s %d times, want once, after the commit", counter, resets)
+	}
+
+	// A failed BEGIN after a failed rollback counts and is checked against the bound.
+	if beginAt+1 >= len(body) {
+		t.Fatal("compact() ends at BeginTx")
+	}
+	beginErr, ok := body[beginAt+1].(*ast.IfStmt)
+	if !ok {
+		t.Fatal("compact() does not check the BeginTx error right after it")
+	}
+	if !contains(beginErr.Body, counter, "Add") || !contains(beginErr.Body, "", exit) {
+		t.Errorf("compact()'s BeginTx error branch does not count the failure and call %s()", exit)
+	}
+
+	// A failed rollback counts in the deferred closure, which still never exits.
+	counted := false
+	ast.Inspect(compact.Body, func(n ast.Node) bool {
+		ds, ok := n.(*ast.DeferStmt)
+		if !ok {
+			return true
+		}
+		lit, ok := ds.Call.Fun.(*ast.FuncLit)
+		if !ok {
+			return true
+		}
+		ast.Inspect(lit.Body, func(m ast.Node) bool {
+			is, ok := m.(*ast.IfStmt)
+			if !ok {
+				return true
+			}
+			as, ok := is.Init.(*ast.AssignStmt)
+			if ok && len(as.Rhs) == 1 && isCall(as.Rhs[0], "t", "Rollback") && contains(is.Body, counter, "Add") {
+				counted = true
+			}
+			return true
+		})
+		if contains(lit.Body, "", exit) || contains(lit.Body, "logrus", "Fatalf") {
+			t.Error("compact()'s deferred closure can exit kine; only the counted paths outside it may")
+		}
+		return true
+	})
+	if !counted {
+		t.Errorf("compact()'s deferred closure does not count a failed t.Rollback() in %s", counter)
+	}
+}
+
+// isBeginTx reports whether e is s.d.BeginTx(...).
+func isBeginTx(e ast.Expr) bool {
+	call, ok := e.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	return ok && sel.Sel.Name == "BeginTx"
 }

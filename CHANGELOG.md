@@ -263,6 +263,11 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
 - A single-node server no longer stops its whole control plane when a datastore compaction's
   transaction fails to roll back. kine used to exit; it now logs the rollback error and retries the
   compaction on the next interval. Every node re-stages kine on upgrade.
+- A datastore compaction whose transaction failed to roll back can no longer stop compaction for
+  good. A failed rollback could leave a database connection stuck inside its transaction, after which
+  every later compaction failed until kine restarted. kine now counts these failures and exits after
+  more than 3 in a row, so the server restarts with fresh connections. A successful compaction resets
+  the count. Every node re-stages kine on upgrade.
 - The sandbox now also denies pods the role's own work dir, by the path `k3sm server` or `k3sm agent`
   was started with, beside the data root's `server` and `agent` directories. Pods created before the
   upgrade keep their old profile until they are recreated. On the default paths, and in every layout
