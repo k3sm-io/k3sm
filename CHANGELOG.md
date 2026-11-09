@@ -12,6 +12,8 @@ pin, its date, and the tarball's sha256.
 
 ### Added
 
+- `sudo k3sm network lan on --for <duration>` turns LAN access on for at most 24h, after which the
+  node daemon turns it off by itself. See [LAN access](docs/user/install.md#lan-access).
 - `sudo k3sm network lan status` lists the sockets on this Mac a LAN peer can reach that LAN access
   does not move: host-network pods, pod processes that bind an explicit address, macOS services, and
   the node daemon's own control-plane ports in a block of their own. See

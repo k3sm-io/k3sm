@@ -336,6 +336,7 @@ answer on the networks this Mac is attached to:
 ```sh
 sudo k3sm network lan off      # only this Mac and the cluster mesh
 sudo k3sm network lan on       # every network this Mac is on
+sudo k3sm network lan on --for 30m   # on for 30 minutes, then off by itself
 k3sm network lan status        # the setting, what it covers, what it does not
 ```
 
@@ -343,6 +344,11 @@ With LAN access off, those listeners bind `127.0.0.1` and the node's own address
 once joined, its pod-range address on a single node), so other nodes reach them over the mesh and
 nothing on your Wi-Fi or Ethernet does. With it on, they bind every interface.
 
+- `--for <duration>` (for example `30m` or `2h`, more than zero and at most `24h`) turns LAN access
+  on until that time, after which the node daemon turns it off by itself. It checks about every 30
+  seconds, so the change lands within that after the expiry, or soon after the Mac wakes if it slept
+  through it. A later `lan on` without `--for`, or `lan off`, replaces it. `k3sm network lan status`
+  shows "on until <time> (in 12m)" while it is in force and says when it expired after.
 - New installs start with LAN access off. An existing install keeps LAN access on across an upgrade,
   so nothing it serves stops answering. `sudo k3sm install --lan on` or `--lan off` sets it at
   install time.

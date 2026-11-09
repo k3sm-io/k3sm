@@ -489,7 +489,8 @@ daemon reports applying. It is additive: `schemaVersion` stays `1`, and it adds 
 
 | field | type | notes |
 |---|---|---|
-| `lan` | string | the recorded setting: `on` (the covered listeners answer on every interface) or `off` (only on this Mac and the cluster mesh); `off` when the record cannot be used, which is what the node daemon serves then |
+| `lan` | string | the recorded setting in force now: `on` (the covered listeners answer on every interface) or `off` (only on this Mac and the cluster mesh); `off` when the record cannot be used, or when a timed `on` has passed its expiry, which is what the node daemon serves then |
+| `expiresAt` | string | RFC 3339 UTC time at which a timed `on` (`sudo k3sm network lan on --for <duration>`) turns off; present only while that window is open |
 | `recorded` | boolean | `false` when no setting is recorded (an install from before the switch), in which case `lan` is `on` |
 | `recordState` | string | `unreadable` when a record exists but cannot be used (it is damaged, or its owner or mode is wrong); omitted when the record was read or there is none. The reason is not included: run `sudo k3sm network lan status` to see it |
 | `covers` | array of strings | the listener families the setting controls: `nodeports`, `loadbalancers`, and `ingress` on a server |

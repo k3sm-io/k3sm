@@ -34,6 +34,9 @@ import (
 // networkUsage is `k3sm network --help`.
 const networkUsage = `Usage:
   sudo k3sm network lan on       answer on every network this Mac is on
+  sudo k3sm network lan on --for <duration>
+                                 the same, then back to off by itself after
+                                 <duration> (for example 30m or 2h; at most 24h)
   sudo k3sm network lan off      answer only on this Mac and the cluster mesh
   k3sm network lan status        show the setting (the applied state needs root)
 
@@ -59,6 +62,10 @@ address but not on 127.0.0.1.
 Not covered: the apiserver (loopback, or the mesh address), the worker join
 port (a new worker joins over the LAN, and every request needs the join
 token) and the wireguard mesh port (it answers only cluster peers).
+
+With --for, the node daemon turns LAN access off by itself once the time is
+up, checking about every 30 seconds (and soon after the Mac wakes). A later
+'lan on' without --for, or 'lan off', replaces it.
 
 New installs start with LAN access off; an existing install keeps LAN access
 on across an upgrade. 'sudo k3sm install --lan on|off' sets it at install.
@@ -102,6 +109,8 @@ type networkEnv struct {
 	Poll   time.Duration
 	Stdout io.Writer
 	Stderr io.Writer
+	// Now is the clock an expiry is set and judged against; nil is time.Now.
+	Now func() time.Time
 }
 
 // defaultNetworkEnv is the production environment.
@@ -124,9 +133,73 @@ func defaultNetworkEnv(stdout, stderr io.Writer) networkEnv {
 		},
 		Wait:   lanApplyTimeout + 10*time.Second,
 		Poll:   200 * time.Millisecond,
+		Now:    time.Now,
 		Stdout: stdout,
 		Stderr: stderr,
 	}
+}
+
+// now is env's time now.
+func (env networkEnv) now() time.Time {
+	if env.Now == nil {
+		return time.Now()
+	}
+	return env.Now()
+}
+
+// maxLANFor bounds `lan on --for`: a temporary opening longer than a day is
+// a permanent one the operator forgot about.
+const maxLANFor = 24 * time.Hour
+
+// parseLANFor parses the flags after `lan on|off|status`: only --for
+// <duration> (or --for=<duration>), only with on, greater than zero and at
+// most maxLANFor. It returns 0 when --for is not given.
+func parseLANFor(verb string, flags []string) (time.Duration, error) {
+	if len(flags) == 0 {
+		return 0, nil
+	}
+	var v string
+	switch {
+	case len(flags) == 2 && flags[0] == "--for":
+		v = flags[1]
+	case len(flags) == 1 && strings.HasPrefix(flags[0], "--for="):
+		v = strings.TrimPrefix(flags[0], "--for=")
+	default:
+		return 0, fmt.Errorf("unexpected arguments %q", strings.Join(flags, " "))
+	}
+	if verb != string(install.LANOn) {
+		return 0, fmt.Errorf("--for applies only to 'lan on' (LAN access off needs no expiry)")
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("--for %q is not a duration (for example 30m or 2h)", v)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("--for %s must be longer than zero", v)
+	}
+	if d > maxLANFor {
+		return 0, fmt.Errorf("--for %s is longer than the 24h limit (run 'sudo k3sm network lan on' without --for to leave it on)", v)
+	}
+	return d, nil
+}
+
+// untilPhrase is "until <local RFC3339> (in <left>)" for an expiry at exp.
+func untilPhrase(exp, now time.Time) string {
+	return fmt.Sprintf("until %s (in %s)", exp.Local().Format(time.RFC3339), shortDuration(exp.Sub(now)))
+}
+
+// shortDuration prints d to the minute (to the second under a minute),
+// without the zero units time.Duration.String adds: 12m, 1h30m, 2h, 45s.
+func shortDuration(d time.Duration) string {
+	if d < time.Minute {
+		return d.Round(time.Second).String()
+	}
+	out := d.Round(time.Minute).String()
+	out = strings.TrimSuffix(out, "0s")
+	if strings.HasSuffix(out, "h0m") {
+		out = strings.TrimSuffix(out, "0m")
+	}
+	return out
 }
 
 // launchctlHUP sends SIGHUP to a system-domain daemon through launchd.
@@ -149,8 +222,19 @@ func runNetworkEnv(ctx context.Context, args []string, env networkEnv) int {
 		fmt.Fprint(env.Stdout, networkUsage)
 		return 0
 	}
-	if len(args) != 2 || args[0] != "lan" {
+	if len(args) < 2 || args[0] != "lan" {
 		fmt.Fprint(env.Stderr, networkUsage)
+		return exitLifecycleUsage
+	}
+	switch args[1] {
+	case "status", string(install.LANOn), string(install.LANOff):
+	default:
+		fmt.Fprint(env.Stderr, networkUsage)
+		return exitLifecycleUsage
+	}
+	forD, err := parseLANFor(args[1], args[2:])
+	if err != nil {
+		fmt.Fprintf(env.Stderr, "k3sm network lan %s: %v (nothing was done)\n", args[1], err)
 		return exitLifecycleUsage
 	}
 	switch args[1] {
@@ -158,10 +242,10 @@ func runNetworkEnv(ctx context.Context, args []string, env networkEnv) int {
 		return networkLANStatus(ctx, env)
 	case string(install.LANOn), string(install.LANOff):
 		if env.Geteuid() != 0 {
-			fmt.Fprintf(env.Stderr, "k3sm network lan %s must run as root: use 'sudo k3sm network lan %s' (nothing was done)\n", args[1], args[1])
+			fmt.Fprintf(env.Stderr, "k3sm network lan %s must run as root: use 'sudo k3sm network lan %s' (nothing was done)\n", args[1], strings.Join(args[1:], " "))
 			return exitNeedsRoot
 		}
-		if err := setNetworkLAN(ctx, env, install.LAN(args[1])); err != nil {
+		if err := setNetworkLAN(ctx, env, install.LAN(args[1]), forD); err != nil {
 			fmt.Fprintf(env.Stderr, "k3sm network lan %s: %v\n", args[1], err)
 			if errors.Is(err, errLANRestoreFailed) {
 				return exitNetworkRestoreFailed
@@ -216,34 +300,44 @@ const exitNetworkRestoreFailed = 4
 // errLANRestoreFailed marks a failed change whose restore failed too.
 var errLANRestoreFailed = errors.New("THE PREVIOUS SETTING COULD NOT BE RESTORED")
 
-// setNetworkLAN records want and has the node daemon apply it: write the
-// record atomically, signal the daemon, wait for its report naming this
+// setNetworkLAN records want (until now+forD when forD is not zero) and has
+// the node daemon apply it: write the record atomically, signal the daemon, wait for its report naming this
 // write, then check the daemon's actual listening sockets. A refused apply or
 // a socket mismatch restores the previous record (and has the daemon apply
 // and prove that); a daemon that does not answer is restarted in place.
-func setNetworkLAN(ctx context.Context, env networkEnv, want install.LAN) error {
+func setNetworkLAN(ctx context.Context, env networkEnv, want install.LAN, forD time.Duration) error {
 	role, err := installedNodeRole(env.Sys)
 	if err != nil {
 		return fmt.Errorf("%w; nothing to switch (choose it at install with 'sudo k3sm install --lan %s')", err, want)
 	}
 	prev, prevPresent, prevErr := install.ReadNetworkRecord(env.ReadRecord, env.RecordPath)
 	rec := install.NewNetworkRecord(want, "k3sm network lan")
+	now := env.now()
+	if forD > 0 {
+		exp := now.Add(forD).UTC()
+		rec.ExpiresAt = &exp
+	}
 	if err := install.WriteNetworkRecord(env.Sys, env.RecordPath, rec); err != nil {
 		return err
 	}
+	want = rec.Effective(now)
+	sentence := lanSentence(want, role)
+	if rec.ExpiresAt != nil {
+		sentence += ", " + untilPhrase(*rec.ExpiresAt, now) + ", then off by itself"
+	}
 	label := nodeLabel(role)
 	if _, present, _ := install.ReadStopMarker(env.Sys, env.StopMarker); present {
-		fmt.Fprintf(env.Stdout, "%s. Recorded; k3sm is stopped on this Mac, so it applies when you run 'sudo k3sm start'.\n", lanSentence(want, role))
+		fmt.Fprintf(env.Stdout, "%s. Recorded; k3sm is stopped on this Mac, so it applies when you run 'sudo k3sm start'.\n", sentence)
 		return nil
 	}
 	if _, err := env.Sys.LaunchctlServicePID(label); err != nil {
-		fmt.Fprintf(env.Stdout, "%s. Recorded; the node daemon (%s) is not running, so it applies when it starts.\n", lanSentence(want, role), label)
+		fmt.Fprintf(env.Stdout, "%s. Recorded; the node daemon (%s) is not running, so it applies when it starts.\n", sentence, label)
 		return nil
 	}
 	applied, how, err := applyNetworkRecord(ctx, env, role, label, rec.Serial)
 	if err == nil && applied.Error == "" && applied.LAN == want {
 		if err = verifyDaemonSockets(ctx, env, role, label, want); err == nil {
-			fmt.Fprintf(env.Stdout, "%s%s.\n", lanSentence(want, role), how)
+			fmt.Fprintf(env.Stdout, "%s%s.\n", sentence, how)
 			return nil
 		}
 	}
@@ -257,7 +351,7 @@ func setNetworkLAN(ctx context.Context, env networkEnv, want install.LAN) error 
 	if rerr := restoreNetworkRecord(ctx, env, role, label, prev, prevPresent, prevErr); rerr != nil {
 		return fmt.Errorf("the change did not take effect: %w; and %w: %v. Check 'sudo k3sm network lan status' and set it again", reason, errLANRestoreFailed, rerr)
 	}
-	return fmt.Errorf("the change did not take effect: %w; %s", reason, restoredSentence(prev, prevPresent, prevErr))
+	return fmt.Errorf("the change did not take effect: %w; %s", reason, restoredSentence(prev, prevPresent, prevErr, env.now()))
 }
 
 // verifyDaemonSockets checks the node daemon's own TCP listening sockets
@@ -283,33 +377,42 @@ func verifyDaemonSockets(ctx context.Context, env networkEnv, role install.Role,
 }
 
 // restoredSentence says what the failed change left in force.
-func restoredSentence(prev install.NetworkRecord, present bool, readErr error) string {
+func restoredSentence(prev install.NetworkRecord, present bool, readErr error, now time.Time) string {
 	switch {
 	case readErr != nil:
 		return "the record it replaced was unusable, which the daemon reads as off, so off is recorded and in force instead"
 	case !present:
 		return "no record is kept, so LAN access stays on (restored and checked)"
 	}
-	return fmt.Sprintf("LAN access stays %s (restored and checked)", prev.LAN)
+	lan := prev.Effective(now)
+	if lan == install.LANOn && prev.ExpiresAt != nil {
+		return fmt.Sprintf("LAN access stays on %s (restored and checked)", untilPhrase(*prev.ExpiresAt, now))
+	}
+	return fmt.Sprintf("LAN access stays %s (restored and checked)", lan)
 }
 
 // restoreNetworkRecord puts the previous setting back and has the daemon
 // apply it, then checks the daemon's sockets for it: the previous value under
-// a fresh serial, no record when there was none, or off when the previous
-// record was unusable (what the daemon made of it). Any failure is returned.
+// a fresh serial (with its expiry, if it had one), no record when there was
+// none, or off when the previous record was unusable (what the daemon made of
+// it). The check is against the restored record's effective state. Any
+// failure is returned.
 func restoreNetworkRecord(ctx context.Context, env networkEnv, role install.Role, label string, prev install.NetworkRecord, present bool, readErr error) error {
 	lan := prev.LAN
+	expires := prev.ExpiresAt
 	var serial string
 	switch {
 	case readErr != nil:
-		lan = install.LANOff
+		lan, expires = install.LANOff, nil
 		fallthrough
 	case present:
 		back := install.NewNetworkRecord(lan, "k3sm network lan (restore)")
+		back.ExpiresAt = expires
 		if err := install.WriteNetworkRecord(env.Sys, env.RecordPath, back); err != nil {
 			return fmt.Errorf("write the previous setting back to %s: %w", env.RecordPath, err)
 		}
 		serial = back.Serial
+		lan = back.Effective(env.now())
 	default:
 		lan = install.LANOn
 		if err := env.Sys.RemoveAll(env.RecordPath); err != nil {
@@ -389,7 +492,14 @@ func networkLANStatus(ctx context.Context, env networkEnv) int {
 		fmt.Fprintf(env.Stderr, "k3sm network lan status: %v (the node daemon serves LAN access off while the record is unusable)\n", err)
 		return exitLifecycleFailed
 	}
-	fmt.Fprintf(env.Stdout, "Recorded: %s.\n", lanSentence(rec.LAN, role))
+	now := env.now()
+	fmt.Fprintf(env.Stdout, "Recorded: %s.\n", lanSentence(rec.Effective(now), role))
+	switch {
+	case rec.Lapsed(now):
+		fmt.Fprintf(env.Stdout, "LAN access expired at %s (it was turned on with --for); it is off until set again.\n", rec.ExpiresAt.Local().Format(time.RFC3339))
+	case rec.ExpiresAt != nil:
+		fmt.Fprintf(env.Stdout, "Temporary: on %s, then off by itself.\n", untilPhrase(*rec.ExpiresAt, now))
+	}
 	if !present {
 		fmt.Fprintf(env.Stdout, "LAN access is on because no setting is recorded (an install from before the switch). Run 'sudo k3sm network lan off' to limit it.\n")
 	}
