@@ -267,6 +267,12 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
 
 ### Fixed
 
+- A server whose control plane does not report healthy in time while the Mac is heavily loaded no
+  longer parks on the crash-loop breaker after five attempts. It backs off instead, from 30 seconds
+  doubling up to 10 minutes, `k3sm status` shows when the next attempt starts, and it parks only
+  after eight slow attempts in a row. A restart also keeps each component's previous log as
+  `<component>.log.1`, so the first failure's cause is not overwritten. See
+  [the crash-loop breaker](docs/user/troubleshooting.md#the-crash-loop-breaker-tripped).
 - A single-node server no longer stops its whole control plane when a datastore compaction runs out of
   time under heavy load. kine used to exit when the compaction failed to commit; it now logs
   `Compact failed` and retries on the next interval. Every node re-stages kine on upgrade.
