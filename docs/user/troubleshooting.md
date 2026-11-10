@@ -617,6 +617,12 @@ several times in a row, the server daemon parks itself: it stays running so laun
 restarting it, but it serves nothing. `k3sm status` reports the server row as `crash-loop` with the
 time the breaker tripped.
 
+A control plane that is still alive but does not report healthy in time while the Mac is heavily
+loaded is not counted toward the breaker. The server waits before its next attempt instead, from 30
+seconds doubling up to 10 minutes, and `k3sm status` shows when the next attempt starts; it parks
+only after eight such attempts in a row. Each component's previous log is kept beside the current
+one as `<component>.log.1`.
+
 A server that was killed outright leaves its control-plane processes running. Its next start stops
 the ones it left behind before starting its own, so they do not count toward the breaker; a process
 holding the datastore port that this server did not start is still refused. A server parked on the

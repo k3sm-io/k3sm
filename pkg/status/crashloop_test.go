@@ -63,6 +63,12 @@ func TestClassifyCrashLoop(t *testing.T) {
 		wantNotIn   []string
 	}{
 		{"absent or empty is quiet", executor.CrashRecord{}, nil, PostureQuiet, nil, nil},
+		{"a slow bring-up streak shows the backoff", executor.CrashRecord{SlowStreak: 3, LastSlowAt: &tripped,
+			Crashes: []executor.Crash{{At: tripped, Component: "kube-apiserver", Origin: executor.CrashOriginBringUpSlow}}},
+			nil, PostureRestarting, []string{"backing off until " + tripped.Add(2*time.Minute).Format(time.RFC3339), "3 consecutive", "parks at"}, nil},
+		{"an elapsed slow backoff is quiet", executor.CrashRecord{SlowStreak: 1, LastSlowAt: &tripped,
+			Crashes: []executor.Crash{{At: tripped, Component: "kube-apiserver", Origin: executor.CrashOriginBringUpSlow}}},
+			nil, PostureQuiet, nil, nil},
 		{"one crash in the window is quiet (a fact for the log, not a pattern)",
 			executor.CrashRecord{Crashes: []executor.Crash{crash(time.Minute, "kine")}}, nil, PostureQuiet, nil, nil},
 		{"two crashes in the window is restarting",

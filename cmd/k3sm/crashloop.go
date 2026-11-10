@@ -41,16 +41,23 @@ const crashLoopPollInterval = 5 * time.Second
 // record one, and the timer's clear could then erase it: a lost crash is a loop
 // that never trips.
 type crashBreaker struct {
-	path   string
-	now    func() time.Time
-	logger *slog.Logger
+	path string
+	now  func() time.Time
+	// pressure reads whether the host is under load at the moment a bring-up's
+	// apiserver health wait ran out (executor.HostUnderPressure); after is the
+	// slow bring-up backoff's timer. Both are seams so a test fakes the host and
+	// the clock.
+	pressure func() (bool, error)
+	after    func(time.Duration) <-chan time.Time
+	logger   *slog.Logger
 
 	mu      sync.Mutex
 	crashed bool // set by record; read by resetIfHealthy under mu
 }
 
 func newCrashBreaker(workDir string, logger *slog.Logger) *crashBreaker {
-	return &crashBreaker{path: executor.CrashLoopPath(workDir), now: time.Now, logger: logger}
+	return &crashBreaker{path: executor.CrashLoopPath(workDir), now: time.Now,
+		pressure: executor.HostUnderPressure, after: time.After, logger: logger}
 }
 
 // load reads the record, pruned to the window. A malformed record is logged and
@@ -97,6 +104,71 @@ func (b *crashBreaker) recordLeaderLost(component, detail string) (tripped bool)
 // error wraps executor.ErrEtcdChildExited and noteBringUpFailure skips it.
 func (b *crashBreaker) recordBringUp(component, detail string) (tripped bool) {
 	return b.recordOrigin(executor.CrashOriginBringUp, component, detail)
+}
+
+// recordBringUpSlow appends one SLOW bring-up: the apiserver health wait ran
+// out while the host was under pressure. It does not count toward the crash
+// threshold; it extends the slow streak that backs the next bring-up off, and
+// trips the breaker only at executor.BringUpSlowStreakLimit.
+func (b *crashBreaker) recordBringUpSlow(component, detail string) (tripped bool) {
+	return b.write(func(r *executor.CrashRecord, now time.Time) bool {
+		return r.RecordBringUpSlow(now, component, detail)
+	})
+}
+
+// slowUnderPressure reports whether a bring-up error is an apiserver health
+// timeout that happened while the host was under pressure, sampled now, at the
+// moment of the timeout. A pressure read that fails is "not slow": the failure
+// is then counted exactly as it was before the backoff existed.
+func (b *crashBreaker) slowUnderPressure(err error) bool {
+	if !errors.Is(err, executor.ErrAPIServerHealthTimeout) || b.pressure == nil {
+		return false
+	}
+	pressured, perr := b.pressure()
+	if perr != nil {
+		b.logger.Warn("could not read host pressure; counting the bring-up timeout as a failure", "err", perr)
+		return false
+	}
+	return pressured
+}
+
+// noteBringUpHealthy ends the slow streak once a bring-up reached healthz. It
+// writes only when there is a streak to end, and it does not mark this process
+// as crashed: the healthy-window reset must still run.
+func (b *crashBreaker) noteBringUpHealthy() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	r := b.load()
+	if r.SlowStreak == 0 && r.LastSlowAt == nil {
+		return
+	}
+	r.NoteBringUpHealthy()
+	if err := executor.WriteCrashRecord(b.path, r); err != nil {
+		b.logger.Error("could not persist the crash-loop record", "path", b.path, "err", err)
+	}
+}
+
+// awaitBringUpBackoff waits out the slow bring-up backoff the record holds
+// before a server bring-up, and returns ctx's error if ctx ends first. The wait
+// is derived from the record, not from this process, because each slow lap
+// ends in a daemon exit and launchd's respawn.
+func (b *crashBreaker) awaitBringUpBackoff(ctx context.Context) error {
+	b.mu.Lock()
+	r := b.load()
+	b.mu.Unlock()
+	wait, until := r.BringUpBackoff(b.now())
+	if wait <= 0 {
+		return nil
+	}
+	b.logger.Warn("the last bring-up timed out while the host was under pressure; backing off before the next one",
+		"attempt", r.SlowStreak+1, "wait", wait, "next_attempt", until.Format(time.RFC3339),
+		"limit", executor.BringUpSlowStreakLimit)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-b.after(wait):
+		return nil
+	}
 }
 
 // recordBringUpPermanent appends one PERMANENT bring-up failure, which trips
@@ -226,6 +298,15 @@ func noteBringUpFailure(stop context.Context, b *crashBreaker, logger *slog.Logg
 	// Checked after every permanent class: a permanent fault that happened to
 	// surface during a stop is still the fault, and still parks.
 	if skipCancelledByStop(stop, logger, component, err) {
+		return
+	}
+	if b.slowUnderPressure(err) {
+		logger.Warn("the control plane did not come up in time while the host was under pressure; backing off instead of counting it",
+			"component", component, "err", err, "limit", executor.BringUpSlowStreakLimit)
+		if b.recordBringUpSlow(component, err.Error()) {
+			logger.Error("crash-loop breaker tripped: the host stayed under pressure for too many slow bring-ups; the next start will park until an operator clears the record",
+				"path", b.path, "remedy", executor.BringUpSlowRemedy)
+		}
 		return
 	}
 	logger.Error("the control plane did not come up; recording it on the crash-loop breaker",
@@ -368,6 +449,10 @@ func parkReason(last executor.Crash) string {
 	if last.Origin == executor.CrashOriginLeaderLost {
 		return "crash-loop breaker tripped on repeated leader-lease loss (last: " + last.Component +
 			"); this server keeps losing etcd quorum; parking until an operator clears the record"
+	}
+	if last.Origin == executor.CrashOriginBringUpSlow {
+		return "crash-loop breaker tripped; the control plane kept timing out on an overloaded host (last: " + last.Component +
+			"); parking until an operator clears the record"
 	}
 	if last.Origin == executor.CrashOriginBringUp {
 		return "crash-loop breaker tripped; the control plane never came up (last: " + last.Component +

@@ -1108,6 +1108,7 @@ func (s *Supervised) spawn(ctx context.Context, name string, args ...string) (*c
 func (s *Supervised) spawnEnv(ctx context.Context, name string, extraEnv []string, args ...string) (*component, error) {
 	bin := filepath.Join(binDir(s.cfg.WorkDir), name)
 	logPath := filepath.Join(s.cfg.WorkDir, name+".log")
+	rotateComponentLog(logPath)
 	lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("create %s log: %w", name, err)
@@ -1182,12 +1183,60 @@ func (s *Supervised) spawnEnv(ctx context.Context, name string, extraEnv []strin
 	return c, nil
 }
 
+// rotateComponentLog keeps the previous run's log as <path>.1 before the new
+// start truncates it, one generation deep. Without it a restart overwrote the
+// one log that held the first crash's cause. It renames rather than copies, so
+// the kept file is the same 0600 inode; an empty or absent log is not rotated,
+// so an unlogged lap cannot push the last useful one out. A rename error is
+// ignored on purpose: losing the previous generation is what happened before
+// this existed, and it must never stop the component from starting.
+func rotateComponentLog(path string) {
+	fi, err := os.Stat(path)
+	if err != nil || !fi.Mode().IsRegular() || fi.Size() == 0 {
+		return
+	}
+	_ = os.Rename(path, path+".1")
+}
+
 // waitHealthz waits for the apiserver to report healthz ok, failing fast (with
 // the log tail) if the apiserver child exits first. The 90s healthTimeout is
 // unchanged — fail-fast only ever shortens the wedge, never lengthens it.
 func (s *Supervised) waitHealthz(ctx context.Context, api *component) error {
-	return awaitHealthy(ctx, api.name, api.exited, api.exitedNow, s.Ready, healthTimeout, 500*time.Millisecond, api.exitDetail)
+	err := awaitHealthy(ctx, api.name, api.exited, api.exitedNow, s.Ready, healthTimeout, 500*time.Millisecond, api.exitDetail)
+	var dl *healthDeadlineError
+	if errors.As(err, &dl) {
+		return &apiHealthTimeoutError{err: err}
+	}
+	return err
 }
+
+// ErrAPIServerHealthTimeout marks a bring-up whose apiserver stayed alive but
+// did not report healthz within healthTimeout: the one failure an overloaded
+// host produces on a control plane that is otherwise fine. A child that exited
+// first is never this error. cmd/k3sm matches it with errors.Is and, when the
+// host is under pressure at that moment, records the lap as
+// CrashOriginBringUpSlow instead of counting it toward the park.
+var ErrAPIServerHealthTimeout = errors.New("kube-apiserver health wait timed out")
+
+// healthDeadlineError is awaitHealthy's "not healthy within" result, typed so a
+// caller can tell the deadline apart from an exit or a cancellation without
+// matching the text. Its message is the one the wait always returned.
+type healthDeadlineError struct {
+	name    string
+	timeout time.Duration
+}
+
+func (e *healthDeadlineError) Error() string {
+	return fmt.Sprintf("%s not healthy within %s", e.name, e.timeout)
+}
+
+// apiHealthTimeoutError is the apiserver's deadline, matching
+// ErrAPIServerHealthTimeout under errors.Is with its message unchanged.
+type apiHealthTimeoutError struct{ err error }
+
+func (e *apiHealthTimeoutError) Error() string        { return e.err.Error() }
+func (e *apiHealthTimeoutError) Unwrap() error        { return e.err }
+func (e *apiHealthTimeoutError) Is(target error) bool { return target == ErrAPIServerHealthTimeout }
 
 // awaitHealthy is the bring-up wait: it polls ready() every poll until it
 // reports true, selecting against child-exit the whole time. It returns nil on
@@ -1231,7 +1280,7 @@ func awaitHealthy(ctx context.Context, name string, exited <-chan struct{}, exit
 					return ctx.Err()
 				}
 			}
-			return fmt.Errorf("%s not healthy within %s", name, timeout)
+			return &healthDeadlineError{name: name, timeout: timeout}
 		}
 		select {
 		case <-ctx.Done():
