@@ -76,10 +76,14 @@ const gateUpstreamHeaderTimeout = 30 * time.Second
 // The registry answers one only after it holds the repository's lock, which a
 // collection sweep of that repository holds for the whole sweep, and after it
 // links every blob the manifest names, which can re-hash a large blob from
-// disk; a healthy push can wait well past 30s on its last request. The gate
-// uses CollectTimeout, this package's bound past which a registry doing that
-// work is taken to be hung.
-const gateManifestHeaderTimeout = CollectTimeout
+// disk; a healthy push can wait well past 30s on its last request.
+// Invariant: it must be at least CollectTimeout. A sweep holds the lock for up
+// to CollectTimeout, so a shorter bound would cut a healthy PUT that is only
+// queued behind a sweep; past CollectTimeout a registry still doing that work
+// is taken to be hung, so the PUT is cut there with a 502. It is its own value
+// rather than an alias so tuning CollectTimeout does not silently move it;
+// TestGateManifestBoundCoversCollect holds the invariant.
+const gateManifestHeaderTimeout = 10 * time.Minute
 
 // gateUploadHeaderTimeout is the response-header bound of a blob upload
 // request (the POST that starts or mounts, a PATCH, the final PUT). The
@@ -122,13 +126,14 @@ type gateConfig struct {
 	// UpstreamHeaderTimeout bounds how long the loopback transport waits for
 	// the registry's response headers to a read, an upload status or any
 	// other request not named below; zero means gateUpstreamHeaderTimeout.
-	// The three bounds are ignored when Transport is set.
+	// Ignored when Transport is set.
 	UpstreamHeaderTimeout time.Duration
 	// ManifestHeaderTimeout is that bound for a manifest PUT; zero means
-	// gateManifestHeaderTimeout.
+	// gateManifestHeaderTimeout. Ignored when Transport is set.
 	ManifestHeaderTimeout time.Duration
 	// UploadHeaderTimeout is that bound for a blob upload request (start or
-	// mount, chunk, finish); zero means gateUploadHeaderTimeout.
+	// mount, chunk, finish); zero means gateUploadHeaderTimeout. Ignored when
+	// Transport is set.
 	UploadHeaderTimeout time.Duration
 }
 
@@ -197,8 +202,10 @@ func newGate(cfg gateConfig) *gate {
 
 // proxyFor is the reverse proxy a request of class op is forwarded through,
 // and so the response-header bound it is held to: a read anonymously, a
-// manifest PUT and the blob upload requests over their own transports, every
-// other authorized write (an upload status) over the upstream one.
+// manifest PUT and the blob upload requests over their own transports, an
+// upload status as an authorized write over the upstream one. opInvalid and
+// opRefused are never forwarded; they fall to the default.
+// TestGateProxyForEveryOperation fails for an operation with no case here.
 func (g *gate) proxyFor(op gateOp) *httputil.ReverseProxy {
 	switch op {
 	case opRead:
@@ -207,6 +214,8 @@ func (g *gate) proxyFor(op gateOp) *httputil.ReverseProxy {
 		return g.manifest
 	case opUploadStart, opUploadChunk, opUploadFinish:
 		return g.upload
+	case opUploadStatus:
+		return g.write
 	default:
 		return g.write
 	}

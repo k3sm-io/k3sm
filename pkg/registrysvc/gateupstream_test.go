@@ -24,9 +24,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
 	"strings"
 	"sync"
 	"testing"
@@ -124,7 +126,7 @@ func TestGateHeaderBoundByOperation(t *testing.T) {
 	}{
 		{opRead, gateUpstreamHeaderTimeout},
 		{opUploadStatus, gateUpstreamHeaderTimeout},
-		{opManifestPut, CollectTimeout},
+		{opManifestPut, gateManifestHeaderTimeout},
 		{opUploadStart, api.DefaultUploadTimeout},
 		{opUploadChunk, api.DefaultUploadTimeout},
 		{opUploadFinish, api.DefaultUploadTimeout},
@@ -141,6 +143,64 @@ func TestGateHeaderBoundByOperation(t *testing.T) {
 	}
 	if gateUpstreamHeaderTimeout != 30*time.Second {
 		t.Errorf("gateUpstreamHeaderTimeout = %v, want 30s", gateUpstreamHeaderTimeout)
+	}
+}
+
+// TestGateManifestBoundCoversCollect: a manifest PUT queued behind a
+// collection sweep of its repository waits up to CollectTimeout for the lock,
+// so the manifest bound must not be shorter or a healthy push is cut.
+func TestGateManifestBoundCoversCollect(t *testing.T) {
+	if gateManifestHeaderTimeout < CollectTimeout {
+		t.Errorf("gateManifestHeaderTimeout = %v, want at least CollectTimeout (%v)",
+			gateManifestHeaderTimeout, CollectTimeout)
+	}
+}
+
+// TestGateProxyForEveryOperation walks every operation the gate classifies
+// (every gateOp with a name, plus opInvalid) and asserts the proxy, and so
+// the transport class, proxyFor picks for it. An operation added without an
+// entry here fails, which makes whoever adds it decide its bound.
+func TestGateProxyForEveryOperation(t *testing.T) {
+	g := newGate(gateConfig{Upstream: "127.0.0.1:1", Logger: quietLogger()})
+	classes := map[*httputil.ReverseProxy]string{
+		g.read:     "read",
+		g.write:    "write",
+		g.manifest: "manifest",
+		g.upload:   "upload",
+	}
+	if len(classes) != 4 {
+		t.Fatalf("the gate's four proxies are not distinct")
+	}
+	want := map[gateOp]string{
+		opInvalid:      "write", // never forwarded; the default
+		opRefused:      "write", // never forwarded; the default
+		opRead:         "read",
+		opUploadStart:  "upload",
+		opUploadChunk:  "upload",
+		opUploadFinish: "upload",
+		opUploadStatus: "write",
+		opManifestPut:  "manifest",
+	}
+	seen := map[gateOp]bool{}
+	for i := 0; i <= math.MaxUint8; i++ {
+		op := gateOp(i)
+		if op != opInvalid && op.String() == opInvalid.String() {
+			continue // not a named operation
+		}
+		seen[op] = true
+		w, ok := want[op]
+		if !ok {
+			t.Errorf("operation %d (%s) has no expected proxy class: add it here and a case in proxyFor", i, op)
+			continue
+		}
+		if got := classes[g.proxyFor(op)]; got != w {
+			t.Errorf("proxyFor(%s) = %q proxy, want %q", op, got, w)
+		}
+	}
+	for op := range want {
+		if !seen[op] {
+			t.Errorf("expected operation %s was not enumerated", op)
+		}
 	}
 }
 
