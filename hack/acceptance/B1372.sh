@@ -404,14 +404,15 @@ sys.exit(1 if errs else 0)
 view_inodes() { awk '$1 == "F" { print $2, $3 }' "$1"; }
 
 # under_scratch <dir>: the dir, made absolute against the working directory, its
-# symlinks and .. resolved (a tail that does not exist yet taken as written), lies
+# symlinks and .. resolved in path order, so a .. after a symlink climbs from the
+# link's target (a tail that does not exist yet taken as written), lies
 # strictly below a directory named $SCRATCH_DIRNAME. p.0 refuses any other --evidence.
 # The test seam is the path alone: --self-test roots its runs' evidence under a
 # $SCRATCH_DIRNAME directory in its mktemp tree. No flag or variable loosens it.
 under_scratch() {
 	py '
 import os, sys
-p = os.path.realpath(os.path.abspath(sys.argv[1]))
+p = os.path.realpath(sys.argv[1])
 sys.exit(0 if sys.argv[2] in p.split(os.sep)[:-1] else 1)
 ' "$1" "$SCRATCH_DIRNAME"
 }
@@ -1914,7 +1915,7 @@ self_test() {
 	# The evidence dir must lie under a k3sm-io.scratch directory (the pure check).
 	mkdir -p "$t/ev-in" "$base/outside"
 	ln -s "$base/outside" "$t/ev-link"
-	for row in "$t/ev-in|0" "$t/new/ev|0" "$t|1" "$base/outside/ev|1" "$t/../outside/ev|1" "$t/ev-link/ev|1" "${base}y/x|1" "$base/${SCRATCH_DIRNAME}y/ev|1" "relative/ev|1"; do
+	for row in "$t/ev-in|0" "$t/new/ev|0" "$t|1" "$base/outside/ev|1" "$t/../outside/ev|1" "$t/ev-link/ev|1" "$t/ev-link/../ev|1" "${base}y/x|1" "$base/${SCRATCH_DIRNAME}y/ev|1" "relative/ev|1"; do
 		rc=0; (cd "$base" && under_scratch "${row%|*}") || rc=$?
 		chk "under_scratch ${row%|*}" "$rc" "${row#*|}"
 	done
