@@ -128,6 +128,7 @@ func TestConditionalDelete(t *testing.T) {
 		gone                bool
 	}{
 		{"a tag delete matching the tag's digest deletes", "/v2/app/manifests/v1", `"<old>"`, http.StatusAccepted, true},
+		{"a tag delete with a star deletes", "/v2/app/manifests/v1", "*", http.StatusAccepted, true},
 		{"a tag delete matching the digest in a list deletes", "/v2/app/manifests/v1", `"sha256:nope", "<old>"`, http.StatusAccepted, true},
 		{"a tag delete naming a digest the tag does not name is refused", "/v2/app/manifests/v1", `"<new>"`, http.StatusPreconditionFailed, false},
 		{"a weak tag of the digest never matches", "/v2/app/manifests/v1", `W/"<old>"`, http.StatusPreconditionFailed, false},

@@ -155,3 +155,53 @@ func TestImageUntagDigestDeletesAnUnmovedTag(t *testing.T) {
 		t.Errorf("app:v1 survived its untag")
 	}
 }
+
+// recordingTransport serves with base and counts the requests it carried.
+type recordingTransport struct {
+	base http.RoundTripper
+	n    *int
+}
+
+// RoundTrip counts req and serves it through base.
+func (t recordingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	*t.n++
+	return t.base.RoundTrip(req)
+}
+
+// TestImageUntagDeleteAccessUsesTheBoundTransport pins what untag's If-Match wrap
+// assumes: registryDeleteAccess's transport is boundRequests(nil), the one
+// over defaultRegistryTransport. imageUntag rebuilds that transport under the
+// wrap, so an access that carried any other transport would be replaced
+// silently; this fails instead.
+func TestImageUntagDeleteAccessUsesTheBoundTransport(t *testing.T) {
+	srv := newRegistryServer(t)
+	dir := t.TempDir()
+	if err := os.MkdirAll(registrysvc.StateDir(dir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := registrysvc.WriteCredential(dir, registrysvc.Credential{
+		Address: "127.0.0.1:6450", Username: "k3sm", Password: "secret",
+	}); err != nil {
+		t.Fatalf("write credential: %v", err)
+	}
+	t.Setenv("K3SM_WORK_DIR", dir)
+	var n int
+	prev := defaultRegistryTransport
+	defaultRegistryTransport = recordingTransport{base: handlerTransport{srv}, n: &n}
+	t.Cleanup(func() { defaultRegistryTransport = prev })
+
+	acc, err := registryDeleteAccess(t.Context(), dir)
+	if err != nil {
+		t.Fatalf("registryDeleteAccess: %v", err)
+	}
+	ref, err := name.NewTag(acc.authority + "/app:v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := remote.Head(ref, acc.opts...); err == nil {
+		t.Fatalf("HEAD of an absent tag succeeded")
+	}
+	if n == 0 {
+		t.Errorf("the delete access's requests bypassed defaultRegistryTransport; imageUntag's If-Match wrap over boundRequests(nil) would replace its transport")
+	}
+}
