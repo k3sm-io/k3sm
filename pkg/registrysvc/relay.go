@@ -251,6 +251,7 @@ func newRelay(port, upstream int, binds []netip.Addr, log *slog.Logger, auth Gat
 		},
 	}
 	r.limiter = newSourceLimiter(newGate(gateConfig{Upstream: r.target(), Auth: auth, Credential: cred, Logger: log}), r.limits, time.Now)
+	r.limiter.log = log
 	r.handler = r.limiter
 	return r
 }
@@ -502,11 +503,24 @@ func (l *limitListener) Close() error {
 	return l.Listener.Close()
 }
 
-// limitConn frees its slot exactly once, on Close.
+// limitConn frees its slot exactly once, on Close, and reports a write the
+// relay's own deadline cut to cut, which the limiter's ConnContext sets before
+// the connection is served.
 type limitConn struct {
 	net.Conn
 	once    sync.Once
 	release func()
+	cut     *cutWatch
+}
+
+// Write is the connection's Write. Every response byte, the server's final
+// flush included, reaches the peer here.
+func (c *limitConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	if err != nil {
+		c.cut.wrote(err)
+	}
+	return n, err
 }
 
 func (c *limitConn) Close() error {

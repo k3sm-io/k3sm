@@ -326,7 +326,7 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
   restart (this applies to the relay; the push gate's upload bound is separate). Each write of a response
   and each read of a request body must make progress within 5 minutes, or the relay closes the
   connection and frees the slot. A blob still streams for as long as it takes while it keeps moving:
-  there is no flat read or write timeout.
+  there is no flat read or write timeout. A connection cut this way is logged as a warning.
 - A server whose control plane does not report healthy in time while the Mac is heavily loaded no
   longer parks on the crash-loop breaker after five attempts. It backs off instead, from 30 seconds
   doubling up to 10 minutes, `k3sm status` shows when the next attempt starts and that an attempt
