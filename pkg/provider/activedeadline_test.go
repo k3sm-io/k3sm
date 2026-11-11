@@ -639,3 +639,91 @@ func TestResyncNotBlockedByDeadlineStop(t *testing.T) {
 		}
 	}
 }
+
+// TestActiveDeadlineStopDropsStatusOfADeletedPod pins a deadline stop that
+// returns after the pod's DeletePod began: the pod is the delete's now, so the
+// stop records no owed status, writes none and publishes none.
+func TestActiveDeadlineStopDropsStatusOfADeletedPod(t *testing.T) {
+	ctx := context.Background()
+	deadline := int64(60)
+	pod := pullPod("deadline-deleted")
+	pod.Spec.ActiveDeadlineSeconds = &deadline
+	f := newFakeRuntimeServer()
+	h := &heldStopRuntime{fakeRuntimeServer: f, holdID: string(pod.UID), hold: make(chan struct{}), entered: make(chan struct{})}
+	r := newRuntimedWith(h, RuntimedConfig{
+		NodeName: "n",
+		NodeIP:   testNodeIP,
+		Root:     t.TempDir(), PodLogsDir: t.TempDir(),
+		Recorder: record.NewFakeRecorder(64),
+		Network:  NewPodNetAdapter(newFakeIPAM(t, "100.64.0.0/24"), testNodeIP, nil),
+	}, nil, nil)
+	clk := testclock.NewFakeClock(time.Now())
+	r.clk = clk
+	cs := fake.NewClientset()
+	r.client = cs
+	if _, err := cs.CoreV1().Pods(pod.Namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("apiserver create: %v", err)
+	}
+	var writes atomic.Int32
+	cs.PrependReactor("update", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		writes.Add(1)
+		return false, nil, nil
+	})
+	var released atomic.Bool
+	release := func() {
+		if released.CompareAndSwap(false, true) {
+			close(h.hold)
+		}
+	}
+	t.Cleanup(r.shutdown)
+	t.Cleanup(release)
+	var deleted atomic.Bool
+	var late atomic.Int32
+	r.notify = func(p *corev1.Pod) {
+		if p.Name == pod.Name && deleted.Load() {
+			late.Add(1)
+		}
+	}
+	if err := r.CreatePod(ctx, pod); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	tr := r.trackByID(string(pod.UID))
+	if tr == nil {
+		t.Fatal("pod not tracked after CreatePod")
+	}
+
+	clk.Step(20 * time.Minute)
+	r.resync(ctx)
+	select {
+	case <-h.entered:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the deadline stop never reached the runtime")
+	}
+	writes.Store(0)
+	delDone := make(chan error, 1)
+	go func() { delDone <- r.DeletePod(ctx, pod) }()
+	waitBounded(t, "DeletePod to mark the track deleting", func() bool {
+		d, _ := tr.deleteProgress()
+		return d
+	})
+	deleted.Store(true)
+	release()
+	select {
+	case err := <-delDone:
+		if err != nil {
+			t.Fatalf("DeletePod: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("DeletePod did not return after the stop was released")
+	}
+	waitDeadlineStops(r)
+	if n := late.Load(); n != 0 {
+		t.Errorf("status callbacks for the deleted pod after its DeletePod = %d, want 0", n)
+	}
+	if n := writes.Load(); n != 0 {
+		t.Errorf("status writes for the deleted pod = %d, want 0", n)
+	}
+	if st := tr.unpersistedStatus(); st != nil {
+		t.Errorf("the deleted pod still owes a status: %v", st)
+	}
+}

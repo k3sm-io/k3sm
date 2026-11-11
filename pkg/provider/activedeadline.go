@@ -277,7 +277,14 @@ func (r *runtimedRuntime) failPastDeadline(ctx context.Context, tracked *corev1.
 		"pod", podKey(tracked.Namespace, tracked.Name), "uid", id,
 		"active_deadline_seconds", *tracked.Spec.ActiveDeadlineSeconds)
 	r.recorder.Event(tracked, corev1.EventTypeWarning, reasonDeadlineExceeded, msgDeadlineExceeded)
+	// A pod deleted while its stop ran is the DeletePod's now: it owes the
+	// apiserver no Failed status, and a callback would republish a pod the
+	// kubelet already let go of.
 	t.restartMu.Lock()
+	if t.deleting {
+		t.restartMu.Unlock()
+		return nil
+	}
 	t.unpersisted = st
 	t.restartMu.Unlock()
 	r.persistDeadlineStatus(ctx, tracked, t, true)
