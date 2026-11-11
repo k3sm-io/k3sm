@@ -100,8 +100,12 @@ const (
 	// relayReadHeaderTimeout, relayMaxHeaderBytes, relayIdleTimeout and
 	// relayMaxConns bound what one client can hold of a relay address before
 	// the gate has decided anything, and relaylimit.go divides relayMaxConns
-	// into per-source shares. There is no read or write timeout: a blob is as
-	// large as an image layer and streams for as long as it takes.
+	// into per-source shares. There is no flat read or write timeout: a blob is
+	// as large as an image layer and streams for as long as it takes. Streaming
+	// is bounded by progress, not total time: the limiter gives every write of
+	// a response and every read of a request body its own deadline
+	// (relayWriteProgress, relayReadProgress), so a peer that stops reading or
+	// sending loses its connection and frees its slot.
 	relayReadHeaderTimeout = 10 * time.Second
 	relayMaxHeaderBytes    = 16 << 10
 	relayIdleTimeout       = 90 * time.Second
