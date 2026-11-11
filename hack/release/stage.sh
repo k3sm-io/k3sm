@@ -131,7 +131,8 @@
 #                     lines recording the pinned toolchain and, for kine, etcd,
 #                     etcdutl and helm, the module version, the patch-set id,
 #                     the build variant and the build flags (kine: also
-#                     the raised golang.org/x/net; helm: its raised modules). After
+#                     every module it is built with raised; helm: its raised
+#                     modules). After
 #                     signing it is the authority for the payload's bytes; check it
 #                     with `shasum -a 256 -c PAYLOAD-SHA256` inside the tree. Also
 #                     written to <out-dir>.PAYLOAD-SHA256. A symlink anywhere in the
@@ -454,10 +455,10 @@ GV_ALLOW="$HERE/govulncheck.allow"
 # path@version), HELM_COMMIT (the tag's commit the build stamps) and HELM_BINARY,
 # XNET_FLOOR (the golang.org/x/net kine is built against),
 # COMPRESS_RAISED (the github.com/klauspost/compress it is built against),
-# KINE_FLOORS (x/net and the golang.org/x modules it requires, "path version"
-# pairs space-separated: the floors buildinfo_problems holds a staged kine to)
-# and KINE_RAISED (every module kine is built with raised, in the same form:
-# KINE_FLOORS, then compress), read from
+# KINE_RAISED (every module kine is built with raised, "path version" pairs
+# space-separated: x/net, the golang.org/x modules it requires, then compress)
+# and KINE_FLOORS (the same form: the raised modules kine links, the floors
+# buildinfo_problems holds a staged kine to), read from
 # the source the staged k3sm is built from, so the checks below compare against
 # that build's own pins.
 read_pins() {
@@ -485,15 +486,23 @@ read_pins() {
 	[ -n "$XNET_FLOOR" ] || die "cannot read the raised golang.org/x/net (XNetVersion) from $cr"
 	COMPRESS_RAISED="$(sed -n 's/^[[:space:]]*const CompressVersion[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$cr")"
 	[ -n "$COMPRESS_RAISED" ] || die "cannot read the raised github.com/klauspost/compress (CompressVersion) from $cr"
+	# A floor is only for a module the kine binary links: Go records a `dep` line
+	# in the build info only for a module that supplies a linked package, so a
+	# raised module kine requires but does not link (x/term: an indirect go.mod
+	# requirement, no package of it in kine's main package's deps) is in
+	# KINE_RAISED, which records the go.mod raise, and never in KINE_FLOORS.
 	local m c v
+	KINE_RAISED="golang.org/x/net $XNET_FLOOR"
 	KINE_FLOORS="golang.org/x/net $XNET_FLOOR"
-	for m in crypto:XCryptoVersion sys:XSysVersion term:XTermVersion text:XTextVersion sync:XSyncVersion; do
-		c="${m#*:}"
+	for m in crypto:XCryptoVersion:linked sys:XSysVersion:linked term:XTermVersion:unlinked text:XTextVersion:linked sync:XSyncVersion:linked; do
+		c="${m#*:}" c="${c%%:*}"
 		v="$(sed -n "s/^[[:space:]]*${c}[[:space:]]*=[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$cr")"
 		[ -n "$v" ] || die "cannot read the raised golang.org/x/${m%%:*} ($c) from $cr"
-		KINE_FLOORS="$KINE_FLOORS golang.org/x/${m%%:*} $v"
+		KINE_RAISED="$KINE_RAISED golang.org/x/${m%%:*} $v"
+		[ "${m##*:}" = linked ] && KINE_FLOORS="$KINE_FLOORS golang.org/x/${m%%:*} $v"
 	done
-	KINE_RAISED="$KINE_FLOORS github.com/klauspost/compress $COMPRESS_RAISED"
+	KINE_RAISED="$KINE_RAISED github.com/klauspost/compress $COMPRESS_RAISED"
+	KINE_FLOORS="$KINE_FLOORS github.com/klauspost/compress $COMPRESS_RAISED"
 }
 
 # helm_buildinfo_problems <want-version> <go-pin> <raised>  (stdin: `go version -m`)
@@ -1974,9 +1983,13 @@ FAILCP
 			echo "  FAIL  read_pins: XNET_FLOOR '$XNET_FLOOR'"; exit 1
 		fi
 		# shellcheck disable=SC2086 # the floors are "path version" pairs, one word each
-		if [ "$(printf '%s\n' $KINE_FLOORS | paste -d' ' - - | grep -Ecx 'golang\.org/x/(net|crypto|sys|term|text|sync) v[0-9]+\.[0-9]+\.[0-9]+')" = 6 ] &&
-			[ "$(printf '%s\n' $KINE_FLOORS | wc -l | tr -d ' ')" = 12 ] && [ "${KINE_RAISED#"$KINE_FLOORS" }" != "$KINE_RAISED" ]; then
-			echo "  ok    read_pins: kine floors $KINE_FLOORS (the raised set's golang.org/x modules)"
+		if [ "$(printf '%s\n' $KINE_FLOORS | paste -d' ' - - | grep -Ecx '(golang\.org/x/(net|crypto|sys|text|sync)|github\.com/klauspost/compress) v[0-9]+\.[0-9]+\.[0-9]+')" = 6 ] &&
+			[ "$(printf '%s\n' $KINE_FLOORS | wc -l | tr -d ' ')" = 12 ] &&
+			[ "$(printf '%s\n' $KINE_RAISED | wc -l | tr -d ' ')" = 14 ] &&
+			[ -z "$(comm -23 <(printf '%s\n' $KINE_FLOORS | paste -d' ' - - | sort) <(printf '%s\n' $KINE_RAISED | paste -d' ' - - | sort))" ] &&
+			printf '%s\n' $KINE_RAISED | paste -d' ' - - | grep -Eqx 'golang\.org/x/term v[0-9]+\.[0-9]+\.[0-9]+' &&
+			! printf '%s\n' $KINE_FLOORS | grep -qx 'golang\.org/x/term'; then
+			echo "  ok    read_pins: kine floors $KINE_FLOORS (the raised modules kine links; x/term is raised, not linked)"
 		else
 			echo "  FAIL  read_pins: KINE_FLOORS '$KINE_FLOORS', KINE_RAISED '$KINE_RAISED'"; exit 1
 		fi
@@ -2014,13 +2027,13 @@ FAKE
 
 	echo "==> the build stamp of kine, etcd and etcdutl (go version -m captures; dep lists trimmed)"
 	local kind want fx2 fp fv lower
-	# The floors the kine fixture is captured at (every raised golang.org/x module);
+	# The floors the kine fixture is captured at (every raised module kine links);
 	# read_pins sets KINE_FLOORS from the source, and the read_pins check above
 	# proves that read.
 	# shellcheck disable=SC2016 # expanded by the inner shell
 	if [ -z "$(KINE_FLOORS='golang.org/x/net v0.0.1' bash -c '. "$1"; printf %s "$KINE_FLOORS"' _ "$HERE/lib/gochild.sh")" ]; then ok "an ambient KINE_FLOORS does not set the floors"; else bad "gochild.sh took KINE_FLOORS from the environment"; fi
-	KINE_FLOORS="golang.org/x/net v0.60.0 golang.org/x/crypto v0.58.0 golang.org/x/sys v0.49.0 golang.org/x/term v0.47.0 golang.org/x/text v0.43.0 golang.org/x/sync v0.24.0"
-	if out="$(buildinfo_problems kine v0.17.2 go1.27.3 <"$td/goversion-kine.txt")"; then ok "kine: all six raised modules linked at their floors pass"; else bad "kine: the six raised modules at their floors were refused: $out"; fi
+	KINE_FLOORS="golang.org/x/net v0.60.0 golang.org/x/crypto v0.58.0 golang.org/x/sys v0.49.0 golang.org/x/text v0.43.0 golang.org/x/sync v0.24.0 github.com/klauspost/compress v1.20.2"
+	if out="$(buildinfo_problems kine v0.17.2 go1.27.3 <"$td/goversion-kine.txt")"; then ok "kine: every linked raised module at its floor passes"; else bad "kine: the linked raised modules at their floors were refused: $out"; fi
 	local -a fl
 	read -ra fl <<<"$KINE_FLOORS"
 	local i
@@ -2042,6 +2055,7 @@ FAKE
 			if out="$(sed 's/\(golang\.org\/x\/net[[:space:]]\)v0\.60\.0/\1v0.61.0/' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.3)"; then ok "$kind: a newer x/net passes"; else bad "$kind: a newer x/net was refused: $out"; fi
 			if out="$(grep -v 'golang\.org/x/net' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.3)"; then bad "$kind: a build info without x/net passed"; elif grep_text "$out" -q "golang.org/x/net is not in the build info"; then ok "$kind: a missing x/net is reported"; else bad "$kind: missing x/net not named: $out"; fi
 			if out="$(grep -v 'golang\.org/x/sync' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.3)"; then bad "$kind: a build info without x/sync passed"; elif grep_text "$out" -q "golang.org/x/sync is not in the build info"; then ok "$kind: a missing raised x/sync is reported"; else bad "$kind: missing x/sync not named: $out"; fi
+			if grep -q 'golang\.org/x/term' "$fx2"; then bad "$kind: the fixture carries x/term, which kine does not link"; elif out="$(buildinfo_problems "$kind" "$want" go1.27.3 <"$fx2")"; then ok "$kind: a raised but unlinked module (x/term absent from the build info) is not reported"; elif grep_text "$out" -q "x/term"; then bad "$kind: the unlinked x/term was reported: $out"; else bad "$kind: capture without x/term rejected: $out"; fi
 			if out="$(KINE_FLOORS='' buildinfo_problems "$kind" "$want" go1.27.3 <"$fx2")"; then bad "$kind: passed with no raised-module floors set"; elif grep_text "$out" -q "no raised-module floors are set"; then ok "$kind: unset raised-module floors are refused"; else bad "$kind: unset floors not named: $out"; fi
 			if out="$(KINE_FLOORS='golang.org/x/net' buildinfo_problems "$kind" "$want" go1.27.3 <"$fx2")"; then bad "$kind: passed with a floor naming no version"; elif grep_text "$out" -q "malformed"; then ok "$kind: a floor list that is not path/version pairs is refused"; else bad "$kind: malformed floors not named: $out"; fi
 			;;
@@ -2074,7 +2088,7 @@ FAKE
 	(
 		KINE_VERSION=v0.17.2 KINE_VARIANT=nocgo+p3 KINE_PATCH=p3 ETCD_VERSION=v3.6.15 ETCD_VARIANT=nocgo GO="$fgo"
 		HELM_BINARY=helm-v4.3.1 HELM_VERSION=v4.3.1 HELM_VARIANT=nocgo+deps3 COMPRESS_RAISED=v1.20.2
-		KINE_FLOORS="golang.org/x/net v0.60.0 golang.org/x/crypto v0.58.0 golang.org/x/sys v0.49.0 golang.org/x/term v0.47.0 golang.org/x/text v0.43.0 golang.org/x/sync v0.24.0"
+		KINE_FLOORS="golang.org/x/net v0.60.0 golang.org/x/crypto v0.58.0 golang.org/x/sys v0.49.0 golang.org/x/text v0.43.0 golang.org/x/sync v0.24.0 github.com/klauspost/compress v1.20.2"
 		HELM_RAISED="golang.org/x/net@v0.62.0" HELM_COMMIT=c0d08d0d6d9424d4a14febb5e8a3e51b0dd00dff
 		printf 'mach-o...v4.3.1...c0d08d0d6d9424d4a14febb5e8a3e51b0dd00dff...\n' >"$cpd/helm-v4.3.1"; echo "v4.3.1 nocgo+deps3" >"$cpd/helm.version"
 		printf 'mach-o...v0.17.2+p3...\n' >"$cpd/kine"; echo "v0.17.2 nocgo+p3" >"$cpd/kine.version"

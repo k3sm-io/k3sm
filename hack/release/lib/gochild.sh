@@ -37,9 +37,13 @@ toolchain_problems() {
 }
 
 # KINE_FLOORS is the lowest version of each raised module a staged kine may
-# link, as space-separated "path version" pairs: golang.org/x/net and the
-# golang.org/x modules it requires, each at the version kine is built against
-# (internal/childreq). The caller sets it from that source after sourcing this
+# link, as space-separated "path version" pairs: golang.org/x/net, the
+# golang.org/x modules it requires that kine links, and
+# github.com/klauspost/compress, each at the version kine is built against
+# (internal/childreq). A floor is only for a module the binary links: Go writes
+# a `dep` line only for a module that supplies a linked package, so a raised
+# module kine does not link (x/term) would read as missing in every real build.
+# The caller sets it from that source after sourcing this
 # file (hack/release/stage.sh read_pins, the same read that records the raised
 # set); unset floors are themselves a problem for kine. It starts empty, never
 # from the environment, so an ambient KINE_FLOORS cannot lower the floors a
