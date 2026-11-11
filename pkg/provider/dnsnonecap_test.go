@@ -19,6 +19,7 @@ package provider
 import (
 	"context"
 	"errors"
+	"net/netip"
 	"slices"
 	"strings"
 	"testing"
@@ -50,6 +51,36 @@ func dnsEventsWith(events []string, substr string) []string {
 	return out
 }
 
+// darwinNetSplit runs each server of ns, deduped as parsed addresses (first seen
+// wins), through darwin-net's exported encoder one at a time: a server it keeps
+// comes back in K3SM_DNS_SERVERS in its form, a server it cannot serve is refused
+// with dns.ErrNoUsableNameserver. One at a time keeps every call within Validate's
+// cap; darwin-net's split is per server, so the order is what the list's is.
+func darwinNetSplit(t *testing.T, ns []string) (kept, dropped []string) {
+	t.Helper()
+	seen := make(map[string]struct{}, len(ns))
+	for _, s := range ns {
+		key := s
+		if addr, err := netip.ParseAddr(s); err == nil {
+			key = addr.Unmap().String()
+		}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		env, err := dns.ConfigToEnvChecked(netv1.DNSConfig{Policy: netv1.DNSPolicyNone, Nameservers: []string{s}})
+		switch {
+		case err == nil:
+			kept = append(kept, strings.Fields(env[dns.EnvDNSServers])...)
+		case errors.Is(err, dns.ErrNoUsableNameserver):
+			dropped = append(dropped, s)
+		default:
+			t.Fatalf("darwin-net ConfigToEnvChecked([%s]) err = %v, want nil or ErrNoUsableNameserver", s, err)
+		}
+	}
+	return kept, dropped
+}
+
 // TestDNSPolicyNoneCapKeepsIPv4Servers pins B1510: a dnsPolicy None pod's
 // nameservers are filtered to IPv4 BEFORE the netv1.MaxNameservers cap, so IPv6
 // servers listed first cannot crowd out the IPv4 servers the in-pod resolver can
@@ -61,7 +92,10 @@ func dnsEventsWith(events []string, substr string) []string {
 // Non-vacuity: on the pre-fix mapping (dedupe, cap, no family check) the
 // [v6, v6, v6, v4] pod is refused as all-IPv6 and its cap event names 1.1.1.1;
 // the mixed case runs on one IPv4 server instead of three; and the mapped config
-// carries IPv6 servers, so it disagrees with darwin-net's kept list.
+// carries IPv6 servers, so it disagrees with darwin-net's kept list. On the
+// mapping before this round, three zoned IPv6 servers ahead of an IPv4 one fill
+// the cap and the cap event names 1.1.1.1, and a mapped server past the cap is
+// named in its raw ::ffff: form.
 func TestDNSPolicyNoneCapKeepsIPv4Servers(t *testing.T) {
 	const (
 		v6a = "2606:4700:4700::1111"
@@ -75,17 +109,16 @@ func TestDNSPolicyNoneCapKeepsIPv4Servers(t *testing.T) {
 		searches []string
 		options  []corev1.PodDNSConfigOption
 		// wantServers is the mapped (and injected) nameserver list; nil means the
-		// pod is refused with msgDNSNoneIPv6Only.
+		// pod is refused: with msgDNSNoneIPv6Only, or, when wantRefusal is set,
+		// with a message containing it.
 		wantServers []string
+		wantRefusal string
 		wantPartial []string // DNSConfigPartial's dropped list; nil means no event
 		wantCapped  []string // the nameserver cap event's dropped list; nil means no event
 		wantSearch  string   // K3SM_DNS_SEARCH, when the pod runs
 		wantNdots   string   // K3SM_DNS_NDOTS, when the pod runs
 		wantOptions []netv1.DNSOption
 		wantNDots   int32
-		// darwinNet pins that dnsPolicyNoneConfig's IPv4 predicate agrees with
-		// darwin-net's (dns.ConfigToEnvChecked over the deduped raw list).
-		darwinNet bool
 	}{
 		{
 			name:        "three IPv6 then one IPv4 runs on the IPv4",
@@ -119,7 +152,6 @@ func TestDNSPolicyNoneCapKeepsIPv4Servers(t *testing.T) {
 			wantServers: []string{"1.1.1.1"},
 			wantPartial: []string{v6a},
 			wantSearch:  "", wantNdots: "5",
-			darwinNet: true,
 		},
 		{
 			name:        "duplicates are merged before the filter and the cap",
@@ -149,7 +181,26 @@ func TestDNSPolicyNoneCapKeepsIPv4Servers(t *testing.T) {
 			wantServers: []string{"8.8.8.8", "1.1.1.1"},
 			wantPartial: []string{v6d},
 			wantSearch:  "", wantNdots: "5",
-			darwinNet: true,
+		},
+		{
+			// Validate refuses a zoned address, so the first zoned server ends the
+			// list and the pod is refused on it, as before; it never fills the cap
+			// ahead of the IPv4 server, so no cap event names 1.1.1.1.
+			name:        "zoned IPv6 ahead of an IPv4 is refused by Validate on the zone",
+			ns:          []string{"fe80::1%en0", "fe80::2%en0", "fe80::3%en0", "1.1.1.1"},
+			wantRefusal: `nameserver "fe80::1%en0" must not carry a zone`,
+		},
+		{
+			name:        "an unparseable entry ahead of an IPv4 is refused by Validate",
+			ns:          []string{"not-an-ip", "1.1.1.1"},
+			wantRefusal: `nameserver "not-an-ip" is not an IP address`,
+		},
+		{
+			name:        "a mapped IPv4 past the cap is named in dotted form",
+			ns:          []string{"1.1.1.1", "8.8.8.8", "9.9.9.9", "::ffff:8.8.4.4"},
+			wantServers: []string{"1.1.1.1", "8.8.8.8", "9.9.9.9"},
+			wantCapped:  []string{"8.8.4.4"},
+			wantSearch:  "", wantNdots: "5",
 		},
 	}
 	for _, tc := range tests {
@@ -174,19 +225,17 @@ func TestDNSPolicyNoneCapKeepsIPv4Servers(t *testing.T) {
 				t.Errorf("forming droppedNameservers = %v, want %v (IPv4 past the cap only)", forming.droppedNameservers, tc.wantCapped)
 			}
 
-			if tc.darwinNet {
-				// The same raw list (no repeats, within the cap) through darwin-net's
-				// own IPv4 split: its kept servers are the mapping's, and the servers
-				// it drops are the ones DNSConfigPartial names.
-				env, err := dns.ConfigToEnvChecked(netv1.DNSConfig{Policy: netv1.DNSPolicyNone, Nameservers: tc.ns})
-				if !errors.Is(err, dns.ErrNameserversDropped) {
-					t.Fatalf("darwin-net ConfigToEnvChecked(%v) err = %v, want ErrNameserversDropped", tc.ns, err)
+			if tc.wantServers != nil {
+				// Every pod that runs: the deduped input through darwin-net's own
+				// IPv4 split, limited to the cap, is exactly what the mapping keeps,
+				// and what darwin-net drops is what DNSConfigPartial names.
+				kept, dropped := darwinNetSplit(t, tc.ns)
+				kept = kept[:min(len(kept), netv1.MaxNameservers)]
+				if !slices.Equal(kept, cfg.Nameservers) {
+					t.Errorf("darwin-net keeps %v, the k3sm mapping keeps %v; the predicates disagree", kept, cfg.Nameservers)
 				}
-				if got := strings.Fields(env[dns.EnvDNSServers]); !slices.Equal(got, cfg.Nameservers) {
-					t.Errorf("darwin-net keeps %v, the k3sm mapping keeps %v; the predicates disagree", got, cfg.Nameservers)
-				}
-				if got := eventDropList(err.Error()); !slices.Equal(got, tc.wantPartial) {
-					t.Errorf("darwin-net drops %v, want %v", got, tc.wantPartial)
+				if !slices.Equal(dropped, tc.wantPartial) {
+					t.Errorf("darwin-net drops %v, want %v", dropped, tc.wantPartial)
 				}
 			}
 
@@ -214,8 +263,14 @@ func TestDNSPolicyNoneCapKeepsIPv4Servers(t *testing.T) {
 				if err != nil {
 					t.Fatalf("GetPodStatus: %v", err)
 				}
-				if w := waitingOf(st, "c0"); w == nil || w.Reason != reasonCreateContainerConfigError || w.Message != msgDNSNoneIPv6Only {
-					t.Errorf("c0 waiting = %+v, want Waiting{CreateContainerConfigError, %q}", w, msgDNSNoneIPv6Only)
+				w := waitingOf(st, "c0")
+				switch {
+				case w == nil || w.Reason != reasonCreateContainerConfigError:
+					t.Errorf("c0 waiting = %+v, want Waiting{CreateContainerConfigError, ...}", w)
+				case tc.wantRefusal == "" && w.Message != msgDNSNoneIPv6Only:
+					t.Errorf("c0 waiting message = %q, want %q", w.Message, msgDNSNoneIPv6Only)
+				case tc.wantRefusal != "" && !strings.Contains(w.Message, tc.wantRefusal):
+					t.Errorf("c0 waiting message = %q, want it to contain %q", w.Message, tc.wantRefusal)
 				}
 			} else {
 				if box == nil {

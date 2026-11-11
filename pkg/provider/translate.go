@@ -572,9 +572,11 @@ func dnsConfigOverride(c *corev1.PodDNSConfig) (searches []string, ndots int32) 
 //     is resolving through it once), then filtered to IPv4 (the in-pod resolver
 //     serves IPv4 only; an IPv4-mapped address is kept in dotted form, as
 //     darwin-net's own split does), then capped at netv1.MaxNameservers, as the
-//     kubelet caps them. The IPv6 servers left out are recorded for
-//     DNSConfigPartial. A list with no IPv4 server keeps its IPv6 servers (capped),
-//     so the encoder refuses it as all-IPv6 (podDNSNoneEnv).
+//     kubelet caps them. The IPv4 servers past the cap are recorded in dotted
+//     form, and the IPv6 servers left out for DNSConfigPartial. A list with no
+//     IPv4 server keeps its IPv6 servers (capped), so the encoder refuses it as
+//     all-IPv6 (podDNSNoneEnv). An entry Validate refuses (not an address, or
+//     zoned) reached before the cap fills ends the list, so Validate refuses it.
 //   - SearchDomains are c.Searches capped at dns.MaxSearchDomains (the shim's
 //     limit; upstream allows 32). dns.ConfigToEnvChecked and
 //     dns.GuestResolvConfFields then sanitize them, as for every policy.
@@ -609,20 +611,27 @@ func dnsPolicyNoneConfig(c *corev1.PodDNSConfig) (netv1.DNSConfig, dnsNoneFormin
 		}
 		seen[key] = struct{}{}
 		// darwin-net's IPv4 predicate (Unmap().Is4()), applied before the cap so
-		// IPv6 servers listed first cannot crowd out the IPv4 ones. A server that
-		// is not a zoneless address stays, for Validate to refuse as before.
+		// IPv6 servers listed first cannot crowd out the IPv4 ones.
+		if err == nil && addr.Zone() == "" && !addr.Unmap().Is4() {
+			ipv6 = append(ipv6, ns)
+			continue
+		}
 		if err == nil && addr.Zone() == "" {
-			if !addr.Unmap().Is4() {
-				ipv6 = append(ipv6, ns)
-				continue
-			}
 			server = key
 		}
 		if len(cfg.Nameservers) == netv1.MaxNameservers {
-			forming.droppedNameservers = append(forming.droppedNameservers, ns)
+			forming.droppedNameservers = append(forming.droppedNameservers, server)
 			continue
 		}
 		cfg.Nameservers = append(cfg.Nameservers, server)
+		if err != nil || addr.Zone() != "" {
+			// An entry Validate refuses (not an address, or zoned) ends the list
+			// where it stands, so Validate refuses the config on it with the text
+			// it gives today, and it never counts toward the cap ahead of a usable
+			// IPv4 server. It is kept only where the cap was not yet full, which is
+			// where it was refused before; past the cap it is dropped as before.
+			break
+		}
 	}
 	if len(cfg.Nameservers) == 0 && len(ipv6) > 0 {
 		// All IPv6: keep them (capped), so dns.ConfigToEnvChecked refuses the config
