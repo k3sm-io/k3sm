@@ -2047,19 +2047,20 @@ func (r *runtimedRuntime) warnDNSConfigPartial(ctx context.Context, pod *corev1.
 	if pod.Spec.DNSPolicy != corev1.DNSNone {
 		return
 	}
-	dnsCfg, _ := r.podDNSConfig(pod)
-	_, err := dns.ConfigToEnvChecked(dnsCfg)
-	if !errors.Is(err, dns.ErrNameserversDropped) {
+	// The mapping filters IPv6 out before the cap, so the config holds only IPv4
+	// and the encoder can no longer name the drop: the mapping records it.
+	_, forming := dnsPolicyNoneConfig(pod.Spec.DNSConfig)
+	if len(forming.droppedIPv6) == 0 {
 		return
 	}
 	r.log.WarnContext(ctx, "dnsPolicy None pod lists IPv6 nameservers the in-pod resolver does not use",
-		"namespace", pod.Namespace, "name", pod.Name, "err", err)
-	r.recorder.Event(pod, corev1.EventTypeWarning, reasonDNSConfigPartial, msgDNSConfigPartial(err))
+		"namespace", pod.Namespace, "name", pod.Name, "dropped", forming.droppedIPv6)
+	r.recorder.Event(pod, corev1.EventTypeWarning, reasonDNSConfigPartial, msgDNSConfigPartial(forming.droppedIPv6))
 }
 
 // warnDNSConfigForming records one DNSConfigForming Warning Event per alteration
 // dnsPolicyNoneConfig made to a dnsPolicy None pod's dnsConfig to fit it:
-// nameservers beyond the cap, search domains beyond the cap, and ndots 0 applied
+// IPv4 nameservers beyond the cap, search domains beyond the cap, and ndots 0 applied
 // as 1. The reason is the kubelet's for a DNS config it altered; CreatePod calls
 // it once, at create.
 func (r *runtimedRuntime) warnDNSConfigForming(ctx context.Context, pod *corev1.Pod) {

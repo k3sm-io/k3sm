@@ -55,9 +55,11 @@ func (e *podDNSRefusal) Unwrap() error { return e.err }
 // config is refused rather than injected, so a caller that forgot the mapping
 // can never hand a None pod a cluster resolver or no resolver at all.
 //
-// A config with some IPv6 nameservers yields the env for the IPv4 subset
-// (dns.ErrNameserversDropped is not a refusal; buildBox reports the drop as a
-// DNSConfigPartial Event). A config with none (dns.ErrNoUsableNameserver) is
+// The None mapping already holds only IPv4 nameservers unless it has none, so
+// dns.ErrNameserversDropped is not expected here; it is still not a refusal (the
+// env is for the IPv4 subset), and the drop the mapping made is reported as a
+// DNSConfigPartial Event from dnsNoneForming. A config with no IPv4 nameserver
+// (dns.ErrNoUsableNameserver) is
 // refused with msgDNSNoneIPv6Only, and any other encoding error is refused with
 // its own text.
 func podDNSNoneEnv(dnsCfg netv1.DNSConfig) (map[string]string, error) {
@@ -158,10 +160,14 @@ func clusterDNSPolicy(policy corev1.DNSPolicy) bool {
 // make it fit, so the pod can be told (warnDNSConfigForming, kubelet's
 // DNSConfigForming). The zero value means nothing was altered.
 type dnsNoneForming struct {
-	// droppedNameservers are the nameservers beyond netv1.MaxNameservers, after
-	// duplicates were removed. A repeated nameserver is removed silently: it
-	// changes nothing about resolution.
+	// droppedNameservers are the IPv4 nameservers beyond netv1.MaxNameservers,
+	// after duplicates and IPv6 servers were removed. A repeated nameserver is
+	// removed silently: it changes nothing about resolution.
 	droppedNameservers []string
+	// droppedIPv6 are the IPv6 nameservers left out because the in-pod resolver
+	// serves IPv4 only, deduped, in pod order (warnDNSConfigPartial). It is empty
+	// when no IPv4 server is listed: that config is refused, not run partially.
+	droppedIPv6 []string
 	// droppedSearches are the search domains beyond dns.MaxSearchDomains.
 	droppedSearches []string
 	// ndotsZero is set when an explicit ndots:0 was applied as ndots 1.

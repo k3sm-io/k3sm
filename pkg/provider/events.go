@@ -403,12 +403,13 @@ func msgFailedPodHostname(e *podHostnameError) string {
 	return fmt.Sprintf("Failed to create pod sandbox: %s (%d characters): %v", e.field, e.length, e.err)
 }
 
-// msgDNSConfigPartial is the DNSConfigPartial-event message. cause is
-// dns.ConfigToEnvChecked's dns.ErrNameserversDropped error, which names the
-// dropped nameservers; they are the pod's own spec, so nothing beyond what the
-// pod's reader can already see is disclosed.
-func msgDNSConfigPartial(cause error) string {
-	return "k3sm: dnsPolicy None uses only the IPv4 nameservers (the in-pod resolver serves IPv4 nameservers only): " + cause.Error()
+// msgDNSConfigPartial is the DNSConfigPartial-event message. dropped are the IPv6
+// nameservers dnsPolicyNoneConfig left out (dnsNoneForming.droppedIPv6); they are
+// the pod's own spec, so nothing beyond what the pod's reader can already see is
+// disclosed.
+func msgDNSConfigPartial(dropped []string) string {
+	return "k3sm: dnsPolicy None uses only the IPv4 nameservers (the in-pod resolver serves IPv4 nameservers only): " +
+		dns.ErrNameserversDropped.Error() + ": " + strings.Join(dropped, ", ")
 }
 
 // msgDNSNdotsZero is the DNSConfigForming message for an ndots:0 applied as 1.

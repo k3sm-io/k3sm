@@ -569,8 +569,12 @@ func dnsConfigOverride(c *corev1.PodDNSConfig) (searches []string, ndots int32) 
 //   - Nameservers are c.Nameservers in order with repeats removed (first seen
 //     wins, compared as parsed addresses so "1.1.1.1" and "::ffff:1.1.1.1" are one
 //     server; netv1 Validate rejects a repeat, and resolving through a server twice
-//     is resolving through it once), then capped at netv1.MaxNameservers, as the
-//     kubelet caps them.
+//     is resolving through it once), then filtered to IPv4 (the in-pod resolver
+//     serves IPv4 only; an IPv4-mapped address is kept in dotted form, as
+//     darwin-net's own split does), then capped at netv1.MaxNameservers, as the
+//     kubelet caps them. The IPv6 servers left out are recorded for
+//     DNSConfigPartial. A list with no IPv4 server keeps its IPv6 servers (capped),
+//     so the encoder refuses it as all-IPv6 (podDNSNoneEnv).
 //   - SearchDomains are c.Searches capped at dns.MaxSearchDomains (the shim's
 //     limit; upstream allows 32). dns.ConfigToEnvChecked and
 //     dns.GuestResolvConfFields then sanitize them, as for every policy.
@@ -593,20 +597,41 @@ func dnsPolicyNoneConfig(c *corev1.PodDNSConfig) (netv1.DNSConfig, dnsNoneFormin
 		return cfg, forming
 	}
 	seen := make(map[string]struct{}, len(c.Nameservers))
+	var ipv6 []string
 	for _, ns := range c.Nameservers {
-		key := ns
-		if addr, err := netip.ParseAddr(ns); err == nil {
+		key, server := ns, ns
+		addr, err := netip.ParseAddr(ns)
+		if err == nil {
 			key = addr.Unmap().String()
 		}
 		if _, dup := seen[key]; dup {
 			continue
 		}
 		seen[key] = struct{}{}
+		// darwin-net's IPv4 predicate (Unmap().Is4()), applied before the cap so
+		// IPv6 servers listed first cannot crowd out the IPv4 ones. A server that
+		// is not a zoneless address stays, for Validate to refuse as before.
+		if err == nil && addr.Zone() == "" {
+			if !addr.Unmap().Is4() {
+				ipv6 = append(ipv6, ns)
+				continue
+			}
+			server = key
+		}
 		if len(cfg.Nameservers) == netv1.MaxNameservers {
 			forming.droppedNameservers = append(forming.droppedNameservers, ns)
 			continue
 		}
-		cfg.Nameservers = append(cfg.Nameservers, ns)
+		cfg.Nameservers = append(cfg.Nameservers, server)
+	}
+	if len(cfg.Nameservers) == 0 && len(ipv6) > 0 {
+		// All IPv6: keep them (capped), so dns.ConfigToEnvChecked refuses the config
+		// with dns.ErrNoUsableNameserver (msgDNSNoneIPv6Only) rather than with
+		// Validate's "requires at least one nameserver".
+		n := min(len(ipv6), netv1.MaxNameservers)
+		cfg.Nameservers = ipv6[:n:n]
+	} else {
+		forming.droppedIPv6 = ipv6
 	}
 	cfg.SearchDomains = c.Searches
 	if len(c.Searches) > dns.MaxSearchDomains {
