@@ -98,3 +98,18 @@ func TestGateAnswers502WhenTheUpstreamStalls(t *testing.T) {
 	}
 	assertUnavailable502(t, r)
 }
+
+// TestGateWriteErrorIs502WhenUpstreamIsDown: a loopback registry that is not
+// listening costs an authorized write a 502 UNAVAILABLE, not a hung request.
+func TestGateWriteErrorIs502WhenUpstreamIsDown(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	closed := ln.Addr().String()
+	_ = ln.Close()
+	front := upstreamGate(t, closed, 0)
+	r := rawDo(t, front, "PUT", "/v2/team/app/manifests/V1.0",
+		map[string]string{"Authorization": basic(tokTeam)}, "{}")
+	assertUnavailable502(t, r)
+}

@@ -40,7 +40,9 @@ TestFlatEndpointSlice kept the relay and cluster publication do not touch the ch
 TestFlatService kept the relay and cluster publication do not touch the child
 TestFlatServingSANs kept the relay and cluster publication do not touch the child
 TestGateAndServerAgree added new with the child switch
+TestGateAnswers502WhenTheUpstreamStalls added the gate's upstream has a response-header timeout
 TestGateRefusesLongLivedBuilderToken kept the push gate is unchanged
+TestGateWriteErrorIs502WhenUpstreamIsDown added an authorized write to a closed upstream is a 502
 TestGenerateCredential kept the credential files are unchanged
 TestHostingDocument kept the relay and cluster publication do not touch the child
 TestIsOrphanedChild added new with the child switch

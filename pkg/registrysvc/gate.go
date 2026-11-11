@@ -55,6 +55,17 @@ const (
 	codeUnavailable  = "UNAVAILABLE"
 )
 
+// gateUpstreamHeaderTimeout bounds how long the gate waits for the loopback
+// registry's response headers once a request, body included, has been written
+// (http.Transport.ResponseHeaderTimeout starts its clock only then, so a blob
+// streaming for minutes is not cut off). A registry that accepted the
+// connection and has not answered in this long is wedged: the client gets a
+// 502 and the relay slot is freed instead of held until the client gives up.
+// It is 30s rather than the dial's 1s because a final blob PUT or a manifest
+// PUT makes the registry verify the digest of what it stored before it
+// answers, which on a large layer is real work on this host.
+const gateUpstreamHeaderTimeout = 30 * time.Second
+
 // gate is the push gate's handler.
 type gate struct {
 	upstream string // the loopback registry, host:port
@@ -81,8 +92,8 @@ type gateConfig struct {
 	// transport.
 	Transport http.RoundTripper
 	// UpstreamHeaderTimeout bounds how long the loopback transport waits for
-	// the registry's response headers; zero means the default. It is ignored
-	// when Transport is set.
+	// the registry's response headers; zero means gateUpstreamHeaderTimeout.
+	// It is ignored when Transport is set.
 	UpstreamHeaderTimeout time.Duration
 }
 
@@ -94,6 +105,9 @@ func newGate(cfg gateConfig) *gate {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
+	if cfg.UpstreamHeaderTimeout <= 0 {
+		cfg.UpstreamHeaderTimeout = gateUpstreamHeaderTimeout
+	}
 	if cfg.Transport == nil {
 		d := &net.Dialer{Timeout: relayDialTimeout}
 		cfg.Transport = &http.Transport{
@@ -102,6 +116,7 @@ func newGate(cfg gateConfig) *gate {
 			MaxIdleConnsPerHost:   32,
 			IdleConnTimeout:       90 * time.Second,
 			ExpectContinueTimeout: 1 * time.Second,
+			ResponseHeaderTimeout: cfg.UpstreamHeaderTimeout,
 		}
 	}
 	g := &gate{upstream: cfg.Upstream, log: cfg.Logger, cred: cfg.Credential}
@@ -164,7 +179,7 @@ func (g *gate) modifyResponse(resp *http.Response) error {
 // connection without a response: what the raw relay did, and what a peer's
 // puller already reads as "this mirror does not have it".
 func (g *gate) readError(w http.ResponseWriter, r *http.Request, err error) {
-	g.log.Debug("ingest registry gate could not reach the local registry", "target", g.upstream, "err", err)
+	g.log.Warn("ingest registry gate could not reach the local registry", "target", g.upstream, "err", err)
 	if hj, ok := w.(http.Hijacker); ok {
 		if c, _, herr := hj.Hijack(); herr == nil {
 			_ = c.Close()
