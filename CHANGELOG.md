@@ -178,6 +178,38 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
 - Uninstall names a vm helper still running from a k3sm version the install no longer keeps. It
   does not signal that helper, and the error gives its process ID and the command to stop it by
   hand, `sudo kill -TERM -<pid>`, to run if `ps -o pid,command -g <pid>` shows only processes of the path the error names.
+- `k3sm model push [--variant <value>] <dir> <name>[:tag]` builds a ModelPack artifact from the files in a
+  directory and pushes it to the cluster registry as `models/<name>`, with one layer per file. The
+  directory is validated and hashed before the registry is contacted, so a code or pickle file is refused by
+  name and never read, and an incomplete split safetensors or GGUF set is refused. The same files give the
+  same digest, and the command prints the manifest digest and a pin. `k3sm model rm <name>[:tag]` removes
+  the tag. With `--variant`, the tag names an OCI image index with one entry per variant, for example `4bit`
+  or `8bit`; pushing a variant that is already there replaces its entry, and a tag that already names a
+  single manifest is refused rather than converted. `k3sm model ls` shows one row per variant. See
+  [Models in the cluster registry](docs/user/models.md).
+- An `MLXModel` can name its weights as an OCI artifact in the cluster registry with `spec.artifact`. The
+  operator resolves the tag to a manifest digest once per generation and records it in
+  `status.resolvedArtifact`, so every replica and rank serves the same bytes. The pod mounts the artifact
+  as a read-only image volume at `/var/lib/mlx/model`, with no cache claim and no download from the Hub, and
+  the model is served under the `MLXModel`'s own name. `spec.quantization` selects a variant when the
+  reference names an index; the operator reports `InvalidSpec` naming the variant when none or several
+  match, or when the reference and `spec.quantization` disagree. A reference off the cluster registry, a
+  digest not yet resolved, and `spec.model`, `spec.revision` or `spec.cache` beside `spec.artifact` are
+  refused. See [Models in the cluster registry](docs/user/models.md).
+- A Pod can mount an `image` volume from the cluster registry. The reference must name the cluster registry
+  (`registry-k3sm:6450/<repository>`); a mounted `image` volume that names any other registry, a bare name,
+  or a node that maps no cluster registry is refused before the Pod is created, with a Warning Event whose
+  reason is `ArtifactPullRefused`, so a Pod cannot make the node fetch from a host of its choosing.
+- A Pod that mounts a volume of a kind k3sm cannot provide, such as `hostPath`, `nfs`, `csi`, a generic
+  `ephemeral` volume or `gitRepo`, is now refused at creation with a Warning Event whose reason is
+  `FailedVolumeSource`, naming the volume and its kind. It used to start and then fail with `volume_mount
+  ... references undefined volume`. A volume no container mounts is still ignored. See
+  [Limitations](docs/user/limitations.md).
+- A node keeps its eviction, OOM kill, kernel kill and restart counts per band in `<work-dir>/budget/`,
+  mode 0700, so they survive a restart of the node daemon. It also keeps a bounded record of recent events,
+  from which the 1 hour and 24 hour windows are derived, and the node writes it again on a clean stop. A
+  container exit 137 that k3sm did not cause counts as a kernel kill. An unreadable history is moved aside and
+  restarts at zero. Nothing publishes these counts yet.
 
 ### Changed
 
@@ -264,6 +296,12 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
   on available memory on an 8 GiB Mac, where the 1 GiB floor still sets the rung, and a Pod
   annotated `budget.k3sm.io/band: batch` is refused for swap growth only from the higher critical
   rung.
+- The `k3sm image` verbs that move content (`load`, `import`, `push`, `pull` and `save`) no longer stop
+  after a fixed 30 minutes. They run with no overall deadline unless `--timeout` sets one, and a registry
+  request is abandoned once it has moved no byte, up or down, for 2 minutes, as is the daemon's export
+  stream when no frame arrives for the same time. The daemon-side pull reports no progress, so it alone
+  keeps a 30-minute ceiling. Ctrl-C and `SIGTERM` cancel the command. The metadata verbs keep their
+  2-minute deadline.
 
 ### Fixed
 
@@ -678,6 +716,49 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
 - A pod's address is no longer released from under a new create of the pod when the create that was
   held for its volume claims is refused. The new create now waits for the release, then allocates its
   own address. Before, the pod could run with no address reserved for it.
+- A server without `--mesh-ip` and with a non-loopback `--node-ip` now names that address in the
+  apiserver's serving certificate, so its own admin, scheduler and controller-manager clients no longer
+  fail TLS unless `--tls-san` repeats the address. The certificate is still issued by the existing cluster
+  CA.
+- A worker no longer advertises a WireGuard endpoint no peer can reach. The endpoint filter now refuses
+  the special-purpose blocks a Mac can hold an address in, among them the CLAT address `192.0.0.2`,
+  carrier-grade NAT, benchmarking, reserved, NAT64 and Teredo space, on join, resume, the server's
+  derivation and the periodic refresh. A worker whose control plane is unreachable derives no endpoint
+  instead of guessing from its interfaces, and when its probe connects, the probe's source address is
+  published on the first tick.
+- A sharded `MLXModel` on a Thunderbolt link is no longer placed before the nodes list the model, which
+  left a rank on a general interconnect slot that refused to start. The operator now writes
+  `ShardsPlaced=False` with the reason `AwaitingInterconnectSlot` and retries after 2 seconds until every
+  node lists the model. The interconnect resolver now also reacts to an `MLXModel` being added, deleted or
+  changed in generation, and a rank on the wrong slot is restarted as a placement error, not counted as a
+  cable loss.
+- A Pod with a readiness or startup probe is no longer published Ready before its probe has succeeded. A
+  status that arrives between the container starting and its prober registering now reads not Ready, and
+  not Started under a startup probe, as the kubelet does. A Pod with no probes, or only a liveness probe,
+  is unchanged.
+- `/usr/local/bin/k3sm` is now readable by the login user under a restrictive umask such as 077, on a
+  fresh install and when an existing correct link is kept on reinstall. It used to take the umask and
+  came out `lrwx------` root, so the login user could not resolve `k3sm`.
+- `k3sm install --start` over a node you stopped now flushes the `lo0` aliases of the Service range the old
+  install recorded, not the default range it had just rewritten. An in-place update that resets a
+  non-default Service range to the default now logs a warning naming the old and new range.
+- The root `lo0` alias sweep no longer widens to the host's own loopback
+  aliases when the recorded Service range is corrupt or planted, such as `0.0.0.0/0` or `127.0.0.0/8`. A
+  range that is not IPv4, is wider than a /12, or overlaps loopback, link-local, multicast or the
+  cluster pod range is refused with a warning, and only the pod range is flushed.
+- The install no longer follows a symlink swapped in for a root-owned directory between its check and its
+  `chown` and `chmod`. It opens the directory once without following links and applies both to that
+  descriptor, and a symlink or a non-directory there is refused with an error naming the path.
+- A FIFO planted at a registry blob's path no longer hangs a read waiting for a
+  writer. It is refused as not a regular file.
+- A refused manifest request on the k3sm registry server no longer carries the `Docker-Content-Digest` or
+  `ETag` header of a manifest it did not deliver.
+- A manifest the k3sm registry's referrers view cached as unreadable because of its blob file is read again
+  when that file changes, so a repaired manifest returns to the referrers list without waiting for the
+  repository's `index.json` to change.
+- Registry garbage collection now removes a repository directory a stopped removal left with only
+  `oci-layout` and empty `blobs/` and `.uploads/`, which no listing returned and no later sweep reaped. A
+  directory that holds a blob, an upload or an unrecognised file is left alone.
 
 ## v0.2.3 — 2026-10-29
 
