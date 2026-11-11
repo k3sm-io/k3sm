@@ -360,6 +360,21 @@ print(int(ready - created), int(t(st) - sched))
 ' "$1"
 }
 
+# pod_pick <pods.json> [uid]: `<name> <uid>` of the one listed pod, or of the one whose
+# uid is not the given one; anything but exactly one such pod is an error.
+pod_pick() {
+	py '
+import json, sys
+items = json.load(open(sys.argv[1])).get("items", [])
+skip = sys.argv[2] if len(sys.argv) > 2 else None
+c = [i["metadata"] for i in items if skip is None or i["metadata"].get("uid") != skip]
+if len(c) != 1:
+    print("%d pods match in the listing, want 1" % len(c))
+    sys.exit(1)
+print(c[0]["name"], c[0].get("uid", ""))
+' "$@"
+}
+
 # view_checks <view lines> <uid>: one view of the manifest on the node, each file a
 # clone of its blob: distinct inode, same device, same size and blocks, 0444, uid.
 # A line is `VIEWS <n>` or `F <rel> <ino> <dev> <blocks> <size> <mode> <uid> | <ino> <dev> <blocks> <size>`.
@@ -657,7 +672,7 @@ print(" ".join(t["key"] for t in d["spec"].get("taints", []) or [] if t.get("eff
 # ---- rungs ----------------------------------------------------------------------------
 
 t0() {
-	local v head c
+	local v head c dirty
 	v="$(ku "$SERVER" version 2>&1)" || { bad "k3sm version on the server: $(oneline "$v")"; return 1; }
 	VER_S="$v"
 	v="$(ku "$WORKER" version 2>&1)" || { bad "k3sm version on the worker: $(oneline "$v")"; return 1; }
@@ -671,14 +686,12 @@ t0() {
 		return 1
 	fi
 	c="$(version_commit "$VER_S")"
-	if [ -z "$c" ]; then
-		echo "the builds name no commit: the tree's HEAD is recorded, not compared"
-	elif [ "$head" = unknown ]; then
-		echo "the tree's HEAD is unknown: the builds' commit $c is recorded, not compared"
-	else
-		case "$head" in "$c"*) [ "${#c}" -ge 7 ] ;; *) false ;; esac ||
-			{ bad "the commit $c the builds carry is not the tree's HEAD $head"; return 1; }
-	fi
+	[ -n "$c" ] || { bad "the builds name no commit: the tree's HEAD $head cannot be compared"; return 1; }
+	[ "$head" != unknown ] || { bad "the tree's HEAD is unknown: the builds' commit $c cannot be compared"; return 1; }
+	case "$head" in "$c"*) [ "${#c}" -ge 7 ] ;; *) false ;; esac ||
+		{ bad "the commit $c the builds carry is not the tree's HEAD $head"; return 1; }
+	dirty="$(git -C "$REPO_ROOT" status --porcelain 2>&1)" || { bad "git status of the tree: $(oneline "$dirty")"; return 1; }
+	[ -z "$dirty" ] || { bad "the tree is dirty, so HEAD does not name the builds' source: $(oneline "$dirty")"; return 1; }
 	kc get nodes -o wide >"$EV/t.0.nodes" 2>&1 || { bad "kubectl get nodes"; return 1; }
 	BASE_S="$(df_read "$SERVER" "$SCACHE")" || { bad "free space of the server cache"; return 1; }
 	BASE_W="$(df_read "$WORKER" "$WCACHE")" || { bad "free space of the worker cache"; return 1; }
@@ -806,6 +819,11 @@ t3() {
 	measure cold_ready_seconds "${times% *}"
 	measure cold_fetch_window_seconds "${times#* }"
 	measure cold_fetch_bytes_per_second "$((MODEL_BYTES / (${times#* } > 0 ? ${times#* } : 1)))"
+	p="$(py 'import json,sys; print(json.load(open(sys.argv[1]))["items"][0]["metadata"]["name"])' "$EV/t.3.$MB.pods.json")"
+	kc get pod "$p" -n "$NS" -o json >"$EV/t.3.cold-pod.worker.json" || { bad "read $p"; return 1; }
+	times="$(pod_times "$EV/t.3.cold-pod.worker.json")" || { bad "the worker's cold pod has no Ready or start time"; return 1; }
+	measure cold_ready_seconds_worker "${times% *}"
+	measure cold_fetch_window_seconds_worker "${times#* }"
 	SIMG="$(py 'import json,sys; print(json.load(open(sys.argv[1]))["spec"]["containers"][0]["image"])' "$EV/t.3.cold-pod.json")"
 	sample_fp final
 	mem="$(quantity_bytes "$MEMORY")"
@@ -988,14 +1006,16 @@ print("HUB-CLEAN" if not dirty else "HUB-NOT-CLEAN %d" % len(dirty))
 '
 
 t5() {
-	local m pod node out first h cache errno rc copyrun
+	local m pod node out first h cache errno rc copyrun id
 	first="$(head -n 1 <<<"$FILES" | awk '{print $3}')"
 	for m in "$MA" "$MB"; do
-		pod="$m-0"
 		node="$SNODE"
 		[ "$m" = "$MA" ] || node="$WNODE"
 		kc get pods -n "$NS" -l "app.kubernetes.io/instance=$m" -o json >"$EV/t.5.$m.pods.json" || { bad "read $m pods"; return 1; }
 		out="$(pod_checks "$EV/t.5.$m.pods.json" "$DIGEST" "$node" 1)" || { bad "$m: $out"; return 1; }
+		id="$(pod_pick "$EV/t.5.$m.pods.json")" || { bad "$m: $id"; return 1; }
+		printf '%s\n' "$id" >"$EV/t.5.$m.pod"
+		pod="${id% *}"
 		# The public object first: the Pod spec sets the Hub offline; the exec'd
 		# process env below corroborates it.
 		out="$(pod_offline_env "$EV/t.5.$m.pods.json")" || { bad "$m: $out"; return 1; }
@@ -1044,7 +1064,7 @@ t5() {
 }
 
 t6() {
-	local d0 d1 p times out
+	local d0 d1 p times out id cold
 	d0="$(df_read "$SERVER" "$SCACHE")" || { bad "free space before the scale"; return 1; }
 	out="$(kc patch mlxmodel "$MA" -n "$NS" --type merge -p '{"spec":{"replicas":2}}' 2>&1)" || { bad "scale $MA: $out"; return 1; }
 	wait_ready "$MA" 2 || return 1
@@ -1056,7 +1076,11 @@ t6() {
 	view_read "$SERVER" "$SCACHE" "$EV/t.6.view.s" || { bad "read the server view"; return 1; }
 	out="$(view_checks "$EV/t.6.view.s" "$VIEW_UID")" || { bad "server view after the scale: $out"; return 1; }
 	[ "$(view_inodes "$EV/t.5.view.s")" = "$(view_inodes "$EV/t.6.view.s")" ] || { bad "the server's view was rebuilt for the second replica (inodes changed)"; return 1; }
-	p="$MA-1"
+	# The warm pod is the one listed now that is not t.3's cold pod.
+	cold="$(pod_pick "$EV/t.3.$MA.pods.json")" || { bad "t.3's $MA pod: $cold"; return 1; }
+	id="$(pod_pick "$EV/t.6.pods.json" "${cold#* }")" || { bad "the warm $MA pod: $id"; return 1; }
+	printf '%s\n' "$id" >"$EV/t.6.warm-pod.id"
+	p="${id% *}"
 	kc get pod "$p" -n "$NS" -o json >"$EV/t.6.warm-pod.json" || { bad "read $p"; return 1; }
 	times="$(pod_times "$EV/t.6.warm-pod.json")" || { bad "the warm pod has no Ready or start time"; return 1; }
 	measure warm_ready_seconds "${times% *}"
@@ -1143,8 +1167,18 @@ f1() {
 		if out="$(ku "$SERVER" model rm "$TAG" 2>&1)"; then
 			TAG_REMOVED=1
 		elif case "$out" in *"not in the cluster registry"*) true ;; *) false ;; esac; then
-			TAG_REMOVED=1
-			echo "f.1: $TAG is not in the registry (never written, or already removed)"
+			# A push that timed out may still commit after that answer: ask again one poll later.
+			sleep "$POLL"
+			if out="$(ku "$SERVER" model rm "$TAG" 2>&1)"; then
+				TAG_REMOVED=1
+				echo "f.1: $TAG was not in the registry, then was: removed on the retry (a push committed late)"
+			elif case "$out" in *"not in the cluster registry"*) true ;; *) false ;; esac; then
+				TAG_REMOVED=1
+				echo "f.1: $TAG is not in the registry, twice one poll apart (never written, or already removed)"
+			else
+				bad "f.1: model rm $TAG (retry): $out"
+				rc=1
+			fi
 		else
 			bad "f.1: model rm $TAG: $out"
 			rc=1
@@ -1384,8 +1418,9 @@ def reconcile(s):
                 commit(h, reg, s)
         ready = 0
         for i in range(rep):
-            pn = "%s-%d" % (name, i)
-            pk = ns + "/" + pn
+            # A non-ordinal name, as a ReplicaSet gives: the rig must read names from the listing.
+            pn = "%s-%s" % (name, hashlib.sha256(("%s/%d" % (name, i)).encode()).hexdigest()[:5])
+            pk = "%s/%s-%d" % (ns, name, i)
             p = s["pods"].get(pk)
             if p is None:
                 t = now()
@@ -1401,7 +1436,7 @@ def reconcile(s):
                 if "hub-env-missing" not in BRK:
                     env.append({"name": "HF_HUB_OFFLINE", "value": "1"})
                 p = {"apiVersion": "v1", "kind": "Pod",
-                     "metadata": {"name": pn, "namespace": ns, "creationTimestamp": t, "annotations": ann,
+                     "metadata": {"name": pn, "namespace": ns, "uid": hashlib.sha256(pk.encode()).hexdigest()[:32], "creationTimestamp": t, "annotations": ann,
                                   "labels": {"app.kubernetes.io/name": "mlx-model", "app.kubernetes.io/instance": name}},
                      "spec": {"nodeName": node, "volumes": vols, "containers": [{"name": "mlx-serve", "image": "fake/mlx:1", "args": args, "env": env}]},
                      "status": {"phase": "Pending", "conditions": [{"type": "PodScheduled", "status": "True", "lastTransitionTime": t}]}}
@@ -1537,7 +1572,7 @@ def kubectl(argv):
         else:
             out({"items": items})
     elif verb == "get" and pos[1] == "pod":
-        p = s["pods"].get(ns + "/" + pos[2])
+        p = next((x for x in s["pods"].values() if x["metadata"]["namespace"] == ns and x["metadata"]["name"] == pos[2]), None)
         if p is None:
             o = s["objs"].get("Pod/%s/%s" % (ns, pos[2]))
             if o is None:
@@ -1590,6 +1625,9 @@ def kubectl(argv):
         if flags.get("-c") != "mlx-serve":
             print("fake kubectl: exec into %s names no mlx-serve container" % pos[1], file=sys.stderr)
             rc = 1
+        elif not any(x["metadata"]["namespace"] == ns and x["metadata"]["name"] == pos[1] for x in s["pods"].values()):
+            print('Error from server (NotFound): pods "%s" not found' % pos[1], file=sys.stderr)
+            rc = 1
         elif "HUB-OFFLINE" in code:
             rc = hub_probe(pos[1], dash)
         elif "WRITE-" in code:
@@ -1626,8 +1664,8 @@ def k3sm(argv):
         if ("version-mismatch" in BRK and HOST != SRV) or ("version-local-mismatch" in BRK and here):
             v = "v0.0.0-other"
         print("k3sm " + v)
-        if "version-commit" in BRK:
-            print("  commit:        " + "0" * 40)
+        if "version-no-commit" not in BRK:
+            print("  commit:        " + ("0" if "version-commit" in BRK else "a") * 40)
         print("  platform:      " + ("darwin/amd64" if here else "darwin/arm64"))
         return 0
     if argv[:2] == ["model", "push"]:
@@ -1659,6 +1697,11 @@ def k3sm(argv):
         return 0
     if argv[:2] == ["model", "rm"]:
         reg = jload("reg.json", None)
+        late = os.path.join(ST, "rm-late-answered")
+        if "rm-late-commit" in BRK and not os.path.exists(late):
+            open(late, "w").close()
+            print("k3sm model: rm %s: not in the cluster registry" % argv[2], file=sys.stderr)
+            return 1
         if reg is None or not reg["tagged"]:
             print("k3sm model: rm %s: not in the cluster registry" % argv[2], file=sys.stderr)
             return 1
@@ -1722,6 +1765,18 @@ def main():
         return 0
     if tool == "tmutil":
         return 0
+    if tool == "git":
+        if "rev-parse" in argv:
+            if "head-unknown" in BRK:
+                print("fatal: not a git repository", file=sys.stderr)
+                return 128
+            print("a" * 40)
+            return 0
+        if "status" in argv:
+            if "dirty-tree" in BRK:
+                print(" M hack/acceptance/B1372.sh")
+            return 0
+        return 2
     if tool == "pgrep":
         s = jload("k8s.json", {"pods": {}})
         node = NODES[HOST][0]
@@ -1738,7 +1793,7 @@ def main():
 
 sys.exit(main())
 PY
-	for t in kubectl k3sm launchctl df tmutil pgrep footprint; do
+	for t in kubectl k3sm launchctl df tmutil pgrep footprint git; do
 		printf '#!/bin/sh\nexec python3 -I %q %s "$@"\n' "$fpy" "$t" >"$bin/$t"
 		chmod +x "$bin/$t"
 	done
@@ -1846,20 +1901,24 @@ self_test() {
 	for out in t.0 t.1 t.2 t.3 t.3b t.4 t.5 t.6 t.7 f.1 t.8; do has "happy: $out passed" "$(cat "$RUN_DIR/out")" "$out: PASS"; done
 	has "happy: cold rate recorded" "$(cat "$RUN_DIR/ev/measurements.tsv")" cold_fetch_bytes_per_second
 	has "happy: warm time recorded" "$(cat "$RUN_DIR/ev/measurements.tsv")" warm_ready_seconds
+	has "happy: worker cold ready recorded" "$(cat "$RUN_DIR/ev/measurements.tsv")" "$(printf 'cold_ready_seconds_worker\t')"
+	has "happy: worker cold fetch window recorded" "$(cat "$RUN_DIR/ev/measurements.tsv")" "$(printf 'cold_fetch_window_seconds_worker\t')"
+	has "happy: t.5 names its pod from the listing" "$(cat "$RUN_DIR/ev/"t.5.*.pod 2>/dev/null)" "$(py 'import json,sys; i=json.load(open(sys.argv[1]))["items"][0]["metadata"]; print(i["name"], i["uid"])' "$(printf '%s\n' "$RUN_DIR/ev/"t.5.*.pods.json | head -n 1)")"
+	has "happy: t.6 names the warm pod from the listing" "$(cat "$RUN_DIR/ev/t.6.warm-pod.id" 2>/dev/null)" " "
 	has "happy: footprint vs memory" "$(cat "$RUN_DIR/ev/measurements.tsv")" peak_footprint_over_spec_memory
 	[ "$(grep -Ec '^# [0-9]+ sample [^ ]+ bytes=[0-9]+$' "$RUN_DIR/ev/t.3.footprint")" -ge 2 ] || { echo "self-test FAIL: happy: t.3.footprint does not keep every sample"; bad=1; }
 	[ ! -e "$RUN_DIR/ev/t.3.footprint.sample" ] || { echo "self-test FAIL: happy: a footprint sample file is left"; bad=1; }
 	has "happy: the copied-file outcome recorded" "$(cat "$RUN_DIR/ev/measurements.tsv")" "$(printf 'copied_chmod_x_file\tCOPYRUN-RAN')"
-	has "happy: the Hub probe ran in the pod" "$(cat "$RUN_DIR/ev/"t.5.*-0.hub)" "HUB-OFFLINE 1"
-	has "happy: the Hub cache read under the pod" "$(cat "$RUN_DIR/ev/"t.5.*-0.hub)" "HUB-CACHE ./models/hub absent"
-	has "happy: the serving log recorded" "$(cat "$RUN_DIR/ev/"t.5.*-0.serve.log)" "INFO serving on"
-	if grep -q 'decoy' "$RUN_DIR/ev/"t.5.*-0.hub; then echo "self-test FAIL: happy: the Hub walk entered the weights mount"; bad=1; fi
+	has "happy: the Hub probe ran in the pod" "$(cat "$RUN_DIR/ev/"t.5.*.hub)" "HUB-OFFLINE 1"
+	has "happy: the Hub cache read under the pod" "$(cat "$RUN_DIR/ev/"t.5.*.hub)" "HUB-CACHE ./models/hub absent"
+	has "happy: the serving log recorded" "$(cat "$RUN_DIR/ev/"t.5.*.serve.log)" "INFO serving on"
+	if grep -q 'decoy' "$RUN_DIR/ev/"t.5.*.hub; then echo "self-test FAIL: happy: the Hub walk entered the weights mount"; bad=1; fi
 	has "happy: the kickstart landed" "$(cat "$RUN_DIR/state/calls")" "wrk launchctl kickstart -k system/io.k3sm.agent"
 
 	# Each rung's failure is caught, the run is red naming it, and f.1 still cleans.
 	local row brk rung
 	for row in \
-		"version-fails|t.0" "version-mismatch|t.0" "version-local-mismatch|t.0" "version-commit|t.0" "push-digest|t.1" "push-bytes|t.1" "apply-refused|t.2" "create-refused|t.2" \
+		"version-fails|t.0" "version-mismatch|t.0" "version-local-mismatch|t.0" "version-commit|t.0" "version-no-commit|t.0" "head-unknown|t.0" "dirty-tree|t.0" "push-digest|t.1" "push-bytes|t.1" "apply-refused|t.2" "create-refused|t.2" \
 		"resolved-mismatch|t.3" "pvc|t.3" "egress-annotation|t.3" "trust-remote-code|t.3" \
 		"no-partial|t.3b" "kick-truncates|t.3b" "empty-completion|t.4" \
 		"hub-online|t.5" "hub-cache-full|t.5" "hub-fetch|t.5" "hub-env-missing|t.5" "egress-late|t.5" \
@@ -1889,7 +1948,7 @@ self_test() {
 	reason hub-cache-env "the Hub cache is not empty or the tree shows a Hub fetch: HUB-DIRTY cache ./mst-elsewhere/hub"
 	reason hub-log "the serving log names huggingface.co: INFO GET https://huggingface.co/"
 	reason serve-log-empty "the serving log is empty"
-	has "hub-log: the serving log is kept" "$(cat "$t/runs/hub-log/ev/"t.5.*-0.serve.log 2>/dev/null)" "huggingface.co"
+	has "hub-log: the serving log is kept" "$(cat "$t/runs/hub-log/ev/"t.5.*.serve.log 2>/dev/null)" "huggingface.co"
 
 	# t.0 names all three builds when they differ, the pushing binary's included.
 	reason0() { has "$1: t.0 reason" "$(awk -F '\t' '$1 == "t.0" && $2 == "FAIL"' "$t/runs/$1/ev/result.tsv" 2>/dev/null)" "$2"; }
@@ -1898,15 +1957,23 @@ self_test() {
 	reason0 version-mismatch "pushing binary [k3sm v0.0.0-fake"
 	reason0 version-local-mismatch "pushing binary [k3sm v0.0.0-other"
 	reason0 version-commit "is not the tree's HEAD"
+	reason0 version-no-commit "the builds name no commit"
+	reason0 head-unknown "the tree's HEAD is unknown"
+	reason0 dirty-tree "the tree is dirty"
 	has "happy: the pushing binary's version recorded" "$(cat "$t/runs/happy/ev/t.0.versions")" "pushing binary"
 	# t.8 states the rig's end state in one line.
-	has "happy: t.8 end state" "$(cat "$t/runs/happy/out")" "end state: the rig is left on k3sm v0.0.0-fake; node-s Ready=True, node-w Ready=True"
+	has "happy: t.8 end state" "$(cat "$t/runs/happy/out")" "end state: the rig is left on k3sm v0.0.0-fake (commit $(printf 'a%.0s' $(seq 40))); node-s Ready=True, node-w Ready=True"
 
 	# A call that times out after the server acted still gets cleaned up.
 	FR_STEP=2 fake_run push-hang push-hang 1 "result: FAIL (t.1)"
 	cleaned push-hang
 	FR_STEP=2 fake_run create-hang create-hang 1 "result: FAIL (t.2)"
 	cleaned create-hang
+
+	# A push that timed out can commit after f.1's first rm said not-in-registry: the retry removes it.
+	fake_run rm-late-commit rm-late-commit,apply-refused 1 "result: FAIL (t.2)"
+	cleaned rm-late-commit
+	has "rm-late-commit: the retry is logged" "$(cat "$RUN_DIR/ev/f.1.log")" "removed on the retry"
 
 	# A cleanup that cannot remove the namespace fails a run whose rungs all passed.
 	fake_run ns-stuck ns-stuck 1 "f.1: FAIL"
