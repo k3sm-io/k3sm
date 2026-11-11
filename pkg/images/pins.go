@@ -39,14 +39,14 @@ const (
 	Buildkitd = "ghcr.io/k3sm-io/mirror/buildkit@sha256:99368f3e46177c6405b9740e4461d91cee004128daeecca78d4ceac50ec1da5c"
 
 	// DebianToolchain is the guest-kernel build toolchain image: the mirror of the
-	// upstream debian trixie-20261005-slim release index, byte-identical, so the
+	// upstream debian trixie-20261027-slim release index, byte-identical, so the
 	// digest is upstream's own. Consumed by runtimed/hack/guest-kernel/build.sh
 	// (which pins the linux/arm64 platform manifest recorded in mirror.yaml under
 	// this index) — a build-time dependency, never pulled by product code.
 	// That recipe pin deliberately lags this one: each kernel release pins its own
 	// toolchain digest and records it in the release's source note, so a build.sh digest
 	// older than mirror.yaml's is designed lag, not drift.
-	DebianToolchain = "ghcr.io/k3sm-io/mirror/debian@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f"
+	DebianToolchain = "ghcr.io/k3sm-io/mirror/debian@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4"
 )
 
 // Pin is one digest-pinned image constant, named so it can be matched against the
