@@ -183,7 +183,7 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
   directory is validated and hashed before the registry is contacted, so a code or pickle file is refused by
   name and never read, and an incomplete split safetensors or GGUF set is refused. The same files give the
   same digest, and the command prints the manifest digest and a pin. `k3sm model rm <name>[:tag]` removes
-  the tag. With `--variant`, the tag names an OCI image index with one entry per variant, for example `4bit`
+  the tag; run it on the server as root, because it needs the server's push credential. With `--variant`, the tag names an OCI image index with one entry per variant, for example `4bit`
   or `8bit`; pushing a variant that is already there replaces its entry, and a tag that already names a
   single manifest is refused rather than converted. `k3sm model ls` shows one row per variant. See
   [Models in the cluster registry](docs/user/models.md).
@@ -195,24 +195,26 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
   reference names an index; the operator reports `InvalidSpec` naming the variant when none or several
   match, or when the reference and `spec.quantization` disagree. A reference off the cluster registry, a
   digest not yet resolved, and `spec.model`, `spec.revision` or `spec.cache` beside `spec.artifact` are
-  refused. See [Models in the cluster registry](docs/user/models.md).
+  refused. `spec.artifact.variant` is refused for now. See [Models in the cluster registry](docs/user/models.md).
 - A Pod can mount an `image` volume from the cluster registry. The reference must name the cluster registry
   (`registry-k3sm:6450/<repository>`); a mounted `image` volume that names any other registry, a bare name,
   or a node that maps no cluster registry is refused before the Pod is created, with a Warning Event whose
   reason is `ArtifactPullRefused`, so a Pod cannot make the node fetch from a host of its choosing.
+- A node started by `k3sm server` or `k3sm agent` keeps its eviction, OOM kill, kernel kill and restart
+  counts per band in `<work-dir>/budget/`, mode 0700, so they survive a restart of the node daemon. A
+  standalone `k3sm node` keeps no history. It also keeps a bounded record of recent events,
+  from which the 1 hour and 24 hour windows are derived, and the node writes it again on a clean stop. A
+  container exit 137 that k3sm did not cause counts as a kernel kill, so a pod killing its own process also
+  counts. An unreadable history is moved aside and restarts at zero. If the directory cannot be written, the
+  counts are kept in memory only and restart at zero. Nothing publishes these counts yet.
+
+### Changed
+
 - A Pod that mounts a volume of a kind k3sm cannot provide, such as `hostPath`, `nfs`, `csi`, a generic
   `ephemeral` volume or `gitRepo`, is now refused at creation with a Warning Event whose reason is
   `FailedVolumeSource`, naming the volume and its kind. It used to start and then fail with `volume_mount
   ... references undefined volume`. A volume no container mounts is still ignored. See
   [Limitations](docs/user/limitations.md).
-- A node keeps its eviction, OOM kill, kernel kill and restart counts per band in `<work-dir>/budget/`,
-  mode 0700, so they survive a restart of the node daemon. It also keeps a bounded record of recent events,
-  from which the 1 hour and 24 hour windows are derived, and the node writes it again on a clean stop. A
-  container exit 137 that k3sm did not cause counts as a kernel kill. An unreadable history is moved aside and
-  restarts at zero. Nothing publishes these counts yet.
-
-### Changed
-
 - A Pod with `dnsPolicy: None` now resolves through its own `dnsConfig`: its IPv4 nameservers
   (up to three), `searches` and `ndots`, natively and in a `vm` guest, with no fallback to the host
   resolver. It used to resolve through the host and ignore its `dnsConfig`. IPv6 nameservers are
@@ -418,7 +420,6 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
   it as untagged, until prune or the registry's garbage collection removes it.
 - A Pod force-deleted and re-created under the same name before the node synced the delete is now replaced at once: the old Pod stops first, with its preStop hooks and grace period, then the new one starts. Before, the old Pod ran on until the orphan reaper removed it, up to about three minutes, and a new Pod with an identical spec could stay Pending.
 - A `vm` image with paths differing only by case now gets a refusal naming both paths and the fix on a case-insensitive data root, and is refused rather than merged when cloned into a case-insensitive pod rootfs.
-- A `vm` Pod's probes now end when its delete starts, so none runs during `preStop` or while the guest stops. Its relay closes before the guest gets `SIGTERM` and stays closed. It used to close part-way through the grace period and could reopen briefly once the guest had stopped, onto an address macOS may give to another guest. A connection through the relay no longer drains during the grace period. A native Pod's probes are unchanged.
 - A `vm` Pod's probes now end when its delete starts, so none runs during `preStop` or while the guest stops. Its relay now stays up until the guest has stopped, so connections through it can drain and new dials still land during the grace period, then closes once and cannot reopen. It used to close part-way through the grace period and could reopen briefly once the guest had stopped, onto an address macOS may give to another guest. A native Pod's probes are unchanged.
 - The registry now checks a caller's access before it reads the digest or upload id in the request, so
   a caller who may not read or write a repository gets the same 401 or 403 for a malformed digest or
@@ -459,7 +460,6 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
   blobs now has to push the blobs first. A descriptor's inline `data` is not honoured: the blob must be in
   the repository, the empty descriptor's included. An index's children and a manifest's subject still need
   not be present; the PUT restarts the garbage collection grace of those that are, on a best-effort basis.
-- A pod whose create failed and which was then deleted no longer keeps its address and references until the node restarts. The orphan reaper releases them once the apiserver has stopped holding the pod.
 - A pod whose create failed and which was then deleted no longer keeps its address and references until the node restarts. The orphan reaper releases them, and removes the pod's log directory, once the apiserver has stopped holding the pod.
 - A pod created under the name of one the node is still finishing a delete for now starts. It could be sent to update the old pod instead, and be left with an address nothing owned or fail for good.
 - A create the runtime refuses after a second create of the same pod took over no longer takes that pod's address and log directory while it runs.
@@ -716,8 +716,8 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
 - A pod's address is no longer released from under a new create of the pod when the create that was
   held for its volume claims is refused. The new create now waits for the release, then allocates its
   own address. Before, the pod could run with no address reserved for it.
-- A server without `--mesh-ip` and with a non-loopback `--node-ip` now names that address in the
-  apiserver's serving certificate, so its own admin, scheduler and controller-manager clients no longer
+- The apiserver's serving certificate now names the node IP, unless it is loopback, link-local, multicast
+  or unspecified, whether or not `--mesh-ip` is set. For a server without `--mesh-ip` this matters because its own admin, scheduler and controller-manager clients no longer
   fail TLS unless `--tls-san` repeats the address. The certificate is still issued by the existing cluster
   CA.
 - A worker no longer advertises a WireGuard endpoint no peer can reach. The endpoint filter now refuses
