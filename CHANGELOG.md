@@ -276,9 +276,11 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
   the kubeconfig they checked. `k3sm kubectl`, the builder verbs and `k3sm interconnect` (including
   its `--kubeconfig` path) check every cluster and user in the file, since you can pick any of them;
   `k3sm status` and the other read-only commands check only the context they use, and their copy
-  holds only that context, so another cluster's `exec` user does not stop them. `k3sm kubeconfig --write` also refuses to merge into a symlink or
-  another account's file. Flags you type on the `k3sm kubectl` command line (for example a different
-  `--kubeconfig` path) are your own choice and are not checked.
+  holds only that context, so another cluster's `exec` user does not stop them.
+  `k3sm kubeconfig --write` also refuses to merge into a symlink or another account's file. When a
+  command refuses your kubeconfig, run it without `sudo`, or remove the named field; see
+  [kubectl access](docs/user/kubectl-access.md). Flags you type on the `k3sm kubectl` command line
+  (for example a different `--kubeconfig` path) are your own choice and are not checked.
 - A server whose control plane does not report healthy in time while the Mac is heavily loaded no
   longer parks on the crash-loop breaker after five attempts. It backs off instead, from 30 seconds
   doubling up to 10 minutes, `k3sm status` shows when the next attempt starts and that an attempt
