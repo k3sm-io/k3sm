@@ -153,6 +153,26 @@ func TestRefusalEventMessageIsBoundedAndVerbatim(t *testing.T) {
 			message: strings.Repeat("a", 999) + strings.Repeat("\u00e9", 100),
 			want:    strings.Repeat("a", 999),
 		},
+		{name: "exactly at the bound", message: strings.Repeat("a", 1000), want: strings.Repeat("a", 1000)},
+		{name: "one byte over the bound", message: strings.Repeat("a", 1001), want: strings.Repeat("a", 1000)},
+		{
+			// U+20AC is three bytes at 998..1000: the cut backs off to 998.
+			name:    "three-byte rune straddling the bound",
+			message: strings.Repeat("a", 998) + "€",
+			want:    strings.Repeat("a", 998),
+		},
+		{
+			// U+1F600 is four bytes at 997..1000: the cut backs off to 997.
+			name:    "four-byte rune straddling the bound",
+			message: strings.Repeat("a", 997) + "\U0001F600",
+			want:    strings.Repeat("a", 997),
+		},
+		{
+			// U+1F600 at 999..1002: byte 1000 is its second byte.
+			name:    "four-byte rune starting just under the bound",
+			message: strings.Repeat("a", 999) + "\U0001F600",
+			want:    strings.Repeat("a", 999),
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
