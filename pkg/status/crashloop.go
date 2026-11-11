@@ -158,6 +158,18 @@ func ClassifyCrashLoop(rec executor.CrashRecord, readErr error, path string, now
 			LeaderLost: lostNote,
 		}
 	}
+	if rec.SlowStreak > 0 {
+		// The backoff is over and the next attempt is running (or about to): the
+		// streak is still live until that attempt reaches healthz, so the row
+		// keeps saying so instead of going quiet mid-attempt.
+		return CrashLoopVerdict{
+			Posture: PostureRestarting,
+			Detail: fmt.Sprintf("bring-up attempt %d in progress: %d consecutive bring-ups timed out while the host was under pressure; parks at %d",
+				rec.SlowStreak+1, rec.SlowStreak, executor.BringUpSlowStreakLimit),
+			Remedy:     "uptime; memory_pressure   # what is loading the host?",
+			LeaderLost: lostNote,
+		}
+	}
 	return CrashLoopVerdict{Posture: PostureQuiet, LeaderLost: lostNote}
 }
 

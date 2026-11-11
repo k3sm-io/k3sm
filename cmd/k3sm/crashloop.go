@@ -43,12 +43,13 @@ const crashLoopPollInterval = 5 * time.Second
 type crashBreaker struct {
 	path string
 	now  func() time.Time
-	// pressure reads whether the host is under load at the moment a bring-up's
-	// apiserver health wait ran out (executor.HostUnderPressure); after is the
+	// pressure reads whether the host is under sustained load at the moment a
+	// bring-up's apiserver health wait ran out (executor.HostUnderPressure), and
+	// the sampled load the record's Detail carries; after is the
 	// slow bring-up backoff's timer, nil in production (a stoppable time.Timer,
 	// so a cancelled wait does not leak one). Both are seams so a test fakes the
 	// host and the clock.
-	pressure func() (bool, error)
+	pressure func() (bool, string, error)
 	after    func(time.Duration) <-chan time.Time
 	logger   *slog.Logger
 
@@ -118,19 +119,21 @@ func (b *crashBreaker) recordBringUpSlow(component, detail string) (tripped bool
 }
 
 // slowUnderPressure reports whether a bring-up error is an apiserver health
-// timeout that happened while the host was under pressure, sampled now, at the
-// moment of the timeout. A pressure read that fails is "not slow": the failure
-// is then counted exactly as it was before the backoff existed.
-func (b *crashBreaker) slowUnderPressure(err error) bool {
+// timeout that happened while the host was under sustained pressure, sampled
+// now, at the moment of the timeout, and returns the sampled load for the
+// record's Detail whichever way it judged ("" when it did not sample). A
+// pressure read that fails is "not slow": the failure is then counted exactly
+// as it was before the backoff existed.
+func (b *crashBreaker) slowUnderPressure(err error) (slow bool, reading string) {
 	if !errors.Is(err, executor.ErrAPIServerHealthTimeout) || b.pressure == nil {
-		return false
+		return false, ""
 	}
-	pressured, perr := b.pressure()
+	pressured, reading, perr := b.pressure()
 	if perr != nil {
 		b.logger.Warn("could not read host pressure; counting the bring-up timeout as a failure", "err", perr)
-		return false
+		return false, ""
 	}
-	return pressured
+	return pressured, reading
 }
 
 // noteBringUpHealthy ends the slow streak once a bring-up reached healthz. It
@@ -309,10 +312,15 @@ func noteBringUpFailure(stop context.Context, b *crashBreaker, logger *slog.Logg
 	if skipCancelledByStop(stop, logger, component, err) {
 		return
 	}
-	if b.slowUnderPressure(err) {
+	slow, reading := b.slowUnderPressure(err)
+	detail := err.Error()
+	if reading != "" {
+		detail += "; " + reading
+	}
+	if slow {
 		logger.Warn("the control plane did not come up in time while the host was under pressure; backing off instead of counting it",
-			"component", component, "err", err, "limit", executor.BringUpSlowStreakLimit)
-		if b.recordBringUpSlow(component, err.Error()) {
+			"component", component, "err", err, "load", reading, "limit", executor.BringUpSlowStreakLimit)
+		if b.recordBringUpSlow(component, detail) {
 			logger.Error("crash-loop breaker tripped: the host stayed under pressure for too many slow bring-ups; the next start will park until an operator clears the record",
 				"path", b.path, "remedy", executor.BringUpSlowRemedy)
 		}
@@ -320,7 +328,7 @@ func noteBringUpFailure(stop context.Context, b *crashBreaker, logger *slog.Logg
 	}
 	logger.Error("the control plane did not come up; recording it on the crash-loop breaker",
 		"component", component, "err", err)
-	if b.recordBringUp(component, err.Error()) {
+	if b.recordBringUp(component, detail) {
 		logger.Error("crash-loop breaker tripped; the next start will park until an operator clears the record",
 			"path", b.path, "threshold", executor.CrashLoopThreshold, "window", executor.CrashLoopWindow)
 	}

@@ -2370,6 +2370,23 @@ func TestUninstallIdempotent(t *testing.T) {
 		"RemoveAll:/Library/LaunchDaemons/io.k3sm.server.plist",
 		"Bootout:io.k3sm.netd",
 		"RemoveAll:/Library/LaunchDaemons/io.k3sm.netd.plist",
+		// The kept control-plane log generations, after the server is booted
+		// out (it is their only writer); the live logs stay.
+		"RemoveAll:/var/lib/k3sm/server/kube-controller-manager.log.2",
+		"RemoveAll:/var/lib/k3sm/server/kube-controller-manager.log.1.pinned",
+		"RemoveAll:/var/lib/k3sm/server/kube-controller-manager.log.1",
+		"RemoveAll:/var/lib/k3sm/server/kube-scheduler.log.2",
+		"RemoveAll:/var/lib/k3sm/server/kube-scheduler.log.1.pinned",
+		"RemoveAll:/var/lib/k3sm/server/kube-scheduler.log.1",
+		"RemoveAll:/var/lib/k3sm/server/kube-apiserver.log.2",
+		"RemoveAll:/var/lib/k3sm/server/kube-apiserver.log.1.pinned",
+		"RemoveAll:/var/lib/k3sm/server/kube-apiserver.log.1",
+		"RemoveAll:/var/lib/k3sm/server/etcd.log.2",
+		"RemoveAll:/var/lib/k3sm/server/etcd.log.1.pinned",
+		"RemoveAll:/var/lib/k3sm/server/etcd.log.1",
+		"RemoveAll:/var/lib/k3sm/server/kine.log.2",
+		"RemoveAll:/var/lib/k3sm/server/kine.log.1.pinned",
+		"RemoveAll:/var/lib/k3sm/server/kine.log.1",
 		// A joining HA server's staged server-class join token, removed in the
 		// same position as the admin token below and for the same reason; on a
 		// server that never joined, removing an absent file is a no-op.
@@ -3088,6 +3105,11 @@ func TestUninstallManifestCoversInstall(t *testing.T) {
 			for _, name := range []string{MeshClaimsRecordName, ServicesRecordName, RegistryStateRecordName} {
 				created[filepath.Join(dc.serverWorkDir(), name)] = true
 				created[filepath.Join(StateStatus.Path(dc.DataRoot), name)] = true
+			}
+			// The kept control-plane log generations: written by the same
+			// daemon when it restarts a component, admitted by exact path.
+			for _, p := range executor.ComponentLogKeptPaths(dc.serverWorkDir()) {
+				created[p] = true
 			}
 		}
 		// The developer-mode marker is written only by an install with

@@ -200,7 +200,7 @@ func TestCrashLoopBringUpTimeoutUnderPressureBacksOff(t *testing.T) {
 			if err := os.WriteFile(p, []byte("first crash: database is locked\n"), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			rotateComponentLog(p)
+			rotateComponentLog(p, false)
 			got, err := os.ReadFile(p + ".1")
 			if err != nil || string(got) != "first crash: database is locked\n" {
 				t.Fatalf(".log.1 = %q, %v", got, err)
@@ -213,12 +213,12 @@ func TestCrashLoopBringUpTimeoutUnderPressureBacksOff(t *testing.T) {
 			if err := os.WriteFile(p, nil, 0o600); err != nil {
 				t.Fatal(err)
 			}
-			rotateComponentLog(p)
+			rotateComponentLog(p, false)
 			if got, _ := os.ReadFile(p + ".1"); !strings.Contains(string(got), "first crash") {
 				t.Fatalf("an empty log rotated over the kept one: %q", got)
 			}
 			// An absent log is a no-op.
-			rotateComponentLog(filepath.Join(dir, "absent.log"))
+			rotateComponentLog(filepath.Join(dir, "absent.log"), true)
 			if _, err := os.Stat(filepath.Join(dir, "absent.log.1")); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("absent log produced a .1: %v", err)
 			}
@@ -252,17 +252,149 @@ func TestParseCrashRecordReadsAStreaklessRecord(t *testing.T) {
 func TestDecodeLoadavg(t *testing.T) {
 	raw := make([]byte, 24)
 	binary.NativeEndian.PutUint32(raw[0:4], 3*2048)
+	binary.NativeEndian.PutUint32(raw[4:8], 2048)
 	binary.NativeEndian.PutUint64(raw[16:24], 2048)
-	load, err := decodeLoadavg1(raw)
-	if err != nil || load != 3 {
-		t.Fatalf("load = %v, %v; want 3", load, err)
+	l1, l5, err := decodeLoadavg(raw)
+	if err != nil || l1 != 3 || l5 != 1 {
+		t.Fatalf("load = %v, %v, %v; want 3, 1", l1, l5, err)
 	}
-	if _, err := decodeLoadavg1(raw[:20]); err == nil {
+	if _, _, err := decodeLoadavg(raw[:20]); err == nil {
 		t.Fatal("short answer accepted")
 	}
-	if !loadPressured(2*HostLoadPerCorePressured, 2) || loadPressured(HostLoadPerCorePressured, 2) {
-		t.Fatal("loadPressured threshold wrong")
+}
+
+// TestHostLoadPressured pins the sustained-load verdict: both the one- and the
+// five-minute average per core must reach the threshold, so a one-minute spike
+// over a quiet five minutes is not pressure.
+func TestHostLoadPressured(t *testing.T) {
+	th := HostLoadPerCorePressured
+	cases := []struct {
+		name string
+		load HostLoad
+		want bool
+	}{
+		{"both high is pressure", HostLoad{Load1: 2 * th * 4, Load5: 2 * th * 4, Cores: 4}, true},
+		{"both exactly at the threshold is pressure", HostLoad{Load1: th * 4, Load5: th * 4, Cores: 4}, true},
+		{"1-minute high, 5-minute low is not pressure", HostLoad{Load1: 3 * th * 4, Load5: 0.5 * th * 4, Cores: 4}, false},
+		{"1-minute low, 5-minute high is not pressure", HostLoad{Load1: 0.5 * th * 4, Load5: 3 * th * 4, Cores: 4}, false},
+		{"both below is not pressure", HostLoad{Load1: th*4 - 0.01, Load5: th*4 - 0.01, Cores: 4}, false},
+		{"no core count reads as one core", HostLoad{Load1: th, Load5: th}, true},
 	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.load.Pressured(); got != tc.want {
+				t.Fatalf("Pressured(%+v) = %v, want %v", tc.load, got, tc.want)
+			}
+			if s := tc.load.String(); !strings.Contains(s, "1m ") || !strings.Contains(s, "5m ") {
+				t.Fatalf("String() = %q; want both samples", s)
+			}
+		})
+	}
+}
+
+// TestComponentLogRotationKeepsFirstCrash drives spawns against a real work
+// dir and crash record: the first failing run's log is kept as .log.1 through
+// every later spawn of the streak (the latest lap rides in .log.2), and only a
+// healthy bring-up lets the next spawn replace it.
+func TestComponentLogRotationKeepsFirstCrash(t *testing.T) {
+	now := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+	type step struct {
+		log     string // the run's log content before the spawn rotates it
+		failing bool   // the crash record holds a live failure at the spawn
+		healthy bool   // the run reached a healthy bring-up before the spawn
+		want1   string
+		want2   string // "" is absent
+	}
+	cases := []struct {
+		name  string
+		steps []step
+	}{
+		{"first crash survives three further spawns and is replaced after a healthy bring-up", []step{
+			{log: "run 0: clean stop", want1: "run 0: clean stop"},
+			{log: "run 1: first crash, database is locked", failing: true, want1: "run 1: first crash, database is locked"},
+			{log: "run 2: crash", failing: true, want1: "run 1: first crash, database is locked", want2: "run 2: crash"},
+			{log: "run 3: crash", failing: true, want1: "run 1: first crash, database is locked", want2: "run 3: crash"},
+			{log: "run 4: crash", failing: true, want1: "run 1: first crash, database is locked", want2: "run 4: crash"},
+			{log: "run 5: healthy, then crashed at hour six", failing: true, healthy: true, want1: "run 5: healthy, then crashed at hour six"},
+		}},
+		{"a slow streak keeps the first slow lap", []step{
+			{log: "slow lap 1", failing: true, want1: "slow lap 1"},
+			{log: "slow lap 2", failing: true, want1: "slow lap 1", want2: "slow lap 2"},
+			{log: "healthy", failing: true, healthy: true, want1: "healthy"},
+			{log: "clean stop", want1: "clean stop"},
+		}},
+		{"no failure rotates every spawn", []step{
+			{log: "run 0", want1: "run 0"},
+			{log: "run 1", want1: "run 1"},
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			p := filepath.Join(dir, "kine.log")
+			for i, st := range tc.steps {
+				if st.healthy {
+					releaseComponentLogs(dir)
+				}
+				rec := CrashRecord{}
+				if st.failing {
+					rec.Record(now, CrashOriginCrash, "kine", "exited")
+				}
+				if err := WriteCrashRecord(CrashLoopPath(dir), rec); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(p, []byte(st.log), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				rotateComponentLog(p, failureLive(dir, now))
+				if got, err := os.ReadFile(p + ".1"); err != nil || string(got) != st.want1 {
+					t.Fatalf("step %d: .log.1 = %q, %v; want %q", i, got, err, st.want1)
+				}
+				got, err := os.ReadFile(p + ".2")
+				switch {
+				case st.want2 == "" && !errors.Is(err, os.ErrNotExist):
+					t.Fatalf("step %d: .log.2 = %q, %v; want absent", i, got, err)
+				case st.want2 != "" && (err != nil || string(got) != st.want2):
+					t.Fatalf("step %d: .log.2 = %q, %v; want %q", i, got, err, st.want2)
+				}
+				for _, kept := range []string{p + ".1", p + ".2"} {
+					if fi, err := os.Stat(kept); err == nil && fi.Mode().Perm() != 0o600 {
+						t.Fatalf("step %d: %s mode %v; want 0600", i, kept, fi.Mode().Perm())
+					}
+				}
+			}
+		})
+	}
+
+	t.Run("a later lap over the cap keeps only its tail", func(t *testing.T) {
+		dir := t.TempDir()
+		src, dst := filepath.Join(dir, "kine.log"), filepath.Join(dir, "kine.log.2")
+		if err := os.WriteFile(src, []byte("headhead-TAIL"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		keepLogTail(src, dst, 13, 4)
+		if got, err := os.ReadFile(dst); err != nil || string(got) != "TAIL" {
+			t.Fatalf(".log.2 = %q, %v; want the 4-byte tail", got, err)
+		}
+		if fi, err := os.Stat(dst); err != nil || fi.Mode().Perm() != 0o600 {
+			t.Fatalf(".log.2 mode: %v", err)
+		}
+		if _, err := os.Stat(src); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("source log left behind: %v", err)
+		}
+	})
+
+	t.Run("uninstall paths cover every kept file", func(t *testing.T) {
+		paths := strings.Join(ComponentLogKeptPaths("/w"), " ")
+		for _, want := range []string{"/w/kine.log.1", "/w/kine.log.1.pinned", "/w/kube-apiserver.log.2", "/w/etcd.log.1"} {
+			if !strings.Contains(paths, want+" ") && !strings.HasSuffix(paths, want) {
+				t.Fatalf("ComponentLogKeptPaths lacks %s: %s", want, paths)
+			}
+		}
+		if strings.Contains(paths, "/w/kine.log ") {
+			t.Fatalf("ComponentLogKeptPaths lists a live log: %s", paths)
+		}
+	})
 }
 
 func apiTimeoutErr() error {
