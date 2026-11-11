@@ -24,7 +24,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -156,10 +155,11 @@ func TestGateManifestBoundCoversCollect(t *testing.T) {
 	}
 }
 
-// TestGateProxyForEveryOperation walks every operation the gate classifies
-// (every gateOp with a name, plus opInvalid) and asserts the proxy, and so
-// the transport class, proxyFor picks for it. An operation added without an
-// entry here fails, which makes whoever adds it decide its bound.
+// TestGateProxyForEveryOperation walks every operation, gateOp 0 to
+// opCount-1, and asserts the proxy, and so the transport class, proxyFor
+// picks for it. Every value in that range must have a String name (or be
+// opInvalid) and an entry here, so an operation added without either fails,
+// which makes whoever adds it name it and decide its bound.
 func TestGateProxyForEveryOperation(t *testing.T) {
 	g := newGate(gateConfig{Upstream: "127.0.0.1:1", Logger: quietLogger()})
 	classes := map[*httputil.ReverseProxy]string{
@@ -181,16 +181,16 @@ func TestGateProxyForEveryOperation(t *testing.T) {
 		opUploadStatus: "write",
 		opManifestPut:  "manifest",
 	}
-	seen := map[gateOp]bool{}
-	for i := 0; i <= math.MaxUint8; i++ {
-		op := gateOp(i)
+	if len(want) != int(opCount) {
+		t.Errorf("table has %d operations, gateOp has %d: keep them equal", len(want), opCount)
+	}
+	for op := gateOp(0); op < opCount; op++ {
 		if op != opInvalid && op.String() == opInvalid.String() {
-			continue // not a named operation
+			t.Errorf("operation %d has no String name: add a case in gateOp.String", op)
 		}
-		seen[op] = true
 		w, ok := want[op]
 		if !ok {
-			t.Errorf("operation %d (%s) has no expected proxy class: add it here and a case in proxyFor", i, op)
+			t.Errorf("operation %d (%s) has no expected proxy class: add it here and a case in proxyFor", op, op)
 			continue
 		}
 		if got := classes[g.proxyFor(op)]; got != w {
@@ -198,8 +198,8 @@ func TestGateProxyForEveryOperation(t *testing.T) {
 		}
 	}
 	for op := range want {
-		if !seen[op] {
-			t.Errorf("expected operation %s was not enumerated", op)
+		if op >= opCount {
+			t.Errorf("expected operation %d is not below opCount", op)
 		}
 	}
 }
