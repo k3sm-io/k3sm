@@ -40,7 +40,7 @@
       "detail": "497 runs, last exit 1",
       "remedy": "sudo launchctl kickstart -k system/io.k3sm.server\nk3sm status logs server",
       "wide": {
-        "cp-binaries": "unknown-staged (no kube.version marker; staged before markers existed), pinned v1.37.1",
+        "cp-binaries": "unknown-staged (no kube.version marker; staged before markers existed), pinned v1.37.2",
         "label": "io.k3sm.server",
         "last-exit": "1",
         "log": "level=ERROR msg=\"control plane exited\" err=\"bind: address already in use\"",

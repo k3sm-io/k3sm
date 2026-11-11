@@ -62,7 +62,7 @@
       "detail": "launchctl reported a state this build cannot read",
       "remedy": "sudo k3sm status",
       "wide": {
-        "cp-binaries": "unknown-staged (no kube.version marker; staged before markers existed), pinned v1.37.1",
+        "cp-binaries": "unknown-staged (no kube.version marker; staged before markers existed), pinned v1.37.2",
         "label": "io.k3sm.server",
         "last-exit": "(never exited)",
         "log-path": "/var/log/k3sm/server.log",

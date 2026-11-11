@@ -47,7 +47,7 @@
       "detail": "io.k3sm.server is not loaded in the system domain",
       "remedy": "sudo k3sm install",
       "wide": {
-        "cp-binaries": "unknown-staged (no kube.version marker; staged before markers existed), pinned v1.37.1",
+        "cp-binaries": "unknown-staged (no kube.version marker; staged before markers existed), pinned v1.37.2",
         "label": "io.k3sm.server",
         "last-exit": "(never exited)",
         "log-path": "/var/log/k3sm/server.log",

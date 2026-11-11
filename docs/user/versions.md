@@ -21,7 +21,7 @@ updates the register. Treat that pin, and `k3sm version`, as the source of truth
 
 For the next release, as built from `main` at the time of writing. The [releases page](https://k3sm.io/releases/) and `k3sm version` show the pin a published release carries:
 
-- **Control plane** (embedded kube-apiserver / KCM / scheduler): `DefaultKubeVersion` **v1.37.1**.
+- **Control plane** (embedded kube-apiserver / KCM / scheduler): `DefaultKubeVersion` **v1.37.2**.
 - **Client libraries** (`k8s.io/api`, `k8s.io/client-go`): **v0.37.1**.
 
 The client libraries match the control-plane minor. If the numbers here disagree with `k3sm version`,

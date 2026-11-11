@@ -99,10 +99,10 @@ grep_text() { local text=$1; shift; grep "$@" <<<"$text"; }
 # Until they are filled in they hold the PLACEHOLDER below, and a real build
 # refuses before it downloads anything.
 PLACEHOLDER="UNPINNED-copy-from-upstream-for-the-tag"
-KUBE_TAG="v1.37.1"
-KUBE_SRC_SHA512="0bf390bf277b36767b8ad494f7f65ae5e3658a5ab2c62061ec4074cac6a26270f4c6beb08d828d3c2323c44e230d04769fdfa532806925333a64d6fcf130f2f4"
-KUBE_TAG_COMMIT="f78e722310e50bcaca9276be22276d9e91d91308"
-KUBE_TAG_EPOCH="1790183182"
+KUBE_TAG="v1.37.2"
+KUBE_SRC_SHA512="2c5e991be1dcf78db1db099b8b52e6750d251045d4662f2cacf28d415f17a41a536ad3a88e35cde6a109f09c120c6a0b05f6b61b88202656a6671ed4c442db44"
+KUBE_TAG_COMMIT="c50e5395f1ae2d4a2c05f28fdcc38c0916cc1a32"
+KUBE_TAG_EPOCH="1793102464"
 KUBE_SRC_URL="https://dl.k8s.io/release/${KUBE_TAG}/kubernetes-src.tar.gz"
 
 # The binaries, in payload order; each is built from ./cmd/<name>.

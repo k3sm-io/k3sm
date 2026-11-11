@@ -47,7 +47,7 @@
       "detail": "io.k3sm.server is disabled in the system domain",
       "remedy": "sudo launchctl enable system/io.k3sm.server\nsudo launchctl kickstart -k system/io.k3sm.server",
       "wide": {
-        "cp-binaries": "unknown-staged (no kube.version marker; staged before markers existed), pinned v1.37.1",
+        "cp-binaries": "unknown-staged (no kube.version marker; staged before markers existed), pinned v1.37.2",
         "label": "io.k3sm.server",
         "last-exit": "0",
         "log-path": "/var/log/k3sm/server.log",

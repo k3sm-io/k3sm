@@ -181,6 +181,7 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
 
 ### Changed
 
+- **The control plane runs Kubernetes v1.37.2.** The `k8s.io` client libraries stay at v0.37.1.
 - A Pod with `dnsPolicy: None` now resolves through its own `dnsConfig`: its IPv4 nameservers
   (up to three), `searches` and `ndots`, natively and in a `vm` guest, with no fallback to the host
   resolver. It used to resolve through the host and ignore its `dnsConfig`. IPv6 nameservers are

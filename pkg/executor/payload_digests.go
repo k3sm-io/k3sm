@@ -80,6 +80,12 @@ var payloadDigests = map[string]map[string]string{
 		"kube-scheduler":          "f71048005fa00d5a1d29780a0663870bdf0f859859cbe7668a309ebb96667190",
 		"kubectl":                 "64d4df1e1264aea1a6b06d29cc20758596f7aff175d379baec65b64968f905b5",
 	},
+	"v1.37.2": {
+		"kube-apiserver":          "40e63029ae1788bde55e21d3c9e072bf05b450d5e01a609c272d3c679a326721",
+		"kube-controller-manager": "d9df31b0806be046320509996ce1b1a901f4627d16f68230160efa5905ed5f9b",
+		"kube-scheduler":          "cc417f285da3e0f2b6efc34a3df396e190513b58e50ef68bba1740e7bf5595c8",
+		"kubectl":                 "9d4af2b120568038516f24c811ceb045b079bed540b54c7b69df6e00b1bb54b7",
+	},
 }
 
 // ErrPayloadDigestMismatch is returned when a downloaded control-plane binary
