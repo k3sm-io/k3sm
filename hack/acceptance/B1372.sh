@@ -69,10 +69,10 @@
 #         reclaimedBytes RECORDED, a kept blob only for the shared reason; a dry-run
 #         `k3sm image prune` on each Mac before the model rm and after the image rm
 #         would reclaim the same other blobs, less the target's (RECORDED: how many;
-#         with none it says the check had nothing to observe, not a pass); then the
-#         registry prune; each node's view and the target's cache blobs are gone and
-#         free space on both caches and the registry store is back at t.0's within
-#         1% of the model
+#         with none it says the check had nothing to observe, not a pass), and the
+#         rm reported removing none of them; each node's view and the target's cache
+#         blobs are gone, all checked before the registry prune; then free space on
+#         both caches and the registry store is back at t.0's within 1% of the model
 #   f.1   cleanup, green or red: the namespace (MLXModels, ConfigMap, client and
 #         client Pods), the pushed tag, the remote scratch dirs; each step that
 #         fails is named and fails the run. Each is marked for cleanup BEFORE the
@@ -164,7 +164,7 @@ RUNGS=(
 	"t.4|a client Pod on each Mac gets a non-empty completion from the other Mac's replica"
 	"t.5|configured and shown offline, not a network observation (a download completed and moved elsewhere is not seen): no egress annotation, weights by digest, HF_HUB_OFFLINE=1 in the Pod spec and the process env, empty Hub cache, no Hub cache or partial download in the pod's tree, a non-empty log naming no huggingface.co; write EPERM, exec fails; on each Mac one view of clones (inode, dev, blocks, 0444, root)"
 	"t.6|three replicas, two on the server Mac: free-space drop under 1% of the model, same view; warm time"
-	"t.7|delete, model rm, image rm of the run's digest on both Macs (a dry-run prune before and after: other blobs untouched), registry prune: views and the target's blobs gone, free space back within 1% on both caches and the registry store"
+	"t.7|delete, model rm, image rm of the run's digest on both Macs (a dry-run prune before and after: other blobs untouched), views and the target's blobs gone, then the registry prune: free space back within 1% on both caches and the registry store"
 	"f.1|cleanup green or red: namespace, MLXModels, ConfigMap, Pods, the pushed tag, remote scratch"
 	"t.8|kubectl get ns recorded; no leftover; both nodes Ready on the build t.0 recorded; one line states the build and Ready the rig is left on"
 )
@@ -429,8 +429,9 @@ view_inodes() { awk '$1 == "F" { print $2, $3 }' "$1"; }
 SHARED_REASON="shared"
 
 # rm_report <image rm JSON>: its reclaimedBytes, then the hex of each blob it kept.
-# JSON without reclaimedBytes, or a blob kept for any reason but the shared one, is
-# an error line and exit 1.
+# JSON without reclaimedBytes, not a forced rm of $DIGEST (dryRun not false, another
+# manifestDigest), naming no blob removed, or a blob kept for any reason but the
+# shared one, is an error line and exit 1.
 rm_report() {
 	py '
 import json, sys
@@ -443,6 +444,13 @@ if not isinstance(d, dict):
     print("the output is not a JSON object")
     sys.exit(1)
 errs, kept = [], []
+if d.get("dryRun") is not False:
+    errs.append("dryRun is not false (%s)" % d.get("dryRun"))
+if d.get("manifestDigest") != sys.argv[3]:
+    errs.append("manifestDigest is %s, not %s" % (d.get("manifestDigest"), sys.argv[3]))
+rd = d.get("removedDigests")
+if not isinstance(rd, list) or not rd:
+    errs.append("removedDigests is empty")
 r = d.get("reclaimedBytes")
 if isinstance(r, bool) or not isinstance(r, int):
     errs.append("no reclaimedBytes in the output")
@@ -462,13 +470,14 @@ if errs:
 print(r)
 for h in kept:
     print(h)
-' "$1" "$SHARED_REASON"
+' "$1" "$SHARED_REASON" "$DIGEST"
 }
 
-# bystanders <prune JSON before> <prune JSON after> <rm JSON> <hex...>: the blobs a
-# dry-run prune would reclaim after the rm are those it would before, less the
-# target's (the hexes given and what the rm removed). Prints how many that is; a
-# difference is printed and exits 1.
+# bystanders <prune JSON before> <prune JSON after> <rm JSON> <hex...>: the hexes
+# given are the target's blobs, known without the rm's report. Outside them, the
+# blobs a dry-run prune would reclaim after the rm are those it would before, and
+# the rm reported removing none. Prints how many that is; a difference, or a
+# removed blob outside the target's, is printed and exits 1.
 bystanders() {
 	py '
 import json, sys
@@ -483,10 +492,16 @@ try:
     removed = json.load(open(sys.argv[3])).get("removedDigests") or []
 except (ValueError, AttributeError):
     removed = []
-target = set(sys.argv[4:]) | set(str(d).split(":", 1)[-1] for d in removed)
-want = before - target
-if after != want:
-    print("lost %s, gained %s" % (sorted(want - after), sorted(after - want)))
+target = set(sys.argv[4:])
+errs = []
+outside = sorted(set(str(d) for d in removed if str(d).split(":", 1)[-1] not in target))
+if outside:
+    errs.append("image rm reported removing blob(s) outside the image: %s" % " ".join(outside))
+want, got = before - target, after - target
+if got != want:
+    errs.append("the bystander blobs changed: a dry-run prune would reclaim other blobs after image rm than before: lost %s, gained %s" % (sorted(want - got), sorted(got - want)))
+if errs:
+    print("; ".join(errs))
     sys.exit(1)
 print(len(want))
 ' "$@"
@@ -1188,12 +1203,13 @@ t7() {
 	TAG_REMOVED=1
 	while read -r n _; do hexes+=("$n"); done <<<"$FILES"
 	# The run's own image off each node's cache, and nothing else.
-	for h in "$SERVER|s" "$WORKER|w"; do
-		tag="${h#*|}" h="${h%|*}"
+	for h in "$SERVER|$SCACHE|s" "$WORKER|$WCACHE|w"; do
+		IFS='|' read -r h cache tag <<<"$h"
 		rc=0
 		out="$(ku "$h" image rm --force "$DIGEST" -o json 2>"$EV/t.7.rm.$tag.err")" || rc=$?
 		printf '%s\n' "$out" >"$EV/t.7.rm.$tag.json"
 		if [ "$rc" != 0 ]; then
+			# rep keeps rm_report's error line only: a report that parses clean says nothing more.
 			rep="$(rm_report "$EV/t.7.rm.$tag.json" 2>/dev/null)" && rep=""
 			bad "image rm $DIGEST on $h exited $rc: $(oneline "$out $(cat "$EV/t.7.rm.$tag.err")")${rep:+ ($rep)}"
 			return 1
@@ -1204,27 +1220,28 @@ t7() {
 		out="$(ku "$h" image prune -o json 2>"$EV/t.7.prune-dry.after.$tag.err")" ||
 			{ bad "dry-run image prune on $h after the image rm: $(oneline "$out $(cat "$EV/t.7.prune-dry.after.$tag.err")")"; return 1; }
 		printf '%s\n' "$out" >"$EV/t.7.prune-dry.after.$tag.json"
-	done
-	out="$(ku "$SERVER" image prune --force -o json 2>&1)" || { bad "registry prune: $out"; return 1; }
-	printf '%s\n' "$out" >"$EV/t.7.prune.registry.json"
-	for h in "$SERVER|$SCACHE|s" "$WORKER|$WCACHE|w"; do
-		IFS='|' read -r h cache tag <<<"$h"
+		# Checked before the registry prune, which evicts the server's unused blobs and
+		# would hide an image rm that did nothing there.
 		view_read "$h" "$cache" "$EV/t.7.view.$tag" || { bad "read the view dir on $h"; return 1; }
-		grep -qx 'VIEWS 0' "$EV/t.7.view.$tag" || { bad "the view of $DIGEST is still on $h after image rm and the registry prune"; return 1; }
+		grep -qx 'VIEWS 0' "$EV/t.7.view.$tag" || { bad "the view of $DIGEST is still on $h after image rm"; return 1; }
 		# The target's blobs are gone, but for one the rm kept because another image shares it.
 		check=()
-		for n in "${hexes[@]}"; do grep -qxF "$n" "$EV/t.7.rm.$tag.kept" || check+=("$n"); done
+		for n in ${hexes[@]+"${hexes[@]}"}; do grep -qxF "$n" "$EV/t.7.rm.$tag.kept" || check+=("$n"); done
 		left="$(rroot "$h" "$STEP_TIMEOUT" "$BLOBS_LEFT" "$cache" ${check[@]+"${check[@]}"})" || { bad "read the cache blobs on $h"; return 1; }
 		[ -z "$left" ] || { bad "blobs of $DIGEST are still in the cache on $h after image rm: $(oneline "$left")"; return 1; }
-		n="$(bystanders "$EV/t.7.prune-dry.before.$tag.json" "$EV/t.7.prune-dry.after.$tag.json" "$EV/t.7.rm.$tag.json" "$MHEX" "${hexes[@]}")" ||
-			{ bad "the bystander blobs changed on $h: a dry-run prune would reclaim other blobs after image rm than before: $n"; return 1; }
+		n="$(bystanders "$EV/t.7.prune-dry.before.$tag.json" "$EV/t.7.prune-dry.after.$tag.json" "$EV/t.7.rm.$tag.json" "$MHEX" ${hexes[@]+"${hexes[@]}"})" ||
+			{ bad "bystander check on $h: $n"; return 1; }
 		measure "t7_bystander_blobs_$tag" "$n"
 		if [ "$n" = 0 ]; then
 			echo "t.7: bystander check on $h: the dry-run prune listed no other unused blob, so the check had nothing to observe"
+		elif [ "$h" = "$SERVER" ]; then
+			echo "t.7: bystander check on $h: PASS, $n other unused blob(s) untouched by image rm; the registry prune then evicts the server's unused blobs"
 		else
 			echo "t.7: bystander check on $h: PASS, $n other unused blob(s) untouched by image rm"
 		fi
 	done
+	out="$(ku "$SERVER" image prune --force -o json 2>&1)" || { bad "registry prune: $out"; return 1; }
+	printf '%s\n' "$out" >"$EV/t.7.prune.registry.json"
 	end=$(($(date +%s) + RECLAIM_TIMEOUT))
 	while :; do
 		if ! { rs="$(df_read "$SERVER" "$SCACHE")" && rw="$(df_read "$WORKER" "$WCACHE")" && rr="$(df_read "$SERVER" "$REG_ROOT")"; }; then
@@ -1878,27 +1895,38 @@ def k3sm(argv):
         if not force:
             out({"manifestDigest": reg["digest"], "dryRun": True, "removedDigests": ["sha256:" + h for h in sorted(mine)], "kept": [], "reclaimedBytes": sum(mine.values())})
             return 0
-        if "prune-keeps" in BRK:
-            # Answers success and deletes nothing.
-            out({"manifestDigest": reg["digest"], "dryRun": False, "removedDigests": [], "kept": [], "reclaimedBytes": 0})
+        if "prune-keeps" in BRK or "rm-noop" in BRK:
+            # Answers success, names the image's blobs removed, and deletes nothing.
+            out({"manifestDigest": reg["digest"], "dryRun": False, "removedDigests": ["sha256:" + h for h in sorted(mine)], "kept": [], "reclaimedBytes": sum(mine.values())})
             return 0
-        # A blob kept for a reason other than the shared one, answered as a failure.
-        kept = {reg["big"]: "young"} if "rm-kept-unshared" in BRK else {}
+        # A blob kept: for a reason other than the shared one (the verb still answers
+        # success), or because another image shares it (the smallest, so the space
+        # check still holds).
+        kept = {}
+        if "rm-kept-unshared" in BRK:
+            kept = {reg["big"]: "young"}
+        if "rm-kept-shared" in BRK:
+            kept = {min(reg["files"], key=lambda f: f[2])[0]: "shared"}
         rmtree(os.path.join(cache, "artifacts", reg["digest"].split(":")[1]))
         gone = [h for h in sorted(mine) if h not in kept and os.path.exists(os.path.join(bdir, h))]
         for h in gone:
             os.remove(os.path.join(bdir, h))
-        if "rm-evicts-all" in BRK:
-            # A broken verb: every other unused blob goes too.
-            for b in os.listdir(bdir):
+        extra = []
+        if "rm-evicts-all" in BRK or "rm-evicts-listed" in BRK:
+            # A broken verb: every other unused blob goes too (and, listed, is reported).
+            for b in sorted(os.listdir(bdir)):
                 if b not in kept:
                     os.remove(os.path.join(bdir, b))
+                    if "rm-evicts-listed" in BRK:
+                        extra.append(b)
         df_add(HOST, sum(mine[h] for h in gone) // 1024)
         s["pulled"][HOST] = False
         jsave("k8s.json", s)
-        out({"manifestDigest": reg["digest"], "dryRun": False, "removedDigests": ["sha256:" + h for h in gone],
+        # Broken reports of a good eviction: a dry run, or nothing named removed.
+        removed = [] if "rm-lists-none" in BRK else ["sha256:" + h for h in gone + extra]
+        out({"manifestDigest": reg["digest"], "dryRun": "rm-says-dry" in BRK, "removedDigests": removed,
              "kept": [{"digest": "sha256:" + h, "reason": r} for h, r in sorted(kept.items())], "reclaimedBytes": sum(mine[h] for h in gone)})
-        return 1 if kept else 0
+        return 0
     print("fake k3sm: unhandled %r" % argv, file=sys.stderr)
     return 2
 
@@ -2037,9 +2065,12 @@ self_test() {
 	fake_run() { # <name> <break> <want-exit> <want-in-output> [evidence-dir]
 		local name="$1" brk="$2" want="$3" grepfor="$4" ev="${5:-$t/runs/$1/ev}" r="$t/runs/$1" got=0 o
 		mkdir -p "$r/state" "$r/srv/cache/blobs/sha256" "$r/wrk/cache/blobs/sha256" "$r/srv/registry"
-		# Another workload's unused cached blob on each Mac: t.7 must leave it alone.
-		printf 'bystander\n' >"$r/srv/cache/blobs/sha256/$BYSTANDER"
-		printf 'bystander\n' >"$r/wrk/cache/blobs/sha256/$BYSTANDER"
+		# Another workload's unused cached blob on each Mac (unless FR_NO_BYSTANDER is
+		# set): t.7 must leave it alone.
+		if [ -z "${FR_NO_BYSTANDER:-}" ]; then
+			printf 'bystander\n' >"$r/srv/cache/blobs/sha256/$BYSTANDER"
+			printf 'bystander\n' >"$r/wrk/cache/blobs/sha256/$BYSTANDER"
+		fi
 		o="$(
 			cd "$t" && env -u K3SM_LAB_TOLERATE_KEYS PATH="$bin:$PATH" K3SM_LAB=1 KUBECONFIG=/dev/null \
 				FAKE_STATE="$r/state" FAKE_BREAK="$brk" FAKE_SERVER_HOST=srv FAKE_REG_ROOT="$r/srv/registry" \
@@ -2088,6 +2119,7 @@ self_test() {
 	for out in srv wrk; do has "happy: t.7 image rm on $out" "$(cat "$RUN_DIR/state/calls")" "$out k3sm image rm --force sha256:"; done
 	if grep -q '^wrk k3sm image prune --force' "$RUN_DIR/state/calls"; then echo "self-test FAIL: happy: t.7 pruned the worker's whole cache"; bad=1; fi
 	[ -e "$RUN_DIR/wrk/cache/blobs/sha256/$BYSTANDER" ] || { echo "self-test FAIL: happy: the worker's other cached blob is gone"; bad=1; }
+	has "happy: t.7 server bystander line" "$(cat "$RUN_DIR/ev/t.7.log")" "t.7: bystander check on srv: PASS, 1 other unused blob(s) untouched by image rm; the registry prune then evicts the server's unused blobs"
 	for out in s w; do
 		has "happy: t.7 rm reclaimed on $out" "$(cat "$RUN_DIR/ev/measurements.tsv")" "$(printf 't7_rm_reclaimed_bytes_%s\t%s' "$out" "$(awk -F '\t' '$1 == "model_bytes" {print $2}' "$RUN_DIR/ev/measurements.tsv")")"
 		has "happy: t.7 bystanders on $out" "$(cat "$RUN_DIR/ev/measurements.tsv")" "$(printf 't7_bystander_blobs_%s\t1' "$out")"
@@ -2104,7 +2136,8 @@ self_test() {
 		"hub-models-dir|t.5" "hub-cache-env|t.5" "hub-log|t.5" "serve-log-empty|t.5" "write-ok|t.5" "write-eacces|t.5" "exec-ok|t.5" "view-hardlink|t.5" "view-twice|t.5" \
 		"pvc-read-fails|t.3" "copyrun-exec-fails|t.5" "copyrun-no-marker|t.5" \
 		"scale-copies|t.6" "prune-keeps|t.7" "registry-keeps|t.7" \
-		"rm-kept-unshared|t.7" "rm-old-daemon|t.7" "rm-evicts-all|t.7"; do
+		"rm-kept-unshared|t.7" "rm-old-daemon|t.7" "rm-evicts-all|t.7" "rm-evicts-listed|t.7" \
+		"rm-says-dry|t.7" "rm-lists-none|t.7" "rm-noop|t.7"; do
 		brk="${row%|*}" rung="${row#*|}"
 		fake_run "$brk" "$brk" 1 "result: FAIL ($rung)"
 		cleaned "$brk"
@@ -2144,8 +2177,24 @@ self_test() {
 	reason7() { has "$1: t.7 reason" "$(awk -F '\t' '$1 == "t.7" && $2 == "FAIL"' "$t/runs/$1/ev/result.tsv" 2>/dev/null)" "$2"; }
 	reason7 prune-keeps "is still on srv after image rm"
 	reason7 rm-kept-unshared "kept for young"
+	# Red on the kept reason alone: the verb answered success.
+	if awk -F '\t' '$1 == "t.7" && $2 == "FAIL"' "$t/runs/rm-kept-unshared/ev/result.tsv" | grep -q 'exited'; then echo "self-test FAIL: rm-kept-unshared: red on the exit, not the kept reason"; bad=1; fi
 	reason7 rm-old-daemon "predates image rm"
 	reason7 rm-evicts-all "the bystander blobs changed"
+	reason7 rm-evicts-listed "reported removing blob(s) outside the image: sha256:$BYSTANDER"
+	reason7 rm-says-dry "dryRun is not false"
+	reason7 rm-lists-none "removedDigests is empty"
+	# Seen before the registry prune, which would evict the server's copy itself.
+	reason7 rm-noop "is still on srv after image rm"
+	# A blob kept because another image shares it is not a failure.
+	fake_run rm-kept-shared rm-kept-shared 0 "result: PASS"
+	has "rm-kept-shared: t.7 passed" "$(cat "$RUN_DIR/out")" "t.7: PASS"
+	# No other unused blob on a Mac: the bystander check says it had nothing to observe.
+	FR_NO_BYSTANDER=1 fake_run no-bystander "" 0 "result: PASS"
+	for out in srv wrk; do
+		has "no-bystander: $out" "$(cat "$RUN_DIR/ev/t.7.log")" "t.7: bystander check on $out: the dry-run prune listed no other unused blob, so the check had nothing to observe"
+		if grep -q "t.7: bystander check on $out: PASS" "$RUN_DIR/ev/t.7.log"; then echo "self-test FAIL: no-bystander: a bystander PASS line on $out"; bad=1; fi
+	done
 	has "happy: the pushing binary's version recorded" "$(cat "$t/runs/happy/ev/t.0.versions")" "pushing binary"
 	# t.8 states the rig's end state in one line.
 	has "happy: t.8 end state" "$(cat "$t/runs/happy/out")" "end state: the rig is left on k3sm v0.0.0-fake (commit $(printf 'a%.0s' $(seq 40))); node-s Ready=True, node-w Ready=True"
