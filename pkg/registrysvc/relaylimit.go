@@ -78,9 +78,13 @@ const (
 	// response, or one read of a request body, may wait on the peer. They
 	// bound progress, not total time: a blob streams for as long as it takes
 	// while it keeps moving, and a peer that stops reading or sending loses
-	// its connection, and its slot, one window later.
-	relayWriteProgress = 60 * time.Second
-	relayReadProgress  = 60 * time.Second
+	// its connection, and its slot, one window later. The window is long on
+	// purpose: the node's ordinary image puller does not resume a cut layer
+	// with a Range request, so a cut costs a full re-download, and a client
+	// may pause that long while it unpacks or syncs a large layer. The bound
+	// exists to free a dead slot, not to police slow peers.
+	relayWriteProgress = 5 * time.Minute
+	relayReadProgress  = 5 * time.Minute
 	// relaySourceTableMax bounds the per-address bucket table. A full table
 	// drops its idle entries and, if still full, starts over: the cost is a
 	// fresh bucket for every address, never a refusal.
@@ -221,12 +225,19 @@ func (s *sourceLimiter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // must reach the peer within writeProgress of its start, and every read of the
 // request body within readProgress. A response or body that keeps moving is
 // never cut, however long it takes; one that stalls fails its write or read,
-// and the server closes the connection, which frees its slot. done clears the
-// write deadline when the handler returns, and the read deadline too unless the
-// body is still unread: then the server drains it after the handler, and that
-// drain gets one more window rather than none.
+// and the server closes the connection, which frees its slot. done arms the
+// write deadline one more window ahead when the handler returns, because the
+// server then flushes the response's buffered tail, and a peer that stops
+// reading there must lose its slot too. The next request on the connection
+// clears that deadline before its handler runs, so a long silent handler is not
+// cut by a deadline left from the request before it. done clears the read
+// deadline unless the body is still unread: then the server drains it after the
+// handler, and that drain gets one more window rather than none. The errors
+// from setting a deadline are ignored: the limiter has no logger, and a writer
+// that cannot take a deadline is served unbounded rather than refused.
 func (s *sourceLimiter) bindProgress(w http.ResponseWriter, r *http.Request) (http.ResponseWriter, *http.Request, func()) {
 	rc := http.NewResponseController(w)
+	_ = rc.SetWriteDeadline(time.Time{})
 	pw := &progressWriter{ResponseWriter: w, rc: rc, d: s.lim.writeProgress}
 	var pr *progressReader
 	if r.Body != nil && r.Body != http.NoBody && r.ContentLength != 0 {
@@ -238,7 +249,7 @@ func (s *sourceLimiter) bindProgress(w http.ResponseWriter, r *http.Request) (ht
 		r.Body = pr
 	}
 	return pw, r, func() {
-		_ = rc.SetWriteDeadline(time.Time{})
+		_ = rc.SetWriteDeadline(time.Now().Add(s.lim.writeProgress))
 		if pr != nil && !pr.ended {
 			_ = rc.SetReadDeadline(time.Now().Add(s.lim.readProgress))
 			return

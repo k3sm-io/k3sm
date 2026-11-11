@@ -269,7 +269,7 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
 
 - A peer that opens a blob GET on the registry relay and stops reading, or declares a request body
   and never sends it, no longer holds one of its address's relay connections until restart. Each
-  write of a response and each read of a request body must make progress within 60 seconds, or the
+  write of a response and each read of a request body must make progress within 5 minutes, or the
   relay closes the connection and frees the slot. A blob still streams for as long as it takes while
   it keeps moving: there is no flat read or write timeout.
 - A server whose control plane does not report healthy in time while the Mac is heavily loaded no
