@@ -452,8 +452,10 @@ GV_ALLOW="$HERE/govulncheck.allow"
 # (the patch-set id, "none" without one),
 # HELM_VERSION, HELM_VARIANT, HELM_RAISED (the raised modules, space-separated
 # path@version), HELM_COMMIT (the tag's commit the build stamps) and HELM_BINARY,
-# XNET_FLOOR (the golang.org/x/net kine is built against) and
-# COMPRESS_RAISED (the github.com/klauspost/compress it is built against), read from
+# XNET_FLOOR (the golang.org/x/net kine is built against),
+# COMPRESS_RAISED (the github.com/klauspost/compress it is built against) and
+# KINE_RAISED (every module kine is built with raised, "path version" pairs
+# space-separated: x/net, the golang.org/x modules it requires, compress), read from
 # the source the staged k3sm is built from, so the checks below compare against
 # that build's own pins.
 read_pins() {
@@ -481,6 +483,15 @@ read_pins() {
 	[ -n "$XNET_FLOOR" ] || die "cannot read the raised golang.org/x/net (XNetVersion) from $cr"
 	COMPRESS_RAISED="$(sed -n 's/^[[:space:]]*const CompressVersion[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$cr")"
 	[ -n "$COMPRESS_RAISED" ] || die "cannot read the raised github.com/klauspost/compress (CompressVersion) from $cr"
+	local m c v
+	KINE_RAISED="golang.org/x/net $XNET_FLOOR"
+	for m in crypto:XCryptoVersion sys:XSysVersion term:XTermVersion text:XTextVersion sync:XSyncVersion; do
+		c="${m#*:}"
+		v="$(sed -n "s/^[[:space:]]*${c}[[:space:]]*=[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$cr")"
+		[ -n "$v" ] || die "cannot read the raised golang.org/x/${m%%:*} ($c) from $cr"
+		KINE_RAISED="$KINE_RAISED golang.org/x/${m%%:*} $v"
+	done
+	KINE_RAISED="$KINE_RAISED github.com/klauspost/compress $COMPRESS_RAISED"
 }
 
 # helm_buildinfo_problems <want-version> <go-pin> <raised>  (stdin: `go version -m`)
@@ -577,15 +588,15 @@ unbang() {
 
 # manifest_comments [stub]: the manifest's header lines. The toolchain pin, then,
 # per source-built child, its module version, patch-set id, build variant and the
-# build settings its own build info records, and for kine the raised
-# golang.org/x/net and github.com/klauspost/compress they are built against (kine's -ldflags stamp is added
+# build settings its own build info records, and for kine every module it is
+# built with raised (KINE_RAISED; kine's -ldflags stamp is added
 # explicitly: -trimpath keeps ldflags out of Go's build info). With "stub" the
 # children were not built, and the header says so.
 manifest_comments() {
 	local stub="${1:-}" dir="$PAYLOAD_DIR" kind
 	printf 'k3sm payload manifest; verify inside the tree with: shasum -a 256 -c %s\n' "$MANIFEST_NAME"
 	printf 'toolchain: %s %s/%s (pinned: PAYLOAD_GO_VERSION %s)\n' "$("$GO" env GOVERSION)" "$GOOS" "$GOARCH" "$PAYLOAD_GO_VERSION"
-	printf 'kine: github.com/k3s-io/kine %s patch-set %s variant %s (stamped %s+%s) raises golang.org/x/net %s github.com/klauspost/compress %s\n' "$KINE_VERSION" "$KINE_PATCH" "$KINE_VARIANT" "$KINE_VERSION" "$KINE_PATCH" "$XNET_FLOOR" "$COMPRESS_RAISED"
+	printf 'kine: github.com/k3s-io/kine %s patch-set %s variant %s (stamped %s+%s) raises %s\n' "$KINE_VERSION" "$KINE_PATCH" "$KINE_VARIANT" "$KINE_VERSION" "$KINE_PATCH" "$KINE_RAISED"
 	printf 'etcd: go.etcd.io/etcd/server/v3 %s patch-set none variant %s\n' "$ETCD_VERSION" "$ETCD_VARIANT"
 	printf 'etcdutl: go.etcd.io/etcd/etcdutl/v3 %s patch-set none variant %s\n' "$ETCD_VERSION" "$ETCD_VARIANT"
 	printf 'helm: helm.sh/helm/v4 %s patch-set none variant %s raises %s (staged as %s)\n' "$HELM_VERSION" "$HELM_VARIANT" "$HELM_RAISED" "$HELM_BINARY"

@@ -19,8 +19,9 @@ limitations under the License.
 //
 // kine is built from pinned upstream module source, out of k3sm's go.mod. Its
 // dependency graph is the one the upstream tag pins, except where a dependency
-// carries a fix the tag predates: then it is built with that one requirement
-// raised, and nothing else moves. kine is built from a patched copy of its own
+// carries a fix the tag predates: then it is built with that requirement raised,
+// together with each requirement the raised version itself needs above the tag's,
+// and nothing else moves. kine is built from a patched copy of its own
 // module, so Apply raises the requirement in that copy's go.mod and adds the hashes
 // to its go.sum.
 //
@@ -40,12 +41,29 @@ import (
 )
 
 // XNetVersion is the golang.org/x/net version kine is built against.
-// v0.60.0 fixes GO-2026-6603, GO-2026-6610, GO-2026-6611, GO-2026-6612 and
-// GO-2026-6617 in its HTTP/2 code; kine's pinned tag selects v0.59.0. Its own
-// requirements (x/crypto, x/sys, x/term, x/text) are the versions that tag
-// already selects, so raising it moves no other module. hack/release/stage.sh
-// reads this line as the floor a staged kine must link.
-const XNetVersion = "v0.60.0"
+// v0.60.0 fixed GO-2026-6603, GO-2026-6610, GO-2026-6611, GO-2026-6612 and
+// GO-2026-6617 in its HTTP/2 code (kine's pinned tag selects v0.59.0). v0.62.0
+// is the x/net the control-plane binaries and the bundled helm are built against,
+// which fixes GO-2026-6860 and GO-2026-6866 in the HTML parser and renderer.
+// v0.62.0 requires newer golang.org/x/crypto, x/sys, x/term and x/text than the
+// tag selects, and that x/text requires a newer golang.org/x/sync, so raising
+// x/net moves those five too; each is raised explicitly below so the build stays
+// -mod=readonly with every hash recorded here. hack/release/stage.sh reads this
+// line as the floor a staged kine must link.
+const XNetVersion = "v0.62.0"
+
+// XCryptoVersion, XSysVersion, XTermVersion and XTextVersion are the versions
+// golang.org/x/net XNetVersion requires, and XSyncVersion the version
+// golang.org/x/text XTextVersion requires; kine's pinned tag selects v0.57.0,
+// v0.48.0, v0.46.0, v0.42.0 and v0.23.0. They are raised only because x/net
+// needs them.
+const (
+	XCryptoVersion = "v0.58.0"
+	XSysVersion    = "v0.49.0"
+	XTermVersion   = "v0.47.0"
+	XTextVersion   = "v0.43.0"
+	XSyncVersion   = "v0.24.0"
+)
 
 // CompressVersion is the github.com/klauspost/compress version kine is
 // built against. v1.20.2 fixes GO-2026-6865, a panic on two-block frames in its fse
@@ -69,8 +87,33 @@ type Requirement struct {
 var Raises = []Requirement{{
 	Path:     "golang.org/x/net",
 	Version:  XNetVersion,
-	Sum:      "h1:79p50tfZlm0J9YfoDsSi639qSXNGVwEzOPLCxM2FsYU=",
-	GoModSum: "h1:2DA/G1UfVbCpQPeWTmMPGY7Cs2PkBkwu743bVX5PIVg=",
+	Sum:      "h1:18ELalfM5+XNRwzM2nYqXsZQ9ByS1uhj2O/U7+5jqRY=",
+	GoModSum: "h1:WgDCOTH8iwtB66T4/GfI94AHo/hhdb7Hah9NDseQfiI=",
+}, {
+	Path:     "golang.org/x/crypto",
+	Version:  XCryptoVersion,
+	Sum:      "h1:COkYLr4k7nDI4r6QtMML2AfzeIswWHAJthLS6K/M/54=",
+	GoModSum: "h1:Xh+kl5A+M0gMiWDytH2Hhr5Z7WbNCpv/eB/EFgfSk+w=",
+}, {
+	Path:     "golang.org/x/sys",
+	Version:  XSysVersion,
+	Sum:      "h1:XbzkgYJHdqh/8m2Uu0W/dQv8nktxx4BFHp1M0gROTXA=",
+	GoModSum: "h1:hNLxWAXmnKAxqDtdwIYC4bM9oQPEecfsnNMuSxOs3og=",
+}, {
+	Path:     "golang.org/x/term",
+	Version:  XTermVersion,
+	Sum:      "h1:cpyOwQkr2Nzxe2p6KnrTG7Ei2wtzjsuSjhpXXepZ/BM=",
+	GoModSum: "h1:efAfAuG6RKABvg1ArGebRkvX6LXul14SM67o2e4mUCY=",
+}, {
+	Path:     "golang.org/x/text",
+	Version:  XTextVersion,
+	Sum:      "h1:1QivrlhwAsnMOcqgOdl9my7s9OyZl8O5/UGUTJVXoWc=",
+	GoModSum: "h1:hbSIYA/amXcRXTFSZqh8tWHEoqRvvbKPJ2uz/KU+a+s=",
+}, {
+	Path:     "golang.org/x/sync",
+	Version:  XSyncVersion,
+	Sum:      "h1:iqiDrGoDgyuvAKrhLQthUEzU/R378N78gXbBjxed7oA=",
+	GoModSum: "h1:sUUOizhqBxiL6pEWpqNLUiaJn1ShEbZ6BBqskPbjZm0=",
 }, {
 	Path:     "github.com/klauspost/compress",
 	Version:  CompressVersion,
