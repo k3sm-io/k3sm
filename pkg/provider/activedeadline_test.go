@@ -477,6 +477,18 @@ func TestActiveDeadlineFencesALateParkedCreate(t *testing.T) {
 	}
 }
 
+// waitBounded polls cond until it holds, failing the test after 30 s.
+func waitBounded(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // waitDeadlineStops waits for every active-deadline stop a resync started off
 // the tick to finish.
 func waitDeadlineStops(r *runtimedRuntime) { r.deadlineStops.Wait() }
@@ -488,11 +500,12 @@ type heldStopRuntime struct {
 	holdID  string
 	hold    chan struct{}
 	entered chan struct{}
+	once    sync.Once
 }
 
 func (h *heldStopRuntime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest) (*runtimev1.DeletePodResponse, error) {
 	if req.GetPodId() == h.holdID {
-		close(h.entered)
+		h.once.Do(func() { close(h.entered) })
 		<-h.hold
 	}
 	return h.fakeRuntimeServer.DeletePod(ctx, req)
@@ -527,6 +540,9 @@ func TestResyncNotBlockedByDeadlineStop(t *testing.T) {
 			close(h.hold)
 		}
 	}
+	// Cleanups run last-in first-out: the held stop is released before the
+	// provider is shut down, so a failed assertion does not leak the stop.
+	t.Cleanup(r.shutdown)
 	t.Cleanup(releaseA)
 	var pubMu sync.Mutex
 	published := map[string]*corev1.Pod{}
@@ -542,6 +558,11 @@ func TestResyncNotBlockedByDeadlineStop(t *testing.T) {
 	}
 	_ = recordedEvents(rec.Events)
 
+	// Drop the creates' own publications, so the unrelated pod's check below
+	// reads only what the resync published.
+	pubMu.Lock()
+	clear(published)
+	pubMu.Unlock()
 	clk.Step(20 * time.Minute)
 	done := make(chan struct{})
 	go func() {
@@ -550,12 +571,12 @@ func TestResyncNotBlockedByDeadlineStop(t *testing.T) {
 	}()
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("resync is held by a pod's deadline stop")
 	}
 	select {
 	case <-h.entered:
-	case <-time.After(5 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("pod A's stop never reached the runtime")
 	}
 	st, err := r.GetPodStatus(ctx, a.Namespace, a.Name)
@@ -565,7 +586,7 @@ func TestResyncNotBlockedByDeadlineStop(t *testing.T) {
 	if st.Phase != corev1.PodFailed || st.Reason != reasonDeadlineExceeded {
 		t.Fatalf("A status = %s/%s while its stop is held, want Failed/%s", st.Phase, st.Reason, reasonDeadlineExceeded)
 	}
-	waitFor(t, "pod B's stop while A's is held", func() bool {
+	waitBounded(t, "pod B's stop while A's is held", func() bool {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		for _, id := range f.deleteIDs {
@@ -587,15 +608,25 @@ func TestResyncNotBlockedByDeadlineStop(t *testing.T) {
 		r.shutdown()
 		close(shut)
 	}()
+	// Wait until shutdown has ended the lifetime, so the window below measures
+	// its wait on the stop, not a shutdown that has not started yet.
+	waitBounded(t, "shutdown to close the provider's lifetime", func() bool {
+		select {
+		case <-r.lifetime:
+			return true
+		default:
+			return false
+		}
+	})
 	select {
 	case <-shut:
 		t.Fatal("shutdown returned with a deadline stop in flight")
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(250 * time.Millisecond):
 	}
 	releaseA()
 	select {
 	case <-shut:
-	case <-time.After(5 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("shutdown did not return after the stop finished")
 	}
 	events := recordedEvents(rec.Events)
