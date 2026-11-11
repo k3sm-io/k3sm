@@ -95,8 +95,19 @@ func (r *runtimedRuntime) enforceActiveDeadlines(ctx context.Context) {
 		if d.t.rejected || d.t.evictedStatus() != nil || trackDeleting(d.t) {
 			continue
 		}
-		if err := r.failPastDeadline(ctx, d.pod, d.t); err != nil {
-			r.log.Warn("active deadline: could not stop the pod; retrying on the next resync",
+		err := r.failPastDeadline(ctx, d.pod, d.t)
+		// A stop that keeps failing is retried every resync: the first failure
+		// of a pod logs at Warn, the repeats at Debug, until a stop succeeds.
+		d.t.restartMu.Lock()
+		repeat := d.t.deadlineStopFailed
+		d.t.deadlineStopFailed = err != nil
+		d.t.restartMu.Unlock()
+		if err != nil {
+			log := r.log.Warn
+			if repeat {
+				log = r.log.Debug
+			}
+			log("active deadline: could not stop the pod; retrying on the next resync",
 				"pod", podKey(d.pod.Namespace, d.pod.Name), "uid", string(d.pod.UID), "err", err)
 		}
 	}
