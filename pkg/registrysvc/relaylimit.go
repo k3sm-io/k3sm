@@ -72,6 +72,13 @@ const (
 	// closed after the response that crosses the bound.
 	relayMaxRequestsPerConn = 100
 	relayMaxConnAge         = 10 * time.Minute
+	// relayWriteProgress and relayReadProgress bound how long one write of a
+	// response, or one read of a request body, may wait on the peer. They
+	// bound progress, not total time: a blob streams for as long as it takes
+	// while it keeps moving, and a peer that stops reading or sending loses
+	// its connection, and its slot, one window later.
+	relayWriteProgress = 60 * time.Second
+	relayReadProgress  = 60 * time.Second
 	// relaySourceTableMax bounds the per-address bucket table. A full table
 	// drops its idle entries and, if still full, starts over: the cost is a
 	// fresh bucket for every address, never a refusal.
@@ -88,6 +95,7 @@ type relayLimits struct {
 	writeWait                   time.Duration
 	maxRequestsPerConn          int
 	maxConnAge                  time.Duration
+	writeProgress, readProgress time.Duration
 	tableMax                    int
 }
 
@@ -103,6 +111,8 @@ var defaultRelayLimits = relayLimits{
 	writeWait:          relayWriteWait,
 	maxRequestsPerConn: relayMaxRequestsPerConn,
 	maxConnAge:         relayMaxConnAge,
+	writeProgress:      relayWriteProgress,
+	readProgress:       relayReadProgress,
 	tableMax:           relaySourceTableMax,
 }
 
