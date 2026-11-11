@@ -1497,6 +1497,90 @@ func TestCreateFailureAttribution(t *testing.T) {
 		}
 	})
 
+	// An image matches only as a delimited token, so a reference that is a
+	// prefix or a substring of a sibling's never claims the sibling's refusal,
+	// whichever the pod declares first.
+	t.Run("overlapping references", func(t *testing.T) {
+		podOf := func(containers ...[2]string) *corev1.Pod {
+			pod := runtimedPod("default", "overlap")
+			pod.Spec.Containers = nil
+			for _, c := range containers {
+				pod.Spec.Containers = append(pod.Spec.Containers,
+					corev1.Container{Name: c[0], Image: c[1], Command: []string{"/x"}})
+			}
+			return pod
+		}
+		short, long := "registry.example/a:1", "registry.example/a:10"
+		inner, outer := "registry.example/a:1", "mirror.registry.example/a:1-rc"
+		tests := []struct {
+			name          string
+			pod           *corev1.Pod
+			message       string
+			wantImage     string
+			wantContainer string
+		}{
+			{
+				"the longer of a prefix pair, the shorter declared first",
+				podOf([2]string{"c0", short}, [2]string{"c1", long}),
+				`pull image "registry.example/a:10": unexpected status 500`,
+				long, "",
+			},
+			{
+				"the longer of a prefix pair, the longer declared first",
+				podOf([2]string{"c0", long}, [2]string{"c1", short}),
+				`pull image "registry.example/a:10": unexpected status 500`,
+				long, "",
+			},
+			{
+				"the shorter of a prefix pair, the longer declared first",
+				podOf([2]string{"c0", long}, [2]string{"c1", short}),
+				`pull image "registry.example/a:1": unexpected status 500`,
+				short, "",
+			},
+			{
+				"the shorter of a prefix pair, the shorter declared first",
+				podOf([2]string{"c0", short}, [2]string{"c1", long}),
+				`pull image "registry.example/a:1": unexpected status 500`,
+				short, "",
+			},
+			{
+				"the outer of a substring-in-the-middle pair, the inner declared first",
+				podOf([2]string{"c0", inner}, [2]string{"c1", outer}),
+				`pull image "mirror.registry.example/a:1-rc": manifest unknown`,
+				outer, "",
+			},
+			{
+				"the inner of a substring-in-the-middle pair, the outer declared first",
+				podOf([2]string{"c0", outer}, [2]string{"c1", inner}),
+				`pull image "registry.example/a:1": manifest unknown`,
+				inner, "",
+			},
+			{
+				"the runtime's fixed sentence resolves the container and its image",
+				podOf([2]string{"sidecar", short}, [2]string{"app", long}),
+				`container app: image "registry.example/a:10" could not be pulled; the daemon log has the cause`,
+				long, "app",
+			},
+			{
+				"two containers sharing one image with no container token are the pod's",
+				podOf([2]string{"c0", short}, [2]string{"c1", short}),
+				`pull image "registry.example/a:1": unexpected status 500`,
+				short, "",
+			},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				image, container := attributeCreateFailure(tt.pod, tt.message)
+				if image != tt.wantImage {
+					t.Errorf("attributeCreateFailure image = %q, want %q", image, tt.wantImage)
+				}
+				if container != tt.wantContainer {
+					t.Errorf("attributeCreateFailure container = %q, want %q (empty is pod-wide)", container, tt.wantContainer)
+				}
+			})
+		}
+	})
+
 	t.Run("the unnamed containers are ContainerCreating with no message", func(t *testing.T) {
 		const boom = "unexpected status 500"
 		cf := &createFailure{

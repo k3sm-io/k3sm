@@ -267,6 +267,10 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
 
 ### Fixed
 
+- A `vm` pod whose create the runtime refuses over an image no longer reports the refusal against a
+  different image whose reference is a prefix or part of the refused one (`registry.example/a:1`
+  for a refusal about `registry.example/a:10`). The pod's waiting status and its retry schedule now
+  follow the image the refusal names.
 - A server whose control plane does not report healthy in time while the Mac is heavily loaded no
   longer parks on the crash-loop breaker after five attempts. It backs off instead, from 30 seconds
   doubling up to 10 minutes, `k3sm status` shows when the next attempt starts and that an attempt

@@ -1176,14 +1176,15 @@ func attributeArtifactFailure(pod *corev1.Pod, message string) (string, string) 
 // resolves first.
 func attributeCreateFailure(pod *corev1.Pod, message string) (string, string) {
 	cs := pullableContainers(pod, "")
-	var named []string
-	seen := map[string]bool{}
+	// An image counts as named only where it stands as a whole reference
+	// (imageTokenIndex), so "registry.example/a:1" is not named by a message
+	// that quotes "registry.example/a:10". Should several still match, the
+	// longest wins, then declaration order.
+	named := ""
 	for _, ci := range cs {
-		if seen[ci.image] || !strings.Contains(message, ci.image) {
-			continue
+		if len(ci.image) > len(named) && imageTokenIndex(message, ci.image) >= 0 {
+			named = ci.image
 		}
-		seen[ci.image] = true
-		named = append(named, ci.image)
 	}
 	// The named container is the one whose "container <name>:" token comes
 	// FIRST in the message, which is where runtimed's refusal puts its subject;
@@ -1200,8 +1201,8 @@ func attributeCreateFailure(pod *corev1.Pod, message string) (string, string) {
 	switch {
 	case container != "":
 		return imagesByContainer(pod)[container], container
-	case len(named) > 0:
-		return named[0], ""
+	case named != "":
+		return named, ""
 	case len(cs) > 0:
 		return cs[0].image, ""
 	default:
@@ -1231,6 +1232,46 @@ func tokenIndex(message, token string) int {
 		from = i + 1
 	}
 	return -1
+}
+
+// imageTokenIndex returns the byte offset of the first occurrence of image in
+// message that stands as a whole reference, or -1: the byte before it and the
+// byte after it are each absent or a byte no image reference can contain (a
+// quote, a space, a semicolon). A '.' or ':' right after it also ends it when
+// what follows is absent or such a byte, so a reference closing a sentence or
+// a wrapped error ("…/a:1: not found") still matches.
+func imageTokenIndex(message, image string) int {
+	if image == "" {
+		return -1
+	}
+	for from := 0; from <= len(message); {
+		i := strings.Index(message[from:], image)
+		if i < 0 {
+			return -1
+		}
+		i += from
+		end := i + len(image)
+		before := i == 0 || !isImageRefByte(message[i-1])
+		after := end == len(message) || !isImageRefByte(message[end]) ||
+			((message[end] == '.' || message[end] == ':') &&
+				(end+1 == len(message) || !isImageRefByte(message[end+1])))
+		if before && after {
+			return i
+		}
+		from = i + 1
+	}
+	return -1
+}
+
+// isImageRefByte reports whether b can appear in an image reference: an ASCII
+// letter or digit, or one of the separators the reference grammar uses
+// ('.', '-', '_', '/', ':', '@', '+').
+func isImageRefByte(b byte) bool {
+	switch b {
+	case '.', '-', '_', '/', ':', '@', '+':
+		return true
+	}
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
 }
 
 // isWordByte reports whether b is an ASCII letter, digit, '-' or '_'.
