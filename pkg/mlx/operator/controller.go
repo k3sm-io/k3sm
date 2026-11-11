@@ -157,8 +157,9 @@ const eventComponent = FieldManager
 
 // eventReasonArtifactUnresolved is the Event reason, and only the Event
 // reason, of a model whose artifact reference could not be resolved. Its
-// status still reports ReasonInvalidSpec; the Event tells a registry that
-// cannot be reached, which is retried, from a spec that cannot be rendered.
+// status still reports ReasonInvalidSpec and is unchanged. The reason means
+// the artifact reference could not be resolved, whether the registry could not
+// be reached or it refused or could not satisfy the reference.
 const eventReasonArtifactUnresolved = "ArtifactUnresolved"
 
 // Controller reconciles MLXModels into the objects that serve them.
@@ -479,8 +480,9 @@ func (c *Controller) reconcile(ctx context.Context, key string, rec EventRecorde
 	// error is retried, a missing resolver waits for the configuration.
 	if err := c.resolveArtifact(ctx, model); err != nil {
 		c.log.Warn("mlxmodel artifact cannot be resolved; no objects applied", "mlxmodel", key, "err", err)
-		// The status is InvalidSpec whatever the cause, but the Event names
-		// the cause: a registry outage that is retried is not a bad spec.
+		// The status is InvalidSpec whatever the cause and is unchanged. The
+		// Event says the artifact reference could not be resolved, whether the
+		// registry could not be reached or it refused the reference.
 		if werr := c.refuseWithEvent(ctx, rec, raw, model, invalidSpecFit(err), eventReasonArtifactUnresolved); werr != nil {
 			return werr
 		}

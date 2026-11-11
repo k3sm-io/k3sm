@@ -278,8 +278,8 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
 
 - An `MLXModel` the operator refuses now gets a Warning Event, so `kubectl describe` and
   `kubectl get events` show why it is not served. A spec that cannot be served gets reason
-  `InvalidSpec`, an artifact reference that cannot be resolved (including a cluster registry that
-  cannot be reached) gets `ArtifactUnresolved` while its `Ready` condition still says
+  `InvalidSpec`, an artifact reference that cannot be resolved (whether the registry cannot be
+  reached or it refuses or cannot satisfy the reference) gets `ArtifactUnresolved` while its `Ready` condition still says
   `InvalidSpec`, and a model that does not fit the node's GPU gets the same reason as its `Ready`
   condition, with the condition's message in every case. The Event is recorded
   once per refusal and reason per generation. A retry of the same refusal adds none, a model that
