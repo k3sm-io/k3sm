@@ -264,7 +264,8 @@ for the precise scope.
 ## MLXModel Not Serving
 
 Run `kubectl describe mlxmodel <name>`, then read the Events and the message of the `Ready`
-condition. A refused model gets one Warning Event per reason per generation:
+condition. A refused model gets one Warning Event per refusal and reason at a
+generation, and a new one if it is served and then refused again:
 
 - `InvalidSpec`: the spec cannot be served.
 - The `Ready` condition's fit-block reason (for example `NoGPU` or `MemoryExceedsWorkingSet`): the
