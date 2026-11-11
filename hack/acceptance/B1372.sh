@@ -42,12 +42,17 @@
 #         Ready
 #   t.4   a client Pod on each Mac (script by ConfigMap) POSTs /v1/chat/completions
 #         to the other Mac's replica through its Service: non-empty content, both ways
-#   t.5   no download from the internet: each serving Pod, read again, carries no
-#         egress annotation and reads its weights from the cluster registry by
-#         digest; `kubectl exec` in it sees HF_HUB_OFFLINE=1, an empty or absent Hub
-#         cache, and no Hub fetch (a models--* entry or an *.incomplete file) in the
-#         Pod's working tree, its HF_HOME or its Hub cache, the weights mount
-#         aside. Native pods have no egress deny, so reach is not tested. A write
+#   t.5   the pod is configured and shown offline, reads its weights by digest, and
+#         its tree shows no Hub cache or partial download: each serving Pod, read
+#         again, carries no egress annotation, reads its weights from the cluster
+#         registry by digest, and its Pod spec sets HF_HUB_OFFLINE=1 on mlx-serve;
+#         `kubectl exec` in it sees HF_HUB_OFFLINE=1 in the process env, an empty or
+#         absent Hub cache, and no Hub fetch (a models--* entry or an *.incomplete
+#         file) in the Pod's working tree, its HF_HOME or its Hub cache, the
+#         weights mount aside (read-only, below); `kubectl logs` of it does not
+#         name huggingface.co (the log is kept). It is NOT a network observation:
+#         native pods have no egress deny, so reach is not tested, and a download
+#         that completed and was moved elsewhere would not be seen. A write
 #         to the mounted weights fails with EPERM; an exec of a mounted file fails
 #         (errno RECORDED: EPERM is the profile, EACCES the mode); RECORDED as a
 #         stated negative, a copied and chmod +x'ed file runs from the data volume.
@@ -136,7 +141,7 @@ RUNGS=(
 	"t.3|both Ready; resolvedArtifact = the pushed digest; image volume by digest, no PVC, no egress, no trust_remote_code; cold time, fetch rate, peak footprint vs spec.memory"
 	"t.3b|kickstart the worker's node daemon mid-pull: the partial survives, the blob commits, the replica is Ready"
 	"t.4|a client Pod on each Mac gets a non-empty completion from the other Mac's replica"
-	"t.5|no download from the internet: no egress annotation, weights by digest, HF_HUB_OFFLINE=1, empty Hub cache, no Hub fetch in the pod's tree; write EPERM, exec fails; on each Mac one view of clones (inode, dev, blocks, 0444, root)"
+	"t.5|configured and shown offline, not a network observation (a download completed and moved elsewhere is not seen): no egress annotation, weights by digest, HF_HUB_OFFLINE=1 in the Pod spec and the process env, empty Hub cache, no Hub cache or partial download in the pod's tree, no huggingface.co in its log; write EPERM, exec fails; on each Mac one view of clones (inode, dev, blocks, 0444, root)"
 	"t.6|three replicas, two on the server Mac: free-space drop under 1% of the model, same view; warm time"
 	"t.7|delete, prune both Macs, model rm, registry prune: views gone, free space back within 1% on both caches and the registry store"
 	"f.1|cleanup green or red: namespace, MLXModels, ConfigMap, Pods, the pushed tag, remote scratch"
@@ -292,6 +297,26 @@ for p in items:
 print("\n".join(errs))
 sys.exit(1 if errs else 0)
 ' "$1" "$2" "$3" "$4" "$REG_HOST" "$EGRESS_ANNOTATION"
+}
+
+# pod_offline_env <pods.json>: each Pod's spec sets HF_HUB_OFFLINE to "1" on its
+# serving container (mlx-serve), every entry of that name, with at least one.
+pod_offline_env() {
+	py '
+import json, sys
+errs = []
+for p in json.load(open(sys.argv[1])).get("items", []):
+    n = p["metadata"]["name"]
+    cs = [c for c in (p.get("spec", {}).get("containers") or []) if c.get("name") == "mlx-serve"]
+    if len(cs) != 1:
+        errs.append("%s: the Pod spec has %d mlx-serve containers, want 1" % (n, len(cs)))
+        continue
+    vals = [e.get("value") for e in (cs[0].get("env") or []) if e.get("name") == "HF_HUB_OFFLINE"]
+    if not vals or any(v != "1" for v in vals):
+        errs.append("%s: the Pod spec does not set HF_HUB_OFFLINE=1 on mlx-serve (env has %s)" % (n, vals or "none"))
+print("\n".join(errs))
+sys.exit(1 if errs else 0)
+' "$1"
 }
 
 # pod_times <pod.json>: `<ready-seconds> <fetch-window-seconds>`: creation to Ready,
@@ -748,14 +773,6 @@ while time.time() < end:
 print("COMPLETION-ERROR " + err)
 sys.exit(1)
 '
-EGRESS_PY='import sys, urllib.request
-try:
-    urllib.request.urlopen(sys.argv[1], timeout=15)
-    print("EGRESS-REACHED")
-except Exception as e:
-    print("EGRESS-BLOCKED " + type(e).__name__)
-    sys.exit(1)
-'
 
 pod_json() { # <name> <node> <args-json> [annotations-json]
 	local ann="${4:-}"
@@ -789,7 +806,7 @@ svc_url() { # <model>
 
 t4() {
 	local cm out url pod node m ph logs
-	cm="$(py 'import json,sys; print(json.dumps({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"mst-probe","namespace":sys.argv[1]},"data":{"client.py":sys.argv[2],"egress.py":sys.argv[3]}}))' "$NS" "$CLIENT_PY" "$EGRESS_PY")"
+	cm="$(py 'import json,sys; print(json.dumps({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"mst-probe","namespace":sys.argv[1]},"data":{"client.py":sys.argv[2]}}))' "$NS" "$CLIENT_PY")"
 	out="$(kc apply -f - <<<"$cm" 2>&1)" || { bad "apply the probe ConfigMap: $out"; return 1; }
 	for pod in "mst-client-w|$WNODE|$MA" "mst-client-s|$SNODE|$MB"; do
 		IFS='|' read -r pod node m <<<"$pod"
@@ -855,6 +872,8 @@ for c in forms(hub):
             dirty.append("cache " + c)
     else:
         print("HUB-CACHE %s absent" % c)
+# Skipping the weights mount is safe because the mount is read-only: nothing can be
+# fetched into it, and t.5 proves that with the write-EPERM check in the same leg.
 skip = set(os.path.realpath(c) for c in forms(mount))
 seen, walked, cap = set(), 0, 200000
 for root in ["."] + forms(home) + forms(hub):
@@ -886,11 +905,19 @@ t5() {
 		[ "$m" = "$MA" ] || node="$WNODE"
 		kc get pods -n "$NS" -l "app.kubernetes.io/instance=$m" -o json >"$EV/t.5.$m.pods.json" || { bad "read $m pods"; return 1; }
 		out="$(pod_checks "$EV/t.5.$m.pods.json" "$DIGEST" "$node" 1)" || { bad "$m: $out"; return 1; }
+		# The public object first: the Pod spec sets the Hub offline; the exec'd
+		# process env below corroborates it.
+		out="$(pod_offline_env "$EV/t.5.$m.pods.json")" || { bad "$m: $out"; return 1; }
 		out="$(kc exec -n "$NS" "$pod" -- "$PYBIN" -c "$PROBE_HUB" "$MOUNT" 2>&1 || true)"
 		printf '%s\n' "$out" >"$EV/t.5.$pod.hub"
 		grep -qx 'HUB-OFFLINE 1' <<<"$out" || { bad "$pod: the Hub is not offline ($(grep -m 1 '^HUB-OFFLINE' <<<"$out" || tail -n 1 <<<"$out"))"; return 1; }
 		grep -qx 'HUB-CLEAN' <<<"$out" || { bad "$pod: the Hub cache is not empty or the tree shows a Hub fetch: $(grep -m 1 '^HUB-DIRTY' <<<"$out" || tail -n 1 <<<"$out")"; return 1; }
 		measure "t5_${m}_tree_entries_walked" "$(awk '$1 == "HUB-WALKED" {print $2}' <<<"$out")"
+		kc logs -n "$NS" "$pod" -c mlx-serve >"$EV/t.5.$pod.serve.log" 2>&1 || { bad "$pod: read the serving log: $(tail -n 1 "$EV/t.5.$pod.serve.log")"; return 1; }
+		if out="$(grep -m 1 -F 'huggingface.co' "$EV/t.5.$pod.serve.log")"; then
+			bad "$pod: the serving log names huggingface.co: $out"
+			return 1
+		fi
 		out="$(kc exec -n "$NS" "$pod" -- "$PYBIN" -c "$PROBE_WRITE" "$MOUNT/$first" 2>&1 || true)"
 		printf '%s\n' "$out" >"$EV/t.5.$pod.write"
 		errno="$(awk '$1 == "WRITE-ERRNO" {print $2}' <<<"$out")"
@@ -1236,10 +1263,14 @@ def reconcile(s):
                 if "trust-remote-code" in BRK:
                     args.append("--trust-remote-code")
                 ann = {"k3sm.io/internet-egress": "true"} if "egress-annotation" in BRK else {}
+                # hub-env-missing: the Pod spec lacks the setting the exec env still shows.
+                env = [{"name": "HF_HOME", "value": "/models"}]
+                if "hub-env-missing" not in BRK:
+                    env.append({"name": "HF_HUB_OFFLINE", "value": "1"})
                 p = {"apiVersion": "v1", "kind": "Pod",
                      "metadata": {"name": pn, "namespace": ns, "creationTimestamp": t, "annotations": ann,
                                   "labels": {"app.kubernetes.io/name": "mlx-model", "app.kubernetes.io/instance": name}},
-                     "spec": {"nodeName": node, "volumes": vols, "containers": [{"name": "mlx-serve", "image": "fake/mlx:1", "args": args}]},
+                     "spec": {"nodeName": node, "volumes": vols, "containers": [{"name": "mlx-serve", "image": "fake/mlx:1", "args": args, "env": env}]},
                      "status": {"phase": "Pending", "conditions": [{"type": "PodScheduled", "status": "True", "lastTransitionTime": t}]}}
                 s["pods"][pk] = p
                 if i >= 1 and "scale-copies" in BRK:
@@ -1280,7 +1311,15 @@ def hub_probe(pod, argv):
             b = os.path.join(cwd, "tmp", "dl", "blobs")
             os.makedirs(b)
             open(os.path.join(b, "0" * 64 + ".incomplete"), "w").close()
+        if "hub-models-dir" in BRK:
+            # A Hub repo dir beside the weights mount, not under it.
+            os.makedirs(os.path.join(cwd, "var", "lib", "mlx", "models--x"))
+        if "hub-cache-env" in BRK:
+            os.makedirs(os.path.join(cwd, "mst-elsewhere", "hub"))
+            open(os.path.join(cwd, "mst-elsewhere", "hub", "version.txt"), "w").write("1")
     env = {"PATH": os.environ.get("PATH", ""), "HOME": cwd, "HF_HOME": "/models"}
+    if "hub-cache-env" in BRK:
+        env["HF_HUB_CACHE"] = "/mst-elsewhere/hub"
     if "hub-online" not in BRK:
         env["HF_HUB_OFFLINE"] = "1"
     r = subprocess.run([sys.executable, "-I"] + argv[1:], cwd=cwd, env=env, capture_output=True, text=True)
@@ -1395,6 +1434,15 @@ def kubectl(argv):
         name = pos[1]
         if name.startswith("mst-client"):
             print("COMPLETION-EMPTY" if "empty-completion" in BRK else "COMPLETION-OK 12")
+            if "egress-late" in BRK:
+                # A late mutation: the serving Pods gain the egress annotation only
+                # after t.3 read them clean and t.4 got its completions.
+                for p in s["pods"].values():
+                    p["metadata"].setdefault("annotations", {})["k3sm.io/internet-egress"] = "true"
+        else:
+            print("INFO loading /var/lib/mlx/model\nINFO serving on :8080")
+            if "hub-log" in BRK:
+                print("INFO GET https://huggingface.co/api/models/x/revision/main 200")
     elif verb == "exec":
         code = " ".join(dash)
         if "HUB-OFFLINE" in code:
@@ -1632,6 +1680,7 @@ self_test() {
 	has "happy: footprint vs memory" "$(cat "$RUN_DIR/ev/measurements.tsv")" peak_footprint_over_spec_memory
 	has "happy: the Hub probe ran in the pod" "$(cat "$RUN_DIR/ev/"t.5.*-0.hub)" "HUB-OFFLINE 1"
 	has "happy: the Hub cache read under the pod" "$(cat "$RUN_DIR/ev/"t.5.*-0.hub)" "HUB-CACHE ./models/hub absent"
+	has "happy: the serving log recorded" "$(cat "$RUN_DIR/ev/"t.5.*-0.serve.log)" "INFO serving on"
 	if grep -q 'decoy' "$RUN_DIR/ev/"t.5.*-0.hub; then echo "self-test FAIL: happy: the Hub walk entered the weights mount"; bad=1; fi
 	has "happy: the kickstart landed" "$(cat "$RUN_DIR/state/calls")" "wrk launchctl kickstart -k system/io.k3sm.agent"
 
@@ -1641,7 +1690,8 @@ self_test() {
 		"version-fails|t.0" "push-digest|t.1" "push-bytes|t.1" "apply-refused|t.2" "create-refused|t.2" \
 		"resolved-mismatch|t.3" "pvc|t.3" "egress-annotation|t.3" "trust-remote-code|t.3" \
 		"no-partial|t.3b" "kick-truncates|t.3b" "empty-completion|t.4" \
-		"hub-online|t.5" "hub-cache-full|t.5" "hub-fetch|t.5" "write-ok|t.5" "write-eacces|t.5" "exec-ok|t.5" "view-hardlink|t.5" "view-twice|t.5" \
+		"hub-online|t.5" "hub-cache-full|t.5" "hub-fetch|t.5" "hub-env-missing|t.5" "egress-late|t.5" \
+		"hub-models-dir|t.5" "hub-cache-env|t.5" "hub-log|t.5" "write-ok|t.5" "write-eacces|t.5" "exec-ok|t.5" "view-hardlink|t.5" "view-twice|t.5" \
 		"scale-copies|t.6" "prune-keeps|t.7" "registry-keeps|t.7"; do
 		brk="${row%|*}" rung="${row#*|}"
 		fake_run "$brk" "$brk" 1 "result: FAIL ($rung)"
@@ -1653,6 +1703,19 @@ self_test() {
 	has "hub online: named" "$(cat "$RUN_DIR/out")" "the Hub is not offline (HUB-OFFLINE unset)"
 	has "hub online: later rungs not reached" "$(cat "$RUN_DIR/ev/result.tsv")" "$(printf 't.6\tNOT-REACHED')"
 	fake_run hub-fetch-again hub-fetch 1 "shows a Hub fetch: HUB-DIRTY fetch ./tmp/dl/blobs/"
+	# Each t.5 mutant above is red for its own reason, not merely red at t.5.
+	reason() { # <run name> <want in t.5's FAIL row of result.tsv>
+		has "$1: t.5 reason" "$(awk -F '\t' '$1 == "t.5" && $2 == "FAIL"' "$t/runs/$1/ev/result.tsv" 2>/dev/null)" "$2"
+	}
+	reason hub-cache-full "the Hub cache is not empty or the tree shows a Hub fetch: HUB-DIRTY cache ./models/hub"
+	reason hub-env-missing "the Pod spec does not set HF_HUB_OFFLINE=1 on mlx-serve"
+	has "hub-env-missing: the exec env still had it" "$(cat "$t/runs/hub-env-missing/out")" "t.4: PASS"
+	reason egress-late "carries k3sm.io/internet-egress"
+	for out in t.3 t.4; do has "egress-late: $out passed first" "$(cat "$t/runs/egress-late/out")" "$out: PASS"; done
+	reason hub-models-dir "shows a Hub fetch: HUB-DIRTY fetch ./var/lib/mlx/models--x"
+	reason hub-cache-env "the Hub cache is not empty or the tree shows a Hub fetch: HUB-DIRTY cache ./mst-elsewhere/hub"
+	reason hub-log "the serving log names huggingface.co: INFO GET https://huggingface.co/"
+	has "hub-log: the serving log is kept" "$(cat "$t/runs/hub-log/ev/"t.5.*-0.serve.log 2>/dev/null)" "huggingface.co"
 
 	# A cleanup that cannot remove the namespace fails a run whose rungs all passed.
 	fake_run ns-stuck ns-stuck 1 "f.1: FAIL"
