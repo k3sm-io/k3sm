@@ -316,8 +316,10 @@ func (s *sourceLimiter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // reading there must lose its slot too. The next request on the connection
 // clears that deadline before its handler runs, so a long silent handler is not
 // cut by a deadline left from the request before it. done clears the read
-// deadline unless the body is still unread: then the server drains it after the
-// handler, and that drain gets one more window rather than none. The errors
+// deadline only for a request with no body or a body read to its end. A body
+// still unread gets one more window for the server's drain after the handler;
+// a body whose read failed, a timeout included, keeps the deadline already
+// armed, so the drain fails at once and the connection closes. The errors
 // from setting a deadline are ignored: a writer that cannot take a deadline is
 // served unbounded rather than refused. Each deadline armed is recorded in the
 // connection's cut watch, so a cut it makes is logged once, where the timed-out
@@ -343,11 +345,15 @@ func (s *sourceLimiter) bindProgress(w http.ResponseWriter, r *http.Request) (ht
 	return pw, r, func() {
 		cut.armWrite(cutFlush)
 		_ = rc.SetWriteDeadline(time.Now().Add(s.lim.writeProgress))
-		if pr != nil && !pr.ended {
+		switch {
+		case pr != nil && pr.failed:
+			// The armed deadline stays: clearing it would let the server's
+			// drain of the unread rest block for good on a stalled peer.
+		case pr != nil && !pr.ended:
 			_ = rc.SetReadDeadline(time.Now().Add(s.lim.readProgress))
-			return
+		default:
+			_ = rc.SetReadDeadline(time.Time{})
 		}
-		_ = rc.SetReadDeadline(time.Time{})
 	}
 }
 
@@ -394,14 +400,18 @@ func (p *progressWriter) Flush() { _ = p.FlushError() }
 func (p *progressWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) { return p.rc.Hijack() }
 
 // progressReader arms a fresh read deadline before each read of the request
-// body, and clears it once the body ends: the server then reads the connection
-// in the background to notice the peer leaving, and that read must not time out.
+// body, and clears it once the body is read to io.EOF: the server then reads
+// the connection in the background to notice the peer leaving, and that read
+// must not time out. A read that fails any other way, a timeout included,
+// leaves the armed deadline in place and marks the read failed, so the
+// server's drain of the rest is bounded by it and the connection closes.
 type progressReader struct {
 	io.ReadCloser
-	rc    *http.ResponseController
-	d     time.Duration
-	cut   *cutWatch
-	ended bool
+	rc     *http.ResponseController
+	d      time.Duration
+	cut    *cutWatch
+	ended  bool
+	failed bool
 }
 
 func (p *progressReader) Read(b []byte) (int, error) {
@@ -409,7 +419,11 @@ func (p *progressReader) Read(b []byte) (int, error) {
 	n, err := p.ReadCloser.Read(b)
 	if err != nil {
 		p.ended = true
-		_ = p.rc.SetReadDeadline(time.Time{})
+		if errors.Is(err, io.EOF) {
+			_ = p.rc.SetReadDeadline(time.Time{})
+		} else {
+			p.failed = true
+		}
 		p.cut.read(err)
 	}
 	return n, err
