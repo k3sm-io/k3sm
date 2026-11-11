@@ -1497,9 +1497,17 @@ func TestCreateFailureAttribution(t *testing.T) {
 		}
 	})
 
-	// An image matches only as a delimited token, so a reference that is a
+	// An image matches as a whole reference first, so a reference that is a
 	// prefix or a substring of a sibling's never claims the sibling's refusal,
-	// whichever the pod declares first.
+	// whichever the pod declares first. Against the old first-declared substring
+	// match only two rows fail: "the longer of a prefix pair, the shorter
+	// declared first" and "the outer of a substring-in-the-middle pair, the
+	// inner declared first". The other prefix and substring rows are symmetry
+	// guards (they pass either way), and the last two pin the container token
+	// and a shared image. The fallback rows pin the second tier: when no image
+	// matches whole (the message carries a resolved or normalized form), the
+	// longest substring match wins, not the first declared image; each declares
+	// an unrelated image first so the first-image default cannot pass them.
 	t.Run("overlapping references", func(t *testing.T) {
 		podOf := func(containers ...[2]string) *corev1.Pod {
 			pod := runtimedPod("default", "overlap")
@@ -1567,6 +1575,36 @@ func TestCreateFailureAttribution(t *testing.T) {
 				`pull image "registry.example/a:1": unexpected status 500`,
 				short, "",
 			},
+			{
+				"fallback: a declared repository the message quotes with a tag",
+				podOf([2]string{"c0", "registry.example/z:1"}, [2]string{"c1", "r/a"}),
+				`pull image "r/a:latest": not found`,
+				"r/a", "",
+			},
+			{
+				"fallback: a declared repository the message quotes with a digest",
+				podOf([2]string{"c0", "registry.example/z:1"}, [2]string{"c1", "r/a"}),
+				`pull image "r/a@sha256:0123456789abcdef": manifest unknown`,
+				"r/a", "",
+			},
+			{
+				"fallback: a short name the message quotes normalized",
+				podOf([2]string{"c0", "registry.example/z:1"}, [2]string{"c1", "nginx:1.25"}),
+				`pull image "docker.io/library/nginx:1.25": unexpected status 500`,
+				"nginx:1.25", "",
+			},
+			{
+				"fallback: the longest substring match wins",
+				podOf([2]string{"c0", "registry.example/z:1"}, [2]string{"c1", "a"}, [2]string{"c2", "r/a"}),
+				`pull image "docker.io/r/a:latest": not found`,
+				"r/a", "",
+			},
+			{
+				"a whole match beats a longer substring-only match",
+				podOf([2]string{"c0", "registry.example/sidecar:1"}, [2]string{"c1", "registry.example/app:1"}),
+				`pull image "registry.example/app:1": manifest unknown; cached registry.example/sidecar:1.5 skipped`,
+				"registry.example/app:1", "",
+			},
 		}
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
@@ -1609,6 +1647,39 @@ func TestCreateFailureAttribution(t *testing.T) {
 			t.Errorf("the unnamed container carries failure_reason %v, want none", other.GetFailureReason())
 		}
 	})
+}
+
+// TestImageTokenIndex pins the boundary bytes of a whole image reference: an
+// image is matched only where neither neighbour can belong to a reference, and
+// a trailing '.' or ':' closes it only when nothing reference-like follows.
+func TestImageTokenIndex(t *testing.T) {
+	tests := []struct {
+		name    string
+		message string
+		image   string
+		want    int
+	}{
+		{"a longer tag", "a:1.5", "a:1", -1},
+		{"a colon then a reference byte", "a:1:x", "a:1", -1},
+		{"a wrapped error", "a:1: not found", "a:1", 0},
+		{"a full stop at the end", "pull a:1.", "a:1", 5},
+		{"a trailing comma", "a:1, then more", "a:1", 0},
+		{"a closing parenthesis", "(a:1)", "a:1", 1},
+		{"a closing quote", `pull "a:1"`, "a:1", 6},
+		{"a digest reference", `pull "r/a@sha256:0123abcd": x`, "r/a@sha256:0123abcd", 6},
+		{"a digest after the declared tag", "a:1@sha256:0123abcd", "a:1", -1},
+		{"a registry with a port", `pull "localhost:5000/a:1"`, "localhost:5000/a:1", 6},
+		{"a tail of a registry-with-port reference", `pull "localhost:5000/a:1"`, "a:1", -1},
+		{"twice, the first occurrence unbounded", "a:1.5 then a:1", "a:1", 11},
+		{"an empty image", "a:1", "", -1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := imageTokenIndex(tt.message, tt.image); got != tt.want {
+				t.Errorf("imageTokenIndex(%q, %q) = %d, want %d", tt.message, tt.image, got, tt.want)
+			}
+		})
+	}
 }
 
 // TestVMRunAsNonRootRefusalParksTheNamedContainer pins the kubelet surface of a

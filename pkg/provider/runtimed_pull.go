@@ -1176,16 +1176,7 @@ func attributeArtifactFailure(pod *corev1.Pod, message string) (string, string) 
 // resolves first.
 func attributeCreateFailure(pod *corev1.Pod, message string) (string, string) {
 	cs := pullableContainers(pod, "")
-	// An image counts as named only where it stands as a whole reference
-	// (imageTokenIndex), so "registry.example/a:1" is not named by a message
-	// that quotes "registry.example/a:10". Should several still match, the
-	// longest wins, then declaration order.
-	named := ""
-	for _, ci := range cs {
-		if len(ci.image) > len(named) && imageTokenIndex(message, ci.image) >= 0 {
-			named = ci.image
-		}
-	}
+	named := namedImage(cs, message)
 	// The named container is the one whose "container <name>:" token comes
 	// FIRST in the message, which is where runtimed's refusal puts its subject;
 	// declaration order must not decide it, or a message that also mentions a
@@ -1208,6 +1199,32 @@ func attributeCreateFailure(pod *corev1.Pod, message string) (string, string) {
 	default:
 		return "", ""
 	}
+}
+
+// namedImage returns the declared image a create refusal names, or "". The
+// match is two-tier. First an image counts only where it stands as a whole
+// reference (imageTokenIndex), so "registry.example/a:1" is not named by a
+// message that quotes "registry.example/a:10". Only when no declared image
+// matches whole does a plain substring match count, because the runtime may
+// quote a resolved or normalized form ("r/a:latest" or "r/a@sha256:…" for a
+// declared "r/a", "docker.io/library/nginx:1.25" for "nginx:1.25"). In either
+// tier the longest match wins, then declaration order.
+func namedImage(cs []containerImage, message string) string {
+	named := ""
+	for _, ci := range cs {
+		if len(ci.image) > len(named) && imageTokenIndex(message, ci.image) >= 0 {
+			named = ci.image
+		}
+	}
+	if named != "" {
+		return named
+	}
+	for _, ci := range cs {
+		if ci.image != "" && len(ci.image) > len(named) && strings.Contains(message, ci.image) {
+			named = ci.image
+		}
+	}
+	return named
 }
 
 // containerTokenIndex returns the byte offset of the first "container <name>:"
