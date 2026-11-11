@@ -392,18 +392,36 @@ when any deletion fails, after printing the report.
 ```sh
 sudo k3sm image rm <ref|digest>                       # report what would go
 sudo k3sm image rm <ref|digest> --force               # evict it
-sudo k3sm image rm <ref> --platform linux/arm64       # one platform entry of a reference
+sudo k3sm image rm <ref> --platform darwin/arm64      # one platform entry of a reference
 sudo k3sm image rm <ref|digest> -o json               # the report as one JSON document
 ```
 
 Without `--force` it only reports what it would evict and deletes nothing. It never touches
-the cluster registry. The node's runtime daemon keeps every blob that a Pod, a root, an
-in-flight ingest or another cached image still needs, and the report lists each kept blob with
-the reason, and says the eviction was partial when any blob is kept. The text report shows at
-most 20 kept blobs; `-o json` lists them all. `--platform` narrows a reference that has several
-platform entries, and the command refuses it together with a digest, since a digest already
-names one manifest. The command exits 1 on any failure. A node whose runtime daemon is too old
-to serve `rm` deletes nothing and tells you to upgrade it; `rm` never falls back to `prune`.
+the cluster registry. The node's runtime daemon (runtimed) keeps every blob that a Pod, a root,
+an in-flight ingest or another cached image still needs, and the report lists each kept blob
+with the reason, and says the eviction was partial when any blob is kept. The text report shows
+at most 20 kept blobs; `-o json` lists them all. Without `--force` the lists are a plan, not a
+promise: a later forced run can keep more blobs than the report showed.
+
+Blobs younger than the daemon's grace window are kept, since a pull may still be in flight.
+When every kept blob is young and nothing is evicted, the command says to retry once the window
+has passed.
+
+`--platform` narrows a reference that has several platform entries, and the command refuses it
+together with a digest, since a digest already names one manifest. The command exits 1 on any
+failure. A refusal deletes nothing, with one exception noted below:
+
+- A Pod on this node still uses the image. Retry once the Pod is gone.
+- The reference names more than one image on this node. Retry with `--platform`, as above, or
+  name the image by its digest.
+- Nothing on this node has that name. `k3sm image prune` reclaims blobs no name holds.
+- The daemon could not read every record that protects blobs. It may already have unlinked some
+  blobs, and its message then counts them. Check the daemon's log, repair the record and re-run.
+
+If the daemon fails partway, some blobs may already be unlinked. The kept list is in the daemon's
+log, and a re-run converges. A node whose runtimed is too old to serve `rm` deletes nothing and
+tells you to upgrade it: run `k3sm install`, then restart runtimed. `rm` never falls back to
+`prune`.
 
 The `-o json` document has the keys `manifestDigest`, `dryRun` (true without `--force`),
 `removedDigests`, `kept` (each blob with its `digest` and `reason`) and `reclaimedBytes`.
