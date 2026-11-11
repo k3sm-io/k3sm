@@ -19,12 +19,16 @@ package registrysvc
 import (
 	"bufio"
 	"context"
+	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
+	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -144,12 +148,80 @@ func sourceOfString(s string) string {
 }
 
 // relayConn is what a connection carries into each request's context: when it
-// was accepted and how many requests it has served. requests is touched only
-// by the connection's own serving goroutine, which serves one request at a time.
+// was accepted, how many requests it has served, and its cut watch. requests is
+// touched only by the connection's own serving goroutine, which serves one
+// request at a time. cut is set once, before the connection is served, and is
+// nil for a connection the relay's listener did not accept.
 type relayConn struct {
 	opened   time.Time
 	requests int
+	cut      *cutWatch
 }
+
+// Directions of a deadline cut, as the cut's log line names them.
+const (
+	cutWrite = "write"
+	cutRead  = "read"
+	cutFlush = "flush"
+)
+
+// cutWatch reports, once, that one of the relay's own deadlines cut its
+// connection. The write deadline the relay last armed is recorded in armed, so
+// a write that times out under it is told apart from one under the server's TLS
+// handshake deadline, which the relay does not own. A read is reported where it
+// is observed, by the progressReader that armed its deadline just before. Both
+// fields are atomic: the response is written from the handler's goroutine and
+// the serving goroutine, and a request body can be read from another.
+type cutWatch struct {
+	log                         *slog.Logger
+	remote                      string
+	writeProgress, readProgress time.Duration
+	armed                       atomic.Pointer[string] // the relay's write deadline in force: nil, cutWrite or cutFlush
+	logged                      atomic.Bool
+}
+
+// armWrite records which of the relay's write deadlines is in force; "" is none.
+func (w *cutWatch) armWrite(dir string) {
+	if w == nil {
+		return
+	}
+	if dir == "" {
+		w.armed.Store(nil)
+		return
+	}
+	w.armed.Store(&dir)
+}
+
+// wrote reports a cut when err is a write timing out under a relay deadline.
+func (w *cutWatch) wrote(err error) {
+	if w == nil || !isDeadline(err) {
+		return
+	}
+	if dir := w.armed.Load(); dir != nil {
+		w.cut(*dir, w.writeProgress)
+	}
+}
+
+// read reports a cut when err is a request-body read timing out under the
+// read deadline the relay armed before it.
+func (w *cutWatch) read(err error) {
+	if w == nil || !isDeadline(err) {
+		return
+	}
+	w.cut(cutRead, w.readProgress)
+}
+
+// cut logs the cut, at most once per connection.
+func (w *cutWatch) cut(dir string, window time.Duration) {
+	if w.log == nil || !w.logged.CompareAndSwap(false, true) {
+		return
+	}
+	w.log.Warn("ingest registry relay cut a stalled connection: the peer made no progress within the window",
+		"direction", dir, "window", window, "remote", w.remote)
+}
+
+// isDeadline reports whether err is a deadline expiring.
+func isDeadline(err error) bool { return err != nil && errors.Is(err, os.ErrDeadlineExceeded) }
 
 // relayConnKey is the context key a relayConn is stored under.
 type relayConnKey struct{}
@@ -160,6 +232,9 @@ type sourceLimiter struct {
 	next http.Handler
 	lim  relayLimits
 	now  func() time.Time
+	// log receives the line for a connection a relay deadline cut. Nil logs
+	// nothing.
+	log *slog.Logger
 
 	mu      sync.Mutex // guards sources
 	sources map[string]*sourceBuckets
@@ -184,10 +259,20 @@ func newSourceLimiter(next http.Handler, lim relayLimits, now func() time.Time) 
 	return &sourceLimiter{next: next, lim: lim, now: now, sources: map[string]*sourceBuckets{}}
 }
 
-// ConnContext stamps a new connection with its relayConn. It is the
-// http.Server's ConnContext.
-func (s *sourceLimiter) ConnContext(ctx context.Context, _ net.Conn) context.Context {
-	return context.WithValue(ctx, relayConnKey{}, &relayConn{opened: s.now()})
+// ConnContext stamps a new connection with its relayConn and, when the relay's
+// listener accepted it, hands the connection the same cut watch. It is the
+// http.Server's ConnContext, so it runs before the connection is served.
+func (s *sourceLimiter) ConnContext(ctx context.Context, c net.Conn) context.Context {
+	rc := &relayConn{opened: s.now()}
+	under := c
+	if t, ok := under.(interface{ NetConn() net.Conn }); ok {
+		under = t.NetConn()
+	}
+	if lc, ok := under.(*limitConn); ok {
+		rc.cut = &cutWatch{log: s.log, remote: c.RemoteAddr().String(), writeProgress: s.lim.writeProgress, readProgress: s.lim.readProgress}
+		lc.cut = rc.cut
+	}
+	return context.WithValue(ctx, relayConnKey{}, rc)
 }
 
 // ServeHTTP applies the limits, then hands the request to the gate.
@@ -233,22 +318,30 @@ func (s *sourceLimiter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // cut by a deadline left from the request before it. done clears the read
 // deadline unless the body is still unread: then the server drains it after the
 // handler, and that drain gets one more window rather than none. The errors
-// from setting a deadline are ignored: the limiter has no logger, and a writer
-// that cannot take a deadline is served unbounded rather than refused.
+// from setting a deadline are ignored: a writer that cannot take a deadline is
+// served unbounded rather than refused. Each deadline armed is recorded in the
+// connection's cut watch, so a cut it makes is logged once, where the timed-out
+// write or read is observed.
 func (s *sourceLimiter) bindProgress(w http.ResponseWriter, r *http.Request) (http.ResponseWriter, *http.Request, func()) {
+	var cut *cutWatch
+	if c, ok := r.Context().Value(relayConnKey{}).(*relayConn); ok {
+		cut = c.cut
+	}
 	rc := http.NewResponseController(w)
+	cut.armWrite("")
 	_ = rc.SetWriteDeadline(time.Time{})
-	pw := &progressWriter{ResponseWriter: w, rc: rc, d: s.lim.writeProgress}
+	pw := &progressWriter{ResponseWriter: w, rc: rc, d: s.lim.writeProgress, cut: cut}
 	var pr *progressReader
 	if r.Body != nil && r.Body != http.NoBody && r.ContentLength != 0 {
 		// Armed before the handler runs: a handler that answers without
 		// reading the body makes the server drain it before the response
 		// goes out, and that drain is bounded by this deadline too.
 		_ = rc.SetReadDeadline(time.Now().Add(s.lim.readProgress))
-		pr = &progressReader{ReadCloser: r.Body, rc: rc, d: s.lim.readProgress}
+		pr = &progressReader{ReadCloser: r.Body, rc: rc, d: s.lim.readProgress, cut: cut}
 		r.Body = pr
 	}
 	return pw, r, func() {
+		cut.armWrite(cutFlush)
 		_ = rc.SetWriteDeadline(time.Now().Add(s.lim.writeProgress))
 		if pr != nil && !pr.ended {
 			_ = rc.SetReadDeadline(time.Now().Add(s.lim.readProgress))
@@ -261,11 +354,15 @@ func (s *sourceLimiter) bindProgress(w http.ResponseWriter, r *http.Request) (ht
 // progressWriter arms a fresh write deadline before each write to the peer.
 type progressWriter struct {
 	http.ResponseWriter
-	rc *http.ResponseController
-	d  time.Duration
+	rc  *http.ResponseController
+	d   time.Duration
+	cut *cutWatch
 }
 
-func (p *progressWriter) arm() { _ = p.rc.SetWriteDeadline(time.Now().Add(p.d)) }
+func (p *progressWriter) arm() {
+	p.cut.armWrite(cutWrite)
+	_ = p.rc.SetWriteDeadline(time.Now().Add(p.d))
+}
 
 func (p *progressWriter) WriteHeader(code int) {
 	p.arm()
@@ -303,6 +400,7 @@ type progressReader struct {
 	io.ReadCloser
 	rc    *http.ResponseController
 	d     time.Duration
+	cut   *cutWatch
 	ended bool
 }
 
@@ -312,6 +410,7 @@ func (p *progressReader) Read(b []byte) (int, error) {
 	if err != nil {
 		p.ended = true
 		_ = p.rc.SetReadDeadline(time.Time{})
+		p.cut.read(err)
 	}
 	return n, err
 }
