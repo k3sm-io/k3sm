@@ -68,6 +68,13 @@ func DeleteManifest(ctx context.Context, ref name.Digest, state string, auth aut
 	return err
 }
 
+// IfMatchTransport returns base with If-Match: etag set on every DELETE it
+// carries, and every other request unchanged. etag is the whole field value,
+// quotes included.
+func IfMatchTransport(base http.RoundTripper, etag string) http.RoundTripper {
+	return ifMatchTransport{base: base, etag: etag}
+}
+
 // ifMatchTransport sets If-Match on every DELETE it carries. Only the DELETE
 // is conditional; the ping and token requests before it go out unchanged.
 type ifMatchTransport struct {

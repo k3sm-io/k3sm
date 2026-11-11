@@ -116,3 +116,42 @@ func TestImageUntagDigestGuardHoldsAgainstConcurrentRepoint(t *testing.T) {
 		t.Errorf("app:v1 = %s, want the re-pointed %s", got, want)
 	}
 }
+
+// TestImageUntagDigestDeletesAnUnmovedTag pins the other half of the guard
+// against the registry server: a tag that still names the --digest is removed,
+// so the conditional delete is not a refusal of every guarded untag.
+func TestImageUntagDigestDeletesAnUnmovedTag(t *testing.T) {
+	srv := newRegistryServer(t)
+	direct := []remote.Option{remote.WithContext(t.Context()), remote.WithTransport(handlerTransport{srv})}
+	ref, err := name.NewTag(registrysvc.LoopbackAuthority(6450) + "/app:v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	img, err := random.Image(128, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := remote.Write(ref, img, direct...); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	dir := t.TempDir()
+	if err := os.MkdirAll(registrysvc.StateDir(dir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := registrysvc.WriteCredential(dir, registrysvc.Credential{
+		Address: "127.0.0.1:6450", Username: "k3sm", Password: "secret",
+	}); err != nil {
+		t.Fatalf("write credential: %v", err)
+	}
+	t.Setenv("K3SM_WORK_DIR", dir)
+	prev := defaultRegistryTransport
+	defaultRegistryTransport = handlerTransport{srv}
+	t.Cleanup(func() { defaultRegistryTransport = prev })
+
+	if out, err := runImageCmd(t, []string{"--work-dir", dir, "untag", "app:v1", "--digest", mustDigest(t, img)}); err != nil {
+		t.Fatalf("untag --digest of an unmoved tag: %v\n%s", err, out)
+	}
+	if _, err := remote.Head(ref, direct...); err == nil {
+		t.Errorf("app:v1 survived its untag")
+	}
+}
