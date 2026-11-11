@@ -17,7 +17,9 @@ limitations under the License.
 package registrysvc
 
 import (
+	"bufio"
 	"context"
+	"io"
 	"net"
 	"net/http"
 	"net/netip"
@@ -186,6 +188,8 @@ func (s *sourceLimiter) ConnContext(ctx context.Context, _ net.Conn) context.Con
 
 // ServeHTTP applies the limits, then hands the request to the gate.
 func (s *sourceLimiter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w, r, done := s.bindProgress(w, r)
+	defer done()
 	if rc, ok := r.Context().Value(relayConnKey{}).(*relayConn); ok {
 		rc.requests++
 		if rc.requests >= s.lim.maxRequestsPerConn || s.now().Sub(rc.opened) >= s.lim.maxConnAge {
@@ -211,6 +215,94 @@ func (s *sourceLimiter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.next.ServeHTTP(w, r)
+}
+
+// bindProgress bounds the request by progress: every write of the response
+// must reach the peer within writeProgress of its start, and every read of the
+// request body within readProgress. A response or body that keeps moving is
+// never cut, however long it takes; one that stalls fails its write or read,
+// and the server closes the connection, which frees its slot. done clears the
+// write deadline when the handler returns, and the read deadline too unless the
+// body is still unread: then the server drains it after the handler, and that
+// drain gets one more window rather than none.
+func (s *sourceLimiter) bindProgress(w http.ResponseWriter, r *http.Request) (http.ResponseWriter, *http.Request, func()) {
+	rc := http.NewResponseController(w)
+	pw := &progressWriter{ResponseWriter: w, rc: rc, d: s.lim.writeProgress}
+	var pr *progressReader
+	if r.Body != nil && r.Body != http.NoBody && r.ContentLength != 0 {
+		// Armed before the handler runs: a handler that answers without
+		// reading the body makes the server drain it before the response
+		// goes out, and that drain is bounded by this deadline too.
+		_ = rc.SetReadDeadline(time.Now().Add(s.lim.readProgress))
+		pr = &progressReader{ReadCloser: r.Body, rc: rc, d: s.lim.readProgress}
+		r.Body = pr
+	}
+	return pw, r, func() {
+		_ = rc.SetWriteDeadline(time.Time{})
+		if pr != nil && !pr.ended {
+			_ = rc.SetReadDeadline(time.Now().Add(s.lim.readProgress))
+			return
+		}
+		_ = rc.SetReadDeadline(time.Time{})
+	}
+}
+
+// progressWriter arms a fresh write deadline before each write to the peer.
+type progressWriter struct {
+	http.ResponseWriter
+	rc *http.ResponseController
+	d  time.Duration
+}
+
+func (p *progressWriter) arm() { _ = p.rc.SetWriteDeadline(time.Now().Add(p.d)) }
+
+func (p *progressWriter) WriteHeader(code int) {
+	p.arm()
+	p.ResponseWriter.WriteHeader(code)
+}
+
+func (p *progressWriter) Write(b []byte) (int, error) {
+	p.arm()
+	return p.ResponseWriter.Write(b)
+}
+
+// Unwrap gives http.ResponseController, and so Flush, the response underneath.
+// A flush the handler asks for goes through FlushError below, so it is bounded
+// too.
+func (p *progressWriter) Unwrap() http.ResponseWriter { return p.ResponseWriter }
+
+// FlushError arms the write deadline, then flushes the response underneath.
+func (p *progressWriter) FlushError() error {
+	p.arm()
+	return p.rc.Flush()
+}
+
+// Flush is FlushError for callers that only know http.Flusher.
+func (p *progressWriter) Flush() { _ = p.FlushError() }
+
+// Hijack hands over the connection underneath, for a caller that only knows
+// http.Hijacker: the gate hijacks to close a read's connection with no
+// response when the registry is gone.
+func (p *progressWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) { return p.rc.Hijack() }
+
+// progressReader arms a fresh read deadline before each read of the request
+// body, and clears it once the body ends: the server then reads the connection
+// in the background to notice the peer leaving, and that read must not time out.
+type progressReader struct {
+	io.ReadCloser
+	rc    *http.ResponseController
+	d     time.Duration
+	ended bool
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	_ = p.rc.SetReadDeadline(time.Now().Add(p.d))
+	n, err := p.ReadCloser.Read(b)
+	if err != nil {
+		p.ended = true
+		_ = p.rc.SetReadDeadline(time.Time{})
+	}
+	return n, err
 }
 
 // reserve takes one token from src's request bucket and, for a write, one from
