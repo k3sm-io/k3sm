@@ -41,6 +41,8 @@ TestFlatService kept the relay and cluster publication do not touch the child
 TestFlatServingSANs kept the relay and cluster publication do not touch the child
 TestGateAndServerAgree added new with the child switch
 TestGateAnswers502WhenTheUpstreamStalls added the gate's upstream has a response-header timeout
+TestGateLeavesBlobUploadsOutOfTheHeaderBound added a blob upload commit is held to the registry's upload bound
+TestGateReadErrorLogsCancellationAtDebug added a read the client cancelled is not a warning
 TestGateRefusesLongLivedBuilderToken kept the push gate is unchanged
 TestGateWriteErrorIs502WhenUpstreamIsDown added an authorized write to a closed upstream is a 502
 TestGenerateCredential kept the credential files are unchanged

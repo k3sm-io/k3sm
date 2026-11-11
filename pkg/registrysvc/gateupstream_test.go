@@ -17,7 +17,16 @@ limitations under the License.
 package registrysvc
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -112,4 +121,61 @@ func TestGateWriteErrorIs502WhenUpstreamIsDown(t *testing.T) {
 	r := rawDo(t, front, "PUT", "/v2/team/app/manifests/V1.0",
 		map[string]string{"Authorization": basic(tokTeam)}, "{}")
 	assertUnavailable502(t, r)
+}
+
+// TestGateLeavesBlobUploadsOutOfTheHeaderBound: the registry commits a blob
+// upload before it writes a header, so a final blob PUT is held to the
+// upload bound, not the short one; past the short bound it is still waiting.
+func TestGateLeavesBlobUploadsOutOfTheHeaderBound(t *testing.T) {
+	const bound = 200 * time.Millisecond
+	front := upstreamGate(t, stallingUpstream(t), bound)
+	c, err := front.dial()
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+	req := fmt.Sprintf("PUT /v2/team/app/blobs/uploads/abc-123?digest=%s HTTP/1.1\r\nHost: registry.test\r\n"+
+		"Authorization: %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", digestA, basic(tokTeam))
+	if _, err := io.WriteString(c, req); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_ = c.SetReadDeadline(time.Now().Add(5 * bound))
+	buf := make([]byte, 1)
+	n, err := c.Read(buf)
+	var ne net.Error
+	if !errors.As(err, &ne) || !ne.Timeout() {
+		t.Fatalf("read after %v = %d bytes, %v; want the upload still waiting on the registry", 5*bound, n, err)
+	}
+}
+
+// TestGateReadErrorLogsCancellationAtDebug: a read that cannot reach the
+// registry is a Warn naming the method and path, unless the client cancelled
+// it, which is a Debug.
+func TestGateReadErrorLogsCancellationAtDebug(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		err   error
+		level string
+	}{
+		{"an unreachable registry is a warning", errors.New("connection refused"), "WARN"},
+		{"a client's cancellation is debug", fmt.Errorf("proxy: %w", context.Canceled), "DEBUG"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			log := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+			g := newGate(gateConfig{Upstream: "127.0.0.1:1", Logger: log})
+			r := httptest.NewRequest(http.MethodGet, "/v2/team/app/blobs/"+digestA, nil)
+			g.readError(httptest.NewRecorder(), r, tc.err)
+			var line map[string]any
+			if err := json.Unmarshal(buf.Bytes(), &line); err != nil {
+				t.Fatalf("log line %q: %v", buf.String(), err)
+			}
+			if line["level"] != tc.level {
+				t.Errorf("level = %v, want %s", line["level"], tc.level)
+			}
+			if line["method"] != "GET" || line["path"] != "/v2/team/app/blobs/"+digestA {
+				t.Errorf("method, path = %v, %v; want the request's", line["method"], line["path"])
+			}
+		})
+	}
 }
