@@ -719,6 +719,11 @@ type statusKubeInputs struct {
 	// would tell an operator to re-join a worker that is perfectly joined.
 	// A nil stat means os.Stat.
 	stat func(string) error
+	// asRoot says this process runs as root and sudoUser is $SUDO_USER: as root
+	// run by sudo, an invoker's kubeconfig is checked before it is used
+	// (vetSudoKubeconfig).
+	asRoot   bool
+	sudoUser string
 }
 
 // statPath reports why a path is unusable, or nil when it is there and
@@ -743,6 +748,8 @@ func statusKubeInputsFor(role install.Role, paths status.Paths) statusKubeInputs
 		kubeconfigEnv:   os.Getenv("KUBECONFIG"),
 		home:            home,
 		exists:          fileExists,
+		asRoot:          kubectlGeteuid() == 0,
+		sudoUser:        os.Getenv("SUDO_USER"),
 	}
 }
 
@@ -787,6 +794,8 @@ func statusKubeconfig(in statusKubeInputs) (kubectlConfig, error) {
 		home:            in.home,
 		contextName:     installedKubeconfigName(),
 		exists:          in.exists,
+		asRoot:          in.asRoot,
+		sudoUser:        in.sudoUser,
 	})
 }
 
@@ -845,7 +854,26 @@ func statusUserKubeFor(role install.Role, joinServer func() (string, error), sta
 		return nil
 	}
 	return func() (status.Kube, string, error) {
+		// As root run by sudo these are the invoker's files: check them, and
+		// read the checked bytes.
+		home, _ := os.UserHomeDir()
+		vc, err := vetSudoKubeconfig(kubectlInputs{
+			kubeconfigEnv: os.Getenv("KUBECONFIG"),
+			home:          home,
+			asRoot:        kubectlGeteuid() == 0,
+		}.withSudoInvoker(), kubectlConfig{})
+		if err != nil {
+			return nil, "", err
+		}
 		rules := clientcmd.NewDefaultClientConfigLoadingRules()
+		vetted, cleanup, err := vettedLoadingRules(vc)
+		if err != nil {
+			return nil, "", err
+		}
+		defer cleanup()
+		if vetted != nil {
+			rules = vetted
+		}
 		raw, err := rules.Load()
 		if err != nil {
 			return nil, "", err
@@ -859,7 +887,7 @@ func statusUserKubeFor(role install.Role, joinServer func() (string, error), sta
 		if !ok {
 			return nil, "", fmt.Errorf("neither the %q context nor the current one points at the server this Mac joined", name)
 		}
-		return buildStatusKube(kubectlConfig{context: ctxName})
+		return buildStatusKube(kubectlConfig{context: ctxName, vetted: vc.vetted})
 	}
 }
 
@@ -874,6 +902,17 @@ func buildStatusKube(cfg kubectlConfig) (status.Kube, string, error) {
 	if cfg.context != "" {
 		overrides.CurrentContext = cfg.context
 	}
+	source := kubeSource(cfg, rules)
+	// As root run by sudo the files were checked; load the checked bytes
+	// rather than read the invoker's paths a second time.
+	vetted, cleanup, err := vettedLoadingRules(cfg)
+	if err != nil {
+		return nil, "", err
+	}
+	defer cleanup()
+	if vetted != nil {
+		rules = vetted
+	}
 	loader := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, overrides)
 	restCfg, err := loader.ClientConfig()
 	if err != nil {
@@ -885,7 +924,7 @@ func buildStatusKube(cfg kubectlConfig) (status.Kube, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	return restKube{client: cs, server: restCfg.Host, tls: tlsPosture(restCfg), cfg: restCfg}, kubeSource(cfg, rules), nil
+	return restKube{client: cs, server: restCfg.Host, tls: tlsPosture(restCfg), cfg: restCfg}, source, nil
 }
 
 // tlsPosture describes how a rest config trusts the apiserver, in the two words

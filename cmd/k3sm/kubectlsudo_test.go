@@ -17,10 +17,14 @@ limitations under the License.
 package main
 
 import (
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/user"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"k3sm.io/k3sm/pkg/executor"
@@ -248,4 +252,135 @@ func TestSudoKubectlRefusesAnExecKubeconfigFromHome(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestSudoRootVerbsRefuseAnInvokerKubeconfig: every verb that loads a kubeconfig
+// itself as root under sudo (`k3sm interconnect`, `k3sm status` and its worker
+// fallback, `k3sm kubeconfig`) checks the invoker's file the way `k3sm kubectl`
+// does, and refuses before any API call or plugin run.
+func TestSudoRootVerbsRefuseAnInvokerKubeconfig(t *testing.T) {
+	me, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One fixture per case: a home, an apiserver that counts requests, and an
+	// exec plugin that leaves a marker when it runs.
+	type fixture struct {
+		home, marker, server string
+		hits                 *atomic.Int32
+	}
+	setup := func(t *testing.T) fixture {
+		prevCredential, prevEUID, prevCopyDir := installedNodeCredential, kubectlGeteuid, sudoKubeconfigCopyDir
+		t.Cleanup(func() {
+			installedNodeCredential, kubectlGeteuid, sudoKubeconfigCopyDir = prevCredential, prevEUID, prevCopyDir
+		})
+		installedNodeCredential = func() (install.Role, string) { return install.RoleServer, "" }
+		kubectlGeteuid = func() int { return 0 }
+		sudoKubeconfigCopyDir = t.TempDir()
+		hits := &atomic.Int32{}
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			hits.Add(1)
+			http.Error(w, "no", http.StatusForbidden)
+		}))
+		t.Cleanup(srv.Close)
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		t.Setenv("KUBECONFIG", "")
+		t.Setenv("K3SM_WORK_DIR", "")
+		t.Setenv("SUDO_USER", me.Username)
+		return fixture{home: home, marker: filepath.Join(home, "plugin-ran"), server: srv.URL, hits: hits}
+	}
+	execConfig := func(f fixture) string {
+		plugin := filepath.Join(f.home, "plugin.sh")
+		writeSudoTestFile(t, plugin, "#!/bin/sh\ntouch "+f.marker+"\n", 0o700)
+		return strings.Replace(sudoTestKubeconfig("", "    exec:\n      apiVersion: client.authentication.k8s.io/v1\n      interactiveMode: Never\n      command: "+plugin+"\n"),
+			"https://127.0.0.1:6443", f.server, 1)
+	}
+	// verbs runs each root-side load site and returns its error.
+	verbs := func(f fixture) map[string]error {
+		out := map[string]error{}
+		out["k3sm interconnect"] = runInterconnectWith([]string{"enable"}, io.Discard, io.Discard, interconnectClients)
+		_, _, out["k3sm status"] = newStatusKube(statusKubeInputsFor(install.RoleServer, statusPaths(workDirFromEnv())))
+		_, _, out["k3sm status (worker fallback)"] = statusUserKubeFor(install.RoleAgent, func() (string, error) { return f.server, nil }, t.TempDir())()
+		_, out["k3sm kubeconfig"] = loadKubeconfigSource("k3sm")
+		return out
+	}
+	assertRefused := func(t *testing.T, f fixture, errs map[string]error, wants ...string) {
+		t.Helper()
+		for verb, err := range errs {
+			if err == nil {
+				t.Errorf("%s went ahead as root, want a refusal naming %q", verb, wants)
+				continue
+			}
+			for _, want := range wants {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("%s err = %v, want it to contain %q", verb, err, want)
+				}
+			}
+		}
+		if n := f.hits.Load(); n != 0 {
+			t.Errorf("the apiserver got %d request(s), want none", n)
+		}
+		if _, err := os.Stat(f.marker); err == nil {
+			t.Errorf("the exec plugin ran as root")
+		}
+	}
+
+	t.Run("exec kubeconfig in home is refused by every verb", func(t *testing.T) {
+		f := setup(t)
+		file := filepath.Join(f.home, ".kube", "config")
+		writeSudoTestFile(t, file, execConfig(f), 0o600)
+		assertRefused(t, f, verbs(f), `user "k3sm" exec`, file)
+	})
+
+	t.Run("explicit K3SM_WORK_DIR in the invoker's directory is checked", func(t *testing.T) {
+		f := setup(t)
+		workDir := filepath.Join(f.home, "work")
+		file := executor.KubeconfigPath(workDir)
+		writeSudoTestFile(t, file, execConfig(f), 0o600)
+		t.Setenv("K3SM_WORK_DIR", workDir)
+		errs := verbs(f)
+		delete(errs, "k3sm status (worker fallback)") // reads no work dir
+		errs["k3sm kubectl"] = runKubectl([]string{"get", "nodes"})
+		assertRefused(t, f, errs, `user "k3sm" exec`, file)
+	})
+
+	t.Run("symlink as the second KUBECONFIG entry is refused", func(t *testing.T) {
+		f := setup(t)
+		first, second := filepath.Join(f.home, "a.yaml"), filepath.Join(f.home, "b.yaml")
+		inline := strings.Replace(sudoTestKubeconfig("    insecure-skip-tls-verify: true\n", sudoTestInlineUser), "https://127.0.0.1:6443", f.server, 1)
+		writeSudoTestFile(t, first, inline, 0o600)
+		target := filepath.Join(f.home, "real.yaml")
+		writeSudoTestFile(t, target, inline, 0o600)
+		if err := os.Symlink(target, second); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("KUBECONFIG", first+string(filepath.ListSeparator)+second)
+		assertRefused(t, f, verbs(f), "is a symlink", second)
+	})
+
+	t.Run("kubeconfig --write target that is a symlink is refused", func(t *testing.T) {
+		f := setup(t)
+		target := filepath.Join(f.home, "root-only.yaml")
+		writeSudoTestFile(t, target, sudoTestKubeconfig("", sudoTestInlineUser), 0o600)
+		dst := filepath.Join(f.home, ".kube", "config")
+		if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, dst); err != nil {
+			t.Fatal(err)
+		}
+		_, err := loadMergeTarget(dst)
+		assertRefused(t, f, map[string]error{"k3sm kubeconfig --write": err}, "is a symlink", dst)
+	})
+
+	t.Run("kubeconfig --write target with exec is merged into, not run", func(t *testing.T) {
+		f := setup(t)
+		dst := filepath.Join(f.home, ".kube", "config")
+		writeSudoTestFile(t, dst, execConfig(f), 0o600)
+		if _, err := loadMergeTarget(dst); err != nil {
+			t.Fatalf("loadMergeTarget: %v, want the invoker's own file loaded for the merge", err)
+		}
+		assertRefused(t, f, nil)
+	})
 }

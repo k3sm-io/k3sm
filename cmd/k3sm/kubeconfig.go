@@ -17,8 +17,10 @@ limitations under the License.
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"net"
 	"net/url"
 	"os"
@@ -89,9 +91,9 @@ func runKubeconfig(args []string) error {
 	}
 
 	dst := clientcmdapi.NewConfig()
-	if existing, err := clientcmd.LoadFromFile(path); err == nil {
+	if existing, err := loadMergeTarget(path); err == nil {
 		dst = existing
-	} else if !os.IsNotExist(err) {
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("load %s: %w", path, err)
 	}
 	merged, err := mergeKubeconfig(dst, src, target, setCurr)
@@ -124,13 +126,26 @@ func runKubeconfig(args []string) error {
 // install, and printing or merging it would hand on an admin credential for an
 // address this Mac may no longer reach. The node credential is no substitute,
 // because this verb's output is an admin's kubeconfig.
+//
+// As root run by sudo, a file the invoker could have put there (a work dir
+// K3SM_WORK_DIR names, each $KUBECONFIG entry, ~/.kube/config) is checked first
+// and its checked bytes are what is read (vetSudoKubeconfig).
 func loadKubeconfigSource(name string) (*clientcmdapi.Config, error) {
-	srcPath := executor.KubeconfigPath(workDirFromEnv())
-	pinned := os.Getenv("K3SM_WORK_DIR") != ""
-	role, _ := installedNodeCredential()
-	worker := role == install.RoleAgent && !pinned
+	home, _ := os.UserHomeDir()
+	in := kubectlInputs{
+		workDirOverride: os.Getenv("K3SM_WORK_DIR"),
+		workDir:         workDirFromEnv(),
+		kubeconfigEnv:   os.Getenv("KUBECONFIG"),
+		home:            home,
+	}.withInstalledRole().withSudoInvoker()
+	srcPath := executor.KubeconfigPath(in.workDir)
+	pinned := in.workDirOverride != ""
+	worker := in.role == install.RoleAgent && !pinned
 	if !worker {
-		src, err := clientcmd.LoadFromFile(srcPath)
+		src, err := loadCheckedKubeconfigFile(in, srcPath)
+		if refusal := (sudoKubeconfigRefusal{}); errors.As(err, &refusal) {
+			return nil, err
+		}
 		if err == nil {
 			return src, nil
 		}
@@ -138,7 +153,20 @@ func loadKubeconfigSource(name string) (*clientcmdapi.Config, error) {
 			return nil, fmt.Errorf("load k3sm kubeconfig %s (run `k3sm server` first): %w", srcPath, err)
 		}
 	}
-	raw, err := clientcmd.NewDefaultClientConfigLoadingRules().Load()
+	vc, err := vetSudoKubeconfig(in, kubectlConfig{})
+	if err != nil {
+		return nil, err
+	}
+	rules := clientcmd.NewDefaultClientConfigLoadingRules()
+	vetted, cleanup, err := vettedLoadingRules(vc)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+	if vetted != nil {
+		rules = vetted
+	}
+	raw, err := rules.Load()
 	if err != nil {
 		return nil, fmt.Errorf("load your kubeconfig: %w", err)
 	}
@@ -150,6 +178,44 @@ func loadKubeconfigSource(name string) (*clientcmdapi.Config, error) {
 		return nil, fmt.Errorf("no k3sm kubeconfig: %s is not readable and %w — run `sudo k3sm install`, or set K3SM_WORK_DIR", srcPath, err)
 	}
 	return out, nil
+}
+
+// loadCheckedKubeconfigFile loads the one kubeconfig file at path, checked
+// first as root run by sudo unless it is root's own (vetSudoKubeconfig).
+func loadCheckedKubeconfigFile(in kubectlInputs, path string) (*clientcmdapi.Config, error) {
+	cfg, err := vetSudoKubeconfig(in, kubectlConfig{kubeconfig: path})
+	if err != nil {
+		return nil, err
+	}
+	if cfg.vetted == nil {
+		return clientcmd.LoadFromFile(path)
+	}
+	if len(*cfg.vetted) == 0 {
+		return nil, &fs.PathError{Op: "open", Path: path, Err: fs.ErrNotExist}
+	}
+	return clientcmd.Load((*cfg.vetted)[0].data)
+}
+
+// loadMergeTarget loads the kubeconfig --write merges into. As root run by sudo
+// it is read only when it is a file root can trust on the invoker's behalf
+// (readSudoInvokerFile): root reads it, and writes the merge back over it, so a
+// symlink or another account's file there would have root read that file into
+// the invoker's path. What the file says is not checked: nothing in it is run or
+// read, and the merge writes it back as it was.
+func loadMergeTarget(path string) (*clientcmdapi.Config, error) {
+	in := kubectlInputs{asRoot: kubectlGeteuid() == 0}.withSudoInvoker()
+	if !in.underSudo() {
+		return clientcmd.LoadFromFile(path)
+	}
+	uid, err := sudoInvokerUID(in)
+	if err != nil {
+		return nil, err
+	}
+	data, err := readSudoInvokerFile(in, uid, path)
+	if err != nil {
+		return nil, err
+	}
+	return clientcmd.Load(data)
 }
 
 // extractContext returns a minimal config holding ONLY the named context and the

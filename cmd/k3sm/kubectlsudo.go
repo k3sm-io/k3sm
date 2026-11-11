@@ -96,35 +96,81 @@ func vetSudoKubeconfig(in kubectlInputs, cfg kubectlConfig) (kubectlConfig, erro
 	default:
 		paths = []string{cfg.kubeconfig}
 	}
-	u, err := user.Lookup(in.sudoUser)
+	uid, err := sudoInvokerUID(in)
 	if err != nil {
-		return kubectlConfig{}, sudoKubeconfigRefusal{fmt.Errorf("SUDO_USER %s is not a user on this Mac, so root does not read a kubeconfig on its behalf: %w", in.sudoUser, err)}
-	}
-	uid, err := strconv.ParseUint(u.Uid, 10, 32)
-	if err != nil {
-		return kubectlConfig{}, sudoKubeconfigRefusal{fmt.Errorf("SUDO_USER %s has a uid %q that is not a number", in.sudoUser, u.Uid)}
+		return kubectlConfig{}, err
 	}
 	var files []vettedKubeconfig
 	for _, p := range paths {
-		f, err := readKubeconfigNoFollow(p)
+		data, err := readSudoInvokerFile(in, uid, p)
 		if errors.Is(err, fs.ErrNotExist) {
 			continue // kubectl skips a missing entry too
 		}
 		if err != nil {
-			return kubectlConfig{}, sudoKubeconfigRefusal{fmt.Errorf("kubeconfig %s: %w; root does not read it on %s's behalf, run this without sudo", p, err, in.sudoUser)}
+			return kubectlConfig{}, err
 		}
-		if problem := sudoKubeconfigFileProblem(f, uint32(uid), in.sudoUser); problem != "" {
-			return kubectlConfig{}, sudoKubeconfigRefusal{fmt.Errorf("kubeconfig %s %s, so root does not use it on %s's behalf; run this without sudo", p, problem, in.sudoUser)}
-		}
-		if field, err := sudoKubeconfigCredentialField(f.data); err != nil {
+		if field, err := sudoKubeconfigCredentialField(data); err != nil {
 			return kubectlConfig{}, sudoKubeconfigRefusal{fmt.Errorf("kubeconfig %s: %w", p, err)}
 		} else if field != "" {
 			return kubectlConfig{}, sudoKubeconfigRefusal{fmt.Errorf("kubeconfig %s sets %s, which root does not act on for %s; run this without sudo", p, field, in.sudoUser)}
 		}
-		files = append(files, vettedKubeconfig{path: p, data: f.data})
+		files = append(files, vettedKubeconfig{path: p, data: data})
 	}
 	cfg.vetted = &files
 	return cfg, nil
+}
+
+// sudoInvokerUID is the uid of in.sudoUser.
+func sudoInvokerUID(in kubectlInputs) (uint32, error) {
+	u, err := user.Lookup(in.sudoUser)
+	if err != nil {
+		return 0, sudoKubeconfigRefusal{fmt.Errorf("SUDO_USER %s is not a user on this Mac, so root does not read a kubeconfig on its behalf: %w", in.sudoUser, err)}
+	}
+	uid, err := strconv.ParseUint(u.Uid, 10, 32)
+	if err != nil {
+		return 0, sudoKubeconfigRefusal{fmt.Errorf("SUDO_USER %s has a uid %q that is not a number", in.sudoUser, u.Uid)}
+	}
+	return uint32(uid), nil
+}
+
+// readSudoInvokerFile reads the kubeconfig at p for root on the invoker's
+// behalf: a regular file, not a symlink, owned by root or the invoker (uid) and
+// writable by nobody else. A missing file is an fs.ErrNotExist error; any other
+// failure is a sudoKubeconfigRefusal. It does not look at what the file says.
+func readSudoInvokerFile(in kubectlInputs, uid uint32, p string) ([]byte, error) {
+	f, err := readKubeconfigNoFollow(p)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, err
+	}
+	if err != nil {
+		return nil, sudoKubeconfigRefusal{fmt.Errorf("kubeconfig %s: %w; root does not read it on %s's behalf, run this without sudo", p, err, in.sudoUser)}
+	}
+	if problem := sudoKubeconfigFileProblem(f, uid, in.sudoUser); problem != "" {
+		return nil, sudoKubeconfigRefusal{fmt.Errorf("kubeconfig %s %s, so root does not use it on %s's behalf; run this without sudo", p, problem, in.sudoUser)}
+	}
+	return f.data, nil
+}
+
+// vettedLoadingRules returns loading rules that read only cfg's checked copies
+// (vetSudoKubeconfig) from a root-only directory, and a func that removes them.
+// Rules built from cfg's paths, or kubectl's defaults, would read the invoker's
+// files a second time, after the check. With no checked files it returns nil
+// rules: the caller loads as it always has.
+func vettedLoadingRules(cfg kubectlConfig) (*clientcmd.ClientConfigLoadingRules, func(), error) {
+	if cfg.vetted == nil {
+		return nil, func() {}, nil
+	}
+	dir, paths, err := writeVettedKubeconfigs(*cfg.vetted)
+	if err != nil {
+		return nil, nil, err
+	}
+	rules := &clientcmd.ClientConfigLoadingRules{}
+	if cfg.kubeconfig != "" {
+		rules.ExplicitPath = paths[0]
+	} else {
+		rules.Precedence = paths
+	}
+	return rules, func() { _ = os.RemoveAll(dir) }, nil
 }
 
 // kubectlRuleFiles is every file kubectl's default loading rules read: each entry

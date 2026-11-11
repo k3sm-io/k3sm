@@ -300,13 +300,23 @@ func interconnectClients(kubeconfig string) (kubernetes.Interface, dynamic.Inter
 			home:            home,
 			contextName:     installedKubeconfigName(),
 			exists:          fileExists,
-		}.withInstalledRole())
+		}.withInstalledRole().withSudoInvoker())
 		if err != nil {
 			return nil, nil, err
 		}
 		rules := clientcmd.NewDefaultClientConfigLoadingRules()
 		if kc.kubeconfig != "" {
 			rules.ExplicitPath = kc.kubeconfig
+		}
+		// As root run by sudo the files were checked; load the checked bytes
+		// rather than read the invoker's paths a second time.
+		vetted, cleanup, verr := vettedLoadingRules(kc)
+		if verr != nil {
+			return nil, nil, verr
+		}
+		defer cleanup()
+		if vetted != nil {
+			rules = vetted
 		}
 		cfg, err = clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules,
 			&clientcmd.ConfigOverrides{CurrentContext: kc.context}).ClientConfig()

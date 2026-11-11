@@ -267,11 +267,15 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
 
 ### Fixed
 
-- Under `sudo`, `k3sm kubectl` and the builder verbs no longer use a kubeconfig from your home or
-  `$KUBECONFIG` that would have root run a credential plugin (`exec`, `auth-provider`), read a file
-  (`tokenFile`, `client-certificate`, `client-key`, `certificate-authority`) or use a `proxy-url`, or
-  one that is a symlink or writable by group or others. They refuse it, naming the field and the file,
-  and hand kubectl a root-only copy of the kubeconfig they checked.
+- Under `sudo`, `k3sm kubectl`, the builder verbs, `k3sm interconnect`, `k3sm status` (with its top
+  view and the commands that read the cluster the way it does) and `k3sm kubeconfig` no longer use a
+  kubeconfig from your home, `$KUBECONFIG` or a `K3SM_WORK_DIR` you named that would have root run a
+  credential plugin (`exec`, `auth-provider`), read a file (`tokenFile`, `client-certificate`,
+  `client-key`, `certificate-authority`) or use a `proxy-url`, or one that is a symlink or writable by
+  group or others. They refuse it, naming the field and the file, and load only a root-only copy of
+  the kubeconfig they checked. `k3sm kubeconfig --write` also refuses to merge into a symlink or
+  another account's file. Flags you type on the `k3sm kubectl` command line (for example a different
+  `--kubeconfig` path) are your own choice and are not checked.
 - A server whose control plane does not report healthy in time while the Mac is heavily loaded no
   longer parks on the crash-loop breaker after five attempts. It backs off instead, from 30 seconds
   doubling up to 10 minutes, `k3sm status` shows when the next attempt starts and that an attempt
