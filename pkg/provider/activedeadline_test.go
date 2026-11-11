@@ -304,3 +304,36 @@ func TestActiveDeadlinePersistRetried(t *testing.T) {
 		t.Errorf("Warning DeadlineExceeded events = %d, want 1", got)
 	}
 }
+
+// TestActiveDeadlineCountsFromTheEarlierStart pins restart safety: a daemon that
+// restarts after a deadline stop but before the Failed status was written is
+// handed the pod Running with its first life's status.startTime, and CreatePod
+// stamps a fresh wall-clock start. The deadline counts from the earlier time, so
+// the pod is failed on the first resync, not after a second full deadline.
+func TestActiveDeadlineCountsFromTheEarlierStart(t *testing.T) {
+	ctx := context.Background()
+	pod := pullPod("deadline-restart")
+	deadline := int64(600)
+	pod.Spec.ActiveDeadlineSeconds = &deadline
+	first := metav1.NewTime(time.Now().Add(-time.Hour))
+	pod.Status.Phase = corev1.PodRunning
+	pod.Status.StartTime = &first
+	id := string(pod.UID)
+	r, e, _, _ := newBlockedCreateProvider(t)
+	clk := testclock.NewFakeClock(time.Now())
+	r.clk = clk
+	if err := r.CreatePod(ctx, pod); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	tr := r.trackByID(id)
+	if tr == nil {
+		t.Fatal("pod not tracked after CreatePod")
+	}
+	r.resync(ctx)
+	if st := tr.evictedStatus(); st == nil || st.Reason != reasonDeadlineExceeded {
+		t.Fatalf("track status = %v, want Failed/%s on the first resync", st, reasonDeadlineExceeded)
+	}
+	if n := e.deleteCount(); n != 1 {
+		t.Errorf("runtime DeletePod calls = %d, want 1", n)
+	}
+}

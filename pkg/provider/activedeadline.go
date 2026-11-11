@@ -79,10 +79,7 @@ func (r *runtimedRuntime) enforceActiveDeadlines(ctx context.Context) {
 			owed = append(owed, tracked{pod: t.pod, t: t})
 			continue
 		}
-		start := &t.startTime
-		if t.startTime.IsZero() {
-			start = t.pod.Status.StartTime
-		}
+		start := deadlineStart(t)
 		if activeDeadlineExceeded(t.pod.Spec.ActiveDeadlineSeconds, start, now) {
 			due = append(due, tracked{pod: t.pod, t: t})
 		}
@@ -103,6 +100,24 @@ func (r *runtimedRuntime) enforceActiveDeadlines(ctx context.Context) {
 				"pod", podKey(d.pod.Namespace, d.pod.Name), "uid", string(d.pod.UID), "err", err)
 		}
 	}
+}
+
+// deadlineStart is the start the active deadline counts from: the earlier of the
+// track's own start and the apiserver pod's status.startTime. A daemon that
+// restarts after a deadline stop but before the Failed status was written sees
+// the pod Running with its first life's startTime and creates it again under a
+// fresh wall-clock start; the earlier time fails it again on the first resync
+// instead of granting it a second full deadline. Either may be unset. Guarded by
+// r.mu (t.pod).
+func deadlineStart(t *podTrack) *metav1.Time {
+	var start *metav1.Time
+	if !t.startTime.IsZero() {
+		start = &t.startTime
+	}
+	if api := t.pod.Status.StartTime; api != nil && !api.IsZero() && (start == nil || api.Before(start)) {
+		start = api
+	}
+	return start
 }
 
 // unpersistedStatus returns the deadline failure status t still owes the
