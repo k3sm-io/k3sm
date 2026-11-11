@@ -65,7 +65,9 @@ func (f *fakeRecorder) Eventf(object runtime.Object, eventtype, reason, messageF
 // the reason and message of its Ready condition. A reconcile retry of the same
 // generation (a resync, a status write that re-enqueues it) must not add a
 // second one, or `kubectl describe` fills with copies of one decision; a new
-// generation is a new decision and gets its own.
+// generation is a new decision and gets its own. The contract holds within one
+// refusal episode: a model served in between starts a new episode, which
+// records again at the same generation (see TestRefusalEventsArePerEpisode).
 func TestInvalidSpecEmitsOneEventPerGeneration(t *testing.T) {
 	cases := []struct {
 		name   string
