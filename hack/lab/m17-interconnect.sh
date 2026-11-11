@@ -49,9 +49,17 @@
 #   r7-desired-forge a node-forged desired annotation yields no out-of-policy alias
 #   r8-killswitch    k3sm interconnect disable: running attached pods keep their addresses and
 #                    new pods do not attach; deleting the pods leaves no reserved-half state
-#   r9-downgrade     on the build under test, no reinstall: no state a downgrade would
-#                    find, doctor clean, no reboot; the old helper's Hello reply is
-#                    pinned by a Go test, and no live downgrade is exercised
+#   r9-downgrade     a post-disarm re-check on the build under test, NOT a downgrade proof:
+#                    no reinstall, nothing is downgraded; every r8 host assertion again,
+#                    doctor clean, no reboot. The id is kept only because evidence
+#                    directories and --until name it. The old helper's Hello reply is
+#                    pinned by a Go test (the client half only), not by a live node
+#
+# OWED, NOT DELIVERED: the live mixed-version leg the earlier r9 ran (a worker on the
+# previous build against the current control plane, then the reinstall) is no longer
+# run on the rig. The stated reason, that the rig carries other workloads so there is
+# no apiserver downgrade, covers a server downgrade, not a worker-only one, so the gap
+# is real and open.
 #
 # THE EXIT CONTRACT:
 #   0  PASS     every rung returned PASS. A RECORDED figure never gates.
@@ -142,7 +150,7 @@ r5-ring|a sharded MLXModel with interconnect thunderbolt serves through rank 0: 
 r6-unplug|a pulled cable: member down <= 20 s and the MLX re-render <= 30 s after the carrier drop, the mesh loses at most one reply, UpHold 60 s on replug, one transition per direction, no second gang restart inside 5 min|armed,ring,operator|assert_r6_unplug|r6-unplug/|BI6
 r7-desired-forge|no-address-channel smoke test: the desired annotation carries no address or slot, so values the node forges with its own credential (unknown address/slot fields, a foreign interconnect name, schema 99) can only hold or drop slot 0: no out-of-policy alias or route, only the two netd verbs; an in-policy rewrite restores slot 0|armed,nodecred|assert_r7_desired_forge|r7-desired-forge/|BI3
 r8-killswitch|k3sm interconnect disable: the annotation goes, a new pod does not attach, a running attached pod keeps its address, lo0 and the mesh unchanged, the ring on the mesh; once the pods are deleted no reserved-half address, route, permanent ARP or ledger entry on either Mac, membership unchanged, no member up, no segment, no armedBy|armed|assert_r8_killswitch|r8-killswitch/|BI6
-r9-downgrade|after r8, on the build under test and with no reinstall: every r8 host assertion again on both Macs, doctor ic-stray clean and ic-residue naming nothing beyond the baseline, no reboot; the old helper's HelperTooOld reply is pinned by a Go test, and no live downgrade is exercised|disarmed|assert_r9_downgrade|r9-downgrade/|BI3
+r9-downgrade|a post-disarm re-check on the build under test, NOT a downgrade proof (id kept for evidence dirs and --until): every r8 host assertion again on both Macs, doctor ic-stray clean and ic-residue naming nothing beyond the baseline, no reboot; the old helper's HelperTooOld reply is pinned by a Go test (client half only); the live mixed-version leg is owed, not delivered|disarmed|assert_r9_downgrade|r9-downgrade/|BI3
 RUNGS
 REQUIRED_IDS="r0-disarmed r1-arm r2-attach r3-cable-path r4-mesh-traffic r5-ring r6-unplug r7-desired-forge r8-killswitch r9-downgrade"
 
@@ -2611,6 +2619,9 @@ case "${1:-}" in
 esac
 
 # ── The run ─────────────────────────────────────────────────────────────────────
+for v in K3SM_M17_PREVIOUS_ARTIFACT K3SM_M17_JOIN_SERVER K3SM_M17_REINSTALL_ARGS; do
+	[ -n "${!v:-}" ] && echo "$0: $v is set but no longer used (r9 does not downgrade or reinstall)" >&2
+done
 if [ "${K3SM_LAB_PRINT_MANIFESTS:-}" = 1 ]; then
 	lab_tolerations_header
 	ic_pod_manifest ic-l-local "<local-node>" 1 "$LISTENER_CMD"

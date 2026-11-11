@@ -123,8 +123,13 @@ func ensureAgainst(t *testing.T, reply []byte) ([]wire.Verb, error) {
 
 // TestOldHelperHelloReplyIsHelperTooOld pins what a helper older than the
 // interconnect verbs answers to a Hello, and what the current client makes of it:
-// the reply the lab ladder used to obtain by downgrading a live node, held here as
-// a fixture so no downgrade is needed to keep it true.
+// the reply the lab ladder used to obtain by downgrading a live node. This pins
+// only how the current client maps this recorded reply to ErrHelperTooOld (the
+// client half); it does not show that a real old helper still sends this reply.
+// The fixture hack/lab/testdata/m17-interconnect/hello-minor1.json has one commit
+// in git log --follow (the ladder's introduction), whose message does not say
+// whether it was captured from a real old helper or written by hand: its
+// provenance is not recorded.
 func TestOldHelperHelloReplyIsHelperTooOld(t *testing.T) {
 	old := readHelloFixture(t, "hello-minor1.json")
 
