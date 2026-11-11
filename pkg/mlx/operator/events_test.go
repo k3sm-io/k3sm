@@ -372,6 +372,36 @@ func TestRefusalEventsArePerEpisode(t *testing.T) {
 			t.Error("the refusal entry outlived its model")
 		}
 	})
+
+	t.Run("entry removed when terminating", func(t *testing.T) {
+		rec := &fakeRecorder{}
+		h := newHarness(t, model(tooBig), func(c *Config) { c.Recorder = rec; c.GPU = StaticGPU(facts()) })
+		h.reconcile(t)
+		if _, ok := h.ctrl.refusals[key()]; !ok {
+			t.Fatal("no refusal entry after a refusal")
+		}
+		// The API server bumps the generation when it sets the deletion
+		// timestamp, so a reconcile that refused the terminating object would
+		// be a new decision and record a second Event.
+		res := h.dyn.Resource(mlxModelResource).Namespace(testNamespace)
+		raw, err := res.Get(context.Background(), testModelName, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("read mlxmodel: %v", err)
+		}
+		now := metav1.NewTime(time.Unix(1700000000, 0))
+		raw.SetDeletionTimestamp(&now)
+		raw.SetGeneration(raw.GetGeneration() + 1)
+		if _, err := res.Update(context.Background(), raw, metav1.UpdateOptions{}); err != nil {
+			t.Fatalf("mark mlxmodel terminating: %v", err)
+		}
+		h.reconcile(t)
+		if len(rec.events) != 1 {
+			t.Errorf("%d events after reconciling a terminating model, want still 1: %+v", len(rec.events), rec.events)
+		}
+		if _, ok := h.ctrl.refusals[key()]; ok {
+			t.Error("the refusal entry outlived its model's termination")
+		}
+	})
 }
 
 // replaceModel deletes the seeded model and creates m in its place.
