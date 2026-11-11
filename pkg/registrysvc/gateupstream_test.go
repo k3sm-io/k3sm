@@ -31,6 +31,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"k3sm.io/k3sm/pkg/ociregistry/api"
 )
 
 // stallingUpstream accepts connections on loopback and never answers them.
@@ -66,8 +68,9 @@ func stallingUpstream(t *testing.T) string {
 	return ln.Addr().String()
 }
 
-// upstreamGate is the fixture's gate over the default loopback transport,
-// pointed at upstream.
+// upstreamGate is the fixture's gate over the default loopback transports,
+// pointed at upstream, with headerTimeout as the bound of every request but a
+// blob upload's.
 func upstreamGate(t *testing.T, upstream string, headerTimeout time.Duration) *memListener {
 	t.Helper()
 	f := newGateFixture(t)
@@ -78,6 +81,7 @@ func upstreamGate(t *testing.T, upstream string, headerTimeout time.Duration) *m
 		Logger:                quietLogger(),
 		Now:                   f.clock.now,
 		UpstreamHeaderTimeout: headerTimeout,
+		ManifestHeaderTimeout: headerTimeout,
 	})
 	return serveMem(t, g)
 }
@@ -94,8 +98,8 @@ func assertUnavailable502(t *testing.T, r rawResponse) {
 }
 
 // TestGateAnswers502WhenTheUpstreamStalls: a loopback registry that accepts a
-// connection and never answers costs an authorized write a 502 within the
-// response-header bound, not a wait until the client gives up.
+// connection and never answers costs an authorized manifest PUT a 502 within
+// its response-header bound, not a wait until the client gives up.
 func TestGateAnswers502WhenTheUpstreamStalls(t *testing.T) {
 	const bound = 200 * time.Millisecond
 	front := upstreamGate(t, stallingUpstream(t), bound)
@@ -106,6 +110,38 @@ func TestGateAnswers502WhenTheUpstreamStalls(t *testing.T) {
 		t.Errorf("the 502 took %v, want about the %v bound", took, bound)
 	}
 	assertUnavailable502(t, r)
+}
+
+// TestGateHeaderBoundByOperation: each class of request is forwarded over the
+// transport with its own response-header bound: 30s for a read and an upload
+// status, the collect bound for a manifest PUT, the registry's upload bound
+// for a blob upload request.
+func TestGateHeaderBoundByOperation(t *testing.T) {
+	g := newGate(gateConfig{Upstream: "127.0.0.1:1", Logger: quietLogger()})
+	for _, tc := range []struct {
+		op   gateOp
+		want time.Duration
+	}{
+		{opRead, gateUpstreamHeaderTimeout},
+		{opUploadStatus, gateUpstreamHeaderTimeout},
+		{opManifestPut, CollectTimeout},
+		{opUploadStart, api.DefaultUploadTimeout},
+		{opUploadChunk, api.DefaultUploadTimeout},
+		{opUploadFinish, api.DefaultUploadTimeout},
+	} {
+		t.Run(tc.op.String(), func(t *testing.T) {
+			tr, ok := g.proxyFor(tc.op).Transport.(*http.Transport)
+			if !ok {
+				t.Fatalf("transport = %T, want *http.Transport", g.proxyFor(tc.op).Transport)
+			}
+			if got := tr.ResponseHeaderTimeout; got != tc.want {
+				t.Errorf("response-header bound = %v, want %v", got, tc.want)
+			}
+		})
+	}
+	if gateUpstreamHeaderTimeout != 30*time.Second {
+		t.Errorf("gateUpstreamHeaderTimeout = %v, want 30s", gateUpstreamHeaderTimeout)
+	}
 }
 
 // TestGateWriteErrorIs502WhenUpstreamIsDown: a loopback registry that is not
