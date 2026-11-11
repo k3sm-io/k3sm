@@ -194,12 +194,21 @@ func (t *podTrack) unpersistedStatus() *corev1.PodStatus {
 // (UID-checked, persistEvictedStatus) and clears the debt once the write lands,
 // the pod was replaced under its name, or the pod is gone. A failure keeps the
 // debt for the next resync; only the first attempt logs above Debug.
+//
+// The first write, from the stop's goroutine, takes persistEvictedStatus's full
+// back-off. A retry from the resync tick is one attempt with no back-off: the
+// next resync is the retry, and several owed pods against an apiserver that is
+// down must not stall the tick behind each other's back-off.
 func (r *runtimedRuntime) persistDeadlineStatus(ctx context.Context, pod *corev1.Pod, t *podTrack, first bool) {
 	st := t.unpersistedStatus()
 	if st == nil {
 		return
 	}
-	if err := r.persistEvictedStatus(ctx, pod, st); err != nil && !apierrors.IsNotFound(err) {
+	write := r.persistDeadlineStatusOnce
+	if first {
+		write = r.persistEvictedStatus
+	}
+	if err := write(ctx, pod, st); err != nil && !apierrors.IsNotFound(err) {
 		log := r.log.Debug
 		if first {
 			log = r.log.Error
@@ -213,6 +222,26 @@ func (r *runtimedRuntime) persistDeadlineStatus(ctx context.Context, pod *corev1
 		t.unpersisted = nil
 	}
 	t.restartMu.Unlock()
+}
+
+// persistDeadlineStatusOnce is one attempt of persistEvictedStatus's write, with
+// no back-off: UID-checked, and a nil client is a no-op.
+func (r *runtimedRuntime) persistDeadlineStatusOnce(ctx context.Context, pod *corev1.Pod, st *corev1.PodStatus) error {
+	if r.client == nil {
+		return nil
+	}
+	live, err := r.client.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("get pod %s/%s: %w", pod.Namespace, pod.Name, err)
+	}
+	if live.UID != pod.UID {
+		r.log.Warn("active deadline: the apiserver pod was replaced; not writing the failed status",
+			"pod", podKey(pod.Namespace, pod.Name), "uid", string(pod.UID), "live_uid", string(live.UID))
+		return nil
+	}
+	live.Status = *st.DeepCopy()
+	_, err = r.client.CoreV1().Pods(pod.Namespace).UpdateStatus(ctx, live, metav1.UpdateOptions{})
+	return err
 }
 
 // failPastDeadline stops a pod past its active deadline in evictPod's shape and

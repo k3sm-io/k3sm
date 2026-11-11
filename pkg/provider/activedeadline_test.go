@@ -338,6 +338,63 @@ func TestActiveDeadlinePersistRetried(t *testing.T) {
 	}
 }
 
+// TestActiveDeadlinePersistRetriedOncePerTick pins the tick's retry: with the
+// apiserver down, a resync with two owed pods makes exactly one status write
+// attempt per pod, with no back-off, so the owed pods cannot stall the tick.
+func TestActiveDeadlinePersistRetriedOncePerTick(t *testing.T) {
+	ctx := context.Background()
+	r, _, _, _ := newBlockedCreateProvider(t)
+	r.clk = testclock.NewFakeClock(time.Now())
+	cs := fake.NewClientset()
+	r.client = cs
+	// A back-off on the tick would show as more than one attempt per pod.
+	saved := persistEvictedBackoff
+	persistEvictedBackoff = wait.Backoff{Steps: 4, Duration: time.Millisecond}
+	t.Cleanup(func() { persistEvictedBackoff = saved })
+	var mu sync.Mutex
+	writes := map[string]int{}
+	cs.PrependReactor("update", "pods", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		if a.GetSubresource() != "status" {
+			return false, nil, nil
+		}
+		ua, ok := a.(k8stesting.UpdateAction)
+		if !ok {
+			return true, nil, errors.New("unexpected action")
+		}
+		mu.Lock()
+		writes[ua.GetObject().(*corev1.Pod).Name]++
+		mu.Unlock()
+		return true, nil, errors.New("apiserver unavailable")
+	})
+	names := []string{"deadline-owed-a", "deadline-owed-b"}
+	for _, name := range names {
+		pod := pullPod(name)
+		if _, err := cs.CoreV1().Pods(pod.Namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("apiserver create: %v", err)
+		}
+		if err := r.CreatePod(ctx, pod); err != nil {
+			t.Fatalf("CreatePod: %v", err)
+		}
+		tr := r.trackByID(string(pod.UID))
+		if tr == nil {
+			t.Fatalf("pod %s not tracked after CreatePod", name)
+		}
+		st := failedPodStatus(pod.Status, reasonDeadlineExceeded, msgDeadlineExceeded, metav1.NewTime(r.clk.Now()))
+		tr.restartMu.Lock()
+		tr.unpersisted = st
+		tr.restartMu.Unlock()
+	}
+	r.enforceActiveDeadlines(ctx)
+	waitDeadlineStops(r)
+	mu.Lock()
+	defer mu.Unlock()
+	for _, name := range names {
+		if got := writes[name]; got != 1 {
+			t.Errorf("status write attempts for %s on one tick = %d, want 1", name, got)
+		}
+	}
+}
+
 // TestActiveDeadlineCountsFromTheEarlierStart pins restart safety: a daemon that
 // restarts after a deadline stop but before the Failed status was written is
 // handed the pod Running with its first life's status.startTime, and CreatePod
