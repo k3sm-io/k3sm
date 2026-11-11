@@ -20,9 +20,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"slices"
 	"time"
+
+	"k3sm.io/k3sm/pkg/executor"
 )
 
 // ErrUserStopped is returned by Restart on a node the user stopped, when
@@ -112,7 +115,12 @@ func Start(ctx context.Context, sys System, cfg Config, actor, reason string) er
 		} else {
 			markNode(ctx, cfg, false, actor, reason)
 		}
-		lifecycleLog(ctx, sys, cfg, slog.LevelInfo, "k3sm start: already running, nothing to do", "actor", actor, "reason", reason, "result", "already-running")
+		msg := "k3sm start: already running, nothing to do"
+		if wait := serverBringUpWait(sys, cfg, d); wait != "" {
+			msg += "; " + wait
+			_, _ = fmt.Fprintln(cfg.Out, msg)
+		}
+		lifecycleLog(ctx, sys, cfg, slog.LevelInfo, msg, "actor", actor, "reason", reason, "result", "already-running")
 		launchApp(ctx, cfg, "start")
 		return nil
 	}
@@ -143,6 +151,41 @@ func Start(ctx context.Context, sys System, cfg Config, actor, reason string) er
 	lifecycleLog(ctx, sys, cfg, slog.LevelInfo, "k3sm start: started", "actor", actor, "reason", reason, "result", "started")
 	launchApp(ctx, cfg, "start")
 	return nil
+}
+
+// serverBringUpWait is what an already-running start adds about a server
+// that is holding off its next bring-up after slow ones: the attempt that is
+// next and when it is due, read from the server's crash record. It is empty
+// on an agent-only node, with no back-off pending, and when the record is
+// absent, unreadable or malformed: the record is bookkeeping, and a start that
+// has nothing to do must not fail over it. It only reads the record.
+func serverBringUpWait(sys System, cfg Config, d installedDaemons) string {
+	if !slices.Contains(d.node, ServerLabel) {
+		return ""
+	}
+	// The record lives in the service user's work dir and this runs as root,
+	// so it is read with the no-follow regular-file read: a symlink or any
+	// non-regular file there is refused, and a refusal reads as no record.
+	path := executor.CrashLoopPath(cfg.serverWorkDir())
+	raw, err := sys.ReadRegularFile(path)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return ""
+	case err != nil:
+		cfg.Logger.Debug("could not read the server's crash-loop record", "path", path, "err", err)
+		return ""
+	}
+	rec, err := executor.ParseCrashRecord(raw)
+	if err != nil {
+		cfg.Logger.Debug("the server's crash-loop record is unreadable; treating it as empty", "path", path, "err", err)
+		return ""
+	}
+	wait, until := rec.BringUpBackoff(sys.Now())
+	if wait <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("the server is waiting to retry a slow start (attempt %d of %d at %s)",
+		rec.SlowStreak+1, executor.BringUpSlowStreakLimit, until.Format(time.RFC3339))
 }
 
 // uncordonAfterStart undoes what a stop did to the Node (awaitMarkNode within

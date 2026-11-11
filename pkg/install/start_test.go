@@ -17,12 +17,17 @@ limitations under the License.
 package install
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
 	"strings"
 	"testing"
+	"time"
+
+	"k3sm.io/k3sm/pkg/executor"
 )
 
 // enableOrBootstrap returns every call that could start a long-running k3sm
@@ -301,5 +306,112 @@ func TestStartFlushesTheRangeTheOldPlistRecorded(t *testing.T) {
 	want := []string{"FlushLo0Aliases:100.64.0.0/10," + stopTestServiceCIDR}
 	if !slices.Equal(flushes, want) {
 		t.Errorf("install --start flushed %q, want %q: the range the old netd plist recorded", flushes, want)
+	}
+}
+
+// TestStartReportsBringUpBackoff is the gate for what a start on an already
+// running node says about a server holding off a slow bring-up: a back-off
+// still pending in the server's crash record adds the next attempt and when
+// it is due to the line, printed and logged; no record, one the no-follow read
+// refuses (a symlink, a non-regular file), a malformed one, a back-off that has
+// elapsed, and an agent-only node leave the line as it was. The start reads the
+// record only through ReadRegularFile and never writes it.
+func TestStartReportsBringUpBackoff(t *testing.T) {
+	const prefix = "k3sm start: already running, nothing to do"
+	pinned := time.Unix(1_700_000_000, 0)
+	slowRecord := func(streak int, lastSlow time.Time) []byte {
+		b, err := json.Marshal(executor.CrashRecord{SlowStreak: streak, LastSlowAt: &lastSlow})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	// A streak of 2 waits 60s from its last slow lap: 20s ago leaves 40s.
+	due := pinned.Add(40 * time.Second).Format(time.RFC3339)
+	wantWait := "; the server is waiting to retry a slow start (attempt 3 of 8 at " + due + ")"
+
+	cases := []struct {
+		name   string
+		role   Role
+		record []byte // nil: no record
+		// kind makes the no-follow read refuse the record; the bytes stay in
+		// the fake, so a read that followed the link would find the back-off.
+		kind     fakeFileKind
+		wantWait bool
+	}{
+		{name: "a pending back-off names the attempt and when", role: RoleServer, record: slowRecord(2, pinned.Add(-20*time.Second)), wantWait: true},
+		{name: "no record", role: RoleServer},
+		{name: "a symlinked record is refused", role: RoleServer, record: slowRecord(2, pinned.Add(-20*time.Second)), kind: fakeSymlink},
+		{name: "a non-regular record is refused", role: RoleServer, record: slowRecord(2, pinned.Add(-20*time.Second)), kind: fakeIrregular},
+		{name: "a malformed record", role: RoleServer, record: []byte("{not json")},
+		{name: "an elapsed back-off", role: RoleServer, record: slowRecord(2, pinned.Add(-2*time.Minute))},
+		{name: "an agent-only node", role: RoleAgent, record: slowRecord(2, pinned.Add(-20*time.Second))},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			f, cfg, _ := stoppedNodeOfRole(t, tc.role)
+			f.now = func() time.Time { return pinned }
+			cfg.MarkNode = func(context.Context, bool, string, string) error { return nil }
+			if err := Start(ctx, f, cfg, ActorUser, "test"); err != nil {
+				t.Fatalf("first Start: %v", err)
+			}
+			path := executor.CrashLoopPath(cfg.withDefaults().serverWorkDir())
+			if tc.record != nil {
+				f.putFile(path, tc.record)
+			}
+			if tc.kind != fakeRegular {
+				f.putKind(path, tc.kind)
+			}
+			f.calls, f.life.oslog = nil, nil
+			var out, logs bytes.Buffer
+			cfg.Out = &out
+			cfg.Logger = testLogger(&logs)
+
+			if err := Start(ctx, f, cfg, ActorUser, "test"); err != nil {
+				t.Fatalf("Start on a running node: %v (exit code would not be 0)", err)
+			}
+
+			var line string
+			for _, l := range f.life.oslog {
+				if strings.Contains(l, prefix) {
+					line = l
+				}
+			}
+			if line == "" {
+				t.Fatalf("no already-running line logged: %q", f.life.oslog)
+			}
+			if tc.wantWait {
+				if !strings.Contains(line, prefix+wantWait) {
+					t.Errorf("logged line = %q, want it to carry %q", line, prefix+wantWait)
+				}
+				if got, want := out.String(), prefix+wantWait+"\n"; got != want {
+					t.Errorf("printed %q, want %q", got, want)
+				}
+				if !strings.Contains(logs.String(), "attempt 3 of 8 at "+due) {
+					t.Errorf("logger output lacks the wait: %s", logs.String())
+				}
+			} else {
+				if strings.Contains(line, "waiting to retry") || !strings.Contains(line, prefix+` actor=`) {
+					t.Errorf("logged line changed: %q", line)
+				}
+				if out.Len() != 0 {
+					t.Errorf("printed %q, want nothing", out.String())
+				}
+			}
+			for _, c := range f.calls {
+				if strings.Contains(c, path) && c != "ReadRegularFile:"+path {
+					t.Errorf("start touched the crash record other than through the no-follow read: %s", c)
+				}
+			}
+			if tc.wantWait && !slices.Contains(f.calls, "ReadRegularFile:"+path) {
+				t.Errorf("the record was not read through ReadRegularFile: %q", f.calls)
+			}
+			if tc.record != nil {
+				if got, err := f.ReadFile(path); err != nil || !slices.Equal(got, tc.record) {
+					t.Errorf("record changed: %q, %v", got, err)
+				}
+			}
+		})
 	}
 }
