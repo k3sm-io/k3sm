@@ -410,3 +410,47 @@ func jsonRoundTrip(r CrashRecord) (CrashRecord, error) {
 	}
 	return ParseCrashRecord(b)
 }
+
+// TestComponentLogRotationDropsStalePin pins the pin lifecycle the content
+// checks cannot see: a failing spawn writes the pin, and a spawn with no live
+// failure removes it even when the previous lap logged nothing.
+func TestComponentLogRotationDropsStalePin(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "kine.log")
+	pin := logPath + componentLogPinSuffix
+	if err := os.WriteFile(logPath, []byte("first failure\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rotateComponentLog(logPath, true)
+	if _, err := os.Stat(pin); err != nil {
+		t.Fatalf("a failing spawn must pin the first failure's log: %v", err)
+	}
+	for _, tc := range []struct {
+		name    string
+		content []byte
+		missing bool
+	}{
+		{name: "empty previous log", content: nil},
+		{name: "missing previous log", missing: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(pin, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_ = os.Remove(logPath)
+			if !tc.missing {
+				if err := os.WriteFile(logPath, tc.content, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			rotateComponentLog(logPath, false)
+			if _, err := os.Stat(pin); !os.IsNotExist(err) {
+				t.Fatalf("a spawn with no live failure must drop the pin, stat err = %v", err)
+			}
+			got, err := os.ReadFile(logPath + ".1")
+			if err != nil || string(got) != "first failure\n" {
+				t.Fatalf(".1 = %q, %v; want the first failure's log untouched", got, err)
+			}
+		})
+	}
+}

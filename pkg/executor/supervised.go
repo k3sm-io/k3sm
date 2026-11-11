@@ -1236,28 +1236,38 @@ func failureLive(workDir string, now time.Time) bool {
 // ignored on purpose: losing a generation must never stop the component from
 // starting.
 func rotateComponentLog(path string, failing bool) {
+	pin := path + componentLogPinSuffix
+	if !failing {
+		// No live failure: the streak is over (cleared or aged out of the
+		// window), so the pin is stale whether or not a healthy bring-up saw
+		// it. Dropped before the empty-log return, so a lap that logged
+		// nothing cannot leave an old streak's pin for the next one.
+		_ = os.Remove(pin)
+	}
 	fi, err := os.Stat(path)
 	if err != nil || !fi.Mode().IsRegular() || fi.Size() == 0 {
 		return
 	}
-	pin := path + componentLogPinSuffix
-	if !failing {
-		// No live failure: the streak is over (cleared or aged out of the
-		// window), so the pin is stale whether or not a healthy bring-up saw it.
-		_ = os.Remove(pin)
-	} else if _, err := os.Stat(pin); err == nil {
-		keepLogTail(path, path+".2", fi.Size(), componentLogKeepMax)
-		return
-	}
-	if err := os.Rename(path, path+".1"); err != nil {
-		return
-	}
-	_ = os.Remove(path + ".2")
 	if failing {
+		if _, err := os.Stat(pin); err == nil {
+			keepLogTail(path, path+".2", fi.Size(), componentLogKeepMax)
+			return
+		}
+		// Pin before the rename: a crash between the two leaves a pin over an
+		// older .1, which the next spawn with no live failure clears. The
+		// other order would let the next failing spawn overwrite the first
+		// failure's log. Without a pin the log is still kept for one lap.
 		if f, err := os.OpenFile(pin, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600); err == nil {
 			_ = f.Close()
 		}
 	}
+	if err := os.Rename(path, path+".1"); err != nil {
+		if failing {
+			_ = os.Remove(pin)
+		}
+		return
+	}
+	_ = os.Remove(path + ".2")
 }
 
 // keepLogTail moves src to dst, keeping at most max bytes from its end: a log
