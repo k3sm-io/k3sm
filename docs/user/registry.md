@@ -388,7 +388,7 @@ A refused push says why, in an OCI error body. Every status a push can get:
 | `403` | The caller is authenticated but refused: the token is not a ServiceAccount's, the namespace has not opted in (no label, or a label value other than the namespace's own name; the message gives the `kubectl label` command that fixes it), the repository is outside the prefix, or RBAC denies the push. |
 | `405` | A delete, or any other write shape the registry never takes from a Pod. |
 | `429` | Token checks are rate-limited, and each client address has its own share of connections, requests and pushes, so one busy client slows itself rather than every other caller; wait for the `Retry-After` interval and retry. |
-| `502` | The registry behind the gate is unreachable. |
+| `502` | The registry behind the gate is unreachable, or it did not answer in time: the gate waits 30 seconds for the response header of most requests, and a manifest push is bounded at the gate by a 10 minute limit. |
 | `503` | The cluster API is unreachable, or the gate has no identity to ask it with. Retry. |
 
 ## Pushing With Other Tools
