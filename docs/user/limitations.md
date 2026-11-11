@@ -712,7 +712,9 @@ on the default runtime too, so they inherit its behavior here.
 - On a `vm` Pod that stop is not available: the container is held NotReady and keeps running.
 - A Pod's `activeDeadlineSeconds` is enforced on the node's 10 s status resync, so the Pod goes
   `Failed` with reason `DeadlineExceeded` up to about 10 s after its deadline. Its address is held
-  until the Pod is deleted.
+  until the Pod is deleted. Its containers are stopped with the Pod's termination grace period
+  (at least 2 s), and its `preStop` hooks do not run before that stop. On `--runtime hostprocess`
+  the deadline is not enforced.
 
 **Plain init containers are not restarted**, and that is the one remaining gap on the default
 runtime. A regular (non-sidecar) init container that fails under `Always` / `OnFailure` is not re-run
