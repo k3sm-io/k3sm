@@ -688,7 +688,11 @@ func verifyServerNotParked(sys System, cfg Config, m []artifact, since time.Time
 		return nil // an agent-only install runs no control plane of its own
 	}
 	path := executor.CrashLoopPath(cfg.serverWorkDir())
-	raw, err := sys.ReadFile(path)
+	// ReadRegularFile, not ReadFile: this read runs as root in a work dir the
+	// service uid (and so every pod) can write, so a symlink or FIFO planted
+	// in the record's place is refused rather than followed or blocked on, and
+	// the refusal takes the unreadable-record branch below.
+	raw, err := sys.ReadRegularFile(path)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		return nil
@@ -990,7 +994,11 @@ func (w agentFailureWitness) newerThan(prev agentFailureWitness) bool {
 // would be a second way to lose a node.
 func readAgentFailures(sys System, cfg Config, since time.Time) (executor.CrashRecord, agentFailureWitness) {
 	path := executor.CrashLoopPath(cfg.agentWorkDir())
-	raw, err := sys.ReadFile(path)
+	// ReadRegularFile, not ReadFile: this read runs as root in a work dir the
+	// service uid (and so every pod) can write, so a symlink or FIFO planted
+	// in the record's place is refused rather than followed or blocked on, and
+	// the refusal takes the unreadable-record branch below.
+	raw, err := sys.ReadRegularFile(path)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		return executor.CrashRecord{}, agentFailureWitness{}

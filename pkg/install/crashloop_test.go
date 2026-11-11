@@ -160,6 +160,15 @@ func TestVerifyDaemonsPassesWithoutAFreshFailure(t *testing.T) {
 		{"a corrupt record is bookkeeping, not a verdict", func(t *testing.T, f *fakeSystem, cfg Config) {
 			f.putFile(executor.CrashLoopPath(cfg.serverWorkDir()), []byte("{not json"))
 		}},
+		{"a symlink in the record's place is refused, not followed, and reads as unreadable", func(t *testing.T, f *fakeSystem, cfg Config) {
+			// The bytes behind the link describe a parked daemon: a read that
+			// followed it would fail the install.
+			at := installStart.Add(time.Minute)
+			path := seedCrashRecord(t, f, cfg, executor.CrashRecord{TrippedAt: &at, Crashes: []executor.Crash{
+				{At: at, Origin: executor.CrashOriginBringUp, Component: "kine", Permanent: true},
+			}})
+			f.putSymlink(path)
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

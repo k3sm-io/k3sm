@@ -722,8 +722,17 @@ func (f *fakeSystem) putKind(path string, k fakeFileKind) {
 // ReadRegularFile answers ReadFile's bytes for an ordinary path, and the
 // ErrNotRegularFile refusal for one a test has said is a symlink or a
 // non-regular file — the two verdicts the real O_NOFOLLOW open reaches.
+//
+// A file seeded to change across reads (putFileAfterReads,
+// putFileChangingAfterReads) answers here as it does through ReadFile, so a
+// reader that moved to the refusing seam keeps its polling fixtures.
 func (f *fakeSystem) ReadRegularFile(path string) ([]byte, error) {
 	f.calls = append(f.calls, "ReadRegularFile:"+path)
+	if _, refused := f.kinds[path]; !refused {
+		if b, err, ok := f.readDelayed(path); ok {
+			return b, err
+		}
+	}
 	return f.readRegularFileContent(path)
 }
 
@@ -799,6 +808,24 @@ func (f *fakeSystem) readRegularFileContent(path string) ([]byte, error) {
 	return nil, fmt.Errorf("open %s: %w", path, fs.ErrNotExist)
 }
 
+// readDelayed answers a read of a file seeded by putFileAfterReads or
+// putFileChangingAfterReads, consuming one of its held-back reads; ok is false
+// for any other path.
+func (f *fakeSystem) readDelayed(path string) (b []byte, err error, ok bool) {
+	d, ok := f.delayed[path]
+	if !ok {
+		return nil, nil, false
+	}
+	if d.absentReads > 0 {
+		d.absentReads--
+		if d.before != nil {
+			return d.before, nil, true
+		}
+		return nil, fmt.Errorf("open %s: %w", path, fs.ErrNotExist), true
+	}
+	return d.content, nil, true
+}
+
 func (f *fakeSystem) ReadFile(path string) ([]byte, error) {
 	f.calls = append(f.calls, "ReadFile:"+path)
 	if err, ok := f.readErrs[path]; ok {
@@ -813,15 +840,8 @@ func (f *fakeSystem) ReadFile(path string) ([]byte, error) {
 			delete(f.swapAfterRead, path)
 		}()
 	}
-	if d, ok := f.delayed[path]; ok {
-		if d.absentReads > 0 {
-			d.absentReads--
-			if d.before != nil {
-				return d.before, nil
-			}
-			return nil, fmt.Errorf("open %s: %w", path, fs.ErrNotExist)
-		}
-		return d.content, nil
+	if b, err, ok := f.readDelayed(path); ok {
+		return b, err
 	}
 	if content, ok := f.files[path]; ok {
 		return content, nil
