@@ -908,7 +908,7 @@ t5() {
 		# The public object first: the Pod spec sets the Hub offline; the exec'd
 		# process env below corroborates it.
 		out="$(pod_offline_env "$EV/t.5.$m.pods.json")" || { bad "$m: $out"; return 1; }
-		out="$(kc exec -n "$NS" "$pod" -- "$PYBIN" -c "$PROBE_HUB" "$MOUNT" 2>&1 || true)"
+		out="$(kc exec -n "$NS" "$pod" -c mlx-serve -- "$PYBIN" -c "$PROBE_HUB" "$MOUNT" 2>&1 || true)"
 		printf '%s\n' "$out" >"$EV/t.5.$pod.hub"
 		grep -qx 'HUB-OFFLINE 1' <<<"$out" || { bad "$pod: the Hub is not offline ($(grep -m 1 '^HUB-OFFLINE' <<<"$out" || tail -n 1 <<<"$out"))"; return 1; }
 		grep -qx 'HUB-CLEAN' <<<"$out" || { bad "$pod: the Hub cache is not empty or the tree shows a Hub fetch: $(grep -m 1 '^HUB-DIRTY' <<<"$out" || tail -n 1 <<<"$out")"; return 1; }
@@ -918,11 +918,11 @@ t5() {
 			bad "$pod: the serving log names huggingface.co: $out"
 			return 1
 		fi
-		out="$(kc exec -n "$NS" "$pod" -- "$PYBIN" -c "$PROBE_WRITE" "$MOUNT/$first" 2>&1 || true)"
+		out="$(kc exec -n "$NS" "$pod" -c mlx-serve -- "$PYBIN" -c "$PROBE_WRITE" "$MOUNT/$first" 2>&1 || true)"
 		printf '%s\n' "$out" >"$EV/t.5.$pod.write"
 		errno="$(awk '$1 == "WRITE-ERRNO" {print $2}' <<<"$out")"
 		[ "$errno" = 1 ] || { bad "$pod: a write to $MOUNT/$first did not fail with EPERM: $(tail -n 1 <<<"$out")"; return 1; }
-		out="$(kc exec -n "$NS" "$pod" -- "$PYBIN" -c "$PROBE_EXEC" "$MOUNT/$first" 2>&1 || true)"
+		out="$(kc exec -n "$NS" "$pod" -c mlx-serve -- "$PYBIN" -c "$PROBE_EXEC" "$MOUNT/$first" 2>&1 || true)"
 		printf '%s\n' "$out" >"$EV/t.5.$pod.exec"
 		errno="$(awk '$1 == "EXEC-ERRNO" {print $2}' <<<"$out")"
 		case "$errno" in
@@ -931,7 +931,7 @@ t5() {
 		[0-9]*) measure "t5_${m}_exec_denied_by" "errno $errno" ;;
 		*) bad "$pod: an exec of $MOUNT/$first did not fail: $(tail -n 1 <<<"$out")"; return 1 ;;
 		esac
-		out="$(kc exec -n "$NS" "$pod" -- "$PYBIN" -c "$PROBE_COPYRUN" 2>&1 || true)"
+		out="$(kc exec -n "$NS" "$pod" -c mlx-serve -- "$PYBIN" -c "$PROBE_COPYRUN" 2>&1 || true)"
 		printf '%s\n' "$out" >"$EV/t.5.$pod.copyrun"
 		measure "t5_${m}_copied_chmod_x_file" "$(grep -o 'COPYRUN-[A-Z]*' <<<"$out" | head -n 1 || echo unread)"
 	done
@@ -1445,7 +1445,12 @@ def kubectl(argv):
                 print("INFO GET https://huggingface.co/api/models/x/revision/main 200")
     elif verb == "exec":
         code = " ".join(dash)
-        if "HUB-OFFLINE" in code:
+        # A probe must name the serving container: in a pod with a second
+        # container, kubectl would otherwise pick one by its own default.
+        if flags.get("-c") != "mlx-serve":
+            print("fake kubectl: exec into %s names no mlx-serve container" % pos[1], file=sys.stderr)
+            rc = 1
+        elif "HUB-OFFLINE" in code:
             rc = hub_probe(pos[1], dash)
         elif "WRITE-" in code:
             print("WRITE-OK" if "write-ok" in BRK else "WRITE-ERRNO 13" if "write-eacces" in BRK else "WRITE-ERRNO 1")
