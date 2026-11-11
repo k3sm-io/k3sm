@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -36,14 +37,14 @@ func TestSlowBringUpClassificationAndBackoff(t *testing.T) {
 		Err: fmt.Errorf("apiserver not healthy: %w", executor.ErrAPIServerHealthTimeout)}
 	cases := []struct {
 		name     string
-		pressure func() (bool, error)
+		pressure func() (bool, string, error)
 		err      error
 		slow     bool
 	}{
-		{"pressured timeout is slow", func() (bool, error) { return true, nil }, timeout, true},
-		{"unpressured timeout counts", func() (bool, error) { return false, nil }, timeout, false},
-		{"pressure read error counts", func() (bool, error) { return false, errors.New("sysctl") }, timeout, false},
-		{"fast failure under pressure counts", func() (bool, error) { return true, nil },
+		{"pressured timeout is slow", func() (bool, string, error) { return true, "load sampled", nil }, timeout, true},
+		{"unpressured timeout counts", func() (bool, string, error) { return false, "load sampled", nil }, timeout, false},
+		{"pressure read error counts", func() (bool, string, error) { return false, "", errors.New("sysctl") }, timeout, false},
+		{"fast failure under pressure counts", func() (bool, string, error) { return true, "load sampled", nil },
 			&executor.BringUpError{Component: "kine", Phase: executor.PhaseBringUp, Err: errors.New("kine exited during bring-up")}, false},
 	}
 	for _, tc := range cases {
@@ -51,7 +52,7 @@ func TestSlowBringUpClassificationAndBackoff(t *testing.T) {
 			dir := t.TempDir()
 			b := newCrashBreaker(dir, quietLogger())
 			sampled := 0
-			b.pressure = func() (bool, error) { sampled++; return tc.pressure() }
+			b.pressure = func() (bool, string, error) { sampled++; return tc.pressure() }
 			for i := 0; i < executor.CrashLoopThreshold; i++ {
 				noteBringUpFailure(context.Background(), b, quietLogger(), tc.err)
 			}
@@ -68,6 +69,11 @@ func TestSlowBringUpClassificationAndBackoff(t *testing.T) {
 			if errors.Is(tc.err, executor.ErrAPIServerHealthTimeout) && sampled == 0 {
 				t.Fatal("the host was not sampled at the timeout")
 			}
+			_, readOK, _ := tc.pressure()
+			last, _ := r.Last()
+			if sampledLoad := errors.Is(tc.err, executor.ErrAPIServerHealthTimeout) && readOK != ""; sampledLoad != strings.Contains(last.Detail, "load sampled") {
+				t.Fatalf("Detail %q: want the sampled load iff it was read (%v)", last.Detail, sampledLoad)
+			}
 		})
 	}
 
@@ -76,7 +82,7 @@ func TestSlowBringUpClassificationAndBackoff(t *testing.T) {
 		b := newCrashBreaker(dir, quietLogger())
 		now := time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
 		b.now = func() time.Time { return now }
-		b.pressure = func() (bool, error) { return true, nil }
+		b.pressure = func() (bool, string, error) { return true, "load sampled", nil }
 		noteBringUpFailure(context.Background(), b, quietLogger(), timeout)
 		noteBringUpFailure(context.Background(), b, quietLogger(), timeout)
 		var asked time.Duration

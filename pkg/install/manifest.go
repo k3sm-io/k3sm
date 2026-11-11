@@ -241,6 +241,14 @@ func artifactManifest(cfg Config) []artifact {
 				artifact{kind: kindFile, disp: dispRemove, path: filepath.Join(cfg.serverWorkDir(), name), assertExists: false},
 				artifact{kind: kindFile, disp: dispRemove, path: filepath.Join(StateStatus.Path(cfg.DataRoot), name), assertExists: false})
 		}
+		// The kept control-plane log generations (<component>.log.1, the pin
+		// that keeps a failure streak's first log there, and the capped .log.2),
+		// REMOVED: they explain a failure of a server that no longer runs. The
+		// live <component>.log stays with the work dir. assertExists is false: a
+		// server writes them only after a restart.
+		for _, p := range executor.ComponentLogKeptPaths(cfg.serverWorkDir()) {
+			items = append(items, artifact{kind: kindFile, disp: dispRemove, path: p, assertExists: false})
+		}
 		// The secrets encryption pair, PRESERVED with the datastore it unlocks:
 		// deleting the key would leave every Secret in the preserved state.db
 		// unreadable. assertExists is false: encryption is opt-in.
