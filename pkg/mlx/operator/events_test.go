@@ -438,6 +438,45 @@ func TestShardedRefusalEmitsAnEvent(t *testing.T) {
 	}
 }
 
+// TestShardedRefusalEventsArePerEpisode pins the episode rule on the sharded
+// path: serving the gang ends the episode both where it is placed and where a
+// whole gang is kept, so a refusal after either, at the same generation and
+// reason, records again.
+func TestShardedRefusalEventsArePerEpisode(t *testing.T) {
+	noMetal := facts(func(f *runtimev1.GPUFacts) { f.MetalAvailable = false })
+	h := shardedHarness(t, shardedModel(2, mlxv1alpha1.MLXDistributedBackendRing), twoMacs(), nil)
+	rec := &fakeRecorder{}
+	gpu := &switchGPU{facts: noMetal}
+	h.ctrl.recorder = rec
+	h.ctrl.gpu = gpu
+
+	h.reconcile(t) // refused: one Event
+	gpu.facts = nil
+	h.reconcile(t) // the gang is placed
+	if len(h.rankPods(t)) == 0 {
+		t.Fatal("the gang was not placed while the fit check was skipped")
+	}
+	gpu.facts = noMetal
+	h.reconcile(t) // refused again: a new episode
+	if len(rec.events) != 2 {
+		t.Fatalf("after refused, placed, refused: %d events, want 2: %+v", len(rec.events), rec.events)
+	}
+
+	h.markRanks(t, true)
+	gpu.facts = nil
+	h.reconcile(t) // the whole gang is kept
+	gpu.facts = noMetal
+	h.reconcile(t) // refused again: a new episode
+	if len(rec.events) != 3 {
+		t.Fatalf("after a kept gang then a refusal: %d events, want 3: %+v", len(rec.events), rec.events)
+	}
+	for i, e := range rec.events {
+		if e.reason != rec.events[0].reason {
+			t.Errorf("event %d reason = %s, want %s", i, e.reason, rec.events[0].reason)
+		}
+	}
+}
+
 // TestFailedStatusWriteRecordsNoEvent pins the ordering: the Event follows a
 // successful status write, so a write that fails records nothing and the retry
 // of the same generation records exactly one.
