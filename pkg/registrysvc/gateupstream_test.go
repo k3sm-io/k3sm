@@ -184,6 +184,12 @@ func TestGateProxyForEveryOperation(t *testing.T) {
 	if len(want) != int(opCount) {
 		t.Errorf("table has %d operations, gateOp has %d: keep them equal", len(want), opCount)
 	}
+	if opCount.String() != opInvalid.String() {
+		t.Errorf("opCount.String() = %q, want the default name %q: the sentinel is not a named operation", opCount.String(), opInvalid.String())
+	}
+	if opInvalid != 0 {
+		t.Errorf("opInvalid = %d, want 0", opInvalid)
+	}
 	for op := gateOp(0); op < opCount; op++ {
 		if op != opInvalid && op.String() == opInvalid.String() {
 			t.Errorf("operation %d has no String name: add a case in gateOp.String", op)
