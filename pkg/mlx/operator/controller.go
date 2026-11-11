@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+	"unicode/utf8"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -154,6 +155,12 @@ type EventRecorder interface {
 // eventComponent is the source component the operator's Events name.
 const eventComponent = FieldManager
 
+// eventReasonArtifactUnresolved is the Event reason, and only the Event
+// reason, of a model whose artifact reference could not be resolved. Its
+// status still reports ReasonInvalidSpec; the Event tells a registry that
+// cannot be reached, which is retried, from a spec that cannot be rendered.
+const eventReasonArtifactUnresolved = "ArtifactUnresolved"
+
 // Controller reconciles MLXModels into the objects that serve them.
 //
 // Concurrency: three informers feed ONE workqueue drained by a SINGLE worker, so
@@ -241,12 +248,15 @@ func (c *Controller) Run(ctx context.Context) error {
 			return fmt.Errorf("mlx operator: ensure mlxmodel crd: %w", err)
 		}
 	}
-	if c.recorder == nil {
-		// Set before the worker starts, so no reconcile reads it concurrently.
+	// The recorder this Run builds lives and dies with this Run: it is handed
+	// to the worker, never stored on the Controller, so a later Run builds its
+	// own instead of recording through a broadcaster this one shut down.
+	rec := c.recorder
+	if rec == nil {
 		b := record.NewBroadcaster()
 		b.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: c.client.CoreV1().Events("")})
 		defer b.Shutdown()
-		c.recorder = b.NewRecorder(scheme.Scheme, corev1.EventSource{Component: eventComponent})
+		rec = b.NewRecorder(scheme.Scheme, corev1.EventSource{Component: eventComponent})
 	}
 
 	modelFactory := dynamicinformer.NewFilteredDynamicSharedInformerFactory(c.dyn, resyncPeriod, metav1.NamespaceAll, nil)
@@ -302,7 +312,7 @@ func (c *Controller) Run(ctx context.Context) error {
 	workerDone := make(chan struct{})
 	go func() {
 		defer close(workerDone)
-		for c.processNext(ctx) {
+		for c.processNext(ctx, rec) {
 		}
 	}()
 
@@ -405,14 +415,14 @@ func (c *Controller) enqueueStatefulSetOwner(oldObj, newObj any) {
 // processNext dequeues one model key and reconciles it, re-queueing with
 // rate-limited backoff on a transient error. It returns false only once the
 // queue has shut down.
-func (c *Controller) processNext(ctx context.Context) bool {
+func (c *Controller) processNext(ctx context.Context, rec EventRecorder) bool {
 	key, shutdown := c.queue.Get()
 	if shutdown {
 		return false
 	}
 	defer c.queue.Done(key)
 
-	if err := c.Reconcile(ctx, key); err != nil {
+	if err := c.reconcile(ctx, key, rec); err != nil {
 		c.log.Error("mlx operator: reconcile mlxmodel", "mlxmodel", key, "err", err)
 		c.queue.AddRateLimited(key)
 		return true
@@ -428,7 +438,15 @@ func (c *Controller) processNext(ctx context.Context) bool {
 // A returned error means TRANSIENT: the key is requeued with backoff. A spec
 // that cannot be served is NOT an error — it is a status — because requeueing it
 // would retry a decision that cannot change until the spec does.
+//
+// Refusal Events go to Config.Recorder; with none configured, a Reconcile
+// called outside Run records nothing.
 func (c *Controller) Reconcile(ctx context.Context, key string) error {
+	return c.reconcile(ctx, key, c.recorder)
+}
+
+// reconcile is Reconcile recording refusal Events through rec, which may be nil.
+func (c *Controller) reconcile(ctx context.Context, key string, rec EventRecorder) error {
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
 		return fmt.Errorf("split mlxmodel key %q: %w", key, err)
@@ -461,7 +479,9 @@ func (c *Controller) Reconcile(ctx context.Context, key string) error {
 	// error is retried, a missing resolver waits for the configuration.
 	if err := c.resolveArtifact(ctx, model); err != nil {
 		c.log.Warn("mlxmodel artifact cannot be resolved; no objects applied", "mlxmodel", key, "err", err)
-		if werr := c.refuseInvalidSpec(ctx, raw, model, err); werr != nil {
+		// The status is InvalidSpec whatever the cause, but the Event names
+		// the cause: a registry outage that is retried is not a bad spec.
+		if werr := c.refuseWithEvent(ctx, rec, raw, model, invalidSpecFit(err), eventReasonArtifactUnresolved); werr != nil {
 			return werr
 		}
 		if errors.Is(err, errNoResolver) {
@@ -473,7 +493,7 @@ func (c *Controller) Reconcile(ctx context.Context, key string) error {
 	// A sharded model is a different workload shape (rank Pods, not a
 	// StatefulSet) with its own fit, placement and lifecycle; see sharded.go.
 	if model.Spec.Distributed != nil {
-		return c.reconcileSharded(ctx, key, raw, model)
+		return c.reconcileSharded(ctx, key, raw, model, rec)
 	}
 	// A model that WAS sharded leaves rank Pods behind; they are not part of
 	// the single-node shape and would hold the GPU the StatefulSet needs.
@@ -487,7 +507,7 @@ func (c *Controller) Reconcile(ctx context.Context, key string) error {
 	if fit := ValidateFit(model.Spec.Memory, c.gpuFacts(ctx)); fit.Blocks() {
 		c.log.Warn("mlxmodel does not fit this node's gpu; no objects applied",
 			"mlxmodel", key, "reason", fit.Reason, "message", fit.Message)
-		return c.refuse(ctx, raw, model, fit)
+		return c.refuse(ctx, rec, raw, model, fit)
 	}
 
 	// 2. Render. A render error is a bad spec, not a busy cluster, so it is
@@ -495,7 +515,7 @@ func (c *Controller) Reconcile(ctx context.Context, key string) error {
 	objs, err := mlx.Render(model, c.opts)
 	if err != nil {
 		c.log.Warn("mlxmodel spec cannot be rendered; no objects applied", "mlxmodel", key, "err", err)
-		return c.refuseInvalidSpec(ctx, raw, model, err)
+		return c.refuseInvalidSpec(ctx, rec, raw, model, err)
 	}
 
 	// 3. Pull secret, only if it exists (see the package doc).
@@ -507,6 +527,7 @@ func (c *Controller) Reconcile(ctx context.Context, key string) error {
 	if err := c.apply(ctx, objs); err != nil {
 		return err
 	}
+	c.servedRefused(key)
 
 	// 5. Observe and report.
 	obs, err := c.observe(ctx, model)
@@ -677,33 +698,41 @@ func blockedStatus(m *mlxv1alpha1.MLXModel, fit Fit, now time.Time) mlxv1alpha1.
 }
 
 // refuse reports a model this reconcile will not serve: the blocked status, then
-// one Warning Event naming the same reason and message (see recordRefusal). The
-// Event follows a successful status write only, so a write that fails and is
-// retried records it on the retry instead.
-func (c *Controller) refuse(ctx context.Context, raw *unstructured.Unstructured, m *mlxv1alpha1.MLXModel, fit Fit) error {
+// one Warning Event naming the same reason and message (see recordRefusal).
+func (c *Controller) refuse(ctx context.Context, rec EventRecorder, raw *unstructured.Unstructured, m *mlxv1alpha1.MLXModel, fit Fit) error {
+	return c.refuseWithEvent(ctx, rec, raw, m, fit, fit.Reason)
+}
+
+// refuseWithEvent is refuse with an Event reason that may differ from the
+// status reason. The Event follows a successful status write only, so a write
+// that fails and is retried records it on the retry instead.
+func (c *Controller) refuseWithEvent(ctx context.Context, rec EventRecorder, raw *unstructured.Unstructured, m *mlxv1alpha1.MLXModel, fit Fit, eventReason string) error {
 	if err := c.writeStatus(ctx, raw, m, blockedStatus(m, fit, c.now())); err != nil {
 		return err
 	}
-	c.recordRefusal(raw, m, fit)
+	c.recordRefusal(rec, raw, m, eventReason, fit.Message)
 	return nil
 }
 
-// recordRefusal records one Warning Event for a refusal, at most once per model
-// UID, generation and reason. Every resync and every status write re-delivers a
-// refused model, and each would otherwise add a copy of one decision to the
-// model's Events; a new generation, a recreated model (a new UID) or a different
-// reason is a new decision and gets its own.
+// recordRefusal records one Warning Event per refusal episode per generation:
+// at most once per model UID, generation and reason until the model is served.
+// Every resync and every status write re-delivers a refused model, and each
+// would otherwise add a copy of one decision to the model's Events; a new
+// generation, a recreated model (a new UID) or a different reason is a new
+// decision and gets its own. A model that is served after a refusal ends the
+// episode (see servedRefused), so a later refusal at the same generation, for
+// the same reason, records again.
 //
 // The memory is in process only. A restart forgets it, so a model still
 // refused gets one more Event at its current generation when the informers'
 // initial sync re-delivers it: at most one per refused model per start. An
-// entry is dropped when a reconcile finds its model gone or terminating, and
+// entry is dropped when its model is served, gone or terminating, and
 // otherwise holds one generation's reasons per model key.
 //
 // The object is the model as read (raw), whose apiVersion and kind are what the
-// recorder's object reference is built from.
-func (c *Controller) recordRefusal(raw *unstructured.Unstructured, m *mlxv1alpha1.MLXModel, fit Fit) {
-	if c.recorder == nil {
+// recorder's object reference is built from. A nil rec records nothing.
+func (c *Controller) recordRefusal(rec EventRecorder, raw *unstructured.Unstructured, m *mlxv1alpha1.MLXModel, reason, message string) {
+	if rec == nil {
 		return
 	}
 	key := m.Namespace + "/" + m.Name
@@ -712,18 +741,44 @@ func (c *Controller) recordRefusal(raw *unstructured.Unstructured, m *mlxv1alpha
 		mark = refusalMark{uid: m.UID, generation: m.Generation, reasons: map[string]struct{}{}}
 		c.refusals[key] = mark
 	}
-	if _, seen := mark.reasons[fit.Reason]; seen {
+	if _, seen := mark.reasons[reason]; seen {
 		return
 	}
-	mark.reasons[fit.Reason] = struct{}{}
+	mark.reasons[reason] = struct{}{}
 	// The message goes in as an argument, never as the format: it carries
 	// spec values a model author wrote.
-	c.recorder.Eventf(raw, corev1.EventTypeWarning, fit.Reason, "%s", fit.Message)
+	rec.Eventf(raw, corev1.EventTypeWarning, reason, "%s", truncateEventMessage(message))
+}
+
+// servedRefused ends a model's refusal episode once its serving objects were
+// applied, so a later refusal records a new Event (see recordRefusal).
+func (c *Controller) servedRefused(key string) {
+	delete(c.refusals, key)
+}
+
+// maxEventMessageBytes bounds a refusal Event's message. The API server
+// rejects a core/v1 Event whose message exceeds 1024 characters, which would
+// drop the Event. A byte bound under that holds whatever the message's runes
+// are, since no rune is shorter than one byte. The Ready condition keeps the
+// whole message.
+const maxEventMessageBytes = 1000
+
+// truncateEventMessage cuts s to at most maxEventMessageBytes bytes, on a
+// UTF-8 rune boundary so the cut never splits a character.
+func truncateEventMessage(s string) string {
+	if len(s) <= maxEventMessageBytes {
+		return s
+	}
+	cut := maxEventMessageBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }
 
 // refuseInvalidSpec is refuse for a spec that cannot be served at all.
-func (c *Controller) refuseInvalidSpec(ctx context.Context, raw *unstructured.Unstructured, m *mlxv1alpha1.MLXModel, err error) error {
-	return c.refuse(ctx, raw, m, invalidSpecFit(err))
+func (c *Controller) refuseInvalidSpec(ctx context.Context, rec EventRecorder, raw *unstructured.Unstructured, m *mlxv1alpha1.MLXModel, err error) error {
+	return c.refuse(ctx, rec, raw, m, invalidSpecFit(err))
 }
 
 // refusalMark is what recordRefusal remembers about one model key: the UID and

@@ -121,10 +121,10 @@ func (c *Controller) readCable(ctx context.Context) (Cable, *netv1alpha1.Interco
 //
 // A spec or a cluster that cannot be served is a status, never a transient
 // error, as on the single-node path.
-func (c *Controller) reconcileSharded(ctx context.Context, key string, raw *unstructured.Unstructured, model *mlxv1alpha1.MLXModel) error {
+func (c *Controller) reconcileSharded(ctx context.Context, key string, raw *unstructured.Unstructured, model *mlxv1alpha1.MLXModel, rec EventRecorder) error {
 	if err := ValidateDistributed(model.Spec); err != nil {
 		c.log.Warn("sharded mlxmodel spec refused; no objects applied", "mlxmodel", key, "err", err)
-		return c.refuseInvalidSpec(ctx, raw, model, err)
+		return c.refuseInvalidSpec(ctx, rec, raw, model, err)
 	}
 	// The single-node StatefulSet of an earlier spec would hold a GPU a rank
 	// needs.
@@ -152,13 +152,13 @@ func (c *Controller) reconcileSharded(ctx context.Context, key string, raw *unst
 	if fit := ValidateFit(perRank, c.gpuFacts(ctx)); fit.Blocks() {
 		c.log.Warn("sharded mlxmodel rank does not fit this node's gpu; no objects applied",
 			"mlxmodel", key, "reason", fit.Reason, "message", fit.Message)
-		return c.refuse(ctx, raw, model, fit)
+		return c.refuse(ctx, rec, raw, model, fit)
 	}
 
 	headless, clusterIP, err := mlx.RenderShardedServices(model, c.opts)
 	if err != nil {
 		c.log.Warn("sharded mlxmodel spec cannot be rendered; no objects applied", "mlxmodel", key, "err", err)
-		return c.refuseInvalidSpec(ctx, raw, model, err)
+		return c.refuseInvalidSpec(ctx, rec, raw, model, err)
 	}
 	hash, err := mlx.SpecHash(model, c.opts)
 	if err != nil {
@@ -219,6 +219,7 @@ func (c *Controller) reconcileSharded(ctx context.Context, key string, raw *unst
 		if err := c.applyService(ctx, clusterIP); err != nil {
 			return err
 		}
+		c.servedRefused(key)
 		cable, ic, err := c.readCable(ctx)
 		if err != nil {
 			return fmt.Errorf("read interconnect for mlxmodel %s: %w", key, err)
@@ -275,7 +276,7 @@ func (c *Controller) reconcileSharded(ctx context.Context, key string, raw *unst
 	objs, err := mlx.RenderSharded(model, c.opts, placement)
 	if err != nil {
 		c.log.Warn("sharded mlxmodel spec cannot be rendered; no objects applied", "mlxmodel", key, "err", err)
-		return c.refuseInvalidSpec(ctx, raw, model, err)
+		return c.refuseInvalidSpec(ctx, rec, raw, model, err)
 	}
 	if c.pullSecretExists(ctx, model.Namespace) {
 		for _, pod := range objs.Pods {
@@ -285,6 +286,7 @@ func (c *Controller) reconcileSharded(ctx context.Context, key string, raw *unst
 	if err := c.applySharded(ctx, objs); err != nil {
 		return err
 	}
+	c.servedRefused(key)
 	c.log.Info("placed sharded mlxmodel", "mlxmodel", key, "backend", placement.Backend,
 		"interconnect", placement.Path(), "nodes", placedNodes(placement))
 	created := make([]corev1.Pod, len(objs.Pods))
