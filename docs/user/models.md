@@ -6,6 +6,11 @@ node pulls it from the cluster. No pod needs internet access to get its weights.
 An `MLXModel` that names one with `spec.artifact` is served with the Hub offline (`HF_HUB_OFFLINE=1`), so
 the engine never contacts Hugging Face.
 
+Because the engine cannot fetch a second repository, a model that sets `spec.artifact` is refused with
+`InvalidSpec` when `spec.runtime.args` sets `--adapter-path` or `--draft-model` (or an unambiguous
+abbreviation of either) to anything but an absolute path. To use an adapter or a draft model, mount its
+weights into the pod and pass their absolute path.
+
 Three verbs manage these artifacts:
 
 | Verb | What it does |

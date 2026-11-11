@@ -151,6 +151,8 @@ That removes the serving workload, both Services, and the cache PVC. The underly
   `--embedding-model <repo>` in `runtime.args`. A pinned model loads at start, beside the served one,
   and `memory` does not account for it. A pin the engine cannot load exits the pod, which then
   crash-loops; the server does not answer HTTP 400 for it.
+- A model served from the cluster registry accepts only an absolute path for `--adapter-path` and
+  `--draft-model` in `runtime.args`; see [Models in the cluster registry](models.md).
 - Send images, video and audio inline as `data:image/`, `data:video/` or `data:audio/` URLs. Remote URLs
   and other `data:` types are refused with HTTP 400.
 - Weights never live in the image. They are downloaded on first start into the cache volume, so give

@@ -186,6 +186,10 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
   at start. A single-node model served from the registry restarts once when the node is upgraded, because its
   pod template changes; a sharded model already running picks this up the next time its pods are recreated. See
   [Models in the cluster registry](docs/user/models.md).
+- An `MLXModel` served from the cluster registry (`spec.artifact`) is now refused with `InvalidSpec`
+  when `spec.runtime.args` sets `--adapter-path` or `--draft-model` to anything but an absolute path,
+  because the engine cannot fetch a second repository. Mount the weights and pass their absolute path.
+  See [Models in the cluster registry](docs/user/models.md).
 - A Pod with `dnsPolicy: None` now resolves through its own `dnsConfig`: its IPv4 nameservers
   (up to three), `searches` and `ndots`, natively and in a `vm` guest, with no fallback to the host
   resolver. It used to resolve through the host and ignore its `dnsConfig`. IPv6 nameservers are
