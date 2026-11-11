@@ -271,7 +271,7 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
   push gate now gets a 502 `UNAVAILABLE` after 10 minutes without response headers, instead of
   waiting until the client gives up. Retry the push. A manifest push gets that long because the
   registry can make it wait behind a garbage-collection sweep of the repository or a re-hash of a
-  large layer. Blob uploads are held to the registry's own 2-hour upload bound instead, because the
+  large layer. Blob uploads get the same 502 after the registry's own 2-hour upload bound, because the
   registry finishes committing a layer before it answers. A stalled pull ends after 30 seconds the
   same way it always ended when the registry could not be reached: the gate closes the connection,
   and the puller tries its next mirror. A pull that cannot reach the local registry is now logged.
