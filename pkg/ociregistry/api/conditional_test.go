@@ -117,6 +117,50 @@ func TestConditionalDelete(t *testing.T) {
 		})
 	}
 
+	// A tag DELETE also matches the tag's own entity tag, its manifest
+	// digest; a by-digest DELETE gains nothing from a digest condition.
+	tagged := newFixture(t)
+	oldBody := tagged.image(t, "app", "v1", "l")
+	newBody := tagged.image(t, "app", "", "m")
+	for _, tc := range []struct {
+		name, path, ifMatch string
+		status              int
+		gone                bool
+	}{
+		{"a tag delete matching the tag's digest deletes", "/v2/app/manifests/v1", `"<old>"`, http.StatusAccepted, true},
+		{"a tag delete matching the digest in a list deletes", "/v2/app/manifests/v1", `"sha256:nope", "<old>"`, http.StatusAccepted, true},
+		{"a tag delete naming a digest the tag does not name is refused", "/v2/app/manifests/v1", `"<new>"`, http.StatusPreconditionFailed, false},
+		{"a weak tag of the digest never matches", "/v2/app/manifests/v1", `W/"<old>"`, http.StatusPreconditionFailed, false},
+		{"a malformed list naming the digest fails whole", "/v2/app/manifests/v1", `"<old>", bogus`, http.StatusPreconditionFailed, false},
+		{"a digest delete naming its own digest is refused", "/v2/app/manifests/<new>", `"<new>"`, http.StatusPreconditionFailed, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := tagged.clone(t)
+			r := strings.NewReplacer("<old>", dg(oldBody).String(), "<new>", dg(newBody).String())
+			want(t, f.do(http.MethodDelete, r.Replace(tc.path), nil, "If-Match", r.Replace(tc.ifMatch)), tc.status, "")
+			if tc.gone {
+				want(t, f.do(http.MethodGet, "/v2/app/manifests/v1", nil), http.StatusNotFound, codeManifestUnknown)
+				return
+			}
+			want(t, f.do(http.MethodGet, "/v2/app/manifests/v1", nil), http.StatusOK, "")
+			want(t, f.do(http.MethodGet, "/v2/app/manifests/"+dg(newBody).String(), nil), http.StatusOK, "")
+		})
+	}
+
+	// A push that re-points the tag after a client read it makes the digest
+	// the client read stale: the tag stays on the new manifest.
+	t.Run("a tag re-pointed since it was read is refused", func(t *testing.T) {
+		f := newFixture(t)
+		read := f.image(t, "app", "v1", "l")
+		moved := f.image(t, "app", "v1", "m")
+		want(t, f.do(http.MethodDelete, "/v2/app/manifests/v1", nil, "If-Match", `"`+dg(read).String()+`"`), http.StatusPreconditionFailed, codeDenied)
+		w := f.do(http.MethodGet, "/v2/app/manifests/v1", nil)
+		want(t, w, http.StatusOK, "")
+		if got := w.Header().Get("Docker-Content-Digest"); got != dg(moved).String() {
+			t.Errorf("app:v1 = %s, want the re-pointed %s", got, dg(moved))
+		}
+	})
+
 	// Several If-Match field lines are one list (RFC 9110 section 5.3): an
 	// empty first line must not turn the condition off for the lines after it.
 	twoImages := newFixture(t)

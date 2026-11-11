@@ -66,7 +66,9 @@ limitations under the License.
 //     (store.IndexState of its rows, as a quoted entity tag), compared under
 //     the repository lock; a state that no longer holds is 412 and deletes
 //     nothing, and so is a conditional DELETE by digest of a digest any row
-//     tags. That refusal protects only a client that sends If-Match: a DELETE
+//     tags. A DELETE by tag also matches the tag's current manifest digest,
+//     the entity tag GET and HEAD of the tag send, so a tag that moved since
+//     it was read is 412 and stays. That refusal protects only a client that sends If-Match: a DELETE
 //     by digest without it removes every row of the digest, tags included, as
 //     above. The registry this replaces ignores If-Match;
 //   - blobs are never deleted through the API; garbage collection removes
