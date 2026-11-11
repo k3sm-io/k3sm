@@ -632,8 +632,8 @@ kube-controller-manager) writes its log to `/var/lib/k3sm/server/<component>.log
 previous run's log is kept as `<component>.log.1`. While failures are on record, `<component>.log.1`
 stays the log of the first failed run, with a marker file `<component>.log.1.pinned` beside it, and
 the most recent failed run is kept as `<component>.log.2` (its last 4 MiB when it is larger). After
-a healthy start the marker is removed, so the next restart replaces `<component>.log.1` again, and
-`<component>.log.2` stays until the next failure replaces it. `k3sm uninstall` removes the kept
+a healthy start the marker is removed, so the next restart replaces `<component>.log.1` again and
+removes `<component>.log.2`. `k3sm uninstall` removes the kept
 `.log.1`, `.log.2` and `.pinned` files; the live logs stay with the work directory.
 
 A server that was killed outright leaves its control-plane processes running. Its next start stops
