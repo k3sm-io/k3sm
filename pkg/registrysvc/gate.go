@@ -80,6 +80,10 @@ type gateConfig struct {
 	// Transport is the round tripper to the upstream; nil means a loopback
 	// transport.
 	Transport http.RoundTripper
+	// UpstreamHeaderTimeout bounds how long the loopback transport waits for
+	// the registry's response headers; zero means the default. It is ignored
+	// when Transport is set.
+	UpstreamHeaderTimeout time.Duration
 }
 
 // newGate builds a gate.
