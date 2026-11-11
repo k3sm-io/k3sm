@@ -19,10 +19,13 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"regexp"
+	"slices"
 
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -112,6 +115,10 @@ func rmRPCError(target, socket string, err error) error {
 		return fmt.Errorf("rm %s: this node's runtimed predates image rm; nothing was evicted; upgrade the node's runtimed (k3sm install, then restart it)", target)
 	case codes.NotFound:
 		return fmt.Errorf("rm %s: no image entry, artifact record or released copy names %s on this node; `k3sm image prune` reclaims unnamed blobs (%s)", target, target, st.Message())
+	case codes.FailedPrecondition:
+		if msg, ok := rmRefusal(target, st); ok {
+			return errors.New(msg)
+		}
 	case codes.Internal:
 		// An unlink that failed, or whose re-verification refused it, is a
 		// failure, not a partial success. Some blobs may already be gone.
@@ -120,9 +127,40 @@ func rmRPCError(target, socket string, err error) error {
 	return imageRPCError("rm "+target, socket, err)
 }
 
+// rmRefusal is the operator's sentence for a FAILED_PRECONDITION refusal
+// whose google.rpc.ErrorInfo detail (domain runtime.k3sm.io) names the case,
+// read from the detail and never from the message text. The daemon attaches a
+// reason and the domain only, no metadata, so the sentence names no pod; its
+// message is appended as context. ok is false for a refusal with no such
+// detail or with a reason this build does not know: the caller keeps the
+// generic line.
+func rmRefusal(target string, st *status.Status) (msg string, ok bool) {
+	for _, d := range st.Details() {
+		info, isInfo := d.(*errdetails.ErrorInfo)
+		if !isInfo || info.GetDomain() != runtimev1.EvictErrorInfoDomain {
+			continue
+		}
+		switch info.GetReason() {
+		case runtimev1.EvictReasonImageInUse:
+			return fmt.Sprintf("rm %s: a pod on this node uses %s, so nothing was evicted; retry once the pod is gone (%s)", target, target, st.Message()), true
+		case runtimev1.EvictReasonReferenceAmbiguous:
+			return fmt.Sprintf("rm %s: %s names more than one image on this node, so nothing was evicted; retry with --platform, or name the image by its digest (%s)", target, target, st.Message()), true
+		case runtimev1.EvictReasonRootsIncomplete:
+			// The contract allows this refusal after an earlier removal stage
+			// already unlinked; the daemon's message then counts the blobs.
+			return fmt.Sprintf("rm %s: the daemon could not read every record that protects blobs, so it refused; nothing was deleted unless its message counts unlinked blobs; see the daemon's log, repair the record, and re-run (%s)", target, st.Message()), true
+		}
+	}
+	return "", false
+}
+
+// rmKeptShown is how many kept blobs the text report lists one by one; a
+// target can name thousands. -o json lists every one.
+const rmKeptShown = 20
+
 // renderRm renders an eviction as the operator's report: the manifest, each
-// blob evicted (or that would be), the reclaimed bytes, and each kept blob
-// with its reason.
+// blob evicted (or that would be), the reclaimed bytes, the kept blobs counted
+// by reason, and the first rmKeptShown kept blobs with their reason.
 func renderRm(out io.Writer, r rmReport, kept []*runtimev1.EvictKeptBlob) {
 	verb := "would evict"
 	if !r.DryRun {
@@ -133,13 +171,25 @@ func renderRm(out io.Writer, r rmReport, kept []*runtimev1.EvictKeptBlob) {
 		fmt.Fprintf(out, "  %s %s\n", verb, d)
 	}
 	fmt.Fprintf(out, "  %s %d blob(s), %s\n", verb, len(r.RemovedDigests), humanBytes(r.ReclaimedBytes))
-	young := 0
+	counts := map[runtimev1.EvictSkipReason]int{}
 	for _, k := range kept {
-		fmt.Fprintf(out, "  kept %s: %s\n", k.GetDigest(), evictReasonText(k.GetReason()))
-		if k.GetReason() == runtimev1.EvictSkipReason_EVICT_SKIP_REASON_YOUNG {
-			young++
-		}
+		counts[k.GetReason()]++
 	}
+	reasons := make([]runtimev1.EvictSkipReason, 0, len(counts))
+	for r := range counts {
+		reasons = append(reasons, r)
+	}
+	slices.Sort(reasons)
+	for _, r := range reasons {
+		fmt.Fprintf(out, "  kept %d blob(s): %s\n", counts[r], evictReasonText(r))
+	}
+	for _, k := range kept[:min(len(kept), rmKeptShown)] {
+		fmt.Fprintf(out, "  kept %s: %s\n", k.GetDigest(), evictReasonText(k.GetReason()))
+	}
+	if n := len(kept) - rmKeptShown; n > 0 {
+		fmt.Fprintf(out, "  ... and %d more kept blob(s)\n", n)
+	}
+	young := counts[runtimev1.EvictSkipReason_EVICT_SKIP_REASON_YOUNG]
 	if len(kept) > 0 {
 		fmt.Fprintf(out, "  partial: %d of %d blob(s) kept\n", len(kept), len(kept)+len(r.RemovedDigests))
 	}

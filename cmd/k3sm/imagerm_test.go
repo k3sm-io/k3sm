@@ -18,6 +18,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -27,6 +29,7 @@ import (
 	"sync"
 	"testing"
 
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -100,6 +103,17 @@ const (
 	rmShared   = "sha256:" + "c300000000000000000000000000000000000000000000000000000000000000"
 )
 
+// evictRefusal is the daemon's FAILED_PRECONDITION refusal with the
+// ErrorInfo detail the handler attaches: a reason and the domain, no metadata.
+func evictRefusal(t *testing.T, domain, reason, msg string) error {
+	t.Helper()
+	st, err := status.New(codes.FailedPrecondition, msg).WithDetails(&errdetails.ErrorInfo{Reason: reason, Domain: domain})
+	if err != nil {
+		t.Fatalf("attach ErrorInfo: %v", err)
+	}
+	return st.Err()
+}
+
 // TestImageRmEvictsOneImage is the gate for `k3sm image rm`: it is a client of
 // the daemon's EvictImage, the request names exactly the target and carries
 // force only under --force, and the outcome (reclaimed bytes, each kept blob
@@ -120,6 +134,7 @@ func TestImageRmEvictsOneImage(t *testing.T) {
 		// EvictImage call at all.
 		wantReq  *runtimev1.EvictImageRequest
 		wantErr  []string
+		denyErr  []string
 		wantOut  []string
 		denyOut  []string
 		wantJSON string
@@ -195,11 +210,56 @@ func TestImageRmEvictsOneImage(t *testing.T) {
 			wantErr: []string{"names " + rmManifest + " on this node", "k3sm image prune"},
 		},
 		{
-			name:    "the daemon's refusal reaches the operator",
+			name:    "a refusal without a detail keeps the generic line",
 			args:    []string{"rm", "app:v1", "--force"},
-			err:     status.Error(codes.FailedPrecondition, "image is in use by pod default/web"),
+			err:     status.Error(codes.FailedPrecondition, "index entry names no manifest digest"),
 			wantReq: &runtimev1.EvictImageRequest{Reference: "app:v1", Force: true},
-			wantErr: []string{"the daemon refused", "default/web"},
+			wantErr: []string{"the daemon refused", "index entry names no manifest digest"},
+		},
+		{
+			name:    "an in-use refusal says to retry once the pod is gone",
+			args:    []string{"rm", "app:v1", "--force"},
+			err:     evictRefusal(t, runtimev1.EvictErrorInfoDomain, runtimev1.EvictReasonImageInUse, "manifest sha256:aa: evict: image is in use by a pod"),
+			wantReq: &runtimev1.EvictImageRequest{Reference: "app:v1", Force: true},
+			wantErr: []string{"a pod on this node uses app:v1", "nothing was evicted", "retry once the pod is gone", "manifest sha256:aa"},
+			denyErr: []string{"the daemon refused"},
+		},
+		{
+			name:    "an ambiguous refusal says to name a platform or the digest",
+			args:    []string{"rm", "app:v1", "--force"},
+			err:     evictRefusal(t, runtimev1.EvictErrorInfoDomain, runtimev1.EvictReasonReferenceAmbiguous, "app:v1: index entry is ambiguous"),
+			wantReq: &runtimev1.EvictImageRequest{Reference: "app:v1", Force: true},
+			wantErr: []string{"app:v1 names more than one image", "nothing was evicted", "retry with --platform", "by its digest"},
+			denyErr: []string{"the daemon refused"},
+		},
+		{
+			name:    "a roots-incomplete refusal points at the daemon log",
+			args:    []string{"rm", "app:v1", "--force"},
+			err:     evictRefusal(t, runtimev1.EvictErrorInfoDomain, runtimev1.EvictReasonRootsIncomplete, "roots incomplete"),
+			wantReq: &runtimev1.EvictImageRequest{Reference: "app:v1", Force: true},
+			wantErr: []string{"could not read every record that protects blobs", "nothing was deleted", "daemon's log", "roots incomplete"},
+			denyErr: []string{"the daemon refused"},
+		},
+		{
+			name:    "an unknown reason keeps the generic line",
+			args:    []string{"rm", "app:v1", "--force"},
+			err:     evictRefusal(t, runtimev1.EvictErrorInfoDomain, "SOMETHING_NEW", "a newer refusal"),
+			wantReq: &runtimev1.EvictImageRequest{Reference: "app:v1", Force: true},
+			wantErr: []string{"the daemon refused", "a newer refusal"},
+		},
+		{
+			name:    "a known reason in another domain keeps the generic line",
+			args:    []string{"rm", "app:v1", "--force"},
+			err:     evictRefusal(t, "example.com", runtimev1.EvictReasonImageInUse, "foreign refusal"),
+			wantReq: &runtimev1.EvictImageRequest{Reference: "app:v1", Force: true},
+			wantErr: []string{"the daemon refused", "foreign refusal"},
+		},
+		{
+			name:    "a short hex digest is sent as a digest and its rejection is an error",
+			args:    []string{"rm", "sha256:abc", "--force"},
+			err:     status.Error(codes.InvalidArgument, "evict: malformed digest \"sha256:abc\""),
+			wantReq: &runtimev1.EvictImageRequest{Digest: "sha256:abc", Force: true},
+			wantErr: []string{"rm sha256:abc", "malformed digest"},
 		},
 		{
 			name: "-o json is a stable machine form",
@@ -257,6 +317,11 @@ func TestImageRmEvictsOneImage(t *testing.T) {
 						t.Errorf("error %q does not say %q", err, w)
 					}
 				}
+				for _, d := range tc.denyErr {
+					if strings.Contains(err.Error(), d) {
+						t.Errorf("error %q says %q", err, d)
+					}
+				}
 			} else if err != nil {
 				t.Fatalf("image rm: %v", err)
 			}
@@ -294,6 +359,68 @@ func TestImageRmEvictsOneImage(t *testing.T) {
 				t.Errorf("json output:\n%s\nwant:\n%s", out, tc.wantJSON)
 			}
 		})
+	}
+}
+
+// TestImageRmBoundsKeptListing pins the text report of a target that keeps
+// many blobs: counts by reason first, then at most twenty kept blobs, then how
+// many more. -o json still lists every one.
+func TestImageRmBoundsKeptListing(t *testing.T) {
+	resp := &runtimev1.EvictImageResponse{ManifestDigest: rmManifest, RemovedDigests: []string{rmLayerA}}
+	for i := range 25 {
+		reason := runtimev1.EvictSkipReason_EVICT_SKIP_REASON_SHARED
+		if i >= 18 {
+			reason = runtimev1.EvictSkipReason_EVICT_SKIP_REASON_ROOTED
+		}
+		resp.Kept = append(resp.Kept, &runtimev1.EvictKeptBlob{Digest: fmt.Sprintf("sha256:%064x", i+1), Reason: reason})
+	}
+	fake := &fakeEvictDaemon{evictResp: resp}
+	sock := serveFakeImages(t, fake)
+
+	out, err := runImageCmd(t, []string{"--socket", sock, "rm", "app:v1", "--force"})
+	if err != nil {
+		t.Fatalf("image rm: %v", err)
+	}
+	lines := strings.Split(out, "\n")
+	blobLines, firstBlob, rootedCount, sharedCount, more := 0, -1, -1, -1, -1
+	for i, l := range lines {
+		switch {
+		case strings.HasPrefix(l, "  kept sha256:"):
+			blobLines++
+			if firstBlob < 0 {
+				firstBlob = i
+			}
+		case l == "  kept 7 blob(s): rooted by an artifact record or operator root":
+			rootedCount = i
+		case l == "  kept 18 blob(s): shared with another cached image":
+			sharedCount = i
+		case l == "  ... and 5 more kept blob(s)":
+			more = i
+		}
+	}
+	if blobLines != 20 {
+		t.Errorf("%d kept-blob lines, want 20:\n%s", blobLines, out)
+	}
+	if rootedCount < 0 || sharedCount < 0 || more < 0 {
+		t.Fatalf("missing a count or the more line:\n%s", out)
+	}
+	if rootedCount > firstBlob || sharedCount > firstBlob || more < firstBlob {
+		t.Errorf("counts must come before the blobs and the more line after:\n%s", out)
+	}
+	if !strings.Contains(out, "partial: 25 of 26 blob(s) kept") {
+		t.Errorf("output does not say the partial total:\n%s", out)
+	}
+
+	jsonOut, err := runImageCmd(t, []string{"--socket", sock, "rm", "app:v1", "--force", "-o", "json"})
+	if err != nil {
+		t.Fatalf("image rm -o json: %v", err)
+	}
+	var doc rmReport
+	if err := json.Unmarshal([]byte(jsonOut), &doc); err != nil {
+		t.Fatalf("decode json: %v\n%s", err, jsonOut)
+	}
+	if len(doc.Kept) != 25 {
+		t.Errorf("json lists %d kept blobs, want 25", len(doc.Kept))
 	}
 }
 
