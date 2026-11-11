@@ -116,6 +116,12 @@ var (
 	// sets spec.distributed. A sharding request rendered as one StatefulSet
 	// would serve the model on one node and look like success.
 	ErrDistributedSpec = errors.New("spec.distributed is set: a sharded model renders through RenderSharded, never as a single-node StatefulSet")
+	// ErrClusterStoreHubArg is returned for a cluster-store (artifact) model
+	// whose spec.runtime.args point --adapter-path or --draft-model at
+	// something other than an absolute path. That model runs with the Hub
+	// switched off, so a second repository named there cannot be fetched and
+	// the engine would crash at load.
+	ErrClusterStoreHubArg = errors.New("a cluster-store model cannot fetch from the Hub")
 )
 
 // Fixed rendering constants. Each is the render's side of a contract with
@@ -416,6 +422,9 @@ func prepare(m *mlxv1alpha1.MLXModel, opts Options) (prepared, error) {
 			return prepared{}, renderErr(m, err)
 		}
 		modelRef, servedName = ArtifactMountPath, ServedModelName(m)
+		if err = checkClusterStoreArgs(m.Spec.Runtime.Args); err != nil {
+			return prepared{}, renderErr(m, err)
+		}
 	} else if modelRef, err = modelReference(m.Spec); err != nil {
 		return prepared{}, renderErr(m, err)
 	}
@@ -435,6 +444,43 @@ func prepare(m *mlxv1alpha1.MLXModel, opts Options) (prepared, error) {
 		replicas:     replicas,
 		nodeSelector: nodeSelector,
 	}, nil
+}
+
+// clusterStoreHubArgs are the serving options whose value the engine resolves
+// as a Hub repository unless it is a local path.
+var clusterStoreHubArgs = []string{"--adapter-path", "--draft-model"}
+
+// checkClusterStoreArgs refuses spec.runtime.args that would make a
+// cluster-store model fetch a second repository from the Hub it runs without:
+// an --adapter-path or --draft-model, in the "--flag value" or "--flag=value"
+// form, whose value is not an absolute path. Like ValidateDistributed in
+// pkg/mlx/operator (which imports this package, so cannot be shared), it
+// matches any option-shaped argument that is a prefix of a checked option,
+// because argparse accepts an unambiguous prefix. No other argument is
+// inspected.
+func checkClusterStoreArgs(args []string) error {
+	for i, arg := range args {
+		name, value, inline := strings.Cut(arg, "=")
+		if !strings.HasPrefix(name, "--") || len(name) <= len("--") {
+			continue
+		}
+		for _, flag := range clusterStoreHubArgs {
+			if !strings.HasPrefix(flag, name) {
+				continue
+			}
+			if !inline {
+				value = ""
+				if i+1 < len(args) {
+					value = args[i+1]
+				}
+			}
+			if !path.IsAbs(value) {
+				return fmt.Errorf("%w: spec.runtime.args sets %s to %q, which is not an absolute path; mount the weights and pass their path instead",
+					ErrClusterStoreHubArg, flag, value)
+			}
+		}
+	}
+	return nil
 }
 
 // resolvePort is the ONE port-resolution rule: the spec's port, else the
@@ -606,7 +652,9 @@ func modelReference(spec mlxv1alpha1.MLXModelSpec) (string, error) {
 // who does that owns the consequence, which is why the pins are what ships by
 // default. Caller args are NOT checked against the measured surface: an operator
 // running a newer engine must be able to pass an option this package has never
-// heard of.
+// heard of. The one exception is checkClusterStoreArgs, which refuses a
+// cluster-store model's --adapter-path or --draft-model naming anything but an
+// absolute path, because that model cannot reach the Hub to fetch it.
 func engineArgs(spec mlxv1alpha1.MLXModelSpec, modelRef, servedName string, port int32, sizing Sizing) []string {
 	args := []string{
 		modelRef,
