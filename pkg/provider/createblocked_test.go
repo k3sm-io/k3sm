@@ -128,12 +128,22 @@ func TestCreateRefusedBesideLiveProcessesParksNotFails(t *testing.T) {
 			// Three re-checks are refused again: still parked, address still held,
 			// and not one Pulling, BackOff or further Warning Event.
 			for i := 2; i <= 4; i++ {
+				// The re-check is paced by the status observer against the clock,
+				// not by a sleeping worker, so there is no waiter for the step to
+				// race: nothing may be asleep on the clock, and the previous attempt
+				// has finished (waitNoAttempt), before the clock moves.
+				if clk.HasWaiters() {
+					t.Fatal("a worker sleeps on the clock while the pod is parked for a re-check")
+				}
 				clk.Step(resyncInterval + time.Second)
 				if _, err := r.GetPodStatus(ctx, pod.Namespace, pod.Name); err != nil {
 					t.Fatalf("GetPodStatus: %v", err)
 				}
-				waitRestart(t, "a re-check", func() bool { return e.createCalls() == i })
+				waitRestart(t, "a re-check", func() bool { return e.createCalls() >= i })
 				waitNoAttempt(t, tr)
+				if n := e.createCalls(); n != i {
+					t.Fatalf("CreatePod calls after re-check %d = %d, want %d: one re-check per resync", i-1, n, i)
+				}
 				if tr.parkedFailure() == nil || !addressHeld(r, id) {
 					t.Fatal("a refused retry unparked the pod or released its address")
 				}
@@ -181,8 +191,19 @@ func TestCreateRefusedBesideLiveProcessesParksNotFails(t *testing.T) {
 				_, blocked := tr.parkedState()
 				return blocked
 			})
-			waitNoAttempt(t, tr)
+			// The refused retry ends the back-off worker: it either returns or
+			// sleeps out a further delay, and only the first is right.
+			waitFor(t, "the back-off worker to return or sleep again", func() bool {
+				return !pullAttemptInFlight(tr) || pullWorkerSleeping(tr)
+			})
+			if pullWorkerSleeping(tr) || clk.HasWaiters() {
+				t.Fatal("a refused back-off retry re-armed the image back-off; it must leave the loop for the resync re-check")
+			}
+			// The next observation files the quiet re-check in its place.
 			assertBlockedStatus(t, r, pod)
+			if cls, ok := soleSchedule(tr); !ok || cls != pullClassRecheck {
+				t.Fatalf("schedule after the refused retry = %v (filed %v), want the resync re-check", cls, ok)
+			}
 			after := recordedEvents(rec.Events)
 			if n := countEvents(after, corev1.EventTypeWarning); n != 1 {
 				t.Errorf("Warning events at the refusal = %d (%v), want exactly 1", n, after)
@@ -262,16 +283,47 @@ const maxPullBackoffForTest = 301 * time.Second
 // waitNoAttempt waits until no re-attempt is in flight on the track.
 func waitNoAttempt(t *testing.T, tr *podTrack) {
 	t.Helper()
-	waitRestart(t, "the attempt to finish", func() bool {
-		tr.restartMu.Lock()
-		defer tr.restartMu.Unlock()
-		for _, pr := range tr.pulls {
-			if pr.attempt {
-				return false
-			}
+	waitRestart(t, "the attempt to finish", func() bool { return !pullAttemptInFlight(tr) })
+}
+
+// pullAttemptInFlight reports whether any of the track's pull schedules holds a
+// worker (a re-attempt running or a back-off sleep).
+func pullAttemptInFlight(tr *podTrack) bool {
+	tr.restartMu.Lock()
+	defer tr.restartMu.Unlock()
+	for _, pr := range tr.pulls {
+		if pr.attempt {
+			return true
 		}
-		return true
-	})
+	}
+	return false
+}
+
+// pullWorkerSleeping reports whether any of the track's pull workers is waiting
+// out a back-off delay.
+func pullWorkerSleeping(tr *podTrack) bool {
+	tr.restartMu.Lock()
+	defer tr.restartMu.Unlock()
+	for _, pr := range tr.pulls {
+		if pr.sleeping {
+			return true
+		}
+	}
+	return false
+}
+
+// soleSchedule returns the class of the track's one pull schedule, and false
+// when it holds none or more than one.
+func soleSchedule(tr *podTrack) (pullRetryClass, bool) {
+	tr.restartMu.Lock()
+	defer tr.restartMu.Unlock()
+	if len(tr.pulls) != 1 {
+		return pullClassNone, false
+	}
+	for _, pr := range tr.pulls {
+		return pr.class, true
+	}
+	return pullClassNone, false
 }
 
 // assertBlockedStatus checks the pod reports ContainerCreating with the plain
