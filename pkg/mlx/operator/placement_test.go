@@ -258,6 +258,7 @@ func TestValidateDistributed(t *testing.T) {
 		{"adapter_refused", func(s *mlxv1alpha1.MLXModelSpec) { s.Runtime.Args = []string{"--adapter-path", "/x"} }, false},
 		{"draft_model_equals_form_refused", func(s *mlxv1alpha1.MLXModelSpec) { s.Runtime.Args = []string{"--draft-model=x"} }, false},
 		{"draft_abbreviation_refused", func(s *mlxv1alpha1.MLXModelSpec) { s.Runtime.Args = []string{"--draft", "x"} }, false},
+		{"shortest_abbreviation_refused", func(s *mlxv1alpha1.MLXModelSpec) { s.Runtime.Args = []string{"--d", "x"} }, false},
 		{"other_args_pass", func(s *mlxv1alpha1.MLXModelSpec) { s.Runtime.Args = []string{"--max-tokens", "64", "-v"} }, true},
 	}
 	for _, tc := range cases {

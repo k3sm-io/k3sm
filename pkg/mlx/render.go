@@ -480,28 +480,6 @@ func checkClusterStoreArgs(args []string) error {
 	return nil
 }
 
-// MatchArgPrefix reports which of flags the option name (the part of an
-// argument before any "=") selects the way argparse would: name equals a
-// flag, or name is "--" plus at least one character and a prefix of exactly
-// one flag. A name that abbreviates several flags, or that is merely another
-// option sharing leading letters, selects none. It is the one matcher every
-// spec.runtime.args refusal in pkg/mlx and pkg/mlx/operator uses.
-func MatchArgPrefix(name string, flags []string) (string, bool) {
-	if !strings.HasPrefix(name, "--") || len(name) <= len("--") {
-		return "", false
-	}
-	match, n := "", 0
-	for _, flag := range flags {
-		if flag == name {
-			return flag, true
-		}
-		if strings.HasPrefix(flag, name) {
-			match, n = flag, n+1
-		}
-	}
-	return match, n == 1
-}
-
 // resolvePort is the ONE port-resolution rule: the spec's port, else the
 // operator default, else 0 meaning unresolvable. Status endpoint publication
 // resolves the port through this same function, because a status that names a
