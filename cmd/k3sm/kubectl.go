@@ -60,7 +60,7 @@ func runKubectl(args []string) error {
 		home:            home,
 		contextName:     installedKubeconfigName(),
 		exists:          fileExists,
-	}.withInstalledRole())
+	}.withInstalledRole().withSudoInvoker())
 	if err != nil {
 		return err
 	}
@@ -68,10 +68,21 @@ func runKubectl(args []string) error {
 	if err != nil {
 		return err
 	}
+	kubeconfig := cfg.kubeconfig
+	if cfg.vetted != nil {
+		// kubectl reads its kubeconfig again after the check, so it gets a
+		// root-only copy of the checked bytes, not the invoker's paths. The
+		// copy outlives this process, which kubectl replaces.
+		_, paths, err := writeVettedKubeconfigs(*cfg.vetted)
+		if err != nil {
+			return err
+		}
+		kubeconfig = strings.Join(paths, string(filepath.ListSeparator))
+	}
 	argv := append([]string{bin}, cfg.argv(args)...)
 	// Open files need no handling here: Go opens every descriptor O_CLOEXEC,
 	// so kubectl inherits only stdin, stdout and stderr.
-	if err := kubectlExec(bin, argv, envWithKubeconfig(os.Environ(), cfg.kubeconfig)); err != nil {
+	if err := kubectlExec(bin, argv, envWithKubeconfig(os.Environ(), kubeconfig)); err != nil {
 		return fmt.Errorf("exec kubectl: %w", err)
 	}
 	return nil
@@ -140,6 +151,9 @@ type kubectlInputs struct {
 	// asRoot says this process runs as root. No verb uses the node credential
 	// then (builderKubeconfig, kubectlVerbConfig).
 	asRoot bool
+	// sudoUser is $SUDO_USER, set by withSudoInvoker. As root, an invoker's
+	// kubeconfig is checked before it is used (vetSudoKubeconfig).
+	sudoUser string
 }
 
 // installedNodeCredential is the role this Mac is installed as and where a
@@ -169,6 +183,10 @@ type kubectlConfig struct {
 	kubeconfig string
 	// context, when non-empty, is prepended to kubectl's argv as --context.
 	context string
+	// vetted, when non-nil, is the files root checked for this choice on a sudo
+	// invoker's behalf, with the bytes it checked, which are what is used. A
+	// pointer keeps kubectlConfig comparable.
+	vetted *[]vettedKubeconfig
 }
 
 // argv returns kubectl's arguments: the pinned context (when there is one)
@@ -199,7 +217,19 @@ func (c kubectlConfig) argv(args []string) []string {
 //     push token (see userMigrationRoute): an account that has a kubeconfig of
 //     its own means that one. Every verb refuses this choice as root
 //     (builderKubeconfig, kubectlVerbConfig), so a new caller must too.
+//
+// As root run by sudo (withSudoInvoker), the files the choice reads are then
+// checked and carried with it (vetSudoKubeconfig); a caller uses those bytes.
 func resolveKubectlConfig(in kubectlInputs) (kubectlConfig, error) {
+	cfg, err := chooseKubectlConfig(in)
+	if err != nil {
+		return kubectlConfig{}, err
+	}
+	return vetSudoKubeconfig(in, cfg)
+}
+
+// chooseKubectlConfig is resolveKubectlConfig's choice, before any check.
+func chooseKubectlConfig(in kubectlInputs) (kubectlConfig, error) {
 	kc := executor.KubeconfigPath(in.workDir)
 	if in.workDirOverride != "" {
 		if !in.exists(kc) {

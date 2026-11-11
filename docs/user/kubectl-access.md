@@ -21,6 +21,12 @@ credentials exist for the account running it:
   `/Library/k3sm`. The server's work directory belongs to the service user and is not readable by
   your account; it does not need to be.
 
+Run with `sudo`, it reads your kubeconfig only when root can use it without acting for its author: no
+`exec` or `auth-provider` plugin, no `tokenFile`, `client-certificate`, `client-key` or
+`certificate-authority` path, and no `proxy-url`, in any file `$KUBECONFIG` lists, and each file a
+regular file, not a symlink, that only you or root can write. Otherwise it stops and names the field
+and the file; run it without `sudo` instead. The builder verbs apply the same check.
+
 `KUBECONFIG` and `--context` behave as they do for `kubectl`. On that second path k3sm selects the
 `k3sm` context for you, but only as a default that your own arguments override, so
 `k3sm kubectl --context=prod get nodes` talks to `prod`. Set `K3SM_WORK_DIR` to name a server started

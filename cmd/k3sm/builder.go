@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -180,7 +181,7 @@ func builderKubeInputs(opts builderOptions) kubectlInputs {
 	if opts.workDirExplicit {
 		in.workDirOverride = opts.workDir
 	}
-	return in.withInstalledRole()
+	return in.withInstalledRole().withSudoInvoker()
 }
 
 // builderKubeconfig picks the credentials the builder verbs run with. The
@@ -197,6 +198,9 @@ func builderKubeInputs(opts builderOptions) kubectlInputs {
 // The service user still reads its own file.
 func builderKubeconfig(in kubectlInputs) (kubectlConfig, error) {
 	cfg, err := resolveKubectlConfig(in)
+	if refusal := (sudoKubeconfigRefusal{}); errors.As(err, &refusal) {
+		return kubectlConfig{}, err
+	}
 	user := userKubeconfigNames(in)
 	if err == nil {
 		if rootChoseNodeCredential(in, cfg) {
@@ -224,8 +228,23 @@ func builderClients(in kubectlInputs) (*rest.Config, kubernetes.Interface, error
 	if err != nil {
 		return nil, nil, err
 	}
+	// As root run by sudo the files were checked; load the checked bytes, from
+	// a root-only copy, rather than read the invoker's paths a second time.
+	var copies []string
+	if cfg.vetted != nil {
+		dir, paths, err := writeVettedKubeconfigs(*cfg.vetted)
+		if err != nil {
+			return nil, nil, err
+		}
+		defer os.RemoveAll(dir)
+		copies = paths
+	}
 	if cfg.kubeconfig != "" {
-		restCfg, cs, err := kubeclient.FromPath(cfg.kubeconfig)
+		path := cfg.kubeconfig
+		if copies != nil {
+			path = copies[0]
+		}
+		restCfg, cs, err := kubeclient.FromPath(path)
 		if err != nil {
 			return nil, nil, fmt.Errorf("load kubeconfig %s: %w", cfg.kubeconfig, err)
 		}
@@ -237,10 +256,14 @@ func builderClients(in kubectlInputs) (*rest.Config, kubernetes.Interface, error
 	} else {
 		rules.Precedence = []string{filepath.Join(in.home, ".kube", "config")}
 	}
+	named := strings.Join(rules.Precedence, ":")
+	if copies != nil {
+		rules.Precedence = copies
+	}
 	restCfg, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules,
 		&clientcmd.ConfigOverrides{CurrentContext: cfg.context}).ClientConfig()
 	if err != nil {
-		return nil, nil, fmt.Errorf("load kubeconfig context %q from %s: %w", cfg.context, strings.Join(rules.Precedence, ":"), err)
+		return nil, nil, fmt.Errorf("load kubeconfig context %q from %s: %w", cfg.context, named, err)
 	}
 	cs, err := kubernetes.NewForConfig(restCfg)
 	if err != nil {
