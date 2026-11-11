@@ -36,7 +36,7 @@ var errTagRepoint = errors.New("the tag already names another manifest")
 
 // errTagMoved reports that `k3sm image untag --digest` found the tag re-pointed
 // between its read and its conditional delete, so the registry removed nothing.
-var errTagMoved = errors.New("the tag no longer names that digest, or the cluster registry is older than this check")
+var errTagMoved = errors.New("the tag no longer names that digest")
 
 // imageTag adds a tag to a manifest the cluster registry already holds.
 //
