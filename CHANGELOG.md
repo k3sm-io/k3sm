@@ -276,6 +276,12 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
 
 ### Fixed
 
+- An `MLXModel` the operator refuses now gets a Warning Event, so `kubectl describe` and
+  `kubectl get events` show why it is not served. A spec that cannot be served gets reason
+  `InvalidSpec`, and a model that does not fit the node's GPU gets the same reason as its `Ready`
+  condition, with the condition's message in both cases. The Event is recorded once per generation;
+  a retry of the same generation adds none, and a server restart records it once more for a model
+  that is still refused.
 - A server whose control plane does not report healthy in time while the Mac is heavily loaded no
   longer parks on the crash-loop breaker after five attempts. It backs off instead, from 30 seconds
   doubling up to 10 minutes, `k3sm status` shows when the next attempt starts and that an attempt

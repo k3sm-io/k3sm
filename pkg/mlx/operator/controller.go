@@ -31,12 +31,17 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
+	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 
 	crdconfig "k3sm.io/apis/config/crd"
@@ -132,9 +137,22 @@ type Config struct {
 	// ProbeTransport is the HTTP transport serving-surface probes use. nil means
 	// mlx.NewProbeTransport().
 	ProbeTransport http.RoundTripper
+	// Recorder records the Warning Event a refused model gets. nil means Run
+	// builds one that writes core/v1 Events through Client; a Controller that
+	// is never Run (a test calling Reconcile) records nothing.
+	Recorder EventRecorder
 	// Log is the structured logger. nil means slog.Default().
 	Log *slog.Logger
 }
+
+// EventRecorder is the slice of client-go's record.EventRecorder the controller
+// uses: one Event on the object a reconcile refused.
+type EventRecorder interface {
+	Eventf(object runtime.Object, eventtype, reason, messageFmt string, args ...any)
+}
+
+// eventComponent is the source component the operator's Events name.
+const eventComponent = FieldManager
 
 // Controller reconciles MLXModels into the objects that serve them.
 //
@@ -153,7 +171,12 @@ type Controller struct {
 	pullName  string
 	transport http.RoundTripper
 	queue     workqueue.TypedRateLimitingInterface[string]
-	log       *slog.Logger
+	recorder  EventRecorder
+	// refusals remembers, per model key, which refusal Events were already
+	// recorded at the model's current UID and generation (see recordRefusal).
+	// Only the single worker touches it, so it needs no lock.
+	refusals map[string]refusalMark
+	log      *slog.Logger
 	// now is the clock status derivation reads. It is a field so a test can pin
 	// condition timestamps; production leaves it at time.Now.
 	now func() time.Time
@@ -191,6 +214,8 @@ func New(cfg Config) (*Controller, error) {
 		pullName:  pullName,
 		transport: transport,
 		queue:     workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
+		recorder:  cfg.Recorder,
+		refusals:  map[string]refusalMark{},
 		log:       log,
 		now:       time.Now,
 	}, nil
@@ -215,6 +240,13 @@ func (c *Controller) Run(ctx context.Context) error {
 			}
 			return fmt.Errorf("mlx operator: ensure mlxmodel crd: %w", err)
 		}
+	}
+	if c.recorder == nil {
+		// Set before the worker starts, so no reconcile reads it concurrently.
+		b := record.NewBroadcaster()
+		b.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: c.client.CoreV1().Events("")})
+		defer b.Shutdown()
+		c.recorder = b.NewRecorder(scheme.Scheme, corev1.EventSource{Component: eventComponent})
 	}
 
 	modelFactory := dynamicinformer.NewFilteredDynamicSharedInformerFactory(c.dyn, resyncPeriod, metav1.NamespaceAll, nil)
@@ -407,6 +439,7 @@ func (c *Controller) Reconcile(ctx context.Context, key string) error {
 	// derived from a spec that has already changed.
 	raw, err := c.dyn.Resource(mlxModelResource).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
+		delete(c.refusals, key)
 		return nil // gone; the owned objects are garbage-collected
 	}
 	if err != nil {
@@ -419,6 +452,7 @@ func (c *Controller) Reconcile(ctx context.Context, key string) error {
 	if model.DeletionTimestamp != nil {
 		// Deletion is the garbage collector's job through the ownerReferences.
 		// Applying to a terminating object would only recreate what it is removing.
+		delete(c.refusals, key)
 		return nil
 	}
 
@@ -427,7 +461,7 @@ func (c *Controller) Reconcile(ctx context.Context, key string) error {
 	// error is retried, a missing resolver waits for the configuration.
 	if err := c.resolveArtifact(ctx, model); err != nil {
 		c.log.Warn("mlxmodel artifact cannot be resolved; no objects applied", "mlxmodel", key, "err", err)
-		if werr := c.writeStatus(ctx, raw, model, invalidSpecStatus(model, err, c.now())); werr != nil {
+		if werr := c.refuseInvalidSpec(ctx, raw, model, err); werr != nil {
 			return werr
 		}
 		if errors.Is(err, errNoResolver) {
@@ -453,7 +487,7 @@ func (c *Controller) Reconcile(ctx context.Context, key string) error {
 	if fit := ValidateFit(model.Spec.Memory, c.gpuFacts(ctx)); fit.Blocks() {
 		c.log.Warn("mlxmodel does not fit this node's gpu; no objects applied",
 			"mlxmodel", key, "reason", fit.Reason, "message", fit.Message)
-		return c.writeStatus(ctx, raw, model, blockedStatus(model, fit, c.now()))
+		return c.refuse(ctx, raw, model, fit)
 	}
 
 	// 2. Render. A render error is a bad spec, not a busy cluster, so it is
@@ -461,7 +495,7 @@ func (c *Controller) Reconcile(ctx context.Context, key string) error {
 	objs, err := mlx.Render(model, c.opts)
 	if err != nil {
 		c.log.Warn("mlxmodel spec cannot be rendered; no objects applied", "mlxmodel", key, "err", err)
-		return c.writeStatus(ctx, raw, model, invalidSpecStatus(model, err, c.now()))
+		return c.refuseInvalidSpec(ctx, raw, model, err)
 	}
 
 	// 3. Pull secret, only if it exists (see the package doc).
@@ -642,13 +676,68 @@ func blockedStatus(m *mlxv1alpha1.MLXModel, fit Fit, now time.Time) mlxv1alpha1.
 	return status
 }
 
-// invalidSpecStatus is the status of a model whose spec cannot be rendered.
-func invalidSpecStatus(m *mlxv1alpha1.MLXModel, err error, now time.Time) mlxv1alpha1.MLXModelStatus {
-	return blockedStatus(m, Fit{
-		Level:   FitFailed,
-		Reason:  ReasonInvalidSpec,
-		Message: err.Error(),
-	}, now)
+// refuse reports a model this reconcile will not serve: the blocked status, then
+// one Warning Event naming the same reason and message (see recordRefusal). The
+// Event follows a successful status write only, so a write that fails and is
+// retried records it on the retry instead.
+func (c *Controller) refuse(ctx context.Context, raw *unstructured.Unstructured, m *mlxv1alpha1.MLXModel, fit Fit) error {
+	if err := c.writeStatus(ctx, raw, m, blockedStatus(m, fit, c.now())); err != nil {
+		return err
+	}
+	c.recordRefusal(raw, m, fit)
+	return nil
+}
+
+// recordRefusal records one Warning Event for a refusal, at most once per model
+// UID, generation and reason. Every resync and every status write re-delivers a
+// refused model, and each would otherwise add a copy of one decision to the
+// model's Events; a new generation, a recreated model (a new UID) or a different
+// reason is a new decision and gets its own.
+//
+// The memory is in process only. A restart forgets it, so a model still
+// refused gets one more Event at its current generation when the informers'
+// initial sync re-delivers it: at most one per refused model per start. An
+// entry is dropped when a reconcile finds its model gone or terminating, and
+// otherwise holds one generation's reasons per model key.
+//
+// The object is the model as read (raw), whose apiVersion and kind are what the
+// recorder's object reference is built from.
+func (c *Controller) recordRefusal(raw *unstructured.Unstructured, m *mlxv1alpha1.MLXModel, fit Fit) {
+	if c.recorder == nil {
+		return
+	}
+	key := m.Namespace + "/" + m.Name
+	mark, ok := c.refusals[key]
+	if !ok || mark.uid != m.UID || mark.generation != m.Generation {
+		mark = refusalMark{uid: m.UID, generation: m.Generation, reasons: map[string]struct{}{}}
+		c.refusals[key] = mark
+	}
+	if _, seen := mark.reasons[fit.Reason]; seen {
+		return
+	}
+	mark.reasons[fit.Reason] = struct{}{}
+	// The message goes in as an argument, never as the format: it carries
+	// spec values a model author wrote.
+	c.recorder.Eventf(raw, corev1.EventTypeWarning, fit.Reason, "%s", fit.Message)
+}
+
+// refuseInvalidSpec is refuse for a spec that cannot be served at all.
+func (c *Controller) refuseInvalidSpec(ctx context.Context, raw *unstructured.Unstructured, m *mlxv1alpha1.MLXModel, err error) error {
+	return c.refuse(ctx, raw, m, invalidSpecFit(err))
+}
+
+// refusalMark is what recordRefusal remembers about one model key: the UID and
+// generation the recorded reasons belong to.
+type refusalMark struct {
+	uid        types.UID
+	generation int64
+	reasons    map[string]struct{}
+}
+
+// invalidSpecFit is the refusal a spec that cannot be rendered reports, as a
+// Fit so it takes the same status and Event path a fit block does.
+func invalidSpecFit(err error) Fit {
+	return Fit{Level: FitFailed, Reason: ReasonInvalidSpec, Message: err.Error()}
 }
 
 // ReasonInvalidSpec means the spec could not be rendered into serving objects at
