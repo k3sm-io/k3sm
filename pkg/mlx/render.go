@@ -453,34 +453,52 @@ var clusterStoreHubArgs = []string{"--adapter-path", "--draft-model"}
 // checkClusterStoreArgs refuses spec.runtime.args that would make a
 // cluster-store model fetch a second repository from the Hub it runs without:
 // an --adapter-path or --draft-model, in the "--flag value" or "--flag=value"
-// form, whose value is not an absolute path. Like ValidateDistributed in
-// pkg/mlx/operator (which imports this package, so cannot be shared), it
-// matches any option-shaped argument that is a prefix of a checked option,
-// because argparse accepts an unambiguous prefix. No other argument is
-// inspected.
+// form, whose value is not an absolute path. A relative path is refused too:
+// it resolves against a working directory the spec does not name, and the
+// engine falls back to the Hub when nothing is there. Because argparse accepts
+// an unambiguous prefix of an option, an argument matches a checked option
+// when its name equals it or abbreviates it unambiguously (see
+// matchArgPrefix). No other argument is inspected.
 func checkClusterStoreArgs(args []string) error {
 	for i, arg := range args {
 		name, value, inline := strings.Cut(arg, "=")
-		if !strings.HasPrefix(name, "--") || len(name) <= len("--") {
+		flag, ok := matchArgPrefix(name, clusterStoreHubArgs)
+		if !ok {
 			continue
 		}
-		for _, flag := range clusterStoreHubArgs {
-			if !strings.HasPrefix(flag, name) {
-				continue
+		if !inline {
+			value = ""
+			if i+1 < len(args) {
+				value = args[i+1]
 			}
-			if !inline {
-				value = ""
-				if i+1 < len(args) {
-					value = args[i+1]
-				}
-			}
-			if !path.IsAbs(value) {
-				return fmt.Errorf("%w: spec.runtime.args sets %s to %q, which is not an absolute path; mount the weights and pass their path instead",
-					ErrClusterStoreHubArg, flag, value)
-			}
+		}
+		if !path.IsAbs(value) {
+			return fmt.Errorf("%w: spec.runtime.args sets %s to %q, which is not an absolute path; mount the weights and pass their path instead",
+				ErrClusterStoreHubArg, flag, value)
 		}
 	}
 	return nil
+}
+
+// matchArgPrefix reports which of flags the option name selects the way
+// argparse would: name equals a flag, or name is "--" plus at least one
+// character and a prefix of exactly one flag. A name that abbreviates several
+// flags, or that is merely another option sharing leading letters, selects
+// none.
+func matchArgPrefix(name string, flags []string) (string, bool) {
+	if !strings.HasPrefix(name, "--") || len(name) <= len("--") {
+		return "", false
+	}
+	match, n := "", 0
+	for _, flag := range flags {
+		if flag == name {
+			return flag, true
+		}
+		if strings.HasPrefix(flag, name) {
+			match, n = flag, n+1
+		}
+	}
+	return match, n == 1
 }
 
 // resolvePort is the ONE port-resolution rule: the spec's port, else the

@@ -27,7 +27,9 @@ import (
 // model, which runs with the Hub switched off, is refused at render when
 // spec.runtime.args names a second Hub repository through --adapter-path or
 // --draft-model, in either flag form; that an absolute path and unrelated args
-// pass; and that a Hub model keeps passing a repo id through unchecked.
+// pass; that an unambiguous abbreviation is refused while an option merely
+// sharing leading letters is not; that the sharded path refuses alike; and
+// that a Hub model keeps passing a repo id through unchecked.
 func TestRenderRefusesHubFetchArgsForClusterStoreModels(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -45,20 +47,29 @@ func TestRenderRefusesHubFetchArgsForClusterStoreModels(t *testing.T) {
 		{"store_adapter_absolute", artifactModel, []string{"--adapter-path", "/models/adapter"}, false},
 		{"store_draft_absolute_equals", artifactModel, []string{"--draft-model=/models/draft"}, false},
 		{"store_unrelated_args", artifactModel, []string{"--log-level", "DEBUG", "--trust-remote-code"}, false},
+		{"store_adapter_abbreviated", artifactModel, []string{"--adapter", "org/a"}, true},
+		{"store_draft_abbreviated", artifactModel, []string{"--draft-m", "org/d"}, true},
+		{"store_adapter_rank_shares_letters", artifactModel, []string{"--adapter-rank", "8"}, false},
+		{"store_decode_concurrency_shares_letters", artifactModel, []string{"--decode-concurrency", "2"}, false},
+		{"store_dtype_shares_letters", artifactModel, []string{"--dtype", "float16"}, false},
+		// A relative path resolves against a working directory the spec does
+		// not name, and the engine falls back to the Hub when nothing is there.
+		{"store_adapter_relative", artifactModel, []string{"--adapter-path", "adapters/v2"}, true},
+		{"sharded_store_adapter_repo_id", shardedArtifactModel, []string{"--adapter-path", "org/adapter"}, true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			m := tc.model()
 			m.Spec.Runtime.Args = tc.args
-			_, err := Render(m, artifactOptions())
+			err := renderEither(m)
 			if tc.refused {
 				if !errors.Is(err, ErrClusterStoreHubArg) {
-					t.Fatalf("Render error = %v, want %v", err, ErrClusterStoreHubArg)
+					t.Fatalf("render error = %v, want %v", err, ErrClusterStoreHubArg)
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("Render: %v", err)
+				t.Fatalf("render: %v", err)
 			}
 		})
 	}
