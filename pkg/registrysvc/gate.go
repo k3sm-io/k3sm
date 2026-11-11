@@ -63,7 +63,8 @@ const (
 // (http.Transport.ResponseHeaderTimeout starts its clock only then, so a blob
 // streaming for minutes is not cut off). A registry that accepted the
 // connection and has not answered in this long is wedged: the client gets a
-// 502 and the relay slot is freed instead of held until the client gives up.
+// 502, which frees the gate's connection and goroutine instead of holding them
+// until the client gives up.
 // It holds reads, upload status and every other request the registry answers
 // from what it already has; 30s rather than the dial's 1s leaves room for a
 // busy disk. A manifest PUT and the blob upload requests wait on work the
