@@ -401,7 +401,8 @@ the cluster registry. The node's runtime daemon (runtimed) keeps every blob that
 an in-flight ingest or another cached image still needs, and the report lists each kept blob
 with the reason, and says the eviction was partial when any blob is kept. The text report shows
 at most 20 kept blobs; `-o json` lists them all. Without `--force` the lists are a plan, not a
-promise: a later forced run can keep more blobs than the report showed.
+promise: a later forced run can differ from the report. A Pod or pull that starts in between
+keeps more blobs, and a blob that ages past the grace window is no longer kept.
 
 Blobs younger than the daemon's grace window are kept, since a pull may still be in flight.
 When every kept blob is young and nothing is evicted, the command says to retry once the window
@@ -414,14 +415,17 @@ failure. A refusal deletes nothing, with one exception noted below:
 - A Pod on this node still uses the image. Retry once the Pod is gone.
 - The reference names more than one image on this node. Retry with `--platform`, as above, or
   name the image by its digest.
-- Nothing on this node has that name. `k3sm image prune` reclaims blobs no name holds.
+- Nothing on this node has that name. Check the spelling against [`k3sm image ls`](#listing-the-registry-k3sm-image-ls--k3sm-image-df).
+  Do not reach for [`prune`](#reclaiming-space-k3sm-image-prune) to fix a typo: it is broader, and
+  evicts everything no Pod uses.
 - The daemon could not read every record that protects blobs. It may already have unlinked some
-  blobs, and its message then counts them. Check the daemon's log, repair the record and re-run.
+  blobs, and its message then counts them. Check the node log (`/var/log/k3sm/server.log`, root
+  only; see [Troubleshooting](troubleshooting.md)), repair the record and re-run.
+- This node's runtimed is too old to serve `rm`. Nothing is evicted; run `k3sm install`, then
+  restart runtimed. `rm` never falls back to `prune`.
 
-If the daemon fails partway, some blobs may already be unlinked. The kept list is in the daemon's
-log, and a re-run converges. A node whose runtimed is too old to serve `rm` deletes nothing and
-tells you to upgrade it: run `k3sm install`, then restart runtimed. `rm` never falls back to
-`prune`.
+If the daemon fails partway, some blobs may already be unlinked. The kept list is in the node log,
+and a re-run converges.
 
 The `-o json` document has the keys `manifestDigest`, `dryRun` (true without `--force`),
 `removedDigests`, `kept` (each blob with its `digest` and `reason`) and `reclaimedBytes`.
