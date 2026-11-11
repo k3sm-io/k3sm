@@ -261,6 +261,17 @@ container is restarted in place with an upstream-shaped `CrashLoopBackOff` backo
 See [Limitations](limitations.md#restartpolicy-is-honored-on-the-default-runtime-not-on-the-hostprocess-opt-out)
 for the precise scope.
 
+## MLXModel Not Serving
+
+Run `kubectl describe mlxmodel <name>`, then read the Events and the message of the `Ready`
+condition. A refused model gets one Warning Event per reason per generation:
+
+- `InvalidSpec`: the spec cannot be served.
+- The `Ready` condition's fit-block reason (for example `NoGPU` or `MemoryExceedsWorkingSet`): the
+  model does not fit the node's GPU.
+- `ArtifactUnresolved`: the `spec.artifact` reference cannot be resolved, for example the registry
+  cannot be reached. `Ready` still says `InvalidSpec`.
+
 ## A Pod's Image Will Not Pull
 
 A container whose image cannot be resolved does **not** fail the rest of the Pod. The Pod is

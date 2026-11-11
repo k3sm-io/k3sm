@@ -282,7 +282,7 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
   cannot be reached) gets `ArtifactUnresolved` while its `Ready` condition still says
   `InvalidSpec`, and a model that does not fit the node's GPU gets the same reason as its `Ready`
   condition, with the condition's message in every case. The Event is recorded
-  once per refusal and reason per generation: a retry of the same refusal adds none, a model that
+  once per refusal and reason per generation. A retry of the same refusal adds none, a model that
   is served and then refused again at the same generation gets a new one, and a server restart
   records it once more for a model that is still refused.
 - A server whose control plane does not report healthy in time while the Mac is heavily loaded no

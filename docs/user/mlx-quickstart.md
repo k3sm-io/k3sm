@@ -25,6 +25,7 @@ so two models on one node contend for the same device.
 A free slot is not enough on its own. A second model also has to fit in GPU memory alongside the first,
 or the node refuses it and records a `FailedGPUFit` event on the pod naming what it wanted, what is
 already committed, and the ceiling. Lower one model's `memory`, or delete the other, and it starts.
+A model refused before any pod exists is reported as a Warning Event on the `MLXModel`.
 
 A pod that requests the GPU has to declare a container memory limit. One without a limit on every
 container is refused on any node that knows its ceiling, because the node cannot budget for it. An
@@ -94,7 +95,9 @@ The `Ready` condition's `reason` names the state: `Pending` (no replica running 
 (fetching weights), `Loading` (weights fetched, model loading), `Serving` (ready), `PodFailed` (the
 replica died), `Crashing` (the serving container keeps exiting or cannot start; the message gives the
 replica, the last exit code and the error), `ImagePullFailed` (the serving image cannot be pulled),
-`ScaledToZero` (you set `replicas: 0`).
+`ScaledToZero` (you set `replicas: 0`), `InvalidSpec` (the spec cannot be served). A refused model also
+gets a Warning Event, so `kubectl describe mlxmodel <name>` shows why. A model whose artifact reference
+cannot be resolved gets an `ArtifactUnresolved` Event while `Ready` still says `InvalidSpec`.
 
 There is no liveness probe on the serving pod, because a first start is an unbounded download and a
 probe that killed it would restart the download from zero.

@@ -82,7 +82,8 @@ The operator reads the index once per generation, picks the entry whose variant 
 records that manifest's digest in `status.resolvedArtifact`, so every replica serves the same bytes. It
 reports `InvalidSpec`, naming the variant, when no entry or more than one entry matches, when `quantization`
 is set but the reference names a single manifest, and when the reference names an index but `quantization`
-is not set.
+is not set. The operator also records the cause as a Warning Event; see it with
+`kubectl describe mlxmodel <name>`.
 
 ## Import From Hugging Face
 
