@@ -555,6 +555,9 @@ func (r *runtimedRuntime) runPullOnce(ctx context.Context, t *podTrack, pr *imag
 	switch {
 	case ctx.Err() != nil:
 		return
+	case isParkableCreateRefusal(err):
+		r.log.Info("a parked create is still refused beside an earlier run's live processes; it is re-attempted once per resync",
+			"pod", podID, "err", err)
 	case err != nil:
 		r.log.Warn("resync-cadence image re-attempt could not reach the runtime",
 			"pod", podID, "image", image, "err", err)
@@ -938,6 +941,54 @@ type createFailure struct {
 	// pullClassSpecChange, so it is never re-attempted and its one Warning Event,
 	// recorded at the park, is never repeated on a resync.
 	specOnly bool
+	// kind says what refused the create: an image (the zero value, everything
+	// above) or the runtime's refusal to build beside processes an earlier run of
+	// the pod left alive (createBlocked). The class, the status and the Event
+	// branch on it.
+	kind createFailureKind
+}
+
+// createFailureKind is what a parked create was refused for.
+type createFailureKind int
+
+const (
+	// createFailureImage is a CONTAINER-class image refusal: reason and message
+	// are runtimed's typed cause.
+	createFailureImage createFailureKind = iota
+	// createBlocked is a create the runtime refused because a process group or a
+	// vm host helper an earlier run of the pod started is still alive
+	// (parkableCreateRefusals). It heals on its own once those exit, so it is
+	// re-attempted quietly once per resync; message is the runtime's error text.
+	createBlocked
+)
+
+// parkableCreateRefusals is the one list of runtime errors a CreatePod is parked
+// on rather than failed: each says the runtime refused to build the pod beside
+// processes an earlier run left alive, which clears once they exit. It is closed
+// on purpose, as isContainerClassFailure is: a wrong yes hides a failed pod
+// behind a Pending that retries forever. runtimed.ErrPodCreateInFlight is not
+// here: it is a waiter whose own context ended, not a refusal.
+var parkableCreateRefusals = []error{
+	runtimed.ErrVMHelperUnadoptable,
+	runtimed.ErrPodGroupStillAlive,
+}
+
+// isParkableCreateRefusal reports whether err, returned by the runtime's
+// CreatePod, is one of parkableCreateRefusals.
+func isParkableCreateRefusal(err error) bool {
+	for _, s := range parkableCreateRefusals {
+		if errors.Is(err, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// msgCreateBlocked is the waiting message and the Event text of a create parked
+// beside live processes of an earlier run; cause is the runtime's error, which
+// names the process group or helper and its record.
+func msgCreateBlocked(cause string) string {
+	return "waiting for the previous run's processes to exit before the pod is created: " + cause
 }
 
 // isContainerClassFailure reports whether a CreatePod refusal is about a
@@ -1004,6 +1055,23 @@ func (t *podTrack) updateParked(reason runtimev1.FailureReason, message string) 
 		return
 	}
 	t.parked.reason, t.parked.message = reason, message
+	t.parked.kind = createFailureImage
+}
+
+// updateParkedBlocked refreshes the record with a retry the runtime refused
+// beside live processes of an earlier run, keeping the schedule key. It reports
+// whether the record was of another kind before, which is a new cause and earns
+// its one Event.
+func (t *podTrack) updateParkedBlocked(message string) bool {
+	t.restartMu.Lock()
+	defer t.restartMu.Unlock()
+	if t.parked == nil {
+		return false
+	}
+	changed := t.parked.kind != createBlocked
+	t.parked.reason, t.parked.message = runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, message
+	t.parked.kind = createBlocked
+	return changed
 }
 
 // markDeleting closes the track to any further create. DeletePod sets it BEFORE
@@ -1022,6 +1090,15 @@ func (r *runtimedRuntime) parkCreate(pod *corev1.Pod, t *podTrack, reason runtim
 	r.park(pod, t, &createFailure{reason: reason, message: message})
 }
 
+// parkBlockedCreate records a create the runtime refused beside live processes of
+// an earlier run (parkableCreateRefusals). The pod keeps its track and its
+// address, reports ContainerCreating with the runtime's text, records one Warning
+// Event here, and is re-created quietly once per resync until the processes have
+// exited or the pod is deleted.
+func (r *runtimedRuntime) parkBlockedCreate(pod *corev1.Pod, t *podTrack, cause error) {
+	r.park(pod, t, &createFailure{kind: createBlocked, message: cause.Error()})
+}
+
 // parkDNSRefusal parks a dnsPolicy None pod the in-pod resolver cannot honor, as
 // a CONTAINER_CONFIG refusal that is never retried (createFailure.specOnly): its
 // Failed Warning Event is recorded once, here.
@@ -1037,10 +1114,15 @@ func (r *runtimedRuntime) parkDNSRefusal(pod *corev1.Pod, t *podTrack, refusal *
 // its Events.
 func (r *runtimedRuntime) park(pod *corev1.Pod, t *podTrack, cf *createFailure) {
 	message := cf.message
-	if isArtifactPullRefusal(message) {
+	switch {
+	case cf.kind == createBlocked:
+		// No image is at fault: the schedule keys on the pod's first image, as a
+		// pod-wide refusal's does, and no container is named.
+		cf.image, cf.container = attributeCreateFailure(pod, "")
+	case isArtifactPullRefusal(message):
 		cf.volume, cf.image = attributeArtifactFailure(pod, message)
 	}
-	if cf.image == "" {
+	if cf.image == "" && cf.kind != createBlocked {
 		cf.image, cf.container = attributeCreateFailure(pod, message)
 	}
 	podID := string(pod.UID)
@@ -1065,10 +1147,7 @@ func (r *runtimedRuntime) park(pod *corev1.Pod, t *podTrack, cf *createFailure) 
 // Caller holds t.restartMu and t.parked is non-nil.
 func (r *runtimedRuntime) observeParkedLocked(t *podTrack, podID string) []podEvent {
 	cf := t.parked
-	cls := failureClass(cf.reason, cf.message)
-	if cf.specOnly {
-		cls = pullClassSpecChange
-	}
+	cls := parkedClass(cf)
 	pr, fresh := t.pullFor(cf.image, cls, r.clk)
 	// A one-shot re-attempt that failed for a cause of another class leaves its
 	// schedule behind with no worker (runPullOnce keeps the entry, so a resync
@@ -1111,6 +1190,21 @@ func (r *runtimedRuntime) observeParkedLocked(t *podTrack, podID string) []podEv
 	}
 }
 
+// parkedClass is the re-attempt cadence of a parked create. A create blocked
+// beside live processes is re-checked quietly once per resync: it clears on its
+// own, its one Event was recorded at the park, and a fixed exponential schedule
+// would only delay the create past the moment the processes are gone.
+func parkedClass(cf *createFailure) pullRetryClass {
+	switch {
+	case cf.specOnly:
+		return pullClassSpecChange
+	case cf.kind == createBlocked:
+		return pullClassRecheck
+	default:
+		return failureClass(cf.reason, cf.message)
+	}
+}
+
 // parkEventFor is the Warning Event a parked create's cause records: the image
 // path's pullEventFor, except for an image volume refused for naming a foreign
 // registry, which records ArtifactPullRefused with the message the provider's
@@ -1118,6 +1212,9 @@ func (r *runtimedRuntime) observeParkedLocked(t *podTrack, podID string) []podEv
 // accepts, never the pod's reference). An artifact's other refusals read as an
 // image pull of the artifact's reference, which is what they are.
 func (r *runtimedRuntime) parkEventFor(cf *createFailure) podEvent {
+	if cf.kind == createBlocked {
+		return podEvent{corev1.EventTypeWarning, reasonFailedCreatePodSandBox, msgCreateBlocked(cf.message)}
+	}
 	if cf.volume != "" && cf.reason == runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX && isArtifactPullRefusal(cf.message) {
 		return podEvent{corev1.EventTypeWarning, reasonArtifactPullRefused, msgArtifactPullRefused(cf.volume, r.clusterRegistry)}
 	}
@@ -1255,6 +1352,13 @@ func parkedRuntimeStatus(pod *corev1.Pod, cf *createFailure) *runtimev1.PodStatu
 	// translation of a runtime report never sees.
 	artifactReason := artifactWaitingReason(cf.reason, cf.message)
 	entry := func(c *corev1.Container) *runtimev1.ContainerStatus {
+		if cf.kind == createBlocked {
+			// Not a failure of any container: every one is still being created,
+			// and the message says what the create waits on.
+			cs := creatingContainerStatus(c, reasonContainerCreating)
+			cs.State.Waiting.Message = msgCreateBlocked(cf.message)
+			return cs
+		}
 		if cf.container != "" && c.Name != cf.container {
 			return creatingContainerStatus(c, reasonContainerCreating)
 		}
@@ -1385,6 +1489,15 @@ func (r *runtimedRuntime) retryParkedCreate(ctx context.Context, pod *corev1.Pod
 			fmt.Errorf("translate pod %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
 	resp, err := r.rt.CreatePod(ctx, &runtimev1.CreatePodRequest{Pod: box})
+	if err != nil && isParkableCreateRefusal(err) {
+		// Still beside the earlier run's processes: the pod stays parked, its
+		// address reserved, and the next resync tries again. A cause new to this
+		// record is announced once; a repeat is only logged.
+		if t.updateParkedBlocked(err.Error()) {
+			r.recordPodEvent(string(pod.UID), r.parkEventFor(&createFailure{kind: createBlocked, message: err.Error()}))
+		}
+		return runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, "", fmt.Errorf("runtimed create pod %s/%s: %w", pod.Namespace, pod.Name, err)
+	}
 	if err != nil {
 		// No guest to compensate for: see the same return in CreatePod.
 		return runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, "",

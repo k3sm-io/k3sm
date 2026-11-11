@@ -2499,6 +2499,18 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	}
 
 	resp, err := r.rt.CreatePod(ctx, &runtimev1.CreatePodRequest{Pod: box})
+	if err != nil && isParkableCreateRefusal(err) {
+		// The runtime refused to build beside processes an earlier run of the pod
+		// left alive. Returning the error would leave this track installed, so VK's
+		// retry takes the update path and never creates again, and a
+		// restartPolicy Never pod goes Failed for a condition that clears once
+		// those processes exit. So the pod is parked: kept tracked with its address
+		// reserved, reported ContainerCreating, and re-created once per resync.
+		r.log.Warn("CreatePod: runtimed refused to create beside an earlier run's live processes; the pod is kept and retried",
+			"namespace", pod.Namespace, "name", pod.Name, "err", err)
+		r.parkBlockedCreate(pod, t, err)
+		return nil
+	}
 	if err != nil {
 		// No guest to compensate for: r.rt is the runtime in process, and its one
 		// error return comes before it builds (TestCreateRPCHasNoTransportToLoseAGuest).
