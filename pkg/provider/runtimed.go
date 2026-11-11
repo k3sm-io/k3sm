@@ -467,6 +467,16 @@ type podTrack struct {
 	// runtime reports during or after the teardown can turn an evicted pod back
 	// into a running or restarting one. Guarded by restartMu with deleting.
 	evicted *corev1.PodStatus
+	// unpersisted holds the terminal status of a pod failed past its active
+	// deadline (failPastDeadline) whose apiserver write has not yet succeeded;
+	// enforceActiveDeadlines retries the write on each resync until it lands, the
+	// pod is replaced or gone, or the track is deleting. Nil once persisted.
+	// Guarded by restartMu.
+	unpersisted *corev1.PodStatus
+	// deadlineStopFailed says a deadline stop of this pod has failed and been
+	// logged at Warn; repeats log at Debug until a stop succeeds. Guarded by
+	// restartMu.
+	deadlineStopFailed bool
 	// rejected marks a track whose pod was refused at admission (admission.go):
 	// evicted holds its rejected status, and the runtime never heard of it, so
 	// DeletePod forgets it without a runtime teardown. Set before the track is

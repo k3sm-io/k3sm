@@ -18,6 +18,8 @@ package provider
 
 import (
 	"context"
+	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,7 +27,9 @@ import (
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 	testclock "k8s.io/utils/clock/testing"
 )
 
@@ -211,5 +215,92 @@ func TestPodPastActiveDeadlineFailsDeadlineExceeded(t *testing.T) {
 			waitRestart(t, "the address release", func() bool { return !addressHeld(r, id) })
 			waitRestart(t, "the track to go", func() bool { return r.trackByID(id) == nil })
 		})
+	}
+}
+
+// TestActiveDeadlinePersistRetried pins the durable Failed status: an apiserver
+// write that fails when the pod is stopped is retried on later resyncs until it
+// lands, with no second stop and no second Event.
+func TestActiveDeadlinePersistRetried(t *testing.T) {
+	ctx := context.Background()
+	pod := pullPod("deadline-persist")
+	deadline := int64(600)
+	pod.Spec.ActiveDeadlineSeconds = &deadline
+	id := string(pod.UID)
+	r, e, _, rec := newBlockedCreateProvider(t)
+	clk := testclock.NewFakeClock(time.Now())
+	r.clk = clk
+	cs := fake.NewClientset()
+	r.client = cs
+	if _, err := cs.CoreV1().Pods(pod.Namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("apiserver create: %v", err)
+	}
+	// The status write fails for the first resync's whole attempt window: the
+	// failure ends that resync's context, so its backoff stops at once.
+	var failing atomic.Bool
+	failing.Store(true)
+	var writes atomic.Int32
+	firstCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	cs.PrependReactor("update", "pods", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		if a.GetSubresource() != "status" {
+			return false, nil, nil
+		}
+		writes.Add(1)
+		if failing.Load() {
+			cancel()
+			return true, nil, errors.New("apiserver unavailable")
+		}
+		return false, nil, nil
+	})
+	if err := r.CreatePod(ctx, pod); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	tr := r.trackByID(id)
+	if tr == nil {
+		t.Fatal("pod not tracked after CreatePod")
+	}
+	_ = recordedEvents(rec.Events)
+
+	clk.Step(time.Duration(deadline)*time.Second + 10*time.Minute)
+	r.resync(firstCtx)
+	if st := tr.evictedStatus(); st == nil || st.Reason != reasonDeadlineExceeded {
+		t.Fatalf("track status = %v, want Failed/%s", st, reasonDeadlineExceeded)
+	}
+	if tr.unpersistedStatus() == nil {
+		t.Fatal("a failed status write left no debt for the next resync")
+	}
+	live, err := cs.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("apiserver get: %v", err)
+	}
+	if isDeadlineExceededPod(live) {
+		t.Fatal("the status reached the apiserver through a failing write")
+	}
+
+	failing.Store(false)
+	clk.Step(10 * time.Second)
+	r.resync(ctx)
+	live, err = cs.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("apiserver get: %v", err)
+	}
+	if !isDeadlineExceededPod(live) {
+		t.Fatalf("apiserver status = %s/%s, want Failed/%s persisted by a later resync", live.Status.Phase, live.Status.Reason, reasonDeadlineExceeded)
+	}
+	if tr.unpersistedStatus() != nil {
+		t.Error("the debt outlived a successful write")
+	}
+	n := writes.Load()
+	clk.Step(10 * time.Second)
+	r.resync(ctx)
+	if got := writes.Load(); got != n {
+		t.Errorf("status writes after the debt was paid = %d, want %d", got, n)
+	}
+	if got := e.deleteCount(); got != 1 {
+		t.Errorf("runtime DeletePod calls = %d, want 1", got)
+	}
+	if got := countEvents(recordedEvents(rec.Events), "Warning "+reasonDeadlineExceeded); got != 1 {
+		t.Errorf("Warning DeadlineExceeded events = %d, want 1", got)
 	}
 }

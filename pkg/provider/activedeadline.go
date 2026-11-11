@@ -24,6 +24,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
@@ -69,9 +70,13 @@ func (r *runtimedRuntime) enforceActiveDeadlines(ctx context.Context) {
 		t   *podTrack
 	}
 	r.mu.Lock()
-	var due []tracked
+	var due, owed []tracked
 	for _, t := range r.track {
 		if t == nil || t.pod == nil {
+			continue
+		}
+		if t.unpersistedStatus() != nil {
+			owed = append(owed, tracked{pod: t.pod, t: t})
 			continue
 		}
 		start := &t.startTime
@@ -83,6 +88,12 @@ func (r *runtimedRuntime) enforceActiveDeadlines(ctx context.Context) {
 		}
 	}
 	r.mu.Unlock()
+	for _, d := range owed {
+		if trackDeleting(d.t) {
+			continue
+		}
+		r.persistDeadlineStatus(ctx, d.pod, d.t, false)
+	}
 	for _, d := range due {
 		if d.t.rejected || d.t.evictedStatus() != nil || trackDeleting(d.t) {
 			continue
@@ -92,6 +103,39 @@ func (r *runtimedRuntime) enforceActiveDeadlines(ctx context.Context) {
 				"pod", podKey(d.pod.Namespace, d.pod.Name), "uid", string(d.pod.UID), "err", err)
 		}
 	}
+}
+
+// unpersistedStatus returns the deadline failure status t still owes the
+// apiserver, or nil.
+func (t *podTrack) unpersistedStatus() *corev1.PodStatus {
+	t.restartMu.Lock()
+	defer t.restartMu.Unlock()
+	return t.unpersisted
+}
+
+// persistDeadlineStatus writes t's owed deadline failure status to the apiserver
+// (UID-checked, persistEvictedStatus) and clears the debt once the write lands,
+// the pod was replaced under its name, or the pod is gone. A failure keeps the
+// debt for the next resync; only the first attempt logs above Debug.
+func (r *runtimedRuntime) persistDeadlineStatus(ctx context.Context, pod *corev1.Pod, t *podTrack, first bool) {
+	st := t.unpersistedStatus()
+	if st == nil {
+		return
+	}
+	if err := r.persistEvictedStatus(ctx, pod, st); err != nil && !apierrors.IsNotFound(err) {
+		log := r.log.Debug
+		if first {
+			log = r.log.Error
+		}
+		log("active deadline: could not persist the failed status to the apiserver; retrying on the next resync",
+			"pod", podKey(pod.Namespace, pod.Name), "uid", string(pod.UID), "err", err)
+		return
+	}
+	t.restartMu.Lock()
+	if t.unpersisted == st {
+		t.unpersisted = nil
+	}
+	t.restartMu.Unlock()
 }
 
 // failPastDeadline stops a pod past its active deadline in evictPod's shape and
@@ -131,10 +175,10 @@ func (r *runtimedRuntime) failPastDeadline(ctx context.Context, tracked *corev1.
 		"pod", podKey(tracked.Namespace, tracked.Name), "uid", id,
 		"active_deadline_seconds", *tracked.Spec.ActiveDeadlineSeconds)
 	r.recorder.Event(tracked, corev1.EventTypeWarning, reasonDeadlineExceeded, msgDeadlineExceeded)
-	if err := r.persistEvictedStatus(ctx, tracked, st); err != nil {
-		r.log.Error("active deadline: could not persist the failed status to the apiserver",
-			"pod", podKey(tracked.Namespace, tracked.Name), "uid", id, "err", err)
-	}
+	t.restartMu.Lock()
+	t.unpersisted = st
+	t.restartMu.Unlock()
+	r.persistDeadlineStatus(ctx, tracked, t, true)
 	if cb := r.callback(); cb != nil {
 		out := tracked.DeepCopy()
 		out.Status = *st.DeepCopy()
