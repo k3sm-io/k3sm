@@ -64,10 +64,21 @@ const (
 // streaming for minutes is not cut off). A registry that accepted the
 // connection and has not answered in this long is wedged: the client gets a
 // 502 and the relay slot is freed instead of held until the client gives up.
-// It is 30s rather than the dial's 1s because a manifest PUT makes the
-// registry verify what it stored before it answers. Blob upload requests are
-// not held to it: see gateUploadHeaderTimeout.
+// It holds reads, upload status and every other request the registry answers
+// from what it already has; 30s rather than the dial's 1s leaves room for a
+// busy disk. A manifest PUT and the blob upload requests wait on work the
+// registry does before it answers, and have their own bounds: see
+// gateManifestHeaderTimeout and gateUploadHeaderTimeout.
 const gateUpstreamHeaderTimeout = 30 * time.Second
+
+// gateManifestHeaderTimeout is the response-header bound of a manifest PUT.
+// The registry answers one only after it holds the repository's lock, which a
+// collection sweep of that repository holds for the whole sweep, and after it
+// links every blob the manifest names, which can re-hash a large blob from
+// disk; a healthy push can wait well past 30s on its last request. The gate
+// uses CollectTimeout, this package's bound past which a registry doing that
+// work is taken to be hung.
+const gateManifestHeaderTimeout = CollectTimeout
 
 // gateUploadHeaderTimeout is the response-header bound of a blob upload
 // request (the POST that starts or mounts, a PATCH, the final PUT). The
@@ -89,9 +100,11 @@ type gate struct {
 	// writes are 503, like a missing auth.
 	cred Credential
 
-	// upload forwards blob upload requests: write, over a transport with the
-	// upload response-header bound.
-	read, write, upload *httputil.ReverseProxy
+	// read forwards reads and write every authorized write not named below,
+	// both over a transport with the upstream response-header bound; manifest
+	// forwards manifest PUTs over one with the manifest bound, and upload blob
+	// upload requests over one with the upload bound. proxyFor picks one.
+	read, write, manifest, upload *httputil.ReverseProxy
 }
 
 // gateConfig configures a gate.
@@ -103,12 +116,19 @@ type gateConfig struct {
 	// Now is the clock the caches read; nil means time.Now.
 	Now func() time.Time
 	// Transport is the round tripper to the upstream, for every request; nil
-	// means two loopback transports, one per response-header bound.
+	// means three loopback transports, one per response-header bound.
 	Transport http.RoundTripper
 	// UpstreamHeaderTimeout bounds how long the loopback transport waits for
-	// the registry's response headers; zero means gateUpstreamHeaderTimeout.
-	// It is ignored when Transport is set.
+	// the registry's response headers to a read, an upload status or any
+	// other request not named below; zero means gateUpstreamHeaderTimeout.
+	// The three bounds are ignored when Transport is set.
 	UpstreamHeaderTimeout time.Duration
+	// ManifestHeaderTimeout is that bound for a manifest PUT; zero means
+	// gateManifestHeaderTimeout.
+	ManifestHeaderTimeout time.Duration
+	// UploadHeaderTimeout is that bound for a blob upload request (start or
+	// mount, chunk, finish); zero means gateUploadHeaderTimeout.
+	UploadHeaderTimeout time.Duration
 }
 
 // newGate builds a gate.
@@ -122,10 +142,17 @@ func newGate(cfg gateConfig) *gate {
 	if cfg.UpstreamHeaderTimeout <= 0 {
 		cfg.UpstreamHeaderTimeout = gateUpstreamHeaderTimeout
 	}
-	uploadTransport := cfg.Transport
+	if cfg.ManifestHeaderTimeout <= 0 {
+		cfg.ManifestHeaderTimeout = gateManifestHeaderTimeout
+	}
+	if cfg.UploadHeaderTimeout <= 0 {
+		cfg.UploadHeaderTimeout = gateUploadHeaderTimeout
+	}
+	manifestTransport, uploadTransport := cfg.Transport, cfg.Transport
 	if cfg.Transport == nil {
 		cfg.Transport = loopbackTransport(cfg.UpstreamHeaderTimeout)
-		uploadTransport = loopbackTransport(gateUploadHeaderTimeout)
+		manifestTransport = loopbackTransport(cfg.ManifestHeaderTimeout)
+		uploadTransport = loopbackTransport(cfg.UploadHeaderTimeout)
 	}
 	g := &gate{upstream: cfg.Upstream, log: cfg.Logger, cred: cfg.Credential}
 	if cfg.Auth.complete() {
@@ -148,6 +175,14 @@ func newGate(cfg gateConfig) *gate {
 		ErrorHandler:   g.writeError,
 		ErrorLog:       errLog,
 	}
+	g.manifest = &httputil.ReverseProxy{
+		Rewrite:        func(pr *httputil.ProxyRequest) { g.rewrite(pr, true) },
+		FlushInterval:  -1,
+		Transport:      manifestTransport,
+		ModifyResponse: g.modifyResponse,
+		ErrorHandler:   g.writeError,
+		ErrorLog:       errLog,
+	}
 	g.upload = &httputil.ReverseProxy{
 		Rewrite:        func(pr *httputil.ProxyRequest) { g.rewrite(pr, true) },
 		FlushInterval:  -1,
@@ -157,6 +192,23 @@ func newGate(cfg gateConfig) *gate {
 		ErrorLog:       errLog,
 	}
 	return g
+}
+
+// proxyFor is the reverse proxy a request of class op is forwarded through,
+// and so the response-header bound it is held to: a read anonymously, a
+// manifest PUT and the blob upload requests over their own transports, every
+// other authorized write (an upload status) over the upstream one.
+func (g *gate) proxyFor(op gateOp) *httputil.ReverseProxy {
+	switch op {
+	case opRead:
+		return g.read
+	case opManifestPut:
+		return g.manifest
+	case opUploadStart, opUploadChunk, opUploadFinish:
+		return g.upload
+	default:
+		return g.write
+	}
 }
 
 // loopbackTransport is the transport to the loopback registry, waiting at
@@ -243,7 +295,7 @@ func (g *gate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	route := classify(r.Method, rawPath, rawQuery)
 	switch {
 	case route.op == opRead:
-		g.read.ServeHTTP(w, r)
+		g.proxyFor(opRead).ServeHTTP(w, r)
 		return
 	case route.op == opRefused:
 		g.audit(r, route, pushIdentity{}, "refused", http.StatusMethodNotAllowed)
@@ -339,12 +391,7 @@ func (g *gate) authorizeWrite(w http.ResponseWriter, r *http.Request, route gate
 	g.audit(r, route, id, "allowed", 0)
 	out := r.Clone(r.Context())
 	out.URL.Path, out.URL.RawPath, out.URL.RawQuery = route.path, "", route.query
-	switch route.op {
-	case opUploadStart, opUploadChunk, opUploadFinish:
-		g.upload.ServeHTTP(w, out)
-	default:
-		g.write.ServeHTTP(w, out)
-	}
+	g.proxyFor(route.op).ServeHTTP(w, out)
 }
 
 // refuseUnavailable answers an apiserver that could not, or was not allowed
