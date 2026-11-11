@@ -350,3 +350,50 @@ func TestActiveDeadlineCountsFromTheEarlierStart(t *testing.T) {
 		t.Errorf("runtime DeletePod calls = %d, want 1", n)
 	}
 }
+
+// TestActiveDeadlineFencesALateParkedCreate pins the fence on a parked pod's
+// retry: a create still in flight when the pod is failed past its deadline lands
+// after the terminal mark, so it is deleted again (commitParkedCreate answers
+// commitDeleted) and no guest stays up, while the address and the Failed status
+// stay for the pod's DeletePod.
+func TestActiveDeadlineFencesALateParkedCreate(t *testing.T) {
+	ctx := context.Background()
+	pod := probePullPod("deadline-late-create")
+	deadline := int64(60)
+	pod.Spec.ActiveDeadlineSeconds = &deadline
+	id := string(pod.UID)
+	r, f, clk, release := parkedWithHeldRetry(t, pod)
+	defer release()
+	tr := r.trackByID(id)
+	if tr == nil {
+		t.Fatal("pod not tracked after CreatePod")
+	}
+	r.mu.Lock()
+	tr.startTime = metav1.NewTime(clk.Now().Add(-20 * time.Minute))
+	r.mu.Unlock()
+
+	r.resync(ctx)
+	if st := tr.evictedStatus(); st == nil || st.Reason != reasonDeadlineExceeded {
+		t.Fatalf("track status = %v, want Failed/%s", st, reasonDeadlineExceeded)
+	}
+	stops := len(f.deleteRecords())
+
+	release()
+	waitRestart(t, "the compensating delete", func() bool { return len(f.deleteRecords()) == stops+1 })
+	if got := f.deleteRecords(); got[stops] != id {
+		t.Errorf("the compensating delete named %q, want the pod's id %q", got[stops], id)
+	}
+	if f.hasCreated(id) {
+		t.Error("the runtime still holds the pod: the late create brought up a guest behind a Failed status")
+	}
+	if !addressHeld(r, id) {
+		t.Error("the failed pod's address was released before its DeletePod")
+	}
+	st, err := r.GetPodStatus(ctx, pod.Namespace, pod.Name)
+	if err != nil {
+		t.Fatalf("GetPodStatus: %v", err)
+	}
+	if st.Phase != corev1.PodFailed || st.Reason != reasonDeadlineExceeded {
+		t.Errorf("status after the late create = %s/%s, want Failed/%s", st.Phase, st.Reason, reasonDeadlineExceeded)
+	}
+}
