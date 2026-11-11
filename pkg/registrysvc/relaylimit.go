@@ -167,21 +167,34 @@ const (
 
 // cutWatch reports, once, that one of the relay's own deadlines cut its
 // connection. The write deadline the relay last armed is recorded in armed, so
-// a write that times out under it is told apart from one under the server's TLS
-// handshake deadline, which the relay does not own. A read is reported where it
-// is observed, by the progressReader that armed its deadline just before. Both
-// fields are atomic: the response is written from the handler's goroutine and
-// the serving goroutine, and a request body can be read from another.
+// a write that times out under it is told apart from one under a deadline the
+// relay does not own: the server's TLS handshake deadline, or the one the TLS
+// close alert sets for itself when the connection closes. The record is dropped
+// when the connection sets any other write deadline, and when the response
+// ends and the connection goes idle, so a later write that times out for
+// another cause, such as a refusal the server writes before a next request
+// reaches the relay, is not logged as a stalled response. A read is reported
+// where it is observed, by the progressReader that armed its deadline just
+// before. Both fields are atomic: the response is written from the handler's
+// goroutine and the serving goroutine, and a request body can be read from
+// another.
 type cutWatch struct {
 	log                         *slog.Logger
 	remote                      string
 	writeProgress, readProgress time.Duration
-	armed                       atomic.Pointer[string] // the relay's write deadline in force: nil, cutWrite or cutFlush
+	armed                       atomic.Pointer[armedWrite] // the relay's write deadline in force, or nil
 	logged                      atomic.Bool
 }
 
-// armWrite records which of the relay's write deadlines is in force; "" is none.
-func (w *cutWatch) armWrite(dir string) {
+// armedWrite is a write deadline the relay armed: which one, and when it fires.
+type armedWrite struct {
+	dir string // cutWrite or cutFlush
+	at  time.Time
+}
+
+// armWrite records which of the relay's write deadlines is in force and when
+// it fires; "" is none.
+func (w *cutWatch) armWrite(dir string, at time.Time) {
 	if w == nil {
 		return
 	}
@@ -189,7 +202,18 @@ func (w *cutWatch) armWrite(dir string) {
 		w.armed.Store(nil)
 		return
 	}
-	w.armed.Store(&dir)
+	w.armed.Store(&armedWrite{dir: dir, at: at})
+}
+
+// writeDeadlineSet drops the record of the relay's write deadline when the
+// connection is given a different one, which is then not the relay's.
+func (w *cutWatch) writeDeadlineSet(t time.Time) {
+	if w == nil {
+		return
+	}
+	if a := w.armed.Load(); a != nil && !a.at.Equal(t) {
+		w.armed.CompareAndSwap(a, nil)
+	}
 }
 
 // wrote reports a cut when err is a write timing out under a relay deadline.
@@ -197,8 +221,8 @@ func (w *cutWatch) wrote(err error) {
 	if w == nil || !isDeadline(err) {
 		return
 	}
-	if dir := w.armed.Load(); dir != nil {
-		w.cut(*dir, w.writeProgress)
+	if a := w.armed.Load(); a != nil {
+		w.cut(a.dir, w.writeProgress)
 	}
 }
 
@@ -257,6 +281,27 @@ func newSourceLimiter(next http.Handler, lim relayLimits, now func() time.Time) 
 		now = time.Now
 	}
 	return &sourceLimiter{next: next, lim: lim, now: now, sources: map[string]*sourceBuckets{}}
+}
+
+// cutWatchOf returns the cut watch of a connection the relay's listener
+// accepted, under its TLS layer if any, or nil.
+func cutWatchOf(c net.Conn) *cutWatch {
+	if t, ok := c.(interface{ NetConn() net.Conn }); ok {
+		c = t.NetConn()
+	}
+	if lc, ok := c.(*limitConn); ok {
+		return lc.cut
+	}
+	return nil
+}
+
+// ConnState is the http.Server's ConnState. A connection going idle has
+// written its response in full, so the relay's write deadline no longer stands
+// for a response in progress and is dropped from the cut watch.
+func (s *sourceLimiter) ConnState(c net.Conn, st http.ConnState) {
+	if st == http.StateIdle {
+		cutWatchOf(c).armWrite("", time.Time{})
+	}
 }
 
 // ConnContext stamps a new connection with its relayConn and, when the relay's
@@ -330,7 +375,7 @@ func (s *sourceLimiter) bindProgress(w http.ResponseWriter, r *http.Request) (ht
 		cut = c.cut
 	}
 	rc := http.NewResponseController(w)
-	cut.armWrite("")
+	cut.armWrite("", time.Time{})
 	_ = rc.SetWriteDeadline(time.Time{})
 	pw := &progressWriter{ResponseWriter: w, rc: rc, d: s.lim.writeProgress, cut: cut}
 	var pr *progressReader
@@ -343,17 +388,14 @@ func (s *sourceLimiter) bindProgress(w http.ResponseWriter, r *http.Request) (ht
 		r.Body = pr
 	}
 	return pw, r, func() {
-		cut.armWrite(cutFlush)
-		_ = rc.SetWriteDeadline(time.Now().Add(s.lim.writeProgress))
-		switch {
-		case pr != nil && pr.failed:
-			// The armed deadline stays: clearing it would let the server's
-			// drain of the unread rest block for good on a stalled peer.
-		case pr != nil && !pr.ended:
-			_ = rc.SetReadDeadline(time.Now().Add(s.lim.readProgress))
-		default:
-			_ = rc.SetReadDeadline(time.Time{})
+		at := time.Now().Add(s.lim.writeProgress)
+		cut.armWrite(cutFlush, at)
+		_ = rc.SetWriteDeadline(at)
+		if pr != nil {
+			pr.finish()
+			return
 		}
+		_ = rc.SetReadDeadline(time.Time{})
 	}
 }
 
@@ -366,8 +408,9 @@ type progressWriter struct {
 }
 
 func (p *progressWriter) arm() {
-	p.cut.armWrite(cutWrite)
-	_ = p.rc.SetWriteDeadline(time.Now().Add(p.d))
+	at := time.Now().Add(p.d)
+	p.cut.armWrite(cutWrite, at)
+	_ = p.rc.SetWriteDeadline(at)
 }
 
 func (p *progressWriter) WriteHeader(code int) {
@@ -405,28 +448,78 @@ func (p *progressWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) { return 
 // must not time out. A read that fails any other way, a timeout included,
 // leaves the armed deadline in place and marks the read failed, so the
 // server's drain of the rest is bounded by it and the connection closes.
+//
+// The body can be read on a goroutine other than the handler's: the proxy's
+// transport sends it upstream from its own, and goes on doing so after the
+// registry has answered. Once the body is closed, or the handler has returned
+// and the connection belongs to the server again, a read sets no deadline:
+// one set then could land on the connection while it serves its next request.
+// mu orders every deadline this reader sets against that end, and guards the
+// state done reads.
 type progressReader struct {
 	io.ReadCloser
-	rc     *http.ResponseController
-	d      time.Duration
-	cut    *cutWatch
-	ended  bool
-	failed bool
+	rc  *http.ResponseController
+	d   time.Duration
+	cut *cutWatch
+
+	mu     sync.Mutex
+	closed bool // the body was closed or the handler returned: set no more deadlines
+	ended  bool // a read returned an error, io.EOF included
+	failed bool // a read returned an error other than io.EOF
 }
 
 func (p *progressReader) Read(b []byte) (int, error) {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return p.ReadCloser.Read(b)
+	}
 	_ = p.rc.SetReadDeadline(time.Now().Add(p.d))
+	p.mu.Unlock()
 	n, err := p.ReadCloser.Read(b)
 	if err != nil {
+		p.mu.Lock()
 		p.ended = true
-		if errors.Is(err, io.EOF) {
-			_ = p.rc.SetReadDeadline(time.Time{})
-		} else {
+		eof := errors.Is(err, io.EOF)
+		if !eof {
 			p.failed = true
 		}
+		if eof && !p.closed {
+			_ = p.rc.SetReadDeadline(time.Time{})
+		}
+		p.mu.Unlock()
 		p.cut.read(err)
 	}
 	return n, err
+}
+
+// Close ends the body: no read after it sets a deadline.
+func (p *progressReader) Close() error {
+	p.mu.Lock()
+	p.closed = true
+	p.mu.Unlock()
+	return p.ReadCloser.Close()
+}
+
+// finish runs when the handler returns. It stops the reader from setting any
+// further deadline and, under the same lock, sets the read deadline the
+// server's drain and next request start from: none for a body read to its
+// end, one more window for a body still unread, and the one already armed for
+// a body whose read failed, so the drain of the rest fails at once and the
+// connection closes.
+func (p *progressReader) finish() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.closed = true
+	switch {
+	case p.failed:
+		// The armed deadline stays: clearing it would let the server's
+		// drain of the unread rest block for good on a stalled peer.
+	case !p.ended:
+		_ = p.rc.SetReadDeadline(time.Now().Add(p.d))
+	default:
+		_ = p.rc.SetReadDeadline(time.Time{})
+	}
 }
 
 // reserve takes one token from src's request bucket and, for a write, one from

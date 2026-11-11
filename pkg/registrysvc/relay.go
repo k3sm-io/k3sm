@@ -424,6 +424,7 @@ func (r *Relay) accept(ctx context.Context, ln net.Listener) error {
 		IdleTimeout:       relayIdleTimeout,
 		ErrorLog:          slog.NewLogLogger(r.log.Handler(), slog.LevelDebug),
 		ConnContext:       r.limiter.ConnContext,
+		ConnState:         r.limiter.ConnState,
 	}
 	stop := make(chan struct{})
 	defer close(stop)
@@ -521,6 +522,19 @@ func (c *limitConn) Write(b []byte) (int, error) {
 		c.cut.wrote(err)
 	}
 	return n, err
+}
+
+// SetWriteDeadline and SetDeadline tell the cut watch when a write deadline
+// other than the relay's is set, such as the one the TLS close alert sets for
+// itself, so a write that times out under it is not logged as the relay's cut.
+func (c *limitConn) SetWriteDeadline(t time.Time) error {
+	c.cut.writeDeadlineSet(t)
+	return c.Conn.SetWriteDeadline(t)
+}
+
+func (c *limitConn) SetDeadline(t time.Time) error {
+	c.cut.writeDeadlineSet(t)
+	return c.Conn.SetDeadline(t)
 }
 
 func (c *limitConn) Close() error {
