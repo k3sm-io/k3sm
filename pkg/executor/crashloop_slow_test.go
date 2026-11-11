@@ -108,8 +108,8 @@ func TestCrashLoopBringUpTimeoutUnderPressureBacksOff(t *testing.T) {
 					t.Fatalf("fast failure %d: tripped = %v", i, tripped)
 				}
 			}
-			if wait, _ := r.BringUpBackoff(t0.Add(10 * time.Second)); wait != 0 || r.SlowStreak != 0 {
-				t.Fatalf("a non-slow entry must end the streak: wait %s, streak %d", wait, r.SlowStreak)
+			if wait, _ := r.BringUpBackoff(t0.Add(10 * time.Second)); wait != 20*time.Second || r.SlowStreak != 1 {
+				t.Fatalf("a non-slow entry must not end the streak: wait %s, streak %d", wait, r.SlowStreak)
 			}
 		}},
 		{"unpressured timeouts are counted as today", func(t *testing.T) {
@@ -146,6 +146,52 @@ func TestCrashLoopBringUpTimeoutUnderPressureBacksOff(t *testing.T) {
 			r.RecordBringUpSlow(now.Add(time.Hour), "kube-apiserver", "slow")
 			if wait, _ := r.BringUpBackoff(now.Add(time.Hour)); wait != BringUpSlowBackoffBase {
 				t.Fatalf("after reset the streak restarts: %s, want %s", wait, BringUpSlowBackoffBase)
+			}
+		}},
+		{"slow, fast failure, slow keeps the streak and counts the fast one", func(t *testing.T) {
+			var r CrashRecord
+			r.RecordBringUpSlow(t0, "kube-apiserver", "slow")
+			r.Record(t0.Add(time.Minute), CrashOriginBringUp, "kine", "kine exited during bring-up")
+			now := t0.Add(2 * time.Minute)
+			r.RecordBringUpSlow(now, "kube-apiserver", "slow")
+			if r.SlowStreak != 2 {
+				t.Fatalf("SlowStreak = %d, want 2", r.SlowStreak)
+			}
+			if n := r.Recent(now); n != 1 {
+				t.Fatalf("Recent = %d, want 1 (the fast failure)", n)
+			}
+			if wait, _ := r.BringUpBackoff(now); wait != 2*BringUpSlowBackoffBase {
+				t.Fatalf("backoff %s, want %s", wait, 2*BringUpSlowBackoffBase)
+			}
+		}},
+		{"a future-dated LastSlowAt never stretches the wait", func(t *testing.T) {
+			var r CrashRecord
+			now := t0
+			for i := 0; i < 3; i++ {
+				r.RecordBringUpSlow(now, "kube-apiserver", "slow")
+			}
+			future := now.Add(time.Hour)
+			r.LastSlowAt = &future
+			d := 4 * BringUpSlowBackoffBase // the streak-3 backoff
+			wait, until := r.BringUpBackoff(now)
+			if wait <= 0 || wait > d || wait > BringUpSlowBackoffCap {
+				t.Fatalf("wait %s, want 0 < wait <= %s", wait, d)
+			}
+			if !until.Equal(now.Add(wait)) {
+				t.Fatalf("until %s, want %s", until, now.Add(wait))
+			}
+		}},
+		{"NoteBringUpHealthy zeroes the streak", func(t *testing.T) {
+			var r CrashRecord
+			r.RecordBringUpSlow(t0, "kube-apiserver", "slow")
+			r.Record(t0.Add(time.Second), CrashOriginBringUp, "kine", "fast")
+			r.RecordBringUpSlow(t0.Add(2*time.Second), "kube-apiserver", "slow")
+			r.NoteBringUpHealthy()
+			if r.SlowStreak != 0 || r.LastSlowAt != nil {
+				t.Fatalf("after healthy: streak %d, LastSlowAt %v", r.SlowStreak, r.LastSlowAt)
+			}
+			if wait, _ := r.BringUpBackoff(t0.Add(2 * time.Second)); wait != 0 {
+				t.Fatalf("after healthy: wait %s, want 0", wait)
 			}
 		}},
 		{"a restart keeps the previous log as .log.1", func(t *testing.T) {

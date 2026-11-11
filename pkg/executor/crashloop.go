@@ -183,8 +183,9 @@ type CrashRecord struct {
 	// TrippedAt is set when the threshold was reached inside the window and
 	// cleared only by ClearCrashRecord. It survives Prune on purpose.
 	TrippedAt *time.Time `json:"tripped_at,omitempty"`
-	// SlowStreak is the count of consecutive slow bring-ups (CrashOriginBringUpSlow)
-	// since the last healthy bring-up or other entry; LastSlowAt is the newest of
+	// SlowStreak is the count of slow bring-ups (CrashOriginBringUpSlow) since the
+	// last healthy bring-up (NoteBringUpHealthy). Other entries do not end it, so
+	// slow laps interleaved with fast failures still reach the park; LastSlowAt is the newest of
 	// them. Both are exempt from Prune, so the backoff they drive survives the
 	// window, and both are omitempty, so a record without a streak is the shape
 	// an older daemon wrote and reads.
@@ -309,14 +310,17 @@ func (r *CrashRecord) RecordBringUpSlow(now time.Time, component, detail string)
 }
 
 // NoteBringUpHealthy ends the slow streak: a bring-up that reached healthz has
-// shown the host can carry the control plane again.
+// shown the host can carry the control plane again. It is the only thing that
+// ends it; recording any other entry leaves the streak as it is.
 func (r *CrashRecord) NoteBringUpHealthy() {
 	r.SlowStreak, r.LastSlowAt = 0, nil
 }
 
 // BringUpBackoff is how long the next bring-up must still wait at now: zero
 // with no slow streak, else BringUpSlowBackoffBase doubled per slow lap after
-// the first, capped at BringUpSlowBackoffCap, counted from LastSlowAt.
+// the first, capped at BringUpSlowBackoffCap, counted from LastSlowAt. The wait
+// never exceeds that streak's backoff, so a LastSlowAt dated in the future (a
+// clock that stepped backwards) cannot stretch it.
 func (r CrashRecord) BringUpBackoff(now time.Time) (wait time.Duration, until time.Time) {
 	if r.SlowStreak <= 0 || r.LastSlowAt == nil {
 		return 0, time.Time{}
@@ -331,6 +335,9 @@ func (r CrashRecord) BringUpBackoff(now time.Time) (wait time.Duration, until ti
 	if !until.After(now) {
 		return 0, time.Time{}
 	}
+	if until.Sub(now) > d {
+		until = now.Add(d)
+	}
 	return until.Sub(now), until
 }
 
@@ -339,14 +346,12 @@ func (r CrashRecord) BringUpBackoff(now time.Time) (wait time.Duration, until ti
 // CrashLoopThreshold, and crashes never count toward this one. It reports
 // whether THIS call tripped the breaker.
 func (r *CrashRecord) RecordLeaderLost(now time.Time, component, detail string) (tripped bool) {
-	r.NoteBringUpHealthy()
 	r.Crashes = append(r.Crashes, Crash{At: now, Origin: CrashOriginLeaderLost, Component: component, Detail: detail})
 	r.Prune(now)
 	return r.trip(now, r.LeaderLost(now) >= LeaderLostThreshold)
 }
 
 func (r *CrashRecord) record(now time.Time, c Crash) (tripped bool) {
-	r.NoteBringUpHealthy() // any other entry ends a slow streak
 	r.Crashes = append(r.Crashes, c)
 	r.Prune(now)
 	return r.trip(now, c.Permanent || r.Recent(now) >= CrashLoopThreshold)

@@ -45,8 +45,9 @@ type crashBreaker struct {
 	now  func() time.Time
 	// pressure reads whether the host is under load at the moment a bring-up's
 	// apiserver health wait ran out (executor.HostUnderPressure); after is the
-	// slow bring-up backoff's timer. Both are seams so a test fakes the host and
-	// the clock.
+	// slow bring-up backoff's timer, nil in production (a stoppable time.Timer,
+	// so a cancelled wait does not leak one). Both are seams so a test fakes the
+	// host and the clock.
 	pressure func() (bool, error)
 	after    func(time.Duration) <-chan time.Time
 	logger   *slog.Logger
@@ -57,7 +58,7 @@ type crashBreaker struct {
 
 func newCrashBreaker(workDir string, logger *slog.Logger) *crashBreaker {
 	return &crashBreaker{path: executor.CrashLoopPath(workDir), now: time.Now,
-		pressure: executor.HostUnderPressure, after: time.After, logger: logger}
+		pressure: executor.HostUnderPressure, logger: logger}
 }
 
 // load reads the record, pruned to the window. A malformed record is logged and
@@ -163,10 +164,18 @@ func (b *crashBreaker) awaitBringUpBackoff(ctx context.Context) error {
 	b.logger.Warn("the last bring-up timed out while the host was under pressure; backing off before the next one",
 		"attempt", r.SlowStreak+1, "wait", wait, "next_attempt", until.Format(time.RFC3339),
 		"limit", executor.BringUpSlowStreakLimit)
+	var fired <-chan time.Time
+	if b.after != nil {
+		fired = b.after(wait)
+	} else {
+		t := time.NewTimer(wait)
+		defer t.Stop()
+		fired = t.C
+	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-b.after(wait):
+	case <-fired:
 		return nil
 	}
 }
