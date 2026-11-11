@@ -3,8 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # The model-store tracer: a model pushed once to the cluster's own registry is served
-# by an MLXModel on either Mac, with no internet from the pod, one verified copy per
-# node read without extraction, and the space back after deletion.
+# by an MLXModel on either Mac, with no download from the internet, one verified copy
+# per node read without extraction, and the space back after deletion.
 #
 # It runs against the RUNNING two-Mac cluster in $KUBECONFIG and installs nothing. The
 # driver has already installed the build under test on both Macs. Surfaces: kubectl,
@@ -42,8 +42,12 @@
 #         Ready
 #   t.4   a client Pod on each Mac (script by ConfigMap) POSTs /v1/chat/completions
 #         to the other Mac's replica through its Service: non-empty content, both ways
-#   t.5   `kubectl exec` in each serving Pod: https to the Hub fails while a control
-#         Pod with the egress annotation, same image and node, reaches it; a write
+#   t.5   no download from the internet: each serving Pod, read again, carries no
+#         egress annotation and reads its weights from the cluster registry by
+#         digest; `kubectl exec` in it sees HF_HUB_OFFLINE=1, an empty or absent Hub
+#         cache, and no Hub fetch (a models--* entry or an *.incomplete file) in the
+#         Pod's working tree, its HF_HOME or its Hub cache, the weights mount
+#         aside. Native pods have no egress deny, so reach is not tested. A write
 #         to the mounted weights fails with EPERM; an exec of a mounted file fails
 #         (errno RECORDED: EPERM is the profile, EACCES the mode); RECORDED as a
 #         stated negative, a copied and chmod +x'ed file runs from the data volume.
@@ -57,13 +61,13 @@
 #         view is gone and free space on both caches and the registry store is back
 #         at t.0's within 1% of the model
 #   f.1   cleanup, green or red: the namespace (MLXModels, ConfigMap, client and
-#         control Pods), the pushed tag, the remote scratch dirs; each step that
+#         client Pods), the pushed tag, the remote scratch dirs; each step that
 #         fails is named and fails the run
 #   t.8   after f.1: `kubectl get ns` recorded, no leftover object of the run, both
 #         nodes Ready, each Mac on the build t.0 recorded
 #
 # A green t.4 with a red t.5 is the failure this tracer exists to catch: a model served
-# while the pod still reaches the internet proves nothing about the store.
+# by a pod that had the Hub online, or shows a Hub fetch, proves nothing about the store.
 #
 # Free space is `df -k` Avail of the volume, and each reading carries a digest of
 # `tmutil listlocalsnapshots` for that volume: two readings compare only when no local
@@ -123,7 +127,6 @@ REG_HOST="registry-k3sm:6450"
 MOUNT="/var/lib/mlx/model"
 EGRESS_ANNOTATION="k3sm.io/internet-egress"
 GPU_LABEL="mlx.k3sm.io/gpu.present"
-HUB_URL="https://huggingface.co"
 
 RUNGS=(
 	"p.0|preconditions, read-only; a refusal exits 3 with the rig untouched"
@@ -133,7 +136,7 @@ RUNGS=(
 	"t.3|both Ready; resolvedArtifact = the pushed digest; image volume by digest, no PVC, no egress, no trust_remote_code; cold time, fetch rate, peak footprint vs spec.memory"
 	"t.3b|kickstart the worker's node daemon mid-pull: the partial survives, the blob commits, the replica is Ready"
 	"t.4|a client Pod on each Mac gets a non-empty completion from the other Mac's replica"
-	"t.5|in-pod: no egress (control reaches it), write EPERM, exec fails; on each Mac one view of clones (inode, dev, blocks, 0444, root)"
+	"t.5|no download from the internet: no egress annotation, weights by digest, HF_HUB_OFFLINE=1, empty Hub cache, no Hub fetch in the pod's tree; write EPERM, exec fails; on each Mac one view of clones (inode, dev, blocks, 0444, root)"
 	"t.6|three replicas, two on the server Mac: free-space drop under 1% of the model, same view; warm time"
 	"t.7|delete, prune both Macs, model rm, registry prune: views gone, free space back within 1% on both caches and the registry store"
 	"f.1|cleanup green or red: namespace, MLXModels, ConfigMap, Pods, the pushed tag, remote scratch"
@@ -826,17 +829,68 @@ try:
 except OSError as e:
     print("COPYRUN-DENIED %d" % e.errno)
 '
+# PROBE_HUB <mount>: the Hub is offline for this container and nothing in its tree
+# shows a Hub fetch. HF_HUB_OFFLINE must be exactly 1. The Hub cache is resolved the
+# way huggingface_hub resolves it (HF_HUB_CACHE, else HUGGINGFACE_HUB_CACHE, else
+# HF_HOME/hub, HF_HOME defaulting to $XDG_CACHE_HOME or ~/.cache, then huggingface)
+# and must be absent or empty. Each path is read as given and again under the working
+# directory, where a native pod's mounts are materialized. The walk covers the working
+# directory, HF_HOME and the Hub cache, prunes the weights mount, and flags a models--*
+# entry or an *.incomplete file; it stops red past 200000 entries.
+PROBE_HUB='import os, sys
+mount = os.path.normpath(sys.argv[1])
+env = os.environ
+print("HUB-OFFLINE " + (env.get("HF_HUB_OFFLINE") or "unset"))
+home = env.get("HF_HOME") or os.path.join(env.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache"), "huggingface")
+hub = env.get("HF_HUB_CACHE") or env.get("HUGGINGFACE_HUB_CACHE") or os.path.join(home, "hub")
+def forms(p):
+    p = os.path.normpath(p)
+    return [p, "." + p] if p.startswith("/") else [p]
+dirty = []
+for c in forms(hub):
+    if os.path.isdir(c):
+        n = os.listdir(c)
+        print("HUB-CACHE %s %s" % (c, "empty" if not n else "holds " + " ".join(sorted(n)[:5])))
+        if n:
+            dirty.append("cache " + c)
+    else:
+        print("HUB-CACHE %s absent" % c)
+skip = set(os.path.realpath(c) for c in forms(mount))
+seen, walked, cap = set(), 0, 200000
+for root in ["."] + forms(home) + forms(hub):
+    if not os.path.isdir(root) or os.path.realpath(root) in seen:
+        continue
+    seen.add(os.path.realpath(root))
+    for d, dirs, files in os.walk(root):
+        dirs[:] = [x for x in dirs if os.path.realpath(os.path.join(d, x)) not in skip]
+        for x in dirs + files:
+            walked += 1
+            if x.startswith("models--") or x.endswith(".incomplete"):
+                dirty.append("fetch " + os.path.join(d, x))
+        if walked > cap:
+            break
+print("HUB-WALKED %d" % walked)
+if walked > cap:
+    dirty.append("walk passed %d entries" % cap)
+for x in dirty[:20]:
+    print("HUB-DIRTY " + x)
+print("HUB-CLEAN" if not dirty else "HUB-NOT-CLEAN %d" % len(dirty))
+'
 
 t5() {
-	local m pod node out first ph logs h cache errno
+	local m pod node out first h cache errno
 	first="$(head -n 1 <<<"$FILES" | awk '{print $3}')"
-	pod_json mst-egress-control "$SNODE" "[\"$PYBIN\",\"/probe/egress.py\",\"$HUB_URL\"]" "{\"$EGRESS_ANNOTATION\":\"true\"}" >"$EV/t.5.control.json"
-	out="$(kc apply -f - <"$EV/t.5.control.json" 2>&1)" || { bad "apply the egress control: $out"; return 1; }
 	for m in "$MA" "$MB"; do
 		pod="$m-0"
-		out="$(kc exec -n "$NS" "$pod" -- "$PYBIN" -c "$EGRESS_PY" "$HUB_URL" 2>&1 || true)"
-		printf '%s\n' "$out" >"$EV/t.5.$pod.egress"
-		case "$out" in *EGRESS-BLOCKED*) ;; *) bad "$pod reaches $HUB_URL (egress is on): $(tail -n 1 <<<"$out")"; return 1 ;; esac
+		node="$SNODE"
+		[ "$m" = "$MA" ] || node="$WNODE"
+		kc get pods -n "$NS" -l "app.kubernetes.io/instance=$m" -o json >"$EV/t.5.$m.pods.json" || { bad "read $m pods"; return 1; }
+		out="$(pod_checks "$EV/t.5.$m.pods.json" "$DIGEST" "$node" 1)" || { bad "$m: $out"; return 1; }
+		out="$(kc exec -n "$NS" "$pod" -- "$PYBIN" -c "$PROBE_HUB" "$MOUNT" 2>&1 || true)"
+		printf '%s\n' "$out" >"$EV/t.5.$pod.hub"
+		grep -qx 'HUB-OFFLINE 1' <<<"$out" || { bad "$pod: the Hub is not offline ($(grep -m 1 '^HUB-OFFLINE' <<<"$out" || tail -n 1 <<<"$out"))"; return 1; }
+		grep -qx 'HUB-CLEAN' <<<"$out" || { bad "$pod: the Hub cache is not empty or the tree shows a Hub fetch: $(grep -m 1 '^HUB-DIRTY' <<<"$out" || tail -n 1 <<<"$out")"; return 1; }
+		measure "t5_${m}_tree_entries_walked" "$(awk '$1 == "HUB-WALKED" {print $2}' <<<"$out")"
 		out="$(kc exec -n "$NS" "$pod" -- "$PYBIN" -c "$PROBE_WRITE" "$MOUNT/$first" 2>&1 || true)"
 		printf '%s\n' "$out" >"$EV/t.5.$pod.write"
 		errno="$(awk '$1 == "WRITE-ERRNO" {print $2}' <<<"$out")"
@@ -854,10 +908,6 @@ t5() {
 		printf '%s\n' "$out" >"$EV/t.5.$pod.copyrun"
 		measure "t5_${m}_copied_chmod_x_file" "$(grep -o 'COPYRUN-[A-Z]*' <<<"$out" | head -n 1 || echo unread)"
 	done
-	ph="$(wait_done mst-egress-control)" || { bad "the egress control did not finish ($ph)"; return 1; }
-	logs="$(kc logs mst-egress-control -n "$NS" 2>&1 || true)"
-	printf '%s\n' "$logs" >"$EV/t.5.control.log"
-	case "$logs" in *EGRESS-REACHED*) ;; *) bad "the control Pod with $EGRESS_ANNOTATION cannot reach $HUB_URL either, so the negative proves nothing"; return 1 ;; esac
 	for h in "$SERVER|$SCACHE|s" "$WORKER|$WCACHE|w"; do
 		IFS='|' read -r h cache node <<<"$h"
 		view_read "$h" "$cache" "$EV/t.5.view.$node" || { bad "read the view on $h"; return 1; }
@@ -1058,7 +1108,7 @@ write_fakes() { # <bin dir> <fake.py>
 	local bin="$1" fpy="$2" t
 	mkdir -p "$bin"
 	cat >"$fpy" <<'PY'
-import datetime, hashlib, json, os, shutil, stat, sys, time
+import datetime, hashlib, json, os, shutil, stat, subprocess, sys, time
 ST = os.environ["FAKE_STATE"]
 BRK = set(x for x in os.environ.get("FAKE_BREAK", "").split(",") if x)
 NODES = {}
@@ -1211,6 +1261,32 @@ def reconcile(s):
 def out(v):
     print(json.dumps(v))
 
+def hub_probe(pod, argv):
+    # Runs the real in-pod probe in a fake pod tree: the working directory is the
+    # pod data volume with the weights mount materialized under it, HF_HOME is
+    # the image's empty /models seen under the working directory. Each mutant
+    # plants what a pod with the Hub online, or after a Hub fetch, would show.
+    cwd = os.path.join(ST, "pods", pod)
+    if not os.path.isdir(cwd):
+        w = os.path.join(cwd, "var", "lib", "mlx", "model")
+        os.makedirs(w)
+        open(os.path.join(w, "model.safetensors"), "w").write("w")
+        os.makedirs(os.path.join(w, "models--decoy--in-the-mount"))
+        os.makedirs(os.path.join(cwd, "models"))
+        os.makedirs(os.path.join(cwd, "tmp"))
+        if "hub-cache-full" in BRK:
+            os.makedirs(os.path.join(cwd, "models", "hub", ".locks"))
+        if "hub-fetch" in BRK:
+            b = os.path.join(cwd, "tmp", "dl", "blobs")
+            os.makedirs(b)
+            open(os.path.join(b, "0" * 64 + ".incomplete"), "w").close()
+    env = {"PATH": os.environ.get("PATH", ""), "HOME": cwd, "HF_HOME": "/models"}
+    if "hub-online" not in BRK:
+        env["HF_HUB_OFFLINE"] = "1"
+    r = subprocess.run([sys.executable, "-I"] + argv[1:], cwd=cwd, env=env, capture_output=True, text=True)
+    sys.stdout.write(r.stdout + r.stderr)
+    return r.returncode
+
 def kubectl(argv):
     s = jload("k8s.json", {"ns": [], "objs": {}, "pods": {}, "pulled": {}})
     flags, pos, i = {}, [], 0
@@ -1319,16 +1395,10 @@ def kubectl(argv):
         name = pos[1]
         if name.startswith("mst-client"):
             print("COMPLETION-EMPTY" if "empty-completion" in BRK else "COMPLETION-OK 12")
-        elif name == "mst-egress-control":
-            print("EGRESS-BLOCKED URLError" if "control-blocked" in BRK else "EGRESS-REACHED")
     elif verb == "exec":
         code = " ".join(dash)
-        if "urlopen" in code:
-            if "egress-open" in BRK:
-                print("EGRESS-REACHED")
-            else:
-                print("EGRESS-BLOCKED URLError")
-                rc = 1
+        if "HUB-OFFLINE" in code:
+            rc = hub_probe(pos[1], dash)
         elif "WRITE-" in code:
             print("WRITE-OK" if "write-ok" in BRK else "WRITE-ERRNO 13" if "write-eacces" in BRK else "WRITE-ERRNO 1")
         elif "EXEC-" in code:
@@ -1560,6 +1630,9 @@ self_test() {
 	has "happy: cold rate recorded" "$(cat "$RUN_DIR/ev/measurements.tsv")" cold_fetch_bytes_per_second
 	has "happy: warm time recorded" "$(cat "$RUN_DIR/ev/measurements.tsv")" warm_ready_seconds
 	has "happy: footprint vs memory" "$(cat "$RUN_DIR/ev/measurements.tsv")" peak_footprint_over_spec_memory
+	has "happy: the Hub probe ran in the pod" "$(cat "$RUN_DIR/ev/"t.5.*-0.hub)" "HUB-OFFLINE 1"
+	has "happy: the Hub cache read under the pod" "$(cat "$RUN_DIR/ev/"t.5.*-0.hub)" "HUB-CACHE ./models/hub absent"
+	if grep -q 'decoy' "$RUN_DIR/ev/"t.5.*-0.hub; then echo "self-test FAIL: happy: the Hub walk entered the weights mount"; bad=1; fi
 	has "happy: the kickstart landed" "$(cat "$RUN_DIR/state/calls")" "wrk launchctl kickstart -k system/io.k3sm.agent"
 
 	# Each rung's failure is caught, the run is red naming it, and f.1 still cleans.
@@ -1568,16 +1641,18 @@ self_test() {
 		"version-fails|t.0" "push-digest|t.1" "push-bytes|t.1" "apply-refused|t.2" "create-refused|t.2" \
 		"resolved-mismatch|t.3" "pvc|t.3" "egress-annotation|t.3" "trust-remote-code|t.3" \
 		"no-partial|t.3b" "kick-truncates|t.3b" "empty-completion|t.4" \
-		"egress-open|t.5" "control-blocked|t.5" "write-ok|t.5" "write-eacces|t.5" "exec-ok|t.5" "view-hardlink|t.5" "view-twice|t.5" \
+		"hub-online|t.5" "hub-cache-full|t.5" "hub-fetch|t.5" "write-ok|t.5" "write-eacces|t.5" "exec-ok|t.5" "view-hardlink|t.5" "view-twice|t.5" \
 		"scale-copies|t.6" "prune-keeps|t.7" "registry-keeps|t.7"; do
 		brk="${row%|*}" rung="${row#*|}"
 		fake_run "$brk" "$brk" 1 "result: FAIL ($rung)"
 		cleaned "$brk"
 	done
-	# The case this tracer exists for: served (t.4 green) while egress is open is red.
-	fake_run egress-open-again egress-open 1 "result: FAIL (t.5)"
-	has "egress open: t.4 passed first" "$(cat "$RUN_DIR/out")" "t.4: PASS"
-	has "egress open: later rungs not reached" "$(cat "$RUN_DIR/ev/result.tsv")" "$(printf 't.6\tNOT-REACHED')"
+	# The case this tracer exists for: served (t.4 green) with the Hub online is red.
+	fake_run hub-online-again hub-online 1 "result: FAIL (t.5)"
+	has "hub online: t.4 passed first" "$(cat "$RUN_DIR/out")" "t.4: PASS"
+	has "hub online: named" "$(cat "$RUN_DIR/out")" "the Hub is not offline (HUB-OFFLINE unset)"
+	has "hub online: later rungs not reached" "$(cat "$RUN_DIR/ev/result.tsv")" "$(printf 't.6\tNOT-REACHED')"
+	fake_run hub-fetch-again hub-fetch 1 "shows a Hub fetch: HUB-DIRTY fetch ./tmp/dl/blobs/"
 
 	# A cleanup that cannot remove the namespace fails a run whose rungs all passed.
 	fake_run ns-stuck ns-stuck 1 "f.1: FAIL"
