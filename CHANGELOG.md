@@ -12,6 +12,10 @@ pin, its date, and the tarball's sha256.
 
 ### Added
 
+- `k3sm status` tells a control plane that is waiting between slow start attempts on a loaded Mac from
+  one that keeps failing: the server row's `wide` gains `crash-loop-phase` (`backing-off` or
+  `attempting`) and `crash-loop-next-attempt`, and the alert names the next attempt. `crash-loop`
+  still reads `restarting`. See [the status JSON](docs/user/status-json.md#daemon-row-states).
 - `sudo k3sm network lan on --for <duration>` turns LAN access on for at most 24h, after which the
   node daemon turns it off by itself. See [LAN access](docs/user/install.md#lan-access).
 - `sudo k3sm network lan status` lists the sockets on this Mac a LAN peer can reach that LAN access
