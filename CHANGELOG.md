@@ -16,8 +16,9 @@ pin, its date, and the tarball's sha256.
   cache, a dry run unless `--force`, keeping every blob a pod, a root, an in-flight ingest or another
   cached image still needs and listing each kept blob with its reason; it never touches the cluster
   registry. `--platform` narrows a reference, `-o json` prints the report as one document, and a
-  node daemon too old to serve it deletes nothing and says to upgrade. See
-  [Reclaiming Space](docs/user/images.md#reclaiming-space-k3sm-image-prune).
+  node daemon too old to serve it deletes nothing and says to upgrade. Any failure exits 1, and `rm`
+  is not a variant of `prune`: it never falls back to it. See
+  [Evicting One Image](docs/user/images.md#evicting-one-image-k3sm-image-rm).
 - `sudo k3sm network lan on --for <duration>` turns LAN access on for at most 24h, after which the
   node daemon turns it off by itself. See [LAN access](docs/user/install.md#lan-access).
 - `sudo k3sm network lan status` lists the sockets on this Mac a LAN peer can reach that LAN access

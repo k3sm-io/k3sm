@@ -348,7 +348,6 @@ It is a dry run unless you pass `--force`.
 sudo k3sm image prune                 # report what would go
 sudo k3sm image prune --force         # delete it
 sudo k3sm image prune -o json         # the same report as one JSON document
-sudo k3sm image rm <ref|digest> --force  # evict one image from this node's cache only (dry run without --force)
 ```
 
 In the registry it deletes untagged manifests: what is left behind when a tag is pushed again
@@ -384,6 +383,30 @@ the `sweep` a forced prune ran (`repositories`, `blobs`, `bytes`, and any `stopp
 `reviewing` repositories and `error`).
 `cache` holds `blobs`, `reclaimedBytes` and `kept` (counts by reason). The command exits non-zero
 when any deletion fails, after printing the report.
+
+## Evicting One Image: `k3sm image rm`
+
+`k3sm image rm` removes one named image or artifact manifest from this node's cache. Unlike
+`prune`, which evicts everything no Pod uses, it acts on the one reference or digest you name.
+
+```sh
+sudo k3sm image rm <ref|digest>                       # report what would go
+sudo k3sm image rm <ref|digest> --force               # evict it
+sudo k3sm image rm <ref> --platform linux/arm64       # one platform entry of a reference
+sudo k3sm image rm <ref|digest> -o json               # the report as one JSON document
+```
+
+Without `--force` it only reports what it would evict and deletes nothing. It never touches
+the cluster registry. The node's runtime daemon keeps every blob that a Pod, a root, an
+in-flight ingest or another cached image still needs, and the report lists each kept blob with
+the reason, and says the eviction was partial when any blob is kept. The text report shows at
+most 20 kept blobs; `-o json` lists them all. `--platform` narrows a reference that has several
+platform entries, and the command refuses it together with a digest, since a digest already
+names one manifest. The command exits 1 on any failure. A node whose runtime daemon is too old
+to serve `rm` deletes nothing and tells you to upgrade it; `rm` never falls back to `prune`.
+
+The `-o json` document has the keys `manifestDigest`, `dryRun` (true without `--force`),
+`removedDigests`, `kept` (each blob with its `digest` and `reason`) and `reclaimedBytes`.
 
 ## Pushing to a Registry: `k3sm image push`
 
