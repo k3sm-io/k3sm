@@ -272,6 +272,13 @@ type pruneJSON struct {
 			Size       int64  `json:"size"`
 			Error      string `json:"error"`
 		} `json:"failed"`
+		Interrupted bool `json:"interrupted"`
+		Unattempted []struct {
+			Repository string `json:"repository"`
+			Digest     string `json:"digest"`
+			MediaType  string `json:"mediaType"`
+			Size       int64  `json:"size"`
+		} `json:"unattempted"`
 		Sweep *struct {
 			Repositories []string `json:"repositories"`
 			Manifests    int      `json:"manifests"`
@@ -895,5 +902,135 @@ func TestImagePruneReportsRecheckSkips(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestImagePruneForceStopsOnCancel proves a forced prune whose context is
+// cancelled (Ctrl+C) stops deleting at once: the manifests it had not reached
+// are reported as unattempted, not as failed deletions, the report says it was
+// interrupted, the deletions it made are still swept under a context the
+// cancellation does not reach, and the command returns the cancellation after
+// the report. The deleter cancels the context on its first call, as a Ctrl+C
+// during the first DELETE would, and that DELETE succeeds.
+func TestImagePruneForceStopsOnCancel(t *testing.T) {
+	for _, output := range []string{"json", "table"} {
+		t.Run(output, func(t *testing.T) {
+			workDir := t.TempDir()
+			reg := serveFakePruneRegistry(t, workDir)
+			f := buildPruneFixture(t, workDir)
+			sock := serveFakeImages(t, &fakeImagesDaemon{pruneResp: &runtimev1.PruneImagesResponse{}})
+			args := []string{"--socket", sock, "--work-dir", workDir, "prune", "--force"}
+			if output == "json" {
+				args = append(args, "-o", "json")
+			}
+			opts, err := parseImageArgs(args, io.Discard)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var calls int
+			del := func(ctx context.Context, rf name.Digest, state string, auth authn.Authenticator) error {
+				calls++
+				cancel()
+				return reg.delete(ctx, rf, state, auth)
+			}
+			var sweepCtxErr error
+			collect := func(ctx context.Context, authority string, deleted []registrysvc.StoredManifest, cred registrysvc.Credential) (registrysvc.CollectResult, error) {
+				sweepCtxErr = ctx.Err()
+				return reg.collect(ctx, authority, deleted, cred)
+			}
+			var out bytes.Buffer
+			err = imageCommandWith(ctx, opts, &out, dialRuntimed, del, collect)
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("err = %v; want the cancellation", err)
+			}
+			if errors.Is(err, errPruneIncomplete) {
+				t.Errorf("err = %v; an unattempted delete is not a failed one", err)
+			}
+			if calls != 1 {
+				t.Errorf("deleter called %d times; want 1, nothing after the cancel", calls)
+			}
+			wantCollect := registrysvc.LoopbackAuthority(fakePruneRegistryPort) + " k3sm [app]"
+			if strings.Join(reg.collects, ";") != wantCollect {
+				t.Errorf("collects %v; want one sweep of the confirmed delete, %q", reg.collects, wantCollect)
+			}
+			if sweepCtxErr != nil {
+				t.Errorf("the sweep ran under a done context: %v", sweepCtxErr)
+			}
+
+			if output == "table" {
+				for _, w := range []string{
+					"  deleted app@" + f.overwritten + " (untagged)\n",
+					"  deleted 1 untagged manifest(s);",
+					"  interrupted: 2 planned manifest(s) not attempted; run prune again to delete them\n",
+				} {
+					if !strings.Contains(out.String(), w) {
+						t.Errorf("table missing %q:\n%s", w, out.String())
+					}
+				}
+				if strings.Contains(out.String(), "could not delete") {
+					t.Errorf("table reports a failed deletion:\n%s", out.String())
+				}
+				return
+			}
+			doc := decodePrune(t, out.String())
+			if len(doc.Registry.Failed) != 0 {
+				t.Errorf("report failed = %+v; want none", doc.Registry.Failed)
+			}
+			if got := manifestList(doc); strings.Join(got, ",") != "app@"+f.overwritten {
+				t.Errorf("report manifests = %v; want only app@%s", got, f.overwritten)
+			}
+			if !doc.Registry.Interrupted {
+				t.Errorf("report interrupted = false")
+			}
+			var unattempted []string
+			for _, m := range doc.Registry.Unattempted {
+				unattempted = append(unattempted, m.Repository+"@"+m.Digest)
+			}
+			if want := []string{"multi@" + f.oldIndex, "multi@" + f.oldLeaf}; strings.Join(unattempted, ",") != strings.Join(want, ",") {
+				t.Errorf("report unattempted = %v; want %v", unattempted, want)
+			}
+		})
+	}
+}
+
+// TestImagePruneForceContinuesPastAServerError proves one deletion the
+// registry answers with a server error does not stop the rest: it is listed
+// under failed, the other two are deleted, and the command exits non-zero.
+func TestImagePruneForceContinuesPastAServerError(t *testing.T) {
+	workDir := t.TempDir()
+	reg := serveFakePruneRegistry(t, workDir)
+	f := buildPruneFixture(t, workDir)
+	sock := serveFakeImages(t, &fakeImagesDaemon{pruneResp: &runtimev1.PruneImagesResponse{}})
+	opts, err := parseImageArgs([]string{"--socket", sock, "--work-dir", workDir, "prune", "--force", "-o", "json"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls int
+	del := func(ctx context.Context, rf name.Digest, state string, auth authn.Authenticator) error {
+		calls++
+		if calls == 2 {
+			return errors.New("unexpected status code 503 Service Unavailable")
+		}
+		return reg.delete(ctx, rf, state, auth)
+	}
+	var out bytes.Buffer
+	err = imageCommandWith(t.Context(), opts, &out, dialRuntimed, del, reg.collect)
+	if !errors.Is(err, errPruneIncomplete) {
+		t.Fatalf("err = %v; want errPruneIncomplete", err)
+	}
+	if calls != 3 {
+		t.Errorf("deleter called %d times; want all 3", calls)
+	}
+	doc := decodePrune(t, out.String())
+	if len(doc.Registry.Failed) != 1 || doc.Registry.Failed[0].Digest != f.oldIndex {
+		t.Errorf("failed = %+v; want the one 503", doc.Registry.Failed)
+	}
+	if want := []string{"app@" + f.overwritten, "multi@" + f.oldLeaf}; strings.Join(manifestList(doc), ",") != strings.Join(want, ",") {
+		t.Errorf("manifests = %v; want %v", manifestList(doc), want)
+	}
+	if doc.Registry.Interrupted || len(doc.Registry.Unattempted) != 0 {
+		t.Errorf("a server error read as an interruption: %+v", doc.Registry)
 	}
 }
