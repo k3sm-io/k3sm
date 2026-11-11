@@ -20,8 +20,11 @@
 #         no untolerated taint, the CRD carries spec.artifact and
 #         status.resolvedArtifact, the node caches hold none of the model's blobs (the
 #         cold rung needs a cold cache). A refusal exits 3 with the rig untouched.
-#   t.0   `k3sm version` on both Macs and the tree's commit; `kubectl get nodes`;
-#         free space of both node caches and of the registry store (the baseline)
+#   t.0   `k3sm version` on both Macs and of the pushing binary on this host, and the
+#         tree's commit: red when the three builds differ (every line of the version
+#         but platform:), or when they carry a commit that is not the tree's HEAD (with
+#         no commit line the HEAD is recorded only); `kubectl get nodes`; free space
+#         of both node caches and of the registry store (the baseline)
 #   t.1   `k3sm model push <dir> <run>:v1`, then the same push again: the same
 #         digest, and the registry's blob files for the repository unchanged (names,
 #         inodes, sizes and mtimes), so the second push wrote zero bytes
@@ -67,9 +70,14 @@
 #         at t.0's within 1% of the model
 #   f.1   cleanup, green or red: the namespace (MLXModels, ConfigMap, client and
 #         client Pods), the pushed tag, the remote scratch dirs; each step that
-#         fails is named and fails the run
+#         fails is named and fails the run. Each is marked for cleanup BEFORE the
+#         call that makes it, so a call that times out after the server acted is
+#         still undone, and one never made reads as already gone. INT and TERM are
+#         logged, not obeyed, until f.1 and t.8 end, so a second Ctrl-C cannot skip
+#         the cleanup.
 #   t.8   after f.1: `kubectl get ns` recorded, no leftover object of the run, both
-#         nodes Ready, each Mac on the build t.0 recorded
+#         nodes Ready, each Mac on the build t.0 recorded; one `end state:` line
+#         names the build the rig is left on and each node's Ready
 #
 # A green t.4 with a red t.5 is the failure this tracer exists to catch: a model served
 # by a pod that had the Hub online, or shows a Hub fetch, proves nothing about the store.
@@ -111,6 +119,11 @@
 #   KUBECTL                      kubectl binary (default kubectl)
 #   K3SM_LAB_TOLERATE_KEYS       extra taint keys every pod tolerates with Exists
 #
+# Evidence: --evidence DIR must resolve (symlinks and .. resolved) strictly below a
+# directory named k3sm-io.scratch, or p.0 refuses before anything touches the rig.
+# There is no override. --self-test meets the rule as written: its fake runs keep
+# their evidence under a k3sm-io.scratch directory inside its own mktemp tree.
+#
 # Exit: 0 every rung held and the cleanup was clean; 1 a rung or the cleanup failed
 # (the run log names it); 2 usage; 3 not run (K3SM_LAB unset or a p.0 refusal), the
 # rig untouched.
@@ -132,10 +145,12 @@ REG_HOST="registry-k3sm:6450"
 MOUNT="/var/lib/mlx/model"
 EGRESS_ANNOTATION="k3sm.io/internet-egress"
 GPU_LABEL="mlx.k3sm.io/gpu.present"
+# --evidence must resolve below a directory of this name (under_scratch).
+SCRATCH_DIRNAME="k3sm-io.scratch"
 
 RUNGS=(
 	"p.0|preconditions, read-only; a refusal exits 3 with the rig untouched"
-	"t.0|k3sm version on both Macs and the tree's commit; nodes; free-space baseline (caches, registry store)"
+	"t.0|k3sm version on both Macs and of the pushing binary, red when they differ or name a commit that is not the tree's HEAD; nodes; free-space baseline (caches, registry store)"
 	"t.1|model push, then push again: same digest, zero bytes written to the registry"
 	"t.2|one MLXModel per Mac on the one artifact (hostname-pinned, no egress, no cache)"
 	"t.3|both Ready; resolvedArtifact = the pushed digest; image volume by digest, no PVC, no egress, no trust_remote_code; cold time, fetch rate, peak footprint vs spec.memory"
@@ -145,7 +160,7 @@ RUNGS=(
 	"t.6|three replicas, two on the server Mac: free-space drop under 1% of the model, same view; warm time"
 	"t.7|delete, prune both Macs, model rm, registry prune: views gone, free space back within 1% on both caches and the registry store"
 	"f.1|cleanup green or red: namespace, MLXModels, ConfigMap, Pods, the pushed tag, remote scratch"
-	"t.8|kubectl get ns recorded; no leftover; both nodes Ready on the build t.0 recorded"
+	"t.8|kubectl get ns recorded; no leftover; both nodes Ready on the build t.0 recorded; one line states the build and Ready the rig is left on"
 )
 
 plan() {
@@ -171,7 +186,13 @@ bounded() {
 		wait "$s" && kill "$pid" 2>/dev/null
 	) >/dev/null 2>&1 &
 	watchdog=$!
-	wait "$pid" || rc=$?
+	# A handled INT or TERM (finish's, during the cleanup) interrupts wait with a
+	# status over 128 while the step still runs: wait again rather than drop it.
+	while :; do
+		rc=0
+		wait "$pid" || rc=$?
+		if [ "$rc" -le 128 ] || ! kill -0 "$pid" 2>/dev/null; then break; fi
+	done
 	kill "$watchdog" 2>/dev/null || true
 	wait "$watchdog" 2>/dev/null || true
 	return "$rc"
@@ -382,6 +403,33 @@ sys.exit(1 if errs else 0)
 # view_inodes <view lines>: `<rel> <ino>` per file, for comparing two readings.
 view_inodes() { awk '$1 == "F" { print $2, $3 }' "$1"; }
 
+# under_scratch <dir>: the dir, made absolute against the working directory, its
+# symlinks and .. resolved (a tail that does not exist yet taken as written), lies
+# strictly below a directory named $SCRATCH_DIRNAME. p.0 refuses any other --evidence.
+# The test seam is the path alone: --self-test roots its runs' evidence under a
+# $SCRATCH_DIRNAME directory in its mktemp tree. No flag or variable loosens it.
+under_scratch() {
+	py '
+import os, sys
+p = os.path.realpath(os.path.abspath(sys.argv[1]))
+sys.exit(0 if sys.argv[2] in p.split(os.sep)[:-1] else 1)
+' "$1" "$SCRATCH_DIRNAME"
+}
+
+# build_id <k3sm version output>: the build's identity, every line but platform:
+# (one release builds the pushing binary for this host's arch from the same commit).
+build_id() { grep -v '^[[:space:]]*platform:' <<<"$1" || true; }
+# version_commit <k3sm version output>: the commit it names, empty when none.
+version_commit() { awk '$1 == "commit:" {print $2; exit}' <<<"$1"; }
+# build_line <k3sm version output>: its first line, and its commit when it names one.
+build_line() {
+	local c
+	c="$(version_commit "$1")"
+	printf '%s%s' "$(head -n 1 <<<"$1")" "${c:+ (commit $c)}"
+}
+# oneline <text>: the text on one line.
+oneline() { tr '\n' ' ' <<<"$1" | sed 's/  */ /g; s/ $//'; }
+
 # within <a-kb> <b-kb> <tolerance-bytes>: |a-b| KiB is within the tolerance.
 within() {
 	local d=$((($1 - $2) * 1024))
@@ -418,7 +466,7 @@ RUN="" NS="" REPO="" TAG="" MA="" MB=""
 FILES="" MODEL_BYTES=0 BIG_HEX="" BIG_SIZE=0 DIGEST="" MHEX="" TOL=0
 TOUCHED=0 NS_MADE=0 PUSHED=0 TAG_REMOVED=0 WORK_MADE=0 WATCH_PID=""
 SHOST_LABEL="" WHOST_LABEL="" SIMG="" FAILED="" REACHED=""
-BASE_S="" BASE_W="" BASE_R="" VER_S="" VER_W=""
+BASE_S="" BASE_W="" BASE_R="" VER_S="" VER_W="" VER_L=""
 
 log() { echo "[mst] $*"; }
 # bad <why>: a rung's reason, to its log and the run's reason file.
@@ -548,10 +596,11 @@ p0() {
 	case "$STEP_TIMEOUT$READY_TIMEOUT$RECLAIM_TIMEOUT" in *[!0-9]*) refuse "a timeout is not a whole number of seconds" ;; esac
 	[ "$STEP_TIMEOUT" -le 240 ] || refuse "K3SM_MST_STEP_TIMEOUT is over 240"
 	for t in python3 shasum awk "$KUBECTL" "$LOCAL_K3SM"; do command -v "$t" >/dev/null 2>&1 || refuse "$t is not on PATH"; done
+	# The evidence dir: under scratch, then absent, or present and empty.
+	[ -n "$EV" ] || refuse "--evidence is required"
+	under_scratch "$EV" || refuse "evidence dir $EV is not under a $SCRATCH_DIRNAME directory (symlinks and .. resolved)"
 	TOLERATIONS="$(lab_tolerations_json NoSchedule)" || exit 2
 
-	# The evidence dir: absent, or present and empty.
-	[ -n "$EV" ] || refuse "--evidence is required"
 	if [ -e "$EV" ]; then
 		[ -d "$EV" ] || refuse "$EV is not a directory"
 		[ -z "$(ls -A "$EV")" ] || refuse "evidence dir $EV is not empty"
@@ -607,9 +656,28 @@ print(" ".join(t["key"] for t in d["spec"].get("taints", []) or [] if t.get("eff
 # ---- rungs ----------------------------------------------------------------------------
 
 t0() {
-	VER_S="$(ku "$SERVER" version 2>&1)" || { bad "k3sm version on the server: $VER_S"; return 1; }
-	VER_W="$(ku "$WORKER" version 2>&1)" || { bad "k3sm version on the worker: $VER_W"; return 1; }
-	printf 'server: %s\nworker: %s\ntree: %s\n' "$VER_S" "$VER_W" "$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)" | tee "$EV/t.0.versions"
+	local v head c
+	v="$(ku "$SERVER" version 2>&1)" || { bad "k3sm version on the server: $(oneline "$v")"; return 1; }
+	VER_S="$v"
+	v="$(ku "$WORKER" version 2>&1)" || { bad "k3sm version on the worker: $(oneline "$v")"; return 1; }
+	VER_W="$v"
+	v="$(bounded "$STEP_TIMEOUT" "$LOCAL_K3SM" version 2>&1)" || { bad "k3sm version of the pushing binary $LOCAL_K3SM: $(oneline "$v")"; return 1; }
+	VER_L="$v"
+	head="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+	printf 'server:\n%s\nworker:\n%s\npushing binary (%s):\n%s\ntree: %s\n' "$VER_S" "$VER_W" "$LOCAL_K3SM" "$VER_L" "$head" | tee "$EV/t.0.versions"
+	if [ "$(build_id "$VER_S")" != "$(build_id "$VER_W")" ] || [ "$(build_id "$VER_S")" != "$(build_id "$VER_L")" ]; then
+		bad "the builds differ: server [$(oneline "$VER_S")], worker [$(oneline "$VER_W")], pushing binary [$(oneline "$VER_L")]"
+		return 1
+	fi
+	c="$(version_commit "$VER_S")"
+	if [ -z "$c" ]; then
+		echo "the builds name no commit: the tree's HEAD is recorded, not compared"
+	elif [ "$head" = unknown ]; then
+		echo "the tree's HEAD is unknown: the builds' commit $c is recorded, not compared"
+	else
+		case "$head" in "$c"*) [ "${#c}" -ge 7 ] ;; *) false ;; esac ||
+			{ bad "the commit $c the builds carry is not the tree's HEAD $head"; return 1; }
+	fi
 	kc get nodes -o wide >"$EV/t.0.nodes" 2>&1 || { bad "kubectl get nodes"; return 1; }
 	BASE_S="$(df_read "$SERVER" "$SCACHE")" || { bad "free space of the server cache"; return 1; }
 	BASE_W="$(df_read "$WORKER" "$WCACHE")" || { bad "free space of the worker cache"; return 1; }
@@ -624,8 +692,10 @@ REPO_LS='d="$1/$2/blobs/sha256"; [ -d "$d" ] || exit 1; cd "$d" && for f in *; d
 t1() {
 	local out1 out2 d2 ls1 ls2
 	TOUCHED=1
-	out1="$(bounded "$((STEP_TIMEOUT * 2))" "$LOCAL_K3SM" model push "$MODEL_DIR" "$TAG" 2>&1)" || { bad "model push: $out1"; return 1; }
+	# Marked before the push: a push that times out after the registry took the tag
+	# still leaves it to f.1, which reads a tag never written as already gone.
 	PUSHED=1
+	out1="$(bounded "$((STEP_TIMEOUT * 2))" "$LOCAL_K3SM" model push "$MODEL_DIR" "$TAG" 2>&1)" || { bad "model push: $out1"; return 1; }
 	echo "$out1"
 	DIGEST="$(awk '$1 == "digest:" {print $2}' <<<"$out1")"
 	case "$DIGEST" in sha256:????????????????????????????????????????????????????????????????) ;; *) bad "model push printed no digest"; return 1 ;; esac
@@ -657,11 +727,13 @@ JSON
 
 t2() {
 	local out
-	out="$(kc create namespace "$NS" 2>&1)" || { bad "create namespace: $out"; return 1; }
+	# Each marked before the call that makes it (a timeout after the server acted
+	# still leaves it to f.1); f.1 reads one never made as already gone.
 	NS_MADE=1
+	out="$(kc create namespace "$NS" 2>&1)" || { bad "create namespace: $out"; return 1; }
+	WORK_MADE=1
 	rroot "$WORKER" "$STEP_TIMEOUT" 'mkdir -p "$1" && chmod 700 "$1"' "$WWORK" || { bad "make the worker scratch"; return 1; }
 	rroot "$SERVER" "$STEP_TIMEOUT" 'mkdir -p "$1" && chmod 700 "$1"' "$SWORK" || { bad "make the server scratch"; return 1; }
-	WORK_MADE=1
 	bounded "$((READY_TIMEOUT + 60))" rsh_raw "$WORKER" "sudo -n /bin/bash -c $(printf '%q' "$WATCH_SCRIPT") mst $(quoted "$WCACHE" "$BIG_HEX" "$BIG_SIZE" "$WORKER_LABEL" "$READY_TIMEOUT" "$POLL" "$WWORK")" >"$EV/t.3b.watch" 2>&1 &
 	WATCH_PID=$!
 	mlxmodel_json "$MA" "$SHOST_LABEL" 1 >"$EV/t.2.$MA.json"
@@ -1032,6 +1104,7 @@ f1() {
 		WATCH_PID=""
 	fi
 	if [ "$NS_MADE" = 1 ]; then
+		# A NotFound delete is clean: the get below is the verdict.
 		kc delete namespace "$NS" --wait=false >/dev/null 2>&1 || true
 		end=$(($(date +%s) + READY_TIMEOUT))
 		while kc get namespace "$NS" -o name >/dev/null 2>&1; do
@@ -1040,7 +1113,15 @@ f1() {
 		done
 	fi
 	if [ "$PUSHED" = 1 ] && [ "$TAG_REMOVED" = 0 ]; then
-		if out="$(ku "$SERVER" model rm "$TAG" 2>&1)"; then TAG_REMOVED=1; else bad "f.1: model rm $TAG: $out"; rc=1; fi
+		if out="$(ku "$SERVER" model rm "$TAG" 2>&1)"; then
+			TAG_REMOVED=1
+		elif case "$out" in *"not in the cluster registry"*) true ;; *) false ;; esac; then
+			TAG_REMOVED=1
+			echo "f.1: $TAG is not in the registry (never written, or already removed)"
+		else
+			bad "f.1: model rm $TAG: $out"
+			rc=1
+		fi
 	fi
 	if [ "$WORK_MADE" = 1 ]; then
 		# shellcheck disable=SC2016 # expands remotely
@@ -1051,20 +1132,38 @@ f1() {
 	return "$rc"
 }
 
+# node_ready <node>: the node's Ready status, empty when unread.
+node_ready() {
+	kc get node "$1" -o json 2>/dev/null | py 'import json,sys; print([c["status"] for c in json.loads(sys.stdin.read())["status"]["conditions"] if c["type"]=="Ready"][0])' 2>/dev/null || true
+}
+
+# end_build <host> <what> <t.0's version>: the host's build now, as one line; a build
+# unread or changed since t.0 is a reason.
+end_build() {
+	local v
+	v="$(ku "$1" version 2>&1)" || { bad "k3sm version on the $2 at the end: $(oneline "$v")"; echo "unreadable"; return 1; }
+	[ -z "$3" ] || [ "$v" = "$3" ] || { bad "the $2's build changed during the run: [$(oneline "$3")] then [$(oneline "$v")]"; build_line "$v"; return 1; }
+	build_line "$v"
+}
+
 t8() {
-	local n st v
-	kc get ns >"$EV/t.8.namespaces" 2>&1 || { bad "kubectl get ns"; return 1; }
+	local rc=0 rs rw bs bw line
+	kc get ns >"$EV/t.8.namespaces" 2>&1 || { bad "kubectl get ns"; rc=1; }
 	cat "$EV/t.8.namespaces"
-	! grep -q "^$NS " "$EV/t.8.namespaces" || { bad "namespace $NS is left"; return 1; }
-	[ -z "$(kc get mlxmodel -A -o name 2>/dev/null | grep -F "$RUN" || true)" ] || { bad "an MLXModel of the run is left"; return 1; }
-	for n in "$SNODE" "$WNODE"; do
-		st="$(kc get node "$n" -o json 2>/dev/null | py 'import json,sys; print([c["status"] for c in json.loads(sys.stdin.read())["status"]["conditions"] if c["type"]=="Ready"][0])' 2>/dev/null || true)"
-		[ "$st" = True ] || { bad "node $n is not Ready at the end"; return 1; }
-	done
-	v="$(ku "$SERVER" version 2>&1)" || { bad "k3sm version on the server at the end: $v"; return 1; }
-	[ "$v" = "$VER_S" ] || { bad "the server's build changed during the run"; return 1; }
-	v="$(ku "$WORKER" version 2>&1)" || { bad "k3sm version on the worker at the end: $v"; return 1; }
-	[ "$v" = "$VER_W" ] || { bad "the worker's build changed during the run"; return 1; }
+	! grep -q "^$NS " "$EV/t.8.namespaces" || { bad "namespace $NS is left"; rc=1; }
+	[ -z "$(kc get mlxmodel -A -o name 2>/dev/null | grep -F "$RUN" || true)" ] || { bad "an MLXModel of the run is left"; rc=1; }
+	rs="$(node_ready "$SNODE")"
+	rw="$(node_ready "$WNODE")"
+	[ "$rs" = True ] || { bad "node $SNODE is not Ready at the end (Ready=${rs:-unread})"; rc=1; }
+	[ "$rw" = True ] || { bad "node $WNODE is not Ready at the end (Ready=${rw:-unread})"; rc=1; }
+	bs="$(end_build "$SERVER" server "$VER_S")" || rc=1
+	bw="$(end_build "$WORKER" worker "$VER_W")" || rc=1
+	if [ "$bs" = "$bw" ]; then line="$bs"; else line="mixed builds: server $bs, worker $bw"; fi
+	line="end state: the rig is left on $line; $SNODE Ready=${rs:-unread}, $WNODE Ready=${rw:-unread}"
+	echo "$line"
+	printf '%s\n' "$line" >"$EV/t.8.end-state"
+	measure t8_end_state "$line"
+	return "$rc"
 }
 
 # run_rung <rung> <function>: one rung, its output to its own log.
@@ -1087,7 +1186,11 @@ run_rung() {
 
 finish() {
 	local rc=$? r seen=0 row
-	trap - EXIT INT TERM
+	trap - EXIT
+	# INT and TERM stay handled until the cleanup ends, so a second Ctrl-C cannot skip
+	# it: logged, not obeyed. Not ignored: an ignored TERM is inherited by every
+	# bounded step, whose watchdog could then no longer stop it.
+	trap 'log "interrupt ignored: the cleanup (f.1, t.8) runs to its end"' INT TERM
 	[ -n "$EV" ] && [ "$TOUCHED" = 1 ] || exit "$rc"
 	for row in "${RUNGS[@]}"; do
 		r="${row%%|*}"
@@ -1097,6 +1200,7 @@ finish() {
 	done
 	run_rung f.1 f1 || true
 	run_rung t.8 t8 || true
+	[ ! -s "$EV/t.8.end-state" ] || log "$(cat "$EV/t.8.end-state")"
 	log "evidence: $EV"
 	if [ -z "$FAILED" ] && [ "$rc" = 0 ]; then
 		echo "result: PASS"
@@ -1375,6 +1479,10 @@ def kubectl(argv):
             rc = 1
         else:
             s["ns"].append(pos[2])
+            if "create-hang" in BRK:
+                # The API server made it; the client never hears back.
+                jsave("k8s.json", s)
+                time.sleep(60)
     elif verb == "apply":
         o = json.loads(sys.stdin.read())
         if o["kind"] == "MLXModel" and "apply-refused" in BRK:
@@ -1474,7 +1582,15 @@ def k3sm(argv):
         if "version-fails" in BRK and HOST != SRV:
             print("cannot reach the daemon", file=sys.stderr)
             return 1
-        print("k3sm v0.0.0-fake")
+        # The pushing binary runs here, with no FAKE_HOST; the Macs' run under ssh.
+        here = "FAKE_HOST" not in os.environ
+        v = "v0.0.0-fake"
+        if ("version-mismatch" in BRK and HOST != SRV) or ("version-local-mismatch" in BRK and here):
+            v = "v0.0.0-other"
+        print("k3sm " + v)
+        if "version-commit" in BRK:
+            print("  commit:        " + "0" * 40)
+        print("  platform:      " + ("darwin/amd64" if here else "darwin/arm64"))
         return 0
     if argv[:2] == ["model", "push"]:
         d, name = argv[2], argv[3]
@@ -1498,12 +1614,15 @@ def k3sm(argv):
         if reg["pushes"] == 2 and "push-bytes" in BRK:
             open(os.path.join(rdir, "extra"), "w").write("x")
         jsave("reg.json", reg)
+        if "push-hang" in BRK:
+            # The registry recorded the tag; the client never hears back.
+            time.sleep(60)
         print("pushed registry-k3sm:6450/models/%s (%d files)\n  digest: %s" % (name, len(files), shown))
         return 0
     if argv[:2] == ["model", "rm"]:
         reg = jload("reg.json", None)
         if reg is None or not reg["tagged"]:
-            print("MANIFEST_UNKNOWN", file=sys.stderr)
+            print("k3sm model: rm %s: not in the cluster registry" % argv[2], file=sys.stderr)
             return 1
         reg["tagged"] = False
         jsave("reg.json", reg)
@@ -1599,8 +1718,12 @@ SH
 }
 
 self_test() {
-	local t bad=0 bin fpy rc out
-	t="$(mktemp -d "${TMPDIR:-/tmp}/mst-self-test.XXXXXX")"
+	local base t bad=0 bin fpy rc out
+	# The fake runs keep their evidence under a directory named k3sm-io.scratch inside
+	# the temp tree, so --lab's evidence rule holds for them as written (no bypass).
+	base="$(mktemp -d "${TMPDIR:-/tmp}/mst-self-test.XXXXXX")"
+	t="$base/$SCRATCH_DIRNAME"
+	mkdir "$t"
 	bin="$t/bin" fpy="$t/fake.py"
 	write_fakes "$bin" "$fpy"
 	chk() { [ "$2" = "$3" ] || { echo "self-test FAIL: $1: got '$2', want '$3'"; bad=1; }; }
@@ -1650,6 +1773,7 @@ self_test() {
 	chk "within: 2 KiB" "$rc" 1
 
 	# One full fake run. FAKE_BREAK names a mutant; want is the exit and the red rung.
+	# FR_STEP, set on one call, shortens K3SM_MST_STEP_TIMEOUT for a run whose fake hangs.
 	fake_run() { # <name> <break> <want-exit> <want-in-output> [evidence-dir]
 		local name="$1" brk="$2" want="$3" grepfor="$4" ev="${5:-$t/runs/$1/ev}" r="$t/runs/$1" got=0 o
 		mkdir -p "$r/state" "$r/srv/cache/blobs" "$r/wrk/cache/blobs" "$r/srv/registry"
@@ -1662,7 +1786,7 @@ self_test() {
 				K3SM_MST_SERVER_WORK="$r/srv/work" K3SM_MST_WORKER_WORK="$r/wrk/work" \
 				K3SM_MST_REGISTRY_ROOT="$r/srv/registry" K3SM_MST_K3SM=k3sm K3SM_MST_LOCAL_K3SM=k3sm \
 				K3SM_MST_VIEW_UID="$(id -u)" K3SM_MST_POLL=0.05 K3SM_MST_READY_TIMEOUT=20 \
-				K3SM_MST_RECLAIM_TIMEOUT=2 K3SM_MST_STEP_TIMEOUT=30 \
+				K3SM_MST_RECLAIM_TIMEOUT=2 K3SM_MST_STEP_TIMEOUT="${FR_STEP:-30}" \
 				"$SELF" --lab --model-dir "$t/m" --model-sums "$t/sums" --evidence "$ev" 2>&1
 		)" || got=$?
 		printf '%s\n' "$o" >"$r/out"
@@ -1694,7 +1818,7 @@ self_test() {
 	# Each rung's failure is caught, the run is red naming it, and f.1 still cleans.
 	local row brk rung
 	for row in \
-		"version-fails|t.0" "push-digest|t.1" "push-bytes|t.1" "apply-refused|t.2" "create-refused|t.2" \
+		"version-fails|t.0" "version-mismatch|t.0" "version-local-mismatch|t.0" "version-commit|t.0" "push-digest|t.1" "push-bytes|t.1" "apply-refused|t.2" "create-refused|t.2" \
 		"resolved-mismatch|t.3" "pvc|t.3" "egress-annotation|t.3" "trust-remote-code|t.3" \
 		"no-partial|t.3b" "kick-truncates|t.3b" "empty-completion|t.4" \
 		"hub-online|t.5" "hub-cache-full|t.5" "hub-fetch|t.5" "hub-env-missing|t.5" "egress-late|t.5" \
@@ -1725,9 +1849,38 @@ self_test() {
 	reason serve-log-empty "the serving log is empty"
 	has "hub-log: the serving log is kept" "$(cat "$t/runs/hub-log/ev/"t.5.*-0.serve.log 2>/dev/null)" "huggingface.co"
 
+	# t.0 names all three builds when they differ, the pushing binary's included.
+	reason0() { has "$1: t.0 reason" "$(awk -F '\t' '$1 == "t.0" && $2 == "FAIL"' "$t/runs/$1/ev/result.tsv" 2>/dev/null)" "$2"; }
+	reason0 version-mismatch "server [k3sm v0.0.0-fake"
+	reason0 version-mismatch "worker [k3sm v0.0.0-other"
+	reason0 version-mismatch "pushing binary [k3sm v0.0.0-fake"
+	reason0 version-local-mismatch "pushing binary [k3sm v0.0.0-other"
+	reason0 version-commit "is not the tree's HEAD"
+	has "happy: the pushing binary's version recorded" "$(cat "$t/runs/happy/ev/t.0.versions")" "pushing binary"
+	# t.8 states the rig's end state in one line.
+	has "happy: t.8 end state" "$(cat "$t/runs/happy/out")" "end state: the rig is left on k3sm v0.0.0-fake; node-s Ready=True, node-w Ready=True"
+
+	# A call that times out after the server acted still gets cleaned up.
+	FR_STEP=2 fake_run push-hang push-hang 1 "result: FAIL (t.1)"
+	cleaned push-hang
+	FR_STEP=2 fake_run create-hang create-hang 1 "result: FAIL (t.2)"
+	cleaned create-hang
+
 	# A cleanup that cannot remove the namespace fails a run whose rungs all passed.
 	fake_run ns-stuck ns-stuck 1 "f.1: FAIL"
 	has "ns-stuck: named" "$(cat "$RUN_DIR/out")" "result: FAIL (f.1)"
+
+	# The evidence dir must lie under a k3sm-io.scratch directory (the pure check).
+	mkdir -p "$t/ev-in" "$base/outside"
+	ln -s "$base/outside" "$t/ev-link"
+	for row in "$t/ev-in|0" "$t/new/ev|0" "$t|1" "$base/outside/ev|1" "$t/../outside/ev|1" "$t/ev-link/ev|1" "${base}y/x|1" "$base/${SCRATCH_DIRNAME}y/ev|1" "relative/ev|1"; do
+		rc=0; (cd "$base" && under_scratch "${row%|*}") || rc=$?
+		chk "under_scratch ${row%|*}" "$rc" "${row#*|}"
+	done
+	# A run with its evidence outside scratch is refused before anything touches the rig.
+	fake_run outside-scratch "" 3 "is not under a $SCRATCH_DIRNAME directory" "$base/outside/ev"
+	[ ! -e "$RUN_DIR/state/calls" ] || { echo "self-test FAIL: outside-scratch: the refused run called the rig: $(cat "$RUN_DIR/state/calls")"; bad=1; }
+	[ ! -e "$base/outside/ev" ] || { echo "self-test FAIL: outside-scratch: the refused evidence dir was created"; bad=1; }
 
 	# The evidence dir must be empty: refused with exit 3, nothing created.
 	mkdir -p "$t/full-ev" && : >"$t/full-ev/old"
@@ -1745,7 +1898,7 @@ self_test() {
 	out="$("$SELF" --plan)"
 	for rung in p.0 t.0 t.1 t.2 t.3 t.3b t.4 t.5 t.6 t.7 f.1 t.8; do has "--plan" "$out" "  $rung "; done
 
-	rm -rf "$t"
+	rm -rf "$base"
 	[ "$bad" = 0 ] || exit 1
 	echo "$GATE self-test: PASS"
 }
