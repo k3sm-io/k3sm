@@ -458,11 +458,11 @@ var clusterStoreHubArgs = []string{"--adapter-path", "--draft-model"}
 // engine falls back to the Hub when nothing is there. Because argparse accepts
 // an unambiguous prefix of an option, an argument matches a checked option
 // when its name equals it or abbreviates it unambiguously (see
-// matchArgPrefix). No other argument is inspected.
+// MatchArgPrefix). No other argument is inspected.
 func checkClusterStoreArgs(args []string) error {
 	for i, arg := range args {
 		name, value, inline := strings.Cut(arg, "=")
-		flag, ok := matchArgPrefix(name, clusterStoreHubArgs)
+		flag, ok := MatchArgPrefix(name, clusterStoreHubArgs)
 		if !ok {
 			continue
 		}
@@ -480,12 +480,13 @@ func checkClusterStoreArgs(args []string) error {
 	return nil
 }
 
-// matchArgPrefix reports which of flags the option name selects the way
-// argparse would: name equals a flag, or name is "--" plus at least one
-// character and a prefix of exactly one flag. A name that abbreviates several
-// flags, or that is merely another option sharing leading letters, selects
-// none.
-func matchArgPrefix(name string, flags []string) (string, bool) {
+// MatchArgPrefix reports which of flags the option name (the part of an
+// argument before any "=") selects the way argparse would: name equals a
+// flag, or name is "--" plus at least one character and a prefix of exactly
+// one flag. A name that abbreviates several flags, or that is merely another
+// option sharing leading letters, selects none. It is the one matcher every
+// spec.runtime.args refusal in pkg/mlx and pkg/mlx/operator uses.
+func MatchArgPrefix(name string, flags []string) (string, bool) {
 	if !strings.HasPrefix(name, "--") || len(name) <= len("--") {
 		return "", false
 	}

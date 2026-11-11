@@ -26,6 +26,7 @@ import (
 
 	mlxv1alpha1 "k3sm.io/apis/mlx/v1alpha1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	"k3sm.io/k3sm/pkg/mlx"
 )
 
 // Reasons carried by the Ready and Degraded conditions when the pre-render fit
@@ -242,16 +243,11 @@ func ValidateDistributed(spec mlxv1alpha1.MLXModelSpec) error {
 	for _, arg := range spec.Runtime.Args {
 		// argparse accepts any unambiguous PREFIX of an option (the silent
 		// prefix-match lesson in pkg/mlx/sizing.go), so "--draft" reaches
-		// --draft-model. Any option-shaped argument that is a prefix of a
-		// refused option is refused with it.
+		// --draft-model. An option-shaped argument that equals or
+		// unambiguously abbreviates a refused option is refused with it.
 		name, _, _ := strings.Cut(arg, "=")
-		if !strings.HasPrefix(name, "--") || len(name) <= len("--") {
-			continue
-		}
-		for _, refused := range distributedRefusedArgs {
-			if strings.HasPrefix(refused, name) {
-				return fmt.Errorf("%w: spec.runtime.args carries %s, which the sharded engine refuses in distributed mode", ErrInvalidDistributed, refused)
-			}
+		if refused, ok := mlx.MatchArgPrefix(name, distributedRefusedArgs); ok {
+			return fmt.Errorf("%w: spec.runtime.args carries %s, which the sharded engine refuses in distributed mode", ErrInvalidDistributed, refused)
 		}
 	}
 	return nil
