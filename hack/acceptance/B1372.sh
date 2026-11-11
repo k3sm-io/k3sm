@@ -742,13 +742,24 @@ t2() {
 	out="$(kc apply -f - <"$EV/t.2.$MB.json" 2>&1)" || { bad "apply $MB: $out"; return 1; }
 }
 
-# sample_fp: the server replica's serving processes' footprint, the largest seen.
+# sample_fp <label>: the server replica's serving processes' footprint, the largest
+# seen. Every sample is appended to t.3.footprint under a "# <epoch> sample <label>"
+# header naming the bytes read, so the peak can be re-derived from the evidence.
 FP_MAX=0
 FP_SCRIPT='for pid in $(pgrep -f -- "--served-model-name $1( |$)"); do footprint "$pid" 2>/dev/null; done'
 sample_fp() {
 	local f="$EV/t.3.footprint" v
-	rroot "$SERVER" "$STEP_TIMEOUT" "$FP_SCRIPT" "$MA" >"$f" 2>/dev/null || return 0
-	v="$(footprint_bytes "$f")"
+	if ! rroot "$SERVER" "$STEP_TIMEOUT" "$FP_SCRIPT" "$MA" >"$f.sample" 2>/dev/null; then
+		printf '# %s sample %s read-failed\n' "$(date +%s)" "$1" >>"$f"
+		rm -f "$f.sample"
+		return 0
+	fi
+	v="$(footprint_bytes "$f.sample")"
+	{
+		printf '# %s sample %s bytes=%s\n' "$(date +%s)" "$1" "${v:-none}"
+		cat "$f.sample"
+	} >>"$f"
+	rm -f "$f.sample"
 	[ -z "$v" ] || [ "$v" -le "$FP_MAX" ] || FP_MAX="$v"
 }
 
@@ -768,7 +779,7 @@ wait_ready() {
 }
 
 t3() {
-	local m node r mem why times p
+	local m node r mem why times p out
 	wait_ready "$MA" 1 sample || return 1
 	wait_ready "$MB" 1 || return 1
 	for m in "$MA" "$MB"; do
@@ -785,7 +796,9 @@ t3() {
 			return 1
 		}
 	done
-	[ -z "$(kc get pvc -n "$NS" -o name 2>/dev/null)" ] || { bad "the namespace holds a PVC"; return 1; }
+	# A failed read proves nothing about PVCs, so it is red, not clean.
+	out="$(kc get pvc -n "$NS" -o name 2>"$EV/t.3.pvc.err")" || { bad "read the namespace's PVCs: $(tail -n 1 "$EV/t.3.pvc.err")"; return 1; }
+	[ -z "$out" ] || { bad "the namespace holds a PVC: $(oneline "$out")"; return 1; }
 	p="$(py 'import json,sys; print(json.load(open(sys.argv[1]))["items"][0]["metadata"]["name"])' "$EV/t.3.$MA.pods.json")"
 	kc get pod "$p" -n "$NS" -o json >"$EV/t.3.cold-pod.json" || { bad "read $p"; return 1; }
 	times="$(pod_times "$EV/t.3.cold-pod.json")" || { bad "the cold pod has no Ready or start time"; return 1; }
@@ -908,15 +921,20 @@ try:
 except OSError as e:
     print("EXEC-ERRNO %d" % e.errno)
 '
-PROBE_COPYRUN='import os, subprocess, tempfile
+# The probe removes its directory and the executable whatever the outcome.
+PROBE_COPYRUN='import os, shutil, subprocess, tempfile
 d = tempfile.mkdtemp()
-p = os.path.join(d, "copied")
-open(p, "w").write("#!/bin/sh\necho ran\n")
-os.chmod(p, 0o755)
 try:
-    print("COPYRUN-RAN" if subprocess.run([p], capture_output=True, text=True).stdout.strip() == "ran" else "COPYRUN-DENIED")
-except OSError as e:
-    print("COPYRUN-DENIED %d" % e.errno)
+    p = os.path.join(d, "copied")
+    with open(p, "w") as f:
+        f.write("#!/bin/sh\necho ran\n")
+    os.chmod(p, 0o755)
+    try:
+        print("COPYRUN-RAN" if subprocess.run([p], capture_output=True, text=True).stdout.strip() == "ran" else "COPYRUN-DENIED")
+    except OSError as e:
+        print("COPYRUN-DENIED %d" % e.errno)
+finally:
+    shutil.rmtree(d, ignore_errors=True)
 '
 # PROBE_HUB <mount>: the Hub is offline for this container and nothing in its tree
 # shows a Hub fetch. HF_HUB_OFFLINE must be exactly 1. The Hub cache is resolved the
@@ -969,7 +987,7 @@ print("HUB-CLEAN" if not dirty else "HUB-NOT-CLEAN %d" % len(dirty))
 '
 
 t5() {
-	local m pod node out first h cache errno
+	local m pod node out first h cache errno rc copyrun
 	first="$(head -n 1 <<<"$FILES" | awk '{print $3}')"
 	for m in "$MA" "$MB"; do
 		pod="$m-0"
@@ -980,8 +998,9 @@ t5() {
 		# The public object first: the Pod spec sets the Hub offline; the exec'd
 		# process env below corroborates it.
 		out="$(pod_offline_env "$EV/t.5.$m.pods.json")" || { bad "$m: $out"; return 1; }
-		out="$(kc exec -n "$NS" "$pod" -c mlx-serve -- "$PYBIN" -c "$PROBE_HUB" "$MOUNT" 2>&1 || true)"
+		rc=0 out="$(kc exec -n "$NS" "$pod" -c mlx-serve -- "$PYBIN" -c "$PROBE_HUB" "$MOUNT" 2>&1)" || rc=$?
 		printf '%s\n' "$out" >"$EV/t.5.$pod.hub"
+		[ "$rc" = 0 ] || { bad "$pod: the Hub probe did not run (exit $rc): $(tail -n 1 <<<"$out")"; return 1; }
 		grep -qx 'HUB-OFFLINE 1' <<<"$out" || { bad "$pod: the Hub is not offline ($(grep -m 1 '^HUB-OFFLINE' <<<"$out" || tail -n 1 <<<"$out"))"; return 1; }
 		grep -qx 'HUB-CLEAN' <<<"$out" || { bad "$pod: the Hub cache is not empty or the tree shows a Hub fetch: $(grep -m 1 '^HUB-DIRTY' <<<"$out" || tail -n 1 <<<"$out")"; return 1; }
 		measure "t5_${m}_tree_entries_walked" "$(awk '$1 == "HUB-WALKED" {print $2}' <<<"$out")"
@@ -992,12 +1011,14 @@ t5() {
 			bad "$pod: the serving log names huggingface.co: $out"
 			return 1
 		fi
-		out="$(kc exec -n "$NS" "$pod" -c mlx-serve -- "$PYBIN" -c "$PROBE_WRITE" "$MOUNT/$first" 2>&1 || true)"
+		rc=0 out="$(kc exec -n "$NS" "$pod" -c mlx-serve -- "$PYBIN" -c "$PROBE_WRITE" "$MOUNT/$first" 2>&1)" || rc=$?
 		printf '%s\n' "$out" >"$EV/t.5.$pod.write"
+		[ "$rc" = 0 ] || { bad "$pod: the write probe did not run (exit $rc): $(tail -n 1 <<<"$out")"; return 1; }
 		errno="$(awk '$1 == "WRITE-ERRNO" {print $2}' <<<"$out")"
 		[ "$errno" = 1 ] || { bad "$pod: a write to $MOUNT/$first did not fail with EPERM: $(tail -n 1 <<<"$out")"; return 1; }
-		out="$(kc exec -n "$NS" "$pod" -c mlx-serve -- "$PYBIN" -c "$PROBE_EXEC" "$MOUNT/$first" 2>&1 || true)"
+		rc=0 out="$(kc exec -n "$NS" "$pod" -c mlx-serve -- "$PYBIN" -c "$PROBE_EXEC" "$MOUNT/$first" 2>&1)" || rc=$?
 		printf '%s\n' "$out" >"$EV/t.5.$pod.exec"
+		[ "$rc" = 0 ] || { bad "$pod: the exec probe did not run (exit $rc): $(tail -n 1 <<<"$out")"; return 1; }
 		errno="$(awk '$1 == "EXEC-ERRNO" {print $2}' <<<"$out")"
 		case "$errno" in
 		1) measure "t5_${m}_exec_denied_by" "profile (EPERM)" ;;
@@ -1005,9 +1026,14 @@ t5() {
 		[0-9]*) measure "t5_${m}_exec_denied_by" "errno $errno" ;;
 		*) bad "$pod: an exec of $MOUNT/$first did not fail: $(tail -n 1 <<<"$out")"; return 1 ;;
 		esac
-		out="$(kc exec -n "$NS" "$pod" -c mlx-serve -- "$PYBIN" -c "$PROBE_COPYRUN" 2>&1 || true)"
+		# The outcome is a recorded stated negative, not a verdict; a probe that did
+		# not demonstrably run (exec failed, or no COPYRUN marker) is red.
+		rc=0 out="$(kc exec -n "$NS" "$pod" -c mlx-serve -- "$PYBIN" -c "$PROBE_COPYRUN" 2>&1)" || rc=$?
 		printf '%s\n' "$out" >"$EV/t.5.$pod.copyrun"
-		measure "t5_${m}_copied_chmod_x_file" "$(grep -o 'COPYRUN-[A-Z]*' <<<"$out" | head -n 1 || echo unread)"
+		[ "$rc" = 0 ] || { bad "$pod: the copied-file probe did not run (exit $rc): $(tail -n 1 <<<"$out")"; return 1; }
+		copyrun="$(grep -o -m 1 '^COPYRUN-[A-Z]*' <<<"$out" || true)"
+		[ -n "$copyrun" ] || { bad "$pod: the copied-file probe printed no COPYRUN marker: $(tail -n 1 <<<"$out")"; return 1; }
+		measure "t5_${m}_copied_chmod_x_file" "$copyrun"
 	done
 	for h in "$SERVER|$SCACHE|s" "$WORKER|$WCACHE|w"; do
 		IFS='|' read -r h cache node <<<"$h"
@@ -1524,7 +1550,10 @@ def kubectl(argv):
     elif verb == "get" and pos[1] == "svc":
         out({"spec": {"ports": [{"port": 8080}]}})
     elif verb == "get" and pos[1] == "pvc":
-        if "pvc" in BRK:
+        if "pvc-read-fails" in BRK:
+            print("error: the server is currently unable to handle the request", file=sys.stderr)
+            rc = 1
+        elif "pvc" in BRK:
             print("persistentvolumeclaim/cache")
     elif verb == "patch":
         o = s["objs"]["MLXModel/%s/%s" % (ns, pos[2])]
@@ -1570,7 +1599,15 @@ def kubectl(argv):
             else:
                 print("EXEC-ERRNO 13")
         elif "COPYRUN" in code:
-            print("COPYRUN-RAN")
+            if "copyrun-exec-fails" in BRK:
+                # The marker is printed, so only the exit status can make this red.
+                print("COPYRUN-RAN")
+                print("error: unable to upgrade connection: container not found", file=sys.stderr)
+                rc = 1
+            elif "copyrun-no-marker" in BRK:
+                print("python3: can't open file")
+            else:
+                print("COPYRUN-RAN")
     else:
         print("fake kubectl: unhandled %r" % argv, file=sys.stderr)
         rc = 2
@@ -1809,6 +1846,9 @@ self_test() {
 	has "happy: cold rate recorded" "$(cat "$RUN_DIR/ev/measurements.tsv")" cold_fetch_bytes_per_second
 	has "happy: warm time recorded" "$(cat "$RUN_DIR/ev/measurements.tsv")" warm_ready_seconds
 	has "happy: footprint vs memory" "$(cat "$RUN_DIR/ev/measurements.tsv")" peak_footprint_over_spec_memory
+	[ "$(grep -Ec '^# [0-9]+ sample [^ ]+ bytes=[0-9]+$' "$RUN_DIR/ev/t.3.footprint")" -ge 2 ] || { echo "self-test FAIL: happy: t.3.footprint does not keep every sample"; bad=1; }
+	[ ! -e "$RUN_DIR/ev/t.3.footprint.sample" ] || { echo "self-test FAIL: happy: a footprint sample file is left"; bad=1; }
+	has "happy: the copied-file outcome recorded" "$(cat "$RUN_DIR/ev/measurements.tsv")" "$(printf 'copied_chmod_x_file\tCOPYRUN-RAN')"
 	has "happy: the Hub probe ran in the pod" "$(cat "$RUN_DIR/ev/"t.5.*-0.hub)" "HUB-OFFLINE 1"
 	has "happy: the Hub cache read under the pod" "$(cat "$RUN_DIR/ev/"t.5.*-0.hub)" "HUB-CACHE ./models/hub absent"
 	has "happy: the serving log recorded" "$(cat "$RUN_DIR/ev/"t.5.*-0.serve.log)" "INFO serving on"
@@ -1823,6 +1863,7 @@ self_test() {
 		"no-partial|t.3b" "kick-truncates|t.3b" "empty-completion|t.4" \
 		"hub-online|t.5" "hub-cache-full|t.5" "hub-fetch|t.5" "hub-env-missing|t.5" "egress-late|t.5" \
 		"hub-models-dir|t.5" "hub-cache-env|t.5" "hub-log|t.5" "serve-log-empty|t.5" "write-ok|t.5" "write-eacces|t.5" "exec-ok|t.5" "view-hardlink|t.5" "view-twice|t.5" \
+		"pvc-read-fails|t.3" "copyrun-exec-fails|t.5" "copyrun-no-marker|t.5" \
 		"scale-copies|t.6" "prune-keeps|t.7" "registry-keeps|t.7"; do
 		brk="${row%|*}" rung="${row#*|}"
 		fake_run "$brk" "$brk" 1 "result: FAIL ($rung)"
