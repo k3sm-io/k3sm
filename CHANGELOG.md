@@ -267,6 +267,10 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
 
 ### Fixed
 
+- A push through a node's registry gate whose local registry accepts the connection but never
+  answers now gets a 502 `UNAVAILABLE` after 30 seconds without response headers, instead of
+  waiting until the client gives up, and the gate logs it at Warn. A pull that cannot reach the
+  local registry is now logged at Warn too, rather than only at Debug.
 - A server whose control plane does not report healthy in time while the Mac is heavily loaded no
   longer parks on the crash-loop breaker after five attempts. It backs off instead, from 30 seconds
   doubling up to 10 minutes, `k3sm status` shows when the next attempt starts and that an attempt
