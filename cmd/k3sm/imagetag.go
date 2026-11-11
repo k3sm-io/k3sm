@@ -36,7 +36,7 @@ var errTagRepoint = errors.New("the tag already names another manifest")
 
 // errTagMoved reports that `k3sm image untag --digest` found the tag re-pointed
 // between its read and its conditional delete, so the registry removed nothing.
-var errTagMoved = errors.New("the tag moved since it was read")
+var errTagMoved = errors.New("the tag no longer names that digest, or the cluster registry is older than this check")
 
 // imageTag adds a tag to a manifest the cluster registry already holds.
 //
@@ -173,7 +173,7 @@ func imageUntag(ctx context.Context, o imageOptions, out io.Writer) error {
 	}
 	if err := remote.Delete(c.remote, opts...); err != nil {
 		if terr, ok := errors.AsType[*transport.Error](err); ok && o.digest != "" && terr.StatusCode == http.StatusPreconditionFailed {
-			return fmt.Errorf("untag %s: %w: it no longer names %s; nothing was removed", c.flat, errTagMoved, o.digest)
+			return fmt.Errorf("untag %s: %w; nothing was removed", c.flat, errTagMoved)
 		}
 		return registryError("untag "+c.flat.String(), err)
 	}
