@@ -379,16 +379,22 @@ The `-o json` document has three keys. `dryRun` is true without `--force`. `regi
 `name`, `skipped` (set only on a node without a registry), `manifests` (each with `repository`,
 `digest`, `mediaType` and `size`, deleted or to be deleted), `kept` (the untagged manifests kept,
 each with its `reason`), and, when present, `unreadable` repositories, `failed` deletions,
-`interrupted` and the `unattempted` manifests of an interrupted prune, and the `sweep` a forced
+`interrupted` and the `unattempted` manifests (not attempted or not confirmed) of an interrupted
+prune, and the `sweep` a forced
 prune ran (`repositories`, `blobs`, `bytes`, and any `stopped`, `failed` or `reviewing`
 repositories and `error`).
 `cache` holds `blobs`, `reclaimedBytes` and `kept` (counts by reason). The command exits non-zero
 when any deletion fails, after printing the report.
 
-Pressing Ctrl+C during `--force` stops the prune before its next deletion. The deletions already
-made stand and are still swept, the report marks the prune as interrupted and lists the manifests
-it did not attempt as unattempted rather than failed, and the command exits non-zero after
-printing it. Run the prune again to delete what is left.
+A forced prune that is cancelled, by Ctrl+C, by SIGTERM or by `--timeout` expiring, stops before
+its next deletion. The deletions already made stand, and `manifests` then holds only the ones the
+registry confirmed. Those are still swept, for a bounded time: a note on stderr says how many and
+for how long. The report marks the prune `interrupted` and lists every planned manifest it did not
+attempt or could not confirm under `unattempted`, not under `failed`. A deletion the cancellation
+cut off in flight may still have been applied by the registry; it is listed under `unattempted`,
+is not swept by this run, and is reclaimed by a later prune or the registry's scheduled sweep. The
+table on stdout keeps its usual lines; the interruption is reported on stderr, and the command
+exits non-zero after printing the report. Run the prune again to delete what is left.
 
 ## Pushing to a Registry: `k3sm image push`
 
