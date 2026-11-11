@@ -295,3 +295,98 @@ func TestCrashLoopSlowStreakNeedsALiveServer(t *testing.T) {
 		}
 	}
 }
+
+// A bring-up back-off is the daemon pacing itself on a loaded host, not the
+// control plane failing over and over. The row keeps its state, severity and
+// crash-loop value, and adds the phase (and, while it waits, when the next
+// attempt starts) in wide keys of its own, so the alert can say which it is.
+func TestCrashLoopBackingOffHasItsOwnWideValue(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	path := "/var/lib/k3sm/server/crashloop.json"
+	recent := now.Add(-10 * time.Second)
+	elapsed := now.Add(-time.Hour)
+	crashes := []executor.Crash{
+		{At: now.Add(-2 * time.Minute), Component: "kine", Origin: executor.CrashOriginCrash},
+		{At: now.Add(-time.Minute), Component: "kine", Origin: executor.CrashOriginCrash}}
+
+	tests := []struct {
+		name      string
+		rec       executor.CrashRecord
+		live      bool
+		wantPhase string
+		wantNext  time.Time // zero: no next-attempt key
+		wantCrash string
+		wantState RowState
+		wantSev   Severity
+	}{
+		{"a live slow-streak wait is backing off",
+			executor.CrashRecord{SlowStreak: 2, LastSlowAt: &recent}, true,
+			PhaseBackingOff, recent.Add(2 * executor.BringUpSlowBackoffBase), "restarting", StateCrashLoop, SeverityWarn},
+		{"an elapsed streak on a running server is attempting",
+			executor.CrashRecord{SlowStreak: 2, LastSlowAt: &elapsed}, true,
+			PhaseAttempting, time.Time{}, "restarting", StateCrashLoop, SeverityWarn},
+		{"an elapsed streak on a stopped server has no phase",
+			executor.CrashRecord{SlowStreak: 2, LastSlowAt: &elapsed}, false,
+			"", time.Time{}, "", StateRunning, SeverityOK},
+		{"a real crash pattern has no phase",
+			executor.CrashRecord{SlowStreak: 1, LastSlowAt: &recent, Crashes: crashes}, true,
+			"", time.Time{}, "restarting", StateCrashLoop, SeverityWarn},
+	}
+	var generic string
+	{
+		v := ClassifyCrashLoop(executor.CrashRecord{Crashes: crashes}, nil, path, now, true)
+		row := Row{Name: RowServer, State: StateRunning, Severity: SeverityOK, Wide: map[string]string{}}
+		applyCrashLoop(&row, v)
+		generic = daemonAlert(row, alertContext{now: now}).Cause
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			v := ClassifyCrashLoop(tc.rec, nil, path, now, tc.live)
+			if v.Phase != tc.wantPhase {
+				t.Fatalf("phase = %q, want %q (%+v)", v.Phase, tc.wantPhase, v)
+			}
+			row := Row{Name: RowServer, State: StateRunning, Severity: SeverityOK, Wide: map[string]string{}}
+			applyCrashLoop(&row, v)
+			if row.State != tc.wantState || row.Severity != tc.wantSev || row.Wide["crash-loop"] != tc.wantCrash {
+				t.Fatalf("row = %s/%s crash-loop %q, want %s/%s %q", row.State, row.Severity,
+					row.Wide["crash-loop"], tc.wantState, tc.wantSev, tc.wantCrash)
+			}
+			phase, hasPhase := row.Wide["crash-loop-phase"]
+			if hasPhase != (tc.wantPhase != "") || phase != tc.wantPhase {
+				t.Errorf("wide crash-loop-phase = %q (present %v), want %q", phase, hasPhase, tc.wantPhase)
+			}
+			next, hasNext := row.Wide["crash-loop-next-attempt"]
+			if tc.wantNext.IsZero() {
+				if hasNext {
+					t.Errorf("wide crash-loop-next-attempt = %q, want absent", next)
+				}
+			} else {
+				at, err := time.Parse(time.RFC3339, next)
+				if err != nil {
+					t.Fatalf("crash-loop-next-attempt %q is not RFC3339: %v", next, err)
+				}
+				if !at.Equal(tc.wantNext) {
+					t.Errorf("crash-loop-next-attempt = %s, want %s", at, tc.wantNext)
+				}
+			}
+			if tc.wantPhase == "" {
+				return
+			}
+			a := daemonAlert(row, alertContext{now: now})
+			if a == nil || a.Cause == generic {
+				t.Fatalf("%s alert reads as the generic crash loop: %+v", tc.wantPhase, a)
+			}
+			if strings.Contains(a.Cause, "keeps failing") {
+				t.Errorf("%s alert says the control plane keeps failing: %q", tc.wantPhase, a.Cause)
+			}
+			if tc.wantPhase == PhaseBackingOff && !strings.Contains(a.Cause, next) {
+				t.Errorf("back-off alert does not name the next attempt %q: %q", next, a.Cause)
+			}
+		})
+	}
+	if !strings.Contains(generic, "keeps failing") {
+		t.Errorf("the generic crash-loop alert changed: %q", generic)
+	}
+}

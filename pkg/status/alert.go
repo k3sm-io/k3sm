@@ -585,6 +585,14 @@ func daemonAlert(r Row, ac alertContext) *Alert {
 	case crash == "restarting" && strings.HasPrefix(r.Detail, "lost the leader lease"):
 		return alert("This server keeps losing its leader lease and restarting, which points at etcd quorum or an overloaded apiserver or datastore.",
 			docsEtcd, append([]FixStep{manual("Check the etcd and apiserver rows on every server")}, steps...)...)
+	case crash == "restarting" && r.State == StateCrashLoop && r.Wide["crash-loop-phase"] == PhaseBackingOff:
+		cause := "The control plane is waiting between slow start attempts because the Mac is under load"
+		if next := r.Wide["crash-loop-next-attempt"]; next != "" {
+			cause += "; the next attempt is at " + next
+		}
+		return alert(cause+".", docsStartup, steps...)
+	case crash == "restarting" && r.State == StateCrashLoop && r.Wide["crash-loop-phase"] == PhaseAttempting:
+		return alert("A slow start attempt is running now.", docsStartup, steps...)
 	case crash == "restarting" && r.State == StateCrashLoop:
 		return alert("The control plane keeps failing and being restarted; if it goes on, the crash-loop breaker parks the daemon and the cluster stops serving.",
 			docsStartup, steps...)
