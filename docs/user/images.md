@@ -348,6 +348,7 @@ It is a dry run unless you pass `--force`.
 sudo k3sm image prune                 # report what would go
 sudo k3sm image prune --force         # delete it
 sudo k3sm image prune -o json         # the same report as one JSON document
+sudo k3sm image rm <ref|digest> --force  # evict one image from this node's cache only (dry run without --force)
 ```
 
 In the registry it deletes untagged manifests: what is left behind when a tag is pushed again

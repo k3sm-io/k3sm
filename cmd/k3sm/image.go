@@ -50,6 +50,7 @@ Usage: k3sm image pull <reference> [flags]
        k3sm image import <oci-layout.tar> [flags]
        k3sm image push <oci-layout-dir|reference> <registry-reference> [flags]
        k3sm image prune [flags]
+       k3sm image rm <reference|digest> [--force] [--platform os/arch] [-o json] [flags]
        k3sm image ls [-o json|ndjson] [flags]
        k3sm image df [-o json] [flags]
        k3sm image migrate [--report] [-o json]   (copy this node's images into the cluster registry once; sudo on a worker)
@@ -131,6 +132,16 @@ prune   delete the cluster registry's untagged manifests and evict what no
         is the runtimed Images service's own prune: a pod's content is never
         deleted, and if the daemon cannot enumerate every pod's references it
         refuses the whole prune. -o json prints both halves as one document.
+rm      evict one image or artifact manifest, by reference or digest, from
+        THIS NODE's cache. DRY RUN BY DEFAULT — pass --force to delete. Never
+        touches the cluster registry. The daemon keeps every blob a pod, a
+        root, an in-flight ingest or another cached image still needs, and
+        the report lists each kept blob with its reason ("partial" when any
+        is kept). --platform narrows a reference with several platform
+        entries and is refused with a digest. -o json prints {manifestDigest,
+        dryRun, removedDigests, kept:[{digest, reason}], reclaimedBytes};
+        dryRun echoes --force. Any failure exits 1; a daemon too old to serve
+        rm deletes nothing, and rm never falls back to prune.
 ls      list the images in the cluster's one registry (the server's), each
         under its canonical reference ` + "`" + canonicalRegistry + "/<repo>:<tag>`" + `, with
         its digest, platforms and size, how many Pods use it, and the nodes
@@ -287,21 +298,21 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 	// blast radius is asymmetric: a needless dry run costs a statfs, while an
 	// unintended prune on a node that cannot reach its registry costs every image
 	// it cannot re-pull.
-	fs.BoolVar(&o.force, "force", false, "prune: actually delete (without this, prune only reports what it would delete); tag: re-point a tag that names another manifest")
+	fs.BoolVar(&o.force, "force", false, "prune, rm: actually delete (without this, they only report what they would delete); tag: re-point a tag that names another manifest")
 	fs.StringVar(&o.reference, "reference", "", "reference to record a loaded image under (load, import; defaults to the one the archive names)")
 	// The platform is part of the store's (reference x platform) KEY, never a
 	// filter, so it is spelled the way an OCI platform is spelled everywhere
 	// else — os/arch[/variant] — rather than as three flags nobody would pair
 	// correctly.
 	var platformSpec, policySpec string
-	fs.StringVar(&platformSpec, "platform", "", "os/arch[/variant] this verb acts on, e.g. darwin/arm64 (pull; tag, inspect, save: one platform of an index)")
+	fs.StringVar(&platformSpec, "platform", "", "os/arch[/variant] this verb acts on, e.g. darwin/arm64 (pull; tag, inspect, save: one platform of an index; rm: one platform entry of a reference)")
 	fs.StringVar(&policySpec, "policy", "", "pull policy: always, if-not-present or never (pull only; default is the pull-through behaviour)")
 	fs.BoolVar(&o.noMirror, "no-mirror", false, "pull: do not copy a public image into the cluster registry")
 	fs.StringVar(&o.digest, "digest", "", "refuse the removal unless the name still resolves to this manifest digest (untag only)")
 	// One flag, several meanings, chosen by the subcommand — the spelling `docker`
 	// uses for both. It is validated per subcommand at parse time so `inspect -o
 	// out.tar` fails before anything is dialled.
-	fs.StringVar(&o.output, "o", "", "save: the file to write the archive to; inspect: json, for the registry's documents instead of the table; prune: json, for one document with both halves; ls, df: json")
+	fs.StringVar(&o.output, "o", "", "save: the file to write the archive to; inspect: json, for the registry's documents instead of the table; prune: json, for one document with both halves; rm, ls, df: json")
 	fs.StringVar(&o.output, "output", "", "alias for -o")
 	fs.DurationVar(&o.timeout, "timeout", metadataTimeout, "overall deadline for the call; load, import, push, pull and save have none by default, and abandon a request only when it moves no byte for "+requestIdleTimeout.String())
 	if err := fs.Parse(args); err != nil {
@@ -361,7 +372,7 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 		if flagWasSet(fs, "reference") {
 			return o, errors.New("push takes its reference as the second argument, not --reference")
 		}
-	case "pull", "untag", "inspect", "save":
+	case "pull", "untag", "inspect", "save", "rm":
 		if len(positional) == 0 {
 			return o, fmt.Errorf("%s requires the reference%s to act on", o.subcommand, digestAlso(o.subcommand))
 		}
@@ -385,12 +396,15 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 	// Every flag below belongs to a subset of the verbs. Refusing a flag the
 	// verb cannot honour beats ignoring it: an ignored --platform on a prune
 	// reads as "that platform was pruned" until someone re-reads the store.
-	platformVerbs := map[string]bool{"pull": true, "tag": true, "inspect": true, "save": true}
+	platformVerbs := map[string]bool{"pull": true, "tag": true, "inspect": true, "save": true, "rm": true}
 	if flagWasSet(fs, "platform") && !platformVerbs[o.subcommand] {
 		return o, fmt.Errorf("%s does not take --platform (it selects the platform pull fetches, or the child of an index tag, inspect and save act on; a tag names the whole index, so untag takes none)", o.subcommand)
 	}
-	if o.force && o.subcommand != "prune" && o.subcommand != "tag" {
-		return o, fmt.Errorf("%s does not take --force (it unlinks for prune and re-points a tag for tag)", o.subcommand)
+	if flagWasSet(fs, "platform") && o.subcommand == "rm" && rmTargetIsDigest(o.source) {
+		return o, fmt.Errorf("rm %s: --platform narrows a reference, and a digest already names one manifest; drop --platform", o.source)
+	}
+	if o.force && o.subcommand != "prune" && o.subcommand != "tag" && o.subcommand != "rm" {
+		return o, fmt.Errorf("%s does not take --force (it unlinks for prune and rm, and re-points a tag for tag)", o.subcommand)
 	}
 	var err error
 	if o.platform, err = parsePlatform(platformSpec); err != nil {
@@ -420,13 +434,13 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 		if o.output != "" && o.output != "json" && o.output != "ndjson" {
 			return o, fmt.Errorf("-o %q: ls renders a table by default, `json` or `ndjson` (one JSON line per image as it is read) on request", o.output)
 		}
-	case "inspect", "prune", "df":
+	case "inspect", "prune", "rm", "df":
 		if o.output != "" && o.output != "json" {
 			return o, fmt.Errorf("-o %q: %s renders a table by default and `json` on request", o.output, o.subcommand)
 		}
 	default:
 		if flagWasSet(fs, "o") || flagWasSet(fs, "output") {
-			return o, fmt.Errorf("%s does not take -o (save writes an archive to it; inspect, prune, ls and df choose a rendering with it)", o.subcommand)
+			return o, fmt.Errorf("%s does not take -o (save writes an archive to it; inspect, prune, rm, ls and df choose a rendering with it)", o.subcommand)
 		}
 	}
 	// The streaming verbs have no overall deadline unless the operator chose
@@ -444,7 +458,7 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 
 // imageSubcommands is the verb list an argument error names, kept in one place
 // so a new verb cannot be advertised in the usage and forgotten in the errors.
-const imageSubcommands = "pull, tag, untag, inspect, save, load, import, push, prune, ls, df"
+const imageSubcommands = "pull, tag, untag, inspect, save, load, import, push, prune, rm, ls, df"
 
 // streamingSubcommands are the verbs that move image content rather than
 // metadata: they carry no overall deadline unless the operator chose one, and
@@ -566,6 +580,8 @@ func imageCommandWith(ctx context.Context, o imageOptions, out io.Writer, dial i
 		return nil
 	case "prune":
 		return imagePrune(ctx, client, o, out, del, collect, time.Now())
+	case "rm":
+		return imageRm(ctx, client, o, out)
 	}
 	return fmt.Errorf("unknown subcommand %q", o.subcommand)
 }
