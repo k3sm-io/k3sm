@@ -349,6 +349,10 @@ type runtimedRuntime struct {
 	// window before the node's watch starts).
 	lifetime     chan struct{}
 	lifetimeOnce sync.Once
+	// deadlineStops counts the active-deadline stops running off the resync
+	// tick (startDeadlineStop). Added to under mu only while lifetime is open;
+	// shutdown waits for it after closing lifetime.
+	deadlineStops sync.WaitGroup
 
 	// stopVerbMissingOnce limits the "upgrade runtimed" line to one per
 	// process: a runtimed that answers StopContainer with a transport
@@ -358,9 +362,16 @@ type runtimedRuntime struct {
 }
 
 // shutdown closes the provider's lifetime channel, ending every worker bounded
-// by it. Idempotent, and safe to call from any goroutine.
+// by it, then waits for the active-deadline stops still in flight
+// (deadlineStops). Idempotent, and safe to call from any goroutine not holding
+// r.mu.
 func (r *runtimedRuntime) shutdown() {
-	r.lifetimeOnce.Do(func() { close(r.lifetime) })
+	r.lifetimeOnce.Do(func() {
+		r.mu.Lock()
+		close(r.lifetime)
+		r.mu.Unlock()
+	})
+	r.deadlineStops.Wait()
 }
 
 // Close releases the embedded runtime: it ends the provider's lifetime workers,

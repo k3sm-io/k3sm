@@ -95,22 +95,73 @@ func (r *runtimedRuntime) enforceActiveDeadlines(ctx context.Context) {
 		if d.t.rejected || d.t.evictedStatus() != nil || trackDeleting(d.t) {
 			continue
 		}
-		err := r.failPastDeadline(ctx, d.pod, d.t)
+		r.startDeadlineStop(ctx, d.pod, d.t)
+	}
+}
+
+// startDeadlineStop takes t's terminal mark on the tick, so this tick's status
+// read already publishes Failed and a later tick sees the mark and starts no
+// second stop, then runs the stop itself in one goroutine per pod: the runtime
+// stop can take the pod's whole termination grace, and several pods expiring
+// together must not hold the tick's status publication behind each other.
+//
+// Locking: the mark and its rollback are t.restartMu's (markTerminal,
+// unmarkEvicted); the goroutine holds only its own *podTrack and takes no
+// provider lock across the RPC. Lifetime: the goroutine's context keeps ctx's
+// values but is cancelled by the provider's lifetime (r.lifetime, closed by
+// shutdown), not by the tick; it is counted in r.deadlineStops, added under r.mu
+// only while the lifetime is open, and shutdown waits for it. A provider already
+// shut down starts no stop and takes no mark.
+func (r *runtimedRuntime) startDeadlineStop(ctx context.Context, tracked *corev1.Pod, t *podTrack) {
+	r.mu.Lock()
+	select {
+	case <-r.lifetime:
+		r.mu.Unlock()
+		return
+	default:
+	}
+	r.deadlineStops.Add(1)
+	r.mu.Unlock()
+	prior := r.podWithStatus(ctx, tracked, t)
+	st := failedPodStatus(prior.Status, reasonDeadlineExceeded, msgDeadlineExceeded, metav1.NewTime(r.clk.Now()))
+	if !t.markTerminal(st) {
+		r.deadlineStops.Done()
+		return
+	}
+	go func() {
+		defer r.deadlineStops.Done()
+		stopCtx, cancel := r.lifetimeContext(ctx)
+		defer cancel()
+		err := r.failPastDeadline(stopCtx, tracked, t, st)
 		// A stop that keeps failing is retried every resync: the first failure
 		// of a pod logs at Warn, the repeats at Debug, until a stop succeeds.
-		d.t.restartMu.Lock()
-		repeat := d.t.deadlineStopFailed
-		d.t.deadlineStopFailed = err != nil
-		d.t.restartMu.Unlock()
+		t.restartMu.Lock()
+		repeat := t.deadlineStopFailed
+		t.deadlineStopFailed = err != nil
+		t.restartMu.Unlock()
 		if err != nil {
 			log := r.log.Warn
 			if repeat {
 				log = r.log.Debug
 			}
 			log("active deadline: could not stop the pod; retrying on the next resync",
-				"pod", podKey(d.pod.Namespace, d.pod.Name), "uid", string(d.pod.UID), "err", err)
+				"pod", podKey(tracked.Namespace, tracked.Name), "uid", string(tracked.UID), "err", err)
 		}
-	}
+	}()
+}
+
+// lifetimeContext returns a context carrying parent's values that is cancelled
+// when the provider's lifetime ends (r.lifetime), or by the returned cancel.
+func (r *runtimedRuntime) lifetimeContext(parent context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.WithoutCancel(parent))
+	go func() {
+		select {
+		case <-r.lifetime:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
 }
 
 // deadlineStart is the start the active deadline counts from: the earlier of the
@@ -166,21 +217,17 @@ func (r *runtimedRuntime) persistDeadlineStatus(ctx context.Context, pod *corev1
 
 // failPastDeadline stops a pod past its active deadline in evictPod's shape and
 // records it Failed, reason DeadlineExceeded, with no DisruptionTarget condition.
-// The terminal mark is set before the stop and rolled back if the stop fails;
+// The terminal mark is set before the stop (by the caller) and rolled back if the stop fails;
 // the pod's address, logs and track stay for the DeletePod that follows, as on an
 // eviction. A parked pod has no runtime pod, so the runtime's not-found answers
 // the stop; its pull schedules are cancelled and its park record cleared, and a
 // create of it still in flight is deleted when it lands (commitParkedCreate).
 //
 // The stop is the pod's own grace, floored, with no preStop hook, through
-// runtimed's DeletePod by pod id (wire 0 stays evictPod's alone).
-func (r *runtimedRuntime) failPastDeadline(ctx context.Context, tracked *corev1.Pod, t *podTrack) error {
+// runtimed's DeletePod by pod id (wire 0 stays evictPod's alone). The caller has
+// taken the terminal mark st (startDeadlineStop); this runs off the tick.
+func (r *runtimedRuntime) failPastDeadline(ctx context.Context, tracked *corev1.Pod, t *podTrack, st *corev1.PodStatus) error {
 	id := string(tracked.UID)
-	prior := r.podWithStatus(ctx, tracked, t)
-	st := failedPodStatus(prior.Status, reasonDeadlineExceeded, msgDeadlineExceeded, metav1.NewTime(r.clk.Now()))
-	if !t.markTerminal(st) {
-		return nil
-	}
 	t.quiesceForEviction()
 	intent := r.recordStopIntent(tracked, "")
 	_, err := r.rt.DeletePod(ctx, &runtimev1.DeletePodRequest{PodId: id, GracePeriodSeconds: floorGrace(graceSeconds(tracked))})

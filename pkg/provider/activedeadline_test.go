@@ -19,6 +19,7 @@ package provider
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -28,9 +29,13 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/record"
 	testclock "k8s.io/utils/clock/testing"
+
+	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
 func TestActiveDeadlineExceeded(t *testing.T) {
@@ -142,6 +147,8 @@ func TestPodPastActiveDeadlineFailsDeadlineExceeded(t *testing.T) {
 
 			clk.Step(c.step)
 			r.resync(ctx)
+			waitDeadlineStops(r)
+			waitDeadlineStops(r)
 			if c.update != nil {
 				if st := tr.evictedStatus(); st != nil {
 					t.Fatalf("failed before the update: %s/%s", st.Phase, st.Reason)
@@ -152,6 +159,9 @@ func TestPodPastActiveDeadlineFailsDeadlineExceeded(t *testing.T) {
 				// expected: the tracked spec is replaced before the call.
 				_ = r.UpdatePod(ctx, updated)
 				r.resync(ctx)
+				waitDeadlineStops(r)
+				waitDeadlineStops(r)
+				waitDeadlineStops(r)
 			}
 
 			st, err := r.GetPodStatus(ctx, pod.Namespace, pod.Name)
@@ -201,6 +211,8 @@ func TestPodPastActiveDeadlineFailsDeadlineExceeded(t *testing.T) {
 			// Later resyncs, and a long wait past any pull back-off, do nothing more.
 			clk.Step(maxPullBackoffForTest)
 			r.resync(ctx)
+			waitDeadlineStops(r)
+			waitDeadlineStops(r)
 			waitNoAttempt(t, tr)
 			if n := e.deleteCount(); n != 1 {
 				t.Errorf("runtime DeletePod calls after a later resync = %d, want 1", n)
@@ -248,6 +260,11 @@ func TestActiveDeadlinePersistRetried(t *testing.T) {
 	if _, err := cs.CoreV1().Pods(pod.Namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("apiserver create: %v", err)
 	}
+	// The stop runs off the tick on the provider's lifetime, not the tick's
+	// context, so the first write is made the only attempt.
+	saved := persistEvictedBackoff
+	persistEvictedBackoff = wait.Backoff{Steps: 1}
+	t.Cleanup(func() { persistEvictedBackoff = saved })
 	// The status write fails for the first resync's whole attempt window: the
 	// failure ends that resync's context, so its backoff stops at once.
 	var failing atomic.Bool
@@ -277,6 +294,7 @@ func TestActiveDeadlinePersistRetried(t *testing.T) {
 
 	clk.Step(time.Duration(deadline)*time.Second + 10*time.Minute)
 	r.resync(firstCtx)
+	waitDeadlineStops(r)
 	if st := tr.evictedStatus(); st == nil || st.Reason != reasonDeadlineExceeded {
 		t.Fatalf("track status = %v, want Failed/%s", st, reasonDeadlineExceeded)
 	}
@@ -294,6 +312,7 @@ func TestActiveDeadlinePersistRetried(t *testing.T) {
 	failing.Store(false)
 	clk.Step(10 * time.Second)
 	r.resync(ctx)
+	waitDeadlineStops(r)
 	live, err = cs.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("apiserver get: %v", err)
@@ -307,6 +326,7 @@ func TestActiveDeadlinePersistRetried(t *testing.T) {
 	n := writes.Load()
 	clk.Step(10 * time.Second)
 	r.resync(ctx)
+	waitDeadlineStops(r)
 	if got := writes.Load(); got != n {
 		t.Errorf("status writes after the debt was paid = %d, want %d", got, n)
 	}
@@ -343,6 +363,7 @@ func TestActiveDeadlineCountsFromTheEarlierStart(t *testing.T) {
 		t.Fatal("pod not tracked after CreatePod")
 	}
 	r.resync(ctx)
+	waitDeadlineStops(r)
 	if st := tr.evictedStatus(); st == nil || st.Reason != reasonDeadlineExceeded {
 		t.Fatalf("track status = %v, want Failed/%s on the first resync", st, reasonDeadlineExceeded)
 	}
@@ -373,6 +394,7 @@ func TestActiveDeadlineFencesALateParkedCreate(t *testing.T) {
 	r.mu.Unlock()
 
 	r.resync(ctx)
+	waitDeadlineStops(r)
 	if st := tr.evictedStatus(); st == nil || st.Reason != reasonDeadlineExceeded {
 		t.Fatalf("track status = %v, want Failed/%s", st, reasonDeadlineExceeded)
 	}
@@ -395,5 +417,137 @@ func TestActiveDeadlineFencesALateParkedCreate(t *testing.T) {
 	}
 	if st.Phase != corev1.PodFailed || st.Reason != reasonDeadlineExceeded {
 		t.Errorf("status after the late create = %s/%s, want Failed/%s", st.Phase, st.Reason, reasonDeadlineExceeded)
+	}
+}
+
+// waitDeadlineStops waits for every active-deadline stop a resync started off
+// the tick to finish.
+func waitDeadlineStops(r *runtimedRuntime) { r.deadlineStops.Wait() }
+
+// heldStopRuntime holds the runtime stop of one pod id open until hold is
+// closed, signalling entered when that stop arrives.
+type heldStopRuntime struct {
+	*fakeRuntimeServer
+	holdID  string
+	hold    chan struct{}
+	entered chan struct{}
+}
+
+func (h *heldStopRuntime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest) (*runtimev1.DeletePodResponse, error) {
+	if req.GetPodId() == h.holdID {
+		close(h.entered)
+		<-h.hold
+	}
+	return h.fakeRuntimeServer.DeletePod(ctx, req)
+}
+
+// TestResyncNotBlockedByDeadlineStop pins the deadline stop off the tick: a
+// stop held open in the runtime does not hold the resync, the held pod already
+// reads Failed/DeadlineExceeded, a second due pod is stopped meanwhile, an
+// unrelated pod's status is still published, each failed pod gets one Event, and
+// shutdown waits for the stop still in flight.
+func TestResyncNotBlockedByDeadlineStop(t *testing.T) {
+	ctx := context.Background()
+	deadline := int64(60)
+	a, b, c := pullPod("deadline-a"), pullPod("deadline-b"), pullPod("deadline-c")
+	a.Spec.ActiveDeadlineSeconds = &deadline
+	b.Spec.ActiveDeadlineSeconds = &deadline
+	f := newFakeRuntimeServer()
+	h := &heldStopRuntime{fakeRuntimeServer: f, holdID: string(a.UID), hold: make(chan struct{}), entered: make(chan struct{})}
+	rec := record.NewFakeRecorder(64)
+	r := newRuntimedWith(h, RuntimedConfig{
+		NodeName: "n",
+		NodeIP:   testNodeIP,
+		Root:     t.TempDir(), PodLogsDir: t.TempDir(),
+		Recorder: rec,
+		Network:  NewPodNetAdapter(newFakeIPAM(t, "100.64.0.0/24"), testNodeIP, nil),
+	}, nil, nil)
+	clk := testclock.NewFakeClock(time.Now())
+	r.clk = clk
+	var released atomic.Bool
+	releaseA := func() {
+		if released.CompareAndSwap(false, true) {
+			close(h.hold)
+		}
+	}
+	t.Cleanup(releaseA)
+	var pubMu sync.Mutex
+	published := map[string]*corev1.Pod{}
+	r.notify = func(p *corev1.Pod) {
+		pubMu.Lock()
+		published[p.Name] = p
+		pubMu.Unlock()
+	}
+	for _, p := range []*corev1.Pod{a, b, c} {
+		if err := r.CreatePod(ctx, p); err != nil {
+			t.Fatalf("CreatePod %s: %v", p.Name, err)
+		}
+	}
+	_ = recordedEvents(rec.Events)
+
+	clk.Step(20 * time.Minute)
+	done := make(chan struct{})
+	go func() {
+		r.resync(ctx)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("resync is held by a pod's deadline stop")
+	}
+	select {
+	case <-h.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("pod A's stop never reached the runtime")
+	}
+	st, err := r.GetPodStatus(ctx, a.Namespace, a.Name)
+	if err != nil {
+		t.Fatalf("GetPodStatus A: %v", err)
+	}
+	if st.Phase != corev1.PodFailed || st.Reason != reasonDeadlineExceeded {
+		t.Fatalf("A status = %s/%s while its stop is held, want Failed/%s", st.Phase, st.Reason, reasonDeadlineExceeded)
+	}
+	waitFor(t, "pod B's stop while A's is held", func() bool {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		for _, id := range f.deleteIDs {
+			if id == string(b.UID) {
+				return true
+			}
+		}
+		return false
+	})
+	pubMu.Lock()
+	pc := published[c.Name]
+	pubMu.Unlock()
+	if pc == nil || pc.Status.Phase == corev1.PodFailed {
+		t.Fatalf("the unrelated pod's status was not published by the resync: %v", pc)
+	}
+
+	shut := make(chan struct{})
+	go func() {
+		r.shutdown()
+		close(shut)
+	}()
+	select {
+	case <-shut:
+		t.Fatal("shutdown returned with a deadline stop in flight")
+	case <-time.After(100 * time.Millisecond):
+	}
+	releaseA()
+	select {
+	case <-shut:
+	case <-time.After(5 * time.Second):
+		t.Fatal("shutdown did not return after the stop finished")
+	}
+	events := recordedEvents(rec.Events)
+	if n := countEvents(events, "Warning "+reasonDeadlineExceeded); n != 2 {
+		t.Errorf("Warning DeadlineExceeded events = %d (%v), want one per failed pod", n, events)
+	}
+	for _, p := range []*corev1.Pod{a, b} {
+		if st := r.trackByID(string(p.UID)).evictedStatus(); st == nil || st.Reason != reasonDeadlineExceeded {
+			t.Errorf("%s track status = %v, want Failed/%s", p.Name, st, reasonDeadlineExceeded)
+		}
 	}
 }
