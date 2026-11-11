@@ -2507,7 +2507,7 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 		// those processes exit. So the pod is parked: kept tracked with its address
 		// reserved, reported ContainerCreating, and re-created once per resync.
 		r.log.Warn("CreatePod: runtimed refused to create beside an earlier run's live processes; the pod is kept and retried",
-			"namespace", pod.Namespace, "name", pod.Name, "err", err)
+			"namespace", pod.Namespace, "name", pod.Name, "pod", string(pod.UID), "err", err)
 		r.parkBlockedCreate(pod, t, err)
 		return nil
 	}
