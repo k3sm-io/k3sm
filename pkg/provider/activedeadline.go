@@ -224,12 +224,18 @@ func (r *runtimedRuntime) persistDeadlineStatus(ctx context.Context, pod *corev1
 	t.restartMu.Unlock()
 }
 
+// deadlineStatusWriteTimeout bounds one per-tick deadline status write so a hung apiserver call cannot stall the resync tick.
+const deadlineStatusWriteTimeout = 5 * time.Second
+
 // persistDeadlineStatusOnce is one attempt of persistEvictedStatus's write, with
 // no back-off: UID-checked, and a nil client is a no-op.
 func (r *runtimedRuntime) persistDeadlineStatusOnce(ctx context.Context, pod *corev1.Pod, st *corev1.PodStatus) error {
 	if r.client == nil {
 		return nil
 	}
+	// A timeout is an ordinary failed attempt: the debt stays and the next tick retries.
+	ctx, cancel := context.WithTimeout(ctx, deadlineStatusWriteTimeout)
+	defer cancel()
 	live, err := r.client.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("get pod %s/%s: %w", pod.Namespace, pod.Name, err)
