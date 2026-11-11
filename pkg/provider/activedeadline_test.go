@@ -70,18 +70,26 @@ func TestPodPastActiveDeadlineFailsDeadlineExceeded(t *testing.T) {
 		deadline *int64
 		parked   bool
 		nilStart bool
+		// backdate, when set, moves the track's start that far before the
+		// provider clock after CreatePod.
+		backdate time.Duration
 		step     time.Duration
 		// update, when set, is the deadline an UpdatePod installs after a first
 		// resync that must leave the pod alone.
 		update     *int64
 		wantFailed bool
 	}{
-		{name: "a running pod past its deadline", deadline: ptr(5), step: 6 * time.Second, wantFailed: true},
-		{name: "a pod parked on an image failure past its deadline", deadline: ptr(5), parked: true, step: 6 * time.Second, wantFailed: true},
+		// Every step clears or misses its deadline by minutes: the track's start
+		// is the wall clock when CreatePod runs, which on a loaded host can be
+		// well after the fake clock was set.
+		{name: "a running pod past its deadline", deadline: ptr(60), step: 20 * time.Minute, wantFailed: true},
+		// The parked pod's start is back-dated instead: a step past the pull
+		// back-off would fire a create re-attempt before the resync.
+		{name: "a pod parked on an image failure past its deadline", deadline: ptr(60), parked: true, backdate: 20 * time.Minute, step: time.Second, wantFailed: true},
 		{name: "a pod with no deadline", step: time.Hour},
-		{name: "a pod whose deadline is not yet reached", deadline: ptr(600), step: 30 * time.Second},
-		{name: "a pod with no start time", deadline: ptr(5), nilStart: true, step: time.Hour},
-		{name: "an update that shortens the deadline is honoured", deadline: ptr(600), step: 30 * time.Second, update: ptr(5), wantFailed: true},
+		{name: "a pod whose deadline is not yet reached", deadline: ptr(3600), step: 10 * time.Minute},
+		{name: "a pod with no start time", deadline: ptr(60), nilStart: true, step: time.Hour},
+		{name: "an update that shortens the deadline is honoured", deadline: ptr(3600), step: 20 * time.Minute, update: ptr(60), wantFailed: true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -122,6 +130,11 @@ func TestPodPastActiveDeadlineFailsDeadlineExceeded(t *testing.T) {
 			if c.nilStart {
 				r.mu.Lock()
 				tr.startTime = metav1.Time{}
+				r.mu.Unlock()
+			}
+			if c.backdate > 0 {
+				r.mu.Lock()
+				tr.startTime = metav1.NewTime(clk.Now().Add(-c.backdate))
 				r.mu.Unlock()
 			}
 			_ = recordedEvents(rec.Events)
