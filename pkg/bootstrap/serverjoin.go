@@ -31,7 +31,7 @@ import (
 // fetching + importing the identical-CA bundle from an existing server.
 type ServerJoinOptions struct {
 	// Server is the existing server's mesh-reachable bootstrap base URL
-	// (https://<mesh-ip>:9345).
+	// (https://<server-address>:9345).
 	Server string
 	// Token is the K10<caHash>::server:<secret> server token: its CA hash PINS the
 	// existing server's TLS chain, and its secret is the bundle's KDF passphrase.

@@ -778,7 +778,8 @@ const bootstrapPort = 9345
 //
 // LAN exposure IS this endpoint's threat model, not a regression of it: every
 // route it serves is authenticated by the K10 cluster token (CA-hash-pinned by the
-// client) or the server-class secret, and the node-password binding is
+// client), the server-class secret, or a joined node's own certificate (the mesh
+// endpoint refresh, deregistration and netserve certificate routes), and the node-password binding is
 // first-write-wins per node name. It has no ambient-authority route.
 //
 // With no mesh (single node) nothing ever opens this listener, but the address is
