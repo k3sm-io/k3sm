@@ -11,8 +11,8 @@
 #   toolchain_problems   the go on PATH, under GOTOOLCHAIN=local, is that release
 #   buildinfo_problems   the build info Go records in the binary names the pinned
 #                        toolchain, main package, module version, no replace,
-#                        the pinned build settings, and (kine) the raised
-#                        golang.org/x/net at XNET_FLOOR or newer
+#                        the pinned build settings, and (kine) every raised
+#                        module in KINE_FLOORS at its floor or newer
 #   buildinfo_settings   the `build` lines, as one line, for a record
 #   marker_problems      the version marker beside a binary names its pin
 #
@@ -36,12 +36,15 @@ toolchain_problems() {
 	[ "$got" = "$want" ] || { echo "the go on PATH is $got; k3sm's out-of-module builds pin $want (PAYLOAD_GO_VERSION): put $want first on PATH"; return 1; }
 }
 
-# XNET_FLOOR is the lowest golang.org/x/net a staged kine may link: the
-# version it is built against (internal/childreq XNetVersion). The caller sets
-# it from that source after sourcing this file; an unset floor is itself a
-# problem for kine. It starts empty, never from the environment, so an
-# ambient XNET_FLOOR cannot lower the floor a caller forgot to set.
-XNET_FLOOR=""
+# KINE_FLOORS is the lowest version of each raised module a staged kine may
+# link, as space-separated "path version" pairs: golang.org/x/net and the
+# golang.org/x modules it requires, each at the version kine is built against
+# (internal/childreq). The caller sets it from that source after sourcing this
+# file (hack/release/stage.sh read_pins, the same read that records the raised
+# set); unset floors are themselves a problem for kine. It starts empty, never
+# from the environment, so an ambient KINE_FLOORS cannot lower the floors a
+# caller forgot to set.
+KINE_FLOORS=""
 
 # release_less <a> <b>: true when release version a ("vX.Y.Z") sorts below b. A
 # version of any other shape (a pseudo-version, a prerelease) never compares as
@@ -61,11 +64,11 @@ release_less() {
 # version (etcd: the server module; etcdutl and metrics-server: their own;
 # kine: built from patched source, so its version is the marker's and the
 # stamped string's), no replaced module, the build settings: CGO_ENABLED=0,
-# darwin/arm64 and -trimpath, and for kine the raised golang.org/x/net,
-# at XNET_FLOOR or newer. Prints one line per problem; returns 0 only when there
-# are none.
+# darwin/arm64 and -trimpath, and for kine every module in KINE_FLOORS,
+# linked at its floor or newer. Prints one line per problem; returns 0 only when
+# there are none.
 buildinfo_problems() {
-	local kind="$1" want="$2" pin="$3" text path mod gov xnet bad=0
+	local kind="$1" want="$2" pin="$3" text path mod gov bad=0
 	text="$(cat)"
 	case "$kind" in
 	kine) path="github.com/k3s-io/kine"; mod="" ;;
@@ -86,13 +89,23 @@ buildinfo_problems() {
 	grep -Eq "^[[:space:]]*=>" <<<"$text" && problem "a module is replaced"
 	case "$kind" in
 	kine)
-		xnet="$(awk '$1 == "dep" && $2 == "golang.org/x/net" { print $3; exit }' <<<"$text")"
-		if [ -z "$XNET_FLOOR" ]; then
-			problem "no golang.org/x/net floor is set (XNET_FLOOR)"
-		elif [ -z "$xnet" ]; then
-			problem "golang.org/x/net is not in the build info (want $XNET_FLOOR or newer)"
-		elif release_less "$xnet" "$XNET_FLOOR"; then
-			problem "golang.org/x/net is $xnet, below the raised $XNET_FLOOR"
+		local -a floors
+		local i fp fv got
+		read -ra floors <<<"$KINE_FLOORS"
+		if [ "${#floors[@]}" -eq 0 ]; then
+			problem "no raised-module floors are set (KINE_FLOORS)"
+		elif [ $((${#floors[@]} % 2)) -ne 0 ]; then
+			problem "the raised-module floors are malformed (KINE_FLOORS is not path/version pairs): $KINE_FLOORS"
+		else
+			for ((i = 0; i < ${#floors[@]}; i += 2)); do
+				fp="${floors[i]}" fv="${floors[i + 1]}"
+				got="$(awk -v p="$fp" '$1 == "dep" && $2 == p { print $3; exit }' <<<"$text")"
+				if [ -z "$got" ]; then
+					problem "$fp is not in the build info (want $fv or newer)"
+				elif release_less "$got" "$fv"; then
+					problem "$fp is $got, below the raised $fv"
+				fi
+			done
 		fi
 		;;
 	esac
