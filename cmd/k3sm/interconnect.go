@@ -289,7 +289,27 @@ func interconnectClients(kubeconfig string) (kubernetes.Interface, dynamic.Inter
 		err error
 	)
 	if kubeconfig != "" {
-		cfg, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
+		// As root run by sudo the path is the invoker's: check the whole file
+		// as `k3sm kubectl` does, and load the checked copy.
+		var kc kubectlConfig
+		kc, err = vetSudoKubeconfig(kubectlInputs{
+			workDirOverride: os.Getenv("K3SM_WORK_DIR"),
+			workDir:         workDirFromEnv(),
+			asRoot:          kubectlGeteuid() == 0,
+		}.withSudoInvoker(), kubectlConfig{kubeconfig: kubeconfig})
+		if err != nil {
+			return nil, nil, err
+		}
+		vetted, cleanup, verr := vettedLoadingRules(kc)
+		if verr != nil {
+			return nil, nil, verr
+		}
+		defer cleanup()
+		if vetted != nil {
+			cfg, err = clientcmd.NewNonInteractiveDeferredLoadingClientConfig(vetted, &clientcmd.ConfigOverrides{}).ClientConfig()
+		} else {
+			cfg, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
+		}
 	} else {
 		home, _ := os.UserHomeDir()
 		var kc kubectlConfig

@@ -42,6 +42,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 
 	budgetv1alpha1 "k3sm.io/apis/budget/v1alpha1"
 	netv1alpha1 "k3sm.io/apis/net/v1alpha1"
@@ -143,14 +144,24 @@ func reportTopKube() (status.Kube, error) {
 // newStatusKube) and, when they give no client, the invoking account's own
 // kubeconfig context for the server a worker joined (user, from
 // statusUserKubeFor, nil on a server). When the fallback fails too, the
-// primary's error is the one returned, since it says what the role lacked.
+// primary's error is the one returned, since it says what the role lacked, with
+// the fallback's refusal added when root refused the account's own kubeconfig.
 func readVerbKube(primary, user func() (status.Kube, string, error)) (status.Kube, string, error) {
 	kube, source, err := primary()
 	if kube != nil || user == nil {
 		return kube, source, err
 	}
-	if k, s, uerr := user(); uerr == nil && k != nil {
+	k, s, uerr := user()
+	if uerr == nil && k != nil {
 		return k, s, nil
+	}
+	if refusal := (sudoKubeconfigRefusal{}); errors.As(uerr, &refusal) {
+		// The account's own kubeconfig was refused as root: say why, since
+		// the primary's error alone would hide that the fallback was tried.
+		if err == nil {
+			return kube, source, uerr
+		}
+		return kube, source, fmt.Errorf("%w; %w", err, uerr)
 	}
 	return kube, source, err
 }
@@ -796,6 +807,7 @@ func statusKubeconfig(in statusKubeInputs) (kubectlConfig, error) {
 		exists:          in.exists,
 		asRoot:          in.asRoot,
 		sudoUser:        in.sudoUser,
+		oneContext:      true,
 	})
 }
 
@@ -856,12 +868,21 @@ func statusUserKubeFor(role install.Role, joinServer func() (string, error), sta
 	return func() (status.Kube, string, error) {
 		// As root run by sudo these are the invoker's files: check them, and
 		// read the checked bytes.
+		// Only the context this report would use is checked and kept.
 		home, _ := os.UserHomeDir()
-		vc, err := vetSudoKubeconfig(kubectlInputs{
+		name := installedKubeconfigName()
+		vc, err := vetSudoKubeconfigContext(kubectlInputs{
 			kubeconfigEnv: os.Getenv("KUBECONFIG"),
 			home:          home,
 			asRoot:        kubectlGeteuid() == 0,
-		}.withSudoInvoker(), kubectlConfig{})
+		}.withSudoInvoker(), kubectlConfig{}, func(merged *clientcmdapi.Config) (string, error) {
+			join, err := joinServer()
+			if err != nil {
+				return "", fmt.Errorf("the server this Mac joined is unknown, so no context can be shown to point at it: %w", err)
+			}
+			ctxName, _ := status.UserKubeContext(merged, name, status.NodeAnchor(statusEndpoints(statusDir), status.JoinAnchor(join)))
+			return ctxName, nil
+		})
 		if err != nil {
 			return nil, "", err
 		}
@@ -882,7 +903,6 @@ func statusUserKubeFor(role install.Role, joinServer func() (string, error), sta
 		if err != nil {
 			return nil, "", fmt.Errorf("the server this Mac joined is unknown, so no context can be shown to point at it: %w", err)
 		}
-		name := installedKubeconfigName()
 		ctxName, ok := status.UserKubeContext(raw, name, status.NodeAnchor(statusEndpoints(statusDir), status.JoinAnchor(join)))
 		if !ok {
 			return nil, "", fmt.Errorf("neither the %q context nor the current one points at the server this Mac joined", name)

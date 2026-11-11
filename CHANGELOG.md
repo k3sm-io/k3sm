@@ -273,7 +273,10 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
   credential plugin (`exec`, `auth-provider`), read a file (`tokenFile`, `client-certificate`,
   `client-key`, `certificate-authority`) or use a `proxy-url`, or one that is a symlink or writable by
   group or others. They refuse it, naming the field and the file, and load only a root-only copy of
-  the kubeconfig they checked. `k3sm kubeconfig --write` also refuses to merge into a symlink or
+  the kubeconfig they checked. `k3sm kubectl`, the builder verbs and `k3sm interconnect` (including
+  its `--kubeconfig` path) check every cluster and user in the file, since you can pick any of them;
+  `k3sm status` and the other read-only commands check only the context they use, and their copy
+  holds only that context, so another cluster's `exec` user does not stop them. `k3sm kubeconfig --write` also refuses to merge into a symlink or
   another account's file. Flags you type on the `k3sm kubectl` command line (for example a different
   `--kubeconfig` path) are your own choice and are not checked.
 - A server whose control plane does not report healthy in time while the Mac is heavily loaded no

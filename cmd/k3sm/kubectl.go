@@ -154,6 +154,11 @@ type kubectlInputs struct {
 	// sudoUser is $SUDO_USER, set by withSudoInvoker. As root, an invoker's
 	// kubeconfig is checked before it is used (vetSudoKubeconfig).
 	sudoUser string
+	// oneContext says the caller uses only the context it resolves, never one
+	// the invoker picks on the command line (`k3sm status`), so as root run by
+	// sudo only that context's entries are checked and kept
+	// (vetSudoKubeconfigContext).
+	oneContext bool
 }
 
 // installedNodeCredential is the role this Mac is installed as and where a
@@ -224,6 +229,9 @@ func resolveKubectlConfig(in kubectlInputs) (kubectlConfig, error) {
 	cfg, err := chooseKubectlConfig(in)
 	if err != nil {
 		return kubectlConfig{}, err
+	}
+	if in.oneContext {
+		return vetSudoKubeconfigContext(in, cfg, pinnedOrCurrentContext(cfg.context))
 	}
 	return vetSudoKubeconfig(in, cfg)
 }

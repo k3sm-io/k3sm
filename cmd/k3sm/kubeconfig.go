@@ -153,7 +153,9 @@ func loadKubeconfigSource(name string) (*clientcmdapi.Config, error) {
 			return nil, fmt.Errorf("load k3sm kubeconfig %s (run `k3sm server` first): %w", srcPath, err)
 		}
 	}
-	vc, err := vetSudoKubeconfig(in, kubectlConfig{})
+	// Only the named context is used, so only its entries are checked and
+	// kept (vetSudoKubeconfigContext).
+	vc, err := vetSudoKubeconfigContext(in, kubectlConfig{}, func(*clientcmdapi.Config) (string, error) { return name, nil })
 	if err != nil {
 		return nil, err
 	}

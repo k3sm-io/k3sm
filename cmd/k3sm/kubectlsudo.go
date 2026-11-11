@@ -29,6 +29,7 @@ import (
 	"syscall"
 
 	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 
 	"k3sm.io/k3sm/pkg/executor"
 )
@@ -82,41 +83,137 @@ func (in kubectlInputs) underSudo() bool {
 // kubectl reads its kubeconfig itself, after this check, so the caller hands it
 // the checked bytes (writeVettedKubeconfigs) rather than the invoker's path.
 func vetSudoKubeconfig(in kubectlInputs, cfg kubectlConfig) (kubectlConfig, error) {
+	files, checked, err := readSudoKubeconfigFiles(in, cfg)
+	if err != nil || !checked {
+		return cfg, err
+	}
+	for _, f := range files {
+		if field, err := sudoKubeconfigCredentialField(f.data); err != nil {
+			return kubectlConfig{}, sudoKubeconfigRefusal{fmt.Errorf("kubeconfig %s: %w", f.path, err)}
+		} else if field != "" {
+			return kubectlConfig{}, sudoKubeconfigRefusal{fmt.Errorf("kubeconfig %s sets %s, which root does not act on for %s; run this without sudo", f.path, field, in.sudoUser)}
+		}
+	}
+	cfg.vetted = &files
+	return cfg, nil
+}
+
+// readSudoKubeconfigFiles reads, for root run by sudo, every kubeconfig file cfg
+// would have root read, each checked as a file (readSudoInvokerFile) but not for
+// what it says. checked is false when nothing needs checking: not under sudo, or
+// root's own admin kubeconfig or the node credential.
+func readSudoKubeconfigFiles(in kubectlInputs, cfg kubectlConfig) (files []vettedKubeconfig, checked bool, err error) {
 	if !in.underSudo() {
-		return cfg, nil
+		return nil, false, nil
 	}
 	var paths []string
 	switch {
 	case cfg.kubeconfig == "":
 		paths = kubectlRuleFiles(in)
 	case in.workDirOverride == "" && cfg.kubeconfig == executor.KubeconfigPath(in.workDir):
-		return cfg, nil
+		return nil, false, nil
 	case in.nodeKubeconfig != "" && cfg.kubeconfig == in.nodeKubeconfig:
-		return cfg, nil
+		return nil, false, nil
 	default:
 		paths = []string{cfg.kubeconfig}
 	}
 	uid, err := sudoInvokerUID(in)
 	if err != nil {
-		return kubectlConfig{}, err
+		return nil, false, err
 	}
-	var files []vettedKubeconfig
+	files = []vettedKubeconfig{}
 	for _, p := range paths {
 		data, err := readSudoInvokerFile(in, uid, p)
 		if errors.Is(err, fs.ErrNotExist) {
 			continue // kubectl skips a missing entry too
 		}
 		if err != nil {
-			return kubectlConfig{}, err
-		}
-		if field, err := sudoKubeconfigCredentialField(data); err != nil {
-			return kubectlConfig{}, sudoKubeconfigRefusal{fmt.Errorf("kubeconfig %s: %w", p, err)}
-		} else if field != "" {
-			return kubectlConfig{}, sudoKubeconfigRefusal{fmt.Errorf("kubeconfig %s sets %s, which root does not act on for %s; run this without sudo", p, field, in.sudoUser)}
+			return nil, false, err
 		}
 		files = append(files, vettedKubeconfig{path: p, data: data})
 	}
-	cfg.vetted = &files
+	return files, true, nil
+}
+
+// pinnedOrCurrentContext picks pinned, or the merged files' current context when
+// nothing is pinned: the context kubectl's own rules would use.
+func pinnedOrCurrentContext(pinned string) func(*clientcmdapi.Config) (string, error) {
+	return func(merged *clientcmdapi.Config) (string, error) {
+		if pinned != "" {
+			return pinned, nil
+		}
+		return merged.CurrentContext, nil
+	}
+}
+
+// vetSudoKubeconfigContext is vetSudoKubeconfig for a verb that uses ONE context
+// it picks itself (`k3sm status`, its worker fallback and top view, `k3sm
+// kubeconfig`), not one the invoker can switch on the command line. The files are
+// checked as files the same way, then pick names the context from the files
+// merged as kubectl merges them (the first file to set a name wins), and only
+// that context's cluster and user are checked for what root would act on. The
+// checked copy holds that context, cluster and user and nothing else, so no
+// other entry's plugin or file path ever reaches root's loading rules.
+//
+// pick returning "" (or a name the files do not define) selects nothing: the
+// copy is empty and the caller's own load reports the missing context. An error
+// from pick is returned as it is.
+func vetSudoKubeconfigContext(in kubectlInputs, cfg kubectlConfig, pick func(*clientcmdapi.Config) (string, error)) (kubectlConfig, error) {
+	files, checked, err := readSudoKubeconfigFiles(in, cfg)
+	if err != nil || !checked {
+		return cfg, err
+	}
+	merged := clientcmdapi.NewConfig()
+	clusterFrom, userFrom := map[string]string{}, map[string]string{}
+	for _, f := range files {
+		c, err := clientcmd.Load(f.data)
+		if err != nil {
+			return kubectlConfig{}, sudoKubeconfigRefusal{fmt.Errorf("kubeconfig %s: parse: %w", f.path, err)}
+		}
+		if merged.CurrentContext == "" {
+			merged.CurrentContext = c.CurrentContext
+		}
+		for name, v := range c.Clusters {
+			if _, ok := merged.Clusters[name]; !ok {
+				merged.Clusters[name], clusterFrom[name] = v, f.path
+			}
+		}
+		for name, v := range c.AuthInfos {
+			if _, ok := merged.AuthInfos[name]; !ok {
+				merged.AuthInfos[name], userFrom[name] = v, f.path
+			}
+		}
+		for name, v := range c.Contexts {
+			if _, ok := merged.Contexts[name]; !ok {
+				merged.Contexts[name] = v
+			}
+		}
+	}
+	name, err := pick(merged)
+	if err != nil {
+		return kubectlConfig{}, err
+	}
+	first := ""
+	if len(files) > 0 {
+		first = files[0].path
+	}
+	out := []vettedKubeconfig{}
+	one, err := extractContext(merged, name)
+	if name != "" && err == nil {
+		kctx := one.Contexts[name]
+		if field := sudoKubeconfigClusterField(kctx.Cluster, one.Clusters[kctx.Cluster]); field != "" {
+			return kubectlConfig{}, sudoKubeconfigRefusal{fmt.Errorf("kubeconfig %s sets %s, which root does not act on for %s; run this without sudo", clusterFrom[kctx.Cluster], field, in.sudoUser)}
+		}
+		if field := sudoKubeconfigUserField(kctx.AuthInfo, one.AuthInfos[kctx.AuthInfo]); field != "" {
+			return kubectlConfig{}, sudoKubeconfigRefusal{fmt.Errorf("kubeconfig %s sets %s, which root does not act on for %s; run this without sudo", userFrom[kctx.AuthInfo], field, in.sudoUser)}
+		}
+		data, err := clientcmd.Write(*one)
+		if err != nil {
+			return kubectlConfig{}, fmt.Errorf("copy the checked kubeconfig: %w", err)
+		}
+		out = append(out, vettedKubeconfig{path: first, data: data})
+	}
+	cfg.vetted = &out
 	return cfg, nil
 }
 
@@ -252,36 +349,50 @@ func sudoKubeconfigCredentialField(data []byte) (string, error) {
 		return "", fmt.Errorf("parse: %w", err)
 	}
 	for _, name := range sortedNames(cfg.Clusters) {
-		c := cfg.Clusters[name]
-		if c == nil {
-			continue
-		}
-		switch {
-		case c.CertificateAuthority != "":
-			return fmt.Sprintf("cluster %q certificate-authority", name), nil
-		case c.ProxyURL != "":
-			return fmt.Sprintf("cluster %q proxy-url", name), nil
+		if field := sudoKubeconfigClusterField(name, cfg.Clusters[name]); field != "" {
+			return field, nil
 		}
 	}
 	for _, name := range sortedNames(cfg.AuthInfos) {
-		a := cfg.AuthInfos[name]
-		if a == nil {
-			continue
-		}
-		switch {
-		case a.Exec != nil:
-			return fmt.Sprintf("user %q exec", name), nil
-		case a.AuthProvider != nil:
-			return fmt.Sprintf("user %q auth-provider", name), nil
-		case a.TokenFile != "":
-			return fmt.Sprintf("user %q tokenFile", name), nil
-		case a.ClientCertificate != "":
-			return fmt.Sprintf("user %q client-certificate", name), nil
-		case a.ClientKey != "":
-			return fmt.Sprintf("user %q client-key", name), nil
+		if field := sudoKubeconfigUserField(name, cfg.AuthInfos[name]); field != "" {
+			return field, nil
 		}
 	}
 	return "", nil
+}
+
+// sudoKubeconfigClusterField names the field of cluster name that would have
+// root read a file or use a proxy, or "".
+func sudoKubeconfigClusterField(name string, c *clientcmdapi.Cluster) string {
+	switch {
+	case c == nil:
+		return ""
+	case c.CertificateAuthority != "":
+		return fmt.Sprintf("cluster %q certificate-authority", name)
+	case c.ProxyURL != "":
+		return fmt.Sprintf("cluster %q proxy-url", name)
+	}
+	return ""
+}
+
+// sudoKubeconfigUserField names the field of user name that would have root run
+// a program or read a file, or "".
+func sudoKubeconfigUserField(name string, a *clientcmdapi.AuthInfo) string {
+	switch {
+	case a == nil:
+		return ""
+	case a.Exec != nil:
+		return fmt.Sprintf("user %q exec", name)
+	case a.AuthProvider != nil:
+		return fmt.Sprintf("user %q auth-provider", name)
+	case a.TokenFile != "":
+		return fmt.Sprintf("user %q tokenFile", name)
+	case a.ClientCertificate != "":
+		return fmt.Sprintf("user %q client-certificate", name)
+	case a.ClientKey != "":
+		return fmt.Sprintf("user %q client-key", name)
+	}
+	return ""
 }
 
 func sortedNames[V any](m map[string]V) []string {
