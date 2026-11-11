@@ -710,11 +710,6 @@ on the default runtime too, so they inherit its behavior here.
 - Under `Never`, a failed `postStart` hook stops the container, which stays `Terminated`, and the
   Pod goes `Failed`, as upstream. Its `preStop` hook does not run before that stop.
 - On a `vm` Pod that stop is not available: the container is held NotReady and keeps running.
-- A Pod's `activeDeadlineSeconds` is enforced on the node's 10 s status resync, so the Pod goes
-  `Failed` with reason `DeadlineExceeded` up to about 10 s after its deadline. Its address is held
-  until the Pod is deleted. Its containers are stopped with the Pod's termination grace period
-  (at least 2 s), and its `preStop` hooks do not run before that stop. On `--runtime hostprocess`
-  the deadline is not enforced.
 
 **Plain init containers are not restarted**, and that is the one remaining gap on the default
 runtime. A regular (non-sidecar) init container that fails under `Always` / `OnFailure` is not re-run
@@ -725,6 +720,10 @@ once and never respawned, whatever the Pod or container policy says. If you are 
 process that exits stays exited until a `Deployment`/`Job` controller replaces the Pod.
 
 **An image edit on a running Pod does not restart its container, as it does upstream.** The container stays on its image and `containerStatuses[].image` keeps naming it until the Pod is recreated: a `vm` Pod records a `Warning` `ImageEditNotApplied` Event, while a native Pod on the default runtime records no warning and can report `Pulling` and `Pulled` for the new image though nothing runs it. A `vm` Pod parked on an image failure takes the edit at its next retry.
+
+### `activeDeadlineSeconds` Is Enforced on the Default Runtime, Not on `hostprocess`
+
+A Pod that runs past its `activeDeadlineSeconds` is marked `Failed` with reason `DeadlineExceeded`. The check runs every 10 s, so this can happen up to about 10 s after the deadline. The Pod's IP address stays reserved until you delete the Pod. Its containers get the Pod's `terminationGracePeriodSeconds` to stop, but never less than 2 s. `preStop` hooks do not run. With `--runtime hostprocess` the deadline is not enforced and the Pod keeps running, so delete it yourself or use the default runtime.
 
 ### What Survives a Node-Daemon Restart
 
