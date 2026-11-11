@@ -37,5 +37,8 @@ func MatchArgPrefix(name string, flags []string) (string, bool) {
 			match, n = flag, n+1
 		}
 	}
-	return match, n == 1
+	if n != 1 {
+		return "", false
+	}
+	return match, true
 }

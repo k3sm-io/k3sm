@@ -44,7 +44,7 @@ func TestMatchArgPrefix(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got, ok := MatchArgPrefix(tc.arg, tc.flags)
-			if ok != tc.wantMatch || (ok && got != tc.wantFlag) {
+			if ok != tc.wantMatch || got != tc.wantFlag || (!ok && got != "") {
 				t.Errorf("MatchArgPrefix(%q) = (%q, %v), want (%q, %v)", tc.arg, got, ok, tc.wantFlag, tc.wantMatch)
 			}
 		})
