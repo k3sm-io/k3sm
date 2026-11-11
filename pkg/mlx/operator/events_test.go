@@ -267,6 +267,20 @@ func TestArtifactResolutionFailureEventReason(t *testing.T) {
 		}
 		assertArtifactUnresolved(t, h, rec)
 	})
+	t.Run("registry error retried at one generation", func(t *testing.T) {
+		rec := &fakeRecorder{}
+		outage := ArtifactResolverFunc(func(context.Context, string, string, string) (string, error) {
+			return "", errors.New("registry-k3sm:6450: connection refused")
+		})
+		h := artifactHarness(t, testRegistryHost+"/models/qwen3:v1", outage)
+		h.ctrl.recorder = rec
+		for i := range 2 {
+			if err := h.ctrl.Reconcile(context.Background(), key()); err == nil {
+				t.Fatalf("reconcile %d returned nil for a registry outage, want the transient error", i+1)
+			}
+		}
+		assertArtifactUnresolved(t, h, rec)
+	})
 	t.Run("no resolver", func(t *testing.T) {
 		rec := &fakeRecorder{}
 		h := artifactHarness(t, testRegistryHost+"/models/qwen3:v1", nil)
