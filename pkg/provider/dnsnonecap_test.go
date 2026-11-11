@@ -112,7 +112,13 @@ func TestDNSPolicyNoneCapKeepsIPv4Servers(t *testing.T) {
 		// pod is refused: with msgDNSNoneIPv6Only, or, when wantRefusal is set,
 		// with a message containing it.
 		wantServers []string
+		// wantMapped is the nameserver list dnsPolicyNoneConfig returns, asserted in
+		// every case, refused or not.
+		wantMapped  []string
 		wantRefusal string
+		// skipDarwin skips the darwin-net cross-check: it rejects a zoned entry
+		// outright, which this case carries past the cap.
+		skipDarwin  bool
 		wantPartial []string // DNSConfigPartial's dropped list; nil means no event
 		wantCapped  []string // the nameserver cap event's dropped list; nil means no event
 		wantSearch  string   // K3SM_DNS_SEARCH, when the pod runs
@@ -124,6 +130,7 @@ func TestDNSPolicyNoneCapKeepsIPv4Servers(t *testing.T) {
 			name:        "three IPv6 then one IPv4 runs on the IPv4",
 			ns:          []string{v6a, v6b, v6c, "1.1.1.1"},
 			wantServers: []string{"1.1.1.1"},
+			wantMapped:  []string{"1.1.1.1"},
 			wantPartial: []string{v6a, v6b, v6c},
 			wantSearch:  "", wantNdots: "5",
 		},
@@ -131,6 +138,7 @@ func TestDNSPolicyNoneCapKeepsIPv4Servers(t *testing.T) {
 			name:        "four IPv4 keep the first three, the cap names the fourth",
 			ns:          []string{"1.1.1.1", "8.8.8.8", "9.9.9.9", "8.8.4.4"},
 			wantServers: []string{"1.1.1.1", "8.8.8.8", "9.9.9.9"},
+			wantMapped:  []string{"1.1.1.1", "8.8.8.8", "9.9.9.9"},
 			wantCapped:  []string{"8.8.4.4"},
 			wantSearch:  "", wantNdots: "5",
 		},
@@ -138,18 +146,21 @@ func TestDNSPolicyNoneCapKeepsIPv4Servers(t *testing.T) {
 			name:        "mixed with more than three IPv4: cap names only IPv4, partial only IPv6",
 			ns:          []string{v6a, "1.1.1.1", v6b, "8.8.8.8", "9.9.9.9", v6c, "8.8.4.4", "1.0.0.1"},
 			wantServers: []string{"1.1.1.1", "8.8.8.8", "9.9.9.9"},
+			wantMapped:  []string{"1.1.1.1", "8.8.8.8", "9.9.9.9"},
 			wantPartial: []string{v6a, v6b, v6c},
 			wantCapped:  []string{"8.8.4.4", "1.0.0.1"},
 			wantSearch:  "", wantNdots: "5",
 		},
 		{
-			name: "all IPv6 is refused and draws no address",
-			ns:   []string{v6a, v6b, v6c, v6d},
+			name:       "all IPv6 is refused and draws no address",
+			ns:         []string{v6a, v6b, v6c, v6d},
+			wantMapped: []string{v6a, v6b, v6c},
 		},
 		{
 			name:        "a mapped IPv4 is kept in dotted form",
 			ns:          []string{v6a, "::ffff:1.1.1.1"},
 			wantServers: []string{"1.1.1.1"},
+			wantMapped:  []string{"1.1.1.1"},
 			wantPartial: []string{v6a},
 			wantSearch:  "", wantNdots: "5",
 		},
@@ -157,6 +168,7 @@ func TestDNSPolicyNoneCapKeepsIPv4Servers(t *testing.T) {
 			name:        "duplicates are merged before the filter and the cap",
 			ns:          []string{v6a, v6a, "1.1.1.1", "::ffff:1.1.1.1", v6b, "9.9.9.9", "1.1.1.1", "8.8.8.8", v6b},
 			wantServers: []string{"1.1.1.1", "9.9.9.9", "8.8.8.8"},
+			wantMapped:  []string{"1.1.1.1", "9.9.9.9", "8.8.8.8"},
 			wantPartial: []string{v6a, v6b},
 			wantSearch:  "", wantNdots: "5",
 		},
@@ -170,6 +182,7 @@ func TestDNSPolicyNoneCapKeepsIPv4Servers(t *testing.T) {
 				{Name: "timeout", Value: ptr("3")},
 			},
 			wantServers: []string{"1.1.1.1"},
+			wantMapped:  []string{"1.1.1.1"},
 			wantPartial: []string{v6a, v6b, v6c},
 			wantSearch:  "a.example b.example", wantNdots: "2",
 			wantOptions: []netv1.DNSOption{{Name: "edns0"}, {Name: "timeout", Value: "3"}},
@@ -179,6 +192,7 @@ func TestDNSPolicyNoneCapKeepsIPv4Servers(t *testing.T) {
 			name:        "the IPv4 predicate agrees with darwin-net",
 			ns:          []string{"::ffff:8.8.8.8", v6d, "1.1.1.1"},
 			wantServers: []string{"8.8.8.8", "1.1.1.1"},
+			wantMapped:  []string{"8.8.8.8", "1.1.1.1"},
 			wantPartial: []string{v6d},
 			wantSearch:  "", wantNdots: "5",
 		},
@@ -188,17 +202,38 @@ func TestDNSPolicyNoneCapKeepsIPv4Servers(t *testing.T) {
 			// ahead of the IPv4 server, so no cap event names 1.1.1.1.
 			name:        "zoned IPv6 ahead of an IPv4 is refused by Validate on the zone",
 			ns:          []string{"fe80::1%en0", "fe80::2%en0", "fe80::3%en0", "1.1.1.1"},
+			wantMapped:  []string{"fe80::1%en0"},
 			wantRefusal: `nameserver "fe80::1%en0" must not carry a zone`,
 		},
 		{
-			name:        "an unparseable entry ahead of an IPv4 is refused by Validate",
+			name: "an unparseable entry ahead of an IPv4 is refused by Validate",
+			// Only the break on a refused entry keeps 1.1.1.1 out of the mapped list.
 			ns:          []string{"not-an-ip", "1.1.1.1"},
+			wantMapped:  []string{"not-an-ip"},
 			wantRefusal: `nameserver "not-an-ip" is not an IP address`,
+		},
+		{
+			name:        "a refused entry between two IPv4 drops the one after it",
+			ns:          []string{"1.1.1.1", "not-an-ip", "8.8.8.8"},
+			wantMapped:  []string{"1.1.1.1", "not-an-ip"},
+			wantRefusal: `nameserver "not-an-ip" is not an IP address`,
+		},
+		{
+			// The cap is full when the zoned entry arrives, so it is dropped as a
+			// capped server (named as written) and the pod runs on the three IPv4.
+			name:        "a zoned entry past a full cap is dropped and the pod runs",
+			ns:          []string{"1.1.1.1", "8.8.8.8", "9.9.9.9", "fe80::1%en0"},
+			wantServers: []string{"1.1.1.1", "8.8.8.8", "9.9.9.9"},
+			wantMapped:  []string{"1.1.1.1", "8.8.8.8", "9.9.9.9"},
+			wantCapped:  []string{"fe80::1%en0"},
+			skipDarwin:  true,
+			wantSearch:  "", wantNdots: "5",
 		},
 		{
 			name:        "a mapped IPv4 past the cap is named in dotted form",
 			ns:          []string{"1.1.1.1", "8.8.8.8", "9.9.9.9", "::ffff:8.8.4.4"},
 			wantServers: []string{"1.1.1.1", "8.8.8.8", "9.9.9.9"},
+			wantMapped:  []string{"1.1.1.1", "8.8.8.8", "9.9.9.9"},
 			wantCapped:  []string{"8.8.4.4"},
 			wantSearch:  "", wantNdots: "5",
 		},
@@ -209,8 +244,11 @@ func TestDNSPolicyNoneCapKeepsIPv4Servers(t *testing.T) {
 
 			// The mapping itself.
 			cfg, forming := dnsPolicyNoneConfig(spec)
-			if tc.wantServers != nil && !slices.Equal(cfg.Nameservers, tc.wantServers) {
-				t.Errorf("mapped Nameservers = %v, want %v", cfg.Nameservers, tc.wantServers)
+			if !slices.Equal(cfg.Nameservers, tc.wantMapped) {
+				t.Errorf("mapped Nameservers = %v, want %v", cfg.Nameservers, tc.wantMapped)
+			}
+			if len(tc.wantServers) == 0 && tc.wantRefusal == "" && len(forming.droppedIPv6) != 0 {
+				t.Errorf("all-IPv6 forming droppedIPv6 = %v, want none (the servers are kept for the refusal)", forming.droppedIPv6)
 			}
 			if !slices.Equal(cfg.SearchDomains, tc.searches) {
 				t.Errorf("mapped SearchDomains = %v, want %v", cfg.SearchDomains, tc.searches)
@@ -225,7 +263,7 @@ func TestDNSPolicyNoneCapKeepsIPv4Servers(t *testing.T) {
 				t.Errorf("forming droppedNameservers = %v, want %v (IPv4 past the cap only)", forming.droppedNameservers, tc.wantCapped)
 			}
 
-			if tc.wantServers != nil {
+			if tc.wantServers != nil && !tc.skipDarwin {
 				// Every pod that runs: the deduped input through darwin-net's own
 				// IPv4 split, limited to the cap, is exactly what the mapping keeps,
 				// and what darwin-net drops is what DNSConfigPartial names.
@@ -298,9 +336,12 @@ func TestDNSPolicyNoneCapKeepsIPv4Servers(t *testing.T) {
 				if got := eventDropList(partial[0]); !slices.Equal(got, tc.wantPartial) {
 					t.Errorf("DNSConfigPartial names %v, want exactly the IPv6 servers %v (%q)", got, tc.wantPartial, partial[0])
 				}
+				if want := "Warning " + reasonDNSConfigPartial + " " + msgDNSConfigPartial(tc.wantPartial); partial[0] != want {
+					t.Errorf("DNSConfigPartial event = %q, want %q", partial[0], want)
+				}
 			}
 
-			capped := dnsEventsWith(events, "Warning "+reasonDNSConfigForming+" k3sm: dnsPolicy None nameserver limits")
+			capped := dnsEventsWith(events, "Warning "+reasonDNSConfigForming+" ")
 			switch {
 			case tc.wantCapped == nil && len(capped) != 0:
 				t.Errorf("nameserver cap events = %q, want none", capped)
