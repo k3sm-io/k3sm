@@ -619,15 +619,22 @@ time the breaker tripped.
 
 A control plane that is still alive but does not report healthy in time while the Mac is heavily
 loaded is not counted toward the breaker. The server waits before its next attempt instead, from 30
-seconds doubling up to 10 minutes, and `k3sm status` shows when the next attempt starts; it parks
-only after eight such attempts in a row. The server counts the Mac as heavily loaded only when both
-the one-minute and the five-minute load averages are high, and it writes the load it read into the
-crash-loop record.
+seconds doubling up to 10 minutes. While it is backing off or restarting and has not parked,
+`k3sm status` reports the server row as `crash-loop` with a warning. The detail reads
+`bring-up backing off until <time>` during the wait and `bring-up attempt <n> in progress` once the
+next attempt runs, and the remedy is `uptime; memory_pressure`. The server parks only after eight
+slow attempts without a healthy start in between. The server counts the Mac as heavily loaded only
+when both the 1-minute and the 5-minute load averages are at least 2 per core, and it writes the
+load it read into the crash-loop record.
 
-Each component's previous log is kept beside the current one as `<component>.log.1`. While failures
-are on record, `<component>.log.1` holds the log of the first failed start and is not replaced, and
-the most recent failed start is kept as `<component>.log.2` (its last 4 MiB when it is larger). The
-next start after a healthy bring-up replaces them. `k3sm uninstall` removes these kept logs.
+Each control-plane component (kine, etcd, kube-apiserver, kube-scheduler and
+kube-controller-manager) writes its log to `/var/lib/k3sm/server/<component>.log`. On a restart the
+previous run's log is kept as `<component>.log.1`. While failures are on record, `<component>.log.1`
+stays the log of the first failed run, with a marker file `<component>.log.1.pinned` beside it, and
+the most recent failed run is kept as `<component>.log.2` (its last 4 MiB when it is larger). After
+a healthy start the marker is removed, so the next restart replaces `<component>.log.1` again, and
+`<component>.log.2` stays until the next failure replaces it. `k3sm uninstall` removes the kept
+`.log.1`, `.log.2` and `.pinned` files; the live logs stay with the work directory.
 
 A server that was killed outright leaves its control-plane processes running. Its next start stops
 the ones it left behind before starting its own, so they do not count toward the breaker; a process

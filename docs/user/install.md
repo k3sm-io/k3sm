@@ -444,7 +444,9 @@ loads no pf rule). Your cluster data, the `_k3sm` user, and your kubeconfig are 
 reinstall picks up where you left off; to remove those too, see
 [Remove Everything](#remove-everything). The server's admin token is removed, because a reinstall
 mints a new one, and so are the records the node writes for `k3sm status` (in the server's work directory
-and in `/var/lib/k3sm/status/`), because they describe a node that no longer runs. The managed update's working directory
+and in `/var/lib/k3sm/status/`), because they describe a node that no longer runs. Uninstall also removes the kept earlier component logs in the server's work directory
+(`<component>.log.1`, `<component>.log.2` and the `.pinned` marker); the live logs stay with the work
+directory. The managed update's working directory
 `/var/lib/k3sm/updates` goes too, with any download a failed update left in it. The command prints the full list of what it kept. If you
 installed a data volume, it stays mounted and declared; the command prints `sudo k3sm install
 --data-volume` to reinstall onto it and `sudo k3sm datavol delete --yes` to remove it for good.

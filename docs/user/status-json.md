@@ -171,7 +171,7 @@ A daemon row's `state` is one of:
 | `not-loaded` | all | not bootstrapped in the system domain |
 | `disabled` | all | disabled in launchd, so it will not start |
 | `failed` | all | not running; its one run exited non-zero |
-| `crash-loop` | all | launchd keeps restarting it into the same failure; on `server` also the control plane restarting after crashes (`warn`) or parked after too many (`fail`) |
+| `crash-loop` | all | launchd keeps restarting it into the same failure; on `server` also the control plane restarting after crashes or backing off between bring-up attempts on a heavily loaded Mac (`warn`) or parked after too many (`fail`) |
 | `unknown` | all | launchctl's output could not be read, or launchd says running and the pid is gone |
 | `waiting` | `agent` | the daemon is up and this Mac has not joined a cluster yet |
 | `expired` | `agent` | the node credential has expired |
