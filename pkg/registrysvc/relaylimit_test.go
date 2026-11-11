@@ -99,7 +99,20 @@ type relayLimitFixture struct {
 
 func newRelayLimitFixture(t *testing.T) *relayLimitFixture {
 	t.Helper()
-	z, zaddr := socketRegistry(t)
+	return newRelayLimitFixtureWith(t, defaultRelayLimits, nil)
+}
+
+// newRelayLimitFixtureWith is newRelayLimitFixture with the relay's limits set
+// to lim and, when registry is not nil, the fake registry serving through it.
+func newRelayLimitFixtureWith(t *testing.T, lim relayLimits, registry http.Handler) *relayLimitFixture {
+	t.Helper()
+	z := newFakeRegistry(t)
+	if registry != nil {
+		z.h = registry
+	}
+	zsrv := httptest.NewServer(z.h)
+	t.Cleanup(zsrv.Close)
+	zaddr := zsrv.Listener.Addr()
 	f := &relayLimitFixture{
 		registry: z,
 		tokens:   &fakeTokens{statuses: map[string]authnv1.TokenReviewStatus{}},
@@ -113,6 +126,9 @@ func newRelayLimitFixture(t *testing.T) *relayLimitFixture {
 		Namespaces: &fakeNamespaces{labels: map[string]map[string]string{"team": {PushLabel: "team"}}},
 	}
 	r := newRelay(portOf(t, zaddr), portOf(t, zaddr), nil, quietLogger(), auth, gateCred)
+	r.limits = lim
+	r.limiter = newSourceLimiter(r.limiter.next, lim, time.Now)
+	r.handler = r.limiter
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
 	go func() {

@@ -88,6 +88,7 @@ TestRelayServesTLSOnly kept the relay and cluster publication do not touch the c
 TestRelayServesTheGate kept the push gate is unchanged
 TestRelayServingSANsWithoutNodePort kept the relay and cluster publication do not touch the child
 TestRelaySkipsAnAbsentAddress kept the relay and cluster publication do not touch the child
+TestRelayStalledReaderFreesItsSlot added a relay connection is bounded by write and read progress, not total time
 TestRelayStopsOnContextCancel kept the relay and cluster publication do not touch the child
 TestRelayVerifiesAtTheNodePortAddress kept the relay and cluster publication do not touch the child
 TestRemoveAdvertisement kept the relay and cluster publication do not touch the child
