@@ -49,8 +49,8 @@
 #         `kubectl exec` in it sees HF_HUB_OFFLINE=1 in the process env, an empty or
 #         absent Hub cache, and no Hub fetch (a models--* entry or an *.incomplete
 #         file) in the Pod's working tree, its HF_HOME or its Hub cache, the
-#         weights mount aside (read-only, below); `kubectl logs` of it does not
-#         name huggingface.co (the log is kept). It is NOT a network observation:
+#         weights mount aside (read-only, below); `kubectl logs` of it is non-empty
+#         and does not name huggingface.co (the log is kept). NOT a network check:
 #         native pods have no egress deny, so reach is not tested, and a download
 #         that completed and was moved elsewhere would not be seen. A write
 #         to the mounted weights fails with EPERM; an exec of a mounted file fails
@@ -141,7 +141,7 @@ RUNGS=(
 	"t.3|both Ready; resolvedArtifact = the pushed digest; image volume by digest, no PVC, no egress, no trust_remote_code; cold time, fetch rate, peak footprint vs spec.memory"
 	"t.3b|kickstart the worker's node daemon mid-pull: the partial survives, the blob commits, the replica is Ready"
 	"t.4|a client Pod on each Mac gets a non-empty completion from the other Mac's replica"
-	"t.5|configured and shown offline, not a network observation (a download completed and moved elsewhere is not seen): no egress annotation, weights by digest, HF_HUB_OFFLINE=1 in the Pod spec and the process env, empty Hub cache, no Hub cache or partial download in the pod's tree, no huggingface.co in its log; write EPERM, exec fails; on each Mac one view of clones (inode, dev, blocks, 0444, root)"
+	"t.5|configured and shown offline, not a network observation (a download completed and moved elsewhere is not seen): no egress annotation, weights by digest, HF_HUB_OFFLINE=1 in the Pod spec and the process env, empty Hub cache, no Hub cache or partial download in the pod's tree, a non-empty log naming no huggingface.co; write EPERM, exec fails; on each Mac one view of clones (inode, dev, blocks, 0444, root)"
 	"t.6|three replicas, two on the server Mac: free-space drop under 1% of the model, same view; warm time"
 	"t.7|delete, prune both Macs, model rm, registry prune: views gone, free space back within 1% on both caches and the registry store"
 	"f.1|cleanup green or red: namespace, MLXModels, ConfigMap, Pods, the pushed tag, remote scratch"
@@ -914,6 +914,8 @@ t5() {
 		grep -qx 'HUB-CLEAN' <<<"$out" || { bad "$pod: the Hub cache is not empty or the tree shows a Hub fetch: $(grep -m 1 '^HUB-DIRTY' <<<"$out" || tail -n 1 <<<"$out")"; return 1; }
 		measure "t5_${m}_tree_entries_walked" "$(awk '$1 == "HUB-WALKED" {print $2}' <<<"$out")"
 		kc logs -n "$NS" "$pod" -c mlx-serve >"$EV/t.5.$pod.serve.log" 2>&1 || { bad "$pod: read the serving log: $(tail -n 1 "$EV/t.5.$pod.serve.log")"; return 1; }
+		# An empty log proves nothing about a Hub fetch, so it is red, not clean.
+		[ -s "$EV/t.5.$pod.serve.log" ] || { bad "$pod: the serving log is empty"; return 1; }
 		if out="$(grep -m 1 -F 'huggingface.co' "$EV/t.5.$pod.serve.log")"; then
 			bad "$pod: the serving log names huggingface.co: $out"
 			return 1
@@ -1439,7 +1441,7 @@ def kubectl(argv):
                 # after t.3 read them clean and t.4 got its completions.
                 for p in s["pods"].values():
                     p["metadata"].setdefault("annotations", {})["k3sm.io/internet-egress"] = "true"
-        else:
+        elif "serve-log-empty" not in BRK:
             print("INFO loading /var/lib/mlx/model\nINFO serving on :8080")
             if "hub-log" in BRK:
                 print("INFO GET https://huggingface.co/api/models/x/revision/main 200")
@@ -1696,7 +1698,7 @@ self_test() {
 		"resolved-mismatch|t.3" "pvc|t.3" "egress-annotation|t.3" "trust-remote-code|t.3" \
 		"no-partial|t.3b" "kick-truncates|t.3b" "empty-completion|t.4" \
 		"hub-online|t.5" "hub-cache-full|t.5" "hub-fetch|t.5" "hub-env-missing|t.5" "egress-late|t.5" \
-		"hub-models-dir|t.5" "hub-cache-env|t.5" "hub-log|t.5" "write-ok|t.5" "write-eacces|t.5" "exec-ok|t.5" "view-hardlink|t.5" "view-twice|t.5" \
+		"hub-models-dir|t.5" "hub-cache-env|t.5" "hub-log|t.5" "serve-log-empty|t.5" "write-ok|t.5" "write-eacces|t.5" "exec-ok|t.5" "view-hardlink|t.5" "view-twice|t.5" \
 		"scale-copies|t.6" "prune-keeps|t.7" "registry-keeps|t.7"; do
 		brk="${row%|*}" rung="${row#*|}"
 		fake_run "$brk" "$brk" 1 "result: FAIL ($rung)"
@@ -1720,6 +1722,7 @@ self_test() {
 	reason hub-models-dir "shows a Hub fetch: HUB-DIRTY fetch ./var/lib/mlx/models--x"
 	reason hub-cache-env "the Hub cache is not empty or the tree shows a Hub fetch: HUB-DIRTY cache ./mst-elsewhere/hub"
 	reason hub-log "the serving log names huggingface.co: INFO GET https://huggingface.co/"
+	reason serve-log-empty "the serving log is empty"
 	has "hub-log: the serving log is kept" "$(cat "$t/runs/hub-log/ev/"t.5.*-0.serve.log 2>/dev/null)" "huggingface.co"
 
 	# A cleanup that cannot remove the namespace fails a run whose rungs all passed.
