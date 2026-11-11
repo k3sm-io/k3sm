@@ -1559,7 +1559,9 @@ func (r *runtimedRuntime) retryParkedCreate(ctx context.Context, pod *corev1.Pod
 func (r *runtimedRuntime) beginParkedRetry(id string, t *podTrack) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, deleted := r.deleteOwed[id]; deleted || trackDeleting(t) {
+	// A pod already terminal on this node (failed past its active deadline) is
+	// never created again: its Failed status is the apiserver's.
+	if _, deleted := r.deleteOwed[id]; deleted || trackDeleting(t) || t.evictedStatus() != nil {
 		return false
 	}
 	r.beginUpdateLocked(id)
@@ -1624,6 +1626,12 @@ func (r *runtimedRuntime) commitParkedCreate(t *podTrack, podID string) commitRe
 	defer t.restartMu.Unlock()
 	switch {
 	case t.deleting:
+		return commitDeleted
+	case t.evicted != nil:
+		// The pod went terminal while this create was in flight (its active
+		// deadline passed): the guest has no owner behind the Failed status and
+		// is deleted like a create behind a delete. The track, and the address,
+		// stay for the pod's DeletePod.
 		return commitDeleted
 	case live == t:
 		t.parked = nil

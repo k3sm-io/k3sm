@@ -710,6 +710,9 @@ on the default runtime too, so they inherit its behavior here.
 - Under `Never`, a failed `postStart` hook stops the container, which stays `Terminated`, and the
   Pod goes `Failed`, as upstream. Its `preStop` hook does not run before that stop.
 - On a `vm` Pod that stop is not available: the container is held NotReady and keeps running.
+- A Pod's `activeDeadlineSeconds` is enforced on the node's 10 s status resync, so the Pod goes
+  `Failed` with reason `DeadlineExceeded` up to about 10 s after its deadline. Its address is held
+  until the Pod is deleted.
 
 **Plain init containers are not restarted**, and that is the one remaining gap on the default
 runtime. A regular (non-sidecar) init container that fails under `Always` / `OnFailure` is not re-run

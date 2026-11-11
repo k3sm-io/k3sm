@@ -460,7 +460,9 @@ type podTrack struct {
 	// (followRunning). Guarded by restartMu with deleting.
 	stop runtimeStop
 	// evicted, when non-nil, is the terminal status of a pod the node-pressure
-	// eviction manager evicted (evictPod). It is set BEFORE the runtime teardown
+	// eviction manager evicted (evictPod), or of a pod failed for outliving its
+	// activeDeadlineSeconds (failPastDeadline); the status carries its own
+	// reason. It is set BEFORE the runtime teardown
 	// starts and never cleared; every status path returns it first, so nothing the
 	// runtime reports during or after the teardown can turn an evicted pod back
 	// into a running or restarting one. Guarded by restartMu with deleting.
@@ -2239,8 +2241,8 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	// Failed pod; this is the provider's own fence behind it, so a restarted
 	// node cannot resurrect a restartPolicy: Always pod that was evicted for
 	// filling memory.
-	if isEvictedPod(pod) || isBudgetRejectedPod(pod) {
-		r.log.Info("CreatePod: the pod was evicted from or rejected by this node; not creating it",
+	if isEvictedPod(pod) || isBudgetRejectedPod(pod) || isDeadlineExceededPod(pod) {
+		r.log.Info("CreatePod: the pod was evicted from, rejected by or failed on this node; not creating it",
 			"namespace", pod.Namespace, "name", pod.Name, "uid", string(pod.UID))
 		return nil
 	}
@@ -3031,7 +3033,7 @@ func (r *runtimedRuntime) checkUpdate(ctx context.Context, pod *corev1.Pod) (t *
 	// A pod whose delete has begun gets no update either: anything acquired behind
 	// the delete's release has no owner. With no track, the deletion stamp and the
 	// tombstone are the only signs an update that arrives after the delete has of it.
-	terminal := isEvictedPod(pod) || isBudgetRejectedPod(pod) || pod.DeletionTimestamp != nil ||
+	terminal := isEvictedPod(pod) || isBudgetRejectedPod(pod) || isDeadlineExceededPod(pod) || pod.DeletionTimestamp != nil ||
 		r.tombstones.has(id)
 	if tracked {
 		terminal = t.rejected || t.evictedStatus() != nil || trackDeleting(t)
@@ -3703,21 +3705,30 @@ func (r *runtimedRuntime) runBackstop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			// A slot-1 pod restored before this node's desired annotation was
-			// readable is verified here, before the status it feeds is built.
-			r.interconnect.recheck(ctx)
-			pods, err := r.GetPods(ctx)
-			if err != nil {
-				continue
-			}
-			cb := r.callback()
-			if cb == nil {
-				continue
-			}
-			for _, p := range pods {
-				cb(p.DeepCopy())
-			}
+			r.resync(ctx)
 		}
+	}
+}
+
+// resync is one backstop tick: the interconnect re-check, the active-deadline
+// enforcement, then every tracked pod's status through the watch callback.
+func (r *runtimedRuntime) resync(ctx context.Context) {
+	// A slot-1 pod restored before this node's desired annotation was
+	// readable is verified here, before the status it feeds is built.
+	r.interconnect.recheck(ctx)
+	// Before the statuses are built, so a pod failed here publishes Failed on
+	// this same tick.
+	r.enforceActiveDeadlines(ctx)
+	pods, err := r.GetPods(ctx)
+	if err != nil {
+		return
+	}
+	cb := r.callback()
+	if cb == nil {
+		return
+	}
+	for _, p := range pods {
+		cb(p.DeepCopy())
 	}
 }
 

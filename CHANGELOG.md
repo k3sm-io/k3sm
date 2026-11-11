@@ -267,6 +267,8 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
 
 ### Fixed
 
+- A Pod that outlives its `activeDeadlineSeconds` is stopped and reported `Failed` with reason
+  `DeadlineExceeded`, as the kubelet does, up to about 10 s late.
 - A server whose control plane does not report healthy in time while the Mac is heavily loaded no
   longer parks on the crash-loop breaker after five attempts. It backs off instead, from 30 seconds
   doubling up to 10 minutes, `k3sm status` shows when the next attempt starts and that an attempt

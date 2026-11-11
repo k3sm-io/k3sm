@@ -63,6 +63,20 @@ func (t *podTrack) markEvicted(st *corev1.PodStatus) bool {
 	return true
 }
 
+// markTerminal is markEvicted's sibling for a node-side failure other than an
+// eviction (the active deadline): it records st, which carries its own reason,
+// in the same terminal mark, and refuses a track that is deleting, was rejected
+// at admission, or is already terminal. unmarkEvicted rolls it back.
+func (t *podTrack) markTerminal(st *corev1.PodStatus) bool {
+	t.restartMu.Lock()
+	defer t.restartMu.Unlock()
+	if t.evicted != nil || t.deleting || t.rejected {
+		return false
+	}
+	t.evicted = st
+	return true
+}
+
 // unmarkEvicted rolls back markEvicted after a failed runtime teardown, so the
 // pod (whose processes are still running) reports its live status again and
 // stays an eviction candidate. Only the status this eviction installed is
@@ -194,9 +208,26 @@ func (r *runtimedRuntime) evictionCandidates(ctx context.Context) []evictionCand
 // message (the kubelet's eviction manager sets it; Job podFailurePolicy and
 // disruption accounting key off it).
 func evictedPodStatus(prior corev1.PodStatus, msg string, now metav1.Time) *corev1.PodStatus {
+	st := failedPodStatus(prior, reasonEvicted, msg, now)
+	setPodCondition(st, corev1.PodCondition{
+		Type:               corev1.DisruptionTarget,
+		Status:             corev1.ConditionTrue,
+		Reason:             corev1.PodReasonTerminationByKubelet,
+		Message:            msg,
+		LastTransitionTime: now,
+	})
+	return st
+}
+
+// failedPodStatus is the node-terminated half of evictedPodStatus, shared with
+// the active-deadline failure: phase Failed with reason and msg, every container
+// not already terminated terminated with exit 137 and reason Error, Ready and
+// ContainersReady False, and PodReadyToStartContainers False. It sets no
+// DisruptionTarget condition.
+func failedPodStatus(prior corev1.PodStatus, reason, msg string, now metav1.Time) *corev1.PodStatus {
 	st := prior.DeepCopy()
 	st.Phase = corev1.PodFailed
-	st.Reason = reasonEvicted
+	st.Reason = reason
 	st.Message = msg
 	terminate := func(list []corev1.ContainerStatus) {
 		for i := range list {
@@ -231,13 +262,6 @@ func evictedPodStatus(prior corev1.PodStatus, msg string, now metav1.Time) *core
 		toStart.LastTransitionTime = c.LastTransitionTime
 	}
 	setPodCondition(st, toStart)
-	setPodCondition(st, corev1.PodCondition{
-		Type:               corev1.DisruptionTarget,
-		Status:             corev1.ConditionTrue,
-		Reason:             corev1.PodReasonTerminationByKubelet,
-		Message:            msg,
-		LastTransitionTime: now,
-	})
 	return st
 }
 
