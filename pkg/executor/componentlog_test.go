@@ -20,9 +20,11 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"k3sm.io/k3sm/internal/atomicfile"
 )
@@ -183,5 +185,116 @@ func TestComponentLogRotationRefusesAnUntrustedDir(t *testing.T) {
 	}
 	if got, err := os.ReadFile(logPath + ".1"); err != nil || !strings.Contains(string(got), "run") {
 		t.Fatalf(".1 = %q, %v", got, err)
+	}
+}
+
+// The child's log is opened without truncating or blocking and checked through
+// the descriptor before it is truncated: a hardlink to another file is refused
+// with that file's bytes intact, a FIFO is refused without hanging the open, and
+// a plain file is truncated and left writable for the child.
+func TestOpenComponentLogChecksBeforeTruncating(t *testing.T) {
+	t.Parallel()
+	const other = "another name for this inode, must keep its bytes"
+	tests := []struct {
+		name    string
+		plant   func(t *testing.T, logPath string)
+		wantErr bool
+	}{
+		{"a hardlinked log", func(t *testing.T, p string) {
+			elsewhere := filepath.Join(filepath.Dir(p), "elsewhere")
+			if err := os.WriteFile(elsewhere, []byte(other), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Link(elsewhere, p); err != nil {
+				t.Fatal(err)
+			}
+		}, true},
+		{"a FIFO at the log path", func(t *testing.T, p string) {
+			if err := syscall.Mkfifo(p, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}, true},
+		{"a previous run's regular log", func(t *testing.T, p string) {
+			if err := os.WriteFile(p, []byte("previous run"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}, false},
+		{"no log yet", func(*testing.T, string) {}, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			logPath := filepath.Join(t.TempDir(), "kine.log")
+			tc.plant(t, logPath)
+			type result struct {
+				f   *os.File
+				err error
+			}
+			done := make(chan result, 1)
+			go func() {
+				f, err := openComponentLog(logPath)
+				done <- result{f, err}
+			}()
+			var r result
+			select {
+			case r = <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("openComponentLog blocked")
+			}
+			if tc.wantErr {
+				if r.err == nil {
+					_ = r.f.Close()
+					t.Fatal("accepted a log path that is not a single-link regular file")
+				}
+				elsewhere := filepath.Join(filepath.Dir(logPath), "elsewhere")
+				if got, err := os.ReadFile(elsewhere); err == nil && string(got) != other {
+					t.Fatalf("the hardlink's other name was truncated: %q", got)
+				}
+				return
+			}
+			if r.err != nil {
+				t.Fatalf("openComponentLog: %v", r.err)
+			}
+			if _, err := r.f.WriteString("this run"); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			if err := r.f.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if got, err := os.ReadFile(logPath); err != nil || string(got) != "this run" {
+				t.Fatalf("log = %q, %v; want only this run's bytes", got, err)
+			}
+			if fi, err := os.Stat(logPath); err != nil || fi.Mode().Perm() != 0o600 {
+				t.Fatalf("log mode = %v, %v; want 0600", fi, err)
+			}
+		})
+	}
+}
+
+// The temp file keepLogTail writes the .2 tail into is one uninstall removes:
+// a crash mid-copy must not leave a file ComponentLogKeptPaths does not list.
+func TestKeepLogTailTempIsAKeptPath(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	kept := ComponentLogKeptPaths(dir)
+	for _, n := range componentLogNames {
+		logPath := filepath.Join(dir, n+".log")
+		tmp := logTailTmp(logPath + ".2")
+		if !slices.Contains(kept, tmp) {
+			t.Errorf("keepLogTail's temp %s is not in ComponentLogKeptPaths", tmp)
+		}
+	}
+	// keepLogTail writes through logTailTmp: a non-empty dir planted at that
+	// name cannot be removed, so the copy must fail on exactly that path.
+	logPath := filepath.Join(dir, kineBinaryName+".log")
+	if err := os.WriteFile(logPath, []byte("headhead-TAIL"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tmp := logTailTmp(logPath + ".2")
+	if err := os.MkdirAll(filepath.Join(tmp, "x"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := keepLogTail(logPath, logPath+".2", 4); err == nil || !strings.Contains(err.Error(), tmp) {
+		t.Fatalf("keepLogTail err = %v, want one naming %s", err, tmp)
 	}
 }

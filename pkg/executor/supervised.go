@@ -1114,7 +1114,9 @@ func (s *Supervised) spawn(ctx context.Context, name string, args ...string) (*c
 func (s *Supervised) spawnEnv(ctx context.Context, name string, extraEnv []string, args ...string) (*component, error) {
 	bin := filepath.Join(binDir(s.cfg.WorkDir), name)
 	logPath := filepath.Join(s.cfg.WorkDir, name+".log")
-	if err := rotateComponentLog(logPath, failureLive(s.cfg.WorkDir, time.Now())); err != nil {
+	if err := rotateComponentLog(logPath, failureLive(s.cfg.WorkDir, time.Now())); errors.Is(err, atomicfile.ErrUnsafeDir) {
+		s.cfg.Logger.Warn("component log not rotated: the work dir is writable by others; the previous run's log may be lost", "component", name, "err", err)
+	} else if err != nil {
 		s.cfg.Logger.Debug("component log not rotated; the previous run's log may be lost", "component", name, "err", err)
 	}
 	lf, err := openComponentLog(logPath)
@@ -1206,8 +1208,11 @@ func (s *Supervised) spawnEnv(ctx context.Context, name string, extraEnv []strin
 // that someone other than root or this process could write.
 const (
 	componentLogPinSuffix = ".1.pinned"
-	componentLogTmpSuffix = ".2.tmp"
-	componentLogKeepMax   = 4 << 20
+	componentLogTmpSuffix = ".2" + componentLogTmpExt
+	// componentLogTmpExt is what keepLogTail appends to its dst for the tail
+	// copy's temp file; componentLogTmpSuffix is that name for the .2 generation.
+	componentLogTmpExt  = ".tmp"
+	componentLogKeepMax = 4 << 20
 )
 
 // The control-plane children spawnEnv starts, by the name that is both the
@@ -1301,21 +1306,60 @@ func rotateComponentLog(path string, failing bool) error {
 }
 
 // openComponentLog creates or truncates a child's 0600 log. It runs as root in
-// the work dir, so a symlink planted at the log path is refused (O_NOFOLLOW)
-// rather than followed, and so is anything there that is not a regular file.
+// the work dir, so nothing planted at the log path is written through: the open
+// refuses a symlink (O_NOFOLLOW), does not truncate (a hardlink to another file
+// would lose that file's bytes at open) and does not block (a FIFO would hang a
+// write-only open). The descriptor is then refused unless it is a regular file
+// with one link, and only then truncated and switched back to blocking for the
+// child.
+//
+// It fails closed, deliberately: a symlink, a hardlink or a non-regular file at
+// the log path aborts that component's spawn, whereas a rotation refusal
+// (rotateComponentLog) never does.
 func openComponentLog(path string) (*os.File, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|syscall.O_NOFOLLOW, 0o600)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o600)
 	if err != nil {
-		return nil, err
+		return nil, err // an *os.PathError: it names the op and the path
 	}
-	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() {
+	if err := prepareComponentLog(f); err != nil {
 		_ = f.Close()
-		if err == nil {
-			err = fmt.Errorf("%s is not a regular file (%v)", path, fi.Mode().Type())
-		}
-		return nil, err
+		return nil, fmt.Errorf("refusing %s as a component log: %w", path, err)
 	}
 	return f, nil
+}
+
+// prepareComponentLog checks the opened log is a regular file with one link,
+// truncates it through the descriptor and clears O_NONBLOCK.
+func prepareComponentLog(f *os.File) error {
+	fi, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("stat: %w", err)
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("not a regular file (%v)", fi.Mode().Type())
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return errors.New("no link count in the file's stat")
+	}
+	if st.Nlink != 1 {
+		return fmt.Errorf("the file has %d links, want 1", st.Nlink)
+	}
+	if err := f.Truncate(0); err != nil {
+		return fmt.Errorf("truncate: %w", err)
+	}
+	rc, err := f.SyscallConn()
+	if err != nil {
+		return fmt.Errorf("raw conn: %w", err)
+	}
+	var nbErr error
+	if err := rc.Control(func(fd uintptr) { nbErr = syscall.SetNonblock(int(fd), false) }); err != nil {
+		return fmt.Errorf("clear O_NONBLOCK: %w", err)
+	}
+	if nbErr != nil {
+		return fmt.Errorf("clear O_NONBLOCK: %w", nbErr)
+	}
+	return nil
 }
 
 // regularLogSize opens path without following a symlink (and without blocking
@@ -1382,7 +1426,7 @@ func keepLogTail(src, dst string, max int64) error {
 	if size <= max {
 		return os.Rename(src, dst)
 	}
-	tmp := dst + ".tmp" // <name>.log + componentLogTmpSuffix for the .2 generation
+	tmp := logTailTmp(dst)
 	// A temp a crash left behind is replaced, never written through.
 	if err := removeIfPresent(tmp); err != nil {
 		return err
@@ -1403,6 +1447,11 @@ func keepLogTail(src, dst string, max int64) error {
 	}
 	return removeIfPresent(src)
 }
+
+// logTailTmp is the temp file keepLogTail copies a tail into before renaming it
+// over dst: <name>.log + componentLogTmpSuffix for the .2 generation, which
+// ComponentLogKeptPaths lists for uninstall.
+func logTailTmp(dst string) string { return dst + componentLogTmpExt }
 
 // releaseComponentLogs ends every pin in workDir after a healthy bring-up: the
 // first failure's log stays as .1 until the next spawn replaces it. The error
