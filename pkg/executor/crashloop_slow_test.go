@@ -372,7 +372,9 @@ func TestComponentLogRotationKeepsFirstCrash(t *testing.T) {
 		if err := os.WriteFile(src, []byte("headhead-TAIL"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		keepLogTail(src, dst, 13, 4)
+		if err := keepLogTail(src, dst, 4); err != nil {
+			t.Fatal(err)
+		}
 		if got, err := os.ReadFile(dst); err != nil || string(got) != "TAIL" {
 			t.Fatalf(".log.2 = %q, %v; want the 4-byte tail", got, err)
 		}
@@ -386,7 +388,7 @@ func TestComponentLogRotationKeepsFirstCrash(t *testing.T) {
 
 	t.Run("uninstall paths cover every kept file", func(t *testing.T) {
 		paths := strings.Join(ComponentLogKeptPaths("/w"), " ")
-		for _, want := range []string{"/w/kine.log.1", "/w/kine.log.1.pinned", "/w/kube-apiserver.log.2", "/w/etcd.log.1"} {
+		for _, want := range []string{"/w/kine.log.1", "/w/kine.log.1.pinned", "/w/kube-apiserver.log.2", "/w/etcd.log.1", "/w/kine.log.2.tmp", "/w/kube-controller-manager.log.2.tmp"} {
 			if !strings.Contains(paths, want+" ") && !strings.HasSuffix(paths, want) {
 				t.Fatalf("ComponentLogKeptPaths lacks %s: %s", want, paths)
 			}
