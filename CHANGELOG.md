@@ -267,7 +267,7 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
 
 ### Fixed
 
-- A Pod that outlives its `activeDeadlineSeconds` is now stopped and reported `Failed` with reason `DeadlineExceeded`, up to about 10 s late. `--runtime hostprocess` does not enforce it.
+- A Pod that outlives its `activeDeadlineSeconds` is now stopped and reported `Failed` with reason `DeadlineExceeded` up to about 10 s late, except under `--runtime hostprocess`, which does not enforce it.
 - A Pod whose previous run left processes alive now waits in `ContainerCreating` until they exit, instead of starting beside them.
 - A server whose control plane does not report healthy in time while the Mac is heavily loaded no
   longer parks on the crash-loop breaker after five attempts. It backs off instead, from 30 seconds

@@ -267,6 +267,7 @@ container is restarted in place with an upstream-shaped `CrashLoopBackOff` backo
 
 See [Limitations](limitations.md#restartpolicy-is-honored-on-the-default-runtime-not-on-the-hostprocess-opt-out)
 for the precise scope.
+For `activeDeadlineSeconds`, see [Limitations](limitations.md#activedeadlineseconds-is-enforced-on-the-default-runtime-not-on-hostprocess).
 
 ## A Pod's Image Will Not Pull
 
