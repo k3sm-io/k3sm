@@ -740,6 +740,8 @@ func parkedSummary(last executor.Crash) string {
 	switch last.Origin {
 	case executor.CrashOriginBringUp:
 		return "the control plane never came up (last: " + last.Component + ")"
+	case executor.CrashOriginBringUpSlow:
+		return "the control plane kept timing out on an overloaded host (last: " + last.Component + ")"
 	case executor.CrashOriginLeaderLost:
 		return "the control plane kept losing its leader lease (last: " + last.Component + ")"
 	}

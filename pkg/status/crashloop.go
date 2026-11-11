@@ -149,6 +149,15 @@ func ClassifyCrashLoop(rec executor.CrashRecord, readErr error, path string, now
 			LeaderLost: lostNote,
 		}
 	}
+	if wait, until := rec.BringUpBackoff(now); wait > 0 {
+		return CrashLoopVerdict{
+			Posture: PostureRestarting,
+			Detail: fmt.Sprintf("bring-up backing off until %s: %d consecutive bring-ups timed out while the host was under pressure; parks at %d",
+				until.Format(time.RFC3339), rec.SlowStreak, executor.BringUpSlowStreakLimit),
+			Remedy:     "uptime; memory_pressure   # what is loading the host?",
+			LeaderLost: lostNote,
+		}
+	}
 	return CrashLoopVerdict{Posture: PostureQuiet, LeaderLost: lostNote}
 }
 
@@ -198,7 +207,12 @@ func leaderLostNote(rec executor.CrashRecord, now time.Time) string {
 // An entry with no origin reads as a crash: records written before the daemon
 // counted bring-up failures hold only crashes, and the row must not invent a
 // distinction the file does not carry.
-func neverCameUp(last executor.Crash) bool { return last.Origin == executor.CrashOriginBringUp }
+//
+// A slow bring-up (an apiserver health wait that ran out on an overloaded host)
+// is a bring-up that never came up too.
+func neverCameUp(last executor.Crash) bool {
+	return last.Origin == executor.CrashOriginBringUp || last.Origin == executor.CrashOriginBringUpSlow
+}
 
 // applyCrashLoop folds the verdict into the server row. A parked daemon is a
 // FAIL whatever launchd says (it is running, and serving nothing); restarting

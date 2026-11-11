@@ -745,6 +745,11 @@ func startControlPlane(ctx, stop context.Context, opts serverOptions, mode hostn
 	exec := executor.NewSupervised(plan.cfg)
 	// Before Start, so the exit handler can ask about any child it is told of.
 	probe.set(exec)
+	// A previous lap that timed out on an overloaded host backs this one off
+	// (executor.BringUpBackoff); server path only, the agent has its own pacing.
+	if err := breaker.awaitBringUpBackoff(ctx); err != nil {
+		return plan, nil, fmt.Errorf("start control plane: %w", err)
+	}
 	logger.Info("bringing up k3sm control plane", "work-dir", opts.workDir, "api-port", opts.apiPort)
 	if err := exec.Start(ctx); err != nil {
 		// This is the place a control plane that never came up gets counted.
@@ -764,5 +769,6 @@ func startControlPlane(ctx, stop context.Context, opts serverOptions, mode hostn
 		noteBringUpFailure(stop, breaker, logger, err)
 		return plan, nil, fmt.Errorf("start control plane: %w", err)
 	}
+	breaker.noteBringUpHealthy()
 	return plan, exec, nil
 }

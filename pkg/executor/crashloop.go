@@ -125,13 +125,44 @@ const (
 	// rest of the control plane was alive — upstream's intended exit on an HA
 	// server that lost etcd quorum, not a crash. cmd/k3sm classifies it.
 	CrashOriginLeaderLost = "leader-lost"
+	// CrashOriginBringUpSlow is a bring-up whose apiserver health wait ran out
+	// while the host was under load or memory pressure. It is recorded so an
+	// operator can see it, it never counts toward CrashLoopThreshold, and it
+	// drives the bring-up backoff (BringUpBackoff) instead. Only a streak of
+	// BringUpSlowStreakLimit of them parks the daemon. cmd/k3sm classifies it.
+	CrashOriginBringUpSlow = "bring-up-slow"
 )
+
+// The slow bring-up backoff. A health timeout on an overloaded host is not the
+// persistent fault the breaker exists for: the host usually recovers in
+// minutes, and five ninety-second laps parked a daemon for hours on a host that
+// was fine again long before an operator looked. So a slow lap waits before the
+// next one instead of counting toward the park, doubling from the base to the
+// cap. The streak lives in the record (SlowStreak, LastSlowAt), outside the
+// pruned Crashes list, so it survives the daemon's own exit and launchd's
+// respawn, and it is not cut short by the window.
+const (
+	// BringUpSlowBackoffBase is the wait after the first slow lap.
+	BringUpSlowBackoffBase = 30 * time.Second
+	// BringUpSlowBackoffCap bounds the doubling.
+	BringUpSlowBackoffCap = 10 * time.Minute
+	// BringUpSlowStreakLimit is the streak of consecutive slow laps that parks
+	// the daemon after all: a host that stays overloaded for roughly an hour of
+	// backed-off laps (30 s + 1 m + 2 m + 4 m + 8 m + 10 m + 10 m, plus a
+	// ninety-second health wait each) needs an operator, not another lap.
+	BringUpSlowStreakLimit = 8
+)
+
+// BringUpSlowRemedy is the status row's fix for a daemon parked on the slow
+// bring-up streak.
+const BringUpSlowRemedy = "find what keeps the host overloaded (uptime, memory pressure, top) and free it"
 
 // Crash is one control-plane failure the breaker counted.
 type Crash struct {
 	At        time.Time `json:"at"`
 	Component string    `json:"component"`
-	// Origin is CrashOriginCrash, CrashOriginBringUp or CrashOriginLeaderLost. It is omitempty, and an
+	// Origin is CrashOriginCrash, CrashOriginBringUp, CrashOriginLeaderLost or
+	// CrashOriginBringUpSlow. It is omitempty, and an
 	// empty value reads as a crash: records written before the daemon counted
 	// bring-up failures hold only crashes.
 	Origin string `json:"origin,omitempty"`
@@ -152,6 +183,14 @@ type CrashRecord struct {
 	// TrippedAt is set when the threshold was reached inside the window and
 	// cleared only by ClearCrashRecord. It survives Prune on purpose.
 	TrippedAt *time.Time `json:"tripped_at,omitempty"`
+	// SlowStreak is the count of slow bring-ups (CrashOriginBringUpSlow) since the
+	// last healthy bring-up (NoteBringUpHealthy). Other entries do not end it, so
+	// slow laps interleaved with fast failures still reach the park; LastSlowAt is the newest of
+	// them. Both are exempt from Prune, so the backoff they drive survives the
+	// window, and both are omitempty, so a record without a streak is the shape
+	// an older daemon wrote and reads.
+	SlowStreak int        `json:"slow_streak,omitempty"`
+	LastSlowAt *time.Time `json:"last_slow_at,omitempty"`
 }
 
 // CrashLoopPath is the record's path for a control-plane work dir.
@@ -252,6 +291,56 @@ func (r *CrashRecord) RecordPermanent(now time.Time, origin, component, detail, 
 		Permanent: true, Remedy: remedy})
 }
 
+// RecordBringUpSlow appends one slow bring-up and extends the streak. It never
+// counts toward CrashLoopThreshold; it trips the breaker only when the streak
+// reaches BringUpSlowStreakLimit, and that last entry carries BringUpSlowRemedy
+// so the parked row can name the fix. It reports whether THIS call tripped it.
+func (r *CrashRecord) RecordBringUpSlow(now time.Time, component, detail string) (tripped bool) {
+	r.SlowStreak++
+	t := now
+	r.LastSlowAt = &t
+	c := Crash{At: now, Origin: CrashOriginBringUpSlow, Component: component, Detail: detail}
+	limit := r.SlowStreak >= BringUpSlowStreakLimit
+	if limit {
+		c.Permanent, c.Remedy = true, BringUpSlowRemedy
+	}
+	r.Crashes = append(r.Crashes, c)
+	r.Prune(now)
+	return r.trip(now, limit)
+}
+
+// NoteBringUpHealthy ends the slow streak: a bring-up that reached healthz has
+// shown the host can carry the control plane again. It is the only thing that
+// ends it; recording any other entry leaves the streak as it is.
+func (r *CrashRecord) NoteBringUpHealthy() {
+	r.SlowStreak, r.LastSlowAt = 0, nil
+}
+
+// BringUpBackoff is how long the next bring-up must still wait at now: zero
+// with no slow streak, else BringUpSlowBackoffBase doubled per slow lap after
+// the first, capped at BringUpSlowBackoffCap, counted from LastSlowAt. The wait
+// never exceeds that streak's backoff, so a LastSlowAt dated in the future (a
+// clock that stepped backwards) cannot stretch it.
+func (r CrashRecord) BringUpBackoff(now time.Time) (wait time.Duration, until time.Time) {
+	if r.SlowStreak <= 0 || r.LastSlowAt == nil {
+		return 0, time.Time{}
+	}
+	d := BringUpSlowBackoffCap
+	if r.SlowStreak-1 < 32 {
+		if b := BringUpSlowBackoffBase << (r.SlowStreak - 1); b < d {
+			d = b
+		}
+	}
+	until = r.LastSlowAt.Add(d)
+	if !until.After(now) {
+		return 0, time.Time{}
+	}
+	if until.Sub(now) > d {
+		until = now.Add(d)
+	}
+	return until.Sub(now), until
+}
+
 // RecordLeaderLost appends one leader-lease loss and trips the breaker when the
 // window now holds LeaderLostThreshold of them. Lease losses never count toward
 // CrashLoopThreshold, and crashes never count toward this one. It reports
@@ -285,9 +374,12 @@ func (r CrashRecord) Tripped() bool { return r.TrippedAt != nil }
 
 // Recent counts the crashes and bring-up failures inside the window ending at
 // now — the entries CrashLoopThreshold counts. Leader-lease losses are not
-// failures and are counted by LeaderLost instead.
+// failures and are counted by LeaderLost instead; slow bring-ups are bounded by
+// the streak (BringUpSlowStreakLimit) instead.
 func (r CrashRecord) Recent(now time.Time) int {
-	return r.count(now, func(c Crash) bool { return c.Origin != CrashOriginLeaderLost })
+	return r.count(now, func(c Crash) bool {
+		return c.Origin != CrashOriginLeaderLost && c.Origin != CrashOriginBringUpSlow
+	})
 }
 
 // LeaderLost counts the leader-lease losses inside the window ending at now.
