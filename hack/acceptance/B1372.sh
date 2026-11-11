@@ -64,10 +64,15 @@
 #   t.6   the server's MLXModel scaled to 2 (three replicas, two on the server Mac):
 #         the server's free space drops by under 1% of the model, the view is the
 #         same one (same inodes). RECORDED: warm time to Ready and fetch window
-#   t.7   both MLXModels deleted and their Pods gone; `k3sm image prune --force` on
-#         both Macs; `k3sm model rm <run>:v1`, then the registry prune; each node's
-#         view is gone and free space on both caches and the registry store is back
-#         at t.0's within 1% of the model
+#   t.7   both MLXModels deleted and their Pods gone; `k3sm model rm <run>:v1`; on
+#         both Macs `k3sm image rm --force <digest>` of the run's own image: exit 0,
+#         reclaimedBytes RECORDED, a kept blob only for the shared reason; a dry-run
+#         `k3sm image prune` on each Mac before the model rm and after the image rm
+#         would reclaim the same other blobs, less the target's (RECORDED: how many;
+#         with none it says the check had nothing to observe, not a pass); then the
+#         registry prune; each node's view and the target's cache blobs are gone and
+#         free space on both caches and the registry store is back at t.0's within
+#         1% of the model
 #   f.1   cleanup, green or red: the namespace (MLXModels, ConfigMap, client and
 #         client Pods), the pushed tag, the remote scratch dirs; each step that
 #         fails is named and fails the run. Each is marked for cleanup BEFORE the
@@ -86,9 +91,10 @@
 # `tmutil listlocalsnapshots` for that volume: two readings compare only when no local
 # snapshot appeared or went between them, so snapshot-held blocks never count.
 #
-# `k3sm image prune --force` evicts every cached image no pod uses at that moment on
-# that Mac, another workload's included; t.7 runs it because it is the one verb that
-# returns node space.
+# t.7's registry prune (`k3sm image prune --force` on the server Mac) also evicts every
+# cached image no pod uses at that moment on the server node, another workload's
+# included. The per-Mac eviction is `k3sm image rm` of the run's own digest, which
+# touches no other image.
 #
 # Environment (required under --lab):
 #   KUBECONFIG                   the admin kubeconfig of the running cluster
@@ -158,7 +164,7 @@ RUNGS=(
 	"t.4|a client Pod on each Mac gets a non-empty completion from the other Mac's replica"
 	"t.5|configured and shown offline, not a network observation (a download completed and moved elsewhere is not seen): no egress annotation, weights by digest, HF_HUB_OFFLINE=1 in the Pod spec and the process env, empty Hub cache, no Hub cache or partial download in the pod's tree, a non-empty log naming no huggingface.co; write EPERM, exec fails; on each Mac one view of clones (inode, dev, blocks, 0444, root)"
 	"t.6|three replicas, two on the server Mac: free-space drop under 1% of the model, same view; warm time"
-	"t.7|delete, prune both Macs, model rm, registry prune: views gone, free space back within 1% on both caches and the registry store"
+	"t.7|delete, model rm, image rm of the run's digest on both Macs (a dry-run prune before and after: other blobs untouched), registry prune: views and the target's blobs gone, free space back within 1% on both caches and the registry store"
 	"f.1|cleanup green or red: namespace, MLXModels, ConfigMap, Pods, the pushed tag, remote scratch"
 	"t.8|kubectl get ns recorded; no leftover; both nodes Ready on the build t.0 recorded; one line states the build and Ready the rig is left on"
 )
@@ -418,6 +424,74 @@ sys.exit(1 if errs else 0)
 # view_inodes <view lines>: `<rel> <ino>` per file, for comparing two readings.
 view_inodes() { awk '$1 == "F" { print $2, $3 }' "$1"; }
 
+# The one reason `k3sm image rm` may keep a target blob for at t.7: another cached
+# image names it.
+SHARED_REASON="shared"
+
+# rm_report <image rm JSON>: its reclaimedBytes, then the hex of each blob it kept.
+# JSON without reclaimedBytes, or a blob kept for any reason but the shared one, is
+# an error line and exit 1.
+rm_report() {
+	py '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except ValueError as e:
+    print("the output is not JSON (%s)" % e)
+    sys.exit(1)
+if not isinstance(d, dict):
+    print("the output is not a JSON object")
+    sys.exit(1)
+errs, kept = [], []
+r = d.get("reclaimedBytes")
+if isinstance(r, bool) or not isinstance(r, int):
+    errs.append("no reclaimedBytes in the output")
+k = d.get("kept") or []
+if not isinstance(k, list):
+    errs.append("kept is not a list")
+    k = []
+for e in k:
+    e = e if isinstance(e, dict) else {}
+    dig = str(e.get("digest") or "")
+    if e.get("reason") != sys.argv[2]:
+        errs.append("%s kept for %s" % (dig or "a blob", e.get("reason")))
+    kept.append(dig.split(":", 1)[-1])
+if errs:
+    print("; ".join(errs))
+    sys.exit(1)
+print(r)
+for h in kept:
+    print(h)
+' "$1" "$SHARED_REASON"
+}
+
+# bystanders <prune JSON before> <prune JSON after> <rm JSON> <hex...>: the blobs a
+# dry-run prune would reclaim after the rm are those it would before, less the
+# target's (the hexes given and what the rm removed). Prints how many that is; a
+# difference is printed and exits 1.
+bystanders() {
+	py '
+import json, sys
+def blobs(p):
+    try:
+        return set(str(b).split(":", 1)[-1] for b in json.load(open(p))["cache"]["blobs"])
+    except (ValueError, KeyError, TypeError) as e:
+        print("unreadable dry-run prune output %s (%s)" % (p, e))
+        sys.exit(1)
+before, after = blobs(sys.argv[1]), blobs(sys.argv[2])
+try:
+    removed = json.load(open(sys.argv[3])).get("removedDigests") or []
+except (ValueError, AttributeError):
+    removed = []
+target = set(sys.argv[4:]) | set(str(d).split(":", 1)[-1] for d in removed)
+want = before - target
+if after != want:
+    print("lost %s, gained %s" % (sorted(want - after), sorted(after - want)))
+    sys.exit(1)
+print(len(want))
+' "$@"
+}
+
 # under_scratch <dir>: the dir, made absolute against the working directory, its
 # symlinks and .. resolved in path order, so a .. after a symlink climbs from the
 # link's target (a tail that does not exist yet taken as written), lies
@@ -664,7 +738,7 @@ print(" ".join(t["key"] for t in d["spec"].get("taints", []) or [] if t.get("eff
 			refuse "on $n: $t/blobs is not a directory, $left already exists, or root is not available"
 		# shellcheck disable=SC2046 # one argument per hash
 		rroot "$n" "$STEP_TIMEOUT" 'c="$1"; shift; for h in "$@"; do [ ! -e "$c/blobs/sha256/$h" ] || exit 1; done' "$t" $(awk '{print $1}' <<<"$FILES") ||
-			refuse "on $n: the node cache already holds a blob of this model; the cold rung needs it gone (k3sm image prune)"
+			refuse "on $n: the node cache already holds a blob of this model; the cold rung needs it gone (k3sm image rm --force <digest>, the t1_digest in the failed run's measurements.tsv)"
 	done
 	rroot "$SERVER" "$STEP_TIMEOUT" '[ -d "$1" ]' "$REG_ROOT" || refuse "the registry store $REG_ROOT is not on the server"
 }
@@ -1087,8 +1161,11 @@ t6() {
 	measure warm_fetch_window_seconds "${times#* }"
 }
 
+# BLOBS_LEFT <cache> <hex...>: each of the hexes still in the node cache's blobs.
+BLOBS_LEFT='c="$1"; shift; for h in "$@"; do [ ! -e "$c/blobs/sha256/$h" ] || echo "$h"; done'
+
 t7() {
-	local m end out ns rs rw rr h cache tag ok
+	local m end out ns rs rw rr h cache tag ok rc rep left n hexes=() check=()
 	for m in "$MA" "$MB"; do
 		out="$(kc delete mlxmodel "$m" -n "$NS" --wait=false 2>&1)" || { bad "delete $m: $out"; return 1; }
 	done
@@ -1099,20 +1176,54 @@ t7() {
 		[ "$(date +%s)" -lt "$end" ] || { bad "serving pods still present: $ns"; return 1; }
 		sleep "$POLL"
 	done
+	# What a dry-run prune would reclaim on each Mac before the run's image goes: the
+	# bystander baseline (another workload's unused blobs, and the target's).
 	for h in "$SERVER|s" "$WORKER|w"; do
 		tag="${h#*|}" h="${h%|*}"
-		out="$(ku "$h" image prune --force -o json 2>&1)" || { bad "image prune on $h: $out"; return 1; }
-		printf '%s\n' "$out" >"$EV/t.7.prune.$tag.json"
-		measure "t7_prune_reclaimed_bytes_$tag" "$(py 'import json,sys; print(json.loads(sys.stdin.read())["cache"]["reclaimedBytes"])' <<<"$out" 2>/dev/null || echo unread)"
+		out="$(ku "$h" image prune -o json 2>"$EV/t.7.prune-dry.before.$tag.err")" ||
+			{ bad "dry-run image prune on $h before the image rm: $(oneline "$out $(cat "$EV/t.7.prune-dry.before.$tag.err")")"; return 1; }
+		printf '%s\n' "$out" >"$EV/t.7.prune-dry.before.$tag.json"
 	done
 	out="$(ku "$SERVER" model rm "$TAG" 2>&1)" || { bad "model rm $TAG: $out"; return 1; }
 	TAG_REMOVED=1
+	while read -r n _; do hexes+=("$n"); done <<<"$FILES"
+	# The run's own image off each node's cache, and nothing else.
+	for h in "$SERVER|s" "$WORKER|w"; do
+		tag="${h#*|}" h="${h%|*}"
+		rc=0
+		out="$(ku "$h" image rm --force "$DIGEST" -o json 2>"$EV/t.7.rm.$tag.err")" || rc=$?
+		printf '%s\n' "$out" >"$EV/t.7.rm.$tag.json"
+		if [ "$rc" != 0 ]; then
+			rep="$(rm_report "$EV/t.7.rm.$tag.json" 2>/dev/null)" && rep=""
+			bad "image rm $DIGEST on $h exited $rc: $(oneline "$out $(cat "$EV/t.7.rm.$tag.err")")${rep:+ ($rep)}"
+			return 1
+		fi
+		rep="$(rm_report "$EV/t.7.rm.$tag.json")" || { bad "image rm $DIGEST on $h: $rep"; return 1; }
+		measure "t7_rm_reclaimed_bytes_$tag" "$(head -n 1 <<<"$rep")"
+		tail -n +2 <<<"$rep" >"$EV/t.7.rm.$tag.kept"
+		out="$(ku "$h" image prune -o json 2>"$EV/t.7.prune-dry.after.$tag.err")" ||
+			{ bad "dry-run image prune on $h after the image rm: $(oneline "$out $(cat "$EV/t.7.prune-dry.after.$tag.err")")"; return 1; }
+		printf '%s\n' "$out" >"$EV/t.7.prune-dry.after.$tag.json"
+	done
 	out="$(ku "$SERVER" image prune --force -o json 2>&1)" || { bad "registry prune: $out"; return 1; }
 	printf '%s\n' "$out" >"$EV/t.7.prune.registry.json"
 	for h in "$SERVER|$SCACHE|s" "$WORKER|$WCACHE|w"; do
 		IFS='|' read -r h cache tag <<<"$h"
 		view_read "$h" "$cache" "$EV/t.7.view.$tag" || { bad "read the view dir on $h"; return 1; }
-		grep -qx 'VIEWS 0' "$EV/t.7.view.$tag" || { bad "the view of $DIGEST is still on $h after the prune"; return 1; }
+		grep -qx 'VIEWS 0' "$EV/t.7.view.$tag" || { bad "the view of $DIGEST is still on $h after image rm and the registry prune"; return 1; }
+		# The target's blobs are gone, but for one the rm kept because another image shares it.
+		check=()
+		for n in "${hexes[@]}"; do grep -qxF "$n" "$EV/t.7.rm.$tag.kept" || check+=("$n"); done
+		left="$(rroot "$h" "$STEP_TIMEOUT" "$BLOBS_LEFT" "$cache" ${check[@]+"${check[@]}"})" || { bad "read the cache blobs on $h"; return 1; }
+		[ -z "$left" ] || { bad "blobs of $DIGEST are still in the cache on $h after image rm: $(oneline "$left")"; return 1; }
+		n="$(bystanders "$EV/t.7.prune-dry.before.$tag.json" "$EV/t.7.prune-dry.after.$tag.json" "$EV/t.7.rm.$tag.json" "$MHEX" "${hexes[@]}")" ||
+			{ bad "the bystander blobs changed on $h: a dry-run prune would reclaim other blobs after image rm than before: $n"; return 1; }
+		measure "t7_bystander_blobs_$tag" "$n"
+		if [ "$n" = 0 ]; then
+			echo "t.7: bystander check on $h: the dry-run prune listed no other unused blob, so the check had nothing to observe"
+		else
+			echo "t.7: bystander check on $h: PASS, $n other unused blob(s) untouched by image rm"
+		fi
 	done
 	end=$(($(date +%s) + RECLAIM_TIMEOUT))
 	while :; do
@@ -1126,7 +1237,7 @@ t7() {
 		df_back "$BASE_R" "$rr" "registry store" || { [ $? = 2 ] && return 1; ok=0; }
 		[ "$ok" = 0 ] || break
 		[ "$(date +%s)" -lt "$end" ] || {
-			bad "free space not back within 1% of the model ($TOL bytes) in ${RECLAIM_TIMEOUT}s: server cache $(((${BASE_S% *} - ${rs% *}) * 1024)), worker cache $(((${BASE_W% *} - ${rw% *}) * 1024)), registry store $(((${BASE_R% *} - ${rr% *}) * 1024)) bytes short"
+			bad "free space not back after image rm and the registry prune, within 1% of the model ($TOL bytes) in ${RECLAIM_TIMEOUT}s: server cache $(((${BASE_S% *} - ${rs% *}) * 1024)), worker cache $(((${BASE_W% *} - ${rw% *}) * 1024)), registry store $(((${BASE_R% *} - ${rr% *}) * 1024)) bytes short"
 			return 1
 		}
 		sleep "$POLL"
@@ -1710,29 +1821,84 @@ def k3sm(argv):
         print("removed")
         return 0
     if argv[:2] == ["image", "prune"]:
+        # Every cached blob no pod on this node uses, another image's included;
+        # without --force it only lists them.
+        dry = "--force" not in argv
         s = jload("k8s.json", {"ns": [], "objs": {}, "pods": {}, "pulled": {}})
         reg = jload("reg.json", None)
         node = NODES[HOST][0]
-        reclaimed = 0
+        cache = NODES[HOST][1]
+        bdir = os.path.join(cache, "blobs", "sha256")
         live = [p for p in s["pods"].values() if p["spec"]["nodeName"] == node]
-        if reg and s["pulled"].get(HOST) and not live and "prune-keeps" not in BRK:
-            cache = NODES[HOST][1]
-            rmtree(os.path.join(cache, "artifacts", reg["digest"].split(":")[1]))
-            for f in reg["files"]:
-                p = os.path.join(cache, "blobs", "sha256", f[0])
-                if os.path.exists(p):
-                    os.remove(p)
-            df_add(HOST, reg["kb"])
-            s["pulled"][HOST] = False
-            reclaimed = reg["kb"] * 1024
-            jsave("k8s.json", s)
-        if HOST == SRV and reg and not reg["tagged"] and not reg.get("reclaimed") and "registry-keeps" not in BRK:
+        held = set(f[0] for f in reg["files"]) if reg and live else set()
+        blobs = sorted(b for b in (os.listdir(bdir) if os.path.isdir(bdir) else []) if b not in held)
+        if not dry and "prune-keeps" in BRK:
+            blobs = []
+        reclaimed = sum(os.path.getsize(os.path.join(bdir, b)) for b in blobs)
+        if not dry and "prune-keeps" not in BRK:
+            for b in blobs:
+                os.remove(os.path.join(bdir, b))
+            if reg and s["pulled"].get(HOST) and not live:
+                rmtree(os.path.join(cache, "artifacts", reg["digest"].split(":")[1]))
+                df_add(HOST, reg["kb"])
+                s["pulled"][HOST] = False
+                jsave("k8s.json", s)
+        if not dry and HOST == SRV and reg and not reg["tagged"] and not reg.get("reclaimed") and "registry-keeps" not in BRK:
             rmtree(os.path.join(REG, "models", reg["repo"]))
             df_add(SRV, reg["kb"])
             reg["reclaimed"] = True
             jsave("reg.json", reg)
-        out({"dryRun": False, "registry": {"name": "registry-k3sm:6450", "manifests": [], "kept": []}, "cache": {"blobs": [], "reclaimedBytes": reclaimed}})
+        out({"dryRun": dry, "registry": {"name": "registry-k3sm:6450", "manifests": [], "kept": []}, "cache": {"blobs": ["sha256:" + b for b in blobs], "reclaimedBytes": reclaimed}})
         return 0
+    if argv[:2] == ["image", "rm"]:
+        # One image's view and blobs on this node's cache; the registry and the tag
+        # are not touched. A dry run unless --force.
+        force = "--force" in argv
+        pos, i = [], 2
+        while i < len(argv):
+            if argv[i] == "-o":
+                i += 2
+            elif argv[i].startswith("-"):
+                i += 1
+            else:
+                pos.append(argv[i])
+                i += 1
+        if "rm-old-daemon" in BRK:
+            print("k3sm image: rm: this node's runtimed predates image rm; nothing was evicted; upgrade the node", file=sys.stderr)
+            return 1
+        s = jload("k8s.json", {"ns": [], "objs": {}, "pods": {}, "pulled": {}})
+        reg = jload("reg.json", None)
+        target = pos[0] if len(pos) == 1 else ""
+        if not reg or target != reg["digest"] or not s["pulled"].get(HOST):
+            print("k3sm image: rm %s: no image entry, artifact record or released copy names it on this node; `k3sm image prune` reclaims unnamed blobs" % target, file=sys.stderr)
+            return 1
+        cache = NODES[HOST][1]
+        bdir = os.path.join(cache, "blobs", "sha256")
+        mine = {f[0]: f[2] for f in reg["files"]}
+        if not force:
+            out({"manifestDigest": reg["digest"], "dryRun": True, "removedDigests": ["sha256:" + h for h in sorted(mine)], "kept": [], "reclaimedBytes": sum(mine.values())})
+            return 0
+        if "prune-keeps" in BRK:
+            # Answers success and deletes nothing.
+            out({"manifestDigest": reg["digest"], "dryRun": False, "removedDigests": [], "kept": [], "reclaimedBytes": 0})
+            return 0
+        # A blob kept for a reason other than the shared one, answered as a failure.
+        kept = {reg["big"]: "young"} if "rm-kept-unshared" in BRK else {}
+        rmtree(os.path.join(cache, "artifacts", reg["digest"].split(":")[1]))
+        gone = [h for h in sorted(mine) if h not in kept and os.path.exists(os.path.join(bdir, h))]
+        for h in gone:
+            os.remove(os.path.join(bdir, h))
+        if "rm-evicts-all" in BRK:
+            # A broken verb: every other unused blob goes too.
+            for b in os.listdir(bdir):
+                if b not in kept:
+                    os.remove(os.path.join(bdir, b))
+        df_add(HOST, sum(mine[h] for h in gone) // 1024)
+        s["pulled"][HOST] = False
+        jsave("k8s.json", s)
+        out({"manifestDigest": reg["digest"], "dryRun": False, "removedDigests": ["sha256:" + h for h in gone],
+             "kept": [{"digest": "sha256:" + h, "reason": r} for h, r in sorted(kept.items())], "reclaimedBytes": sum(mine[h] for h in gone)})
+        return 1 if kept else 0
     print("fake k3sm: unhandled %r" % argv, file=sys.stderr)
     return 2
 
@@ -1865,11 +2031,15 @@ self_test() {
 	rc=0; within 100 102 "$TOL" || rc=$?
 	chk "within: 2 KiB" "$rc" 1
 
+	BYSTANDER="$(printf 'bystander\n' | shasum -a 256 | awk '{print $1}')"
 	# One full fake run. FAKE_BREAK names a mutant; want is the exit and the red rung.
 	# FR_STEP, set on one call, shortens K3SM_MST_STEP_TIMEOUT for a run whose fake hangs.
 	fake_run() { # <name> <break> <want-exit> <want-in-output> [evidence-dir]
 		local name="$1" brk="$2" want="$3" grepfor="$4" ev="${5:-$t/runs/$1/ev}" r="$t/runs/$1" got=0 o
-		mkdir -p "$r/state" "$r/srv/cache/blobs" "$r/wrk/cache/blobs" "$r/srv/registry"
+		mkdir -p "$r/state" "$r/srv/cache/blobs/sha256" "$r/wrk/cache/blobs/sha256" "$r/srv/registry"
+		# Another workload's unused cached blob on each Mac: t.7 must leave it alone.
+		printf 'bystander\n' >"$r/srv/cache/blobs/sha256/$BYSTANDER"
+		printf 'bystander\n' >"$r/wrk/cache/blobs/sha256/$BYSTANDER"
 		o="$(
 			cd "$t" && env -u K3SM_LAB_TOLERATE_KEYS PATH="$bin:$PATH" K3SM_LAB=1 KUBECONFIG=/dev/null \
 				FAKE_STATE="$r/state" FAKE_BREAK="$brk" FAKE_SERVER_HOST=srv FAKE_REG_ROOT="$r/srv/registry" \
@@ -1914,6 +2084,15 @@ self_test() {
 	has "happy: the serving log recorded" "$(cat "$RUN_DIR/ev/"t.5.*.serve.log)" "INFO serving on"
 	if grep -q 'decoy' "$RUN_DIR/ev/"t.5.*.hub; then echo "self-test FAIL: happy: the Hub walk entered the weights mount"; bad=1; fi
 	has "happy: the kickstart landed" "$(cat "$RUN_DIR/state/calls")" "wrk launchctl kickstart -k system/io.k3sm.agent"
+	# t.7 evicts the run's own image on each Mac and never prunes the worker's cache.
+	for out in srv wrk; do has "happy: t.7 image rm on $out" "$(cat "$RUN_DIR/state/calls")" "$out k3sm image rm --force sha256:"; done
+	if grep -q '^wrk k3sm image prune --force' "$RUN_DIR/state/calls"; then echo "self-test FAIL: happy: t.7 pruned the worker's whole cache"; bad=1; fi
+	[ -e "$RUN_DIR/wrk/cache/blobs/sha256/$BYSTANDER" ] || { echo "self-test FAIL: happy: the worker's other cached blob is gone"; bad=1; }
+	for out in s w; do
+		has "happy: t.7 rm reclaimed on $out" "$(cat "$RUN_DIR/ev/measurements.tsv")" "$(printf 't7_rm_reclaimed_bytes_%s\t%s' "$out" "$(awk -F '\t' '$1 == "model_bytes" {print $2}' "$RUN_DIR/ev/measurements.tsv")")"
+		has "happy: t.7 bystanders on $out" "$(cat "$RUN_DIR/ev/measurements.tsv")" "$(printf 't7_bystander_blobs_%s\t1' "$out")"
+		[ -s "$RUN_DIR/ev/t.7.rm.$out.json" ] || { echo "self-test FAIL: happy: t.7.rm.$out.json not kept"; bad=1; }
+	done
 
 	# Each rung's failure is caught, the run is red naming it, and f.1 still cleans.
 	local row brk rung
@@ -1924,7 +2103,8 @@ self_test() {
 		"hub-online|t.5" "hub-cache-full|t.5" "hub-fetch|t.5" "hub-env-missing|t.5" "egress-late|t.5" \
 		"hub-models-dir|t.5" "hub-cache-env|t.5" "hub-log|t.5" "serve-log-empty|t.5" "write-ok|t.5" "write-eacces|t.5" "exec-ok|t.5" "view-hardlink|t.5" "view-twice|t.5" \
 		"pvc-read-fails|t.3" "copyrun-exec-fails|t.5" "copyrun-no-marker|t.5" \
-		"scale-copies|t.6" "prune-keeps|t.7" "registry-keeps|t.7"; do
+		"scale-copies|t.6" "prune-keeps|t.7" "registry-keeps|t.7" \
+		"rm-kept-unshared|t.7" "rm-old-daemon|t.7" "rm-evicts-all|t.7"; do
 		brk="${row%|*}" rung="${row#*|}"
 		fake_run "$brk" "$brk" 1 "result: FAIL ($rung)"
 		cleaned "$brk"
@@ -1960,6 +2140,12 @@ self_test() {
 	reason0 version-no-commit "the builds name no commit"
 	reason0 head-unknown "the tree's HEAD is unknown"
 	reason0 dirty-tree "the tree is dirty"
+	# Each t.7 eviction mutant is red for its own reason.
+	reason7() { has "$1: t.7 reason" "$(awk -F '\t' '$1 == "t.7" && $2 == "FAIL"' "$t/runs/$1/ev/result.tsv" 2>/dev/null)" "$2"; }
+	reason7 prune-keeps "is still on srv after image rm"
+	reason7 rm-kept-unshared "kept for young"
+	reason7 rm-old-daemon "predates image rm"
+	reason7 rm-evicts-all "the bystander blobs changed"
 	has "happy: the pushing binary's version recorded" "$(cat "$t/runs/happy/ev/t.0.versions")" "pushing binary"
 	# t.8 states the rig's end state in one line.
 	has "happy: t.8 end state" "$(cat "$t/runs/happy/out")" "end state: the rig is left on k3sm v0.0.0-fake (commit $(printf 'a%.0s' $(seq 40))); node-s Ready=True, node-w Ready=True"
