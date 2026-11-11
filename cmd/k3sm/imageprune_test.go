@@ -923,7 +923,8 @@ func TestImagePruneForceStopsOnCancel(t *testing.T) {
 			if output == "json" {
 				args = append(args, "-o", "json")
 			}
-			opts, err := parseImageArgs(args, io.Discard)
+			var stderr bytes.Buffer
+			opts, err := parseImageArgs(args, &stderr)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -958,12 +959,17 @@ func TestImagePruneForceStopsOnCancel(t *testing.T) {
 			if sweepCtxErr != nil {
 				t.Errorf("the sweep ran under a done context: %v", sweepCtxErr)
 			}
+			// The notes go to stderr, the sweep's before the sweep runs.
+			wantNotes := "prune interrupted: sweeping the 1 deleted manifest(s) for up to " + pruneSweepGrace.String() + "\n" +
+				"prune interrupted: 2 planned manifest(s) not attempted or not confirmed; run prune again to delete them\n"
+			if stderr.String() != wantNotes {
+				t.Errorf("stderr = %q\nwant     %q", stderr.String(), wantNotes)
+			}
 
 			if output == "table" {
 				for _, w := range []string{
 					"  deleted app@" + f.overwritten + " (untagged)\n",
 					"  deleted 1 untagged manifest(s);",
-					"  interrupted: 2 planned manifest(s) not attempted; run prune again to delete them\n",
 				} {
 					if !strings.Contains(out.String(), w) {
 						t.Errorf("table missing %q:\n%s", w, out.String())
@@ -971,6 +977,21 @@ func TestImagePruneForceStopsOnCancel(t *testing.T) {
 				}
 				if strings.Contains(out.String(), "could not delete") {
 					t.Errorf("table reports a failed deletion:\n%s", out.String())
+				}
+				// The app reads this table strictly and refuses any line it does
+				// not know, so an interrupted run's stdout carries only the line
+				// shapes the report always had.
+				known := []string{
+					"registry ", "  skipped: ", "  deleted ", "  would delete ", "  could not delete ",
+					"  swept ", "  sweep stopped by the mass-delete brake, nothing freed: ",
+					"  not yet reviewed by the registry's garbage collection, only reported on: ",
+					"  sweep failed, nothing freed: ", "  sweep: ", "  kept untagged:", "    ",
+					"  unreadable, left alone: ", "node cache:", "  nothing to reclaim: ", "  kept:", "(dry run",
+				}
+				for _, line := range strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n") {
+					if !slices.ContainsFunc(known, func(p string) bool { return strings.HasPrefix(line, p) }) {
+						t.Errorf("stdout carries a line the report never had: %q", line)
+					}
 				}
 				return
 			}

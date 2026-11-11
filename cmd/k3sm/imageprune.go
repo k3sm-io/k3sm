@@ -70,9 +70,12 @@ type registryPruneResult struct {
 	// Interrupted says a forced prune was cancelled (Ctrl+C) before it had
 	// attempted every planned deletion. What it deleted stands and is swept.
 	Interrupted bool `json:"interrupted,omitempty"`
-	// Unattempted are the planned manifests an interrupted prune never sent a
-	// DELETE for, or whose DELETE the cancellation cut off before the registry
-	// answered. They are not failures: a later prune plans them again.
+	// Unattempted are the planned manifests an interrupted prune did not
+	// attempt or could not confirm: those it never sent a DELETE for, and one
+	// whose DELETE the cancellation cut off in flight. The registry may have
+	// applied that one; it is listed here, not under Manifests, and this run
+	// does not sweep it, so a later prune or the registry's scheduled
+	// collection reclaims it. None of them is a failure.
 	Unattempted []registrysvc.StoredManifest `json:"unattempted,omitempty"`
 	// Sweep is the garbage-collection sweep of the repositories a forced
 	// prune deleted from, and what it freed. It is absent from a dry run and
@@ -189,6 +192,9 @@ func imagePrune(ctx context.Context, client runtimev1.ImagesClient, o imageOptio
 	}
 	var errs []error
 	if report.Registry.Interrupted {
+		// The note goes to stderr: the table on stdout is a contract with the
+		// app, which refuses any line it does not know.
+		fmt.Fprintf(pruneWarn(o), "prune interrupted: %d planned manifest(s) not attempted or not confirmed; run prune again to delete them\n", len(report.Registry.Unattempted))
 		errs = append(errs, fmt.Errorf("prune %s interrupted (%d not attempted; see the report): %w", flatRegistryHost, len(report.Registry.Unattempted), context.Cause(ctx)))
 	}
 	if failed > 0 {
@@ -305,6 +311,7 @@ func pruneRegistry(ctx context.Context, o imageOptions, cred registrysvc.Credent
 			var cancel context.CancelFunc
 			sweepCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), pruneSweepGrace)
 			defer cancel()
+			fmt.Fprintf(pruneWarn(o), "prune interrupted: sweeping the %d deleted manifest(s) for up to %s\n", len(res.Manifests), pruneSweepGrace)
 		}
 		sweep, err := collect(sweepCtx, authority, res.Manifests, cred)
 		if err != nil {
@@ -313,6 +320,15 @@ func pruneRegistry(ctx context.Context, o imageOptions, cred registrysvc.Credent
 		res.Sweep = &sweep
 	}
 	return failed, nil
+}
+
+// pruneWarn is where prune writes a note that is not part of its report:
+// stderr from the CLI, nowhere when no writer was set.
+func pruneWarn(o imageOptions) io.Writer {
+	if o.warn == nil {
+		return io.Discard
+	}
+	return o.warn
 }
 
 // renderPrune renders a prune report as the operator's table.
@@ -335,9 +351,6 @@ func renderPrune(out io.Writer, r pruneReport) {
 		}
 		fmt.Fprintf(out, "  %s %d untagged manifest(s); the registry's garbage collection reclaims their layers on its next sweep\n", verb, len(reg.Manifests))
 		renderSweep(out, reg.Sweep)
-		if reg.Interrupted {
-			fmt.Fprintf(out, "  interrupted: %d planned manifest(s) not attempted; run prune again to delete them\n", len(reg.Unattempted))
-		}
 		if len(reg.Kept) > 0 {
 			counts := map[string]int{}
 			for _, k := range reg.Kept {
