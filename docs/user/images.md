@@ -378,11 +378,17 @@ anywhere.
 The `-o json` document has three keys. `dryRun` is true without `--force`. `registry` holds
 `name`, `skipped` (set only on a node without a registry), `manifests` (each with `repository`,
 `digest`, `mediaType` and `size`, deleted or to be deleted), `kept` (the untagged manifests kept,
-each with its `reason`), and, when present, `unreadable` repositories, `failed` deletions and
-the `sweep` a forced prune ran (`repositories`, `blobs`, `bytes`, and any `stopped`, `failed` or
-`reviewing` repositories and `error`).
+each with its `reason`), and, when present, `unreadable` repositories, `failed` deletions,
+`interrupted` and the `unattempted` manifests of an interrupted prune, and the `sweep` a forced
+prune ran (`repositories`, `blobs`, `bytes`, and any `stopped`, `failed` or `reviewing`
+repositories and `error`).
 `cache` holds `blobs`, `reclaimedBytes` and `kept` (counts by reason). The command exits non-zero
 when any deletion fails, after printing the report.
+
+Pressing Ctrl+C during `--force` stops the prune before its next deletion. The deletions already
+made stand and are still swept, the report marks the prune as interrupted and lists the manifests
+it did not attempt as unattempted rather than failed, and the command exits non-zero after
+printing it. Run the prune again to delete what is left.
 
 ## Pushing to a Registry: `k3sm image push`
 

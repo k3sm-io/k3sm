@@ -300,6 +300,10 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
   condition, so a tag re-pointed between the check and the delete is still removed, and a
   development build from between releases refuses the removal even though the tag has not moved.
   Upgrading the cluster is the fix in both cases.
+- `sudo k3sm image prune --force` now stops at Ctrl+C instead of reporting every manifest it had not
+  reached as a failed deletion. The deletions it made are still swept, the report marks it
+  `interrupted` and lists the rest as `unattempted`, and the command exits non-zero. See
+  [Reclaiming Space](docs/user/images.md#reclaiming-space-k3sm-image-prune).
 - A server whose control plane does not report healthy in time while the Mac is heavily loaded no
   longer parks on the crash-loop breaker after five attempts. It backs off instead, from 30 seconds
   doubling up to 10 minutes, `k3sm status` shows when the next attempt starts and that an attempt
