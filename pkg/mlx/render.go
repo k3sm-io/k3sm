@@ -171,6 +171,14 @@ const (
 	// hub's own layout.
 	hfHomePath = CacheMountPath + "/huggingface"
 
+	// hfHubOfflineEnv tells the serving runtime never to contact the Hub. It is
+	// set only on an artifact model, whose weights are already on the read-only
+	// image volume: a Hub model downloads at start and must keep the Hub.
+	hfHubOfflineEnv = "HF_HUB_OFFLINE"
+
+	// hfHubOfflineValue is the value that switches hfHubOfflineEnv on.
+	hfHubOfflineValue = "1"
+
 	// hubDir is the hub cache directory the Hugging Face client keeps under
 	// HF_HOME. It is part of that client's on-disk layout, not a k3sm choice, and
 	// it is named here because a pinned revision is rendered as a path INTO it.
@@ -652,6 +660,7 @@ func statefulSet(m *mlxv1alpha1.MLXModel, p prepared, sizing Sizing) *appsv1.Sta
 	var volumes []corev1.Volume
 	if p.artifact != nil {
 		container.VolumeMounts = append(container.VolumeMounts, artifactMount())
+		container.Env = append(container.Env, hubOfflineEnv())
 		volumes = append(volumes, *p.artifact)
 	}
 
@@ -755,4 +764,11 @@ func service(m *mlxv1alpha1.MLXModel, owner metav1.OwnerReference, name string, 
 			}},
 		},
 	}
+}
+
+// hubOfflineEnv is the env var an artifact model's serving container runs
+// with, so the engine resolves everything from the mounted weights and never
+// reaches the Hub.
+func hubOfflineEnv() corev1.EnvVar {
+	return corev1.EnvVar{Name: hfHubOfflineEnv, Value: hfHubOfflineValue}
 }

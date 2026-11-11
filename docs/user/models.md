@@ -3,6 +3,8 @@
 k3sm stores a model as a [ModelPack](https://github.com/modelpack/model-spec) OCI artifact in the cluster
 registry, under `registry-k3sm:6450/models/<name>`. You put a model there once, from your Mac, and every
 node pulls it from the cluster. No pod needs internet access to get its weights.
+An `MLXModel` that names one with `spec.artifact` is served with the Hub offline (`HF_HUB_OFFLINE=1`), so
+the engine never contacts Hugging Face.
 
 Three verbs manage these artifacts:
 

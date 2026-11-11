@@ -181,6 +181,10 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
 
 ### Changed
 
+- An `MLXModel` served from the cluster registry (`spec.artifact`) now runs with `HF_HUB_OFFLINE=1`,
+  so the engine never contacts Hugging Face; a model served from the Hub (`spec.model`) still downloads
+  at start. A sharded model already running picks this up the next time its pods are recreated. See
+  [Models in the cluster registry](docs/user/models.md).
 - A Pod with `dnsPolicy: None` now resolves through its own `dnsConfig`: its IPv4 nameservers
   (up to three), `searches` and `ndots`, natively and in a `vm` guest, with no fallback to the host
   resolver. It used to resolve through the host and ignore its `dnsConfig`. IPv6 nameservers are

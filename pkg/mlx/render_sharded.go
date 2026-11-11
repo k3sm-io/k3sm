@@ -596,6 +596,7 @@ func rankPod(m *mlxv1alpha1.MLXModel, p prepared, placement Placement, r RankPla
 	}
 	if p.artifact != nil {
 		container.VolumeMounts = append(container.VolumeMounts, artifactMount())
+		container.Env = append(container.Env, hubOfflineEnv())
 		volumes = append(volumes, *p.artifact)
 	}
 
