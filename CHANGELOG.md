@@ -269,8 +269,8 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
 
 - A server whose control plane does not report healthy in time while the Mac is heavily loaded no
   longer parks on the crash-loop breaker after five attempts. It backs off instead, from 30 seconds
-  doubling up to 10 minutes, `k3sm status` shows when the next attempt starts and that an attempt
-  is running, and it parks only after eight slow attempts in a row. The Mac counts as heavily loaded
+  doubling up to 10 minutes, `k3sm status` shows when the next attempt starts and, while the
+  server is running, that an attempt is in progress, and it parks only after eight slow attempts in a row. The Mac counts as heavily loaded
   only when both its 1-minute and 5-minute load averages are at least 2 per core, and the crash-loop
   record notes both. Each component's log from the first failed run is kept as
   `<component>.log.1` until the control plane comes up healthy again, with the latest failed run's

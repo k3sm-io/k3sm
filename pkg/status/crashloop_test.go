@@ -124,7 +124,7 @@ func TestClassifyCrashLoop(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			v := ClassifyCrashLoop(tc.rec, tc.err, path, now)
+			v := ClassifyCrashLoop(tc.rec, tc.err, path, now, true)
 			if v.Posture != tc.wantPosture {
 				t.Fatalf("posture = %v, want %v (%+v)", v.Posture, tc.wantPosture, v)
 			}
@@ -232,4 +232,66 @@ func TestCollectorServerRowReadsTheCrashRecord(t *testing.T) {
 			t.Fatalf("%+v", row)
 		}
 	})
+}
+
+// A stop or kill during a slow bring-up streak leaves SlowStreak > 0 in the
+// record with no attempt behind it. Only a running server has a bring-up
+// attempt in progress; without one the elapsed streak is quiet, while the
+// postures the record alone proves (parked, a crash pattern) are unchanged.
+func TestCrashLoopSlowStreakNeedsALiveServer(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	path := "/var/lib/k3sm/server/crashloop.json"
+	// Past the slow backoff: the record says only "a streak of N".
+	elapsed := now.Add(-time.Hour)
+	streak := executor.CrashRecord{SlowStreak: 2, LastSlowAt: &elapsed}
+	tripped := now.Add(-time.Minute)
+	parked := executor.CrashRecord{SlowStreak: 2, LastSlowAt: &tripped, TrippedAt: &tripped,
+		Crashes: []executor.Crash{{At: tripped, Component: "kube-apiserver", Origin: executor.CrashOriginBringUpSlow}}}
+	crashing := executor.CrashRecord{SlowStreak: 1, LastSlowAt: &elapsed, Crashes: []executor.Crash{
+		{At: now.Add(-2 * time.Minute), Component: "kine", Origin: executor.CrashOriginCrash},
+		{At: now.Add(-time.Minute), Component: "kine", Origin: executor.CrashOriginCrash}}}
+
+	tests := []struct {
+		name        string
+		rec         executor.CrashRecord
+		live        bool
+		wantPosture CrashLoopPosture
+		wantIn      string
+	}{
+		{"a live server with a streak is mid-attempt", streak, true, PostureRestarting, "bring-up attempt 3 in progress"},
+		{"a stopped server with a streak is quiet", streak, false, PostureQuiet, ""},
+		{"a stopped server still reads as parked", parked, false, PostureParked, "tripped"},
+		{"a stopped server still shows the crash pattern", crashing, false, PostureRestarting, "restarted 2 times"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			v := ClassifyCrashLoop(tc.rec, nil, path, now, tc.live)
+			if v.Posture != tc.wantPosture {
+				t.Fatalf("posture = %v, want %v (%+v)", v.Posture, tc.wantPosture, v)
+			}
+			if !strings.Contains(v.Detail, tc.wantIn) {
+				t.Errorf("detail lacks %q: %+v", tc.wantIn, v)
+			}
+			if !tc.live && strings.Contains(v.Detail, "in progress") {
+				t.Errorf("no server is running, yet the verdict claims an attempt: %+v", v)
+			}
+		})
+	}
+
+	// The collector takes liveness from the server row it folds into.
+	b, _ := json.Marshal(streak)
+	c := Collector{FS: fakeFS{contents: map[string][]byte{executor.CrashLoopPath("/var/lib/k3sm/server"): b}},
+		Paths: Paths{WorkDir: "/var/lib/k3sm/server"}, Now: func() time.Time { return now }}
+	for _, st := range []struct {
+		state RowState
+		want  string
+	}{{StateRunning, "restarting"}, {StateStopped, ""}} {
+		row := Row{Name: RowServer, State: st.state, Severity: SeverityOK, Wide: map[string]string{}}
+		c.crashLoop(&row)
+		if row.Wide["crash-loop"] != st.want {
+			t.Errorf("server row %s: crash-loop = %q, want %q (%+v)", st.state, row.Wide["crash-loop"], st.want, row)
+		}
+	}
 }

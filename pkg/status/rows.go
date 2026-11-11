@@ -1788,5 +1788,7 @@ func (c Collector) crashLoop(row *Row) {
 	if err == nil {
 		err = json.Unmarshal(b, &rec)
 	}
-	applyCrashLoop(row, ClassifyCrashLoop(rec, err, path, now))
+	// The row's state is launchd's verdict already checked against the process
+	// table (daemonRow): a running server is the only one with an attempt live.
+	applyCrashLoop(row, ClassifyCrashLoop(rec, err, path, now, row.State == StateRunning))
 }

@@ -80,8 +80,11 @@ type CrashLoopVerdict struct {
 const restartingFloor = 2
 
 // ClassifyCrashLoop reads a record into a verdict. Pure: the caller passes the
-// record (or the read error) and the clock.
-func ClassifyCrashLoop(rec executor.CrashRecord, readErr error, path string, now time.Time) CrashLoopVerdict {
+// record (or the read error), the clock, and serverLive, whether a server
+// daemon is running right now (launchd's running state, confirmed in the
+// process table). The record cannot say that itself: a stop or kill during a
+// slow streak leaves SlowStreak > 0 with no attempt behind it.
+func ClassifyCrashLoop(rec executor.CrashRecord, readErr error, path string, now time.Time, serverLive bool) CrashLoopVerdict {
 	if readErr != nil {
 		if errors.Is(readErr, os.ErrPermission) {
 			return CrashLoopVerdict{Posture: PostureUnreadable,
@@ -158,10 +161,12 @@ func ClassifyCrashLoop(rec executor.CrashRecord, readErr error, path string, now
 			LeaderLost: lostNote,
 		}
 	}
-	if rec.SlowStreak > 0 {
+	if rec.SlowStreak > 0 && serverLive {
 		// The backoff is over and the next attempt is running (or about to): the
 		// streak is still live until that attempt reaches healthz, so the row
-		// keeps saying so instead of going quiet mid-attempt.
+		// keeps saying so instead of going quiet mid-attempt. Only a running
+		// server has an attempt: a stop or kill mid-streak leaves the count in
+		// the record with nothing behind it, which is quiet.
 		return CrashLoopVerdict{
 			Posture: PostureRestarting,
 			Detail: fmt.Sprintf("bring-up attempt %d in progress: %d consecutive bring-ups timed out while the host was under pressure; parks at %d",
