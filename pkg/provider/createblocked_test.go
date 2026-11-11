@@ -106,8 +106,8 @@ func TestCreateRefusedBesideLiveProcessesParksNotFails(t *testing.T) {
 			pod := pullPod("blocked")
 			pod.Spec.RestartPolicy = corev1.RestartPolicyNever
 			id := string(pod.UID)
-			// The first create and the first retry are refused; the next one passes.
-			r, e, clk, rec := newBlockedCreateProvider(t, s.cause, s.cause)
+			// The first create and three re-checks are refused; the next one passes.
+			r, e, clk, rec := newBlockedCreateProvider(t, s.cause, s.cause, s.cause, s.cause)
 
 			if err := r.CreatePod(ctx, pod); err != nil {
 				t.Fatalf("CreatePod = %v, want nil: the pod is parked, not failed", err)
@@ -119,51 +119,29 @@ func TestCreateRefusedBesideLiveProcessesParksNotFails(t *testing.T) {
 			if !addressHeld(r, id) {
 				t.Fatal("the parked pod's address was released")
 			}
-			st, err := r.GetPodStatus(ctx, pod.Namespace, pod.Name)
-			if err != nil {
-				t.Fatalf("GetPodStatus: %v", err)
-			}
-			if st.Phase != corev1.PodPending {
-				t.Errorf("phase = %s, want Pending", st.Phase)
-			}
-			w := waitingOf(st, "c0")
-			if w == nil || w.Reason != reasonContainerCreating {
-				t.Fatalf("waiting = %+v, want ContainerCreating, not an image reason", w)
-			}
-			if !strings.Contains(w.Message, s.cause.Error()) || !strings.Contains(w.Message, "previous run's processes") {
-				t.Errorf("waiting message = %q, want the wait explained with the runtime's text %q", w.Message, s.cause.Error())
-			}
+			assertBlockedStatus(t, r, pod)
 			events := recordedEvents(rec.Events)
-			if n := countEvents(events, corev1.EventTypeWarning); n != 1 {
-				t.Errorf("Warning events at the park = %d (%v), want exactly 1", n, events)
-			}
 			if !containsEvent(events, reasonFailedCreatePodSandBox) {
 				t.Errorf("events = %v, want %s", events, reasonFailedCreatePodSandBox)
 			}
 
-			// The first resync's retry is refused again: still parked, address
-			// still held, and no further Warning.
-			clk.Step(resyncInterval + time.Second)
-			if _, err := r.GetPodStatus(ctx, pod.Namespace, pod.Name); err != nil {
-				t.Fatalf("GetPodStatus: %v", err)
-			}
-			waitRestart(t, "the first retry", func() bool { return e.createCalls() == 2 })
-			waitRestart(t, "the first retry to finish", func() bool {
-				tr.restartMu.Lock()
-				defer tr.restartMu.Unlock()
-				for _, pr := range tr.pulls {
-					if pr.attempt {
-						return false
-					}
+			// Three re-checks are refused again: still parked, address still held,
+			// and not one Pulling, BackOff or further Warning Event.
+			for i := 2; i <= 4; i++ {
+				clk.Step(resyncInterval + time.Second)
+				if _, err := r.GetPodStatus(ctx, pod.Namespace, pod.Name); err != nil {
+					t.Fatalf("GetPodStatus: %v", err)
 				}
-				return true
-			})
-			if tr.parkedFailure() == nil || !addressHeld(r, id) {
-				t.Fatal("a refused retry unparked the pod or released its address")
+				waitRestart(t, "a re-check", func() bool { return e.createCalls() == i })
+				waitNoAttempt(t, tr)
+				if tr.parkedFailure() == nil || !addressHeld(r, id) {
+					t.Fatal("a refused retry unparked the pod or released its address")
+				}
+				assertBlockedStatus(t, r, pod)
 			}
-			if n := countEvents(recordedEvents(rec.Events), corev1.EventTypeWarning); n != 0 {
-				t.Errorf("Warning events on a refused resync retry = %d, want 0", n)
-			}
+			// The create's own Pulling precedes its refusal; the re-checks add none.
+			rechecks := recordedEvents(rec.Events)
+			assertBlockedEvents(t, append(events, rechecks...), rechecks)
 
 			// The processes have exited: the next resync creates the pod.
 			clk.Step(resyncInterval + time.Second)
@@ -176,6 +154,60 @@ func TestCreateRefusedBesideLiveProcessesParksNotFails(t *testing.T) {
 			}
 			if n := countEvents(recordedEvents(rec.Events), corev1.EventTypeWarning); n != 0 {
 				t.Errorf("Warning events after the park = %d, want 0", n)
+			}
+		})
+
+		t.Run(s.name+": an image-parked pod whose retry is refused moves to the re-check", func(t *testing.T) {
+			ctx := context.Background()
+			pod := pullPod("image-then-blocked")
+			id := string(pod.UID)
+			// The create is refused for the image (the fake's FIFO), the back-off
+			// retry is refused beside live processes, the re-check passes.
+			r, e, clk, rec := newBlockedCreateProvider(t, nil, s.cause)
+			e.pushCreate(imageRefusal())
+			if err := r.CreatePod(ctx, pod); err != nil {
+				t.Fatalf("CreatePod = %v, want nil", err)
+			}
+			tr := r.trackByID(id)
+			if tr == nil || tr.parkedFailure() == nil {
+				t.Fatal("the image-refused pod is not parked")
+			}
+			waitFor(t, "the back-off worker to sleep", clk.HasWaiters)
+			_ = recordedEvents(rec.Events) // the image park's own Events
+
+			clk.Step(maxPullBackoffForTest)
+			waitRestart(t, "the back-off retry", func() bool { return e.createCalls() == 2 })
+			waitRestart(t, "the record to turn blocked", func() bool {
+				_, blocked := tr.parkedState()
+				return blocked
+			})
+			waitNoAttempt(t, tr)
+			assertBlockedStatus(t, r, pod)
+			after := recordedEvents(rec.Events)
+			if n := countEvents(after, corev1.EventTypeWarning); n != 1 {
+				t.Errorf("Warning events at the refusal = %d (%v), want exactly 1", n, after)
+			}
+			if !containsEvent(after, msgCreateBlocked) {
+				t.Errorf("events = %v, want the plain sentence", after)
+			}
+			if n := countEvents(after, reasonBackOff); n != 0 {
+				t.Errorf("BackOff events after the refusal = %d (%v), want 0", n, after)
+			}
+
+			// The re-check class now paces it: the next resync creates the pod.
+			clk.Step(resyncInterval + time.Second)
+			if _, err := r.GetPodStatus(ctx, pod.Namespace, pod.Name); err != nil {
+				t.Fatalf("GetPodStatus: %v", err)
+			}
+			waitRestart(t, "the park to clear", func() bool { return tr.parkedFailure() == nil })
+			if !e.hasCreated(id) {
+				t.Error("the runtime does not hold the pod after the create passed")
+			}
+			rest := recordedEvents(rec.Events)
+			for _, reason := range []string{reasonBackOff, reasonPulling, corev1.EventTypeWarning} {
+				if n := countEvents(rest, reason); n != 0 {
+					t.Errorf("%s events after the refusal = %d (%v), want 0", reason, n, rest)
+				}
 			}
 		})
 
@@ -222,4 +254,65 @@ func TestCreateRefusedBesideLiveProcessesParksNotFails(t *testing.T) {
 			t.Error("ErrPodCreateInFlight is in the parkable list")
 		}
 	})
+}
+
+// maxPullBackoffForTest steps past any delay the pull back-off can pick.
+const maxPullBackoffForTest = 301 * time.Second
+
+// waitNoAttempt waits until no re-attempt is in flight on the track.
+func waitNoAttempt(t *testing.T, tr *podTrack) {
+	t.Helper()
+	waitRestart(t, "the attempt to finish", func() bool {
+		tr.restartMu.Lock()
+		defer tr.restartMu.Unlock()
+		for _, pr := range tr.pulls {
+			if pr.attempt {
+				return false
+			}
+		}
+		return true
+	})
+}
+
+// assertBlockedStatus checks the pod reports ContainerCreating with the plain
+// sentence, never the runtime's process group or record path.
+func assertBlockedStatus(t *testing.T, r *runtimedRuntime, pod *corev1.Pod) {
+	t.Helper()
+	st, err := r.GetPodStatus(context.Background(), pod.Namespace, pod.Name)
+	if err != nil {
+		t.Fatalf("GetPodStatus: %v", err)
+	}
+	if st.Phase != corev1.PodPending {
+		t.Errorf("phase = %s, want Pending", st.Phase)
+	}
+	w := waitingOf(st, "c0")
+	if w == nil || w.Reason != reasonContainerCreating {
+		t.Fatalf("waiting = %+v, want ContainerCreating, not an image reason", w)
+	}
+	if w.Message != msgCreateBlocked {
+		t.Errorf("waiting message = %q, want %q", w.Message, msgCreateBlocked)
+	}
+	for _, leak := range []string{"/var/lib/k3sm", "pgid", "4242", "4343"} {
+		if strings.Contains(w.Message, leak) {
+			t.Errorf("waiting message %q leaks the runtime's %q", w.Message, leak)
+		}
+	}
+}
+
+// assertBlockedEvents checks a blocked park and its refused re-checks recorded
+// exactly one Warning, with the plain sentence, and that the re-checks recorded
+// no Pulling or BackOff.
+func assertBlockedEvents(t *testing.T, events, rechecks []string) {
+	t.Helper()
+	if n := countEvents(events, corev1.EventTypeWarning); n != 1 {
+		t.Errorf("Warning events = %d (%v), want exactly 1", n, events)
+	}
+	if !containsEvent(events, msgCreateBlocked) {
+		t.Errorf("events = %v, want the plain sentence", events)
+	}
+	for _, reason := range []string{reasonPulling, reasonBackOff} {
+		if n := countEvents(rechecks, reason); n != 0 {
+			t.Errorf("%s events on the re-checks = %d (%v), want 0", reason, n, rechecks)
+		}
+	}
 }

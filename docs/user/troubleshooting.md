@@ -257,13 +257,13 @@ container is restarted in place with an upstream-shaped `CrashLoopBackOff` backo
   replacement boots a guest that supports it. The node keeps retrying under the backoff until then.
 - Stuck rather than exiting? Check the Pod was **adapted** to the native image model, because a raw
   Linux image cannot run as a Darwin process (see [Images](images.md)).
-- Stuck in `ContainerCreating` with a message that the previous run's processes are still
-  exiting? The node will not start a Pod beside processes, or a `vm` Pod's host helper, that an
-  earlier run of the same Pod left alive. The message names the process group or helper and the
-  record the node read it from, and `kubectl describe pod` shows one Warning
-  `FailedCreatePodSandBox` Event. The Pod stays `Pending`, keeps its address, and the node tries
-  the create again about every 10 seconds, so it starts once those processes exit. If they never
-  exit, stop them yourself or delete the Pod.
+- Stuck in `ContainerCreating` with the message "waiting for processes from the pod's previous
+  run to exit before the pod is created; the node's k3sm log has the details"? The node will not
+  start a Pod beside processes, or a `vm` Pod's host helper, that an earlier run of the same Pod
+  left alive. `kubectl describe pod` shows one Warning `FailedCreatePodSandBox` Event with the
+  same text. The node's k3sm log says which processes are still running. The Pod stays
+  `Pending`, keeps its address, and the node tries the create again about every 10 seconds, so it
+  starts once those processes are gone. If they do not exit, stop them yourself or delete the Pod.
 
 See [Limitations](limitations.md#restartpolicy-is-honored-on-the-default-runtime-not-on-the-hostprocess-opt-out)
 for the precise scope.
