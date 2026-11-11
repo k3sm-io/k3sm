@@ -49,15 +49,17 @@ type kineSourcePatch struct {
 // other half is childreq.Raises, the module requirements raised in the copied tree's
 // go.mod (p2 added golang.org/x/net v0.60.0 to p1's source patch, p3 added
 // github.com/klauspost/compress v1.20.2, p4 added the compact-commit-returns-error
-// source patch, p5 added compact-rollback-logs-error). kineBuildVariant names the
-// whole set: any change to either changes that variant, so every staged kine
-// re-stages. TestKinePatchSetIsMarked enforces that, against an append-only history
-// of digests.
+// source patch, p5 added compact-rollback-logs-error, p6 is p4 with x/net raised
+// to v0.62.0 together with the golang.org/x/crypto, x/sys, x/term, x/text and
+// x/sync it requires). kineBuildVariant names the whole set: any change to either
+// changes that variant, so every staged kine re-stages. TestKinePatchSetIsMarked
+// enforces that, against an append-only history of digests.
 //
-// The set is p4's again. p5 also replaced compact()'s deferred t.MustRollback() with
-// a closure that only logged a failed rollback. That was reverted: a ROLLBACK that
-// fails with anything but sql.ErrTxDone can return its connection to the pool still
-// inside the transaction and holding the WAL write lock (database/sql discards a
+// p6's source patches are p4's. p5 also replaced compact()'s deferred
+// t.MustRollback() with a closure that only logged a failed rollback. That was
+// reverted: a ROLLBACK that fails with anything but sql.ErrTxDone can return its
+// connection to the pool still inside the transaction and holding the WAL write
+// lock (database/sql discards a
 // connection only on driver.ErrBadConn, and modernc.org/sqlite's tx.Rollback never
 // returns it), and nothing later detects that reliably. Exiting there, as upstream's
 // MustRollback does (pkg/drivers/generic/tx.go:50-56), lets kine restart with a clean
