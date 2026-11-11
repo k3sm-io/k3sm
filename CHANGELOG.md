@@ -268,14 +268,13 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
 ### Fixed
 
 - `sudo k3sm image prune --force` now stops when it is cancelled (Ctrl+C, SIGTERM, or `--timeout`
-  expiring) instead of reporting every manifest it had not reached as a failed deletion. `manifests`
-  then holds only confirmed deletions, which are still swept for a bounded time. The JSON report
-  marks the run `interrupted` and lists the manifests not attempted or not confirmed under
-  `unattempted`; a deletion cut off in flight may have been applied, is not swept by this run, and is
-  reclaimed by a later prune or the registry's scheduled sweep. The table keeps its usual lines and
-  the interruption is noted on stderr. The command exits non-zero. See
+  expiring). `manifests` then holds only confirmed deletions, which the registry's garbage collection
+  (the sweep) still reclaims within a time limit. Manifests it had not reached are no longer reported
+  as failed deletions. The JSON report sets `interrupted` and lists them under `unattempted`, along
+  with deletions that were not confirmed. A deletion cut off mid-way may have been applied; a later
+  prune or the registry's scheduled garbage collection reclaims it. The interruption is noted on
+  stderr. The table keeps its usual lines, and the command exits non-zero. See
   [Reclaiming Space](docs/user/images.md#reclaiming-space-k3sm-image-prune).
-
 - A server whose control plane does not report healthy in time while the Mac is heavily loaded no
   longer parks on the crash-loop breaker after five attempts. It backs off instead, from 30 seconds
   doubling up to 10 minutes, `k3sm status` shows when the next attempt starts and that an attempt
