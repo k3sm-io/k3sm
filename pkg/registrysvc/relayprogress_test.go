@@ -57,6 +57,11 @@ func TestRelayEarlyAnswerWhileBodyIsSent(t *testing.T) {
 	f := newRelayLimitFixtureWith(t, stallLimits(), registry)
 	f.tokens.statuses[tokTeam] = saStatus("team", "builder")
 	for i := range 20 {
+		if i > 0 {
+			// The server frees the per-source slot only when it closes its
+			// side of the previous round's connection.
+			f.awaitSlot(t, peerA, 3*stallWindow+500*time.Millisecond)
+		}
 		c := f.dialTCP(t, peerA)
 		_ = c.SetDeadline(time.Now().Add(5 * time.Second))
 		const total = 4 << 10
@@ -238,7 +243,8 @@ func TestRelayCutLogEndsWithTheResponse(t *testing.T) {
 		// The response has ended. The server's refusal of the malformed
 		// next request is written outside any response the relay serves,
 		// and here it times out.
-		time.Sleep(50 * time.Millisecond)
+		// net/http sets StateIdle on the serve goroutine before it reads
+		// the next request, so the refusal below always follows it.
 		fc.fail.Store(true)
 		if _, err := fmt.Fprintf(c, "NOT A REQUEST\r\n\r\n"); err != nil {
 			t.Fatal(err)
