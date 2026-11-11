@@ -23,6 +23,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"strconv"
 	"strings"
@@ -230,4 +231,50 @@ func TestRelayStalledReaderFreesItsSlot(t *testing.T) {
 		// Send no body and never close.
 		f.awaitSlot(t, peerA, budget)
 	})
+
+	// The server flushes the response's buffered tail after the handler
+	// returns, so a peer that stops reading there is bounded only if done
+	// leaves the write deadline armed. The next request clears it before its
+	// handler runs.
+	t.Run("a reader that stops at the tail is cut", func(t *testing.T) {
+		s := newSourceLimiter(http.NotFoundHandler(), stallLimits(), nil)
+		dw := &deadlineRecorder{header: http.Header{}}
+		r := httptest.NewRequest(http.MethodGet, bigBlob, nil)
+		w, _, done := s.bindProgress(dw, r)
+		_, _ = w.Write([]byte("tail"))
+		before := time.Now()
+		done()
+		if len(dw.write) == 0 {
+			t.Fatal("done set no write deadline")
+		}
+		last := dw.write[len(dw.write)-1]
+		if last.IsZero() {
+			t.Fatal("done cleared the write deadline: the server's final flush is unbounded")
+		}
+		if last.Before(before) || last.After(before.Add(stallWindow+time.Second)) {
+			t.Errorf("done armed the write deadline at %v, want about one window after %v", last, before)
+		}
+		dw.write = nil
+		_, _, done = s.bindProgress(dw, httptest.NewRequest(http.MethodGet, bigBlob, nil))
+		defer done()
+		if len(dw.write) == 0 || !dw.write[0].IsZero() {
+			t.Fatalf("the next request's bind set write deadlines %v, want it to clear the stale one first", dw.write)
+		}
+	})
 }
+
+// deadlineRecorder is a ResponseWriter that records the write deadlines set on
+// it through http.ResponseController.
+type deadlineRecorder struct {
+	header http.Header
+	write  []time.Time
+}
+
+func (d *deadlineRecorder) Header() http.Header         { return d.header }
+func (d *deadlineRecorder) Write(b []byte) (int, error) { return len(b), nil }
+func (d *deadlineRecorder) WriteHeader(int)             {}
+func (d *deadlineRecorder) SetWriteDeadline(t time.Time) error {
+	d.write = append(d.write, t)
+	return nil
+}
+func (d *deadlineRecorder) SetReadDeadline(time.Time) error { return nil }
