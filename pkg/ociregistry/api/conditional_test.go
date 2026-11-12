@@ -122,6 +122,7 @@ func TestConditionalDelete(t *testing.T) {
 	tagged := newFixture(t)
 	oldBody := tagged.image(t, "app", "v1", "l")
 	newBody := tagged.image(t, "app", "", "m")
+	taggedState := state(t, tagged)
 	for _, tc := range []struct {
 		name, path, ifMatch string
 		status              int
@@ -134,13 +135,16 @@ func TestConditionalDelete(t *testing.T) {
 		{"a weak tag of the digest never matches", "/v2/app/manifests/v1", `W/"<old>"`, http.StatusPreconditionFailed, false},
 		{"a malformed list naming the digest fails whole", "/v2/app/manifests/v1", `"<old>", bogus`, http.StatusPreconditionFailed, false},
 		{"a digest delete naming its own digest is refused", "/v2/app/manifests/<new>", `"<new>"`, http.StatusPreconditionFailed, false},
+		{"a tag delete of an absent tag with a well-formed digest is not found", "/v2/app/manifests/v9", `"<old>"`, http.StatusNotFound, false},
+		{"a tag delete with a lone malformed tag is refused", "/v2/app/manifests/v1", `bogus`, http.StatusPreconditionFailed, false},
+		{"a digest delete matching the index state deletes", "/v2/app/manifests/<new>", `"<state>"`, http.StatusAccepted, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := tagged.clone(t)
-			r := strings.NewReplacer("<old>", dg(oldBody).String(), "<new>", dg(newBody).String())
+			r := strings.NewReplacer("<old>", dg(oldBody).String(), "<new>", dg(newBody).String(), "<state>", taggedState)
 			want(t, f.do(http.MethodDelete, r.Replace(tc.path), nil, "If-Match", r.Replace(tc.ifMatch)), tc.status, "")
 			if tc.gone {
-				want(t, f.do(http.MethodGet, "/v2/app/manifests/v1", nil), http.StatusNotFound, codeManifestUnknown)
+				want(t, f.do(http.MethodGet, r.Replace(tc.path), nil), http.StatusNotFound, codeManifestUnknown)
 				return
 			}
 			want(t, f.do(http.MethodGet, "/v2/app/manifests/v1", nil), http.StatusOK, "")
