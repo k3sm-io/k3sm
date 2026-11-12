@@ -67,6 +67,11 @@ func TestRenderTopStripsControlCharacters(t *testing.T) {
 		}
 	})
 
+	t.Run("metrics condition", func(t *testing.T) {
+		out := RenderTop(TopReport{Metrics: TopMetrics{Reason: dirty("reason"), Message: dirty("msg")}}, Style{})
+		check(t, out, map[string][]string{"reason": {"msg"}})
+	})
+
 	t.Run("tables", func(t *testing.T) {
 		r := TopReport{
 			Nodes: []TopNode{{Name: dirty("node"), Role: dataroot.Role(dirty("role"))}},

@@ -52,9 +52,10 @@ func topHeader(m TopMetrics, s Style) string {
 		return fmt.Sprintf("metrics: %s from %s, read at most every %s\n",
 			colorize("available", ansiGreen, s), MetricsAPIService, TopMetricsMinInterval)
 	}
-	why := m.Reason
+	// Reason and Message are the metrics APIService condition, cluster text.
+	why := stripControls(m.Reason)
 	if m.Message != "" {
-		why += ": " + m.Message
+		why += ": " + stripControls(m.Message)
 	}
 	return fmt.Sprintf("metrics: %s (%s); showing nodes and pods without usage\n",
 		colorize("unavailable", ansiYellow, s), why)
