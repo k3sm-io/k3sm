@@ -21,6 +21,7 @@ package install
 import (
 	"errors"
 	"io/fs"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1798,9 +1799,9 @@ func TestEnsureRunDirAppliesTheRunRow(t *testing.T) {
 }
 
 // TestReadOwnedRegularFileOnDisk is the on-disk half of the admin-token carry's
-// read: the owner and mode come from the descriptor read, a symlink and a fifo
-// are refused as non-regular (the fifo without parking the open), and a file
-// past the limit is refused.
+// read: the owner and mode come from the descriptor read, a symlink, a fifo
+// and a unix socket are refused as non-regular (the fifo without parking the
+// open), and a file past the limit is refused.
 func TestReadOwnedRegularFileOnDisk(t *testing.T) {
 	dir := t.TempDir()
 	tok := filepath.Join(dir, "token")
@@ -1833,6 +1834,28 @@ func TestReadOwnedRegularFileOnDisk(t *testing.T) {
 		if _, _, err := readOwnedRegularFile(fifo, 256); !errors.Is(err, ErrNotRegularFile) || errors.Is(err, ErrFileTooLarge) {
 			t.Errorf("readOwnedRegularFile(fifo) = %v, want ErrNotRegularFile and not ErrFileTooLarge", err)
 		}
+	})
+	t.Run("a unix socket is refused, not left as a retryable error", func(t *testing.T) {
+		// open() of a socket fails (ENXIO or EOPNOTSUPP) before any fstat,
+		// so the refusal must come from the open error. macOS caps a socket
+		// path near 104 bytes, past which t.TempDir runs, so this one sits
+		// under a short /tmp directory.
+		sdir, err := os.MkdirTemp("/tmp", "k3sm")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(sdir) })
+		sock := filepath.Join(sdir, "s")
+		l, err := net.Listen("unix", sock)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = l.Close() })
+		_, _, err = readOwnedRegularFile(sock, 256)
+		if !errors.Is(err, ErrNotRegularFile) || errors.Is(err, ErrFileTooLarge) {
+			t.Errorf("readOwnedRegularFile(socket) = %v, want ErrNotRegularFile and not ErrFileTooLarge", err)
+		}
+		t.Logf("socket open error: %v", err)
 	})
 	t.Run("a file past the limit is refused", func(t *testing.T) {
 		// The read-past-limit path (a file that grows between fstat and

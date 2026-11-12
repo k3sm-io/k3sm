@@ -1100,13 +1100,19 @@ func readCrashRecordFile(sys System, role, path string) ([]byte, bool, error) {
 // names what the operator does to the record ("remove it", "fix or remove
 // it"); path is quoted for the shell, since the data root is operator-chosen.
 func crashRecordRemedy(fix, path string) string {
-	return "the new binary is already running, and re-running install after you " + fix + " is safe: sudo rm " + shellQuote(path)
+	return "the new binary is already running, and re-running install after you " + fix + " is safe: sudo rm -- " + shellQuote(path)
 }
 
 // shellQuote quotes s as ONE POSIX shell word: single quotes around it, each
-// embedded single quote closed, escaped and reopened ('\”). Inside single
-// quotes the shell expands nothing, so a path with spaces, $, backticks or
-// globs pastes back as the path it names.
+// embedded single quote replaced by the four ASCII characters below, which
+// close the quoting, escape a quote and reopen it (kept in a code block:
+// gofmt rewrites two adjacent single quotes in doc text as a curly quote):
+//
+//	'\''
+//
+// Inside single quotes the shell expands nothing, so a path with spaces, $,
+// backticks or globs pastes back as the path it names. The remedy puts `--`
+// before it so a path that begins with "-" is never read as an rm option.
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
