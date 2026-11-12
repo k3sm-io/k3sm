@@ -22,10 +22,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -363,4 +365,95 @@ func TestSourceLimiter(t *testing.T) {
 			t.Error("a request whose context ended was served after waiting")
 		}
 	})
+}
+
+// plainWriter implements only http.ResponseWriter, so a ResponseController
+// over it cannot set a deadline.
+type plainWriter struct {
+	h    http.Header
+	code int
+}
+
+func (p *plainWriter) Header() http.Header {
+	if p.h == nil {
+		p.h = http.Header{}
+	}
+	return p.h
+}
+func (p *plainWriter) Write(b []byte) (int, error) { return len(b), nil }
+func (p *plainWriter) WriteHeader(code int)        { p.code = code }
+func (p *plainWriter) status() int                 { return p.code }
+
+// statusWriter is a test writer that reports the status it was given.
+type statusWriter interface {
+	http.ResponseWriter
+	status() int
+}
+
+// deadlineWriter is a plainWriter that takes deadlines.
+type deadlineWriter struct{ plainWriter }
+
+func (*deadlineWriter) SetWriteDeadline(time.Time) error { return nil }
+func (*deadlineWriter) SetReadDeadline(time.Time) error  { return nil }
+
+// TestBindProgressLogsUnboundedConnection pins that a writer which cannot take
+// a deadline is still served, and that the connection is logged once as served
+// without a progress bound; a writer that takes deadlines logs nothing.
+func TestBindProgressLogsUnboundedConnection(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		w     func() statusWriter
+		warns int
+	}{
+		{"a writer without deadlines is served and logged once", func() statusWriter { return &plainWriter{} }, 1},
+		{"a writer with deadlines logs nothing", func() statusWriter { return &deadlineWriter{} }, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &recordedLog{}
+			ok := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
+			s := newSourceLimiter(ok, relayLimits{
+				requestRate: 100, requestBurst: 100, writeRate: 100, writeBurst: 100,
+				maxRequestsPerConn: 100, maxConnAge: time.Hour, tableMax: 10,
+				writeProgress: time.Minute, readProgress: time.Minute,
+			}, nil)
+			s.log = slog.New(rec)
+			ctx := s.ConnContext(t.Context(), nil)
+			for i := range 2 {
+				req := httptest.NewRequestWithContext(ctx, http.MethodGet, "/v2/library/x/blobs/sha256:00", nil)
+				req.RemoteAddr = "10.0.0.9:1234"
+				w := tc.w()
+				s.ServeHTTP(w, req)
+				if w.status() != http.StatusNoContent {
+					t.Fatalf("request %d = %d, want 204", i+1, w.status())
+				}
+			}
+			var warns []slog.Record
+			rec.mu.Lock()
+			for _, r := range rec.recs {
+				if r.Level == slog.LevelWarn {
+					warns = append(warns, r)
+				}
+			}
+			rec.mu.Unlock()
+			if len(warns) != tc.warns {
+				t.Fatalf("warnings = %d, want %d: %v", len(warns), tc.warns, warns)
+			}
+			if tc.warns == 0 {
+				return
+			}
+			got := map[string]string{}
+			warns[0].Attrs(func(a slog.Attr) bool {
+				got[a.Key] = a.Value.String()
+				return true
+			})
+			if !strings.Contains(warns[0].Message, "without a progress bound") || got["remote"] != "10.0.0.9:1234" {
+				t.Errorf("warning = %q %v, want the no-progress-bound line with remote 10.0.0.9:1234", warns[0].Message, got)
+			}
+			for _, k := range []string{"path", "url", "repo"} {
+				if _, ok := got[k]; ok {
+					t.Errorf("warning carries %q; want the address only", k)
+				}
+			}
+		})
+	}
 }
