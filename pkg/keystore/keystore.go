@@ -22,10 +22,9 @@ import (
 	"time"
 )
 
-// This file is the contract sketch for the keystore. It is deliberately
-// implementation-free (no cipher code, no file I/O), and the design review in
-// docs/design/keystore.md may still change any of it before the
-// implementation lands.
+// This file is the keystore's contract: the Store interface, its types and its
+// refusals. FileStore (store.go) is the implementation, landing in parts as
+// docs/design/keystore.md § "Acceptance gate" lays out.
 
 // Kind is the type of key material an entry holds.
 type Kind int
@@ -83,6 +82,17 @@ type Entry struct {
 	Current Version
 	// Versions is every stored version, oldest first, including Current.
 	Versions []Version
+	// Err is non-nil exactly when the entry could not be opened: its generation
+	// file, its current pointer or any version the pointer covers is missing,
+	// fails authentication or does not parse, or the floor rules the pointer
+	// out (an older sequence, or another generation). A directory with no current
+	// pointer is an interrupted Put, which is not an entry and is not listed,
+	// only when it holds nothing, generation, or generation and v1 (plus
+	// temporary files) and the floor does not record its generation; any other
+	// such directory is an entry with an Err. Current and Versions are zero
+	// then. List reports such an entry here, not as an error for the whole
+	// call, so one bad entry does not hide the healthy ones.
+	Err error
 }
 
 // Store is the keystore contract a consumer (the CLI verbs, the delivery
@@ -102,6 +112,11 @@ type Store interface {
 	// entry does not exist, or ErrVersionNotFound when the version does not.
 	Get(ctx context.Context, name string, version uint64) (Version, []byte, error)
 	// List returns the metadata of every entry, sorted by name, with no values.
+	// An entry that cannot be opened is still returned, with Entry.Err set. The
+	// call itself fails only for a problem that is not about one entry: the
+	// master key missing or untrusted, the entries' directory untrusted or
+	// unreadable, the recorded floor untrusted or malformed, or the store lock
+	// not acquired (in time, or before ctx is done).
 	List(ctx context.Context) ([]Entry, error)
 	// Rotate writes value as the next version of name and then flips the
 	// current pointer to it, returning the new version, or ErrNotFound.
@@ -118,15 +133,22 @@ type Store interface {
 // pkg/executor/secretsencryption.go.
 var (
 	// ErrInvalidName reports an entry name that may not be used. A name is
-	// validated before it becomes a file name: it is not empty, contains no
-	// path separator, and is not made only of dots.
-	ErrInvalidName = errors.New("invalid keystore entry name: it must be non-empty, contain no path separator, and not consist only of dots")
+	// validated before it becomes a file name: it must be a Kubernetes
+	// DNS-1123 subdomain (1 to 253 bytes of dot-separated labels of lowercase
+	// letters, digits and '-', each beginning and ending with a letter or
+	// digit). That rules out a path separator, a name made only of dots, a
+	// name that differs from another only in case (APFS is case-insensitive
+	// by default), a dot name the store keeps for its own files, and a name
+	// that could not be the delivered Secret's default name.
+	ErrInvalidName = errors.New("invalid keystore entry name: it must be 1 to 253 bytes of dot-separated labels of lowercase letters, digits and '-', each beginning and ending with a letter or digit")
 	// ErrExists reports a Put on a name that already exists; a new value for
 	// an existing entry is a Rotate.
 	ErrExists = errors.New("keystore entry already exists; use rotate to store a new version")
 	// ErrCorrupt reports a record that fails its authenticated open or does
-	// not parse: it was tampered with, moved or truncated. It is distinct
-	// from ErrMasterUntrusted, which concerns the master key file itself.
+	// not parse: it was tampered with, moved or truncated. A current pointer
+	// that authenticates but is older than the recorded floor is reported the
+	// same way, with a message that says so. It is distinct from
+	// ErrMasterUntrusted, which concerns the master key file itself.
 	ErrCorrupt = errors.New("keystore record is corrupt: it failed authentication or does not parse, so it was tampered with, moved or truncated; restore it from backup")
 	// ErrNotFound reports that no entry has the requested name.
 	ErrNotFound = errors.New("keystore entry not found")
@@ -140,8 +162,10 @@ var (
 	// ErrMasterMissing reports that the keystore holds entries but the master
 	// key file is missing, so none of them can be opened.
 	ErrMasterMissing = errors.New("the keystore master key file is missing: every entry is unreadable without it; restore it from backup")
-	// ErrMasterUntrusted reports a master key file that may not be used: its
-	// mode is not 0600, it is not owned by the service user, or it does not
-	// match the recorded fingerprint.
-	ErrMasterUntrusted = errors.New("the keystore master key file is not trusted: it must be mode 0600, owned by the service user, and match its recorded fingerprint")
+	// ErrMasterUntrusted reports a master key that may not be used: the file
+	// is a symlink, not mode 0600, not owned by the service user, not 32
+	// bytes, or does not match its recorded fingerprint (or that fingerprint
+	// is missing), or its directory, or cred/ above it, is a symlink, not the
+	// service user's, or open to group or others.
+	ErrMasterUntrusted = errors.New("the keystore master key is not trusted: the master file must be a regular file of 32 bytes, mode 0600, owned by the service user, and match its recorded fingerprint, in a directory (and cred/ above it) owned by the service user and closed to group and others")
 )
