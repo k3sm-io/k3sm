@@ -68,7 +68,9 @@ type registryPruneResult struct {
 	// Failed are deletions the registry refused, under --force.
 	Failed []failedManifest `json:"failed,omitempty"`
 	// Interrupted says a forced prune was cancelled (Ctrl+C) before it had
-	// attempted every planned deletion. What it deleted stands and is swept.
+	// attempted every planned deletion, or while its last planned deletion was
+	// in flight; in that last case Unattempted may be empty. What it deleted
+	// stands and is swept.
 	Interrupted bool `json:"interrupted,omitempty"`
 	// Unattempted are the planned manifests an interrupted prune did not
 	// attempt or could not confirm: those it never sent a DELETE for, and one
@@ -194,8 +196,15 @@ func imagePrune(ctx context.Context, client runtimev1.ImagesClient, o imageOptio
 	if report.Registry.Interrupted {
 		// The note goes to stderr: the table on stdout is a contract with the
 		// app, which refuses any line it does not know.
-		fmt.Fprintf(pruneWarn(o), "prune interrupted: %d planned manifest(s) not attempted or not confirmed; run prune again to delete them\n", len(report.Registry.Unattempted))
-		errs = append(errs, fmt.Errorf("prune %s interrupted (%d not attempted; see the report): %w", flatRegistryHost, len(report.Registry.Unattempted), context.Cause(ctx)))
+		// A run cancelled at its last planned deletion leaves nothing
+		// unattempted; its note and error say so rather than count zero.
+		if n := len(report.Registry.Unattempted); n > 0 {
+			fmt.Fprintf(pruneWarn(o), "prune interrupted: %d planned manifest(s) not attempted or not confirmed; run prune again to delete them\n", n)
+			errs = append(errs, fmt.Errorf("prune %s interrupted (%d not attempted; see the report): %w", flatRegistryHost, n, context.Cause(ctx)))
+		} else {
+			fmt.Fprintln(pruneWarn(o), "prune interrupted after its last planned deletion: no planned manifest was left unattempted")
+			errs = append(errs, fmt.Errorf("prune %s interrupted at its last planned deletion (see the report): %w", flatRegistryHost, context.Cause(ctx)))
+		}
 	}
 	if failed > 0 {
 		errs = append(errs, fmt.Errorf("prune %s: %w (%d failed; see the report)", flatRegistryHost, errPruneIncomplete, failed))
