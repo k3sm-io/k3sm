@@ -971,15 +971,20 @@ const (
 	supersededClusterPattern = `[0-9a-f]{1,16}`
 )
 
-// supersededRemedyPattern accepts exactly the strings Remedy can produce: the
-// format's fixed text, quoted, with each verb replaced by its part's class and
-// the whole anchored at both ends (\A, \z), so no text before, after or inside
-// the fixed parts and no control byte passes.
-var supersededRemedyPattern = func() *regexp.Regexp {
-	fixed := regexp.MustCompile(`%[sx]`).Split(supersededRemedyFormat, -1)
-	parts := []string{supersededPeerPattern, supersededURLPattern, supersededClusterPattern, supersededClusterPattern}
+// supersededRemedyParts are the patterns of supersededRemedyFormat's verbs, in
+// order.
+var supersededRemedyParts = []string{supersededPeerPattern, supersededURLPattern, supersededClusterPattern, supersededClusterPattern}
+
+// remedyVerb matches a verb of supersededRemedyFormat.
+var remedyVerb = regexp.MustCompile(`%[sx]`)
+
+// buildRemedyPattern returns format's fixed text, quoted, with each verb
+// replaced by its part's pattern and the whole anchored at both ends (\A, \z).
+// ok is false when format's verb count and len(parts) disagree.
+func buildRemedyPattern(format string, parts []string) (pattern string, ok bool) {
+	fixed := remedyVerb.Split(format, -1)
 	if len(fixed) != len(parts)+1 {
-		panic("executor: supersededRemedyFormat's verbs do not match its patterns")
+		return "", false
 	}
 	var b strings.Builder
 	b.WriteString(`\A`)
@@ -989,7 +994,24 @@ var supersededRemedyPattern = func() *regexp.Regexp {
 	}
 	b.WriteString(regexp.QuoteMeta(fixed[len(parts)]))
 	b.WriteString(`\z`)
-	return regexp.MustCompile(b.String())
+	return b.String(), true
+}
+
+// matchNothing is a pattern no string matches.
+const matchNothing = `[^\x00-\x{10FFFF}]`
+
+// supersededRemedyPattern accepts exactly the strings Remedy can produce: the
+// format's fixed text, quoted, with each verb replaced by its part's class and
+// the whole anchored at both ends, so no text before, after or inside the fixed
+// parts and no control byte passes. Should the format and its parts ever
+// disagree it matches nothing (fail closed), and
+// TestSupersededRemedyFormatMatchesItsParts fails.
+var supersededRemedyPattern = func() *regexp.Regexp {
+	p, ok := buildRemedyPattern(supersededRemedyFormat, supersededRemedyParts)
+	if !ok {
+		p = matchNothing
+	}
+	return regexp.MustCompile(p)
 }()
 
 // maxRemedyLen bounds the input IsKnownRemedy and IsSupersededRemedy examine:

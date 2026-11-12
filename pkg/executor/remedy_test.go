@@ -23,6 +23,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -231,5 +232,29 @@ func TestIsKnownRemedyNamesTheMemberRouteRemedies(t *testing.T) {
 		if IsKnownRemedy(r + "\n") {
 			t.Errorf("IsKnownRemedy accepts %q with a trailing newline", r)
 		}
+	}
+}
+
+// TestSupersededRemedyFormatMatchesItsParts: supersededRemedyFormat has exactly
+// one verb per entry of supersededRemedyParts, so supersededRemedyPattern is
+// built from them and not the match-nothing fallback.
+func TestSupersededRemedyFormatMatchesItsParts(t *testing.T) {
+	t.Parallel()
+	p, ok := buildRemedyPattern(supersededRemedyFormat, supersededRemedyParts)
+	if !ok {
+		t.Fatalf("supersededRemedyFormat has %d verbs, supersededRemedyParts %d patterns",
+			len(remedyVerb.FindAllString(supersededRemedyFormat, -1)), len(supersededRemedyParts))
+	}
+	if got := supersededRemedyPattern.String(); got != p {
+		t.Errorf("supersededRemedyPattern = %q, want the built %q", got, p)
+	}
+	if _, ok := buildRemedyPattern(supersededRemedyFormat, supersededRemedyParts[1:]); ok {
+		t.Error("buildRemedyPattern accepted a part count that disagrees with the format's verbs")
+	}
+	if _, ok := buildRemedyPattern(supersededRemedyFormat+" %s", supersededRemedyParts); ok {
+		t.Error("buildRemedyPattern accepted a format with one verb more than its parts")
+	}
+	if regexp.MustCompile(matchNothing).MatchString("") {
+		t.Error("the match-nothing fallback matches the empty string")
 	}
 }
