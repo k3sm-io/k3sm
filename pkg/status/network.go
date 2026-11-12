@@ -130,9 +130,9 @@ func networkLine(r Report) string {
 	}
 	switch {
 	case n.Applied != nil && n.Applied.Error != "":
-		line += fmt.Sprintf("\nthe node daemon serves LAN access %s; its last change was refused: %s", n.Applied.LAN, n.Applied.Error)
+		line += fmt.Sprintf("\nthe node daemon serves LAN access %s; its last change was refused: %s", stripControls(n.Applied.LAN), stripControls(n.Applied.Error))
 	case n.Applied != nil && n.Applied.LAN != n.LAN:
-		line += fmt.Sprintf("\nthe node daemon still serves LAN access %s, not the recorded %s", n.Applied.LAN, n.LAN)
+		line += fmt.Sprintf("\nthe node daemon still serves LAN access %s, not the recorded %s", stripControls(n.Applied.LAN), n.LAN)
 	case n.AppliedReadable != nil && !*n.AppliedReadable:
 		line += "\nthe applied state is readable by root only (sudo k3sm network lan status)"
 	}

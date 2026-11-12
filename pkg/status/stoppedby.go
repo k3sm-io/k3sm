@@ -53,9 +53,9 @@ func stoppedByLine(r Report) string {
 	if sb == nil {
 		return ""
 	}
-	line := fmt.Sprintf("%s by %s", sb.Phase, sb.Actor)
+	line := fmt.Sprintf("%s by %s", sb.Phase, stripControls(sb.Actor))
 	if sb.Reason != "" {
-		line += ": " + sb.Reason
+		line += ": " + stripControls(sb.Reason)
 	}
 	if !sb.At.IsZero() && !r.Timestamp.IsZero() {
 		line += ", " + r.Timestamp.Sub(sb.At).Round(time.Second).String() + " ago"
