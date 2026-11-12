@@ -17,6 +17,7 @@ limitations under the License.
 package registrysvc
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"net"
@@ -213,6 +214,174 @@ func TestRelayLogsWhenFullOrOverShare(t *testing.T) {
 		}
 		if n := len(rec.warnings(fullMsg)); n != 0 {
 			t.Errorf("full warnings = %d, want none", n)
+		}
+	})
+
+	t.Run("three drops inside the interval", func(t *testing.T) {
+		ll, rec, clk, accepted := listen(t, 4, 1)
+		dial(t, ll)
+		held := take(t, accepted)
+		defer held.Close()
+		refused := func(t *testing.T) {
+			t.Helper()
+			c := dial(t, ll)
+			_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+			if _, err := io.ReadAll(c); err != nil {
+				t.Fatalf("read the refused connection: %v", err)
+			}
+		}
+
+		refused(t)
+		waitFor(t, "the share warning", func() bool { return len(rec.warnings(overShareMsg)) == 1 })
+		for range 3 {
+			refused(t)
+		}
+		waitFor(t, "three refusals to be counted", func() bool { return suppressed(&ll.overShare) == 3 })
+		if n := len(rec.warnings(overShareMsg)); n != 1 {
+			t.Fatalf("share warnings = %d inside the interval, want 1", n)
+		}
+
+		// The next line after the interval carries the three it dropped.
+		clk.advance(testWarnGap)
+		refused(t)
+		waitFor(t, "the share warning after the interval", func() bool { return len(rec.warnings(overShareMsg)) == 2 })
+		if got := rec.warnings(overShareMsg)[1]; got["suppressed"] != "3" {
+			t.Errorf("share warning after the interval = %v, want suppressed=3", got)
+		}
+
+		// The one after another interval, with nothing dropped, carries 0.
+		clk.advance(testWarnGap)
+		refused(t)
+		waitFor(t, "the share warning after another interval", func() bool { return len(rec.warnings(overShareMsg)) == 3 })
+		if got := rec.warnings(overShareMsg)[2]; got["suppressed"] != "0" {
+			t.Errorf("share warning after another interval = %v, want suppressed=0", got)
+		}
+	})
+
+	t.Run("a share refusal inside a full warning's interval still logs", func(t *testing.T) {
+		// Two sources fill the listener, which a loopback socket cannot do,
+		// so this row dials over a listener that names each source.
+		front := newSrcListener()
+		rec := &recordedLog{}
+		clk := &warnClock{t: time.Unix(1_700_000_000, 0)}
+		ll := newLimitListener(front, 2, 1)
+		ll.log = slog.New(rec)
+		ll.now = clk.now
+		ll.warnEvery = testWarnGap
+		t.Cleanup(func() { _ = ll.Close() })
+		accepted := make(chan net.Conn, 8)
+		go func() {
+			for {
+				c, err := ll.Accept()
+				if err != nil {
+					return
+				}
+				accepted <- c
+			}
+		}()
+		srcDial := func(t *testing.T, src string) net.Conn {
+			t.Helper()
+			c, err := front.dial(src, 5*time.Second)
+			if err != nil {
+				t.Fatalf("dial from %s: %v", src, err)
+			}
+			t.Cleanup(func() { _ = c.Close() })
+			return c
+		}
+		const peerA, peerB = "100.64.1.1", "100.64.2.1"
+
+		srcDial(t, peerA)
+		heldA := take(t, accepted)
+		defer heldA.Close()
+		srcDial(t, peerB)
+		heldB := take(t, accepted)
+		waitFor(t, "the full warning", func() bool { return len(rec.warnings(fullMsg)) == 1 })
+
+		// A slot frees and peer A, already at its share, dials again, with the
+		// clock still inside the full warning's interval.
+		_ = heldB.Close()
+		srcDial(t, peerA)
+		waitFor(t, "the share warning", func() bool { return len(rec.warnings(overShareMsg)) == 1 })
+		if got := rec.warnings(overShareMsg)[0]; got["source"] != peerA || got["suppressed"] != "0" {
+			t.Errorf("share warning = %v, want source=%s suppressed=0", got, peerA)
+		}
+		if n := len(rec.warnings(fullMsg)); n != 1 {
+			t.Errorf("full warnings = %d, want 1", n)
+		}
+	})
+}
+
+// TestRelayLogsLimitWarningsToItsLogger is the gate for the warnings' wiring:
+// a relay built by newRelay and served by its own accept hands its logger to
+// the limit listener, so a full relay and a refused source reach the logger
+// the relay was built with, naming the address the relay listens on.
+func TestRelayLogsLimitWarningsToItsLogger(t *testing.T) {
+	// serve builds a relay over the production seams with a recorded logger
+	// and the given connection caps, and serves it on a loopback listener.
+	serve := func(t *testing.T, total, perSource int) (*recordedLog, string) {
+		t.Helper()
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen: %v", err)
+		}
+		rec := &recordedLog{}
+		r := newRelay(portOf(t, ln.Addr()), portOf(t, ln.Addr()), nil, slog.New(rec), GateAuth{}, gateCred)
+		r.limits.maxConns = total
+		r.limits.maxConnsPerSource = perSource
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			_ = r.accept(ctx, ln)
+		}()
+		t.Cleanup(func() {
+			cancel()
+			<-done
+			_ = ln.Close()
+		})
+		return rec, ln.Addr().String()
+	}
+	dial := func(t *testing.T, addr string) net.Conn {
+		t.Helper()
+		c, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		t.Cleanup(func() { _ = c.Close() })
+		return c
+	}
+	waitFor := func(t *testing.T, rec *recordedLog, msg string) map[string]string {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			if got := rec.warnings(msg); len(got) > 0 {
+				return got[0]
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("no %q warning reached the relay's logger", msg)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+
+	t.Run("a source over its share", func(t *testing.T) {
+		rec, addr := serve(t, 4, 1)
+		dial(t, addr)
+		c := dial(t, addr)
+		_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+		if _, err := io.ReadAll(c); err != nil {
+			t.Fatalf("read the refused connection: %v", err)
+		}
+		if got := waitFor(t, rec, overShareMsg); got["addr"] != addr || got["source"] != "127.0.0.1" || got["share"] != "1" {
+			t.Errorf("share warning = %v, want addr=%s source=127.0.0.1 share=1", got, addr)
+		}
+	})
+
+	t.Run("a full relay", func(t *testing.T) {
+		rec, addr := serve(t, 1, 1)
+		dial(t, addr)
+		if got := waitFor(t, rec, fullMsg); got["addr"] != addr || got["limit"] != "1" {
+			t.Errorf("full warning = %v, want addr=%s limit=1", got, addr)
 		}
 	})
 }
