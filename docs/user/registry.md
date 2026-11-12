@@ -148,7 +148,8 @@ A pull through the registry's cluster address is cut by the registry if the tran
 progress for 5 minutes. A slow transfer that keeps moving is never cut, because a node cannot resume
 a cut layer and would download it again from the start. The registry serves 256 connections at once,
 and one client address may hold 64 of them. A connection past that address's share is closed at
-once, and when all 256 are held a new pull waits, with no error, until one frees.
+once, and when all 256 are held a new pull waits, with no error, until one frees. The node's registry
+relay logs both cases as warnings, at most once a minute each.
 
 ## Models
 
