@@ -1069,8 +1069,11 @@ func TestImagePruneForceClassifiesAnErrorAtCancel(t *testing.T) {
 		wantCause: context.Canceled,
 	}, {
 		name: "deadline",
+		// The deadline is far enough out that the plan before the first
+		// DELETE cannot outrun it under load; the deleter then waits for it,
+		// so the context ends by its own deadline, not by a cancel.
 		ctx: func() (context.Context, context.CancelFunc) {
-			return context.WithTimeout(context.Background(), 50*time.Millisecond)
+			return context.WithDeadline(context.Background(), time.Now().Add(2*time.Second))
 		},
 		del: func(ctx context.Context, _ context.CancelFunc) error {
 			<-ctx.Done()
@@ -1083,7 +1086,8 @@ func TestImagePruneForceClassifiesAnErrorAtCancel(t *testing.T) {
 			reg := serveFakePruneRegistry(t, workDir)
 			f := buildPruneFixture(t, workDir)
 			sock := serveFakeImages(t, &fakeImagesDaemon{pruneResp: &runtimev1.PruneImagesResponse{}})
-			opts, err := parseImageArgs([]string{"--socket", sock, "--work-dir", workDir, "prune", "--force", "-o", "json"}, io.Discard)
+			var warn bytes.Buffer
+			opts, err := parseImageArgs([]string{"--socket", sock, "--work-dir", workDir, "prune", "--force", "-o", "json"}, &warn)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1138,6 +1142,27 @@ func TestImagePruneForceClassifiesAnErrorAtCancel(t *testing.T) {
 			}
 			if got := manifestList(doc); strings.Join(got, ",") != strings.Join(wantManifests, ",") {
 				t.Errorf("report manifests = %v; want %v", got, wantManifests)
+			}
+			if strings.Contains(out.String(), "prune interrupted") {
+				t.Errorf("stdout carries the stderr note:\n%s", out.String())
+			}
+			if len(wantUnattempted) == 0 {
+				// Cut short at the last planned deletion: nothing is left
+				// unattempted, and neither the note nor the error counts zero.
+				if len(doc.Registry.Unattempted) != 0 {
+					t.Errorf("report unattempted = %v; want none", doc.Registry.Unattempted)
+				}
+				for _, bad := range []string{"0 planned", "0 not attempted"} {
+					if strings.Contains(warn.String(), bad) {
+						t.Errorf("stderr note = %q; want no %q", warn.String(), bad)
+					}
+					if err != nil && strings.Contains(err.Error(), bad) {
+						t.Errorf("err = %v; want no %q", err, bad)
+					}
+				}
+				if !strings.Contains(warn.String(), "prune interrupted after its last planned deletion") {
+					t.Errorf("stderr note = %q; want the last-deletion note", warn.String())
+				}
 			}
 		})
 	}
