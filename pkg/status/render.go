@@ -225,8 +225,11 @@ func renderDetail(r Report, s Style, names []string, view string) string {
 // provenance simply follows after two spaces — a truncated version string is
 // worse than a long line.
 func headline(r Report, s Style) string {
-	left := "k3sm " + colorize(r.Verdict.String(), verdictColor(r.Verdict), s) + ": " + r.Summary
-	plainLen := len("k3sm " + r.Verdict.String() + ": " + r.Summary)
+	// The summary is row text on the degraded path (Aggregate copies a row's
+	// Detail into it), so it is stripped here, at render time; the JSON keeps it.
+	summary := stripControls(r.Summary)
+	left := "k3sm " + colorize(r.Verdict.String(), verdictColor(r.Verdict), s) + ": " + summary
+	plainLen := len("k3sm " + r.Verdict.String() + ": " + summary)
 	right := provenance(r)
 	if right == "" {
 		return left
@@ -252,7 +255,7 @@ func provenance(r Report) string {
 	if r.Host != "" {
 		parts = append(parts, "macOS "+r.Host)
 	}
-	return strings.Join(parts, " · ")
+	return stripControls(strings.Join(parts, " · "))
 }
 
 // renderRow is one subsystem line. The STATE word is always present in plain
@@ -264,8 +267,8 @@ func renderRow(row Row, s Style) string {
 		glyph = row.Severity.Glyph() + " "
 	}
 	return "  " + glyph +
-		pad(row.Name, nameWidth) + " " +
-		colorize(pad(string(row.State), stateWidth), severityColor(row.Severity), s) + " " +
+		pad(stripControls(row.Name), nameWidth) + " " +
+		colorize(pad(stripControls(string(row.State)), stateWidth), severityColor(row.Severity), s) + " " +
 		strings.TrimRight(stripControls(row.Detail), " ") + "\n"
 }
 

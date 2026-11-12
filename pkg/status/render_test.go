@@ -428,3 +428,34 @@ func TestNextStepsAreStripped(t *testing.T) {
 		t.Fatalf("Aggregate produced %d steps, want 2: %q", len(aggregated), aggregated)
 	}
 }
+
+// TestHeadlineSummaryIsStripped: the summary on the headline is row text on the
+// degraded path, so ESC and the bidi override must not reach any human view,
+// whether the summary is given directly or built by Aggregate from a row's detail.
+func TestHeadlineSummaryIsStripped(t *testing.T) {
+	const hostile = "evil\u001b[2J‮gnp.exe"
+	degraded := report([]Row{
+		{Name: RowInterconnect, State: "degraded", Severity: SeverityFail, Detail: hostile},
+	}, true)
+	direct := report(nil, true)
+	direct.Summary = hostile
+	for name, r := range map[string]Report{"aggregated": degraded, "direct": direct} {
+		if !strings.Contains(r.Summary, "\u001b") {
+			t.Fatalf("%s: fixture summary lost its escape: %q", name, r.Summary)
+		}
+		views := map[string]string{
+			"overview": Render(r, Style{}),
+			"rows":     RenderRows(r, Style{}),
+			"daemons":  RenderDaemons(r, Style{}),
+			"cluster":  RenderCluster(r, Style{}),
+		}
+		for view, out := range views {
+			if strings.ContainsAny(out, "\u001b‮") {
+				t.Errorf("%s/%s: control character survived: %q", name, view, out)
+			}
+			if !strings.Contains(out, "evil[2Jgnp.exe") {
+				t.Errorf("%s/%s: printable text was dropped: %q", name, view, out)
+			}
+		}
+	}
+}
