@@ -296,7 +296,7 @@ The write order on a change is: the record, then the pointer, then the floor.
 - **Put:** write `generation`, `v1`, `current` (sequence 1), then set the floor entry.
 - **Rotate:** write the new version file, flip `current` (sequence + 1), then raise the
   floor to that sequence.
-- **Delete:** remove the entry directory, then remove the floor entry.
+- **Delete:** remove `current`, remove the entry directory, then remove the floor entry.
 
 A crash after the pointer flip but before the floor write leaves the floor one behind the
 pointer, which the rule above accepts (pointer at or above floor). So that the lag does not
@@ -382,10 +382,24 @@ That is a pointer lost to damage or to an interrupted Delete, with sealed record
 disk. `List` returns it with `Err` set, wrapping `ErrCorrupt`, and `rm` removes the directory
 and its floor entry, since `rm` reads nothing inside an entry. Put of that name answers
 `ErrExists` and touches nothing, so no Put silently deletes versions an operator can still
-see. One case cannot be told apart: a one-version entry that lost `current` is `generation`
-and `v1`, the same as an incomplete Put, so the next Put discards it without saying so. The
-loss is that one version, and the restore procedure under "Backup and snapshots" is what
-recovers it.
+see.
+
+**The floor tells a lost pointer from a crashed Put.** By shape alone, a one-version entry
+that lost `current` is `generation` and `v1`, the same as an incomplete Put. But Put records
+the floor only after its pointer, so a directory in an incomplete-Put shape whose generation
+file matches the generation the floor records for its name **did** commit a pointer, and is
+damage, not an incomplete Put: `list` returns it with `Err`, `rm` clears it, and Put answers
+`ErrExists`. The same holds for an interrupted Delete, which removes `current` first and the
+floor entry last, so a retried `rm` clears what the first one left. A floor entry of another
+generation (a Delete interrupted before its floor write, then a Put that crashed) and an empty
+directory (no generation to compare) do not count. A `generation` file that does not read
+while the floor records the name is damage, since a crashed Put writes that file whole. Only
+with no floor file, or no floor entry for the name (a Put that crashed after its pointer and
+before its floor write, which has `current` and so is not this case), do the two stay
+indistinguishable. Then a one-version entry that lost `current` costs its sealed `v1`: `Get`
+and `rm` answer not found, the sealed record stays on disk, and the next Put of the name
+discards it without saying so. The restore procedure under "Backup and snapshots" recovers
+it.
 
 The reason is what an operator running `list` needs: the truth about every entry,
 including which one is wrong, not a refusal that hides the healthy ones. A consumer that
@@ -408,8 +422,8 @@ serializes Rewrap, Rotate and Put against each other and against the reconciler'
   leaves a state the next operation can finish or discard. The lock is for serialization,
   not for crash safety.
 - An entry directory with no `current` is an incomplete Put only in the one shape a crashed
-  Put can leave, ignoring leftover `.tmp` files; any other directory with no `current` is
-  damage. "An entry directory with no
+  Put can leave, ignoring leftover `.tmp` files, and only when the floor does not record its
+  generation; any other directory with no `current` is damage. "An entry directory with no
   `current`" under "List, when one entry is corrupt" is the rule, and Put discards only the
   first shape, so one crash does not leave a name that can never be reused.
 
@@ -722,7 +736,7 @@ last pull request lands and no row is pending.
 | G13 | A crash between the two master renames leaves a master that passes its trust check, and the next verb completes the swap | unit: stop after the first rename |
 | G14 | One lock serializes Rewrap, Rotate, Put and reads, with a bounded wait | unit: a held lock gives a timeout error within the bound, not a hang |
 | G15 | Files a root-run verb writes under `server/` are owned by the service user at the layout's modes | unit with a fake owner seam |
-| G16 | `list` returns every entry, marks an unreadable one with `Err`, and exits 1. A directory holding nothing, `generation`, or `generation` and `v1`, with or without leftover `.tmp` files, is an incomplete Put: not listed, `ErrNotFound` from `Current`, `Get` and `Delete`, discarded by the next Put. A directory with no `current` and any other file (`v1` without `generation` included) is damage: listed with `Err` wrapping `ErrCorrupt`, removed by `rm` with its floor entry, and `ErrExists` from Put with every file left in place | unit: both shapes, an empty directory, a `generation`-and-`.tmp` directory standing in for a crash while writing `v1`, a `v1`-without-`generation` directory, a `v1`-only directory standing in for the one-version entry that lost `current`, and a `v1`-and-`v2` directory with `current` removed; a CLI exit-code test for `list` and `rm` |
+| G16 | `list` returns every entry, marks an unreadable one with `Err`, and exits 1. A directory holding nothing, `generation`, or `generation` and `v1`, with or without leftover `.tmp` files, is an incomplete Put unless the floor records its generation: not listed, `ErrNotFound` from `Current`, `Get` and `Delete`, discarded by the next Put. A directory with no `current` and any other file (`v1` without `generation` included), or in one of those shapes with its generation recorded in the floor, is damage: listed with `Err` wrapping `ErrCorrupt`, removed by `rm` with its floor entry, and `ErrExists` from Put with every file left in place | unit: each incomplete-Put shape with no floor entry, an empty directory, a `generation`-and-`.tmp` directory standing in for a crash while writing `v1`, no floor file, a floor of another generation; damage: `v1` without `generation`, `v2` without `v1`, a `v1`-and-`v2` directory with `current` removed, and the one-version entry that lost `current` (`generation` and `v1`, or `current` renamed to a temporary name) with its generation in the floor; a retried `rm` after an interrupted one; a CLI exit-code test for `list` and `rm` |
 | G17 | `show` prints a value only with `--reveal`, and then writes exactly the stored bytes with no trailing newline; no verb takes a value as an argument | CLI test over the usage strings; a `--reveal` test comparing stdout to the stored bytes for an opaque value and for 32- and 64-byte Ed25519 values |
 | G18 | Delivery is refused while encryption is off unless the override flag was set at server start; a delivered target stays when the override is removed | unit over the reconciler with a fake client |
 | G19 | The delivery declaration is root-owned and not shared-writable, and is refused otherwise | unit, the same cases as the manifest directory |

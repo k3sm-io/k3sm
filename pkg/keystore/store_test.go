@@ -726,6 +726,9 @@ func TestListMarksCorruptEntry(t *testing.T) {
 func TestEntryWithNoPointer(t *testing.T) {
 	ctx := context.Background()
 	// setup stores "a" and then leaves its directory in the shape under test.
+	// A Put that crashed before its pointer never recorded a floor, so the
+	// interrupted-put cases also take "a" out of the floor; the cases where a
+	// committed entry lost its pointer keep it.
 	setup := func(t *testing.T, shape func(dir string)) (*FileStore, string) {
 		t.Helper()
 		s, server := newTestStore(t)
@@ -734,6 +737,9 @@ func TestEntryWithNoPointer(t *testing.T) {
 		remove(t, filepath.Join(dir, currentName))
 		shape(dir)
 		return s, dir
+	}
+	unrecorded := func(dir string) {
+		writeFile(t, filepath.Join(filepath.Dir(filepath.Dir(filepath.Dir(dir))), floorName), `{"version":1,"entries":{}}`)
 	}
 	files := func(t *testing.T, dir string) string {
 		t.Helper()
@@ -749,10 +755,28 @@ func TestEntryWithNoPointer(t *testing.T) {
 	}
 
 	for name, shape := range map[string]func(dir string){
-		"generation and v1": func(string) {},
-		"generation only":   func(dir string) { remove(t, filepath.Join(dir, "v1")) },
+		"generation and v1": unrecorded,
+		"generation only":   func(dir string) { remove(t, filepath.Join(dir, "v1")); unrecorded(dir) },
+		"empty":             func(dir string) { remove(t, filepath.Join(dir, "v1")); remove(t, filepath.Join(dir, generationName)) },
 		"a leftover temporary file": func(dir string) {
 			writeFile(t, filepath.Join(dir, "."+currentName+".0123abcd.tmp"), "half a write")
+			unrecorded(dir)
+		},
+		"generation and a temporary file, as a crash while writing v1 leaves": func(dir string) {
+			remove(t, filepath.Join(dir, "v1"))
+			writeFile(t, filepath.Join(dir, ".v1.0123abcd.tmp"), "half a write")
+			unrecorded(dir)
+		},
+		// Without a floor file the two cannot be told apart, and the rule
+		// falls back to the shape.
+		"no floor file": func(dir string) {
+			remove(t, filepath.Join(filepath.Dir(filepath.Dir(filepath.Dir(dir))), floorName))
+		},
+		// A floor of another generation is what an interrupted Delete leaves
+		// for the name before the Put that crashed here.
+		"a floor of another generation": func(dir string) {
+			writeFile(t, filepath.Join(filepath.Dir(filepath.Dir(filepath.Dir(dir))), floorName),
+				`{"version":1,"entries":{"a":{"generation":"00000000000000000000000000000000","seq":3}}}`)
 		},
 	} {
 		t.Run("interrupted put: "+name, func(t *testing.T) {
@@ -788,6 +812,13 @@ func TestEntryWithNoPointer(t *testing.T) {
 		"v2 without v1": func(dir string) {
 			copyFile(t, filepath.Join(dir, "v1"), filepath.Join(dir, "v2"))
 			remove(t, filepath.Join(dir, "v1"))
+		},
+		// The floor records this generation, so the pointer was committed:
+		// the one-version entry that lost it is told apart from a crashed Put.
+		"lost pointer, generation and v1": func(string) {},
+		"lost pointer, generation only":   func(dir string) { remove(t, filepath.Join(dir, "v1")) },
+		"lost pointer, renamed to a temporary name": func(dir string) {
+			writeFile(t, filepath.Join(dir, "."+currentName+".0123abcd.tmp"), "the old pointer")
 		},
 	} {
 		t.Run("damage: "+name, func(t *testing.T) {
@@ -867,8 +898,18 @@ func TestPutCrashAtEveryStep(t *testing.T) {
 			t.Fatal("Delete succeeded through a crash")
 		}
 		s.step = func(string) error { return nil }
-		if _, _, err := s.Current(ctx, "k"); !errors.Is(err, ErrNotFound) {
-			t.Fatalf("Current after an interrupted Delete: %v, want ErrNotFound", err)
+		// The floor still records the entry, so what the interrupted Delete
+		// left is a committed entry without its pointer, which a retried
+		// Delete clears, not a crashed Put that would hide the sealed v1 from
+		// rm until the next Put.
+		if _, _, err := s.Current(ctx, "k"); !errors.Is(err, errLostPointer) {
+			t.Fatalf("Current after an interrupted Delete: %v, want the lost-pointer refusal", err)
+		}
+		if _, err := s.Put(ctx, "k", KindOpaque, []byte("again")); !errors.Is(err, ErrExists) {
+			t.Fatalf("Put over an interrupted Delete: %v, want ErrExists", err)
+		}
+		if err := s.Delete(ctx, "k"); err != nil {
+			t.Fatalf("retried Delete: %v", err)
 		}
 		mustPut(t, s, "k", KindOpaque, []byte("again"))
 	})

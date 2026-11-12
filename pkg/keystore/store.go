@@ -46,11 +46,17 @@ var (
 	// holds only what a crashed Put leaves: generation and at most v1. It is not
 	// an entry, so it matches ErrNotFound, and only a Put touches it.
 	errInterruptedPut = fmt.Errorf("%w: an interrupted put left a directory with no current pointer", ErrNotFound)
-	// errNoPointer is an entry directory with no current pointer that holds
-	// more than a crashed Put leaves. Put never writes that before the pointer,
-	// so it is damage, or an interrupted Delete: List reports it, Put refuses
-	// it, and Delete clears it.
-	errNoPointer = fmt.Errorf("%w: the current pointer is missing and the directory holds more than an interrupted put leaves", ErrCorrupt)
+	// errNoPointer is an entry directory with no current pointer that is not
+	// an interrupted Put: damage, or an interrupted Delete. List reports it,
+	// Put refuses it, and Delete clears it. It is one of the two below.
+	errNoPointer = fmt.Errorf("%w: the current pointer is missing", ErrCorrupt)
+	// errDamagedShape is errNoPointer for a directory that holds more than a
+	// crashed Put leaves: Put never writes that before the pointer.
+	errDamagedShape = fmt.Errorf("%w, and the directory holds more than an interrupted put leaves", errNoPointer)
+	// errLostPointer is errNoPointer for a directory in the shape a crashed Put
+	// leaves whose generation the floor records: Put records the floor only
+	// after its pointer, so this entry's pointer was committed and then lost.
+	errLostPointer = fmt.Errorf("%w, although the floor records that this entry committed one", errNoPointer)
 )
 
 // Config locates a FileStore and names the user it belongs to.
@@ -114,8 +120,8 @@ func New(cfg Config) *FileStore {
 // Put creates name at version 1 holding value, minting the master on the
 // keystore's first Put. The entry is written generation, then version 1, then
 // the current pointer, then its floor; an entry directory without a pointer
-// in the shape a crashed Put leaves is an interrupted Put, which the next Put
-// of that name discards.
+// in the shape a crashed Put leaves, whose generation the floor does not
+// record, is an interrupted Put, which the next Put of that name discards.
 func (s *FileStore) Put(ctx context.Context, name string, kind Kind, value []byte) (Version, error) {
 	v, err := s.put(ctx, name, kind, value)
 	if err != nil {
@@ -150,7 +156,7 @@ func (s *FileStore) put(ctx context.Context, name string, kind Kind, value []byt
 	if fl, err = s.syncFloor(root, fdir, fl, k); err != nil {
 		return Version{}, err
 	}
-	e, err := s.createEntry(root, name)
+	e, err := s.createEntry(root, name, fl)
 	if err != nil {
 		return Version{}, err
 	}
@@ -175,10 +181,10 @@ func (s *FileStore) put(ctx context.Context, name string, kind Kind, value []byt
 // with a current pointer is ErrExists, and so is one without a pointer that
 // holds more than an interrupted Put leaves, which is damage for rm to clear
 // and is left untouched. An interrupted Put is discarded first.
-func (s *FileStore) createEntry(root *os.Root, name string) (*entry, error) {
+func (s *FileStore) createEntry(root *os.Root, name string, fl floor) (*entry, error) {
 	err := s.mkdirAt(root, name)
 	if errors.Is(err, fs.ErrExist) {
-		old, oerr := openEntryDir(root, name)
+		old, oerr := openEntryDir(root, name, fl)
 		switch {
 		case oerr == nil:
 			old.close()
@@ -289,7 +295,12 @@ func (s *FileStore) read(ctx context.Context, name string, fn func(*entry, keys,
 			return err
 		}
 		defer done()
-		e, err := openEntry(root, name)
+		fdir, fl, err := s.openFloor()
+		if err != nil {
+			return err
+		}
+		_ = fdir.Close() // read-only; nothing to flush
+		e, err := openEntry(root, name, fl)
 		if err != nil {
 			return err
 		}
@@ -298,11 +309,6 @@ func (s *FileStore) read(ctx context.Context, name string, fn func(*entry, keys,
 		if err != nil {
 			return err
 		}
-		fdir, fl, err := s.openFloor()
-		if err != nil {
-			return err
-		}
-		_ = fdir.Close() // read-only; nothing to flush
 		return fn(e, k, fl)
 	}()
 	if err != nil {
@@ -332,22 +338,27 @@ func (s *FileStore) list(ctx context.Context) ([]Entry, error) {
 		return nil, err
 	}
 	defer done()
+	// The floor decides what is an entry, and a floor that cannot be trusted
+	// is about every entry, so it fails the whole call.
+	fdir, fl, err := s.openFloor()
+	if err != nil {
+		return nil, err
+	}
+	_ = fdir.Close() // read-only; nothing to flush
 	names, err := readDirNames(root)
 	if err != nil {
 		return nil, err
 	}
 	sort.Strings(names)
 	var (
-		out    []Entry
-		k      keys
-		fl     floor
-		loaded bool
+		out []Entry
+		k   keys
 	)
 	for _, name := range names {
 		if checkName(name) != nil {
 			continue
 		}
-		e, err := openEntry(root, name)
+		e, err := openEntry(root, name, fl)
 		if errors.Is(err, ErrNotFound) {
 			continue
 		}
@@ -357,19 +368,11 @@ func (s *FileStore) list(ctx context.Context) ([]Entry, error) {
 		}
 		// The master is needed only once there is an entry to open, and its
 		// failure is about every entry, so it fails the whole call.
-		// The floor likewise, and a floor that cannot be trusted is about
-		// every entry too.
-		if !loaded {
-			var fdir *os.Root
-			if k, err = s.loadMaster(); err == nil {
-				fdir, fl, err = s.openFloor()
-			}
-			if err != nil {
+		if k.seal == nil {
+			if k, err = s.loadMaster(); err != nil {
 				e.close()
 				return nil, err
 			}
-			_ = fdir.Close() // read-only; nothing to flush
-			loaded = true
 		}
 		out = append(out, listEntry(e, k, fl))
 		e.close()
@@ -396,14 +399,14 @@ func listEntry(e *entry, k keys, fl floor) Entry {
 	return out
 }
 
-// Delete removes name and every version of it. The pointer is removed first,
-// so an interrupted Delete leaves a directory with no pointer. One holding only
-// generation and v1 is an interrupted Put, which is not an entry and is
-// discarded by the next Put of the name; one holding more is damage that List
-// reports, and Delete, called again, clears it. Delete reads nothing inside the
-// entry, so it removes one List reports as corrupt. The entry's floor is
-// removed last; a crash before that leaves a floor for a name with no entry,
-// which the next Put of the name replaces.
+// Delete removes name and every version of it. The pointer is removed first
+// and the entry's floor last, so an interrupted Delete leaves a directory with
+// no pointer whose generation the floor still records: damage that List
+// reports and Delete, called again, clears (with no floor file to say so, a
+// directory holding only generation and v1 is an interrupted Put instead).
+// Delete reads nothing inside the entry, so it removes one List reports as
+// corrupt. A crash after the directory is gone leaves a floor for a name with
+// no entry, which the next Put of the name replaces.
 func (s *FileStore) Delete(ctx context.Context, name string) error {
 	if err := s.delete(ctx, name); err != nil {
 		return fmt.Errorf("delete %s: %w", name, err)
@@ -435,7 +438,7 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 			return err
 		}
 	}
-	e, err := openEntryDir(root, name)
+	e, err := openEntryDir(root, name, fl)
 	damaged := errors.Is(err, errNoPointer)
 	if err != nil && !damaged {
 		return err
@@ -496,7 +499,7 @@ func (s *FileStore) rotate(ctx context.Context, name string, value []byte) (Vers
 		return Version{}, err
 	}
 	defer func() { _ = fdir.Close() }() // writes are fsynced by writeFloor
-	e, err := openEntry(root, name)
+	e, err := openEntry(root, name, fl)
 	if err != nil {
 		return Version{}, err
 	}
@@ -636,8 +639,8 @@ type entry struct {
 }
 
 // openEntry opens name's directory and reads its generation.
-func openEntry(root *os.Root, name string) (*entry, error) {
-	e, err := openEntryDir(root, name)
+func openEntry(root *os.Root, name string, fl floor) (*entry, error) {
+	e, err := openEntryDir(root, name, fl)
 	if err != nil {
 		return nil, err
 	}
@@ -657,11 +660,13 @@ func openEntry(root *os.Root, name string) (*entry, error) {
 	return e, nil
 }
 
-// openEntryDir opens name's directory. A missing directory is ErrNotFound, a
-// real directory without a current pointer is errInterruptedPut or errNoPointer
-// as interruptedPut tells them apart, and one that is not a real directory is
-// ErrCorrupt.
-func openEntryDir(root *os.Root, name string) (*entry, error) {
+// openEntryDir opens name's directory. A missing directory is ErrNotFound, and
+// one that is not a real directory is ErrCorrupt. A real directory without a
+// current pointer is errInterruptedPut or errNoPointer: interruptedPut tells
+// them apart by shape, and committedBefore by the floor, since a directory in
+// the shape a crashed Put leaves whose generation the floor records once had
+// a committed pointer.
+func openEntryDir(root *os.Root, name string, fl floor) (*entry, error) {
 	e, err := openEntryDirRaw(root, name)
 	if err != nil {
 		return nil, err
@@ -672,16 +677,46 @@ func openEntryDir(root *os.Root, name string) (*entry, error) {
 			return nil, err
 		}
 		interrupted, ierr := interruptedPut(e.root)
-		e.close()
-		if ierr != nil {
-			return nil, ierr
+		committed := false
+		if ierr == nil && interrupted {
+			committed, ierr = committedBefore(e.root, name, fl)
 		}
-		if interrupted {
+		e.close()
+		switch {
+		case ierr != nil:
+			return nil, ierr
+		case committed:
+			return nil, errLostPointer
+		case interrupted:
 			return nil, errInterruptedPut
 		}
-		return nil, errNoPointer
+		return nil, errDamagedShape
 	}
 	return e, nil
+}
+
+// committedBefore reports whether the floor records, for name, the
+// generation in dir's generation file. Put records the floor only after its
+// pointer, so a recorded generation means this entry committed a pointer. A
+// directory with no generation file never did. A generation file that does
+// not read while the floor records the name is damage: a crashed Put writes
+// that file whole, by rename.
+func committedBefore(dir *os.Root, name string, fl floor) (bool, error) {
+	f, ok := fl[name]
+	if !ok {
+		return false, nil
+	}
+	b, _, err := readFile(dir, generationName, generationFileSize)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if errors.Is(err, errBadFile) || (err == nil && (len(b) != generationFileSize || b[len(b)-1] != '\n')) {
+		return false, fmt.Errorf("%w: the generation file does not read", errDamagedShape)
+	}
+	if err != nil {
+		return false, readError(generationName, err)
+	}
+	return string(b[:len(b)-1]) == f.Generation, nil
 }
 
 // interruptedPut reports whether dir holds only what a crashed Put leaves

@@ -271,7 +271,7 @@ func (s *FileStore) syncFloor(entries, dir *os.Root, fl floor, k keys) (floor, e
 		if checkName(name) != nil {
 			continue
 		}
-		e, err := openEntry(entries, name)
+		e, err := openEntry(entries, name, fl)
 		if err != nil {
 			continue
 		}
