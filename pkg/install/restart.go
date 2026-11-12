@@ -1130,12 +1130,33 @@ func lastCrash(rec executor.CrashRecord) executor.Crash {
 // build that did not write details). The record is writable by the service uid
 // and this runs as root, so the detail goes through termsafe.Strip, as on
 // `k3sm status`: an ESC, CR or newline in it is data, not terminal or log input.
+// Strip deletes CR, LF and TAB outright, which would fuse the lines of a log
+// tail together, so each run of them becomes one space first.
 func agentFailureDetail(c executor.Crash) string {
-	d := termsafe.Strip(c.Detail)
-	if strings.TrimSpace(d) == "" {
+	d := strings.TrimSpace(termsafe.Strip(collapseLineBreaks(c.Detail)))
+	if d == "" {
 		return "no detail recorded"
 	}
 	return d
+}
+
+// collapseLineBreaks replaces each run of CR, LF and TAB in s with one space.
+func collapseLineBreaks(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	inRun := false
+	for _, r := range s {
+		if r == '\r' || r == '\n' || r == '\t' {
+			if !inRun {
+				b.WriteByte(' ')
+				inRun = true
+			}
+			continue
+		}
+		inRun = false
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 // agentCredentialProvesJoin reports whether the stored node credential is proof

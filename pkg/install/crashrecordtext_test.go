@@ -155,3 +155,24 @@ func TestHostileCrashRecordRendersAsDataOnInstall(t *testing.T) {
 		}
 	})
 }
+
+// TestAgentFailureDetailKeepsLineBreaksAsSpaces pins that a multi-line detail
+// (a log tail) renders with its CR, LF and TAB runs as single spaces rather
+// than fused away, still carries no control rune, and that a detail of nothing
+// but control characters still reads as no detail.
+func TestAgentFailureDetailKeepsLineBreaksAsSpaces(t *testing.T) {
+	for _, tc := range []struct{ detail, want string }{
+		{"line one\nline two\tend", "line one line two end"},
+		{"a\r\n\r\nb", "a b"},
+		{"\r\n\t", "no detail recorded"},
+		{"\x1b\r\n", "no detail recorded"},
+	} {
+		got := agentFailureDetail(executor.Crash{Detail: tc.detail})
+		if got != tc.want {
+			t.Errorf("agentFailureDetail(%q) = %q, want %q", tc.detail, got, tc.want)
+		}
+		if bad := controlRunes(got); len(bad) > 0 {
+			t.Errorf("agentFailureDetail(%q) carries control runes %q", tc.detail, bad)
+		}
+	}
+}
