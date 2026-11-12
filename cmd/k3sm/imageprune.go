@@ -302,6 +302,12 @@ func pruneRegistry(ctx context.Context, o imageOptions, cred registrysvc.Credent
 			if err != nil {
 				res.Failed = append(res.Failed, failedManifest{StoredManifest: m, Error: err.Error()})
 				failed++
+				if ctx.Err() != nil {
+					// A refusal that coincides with the cancellation stays failed,
+					// but the run was still cut short: say so even when this was
+					// the last planned manifest and no later check runs.
+					res.Interrupted = true
+				}
 				continue
 			}
 			res.Manifests = append(res.Manifests, m)

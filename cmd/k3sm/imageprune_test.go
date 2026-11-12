@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -1021,12 +1022,14 @@ func TestImagePruneForceStopsOnCancel(t *testing.T) {
 // an error while the context is done is filed by what the error is: a registry
 // refusal is a failed deletion even when a cancellation coincides with it, and
 // only the context's own error, cancellation or deadline, leaves the manifest
-// unattempted. Either way the manifests not yet reached are unattempted.
+// unattempted. Either way the manifests not yet reached are unattempted, and a
+// refusal on the last planned manifest still reports the run as interrupted.
 func TestImagePruneForceClassifiesAnErrorAtCancel(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		ctx        func() (context.Context, context.CancelFunc)
 		del        func(ctx context.Context, cancel context.CancelFunc) error
+		at         int // the 1-based DELETE that runs del; the earlier ones delete
 		wantFailed bool
 		wantCause  error
 	}{{
@@ -1039,6 +1042,16 @@ func TestImagePruneForceClassifiesAnErrorAtCancel(t *testing.T) {
 		wantFailed: true,
 		wantCause:  context.Canceled,
 	}, {
+		name: "registry refusal of the last planned manifest",
+		ctx:  func() (context.Context, context.CancelFunc) { return context.WithCancel(context.Background()) },
+		del: func(_ context.Context, cancel context.CancelFunc) error {
+			cancel()
+			return &transport.Error{StatusCode: http.StatusInternalServerError}
+		},
+		at:         3,
+		wantFailed: true,
+		wantCause:  context.Canceled,
+	}, {
 		name: "cancellation",
 		ctx:  func() (context.Context, context.CancelFunc) { return context.WithCancel(context.Background()) },
 		del: func(ctx context.Context, cancel context.CancelFunc) error {
@@ -1047,9 +1060,17 @@ func TestImagePruneForceClassifiesAnErrorAtCancel(t *testing.T) {
 		},
 		wantCause: context.Canceled,
 	}, {
+		name: "cancellation as a url.Error",
+		ctx:  func() (context.Context, context.CancelFunc) { return context.WithCancel(context.Background()) },
+		del: func(_ context.Context, cancel context.CancelFunc) error {
+			cancel()
+			return &url.Error{Op: "Delete", URL: "https://registry.invalid/v2/app/manifests/x", Err: context.Canceled}
+		},
+		wantCause: context.Canceled,
+	}, {
 		name: "deadline",
 		ctx: func() (context.Context, context.CancelFunc) {
-			return context.WithTimeout(context.Background(), 3*time.Second)
+			return context.WithTimeout(context.Background(), 50*time.Millisecond)
 		},
 		del: func(ctx context.Context, _ context.CancelFunc) error {
 			<-ctx.Done()
@@ -1068,15 +1089,22 @@ func TestImagePruneForceClassifiesAnErrorAtCancel(t *testing.T) {
 			}
 			ctx, cancel := tc.ctx()
 			defer cancel()
+			at := max(tc.at, 1)
 			var calls int
-			del := func(ctx context.Context, _ name.Digest, _ string, _ authn.Authenticator) error {
+			del := func(ctx context.Context, rf name.Digest, state string, auth authn.Authenticator) error {
 				calls++
+				if calls < at {
+					return reg.delete(ctx, rf, state, auth)
+				}
 				return tc.del(ctx, cancel)
 			}
 			var out bytes.Buffer
 			err = imageCommandWith(ctx, opts, &out, dialRuntimed, del, reg.collect)
-			if calls != 1 {
-				t.Fatalf("deleter called %d times; want 1, nothing after the context is done", calls)
+			if calls == 0 {
+				t.Fatalf("deleter never called: the context was done before the first DELETE (err = %v)", err)
+			}
+			if calls != at {
+				t.Fatalf("deleter called %d times; want %d, nothing after the context is done", calls, at)
 			}
 			if !errors.Is(err, tc.wantCause) {
 				t.Errorf("err = %v; want %v", err, tc.wantCause)
@@ -1096,10 +1124,11 @@ func TestImagePruneForceClassifiesAnErrorAtCancel(t *testing.T) {
 			for _, m := range doc.Registry.Unattempted {
 				unattempted = append(unattempted, m.Repository+"@"+m.Digest)
 			}
-			first := "app@" + f.overwritten
-			wantFailed, wantUnattempted := []string(nil), []string{first, "multi@" + f.oldIndex, "multi@" + f.oldLeaf}
+			planned := []string{"app@" + f.overwritten, "multi@" + f.oldIndex, "multi@" + f.oldLeaf}
+			wantManifests := planned[:at-1]
+			wantFailed, wantUnattempted := []string(nil), planned[at-1:]
 			if tc.wantFailed {
-				wantFailed, wantUnattempted = []string{first}, wantUnattempted[1:]
+				wantFailed, wantUnattempted = planned[at-1:at], planned[at:]
 			}
 			if strings.Join(failed, ",") != strings.Join(wantFailed, ",") {
 				t.Errorf("report failed = %v; want %v", failed, wantFailed)
@@ -1107,8 +1136,8 @@ func TestImagePruneForceClassifiesAnErrorAtCancel(t *testing.T) {
 			if strings.Join(unattempted, ",") != strings.Join(wantUnattempted, ",") {
 				t.Errorf("report unattempted = %v; want %v", unattempted, wantUnattempted)
 			}
-			if got := manifestList(doc); len(got) != 0 {
-				t.Errorf("report manifests = %v; want none", got)
+			if got := manifestList(doc); strings.Join(got, ",") != strings.Join(wantManifests, ",") {
+				t.Errorf("report manifests = %v; want %v", got, wantManifests)
 			}
 		})
 	}
