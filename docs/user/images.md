@@ -435,10 +435,10 @@ username in `K3SM_REGISTRY_USER` (`token` if that is unset), and a registry that
 short-lived tokens, as ghcr.io and most hosted public registries do, trades it for a token
 scoped to the repository being pushed. The exchange goes to the token realm the registry names,
 which can be a different host from the registry itself, so the credential is sent there.
-The token realm is refused if it is on a different host from the registry and that host is
-written as an IP address that is loopback, private, link-local or unspecified. The pull or push
-stops with `invalid realm in www-authenticate: realm host ... is a private or link-local address`.
-Give the token service a host name, or run it on the registry's own host and port.
+k3sm refuses the token realm if it is on a different host from the registry and that host is
+written as an IP address that is loopback (127.0.0.1), private, link-local or 0.0.0.0. The pull or
+push stops with `invalid realm in www-authenticate: realm host ... is a private or link-local
+address`. Give the token service a host name, or run it on the registry's own host and port.
 
 For ghcr.io, use a classic personal access token with the `write:packages` scope, or a
 fine-grained token with write access to packages. ghcr ignores the username for a token, so
