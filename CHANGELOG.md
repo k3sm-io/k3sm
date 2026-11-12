@@ -270,8 +270,10 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
 - `k3sm image untag --digest` no longer removes a tag that a push re-points between its check and
   its delete. The delete is now conditional at the cluster registry, which deletes a tag only while
   it still names that digest, and a tag that moved is reported as an error with nothing removed. A
-  cluster registry running v0.2.3 or earlier does not enforce this: against it, a tag re-pointed
-  between the check and the delete is still removed.
+  cluster registry without this change does not enforce it: v0.2.3 and earlier ignore the
+  condition, so a tag re-pointed between the check and the delete is still removed, and a
+  development build from between releases refuses the removal even though the tag has not moved.
+  Upgrading the cluster is the fix in both cases.
 - A server whose control plane does not report healthy in time while the Mac is heavily loaded no
   longer parks on the crash-loop breaker after five attempts. It backs off instead, from 30 seconds
   doubling up to 10 minutes, `k3sm status` shows when the next attempt starts and that an attempt
