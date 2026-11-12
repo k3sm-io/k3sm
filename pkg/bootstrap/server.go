@@ -187,15 +187,23 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 // when ServerAuth + Bundle are configured, and the server-class etcd member routes
 // when ServerAuth + Members are configured).
 //
-// The routes do NOT share an authentication scheme, and that is deliberate:
-// /cacert, /join and /server-bootstrap are reached by a node that holds no cluster
-// certificate yet, so they authenticate a token (or nothing, for the public CA);
-// MeshEndpointPath, DeregisterPath and NetserveCertPath are reached only by a node
-// that has already joined, so they authenticate that node's own certificate and accept no token at
-// all. Those three are the cluster's whole node-certificate-authenticated surface:
-// one moves a node's endpoint, one removes the node, one issues the node's own
-// netserve certificate, and none can name any node but the one the certificate
-// identifies.
+// The routes do NOT share an authentication scheme, and that is deliberate. Each
+// route's credential, as its handler checks it:
+//   - CACertPath: none. It serves the public cluster CA, which a joining node
+//     hash-verifies, so there is nothing to protect.
+//   - JoinPath: the worker join token, carried in the request body
+//     (Tokens.VerifyToken). The caller holds no cluster certificate yet.
+//   - BundlePath: the server secret, as a bearer token (a worker join token is
+//     refused). Served only with ServerAuth + Bundle.
+//   - EtcdMemberPath and EtcdMemberPromotePath: the server secret, as a bearer
+//     token, checked by authorizeServerRoute (a worker join token is refused).
+//     Served only with ServerAuth + Members.
+//   - MeshEndpointPath, DeregisterPath and NetserveCertPath: the calling node's
+//     own client certificate (verifiedNodeLeaf), and no token at all. They are
+//     reached only by a node that has already joined. They are the cluster's whole
+//     node-certificate-authenticated surface: one moves a node's endpoint, one
+//     removes the node, one issues the node's own netserve certificate, and none
+//     can name any node but the one the certificate identifies.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc(CACertPath, s.handleCACert)
