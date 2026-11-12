@@ -290,9 +290,11 @@ func pruneRegistry(ctx context.Context, o imageOptions, cred registrysvc.Credent
 				res.Kept = append(res.Kept, registrysvc.KeptManifest{StoredManifest: m, Reason: registrysvc.KeepChangedSincePlan})
 				continue
 			}
-			if err != nil && ctx.Err() != nil {
-				// The cancellation cut this DELETE off: the registry did not
-				// refuse it, and a later prune plans it again if it is still there.
+			if err != nil && ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+				// The cancellation or deadline cut this DELETE off: the registry
+				// did not refuse it, and a later prune plans it again if it is
+				// still there. A refusal that merely coincides with the
+				// cancellation is not the context's error and is filed as failed.
 				res.Interrupted = true
 				res.Unattempted = append(res.Unattempted, m)
 				continue

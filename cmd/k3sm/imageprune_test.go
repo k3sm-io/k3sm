@@ -36,6 +36,7 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
 	"github.com/opencontainers/go-digest"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
@@ -1011,6 +1012,103 @@ func TestImagePruneForceStopsOnCancel(t *testing.T) {
 			}
 			if want := []string{"multi@" + f.oldIndex, "multi@" + f.oldLeaf}; strings.Join(unattempted, ",") != strings.Join(want, ",") {
 				t.Errorf("report unattempted = %v; want %v", unattempted, want)
+			}
+		})
+	}
+}
+
+// TestImagePruneForceClassifiesAnErrorAtCancel proves the DELETE that returns
+// an error while the context is done is filed by what the error is: a registry
+// refusal is a failed deletion even when a cancellation coincides with it, and
+// only the context's own error, cancellation or deadline, leaves the manifest
+// unattempted. Either way the manifests not yet reached are unattempted.
+func TestImagePruneForceClassifiesAnErrorAtCancel(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		ctx        func() (context.Context, context.CancelFunc)
+		del        func(ctx context.Context, cancel context.CancelFunc) error
+		wantFailed bool
+		wantCause  error
+	}{{
+		name: "registry refusal",
+		ctx:  func() (context.Context, context.CancelFunc) { return context.WithCancel(context.Background()) },
+		del: func(_ context.Context, cancel context.CancelFunc) error {
+			cancel()
+			return &transport.Error{StatusCode: http.StatusInternalServerError}
+		},
+		wantFailed: true,
+		wantCause:  context.Canceled,
+	}, {
+		name: "cancellation",
+		ctx:  func() (context.Context, context.CancelFunc) { return context.WithCancel(context.Background()) },
+		del: func(ctx context.Context, cancel context.CancelFunc) error {
+			cancel()
+			return fmt.Errorf("DELETE: %w", ctx.Err())
+		},
+		wantCause: context.Canceled,
+	}, {
+		name: "deadline",
+		ctx: func() (context.Context, context.CancelFunc) {
+			return context.WithTimeout(context.Background(), 3*time.Second)
+		},
+		del: func(ctx context.Context, _ context.CancelFunc) error {
+			<-ctx.Done()
+			return fmt.Errorf("DELETE: %w", ctx.Err())
+		},
+		wantCause: context.DeadlineExceeded,
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			workDir := t.TempDir()
+			reg := serveFakePruneRegistry(t, workDir)
+			f := buildPruneFixture(t, workDir)
+			sock := serveFakeImages(t, &fakeImagesDaemon{pruneResp: &runtimev1.PruneImagesResponse{}})
+			opts, err := parseImageArgs([]string{"--socket", sock, "--work-dir", workDir, "prune", "--force", "-o", "json"}, io.Discard)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := tc.ctx()
+			defer cancel()
+			var calls int
+			del := func(ctx context.Context, _ name.Digest, _ string, _ authn.Authenticator) error {
+				calls++
+				return tc.del(ctx, cancel)
+			}
+			var out bytes.Buffer
+			err = imageCommandWith(ctx, opts, &out, dialRuntimed, del, reg.collect)
+			if calls != 1 {
+				t.Fatalf("deleter called %d times; want 1, nothing after the context is done", calls)
+			}
+			if !errors.Is(err, tc.wantCause) {
+				t.Errorf("err = %v; want %v", err, tc.wantCause)
+			}
+			if got := errors.Is(err, errPruneIncomplete); got != tc.wantFailed {
+				t.Errorf("err = %v; errors.Is(errPruneIncomplete) = %t, want %t", err, got, tc.wantFailed)
+			}
+			doc := decodePrune(t, out.String())
+			if !doc.Registry.Interrupted {
+				t.Errorf("report interrupted = false")
+			}
+			var failed []string
+			for _, m := range doc.Registry.Failed {
+				failed = append(failed, m.Repository+"@"+m.Digest)
+			}
+			var unattempted []string
+			for _, m := range doc.Registry.Unattempted {
+				unattempted = append(unattempted, m.Repository+"@"+m.Digest)
+			}
+			first := "app@" + f.overwritten
+			wantFailed, wantUnattempted := []string(nil), []string{first, "multi@" + f.oldIndex, "multi@" + f.oldLeaf}
+			if tc.wantFailed {
+				wantFailed, wantUnattempted = []string{first}, wantUnattempted[1:]
+			}
+			if strings.Join(failed, ",") != strings.Join(wantFailed, ",") {
+				t.Errorf("report failed = %v; want %v", failed, wantFailed)
+			}
+			if strings.Join(unattempted, ",") != strings.Join(wantUnattempted, ",") {
+				t.Errorf("report unattempted = %v; want %v", unattempted, wantUnattempted)
+			}
+			if got := manifestList(doc); len(got) != 0 {
+				t.Errorf("report manifests = %v; want none", got)
 			}
 		})
 	}
