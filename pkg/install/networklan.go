@@ -79,8 +79,8 @@ func LANCovers(role Role) []string {
 
 // LANAlwaysOn is the network-facing listeners the switch does not control on
 // a node of role. The worker join port stays reachable because a new worker
-// joins over the LAN before it has a mesh (every request needs the join
-// token); the apiserver is reached over the mesh or loopback.
+// joins over the LAN before it has a mesh (each route takes a credential
+// except the public CA certificate route); the apiserver is reached over the mesh or loopback.
 func LANAlwaysOn(role Role) []string {
 	if role == RoleAgent {
 		return []string{ListenerMesh}

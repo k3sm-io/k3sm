@@ -60,8 +60,8 @@ node's own address and on 127.0.0.1. The ingress answers on the node's own
 address but not on 127.0.0.1.
 
 Not covered: the apiserver (loopback, or the mesh address), the worker join
-port (a new worker joins over the LAN, and every request needs the join
-token) and the wireguard mesh port (it answers only cluster peers).
+port (a new worker joins over the LAN; each route takes a credential except
+the public CA certificate route) and the wireguard mesh port (it answers only cluster peers).
 
 With --for, the node daemon turns LAN access off by itself once the time is
 up, checking about every 30 seconds (and soon after the Mac wakes). A later
