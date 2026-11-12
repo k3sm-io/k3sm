@@ -203,7 +203,7 @@ func renderDetail(r Report, s Style, names []string, view string) string {
 		}
 		if row.Remedy != "" {
 			for _, step := range strings.Split(row.Remedy, "\n") {
-				b.WriteString(logIndent + "fix: " + strings.TrimSpace(step) + "\n")
+				b.WriteString(logIndent + "fix: " + strings.TrimSpace(stripControls(step)) + "\n")
 			}
 		}
 		b.WriteString("\n")

