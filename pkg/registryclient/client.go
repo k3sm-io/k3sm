@@ -34,6 +34,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -75,7 +76,46 @@ var (
 	// ErrDigestMismatch is a manifest whose bytes do not hash to the digest it
 	// was requested by or the one the registry reported for it.
 	ErrDigestMismatch = errors.New("manifest bytes do not match their digest")
+	// ErrUnreachable wraps a transport error that means the registry could
+	// not be reached: a failed dial, a refused or reset connection, or one
+	// closed before the answer.
+	ErrUnreachable = errors.New("the registry cannot be reached")
+	// ErrTimeout wraps a request that ran out of time: the client's timeout,
+	// a transport deadline, or the caller's context deadline.
+	ErrTimeout = errors.New("the registry did not answer in time")
+	// ErrShortRead wraps a response body that failed partway through.
+	ErrShortRead = errors.New("the registry's response could not be read")
 )
+
+// StatusError is a registry answer with a status this client does not read
+// a body from and that has no sentinel of its own (404 is ErrNotFound, 401
+// and 403 are ErrUnauthorized). A caller branches on StatusCode with
+// errors.As.
+type StatusError struct {
+	// StatusCode is the HTTP status code.
+	StatusCode int
+	// Status is the HTTP status line ("503 Service Unavailable").
+	Status string
+}
+
+func (e *StatusError) Error() string { return fmt.Sprintf("registry answered %q", e.Status) }
+
+// transportError wraps err, a failed request, with ErrTimeout or
+// ErrUnreachable when it is one of those, and returns it unchanged otherwise.
+func transportError(err error) error {
+	var nerr net.Error
+	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &nerr) && nerr.Timeout()) {
+		return fmt.Errorf("%w: %w", ErrTimeout, err)
+	}
+	var opErr *net.OpError
+	var dnsErr *net.DNSError
+	if errors.As(err, &opErr) || errors.As(err, &dnsErr) ||
+		errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return fmt.Errorf("%w: %w", ErrUnreachable, err)
+	}
+	return err
+}
 
 // Options configure a Client. The zero value is a plain-HTTP-capable client
 // with the default per-request timeout and the system trust store.
@@ -746,7 +786,10 @@ func (c *Client) get(ctx context.Context, u *url.URL, accept string, limit int64
 }
 
 // do performs one anonymous request and, for a GET, reads at most limit bytes
-// of body. A non-200 answer is an error; 404 and 401/403 map to the sentinels.
+// of body. A non-200 answer is an error; 404 and 401/403 map to the sentinels
+// and any other status is a *StatusError. A request that fails is wrapped
+// with ErrTimeout or ErrUnreachable when it is one of those, and a body that
+// fails partway with ErrShortRead.
 func (c *Client) do(ctx context.Context, method string, u *url.URL, accept string, limit int64) (*http.Response, []byte, error) {
 	req, err := http.NewRequestWithContext(ctx, method, u.String(), nil)
 	if err != nil {
@@ -757,7 +800,7 @@ func (c *Client) do(ctx context.Context, method string, u *url.URL, accept strin
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, transportError(err)
 	}
 	defer resp.Body.Close()
 	switch {
@@ -766,14 +809,14 @@ func (c *Client) do(ctx context.Context, method string, u *url.URL, accept strin
 	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
 		return nil, nil, ErrUnauthorized
 	case resp.StatusCode != http.StatusOK:
-		return nil, nil, fmt.Errorf("registry answered %q", resp.Status)
+		return nil, nil, &StatusError{StatusCode: resp.StatusCode, Status: resp.Status}
 	}
 	if method == http.MethodHead {
 		return resp, nil, nil
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if err != nil {
-		return nil, nil, fmt.Errorf("read the response body: %w", err)
+		return nil, nil, fmt.Errorf("read the response body: %w: %w", ErrShortRead, err)
 	}
 	if int64(len(body)) > limit {
 		return nil, nil, fmt.Errorf("response body exceeds %d bytes", limit)

@@ -51,6 +51,7 @@ import (
 	"k3sm.io/k3sm/pkg/crdensure"
 	"k3sm.io/k3sm/pkg/interconnect"
 	"k3sm.io/k3sm/pkg/mlx"
+	"k3sm.io/k3sm/pkg/registryclient"
 )
 
 // FieldManager is the server-side-apply field manager every serving object this
@@ -114,7 +115,7 @@ type Config struct {
 	GPU GPUSource
 	// Artifacts resolves a spec.artifact tag to a manifest digest in the
 	// cluster registry (RegistryResolver). nil leaves only references by
-	// digest servable; a tag reference reports InvalidSpec.
+	// digest servable; a tag reference reports ArtifactUnavailable.
 	Artifacts ArtifactResolver
 	// InterconnectIndices returns every node's cluster index, from its pod /24:
 	// the derivation the interconnect resolver uses (the server wires the same
@@ -156,10 +157,9 @@ type EventRecorder interface {
 const eventComponent = FieldManager
 
 // eventReasonArtifactUnresolved is the Event reason, and only the Event
-// reason, of a model whose artifact reference could not be resolved. Its
-// status still reports ReasonInvalidSpec and is unchanged. The reason means
-// the artifact reference could not be resolved, whether the registry could not
-// be reached or it refused or could not satisfy the reference.
+// reason, of a model whose artifact reference could not be resolved, whatever
+// the cause. Its status reports ReasonArtifactUnavailable for a cause outside
+// the spec and ReasonInvalidSpec for any other (see artifactFailureFit).
 const eventReasonArtifactUnresolved = "ArtifactUnresolved"
 
 // Controller reconciles MLXModels into the objects that serve them.
@@ -480,10 +480,9 @@ func (c *Controller) reconcile(ctx context.Context, key string, rec EventRecorde
 	// error is retried, a missing resolver waits for the configuration.
 	if err := c.resolveArtifact(ctx, model); err != nil {
 		c.log.Warn("mlxmodel artifact cannot be resolved; no objects applied", "mlxmodel", key, "err", err)
-		// The status is InvalidSpec whatever the cause and is unchanged. The
-		// Event says the artifact reference could not be resolved, whether the
-		// registry could not be reached or it refused the reference.
-		if werr := c.refuseWithEvent(ctx, rec, raw, model, invalidSpecFit(err), eventReasonArtifactUnresolved); werr != nil {
+		// The status is ArtifactUnavailable for a cause outside the spec and
+		// InvalidSpec for any other. The Event is ArtifactUnresolved for both.
+		if werr := c.refuseWithEvent(ctx, rec, raw, model, artifactFailureFit(err), eventReasonArtifactUnresolved); werr != nil {
 			return werr
 		}
 		if errors.Is(err, errNoResolver) {
@@ -801,6 +800,48 @@ func invalidSpecFit(err error) Fit {
 // all. It is terminal in the same way a fit failure is: nothing changes until the
 // spec does.
 const ReasonInvalidSpec = "InvalidSpec"
+
+// ReasonArtifactUnavailable means spec.artifact could not be resolved for a
+// cause outside the spec: the registry could not be reached, did not answer in
+// time, failed, throttled, refused the read, does not have the artifact yet,
+// or the operator has no registry client. It is not terminal: the controller
+// keeps retrying (a missing registry client waits for the operator's
+// configuration instead).
+const ReasonArtifactUnavailable = "ArtifactUnavailable"
+
+// artifactFailureFit is the refusal a failed artifact resolution reports. Only
+// a cause positively known to be outside the spec is ReasonArtifactUnavailable;
+// a digest mismatch, a spec fault and any error not classified here are
+// invalidSpecFit, so an unknown cause fails toward the terminal reason.
+func artifactFailureFit(err error) Fit {
+	if artifactUnavailable(err) {
+		return Fit{Level: FitFailed, Reason: ReasonArtifactUnavailable, Message: err.Error()}
+	}
+	return invalidSpecFit(err)
+}
+
+// artifactUnavailable reports whether err, a failed resolution, has a cause
+// outside the spec.
+func artifactUnavailable(err error) bool {
+	if errors.Is(err, registryclient.ErrDigestMismatch) {
+		return false
+	}
+	switch {
+	case errors.Is(err, errNoResolver),
+		errors.Is(err, registryclient.ErrUnreachable),
+		errors.Is(err, registryclient.ErrTimeout),
+		errors.Is(err, context.DeadlineExceeded),
+		errors.Is(err, registryclient.ErrShortRead),
+		errors.Is(err, registryclient.ErrNotFound),
+		errors.Is(err, registryclient.ErrUnauthorized):
+		return true
+	}
+	var se *registryclient.StatusError
+	if errors.As(err, &se) {
+		return se.StatusCode == http.StatusTooManyRequests || (se.StatusCode >= 500 && se.StatusCode <= 599)
+	}
+	return false
+}
 
 // hostPort joins an IP and port for a URL, bracketing an IPv6 literal.
 func hostPort(ip string, port int32) string {

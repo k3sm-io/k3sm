@@ -253,9 +253,10 @@ func TestRunRecorderIsScopedToRun(t *testing.T) {
 }
 
 // TestArtifactResolutionFailureEventReason pins the Event reason of the
-// artifact branch: the status stays InvalidSpec, but the Event says
-// ArtifactUnresolved, because a registry outage is retried and is not a bad
-// spec. A render failure keeps InvalidSpec for both.
+// artifact branch: the Event says ArtifactUnresolved whatever the status
+// reason (an unclassified registry error is InvalidSpec, a missing resolver
+// ArtifactUnavailable; TestResolutionFailureConditionReason covers every
+// cause). A render failure keeps InvalidSpec for both.
 func TestArtifactResolutionFailureEventReason(t *testing.T) {
 	t.Run("registry error", func(t *testing.T) {
 		rec := &fakeRecorder{}
@@ -267,7 +268,7 @@ func TestArtifactResolutionFailureEventReason(t *testing.T) {
 		if err := h.ctrl.Reconcile(context.Background(), key()); err == nil {
 			t.Fatal("Reconcile returned nil for a registry outage, want the transient error")
 		}
-		assertArtifactUnresolved(t, h, rec)
+		assertArtifactUnresolved(t, h, rec, ReasonInvalidSpec)
 	})
 	t.Run("registry error retried at one generation", func(t *testing.T) {
 		rec := &fakeRecorder{}
@@ -281,14 +282,14 @@ func TestArtifactResolutionFailureEventReason(t *testing.T) {
 				t.Fatalf("reconcile %d returned nil for a registry outage, want the transient error", i+1)
 			}
 		}
-		assertArtifactUnresolved(t, h, rec)
+		assertArtifactUnresolved(t, h, rec, ReasonInvalidSpec)
 	})
 	t.Run("no resolver", func(t *testing.T) {
 		rec := &fakeRecorder{}
 		h := artifactHarness(t, testRegistryHost+"/models/qwen3:v1", nil)
 		h.ctrl.recorder = rec
 		h.reconcile(t)
-		assertArtifactUnresolved(t, h, rec)
+		assertArtifactUnresolved(t, h, rec, ReasonArtifactUnavailable)
 	})
 	t.Run("render failure", func(t *testing.T) {
 		rec := &fakeRecorder{}
@@ -300,11 +301,11 @@ func TestArtifactResolutionFailureEventReason(t *testing.T) {
 	})
 }
 
-func assertArtifactUnresolved(t *testing.T, h *harness, rec *fakeRecorder) {
+func assertArtifactUnresolved(t *testing.T, h *harness, rec *fakeRecorder, wantReason string) {
 	t.Helper()
 	ready := meta.FindStatusCondition(h.status(t).Conditions, mlxv1alpha1.MLXModelConditionReady)
-	if ready == nil || ready.Reason != ReasonInvalidSpec {
-		t.Errorf("Ready = %+v, want the status reason to stay %s", ready, ReasonInvalidSpec)
+	if ready == nil || ready.Reason != wantReason {
+		t.Errorf("Ready = %+v, want the status reason %s", ready, wantReason)
 	}
 	if len(rec.events) != 1 {
 		t.Fatalf("%d events, want 1: %+v", len(rec.events), rec.events)
