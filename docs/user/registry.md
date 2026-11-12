@@ -136,7 +136,13 @@ registry can read the images this cluster runs, and only a user holding a builde
 [Pushing With Other Tools](#pushing-with-other-tools)), or a Pod the cluster's RBAC allows to push (see [Pushing From Inside a Pod](#pushing-from-inside-a-pod)),
 can put a new one there.
 
-A pull whose registry sends no response headers within 30 seconds gets no error status: the gate closes the connection, the puller tries its next mirror, and the server log shows the warning `ingest registry gate could not reach the local registry`.
+A pull is a read, so it is timed differently from a push. If the registry behind the gate sends no
+response headers within 30 seconds, the gate closes the connection without an error status, or
+answers 502 where it cannot take over the connection, and logs the warning
+`ingest registry gate could not reach the local registry`. A pull the client itself gave up on is
+not logged as a warning. A node's runtime reads a closed connection as this registry not having the
+image and moves on to its next source, if it has one. The 30 seconds covers the registry's response
+headers only, not the time a transfer takes once the registry has started to answer.
 
 ## Models
 
