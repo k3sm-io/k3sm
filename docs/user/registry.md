@@ -131,12 +131,6 @@ pulls the copy instead. An answer from the public registry, such as a 404 or a c
 node does not trust, is never replaced by the copy. See
 [Naming and Reading Images](images.md#naming-and-reading-images-tag-untag-inspect-save-pull).
 
-A pull through the cluster address is relayed, and the relay cuts a transfer that makes no progress
-for 5 minutes. A slow transfer that keeps moving is never cut, because a node cannot resume a cut
-layer and would download it again from the start. The relay serves 256 connections at once, and one
-client address may hold 64 of them. A connection past that address's share is closed at once, and
-when all 256 are held a new pull waits, with no error, until a slot frees.
-
 Pushes are authenticated. Together those two are the whole access model. Anyone who can reach the
 registry can read the images this cluster runs, and only a user holding a builder token (see
 [Pushing With Other Tools](#pushing-with-other-tools)), or a Pod the cluster's RBAC allows to push (see [Pushing From Inside a Pod](#pushing-from-inside-a-pod)),
@@ -149,6 +143,12 @@ answers 502 where it cannot take over the connection, and logs the warning
 not logged as a warning. A node's runtime reads a closed connection as this registry not having the
 image and moves on to its next source, if it has one. The 30 seconds covers the registry's response
 headers only, not the time a transfer takes once the registry has started to answer.
+
+A pull through the registry's cluster address is cut by the registry if the transfer makes no
+progress for 5 minutes. A slow transfer that keeps moving is never cut, because a node cannot resume
+a cut layer and would download it again from the start. The registry serves 256 connections at once,
+and one client address may hold 64 of them. A connection past that address's share is closed at
+once, and when all 256 are held a new pull waits, with no error, until one frees.
 
 ## Models
 
