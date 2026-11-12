@@ -624,8 +624,9 @@ only after eight such attempts in a row. The server counts the Mac as heavily lo
 the one-minute and the five-minute load averages are high, and it writes the load it read into the
 crash-loop record.
 
-`k3sm status` shows the text it reads from the crash-loop record as data: control characters and
-bidirectional text controls are stripped from what it prints. A record that is a symlink, is not a
+`k3sm status` shows the text it reads from the crash-loop record as data: control characters,
+invisible format characters such as bidirectional text controls and zero-width characters, and the
+line and paragraph separators are stripped from what it prints. JSON output is unchanged. A record that is a symlink, is not a
 regular file or is over 1 MiB is not read, and status reports it as unreadable. `sudo k3sm install`
 fails on such a record, and the error names its path. Remove the record and run the install again;
 re-running is safe.

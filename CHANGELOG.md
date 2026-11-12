@@ -276,9 +276,9 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
   you fix or remove the record is safe.
 - `k3sm status` no longer follows a symlink or reads a FIFO or other non-regular file, or a file
   over 1 MiB, in place of the crash-loop record, and reports the record as unreadable. It shows text
-  from the crash-loop record, the stop marker and the applied LAN report as data: terminal control
-  characters, bidirectional text controls and the line and paragraph separators are stripped from
-  all human output. A fix recorded in the crash-loop record is shown only when it is one k3sm itself
+  from the crash-loop record, the stop marker and the applied LAN report as data: control
+  characters, invisible format characters such as bidirectional text controls and zero-width
+  characters, and the line and paragraph separators are stripped from all human output. A fix recorded in the crash-loop record is shown only when it is one k3sm itself
   writes, and otherwise the generic fix is shown. JSON output is unchanged.
 - A server whose control plane does not report healthy in time while the Mac is heavily loaded no
   longer parks on the crash-loop breaker after five attempts. It backs off instead, from 30 seconds
