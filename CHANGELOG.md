@@ -268,7 +268,7 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
 ### Fixed
 
 - When a node's local registry accepts a connection but never answers, a manifest push through the
-  push gate now gets a 502 `UNAVAILABLE` after 10 minutes without response headers, instead of
+  push gate now gets a 502 `UNAVAILABLE` after 15 minutes without response headers, instead of
   waiting until the client gives up. Retry the push. A manifest push gets that long because the
   registry can make it wait behind a garbage-collection sweep of the repository or a re-hash of a
   large layer. Blob uploads get the same 502 after the registry's own 2-hour upload bound, because the

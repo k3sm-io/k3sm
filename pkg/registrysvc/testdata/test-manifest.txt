@@ -48,6 +48,7 @@ TestGateProxyForEveryOperation added every gate operation is pinned to a proxy c
 TestGateReadErrorLogsCancellationAtDebug added a read the client cancelled is not a warning
 TestGateRefusesLongLivedBuilderToken kept the push gate is unchanged
 TestGateWriteErrorIs502WhenUpstreamIsDown added an authorized write to a closed upstream is a 502
+TestGateWriteErrorLogsCancellationAtDebug added a write the client cancelled is not a warning
 TestGenerateCredential kept the credential files are unchanged
 TestHostingDocument kept the relay and cluster publication do not touch the child
 TestIsOrphanedChild added new with the child switch

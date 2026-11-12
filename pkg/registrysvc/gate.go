@@ -77,13 +77,20 @@ const gateUpstreamHeaderTimeout = 30 * time.Second
 // collection sweep of that repository holds for the whole sweep, and after it
 // links every blob the manifest names, which can re-hash a large blob from
 // disk; a healthy push can wait well past 30s on its last request.
-// Invariant: it must be at least CollectTimeout. A sweep holds the lock for up
-// to CollectTimeout, so a shorter bound would cut a healthy PUT that is only
-// queued behind a sweep; past CollectTimeout a registry still doing that work
-// is taken to be hung, so the PUT is cut there with a 502. It is its own value
-// rather than an alias so tuning CollectTimeout does not silently move it;
-// TestGateManifestBoundCoversCollect holds the invariant.
-const gateManifestHeaderTimeout = 10 * time.Minute
+// Invariant: it is CollectTimeout plus gateManifestCollectMargin. A sweep
+// holds the lock for up to CollectTimeout, and a PUT queued behind a full
+// sweep still has to link and re-hash its blobs after it gets the lock, so a
+// bound of exactly CollectTimeout would cut a healthy PUT; the margin is the
+// room for that work. Past the bound a registry still doing it is taken to be
+// hung, so the PUT is cut there with a 502. The relation is in code so tuning
+// CollectTimeout moves the bound with it; TestGateManifestBoundCoversCollect
+// holds the invariant.
+const gateManifestHeaderTimeout = CollectTimeout + gateManifestCollectMargin
+
+// gateManifestCollectMargin is how long past CollectTimeout a manifest PUT
+// may wait for headers: the link and re-hash work it does after waiting out a
+// full collection sweep for the repository's lock.
+const gateManifestCollectMargin = 5 * time.Minute
 
 // gateUploadHeaderTimeout is the response-header bound of a blob upload
 // request (the POST that starts or mounts, a PATCH, the final PUT). The
@@ -287,9 +294,16 @@ func (g *gate) readError(w http.ResponseWriter, r *http.Request, err error) {
 	w.WriteHeader(http.StatusBadGateway)
 }
 
-// writeError answers an authorized write the registry did not take.
+// writeError answers an authorized write the registry did not take. A write
+// the client itself abandoned is no fault of the registry and is logged at
+// Debug.
 func (g *gate) writeError(w http.ResponseWriter, r *http.Request, err error) {
-	g.log.Warn("ingest registry gate could not forward an authorized write", "target", g.upstream, "err", err)
+	level := slog.LevelWarn
+	if errors.Is(err, context.Canceled) {
+		level = slog.LevelDebug
+	}
+	g.log.Log(r.Context(), level, "ingest registry gate could not forward an authorized write",
+		"target", g.upstream, "method", r.Method, "path", r.URL.Path, "err", err)
 	ociError(w, r, http.StatusBadGateway, codeUnavailable, "the node's registry is not answering")
 }
 
