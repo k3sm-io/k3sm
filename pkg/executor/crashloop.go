@@ -163,6 +163,21 @@ const (
 // bring-up streak.
 const BringUpSlowRemedy = "find what keeps the host overloaded (uptime, memory pressure, top) and free it"
 
+// EtcdMemberRouteRemedy is the fix a joining server's permanent member-route
+// refusal names (cmd/k3sm records it). The status row appends the
+// clear-crashloop step itself.
+const EtcdMemberRouteRemedy = "the existing server refused to add this server's etcd member: re-install this server with --server naming a server of THIS cluster, --token set to that cluster's server token, and a valid node name and --node-ip"
+
+// EtcdMemberRouteMeshRemedy is the fix when the refusal was this server's mesh
+// range (bootstrap.RefusalMeshRangeClaimed / RefusalMeshClaimRefused). Nothing was
+// added to the cluster: the existing server refuses before its member add.
+const EtcdMemberRouteMeshRemedy = "the existing server refused this server's mesh range, so no etcd member was added: choose a free --mesh-ip (the first address of an unused /24 in 100.64.0.0/10) and re-install this server, or remove the stale MeshPeer and its claim on the existing server (`kubectl delete meshpeer <holder>`, `kubectl -n kube-system delete lease <claim>`), then clear the crash-loop record and restart this server"
+
+// EtcdMemberRouteUnacknowledgedRemedy is the fix when the existing server added the
+// member without acknowledging this server's mesh claim: it predates claims, so it
+// reserved nothing.
+const EtcdMemberRouteUnacknowledgedRemedy = "the existing server did not acknowledge this server's mesh claim, so it runs a k3sm that predates server mesh ranges: upgrade every existing server first, then clear the crash-loop record and restart this server. The unstarted learner it added holds no vote; the next member request for this name removes it"
+
 // knownRemedies is every fixed remedy string this package owns.
 var knownRemedies = [...]string{
 	BringUpSlowRemedy,
@@ -174,13 +189,20 @@ var knownRemedies = [...]string{
 	NewerControlPlaneRemedy,
 	EtcdStrandedLearnerRemedy,
 	EtcdPeerURLDriftRemedy,
+	EtcdMemberRouteRemedy,
+	EtcdMemberRouteMeshRemedy,
+	EtcdMemberRouteUnacknowledgedRemedy,
 }
 
 // IsKnownRemedy reports whether s is exactly one of the fixed remedy strings
-// this package owns. The crash record is writable by the service uid, so a
+// this package owns, or a remedy EtcdSupersededError.Remedy can produce
+// (IsSupersededRemedy). The crash record is writable by the service uid, so a
 // reader that shows a record's Remedy to an operator shows it only when this
 // holds; any other text in that field is data, not a fix to print.
 func IsKnownRemedy(s string) bool {
+	if IsSupersededRemedy(s) {
+		return true
+	}
 	for _, k := range knownRemedies {
 		if s == k {
 			return true

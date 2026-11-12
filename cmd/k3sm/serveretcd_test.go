@@ -324,7 +324,7 @@ func TestEtcdMemberRouteRetryAndPermanence(t *testing.T) {
 			}
 			last, _ := rec.Last()
 			if !rec.Tripped() || len(rec.Crashes) != 1 || !last.Permanent || last.Component != etcdMemberRouteComponent ||
-				last.Remedy != etcdMemberRouteRemedy || last.Origin != executor.CrashOriginBringUp {
+				last.Remedy != executor.EtcdMemberRouteRemedy || last.Origin != executor.CrashOriginBringUp {
 				t.Errorf("record = %+v (tripped %v), want one permanent %s bring-up failure that trips the breaker",
 					rec.Crashes, rec.Tripped(), etcdMemberRouteComponent)
 			}
