@@ -17,10 +17,140 @@ limitations under the License.
 package executor
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"math"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
+
+// parsePackageFiles parses this package's non-test .go files.
+func parsePackageFiles(t *testing.T) []*ast.File {
+	t.Helper()
+	paths, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fset := token.NewFileSet()
+	var files []*ast.File
+	for _, p := range paths {
+		if strings.HasSuffix(p, "_test.go") {
+			continue
+		}
+		src, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f, err := parser.ParseFile(fset, p, src, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatal(err)
+		}
+		files = append(files, f)
+	}
+	if len(files) == 0 {
+		t.Fatal("no non-test .go files found in the package directory")
+	}
+	return files
+}
+
+// packageStringConsts evaluates every package-level const whose value is a string
+// expression this evaluator can follow (string literals, + and references to other
+// such consts). names holds every package-level const name, evaluable or not.
+func packageStringConsts(files []*ast.File) (values map[string]string, names []string) {
+	exprs := map[string]ast.Expr{}
+	for _, f := range files {
+		for _, d := range f.Decls {
+			g, ok := d.(*ast.GenDecl)
+			if !ok || g.Tok != token.CONST {
+				continue
+			}
+			for _, spec := range g.Specs {
+				vs := spec.(*ast.ValueSpec)
+				for i, n := range vs.Names {
+					names = append(names, n.Name)
+					if i < len(vs.Values) {
+						exprs[n.Name] = vs.Values[i]
+					}
+				}
+			}
+		}
+	}
+	values = map[string]string{}
+	for changed := true; changed; {
+		changed = false
+		for n, e := range exprs {
+			if _, done := values[n]; done {
+				continue
+			}
+			if v, ok := evalString(e, values); ok {
+				values[n] = v
+				changed = true
+			}
+		}
+	}
+	sort.Strings(names)
+	return values, names
+}
+
+// evalString evaluates a constant string expression against the known consts.
+func evalString(e ast.Expr, known map[string]string) (string, bool) {
+	switch e := e.(type) {
+	case *ast.BasicLit:
+		if e.Kind != token.STRING {
+			return "", false
+		}
+		v, err := strconv.Unquote(e.Value)
+		return v, err == nil
+	case *ast.Ident:
+		v, ok := known[e.Name]
+		return v, ok
+	case *ast.ParenExpr:
+		return evalString(e.X, known)
+	case *ast.BinaryExpr:
+		if e.Op != token.ADD {
+			return "", false
+		}
+		x, ok := evalString(e.X, known)
+		if !ok {
+			return "", false
+		}
+		y, ok := evalString(e.Y, known)
+		return x + y, ok
+	}
+	return "", false
+}
+
+// TestEveryRemedyConstIsKnown: every package-level const named *Remedy is a fixed
+// remedy string, and IsKnownRemedy accepts it. A new remedy const that is not
+// listed in knownRemedies fails here, so a crash record carrying it is never shown
+// as untrusted text.
+func TestEveryRemedyConstIsKnown(t *testing.T) {
+	t.Parallel()
+	values, names := packageStringConsts(parsePackageFiles(t))
+	checked := 0
+	for _, n := range names {
+		if !strings.HasSuffix(n, "Remedy") {
+			continue
+		}
+		v, ok := values[n]
+		if !ok {
+			t.Errorf("const %s is not a string this test can evaluate; extend evalString", n)
+			continue
+		}
+		checked++
+		if !IsKnownRemedy(v) {
+			t.Errorf("const %s is not accepted by IsKnownRemedy; add it to knownRemedies", n)
+		}
+	}
+	if checked < len(knownRemedies) {
+		t.Errorf("found %d *Remedy consts, fewer than the %d knownRemedies lists", checked, len(knownRemedies))
+	}
+}
 
 // TestIsSupersededRemedyAcceptsEveryRemedyOutput: the remedies Remedy builds for
 // realistic peers (node names, IPv4 and IPv6 peer URLs, small and full-width
