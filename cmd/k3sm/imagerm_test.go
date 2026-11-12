@@ -200,7 +200,7 @@ func TestImageRmEvictsOneImage(t *testing.T) {
 			args:    []string{"rm", "app:v1", "--force"},
 			err:     status.Error(codes.Internal, "evict: unlink sha256:a1: permission denied"),
 			wantReq: &runtimev1.EvictImageRequest{Reference: "app:v1", Force: true},
-			wantErr: []string{"unlink sha256:a1: permission denied", "daemon's log", "re-run"},
+			wantErr: []string{"unlink sha256:a1: permission denied", "node log", "re-run"},
 		},
 		{
 			name:    "an image no record names points at prune",
@@ -237,7 +237,7 @@ func TestImageRmEvictsOneImage(t *testing.T) {
 			args:    []string{"rm", "app:v1", "--force"},
 			err:     evictRefusal(t, runtimev1.EvictErrorInfoDomain, runtimev1.EvictReasonRootsIncomplete, "roots incomplete"),
 			wantReq: &runtimev1.EvictImageRequest{Reference: "app:v1", Force: true},
-			wantErr: []string{"could not read every record that protects blobs", "nothing was deleted", "daemon's log", "roots incomplete"},
+			wantErr: []string{"could not read every record that protects blobs", "nothing was deleted", "node log", "roots incomplete"},
 			denyErr: []string{"the daemon refused"},
 		},
 		{

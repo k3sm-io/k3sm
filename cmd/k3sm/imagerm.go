@@ -122,7 +122,7 @@ func rmRPCError(target, socket string, err error) error {
 	case codes.Internal:
 		// An unlink that failed, or whose re-verification refused it, is a
 		// failure, not a partial success. Some blobs may already be gone.
-		return fmt.Errorf("rm %s: the daemon failed: %s; some blobs may already be unlinked and the kept list is in the daemon's log; a re-run converges", target, st.Message())
+		return fmt.Errorf("rm %s: the daemon failed: %s; some blobs may already be unlinked and the kept list is in the node log (/var/log/k3sm/server.log, or agent.log on a joined worker); a re-run converges", target, st.Message())
 	}
 	return imageRPCError("rm "+target, socket, err)
 }
@@ -148,7 +148,7 @@ func rmRefusal(target string, st *status.Status) (msg string, ok bool) {
 		case runtimev1.EvictReasonRootsIncomplete:
 			// The contract allows this refusal after an earlier removal stage
 			// already unlinked; the daemon's message then counts the blobs.
-			return fmt.Sprintf("rm %s: the daemon could not read every record that protects blobs, so it refused; nothing was deleted unless its message counts unlinked blobs; see the daemon's log, repair the record, and re-run (%s)", target, st.Message()), true
+			return fmt.Sprintf("rm %s: the daemon could not read every record that protects blobs, so it refused; nothing was deleted unless its message counts unlinked blobs; check the node log (/var/log/k3sm/server.log, or agent.log on a joined worker), repair the record, and re-run (%s)", target, st.Message()), true
 		}
 	}
 	return "", false
