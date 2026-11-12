@@ -27,17 +27,19 @@ import (
 // tables below are checked against a fixed spelling rather than against the
 // function they test.
 func TestShellQuoteGolden(t *testing.T) {
-	cases := []struct{ in, want string }{
-		{"plain", `'plain'`},
-		{"it's", `'it'\''s'`},
-		{"a\nb", "'a\nb'"},
-		{"-rf", `'-rf'`},
-		{"", `''`},
+	cases := []struct{ name, in, want string }{
+		{"plain", "plain", `'plain'`},
+		{"embedded single quote", "it's", `'it'\''s'`},
+		{"newline", "a\nb", "'a\nb'"},
+		{"leading dash", "-rf", `'-rf'`},
+		{"empty string", "", `''`},
 	}
 	for _, tc := range cases {
-		if got := shellQuote(tc.in); got != tc.want {
-			t.Errorf("shellQuote(%q) = %q, want %q", tc.in, got, tc.want)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			if got := shellQuote(tc.in); got != tc.want {
+				t.Errorf("shellQuote(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -55,10 +57,16 @@ const (
 // read as an option. The expected commands are literals.
 func TestRemediesQuoteTheirPaths(t *testing.T) {
 	const q = remedyQuoted
+	if !strings.HasPrefix(DeveloperModeMarkerPath, "/") {
+		t.Errorf("DeveloperModeMarkerPath = %q, want an absolute path (the chmod -N row has no `--`)", DeveloperModeMarkerPath)
+	}
 	cases := []struct {
 		name   string
 		remedy func(t *testing.T) string
 		want   []string
+		// prose, when set, says why the remedy also names the path raw in its
+		// diagnosis sentence, so the raw-copy check is skipped for the row.
+		prose string
 	}{
 		{"stuck developer-mode marker", func(t *testing.T) string {
 			return stuckMarkerRemedy(remedyPath)
@@ -67,8 +75,12 @@ func TestRemediesQuoteTheirPaths(t *testing.T) {
 			"`sudo rm -- " + q + "`",
 			"`ls -lO@e -- " + q + "`",
 			"`sudo chflags -- noschg " + q + "`",
+			// No `--` here: macOS chmod reads a `--` after -N as a file name
+			// (verified on a Mac: `chmod -N -- f` fails with "Failed to clear
+			// ACL on file --"). The operand is the absolute constant
+			// DeveloperModeMarkerPath, so it cannot be read as an option.
 			"`sudo chmod -N " + q + "`",
-		}},
+		}, ""},
 		{"unreadable agent arguments record", func(t *testing.T) string {
 			f := newFakeSystem(t)
 			f.putFile(remedyPath, []byte("not json"))
@@ -77,7 +89,8 @@ func TestRemediesQuoteTheirPaths(t *testing.T) {
 				t.Fatal("recordedAgentArgs read an unparseable record")
 			}
 			return err.Error()
-		}, []string{"`sudo rm -- " + q + "`"}},
+		}, []string{"`sudo rm -- " + q + "`"},
+			"the diagnosis sentence names the path raw before the quoted command"},
 		{"unreadable server arguments record", func(t *testing.T) string {
 			f := newFakeSystem(t)
 			f.putFile(remedyPath, []byte("not json"))
@@ -86,12 +99,14 @@ func TestRemediesQuoteTheirPaths(t *testing.T) {
 				t.Fatal("recordedServerArgs read an unparseable record")
 			}
 			return err.Error()
-		}, []string{"`sudo rm -- " + q + "`"}},
+		}, []string{"`sudo rm -- " + q + "`"},
+			"the diagnosis sentence names the path raw before the quoted command"},
 		{"unreadable server plist with an unreadable record", func(t *testing.T) string {
 			f := newFakeSystem(t)
 			f.putFile(remedyPath, []byte("not json"))
 			return unreadablePlistError(f, Config{ServerArgsRecord: remedyPath}, "/Library/LaunchDaemons/io.k3sm.server.plist", errors.New("EIO")).Error()
-		}, []string{"`sudo rm -- " + q + "`"}},
+		}, []string{"`sudo rm -- " + q + "`"},
+			"the diagnosis sentence names the path raw before the quoted command"},
 		{"join token file readable by others", func(t *testing.T) string {
 			f := newFakeSystem(t)
 			f.putFile(remedyPath, []byte("K10abc::node:secret"))
@@ -104,25 +119,29 @@ func TestRemediesQuoteTheirPaths(t *testing.T) {
 				t.Fatal("operatorJoinToken accepted a group- and world-readable token file")
 			}
 			return err.Error()
-		}, []string{"`chmod -- 600 " + q + "`"}},
+		}, []string{"`chmod -- 600 " + q + "`"},
+			"the diagnosis sentence names the path raw before the quoted command"},
 		{"link directory owned by another account", func(t *testing.T) string {
 			err := linkDirVerdict(remedyPath, "", linkDirFacts{UID: 501, Mode: 0o755 | fs.ModeDir, IsDir: true}, 0)
 			if err == nil {
 				t.Fatal("linkDirVerdict accepted a directory owned by uid 501")
 			}
 			return err.Error()
-		}, []string{"sudo chown -- root:wheel " + q + " && sudo chmod -- 755 " + q}},
+		}, []string{"sudo chown -- root:wheel " + q + " && sudo chmod -- 755 " + q},
+			"the diagnosis sentence names the path raw before the quoted command"},
 		{"absent launcher directory", func(t *testing.T) string {
 			err := linkDirVerdict("/usr/local", remedyPath, linkDirFacts{Absent: true}, 0)
 			if err == nil {
 				t.Fatal("linkDirVerdict accepted an absent ancestor")
 			}
 			return err.Error()
-		}, []string{"sudo mkdir -p -- " + q + " && sudo chown -- root:wheel " + q + " && sudo chmod -- 755 " + q}},
+		}, []string{"sudo mkdir -p -- " + q + " && sudo chown -- root:wheel " + q + " && sudo chmod -- 755 " + q},
+			"the diagnosis sentence names the path raw before the quoted command"},
 		{"first-install tree that could not be withdrawn", func(t *testing.T) string {
 			f := &failingSwap{fakeSystem: newFakeSystem(t)}
 			return withdrawFirstInstallTree(f, Config{InstallDir: remedyPath}, errors.New("cause")).Error()
-		}, []string{"`sudo rm -rf -- " + q + "`"}},
+		}, []string{"`sudo rm -rf -- " + q + "`"},
+			"the diagnosis sentence names the path raw before the quoted command"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -131,6 +150,14 @@ func TestRemediesQuoteTheirPaths(t *testing.T) {
 				if !strings.Contains(got, w) {
 					t.Errorf("remedy %q does not carry %q", got, w)
 				}
+			}
+			// An unquoted copy of the path must not ride along with the
+			// quoted one.
+			if rest := strings.ReplaceAll(got, q, ""); strings.Contains(rest, "k3sm data") {
+				if tc.prose != "" {
+					t.Skip(tc.prose)
+				}
+				t.Errorf("remedy %q carries a raw copy of the path outside %q", got, q)
 			}
 		})
 	}
