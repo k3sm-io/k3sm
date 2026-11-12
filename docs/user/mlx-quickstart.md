@@ -97,7 +97,11 @@ replica died), `Crashing` (the serving container keeps exiting or cannot start; 
 replica, the last exit code and the error), `ImagePullFailed` (the serving image cannot be pulled),
 `ScaledToZero` (you set `replicas: 0`), `InvalidSpec` (the spec cannot be served). A refused model also
 gets a Warning Event, so `kubectl describe mlxmodel <name>` shows why. A model whose artifact reference
-cannot be resolved gets an `ArtifactUnresolved` Event while `Ready` still says `InvalidSpec`.
+cannot be resolved gets an `ArtifactUnresolved` Event. `Ready` says `ArtifactUnavailable` when the cause is outside
+the spec (the registry cannot be reached, times out, fails or throttles the read, refuses an
+anonymous read, does not have the artifact yet, or no registry is configured), and the operator keeps
+retrying. It stays `InvalidSpec` for a fault in the spec, a digest mismatch or any other cause the
+operator cannot classify; see [Troubleshooting](troubleshooting.md).
 
 There is no liveness probe on the serving pod, because a first start is an unbounded download and a
 probe that killed it would restart the download from zero.
