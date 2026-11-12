@@ -20,7 +20,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"regexp"
 	"time"
 
 	"k3sm.io/k3sm/pkg/executor"
@@ -217,15 +216,12 @@ func leaderLostNote(rec executor.CrashRecord, now time.Time) string {
 		n, executor.CrashLoopWindow, shownComponent(lost), lost.At.Format(time.RFC3339))
 }
 
-// componentPattern is the shape of a component name the daemon writes into the
-// crash record ("kine", "etcd-member-route", "provision/<step>").
-var componentPattern = regexp.MustCompile(`^[a-z0-9._/-]{1,64}$`)
-
 // shownComponent is c's component as a human screen may show it. The record is
 // writable by the service uid and `k3sm status` may run as root, so a value
-// off componentPattern is data, not a name: the fixed word "unknown" stands in.
+// executor.IsComponentName refuses is data, not a name: the fixed word "unknown"
+// stands in.
 func shownComponent(c executor.Crash) string {
-	if componentPattern.MatchString(c.Component) {
+	if executor.IsComponentName(c.Component) {
 		return c.Component
 	}
 	return "unknown"
