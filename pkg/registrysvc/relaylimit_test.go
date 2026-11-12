@@ -449,6 +449,9 @@ func TestBindProgressLogsUnboundedConnection(t *testing.T) {
 			if !strings.Contains(warns[0].Message, "without a progress bound") || got["remote"] != "10.0.0.9:1234" {
 				t.Errorf("warning = %q %v, want the no-progress-bound line with remote 10.0.0.9:1234", warns[0].Message, got)
 			}
+			if got["error"] == "" {
+				t.Errorf("warning error attribute is empty: %v", got)
+			}
 			for _, k := range []string{"path", "url", "repo"} {
 				if _, ok := got[k]; ok {
 					t.Errorf("warning carries %q; want the address only", k)
@@ -456,4 +459,41 @@ func TestBindProgressLogsUnboundedConnection(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("two connections each log once", func(t *testing.T) {
+		rec := &recordedLog{}
+		ok := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
+		s := newSourceLimiter(ok, relayLimits{
+			requestRate: 100, requestBurst: 100, writeRate: 100, writeBurst: 100,
+			maxRequestsPerConn: 100, maxConnAge: time.Hour, tableMax: 10,
+			writeProgress: time.Minute, readProgress: time.Minute,
+		}, nil)
+		s.log = slog.New(rec)
+		remotes := []string{"10.0.0.1:1111", "10.0.0.2:2222"}
+		for _, remote := range remotes {
+			ctx := s.ConnContext(t.Context(), nil)
+			for range 2 {
+				req := httptest.NewRequestWithContext(ctx, http.MethodGet, "/v2/library/x/blobs/sha256:00", nil)
+				req.RemoteAddr = remote
+				s.ServeHTTP(&plainWriter{}, req)
+			}
+		}
+		var seen []string
+		rec.mu.Lock()
+		for _, r := range rec.recs {
+			if r.Level != slog.LevelWarn {
+				continue
+			}
+			r.Attrs(func(a slog.Attr) bool {
+				if a.Key == "remote" {
+					seen = append(seen, a.Value.String())
+				}
+				return true
+			})
+		}
+		rec.mu.Unlock()
+		if len(seen) != 2 || seen[0] != remotes[0] || seen[1] != remotes[1] {
+			t.Errorf("warnings for remotes %v, want one each for %v", seen, remotes)
+		}
+	})
 }
