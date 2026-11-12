@@ -181,6 +181,11 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
 
 ### Changed
 
+- An `MLXModel` whose `spec.artifact` cannot be resolved for a cause outside the spec (the
+  registry cannot be reached, does not answer in time, answers 5xx, 429, 401, 403 or 404, a
+  response cannot be read, or the operator has no registry client) now reports `Ready` reason
+  `ArtifactUnavailable` instead of `InvalidSpec`, and the operator keeps retrying. Any other
+  resolution failure still reports `InvalidSpec`. The `ArtifactUnresolved` Event is unchanged.
 - An `MLXModel` served from the cluster registry (`spec.artifact`) now runs with `HF_HUB_OFFLINE=1`,
   so the engine never contacts Hugging Face; a model served from the Hub (`spec.model`) still downloads
   at start. A single-node model served from the registry restarts once when the node is upgraded, because its

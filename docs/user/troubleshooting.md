@@ -270,8 +270,12 @@ generation, and a new one if it is served and then refused again:
 - `InvalidSpec`: the spec cannot be served.
 - The `Ready` condition's fit-block reason (for example `NoGPU` or `MemoryExceedsWorkingSet`): the
   model does not fit the node's GPU.
-- `ArtifactUnresolved`: the `spec.artifact` reference cannot be resolved, whether the registry
-  cannot be reached or it refuses or cannot satisfy the reference. `Ready` still says `InvalidSpec`.
+- `ArtifactUnresolved`: the `spec.artifact` reference cannot be resolved. `Ready` says
+  `ArtifactUnavailable` when the cause is outside the spec (the registry cannot be reached, does
+  not answer in time, fails or throttles the read, refuses an anonymous read, or does not have the
+  artifact yet, or the operator has no registry client), and the operator keeps retrying. Any other
+  cause, such as a digest mismatch or a reference the registry content cannot satisfy, leaves
+  `Ready` at `InvalidSpec`.
 
 ## A Pod's Image Will Not Pull
 
