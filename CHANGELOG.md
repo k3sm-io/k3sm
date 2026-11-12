@@ -181,6 +181,11 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
 
 ### Changed
 
+- The documentation of the worker join port now states which credential each route takes. The CA
+  certificate route takes none, because a joiner pins the CA by the hash in its token, and every
+  other route takes the join token, the node's own certificate or the server secret. The earlier
+  text said every request needs the cluster join token. See
+  [LAN access](docs/user/install.md#lan-access).
 - A Pod with `dnsPolicy: None` now resolves through its own `dnsConfig`: its IPv4 nameservers
   (up to three), `searches` and `ndots`, natively and in a `vm` guest, with no fallback to the host
   resolver. It used to resolve through the host and ignore its `dnsConfig`. IPv6 nameservers are
