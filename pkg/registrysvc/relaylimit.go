@@ -157,7 +157,11 @@ type relayConn struct {
 	requests int
 	cut      *cutWatch
 	// unbounded is set once the connection is logged as served without a
-	// progress bound, so the line is written once per connection.
+	// progress bound, so the line is written once per connection. It is
+	// touched only from the connection's serial request path, which holds
+	// because the relay server speaks HTTP/1.1 only: accept starts it with
+	// Serve over a TLS listener, and the TLS config pins http/1.1. Enabling
+	// HTTP/2 would need a lock here.
 	unbounded bool
 }
 
