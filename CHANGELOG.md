@@ -268,14 +268,14 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
 ### Fixed
 
 - `sudo k3sm image prune --force` now stops when it is cancelled (Ctrl+C, SIGTERM, or `--timeout`
-  expiring). `manifests` then holds only confirmed deletions, which the registry's garbage collection
-  (the sweep) still reclaims within a time limit. Manifests it had not reached are no longer reported
-  as failed deletions. The JSON report sets `interrupted` and lists them under `unattempted`, along
-  with deletions the cancellation cut off. A deletion the registry refused is still listed under
-  `failed`, and the prune is marked `interrupted` either way. A deletion cut off mid-way may have
-  been applied; a later prune or the registry's scheduled garbage collection reclaims it. The
-  interruption is noted on stderr. The table keeps its usual lines, and the command exits non-zero.
-  See [Reclaiming Space](docs/user/images.md#reclaiming-space-k3sm-image-prune).
+  expiring). `manifests` then holds only confirmed deletions, which the registry's garbage
+  collection (the sweep) still reclaims within a time limit. Manifests it had not reached are no
+  longer reported as failed deletions. The JSON report sets `interrupted` and lists them under
+  `unattempted`, along with deletions the cancellation cut off. A deletion the registry refused is
+  still listed under `failed`, and the prune is marked `interrupted` either way. A deletion cut off
+  mid-way may have been applied; a later prune or the registry's scheduled garbage collection
+  reclaims it. The interruption is noted on stderr. The table keeps its usual lines, and the command
+  exits non-zero. See [Reclaiming Space](docs/user/images.md#reclaiming-space-k3sm-image-prune).
 - A server whose control plane does not report healthy in time while the Mac is heavily loaded no
   longer parks on the crash-loop breaker after five attempts. It backs off instead, from 30 seconds
   doubling up to 10 minutes, `k3sm status` shows when the next attempt starts and that an attempt
