@@ -372,6 +372,9 @@ func TestStripControlsDropsBidiAndSeparators(t *testing.T) {
 		{"RLI", "a\u2067b", "ab"},
 		{"FSI", "a\u2068b", "ab"},
 		{"PDI", "a\u2069b", "ab"},
+		{"LRM", "a\u200eb", "ab"},
+		{"RLM", "a\u200fb", "ab"},
+		{"ALM", "a\u061cb", "ab"},
 		{"line separator", "a\u2028b", "ab"},
 		{"paragraph separator", "a\u2029b", "ab"},
 		{"trojan-source reorder", "rm \u202e/ fr-\u2066 x\u2069\u202c", "rm / fr- x"},
@@ -380,6 +383,8 @@ func TestStripControlsDropsBidiAndSeparators(t *testing.T) {
 		{"word joiner is kept", "a\u2060b", "a\u2060b"},
 		{"function application is kept", "a\u2061b", "a\u2061b"},
 		{"inhibit symmetric swapping is kept", "a\u206ab", "a\u206ab"},
+		{"unassigned U+2065 below the isolates is kept", "a\u2065b", "a\u2065b"},
+		{"zero width non-joiner below the marks is kept", "a\u200cb", "a\u200cb"},
 		{"en space is kept", "a\u2002b", "a\u2002b"},
 		{"C0 and C1 still go", "a\x1b\u009bb\x7f", "ab"},
 		{"printable Unicode is kept", "é世→", "é世→"},
@@ -414,7 +419,8 @@ func TestNextStepsAreStripped(t *testing.T) {
 		} {
 			for _, c := range out {
 				if c != '\n' && (c < 0x20 || (c >= 0x7f && c <= 0x9f) ||
-					(c >= 0x202a && c <= 0x202e) || (c >= 0x2066 && c <= 0x2069) || c == 0x2028 || c == 0x2029) {
+					(c >= 0x202a && c <= 0x202e) || (c >= 0x2066 && c <= 0x2069) || c == 0x2028 || c == 0x2029 ||
+					c == 0x200e || c == 0x200f || c == 0x061c) {
 					t.Errorf("%s/%s: %U reaches the human output:\n%q", name, view, c, out)
 					break
 				}

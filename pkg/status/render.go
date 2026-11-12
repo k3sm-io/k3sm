@@ -376,8 +376,8 @@ func sortedKeys(m map[string]string) []string {
 // came from the cluster (apiserver errors, node names), so a hostile apiserver
 // or proxy cannot put terminal escape sequences on the operator's TTY. It also
 // removes the Unicode bidi embedding, override and isolate controls (U+202A to
-// U+202E, U+2066 to U+2069), which reorder what the operator sees against what
-// is copied, and the line and paragraph separators U+2028 and U+2029, which
+// U+202E, U+2066 to U+2069) and the bidi marks (U+200E, U+200F, U+061C), which
+// reorder what the operator sees against what is copied, and the line and paragraph separators U+2028 and U+2029, which
 // some terminals break a line on. Other printable Unicode is kept. Only the
 // human renderer calls it; the JSON output carries the value as data and its
 // encoder already escapes controls.
@@ -387,6 +387,8 @@ func stripControls(s string) string {
 		case r < 0x20, r >= 0x7f && r <= 0x9f:
 			return -1
 		case r >= 0x202a && r <= 0x202e, r >= 0x2066 && r <= 0x2069:
+			return -1
+		case r == 0x200e, r == 0x200f, r == 0x061c:
 			return -1
 		case r == 0x2028, r == 0x2029:
 			return -1
