@@ -34,7 +34,7 @@ const topNoSample = "no metrics yet"
 func RenderTop(r TopReport, s Style) string {
 	var b strings.Builder
 	if r.ClusterError != "" {
-		fmt.Fprintf(&b, "cluster: %s, %s\n", colorize("unreachable", ansiRed, s), r.ClusterError)
+		fmt.Fprintf(&b, "cluster: %s, %s\n", colorize("unreachable", ansiRed, s), stripControls(r.ClusterError))
 		return b.String()
 	}
 	b.WriteString(topHeader(r.Metrics, s))
@@ -79,7 +79,7 @@ func renderTopNodes(b *strings.Builder, r TopReport) {
 		case r.Metrics.Available:
 			cpu, cpuPct, mem, memPct = topNoSample, "", "", ""
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n", n.Name, n.Role, cpu, cpuPct, mem, memPct, n.Pods, age)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n", stripControls(n.Name), stripControls(string(n.Role)), cpu, cpuPct, mem, memPct, n.Pods, age)
 	}
 	// tabwriter writes into a strings.Builder, whose Write never fails.
 	_ = tw.Flush()
@@ -106,14 +106,14 @@ func renderTopPods(b *strings.Builder, r TopReport) {
 	tw := tabwriter.NewWriter(b, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "NAMESPACE\tPOD\tNODE\tCPU\tMEMORY\tRESTARTS")
 	for _, p := range r.Pods {
-		node, cpu, mem := p.Node, "-", "-"
+		node, cpu, mem := stripControls(p.Node), "-", "-"
 		if node == "" {
 			node = "-"
 		}
 		if p.Sampled {
 			cpu, mem = milli(*p.CPUMillicores), mebi(*p.MemoryBytes)
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%d\n", p.Namespace, p.Name, node, cpu, mem, p.Restarts)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%d\n", stripControls(p.Namespace), stripControls(p.Name), node, cpu, mem, p.Restarts)
 	}
 	// tabwriter writes into a strings.Builder, whose Write never fails.
 	_ = tw.Flush()
