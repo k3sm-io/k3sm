@@ -200,6 +200,9 @@ var knownRemedies = [...]string{
 // reader that shows a record's Remedy to an operator shows it only when this
 // holds; any other text in that field is data, not a fix to print.
 func IsKnownRemedy(s string) bool {
+	if len(s) > maxRemedyLen {
+		return false
+	}
 	if IsSupersededRemedy(s) {
 		return true
 	}

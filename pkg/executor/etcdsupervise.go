@@ -27,6 +27,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -966,7 +967,7 @@ const supersededRemedyFormat = "confirm %s (%s, cluster %x) is the server you re
 //   - a cluster ID is a uint64 under %x: one to sixteen lowercase hex digits.
 const (
 	supersededPeerPattern    = `[a-z0-9.-]{0,253}`
-	supersededURLPattern     = `https://(?:[0-9.]{7,15}|\[[0-9a-f:.]{2,45}\]):[0-9]{1,5}`
+	supersededURLPattern     = `https://((?:[0-9.]{7,15}|\[[0-9a-f:.]{2,45}\]):[0-9]{1,5})`
 	supersededClusterPattern = `[0-9a-f]{1,16}`
 )
 
@@ -991,12 +992,27 @@ var supersededRemedyPattern = func() *regexp.Regexp {
 	return regexp.MustCompile(b.String())
 }()
 
+// maxRemedyLen bounds the input IsKnownRemedy and IsSupersededRemedy examine:
+// every remedy this package owns is far shorter, so a longer string is refused
+// before any matching.
+const maxRemedyLen = 1024
+
 // IsSupersededRemedy reports whether s is a remedy EtcdSupersededError.Remedy
 // can produce: its fixed text with a node-name peer, an https peer URL on an IP
 // and hex cluster IDs. A crash record's Remedy is untrusted data; this is how a
-// reader tells this runtime-built remedy from injected text.
+// reader tells this runtime-built remedy from injected text. Past the pattern,
+// the URL's host:port must parse as an address and port, so an out-of-range
+// IPv4 or a malformed IPv6 the character classes admit is refused.
 func IsSupersededRemedy(s string) bool {
-	return supersededRemedyPattern.MatchString(s)
+	if len(s) > maxRemedyLen {
+		return false
+	}
+	m := supersededRemedyPattern.FindStringSubmatch(s)
+	if m == nil {
+		return false
+	}
+	_, err := netip.ParseAddrPort(m[1])
+	return err == nil
 }
 
 // EtcdPeerView is what a peer's listener reports about its cluster.

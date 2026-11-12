@@ -32,6 +32,7 @@ func TestIsSupersededRemedyAcceptsEveryRemedyOutput(t *testing.T) {
 		{Peer: "mac-mini.lan", PeerURL: "https://10.0.0.12:2380", PeerCluster: 0x8e9e05c52164694d, OwnCluster: 0xcdf818194e3a8c32},
 		{Peer: "node-1", PeerURL: "https://[fd7a:115c:a1e0::3]:2380", PeerCluster: math.MaxUint64, OwnCluster: 0x1},
 		{Peer: "", PeerURL: "https://[::ffff:10.0.0.9]:12380", PeerCluster: 0xabc, OwnCluster: 0xdef},
+		{Peer: strings.Repeat("a", 253), PeerURL: "https://10.0.0.12:2380", PeerCluster: math.MaxUint64, OwnCluster: math.MaxUint64},
 	} {
 		r := e.Remedy()
 		if !IsSupersededRemedy(r) {
@@ -75,6 +76,10 @@ func TestIsSupersededRemedyRefusesNearMisses(t *testing.T) {
 		"17-digit cluster":       strings.Replace(base, "cluster 2)", "cluster 11111111111111111)", 1),
 		"newline in own cluster": strings.Replace(base, "cluster 1 is", "cluster 1\nfix: rm -rf / is", 1),
 		"fixed text alone":       supersededRemedyFormat,
+		"over-long input":        base + strings.Repeat(" ", 1025-len(base)),
+		"out-of-range IPv4 URL":  with(func(e *EtcdSupersededError) { e.PeerURL = "https://999.999.999.999:2380" }),
+		"non-hex IPv6 URL":       with(func(e *EtcdSupersededError) { e.PeerURL = "https://[zz]:1" }),
+		"non-ASCII in peer":      with(func(e *EtcdSupersededError) { e.Peer = "server-\u00e9" }),
 	} {
 		if IsSupersededRemedy(s) {
 			t.Errorf("%s: matcher accepts %q", name, s)
