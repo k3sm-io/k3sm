@@ -154,7 +154,7 @@ func renderScreen(r Report, rows []Row, s Style) string {
 	for _, row := range rows {
 		b.WriteString(renderRow(row, s))
 		if log := row.Wide["log"]; log != "" {
-			b.WriteString(logIndent + "log: " + log + repeatSuffix(row.Wide["log-repeats"]) + "\n")
+			b.WriteString(logIndent + "log: " + stripControls(log) + repeatSuffix(row.Wide["log-repeats"]) + "\n")
 		}
 		if s.Wide {
 			b.WriteString(wideLine(row))

