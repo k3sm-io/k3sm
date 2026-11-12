@@ -274,7 +274,8 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
   large layer. Blob uploads get the same 502 after the registry's own 2-hour upload bound, because the
   registry finishes committing a layer before it answers. A pull whose registry sends no response
   headers within 30 seconds ends the same way it always ended when the registry could not be reached:
-  the gate closes the connection, and the puller tries its next mirror. A pull that cannot reach the local registry is now logged.
+  the gate closes the connection, and the puller tries its next mirror. A pull that cannot reach the
+  local registry is now logged.
 - A server whose control plane does not report healthy in time while the Mac is heavily loaded no
   longer parks on the crash-loop breaker after five attempts. It backs off instead, from 30 seconds
   doubling up to 10 minutes, `k3sm status` shows when the next attempt starts and that an attempt
