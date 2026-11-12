@@ -17,12 +17,16 @@ limitations under the License.
 package status
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"k3sm.io/k3sm/pkg/executor"
 )
@@ -196,20 +200,22 @@ func TestApplyCrashLoopOnTheServerRow(t *testing.T) {
 	})
 }
 
-// The collector reads the record through the FS seam: a tripped record makes
-// the server row FAIL; a 0700 work dir a plain user cannot read leaves the row
-// alone and notes why.
+// The collector reads the record with the daemon's owned reader: a tripped
+// record makes the server row FAIL; a record a plain user cannot read leaves
+// the row alone and notes why.
 func TestCollectorServerRowReadsTheCrashRecord(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
-	workDir := "/var/lib/k3sm/server"
-	path := executor.CrashLoopPath(workDir)
 	tripped := now.Add(-time.Minute)
 	rec := executor.CrashRecord{Crashes: []executor.Crash{{At: tripped, Component: "kine"}}, TrippedAt: &tripped}
 	b, _ := json.Marshal(rec)
 
 	t.Run("tripped record fails the row", func(t *testing.T) {
-		c := Collector{FS: fakeFS{contents: map[string][]byte{path: b}}, Paths: Paths{WorkDir: workDir}, Now: func() time.Time { return now }}
+		workDir := t.TempDir()
+		if err := os.WriteFile(executor.CrashLoopPath(workDir), b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		c := Collector{FS: fakeFS{}, Paths: Paths{WorkDir: workDir}, Now: func() time.Time { return now }}
 		row := Row{Name: RowServer, State: StateRunning, Severity: SeverityOK, Wide: map[string]string{}}
 		c.crashLoop(&row)
 		if row.Severity != SeverityFail || !strings.Contains(row.Detail, "kine") || !strings.Contains(row.Remedy, "--clear-crashloop") {
@@ -217,7 +223,14 @@ func TestCollectorServerRowReadsTheCrashRecord(t *testing.T) {
 		}
 	})
 	t.Run("unreadable record is noted, not judged", func(t *testing.T) {
-		c := Collector{FS: fakeFS{unreadable: map[string]bool{path: true}}, Paths: Paths{WorkDir: workDir}, Now: func() time.Time { return now }}
+		if os.Geteuid() == 0 {
+			t.Skip("root reads a mode-0000 file")
+		}
+		workDir := t.TempDir()
+		if err := os.WriteFile(executor.CrashLoopPath(workDir), b, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		c := Collector{FS: fakeFS{}, Paths: Paths{WorkDir: workDir}, Now: func() time.Time { return now }}
 		row := Row{Name: RowServer, State: StateRunning, Severity: SeverityOK, Wide: map[string]string{}}
 		c.crashLoop(&row)
 		if row.Severity != SeverityOK || !strings.Contains(row.Wide["crash-loop"], "not readable") {
@@ -225,10 +238,108 @@ func TestCollectorServerRowReadsTheCrashRecord(t *testing.T) {
 		}
 	})
 	t.Run("absent record changes nothing", func(t *testing.T) {
-		c := Collector{FS: fakeFS{}, Paths: Paths{WorkDir: workDir}, Now: func() time.Time { return now }}
+		c := Collector{FS: fakeFS{}, Paths: Paths{WorkDir: t.TempDir()}, Now: func() time.Time { return now }}
 		row := Row{Name: RowServer, State: StateRunning, Severity: SeverityOK, Wide: map[string]string{}}
 		c.crashLoop(&row)
 		if row.Severity != SeverityOK || len(row.Wide) != 0 {
+			t.Fatalf("%+v", row)
+		}
+	})
+}
+
+// TestCrashRecordRowRefusesSymlinkFIFOAndOversize pins that status reads the
+// crash-loop record through the bounded, no-follow, regular-file-only reader.
+// The work dir is writable by the service user, so each planted shape is one a
+// plain os.ReadFile would honour: a symlink to a valid tripped record (followed,
+// FAIL), a FIFO (the open blocks, status hangs) and a valid tripped record
+// padded past executor.CrashRecordMaxBytes (parsed whole, FAIL). Each must
+// render as the unreadable note on an otherwise untouched row instead. A
+// normal record still renders, and a missing one is no record.
+func TestCrashRecordRowRefusesSymlinkFIFOAndOversize(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	tripped := now.Add(-time.Minute)
+	rec := executor.CrashRecord{Crashes: []executor.Crash{{At: tripped, Component: "kine"}}, TrippedAt: &tripped}
+	valid, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// collect runs the read with a deadline, so a regression that blocks on
+	// the FIFO fails here instead of hanging the package.
+	collect := func(t *testing.T, workDir string) Row {
+		t.Helper()
+		c := Collector{FS: fakeFS{}, Paths: Paths{WorkDir: workDir}, Now: func() time.Time { return now }}
+		done := make(chan Row, 1)
+		go func() {
+			row := Row{Name: RowServer, State: StateRunning, Severity: SeverityOK, Wide: map[string]string{}}
+			c.crashLoop(&row)
+			done <- row
+		}()
+		select {
+		case row := <-done:
+			return row
+		case <-time.After(5 * time.Second):
+			t.Fatal("crash-loop read did not return within 5s (blocked on a planted FIFO?)")
+			return Row{}
+		}
+	}
+	assertUnreadable := func(t *testing.T, row Row) {
+		t.Helper()
+		if row.Severity != SeverityOK || row.State != StateRunning || row.Detail != "" || row.Remedy != "" {
+			t.Fatalf("a refused record judged the row: %+v", row)
+		}
+		if !strings.HasPrefix(row.Wide["crash-loop"], "crash-loop record unreadable") {
+			t.Fatalf("crash-loop note = %q, want the unreadable note", row.Wide["crash-loop"])
+		}
+	}
+
+	t.Run("symlink", func(t *testing.T) {
+		t.Parallel()
+		workDir := t.TempDir()
+		target := filepath.Join(t.TempDir(), "elsewhere.json")
+		if err := os.WriteFile(target, valid, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, executor.CrashLoopPath(workDir)); err != nil {
+			t.Fatal(err)
+		}
+		assertUnreadable(t, collect(t, workDir))
+	})
+	t.Run("fifo", func(t *testing.T) {
+		t.Parallel()
+		workDir := t.TempDir()
+		if err := unix.Mkfifo(executor.CrashLoopPath(workDir), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		assertUnreadable(t, collect(t, workDir))
+	})
+	t.Run("oversize", func(t *testing.T) {
+		t.Parallel()
+		workDir := t.TempDir()
+		// A valid record padded with JSON whitespace: os.ReadFile plus
+		// json.Unmarshal would accept it, so only the bound refuses it.
+		big := append(append([]byte{}, valid...), bytes.Repeat([]byte{' '}, executor.CrashRecordMaxBytes)...)
+		if err := os.WriteFile(executor.CrashLoopPath(workDir), big, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		assertUnreadable(t, collect(t, workDir))
+	})
+	t.Run("normal record renders", func(t *testing.T) {
+		t.Parallel()
+		workDir := t.TempDir()
+		if err := os.WriteFile(executor.CrashLoopPath(workDir), valid, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		row := collect(t, workDir)
+		if row.Severity != SeverityFail || row.Wide["crash-loop"] != "tripped" || !strings.Contains(row.Detail, "kine") {
+			t.Fatalf("%+v", row)
+		}
+	})
+	t.Run("missing is no record", func(t *testing.T) {
+		t.Parallel()
+		row := collect(t, t.TempDir())
+		if row.Severity != SeverityOK || row.State != StateRunning || len(row.Wide) != 0 {
 			t.Fatalf("%+v", row)
 		}
 	})
