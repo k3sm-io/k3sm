@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"k3sm.io/k3sm/pkg/executor"
 )
@@ -198,5 +199,24 @@ func TestAgentFailureDetailKeepsLineBreaksAsSpaces(t *testing.T) {
 		if bad := controlRunes(got); len(bad) > 0 {
 			t.Errorf("agentFailureDetail(%q) carries control runes %q", tc.detail, bad)
 		}
+	}
+}
+
+// TestAgentFailureDetailIsCapped pins that a long detail (the record file may
+// be up to 1 MiB) renders as at most 512 runes plus an
+// ellipsis, and that a detail at the cap is shown whole.
+func TestAgentFailureDetailIsCapped(t *testing.T) {
+	long := strings.Repeat("é", 4096)
+	got := agentFailureDetail(executor.Crash{Detail: long})
+	if n := utf8.RuneCountInString(got); n > 513 {
+		t.Errorf("agentFailureDetail of a 4096-rune detail renders %d runes, want at most 513", n)
+	}
+	if !strings.HasSuffix(got, "…") {
+		t.Errorf("agentFailureDetail of a 4096-rune detail does not end with \"…\": %q", got)
+	}
+
+	exact := strings.Repeat("a", 512)
+	if got := agentFailureDetail(executor.Crash{Detail: exact}); got != exact {
+		t.Errorf("agentFailureDetail of a 512-rune detail = %q, want it unchanged", got)
 	}
 }

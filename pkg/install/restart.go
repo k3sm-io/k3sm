@@ -1145,13 +1145,32 @@ func lastCrash(rec executor.CrashRecord) executor.Crash {
 // and this runs as root, so the detail goes through termsafe.Strip, as on
 // `k3sm status`: an ESC, CR or newline in it is data, not terminal or log input.
 // Strip deletes CR, LF and TAB outright, which would fuse the lines of a log
-// tail together, so each run of them becomes one space first.
+// tail together, so each run of them becomes one space first. The record file
+// may be up to 1 MiB, so the detail is cut at agentFailureDetailMax runes, with
+// an ellipsis marking the cut.
 func agentFailureDetail(c executor.Crash) string {
 	d := strings.TrimSpace(termsafe.Strip(collapseLineBreaks(c.Detail)))
 	if d == "" {
 		return "no detail recorded"
 	}
-	return d
+	return capRunes(d, agentFailureDetailMax)
+}
+
+// agentFailureDetailMax is the most runes of a recorded detail an install
+// error or log line shows.
+const agentFailureDetailMax = 512
+
+// capRunes returns s whole when it has at most limit runes, and otherwise its
+// first limit runes followed by "…".
+func capRunes(s string, limit int) string {
+	n := 0
+	for i := range s {
+		if n == limit {
+			return s[:i] + "…"
+		}
+		n++
+	}
+	return s
 }
 
 // collapseLineBreaks replaces each run of CR, LF and TAB in s with one space.
