@@ -136,13 +136,24 @@ registry can read the images this cluster runs, and only a user holding a builde
 [Pushing With Other Tools](#pushing-with-other-tools)), or a Pod the cluster's RBAC allows to push (see [Pushing From Inside a Pod](#pushing-from-inside-a-pod)),
 can put a new one there.
 
-A pull through the registry's cluster address is cut by the registry if the transfer makes no
-progress for 5 minutes. A slow transfer that keeps moving is never cut, because a node cannot resume
-a cut layer and would download it again from the start. The registry relay serves 256 connections
-at once on each address it listens on, and one client address may hold 64 of them. A connection past
-that client's share is closed at once, and when all 256 are held a further connection waits, with no
-error, until one frees. The node's registry relay logs both cases as warnings, each at most once a
-minute for each address it listens on, and names that address.
+The cluster reaches the registry through the registry relay, a front that listens on the
+server's cluster network address and on its guest network's gateway address, terminates TLS, and
+passes reads through to the registry. A pull through it is cut if the transfer makes no progress
+for 5 minutes, and so is a push body sent through it. A slow transfer that keeps moving is not cut
+mid-layer, because a node cannot resume a cut layer and would download it again from the start. A
+connection is closed only after the response that takes it past 10 minutes old, never in the
+middle of one. The relay serves 256 connections at once on each address it listens on, and one
+client address may hold 64 of them. A pull that arrives through the registry's Service address
+counts as coming from the node it came from, so that node's Pods share its 64. A connection past
+that client's share is closed at once, and when all 256 are held a further connection waits, with
+no error, until one frees.
+
+The relay writes these cases to the server log as warnings. Search the log for the start of the
+line. `ingest registry relay is at its connection limit` means all 256 are held, and
+`ingest registry relay refused a connection` means a client already held its 64. Each of those
+names the address it listens on and is logged at most once a minute for that address.
+`ingest registry relay cut a stalled connection` means the 5 minute cut closed a connection, and
+it is logged once for each connection cut.
 
 ## Models
 
