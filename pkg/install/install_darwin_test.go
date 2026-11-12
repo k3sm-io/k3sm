@@ -676,7 +676,7 @@ func TestWriteServiceUserFileOnDisk(t *testing.T) {
 		if err == nil {
 			t.Fatal("operatorJoinToken accepted a world-readable join token file")
 		}
-		if !strings.Contains(err.Error(), "chmod 600") {
+		if !strings.Contains(err.Error(), "chmod -- 600 ") {
 			t.Errorf("error %q does not name the remedy", err)
 		}
 		if strings.Contains(err.Error(), strings.TrimSpace(token)) {

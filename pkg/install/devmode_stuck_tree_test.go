@@ -129,9 +129,9 @@ func TestDeveloperModeStuckMarkerLeavesNoSignedTree(t *testing.T) {
 			"the developer-mode marker " + DeveloperModeMarkerPath + " is beside the new tree",
 			"plists name paths inside it",
 			"sudo chflags -- nouchg " + shellQuote(DeveloperModeMarkerPath),
-			"ls -lO@e " + DeveloperModeMarkerPath,
+			"ls -lO@e -- " + shellQuote(DeveloperModeMarkerPath),
 			"a system-immutable flag (schg): `sudo chflags -- noschg " + shellQuote(DeveloperModeMarkerPath) + "`, or Recovery if the securelevel is raised",
-			"a deny-delete ACL: `sudo chmod -N " + DeveloperModeMarkerPath + "`",
+			"a deny-delete ACL: `sudo chmod -N " + shellQuote(DeveloperModeMarkerPath) + "`",
 			"`sudo launchctl bootout system/<label>` and `sudo launchctl disable system/<label>`",
 			"a stop-gap until the marker is cleared and the install is re-run",
 		} {

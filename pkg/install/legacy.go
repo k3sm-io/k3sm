@@ -26,6 +26,7 @@ import (
 	"net/netip"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"k3sm.io/k3sm/pkg/bootstrap"
@@ -146,7 +147,7 @@ func adoptLegacyAgentFiles(sys System, cfg Config, uid uint32) error {
 		case known[filepath.Base(e.Path)]:
 			switch {
 			case e.Kind != EntryRegular:
-				notRegular = append(notRegular, fmt.Sprintf("%s (%s)", e.Path, e.Kind))
+				notRegular = append(notRegular, fmt.Sprintf("%q (%s)", e.Path, e.Kind))
 			case e.UID == 0 && svcUID != 0:
 				adopt = append(adopt, e)
 			}
@@ -154,7 +155,7 @@ func adoptLegacyAgentFiles(sys System, cfg Config, uid uint32) error {
 			// A subdirectory, a symlink, a socket under a name k3sm does not
 			// claim: not this step's business, and never chowned.
 		case !serviceCanRead(e, svcUID, svcGID):
-			unreadable = append(unreadable, e.Path)
+			unreadable = append(unreadable, strconv.Quote(e.Path))
 		default:
 			ignored = append(ignored, e.Path)
 		}
@@ -167,6 +168,9 @@ func adoptLegacyAgentFiles(sys System, cfg Config, uid uint32) error {
 	// than its target, so this is a refusal out of caution rather than a repair
 	// of a live escalation — but "the artifact k3sm was about to hand over is
 	// not the artifact" is never something to continue past.
+	// Both lists hold Go-quoted names: the service user can write this
+	// directory, so a name may carry ESC, CR or newline bytes, and those must
+	// not reach the operator's terminal raw.
 	if len(notRegular) > 0 {
 		return fmt.Errorf("install: the agent work dir %s holds an entry under one of this node's own state file names that is not a regular file; remove it and let the agent write its state afresh: %s — k3sm hands ownership of a state file to %s, never of something standing in for one",
 			dir, strings.Join(notRegular, ", "), cfg.ServiceUser)

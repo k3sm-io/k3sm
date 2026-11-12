@@ -17,47 +17,158 @@ limitations under the License.
 package install
 
 import (
+	"errors"
+	"io/fs"
 	"strings"
 	"testing"
 )
 
-// TestRemediesQuoteTheirPaths pins that a remedy printing a removal command
-// pastes back as ONE argument after `--`: a path with a space would split into
-// two operands, and one with a leading dash would be read as an option.
+// TestShellQuoteGolden pins shellQuote's bytes as literals, so the remedy
+// tables below are checked against a fixed spelling rather than against the
+// function they test.
+func TestShellQuoteGolden(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"plain", `'plain'`},
+		{"it's", `'it'\''s'`},
+		{"a\nb", "'a\nb'"},
+		{"-rf", `'-rf'`},
+		{"", `''`},
+	}
+	for _, tc := range cases {
+		if got := shellQuote(tc.in); got != tc.want {
+			t.Errorf("shellQuote(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// remedyPath is the hostile path every remedy below is fed: a leading dash an
+// unquoted operand would read as an option, a space that would split it, and a
+// single quote. remedyQuoted is its shell-quoted spelling, written out by hand.
+const (
+	remedyPath   = "-k3sm data/it's here"
+	remedyQuoted = `'-k3sm data/it'\''s here'`
+)
+
+// TestRemediesQuoteTheirPaths pins that a remedy printing a command pastes
+// back as ONE argument, after `--` wherever the tool accepts it: a path with a
+// space would split into two operands, and one with a leading dash would be
+// read as an option. The expected commands are literals.
 func TestRemediesQuoteTheirPaths(t *testing.T) {
-	const path = "-k3sm data/it's here"
-	want := "-- " + shellQuote(path)
+	const q = remedyQuoted
 	cases := []struct {
 		name   string
 		remedy func(t *testing.T) string
+		want   []string
 	}{
 		{"stuck developer-mode marker", func(t *testing.T) string {
-			return stuckMarkerRemedy(path)
+			return stuckMarkerRemedy(remedyPath)
+		}, []string{
+			"`sudo chflags -- nouchg " + q + "`",
+			"`sudo rm -- " + q + "`",
+			"`ls -lO@e -- " + q + "`",
+			"`sudo chflags -- noschg " + q + "`",
+			"`sudo chmod -N " + q + "`",
 		}},
 		{"unreadable agent arguments record", func(t *testing.T) string {
 			f := newFakeSystem(t)
-			f.putFile(path, []byte("not json"))
-			_, err := recordedAgentArgs(f, Config{AgentArgsRecord: path})
+			f.putFile(remedyPath, []byte("not json"))
+			_, err := recordedAgentArgs(f, Config{AgentArgsRecord: remedyPath})
 			if err == nil {
 				t.Fatal("recordedAgentArgs read an unparseable record")
 			}
 			return err.Error()
-		}},
+		}, []string{"`sudo rm -- " + q + "`"}},
 		{"unreadable server arguments record", func(t *testing.T) string {
 			f := newFakeSystem(t)
-			f.putFile(path, []byte("not json"))
-			_, err := recordedServerArgs(f, Config{ServerArgsRecord: path})
+			f.putFile(remedyPath, []byte("not json"))
+			_, err := recordedServerArgs(f, Config{ServerArgsRecord: remedyPath})
 			if err == nil {
 				t.Fatal("recordedServerArgs read an unparseable record")
 			}
 			return err.Error()
-		}},
+		}, []string{"`sudo rm -- " + q + "`"}},
+		{"unreadable server plist with an unreadable record", func(t *testing.T) string {
+			f := newFakeSystem(t)
+			f.putFile(remedyPath, []byte("not json"))
+			return unreadablePlistError(f, Config{ServerArgsRecord: remedyPath}, "/Library/LaunchDaemons/io.k3sm.server.plist", errors.New("EIO")).Error()
+		}, []string{"`sudo rm -- " + q + "`"}},
+		{"join token file readable by others", func(t *testing.T) string {
+			f := newFakeSystem(t)
+			f.putFile(remedyPath, []byte("K10abc::node:secret"))
+			if f.modes == nil {
+				f.modes = map[string]fs.FileMode{}
+			}
+			f.modes[remedyPath] = 0o644
+			_, _, err := operatorJoinToken(f, Config{TokenFile: remedyPath})
+			if err == nil {
+				t.Fatal("operatorJoinToken accepted a group- and world-readable token file")
+			}
+			return err.Error()
+		}, []string{"`chmod -- 600 " + q + "`"}},
+		{"link directory owned by another account", func(t *testing.T) string {
+			err := linkDirVerdict(remedyPath, "", linkDirFacts{UID: 501, Mode: 0o755 | fs.ModeDir, IsDir: true}, 0)
+			if err == nil {
+				t.Fatal("linkDirVerdict accepted a directory owned by uid 501")
+			}
+			return err.Error()
+		}, []string{"sudo chown -- root:wheel " + q + " && sudo chmod -- 755 " + q}},
+		{"absent launcher directory", func(t *testing.T) string {
+			err := linkDirVerdict("/usr/local", remedyPath, linkDirFacts{Absent: true}, 0)
+			if err == nil {
+				t.Fatal("linkDirVerdict accepted an absent ancestor")
+			}
+			return err.Error()
+		}, []string{"sudo mkdir -p -- " + q + " && sudo chown -- root:wheel " + q + " && sudo chmod -- 755 " + q}},
+		{"first-install tree that could not be withdrawn", func(t *testing.T) string {
+			f := &failingSwap{fakeSystem: newFakeSystem(t)}
+			return withdrawFirstInstallTree(f, Config{InstallDir: remedyPath}, errors.New("cause")).Error()
+		}, []string{"`sudo rm -rf -- " + q + "`"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := tc.remedy(t)
-			if !strings.Contains(got, "sudo rm "+want) {
-				t.Errorf("remedy %q does not carry %q", got, "sudo rm "+want)
+			for _, w := range tc.want {
+				if !strings.Contains(got, w) {
+					t.Errorf("remedy %q does not carry %q", got, w)
+				}
+			}
+		})
+	}
+}
+
+// TestLegacyRefusalEscapesEntryNames pins that a file name read from the
+// service-user-writable agent work dir reaches the operator Go-quoted: an ESC
+// or newline byte in the name must not land on the terminal raw.
+func TestLegacyRefusalEscapesEntryNames(t *testing.T) {
+	cfg := agentCfg(t).withDefaults()
+	dir := cfg.agentWorkDir()
+	name := "x\x1b[2Jy\nz"
+	cases := []struct {
+		name string
+		seed func(f *fakeSystem)
+		want string
+	}{
+		{"unreadable unrecognised file", func(f *fakeSystem) {
+			f.putOwned(dir+"/"+name, 0, 0, 0o600, EntryRegular)
+		}, `"` + dir + `/x\x1b[2Jy\nz"`},
+		{"known name that is not a regular file", func(f *fakeSystem) {
+			f.putOwned(dir+"/"+agentMeshKeyName, 0, 0, 0o777, EntrySymlink)
+		}, `"` + dir + "/" + agentMeshKeyName + `" (`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeSystem(t)
+			f.putOwned(dir, legacyServiceUID, ServiceTreeGID, AgentTokenDirMode, EntryDir)
+			tc.seed(f)
+			err := adoptLegacyAgentFiles(f, cfg, legacyServiceUID)
+			if err == nil {
+				t.Fatal("adoptLegacyAgentFiles accepted the work dir")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q does not carry %q", err, tc.want)
+			}
+			if strings.ContainsAny(err.Error(), "\x1b\n\r") {
+				t.Errorf("error %q carries a raw control byte", err)
 			}
 		})
 	}
