@@ -168,6 +168,10 @@ type fakeSystem struct {
 	// path instead of reading it: a file that exists but cannot be read. The
 	// zero value reads everything.
 	readErrs map[string]error
+	// readErrReads[path], when set, makes readErrs[path] transient for
+	// ReadOwnedRegularFile: it answers that many reads and is then cleared, so
+	// the path reads normally again. See putTransientReadErr.
+	readErrReads map[string]int
 	// missingPaths are paths PathExists reports absent. The zero value reports
 	// EVERY path present, so an unconfigured fake describes a healthy install and
 	// only a test that cares about the netd socket has to say so.
@@ -712,6 +716,24 @@ func (f *fakeSystem) putSymlink(path string) { f.putKind(path, fakeSymlink) }
 // putIrregular makes ReadRegularFile refuse path as a non-regular file.
 func (f *fakeSystem) putIrregular(path string) { f.putKind(path, fakeIrregular) }
 
+// putTransientReadErr makes the next n ReadOwnedRegularFile reads of path fail
+// with err (a file that exists but momentarily cannot be read: EIO, EACCES);
+// the read after them answers the file normally. n < 1 makes it permanent,
+// the same as setting readErrs directly.
+func (f *fakeSystem) putTransientReadErr(path string, err error, n int) {
+	if f.readErrs == nil {
+		f.readErrs = map[string]error{}
+	}
+	f.readErrs[path] = err
+	if n < 1 {
+		return
+	}
+	if f.readErrReads == nil {
+		f.readErrReads = map[string]int{}
+	}
+	f.readErrReads[path] = n
+}
+
 func (f *fakeSystem) putKind(path string, k fakeFileKind) {
 	if f.kinds == nil {
 		f.kinds = map[string]fakeFileKind{}
@@ -775,6 +797,16 @@ func (f *fakeSystem) ReadRegularFileWithMode(path string) ([]byte, fs.FileMode, 
 func (f *fakeSystem) ReadOwnedRegularFile(path string, limit int64) ([]byte, OwnedEntry, error) {
 	f.calls = append(f.calls, "ReadOwnedRegularFile:"+path)
 	if err, ok := f.readErrs[path]; ok {
+		if n, counted := f.readErrReads[path]; counted {
+			// A transient failure: it answers this many reads, then the
+			// path reads normally again.
+			if n <= 1 {
+				delete(f.readErrs, path)
+				delete(f.readErrReads, path)
+			} else {
+				f.readErrReads[path] = n - 1
+			}
+		}
 		return nil, OwnedEntry{}, err
 	}
 	b, err := f.readRegularFileContent(path)
@@ -797,7 +829,7 @@ func (f *fakeSystem) ReadOwnedRegularFile(path string, limit int64) ([]byte, Own
 		e = OwnedEntry{Path: path, UID: 271, GID: 271, Mode: perm, Kind: EntryRegular}
 	}
 	if int64(len(b)) > limit {
-		return nil, e, fmt.Errorf("read %s: larger than %d bytes", path, limit)
+		return nil, e, fmt.Errorf("read %s: larger than %d bytes: %w", path, limit, ErrFileTooLarge)
 	}
 	return b, e, nil
 }

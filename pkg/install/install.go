@@ -944,7 +944,8 @@ type System interface {
 	ReadRegularFileWithMode(path string) ([]byte, fs.FileMode, error)
 	// ReadOwnedRegularFile is ReadRegularFile plus the owner, group and mode,
 	// all read off the SAME open descriptor as the content (O_NOFOLLOW and
-	// fstat), and it refuses a file larger than limit bytes. It exists for the
+	// fstat), and it refuses a file larger than limit bytes with an error
+	// wrapping ErrFileTooLarge. It exists for the
 	// one credential install reads AS ROOT from a service-user-writable
 	// directory and then trusts: the admin token an in-place update carries
 	// (carriedAdminToken), whose owner and write bits have to be judged on the
@@ -1767,6 +1768,13 @@ func stageTokenFile(sys System, uid uint32, token, dst, what string, mode, dirMo
 // been provisioned yet), while a non-regular file where a key belongs is
 // somebody having put it there, and the two lead to opposite actions.
 var ErrNotRegularFile = errors.New("not a regular file")
+
+// ErrFileTooLarge is what ReadOwnedRegularFile reports for a regular file over
+// its size limit, whether the fstat said so or the file grew past it during the
+// read. It is a sentinel so a caller can tell the size refusal apart from a
+// read that failed for any other reason (EIO, EACCES) after the file was
+// opened and judged regular.
+var ErrFileTooLarge = errors.New("larger than the read limit")
 
 // argsRecordPath is the arguments record THIS role reads and writes: the
 // server record on a control plane, the agent record on a worker. It is an

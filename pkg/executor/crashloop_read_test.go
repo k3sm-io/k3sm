@@ -87,7 +87,7 @@ func TestReadCrashRecordRefusesSymlinkAndBoundsSize(t *testing.T) {
 			setup: func(t *testing.T, dir string) string {
 				p := CrashLoopPath(dir)
 				// Valid JSON padded past the bound, so only the size can refuse it.
-				b := append([]byte(`{"crashes":[]}`), bytes.Repeat([]byte(" "), crashRecordMaxBytes)...)
+				b := append([]byte(`{"crashes":[]}`), bytes.Repeat([]byte(" "), CrashRecordMaxBytes)...)
 				if err := os.WriteFile(p, b, 0o600); err != nil {
 					t.Fatal(err)
 				}

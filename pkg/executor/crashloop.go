@@ -213,17 +213,19 @@ func ParseCrashRecord(b []byte) (CrashRecord, error) {
 	return r, nil
 }
 
-// crashRecordMaxBytes bounds how much of a record readCrashRecordFile reads.
+// CrashRecordMaxBytes bounds how much of a crash-loop record any reader reads:
+// the daemon's own readCrashRecordFile and the installer's root-run read of the
+// same file (pkg/install), which uses this constant so the two cannot drift.
 // The daemon writes at most a window's worth of entries, each carrying a
 // Detail capped at exitLogTailBytes (4 KiB) before JSON escaping, which can at
 // worst sextuple it (\u00XX); even a few dozen such entries, indented, stay
 // well under 1 MiB. Anything larger is not a record this daemon wrote, and the
 // bound keeps a file planted in the service-user-writable work dir from making
 // its reader allocate without limit.
-const crashRecordMaxBytes = 1 << 20
+const CrashRecordMaxBytes = 1 << 20
 
 // errCrashRecordRefused marks a record readCrashRecordFile would not read: a
-// symlink, a non-regular file, or one over crashRecordMaxBytes.
+// symlink, a non-regular file, or one over CrashRecordMaxBytes.
 var errCrashRecordRefused = errors.New("crash-loop record refused")
 
 // readCrashRecordFile reads the record's bytes the way dataroot.ReadMarker
@@ -250,24 +252,24 @@ func readCrashRecordFile(path string) ([]byte, error) {
 	if st.Mode&unix.S_IFMT != unix.S_IFREG {
 		return nil, fmt.Errorf("%s is not a regular file (mode %#o): %w", path, st.Mode&unix.S_IFMT, errCrashRecordRefused)
 	}
-	if st.Size > crashRecordMaxBytes {
-		return nil, fmt.Errorf("%s is %d bytes, over the %d-byte bound: %w", path, st.Size, crashRecordMaxBytes, errCrashRecordRefused)
+	if st.Size > CrashRecordMaxBytes {
+		return nil, fmt.Errorf("%s is %d bytes, over the %d-byte bound: %w", path, st.Size, CrashRecordMaxBytes, errCrashRecordRefused)
 	}
 	// Read one byte past the bound, so a file that grew after the fstat is
 	// refused rather than silently truncated into a parse error.
-	b, err := io.ReadAll(io.LimitReader(f, crashRecordMaxBytes+1))
+	b, err := io.ReadAll(io.LimitReader(f, CrashRecordMaxBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
-	if len(b) > crashRecordMaxBytes {
-		return nil, fmt.Errorf("%s grew past the %d-byte bound: %w", path, crashRecordMaxBytes, errCrashRecordRefused)
+	if len(b) > CrashRecordMaxBytes {
+		return nil, fmt.Errorf("%s grew past the %d-byte bound: %w", path, CrashRecordMaxBytes, errCrashRecordRefused)
 	}
 	return b, nil
 }
 
 // ReadCrashRecord loads the record at path. An absent file is an empty record,
 // not an error; an unreadable, refused (a symlink, a non-regular file, or one
-// over crashRecordMaxBytes) or malformed one is returned as an error so a
+// over CrashRecordMaxBytes) or malformed one is returned as an error so a
 // caller can decide (the daemon treats such a record as empty and logs it,
 // because refusing to boot over a corrupt bookkeeping file would be a second
 // way to lose the control plane).
