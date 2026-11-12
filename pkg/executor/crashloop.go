@@ -27,6 +27,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"k3sm.io/k3sm/internal/atomicfile"
 )
 
 // The crash-loop circuit breaker.
@@ -289,23 +291,18 @@ func ReadCrashRecord(path string) (CrashRecord, error) {
 	return r, nil
 }
 
-// WriteCrashRecord persists r at path atomically (temp file + rename), mode
+// WriteCrashRecord persists r at path atomically with atomicfile.Replace, mode
 // 0600: the details are redacted, but the file still describes a failure an
-// operator has not read yet.
+// operator has not read yet. The record's directory is writable by the service
+// user, so the temp is a randomly named, exclusively created file in that
+// directory (a symlink planted at any fixed temp name is never followed), and
+// the rename replaces a symlink at path rather than writing through it.
 func WriteCrashRecord(path string, r CrashRecord) error {
 	b, err := json.MarshalIndent(r, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	return atomicfile.Replace(path, b, 0o600)
 }
 
 // ClearCrashRecord removes the record. An absent file is success: the operator's

@@ -278,3 +278,81 @@ func TestComponentExitedUnspawnedIsNotDead(t *testing.T) {
 		t.Fatal("an unspawned component reported exited")
 	}
 }
+
+// WriteCrashRecord's directory is writable by the service user, so a symlink
+// planted at the old fixed temp name (<record>.tmp) or at the record itself
+// must never be followed: its target keeps its bytes and the record becomes a
+// fresh regular 0600 file.
+func TestWriteCrashRecordIgnoresPlantedTempSymlink(t *testing.T) {
+	const sentinelBytes = "sentinel: must not change\n"
+	rec := CrashRecord{Crashes: []Crash{{At: time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)}}}
+
+	setup := func(t *testing.T) (dir, path, sentinel string) {
+		t.Helper()
+		outside := t.TempDir()
+		sentinel = filepath.Join(outside, "sentinel")
+		if err := os.WriteFile(sentinel, []byte(sentinelBytes), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		dir = t.TempDir()
+		return dir, CrashLoopPath(dir), sentinel
+	}
+	check := func(t *testing.T, dir, path, sentinel string, allowed map[string]bool) {
+		t.Helper()
+		if got, err := os.ReadFile(sentinel); err != nil || string(got) != sentinelBytes {
+			t.Fatalf("sentinel = %q, %v; want it unchanged", got, err)
+		}
+		fi, err := os.Lstat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !fi.Mode().IsRegular() {
+			t.Fatalf("record mode = %v; want a regular file", fi.Mode())
+		}
+		if perm := fi.Mode().Perm(); perm != 0o600 {
+			t.Fatalf("record perm = %o; want 600", perm)
+		}
+		got, err := ReadCrashRecord(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got.Crashes) != 1 || !got.Crashes[0].At.Equal(rec.Crashes[0].At) {
+			t.Fatalf("record = %+v; want %+v", got, rec)
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range entries {
+			if e.Name() != filepath.Base(path) && !allowed[e.Name()] {
+				t.Fatalf("leftover entry %q in the record directory", e.Name())
+			}
+		}
+	}
+
+	t.Run("symlink at temp name", func(t *testing.T) {
+		dir, path, sentinel := setup(t)
+		link := path + ".tmp"
+		if err := os.Symlink(sentinel, link); err != nil {
+			t.Fatal(err)
+		}
+		if err := WriteCrashRecord(path, rec); err != nil {
+			t.Fatal(err)
+		}
+		check(t, dir, path, sentinel, map[string]bool{filepath.Base(link): true})
+		if fi, err := os.Lstat(link); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+			t.Fatalf("planted link = %v, %v; want it left as a symlink", fi, err)
+		}
+	})
+
+	t.Run("symlink at record path", func(t *testing.T) {
+		dir, path, sentinel := setup(t)
+		if err := os.Symlink(sentinel, path); err != nil {
+			t.Fatal(err)
+		}
+		if err := WriteCrashRecord(path, rec); err != nil {
+			t.Fatal(err)
+		}
+		check(t, dir, path, sentinel, nil)
+	})
+}
