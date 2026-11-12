@@ -206,14 +206,17 @@ func newStatusCollector() status.Collector {
 	kube, source, kubeErr := newStatusKube(statusKubeInputsFor(role, paths))
 
 	return status.Collector{
-		Launchd:    launchctlProbe{},
-		FS:         osStatusFS{},
-		Kube:       kube,
-		KubeErr:    kubeErr,
-		KubeSource: source,
-		Procs:      procTable{},
-		Runtimed:   runtimedFor(euid, serviceUID, runtimed.DefaultSocketPath),
-		DataRoot:   dataRootFS{},
+		Launchd: launchctlProbe{},
+		FS:      osStatusFS{},
+		// The crash record goes through the daemon's own bounded no-follow
+		// reader, never the FS seam (the work dir is service-user writable).
+		ReadCrashRecord: executor.ReadCrashRecord,
+		Kube:            kube,
+		KubeErr:         kubeErr,
+		KubeSource:      source,
+		Procs:           procTable{},
+		Runtimed:        runtimedFor(euid, serviceUID, runtimed.DefaultSocketPath),
+		DataRoot:        dataRootFS{},
 		// The diskutil read surface, for the one figure statfs cannot answer:
 		// how much a quota-less data volume is using. `diskutil apfs list` needs
 		// no privilege, so this is wired for every caller, not just root.
@@ -437,11 +440,14 @@ func newDaemonsCollector() status.Collector {
 	euid := os.Geteuid()
 	serviceUID := lookupServiceUID()
 	return status.Collector{
-		Launchd:    launchctlProbe{},
-		FS:         osStatusFS{},
-		Procs:      procTable{},
-		DataRoot:   dataRootFS{},
-		StopMarker: statusStopMarker,
+		Launchd: launchctlProbe{},
+		FS:      osStatusFS{},
+		// The crash record goes through the daemon's own bounded no-follow
+		// reader, never the FS seam (the work dir is service-user writable).
+		ReadCrashRecord: executor.ReadCrashRecord,
+		Procs:           procTable{},
+		DataRoot:        dataRootFS{},
+		StopMarker:      statusStopMarker,
 		// The LAN access record is world-readable; the daemon's applied
 		// report is root-only, so the probe leaves it out.
 		Network:    statusNetwork,
