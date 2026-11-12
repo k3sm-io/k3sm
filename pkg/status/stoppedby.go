@@ -53,7 +53,7 @@ func stoppedByLine(r Report) string {
 	if sb == nil {
 		return ""
 	}
-	line := fmt.Sprintf("%s by %s", sb.Phase, stripControls(sb.Actor))
+	line := fmt.Sprintf("%s by %s", stripControls(sb.Phase), stripControls(sb.Actor))
 	if sb.Reason != "" {
 		line += ": " + stripControls(sb.Reason)
 	}

@@ -353,11 +353,12 @@ func TestRowDetailStripsControlCharacters(t *testing.T) {
 	}
 }
 
-// TestStripControlsDropsBidiAndSeparators: the Unicode bidi embedding,
-// override and isolate controls and the line and paragraph separators are
-// removed like the C0/C1 controls, so record text cannot reorder or break the
-// line an operator reads. The code points just outside each range, and other
-// printable Unicode, are kept.
+// TestStripControlsDropsBidiAndSeparators: every control character, every
+// rune in the Unicode format category Cf (the bidi controls and marks, the
+// zero-width characters, the soft hyphen, the interlinear annotation and tag
+// characters) and the line and paragraph separators are removed, so record
+// text cannot reorder, hide or break the line an operator reads. The code
+// points just outside each range, U+FFFD and other printable Unicode are kept.
 func TestStripControlsDropsBidiAndSeparators(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
@@ -380,11 +381,23 @@ func TestStripControlsDropsBidiAndSeparators(t *testing.T) {
 		{"trojan-source reorder", "rm \u202e/ fr-\u2066 x\u2069\u202c", "rm / fr- x"},
 		{"hyphenation point below the separators is kept", "a\u2027b", "a\u2027b"},
 		{"narrow no-break space is kept", "a\u202fb", "a\u202fb"},
-		{"word joiner is kept", "a\u2060b", "a\u2060b"},
-		{"function application is kept", "a\u2061b", "a\u2061b"},
-		{"inhibit symmetric swapping is kept", "a\u206ab", "a\u206ab"},
+		// Status values are identifiers and messages, so the joiner
+		// characters are removed with the rest of the format category.
+		{"zero width non-joiner", "a\u200cb", "ab"},
+		{"zero width joiner", "a\u200db", "ab"},
+		{"zero width space", "a\u200bb", "ab"},
+		{"word joiner", "a\u2060b", "ab"},
+		{"function application", "a\u2061b", "ab"},
+		{"inhibit symmetric swapping", "a\u206ab", "ab"},
+		{"byte order mark", "a\ufeffb", "ab"},
+		{"soft hyphen", "a\u00adb", "ab"},
+		{"interlinear annotation anchor", "a\ufff9b", "ab"},
+		{"language tag", "a\U000E0001b", "ab"},
+		{"tag latin capital letter A", "a\U000E0041b", "ab"},
+		{"cancel tag", "a\U000E007Fb", "ab"},
 		{"unassigned U+2065 below the isolates is kept", "a\u2065b", "a\u2065b"},
-		{"zero width non-joiner below the marks is kept", "a\u200cb", "a\u200cb"},
+		{"replacement character is kept", "a\ufffdb", "a\ufffdb"},
+		{"ordinary non-ASCII text is kept", "café Ελληνικά العربية", "café Ελληνικά العربية"},
 		{"en space is kept", "a\u2002b", "a\u2002b"},
 		{"C0 and C1 still go", "a\x1b\u009bb\x7f", "ab"},
 		{"printable Unicode is kept", "é世→", "é世→"},

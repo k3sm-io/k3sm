@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strings"
 	"text/tabwriter"
+	"unicode"
 
 	"k3sm.io/k3sm/pkg/dataroot"
 )
@@ -372,25 +373,22 @@ func sortedKeys(m map[string]string) []string {
 	return keys
 }
 
-// stripControls removes C0 and C1 control characters and DEL from text that
-// came from the cluster (apiserver errors, node names), so a hostile apiserver
-// or proxy cannot put terminal escape sequences on the operator's TTY. It also
-// removes the Unicode bidi embedding, override and isolate controls (U+202A to
-// U+202E, U+2066 to U+2069) and the bidi marks (U+200E, U+200F, U+061C), which
-// reorder what the operator sees against what is copied, and the line and paragraph separators U+2028 and U+2029, which
-// some terminals break a line on. Other printable Unicode is kept. Only the
-// human renderer calls it; the JSON output carries the value as data and its
-// encoder already escapes controls.
+// stripControls removes characters that can change what the operator sees
+// from text that came from the cluster or a file on disk (apiserver errors,
+// node names, records), so a hostile apiserver, proxy or file cannot put
+// terminal escape sequences on the operator's TTY, reorder the line against
+// what is copied, or hide text. It drops every rune for which
+// unicode.IsControl is true (C0, DEL, C1), every rune in the Unicode format
+// category Cf (the bidi embedding, override and isolate controls and the bidi
+// marks, the zero-width characters, the soft hyphen, the interlinear
+// annotation characters and the tag characters), and the line and paragraph
+// separators U+2028 and U+2029 (categories Zl and Zp), which some terminals
+// break a line on. Every other rune is kept, including U+FFFD, which is what
+// an invalid byte becomes. Only the human renderer calls it; the JSON output
+// carries the value as data and its encoder already escapes controls.
 func stripControls(s string) string {
 	return strings.Map(func(r rune) rune {
-		switch {
-		case r < 0x20, r >= 0x7f && r <= 0x9f:
-			return -1
-		case r >= 0x202a && r <= 0x202e, r >= 0x2066 && r <= 0x2069:
-			return -1
-		case r == 0x200e, r == 0x200f, r == 0x061c:
-			return -1
-		case r == 0x2028, r == 0x2029:
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || r == 0x2028 || r == 0x2029 {
 			return -1
 		}
 		return r
