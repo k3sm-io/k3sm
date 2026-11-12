@@ -776,11 +776,14 @@ const bootstrapPort = 9345
 // the defect the first real --mesh-ip boot exposed and which a 127.0.0.1 mesh IP
 // had masked, loopback being reachable from the same host either way.
 //
-// LAN exposure IS this endpoint's threat model, not a regression of it: every
-// route it serves is authenticated by the K10 cluster token (CA-hash-pinned by the
-// client), the server-class secret, or a joined node's own certificate (the mesh
-// endpoint refresh, deregistration and netserve certificate routes), and the node-password binding is
-// first-write-wins per node name. It has no ambient-authority route.
+// LAN exposure IS this endpoint's threat model, not a regression of it. One
+// route is unauthenticated by design: the CA certificate route serves the public
+// cluster CA, which a joiner pins by the hash in its token before trusting it.
+// Every other route takes a credential: the cluster join token (the worker join
+// route), a joined node's own certificate (the mesh endpoint refresh,
+// deregistration and netserve certificate routes), or the server-class secret
+// (the server bootstrap route and the etcd member routes). The node-password
+// binding is first-write-wins per node name.
 //
 // With no mesh (single node) nothing ever opens this listener, but the address is
 // still derived closed — loopback — so a future caller cannot acquire LAN exposure

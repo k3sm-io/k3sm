@@ -316,7 +316,7 @@ Every listener a node opens, and the addresses it binds:
 | Ingress host (server) | `80`, `443` (`--ingress-http-port`, `--ingress-https-port`) | follows LAN access: every interface when on, the node's own address when off |
 | wireguard mesh | `51820/udp` | every interface; it answers only peers holding a cluster key |
 | apiserver (server) | `6444` (`--api-port`) | `127.0.0.1` on a single server; the mesh address only on a server with `--mesh-ip` |
-| worker join (server with `--mesh-ip`) | `9345` | every interface, because a joining worker has no mesh yet; it takes the cluster join token (a worker joining), the node's own certificate (a joined worker) or the server secret (a server joining) |
+| worker join (server with `--mesh-ip`) | `9345` | every interface, because a joining worker has no mesh yet; the CA certificate route takes no credential, because a joiner pins the CA by the hash in its token before it trusts it, and every other route takes the cluster join token (a worker joining), the node's own certificate (a joined worker) or the server secret (a server joining or adding an etcd member) |
 | embedded etcd peer (HA servers) | `--etcd-peer-port` | the `--etcd-peer-ip` address you name; peers need a peer certificate |
 | image registry (on by default; `--registry-port`, 0 turns it off) | 6450, or the chosen port | `127.0.0.1`, plus an HTTPS relay on the mesh address and the `vm` NAT gateway |
 | cluster DNS and ClusterIP Services | Service ports | their virtual IPs, aliased on `lo0` |
@@ -396,9 +396,11 @@ nothing on your Wi-Fi or Ethernet does. With it on, they bind every interface.
   the Mac's `en` interfaces, so a node address on a Thunderbolt bridge is not served below 1024.
 - The switch does not cover the apiserver (loopback, or the mesh address), the wireguard mesh port
   (it answers only cluster peers) or the worker join port. A new worker joins over the LAN, so the
-  join port stays reachable with LAN access off. The port accepts three credentials: the cluster
-  join token from a node joining, the node's own certificate from a node that has joined, and the
-  server secret from a server joining an HA control plane. A joined node keeps using the port for
+  join port stays reachable with LAN access off. The CA certificate route (the public cluster CA)
+  takes no credential by design, because a joiner pins the CA by the hash in its token before it
+  trusts it. Every other route takes one of three credentials: the cluster join token from a node
+  joining, the node's own certificate from a node that has joined, and the server secret from a
+  server joining an HA control plane or adding an etcd member. A joined node keeps using the port for
   its whole life, to refresh its mesh endpoint, to deregister and to fetch the certificate for its
   serving endpoint.
 - The setting is kept in `/Library/Preferences/io.k3sm.network.json`, beside the other install
