@@ -624,12 +624,14 @@ only after eight such attempts in a row. The server counts the Mac as heavily lo
 the one-minute and the five-minute load averages are high, and it writes the load it read into the
 crash-loop record.
 
-`k3sm status` shows the text it reads from the crash-loop record as data: control characters,
-invisible format characters such as bidirectional text controls and zero-width characters, and the
-line and paragraph separators are stripped from what it prints. JSON output is unchanged. A record that is a symlink, is not a
-regular file or is over 1 MiB is not read, and status reports it as unreadable. `sudo k3sm install`
-fails on such a record, and the error names its path. Remove the record and run the install again;
-re-running is safe.
+`k3sm status` shows text from three sources as plain text: the crash-loop record, the stop
+marker and the applied LAN report. It strips control characters, invisible format characters such
+as bidirectional text controls and zero-width characters, and the line and paragraph separators.
+JSON output is unchanged. A record that is a symlink, is not a regular file or is over 1 MiB is not
+read, and status reports it as unreadable. `sudo k3sm install` fails on such a record, and the
+error names its path. Remove the record with `sudo k3sm server --clear-crashloop`, which deletes
+`/var/lib/k3sm/server/crashloop.json` itself, then run the install again. Re-running is safe
+because the new binary is already running and install boots each daemon out and in again.
 
 Each component's previous log is kept beside the current one as `<component>.log.1`. While failures
 are on record, `<component>.log.1` holds the log of the first failed start and is not replaced, and
@@ -650,12 +652,11 @@ before a restore.
    sudo tail -n 50 /var/lib/k3sm/server/crashloop.json
    ```
 
-2. Fix the fault it names. A fault that cannot heal on retry (a bad flag, a missing file) shows
-   the command that repairs it in the row's remedy, but only when k3sm itself wrote that fix into
-   the record; any other text there is ignored and the row keeps the generic remedy that points at
-   the record. A breaker tripped by repeated loss
-   of the leader lease points at etcd quorum or an overloaded apiserver; check the etcd and
-   apiserver rows on every server.
+2. Fix the fault it names. A fault that cannot heal on retry (a bad flag, a missing file) can
+   show a repair command. If the row's remedy shows a command, run it. The row shows a command
+   only when k3sm wrote it into the record. Otherwise it shows a general remedy that points at the
+   record. A breaker tripped by repeated loss of the leader lease points at etcd quorum or an
+   overloaded apiserver; check the etcd and apiserver rows on every server.
 3. Clear the record. The parked daemon notices and restarts the control plane by itself:
 
    ```sh
