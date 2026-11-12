@@ -57,11 +57,13 @@ check G2 "AAD is length-prefixed and binds format, kind, name, version, generati
 check G3 "every seal draws a fresh nonce (library)" TestSealNonceIsFresh
 pend G3 "Rewrap changes every nonce (PR 3: Rewrap)"
 check G4 "Delete then Put does not reopen the old v1" TestDeleteThenPutRefusesReplayedRecord
-pend G5 "a copied-back current is refused against the floor (PR 2)"
-pend G6 "the floor is root-owned and checked on the descriptor (PR 2)"
-pend G7 "the floor is raised by every root verb (PR 2)"
-pend G8 "Rotate flips the pointer last under fault injection (PR 2)"
-pend G9 "a Rotate retry discards the orphan (PR 2)"
+check G5 "a copied-back current is refused against the floor, with its own message; nothing recorded for the name accepts it" \
+	TestFloorRefusesCopiedBackPointer TestFloorCheck
+check G6 "the floor and the data root are root-owned and not shared, judged on the descriptor" TestFloorTrust
+check G7 "the floor is raised by every mutating verb and the start of every root verb; one behind is accepted" TestFloorRaised
+check G8 "Rotate flips the pointer last; a crash before the flip leaves the old version current" \
+	TestRotateCrashAtEveryStep TestRotate
+check G9 "a Rotate retry discards the orphan and seals the value it was given" TestRotateRetryDiscardsOrphan TestParseVersionName
 check G10 "the master is minted only by the first put, never over entries" TestMasterMint
 check G11 "the master is judged on the open descriptor" TestMasterTrust
 pend G12 "Rewrap resumes after a crash at every step (PR 3)"
