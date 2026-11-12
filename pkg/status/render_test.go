@@ -352,3 +352,79 @@ func TestRowDetailStripsControlCharacters(t *testing.T) {
 		t.Errorf("stripped text still breaks the row across lines: %q", out)
 	}
 }
+
+// TestStripControlsDropsBidiAndSeparators: the Unicode bidi embedding,
+// override and isolate controls and the line and paragraph separators are
+// removed like the C0/C1 controls, so record text cannot reorder or break the
+// line an operator reads. The code points just outside each range, and other
+// printable Unicode, are kept.
+func TestStripControlsDropsBidiAndSeparators(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, in, want string
+	}{
+		{"LRE", "a\u202ab", "ab"},
+		{"RLE", "a\u202bb", "ab"},
+		{"PDF", "a\u202cb", "ab"},
+		{"LRO", "a\u202db", "ab"},
+		{"RLO", "a\u202eb", "ab"},
+		{"LRI", "a\u2066b", "ab"},
+		{"RLI", "a\u2067b", "ab"},
+		{"FSI", "a\u2068b", "ab"},
+		{"PDI", "a\u2069b", "ab"},
+		{"line separator", "a\u2028b", "ab"},
+		{"paragraph separator", "a\u2029b", "ab"},
+		{"trojan-source reorder", "rm \u202e/ fr-\u2066 x\u2069\u202c", "rm / fr- x"},
+		{"hyphenation point below the separators is kept", "a\u2027b", "a\u2027b"},
+		{"narrow no-break space is kept", "a\u202fb", "a\u202fb"},
+		{"word joiner is kept", "a\u2060b", "a\u2060b"},
+		{"function application is kept", "a\u2061b", "a\u2061b"},
+		{"inhibit symmetric swapping is kept", "a\u206ab", "a\u206ab"},
+		{"en space is kept", "a\u2002b", "a\u2002b"},
+		{"C0 and C1 still go", "a\x1b\u009bb\x7f", "ab"},
+		{"printable Unicode is kept", "é世→", "é世→"},
+	} {
+		if got := stripControls(tc.in); got != tc.want {
+			t.Errorf("%s: stripControls(%q) = %q, want %q", tc.name, tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestNextStepsAreStripped: the Next block prints step text, and a step is a
+// row's Remedy, so it carries no control byte, bidi control or separator on
+// the overview or a detail view, whether the step came from Report.Next
+// directly or from the aggregate's remedy list.
+func TestNextStepsAreStripped(t *testing.T) {
+	t.Parallel()
+	const hostile = "first\x1b[2J \u202eevil\u202c step\u2028second\x07 line\u2029"
+	const want = "first[2J evil stepsecond line"
+	rows := []Row{{Name: RowServer, State: StateCrashLoop, Severity: SeverityFail, Detail: "d",
+		Remedy: hostile + "\nthen\u2066 this\x1b]0;owned\x07", Wide: map[string]string{}}}
+	_, _, aggregated := Aggregate(rows, true, dataroot.RoleServer)
+	for name, next := range map[string][]string{
+		"report next":    {hostile, "two\x1b[31m\u2067 steps\u2029"},
+		"aggregate next": aggregated,
+	} {
+		r := Report{Role: dataroot.RoleServer, Rows: rows, Next: next}
+		for view, out := range map[string]string{
+			"overview": Render(r, Style{}),
+			"daemons":  RenderDaemons(r, Style{}),
+			"cluster":  RenderCluster(r, Style{}),
+			"rows":     RenderRows(r, Style{}),
+		} {
+			for _, c := range out {
+				if c != '\n' && (c < 0x20 || (c >= 0x7f && c <= 0x9f) ||
+					(c >= 0x202a && c <= 0x202e) || (c >= 0x2066 && c <= 0x2069) || c == 0x2028 || c == 0x2029) {
+					t.Errorf("%s/%s: %U reaches the human output:\n%q", name, view, c, out)
+					break
+				}
+			}
+			if !strings.Contains(out, "Next: "+want+"\n") {
+				t.Errorf("%s/%s: output lacks the stripped first step:\n%q", name, view, out)
+			}
+		}
+	}
+	if len(aggregated) != 2 {
+		t.Fatalf("Aggregate produced %d steps, want 2: %q", len(aggregated), aggregated)
+	}
+}

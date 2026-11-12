@@ -295,9 +295,11 @@ func renderNext(next []string) string {
 		return ""
 	}
 	var b strings.Builder
-	b.WriteString("\nNext: " + next[0] + "\n")
+	// A step is a row's Remedy, which can carry record text, so it is stripped
+	// like every other value that reaches the screen.
+	b.WriteString("\nNext: " + stripControls(next[0]) + "\n")
 	for _, step := range next[1:] {
-		b.WriteString(logIndent + step + "\n")
+		b.WriteString(logIndent + stripControls(step) + "\n")
 	}
 	return b.String()
 }
@@ -369,12 +371,21 @@ func sortedKeys(m map[string]string) []string {
 
 // stripControls removes C0 and C1 control characters and DEL from text that
 // came from the cluster (apiserver errors, node names), so a hostile apiserver
-// or proxy cannot put terminal escape sequences on the operator's TTY. Printable
-// Unicode is kept. Only the human renderer calls it; the JSON output carries
-// the value as data and its encoder already escapes controls.
+// or proxy cannot put terminal escape sequences on the operator's TTY. It also
+// removes the Unicode bidi embedding, override and isolate controls (U+202A to
+// U+202E, U+2066 to U+2069), which reorder what the operator sees against what
+// is copied, and the line and paragraph separators U+2028 and U+2029, which
+// some terminals break a line on. Other printable Unicode is kept. Only the
+// human renderer calls it; the JSON output carries the value as data and its
+// encoder already escapes controls.
 func stripControls(s string) string {
 	return strings.Map(func(r rune) rune {
-		if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
+		switch {
+		case r < 0x20, r >= 0x7f && r <= 0x9f:
+			return -1
+		case r >= 0x202a && r <= 0x202e, r >= 0x2066 && r <= 0x2069:
+			return -1
+		case r == 0x2028, r == 0x2029:
 			return -1
 		}
 		return r
