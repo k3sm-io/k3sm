@@ -162,7 +162,7 @@ func TestInstallStagesTheRootAndPublishesItOnce(t *testing.T) {
 		// verifyDaemons' last read is the server's crash-loop record: a daemon
 		// parked by its breaker reports a healthy pid while serving nothing, so
 		// that read is the end of the verification, not the pid reads.
-		verify := idx(calls, "ReadFile:/var/lib/k3sm/server/crashloop.json")
+		verify := idx(calls, "ReadOwnedRegularFile:/var/lib/k3sm/server/crashloop.json")
 		if verify < 0 || reap < verify {
 			t.Errorf("the reap (%d) did not wait for the verification (%d); calls =\n%s", reap, verify, strings.Join(calls, "\n"))
 		}

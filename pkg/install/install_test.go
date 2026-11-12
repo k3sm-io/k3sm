@@ -2186,7 +2186,7 @@ func TestInstallOrchestration(t *testing.T) {
 		"PathExists:/var/lib/k3sm/run/netd.sock",
 		// ...and the server's crash-loop record read, because a daemon parked by
 		// its breaker reports a healthy pid while serving nothing.
-		"ReadFile:/var/lib/k3sm/server/crashloop.json",
+		"ReadOwnedRegularFile:/var/lib/k3sm/server/crashloop.json",
 		// No reap: this is a first install, so the publish was a plain rename
 		// and there is no previous tree at the staging path. A reinstall has
 		// one, and removes it HERE and not a step earlier
