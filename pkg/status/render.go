@@ -21,8 +21,8 @@ import (
 	"sort"
 	"strings"
 	"text/tabwriter"
-	"unicode"
 
+	"k3sm.io/k3sm/internal/termsafe"
 	"k3sm.io/k3sm/pkg/dataroot"
 )
 
@@ -373,24 +373,6 @@ func sortedKeys(m map[string]string) []string {
 	return keys
 }
 
-// stripControls removes characters that can change what the operator sees
-// from text that came from the cluster or a file on disk (apiserver errors,
-// node names, records), so a hostile apiserver, proxy or file cannot put
-// terminal escape sequences on the operator's TTY, reorder the line against
-// what is copied, or hide text. It drops every rune for which
-// unicode.IsControl is true (C0, DEL, C1), every rune in the Unicode format
-// category Cf (the bidi embedding, override and isolate controls and the bidi
-// marks, the zero-width characters, the soft hyphen, the interlinear
-// annotation characters and the tag characters), and the line and paragraph
-// separators U+2028 and U+2029 (categories Zl and Zp), which some terminals
-// break a line on. Every other rune is kept, including U+FFFD, which is what
-// an invalid byte becomes. Only the human renderer calls it; the JSON output
-// carries the value as data and its encoder already escapes controls.
-func stripControls(s string) string {
-	return strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || r == 0x2028 || r == 0x2029 {
-			return -1
-		}
-		return r
-	}, s)
-}
+// stripControls is termsafe.Strip, the one rule this screen and the install
+// readers share for rendering outside text as data.
+func stripControls(s string) string { return termsafe.Strip(s) }

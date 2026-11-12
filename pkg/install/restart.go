@@ -27,6 +27,7 @@ import (
 	"strings"
 	"time"
 
+	"k3sm.io/k3sm/internal/termsafe"
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/install/order"
@@ -705,7 +706,7 @@ func verifyServerNotParked(sys System, cfg Config, m []artifact, since time.Time
 	if rec.Tripped() {
 		last, _ := rec.Last()
 		return fmt.Errorf("%w: %s, so it is resident and serving nothing (tripped at %s; %s: %s; record: %s). Clear it and reinstall: sudo k3sm server --clear-crashloop",
-			ErrServerParked, parkedSummary(last), rec.TrippedAt.Format(time.RFC3339), last.Origin, last.Component, path)
+			ErrServerParked, parkedSummary(last), rec.TrippedAt.Format(time.RFC3339), termsafe.Strip(last.Origin), termsafe.Component(last.Component), path)
 	}
 	// The daemon and this process read the same machine's clock, so comparing
 	// the record's timestamps with the bootstrap fence compares a clock with
@@ -715,7 +716,7 @@ func verifyServerNotParked(sys System, cfg Config, m []artifact, since time.Time
 		return nil
 	}
 	return fmt.Errorf("%w: the control plane failed to come up %d times since this install began (last: %s at %s); launchd keeps respawning it into the same fault and the breaker parks the daemon after %d. The reason is the last lines of %s, with the redacted tails in %s; fix it and reinstall (clear a parked daemon first: sudo k3sm server --clear-crashloop)",
-		ErrServerNotComingUp, fresh, last.Component, last.At.Format(time.RFC3339), executor.CrashLoopThreshold, ServerLogPath(), path)
+		ErrServerNotComingUp, fresh, termsafe.Component(last.Component), last.At.Format(time.RFC3339), executor.CrashLoopThreshold, ServerLogPath(), path)
 }
 
 // freshBringUpFailures counts the bring-up failures dated at or after since, and
@@ -737,16 +738,19 @@ func freshBringUpFailures(rec executor.CrashRecord, since time.Time) (int, execu
 // parkedSummary says which of the three failures the breaker counted last, in the
 // words an operator needs to start looking: a control plane that came up and
 // then died is a different search through the log than one that never came up.
+// The component is read through termsafe.Component, as on `k3sm status`: the
+// record is writable by the service uid and this runs as root.
 func parkedSummary(last executor.Crash) string {
+	component := termsafe.Component(last.Component)
 	switch last.Origin {
 	case executor.CrashOriginBringUp:
-		return "the control plane never came up (last: " + last.Component + ")"
+		return "the control plane never came up (last: " + component + ")"
 	case executor.CrashOriginBringUpSlow:
-		return "the control plane kept timing out on an overloaded host (last: " + last.Component + ")"
+		return "the control plane kept timing out on an overloaded host (last: " + component + ")"
 	case executor.CrashOriginLeaderLost:
-		return "the control plane kept losing its leader lease (last: " + last.Component + ")"
+		return "the control plane kept losing its leader lease (last: " + component + ")"
 	}
-	return "the control plane kept crashing (last: " + last.Component + ")"
+	return "the control plane kept crashing (last: " + component + ")"
 }
 
 // verifyAgentJoined is the extra assertion an agent install needs, and the
@@ -1123,12 +1127,15 @@ func lastCrash(rec executor.CrashRecord) executor.Crash {
 
 // agentFailureDetail is the recorded, already-redacted reason the agent could
 // not start, or a stand-in when the entry carried none (a record left by a
-// build that did not write details).
+// build that did not write details). The record is writable by the service uid
+// and this runs as root, so the detail goes through termsafe.Strip, as on
+// `k3sm status`: an ESC, CR or newline in it is data, not terminal or log input.
 func agentFailureDetail(c executor.Crash) string {
-	if strings.TrimSpace(c.Detail) == "" {
+	d := termsafe.Strip(c.Detail)
+	if strings.TrimSpace(d) == "" {
 		return "no detail recorded"
 	}
-	return c.Detail
+	return d
 }
 
 // agentCredentialProvesJoin reports whether the stored node credential is proof

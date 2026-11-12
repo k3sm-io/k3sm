@@ -22,6 +22,7 @@ import (
 	"os"
 	"time"
 
+	"k3sm.io/k3sm/internal/termsafe"
 	"k3sm.io/k3sm/pkg/executor"
 )
 
@@ -216,16 +217,9 @@ func leaderLostNote(rec executor.CrashRecord, now time.Time) string {
 		n, executor.CrashLoopWindow, shownComponent(lost), lost.At.Format(time.RFC3339))
 }
 
-// shownComponent is c's component as a human screen may show it. The record is
-// writable by the service uid and `k3sm status` may run as root, so a value
-// executor.IsComponentName refuses is data, not a name: the fixed word "unknown"
-// stands in.
-func shownComponent(c executor.Crash) string {
-	if executor.IsComponentName(c.Component) {
-		return c.Component
-	}
-	return "unknown"
-}
+// shownComponent is c's component as a human screen may show it
+// (termsafe.Component: a name executor.IsComponentName refuses reads "unknown").
+func shownComponent(c executor.Crash) string { return termsafe.Component(c.Component) }
 
 // neverCameUp reports whether the record's last entry was a BRING-UP failure
 // rather than a crash. The breaker counts two different failures now, and they
