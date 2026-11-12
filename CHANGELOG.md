@@ -272,9 +272,10 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
   collection (the sweep) still reclaims within a time limit. Manifests it had not reached are no
   longer reported as failed deletions. The JSON report sets `interrupted` and lists them under
   `unattempted`, along with deletions the cancellation cut off. A deletion the registry refused is
-  still listed under `failed`, and the prune is marked `interrupted` either way. A deletion cut off
-  mid-way may have been applied; a later prune or the registry's scheduled garbage collection
-  reclaims it. The interruption is noted on stderr. The table keeps its usual lines, and the command
+  still listed under `failed`, and the prune is marked `interrupted` either way. A manifest listed
+  under `unattempted` was not confirmed deleted, but the registry may have completed a deletion
+  after the command gave up, so it may already be gone. Running the prune again is safe; a later
+  prune or the registry's scheduled garbage collection reclaims what remains. The interruption is noted on stderr. The table keeps its usual lines, and the command
   exits non-zero. See [Reclaiming Space](docs/user/images.md#reclaiming-space-k3sm-image-prune).
 - A server whose control plane does not report healthy in time while the Mac is heavily loaded no
   longer parks on the crash-loop breaker after five attempts. It backs off instead, from 30 seconds
