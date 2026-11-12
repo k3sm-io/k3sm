@@ -415,12 +415,15 @@ failure. A refusal deletes nothing, with one exception noted below:
 - A Pod on this node still uses the image. Retry once the Pod is gone.
 - The reference names more than one image on this node. Retry with `--platform`, as above, or
   name the image by its digest.
-- Nothing on this node has that name. Check the spelling against [`k3sm image ls`](#listing-the-registry-k3sm-image-ls--k3sm-image-df).
-  Do not reach for [`prune`](#reclaiming-space-k3sm-image-prune) to fix a typo: it is broader, and
-  evicts everything no Pod uses.
+- Nothing on this node has that name. Check the spelling against
+  [`k3sm image ls`](#listing-the-registry-k3sm-image-ls--k3sm-image-df) for images in the cluster
+  registry, or `kubectl get node <name> -o json` (`status.images`, the node's 50 largest) for one
+  pulled from elsewhere. Do not reach for [`prune`](#reclaiming-space-k3sm-image-prune) to fix a
+  typo: it is broader, and evicts everything no Pod uses.
 - The daemon could not read every record that protects blobs. It may already have unlinked some
-  blobs, and its message then counts them. Check the node log (`/var/log/k3sm/server.log`, root
-  only; see [Troubleshooting](troubleshooting.md)), repair the record and re-run.
+  blobs, and its message then counts them. Check the node log (`/var/log/k3sm/server.log`, or
+  `agent.log` on a joined worker; root only, see [Troubleshooting](troubleshooting.md)), repair the
+  record and re-run.
 - This node's runtimed is too old to serve `rm`. Nothing is evicted; run `k3sm install`, then
   restart runtimed. `rm` never falls back to `prune`.
 
