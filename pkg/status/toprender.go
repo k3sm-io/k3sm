@@ -89,13 +89,13 @@ func renderTopNodes(b *strings.Builder, r TopReport) {
 func renderTopPods(b *strings.Builder, r TopReport) {
 	where := "in all namespaces"
 	if r.Namespace != "" {
-		where = "in namespace " + r.Namespace
+		where = "in namespace " + stripControls(r.Namespace)
 	}
 	if r.PodsTotal == 0 {
 		fmt.Fprintf(b, "pods: none %s\n", where)
 		return
 	}
-	order := "by " + string(r.Sort)
+	order := "by " + stripControls(string(r.Sort))
 	if !r.Metrics.Available {
 		order = "by namespace and name"
 	}

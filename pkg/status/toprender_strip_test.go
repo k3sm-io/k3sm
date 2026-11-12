@@ -88,4 +88,16 @@ func TestRenderTopStripsControlCharacters(t *testing.T) {
 			"ns":   {"pod", "on"},
 		})
 	})
+
+	t.Run("namespace and sort", func(t *testing.T) {
+		r := TopReport{
+			Namespace: dirty("ns"),
+			Sort:      TopSort(dirty("sort")),
+			Metrics:   TopMetrics{Available: true},
+			Pods:      []TopPod{{Namespace: "a", Name: "p"}},
+			PodsTotal: 1,
+		}
+		out := RenderTop(r, Style{})
+		check(t, out, map[string][]string{"ns": {"sort"}})
+	})
 }
