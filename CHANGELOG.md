@@ -178,6 +178,9 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
 - Uninstall names a vm helper still running from a k3sm version the install no longer keeps. It
   does not signal that helper, and the error gives its process ID and the command to stop it by
   hand, `sudo kill -TERM -<pid>`, to run if `ps -o pid,command -g <pid>` shows only processes of the path the error names.
+- The registry relay logs a warning when all of its connections are held and a new pull waits, and
+  when it closes a connection from an address already holding its share, each at most once a minute
+  with a count of the lines it dropped in between. See [Pulling](docs/user/registry.md#pulling).
 
 ### Changed
 
