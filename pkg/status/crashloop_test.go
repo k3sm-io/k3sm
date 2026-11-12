@@ -352,7 +352,8 @@ func TestCrashRecordRowRefusesSymlinkFIFOAndOversize(t *testing.T) {
 // must reach the human screens with no control byte but the renderer's own
 // newlines, and with the generic remedy in place of the unknown one; a record
 // with a known remedy still names it. A row remedy carrying control bytes is
-// stripped by the renderer whatever produced it.
+// stripped by the renderer whatever produced it. The JSON output carries such
+// text escaped, with no raw control byte, and decodes back to itself.
 func TestHostileCrashRecordRendersAsData(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
@@ -431,6 +432,47 @@ func TestHostileCrashRecordRendersAsData(t *testing.T) {
 		assertNoControls(t, out)
 		if strings.Contains(out, "curl evil") {
 			t.Errorf("output carries the injected remedy:\n%s", out)
+		}
+	})
+	t.Run("the JSON output carries the record as escaped data", func(t *testing.T) {
+		t.Parallel()
+		row := Row{Name: RowServer, State: StateRunning, Severity: SeverityOK, Detail: "pid 42", Wide: map[string]string{}}
+		applyCrashLoop(&row, ClassifyCrashLoop(record(hostileRemedy), nil, path, now))
+		// A second row whose remedy carries the hostile bytes outright, so the
+		// document holds them as data whatever the classifier kept.
+		raw := Row{Name: RowAPIServer, State: StateFailed, Severity: SeverityFail, Detail: "d\x1b[31m",
+			Remedy: hostileRemedy, Wide: map[string]string{"comp\x1b": "kine\x07"}}
+		rows := []Row{row, raw}
+		r := Report{SchemaVersion: SchemaVersion, Role: dataroot.RoleServer, Rows: rows}
+		r.Verdict, r.Summary, r.Next = Aggregate(rows, true, dataroot.RoleServer)
+		// Encoded as `k3sm status --json` encodes it.
+		out, err := json.MarshalIndent(r, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, c := range out {
+			// MarshalIndent's own line breaks are the only control bytes allowed;
+			// a newline inside a string would make the document fail to decode below.
+			if c == '\n' {
+				continue
+			}
+			if c < 0x20 || c == 0x7f {
+				t.Fatalf("raw control byte %#x at %d in the JSON output:\n%s", c, i, out)
+			}
+		}
+		if !bytes.Contains(out, []byte(`\u001b[2J`)) {
+			t.Errorf("the JSON output lacks the hostile remedy as escaped data:\n%s", out)
+		}
+		var back Report
+		if err := json.Unmarshal(out, &back); err != nil {
+			t.Fatalf("the JSON output does not decode: %v\n%s", err, out)
+		}
+		again, err := json.MarshalIndent(back, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(out, again) {
+			t.Errorf("the JSON output does not round-trip:\nfirst:\n%s\nsecond:\n%s", out, again)
 		}
 	})
 	t.Run("the detail view strips control bytes from wide values", func(t *testing.T) {
