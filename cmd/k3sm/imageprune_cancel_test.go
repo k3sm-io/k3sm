@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -53,6 +54,33 @@ func decodeOnlyPrune(t *testing.T, stdout string) pruneJSON {
 		t.Fatalf("stdout carries %q after the JSON document", rest)
 	}
 	return doc
+}
+
+// expiringCtx is a context whose deadline is simulated: it is done, with
+// context.DeadlineExceeded, from the moment expire is first called and never
+// before, so a test of what a deadline does mid-run waits on no wall clock.
+type expiringCtx struct {
+	context.Context
+	done chan struct{}
+	once sync.Once
+}
+
+func newExpiringCtx(parent context.Context) *expiringCtx {
+	return &expiringCtx{Context: parent, done: make(chan struct{})}
+}
+
+// expire ends the context by its simulated deadline; later calls do nothing.
+func (c *expiringCtx) expire() { c.once.Do(func() { close(c.done) }) }
+
+func (c *expiringCtx) Done() <-chan struct{} { return c.done }
+
+func (c *expiringCtx) Err() error {
+	select {
+	case <-c.done:
+		return context.DeadlineExceeded
+	default:
+		return nil
+	}
 }
 
 // unattemptedList is the report's unattempted manifests as repo@digest.
@@ -125,11 +153,12 @@ func TestImagePruneForceJSONInterruptedStdoutIsOneDocument(t *testing.T) {
 // expiring during a forced prune stops it exactly as a Ctrl+C does: the same
 // report shape (interrupted, the rest unattempted, nothing failed), the notes
 // on stderr only, stdout one JSON document, and the deadline returned as the
-// error. The context is the one the CLI builds from --timeout (imageContext);
-// the first DELETE blocks until the deadline passes. In "confirmed" the
-// registry still answers that DELETE, so it is deleted and swept; in
-// "cut-off" the deadline cuts it off in flight, so it is unattempted too and
-// nothing is swept.
+// error. --timeout parses and imageContext turns it into a deadline; the
+// deadline's expiry is simulated by an expiringCtx over that context, which
+// the first DELETE expires, so nothing waits on the wall clock. In
+// "confirmed" the registry still answers that DELETE, so it is deleted and
+// swept; in "cut-off" the deadline cuts it off in flight, so it is
+// unattempted too and nothing is swept.
 func TestImagePruneForceTimeoutIsAnInterruption(t *testing.T) {
 	for _, tc := range []struct {
 		name           string
@@ -159,30 +188,29 @@ func TestImagePruneForceTimeoutIsAnInterruption(t *testing.T) {
 			f := buildPruneFixture(t, workDir)
 			sock := serveFakeImages(t, &fakeImagesDaemon{pruneResp: &runtimev1.PruneImagesResponse{}})
 			var stderr bytes.Buffer
-			opts, err := parseImageArgs([]string{"--socket", sock, "--work-dir", workDir, "prune", "--force", "-o", "json", "--timeout", "1s"}, &stderr)
+			opts, err := parseImageArgs([]string{"--socket", sock, "--work-dir", workDir, "prune", "--force", "-o", "json", "--timeout", "1h"}, &stderr)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if opts.timeout != time.Second {
-				t.Fatalf("parsed timeout = %v; want 1s", opts.timeout)
+			if opts.timeout != time.Hour {
+				t.Fatalf("parsed timeout = %v; want 1h", opts.timeout)
 			}
-			ctx, cancel := imageContext(t.Context(), opts)
+			deadlineCtx, cancel := imageContext(t.Context(), opts)
 			defer cancel()
-			if _, ok := ctx.Deadline(); !ok {
+			if _, ok := deadlineCtx.Deadline(); !ok {
 				t.Fatal("imageContext set no deadline for prune --timeout")
 			}
+			ctx := newExpiringCtx(deadlineCtx)
 			var calls int
-			del := func(ctx context.Context, rf name.Digest, state string, auth authn.Authenticator) error {
+			del := func(dctx context.Context, rf name.Digest, state string, auth authn.Authenticator) error {
 				calls++
-				select {
-				case <-ctx.Done():
-				case <-time.After(30 * time.Second):
-					t.Error("the --timeout deadline never fired")
+				if calls == 1 {
+					ctx.expire()
 				}
 				if !tc.confirm {
-					return ctx.Err()
+					return dctx.Err()
 				}
-				return reg.delete(context.WithoutCancel(ctx), rf, state, auth)
+				return reg.delete(context.WithoutCancel(dctx), rf, state, auth)
 			}
 			var sweepCtxErr error
 			collect := func(ctx context.Context, authority string, deleted []registrysvc.StoredManifest, cred registrysvc.Credential) (registrysvc.CollectResult, error) {

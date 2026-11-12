@@ -1069,14 +1069,16 @@ func TestImagePruneForceClassifiesAnErrorAtCancel(t *testing.T) {
 		wantCause: context.Canceled,
 	}, {
 		name: "deadline",
-		// The deadline is far enough out that the plan before the first
-		// DELETE cannot outrun it under load; the deleter then waits for it,
-		// so the context ends by its own deadline, not by a cancel.
+		// The deadline is simulated: the context reports DeadlineExceeded
+		// once the deleter expires it, so no wall-clock deadline can pass
+		// during the plan on a slow machine, and the context ends by its
+		// deadline, not by a cancel.
 		ctx: func() (context.Context, context.CancelFunc) {
-			return context.WithDeadline(context.Background(), time.Now().Add(2*time.Second))
+			e := newExpiringCtx(context.Background())
+			return e, e.expire
 		},
-		del: func(ctx context.Context, _ context.CancelFunc) error {
-			<-ctx.Done()
+		del: func(ctx context.Context, expire context.CancelFunc) error {
+			expire()
 			return fmt.Errorf("DELETE: %w", ctx.Err())
 		},
 		wantCause: context.DeadlineExceeded,
