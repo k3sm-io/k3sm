@@ -39,7 +39,8 @@ import (
 // test user, with the work dir path for tests that inspect the files.
 func newTestStore(t *testing.T) (*FileStore, string) {
 	t.Helper()
-	server := filepath.Join(t.TempDir(), "server")
+	data := t.TempDir()
+	server := filepath.Join(data, "server")
 	if err := os.Mkdir(server, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +49,11 @@ func newTestStore(t *testing.T) (*FileStore, string) {
 		MasterDir: filepath.Join(server, "cred", "keystore-master"),
 		UID:       uint32(os.Getuid()),
 		GID:       uint32(os.Getgid()),
+		DataRoot:  data,
 	})
+	// A test cannot create a root-owned file, so the test user stands in for
+	// root as the floor's owner.
+	s.floorUID, s.floorGID = uint32(os.Getuid()), uint32(os.Getgid())
 	return s, server
 }
 
@@ -830,11 +835,14 @@ func TestPutCrashAtEveryStep(t *testing.T) {
 		s.step = func(name string) error { steps = append(steps, name); return nil }
 		mustPut(t, s, "k", KindOpaque, []byte("x"))
 	}
-	want := "write master,write master.sha256,write generation,write v1,write current"
+	want := "write master,write master.sha256,write generation,write v1,write current,write keystore-floor.json"
 	if strings.Join(steps, ",") != want {
 		t.Fatalf("Put steps = %v, want %s", steps, want)
 	}
 	for _, step := range steps {
+		if step == "write "+floorName {
+			continue // after the pointer: the entry is committed (TestFloorRaised)
+		}
 		t.Run(step, func(t *testing.T) {
 			s, _ := newTestStore(t)
 			s.step = failAt(step)

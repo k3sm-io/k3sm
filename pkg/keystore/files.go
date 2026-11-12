@@ -171,8 +171,13 @@ func (s *FileStore) mkdirAt(root *os.Root, name string) error {
 // directory. A non-root process giving a file to its own uid and group is a
 // no-op chown.
 func (s *FileStore) own(f *os.File, mode fs.FileMode) error {
-	if err := s.chown(f, int(s.uid), int(s.gid)); err != nil {
-		return fmt.Errorf("chown %s to %d:%d: %w", f.Name(), s.uid, s.gid, err)
+	return s.ownAs(f, s.uid, s.gid, mode)
+}
+
+// ownAs is own with the owner given.
+func (s *FileStore) ownAs(f *os.File, uid, gid uint32, mode fs.FileMode) error {
+	if err := s.chown(f, int(uid), int(gid)); err != nil {
+		return fmt.Errorf("chown %s to %d:%d: %w", f.Name(), uid, gid, err)
 	}
 	if err := f.Chmod(mode); err != nil {
 		return fmt.Errorf("chmod %s %#o: %w", f.Name(), mode, err)
@@ -203,6 +208,12 @@ func (s *FileStore) checkOwned(fi fs.FileInfo, want fs.FileMode) error {
 // file, and never one at a wider mode or another owner. A crash before the
 // rename leaves the temporary file, which no reader opens.
 func (s *FileStore) writeFile(root *os.Root, name string, data []byte) error {
+	return s.writeFileAs(root, name, data, s.uid, s.gid, fileMode)
+}
+
+// writeFileAs is writeFile with the owner and mode given, for the one file
+// the store keeps outside the service user's tree: the root-owned floor.
+func (s *FileStore) writeFileAs(root *os.Root, name string, data []byte, uid, gid uint32, mode fs.FileMode) error {
 	var suffix [8]byte
 	if err := s.readRandom(suffix[:]); err != nil {
 		return fmt.Errorf("name a temporary file: %w", err)
@@ -218,7 +229,7 @@ func (s *FileStore) writeFile(root *os.Root, name string, data []byte) error {
 			_ = root.Remove(tmp) // best effort: a leftover temporary file is ignored by every reader
 		}
 	}()
-	err = s.own(f, fileMode)
+	err = s.ownAs(f, uid, gid, mode)
 	if err == nil {
 		_, err = f.Write(data)
 	}
