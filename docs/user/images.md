@@ -390,15 +390,18 @@ next deletion. The deletions already made stand, and `manifests` then holds only
 registry confirmed. The registry's garbage collection (the sweep) still reclaims those within a time
 limit: a note on stderr says how many and how long. The report marks the prune `interrupted` and
 lists under `unattempted`, not under `failed`, every planned manifest the prune did not attempt and
-every deletion the cancellation cut off. A deletion the registry refused is listed under `failed`,
+every deletion it could not confirm because the cancellation cut it off. Listing here means the
+prune did not confirm the deletion, not that the manifest still exists. A deletion the registry refused is listed under `failed`,
 even when the refusal came at the moment of the cancellation. The prune is still marked
 `interrupted`, so an interrupted prune can list failures. If the registry refuses the last planned
 deletion just as the cancellation arrives, `unattempted` is empty, that manifest is under `failed`,
 and the note on stderr says no planned manifest was left unattempted. A deletion the cancellation
-cut off in flight may still have been applied by the registry; it is listed under `unattempted`, is
-not swept by this run, and is reclaimed by a later prune or the registry's scheduled garbage
-collection. The table on stdout keeps its usual lines; the interruption is reported on stderr, and
-the command exits non-zero after printing the report. Run the prune again to delete what is left.
+cut off in flight may still have been completed by the registry, so a manifest under `unattempted`
+may already be gone. Those manifests are not swept by this run; a later prune or the registry's
+scheduled garbage collection reclaims them. The table on stdout keeps its usual lines; the
+interruption is reported on stderr, and the command exits non-zero after printing the report. It is
+safe to run the prune again: it plans from the registry's current state, so a manifest that is
+already gone is simply not listed and the rest are deleted.
 
 ## Pushing to a Registry: `k3sm image push`
 
