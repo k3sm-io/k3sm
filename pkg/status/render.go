@@ -195,7 +195,9 @@ func renderDetail(r Report, s Style, names []string, view string) string {
 		b.WriteString(renderRow(row, s))
 		tw := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
 		for _, k := range sortedKeys(row.Wide) {
-			fmt.Fprintf(tw, "%s%s\t%s\n", logIndent, k, row.Wide[k])
+			// The wide values can carry record text (a component name), so a
+			// control byte, a tab or a newline is stripped like every other path.
+			fmt.Fprintf(tw, "%s%s\t%s\n", logIndent, stripControls(k), stripControls(row.Wide[k]))
 		}
 		if err := tw.Flush(); err != nil {
 			// tabwriter writes into a strings.Builder, whose Write never fails.

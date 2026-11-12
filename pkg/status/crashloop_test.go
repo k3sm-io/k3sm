@@ -433,6 +433,16 @@ func TestHostileCrashRecordRendersAsData(t *testing.T) {
 			t.Errorf("output carries the injected remedy:\n%s", out)
 		}
 	})
+	t.Run("the detail view strips control bytes from wide values", func(t *testing.T) {
+		t.Parallel()
+		row := Row{Name: RowServer, State: StateRunning, Severity: SeverityOK, Detail: "d",
+			Wide: map[string]string{"comp\x1b[31m": "kine\x1b[2J\tFAKE\nok  fine"}}
+		out := RenderDaemons(Report{Role: dataroot.RoleServer, Rows: []Row{row}}, Style{})
+		assertNoControls(t, out)
+		if !strings.Contains(out, "comp[31m") || !strings.Contains(out, "kine[2JFAKEok  fine") {
+			t.Errorf("output lacks the stripped wide row:\n%q", out)
+		}
+	})
 	t.Run("the renderer strips control bytes from every remedy step", func(t *testing.T) {
 		t.Parallel()
 		row := Row{Name: RowServer, State: StateCrashLoop, Severity: SeverityFail, Detail: "d",
