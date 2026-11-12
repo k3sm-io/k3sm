@@ -1002,7 +1002,9 @@ EOF
 }
 mlx_model() { mlx_model_manifest "$@" | kc apply -f - >/dev/null; }
 # mlx_invalid_spec <name> — the message of a spec the operator cannot render: it
-# stays that way until the spec changes (pkg/mlx/operator ReasonInvalidSpec).
+# stays that way until the spec changes (pkg/mlx/operator ReasonInvalidSpec). An
+# artifact the registry cannot serve yet is ArtifactUnavailable, which the operator
+# retries, so it is not matched here and the waits keep waiting on it.
 mlx_invalid_spec() { kc get mlxmodel -n "$NS" "$1" -o jsonpath='{.status.conditions[?(@.reason=="InvalidSpec")].message}' 2>/dev/null; }
 # model_wait <name> <seconds> <command...> — poll like wait_until, but return 3 at
 # once on an InvalidSpec, which no amount of waiting can change.
@@ -1025,9 +1027,11 @@ model_wait_failed() {
 	if [ "$2" = 3 ]; then
 		fail "MLXModel $1 was rejected with InvalidSpec: $(mlx_invalid_spec "$1")"
 	else
-		fail "MLXModel $1 $3"
+		fail "MLXModel $1 $3 (last Ready reason: $(mlx_ready_reason "$1" || true))"
 	fi
 }
+# mlx_ready_reason <name> — the reason of the model's Ready condition, if any.
+mlx_ready_reason() { kc get mlxmodel -n "$NS" "$1" -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}' 2>/dev/null; }
 model_ready() { grep -qx True <<<"$(kc get mlxmodel -n "$NS" "$1" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)"; }
 # ring_settled <path> — stdin is rank_pods output: exactly two rank pods, each on
 # that path, Ready=True, and (when RING_OLD_UIDS is set) none of the pre-patch pods.
@@ -2334,8 +2338,9 @@ st_ring_settled() {
 	st "ring_settled with no pre-patch set accepts two Ready pods on the path" 0 ring_settled thunderbolt <<<"$two_old"
 }
 
-# st_r5_run <invalid|slow> — the real r5 assertion to its first wait, the cluster
-# stubbed: an InvalidSpec model, or one that never reports anything.
+# st_r5_run <invalid|slow|unavailable> — the real r5 assertion to its first wait,
+# the cluster stubbed: an InvalidSpec model, one that never reports anything, or
+# one whose artifact stays ArtifactUnavailable (retryable, so r5 keeps waiting).
 st_r5_run() {
 	local prof="$1" r5_dir
 	r5_dir="$(mktemp -d -t m17-r5.XXXXXX)"
@@ -2353,6 +2358,7 @@ st_r5_run() {
 		case "$*" in
 		"get node "*) echo 1 ;;
 		*'@.reason=="InvalidSpec"'*) [ "$prof" != invalid ] || echo "no serving image" ;;
+		*'@.type=="Ready")].reason'*) [ "$prof" != unavailable ] || echo ArtifactUnavailable ;;
 		"get mlxmodel -n stub ic-ring -o json") echo '{"status":{}}' ;;
 		esac
 	}
@@ -2700,6 +2706,7 @@ self_test_body() {
 	st_out "r5 saves the status of an InvalidSpec model" "SAVED mlxmodel-ic-ring.json" st_r5_run invalid
 	st_out "r5 still runs out its budget for a model that is only slow" "never became Ready within 2s" st_r5_run slow
 	st_out "r5 saves the status of a model that timed out" "SAVED mlxmodel-ic-ring.json" st_r5_run slow
+	st_out "r5 keeps waiting on ArtifactUnavailable and names it at the timeout" "last Ready reason: ArtifactUnavailable" st_r5_run unavailable
 	st_ring_settled
 	st "--until with no rung exits 2" 0 gate_run 2 - -- --until
 	st "--until with a rung and more exits 2" 0 gate_run 2 - -- --until r5 extra
