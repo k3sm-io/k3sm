@@ -102,7 +102,13 @@ func (e *StatusError) Error() string { return fmt.Sprintf("registry answered %q"
 
 // transportError wraps err, a failed request, with ErrTimeout or
 // ErrUnreachable when it is one of those, and returns it unchanged otherwise.
+// A TLS failure and a cancelled context come back unchanged even inside a
+// *net.OpError (a peer's TLS alert arrives as Op "remote error", a cancelled
+// dial as Op "dial"): neither is an unreachable or slow registry.
 func transportError(err error) error {
+	if tlsFailure(err) || errors.Is(err, context.Canceled) {
+		return err
+	}
 	var nerr net.Error
 	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &nerr) && nerr.Timeout()) {
 		return fmt.Errorf("%w: %w", ErrTimeout, err)
@@ -115,6 +121,22 @@ func transportError(err error) error {
 		return fmt.Errorf("%w: %w", ErrUnreachable, err)
 	}
 	return err
+}
+
+// tlsFailure reports whether err is a failed TLS handshake or a TLS-level
+// error from either side of the connection.
+func tlsFailure(err error) bool {
+	var (
+		verifyErr    *tls.CertificateVerificationError
+		authorityErr x509.UnknownAuthorityError
+		invalidErr   x509.CertificateInvalidError
+		hostnameErr  x509.HostnameError
+		alertErr     tls.AlertError
+		headerErr    tls.RecordHeaderError
+	)
+	return errors.As(err, &verifyErr) || errors.As(err, &authorityErr) ||
+		errors.As(err, &invalidErr) || errors.As(err, &hostnameErr) ||
+		errors.As(err, &alertErr) || errors.As(err, &headerErr)
 }
 
 // Options configure a Client. The zero value is a plain-HTTP-capable client

@@ -806,7 +806,8 @@ const ReasonInvalidSpec = "InvalidSpec"
 // time, failed, throttled, refused the read, does not have the artifact yet,
 // or the operator has no registry client. It is not terminal: the controller
 // keeps retrying (a missing registry client waits for the operator's
-// configuration instead).
+// configuration instead). A 404 is treated as "not pushed yet" on purpose, so
+// a mistyped tag also waits here, with a message that names the cause.
 const ReasonArtifactUnavailable = "ArtifactUnavailable"
 
 // artifactFailureFit is the refusal a failed artifact resolution reports. Only
@@ -830,6 +831,7 @@ func artifactUnavailable(err error) bool {
 	case errors.Is(err, errNoResolver),
 		errors.Is(err, registryclient.ErrUnreachable),
 		errors.Is(err, registryclient.ErrTimeout),
+		// Serves resolvers other than registryclient, which wraps it in ErrTimeout.
 		errors.Is(err, context.DeadlineExceeded),
 		errors.Is(err, registryclient.ErrShortRead),
 		errors.Is(err, registryclient.ErrNotFound),

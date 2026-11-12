@@ -18,6 +18,8 @@ package operator
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -158,6 +160,21 @@ func TestResolutionFailureConditionReason(t *testing.T) {
 		}, ReasonInvalidSpec},
 		{"cancelled", func(*testing.T) ArtifactResolver {
 			return failingResolver(context.Canceled)
+		}, ReasonInvalidSpec},
+		{"tls alert from the peer", func(t *testing.T) ArtifactResolver {
+			return clientResolver(t, roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return nil, &net.OpError{Op: "remote error", Err: tls.AlertError(42)}
+			}))
+		}, ReasonInvalidSpec},
+		{"certificate verification", func(t *testing.T) ArtifactResolver {
+			return clientResolver(t, roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return nil, &tls.CertificateVerificationError{Err: x509.UnknownAuthorityError{}}
+			}))
+		}, ReasonInvalidSpec},
+		{"cancelled dial", func(t *testing.T) ArtifactResolver {
+			return clientResolver(t, roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return nil, &net.OpError{Op: "dial", Net: "tcp", Err: context.Canceled}
+			}))
 		}, ReasonInvalidSpec},
 	}
 	for _, tc := range cases {

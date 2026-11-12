@@ -18,6 +18,8 @@ package registryclient_test
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -77,6 +79,15 @@ func TestTypedErrors(t *testing.T) {
 		{"502", answer(http.StatusBadGateway, empty()), nil, http.StatusBadGateway},
 		{"400", answer(http.StatusBadRequest, empty()), nil, http.StatusBadRequest},
 		{"other transport failure", func(*http.Request) (*http.Response, error) { return nil, errors.New("tls: bad certificate") }, nil, 0},
+		{"tls alert from the peer", func(*http.Request) (*http.Response, error) {
+			return nil, &net.OpError{Op: "remote error", Err: tls.AlertError(42)}
+		}, nil, 0},
+		{"certificate verification", func(*http.Request) (*http.Response, error) {
+			return nil, &tls.CertificateVerificationError{Err: x509.UnknownAuthorityError{}}
+		}, nil, 0},
+		{"cancelled dial", func(*http.Request) (*http.Response, error) {
+			return nil, &net.OpError{Op: "dial", Net: "tcp", Err: context.Canceled}
+		}, nil, 0},
 	}
 	sentinels := []error{registryclient.ErrUnreachable, registryclient.ErrTimeout, registryclient.ErrShortRead, registryclient.ErrNotFound, registryclient.ErrUnauthorized}
 	for _, tc := range cases {
