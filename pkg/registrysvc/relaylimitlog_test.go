@@ -146,8 +146,8 @@ func TestRelayLogsWhenFullOrOverShare(t *testing.T) {
 		// The accept loop's next Accept finds the only slot held.
 		waitFor(t, "the full warning", func() bool { return len(rec.warnings(fullMsg)) == 1 })
 		got := rec.warnings(fullMsg)[0]
-		if got["limit"] != "1" || got["suppressed"] != "0" {
-			t.Errorf("full warning = %v, want limit=1 suppressed=0", got)
+		if got["addr"] != ll.Addr().String() || got["limit"] != "1" || got["suppressed"] != "0" {
+			t.Errorf("full warning = %v, want addr=%s limit=1 suppressed=0", got, ll.Addr())
 		}
 
 		// A second wait inside the interval logs nothing.
@@ -166,8 +166,8 @@ func TestRelayLogsWhenFullOrOverShare(t *testing.T) {
 		third := take(t, accepted)
 		defer third.Close()
 		waitFor(t, "the full warning after the interval", func() bool { return len(rec.warnings(fullMsg)) == 2 })
-		if got := rec.warnings(fullMsg)[1]; got["suppressed"] != "1" {
-			t.Errorf("full warning after the interval = %v, want suppressed=1", got)
+		if got := rec.warnings(fullMsg)[1]; got["addr"] != ll.Addr().String() || got["suppressed"] != "1" {
+			t.Errorf("full warning after the interval = %v, want addr=%s suppressed=1", got, ll.Addr())
 		}
 		if n := len(rec.warnings(overShareMsg)); n != 0 {
 			t.Errorf("share warnings = %d, want none", n)
@@ -180,7 +180,8 @@ func TestRelayLogsWhenFullOrOverShare(t *testing.T) {
 		held := take(t, accepted)
 		defer held.Close()
 		// refused dials once more from the same address and waits for the
-		// listener to close the connection, which it does after logging.
+		// listener to close the connection. The listener logs only after
+		// closing it and releasing the slot, so callers wait for the line.
 		refused := func(t *testing.T) {
 			t.Helper()
 			c := dial(t, ll)
@@ -191,27 +192,24 @@ func TestRelayLogsWhenFullOrOverShare(t *testing.T) {
 		}
 
 		refused(t)
+		waitFor(t, "the share warning", func() bool { return len(rec.warnings(overShareMsg)) == 1 })
 		got := rec.warnings(overShareMsg)
-		if len(got) != 1 {
-			t.Fatalf("share warnings = %v, want exactly 1", got)
-		}
-		if got[0]["source"] != "127.0.0.1" || got[0]["share"] != "1" || got[0]["suppressed"] != "0" {
-			t.Errorf("share warning = %v, want source=127.0.0.1 share=1 suppressed=0", got[0])
+		if got[0]["addr"] != ll.Addr().String() || got[0]["source"] != "127.0.0.1" || got[0]["share"] != "1" || got[0]["suppressed"] != "0" {
+			t.Errorf("share warning = %v, want addr=%s source=127.0.0.1 share=1 suppressed=0", got[0], ll.Addr())
 		}
 
 		refused(t)
+		waitFor(t, "the second refusal to be counted", func() bool { return suppressed(&ll.overShare) == 1 })
 		if n := len(rec.warnings(overShareMsg)); n != 1 {
 			t.Fatalf("share warnings = %d inside the interval, want 1", n)
 		}
 
 		clk.advance(testWarnGap)
 		refused(t)
+		waitFor(t, "the share warning after the interval", func() bool { return len(rec.warnings(overShareMsg)) == 2 })
 		got = rec.warnings(overShareMsg)
-		if len(got) != 2 {
-			t.Fatalf("share warnings = %v after the interval, want 2", got)
-		}
-		if got[1]["suppressed"] != "1" {
-			t.Errorf("share warning after the interval = %v, want suppressed=1", got[1])
+		if got[1]["addr"] != ll.Addr().String() || got[1]["suppressed"] != "1" {
+			t.Errorf("share warning after the interval = %v, want addr=%s suppressed=1", got[1], ll.Addr())
 		}
 		if n := len(rec.warnings(fullMsg)); n != 0 {
 			t.Errorf("full warnings = %d, want none", n)

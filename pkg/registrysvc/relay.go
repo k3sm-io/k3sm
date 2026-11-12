@@ -456,8 +456,9 @@ func (r *Relay) accept(ctx context.Context, ln net.Listener) error {
 // clients holding connections open cost other clients a wait, never this
 // process its file descriptors. A connection from an address already at its
 // share is closed on accept instead: queueing it would make every other
-// address wait behind it. Both are logged as warnings, each at most once per
-// warnEvery, so a flood of either cannot flood the log.
+// address wait behind it. Both are logged as warnings naming the listener's
+// address, each at most once per warnEvery for this listener, so a flood of
+// either cannot flood the log.
 type limitListener struct {
 	net.Listener
 	sem       chan struct{}
@@ -507,35 +508,40 @@ func (l *limitListener) Accept() (net.Conn, error) {
 		}
 		src := sourceOf(c.RemoteAddr())
 		if !l.open.take(src, l.perSource) {
-			l.warnOverShare(src)
 			_ = c.Close()
 			<-l.sem
+			// Logged after the slot is released, so a slow log handler never
+			// holds one.
+			l.warnOverShare(src)
 			continue
 		}
 		return &limitConn{Conn: c, release: func() { l.open.give(src); <-l.sem }}, nil
 	}
 }
 
-// warnFull logs that every slot is held and the next connection waits for one.
+// warnFull logs that every slot is held, so a further connection waits for
+// one. addr is this listener's address: each bind address has its own
+// listener, limit and warnings.
 func (l *limitListener) warnFull() {
 	if l.log == nil {
 		return
 	}
 	if dropped, ok := l.full.allow(l.now(), l.warnEvery); ok {
-		l.log.Warn("ingest registry relay is at its connection limit: new pulls wait until a connection frees",
-			"limit", cap(l.sem), "suppressed", dropped)
+		l.log.Warn("ingest registry relay is at its connection limit: further connections wait until one frees",
+			"addr", l.Addr().String(), "limit", cap(l.sem), "suppressed", dropped)
 	}
 }
 
 // warnOverShare logs that a connection from src was refused because src
-// already holds its share. src is the address alone, with no port.
+// already holds its share. src is the address alone, with no port; addr is
+// this listener's address.
 func (l *limitListener) warnOverShare(src string) {
 	if l.log == nil {
 		return
 	}
 	if dropped, ok := l.overShare.allow(l.now(), l.warnEvery); ok {
 		l.log.Warn("ingest registry relay refused a connection: the source already holds its share of connections",
-			"source", src, "share", l.perSource, "suppressed", dropped)
+			"addr", l.Addr().String(), "source", src, "share", l.perSource, "suppressed", dropped)
 	}
 }
 
