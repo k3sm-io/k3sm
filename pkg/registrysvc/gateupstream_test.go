@@ -146,12 +146,16 @@ func TestGateHeaderBoundByOperation(t *testing.T) {
 }
 
 // TestGateManifestBoundCoversCollect: a manifest PUT queued behind a
-// collection sweep of its repository waits up to CollectTimeout for the lock,
-// so the manifest bound must not be shorter or a healthy push is cut.
+// collection sweep of its repository waits up to CollectTimeout for the lock
+// and then links and re-hashes its blobs, so the manifest bound must exceed
+// CollectTimeout by a positive margin or a healthy push is cut.
 func TestGateManifestBoundCoversCollect(t *testing.T) {
-	if gateManifestHeaderTimeout < CollectTimeout {
-		t.Errorf("gateManifestHeaderTimeout = %v, want at least CollectTimeout (%v)",
-			gateManifestHeaderTimeout, CollectTimeout)
+	if gateManifestCollectMargin <= 0 {
+		t.Errorf("gateManifestCollectMargin = %v, want > 0", gateManifestCollectMargin)
+	}
+	if gateManifestHeaderTimeout < CollectTimeout+gateManifestCollectMargin {
+		t.Errorf("gateManifestHeaderTimeout = %v, want at least CollectTimeout (%v) + margin (%v)",
+			gateManifestHeaderTimeout, CollectTimeout, gateManifestCollectMargin)
 	}
 }
 
@@ -277,6 +281,43 @@ func TestGateReadErrorLogsCancellationAtDebug(t *testing.T) {
 			}
 			if line["method"] != "GET" || line["path"] != "/v2/team/app/blobs/"+digestA {
 				t.Errorf("method, path = %v, %v; want the request's", line["method"], line["path"])
+			}
+		})
+	}
+}
+
+// TestGateWriteErrorLogsCancellationAtDebug: an authorized write the registry
+// did not take is a Warn naming the method and path, unless the client
+// cancelled it, which is a Debug. Either way the client is answered 502.
+func TestGateWriteErrorLogsCancellationAtDebug(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		err   error
+		level string
+	}{
+		{"an unreachable registry is a warning", errors.New("connection refused"), "WARN"},
+		{"a client's cancellation is debug", fmt.Errorf("proxy: %w", context.Canceled), "DEBUG"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			log := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+			g := newGate(gateConfig{Upstream: "127.0.0.1:1", Logger: log})
+			path := "/v2/team/app/manifests/v1"
+			r := httptest.NewRequest(http.MethodPut, path, nil)
+			rec := httptest.NewRecorder()
+			g.writeError(rec, r, tc.err)
+			var line map[string]any
+			if err := json.Unmarshal(buf.Bytes(), &line); err != nil {
+				t.Fatalf("log line %q: %v", buf.String(), err)
+			}
+			if line["level"] != tc.level {
+				t.Errorf("level = %v, want %s", line["level"], tc.level)
+			}
+			if line["method"] != "PUT" || line["path"] != path {
+				t.Errorf("method, path = %v, %v; want the request's", line["method"], line["path"])
+			}
+			if rec.Code != http.StatusBadGateway {
+				t.Errorf("status = %d, want 502", rec.Code)
 			}
 		})
 	}
