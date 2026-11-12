@@ -156,6 +156,9 @@ type relayConn struct {
 	opened   time.Time
 	requests int
 	cut      *cutWatch
+	// unbounded is set once the connection is logged as served without a
+	// progress bound, so the line is written once per connection.
+	unbounded bool
 }
 
 // Directions of a deadline cut, as the cut's log line names them.
@@ -256,8 +259,8 @@ type sourceLimiter struct {
 	next http.Handler
 	lim  relayLimits
 	now  func() time.Time
-	// log receives the line for a connection a relay deadline cut. Nil logs
-	// nothing.
+	// log receives the line for a connection a relay deadline cut, and for one
+	// served without a progress bound. Nil logs nothing.
 	log *slog.Logger
 
 	mu      sync.Mutex // guards sources
@@ -365,18 +368,22 @@ func (s *sourceLimiter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // still unread gets one more window for the server's drain after the handler;
 // a body whose read failed, a timeout included, keeps the deadline already
 // armed, so the drain fails at once and the connection closes. The errors
-// from setting a deadline are ignored: a writer that cannot take a deadline is
-// served unbounded rather than refused. Each deadline armed is recorded in the
+// from setting a deadline are ignored, except the first: a writer that cannot
+// take a deadline is served unbounded rather than refused, and logged once per
+// connection as served so. Each deadline armed is recorded in the
 // connection's cut watch, so a cut it makes is logged once, where the timed-out
 // write or read is observed.
 func (s *sourceLimiter) bindProgress(w http.ResponseWriter, r *http.Request) (http.ResponseWriter, *http.Request, func()) {
 	var cut *cutWatch
-	if c, ok := r.Context().Value(relayConnKey{}).(*relayConn); ok {
-		cut = c.cut
+	conn, _ := r.Context().Value(relayConnKey{}).(*relayConn)
+	if conn != nil {
+		cut = conn.cut
 	}
 	rc := http.NewResponseController(w)
 	cut.armWrite("", time.Time{})
-	_ = rc.SetWriteDeadline(time.Time{})
+	if err := rc.SetWriteDeadline(time.Time{}); err != nil {
+		s.logUnbounded(conn, r.RemoteAddr, err)
+	}
 	pw := &progressWriter{ResponseWriter: w, rc: rc, d: s.lim.writeProgress, cut: cut}
 	var pr *progressReader
 	if r.Body != nil && r.Body != http.NoBody && r.ContentLength != 0 {
@@ -397,6 +404,23 @@ func (s *sourceLimiter) bindProgress(w http.ResponseWriter, r *http.Request) (ht
 		}
 		_ = rc.SetReadDeadline(time.Time{})
 	}
+}
+
+// logUnbounded logs a connection whose writer refused a deadline, http.ErrNotSupported
+// included: it is served with no progress bound. A connection the limiter
+// stamped is logged once; one it did not stamp is logged per request.
+func (s *sourceLimiter) logUnbounded(conn *relayConn, remote string, err error) {
+	if s.log == nil {
+		return
+	}
+	if conn != nil {
+		if conn.unbounded {
+			return
+		}
+		conn.unbounded = true
+	}
+	s.log.Warn("ingest registry relay serves a connection without a progress bound: its writer cannot take a deadline",
+		"remote", remote, "error", err)
 }
 
 // progressWriter arms a fresh write deadline before each write to the peer.
