@@ -164,9 +164,9 @@ type fakeSystem struct {
 	// never caps serverFileLimit. maxFilesPerProcErr, when set, is returned instead.
 	maxFilesPerProc    uint64
 	maxFilesPerProcErr error
-	// readErrs[path] is an error ReadFile returns for path instead of reading
-	// it: an installed file that exists but cannot be read. The zero value
-	// reads everything.
+	// readErrs[path] is an error ReadFile and ReadOwnedRegularFile return for
+	// path instead of reading it: a file that exists but cannot be read. The
+	// zero value reads everything.
 	readErrs map[string]error
 	// missingPaths are paths PathExists reports absent. The zero value reports
 	// EVERY path present, so an unconfigured fake describes a healthy install and
@@ -774,6 +774,9 @@ func (f *fakeSystem) ReadRegularFileWithMode(path string) ([]byte, fs.FileMode, 
 // putFileMode's mode, which is what the install's own staging leaves.
 func (f *fakeSystem) ReadOwnedRegularFile(path string, limit int64) ([]byte, OwnedEntry, error) {
 	f.calls = append(f.calls, "ReadOwnedRegularFile:"+path)
+	if err, ok := f.readErrs[path]; ok {
+		return nil, OwnedEntry{}, err
+	}
 	b, err := f.readRegularFileContent(path)
 	// A file seeded to change across reads answers here as it does through
 	// ReadRegularFile, so the crash-record polling fixtures keep working.

@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -374,6 +375,15 @@ func refusedRecordCases(installStart time.Time) []struct {
 		{"oversize", func(f *fakeSystem, path string) {
 			f.putFile(path, make([]byte, crashRecordReadLimit+1))
 		}},
+		// A record that exists but cannot be read for any other reason
+		// (EACCES, EIO, a failed fstat) is not "no record" either: only
+		// fs.ErrNotExist is.
+		{"unreadable", func(f *fakeSystem, path string) {
+			if f.readErrs == nil {
+				f.readErrs = map[string]error{}
+			}
+			f.readErrs[path] = fmt.Errorf("open %s: input/output error", path)
+		}},
 	}
 }
 
@@ -400,7 +410,7 @@ func TestVerifyServerNotParkedFailsClosedOnRefusedRecord(t *testing.T) {
 			if err == nil {
 				t.Fatal("verifyServerNotParked passed over a crash record it refused to read")
 			}
-			for _, want := range []string{path, "remove it"} {
+			for _, want := range []string{path, "remove it", "the new binary is already running", "re-running install", "is safe"} {
 				if !strings.Contains(err.Error(), want) {
 					t.Errorf("error %q must carry %q", err, want)
 				}
@@ -423,7 +433,7 @@ func TestReadAgentFailuresFailsClosedOnRefusedRecord(t *testing.T) {
 			if err == nil {
 				t.Fatal("readAgentFailures answered over a crash record it refused to read")
 			}
-			for _, want := range []string{path, "remove it"} {
+			for _, want := range []string{path, "remove it", "the new binary is already running", "re-running install", "is safe"} {
 				if !strings.Contains(err.Error(), want) {
 					t.Errorf("error %q must carry %q", err, want)
 				}
