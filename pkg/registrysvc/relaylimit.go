@@ -157,11 +157,11 @@ type relayConn struct {
 	requests int
 	cut      *cutWatch
 	// unbounded is set once the connection is logged as served without a
-	// progress bound, so the line is written once per connection. It is
-	// touched only from the connection's serial request path, which holds
-	// because the relay server speaks HTTP/1.1 only: accept starts it with
-	// Serve over a TLS listener, and the TLS config pins http/1.1. Enabling
-	// HTTP/2 would need a lock here.
+	// progress bound, so the line is written once per connection. The server
+	// handles one request at a time on a connection, so no lock guards it.
+	// That holds because the relay speaks HTTP/1.1 only: accept starts the
+	// relay's HTTP server with Serve over a TLS listener, and the TLS config
+	// pins http/1.1. Enabling HTTP/2 would need a lock here.
 	unbounded bool
 }
 
@@ -410,9 +410,10 @@ func (s *sourceLimiter) bindProgress(w http.ResponseWriter, r *http.Request) (ht
 	}
 }
 
-// logUnbounded logs a connection whose writer refused a deadline, http.ErrNotSupported
-// included: it is served with no progress bound. A connection the limiter
-// stamped is logged once; one it did not stamp is logged per request.
+// logUnbounded logs a connection that is served with no progress bound.
+// Its writer refused a deadline, http.ErrNotSupported included. A connection
+// that has a relayConn record, set by ConnContext, is logged once. A request
+// with no such record is logged every time.
 func (s *sourceLimiter) logUnbounded(conn *relayConn, remote string, err error) {
 	if s.log == nil {
 		return
