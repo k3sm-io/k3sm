@@ -80,7 +80,7 @@ func TestDeveloperModeStuckMarkerLeavesNoSignedTree(t *testing.T) {
 		if err == nil {
 			t.Fatal("Install succeeded beside a marker that still reads on")
 		}
-		for _, want := range []string{"first install", "moved from the install root " + live, "sudo chflags nouchg " + DeveloperModeMarkerPath} {
+		for _, want := range []string{"first install", "moved from the install root " + live, "sudo chflags -- nouchg " + shellQuote(DeveloperModeMarkerPath)} {
 			if !strings.Contains(err.Error(), want) {
 				t.Errorf("error %q does not carry %q", err, want)
 			}
@@ -104,7 +104,7 @@ func TestDeveloperModeStuckMarkerLeavesNoSignedTree(t *testing.T) {
 		if err == nil {
 			t.Fatal("Install succeeded beside a marker that still reads on")
 		}
-		for _, want := range []string{"so it is still there beside the developer-mode marker " + DeveloperModeMarkerPath, "sudo rm -rf " + live} {
+		for _, want := range []string{"so it is still there beside the developer-mode marker " + DeveloperModeMarkerPath, "sudo rm -rf -- " + shellQuote(live)} {
 			if !strings.Contains(err.Error(), want) {
 				t.Errorf("error %q does not carry %q", err, want)
 			}
@@ -128,9 +128,9 @@ func TestDeveloperModeStuckMarkerLeavesNoSignedTree(t *testing.T) {
 			"DEVELOPER MODE IS STILL ON",
 			"the developer-mode marker " + DeveloperModeMarkerPath + " is beside the new tree",
 			"plists name paths inside it",
-			"sudo chflags nouchg " + DeveloperModeMarkerPath,
+			"sudo chflags -- nouchg " + shellQuote(DeveloperModeMarkerPath),
 			"ls -lO@e " + DeveloperModeMarkerPath,
-			"a system-immutable flag (schg): `sudo chflags noschg " + DeveloperModeMarkerPath + "`, or Recovery if the securelevel is raised",
+			"a system-immutable flag (schg): `sudo chflags -- noschg " + shellQuote(DeveloperModeMarkerPath) + "`, or Recovery if the securelevel is raised",
 			"a deny-delete ACL: `sudo chmod -N " + DeveloperModeMarkerPath + "`",
 			"`sudo launchctl bootout system/<label>` and `sudo launchctl disable system/<label>`",
 			"a stop-gap until the marker is cleared and the install is re-run",
@@ -189,7 +189,7 @@ func TestDeveloperModeStuckMarkerWithdrawIsOneWay(t *testing.T) {
 	if err == nil {
 		t.Fatal("Install succeeded beside a marker that still reads on")
 	}
-	for _, want := range []string{"so it is still there beside the developer-mode marker " + DeveloperModeMarkerPath, "sudo rm -rf " + live} {
+	for _, want := range []string{"so it is still there beside the developer-mode marker " + DeveloperModeMarkerPath, "sudo rm -rf -- " + shellQuote(live)} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not carry %q", err, want)
 		}

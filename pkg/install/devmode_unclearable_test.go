@@ -107,7 +107,7 @@ func TestDeveloperModeMarkerUnclearableRevertsTheSwap(t *testing.T) {
 		if err == nil {
 			t.Fatal("Install succeeded beside a marker that still reads on")
 		}
-		for _, want := range []string{"sudo chflags nouchg " + DeveloperModeMarkerPath, "rolled back to the previous install root"} {
+		for _, want := range []string{"sudo chflags -- nouchg " + shellQuote(DeveloperModeMarkerPath), "rolled back to the previous install root"} {
 			if !strings.Contains(err.Error(), want) {
 				t.Errorf("error %q does not carry %q", err, want)
 			}
@@ -143,7 +143,7 @@ func TestDeveloperModeMarkerUnclearableRevertsTheSwap(t *testing.T) {
 		if err == nil {
 			t.Fatal("Install succeeded beside a marker that still reads on")
 		}
-		for _, want := range []string{"sudo chflags nouchg " + DeveloperModeMarkerPath, "first install"} {
+		for _, want := range []string{"sudo chflags -- nouchg " + shellQuote(DeveloperModeMarkerPath), "first install"} {
 			if !strings.Contains(err.Error(), want) {
 				t.Errorf("error %q does not carry %q", err, want)
 			}

@@ -281,8 +281,8 @@ func ensureFileOwnedByVia(ops fileOps, path string, uid, gid int, mode fs.FileMo
 		return fmt.Errorf("%s: %w; %s", path, ErrNotRegularFile, lockRemedy(mode, path))
 	}
 	if st.Nlink != 1 {
-		return fmt.Errorf("%s has %d links: %w: %w; the lock file holds no state, so it is safe to remove: run `sudo rm %s` and re-run the install",
-			path, st.Nlink, ErrNotRegularFile, errHardlinkRefused, path)
+		return fmt.Errorf("%s has %d links: %w: %w; the lock file holds no state, so it is safe to remove: run `sudo rm -- %s` and re-run the install",
+			path, st.Nlink, ErrNotRegularFile, errHardlinkRefused, shellQuote(path))
 	}
 	if err := ops.fchown(fd, uid, gid); err != nil {
 		return fmt.Errorf("chown %s to %d:%d: %w", path, uid, gid, err)
@@ -308,9 +308,9 @@ func lockEntryKind(m fs.FileMode) string {
 // no state, so removing the entry is safe.
 func lockRemedy(m fs.FileMode, path string) string {
 	if m.IsDir() {
-		return fmt.Sprintf("the lock file holds no state, so it is safe to remove the directory: run `sudo rmdir %s` (`sudo rm -rf %s` if it is not empty) and re-run the install", path, path)
+		return fmt.Sprintf("the lock file holds no state, so it is safe to remove the directory: run `sudo rmdir -- %s` (`sudo rm -rf -- %s` if it is not empty) and re-run the install", shellQuote(path), shellQuote(path))
 	}
-	return fmt.Sprintf("the lock file holds no state, so it is safe to remove the entry: run `sudo rm %s` and re-run the install", path)
+	return fmt.Sprintf("the lock file holds no state, so it is safe to remove the entry: run `sudo rm -- %s` and re-run the install", shellQuote(path))
 }
 
 // EnsureLogDir creates (or repairs) the log dir owned by the service uid, group

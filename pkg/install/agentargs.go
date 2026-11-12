@@ -115,7 +115,7 @@ func recordedAgentArgs(sys System, cfg Config) ([]string, error) {
 	path := cfg.AgentArgsRecord
 	rec, err := dataroot.ReadAgentArgsRecord(systemFiles{sys}, path)
 	if err != nil {
-		return nil, fmt.Errorf("install: %w (`sudo rm %s` to reinstall from the stock template, which discards the arguments it lists)", err, path)
+		return nil, fmt.Errorf("install: %w (`sudo rm -- %s` to reinstall from the stock template, which discards the arguments it lists)", err, shellQuote(path))
 	}
 	if rec == nil {
 		return nil, nil

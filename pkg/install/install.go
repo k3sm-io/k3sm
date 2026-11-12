@@ -2860,7 +2860,7 @@ func uninstall(ctx context.Context, sys System, cfg Config, preflight func(m []a
 	// server flags they configured are still there — and guessing wrong in the
 	// safe direction means restoring a backup nobody needed to take.
 	cfg.Logger.Info("kept, so a reinstall picks up where you left off: "+strings.Join(keptArtifacts(cfg, m), ", "),
-		"remove-the-carried-arguments", "sudo rm "+cfg.argsRecordPath())
+		"remove-the-carried-arguments", "sudo rm -- "+shellQuote(cfg.argsRecordPath()))
 	if st.Volume != nil {
 		// The volume is data, not an artifact: it holds the datastore, the image
 		// blobs and every PersistentVolume, so uninstall leaves it mounted and

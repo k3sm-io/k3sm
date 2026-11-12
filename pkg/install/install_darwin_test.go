@@ -2015,7 +2015,7 @@ func TestEnsureFileOwnedByRefusesHardlinkWithRemedy(t *testing.T) {
 	if !errors.Is(err, errHardlinkRefused) || !errors.Is(err, ErrNotRegularFile) {
 		t.Fatalf("ensureFileOwnedBy = %v, want the hard link refusal", err)
 	}
-	for _, want := range []string{"sudo rm " + path, "safe to remove", "no state"} {
+	for _, want := range []string{"sudo rm -- " + shellQuote(path), "safe to remove", "no state"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not contain %q", err, want)
 		}
@@ -2264,12 +2264,12 @@ func TestLockDirectoryRemedy(t *testing.T) {
 	if !errors.Is(err, ErrNotRegularFile) || errors.Is(err, errHardlinkRefused) {
 		t.Fatalf("ensureFileOwnedBy = %v, want ErrNotRegularFile and not the hard link refusal", err)
 	}
-	for _, want := range []string{"directory", "sudo rmdir " + path, "sudo rm -rf " + path, "no state"} {
+	for _, want := range []string{"directory", "sudo rmdir -- " + shellQuote(path), "sudo rm -rf -- " + shellQuote(path), "no state"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not contain %q", err, want)
 		}
 	}
-	if strings.Contains(err.Error(), "sudo rm "+path) {
+	if strings.Contains(err.Error(), "sudo rm -- "+shellQuote(path)) {
 		t.Errorf("error %q offers `sudo rm`, which fails on a directory", err)
 	}
 	if fi, statErr := os.Lstat(path); statErr != nil || !fi.IsDir() {

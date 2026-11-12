@@ -553,7 +553,7 @@ func revertInstallRoot(ctx context.Context, sys System, cfg Config, m []artifact
 	if _, err := restartDaemons(ctx, sys, cfg, m); err != nil {
 		return fmt.Errorf("%w; rolled back to the previous install root (the failed tree is at %s), but restarting the daemons on it also failed: %v; daemon state: %s", cause, staging, err, states())
 	}
-	return fmt.Errorf("%w; rolled back to the previous install root and restarted the daemons on it (the failed tree is at %s, remove it with `sudo rm -rf %s`); daemon state: %s", cause, staging, staging, states())
+	return fmt.Errorf("%w; rolled back to the previous install root and restarted the daemons on it (the failed tree is at %s, remove it with `sudo rm -rf -- %s`); daemon state: %s", cause, staging, shellQuote(staging), states())
 }
 
 // recoverBootedOut re-bootstraps, best effort, every label this install booted out
@@ -1351,7 +1351,7 @@ func withdrawFirstInstallTree(sys System, cfg Config, cause error) error {
 	// One way only: a swap would put whatever occupies the staging path at
 	// the install root, so a staging path that exists is refused instead.
 	if err := sys.MoveInstallRootAside(live, staging); err != nil {
-		return fmt.Errorf("%w; first install: moving the new tree from the install root %s to %s failed too (%v), so it is still there beside the developer-mode marker %s, which still reads on; remove it with `sudo rm -rf %s` before k3sm.app runs anything as root", cause, live, staging, err, DeveloperModeMarkerPath, live)
+		return fmt.Errorf("%w; first install: moving the new tree from the install root %s to %s failed too (%v), so it is still there beside the developer-mode marker %s, which still reads on; remove it with `sudo rm -rf -- %s` before k3sm.app runs anything as root", cause, live, staging, err, DeveloperModeMarkerPath, shellQuote(live))
 	}
 	cfg.Logger.Warn("moved the new tree out of the install root: the developer-mode marker still reads on", "install-root", live, "moved-to", staging)
 	return fmt.Errorf("%w; first install: the new tree was moved from the install root %s to %s (the next install removes it), and nothing was wired or started", cause, live, staging)
