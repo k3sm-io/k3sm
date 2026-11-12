@@ -160,15 +160,6 @@ func TestVerifyDaemonsPassesWithoutAFreshFailure(t *testing.T) {
 		{"a corrupt record is bookkeeping, not a verdict", func(t *testing.T, f *fakeSystem, cfg Config) {
 			f.putFile(executor.CrashLoopPath(cfg.serverWorkDir()), []byte("{not json"))
 		}},
-		{"a symlink in the record's place is refused, not followed, and reads as unreadable", func(t *testing.T, f *fakeSystem, cfg Config) {
-			// The bytes behind the link describe a parked daemon: a read that
-			// followed it would fail the install.
-			at := installStart.Add(time.Minute)
-			path := seedCrashRecord(t, f, cfg, executor.CrashRecord{TrippedAt: &at, Crashes: []executor.Crash{
-				{At: at, Origin: executor.CrashOriginBringUp, Component: "kine", Permanent: true},
-			}})
-			f.putSymlink(path)
-		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -331,7 +322,10 @@ func TestBringUpWindowStartsAtTheDaemonBootstrap(t *testing.T) {
 
 				if r.label == AgentLabel {
 					seedAgentCrashRecord(t, f, cfg, rec)
-					_, got := readAgentFailures(f, cfg, window.since(AgentLabel))
+					_, got, err := readAgentFailures(f, cfg, window.since(AgentLabel))
+					if err != nil {
+						t.Fatalf("readAgentFailures: %v", err)
+					}
 					if got.count != row.wantCount {
 						t.Fatalf("counted %d agent failures from the fence, want %d (entries %+v)", got.count, row.wantCount, rec.Crashes)
 					}
@@ -356,5 +350,84 @@ func TestBringUpWindowStartsAtTheDaemonBootstrap(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// refusedRecordCases are the crash-record entries a root read must refuse
+// rather than treat as "no record": the record's directory is writable by the
+// service uid, so each of these is something a writer there can plant to hide
+// a parked daemon from the installer. The bytes seeded first describe a
+// parked daemon, so a read that followed the planted entry would see one.
+func refusedRecordCases(installStart time.Time) []struct {
+	name  string
+	plant func(f *fakeSystem, path string)
+} {
+	return []struct {
+		name  string
+		plant func(f *fakeSystem, path string)
+	}{
+		{"symlink", func(f *fakeSystem, path string) { f.putSymlink(path) }},
+		// The fake answers a FIFO as the non-regular refusal; that the real
+		// read refuses one without blocking is readOwnedRegularFile's
+		// O_NONBLOCK open, checked on disk in install_darwin_test.go.
+		{"fifo", func(f *fakeSystem, path string) { f.putIrregular(path) }},
+		{"oversize", func(f *fakeSystem, path string) {
+			f.putFile(path, make([]byte, crashRecordReadLimit+1))
+		}},
+	}
+}
+
+func parkedRecord(at time.Time) executor.CrashRecord {
+	return executor.CrashRecord{TrippedAt: &at, Crashes: []executor.Crash{
+		{At: at, Origin: executor.CrashOriginBringUp, Component: "kine", Permanent: true},
+	}}
+}
+
+// A refused crash-record read fails the install closed, naming the path and
+// the remedy. Treating it as "no record" would let a planted entry hide a
+// parked daemon and report a healthy install over a control plane that is not
+// running.
+func TestVerifyServerNotParkedFailsClosedOnRefusedRecord(t *testing.T) {
+	installStart := time.Date(2026, 9, 16, 9, 0, 0, 0, time.UTC)
+	for _, tc := range refusedRecordCases(installStart) {
+		t.Run(tc.name, func(t *testing.T) {
+			f := reinstallFake(t)
+			cfg := installCfg(t).withDefaults()
+			path := seedCrashRecord(t, f, cfg, parkedRecord(installStart.Add(time.Minute)))
+			tc.plant(f, path)
+
+			err := verifyServerNotParked(f, cfg, artifactManifest(cfg), installStart)
+			if err == nil {
+				t.Fatal("verifyServerNotParked passed over a crash record it refused to read")
+			}
+			for _, want := range []string{path, "remove it"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q must carry %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+// The agent's crash-record read fails closed the same way.
+func TestReadAgentFailuresFailsClosedOnRefusedRecord(t *testing.T) {
+	installStart := time.Date(2026, 9, 16, 9, 0, 0, 0, time.UTC)
+	for _, tc := range refusedRecordCases(installStart) {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeSystem{}
+			cfg := agentCfg(t).withDefaults()
+			path := seedAgentCrashRecord(t, f, cfg, parkedRecord(installStart.Add(time.Minute)))
+			tc.plant(f, path)
+
+			_, _, err := readAgentFailures(f, cfg, installStart)
+			if err == nil {
+				t.Fatal("readAgentFailures answered over a crash record it refused to read")
+			}
+			for _, want := range []string{path, "remove it"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q must carry %q", err, want)
+				}
+			}
+		})
 	}
 }

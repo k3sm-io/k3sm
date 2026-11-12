@@ -775,6 +775,13 @@ func (f *fakeSystem) ReadRegularFileWithMode(path string) ([]byte, fs.FileMode, 
 func (f *fakeSystem) ReadOwnedRegularFile(path string, limit int64) ([]byte, OwnedEntry, error) {
 	f.calls = append(f.calls, "ReadOwnedRegularFile:"+path)
 	b, err := f.readRegularFileContent(path)
+	// A file seeded to change across reads answers here as it does through
+	// ReadRegularFile, so the crash-record polling fixtures keep working.
+	if _, refused := f.kinds[path]; !refused {
+		if db, derr, ok := f.readDelayed(path); ok {
+			b, err = db, derr
+		}
+	}
 	if err != nil {
 		return nil, OwnedEntry{}, err
 	}
