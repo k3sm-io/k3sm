@@ -1924,7 +1924,9 @@ def k3sm(argv):
         jsave("k8s.json", s)
         # Broken reports of a good eviction: a dry run, or nothing named removed.
         removed = [] if "rm-lists-none" in BRK else ["sha256:" + h for h in gone + extra]
-        out({"manifestDigest": reg["digest"], "dryRun": "rm-says-dry" in BRK, "removedDigests": removed,
+        # A broken report: the rm names another image's manifest.
+        md = "sha256:" + "0" * 64 if "rm-wrong-manifest" in BRK else reg["digest"]
+        out({"manifestDigest": md, "dryRun": "rm-says-dry" in BRK, "removedDigests": removed,
              "kept": [{"digest": "sha256:" + h, "reason": r} for h, r in sorted(kept.items())], "reclaimedBytes": sum(mine[h] for h in gone)})
         return 0
     print("fake k3sm: unhandled %r" % argv, file=sys.stderr)
@@ -2061,7 +2063,9 @@ self_test() {
 
 	BYSTANDER="$(printf 'bystander\n' | shasum -a 256 | awk '{print $1}')"
 	# One full fake run. FAKE_BREAK names a mutant; want is the exit and the red rung.
-	# FR_STEP, set on one call, shortens K3SM_MST_STEP_TIMEOUT for a run whose fake hangs.
+	# FR_STEP, set on one call, shortens K3SM_MST_STEP_TIMEOUT for a run whose fake hangs;
+	# FR_READY and FR_RECLAIM widen the ready and reclaim bounds for a run that must not
+	# go red early on a loaded host.
 	fake_run() { # <name> <break> <want-exit> <want-in-output> [evidence-dir]
 		local name="$1" brk="$2" want="$3" grepfor="$4" ev="${5:-$t/runs/$1/ev}" r="$t/runs/$1" got=0 o
 		mkdir -p "$r/state" "$r/srv/cache/blobs/sha256" "$r/wrk/cache/blobs/sha256" "$r/srv/registry"
@@ -2079,8 +2083,8 @@ self_test() {
 				K3SM_MST_SERVER_CACHE="$r/srv/cache" K3SM_MST_WORKER_CACHE="$r/wrk/cache" \
 				K3SM_MST_SERVER_WORK="$r/srv/work" K3SM_MST_WORKER_WORK="$r/wrk/work" \
 				K3SM_MST_REGISTRY_ROOT="$r/srv/registry" K3SM_MST_K3SM=k3sm K3SM_MST_LOCAL_K3SM=k3sm \
-				K3SM_MST_VIEW_UID="$(id -u)" K3SM_MST_POLL=0.05 K3SM_MST_READY_TIMEOUT=20 \
-				K3SM_MST_RECLAIM_TIMEOUT=2 K3SM_MST_STEP_TIMEOUT="${FR_STEP:-30}" \
+				K3SM_MST_VIEW_UID="$(id -u)" K3SM_MST_POLL=0.05 K3SM_MST_READY_TIMEOUT="${FR_READY:-20}" \
+				K3SM_MST_RECLAIM_TIMEOUT="${FR_RECLAIM:-2}" K3SM_MST_STEP_TIMEOUT="${FR_STEP:-30}" \
 				"$SELF" --lab --model-dir "$t/m" --model-sums "$t/sums" --evidence "$ev" 2>&1
 		)" || got=$?
 		printf '%s\n' "$o" >"$r/out"
@@ -2137,7 +2141,7 @@ self_test() {
 		"pvc-read-fails|t.3" "copyrun-exec-fails|t.5" "copyrun-no-marker|t.5" \
 		"scale-copies|t.6" "prune-keeps|t.7" "registry-keeps|t.7" \
 		"rm-kept-unshared|t.7" "rm-old-daemon|t.7" "rm-evicts-all|t.7" "rm-evicts-listed|t.7" \
-		"rm-says-dry|t.7" "rm-lists-none|t.7" "rm-noop|t.7"; do
+		"rm-says-dry|t.7" "rm-lists-none|t.7" "rm-noop|t.7" "rm-wrong-manifest|t.7"; do
 		brk="${row%|*}" rung="${row#*|}"
 		fake_run "$brk" "$brk" 1 "result: FAIL ($rung)"
 		cleaned "$brk"
@@ -2152,6 +2156,9 @@ self_test() {
 	reason() { # <run name> <want in t.5's FAIL row of result.tsv>
 		has "$1: t.5 reason" "$(awk -F '\t' '$1 == "t.5" && $2 == "FAIL"' "$t/runs/$1/ev/result.tsv" 2>/dev/null)" "$2"
 	}
+	# t.3b's order: the worker's watcher must see the partial before the pull commits.
+	# A worker that commits the blob first is red for that order, not for a timeout.
+	has "no-partial: t.3b reason" "$(awk -F '\t' '$1 == "t.3b" && $2 == "FAIL"' "$t/runs/no-partial/ev/result.tsv" 2>/dev/null)" "the blob was committed before a partial was seen"
 	reason hub-cache-full "the Hub cache is not empty or the tree shows a Hub fetch: HUB-DIRTY cache ./models/hub"
 	reason hub-env-missing "the Pod spec does not set HF_HUB_OFFLINE=1 on mlx-serve"
 	has "hub-env-missing: the exec env still had it" "$(cat "$t/runs/hub-env-missing/out")" "t.4: PASS"
@@ -2184,6 +2191,7 @@ self_test() {
 	reason7 rm-evicts-listed "reported removing blob(s) outside the image: sha256:$BYSTANDER"
 	reason7 rm-says-dry "dryRun is not false"
 	reason7 rm-lists-none "removedDigests is empty"
+	reason7 rm-wrong-manifest "manifestDigest is sha256:$(printf '0%.0s' $(seq 64)), not sha256:"
 	# Seen before the registry prune, which would evict the server's copy itself.
 	reason7 rm-noop "is still on srv after image rm"
 	# A blob kept because another image shares it is not a failure.
@@ -2211,8 +2219,12 @@ self_test() {
 	has "rm-late-commit: the retry is logged" "$(cat "$RUN_DIR/ev/f.1.log")" "removed on the retry"
 
 	# A cleanup that cannot remove the namespace fails a run whose rungs all passed.
-	fake_run ns-stuck ns-stuck 1 "f.1: FAIL"
+	# f.1 waits the whole ready bound for a namespace that never goes, so no fake event
+	# can end it early: the bounds are wide instead, so a loaded host cannot turn t.3's
+	# ready waits or t.7's reclaim wait red before f.1 is reached.
+	FR_READY=60 FR_RECLAIM=10 fake_run ns-stuck ns-stuck 1 "f.1: FAIL"
 	has "ns-stuck: named" "$(cat "$RUN_DIR/out")" "result: FAIL (f.1)"
+	for out in t.3 t.3b t.4 t.5 t.6 t.7; do has "ns-stuck: $out passed first" "$(cat "$RUN_DIR/out")" "$out: PASS"; done
 
 	# The evidence dir must lie under a k3sm-io.scratch directory (the pure check).
 	mkdir -p "$t/ev-in" "$base/outside"
