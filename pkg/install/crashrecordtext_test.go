@@ -95,6 +95,30 @@ func TestHostileCrashRecordRendersAsDataOnInstall(t *testing.T) {
 			t.Fatal("verifyServerNotParked passed over a tripped record")
 		}
 		check(t, "the parked error", err.Error())
+		if strings.Contains(err.Error(), "FAKE: install succeeded") {
+			t.Errorf("the parked error carries text from the record's origin: %q", err)
+		}
+	})
+
+	// An origin with no control rune in it is still not one the executor
+	// writes: it is data, and the parked error names it "unknown".
+	t.Run("server parked, printable unknown origin", func(t *testing.T) {
+		const fake = "FAKE: install succeeded"
+		f := reinstallFake(t)
+		cfg := installCfg(t).withDefaults()
+		seedCrashRecord(t, f, cfg, executor.CrashRecord{TrippedAt: &at, Crashes: []executor.Crash{
+			{At: at, Origin: fake, Component: "kine", Detail: "x", Permanent: true},
+		}})
+		err := verifyServerNotParked(f, cfg, artifactManifest(cfg), installStart)
+		if err == nil {
+			t.Fatal("verifyServerNotParked passed over a tripped record")
+		}
+		if strings.Contains(err.Error(), fake) {
+			t.Errorf("the parked error carries the record's unknown origin %q: %q", fake, err)
+		}
+		if !strings.Contains(err.Error(), "unknown: kine") {
+			t.Errorf("the parked error does not name the unknown origin \"unknown\": %q", err)
+		}
 	})
 
 	t.Run("server not coming up", func(t *testing.T) {

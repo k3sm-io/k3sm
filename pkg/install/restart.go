@@ -706,7 +706,7 @@ func verifyServerNotParked(sys System, cfg Config, m []artifact, since time.Time
 	if rec.Tripped() {
 		last, _ := rec.Last()
 		return fmt.Errorf("%w: %s, so it is resident and serving nothing (tripped at %s; %s: %s; record: %s). Clear it and reinstall: sudo k3sm server --clear-crashloop",
-			ErrServerParked, parkedSummary(last), rec.TrippedAt.Format(time.RFC3339), termsafe.Strip(last.Origin), termsafe.Component(last.Component), path)
+			ErrServerParked, parkedSummary(last), rec.TrippedAt.Format(time.RFC3339), crashOrigin(last.Origin), termsafe.Component(last.Component), path)
 	}
 	// The daemon and this process read the same machine's clock, so comparing
 	// the record's timestamps with the bootstrap fence compares a clock with
@@ -733,6 +733,20 @@ func freshBringUpFailures(rec executor.CrashRecord, since time.Time) (int, execu
 		last = c
 	}
 	return n, last
+}
+
+// crashOrigin is a crash-loop record's origin as an install error may show it.
+// Origin belongs to a closed set, the executor.CrashOrigin* constants (or empty);
+// the record is writable by the service uid and this runs as root, so any other
+// value is data, not an origin, and the fixed word "unknown" stands in, as
+// termsafe.Component does for a component.
+func crashOrigin(origin string) string {
+	switch origin {
+	case "", executor.CrashOriginCrash, executor.CrashOriginBringUp,
+		executor.CrashOriginLeaderLost, executor.CrashOriginBringUpSlow:
+		return origin
+	}
+	return "unknown"
 }
 
 // parkedSummary says which of the three failures the breaker counted last, in the
