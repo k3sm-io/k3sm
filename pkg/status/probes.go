@@ -29,6 +29,7 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/datavol"
+	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/version"
 )
@@ -49,9 +50,11 @@ type FS interface {
 	Stat(path string) (fs.FileInfo, error)
 	ReadTail(path string, n int) ([]string, error)
 	Readlink(path string) (string, error)
-	// ReadFile reads a whole small file (the crash-loop record). It exists as
-	// its own method so a fake can refuse it the way a 0700 work dir refuses a
-	// plain-user status run.
+	// ReadFile reads a whole small file (the daemons' published summaries,
+	// markers and records the rows parse, and the server plist). It exists as its
+	// own method so a fake can refuse it the way a 0700 work dir refuses a
+	// plain-user status run. The crash-loop record is NOT read through it: see
+	// Collector.ReadCrashRecord.
 	ReadFile(path string) ([]byte, error)
 }
 
@@ -377,8 +380,13 @@ type Collector struct {
 	EUID          int
 	ServiceUID    int
 	Now           func() time.Time
-	Version       version.Info
-	Host          string
+	// ReadCrashRecord reads the daemon's crash-loop record (cmd/k3sm wires
+	// executor.ReadCrashRecord, the bounded no-follow reader). OPTIONAL: nil
+	// skips the read and leaves the server row to launchd's verdict, so a
+	// collector built on a fake FS never reads the host's real record.
+	ReadCrashRecord func(path string) (executor.CrashRecord, error)
+	Version         version.Info
+	Host            string
 	// Hostname is this Mac's host name, used to pick THIS node out of a
 	// multi-node cluster's node list. Empty leaves the node row to its fallback.
 	Hostname string

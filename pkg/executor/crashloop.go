@@ -20,9 +20,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"time"
+
+	"golang.org/x/sys/unix"
+
+	"k3sm.io/k3sm/internal/atomicfile"
 )
 
 // The crash-loop circuit breaker.
@@ -209,15 +215,70 @@ func ParseCrashRecord(b []byte) (CrashRecord, error) {
 	return r, nil
 }
 
+// CrashRecordMaxBytes bounds how much of a crash-loop record any reader reads:
+// the daemon's own readCrashRecordFile and the installer's root-run read of the
+// same file (pkg/install), which uses this constant so the two cannot drift.
+// The daemon writes at most a window's worth of entries, each carrying a
+// Detail capped at exitLogTailBytes (4 KiB) before JSON escaping, which can at
+// worst sextuple it (\u00XX); even a few dozen such entries, indented, stay
+// well under 1 MiB. Anything larger is not a record this daemon wrote, and the
+// bound keeps a file planted in the service-user-writable work dir from making
+// its reader allocate without limit.
+const CrashRecordMaxBytes = 1 << 20
+
+// errCrashRecordRefused marks a record readCrashRecordFile would not read: a
+// symlink, a non-regular file, or one over CrashRecordMaxBytes.
+var errCrashRecordRefused = errors.New("crash-loop record refused")
+
+// readCrashRecordFile reads the record's bytes the way dataroot.ReadMarker
+// reads its marker: opened O_NOFOLLOW|O_NONBLOCK, typed and sized by fstat on
+// that one descriptor, and read from it, so nothing can be swapped between the
+// check and the read. O_NOFOLLOW guards only the last path component; a
+// symlinked parent directory is followed, and the work dir's ownership is the
+// control for it. O_NONBLOCK keeps a planted FIFO from blocking the open. A
+// missing file keeps os.ReadFile's contract (errors.Is(err, fs.ErrNotExist)).
+func readCrashRecordFile(path string) ([]byte, error) {
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		if errors.Is(err, unix.ELOOP) {
+			return nil, fmt.Errorf("%s is a symlink: %w", path, errCrashRecordRefused)
+		}
+		return nil, &fs.PathError{Op: "open", Path: path, Err: err}
+	}
+	f := os.NewFile(uintptr(fd), path)
+	defer func() { _ = f.Close() }()
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return nil, fmt.Errorf("stat %s: %w", path, err)
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
+		return nil, fmt.Errorf("%s is not a regular file (mode %#o): %w", path, st.Mode&unix.S_IFMT, errCrashRecordRefused)
+	}
+	if st.Size > CrashRecordMaxBytes {
+		return nil, fmt.Errorf("%s is %d bytes, over the %d-byte bound: %w", path, st.Size, CrashRecordMaxBytes, errCrashRecordRefused)
+	}
+	// Read one byte past the bound, so a file that grew after the fstat is
+	// refused rather than silently truncated into a parse error.
+	b, err := io.ReadAll(io.LimitReader(f, CrashRecordMaxBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	if len(b) > CrashRecordMaxBytes {
+		return nil, fmt.Errorf("%s grew past the %d-byte bound: %w", path, CrashRecordMaxBytes, errCrashRecordRefused)
+	}
+	return b, nil
+}
+
 // ReadCrashRecord loads the record at path. An absent file is an empty record,
-// not an error; an unreadable or malformed one is returned as an error so a
-// caller can decide (the daemon treats a malformed record as empty and logs it,
+// not an error; an unreadable, refused (a symlink, a non-regular file, or one
+// over CrashRecordMaxBytes) or malformed one is returned as an error so a
+// caller can decide (the daemon treats such a record as empty and logs it,
 // because refusing to boot over a corrupt bookkeeping file would be a second
 // way to lose the control plane).
 func ReadCrashRecord(path string) (CrashRecord, error) {
 	var r CrashRecord
-	b, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
+	b, err := readCrashRecordFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
 		return r, nil
 	}
 	if err != nil {
@@ -230,23 +291,18 @@ func ReadCrashRecord(path string) (CrashRecord, error) {
 	return r, nil
 }
 
-// WriteCrashRecord persists r at path atomically (temp file + rename), mode
+// WriteCrashRecord persists r at path atomically with atomicfile.Replace, mode
 // 0600: the details are redacted, but the file still describes a failure an
-// operator has not read yet.
+// operator has not read yet. The record's directory is writable by the service
+// user, so the temp is a randomly named, exclusively created file in that
+// directory (a symlink planted at any fixed temp name is never followed), and
+// the rename replaces a symlink at path rather than writing through it.
 func WriteCrashRecord(path string, r CrashRecord) error {
 	b, err := json.MarshalIndent(r, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	return atomicfile.Replace(path, b, 0o600)
 }
 
 // ClearCrashRecord removes the record. An absent file is success: the operator's

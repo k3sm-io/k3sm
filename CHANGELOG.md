@@ -271,6 +271,13 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
 
 ### Fixed
 
+- The node daemon and `k3sm install` no longer follow a symlink or read a FIFO or other non-regular
+  file in place of the crash-loop record, and both read at most 1 MiB of it. The daemon treats such
+  a record as unreadable, the same as a corrupt one. `k3sm install` fails instead of reporting a
+  parked daemon as healthy, and it fails the same way on a record it cannot read for any other
+  reason, such as a permission or I/O error; only a missing record counts as no record. The error
+  names the path, says the new binary is already running, and says that re-running install after
+  you fix or remove the record is safe.
 - A server whose control plane does not report healthy in time while the Mac is heavily loaded no
   longer parks on the crash-loop breaker after five attempts. It backs off instead, from 30 seconds
   doubling up to 10 minutes, `k3sm status` shows when the next attempt starts and, while the

@@ -1821,8 +1821,8 @@ func TestReadOwnedRegularFileOnDisk(t *testing.T) {
 		if err := os.Symlink(tok, link); err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := readOwnedRegularFile(link, 256); !errors.Is(err, ErrNotRegularFile) {
-			t.Errorf("readOwnedRegularFile(symlink) = %v, want ErrNotRegularFile", err)
+		if _, _, err := readOwnedRegularFile(link, 256); !errors.Is(err, ErrNotRegularFile) || errors.Is(err, ErrFileTooLarge) {
+			t.Errorf("readOwnedRegularFile(symlink) = %v, want ErrNotRegularFile and not ErrFileTooLarge", err)
 		}
 	})
 	t.Run("a fifo is refused without blocking", func(t *testing.T) {
@@ -1830,13 +1830,17 @@ func TestReadOwnedRegularFileOnDisk(t *testing.T) {
 		if err := syscall.Mkfifo(fifo, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := readOwnedRegularFile(fifo, 256); !errors.Is(err, ErrNotRegularFile) {
-			t.Errorf("readOwnedRegularFile(fifo) = %v, want ErrNotRegularFile", err)
+		if _, _, err := readOwnedRegularFile(fifo, 256); !errors.Is(err, ErrNotRegularFile) || errors.Is(err, ErrFileTooLarge) {
+			t.Errorf("readOwnedRegularFile(fifo) = %v, want ErrNotRegularFile and not ErrFileTooLarge", err)
 		}
 	})
 	t.Run("a file past the limit is refused", func(t *testing.T) {
-		if _, _, err := readOwnedRegularFile(tok, 4); err == nil {
-			t.Error("readOwnedRegularFile read a file larger than its limit")
+		// The read-past-limit path (a file that grows between fstat and
+		// read) cannot be reached without racing a writer; the stat-size
+		// refusal is the deterministic one.
+		_, _, err := readOwnedRegularFile(tok, 4)
+		if !errors.Is(err, ErrFileTooLarge) || errors.Is(err, ErrNotRegularFile) {
+			t.Errorf("readOwnedRegularFile(oversize) = %v, want ErrFileTooLarge and not ErrNotRegularFile", err)
 		}
 	})
 	t.Run("a missing file keeps the not-exist contract", func(t *testing.T) {

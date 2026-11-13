@@ -679,22 +679,23 @@ var ErrServerNotComingUp = errors.New("the k3sm server daemon did not bring the 
 // by the fresh check either way: a component that came up and later died is a
 // different and survivable story, and launchd's restart of it is the design.
 //
-// It is FAIL-OPEN on everything else: an absent record is the ordinary case, and
-// an unreadable or malformed one is bookkeeping, not a verdict — refusing an
-// install over a corrupt marker would be a second way to lose a control plane,
-// the same reason the daemon treats it as empty.
+// An absent record is the ordinary case, and a malformed one is bookkeeping,
+// not a verdict: it is logged and passes, because refusing an install over a
+// corrupt marker would be a second way to lose a control plane, the same
+// reason the daemon treats it as empty. A record the read REFUSES — a
+// symlink, a FIFO or other non-regular entry, or one over the size bound —
+// fails the install closed (readCrashRecordFile): it is something planted in
+// the record's place, and passing over it would hide a parked daemon. So does
+// a record that exists but cannot be read for any other reason; this is a
+// single read, so unlike the agent's polled one it is not retried.
 func verifyServerNotParked(sys System, cfg Config, m []artifact, since time.Time) error {
 	if !slices.Contains(longRunningDaemonLabels(m), ServerLabel) {
 		return nil // an agent-only install runs no control plane of its own
 	}
 	path := executor.CrashLoopPath(cfg.serverWorkDir())
-	raw, err := sys.ReadFile(path)
-	switch {
-	case errors.Is(err, fs.ErrNotExist):
-		return nil
-	case err != nil:
-		cfg.Logger.Warn("could not read the server's crash-loop record", "path", path, "err", err)
-		return nil
+	raw, ok, err := readCrashRecordFile(sys, "server", path)
+	if err != nil || !ok {
+		return err
 	}
 	rec, err := executor.ParseCrashRecord(raw)
 	if err != nil {
@@ -777,8 +778,12 @@ func parkedSummary(last executor.Crash) string {
 //     at or after THIS install's start is this install's to report and fails it
 //     immediately, quoting what the daemon recorded. Older entries fail
 //     nothing — they are the fault an operator may well be reinstalling to fix.
-//     It is FAIL-OPEN on everything else (absent, unreadable, malformed), for
-//     the reason the server's is: bookkeeping is not a verdict.
+//     An absent or malformed record passes, for the reason the server's does:
+//     bookkeeping is not a verdict. A record the read refuses (non-regular or
+//     oversize) fails the install closed at once, as the server's does. A
+//     record that exists but cannot be read (EIO, EACCES) is retried on each
+//     tick until the deadline, and then fails the install closed with the
+//     last such error; a tick that could not read it never proves a join.
 //   - THE CREDENTIAL'S CLUSTER, not its existence. The credential counts only
 //     when it parses as a complete node credential (pkg/nodecred — the same
 //     reader the daemon and `k3sm status` use) AND its cluster-CA pin is the one
@@ -879,7 +884,23 @@ func verifyAgentJoinedOn(ctx context.Context, sys System, cfg Config, since time
 		loggedState nodecred.State
 	)
 	for {
-		rec, fresh := readAgentFailures(sys, cfg, since)
+		rec, fresh, err := readAgentFailures(sys, cfg, since)
+		if err != nil {
+			// A refused record (not a regular file, over the bound) is planted,
+			// and waiting does not change that. Any other read failure may be
+			// momentary, so it is retried until the deadline — but a tick that
+			// could not read the record proves nothing, and at the deadline the
+			// last such failure is the install's error.
+			if isCrashRecordRefused(err) || clk.now().After(deadline) {
+				return err
+			}
+			cfg.Logger.Warn("the agent's crash-loop record could not be read; retrying until the join deadline",
+				"record", record, "err", err)
+			if err := clk.tick(ctx, agentJoinBudget.poll); err != nil {
+				return err
+			}
+			continue
+		}
 		if rec.Tripped() {
 			return fmt.Errorf("the agent daemon is not joining the cluster: its crash-loop breaker tripped at %s after %d start failures inside %s (last: %s), so this is a loop rather than a start that is about to recover. The reason is the last lines of %s; the agent's own record is %s",
 				rec.TrippedAt.Format(time.RFC3339), executor.CrashLoopThreshold, executor.CrashLoopWindow, agentFailureDetail(lastCrash(rec)), AgentLogPath(), record)
@@ -983,31 +1004,111 @@ func (w agentFailureWitness) newerThan(prev agentFailureWitness) bool {
 // with the bring-up failures dated at or after since, the agent label's
 // bootstrap fence.
 //
-// It is FAIL-OPEN on everything that is not a failure the daemon recorded — an
-// absent record is the ordinary case, and an unreadable or malformed one is
-// bookkeeping rather than a verdict, for the same reason the daemon treats a
-// corrupt record as empty: refusing an install over a marker nobody can parse
-// would be a second way to lose a node.
-func readAgentFailures(sys System, cfg Config, since time.Time) (executor.CrashRecord, agentFailureWitness) {
+// An absent record is the ordinary case, and a malformed one is bookkeeping
+// rather than a verdict, for the same reason the daemon treats a corrupt
+// record as empty: refusing an install over a marker nobody can parse would be
+// a second way to lose a node. A record the read refuses — non-regular or over
+// the size bound — or cannot read for any other reason is the error return
+// (readCrashRecordFile, whose crashRecordReadError says which), because
+// passing over it would hide a crash-looping agent.
+func readAgentFailures(sys System, cfg Config, since time.Time) (executor.CrashRecord, agentFailureWitness, error) {
 	path := executor.CrashLoopPath(cfg.agentWorkDir())
-	raw, err := sys.ReadFile(path)
-	switch {
-	case errors.Is(err, fs.ErrNotExist):
-		return executor.CrashRecord{}, agentFailureWitness{}
-	case err != nil:
-		cfg.Logger.Warn("could not read the agent's crash-loop record", "path", path, "err", err)
-		return executor.CrashRecord{}, agentFailureWitness{}
+	raw, ok, err := readCrashRecordFile(sys, "agent", path)
+	if err != nil || !ok {
+		return executor.CrashRecord{}, agentFailureWitness{}, err
 	}
 	rec, err := executor.ParseCrashRecord(raw)
 	if err != nil {
 		cfg.Logger.Warn("the agent's crash-loop record is unreadable; treating it as empty", "path", path, "err", err)
-		return executor.CrashRecord{}, agentFailureWitness{}
+		return executor.CrashRecord{}, agentFailureWitness{}, nil
 	}
 	// The daemon and this process read the same machine's clock, so comparing
 	// the record's timestamps with the bootstrap fence compares a clock with
 	// itself.
 	n, last := freshBringUpFailures(rec, since)
-	return rec, agentFailureWitness{count: n, last: last}
+	return rec, agentFailureWitness{count: n, last: last}, nil
+}
+
+// crashRecordReadError is readCrashRecordFile's error. Its text is the whole
+// operator-facing message; refused says which of the two classes it is, so a
+// caller branches with errors.As rather than on the wording:
+//
+//   - refused: the entry is not a regular file, or is over
+//     executor.CrashRecordMaxBytes. Something was planted in the record's
+//     place, and no amount of waiting turns it into a record, so every caller
+//     fails at once.
+//   - otherwise: a record that exists but could not be read this time (EIO,
+//     EACCES, a failed fstat). verifyAgentJoined, which polls, retries it until
+//     its deadline; verifyServerNotParked, which reads once, fails at once.
+type crashRecordReadError struct {
+	refused bool
+	err     error
+}
+
+func (e *crashRecordReadError) Error() string { return e.err.Error() }
+func (e *crashRecordReadError) Unwrap() error { return e.err }
+
+// isCrashRecordRefused reports whether err is a refused crash-record read
+// (crashRecordReadError.refused).
+func isCrashRecordRefused(err error) bool {
+	var re *crashRecordReadError
+	return errors.As(err, &re) && re.refused
+}
+
+// readCrashRecordFile reads a daemon's crash-loop record for the install-time
+// checks. ok is false, with a nil error, only when there is no record to judge:
+// the file does not exist (fs.ErrNotExist), the ordinary case.
+//
+// The read runs as root in a work dir the service uid (and so every pod) can
+// write, so it goes through ReadOwnedRegularFile: a symlink is refused rather
+// than followed, a FIFO is refused rather than blocked on (the open is
+// O_NONBLOCK and the type is judged on the descriptor), and the size is
+// bounded. Each of those refusals is an ERROR, not "no record": an entry a
+// writer there planted in the record's place would otherwise hide a parked
+// daemon and the install would report a healthy one. Any other read failure —
+// EACCES, EIO, a failed fstat — is an error for the same reason: a record that
+// exists but cannot be read cannot vouch that the daemon is not parked.
+//
+// Both callers run after restartDaemons has bootstrapped the new binary, so
+// the error says the new binary is already running and that re-running the
+// install once the record is fixed or removed is safe: install boots each
+// label out and bootstraps it again, which is idempotent.
+func readCrashRecordFile(sys System, role, path string) ([]byte, bool, error) {
+	raw, _, err := sys.ReadOwnedRegularFile(path, executor.CrashRecordMaxBytes)
+	switch {
+	case err == nil:
+		return raw, true, nil
+	case errors.Is(err, fs.ErrNotExist):
+		return nil, false, nil
+	case errors.Is(err, ErrNotRegularFile):
+		return nil, false, &crashRecordReadError{refused: true, err: fmt.Errorf("the %s's crash-loop record %s is not a regular file, so this install cannot tell whether the daemon is parked (%w); %s",
+			role, path, err, crashRecordRemedy("remove it", path))}
+	case errors.Is(err, ErrFileTooLarge):
+		// A regular file over the bound, by its fstat size or by what the read
+		// found: a record the daemon did not write.
+		return nil, false, &crashRecordReadError{refused: true, err: fmt.Errorf("the %s's crash-loop record %s could not be read within %d bytes, so this install cannot tell whether the daemon is parked (%w); %s",
+			role, path, executor.CrashRecordMaxBytes, err, crashRecordRemedy("remove it", path))}
+	default:
+		// Any other failure, including one after the entry was opened and
+		// judged regular, is the unreadable case, not the size bound.
+		return nil, false, &crashRecordReadError{err: fmt.Errorf("the %s's crash-loop record %s could not be read, so this install cannot tell whether the daemon is parked (%w); %s",
+			role, path, err, crashRecordRemedy("fix or remove it", path))}
+	}
+}
+
+// crashRecordRemedy is the shared tail of readCrashRecordFile's errors. fix
+// names what the operator does to the record ("remove it", "fix or remove
+// it"); path is quoted for the shell, since the data root is operator-chosen.
+func crashRecordRemedy(fix, path string) string {
+	return "the new binary is already running, and re-running install after you " + fix + " is safe: sudo rm " + shellQuote(path)
+}
+
+// shellQuote quotes s as ONE POSIX shell word: single quotes around it, each
+// embedded single quote closed, escaped and reopened ('\”). Inside single
+// quotes the shell expands nothing, so a path with spaces, $, backticks or
+// globs pastes back as the path it names.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // lastCrash is the newest entry of any origin, for the tripped message — which

@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -322,7 +323,10 @@ func TestBringUpWindowStartsAtTheDaemonBootstrap(t *testing.T) {
 
 				if r.label == AgentLabel {
 					seedAgentCrashRecord(t, f, cfg, rec)
-					_, got := readAgentFailures(f, cfg, window.since(AgentLabel))
+					_, got, err := readAgentFailures(f, cfg, window.since(AgentLabel))
+					if err != nil {
+						t.Fatalf("readAgentFailures: %v", err)
+					}
 					if got.count != row.wantCount {
 						t.Fatalf("counted %d agent failures from the fence, want %d (entries %+v)", got.count, row.wantCount, rec.Crashes)
 					}
@@ -347,5 +351,280 @@ func TestBringUpWindowStartsAtTheDaemonBootstrap(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// refusedRecordCases are the crash-record entries a root read must refuse
+// rather than treat as "no record": the record's directory is writable by the
+// service uid, so each of these is something a writer there can plant to hide
+// a parked daemon from the installer. The bytes seeded first describe a
+// parked daemon, so a read that followed the planted entry would see one.
+//
+// refused says which class the read error is (crashRecordReadError): a planted
+// entry is a refusal, an unreadable one is the class the agent retries.
+func refusedRecordCases(installStart time.Time) []struct {
+	name    string
+	plant   func(f *fakeSystem, path string)
+	refused bool
+} {
+	return []struct {
+		name    string
+		plant   func(f *fakeSystem, path string)
+		refused bool
+	}{
+		{"symlink", func(f *fakeSystem, path string) { f.putSymlink(path) }, true},
+		// The fake answers a FIFO as the non-regular refusal; that the real
+		// read refuses one without blocking is readOwnedRegularFile's
+		// O_NONBLOCK open, checked on disk in install_darwin_test.go.
+		{"fifo", func(f *fakeSystem, path string) { f.putIrregular(path) }, true},
+		{"oversize", func(f *fakeSystem, path string) {
+			f.putFile(path, make([]byte, executor.CrashRecordMaxBytes+1))
+		}, true},
+		// A record that exists but cannot be read for any other reason
+		// (EACCES, EIO, a failed fstat) is not "no record" either: only
+		// fs.ErrNotExist is.
+		{"unreadable", func(f *fakeSystem, path string) {
+			if f.readErrs == nil {
+				f.readErrs = map[string]error{}
+			}
+			f.readErrs[path] = fmt.Errorf("open %s: input/output error", path)
+		}, false},
+	}
+}
+
+func parkedRecord(at time.Time) executor.CrashRecord {
+	return executor.CrashRecord{TrippedAt: &at, Crashes: []executor.Crash{
+		{At: at, Origin: executor.CrashOriginBringUp, Component: "kine", Permanent: true},
+	}}
+}
+
+// A refused crash-record read fails the install closed, naming the path and
+// the remedy. Treating it as "no record" would let a planted entry hide a
+// parked daemon and report a healthy install over a control plane that is not
+// running.
+func TestVerifyServerNotParkedFailsClosedOnRefusedRecord(t *testing.T) {
+	installStart := time.Date(2026, 9, 16, 9, 0, 0, 0, time.UTC)
+	for _, tc := range refusedRecordCases(installStart) {
+		t.Run(tc.name, func(t *testing.T) {
+			f := reinstallFake(t)
+			cfg := installCfg(t).withDefaults()
+			path := seedCrashRecord(t, f, cfg, parkedRecord(installStart.Add(time.Minute)))
+			tc.plant(f, path)
+
+			err := verifyServerNotParked(f, cfg, artifactManifest(cfg), installStart)
+			if err == nil {
+				t.Fatal("verifyServerNotParked passed over a crash record it refused to read")
+			}
+			for _, want := range []string{path, "remove it", "the new binary is already running", "re-running install", "is safe"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q must carry %q", err, want)
+				}
+			}
+			if got := isCrashRecordRefused(err); got != tc.refused {
+				t.Errorf("isCrashRecordRefused(%q) = %v, want %v", err, got, tc.refused)
+			}
+		})
+	}
+}
+
+// The agent's crash-record read fails closed the same way.
+func TestReadAgentFailuresFailsClosedOnRefusedRecord(t *testing.T) {
+	installStart := time.Date(2026, 9, 16, 9, 0, 0, 0, time.UTC)
+	for _, tc := range refusedRecordCases(installStart) {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeSystem{}
+			cfg := agentCfg(t).withDefaults()
+			path := seedAgentCrashRecord(t, f, cfg, parkedRecord(installStart.Add(time.Minute)))
+			tc.plant(f, path)
+
+			_, _, err := readAgentFailures(f, cfg, installStart)
+			if err == nil {
+				t.Fatal("readAgentFailures answered over a crash record it refused to read")
+			}
+			for _, want := range []string{path, "remove it", "the new binary is already running", "re-running install", "is safe"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q must carry %q", err, want)
+				}
+			}
+			if got := isCrashRecordRefused(err); got != tc.refused {
+				t.Errorf("isCrashRecordRefused(%q) = %v, want %v", err, got, tc.refused)
+			}
+		})
+	}
+}
+
+// regularEntryReadErr is a System whose crash-record read opens the entry,
+// judges it a regular file within the bound, and then fails: the EIO after a
+// good fstat. It is the case readCrashRecordFile used to report as "over the
+// size bound" because the entry it got back was regular.
+type regularEntryReadErr struct {
+	*fakeSystem
+	err error
+}
+
+func (s regularEntryReadErr) ReadOwnedRegularFile(path string, _ int64) ([]byte, OwnedEntry, error) {
+	return nil, OwnedEntry{Path: path, UID: 271, GID: 271, Mode: 0o600, Kind: EntryRegular}, s.err
+}
+
+// readCrashRecordFile sorts its failures into the two classes the agent's
+// polling loop branches on, and names the size bound only when the size is
+// what refused the read.
+func TestReadCrashRecordFileClassifiesFailures(t *testing.T) {
+	cfg := agentCfg(t).withDefaults()
+	path := executor.CrashLoopPath(cfg.agentWorkDir())
+	eio := fmt.Errorf("read %s: input/output error", path)
+	within := fmt.Sprintf("within %d bytes", executor.CrashRecordMaxBytes)
+	cases := []struct {
+		name        string
+		sys         func(f *fakeSystem) System
+		wantRefused bool
+		want        []string
+		notWant     []string
+	}{
+		{
+			name:        "not a regular file is a refusal",
+			sys:         func(f *fakeSystem) System { f.putIrregular(path); return f },
+			wantRefused: true,
+			want:        []string{"is not a regular file", "remove it"},
+		},
+		{
+			name: "over the bound is a refusal naming the bound",
+			sys: func(f *fakeSystem) System {
+				f.putFile(path, make([]byte, executor.CrashRecordMaxBytes+1))
+				return f
+			},
+			wantRefused: true,
+			want:        []string{within},
+		},
+		{
+			name:    "a read error after a regular-file stat is unreadable, not oversize",
+			sys:     func(f *fakeSystem) System { return regularEntryReadErr{fakeSystem: f, err: eio} },
+			want:    []string{"could not be read,", "input/output error", "fix or remove it"},
+			notWant: []string{within},
+		},
+		{
+			name:    "a read error before the stat is unreadable",
+			sys:     func(f *fakeSystem) System { f.putTransientReadErr(path, eio, 0); return f },
+			want:    []string{"could not be read,", "fix or remove it"},
+			notWant: []string{within},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeSystem{}
+			f.putFile(path, []byte(`{"crashes":[]}`))
+			_, ok, err := readCrashRecordFile(tc.sys(f), "agent", path)
+			if err == nil || ok {
+				t.Fatalf("readCrashRecordFile = ok %v, err %v; want a failure", ok, err)
+			}
+			if got := isCrashRecordRefused(err); got != tc.wantRefused {
+				t.Errorf("isCrashRecordRefused(%q) = %v, want %v", err, got, tc.wantRefused)
+			}
+			var re *crashRecordReadError
+			if !errors.As(err, &re) {
+				t.Errorf("error %q is not a crashRecordReadError, so no caller can branch on its class", err)
+			}
+			for _, w := range append(tc.want, "sudo rm "+shellQuote(path)) {
+				if !strings.Contains(err.Error(), w) {
+					t.Errorf("error %q must carry %q", err, w)
+				}
+			}
+			for _, w := range tc.notWant {
+				if strings.Contains(err.Error(), w) {
+					t.Errorf("error %q must not carry %q: the size did not refuse this read", err, w)
+				}
+			}
+		})
+	}
+}
+
+// The remedy's `sudo rm` pastes back as ONE argument naming the record, even
+// under a data root with a space and a single quote in it.
+func TestCrashRecordRemedyQuotesPath(t *testing.T) {
+	cases := []struct{ path, want string }{
+		{"/var/lib/k3sm/agent/crashloop.json", `sudo rm '/var/lib/k3sm/agent/crashloop.json'`},
+		{"/Volumes/My Disk/k3sm's/agent/crashloop.json", `sudo rm '/Volumes/My Disk/k3sm'\''s/agent/crashloop.json'`},
+		{"/a/$(touch x)/`id`/*", "sudo rm '/a/$(touch x)/`id`/*'"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.path, func(t *testing.T) {
+			got := crashRecordRemedy("remove it", tc.path)
+			if !strings.HasSuffix(got, ": "+tc.want) {
+				t.Errorf("crashRecordRemedy(%q) = %q, want it to end in %q", tc.path, got, tc.want)
+			}
+		})
+	}
+}
+
+// A crash record that exists but cannot be read is retried across the agent's
+// join wait rather than failing the first tick: EIO or EACCES on a record the
+// daemon is rewriting is not a verdict. A refusal is, and still fails at once;
+// a failure that outlasts the deadline still fails the install closed.
+func TestVerifyAgentJoinedRetriesUnreadableCrashRecord(t *testing.T) {
+	installStart := time.Date(2026, 9, 17, 19, 3, 11, 0, time.UTC)
+	dir := Config{}.withDefaults().agentWorkDir()
+	cases := []struct {
+		name      string
+		plant     func(f *fakeSystem, path string)
+		wantErr   []string
+		wantReads func(n int) bool
+		readsDesc string
+	}{
+		{
+			name: "one transient read error then a good read is a join",
+			plant: func(f *fakeSystem, path string) {
+				f.putTransientReadErr(path, fmt.Errorf("open %s: input/output error", path), 1)
+			},
+			wantReads: func(n int) bool { return n > 1 },
+			readsDesc: "more than 1",
+		},
+		{
+			name: "read errors until the deadline fail closed with the last one",
+			plant: func(f *fakeSystem, path string) {
+				f.putTransientReadErr(path, fmt.Errorf("open %s: permission denied", path), 0)
+			},
+			wantErr: []string{
+				"could not be read, so this install cannot tell whether the daemon is parked",
+				"permission denied", "fix or remove it", "the new binary is already running",
+			},
+			wantReads: func(n int) bool { return n > 2 },
+			readsDesc: "more than 2 (the wait must have been spent)",
+		},
+		{
+			name:      "a refused record fails on the first tick",
+			plant:     func(f *fakeSystem, path string) { f.putSymlink(path) },
+			wantErr:   []string{"is not a regular file", "remove it"},
+			wantReads: func(n int) bool { return n == 1 },
+			readsDesc: "exactly 1",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clk := &steppedClock{at: installStart.Add(5 * time.Second), step: time.Second}
+			f := &fakeSystem{}
+			cfg := agentCfg(t).withDefaults()
+			cred := mintNodeCredential(t, dir)
+			cred.seed(f)
+			f.putLoaded(AgentLabel)
+			path := seedAgentCrashRecord(t, f, cfg, executor.CrashRecord{})
+			tc.plant(f, path)
+			f.putFile(cfg.agentTokenPath(), []byte(cred.token+"\n"))
+
+			err := verifyAgentJoinedOn(context.Background(), f, cfg, installStart, clk.clock())
+			switch {
+			case len(tc.wantErr) == 0 && err != nil:
+				t.Fatalf("verifyAgentJoined: %v", err)
+			case len(tc.wantErr) > 0 && err == nil:
+				t.Fatal("verifyAgentJoined reported a join over a crash record it never read")
+			}
+			for _, want := range tc.wantErr {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q must carry %q", err, want)
+				}
+			}
+			if n := countCalls(f, "ReadOwnedRegularFile:"+path); !tc.wantReads(n) {
+				t.Errorf("crash-record reads = %d, want %s", n, tc.readsDesc)
+			}
+		})
 	}
 }

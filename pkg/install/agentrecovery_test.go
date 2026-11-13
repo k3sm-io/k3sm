@@ -229,7 +229,7 @@ func TestVerifyAgentJoinedAcceptsARecoveredStart(t *testing.T) {
 				}
 			}
 			if tc.wantRecordReads > 0 {
-				if n := countCalls(f, "ReadFile:"+executor.CrashLoopPath(cfg.agentWorkDir())); n != tc.wantRecordReads {
+				if n := countCalls(f, "ReadOwnedRegularFile:"+executor.CrashLoopPath(cfg.agentWorkDir())); n != tc.wantRecordReads {
 					t.Errorf("crash-record reads = %d, want %d (the verdict is reached on the first tick)", n, tc.wantRecordReads)
 				}
 			}
