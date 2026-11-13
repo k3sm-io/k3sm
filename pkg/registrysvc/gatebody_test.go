@@ -18,6 +18,7 @@ package registrysvc
 
 import (
 	"bufio"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -157,7 +158,24 @@ func TestGateCutsUpstreamStalledAfterHeaders(t *testing.T) {
 				t.Fatalf("the registry's request context was not cancelled within %v of the cut", bound)
 			}
 			if n := strings.Count(logs.String(), cutMsg); n != 1 {
-				t.Errorf("logged %d cuts, want exactly 1:\n%s", n, logs)
+				t.Fatalf("logged %d cuts, want exactly 1:\n%s", n, logs)
+			}
+			var cut struct {
+				Bytes   *int64         `json:"bytes"`
+				Elapsed *time.Duration `json:"elapsed"`
+			}
+			for line := range strings.Lines(logs.String()) {
+				if strings.Contains(line, cutMsg) {
+					if err := json.Unmarshal([]byte(line), &cut); err != nil {
+						t.Fatalf("decode the cut line: %v\n%s", err, line)
+					}
+				}
+			}
+			if cut.Bytes == nil || *cut.Bytes != int64(len("part")) {
+				t.Errorf("cut line bytes = %v, want %d (the bytes passed before the stall):\n%s", cut.Bytes, len("part"), logs)
+			}
+			if cut.Elapsed == nil || *cut.Elapsed < window || *cut.Elapsed >= bound {
+				t.Errorf("cut line elapsed = %v, want at least the %v window and under %v:\n%s", cut.Elapsed, window, bound, logs)
 			}
 		})
 	}
@@ -173,7 +191,7 @@ func TestProgressBodyTimesOnlyUpstreamReads(t *testing.T) {
 	t.Run("slow consumer", func(t *testing.T) {
 		const body = "abcd"
 		var stalls atomic.Int32
-		p := newProgressBody(io.NopCloser(strings.NewReader(body)), window, func() { stalls.Add(1) })
+		p := newProgressBody(io.NopCloser(strings.NewReader(body)), window, func(int64, time.Duration) { stalls.Add(1) })
 		defer p.Close()
 		var got []byte
 		buf := make([]byte, 1)
@@ -201,7 +219,7 @@ func TestProgressBodyTimesOnlyUpstreamReads(t *testing.T) {
 		defer pw.Close()
 		go func() { _, _ = io.WriteString(pw, "part") }()
 		var stalls atomic.Int32
-		p := newProgressBody(pr, window, func() { stalls.Add(1) })
+		p := newProgressBody(pr, window, func(int64, time.Duration) { stalls.Add(1) })
 		defer p.Close()
 		buf := make([]byte, 16)
 		n, err := p.Read(buf)
