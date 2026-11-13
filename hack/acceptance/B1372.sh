@@ -115,6 +115,12 @@
 #   K3SM_MST_READY_TIMEOUT       seconds for a model to come Ready (default 900)
 #   K3SM_MST_RECLAIM_TIMEOUT     seconds t.7 waits for space to come back (default 240)
 #   K3SM_MST_POLL                seconds between polls (default 2)
+#   K3SM_MST_DNS_TIMEOUT         seconds t.4 waits for a node to resolve a Service name (default 120)
+#   K3SM_MST_MIN_FREE            bytes each node cache volume must have free at t.0
+#                                (default 2 x the model's bytes + 2 GiB: the registry copy and
+#                                the cache copy share the server's volume)
+#   K3SM_MST_STORAGE_ROOT        the nodes' storage root f.1 clears of the run's namespace
+#                                (default /var/lib/k3sm/storage)
 #   K3SM_MST_VIEW_UID            uid a view file must have (default 0)
 #   KUBECTL                      kubectl binary (default kubectl)
 #   K3SM_LAB_TOLERATE_KEYS       extra taint keys every pod tolerates with Exists
@@ -459,6 +465,10 @@ STEP_TIMEOUT="${K3SM_MST_STEP_TIMEOUT:-120}"
 READY_TIMEOUT="${K3SM_MST_READY_TIMEOUT:-900}"
 RECLAIM_TIMEOUT="${K3SM_MST_RECLAIM_TIMEOUT:-240}"
 POLL="${K3SM_MST_POLL:-2}"
+DNS_TIMEOUT="${K3SM_MST_DNS_TIMEOUT:-120}"
+# Bytes; empty means 2 x the model's bytes + 2 GiB, sized at p.0.
+MIN_FREE="${K3SM_MST_MIN_FREE:-}"
+STORAGE_ROOT="${K3SM_MST_STORAGE_ROOT:-/var/lib/k3sm/storage}"
 K3SM_BIN="${K3SM_MST_K3SM:-/Library/k3sm/k3sm}"
 LOCAL_K3SM="${K3SM_MST_LOCAL_K3SM:-k3sm}"
 WORKER_LABEL="${K3SM_MST_WORKER_LABEL:-io.k3sm.agent}"
@@ -609,7 +619,9 @@ p0() {
 		case "$v" in /?*) ;; *) refuse "$v is not an absolute path" ;; esac
 	done
 	[ "$SWORK" != "$WWORK" ] || [ "$SERVER" != "$WORKER" ] || refuse "the two scratch dirs are one directory"
-	case "$STEP_TIMEOUT$READY_TIMEOUT$RECLAIM_TIMEOUT" in *[!0-9]*) refuse "a timeout is not a whole number of seconds" ;; esac
+	case "$STEP_TIMEOUT$READY_TIMEOUT$RECLAIM_TIMEOUT$DNS_TIMEOUT" in *[!0-9]*) refuse "a timeout is not a whole number of seconds" ;; esac
+	case "$MIN_FREE" in *[!0-9]*) refuse "K3SM_MST_MIN_FREE is not a whole number of bytes" ;; esac
+	case "$STORAGE_ROOT" in /?*) ;; *) refuse "K3SM_MST_STORAGE_ROOT $STORAGE_ROOT is not an absolute path" ;; esac
 	[ "$STEP_TIMEOUT" -le 240 ] || refuse "K3SM_MST_STEP_TIMEOUT is over 240"
 	for t in python3 shasum awk "$KUBECTL" "$LOCAL_K3SM"; do command -v "$t" >/dev/null 2>&1 || refuse "$t is not on PATH"; done
 	# The evidence dir: under scratch, then absent, or present and empty.
@@ -633,6 +645,7 @@ p0() {
 	BIG_HEX="$(tail -n 1 <<<"$FILES" | awk '{print $1}')"
 	BIG_SIZE="$(tail -n 1 <<<"$FILES" | awk '{print $2}')"
 	TOL=$((MODEL_BYTES / 100))
+	[ -n "$MIN_FREE" ] || MIN_FREE=$((MODEL_BYTES * 2 + 2147483648))
 	quantity_bytes "$MEMORY" >/dev/null || refuse "K3SM_MST_MEMORY $MEMORY is not a quantity"
 
 	# The cluster, read-only.
@@ -699,6 +712,18 @@ t0() {
 	measure t0_server_cache_avail_kib "${BASE_S% *}"
 	measure t0_worker_cache_avail_kib "${BASE_W% *}"
 	measure t0_registry_avail_kib "${BASE_R% *}"
+	measure t0_min_free_bytes "$MIN_FREE"
+	# The ladder starts only with room for the model on each node: refused before any push.
+	local row node kb short=0
+	for row in "$SNODE|$BASE_S" "$WNODE|$BASE_W"; do
+		node="${row%%|*}" kb="${row#*|}" kb="${kb% *}"
+		case "$kb" in '' | *[!0-9]*) bad "free space on $node is unread ($kb)"; short=1; continue ;; esac
+		if [ $((kb * 1024)) -lt "$MIN_FREE" ]; then
+			bad "node $node has $((kb * 1024)) bytes free, under the minimum $MIN_FREE: short by $((MIN_FREE - kb * 1024)) bytes (K3SM_MST_MIN_FREE)"
+			short=1
+		fi
+	done
+	[ "$short" = 0 ]
 }
 
 REPO_LS='d="$1/$2/blobs/sha256"; [ -d "$d" ] || exit 1; cd "$d" && for f in *; do stat -f "%N %i %z %m" "$f"; done'
@@ -908,8 +933,25 @@ svc_url() { # <model>
 	echo "http://$1.$NS.svc:$port/v1/chat/completions"
 }
 
+# DNS_SCRIPT <name>: the host's resolver answers for the name (an ip_address line).
+DNS_SCRIPT='case "$(dscacheutil -q host -a name "$1" 2>/dev/null)" in *ip_address*) exit 0 ;; esac; exit 1'
+
+# wait_dns <host> <node> <name>: the node resolves the Service name within DNS_TIMEOUT.
+wait_dns() {
+	local end=$(($(date +%s) + DNS_TIMEOUT))
+	until rroot "$1" "$STEP_TIMEOUT" "$DNS_SCRIPT" "$3"; do
+		[ "$(date +%s)" -lt "$end" ] || { bad "node $2 did not resolve $3 within ${DNS_TIMEOUT}s (K3SM_MST_DNS_TIMEOUT)"; return 1; }
+		sleep "$POLL"
+	done
+	echo "node $2 resolves $3"
+}
+
 t4() {
-	local cm out url pod node m ph logs
+	local cm out url pod node m ph logs h
+	for pod in "$WORKER|$WNODE|$MA" "$SERVER|$SNODE|$MB"; do
+		IFS='|' read -r h node m <<<"$pod"
+		wait_dns "$h" "$node" "$m.$NS.svc" || return 1
+	done
 	cm="$(py 'import json,sys; print(json.dumps({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"mst-probe","namespace":sys.argv[1]},"data":{"client.py":sys.argv[2]}}))' "$NS" "$CLIENT_PY")"
 	out="$(kc apply -f - <<<"$cm" 2>&1)" || { bad "apply the probe ConfigMap: $out"; return 1; }
 	for pod in "mst-client-w|$WNODE|$MA" "mst-client-s|$SNODE|$MB"; do
@@ -1162,6 +1204,7 @@ f1() {
 			[ "$(date +%s)" -lt "$end" ] || { bad "f.1: namespace $NS (its MLXModels, ConfigMap and Pods) is still present"; rc=1; break; }
 			sleep "$POLL"
 		done
+		storage_clean f.1 delete || rc=1
 	fi
 	if [ "$PUSHED" = 1 ] && [ "$TAG_REMOVED" = 0 ]; then
 		if out="$(ku "$SERVER" model rm "$TAG" 2>&1)"; then
@@ -1193,6 +1236,46 @@ f1() {
 	return "$rc"
 }
 
+# released_pvs: the Released PersistentVolumes whose claimRef is in the run's namespace.
+released_pvs() {
+	kc get pv -o json | py '
+import json, sys
+for p in json.loads(sys.stdin.read()).get("items", []):
+    if p.get("status", {}).get("phase") == "Released" and (p.get("spec", {}).get("claimRef") or {}).get("namespace") == sys.argv[1]:
+        print(p["metadata"]["name"])
+' "$NS"
+}
+
+# STORAGE_SCRIPT <root> <namespace> <delete|check>: the namespace's storage dir on the
+# node, removed or only checked; nothing outside <root>/<namespace> is touched.
+STORAGE_SCRIPT='
+case "$2" in "" | . | .. | */*) exit 2 ;; esac
+d="$1/$2"
+if [ -e "$d" ] && [ "$3" = delete ]; then rm -rf -- "$d" && echo "removed $d"; fi
+[ ! -e "$d" ]
+'
+
+# storage_clean <rung> <delete|check>: the run's Released PVs and the namespace's storage
+# dir on each node are gone (removed first when delete); a survivor is a reason.
+storage_clean() {
+	local rc=0 pvs pv h
+	[ -n "$NS" ] || return 0
+	pvs="$(released_pvs)" || { bad "$1: list PersistentVolumes"; return 1; }
+	if [ "$2" = delete ]; then
+		for pv in $pvs; do
+			kc delete pv "$pv" --wait=false >/dev/null 2>&1 || true
+			echo "$1: deleted Released PersistentVolume $pv of namespace $NS"
+		done
+		pvs="$(released_pvs)" || { bad "$1: list PersistentVolumes"; return 1; }
+	fi
+	[ -z "$pvs" ] || { bad "$1: Released PersistentVolume(s) of namespace $NS survive: $(oneline "$pvs")"; rc=1; }
+	for h in "$SERVER" "$WORKER"; do
+		rroot "$h" "$STEP_TIMEOUT" "$STORAGE_SCRIPT" "$STORAGE_ROOT" "$NS" "$2" ||
+			{ bad "$1: $STORAGE_ROOT/$NS survives on $h"; rc=1; }
+	done
+	return "$rc"
+}
+
 # node_ready <node>: the node's Ready status, empty when unread.
 node_ready() {
 	kc get node "$1" -o json 2>/dev/null | py 'import json,sys; print([c["status"] for c in json.loads(sys.stdin.read())["status"]["conditions"] if c["type"]=="Ready"][0])' 2>/dev/null || true
@@ -1213,6 +1296,7 @@ t8() {
 	cat "$EV/t.8.namespaces"
 	! grep -q "^$NS " "$EV/t.8.namespaces" || { bad "namespace $NS is left"; rc=1; }
 	[ -z "$(kc get mlxmodel -A -o name 2>/dev/null | grep -F "$RUN" || true)" ] || { bad "an MLXModel of the run is left"; rc=1; }
+	[ "$NS_MADE" != 1 ] || storage_clean t.8 check || rc=1
 	rs="$(node_ready "$SNODE")"
 	rw="$(node_ready "$WNODE")"
 	[ "$rs" = True ] || { bad "node $SNODE is not Ready at the end (Ready=${rs:-unread})"; rc=1; }
@@ -1541,6 +1625,13 @@ def kubectl(argv):
             rc = 1
         else:
             s["ns"].append(pos[2])
+            if "pv-leftover" in BRK or "pv-stuck" in BRK:
+                # A volume each of this run's namespace and another's, both Released,
+                # and each namespace's storage dir: only the run's may be removed.
+                for n in (pos[2], "other-ns"):
+                    s.setdefault("pvs", {})["pv-" + n] = {"metadata": {"name": "pv-" + n},
+                        "spec": {"claimRef": {"namespace": n, "name": "data"}}, "status": {"phase": "Released"}}
+                    os.makedirs(os.path.join(os.environ["FAKE_STORAGE"], n, "data"), exist_ok=True)
             if "create-hang" in BRK:
                 # The API server made it; the client never hears back.
                 jsave("k8s.json", s)
@@ -1595,6 +1686,11 @@ def kubectl(argv):
         o = s["objs"]["MLXModel/%s/%s" % (ns, pos[2])]
         o["spec"].update(json.loads(flags["-p"])["spec"])
         reconcile(s)
+    elif verb == "get" and pos[1] == "pv":
+        out({"items": list(s.get("pvs", {}).values())})
+    elif verb == "delete" and pos[1] == "pv":
+        if "pv-stuck" not in BRK:
+            s.get("pvs", {}).pop(pos[2], None)
     elif verb == "delete" and pos[1] == "mlxmodel":
         s["objs"].pop("MLXModel/%s/%s" % (ns, pos[2]), None)
         for k in [k for k in s["pods"] if k.startswith(ns + "/" + pos[2] + "-")]:
@@ -1761,7 +1857,13 @@ def main():
         return launchctl(argv)
     if tool == "df":
         print("Filesystem 1024-blocks Used Available Capacity Mounted on")
-        print("/dev/fake 200000000 100000000 %d 50%% /" % df_get(HOST))
+        # df-low: the worker's volume is 1 GiB free, under any default minimum.
+        print("/dev/fake 200000000 100000000 %d 50%% /" % (1048576 if "df-low" in BRK and HOST != SRV else df_get(HOST)))
+        return 0
+    if tool == "dscacheutil":
+        if "dns-never" in BRK:
+            return 0
+        print("name: %s\nip_address: 10.43.0.10" % argv[-1])
         return 0
     if tool == "tmutil":
         return 0
@@ -1793,7 +1895,7 @@ def main():
 
 sys.exit(main())
 PY
-	for t in kubectl k3sm launchctl df tmutil pgrep footprint git; do
+	for t in kubectl k3sm launchctl df tmutil pgrep footprint git dscacheutil; do
 		printf '#!/bin/sh\nexec python3 -I %q %s "$@"\n' "$fpy" "$t" >"$bin/$t"
 		chmod +x "$bin/$t"
 	done
@@ -1880,6 +1982,7 @@ self_test() {
 				K3SM_MST_REGISTRY_ROOT="$r/srv/registry" K3SM_MST_K3SM=k3sm K3SM_MST_LOCAL_K3SM=k3sm \
 				K3SM_MST_VIEW_UID="$(id -u)" K3SM_MST_POLL=0.05 K3SM_MST_READY_TIMEOUT=20 \
 				K3SM_MST_RECLAIM_TIMEOUT=2 K3SM_MST_STEP_TIMEOUT="${FR_STEP:-30}" \
+				K3SM_MST_DNS_TIMEOUT="${FR_DNS:-20}" FAKE_STORAGE="$r/storage" K3SM_MST_STORAGE_ROOT="$r/storage" \
 				"$SELF" --lab --model-dir "$t/m" --model-sums "$t/sums" --evidence "$ev" 2>&1
 		)" || got=$?
 		printf '%s\n' "$o" >"$r/out"
@@ -1978,6 +2081,29 @@ self_test() {
 	# A cleanup that cannot remove the namespace fails a run whose rungs all passed.
 	fake_run ns-stuck ns-stuck 1 "f.1: FAIL"
 	has "ns-stuck: named" "$(cat "$RUN_DIR/out")" "result: FAIL (f.1)"
+
+	# A node that never resolves a Service name makes t.4 red before any probe Pod.
+	FR_DNS=1 fake_run dns-never dns-never 1 "result: FAIL (t.4)"
+	cleaned dns-never
+	has "dns-never: named" "$(cat "$RUN_DIR/out")" "did not resolve mst-"
+	if grep -q 'mst-client' "$RUN_DIR/state/calls"; then echo "self-test FAIL: dns-never: a probe Pod was applied"; bad=1; fi
+
+	# A node short of free space is refused at t.0, before any push.
+	fake_run df-low df-low 1 "result: FAIL (t.0)"
+	has "df-low: named" "$(cat "$RUN_DIR/out")" "node node-w has 1073741824 bytes free, under the minimum"
+	if grep -q 'model push' "$RUN_DIR/state/calls"; then echo "self-test FAIL: df-low: the model was pushed"; bad=1; fi
+
+	# Cleanup removes the run's Released PV and storage dir, never another namespace's.
+	fake_run pv-leftover pv-leftover 0 "result: PASS"
+	cleaned pv-leftover
+	has "pv-leftover: reported" "$(cat "$RUN_DIR/ev/f.1.log")" "deleted Released PersistentVolume pv-mst-"
+	[ "$(py 'import json,sys; print(" ".join(sorted(json.load(open(sys.argv[1])).get("pvs", {}))))' "$RUN_DIR/state/k8s.json")" = pv-other-ns ] ||
+		{ echo "self-test FAIL: pv-leftover: the PVs left are not exactly the other namespace's"; bad=1; }
+	[ -d "$RUN_DIR/storage/other-ns/data" ] || { echo "self-test FAIL: pv-leftover: another namespace's storage dir was removed"; bad=1; }
+	[ -z "$(find "$RUN_DIR/storage" -mindepth 1 -maxdepth 1 -name 'mst-*')" ] || { echo "self-test FAIL: pv-leftover: the run's storage dir is left"; bad=1; }
+	# A Released PV of the run that will not delete fails the cleanup.
+	fake_run pv-stuck pv-stuck 1 "f.1: FAIL"
+	has "pv-stuck: named" "$(cat "$RUN_DIR/out")" "Released PersistentVolume(s) of namespace mst-"
 
 	# The evidence dir must lie under a k3sm-io.scratch directory (the pure check).
 	mkdir -p "$t/ev-in" "$base/outside"
