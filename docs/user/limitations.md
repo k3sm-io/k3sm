@@ -854,7 +854,7 @@ marks every Pod process so that kill picks a Pod before the control plane. The m
 Runbook:
 
 - To tell an eviction from a kernel kill: an evicted Pod is `Failed` with reason `Evicted` and has
-  an `Evicted` Event. A Pod that still shows `Running` was not evicted, because the status is published only after the kill succeeds. A kernel kill leaves a container that exited 137 with no such Event, and a
+  an `Evicted` Event. A Pod that still shows `Running` has not been evicted yet: its kill is still running or failed, and the status is published only after the kill succeeds. A kernel kill leaves a container that exited 137 with no such Event, and a
   kernel log line you can find with
   `log show --predicate 'sender == "kernel"' --last 1h | grep -i "paging space"`.
 - After upgrading k3sm, recreate long-running Pods. A Pod started by an older version is not marked
