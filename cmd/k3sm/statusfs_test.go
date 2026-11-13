@@ -191,6 +191,14 @@ func TestStatusCollectorFSFollowsTheAdminKubeconfigLink(t *testing.T) {
 	if err := os.Symlink(big, bigLink); err != nil {
 		t.Fatal(err)
 	}
+	small := filepath.Join(t.TempDir(), "small")
+	if err := os.WriteFile(small, []byte("small-bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	smallLink := filepath.Join(t.TempDir(), "smalllink")
+	if err := os.Symlink(small, smallLink); err != nil {
+		t.Fatal(err)
+	}
 	for name, fs := range map[string]any{
 		"newStatusCollector":  newStatusCollector().FS,
 		"newDaemonsCollector": newDaemonsCollector().FS,
@@ -201,11 +209,21 @@ func TestStatusCollectorFSFollowsTheAdminKubeconfigLink(t *testing.T) {
 		} else if _, err := lf.ReadFileFollowingLink(bigLink); !errors.Is(err, boundedread.ErrRefused) {
 			t.Errorf("%s FS.ReadFileFollowingLink(oversized) err = %v, want boundedread.ErrRefused", name, err)
 		}
+		if ok {
+			if b, err := lf.ReadFileFollowingLink(smallLink); err != nil || string(b) != "small-bytes" {
+				t.Errorf("%s FS.ReadFileFollowingLink(small link) = %q, %v; want the target bytes and no error", name, b, err)
+			}
+		}
 		r, ok := fs.(reader)
 		if !ok {
 			t.Errorf("%s FS is %T, which does not implement ReadFile", name, fs)
 		} else if _, err := r.ReadFile(big); !errors.Is(err, boundedread.ErrRefused) {
 			t.Errorf("%s FS.ReadFile(oversized) err = %v, want boundedread.ErrRefused", name, err)
+		}
+		if ok {
+			if _, err := r.ReadFile(smallLink); !errors.Is(err, boundedread.ErrRefused) {
+				t.Errorf("%s FS.ReadFile(small link) err = %v, want boundedread.ErrRefused", name, err)
+			}
 		}
 	}
 }
