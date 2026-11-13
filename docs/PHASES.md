@@ -1290,7 +1290,7 @@ phases:
             method: integration
           - id: M17.3-a3
             met: false
-            check: "hack/lab/m17.sh exits 0 on the rig under K3SM_LAB=1 with every rung above, the run log in hack/lab/runs/ carrying the four header fields, and the phases.json M17-lab row reading skeleton:false. Lab-ledger carve-out applies: met only by a recorded K3SM_LAB=1 run of hack/lab/m17.sh on the rig, never auto-greened by CI."
+            check: "hack/lab/m17.sh exits 0 on the rig under K3SM_LAB=1 with every rung above, the run log (run.log in the run's evidence directory) carrying the four header fields, and the phases.json M17-lab row reading skeleton:false. Lab-ledger carve-out applies: met only by a recorded K3SM_LAB=1 run of hack/lab/m17.sh on the rig, never auto-greened by CI."
             method: lab
       - id: M17.4
         title: sharded MLXModel — placement over the link graph, gang-scheduled rank Pods, the k3sm-shard entrypoint
