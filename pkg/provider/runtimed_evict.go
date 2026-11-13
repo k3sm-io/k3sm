@@ -89,6 +89,7 @@ func (t *podTrack) beginStopLocked(live *corev1.PodStatus) bool {
 	t.stopping = true
 	t.stopEpoch++
 	t.stoppingLive = live
+	t.stopExits = nil
 	return true
 }
 
@@ -159,6 +160,7 @@ func (t *podTrack) finishStopping(st *corev1.PodStatus) bool {
 	defer t.restartMu.Unlock()
 	t.stopping = false
 	t.stoppingLive = nil
+	t.stopExits = nil
 	if t.evicted != nil || t.rejected {
 		return false
 	}
@@ -176,6 +178,47 @@ func (t *podTrack) clearStopping() {
 	t.restartMu.Lock()
 	defer t.restartMu.Unlock()
 	t.stopping = false
+	t.stopExits = nil
+}
+
+// takeStopExits returns the container terminations captured for t's stop in
+// flight (captureStopExits), or nil.
+func (t *podTrack) takeStopExits() map[string]corev1.ContainerState {
+	t.restartMu.Lock()
+	defer t.restartMu.Unlock()
+	exits := t.stopExits
+	t.stopExits = nil
+	return exits
+}
+
+// overlayStopExits replaces, per container name, the fallback termination in
+// st with the one the runtime reported for the stop, keeping the fallback's
+// container id and start time where the runtime's is empty.
+func overlayStopExits(st *corev1.PodStatus, exits map[string]corev1.ContainerState) {
+	apply := func(list []corev1.ContainerStatus) {
+		for i := range list {
+			cs := &list[i]
+			ex, ok := exits[cs.Name]
+			if !ok || ex.Terminated == nil {
+				continue
+			}
+			term := ex.Terminated.DeepCopy()
+			if prev := cs.State.Terminated; prev != nil {
+				if term.ContainerID == "" {
+					term.ContainerID = prev.ContainerID
+				}
+				if term.StartedAt.IsZero() {
+					term.StartedAt = prev.StartedAt
+				}
+				if term.FinishedAt.IsZero() {
+					term.FinishedAt = prev.FinishedAt
+				}
+			}
+			cs.State = corev1.ContainerState{Terminated: term}
+		}
+	}
+	apply(st.InitContainerStatuses)
+	apply(st.ContainerStatuses)
 }
 
 // quiesceForEviction cancels the provider workers that could restart or

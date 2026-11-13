@@ -502,6 +502,12 @@ type podTrack struct {
 	// pod before the runtime forgot it; letting it drop the snapshot made the
 	// next read synthesize Pending. Guarded by restartMu.
 	stoppingLive *corev1.PodStatus
+	// stopExits holds the container terminations (by container name) a
+	// DELETED status event reported for t while its node-side stop was in
+	// flight (captureStopExits): the runtime's real exit codes, which a
+	// graceful deadline stop overlays on its 137/Error fallback. Reset when a
+	// stop begins, cleared with the stopping mark. Guarded by restartMu.
+	stopExits map[string]corev1.ContainerState
 	// stopEpoch counts the node-side stops (deadline or eviction) begun on t
 	// (beginStopLocked bumps it); see stoppingLive. Guarded by restartMu.
 	stopEpoch uint64
@@ -3800,9 +3806,57 @@ func (r *runtimedRuntime) consume(ctx context.Context, stream *watchStream, done
 			if ev == nil {
 				continue
 			}
-			r.emit(ev.GetStatus())
+			r.handleEvent(ev)
 		}
 	}
+}
+
+// handleEvent dispatches one watch event. A DELETED event for a pod whose
+// node-side stop is in flight is the runtime's account of that stop: its
+// container terminations are captured onto the track (captureStopExits) and
+// nothing is published from it, since its phase is the runtime's, not the
+// stop's. Every other event is emitted as before.
+func (r *runtimedRuntime) handleEvent(ev *runtimev1.PodStatusEvent) {
+	if ev.GetType() == runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_DELETED && r.captureStopExits(ev.GetStatus()) {
+		return
+	}
+	r.emit(ev.GetStatus())
+}
+
+// captureStopExits records rs's terminated container states on the pod's track
+// when its node-side stop is in flight, and reports whether it was. The
+// event's phase is never taken.
+func (r *runtimedRuntime) captureStopExits(rs *runtimev1.PodStatus) bool {
+	if rs == nil {
+		return false
+	}
+	t := r.trackByID(rs.GetPodId())
+	if t == nil {
+		return false
+	}
+	exits := map[string]corev1.ContainerState{}
+	collect := func(css []*runtimev1.ContainerStatus) {
+		for _, cs := range css {
+			if cs.GetState().GetTerminated() == nil {
+				continue
+			}
+			exits[cs.GetName()] = toContainerState(cs.GetState())
+		}
+	}
+	collect(rs.GetInitContainerStatuses())
+	collect(rs.GetContainerStatuses())
+	t.restartMu.Lock()
+	defer t.restartMu.Unlock()
+	if !t.stopping {
+		return false
+	}
+	if t.stopExits == nil {
+		t.stopExits = map[string]corev1.ContainerState{}
+	}
+	for name, st := range exits {
+		t.stopExits[name] = st
+	}
+	return true
 }
 
 // runBackstop periodically reconciles every tracked pod via GetPodStatus,

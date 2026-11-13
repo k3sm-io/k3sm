@@ -27,6 +27,7 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -856,8 +857,15 @@ type deadlineStopHarness struct {
 
 func newDeadlineStopHarness(t *testing.T, rt runtimev1.RuntimeServer, name string) *deadlineStopHarness {
 	t.Helper()
+	return newDeadlineStopHarnessFor(t, rt, pullPod(name))
+}
+
+// newDeadlineStopHarnessFor is newDeadlineStopHarness for a given pod, which
+// it gives a 60 s active deadline.
+func newDeadlineStopHarnessFor(t *testing.T, rt runtimev1.RuntimeServer, pod *corev1.Pod) *deadlineStopHarness {
+	t.Helper()
 	deadline := int64(60)
-	pod := pullPod(name)
+	name := pod.Name
 	pod.Spec.ActiveDeadlineSeconds = &deadline
 	h := &deadlineStopHarness{rec: record.NewFakeRecorder(64), pod: pod}
 	h.r = newRuntimedWith(rt, RuntimedConfig{
@@ -1719,6 +1727,121 @@ func TestFailedDeadlineStopKeepsTheLiveStatusOverATransportError(t *testing.T) {
 			assertRunningNotWaiting(t, reader.name+" over a transport error", st)
 			if tr.stoppingStatus() == nil {
 				t.Errorf("%s over a transport error dropped the failed stop's live status", reader.name)
+			}
+		})
+	}
+}
+
+// exitingStopRuntime delivers a DELETED status event for the stopped pod
+// through the provider's watch handler before its DeletePod returns, as the
+// runtime does, when event is set.
+type exitingStopRuntime struct {
+	*fakeRuntimeServer
+	r     atomic.Pointer[runtimedRuntime]
+	event *runtimev1.PodStatusEvent
+}
+
+func (e *exitingStopRuntime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest) (*runtimev1.DeletePodResponse, error) {
+	if r := e.r.Load(); r != nil && e.event != nil && e.event.GetStatus().GetPodId() == req.GetPodId() {
+		r.handleEvent(e.event)
+	}
+	return e.fakeRuntimeServer.DeletePod(ctx, req)
+}
+
+// GetPodStatus reports a second container, c1, in c0's state: the base fake
+// renders c0 alone.
+func (e *exitingStopRuntime) GetPodStatus(ctx context.Context, req *runtimev1.GetPodStatusRequest) (*runtimev1.GetPodStatusResponse, error) {
+	resp, err := e.fakeRuntimeServer.GetPodStatus(ctx, req)
+	if err != nil || resp.GetStatus() == nil {
+		return resp, err
+	}
+	for _, cs := range resp.GetStatus().GetContainerStatuses() {
+		if cs.GetName() == "c0" {
+			c1 := proto.Clone(cs).(*runtimev1.ContainerStatus)
+			c1.Name = "c1"
+			resp.Status.ContainerStatuses = append(resp.Status.ContainerStatuses, c1)
+			break
+		}
+	}
+	return resp, nil
+}
+
+// TestGracefulStopReportsACleanExitAsCompleted pins the deadline stop's
+// container terminations: a DELETED event the runtime emits during the stop
+// carries the real exits (one clean exit 0 on SIGTERM, one killed), which the
+// Failed/DeadlineExceeded status reports instead of the 137/Error fallback;
+// with no event both containers keep the fallback.
+func TestGracefulStopReportsACleanExitAsCompleted(t *testing.T) {
+	type want struct {
+		code   int32
+		reason string
+	}
+	for _, tc := range []struct {
+		name      string
+		withEvent bool
+		want      map[string]want
+	}{
+		{"a DELETED event during the stop", true, map[string]want{
+			"c0": {0, "Completed"}, "c1": {137, "Error"},
+		}},
+		{"no event", false, map[string]want{
+			"c0": {evictedExitCode, evictedContainerReason}, "c1": {evictedExitCode, evictedContainerReason},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			pod := pullPod("deadline-graceful")
+			pod.Spec.Containers = append(pod.Spec.Containers, corev1.Container{Name: "c1", Image: pullImage})
+			e := &exitingStopRuntime{fakeRuntimeServer: newFakeRuntimeServer()}
+			if tc.withEvent {
+				e.event = &runtimev1.PodStatusEvent{
+					Type: runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_DELETED,
+					Status: &runtimev1.PodStatus{
+						PodId: string(pod.UID),
+						Phase: runtimev1.PodPhase_POD_PHASE_SUCCEEDED,
+						ContainerStatuses: []*runtimev1.ContainerStatus{
+							{Name: "c0", State: &runtimev1.ContainerState{Terminated: &runtimev1.ContainerStateTerminated{ExitCode: 0, Reason: "Completed"}}},
+							{Name: "c1", State: &runtimev1.ContainerState{Terminated: &runtimev1.ContainerStateTerminated{ExitCode: 137, Signal: 9, Reason: "Error"}}},
+						},
+					},
+				}
+			}
+			h := newDeadlineStopHarnessFor(t, e, pod)
+			t.Cleanup(h.r.shutdown)
+			e.r.Store(h.r)
+
+			h.clk.Step(20 * time.Minute)
+			h.r.resync(ctx)
+			waitDeadlineStops(h.r)
+
+			st, err := h.r.GetPodStatus(ctx, pod.Namespace, pod.Name)
+			if err != nil {
+				t.Fatalf("GetPodStatus: %v", err)
+			}
+			if st.Phase != corev1.PodFailed || st.Reason != reasonDeadlineExceeded {
+				t.Fatalf("status = %s/%s, want Failed/%s", st.Phase, st.Reason, reasonDeadlineExceeded)
+			}
+			h.mu.Lock()
+			published := append([]corev1.PodStatus(nil), h.published...)
+			h.mu.Unlock()
+			for i, p := range published {
+				if p.Phase == corev1.PodSucceeded {
+					t.Errorf("publication %d took the DELETED event's phase Succeeded", i)
+				}
+			}
+			if len(st.ContainerStatuses) != len(tc.want) {
+				t.Fatalf("container statuses = %d, want %d", len(st.ContainerStatuses), len(tc.want))
+			}
+			for _, cs := range st.ContainerStatuses {
+				w := tc.want[cs.Name]
+				term := cs.State.Terminated
+				if term == nil {
+					t.Errorf("container %s not terminated: %+v", cs.Name, cs.State)
+					continue
+				}
+				if term.ExitCode != w.code || term.Reason != w.reason {
+					t.Errorf("container %s terminated %d/%s, want %d/%s", cs.Name, term.ExitCode, term.Reason, w.code, w.reason)
+				}
 			}
 		})
 	}

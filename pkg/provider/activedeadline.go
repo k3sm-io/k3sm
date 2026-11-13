@@ -318,6 +318,15 @@ func (r *runtimedRuntime) failPastDeadline(ctx context.Context, tracked *corev1.
 		t.clearStopping()
 		return fmt.Errorf("runtimed delete pod %s/%s: %w", tracked.Namespace, tracked.Name, err)
 	}
+	// The stop ran with a grace, so a container may have exited cleanly on
+	// SIGTERM: overlay the terminations the runtime's DELETED event reported
+	// (captureStopExits). The event is lossy and unordered relative to the
+	// reply and is not waited for: a container whose termination has not
+	// arrived by now keeps the 137/Error fallback.
+	if exits := t.takeStopExits(); len(exits) > 0 {
+		st = st.DeepCopy()
+		overlayStopExits(st, exits)
+	}
 	if !t.finishStopping(st) {
 		// Another path made the pod terminal while this stop ran; its status
 		// stands and this failure publishes nothing.
