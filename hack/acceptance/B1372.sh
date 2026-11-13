@@ -25,6 +25,11 @@
 #   - The run's own paths: t.2 makes the two scratch dirs, f.1 removes them and
 #     removes <storage root>/<namespace> on both Macs, so nothing of the run stays.
 #
+# The script also runs the k3sm CLI itself as root on each Mac over ssh (`sudo -n k3sm`):
+# `version`, `image prune --force` and `model rm <tag>`. These are the product's public
+# verbs, so they are not exceptions, but they do delete: the run's model and every image
+# no pod uses at that moment.
+#
 # Rungs (`--plan` prints them; the first red rung ends the run, every rung not reached
 # is red, and the cleanup f.1 runs green or red):
 #   p.0   preconditions, read-only: K3SM_LAB=1, tools, the environment, an empty
