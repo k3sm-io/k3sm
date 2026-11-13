@@ -370,8 +370,10 @@ What the script does, on either path, and why each step is there:
    python-build-standalone build of the same CPython patch release. `build.sh`
    compares uv's resolved URL against `PY_URL` and stops if they differ. The
    stage clears uv's catalog and mirror variables (`UV_PYTHON_DOWNLOADS_JSON_URL`,
-   `UV_PYTHON_INSTALL_MIRROR`, `UV_ASTRAL_MIRROR_URL`), so the digests embedded in the
-   pinned uv are the ones that check the interpreter. The
+   `UV_PYTHON_INSTALL_MIRROR`, `UV_ASTRAL_MIRROR_URL`) and ignores uv config files
+   (`UV_NO_CONFIG=1`), so the digests embedded in uv check the interpreter: pinned
+   transitively on the Job path, where the uv binary is digest-pinned, and whatever uv
+   the operator supplies (at or above `UV_MIN`) on a local run. The
    listing is parsed by the interpreter just installed, run with `-I -B` so it
    leaves no bytecode in the tree it is about to stage.
 3. **Stages the resolved versioned directory.** uv keeps a version-alias symlink

@@ -2955,14 +2955,15 @@ printf '#!/bin/bash\n: >> "%s"\nenv | grep "^UV_" >> "%s"\nexit 0\n' "$UVENV" "$
 chmod +x "$STALLD/uvenv-uv"
 (
 	sed -n '/^clear_uv_redirects() {$/,/^}$/p' "$BUILD" > "$STALLD/clear.sh"
-	export UV_PYTHON_DOWNLOADS_JSON_URL=file:///junk UV_PYTHON_INSTALL_MIRROR=file:///junk UV_ASTRAL_MIRROR_URL=file:///junk
+	export UV_PYTHON_DOWNLOADS_JSON_URL=file:///junk UV_PYTHON_INSTALL_MIRROR=file:///junk UV_ASTRAL_MIRROR_URL=file:///junk UV_CONFIG_FILE=/junk/uv.toml
 	# shellcheck disable=SC1091 # generated from build.sh just above
 	. "$STALLD/clear.sh"
 	clear_uv_redirects
 	"$STALLD/uvenv-uv" python install x
 ) > /dev/null 2>&1
 if [ -s "$STALLD/clear.sh" ] && grep -q 'clear_uv_redirects$' <(sed -n '/^stage_tree() {$/,/^}$/p' "$BUILD" | sed -n 2p | tr -d '\t') &&
-	[ -f "$UVENV" ] && ! grep -qE 'UV_(PYTHON_DOWNLOADS_JSON_URL|PYTHON_INSTALL_MIRROR|ASTRAL_MIRROR_URL)' "$UVENV"; then
+	[ -f "$UVENV" ] && ! grep -qE 'UV_(PYTHON_DOWNLOADS_JSON_URL|PYTHON_INSTALL_MIRROR|ASTRAL_MIRROR_URL|CONFIG_FILE)=' "$UVENV" &&
+	grep -qx 'UV_NO_CONFIG=1' "$UVENV"; then
 	ladder ok "10.uvredirect  uv's catalog and mirror variables are cleared before the stage's first uv call"
 else
 	ladder no "10.uvredirect  uv's catalog and mirror variables are cleared before the stage's first uv call"
