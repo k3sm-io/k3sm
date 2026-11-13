@@ -488,9 +488,9 @@ the images the node lists in its status, so they do not have to add up to `IMAGE
 `OTHER`, which come from what the node's store holds. A node on an older version does not report
 this, so its row shows dashes. The numbers are the node's own report, which it updates periodically,
 so they can lag behind the store. A row is marked when the report is more than 10 minutes old or
-ahead of this Mac's clock, or when it cannot be read. In `-o json` the same numbers are under
+ahead of this Mac's clock, or when it cannot be read or is not recognised. In `-o json` the same numbers are under
 `classes`, `storeBytes` and `classesObservedAt`; a report that cannot be read leaves those three out
-and sets `classesNote`, and an empty store is `"classes": {}`.
+and sets `classesNote` to `unreadable` or `unrecognised schema`, and an empty store is `"classes": {}`.
 
 Both commands keep what each image digest describes (its platforms, size and blobs) in a cache
 under your account's cache directory, `~/Library/Caches/k3sm/registry/<registry address>/`, so a
