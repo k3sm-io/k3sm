@@ -18,6 +18,7 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -42,6 +43,18 @@ const (
 	reasonDeadlineExceeded = "DeadlineExceeded"
 	msgDeadlineExceeded    = "Pod was active on the node longer than the specified deadline"
 )
+
+// deadlineStopSlack is added to a pod's effective termination grace to bound
+// one deadline stop: it covers the runtime's own post-kill steps (reaping the
+// processes, tearing down the pod's mounts and network) after the grace ends.
+// A variable, not a constant, so a test can shorten it.
+var deadlineStopSlack = 30 * time.Second
+
+// deadlineStopGrace is the grace a deadline stop sends to the runtime: the
+// pod's own effective termination grace, floored.
+func deadlineStopGrace(pod *corev1.Pod) int64 {
+	return floorGrace(graceSeconds(pod))
+}
 
 // activeDeadlineExceeded reports whether a pod with the given
 // spec.activeDeadlineSeconds and status.startTime has outlived its deadline at
@@ -111,7 +124,11 @@ func (r *runtimedRuntime) enforceActiveDeadlines(ctx context.Context) {
 // (markStopping, finishStopping, clearStopping); the goroutine holds only its
 // own *podTrack and takes no provider lock across the RPC. Lifetime: the
 // goroutine's context keeps ctx's values but is cancelled by the provider's
-// lifetime (r.lifetime, closed by shutdown), not by the tick; it is counted in
+// lifetime (r.lifetime, closed by shutdown), not by the tick, and is bounded by
+// the stop's grace plus deadlineStopSlack (real time: lifetimeContext has no
+// clock), so a runtime stop that hangs cannot hold the stopping mark, and with
+// it the pod's fence, for the daemon's life; a timed-out stop is a failed stop
+// and the next tick retries it. It is counted in
 // r.deadlineStops, added under r.mu only while the lifetime is open, and
 // shutdown waits for it. A provider already shut down starts no stop and takes
 // no mark.
@@ -144,9 +161,13 @@ func (r *runtimedRuntime) startDeadlineStop(ctx context.Context, tracked *corev1
 	}
 	go func() {
 		defer r.deadlineStops.Done()
-		stopCtx, cancel := r.lifetimeContext(ctx)
+		lifeCtx, cancelLife := r.lifetimeContext(ctx)
+		defer cancelLife()
+		bound := time.Duration(deadlineStopGrace(tracked))*time.Second + deadlineStopSlack
+		stopCtx, cancel := context.WithTimeout(lifeCtx, bound)
 		defer cancel()
 		err := r.failPastDeadline(stopCtx, tracked, t, st)
+		timedOut := err != nil && errors.Is(stopCtx.Err(), context.DeadlineExceeded)
 		// A stop that keeps failing is retried every resync: the first failure
 		// of a pod logs at Warn, the repeats at Debug, until a stop succeeds.
 		t.restartMu.Lock()
@@ -154,12 +175,18 @@ func (r *runtimedRuntime) startDeadlineStop(ctx context.Context, tracked *corev1
 		t.deadlineStopFailed = err != nil
 		t.restartMu.Unlock()
 		if err != nil {
+			// A timeout always logs at Warn: each takes the whole bound, so its
+			// repeats are already spaced out.
 			log := r.log.Warn
-			if repeat {
+			if repeat && !timedOut {
 				log = r.log.Debug
 			}
-			log("active deadline: could not stop the pod; retrying on the next resync",
-				"pod", podKey(tracked.Namespace, tracked.Name), "uid", string(tracked.UID), "err", err)
+			msg := "active deadline: could not stop the pod; retrying on the next resync"
+			if timedOut {
+				msg = "active deadline: the pod's stop timed out; retrying on the next resync"
+			}
+			log(msg, "pod", podKey(tracked.Namespace, tracked.Name), "uid", string(tracked.UID),
+				"timeout", bound, "err", err)
 		}
 	}()
 }
@@ -282,7 +309,7 @@ func (r *runtimedRuntime) failPastDeadline(ctx context.Context, tracked *corev1.
 	id := string(tracked.UID)
 	t.quiesceForEviction()
 	intent := r.recordStopIntent(tracked, "")
-	_, err := r.rt.DeletePod(ctx, &runtimev1.DeletePodRequest{PodId: id, GracePeriodSeconds: floorGrace(graceSeconds(tracked))})
+	_, err := r.rt.DeletePod(ctx, &runtimev1.DeletePodRequest{PodId: id, GracePeriodSeconds: deadlineStopGrace(tracked)})
 	if err != nil && status.Code(err) != codes.NotFound {
 		if stopNotIssued(err) {
 			r.history.dropIntent(intent)

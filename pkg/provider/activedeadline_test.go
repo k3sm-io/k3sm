@@ -1191,3 +1191,104 @@ func TestDeadlineStopKeepsTheLastLiveStatusWhileTheRuntimeForgetsThePod(t *testi
 	events = append(events, recordedEvents(h.rec.Events)...)
 	h.assertDeadlineFailed(t, events)
 }
+
+// hungStopRuntime hangs the first runtime stop of one pod id until its context
+// is done and then returns the context's error, as a wedged runtime would; it
+// records each stop's grace. Later stops reach the fake runtime.
+type hungStopRuntime struct {
+	*fakeRuntimeServer
+	hangID  string
+	entered chan struct{}
+
+	mu     sync.Mutex
+	hung   bool
+	graces []int64
+}
+
+func (h *hungStopRuntime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest) (*runtimev1.DeletePodResponse, error) {
+	h.mu.Lock()
+	h.graces = append(h.graces, req.GetGracePeriodSeconds())
+	hang := req.GetPodId() == h.hangID && !h.hung
+	if hang {
+		h.hung = true
+	}
+	h.mu.Unlock()
+	if hang {
+		close(h.entered)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return h.fakeRuntimeServer.DeletePod(ctx, req)
+}
+
+func (h *hungStopRuntime) stopGraces() []int64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]int64(nil), h.graces...)
+}
+
+// TestDeadlineStopTimesOutAndIsRetried pins the bound on one deadline stop: a
+// runtime stop that hangs returns once the pod's grace plus deadlineStopSlack
+// has passed, the pod's stopping mark (and with it its fence) is released, no
+// surface reads Failed, and the next tick starts a second stop.
+func TestDeadlineStopTimesOutAndIsRetried(t *testing.T) {
+	saved := deadlineStopSlack
+	deadlineStopSlack = 100 * time.Millisecond
+	t.Cleanup(func() { deadlineStopSlack = saved })
+
+	ctx := context.Background()
+	f := newFakeRuntimeServer()
+	hs := &hungStopRuntime{fakeRuntimeServer: f, entered: make(chan struct{})}
+	h := newDeadlineStopHarness(t, hs, "deadline-hung")
+	id := string(h.pod.UID)
+	hs.hangID = id
+	t.Cleanup(h.r.shutdown)
+	tr := h.r.trackByID(id)
+	if tr == nil {
+		t.Fatal("pod not tracked after CreatePod")
+	}
+	grace := int64(1)
+	h.r.mu.Lock()
+	tr.pod.Spec.TerminationGracePeriodSeconds = &grace
+	h.r.mu.Unlock()
+	bound := time.Duration(floorGrace(grace))*time.Second + deadlineStopSlack
+
+	began := time.Now()
+	h.clk.Step(20 * time.Minute)
+	h.r.resync(ctx)
+	select {
+	case <-hs.entered:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the deadline stop never reached the runtime")
+	}
+	if !tr.isStopping() {
+		t.Error("the pod is not stopping while its stop hangs")
+	}
+	stopped := make(chan struct{})
+	go func() {
+		waitDeadlineStops(h.r)
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(bound + 10*time.Second):
+		t.Fatalf("the hung deadline stop did not return within %v: it fences the pod until shutdown", bound+10*time.Second)
+	}
+	if elapsed := time.Since(began); elapsed < bound {
+		t.Errorf("the stop returned after %v, before its bound %v", elapsed, bound)
+	}
+	if tr.isStopping() {
+		t.Error("the pod is still stopping after its stop timed out")
+	}
+	h.assertNotFailed(t, "after the stop timed out")
+	if events := recordedEvents(h.rec.Events); countEvents(events, reasonDeadlineExceeded) != 0 {
+		t.Errorf("DeadlineExceeded events after the timed-out stop = %v, want none", events)
+	}
+
+	h.clk.Step(10 * time.Second)
+	h.r.resync(ctx)
+	waitDeadlineStops(h.r)
+	if got := hs.stopGraces(); len(got) != 2 || got[0] != floorGrace(grace) || got[1] != floorGrace(grace) {
+		t.Errorf("runtime stop graces = %v, want two stops of %d s: the next tick retries the timed-out stop", got, floorGrace(grace))
+	}
+}
