@@ -25,6 +25,8 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/tools/record"
@@ -270,5 +272,183 @@ func TestDeadlineStopNeverPublishesSucceededBeforeFailed(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// failingDeletedEventRuntime is deletedEventRuntime whose DeletePod of holdID
+// fails: the first call forgets the pod, publishes the DELETED event and holds
+// as deletedEventRuntime does, then answers an error; a retry fails at once.
+type failingDeletedEventRuntime struct {
+	*deletedEventRuntime
+	calls atomic.Int32
+}
+
+func (d *failingDeletedEventRuntime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest) (*runtimev1.DeletePodResponse, error) {
+	if req.GetPodId() != d.holdID {
+		return d.deletedEventRuntime.DeletePod(ctx, req)
+	}
+	if d.calls.Add(1) == 1 {
+		if _, err := d.deletedEventRuntime.DeletePod(ctx, req); err != nil {
+			return nil, err
+		}
+	}
+	return nil, status.Error(codes.Unavailable, "stop failed")
+}
+
+// TestDeadlineStopThatFailsPublishesOnlyRunning pins the watch path when the
+// deadline stop fails after runtimed published the pod's DELETED event (phase
+// SUCCEEDED): that event is not published while the stop is in flight, and the
+// failed stop records nothing, so every publication, on every status surface,
+// before and after the failure, reads Running.
+func TestDeadlineStopThatFailsPublishesOnlyRunning(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	f := newFakeRuntimeServer()
+	d := &failingDeletedEventRuntime{deletedEventRuntime: &deletedEventRuntime{
+		fakeRuntimeServer: f,
+		events:            make(chan *runtimev1.PodStatusEvent, 8),
+		entered:           make(chan struct{}),
+		hold:              make(chan struct{}),
+	}}
+	var released atomic.Bool
+	release := func() {
+		if released.CompareAndSwap(false, true) {
+			close(d.hold)
+		}
+	}
+	deadline := int64(60)
+	pod := pullPod("deadline-watch-fail")
+	pod.Spec.RestartPolicy = corev1.RestartPolicyNever
+	pod.Spec.ActiveDeadlineSeconds = &deadline
+	sentinel := pullPod("deadline-watch-fail-sentinel")
+	d.holdID, d.sentinelID = string(pod.UID), string(sentinel.UID)
+
+	r := newRuntimedWith(d, RuntimedConfig{
+		NodeName: "n",
+		NodeIP:   testNodeIP,
+		Root:     t.TempDir(), PodLogsDir: t.TempDir(),
+		Recorder: record.NewFakeRecorder(64),
+		Network:  NewPodNetAdapter(newFakeIPAM(t, "100.64.0.0/24"), testNodeIP, nil),
+	}, nil, nil)
+	clk := testclock.NewFakeClock(time.Now())
+	r.clk = clk
+
+	var (
+		mu         sync.Mutex
+		recording  bool
+		published  []string
+		phases     []corev1.PodStatus
+		sentinelOK = make(chan struct{}, 64)
+	)
+	add := func(surface string, st corev1.PodStatus) {
+		mu.Lock()
+		defer mu.Unlock()
+		if !recording {
+			return
+		}
+		published = append(published, fmt.Sprintf("%s %s/%s", surface, st.Phase, st.Reason))
+		phases = append(phases, st)
+	}
+	r.mu.Lock()
+	r.notify = func(p *corev1.Pod) {
+		switch p.Name {
+		case pod.Name:
+			add("notify", *p.Status.DeepCopy())
+		case sentinel.Name:
+			if len(p.Status.ContainerStatuses) == 0 || p.Status.ContainerStatuses[0].Image != sentinelImage {
+				return
+			}
+			select {
+			case sentinelOK <- struct{}{}:
+			default:
+			}
+		}
+	}
+	r.mu.Unlock()
+	for _, p := range []*corev1.Pod{pod, sentinel} {
+		if err := r.CreatePod(ctx, p); err != nil {
+			t.Fatalf("CreatePod %s: %v", p.Name, err)
+		}
+	}
+	watchDone := make(chan struct{})
+	go func() {
+		defer close(watchDone)
+		r.runWatch(ctx)
+	}()
+	t.Cleanup(func() {
+		release()
+		cancel()
+		<-watchDone
+		r.shutdown()
+	})
+
+	read := func(when string) {
+		st, err := r.GetPodStatus(ctx, pod.Namespace, pod.Name)
+		if err != nil {
+			t.Fatalf("GetPodStatus %s: %v", when, err)
+		}
+		add("GetPodStatus", *st)
+		pods, err := r.GetPods(ctx)
+		if err != nil {
+			t.Fatalf("GetPods %s: %v", when, err)
+		}
+		for _, p := range pods {
+			if p.Name == pod.Name {
+				add("GetPods", p.Status)
+			}
+		}
+	}
+
+	mu.Lock()
+	recording = true
+	mu.Unlock()
+
+	clk.Step(20 * time.Minute)
+	r.resync(ctx)
+	select {
+	case <-d.entered:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the deadline stop never reached the runtime")
+	}
+	waitSentinel := time.After(30 * time.Second)
+	for done := false; !done; {
+		select {
+		case <-sentinelOK:
+			done = true
+		case <-waitSentinel:
+			t.Fatal("the watch never consumed the events DeletePod published")
+		}
+	}
+	read("while the stop is in flight")
+
+	release()
+	waitDeadlineStops(r)
+	read("after the failed stop")
+	// The next tick retries the stop, which fails again, and publishes the
+	// pod's status through the callback.
+	clk.Step(10 * time.Second)
+	r.resync(ctx)
+	waitDeadlineStops(r)
+	read("after the failed retry")
+
+	mu.Lock()
+	defer mu.Unlock()
+	t.Logf("published: %v", published)
+	if len(phases) == 0 {
+		t.Fatal("nothing was published")
+	}
+	var notified bool
+	for i, st := range phases {
+		if st.Phase != corev1.PodRunning {
+			t.Errorf("publication %d = %q, want Running; sequence %v", i, published[i], published)
+		}
+		if published[i][:len("notify")] == "notify" {
+			notified = true
+		}
+	}
+	if !notified {
+		t.Errorf("no NotifyPods publication; sequence %v", published)
+	}
+	if got := d.calls.Load(); got < 2 {
+		t.Errorf("DeletePod calls = %d, want the stop and its retry", got)
 	}
 }

@@ -3838,6 +3838,14 @@ func (r *runtimedRuntime) emit(rs *runtimev1.PodStatus) {
 	if !ok || cb == nil {
 		return
 	}
+	// A pod whose active-deadline stop is in flight publishes nothing the
+	// runtime says about it: that stop is tearing it down, so its events (the
+	// DELETED one reads Succeeded for restartPolicy Never) describe the stop, not
+	// the pod. The stop's success publishes Failed; a failed stop's rollback
+	// leaves the pod reporting its live status.
+	if t.isStopping() {
+		return
+	}
 	var ps probeState
 	if pr != nil {
 		ps = pr
