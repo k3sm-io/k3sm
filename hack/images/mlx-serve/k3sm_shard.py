@@ -659,6 +659,7 @@ def main(argv=None):
         return SEED_FAILED_STATUS
     try:
         result = serve(child_env, child_argv, served)
+    # Every ShardError raised inside serve() is an engine check; never raise an interconnect refusal there.
     except ShardError as e:
         print(f"k3sm-shard: {e}", file=sys.stderr, flush=True)
         return ENGINE_CHECK_STATUS

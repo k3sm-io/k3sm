@@ -274,7 +274,8 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
 - A sharded MLX model on the Thunderbolt path whose image's engine fails a startup check (a patched
   `mlx_lm.server` function that has changed) is now restarted as an ordinary failure, not reported
   as a lost Thunderbolt link that moves the model onto the network. The rank exits 1 instead of 2;
-  exit 2 still means the rank had no Thunderbolt address.
+  exit 2 still means the rank had no Thunderbolt address. The fix takes effect with the next
+  mlx-serve image; a model running an older image still exits 2 on this path.
 - A server whose control plane does not report healthy in time while the Mac is heavily loaded no
   longer parks on the crash-loop breaker after five attempts. It backs off instead, from 30 seconds
   doubling up to 10 minutes, `k3sm status` shows when the next attempt starts and that an attempt

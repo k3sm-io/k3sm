@@ -1808,6 +1808,23 @@ for label, e, want in (("tb.mismatch  refuses an own entry that is not K3SM_INTE
         os.environ.clear()
         os.environ.update(saved)
     check(label, refused and rc == want and want in (ks.MISPLACED_STATUS, ks.REFUSED_STATUS))
+# An engine check failing inside serve() after a good plan exits
+# ENGINE_CHECK_STATUS, never REFUSED_STATUS: the operator reads 2 as a lost link.
+e = env(K3SM_MLX_HOSTS=tb_hosts, K3SM_INTERCONNECT_IP="169.254.0.10")
+def engine_moved(*a, **k):
+    raise ks.ShardError("an engine hook has moved")
+saved, saved_serve = dict(os.environ), ks.serve
+os.environ.clear()
+os.environ.update(e)
+ks.serve = engine_moved
+try:
+    rc = ks.main(["--model", "/m"])
+finally:
+    ks.serve = saved_serve
+    os.environ.clear()
+    os.environ.update(saved)
+check("tb.enginecheck  a ShardError from serve() after the plan exits ENGINE_CHECK_STATUS, not 2",
+      rc == ks.ENGINE_CHECK_STATUS and rc != ks.REFUSED_STATUS)
 
 # refusals: no pod data volume, a rank list that disagrees with the world size
 for label, e in (("nodatavolume  refuses to write anywhere but the pod data volume", env(TMPDIR=None)),
@@ -2199,10 +2216,10 @@ while read -r verdict name; do
 	esac
 done <<< "$shard_out"
 # A driver that crashed before its checks would otherwise pass vacuously.
-if [ "$SHARD_CHECKS" -ge 49 ]; then
+if [ "$SHARD_CHECKS" -ge 50 ]; then
 	ladder ok "7.count  all $SHARD_CHECKS entrypoint checks reported"
 else
-	ladder no "7.count  only $SHARD_CHECKS of 49 entrypoint checks reported (the driver crashed?)"
+	ladder no "7.count  only $SHARD_CHECKS of 50 entrypoint checks reported (the driver crashed?)"
 	head -20 "$WORK/shard-driver.err"
 fi
 

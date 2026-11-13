@@ -190,6 +190,14 @@ func TestShardRunBodyRefusalIsNotInterconnectLoss(t *testing.T) {
 	if got := lostRanks([]corev1.Pod{failedRank("r0", 2, &attached)}); len(got) != 1 {
 		t.Errorf("lostRanks on an interconnect refusal (exit 2) = %v, want one loss", got)
 	}
+	// Known dependency: a failed thunderbolt rank with no InterconnectAttached
+	// condition is still a loss whatever its exit, the "failed before any
+	// attach was recorded" rule, so an engine-check exit 1 there is listed.
+	// The engine-check path does not normally reach it: the rank only runs
+	// (and so only reaches serve()) after its attach has been recorded.
+	if got := lostRanks([]corev1.Pod{failedRank("r0", int32(code), nil)}); len(got) != 1 {
+		t.Errorf("lostRanks on exit %d with no attach recorded = %v, want one loss", code, got)
+	}
 	if shardRefusedExit != 2 {
 		t.Errorf("shardRefusedExit = %d, want 2", shardRefusedExit)
 	}
