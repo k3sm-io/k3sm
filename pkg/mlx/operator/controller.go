@@ -51,6 +51,7 @@ import (
 	"k3sm.io/k3sm/pkg/crdensure"
 	"k3sm.io/k3sm/pkg/interconnect"
 	"k3sm.io/k3sm/pkg/mlx"
+	"k3sm.io/k3sm/pkg/registryclient"
 )
 
 // FieldManager is the server-side-apply field manager every serving object this
@@ -155,11 +156,12 @@ type EventRecorder interface {
 // eventComponent is the source component the operator's Events name.
 const eventComponent = FieldManager
 
-// eventReasonArtifactUnresolved is the Event reason, and only the Event
-// reason, of a model whose artifact reference could not be resolved. Its
-// status still reports ReasonInvalidSpec and is unchanged. The reason means
-// the artifact reference could not be resolved, whether the registry could not
-// be reached or it refused or could not satisfy the reference.
+// eventReasonArtifactUnresolved is the Event reason of a model whose artifact
+// reference could not be resolved, whatever the cause. Its status reports
+// ReasonArtifactUnresolved for a transient registry failure and
+// ReasonInvalidSpec for any other (see unresolvedFit). The reason means the
+// artifact reference could not be resolved, whether the registry could not be
+// reached or it refused or could not satisfy the reference.
 const eventReasonArtifactUnresolved = "ArtifactUnresolved"
 
 // Controller reconciles MLXModels into the objects that serve them.
@@ -480,10 +482,11 @@ func (c *Controller) reconcile(ctx context.Context, key string, rec EventRecorde
 	// error is retried, a missing resolver waits for the configuration.
 	if err := c.resolveArtifact(ctx, model); err != nil {
 		c.log.Warn("mlxmodel artifact cannot be resolved; no objects applied", "mlxmodel", key, "err", err)
-		// The status is InvalidSpec whatever the cause and is unchanged. The
-		// Event says the artifact reference could not be resolved, whether the
+		// The status is ArtifactUnresolved for a transient registry failure
+		// and InvalidSpec for any other cause (see unresolvedFit). The Event
+		// says the artifact reference could not be resolved, whether the
 		// registry could not be reached or it refused the reference.
-		if werr := c.refuseWithEvent(ctx, rec, raw, model, invalidSpecFit(err), eventReasonArtifactUnresolved); werr != nil {
+		if werr := c.refuseWithEvent(ctx, rec, raw, model, unresolvedFit(err), eventReasonArtifactUnresolved); werr != nil {
 			return werr
 		}
 		if errors.Is(err, errNoResolver) {
@@ -797,10 +800,31 @@ func invalidSpecFit(err error) Fit {
 	return Fit{Level: FitFailed, Reason: ReasonInvalidSpec, Message: err.Error()}
 }
 
+// unresolvedFit is the refusal an artifact resolution failure reports. A
+// transient registry failure (registryclient.ErrTransient: the registry could
+// not be reached, answered 5xx or 429, or its body could not be read) reports
+// ReasonArtifactUnresolved, since a retry may clear it with the spec
+// unchanged. Every other cause keeps ReasonInvalidSpec: a 404, a 401/403, a
+// digest mismatch, a refused variant or manifest, a missing registry client,
+// and any error not positively classified, so an unknown fault never reads as
+// waiting.
+func unresolvedFit(err error) Fit {
+	if errors.Is(err, registryclient.ErrTransient) {
+		return Fit{Level: FitFailed, Reason: ReasonArtifactUnresolved, Message: err.Error()}
+	}
+	return invalidSpecFit(err)
+}
+
 // ReasonInvalidSpec means the spec could not be rendered into serving objects at
 // all. It is terminal in the same way a fit failure is: nothing changes until the
 // spec does.
 const ReasonInvalidSpec = "InvalidSpec"
+
+// ReasonArtifactUnresolved means the artifact reference could not be resolved
+// because of a transient registry failure. It is NOT terminal: the reconcile
+// is retried, and the reason gives way to the model's normal one once the
+// reference resolves, with no spec change.
+const ReasonArtifactUnresolved = "ArtifactUnresolved"
 
 // hostPort joins an IP and port for a URL, bracketing an IPv6 literal.
 func hostPort(ip string, port int32) string {

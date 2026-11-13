@@ -253,9 +253,11 @@ func TestRunRecorderIsScopedToRun(t *testing.T) {
 }
 
 // TestArtifactResolutionFailureEventReason pins the Event reason of the
-// artifact branch: the status stays InvalidSpec, but the Event says
-// ArtifactUnresolved, because a registry outage is retried and is not a bad
-// spec. A render failure keeps InvalidSpec for both.
+// artifact branch: the Event says ArtifactUnresolved for every resolution
+// failure. The resolver errors here are unclassified (a plain error, not
+// registryclient.ErrTransient), so the status stays InvalidSpec; the
+// transient case's status is TestResolutionFailureConditionReason's. A render
+// failure keeps InvalidSpec for both.
 func TestArtifactResolutionFailureEventReason(t *testing.T) {
 	t.Run("registry error", func(t *testing.T) {
 		rec := &fakeRecorder{}
