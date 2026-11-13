@@ -307,7 +307,7 @@ verbatim, and the Job. The Job's pod is a native pod that:
 
 - checks the ConfigMap's `requirements.lock` against the sha256 rendered into
   the Job;
-- downloads uv at the exact version that generated the lockfile and checks it
+- downloads the pinned uv, the version the lock is regenerated with, and checks it
   against the sha256 its release publishes, failing closed on a mismatch;
 - runs `build.sh --stage-only`, which is every check and step below up to the
   context ceiling, into the claim.
@@ -480,6 +480,9 @@ uv pip compile --generate-hashes --no-header \
     --python "${UV_PYTHON_INSTALL_DIR:-$HOME/.local/share/uv/python}/cpython-3.12.16-macos-aarch64-none/bin/python3.12" \
     requirements.in -o requirements.lock
 ```
+
+The lock's header names the uv and interpreter it was last generated with, which lag the
+pins until it is regenerated.
 
 `--exclude-newer` is the 14-day dependency cooldown: the resolver ignores every
 artifact uploaded after midnight UTC 14 days before the run, so a version

@@ -50,7 +50,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 PY_KEY="cpython-3.12.16-macos-aarch64-none"
 PY_URL="https://releases.astral.sh/github/python-build-standalone/releases/download/20261026/cpython-3.12.16%2B20261026-aarch64-apple-darwin-install_only_stripped.tar.gz"
 PY_BIN="bin/python3.12"
-# The uv that generated requirements.lock. Older uv is refused rather than
+# The pinned uv: the version requirements.lock is regenerated with and the oldest
+# whose listing carries the pinned interpreter. Older uv is refused rather than
 # tried: the JSON interpreter listing this script pins against is not in every
 # release, and a silent skip of the URL assertion would un-pin the interpreter.
 UV_MIN="0.13.6"
@@ -200,7 +201,7 @@ require_uv() {
 	have="$("$UV" --version 2>/dev/null | awk '{print $2}')"
 	[ -n "$have" ] || die "cannot read a version from '$UV --version'"
 	if [ "$(printf '%s\n%s\n' "$UV_MIN" "$have" | sort -V | sed -n 1p)" != "$UV_MIN" ]; then
-		die "uv $have is older than the pinned minimum $UV_MIN (requirements.lock was generated with $UV_MIN)"
+		die "uv $have is older than the pinned minimum $UV_MIN (the pinned uv, which requirements.lock is regenerated with)"
 	fi
 	echo "  uv: $have ($UV)"
 }

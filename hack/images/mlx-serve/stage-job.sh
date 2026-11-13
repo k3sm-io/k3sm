@@ -33,8 +33,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 
 # ---- pins -------------------------------------------------------------------
 # uv, pinned by exact version and by the sha256 the release publishes beside the
-# asset (uv-aarch64-apple-darwin.tar.gz.sha256). It is the version that
-# generated requirements.lock (build.sh's UV_MIN), and it is the uv whose
+# asset (uv-aarch64-apple-darwin.tar.gz.sha256). It is the pinned uv, the version
+# requirements.lock is regenerated with (build.sh's UV_MIN), and it is the uv whose
 # manifest maps build.sh's PY_KEY to build.sh's PY_URL; a later uv maps the same
 # key to a newer python-build-standalone build, which build.sh refuses.
 UV_VERSION="0.13.6"
