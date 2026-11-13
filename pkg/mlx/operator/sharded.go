@@ -413,8 +413,11 @@ func (c *Controller) forceNetwork(model *mlxv1alpha1.MLXModel) bool {
 // gang restart, which would re-resolve straight back onto the cable. A rank
 // that exited shardMisplacedExit is not listed: it held an interconnect
 // address, only not the one its hostfile entry names (misplacedRanks). A rank
-// that failed otherwise, after its attach succeeded, is the generic gang fault.
-// A gang on the network path lists nothing.
+// that failed otherwise, after its attach succeeded, is the generic gang fault;
+// that includes shardEngineCheckExit, a rank whose engine failed a hook check
+// (the run body among them), which k3sm-shard keeps off exit 2 so a moved
+// engine is never read as a lost link. A gang on the network path lists
+// nothing.
 func lostRanks(pods []corev1.Pod) []string {
 	var out []string
 	for i := range pods {
@@ -443,8 +446,8 @@ func lostRanks(pods []corev1.Pod) []string {
 }
 
 // The k3sm-shard exit statuses the operator reads
-// (hack/images/mlx-serve/k3sm_shard.py, REFUSED_STATUS and MISPLACED_STATUS;
-// TestShardExitStatusesMatchTheScript keeps them in sync).
+// (hack/images/mlx-serve/k3sm_shard.py, REFUSED_STATUS, MISPLACED_STATUS and
+// ENGINE_CHECK_STATUS; TestShardExitStatusesMatchTheScript keeps them in sync).
 const (
 	// shardRefusedExit is k3sm-shard refusing to start a rank: on the
 	// thunderbolt path, a rank without its interconnect address.
@@ -453,6 +456,10 @@ const (
 	// whose interconnect address is not the one its K3SM_MLX_HOSTS entry
 	// names: the node's provider gave it another slot.
 	shardMisplacedExit = 3
+	// shardEngineCheckExit is k3sm-shard refusing to serve because an engine
+	// hook it patches has moved. It is the generic gang fault, never
+	// shardRefusedExit: the rank already held its interconnect address.
+	shardEngineCheckExit = 1
 )
 
 // misplacedRanks lists the rank Pods on the thunderbolt path that exited

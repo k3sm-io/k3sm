@@ -55,7 +55,8 @@ the name alone. That needs four hooks in mlx_lm.server
 _run_http_server), none of them a published API. install_alias checks each
 against the shape it was written for, mlx-lm 0.32.2, and the source of run
 against the 0.32.2 body its replacement copies; the rank exits naming the hook
-that moved instead of serving under the wrong name.
+that moved instead of serving under the wrong name, with ENGINE_CHECK_STATUS
+rather than REFUSED_STATUS, since a moved engine is not an interconnect loss.
 
 Every rank, with or without that option, also replaces mlx-lm 0.32.2's
 _inline_image_urls, which fetches any http(s) image URL in a chat request, with
@@ -140,6 +141,14 @@ MISPLACED_STATUS = 3
 # not REFUSED_STATUS: a Hub failure is not an interconnect loss. Status 1 is the
 # generic gang fault.
 SEED_FAILED_STATUS = 1
+
+# The exit status of a rank whose engine fails a hook check before it serves:
+# the run body the served-name alias copies, another hook it patches, or the
+# remote-image guard's function has moved. The rank already holds its
+# interconnect address, so it is not REFUSED_STATUS: an image whose engine moved
+# is not an interconnect loss. Like SEED_FAILED_STATUS it is the generic gang
+# fault (pkg/mlx/operator shardEngineCheckExit). Keep the value in sync with Go.
+ENGINE_CHECK_STATUS = 1
 
 # The option the operator renders for the name the engine serves under, and the
 # key mlx_lm.server's ModelProvider maps to its --model.
@@ -652,7 +661,7 @@ def main(argv=None):
         result = serve(child_env, child_argv, served)
     except ShardError as e:
         print(f"k3sm-shard: {e}", file=sys.stderr, flush=True)
-        return REFUSED_STATUS
+        return ENGINE_CHECK_STATUS
     return exit_status(result)
 
 

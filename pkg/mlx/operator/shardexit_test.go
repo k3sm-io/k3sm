@@ -46,6 +46,7 @@ func TestShardExitStatusesMatchTheScript(t *testing.T) {
 	}{
 		{"REFUSED_STATUS", shardRefusedExit},
 		{"MISPLACED_STATUS", shardMisplacedExit},
+		{"ENGINE_CHECK_STATUS", shardEngineCheckExit},
 	} {
 		m := regexp.MustCompile(`(?m)^`+tc.name+` = (\d+)$`).FindAllSubmatch(src, -1)
 		if len(m) != 1 {
@@ -149,5 +150,47 @@ func TestMisplacedRankReplacesOnTheCable(t *testing.T) {
 	h.reconcile(t)
 	if got := h.gangPath(t); got != tb {
 		t.Errorf("re-placed on %q, want thunderbolt (the cable is up)", got)
+	}
+}
+
+// TestShardRunBodyRefusalIsNotInterconnectLoss pins that a rank refusing to
+// start because an engine hook it patches (the run body among them) has moved
+// exits with a status the operator does not read as an interconnect loss,
+// while k3sm-shard's real refusal to start on the interconnect stays exit 2.
+// The status comes from what k3sm_shard.py's main() returns when serve()
+// raises, so the script and the operator cannot drift apart.
+func TestShardRunBodyRefusalIsNotInterconnectLoss(t *testing.T) {
+	src, err := os.ReadFile(filepath.Join("..", "..", "..", "hack", "images", "mlx-serve", "k3sm_shard.py"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := regexp.MustCompile(`(?s)result = serve\(.*?except ShardError as e:.*?return ([A-Z_]+)\n`).FindSubmatch(src)
+	if m == nil {
+		t.Fatal("k3sm_shard.py main() has no except ShardError branch around serve()")
+	}
+	name := string(m[1])
+	v := regexp.MustCompile(`(?m)^`+name+` = (\d+)$`).FindAllSubmatch(src, -1)
+	if len(v) != 1 {
+		t.Fatalf("k3sm_shard.py defines %s %d times, want once", name, len(v))
+	}
+	code, err := strconv.Atoi(string(v[0][1]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code == shardRefusedExit {
+		t.Errorf("a refused engine hook exits %s = %d, the interconnect refusal's status", name, code)
+	}
+	if code != shardEngineCheckExit {
+		t.Errorf("a refused engine hook exits %s = %d, the operator reads %d", name, code, shardEngineCheckExit)
+	}
+	attached := corev1.ConditionTrue
+	if got := lostRanks([]corev1.Pod{failedRank("r0", int32(code), &attached)}); len(got) != 0 {
+		t.Errorf("lostRanks on a run-body refusal (exit %d) = %v, want no interconnect loss", code, got)
+	}
+	if got := lostRanks([]corev1.Pod{failedRank("r0", 2, &attached)}); len(got) != 1 {
+		t.Errorf("lostRanks on an interconnect refusal (exit 2) = %v, want one loss", got)
+	}
+	if shardRefusedExit != 2 {
+		t.Errorf("shardRefusedExit = %d, want 2", shardRefusedExit)
 	}
 }
