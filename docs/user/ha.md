@@ -122,8 +122,9 @@ Rolling back is described under [Upgrade](upgrade.md#rolling-back-past-the-aggre
 
 ## Caveats
 
-Until a two-server cluster has been run end to end, there is no HA control plane to rely on, and no
-availability guarantee. Keep datastore backups (see [Backup & restore](backup-restore.md)).
+The two-server mechanics have been run on two Macs: join, replication, leader election, loss and
+recovery of a server, reset, cold restart and a one-hour load. That shows the mechanics, not fault
+tolerance, and a three-server cluster has not been run. There is no availability guarantee. Keep datastore backups (see [Backup & restore](backup-restore.md)).
 On a server started with `--cluster-init` or `--server-join`, `k3sm snapshot save` streams an online
 snapshot of this server's etcd member. `k3sm snapshot restore` puts one back as a new single-member
 cluster, and every other server joins it again as a new member; see
