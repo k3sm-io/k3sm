@@ -391,7 +391,8 @@ registry confirmed. The registry's garbage collection (the sweep) still reclaims
 limit: a note on stderr says how many and how long. The report marks the prune `interrupted` and
 lists under `unattempted`, not under `failed`, every planned manifest the prune did not attempt and
 every deletion it could not confirm because the cancellation cut it off. Listing here means the
-prune did not confirm the deletion, not that the manifest still exists. A deletion the registry refused is listed under `failed`,
+prune did not confirm the deletion, not that the manifest still exists. A deletion the registry
+refused is listed under `failed`,
 even when the refusal came at the moment of the cancellation. The prune is still marked
 `interrupted`, so an interrupted prune can list failures. If the registry refuses the last planned
 deletion just as the cancellation arrives, `unattempted` is empty, that manifest is under `failed`,
