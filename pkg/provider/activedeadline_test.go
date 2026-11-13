@@ -26,6 +26,7 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -725,5 +726,117 @@ func TestActiveDeadlineStopDropsStatusOfADeletedPod(t *testing.T) {
 	}
 	if st := tr.unpersistedStatus(); st != nil {
 		t.Errorf("the deleted pod still owes a status: %v", st)
+	}
+}
+
+// finishedRuntime reports every pod the fake runtime holds as finished on its
+// own: phase phase, its one container c0 terminated with exit.
+type finishedRuntime struct {
+	*fakeRuntimeServer
+	phase runtimev1.PodPhase
+	exit  int32
+}
+
+func (f *finishedRuntime) GetPodStatus(ctx context.Context, req *runtimev1.GetPodStatusRequest) (*runtimev1.GetPodStatusResponse, error) {
+	resp, err := f.fakeRuntimeServer.GetPodStatus(ctx, req)
+	if err != nil || resp.GetStatus() == nil {
+		return resp, err
+	}
+	reason := "Completed"
+	if f.exit != 0 {
+		reason = "Error"
+	}
+	resp.Status.Phase = f.phase
+	resp.Status.ContainerStatuses = []*runtimev1.ContainerStatus{{
+		Name: "c0", Image: "web",
+		State: &runtimev1.ContainerState{Terminated: &runtimev1.ContainerStateTerminated{
+			ExitCode:   f.exit,
+			Reason:     reason,
+			StartedAt:  timestamppb.New(f.started),
+			FinishedAt: timestamppb.New(f.started.Add(time.Second)),
+		}},
+	}}
+	return resp, nil
+}
+
+// TestActiveDeadlineLeavesAFinishedPodAlone pins the kubelet's terminal-phase
+// guard: a restartPolicy Never pod that finished on its own inside its deadline
+// is not active, so the deadline passing later neither stops it nor replaces its
+// own Succeeded or Failed status with DeadlineExceeded.
+func TestActiveDeadlineLeavesAFinishedPodAlone(t *testing.T) {
+	cases := []struct {
+		name  string
+		phase runtimev1.PodPhase
+		exit  int32
+		want  corev1.PodPhase
+	}{
+		{"a pod that succeeded", runtimev1.PodPhase_POD_PHASE_SUCCEEDED, 0, corev1.PodSucceeded},
+		{"a pod that failed on its own", runtimev1.PodPhase_POD_PHASE_FAILED, 1, corev1.PodFailed},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := context.Background()
+			pod := crashPod("deadline-finished", corev1.RestartPolicyNever)
+			deadline := int64(10)
+			pod.Spec.ActiveDeadlineSeconds = &deadline
+			id := string(pod.UID)
+			f := &finishedRuntime{fakeRuntimeServer: newFakeRuntimeServer(), phase: c.phase, exit: c.exit}
+			rec := record.NewFakeRecorder(64)
+			r := newRuntimedWith(f, RuntimedConfig{
+				NodeName: "n",
+				NodeIP:   testNodeIP,
+				Root:     t.TempDir(), PodLogsDir: t.TempDir(),
+				Recorder: rec,
+			}, nil, nil)
+			clk := testclock.NewFakeClock(time.Now())
+			r.clk = clk
+			cs := fake.NewClientset()
+			r.client = cs
+			if _, err := cs.CoreV1().Pods(pod.Namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+				t.Fatalf("apiserver create: %v", err)
+			}
+			var writes atomic.Int32
+			cs.PrependReactor("update", "pods", func(a k8stesting.Action) (bool, runtime.Object, error) {
+				if a.GetSubresource() == "status" {
+					writes.Add(1)
+				}
+				return false, nil, nil
+			})
+			if err := r.CreatePod(ctx, pod); err != nil {
+				t.Fatalf("CreatePod: %v", err)
+			}
+			tr := r.trackByID(id)
+			if tr == nil {
+				t.Fatal("pod not tracked after CreatePod")
+			}
+			_ = recordedEvents(rec.Events)
+
+			// Past the 10 s deadline by minutes: the track's start is the wall
+			// clock when CreatePod ran, which on a loaded host trails the fake
+			// clock's start.
+			clk.Step(20 * time.Minute)
+			r.resync(ctx)
+			waitDeadlineStops(r)
+
+			if n := f.deleteCount(); n != 0 {
+				t.Errorf("runtime DeletePod calls = %d, want 0: a finished pod is not stopped", n)
+			}
+			if n := countEvents(recordedEvents(rec.Events), reasonDeadlineExceeded); n != 0 {
+				t.Errorf("DeadlineExceeded events = %d, want 0", n)
+			}
+			if n := writes.Load(); n != 0 {
+				t.Errorf("apiserver status writes = %d, want 0", n)
+			}
+			if st := tr.evictedStatus(); st != nil {
+				t.Errorf("track marked terminal %s/%s, want no mark", st.Phase, st.Reason)
+			}
+			st, err := r.GetPodStatus(ctx, pod.Namespace, pod.Name)
+			if err != nil {
+				t.Fatalf("GetPodStatus: %v", err)
+			}
+			if st.Phase != c.want || st.Reason == reasonDeadlineExceeded {
+				t.Errorf("status = %s/%s, want %s, not %s", st.Phase, st.Reason, c.want, reasonDeadlineExceeded)
+			}
+		})
 	}
 }

@@ -123,6 +123,17 @@ func (r *runtimedRuntime) startDeadlineStop(ctx context.Context, tracked *corev1
 	r.deadlineStops.Add(1)
 	r.mu.Unlock()
 	prior := r.podWithStatus(ctx, tracked, t)
+	// A pod that reached a terminal phase on its own (a restartPolicy Never pod
+	// that Succeeded, or Failed, inside its deadline) is not active, so the
+	// kubelet's deadline leaves it alone, as the eviction ranking does
+	// (evictionCandidates). The check sits here, not in enforceActiveDeadlines'
+	// collection loop, because the phase needs podWithStatus's runtime
+	// GetPodStatus, which must not run under r.mu.
+	switch prior.Status.Phase {
+	case corev1.PodSucceeded, corev1.PodFailed:
+		r.deadlineStops.Done()
+		return
+	}
 	st := failedPodStatus(prior.Status, reasonDeadlineExceeded, msgDeadlineExceeded, metav1.NewTime(r.clk.Now()))
 	if !t.markTerminal(st) {
 		r.deadlineStops.Done()
