@@ -85,6 +85,18 @@ func (t *podTrack) isStopping() bool {
 	return t.stopping
 }
 
+// stopFenced reports whether t is fenced against new work by a node-side stop:
+// it is terminal (evicted, or failed by its deadline) or its active-deadline
+// stop is in flight. The fences (a repeat create, an update, a parked create, a
+// restart, eviction) consult it; the status readers consult evictedStatus
+// alone, because a pod being stopped has published nothing yet and must not
+// read Failed.
+func (t *podTrack) stopFenced() bool {
+	t.restartMu.Lock()
+	defer t.restartMu.Unlock()
+	return t.evicted != nil || t.stopping
+}
+
 // finishStopping is the second stage, after the stop succeeded: it records st,
 // which carries its own reason, as t's terminal mark and ends the stopping
 // mark, in one critical section so no tick sees the track neither stopping nor
@@ -180,7 +192,7 @@ func (r *runtimedRuntime) evictionCandidates(ctx context.Context) []evictionCand
 	// no stats, first.
 	probeFailed := map[types.UID]bool{}
 	for _, tr := range all {
-		if tr.t.evictedStatus() != nil || trackDeleting(tr.t) {
+		if tr.t.stopFenced() || trackDeleting(tr.t) {
 			continue
 		}
 		resp, err := r.rt.GetPodStatus(ctx, &runtimev1.GetPodStatusRequest{PodId: tr.id})

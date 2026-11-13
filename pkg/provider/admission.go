@@ -260,8 +260,9 @@ func (r *runtimedRuntime) admitOnCreate(ctx context.Context, pod *corev1.Pod) (r
 	}
 	if prior := r.track[id]; prior != nil {
 		// Admitted (or refused) at its first create; a refused or evicted pod
-		// is terminal and is never created by a repeat call.
-		if prior.evictedStatus() != nil {
+		// is terminal and is never created by a repeat call, nor is one whose
+		// deadline stop is in flight.
+		if prior.stopFenced() {
 			r.mu.Unlock()
 			return true, nil
 		}
@@ -382,7 +383,7 @@ func (r *runtimedRuntime) waitForUpdateVerdict(ctx context.Context, id string, c
 // The caller holds r.mu.
 func (r *runtimedRuntime) updateWaitLocked(id string) <-chan struct{} {
 	t := r.track[id]
-	if t != nil && (t.rejected || t.evictedStatus() != nil) {
+	if t != nil && (t.rejected || t.stopFenced()) {
 		return nil
 	}
 	if ch := r.fenceReleasing[id]; ch != nil {

@@ -1025,3 +1025,81 @@ func TestDeadlineStopFailureNeverPublishesFailedThenRunning(t *testing.T) {
 		h.assertDeadlineFailed(t, events)
 	})
 }
+
+// TestDeadlineStopFencesThePodWhileItRuns pins the fences of a deadline stop in
+// flight: while the runtime stop is held the pod reads live (not Failed), yet a
+// repeat CreatePod starts no second runtime create, an UpdatePod makes no runtime
+// update, a container exit the teardown produces schedules no restart of a
+// restartPolicy Always pod, and the pod is not an eviction candidate.
+func TestDeadlineStopFencesThePodWhileItRuns(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeRuntimeServer()
+	hs := &heldStopRuntime{fakeRuntimeServer: f, hold: make(chan struct{}), entered: make(chan struct{})}
+	h := newDeadlineStopHarness(t, hs, "deadline-fenced")
+	id := string(h.pod.UID)
+	hs.holdID = id
+	var released atomic.Bool
+	release := func() {
+		if released.CompareAndSwap(false, true) {
+			close(hs.hold)
+		}
+	}
+	t.Cleanup(h.r.shutdown)
+	t.Cleanup(release)
+	tr := h.r.trackByID(id)
+	if tr == nil {
+		t.Fatal("pod not tracked after CreatePod")
+	}
+	if h.pod.Spec.RestartPolicy != corev1.RestartPolicyAlways {
+		t.Fatalf("restartPolicy = %s, want Always", h.pod.Spec.RestartPolicy)
+	}
+
+	h.clk.Step(20 * time.Minute)
+	h.r.resync(ctx)
+	select {
+	case <-hs.entered:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the deadline stop never reached the runtime")
+	}
+	h.assertNotFailed(t, "while the stop is held")
+
+	creates := f.createCount()
+	if err := h.r.CreatePod(ctx, h.pod.DeepCopy()); err != nil {
+		t.Fatalf("repeat CreatePod: %v", err)
+	}
+	if n := f.createCount(); n != creates {
+		t.Errorf("runtime CreatePod calls = %d, want %d: a repeat create during the stop started a second one", n, creates)
+	}
+
+	updated := h.pod.DeepCopy()
+	updated.Labels = map[string]string{"edited": "true"}
+	if err := h.r.UpdatePod(ctx, updated); err != nil {
+		t.Errorf("UpdatePod: %v (a runtime update was attempted for a pod being stopped)", err)
+	}
+	if n := f.updateCount(); n != 0 {
+		t.Errorf("runtime UpdatePod calls = %d, want 0: a pod being stopped was updated", n)
+	}
+
+	h.r.buildStatus(h.pod.DeepCopy(), tr, exitStatus(id, 143, "Error", 0, h.clk.Now()), nil)
+	if restartScheduled(tr, "c0") {
+		t.Error("an exit observed during the deadline stop scheduled a restart")
+	}
+
+	for _, c := range h.r.evictionCandidates(ctx) {
+		if c.pod.UID == h.pod.UID {
+			t.Error("a pod whose deadline stop is in flight is an eviction candidate")
+		}
+	}
+
+	release()
+	waitDeadlineStops(h.r)
+	if n := f.deleteCount(); n != 1 {
+		t.Errorf("runtime DeletePod calls = %d, want 1", n)
+	}
+	if got, _ := f.restartState(); got != 0 {
+		t.Errorf("RestartContainer calls = %d, want 0", got)
+	}
+	if st := tr.evictedStatus(); st == nil || st.Reason != reasonDeadlineExceeded {
+		t.Errorf("track status = %v, want Failed/%s once the stop succeeded", st, reasonDeadlineExceeded)
+	}
+}

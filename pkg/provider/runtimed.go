@@ -2425,7 +2425,7 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	r.mu.Lock()
 	old := r.track[id]
 	_, deleted := r.deleteOwed[id]
-	if deleted || (old != nil && old.evictedStatus() != nil) {
+	if deleted || (old != nil && old.stopFenced()) {
 		// The pod was refused at admission, evicted or deleted while this create
 		// ran. A terminal status is already the apiserver's; a live track here
 		// would run a pod the apiserver reports Failed or no longer holds.
@@ -3064,7 +3064,7 @@ func (r *runtimedRuntime) checkUpdate(ctx context.Context, pod *corev1.Pod) (t *
 	terminal := isEvictedPod(pod) || isBudgetRejectedPod(pod) || isDeadlineExceededPod(pod) || pod.DeletionTimestamp != nil ||
 		r.tombstones.has(id)
 	if tracked {
-		terminal = t.rejected || t.evictedStatus() != nil || trackDeleting(t)
+		terminal = t.rejected || t.stopFenced() || trackDeleting(t)
 	}
 	if _, deleted := r.deleteOwed[id]; deleted {
 		terminal = true
@@ -3138,7 +3138,7 @@ func (r *runtimedRuntime) DeletePod(ctx context.Context, pod *corev1.Pod) error 
 	// for this call (the /32, the log tree, the track, the apiserver object).
 	// The grace is the floor, not 0: runtimed already forgot the pod, and wire 0
 	// is reserved for evictPod's immediate kill.
-	if t != nil && t.evictedStatus() != nil {
+	if t != nil && t.stopFenced() {
 		return r.teardownPod(ctx, pod, minimumGracePeriodSeconds, nil)
 	}
 	// The kubelet's killContainer records Killing for each container it stops
@@ -3576,7 +3576,12 @@ func (r *runtimedRuntime) buildStatus(pod *corev1.Pod, t *podTrack, rs *runtimev
 	if st := t.evictedStatus(); st != nil {
 		return *st
 	}
-	r.observeExits(pod, t, rs)
+	// A pod whose deadline stop is in flight reports its live status (it has
+	// published nothing yet), but its teardown's exits are not crashes: they
+	// must not schedule a restart of a container the stop is ending.
+	if !t.isStopping() {
+		r.observeExits(pod, t, rs)
+	}
 	// The prober follows container instances on the same convergence, so a
 	// liveness restart's hold lifts only once the replacement is observed.
 	observeProbeInstances(ps, rs)
@@ -3744,8 +3749,11 @@ func (r *runtimedRuntime) resync(ctx context.Context) {
 	// A slot-1 pod restored before this node's desired annotation was
 	// readable is verified here, before the status it feeds is built.
 	r.interconnect.recheck(ctx)
-	// Before the statuses are built, so a pod failed here publishes Failed on
-	// this same tick.
+	// Before the statuses are built, so a pod failed on an earlier tick whose
+	// Failed status is still owed is persisted first. A pod whose deadline
+	// passes here only has its stop started (in the background): it goes on
+	// reporting its live status, on this tick and until that stop succeeds,
+	// and publishes Failed on the first tick after it.
 	r.enforceActiveDeadlines(ctx)
 	pods, err := r.GetPods(ctx)
 	if err != nil {
