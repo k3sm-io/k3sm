@@ -63,6 +63,12 @@ func TestRenderRefusesHubFetchArgsForClusterStoreModels(t *testing.T) {
 		// option takes that option's name as its value, which is not an
 		// absolute path, so it is refused.
 		{"store_adapter_value_is_next_option_refused_today", artifactModel, []string{"--adapter-path", "--draft-model", "/a"}, true},
+		// An option before a bare "--" is still checked.
+		{"store_before_double_dash_still_checked", artifactModel, []string{"--adapter-path", "org/x", "--", "pos"}, true},
+		// A good occurrence before "--" passes and a bad-looking one after it is positional.
+		{"store_good_before_bad_looking_after_double_dash", artifactModel, []string{"--adapter-path", "/a", "--", "--adapter-path", "org/x"}, false},
+		// "--" in the value position is the flag's value, not a terminator.
+		{"store_double_dash_as_value_refused", artifactModel, []string{"--adapter-path", "--"}, true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
