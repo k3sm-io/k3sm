@@ -43,6 +43,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/yaml"
 
+	imagestorev1 "k3sm.io/apis/imagestore/v1"
+
 	"k3sm.io/k3sm/pkg/registryclient"
 	"k3sm.io/k3sm/pkg/registrysvc"
 	"k3sm.io/k3sm/pkg/status"
@@ -104,6 +106,20 @@ type nodeCacheRow struct {
 	// Incomplete is a node at the status.images cap: it may cache more than it
 	// reports, so CacheBytes is a lower bound.
 	Incomplete bool `json:"incomplete"`
+	// Classes, ClassesObservedAt and StoreBytes are the node's own report of
+	// its image store by content class, read from its
+	// imagestorev1.AnnotationClassReport annotation. All three are absent when
+	// the node publishes no report (a node on an older version) or the report
+	// is unreadable; StoreBytes is the store's total, not CacheBytes. A read
+	// report sets all three, so a valid empty store is "classes": {} with
+	// "storeBytes": 0: Classes is omitzero, not omitempty, so only the nil
+	// map of no report is dropped and an empty one is kept.
+	Classes           map[string]uint64 `json:"classes,omitzero"`
+	ClassesObservedAt string            `json:"classesObservedAt,omitempty"`
+	StoreBytes        *uint64           `json:"storeBytes,omitempty"`
+	// ClassesNote says why a present report was not read: "unreadable", or
+	// "newer schema" for a report from a newer node than this CLI.
+	ClassesNote string `json:"classesNote,omitempty"`
 }
 
 // imageDFReport is `k3sm image df -o json`.
@@ -237,7 +253,7 @@ func imageRegistryCommand(ctx context.Context, o imageOptions, out io.Writer, en
 		if o.output == "json" {
 			return writeImageReport(out, rep)
 		}
-		return renderImageDF(out, rep)
+		return renderImageDF(out, rep, time.Now())
 	}
 	return fmt.Errorf("unknown subcommand %q", o.subcommand)
 }
@@ -698,10 +714,70 @@ func buildImageDF(reg registryReport, l registryListing, nodes []corev1.Node) im
 		for _, ci := range n.Status.Images {
 			row.CacheBytes += ci.SizeBytes
 		}
+		readClassReport(&row, n)
 		rep.Nodes = append(rep.Nodes, row)
 	}
 	sort.Slice(rep.Nodes, func(i, j int) bool { return rep.Nodes[i].Node < rep.Nodes[j].Node })
 	return rep
+}
+
+// readClassReport fills row's class fields from n's class report annotation.
+// A missing annotation leaves them absent; a report this CLI cannot read sets
+// only ClassesNote, so one odd node never fails the command.
+func readClassReport(row *nodeCacheRow, n corev1.Node) {
+	v, ok := n.Annotations[imagestorev1.AnnotationClassReport]
+	if !ok {
+		return
+	}
+	r, err := imagestorev1.ParseClassReport(v)
+	switch {
+	case errors.Is(err, imagestorev1.ErrUnknownClassReportSchema):
+		row.ClassesNote = "newer schema"
+		return
+	case err != nil:
+		row.ClassesNote = "unreadable"
+		return
+	}
+	row.Classes = r.BytesByClass
+	row.ClassesObservedAt = r.ObservedAt.UTC().Format(time.RFC3339)
+	total := r.StoreBytes
+	row.StoreBytes = &total
+}
+
+// classReportMaxSkew is how far a node's class report may be from the CLI's
+// clock, older or ahead, before the table flags it.
+const classReportMaxSkew = 10 * time.Minute
+
+// classCells are the IMAGE, ARTIFACT and OTHER cells of n, and the trailing
+// note, judged against now. OTHER is every media-type class plus the
+// unattributed one.
+func classCells(n nodeCacheRow, now time.Time) (img, art, other, note string) {
+	img, art, other = "-", "-", "-"
+	if n.ClassesNote != "" {
+		return img, art, other, "(class report " + n.ClassesNote + ")"
+	}
+	if n.ClassesObservedAt == "" {
+		return img, art, other, ""
+	}
+	var rest uint64
+	for k, b := range n.Classes {
+		if k != imagestorev1.ClassImage && k != imagestorev1.ClassArtifact {
+			rest += b
+		}
+	}
+	img = humanBytes(n.Classes[imagestorev1.ClassImage])
+	art = humanBytes(n.Classes[imagestorev1.ClassArtifact])
+	other = humanBytes(rest)
+	at, err := time.Parse(time.RFC3339, n.ClassesObservedAt)
+	switch {
+	case err != nil:
+		note = "(class report time unreadable)"
+	case now.Sub(at) > classReportMaxSkew:
+		note = "(class report " + now.Sub(at).Truncate(time.Minute).String() + " old)"
+	case at.Sub(now) > classReportMaxSkew:
+		note = "(class report ahead of this clock)"
+	}
+	return img, art, other, note
 }
 
 // incompleteNodes are the nodes whose status.images is at the cap, sorted.
@@ -817,8 +893,9 @@ func renderImageList(out io.Writer, rep imageListReport) error {
 	return nil
 }
 
-// renderImageDF is df's table.
-func renderImageDF(out io.Writer, rep imageDFReport) error {
+// renderImageDF is df's table. now is the CLI's clock, against which each
+// node's class report is judged stale or ahead.
+func renderImageDF(out io.Writer, rep imageDFReport, now time.Time) error {
 	if rep.Registry.Reachable {
 		fmt.Fprintf(out, "registry %s: %s\n", rep.Registry.Name, humanBytes(uint64(max(rep.RegistryBytes, 0))))
 	} else {
@@ -828,13 +905,18 @@ func renderImageDF(out io.Writer, rep imageDFReport) error {
 		return nil
 	}
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "NODE\tCACHED\tIMAGES")
+	fmt.Fprintln(tw, "NODE\tCACHED\tIMAGES\tIMAGE\tARTIFACT\tOTHER")
 	for _, n := range rep.Nodes {
 		count := strconv.Itoa(n.Images)
 		if n.Incomplete {
 			count += " (at the status.images cap; the cache may hold more)"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\n", n.Node, humanBytes(uint64(max(n.CacheBytes, 0))), count)
+		img, art, other, note := classCells(n, now)
+		line := fmt.Sprintf("%s\t%s\t%s\t%s\t%s\t%s", n.Node, humanBytes(uint64(max(n.CacheBytes, 0))), count, img, art, other)
+		if note != "" {
+			line += "\t" + note
+		}
+		fmt.Fprintln(tw, line)
 	}
 	return tw.Flush()
 }

@@ -12,6 +12,10 @@ pin, its date, and the tarball's sha256.
 
 ### Added
 
+- `k3sm image df` shows each node's image store split into `IMAGE`, `ARTIFACT` and `OTHER` bytes, as
+  the node reports them, and `-o json` adds `classes`, `storeBytes` and `classesObservedAt` per node.
+  A node on an older version shows dashes. See
+  [Listing the Registry](docs/user/images.md#listing-the-registry-k3sm-image-ls--k3sm-image-df).
 - `sudo k3sm network lan on --for <duration>` turns LAN access on for at most 24h, after which the
   node daemon turns it off by itself. See [LAN access](docs/user/install.md#lan-access).
 - `sudo k3sm network lan status` lists the sockets on this Mac a LAN peer can reach that LAN access

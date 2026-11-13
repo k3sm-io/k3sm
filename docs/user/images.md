@@ -481,6 +481,14 @@ If the registry does not answer, both commands still exit 0: the table says it i
 the JSON document carries `"reachable": false` with the error. `df` then still reports the node
 caches.
 
+`df` also splits each node's image store by what it holds. `IMAGE` is content that container images
+use, `ARTIFACT` is OCI artifacts with no known media type, and `OTHER` is everything else: artifacts
+counted by their media type, and content nothing uses any more. A node on an older version does not
+report this, so its row shows dashes. The numbers are the node's own report, which it updates from
+time to time, so they can lag behind the store; a report more than 10 minutes old is marked at the
+end of the row. In `-o json` the same numbers are under `classes`, `storeBytes` and
+`classesObservedAt`.
+
 Both commands keep what each image digest describes (its platforms, size and blobs) in a cache
 under your account's cache directory, `~/Library/Caches/k3sm/registry/<registry address>/`, so a
 later run reads only each tag's current digest and describes just the digests it has not seen.
