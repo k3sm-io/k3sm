@@ -69,8 +69,10 @@
 #         view is gone and free space on both caches and the registry store is back
 #         at t.0's within 1% of the model
 #   f.1   cleanup, green or red: the namespace (MLXModels, ConfigMap, client and
-#         client Pods), the pushed tag, the remote scratch dirs; each step that
-#         fails is named and fails the run. Each is marked for cleanup BEFORE the
+#         client Pods), the run's Released PersistentVolumes and its storage dir on
+#         each node, the pushed tag, the remote scratch dirs; each step that fails is
+#         named and fails the run, and none is skipped because another failed (a
+#         failed PersistentVolume list still leaves each node's storage dir removed). Each is marked for cleanup BEFORE the
 #         call that makes it, so a call that times out after the server acted is
 #         still undone, and one never made reads as already gone. INT and TERM are
 #         logged, not obeyed, until f.1 and t.8 end, so a second Ctrl-C cannot skip
@@ -119,8 +121,9 @@
 #   K3SM_MST_MIN_FREE            bytes each node cache volume must have free at t.0
 #                                (default 2 x the model's bytes + 2 GiB: the registry copy and
 #                                the cache copy share the server's volume)
-#   K3SM_MST_STORAGE_ROOT        the nodes' storage root f.1 clears of the run's namespace
-#                                (default /var/lib/k3sm/storage)
+#   K3SM_MST_STORAGE_ROOT        the nodes' storage root f.1 clears of the run's namespace;
+#                                exactly /var/lib/k3sm/storage (the default): p.0 refuses
+#                                any other, which only --self-test's fake runs may name
 #   K3SM_MST_VIEW_UID            uid a view file must have (default 0)
 #   KUBECTL                      kubectl binary (default kubectl)
 #   K3SM_LAB_TOLERATE_KEYS       extra taint keys every pod tolerates with Exists
@@ -421,6 +424,25 @@ sys.exit(1 if errs else 0)
 ' "$1" "$2"
 }
 
+# own_events <object json>...: of the Events list JSON on stdin, those whose
+# involvedObject.uid is the uid of one of the objects (a file holds one object or a
+# list); a name alone could be another, earlier object's.
+own_events() {
+	py '
+import json, sys
+uids = set()
+for f in sys.argv[1:]:
+    d = json.load(open(f))
+    for o in d.get("items", [d]):
+        u = (o.get("metadata") or {}).get("uid")
+        if u:
+            uids.add(u)
+items = [e for e in json.loads(sys.stdin.read()).get("items", []) if (e.get("involvedObject") or {}).get("uid") in uids]
+json.dump({"apiVersion": "v1", "kind": "List", "items": items}, sys.stdout, indent=1)
+print()
+' "$@"
+}
+
 # view_inodes <view lines>: `<rel> <ino>` per file, for comparing two readings.
 view_inodes() { awk '$1 == "F" { print $2, $3 }' "$1"; }
 
@@ -468,7 +490,8 @@ POLL="${K3SM_MST_POLL:-2}"
 DNS_TIMEOUT="${K3SM_MST_DNS_TIMEOUT:-120}"
 # Bytes; empty means 2 x the model's bytes + 2 GiB, sized at p.0.
 MIN_FREE="${K3SM_MST_MIN_FREE:-}"
-STORAGE_ROOT="${K3SM_MST_STORAGE_ROOT:-/var/lib/k3sm/storage}"
+DEFAULT_STORAGE_ROOT="/var/lib/k3sm/storage"
+STORAGE_ROOT="${K3SM_MST_STORAGE_ROOT:-$DEFAULT_STORAGE_ROOT}"
 K3SM_BIN="${K3SM_MST_K3SM:-/Library/k3sm/k3sm}"
 LOCAL_K3SM="${K3SM_MST_LOCAL_K3SM:-k3sm}"
 WORKER_LABEL="${K3SM_MST_WORKER_LABEL:-io.k3sm.agent}"
@@ -621,7 +644,15 @@ p0() {
 	[ "$SWORK" != "$WWORK" ] || [ "$SERVER" != "$WORKER" ] || refuse "the two scratch dirs are one directory"
 	case "$STEP_TIMEOUT$READY_TIMEOUT$RECLAIM_TIMEOUT$DNS_TIMEOUT" in *[!0-9]*) refuse "a timeout is not a whole number of seconds" ;; esac
 	case "$MIN_FREE" in *[!0-9]*) refuse "K3SM_MST_MIN_FREE is not a whole number of bytes" ;; esac
-	case "$STORAGE_ROOT" in /?*) ;; *) refuse "K3SM_MST_STORAGE_ROOT $STORAGE_ROOT is not an absolute path" ;; esac
+	# f.1 removes <root>/<namespace> on both Macs as root, so a lab run clears only the
+	# root k3sm writes. --self-test marks its fake runs (K3SM_MST_SELF_TEST_RUN=1), whose
+	# storage roots are absolute paths in its temp tree.
+	if [ "${K3SM_MST_SELF_TEST_RUN:-}" = 1 ]; then
+		case "$STORAGE_ROOT" in /?*) ;; *) refuse "K3SM_MST_STORAGE_ROOT $STORAGE_ROOT is not an absolute path" ;; esac
+	else
+		[ "$STORAGE_ROOT" = "$DEFAULT_STORAGE_ROOT" ] ||
+			refuse "K3SM_MST_STORAGE_ROOT $STORAGE_ROOT is not $DEFAULT_STORAGE_ROOT (the only storage root a lab run clears)"
+	fi
 	[ "$STEP_TIMEOUT" -le 240 ] || refuse "K3SM_MST_STEP_TIMEOUT is over 240"
 	for t in python3 shasum awk "$KUBECTL" "$LOCAL_K3SM"; do command -v "$t" >/dev/null 2>&1 || refuse "$t is not on PATH"; done
 	# The evidence dir: under scratch, then absent, or present and empty.
@@ -830,7 +861,8 @@ t3() {
 		kc get pods -n "$NS" -l "app.kubernetes.io/instance=$m" -o json >"$EV/t.3.$m.pods.json" || { bad "read $m pods"; return 1; }
 		why="$(pod_checks "$EV/t.3.$m.pods.json" "$DIGEST" "$node" 1)" || {
 			kc logs -n "$NS" -l "app.kubernetes.io/instance=$m" --tail=200 >"$EV/t.3.$m.logs" 2>&1 || true
-			kc get events -n "$NS" -o wide >"$EV/t.3.events" 2>&1 || true
+			kc get events -n "$NS" -o json 2>"$EV/t.3.$m.events.err" |
+				own_events "$EV/t.3.$m.mlxmodel.json" "$EV/t.3.$m.pods.json" >"$EV/t.3.$m.events.json" 2>>"$EV/t.3.$m.events.err" || true
 			bad "$m: $why"
 			return 1
 		}
@@ -1260,15 +1292,21 @@ if [ -e "$d" ] && [ "$3" = delete ]; then rm -rf -- "$d" && echo "removed $d"; f
 storage_clean() {
 	local rc=0 pvs pv h
 	[ -n "$NS" ] || return 0
-	pvs="$(released_pvs)" || { bad "$1: list PersistentVolumes"; return 1; }
-	if [ "$2" = delete ]; then
-		for pv in $pvs; do
-			kc delete pv "$pv" --wait=false >/dev/null 2>&1 || true
-			echo "$1: deleted Released PersistentVolume $pv of namespace $NS"
-		done
-		pvs="$(released_pvs)" || { bad "$1: list PersistentVolumes"; return 1; }
+	# The volumes and the storage dirs are independent: a failed list is red, and each
+	# node's storage dir is still removed.
+	if ! pvs="$(released_pvs)"; then
+		bad "$1: list PersistentVolumes"
+		rc=1
+	else
+		if [ "$2" = delete ]; then
+			for pv in $pvs; do
+				kc delete pv "$pv" --wait=false >/dev/null 2>&1 || true
+				echo "$1: deleted Released PersistentVolume $pv of namespace $NS"
+			done
+			pvs="$(released_pvs)" || { bad "$1: list PersistentVolumes"; rc=1; pvs=""; }
+		fi
+		[ -z "$pvs" ] || { bad "$1: Released PersistentVolume(s) of namespace $NS survive: $(oneline "$pvs")"; rc=1; }
 	fi
-	[ -z "$pvs" ] || { bad "$1: Released PersistentVolume(s) of namespace $NS survive: $(oneline "$pvs")"; rc=1; }
 	for h in "$SERVER" "$WORKER"; do
 		rroot "$h" "$STEP_TIMEOUT" "$STORAGE_SCRIPT" "$STORAGE_ROOT" "$NS" "$2" ||
 			{ bad "$1: $STORAGE_ROOT/$NS survives on $h"; rc=1; }
@@ -1625,7 +1663,7 @@ def kubectl(argv):
             rc = 1
         else:
             s["ns"].append(pos[2])
-            if "pv-leftover" in BRK or "pv-stuck" in BRK:
+            if "pv-leftover" in BRK or "pv-stuck" in BRK or "pv-list-fails" in BRK:
                 # A volume each of this run's namespace and another's, both Released,
                 # and each namespace's storage dir: only the run's may be removed.
                 for n in (pos[2], "other-ns"):
@@ -1687,7 +1725,21 @@ def kubectl(argv):
         o["spec"].update(json.loads(flags["-p"])["spec"])
         reconcile(s)
     elif verb == "get" and pos[1] == "pv":
-        out({"items": list(s.get("pvs", {}).values())})
+        if "pv-list-fails" in BRK:
+            print("error: the server is currently unable to handle the request", file=sys.stderr)
+            rc = 1
+        else:
+            out({"items": list(s.get("pvs", {}).values())})
+    elif verb == "get" and pos[1] == "events":
+        # One Event per Pod, and a decoy per Pod: the same name, another uid (an
+        # earlier Pod of that name). Only the first is the Pod's.
+        items = []
+        for p in s["pods"].values():
+            if p["metadata"]["namespace"] != ns:
+                continue
+            for u, why in ((p["metadata"]["uid"], "Pulled"), ("decoy-" + p["metadata"]["uid"], "DecoyEarlierPod")):
+                items.append({"reason": why, "involvedObject": {"kind": "Pod", "namespace": ns, "name": p["metadata"]["name"], "uid": u}})
+        out({"items": items})
     elif verb == "delete" and pos[1] == "pv":
         if "pv-stuck" not in BRK:
             s.get("pvs", {}).pop(pos[2], None)
@@ -1969,11 +2021,13 @@ self_test() {
 
 	# One full fake run. FAKE_BREAK names a mutant; want is the exit and the red rung.
 	# FR_STEP, set on one call, shortens K3SM_MST_STEP_TIMEOUT for a run whose fake hangs.
+	# FR_SELF_TEST_RUN, set empty on one call, runs it as a lab run outside --self-test.
 	fake_run() { # <name> <break> <want-exit> <want-in-output> [evidence-dir]
 		local name="$1" brk="$2" want="$3" grepfor="$4" ev="${5:-$t/runs/$1/ev}" r="$t/runs/$1" got=0 o
 		mkdir -p "$r/state" "$r/srv/cache/blobs" "$r/wrk/cache/blobs" "$r/srv/registry"
 		o="$(
 			cd "$t" && env -u K3SM_LAB_TOLERATE_KEYS PATH="$bin:$PATH" K3SM_LAB=1 KUBECONFIG=/dev/null \
+				K3SM_MST_SELF_TEST_RUN="${FR_SELF_TEST_RUN-1}" \
 				FAKE_STATE="$r/state" FAKE_BREAK="$brk" FAKE_SERVER_HOST=srv FAKE_REG_ROOT="$r/srv/registry" \
 				FAKE_NODES="srv=node-s=$r/srv/cache wrk=node-w=$r/wrk/cache" \
 				K3SM_MST_SERVER_SSH=srv K3SM_MST_WORKER_SSH=wrk K3SM_MST_SERVER_NODE=node-s K3SM_MST_WORKER_NODE=node-w \
@@ -2032,6 +2086,9 @@ self_test() {
 		fake_run "$brk" "$brk" 1 "result: FAIL ($rung)"
 		cleaned "$brk"
 	done
+	# t.3's Events of a model's Pods are chosen by uid: the same-named decoy is dropped.
+	has "trust-remote-code: the Pod's own Event kept" "$(cat "$t/runs/trust-remote-code/ev/"t.3.*.events.json 2>/dev/null)" '"reason": "Pulled"'
+	if grep -q DecoyEarlierPod "$t/runs/trust-remote-code/ev/"t.3.*.events.json 2>/dev/null; then echo "self-test FAIL: trust-remote-code: an Event of another uid was kept"; bad=1; fi
 	# The case this tracer exists for: served (t.4 green) with the Hub online is red.
 	fake_run hub-online-again hub-online 1 "result: FAIL (t.5)"
 	has "hub online: t.4 passed first" "$(cat "$RUN_DIR/out")" "t.4: PASS"
@@ -2104,6 +2161,19 @@ self_test() {
 	# A Released PV of the run that will not delete fails the cleanup.
 	fake_run pv-stuck pv-stuck 1 "f.1: FAIL"
 	has "pv-stuck: named" "$(cat "$RUN_DIR/out")" "Released PersistentVolume(s) of namespace mst-"
+
+	# A failed PersistentVolume list fails the cleanup, and each node's storage dir of the
+	# run is still removed (another namespace's kept).
+	fake_run pv-list-fails pv-list-fails 1 "f.1: FAIL"
+	has "pv-list-fails: named" "$(cat "$RUN_DIR/ev/f.1.log")" "f.1: list PersistentVolumes"
+	[ -z "$(find "$RUN_DIR/storage" -mindepth 1 -maxdepth 1 -name 'mst-*')" ] || { echo "self-test FAIL: pv-list-fails: the run's storage dir is left"; bad=1; }
+	[ -d "$RUN_DIR/storage/other-ns/data" ] || { echo "self-test FAIL: pv-list-fails: another namespace's storage dir was removed"; bad=1; }
+
+	# Outside --self-test a storage root other than /var/lib/k3sm/storage is refused at
+	# p.0, before anything touches the rig.
+	FR_SELF_TEST_RUN="" fake_run storage-root-other "" 3 "is not /var/lib/k3sm/storage"
+	[ ! -e "$RUN_DIR/state/calls" ] || { echo "self-test FAIL: storage-root-other: the refused run called the rig: $(cat "$RUN_DIR/state/calls")"; bad=1; }
+	[ ! -e "$RUN_DIR/ev" ] || { echo "self-test FAIL: storage-root-other: the refused evidence dir was created"; bad=1; }
 
 	# The evidence dir must lie under a k3sm-io.scratch directory (the pure check).
 	mkdir -p "$t/ev-in" "$base/outside"
