@@ -164,10 +164,14 @@ type fakeSystem struct {
 	// never caps serverFileLimit. maxFilesPerProcErr, when set, is returned instead.
 	maxFilesPerProc    uint64
 	maxFilesPerProcErr error
-	// readErrs[path] is an error ReadFile returns for path instead of reading
-	// it: an installed file that exists but cannot be read. The zero value
-	// reads everything.
+	// readErrs[path] is an error ReadFile and ReadOwnedRegularFile return for
+	// path instead of reading it: a file that exists but cannot be read. The
+	// zero value reads everything.
 	readErrs map[string]error
+	// readErrReads[path], when set, makes readErrs[path] transient for
+	// ReadOwnedRegularFile: it answers that many reads and is then cleared, so
+	// the path reads normally again. See putTransientReadErr.
+	readErrReads map[string]int
 	// missingPaths are paths PathExists reports absent. The zero value reports
 	// EVERY path present, so an unconfigured fake describes a healthy install and
 	// only a test that cares about the netd socket has to say so.
@@ -712,6 +716,24 @@ func (f *fakeSystem) putSymlink(path string) { f.putKind(path, fakeSymlink) }
 // putIrregular makes ReadRegularFile refuse path as a non-regular file.
 func (f *fakeSystem) putIrregular(path string) { f.putKind(path, fakeIrregular) }
 
+// putTransientReadErr makes the next n ReadOwnedRegularFile reads of path fail
+// with err (a file that exists but momentarily cannot be read: EIO, EACCES);
+// the read after them answers the file normally. n < 1 makes it permanent,
+// the same as setting readErrs directly.
+func (f *fakeSystem) putTransientReadErr(path string, err error, n int) {
+	if f.readErrs == nil {
+		f.readErrs = map[string]error{}
+	}
+	f.readErrs[path] = err
+	if n < 1 {
+		return
+	}
+	if f.readErrReads == nil {
+		f.readErrReads = map[string]int{}
+	}
+	f.readErrReads[path] = n
+}
+
 func (f *fakeSystem) putKind(path string, k fakeFileKind) {
 	if f.kinds == nil {
 		f.kinds = map[string]fakeFileKind{}
@@ -722,8 +744,17 @@ func (f *fakeSystem) putKind(path string, k fakeFileKind) {
 // ReadRegularFile answers ReadFile's bytes for an ordinary path, and the
 // ErrNotRegularFile refusal for one a test has said is a symlink or a
 // non-regular file — the two verdicts the real O_NOFOLLOW open reaches.
+//
+// A file seeded to change across reads (putFileAfterReads,
+// putFileChangingAfterReads) answers here as it does through ReadFile, so a
+// reader that moved to the refusing seam keeps its polling fixtures.
 func (f *fakeSystem) ReadRegularFile(path string) ([]byte, error) {
 	f.calls = append(f.calls, "ReadRegularFile:"+path)
+	if _, refused := f.kinds[path]; !refused {
+		if b, err, ok := f.readDelayed(path); ok {
+			return b, err
+		}
+	}
 	return f.readRegularFileContent(path)
 }
 
@@ -765,7 +796,27 @@ func (f *fakeSystem) ReadRegularFileWithMode(path string) ([]byte, fs.FileMode, 
 // putFileMode's mode, which is what the install's own staging leaves.
 func (f *fakeSystem) ReadOwnedRegularFile(path string, limit int64) ([]byte, OwnedEntry, error) {
 	f.calls = append(f.calls, "ReadOwnedRegularFile:"+path)
+	if err, ok := f.readErrs[path]; ok {
+		if n, counted := f.readErrReads[path]; counted {
+			// A transient failure: it answers this many reads, then the
+			// path reads normally again.
+			if n <= 1 {
+				delete(f.readErrs, path)
+				delete(f.readErrReads, path)
+			} else {
+				f.readErrReads[path] = n - 1
+			}
+		}
+		return nil, OwnedEntry{}, err
+	}
 	b, err := f.readRegularFileContent(path)
+	// A file seeded to change across reads answers here as it does through
+	// ReadRegularFile, so the crash-record polling fixtures keep working.
+	if _, refused := f.kinds[path]; !refused {
+		if db, derr, ok := f.readDelayed(path); ok {
+			b, err = db, derr
+		}
+	}
 	if err != nil {
 		return nil, OwnedEntry{}, err
 	}
@@ -778,7 +829,7 @@ func (f *fakeSystem) ReadOwnedRegularFile(path string, limit int64) ([]byte, Own
 		e = OwnedEntry{Path: path, UID: 271, GID: 271, Mode: perm, Kind: EntryRegular}
 	}
 	if int64(len(b)) > limit {
-		return nil, e, fmt.Errorf("read %s: larger than %d bytes", path, limit)
+		return nil, e, fmt.Errorf("read %s: larger than %d bytes: %w", path, limit, ErrFileTooLarge)
 	}
 	return b, e, nil
 }
@@ -799,6 +850,24 @@ func (f *fakeSystem) readRegularFileContent(path string) ([]byte, error) {
 	return nil, fmt.Errorf("open %s: %w", path, fs.ErrNotExist)
 }
 
+// readDelayed answers a read of a file seeded by putFileAfterReads or
+// putFileChangingAfterReads, consuming one of its held-back reads; ok is false
+// for any other path.
+func (f *fakeSystem) readDelayed(path string) (b []byte, err error, ok bool) {
+	d, ok := f.delayed[path]
+	if !ok {
+		return nil, nil, false
+	}
+	if d.absentReads > 0 {
+		d.absentReads--
+		if d.before != nil {
+			return d.before, nil, true
+		}
+		return nil, fmt.Errorf("open %s: %w", path, fs.ErrNotExist), true
+	}
+	return d.content, nil, true
+}
+
 func (f *fakeSystem) ReadFile(path string) ([]byte, error) {
 	f.calls = append(f.calls, "ReadFile:"+path)
 	if err, ok := f.readErrs[path]; ok {
@@ -813,15 +882,8 @@ func (f *fakeSystem) ReadFile(path string) ([]byte, error) {
 			delete(f.swapAfterRead, path)
 		}()
 	}
-	if d, ok := f.delayed[path]; ok {
-		if d.absentReads > 0 {
-			d.absentReads--
-			if d.before != nil {
-				return d.before, nil
-			}
-			return nil, fmt.Errorf("open %s: %w", path, fs.ErrNotExist)
-		}
-		return d.content, nil
+	if b, err, ok := f.readDelayed(path); ok {
+		return b, err
 	}
 	if content, ok := f.files[path]; ok {
 		return content, nil
@@ -2124,7 +2186,7 @@ func TestInstallOrchestration(t *testing.T) {
 		"PathExists:/var/lib/k3sm/run/netd.sock",
 		// ...and the server's crash-loop record read, because a daemon parked by
 		// its breaker reports a healthy pid while serving nothing.
-		"ReadFile:/var/lib/k3sm/server/crashloop.json",
+		"ReadOwnedRegularFile:/var/lib/k3sm/server/crashloop.json",
 		// No reap: this is a first install, so the publish was a plain rename
 		// and there is no previous tree at the staging path. A reinstall has
 		// one, and removes it HERE and not a step earlier

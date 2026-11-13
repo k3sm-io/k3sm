@@ -27,9 +27,11 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -946,8 +948,93 @@ func (e *EtcdSupersededError) Is(target error) bool { return target == ErrEtcdMe
 // Remedy is the fix, verification first: the destructive step is only right if the
 // peer really is the server the operator restored.
 func (e *EtcdSupersededError) Remedy() string {
-	return fmt.Sprintf("confirm %s (%s, cluster %x) is the server you restored; then wipe <work-dir>/etcd and re-join: stop this server, move <work-dir>/etcd aside, clear the crash-loop record (k3sm server --clear-crashloop) and start it, and it joins the restored cluster as a new member (this member's cluster %x is the one the restore replaced)",
-		e.Peer, e.PeerURL, e.PeerCluster, e.OwnCluster)
+	return fmt.Sprintf(supersededRemedyFormat, e.Peer, e.PeerURL, e.PeerCluster, e.OwnCluster)
+}
+
+// supersededRemedyFormat is Remedy's text. Its verbs are, in order, the peer's
+// member name, its peer URL and the two cluster IDs; supersededRemedyPattern
+// is built from it, so the two cannot drift.
+const supersededRemedyFormat = "confirm %s (%s, cluster %x) is the server you restored; then wipe <work-dir>/etcd and re-join: stop this server, move <work-dir>/etcd aside, clear the crash-loop record (k3sm server --clear-crashloop) and start it, and it joins the restored cluster as a new member (this member's cluster %x is the one the restore replaced)"
+
+// The character classes of Remedy's variable parts, each limited to what the
+// real value can hold:
+//   - the peer is an etcd member name, which k3sm sets to the node name: a
+//     DNS-1123 subdomain (lowercase alphanumerics, '.', '-'; at most 253), or
+//     empty for a learner that has not started yet;
+//   - the peer URL is etcdPeerURL's shape, https:// then an IPv4 address or a
+//     bracketed IPv6 address (hex digits, ':' and '.' for an embedded IPv4;
+//     at most 45), then ':' and a port of at most five digits;
+//   - a cluster ID is a uint64 under %x: one to sixteen lowercase hex digits.
+const (
+	supersededPeerPattern    = `[a-z0-9.-]{0,253}`
+	supersededURLPattern     = `https://((?:[0-9.]{7,15}|\[[0-9a-f:.]{2,45}\]):[0-9]{1,5})`
+	supersededClusterPattern = `[0-9a-f]{1,16}`
+)
+
+// supersededRemedyParts are the patterns of supersededRemedyFormat's verbs, in
+// order.
+var supersededRemedyParts = []string{supersededPeerPattern, supersededURLPattern, supersededClusterPattern, supersededClusterPattern}
+
+// remedyVerb matches a verb of supersededRemedyFormat.
+var remedyVerb = regexp.MustCompile(`%[sx]`)
+
+// buildRemedyPattern returns format's fixed text, quoted, with each verb
+// replaced by its part's pattern and the whole anchored at both ends (\A, \z).
+// ok is false when format's verb count and len(parts) disagree.
+func buildRemedyPattern(format string, parts []string) (pattern string, ok bool) {
+	fixed := remedyVerb.Split(format, -1)
+	if len(fixed) != len(parts)+1 {
+		return "", false
+	}
+	var b strings.Builder
+	b.WriteString(`\A`)
+	for i, p := range parts {
+		b.WriteString(regexp.QuoteMeta(fixed[i]))
+		b.WriteString(p)
+	}
+	b.WriteString(regexp.QuoteMeta(fixed[len(parts)]))
+	b.WriteString(`\z`)
+	return b.String(), true
+}
+
+// matchNothing is a pattern no string matches.
+const matchNothing = `[^\x00-\x{10FFFF}]`
+
+// supersededRemedyPattern accepts exactly the strings Remedy can produce: the
+// format's fixed text, quoted, with each verb replaced by its part's class and
+// the whole anchored at both ends, so no text before, after or inside the fixed
+// parts and no control byte passes. Should the format and its parts ever
+// disagree it matches nothing (fail closed), and
+// TestSupersededRemedyFormatMatchesItsParts fails.
+var supersededRemedyPattern = func() *regexp.Regexp {
+	p, ok := buildRemedyPattern(supersededRemedyFormat, supersededRemedyParts)
+	if !ok {
+		p = matchNothing
+	}
+	return regexp.MustCompile(p)
+}()
+
+// maxRemedyLen bounds the input IsKnownRemedy and IsSupersededRemedy examine:
+// every remedy this package owns is far shorter, so a longer string is refused
+// before any matching.
+const maxRemedyLen = 1024
+
+// IsSupersededRemedy reports whether s is a remedy EtcdSupersededError.Remedy
+// can produce: its fixed text with a node-name peer, an https peer URL on an IP
+// and hex cluster IDs. A crash record's Remedy is untrusted data; this is how a
+// reader tells this runtime-built remedy from injected text. Past the pattern,
+// the URL's host:port must parse as an address and port, so an out-of-range
+// IPv4 or a malformed IPv6 the character classes admit is refused.
+func IsSupersededRemedy(s string) bool {
+	if len(s) > maxRemedyLen {
+		return false
+	}
+	m := supersededRemedyPattern.FindStringSubmatch(s)
+	if m == nil {
+		return false
+	}
+	_, err := netip.ParseAddrPort(m[1])
+	return err == nil
 }
 
 // EtcdPeerView is what a peer's listener reports about its cluster.

@@ -87,20 +87,6 @@ const etcdMemberRouteRetry = 5 * time.Second
 // recorded under on the crash-loop breaker.
 const etcdMemberRouteComponent = "etcd-member-route"
 
-// etcdMemberRouteRemedy is the fix a permanent member-route refusal names.
-// The status row appends the clear-crashloop step itself.
-const etcdMemberRouteRemedy = "the existing server refused to add this server's etcd member: re-install this server with --server naming a server of THIS cluster, --token set to that cluster's server token, and a valid node name and --node-ip"
-
-// etcdMemberRouteMeshRemedy is the fix when the refusal was this server's mesh
-// range (bootstrap.RefusalMeshRangeClaimed / RefusalMeshClaimRefused). Nothing was
-// added to the cluster: the existing server refuses before its member add.
-const etcdMemberRouteMeshRemedy = "the existing server refused this server's mesh range, so no etcd member was added: choose a free --mesh-ip (the first address of an unused /24 in 100.64.0.0/10) and re-install this server, or remove the stale MeshPeer and its claim on the existing server (`kubectl delete meshpeer <holder>`, `kubectl -n kube-system delete lease <claim>`), then clear the crash-loop record and restart this server"
-
-// etcdMemberRouteUnacknowledgedRemedy is the fix when the existing server added the
-// member without acknowledging this server's mesh claim: it predates claims, so it
-// reserved nothing.
-const etcdMemberRouteUnacknowledgedRemedy = "the existing server did not acknowledge this server's mesh claim, so it runs a k3sm that predates server mesh ranges: upgrade every existing server first, then clear the crash-loop record and restart this server. The unstarted learner it added holds no vote; the next member request for this name removes it"
-
 // errMeshClaimUnacknowledged marks a member route that answered without
 // acknowledging the mesh claim this server sent.
 var errMeshClaimUnacknowledged = errors.New("the existing server did not acknowledge this server's mesh claim")
@@ -109,15 +95,15 @@ var errMeshClaimUnacknowledged = errors.New("the existing server did not acknowl
 // chosen by the refusal reason the route set (never by its message text).
 func etcdMemberRouteRemedyFor(err error) string {
 	if errors.Is(err, errMeshClaimUnacknowledged) {
-		return etcdMemberRouteUnacknowledgedRemedy
+		return executor.EtcdMemberRouteUnacknowledgedRemedy
 	}
 	if re, ok := errors.AsType[*bootstrap.ServerRouteError](err); ok {
 		switch re.Reason {
 		case bootstrap.RefusalMeshRangeClaimed, bootstrap.RefusalMeshClaimRefused, bootstrap.RefusalMeshClaimInvalid:
-			return etcdMemberRouteMeshRemedy
+			return executor.EtcdMemberRouteMeshRemedy
 		}
 	}
-	return etcdMemberRouteRemedy
+	return executor.EtcdMemberRouteRemedy
 }
 
 // serverEtcdJoin is the joining server's member step.

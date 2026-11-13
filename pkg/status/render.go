@@ -22,6 +22,7 @@ import (
 	"strings"
 	"text/tabwriter"
 
+	"k3sm.io/k3sm/internal/termsafe"
 	"k3sm.io/k3sm/pkg/dataroot"
 )
 
@@ -154,7 +155,7 @@ func renderScreen(r Report, rows []Row, s Style) string {
 	for _, row := range rows {
 		b.WriteString(renderRow(row, s))
 		if log := row.Wide["log"]; log != "" {
-			b.WriteString(logIndent + "log: " + log + repeatSuffix(row.Wide["log-repeats"]) + "\n")
+			b.WriteString(logIndent + "log: " + stripControls(log) + repeatSuffix(row.Wide["log-repeats"]) + "\n")
 		}
 		if s.Wide {
 			b.WriteString(wideLine(row))
@@ -195,7 +196,9 @@ func renderDetail(r Report, s Style, names []string, view string) string {
 		b.WriteString(renderRow(row, s))
 		tw := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
 		for _, k := range sortedKeys(row.Wide) {
-			fmt.Fprintf(tw, "%s%s\t%s\n", logIndent, k, row.Wide[k])
+			// The wide values can carry record text (a component name), so a
+			// control byte, a tab or a newline is stripped like every other path.
+			fmt.Fprintf(tw, "%s%s\t%s\n", logIndent, stripControls(k), stripControls(row.Wide[k]))
 		}
 		if err := tw.Flush(); err != nil {
 			// tabwriter writes into a strings.Builder, whose Write never fails.
@@ -203,7 +206,7 @@ func renderDetail(r Report, s Style, names []string, view string) string {
 		}
 		if row.Remedy != "" {
 			for _, step := range strings.Split(row.Remedy, "\n") {
-				b.WriteString(logIndent + "fix: " + strings.TrimSpace(step) + "\n")
+				b.WriteString(logIndent + "fix: " + strings.TrimSpace(stripControls(step)) + "\n")
 			}
 		}
 		b.WriteString("\n")
@@ -223,8 +226,11 @@ func renderDetail(r Report, s Style, names []string, view string) string {
 // provenance simply follows after two spaces — a truncated version string is
 // worse than a long line.
 func headline(r Report, s Style) string {
-	left := "k3sm " + colorize(r.Verdict.String(), verdictColor(r.Verdict), s) + ": " + r.Summary
-	plainLen := len("k3sm " + r.Verdict.String() + ": " + r.Summary)
+	// The summary is row text on the degraded path (Aggregate copies a row's
+	// Detail into it), so it is stripped here, at render time; the JSON keeps it.
+	summary := stripControls(r.Summary)
+	left := "k3sm " + colorize(r.Verdict.String(), verdictColor(r.Verdict), s) + ": " + summary
+	plainLen := len("k3sm " + r.Verdict.String() + ": " + summary)
 	right := provenance(r)
 	if right == "" {
 		return left
@@ -250,7 +256,7 @@ func provenance(r Report) string {
 	if r.Host != "" {
 		parts = append(parts, "macOS "+r.Host)
 	}
-	return strings.Join(parts, " · ")
+	return stripControls(strings.Join(parts, " · "))
 }
 
 // renderRow is one subsystem line. The STATE word is always present in plain
@@ -262,8 +268,8 @@ func renderRow(row Row, s Style) string {
 		glyph = row.Severity.Glyph() + " "
 	}
 	return "  " + glyph +
-		pad(row.Name, nameWidth) + " " +
-		colorize(pad(string(row.State), stateWidth), severityColor(row.Severity), s) + " " +
+		pad(stripControls(row.Name), nameWidth) + " " +
+		colorize(pad(stripControls(string(row.State)), stateWidth), severityColor(row.Severity), s) + " " +
 		strings.TrimRight(stripControls(row.Detail), " ") + "\n"
 }
 
@@ -293,9 +299,11 @@ func renderNext(next []string) string {
 		return ""
 	}
 	var b strings.Builder
-	b.WriteString("\nNext: " + next[0] + "\n")
+	// A step is a row's Remedy, which can carry record text, so it is stripped
+	// like every other value that reaches the screen.
+	b.WriteString("\nNext: " + stripControls(next[0]) + "\n")
 	for _, step := range next[1:] {
-		b.WriteString(logIndent + step + "\n")
+		b.WriteString(logIndent + stripControls(step) + "\n")
 	}
 	return b.String()
 }
@@ -365,16 +373,6 @@ func sortedKeys(m map[string]string) []string {
 	return keys
 }
 
-// stripControls removes C0 and C1 control characters and DEL from text that
-// came from the cluster (apiserver errors, node names), so a hostile apiserver
-// or proxy cannot put terminal escape sequences on the operator's TTY. Printable
-// Unicode is kept. Only the human renderer calls it; the JSON output carries
-// the value as data and its encoder already escapes controls.
-func stripControls(s string) string {
-	return strings.Map(func(r rune) rune {
-		if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
-			return -1
-		}
-		return r
-	}, s)
-}
+// stripControls is termsafe.Strip, the one rule this screen and the install
+// readers share for rendering outside text as data.
+func stripControls(s string) string { return termsafe.Strip(s) }

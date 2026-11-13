@@ -1981,14 +1981,14 @@ func readOwnedRegularFile(path string, limit int64) ([]byte, OwnedEntry, error) 
 	}
 	e.Kind = EntryRegular
 	if st.Size > limit {
-		return nil, e, fmt.Errorf("read %s: %d bytes, larger than %d", path, st.Size, limit)
+		return nil, e, fmt.Errorf("read %s: %d bytes, larger than %d: %w", path, st.Size, limit, ErrFileTooLarge)
 	}
 	b, err := io.ReadAll(io.LimitReader(f, limit+1))
 	if err != nil {
 		return nil, e, fmt.Errorf("read %s: %w", path, err)
 	}
 	if int64(len(b)) > limit {
-		return nil, e, fmt.Errorf("read %s: larger than %d bytes", path, limit)
+		return nil, e, fmt.Errorf("read %s: larger than %d bytes: %w", path, limit, ErrFileTooLarge)
 	}
 	return b, e, nil
 }

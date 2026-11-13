@@ -32,6 +32,14 @@ import (
 	"k3sm.io/k3sm/pkg/executor"
 )
 
+// TestEtcdMemberRouteComponentIsComponentName: the member-route component the
+// breaker records passes executor.IsComponentName, so status shows it by name.
+func TestEtcdMemberRouteComponentIsComponentName(t *testing.T) {
+	if !executor.IsComponentName(etcdMemberRouteComponent) {
+		t.Errorf("executor.IsComponentName(%q) = false", etcdMemberRouteComponent)
+	}
+}
+
 // TestServerJoinMemberRouteBeforeExecutor pins the joining server's order: the CA
 // bundle, then (first boot only) the etcd member route, then the executor, which
 // starts with the route's --initial-cluster and a Promote bound to the same server;
@@ -324,7 +332,7 @@ func TestEtcdMemberRouteRetryAndPermanence(t *testing.T) {
 			}
 			last, _ := rec.Last()
 			if !rec.Tripped() || len(rec.Crashes) != 1 || !last.Permanent || last.Component != etcdMemberRouteComponent ||
-				last.Remedy != etcdMemberRouteRemedy || last.Origin != executor.CrashOriginBringUp {
+				last.Remedy != executor.EtcdMemberRouteRemedy || last.Origin != executor.CrashOriginBringUp {
 				t.Errorf("record = %+v (tripped %v), want one permanent %s bring-up failure that trips the breaker",
 					rec.Crashes, rec.Tripped(), etcdMemberRouteComponent)
 			}

@@ -153,13 +153,13 @@ func TestMemberRoute409IsPermanent(t *testing.T) {
 	if !errors.Is(err, errEtcdMemberRoutePermanent) {
 		t.Fatalf("err = %v, want a permanent member-route failure", err)
 	}
-	if got := etcdMemberRouteRemedyFor(err); got != etcdMemberRouteMeshRemedy {
+	if got := etcdMemberRouteRemedyFor(err); got != executor.EtcdMemberRouteMeshRemedy {
 		t.Errorf("remedy = %q, want the mesh remedy", got)
 	}
 	// The same status without the mesh reason keeps the general remedy.
 	other := *refusal
 	other.Reason = ""
-	if got := etcdMemberRouteRemedyFor(fmt.Errorf("w: %w", &other)); got != etcdMemberRouteRemedy {
+	if got := etcdMemberRouteRemedyFor(fmt.Errorf("w: %w", &other)); got != executor.EtcdMemberRouteRemedy {
 		t.Errorf("a 409 with no mesh reason got remedy %q", got)
 	}
 }
@@ -200,7 +200,7 @@ func TestJoinerRefusesAnUnacknowledgedMeshClaim(t *testing.T) {
 	if sent.MeshClaim == nil || sent.NodePassword != "pw" {
 		t.Errorf("the request did not carry the claim and the node-password: %+v", sent)
 	}
-	if got := etcdMemberRouteRemedyFor(err); got != etcdMemberRouteUnacknowledgedRemedy {
+	if got := etcdMemberRouteRemedyFor(err); got != executor.EtcdMemberRouteUnacknowledgedRemedy {
 		t.Errorf("remedy = %q, want the upgrade remedy", got)
 	}
 	if _, err := run(bootstrap.MeshClaimReserved, true); err != nil {

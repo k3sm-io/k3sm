@@ -22,6 +22,7 @@ import (
 	"os"
 	"time"
 
+	"k3sm.io/k3sm/internal/termsafe"
 	"k3sm.io/k3sm/pkg/executor"
 )
 
@@ -40,8 +41,11 @@ import (
 // it is already redacted, but a status report is the one output an operator
 // pastes into an issue, and a component name plus a count is what the decision
 // needs. A parked record whose last entry is a PERMANENT bring-up failure does
-// name its fix: that is the entry's Remedy, a fixed string pkg/executor owns
-// (never log text), so the row stays paste-safe and says what to do.
+// name its fix, but the record is a file the service uid can write, so its
+// Remedy field is untrusted data: the row shows it only when it is exactly one
+// of pkg/executor's fixed remedy strings (executor.IsKnownRemedy) and otherwise
+// keeps the generic clear-the-record remedy. The renderer also strips control
+// bytes from every remedy step.
 
 // CrashLoopPosture is what the record says about the server job. Exactly one
 // of the Severity-bearing states is returned; a record that is absent or empty
@@ -116,7 +120,7 @@ func ClassifyCrashLoop(rec executor.CrashRecord, readErr error, path string, now
 			return CrashLoopVerdict{
 				Posture: PostureParked,
 				Detail: fmt.Sprintf("crash-loop breaker tripped at %s on repeated leader-lease loss: %s lost its leader lease %d times within %s while its etcd, kine and apiserver children were running (lost etcd quorum, an overloaded apiserver or datastore, or a clock jump all do this); the daemon is parked and serves nothing, which also removes it as an etcd voter",
-					rec.TrippedAt.Format(time.RFC3339), last.Component, n, executor.CrashLoopWindow),
+					rec.TrippedAt.Format(time.RFC3339), shownComponent(last), n, executor.CrashLoopWindow),
 				Remedy:     "find why the lease is not renewed: etcd quorum and apiserver health on every server (sudo k3sm status on each), then sudo k3sm server --clear-crashloop   # the parked daemon restarts itself",
 				LeaderLost: lostNote,
 			}
@@ -126,16 +130,20 @@ func ClassifyCrashLoop(rec executor.CrashRecord, readErr error, path string, now
 	if rec.Tripped() {
 		n := rec.Recent(*rec.TrippedAt)
 		detail := fmt.Sprintf("crash-loop breaker tripped at %s: %s crashed %d times within %s; the daemon is parked and serves nothing",
-			rec.TrippedAt.Format(time.RFC3339), last.Component, n, executor.CrashLoopWindow)
+			rec.TrippedAt.Format(time.RFC3339), shownComponent(last), n, executor.CrashLoopWindow)
 		if neverCameUp(last) {
 			detail = fmt.Sprintf("crash-loop breaker tripped at %s: the control plane never came up (last: %s), %d failures within %s; the daemon is parked and serves nothing",
-				rec.TrippedAt.Format(time.RFC3339), last.Component, n, executor.CrashLoopWindow)
+				rec.TrippedAt.Format(time.RFC3339), shownComponent(last), n, executor.CrashLoopWindow)
 		}
 		remedy := "sudo k3sm server --clear-crashloop   # after fixing the fault named in " + path + "; the parked daemon restarts itself"
 		if neverCameUp(last) && last.Permanent && last.Remedy != "" {
 			detail = fmt.Sprintf("crash-loop breaker tripped at %s: the control plane never came up (last: %s) with a fault that cannot heal on retry; the daemon is parked and serves nothing",
-				rec.TrippedAt.Format(time.RFC3339), last.Component)
-			remedy = last.Remedy + "; then sudo k3sm server --clear-crashloop   # the parked daemon restarts itself"
+				rec.TrippedAt.Format(time.RFC3339), shownComponent(last))
+			// Only a remedy this binary owns is shown; any other text in the
+			// field keeps the generic remedy above, which names the record.
+			if executor.IsKnownRemedy(last.Remedy) {
+				remedy = last.Remedy + "; then sudo k3sm server --clear-crashloop   # the parked daemon restarts itself"
+			}
 		}
 		return CrashLoopVerdict{
 			Posture:    PostureParked,
@@ -146,10 +154,10 @@ func ClassifyCrashLoop(rec executor.CrashRecord, readErr error, path string, now
 	}
 	if n := rec.Recent(now); n >= restartingFloor {
 		detail := fmt.Sprintf("restarted %d times in the last %s (last crash: %s at %s); trips at %d",
-			n, executor.CrashLoopWindow, last.Component, last.At.Format(time.RFC3339), executor.CrashLoopThreshold)
+			n, executor.CrashLoopWindow, shownComponent(last), last.At.Format(time.RFC3339), executor.CrashLoopThreshold)
 		if neverCameUp(last) {
 			detail = fmt.Sprintf("the control plane never came up (last: %s), %d failures in the last %s (latest at %s); trips at %d",
-				last.Component, n, executor.CrashLoopWindow, last.At.Format(time.RFC3339), executor.CrashLoopThreshold)
+				shownComponent(last), n, executor.CrashLoopWindow, last.At.Format(time.RFC3339), executor.CrashLoopThreshold)
 		}
 		return CrashLoopVerdict{
 			Posture:    PostureRestarting,
@@ -163,7 +171,7 @@ func ClassifyCrashLoop(rec executor.CrashRecord, readErr error, path string, now
 		return CrashLoopVerdict{
 			Posture: PostureRestarting,
 			Detail: fmt.Sprintf("lost the leader lease %d times in the last %s (last: %s at %s) while the control plane kept running; each loss restarts the daemon and is not a crash; trips at %d",
-				n, executor.CrashLoopWindow, lost.Component, lost.At.Format(time.RFC3339), executor.LeaderLostThreshold),
+				n, executor.CrashLoopWindow, shownComponent(lost), lost.At.Format(time.RFC3339), executor.LeaderLostThreshold),
 			Remedy:     "sudo k3sm status   # on every server: is etcd quorum or the apiserver flapping?",
 			LeaderLost: lostNote,
 		}
@@ -230,8 +238,12 @@ func leaderLostNote(rec executor.CrashRecord, now time.Time) string {
 	}
 	lost := lastLeaderLost(rec)
 	return fmt.Sprintf("%d in the last %s (last: %s at %s; not a crash)",
-		n, executor.CrashLoopWindow, lost.Component, lost.At.Format(time.RFC3339))
+		n, executor.CrashLoopWindow, shownComponent(lost), lost.At.Format(time.RFC3339))
 }
+
+// shownComponent is c's component as a human screen may show it
+// (termsafe.Component: a name executor.IsComponentName refuses reads "unknown").
+func shownComponent(c executor.Crash) string { return termsafe.Component(c.Component) }
 
 // neverCameUp reports whether the record's last entry was a BRING-UP failure
 // rather than a crash. The breaker counts two different failures now, and they

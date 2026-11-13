@@ -20,12 +20,10 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
 	"net"
-	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -1769,8 +1767,18 @@ func plural(n int, noun string) string {
 }
 
 // crashLoop folds the daemon's crash record into the server row (see
-// crashloop.go). The record is read through the FS seam; when the collector has
-// none, or no work dir, the row is left to launchd's verdict.
+// crashloop.go). When the collector has no FS seam (no host reads), or no work
+// dir, the row is left to launchd's verdict.
+//
+// The record is read with executor.ReadCrashRecord, the daemon's own bounded
+// reader, not the FS seam's plain ReadFile: the work dir is writable by the
+// service user, so the path may hold a planted symlink (which a root status run
+// would follow), a FIFO (which would block the open and hang status) or an
+// unbounded file. The owned reader opens O_NOFOLLOW|O_NONBLOCK, refuses
+// anything but a regular file up to executor.CrashRecordMaxBytes, and returns
+// a missing file as the empty record, which classifies as quiet and leaves the
+// row alone. A refused, failed or malformed read renders as the unreadable
+// posture; it never fails status.
 func (c Collector) crashLoop(row *Row) {
 	if c.FS == nil || c.Paths.WorkDir == "" {
 		return
@@ -1780,14 +1788,7 @@ func (c Collector) crashLoop(row *Row) {
 	if c.Now != nil {
 		now = c.Now()
 	}
-	b, err := c.FS.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return
-	}
-	var rec executor.CrashRecord
-	if err == nil {
-		err = json.Unmarshal(b, &rec)
-	}
+	rec, err := executor.ReadCrashRecord(path)
 	// The row's state is launchd's verdict already checked against the process
 	// table (daemonRow): a running server is the only one with an attempt live.
 	applyCrashLoop(row, ClassifyCrashLoop(rec, err, path, now, row.State == StateRunning))

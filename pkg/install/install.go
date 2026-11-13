@@ -944,7 +944,8 @@ type System interface {
 	ReadRegularFileWithMode(path string) ([]byte, fs.FileMode, error)
 	// ReadOwnedRegularFile is ReadRegularFile plus the owner, group and mode,
 	// all read off the SAME open descriptor as the content (O_NOFOLLOW and
-	// fstat), and it refuses a file larger than limit bytes. It exists for the
+	// fstat), and it refuses a file larger than limit bytes with an error
+	// wrapping ErrFileTooLarge. It exists for the
 	// one credential install reads AS ROOT from a service-user-writable
 	// directory and then trusts: the admin token an in-place update carries
 	// (carriedAdminToken), whose owner and write bits have to be judged on the

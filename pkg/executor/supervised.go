@@ -136,6 +136,17 @@ type BringUpError struct {
 	Err error
 }
 
+// componentNamePattern is the shape of every component name this package (and
+// cmd/k3sm, for "etcd-member-route") writes into BringUpError.Component and the
+// crash record.
+var componentNamePattern = regexp.MustCompile(`^[a-z0-9._/-]{1,64}$`)
+
+// IsComponentName reports whether s has the shape of a component name the daemon
+// produces ("kine", "etcd", "kube-apiserver", "etcd-member-route",
+// "provision/<step>"). A crash record's Component is untrusted data; a reader
+// shows a value off this shape as data, never as a name.
+func IsComponentName(s string) bool { return componentNamePattern.MatchString(s) }
+
 // The two phases a bring-up failure can happen in: laying the work dir down, and
 // starting the children over it.
 const (
