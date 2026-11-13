@@ -763,7 +763,7 @@ ns_create() {
 		local have rc=0
 		have="$(kc get namespace "$NS" --ignore-not-found -o name 2>/dev/null)" || rc=$?
 		[ "$rc" = 0 ] || refuse_run "${RUNG:-namespace}" "could not read whether namespace $NS already exists (kubectl exit $rc); the run deletes only a namespace it created (BI10)"
-		[ -z "$have" ] || refuse_run "${RUNG:-namespace}" "namespace $NS already exists and this run did not create it; remove it (kubectl delete namespace $NS) or wait for it to finish terminating, then rerun (BI10)"
+		[ -z "$have" ] || refuse_run "${RUNG:-namespace}" "namespace $NS already exists ($(ns_state "$NS")) and this run did not create it; remove it (kubectl delete namespace $NS) or wait for it to finish terminating, then rerun (BI10)"
 	fi
 	NS_CREATE_TRIED=1
 	kc create namespace "$NS" >/dev/null 2>&1
@@ -2091,7 +2091,8 @@ st_ns_attempted() (
 )
 # st_ns_owner <profile> — ns_create's ownership check with the cluster stubbed and
 # the exit trap's namespace step armed, counting every delete and root rm that
-# reaches the stubs. exists: the namespace is there before the run's first create;
+# reaches the stubs. exists: the namespace is there before the run's first create
+# (Terminating, finalizer kubernetes, so the refusal names its state);
 # noread: its existence cannot be read; recreate: the run created it, deleted it
 # (still Terminating) and creates it again, which must not be refused.
 st_ns_owner() (
@@ -2111,7 +2112,12 @@ st_ns_owner() (
 			creates=$((creates + 1)) made=1
 			;;
 		"delete "*) deletes=$((deletes + 1)) ;;
-		"get namespace"*jsonpath*) printf 'Terminating\t' ;;
+		"get namespace"*jsonpath*)
+			case "$prof" in
+			exists) printf 'Terminating\tkubernetes' ;;
+			*) printf 'Terminating\t' ;;
+			esac
+			;;
 		"get namespace"*)
 			case "$prof" in
 			noread) return 1 ;;
@@ -2743,6 +2749,7 @@ self_test_body() {
 	st_out "teardown red: a create that reported failure is still verified (exit 1)" "EXIT 1" st_ns_attempted 0
 	st_out "teardown red: the attempted create's leftover namespace is named" "TEARDOWN-LEFT: namespace k3sm-m17-lab still exists" st_ns_attempted 0
 	st_out "ownership red: a namespace there before the first create refuses the run" "REFUSED(r2-attach): namespace k3sm-m17-lab already exists" st_ns_owner exists
+	st_out "ownership red: the refusal names the namespace's phase and finalizers" "REFUSED(r2-attach): namespace k3sm-m17-lab already exists (phase Terminating, finalizers kubernetes) and this run did not create it" st_ns_owner exists
 	st_out "ownership red: the refused run's exit trap deletes nothing" "CREATES 0 DELETES 0" st_ns_owner exists
 	st_out "ownership red: an unreadable namespace refuses the run" "REFUSED(r2-attach): could not read whether namespace k3sm-m17-lab already exists" st_ns_owner noread
 	st_out "ownership red: the unreadable refusal's exit trap deletes nothing" "CREATES 0 DELETES 0" st_ns_owner noread
