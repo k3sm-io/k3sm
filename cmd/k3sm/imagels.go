@@ -118,7 +118,8 @@ type nodeCacheRow struct {
 	ClassesObservedAt string            `json:"classesObservedAt,omitempty"`
 	StoreBytes        *uint64           `json:"storeBytes,omitempty"`
 	// ClassesNote says why a present report was not read: "unreadable", or
-	// "newer schema" for a report from a newer node than this CLI.
+	// "unrecognised schema" for a report whose schema this CLI does not know
+	// (a newer node, or a faulty one; the value does not say which).
 	ClassesNote string `json:"classesNote,omitempty"`
 }
 
@@ -732,7 +733,7 @@ func readClassReport(row *nodeCacheRow, n corev1.Node) {
 	r, err := imagestorev1.ParseClassReport(v)
 	switch {
 	case errors.Is(err, imagestorev1.ErrUnknownClassReportSchema):
-		row.ClassesNote = "newer schema"
+		row.ClassesNote = "unrecognised schema"
 		return
 	case err != nil:
 		row.ClassesNote = "unreadable"
@@ -753,7 +754,11 @@ const classReportMaxSkew = 10 * time.Minute
 // unattributed one.
 func classCells(n nodeCacheRow, now time.Time) (img, art, other, note string) {
 	img, art, other = "-", "-", "-"
-	if n.ClassesNote != "" {
+	switch n.ClassesNote {
+	case "":
+	case "unrecognised schema":
+		return img, art, other, "(class report not recognised)"
+	default:
 		return img, art, other, "(class report " + n.ClassesNote + ")"
 	}
 	if n.ClassesObservedAt == "" {
@@ -768,16 +773,29 @@ func classCells(n nodeCacheRow, now time.Time) (img, art, other, note string) {
 	img = humanBytes(n.Classes[imagestorev1.ClassImage])
 	art = humanBytes(n.Classes[imagestorev1.ClassArtifact])
 	other = humanBytes(rest)
-	at, err := time.Parse(time.RFC3339, n.ClassesObservedAt)
+	// ClassesObservedAt is only ever set by readClassReport, from a time that
+	// ParseClassReport accepted and that was formatted as RFC3339 (years
+	// 0000 to 9999), so it always parses back; there is no unreadable-time case.
+	at, _ := time.Parse(time.RFC3339, n.ClassesObservedAt)
 	switch {
-	case err != nil:
-		note = "(class report time unreadable)"
 	case now.Sub(at) > classReportMaxSkew:
-		note = "(class report " + now.Sub(at).Truncate(time.Minute).String() + " old)"
+		note = "(class report " + classReportAge(now.Sub(at)) + " old)"
 	case at.Sub(now) > classReportMaxSkew:
-		note = "(class report ahead of this clock)"
+		note = "(class report time is ahead of this Mac's clock)"
 	}
 	return img, art, other, note
+}
+
+// classReportAge renders d in whole minutes, or whole hours from 2 hours up.
+func classReportAge(d time.Duration) string {
+	if d >= 2*time.Hour {
+		return strconv.Itoa(int(d/time.Hour)) + " hours"
+	}
+	m := int(d / time.Minute)
+	if m == 1 {
+		return "1 minute"
+	}
+	return strconv.Itoa(m) + " minutes"
 }
 
 // incompleteNodes are the nodes whose status.images is at the cap, sorted.

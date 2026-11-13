@@ -32,7 +32,7 @@ import (
 
 // TestImageDFClassesColumnAndMissingAnnotation pins how df reads each node's
 // class report: the JSON fields, the IMAGE/ARTIFACT/OTHER cells and the
-// trailing note, for a valid report, no report, an unreadable one, a newer
+// trailing note, for a valid report, no report, an unreadable one, an unrecognised
 // schema, a stale one, one ahead of the clock, and a valid empty store.
 func TestImageDFClassesColumnAndMissingAnnotation(t *testing.T) {
 	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
@@ -77,7 +77,7 @@ func TestImageDFClassesColumnAndMissingAnnotation(t *testing.T) {
 		`{"node":"n1-valid",` + base + `,"classes":{"application/x-foo":1536,"artifact":1024,"image":3145728,"unattributed":512},"classesObservedAt":"2026-11-13T11:58:00Z","storeBytes":3148800}`,
 		`{"node":"n2-missing",` + base + `}`,
 		`{"node":"n3-unreadable",` + base + `,"classesNote":"unreadable"}`,
-		`{"node":"n4-newer",` + base + `,"classesNote":"newer schema"}`,
+		`{"node":"n4-newer",` + base + `,"classesNote":"unrecognised schema"}`,
 		`{"node":"n5-stale",` + base + `,"classes":{"image":100},"classesObservedAt":"2026-11-13T11:34:30Z","storeBytes":100}`,
 		`{"node":"n6-ahead",` + base + `,"classes":{"artifact":2048},"classesObservedAt":"2026-11-13T12:11:00Z","storeBytes":2048}`,
 		// A valid empty store keeps "classes": {} and "storeBytes": 0, so it
@@ -113,9 +113,9 @@ func TestImageDFClassesColumnAndMissingAnnotation(t *testing.T) {
 		{"n1-valid", "0 B", "0", "3.0 MiB", "1.0 KiB", "2.0 KiB"},
 		{"n2-missing", "0 B", "0", "-", "-", "-"},
 		{"n3-unreadable", "0 B", "0", "-", "-", "-", "(class report unreadable)"},
-		{"n4-newer", "0 B", "0", "-", "-", "-", "(class report newer schema)"},
-		{"n5-stale", "0 B", "0", "100 B", "0 B", "0 B", "(class report 25m0s old)"},
-		{"n6-ahead", "0 B", "0", "0 B", "2.0 KiB", "0 B", "(class report ahead of this clock)"},
+		{"n4-newer", "0 B", "0", "-", "-", "-", "(class report not recognised)"},
+		{"n5-stale", "0 B", "0", "100 B", "0 B", "0 B", "(class report 25 minutes old)"},
+		{"n6-ahead", "0 B", "0", "0 B", "2.0 KiB", "0 B", "(class report time is ahead of this Mac's clock)"},
 		{"n7-empty", "0 B", "0", "0 B", "0 B", "0 B"},
 	}
 	table := lines[1:]

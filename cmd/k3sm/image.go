@@ -153,7 +153,9 @@ ls      list the images in the cluster's one registry (the server's), each
         then end, exit 0; a failure after the registry answered is
         {"type":"error","error"} and a non-zero exit, with no end line.
 df      show the registry's size (its distinct blobs) and each node's image
-        cache as its status.images reports it. Same reads as ls.
+        cache as its status.images reports it. Each node's own report of its
+        store by content class is shown (IMAGE, ARTIFACT, OTHER); a node with
+        no report shows dashes. Same reads as ls.
 
 Flags:
 `

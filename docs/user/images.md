@@ -465,7 +465,7 @@ publishes.
 k3sm image ls             # every tag, where it is cached, and how many Pods use it
 k3sm image ls -o json     # the same, as a versioned document
 k3sm image ls -o ndjson   # the same, one JSON line per image as it is read
-k3sm image df             # the registry's size and each node's image cache
+k3sm image df             # the registry's size, each node's image cache and its store by class
 k3sm image df -o json
 ```
 
@@ -482,12 +482,15 @@ the JSON document carries `"reachable": false` with the error. `df` then still r
 caches.
 
 `df` also splits each node's image store by what it holds. `IMAGE` is content that container images
-use, `ARTIFACT` is OCI artifacts with no known media type, and `OTHER` is everything else: artifacts
-counted by their media type, and content nothing uses any more. A node on an older version does not
-report this, so its row shows dashes. The numbers are the node's own report, which it updates from
-time to time, so they can lag behind the store; a report more than 10 minutes old is marked at the
-end of the row. In `-o json` the same numbers are under `classes`, `storeBytes` and
-`classesObservedAt`.
+name. `ARTIFACT` is artifact content with no usable media type. `OTHER` is everything else: artifact
+content counted under its media type, and content that nothing names. `CACHED` and `IMAGES` come from
+the images the node lists in its status, so they do not have to add up to `IMAGE`, `ARTIFACT` and
+`OTHER`, which come from what the node's store holds. A node on an older version does not report
+this, so its row shows dashes. The numbers are the node's own report, which it updates periodically,
+so they can lag behind the store. A row is marked when the report is more than 10 minutes old or
+ahead of this Mac's clock, or when it cannot be read. In `-o json` the same numbers are under
+`classes`, `storeBytes` and `classesObservedAt`; a report that cannot be read leaves those three out
+and sets `classesNote`, and an empty store is `"classes": {}`.
 
 Both commands keep what each image digest describes (its platforms, size and blobs) in a cache
 under your account's cache directory, `~/Library/Caches/k3sm/registry/<registry address>/`, so a
