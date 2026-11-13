@@ -44,6 +44,10 @@ func TestStrip(t *testing.T) {
 		{"soft hyphen", "a\u00adb", "ab"},
 		{"line separator", "a\u2028b", "ab"},
 		{"paragraph separator", "a\u2029b", "ab"},
+		{"C1 CSI again", "a\u009bb", "ab"},
+		{"bidi override", "a\u202eb", "ab"},
+		{"tag character", "a\U000e0041b", "ab"},
+		{"mixed printable", "Node 7 ok 漢字 🚀", "Node 7 ok 漢字 🚀"},
 		{"ASCII", "kine: exit status 1", "kine: exit status 1"},
 		{"Latin-1 letter", "é", "é"},
 		{"CJK", "漢", "漢"},
@@ -111,49 +115,88 @@ func TestStripInvalidBytes(t *testing.T) {
 	}
 }
 
-// TestStripRandomBytesAgainstTypedRanges feeds 3000 fixed-seed random byte
-// strings (length 0-64) to Strip and checks the output against a range list
-// typed out here, independent of unicode.IsControl and unicode.Cf.
-func TestStripRandomBytesAgainstTypedRanges(t *testing.T) {
-	ranges := [][2]rune{
-		{0x0000, 0x001F}, {0x007F, 0x009F}, {0x00AD, 0x00AD}, {0x061C, 0x061C},
-		{0x200B, 0x200F}, {0x202A, 0x202E}, {0x2028, 0x2029}, {0x2060, 0x2064},
-		{0x2066, 0x206F}, {0xFEFF, 0xFEFF}, {0xFFF9, 0xFFFB},
-	}
-	banned := func(r rune) bool {
-		for _, rg := range ranges {
-			if r >= rg[0] && r <= rg[1] {
-				return true
-			}
+// typedRanges is the set of runes Strip removes, typed out here and
+// independent of unicode.IsControl and unicode.Cf.
+var typedRanges = [][2]rune{
+	{0x0000, 0x001F}, {0x007F, 0x009F}, {0x00AD, 0x00AD},
+	{0x0600, 0x0605}, {0x061C, 0x061C}, {0x06DD, 0x06DD}, {0x070F, 0x070F},
+	{0x0890, 0x0891}, {0x08E2, 0x08E2}, {0x180E, 0x180E},
+	{0x200B, 0x200F}, {0x2028, 0x2029}, {0x202A, 0x202E}, {0x2060, 0x2064},
+	{0x2066, 0x206F}, {0xFEFF, 0xFEFF}, {0xFFF9, 0xFFFB},
+	{0x110BD, 0x110BD}, {0x110CD, 0x110CD}, {0x13430, 0x1343F},
+	{0x1BCA0, 0x1BCA3}, {0x1D173, 0x1D17A}, {0xE0001, 0xE0001},
+	{0xE0020, 0xE007F},
+}
+
+func typedBanned(r rune) bool {
+	for _, rg := range typedRanges {
+		if r >= rg[0] && r <= rg[1] {
+			return true
 		}
-		return false
 	}
+	return false
+}
+
+// expectedStrip builds Strip's expected output without calling Strip: invalid
+// bytes become U+FFFD, runes in typedRanges are dropped, the rest are kept.
+func expectedStrip(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		r, n := utf8.DecodeRuneInString(s[i:])
+		i += n
+		if r == utf8.RuneError && n == 1 {
+			b.WriteRune(utf8.RuneError)
+			continue
+		}
+		if !typedBanned(r) {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// TestTypedRangesMatchStrip sweeps every valid rune and fails, naming the
+// rune, wherever typedRanges and Strip disagree in either direction.
+func TestTypedRangesMatchStrip(t *testing.T) {
+	for r := rune(0); r <= unicode.MaxRune; r++ {
+		if r >= 0xD800 && r <= 0xDFFF {
+			continue
+		}
+		// The classification is the thing compared against here.
+		want := unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || r == 0x2028 || r == 0x2029
+		if typedBanned(r) != want {
+			t.Errorf("U+%04X: typed list banned=%v, classification banned=%v", r, typedBanned(r), want)
+		}
+		if removed := Strip(string(r)) == ""; removed != typedBanned(r) {
+			t.Errorf("U+%04X: Strip removed=%v, typed list banned=%v", r, removed, typedBanned(r))
+		}
+	}
+}
+
+// TestStripRandomBytesAgainstTypedRanges feeds 3000 fixed-seed random byte
+// strings (length 0-64) to Strip and compares the whole output with
+// expectedStrip. About 1 position in 8 appends a whole rune from typedRanges.
+func TestStripRandomBytesAgainstTypedRanges(t *testing.T) {
 	// Bias bytes toward the ones that matter so multi-byte banned runes
-	// (U+00AD, U+200B, U+202E, U+FEFF) and C0/C1 bytes appear often.
+	// and C0/C1 bytes appear often.
 	interesting := []byte{0x00, 0x07, 0x1b, 0x7f, 0x9b, 0xc2, 0xad, 0xe2, 0x80, 0x8b, 0xae, 0xa8, 0xef, 0xbb, 0xbf, 0xed, 0xff, 'a'}
 	rng := rand.New(rand.NewSource(1713))
 	for i := 0; i < 3000; i++ {
-		in := make([]byte, rng.Intn(65))
-		for j := range in {
-			if rng.Intn(2) == 0 {
-				in[j] = interesting[rng.Intn(len(interesting))]
-			} else {
-				in[j] = byte(rng.Intn(256))
+		var in []byte
+		for j, n := 0, rng.Intn(65); j < n; j++ {
+			switch {
+			case rng.Intn(8) == 0:
+				rg := typedRanges[rng.Intn(len(typedRanges))]
+				in = utf8.AppendRune(in, rg[0]+rune(rng.Intn(int(rg[1]-rg[0])+1)))
+			case rng.Intn(2) == 0:
+				in = append(in, interesting[rng.Intn(len(interesting))])
+			default:
+				in = append(in, byte(rng.Intn(256)))
 			}
 		}
 		out := Strip(string(in))
-		if !utf8.ValidString(out) {
-			t.Fatalf("Strip(%q) = %q is not valid UTF-8", in, out)
-		}
-		for j := 0; j < len(out); j++ {
-			if out[j] < 0x20 || out[j] == 0x7f {
-				t.Fatalf("Strip(%q) = %q holds byte 0x%02x", in, out, out[j])
-			}
-		}
-		for _, r := range out {
-			if banned(r) {
-				t.Fatalf("Strip(%q) = %q holds U+%04X", in, out, r)
-			}
+		if want := expectedStrip(string(in)); out != want {
+			t.Fatalf("Strip(%q) = %q, want %q", in, out, want)
 		}
 	}
 }
