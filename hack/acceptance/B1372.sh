@@ -82,6 +82,15 @@
 #         still undone, and one never made reads as already gone. INT and TERM are
 #         logged, not obeyed, until f.1 and t.8 end, so a second Ctrl-C cannot skip
 #         the cleanup.
+#         Worst case of f.1, with S = K3SM_MST_STEP_TIMEOUT, R = K3SM_MST_RECLAIM_TIMEOUT,
+#         D = K3SM_MST_READY_TIMEOUT, P = K3SM_MST_POLL and n the run's PersistentVolumes:
+#         every kubectl call is `kc` and every node step `rroot`, each bounded by S, and
+#         the Bound-volume wait is R plus one last list and sleep (S + P). The volume and
+#         storage part is R + P + (5 + n) S (list, wait overshoot, n deletes, relist, two
+#         node removals); the namespace delete and its D wait add D + 3 S + P, the tag
+#         removal (twice at most) 2 S + P, the two scratch removals 2 S. Total
+#         D + R + (11 + n) S + 3 P: with the defaults (900, 240, 120, 2) and n = 1,
+#         2586 s, about 43 minutes. INT and TERM are ignored until it, and t.8, end.
 #   t.8   after f.1: `kubectl get ns` recorded, no leftover object of the run, both
 #         nodes Ready, each Mac on the build t.0 recorded; one `end state:` line
 #         names the build the rig is left on and each node's Ready
@@ -135,6 +144,9 @@
 #                                must lie under that dir (no ..) with the kubectl in use
 #                                resolving under it too; the run then prints a
 #                                "SELF-TEST ROOT BYPASS" line. A bare mark (=1) is refused.
+#                                The bypass does not fake the rig hosts: a run that takes it still
+#                                reaches whatever ssh hosts K3SM_MST_*_SSH name, so
+#                                K3SM_MST_SELF_TEST_RUN must be unset in a lab shell.
 #   K3SM_MST_VIEW_UID            uid a view file must have (default 0)
 #   KUBECTL                      kubectl binary (default kubectl)
 #   K3SM_LAB_TOLERATE_KEYS       extra taint keys every pod tolerates with Exists
