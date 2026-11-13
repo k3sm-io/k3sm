@@ -117,6 +117,11 @@ type gate struct {
 	// forwards manifest PUTs over one with the manifest bound, and upload blob
 	// upload requests over one with the upload bound. proxyFor picks one.
 	read, write, manifest, upload *httputil.ReverseProxy
+
+	// warn limits readError's warning to one per interval per cause, on the
+	// clock now (gateConfig.Now).
+	warn readWarnLimiter
+	now  func() time.Time
 }
 
 // gateConfig configures a gate.
@@ -167,7 +172,7 @@ func newGate(cfg gateConfig) *gate {
 		manifestTransport = loopbackTransport(cfg.ManifestHeaderTimeout)
 		uploadTransport = loopbackTransport(cfg.UploadHeaderTimeout)
 	}
-	g := &gate{upstream: cfg.Upstream, log: cfg.Logger, cred: cfg.Credential}
+	g := &gate{upstream: cfg.Upstream, log: cfg.Logger, cred: cfg.Credential, now: cfg.Now}
 	if cfg.Auth.complete() {
 		g.auth = newAuthorizer(cfg.Auth, cfg.Now)
 	}
@@ -278,13 +283,29 @@ func (g *gate) modifyResponse(resp *http.Response) error {
 // connection without a response: what the raw relay did, and what a peer's
 // puller already reads as "this mirror does not have it". A read the client
 // itself abandoned is no fault of the registry and is logged at Debug.
+// Any other failure warns at most once per gateReadWarnInterval for its cause,
+// without the request (a down registry fails every pull alike), counting the
+// failures suppressed since the last warning; those are logged at Debug.
 func (g *gate) readError(w http.ResponseWriter, r *http.Request, err error) {
-	level := slog.LevelWarn
+	const msg = "ingest registry gate could not reach the local registry"
 	if errors.Is(err, context.Canceled) {
-		level = slog.LevelDebug
+		g.log.Log(r.Context(), slog.LevelDebug, msg,
+			"target", g.upstream, "method", r.Method, "path", r.URL.Path, "err", err)
+	} else {
+		cause := readCauseOf(err)
+		warn, suppressed := g.warn.allow(g.now(), cause)
+		switch {
+		case !warn:
+			g.log.Log(r.Context(), slog.LevelDebug, msg,
+				"target", g.upstream, "method", r.Method, "path", r.URL.Path, "cause", cause.String(), "err", err)
+		case suppressed > 0:
+			g.log.Log(r.Context(), slog.LevelWarn, msg,
+				"target", g.upstream, "cause", cause.String(), "err", err, "suppressed", suppressed)
+		default:
+			g.log.Log(r.Context(), slog.LevelWarn, msg,
+				"target", g.upstream, "cause", cause.String(), "err", err)
+		}
 	}
-	g.log.Log(r.Context(), level, "ingest registry gate could not reach the local registry",
-		"target", g.upstream, "method", r.Method, "path", r.URL.Path, "err", err)
 	if hj, ok := w.(http.Hijacker); ok {
 		if c, _, herr := hj.Hijack(); herr == nil {
 			_ = c.Close()
