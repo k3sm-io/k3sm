@@ -490,8 +490,21 @@ type podTrack struct {
 	// set. The runtime forgets the pod as its DeletePod begins, so while the
 	// stop is in flight a NotFound (or a failed read) reports this instead of a
 	// synthesized creating status: a Running pod must not read Pending as it
-	// stops. Set and cleared with stopping; guarded by restartMu.
+	// stops. Set with stopping; a failed stop keeps it (the runtime may have
+	// forgotten the pod all the same). Its lifetime is bounded: it ends when a
+	// stop succeeds (finishStopping), or when a runtime read ISSUED after the
+	// last stop attempt began succeeds (observedLive), whichever is first;
+	// otherwise it lives and dies with the track. The discipline that enforces
+	// "issued after": every reader captures stopEpoch (liveReadEpoch) before
+	// its runtime GetPodStatus and passes it to observedLive, which drops the
+	// snapshot only when no stop is in flight and the epoch is unchanged. A
+	// read issued before a stop that completes after the stop failed saw the
+	// pod before the runtime forgot it; letting it drop the snapshot made the
+	// next read synthesize Pending. Guarded by restartMu.
 	stoppingLive *corev1.PodStatus
+	// stopEpoch counts the node-side stops (deadline or eviction) begun on t
+	// (beginStopLocked bumps it); see stoppingLive. Guarded by restartMu.
+	stopEpoch uint64
 	// unpersisted holds the terminal status of a pod failed past its active
 	// deadline (failPastDeadline) whose apiserver write has not yet succeeded;
 	// enforceActiveDeadlines retries the write on each resync until it lands, the
@@ -3489,15 +3502,19 @@ func (r *runtimedRuntime) GetPodStatus(ctx context.Context, namespace, name stri
 	}
 	// An evicted pod reports its eviction without asking the runtime, which has
 	// already forgotten it.
-	if t := r.trackByID(id); t != nil {
-		if st := t.evictedStatus(); st != nil {
+	pre := r.trackByID(id)
+	var epoch uint64
+	if pre != nil {
+		if st := pre.evictedStatus(); st != nil {
 			return st, nil
 		}
+		// Captured before the runtime call: see podTrack.stoppingLive.
+		epoch = pre.liveReadEpoch()
 	}
 	resp, err := r.rt.GetPodStatus(ctx, &runtimev1.GetPodStatusRequest{PodId: id})
 	if err != nil {
-		// A pod whose deadline or eviction stop is in flight reports its last
-		// live status: the runtime may be forgetting it as the stop runs.
+		// A pod whose deadline or eviction stop is in flight, or failed, reports
+		// its last live status: the runtime may be forgetting it as the stop runs.
 		if t := r.trackByID(id); t != nil {
 			if st := t.stoppingStatus(); st != nil {
 				return st, nil
@@ -3510,9 +3527,9 @@ func (r *runtimedRuntime) GetPodStatus(ctx context.Context, namespace, name stri
 		return nil, vkadapter.NotFoundf("pod %q not found", namespace+"/"+name)
 	}
 	if e := resp.GetError(); e != nil && e.GetCode() != 0 {
-		// A pod whose deadline or eviction stop is in flight is not being
-		// created: the runtime forgot it as its DeletePod began. It reports its
-		// last live status until the stop finishes and records Failed.
+		// A pod whose deadline or eviction stop is in flight, or failed, is not
+		// being created: the runtime forgot it as its DeletePod began. It reports
+		// its last live status until a stop succeeds and records Failed.
 		if st := t.stoppingStatus(); st != nil {
 			return st, nil
 		}
@@ -3527,6 +3544,9 @@ func (r *runtimedRuntime) GetPodStatus(ctx context.Context, namespace, name stri
 		// case where nothing is being created.
 		st := r.buildStatus(pod.DeepCopy(), t, r.synthesizedStatus(pod, t), r.proberFor(id))
 		return &st, nil
+	}
+	if t == pre {
+		t.observedLive(epoch)
 	}
 	st := r.buildStatus(pod.DeepCopy(), t, resp.GetStatus(), r.proberFor(id))
 	return &st, nil
@@ -3571,11 +3591,13 @@ func (r *runtimedRuntime) podWithStatus(ctx context.Context, tracked *corev1.Pod
 		pod.Status = *st
 		return pod
 	}
+	// Captured before the runtime call: see podTrack.stoppingLive.
+	epoch := t.liveReadEpoch()
 	resp, err := r.rt.GetPodStatus(ctx, &runtimev1.GetPodStatusRequest{PodId: string(pod.UID)})
 	if err != nil || (resp.GetError() != nil && resp.GetError().GetCode() != 0) {
-		// A pod whose deadline or eviction stop is in flight keeps its last
-		// live status: the runtime forgets the pod as its DeletePod begins, and
-		// the stop is not a create (see podTrack.stoppingLive).
+		// A pod whose deadline or eviction stop is in flight, or failed, keeps
+		// its last live status: the runtime forgets the pod as its DeletePod
+		// begins, and the stop is not a create (see podTrack.stoppingLive).
 		if st := t.stoppingStatus(); st != nil {
 			pod.Status = *st
 			return pod
@@ -3592,6 +3614,7 @@ func (r *runtimedRuntime) podWithStatus(ctx context.Context, tracked *corev1.Pod
 		// a pod that is legitimately waiting.
 		pod.Status = r.buildStatus(pod, t, r.synthesizedStatus(pod, t), r.proberFor(string(pod.UID)))
 	default:
+		t.observedLive(epoch)
 		pod.Status = r.buildStatus(pod, t, resp.GetStatus(), r.proberFor(string(pod.UID)))
 	}
 	return pod

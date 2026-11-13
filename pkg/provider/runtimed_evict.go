@@ -57,8 +57,9 @@ var persistEvictedBackoff = wait.Backoff{Steps: 6, Duration: 200 * time.Millisec
 // finishStopping records the status once the stop succeeds; clearStopping
 // rolls it back. live is the pod's last live status, read before the mark: the
 // runtime forgets the pod as its stop begins, so the readers report live
-// (stoppingStatus) for the rest of the stop instead of a synthesized creating
-// status.
+// (stoppingStatus) for the rest of the stop, and after a failed one until the
+// retry, instead of a synthesized creating status. A mark bumps t's stop epoch,
+// so a read issued before it cannot drop that status (observedLive).
 func (t *podTrack) markStopping(live *corev1.PodStatus) bool {
 	t.restartMu.Lock()
 	defer t.restartMu.Unlock()
@@ -86,19 +87,46 @@ func (t *podTrack) beginStopLocked(live *corev1.PodStatus) bool {
 		return false
 	}
 	t.stopping = true
+	t.stopEpoch++
 	t.stoppingLive = live
 	return true
 }
 
 // stoppingStatus returns a copy of the last live status the stopping mark
-// recorded while t's node-side stop is in flight, or nil when no stop is.
+// recorded for t's node-side stop (a deadline's or an eviction's), or nil. It is
+// kept while the stop is in flight and, after a failed stop, until a runtime
+// read issued after that stop began succeeds (observedLive) or a stop succeeds
+// (finishStopping).
 func (t *podTrack) stoppingStatus() *corev1.PodStatus {
 	t.restartMu.Lock()
 	defer t.restartMu.Unlock()
-	if !t.stopping || t.stoppingLive == nil {
+	if t.stoppingLive == nil {
 		return nil
 	}
 	return t.stoppingLive.DeepCopy()
+}
+
+// liveReadEpoch returns t's stop epoch, which a status reader captures BEFORE
+// its runtime GetPodStatus and hands to observedLive with the read's result.
+func (t *podTrack) liveReadEpoch() uint64 {
+	t.restartMu.Lock()
+	defer t.restartMu.Unlock()
+	return t.stopEpoch
+}
+
+// observedLive drops the live status a failed node-side stop kept, once the
+// runtime reports the pod again: its own status is the truth from then on.
+// epoch is t's stop epoch the reader captured (liveReadEpoch) before its
+// runtime call. The status is dropped only when no stop is in flight and no
+// stop began since that capture: a stop in flight may yet make the runtime
+// forget the pod, and a read issued before a stop that has since failed saw
+// the pod before the runtime forgot it, so it says nothing about the pod now.
+func (t *podTrack) observedLive(epoch uint64) {
+	t.restartMu.Lock()
+	defer t.restartMu.Unlock()
+	if !t.stopping && t.stopEpoch == epoch {
+		t.stoppingLive = nil
+	}
 }
 
 // isStopping reports whether t's node-side stop (an active deadline's or an
@@ -138,14 +166,16 @@ func (t *podTrack) finishStopping(st *corev1.PodStatus) bool {
 	return true
 }
 
-// clearStopping rolls back the stopping mark after a failed stop, so the next
-// tick (or eviction cycle) retries it and the pod, whose processes still run,
-// stays an eviction candidate. Nothing was published, so nothing is withdrawn.
+// clearStopping rolls back the stopping mark after a failed stop, releasing the
+// fence so the next tick (or eviction cycle) retries it and the pod, whose
+// processes still run, stays an eviction candidate. Nothing was published, so
+// nothing is withdrawn. The live status stays: the runtime may already have
+// forgotten the pod, and until the retry the pod must not read as being
+// created, nor the retry build its terminal status from such a read.
 func (t *podTrack) clearStopping() {
 	t.restartMu.Lock()
 	defer t.restartMu.Unlock()
 	t.stopping = false
-	t.stoppingLive = nil
 }
 
 // quiesceForEviction cancels the provider workers that could restart or
