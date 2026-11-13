@@ -15,11 +15,15 @@ loss of a server takes three.
 ## HA Model
 
 A single-node k3sm embeds the control plane over **kine/SQLite**. HA extends this to multiple
-control-plane Macs so the apiserver stays reachable if one server is lost, which needs three servers,
-with an embedded **etcd** cluster instead of the local SQLite file. The design opts in with `--cluster-init` on the
-first server and `--server-join` on the others. There is no conversion from an existing SQLite
-cluster to etcd, and none from an external database. The controller-manager and scheduler elect a
-leader across the servers, and a joining server authenticates against the same cluster CA bundle.
+control-plane Macs so the apiserver stays reachable if one server is lost, which needs three
+servers, with an embedded **etcd** cluster instead of the local SQLite file. The apiserver on each
+surviving server keeps answering, but k3sm does not fail clients over: a kubeconfig or worker
+pointed at the lost server stays down until you point it at another server (see
+[Reaching the Apiservers](#reaching-the-apiservers)). A three-server cluster has not been run end
+to end. The design opts in with `--cluster-init` on the first server and `--server-join` on the
+others. There is no conversion from an existing SQLite cluster to etcd, and none from an external
+database. The controller-manager and scheduler elect a leader across the servers, and a joining
+server authenticates against the same cluster CA bundle.
 This builds on the [multi-node](multi-node.md) mesh.
 
 ## Mesh Addresses and Pod Ranges
