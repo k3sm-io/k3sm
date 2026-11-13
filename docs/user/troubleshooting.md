@@ -264,6 +264,11 @@ container is restarted in place with an upstream-shaped `CrashLoopBackOff` backo
   same text. The node's k3sm log says which processes are still running. The Pod stays
   `Pending`, keeps its address, and the node tries the create again about every 10 seconds, so it
   starts once those processes are gone. If they do not exit, stop them yourself or delete the Pod.
+- A Pod past its deadline still shows `Running`? A Pod is reported `Failed` with reason
+  `DeadlineExceeded` only after its stop succeeds. Either the stop is still running, or it failed or
+  timed out and the node retries it at the next 10 s check. Wait for the retry, read the node's k3sm
+  log for why the stop failed, or delete the Pod. See
+  [Limitations](limitations.md#activedeadlineseconds-is-enforced-on-the-default-runtime-not-on-hostprocess).
 
 See [Limitations](limitations.md#restartpolicy-is-honored-on-the-default-runtime-not-on-the-hostprocess-opt-out)
 for the precise scope.
