@@ -136,6 +136,14 @@ registry can read the images this cluster runs, and only a user holding a builde
 [Pushing With Other Tools](#pushing-with-other-tools)), or a Pod the cluster's RBAC allows to push (see [Pushing From Inside a Pod](#pushing-from-inside-a-pod)),
 can put a new one there.
 
+A pull is a read, so it is timed differently from a push. If the registry behind the gate sends no
+response headers within 30 seconds, the gate closes the connection without an error status, or
+answers 502 where it cannot take over the connection, and logs the warning
+`ingest registry gate could not reach the local registry`. A pull the client itself gave up on is
+not logged as a warning. A node's runtime reads a closed connection as this registry not having the
+image and moves on to its next source, if it has one. The 30 seconds covers the registry's response
+headers only, not the time a transfer takes once the registry has started to answer.
+
 ## Models
 
 `k3sm model push <dir> <name>[:tag]` stores a model directory in the registry as a
@@ -388,7 +396,7 @@ A refused push says why, in an OCI error body. Every status a push can get:
 | `403` | The caller is authenticated but refused: the token is not a ServiceAccount's, the namespace has not opted in (no label, or a label value other than the namespace's own name; the message gives the `kubectl label` command that fixes it), the repository is outside the prefix, or RBAC denies the push. |
 | `405` | A delete, or any other write shape the registry never takes from a Pod. |
 | `429` | Token checks are rate-limited, and each client address has its own share of connections, requests and pushes, so one busy client slows itself rather than every other caller; wait for the `Retry-After` interval and retry. |
-| `502` | The registry behind the gate is unreachable. |
+| `502` | The registry behind the gate is unreachable, or it did not answer in time. The gate waits for the registry's response headers for up to 15 minutes on a manifest push, up to 2 hours on a blob upload request (start, chunk or finish), and 30 seconds on an upload status check. A manifest push can wait up to 15 minutes because the registry can make it wait behind a garbage-collection sweep of the repository and then link and re-check its layers, so a push that is slow is not necessarily stuck. A 502 means the registry did not answer within that time: retry the push, and if it keeps failing, look in the server log for the warning `ingest registry gate could not forward an authorized write`, which is logged for each of the three cases above. The bounds apply to the registry's response headers only, not to the time a transfer takes once the registry has started to answer. A client with a shorter timeout gives up before the gate does. |
 | `503` | The cluster API is unreachable, or the gate has no identity to ask it with. Retry. |
 
 ## Pushing With Other Tools
