@@ -35,7 +35,7 @@ import (
 var ErrRefused = errors.New("file refused")
 
 // ReadFileBounded reads the whole regular file at path, refusing one larger
-// than max bytes. The file is opened O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC, typed and
+// than max bytes. The file is opened O_NOFOLLOW|O_NONBLOCK|O_NOCTTY|O_CLOEXEC, typed and
 // sized by fstat on that one descriptor, and read from it, so nothing can be
 // swapped between the check and the read; O_NONBLOCK keeps a planted FIFO from
 // blocking the open, and the regular-file check keeps it from blocking the
@@ -66,7 +66,7 @@ func ReadFileBoundedFollow(path string, max int64) ([]byte, error) {
 }
 
 func read(path string, max int64, extra int) ([]byte, error) {
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_CLOEXEC|extra, 0)
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOCTTY|unix.O_CLOEXEC|extra, 0)
 	if err != nil {
 		if extra&unix.O_NOFOLLOW != 0 && errors.Is(err, unix.ELOOP) {
 			return nil, fmt.Errorf("%s is a symlink: %w", path, ErrRefused)
@@ -82,8 +82,15 @@ func read(path string, max int64, extra int) ([]byte, error) {
 	if st.Mode&unix.S_IFMT != unix.S_IFREG {
 		return nil, fmt.Errorf("%s is not a regular file (mode %#o): %w", path, st.Mode&unix.S_IFMT, ErrRefused)
 	}
-	if st.Size > max {
-		return nil, fmt.Errorf("%s is %d bytes, over the %d-byte bound: %w", path, st.Size, max, ErrRefused)
+	return readOpened(f, path, st.Size, max)
+}
+
+// readOpened applies the size bound to an opened regular file whose fstat size
+// is size, and reads it. It is split out so a test can present a file whose
+// size at fstat was under max but whose content is over it.
+func readOpened(f *os.File, path string, size, max int64) ([]byte, error) {
+	if size > max {
+		return nil, fmt.Errorf("%s is %d bytes, over the %d-byte bound: %w", path, size, max, ErrRefused)
 	}
 	// Read one byte past the bound, so a file that grew after the fstat is
 	// refused rather than silently truncated.

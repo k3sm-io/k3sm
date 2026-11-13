@@ -200,3 +200,37 @@ func makeFIFO(t *testing.T, dir, name string) string {
 	}
 	return p
 }
+
+// TestReadOpenedRefusesAFileThatGrewPastTheBound presents a file whose fstat
+// size was under max but whose content is over it, the race the one-byte-over
+// read exists for.
+func TestReadOpenedRefusesAFileThatGrewPastTheBound(t *testing.T) {
+	path := writeFile(t, t.TempDir(), "grown", bytes.Repeat([]byte("x"), testMax+1))
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	got, err := readOpened(f, path, 1, testMax)
+	if !errors.Is(err, ErrRefused) {
+		t.Fatalf("err = %v, want ErrRefused", err)
+	}
+	if got != nil {
+		t.Errorf("bytes = %d on error, want nil", len(got))
+	}
+}
+
+// TestReadOpenedReadsAFileExactlyAtTheBound pins the boundary: max bytes read.
+func TestReadOpenedReadsAFileExactlyAtTheBound(t *testing.T) {
+	want := bytes.Repeat([]byte("x"), testMax)
+	path := writeFile(t, t.TempDir(), "exact", want)
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	got, err := readOpened(f, path, 1, testMax)
+	if err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("got %d bytes, err %v; want %d bytes", len(got), err, len(want))
+	}
+}

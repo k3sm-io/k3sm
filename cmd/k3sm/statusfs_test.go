@@ -85,3 +85,90 @@ func TestStatusFSRefusesAFIFOALinkAndAnOversizedFile(t *testing.T) {
 		})
 	}
 }
+
+// TestStatusFSReadFileFollowingLink pins the admin-kubeconfig reader: a link to
+// a regular file is read, a link to a FIFO is refused without blocking, and an
+// oversized target is refused.
+func TestStatusFSReadFileFollowingLink(t *testing.T) {
+	link := func(t *testing.T, dir string, target string) string {
+		p := filepath.Join(dir, "link")
+		if err := os.Symlink(target, p); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	cases := []struct {
+		name string
+		make func(t *testing.T, dir string) string
+		want []byte // nil means refused
+	}{
+		{"a link to a regular file", func(t *testing.T, dir string) string {
+			target := filepath.Join(dir, "target")
+			if err := os.WriteFile(target, []byte("{}"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			return link(t, dir, target)
+		}, []byte("{}")},
+		{"a link to a FIFO", func(t *testing.T, dir string) string {
+			target := filepath.Join(dir, "fifo")
+			if err := unix.Mkfifo(target, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			return link(t, dir, target)
+		}, nil},
+		{"a link to an oversized file", func(t *testing.T, dir string) string {
+			target := filepath.Join(dir, "big")
+			if err := os.WriteFile(target, make([]byte, statusFSReadMax+1), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			return link(t, dir, target)
+		}, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := tc.make(t, t.TempDir())
+			type res struct {
+				b   []byte
+				err error
+			}
+			done := make(chan res, 1)
+			go func() {
+				b, err := osStatusFS{}.ReadFileFollowingLink(path)
+				done <- res{b, err}
+			}()
+			select {
+			case r := <-done:
+				if tc.want == nil {
+					if !errors.Is(r.err, boundedread.ErrRefused) {
+						t.Fatalf("ReadFileFollowingLink(%s) err = %v, want boundedread.ErrRefused", path, r.err)
+					}
+					return
+				}
+				if r.err != nil || string(r.b) != string(tc.want) {
+					t.Fatalf("ReadFileFollowingLink(%s) = %q, %v; want %q", path, r.b, r.err, tc.want)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatalf("ReadFileFollowingLink(%s) did not return: it blocked", path)
+			}
+		})
+	}
+}
+
+// TestStatusCollectorFSFollowsTheAdminKubeconfigLink pins the wiring: the FS
+// the status commands hand the collector exposes ReadFileFollowingLink, which
+// pkg/status/servingcert.go finds by an optional-interface assertion. A wrapper
+// that hid the method would silently turn a linked admin kubeconfig into a
+// "not readable" mismatch.
+func TestStatusCollectorFSFollowsTheAdminKubeconfigLink(t *testing.T) {
+	type linkFollower interface {
+		ReadFileFollowingLink(path string) ([]byte, error)
+	}
+	for name, fs := range map[string]any{
+		"newStatusCollector":  newStatusCollector().FS,
+		"newDaemonsCollector": newDaemonsCollector().FS,
+	} {
+		if _, ok := fs.(linkFollower); !ok {
+			t.Errorf("%s FS is %T, which does not implement ReadFileFollowingLink", name, fs)
+		}
+	}
+}
