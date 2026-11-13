@@ -278,7 +278,8 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
   mlx-serve image; a model running an older image still exits 2 on this path.
 - A sharded MLXModel whose rank Pod the scheduler cannot place no longer reads as a plain `Pending`
   with nothing to say why. After 30 seconds its `Ready` condition carries the reason
-  `RankUnschedulable`, naming the rank and quoting the scheduler's message. No rank Pod is deleted
+  `RankUnschedulable`, naming the rank and quoting the scheduler's message, unless another rank is
+  crashing or cannot pull its image, which keeps its own reason. No rank Pod is deleted
   or re-placed for it, and `ShardsPlaced` stays `True`.
 - A server whose control plane does not report healthy in time while the Mac is heavily loaded no
   longer parks on the crash-loop breaker after five attempts. It backs off instead, from 30 seconds

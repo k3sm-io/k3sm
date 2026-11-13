@@ -644,7 +644,7 @@ func (c *Controller) deleteOwnedStatefulSet(ctx context.Context, model *mlxv1alp
 // observeRanks builds the per-rank PodStates, probing rank 0 when it runs but
 // is not ready (it is the only rank with a serving surface). A rank the
 // scheduler has refused to bind for rankUnschedulableGrace or longer carries
-// that refusal.
+// that refusal (rankRefusal).
 func (c *Controller) observeRanks(ctx context.Context, model *mlxv1alpha1.MLXModel, pods []corev1.Pod) []mlx.PodState {
 	out := make([]mlx.PodState, 0, len(pods))
 	rank0 := mlx.RankPodName(model.Name, 0)
@@ -662,9 +662,7 @@ func (c *Controller) observeRanks(ctx context.Context, model *mlxv1alpha1.MLXMod
 		if pod.Name == rank0 && !state.Ready && state.Phase == corev1.PodRunning && pod.Status.PodIP != "" {
 			state.Probe = c.probe(ctx, model, pod.Status.PodIP)
 		}
-		if u, ok := unschedulable(pod); ok && now.Sub(u.Since) >= rankUnschedulableGrace {
-			state.Unschedulable = &u
-		}
+		state.Unschedulable, _ = rankRefusal(pod, now)
 		out = append(out, state)
 	}
 	return out
@@ -694,16 +692,27 @@ func unschedulable(pod *corev1.Pod) (mlx.Unschedulable, bool) {
 	return mlx.Unschedulable{}, false
 }
 
+// rankRefusal is the one place a scheduler refusal is measured against
+// rankUnschedulableGrace. A refusal that has lasted the grace or longer comes
+// back as past, to be reported; one still inside it comes back as the wait
+// left until it leaves it. A Pod the scheduler is not refusing returns nil, 0.
+func rankRefusal(pod *corev1.Pod, now time.Time) (past *mlx.Unschedulable, wait time.Duration) {
+	u, ok := unschedulable(pod)
+	if !ok {
+		return nil, 0
+	}
+	if left := rankUnschedulableGrace - now.Sub(u.Since); left > 0 {
+		return nil, left
+	}
+	return &u, 0
+}
+
 // unschedulableRecheck is how soon the earliest scheduler refusal still inside
 // rankUnschedulableGrace leaves it, so the reconcile that reports it is not
 // left to the next unrelated event. ok is false when no refusal is pending.
 func unschedulableRecheck(pods []corev1.Pod, now time.Time) (wait time.Duration, ok bool) {
 	for i := range pods {
-		u, refused := unschedulable(&pods[i])
-		if !refused {
-			continue
-		}
-		left := rankUnschedulableGrace - now.Sub(u.Since)
+		_, left := rankRefusal(&pods[i], now)
 		if left <= 0 {
 			continue
 		}

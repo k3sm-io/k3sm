@@ -208,10 +208,14 @@ func DeriveShardedStatus(m *mlxv1alpha1.MLXModel, obs ShardObservation, opts Sta
 		// A rank the scheduler will not bind holds the gang back for a reason
 		// no pod phase shows: it is Pending either way. Name it, but leave
 		// ShardsPlaced alone: the placement stands and nothing is re-placed.
-		if u, name := unschedulableRank(obs.Pods); u != nil {
+		// It only refines a plain Pending: a rank that is crashing or cannot
+		// pull its image says more, and keeps its own reason. The scheduler's
+		// text goes through faultText so a long one cannot push the message
+		// past the condition's length limit.
+		if u, name := unschedulableRank(obs.Pods); u != nil && reason == ReasonPending {
 			ready, reason = false, ReasonRankUnschedulable
 			message = fmt.Sprintf("rank pod %s cannot be scheduled since %s: %s",
-				name, u.Since.UTC().Format(time.RFC3339), u.Message)
+				name, u.Since.UTC().Format(time.RFC3339), faultText(u.Message))
 		}
 		set(mlxv1alpha1.MLXModelConditionReady, ready, reason, message)
 	}

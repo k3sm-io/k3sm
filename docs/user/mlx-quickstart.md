@@ -96,7 +96,9 @@ replica died), `Crashing` (the serving container keeps exiting or cannot start; 
 replica, the last exit code and the error), `ImagePullFailed` (the serving image cannot be pulled),
 `RankUnschedulable` (a sharded model's rank Pod has waited more than 30 seconds for the scheduler to
 place it; the message names the rank and quotes the scheduler, and the model reads `Pending`),
-`ScaledToZero` (you set `replicas: 0`).
+`ScaledToZero` (you set `replicas: 0`). On a sharded model, `ShardsPlaced=True` means the operator
+has decided where each rank runs, not that the scheduler has bound every rank Pod to its node, which
+is why it can sit beside `RankUnschedulable`.
 
 There is no liveness probe on the serving pod, because a first start is an unbounded download and a
 probe that killed it would restart the download from zero.

@@ -203,6 +203,37 @@ func TestShardedUnschedulableRankIsReported(t *testing.T) {
 	}
 }
 
+// TestShardedUnschedulableInsideGraceRequeues: a reconcile that sees a refusal
+// still inside the grace schedules the model again for the moment it leaves
+// it, and one that sees only a refusal past the grace does not.
+func TestShardedUnschedulableInsideGraceRequeues(t *testing.T) {
+	h := shardedHarness(t, shardedModel(2, mlxv1alpha1.MLXDistributedBackendRing), twoMacs(), nil)
+	h.reconcile(t)
+	q := h.recordRequeues()
+
+	h.setUnschedulable(t, 1, rankUnschedulableGrace-7*time.Second)
+	h.reconcile(t)
+	if !hasRequeue(q.take(), key(), 7*time.Second) {
+		t.Errorf("no requeue of %s after 7s for a refusal 7s short of the grace", key())
+	}
+
+	h.setUnschedulable(t, 1, rankUnschedulableGrace+time.Second)
+	h.reconcile(t)
+	if got := q.take(); hasRequeue(got, key(), time.Second) || hasRequeue(got, key(), 0) {
+		t.Errorf("requeues %v for a refusal already past the grace", got)
+	}
+}
+
+// hasRequeue reports whether rs holds an AddAfter of k after d.
+func hasRequeue(rs []requeue, k string, d time.Duration) bool {
+	for _, r := range rs {
+		if r.key == k && r.after == d {
+			return true
+		}
+	}
+	return false
+}
+
 // TestUnschedulableRecheck: the requeue fires when the earliest refusal still
 // inside the grace leaves it, and not at all once every refusal is past it.
 func TestUnschedulableRecheck(t *testing.T) {

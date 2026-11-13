@@ -36,6 +36,9 @@ func TestDeriveShardedStatus(t *testing.T) {
 	ready := func(name string) PodState {
 		return PodState{Name: name, Phase: corev1.PodRunning, Ready: true, Revision: "h"}
 	}
+	// A scheduler message lists every node's verdict; on a large cluster it
+	// runs past the CRD's 1024-character condition message limit.
+	longSched := strings.Repeat("0/40 nodes are available: 1 Insufficient mlx.k3sm.io/gpu.\n", 40)
 	cases := []struct {
 		name      string
 		obs       ShardObservation
@@ -78,6 +81,18 @@ func TestDeriveShardedStatus(t *testing.T) {
 				Unschedulable: &Unschedulable{Message: "0/2 nodes are available", Since: now.Add(-time.Minute)}}}},
 			wantReady: metav1.ConditionFalse, wantRsn: ReasonRankUnschedulable, wantPhase: mlxv1alpha1.MLXModelPhasePending, wantLinks: ReasonLinksUp,
 			wantMsg: "rank pod m-rank-1 cannot be scheduled since 2026-10-04T23:59:00Z: 0/2 nodes are available"},
+		{name: "long_scheduler_message_is_capped", obs: ShardObservation{Desired: 2, Placed: true, SpecHash: "h",
+			Pods: []PodState{ready("m-rank-0"), {Name: "m-rank-1", Phase: corev1.PodPending, Revision: "h",
+				Unschedulable: &Unschedulable{Message: longSched, Since: now.Add(-time.Minute)}}}},
+			wantReady: metav1.ConditionFalse, wantRsn: ReasonRankUnschedulable, wantPhase: mlxv1alpha1.MLXModelPhasePending, wantLinks: ReasonLinksUp,
+			wantMsg: "rank pod m-rank-1 cannot be scheduled since 2026-10-04T23:59:00Z: 0/40 nodes are available"},
+		{name: "crashing_rank_outranks_unschedulable_rank", obs: ShardObservation{Desired: 2, Placed: true, SpecHash: "h",
+			Pods: []PodState{
+				{Name: "m-rank-0", Phase: corev1.PodRunning, Revision: "h",
+					Container: ContainerState{WaitingReason: "CrashLoopBackOff", Terminated: true, ExitCode: 1}},
+				{Name: "m-rank-1", Phase: corev1.PodPending, Revision: "h",
+					Unschedulable: &Unschedulable{Message: "0/2 nodes are available", Since: now.Add(-time.Minute)}}}},
+			wantReady: metav1.ConditionFalse, wantRsn: ReasonCrashing, wantPhase: mlxv1alpha1.MLXModelPhaseFailed, wantLinks: ReasonLinksUp, wantMsg: "m-rank-0"},
 		{name: "stale_rank_is_not_ready", obs: ShardObservation{Desired: 2, Placed: true, SpecHash: "new",
 			Pods: []PodState{ready("m-rank-0"), ready("m-rank-1")}},
 			wantReady: metav1.ConditionFalse, wantRsn: ReasonPending, wantPhase: mlxv1alpha1.MLXModelPhasePending, wantLinks: ReasonLinksUp},
@@ -90,6 +105,14 @@ func TestDeriveShardedStatus(t *testing.T) {
 			r := meta.FindStatusCondition(s.Conditions, mlxv1alpha1.MLXModelConditionReady)
 			if r == nil || r.Status != tc.wantReady || r.Reason != tc.wantRsn {
 				t.Fatalf("Ready = %+v, want %s/%s", r, tc.wantReady, tc.wantRsn)
+			}
+			// The CRD caps every condition message at 1024 characters; a
+			// longer one fails the whole status write.
+			if n := len([]rune(r.Message)); n > 1024 {
+				t.Errorf("Ready message is %d characters, want at most 1024", n)
+			}
+			if strings.Contains(r.Message, "\n") {
+				t.Errorf("Ready message %q spans lines", r.Message)
 			}
 			if s.Phase != tc.wantPhase {
 				t.Errorf("phase = %s, want %s", s.Phase, tc.wantPhase)
