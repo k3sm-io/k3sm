@@ -223,10 +223,43 @@ class LRUPromptCache:
 PY
 }
 
+# stage_stale SITE LOCK prints one line per engine package whose staged version
+# (the dist-info directory name under SITE) differs from the version LOCK pins,
+# and returns 1 when any does. It runs no interpreter and uses no network; a
+# package with no dist-info or no pin is not compared.
+stage_stale() {
+	local site="$1" lock="$2" stale=0 mod pkg d staged pinned
+	for mod in mlx_lm vllm_mlx; do
+		pkg="${mod//_/-}"
+		staged=""
+		for d in "$site/$mod"-*.dist-info; do
+			[ -d "$d" ] || continue
+			staged="${d##*/"$mod"-}"; staged="${staged%.dist-info}"
+			break
+		done
+		pinned="$(sed -n "s/^$pkg==\([^ ;\\]*\).*/\1/p" "$lock" | head -1)"
+		[ -n "$staged" ] && [ -n "$pinned" ] || continue
+		if [ "$staged" != "$pinned" ]; then
+			echo "staged $mod $staged is not the pinned $pkg $pinned (rebuild with hack/images/mlx-serve/build.sh)"
+			stale=1
+		fi
+	done
+	return "$stale"
+}
+
 # rung_9a is rung 9a (described where it is called); it needs the driver
 # write_engine_source writes.
 rung_9a() {
-	if [ -x "$STAGED/bin/python3.12" ] && [ -d "$STAGED/lib/python3.12/site-packages/mlx_lm" ]; then
+	local stale
+	if [ -x "$STAGED/bin/python3.12" ] && [ -d "$STAGED/lib/python3.12/site-packages/mlx_lm" ] &&
+		! stale="$(stage_stale "$STAGED/lib/python3.12/site-packages" "$LOCK")"; then
+		stale="$(echo "$stale" | paste -sd ';' - | sed 's/;/; /g')"
+		if [ "$STAGED_REQUIRED" = 1 ]; then
+			ladder no "9a.stale  --staged, but the $stale"
+		else
+			ladder skip "9a.stale  $stale"
+		fi
+	elif [ -x "$STAGED/bin/python3.12" ] && [ -d "$STAGED/lib/python3.12/site-packages/mlx_lm" ]; then
 		ALIAS_CHECKS=0
 		src_out="$(cd "$WORK" && PYTHONDONTWRITEBYTECODE=1 "$STAGED/bin/python3.12" -I -B "$WORK/engine-source.py" "$HERE" "$STAGED/lib/python3.12/site-packages" 2>"$WORK/engine-real.err")"
 		while read -r verdict name; do
@@ -2784,6 +2817,34 @@ done
 # without a socket over an empty Hub cache. With --staged a missing tree is a
 # failure, not a skip.
 rung_9a
+
+# ---- 10.stale — rung 9a's staged-version check, against fake stages -----------
+SF="$WORK/stale-fake"
+mkdir -p "$SF/match/mlx_lm-0.32.2.dist-info" "$SF/match/vllm_mlx-0.5.0.dist-info" "$SF/old/mlx_lm-0.31.3.dist-info"
+if stage_stale "$SF/match" "$LOCK" > /dev/null; then
+	ladder ok "10.stale.match  a stage at the pinned versions proceeds"
+else
+	ladder no "10.stale.match  a stage at the pinned versions proceeds"
+fi
+SF_MSG="$(stage_stale "$SF/old" "$LOCK")"
+SF_SKIP="$(printf '%s\n' "$SF_MSG" | grep -c 'staged mlx_lm 0.31.3 is not the pinned mlx-lm .*build.sh')"
+if [ -n "$SF_MSG" ] && [ "$SF_SKIP" = 1 ] && ! stage_stale "$SF/old" "$LOCK" > /dev/null; then
+	ladder ok "10.stale.skip  a stale stage is reported with both versions and the rebuild command"
+else
+	ladder no "10.stale.skip  a stale stage is reported with both versions and the rebuild command (got: $SF_MSG)"
+fi
+mkdir -p "$SF/old/bin" "$SF/old/lib/python3.12/site-packages"
+: > "$SF/old/bin/python3.12"; chmod +x "$SF/old/bin/python3.12"
+mv "$SF/old/mlx_lm-0.31.3.dist-info" "$SF/old/lib/python3.12/site-packages/"
+mkdir -p "$SF/old/lib/python3.12/site-packages/mlx_lm"
+SF_LOOSE="$(STAGED="$SF/old" STAGED_REQUIRED=0 rung_9a)"
+SF_STRICT="$(STAGED="$SF/old" STAGED_REQUIRED=1 rung_9a)"
+if printf '%s\n' "$SF_LOOSE" | grep -q '^SKIP  9a\.stale  staged mlx_lm 0\.31\.3 is not the pinned mlx-lm ' &&
+	printf '%s\n' "$SF_STRICT" | grep -q '^FAIL  9a\.stale  --staged, but the staged mlx_lm 0\.31\.3 is not the pinned mlx-lm '; then
+	ladder ok "10.stale.rung  mismatch skips 9a without --staged and fails it with --staged"
+else
+	ladder no "10.stale.rung  mismatch skips 9a without --staged and fails it with --staged (got: $SF_LOOSE / $SF_STRICT)"
+fi
 
 # ---- 10 — the stage Job (stage-job.sh render) --------------------------------
 # A golden check of what the cluster is asked to run. The uv pin is repeated
