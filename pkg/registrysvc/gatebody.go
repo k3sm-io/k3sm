@@ -52,9 +52,11 @@ var errUpstreamBodyStalled = errors.New("the local registry sent no response byt
 type progressBody struct {
 	body    io.ReadCloser
 	window  time.Duration
-	onStall func()
+	onStall func(passed int64, elapsed time.Duration)
+	wrapped time.Time // when the body was wrapped
 
 	mu       sync.Mutex
+	passed   int64       // bytes read from the upstream body so far
 	timer    *time.Timer // nil until the first Read
 	reading  bool        // a Read is waiting on the upstream body
 	done     bool        // closed, ended, or cut: no timer is armed again
@@ -66,9 +68,10 @@ type progressBody struct {
 }
 
 // newProgressBody wraps body. No timer runs until the first Read. onStall
-// runs once, before the body is closed, when the body is cut.
-func newProgressBody(body io.ReadCloser, window time.Duration, onStall func()) *progressBody {
-	return &progressBody{body: body, window: window, onStall: onStall}
+// runs once, before the body is closed, when the body is cut, with the bytes
+// passed so far and the time since the body was wrapped.
+func newProgressBody(body io.ReadCloser, window time.Duration, onStall func(passed int64, elapsed time.Duration)) *progressBody {
+	return &progressBody{body: body, window: window, onStall: onStall, wrapped: time.Now()}
 }
 
 // stall is the timer's callback. A firing that raced a Read which already
@@ -80,8 +83,9 @@ func (p *progressBody) stall() {
 		return
 	}
 	p.done, p.stalled = true, true
+	passed := p.passed
 	p.mu.Unlock()
-	p.onStall()
+	p.onStall(passed, time.Since(p.wrapped))
 	p.closeBody()
 }
 
@@ -108,6 +112,7 @@ func (p *progressBody) Read(b []byte) (int, error) {
 
 	p.mu.Lock()
 	p.reading = false
+	p.passed += int64(n)
 	if p.timer != nil {
 		p.timer.Stop()
 	}

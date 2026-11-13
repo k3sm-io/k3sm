@@ -288,9 +288,10 @@ func (g *gate) modifyResponse(resp *http.Response) error {
 		if resp.Request != nil {
 			method, path = resp.Request.Method, resp.Request.URL.Path
 		}
-		resp.Body = newProgressBody(resp.Body, g.bodyProgress, func() {
+		resp.Body = newProgressBody(resp.Body, g.bodyProgress, func(passed int64, elapsed time.Duration) {
 			g.log.Warn("ingest registry gate cut a local registry response that stopped sending",
-				"target", g.upstream, "method", method, "path", path, "window", g.bodyProgress)
+				"target", g.upstream, "method", method, "path", path, "window", g.bodyProgress,
+				"bytes", passed, "elapsed", elapsed)
 		})
 	}
 	return nil
