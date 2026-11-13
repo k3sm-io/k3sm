@@ -613,10 +613,14 @@ func (osStatusFS) ReadTail(path string, lines int) ([]string, error) {
 	return out, err
 }
 
-// statusFSReadMax bounds every osStatusFS.ReadFile. The files status reads
-// whole (records, certificates, kubeconfigs, plists, summaries) are a few KiB;
-// anything near 1 MiB is not one k3sm wrote.
-const statusFSReadMax = 1 << 20
+// statusFSReadMax bounds every osStatusFS.ReadFile. Most files status reads
+// whole (certificates, kubeconfigs, plists, summaries) are a few KiB, but two
+// grow with the cluster and have no cap at their writers: the services record
+// (one entry per Service VIP) and the image-migration journal (one record per
+// node-store image). The bound is sized so neither is refused on a large
+// node, while a planted file still cannot make a root status read without
+// limit.
+const statusFSReadMax = 16 << 20
 
 // ReadFile reads a whole small file through boundedread.ReadFileBounded.
 // `k3sm status` may run as root and reads files in trees the service user can
