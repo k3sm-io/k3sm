@@ -27,6 +27,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -41,7 +42,7 @@ import (
 // is not cut.
 func TestGateCutsUpstreamStalledAfterHeaders(t *testing.T) {
 	const (
-		window = 500 * time.Millisecond
+		window = time.Second
 		// cadence is a tenth of the window, so a loaded host has room.
 		cadence = window / 10
 		// bound is generous: the cut is due one window after the last byte.
@@ -187,7 +188,7 @@ func TestGateCutsUpstreamStalledAfterHeaders(t *testing.T) {
 // whole body and is never cut; an upstream that blocks a Read for the window
 // is cut once, and that Read and every later one fail with the stall error.
 func TestProgressBodyTimesOnlyUpstreamReads(t *testing.T) {
-	const window = 100 * time.Millisecond
+	const window = 200 * time.Millisecond
 	t.Run("slow consumer", func(t *testing.T) {
 		const body = "abcd"
 		var stalls atomic.Int32
@@ -240,4 +241,102 @@ func TestProgressBodyTimesOnlyUpstreamReads(t *testing.T) {
 			t.Errorf("stall callback ran %d times, want exactly 1", n)
 		}
 	})
+}
+
+// TestProgressBodyFirstReadBlocks: an upstream that never sends a byte is cut
+// after one window on the first Read, once, and that Read returns the stall
+// error.
+func TestProgressBodyFirstReadBlocks(t *testing.T) {
+	const window = 200 * time.Millisecond
+	pr, pw := io.Pipe()
+	defer pw.Close()
+	var stalls atomic.Int32
+	var passed atomic.Int64
+	p := newProgressBody(pr, window, func(n int64, _ time.Duration) { passed.Store(n); stalls.Add(1) })
+	defer p.Close()
+	start := time.Now()
+	n, err := p.Read(make([]byte, 8))
+	if n != 0 || !errors.Is(err, errUpstreamBodyStalled) {
+		t.Fatalf("first read = %d, %v; want 0, %v", n, err, errUpstreamBodyStalled)
+	}
+	if took := time.Since(start); took < window {
+		t.Errorf("cut after %v, before the %v window", took, window)
+	}
+	if c := stalls.Load(); c != 1 {
+		t.Errorf("stall callback ran %d times, want exactly 1", c)
+	}
+	if passed.Load() != 0 {
+		t.Errorf("stall reported %d bytes passed, want 0", passed.Load())
+	}
+}
+
+// TestProgressBodyCloseDuringRead: closing the body while a Read is blocked
+// ends that Read and the stall callback never runs.
+func TestProgressBodyCloseDuringRead(t *testing.T) {
+	const window = 200 * time.Millisecond
+	pr, pw := io.Pipe()
+	defer pw.Close()
+	var stalls atomic.Int32
+	p := newProgressBody(pr, window, func(int64, time.Duration) { stalls.Add(1) })
+	var wg sync.WaitGroup
+	wg.Add(1)
+	readErr := make(chan error, 1)
+	go func() {
+		defer wg.Done()
+		_, err := p.Read(make([]byte, 8))
+		readErr <- err
+	}()
+	time.Sleep(window / 4)
+	if err := p.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	select {
+	case err := <-readErr:
+		if err == nil || errors.Is(err, errUpstreamBodyStalled) {
+			t.Errorf("read ended with %v, want the close error and not the stall error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the blocked Read did not end after Close")
+	}
+	wg.Wait()
+	time.Sleep(window * 3 / 2)
+	if n := stalls.Load(); n != 0 {
+		t.Errorf("stall callback ran %d times after Close, want 0", n)
+	}
+}
+
+// TestGateDefaultBodyProgress: a gate built with a zero config watches
+// response bodies for the relay's progress window.
+func TestGateDefaultBodyProgress(t *testing.T) {
+	g := newGate(gateConfig{Logger: slog.New(slog.NewJSONHandler(io.Discard, nil))})
+	if g.bodyProgress != relayWriteProgress {
+		t.Errorf("default body progress = %v, want relayWriteProgress %v", g.bodyProgress, relayWriteProgress)
+	}
+}
+
+// TestWatchesBody: only a response with a body, that is not a HEAD answer and
+// not a protocol switch, is watched.
+func TestWatchesBody(t *testing.T) {
+	body := func() io.ReadCloser { return io.NopCloser(strings.NewReader("x")) }
+	get := &http.Request{Method: http.MethodGet}
+	cases := []struct {
+		name string
+		resp *http.Response
+		want bool
+	}{
+		{"HEAD request", &http.Response{StatusCode: 200, Body: body(), ContentLength: 1, Request: &http.Request{Method: http.MethodHead}}, false},
+		{"Content-Length 0", &http.Response{StatusCode: 200, Body: body(), ContentLength: 0, Request: get}, false},
+		{"http.NoBody", &http.Response{StatusCode: 200, Body: http.NoBody, ContentLength: 1, Request: get}, false},
+		{"nil body", &http.Response{StatusCode: 200, Body: nil, ContentLength: 1, Request: get}, false},
+		{"101 switching protocols", &http.Response{StatusCode: http.StatusSwitchingProtocols, Body: body(), ContentLength: 1, Request: get}, false},
+		{"nil request", &http.Response{StatusCode: 200, Body: body(), ContentLength: 1}, true},
+		{"plain GET 200", &http.Response{StatusCode: 200, Body: body(), ContentLength: 1, Request: get}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := watchesBody(tc.resp); got != tc.want {
+				t.Errorf("watchesBody = %v, want %v", got, tc.want)
+			}
+		})
+	}
 }
