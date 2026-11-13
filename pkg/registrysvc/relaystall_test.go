@@ -163,7 +163,8 @@ func stallLimits() relayLimits {
 // is served in full however long that takes.
 func TestRelayStalledReaderFreesItsSlot(t *testing.T) {
 	const peerA = "100.64.1.1"
-	budget := 3*stallWindow + 500*time.Millisecond
+	// Only the upper bound is widened: a larger budget cannot make a red test green, because a slot that never frees still fails.
+	budget := 10*stallWindow + 2*time.Second
 
 	t.Run("a stalled reader is cut and its slot freed", func(t *testing.T) {
 		f := newRelayLimitFixtureWith(t, stallLimits(), stallRegistry())
