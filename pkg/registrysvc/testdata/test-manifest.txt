@@ -72,6 +72,7 @@ TestPayloadBinaries deleted the zot child left the build, and its staging with i
 TestPlanRepositoryFailsClosed kept prune works on the store, which is unchanged
 TestPreflightPortRefusesAHeldPort kept the behaviour it pins is unchanged by the child switch
 TestProcargsArgv kept the behaviour it pins is unchanged by the child switch
+TestProgressBodyTimesOnlyUpstreamReads added the gate's body progress clock runs only inside a Read on the registry, so a slow client is never cut
 TestProvisionWritesTheChildsConfig added new with the child switch
 TestPruneDeleteIsConditionalOnPlannedState kept prune works on the store, which is unchanged
 TestPruneForceCollectsThePrunedRepositories added a forced prune sweeps the repositories it deleted from
