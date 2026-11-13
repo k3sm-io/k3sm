@@ -6,6 +6,7 @@ FuzzGateAndServerAgree added the differential over arbitrary names and mount sou
 TestAdvertisement kept the relay and cluster publication do not touch the child
 TestApplyServeCredential added new with the child switch
 TestAwaitNeedsA200 added new with the child switch
+TestBindProgressLogsUnboundedConnection added a writer that cannot take a deadline is served and logged once as unbounded
 TestCheckDataVolume added new with the child switch
 TestChildCommand added new with the child switch
 TestClassify rewritten the gate reads names through the shared validator
