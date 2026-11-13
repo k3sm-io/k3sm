@@ -272,6 +272,11 @@ generation, and a new one if it is served and then refused again:
   model does not fit the node's GPU.
 - `ArtifactUnresolved`: the `spec.artifact` reference cannot be resolved, whether the registry
   cannot be reached or it refuses or cannot satisfy the reference. `Ready` still says `InvalidSpec`.
+- `InvalidSpec` naming `--adapter-path` or `--draft-model`: a model that sets `spec.artifact` sets
+  either flag (or an unambiguous abbreviation) in `spec.runtime.args` to anything but an absolute
+  path. `Ready` is `False`, a Warning Event is recorded, and no workload is created. Mount the
+  weights and pass their absolute path; see
+  [Models in the cluster registry](models.md#models-in-the-cluster-registry).
 
 ## A Pod's Image Will Not Pull
 
