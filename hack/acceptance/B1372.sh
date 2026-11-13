@@ -69,9 +69,13 @@
 #         view is gone and free space on both caches and the registry store is back
 #         at t.0's within 1% of the model
 #   f.1   cleanup, green or red: the namespace (MLXModels, ConfigMap, client and
-#         client Pods), the run's Released PersistentVolumes and its storage dir on
-#         each node (a symlink in its place, dangling or not, is unlinked and its
-#         target never touched), the pushed tag, the remote scratch dirs; each step that fails is
+#         client Pods), the run's PersistentVolumes (every one whose claimRef is
+#         in the run's namespace, whatever its phase: one still Bound is waited for
+#         up to K3SM_MST_RECLAIM_TIMEOUT to turn Released, the Released ones are
+#         deleted, and one left Bound is red as "still Bound"; another namespace's
+#         are never touched) and its storage dir on each node (a symlink in its
+#         place, dangling or not, is unlinked and its target never touched), the
+#         pushed tag, the remote scratch dirs; each step that fails is
 #         named and fails the run, and none is skipped because another failed (a
 #         failed PersistentVolume list still leaves each node's storage dir removed). Each is marked for cleanup BEFORE the
 #         call that makes it, so a call that times out after the server acted is
@@ -116,7 +120,8 @@
 #   K3SM_MST_PYTHON              python in the serving image (default python3)
 #   K3SM_MST_STEP_TIMEOUT        seconds for one remote or kubectl step (default 120, <=240)
 #   K3SM_MST_READY_TIMEOUT       seconds for a model to come Ready (default 900)
-#   K3SM_MST_RECLAIM_TIMEOUT     seconds t.7 waits for space to come back (default 240)
+#   K3SM_MST_RECLAIM_TIMEOUT     seconds t.7 waits for space to come back, and f.1 for the
+#                                run's Bound PersistentVolumes to turn Released (default 240)
 #   K3SM_MST_POLL                seconds between polls (default 2)
 #   K3SM_MST_DNS_TIMEOUT         seconds t.4 waits for a node to resolve a Service name (default 120)
 #   K3SM_MST_MIN_FREE            bytes each node cache volume must have free at t.0
@@ -1294,13 +1299,14 @@ f1() {
 	return "$rc"
 }
 
-# released_pvs: the Released PersistentVolumes whose claimRef is in the run's namespace.
-released_pvs() {
+# ns_pvs: `<name> <phase>` of every PersistentVolume whose claimRef is in the run's
+# namespace, whatever its phase; another namespace's volumes are never listed.
+ns_pvs() {
 	kc get pv -o json | py '
 import json, sys
 for p in json.loads(sys.stdin.read()).get("items", []):
-    if p.get("status", {}).get("phase") == "Released" and (p.get("spec", {}).get("claimRef") or {}).get("namespace") == sys.argv[1]:
-        print(p["metadata"]["name"])
+    if (p.get("spec", {}).get("claimRef") or {}).get("namespace") == sys.argv[1]:
+        print(p["metadata"]["name"], p.get("status", {}).get("phase") or "unknown")
 ' "$NS"
 }
 
@@ -1317,25 +1323,43 @@ fi
 [ ! -e "$d" ] && [ ! -L "$d" ]
 '
 
-# storage_clean <rung> <delete|check>: the run's Released PVs and the namespace's storage
-# dir on each node are gone (removed first when delete); a survivor is a reason.
+# storage_clean <rung> <delete|check>: the run's PVs and the namespace's storage dir on
+# each node are gone (removed first when delete); a survivor is a reason.
 storage_clean() {
-	local rc=0 pvs pv h
+	local rc=0 pvs pv h end left
 	[ -n "$NS" ] || return 0
 	# The volumes and the storage dirs are independent: a failed list is red, and each
 	# node's storage dir is still removed.
-	if ! pvs="$(released_pvs)"; then
+	if ! pvs="$(ns_pvs)"; then
 		bad "$1: list PersistentVolumes"
 		rc=1
 	else
 		if [ "$2" = delete ]; then
-			for pv in $pvs; do
-				kc delete pv "$pv" --wait=false >/dev/null 2>&1 || true
+			# A volume whose claim went with the namespace turns Released on its own; one
+			# still Bound is waited for up to RECLAIM_TIMEOUT, never deleted while Bound.
+			if awk '$2 == "Bound" {f = 1} END {exit !f}' <<<"$pvs"; then
+				echo "$1: PersistentVolume(s) of namespace $NS still Bound: $(oneline "$(awk '$2 == "Bound" {print $1}' <<<"$pvs")"); waiting up to ${RECLAIM_TIMEOUT}s for Released"
+				end=$(($(date +%s) + RECLAIM_TIMEOUT))
+				while awk '$2 == "Bound" {f = 1} END {exit !f}' <<<"$pvs" && [ "$(date +%s)" -lt "$end" ]; do
+					sleep "$POLL"
+					pvs="$(ns_pvs)" || { bad "$1: list PersistentVolumes"; rc=1; pvs=""; break; }
+				done
+			fi
+			while read -r pv; do
+				[ -n "$pv" ] || continue
+				kc delete pv "$pv" --wait=false </dev/null >/dev/null 2>&1 || true
 				echo "$1: deleted Released PersistentVolume $pv of namespace $NS"
-			done
-			pvs="$(released_pvs)" || { bad "$1: list PersistentVolumes"; rc=1; pvs=""; }
+			done <<<"$(awk '$2 == "Released" {print $1}' <<<"$pvs")"
+			if [ "$rc" = 0 ]; then
+				pvs="$(ns_pvs)" || { bad "$1: list PersistentVolumes"; rc=1; pvs=""; }
+			fi
 		fi
-		[ -z "$pvs" ] || { bad "$1: Released PersistentVolume(s) of namespace $NS survive: $(oneline "$pvs")"; rc=1; }
+		left="$(awk '$2 == "Bound" {print $1}' <<<"$pvs")"
+		[ -z "$left" ] || { bad "$1: PersistentVolume(s) of namespace $NS still Bound: $(oneline "$left")"; rc=1; }
+		left="$(awk '$2 == "Released" {print $1}' <<<"$pvs")"
+		[ -z "$left" ] || { bad "$1: Released PersistentVolume(s) of namespace $NS survive: $(oneline "$left")"; rc=1; }
+		left="$(awk 'NF && $2 != "Bound" && $2 != "Released" {print $1 " (" $2 ")"}' <<<"$pvs")"
+		[ -z "$left" ] || { bad "$1: PersistentVolume(s) of namespace $NS survive: $(oneline "$left")"; rc=1; }
 	fi
 	for h in "$SERVER" "$WORKER"; do
 		rroot "$h" "$STEP_TIMEOUT" "$STORAGE_SCRIPT" "$STORAGE_ROOT" "$NS" "$2" ||
@@ -1693,6 +1717,12 @@ def kubectl(argv):
             rc = 1
         else:
             s["ns"].append(pos[2])
+            if "pv-bound" in BRK or "pv-bound-late" in BRK:
+                # The run's volume still Bound when f.1 starts, and another namespace's
+                # Bound volume that must never be touched.
+                for n in (pos[2], "other-ns"):
+                    s.setdefault("pvs", {})["pv-" + n] = {"metadata": {"name": "pv-" + n},
+                        "spec": {"claimRef": {"namespace": n, "name": "data"}}, "status": {"phase": "Bound"}}
             if "pv-leftover" in BRK or "pv-stuck" in BRK or "pv-list-fails" in BRK:
                 # A volume each of this run's namespace and another's, both Released,
                 # and each namespace's storage dir: only the run's may be removed.
@@ -1759,6 +1789,14 @@ def kubectl(argv):
             print("error: the server is currently unable to handle the request", file=sys.stderr)
             rc = 1
         else:
+            if "pv-bound-late" in BRK:
+                # Released a few gets after the run's namespace is gone.
+                for p in s.get("pvs", {}).values():
+                    c = p["spec"]["claimRef"]["namespace"]
+                    if c != "other-ns" and c not in s["ns"]:
+                        s["late_gets"] = s.get("late_gets", 0) + 1
+                        if s["late_gets"] >= 3:
+                            p["status"]["phase"] = "Released"
             out({"items": list(s.get("pvs", {}).values())})
     elif verb == "get" and pos[1] == "events":
         # One Event per Pod, and a decoy per Pod: the same name, another uid (an
@@ -2209,6 +2247,20 @@ self_test() {
 	# A Released PV of the run that will not delete fails the cleanup.
 	fake_run pv-stuck pv-stuck 1 "f.1: FAIL"
 	has "pv-stuck: named" "$(cat "$RUN_DIR/out")" "Released PersistentVolume(s) of namespace mst-"
+
+	# A run's volume still Bound after the reclaim wait fails f.1, named, and is not
+	# deleted; another namespace's Bound volume is untouched.
+	fake_run pv-bound pv-bound 1 "f.1: FAIL"
+	has "pv-bound: named" "$(awk -F '\t' '$1 == "f.1" && $2 == "FAIL"' "$RUN_DIR/ev/result.tsv" 2>/dev/null)" "still Bound"
+	[ "$(py 'import json,sys; v=json.load(open(sys.argv[1])).get("pvs", {}); print(" ".join("%s=%s" % ("run" if k.startswith("pv-mst-") else k, p["status"]["phase"]) for k, p in sorted(v.items())))' "$RUN_DIR/state/k8s.json")" = "run=Bound pv-other-ns=Bound" ] ||
+		{ echo "self-test FAIL: pv-bound: the PVs left are not exactly the run's and the other namespace's, both Bound"; bad=1; }
+	if grep -q 'delete pv' "$RUN_DIR/state/calls"; then echo "self-test FAIL: pv-bound: a Bound PersistentVolume was deleted"; bad=1; fi
+	# One that turns Released during the wait is deleted, and the run is green.
+	fake_run pv-bound-late pv-bound-late 0 "result: PASS"
+	has "pv-bound-late: waited" "$(cat "$RUN_DIR/ev/f.1.log")" "still Bound"
+	has "pv-bound-late: deleted" "$(cat "$RUN_DIR/ev/f.1.log")" "deleted Released PersistentVolume pv-mst-"
+	[ "$(py 'import json,sys; print(" ".join(sorted(json.load(open(sys.argv[1])).get("pvs", {}))))' "$RUN_DIR/state/k8s.json")" = pv-other-ns ] ||
+		{ echo "self-test FAIL: pv-bound-late: the PVs left are not exactly the other namespace's"; bad=1; }
 
 	# A failed PersistentVolume list fails the cleanup, and each node's storage dir of the
 	# run is still removed (another namespace's kept).
