@@ -1250,14 +1250,15 @@ func TestReadIssuedBeforeAFailedEvictionStopKeepsTheLiveStatus(t *testing.T) {
 			case <-time.After(30 * time.Second):
 				t.Fatal("the held read never returned")
 			}
-			if tr.stoppingStatus() == nil {
-				t.Errorf("the %s issued before the stop dropped the failed stop's live status", reader.name)
-			}
 			st, err := reader.read(ctx, h.r)
 			if err != nil {
 				t.Fatalf("%s after the late read: %v", reader.name, err)
 			}
 			assertRunningNotWaiting(t, reader.name+" after the late read", st)
+			// Diagnostic only: names the internal cause when the public read above fails.
+			if tr.stoppingStatus() == nil {
+				t.Errorf("the %s issued before the stop dropped the failed stop's live status", reader.name)
+			}
 		})
 	}
 }
