@@ -105,8 +105,9 @@
 #   K3SM_LAB_PRINT_MANIFESTS=1 print the pod manifests and exit; contacts nothing
 #
 # Evidence: the run log is EVIDENCE_DIR/run.log only (nothing is written into the
-# repository tree; a rerun into the same EVIDENCE_DIR appends, each run opening with
-# a dated "# ==== m17-lab run started" line), with the M11 run-log header (gate,
+# repository tree; an EVIDENCE_DIR whose run.log is not empty is refused, so each
+# run gets its own directory, its log opening with a dated "# ==== m17-lab run
+# started" line), with the M11 run-log header (gate,
 # artifact_sha256, git_sha.<repo>, result) emitted by hack/lab/lib/runlog.sh; a copy of this driver
 # as run sits beside it as EVIDENCE_DIR/m17-interconnect.sh, and the baseline line
 # names each Mac's `k3sm version` next to the binary's sha256;
@@ -753,7 +754,17 @@ pv_claims() { kc get pv -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.sp
 # ns_create — create the test namespace. NS_CREATE_TRIED is set first: a create that
 # timed out after the server applied it still leaves a namespace, so the exit trap
 # deletes and verifies whenever a create was attempted, not only when one succeeded.
+# Ownership first: NS is a fixed name, so before the run's first create (and only
+# then; a later create is the run's own recreate) a namespace already there, or one
+# whose existence cannot be read, refuses the run (exit 2) with NS_CREATE_TRIED
+# still 0, and the exit trap deletes nothing it did not make.
 ns_create() {
+	if [ "$NS_CREATE_TRIED" != 1 ]; then
+		local have rc=0
+		have="$(kc get namespace "$NS" --ignore-not-found -o name 2>/dev/null)" || rc=$?
+		[ "$rc" = 0 ] || refuse_run "${RUNG:-namespace}" "could not read whether namespace $NS already exists (kubectl exit $rc); the run deletes only a namespace it created (BI10)"
+		[ -z "$have" ] || refuse_run "${RUNG:-namespace}" "namespace $NS already exists and this run did not create it; remove it (kubectl delete namespace $NS) or wait for it to finish terminating, then rerun (BI10)"
+	fi
 	NS_CREATE_TRIED=1
 	kc create namespace "$NS" >/dev/null 2>&1
 }
@@ -2061,18 +2072,63 @@ st_teardown_run() (
 # still delete and verify it.
 st_ns_attempted() (
 	NS=k3sm-m17-lab TEARDOWN_WAIT_SECS=0 NS_CREATE_TRIED=0 TEARDOWN_FAILED=0
+	local applied=0
 	sleep() { :; }
 	ns_storage_cleanup() { :; }
 	kc() {
 		case "$*" in
-		"create namespace"*) return 1 ;;
+		"create namespace"*)
+			applied=1
+			return 1
+			;;
 		"get namespace"*jsonpath*) printf 'Active\t' ;;
-		"get namespace"*) echo namespace/k3sm-m17-lab ;;
+		"get namespace"*) [ "$applied" = 0 ] || echo namespace/k3sm-m17-lab ;;
 		esac
 	}
 	ns_create
 	ns_teardown
 	echo "EXIT $(teardown_exit_status "$1" "$TEARDOWN_FAILED")"
+)
+# st_ns_owner <profile> — ns_create's ownership check with the cluster stubbed and
+# the exit trap's namespace step armed, counting every delete and root rm that
+# reaches the stubs. exists: the namespace is there before the run's first create;
+# noread: its existence cannot be read; recreate: the run created it, deleted it
+# (still Terminating) and creates it again, which must not be refused.
+st_ns_owner() (
+	NS=k3sm-m17-lab TEARDOWN_WAIT_SECS=0 PVC_WAIT_SECS=0 NS_CREATE_TRIED=0 TEARDOWN_FAILED=0 RUNG=r2-attach
+	# Not local: the exit trap reads them after the stack has unwound.
+	prof="$1" made=0 creates=0 deletes=0
+	sleep() { :; }
+	refuse_run() {
+		echo "REFUSED($1): $2"
+		exit 2
+	}
+	on_local() { deletes=$((deletes + 1)); }
+	on_peer() { deletes=$((deletes + 1)); }
+	kc() {
+		case "$*" in
+		"create namespace"*)
+			creates=$((creates + 1)) made=1
+			;;
+		"delete "*) deletes=$((deletes + 1)) ;;
+		"get namespace"*jsonpath*) printf 'Terminating\t' ;;
+		"get namespace"*)
+			case "$prof" in
+			noread) return 1 ;;
+			exists) echo namespace/k3sm-m17-lab ;;
+			*) [ "$made" = 0 ] || echo namespace/k3sm-m17-lab ;;
+			esac
+			;;
+		esac
+	}
+	trap 'ns_teardown >/dev/null; echo "CREATES $creates DELETES $deletes"' EXIT
+	ns_create
+	[ "$prof" != recreate ] || {
+		kc delete namespace "$NS"
+		deletes=0
+		ns_create
+	}
+	echo "CREATED"
 )
 
 # st_driver_run <rung> <profile> — the body st_driver runs in a subshell: the
@@ -2338,6 +2394,7 @@ st_r8_run() {
 	kc() {
 		case "$*" in
 		"delete pod"*) [ "$prof" = pods-stuck ] || : >"$r8_dir/.deleted" ;;
+		"get namespace stub --ignore-not-found"*) ;;
 		"get pod -n stub --ignore-not-found"*) [ -e "$r8_dir/.deleted" ] || echo pod/ic-l-local ;;
 		"get meshpeers"*) echo "node-a {}" ;;
 		"logs "*) echo "ICIP=" ;;
@@ -2398,6 +2455,9 @@ self_test_body() {
 	st_out "r9 red: a residue route this run left" "FAIL      [r9] local Mac: doctor ic-residue names nothing this run left: residue this run left: 169.254.0.10/32" st_r9_run "$F/doctor-residue-new.json"
 	st_out "r9 red: a changed boot time is a reboot" "FAIL      [r9] local Mac: no reboot happened" st_r9_run "$F/doctor-clean.json" c
 	st_out "r9 records that the old helper's reply is pinned by the Go test" "RECORDED  [r9] the old helper's Hello reply is pinned by TestOldHelperHelloReplyIsHelperTooOld" st_r9_run "$F/doctor-clean.json"
+	mkdir -p "$tmp/ev-used"
+	echo "# ==== m17-lab run started" >"$tmp/ev-used/run.log"
+	st "K3SM_LAB=1 into an EVIDENCE_DIR holding a run.log exits 2" 0 gate_run 2 "already holds a run.log" K3SM_LAB=1 PEER_SSH=x EVIDENCE_DIR="$tmp/ev-used" K3SM_M17_REMOTE_SCRATCH=/Users/x/scratch --
 	st "K3SM_LAB=1 without a remote scratch exits 2" 0 gate_run 2 "K3SM_M17_REMOTE_SCRATCH is unset" K3SM_LAB=1 PEER_SSH=x EVIDENCE_DIR="$tmp/ev" --
 	st "K3SM_LAB=1 with a remote scratch in /tmp exits 2" 0 gate_run 2 "shared temporary directory" K3SM_LAB=1 PEER_SSH=x EVIDENCE_DIR="$tmp/ev" K3SM_M17_REMOTE_SCRATCH=/tmp/x --
 	st "remote scratch: a private absolute directory" 0 remote_scratch_problem /Users/x/scratch
@@ -2682,6 +2742,12 @@ self_test_body() {
 	st_out "teardown: a clean teardown keeps a green --until stop (4)" "EXIT 4" st_teardown_run clean 4
 	st_out "teardown red: a create that reported failure is still verified (exit 1)" "EXIT 1" st_ns_attempted 0
 	st_out "teardown red: the attempted create's leftover namespace is named" "TEARDOWN-LEFT: namespace k3sm-m17-lab still exists" st_ns_attempted 0
+	st_out "ownership red: a namespace there before the first create refuses the run" "REFUSED(r2-attach): namespace k3sm-m17-lab already exists" st_ns_owner exists
+	st_out "ownership red: the refused run's exit trap deletes nothing" "CREATES 0 DELETES 0" st_ns_owner exists
+	st_out "ownership red: an unreadable namespace refuses the run" "REFUSED(r2-attach): could not read whether namespace k3sm-m17-lab already exists" st_ns_owner noread
+	st_out "ownership red: the unreadable refusal's exit trap deletes nothing" "CREATES 0 DELETES 0" st_ns_owner noread
+	st_out "ownership: the run's own recreate after its own delete is not refused" "CREATED" st_ns_owner recreate
+	st_out "ownership: the recreate reaches the create" "CREATES 2" st_ns_owner recreate
 	st_out "teardown red: a stuck finalizer names the phase and finalizers" 'TEARDOWN-LEFT: namespace k3sm-m17-lab still exists (phase Terminating, finalizers ["lab.k3sm.io/hold"])' st_teardown_run ns-stuck 0
 	st_out "teardown red: a namespace still Active names no finalizers" "TEARDOWN-LEFT: namespace k3sm-m17-lab still exists (phase Active, finalizers none)" st_teardown_run ns-left 0
 	st_out "teardown red: an unreadable phase is printed as unreadable" "still exists (phase unreadable, finalizers unreadable)" st_teardown_run ns-noread 0
@@ -2800,6 +2866,9 @@ for v in PEER_SSH EVIDENCE_DIR; do
 	[ -n "${!v:-}" ] || refuse_run preflight "K3SM_LAB=1 but $v is unset (no defaults: the ssh target is the operator's own Mac, and evidence lives outside any repository) (BI10)"
 done
 case "$EVIDENCE_DIR" in /*) ;; *) refuse_run preflight "EVIDENCE_DIR must be an absolute path (BI10)" ;; esac
+# One run per EVIDENCE_DIR: a second run's log would sit beside the first's header
+# and --verify-twice would read one run's header with another's result line.
+[ ! -s "$EVIDENCE_DIR/run.log" ] || refuse_run preflight "EVIDENCE_DIR $EVIDENCE_DIR already holds a run.log; give each run its own EVIDENCE_DIR (BI10)"
 REMOTE_SCRATCH="${K3SM_M17_REMOTE_SCRATCH:-}"
 why="$(remote_scratch_problem "$REMOTE_SCRATCH")" || refuse_run preflight "K3SM_M17_REMOTE_SCRATCH $why (BI10)"
 # Where payload scripts land on the peer (hack/spike/m17-interconnect/lib.sh reads it).
@@ -2827,10 +2896,10 @@ mkdir -p "$EVIDENCE_DIR" || refuse_run preflight "cannot create $EVIDENCE_DIR (B
 # The driver as run is evidence too; the run log lives only under EVIDENCE_DIR.
 cp -- "$0" "$EVIDENCE_DIR/m17-interconnect.sh" || refuse_run preflight "cannot copy the driver into $EVIDENCE_DIR (BI10)"
 RUN_LOG="$EVIDENCE_DIR/run.log"
-# Appended, so a rerun into the same EVIDENCE_DIR keeps the earlier log; each run
-# opens with a dated line. The exit trap waits (bounded) for this tee to drain.
-exec > >(tee -a "$RUN_LOG") 2>&1
-RUN_LOG_TEE_PID=$!
+# Preflight refused an EVIDENCE_DIR whose run.log is not empty, so one log holds one
+# run; it opens with a dated line. The exit trap waits (bounded) for this tee to drain.
+exec > >(tee "$RUN_LOG") 2>&1
+RUN_LOG_TEE_PID="${!:-}"
 echo "# ==== m17-lab run started $(date -u +%Y-%m-%dT%H:%M:%SZ) (pid $$) ===="
 emit_run_log_header "FAIL (provisional; the final result line below is the verdict, and a log that ends here did not finish)"
 echo "evidence_dir: $EVIDENCE_DIR"
@@ -2889,7 +2958,7 @@ on_exit() {
 	# child still holding the pipe must not hang the exit. The status stays rc.
 	exec >&- 2>&-
 	p=0
-	while kill -0 "$RUN_LOG_TEE_PID" 2>/dev/null && [ "$p" -lt 100 ]; do
+	while [ -n "$RUN_LOG_TEE_PID" ] && kill -0 "$RUN_LOG_TEE_PID" 2>/dev/null && [ "$p" -lt 100 ]; do
 		sleep 0.1
 		p=$((p + 1))
 	done
