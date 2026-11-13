@@ -12,6 +12,19 @@
 # space, the serving process's footprint) and the daemon restart go over SSH, because
 # that evidence lives nowhere public.
 #
+# Named exceptions to public surfaces. These steps run over ssh, as root through
+# `sudo -n`, because no public surface offers them:
+#   - Reads only: the cache dirs and blobs, the cache view, the
+#     partial download, the registry's blob listing for the run's repo (t.1), free
+#     space and its local snapshots (df, tmutil), the serving process's footprint,
+#     the worker daemon's pid (launchctl print) and the node's resolver
+#     (dscacheutil). They are what the rungs measure.
+#   - `launchctl kickstart -k system/<worker label>`, once, in t.3b: the watcher
+#     restarts the worker's node daemon while a partial download exists, to show
+#     the partial survives and the blob still commits.
+#   - The run's own paths: t.2 makes the two scratch dirs, f.1 removes them and
+#     removes <storage root>/<namespace> on both Macs, so nothing of the run stays.
+#
 # Rungs (`--plan` prints them; the first red rung ends the run, every rung not reached
 # is red, and the cleanup f.1 runs green or red):
 #   p.0   preconditions, read-only: K3SM_LAB=1, tools, the environment, an empty
@@ -709,6 +722,8 @@ p0() {
 	fi
 	mkdir -p "$EV" || refuse "cannot create $EV"
 	EV="$(cd "$EV" && pwd)"
+	# The evidence keeps the exact driver that produced it, before any rig step.
+	cp -- "$0" "$EV/B1372.sh" || refuse "cannot copy the driver $0 into $EV"
 
 	# The model, before anything is pushed.
 	[ -d "$MODEL_DIR" ] || refuse "--model-dir $MODEL_DIR is not a directory"
@@ -2152,6 +2167,7 @@ self_test() {
 
 	fake_run happy "" 0 "result: PASS"
 	cleaned happy
+	cmp -s "$SELF" "$RUN_DIR/ev/B1372.sh" || { echo "self-test FAIL: happy: the evidence dir lacks a byte-identical copy of the driver"; bad=1; }
 	has "happy: the storage-root bypass is announced" "$(cat "$RUN_DIR/out")" "SELF-TEST ROOT BYPASS"
 	for out in t.0 t.1 t.2 t.3 t.3b t.4 t.5 t.6 t.7 f.1 t.8; do has "happy: $out passed" "$(cat "$RUN_DIR/out")" "$out: PASS"; done
 	has "happy: cold rate recorded" "$(cat "$RUN_DIR/ev/measurements.tsv")" cold_fetch_bytes_per_second
