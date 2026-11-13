@@ -417,8 +417,9 @@ func TestRefusalEventsArePerEpisode(t *testing.T) {
 			t.Fatal("no refusal entry after a refusal")
 		}
 		// The API server bumps the generation when it sets the deletion
-		// timestamp, so a reconcile that refused the terminating object would
-		// be a new decision and record a second Event.
+		// timestamp. reconcile returns for a terminating object before any
+		// refusal, so the Event count cannot tell whether the entry was dropped;
+		// the map assertion and the recreation step below do.
 		res := h.dyn.Resource(mlxModelResource).Namespace(testNamespace)
 		raw, err := res.Get(context.Background(), testModelName, metav1.GetOptions{})
 		if err != nil {
@@ -436,6 +437,14 @@ func TestRefusalEventsArePerEpisode(t *testing.T) {
 		}
 		if _, ok := h.ctrl.refusals[key()]; ok {
 			t.Error("the refusal entry outlived its model's termination")
+		}
+		// A fresh model under the same key, at the same UID and generation as
+		// the first, refused for the same reason: a kept entry would match it
+		// and swallow the Event.
+		h.replaceModel(t, model(tooBig))
+		h.reconcile(t)
+		if len(rec.events) != 2 {
+			t.Errorf("%d events after the refused model came back, want 2 (a new episode): %+v", len(rec.events), rec.events)
 		}
 	})
 }
