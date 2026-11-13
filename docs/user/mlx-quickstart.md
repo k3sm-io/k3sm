@@ -94,8 +94,10 @@ The `Ready` condition's `reason` names the state: `Pending` (no replica running 
 (fetching weights), `Loading` (weights fetched, model loading), `Serving` (ready), `PodFailed` (the
 replica died), `Crashing` (the serving container keeps exiting or cannot start; the message gives the
 replica, the last exit code and the error), `ImagePullFailed` (the serving image cannot be pulled),
-`RankUnschedulable` (a sharded model's rank Pod has waited more than 30 seconds for the scheduler to
-place it; the message names the rank and quotes the scheduler, and the model reads `Pending`),
+`RankUnschedulable` (a sharded model's rank Pod has waited 30 seconds or more for the scheduler to
+place it; the message names the rank, the time it became unplaceable, and the scheduler's text, and
+the model reads `Pending`; a rank that already has a reason of its own, such as crashing, failing an
+image pull, or downloading, keeps that reason),
 `ScaledToZero` (you set `replicas: 0`). On a sharded model, `ShardsPlaced=True` means the operator
 has decided where each rank runs, not that the scheduler has bound every rank Pod to its node, which
 is why it can sit beside `RankUnschedulable`.
