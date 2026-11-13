@@ -60,6 +60,11 @@ const (
 	// linkRecheck is how often a gang placed on the network re-reads its
 	// status. It watches no link, so it has no loss budget to meet.
 	linkRecheck = 30 * time.Second
+	// rankUnschedulableGrace is how long the scheduler may refuse to bind a
+	// rank Pod (PodScheduled=False, Unschedulable) before Ready says so. A
+	// refusal shorter than this is the ordinary wait for a GPU slot to free
+	// and reads as plain Pending.
+	rankUnschedulableGrace = 30 * time.Second
 	// interconnectRecheck is how often a gang placed on the thunderbolt path
 	// re-reads the Interconnect for LinksHealthy.
 	//
@@ -224,6 +229,11 @@ func (c *Controller) reconcileSharded(ctx context.Context, key string, raw *unst
 			return fmt.Errorf("read interconnect for mlxmodel %s: %w", key, err)
 		}
 		obs := c.placedObservation(model, pods, cable.Graph, desired, hash, c.observeRanks(ctx, model, pods))
+		// A refusal still inside the grace is reported only once it outlasts
+		// it; nothing else is sure to reconcile the model at that moment.
+		if wait, ok := unschedulableRecheck(pods, c.now()); ok {
+			c.queue.AddAfter(key, wait)
+		}
 		if obs.Interconnect != mlxv1alpha1.MLXInterconnectThunderbolt {
 			c.queue.AddAfter(key, linkRecheck)
 			return c.writeShardedStatus(ctx, raw, model, obs)
@@ -632,10 +642,13 @@ func (c *Controller) deleteOwnedStatefulSet(ctx context.Context, model *mlxv1alp
 }
 
 // observeRanks builds the per-rank PodStates, probing rank 0 when it runs but
-// is not ready (it is the only rank with a serving surface).
+// is not ready (it is the only rank with a serving surface). A rank the
+// scheduler has refused to bind for rankUnschedulableGrace or longer carries
+// that refusal.
 func (c *Controller) observeRanks(ctx context.Context, model *mlxv1alpha1.MLXModel, pods []corev1.Pod) []mlx.PodState {
 	out := make([]mlx.PodState, 0, len(pods))
 	rank0 := mlx.RankPodName(model.Name, 0)
+	now := c.now()
 	for i := range pods {
 		pod := &pods[i]
 		state := mlx.PodState{
@@ -649,9 +662,56 @@ func (c *Controller) observeRanks(ctx context.Context, model *mlxv1alpha1.MLXMod
 		if pod.Name == rank0 && !state.Ready && state.Phase == corev1.PodRunning && pod.Status.PodIP != "" {
 			state.Probe = c.probe(ctx, model, pod.Status.PodIP)
 		}
+		if u, ok := unschedulable(pod); ok && now.Sub(u.Since) >= rankUnschedulableGrace {
+			state.Unschedulable = &u
+		}
 		out = append(out, state)
 	}
 	return out
+}
+
+// unschedulable reads the scheduler's refusal off a rank Pod: no
+// spec.nodeName and PodScheduled=False with reason Unschedulable. Since is the
+// condition's lastTransitionTime, or the Pod's creation time when the
+// condition carries none.
+func unschedulable(pod *corev1.Pod) (mlx.Unschedulable, bool) {
+	if pod.Spec.NodeName != "" {
+		return mlx.Unschedulable{}, false
+	}
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type != corev1.PodScheduled {
+			continue
+		}
+		if cond.Status != corev1.ConditionFalse || cond.Reason != corev1.PodReasonUnschedulable {
+			return mlx.Unschedulable{}, false
+		}
+		since := cond.LastTransitionTime.Time
+		if since.IsZero() {
+			since = pod.CreationTimestamp.Time
+		}
+		return mlx.Unschedulable{Message: cond.Message, Since: since}, true
+	}
+	return mlx.Unschedulable{}, false
+}
+
+// unschedulableRecheck is how soon the earliest scheduler refusal still inside
+// rankUnschedulableGrace leaves it, so the reconcile that reports it is not
+// left to the next unrelated event. ok is false when no refusal is pending.
+func unschedulableRecheck(pods []corev1.Pod, now time.Time) (wait time.Duration, ok bool) {
+	for i := range pods {
+		u, refused := unschedulable(&pods[i])
+		if !refused {
+			continue
+		}
+		left := rankUnschedulableGrace - now.Sub(u.Since)
+		if left <= 0 {
+			continue
+		}
+		if !ok || left < wait {
+			wait, ok = left, true
+		}
+	}
+	return wait, ok
 }
 
 // placedObservation is the observation of a placed gang: placement facts read

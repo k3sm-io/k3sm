@@ -139,6 +139,21 @@ type PodState struct {
 	// still starting from one that keeps failing, which readiness alone cannot:
 	// both are simply not ready. Build it with ServingContainerState.
 	Container ContainerState
+	// Unschedulable is set when the scheduler has refused to bind this pod
+	// for longer than the caller's grace; nil otherwise, including while the
+	// refusal is still inside the grace. Only the sharded derivation reads it:
+	// the pod named by Name is the rank the scheduler cannot place.
+	Unschedulable *Unschedulable
+}
+
+// Unschedulable is the scheduler's standing refusal to bind a pod: its
+// PodScheduled=False (Unschedulable) condition, copied out as plain values.
+type Unschedulable struct {
+	// Message is the scheduler's message on the PodScheduled condition.
+	Message string
+	// Since is when the refusal began: the condition's lastTransitionTime, or
+	// the pod's creation time when the condition carries none.
+	Since time.Time
 }
 
 // ContainerState is the serving container's waiting and last-exit facts, copied
@@ -311,7 +326,7 @@ func PhaseFromConditions(conds []metav1.Condition) mlxv1alpha1.MLXModelPhase {
 		return mlxv1alpha1.MLXModelPhaseReady
 	}
 	switch c.Reason {
-	case ReasonPending, ReasonScaledToZero, ReasonNoDirectLinkTopology, ReasonNoInterconnectSegment, ReasonAwaitingInterconnectSlot, ReasonInsufficientMemory, ReasonInsufficientGPU:
+	case ReasonPending, ReasonScaledToZero, ReasonNoDirectLinkTopology, ReasonNoInterconnectSegment, ReasonAwaitingInterconnectSlot, ReasonInsufficientMemory, ReasonInsufficientGPU, ReasonRankUnschedulable:
 		// The sharded placement refusals read as Pending, not Failed: the
 		// operator re-places on its own when nodes or cables appear, so the
 		// model is waiting on the cluster, not dead.

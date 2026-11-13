@@ -487,6 +487,11 @@ func TestPhaseFromConditionsIsAProjectionOfTheReadyCondition(t *testing.T) {
 			want:  mlxv1alpha1.MLXModelPhasePending,
 		},
 		{
+			name:  "rank_unschedulable",
+			conds: []metav1.Condition{{Type: mlxv1alpha1.MLXModelConditionReady, Status: metav1.ConditionFalse, Reason: ReasonRankUnschedulable}},
+			want:  mlxv1alpha1.MLXModelPhasePending,
+		},
+		{
 			name:  "unrecognized_reason",
 			conds: []metav1.Condition{{Type: mlxv1alpha1.MLXModelConditionReady, Status: metav1.ConditionFalse, Reason: "Whatever"}},
 			want:  "",

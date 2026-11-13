@@ -53,6 +53,13 @@ const (
 	// ReasonInsufficientMemory means the per-rank share of spec.memory does not
 	// fit on enough candidate nodes, or cannot fund a serving context at all.
 	ReasonInsufficientMemory = "InsufficientMemory"
+	// ReasonRankUnschedulable is carried by Ready alone, never by ShardsPlaced:
+	// the gang is placed and every rank Pod exists, but the scheduler has
+	// refused to bind one of them for longer than the operator's grace. The
+	// message names the rank and the scheduler's own message. It is not a gang
+	// fault: nothing is deleted or re-placed, and the model reads Pending until
+	// the scheduler binds the rank.
+	ReasonRankUnschedulable = "RankUnschedulable"
 	// ReasonInsufficientGPU means too few candidate nodes have a free
 	// mlx.k3sm.io/gpu slot: every slot on the others is held by pods of other
 	// models (or other GPU workloads), so a rank placed there could not get the
@@ -198,6 +205,14 @@ func DeriveShardedStatus(m *mlxv1alpha1.MLXModel, obs ShardObservation, opts Sta
 		pods := Observation{Pods: obs.Pods, CurrentRevision: obs.SpecHash}
 		ready, c, reason, message := deriveReady(obs.Desired, pods, unitRanks)
 		counts = c
+		// A rank the scheduler will not bind holds the gang back for a reason
+		// no pod phase shows: it is Pending either way. Name it, but leave
+		// ShardsPlaced alone: the placement stands and nothing is re-placed.
+		if u, name := unschedulableRank(obs.Pods); u != nil {
+			ready, reason = false, ReasonRankUnschedulable
+			message = fmt.Sprintf("rank pod %s cannot be scheduled since %s: %s",
+				name, u.Since.UTC().Format(time.RFC3339), u.Message)
+		}
 		set(mlxv1alpha1.MLXModelConditionReady, ready, reason, message)
 	}
 	status.Replicas = counts.replicas
@@ -215,6 +230,17 @@ func DeriveShardedStatus(m *mlxv1alpha1.MLXModel, obs ShardObservation, opts Sta
 		status.Endpoint = endpoint(m, opts)
 	}
 	return status
+}
+
+// unschedulableRank returns the first rank, in observation order, that the
+// scheduler refuses to bind, and its name; nil when there is none.
+func unschedulableRank(pods []PodState) (*Unschedulable, string) {
+	for _, p := range pods {
+		if p.Unschedulable != nil {
+			return p.Unschedulable, p.Name
+		}
+	}
+	return nil, ""
 }
 
 // InterconnectLost reports whether the observed gang lost its interconnect: a

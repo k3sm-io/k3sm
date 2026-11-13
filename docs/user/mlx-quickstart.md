@@ -94,6 +94,8 @@ The `Ready` condition's `reason` names the state: `Pending` (no replica running 
 (fetching weights), `Loading` (weights fetched, model loading), `Serving` (ready), `PodFailed` (the
 replica died), `Crashing` (the serving container keeps exiting or cannot start; the message gives the
 replica, the last exit code and the error), `ImagePullFailed` (the serving image cannot be pulled),
+`RankUnschedulable` (a sharded model's rank Pod has waited more than 30 seconds for the scheduler to
+place it; the message names the rank and quotes the scheduler, and the model reads `Pending`),
 `ScaledToZero` (you set `replicas: 0`).
 
 There is no liveness probe on the serving pod, because a first start is an unbounded download and a
