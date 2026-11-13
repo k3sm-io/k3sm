@@ -73,8 +73,8 @@ every server by one load-balancer name, give that name to each of them when you 
 [Multi-node](multi-node.md#extra-names-for-the-apiserver-certificate).
 
 A worker that joins receives a list of apiserver endpoints: the server it joined through first, then
-every other server whose node is Ready. Workers stay attached to the server they joined through;
-there is no client-side failover between servers yet.
+every other server whose node is Ready. A worker uses the first reachable entry of that list and
+does not move to another one later; there is no client-side failover between servers.
 
 ## What to Plan For
 
