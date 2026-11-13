@@ -70,7 +70,8 @@ func (t *podTrack) markEvicted(st *corev1.PodStatus) bool {
 // records the status once the stop succeeds; clearStopping rolls it back.
 // live is the pod's last live status, read before the mark: the runtime forgets
 // the pod as its stop begins, so the readers report live (stoppingStatus) for
-// the rest of the stop instead of a synthesized creating status.
+// the rest of the stop, and after a failed one until the retry, instead of a
+// synthesized creating status.
 func (t *podTrack) markStopping(live *corev1.PodStatus) bool {
 	t.restartMu.Lock()
 	defer t.restartMu.Unlock()
@@ -83,14 +84,27 @@ func (t *podTrack) markStopping(live *corev1.PodStatus) bool {
 }
 
 // stoppingStatus returns a copy of the last live status markStopping recorded
-// while t's active-deadline stop is in flight, or nil when no stop is.
+// for t's active-deadline stop, or nil. It is kept while the stop is in flight
+// and, after a failed stop, until a runtime read succeeds again
+// (observedLive) or a stop succeeds (finishStopping).
 func (t *podTrack) stoppingStatus() *corev1.PodStatus {
 	t.restartMu.Lock()
 	defer t.restartMu.Unlock()
-	if !t.stopping || t.stoppingLive == nil {
+	if t.stoppingLive == nil {
 		return nil
 	}
 	return t.stoppingLive.DeepCopy()
+}
+
+// observedLive drops the live status a failed deadline stop kept, once the
+// runtime reports the pod again: its own status is the truth from then on. A
+// stop in flight keeps its status, which the runtime may yet forget.
+func (t *podTrack) observedLive() {
+	t.restartMu.Lock()
+	defer t.restartMu.Unlock()
+	if !t.stopping {
+		t.stoppingLive = nil
+	}
 }
 
 // isStopping reports whether t's active-deadline stop is in flight.
@@ -129,13 +143,15 @@ func (t *podTrack) finishStopping(st *corev1.PodStatus) bool {
 	return true
 }
 
-// clearStopping rolls back markStopping after a failed stop, so the next tick
-// retries it. Nothing was published, so nothing is withdrawn.
+// clearStopping rolls back markStopping after a failed stop, releasing the
+// fence so the next tick retries it. Nothing was published, so nothing is
+// withdrawn. The live status stays: the runtime may already have forgotten the
+// pod, and until the retry the pod must not read as being created, nor the
+// retry build its Failed status from such a read.
 func (t *podTrack) clearStopping() {
 	t.restartMu.Lock()
 	defer t.restartMu.Unlock()
 	t.stopping = false
-	t.stoppingLive = nil
 }
 
 // unmarkEvicted rolls back markEvicted after a failed runtime teardown, so the

@@ -296,7 +296,8 @@ func (r *runtimedRuntime) persistDeadlineStatusOnce(ctx context.Context, pod *co
 // The caller has taken the stopping mark (startDeadlineStop); the terminal
 // status st is recorded only once the stop succeeds or the runtime answers
 // not-found, and a failed stop clears the stopping mark and publishes nothing,
-// so the next tick retries it. The pod's address, logs and track stay for the
+// so the next tick retries it; the pod's last live status stays readable until
+// then, and the retry builds its Failed status from it (clearStopping). The pod's address, logs and track stay for the
 // DeletePod that follows, as on an eviction. A parked pod has no runtime pod, so
 // the runtime's not-found answers the stop; its pull schedules are cancelled and
 // its park record cleared, and a create of it still in flight is deleted when it

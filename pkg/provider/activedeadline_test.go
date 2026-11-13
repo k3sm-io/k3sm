@@ -1292,3 +1292,209 @@ func TestDeadlineStopTimesOutAndIsRetried(t *testing.T) {
 		t.Errorf("runtime stop graces = %v, want two stops of %d s: the next tick retries the timed-out stop", got, floorGrace(grace))
 	}
 }
+
+// forgettingStopRuntime fails the first runtime stop of one pod id after
+// forgetting the pod, as runtimed does: the daemon drops the pod as its
+// DeletePod begins, so the pod reads NotFound even though the stop then
+// failed. With hang the stop hangs until its context is done (the per-stop
+// timeout); otherwise it returns Unavailable. Later stops reach the fake
+// runtime, which answers a stop of a forgotten pod with success.
+type forgettingStopRuntime struct {
+	*fakeRuntimeServer
+	failID string
+	hang   bool
+
+	mu     sync.Mutex
+	failed bool
+	stops  int
+}
+
+func (f *forgettingStopRuntime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest) (*runtimev1.DeletePodResponse, error) {
+	f.mu.Lock()
+	f.stops++
+	fail := req.GetPodId() == f.failID && !f.failed
+	if fail {
+		f.failed = true
+	}
+	f.mu.Unlock()
+	if !fail {
+		return f.fakeRuntimeServer.DeletePod(ctx, req)
+	}
+	f.fakeRuntimeServer.mu.Lock()
+	delete(f.fakeRuntimeServer.created, req.GetPodId())
+	f.fakeRuntimeServer.mu.Unlock()
+	if f.hang {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return nil, status.Error(codes.Unavailable, "runtime unavailable")
+}
+
+func (f *forgettingStopRuntime) stopCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.stops
+}
+
+// TestFailedDeadlineStopKeepsTheLiveStatusUntilTheRetry pins the status of a
+// pod whose deadline stop failed after the runtime had already forgotten it:
+// between the failure and the next tick's retry every surface (GetPodStatus,
+// GetPods, a tick's publication) goes on reading the pod's last live status,
+// Running with no container Waiting, never the synthesized creating status;
+// and the Failed/DeadlineExceeded status the retry publishes is built from
+// that live status, so no container in it is Waiting and each carries the
+// start time it was running from.
+func TestFailedDeadlineStopKeepsTheLiveStatusUntilTheRetry(t *testing.T) {
+	saved := deadlineStopSlack
+	deadlineStopSlack = 100 * time.Millisecond
+	t.Cleanup(func() { deadlineStopSlack = saved })
+
+	for _, c := range []struct {
+		name string
+		hang bool
+	}{
+		{name: "the stop fails Unavailable"},
+		{name: "the stop hangs until its timeout", hang: true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := context.Background()
+			fs := &forgettingStopRuntime{fakeRuntimeServer: newFakeRuntimeServer(), hang: c.hang}
+			h := newDeadlineStopHarness(t, fs, "deadline-forgotten-failed")
+			id := string(h.pod.UID)
+			fs.failID = id
+			t.Cleanup(h.r.shutdown)
+			tr := h.r.trackByID(id)
+			if tr == nil {
+				t.Fatal("pod not tracked after CreatePod")
+			}
+			grace := int64(1)
+			h.r.mu.Lock()
+			tr.pod.Spec.TerminationGracePeriodSeconds = &grace
+			h.r.mu.Unlock()
+
+			noWaiting := func(t *testing.T, surface string, st corev1.PodStatus) {
+				t.Helper()
+				for _, cs := range st.ContainerStatuses {
+					if cs.State.Waiting != nil {
+						t.Errorf("%s container %s Waiting (%s), want not Waiting", surface, cs.Name, cs.State.Waiting.Reason)
+					}
+				}
+			}
+			assertLive := func(t *testing.T, surface string, st corev1.PodStatus) {
+				t.Helper()
+				if st.Phase != corev1.PodRunning {
+					t.Errorf("%s phase = %s, want %s", surface, st.Phase, corev1.PodRunning)
+				}
+				noWaiting(t, surface, st)
+			}
+			st, err := h.r.GetPodStatus(ctx, h.pod.Namespace, h.pod.Name)
+			if err != nil {
+				t.Fatalf("GetPodStatus before the deadline: %v", err)
+			}
+			assertLive(t, "GetPodStatus before the deadline", *st)
+
+			// The first tick starts the stop; the runtime forgets the pod and the
+			// stop fails (or times out). Nothing is Failed yet.
+			h.clk.Step(20 * time.Minute)
+			h.r.resync(ctx)
+			waitDeadlineStops(h.r)
+			if n := fs.stopCount(); n != 1 {
+				t.Fatalf("runtime stops after the first tick = %d, want 1", n)
+			}
+			if tr.isStopping() {
+				t.Fatal("the pod is still stopping after its stop failed: the fence was not released")
+			}
+			fs.fakeRuntimeServer.mu.Lock()
+			_, known := fs.fakeRuntimeServer.created[id]
+			fs.fakeRuntimeServer.mu.Unlock()
+			if known {
+				t.Fatal("the fake runtime still knows the pod after its failed stop")
+			}
+
+			// Between the failure and the retry.
+			st, err = h.r.GetPodStatus(ctx, h.pod.Namespace, h.pod.Name)
+			if err != nil {
+				t.Fatalf("GetPodStatus after the failed stop: %v", err)
+			}
+			assertLive(t, "GetPodStatus after the failed stop", *st)
+			pods, err := h.r.GetPods(ctx)
+			if err != nil {
+				t.Fatalf("GetPods after the failed stop: %v", err)
+			}
+			for _, p := range pods {
+				if p.Name == h.pod.Name {
+					assertLive(t, "GetPods after the failed stop", p.Status)
+				}
+			}
+			// A tick that publishes without retrying: the tracked spec's deadline
+			// is lifted for this one tick (the pointer is swapped, as UpdatePod
+			// does, and restored after).
+			h.mu.Lock()
+			h.published = nil
+			h.mu.Unlock()
+			h.r.mu.Lock()
+			withDeadline := tr.pod
+			lifted := withDeadline.DeepCopy()
+			lifted.Spec.ActiveDeadlineSeconds = nil
+			tr.pod = lifted
+			h.r.mu.Unlock()
+			h.r.resync(ctx)
+			h.r.mu.Lock()
+			tr.pod = withDeadline
+			h.r.mu.Unlock()
+			if n := fs.stopCount(); n != 1 {
+				t.Fatalf("runtime stops after the publishing tick = %d, want 1", n)
+			}
+			h.mu.Lock()
+			published := append([]corev1.PodStatus(nil), h.published...)
+			h.published = nil
+			h.mu.Unlock()
+			if len(published) == 0 {
+				t.Fatal("no status published between the failure and the retry")
+			}
+			for i, p := range published {
+				assertLive(t, fmt.Sprintf("publication %d after the failed stop", i), p)
+			}
+
+			// The retry.
+			h.clk.Step(10 * time.Second)
+			h.r.resync(ctx)
+			waitDeadlineStops(h.r)
+			if n := fs.stopCount(); n != 2 {
+				t.Errorf("runtime stops after the retry tick = %d, want 2", n)
+			}
+			h.r.resync(ctx)
+			st, err = h.r.GetPodStatus(ctx, h.pod.Namespace, h.pod.Name)
+			if err != nil {
+				t.Fatalf("GetPodStatus after the retry: %v", err)
+			}
+			if st.Phase != corev1.PodFailed || st.Reason != reasonDeadlineExceeded {
+				t.Fatalf("status after the retry = %s/%s, want Failed/%s", st.Phase, st.Reason, reasonDeadlineExceeded)
+			}
+			h.mu.Lock()
+			published = append([]corev1.PodStatus(nil), h.published...)
+			h.mu.Unlock()
+			failed := 0
+			for i, p := range append(published, *st) {
+				surface := fmt.Sprintf("publication %d from the retry", i)
+				if i == len(published) {
+					surface = "GetPodStatus after the retry"
+				}
+				if p.Phase != corev1.PodFailed {
+					assertLive(t, surface, p)
+					continue
+				}
+				failed++
+				noWaiting(t, surface, p)
+				for _, cs := range p.ContainerStatuses {
+					if term := cs.State.Terminated; term != nil && term.StartedAt.IsZero() {
+						t.Errorf("%s container %s terminated with no start time: built from a not-running status", surface, cs.Name)
+					}
+				}
+			}
+			if failed == 0 {
+				t.Error("the retry published no Failed status")
+			}
+		})
+	}
+}
