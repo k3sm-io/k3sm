@@ -20,6 +20,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -466,6 +467,13 @@ type evictionHarness struct {
 func newEvictionHarness(t *testing.T) *evictionHarness {
 	t.Helper()
 	r, f, _ := newRestartFake(t)
+	return newEvictionHarnessOn(t, r, f)
+}
+
+// newEvictionHarnessOn wires the harness onto r, whose runtime is f or a
+// wrapper of f.
+func newEvictionHarnessOn(t *testing.T, r *runtimedRuntime, f *fakeRuntimeServer) *evictionHarness {
+	t.Helper()
 	f.strict = t
 	h := &evictionHarness{t: t, r: r, f: f, cs: fake.NewClientset(), rec: record.NewFakeRecorder(200), sm: &staticMonitor{s: compressorAt(10)}}
 	h.now = time.Unix(100000, 0)
@@ -1127,6 +1135,130 @@ func TestFailedEvictionStopOfAForgottenPodKeepsTheLiveStatus(t *testing.T) {
 			t.Fatalf("GetPods %d after the failed stop = %d pods, %v", i, len(pods), err)
 		}
 		assertRunningNotWaiting(t, "GetPods after the failed eviction stop", pods[0].Status)
+	}
+}
+
+// TestReadIssuedBeforeAFailedEvictionStopKeepsTheLiveStatus pins the stop
+// epoch on the eviction's side: a runtime read issued before an eviction stop
+// began, which the runtime answers with the pod still known but which completes
+// only after the stop failed (and the runtime forgot the pod), does not drop the
+// failed stop's live status, so the next read, which the runtime answers
+// NotFound, still reports the pod Running and not as being created.
+func TestReadIssuedBeforeAFailedEvictionStopKeepsTheLiveStatus(t *testing.T) {
+	readers := []struct {
+		name string
+		read func(ctx context.Context, r *runtimedRuntime) (corev1.PodStatus, error)
+	}{
+		{"GetPodStatus", func(ctx context.Context, r *runtimedRuntime) (corev1.PodStatus, error) {
+			st, err := r.GetPodStatus(ctx, "default", "hog")
+			if err != nil {
+				return corev1.PodStatus{}, err
+			}
+			return *st, nil
+		}},
+		{"GetPods", func(ctx context.Context, r *runtimedRuntime) (corev1.PodStatus, error) {
+			pods, err := r.GetPods(ctx)
+			if err != nil {
+				return corev1.PodStatus{}, err
+			}
+			for _, p := range pods {
+				if p.Name == "hog" {
+					return p.Status, nil
+				}
+			}
+			return corev1.PodStatus{}, fmt.Errorf("pod hog not listed")
+		}},
+	}
+	for _, reader := range readers {
+		t.Run(reader.name, func(t *testing.T) {
+			ctx := context.Background()
+			r, f, _ := newRestartFake(t)
+			hr := &heldReadRuntime{
+				forgettingStopRuntime: &forgettingStopRuntime{fakeRuntimeServer: f},
+				entered:               make(chan struct{}),
+				release:               make(chan struct{}),
+			}
+			r.rt = hr
+			h := newEvictionHarnessOn(t, r, f)
+			h.add(evPod("hog", nil, "", ""), "2Gi")
+			f.pushDeleteErr(status.Error(codes.Unavailable, "runtime unavailable"))
+			hold := make(chan struct{})
+			f.mu.Lock()
+			f.deleteHold = hold
+			f.mu.Unlock()
+			var deleteReleased atomic.Bool
+			releaseDelete := func() {
+				if deleteReleased.CompareAndSwap(false, true) {
+					close(hold)
+				}
+			}
+			t.Cleanup(releaseDelete)
+			var released atomic.Bool
+			release := func() {
+				if released.CompareAndSwap(false, true) {
+					close(hr.release)
+				}
+			}
+			t.Cleanup(release)
+
+			done := make(chan error, 1)
+			go func() {
+				_, err := reader.read(context.WithValue(ctx, heldReadKey{}, true), h.r)
+				done <- err
+			}()
+			select {
+			case <-hr.entered:
+			case <-time.After(30 * time.Second):
+				t.Fatal("the held read never reached the runtime")
+			}
+
+			// The eviction stop begins; the runtime forgets the pod while the stop
+			// is in flight, then the stop fails.
+			cycled := make(chan struct{})
+			go func() {
+				defer close(cycled)
+				h.step(compressorAt(85))
+			}()
+			waitBounded(t, "the eviction stop to reach the runtime", func() bool {
+				f.mu.Lock()
+				defer f.mu.Unlock()
+				return f.deleteCalls == 1
+			})
+			f.mu.Lock()
+			delete(f.created, "uid-hog")
+			f.mu.Unlock()
+			releaseDelete()
+			select {
+			case <-cycled:
+			case <-time.After(30 * time.Second):
+				t.Fatal("the eviction cycle never returned")
+			}
+			tr := h.r.trackByID("uid-hog")
+			if tr == nil {
+				t.Fatal("pod not tracked after the failed eviction")
+			}
+			if tr.isStopping() {
+				t.Fatal("the pod is still stopping after its eviction stop failed")
+			}
+
+			release()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("the held %s: %v", reader.name, err)
+				}
+			case <-time.After(30 * time.Second):
+				t.Fatal("the held read never returned")
+			}
+			if tr.stoppingStatus() == nil {
+				t.Errorf("the %s issued before the stop dropped the failed stop's live status", reader.name)
+			}
+			st, err := reader.read(ctx, h.r)
+			if err != nil {
+				t.Fatalf("%s after the late read: %v", reader.name, err)
+			}
+			assertRunningNotWaiting(t, reader.name+" after the late read", st)
+		})
 	}
 }
 
