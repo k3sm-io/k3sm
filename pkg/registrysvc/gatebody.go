@@ -38,37 +38,44 @@ const gateUpstreamBodyProgress = relayWriteProgress
 // for making no progress.
 var errUpstreamBodyStalled = errors.New("the local registry sent no response bytes within the progress window")
 
-// progressBody is an upstream response body that closes itself when no byte
-// arrives for window. Closing it fails the reverse proxy's copy loop, which
-// drops the client connection and releases the upstream one.
+// progressBody is an upstream response body that is cut when a single Read
+// on the upstream body blocks for longer than window. The clock runs only
+// while a Read is waiting on the registry: it starts when Read is called and
+// stops when Read returns, with bytes, io.EOF or an error. Time the caller
+// spends between Reads, such as the reverse proxy writing to a slow client,
+// never counts, so only a silent registry is cut, never a slow consumer.
+// Cutting closes the upstream body, which fails the blocked Read and with it
+// the reverse proxy's copy loop; the proxy then drops the client connection
+// and releases the upstream one. onStall runs once per cut, and every Read
+// from then on fails with errUpstreamBodyStalled. Close is idempotent and safe
+// against a concurrent Read; after io.EOF, an error or Close no timer remains.
 type progressBody struct {
 	body    io.ReadCloser
 	window  time.Duration
 	onStall func()
-	timer   *time.Timer
 
 	mu       sync.Mutex
-	done     bool      // closed, ended, or cut: the timer must not act again
-	deadline time.Time // when the body is cut if no byte arrives first
+	timer    *time.Timer // nil until the first Read
+	reading  bool        // a Read is waiting on the upstream body
+	done     bool        // closed, ended, or cut: no timer is armed again
+	deadline time.Time   // when the Read in flight is cut
 	stalled  bool
 
 	closeOnce sync.Once
 	closeErr  error
 }
 
-// newProgressBody wraps body and arms its progress timer. onStall runs once,
-// before the body is closed, when the body is cut.
+// newProgressBody wraps body. No timer runs until the first Read. onStall
+// runs once, before the body is closed, when the body is cut.
 func newProgressBody(body io.ReadCloser, window time.Duration, onStall func()) *progressBody {
-	p := &progressBody{body: body, window: window, onStall: onStall, deadline: time.Now().Add(window)}
-	p.timer = time.AfterFunc(window, p.stall)
-	return p
+	return &progressBody{body: body, window: window, onStall: onStall}
 }
 
-// stall is the timer's callback. A firing that raced a Read which moved the
-// deadline returns; the timer that Read re-armed fires again at the new one.
+// stall is the timer's callback. A firing that raced a Read which already
+// returned, or a later Read that moved the deadline, does nothing.
 func (p *progressBody) stall() {
 	p.mu.Lock()
-	if p.done || time.Now().Before(p.deadline) {
+	if p.done || !p.reading || time.Now().Before(p.deadline) {
 		p.mu.Unlock()
 		return
 	}
@@ -78,23 +85,38 @@ func (p *progressBody) stall() {
 	p.closeBody()
 }
 
-// Read reads from the upstream body and re-arms the timer on progress. The
-// first error, io.EOF included, ends the watch.
+// Read reads from the upstream body with the timer armed for the duration
+// of the call only. The first error, io.EOF included, ends the watch.
 func (p *progressBody) Read(b []byte) (int, error) {
-	n, err := p.body.Read(b)
 	p.mu.Lock()
-	switch {
-	case p.done:
-	case err != nil:
-		p.done = true
-		p.timer.Stop()
-	case n > 0:
+	if p.stalled {
+		p.mu.Unlock()
+		return 0, errUpstreamBodyStalled
+	}
+	if !p.done {
+		p.reading = true
 		p.deadline = time.Now().Add(p.window)
-		p.timer.Reset(p.window)
+		if p.timer == nil {
+			p.timer = time.AfterFunc(p.window, p.stall)
+		} else {
+			p.timer.Reset(p.window)
+		}
+	}
+	p.mu.Unlock()
+
+	n, err := p.body.Read(b)
+
+	p.mu.Lock()
+	p.reading = false
+	if p.timer != nil {
+		p.timer.Stop()
+	}
+	if err != nil {
+		p.done = true
 	}
 	stalled := p.stalled
 	p.mu.Unlock()
-	if err != nil && stalled {
+	if stalled {
 		err = errUpstreamBodyStalled
 	}
 	return n, err
@@ -105,7 +127,9 @@ func (p *progressBody) Read(b []byte) (int, error) {
 func (p *progressBody) Close() error {
 	p.mu.Lock()
 	p.done = true
-	p.timer.Stop()
+	if p.timer != nil {
+		p.timer.Stop()
+	}
 	p.mu.Unlock()
 	return p.closeBody()
 }

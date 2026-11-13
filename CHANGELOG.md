@@ -333,10 +333,11 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
   connection and frees the slot. A blob still streams for as long as it takes while it keeps moving:
   there is no flat read or write timeout. A connection cut this way is logged as a warning. See
   [Pulling](docs/user/registry.md#pulling).
-- A node's local registry that starts answering a request through the push gate and then stops
+- A node's local registry that starts answering a request through the registry gate and then stops
   sending mid-body no longer holds the gate's connection, and the relay slot behind it, until the
-  client gives up. If no byte of the answer arrives for 5 minutes, the gate cuts the connection and
-  logs a warning. A slow answer that keeps moving is never cut.
+  client gives up. If the gate waits 5 minutes for the next byte of the answer, it cuts the connection
+  and logs a warning. A slow answer that keeps moving is never cut, and time the gate spends sending
+  to a slow client does not count.
 - A server whose control plane does not report healthy in time while the Mac is heavily loaded no
   longer parks on the crash-loop breaker after five attempts. It backs off instead, from 30 seconds
   doubling up to 10 minutes, `k3sm status` shows when the next attempt starts and that an attempt

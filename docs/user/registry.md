@@ -143,8 +143,9 @@ answers 502 where it cannot take over the connection, and logs the warning
 not logged as a warning. A node's runtime reads a closed connection as this registry not having the
 image and moves on to its next source, if it has one. The 30 seconds covers the registry's response
 headers only, not the time a transfer takes once the registry has started to answer. If the
-registry starts an answer and then sends nothing for 5 minutes, the gate cuts the connection and
-logs a warning. A slow answer that keeps moving is never cut.
+registry starts an answer and the gate then waits 5 minutes for its next byte, the gate cuts the
+connection and logs a warning. A slow answer that keeps moving is never cut, and time the gate spends
+sending to a slow client does not count.
 
 The cluster reaches the registry through the registry relay, a front that listens on the
 server's cluster network address and on its guest network's gateway address, terminates TLS, and
