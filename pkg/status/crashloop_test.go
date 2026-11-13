@@ -294,9 +294,16 @@ func TestCrashLoopSlowStreakNeedsALiveServer(t *testing.T) {
 	}
 
 	// The collector takes liveness from the server row it folds into.
+	// The record reaches the collector through the ReadCrashRecord seam (a
+	// nil seam reads nothing), from a real work dir, as the collector tests
+	// above do.
 	b, _ := json.Marshal(streak)
-	c := Collector{FS: fakeFS{contents: map[string][]byte{executor.CrashLoopPath("/var/lib/k3sm/server"): b}},
-		Paths: Paths{WorkDir: "/var/lib/k3sm/server"}, Now: func() time.Time { return now }}
+	workDir := t.TempDir()
+	if err := os.WriteFile(executor.CrashLoopPath(workDir), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c := Collector{FS: fakeFS{}, ReadCrashRecord: executor.ReadCrashRecord,
+		Paths: Paths{WorkDir: workDir}, Now: func() time.Time { return now }}
 	for _, st := range []struct {
 		state RowState
 		want  string
