@@ -1297,12 +1297,14 @@ func TestDeadlineStopTimesOutAndIsRetried(t *testing.T) {
 // forgetting the pod, as runtimed does: the daemon drops the pod as its
 // DeletePod begins, so the pod reads NotFound even though the stop then
 // failed. With hang the stop hangs until its context is done (the per-stop
-// timeout); otherwise it returns Unavailable. Later stops reach the fake
-// runtime, which answers a stop of a forgotten pod with success.
+// timeout); otherwise it returns Unavailable. With keep the stop fails before
+// the runtime forgets the pod, which it then still knows. Later stops reach the
+// fake runtime, which answers a stop of a forgotten pod with success.
 type forgettingStopRuntime struct {
 	*fakeRuntimeServer
 	failID string
 	hang   bool
+	keep   bool
 
 	mu     sync.Mutex
 	failed bool
@@ -1320,9 +1322,11 @@ func (f *forgettingStopRuntime) DeletePod(ctx context.Context, req *runtimev1.De
 	if !fail {
 		return f.fakeRuntimeServer.DeletePod(ctx, req)
 	}
-	f.fakeRuntimeServer.mu.Lock()
-	delete(f.fakeRuntimeServer.created, req.GetPodId())
-	f.fakeRuntimeServer.mu.Unlock()
+	if !f.keep {
+		f.fakeRuntimeServer.mu.Lock()
+		delete(f.fakeRuntimeServer.created, req.GetPodId())
+		f.fakeRuntimeServer.mu.Unlock()
+	}
 	if f.hang {
 		<-ctx.Done()
 		return nil, ctx.Err()
@@ -1494,6 +1498,227 @@ func TestFailedDeadlineStopKeepsTheLiveStatusUntilTheRetry(t *testing.T) {
 			}
 			if failed == 0 {
 				t.Error("the retry published no Failed status")
+			}
+		})
+	}
+}
+
+// heldReadKey marks the context of the one status read a heldReadRuntime holds.
+type heldReadKey struct{}
+
+// heldReadRuntime holds the runtime GetPodStatus whose context carries
+// heldReadKey after the runtime has answered it: the answer is fixed when the
+// read arrives, entered is closed, and the read returns once release is
+// closed. Other reads, and stops, go to the forgettingStopRuntime.
+type heldReadRuntime struct {
+	*forgettingStopRuntime
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (h *heldReadRuntime) GetPodStatus(ctx context.Context, req *runtimev1.GetPodStatusRequest) (*runtimev1.GetPodStatusResponse, error) {
+	resp, err := h.forgettingStopRuntime.GetPodStatus(ctx, req)
+	if ctx.Value(heldReadKey{}) != nil {
+		close(h.entered)
+		<-h.release
+	}
+	return resp, err
+}
+
+// liveStatusReaders are the two status surfaces that read the runtime and drop
+// a failed stop's live status on a successful read (observedLive).
+var liveStatusReaders = []struct {
+	name string
+	read func(ctx context.Context, h *deadlineStopHarness) (corev1.PodStatus, error)
+}{
+	{name: "GetPodStatus", read: func(ctx context.Context, h *deadlineStopHarness) (corev1.PodStatus, error) {
+		st, err := h.r.GetPodStatus(ctx, h.pod.Namespace, h.pod.Name)
+		if err != nil {
+			return corev1.PodStatus{}, err
+		}
+		return *st, nil
+	}},
+	{name: "GetPods", read: func(ctx context.Context, h *deadlineStopHarness) (corev1.PodStatus, error) {
+		pods, err := h.r.GetPods(ctx)
+		if err != nil {
+			return corev1.PodStatus{}, err
+		}
+		for _, p := range pods {
+			if p.Name == h.pod.Name {
+				return p.Status, nil
+			}
+		}
+		return corev1.PodStatus{}, fmt.Errorf("pod %s not listed", h.pod.Name)
+	}},
+}
+
+// assertRunningNotWaiting checks st is Running with no container Waiting: the
+// pod's live status, not the synthesized creating one.
+func assertRunningNotWaiting(t *testing.T, surface string, st corev1.PodStatus) {
+	t.Helper()
+	if st.Phase != corev1.PodRunning {
+		t.Errorf("%s phase = %s, want %s", surface, st.Phase, corev1.PodRunning)
+	}
+	for _, cs := range st.ContainerStatuses {
+		if cs.State.Waiting != nil {
+			t.Errorf("%s container %s Waiting (%s), want not Waiting", surface, cs.Name, cs.State.Waiting.Reason)
+		}
+	}
+}
+
+// failOneDeadlineStop runs the tick that starts h's pod's deadline stop, which
+// fs fails, and checks the stop is over and its live status kept.
+func failOneDeadlineStop(t *testing.T, h *deadlineStopHarness, fs *forgettingStopRuntime, tr *podTrack) {
+	t.Helper()
+	h.clk.Step(20 * time.Minute)
+	h.r.resync(context.Background())
+	waitDeadlineStops(h.r)
+	if n := fs.stopCount(); n != 1 {
+		t.Fatalf("runtime stops after the tick = %d, want 1", n)
+	}
+	if tr.isStopping() {
+		t.Fatal("the pod is still stopping after its stop failed")
+	}
+	if tr.stoppingStatus() == nil {
+		t.Fatal("the failed stop did not keep the pod's live status")
+	}
+}
+
+// TestFailedDeadlineStopOfAKnownPodDropsTheLiveStatusOnTheNextRead pins
+// observedLive for a stop that failed before the runtime forgot the pod: the
+// next successful runtime read, on either surface, drops the kept live status,
+// and the pod then reads the runtime's own live status.
+func TestFailedDeadlineStopOfAKnownPodDropsTheLiveStatusOnTheNextRead(t *testing.T) {
+	for _, reader := range liveStatusReaders {
+		t.Run(reader.name, func(t *testing.T) {
+			ctx := context.Background()
+			fs := &forgettingStopRuntime{fakeRuntimeServer: newFakeRuntimeServer(), keep: true}
+			h := newDeadlineStopHarness(t, fs, "deadline-known-failed")
+			id := string(h.pod.UID)
+			fs.failID = id
+			t.Cleanup(h.r.shutdown)
+			tr := h.r.trackByID(id)
+			if tr == nil {
+				t.Fatal("pod not tracked after CreatePod")
+			}
+			failOneDeadlineStop(t, h, fs, tr)
+			fs.fakeRuntimeServer.mu.Lock()
+			_, known := fs.fakeRuntimeServer.created[id]
+			fs.fakeRuntimeServer.mu.Unlock()
+			if !known {
+				t.Fatal("the fake runtime forgot the pod: the stop was to fail before that")
+			}
+
+			st, err := reader.read(ctx, h)
+			if err != nil {
+				t.Fatalf("%s after the failed stop: %v", reader.name, err)
+			}
+			if tr.stoppingStatus() != nil {
+				t.Errorf("%s read the pod from the runtime but kept the failed stop's live status", reader.name)
+			}
+			assertRunningNotWaiting(t, reader.name+" after the failed stop", st)
+		})
+	}
+}
+
+// TestReadIssuedBeforeAFailedDeadlineStopKeepsTheLiveStatus pins the stop
+// epoch: a runtime read issued before a deadline stop began, which the runtime
+// answers with the pod still known but which completes only after the stop
+// failed (and the runtime forgot the pod), does not drop the failed stop's
+// live status, so the next read, which the runtime answers NotFound, still
+// reports the pod Running and not as being created.
+func TestReadIssuedBeforeAFailedDeadlineStopKeepsTheLiveStatus(t *testing.T) {
+	for _, reader := range liveStatusReaders {
+		t.Run(reader.name, func(t *testing.T) {
+			ctx := context.Background()
+			hr := &heldReadRuntime{
+				forgettingStopRuntime: &forgettingStopRuntime{fakeRuntimeServer: newFakeRuntimeServer()},
+				entered:               make(chan struct{}),
+				release:               make(chan struct{}),
+			}
+			h := newDeadlineStopHarness(t, hr, "deadline-late-read")
+			id := string(h.pod.UID)
+			hr.failID = id
+			t.Cleanup(h.r.shutdown)
+			var released atomic.Bool
+			release := func() {
+				if released.CompareAndSwap(false, true) {
+					close(hr.release)
+				}
+			}
+			t.Cleanup(release)
+			tr := h.r.trackByID(id)
+			if tr == nil {
+				t.Fatal("pod not tracked after CreatePod")
+			}
+
+			done := make(chan error, 1)
+			go func() {
+				_, err := reader.read(context.WithValue(ctx, heldReadKey{}, true), h)
+				done <- err
+			}()
+			select {
+			case <-hr.entered:
+			case <-time.After(30 * time.Second):
+				t.Fatal("the held read never reached the runtime")
+			}
+			failOneDeadlineStop(t, h, hr.forgettingStopRuntime, tr)
+
+			release()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("the held %s: %v", reader.name, err)
+				}
+			case <-time.After(30 * time.Second):
+				t.Fatal("the held read never returned")
+			}
+			if tr.stoppingStatus() == nil {
+				t.Errorf("the %s issued before the stop dropped the failed stop's live status", reader.name)
+			}
+			st, err := reader.read(ctx, h)
+			if err != nil {
+				t.Fatalf("%s after the late read: %v", reader.name, err)
+			}
+			assertRunningNotWaiting(t, reader.name+" after the late read", st)
+		})
+	}
+}
+
+// TestFailedDeadlineStopKeepsTheLiveStatusOverATransportError pins that a
+// runtime read failing in transport (not NotFound) after a failed deadline
+// stop reports the kept live status, on either surface, and keeps it.
+func TestFailedDeadlineStopKeepsTheLiveStatusOverATransportError(t *testing.T) {
+	for _, reader := range liveStatusReaders {
+		t.Run(reader.name, func(t *testing.T) {
+			ctx := context.Background()
+			fs := &forgettingStopRuntime{fakeRuntimeServer: newFakeRuntimeServer()}
+			h := newDeadlineStopHarness(t, fs, "deadline-transport")
+			id := string(h.pod.UID)
+			fs.failID = id
+			t.Cleanup(h.r.shutdown)
+			tr := h.r.trackByID(id)
+			if tr == nil {
+				t.Fatal("pod not tracked after CreatePod")
+			}
+			failOneDeadlineStop(t, h, fs, tr)
+
+			fs.fakeRuntimeServer.mu.Lock()
+			fs.fakeRuntimeServer.statusFIFO = append(fs.fakeRuntimeServer.statusFIFO, status.Error(codes.Unavailable, "runtime unavailable"))
+			fs.fakeRuntimeServer.mu.Unlock()
+			st, err := reader.read(ctx, h)
+			if err != nil {
+				t.Fatalf("%s over a transport error: %v, want the kept live status", reader.name, err)
+			}
+			fs.fakeRuntimeServer.mu.Lock()
+			left := len(fs.fakeRuntimeServer.statusFIFO)
+			fs.fakeRuntimeServer.mu.Unlock()
+			if left != 0 {
+				t.Fatalf("the queued transport error was not served (%d left)", left)
+			}
+			assertRunningNotWaiting(t, reader.name+" over a transport error", st)
+			if tr.stoppingStatus() == nil {
+				t.Errorf("%s over a transport error dropped the failed stop's live status", reader.name)
 			}
 		})
 	}

@@ -490,10 +490,20 @@ type podTrack struct {
 	// stop is in flight a NotFound (or a failed read) reports this instead of a
 	// synthesized creating status: a Running pod must not read Pending as it
 	// stops. Set with stopping; a failed stop keeps it (the runtime may have
-	// forgotten the pod all the same) until a runtime read succeeds
-	// (observedLive) or a stop succeeds (finishStopping). It lives and dies with
-	// the track. Guarded by restartMu.
+	// forgotten the pod all the same). Its lifetime is bounded: it ends when a
+	// stop succeeds (finishStopping), or when a runtime read ISSUED after the
+	// last stop attempt began succeeds (observedLive), whichever is first;
+	// otherwise it lives and dies with the track. The discipline that enforces
+	// "issued after": every reader captures stopEpoch (liveReadEpoch) before
+	// its runtime GetPodStatus and passes it to observedLive, which drops the
+	// snapshot only when no stop is in flight and the epoch is unchanged. A
+	// read issued before a stop that completes after the stop failed saw the
+	// pod before the runtime forgot it; letting it drop the snapshot made the
+	// next read synthesize Pending. Guarded by restartMu.
 	stoppingLive *corev1.PodStatus
+	// stopEpoch counts the active-deadline stops begun on t (markStopping
+	// bumps it); see stoppingLive. Guarded by restartMu.
+	stopEpoch uint64
 	// unpersisted holds the terminal status of a pod failed past its active
 	// deadline (failPastDeadline) whose apiserver write has not yet succeeded;
 	// enforceActiveDeadlines retries the write on each resync until it lands, the
@@ -3467,10 +3477,14 @@ func (r *runtimedRuntime) GetPodStatus(ctx context.Context, namespace, name stri
 	}
 	// An evicted pod reports its eviction without asking the runtime, which has
 	// already forgotten it.
-	if t := r.trackByID(id); t != nil {
-		if st := t.evictedStatus(); st != nil {
+	pre := r.trackByID(id)
+	var epoch uint64
+	if pre != nil {
+		if st := pre.evictedStatus(); st != nil {
 			return st, nil
 		}
+		// Captured before the runtime call: see podTrack.stoppingLive.
+		epoch = pre.liveReadEpoch()
 	}
 	resp, err := r.rt.GetPodStatus(ctx, &runtimev1.GetPodStatusRequest{PodId: id})
 	if err != nil {
@@ -3506,7 +3520,9 @@ func (r *runtimedRuntime) GetPodStatus(ctx context.Context, namespace, name stri
 		st := r.buildStatus(pod.DeepCopy(), t, r.synthesizedStatus(pod, t), r.proberFor(id))
 		return &st, nil
 	}
-	t.observedLive()
+	if t == pre {
+		t.observedLive(epoch)
+	}
 	st := r.buildStatus(pod.DeepCopy(), t, resp.GetStatus(), r.proberFor(id))
 	return &st, nil
 }
@@ -3550,6 +3566,8 @@ func (r *runtimedRuntime) podWithStatus(ctx context.Context, tracked *corev1.Pod
 		pod.Status = *st
 		return pod
 	}
+	// Captured before the runtime call: see podTrack.stoppingLive.
+	epoch := t.liveReadEpoch()
 	resp, err := r.rt.GetPodStatus(ctx, &runtimev1.GetPodStatusRequest{PodId: string(pod.UID)})
 	if err != nil || (resp.GetError() != nil && resp.GetError().GetCode() != 0) {
 		// A pod whose deadline stop is in flight, or failed, keeps its last
@@ -3571,7 +3589,7 @@ func (r *runtimedRuntime) podWithStatus(ctx context.Context, tracked *corev1.Pod
 		// a pod that is legitimately waiting.
 		pod.Status = r.buildStatus(pod, t, r.synthesizedStatus(pod, t), r.proberFor(string(pod.UID)))
 	default:
-		t.observedLive()
+		t.observedLive(epoch)
 		pod.Status = r.buildStatus(pod, t, resp.GetStatus(), r.proberFor(string(pod.UID)))
 	}
 	return pod
