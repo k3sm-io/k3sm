@@ -181,12 +181,31 @@ func TestStatusCollectorFSFollowsTheAdminKubeconfigLink(t *testing.T) {
 	// rules never see the host's ~/.kube/config or $KUBECONFIG.
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("KUBECONFIG", filepath.Join(t.TempDir(), "no-such-kubeconfig"))
+	t.Setenv("K3SM_WORK_DIR", "")
+	type reader interface {
+		ReadFile(path string) ([]byte, error)
+	}
+	big := filepath.Join(t.TempDir(), "big")
+	makeSparseOversized(t, big)
+	bigLink := filepath.Join(t.TempDir(), "biglink")
+	if err := os.Symlink(big, bigLink); err != nil {
+		t.Fatal(err)
+	}
 	for name, fs := range map[string]any{
 		"newStatusCollector":  newStatusCollector().FS,
 		"newDaemonsCollector": newDaemonsCollector().FS,
 	} {
-		if _, ok := fs.(linkFollower); !ok {
+		lf, ok := fs.(linkFollower)
+		if !ok {
 			t.Errorf("%s FS is %T, which does not implement ReadFileFollowingLink", name, fs)
+		} else if _, err := lf.ReadFileFollowingLink(bigLink); !errors.Is(err, boundedread.ErrRefused) {
+			t.Errorf("%s FS.ReadFileFollowingLink(oversized) err = %v, want boundedread.ErrRefused", name, err)
+		}
+		r, ok := fs.(reader)
+		if !ok {
+			t.Errorf("%s FS is %T, which does not implement ReadFile", name, fs)
+		} else if _, err := r.ReadFile(big); !errors.Is(err, boundedread.ErrRefused) {
+			t.Errorf("%s FS.ReadFile(oversized) err = %v, want boundedread.ErrRefused", name, err)
 		}
 	}
 }
