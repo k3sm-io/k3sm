@@ -276,7 +276,7 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
   headers within 30 seconds ends the same way it always ended when the registry could not be reached:
   the gate closes the connection, and the puller tries its next mirror. A pull that cannot reach the
   local registry is now logged.
-- The push gate warns at most once a minute per cause when pulls cannot reach the local registry.
+- The push gate warns at most once a minute per cause when pulls or authorized pushes cannot reach the local registry.
 - A server whose control plane does not report healthy in time while the Mac is heavily loaded no
   longer parks on the crash-loop breaker after five attempts. It backs off instead, from 30 seconds
   doubling up to 10 minutes, `k3sm status` shows when the next attempt starts and that an attempt

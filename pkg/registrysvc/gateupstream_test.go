@@ -466,8 +466,9 @@ func TestGateReadErrorWarnsOncePerIntervalPerCause(t *testing.T) {
 }
 
 // TestGateWriteErrorLogsCancellationAtDebug: an authorized write the registry
-// did not take is a Warn naming the method and path, unless the client
-// cancelled it, which is a Debug. Either way the client is answered 502.
+// did not take is a Warn naming its cause and not the request, unless the
+// client cancelled it, which is a Debug naming the method and path. Either way
+// the client is answered 502.
 func TestGateWriteErrorLogsCancellationAtDebug(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -492,11 +493,144 @@ func TestGateWriteErrorLogsCancellationAtDebug(t *testing.T) {
 			if line["level"] != tc.level {
 				t.Errorf("level = %v, want %s", line["level"], tc.level)
 			}
-			if line["method"] != "PUT" || line["path"] != path {
+			if tc.level == "WARN" {
+				if _, ok := line["method"]; ok {
+					t.Errorf("warning names the method %v; want no request", line["method"])
+				}
+				if _, ok := line["path"]; ok {
+					t.Errorf("warning names the path %v; want no request", line["path"])
+				}
+				if line["cause"] != "other" {
+					t.Errorf("cause = %v, want other", line["cause"])
+				}
+			} else if line["method"] != "PUT" || line["path"] != path {
 				t.Errorf("method, path = %v, %v; want the request's", line["method"], line["path"])
 			}
 			if rec.Code != http.StatusBadGateway {
 				t.Errorf("status = %d, want 502", rec.Code)
+			}
+		})
+	}
+}
+
+// TestGateWriteErrorWarnsOncePerInterval: an authorized write that cannot
+// reach the registry is a Warn at most once per interval for each cause, with
+// a limit of its own apart from the reads'; the failures in between are Debug,
+// and the next Warn counts them. A client's cancellation is a Debug outside the
+// count. Every write failure is answered 502.
+func TestGateWriteErrorWarnsOncePerInterval(t *testing.T) {
+	refused := &net.OpError{Op: "dial", Net: "tcp", Err: &os.SyscallError{Syscall: "connect", Err: syscall.ECONNREFUSED}}
+	canceled := fmt.Errorf("proxy: %w", context.Canceled)
+	interval := gateReadWarnInterval
+	const (
+		readPath  = "/v2/team/app/blobs/" + digestA
+		writePath = "/v2/team/app/manifests/v1"
+	)
+
+	// event is one failed request, a read or a write, made after advancing
+	// the clock by after.
+	type event struct {
+		after time.Duration
+		read  bool
+		err   error
+	}
+	// line is one expected log line: cause "" means no cause key, suppressed
+	// 0 means no suppressed key.
+	type line struct {
+		level      string
+		msg        string
+		cause      string
+		suppressed int
+	}
+	const (
+		readMsg  = "ingest registry gate could not reach the local registry"
+		writeMsg = "ingest registry gate could not forward an authorized write"
+	)
+	write := func(err error) event { return event{err: err} }
+	warnW := func(suppressed int) line { return line{"WARN", writeMsg, "refused", suppressed} }
+	debugW := func(cause string) line { return line{"DEBUG", writeMsg, cause, 0} }
+
+	for _, tc := range []struct {
+		name   string
+		events []event
+		want   []line
+	}{
+		{
+			name:   "the first write failure warns with its cause and no count",
+			events: []event{write(refused)},
+			want:   []line{warnW(0)},
+		},
+		{
+			name:   "write failures inside the interval are debug",
+			events: []event{write(refused), write(refused), write(refused)},
+			want:   []line{warnW(0), debugW("refused"), debugW("refused")},
+		},
+		{
+			name:   "the first write failure after the interval warns with the count",
+			events: []event{write(refused), write(refused), write(refused), {after: interval, err: refused}},
+			want:   []line{warnW(0), debugW("refused"), debugW("refused"), warnW(2)},
+		},
+		{
+			name:   "a read and a write failing at one instant both warn",
+			events: []event{{read: true, err: refused}, write(refused)},
+			want:   []line{{"WARN", readMsg, "refused", 0}, warnW(0)},
+		},
+		{
+			name:   "a write cancellation is debug and not counted",
+			events: []event{write(refused), write(canceled), write(refused), {after: interval, err: refused}},
+			want:   []line{warnW(0), debugW(""), debugW("refused"), warnW(1)},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sink := &syncBuffer{}
+			log := slog.New(slog.NewJSONHandler(sink, &slog.HandlerOptions{Level: slog.LevelDebug}))
+			clk := &fakeClock{t: time.Date(2026, 11, 13, 7, 0, 0, 0, time.UTC)}
+			g := newGate(gateConfig{Upstream: "127.0.0.1:1", Logger: log, Now: clk.now})
+			for _, e := range tc.events {
+				clk.advance(e.after)
+				if e.read {
+					g.readError(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, readPath, nil), e.err)
+					continue
+				}
+				rec := httptest.NewRecorder()
+				g.writeError(rec, httptest.NewRequest(http.MethodPut, writePath, nil), e.err)
+				if rec.Code != http.StatusBadGateway {
+					t.Errorf("write status = %d, want 502", rec.Code)
+				}
+			}
+
+			var got []line
+			for _, raw := range strings.Split(strings.TrimSpace(sink.String()), "\n") {
+				var m map[string]any
+				if err := json.Unmarshal([]byte(raw), &m); err != nil {
+					t.Fatalf("log line %q: %v", raw, err)
+				}
+				l := line{level: fmt.Sprint(m["level"]), msg: fmt.Sprint(m["msg"])}
+				if c, ok := m["cause"]; ok {
+					l.cause = fmt.Sprint(c)
+				}
+				if n, ok := m["suppressed"]; ok {
+					if f, _ := n.(float64); f <= 0 {
+						t.Errorf("line %q: want suppressed only when positive", raw)
+					} else {
+						l.suppressed = int(f)
+					}
+				}
+				_, hasMethod := m["method"]
+				_, hasPath := m["path"]
+				if l.level == "WARN" && (hasMethod || hasPath) {
+					t.Errorf("warning %q names a request; want only the target, cause and error", raw)
+				}
+				if l.level == "DEBUG" && l.msg == writeMsg && (m["method"] != "PUT" || m["path"] != writePath) {
+					t.Errorf("debug line %q: want the write's method and path", raw)
+				}
+				if m["target"] != "127.0.0.1:1" || m["err"] == nil {
+					t.Errorf("line %q: want the target and the error", raw)
+				}
+				got = append(got, l)
+			}
+			if fmt.Sprint(got) != fmt.Sprint(tc.want) {
+				t.Errorf("lines =\n%v\nwant\n%v", got, tc.want)
 			}
 		})
 	}
