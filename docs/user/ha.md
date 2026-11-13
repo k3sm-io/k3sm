@@ -125,9 +125,10 @@ Rolling back is described under [Upgrade](upgrade.md#rolling-back-past-the-aggre
 One full run on two Macs with two servers covered join, replication, leader election, stopping one
 server (the survivor lost quorum and writes stopped), killing and restarting etcd with no
 acknowledged write lost, a cluster reset, a cold restart and a one-hour load. It was made on an
-earlier build and has not been repeated. Two Macs show the mechanics, not fault tolerance. Not run:
-three servers, a longer load, sleep and wake of a server, snapshots across two Macs, and a worker
-joined to two servers. There is no availability guarantee. Keep datastore backups (see
+earlier build and has not been repeated. Two voting members tolerate no failure, so two Macs show
+the mechanics, not fault tolerance. These were not run: three servers, a longer load, sleep and
+wake of a server, snapshot save and restore on two Macs (only loopback tests cover them), and a
+worker joined to two servers. There is no availability guarantee. Keep datastore backups (see
 [Backup & restore](backup-restore.md)).
 On a server started with `--cluster-init` or `--server-join`, `k3sm snapshot save` streams an online
 snapshot of this server's etcd member. `k3sm snapshot restore` puts one back as a new single-member
