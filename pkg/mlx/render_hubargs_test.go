@@ -56,6 +56,13 @@ func TestRenderRefusesHubFetchArgsForClusterStoreModels(t *testing.T) {
 		// not name, and the engine falls back to the Hub when nothing is there.
 		{"store_adapter_relative", artifactModel, []string{"--adapter-path", "adapters/v2"}, true},
 		{"sharded_store_adapter_repo_id", shardedArtifactModel, []string{"--adapter-path", "org/adapter"}, true},
+		// argparse treats every argument after a bare "--" as positional.
+		{"store_after_double_dash_not_an_option", artifactModel, []string{"--", "--adapter-path", "org/x"}, false},
+		{"store_later_bad_occurrence", artifactModel, []string{"--adapter-path", "/abs/a", "--adapter-path", "org/x"}, true},
+		// Today's behaviour: a checked option followed directly by another
+		// option takes that option's name as its value, which is not an
+		// absolute path, so it is refused.
+		{"store_adapter_value_is_next_option_refused_today", artifactModel, []string{"--adapter-path", "--draft-model", "/a"}, true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

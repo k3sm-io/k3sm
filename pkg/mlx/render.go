@@ -458,9 +458,14 @@ var clusterStoreHubArgs = []string{"--adapter-path", "--draft-model"}
 // engine falls back to the Hub when nothing is there. Because argparse accepts
 // an unambiguous prefix of an option, an argument matches a checked option
 // when its name equals it or abbreviates it unambiguously (see
-// MatchArgPrefix). No other argument is inspected.
+// MatchArgPrefix). Scanning stops at a bare "--": argparse treats every
+// argument after it as positional, so none of them sets an option. No other
+// argument is inspected.
 func checkClusterStoreArgs(args []string) error {
 	for i, arg := range args {
+		if arg == "--" {
+			break
+		}
 		name, value, inline := strings.Cut(arg, "=")
 		flag, ok := MatchArgPrefix(name, clusterStoreHubArgs)
 		if !ok {

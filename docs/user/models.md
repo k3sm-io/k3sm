@@ -8,7 +8,8 @@ the engine never contacts Hugging Face.
 
 Because the engine cannot fetch a second repository, a model that sets `spec.artifact` is refused with
 `InvalidSpec` when `spec.runtime.args` sets `--adapter-path` or `--draft-model` (or an unambiguous
-abbreviation of either) to anything but an absolute path. To use an adapter or a draft model, mount its
+abbreviation of either) to anything but an absolute path; arguments after a bare `--` are positional
+to the engine and are not checked. To use an adapter or a draft model, mount its
 weights into the pod and pass their absolute path.
 
 Three verbs manage these artifacts:
