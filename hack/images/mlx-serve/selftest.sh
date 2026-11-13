@@ -68,15 +68,20 @@
 #   --case serve.model.routes runs only that case: k3sm_serve's refusal of the
 #   embedding and audio model routes, on fakes and, when a staged tree is present,
 #   on the real engine.
-#   Any other argument is refused with exit 2.
+#   --check runs the full ladder, as no argument does (gate fields name it).
+#   Any other argument is refused with a usage line and exit 2.
 # Exit: 0 all checks pass, 1 otherwise, 2 on a usage error.
 set -uo pipefail
 
 STAGED_REQUIRED=0
 STRICT_SELF_TEST=0
 CASE=""
+usage() {
+	echo "usage: selftest.sh [--check] [--staged] [--strict-self-test] [--case serve.image.remote|serve.model.routes]" >&2
+}
 while [ $# -gt 0 ]; do
 	case "$1" in
+		--check) ;;
 		--staged) STAGED_REQUIRED=1 ;;
 		--strict-self-test)
 			if [ -n "${K3SM_MLX_SELFTEST_ONLY:-}" ]; then
@@ -92,7 +97,8 @@ while [ $# -gt 0 ]; do
 			CASE="$2"
 			shift ;;
 		*)
-			echo "selftest: unknown argument '$1' (only --staged, --strict-self-test and --case)" >&2
+			echo "selftest: unknown argument '$1' (only --check, --staged, --strict-self-test and --case)" >&2
+			usage
 			exit 2 ;;
 	esac
 	shift
@@ -1287,27 +1293,36 @@ fi
 # stage, --staged fails and exits 1 and no flag skips and exits 0; against a
 # fixture stage, 9a reports pin.real and fails runshape (the fixture is not the
 # pinned body); an unknown argument and a nested --strict-self-test exit 2.
+# strict_leg <label> <want-exit> <stage> <args>... -- <want-line-regex>...
+# re-runs this script's 9a verdict with <args> against <stage> and checks the
+# exit and the lines; the argument parse is the full run's.
+strict_leg() {
+	local label="$1" want="$2" stage="$3"; shift 3
+	local args=() lines=() out rc miss=""
+	while [ $# -gt 0 ] && [ "$1" != -- ]; do args+=("$1"); shift; done
+	[ $# -gt 0 ] && shift
+	lines=("$@")
+	out="$(K3SM_MLX_SELFTEST_ONLY=9a K3SM_MLX_STAGE="$stage" bash "$HERE/selftest.sh" ${args[@]+"${args[@]}"} 2>&1)"
+	rc=$?
+	for l in ${lines[@]+"${lines[@]}"}; do
+		grep -qE -- "$l" <<< "$out" || miss="$miss '$l'"
+	done
+	if [ "$rc" = "$want" ] && [ -z "$miss" ]; then
+		ladder ok "$label"
+	else
+		ladder no "$label (exit $rc, want $want; missing:${miss:- none})"
+		printf '%s\n' "$out" | tail -5
+	fi
+}
+mkdir -p "$WORK/strict-empty"
+# args_legs: --check is accepted, and an unknown flag gets a usage line and exit 2
+args_legs() {
+	strict_leg "$1.check  --check is accepted and runs as no argument does (exit 0 on an empty stage)" \
+		0 "$WORK/strict-empty" --check -- '^SKIP  9a\.real  no staged tree'
+	strict_leg "$1.bogus  an unknown flag (--bogus) is refused with a usage line and exit 2" \
+		2 "$WORK/strict-empty" --bogus -- "unknown argument '--bogus'" '^usage: selftest\.sh '
+}
 if [ "$STRICT_SELF_TEST" = 1 ]; then
-	# strict_leg <label> <want-exit> <stage> <args>... -- <want-line-regex>...
-	strict_leg() {
-		local label="$1" want="$2" stage="$3"; shift 3
-		local args=() lines=() out rc miss=""
-		while [ $# -gt 0 ] && [ "$1" != -- ]; do args+=("$1"); shift; done
-		[ $# -gt 0 ] && shift
-		lines=("$@")
-		out="$(K3SM_MLX_SELFTEST_ONLY=9a K3SM_MLX_STAGE="$stage" bash "$HERE/selftest.sh" ${args[@]+"${args[@]}"} 2>&1)"
-		rc=$?
-		for l in ${lines[@]+"${lines[@]}"}; do
-			grep -qE -- "$l" <<< "$out" || miss="$miss '$l'"
-		done
-		if [ "$rc" = "$want" ] && [ -z "$miss" ]; then
-			ladder ok "$label"
-		else
-			ladder no "$label (exit $rc, want $want; missing:${miss:- none})"
-			printf '%s\n' "$out" | tail -5
-		fi
-	}
-	mkdir -p "$WORK/strict-empty"
 	SFIX="$WORK/strict-stage"
 	mkdir -p "$SFIX/bin" "$SFIX/lib/python3.12/site-packages"
 	make_engine_fixture "$SFIX/lib/python3.12/site-packages"
@@ -1330,6 +1345,7 @@ if [ "$STRICT_SELF_TEST" = 1 ]; then
 		2 "$WORK/strict-empty" --case serve.nothing -- "unknown case 'serve.nothing'"
 	strict_leg "strict.recursion  --strict-self-test inside its own child run is refused with exit 2" \
 		2 "$WORK/strict-empty" --strict-self-test -- 'recursion refused'
+	args_legs strict.args
 	echo "----------------------------------------"
 	echo "mlx-serve strict self-test: $PASS passed, $FAIL failed, $SKIP skipped"
 	[ "$FAIL" -eq 0 ] || exit 1
@@ -1356,6 +1372,8 @@ if command -v shellcheck >/dev/null 2>&1; then
 else
 	ladder skip "0.shellcheck  not installed on this host"
 fi
+
+args_legs 0.args
 
 # ---- 1 — the lockfile is exactly pinned, with hashes ------------------------
 # Counted here independently of build.sh, so a broken checker cannot pass itself.
@@ -2046,6 +2064,15 @@ with open(os.path.join(fakepkg, "mlx_lm", "server.py"), "w") as f:
         "    mode = os.environ['FAKE_ENGINE_MODE']\n"
         "    if mode == 'fail':\n"
         "        return 3\n"
+        # like the real mlx_lm.server: no SIGTERM handler, so the signal's
+        # default action ends the process; the pid goes in the ready file
+        "    if mode == 'bare':\n"
+        "        ready = os.environ['FAKE_ENGINE_READY']\n"
+        "        with open(ready + '.tmp', 'w') as r:\n"
+        "            r.write(str(os.getpid()))\n"
+        "        os.rename(ready + '.tmp', ready)\n"
+        "        time.sleep(30)\n"
+        "        return 0\n"
         "    signal.signal(signal.SIGTERM, _stop)\n"
         "    open(os.environ['FAKE_ENGINE_READY'], 'w').close()\n"
         "    try:\n"
@@ -2061,28 +2088,73 @@ with open(os.path.join(fakepkg, "mlx_lm", "server.py"), "w") as f:
         "from typing import Any, Dict, List\n"
         "from urllib.request import urlopen\n"
         + "".join(inspect.getsource(fn) for fn in (_image_url, _image_parts, _inline_image_urls)))
-def rank_proc(mode):
+def rank_proc(mode, wrap=()):
     e = env(MLX_WORLD_SIZE="1", MLX_RANK="0", K3SM_MLX_RANKS=names[0], K3SM_POD_IP="10.42.0.5")
     e.update(PYTHONPATH=os.pathsep.join([here, fakepkg]), PYTHONDONTWRITEBYTECODE="1", FAKE_ENGINE_MODE=mode,
              FAKE_ENGINE_READY=os.path.join(work, "engine-ready"), FAKE_ENGINE_GOT=os.path.join(work, "engine-got"),
              PATH=os.environ.get("PATH", ""))
-    return subprocess.Popen([sys.executable, "-m", "k3sm_shard", "--model", "/snap"], env=e,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL), e
+    for f in (e["FAKE_ENGINE_READY"], e["FAKE_ENGINE_GOT"]):
+        if os.path.exists(f):
+            os.remove(f)
+    # the rank's stderr goes to a file, shown when a check on the rank fails
+    errf = open(os.path.join(work, f"rank-{mode}.err"), "w+")
+    p = subprocess.Popen(list(wrap) + [sys.executable, "-m", "k3sm_shard", "--model", "/snap"], env=e,
+                         stdout=subprocess.PIPE if wrap else subprocess.DEVNULL, stderr=errf, text=True)
+    p.errf = errf
+    return p, e
+def wait_rank(p):
+    try:
+        return p.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.wait()
+        return "timeout"
+def check_rank(name, cond, p):
+    check(name, cond)
+    p.errf.seek(0)
+    err = p.errf.read()
+    p.errf.close()
+    if not cond:
+        # "|" lines are shown under the failed check, not counted as verdicts
+        print("| rank stderr (" + name.split()[0] + "):", flush=True)
+        for line in (err or "(empty)").splitlines()[-20:]:
+            print("| " + line, flush=True)
+def wait_ready(p, e):
+    deadline = time.monotonic() + 30
+    while not os.path.exists(e["FAKE_ENGINE_READY"]) and p.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.05)
 p, _ = rank_proc("fail")
-check("exit.status  an engine main() returning 3 makes the rank exit 3", p.wait(timeout=30) == 3)
+check_rank("exit.status  an engine main() returning 3 makes the rank exit 3", wait_rank(p) == 3, p)
 p, e = rank_proc("term")
-deadline = time.monotonic() + 30
-while not os.path.exists(e["FAKE_ENGINE_READY"]) and p.poll() is None and time.monotonic() < deadline:
-    time.sleep(0.05)
+wait_ready(p, e)
 p.send_signal(signal.SIGTERM)
-try:
-    rc = p.wait(timeout=30)
-except subprocess.TimeoutExpired:
-    p.kill()
-    rc = p.wait()
+rc = wait_rank(p)
 got = open(e["FAKE_ENGINE_GOT"]).read() if os.path.exists(e["FAKE_ENGINE_GOT"]) else ""
-check("exit.sigterm  SIGTERM to the rank reaches the engine, and its shutdown status is the rank's",
-      got == str(int(signal.SIGTERM)) and rc == 128 + signal.SIGTERM)
+check_rank("exit.sigterm  SIGTERM to the rank reaches the engine, and its shutdown status is the rank's",
+           got == str(int(signal.SIGTERM)) and rc == 128 + signal.SIGTERM, p)
+# an engine with no SIGTERM handler (mlx_lm.server installs none): the rank
+# dies by the signal, and the shell that started it, as a pod's runtime does,
+# reports 128+15
+p, e = rank_proc("bare")
+wait_ready(p, e)
+p.send_signal(signal.SIGTERM)
+rc = wait_rank(p)
+check_rank("exit.sigterm.bare  with no engine handler, SIGTERM kills the rank by the signal", rc == -signal.SIGTERM, p)
+p, e = rank_proc("bare", wrap=("sh", "-c", '"$@"; echo "status $?"', "sh"))
+wait_ready(p, e)
+pid = open(e["FAKE_ENGINE_READY"]).read() if os.path.exists(e["FAKE_ENGINE_READY"]) else ""
+if pid.isdigit():
+    os.kill(int(pid), signal.SIGTERM)
+rc = wait_rank(p)
+out = p.stdout.read() if rc != "timeout" else ""
+p.stdout.close()
+check_rank("exit.sigterm.status  with no engine handler, the rank's parent reports 128+15 for it",
+           pid.isdigit() and rc == 0 and out.strip() == f"status {128 + signal.SIGTERM}", p)
+
+# exit_status: None is 0, an int is itself, a bool or any other value is 1
+check("exit.status.unit  exit_status maps None to 0, 7 to 7, and True, False, '3', 3.0 and object() to 1",
+      ks.exit_status(None) == 0 and ks.exit_status(7) == 7
+      and all(ks.exit_status(v) == 1 for v in (True, False, "3", 3.0, object())))
 
 # the liveness probe against a local server
 class H(http.server.BaseHTTPRequestHandler):
@@ -2109,11 +2181,16 @@ check("probe.starting  a server not listening yet exits 0 (starting, not hung)",
       ks.probe({"K3SM_MLX_SERVE_PORT": closed}, timeout=5) == 0)
 PY
 SHARD_CHECKS=0
-# stdout carries the verdicts; stderr (the probe's own diagnostics) is kept
-# aside and shown only if the driver did not report every check.
+# stdout carries the verdicts, and a failed rank check's "|" lines (the rank's
+# stderr); the driver's own stderr (the probe's diagnostics) is kept aside and
+# shown only if the driver did not report every check.
 shard_out="$(PYTHONDONTWRITEBYTECODE=1 python3 "$WORK/shard-driver.py" "$HERE" "$WORK/shard" 2>"$WORK/shard-driver.err")"
 while read -r verdict name; do
 	[ -n "$verdict" ] || continue
+	if [ "$verdict" = "|" ]; then
+		echo "      | $name"
+		continue
+	fi
 	SHARD_CHECKS=$((SHARD_CHECKS + 1))
 	case "$verdict" in
 		ok) ladder ok "7.$name" ;;
@@ -2122,10 +2199,10 @@ while read -r verdict name; do
 	esac
 done <<< "$shard_out"
 # A driver that crashed before its checks would otherwise pass vacuously.
-if [ "$SHARD_CHECKS" -ge 46 ]; then
+if [ "$SHARD_CHECKS" -ge 49 ]; then
 	ladder ok "7.count  all $SHARD_CHECKS entrypoint checks reported"
 else
-	ladder no "7.count  only $SHARD_CHECKS of 46 entrypoint checks reported (the driver crashed?)"
+	ladder no "7.count  only $SHARD_CHECKS of 49 entrypoint checks reported (the driver crashed?)"
 	head -20 "$WORK/shard-driver.err"
 fi
 
