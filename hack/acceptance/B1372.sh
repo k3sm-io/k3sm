@@ -31,6 +31,8 @@
 # registry prune. `model rm <tag>` runs on the server only (t.7, and f.1 if t.7 did not
 # remove it). These are the product's public verbs, so they are not exceptions, but they
 # do delete: the run's model and every image no pod uses at that moment.
+# The one exception to "as root over ssh" is the pushing binary's `version` (t.0): it runs
+# on this machine, not as root and not over ssh.
 #
 # Rungs (`--plan` prints them; the first red rung ends the run, every rung not reached
 # is red, and the cleanup f.1 runs green or red):
@@ -186,9 +188,19 @@
 #             --model-sums: one `<sha256-hex>  <relative path>` line per file (shasum -a 256 form)
 # shellcheck disable=SC2016 # the remote script texts expand on the remote side
 set -euo pipefail
-HERE="$(cd "$(dirname "$0")" && pwd)"
+# Resolve $0 through symlinks first (no readlink -f or realpath: macOS bash 3.2), so a
+# run through a link still finds the repo and the tolerations library.
+SELF_PATH="$0"
+while [ -L "$SELF_PATH" ]; do
+	link_target="$(readlink "$SELF_PATH")"
+	case "$link_target" in
+	/*) SELF_PATH="$link_target" ;;
+	*) SELF_PATH="$(dirname "$SELF_PATH")/$link_target" ;;
+	esac
+done
+HERE="$(cd "$(dirname "$SELF_PATH")" 2>/dev/null && pwd)" || { echo "cannot enter the directory of $SELF_PATH" >&2; exit 2; }
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
-SELF="$HERE/$(basename "$0")"
+SELF="$HERE/$(basename "$SELF_PATH")"
 # shellcheck source-path=SCRIPTDIR/../lab source=../lab/lib/tolerations.sh
 . "$REPO_ROOT/hack/lab/lib/tolerations.sh"
 
@@ -2348,6 +2360,12 @@ self_test() {
 	chk "--lab without K3SM_LAB" "$rc" 3
 	out="$("$SELF" --plan)"
 	for rung in p.0 t.0 t.1 t.2 t.3 t.3b t.4 t.5 t.6 t.7 f.1 t.8; do has "--plan" "$out" "  $rung "; done
+
+	# Run through a symlink in another directory, the script finds its repo and starts.
+	mkdir "$base/lnk"
+	ln -s "$SELF" "$base/lnk/B1372-link.sh"
+	out="$("$base/lnk/B1372-link.sh" --plan 2>&1)" || { echo "self-test FAIL: --plan through a symlink"; bad=1; }
+	has "--plan through a symlink" "$out" "  t.0 "
 
 	rm -rf "$base"
 	[ "$bad" = 0 ] || exit 1
