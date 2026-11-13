@@ -723,7 +723,7 @@ process that exits stays exited until a `Deployment`/`Job` controller replaces t
 
 ### `activeDeadlineSeconds` Is Enforced on the Default Runtime, Not on `hostprocess`
 
-A Pod that runs past its `activeDeadlineSeconds` is marked `Failed` with reason `DeadlineExceeded`. The check runs every 10 s, so this can happen up to about 10 s after the deadline. The Pod's IP address stays reserved until you delete the Pod. Its containers get the Pod's `terminationGracePeriodSeconds` to stop, but never less than 2 s. `preStop` hooks do not run. With `--runtime hostprocess` the deadline is not enforced and the Pod keeps running, so delete it yourself or use the default runtime.
+A Pod that runs past its `activeDeadlineSeconds` is marked `Failed` with reason `DeadlineExceeded`. The check runs every 10 s, so this can happen up to about 10 s after the deadline. The Pod's IP address stays reserved until you delete the Pod. Its containers get the Pod's `terminationGracePeriodSeconds` to stop, but never less than 2 s. `preStop` hooks do not run. The Pod is reported `Failed` only after its stop succeeds. While the stop runs, and after a stop that failed or timed out until the retry, the Pod keeps showing its last live status, `Running`. Each stop attempt is bounded by the Pod's termination grace period plus 30 s, and a failed or timed-out attempt is retried at the next 10 s check. With `--runtime hostprocess` the deadline is not enforced and the Pod keeps running, so delete it yourself or use the default runtime.
 
 ### What Survives a Node-Daemon Restart
 
@@ -826,9 +826,11 @@ always agree.
 - **One Pod per round.** After each eviction k3sm waits for that Pod to stop and for a fresh
   sample, and evicts again only if pressure is not falling. After 3 evictions in 5 minutes it stops
   for the rest of that pressure episode, logs an error, and records an `EvictionCascadeHalted`
-  Event on the node.
+  Event on the node. A kill that fails publishes nothing and does not count toward that halt: the Pod
+  stays `Running` and may be picked again. If the chosen Pod is already being stopped by something
+  else, k3sm tries the next candidate in the same round.
 - **What an evicted Pod shows.** Phase `Failed`, reason `Evicted`, the kubelet's message, an
-  `Evicted` Event, and the `DisruptionTarget` condition. Its containers are killed at once, with no
+  `Evicted` Event, and the `DisruptionTarget` condition, all reported only after the kill succeeds. Its containers are killed at once, with no
   `preStop` hook, and exit 137. The Pod object stays until it is deleted, so its controller replaces
   it as it would on a kubelet, and this node never starts it again.
 - **Two differences from the kubelet.** Eviction sends SIGKILL at once, with no SIGTERM grace
@@ -852,7 +854,7 @@ marks every Pod process so that kill picks a Pod before the control plane. The m
 Runbook:
 
 - To tell an eviction from a kernel kill: an evicted Pod is `Failed` with reason `Evicted` and has
-  an `Evicted` Event. A kernel kill leaves a container that exited 137 with no such Event, and a
+  an `Evicted` Event. A Pod that still shows `Running` has not been evicted yet: its kill is still running or failed, and the status is published only after the kill succeeds. A kernel kill leaves a container that exited 137 with no such Event, and a
   kernel log line you can find with
   `log show --predicate 'sender == "kernel"' --last 1h | grep -i "paging space"`.
 - After upgrading k3sm, recreate long-running Pods. A Pod started by an older version is not marked
