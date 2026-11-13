@@ -138,7 +138,7 @@ func (r *runtimedRuntime) startDeadlineStop(ctx context.Context, tracked *corev1
 		return
 	}
 	st := failedPodStatus(prior.Status, reasonDeadlineExceeded, msgDeadlineExceeded, metav1.NewTime(r.clk.Now()))
-	if !t.markStopping() {
+	if !t.markStopping(prior.Status.DeepCopy()) {
 		r.deadlineStops.Done()
 		return
 	}

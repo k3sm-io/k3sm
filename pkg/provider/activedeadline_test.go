@@ -19,6 +19,7 @@ package provider
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1102,4 +1103,91 @@ func TestDeadlineStopFencesThePodWhileItRuns(t *testing.T) {
 	if st := tr.evictedStatus(); st == nil || st.Reason != reasonDeadlineExceeded {
 		t.Errorf("track status = %v, want Failed/%s once the stop succeeded", st, reasonDeadlineExceeded)
 	}
+}
+
+// TestDeadlineStopKeepsTheLastLiveStatusWhileTheRuntimeForgetsThePod pins the
+// status of a pod whose deadline stop is in flight once the runtime has
+// forgotten it: the runtime drops the pod as its DeletePod begins (the base
+// fake deletes its record before waiting on deleteHold), and the pod must go on
+// reading its last live status (Running, no container Waiting) on every
+// surface, never the synthesized creating status (Pending, ContainerCreating),
+// until the stop succeeds and it reads Failed/DeadlineExceeded.
+func TestDeadlineStopKeepsTheLastLiveStatusWhileTheRuntimeForgetsThePod(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeRuntimeServer()
+	hold := make(chan struct{})
+	f.deleteHold = hold
+	var released atomic.Bool
+	release := func() {
+		if released.CompareAndSwap(false, true) {
+			close(hold)
+		}
+	}
+	h := newDeadlineStopHarness(t, f, "deadline-forgotten")
+	t.Cleanup(h.r.shutdown)
+	t.Cleanup(release)
+	var events []string
+	events = append(events, recordedEvents(h.rec.Events)...)
+
+	assertLive := func(t *testing.T, surface string, st corev1.PodStatus) {
+		t.Helper()
+		if st.Phase != corev1.PodRunning {
+			t.Errorf("%s phase = %s, want %s", surface, st.Phase, corev1.PodRunning)
+		}
+		for _, cs := range st.ContainerStatuses {
+			if cs.State.Waiting != nil {
+				t.Errorf("%s container %s Waiting (%s), want not Waiting", surface, cs.Name, cs.State.Waiting.Reason)
+			}
+		}
+	}
+	st, err := h.r.GetPodStatus(ctx, h.pod.Namespace, h.pod.Name)
+	if err != nil {
+		t.Fatalf("GetPodStatus before the deadline: %v", err)
+	}
+	assertLive(t, "GetPodStatus before the deadline", *st)
+
+	h.mu.Lock()
+	h.published = nil
+	h.mu.Unlock()
+	h.clk.Step(20 * time.Minute)
+	h.r.resync(ctx)
+	waitBounded(t, "the deadline stop to reach the runtime", func() bool { return f.deleteCount() == 1 })
+	f.mu.Lock()
+	_, known := f.created[string(h.pod.UID)]
+	f.mu.Unlock()
+	if known {
+		t.Fatal("the fake runtime still knows the pod inside its held DeletePod")
+	}
+
+	// A second tick while the stop is held publishes from the runtime's NotFound.
+	h.clk.Step(10 * time.Second)
+	h.r.resync(ctx)
+	st, err = h.r.GetPodStatus(ctx, h.pod.Namespace, h.pod.Name)
+	if err != nil {
+		t.Fatalf("GetPodStatus while the stop is held: %v", err)
+	}
+	assertLive(t, "GetPodStatus while the stop is held", *st)
+	pods, err := h.r.GetPods(ctx)
+	if err != nil {
+		t.Fatalf("GetPods while the stop is held: %v", err)
+	}
+	for _, p := range pods {
+		if p.Name == h.pod.Name {
+			assertLive(t, "GetPods while the stop is held", p.Status)
+		}
+	}
+	h.mu.Lock()
+	published := append([]corev1.PodStatus(nil), h.published...)
+	h.mu.Unlock()
+	if len(published) == 0 {
+		t.Fatal("no status published while the stop is held")
+	}
+	for i, p := range published {
+		assertLive(t, fmt.Sprintf("publication %d while the stop is held", i), p)
+	}
+
+	release()
+	waitDeadlineStops(h.r)
+	events = append(events, recordedEvents(h.rec.Events)...)
+	h.assertDeadlineFailed(t, events)
 }

@@ -485,6 +485,12 @@ type podTrack struct {
 	// and failPastDeadline sets evicted. Cleared by that, or by a failed stop.
 	// Guarded by restartMu.
 	stopping bool
+	// stoppingLive is the pod's last live status, read just before stopping was
+	// set. The runtime forgets the pod as its DeletePod begins, so while the
+	// stop is in flight a NotFound (or a failed read) reports this instead of a
+	// synthesized creating status: a Running pod must not read Pending as it
+	// stops. Set and cleared with stopping; guarded by restartMu.
+	stoppingLive *corev1.PodStatus
 	// unpersisted holds the terminal status of a pod failed past its active
 	// deadline (failPastDeadline) whose apiserver write has not yet succeeded;
 	// enforceActiveDeadlines retries the write on each resync until it lands, the
@@ -3465,6 +3471,13 @@ func (r *runtimedRuntime) GetPodStatus(ctx context.Context, namespace, name stri
 	}
 	resp, err := r.rt.GetPodStatus(ctx, &runtimev1.GetPodStatusRequest{PodId: id})
 	if err != nil {
+		// A pod whose deadline stop is in flight reports its last live status:
+		// the runtime may be forgetting it as the stop runs.
+		if t := r.trackByID(id); t != nil {
+			if st := t.stoppingStatus(); st != nil {
+				return st, nil
+			}
+		}
 		return nil, fmt.Errorf("runtimed get pod status %s/%s: %w", namespace, name, err)
 	}
 	t := r.trackByID(id)
@@ -3472,6 +3485,12 @@ func (r *runtimedRuntime) GetPodStatus(ctx context.Context, namespace, name stri
 		return nil, vkadapter.NotFoundf("pod %q not found", namespace+"/"+name)
 	}
 	if e := resp.GetError(); e != nil && e.GetCode() != 0 {
+		// A pod whose deadline stop is in flight is not being created: the
+		// runtime forgot it as its DeletePod began. It reports its last live
+		// status until the stop finishes and records Failed.
+		if st := t.stoppingStatus(); st != nil {
+			return st, nil
+		}
 		// The provider tracks this pod but the runtime does not know it: either the
 		// CreatePod RPC is still in flight (the track is installed before the
 		// call), or the create was refused for an image failure and the pod is
@@ -3528,6 +3547,15 @@ func (r *runtimedRuntime) podWithStatus(ctx context.Context, tracked *corev1.Pod
 		return pod
 	}
 	resp, err := r.rt.GetPodStatus(ctx, &runtimev1.GetPodStatusRequest{PodId: string(pod.UID)})
+	if err != nil || (resp.GetError() != nil && resp.GetError().GetCode() != 0) {
+		// A pod whose deadline stop is in flight keeps its last live status:
+		// the runtime forgets the pod as its DeletePod begins, and the stop is
+		// not a create (see podTrack.stoppingLive).
+		if st := t.stoppingStatus(); st != nil {
+			pod.Status = *st
+			return pod
+		}
+	}
 	switch {
 	case err != nil:
 		// A transport failure says nothing about the pod; leave the status it

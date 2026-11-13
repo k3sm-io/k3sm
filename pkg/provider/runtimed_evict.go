@@ -68,14 +68,29 @@ func (t *podTrack) markEvicted(st *corev1.PodStatus) bool {
 // is recorded yet. It refuses a track that is deleting, was rejected at
 // admission, is already stopping, or is already terminal. finishStopping
 // records the status once the stop succeeds; clearStopping rolls it back.
-func (t *podTrack) markStopping() bool {
+// live is the pod's last live status, read before the mark: the runtime forgets
+// the pod as its stop begins, so the readers report live (stoppingStatus) for
+// the rest of the stop instead of a synthesized creating status.
+func (t *podTrack) markStopping(live *corev1.PodStatus) bool {
 	t.restartMu.Lock()
 	defer t.restartMu.Unlock()
 	if t.evicted != nil || t.deleting || t.rejected || t.stopping {
 		return false
 	}
 	t.stopping = true
+	t.stoppingLive = live
 	return true
+}
+
+// stoppingStatus returns a copy of the last live status markStopping recorded
+// while t's active-deadline stop is in flight, or nil when no stop is.
+func (t *podTrack) stoppingStatus() *corev1.PodStatus {
+	t.restartMu.Lock()
+	defer t.restartMu.Unlock()
+	if !t.stopping || t.stoppingLive == nil {
+		return nil
+	}
+	return t.stoppingLive.DeepCopy()
 }
 
 // isStopping reports whether t's active-deadline stop is in flight.
@@ -106,6 +121,7 @@ func (t *podTrack) finishStopping(st *corev1.PodStatus) bool {
 	t.restartMu.Lock()
 	defer t.restartMu.Unlock()
 	t.stopping = false
+	t.stoppingLive = nil
 	if t.evicted != nil || t.rejected {
 		return false
 	}
@@ -119,6 +135,7 @@ func (t *podTrack) clearStopping() {
 	t.restartMu.Lock()
 	defer t.restartMu.Unlock()
 	t.stopping = false
+	t.stoppingLive = nil
 }
 
 // unmarkEvicted rolls back markEvicted after a failed runtime teardown, so the
