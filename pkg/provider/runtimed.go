@@ -473,16 +473,17 @@ type podTrack struct {
 	// evicted, when non-nil, is the terminal status of a pod the node-pressure
 	// eviction manager evicted (evictPod), or of a pod failed for outliving its
 	// activeDeadlineSeconds (failPastDeadline); the status carries its own
-	// reason. An eviction sets it BEFORE the runtime teardown starts; a deadline
-	// failure sets it only once its stop has succeeded (stopping holds the pod
-	// meanwhile). Once set it is never cleared; every status path returns it
+	// reason. An eviction and a deadline failure both set it only once their
+	// stop has succeeded (stopping holds the pod meanwhile). Once set it is
+	// never cleared; every status path returns it
 	// first, so nothing the runtime reports afterwards can turn an evicted pod
 	// back into a running or restarting one. Guarded by restartMu with deleting.
 	evicted *corev1.PodStatus
-	// stopping marks a pod whose active-deadline stop is in flight
-	// (startDeadlineStop): it fences a second stop and, unlike evicted, is not
-	// a status, so readers keep reporting the live pod until the stop succeeds
-	// and failPastDeadline sets evicted. Cleared by that, or by a failed stop.
+	// stopping marks a pod whose node-side stop is in flight: an active
+	// deadline's (startDeadlineStop) or an eviction's (evictPod). It fences a
+	// second stop and, unlike evicted, is not a status, so readers keep
+	// reporting the live pod until the stop succeeds and failPastDeadline or
+	// evictPod sets evicted. Cleared by that, or by a failed stop.
 	// Guarded by restartMu.
 	stopping bool
 	// stoppingLive is the pod's last live status, read just before stopping was
@@ -3179,20 +3180,25 @@ func (r *runtimedRuntime) DeletePod(ctx context.Context, pod *corev1.Pod) error 
 //
 // In order:
 //
-//  1. Mark the track evicted, with the full terminal status, BEFORE anything is
-//     stopped, so every status built from here on (stream, backstop, direct
-//     reads) reports the eviction and the restart engine never observes the
-//     teardown's exits as crashes. A second eviction of the same pod is a no-op.
+//  1. Take the track's stopping mark (markEvictionStopping, the deadline
+//     stop's own), with the pod's live status, BEFORE anything is stopped. It
+//     is not a status: every reader goes on reporting the live pod, so nothing
+//     says Failed before the stop has happened. It fences the pod (a second
+//     eviction or a deadline stop, a create, an update, a restart) and keeps
+//     the restart engine from observing the teardown's exits as crashes. A
+//     second eviction of a pod already stopping or terminal is a no-op.
 //  2. Emit the pod's Warning Evicted Event (the kubelet records it before the
 //     kill).
 //  3. Quiesce the track (cancel pending re-execs, pulls, postStart), so no
 //     restart can bring an evicted restartPolicy: Always container back.
 //  4. DeletePod by pod id with grace 0 and no preStop. If it FAILS, the
-//     eviction is rolled back: the evicted mark is removed (the processes are
+//     stopping mark is cleared and nothing is published (the processes are
 //     still running, so the pod reports its live status and stays a
 //     candidate), and the error is returned; the manager does not count it.
-//  5. Stop the prober and drop the pod's transport override (a stopped guest's
-//     lease must not keep routing).
+//     Only once it succeeds is the evicted status recorded (finishStopping),
+//     so a failed stop never reads Failed and then Running.
+//  5. Record the budget eviction, stop the prober and drop the pod's
+//     transport override (a stopped guest's lease must not keep routing).
 //  6. Persist the status to the apiserver (synchronously, UID-checked, retried
 //     with a bounded backoff) and push it through the watch callback.
 //
@@ -3226,7 +3232,7 @@ func (r *runtimedRuntime) evictPod(ctx context.Context, pod *corev1.Pod, n evict
 	r.mu.Unlock()
 	prior := r.podWithStatus(ctx, tracked, t)
 	st := evictedPodStatus(prior.Status, n.message, metav1.Now())
-	if !t.markEvicted(st) {
+	if !t.markEvictionStopping(prior.Status.DeepCopy()) {
 		return nil
 	}
 	r.recorder.Event(tracked, corev1.EventTypeWarning, reasonEvicted, n.message)
@@ -3241,8 +3247,13 @@ func (r *runtimedRuntime) evictPod(ctx context.Context, pod *corev1.Pod, n evict
 		if stopNotIssued(err) {
 			r.history.dropIntent(intent)
 		}
-		t.unmarkEvicted(st)
+		t.clearStopping()
 		return fmt.Errorf("runtimed delete pod %s/%s: %w", pod.Namespace, pod.Name, err)
+	}
+	if !t.finishStopping(st) {
+		// The pod was made terminal by another path while this stop ran; its
+		// status stands and this eviction publishes nothing.
+		return nil
 	}
 	r.recordBudgetEvent(tracked, budgetv1alpha1.CounterEviction)
 	r.stopProber(id)
@@ -3471,8 +3482,8 @@ func (r *runtimedRuntime) GetPodStatus(ctx context.Context, namespace, name stri
 	}
 	resp, err := r.rt.GetPodStatus(ctx, &runtimev1.GetPodStatusRequest{PodId: id})
 	if err != nil {
-		// A pod whose deadline stop is in flight reports its last live status:
-		// the runtime may be forgetting it as the stop runs.
+		// A pod whose deadline or eviction stop is in flight reports its last
+		// live status: the runtime may be forgetting it as the stop runs.
 		if t := r.trackByID(id); t != nil {
 			if st := t.stoppingStatus(); st != nil {
 				return st, nil
@@ -3485,9 +3496,9 @@ func (r *runtimedRuntime) GetPodStatus(ctx context.Context, namespace, name stri
 		return nil, vkadapter.NotFoundf("pod %q not found", namespace+"/"+name)
 	}
 	if e := resp.GetError(); e != nil && e.GetCode() != 0 {
-		// A pod whose deadline stop is in flight is not being created: the
-		// runtime forgot it as its DeletePod began. It reports its last live
-		// status until the stop finishes and records Failed.
+		// A pod whose deadline or eviction stop is in flight is not being
+		// created: the runtime forgot it as its DeletePod began. It reports its
+		// last live status until the stop finishes and records Failed.
 		if st := t.stoppingStatus(); st != nil {
 			return st, nil
 		}
@@ -3548,9 +3559,9 @@ func (r *runtimedRuntime) podWithStatus(ctx context.Context, tracked *corev1.Pod
 	}
 	resp, err := r.rt.GetPodStatus(ctx, &runtimev1.GetPodStatusRequest{PodId: string(pod.UID)})
 	if err != nil || (resp.GetError() != nil && resp.GetError().GetCode() != 0) {
-		// A pod whose deadline stop is in flight keeps its last live status:
-		// the runtime forgets the pod as its DeletePod begins, and the stop is
-		// not a create (see podTrack.stoppingLive).
+		// A pod whose deadline or eviction stop is in flight keeps its last
+		// live status: the runtime forgets the pod as its DeletePod begins, and
+		// the stop is not a create (see podTrack.stoppingLive).
 		if st := t.stoppingStatus(); st != nil {
 			pod.Status = *st
 			return pod
@@ -3604,9 +3615,10 @@ func (r *runtimedRuntime) buildStatus(pod *corev1.Pod, t *podTrack, rs *runtimev
 	if st := t.evictedStatus(); st != nil {
 		return *st
 	}
-	// A pod whose deadline stop is in flight reports its live status (it has
-	// published nothing yet), but its teardown's exits are not crashes: they
-	// must not schedule a restart of a container the stop is ending.
+	// A pod whose deadline or eviction stop is in flight reports its live
+	// status (it has published nothing yet), but its teardown's exits are not
+	// crashes: they must not schedule a restart of a container the stop is
+	// ending.
 	if !t.isStopping() {
 		r.observeExits(pod, t, rs)
 	}

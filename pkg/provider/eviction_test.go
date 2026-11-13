@@ -27,9 +27,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -929,4 +932,123 @@ func TestEvictionKillsVictimAndSetsEvictedReason(t *testing.T) {
 			t.Errorf("DeletePod ids = %v, want only the tracked pod", got)
 		}
 	})
+}
+
+// TestEvictionStopFailureNeverPublishesFailedThenRunning pins the eviction's
+// two-stage mark: a victim reads Failed/Evicted only once its runtime stop has
+// succeeded. While a stop that will fail is held inside the runtime, no status
+// surface says Failed, the pod is no eviction candidate and nothing is counted;
+// once it fails the pod reads as it did before, and the next cycle's stop, which
+// succeeds, publishes Failed/Evicted and is counted once. No reader ever sees
+// Failed and then Running.
+func TestEvictionStopFailureNeverPublishesFailedThenRunning(t *testing.T) {
+	ctx := context.Background()
+	h := newEvictionHarness(t)
+	h.add(evPod("hog", nil, "", ""), "2Gi")
+	h.f.pushDeleteErr(status.Error(codes.Unavailable, "runtime unavailable"))
+	hold := make(chan struct{})
+	h.f.mu.Lock()
+	h.f.deleteHold = hold
+	h.f.mu.Unlock()
+	var released atomic.Bool
+	release := func() {
+		if released.CompareAndSwap(false, true) {
+			close(hold)
+		}
+	}
+	t.Cleanup(release)
+
+	// reads is every phase a reader saw, in order; read appends the direct
+	// reads and the watch callback's publications since the last call (those
+	// of the create itself are skipped).
+	var reads []string
+	h.cbMu.Lock()
+	seenCB := len(h.cbPods)
+	h.cbMu.Unlock()
+	read := func(where string) {
+		t.Helper()
+		st, err := h.r.GetPodStatus(ctx, "default", "hog")
+		if err != nil {
+			t.Fatalf("%s: GetPodStatus: %v", where, err)
+		}
+		reads = append(reads, where+" GetPodStatus "+string(st.Phase)+"/"+st.Reason)
+		pods, err := h.r.GetPods(ctx)
+		if err != nil || len(pods) != 1 {
+			t.Fatalf("%s: GetPods = %d pods, %v", where, len(pods), err)
+		}
+		reads = append(reads, where+" GetPods "+string(pods[0].Status.Phase)+"/"+pods[0].Status.Reason)
+		h.cbMu.Lock()
+		for _, p := range h.cbPods[seenCB:] {
+			if p.Name == "hog" {
+				reads = append(reads, where+" watch "+string(p.Status.Phase)+"/"+p.Status.Reason)
+			}
+		}
+		seenCB = len(h.cbPods)
+		h.cbMu.Unlock()
+	}
+	failedRead := func(r string) bool { return strings.Contains(r, " "+string(corev1.PodFailed)+"/") }
+
+	cycled := make(chan struct{})
+	go func() {
+		defer close(cycled)
+		h.step(compressorAt(85))
+	}()
+	waitBounded(t, "the eviction stop to reach the runtime", func() bool {
+		h.f.mu.Lock()
+		defer h.f.mu.Unlock()
+		return h.f.deleteCalls == 1
+	})
+	read("while the failing stop is held")
+	for _, c := range h.r.evictionCandidates(ctx) {
+		if c.pod.Name == "hog" {
+			t.Error("a pod whose eviction stop is in flight is an eviction candidate")
+		}
+	}
+	if n := evictionsTotal(h.m, signalCompressor); n != 0 {
+		t.Errorf("evictions_total while the stop is in flight = %d, want 0", n)
+	}
+	release()
+	select {
+	case <-cycled:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the eviction cycle never returned")
+	}
+	read("after the stop failed")
+	if n := evictionsTotal(h.m, signalCompressor); n != 0 || len(h.m.evictedAt) != 0 {
+		t.Errorf("a failed eviction was counted: evictions_total=%d cascade entries=%d", n, len(h.m.evictedAt))
+	}
+	if live, _ := h.cs.CoreV1().Pods("default").Get(ctx, "hog", metav1.GetOptions{}); live.Status.Phase == corev1.PodFailed {
+		t.Error("a failed eviction was persisted to the apiserver")
+	}
+	for _, r := range reads {
+		if failedRead(r) {
+			t.Errorf("read Failed before any stop succeeded: %q (all reads: %q)", r, reads)
+		}
+	}
+
+	// The next cycle retries; the stop succeeds and the eviction is published.
+	h.step(compressorAt(85))
+	if got := h.deleteIDs(); !slices.Equal(got, []string{"uid-hog", "uid-hog"}) {
+		t.Fatalf("retry: DeletePod ids = %v, want the failed stop then the retry", got)
+	}
+	read("after the retry")
+	if n := evictionsTotal(h.m, signalCompressor); n != 1 || len(h.m.evictedAt) != 1 {
+		t.Errorf("after the successful retry: evictions_total=%d cascade entries=%d, want 1/1", n, len(h.m.evictedAt))
+	}
+	st, err := h.r.GetPodStatus(ctx, "default", "hog")
+	if err != nil {
+		t.Fatalf("GetPodStatus after the retry: %v", err)
+	}
+	assertEvictedTuple(t, "GetPodStatus after the retry", *st, "The node was low on resource: memory.")
+	failed := false
+	for _, r := range reads {
+		if failedRead(r) {
+			failed = true
+		} else if failed {
+			t.Errorf("read %q after an earlier Failed read: a kubelet never moves Failed back (all reads: %q)", r, reads)
+		}
+	}
+	if !failed {
+		t.Errorf("no reader ever saw the eviction after the retry succeeded: %q", reads)
+	}
 }

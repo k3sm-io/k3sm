@@ -318,7 +318,7 @@ func (r *runtimedRuntime) failPastDeadline(ctx context.Context, tracked *corev1.
 		return fmt.Errorf("runtimed delete pod %s/%s: %w", tracked.Namespace, tracked.Name, err)
 	}
 	if !t.finishStopping(st) {
-		// An eviction made the pod terminal while this stop ran; its status
+		// Another path made the pod terminal while this stop ran; its status
 		// stands and this failure publishes nothing.
 		return nil
 	}

@@ -50,31 +50,39 @@ const (
 // 200 ms doubling to a 3 s cap, about 7 s in all.
 var persistEvictedBackoff = wait.Backoff{Steps: 6, Duration: 200 * time.Millisecond, Factor: 2, Cap: 3 * time.Second}
 
-// markEvicted records st as t's terminal evicted status. It returns false if t
-// was already evicted (the first eviction's status stands). Guarded by
-// restartMu, with the rest of the delete fence.
-func (t *podTrack) markEvicted(st *corev1.PodStatus) bool {
-	t.restartMu.Lock()
-	defer t.restartMu.Unlock()
-	if t.evicted != nil {
-		return false
-	}
-	t.evicted = st
-	return true
-}
-
-// markStopping takes the first stage of a node-side failure other than an
-// eviction (the active deadline): the stop is in flight, but no terminal status
-// is recorded yet. It refuses a track that is deleting, was rejected at
-// admission, is already stopping, or is already terminal. finishStopping
-// records the status once the stop succeeds; clearStopping rolls it back.
-// live is the pod's last live status, read before the mark: the runtime forgets
-// the pod as its stop begins, so the readers report live (stoppingStatus) for
-// the rest of the stop instead of a synthesized creating status.
+// markStopping takes the first stage of a node-side stop (the active deadline,
+// or an eviction through markEvictionStopping): the stop is in flight, but no
+// terminal status is recorded yet. It refuses a track that is deleting, was
+// rejected at admission, is already stopping, or is already terminal.
+// finishStopping records the status once the stop succeeds; clearStopping
+// rolls it back. live is the pod's last live status, read before the mark: the
+// runtime forgets the pod as its stop begins, so the readers report live
+// (stoppingStatus) for the rest of the stop instead of a synthesized creating
+// status.
 func (t *podTrack) markStopping(live *corev1.PodStatus) bool {
 	t.restartMu.Lock()
 	defer t.restartMu.Unlock()
-	if t.evicted != nil || t.deleting || t.rejected || t.stopping {
+	if t.deleting {
+		return false
+	}
+	return t.beginStopLocked(live)
+}
+
+// markEvictionStopping is markStopping for an eviction (evictPod). Unlike the
+// deadline it does not refuse a track whose DeletePod has begun since the
+// candidates were listed: the eviction's immediate kill still runs and is
+// recorded, as it always has been.
+func (t *podTrack) markEvictionStopping(live *corev1.PodStatus) bool {
+	t.restartMu.Lock()
+	defer t.restartMu.Unlock()
+	return t.beginStopLocked(live)
+}
+
+// beginStopLocked takes the stopping mark unless t is terminal (evicted, or
+// rejected at admission) or another node-side stop is already in flight. The
+// caller holds t.restartMu.
+func (t *podTrack) beginStopLocked(live *corev1.PodStatus) bool {
+	if t.evicted != nil || t.rejected || t.stopping {
 		return false
 	}
 	t.stopping = true
@@ -82,8 +90,8 @@ func (t *podTrack) markStopping(live *corev1.PodStatus) bool {
 	return true
 }
 
-// stoppingStatus returns a copy of the last live status markStopping recorded
-// while t's active-deadline stop is in flight, or nil when no stop is.
+// stoppingStatus returns a copy of the last live status the stopping mark
+// recorded while t's node-side stop is in flight, or nil when no stop is.
 func (t *podTrack) stoppingStatus() *corev1.PodStatus {
 	t.restartMu.Lock()
 	defer t.restartMu.Unlock()
@@ -93,7 +101,8 @@ func (t *podTrack) stoppingStatus() *corev1.PodStatus {
 	return t.stoppingLive.DeepCopy()
 }
 
-// isStopping reports whether t's active-deadline stop is in flight.
+// isStopping reports whether t's node-side stop (an active deadline's or an
+// eviction's) is in flight.
 func (t *podTrack) isStopping() bool {
 	t.restartMu.Lock()
 	defer t.restartMu.Unlock()
@@ -101,8 +110,8 @@ func (t *podTrack) isStopping() bool {
 }
 
 // stopFenced reports whether t is fenced against new work by a node-side stop:
-// it is terminal (evicted, or failed by its deadline) or its active-deadline
-// stop is in flight. The fences (a repeat create, an update, a parked create, a
+// it is terminal (evicted, or failed by its deadline) or its node-side stop
+// (deadline or eviction) is in flight. The fences (a repeat create, an update, a parked create, a
 // restart, eviction) consult it; the status readers consult evictedStatus
 // alone, because a pod being stopped has published nothing yet and must not
 // read Failed.
@@ -116,7 +125,7 @@ func (t *podTrack) stopFenced() bool {
 // which carries its own reason, as t's terminal mark and ends the stopping
 // mark, in one critical section so no tick sees the track neither stopping nor
 // terminal. It returns false, recording nothing, if t was meanwhile made
-// terminal by another path (an eviction), whose status stands.
+// terminal by another path, whose status stands.
 func (t *podTrack) finishStopping(st *corev1.PodStatus) bool {
 	t.restartMu.Lock()
 	defer t.restartMu.Unlock()
@@ -129,25 +138,14 @@ func (t *podTrack) finishStopping(st *corev1.PodStatus) bool {
 	return true
 }
 
-// clearStopping rolls back markStopping after a failed stop, so the next tick
-// retries it. Nothing was published, so nothing is withdrawn.
+// clearStopping rolls back the stopping mark after a failed stop, so the next
+// tick (or eviction cycle) retries it and the pod, whose processes still run,
+// stays an eviction candidate. Nothing was published, so nothing is withdrawn.
 func (t *podTrack) clearStopping() {
 	t.restartMu.Lock()
 	defer t.restartMu.Unlock()
 	t.stopping = false
 	t.stoppingLive = nil
-}
-
-// unmarkEvicted rolls back markEvicted after a failed runtime teardown, so the
-// pod (whose processes are still running) reports its live status again and
-// stays an eviction candidate. Only the status this eviction installed is
-// removed.
-func (t *podTrack) unmarkEvicted(st *corev1.PodStatus) {
-	t.restartMu.Lock()
-	defer t.restartMu.Unlock()
-	if t.evicted == st {
-		t.evicted = nil
-	}
 }
 
 // quiesceForEviction cancels the provider workers that could restart or
@@ -182,7 +180,8 @@ func isEvictedPod(pod *corev1.Pod) bool {
 
 // evictionCandidates implements evictionTarget: every tracked pod the runtime
 // reports as still active (not Succeeded or Failed, not unknown to the runtime),
-// minus pods already evicted or being deleted, each with its memory stats.
+// minus pods already evicted, being stopped (a deadline's or an eviction's stop
+// in flight) or being deleted, each with its memory stats.
 //
 // Stats come from ONE ListPodStats under ctx, whose deadline the manager keeps
 // shorter than the fast sampling tick. A pod absent from the answer, or every
