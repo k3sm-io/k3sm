@@ -25,10 +25,12 @@
 #   - The run's own paths: t.2 makes the two scratch dirs, f.1 removes them and
 #     removes <storage root>/<namespace> on both Macs, so nothing of the run stays.
 #
-# The script also runs the k3sm CLI itself as root on each Mac over ssh (`sudo -n k3sm`):
-# `version`, `image prune --force` and `model rm <tag>`. These are the product's public
-# verbs, so they are not exceptions, but they do delete: the run's model and every image
-# no pod uses at that moment.
+# The script also runs the k3sm CLI itself as root over ssh (`sudo -n k3sm`), and the verbs
+# do not all run on both Macs. `version` runs on both (t.0, and again at the end).
+# `image prune --force` runs on both in t.7, and once more on the server alone as the
+# registry prune. `model rm <tag>` runs on the server only (t.7, and f.1 if t.7 did not
+# remove it). These are the product's public verbs, so they are not exceptions, but they
+# do delete: the run's model and every image no pod uses at that moment.
 #
 # Rungs (`--plan` prints them; the first red rung ends the run, every rung not reached
 # is red, and the cleanup f.1 runs green or red):
@@ -728,7 +730,7 @@ p0() {
 	mkdir -p "$EV" || refuse "cannot create $EV"
 	EV="$(cd "$EV" && pwd)"
 	# The evidence keeps the exact driver that produced it, before any rig step.
-	cp -- "$0" "$EV/B1372.sh" || refuse "cannot copy the driver $0 into $EV"
+	cp -- "$SELF" "$EV/B1372.sh" || refuse "cannot copy the driver $SELF into $EV"
 
 	# The model, before anything is pushed.
 	[ -d "$MODEL_DIR" ] || refuse "--model-dir $MODEL_DIR is not a directory"
