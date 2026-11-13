@@ -123,7 +123,12 @@
 #                                the cache copy share the server's volume)
 #   K3SM_MST_STORAGE_ROOT        the nodes' storage root f.1 clears of the run's namespace;
 #                                exactly /var/lib/k3sm/storage (the default): p.0 refuses
-#                                any other, which only --self-test's fake runs may name
+#                                any other (exit 3, rig untouched). Only --self-test's
+#                                fake runs may name another: they export
+#                                K3SM_MST_SELF_TEST_RUN=<its mktemp dir>, and the root
+#                                must lie under that dir (no ..) with the kubectl in use
+#                                resolving under it too; the run then prints a
+#                                "SELF-TEST ROOT BYPASS" line. A bare mark (=1) is refused.
 #   K3SM_MST_VIEW_UID            uid a view file must have (default 0)
 #   KUBECTL                      kubectl binary (default kubectl)
 #   K3SM_LAB_TOLERATE_KEYS       extra taint keys every pod tolerates with Exists
@@ -628,6 +633,25 @@ refuse() {
 	exit 3
 }
 
+# self_test_root: K3SM_MST_SELF_TEST_RUN names an existing absolute directory other
+# than /, the storage root lies under it with no .. component, and the kubectl this
+# run uses resolves under it too (the fake rig is active). A bare mark is not enough.
+self_test_root() {
+	local m="${K3SM_MST_SELF_TEST_RUN:-}" mr k kd
+	case "$m" in /?*) ;; *) return 1 ;; esac
+	case "/$m/" in */../*) return 1 ;; esac
+	[ -d "$m" ] || return 1
+	mr="$(cd "$m" && pwd -P)" || return 1
+	[ "$mr" != / ] || return 1
+	case "/$STORAGE_ROOT/" in */../*) return 1 ;; esac
+	case "$STORAGE_ROOT" in "${m%/}"/?*) ;; *) return 1 ;; esac
+	k="$(command -v "$KUBECTL" 2>/dev/null)" || return 1
+	case "$k" in /?*) ;; *) return 1 ;; esac
+	[ -f "$k" ] && [ ! -L "$k" ] || return 1
+	kd="$(cd "$(dirname "$k")" && pwd -P)" || return 1
+	case "$kd/" in "$mr"/*) ;; *) return 1 ;; esac
+}
+
 p0() {
 	local v n json t left
 	for v in KUBECONFIG K3SM_MST_SERVER_SSH K3SM_MST_WORKER_SSH K3SM_MST_SERVER_NODE K3SM_MST_WORKER_NODE \
@@ -645,10 +669,11 @@ p0() {
 	case "$STEP_TIMEOUT$READY_TIMEOUT$RECLAIM_TIMEOUT$DNS_TIMEOUT" in *[!0-9]*) refuse "a timeout is not a whole number of seconds" ;; esac
 	case "$MIN_FREE" in *[!0-9]*) refuse "K3SM_MST_MIN_FREE is not a whole number of bytes" ;; esac
 	# f.1 removes <root>/<namespace> on both Macs as root, so a lab run clears only the
-	# root k3sm writes. --self-test marks its fake runs (K3SM_MST_SELF_TEST_RUN=1), whose
-	# storage roots are absolute paths in its temp tree.
-	if [ "${K3SM_MST_SELF_TEST_RUN:-}" = 1 ]; then
-		case "$STORAGE_ROOT" in /?*) ;; *) refuse "K3SM_MST_STORAGE_ROOT $STORAGE_ROOT is not an absolute path" ;; esac
+	# root k3sm writes. --self-test's fake runs name their own temp dir in
+	# K3SM_MST_SELF_TEST_RUN; only a root under that dir, with the fake kubectl in it,
+	# is let through (self_test_root).
+	if self_test_root; then
+		log "SELF-TEST ROOT BYPASS: storage root $STORAGE_ROOT under $K3SM_MST_SELF_TEST_RUN (kubectl $(command -v "$KUBECTL"))"
 	else
 		[ "$STORAGE_ROOT" = "$DEFAULT_STORAGE_ROOT" ] ||
 			refuse "K3SM_MST_STORAGE_ROOT $STORAGE_ROOT is not $DEFAULT_STORAGE_ROOT (the only storage root a lab run clears)"
@@ -2021,13 +2046,15 @@ self_test() {
 
 	# One full fake run. FAKE_BREAK names a mutant; want is the exit and the red rung.
 	# FR_STEP, set on one call, shortens K3SM_MST_STEP_TIMEOUT for a run whose fake hangs.
-	# FR_SELF_TEST_RUN, set empty on one call, runs it as a lab run outside --self-test.
+	# FR_SELF_TEST_RUN, set empty on one call, runs it as a lab run outside --self-test;
+	# unset, the run carries the self-test's own temp dir as its mark.
+	# FR_ROOT, set on one call, names its storage root.
 	fake_run() { # <name> <break> <want-exit> <want-in-output> [evidence-dir]
 		local name="$1" brk="$2" want="$3" grepfor="$4" ev="${5:-$t/runs/$1/ev}" r="$t/runs/$1" got=0 o
 		mkdir -p "$r/state" "$r/srv/cache/blobs" "$r/wrk/cache/blobs" "$r/srv/registry"
 		o="$(
 			cd "$t" && env -u K3SM_LAB_TOLERATE_KEYS PATH="$bin:$PATH" K3SM_LAB=1 KUBECONFIG=/dev/null \
-				K3SM_MST_SELF_TEST_RUN="${FR_SELF_TEST_RUN-1}" \
+				K3SM_MST_SELF_TEST_RUN="${FR_SELF_TEST_RUN-$base}" \
 				FAKE_STATE="$r/state" FAKE_BREAK="$brk" FAKE_SERVER_HOST=srv FAKE_REG_ROOT="$r/srv/registry" \
 				FAKE_NODES="srv=node-s=$r/srv/cache wrk=node-w=$r/wrk/cache" \
 				K3SM_MST_SERVER_SSH=srv K3SM_MST_WORKER_SSH=wrk K3SM_MST_SERVER_NODE=node-s K3SM_MST_WORKER_NODE=node-w \
@@ -2036,7 +2063,7 @@ self_test() {
 				K3SM_MST_REGISTRY_ROOT="$r/srv/registry" K3SM_MST_K3SM=k3sm K3SM_MST_LOCAL_K3SM=k3sm \
 				K3SM_MST_VIEW_UID="$(id -u)" K3SM_MST_POLL=0.05 K3SM_MST_READY_TIMEOUT=20 \
 				K3SM_MST_RECLAIM_TIMEOUT=2 K3SM_MST_STEP_TIMEOUT="${FR_STEP:-30}" \
-				K3SM_MST_DNS_TIMEOUT="${FR_DNS:-20}" FAKE_STORAGE="$r/storage" K3SM_MST_STORAGE_ROOT="$r/storage" \
+				K3SM_MST_DNS_TIMEOUT="${FR_DNS:-20}" FAKE_STORAGE="$r/storage" K3SM_MST_STORAGE_ROOT="${FR_ROOT:-$r/storage}" \
 				"$SELF" --lab --model-dir "$t/m" --model-sums "$t/sums" --evidence "$ev" 2>&1
 		)" || got=$?
 		printf '%s\n' "$o" >"$r/out"
@@ -2055,6 +2082,7 @@ self_test() {
 
 	fake_run happy "" 0 "result: PASS"
 	cleaned happy
+	has "happy: the storage-root bypass is announced" "$(cat "$RUN_DIR/out")" "SELF-TEST ROOT BYPASS"
 	for out in t.0 t.1 t.2 t.3 t.3b t.4 t.5 t.6 t.7 f.1 t.8; do has "happy: $out passed" "$(cat "$RUN_DIR/out")" "$out: PASS"; done
 	has "happy: cold rate recorded" "$(cat "$RUN_DIR/ev/measurements.tsv")" cold_fetch_bytes_per_second
 	has "happy: warm time recorded" "$(cat "$RUN_DIR/ev/measurements.tsv")" warm_ready_seconds
@@ -2174,6 +2202,17 @@ self_test() {
 	FR_SELF_TEST_RUN="" fake_run storage-root-other "" 3 "is not /var/lib/k3sm/storage"
 	[ ! -e "$RUN_DIR/state/calls" ] || { echo "self-test FAIL: storage-root-other: the refused run called the rig: $(cat "$RUN_DIR/state/calls")"; bad=1; }
 	[ ! -e "$RUN_DIR/ev" ] || { echo "self-test FAIL: storage-root-other: the refused evidence dir was created"; bad=1; }
+	# A forged mark is refused the same way: a bare 1, the self-test's dir with the root
+	# outside it (a sibling sharing its prefix, or a .. walk out of it), or a mark holding
+	# the root but not the kubectl in use.
+	for row in "1|" "$base|${base}-outside/storage" "$base|$base/../outside/storage" \
+		"$t/runs/storage-root-mark-forged|$t/runs/storage-root-mark-forged/storage"; do
+		FR_SELF_TEST_RUN="${row%%|*}" FR_ROOT="${row#*|}" fake_run storage-root-mark-forged "" 3 "is not /var/lib/k3sm/storage"
+		[ ! -e "$RUN_DIR/state/calls" ] || { echo "self-test FAIL: storage-root-mark-forged ($row): the refused run called the rig: $(cat "$RUN_DIR/state/calls")"; bad=1; }
+		[ ! -e "$RUN_DIR/ev" ] || { echo "self-test FAIL: storage-root-mark-forged ($row): the refused evidence dir was created"; bad=1; }
+		if grep -q 'SELF-TEST ROOT BYPASS' "$RUN_DIR/out"; then echo "self-test FAIL: storage-root-mark-forged ($row): the bypass was taken"; bad=1; fi
+		rm -rf "$RUN_DIR"
+	done
 
 	# The evidence dir must lie under a k3sm-io.scratch directory (the pure check).
 	mkdir -p "$t/ev-in" "$base/outside"
