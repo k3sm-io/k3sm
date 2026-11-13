@@ -12,6 +12,10 @@ pin, its date, and the tarball's sha256.
 
 ### Added
 
+- `k3sm status` tells a control plane that is waiting between slow start attempts on a loaded Mac from
+  one that keeps failing: the server row's `wide` gains `crash-loop-phase` (`backing-off` or
+  `attempting`) and `crash-loop-next-attempt`, and the alert names the next attempt. `crash-loop`
+  still reads `restarting`. See [the status JSON](docs/user/status-json.md#daemon-row-states).
 - `sudo k3sm network lan on --for <duration>` turns LAN access on for at most 24h, after which the
   node daemon turns it off by itself. See [LAN access](docs/user/install.md#lan-access).
 - `sudo k3sm network lan status` lists the sockets on this Mac a LAN peer can reach that LAN access
@@ -269,8 +273,8 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
 
 - A server whose control plane does not report healthy in time while the Mac is heavily loaded no
   longer parks on the crash-loop breaker after five attempts. It backs off instead, from 30 seconds
-  doubling up to 10 minutes, `k3sm status` shows when the next attempt starts and that an attempt
-  is running, and it parks only after eight slow attempts in a row. The Mac counts as heavily loaded
+  doubling up to 10 minutes, `k3sm status` shows when the next attempt starts and, while the
+  server is running, that an attempt is in progress, and it parks only after eight slow attempts in a row. The Mac counts as heavily loaded
   only when both its 1-minute and 5-minute load averages are at least 2 per core, and the crash-loop
   record notes both. Each component's log from the first failed run is kept as
   `<component>.log.1` until the control plane comes up healthy again, with the latest failed run's

@@ -242,8 +242,8 @@ func artifactManifest(cfg Config) []artifact {
 				artifact{kind: kindFile, disp: dispRemove, path: filepath.Join(StateStatus.Path(cfg.DataRoot), name), assertExists: false})
 		}
 		// The kept control-plane log generations (<component>.log.1, the pin
-		// that keeps a failure streak's first log there, and the capped .log.2),
-		// REMOVED: they explain a failure of a server that no longer runs. The
+		// that keeps a failure streak's first log there, the capped .log.2, and
+		// the .log.2.tmp a crash mid-copy can leave), REMOVED: they explain a failure of a server that no longer runs. The
 		// live <component>.log stays with the work dir. assertExists is false: a
 		// server writes them only after a restart.
 		for _, p := range executor.ComponentLogKeptPaths(cfg.serverWorkDir()) {

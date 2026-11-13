@@ -37,6 +37,7 @@ import (
 	"time"
 
 	"k3sm.io/darwin-net/pkg/tcpseg"
+	"k3sm.io/k3sm/internal/atomicfile"
 	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/defaults"
 	"k3sm.io/k3sm/pkg/ports"
@@ -713,7 +714,9 @@ func (s *Supervised) bringUp(ctx context.Context) error {
 		return err
 	}
 	// Healthy: the kept first-failure logs may be replaced from the next spawn on.
-	releaseComponentLogs(s.cfg.WorkDir)
+	if err := releaseComponentLogs(s.cfg.WorkDir); err != nil {
+		s.cfg.Logger.Debug("could not release the kept component logs", "err", err)
+	}
 	return nil
 }
 
@@ -798,7 +801,7 @@ func (s *Supervised) startKine(ctx context.Context) (*component, error) {
 	kineVersion, kineVariant := readKineMarker(binDir(s.cfg.WorkDir))
 	s.cfg.Logger.Info("starting datastore shim", "component", "kine",
 		"version", kineVersion, "variant", kineVariant, "datastore", datastorePosture(s.cfg))
-	return s.spawn(ctx, "kine", args...)
+	return s.spawn(ctx, kineBinaryName, args...)
 }
 
 // startAPIServer launches kube-apiserver against kine on the secure port. It
@@ -837,7 +840,7 @@ func (s *Supervised) startKine(ctx context.Context) (*component, error) {
 // watch cache are unconditional at the pin; the soak is revisited if k3sm ever
 // pins a kube version where the behaviour is settable again.
 func (s *Supervised) startAPIServer(ctx context.Context) (*component, error) {
-	return s.spawn(ctx, "kube-apiserver", apiServerArgs(s.cfg)...)
+	return s.spawn(ctx, apiServerComponent, apiServerArgs(s.cfg)...)
 }
 
 // apiServerArgs renders the kube-apiserver argv from cfg. It is a pure function so
@@ -1021,7 +1024,7 @@ func LoopbackServingArgs(port int) []string {
 
 // startScheduler launches kube-scheduler against its OWN per-component kubeconfig.
 func (s *Supervised) startScheduler(ctx context.Context) (*component, error) {
-	return s.spawn(ctx, "kube-scheduler", schedulerArgs(s.cfg)...)
+	return s.spawn(ctx, schedulerComponent, schedulerArgs(s.cfg)...)
 }
 
 // schedulerArgs renders the kube-scheduler argv from cfg. The --kubeconfig /
@@ -1047,7 +1050,7 @@ func schedulerArgs(cfg Config) []string {
 // startControllerManager launches kube-controller-manager with the scoped
 // controller set (node-side controllers dropped; endpointslice kept).
 func (s *Supervised) startControllerManager(ctx context.Context) (*component, error) {
-	return s.spawn(ctx, "kube-controller-manager", controllerManagerArgs(s.cfg)...)
+	return s.spawn(ctx, controllerManagerComponent, controllerManagerArgs(s.cfg)...)
 }
 
 // controllerManagerArgs renders the kube-controller-manager argv from cfg. The three
@@ -1111,8 +1114,12 @@ func (s *Supervised) spawn(ctx context.Context, name string, args ...string) (*c
 func (s *Supervised) spawnEnv(ctx context.Context, name string, extraEnv []string, args ...string) (*component, error) {
 	bin := filepath.Join(binDir(s.cfg.WorkDir), name)
 	logPath := filepath.Join(s.cfg.WorkDir, name+".log")
-	rotateComponentLog(logPath, failureLive(s.cfg.WorkDir, time.Now()))
-	lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err := rotateComponentLog(logPath, failureLive(s.cfg.WorkDir, time.Now())); errors.Is(err, atomicfile.ErrUnsafeDir) {
+		s.cfg.Logger.Warn("component log not rotated: the work dir is writable by others; the previous run's log may be lost", "component", name, "err", err)
+	} else if err != nil {
+		s.cfg.Logger.Debug("component log not rotated; the previous run's log may be lost", "component", name, "err", err)
+	}
+	lf, err := openComponentLog(logPath)
 	if err != nil {
 		return nil, fmt.Errorf("create %s log: %w", name, err)
 	}
@@ -1194,22 +1201,42 @@ func (s *Supervised) spawnEnv(ctx context.Context, name string, extraEnv []strin
 // later spawns leave .1 alone and keep only the latest lap, tail-capped at
 // componentLogKeepMax, as <name>.log.2. A healthy bring-up removes the markers
 // (releaseComponentLogs), so the next spawn rotates into .1 again.
+//
+// The rotation runs as root in the server work dir, so every create and open it
+// makes refuses a symlink (O_NOFOLLOW, and O_EXCL for a create) and a source
+// that is not a regular file once opened, and it rotates nothing in a work dir
+// that someone other than root or this process could write.
 const (
 	componentLogPinSuffix = ".1.pinned"
-	componentLogKeepMax   = 4 << 20
+	componentLogTmpSuffix = ".2" + componentLogTmpExt
+	// componentLogTmpExt is what keepLogTail appends to its dst for the tail
+	// copy's temp file; componentLogTmpSuffix is that name for the .2 generation.
+	componentLogTmpExt  = ".tmp"
+	componentLogKeepMax = 4 << 20
 )
 
-// componentLogNames are the children spawnEnv logs, for the uninstall sweep.
-var componentLogNames = []string{"kine", etcdComponent, "kube-apiserver", "kube-scheduler", "kube-controller-manager"}
+// The control-plane children spawnEnv starts, by the name that is both the
+// binary's and the log's (<name>.log). kine and etcd name theirs where they are
+// staged (kineBinaryName, etcdComponent).
+const (
+	apiServerComponent         = "kube-apiserver"
+	schedulerComponent         = "kube-scheduler"
+	controllerManagerComponent = "kube-controller-manager"
+)
 
-// ComponentLogKeptPaths lists the kept generations and pin markers in a
-// control-plane work dir — every file the rotation creates beside a live log —
-// so uninstall removes them. The live <name>.log files are not listed.
+// componentLogNames are the children spawnEnv logs, for the uninstall sweep and
+// the pin release. It is built from the same constants the spawn sites pass.
+var componentLogNames = []string{kineBinaryName, etcdComponent, apiServerComponent, schedulerComponent, controllerManagerComponent}
+
+// ComponentLogKeptPaths lists the kept generations, pin markers and the tail
+// copy's temp file in a control-plane work dir — every file the rotation
+// creates beside a live log — so uninstall removes them, a partial copy left by
+// a crash mid-rotation included. The live <name>.log files are not listed.
 func ComponentLogKeptPaths(workDir string) []string {
 	var out []string
 	for _, n := range componentLogNames {
 		p := filepath.Join(workDir, n+".log")
-		out = append(out, p+".1", p+componentLogPinSuffix, p+".2")
+		out = append(out, p+".1", p+componentLogPinSuffix, p+".2", p+componentLogTmpSuffix)
 	}
 	return out
 }
@@ -1218,6 +1245,12 @@ func ComponentLogKeptPaths(workDir string) []string {
 // next spawn's previous log may explain: a slow streak, a tripped breaker, or
 // any entry inside the window. An unreadable record is "no failure", which is
 // the rotation this replaced, so bookkeeping trouble cannot block a start.
+//
+// Limit: a healthy bring-up does not clear the window's entries, so a spawn
+// after a healthy run that is still inside CrashLoopWindow of an earlier
+// failure counts as failing and pins the HEALTHY run's log as .1. The pin then
+// holds a log that explains nothing until the window ages out; .2 still has the
+// latest lap.
 func failureLive(workDir string, now time.Time) bool {
 	r, err := ReadCrashRecord(CrashLoopPath(workDir))
 	if err != nil {
@@ -1230,82 +1263,205 @@ func failureLive(workDir string, now time.Time) bool {
 // rotateComponentLog moves the previous run's log aside before the new start
 // truncates it. When failing (failureLive) and .1 is pinned, .1 is kept and the
 // log becomes <path>.2, tail-capped. Otherwise it becomes <path>.1, and when
-// failing it is the first failing run's log, so .1 is pinned. It renames rather than copies when
-// it can, so the kept file is the same 0600 inode; an empty or absent log is
-// not rotated, so an unlogged lap cannot push a useful one out. Errors are
-// ignored on purpose: losing a generation must never stop the component from
-// starting.
-func rotateComponentLog(path string, failing bool) {
+// failing it is the first failing run's log, so .1 is pinned. It renames rather
+// than copies when it can, so the kept file is the same 0600 inode; an empty or
+// absent log is not rotated, so an unlogged lap cannot push a useful one out.
+// The returned error is for a Debug line only: losing a generation must never
+// stop the component from starting.
+func rotateComponentLog(path string, failing bool) error {
+	if err := atomicfile.CheckTrustedDir(filepath.Dir(path)); err != nil {
+		return fmt.Errorf("not rotating %s: %w", path, err)
+	}
 	pin := path + componentLogPinSuffix
+	var errs []error
 	if !failing {
 		// No live failure: the streak is over (cleared or aged out of the
 		// window), so the pin is stale whether or not a healthy bring-up saw
 		// it. Dropped before the empty-log return, so a lap that logged
 		// nothing cannot leave an old streak's pin for the next one.
-		_ = os.Remove(pin)
+		errs = append(errs, removeIfPresent(pin))
 	}
-	fi, err := os.Stat(path)
-	if err != nil || !fi.Mode().IsRegular() || fi.Size() == 0 {
-		return
+	size, err := regularLogSize(path)
+	if err != nil || size == 0 {
+		return errors.Join(append(errs, err)...)
 	}
 	if failing {
-		if _, err := os.Stat(pin); err == nil {
-			keepLogTail(path, path+".2", fi.Size(), componentLogKeepMax)
-			return
+		if _, err := os.Lstat(pin); err == nil {
+			return errors.Join(append(errs, keepLogTail(path, path+".2", componentLogKeepMax))...)
 		}
 		// Pin before the rename: a crash between the two leaves a pin over an
 		// older .1, which the next spawn with no live failure clears. The
 		// other order would let the next failing spawn overwrite the first
 		// failure's log. Without a pin the log is still kept for one lap.
-		if f, err := os.OpenFile(pin, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600); err == nil {
-			_ = f.Close()
-		}
+		errs = append(errs, createExclusive(pin))
 	}
 	if err := os.Rename(path, path+".1"); err != nil {
+		errs = append(errs, err)
 		if failing {
-			_ = os.Remove(pin)
+			errs = append(errs, removeIfPresent(pin))
 		}
-		return
+		return errors.Join(errs...)
 	}
-	_ = os.Remove(path + ".2")
+	return errors.Join(append(errs, removeIfPresent(path+".2"))...)
+}
+
+// openComponentLog creates or truncates a child's 0600 log. It runs as root in
+// the work dir, so nothing planted at the log path is written through: the open
+// refuses a symlink (O_NOFOLLOW), does not truncate (a hardlink to another file
+// would lose that file's bytes at open) and does not block (a FIFO would hang a
+// write-only open). The descriptor is then refused unless it is a regular file
+// with one link, and only then truncated and switched back to blocking for the
+// child.
+//
+// It fails closed, deliberately: a symlink, a hardlink or a non-regular file at
+// the log path aborts that component's spawn, whereas a rotation refusal
+// (rotateComponentLog) never does.
+func openComponentLog(path string) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o600)
+	if err != nil {
+		return nil, err // an *os.PathError: it names the op and the path
+	}
+	if err := prepareComponentLog(f); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("refusing %s as a component log: %w", path, err)
+	}
+	return f, nil
+}
+
+// prepareComponentLog checks the opened log is a regular file with one link,
+// truncates it through the descriptor and clears O_NONBLOCK.
+func prepareComponentLog(f *os.File) error {
+	fi, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("stat: %w", err)
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("not a regular file (%v)", fi.Mode().Type())
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return errors.New("no link count in the file's stat")
+	}
+	if st.Nlink != 1 {
+		return fmt.Errorf("the file has %d links, want 1", st.Nlink)
+	}
+	if err := f.Truncate(0); err != nil {
+		return fmt.Errorf("truncate: %w", err)
+	}
+	rc, err := f.SyscallConn()
+	if err != nil {
+		return fmt.Errorf("raw conn: %w", err)
+	}
+	var nbErr error
+	if err := rc.Control(func(fd uintptr) { nbErr = syscall.SetNonblock(int(fd), false) }); err != nil {
+		return fmt.Errorf("clear O_NONBLOCK: %w", err)
+	}
+	if nbErr != nil {
+		return fmt.Errorf("clear O_NONBLOCK: %w", nbErr)
+	}
+	return nil
+}
+
+// regularLogSize opens path without following a symlink (and without blocking
+// on a FIFO) and returns the size of the regular file it is: 0 with no error
+// when it is absent, an error when it is a symlink or not a regular file.
+func regularLogSize(path string) (int64, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("open %s: %w", path, err)
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return 0, fmt.Errorf("stat %s: %w", path, err)
+	}
+	if !fi.Mode().IsRegular() {
+		return 0, fmt.Errorf("refusing to rotate %s: not a regular file (%v)", path, fi.Mode().Type())
+	}
+	return fi.Size(), nil
+}
+
+// createExclusive creates an empty 0600 file at path, refusing anything already
+// there, a symlink included.
+func createExclusive(path string) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return err
+	}
+	return f.Close()
+}
+
+// removeIfPresent removes path (a symlink itself, never its target); absent is
+// not an error.
+func removeIfPresent(path string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // keepLogTail moves src to dst, keeping at most max bytes from its end: a log
 // within the cap is renamed, a larger one has its tail copied to a 0600 temp
-// file renamed over dst. On a copy failure src is left for the caller's
-// truncation, which is the loss of one lap and nothing more.
-func keepLogTail(src, dst string, size, max int64) {
-	if size <= max {
-		_ = os.Rename(src, dst)
-		return
-	}
-	in, err := os.Open(src)
+// file (dst's componentLogTmpSuffix sibling) renamed over dst. src is opened
+// without following a symlink and refused unless it is a regular file. On a
+// copy failure src is left for the caller's truncation, which is the loss of
+// one lap and nothing more.
+func keepLogTail(src, dst string, max int64) error {
+	in, err := os.OpenFile(src, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
-		return
+		return fmt.Errorf("open %s: %w", src, err)
 	}
 	defer in.Close()
-	tmp := dst + ".tmp"
-	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	fi, err := in.Stat()
 	if err != nil {
-		return
+		return fmt.Errorf("stat %s: %w", src, err)
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("refusing to keep %s: not a regular file (%v)", src, fi.Mode().Type())
+	}
+	size := fi.Size()
+	if size <= max {
+		return os.Rename(src, dst)
+	}
+	tmp := logTailTmp(dst)
+	// A temp a crash left behind is replaced, never written through.
+	if err := removeIfPresent(tmp); err != nil {
+		return err
+	}
+	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return err
 	}
 	_, cerr := io.Copy(out, io.NewSectionReader(in, size-max, max))
 	if err := out.Close(); cerr == nil {
 		cerr = err
 	}
-	if cerr != nil || os.Rename(tmp, dst) != nil {
-		_ = os.Remove(tmp)
-		return
+	if cerr == nil {
+		cerr = os.Rename(tmp, dst)
 	}
-	_ = os.Remove(src)
+	if cerr != nil {
+		return errors.Join(cerr, removeIfPresent(tmp))
+	}
+	return removeIfPresent(src)
 }
 
+// logTailTmp is the temp file keepLogTail copies a tail into before renaming it
+// over dst: <name>.log + componentLogTmpSuffix for the .2 generation, which
+// ComponentLogKeptPaths lists for uninstall.
+func logTailTmp(dst string) string { return dst + componentLogTmpExt }
+
 // releaseComponentLogs ends every pin in workDir after a healthy bring-up: the
-// first failure's log stays as .1 until the next spawn replaces it.
-func releaseComponentLogs(workDir string) {
+// first failure's log stays as .1 until the next spawn replaces it. The error
+// is for a Debug line only.
+func releaseComponentLogs(workDir string) error {
+	var errs []error
 	for _, n := range componentLogNames {
-		_ = os.Remove(filepath.Join(workDir, n+".log"+componentLogPinSuffix))
+		errs = append(errs, removeIfPresent(filepath.Join(workDir, n+".log"+componentLogPinSuffix)))
 	}
+	return errors.Join(errs...)
 }
 
 // waitHealthz waits for the apiserver to report healthz ok, failing fast (with

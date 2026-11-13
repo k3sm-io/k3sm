@@ -72,7 +72,23 @@ type CrashLoopVerdict struct {
 	// an HA server's scheduler or controller-manager that exited on a lost lease,
 	// which restarts the daemon but is not a crash. Empty when there are none.
 	LeaderLost string
+	// Phase names where a slow bring-up streak stands, set only by the two
+	// slow-streak readings: PhaseBackingOff while the daemon waits between slow
+	// attempts, PhaseAttempting while an attempt runs on a live server. Every
+	// other verdict leaves it empty, so a real crash pattern never carries it.
+	Phase string
+	// Until is when the next bring-up attempt may start; set only with
+	// PhaseBackingOff.
+	Until time.Time
 }
+
+// The slow-streak phases. The state word stays "restarting" for both; the phase
+// tells a reader that the daemon is pacing itself on a loaded host rather than
+// failing over and over.
+const (
+	PhaseBackingOff = "backing-off"
+	PhaseAttempting = "attempting"
+)
 
 // restartingFloor is how many crashes inside the window make the row say so.
 // One crash is a fact for the log; two is a pattern worth a WARN before the
@@ -80,8 +96,11 @@ type CrashLoopVerdict struct {
 const restartingFloor = 2
 
 // ClassifyCrashLoop reads a record into a verdict. Pure: the caller passes the
-// record (or the read error) and the clock.
-func ClassifyCrashLoop(rec executor.CrashRecord, readErr error, path string, now time.Time) CrashLoopVerdict {
+// record (or the read error), the clock, and serverLive, whether a server
+// daemon is running right now (launchd's running state, confirmed in the
+// process table). The record cannot say that itself: a stop or kill during a
+// slow streak leaves SlowStreak > 0 with no attempt behind it.
+func ClassifyCrashLoop(rec executor.CrashRecord, readErr error, path string, now time.Time, serverLive bool) CrashLoopVerdict {
 	if readErr != nil {
 		if errors.Is(readErr, os.ErrPermission) {
 			return CrashLoopVerdict{Posture: PostureUnreadable,
@@ -156,18 +175,23 @@ func ClassifyCrashLoop(rec executor.CrashRecord, readErr error, path string, now
 				until.Format(time.RFC3339), rec.SlowStreak, executor.BringUpSlowStreakLimit),
 			Remedy:     "uptime; memory_pressure   # what is loading the host?",
 			LeaderLost: lostNote,
+			Phase:      PhaseBackingOff,
+			Until:      until,
 		}
 	}
-	if rec.SlowStreak > 0 {
+	if rec.SlowStreak > 0 && serverLive {
 		// The backoff is over and the next attempt is running (or about to): the
 		// streak is still live until that attempt reaches healthz, so the row
-		// keeps saying so instead of going quiet mid-attempt.
+		// keeps saying so instead of going quiet mid-attempt. Only a running
+		// server has an attempt: a stop or kill mid-streak leaves the count in
+		// the record with nothing behind it, which is quiet.
 		return CrashLoopVerdict{
 			Posture: PostureRestarting,
 			Detail: fmt.Sprintf("bring-up attempt %d in progress: %d consecutive bring-ups timed out while the host was under pressure; parks at %d",
 				rec.SlowStreak+1, rec.SlowStreak, executor.BringUpSlowStreakLimit),
 			Remedy:     "uptime; memory_pressure   # what is loading the host?",
 			LeaderLost: lostNote,
+			Phase:      PhaseAttempting,
 		}
 	}
 	return CrashLoopVerdict{Posture: PostureQuiet, LeaderLost: lostNote}
@@ -248,6 +272,12 @@ func applyCrashLoop(row *Row, v CrashLoopVerdict) {
 			row.Remedy = v.Remedy
 		}
 		row.Wide["crash-loop"] = "restarting"
+		if v.Phase != "" {
+			row.Wide["crash-loop-phase"] = v.Phase
+		}
+		if v.Phase == PhaseBackingOff && !v.Until.IsZero() {
+			row.Wide["crash-loop-next-attempt"] = v.Until.UTC().Format(time.RFC3339)
+		}
 	case PostureUnreadable:
 		row.Wide["crash-loop"] = v.Detail
 	}

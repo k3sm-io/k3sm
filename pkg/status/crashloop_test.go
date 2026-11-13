@@ -124,7 +124,7 @@ func TestClassifyCrashLoop(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			v := ClassifyCrashLoop(tc.rec, tc.err, path, now)
+			v := ClassifyCrashLoop(tc.rec, tc.err, path, now, true)
 			if v.Posture != tc.wantPosture {
 				t.Fatalf("posture = %v, want %v (%+v)", v.Posture, tc.wantPosture, v)
 			}
@@ -232,4 +232,161 @@ func TestCollectorServerRowReadsTheCrashRecord(t *testing.T) {
 			t.Fatalf("%+v", row)
 		}
 	})
+}
+
+// A stop or kill during a slow bring-up streak leaves SlowStreak > 0 in the
+// record with no attempt behind it. Only a running server has a bring-up
+// attempt in progress; without one the elapsed streak is quiet, while the
+// postures the record alone proves (parked, a crash pattern) are unchanged.
+func TestCrashLoopSlowStreakNeedsALiveServer(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	path := "/var/lib/k3sm/server/crashloop.json"
+	// Past the slow backoff: the record says only "a streak of N".
+	elapsed := now.Add(-time.Hour)
+	streak := executor.CrashRecord{SlowStreak: 2, LastSlowAt: &elapsed}
+	tripped := now.Add(-time.Minute)
+	parked := executor.CrashRecord{SlowStreak: 2, LastSlowAt: &tripped, TrippedAt: &tripped,
+		Crashes: []executor.Crash{{At: tripped, Component: "kube-apiserver", Origin: executor.CrashOriginBringUpSlow}}}
+	crashing := executor.CrashRecord{SlowStreak: 1, LastSlowAt: &elapsed, Crashes: []executor.Crash{
+		{At: now.Add(-2 * time.Minute), Component: "kine", Origin: executor.CrashOriginCrash},
+		{At: now.Add(-time.Minute), Component: "kine", Origin: executor.CrashOriginCrash}}}
+
+	tests := []struct {
+		name        string
+		rec         executor.CrashRecord
+		live        bool
+		wantPosture CrashLoopPosture
+		wantIn      string
+	}{
+		{"a live server with a streak is mid-attempt", streak, true, PostureRestarting, "bring-up attempt 3 in progress"},
+		{"a stopped server with a streak is quiet", streak, false, PostureQuiet, ""},
+		{"a stopped server still reads as parked", parked, false, PostureParked, "tripped"},
+		{"a stopped server still shows the crash pattern", crashing, false, PostureRestarting, "restarted 2 times"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			v := ClassifyCrashLoop(tc.rec, nil, path, now, tc.live)
+			if v.Posture != tc.wantPosture {
+				t.Fatalf("posture = %v, want %v (%+v)", v.Posture, tc.wantPosture, v)
+			}
+			if !strings.Contains(v.Detail, tc.wantIn) {
+				t.Errorf("detail lacks %q: %+v", tc.wantIn, v)
+			}
+			if !tc.live && strings.Contains(v.Detail, "in progress") {
+				t.Errorf("no server is running, yet the verdict claims an attempt: %+v", v)
+			}
+		})
+	}
+
+	// The collector takes liveness from the server row it folds into.
+	b, _ := json.Marshal(streak)
+	c := Collector{FS: fakeFS{contents: map[string][]byte{executor.CrashLoopPath("/var/lib/k3sm/server"): b}},
+		Paths: Paths{WorkDir: "/var/lib/k3sm/server"}, Now: func() time.Time { return now }}
+	for _, st := range []struct {
+		state RowState
+		want  string
+	}{{StateRunning, "restarting"}, {StateStopped, ""}} {
+		row := Row{Name: RowServer, State: st.state, Severity: SeverityOK, Wide: map[string]string{}}
+		c.crashLoop(&row)
+		if row.Wide["crash-loop"] != st.want {
+			t.Errorf("server row %s: crash-loop = %q, want %q (%+v)", st.state, row.Wide["crash-loop"], st.want, row)
+		}
+	}
+}
+
+// A bring-up back-off is the daemon pacing itself on a loaded host, not the
+// control plane failing over and over. The row keeps its state, severity and
+// crash-loop value, and adds the phase (and, while it waits, when the next
+// attempt starts) in wide keys of its own, so the alert can say which it is.
+func TestCrashLoopBackingOffHasItsOwnWideValue(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	path := "/var/lib/k3sm/server/crashloop.json"
+	recent := now.Add(-10 * time.Second)
+	elapsed := now.Add(-time.Hour)
+	crashes := []executor.Crash{
+		{At: now.Add(-2 * time.Minute), Component: "kine", Origin: executor.CrashOriginCrash},
+		{At: now.Add(-time.Minute), Component: "kine", Origin: executor.CrashOriginCrash}}
+
+	tests := []struct {
+		name      string
+		rec       executor.CrashRecord
+		live      bool
+		wantPhase string
+		wantNext  time.Time // zero: no next-attempt key
+		wantCrash string
+		wantState RowState
+		wantSev   Severity
+	}{
+		{"a live slow-streak wait is backing off",
+			executor.CrashRecord{SlowStreak: 2, LastSlowAt: &recent}, true,
+			PhaseBackingOff, recent.Add(2 * executor.BringUpSlowBackoffBase), "restarting", StateCrashLoop, SeverityWarn},
+		{"an elapsed streak on a running server is attempting",
+			executor.CrashRecord{SlowStreak: 2, LastSlowAt: &elapsed}, true,
+			PhaseAttempting, time.Time{}, "restarting", StateCrashLoop, SeverityWarn},
+		{"an elapsed streak on a stopped server has no phase",
+			executor.CrashRecord{SlowStreak: 2, LastSlowAt: &elapsed}, false,
+			"", time.Time{}, "", StateRunning, SeverityOK},
+		{"a real crash pattern has no phase",
+			executor.CrashRecord{SlowStreak: 1, LastSlowAt: &recent, Crashes: crashes}, true,
+			"", time.Time{}, "restarting", StateCrashLoop, SeverityWarn},
+	}
+	var generic string
+	{
+		v := ClassifyCrashLoop(executor.CrashRecord{Crashes: crashes}, nil, path, now, true)
+		row := Row{Name: RowServer, State: StateRunning, Severity: SeverityOK, Wide: map[string]string{}}
+		applyCrashLoop(&row, v)
+		generic = daemonAlert(row, alertContext{now: now}).Cause
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			v := ClassifyCrashLoop(tc.rec, nil, path, now, tc.live)
+			if v.Phase != tc.wantPhase {
+				t.Fatalf("phase = %q, want %q (%+v)", v.Phase, tc.wantPhase, v)
+			}
+			row := Row{Name: RowServer, State: StateRunning, Severity: SeverityOK, Wide: map[string]string{}}
+			applyCrashLoop(&row, v)
+			if row.State != tc.wantState || row.Severity != tc.wantSev || row.Wide["crash-loop"] != tc.wantCrash {
+				t.Fatalf("row = %s/%s crash-loop %q, want %s/%s %q", row.State, row.Severity,
+					row.Wide["crash-loop"], tc.wantState, tc.wantSev, tc.wantCrash)
+			}
+			phase, hasPhase := row.Wide["crash-loop-phase"]
+			if hasPhase != (tc.wantPhase != "") || phase != tc.wantPhase {
+				t.Errorf("wide crash-loop-phase = %q (present %v), want %q", phase, hasPhase, tc.wantPhase)
+			}
+			next, hasNext := row.Wide["crash-loop-next-attempt"]
+			if tc.wantNext.IsZero() {
+				if hasNext {
+					t.Errorf("wide crash-loop-next-attempt = %q, want absent", next)
+				}
+			} else {
+				at, err := time.Parse(time.RFC3339, next)
+				if err != nil {
+					t.Fatalf("crash-loop-next-attempt %q is not RFC3339: %v", next, err)
+				}
+				if !at.Equal(tc.wantNext) {
+					t.Errorf("crash-loop-next-attempt = %s, want %s", at, tc.wantNext)
+				}
+			}
+			if tc.wantPhase == "" {
+				return
+			}
+			a := daemonAlert(row, alertContext{now: now})
+			if a == nil || a.Cause == generic {
+				t.Fatalf("%s alert reads as the generic crash loop: %+v", tc.wantPhase, a)
+			}
+			if strings.Contains(a.Cause, "keeps failing") {
+				t.Errorf("%s alert says the control plane keeps failing: %q", tc.wantPhase, a.Cause)
+			}
+			if tc.wantPhase == PhaseBackingOff && !strings.Contains(a.Cause, next) {
+				t.Errorf("back-off alert does not name the next attempt %q: %q", next, a.Cause)
+			}
+		})
+	}
+	if !strings.Contains(generic, "keeps failing") {
+		t.Errorf("the generic crash-loop alert changed: %q", generic)
+	}
 }
