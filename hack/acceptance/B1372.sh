@@ -70,7 +70,8 @@
 #         at t.0's within 1% of the model
 #   f.1   cleanup, green or red: the namespace (MLXModels, ConfigMap, client and
 #         client Pods), the run's Released PersistentVolumes and its storage dir on
-#         each node, the pushed tag, the remote scratch dirs; each step that fails is
+#         each node (a symlink in its place, dangling or not, is unlinked and its
+#         target never touched), the pushed tag, the remote scratch dirs; each step that fails is
 #         named and fails the run, and none is skipped because another failed (a
 #         failed PersistentVolume list still leaves each node's storage dir removed). Each is marked for cleanup BEFORE the
 #         call that makes it, so a call that times out after the server acted is
@@ -1304,12 +1305,16 @@ for p in json.loads(sys.stdin.read()).get("items", []):
 }
 
 # STORAGE_SCRIPT <root> <namespace> <delete|check>: the namespace's storage dir on the
-# node, removed or only checked; nothing outside <root>/<namespace> is touched.
+# node, removed or only checked; nothing outside <root>/<namespace> is touched. A
+# symlink there (dangling or live) counts as an entry: delete unlinks it and never
+# touches its target, and the check wants neither an entry nor a link.
 STORAGE_SCRIPT='
 case "$2" in "" | . | .. | */*) exit 2 ;; esac
 d="$1/$2"
-if [ -e "$d" ] && [ "$3" = delete ]; then rm -rf -- "$d" && echo "removed $d"; fi
-[ ! -e "$d" ]
+if { [ -e "$d" ] || [ -L "$d" ]; } && [ "$3" = delete ]; then
+	if [ -L "$d" ]; then rm -f -- "$d" && echo "unlinked $d"; else rm -rf -- "$d" && echo "removed $d"; fi
+fi
+[ ! -e "$d" ] && [ ! -L "$d" ]
 '
 
 # storage_clean <rung> <delete|check>: the run's Released PVs and the namespace's storage
@@ -2043,6 +2048,21 @@ self_test() {
 	chk "within: 1 KiB" "$rc" 0
 	rc=0; within 100 102 "$TOL" || rc=$?
 	chk "within: 2 KiB" "$rc" 1
+	# STORAGE_SCRIPT on a link at <root>/<namespace>: a dangling one fails the check and
+	# is unlinked by delete; a live one is unlinked and its target outside the root kept.
+	mkdir -p "$t/sroot" "$t/slive/keep"
+	: >"$t/slive/keep/f"
+	ln -s "$t/nowhere" "$t/sroot/ns-dangling"
+	rc=0; bash -c "$STORAGE_SCRIPT" mst "$t/sroot" ns-dangling check >/dev/null 2>&1 || rc=$?
+	chk "storage-dangling-check" "$rc" 1
+	rc=0; bash -c "$STORAGE_SCRIPT" mst "$t/sroot" ns-dangling delete >/dev/null 2>&1 || rc=$?
+	chk "storage-dangling-delete" "$rc" 0
+	[ ! -L "$t/sroot/ns-dangling" ] || { echo "self-test FAIL: storage-dangling-delete: the link is left"; bad=1; }
+	ln -s "$t/slive" "$t/sroot/ns-live"
+	rc=0; bash -c "$STORAGE_SCRIPT" mst "$t/sroot" ns-live delete >/dev/null 2>&1 || rc=$?
+	chk "storage-link-live-target" "$rc" 0
+	[ ! -L "$t/sroot/ns-live" ] || { echo "self-test FAIL: storage-link-live-target: the link is left"; bad=1; }
+	[ -f "$t/slive/keep/f" ] || { echo "self-test FAIL: storage-link-live-target: the target outside the root was touched"; bad=1; }
 
 	# One full fake run. FAKE_BREAK names a mutant; want is the exit and the red rung.
 	# FR_STEP, set on one call, shortens K3SM_MST_STEP_TIMEOUT for a run whose fake hangs.
