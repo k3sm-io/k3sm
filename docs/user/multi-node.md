@@ -487,7 +487,8 @@ There are no per-node `svclb-*` pods. Each node's k3sm process holds the listene
   the ports it declares and the ports a Service targets on it; UDP to a `vm` Pod's IP is not relayed
   ([Limitations](limitations.md#vm-pods-services-and-direct-pod-ips)).
 - Per-pod IP identity and headless/StatefulSet DNS records are present, but multi-node as a whole is
-  EXPERIMENTAL. Validate cross-node resolution for your own workload rather than assuming it. See
+  EXPERIMENTAL. Multi-node has been run on two Macs; larger clusters are untested. Validate
+  cross-node resolution for your own workload rather than assuming it. See
   [Limitations](limitations.md).
 - A cluster upgrade is a **node-by-node** rolling restart of the launchd daemons; see
   [Upgrade](upgrade.md).
