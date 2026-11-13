@@ -276,6 +276,12 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
   headers within 30 seconds ends the same way it always ended when the registry could not be reached:
   the gate closes the connection, and the puller tries its next mirror. A pull that cannot reach the
   local registry is now logged.
+- A peer that opens a blob GET on the registry relay and stops reading, or declares a request body
+  and never sends it, no longer holds one of the relay's limited connections for that client until
+  restart (this applies to the relay; the push gate's upload bound is separate). Each write of a response
+  and each read of a request body must make progress within 5 minutes, or the relay closes the
+  connection and frees the slot. A blob still streams for as long as it takes while it keeps moving:
+  there is no flat read or write timeout. A connection cut this way is logged as a warning.
 - A server whose control plane does not report healthy in time while the Mac is heavily loaded no
   longer parks on the crash-loop breaker after five attempts. It backs off instead, from 30 seconds
   doubling up to 10 minutes, `k3sm status` shows when the next attempt starts and that an attempt

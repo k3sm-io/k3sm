@@ -22,10 +22,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -99,7 +101,20 @@ type relayLimitFixture struct {
 
 func newRelayLimitFixture(t *testing.T) *relayLimitFixture {
 	t.Helper()
-	z, zaddr := socketRegistry(t)
+	return newRelayLimitFixtureWith(t, defaultRelayLimits, nil)
+}
+
+// newRelayLimitFixtureWith is newRelayLimitFixture with the relay's limits set
+// to lim and, when registry is not nil, the fake registry serving through it.
+func newRelayLimitFixtureWith(t *testing.T, lim relayLimits, registry http.Handler) *relayLimitFixture {
+	t.Helper()
+	z := newFakeRegistry(t)
+	if registry != nil {
+		z.h = registry
+	}
+	zsrv := httptest.NewServer(z.h)
+	t.Cleanup(zsrv.Close)
+	zaddr := zsrv.Listener.Addr()
 	f := &relayLimitFixture{
 		registry: z,
 		tokens:   &fakeTokens{statuses: map[string]authnv1.TokenReviewStatus{}},
@@ -113,6 +128,9 @@ func newRelayLimitFixture(t *testing.T) *relayLimitFixture {
 		Namespaces: &fakeNamespaces{labels: map[string]map[string]string{"team": {PushLabel: "team"}}},
 	}
 	r := newRelay(portOf(t, zaddr), portOf(t, zaddr), nil, quietLogger(), auth, gateCred)
+	r.limits = lim
+	r.limiter = newSourceLimiter(r.limiter.next, lim, time.Now)
+	r.handler = r.limiter
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
 	go func() {
@@ -345,6 +363,137 @@ func TestSourceLimiter(t *testing.T) {
 		cancel()
 		if rec := serve(ctx, "10.0.0.9", "GET"); rec.Code == http.StatusNoContent {
 			t.Error("a request whose context ended was served after waiting")
+		}
+	})
+}
+
+// plainWriter implements only http.ResponseWriter, so a ResponseController
+// over it cannot set a deadline.
+type plainWriter struct {
+	h    http.Header
+	code int
+}
+
+func (p *plainWriter) Header() http.Header {
+	if p.h == nil {
+		p.h = http.Header{}
+	}
+	return p.h
+}
+func (p *plainWriter) Write(b []byte) (int, error) { return len(b), nil }
+func (p *plainWriter) WriteHeader(code int)        { p.code = code }
+func (p *plainWriter) status() int                 { return p.code }
+
+// statusWriter is a test writer that reports the status it was given.
+type statusWriter interface {
+	http.ResponseWriter
+	status() int
+}
+
+// deadlineWriter is a plainWriter that takes deadlines.
+type deadlineWriter struct{ plainWriter }
+
+func (*deadlineWriter) SetWriteDeadline(time.Time) error { return nil }
+func (*deadlineWriter) SetReadDeadline(time.Time) error  { return nil }
+
+// TestBindProgressLogsUnboundedConnection pins that a writer which cannot take
+// a deadline is still served, and that the connection is logged once as served
+// without a progress bound; a writer that takes deadlines logs nothing.
+func TestBindProgressLogsUnboundedConnection(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		w     func() statusWriter
+		warns int
+	}{
+		{"a writer without deadlines is served and logged once", func() statusWriter { return &plainWriter{} }, 1},
+		{"a writer with deadlines logs nothing", func() statusWriter { return &deadlineWriter{} }, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &recordedLog{}
+			ok := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
+			s := newSourceLimiter(ok, relayLimits{
+				requestRate: 100, requestBurst: 100, writeRate: 100, writeBurst: 100,
+				maxRequestsPerConn: 100, maxConnAge: time.Hour, tableMax: 10,
+				writeProgress: time.Minute, readProgress: time.Minute,
+			}, nil)
+			s.log = slog.New(rec)
+			ctx := s.ConnContext(t.Context(), nil)
+			for i := range 2 {
+				req := httptest.NewRequestWithContext(ctx, http.MethodGet, "/v2/library/x/blobs/sha256:00", nil)
+				req.RemoteAddr = "10.0.0.9:1234"
+				w := tc.w()
+				s.ServeHTTP(w, req)
+				if w.status() != http.StatusNoContent {
+					t.Fatalf("request %d = %d, want 204", i+1, w.status())
+				}
+			}
+			var warns []slog.Record
+			rec.mu.Lock()
+			for _, r := range rec.recs {
+				if r.Level == slog.LevelWarn {
+					warns = append(warns, r)
+				}
+			}
+			rec.mu.Unlock()
+			if len(warns) != tc.warns {
+				t.Fatalf("warnings = %d, want %d: %v", len(warns), tc.warns, warns)
+			}
+			if tc.warns == 0 {
+				return
+			}
+			got := map[string]string{}
+			warns[0].Attrs(func(a slog.Attr) bool {
+				got[a.Key] = a.Value.String()
+				return true
+			})
+			if !strings.Contains(warns[0].Message, "without a progress bound") || got["remote"] != "10.0.0.9:1234" {
+				t.Errorf("warning = %q %v, want the no-progress-bound line with remote 10.0.0.9:1234", warns[0].Message, got)
+			}
+			if got["error"] == "" {
+				t.Errorf("warning error attribute is empty: %v", got)
+			}
+			for _, k := range []string{"path", "url", "repo"} {
+				if _, ok := got[k]; ok {
+					t.Errorf("warning carries %q; want the address only", k)
+				}
+			}
+		})
+	}
+
+	t.Run("two connections each log once", func(t *testing.T) {
+		rec := &recordedLog{}
+		ok := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
+		s := newSourceLimiter(ok, relayLimits{
+			requestRate: 100, requestBurst: 100, writeRate: 100, writeBurst: 100,
+			maxRequestsPerConn: 100, maxConnAge: time.Hour, tableMax: 10,
+			writeProgress: time.Minute, readProgress: time.Minute,
+		}, nil)
+		s.log = slog.New(rec)
+		remotes := []string{"10.0.0.1:1111", "10.0.0.2:2222"}
+		for _, remote := range remotes {
+			ctx := s.ConnContext(t.Context(), nil)
+			for range 2 {
+				req := httptest.NewRequestWithContext(ctx, http.MethodGet, "/v2/library/x/blobs/sha256:00", nil)
+				req.RemoteAddr = remote
+				s.ServeHTTP(&plainWriter{}, req)
+			}
+		}
+		var seen []string
+		rec.mu.Lock()
+		for _, r := range rec.recs {
+			if r.Level != slog.LevelWarn {
+				continue
+			}
+			r.Attrs(func(a slog.Attr) bool {
+				if a.Key == "remote" {
+					seen = append(seen, a.Value.String())
+				}
+				return true
+			})
+		}
+		rec.mu.Unlock()
+		if len(seen) != 2 || seen[0] != remotes[0] || seen[1] != remotes[1] {
+			t.Errorf("warnings for remotes %v, want one each for %v", seen, remotes)
 		}
 	})
 }

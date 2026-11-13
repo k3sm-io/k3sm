@@ -91,11 +91,17 @@ TestReclaimRechecksBeforeEachSignal added new with the child switch
 TestRecordKeepsTheServersFields added new with the child switch
 TestRegistryNodePortIsOptInAndGated kept the push gate is unchanged
 TestRegistryReadyFollowsNoRedirect added the readiness probe stays on the loopback address it was given
+TestRelayCutIsLogged added a connection a relay deadline cuts is logged once
+TestRelayCutLogEndsWithTheResponse added a write timeout after the response ends is not logged as a relay cut
+TestRelayEarlyAnswerWhileBodyIsSent added an answer before the upload body is sent does not race the body reads
 TestRelayLimitsArePerSource kept the relay and cluster publication do not touch the child
+TestRelayReadAfterCloseArmsNoDeadline added a body read after close leaves no read deadline on the connection
 TestRelayServesTLSOnly kept the relay and cluster publication do not touch the child
 TestRelayServesTheGate kept the push gate is unchanged
 TestRelayServingSANsWithoutNodePort kept the relay and cluster publication do not touch the child
 TestRelaySkipsAnAbsentAddress kept the relay and cluster publication do not touch the child
+TestRelayStalledReaderFreesItsSlot added a relay connection is bounded by write and read progress, not total time
+TestRelayStalledUploadBodyFreesItsSlot added a relay connection is bounded by write and read progress, not total time
 TestRelayStopsOnContextCancel kept the relay and cluster publication do not touch the child
 TestRelayVerifiesAtTheNodePortAddress kept the relay and cluster publication do not touch the child
 TestRemoveAdvertisement kept the relay and cluster publication do not touch the child
