@@ -1,6 +1,7 @@
 # High availability
 
-Running the k3sm control plane so a single Mac is not a single point of failure.
+Running the k3sm control plane on more than one Mac. Two servers tolerate no failure; tolerating the
+loss of a server takes three.
 
 > **Status: EXPERIMENTAL** (what that means: [Experimental and alpha](README.md#what-experimental-means)). `k3sm install --cluster-init` forms an embedded etcd control plane on
 > the first server, and `k3sm install --server-join` adds a second one. Keep datastore
@@ -14,8 +15,8 @@ Running the k3sm control plane so a single Mac is not a single point of failure.
 ## HA Model
 
 A single-node k3sm embeds the control plane over **kine/SQLite**. HA extends this to multiple
-control-plane Macs so the apiserver remains reachable if one node is lost, with an embedded
-**etcd** cluster instead of the local SQLite file. The design opts in with `--cluster-init` on the
+control-plane Macs so the apiserver stays reachable if one server is lost, which needs three servers,
+with an embedded **etcd** cluster instead of the local SQLite file. The design opts in with `--cluster-init` on the
 first server and `--server-join` on the others. There is no conversion from an existing SQLite
 cluster to etcd, and none from an external database. The controller-manager and scheduler elect a
 leader across the servers, and a joining server authenticates against the same cluster CA bundle.
