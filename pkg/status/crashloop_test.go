@@ -216,7 +216,7 @@ func TestCollectorServerRowReadsTheCrashRecord(t *testing.T) {
 		if err := os.WriteFile(executor.CrashLoopPath(workDir), b, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		c := Collector{FS: fakeFS{}, Paths: Paths{WorkDir: workDir}, Now: func() time.Time { return now }}
+		c := Collector{FS: fakeFS{}, ReadCrashRecord: executor.ReadCrashRecord, Paths: Paths{WorkDir: workDir}, Now: func() time.Time { return now }}
 		row := Row{Name: RowServer, State: StateRunning, Severity: SeverityOK, Wide: map[string]string{}}
 		c.crashLoop(&row)
 		if row.Severity != SeverityFail || !strings.Contains(row.Detail, "kine") || !strings.Contains(row.Remedy, "--clear-crashloop") {
@@ -231,7 +231,7 @@ func TestCollectorServerRowReadsTheCrashRecord(t *testing.T) {
 		if err := os.WriteFile(executor.CrashLoopPath(workDir), b, 0o000); err != nil {
 			t.Fatal(err)
 		}
-		c := Collector{FS: fakeFS{}, Paths: Paths{WorkDir: workDir}, Now: func() time.Time { return now }}
+		c := Collector{FS: fakeFS{}, ReadCrashRecord: executor.ReadCrashRecord, Paths: Paths{WorkDir: workDir}, Now: func() time.Time { return now }}
 		row := Row{Name: RowServer, State: StateRunning, Severity: SeverityOK, Wide: map[string]string{}}
 		c.crashLoop(&row)
 		if row.Severity != SeverityOK || !strings.Contains(row.Wide["crash-loop"], "not readable") {
@@ -239,7 +239,7 @@ func TestCollectorServerRowReadsTheCrashRecord(t *testing.T) {
 		}
 	})
 	t.Run("absent record changes nothing", func(t *testing.T) {
-		c := Collector{FS: fakeFS{}, Paths: Paths{WorkDir: t.TempDir()}, Now: func() time.Time { return now }}
+		c := Collector{FS: fakeFS{}, ReadCrashRecord: executor.ReadCrashRecord, Paths: Paths{WorkDir: t.TempDir()}, Now: func() time.Time { return now }}
 		row := Row{Name: RowServer, State: StateRunning, Severity: SeverityOK, Wide: map[string]string{}}
 		c.crashLoop(&row)
 		if row.Severity != SeverityOK || len(row.Wide) != 0 {
@@ -427,7 +427,7 @@ func TestCrashRecordRowRefusesSymlinkFIFOAndOversize(t *testing.T) {
 	// the FIFO fails here instead of hanging the package.
 	collect := func(t *testing.T, workDir string) Row {
 		t.Helper()
-		c := Collector{FS: fakeFS{}, Paths: Paths{WorkDir: workDir}, Now: func() time.Time { return now }}
+		c := Collector{FS: fakeFS{}, ReadCrashRecord: executor.ReadCrashRecord, Paths: Paths{WorkDir: workDir}, Now: func() time.Time { return now }}
 		done := make(chan Row, 1)
 		go func() {
 			row := Row{Name: RowServer, State: StateRunning, Severity: SeverityOK, Wide: map[string]string{}}
