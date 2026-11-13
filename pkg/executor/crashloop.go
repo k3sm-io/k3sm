@@ -20,15 +20,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"time"
 
-	"golang.org/x/sys/unix"
-
 	"k3sm.io/k3sm/internal/atomicfile"
+	"k3sm.io/k3sm/internal/boundedread"
 )
 
 // The crash-loop circuit breaker.
@@ -278,46 +276,24 @@ func ParseCrashRecord(b []byte) (CrashRecord, error) {
 const CrashRecordMaxBytes = 1 << 20
 
 // errCrashRecordRefused marks a record readCrashRecordFile would not read: a
-// symlink, a non-regular file, or one over CrashRecordMaxBytes.
+// symlink, a non-regular file, or one over CrashRecordMaxBytes. Such an error
+// also matches boundedread.ErrRefused.
 var errCrashRecordRefused = errors.New("crash-loop record refused")
 
-// readCrashRecordFile reads the record's bytes the way dataroot.ReadMarker
-// reads its marker: opened O_NOFOLLOW|O_NONBLOCK, typed and sized by fstat on
-// that one descriptor, and read from it, so nothing can be swapped between the
-// check and the read. O_NOFOLLOW guards only the last path component; a
-// symlinked parent directory is followed, and the work dir's ownership is the
-// control for it. O_NONBLOCK keeps a planted FIFO from blocking the open. A
-// missing file keeps os.ReadFile's contract (errors.Is(err, fs.ErrNotExist)).
+// readCrashRecordFile reads the record's bytes through boundedread.ReadFileBounded:
+// opened O_NOFOLLOW|O_NONBLOCK, typed and sized by fstat on that one
+// descriptor, and read from it, so nothing can be swapped between the check
+// and the read. O_NOFOLLOW guards only the last path component; a symlinked
+// parent directory is followed, and the work dir's ownership is the control
+// for it. O_NONBLOCK keeps a planted FIFO from blocking the open. A missing
+// file keeps os.ReadFile's contract (errors.Is(err, fs.ErrNotExist)); a
+// refused one wraps errCrashRecordRefused.
 func readCrashRecordFile(path string) ([]byte, error) {
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
-	if err != nil {
-		if errors.Is(err, unix.ELOOP) {
-			return nil, fmt.Errorf("%s is a symlink: %w", path, errCrashRecordRefused)
-		}
-		return nil, &fs.PathError{Op: "open", Path: path, Err: err}
+	b, err := boundedread.ReadFileBounded(path, CrashRecordMaxBytes)
+	if errors.Is(err, boundedread.ErrRefused) {
+		return nil, fmt.Errorf("%w: %w", errCrashRecordRefused, err)
 	}
-	f := os.NewFile(uintptr(fd), path)
-	defer func() { _ = f.Close() }()
-	var st unix.Stat_t
-	if err := unix.Fstat(fd, &st); err != nil {
-		return nil, fmt.Errorf("stat %s: %w", path, err)
-	}
-	if st.Mode&unix.S_IFMT != unix.S_IFREG {
-		return nil, fmt.Errorf("%s is not a regular file (mode %#o): %w", path, st.Mode&unix.S_IFMT, errCrashRecordRefused)
-	}
-	if st.Size > CrashRecordMaxBytes {
-		return nil, fmt.Errorf("%s is %d bytes, over the %d-byte bound: %w", path, st.Size, CrashRecordMaxBytes, errCrashRecordRefused)
-	}
-	// Read one byte past the bound, so a file that grew after the fstat is
-	// refused rather than silently truncated into a parse error.
-	b, err := io.ReadAll(io.LimitReader(f, CrashRecordMaxBytes+1))
-	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", path, err)
-	}
-	if len(b) > CrashRecordMaxBytes {
-		return nil, fmt.Errorf("%s grew past the %d-byte bound: %w", path, CrashRecordMaxBytes, errCrashRecordRefused)
-	}
-	return b, nil
+	return b, err
 }
 
 // ReadCrashRecord loads the record at path. An absent file is an empty record,

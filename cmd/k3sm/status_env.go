@@ -49,6 +49,7 @@ import (
 	"k3sm.io/darwin-net/pkg/tcpseg"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 
+	"k3sm.io/k3sm/internal/boundedread"
 	"k3sm.io/k3sm/pkg/datavol"
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/install"
@@ -611,7 +612,29 @@ func (osStatusFS) ReadTail(path string, lines int) ([]string, error) {
 	}
 	return out, err
 }
-func (osStatusFS) ReadFile(path string) ([]byte, error) { return os.ReadFile(path) }
+
+// statusFSReadMax bounds every osStatusFS.ReadFile. The files status reads
+// whole (records, certificates, kubeconfigs, plists, summaries) are a few KiB;
+// anything near 1 MiB is not one k3sm wrote.
+const statusFSReadMax = 1 << 20
+
+// ReadFile reads a whole small file through boundedread.ReadFileBounded.
+// `k3sm status` may run as root and reads files in trees the service user can
+// write, so a symlink, a FIFO or other non-regular file, or a file over
+// statusFSReadMax planted there is refused (boundedread.ErrRefused) instead of
+// followed, blocked on, or read without limit.
+func (osStatusFS) ReadFile(path string) ([]byte, error) {
+	return boundedread.ReadFileBounded(path, statusFSReadMax)
+}
+
+// ReadFileFollowingLink is ReadFile for the one path whose final component may
+// legitimately be a symlink: the admin kubeconfig, which the operator chose at
+// install and may link to wherever they keep it. It follows that link but keeps
+// the bound, the non-blocking open and the regular-file check on the
+// descriptor read (boundedread.ReadFileBoundedFollow).
+func (osStatusFS) ReadFileFollowingLink(path string) ([]byte, error) {
+	return boundedread.ReadFileBoundedFollow(path, statusFSReadMax)
+}
 
 // readTail returns the last n lines of path without reading the whole file: it
 // seeks to the last logTailBudget bytes and drops the first (necessarily

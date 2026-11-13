@@ -39,6 +39,14 @@ import (
 // not start without it, so a row that is not ok names the file and the recovery.
 const RowServingCert = "serving-cert"
 
+// linkFollowingReader is the optional FS method the admin-kubeconfig check
+// reads through: FS.ReadFile may refuse a symlink at the final component, and
+// the admin kubeconfig is the one file status reads that may legitimately be
+// one. An FS without it is read through ReadFile.
+type linkFollowingReader interface {
+	ReadFileFollowingLink(path string) ([]byte, error)
+}
+
 // servingCertRow reports RowServingCert. It exists on a server whose work dir holds
 // a cluster CA (a control plane has booted there); it reports ok=false elsewhere.
 // An unreadable work dir (a plain-user run) reads the certificate the apiserver
@@ -259,7 +267,15 @@ func (c Collector) adminKubeconfigAnchorRow() (Row, bool) {
 	if n, err := install.InstalledKubeconfigName(c.FS.ReadFile, c.plistPath(c.Paths.ServerLabel), recordPath); err == nil {
 		name = n
 	}
-	raw, err := c.FS.ReadFile(path)
+	// The admin kubeconfig is the operator's file, at a path they chose, and may
+	// legitimately be a symlink to where they keep it; a FS that refuses links
+	// in ReadFile offers a link-following read for it, still bounded and still
+	// refusing a FIFO or other non-regular target.
+	read := c.FS.ReadFile
+	if lf, ok := c.FS.(linkFollowingReader); ok {
+		read = lf.ReadFileFollowingLink
+	}
+	raw, err := read(path)
 	if err != nil {
 		return mismatch(path + " is not readable")
 	}
