@@ -29,10 +29,13 @@
 # starts from r0; `--until r5` is the unattended stretch (r6 is the first rung that
 # wants /dev/tty, and refuses without one), and `--until r8` chooses to skip r9.
 #
-# The teardown can fail the run: after the exit trap deletes the namespace and the
-# PVs claimed from it, it waits up to 120 s for both to be gone; anything left (or
-# unreadable) is printed as TEARDOWN-LEFT/TEARDOWN-UNVERIFIED and turns an exit 0
-# or 4 into 1. A rung's own FAIL (1) or REFUSED (2) code is kept as it is.
+# The teardown can fail the run: whenever a rung attempted to create the namespace
+# (even a create that reported failure), the exit trap deletes it and the PVs
+# claimed from it, then re-checks for both to be gone, starting its last check by
+# 120 s (about 155 s worst case with the request timeouts); anything left (or
+# unreadable) is printed as TEARDOWN-LEFT/TEARDOWN-UNVERIFIED, a namespace still
+# there with its phase and finalizers, and turns an exit 0 or 4 into 1. A rung's
+# own FAIL (1) or REFUSED (2) code is kept as it is.
 #
 # The driver runs on one of the two Macs (local) with the admin KUBECONFIG and
 # reaches the other (peer) over ssh. Every privileged step is a script file run
@@ -102,8 +105,9 @@
 #   K3SM_LAB_PRINT_MANIFESTS=1 print the pod manifests and exit; contacts nothing
 #
 # Evidence: the run log is EVIDENCE_DIR/run.log only (nothing is written into the
-# repository tree), with the M11 run-log header (gate, artifact_sha256,
-# git_sha.<repo>, result) emitted by hack/lab/lib/runlog.sh; a copy of this driver
+# repository tree; a rerun into the same EVIDENCE_DIR appends, each run opening with
+# a dated "# ==== m17-lab run started" line), with the M11 run-log header (gate,
+# artifact_sha256, git_sha.<repo>, result) emitted by hack/lab/lib/runlog.sh; a copy of this driver
 # as run sits beside it as EVIDENCE_DIR/m17-interconnect.sh, and the baseline line
 # names each Mac's `k3sm version` next to the binary's sha256;
 # per-rung transcripts, counters and figures sit under EVIDENCE_DIR/<rung>/; a rung
@@ -739,19 +743,44 @@ ns_storage_cleanup() {
 	return 0
 }
 # The teardown re-check after ns_storage_cleanup: what it finds left CAN fail the run.
+# TEARDOWN_WAIT_SECS is when the last iteration may START, not the whole bound: one
+# iteration is two 15 s request timeouts (the namespace and the PV list) plus the
+# step, so the worst case is about 155 s, and one more 15 s read of the namespace's
+# phase and finalizers when it fails with the namespace still there.
 TEARDOWN_WAIT_SECS=120
 TEARDOWN_WAIT_STEP=5
 pv_claims() { kc get pv -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.claimRef.namespace}{"\n"}{end}' 2>/dev/null; }
-# teardown_left <ns> <ns query rc> <ns query out> <pv query rc> <pv claim lines> —
-# pure: one named reason per thing the teardown left (or could not read), and
-# non-zero when there is any. A read that failed is never taken for "gone".
+# ns_create — create the test namespace. NS_CREATE_TRIED is set first: a create that
+# timed out after the server applied it still leaves a namespace, so the exit trap
+# deletes and verifies whenever a create was attempted, not only when one succeeded.
+ns_create() {
+	NS_CREATE_TRIED=1
+	kc create namespace "$NS" >/dev/null 2>&1
+}
+# ns_state <ns> — "phase <phase>, finalizers <metadata.finalizers>" in one bounded
+# read, so a slow Terminating namespace and a stuck finalizer read differently; a
+# failed read prints "unreadable" for both, never a guess.
+ns_state() {
+	local out phase fin
+	out="$(kc get namespace "$1" -o jsonpath='{.status.phase}{"\t"}{.metadata.finalizers}' 2>/dev/null)" || {
+		echo "phase unreadable, finalizers unreadable"
+		return 0
+	}
+	phase="${out%%$'\t'*}" fin=""
+	[[ "$out" != *$'\t'* ]] || fin="${out#*$'\t'}"
+	echo "phase ${phase:-unreadable}, finalizers ${fin:-none}"
+}
+# teardown_left <ns> <ns query rc> <ns query out> <pv query rc> <pv claim lines>
+# [ns state] — pure: one named reason per thing the teardown left (or could not
+# read), and non-zero when there is any. A read that failed is never taken for
+# "gone". The optional ns state (ns_state) is appended to a namespace still there.
 teardown_left() {
 	local bad=0 pvs
 	if [ "$2" != 0 ]; then
 		echo "TEARDOWN-UNVERIFIED: namespace $1 could not be read (kubectl exit $2)"
 		bad=1
 	elif [ -n "$3" ]; then
-		echo "TEARDOWN-LEFT: namespace $1 still exists"
+		echo "TEARDOWN-LEFT: namespace $1 still exists${6:+ ($6)}"
 		bad=1
 	fi
 	if [ "$4" != 0 ]; then
@@ -783,8 +812,18 @@ teardown_verify() {
 		[ "$SECONDS" -lt "$deadline" ] || break
 		sleep "$TEARDOWN_WAIT_STEP"
 	done
+	# A namespace still there: name its phase and finalizers in the reason.
+	[ "$nrc" != 0 ] || [ -z "$nout" ] || why="$(teardown_left "$NS" "$nrc" "$nout" "$prc" "$pout" "$(ns_state "$NS")")"
 	printf '%s\n' "$why" | sed "s/^/cleanup FAILED after ${TEARDOWN_WAIT_SECS}s: /"
 	return 1
+}
+# ns_teardown — the exit trap's namespace step: delete, clean the peer's storage and
+# verify, whenever a create was attempted (ns_create); a leftover sets TEARDOWN_FAILED.
+ns_teardown() {
+	[ "$NS_CREATE_TRIED" = 1 ] || return 0
+	kc delete namespace "$NS" --wait=false >/dev/null 2>&1
+	ns_storage_cleanup
+	teardown_verify || TEARDOWN_FAILED=1
 }
 # teardown_exit_status <ladder rc> <teardown failed 0|1> — a failed teardown turns
 # a pass (0) or a green --until stop (4) into 1, and never masks a rung's own
@@ -857,7 +896,7 @@ assert_r1_arm() {
 }
 
 assert_r2_attach() {
-	kc create namespace "$NS" >/dev/null 2>&1 && NS_CREATED=1
+	ns_create
 	local s n p icip idx line
 	for s in local peer; do
 		ic_pod "ic-l-$s" "$(node_of "$s")" 1 "$LISTENER_CMD"
@@ -1614,7 +1653,7 @@ assert_r8_killswitch() {
 	# see the annotation go before a new pod asks it.
 	hold_until=$((SECONDS + DESIRED_INTERVAL + 5))
 	sleep 5
-	kc create namespace "$NS" >/dev/null 2>&1 && NS_CREATED=1
+	ns_create
 	for s in local peer; do ic_pod "ic-late-$s" "$(node_of "$s")" 1 "$LATE_POD_CMD"; done
 	for s in local peer; do r8_no_new_attach "$s"; done
 	[ "$SECONDS" -ge "$hold_until" ] || sleep $((hold_until - SECONDS))
@@ -2005,7 +2044,8 @@ st_teardown_run() (
 	sleep() { :; }
 	kc() {
 		case "$*" in
-		"get namespace"*) case "$PROF" in ns-left) echo namespace/k3sm-m17-lab ;; unreadable) return 1 ;; esac ;;
+		"get namespace"*jsonpath*) case "$PROF" in ns-stuck) printf 'Terminating\t["lab.k3sm.io/hold"]' ;; ns-left) printf 'Active\t' ;; *) return 1 ;; esac ;;
+		"get namespace"*) case "$PROF" in ns-left | ns-stuck | ns-noread) echo namespace/k3sm-m17-lab ;; unreadable) return 1 ;; esac ;;
 		"get pv"*)
 			printf 'pv-b\tother-ns\n'
 			[ "$PROF" != pv-left ] || printf 'pv-a\tk3sm-m17-lab\n'
@@ -2015,6 +2055,24 @@ st_teardown_run() (
 	PROF="$1"
 	teardown_verify || failed=1
 	echo "EXIT $(teardown_exit_status "$2" "$failed")"
+)
+# st_ns_attempted <ladder rc> — a create that reported failure (a timeout after the
+# server applied it) and a namespace that is still there: the exit trap's step must
+# still delete and verify it.
+st_ns_attempted() (
+	NS=k3sm-m17-lab TEARDOWN_WAIT_SECS=0 NS_CREATE_TRIED=0 TEARDOWN_FAILED=0
+	sleep() { :; }
+	ns_storage_cleanup() { :; }
+	kc() {
+		case "$*" in
+		"create namespace"*) return 1 ;;
+		"get namespace"*jsonpath*) printf 'Active\t' ;;
+		"get namespace"*) echo namespace/k3sm-m17-lab ;;
+		esac
+	}
+	ns_create
+	ns_teardown
+	echo "EXIT $(teardown_exit_status "$1" "$TEARDOWN_FAILED")"
 )
 
 # st_driver_run <rung> <profile> — the body st_driver runs in a subshell: the
@@ -2251,7 +2309,7 @@ st_exit_evidence() {
 st_r8_run() {
 	local prof="$1" F="$FIXTURES" r8_dir s
 	r8_dir="$(mktemp -d -t m17-r8.XXXXXX)"
-	RUNG_DIR="$r8_dir" BASE_DIR="$r8_dir" RUNG=r8 R_PASS=0 R_FAIL=0 NS=stub DESIRED_INTERVAL=0 HAVE=attached NS_CREATED=0 ARMED_BY_RUN=1
+	RUNG_DIR="$r8_dir" BASE_DIR="$r8_dir" RUNG=r8 R_PASS=0 R_FAIL=0 NS=stub DESIRED_INTERVAL=0 HAVE=attached NS_CREATE_TRIED=0 ARMED_BY_RUN=1
 	# shellcheck disable=SC2034 # read through side_var and node_of
 	local_NODE=node-a peer_NODE=node-b local_IDX=3 peer_IDX=3 local_OS=x peer_OS=x
 	# shellcheck disable=SC2034 # read through side_var
@@ -2622,6 +2680,11 @@ self_test_body() {
 	st_out "teardown red: a leftover PV turns a green --until stop (4) into 1" "EXIT 1" st_teardown_run pv-left 4
 	st_out "teardown: a leftover PV keeps a rung's REFUSED (2)" "EXIT 2" st_teardown_run pv-left 2
 	st_out "teardown: a clean teardown keeps a green --until stop (4)" "EXIT 4" st_teardown_run clean 4
+	st_out "teardown red: a create that reported failure is still verified (exit 1)" "EXIT 1" st_ns_attempted 0
+	st_out "teardown red: the attempted create's leftover namespace is named" "TEARDOWN-LEFT: namespace k3sm-m17-lab still exists" st_ns_attempted 0
+	st_out "teardown red: a stuck finalizer names the phase and finalizers" 'TEARDOWN-LEFT: namespace k3sm-m17-lab still exists (phase Terminating, finalizers ["lab.k3sm.io/hold"])' st_teardown_run ns-stuck 0
+	st_out "teardown red: a namespace still Active names no finalizers" "TEARDOWN-LEFT: namespace k3sm-m17-lab still exists (phase Active, finalizers none)" st_teardown_run ns-left 0
+	st_out "teardown red: an unreadable phase is printed as unreadable" "still exists (phase unreadable, finalizers unreadable)" st_teardown_run ns-noread 0
 	st "teardown predicate: clean" 0 teardown_left k3sm-m17-lab 0 "" 0 "$(printf 'pv-b\tother-ns')"
 	st "teardown predicate red: a PV claimed from the namespace" 1 teardown_left k3sm-m17-lab 0 "" 0 "$(printf 'pv-a\tk3sm-m17-lab')"
 	st "teardown predicate red: the PV list could not be read" 1 teardown_left k3sm-m17-lab 0 "" 1 ""
@@ -2764,7 +2827,11 @@ mkdir -p "$EVIDENCE_DIR" || refuse_run preflight "cannot create $EVIDENCE_DIR (B
 # The driver as run is evidence too; the run log lives only under EVIDENCE_DIR.
 cp -- "$0" "$EVIDENCE_DIR/m17-interconnect.sh" || refuse_run preflight "cannot copy the driver into $EVIDENCE_DIR (BI10)"
 RUN_LOG="$EVIDENCE_DIR/run.log"
-exec > >(tee "$RUN_LOG") 2>&1
+# Appended, so a rerun into the same EVIDENCE_DIR keeps the earlier log; each run
+# opens with a dated line. The exit trap waits (bounded) for this tee to drain.
+exec > >(tee -a "$RUN_LOG") 2>&1
+RUN_LOG_TEE_PID=$!
+echo "# ==== m17-lab run started $(date -u +%Y-%m-%dT%H:%M:%SZ) (pid $$) ===="
 emit_run_log_header "FAIL (provisional; the final result line below is the verdict, and a log that ends here did not finish)"
 echo "evidence_dir: $EVIDENCE_DIR"
 echo "peer_run_dir: $IC_REMOTE_DIR"
@@ -2780,7 +2847,7 @@ echo "knobs: payload ${PAYLOAD_MB} MiB, LAN slack ${LAN_SLACK} B, DesiredInterva
 	local_SHA="" peer_SHA="" local_BOOT="" peer_BOOT="" local_OS="" peer_OS="" local_VER="" peer_VER=""
 	local_MACS="" peer_MACS="" local_ICIP="" peer_ICIP="" WORKER_NODE=""
 }
-FIXTURES_MADE=0 HAVE="" ARMED_BY_RUN=0 FORGED_SIDE="" FORGED_ORIG="" BG_PIDS="" PING_PIDS="" NS_CREATED=0 REMOTE_DIR_MADE=0 TEARDOWN_FAILED=0
+FIXTURES_MADE=0 HAVE="" ARMED_BY_RUN=0 FORGED_SIDE="" FORGED_ORIG="" BG_PIDS="" PING_PIDS="" NS_CREATE_TRIED=0 REMOTE_DIR_MADE=0 TEARDOWN_FAILED=0
 N_PASS=0 N_FAIL=0 N_REFUSED=0
 MESH_UTUN="" PEER_UTUN=""
 on_exit() {
@@ -2807,11 +2874,7 @@ on_exit() {
 		echo "cleanup: disarming the interconnect this run armed"
 		on_local "$K3SM_BIN interconnect disable" 2>&1 | sed 's/^/          /'
 	fi
-	if [ "$NS_CREATED" = 1 ]; then
-		kc delete namespace "$NS" --wait=false >/dev/null 2>&1
-		ns_storage_cleanup
-		teardown_verify || TEARDOWN_FAILED=1
-	fi
+	ns_teardown
 	fixtures_remove
 	remote_dir_remove
 	# A teardown that left the namespace or a PV fails the run, never masking a
@@ -2822,6 +2885,14 @@ on_exit() {
 	echo "$ROW: $N_PASS rung(s) PASS, $N_FAIL FAIL, $N_REFUSED REFUSED, $N_NOT_RUN NOT-RUN (evidence: $EVIDENCE_DIR)"
 	[ "$rc" != 4 ] || echo "PARTIAL: every rung through $UNTIL passed and --until stopped the ladder there; this is not a pass (exit 4)"
 	if [ "$rc" = 0 ]; then emit_run_log_verdict PASS; else emit_run_log_verdict FAIL; fi
+	# Close our ends of the log pipe and let tee drain, for at most 10 s: a background
+	# child still holding the pipe must not hang the exit. The status stays rc.
+	exec >&- 2>&-
+	p=0
+	while kill -0 "$RUN_LOG_TEE_PID" 2>/dev/null && [ "$p" -lt 100 ]; do
+		sleep 0.1
+		p=$((p + 1))
+	done
 	exit "$rc"
 }
 trap on_exit EXIT
