@@ -75,7 +75,18 @@ var (
 	// ErrDigestMismatch is a manifest whose bytes do not hash to the digest it
 	// was requested by or the one the registry reported for it.
 	ErrDigestMismatch = errors.New("manifest bytes do not match their digest")
+	// ErrTransient is a failure a retry may clear with nothing changed: the
+	// request did not complete (the registry could not be reached, the
+	// connection broke, the timeout fired), the registry answered 5xx or 429,
+	// or the response body could not be read. A refused certificate and a
+	// refused redirect are not transient. The error wraps the underlying
+	// cause too, so errors.Is still finds a context or net error.
+	ErrTransient = errors.New("transient registry failure")
 )
+
+// errRedirectRefused is CheckRedirect's refusal of a redirect off the
+// registry host: a configuration answer, not a transient failure.
+var errRedirectRefused = errors.New("refusing a redirect to another host")
 
 // Options configure a Client. The zero value is a plain-HTTP-capable client
 // with the default per-request timeout and the system trust store.
@@ -148,7 +159,7 @@ func New(base string, opts Options) (*Client, error) {
 			// refused rather than followed.
 			CheckRedirect: func(req *http.Request, _ []*http.Request) error {
 				if req.URL.Host != u.Host {
-					return fmt.Errorf("refusing a redirect to another host %q", req.URL.Host)
+					return fmt.Errorf("%w %q", errRedirectRefused, req.URL.Host)
 				}
 				return nil
 			},
@@ -740,13 +751,16 @@ func (c *Client) endpoint(path string) *url.URL {
 }
 
 // get performs one anonymous GET and reads at most limit bytes of body. A
-// non-200 answer is an error; 404 and 401/403 map to the sentinels.
+// non-200 answer is an error; 404 and 401/403 map to the sentinels, and a
+// transient failure wraps ErrTransient (see do).
 func (c *Client) get(ctx context.Context, u *url.URL, accept string, limit int64) (*http.Response, []byte, error) {
 	return c.do(ctx, http.MethodGet, u, accept, limit)
 }
 
 // do performs one anonymous request and, for a GET, reads at most limit bytes
 // of body. A non-200 answer is an error; 404 and 401/403 map to the sentinels.
+// A request that did not complete, a 5xx or 429, and a failed body read wrap
+// ErrTransient; any other answer is an error with no sentinel.
 func (c *Client) do(ctx context.Context, method string, u *url.URL, accept string, limit int64) (*http.Response, []byte, error) {
 	req, err := http.NewRequestWithContext(ctx, method, u.String(), nil)
 	if err != nil {
@@ -757,7 +771,10 @@ func (c *Client) do(ctx context.Context, method string, u *url.URL, accept strin
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, nil, err
+		if !transportTransient(err) {
+			return nil, nil, err
+		}
+		return nil, nil, fmt.Errorf("%w: %w", err, ErrTransient)
 	}
 	defer resp.Body.Close()
 	switch {
@@ -765,6 +782,8 @@ func (c *Client) do(ctx context.Context, method string, u *url.URL, accept strin
 		return nil, nil, ErrNotFound
 	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
 		return nil, nil, ErrUnauthorized
+	case resp.StatusCode >= http.StatusInternalServerError || resp.StatusCode == http.StatusTooManyRequests:
+		return nil, nil, fmt.Errorf("registry answered %q: %w", resp.Status, ErrTransient)
 	case resp.StatusCode != http.StatusOK:
 		return nil, nil, fmt.Errorf("registry answered %q", resp.Status)
 	}
@@ -773,12 +792,32 @@ func (c *Client) do(ctx context.Context, method string, u *url.URL, accept strin
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if err != nil {
-		return nil, nil, fmt.Errorf("read the response body: %w", err)
+		return nil, nil, fmt.Errorf("read the response body: %w: %w", err, ErrTransient)
 	}
 	if int64(len(body)) > limit {
 		return nil, nil, fmt.Errorf("response body exceeds %d bytes", limit)
 	}
 	return resp, body, nil
+}
+
+// transportTransient reports whether err, from http.Client.Do, is a request
+// that did not complete for a reason a retry may clear. A refused redirect
+// and a certificate the trust store refuses are answers about configuration
+// and are not.
+func transportTransient(err error) bool {
+	var certErr *tls.CertificateVerificationError
+	var authErr x509.UnknownAuthorityError
+	var hostErr x509.HostnameError
+	var invalidErr x509.CertificateInvalidError
+	switch {
+	case errors.Is(err, errRedirectRefused),
+		errors.As(err, &certErr),
+		errors.As(err, &authErr),
+		errors.As(err, &hostErr),
+		errors.As(err, &invalidErr):
+		return false
+	}
+	return true
 }
 
 // mediaTypeOf strips parameters from a Content-Type value.
