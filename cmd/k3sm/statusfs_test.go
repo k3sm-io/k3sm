@@ -28,6 +28,23 @@ import (
 	"k3sm.io/k3sm/internal/boundedread"
 )
 
+// makeSparseOversized creates a file one byte over the status read cap as a
+// sparse file: the reader refuses on the fstat size, so no bytes need exist.
+func makeSparseOversized(t *testing.T, path string) {
+	t.Helper()
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(statusFSReadMax + 1); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestStatusFSRefusesAFIFOALinkAndAnOversizedFile pins that `k3sm status`,
 // which may run as root, reads the files it finds in service-user-writable
 // trees through the bounded reader: a FIFO planted there must not hang it, a
@@ -58,9 +75,7 @@ func TestStatusFSRefusesAFIFOALinkAndAnOversizedFile(t *testing.T) {
 		}},
 		{"an oversized file", func(t *testing.T, dir string) string {
 			p := filepath.Join(dir, "big")
-			if err := os.WriteFile(p, make([]byte, statusFSReadMax+1), 0o600); err != nil {
-				t.Fatal(err)
-			}
+			makeSparseOversized(t, p)
 			return p
 		}},
 	}
@@ -118,9 +133,7 @@ func TestStatusFSReadFileFollowingLink(t *testing.T) {
 		}, nil},
 		{"a link to an oversized file", func(t *testing.T, dir string) string {
 			target := filepath.Join(dir, "big")
-			if err := os.WriteFile(target, make([]byte, statusFSReadMax+1), 0o600); err != nil {
-				t.Fatal(err)
-			}
+			makeSparseOversized(t, target)
 			return link(t, dir, target)
 		}, nil},
 	}
@@ -163,6 +176,11 @@ func TestStatusCollectorFSFollowsTheAdminKubeconfigLink(t *testing.T) {
 	type linkFollower interface {
 		ReadFileFollowingLink(path string) ([]byte, error)
 	}
+	// Construction dials nothing; it only resolves paths and reads local files.
+	// Point HOME and KUBECONFIG at a temp dir so clientcmd's default loading
+	// rules never see the host's ~/.kube/config or $KUBECONFIG.
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("KUBECONFIG", filepath.Join(t.TempDir(), "no-such-kubeconfig"))
 	for name, fs := range map[string]any{
 		"newStatusCollector":  newStatusCollector().FS,
 		"newDaemonsCollector": newDaemonsCollector().FS,
