@@ -29,6 +29,11 @@
 # starts from r0; `--until r5` is the unattended stretch (r6 is the first rung that
 # wants /dev/tty, and refuses without one), and `--until r8` chooses to skip r9.
 #
+# The teardown can fail the run: after the exit trap deletes the namespace and the
+# PVs claimed from it, it waits up to 120 s for both to be gone; anything left (or
+# unreadable) is printed as TEARDOWN-LEFT/TEARDOWN-UNVERIFIED and turns an exit 0
+# or 4 into 1. A rung's own FAIL (1) or REFUSED (2) code is kept as it is.
+#
 # The driver runs on one of the two Macs (local) with the admin KUBECONFIG and
 # reaches the other (peer) over ssh. Every privileged step is a script file run
 # under `sudo -n /bin/bash <file>` (never an ssh "sudo a && b" chain). The run
@@ -96,9 +101,11 @@
 #                              (hack/lab/lib/tolerations.sh)
 #   K3SM_LAB_PRINT_MANIFESTS=1 print the pod manifests and exit; contacts nothing
 #
-# Evidence: the run log is hack/lab/runs/m17-lab-<rc-tag>-<UTCdate>.log (gitignored;
-# hack/lab/runs/README.md) and EVIDENCE_DIR/run.log, with the M11 run-log header
-# (gate, artifact_sha256, git_sha.<repo>, result) emitted by hack/lab/lib/runlog.sh;
+# Evidence: the run log is EVIDENCE_DIR/run.log only (nothing is written into the
+# repository tree), with the M11 run-log header (gate, artifact_sha256,
+# git_sha.<repo>, result) emitted by hack/lab/lib/runlog.sh; a copy of this driver
+# as run sits beside it as EVIDENCE_DIR/m17-interconnect.sh, and the baseline line
+# names each Mac's `k3sm version` next to the binary's sha256;
 # per-rung transcripts, counters and figures sit under EVIDENCE_DIR/<rung>/; a rung
 # that does not pass adds the test namespace's Events, pods and MLXModels as ns-*,
 # and a run that does not pass adds them to every rung directory as ns-at-exit-*,
@@ -694,7 +701,8 @@ pvcs_gone() { [ -z "$(kc get pvc -n "$NS" -o name 2>/dev/null)" ]; }
 storage_remove_cmd() { printf 'sudo -n rm -rf %s/%s' "$STORAGE_ROOT" "$NS"; }
 # ns_storage_cleanup — after the namespace delete: wait for the PVCs, delete the
 # PVs claimed from this namespace, then remove the storage directory on both Macs.
-# Every failure is printed and none changes the exit status.
+# Every failure is printed and none changes the exit status here; teardown_verify
+# then re-checks what is left, and that can.
 ns_storage_cleanup() {
 	if ! ns_is_ladders "$NS"; then
 		echo "cleanup: not touching PVs or storage: '$NS' is not this ladder's namespace"
@@ -709,7 +717,7 @@ ns_storage_cleanup() {
 		fi
 		sleep "$PVC_WAIT_STEP"
 	done
-	pvs="$(kc get pv -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.claimRef.namespace}{"\n"}{end}' 2>/dev/null | pvs_claimed_by "$NS")"
+	pvs="$(pv_claims | pvs_claimed_by "$NS")"
 	for pv in $pvs; do
 		if kc delete pv "$pv" --wait=false >/dev/null 2>&1; then
 			echo "cleanup: deleted PV $pv (claimed from $NS)"
@@ -729,6 +737,60 @@ ns_storage_cleanup() {
 		echo "cleanup: could not remove $STORAGE_ROOT/$NS on the peer; remove it by hand as root"
 	fi
 	return 0
+}
+# The teardown re-check after ns_storage_cleanup: what it finds left CAN fail the run.
+TEARDOWN_WAIT_SECS=120
+TEARDOWN_WAIT_STEP=5
+pv_claims() { kc get pv -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.claimRef.namespace}{"\n"}{end}' 2>/dev/null; }
+# teardown_left <ns> <ns query rc> <ns query out> <pv query rc> <pv claim lines> —
+# pure: one named reason per thing the teardown left (or could not read), and
+# non-zero when there is any. A read that failed is never taken for "gone".
+teardown_left() {
+	local bad=0 pvs
+	if [ "$2" != 0 ]; then
+		echo "TEARDOWN-UNVERIFIED: namespace $1 could not be read (kubectl exit $2)"
+		bad=1
+	elif [ -n "$3" ]; then
+		echo "TEARDOWN-LEFT: namespace $1 still exists"
+		bad=1
+	fi
+	if [ "$4" != 0 ]; then
+		echo "TEARDOWN-UNVERIFIED: the PersistentVolumes could not be listed (kubectl exit $4)"
+		bad=1
+	else
+		pvs="$(printf '%s\n' "$5" | pvs_claimed_by "$1" | tr '\n' ' ')"
+		pvs="${pvs% }"
+		[ -z "$pvs" ] || {
+			echo "TEARDOWN-LEFT: PersistentVolume(s) claimed from $1 remain: $pvs"
+			bad=1
+		}
+	fi
+	return "$bad"
+}
+# teardown_verify — wait up to TEARDOWN_WAIT_SECS for the namespace and every PV
+# claimed from it to be gone; prints the reasons and returns non-zero if any remain.
+teardown_verify() {
+	local deadline=$((SECONDS + TEARDOWN_WAIT_SECS)) nrc prc nout pout why
+	echo "cleanup: waiting up to ${TEARDOWN_WAIT_SECS}s for namespace $NS and its PVs to be gone"
+	while :; do
+		nrc=0 prc=0
+		nout="$(kc get namespace "$NS" --ignore-not-found -o name 2>/dev/null)" || nrc=$?
+		pout="$(pv_claims)" || prc=$?
+		if why="$(teardown_left "$NS" "$nrc" "$nout" "$prc" "$pout")"; then
+			echo "cleanup: namespace $NS and every PV claimed from it are gone"
+			return 0
+		fi
+		[ "$SECONDS" -lt "$deadline" ] || break
+		sleep "$TEARDOWN_WAIT_STEP"
+	done
+	printf '%s\n' "$why" | sed "s/^/cleanup FAILED after ${TEARDOWN_WAIT_SECS}s: /"
+	return 1
+}
+# teardown_exit_status <ladder rc> <teardown failed 0|1> — a failed teardown turns
+# a pass (0) or a green --until stop (4) into 1, and never masks a rung's own
+# FAIL (1) or REFUSED (2).
+teardown_exit_status() {
+	if [ "$2" = 1 ] && { [ "$1" = 0 ] || [ "$1" = 4 ]; }; then echo 1; else echo "$1"; fi
 }
 
 # ── The assertions ──────────────────────────────────────────────────────────────
@@ -1935,6 +1997,26 @@ st_cleanup_run() (
 	rm -f "$log"
 )
 
+# st_teardown_run <profile> <ladder rc> — teardown_verify with the cluster stubbed
+# (clean | pv-left | ns-left | unreadable), then the exit the trap would take.
+st_teardown_run() (
+	NS=k3sm-m17-lab TEARDOWN_WAIT_SECS=0
+	local failed=0
+	sleep() { :; }
+	kc() {
+		case "$*" in
+		"get namespace"*) case "$PROF" in ns-left) echo namespace/k3sm-m17-lab ;; unreadable) return 1 ;; esac ;;
+		"get pv"*)
+			printf 'pv-b\tother-ns\n'
+			[ "$PROF" != pv-left ] || printf 'pv-a\tk3sm-m17-lab\n'
+			;;
+		esac
+	}
+	PROF="$1"
+	teardown_verify || failed=1
+	echo "EXIT $(teardown_exit_status "$2" "$failed")"
+)
+
 # st_driver_run <rung> <profile> — the body st_driver runs in a subshell: the
 # stubs below replace the host and cluster helpers there only.
 st_driver_run() {
@@ -2532,6 +2614,17 @@ self_test_body() {
 	st_out "cleanup: the PVC wait is logged before the PV deletes" "waiting up to 0s for the PVCs" st_cleanup_run k3sm-m17-lab
 	st_eq "cleanup red: a foreign namespace touches nothing" "$(st_cleanup_run default | grep -c 'rm -rf\|kc delete')" 0
 	st_eq "cleanup red: an empty namespace touches nothing" "$(st_cleanup_run "" | grep -c 'rm -rf\|kc delete')" 0
+	st_out "teardown: a clean teardown leaves a green ladder at exit 0" "EXIT 0" st_teardown_run clean 0
+	st_out "teardown red: a leftover PV makes a green ladder exit 1" "EXIT 1" st_teardown_run pv-left 0
+	st_out "teardown red: the leftover PV is named" "TEARDOWN-LEFT: PersistentVolume(s) claimed from k3sm-m17-lab remain: pv-a" st_teardown_run pv-left 0
+	st_out "teardown red: a namespace still there makes a green ladder exit 1" "EXIT 1" st_teardown_run ns-left 0
+	st_out "teardown red: an unreadable namespace is not taken for gone" "EXIT 1" st_teardown_run unreadable 0
+	st_out "teardown red: a leftover PV turns a green --until stop (4) into 1" "EXIT 1" st_teardown_run pv-left 4
+	st_out "teardown: a leftover PV keeps a rung's REFUSED (2)" "EXIT 2" st_teardown_run pv-left 2
+	st_out "teardown: a clean teardown keeps a green --until stop (4)" "EXIT 4" st_teardown_run clean 4
+	st "teardown predicate: clean" 0 teardown_left k3sm-m17-lab 0 "" 0 "$(printf 'pv-b\tother-ns')"
+	st "teardown predicate red: a PV claimed from the namespace" 1 teardown_left k3sm-m17-lab 0 "" 0 "$(printf 'pv-a\tk3sm-m17-lab')"
+	st "teardown predicate red: the PV list could not be read" 1 teardown_left k3sm-m17-lab 0 "" 1 ""
 	rm -rf "$tmp"
 	if [ "$ST_MISS" -gt 0 ]; then
 		echo "$ROW self-test: FAIL ($ST_MISS miss(es))"
@@ -2668,9 +2761,10 @@ why="$(fixture_root_problem "$FIXTURE_ROOT")" || refuse_run preflight "K3SM_M17_
 FIXTURE_DIR="$FIXTURE_ROOT/${IC_REMOTE_DIR##*/}"
 mkdir -p "$EVIDENCE_DIR" || refuse_run preflight "cannot create $EVIDENCE_DIR (BI10)"
 
-RUN_LOG="$HERE/runs/m17-lab-${K3SM_RC_TAG:-local}-$(date -u +%Y-%m-%d).log"
-mkdir -p "$HERE/runs"
-exec > >(tee "$EVIDENCE_DIR/run.log" | tee -a "$RUN_LOG") 2>&1
+# The driver as run is evidence too; the run log lives only under EVIDENCE_DIR.
+cp -- "$0" "$EVIDENCE_DIR/m17-interconnect.sh" || refuse_run preflight "cannot copy the driver into $EVIDENCE_DIR (BI10)"
+RUN_LOG="$EVIDENCE_DIR/run.log"
+exec > >(tee "$RUN_LOG") 2>&1
 emit_run_log_header "FAIL (provisional; the final result line below is the verdict, and a log that ends here did not finish)"
 echo "evidence_dir: $EVIDENCE_DIR"
 echo "peer_run_dir: $IC_REMOTE_DIR"
@@ -2683,10 +2777,10 @@ echo "knobs: payload ${PAYLOAD_MB} MiB, LAN slack ${LAN_SLACK} B, DesiredInterva
 {
 	local_NODE="" peer_NODE="" local_IDX="" peer_IDX="" local_SLOT0="" peer_SLOT0=""
 	local_TB="" peer_TB="" local_LAN="" peer_LAN="" local_MESH="" peer_MESH=""
-	local_SHA="" peer_SHA="" local_BOOT="" peer_BOOT="" local_OS="" peer_OS=""
+	local_SHA="" peer_SHA="" local_BOOT="" peer_BOOT="" local_OS="" peer_OS="" local_VER="" peer_VER=""
 	local_MACS="" peer_MACS="" local_ICIP="" peer_ICIP="" WORKER_NODE=""
 }
-FIXTURES_MADE=0 HAVE="" ARMED_BY_RUN=0 FORGED_SIDE="" FORGED_ORIG="" BG_PIDS="" PING_PIDS="" NS_CREATED=0 REMOTE_DIR_MADE=0
+FIXTURES_MADE=0 HAVE="" ARMED_BY_RUN=0 FORGED_SIDE="" FORGED_ORIG="" BG_PIDS="" PING_PIDS="" NS_CREATED=0 REMOTE_DIR_MADE=0 TEARDOWN_FAILED=0
 N_PASS=0 N_FAIL=0 N_REFUSED=0
 MESH_UTUN="" PEER_UTUN=""
 on_exit() {
@@ -2716,10 +2810,15 @@ on_exit() {
 	if [ "$NS_CREATED" = 1 ]; then
 		kc delete namespace "$NS" --wait=false >/dev/null 2>&1
 		ns_storage_cleanup
+		teardown_verify || TEARDOWN_FAILED=1
 	fi
 	fixtures_remove
 	remote_dir_remove
+	# A teardown that left the namespace or a PV fails the run, never masking a
+	# rung's own FAIL or REFUSED code.
+	rc="$(teardown_exit_status "$rc" "$TEARDOWN_FAILED")"
 	echo "----------------------------------------"
+	[ "$TEARDOWN_FAILED" = 0 ] || echo "TEARDOWN FAIL: namespace $NS or a PV claimed from it is still there (reasons above); the run cannot pass (exit $rc)"
 	echo "$ROW: $N_PASS rung(s) PASS, $N_FAIL FAIL, $N_REFUSED REFUSED, $N_NOT_RUN NOT-RUN (evidence: $EVIDENCE_DIR)"
 	[ "$rc" != 4 ] || echo "PARTIAL: every rung through $UNTIL passed and --until stopped the ladder there; this is not a pass (exit 4)"
 	if [ "$rc" = 0 ]; then emit_run_log_verdict PASS; else emit_run_log_verdict FAIL; fi
@@ -2757,6 +2856,7 @@ echo "LAN=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')"
 echo "MESH=$(ifconfig -a inet | awk '$1=="inet"{print $2}' | awk -F. '$1==100 && $2>=64 && $2<=127' | sed -n 1p)"
 bin="$(readlink -f "$K3SM_BIN" 2>/dev/null || echo "$K3SM_BIN")"
 echo "SHA=$(shasum -a 256 "$bin" 2>/dev/null | cut -d' ' -f1)"
+echo "VERSION=$("$K3SM_BIN" version 2>/dev/null | tr '\n' ' ' | sed 's/ *$//')"
 grep -aqF 'k3sm.io/InterconnectAttached' "$bin" && echo HAS_attach=yes || echo HAS_attach=no
 grep -aqF 'K3SM_MLX_HOSTS' "$bin" && echo HAS_mlxhosts=yes || echo HAS_mlxhosts=no
 echo "BOOT=$(sysctl -n kern.boottime)"
@@ -2772,7 +2872,8 @@ EOF
 	for t in python3 nc lsof; do [ "$(kv "$f" "HAS_$t")" = yes ] || probe_miss tools preflight "the $side Mac has no $t"; done
 	[ "$(kv "$f" HAS_attach)" = yes ] || probe_miss attach preflight "the $side Mac's installed binary"
 	[ "$(kv "$f" HAS_mlxhosts)" = yes ] || probe_miss mlxhosts preflight "the $side Mac's installed binary"
-	eval "${side}_TB=\${tb%% *} ${side}_LAN=\$(kv \"\$f\" LAN) ${side}_MESH=\$(kv \"\$f\" MESH) ${side}_SHA=\$(kv \"\$f\" SHA) ${side}_BOOT=\$(kv \"\$f\" BOOT) ${side}_OS=\$(kv \"\$f\" OS)"
+	eval "${side}_TB=\${tb%% *} ${side}_LAN=\$(kv \"\$f\" LAN) ${side}_MESH=\$(kv \"\$f\" MESH) ${side}_SHA=\$(kv \"\$f\" SHA) ${side}_BOOT=\$(kv \"\$f\" BOOT) ${side}_OS=\$(kv \"\$f\" OS) ${side}_VER=\$(kv \"\$f\" VERSION)"
+	echo "      [$side] k3sm version: $(kv "$f" VERSION | grep . || echo unreadable), sha256 $(kv "$f" SHA)"
 	macs=""
 	for m in $(kv "$f" MACS); do macs="$macs $(norm_mac "$m")"; done
 	eval "${side}_MACS=\$macs"
@@ -2828,7 +2929,7 @@ echo "fixtures: hello-http and conftool in $FIXTURE_DIR on both Macs"
 HAVE="$PREREQ_STATIC"
 FINAL_RC=1
 [ -n "$UNTIL" ] && [ "$UNTIL" != r9-downgrade ] && echo "notice: --until stops the ladder after $UNTIL; the exit trap still disarms and deletes the namespace"
-echo "baseline: local $local_NODE (index $local_IDX, $local_TB, LAN $local_LAN, macOS $local_OS), peer $peer_NODE (index $peer_IDX, $peer_TB, LAN $peer_LAN, macOS $peer_OS); artifact $local_SHA; worker $WORKER_NODE"
+echo "baseline: local $local_NODE (index $local_IDX, $local_TB, LAN $local_LAN, macOS $local_OS, k3sm ${local_VER:-unreadable}), peer $peer_NODE (index $peer_IDX, $peer_TB, LAN $peer_LAN, macOS $peer_OS, k3sm ${peer_VER:-unreadable}); artifact $local_SHA; worker $WORKER_NODE"
 
 # ── The rungs, in table order ──────────────────────────────────────────────────
 run_rungs
