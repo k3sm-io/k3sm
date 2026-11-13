@@ -31,7 +31,13 @@ import (
 // answers and then goes silent mid-body holds the gate's connection, and the
 // relay slot behind it, until the client gives up. It is the relay's own
 // progress window, for the same reason: it frees a dead connection and never
-// cuts a slow transfer that keeps moving.
+// cuts a slow transfer that keeps moving. The relay passes its own configured
+// window when it builds its gate, so the two cannot drift; this constant is
+// the default for a gate built without one.
+//
+// The relay's connection-deadline progress types are not reused here: the
+// upstream body sits behind a pooled transport, so there is no connection
+// deadline this code owns, and the cut works by closing the body instead.
 const gateUpstreamBodyProgress = relayWriteProgress
 
 // errUpstreamBodyStalled is the read error of an upstream body the gate cut

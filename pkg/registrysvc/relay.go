@@ -250,7 +250,7 @@ func newRelay(port, upstream int, binds []netip.Addr, log *slog.Logger, auth Gat
 			return tcpseg.WrapListener(ln), nil
 		},
 	}
-	r.limiter = newSourceLimiter(newGate(gateConfig{Upstream: r.target(), Auth: auth, Credential: cred, Logger: log}), r.limits, time.Now)
+	r.limiter = newSourceLimiter(newGate(gateConfig{Upstream: r.target(), Auth: auth, Credential: cred, Logger: log, UpstreamBodyProgress: r.limits.writeProgress}), r.limits, time.Now)
 	r.limiter.log = log
 	r.handler = r.limiter
 	return r

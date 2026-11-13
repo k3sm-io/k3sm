@@ -100,6 +100,7 @@ TestRecordKeepsTheServersFields added new with the child switch
 TestRegistryNodePortIsOptInAndGated kept the push gate is unchanged
 TestRegistryReadyFollowsNoRedirect added the readiness probe stays on the loopback address it was given
 TestRelayCutIsLogged added a connection a relay deadline cuts is logged once
+TestRelayGateBodyWindowFollowsRelayLimits added the relay hands its write-progress window to its gate so the two cannot drift
 TestRelayCutLogEndsWithTheResponse added a write timeout after the response ends is not logged as a relay cut
 TestRelayEarlyAnswerWhileBodyIsSent added an answer before the upload body is sent does not race the body reads
 TestRelayLimitsArePerSource kept the relay and cluster publication do not touch the child
