@@ -774,7 +774,7 @@ ns_create() {
 ns_state() {
 	local out phase fin
 	out="$(kc get namespace "$1" -o jsonpath='{.status.phase}{"\t"}{.metadata.finalizers}' 2>/dev/null)" || {
-		echo "phase unreadable, finalizers unreadable"
+		echo "phase unreadable or namespace gone, finalizers unreadable"
 		return 0
 	}
 	phase="${out%%$'\t'*}" fin=""
@@ -2092,7 +2092,7 @@ st_ns_attempted() (
 # st_ns_owner <profile> — ns_create's ownership check with the cluster stubbed and
 # the exit trap's namespace step armed, counting every delete and root rm that
 # reaches the stubs. exists: the namespace is there before the run's first create
-# (Terminating, finalizer kubernetes, so the refusal names its state);
+# (Terminating, finalizer ["kubernetes"], so the refusal names its state);
 # unreadstate: it exists but its phase and finalizers cannot be read;
 # noread: its existence cannot be read; recreate: the run created it, deleted it
 # (still Terminating) and creates it again, which must not be refused.
@@ -2115,7 +2115,7 @@ st_ns_owner() (
 		"delete "*) deletes=$((deletes + 1)) ;;
 		"get namespace"*jsonpath*)
 			case "$prof" in
-			exists) printf 'Terminating\tkubernetes' ;;
+			exists) printf 'Terminating\t["kubernetes"]' ;;
 			unreadstate) return 1 ;;
 			*) printf 'Terminating\t' ;;
 			esac
@@ -2751,16 +2751,17 @@ self_test_body() {
 	st_out "teardown red: a create that reported failure is still verified (exit 1)" "EXIT 1" st_ns_attempted 0
 	st_out "teardown red: the attempted create's leftover namespace is named" "TEARDOWN-LEFT: namespace k3sm-m17-lab still exists" st_ns_attempted 0
 	st_out "ownership red: a namespace there before the first create refuses the run" "REFUSED(r2-attach): namespace k3sm-m17-lab already exists" st_ns_owner exists
-	st_out "ownership red: the refusal names the namespace's phase and finalizers" "REFUSED(r2-attach): namespace k3sm-m17-lab already exists (phase Terminating, finalizers kubernetes) and this run did not create it" st_ns_owner exists
-	st_out "ownership red: an unreadable state is named and still refuses the run" "REFUSED(r2-attach): namespace k3sm-m17-lab already exists (phase unreadable, finalizers unreadable) and this run did not create it" st_ns_owner unreadstate
+	st_out "ownership red: the refusal names the namespace's phase and finalizers" 'REFUSED(r2-attach): namespace k3sm-m17-lab already exists (phase Terminating, finalizers ["kubernetes"]) and this run did not create it' st_ns_owner exists
+	st_out "ownership red: an unreadable state is named and still refuses the run" "REFUSED(r2-attach): namespace k3sm-m17-lab already exists (phase unreadable or namespace gone, finalizers unreadable) and this run did not create it" st_ns_owner unreadstate
 	st_out "ownership red: the refused run's exit trap deletes nothing" "CREATES 0 DELETES 0" st_ns_owner exists
+	st_out "ownership red: the unreadable-state refusal exit trap deletes nothing" "CREATES 0 DELETES 0" st_ns_owner unreadstate
 	st_out "ownership red: an unreadable namespace refuses the run" "REFUSED(r2-attach): could not read whether namespace k3sm-m17-lab already exists" st_ns_owner noread
 	st_out "ownership red: the unreadable refusal's exit trap deletes nothing" "CREATES 0 DELETES 0" st_ns_owner noread
 	st_out "ownership: the run's own recreate after its own delete is not refused" "CREATED" st_ns_owner recreate
 	st_out "ownership: the recreate reaches the create" "CREATES 2" st_ns_owner recreate
 	st_out "teardown red: a stuck finalizer names the phase and finalizers" 'TEARDOWN-LEFT: namespace k3sm-m17-lab still exists (phase Terminating, finalizers ["lab.k3sm.io/hold"])' st_teardown_run ns-stuck 0
 	st_out "teardown red: a namespace still Active names no finalizers" "TEARDOWN-LEFT: namespace k3sm-m17-lab still exists (phase Active, finalizers none)" st_teardown_run ns-left 0
-	st_out "teardown red: an unreadable phase is printed as unreadable" "still exists (phase unreadable, finalizers unreadable)" st_teardown_run ns-noread 0
+	st_out "teardown red: an unreadable phase is printed as unreadable" "still exists (phase unreadable or namespace gone, finalizers unreadable)" st_teardown_run ns-noread 0
 	st "teardown predicate: clean" 0 teardown_left k3sm-m17-lab 0 "" 0 "$(printf 'pv-b\tother-ns')"
 	st "teardown predicate red: a PV claimed from the namespace" 1 teardown_left k3sm-m17-lab 0 "" 0 "$(printf 'pv-a\tk3sm-m17-lab')"
 	st "teardown predicate red: the PV list could not be read" 1 teardown_left k3sm-m17-lab 0 "" 1 ""
