@@ -63,18 +63,50 @@ func (t *podTrack) markEvicted(st *corev1.PodStatus) bool {
 	return true
 }
 
-// markTerminal is markEvicted's sibling for a node-side failure other than an
-// eviction (the active deadline): it records st, which carries its own reason,
-// in the same terminal mark, and refuses a track that is deleting, was rejected
-// at admission, or is already terminal. unmarkEvicted rolls it back.
-func (t *podTrack) markTerminal(st *corev1.PodStatus) bool {
+// markStopping takes the first stage of a node-side failure other than an
+// eviction (the active deadline): the stop is in flight, but no terminal status
+// is recorded yet. It refuses a track that is deleting, was rejected at
+// admission, is already stopping, or is already terminal. finishStopping
+// records the status once the stop succeeds; clearStopping rolls it back.
+func (t *podTrack) markStopping() bool {
 	t.restartMu.Lock()
 	defer t.restartMu.Unlock()
-	if t.evicted != nil || t.deleting || t.rejected {
+	if t.evicted != nil || t.deleting || t.rejected || t.stopping {
+		return false
+	}
+	t.stopping = true
+	return true
+}
+
+// isStopping reports whether t's active-deadline stop is in flight.
+func (t *podTrack) isStopping() bool {
+	t.restartMu.Lock()
+	defer t.restartMu.Unlock()
+	return t.stopping
+}
+
+// finishStopping is the second stage, after the stop succeeded: it records st,
+// which carries its own reason, as t's terminal mark and ends the stopping
+// mark, in one critical section so no tick sees the track neither stopping nor
+// terminal. It returns false, recording nothing, if t was meanwhile made
+// terminal by another path (an eviction), whose status stands.
+func (t *podTrack) finishStopping(st *corev1.PodStatus) bool {
+	t.restartMu.Lock()
+	defer t.restartMu.Unlock()
+	t.stopping = false
+	if t.evicted != nil || t.rejected {
 		return false
 	}
 	t.evicted = st
 	return true
+}
+
+// clearStopping rolls back markStopping after a failed stop, so the next tick
+// retries it. Nothing was published, so nothing is withdrawn.
+func (t *podTrack) clearStopping() {
+	t.restartMu.Lock()
+	defer t.restartMu.Unlock()
+	t.stopping = false
 }
 
 // unmarkEvicted rolls back markEvicted after a failed runtime teardown, so the

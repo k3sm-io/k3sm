@@ -92,26 +92,29 @@ func (r *runtimedRuntime) enforceActiveDeadlines(ctx context.Context) {
 		r.persistDeadlineStatus(ctx, d.pod, d.t, false)
 	}
 	for _, d := range due {
-		if d.t.rejected || d.t.evictedStatus() != nil || trackDeleting(d.t) {
+		if d.t.rejected || d.t.evictedStatus() != nil || d.t.isStopping() || trackDeleting(d.t) {
 			continue
 		}
 		r.startDeadlineStop(ctx, d.pod, d.t)
 	}
 }
 
-// startDeadlineStop takes t's terminal mark on the tick, so this tick's status
-// read already publishes Failed and a later tick sees the mark and starts no
-// second stop, then runs the stop itself in one goroutine per pod: the runtime
-// stop can take the pod's whole termination grace, and several pods expiring
-// together must not hold the tick's status publication behind each other.
+// startDeadlineStop takes t's stopping mark on the tick, so a later tick sees
+// the mark and starts no second stop, then runs the stop itself in one
+// goroutine per pod: the runtime stop can take the pod's whole termination
+// grace, and several pods expiring together must not hold the tick's status
+// publication behind each other. The stopping mark is not a status: readers go
+// on reporting the live pod until the stop succeeds and failPastDeadline
+// records Failed, so a stop that fails never shows Failed and then Running.
 //
-// Locking: the mark and its rollback are t.restartMu's (markTerminal,
-// unmarkEvicted); the goroutine holds only its own *podTrack and takes no
-// provider lock across the RPC. Lifetime: the goroutine's context keeps ctx's
-// values but is cancelled by the provider's lifetime (r.lifetime, closed by
-// shutdown), not by the tick; it is counted in r.deadlineStops, added under r.mu
-// only while the lifetime is open, and shutdown waits for it. A provider already
-// shut down starts no stop and takes no mark.
+// Locking: the mark, its completion and its rollback are t.restartMu's
+// (markStopping, finishStopping, clearStopping); the goroutine holds only its
+// own *podTrack and takes no provider lock across the RPC. Lifetime: the
+// goroutine's context keeps ctx's values but is cancelled by the provider's
+// lifetime (r.lifetime, closed by shutdown), not by the tick; it is counted in
+// r.deadlineStops, added under r.mu only while the lifetime is open, and
+// shutdown waits for it. A provider already shut down starts no stop and takes
+// no mark.
 func (r *runtimedRuntime) startDeadlineStop(ctx context.Context, tracked *corev1.Pod, t *podTrack) {
 	r.mu.Lock()
 	select {
@@ -135,7 +138,7 @@ func (r *runtimedRuntime) startDeadlineStop(ctx context.Context, tracked *corev1
 		return
 	}
 	st := failedPodStatus(prior.Status, reasonDeadlineExceeded, msgDeadlineExceeded, metav1.NewTime(r.clk.Now()))
-	if !t.markTerminal(st) {
+	if !t.markStopping() {
 		r.deadlineStops.Done()
 		return
 	}
@@ -263,15 +266,18 @@ func (r *runtimedRuntime) persistDeadlineStatusOnce(ctx context.Context, pod *co
 
 // failPastDeadline stops a pod past its active deadline in evictPod's shape and
 // records it Failed, reason DeadlineExceeded, with no DisruptionTarget condition.
-// The terminal mark is set before the stop (by the caller) and rolled back if the stop fails;
-// the pod's address, logs and track stay for the DeletePod that follows, as on an
-// eviction. A parked pod has no runtime pod, so the runtime's not-found answers
-// the stop; its pull schedules are cancelled and its park record cleared, and a
-// create of it still in flight is deleted when it lands (commitParkedCreate).
+// The caller has taken the stopping mark (startDeadlineStop); the terminal
+// status st is recorded only once the stop succeeds or the runtime answers
+// not-found, and a failed stop clears the stopping mark and publishes nothing,
+// so the next tick retries it. The pod's address, logs and track stay for the
+// DeletePod that follows, as on an eviction. A parked pod has no runtime pod, so
+// the runtime's not-found answers the stop; its pull schedules are cancelled and
+// its park record cleared, and a create of it still in flight is deleted when it
+// lands after st is recorded (commitParkedCreate).
 //
 // The stop is the pod's own grace, floored, with no preStop hook, through
-// runtimed's DeletePod by pod id (wire 0 stays evictPod's alone). The caller has
-// taken the terminal mark st (startDeadlineStop); this runs off the tick.
+// runtimed's DeletePod by pod id (wire 0 stays evictPod's alone). This runs off
+// the tick.
 func (r *runtimedRuntime) failPastDeadline(ctx context.Context, tracked *corev1.Pod, t *podTrack, st *corev1.PodStatus) error {
 	id := string(tracked.UID)
 	t.quiesceForEviction()
@@ -281,8 +287,13 @@ func (r *runtimedRuntime) failPastDeadline(ctx context.Context, tracked *corev1.
 		if stopNotIssued(err) {
 			r.history.dropIntent(intent)
 		}
-		t.unmarkEvicted(st)
+		t.clearStopping()
 		return fmt.Errorf("runtimed delete pod %s/%s: %w", tracked.Namespace, tracked.Name, err)
+	}
+	if !t.finishStopping(st) {
+		// An eviction made the pod terminal while this stop ran; its status
+		// stands and this failure publishes nothing.
+		return nil
 	}
 	t.restartMu.Lock()
 	t.parked = nil

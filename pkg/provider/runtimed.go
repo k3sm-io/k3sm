@@ -473,11 +473,18 @@ type podTrack struct {
 	// evicted, when non-nil, is the terminal status of a pod the node-pressure
 	// eviction manager evicted (evictPod), or of a pod failed for outliving its
 	// activeDeadlineSeconds (failPastDeadline); the status carries its own
-	// reason. It is set BEFORE the runtime teardown
-	// starts and never cleared; every status path returns it first, so nothing the
-	// runtime reports during or after the teardown can turn an evicted pod back
-	// into a running or restarting one. Guarded by restartMu with deleting.
+	// reason. An eviction sets it BEFORE the runtime teardown starts; a deadline
+	// failure sets it only once its stop has succeeded (stopping holds the pod
+	// meanwhile). Once set it is never cleared; every status path returns it
+	// first, so nothing the runtime reports afterwards can turn an evicted pod
+	// back into a running or restarting one. Guarded by restartMu with deleting.
 	evicted *corev1.PodStatus
+	// stopping marks a pod whose active-deadline stop is in flight
+	// (startDeadlineStop): it fences a second stop and, unlike evicted, is not
+	// a status, so readers keep reporting the live pod until the stop succeeds
+	// and failPastDeadline sets evicted. Cleared by that, or by a failed stop.
+	// Guarded by restartMu.
+	stopping bool
 	// unpersisted holds the terminal status of a pod failed past its active
 	// deadline (failPastDeadline) whose apiserver write has not yet succeeded;
 	// enforceActiveDeadlines retries the write on each resync until it lands, the

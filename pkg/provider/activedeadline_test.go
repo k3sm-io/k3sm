@@ -513,8 +513,8 @@ func (h *heldStopRuntime) DeletePod(ctx context.Context, req *runtimev1.DeletePo
 }
 
 // TestResyncNotBlockedByDeadlineStop pins the deadline stop off the tick: a
-// stop held open in the runtime does not hold the resync, the held pod already
-// reads Failed/DeadlineExceeded, a second due pod is stopped meanwhile, an
+// stop held open in the runtime does not hold the resync, the held pod does not
+// read Failed before its stop succeeds, a second due pod is stopped meanwhile, an
 // unrelated pod's status is still published, each failed pod gets one Event, and
 // shutdown waits for the stop still in flight.
 func TestResyncNotBlockedByDeadlineStop(t *testing.T) {
@@ -584,8 +584,8 @@ func TestResyncNotBlockedByDeadlineStop(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetPodStatus A: %v", err)
 	}
-	if st.Phase != corev1.PodFailed || st.Reason != reasonDeadlineExceeded {
-		t.Fatalf("A status = %s/%s while its stop is held, want Failed/%s", st.Phase, st.Reason, reasonDeadlineExceeded)
+	if st.Phase == corev1.PodFailed || st.Reason == reasonDeadlineExceeded {
+		t.Fatalf("A status = %s/%s while its stop is held, want not Failed until the stop succeeds", st.Phase, st.Reason)
 	}
 	waitBounded(t, "pod B's stop while A's is held", func() bool {
 		f.mu.Lock()
@@ -839,4 +839,189 @@ func TestActiveDeadlineLeavesAFinishedPodAlone(t *testing.T) {
 			}
 		})
 	}
+}
+
+// deadlineStopHarness is a provider over rt with a fake clock, a recorder, and a
+// log of every status the resync published for one pod.
+type deadlineStopHarness struct {
+	r   *runtimedRuntime
+	clk *testclock.FakeClock
+	rec *record.FakeRecorder
+	pod *corev1.Pod
+
+	mu        sync.Mutex
+	published []corev1.PodStatus
+}
+
+func newDeadlineStopHarness(t *testing.T, rt runtimev1.RuntimeServer, name string) *deadlineStopHarness {
+	t.Helper()
+	deadline := int64(60)
+	pod := pullPod(name)
+	pod.Spec.ActiveDeadlineSeconds = &deadline
+	h := &deadlineStopHarness{rec: record.NewFakeRecorder(64), pod: pod}
+	h.r = newRuntimedWith(rt, RuntimedConfig{
+		NodeName: "n",
+		NodeIP:   testNodeIP,
+		Root:     t.TempDir(), PodLogsDir: t.TempDir(),
+		Recorder: h.rec,
+		Network:  NewPodNetAdapter(newFakeIPAM(t, "100.64.0.0/24"), testNodeIP, nil),
+	}, nil, nil)
+	h.clk = testclock.NewFakeClock(time.Now())
+	h.r.clk = h.clk
+	h.r.notify = func(p *corev1.Pod) {
+		if p.Name != name {
+			return
+		}
+		h.mu.Lock()
+		h.published = append(h.published, *p.Status.DeepCopy())
+		h.mu.Unlock()
+	}
+	if err := h.r.CreatePod(context.Background(), pod); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	return h
+}
+
+// failedPublications counts the published statuses that report the pod Failed.
+func (h *deadlineStopHarness) failedPublications() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	n := 0
+	for _, st := range h.published {
+		if st.Phase == corev1.PodFailed {
+			n++
+		}
+	}
+	return n
+}
+
+// assertNotFailed checks every status surface (GetPodStatus, GetPods, the
+// resync's publications) reports the pod as anything but Failed.
+func (h *deadlineStopHarness) assertNotFailed(t *testing.T, when string) {
+	t.Helper()
+	ctx := context.Background()
+	st, err := h.r.GetPodStatus(ctx, h.pod.Namespace, h.pod.Name)
+	if err != nil {
+		t.Fatalf("GetPodStatus %s: %v", when, err)
+	}
+	if st.Phase == corev1.PodFailed || st.Reason == reasonDeadlineExceeded {
+		t.Errorf("GetPodStatus %s = %s/%s, want not Failed", when, st.Phase, st.Reason)
+	}
+	pods, err := h.r.GetPods(ctx)
+	if err != nil {
+		t.Fatalf("GetPods %s: %v", when, err)
+	}
+	for _, p := range pods {
+		if p.Name == h.pod.Name && (p.Status.Phase == corev1.PodFailed || p.Status.Reason == reasonDeadlineExceeded) {
+			t.Errorf("GetPods %s = %s/%s, want not Failed", when, p.Status.Phase, p.Status.Reason)
+		}
+	}
+	if n := h.failedPublications(); n != 0 {
+		t.Errorf("Failed publications %s = %d, want 0", when, n)
+	}
+}
+
+// assertDeadlineFailed checks the pod reads Failed/DeadlineExceeded with exactly
+// one Warning Event over the whole test.
+func (h *deadlineStopHarness) assertDeadlineFailed(t *testing.T, events []string) {
+	t.Helper()
+	st, err := h.r.GetPodStatus(context.Background(), h.pod.Namespace, h.pod.Name)
+	if err != nil {
+		t.Fatalf("GetPodStatus: %v", err)
+	}
+	if st.Phase != corev1.PodFailed || st.Reason != reasonDeadlineExceeded {
+		t.Errorf("status after the stop = %s/%s, want Failed/%s", st.Phase, st.Reason, reasonDeadlineExceeded)
+	}
+	if n := countEvents(events, "Warning "+reasonDeadlineExceeded); n != 1 {
+		t.Errorf("Warning DeadlineExceeded events = %d (%v), want 1", n, events)
+	}
+}
+
+// TestDeadlineStopFailureNeverPublishesFailedThenRunning pins the two-stage
+// deadline mark: a pod past its deadline reads Failed/DeadlineExceeded only once
+// its runtime stop has succeeded. While the stop is held no status surface says
+// Failed and a later tick starts no second stop; a stop that fails publishes
+// nothing, so no reader ever sees Failed and then Running again, and the next
+// tick retries it.
+func TestDeadlineStopFailureNeverPublishesFailedThenRunning(t *testing.T) {
+	t.Run("a held stop", func(t *testing.T) {
+		ctx := context.Background()
+		f := newFakeRuntimeServer()
+		hs := &heldStopRuntime{fakeRuntimeServer: f, hold: make(chan struct{}), entered: make(chan struct{})}
+		h := newDeadlineStopHarness(t, hs, "deadline-held")
+		hs.holdID = string(h.pod.UID)
+		var released atomic.Bool
+		release := func() {
+			if released.CompareAndSwap(false, true) {
+				close(hs.hold)
+			}
+		}
+		t.Cleanup(h.r.shutdown)
+		t.Cleanup(release)
+		var events []string
+		events = append(events, recordedEvents(h.rec.Events)...)
+
+		h.clk.Step(20 * time.Minute)
+		h.r.resync(ctx)
+		select {
+		case <-hs.entered:
+		case <-time.After(30 * time.Second):
+			t.Fatal("the deadline stop never reached the runtime")
+		}
+		h.assertNotFailed(t, "while the stop is held")
+
+		h.clk.Step(10 * time.Second)
+		h.r.resync(ctx)
+		h.assertNotFailed(t, "on a second tick while the stop is held")
+
+		release()
+		waitDeadlineStops(h.r)
+		if n := f.deleteCount(); n != 1 {
+			t.Errorf("runtime DeletePod calls = %d, want 1: a tick during the stop started a second one", n)
+		}
+		events = append(events, recordedEvents(h.rec.Events)...)
+		h.assertDeadlineFailed(t, events)
+	})
+
+	t.Run("a stop that fails once", func(t *testing.T) {
+		ctx := context.Background()
+		f := newFakeRuntimeServer()
+		f.deleteFIFO = append(f.deleteFIFO, status.Error(codes.Unavailable, "runtime unavailable"))
+		// The failing stop is held inside the RPC, so the tick's own publication
+		// runs while it is in flight; the closed channel holds no later call.
+		hold := make(chan struct{})
+		f.deleteHold = hold
+		var released atomic.Bool
+		release := func() {
+			if released.CompareAndSwap(false, true) {
+				close(hold)
+			}
+		}
+		h := newDeadlineStopHarness(t, f, "deadline-fails-once")
+		t.Cleanup(h.r.shutdown)
+		t.Cleanup(release)
+		var events []string
+		events = append(events, recordedEvents(h.rec.Events)...)
+
+		h.clk.Step(20 * time.Minute)
+		h.r.resync(ctx)
+		waitBounded(t, "the deadline stop to reach the runtime", func() bool { return f.deleteCount() == 1 })
+		h.assertNotFailed(t, "while the failing stop is in flight")
+		release()
+		waitDeadlineStops(h.r)
+		h.assertNotFailed(t, "after the stop failed")
+		events = append(events, recordedEvents(h.rec.Events)...)
+		if n := countEvents(events, reasonDeadlineExceeded); n != 0 {
+			t.Errorf("DeadlineExceeded events after the failed stop = %d, want 0", n)
+		}
+
+		h.clk.Step(10 * time.Second)
+		h.r.resync(ctx)
+		waitDeadlineStops(h.r)
+		if n := f.deleteCount(); n != 2 {
+			t.Errorf("runtime DeletePod calls = %d, want 2: the next tick retries the failed stop", n)
+		}
+		events = append(events, recordedEvents(h.rec.Events)...)
+		h.assertDeadlineFailed(t, events)
+	})
 }
