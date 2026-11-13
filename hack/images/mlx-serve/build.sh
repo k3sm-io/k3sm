@@ -323,12 +323,12 @@ install_closure() {
 	[ "$rc" -eq 0 ] || die "uv pip install failed (exit $rc)"
 }
 
-# clear_uv_redirects clears the three variables that redirect where uv gets its
+# clear_uv_redirects unsets the four variables that redirect where uv gets its
 # interpreter or which catalog it reads (UV_PYTHON_DOWNLOADS_JSON_URL,
-# UV_PYTHON_INSTALL_MIRROR, UV_ASTRAL_MIRROR_URL) and the uv config files that
-# can set the same redirects. On the Job path the uv binary is digest-pinned, so
-# the digests embedded in it are pinned transitively; a local run uses whatever
-# uv the operator supplies at or above UV_MIN.
+# UV_PYTHON_INSTALL_MIRROR, UV_ASTRAL_MIRROR_URL, UV_CONFIG_FILE) and exports
+# UV_NO_CONFIG=1 so uv config files cannot set the same redirects. On the Job
+# path the uv binary is digest-pinned, so the digests built into it are fixed;
+# a local run uses whatever uv the operator supplies at or above UV_MIN.
 clear_uv_redirects() {
 	unset UV_PYTHON_DOWNLOADS_JSON_URL UV_PYTHON_INSTALL_MIRROR UV_ASTRAL_MIRROR_URL UV_CONFIG_FILE
 	export UV_NO_CONFIG=1
