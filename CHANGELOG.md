@@ -250,6 +250,7 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
 - The `mlx-serve` image's interpreter moves from the python-build-standalone 20260929 build of CPython 3.12.14 to the 20261013 build of CPython 3.12.15, the newest build the pinned uv 0.13.1 offers. The next image tag carries it; the package closure does not move.
 - The `mlx-serve` image is staged with uv 0.13.5 (was 0.13.1), and its interpreter moves to the python-build-standalone 20261021 build of CPython 3.12.15 (was 20261013), the build uv 0.13.5 offers. The next image tag carries it; the package closure does not move, and `requirements.lock` is regenerated with uv 0.13.5 at the next image build.
 - The `mlx-serve` image is staged with uv 0.13.6 (was 0.13.5), and its interpreter moves to the python-build-standalone 20261026 build of CPython 3.12.16 (was the 20261021 build of 3.12.15), the build uv 0.13.6 offers. The next image tag carries it; the package closure does not move, and `requirements.lock` is not regenerated here and still records the uv and interpreter it was last generated with.
+- The `mlx-serve` stage clears `UV_PYTHON_DOWNLOADS_JSON_URL`, `UV_PYTHON_INSTALL_MIRROR` and `UV_ASTRAL_MIRROR_URL` before it calls uv, so an inherited value cannot replace the digests embedded in the pinned uv that check the interpreter.
 - The embedded runtime takes an exclusive lock on its root (`runtimed.lock`). A second runtime
   started on a root already in use waits up to 15 seconds for the lock and is then refused,
   instead of running beside the first.

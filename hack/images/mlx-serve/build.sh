@@ -323,7 +323,16 @@ install_closure() {
 	[ "$rc" -eq 0 ] || die "uv pip install failed (exit $rc)"
 }
 
+# clear_uv_redirects drops the three variables that redirect where uv gets its
+# interpreter or which digests it checks. The catalog embedded in the pinned uv
+# and its digests are the control; the pinned uv binary's digest pins them
+# transitively, so an inherited override must not replace them.
+clear_uv_redirects() {
+	unset UV_PYTHON_DOWNLOADS_JSON_URL UV_PYTHON_INSTALL_MIRROR UV_ASTRAL_MIRROR_URL
+}
+
 stage_tree() {
+	clear_uv_redirects
 	export UV_PYTHON_INSTALL_DIR="$WORK/python"
 	export UV_CACHE_DIR="${UV_CACHE_DIR:-$WORK/uv-cache}"
 	mkdir -p "$UV_PYTHON_INSTALL_DIR"

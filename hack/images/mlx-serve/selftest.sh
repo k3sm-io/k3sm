@@ -2946,6 +2946,27 @@ if [ "$rc" -eq 0 ] && [ "$runs" -eq 1 ]; then
 else
 	ladder no "10.stall.idle  no download in progress, no growth: uv is left alone (exit $rc, $runs runs)"
 fi
+# The stage must not inherit uv's catalog or mirror variables: they replace the
+# digests embedded in the pinned uv. stage_tree calls clear_uv_redirects first
+# (it cannot run hermetically: it copies trees and runs the staged python), so
+# that function runs as build.sh defines it, then a fake uv records its env.
+UVENV="$STALLD/uvenv"; rm -f "$UVENV"
+printf '#!/bin/bash\n: >> "%s"\nenv | grep "^UV_" >> "%s"\nexit 0\n' "$UVENV" "$UVENV" > "$STALLD/uvenv-uv"
+chmod +x "$STALLD/uvenv-uv"
+(
+	sed -n '/^clear_uv_redirects() {$/,/^}$/p' "$BUILD" > "$STALLD/clear.sh"
+	export UV_PYTHON_DOWNLOADS_JSON_URL=file:///junk UV_PYTHON_INSTALL_MIRROR=file:///junk UV_ASTRAL_MIRROR_URL=file:///junk
+	# shellcheck disable=SC1091 # generated from build.sh just above
+	. "$STALLD/clear.sh"
+	clear_uv_redirects
+	"$STALLD/uvenv-uv" python install x
+) > /dev/null 2>&1
+if [ -s "$STALLD/clear.sh" ] && grep -q 'clear_uv_redirects$' <(sed -n '/^stage_tree() {$/,/^}$/p' "$BUILD" | sed -n 2p | tr -d '\t') &&
+	[ -f "$UVENV" ] && ! grep -qE 'UV_(PYTHON_DOWNLOADS_JSON_URL|PYTHON_INSTALL_MIRROR|ASTRAL_MIRROR_URL)' "$UVENV"; then
+	ladder ok "10.uvredirect  uv's catalog and mirror variables are cleared before the stage's first uv call"
+else
+	ladder no "10.uvredirect  uv's catalog and mirror variables are cleared before the stage's first uv call"
+fi
 # shellcheck disable=SC2016 # the literal line in build.sh
 if grep -qF '"$UV" pip install --python "$STAGE/$PY_BIN" --require-hashes -r "$HERE/requirements.lock" &' "$BUILD"; then
 	ladder ok "10.stall.hashes  the watched install keeps --require-hashes and the lockfile"
