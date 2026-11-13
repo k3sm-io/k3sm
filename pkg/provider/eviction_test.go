@@ -1053,6 +1053,83 @@ func TestEvictionStopFailureNeverPublishesFailedThenRunning(t *testing.T) {
 	}
 }
 
+// TestFailedEvictionStopOfAForgottenPodKeepsTheLiveStatus pins the eviction's
+// side of the stop's live-status snapshot: runtimed forgets a pod as its
+// DeletePod begins, so a victim whose eviction stop then fails reads NotFound
+// from the runtime. After the failure every surface (GetPodStatus, GetPods)
+// still reads the pod's last live status, Running with no container Waiting,
+// never the synthesized creating status, and nothing reads Failed.
+func TestFailedEvictionStopOfAForgottenPodKeepsTheLiveStatus(t *testing.T) {
+	ctx := context.Background()
+	h := newEvictionHarness(t)
+	h.add(evPod("hog", nil, "", ""), "2Gi")
+	h.f.pushDeleteErr(status.Error(codes.Unavailable, "runtime unavailable"))
+	hold := make(chan struct{})
+	h.f.mu.Lock()
+	h.f.deleteHold = hold
+	h.f.mu.Unlock()
+	var released atomic.Bool
+	release := func() {
+		if released.CompareAndSwap(false, true) {
+			close(hold)
+		}
+	}
+	t.Cleanup(release)
+
+	st, err := h.r.GetPodStatus(ctx, "default", "hog")
+	if err != nil {
+		t.Fatalf("GetPodStatus before the eviction: %v", err)
+	}
+	assertRunningNotWaiting(t, "GetPodStatus before the eviction", *st)
+
+	cycled := make(chan struct{})
+	go func() {
+		defer close(cycled)
+		h.step(compressorAt(85))
+	}()
+	waitBounded(t, "the eviction stop to reach the runtime", func() bool {
+		h.f.mu.Lock()
+		defer h.f.mu.Unlock()
+		return h.f.deleteCalls == 1
+	})
+	// The runtime forgets the pod while its stop is in flight; the stop then
+	// fails.
+	h.f.mu.Lock()
+	delete(h.f.created, "uid-hog")
+	h.f.mu.Unlock()
+	release()
+	select {
+	case <-cycled:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the eviction cycle never returned")
+	}
+	tr := h.r.trackByID("uid-hog")
+	if tr == nil {
+		t.Fatal("pod not tracked after the failed eviction")
+	}
+	if tr.isStopping() {
+		t.Fatal("the pod is still stopping after its eviction stop failed: the fence was not released")
+	}
+	if n := evictionsTotal(h.m, signalCompressor); n != 0 {
+		t.Errorf("a failed eviction was counted: evictions_total=%d", n)
+	}
+
+	// Two reads of each surface: a read the runtime answers NotFound must not
+	// drop the snapshot for the next one.
+	for i := range 2 {
+		st, err := h.r.GetPodStatus(ctx, "default", "hog")
+		if err != nil {
+			t.Fatalf("GetPodStatus %d after the failed stop: %v", i, err)
+		}
+		assertRunningNotWaiting(t, "GetPodStatus after the failed eviction stop", *st)
+		pods, err := h.r.GetPods(ctx)
+		if err != nil || len(pods) != 1 {
+			t.Fatalf("GetPods %d after the failed stop = %d pods, %v", i, len(pods), err)
+		}
+		assertRunningNotWaiting(t, "GetPods after the failed eviction stop", pods[0].Status)
+	}
+}
+
 // stopRacingTarget is the real provider as the manager's target, with a hook
 // run between the candidate listing and the eviction: the window in which
 // another node-side stop (an active deadline's) can take the pod's stopping
