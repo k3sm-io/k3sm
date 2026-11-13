@@ -18,6 +18,7 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -133,9 +134,17 @@ type evictionTarget interface {
 	// evicted or being deleted) with whatever stats could be fetched under ctx.
 	evictionCandidates(ctx context.Context) []evictionCandidate
 	// evictPod terminates pod as a hard eviction and records it as evicted. It
-	// returns once the runtime teardown has returned.
+	// returns once the runtime teardown has returned. It returns
+	// errEvictionNotIssued when it issued no kill because another stop already
+	// holds the pod or the pod is already terminal.
 	evictPod(ctx context.Context, pod *corev1.Pod, n evictionNotice) error
 }
+
+// errEvictionNotIssued reports an eviction that issued no kill: the pod was
+// already stopping (another node-side stop, such as an active deadline's, took
+// it after the candidates were listed) or already terminal. Nothing was evicted
+// this cycle, so the manager counts nothing and waits for nothing.
+var errEvictionNotIssued = errors.New("eviction not issued: the pod is already stopping or terminal")
 
 // admissionSourceSetter is the runtime surface admission is wired through: the
 // runtime admits new pods against the pressure source it is given. Defined
@@ -319,7 +328,15 @@ func (m *evictionManager) cycle(ctx context.Context) {
 	// Only a SUCCESSFUL eviction counts: toward evictions_total, and toward the
 	// cascade cap. A failed one was rolled back by the runtime (the pod is still
 	// running and still a candidate), so the next cycle simply tries again.
+	// An eviction that lost the pod to another stop issued no kill: nothing was
+	// evicted this cycle, so it is not counted and opens no relief wait; the
+	// next cycle re-lists the candidates, which no longer include the pod.
 	if err := m.target.evictPod(ctx, victim.pod, notice); err != nil {
+		if errors.Is(err, errEvictionNotIssued) {
+			m.log.Debug("eviction manager: the pod is already stopping or terminal; nothing evicted this cycle",
+				"pod", victim.pod.Namespace+"/"+victim.pod.Name, "uid", string(victim.pod.UID))
+			return
+		}
 		m.log.Error("eviction manager: evicting the pod failed; it stays a candidate",
 			"pod", victim.pod.Namespace+"/"+victim.pod.Name, "err", err)
 		return

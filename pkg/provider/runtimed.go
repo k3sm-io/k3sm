@@ -3186,7 +3186,8 @@ func (r *runtimedRuntime) DeletePod(ctx context.Context, pod *corev1.Pod) error 
 //     says Failed before the stop has happened. It fences the pod (a second
 //     eviction or a deadline stop, a create, an update, a restart) and keeps
 //     the restart engine from observing the teardown's exits as crashes. A
-//     second eviction of a pod already stopping or terminal is a no-op.
+//     second eviction of a pod already stopping or terminal issues nothing and
+//     returns errEvictionNotIssued, so the manager does not count it.
 //  2. Emit the pod's Warning Evicted Event (the kubelet records it before the
 //     kill).
 //  3. Quiesce the track (cancel pending re-execs, pulls, postStart), so no
@@ -3233,7 +3234,10 @@ func (r *runtimedRuntime) evictPod(ctx context.Context, pod *corev1.Pod, n evict
 	prior := r.podWithStatus(ctx, tracked, t)
 	st := evictedPodStatus(prior.Status, n.message, metav1.Now())
 	if !t.markEvictionStopping(prior.Status.DeepCopy()) {
-		return nil
+		// Another node-side stop holds the pod (an active deadline's that
+		// began after the candidates were listed), or it is already terminal:
+		// this eviction issued no kill, so the manager must not count it.
+		return errEvictionNotIssued
 	}
 	r.recorder.Event(tracked, corev1.EventTypeWarning, reasonEvicted, n.message)
 
@@ -3250,14 +3254,24 @@ func (r *runtimedRuntime) evictPod(ctx context.Context, pod *corev1.Pod, n evict
 		t.clearStopping()
 		return fmt.Errorf("runtimed delete pod %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
-	if !t.finishStopping(st) {
-		// The pod was made terminal by another path while this stop ran; its
-		// status stands and this eviction publishes nothing.
-		return nil
+	// Unreachable under today's invariants: only this path sets evicted on a
+	// track while its stopping mark fences every other stop, and rejected is
+	// fixed at admission (beginStopLocked refused it above). Should it ever
+	// fire, the kill above still happened, so the cleanup that publishes
+	// nothing (budget event, prober, transport) still runs; only the status
+	// persist and the callback are skipped, because the other path's status
+	// stands.
+	published := t.finishStopping(st)
+	if !published {
+		r.log.Warn("eviction: the pod was made terminal by another path during its eviction stop; keeping that status",
+			"pod", podKey(pod.Namespace, pod.Name))
 	}
 	r.recordBudgetEvent(tracked, budgetv1alpha1.CounterEviction)
 	r.stopProber(id)
 	r.transport.drop(id)
+	if !published {
+		return nil
+	}
 
 	if err := r.persistEvictedStatus(ctx, tracked, st); err != nil {
 		r.log.Error("eviction: could not persist the evicted status to the apiserver",

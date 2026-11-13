@@ -1052,3 +1052,71 @@ func TestEvictionStopFailureNeverPublishesFailedThenRunning(t *testing.T) {
 		t.Errorf("no reader ever saw the eviction after the retry succeeded: %q", reads)
 	}
 }
+
+// stopRacingTarget is the real provider as the manager's target, with a hook
+// run between the candidate listing and the eviction: the window in which
+// another node-side stop (an active deadline's) can take the pod's stopping
+// mark first.
+type stopRacingTarget struct {
+	r        *runtimedRuntime
+	onListed func()
+}
+
+func (s *stopRacingTarget) evictionCandidates(ctx context.Context) []evictionCandidate {
+	cands := s.r.evictionCandidates(ctx)
+	s.onListed()
+	return cands
+}
+
+func (s *stopRacingTarget) evictPod(ctx context.Context, pod *corev1.Pod, n evictionNotice) error {
+	return s.r.evictPod(ctx, pod, n)
+}
+
+// TestEvictionThatLosesToAnotherStopIsNotCounted pins that an eviction refused
+// because the pod is already stopping (another stop took the mark after the
+// candidates were listed) is nothing evicted this cycle: evictPod reports
+// errEvictionNotIssued, and the manager counts nothing, opens no cascade entry,
+// does not wait for pressure relief, and sends no DeletePod of its own.
+func TestEvictionThatLosesToAnotherStopIsNotCounted(t *testing.T) {
+	ctx := context.Background()
+	h := newEvictionHarness(t)
+	pod := evPod("hog", nil, "", "")
+	h.add(pod, "2Gi")
+	tr := h.r.trackByID(string(pod.UID))
+	if tr == nil {
+		t.Fatal("setup: the pod is not tracked")
+	}
+	h.m.target = &stopRacingTarget{r: h.r, onListed: func() {
+		if !tr.markStopping(nil) {
+			t.Error("setup: the competing stop could not take the stopping mark")
+		}
+	}}
+	baseline := h.m.hasBaseline
+
+	h.step(compressorAt(85))
+
+	if got := h.deleteIDs(); len(got) != 0 {
+		t.Errorf("DeletePod ids = %v, want none from the eviction (the competing stop owns the kill)", got)
+	}
+	if n := evictionsTotal(h.m, signalCompressor); n != 0 {
+		t.Errorf("evictions_total = %d, want 0: no kill was issued by the eviction", n)
+	}
+	if n := len(h.m.evictedAt); n != 0 {
+		t.Errorf("cascade window entries = %d, want 0", n)
+	}
+	if h.m.awaiting {
+		t.Error("the manager is awaiting pressure relief after an eviction it did not issue")
+	}
+	if h.m.hasBaseline != baseline {
+		t.Errorf("hasBaseline = %v, want it unchanged (%v)", h.m.hasBaseline, baseline)
+	}
+	if n := countPrefix(h.events(), "Warning "+reasonEvicted); n != 0 {
+		t.Errorf("Evicted Events = %d, want 0", n)
+	}
+	if !tr.isStopping() || tr.evictedStatus() != nil {
+		t.Errorf("the competing stop's mark was disturbed: stopping=%v evicted=%v", tr.isStopping(), tr.evictedStatus() != nil)
+	}
+	if err := h.r.evictPod(ctx, pod, evictionNotice{signal: signalCompressor, message: "x"}); !errors.Is(err, errEvictionNotIssued) {
+		t.Errorf("evictPod on a stopping pod = %v, want errEvictionNotIssued", err)
+	}
+}
