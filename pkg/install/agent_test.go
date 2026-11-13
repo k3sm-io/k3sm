@@ -311,7 +311,7 @@ func TestInstallRendersAgentDaemonWhenJoining(t *testing.T) {
 		if err == nil {
 			t.Fatal("install accepted a world-readable join token file")
 		}
-		if !strings.Contains(err.Error(), "chmod 600") || !strings.Contains(err.Error(), operatorTokenFile) {
+		if !strings.Contains(err.Error(), "chmod -- 600 ") || !strings.Contains(err.Error(), operatorTokenFile) {
 			t.Errorf("error %q must name the file and the remedy", err)
 		}
 		for _, c := range f.calls {

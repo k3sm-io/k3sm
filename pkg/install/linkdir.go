@@ -105,8 +105,11 @@ func linkDirVerdict(dir, launcherDir string, f linkDirFacts, euid int) error {
 	// itself; or clear the way when the LAUNCHER path is the thing that is not a
 	// directory. Only the third ever says "remove", and it never names an
 	// ancestor.
-	chown := fmt.Sprintf("sudo chown root:wheel %s && sudo chmod 755 %s", dir, dir)
-	create := fmt.Sprintf("create %s as a root-owned directory first: sudo mkdir -p %s && sudo chown root:wheel %s && sudo chmod 755 %s", launcherDir, launcherDir, launcherDir, launcherDir)
+	// The commands quote the path and end options with `--` before the first
+	// operand: BSD getopt stops at the mode, so a `--` after it is a file.
+	qd, ql := shellQuote(dir), shellQuote(launcherDir)
+	chown := fmt.Sprintf("sudo chown -- root:wheel %s && sudo chmod -- 755 %s", qd, qd)
+	create := fmt.Sprintf("create %s as a root-owned directory first: sudo mkdir -p -- %s && sudo chown -- root:wheel %s && sudo chmod -- 755 %s", launcherDir, ql, ql, ql)
 	remove := fmt.Sprintf("remove %s, or choose another directory already on your shell's PATH", dir)
 
 	reason, remedy := "", ""

@@ -281,8 +281,8 @@ func ensureFileOwnedByVia(ops fileOps, path string, uid, gid int, mode fs.FileMo
 		return fmt.Errorf("%s: %w; %s", path, ErrNotRegularFile, lockRemedy(mode, path))
 	}
 	if st.Nlink != 1 {
-		return fmt.Errorf("%s has %d links: %w: %w; the lock file holds no state, so it is safe to remove: run `sudo rm %s` and re-run the install",
-			path, st.Nlink, ErrNotRegularFile, errHardlinkRefused, path)
+		return fmt.Errorf("%s has %d links: %w: %w; the lock file holds no state, so it is safe to remove: run `sudo rm -- %s` and re-run the install",
+			path, st.Nlink, ErrNotRegularFile, errHardlinkRefused, shellQuote(path))
 	}
 	if err := ops.fchown(fd, uid, gid); err != nil {
 		return fmt.Errorf("chown %s to %d:%d: %w", path, uid, gid, err)
@@ -308,9 +308,9 @@ func lockEntryKind(m fs.FileMode) string {
 // no state, so removing the entry is safe.
 func lockRemedy(m fs.FileMode, path string) string {
 	if m.IsDir() {
-		return fmt.Sprintf("the lock file holds no state, so it is safe to remove the directory: run `sudo rmdir %s` (`sudo rm -rf %s` if it is not empty) and re-run the install", path, path)
+		return fmt.Sprintf("the lock file holds no state, so it is safe to remove the directory: run `sudo rmdir -- %s` (`sudo rm -rf -- %s` if it is not empty) and re-run the install", shellQuote(path), shellQuote(path))
 	}
-	return fmt.Sprintf("the lock file holds no state, so it is safe to remove the entry: run `sudo rm %s` and re-run the install", path)
+	return fmt.Sprintf("the lock file holds no state, so it is safe to remove the entry: run `sudo rm -- %s` and re-run the install", shellQuote(path))
 }
 
 // EnsureLogDir creates (or repairs) the log dir owned by the service uid, group
@@ -1966,6 +1966,16 @@ func readOwnedRegularFile(path string, limit int64) ([]byte, OwnedEntry, error) 
 	if err != nil {
 		if errors.Is(err, unix.ELOOP) {
 			return nil, OwnedEntry{}, fmt.Errorf("open %s: %w: it is a symlink, and this read refuses to follow one", path, ErrNotRegularFile)
+		}
+		// A unix socket fails open() itself (ENXIO, or EOPNOTSUPP on some
+		// filesystems), before the fstat type check below can see it. It is
+		// a planted non-regular entry like the rest, so it is an immediate
+		// refusal, not the generic error a caller may retry as transient.
+		// No caller relies on ENXIO here: a FIFO with no writer opens fine
+		// for O_RDONLY|O_NONBLOCK (ENXIO is the write-side open's answer),
+		// so the fifo still reaches the fstat check.
+		if errors.Is(err, unix.ENXIO) || errors.Is(err, unix.EOPNOTSUPP) {
+			return nil, OwnedEntry{}, fmt.Errorf("open %s: %w: it is not a file open() can read (%v), such as a socket", path, ErrNotRegularFile, err)
 		}
 		return nil, OwnedEntry{}, &fs.PathError{Op: "open", Path: path, Err: err}
 	}

@@ -524,7 +524,7 @@ func TestReadCrashRecordFileClassifiesFailures(t *testing.T) {
 			if !errors.As(err, &re) {
 				t.Errorf("error %q is not a crashRecordReadError, so no caller can branch on its class", err)
 			}
-			for _, w := range append(tc.want, "sudo rm "+shellQuote(path)) {
+			for _, w := range append(tc.want, "sudo rm -- "+shellQuote(path)) {
 				if !strings.Contains(err.Error(), w) {
 					t.Errorf("error %q must carry %q", err, w)
 				}
@@ -538,13 +538,14 @@ func TestReadCrashRecordFileClassifiesFailures(t *testing.T) {
 	}
 }
 
-// The remedy's `sudo rm` pastes back as ONE argument naming the record, even
-// under a data root with a space and a single quote in it.
+// The remedy's `sudo rm --` pastes back as ONE argument naming the record, even
+// under a data root with a space and a single quote in it, and `--` ends rm's
+// options before it.
 func TestCrashRecordRemedyQuotesPath(t *testing.T) {
 	cases := []struct{ path, want string }{
-		{"/var/lib/k3sm/agent/crashloop.json", `sudo rm '/var/lib/k3sm/agent/crashloop.json'`},
-		{"/Volumes/My Disk/k3sm's/agent/crashloop.json", `sudo rm '/Volumes/My Disk/k3sm'\''s/agent/crashloop.json'`},
-		{"/a/$(touch x)/`id`/*", "sudo rm '/a/$(touch x)/`id`/*'"},
+		{"/var/lib/k3sm/agent/crashloop.json", `sudo rm -- '/var/lib/k3sm/agent/crashloop.json'`},
+		{"/Volumes/My Disk/k3sm's/agent/crashloop.json", `sudo rm -- '/Volumes/My Disk/k3sm'\''s/agent/crashloop.json'`},
+		{"/a/$(touch x)/`id`/*", "sudo rm -- '/a/$(touch x)/`id`/*'"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.path, func(t *testing.T) {

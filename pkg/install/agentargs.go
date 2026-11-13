@@ -115,7 +115,7 @@ func recordedAgentArgs(sys System, cfg Config) ([]string, error) {
 	path := cfg.AgentArgsRecord
 	rec, err := dataroot.ReadAgentArgsRecord(systemFiles{sys}, path)
 	if err != nil {
-		return nil, fmt.Errorf("install: %w (`sudo rm %s` to reinstall from the stock template, which discards the arguments it lists)", err, path)
+		return nil, fmt.Errorf("install: %w (`sudo rm -- %s` to reinstall from the stock template, which discards the arguments it lists)", err, shellQuote(path))
 	}
 	if rec == nil {
 		return nil, nil
@@ -273,7 +273,7 @@ func operatorJoinToken(sys System, cfg Config) (string, bootstrap.Token, error) 
 		// The mode BEFORE the bytes are trusted: a credential this Mac should not
 		// have accepted is refused before anything below parses raw.
 		if perm&tokenFileMask != 0 {
-			return "", bootstrap.Token{}, fmt.Errorf("install: the join token file %s is mode %#o: a join token is a credential, so the file must not be readable by its group or by other accounts — `chmod 600 %s`, and mint a fresh token if it has been exposed", cfg.TokenFile, perm, cfg.TokenFile)
+			return "", bootstrap.Token{}, fmt.Errorf("install: the join token file %s is mode %#o: a join token is a credential, so the file must not be readable by its group or by other accounts — `chmod -- 600 %s`, and mint a fresh token if it has been exposed", cfg.TokenFile, perm, shellQuote(cfg.TokenFile))
 		}
 	}
 	token := strings.TrimSpace(string(raw))

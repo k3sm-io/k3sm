@@ -3376,7 +3376,7 @@ func TestEnsureSymlinkNamesTheRemedyForAnUntrustedLinkDir(t *testing.T) {
 					bin,
 					"uid 501",
 					"root's PATH",
-					"sudo chown root:wheel " + bin + " && sudo chmod 755 " + bin,
+					"sudo chown -- root:wheel " + shellQuote(bin) + " && sudo chmod -- 755 " + shellQuote(bin),
 				},
 			},
 			{
@@ -3384,14 +3384,14 @@ func TestEnsureSymlinkNamesTheRemedyForAnUntrustedLinkDir(t *testing.T) {
 				dir:   bin,
 				facts: linkDirFacts{UID: 0, Mode: 0o775 | fs.ModeDir, IsDir: true},
 				euid:  0,
-				want:  []string{bin, "group-writable", "0775", "root's PATH", "sudo chmod 755 " + bin},
+				want:  []string{bin, "group-writable", "0775", "root's PATH", "sudo chmod -- 755 " + shellQuote(bin)},
 			},
 			{
 				name:  "root-owned but world-writable",
 				dir:   bin,
 				facts: linkDirFacts{UID: 0, Mode: 0o757 | fs.ModeDir, IsDir: true},
 				euid:  0,
-				want:  []string{bin, "world-writable", "0757", "root's PATH", "sudo chmod 755 " + bin},
+				want:  []string{bin, "world-writable", "0757", "root's PATH", "sudo chmod -- 755 " + shellQuote(bin)},
 			},
 			{
 				// Lstat, never Stat: whoever can re-point the symlink chooses
@@ -3425,8 +3425,8 @@ func TestEnsureSymlinkNamesTheRemedyForAnUntrustedLinkDir(t *testing.T) {
 					bin,
 					"its parent /usr/local",
 					"is a symlink",
-					"sudo mkdir -p " + bin,
-					"sudo chown root:wheel " + bin,
+					"sudo mkdir -p -- " + shellQuote(bin),
+					"sudo chown -- root:wheel " + shellQuote(bin),
 				},
 				notWant: []string{"remove /usr/local"},
 			},
@@ -3442,8 +3442,8 @@ func TestEnsureSymlinkNamesTheRemedyForAnUntrustedLinkDir(t *testing.T) {
 				want: []string{
 					bin,
 					"/usr/local does not exist",
-					"sudo mkdir -p " + bin,
-					"sudo chmod 755 " + bin,
+					"sudo mkdir -p -- " + shellQuote(bin),
+					"sudo chmod -- 755 " + shellQuote(bin),
 				},
 				notWant: []string{"remove /usr/local", "no such file"},
 			},
@@ -3500,7 +3500,7 @@ func TestEnsureSymlinkNamesTheRemedyForAnUntrustedLinkDir(t *testing.T) {
 		if err == nil {
 			t.Fatal("a user-owned /usr/local must be refused: that user could create /usr/local/bin and own it")
 		}
-		for _, w := range []string{"/usr/local", "uid 501", "sudo chown root:wheel /usr/local"} {
+		for _, w := range []string{"/usr/local", "uid 501", "sudo chown -- root:wheel '/usr/local'"} {
 			if !strings.Contains(err.Error(), w) {
 				t.Errorf("refusal %q does not name %q", err, w)
 			}

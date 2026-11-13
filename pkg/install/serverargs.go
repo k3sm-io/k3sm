@@ -285,7 +285,7 @@ func recordedServerArgs(sys System, cfg Config) ([]string, error) {
 	path := cfg.ServerArgsRecord
 	rec, err := dataroot.ReadServerArgsRecord(systemFiles{sys}, path)
 	if err != nil {
-		return nil, fmt.Errorf("install: %w (`sudo rm %s` to reinstall from the stock template, which discards the arguments it lists)", err, path)
+		return nil, fmt.Errorf("install: %w (`sudo rm -- %s` to reinstall from the stock template, which discards the arguments it lists)", err, shellQuote(path))
 	}
 	if rec == nil {
 		warnNothingCarried(cfg)
@@ -334,8 +334,8 @@ func unreadablePlistError(sys System, cfg Config, path string, cause error) erro
 		// BOTH sources are unreadable. Naming only the plist here would send the
 		// operator to remove it and hit the record's refusal on the very next
 		// run, having been told nothing about it.
-		return fmt.Errorf("install: cannot read the arguments of the installed server plist %s: %w — and the recorded arguments are unreadable too: %v (remove %s AND fix or `sudo rm %s`; with both gone the next install renders the stock template)",
-			path, cause, recErr, path, recPath)
+		return fmt.Errorf("install: cannot read the arguments of the installed server plist %s: %w — and the recorded arguments are unreadable too: %v (remove %s AND fix or `sudo rm -- %s`; with both gone the next install renders the stock template)",
+			path, cause, recErr, path, shellQuote(recPath))
 	case rec != nil:
 		return fmt.Errorf("install: cannot read the arguments of the installed server plist %s: %w (remove %s to reinstall; the recorded operator arguments (%s) from %s in %s will be carried over)",
 			path, cause, path, redactedServerArgsText(rec.Args), rec.CreatedAt.Format(time.RFC3339), recPath)
