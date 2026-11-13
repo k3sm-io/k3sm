@@ -142,7 +142,9 @@ answers 502 where it cannot take over the connection, and logs the warning
 `ingest registry gate could not reach the local registry`. A pull the client itself gave up on is
 not logged as a warning. A node's runtime reads a closed connection as this registry not having the
 image and moves on to its next source, if it has one. The 30 seconds covers the registry's response
-headers only, not the time a transfer takes once the registry has started to answer.
+headers only, not the time a transfer takes once the registry has started to answer. If the
+registry starts an answer and then sends nothing for 5 minutes, the gate cuts the connection and
+logs a warning. A slow answer that keeps moving is never cut.
 
 A pull through the registry's cluster address is cut by the registry if the transfer makes no
 progress for 5 minutes. A slow transfer that keeps moving is never cut, because a node cannot resume

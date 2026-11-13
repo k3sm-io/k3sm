@@ -41,6 +41,7 @@ TestFlatService kept the relay and cluster publication do not touch the child
 TestFlatServingSANs kept the relay and cluster publication do not touch the child
 TestGateAndServerAgree added new with the child switch
 TestGateAnswers502WhenTheUpstreamStalls added the gate's upstream has a response-header timeout
+TestGateCutsUpstreamStalledAfterHeaders added a registry that stops sending mid-body loses the connection one progress window later
 TestGateHeaderBoundByOperation added a manifest PUT is held to the collect bound plus a 5 minute margin, reads and upload status to 30s
 TestGateManifestBoundCoversCollect added the manifest PUT bound is the collect bound plus a 5 minute margin
 TestGateLeavesBlobUploadsOutOfTheHeaderBound added a blob upload commit is held to the registry's upload bound

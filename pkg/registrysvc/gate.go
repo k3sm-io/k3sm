@@ -111,6 +111,9 @@ type gate struct {
 	// cred is the registry credential writes are forwarded with. Empty means
 	// writes are 503, like a missing auth.
 	cred Credential
+	// bodyProgress is how long a forwarded response body may go without a
+	// byte from the registry before the gate cuts it.
+	bodyProgress time.Duration
 
 	// read forwards reads and write every authorized write not named below,
 	// both over a transport with the upstream response-header bound; manifest
@@ -142,6 +145,10 @@ type gateConfig struct {
 	// mount, chunk, finish); zero means gateUploadHeaderTimeout. Ignored when
 	// Transport is set.
 	UploadHeaderTimeout time.Duration
+	// UpstreamBodyProgress bounds how long a registry response body, once its
+	// headers have arrived, may go without a byte before the gate cuts it;
+	// zero means gateUpstreamBodyProgress. It applies with any Transport.
+	UpstreamBodyProgress time.Duration
 }
 
 // newGate builds a gate.
@@ -161,13 +168,16 @@ func newGate(cfg gateConfig) *gate {
 	if cfg.UploadHeaderTimeout <= 0 {
 		cfg.UploadHeaderTimeout = gateUploadHeaderTimeout
 	}
+	if cfg.UpstreamBodyProgress <= 0 {
+		cfg.UpstreamBodyProgress = gateUpstreamBodyProgress
+	}
 	manifestTransport, uploadTransport := cfg.Transport, cfg.Transport
 	if cfg.Transport == nil {
 		cfg.Transport = loopbackTransport(cfg.UpstreamHeaderTimeout)
 		manifestTransport = loopbackTransport(cfg.ManifestHeaderTimeout)
 		uploadTransport = loopbackTransport(cfg.UploadHeaderTimeout)
 	}
-	g := &gate{upstream: cfg.Upstream, log: cfg.Logger, cred: cfg.Credential}
+	g := &gate{upstream: cfg.Upstream, log: cfg.Logger, cred: cfg.Credential, bodyProgress: cfg.UpstreamBodyProgress}
 	if cfg.Auth.complete() {
 		g.auth = newAuthorizer(cfg.Auth, cfg.Now)
 	}
@@ -260,9 +270,11 @@ func (g *gate) rewrite(pr *httputil.ProxyRequest, attach bool) {
 	}
 }
 
-// modifyResponse keeps the registry's session cookies inside this process and
+// modifyResponse keeps the registry's session cookies inside this process,
 // turns an absolute Location naming the loopback upstream into a path, so a
-// client keeps talking to the gate.
+// client keeps talking to the gate, and puts the response body under the
+// progress bound, so a registry that stops sending mid-body loses the
+// connection one window later instead of holding it until the client gives up.
 func (g *gate) modifyResponse(resp *http.Response) error {
 	resp.Header.Del("Set-Cookie")
 	if loc := resp.Header.Get("Location"); loc != "" {
@@ -270,6 +282,16 @@ func (g *gate) modifyResponse(resp *http.Response) error {
 			u.Scheme, u.Host = "", ""
 			resp.Header.Set("Location", u.String())
 		}
+	}
+	if watchesBody(resp) {
+		var method, path string
+		if resp.Request != nil {
+			method, path = resp.Request.Method, resp.Request.URL.Path
+		}
+		resp.Body = newProgressBody(resp.Body, g.bodyProgress, func() {
+			g.log.Warn("ingest registry gate cut a local registry response that stopped sending",
+				"target", g.upstream, "method", method, "path", path, "window", g.bodyProgress)
+		})
 	}
 	return nil
 }
