@@ -2961,12 +2961,50 @@ chmod +x "$STALLD/uvenv-uv"
 	clear_uv_redirects
 	"$STALLD/uvenv-uv" python install x
 ) > /dev/null 2>&1
-if [ -s "$STALLD/clear.sh" ] && grep -q 'clear_uv_redirects$' <(sed -n '/^stage_tree() {$/,/^}$/p' "$BUILD" | sed -n 2p | tr -d '\t') &&
+if [ -s "$STALLD/clear.sh" ] && grep -q 'clear_uv_redirects$' <(sed -n '/^stage_tree() {$/,/^}$/p' "$BUILD" | tr -d '\t' | sed '/^"\$UV"/,$d') &&
 	[ -f "$UVENV" ] && ! grep -qE 'UV_(PYTHON_DOWNLOADS_JSON_URL|PYTHON_INSTALL_MIRROR|ASTRAL_MIRROR_URL|CONFIG_FILE)=' "$UVENV" &&
 	grep -qx 'UV_NO_CONFIG=1' "$UVENV"; then
 	ladder ok "10.uvredirect  uv's catalog and mirror variables are cleared before the stage's first uv call"
 else
 	ladder no "10.uvredirect  uv's catalog and mirror variables are cleared before the stage's first uv call"
+fi
+# assert_interpreter_pin dies when uv maps the pinned interpreter to a URL other
+# than PY_URL, and when uv lists nothing; it passes on a match. The function runs
+# as build.sh defines it, against a fake uv that prints a canned listing, and the
+# "pinned interpreter" that parses the listing is the host python3.
+PINB="$STALLD/pin"; mkdir -p "$PINB/dist/k"
+printf '#!/bin/bash\nexec python3 "$@"\n' > "$PINB/dist/k/py"; chmod +x "$PINB/dist/k/py"
+cat > "$PINB/uv" <<'FAKE'
+#!/bin/bash
+case "$FAKE_LIST" in
+	fail) exit 9 ;;
+	*) printf '%s' "$FAKE_LIST" ;;
+esac
+FAKE
+chmod +x "$PINB/uv"
+pin_case() {
+	# pin_case <listing>: prints the exit status; the output lands in $PINB/out.
+	local rc=0
+	(
+		{ sed -n '/^die() /p' "$BUILD"; sed -n '/^assert_interpreter_pin() {$/,/^}$/p' "$BUILD"; } > "$PINB/fns.sh"
+		printf 'UV=%q UV_PYTHON_INSTALL_DIR=%q PY_KEY=k PY_BIN=py UV_MIN=0 PY_URL=%q\n' "$PINB/uv" "$PINB/dist" https://example.invalid/pinned.tar.gz >> "$PINB/fns.sh"
+		# shellcheck disable=SC1091 # generated from build.sh just above
+		. "$PINB/fns.sh"
+		export FAKE_LIST="$1"
+		assert_interpreter_pin
+	) > "$PINB/out" 2>&1 || rc=$?
+	echo "$rc"
+}
+rc_mis="$(pin_case '[{"key":"k","url":"https://example.invalid/other.tar.gz"}]')"
+out_mis="$(cat "$PINB/out")"
+rc_empty="$(pin_case '[]')"
+rc_fail="$(pin_case fail)"
+rc_ok="$(pin_case '[{"key":"j","url":"x"},{"key":"k","url":"https://example.invalid/pinned.tar.gz"}]')"
+if [ -s "$PINB/fns.sh" ] && [ "$rc_mis" -eq 2 ] && grep -q 'uv maps k to' <<< "$out_mis" && grep -q 'other.tar.gz' <<< "$out_mis" &&
+	[ "$rc_empty" -eq 2 ] && [ "$rc_fail" -eq 2 ] && [ "$rc_ok" -eq 0 ]; then
+	ladder ok "10.uvpin.interp  the interpreter pin dies on a URL mismatch and on an empty or failing listing, and passes on a match"
+else
+	ladder no "10.uvpin.interp  the interpreter pin dies on a URL mismatch and on an empty or failing listing, and passes on a match (mismatch $rc_mis, empty $rc_empty, failing $rc_fail, match $rc_ok)"
 fi
 # shellcheck disable=SC2016 # the literal line in build.sh
 if grep -qF '"$UV" pip install --python "$STAGE/$PY_BIN" --require-hashes -r "$HERE/requirements.lock" &' "$BUILD"; then
