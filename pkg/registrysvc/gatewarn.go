@@ -69,9 +69,10 @@ func readCauseOf(err error) readCause {
 	return causeOther
 }
 
-// readWarnLimiter decides, per cause, whether a read failure is the one
-// warning of its interval.
-type readWarnLimiter struct {
+// upstreamWarnLimiter decides, per cause, whether a failure to reach the
+// local registry is the one warning of its interval. The gate keeps one for
+// reads and one for writes.
+type upstreamWarnLimiter struct {
 	// mu guards byCause. It is held only to read and update it: the caller
 	// logs after allow returns, with mu released.
 	mu      sync.Mutex
@@ -85,7 +86,7 @@ type readWarnLimiter struct {
 // allow reports whether a failure of cause c at now is to be a warning, and
 // if so how many failures of c were suppressed since the last one. It does
 // not log.
-func (l *readWarnLimiter) allow(now time.Time, c readCause) (warn bool, suppressed int) {
+func (l *upstreamWarnLimiter) allow(now time.Time, c readCause) (warn bool, suppressed int) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	s := &l.byCause[c]

@@ -118,10 +118,10 @@ type gate struct {
 	// upload requests over one with the upload bound. proxyFor picks one.
 	read, write, manifest, upload *httputil.ReverseProxy
 
-	// warn limits readError's warning to one per interval per cause, on the
-	// clock now (gateConfig.Now).
-	warn readWarnLimiter
-	now  func() time.Time
+	// readWarn and writeWarn limit readError's and writeError's warnings to
+	// one per interval per cause each, on the clock now (gateConfig.Now).
+	readWarn, writeWarn upstreamWarnLimiter
+	now                 func() time.Time
 }
 
 // gateConfig configures a gate.
@@ -287,25 +287,7 @@ func (g *gate) modifyResponse(resp *http.Response) error {
 // without the request (a down registry fails every pull alike), counting the
 // failures suppressed since the last warning; those are logged at Debug.
 func (g *gate) readError(w http.ResponseWriter, r *http.Request, err error) {
-	const msg = "ingest registry gate could not reach the local registry"
-	if errors.Is(err, context.Canceled) {
-		g.log.Log(r.Context(), slog.LevelDebug, msg,
-			"target", g.upstream, "method", r.Method, "path", r.URL.Path, "err", err)
-	} else {
-		cause := readCauseOf(err)
-		warn, suppressed := g.warn.allow(g.now(), cause)
-		switch {
-		case !warn:
-			g.log.Log(r.Context(), slog.LevelDebug, msg,
-				"target", g.upstream, "method", r.Method, "path", r.URL.Path, "cause", cause.String(), "err", err)
-		case suppressed > 0:
-			g.log.Log(r.Context(), slog.LevelWarn, msg,
-				"target", g.upstream, "cause", cause.String(), "err", err, "suppressed", suppressed)
-		default:
-			g.log.Log(r.Context(), slog.LevelWarn, msg,
-				"target", g.upstream, "cause", cause.String(), "err", err)
-		}
-	}
+	g.logUpstreamError(r, &g.readWarn, "ingest registry gate could not reach the local registry", err)
 	if hj, ok := w.(http.Hijacker); ok {
 		if c, _, herr := hj.Hijack(); herr == nil {
 			_ = c.Close()
@@ -315,17 +297,39 @@ func (g *gate) readError(w http.ResponseWriter, r *http.Request, err error) {
 	w.WriteHeader(http.StatusBadGateway)
 }
 
-// writeError answers an authorized write the registry did not take. A write
-// the client itself abandoned is no fault of the registry and is logged at
-// Debug.
+// writeError answers an authorized write the registry did not take with a
+// 502. It logs like readError, on a limiter of its own: a write the client
+// itself abandoned is a Debug, and any other failure warns at most once per
+// gateReadWarnInterval for its cause, without the request.
 func (g *gate) writeError(w http.ResponseWriter, r *http.Request, err error) {
-	level := slog.LevelWarn
-	if errors.Is(err, context.Canceled) {
-		level = slog.LevelDebug
-	}
-	g.log.Log(r.Context(), level, "ingest registry gate could not forward an authorized write",
-		"target", g.upstream, "method", r.Method, "path", r.URL.Path, "err", err)
+	g.logUpstreamError(r, &g.writeWarn, "ingest registry gate could not forward an authorized write", err)
 	ociError(w, r, http.StatusBadGateway, codeUnavailable, "the node's registry is not answering")
+}
+
+// logUpstreamError logs a request's failure to reach the local registry. A
+// client's cancellation is a Debug naming the method and path, outside the
+// limiter l. Any other failure is a Warn naming the target, cause and error,
+// and the count of failures suppressed since the last one when there were
+// any, if l allows it; otherwise a Debug naming the method and path.
+func (g *gate) logUpstreamError(r *http.Request, l *upstreamWarnLimiter, msg string, err error) {
+	if errors.Is(err, context.Canceled) {
+		g.log.Log(r.Context(), slog.LevelDebug, msg,
+			"target", g.upstream, "method", r.Method, "path", r.URL.Path, "err", err)
+		return
+	}
+	cause := readCauseOf(err)
+	warn, suppressed := l.allow(g.now(), cause)
+	switch {
+	case !warn:
+		g.log.Log(r.Context(), slog.LevelDebug, msg,
+			"target", g.upstream, "method", r.Method, "path", r.URL.Path, "cause", cause.String(), "err", err)
+	case suppressed > 0:
+		g.log.Log(r.Context(), slog.LevelWarn, msg,
+			"target", g.upstream, "cause", cause.String(), "err", err, "suppressed", suppressed)
+	default:
+		g.log.Log(r.Context(), slog.LevelWarn, msg,
+			"target", g.upstream, "cause", cause.String(), "err", err)
+	}
 }
 
 // ServeHTTP is the gate. It is mounted directly on the server, never behind a
