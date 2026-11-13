@@ -104,7 +104,7 @@ func launchdRow(t *testing.T, name, fixtureName string, procs Liveness) Row {
 func parkedServer(t *testing.T, rec executor.CrashRecord) Row {
 	t.Helper()
 	r := launchdRow(t, RowServer, "launchctl_netd_running.txt", LivenessRunning)
-	applyCrashLoop(&r, ClassifyCrashLoop(rec, nil, "/var/lib/k3sm/server/crashloop.json", goldenTime))
+	applyCrashLoop(&r, ClassifyCrashLoop(rec, nil, "/var/lib/k3sm/server/crashloop.json", goldenTime, r.State == StateRunning))
 	return r
 }
 

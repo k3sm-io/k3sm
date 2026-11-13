@@ -181,6 +181,15 @@ A daemon row's `state` is one of:
 The four `agent` states describe the node credential, not the process: the daemon is running in all
 four.
 
+On the `server` row, `wide.crash-loop` reads `restarting` or `tripped` with the states above. Two more
+keys say when a `restarting` row is a start that is slow on a loaded Mac rather than repeated failure;
+`wide.crash-loop` still reads `restarting` with either:
+
+| wide key | values, when present |
+|---|---|
+| `crash-loop-phase` | `backing-off` while the daemon waits between slow start attempts, `attempting` while a slow start attempt runs; absent for a crash pattern, a tripped breaker, or a stopped server |
+| `crash-loop-next-attempt` | when the next start attempt begins, in UTC RFC 3339; present only with `backing-off` |
+
 ## The full report
 
 ```json
