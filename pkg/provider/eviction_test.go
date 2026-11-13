@@ -1197,3 +1197,66 @@ func TestEvictionThatLosesToAnotherStopIsNotCounted(t *testing.T) {
 		t.Errorf("evictPod on a stopping pod = %v, want errEvictionNotIssued", err)
 	}
 }
+
+// TestEvictionSkipsACandidateItCannotStop pins that a candidate whose eviction
+// is refused because another stop already owns it does not end the cycle: the
+// manager moves on to the next-ranked candidate in the same cycle, evicts it,
+// and counts that one eviction only.
+func TestEvictionSkipsACandidateItCannotStop(t *testing.T) {
+	h := newEvictionHarness(t)
+	hog := evPod("hog", nil, "", "")
+	next := evPod("next", nil, "", "")
+	h.add(hog, "2Gi")
+	h.add(next, "1Gi")
+	tr := h.r.trackByID(string(hog.UID))
+	if tr == nil {
+		t.Fatal("setup: the hog is not tracked")
+	}
+	h.m.target = &stopRacingTarget{r: h.r, onListed: func() {
+		if !tr.markStopping(nil) {
+			t.Error("setup: the competing stop could not take the stopping mark")
+		}
+	}}
+
+	h.step(compressorAt(85))
+
+	if got := h.deleteIDs(); !slices.Equal(got, []string{string(next.UID)}) {
+		t.Errorf("DeletePod ids = %v, want only the next-ranked pod %q", got, next.UID)
+	}
+	if n := evictionsTotal(h.m, signalCompressor); n != 1 {
+		t.Errorf("evictions_total = %d, want 1: only the issued eviction counts", n)
+	}
+	if n := len(h.m.evictedAt); n != 1 {
+		t.Errorf("cascade window entries = %d, want 1", n)
+	}
+	if !h.m.awaiting {
+		t.Error("the manager is not awaiting pressure relief after the eviction it issued")
+	}
+	if n := countPrefix(h.events(), "Warning "+reasonEvicted); n != 1 {
+		t.Errorf("Evicted Events = %d, want 1", n)
+	}
+	if !tr.isStopping() || tr.evictedStatus() != nil {
+		t.Errorf("the competing stop's mark was disturbed: stopping=%v evicted=%v", tr.isStopping(), tr.evictedStatus() != nil)
+	}
+}
+
+// TestEvictionCandidatesExcludeARejectedTrack pins that a track rejected at
+// admission is never an eviction candidate, even if its evicted status were
+// absent: beginStopLocked refuses every rejected track, so listing one would
+// rank a pod the manager can never stop.
+func TestEvictionCandidatesExcludeARejectedTrack(t *testing.T) {
+	h := newEvictionHarness(t)
+	pod := evPod("refused", nil, "", "")
+	h.add(pod, "2Gi")
+	tr := h.r.trackByID(string(pod.UID))
+	if tr == nil {
+		t.Fatal("setup: the pod is not tracked")
+	}
+	tr.restartMu.Lock()
+	tr.rejected = true
+	tr.restartMu.Unlock()
+
+	if c := h.r.evictionCandidates(context.Background()); len(c) != 0 {
+		t.Errorf("candidates = %v, want none: a rejected track cannot be stopped", names(c))
+	}
+}

@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -143,7 +144,8 @@ type evictionTarget interface {
 // errEvictionNotIssued reports an eviction that issued no kill: the pod was
 // already stopping (another node-side stop, such as an active deadline's, took
 // it after the candidates were listed) or already terminal. Nothing was evicted
-// this cycle, so the manager counts nothing and waits for nothing.
+// by that attempt, so the manager counts nothing, waits for nothing, and tries
+// the next-ranked candidate in the same cycle.
 var errEvictionNotIssued = errors.New("eviction not issued: the pod is already stopping or terminal")
 
 // admissionSourceSetter is the runtime surface admission is wired through: the
@@ -309,33 +311,45 @@ func (m *evictionManager) cycle(ctx context.Context) {
 	statsCtx, cancel := context.WithTimeout(ctx, evictionStatsTimeout)
 	cands := m.target.evictionCandidates(statsCtx)
 	cancel()
-	victim, ok := m.pickVictim(cands)
-	if !ok {
-		if !m.noneLogged {
-			m.noneLogged = true
-			m.log.Warn("eviction manager: memory threshold met but no pod is eligible for eviction",
-				"signal", string(v.signal), "reading", v.reading, "candidates", len(cands))
-		}
-		return
-	}
-
-	notice := evictionNotice{signal: v.signal, message: evictionMessage(victim, v)}
-	m.log.Warn("eviction manager: evicting pod",
-		"pod", victim.pod.Namespace+"/"+victim.pod.Name, "uid", string(victim.pod.UID),
-		"signal", string(v.signal), "reading", v.reading,
-		"usage_bytes", victim.usage, "has_stats", victim.hasStats,
-		"sample_age_seconds", int64(m.monitor.sampleAge()/time.Second))
-	// Only a SUCCESSFUL eviction counts: toward evictions_total, and toward the
-	// cascade cap. A failed one was rolled back by the runtime (the pod is still
-	// running and still a candidate), so the next cycle simply tries again.
-	// An eviction that lost the pod to another stop issued no kill: nothing was
-	// evicted this cycle, so it is not counted and opens no relief wait; the
-	// next cycle re-lists the candidates, which no longer include the pod.
-	if err := m.target.evictPod(ctx, victim.pod, notice); err != nil {
-		if errors.Is(err, errEvictionNotIssued) {
-			m.log.Debug("eviction manager: the pod is already stopping or terminal; nothing evicted this cycle",
-				"pod", victim.pod.Namespace+"/"+victim.pod.Name, "uid", string(victim.pod.UID))
+	// A candidate whose eviction issued no kill (another stop already owns it)
+	// is dropped and the next-ranked one is tried in the same cycle, so a pod
+	// the manager cannot stop never shields the rest. The loop is bounded by
+	// the candidate list, and the cycle still ends at its first issued
+	// eviction, successful or failed.
+	var victim evictionCandidate
+	for {
+		var ok bool
+		victim, ok = m.pickVictim(cands)
+		if !ok {
+			if !m.noneLogged {
+				m.noneLogged = true
+				m.log.Warn("eviction manager: memory threshold met but no pod is eligible for eviction",
+					"signal", string(v.signal), "reading", v.reading, "candidates", len(cands))
+			}
 			return
+		}
+
+		notice := evictionNotice{signal: v.signal, message: evictionMessage(victim, v)}
+		m.log.Warn("eviction manager: evicting pod",
+			"pod", victim.pod.Namespace+"/"+victim.pod.Name, "uid", string(victim.pod.UID),
+			"signal", string(v.signal), "reading", v.reading,
+			"usage_bytes", victim.usage, "has_stats", victim.hasStats,
+			"sample_age_seconds", int64(m.monitor.sampleAge()/time.Second))
+		// Only a SUCCESSFUL eviction counts: toward evictions_total, and toward the
+		// cascade cap. A failed one was rolled back by the runtime (the pod is still
+		// running and still a candidate), so the next cycle simply tries again.
+		// An eviction that lost the pod to another stop issued no kill: it is not
+		// counted and opens no relief wait; the Info line explains the Warn above
+		// at the default level, and the manager moves on to the next candidate.
+		err := m.target.evictPod(ctx, victim.pod, notice)
+		if err == nil {
+			break
+		}
+		if errors.Is(err, errEvictionNotIssued) {
+			m.log.Info("eviction manager: another stop already owns the pod; nothing evicted, trying the next candidate",
+				"pod", victim.pod.Namespace+"/"+victim.pod.Name, "uid", string(victim.pod.UID))
+			cands = slices.DeleteFunc(cands, func(c evictionCandidate) bool { return c.pod.UID == victim.pod.UID })
+			continue
 		}
 		m.log.Error("eviction manager: evicting the pod failed; it stays a candidate",
 			"pod", victim.pod.Namespace+"/"+victim.pod.Name, "err", err)

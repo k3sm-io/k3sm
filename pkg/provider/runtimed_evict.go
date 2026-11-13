@@ -210,8 +210,11 @@ func isEvictedPod(pod *corev1.Pod) bool {
 
 // evictionCandidates implements evictionTarget: every tracked pod the runtime
 // reports as still active (not Succeeded or Failed, not unknown to the runtime),
-// minus pods already evicted, being stopped (a deadline's or an eviction's stop
-// in flight) or being deleted, each with its memory stats.
+// minus pods rejected at admission, already evicted, being stopped (a
+// deadline's or an eviction's stop in flight) or being deleted, each with its
+// memory stats. A rejected track is excluded on its own mark, not only through
+// its evicted status, because beginStopLocked refuses every rejected track: one
+// listed would be ranked, refused, and ranked again every cycle.
 //
 // Stats come from ONE ListPodStats under ctx, whose deadline the manager keeps
 // shorter than the fast sampling tick. A pod absent from the answer, or every
@@ -238,7 +241,7 @@ func (r *runtimedRuntime) evictionCandidates(ctx context.Context) []evictionCand
 	// no stats, first.
 	probeFailed := map[types.UID]bool{}
 	for _, tr := range all {
-		if tr.t.stopFenced() || trackDeleting(tr.t) {
+		if tr.t.rejected || tr.t.stopFenced() || trackDeleting(tr.t) {
 			continue
 		}
 		resp, err := r.rt.GetPodStatus(ctx, &runtimev1.GetPodStatusRequest{PodId: tr.id})
