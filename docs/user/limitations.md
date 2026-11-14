@@ -139,15 +139,31 @@ the same user with no PID namespace, and the other surfaces that user can reach 
 way (see "No Per-Pod uid Isolation" above). Untrusted work belongs on the **`vm` RuntimeClass** (see
 [`vm` RuntimeClass](vm-runtimeclass.md)).
 
-### Signing Names Files by Relative Path, and SwiftPM Cannot Finish
+### SwiftPM Builds With the Native Build System Only
 
 A Pod compiles. `clang` and `swiftc` build C, Objective-C and Swift against an installed SDK into the
-Pod's own data volume, and the binary they produce runs. Ad-hoc signing works as well. `codesign -s -`
-succeeds when the file is named by a **relative** path.
+Pod's own data volume, and the binary they produce runs. Ad-hoc signing works as well:
+`codesign -f -s -` succeeds on a file named by a relative or an absolute path.
 
-Naming that same file by an **absolute** path is refused with `Operation not permitted`. That is what
-stops SwiftPM. `swift build` re-signs its product by absolute path as its final step, so the build
-does not complete inside a Pod even though every compile and link before it succeeded.
+`swift build` completes in a Pod with two flags:
+
+```sh
+swift build --disable-sandbox --build-system native
+```
+
+- `--disable-sandbox` is required. SwiftPM runs its compiler and its manifest under a Seatbelt
+  profile of its own, and macOS refuses a nested sandbox inside the Pod's.
+- `--build-system native` is required. The default build system (Swift Build) resolves its temporary
+  directory through `confstr(_CS_DARWIN_USER_TEMP_DIR)`, which ignores `TMPDIR` and names a
+  directory under `/var/folders` that the profile does not grant. It stops with
+  `couldNotFindTmpDir`. That directory belongs to the `_k3sm` user, so every Pod on the node would
+  share it, and k3sm does not grant it.
+
+k3sm gives every container containerd's default `PATH`
+(`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`) when neither the image nor the Pod
+spec sets one. On an earlier k3sm a native container started with no `PATH`, and `swift build`
+failed at its last step with `unable to spawn process 'codesign'`. On such a node, set `PATH` in the
+container's `env`.
 
 One message on the way is not a failure, and it is worth recognising. Apple's toolchain resolves its
 `xcrun` lookup cache through `confstr(_CS_DARWIN_USER_TEMP_DIR)`, which **ignores `TMPDIR`** and names
