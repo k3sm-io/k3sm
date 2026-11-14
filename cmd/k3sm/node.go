@@ -51,6 +51,7 @@ import (
 	"k3sm.io/darwin-net/pkg/dns"
 	"k3sm.io/darwin-net/pkg/netd"
 	"k3sm.io/darwin-net/pkg/podnet"
+	"k3sm.io/runtimed/pkg/hostshare"
 	"k3sm.io/runtimed/pkg/image"
 
 	"k3sm.io/k3sm/pkg/bootstrap"
@@ -1888,9 +1889,12 @@ func runtimedConfig(opts nodeOptions, cs kubernetes.Interface) provider.Runtimed
 		PathShim: firstNonEmpty(opts.pathShim, resolvePathShim()),
 		// The shadow binary set `sudo k3sm install` makes beside the binary; a
 		// dev or from-source run has none and keeps the host binaries.
-		ShadowBinDir:  resolveShadowDir(),
-		ResolverVIP:   resolverVIP,
-		ClusterDomain: clusterDomain,
+		ShadowBinDir: resolveShadowDir(),
+		// The node admin's host-share allowlist (sudo k3sm share); a missing
+		// file shares nothing.
+		HostSharesFile: hostshare.DefaultFile,
+		ResolverVIP:    resolverVIP,
+		ClusterDomain:  clusterDomain,
 		// The container-log tree and its rotation policy — the kubelet's own
 		// defaults unless the operator said otherwise.
 		PodLogsDir:                  opts.logs.dir,

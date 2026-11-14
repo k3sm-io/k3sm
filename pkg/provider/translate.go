@@ -1200,9 +1200,10 @@ func toVolumes(pod *corev1.Pod, clusterRegistry string) ([]*runtimev1.Volume, er
 		return nil, nil
 	}
 	mounted := mountedVolumes(pod)
+	native := pod.Spec.RuntimeClassName == nil || *pod.Spec.RuntimeClassName == ""
 	out := make([]*runtimev1.Volume, 0, len(vols))
 	for i := range vols {
-		v, err := toVolume(&vols[i], mounted[vols[i].Name], clusterRegistry)
+		v, err := toVolume(&vols[i], mounted[vols[i].Name], native, clusterRegistry)
 		if err != nil {
 			return nil, err
 		}
@@ -1219,7 +1220,9 @@ func toVolumes(pod *corev1.Pod, clusterRegistry string) ([]*runtimev1.Volume, er
 // An image volume is mapped only when mounted. Unmounted, it is skipped rather
 // than fetched or refused: a pod that runs today with one it never uses must
 // not be refused, nor torn down by a startup re-attach, and nothing reads it.
-func toVolume(v *corev1.Volume, mounted bool, clusterRegistry string) (*runtimev1.Volume, error) {
+//
+// A mounted hostPath on a native pod is carried as shape; authorizeHostShares decides it.
+func toVolume(v *corev1.Volume, mounted, native bool, clusterRegistry string) (*runtimev1.Volume, error) {
 	rv := &runtimev1.Volume{Name: v.Name}
 	switch {
 	case v.ConfigMap != nil:
@@ -1239,6 +1242,8 @@ func toVolume(v *corev1.Volume, mounted bool, clusterRegistry string) (*runtimev
 			return nil, err
 		}
 		rv.Image = toImageVolumeSource(v.Image)
+	case v.HostPath != nil && mounted && native:
+		rv.HostPath = toHostPathSource(v.HostPath)
 	case mounted:
 		return nil, unmodeledVolume(v)
 	default:

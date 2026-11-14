@@ -276,7 +276,8 @@ root-tier run. Rootless stops at mount resolution.
 
 ### Unsupported Volume Kinds Are Refused When Mounted
 
-`hostPath` is **not modeled on any runtime path**, native or `vm`. Neither are `nfs`, `csi`, generic
+`hostPath` is **not modeled on the `vm` path**, and on the native path only for a host share the
+node admin listed (see [Host Shares](storage.md#host-shares-for-native-pods)). Neither are `nfs`, `csi`, generic
 `ephemeral` volumes, `gitRepo` or the other in-tree network and cloud-disk kinds. A native Pod is a
 Darwin process with no mount namespace, so k3sm has nothing to bind such a volume into. Admission
 does not stop these Pods: k3sm ships PodSecurity `enforce = privileged`, so a `hostPath` Pod is
@@ -288,7 +289,9 @@ the volume.
 - If nothing mounts it, the volume is ignored and the Pod runs as if it were not declared. No Event
   reports it, because nothing in the Pod can reach the volume.
 
-Use a PVC instead of a `hostPath`.
+Use a PVC instead of a `hostPath`, or, for a native Pod that has to work on a host directory in
+place, ask the node admin for a host share. A native Pod that mounts a `hostPath` the node does not
+share is refused at creation with a Warning Event whose reason is `FailedHostShare`.
 
 An `image` volume is supported, and its reference must name the cluster registry
 (`registry-k3sm:6450/<repository>`). A mounted `image` volume that names any other registry is
