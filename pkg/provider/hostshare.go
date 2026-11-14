@@ -107,7 +107,8 @@ func msgFailedHostShare(volume string, err error) string {
 		}
 	}
 	return fmt.Sprintf("Error: hostPath volume %q is not shared with this pod: %s. A native pod can mount only "+
-		"a host path the node admin listed (sudo k3sm share add), at that same path, with no subPath.", volume, why)
+		"a host path the node shares (sudo k3sm share add, or k3sm share add by a user the node admin delegated a prefix to), "+
+		"at that same path, with no subPath.", volume, why)
 }
 
 func boxMountsHostPath(box *runtimev1.PodBox) bool {
