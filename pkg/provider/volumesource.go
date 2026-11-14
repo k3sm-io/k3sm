@@ -157,8 +157,11 @@ func (r *runtimedRuntime) recordVolumeRefusal(pod *corev1.Pod, err error) {
 		return
 	}
 	msg := msgFailedVolumeSource(vr.volume, vr.kind)
-	if vr.reason == reasonArtifactPullRefused {
+	switch vr.reason {
+	case reasonArtifactPullRefused:
 		msg = msgArtifactPullRefused(vr.volume, r.clusterRegistry)
+	case reasonFailedHostShare:
+		msg = msgFailedHostShare(vr.volume, vr.err)
 	}
 	r.recorder.Event(pod, corev1.EventTypeWarning, vr.reason, msg)
 }
