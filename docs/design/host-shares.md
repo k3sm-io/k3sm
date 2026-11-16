@@ -170,6 +170,65 @@ a read-write share would carry the entry to its target. `remove` and `undelegate
 search entries no remaining share needs. A stale entry reaches nothing a Pod's profile does not
 grant.
 
+## Exposures
+
+An exposure is the reverse of a share: a native Pod publishes one of its volumes to one host
+account. An add-on whose Mac-side tool reads a socket or files a Pod writes needs it, and without a
+supported mechanism each add-on would find its own way around the data root's modes.
+
+### Pod spec
+
+An inline CSI ephemeral volume with the reserved driver `expose.k3sm.io`, attributes `user`
+(required) and `access` (`read` or `read-write`, default `read`). The provider maps it to the
+runtime's `Volume.expose` (`user`, `uid`, `read_write`); no CSI driver process exists. The volume
+is self-describing in one place, the API server already accepts the shape (no admission change, and
+Pod Security `restricted` allows inline CSI), and tooling that inspects volumes sees it. Unknown
+attributes, `fsType`, `readOnly: true`, `nodePublishSecretRef`, a `subPath` or `readOnly` mount, and
+any non-native RuntimeClass are refused. Every other CSI driver stays an unmodeled source.
+
+### Grant
+
+The node file gains one line type, written only by `sudo k3sm expose allow|revoke`:
+
+```
+expose uid=<uid> user=<name> namespaces=<ns>[,<ns>...] access=read|read-write
+```
+
+It is the same file, parser and root-owned, no-symlink, no-group-write checks as the shares. At
+every create the provider (to refuse early with a `FailedExposure` Event) and the runtime (the
+enforcement point, before any container starts) resolve the account, and require a grant whose uid
+and name both match the account now, whose namespaces contain the Pod's, and whose access is at
+least the volume's. A system uid is never a valid grant. An admitted volume is recorded with an
+`ExposureGranted` Event naming the host path.
+
+### Host path and permissions
+
+`<data root>/expose/<namespace>/<pod>/<volume>`. `expose/` is a state-tree row, the service user's,
+group wheel, 0711, created by the installer and re-aligned by netd at start. 0711 lets the runtime
+create below it without root and lets a login user traverse to a name it knows without listing the
+tree. The data root is used rather than `/var/run`, which is emptied at boot and not writable by the
+service user. The leaf is 0700 and lives for the Pod's lifetime.
+
+Access is an ACL, not ownership: ownership by the account would take the Pod's write away or need a
+group, and a group is what closed the data root to login users. The runtime, as the leaf's owner,
+sets through a seam the node wires to `internal/hostacl` an inheritable allow entry for the uid
+(read: list, search, read; read-write: also add, delete and write), and for read-write the same
+entry for the service user. A runtime with no seam refuses every exposure. `revoke` removes the
+grant and then the uid's entries on each live leaf of the affected namespaces, opened with
+`O_NOFOLLOW` and never descending below it.
+
+### Residual risks
+
+- An account with a read-write exposure can create files in it, so the hard-link residuals of a
+  read-write share apply to that leaf.
+- Exposure files are the service user's under 0711 parents: a user who knows a name and has a
+  read-write share could hard-link a file the ACL lets them read into that share, and a Pod mounting
+  the share could then rewrite it.
+- A Pod reaches the leaf through the path rebase; a program that resolves its mount path sees the
+  host path.
+- A running Pod keeps its leaf after a revoke until it is recreated; the account loses its entry at
+  once.
+
 ## Residual risks
 
 - A Pod that is running keeps a share after it is removed, until the Pod is recreated.

@@ -238,6 +238,82 @@ case-sensitive volume is refused, because the sandbox matches paths without rega
 `k3sm share` takes ASCII paths only and refuses a system, k3sm or home path in any letter case,
 because APFS and the sandbox both compare paths without regard to case.
 
+## Exposing a Pod Volume to a Host User
+
+A host share lets a Pod reach a host directory. An exposure is the other direction: a native Pod
+publishes one of its volumes to one named account on the Mac, so a tool you run there can read (or
+read and write) what the Pod writes, such as a Unix socket or a status file. The node admin decides
+which accounts may receive exposures from which namespaces; a Pod spec cannot.
+
+A Pod asks for it with an inline CSI volume whose driver is `expose.k3sm.io`. k3sm handles that
+driver itself, so no CSI driver or `CSIDriver` object is installed for it:
+
+```yaml
+spec:
+  volumes:
+    - name: sockets
+      csi:
+        driver: expose.k3sm.io
+        volumeAttributes:
+          user: you        # required: the host account that receives it
+          access: read     # optional: read (the default) or read-write
+  containers:
+    - name: app
+      image: native
+      volumeMounts:
+        - name: sockets
+          mountPath: /var/run/app
+```
+
+The node refuses the Pod, with a Warning Event whose reason is `FailedExposure`, when the volume is
+not on a native Pod, names an account the node does not have, sets an attribute other than `user`
+and `access`, sets `fsType`, `readOnly: true` or `nodePublishSecretRef`, is mounted with a `subPath`
+or `readOnly`, or no grant admits it. Any other CSI driver is refused as before.
+
+The node admin grants it once, as root:
+
+```sh
+sudo k3sm expose allow --user you --namespace apps            # read
+sudo k3sm expose allow --user you --namespace apps,tools --access read-write
+k3sm expose list
+sudo k3sm expose revoke --user you --namespace tools          # one namespace
+sudo k3sm expose revoke --user you                            # the whole grant
+```
+
+The grant is a line in the root-owned `/Library/k3sm.host-shares`, beside the shares. It names the
+account by uid and by its current name, so a renamed or recycled uid gets nothing; the namespaces
+whose Pods may expose to it; and the highest access it may get. `allow` adds namespaces to the
+account's grant and, with `--access`, sets its access (a new grant is `read`). System accounts are
+refused. The node checks the grant every time a Pod is created, in the node daemon and again in the
+runtime. An admitted volume is recorded with a Normal `ExposureGranted` Event naming the account,
+the access and the host path.
+
+**Where it is.** The volume lives on the host at
+`/var/lib/k3sm/expose/<namespace>/<pod>/<volume>` for the Pod's lifetime: created empty when the Pod
+is created and removed when it is deleted, like an `emptyDir`. The Pod reaches it at its
+`mountPath`. The `expose` directory and the namespace and Pod directories below it can be passed
+through but not listed, so the account reaches the path it is told and cannot see who else exposes
+what.
+
+**Read or read-write.** The account gets an inheritable access-control entry on the volume
+directory, so what the Pod creates later carries it too. `read` lets it list and read; `read-write`
+also lets it create, change and delete, and gives `_k3sm` the same entry so the Pod keeps access to
+what the account creates. Connecting to a Unix socket needs write permission on the socket itself,
+so a `read` exposure reaches a socket the Pod creates with mode 0666, and a socket with mode 0600
+needs `read-write`.
+
+**Revoke.** `revoke` removes the grant, then strips the account's entries from every live exposure
+in the affected namespaces. It never follows a symlink and never goes below the volume directory,
+which is 0700, so without its entry the account reaches nothing under it. A failure there is an
+error, not a warning. A Pod that is running keeps its directory until it is recreated, and a Pod
+created after the revoke is refused.
+
+**What remains.** An account with a `read-write` exposure can create files in it, so the hard-link
+risks of a read-write share apply there too. Files in an exposure are owned by `_k3sm`; a user who
+knows their path and has a read-write share could hard-link one the account can read into that
+share, and a Pod that mounts the share could then rewrite it. A program in the Pod that resolves the
+real path of its mount sees the host path.
+
 ## What Is Not Supported (Yet)
 
 - **Volume resize, snapshots, and generic ephemeral volumes** are **planned**, not present. See
