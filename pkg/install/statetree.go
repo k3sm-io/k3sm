@@ -43,6 +43,18 @@ import (
 //	/var/lib/k3sm/<tree>   service user     (every tree an unprivileged daemon writes)
 //	/var/lib/k3sm/runtimed.lock service user 0600 (the embedded runtime's root lock)
 //
+// Every service-user tree is closed to every other account except the two
+// named exceptions, status (StatusDirMode, world-readable records by contract)
+// and the artifact views root (ArtifactViewsMode, the runtime requires 0711).
+// Every reader of the others is the owner uid: the daemons and every native pod
+// run as the service user, and root bypasses modes. The group bit is not an
+// access path and must not become one. The service user's primary group is
+// staff, which every login user shares, and link(2) needs only search on the
+// source's directories: a group-search bit on, say, the image store would let
+// any login user hard-link a blob or a PersistentVolume file into a read-write
+// host share (docs/user/storage.md), where a pod, running as the owner, could
+// then rewrite the node's copy.
+//
 // The lock file is the one entry directly in the root that is not a directory:
 // the runtime opens <root>/runtimed.RootLockName O_CREAT as the service user,
 // which the root-owned root does not allow, so the installer creates it and
@@ -66,16 +78,28 @@ const (
 	StateRootGID  int         = 0
 )
 
-// ServiceTreeMode and ServiceTreeGID are the default ownership of a
-// service-user tree directly under the data root: group staff (the service
-// user's primary group), 0750. A tree whose owning code already decided a
-// tighter mode (the run dir, the two work dirs, the daemon-private stores)
-// carries that mode in the table instead.
+// ServiceTreeMode is the default mode of a service-user tree directly under the
+// data root (the pod and PersistentVolume parents, the image store and the
+// guest-artifact cache): 0700, the owner's alone. Every reader of these trees
+// is the owner uid (the daemons and every native pod run as the service user;
+// root bypasses modes), so no group or other bit is needed, and a group-search
+// bit must not be granted: it would let any staff member hard-link the node's
+// files into a host share (docs/user/storage.md), where a pod, running as the
+// owner, rewrites them. A tree whose owning code names its own mode (the run
+// dir, the work dirs, the daemon-private stores, and the two exceptions open to
+// other accounts, the status dir and the artifact views root) carries that
+// constant in the table instead.
+//
+// ServiceTreeGID is the group the service-user trees and files are created
+// with: staff, the service user's primary group. It is NOT an access control:
+// staff is every login user's group too, which is exactly why no service-user
+// row grants a group bit (TestServiceGroupIsNotAnAccessPath). It stays staff
+// only so a file keeps the group the service user would give it anyway.
 //
 // They are NOT the data root's ownership, which is StateRootMode/StateRootGID:
 // the root is root's, and only the trees under it are the service user's.
 const (
-	ServiceTreeMode fs.FileMode = 0o750
+	ServiceTreeMode fs.FileMode = 0o700
 	ServiceTreeGID  int         = 20
 )
 
@@ -222,6 +246,8 @@ const (
 	// StateLibrary is the service user's home-Library (<home>/Library): the
 	// data root is _k3sm's home, and macOS writes per-user state there.
 	StateLibrary StateLevel = "Library"
+	// StateKube is the service user's ~/.kube (KubeSubdir).
+	StateKube StateLevel = KubeSubdir
 	// StateStatus is the service user's world-readable status directory
 	// (StatusSubdir).
 	StateStatus StateLevel = StatusSubdir
@@ -230,6 +256,17 @@ const (
 	// before handing it to the root helper (pkg/update.Watcher).
 	StateUpdates StateLevel = UpdatesSubdir
 )
+
+// KubeSubdir is the service user's ~/.kube under the data root. The data root is
+// the service user's HOME (daemonEnv), so a kubectl-style client run as that
+// user writes ~/.kube/config (and a cache) here; left to the client, the
+// directory lands 0755. It is the owner's alone (KubeDirMode), like every other
+// service-user tree, so no other account can read a credential in it or link
+// to anything under it.
+const KubeSubdir = ".kube"
+
+// KubeDirMode is the service user's ~/.kube mode: the owner's alone.
+const KubeDirMode fs.FileMode = 0o700
 
 // UpdatesSubdir is the data-root subdirectory of the managed update
 // (StateUpdates).
@@ -277,6 +314,9 @@ var stateTree = func() []stateLevel {
 		// the first time a framework running as that user asks for it; the
 		// home-Library convention is the user's own 0700.
 		{StateLibrary, svc(LibraryMode)},
+		// The service user's ~/.kube: HOME is the data root, so a client run
+		// as that user writes its kubeconfig here (KubeSubdir).
+		{StateKube, svc(KubeDirMode)},
 		// The records the server publishes for `k3sm status`, readable by any
 		// account (StatusSubdir).
 		{StateStatus, svc(StatusDirMode)},
@@ -284,7 +324,9 @@ var stateTree = func() []stateLevel {
 		{StateUpdates, svc(UpdatesDirMode)},
 		{StateLevel(sandbox.ServerSubdir), svc(ServerTokenDirMode)},
 		{StateLevel(agentWorkSubdir), svc(AgentTokenDirMode)},
-		// The per-pod rootfs parent and the PersistentVolume parent.
+		// The per-pod rootfs parent and the PersistentVolume parent. These and
+		// the four image and artifact trees below are the owner's alone
+		// (ServiceTreeMode): no login user may search them.
 		{StateLevel(podsSubdir), svc(ServiceTreeMode)},
 		{StateLevel(storageSubdir), svc(ServiceTreeMode)},
 		// The image store and the guest-artifact cache.

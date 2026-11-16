@@ -59,6 +59,13 @@ and one residual limitation remains (no per-pod uid isolation).
   on both roles (see [Upgrade](upgrade.md#on-each-node)).
 - An empty auto-deploy manifest directory, **`/var/lib/k3sm/manifests`**, owned by `root:wheel`,
   mode `0755` (see below).
+- The directories the daemons write under `/var/lib/k3sm` (`pods`, `storage`, the image store in
+  `blobs`, `unpacked` and `snapshots`, `guest-artifacts`, and the service account's own `.kube`),
+  owned by `_k3sm`, mode `0700`. The group is `staff`, but it grants nothing: every ordinary
+  account is in `staff`, and a directory it could search is one whose files it could hard-link
+  elsewhere. Only `status` (`0755`, records any account may read) and the runtime's `artifacts`
+  views root (`0711`) are open to other accounts. Installing over an older release, or restarting
+  the netd helper, tightens directories an older release left at `0750`.
 
 ## Auto-Deploy Manifests
 
