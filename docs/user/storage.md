@@ -123,12 +123,205 @@ rather than a bind mount. Its data is durable across the Pod's lifetime: files w
 on the host under the claim's directory, owned by the `_k3sm` service user. See
 [`vm` RuntimeClass](vm-runtimeclass.md) for the ownership ceilings that follow from that.
 
+## Host Shares for Native Pods
+
+A native Pod is a macOS process with no mount namespace, so k3sm cannot bind a host directory to a
+new path inside it. What it can do is let the Pod reach a host directory **at that directory's own
+path**. The node admin decides which paths; a Pod spec cannot. The list is a root-owned file,
+`/Library/k3sm.host-shares`, kept with `k3sm share`:
+
+```sh
+sudo k3sm share add /Users/you/Code/app              # read-write directory
+sudo k3sm share add --read-only /Volumes/datasets    # read-only directory
+sudo k3sm share add --socket /Users/you/run/app.sock # one Unix socket, connect only
+sudo k3sm share remove /Users/you/Code/app
+k3sm share list
+```
+
+A share covers everything below the path. When one share sits inside another, the more specific
+one decides, so `--read-only` on a subdirectory of a read-write share keeps that subdirectory
+read-only. k3sm refuses system and k3sm trees, `/Users` itself, a
+whole home directory, a dot directory and a home's `Library`. Under `/Users` a share names a project
+below a home, never the home.
+
+### Delegating a Prefix So Later Shares Need No sudo
+
+The node admin can delegate a directory to one user, once. After that, the user adds and removes
+shares under it as themselves:
+
+```sh
+sudo k3sm share delegate --user you /Users/you/Code   # once, by the node admin
+k3sm share add /Users/you/Code/app                     # later, as you, no sudo
+k3sm share add --socket /Users/you/Code/run/q.sock
+k3sm share remove /Users/you/Code/app
+sudo k3sm share undelegate --user you                  # take it back
+```
+
+The delegation is a line in the root-owned `/Library/k3sm.host-shares`. The shares a user adds live
+in a file the user owns, `/Library/k3sm.host-shares.d/<uid>/host-shares`, in a directory the
+delegation creates for them. That file is not trusted. Every time a Pod is created, the node checks
+each of its lines against the delegation again, and admits a line only when all of these hold:
+
+- the path is the delegated directory or under it, in any letter case;
+- no part of the path is a symlink;
+- the delegated directory, and every directory from it down to the path, is owned by the delegated
+  user, and the path's first part names the same directory the admin delegated;
+- the path passes the same rules as any share (no system or k3sm tree, no dot directory or `Library`
+  under a home, ASCII only).
+
+A line that fails is not admitted, and `k3sm share list` shows it under "not admitted" with the
+reason. Editing the file by hand therefore admits nothing `k3sm share add` would refuse.
+
+A Pod mounts a share with a `hostPath` volume whose `mountPath` equals `hostPath.path`, with no
+`subPath`, and with `readOnly: true` when the share is read-only:
+
+```yaml
+spec:
+  volumes:
+    - name: app
+      hostPath:
+        path: /Users/you/Code/app
+        type: Directory
+  containers:
+    - name: work
+      image: native
+      command: ["/bin/sh", "-c", "cd /Users/you/Code/app && make"]
+      volumeMounts:
+        - name: app
+          mountPath: /Users/you/Code/app
+```
+
+The node decides the volume twice, in the node daemon before the Pod is created and in the runtime
+when it writes the Pod's Seatbelt profile, both from the same file. A volume the list does not
+admit, or one mounted at another path, refuses the Pod with a Warning Event whose reason is
+`FailedHostShare`. Each admitted volume is recorded with a Normal `HostShareGranted` Event on the Pod
+and a `host share granted` line in the node log.
+
+The list is read when a Pod is created. A Pod that is running keeps what it was given until it is
+recreated, and a Pod the node re-attaches after a restart gets only what the list holds then.
+
+**Who owns the files.** Pods run as the `_k3sm` user, not as you, and k3sm cannot map them to your
+user. The Seatbelt grant does not change file permissions, so `k3sm share add` also sets them, and
+prints exactly what it changed:
+
+- read-write: an inheritable access-control entry for `_k3sm` on the directory and on every
+  directory and file under it that you own, and the same entry for you, so you keep full access to
+  what a Pod creates;
+- read-only: a read entry for `_k3sm`;
+- socket: a connect entry for `_k3sm` on the socket;
+- search for `_k3sm` on each parent directory you own that `_k3sm` cannot already pass through.
+
+It never follows a symlink, and it leaves alone a file with more than one hard link and anything
+you do not own. (`chmod -R +a` is not a safe way to do this by hand: it follows symlinks inside the
+tree and puts the entry on their targets.) `k3sm share remove` takes the `_k3sm` entries back,
+unless another share still covers the path; your own entries stay. `--no-acl` leaves permissions
+alone. Files a Pod creates are owned by `_k3sm`. Git refuses a repository owned by another user, so
+a Pod that runs git in a share sets `safe.directory` for it, for example with the environment
+variables `GIT_CONFIG_COUNT=1`, `GIT_CONFIG_KEY_0=safe.directory` and `GIT_CONFIG_VALUE_0=<path>`.
+
+**What a share is.** Every native Pod on a node runs as the same user, so a share is reachable by
+every Pod that mounts it, and by nothing else. Share only what you would let any workload you
+schedule on this node read and, for a read-write share, change. `vm` Pods cannot mount host shares.
+
+A read-write share of a repository lets a Pod change what you later run there yourself: git hooks
+under `.git/hooks`, a `.envrc`, editor task files, build scripts. Treat a Pod with a read-write
+share as able to run code as you the next time you work in that tree. A delegation does not change
+this: it lets you, rather than the node admin, decide which of your trees every Pod on the node can
+reach. A hard link inside a share reaches its file wherever that file lives. A Pod cannot make one
+to a file outside its shares, but you can, to any file in a directory you can search. The node's
+image store, Pod trees and volumes under `/var/lib/k3sm` are closed to every user but `_k3sm`, so
+they cannot be linked. The status records, the artifact views and the node logs (which admin users
+can read) can be, and a Pod could then rewrite the linked file, so delegate a prefix only to a user
+you trust not to do that. A share on a
+case-sensitive volume is refused, because the sandbox matches paths without regard to case.
+
+`k3sm share` takes ASCII paths only and refuses a system, k3sm or home path in any letter case,
+because APFS and the sandbox both compare paths without regard to case.
+
+## Exposing a Pod Volume to a Host User
+
+A host share lets a Pod reach a host directory. An exposure is the other direction: a native Pod
+publishes one of its volumes to one named account on the Mac, so a tool you run there can read (or
+read and write) what the Pod writes, such as a Unix socket or a status file. The node admin decides
+which accounts may receive exposures from which namespaces; a Pod spec cannot.
+
+A Pod asks for it with an inline CSI volume whose driver is `expose.k3sm.io`. k3sm handles that
+driver itself, so no CSI driver or `CSIDriver` object is installed for it:
+
+```yaml
+spec:
+  volumes:
+    - name: sockets
+      csi:
+        driver: expose.k3sm.io
+        volumeAttributes:
+          user: you        # required: the host account that receives it
+          access: read     # optional: read (the default) or read-write
+  containers:
+    - name: app
+      image: native
+      volumeMounts:
+        - name: sockets
+          mountPath: /var/run/app
+```
+
+The node refuses the Pod, with a Warning Event whose reason is `FailedExposure`, when the volume is
+not on a native Pod, names an account the node does not have, sets an attribute other than `user`
+and `access`, sets `fsType`, `readOnly: true` or `nodePublishSecretRef`, is mounted with a `subPath`
+or `readOnly`, or no grant admits it. Any other CSI driver is refused as before.
+
+The node admin grants it once, as root:
+
+```sh
+sudo k3sm expose allow --user you --namespace apps            # read
+sudo k3sm expose allow --user you --namespace apps,tools --access read-write
+k3sm expose list
+sudo k3sm expose revoke --user you --namespace tools          # one namespace
+sudo k3sm expose revoke --user you                            # the whole grant
+```
+
+The grant is a line in the root-owned `/Library/k3sm.host-shares`, beside the shares. It names the
+account by uid and by its current name, so a renamed or recycled uid gets nothing; the namespaces
+whose Pods may expose to it; and the highest access it may get. `allow` adds namespaces to the
+account's grant and, with `--access`, sets its access (a new grant is `read`). System accounts are
+refused. The node checks the grant every time a Pod is created, in the node daemon and again in the
+runtime. An admitted volume is recorded with a Normal `ExposureGranted` Event naming the account,
+the access and the host path.
+
+**Where it is.** The volume lives on the host at
+`/var/lib/k3sm/expose/<namespace>/<pod>/<volume>` for the Pod's lifetime: created empty when the Pod
+is created and removed when it is deleted, like an `emptyDir`. The Pod reaches it at its
+`mountPath`. The `expose` directory and the namespace and Pod directories below it can be passed
+through but not listed, so the account reaches the path it is told and cannot see who else exposes
+what.
+
+**Read or read-write.** The account gets an inheritable access-control entry on the volume
+directory, so what the Pod creates later carries it too. `read` lets it list and read; `read-write`
+also lets it create, change and delete, and gives `_k3sm` the same entry so the Pod keeps access to
+what the account creates. Connecting to a Unix socket needs write permission on the socket itself,
+so a `read` exposure reaches a socket the Pod creates with mode 0666, and a socket with mode 0600
+needs `read-write`.
+
+**Revoke.** `revoke` removes the grant, then strips the account's entries from every live exposure
+in the affected namespaces. It never follows a symlink and never goes below the volume directory,
+which is 0700, so without its entry the account reaches nothing under it. It tries every live
+exposure even when one fails, and any failure is an error, not a warning. Run the same `revoke`
+again to finish: with no grant left it still removes the account's remaining entries. A Pod that is running keeps its directory until it is recreated, and a Pod
+created after the revoke is refused.
+
+**What remains.** An account with a `read-write` exposure can create files in it, so the hard-link
+risks of a read-write share apply there too. Files in an exposure are owned by `_k3sm`; a user who
+knows their path and has a read-write share could hard-link one the account can read into that
+share, and a Pod that mounts the share could then rewrite it. A program in the Pod that resolves the
+real path of its mount sees the host path.
+
 ## What Is Not Supported (Yet)
 
 - **Volume resize, snapshots, and generic ephemeral volumes** are **planned**, not present. See
   [Limitations](limitations.md).
 - **`hostPath` bind mounts** and `terminationMessagePath` file mounts are a documented ceiling on the
-  native substrate (no Linux bind mounts). See [Limitations](limitations.md).
+  native substrate (no Linux bind mounts). A native Pod can reach a host directory only through a
+  host share, at its own path (above). See [Limitations](limitations.md).
 - Networked / distributed storage classes are out of scope for the local-path model.
 
 ## Next
