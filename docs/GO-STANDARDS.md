@@ -56,6 +56,10 @@ Targets **darwin/arm64, macOS 26+**. Go **1.26 or later** (each `go.mod` declare
   (golden files where useful).
 - `go test ./...` must pass, and `go test -race ./...` too; the `k3sm` gate runs `-race`. No network or real privilege in unit tests — fake at
   seams (interfaces). Integration/e2e tests are build-tagged and live separately.
+- Unit tests are hermetic. A test never times with the wall clock: it uses an injected clock (a
+  small `clock` interface at the consumer, per §Interfaces) or `testing/synctest`, whose bubble
+  makes `time.Sleep`, timers and `time.Now` virtual. Listeners bind `127.0.0.1:0` and read the port
+  back. No test depends on another test's side effects or on the order tests run in.
 - A root check in an integration-tagged test goes through `k3smtest.SkipUnless(t, k3smtest.Root)`
   (`k3sm.io/apis`), never a hand-rolled `os.Geteuid()` gate; `darwin-net`'s gate fails on a raw
   `Geteuid` there.
