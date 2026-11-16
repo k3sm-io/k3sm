@@ -214,8 +214,11 @@ group, and a group is what closed the data root to login users. The runtime, as 
 sets through a seam the node wires to `internal/hostacl` an inheritable allow entry for the uid
 (read: list, search, read; read-write: also add, delete and write), and for read-write the same
 entry for the service user. A runtime with no seam refuses every exposure. `revoke` removes the
-grant and then the uid's entries on each live leaf of the affected namespaces, opened with
-`O_NOFOLLOW` and never descending below it.
+grant and then the uid's entries on each live leaf of the affected namespaces and on everything below
+it the service user owns, inherited entries included, so a file the account hard-linked out before
+the revoke does not stay readable. The walk opens every component with `O_NOFOLLOW` and stays on the
+leaf's device. A refusal for an account that does not exist reads exactly like one for a missing
+grant, so a Pod author cannot probe which accounts the node has.
 
 ### Residual risks
 
@@ -228,6 +231,9 @@ grant and then the uid's entries on each live leaf of the affected namespaces, o
   host path.
 - A running Pod keeps its leaf after a revoke until it is recreated; the account loses its entry at
   once.
+- Lowering a grant from read-write to read (`expose allow --access read` over an existing grant)
+  applies to Pods created afterwards; a live read-write leaf keeps the account's write entry until
+  its Pod is recreated. `expose revoke` followed by `expose allow` cuts it at once.
 
 ## Residual risks
 

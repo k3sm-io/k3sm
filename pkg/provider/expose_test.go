@@ -207,7 +207,7 @@ func TestCreatePodExpose(t *testing.T) {
 	}{
 		{"no_grant_for_namespace", "other", exposeVolume("sockets", nil), loadGrants, "sudo k3sm expose allow --user miko --namespace other"},
 		{"read_write_over_read_grant", "apps", exposeVolume("sockets", func(c *corev1.CSIVolumeSource) { c.VolumeAttributes["access"] = "read-write" }), loadGrants, "allows read only"},
-		{"unknown_account", "apps", exposeVolume("sockets", func(c *corev1.CSIVolumeSource) { c.VolumeAttributes["user"] = "ghost" }), loadGrants, `host account "ghost" does not exist`},
+		{"unknown_account_reads_as_no_grant", "apps", exposeVolume("sockets", func(c *corev1.CSIVolumeSource) { c.VolumeAttributes["user"] = "ghost" }), loadGrants, "no exposure grant lets namespace apps expose to ghost"},
 		{"file_unreadable", "apps", exposeVolume("sockets", nil), func(string) ([]hostshare.ExposeGrant, error) {
 			return nil, &loadError{errors.New("/node/host-shares: not owned by root")}
 		}, "could not be read"},

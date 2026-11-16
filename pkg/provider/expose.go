@@ -152,7 +152,9 @@ func (r *runtimedRuntime) authorizeExposures(box *runtimev1.PodBox) error {
 		}
 		uid, err := lookup(x.GetUser())
 		if err != nil {
-			return exposeRefusal(v.GetName(), fmt.Errorf("%w: volume %q: host account %q does not exist on this node", hostshare.ErrNotExposed, v.GetName(), x.GetUser()))
+			// The same text as a missing grant: a pod author learns nothing
+			// about which accounts exist on the node.
+			return exposeRefusal(v.GetName(), fmt.Errorf("%w: volume %q: no exposure grant lets namespace %s expose to %s; the node admin adds one with `sudo k3sm expose allow --user %s --namespace %s`", hostshare.ErrNotExposed, v.GetName(), box.GetNamespace(), x.GetUser(), x.GetUser(), box.GetNamespace()))
 		}
 		x.Uid = uid
 	}
@@ -330,14 +332,16 @@ func (exposeACL) Grant(dir string, uid uint32, readWrite bool) error {
 	return err
 }
 
-// Revoke removes uid's allow entries from dir itself, never below it: dir is
-// 0700, so without its entry uid reaches nothing under it.
+// Revoke removes uid's allow entries from dir and from what this process
+// (the owner) owns below it, inherited entries included: a file the account
+// hard-linked out shares its inode, so the directory's own entry is not
+// enough. The walk is hostacl's no-follow, same-device, owner-only one.
 func (exposeACL) Revoke(dir string, uid uint32) error {
 	dir, err := realExposeDir(dir)
 	if err != nil {
 		return err
 	}
-	_, err = hostacl.RevokeSearch(dir, uid)
+	_, err = hostacl.RevokeTree(dir, uid, uint32(os.Getuid()))
 	return err
 }
 

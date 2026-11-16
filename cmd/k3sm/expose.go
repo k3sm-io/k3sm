@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 
 	"k3sm.io/k3sm/internal/hostacl"
 	"k3sm.io/k3sm/pkg/install"
@@ -72,9 +73,11 @@ it. Connecting to a Unix socket needs write permission on the socket, so a read
 exposure reaches a socket the pod creates 0666, and a 0600 one needs read-write.
 
 'revoke' removes the grant and then strips the account's entries from every
-live exposure in the affected namespaces, never descending below the volume
-directory or following a symlink. A pod that is running keeps its directory
-until it is recreated, but the account can no longer enter it.
+live exposure in the affected namespaces: from the volume directory and from
+everything under it the pod owns, inherited entries included, so a file the
+account hard-linked out before the revoke is not left readable. The walk never
+follows a symlink or leaves the volume's device. A pod that is running keeps
+its directory until it is recreated, but the account can no longer enter it.
 
 Exit codes: 0 done; 1 failed; 2 usage; 3 not permitted (not root).
 `
@@ -106,12 +109,9 @@ func defaultExposeEnv(stdout, stderr io.Writer) exposeEnv {
 		write:    writeShareFile,
 		lookup:   lookupAccount,
 		leaves:   exposureLeaves,
-		revoke: func(dir string, uid uint32) error {
-			_, err := hostacl.RevokeSearch(dir, uid)
-			return err
-		},
-		stdout: stdout,
-		stderr: stderr,
+		revoke:   revokeExposureTree,
+		stdout:   stdout,
+		stderr:   stderr,
 	}
 }
 
@@ -412,4 +412,24 @@ func listDirsNoFollow(dir string) ([]string, error) {
 	}
 	slices.Sort(out)
 	return out, nil
+}
+
+// revokeExposureTree removes uid's entries from an exposure directory and
+// from what its owner (the pods' user) owns below it. GrantTree put an
+// inheritable entry on every file, and a file the account hard-linked out
+// shares its inode, so stripping the directory's own entry alone would leave
+// that file readable. The owner is read from the directory; hostacl re-opens
+// every component with no symlink followed and touches only what that owner
+// owns, so a raced swap reaches nothing else.
+func revokeExposureTree(dir string, uid uint32) error {
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		return err
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok || !fi.IsDir() {
+		return fmt.Errorf("%s is not a directory", dir)
+	}
+	_, err = hostacl.RevokeTree(dir, uid, st.Uid)
+	return err
 }
