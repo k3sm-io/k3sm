@@ -139,25 +139,56 @@ the same user with no PID namespace, and the other surfaces that user can reach 
 way (see "No Per-Pod uid Isolation" above). Untrusted work belongs on the **`vm` RuntimeClass** (see
 [`vm` RuntimeClass](vm-runtimeclass.md)).
 
-### SwiftPM Builds With the Native Build System Only
+### SwiftPM Builds in a Pod, `xcodebuild` Builds Do Not
 
 A Pod compiles. `clang` and `swiftc` build C, Objective-C and Swift against an installed SDK into the
 Pod's own data volume, and the binary they produce runs. Ad-hoc signing works as well:
 `codesign -f -s -` succeeds on a file named by a relative or an absolute path.
 
-`swift build` completes in a Pod with two flags:
+`swift build` and `swift test` complete in a Pod with the default build system (Swift Build):
 
 ```sh
-swift build --disable-sandbox --build-system native
+export PATH="$DEVELOPER_DIR/usr/bin:$PATH"     # Command Line Tools
+# or, under the k3sm.io/xcode-toolchain annotation:
+export PATH="$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin:$PATH"
+swift build --disable-sandbox
+swift test --disable-sandbox
 ```
 
 - `--disable-sandbox` is required. SwiftPM runs its compiler and its manifest under a Seatbelt
   profile of its own, and macOS refuses a nested sandbox inside the Pod's.
-- `--build-system native` is required. The default build system (Swift Build) resolves its temporary
-  directory through `confstr(_CS_DARWIN_USER_TEMP_DIR)`, which ignores `TMPDIR` and names a
-  directory under `/var/folders` that the profile does not grant. It stops with
-  `couldNotFindTmpDir`. That directory belongs to the `_k3sm` user, so every Pod on the node would
-  share it, and k3sm does not grant it.
+- The toolchain's own `bin` must come before `/usr/bin` on `PATH`, or `swift-build` and
+  `swift-test` must be named by absolute path. `/usr/bin/swift` is Apple's `xcrun` shim, a platform
+  binary, and starting the build through it loses what keeps Swift Build's link step in the Pod's
+  own temp directory (below). Through the shim the link stops with `couldNotFindTmpDir`.
+
+Why it works. Foundation, `swift-driver` and clang find their temp and cache directories through
+`confstr(_CS_DARWIN_USER_TEMP_DIR)` and `confstr(_CS_DARWIN_USER_CACHE_DIR)`, which **ignore
+`TMPDIR`** and name the `_k3sm` user's directories under `/var/folders`. Every Pod on the node runs as
+that user, so those directories are shared, and the profile does not grant them. Instead k3sm gives
+each Pod its own pair. It sets `DIRHELPER_USER_DIR_SUFFIX` in every container and `kubectl exec`
+session, which makes `confstr` name `<temp dir>/k3sm.<pod uid>` and `<cache dir>/k3sm.<pod uid>`, and
+makes those two paths links into the Pod's data volume (`tmp/darwin-user-temp` and
+`tmp/darwin-user-cache`). The profile lets the Pod resolve its own two links and nothing else in the
+shared directories, so everything written through them lands in the Pod's data volume and is
+removed with the Pod. Swift Build runs its link step with almost no environment, so the path-rebase
+shim carries the variable into child processes that dropped it. The variable is set by k3sm; a
+value in the Pod spec is replaced.
+
+What this does not cover:
+
+- **`xcodebuild` builds.** `xcodebuild` ignores the variable, and a full build also needs services and
+  parts of Xcode that no read grant reaches (LaunchServices, FSEvents, job creation, the plug-ins).
+  `swift build --build-system native` remains available for a package, though SwiftPM has deprecated it.
+- **Platform and hardened-runtime binaries** ignore the variable, so they keep the shared directory
+  and fail with `Operation not permitted` when they write there, as before.
+- **A container that runs as another uid** (`runAsUser`) gets that user's directories, where k3sm
+  makes no links.
+- **A link the OS removes while a process runs.** macOS empties the temp directory at boot. k3sm
+  makes the links again before every container start and every `kubectl exec`, not while a process
+  is running.
+- **Isolation between Pods.** The directories are per Pod, but every Pod still runs as the same user
+  (see "No Per-Pod uid Isolation" above).
 
 k3sm gives every container containerd's default `PATH`
 (`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`) when neither the image nor the Pod
