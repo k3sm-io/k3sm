@@ -31,6 +31,7 @@ import (
 
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/netdsvc"
+	"k3sm.io/runtimed/pkg/hostshare"
 	"k3sm.io/runtimed/pkg/sandbox"
 )
 
@@ -855,5 +856,32 @@ func TestStateTreeRuntimeTreeModes(t *testing.T) {
 		if !ok || own.Principal != PrincipalServiceUser || own.GID != ServiceTreeGID || own.Mode != tc.mode {
 			t.Errorf("OwnershipOf(%s) = %+v, %v; want the service user, gid %d, mode %#o", tc.name, own, ok, ServiceTreeGID, tc.mode)
 		}
+	}
+}
+
+// TestStateTreeExposeRoot pins the exposure root: a service-user row, group
+// wheel, 0711, so the install creates it and netd re-aligns it, and the leaf
+// is runtimed's own name for it.
+func TestStateTreeExposeRoot(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		level StateLevel
+		want  StateOwnership
+	}{
+		{"the table row", StateExpose, StateOwnership{Principal: PrincipalServiceUser, GID: 0, Mode: 0o711}},
+		{"runtimed's leaf name", StateLevel(hostshare.ExposeSubdir), StateOwnership{Principal: PrincipalServiceUser, GID: 0, Mode: 0o711}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			own, ok := OwnershipOf(tc.level)
+			if !ok || own != tc.want {
+				t.Fatalf("OwnershipOf(%s) = %+v, %v; want %+v", tc.level, own, ok, tc.want)
+			}
+			if !slices.Contains(ServiceLevels(), tc.level) {
+				t.Errorf("%s is not a service-user level, so netd would not re-align it", tc.level)
+			}
+		})
+	}
+	if got, want := StateExpose.Path(DefaultDataRoot), DefaultDataRoot+"/expose"; got != want {
+		t.Errorf("StateExpose path = %q, want %q", got, want)
 	}
 }

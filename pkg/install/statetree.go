@@ -21,6 +21,7 @@ import (
 	"io/fs"
 	"path/filepath"
 
+	"k3sm.io/runtimed/pkg/hostshare"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 	"k3sm.io/runtimed/pkg/sandbox"
 )
@@ -229,6 +230,9 @@ const (
 	// daemon downloads a release archive into a fresh attempt directory here
 	// before handing it to the root helper (pkg/update.Watcher).
 	StateUpdates StateLevel = UpdatesSubdir
+	// StateExpose is the exposure root (ExposeSubdir): the pod-lifetime
+	// directories a pod publishes to one named host account.
+	StateExpose StateLevel = ExposeSubdir
 )
 
 // UpdatesSubdir is the data-root subdirectory of the managed update
@@ -238,6 +242,23 @@ const UpdatesSubdir = "updates"
 // UpdatesDirMode is the update root's mode: the service user's own, because a
 // downloaded archive is not for any other account to read or replace.
 const UpdatesDirMode fs.FileMode = 0o700
+
+// ExposeSubdir is the data-root subdirectory that holds every exposure
+// volume, <data root>/expose/<namespace>/<pod>/<volume> (StateExpose). It is
+// runtimed's hostshare.ExposeSubdir, spelled through it so the two cannot
+// name different leaves.
+const ExposeSubdir = hostshare.ExposeSubdir
+
+// ExposeDirMode and ExposeDirGID are the exposure root's mode and group:
+// the service user's, group wheel, 0711. The runtime (as the service user)
+// creates each namespace, pod and volume directory under it without root; a
+// host account granted an exposure can traverse to the name it is given but
+// cannot list who exposes what. Group wheel, not staff: no login account is
+// let in through the group.
+const (
+	ExposeDirMode fs.FileMode = 0o711
+	ExposeDirGID  int         = 0
+)
 
 // Path joins the level onto a data root.
 func (l StateLevel) Path(dataRoot string) string {
@@ -287,6 +308,9 @@ var stateTree = func() []stateLevel {
 		// The per-pod rootfs parent and the PersistentVolume parent.
 		{StateLevel(podsSubdir), svc(ServiceTreeMode)},
 		{StateLevel(storageSubdir), svc(ServiceTreeMode)},
+		// The exposure root (ExposeDirMode, ExposeDirGID): traversable by a
+		// host account that knows a name, listable by the service user alone.
+		{StateExpose, StateOwnership{Principal: PrincipalServiceUser, GID: ExposeDirGID, Mode: ExposeDirMode}},
 		// The image store and the guest-artifact cache.
 		{StateLevel(sandbox.BlobsSubdir), svc(ServiceTreeMode)},
 		{StateLevel(sandbox.ImageUnpackedSubdir), svc(ServiceTreeMode)},
