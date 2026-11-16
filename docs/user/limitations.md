@@ -190,11 +190,10 @@ What this does not cover:
 - **Isolation between Pods.** The directories are per Pod, but every Pod still runs as the same user
   (see "No Per-Pod uid Isolation" above).
 
-k3sm gives every container containerd's default `PATH`
-(`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`) when neither the image nor the Pod
-spec sets one. On an earlier k3sm a native container started with no `PATH`, and `swift build`
-failed at its last step with `unable to spawn process 'codesign'`. On such a node, set `PATH` in the
-container's `env`.
+A native container whose image and Pod spec set no `PATH` starts with none, and `swift build` then
+fails at its last step with `unable to spawn process 'codesign'`. Set `PATH` in the container's
+`env`, with `/usr/bin` and `/bin` after the toolchain's `bin`, for example
+`/Library/Developer/CommandLineTools/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin`.
 
 One message on the way is not a failure, and it is worth recognising. Apple's toolchain resolves its
 `xcrun` lookup cache through `confstr(_CS_DARWIN_USER_TEMP_DIR)`, which **ignores `TMPDIR`** and names
