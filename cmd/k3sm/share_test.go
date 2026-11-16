@@ -358,3 +358,30 @@ func TestShareDelegation(t *testing.T) {
 		t.Errorf("add after undelegate = %d, want 3", code)
 	}
 }
+
+// TestShareUndelegateDeletedAccount pins that root can take back a delegation
+// whose account no longer resolves, by the uid the delegation recorded under
+// that name, and that a name with no recorded delegation is still refused.
+func TestShareUndelegateDeletedAccount(t *testing.T) {
+	t.Parallel()
+	f := newShareFixture(t)
+	env, _, errb := f.env(0)
+	if code := runShareWith([]string{"delegate", "--user", "dev", f.prefix}, env); code != 0 {
+		t.Fatalf("delegate = %d (%s)", code, errb)
+	}
+	f.me.name = "renamed" // "dev" no longer resolves
+	env, _, errb = f.env(0)
+	if code := runShareWith([]string{"undelegate", "--user", "nobody"}, env); code != 1 {
+		t.Errorf("undelegate of a name with no delegation = %d (%s), want 1", code, errb)
+	}
+	env, _, errb = f.env(0)
+	if code := runShareWith([]string{"undelegate", "--user", "dev"}, env); code != 0 {
+		t.Fatalf("undelegate of a deleted account = %d (%s), want 0", code, errb)
+	}
+	if strings.Contains(string(f.stored), "delegate") {
+		t.Errorf("delegation survived: %q", f.stored)
+	}
+	if !strings.Contains(errb.String(), fmt.Sprintf("using the uid %d", f.me.uid)) {
+		t.Errorf("undelegate did not say which uid it used: %s", errb)
+	}
+}

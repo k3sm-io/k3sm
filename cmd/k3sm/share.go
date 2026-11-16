@@ -612,7 +612,14 @@ func shareUndelegate(env shareEnv, f shareFlags, arg string) int {
 	}
 	acct, err := env.lookup(f.user)
 	if err != nil {
-		return fail(err)
+		// An account deleted since its delegation cannot be looked up, but the
+		// delegation is keyed by uid and records the name it was made for, so
+		// root can still take it back (a recycled uid would inherit it).
+		var ok bool
+		if acct, ok = recordedDelegate(env, f.user); !ok {
+			return fail(err)
+		}
+		fmt.Fprintf(env.stderr, "k3sm share undelegate: %v; using the uid %d its delegation records\n", err, acct.uid)
 	}
 	prefix := ""
 	if arg != "" {
@@ -643,6 +650,7 @@ func shareUndelegate(env shareEnv, f shareFlags, arg string) int {
 	if err != nil {
 		return fail(err)
 	}
+	rc := 0
 	for e, uid := range before.Owners {
 		if uid != acct.uid || slices.Contains(after.Entries, e) {
 			continue
@@ -652,6 +660,7 @@ func shareUndelegate(env shareEnv, f shareFlags, arg string) int {
 		}
 		if err := revokeACL(env, e, acct.uid, after.Entries); err != nil {
 			fmt.Fprintf(env.stderr, "k3sm share undelegate: revoking permissions on %s: %v\n", e.Path, err)
+			rc = 1
 		}
 	}
 	if len(delegationsFor(nf, acct.uid)) == 0 {
@@ -661,7 +670,27 @@ func shareUndelegate(env shareEnv, f shareFlags, arg string) int {
 			fmt.Fprintf(env.stdout, "removed %s\n", hostshare.UserDir(env.file, acct.uid))
 		}
 	}
-	return 0
+	return rc
+}
+
+// recordedDelegate finds the one uid the node file delegates to under name,
+// for an account that no longer resolves. Two uids recorded under one name
+// are ambiguous and refused.
+func recordedDelegate(env shareEnv, name string) (account, bool) {
+	nf, err := env.readFile(env.file)
+	if err != nil {
+		return account{}, false
+	}
+	var uids []uint32
+	for _, d := range nf.Delegations {
+		if d.User == name && !slices.Contains(uids, d.UID) {
+			uids = append(uids, d.UID)
+		}
+	}
+	if len(uids) != 1 {
+		return account{}, false
+	}
+	return account{name: name, uid: uids[0]}, true
 }
 
 func shareList(env shareEnv) int {
