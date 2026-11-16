@@ -1990,10 +1990,10 @@ case "\$1 \$2" in
 esac
 FAKE
 	chmod +x "$fgo"
-	if GO="$fgo" FAKE_GOVERSION=go1.27.3 toolchain_problems go1.27.3 >/dev/null; then ok "the pinned toolchain passes"; else bad "the pinned toolchain was refused"; fi
+	if GO="$fgo" FAKE_GOVERSION=go1.27.4 toolchain_problems go1.27.4 >/dev/null; then ok "the pinned toolchain passes"; else bad "the pinned toolchain was refused"; fi
 	if [ "$(cat "$tmp/fake-go.toolchain")" = local ]; then ok "the assert asks with GOTOOLCHAIN=local, as the payload build runs"; else bad "the assert did not set GOTOOLCHAIN=local"; fi
-	if out="$(GO="$fgo" FAKE_GOVERSION=go1.27.1 toolchain_problems go1.27.3)"; then bad "another toolchain passed"; elif grep_text "$out" -q "go1.27.1.*pin go1.27.3"; then ok "another toolchain is refused, naming both"; else bad "toolchain refusal not named: $out"; fi
-	if GO="$fgo" FAKE_GOVERSION='' toolchain_problems go1.27.3 >/dev/null; then bad "a failing go passed"; else ok "a go that cannot report its version is refused"; fi
+	if out="$(GO="$fgo" FAKE_GOVERSION=go1.27.1 toolchain_problems go1.27.4)"; then bad "another toolchain passed"; elif grep_text "$out" -q "go1.27.1.*pin go1.27.4"; then ok "another toolchain is refused, naming both"; else bad "toolchain refusal not named: $out"; fi
+	if GO="$fgo" FAKE_GOVERSION='' toolchain_problems go1.27.4 >/dev/null; then bad "a failing go passed"; else ok "a go that cannot report its version is refused"; fi
 	# PATH holds no go, so even a broken assert could not build anything here.
 	if out="$(PATH=/usr/bin:/bin GO="$fgo" FAKE_GOVERSION=go1.0.0 "$self" "$tmp/stage-oldgo" 2>&1)"; then
 		bad "staging with a non-pinned go exited 0"
@@ -2013,38 +2013,38 @@ FAKE
 	for kind in kine etcd etcdutl; do
 		case "$kind" in kine) want=v0.17.2 ;; *) want=v3.6.15 ;; esac
 		fx2="$td/goversion-$kind.txt"
-		if out="$(buildinfo_problems "$kind" "$want" go1.27.3 <"$fx2")"; then ok "$kind capture passes"; else bad "$kind capture rejected: $out"; fi
-		if out="$(buildinfo_problems "$kind" "$want" go1.27.9 <"$fx2")"; then bad "$kind: another toolchain passed"; elif grep_text "$out" -q "built with 'go1.27.3'"; then ok "$kind: another toolchain is refused"; else bad "$kind: toolchain not named: $out"; fi
-		if out="$(sed 's/CGO_ENABLED=0/CGO_ENABLED=1/' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.3)"; then bad "$kind: a cgo build passed"; elif grep_text "$out" -q "CGO_ENABLED=0"; then ok "$kind: a cgo build is refused"; else bad "$kind: cgo not named: $out"; fi
-		if out="$(grep -v -- '-trimpath' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.3)"; then bad "$kind: a build without -trimpath passed"; else ok "$kind: a build without -trimpath is refused"; fi
+		if out="$(buildinfo_problems "$kind" "$want" go1.27.4 <"$fx2")"; then ok "$kind capture passes"; else bad "$kind capture rejected: $out"; fi
+		if out="$(buildinfo_problems "$kind" "$want" go1.27.9 <"$fx2")"; then bad "$kind: another toolchain passed"; elif grep_text "$out" -q "built with 'go1.27.4'"; then ok "$kind: another toolchain is refused"; else bad "$kind: toolchain not named: $out"; fi
+		if out="$(sed 's/CGO_ENABLED=0/CGO_ENABLED=1/' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.4)"; then bad "$kind: a cgo build passed"; elif grep_text "$out" -q "CGO_ENABLED=0"; then ok "$kind: a cgo build is refused"; else bad "$kind: cgo not named: $out"; fi
+		if out="$(grep -v -- '-trimpath' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.4)"; then bad "$kind: a build without -trimpath passed"; else ok "$kind: a build without -trimpath is refused"; fi
 		case "$kind" in
 		kine)
-			if out="$(sed 's/\(golang\.org\/x\/net[[:space:]]\)v0\.60\.0/\1v0.59.0/' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.3)"; then bad "$kind: x/net v0.59.0 passed"; elif grep_text "$out" -q "golang.org/x/net is v0.59.0, below the raised v0.60.0"; then ok "$kind: x/net v0.59.0 is reported"; else bad "$kind: x/net v0.59.0 not named: $out"; fi
-			if out="$(sed 's/\(golang\.org\/x\/net[[:space:]]\)v0\.60\.0/\1v0.61.0/' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.3)"; then ok "$kind: a newer x/net passes"; else bad "$kind: a newer x/net was refused: $out"; fi
-			if out="$(grep -v 'golang\.org/x/net' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.3)"; then bad "$kind: a build info without x/net passed"; elif grep_text "$out" -q "golang.org/x/net is not in the build info"; then ok "$kind: a missing x/net is reported"; else bad "$kind: missing x/net not named: $out"; fi
-			if out="$(XNET_FLOOR='' buildinfo_problems "$kind" "$want" go1.27.3 <"$fx2")"; then bad "$kind: passed with no x/net floor set"; elif grep_text "$out" -q "no golang.org/x/net floor"; then ok "$kind: an unset x/net floor is refused"; else bad "$kind: unset floor not named: $out"; fi
+			if out="$(sed 's/\(golang\.org\/x\/net[[:space:]]\)v0\.60\.0/\1v0.59.0/' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.4)"; then bad "$kind: x/net v0.59.0 passed"; elif grep_text "$out" -q "golang.org/x/net is v0.59.0, below the raised v0.60.0"; then ok "$kind: x/net v0.59.0 is reported"; else bad "$kind: x/net v0.59.0 not named: $out"; fi
+			if out="$(sed 's/\(golang\.org\/x\/net[[:space:]]\)v0\.60\.0/\1v0.61.0/' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.4)"; then ok "$kind: a newer x/net passes"; else bad "$kind: a newer x/net was refused: $out"; fi
+			if out="$(grep -v 'golang\.org/x/net' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.4)"; then bad "$kind: a build info without x/net passed"; elif grep_text "$out" -q "golang.org/x/net is not in the build info"; then ok "$kind: a missing x/net is reported"; else bad "$kind: missing x/net not named: $out"; fi
+			if out="$(XNET_FLOOR='' buildinfo_problems "$kind" "$want" go1.27.4 <"$fx2")"; then bad "$kind: passed with no x/net floor set"; elif grep_text "$out" -q "no golang.org/x/net floor"; then ok "$kind: an unset x/net floor is refused"; else bad "$kind: unset floor not named: $out"; fi
 			;;
 		esac
-		if out="$(sed 's/GOARCH=arm64/GOARCH=amd64/' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.3)"; then bad "$kind: an amd64 build passed"; else ok "$kind: an amd64 build is refused"; fi
-		if out="$(printf '%s\n\t=>\texample.com/fork\tv0.0.1\th1:x=\n' "$(cat "$fx2")" | buildinfo_problems "$kind" "$want" go1.27.3)"; then bad "$kind: a replaced module passed"; elif grep_text "$out" -q "$kind: a module is replaced"; then ok "$kind: a replaced module is refused"; else bad "$kind: replace not named: $out"; fi
-		if out="$(sed 's/^\([[:space:]]*path[[:space:]]\).*/\1example.com\/other/' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.3)"; then bad "$kind: another main package passed"; else ok "$kind: another main package is refused"; fi
+		if out="$(sed 's/GOARCH=arm64/GOARCH=amd64/' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.4)"; then bad "$kind: an amd64 build passed"; else ok "$kind: an amd64 build is refused"; fi
+		if out="$(printf '%s\n\t=>\texample.com/fork\tv0.0.1\th1:x=\n' "$(cat "$fx2")" | buildinfo_problems "$kind" "$want" go1.27.4)"; then bad "$kind: a replaced module passed"; elif grep_text "$out" -q "$kind: a module is replaced"; then ok "$kind: a replaced module is refused"; else bad "$kind: replace not named: $out"; fi
+		if out="$(sed 's/^\([[:space:]]*path[[:space:]]\).*/\1example.com\/other/' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.4)"; then bad "$kind: another main package passed"; else ok "$kind: another main package is refused"; fi
 	done
-	if out="$(buildinfo_problems etcd v3.6.14 go1.27.3 <"$td/goversion-etcd.txt")"; then bad "etcd at another version passed"; elif grep_text "$out" -q "server/v3 is not at v3.6.14"; then ok "etcd at another version is refused"; else bad "etcd version not named: $out"; fi
-	if out="$(buildinfo_problems etcd v3.6.15 go1.27.3 <"$td/goversion-etcdutl.txt")"; then bad "etcdutl passed as etcd"; else ok "etcdutl does not pass as etcd"; fi
-	if out="$(printf '%s\n\t=>\texample.com/fork\tv0.0.1\th1:x=\n' "$(cat "$td/goversion-etcd.txt")" | buildinfo_problems etcd v3.6.15 go1.27.3)"; then bad "a replaced module passed"; elif grep_text "$out" -q "replaced"; then ok "a replaced module is refused"; else bad "replace not named: $out"; fi
+	if out="$(buildinfo_problems etcd v3.6.14 go1.27.4 <"$td/goversion-etcd.txt")"; then bad "etcd at another version passed"; elif grep_text "$out" -q "server/v3 is not at v3.6.14"; then ok "etcd at another version is refused"; else bad "etcd version not named: $out"; fi
+	if out="$(buildinfo_problems etcd v3.6.15 go1.27.4 <"$td/goversion-etcdutl.txt")"; then bad "etcdutl passed as etcd"; else ok "etcdutl does not pass as etcd"; fi
+	if out="$(printf '%s\n\t=>\texample.com/fork\tv0.0.1\th1:x=\n' "$(cat "$td/goversion-etcd.txt")" | buildinfo_problems etcd v3.6.15 go1.27.4)"; then bad "a replaced module passed"; elif grep_text "$out" -q "replaced"; then ok "a replaced module is refused"; else bad "replace not named: $out"; fi
 	echo "==> the build stamp of helm (go version -m capture of the wrapper build; dep list trimmed)"
 	local hraised="golang.org/x/net@v0.62.0" hfx="$td/goversion-helm-v4.3.1.txt"
-	if out="$(helm_buildinfo_problems v4.3.1 go1.27.3 "$hraised" <"$hfx")"; then ok "helm capture passes"; else bad "helm capture rejected: $out"; fi
-	if out="$(helm_buildinfo_problems v4.3.1 go1.27.9 "$hraised" <"$hfx")"; then bad "helm: another toolchain passed"; elif grep_text "$out" -q "helm: built with 'go1.27.3', the payload pins go1.27.9"; then ok "helm: a build on another toolchain is refused, naming both"; else bad "helm: toolchain not named: $out"; fi
-	if out="$(sed '1s/go1.27.3$/go1.27.1/' "$hfx" | helm_buildinfo_problems v4.3.1 go1.27.3 "$hraised")"; then bad "helm: the upstream release's go1.27.1 passed"; elif grep_text "$out" -q "built with 'go1.27.1'"; then ok "helm: a build-info line on go1.27.1 (the upstream tarball's toolchain) is refused"; else bad "helm: go1.27.1 not named: $out"; fi
-	if out="$(sed 's/v0.62.0/v0.60.0/' "$hfx" | helm_buildinfo_problems v4.3.1 go1.27.3 "$hraised")"; then bad "helm: helm's own x/net passed"; elif grep_text "$out" -q "golang.org/x/net is not at the raised v0.62.0"; then ok "helm: a build without the raised x/net is refused"; else bad "helm: raised x/net not named: $out"; fi
-	if out="$(grep -v 'golang.org/x/crypto' "$hfx" | helm_buildinfo_problems v4.3.1 go1.27.3 "$hraised golang.org/x/crypto@v0.58.0")"; then bad "helm: a build without x/crypto passed"; elif grep_text "$out" -q "golang.org/x/crypto is not at the raised v0.58.0"; then ok "helm: a build without a second raised module (x/crypto) is refused"; else bad "helm: raised x/crypto not named: $out"; fi
-	if out="$(helm_buildinfo_problems v4.3.2 go1.27.3 "$hraised" <"$hfx")"; then bad "helm at another version passed"; elif grep_text "$out" -q "helm.sh/helm/v4 is not at v4.3.2"; then ok "helm at another version is refused"; else bad "helm version not named: $out"; fi
-	if out="$(sed 's/CGO_ENABLED=0/CGO_ENABLED=1/' "$hfx" | helm_buildinfo_problems v4.3.1 go1.27.3 "$hraised")"; then bad "helm: a cgo build passed"; else ok "helm: a cgo build is refused"; fi
-	if out="$(grep -v -- '-trimpath' "$hfx" | helm_buildinfo_problems v4.3.1 go1.27.3 "$hraised")"; then bad "helm: a build without -trimpath passed"; else ok "helm: a build without -trimpath is refused"; fi
-	if out="$(sed 's/GOARCH=arm64/GOARCH=amd64/' "$hfx" | helm_buildinfo_problems v4.3.1 go1.27.3 "$hraised")"; then bad "helm: an amd64 build passed"; else ok "helm: an amd64 build is refused"; fi
-	if out="$(printf '%s\n\t=>\texample.com/fork\tv0.0.1\th1:x=\n' "$(cat "$hfx")" | helm_buildinfo_problems v4.3.1 go1.27.3 "$hraised")"; then bad "helm: a replaced module passed"; elif grep_text "$out" -q "replaced"; then ok "helm: a replaced module is refused"; else bad "helm: replace not named: $out"; fi
-	if out="$(helm_buildinfo_problems v4.3.1 go1.27.3 "" <"$hfx")"; then bad "helm: an empty raised set passed"; else ok "helm: an empty raised set is refused, never a vacuous pass"; fi
+	if out="$(helm_buildinfo_problems v4.3.1 go1.27.4 "$hraised" <"$hfx")"; then ok "helm capture passes"; else bad "helm capture rejected: $out"; fi
+	if out="$(helm_buildinfo_problems v4.3.1 go1.27.9 "$hraised" <"$hfx")"; then bad "helm: another toolchain passed"; elif grep_text "$out" -q "helm: built with 'go1.27.4', the payload pins go1.27.9"; then ok "helm: a build on another toolchain is refused, naming both"; else bad "helm: toolchain not named: $out"; fi
+	if out="$(sed '1s/go1.27.4$/go1.27.1/' "$hfx" | helm_buildinfo_problems v4.3.1 go1.27.4 "$hraised")"; then bad "helm: the upstream release's go1.27.1 passed"; elif grep_text "$out" -q "built with 'go1.27.1'"; then ok "helm: a build-info line on go1.27.1 (the upstream tarball's toolchain) is refused"; else bad "helm: go1.27.1 not named: $out"; fi
+	if out="$(sed 's/v0.62.0/v0.60.0/' "$hfx" | helm_buildinfo_problems v4.3.1 go1.27.4 "$hraised")"; then bad "helm: helm's own x/net passed"; elif grep_text "$out" -q "golang.org/x/net is not at the raised v0.62.0"; then ok "helm: a build without the raised x/net is refused"; else bad "helm: raised x/net not named: $out"; fi
+	if out="$(grep -v 'golang.org/x/crypto' "$hfx" | helm_buildinfo_problems v4.3.1 go1.27.4 "$hraised golang.org/x/crypto@v0.58.0")"; then bad "helm: a build without x/crypto passed"; elif grep_text "$out" -q "golang.org/x/crypto is not at the raised v0.58.0"; then ok "helm: a build without a second raised module (x/crypto) is refused"; else bad "helm: raised x/crypto not named: $out"; fi
+	if out="$(helm_buildinfo_problems v4.3.2 go1.27.4 "$hraised" <"$hfx")"; then bad "helm at another version passed"; elif grep_text "$out" -q "helm.sh/helm/v4 is not at v4.3.2"; then ok "helm at another version is refused"; else bad "helm version not named: $out"; fi
+	if out="$(sed 's/CGO_ENABLED=0/CGO_ENABLED=1/' "$hfx" | helm_buildinfo_problems v4.3.1 go1.27.4 "$hraised")"; then bad "helm: a cgo build passed"; else ok "helm: a cgo build is refused"; fi
+	if out="$(grep -v -- '-trimpath' "$hfx" | helm_buildinfo_problems v4.3.1 go1.27.4 "$hraised")"; then bad "helm: a build without -trimpath passed"; else ok "helm: a build without -trimpath is refused"; fi
+	if out="$(sed 's/GOARCH=arm64/GOARCH=amd64/' "$hfx" | helm_buildinfo_problems v4.3.1 go1.27.4 "$hraised")"; then bad "helm: an amd64 build passed"; else ok "helm: an amd64 build is refused"; fi
+	if out="$(printf '%s\n\t=>\texample.com/fork\tv0.0.1\th1:x=\n' "$(cat "$hfx")" | helm_buildinfo_problems v4.3.1 go1.27.4 "$hraised")"; then bad "helm: a replaced module passed"; elif grep_text "$out" -q "replaced"; then ok "helm: a replaced module is refused"; else bad "helm: replace not named: $out"; fi
+	if out="$(helm_buildinfo_problems v4.3.1 go1.27.4 "" <"$hfx")"; then bad "helm: an empty raised set passed"; else ok "helm: an empty raised set is refused, never a vacuous pass"; fi
 	if [ "$(buildinfo_settings <"$td/goversion-kine.txt" | tr ' ' '\n' | grep -c .)" = 8 ]; then ok "the build settings are recorded from the build info"; else bad "buildinfo_settings: $(buildinfo_settings <"$td/goversion-kine.txt")"; fi
 
 	echo "==> child_problems over a staged payload (fake go, real-shaped build info)"
@@ -2059,27 +2059,27 @@ FAKE
 		printf 'etcd\n' >"$cpd/etcd"; echo "v3.6.15 nocgo" >"$cpd/etcd.version"
 		printf 'etcdutl\n' >"$cpd/etcdutl"; echo "v3.6.15 nocgo" >"$cpd/etcdutl.version"
 		r=0
-		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  ok    the pinned children pass"; else echo "  FAIL  the pinned children were refused: $o"; r=1; fi
+		if o="$(child_problems "$cpd" go1.27.4)"; then echo "  ok    the pinned children pass"; else echo "  FAIL  the pinned children were refused: $o"; r=1; fi
 		echo "v0.17.2 nocgo+p0" >"$cpd/kine.version"
-		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a patch-set mismatch passed"; r=1; elif grep_text "$o" -q "kine.version"; then echo "  ok    a marker naming another patch set is refused"; else echo "  FAIL  marker not named: $o"; r=1; fi
+		if o="$(child_problems "$cpd" go1.27.4)"; then echo "  FAIL  a patch-set mismatch passed"; r=1; elif grep_text "$o" -q "kine.version"; then echo "  ok    a marker naming another patch set is refused"; else echo "  FAIL  marker not named: $o"; r=1; fi
 		echo "v0.17.2 nocgo+p3" >"$cpd/kine.version"
 		printf 'mach-o...v0.17.2...\n' >"$cpd/kine"
-		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a kine without the stamped version passed"; r=1; elif grep_text "$o" -q "stamped version"; then echo "  ok    a kine without its stamp is refused"; else echo "  FAIL  stamp not named: $o"; r=1; fi
+		if o="$(child_problems "$cpd" go1.27.4)"; then echo "  FAIL  a kine without the stamped version passed"; r=1; elif grep_text "$o" -q "stamped version"; then echo "  ok    a kine without its stamp is refused"; else echo "  FAIL  stamp not named: $o"; r=1; fi
 		printf 'mach-o...v0.17.2+p3...\n' >"$cpd/kine"
 		rm "$cpd/etcdutl"
-		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a payload without etcdutl passed"; r=1; elif grep_text "$o" -q "etcdutl: not staged"; then echo "  ok    a missing etcdutl is refused"; else echo "  FAIL  missing etcdutl not named: $o"; r=1; fi
+		if o="$(child_problems "$cpd" go1.27.4)"; then echo "  FAIL  a payload without etcdutl passed"; r=1; elif grep_text "$o" -q "etcdutl: not staged"; then echo "  ok    a missing etcdutl is refused"; else echo "  FAIL  missing etcdutl not named: $o"; r=1; fi
 		printf 'etcdutl\n' >"$cpd/etcdutl"
 		echo "v4.3.1 tarball" >"$cpd/helm.version"
-		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a helm marker naming another variant passed"; r=1; elif grep_text "$o" -q "helm.version is not 'v4.3.1 nocgo+deps3'"; then echo "  ok    a helm marker naming another build variant is refused"; else echo "  FAIL  helm marker not named: $o"; r=1; fi
+		if o="$(child_problems "$cpd" go1.27.4)"; then echo "  FAIL  a helm marker naming another variant passed"; r=1; elif grep_text "$o" -q "helm.version is not 'v4.3.1 nocgo+deps3'"; then echo "  ok    a helm marker naming another build variant is refused"; else echo "  FAIL  helm marker not named: $o"; r=1; fi
 		echo "v4.3.1 nocgo+deps3" >"$cpd/helm.version"
 		printf 'mach-o...v4.3.1...\n' >"$cpd/helm-v4.3.1"
-		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a helm without its stamped commit passed"; r=1; elif grep_text "$o" -q "helm: the stamped string c0d08d0d6d9424d4a14febb5e8a3e51b0dd00dff is not in the binary"; then echo "  ok    a helm built without its -X stamp (no commit in the bytes) is refused"; else echo "  FAIL  helm stamp not named: $o"; r=1; fi
+		if o="$(child_problems "$cpd" go1.27.4)"; then echo "  FAIL  a helm without its stamped commit passed"; r=1; elif grep_text "$o" -q "helm: the stamped string c0d08d0d6d9424d4a14febb5e8a3e51b0dd00dff is not in the binary"; then echo "  ok    a helm built without its -X stamp (no commit in the bytes) is refused"; else echo "  FAIL  helm stamp not named: $o"; r=1; fi
 		printf 'mach-o...c0d08d0d6d9424d4a14febb5e8a3e51b0dd00dff...\n' >"$cpd/helm-v4.3.1"
-		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a helm without its stamped version passed"; r=1; elif grep_text "$o" -q "helm: the stamped string v4.3.1 is not in the binary"; then echo "  ok    a helm without its stamped version is refused"; else echo "  FAIL  helm version stamp not named: $o"; r=1; fi
+		if o="$(child_problems "$cpd" go1.27.4)"; then echo "  FAIL  a helm without its stamped version passed"; r=1; elif grep_text "$o" -q "helm: the stamped string v4.3.1 is not in the binary"; then echo "  ok    a helm without its stamped version is refused"; else echo "  FAIL  helm version stamp not named: $o"; r=1; fi
 		printf 'mach-o...v4.3.1...c0d08d0d6d9424d4a14febb5e8a3e51b0dd00dff...\n' >"$cpd/helm-v4.3.1"
-		if o="$(child_problems "$cpd" go1.27.9)"; then echo "  FAIL  a helm built on another toolchain passed child_problems"; r=1; elif grep_text "$o" -q "^helm: built with 'go1.27.3', the payload pins go1.27.9"; then echo "  ok    child_problems names a helm built on another toolchain"; else echo "  FAIL  helm toolchain not named by child_problems: $o"; r=1; fi
+		if o="$(child_problems "$cpd" go1.27.9)"; then echo "  FAIL  a helm built on another toolchain passed child_problems"; r=1; elif grep_text "$o" -q "^helm: built with 'go1.27.4', the payload pins go1.27.9"; then echo "  ok    child_problems names a helm built on another toolchain"; else echo "  FAIL  helm toolchain not named by child_problems: $o"; r=1; fi
 		rm "$cpd/helm-v4.3.1"
-		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a payload without helm passed"; r=1; elif grep_text "$o" -q "helm-v4.3.1: not staged"; then echo "  ok    a missing helm is refused"; else echo "  FAIL  missing helm not named: $o"; r=1; fi
+		if o="$(child_problems "$cpd" go1.27.4)"; then echo "  FAIL  a payload without helm passed"; r=1; elif grep_text "$o" -q "helm-v4.3.1: not staged"; then echo "  ok    a missing helm is refused"; else echo "  FAIL  missing helm not named: $o"; r=1; fi
 		exit "$r"
 	) || fails=$((fails + 1))
 
