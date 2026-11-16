@@ -12,6 +12,14 @@ pin, its date, and the tarball's sha256.
 
 ### Added
 
+- A native Pod can publish a volume to one host account with an inline CSI volume of driver
+  `expose.k3sm.io` (`volumeAttributes.user`, and `access: read` or `read-write`). The node admin
+  grants it per account and namespace with `sudo k3sm expose allow --user <name> --namespace <ns>`,
+  takes it back with `sudo k3sm expose revoke`, and lists grants with `k3sm expose list`. The volume
+  lives at `/var/lib/k3sm/expose/<namespace>/<pod>/<volume>` for the Pod's lifetime, reached by the
+  account through an access-control entry; refusals are `FailedExposure` Events. `k3sm install`
+  creates `/var/lib/k3sm/expose`. See
+  [Exposing a Pod volume to a host user](docs/user/storage.md#exposing-a-pod-volume-to-a-host-user).
 - `sudo k3sm network lan on --for <duration>` turns LAN access on for at most 24h, after which the
   node daemon turns it off by itself. See [LAN access](docs/user/install.md#lan-access).
 - `sudo k3sm network lan status` lists the sockets on this Mac a LAN peer can reach that LAN access
@@ -267,6 +275,12 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
 
 ### Fixed
 
+- `k3sm install` and the netd helper keep the data root's image store, Pod trees, volumes and
+  guest-artifact cache (`blobs`, `unpacked`, `snapshots`, `guest-artifacts`, `pods`, `storage`) and
+  the service user's `.kube` at mode `0700`. They were `0750` with group `staff`, every login
+  user's group, so a user could hard-link a node file into a read-write host share where a Pod
+  could rewrite it. An existing node tightens at its next install or netd helper start. See
+  [Install](docs/user/install.md).
 - A server whose control plane does not report healthy in time while the Mac is heavily loaded no
   longer parks on the crash-loop breaker after five attempts. It backs off instead, from 30 seconds
   doubling up to 10 minutes, `k3sm status` shows when the next attempt starts and that an attempt

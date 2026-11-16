@@ -212,7 +212,7 @@ install if you were in the middle of one.
 
 The data root itself, `/var/lib/k3sm`, belongs to root (`root:wheel`, mode `0755`), the same way
 k3s keeps its data dir. The directories the daemons write under it (`run`, `server`, `agent`,
-`pods`, `storage`, the image store) belong to the unprivileged `_k3sm` service user, and the
+`pods`, `storage`, the image store) belong to the unprivileged `_k3sm` service user, mode `0700`, and the
 node's mesh keys live in `/var/lib/k3sm/keys`, which only root can read or change. If the root is
 owned by anyone else, `k3sm status` reports the data root as `wrong-owner` with the uid it found.
 A root owned by `_k3sm` is the layout older releases left behind. Restarting the netd helper

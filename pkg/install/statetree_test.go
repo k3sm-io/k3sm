@@ -31,6 +31,7 @@ import (
 
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/netdsvc"
+	"k3sm.io/runtimed/pkg/hostshare"
 	"k3sm.io/runtimed/pkg/sandbox"
 )
 
@@ -854,6 +855,103 @@ func TestStateTreeRuntimeTreeModes(t *testing.T) {
 		own, ok := OwnershipOf(StateLevel(tc.name))
 		if !ok || own.Principal != PrincipalServiceUser || own.GID != ServiceTreeGID || own.Mode != tc.mode {
 			t.Errorf("OwnershipOf(%s) = %+v, %v; want the service user, gid %d, mode %#o", tc.name, own, ok, ServiceTreeGID, tc.mode)
+		}
+	}
+}
+
+// TestStateTreeExposeRoot pins the exposure root: a service-user row, group
+// wheel, 0711, so the install creates it and netd re-aligns it, and the leaf
+// is runtimed's own name for it.
+func TestStateTreeExposeRoot(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		level StateLevel
+		want  StateOwnership
+	}{
+		{"the table row", StateExpose, StateOwnership{Principal: PrincipalServiceUser, GID: 0, Mode: 0o711}},
+		{"runtimed's leaf name", StateLevel(hostshare.ExposeSubdir), StateOwnership{Principal: PrincipalServiceUser, GID: 0, Mode: 0o711}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			own, ok := OwnershipOf(tc.level)
+			if !ok || own != tc.want {
+				t.Fatalf("OwnershipOf(%s) = %+v, %v; want %+v", tc.level, own, ok, tc.want)
+			}
+			if !slices.Contains(ServiceLevels(), tc.level) {
+				t.Errorf("%s is not a service-user level, so netd would not re-align it", tc.level)
+			}
+		})
+	}
+	if got, want := StateExpose.Path(DefaultDataRoot), DefaultDataRoot+"/expose"; got != want {
+		t.Errorf("StateExpose path = %q, want %q", got, want)
+	}
+}
+
+// serviceTreeOpenToOthers is the explicit set of service-user rows that grant
+// other-search, each by contract: the status dir publishes world-readable
+// records (StatusDirMode), and the runtime requires the artifact views root at
+// exactly 0711 (ArtifactViewsMode). Every other service-user row is closed to
+// every account but its owner.
+var serviceTreeOpenToOthers = map[StateLevel]fs.FileMode{
+	StateStatus:                             StatusDirMode,
+	StateLevel(sandbox.ArtifactViewsSubdir): ArtifactViewsMode,
+	// The operator-exposure root: 0711, so an account a pod exposes a volume
+	// to can traverse to its own leaf (0700, with an entry for that account
+	// alone) and nothing else can be listed. Named by its literal leaf so
+	// this set holds before the row exists.
+	StateLevel("expose"): 0o711,
+}
+
+// TestDataRootModeNoLoginSearch pins that no login user can search a
+// service-user tree under the data root. The service user's group is staff,
+// which every login user shares, and link(2) needs only search on the source's
+// directories, so a group- or other-search bit on, say, the image store lets
+// any login user hard-link a node file into a read-write host share, where a
+// pod (running as the owner) rewrites it.
+func TestDataRootModeNoLoginSearch(t *testing.T) {
+	for _, level := range ServiceLevels() {
+		own, _ := OwnershipOf(level)
+		if want, ok := serviceTreeOpenToOthers[level]; ok {
+			if own.Mode != want {
+				t.Errorf("%s is %#o; the exception set allows exactly %#o", level, own.Mode, want)
+			}
+			continue
+		}
+		if own.Mode&0o010 != 0 {
+			t.Errorf("%s is %#o: group search lets every staff member hard-link out of it", level, own.Mode)
+		}
+		if own.Mode&0o001 != 0 {
+			t.Errorf("%s is %#o: other search outside the explicit exception set", level, own.Mode)
+		}
+	}
+	for _, level := range []StateLevel{
+		StateLevel(podsSubdir),
+		StateLevel(storageSubdir),
+		StateLevel(sandbox.BlobsSubdir),
+		StateLevel(sandbox.ImageUnpackedSubdir),
+		StateLevel(sandbox.ImageSnapshotsSubdir),
+		StateLevel(sandbox.GuestArtifactsSubdir),
+		StateLevel(".kube"),
+	} {
+		own, ok := OwnershipOf(level)
+		if !ok || own.Principal != PrincipalServiceUser || own.Mode != 0o700 {
+			t.Errorf("OwnershipOf(%s) = %+v, %v; want a service-user row at exactly 0700", level, own, ok)
+		}
+	}
+}
+
+// TestServiceGroupIsNotAnAccessPath pins that ServiceTreeGID (staff, every
+// login user's group) grants nothing: no service-user row has a group bit,
+// except the exception set's world-open rows, whose group bits are no wider
+// than their other bits.
+func TestServiceGroupIsNotAnAccessPath(t *testing.T) {
+	for _, level := range ServiceLevels() {
+		own, _ := OwnershipOf(level)
+		group := own.Mode & 0o070
+		if _, ok := serviceTreeOpenToOthers[level]; ok && group>>3 == own.Mode&0o007 {
+			continue
+		}
+		if group != 0 {
+			t.Errorf("%s is %#o: the service group (gid %d) is an access path", level, own.Mode, ServiceTreeGID)
 		}
 	}
 }
