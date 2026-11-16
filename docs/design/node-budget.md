@@ -1,27 +1,23 @@
 # Node budget design
 
-This document records the design of the cooperative node budget: the node's memory and disk
-pressure signals, the budget it publishes to pods, and the two kill tiers that act on it.
-
 ## P0 calibration results
 
-The calibration run measured the pressure signals and channels on two Macs before any of the
-design's thresholds were fixed: the server (64 GiB, runs the control plane) and the worker (8 GiB).
-Both ran macOS 27.0.1. Nothing was installed or restarted for the run, and no pressure was induced on
-the server.
+This table records the verdict of each M21 P0 calibration question and the rule k3sm adopts from it.
 
-Each row answers one calibration question. The verdict is exactly one of PASS (the design holds as
-written), FAIL (the design had to change, and the answer says how) or N/A (no verdict yet, and the
-answer says what is still owed). The evidence column names each evidence file with the first 16 hex
-characters of its sha256. Question (f) is not a measurement, since a design decision settled it, so it
-has no row. The gate `hack/acceptance/m21.sh --g0` parses this table.
-
-| Q | verdict | answer | evidence (sha256 prefix) |
-|---|---|---|---|
-| (a) | PASS | `kern.memorystatus_vm_pressure_level` (1, 2, 4) and `kern.memorystatus_level` (percent) read without privilege as `_k3sm` and inside a generated pod sandbox profile on both Macs, with no profile change; the macOS level sat at warning in 8.2% of samples on the worker at ordinary load, so it is reported as information only and carries no threshold | `a-server-sysctl-unprivileged.txt` `c51323f82eff6a73`, `a-worker-sysctl-unprivileged.txt` `9ea9c6bf0f8343b6`, `c-server-probe.txt` `f6b635690b3215d0`, `c-worker-probe.txt` `cad80a9c57a417f9` |
-| (b) | N/A | time at the warn rung over 0.95 h of samples: `memory.available` 0% and `memory.compressor` 0% (max 18.7%) on both Macs, so those defaults stand; `memory.swap` and `swapfs.available` sat at warn 100% of the time on the worker at idle (5.1 to 5.5 GiB of swap used, 26 to 29 GiB free), so swap is re-derived as growth rungs and the swap-volume floor as 3x, 2x, 1.5x and 1x; `nodefs.available` and `pid.available` were not measured. Still owed: the full week of samples (168 h), until which these values are provisional | `b-g-analysis-partial.txt` `53d90ea9090a13bb` |
-| (c) | PASS | a shared `os_sync_wait_on_address` on the `notifyEpoch` word and a kqueue doorbell both wake a sandboxed `_k3sm` reader across processes and across uids; a pod that has not opted in gets EPERM, and an opted-in pod can only read | `c-server-probe.txt` `f6b635690b3215d0`, `c-worker-probe.txt` `cad80a9c57a417f9` |
-| (d) | PASS | the Node annotation stays the channel: an annotation write costs the same apiserver latency as a Lease renew (the difference is about 64x the datastore bytes), and annotation-only Node updates requeue no pending pod; writes become edge-triggered on a quantized change, at most one per 60 s, and the Lease fallback is dropped | `d-write-cost.txt` `a31962683b8bf0db`, `d-scheduler-metrics-t3.txt` `c4465c916a564ac2`, `d-scheduler-metrics-t4.txt` `02b98dbed79684c9`, `d-node-watch-180s.txt` `8a6237a562acea16` |
-| (e) | PASS | negative confirmed: a guest never sees host updates to a virtiofs file it holds open, through mmap or `pread`, even after a host `msync` or `pwrite`; a fresh open sees the latest value, so `vm` pods keep the `PublishBudget` path into a guest-local page | `e-virtiofs-mmap.txt` `1a2f36f0b5236fc0` |
-| (g) | N/A | the fill rate inside the 75-98% band was not measured: on the worker the swap volume fills before the band is reached, and inducing that pressure on the server was out of scope. The worst-case bound measured is 1.15% of the compressor segment limit per second, from an induced 1.28 GiB burst on the worker (passive maxima 0.139%/s on the server and 0.118%/s on the worker), which supports a tier-2 trip at 80% held 5 s and an instant trip at 90%. Still owed: the pod eviction teardown latency, which sets the tier-2 hold | `g-induced-worker.txt` `16a2888010a63f1e`, `samples-worker-burst.csv` `46ac67e17632d733`, `b-g-analysis-partial.txt` `53d90ea9090a13bb` |
-| (h) | FAIL | read from the kernel source, not tested live: with only batch-band pods carrying the kill mark, the kernel's no-paging-space action finds a victim only if a marked process holds compressed pages or one unmarked process holds over half of them, and otherwise kills nothing and retries every 5 s; resolved by marking both the batch and the standard bands | `h-xnu-excerpts.txt` `30473e3be051488f` |
+| Q | verdict | result and the rule adopted |
+|---|---|---|
+| (a) | PASS | `kern.memorystatus_vm_pressure_level` (1/2/4) and `kern.memorystatus_level` (percent) read without privilege as `_k3sm` and inside a generated pod SBPL. The macOS level sits at warning for a large share of ordinary use, far above the 5% warn rule, which supports a design decision: it stays information only |
+| (b1) `memory.available` | PASS | the warn rung holds below 5% of the time at quiet load; under heavy load max(1Gi, 12% mem) does not and max(1Gi, 11% mem) does (amendment A below, ruled by the operator). On a small-memory Mac the 1Gi floor sets the rung |
+| (b2) `memory.compressor` | PASS | the warn rung holds below 5% at quiet load; under heavy load 50% does not and 56% does (amendment A) |
+| (b3) `memory.swap` | PASS | the growth rungs of the earlier ruling (warn on a 256Mi rise in 60 s, gated on used >= max(1Gi, memsize/4)) hold below 5% at quiet load; under heavy load a 512Mi warn is needed (amendment A). The first-pass FAIL was the level rungs, already replaced |
+| (b4) `swapfs.available` | FAIL | on a small-memory Mac, swap-volume free space falls below 3x floor often in ordinary use even while the compressor is low, because the shared APFS container fills. No threshold fixes it as a memory signal; this is the D1 disk-versus-memory split, carried by separate follow-up work |
+| (b5) `nodefs.available`, `pid.available` | N/A | not sampled by the spike; the threshold rows unchanged |
+| (b6) the extended sample run | PASS | an extended run on each of two machines answered (b1) to (b4). The samples carry no load column, so "quiet" and "heavy" are split by a memory-churn proxy (mean gross compressions per second over 10 minutes) |
+| (c) | PASS | shared `os_sync_wait_on_address` on `notifyEpoch` and the kqueue doorbell wake a sandboxed reader across processes and uids; non-opted-in pods get EPERM, opted-in pods read only |
+| (d) | PASS | an annotation write costs the same apiserver latency as a Lease renew but about 64x the kine bytes, so writes are rate-limited; the Node annotation stays the channel; annotation-only updates requeue no pending pod; the rate changed to edge-triggered quantized writes at most one per 60 s, Lease fallback dropped |
+| (e) | PASS | negative confirmed: a guest never sees host updates to an open virtiofs file through mmap or `pread`; `PublishBudget` stands |
+| (f) | N/A | resolved by a design decision; nothing to measure |
+| (g1) fill rate inside the 75-98% band | PASS | measured; in-band fills are slow enough that the tier-1 rungs and the 5 s hold have time to act, and the fastest fills are tier 2's by construction (amendment C) |
+| (g2) worst-case fill-rate bound | FAIL | the earlier, lower bound of the prior ruling is exceeded. The design bound becomes 2.533% of the segment limit per second. At that rate the kernel's 98% point is 7.1 s from 80% and 3.2 s from 90% (to 100%: 8 s and 4 s). The tier-2 numbers are re-sized: amendment B below, ruled by the operator (85% instant) |
+| (h) | FAIL | from source, no live test: with only batch pods marked the kernel can find no victim; resolved by an operator ruling (batch and standard marked) |
+| (i) eviction teardown latency | PASS | delete call to process gone and footprint returned is under 1 s for native and vm pods, and the tier-2 teardown allowance is 0.8 s. It also found grace 0 resolving to the pod's 30 s grace; follow-up fixes (done) make wire grace 0 the immediate SIGKILL, so the 0.8 s allowance is the tier-2 teardown |
