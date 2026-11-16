@@ -99,6 +99,18 @@ type runtimedRuntime struct {
 	// loadHostShares reads hostSharesFile; nil is hostshare.Load. A test seam:
 	// the real loader accepts only a root-owned file.
 	loadHostShares func(string) ([]hostshare.Entry, error)
+	// exposeRoot is the data root runtimed keeps exposure volumes under
+	// (<exposeRoot>/expose/<namespace>/<pod>/<volume>), as exposeRootOf
+	// derives it.
+	exposeRoot string
+	// loadExposeGrants reads hostSharesFile's exposure grants; nil is
+	// hostshare.LoadEffective. lookupExposeUser resolves an account name to
+	// its uid (nil is os/user), and exposeAccountName a uid to its current
+	// name (nil is os/user). Test seams: the real loader accepts only a
+	// root-owned file, and the real lookups read the node's directory.
+	loadExposeGrants  func(string) ([]hostshare.ExposeGrant, error)
+	lookupExposeUser  func(name string) (uint32, error)
+	exposeAccountName hostshare.AccountName
 	// resolverVIP and clusterDomain are the cluster DNS inputs buildBox feeds
 	// dns.PodDNSConfig (per-pod namespace) to derive the K3SM_DNS_* env the DYLD
 	// getaddrinfo shim reads — so an in-pod unqualified Service lookup expands and
@@ -852,6 +864,9 @@ func NewRuntimed(ctx context.Context, cfg RuntimedConfig) (*runtimedRuntime, err
 	deps.RootLockWait = cfg.rootLockWait
 	deps.Credentials = creds
 	deps.Network = network
+	// The exposure ACL seam: runtimed sets an exposure directory's entries as
+	// its owner through this, and refuses every exposure without it.
+	deps.ExposeACL = exposeACL{}
 	// The cluster-mirror seam. Threaded as DATA, exactly like the resolver and the
 	// credential resolver above and for the same reason: runtimed never reads the
 	// apiserver, so the component that knows the cluster's peers is the one that
@@ -1042,6 +1057,7 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 		clusterRegistry: cfg.FlatRegistry.Host,
 		pathShim:        cfg.PathShim,
 		hostSharesFile:  cfg.HostSharesFile,
+		exposeRoot:      exposeRootOf(cfg),
 		resolverVIP:     cfg.ResolverVIP,
 		clusterDomain:   cfg.ClusterDomain,
 		apiServerVIP:    cfg.APIServerVIP,
@@ -2139,6 +2155,9 @@ func (r *runtimedRuntime) buildBox(ctx context.Context, pod *corev1.Pod, podIP s
 	if err := r.authorizeHostShares(pod, box); err != nil {
 		return nil, err
 	}
+	if err := r.authorizeExposures(box); err != nil {
+		return nil, err
+	}
 	// Deny every pod the daemon control sockets: pods share the _k3sm uid with the
 	// legitimate daemon clients, so the sandbox is where a privileged daemon is
 	// fenced off from the workload.
@@ -2383,6 +2402,7 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 		// The node-admitted host shares, recorded on the pod once, at create: the
 		// cluster-side audit record beside runtimed's log line.
 		r.recordHostShareGrants(pod, box)
+		r.recordExposureGrants(pod, box)
 		// A pod that asked for the developer toolchain and got none still runs; say so
 		// on the pod, once, at create. Degrade-not-fail, unlike the preflight above.
 		r.warnXcodeToolchainUngranted(ctx, pod, box)

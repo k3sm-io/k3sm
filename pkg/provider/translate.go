@@ -1244,6 +1244,8 @@ func toVolume(v *corev1.Volume, mounted, native bool, clusterRegistry string) (*
 		rv.Image = toImageVolumeSource(v.Image)
 	case v.HostPath != nil && mounted && native:
 		rv.HostPath = toHostPathSource(v.HostPath)
+	case v.CSI != nil && v.CSI.Driver == ExposeDriver && mounted:
+		return toExposeVolume(v, native)
 	case mounted:
 		return nil, unmodeledVolume(v)
 	default:
