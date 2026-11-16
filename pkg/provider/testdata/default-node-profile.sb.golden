@@ -74,6 +74,7 @@
 ;;   daemon trees: server, agent, run, blobs, status, sbpl, index,
 ;;     operator, unpacked, snapshots, ingest, guest-artifacts,
 ;;     artifact-partial, artifacts, vmboot-failures
+;;   exposures root: expose
 (deny file-read* file-write*
   (subpath "/Users"))
 (deny file-read* file-write*
@@ -124,6 +125,8 @@
   (subpath "/private/var/log/pods")
   (subpath "/var/log/containers")
   (subpath "/private/var/log/containers")
+  (subpath "/var/lib/k3sm/expose")
+  (subpath "/private/var/lib/k3sm/expose")
   )
 ;; dyld cryptex: deny WRITE only (read is needed at link time).
 (deny file-write*
