@@ -866,6 +866,11 @@ func TestStateTreeRuntimeTreeModes(t *testing.T) {
 var serviceTreeOpenToOthers = map[StateLevel]fs.FileMode{
 	StateStatus:                             StatusDirMode,
 	StateLevel(sandbox.ArtifactViewsSubdir): ArtifactViewsMode,
+	// The operator-exposure root: 0711, so an account a pod exposes a volume
+	// to can traverse to its own leaf (0700, with an entry for that account
+	// alone) and nothing else can be listed. Named by its literal leaf so
+	// this set holds before the row exists.
+	StateLevel("expose"): 0o711,
 }
 
 // TestDataRootModeNoLoginSearch pins that no login user can search a
