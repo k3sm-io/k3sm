@@ -206,12 +206,22 @@ func TestExposeRevoke(t *testing.T) {
 		{"namespace_with_no_exposures", 0, []string{"--user", "ana", "--namespace", "apps"}, nil, 0,
 			[]string{"expose uid=501 user=miko namespaces=apps,tools access=read-write"},
 			[]string{"/expose/apps/web-0/sockets uid=502", "/expose/apps/web-1/state uid=502"}, ""},
-		{"no_such_grant", 0, []string{"--user", "ana", "--namespace", "tools"}, nil, 1,
+		// With no grant left, revoke still sweeps the account's entries, so a
+		// revoke that failed half-way can be run again to finish.
+		{"no_grant_left_sweeps", 0, []string{"--user", "ana", "--namespace", "tools"}, nil, 0,
 			[]string{"expose uid=501 user=miko namespaces=apps,tools access=read-write", "expose uid=502 user=ana namespaces=apps access=read"},
-			nil, "no exposure grant to ana for tools"},
+			[]string{"/expose/tools/cli-0/out uid=502"}, ""},
+		{"no_grant_no_account", 0, []string{"--user", "nosuch", "--namespace", "tools"}, nil, 1,
+			[]string{"expose uid=501 user=miko namespaces=apps,tools access=read-write", "expose uid=502 user=ana namespaces=apps access=read"},
+			nil, "no exposure grant to nosuch"},
 		{"acl_failure_is_an_error", 0, []string{"--user", "miko", "--namespace", "tools"}, errors.New("EPERM"), 1,
 			[]string{"expose uid=501 user=miko namespaces=apps access=read-write", "expose uid=502 user=ana namespaces=apps access=read"},
 			[]string{"/expose/tools/cli-0/out uid=501"}, "removing miko's access"},
+		// A failure on one leaf never stops the others: every live exposure
+		// is attempted, and the failure is the exit status.
+		{"acl_failure_attempts_every_leaf", 0, []string{"--user", "miko"}, errors.New("EPERM"), 1,
+			[]string{"expose uid=502 user=ana namespaces=apps access=read"},
+			[]string{"/expose/apps/web-0/sockets uid=501", "/expose/apps/web-1/state uid=501", "/expose/tools/cli-0/out uid=501"}, "run the same revoke again"},
 		{"not_root", 501, []string{"--user", "miko"}, nil, 3,
 			[]string{"expose uid=501 user=miko namespaces=apps,tools access=read-write", "expose uid=502 user=ana namespaces=apps access=read"},
 			nil, "run as root"},

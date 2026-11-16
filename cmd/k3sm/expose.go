@@ -262,40 +262,82 @@ func exposeRevoke(env exposeEnv, userName string, nss []string) int {
 			kept = append(kept, g)
 		}
 	}
-	if len(affected) == 0 {
-		what := ""
-		if len(nss) > 0 {
-			what = " for " + strings.Join(nss, ", ")
+	// Revoke must be retryable: when an earlier run removed the grant but
+	// could not strip every live entry, the grant is gone and only the sweep
+	// is left. So with no grant left to remove, the sweep still runs for an
+	// account that exists, over the named namespaces or every exposed one.
+	removedGrant := len(affected) > 0
+	if !removedGrant {
+		acct, err := env.lookup(userName)
+		if err != nil {
+			return fail(fmt.Errorf("no exposure grant to %s, and no such account to sweep for", userName))
 		}
-		return fail(fmt.Errorf("no exposure grant to %s%s", userName, what))
-	}
-	nf.Exposes = kept
-	if err := env.write(env.file, hostshare.FormatFile(nf)); err != nil {
-		return fail(err)
+		sweep := nss
+		if len(sweep) == 0 {
+			if sweep, err = listDirsNoFollow(hostshare.ExposeRoot(exposeDataRoot(env.dataRoot))); err != nil {
+				return fail(fmt.Errorf("no exposure grant to %s; listing the exposures failed: %w", userName, err))
+			}
+		}
+		if len(sweep) == 0 {
+			return fail(fmt.Errorf("no exposure grant to %s", userName))
+		}
+		fmt.Fprintf(env.stdout, "no exposure grant to %s is left in %s; removing any entries it still has on live exposures\n", userName, env.file)
+		affected[acct.uid] = sweep
+	} else {
+		nf.Exposes = kept
+		if err := env.write(env.file, hostshare.FormatFile(nf)); err != nil {
+			return fail(err)
+		}
 	}
 	uids := make([]uint32, 0, len(affected))
 	for uid := range affected {
 		uids = append(uids, uid)
 	}
 	slices.Sort(uids)
-	for _, uid := range uids {
-		fmt.Fprintf(env.stdout, "removed the exposure grant to %s (uid %d) for %s from %s\n", userName, uid, strings.Join(affected[uid], ", "), env.file)
+	if removedGrant {
+		for _, uid := range uids {
+			fmt.Fprintf(env.stdout, "removed the exposure grant to %s (uid %d) for %s from %s\n", userName, uid, strings.Join(affected[uid], ", "), env.file)
+		}
 	}
+	// Every live leaf is attempted, whatever fails on the way, so one stuck
+	// leaf never leaves the account in the others. Any failure is the exit
+	// status, and running revoke again repeats the sweep.
+	root := exposeDataRoot(env.dataRoot)
+	var failed []string
 	for _, uid := range uids {
 		for _, ns := range affected[uid] {
-			dirs, err := env.leaves(env.dataRoot, ns)
+			dirs, err := env.leaves(root, ns)
 			if err != nil {
-				return fail(fmt.Errorf("the grant is gone, but listing the live exposures of %s failed: %w", ns, err))
+				failed = append(failed, fmt.Sprintf("listing the live exposures of %s: %v", ns, err))
+				continue
 			}
 			for _, dir := range dirs {
 				if err := env.revoke(dir, uid); err != nil {
-					return fail(fmt.Errorf("the grant is gone, but removing %s's access to %s failed: %w", userName, dir, err))
+					failed = append(failed, fmt.Sprintf("removing %s's access to %s: %v", userName, dir, err))
+					continue
 				}
 				fmt.Fprintf(env.stdout, "acl: %s: removed the entries for uid %d\n", dir, uid)
 			}
 		}
 	}
+	if len(failed) > 0 {
+		for _, f := range failed {
+			fmt.Fprintln(env.stderr, "k3sm expose revoke:", f)
+		}
+		return fail(fmt.Errorf("the grant is gone, but %d live exposure(s) still need their entries removed; run the same revoke again", len(failed)))
+	}
 	return 0
+}
+
+// exposeDataRoot spells the data root with its symlinks resolved (/var is
+// one on macOS). The leaf walk opens every component with no symlink
+// followed, so it must start from the real path; the data root and its
+// parents are root-owned, which is what makes resolving them safe.
+func exposeDataRoot(dataRoot string) string {
+	if r, err := filepath.EvalSymlinks(dataRoot); err == nil {
+		return r
+	}
+	return dataRoot
 }
 
 func exposeList(env exposeEnv) int {

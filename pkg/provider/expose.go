@@ -322,13 +322,44 @@ func (exposeACL) Grant(dir string, uid uint32, readWrite bool) error {
 	if readWrite {
 		a = hostacl.ReadWrite
 	}
-	_, err := hostacl.GrantTree(dir, a, uid, uint32(os.Getuid()))
+	dir, err := realExposeDir(dir)
+	if err != nil {
+		return err
+	}
+	_, err = hostacl.GrantTree(dir, a, uid, uint32(os.Getuid()))
 	return err
 }
 
 // Revoke removes uid's allow entries from dir itself, never below it: dir is
 // 0700, so without its entry uid reaches nothing under it.
 func (exposeACL) Revoke(dir string, uid uint32) error {
-	_, err := hostacl.RevokeSearch(dir, uid)
+	dir, err := realExposeDir(dir)
+	if err != nil {
+		return err
+	}
+	_, err = hostacl.RevokeSearch(dir, uid)
 	return err
+}
+
+// realExposeDir spells an exposure directory, <data root>/expose/<ns>/<pod>/<volume>,
+// with the data root's symlinks resolved: hostacl opens every component with
+// no symlink followed, and the default data root sits under /var, which is a
+// symlink on macOS. Only the data root is resolved. It and its parents are
+// root-owned; the four components below it are runtimed's own and are still
+// walked with no symlink followed.
+func realExposeDir(dir string) (string, error) {
+	exposeRoot := filepath.Dir(filepath.Dir(filepath.Dir(dir)))
+	if filepath.Base(exposeRoot) != hostshare.ExposeSubdir {
+		return "", fmt.Errorf("%s is not an exposure directory (<data root>/%s/<namespace>/<pod>/<volume>)", dir, hostshare.ExposeSubdir)
+	}
+	dataRoot := filepath.Dir(exposeRoot)
+	real, err := filepath.EvalSymlinks(dataRoot)
+	if err != nil {
+		return "", fmt.Errorf("resolve the data root %s: %w", dataRoot, err)
+	}
+	rel, err := filepath.Rel(dataRoot, dir)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(real, rel), nil
 }

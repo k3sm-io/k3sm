@@ -19,6 +19,7 @@ package provider
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -246,18 +247,34 @@ func TestExposeACLGrantAndRevoke(t *testing.T) {
 	}{{"read", false}, {"read_write", true}} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			dir, err := filepath.EvalSymlinks(t.TempDir())
+			base, err := filepath.EvalSymlinks(t.TempDir())
 			if err != nil {
 				t.Fatal(err)
 			}
+			// The data root is reached through a symlink, as /var/lib/k3sm is
+			// (/var is a symlink on macOS); hostacl refuses any symlink on
+			// the way, so the data root must be resolved first.
+			real := filepath.Join(base, "real")
+			const leaf = "expose/ns/pod-0/vol"
+			if err := os.MkdirAll(filepath.Join(real, leaf), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(real, filepath.Join(base, "link")); err != nil {
+				t.Fatal(err)
+			}
+			dir := filepath.Join(base, "link", leaf)
 			var acl exposeACL
+			if err := acl.Grant(filepath.Join(base, "link", "expose", "ns"), uid, tc.readWrite); err == nil {
+				t.Fatal("Grant on a directory that is not an exposure leaf = nil")
+			}
 			if err := acl.Grant(dir, uid, tc.readWrite); err != nil {
 				if errors.Is(err, hostacl.ErrUnsupported) {
 					t.Skip(err)
 				}
 				t.Fatalf("Grant = %v", err)
 			}
-			p, err := hostacl.Allowed(dir, uid)
+			realDir := filepath.Join(real, leaf)
+			p, err := hostacl.Allowed(realDir, uid)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -267,7 +284,7 @@ func TestExposeACLGrantAndRevoke(t *testing.T) {
 			if err := acl.Revoke(dir, uid); err != nil {
 				t.Fatalf("Revoke = %v", err)
 			}
-			if p, err := hostacl.Allowed(dir, uid); err != nil || p != 0 {
+			if p, err := hostacl.Allowed(realDir, uid); err != nil || p != 0 {
 				t.Fatalf("after Revoke the entry allows %#x (%v); want none", p, err)
 			}
 		})

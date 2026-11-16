@@ -304,8 +304,9 @@ needs `read-write`.
 
 **Revoke.** `revoke` removes the grant, then strips the account's entries from every live exposure
 in the affected namespaces. It never follows a symlink and never goes below the volume directory,
-which is 0700, so without its entry the account reaches nothing under it. A failure there is an
-error, not a warning. A Pod that is running keeps its directory until it is recreated, and a Pod
+which is 0700, so without its entry the account reaches nothing under it. It tries every live
+exposure even when one fails, and any failure is an error, not a warning. Run the same `revoke`
+again to finish: with no grant left it still removes the account's remaining entries. A Pod that is running keeps its directory until it is recreated, and a Pod
 created after the revoke is refused.
 
 **What remains.** An account with a `read-write` exposure can create files in it, so the hard-link
