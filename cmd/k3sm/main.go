@@ -30,7 +30,7 @@ const usage = `k3sm %s — Kubernetes for macOS, natively
 
 Usage: k3sm <command> [flags]
 
-Commands ("server", "agent", "node", "netd", "install", "uninstall", "stop", "start", "restart", "network", "datavol", "token", "certificate", "snapshot", "secrets-encrypt", "interconnect", "build", "builder", "image", "model", "registry", "kubectl", "kubeconfig", "status", "alerts", "update", "doctor", "dev" are implemented):
+Commands ("server", "agent", "node", "netd", "install", "uninstall", "stop", "start", "restart", "network", "share", "datavol", "token", "certificate", "snapshot", "secrets-encrypt", "interconnect", "build", "builder", "image", "model", "registry", "kubectl", "kubeconfig", "status", "alerts", "update", "doctor", "dev" are implemented):
   server      run the control plane + a node on this Mac (--mesh-ip enables multi-node join)
   agent       join this Mac to an existing cluster as a worker node
   node        run a Virtual Kubelet node here (HostProcess or runtimed runtime)
@@ -46,6 +46,8 @@ Commands ("server", "agent", "node", "netd", "install", "uninstall", "stop", "st
               --start also starts a stopped node)
   network     LAN access for this node's NodePort, LoadBalancer and ingress
               listeners (network lan on|off|status; on/off run as root via sudo)
+  share       the host paths native pods may mount with a hostPath volume
+              (share add|remove|list; add/remove run as root via sudo)
   datavol     the APFS volume the data root lives on (datavol mount|status|delete)
   token       mint cluster join tokens (token create)
   certificate re-issue the control-plane leaf certs over the existing CA (certificate rotate)
@@ -131,6 +133,10 @@ func main() {
 		}
 	case "network":
 		if code := runNetwork(os.Args[2:], os.Stdout, os.Stderr); code != 0 {
+			os.Exit(code)
+		}
+	case "share":
+		if code := runShare(os.Args[2:], os.Stdout, os.Stderr); code != 0 {
 			os.Exit(code)
 		}
 	case netdRemoveMeshVerb:

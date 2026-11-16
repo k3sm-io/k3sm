@@ -123,12 +123,83 @@ rather than a bind mount. Its data is durable across the Pod's lifetime: files w
 on the host under the claim's directory, owned by the `_k3sm` service user. See
 [`vm` RuntimeClass](vm-runtimeclass.md) for the ownership ceilings that follow from that.
 
+## Host Shares for Native Pods
+
+A native Pod is a macOS process with no mount namespace, so k3sm cannot bind a host directory to a
+new path inside it. What it can do is let the Pod reach a host directory **at that directory's own
+path**. The node admin decides which paths; a Pod spec cannot. The list is a root-owned file,
+`/Library/k3sm.host-shares`, kept with `k3sm share`:
+
+```sh
+sudo k3sm share add /Users/you/Code/app              # read-write directory
+sudo k3sm share add --read-only /Volumes/datasets    # read-only directory
+sudo k3sm share add --socket /Users/you/run/app.sock # one Unix socket, connect only
+sudo k3sm share remove /Users/you/Code/app
+k3sm share list
+```
+
+A share covers everything below the path. When one share sits inside another, the more specific
+one decides, so `--read-only` on a subdirectory of a read-write share keeps that subdirectory
+read-only. k3sm refuses system and k3sm trees, `/Users` itself, a
+whole home directory, a dot directory and a home's `Library`. Under `/Users` a share names a project
+below a home, never the home.
+
+A Pod mounts a share with a `hostPath` volume whose `mountPath` equals `hostPath.path`, with no
+`subPath`, and with `readOnly: true` when the share is read-only:
+
+```yaml
+spec:
+  volumes:
+    - name: app
+      hostPath:
+        path: /Users/you/Code/app
+        type: Directory
+  containers:
+    - name: work
+      image: native
+      command: ["/bin/sh", "-c", "cd /Users/you/Code/app && make"]
+      volumeMounts:
+        - name: app
+          mountPath: /Users/you/Code/app
+```
+
+The node decides the volume twice, in the node daemon before the Pod is created and in the runtime
+when it writes the Pod's Seatbelt profile, both from the same file. A volume the list does not
+admit, or one mounted at another path, refuses the Pod with a Warning Event whose reason is
+`FailedHostShare`. Each admitted volume is recorded with a Normal `HostShareGranted` Event on the Pod
+and a `host share granted` line in the node log.
+
+The list is read when a Pod is created. A Pod that is running keeps what it was given until it is
+recreated, and a Pod the node re-attaches after a restart gets only what the list holds then.
+
+**Who owns the files.** Pods run as the `_k3sm` user, not as you, and k3sm cannot map them to your
+user. The Seatbelt grant does not change file permissions: to write into a share, `_k3sm` needs
+write access there. `k3sm share add` prints the two `chmod +a` commands that grant it with an
+inheritable ACL, one for `_k3sm` and one for you, so you keep full access to what the Pod creates.
+Files a Pod creates are owned by `_k3sm`. Git refuses a repository owned by another user, so a Pod
+that runs git in a share sets `safe.directory` for it, for example with the environment variables
+`GIT_CONFIG_COUNT=1`, `GIT_CONFIG_KEY_0=safe.directory` and `GIT_CONFIG_VALUE_0=<path>`.
+
+**What a share is.** Every native Pod on a node runs as the same user, so a share is reachable by
+every Pod that mounts it, and by nothing else. Share only what you would let any workload you
+schedule on this node read and, for a read-write share, change. `vm` Pods cannot mount host shares.
+
+A read-write share of a repository lets a Pod change what you later run there yourself: git hooks
+under `.git/hooks`, a `.envrc`, editor task files, build scripts. Treat a Pod with a read-write
+share as able to run code as you the next time you work in that tree. A hard link that already
+exists inside a share reaches its file wherever that file lives; a Pod cannot make new hard links
+to files outside the share.
+
+`k3sm share` takes ASCII paths only and refuses a system, k3sm or home path in any letter case,
+because APFS and the sandbox both compare paths without regard to case.
+
 ## What Is Not Supported (Yet)
 
 - **Volume resize, snapshots, and generic ephemeral volumes** are **planned**, not present. See
   [Limitations](limitations.md).
 - **`hostPath` bind mounts** and `terminationMessagePath` file mounts are a documented ceiling on the
-  native substrate (no Linux bind mounts). See [Limitations](limitations.md).
+  native substrate (no Linux bind mounts). A native Pod can reach a host directory only through a
+  host share, at its own path (above). See [Limitations](limitations.md).
 - Networked / distributed storage classes are out of scope for the local-path model.
 
 ## Next
