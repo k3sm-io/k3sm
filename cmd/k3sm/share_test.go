@@ -20,7 +20,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -295,16 +294,8 @@ func TestShareDelegation(t *testing.T) {
 	if !f.acl.did(fmt.Sprintf("grant-tree %s 0 pod=250 owner=%d", app, f.me.uid)) {
 		t.Errorf("delegated add did not set the ACL as the owner: %v", f.acl.calls)
 	}
-	sock := filepath.Join(f.prefix, "q.sock")
-	ln, err := net.Listen("unix", sock)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	env, _, errb = user()
-	if code := runShareWith([]string{"add", "--socket", sock}, env); code != 0 || !f.acl.did("grant-socket "+sock) {
-		t.Errorf("delegated socket add = %d (%s), calls %v", code, errb, f.acl.calls)
-	}
+	// The delegated socket add needs a real socket: TestShareDelegatedSocket
+	// (integration).
 	if err := os.Symlink(filepath.Join(f.base, "Other"), filepath.Join(f.prefix, "out")); err != nil {
 		t.Fatal(err)
 	}

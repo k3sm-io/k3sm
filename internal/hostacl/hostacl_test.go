@@ -19,7 +19,6 @@ limitations under the License.
 package hostacl
 
 import (
-	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -147,7 +146,10 @@ func TestGrantTreeSkipsWhatTheOwnerDoesNotOwn(t *testing.T) {
 	}
 }
 
-func TestSearchAndSocket(t *testing.T) {
+// TestSearchAndNoFollow covers the search grant, the socket refusal on a
+// regular file and OpenNoFollow. A grant on a real socket is
+// TestGrantSocket (integration).
+func TestSearchAndNoFollow(t *testing.T) {
 	root, _ := tree(t)
 	if changed, err := GrantSearch(root, podUID); err != nil || !changed {
 		t.Fatalf("GrantSearch = %v, %v", changed, err)
@@ -161,20 +163,8 @@ func TestSearchAndSocket(t *testing.T) {
 	if changed, err := RevokeSearch(root, podUID); err != nil || !changed || has(t, root, Search) {
 		t.Errorf("RevokeSearch = %v, %v", changed, err)
 	}
-	sock := filepath.Join(root, "q.sock")
-	ln, err := net.Listen("unix", sock)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	if changed, err := GrantSocket(sock, podUID); err != nil || !changed || !has(t, sock, Write) {
-		t.Errorf("GrantSocket = %v, %v", changed, err)
-	}
 	if _, err := GrantSocket(filepath.Join(root, "f"), podUID); err == nil {
 		t.Error("GrantSocket on a regular file = nil, want an error")
-	}
-	if changed, err := RevokeSocket(sock, podUID); err != nil || !changed || has(t, sock, Write) {
-		t.Errorf("RevokeSocket = %v, %v", changed, err)
 	}
 	link := filepath.Join(root, "link")
 	if err := os.Symlink(filepath.Join(root, "sub"), link); err != nil {
