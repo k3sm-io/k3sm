@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"os/user"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
@@ -296,6 +297,16 @@ func refusedExposureName(box *runtimev1.PodBox, err error) string {
 		}
 	}
 	return firstExposureVolume(box)
+}
+
+// exposeRootOf is the data root whose expose/ tree runtimed keeps this
+// node's exposures under, derived the way runtimed derives it: the data root
+// it is given (dataRootOf) when there is one, else the runtime root.
+func exposeRootOf(cfg RuntimedConfig) string {
+	if dataRoot, _, err := dataRootOf(cfg); err == nil && dataRoot != "" {
+		return filepath.Clean(dataRoot)
+	}
+	return filepath.Clean(runtimeRoot(cfg.Root))
 }
 
 // exposeACL is the node's runtime.Deps.ExposeACL, backed by internal/hostacl:

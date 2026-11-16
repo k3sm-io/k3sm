@@ -100,8 +100,8 @@ type runtimedRuntime struct {
 	// the real loader accepts only a root-owned file.
 	loadHostShares func(string) ([]hostshare.Entry, error)
 	// exposeRoot is the data root runtimed keeps exposure volumes under
-	// (<exposeRoot>/expose/<namespace>/<pod>/<volume>): the runtime's own
-	// root, where its storage tree lives too.
+	// (<exposeRoot>/expose/<namespace>/<pod>/<volume>), as exposeRootOf
+	// derives it.
 	exposeRoot string
 	// loadExposeGrants reads hostSharesFile's exposure grants; nil is
 	// hostshare.LoadEffective. lookupExposeUser resolves an account name to
@@ -1057,7 +1057,7 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 		clusterRegistry: cfg.FlatRegistry.Host,
 		pathShim:        cfg.PathShim,
 		hostSharesFile:  cfg.HostSharesFile,
-		exposeRoot:      runtimeRoot(cfg.Root),
+		exposeRoot:      exposeRootOf(cfg),
 		resolverVIP:     cfg.ResolverVIP,
 		clusterDomain:   cfg.ClusterDomain,
 		apiServerVIP:    cfg.APIServerVIP,
