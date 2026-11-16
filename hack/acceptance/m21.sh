@@ -12,22 +12,21 @@
 #                                          and no node grant
 # The lab-run modes --g3, --g5 and --g6 live in hack/lab/m21.sh.
 #
-# G0. The P0 calibration results are committed as a table under "## P0 calibration
-# results" in docs/design/node-budget.md, so this public gate can read them. The
-# table has the columns Q | verdict | answer | evidence (sha256 prefix). G0 is green
-# iff that table has rows (a), (b), (c), (d), (e), (g) and (h) exactly once each and
-# no other row ((f) was settled by a design decision and is not a measurement), each
-# row has exactly four cells, each verdict is exactly PASS, FAIL or N/A, each answer
-# is non-empty, each evidence cell carries at least one complete backticked token of
-# exactly 16 lowercase hex characters (the sha256 prefix the doc records), and no
-# table row follows the end of the table anywhere in the section (a trailing row or a
-# second table). On a defect it prints every defect as a FAIL line, the first one
-# first, and exits 1. It boots nothing and reads only the table file.
+# G0. The M21 P0 calibration verdicts are committed as a table under "## P0
+# calibration results" in docs/design/node-budget.md, so this public gate can read
+# them; the raw evidence is kept outside the repository. The table has the columns
+# Q | verdict | result and the rule adopted. Each row's Q cell starts with its
+# question label, and the labels are the closed set (a), (b1) to (b6), (c), (d),
+# (e), (f), (g1), (g2), (h) and (i). G0 is green iff the section appears once and
+# holds that table, every row has exactly three cells, every label appears exactly
+# once and no other label appears, every verdict is exactly PASS, FAIL or N/A, no
+# row is pending (a verdict of PENDING or TODO, or an N/A whose note starts
+# "pending:"), every note is non-empty, and no table row follows the end of the
+# table anywhere in the section. On a defect it prints every defect as a FAIL line,
+# the first one first, and exits 1. It boots nothing and reads only the table file.
 #
-# What G0 attests: the calibration was run and its results recorded, one row per
-# question. An N/A row is accepted when its answer names the work still owed. G0
-# does NOT attest that the thresholds are final: N/A rows and provisional values stay
-# open until their owed work lands, and the table, not this gate, says so.
+# What G0 attests: every P0 question is recorded with a verdict, and none is
+# pending. It does not re-derive the numbers; the table is the record.
 #
 # Usage:
 #   hack/acceptance/m21.sh --g0 [--table <file>]   check the committed table (or <file>)
@@ -62,18 +61,11 @@ g0_check() {
 	out="$(awk '
 		function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
 		function defect(msg) { defects[++nd] = msg }
-		# hex16: a whole backticked token of exactly 16 lowercase hex characters (no
-		# interval expressions: not every awk supports them).
-		function hex16(s) { return length(s) == 16 && s ~ /^[0-9a-f]+$/ }
-		# has_prefix: true iff some complete code span of the cell is a hex16 token. The
-		# cell is split on backticks, so the even-numbered pieces before the last are
-		# the closed spans; a run of hex inside a longer span or outside one is no token.
-		function has_prefix(cell,   n, parts, i) {
-			n = split(cell, parts, "`")
-			for (i = 2; i < n; i += 2) if (hex16(parts[i])) return 1
-			return 0
+		BEGIN {
+			insec = 0; seen_sec = 0; intable = 0; ended = 0; hdr = 0; nrows = 0; nd = 0
+			nwant = split("(a) (b1) (b2) (b3) (b4) (b5) (b6) (c) (d) (e) (f) (g1) (g2) (h) (i)", want, " ")
+			for (i = 1; i <= nwant; i++) known[want[i]] = 1
 		}
-		BEGIN { insec = 0; seen_sec = 0; intable = 0; ended = 0; hdr = 0; nrows = 0; nd = 0 }
 		/^## / {
 			if ($0 ~ /^## P0 calibration results[ \t]*$/) { insec = 1; seen_sec++; next }
 			insec = 0
@@ -84,25 +76,32 @@ g0_check() {
 		# table row (a trailing row or a second table) is a defect, never skipped.
 		/^\|/ && ended { defect("row after the table at line " NR); next }
 		/^\|/ {
-			if (!intable) { intable = 1; hdr = 1; next }
+			line = $0; sub(/[ \t]+$/, "", line)
+			if (!intable) {
+				intable = 1; hdr = 1
+				if (split(line, h, "|") != 5) defect("line " NR ": the table header has " (split(line, h, "|") - 2) " cells, want 3 (Q, verdict, result and the rule adopted)")
+				next
+			}
 			if (hdr == 1) {
 				hdr = 2
 				if ($0 !~ /^\|[-: |]+\|[ \t]*$/) defect("line " NR ": the table header is not followed by a separator row")
 				next
 			}
-			line = $0; sub(/[ \t]+$/, "", line)
 			if (line !~ /\|$/) { defect("line " NR ": the row does not end with |"); next }
 			n = split(line, c, "|")
-			if (n != 6) { defect("line " NR ": the row has " (n - 2) " cells, want 4 (Q, verdict, answer, evidence)"); next }
-			q = trim(c[2]); v = trim(c[3]); a = trim(c[4]); e = trim(c[5])
+			if (n != 5) { defect("line " NR ": the row has " (n - 2) " cells, want 3 (Q, verdict, result and the rule adopted)"); next }
+			qc = trim(c[2]); v = trim(c[3]); a = trim(c[4])
 			nrows++
-			if (q !~ /^\([abcdegh]\)$/) { defect("line " NR ": unknown row " q " (want one of (a) (b) (c) (d) (e) (g) (h))"); next }
+			# The label is the leading parenthesized token; a description may follow it.
+			if (match(qc, /^\([a-z][0-9]*\)/)) q = substr(qc, 1, RLENGTH); else q = qc
+			if (!(q in known)) { defect("line " NR ": unknown row " q); next }
 			if (q in count) defect("line " NR ": row " q " appears more than once")
 			count[q]++
-			if (v != "PASS" && v != "FAIL" && v != "N/A") defect("line " NR ": row " q " has verdict \"" v "\", want PASS, FAIL or N/A")
-			if (a == "") defect("line " NR ": row " q " has an empty answer")
-			if (!has_prefix(e)) defect("line " NR ": row " q " has no backticked sha256 prefix of exactly 16 lowercase hex characters")
-			else ok[q] = v
+			if (v == "PENDING" || v == "TODO") { defect("line " NR ": row " q " is pending (verdict \"" v "\")"); next }
+			if (v != "PASS" && v != "FAIL" && v != "N/A") { defect("line " NR ": row " q " has verdict \"" v "\", want PASS, FAIL or N/A"); next }
+			if (a == "") { defect("line " NR ": row " q " has an empty note"); next }
+			if (v == "N/A" && tolower(a) ~ /^pending:/) { defect("line " NR ": row " q " is pending (N/A with a pending: note)"); next }
+			ok[q] = v
 			next
 		}
 		{ if (intable) ended = 1 }
@@ -110,14 +109,13 @@ g0_check() {
 			if (seen_sec == 0) defect("no \"## P0 calibration results\" section")
 			else if (seen_sec > 1) defect("the \"## P0 calibration results\" section appears " seen_sec " times")
 			else if (!intable) defect("no table under \"## P0 calibration results\"")
-			split("(a) (b) (c) (d) (e) (g) (h)", want, " ")
-			for (i = 1; i <= 7; i++) if (!(want[i] in count)) defect("missing row " want[i])
+			if (seen_sec > 0) for (i = 1; i <= nwant; i++) if (!(want[i] in count)) defect("missing row " want[i])
 			if (nd > 0) {
 				for (i = 1; i <= nd; i++) print "FAIL  M21 G0: " defects[i]
 				print "M21 G0: red (first defect: " defects[1] ")"
 				exit 1
 			}
-			for (i = 1; i <= 7; i++) print "ok    M21 G0: row " want[i] " " ok[want[i]]
+			for (i = 1; i <= nwant; i++) print "ok    M21 G0: row " want[i] " " ok[want[i]]
 			print "M21 G0: green (" nrows " rows)"
 		}
 	' "$table")"
@@ -136,17 +134,12 @@ self_test() {
 	if [ "$rc" -eq 0 ]; then ladder ok "m21.g0.1  testdata/m21/g0-green.md parses green"
 	else ladder no "m21.g0.1  testdata/m21/g0-green.md exit $rc, want 0:"; printf '%s\n' "$out"; fi
 
-	set +e; out="$(g0_check "$TESTDATA/g0-red.md")"; rc=$?; set -e
-	if [ "$rc" -eq 1 ] && grep -q 'missing row (c)' <<<"$out" && grep -q 'row (d) has verdict' <<<"$out"; then
-		ladder ok "m21.g0.2  testdata/m21/g0-red.md is red, naming the missing row (c) and the bad verdict of (d)"
-	else ladder no "m21.g0.2  testdata/m21/g0-red.md exit $rc, want 1 naming both defects:"; printf '%s\n' "$out"; fi
-
 	set +e; out="$(g0_check "$DOC")"; rc=$?; set -e
-	if [ "$rc" -eq 0 ]; then ladder ok "m21.g0.3  the committed docs/design/node-budget.md parses green"
-	else ladder no "m21.g0.3  docs/design/node-budget.md exit $rc, want 0:"; printf '%s\n' "$out"; fi
+	if [ "$rc" -eq 0 ]; then ladder ok "m21.g0.2  the committed docs/design/node-budget.md parses green"
+	else ladder no "m21.g0.2  docs/design/node-budget.md exit $rc, want 0:"; printf '%s\n' "$out"; fi
 
 	# One red fixture per defect class: each must exit 1 and print its own FAIL text.
-	local i=3 file want
+	local i=2 file want
 	while IFS='|' read -r file want; do
 		i=$((i + 1))
 		set +e; out="$(g0_check "$TESTDATA/$file")"; rc=$?; set -e
@@ -154,15 +147,18 @@ self_test() {
 			ladder ok "m21.g0.$i  testdata/m21/$file is red: $want"
 		else ladder no "m21.g0.$i  testdata/m21/$file exit $rc, want 1 with FAIL text \"$want\":"; printf '%s\n' "$out"; fi
 	done <<'CASES'
-g0-red-duplicate.md|line 16: row (a) appears more than once
-g0-red-row-f.md|line 14: unknown row (f) (want one of (a) (b) (c) (d) (e) (g) (h))
-g0-red-sha-short.md|line 9: row (a) has no backticked sha256 prefix of exactly 16 lowercase hex characters
-g0-red-sha-unanchored.md|line 9: row (a) has no backticked sha256 prefix of exactly 16 lowercase hex characters
-g0-red-empty-answer.md|line 9: row (a) has an empty answer
-g0-red-cell-count.md|line 9: the row has 3 cells, want 4 (Q, verdict, answer, evidence)
+g0-red-missing-row.md|missing row (c)
+g0-red-duplicate.md|line 24: row (a) appears more than once
+g0-red-pending.md|line 9: row (a) is pending (verdict "PENDING")
+g0-red-todo.md|line 9: row (a) is pending (verdict "TODO")
+g0-red-pending-note.md|line 19: row (f) is pending (N/A with a pending: note)
+g0-red-unknown-verdict.md|line 9: row (a) has verdict "pass", want PASS, FAIL or N/A
+g0-red-empty-verdict.md|line 9: row (a) has verdict "", want PASS, FAIL or N/A
+g0-red-unknown-row.md|line 24: unknown row (j)
+g0-red-empty-answer.md|line 9: row (a) has an empty note
+g0-red-cell-count.md|line 9: the row has 4 cells, want 3 (Q, verdict, result and the rule adopted)
 g0-red-no-section.md|no "## P0 calibration results" section
-g0-red-lowercase-verdict.md|line 9: row (a) has verdict "pass", want PASS, FAIL or N/A
-g0-red-row-after-table.md|row after the table at line 19
+g0-red-row-after-table.md|row after the table at line 27
 CASES
 
 	echo "M21 G0 self-test: $pass passed, $fail failed"

@@ -2,15 +2,23 @@
 
 ## P0 calibration results
 
-A minimal results table with one defect.
+A minimal results table.
 
-| Q | verdict | answer | evidence (sha256 prefix) |
-|---|---|---|---|
-| (a) | PASS | answer for (a) | `a-evidence.txt` `0123456789abcdef` |
-| (b) | PASS | answer for (b) | `b-evidence.txt` `1123456789abcdef` |
-| (c) | PASS | answer for (c) | `c-evidence.txt` `2123456789abcdef` |
-| (d) | PASS | answer for (d) | `d-evidence.txt` `3123456789abcdef` |
-| (e) | PASS | answer for (e) | `e-evidence.txt` `4123456789abcdef` |
-| (g) | PASS | answer for (g) | `g-evidence.txt` `5123456789abcdef` |
-| (h) | PASS | answer for (h) | `h-evidence.txt` `6123456789abcdef` |
-| (a) | PASS | answer for (a) | `a-evidence.txt` `0123456789abcdef` |
+| Q | verdict | result and the rule adopted |
+|---|---|---|
+| (a) | PASS | note for (a) |
+| (b1) | PASS | note for (b1) |
+| (b2) | PASS | note for (b2) |
+| (b3) | PASS | note for (b3) |
+| (b4) | FAIL | note for (b4) |
+| (b5) | N/A | note for (b5) |
+| (b6) | PASS | note for (b6) |
+| (c) | PASS | note for (c) |
+| (d) | PASS | note for (d) |
+| (e) | PASS | note for (e) |
+| (f) | N/A | note for (f) |
+| (g1) | PASS | note for (g1) |
+| (g2) | FAIL | note for (g2) |
+| (h) | FAIL | note for (h) |
+| (i) | PASS | note for (i) |
+| (a) | PASS | a second note for (a) |
