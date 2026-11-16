@@ -144,6 +144,34 @@ read-only. k3sm refuses system and k3sm trees, `/Users` itself, a
 whole home directory, a dot directory and a home's `Library`. Under `/Users` a share names a project
 below a home, never the home.
 
+### Delegating a Prefix So Later Shares Need No sudo
+
+The node admin can delegate a directory to one user, once. After that, the user adds and removes
+shares under it as themselves:
+
+```sh
+sudo k3sm share delegate --user you /Users/you/Code   # once, by the node admin
+k3sm share add /Users/you/Code/app                     # later, as you, no sudo
+k3sm share add --socket /Users/you/Code/run/q.sock
+k3sm share remove /Users/you/Code/app
+sudo k3sm share undelegate --user you                  # take it back
+```
+
+The delegation is a line in the root-owned `/Library/k3sm.host-shares`. The shares a user adds live
+in a file the user owns, `/Library/k3sm.host-shares.d/<uid>/host-shares`, in a directory the
+delegation creates for them. That file is not trusted. Every time a Pod is created, the node checks
+each of its lines against the delegation again, and admits a line only when all of these hold:
+
+- the path is the delegated directory or under it, in any letter case;
+- no part of the path is a symlink;
+- the delegated directory, and every directory from it down to the path, is owned by the delegated
+  user, and the path's first part names the same directory the admin delegated;
+- the path passes the same rules as any share (no system or k3sm tree, no dot directory or `Library`
+  under a home, ASCII only).
+
+A line that fails is not admitted, and `k3sm share list` shows it under "not admitted" with the
+reason. Editing the file by hand therefore admits nothing `k3sm share add` would refuse.
+
 A Pod mounts a share with a `hostPath` volume whose `mountPath` equals `hostPath.path`, with no
 `subPath`, and with `readOnly: true` when the share is read-only:
 
@@ -173,12 +201,23 @@ The list is read when a Pod is created. A Pod that is running keeps what it was 
 recreated, and a Pod the node re-attaches after a restart gets only what the list holds then.
 
 **Who owns the files.** Pods run as the `_k3sm` user, not as you, and k3sm cannot map them to your
-user. The Seatbelt grant does not change file permissions: to write into a share, `_k3sm` needs
-write access there. `k3sm share add` prints the two `chmod +a` commands that grant it with an
-inheritable ACL, one for `_k3sm` and one for you, so you keep full access to what the Pod creates.
-Files a Pod creates are owned by `_k3sm`. Git refuses a repository owned by another user, so a Pod
-that runs git in a share sets `safe.directory` for it, for example with the environment variables
-`GIT_CONFIG_COUNT=1`, `GIT_CONFIG_KEY_0=safe.directory` and `GIT_CONFIG_VALUE_0=<path>`.
+user. The Seatbelt grant does not change file permissions, so `k3sm share add` also sets them, and
+prints exactly what it changed:
+
+- read-write: an inheritable access-control entry for `_k3sm` on the directory and on every
+  directory and file under it that you own, and the same entry for you, so you keep full access to
+  what a Pod creates;
+- read-only: a read entry for `_k3sm`;
+- socket: a connect entry for `_k3sm` on the socket;
+- search for `_k3sm` on each parent directory you own that `_k3sm` cannot already pass through.
+
+It never follows a symlink, and it leaves alone a file with more than one hard link and anything
+you do not own. (`chmod -R +a` is not a safe way to do this by hand: it follows symlinks inside the
+tree and puts the entry on their targets.) `k3sm share remove` takes the `_k3sm` entries back,
+unless another share still covers the path; your own entries stay. `--no-acl` leaves permissions
+alone. Files a Pod creates are owned by `_k3sm`. Git refuses a repository owned by another user, so
+a Pod that runs git in a share sets `safe.directory` for it, for example with the environment
+variables `GIT_CONFIG_COUNT=1`, `GIT_CONFIG_KEY_0=safe.directory` and `GIT_CONFIG_VALUE_0=<path>`.
 
 **What a share is.** Every native Pod on a node runs as the same user, so a share is reachable by
 every Pod that mounts it, and by nothing else. Share only what you would let any workload you
@@ -186,9 +225,15 @@ schedule on this node read and, for a read-write share, change. `vm` Pods cannot
 
 A read-write share of a repository lets a Pod change what you later run there yourself: git hooks
 under `.git/hooks`, a `.envrc`, editor task files, build scripts. Treat a Pod with a read-write
-share as able to run code as you the next time you work in that tree. A hard link that already
-exists inside a share reaches its file wherever that file lives; a Pod cannot make new hard links
-to files outside the share.
+share as able to run code as you the next time you work in that tree. A delegation does not change
+this: it lets you, rather than the node admin, decide which of your trees every Pod on the node can
+reach. A hard link inside a share reaches its file wherever that file lives. A Pod cannot make one
+to a file outside its shares, but you can, to any file in a directory you can search. The node's
+image store, Pod trees and volumes under `/var/lib/k3sm` are closed to every user but `_k3sm`, so
+they cannot be linked. The status records, the artifact views and the node logs (which admin users
+can read) can be, and a Pod could then rewrite the linked file, so delegate a prefix only to a user
+you trust not to do that. A share on a
+case-sensitive volume is refused, because the sandbox matches paths without regard to case.
 
 `k3sm share` takes ASCII paths only and refuses a system, k3sm or home path in any letter case,
 because APFS and the sandbox both compare paths without regard to case.
