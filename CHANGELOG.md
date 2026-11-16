@@ -275,6 +275,12 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
 
 ### Fixed
 
+- `k3sm install` and the netd helper keep the data root's image store, Pod trees, volumes and
+  guest-artifact cache (`blobs`, `unpacked`, `snapshots`, `guest-artifacts`, `pods`, `storage`) and
+  the service user's `.kube` at mode `0700`. They were `0750` with group `staff`, every login
+  user's group, so a user could hard-link a node file into a read-write host share where a Pod
+  could rewrite it. An existing node tightens at its next install or netd helper start. See
+  [Install](docs/user/install.md).
 - A server whose control plane does not report healthy in time while the Mac is heavily loaded no
   longer parks on the crash-loop breaker after five attempts. It backs off instead, from 30 seconds
   doubling up to 10 minutes, `k3sm status` shows when the next attempt starts and that an attempt
