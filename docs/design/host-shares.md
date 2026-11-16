@@ -54,19 +54,19 @@ What is not protected: a Pod that is already running keeps its profile until it 
 read-write share of a repository lets a Pod plant code (git hooks, build scripts) the owner may
 later run; and hard links (next paragraph).
 
-**Hard links are the open gap.** Seatbelt matches the path used to reach a file, so a hard link
-inside a share reaches its file wherever it lives, and `link(2)` does not require owning the source.
-A Pod cannot make such a link (Seatbelt checks the source path), but the share's owner can, for any
-file in a directory they can search. Every file `_k3sm`'s own permission bits let it read or write
-is then open to every Pod that mounts the share. On a current node several directories under
-`/var/lib/k3sm` (`blobs`, `guest-artifacts`, `pods`, `storage`, `snapshots`, `unpacked`) are mode
-0750 with group `staff`, and `_k3sm` and every login user are in `staff`, so a user can link an
-image blob into their share and a Pod can then rewrite it. This was already true of any share of a
-user-writable tree under the first change; delegation makes it self-service. The fix is in the
-install, not in the share rules: give `_k3sm` a primary group of its own and close the data root's
-group bits, so no other user can search the directories that hold `_k3sm`'s files. Until that lands,
-a delegation is safe only to a user already trusted with the node's data, such as the admin of a
-single-user Mac.
+**Hard links.** Seatbelt matches the path used to reach a file, so a hard link inside a share
+reaches its file wherever it lives, and `link(2)` does not require owning the source. A Pod cannot
+make such a link (Seatbelt checks the source path), but the share's owner can, for any file in a
+directory they can search. Every file `_k3sm`'s own permission bits let it read or write is then
+open to every Pod that mounts the share. The install therefore keeps the data root's stores
+(`blobs`, `guest-artifacts`, `pods`, `storage`, `snapshots`, `unpacked`, and the service user's
+`.kube`) at mode 0700: every reader of those trees runs as `_k3sm` or as root, so no group or other
+bit is an access path. Earlier installs left them 0750 with group `staff`, which every login user
+is in; the next install or node-daemon start re-applies the mode.
+
+A private primary group for `_k3sm` was considered and rejected: the group bit would have no member
+and no reader, and it would need a directory-service migration, a run-time group id and an
+ordering for purge. What is still linkable is listed under residual risks.
 
 ## Decisions
 
@@ -176,6 +176,13 @@ grant.
 - The Pod fields in runtimed's `host share granted` log line come from the request; the path, mode,
   entry and delegated uid are the node's own decision.
 - A hard link that already exists inside a share reaches its target.
+- Files a login user can still search to: the world-readable status records (`status/`, which
+  consumers may use only to refuse or delay an action), the artifact views under the 0711
+  `artifacts/` root (clones of image blobs, so a rewrite reaches the Pods that mount that view, not
+  the store), `runtimed.lock` in the data root, and the node logs, which admin users can read. A
+  user who links one of these into a read-write share lets a Pod rewrite it.
+- A hard link made before an install closed the stores survives the mode change, and installing a
+  build older than that change reopens them.
 - A socket cannot be opened, so its entry is set by path. Run as root, a path through directories
   the socket's owner controls could be raced to another file, so root never sets it: `sudo k3sm
   share add --socket` prints the `chmod +a` for the owner instead. Run as the owner, a race can
