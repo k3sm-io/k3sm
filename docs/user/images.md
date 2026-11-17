@@ -509,7 +509,7 @@ completion order; sort them yourself.
 There is no public supply of `darwin/arm64` runtimes, so projects build their own interpreters and
 servers (CPython, PostgreSQL, Node.js) from source. When several projects on one cluster need the
 same runtime, build it once and keep it in the cluster registry under one shared name instead of
-pushing a copy per project. This section is that convention. k3sm does not build or ship these
+pushing a copy per project. The convention below says how. k3sm does not build or ship these
 images; the projects that need them do.
 
 ### Where They Live
@@ -518,15 +518,25 @@ images; the projects that need them do.
 registry-k3sm:6450/base/<runtime>:<upstream version>-<content hash>
 ```
 
-- **`base/`** is the shared prefix. A project's own images stay under its own name
-  (`registry-k3sm:6450/<project>/...`), so nothing a project pushes collides with a base image.
+- **`base/`** is the shared prefix, reserved for these images. A project's own images stay under
+  its own name (`registry-k3sm:6450/<project>/...`), and no project takes the name `base`.
 - **`<runtime>`** is the upstream project's name in lowercase: `cpython`, `postgres`, `node`.
 - **`<upstream version>`** is the upstream release, exactly as upstream writes it: `3.13.1`, `17.2`,
   `22.12.0`.
 - **`<content hash>`** is the first 12 hex digits of a sha256 over the build's inputs: the upstream
-  source archive's sha256, every patch applied, and the build recipe. The same inputs give the same
-  tag on any Mac, and a different patch set gives a different tag, so two builds of `17.2` with
-  different patches never share a name.
+  source archive, every patch applied, and every file of the build recipe (the Dockerfile and the
+  scripts it runs). List them with `shasum -a 256`, sort the lines by file name, and hash that
+  listing:
+
+  ```sh
+  shasum -a 256 postgres-17.2.tar.bz2 patches/*.patch Dockerfile build.sh \
+    | sort -k2 | shasum -a 256 | cut -c1-12
+  ```
+
+  The same inputs give the same tag on any Mac, and a different patch set gives a different tag, so
+  two builds of `17.2` with different patches never share a name. The same tag does not promise the
+  same bytes: a rebuild from the same inputs can produce different binaries, which is why a tag is
+  written once (below) and consumers pin a digest.
 
 For example, `registry-k3sm:6450/base/postgres:17.2-3f9a0c1d7b2e`.
 
@@ -536,8 +546,9 @@ credentials and project data out of base images as well.
 
 ### A Tag Is Written Once
 
-A base tag names one set of inputs, so it never moves. Before you push, check whether the tag is
-already there, and use it if it is:
+A base tag names one set of inputs, so it never moves. Nothing in the registry enforces that: a
+push to an existing tag replaces it. It is a rule for whoever pushes. Before you push, check whether
+the tag is already there, and use it if it is:
 
 ```sh
 k3sm image inspect registry-k3sm:6450/base/postgres:17.2-3f9a0c1d7b2e && echo "already there"
@@ -573,19 +584,21 @@ from before it pins one.
 
 ### What a Native Base Image Must Be
 
-The platform is `darwin/arm64` and nothing else. `k3sm build` stamps it. The image must also follow
-the rules every native image follows today:
+The platform is `darwin/arm64` and nothing else. `k3sm build` stamps it. The runtime also requires
+the following of a pulled native image today:
 
 - **`FROM scratch`.** Nothing comes from the host. Every Mach-O in the image links only against
   `/usr/lib` and `/System`, and names its other libraries inside the image relative to itself
   (`@loader_path/...`). `otool -L` lists what each one links against.
 - **Signed ad hoc, after the last edit.** Rewriting an install name invalidates the signature, and
-  an arm64 Mac does not run an unsigned Mach-O, so re-sign every Mach-O last with
-  `codesign -f -s - <file>`. Use no signing identity: a base image never carries a Developer ID or
-  any other key.
-- **The entrypoint is a regular Mach-O file inside the image.** k3sm signs a pulled image's
-  entrypoint inside the image's own tree, so it refuses a symlink there (name
-  `/python/bin/python3.13`, not `python3`) and a `/bin/sh` the image does not carry.
+  an arm64 Mac does not run an unsigned Mach-O, so re-sign every Mach-O as the last build step with
+  `codesign -f -s - <file>`. k3sm ad-hoc signs a pulled image's tree as well, but an image that is
+  already signed runs the same on every node. Use no signing identity: a base image never carries a
+  Developer ID or any other key.
+- **The entrypoint is a regular Mach-O file inside the image.** k3sm signs the entrypoint inside the
+  image's own tree, and refuses the pull with `sign target is not a regular file inside its root`
+  when the entrypoint is a symlink (name `/python/bin/python3.13`, not `python3`) or a `/bin/sh` the
+  image does not carry.
 - **The runtime finds its own files relative to its executable.** An absolute path that names a file
   inside the image (`PYTHONPATH=/app`, `/python/lib/...`) resolves on the host, not in the image,
   for a native process. Absolute paths of volume mounts do resolve. Build the runtime relocatable:
@@ -600,9 +613,11 @@ Pin a base image by **digest**, never by tag alone. Read the digest once:
 k3sm image inspect registry-k3sm:6450/base/postgres:17.2-3f9a0c1d7b2e
 ```
 
-Then build on it. `FROM` is fetched by `k3sm build` on the Mac, which does not resolve
-`registry-k3sm`. On the server, write the registry's loopback name, `localhost:6450`, which is the
-same registry:
+Then build on it. `FROM` is fetched by `k3sm build` on the Mac it runs on, and no Mac resolves
+`registry-k3sm`. On the server, write the registry's loopback name, `localhost:<port>` (`6450` unless
+`--registry-port` changed it), which is the same registry. On another Mac, turn on the registry's
+NodePort and write `<server>:<node port>` (see
+[Reaching It From Another Mac](registry.md#reaching-it-from-another-mac)), or build on the server.
 
 ```dockerfile
 FROM localhost:6450/base/postgres@sha256:<digest>
