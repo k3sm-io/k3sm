@@ -265,8 +265,8 @@ xcodebuild -project App.xcodeproj -scheme App -configuration Debug \
 ```
 
 - Put `$DEVELOPER_DIR/usr/bin` before `/usr/bin` on `PATH`, or name
-  `$DEVELOPER_DIR/usr/bin/xcodebuild`. `/usr/bin/xcodebuild` is Apple's `xcrun` shim, a platform
-  binary, and through it `xcodebuild` starts without k3sm's copy and fails as before.
+  `$DEVELOPER_DIR/usr/bin/xcodebuild`. `/usr/bin/xcodebuild` is the system's developer-tool
+  trampoline, a platform binary, and through it `xcodebuild` starts without k3sm's copy and fails as before.
 
 - Keep `-derivedDataPath` in the Pod's data volume. The default, `~/Library/Developer/Xcode/DerivedData`,
   is under the node user's home, which a Pod cannot write.
@@ -284,7 +284,8 @@ xcodebuild -project App.xcodeproj -scheme App -configuration Debug \
   `xcodebuild` for each one. A copy has no entitlements and no hardened runtime, so it honours
   `DYLD_*` variables from the Pod's environment; that runs code inside the Pod's own sandbox and
   gains it nothing. `sudo k3sm install` makes the `xcodebuild` copy only when Xcode and every
-  directory above it are owned by root and not writable by other users. After an Xcode update, run
+  directory above it are owned by root and writable by no one but root and the admin group (which
+  can already install software), and only from a binary Apple signed. After an Xcode update, run
   `sudo k3sm install` again: `k3sm status` reports the copy as drifted until you do, and a copy
   older than the Xcode it loads its frameworks from may fail to start.
 - The read grant for Xcode now includes `Contents/PlugIns`, the IDE plug-ins a build loads, without

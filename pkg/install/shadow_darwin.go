@@ -75,23 +75,32 @@ func (darwinSystem) AdHocSign(path string) error {
 
 // RelinkRpaths reads path's LC_RPATH load commands with debug/macho and
 // rewrites each @executable_path one with install_name_tool, resolved against
-// sourceDir. The tool comes from the developer dir that holds sourceDir when
-// there is one (xcodebuild is the only Relink copy, and it lives in one), so
-// the libxcselect trampoline's own developer-dir lookup is not involved.
+// sourceDir. Everything this root process trusts is checked on an object no
+// other user can change (B1786 review): path is the root-owned clone and must
+// be Apple-signed before it is edited, and install_name_tool and the @rpath
+// dylibs it loads are first cloned into a root-only directory, checked as
+// Apple-signed there, and run from there with a minimal environment. A swap of
+// the source tree during the install therefore cannot hand root other bytes.
 func (darwinSystem) RelinkRpaths(path, sourceDir string) error {
 	rewrites, err := executableRpathRewrites(path, sourceDir)
 	if err != nil {
 		return err
 	}
-	tool := installNameTool(sourceDir)
-	// The tool runs as root: it must come from a root-owned, protected tree
-	// (an Xcode a user owns could otherwise hand root a binary to run).
-	if err := (darwinSystem{}).CheckTrustedSource(tool); err != nil {
-		return fmt.Errorf("refusing to run %s as root: %w", tool, err)
-	}
 	if len(rewrites) == 0 {
 		return nil
 	}
+	if err := verifyAppleSigned(path); err != nil {
+		return fmt.Errorf("refusing to relink %s: %w", path, err)
+	}
+	dev, ok := developerDirOf(sourceDir)
+	if !ok {
+		return fmt.Errorf("relink %s: %s is not in a developer dir, so there is no toolchain install_name_tool", path, sourceDir)
+	}
+	tool, cleanup, err := stageInstallNameTool(filepath.Dir(path), dev)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
 	args := make([]string, 0, 3*len(rewrites)+1)
 	for _, r := range rewrites {
 		args = append(args, "-rpath", r[0], r[1])
@@ -100,11 +109,68 @@ func (darwinSystem) RelinkRpaths(path, sourceDir string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), shadowSignTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, tool, args...)
-	if dev, ok := developerDirOf(sourceDir); ok {
-		cmd.Env = append(os.Environ(), "DEVELOPER_DIR="+dev)
-	}
+	cmd.Env = []string{"PATH=/usr/bin:/bin"}
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("install_name_tool %v: %w: %s", args, err, out)
+	}
+	return nil
+}
+
+// stageInstallNameTool clones dev's toolchain install_name_tool, and every
+// @rpath dylib it imports from the toolchain's usr/lib, into a fresh root-only
+// directory under parent (bin/ and lib/, so its @executable_path/../lib rpath
+// resolves to the staged copies), and checks each staged file is Apple-signed.
+func stageInstallNameTool(parent, dev string) (string, func(), error) {
+	usr := filepath.Join(dev, "Toolchains", "XcodeDefault.xctoolchain", "usr")
+	tmp, err := os.MkdirTemp(parent, ".relink-")
+	if err != nil {
+		return "", nil, fmt.Errorf("stage install_name_tool: %w", err)
+	}
+	cleanup := func() { _ = os.RemoveAll(tmp) }
+	fail := func(err error) (string, func(), error) { cleanup(); return "", nil, err }
+	if err := os.Chmod(tmp, 0o700); err != nil {
+		return fail(err)
+	}
+	for _, d := range []string{"bin", "lib"} {
+		if err := os.Mkdir(filepath.Join(tmp, d), 0o700); err != nil {
+			return fail(err)
+		}
+	}
+	stage := func(src, dst string) error {
+		if out, err := exec.Command("cp", "-c", src, dst).CombinedOutput(); err != nil {
+			return fmt.Errorf("cp -c %s %s: %w: %s", src, dst, err, out)
+		}
+		if err := refuseSymlinkAt(dst); err != nil {
+			return err
+		}
+		if err := verifyAppleSigned(dst); err != nil {
+			return fmt.Errorf("refusing to run %s as root: %w", src, err)
+		}
+		return nil
+	}
+	tool := filepath.Join(tmp, "bin", "install_name_tool")
+	if err := stage(filepath.Join(usr, "bin", "install_name_tool"), tool); err != nil {
+		return fail(err)
+	}
+	libs, err := rpathImports(tool)
+	if err != nil {
+		return fail(err)
+	}
+	for _, name := range libs {
+		if err := stage(filepath.Join(usr, "lib", name), filepath.Join(tmp, "lib", name)); err != nil {
+			return fail(err)
+		}
+	}
+	return tool, cleanup, nil
+}
+
+// verifyAppleSigned checks path's signature is valid and anchored at Apple.
+func verifyAppleSigned(path string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), shadowSignTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "/usr/bin/codesign", "--verify", "--strict", "-R=anchor apple", path).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w: %s is not Apple-signed: %s", errUntrustedSource, path, out)
 	}
 	return nil
 }
@@ -119,18 +185,6 @@ func (darwinSystem) CheckTrustedSource(path string) error {
 		}
 		return trustStat{uid: st.Uid, gid: st.Gid, mode: uint32(st.Mode)}, nil
 	})
-}
-
-// installNameTool is the toolchain's install_name_tool when sourceDir is in a
-// developer dir that has one, else /usr/bin/install_name_tool.
-func installNameTool(sourceDir string) string {
-	if dev, ok := developerDirOf(sourceDir); ok {
-		p := filepath.Join(dev, "Toolchains", "XcodeDefault.xctoolchain", "usr", "bin", "install_name_tool")
-		if _, err := os.Stat(p); err == nil {
-			return p
-		}
-	}
-	return "/usr/bin/install_name_tool"
 }
 
 // CDHash reads path's cdhash through codesign.

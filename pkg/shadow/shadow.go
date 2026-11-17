@@ -73,6 +73,17 @@ const ManifestVersion = 1
 type Manifest struct {
 	Version int      `json:"version"`
 	Sources []Source `json:"sources"`
+	// Skipped names the copies the install deliberately did not make
+	// because their source failed the trust check (B1786); status reports
+	// them as skipped, not as a stale set.
+	Skipped []Skipped `json:"skipped,omitempty"`
+}
+
+// Skipped is a copy the install refused to make, with the reason.
+type Skipped struct {
+	Name   string `json:"name"`
+	Path   string `json:"path"`
+	Reason string `json:"reason"`
 }
 
 // Source is one copy's provenance: the copy's name, the host binary, and that
@@ -141,8 +152,11 @@ func Drift(m Manifest, cdhash func(path string) (string, error)) []Drifted {
 // source this host lacks is never missing, because the installer skips it.
 // expected is the number of copies whose source is present.
 func Missing(m Manifest, present func(source string) bool) (missing []Copy, expected int) {
-	have := make(map[string]bool, len(m.Sources))
+	have := make(map[string]bool, len(m.Sources)+len(m.Skipped))
 	for _, s := range m.Sources {
+		have[s.Name] = true
+	}
+	for _, s := range m.Skipped {
 		have[s.Name] = true
 	}
 	for _, c := range Copies() {

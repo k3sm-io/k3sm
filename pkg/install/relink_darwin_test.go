@@ -38,30 +38,40 @@ func TestRelinkedXcodebuildCopyRuns(t *testing.T) {
 	if _, err := os.Stat(src); err != nil {
 		t.Skipf("SKIP: no %s on this host: %v", src, err)
 	}
-	dst := filepath.Join(t.TempDir(), "xcodebuild")
 	b, err := os.ReadFile(src)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(dst, b, 0o755); err != nil {
-		t.Fatal(err)
+	copyOf := func(name string) string {
+		p := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(p, b, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return p
 	}
 	sys := darwinSystem{}
 	dev := filepath.Dir(filepath.Dir(filepath.Dir(src)))
-	run := func() ([]byte, error) {
-		cmd := exec.Command(dst, "-version")
+	run := func(p string) ([]byte, error) {
+		cmd := exec.Command(p, "-version")
 		cmd.Env = append(os.Environ(), "DEVELOPER_DIR="+dev)
 		return cmd.CombinedOutput()
 	}
 
-	// Red half: signed but not relinked, the copy cannot start.
-	if err := sys.AdHocSign(dst); err != nil {
+	// Red half: signed but not relinked, a copy cannot start.
+	red := copyOf("xcodebuild")
+	if err := sys.AdHocSign(red); err != nil {
 		t.Fatalf("AdHocSign: %v", err)
 	}
-	if out, err := run(); err == nil {
+	if out, err := run(red); err == nil {
 		t.Fatalf("an un-relinked copy ran (%s); the relink proves nothing", out)
 	}
+	// RelinkRpaths refuses a copy that is no longer Apple-signed.
+	if err := sys.RelinkRpaths(red, filepath.Dir(src)); err == nil {
+		t.Fatal("RelinkRpaths edited a copy that is not Apple-signed")
+	}
 
+	// Green half: the installer's order, on a pristine clone.
+	dst := copyOf("xcodebuild")
 	if err := sys.RelinkRpaths(dst, filepath.Dir(src)); err != nil {
 		t.Fatalf("RelinkRpaths: %v", err)
 	}
@@ -79,7 +89,7 @@ func TestRelinkedXcodebuildCopyRuns(t *testing.T) {
 			}
 		}
 	}
-	out, err := run()
+	out, err := run(dst)
 	if err != nil || !strings.Contains(string(out), "Xcode") {
 		t.Fatalf("relinked copy -version: %v: %s", err, out)
 	}

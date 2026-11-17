@@ -511,20 +511,7 @@ type System interface {
 	// so the copy is neither a platform binary nor restricted and dyld keeps
 	// DYLD_INSERT_LIBRARIES in it.
 	AdHocSign(path string) error
-	// RelinkRpaths rewrites every LC_RPATH of path that starts with
-	// @executable_path to the absolute, cleaned path it names when the binary
-	// sits in sourceDir, so a copy cloned out of an application bundle still
-	// finds the bundle's frameworks. Other rpaths are left alone. It runs
-	// before AdHocSign, which the edit invalidates.
-	RelinkRpaths(path, sourceDir string) error
-	// CheckTrustedSource reports whether a shadow source outside the
-	// SIP-protected system trees may be copied: path and every ancestor up to
-	// / is a real (not symlinked) file or directory owned by root and not
-	// world-writable, and group-writable only for the admin group, whose
-	// members can already become root. A Relink source is checked before it
-	// is cloned, because the copy becomes a root-owned binary every pod may
-	// exec without the signature gate. An error wraps errUntrustedSource.
-	CheckTrustedSource(path string) error
+	shadowRelinker // RelinkRpaths and CheckTrustedSource (relink.go)
 	// CDHash reads path's code directory hash (codesign -dvvv).
 	CDHash(path string) (string, error)
 	// VerifyShadowCopy checks a made shadow copy (shadow.CheckCopyFile and

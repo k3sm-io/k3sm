@@ -128,6 +128,26 @@ func developerDirOf(dir string) (string, bool) {
 	return "", false
 }
 
+// shadowRelinker is the part of System that makes a Relink shadow copy
+// (B1786): the xcodebuild copy cloned out of Xcode.app.
+type shadowRelinker interface {
+	// RelinkRpaths rewrites every LC_RPATH of path that starts with
+	// @executable_path to the absolute, cleaned path it names when the binary
+	// sits in sourceDir, so a copy cloned out of an application bundle still
+	// finds the bundle's frameworks. Other rpaths are left alone. It runs
+	// before AdHocSign, which the edit invalidates. path must still be
+	// Apple-signed; the tool it runs is staged and checked first. A trust
+	// failure wraps errUntrustedSource.
+	RelinkRpaths(path, sourceDir string) error
+	// CheckTrustedSource reports whether a shadow source outside the
+	// SIP-protected system trees may be copied: path and every ancestor up to
+	// / is a real (not symlinked) file or directory owned by root and not
+	// world-writable, and group-writable only for the admin group, whose
+	// members can already become root. An error wraps errUntrustedSource, or
+	// fs.ErrNotExist when the source is absent.
+	CheckTrustedSource(path string) error
+}
+
 // errUntrustedSource reports a path some non-root identity could replace.
 var errUntrustedSource = errors.New("not a root-owned, protected path")
 
@@ -170,4 +190,52 @@ func checkTrustedChain(path string, lstat func(string) (trustStat, error)) error
 			return nil
 		}
 	}
+}
+
+// rpathImports lists the leaf names of path's @rpath/<name> dylib imports
+// (thin or fat; the slices must agree). A name with a directory part is
+// refused so a staged copy cannot reach outside its lib/ directory.
+func rpathImports(path string) ([]string, error) {
+	var sets [][]string
+	if ff, err := macho.OpenFat(path); err == nil {
+		defer ff.Close()
+		for _, a := range ff.Arches {
+			l, err := a.ImportedLibraries()
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", path, err)
+			}
+			sets = append(sets, l)
+		}
+	} else {
+		f, err := macho.Open(path)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", path, err)
+		}
+		defer f.Close()
+		l, err := f.ImportedLibraries()
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", path, err)
+		}
+		sets = append(sets, l)
+	}
+	var out []string
+	for i, libs := range sets {
+		var names []string
+		for _, l := range libs {
+			name, ok := strings.CutPrefix(l, "@rpath/")
+			if !ok {
+				continue
+			}
+			if name == "" || strings.Contains(name, "/") || name == "." || name == ".." {
+				return nil, fmt.Errorf("%s imports %q, which is not a plain @rpath dylib name", path, l)
+			}
+			names = append(names, name)
+		}
+		if i == 0 {
+			out = names
+		} else if strings.Join(names, "\x00") != strings.Join(out, "\x00") {
+			return nil, fmt.Errorf("%s: slices disagree on @rpath imports", path)
+		}
+	}
+	return out, nil
 }

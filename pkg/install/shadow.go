@@ -88,6 +88,7 @@ func makeShadowSet(sys System, cfg Config) error {
 				} else {
 					cfg.Logger.Warn("shadow source is not root-owned and protected; no shadow copy made (pods that exec it run the host binary)",
 						"copy", c.Name, "source", c.Source, "err", err)
+					m.Skipped = append(m.Skipped, shadow.Skipped{Name: c.Name, Path: c.Source, Reason: err.Error()})
 				}
 				continue
 			}
@@ -102,7 +103,16 @@ func makeShadowSet(sys System, cfg Config) error {
 		}
 		if c.Relink {
 			if err := sys.RelinkRpaths(dst, filepath.Dir(c.Source)); err != nil {
-				return fmt.Errorf("install: relink the shadow copy %s: %w", dst, err)
+				if !errors.Is(err, errUntrustedSource) {
+					return fmt.Errorf("install: relink the shadow copy %s: %w", dst, err)
+				}
+				// Not Apple-signed (the source or the toolchain tool): no
+				// copy, the same outcome as an untrusted source path.
+				_ = sys.RemoveAll(dst)
+				cfg.Logger.Warn("shadow source is not Apple-signed; no shadow copy made (pods that exec it run the host binary)",
+					"copy", c.Name, "source", c.Source, "err", err)
+				m.Skipped = append(m.Skipped, shadow.Skipped{Name: c.Name, Path: c.Source, Reason: err.Error()})
+				continue
 			}
 		}
 		if err := sys.AdHocSign(dst); err != nil {

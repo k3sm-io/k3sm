@@ -19,6 +19,7 @@ package install
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"strings"
@@ -132,5 +133,39 @@ func TestShadowSetSkipsAnUntrustedRelinkSource(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "not root-owned and protected") {
 		t.Errorf("no WARN for the skipped copy:\n%s", logs.String())
+	}
+}
+
+// TestShadowSetSkipsANonAppleSignedRelink: a relink refused for an untrusted
+// signature drops the copy, records it as skipped (so status does not call the
+// set stale), and the install goes on.
+func TestShadowSetSkipsANonAppleSignedRelink(t *testing.T) {
+	sys := newFakeSystem(t)
+	sys.failures = map[string]error{"RelinkRpaths": fmt.Errorf("%w: not Apple-signed", errUntrustedSource)}
+	cfg := serverCfg(t)
+	cfg.Logger = slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+	if err := makeShadowSet(sys, cfg); err != nil {
+		t.Fatalf("makeShadowSet: %v", err)
+	}
+	var manifest []byte
+	for p, b := range sys.files {
+		if strings.HasSuffix(p, "/"+shadow.ManifestName) {
+			manifest = b
+		}
+	}
+	m, err := shadow.Decode(manifest)
+	if err != nil {
+		t.Fatalf("decode the written manifest: %v", err)
+	}
+	if len(m.Skipped) != 1 || m.Skipped[0].Name != "xcodebuild" {
+		t.Fatalf("Skipped = %+v, want the xcodebuild copy", m.Skipped)
+	}
+	for _, s := range m.Sources {
+		if s.Name == "xcodebuild" {
+			t.Fatal("a skipped copy is listed as a source")
+		}
+	}
+	if missing, _ := shadow.Missing(m, func(string) bool { return true }); len(missing) != 0 {
+		t.Errorf("a skipped copy reads as missing: %+v", missing)
 	}
 }
