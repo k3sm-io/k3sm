@@ -603,8 +603,8 @@ func EnsureEgressAnnotationWarn(ctx context.Context, cs kubernetes.Interface) er
 func EnsureXcodeToolchainAnnotationWarn(ctx context.Context, cs kubernetes.Interface) error {
 	msg := fmt.Sprintf("k3sm: pod carries a hand-set %s annotation, which opts its sandbox into read "+
 		"access to this node's Xcode toolchain (SandboxProfile.xcode_toolchain_dir: the compilers, "+
-		"linker, SDKs, xcrun and xcodebuild, including a full xcodebuild build through the node's "+
-		"re-signed copy). What it grants is a full Xcode developer directory: "+
+		"linker, SDKs, the IDE plug-ins, xcrun and xcodebuild, including an xcodebuild build through "+
+		"the node's re-signed copy). What it grants is a full Xcode developer directory: "+
 		"on a node whose `xcode-select -p` names a Command Line Tools root the annotation grants "+
 		"nothing, and needs to grant nothing, because a pod already reads that tree. It is meant to be "+
 		"stamped by a controller acting on the pod's behalf, not set by hand — hand-setting it still "+

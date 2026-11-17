@@ -517,6 +517,14 @@ type System interface {
 	// finds the bundle's frameworks. Other rpaths are left alone. It runs
 	// before AdHocSign, which the edit invalidates.
 	RelinkRpaths(path, sourceDir string) error
+	// CheckTrustedSource reports whether a shadow source outside the
+	// SIP-protected system trees may be copied: path and every ancestor up to
+	// / is a real (not symlinked) file or directory owned by root and not
+	// world-writable, and group-writable only for the admin group, whose
+	// members can already become root. A Relink source is checked before it
+	// is cloned, because the copy becomes a root-owned binary every pod may
+	// exec without the signature gate. An error wraps errUntrustedSource.
+	CheckTrustedSource(path string) error
 	// CDHash reads path's code directory hash (codesign -dvvv).
 	CDHash(path string) (string, error)
 	// VerifyShadowCopy checks a made shadow copy (shadow.CheckCopyFile and

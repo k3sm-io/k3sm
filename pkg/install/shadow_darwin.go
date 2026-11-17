@@ -83,6 +83,12 @@ func (darwinSystem) RelinkRpaths(path, sourceDir string) error {
 	if err != nil {
 		return err
 	}
+	tool := installNameTool(sourceDir)
+	// The tool runs as root: it must come from a root-owned, protected tree
+	// (an Xcode a user owns could otherwise hand root a binary to run).
+	if err := (darwinSystem{}).CheckTrustedSource(tool); err != nil {
+		return fmt.Errorf("refusing to run %s as root: %w", tool, err)
+	}
 	if len(rewrites) == 0 {
 		return nil
 	}
@@ -93,7 +99,7 @@ func (darwinSystem) RelinkRpaths(path, sourceDir string) error {
 	args = append(args, path)
 	ctx, cancel := context.WithTimeout(context.Background(), shadowSignTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, installNameTool(sourceDir), args...)
+	cmd := exec.CommandContext(ctx, tool, args...)
 	if dev, ok := developerDirOf(sourceDir); ok {
 		cmd.Env = append(os.Environ(), "DEVELOPER_DIR="+dev)
 	}
@@ -101,6 +107,18 @@ func (darwinSystem) RelinkRpaths(path, sourceDir string) error {
 		return fmt.Errorf("install_name_tool %v: %w: %s", args, err, out)
 	}
 	return nil
+}
+
+// CheckTrustedSource walks path and its ancestors with lstat (see the System
+// interface for the rule).
+func (darwinSystem) CheckTrustedSource(path string) error {
+	return checkTrustedChain(path, func(p string) (trustStat, error) {
+		var st unix.Stat_t
+		if err := unix.Lstat(p, &st); err != nil {
+			return trustStat{}, err
+		}
+		return trustStat{uid: st.Uid, gid: st.Gid, mode: uint32(st.Mode)}, nil
+	})
 }
 
 // installNameTool is the toolchain's install_name_tool when sourceDir is in a

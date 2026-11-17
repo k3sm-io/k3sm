@@ -39,6 +39,12 @@ func shadowSetCalls(dir string, missing map[string]bool) []string {
 	read := map[string]bool{}
 	for _, c := range shadow.Copies() {
 		dst := dir + "/" + c.Name
+		if c.Relink {
+			out = append(out, "CheckTrustedSource:"+c.Source)
+			if missing[c.Source] {
+				continue
+			}
+		}
 		out = append(out, fmt.Sprintf("CloneToOwned:%s->%s:%d:%d:%#o", c.Source, dst,
 			shadowOwnership.uid, shadowOwnership.gid, shadowOwnership.mode))
 		if missing[c.Source] {

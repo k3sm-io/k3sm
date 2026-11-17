@@ -80,6 +80,18 @@ func makeShadowSet(sys System, cfg Config) error {
 			return fmt.Errorf("install: the shadow binary set took longer than %s (stopped before %s)", shadowSetBudget, c.Name)
 		}
 		dst := filepath.Join(dir, c.Name)
+		if c.Relink {
+			if err := sys.CheckTrustedSource(c.Source); err != nil {
+				if errors.Is(err, fs.ErrNotExist) {
+					cfg.Logger.Warn("host binary not present; no shadow copy made (pods that exec it run the host binary)",
+						"copy", c.Name, "source", c.Source)
+				} else {
+					cfg.Logger.Warn("shadow source is not root-owned and protected; no shadow copy made (pods that exec it run the host binary)",
+						"copy", c.Name, "source", c.Source, "err", err)
+				}
+				continue
+			}
+		}
 		if err := sys.CloneToOwned(c.Source, dst, shadowOwnership.uid, shadowOwnership.gid, shadowOwnership.mode); err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
 				cfg.Logger.Warn("host binary not present; no shadow copy made (pods that exec it run the host binary)",

@@ -259,9 +259,14 @@ Pod's data volume, and the rename stays on one volume.
 `k3sm.io/xcode-toolchain` annotation, on a node whose Xcode is `/Applications/Xcode.app`:
 
 ```sh
+export PATH="$DEVELOPER_DIR/usr/bin:$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin:$PATH"
 xcodebuild -project App.xcodeproj -scheme App -configuration Debug \
   -derivedDataPath "$PWD/DerivedData" CODE_SIGN_IDENTITY=- build
 ```
+
+- Put `$DEVELOPER_DIR/usr/bin` before `/usr/bin` on `PATH`, or name
+  `$DEVELOPER_DIR/usr/bin/xcodebuild`. `/usr/bin/xcodebuild` is Apple's `xcrun` shim, a platform
+  binary, and through it `xcodebuild` starts without k3sm's copy and fails as before.
 
 - Keep `-derivedDataPath` in the Pod's data volume. The default, `~/Library/Developer/Xcode/DerivedData`,
   is under the node user's home, which a Pod cannot write.
@@ -274,13 +279,19 @@ xcodebuild -project App.xcodeproj -scheme App -configuration Debug \
   entitlements and ships `xcrun` as a platform binary, and macOS ignores `DIRHELPER_USER_DIR_SUFFIX`
   and the path-rebase shim for both. `sudo k3sm install` copies each into the node's shadow
   directory, re-signs it ad hoc without the entitlements, and k3sm runs the copy wherever a Pod
-  execs `/usr/bin/xcrun`, `/usr/bin/xcodebuild` or Xcode's own `xcodebuild`. The copies use the
+  execs `/usr/bin/xcrun` or Xcode's own `xcodebuild`. The copies use the
   Pod's own temp and cache directories, so `xcrun` caches its lookups instead of starting
-  `xcodebuild` for each one. After an Xcode update, run `sudo k3sm install` again: `k3sm status`
-  reports the copy as drifted until you do, and a stale copy may fail to start.
+  `xcodebuild` for each one. A copy has no entitlements and no hardened runtime, so it honours
+  `DYLD_*` variables from the Pod's environment; that runs code inside the Pod's own sandbox and
+  gains it nothing. `sudo k3sm install` makes the `xcodebuild` copy only when Xcode and every
+  directory above it are owned by root and not writable by other users. After an Xcode update, run
+  `sudo k3sm install` again: `k3sm status` reports the copy as drifted until you do, and a copy
+  older than the Xcode it loads its frameworks from may fail to start.
 - The read grant for Xcode now includes `Contents/PlugIns`, the IDE plug-ins a build loads, without
-  their helper apps and XPC services. A build needs no Mach service and no launchd job, and the
-  profile grants none.
+  their helper apps, app extensions and XPC services. The profile grants no Mach service and no
+  launchd job. The builds k3sm measured (a macOS app target and Swift packages) finish without
+  either; a build step that needs a system service, such as some asset or Interface Builder
+  compilers, fails in the Pod and is worth reporting.
 
 What this does not cover:
 

@@ -20,8 +20,11 @@ import (
 	"debug/macho"
 	"errors"
 	"fmt"
+	"io/fs"
 	"path/filepath"
 	"strings"
+
+	"golang.org/x/sys/unix"
 )
 
 // executablePathPrefix is the dyld token a bundled binary's rpaths start with.
@@ -38,6 +41,13 @@ var errRelinkSourceDir = errors.New("relink: source dir is not an absolute clean
 func executableRpathRewrites(path, sourceDir string) ([][2]string, error) {
 	if !filepath.IsAbs(sourceDir) || filepath.Clean(sourceDir) != sourceDir {
 		return nil, fmt.Errorf("%w: %q", errRelinkSourceDir, sourceDir)
+	}
+	// Every rewritten rpath must stay inside the application bundle that
+	// holds the source (<bundle>/Contents/Developer/...): the copy may load
+	// the bundle's frameworks and nothing else by that route.
+	bundle := ""
+	if dev, ok := developerDirOf(sourceDir); ok && filepath.Base(filepath.Dir(dev)) == "Contents" {
+		bundle = filepath.Dir(filepath.Dir(dev))
 	}
 	slices, err := machoRpaths(path)
 	if err != nil {
@@ -70,7 +80,11 @@ func executableRpathRewrites(path, sourceDir string) ([][2]string, error) {
 		if rest != "" && !strings.HasPrefix(rest, "/") {
 			return nil, fmt.Errorf("relink %s: rpath %q is not @executable_path or @executable_path/...", path, old)
 		}
-		out = append(out, [2]string{old, filepath.Clean(sourceDir + rest)})
+		abs := filepath.Clean(sourceDir + rest)
+		if bundle == "" || (abs != bundle && !strings.HasPrefix(abs, bundle+"/")) {
+			return nil, fmt.Errorf("relink %s: rpath %q resolves to %s, outside the bundle %q", path, old, abs, bundle)
+		}
+		out = append(out, [2]string{old, abs})
 	}
 	return out, nil
 }
@@ -112,4 +126,48 @@ func developerDirOf(dir string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// errUntrustedSource reports a path some non-root identity could replace.
+var errUntrustedSource = errors.New("not a root-owned, protected path")
+
+// adminGID is the macOS admin group. Its members can become root, so a tree
+// they may write (/Applications is root:admin 0775) is no weaker than root's.
+const adminGID = 80
+
+// trustStat is the part of lstat checkTrustedChain reads.
+type trustStat struct {
+	uid, gid uint32
+	mode     uint32
+}
+
+// checkTrustedChain applies CheckTrustedSource's rule to path and each
+// ancestor, with lstat injected for tests. A missing path wraps
+// fs.ErrNotExist so the caller can tell "absent" from "untrusted".
+func checkTrustedChain(path string, lstat func(string) (trustStat, error)) error {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return fmt.Errorf("%w: %q is not an absolute clean path", errUntrustedSource, path)
+	}
+	for p := path; ; p = filepath.Dir(p) {
+		st, err := lstat(p)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) || errors.Is(err, unix.ENOENT) {
+				return fmt.Errorf("%s: %w", p, fs.ErrNotExist)
+			}
+			return fmt.Errorf("%w: %s: lstat: %v", errUntrustedSource, p, err)
+		}
+		switch {
+		case st.mode&unix.S_IFMT == unix.S_IFLNK:
+			return fmt.Errorf("%w: %s is a symlink", errUntrustedSource, p)
+		case st.uid != 0:
+			return fmt.Errorf("%w: %s is owned by uid %d, not root", errUntrustedSource, p, st.uid)
+		case st.mode&unix.S_IWOTH != 0:
+			return fmt.Errorf("%w: %s is world-writable", errUntrustedSource, p)
+		case st.mode&unix.S_IWGRP != 0 && st.gid != 0 && st.gid != adminGID:
+			return fmt.Errorf("%w: %s is writable by group %d", errUntrustedSource, p, st.gid)
+		}
+		if p == "/" {
+			return nil
+		}
+	}
 }

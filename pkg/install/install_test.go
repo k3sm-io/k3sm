@@ -172,6 +172,8 @@ type fakeSystem struct {
 	// EVERY path present, so an unconfigured fake describes a healthy install and
 	// only a test that cares about the netd socket has to say so.
 	missingPaths map[string]bool
+	// untrustedPaths makes CheckTrustedSource refuse a shadow source.
+	untrustedPaths map[string]error
 	// verifyErrs[path] is the error VerifyShadowCopy reports for a made shadow
 	// copy; the zero value verifies every copy.
 	verifyErrs map[string]error
@@ -876,6 +878,16 @@ func (f *fakeSystem) CloneToOwned(src, dst string, uid, gid int, mode fs.FileMod
 	}
 	f.putTree(dst, src)
 	return nil
+}
+
+// CheckTrustedSource records the check and answers untrustedPaths[path] or,
+// for a source in missingPaths, fs.ErrNotExist.
+func (f *fakeSystem) CheckTrustedSource(path string) error {
+	f.calls = append(f.calls, "CheckTrustedSource:"+path)
+	if f.missingPaths[path] {
+		return fmt.Errorf("%s: %w", path, fs.ErrNotExist)
+	}
+	return f.untrustedPaths[path]
 }
 
 // RelinkRpaths records the relink.
