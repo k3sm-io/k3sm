@@ -12,6 +12,13 @@ pin, its date, and the tarball's sha256.
 
 ### Added
 
+- New unpinned Pods prefer a node whose Mac is not CPU-busy. Each node reports a `HostCPUBusy`
+  condition from the whole Mac's CPU, Pods and every other process, averaged over about two minutes
+  (True from 75%, cleared below 50%), and the server puts the
+  `k3sm.io/host-cpu-busy:PreferNoSchedule` taint on a node while it is True. Before this, a Mac
+  whose own builds held every core still looked empty to the scheduler and kept getting new Pods.
+  Pinned Pods and DaemonSets are unaffected and nothing is evicted. See
+  [Limitations](docs/user/limitations.md).
 - A native Pod can publish a volume to one host account with an inline CSI volume of driver
   `expose.k3sm.io` (`volumeAttributes.user`, and `access: read` or `read-write`). The node admin
   grants it per account and namespace with `sudo k3sm expose allow --user <name> --namespace <ns>`,

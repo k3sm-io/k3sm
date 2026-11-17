@@ -949,6 +949,20 @@ always agree.
   The rungs are held in memory: after a node-daemon restart the first sample starts with no hold,
   and swap growth reads unset until a second sample exists. The rung values for swap growth and
   swap-volume free space are provisional.
+- **`HostCPUBusy` steers new Pods away from a busy Mac.** The scheduler scores a node by the CPU
+  its Pods request, so a Mac whose own apps and builds hold every core still looks empty to it. The
+  node measures the whole Mac's CPU, Pods and every other process, averaged over about two minutes,
+  and reports `HostCPUBusy=True` from 75% until the average falls below 50%. While it is True the
+  server puts the `k3sm.io/host-cpu-busy:PreferNoSchedule` taint on the node, and takes it off when
+  the condition clears. The taint only lowers the node's score: a Pod still lands there when it is
+  pinned to that node, is a DaemonSet Pod, tolerates the taint, or has no other node to go to.
+  The lowering is large: it outweighs the resource and spreading scores, so while one Mac is busy
+  the unpinned Pods created then, replicas of one Deployment included, all go to the other Macs.
+  Nothing running is moved or evicted. A node that reports no condition (its daemon has just
+  restarted, its CPU reading keeps failing, or it runs a release without this condition) keeps a
+  taint it already had for 3 minutes, then loses it. After a rollback of the servers to a release
+  without this change nothing removes the taint; remove it with
+  `kubectl taint node <node> k3sm.io/host-cpu-busy:PreferNoSchedule-`.
 - **One Pod per round.** After each eviction k3sm waits for that Pod to stop and for a fresh
   sample, and evicts again only if pressure is not falling. After 3 evictions in 5 minutes it stops
   for the rest of that pressure episode, logs an error, and records an `EvictionCascadeHalted`

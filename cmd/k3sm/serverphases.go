@@ -41,6 +41,7 @@ import (
 	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/executor"
+	"k3sm.io/k3sm/pkg/hostload"
 	"k3sm.io/k3sm/pkg/ingresshost"
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/interconnect"
@@ -649,10 +650,39 @@ func startServerOperators(ctx context.Context, plan serverPlan, restCfg *rest.Co
 	}
 	go runUpdateRecorder(ctx, plan.opts.workDir, plan.opts.nodeName, releaseBaseURL(plan.opts.updateReleaseBase), cs, dyn, logger)
 	stopUpdates := startUpdateController(ctx, plan, restCfg, cs, logger)
+	stopHostLoad := startHostLoadReconciler(ctx, cs, logger)
 	return mlxGPU, func() {
+		stopHostLoad()
 		stopUpdates()
 		stopInterconnect()
 		stopMLX()
+	}
+}
+
+// startHostLoadReconciler starts the host cpu taint reconciler (pkg/hostload):
+// it keeps the k3sm.io/host-cpu-busy PreferNoSchedule taint on the nodes whose
+// HostCPUBusy condition is True, so new unpinned pods prefer a Mac whose host is
+// not saturated. It runs on the in-process admin client like the other server
+// operators, because NodeRestriction forbids a node from changing its own
+// taints. Every server runs one; their writes are resourceVersion-guarded and
+// agree. A reconciler that cannot be built is logged and stop is noStop.
+func startHostLoadReconciler(ctx context.Context, cs kubernetes.Interface, logger *slog.Logger) (stop func()) {
+	r, err := hostload.New(hostload.Config{Client: cs, Log: logger})
+	if err != nil {
+		logger.Error("host cpu taint reconciler disabled", "err", err)
+		return noStop
+	}
+	hCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := r.Run(hCtx); err != nil && hCtx.Err() == nil {
+			logger.Error("host cpu taint reconciler", "err", err)
+		}
+	}()
+	return func() {
+		cancel()
+		<-done
 	}
 }
 
