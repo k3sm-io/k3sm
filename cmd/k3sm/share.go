@@ -43,7 +43,10 @@ const shareUsage = `Usage:
                                         read-only, or one Unix socket), with
                                         pods in every namespace or only in
                                         the named ones
-  k3sm share remove [--no-acl] <path>   stop sharing a path
+  k3sm share remove [--no-acl] [--namespace <ns>]... <path>
+                                        stop sharing a path (only its line
+                                        for exactly those namespaces, when
+                                        given)
   k3sm share list                       print the shares and delegations (also: ls)
   sudo k3sm share delegate --user <name> [--modes rw,ro,socket]
                           [--namespaces <ns>,...] <prefix>
@@ -63,10 +66,13 @@ Which pods. With no --namespace a share admits pods in every namespace. Each
 --namespace <ns> limits it to pods in that namespace; <ns> is a namespace name
 or a prefix pattern ending in one '*' (yurei-p-* is every namespace starting
 yurei-p-). A pod in any other namespace is refused (FailedHostShare naming its
-namespace). Adding a path again replaces its line, so to narrow a share add it
-again with the namespaces it keeps. A share for every namespace still admits
-every namespace whatever narrower lines exist, so narrowing one means replacing
-it. Each node reads its own list.
+namespace). A path may have one line per namespace set, with its own mode:
+rw for yurei-system and ro for yurei-* is two lines. Adding a path again
+replaces its line for the same namespaces; a line for every namespace and a
+namespaced line replace each other, so to narrow a share add it again with
+the namespaces it keeps. Where two lines for one path both admit a pod, the
+more specific path decides and, on the same path, rw wins. Each node reads its
+own list.
 
 Who may add a share. Root, with sudo, anywhere the rules below allow; the list
 is ` + hostshare.DefaultFile + `, owned by root and writable by root alone. Or a
@@ -231,6 +237,10 @@ func runShareWith(args []string, env shareEnv) int {
 		})
 	case "remove":
 		fs.BoolVar(&f.noACL, "no-acl", false, "leave file permissions alone")
+		fs.Func("namespace", "remove only the path's line for exactly these namespaces; repeat for more", func(v string) error {
+			f.namespaces = append(f.namespaces, v)
+			return nil
+		})
 	case "delegate", "undelegate":
 		fs.StringVar(&f.user, "user", "", "the account the prefix is delegated to")
 		if verb == "delegate" {
@@ -319,7 +329,7 @@ func (s *sharer) add(arg string) int {
 	}
 	var owner uint32
 	if s.root {
-		kept := slices.DeleteFunc(slices.Clone(nf.Entries), func(x hostshare.Entry) bool { return x.Path == path })
+		kept := slices.DeleteFunc(slices.Clone(nf.Entries), func(x hostshare.Entry) bool { return replacedBy(x, e) })
 		nf.Entries = append(kept, e)
 		if err := s.env.write(s.env.file, hostshare.FormatFile(nf)); err != nil {
 			return s.fail("add", err)
@@ -359,7 +369,7 @@ func (s *sharer) add(arg string) int {
 		if err != nil {
 			return s.fail("add", err)
 		}
-		entries = slices.DeleteFunc(entries, func(x hostshare.Entry) bool { return x.Path == path })
+		entries = slices.DeleteFunc(entries, func(x hostshare.Entry) bool { return replacedBy(x, e) })
 		entries = append(entries, e)
 		if err := s.env.write(hostshare.UserFile(s.env.file, owner), hostshare.FormatUser(entries)); err != nil {
 			return s.fail("add", err)
@@ -390,9 +400,9 @@ func (s *sharer) remove(arg string) int {
 	var removed []hostshare.Entry
 	var owner uint32
 	if s.root {
-		kept := slices.DeleteFunc(slices.Clone(nf.Entries), func(e hostshare.Entry) bool { return e.Path == path })
+		kept := slices.DeleteFunc(slices.Clone(nf.Entries), func(e hostshare.Entry) bool { return s.removes(e, path) })
 		for _, e := range nf.Entries {
-			if e.Path == path {
+			if s.removes(e, path) {
 				removed = append(removed, e)
 			}
 		}
@@ -413,9 +423,9 @@ func (s *sharer) remove(arg string) int {
 		if err != nil {
 			return s.fail("remove", err)
 		}
-		kept := slices.DeleteFunc(slices.Clone(entries), func(e hostshare.Entry) bool { return e.Path == path })
+		kept := slices.DeleteFunc(slices.Clone(entries), func(e hostshare.Entry) bool { return s.removes(e, path) })
 		for _, e := range entries {
-			if e.Path == path {
+			if s.removes(e, path) {
 				removed = append(removed, e)
 			}
 		}
@@ -758,6 +768,31 @@ func shareList(env shareEnv) int {
 		fmt.Fprintf(env.stdout, "not admitted (uid %d): %s: %s\n", d.UID, what, d.Reason)
 	}
 	return 0
+}
+
+// replacedBy reports whether adding e replaces the existing line x. One path
+// may carry a line per namespace set (rw for one namespace, ro for others),
+// so e replaces the path's line for the same set, and a line for every
+// namespace and a namespaced line replace each other: adding a namespaced
+// line is how a share for every namespace is narrowed.
+func replacedBy(x, e hostshare.Entry) bool {
+	if x.Path != e.Path {
+		return false
+	}
+	return len(x.Namespaces) == 0 || len(e.Namespaces) == 0 || sameNamespaces(x.Namespaces, e.Namespaces)
+}
+
+// removes reports whether `share remove` takes line e for path: every line
+// for the path, or with --namespace only the line for exactly that set.
+func (s *sharer) removes(e hostshare.Entry, path string) bool {
+	return e.Path == path && (len(s.f.namespaces) == 0 || sameNamespaces(e.Namespaces, s.f.namespaces))
+}
+
+func sameNamespaces(a, b []string) bool {
+	a, b = slices.Clone(a), slices.Clone(b)
+	slices.Sort(a)
+	slices.Sort(b)
+	return slices.Equal(a, b)
 }
 
 // namespacesPhrase says which pods a share line, or a delegation's cap,

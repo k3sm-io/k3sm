@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -467,5 +468,68 @@ func TestShareNamespace(t *testing.T) {
 	env, out, _ = user()
 	if code := runShareWith([]string{"list"}, env); code != 0 || !strings.Contains(out.String(), "rw "+app+" namespaces=proj-*\t(added by dev") {
 		t.Errorf("list = %d %q, want the delegated line with the inherited cap", code, out)
+	}
+}
+
+// TestShareNamespaceSamePath pins that one path can carry a line per
+// namespace set: adding `ro --namespace yurei-*` keeps the `rw
+// --namespace yurei-system` line, re-adding the same set replaces its own
+// line, a namespaced add replaces the path's line for every namespace (the
+// way a share is narrowed), and remove --namespace takes one line only.
+func TestShareNamespaceSamePath(t *testing.T) {
+	t.Parallel()
+	f := newShareFixture(t)
+	code := filepath.Join(f.base, "Other")
+	add := func(args ...string) {
+		t.Helper()
+		env, _, errb := f.env(0)
+		if c := runShareWith(append([]string{"add", "--no-acl"}, args...), env); c != 0 {
+			t.Fatalf("add %v = %d (%s)", args, c, errb)
+		}
+	}
+	lines := func() string {
+		nf, err := hostshare.ParseFile(bytes.NewReader(f.stored))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var ls []string
+		for _, e := range nf.Entries {
+			ls = append(ls, e.String())
+		}
+		slices.Sort(ls)
+		return strings.Join(ls, "|")
+	}
+	add(code)
+	add("--namespace", "yurei-system", code)
+	if got, want := lines(), "rw "+code+" namespaces=yurei-system"; got != want {
+		t.Fatalf("after narrowing: %q, want %q (the line for every namespace replaced)", got, want)
+	}
+	add("--read-only", "--namespace", "yurei-*", code)
+	want := "ro " + code + " namespaces=yurei-*|rw " + code + " namespaces=yurei-system"
+	if got := lines(); got != want {
+		t.Fatalf("after the ro line: %q, want %q", got, want)
+	}
+	add("--namespace", "yurei-system", code) // same set: replaces only its own line
+	if got := lines(); got != want {
+		t.Errorf("after re-adding yurei-system: %q, want %q", got, want)
+	}
+	env, out, _ := f.env(501)
+	if c := runShareWith([]string{"list"}, env); c != 0 || !strings.Contains(out.String(), "ro "+code) || !strings.Contains(out.String(), "rw "+code) {
+		t.Errorf("list = %d %q, want both lines", c, out)
+	}
+	env, _, errb := f.env(0)
+	if c := runShareWith([]string{"remove", "--no-acl", "--namespace", "yurei-*", code}, env); c != 0 {
+		t.Fatalf("remove --namespace = %d (%s)", c, errb)
+	}
+	if got, want := lines(), "rw "+code+" namespaces=yurei-system"; got != want {
+		t.Errorf("after remove --namespace: %q, want %q", got, want)
+	}
+	env, _, _ = f.env(0)
+	if c := runShareWith([]string{"remove", "--no-acl", "--namespace", "other", code}, env); c != 1 {
+		t.Errorf("remove of a set the path has no line for = %d, want 1", c)
+	}
+	add(code) // a line for every namespace replaces every line for the path
+	if got, want := lines(), "rw "+code; got != want {
+		t.Errorf("after a node-wide add: %q, want %q", got, want)
 	}
 }
