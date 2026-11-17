@@ -610,7 +610,9 @@ Today at `main`, per port class:
   is off cannot keep it from starting later. A `type: LoadBalancer`
   Service declaring one of those ports is **rejected at `kubectl apply`** with a message naming the
   port, and every node additionally refuses to bind it. Plain NodePort Services are unaffected,
-  because the apiserver allocates their `nodePort` out of that very range. Ordinary duplicate
+  because the apiserver allocates their `nodePort` out of that very range. A Service that pins its
+  own `nodePort` should pick it from the static band, `30000-30085`; see
+  [Fixed NodePorts](install.md#fixed-nodeports). Ordinary duplicate
   LoadBalancer ports are **not** arbitrated. Two Services on `8080` that land on the same node are
   first-come there, and the loser is left out of its status on that node (a `HostNotBound` Warning
   Event names the node). Node pools can keep them apart; see [Multi-node](multi-node.md#node-pools).
