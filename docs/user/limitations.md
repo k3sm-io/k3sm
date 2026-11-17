@@ -118,6 +118,42 @@ names. The runtime moves a workload's own names under that prefix, so programs n
 - Untrusted or multi-tenant work belongs on the **`vm` RuntimeClass**, where the Linux guest has its
   own IPC namespace (see [`vm` RuntimeClass](vm-runtimeclass.md)).
 
+### System V IPC Is Not Available in a Native Pod
+
+A native Pod cannot use System V shared memory, semaphores or message queues. `shmget`, `semget` and
+`msgget` fail with `ENOSYS` ("function not implemented"), the error a kernel built without System V
+IPC gives, so a program that can fall back does, and one that cannot fails at once with a clear
+message. macOS keeps these objects in one table for the whole host, keyed by numbers any process can
+guess, and the sandbox has no way to give each Pod its own part of it. Every Pod also runs as the same
+OS user (see "No Per-Pod uid Isolation" above), so allowing System V IPC would let one Pod read and
+write another Pod's shared memory.
+
+- **Stock PostgreSQL does not run natively.** It creates a small System V shared-memory segment at
+  every start, and on macOS it uses System V semaphores by default. It stops with `could not create
+  shared memory segment: Function not implemented`. Run it on the `vm` RuntimeClass, or use a build
+  that avoids System V IPC entirely: `PREFERRED_SEMAPHORES=NAMED_POSIX` replaces the semaphores, but
+  the start-up segment needs a source change.
+- The refusal comes from the library k3sm injects into native processes. A process that does not
+  load it (a platform binary, a container that sets its own `DYLD_INSERT_LIBRARIES`, or a program
+  that makes the system call directly instead of through the C library) can still create an object,
+  but the sandbox refuses every use of it, its removal included. Until something removes it, it
+  counts against the host's limit, which is small for shared memory (`kern.sysv.shmmni`, 32
+  segments), so a Pod that creates objects in a loop can exhaust it for every process on the Mac.
+- An installed node removes such shared-memory segments and semaphore sets itself. About every
+  minute it deletes one that the k3sm service account both owns and created, that was never used,
+  that no process is waiting on, that has stood unchanged for two minutes and, for a segment, whose
+  creator is not a live process outside a Pod. Any other process running as the service account
+  loses an object it leaves in that state. An object created without read permission for its owner
+  (mode `0000` or `0200`) cannot be inspected, so the node leaves it alone; remove it with `ipcrm`.
+- The node never removes a message queue, because nothing records who made one or who is waiting on
+  it. It logs each unused queue the service account owns once, and you remove it with `ipcrm -q
+  <id>` after checking that nothing uses it.
+- A node whose daemon runs as root or as a person (`k3sm dev`) removes nothing, because there the
+  Pods' objects cannot be told apart from yours. On such a node a leaked object stays until you
+  remove it with `ipcrm`.
+- POSIX shared memory (`shm_open`) stays denied, as above. POSIX named semaphores and anonymous
+  shared `mmap` work.
+
 ### A Native Pod Signals Its Own Process Group
 
 A process in a native Pod can signal its own children and every process in its own process group, so
