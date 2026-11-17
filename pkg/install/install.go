@@ -511,6 +511,7 @@ type System interface {
 	// so the copy is neither a platform binary nor restricted and dyld keeps
 	// DYLD_INSERT_LIBRARIES in it.
 	AdHocSign(path string) error
+	shadowRelinker // RelinkRpaths and CheckTrustedSource (relink.go)
 	// CDHash reads path's code directory hash (codesign -dvvv).
 	CDHash(path string) (string, error)
 	// VerifyShadowCopy checks a made shadow copy (shadow.CheckCopyFile and

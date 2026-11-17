@@ -78,7 +78,7 @@ func TestCopiesAreTheSharedList(t *testing.T) {
 		t.Fatalf("Copies() = %d entries, want %d", len(got), len(entries))
 	}
 	for i, e := range entries {
-		if got[i] != (Copy{Name: e.Copy, Source: e.Source}) {
+		if got[i] != (Copy{Name: e.Copy, Source: e.Source, Relink: e.Relink}) {
 			t.Errorf("copy %d = %+v, want %s from %s", i, got[i], e.Copy, e.Source)
 		}
 	}
