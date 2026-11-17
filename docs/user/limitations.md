@@ -181,7 +181,8 @@ A Pod compiles. `clang` and `swiftc` build C, Objective-C and Swift against an i
 Pod's own data volume, and the binary they produce runs. Ad-hoc signing works as well:
 `codesign -f -s -` succeeds on a file named by a relative or an absolute path.
 
-`swift build` and `swift test` complete in a Pod with the default build system (Swift Build):
+`swift build` and `swift test` complete in a Pod with the default build system (Swift Build), on
+a node running a release that gives each Pod its own replacement directory (below):
 
 ```sh
 export PATH="$DEVELOPER_DIR/usr/bin:$PATH"     # Command Line Tools
@@ -211,13 +212,31 @@ removed with the Pod. Swift Build runs its link step with almost no environment,
 shim carries the variable into child processes that dropped it. The variable is set by k3sm; a
 value in the Pod spec is replaced.
 
+The temp directories are not the only shared place. On a node, `/var/lib/k3sm` is its own APFS
+volume, and for a file on a volume other than the temp directory's, Foundation stages an atomic
+write (`Data.write(options: .atomic)`, `FileManager.url(for: .itemReplacementDirectory)`, and so
+SwiftPM's own manifest and build-description writes) in
+`<volume root>/.TemporaryItems/folders.<uid>`. That directory is one per user, so every Pod on the
+node would share it. Earlier releases did not grant it, and `swift build` in a Pod on a node stopped
+with `You don't have permission to save the file` (Cocoa error 513) although this page said it
+worked. The profile now denies that directory outright, and the path-rebase shim, which k3sm loads
+in every container once it has read the volume's mount point at start, points the path at the Pod's
+own data volume, where it does not exist. Foundation then stages the write beside the file, in the
+Pod's data volume, and the rename stays on one volume.
+
 What this does not cover:
 
 - **`xcodebuild` builds.** `xcodebuild` ignores the variable, and a full build also needs services and
   parts of Xcode that no read grant reaches (LaunchServices, FSEvents, job creation, the plug-ins).
   `swift build --build-system native` remains available for a package, though SwiftPM has deprecated it.
 - **Platform and hardened-runtime binaries** ignore the variable, so they keep the shared directory
-  and fail with `Operation not permitted` when they write there, as before.
+  and fail with `Operation not permitted` when they write there, as before. They do not load the
+  path-rebase shim either, so an atomic Foundation write they make into the Pod's data volume fails
+  the same way. So does a container that sets its own `DYLD_INSERT_LIBRARIES`, which k3sm then
+  leaves without the shim.
+- **A volume on another disk.** A persistent volume or host path on a volume other than the node's
+  `/var/lib/k3sm` stages its atomic writes in that volume's own `.TemporaryItems`, which k3sm neither
+  redirects nor grants, so those writes fail with `Operation not permitted`.
 - **A container that runs as another uid** (`runAsUser`) gets that user's directories, where k3sm
   makes no links.
 - **A link the OS removes while a process runs.** macOS empties the temp directory at boot. k3sm
