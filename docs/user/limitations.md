@@ -206,7 +206,7 @@ to hold once the Mac has reused it.
 - Upgrading the node to a release with this grant changes every running Pod's profile, so the daemon
   recreates those Pods instead of re-attaching them, and they come back with the grant.
 
-### SwiftPM Builds in a Pod, `xcodebuild` Builds Do Not
+### SwiftPM and `xcodebuild` Builds in a Pod
 
 A Pod compiles. `clang` and `swiftc` build C, Objective-C and Swift against an installed SDK into the
 Pod's own data volume, and the binary they produce runs. Ad-hoc signing works as well:
@@ -255,13 +255,39 @@ in every container once it has read the volume's mount point at start, points th
 own data volume, where it does not exist. Foundation then stages the write beside the file, in the
 Pod's data volume, and the rename stays on one volume.
 
+`xcodebuild` builds a project, a workspace or a package in a Pod that carries the
+`k3sm.io/xcode-toolchain` annotation, on a node whose Xcode is `/Applications/Xcode.app`:
+
+```sh
+xcodebuild -project App.xcodeproj -scheme App -configuration Debug \
+  -derivedDataPath "$PWD/DerivedData" CODE_SIGN_IDENTITY=- build
+```
+
+- Keep `-derivedDataPath` in the Pod's data volume. The default, `~/Library/Developer/Xcode/DerivedData`,
+  is under the node user's home, which a Pod cannot write.
+- Sign ad hoc (`CODE_SIGN_IDENTITY=-`, or `CODE_SIGN_STYLE = Manual` with an identity of `-` in the
+  project). A Developer ID or Apple Development identity needs the keychain (below).
+- Simulators, devices, `xcodebuild test` against a destination other than `platform=macOS`, and
+  anything that talks to a running Xcode are not available: the Pod reaches none of the services they
+  use.
+- `xcodebuild` and `xcrun` run as k3sm's re-signed copies. Apple signs `xcodebuild` with private
+  entitlements and ships `xcrun` as a platform binary, and macOS ignores `DIRHELPER_USER_DIR_SUFFIX`
+  and the path-rebase shim for both. `sudo k3sm install` copies each into the node's shadow
+  directory, re-signs it ad hoc without the entitlements, and k3sm runs the copy wherever a Pod
+  execs `/usr/bin/xcrun`, `/usr/bin/xcodebuild` or Xcode's own `xcodebuild`. The copies use the
+  Pod's own temp and cache directories, so `xcrun` caches its lookups instead of starting
+  `xcodebuild` for each one. After an Xcode update, run `sudo k3sm install` again: `k3sm status`
+  reports the copy as drifted until you do, and a stale copy may fail to start.
+- The read grant for Xcode now includes `Contents/PlugIns`, the IDE plug-ins a build loads, without
+  their helper apps and XPC services. A build needs no Mach service and no launchd job, and the
+  profile grants none.
+
 What this does not cover:
 
-- **`xcodebuild` builds.** `xcodebuild` ignores the variable, and a full build also needs services and
-  parts of Xcode that no read grant reaches (LaunchServices, FSEvents, job creation, the plug-ins).
-  `swift build --build-system native` remains available for a package, though SwiftPM has deprecated it.
-- **Platform and hardened-runtime binaries** ignore the variable, so they keep the shared directory
-  and fail with `Operation not permitted` when they write there, as before. They do not load the
+- **A node whose Xcode lives elsewhere** (`Xcode-beta.app`, a versioned name). It gets no
+  `xcodebuild` copy, and `xcodebuild` in its Pods still fails as before. `swift build` is unaffected.
+- **Platform and hardened-runtime binaries** outside the shadow set ignore the variable, so they
+  keep the shared directory and fail with `Operation not permitted` when they write there, as before. They do not load the
   path-rebase shim either, so an atomic Foundation write they make into the Pod's data volume fails
   the same way. So does a container that sets its own `DYLD_INSERT_LIBRARIES`, which k3sm then
   leaves without the shim.
@@ -281,10 +307,11 @@ fails at its last step with `unable to spawn process 'codesign'`. Set `PATH` in 
 `env`, with `/usr/bin` and `/bin` after the toolchain's `bin`, for example
 `/Library/Developer/CommandLineTools/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin`.
 
-One message on the way is not a failure, and it is worth recognising. Apple's toolchain resolves its
-`xcrun` lookup cache through `confstr(_CS_DARWIN_USER_TEMP_DIR)`, which **ignores `TMPDIR`** and names
-a path under `/var/folders` that the profile does not grant. Invocations therefore print
-`couldn't create cache file … Operation not permitted` on **stderr** and then succeed on stdout. The
+One message on the way is not a failure, and it is worth recognising. On a node installed before
+k3sm shipped its `xcrun` copy, or one without Xcode, `xcrun` resolves its lookup cache in the shared
+`/var/folders` tree, which the profile does not grant. Invocations then print
+`couldn't create cache file … Operation not permitted` on **stderr** and succeed on stdout, slowly,
+because nothing is cached. The
 clang module cache resolves the same way, and that one would have broken compilation, so k3sm gives
 every Pod its own by pointing `CLANG_MODULE_CACHE_PATH` into the Pod's data volume, for every Pod,
 with no annotation required.
