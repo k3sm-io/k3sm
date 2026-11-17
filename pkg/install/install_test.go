@@ -878,6 +878,12 @@ func (f *fakeSystem) CloneToOwned(src, dst string, uid, gid int, mode fs.FileMod
 	return nil
 }
 
+// RelinkRpaths records the relink.
+func (f *fakeSystem) RelinkRpaths(path, sourceDir string) error {
+	f.calls = append(f.calls, "RelinkRpaths:"+path+":"+sourceDir)
+	return f.failures["RelinkRpaths"]
+}
+
 // AdHocSign records the re-sign.
 func (f *fakeSystem) AdHocSign(path string) error {
 	f.calls = append(f.calls, "AdHocSign:"+path)

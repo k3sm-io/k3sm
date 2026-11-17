@@ -73,6 +73,48 @@ func (darwinSystem) AdHocSign(path string) error {
 	return image.AdHocSign(ctx, path)
 }
 
+// RelinkRpaths reads path's LC_RPATH load commands with debug/macho and
+// rewrites each @executable_path one with install_name_tool, resolved against
+// sourceDir. The tool comes from the developer dir that holds sourceDir when
+// there is one (xcodebuild is the only Relink copy, and it lives in one), so
+// the libxcselect trampoline's own developer-dir lookup is not involved.
+func (darwinSystem) RelinkRpaths(path, sourceDir string) error {
+	rewrites, err := executableRpathRewrites(path, sourceDir)
+	if err != nil {
+		return err
+	}
+	if len(rewrites) == 0 {
+		return nil
+	}
+	args := make([]string, 0, 3*len(rewrites)+1)
+	for _, r := range rewrites {
+		args = append(args, "-rpath", r[0], r[1])
+	}
+	args = append(args, path)
+	ctx, cancel := context.WithTimeout(context.Background(), shadowSignTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, installNameTool(sourceDir), args...)
+	if dev, ok := developerDirOf(sourceDir); ok {
+		cmd.Env = append(os.Environ(), "DEVELOPER_DIR="+dev)
+	}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("install_name_tool %v: %w: %s", args, err, out)
+	}
+	return nil
+}
+
+// installNameTool is the toolchain's install_name_tool when sourceDir is in a
+// developer dir that has one, else /usr/bin/install_name_tool.
+func installNameTool(sourceDir string) string {
+	if dev, ok := developerDirOf(sourceDir); ok {
+		p := filepath.Join(dev, "Toolchains", "XcodeDefault.xctoolchain", "usr", "bin", "install_name_tool")
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return "/usr/bin/install_name_tool"
+}
+
 // CDHash reads path's cdhash through codesign.
 func (darwinSystem) CDHash(path string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), shadowSignTimeout)

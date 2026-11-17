@@ -47,6 +47,10 @@ func ManifestPath(installDir string) string { return filepath.Join(Dir(installDi
 type Copy struct {
 	Name   string
 	Source string
+	// Relink: the installer rewrites the copy's @executable_path rpaths to
+	// absolute paths at Source's directory before re-signing (a binary cloned
+	// out of an application bundle, shadowset.Entry.Relink).
+	Relink bool
 }
 
 // Copies is the set, in the order the installer makes it: one copy per entry
@@ -57,7 +61,7 @@ func Copies() []Copy {
 	entries := shadowset.Entries()
 	out := make([]Copy, 0, len(entries))
 	for _, e := range entries {
-		out = append(out, Copy{Name: e.Copy, Source: e.Source})
+		out = append(out, Copy{Name: e.Copy, Source: e.Source, Relink: e.Relink})
 	}
 	return out
 }

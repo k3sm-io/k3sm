@@ -44,6 +44,9 @@ func shadowSetCalls(dir string, missing map[string]bool) []string {
 		if missing[c.Source] {
 			continue
 		}
+		if c.Relink {
+			out = append(out, "RelinkRpaths:"+dst+":"+filepath.Dir(c.Source))
+		}
 		out = append(out, "AdHocSign:"+dst, "VerifyShadowCopy:"+dst)
 		if !read[c.Source] {
 			out = append(out, "CDHash:"+c.Source)

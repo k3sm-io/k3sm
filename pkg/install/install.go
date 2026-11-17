@@ -511,6 +511,12 @@ type System interface {
 	// so the copy is neither a platform binary nor restricted and dyld keeps
 	// DYLD_INSERT_LIBRARIES in it.
 	AdHocSign(path string) error
+	// RelinkRpaths rewrites every LC_RPATH of path that starts with
+	// @executable_path to the absolute, cleaned path it names when the binary
+	// sits in sourceDir, so a copy cloned out of an application bundle still
+	// finds the bundle's frameworks. Other rpaths are left alone. It runs
+	// before AdHocSign, which the edit invalidates.
+	RelinkRpaths(path, sourceDir string) error
 	// CDHash reads path's code directory hash (codesign -dvvv).
 	CDHash(path string) (string, error)
 	// VerifyShadowCopy checks a made shadow copy (shadow.CheckCopyFile and

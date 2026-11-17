@@ -1,0 +1,115 @@
+/*
+Copyright The k3sm Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package install
+
+import (
+	"debug/macho"
+	"errors"
+	"fmt"
+	"path/filepath"
+	"strings"
+)
+
+// executablePathPrefix is the dyld token a bundled binary's rpaths start with.
+const executablePathPrefix = "@executable_path"
+
+// errRelinkSourceDir reports a sourceDir that is not an absolute clean path.
+var errRelinkSourceDir = errors.New("relink: source dir is not an absolute clean path")
+
+// executableRpathRewrites lists, for the thin or fat Mach-O at path, each
+// LC_RPATH that starts with @executable_path and the absolute path it resolves
+// to when the binary sits in sourceDir: [old, new] pairs in load-command order,
+// one per distinct old value. A fat binary must carry the same @executable_path
+// rpaths in every slice (install_name_tool edits all slices at once).
+func executableRpathRewrites(path, sourceDir string) ([][2]string, error) {
+	if !filepath.IsAbs(sourceDir) || filepath.Clean(sourceDir) != sourceDir {
+		return nil, fmt.Errorf("%w: %q", errRelinkSourceDir, sourceDir)
+	}
+	slices, err := machoRpaths(path)
+	if err != nil {
+		return nil, err
+	}
+	var want []string
+	for i, rp := range slices {
+		var exe []string
+		for _, r := range rp {
+			if strings.HasPrefix(r, executablePathPrefix) {
+				exe = append(exe, r)
+			}
+		}
+		if i == 0 {
+			want = exe
+			continue
+		}
+		if strings.Join(exe, "\x00") != strings.Join(want, "\x00") {
+			return nil, fmt.Errorf("relink %s: the architecture slices disagree on their @executable_path rpaths", path)
+		}
+	}
+	seen := map[string]bool{}
+	var out [][2]string
+	for _, old := range want {
+		if seen[old] {
+			continue
+		}
+		seen[old] = true
+		rest := strings.TrimPrefix(old, executablePathPrefix)
+		if rest != "" && !strings.HasPrefix(rest, "/") {
+			return nil, fmt.Errorf("relink %s: rpath %q is not @executable_path or @executable_path/...", path, old)
+		}
+		out = append(out, [2]string{old, filepath.Clean(sourceDir + rest)})
+	}
+	return out, nil
+}
+
+// machoRpaths returns the LC_RPATH paths of each architecture slice of path.
+func machoRpaths(path string) ([][]string, error) {
+	if ff, err := macho.OpenFat(path); err == nil {
+		defer ff.Close()
+		out := make([][]string, 0, len(ff.Arches))
+		for _, a := range ff.Arches {
+			out = append(out, rpathsOf(a.File))
+		}
+		return out, nil
+	}
+	f, err := macho.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("relink: read the Mach-O %s: %w", path, err)
+	}
+	defer f.Close()
+	return [][]string{rpathsOf(f)}, nil
+}
+
+func rpathsOf(f *macho.File) []string {
+	var out []string
+	for _, l := range f.Loads {
+		if r, ok := l.(*macho.Rpath); ok {
+			out = append(out, r.Path)
+		}
+	}
+	return out
+}
+
+// developerDirOf returns the developer dir that holds dir (the nearest
+// ancestor named Developer, as in .../Contents/Developer/usr/bin), if any.
+func developerDirOf(dir string) (string, bool) {
+	for d := dir; d != "/" && d != "."; d = filepath.Dir(d) {
+		if filepath.Base(d) == "Developer" {
+			return d, true
+		}
+	}
+	return "", false
+}

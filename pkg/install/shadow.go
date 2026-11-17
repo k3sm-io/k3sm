@@ -88,6 +88,11 @@ func makeShadowSet(sys System, cfg Config) error {
 			}
 			return fmt.Errorf("install: clone %s to %s: %w", c.Source, dst, err)
 		}
+		if c.Relink {
+			if err := sys.RelinkRpaths(dst, filepath.Dir(c.Source)); err != nil {
+				return fmt.Errorf("install: relink the shadow copy %s: %w", dst, err)
+			}
+		}
 		if err := sys.AdHocSign(dst); err != nil {
 			return fmt.Errorf("install: re-sign the shadow copy %s: %w", dst, err)
 		}
