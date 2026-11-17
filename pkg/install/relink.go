@@ -78,7 +78,7 @@ func executableRpathRewrites(path, sourceDir string) ([][2]string, error) {
 		seen[old] = true
 		rest := strings.TrimPrefix(old, executablePathPrefix)
 		if rest != "" && !strings.HasPrefix(rest, "/") {
-			return nil, fmt.Errorf("relink %s: rpath %q is not @executable_path or @executable_path/...", path, old)
+			return nil, fmt.Errorf("relink %s: rpath %q is neither @executable_path nor a path under it", path, old)
 		}
 		abs := filepath.Clean(sourceDir + rest)
 		if bundle == "" || (abs != bundle && !strings.HasPrefix(abs, bundle+"/")) {
