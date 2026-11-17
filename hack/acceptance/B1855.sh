@@ -15,8 +15,9 @@
 #   --place N [--expect-on NODE | --expect-spread]   create a namespace and N
 #       independent one-replica Deployments (each its own selector, so no
 #       topology-spread default ties them together: the shape of the singletons
-#       that pile onto one node), unpinned (image native, /bin/sleep, a 10m CPU
-#       request, the provider toleration and nothing else, no nodeName and no
+#       that pile onto one node), unpinned (image native, /bin/sleep, requests of
+#       500m CPU and 768Mi by default; --requests none|<cpu>,<memory> changes them),
+#       the provider toleration and nothing else, no nodeName and no
 #       nodeSelector but kubernetes.io/os), wait until every replica is scheduled,
 #       print the replicas per node and the taints at that moment, then delete
 #       the namespace. --expect-on passes when at least three quarters of the
@@ -41,6 +42,12 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/../lab/lib/tolerations.sh"
 
 GATE=B1855
+# REQUESTS is --requests: "none" (no resources, scored at the scheduler's 100m/200Mi
+# non-zero defaults) or "<cpu>,<memory>". The default is the shape that reds without
+# the fix: a memory request large against a small Mac's allocatable makes request
+# scoring prefer the large Mac however busy its host is. Tiny requests (10m/16Mi)
+# prefer the small Mac either way and prove nothing.
+REQUESTS="500m,768Mi"
 TAINT_KEY=k3sm.io/host-cpu-busy
 COND=HostCPUBusy
 
@@ -134,6 +141,10 @@ place_leg() {
 	NS="b1855-lab-$$"
 	trap cleanup EXIT
 	tol="$(lab_tolerations_json NoSchedule)"
+	res='{}'
+	if [ "$REQUESTS" != none ]; then
+		res="{\"requests\": {\"cpu\": \"${REQUESTS%,*}\", \"memory\": \"${REQUESTS#*,}\"}}"
+	fi
 	kc create namespace "$NS" >/dev/null
 	local i
 	for i in $(seq 1 "$n"); do
@@ -146,7 +157,7 @@ place_leg() {
     "tolerations": [$tol],
     "terminationGracePeriodSeconds": 1,
     "containers": [{"name": "c", "image": "native", "command": ["/bin/sleep", "3600"],
-     "resources": {"requests": {"cpu": "10m", "memory": "16Mi"}}}]}}}}
+     "resources": $res}]}}}}
 EOF
 	done
 	say "placed $n independent one-replica Deployments in $NS"
@@ -206,6 +217,7 @@ main() {
 		--place) [ $# -ge 2 ] || usage; mode="place"; n="$2"; shift 2 ;;
 		--expect-on) [ $# -ge 2 ] || usage; expect=on; target="$2"; shift 2 ;;
 		--expect-spread) expect=spread; shift ;;
+		--requests) [ $# -ge 2 ] || usage; REQUESTS="$2"; shift 2 ;;
 		*) usage ;;
 		esac
 	done
