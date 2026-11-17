@@ -25,6 +25,7 @@ import (
 	"strings"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	"k3sm.io/runtimed/pkg/image"
 	"k3sm.io/runtimed/pkg/mount"
 )
 
@@ -150,12 +151,36 @@ func resolveContainerEnv(ctx context.Context, c *runtimev1.Container, ns string,
 		if skip {
 			continue
 		}
+		if e.GetValueFrom() == nil {
+			val = image.ExpandVars(val, envSoFar(ordered))
+		}
 		upsert(e.GetName(), val)
 	}
 
 	c.Env = ordered
 	c.EnvFrom = nil
 	return nil
+}
+
+// envSoFar is the lookup an env value's $(VAR) references resolve against: every
+// variable already in the container's env when the value is reached, which is
+// the kubelet's "dependent environment variables" rule. That is the namespace
+// service links, the master service, the envFrom keys, and the explicit env
+// vars declared EARLIER in the list (a later declaration of a name is not yet
+// visible, so a forward reference stays verbatim). Values that came from
+// valueFrom or envFrom are never expanded themselves, as upstream; only a
+// literal value is. The grammar is runtimed's image.ExpandVars, the same copy
+// command and args go through, and since runtimed reads this already-expanded
+// env, command and args see the expanded values.
+//
+// It rebuilds the map per value rather than keeping one beside upsert, because
+// only a value containing "$" consults it and pod env lists are short.
+func envSoFar(ordered []*runtimev1.EnvVar) map[string]string {
+	m := make(map[string]string, len(ordered))
+	for _, e := range ordered {
+		m[e.GetName()] = e.GetValue()
+	}
+	return m
 }
 
 // expandEnvFrom expands a whole ConfigMap/Secret into env vars (sorted keys, with
