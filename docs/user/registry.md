@@ -516,8 +516,9 @@ user can log in and push from a worker with no other grant.
 The in-cluster name does not resolve on a Mac, and k3sm does not make it resolve. A tool running on
 a Mac that is not the server can reach the registry through a NodePort instead. It is off by
 default. Turn it on with `--registry-node-port` on the server, choosing a port in the NodePort range
-(30000 to 32767), and restart the server. A port in the static band, `30000-30085`, is one the
-apiserver never hands to another Service first (see [Fixed NodePorts](install.md#fixed-nodeports)):
+(30000 to 32767), and restart the server. Pick it from the static band, `30000-30085`, which the
+apiserver gives to a Service without a `nodePort` only once the rest of the range is full (see
+[Fixed NodePorts](install.md#fixed-nodeports)):
 
 ```sh
 k3sm server --registry-node-port 30050

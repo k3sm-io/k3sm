@@ -456,10 +456,11 @@ The apiserver keeps automatic allocation out of that band. It takes the size of 
 by 32, at least 16 and at most 128, and reserves that many ports at the bottom (KEP-3668, which
 every Kubernetes release since 1.29 applies, including the one k3sm ships). For k3sm's 2768 ports
 that is 86. A Service without a `nodePort` is given a port from `30086-32767`, and from the
-band only once that upper part is full. A fixed port above `30085` is still accepted, but a later
-Service that sets no `nodePort` can be given it first, and your Service then fails to apply.
+band only once that upper part is full. A fixed port above `30085` is still accepted, but nothing
+keeps it for you: if a Service without a `nodePort` was given that port before yours is applied (on a
+rebuilt cluster, or after someone else's install), your Service is refused.
 
-The convention:
+The convention has three parts:
 
 - A Service whose port is published somewhere sets `nodePort` in `30000-30085`.
 - Every other Service leaves `nodePort` unset.
@@ -475,22 +476,23 @@ kubectl get svc -A -o jsonpath='{range .items[*]}{range .spec.ports[*]}{.nodePor
   | awk '$1 >= 30000 && $1 <= 30085' | sort -n
 ```
 
-The apiserver is the registry of record. A nodePort is unique across the whole cluster, and every
+The apiserver is the source of truth. A nodePort is unique across the whole cluster, and every
 node listens on it, so a Service that asks for one already held is refused when you apply it:
 
 ```
 spec.ports[0].nodePort: Invalid value: 30048: provided port is already allocated
 ```
 
-That refusal is the claim, and it cannot race: two tools that both found a port free cannot both
-get it. A tool that picks ports should take a free one from the listing, apply, and on that error
+The refusal is atomic, so two tools that both found a port free cannot both get it. A tool that picks ports should take a free one from the listing, apply, and on that error
 pick the next free one, rather than keep a list of its own. 86 ports is too few to pick by hashing a
 name without collisions, so allocate from the listing.
 
-The listing sees only Services. A NodePort also needs the port free on every Mac in the cluster:
-with LAN access on it binds every interface, and a process of your own already listening there
-keeps the NodePort from binding on that Mac. Check a Mac with
-`lsof -nP -iTCP:30048 -sTCP:LISTEN`, which prints nothing when the port is free.
+The listing sees only Services, and the empty lines it prints for ports without a nodePort are
+dropped by the `awk` filter. A NodePort also needs the port on every Mac in the cluster: with LAN
+access on it binds the wildcard address, and a process of your own already listening on the same
+port can keep it from binding on that Mac (whether one does depends on the address and the address
+family it holds). Check a Mac with `lsof -nP -iTCP:30048 -sTCP:LISTEN`, which prints nothing when no
+process listens there, and pick another port if it prints anything.
 
 ## Uninstalling
 
