@@ -494,6 +494,28 @@ Today at `main`, per port class:
     freed. That behaviour is inherited rather than introduced here, and it is the same leak the old
     shared wildcard had.
 
+  A Pod reaches its own listeners on `127.0.0.1`. Loopback is one address range shared by every Pod
+  and the host, so it cannot be given to each Pod. Instead, the same shim moves a Pod's dial to
+  `127.0.0.0/8` or `::1` onto the Pod's own address when, and only when, the Pod has a socket of the
+  same kind (TCP or UDP) bound to that address and port. So an app, a sidecar or an exec probe that
+  dials `localhost:<port>` reaches the Pod's own server, as it would in a Linux Pod. The rules:
+
+  - When the Pod holds the port, its own listener wins, even if a host service also listens on
+    `127.0.0.1` at the same port. "Holds" means that some socket is bound to the Pod's address and
+    port, and the shim cannot tell whose it is. Same-node Pods share one OS user, so another Pod
+    that binds this Pod's address receives the dials this moves (see "No Per-Pod uid Isolation"
+    above). Untrusted neighbours belong on the `vm` RuntimeClass.
+  - A moved dial arrives from the Pod's address, not from `127.0.0.1`.
+  - When the Pod does not hold the port, the dial goes to the host's loopback exactly as before.
+    The change never makes a host loopback service reachable that was not, and the sandbox's
+    per-port denies still apply to the moved dial.
+  - A Pod listener bound explicitly to `127.0.0.1` is still reached through loopback, and ports
+    below 1024 are left alone, because the bind rewrite never moved them.
+  - `connect()` and `sendto()` are covered. `sendmsg()` is not, and a UDP client that sends with
+    `sendto()` and checks the reply's source address sees the Pod's address instead of `127.0.0.1`.
+  - A process without the shim keeps the old behaviour: a platform or statically linked binary, or a
+    container that sets its own `DYLD_INSERT_LIBRARIES`.
+
   An Apple platform binary run inside a native pod (for example `/usr/bin/nc`, or the system `python3`
   or `ruby`) ignores `DYLD_INSERT_LIBRARIES`, so the per-pod bind shim never loads and a listener it opens
   binds every address on the node rather than the pod's own. Because every native pod shares the node's
