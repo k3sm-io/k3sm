@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -119,7 +120,7 @@ func (f *shareFixture) effective(string) (hostshare.Effective, error) {
 	if err != nil {
 		return hostshare.Effective{}, err
 	}
-	eff := hostshare.Effective{Entries: nf.Entries, Delegations: nf.Delegations, Owners: map[hostshare.Entry]uint32{}}
+	eff := hostshare.Effective{Entries: nf.Entries, Delegations: nf.Delegations, Owners: map[string]uint32{}}
 	for _, d := range nf.Delegations {
 		entries, err := f.readUser("", d.UID)
 		if err != nil {
@@ -131,7 +132,8 @@ func (f *shareFixture) effective(string) (hostshare.Effective, error) {
 				eff.Dropped = append(eff.Dropped, hostshare.Dropped{UID: d.UID, Entry: e, Reason: err.Error()})
 				continue
 			}
-			eff.Owners[e] = d.UID
+			e = d.Scope(e)
+			eff.Owners[e.String()] = d.UID
 			eff.Entries = append(eff.Entries, e)
 		}
 	}
@@ -285,7 +287,7 @@ func TestShareDelegation(t *testing.T) {
 	if code := runShareWith([]string{"add", app}, env); code != 0 {
 		t.Fatalf("delegated add = %d (%s)", code, errb)
 	}
-	if got, _ := f.readUser("", f.me.uid); len(got) != 1 || got[0] != (hostshare.Entry{Mode: hostshare.ModeReadWrite, Path: app}) {
+	if got, _ := f.readUser("", f.me.uid); len(got) != 1 || got[0].String() != (hostshare.Entry{Mode: hostshare.ModeReadWrite, Path: app}).String() {
 		t.Errorf("user file = %v, want rw %s", got, app)
 	}
 	if !strings.Contains(string(f.stored), "delegate") || strings.Contains(string(f.stored), "rw "+app) {
@@ -383,5 +385,203 @@ func TestShareUndelegateDeletedAccount(t *testing.T) {
 	}
 	if !strings.Contains(errb.String(), fmt.Sprintf("using the uid %d", f.me.uid)) {
 		t.Errorf("undelegate did not say which uid it used: %s", errb)
+	}
+}
+
+// TestShareNamespace pins the CLI half of namespaced shares: root records a
+// share line for named namespaces (and node-wide without --namespace), an
+// invalid or repeated name records nothing, list shows the namespaces, root
+// caps a delegation, and the delegated user's add is held to the cap (an
+// add naming none takes it).
+func TestShareNamespace(t *testing.T) {
+	t.Parallel()
+	f := newShareFixture(t)
+	app := filepath.Join(f.prefix, "app")
+	other := filepath.Join(f.base, "Other")
+
+	env, out, errb := f.env(0)
+	if code := runShareWith([]string{"add", "--no-acl", "--namespace", "yurei-system", "--namespace", "yurei-p-*", other}, env); code != 0 {
+		t.Fatalf("add --namespace = %d (%s)", code, errb)
+	}
+	if !strings.Contains(string(f.stored), "rw "+other+" namespaces=yurei-p-*,yurei-system\n") {
+		t.Errorf("stored = %q, want the namespaced line", f.stored)
+	}
+	if !strings.Contains(out.String(), "yurei-p-*,yurei-system") {
+		t.Errorf("add output = %q, want the namespaces named", out)
+	}
+	for _, args := range [][]string{
+		{"add", "--no-acl", "--namespace", "Bad", other},
+		{"add", "--no-acl", "--namespace", "a", "--namespace", "a", other},
+		{"add", "--no-acl", "--namespace", "*", other},
+		{"add", "--no-acl", "--namespace", "", other},
+	} {
+		before := string(f.stored)
+		env, _, _ = f.env(0)
+		if code := runShareWith(args, env); code == 0 {
+			t.Errorf("share %v = 0, want a refusal", args)
+		}
+		if string(f.stored) != before {
+			t.Errorf("share %v changed the node file to %q", args, f.stored)
+		}
+	}
+	env, out, _ = f.env(501)
+	if code := runShareWith([]string{"list"}, env); code != 0 || !strings.Contains(out.String(), "rw "+other+" namespaces=yurei-p-*,yurei-system\t(root)") {
+		t.Errorf("list = %d %q, want the namespaces shown", code, out)
+	}
+
+	// A capped delegation.
+	env, out, errb = f.env(0)
+	if code := runShareWith([]string{"delegate", "--user", "dev", "--modes", "rw", "--namespaces", "proj-*", f.prefix}, env); code != 0 {
+		t.Fatalf("delegate --namespaces = %d (%s)", code, errb)
+	}
+	if !strings.Contains(string(f.stored), fmt.Sprintf("delegate uid=%d user=dev modes=rw namespaces=proj-* %s\n", f.me.uid, f.prefix)) {
+		t.Errorf("stored = %q, want the capped delegate line", f.stored)
+	}
+	if !strings.Contains(out.String(), "proj-*") {
+		t.Errorf("delegate output = %q, want the cap named", out)
+	}
+	env, _, _ = f.env(0)
+	if code := runShareWith([]string{"delegate", "--user", "dev", "--namespaces", "proj-*,,x", f.prefix}, env); code == 0 {
+		t.Error("delegate with a malformed --namespaces = 0, want a refusal")
+	}
+
+	user := func() (shareEnv, *bytes.Buffer, *bytes.Buffer) { return f.env(int(f.me.uid)) }
+	env, _, errb = user()
+	if code := runShareWith([]string{"add", "--no-acl", "--namespace", "other", app}, env); code != 1 || !strings.Contains(errb.String(), "namespace") {
+		t.Errorf("delegated add outside the cap = %d (%s), want 1 naming the namespace", code, errb)
+	}
+	env, _, errb = user()
+	if code := runShareWith([]string{"add", "--no-acl", "--namespace", "proj-a", app}, env); code != 0 {
+		t.Fatalf("delegated add within the cap = %d (%s)", code, errb)
+	}
+	if got, _ := f.readUser("", f.me.uid); len(got) != 1 || got[0].String() != "rw "+app+" namespaces=proj-a" {
+		t.Errorf("user file = %v, want rw %s namespaces=proj-a", got, app)
+	}
+	// No --namespace under a capped delegation: the line takes the cap.
+	env, out, errb = user()
+	if code := runShareWith([]string{"add", "--no-acl", app}, env); code != 0 {
+		t.Fatalf("delegated add with no namespace = %d (%s)", code, errb)
+	}
+	if !strings.Contains(out.String(), "proj-*") {
+		t.Errorf("add output = %q, want the inherited cap named", out)
+	}
+	env, out, _ = user()
+	if code := runShareWith([]string{"list"}, env); code != 0 || !strings.Contains(out.String(), "rw "+app+" namespaces=proj-*\t(added by dev") {
+		t.Errorf("list = %d %q, want the delegated line with the inherited cap", code, out)
+	}
+}
+
+// TestShareNamespaceSamePath pins that one path can carry a line per
+// namespace set: adding `ro --namespace yurei-*` keeps the `rw
+// --namespace yurei-system` line, re-adding the same set replaces its own
+// line, a namespaced add replaces the path's line for every namespace (the
+// way a share is narrowed), and remove --namespace takes one line only.
+func TestShareNamespaceSamePath(t *testing.T) {
+	t.Parallel()
+	f := newShareFixture(t)
+	code := filepath.Join(f.base, "Other")
+	add := func(args ...string) {
+		t.Helper()
+		env, _, errb := f.env(0)
+		if c := runShareWith(append([]string{"add", "--no-acl"}, args...), env); c != 0 {
+			t.Fatalf("add %v = %d (%s)", args, c, errb)
+		}
+	}
+	lines := func() string {
+		nf, err := hostshare.ParseFile(bytes.NewReader(f.stored))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var ls []string
+		for _, e := range nf.Entries {
+			ls = append(ls, e.String())
+		}
+		slices.Sort(ls)
+		return strings.Join(ls, "|")
+	}
+	add(code)
+	add("--namespace", "yurei-system", code)
+	if got, want := lines(), "rw "+code+" namespaces=yurei-system"; got != want {
+		t.Fatalf("after narrowing: %q, want %q (the line for every namespace replaced)", got, want)
+	}
+	add("--read-only", "--namespace", "yurei-*", code)
+	want := "ro " + code + " namespaces=yurei-*|rw " + code + " namespaces=yurei-system"
+	if got := lines(); got != want {
+		t.Fatalf("after the ro line: %q, want %q", got, want)
+	}
+	add("--namespace", "yurei-system", code) // same set: replaces only its own line
+	if got := lines(); got != want {
+		t.Errorf("after re-adding yurei-system: %q, want %q", got, want)
+	}
+	env, out, _ := f.env(501)
+	if c := runShareWith([]string{"list"}, env); c != 0 || !strings.Contains(out.String(), "ro "+code) || !strings.Contains(out.String(), "rw "+code) {
+		t.Errorf("list = %d %q, want both lines", c, out)
+	}
+	env, _, errb := f.env(0)
+	if c := runShareWith([]string{"remove", "--no-acl", "--namespace", "yurei-*", code}, env); c != 0 {
+		t.Fatalf("remove --namespace = %d (%s)", c, errb)
+	}
+	if got, want := lines(), "rw "+code+" namespaces=yurei-system"; got != want {
+		t.Errorf("after remove --namespace: %q, want %q", got, want)
+	}
+	env, _, _ = f.env(0)
+	if c := runShareWith([]string{"remove", "--no-acl", "--namespace", "other", code}, env); c != 1 {
+		t.Errorf("remove of a set the path has no line for = %d, want 1", c)
+	}
+	add(code) // a line for every namespace replaces every line for the path
+	if got, want := lines(), "rw "+code; got != want {
+		t.Errorf("after a node-wide add: %q, want %q", got, want)
+	}
+}
+
+// TestShareDelegateNamespaceCapDrop pins that re-running delegate without
+// --namespaces never silently uncaps a capped delegation: it is refused
+// unless --no-namespace-cap is given, and then the user's lines that widen
+// to every namespace are listed.
+func TestShareDelegateNamespaceCapDrop(t *testing.T) {
+	t.Parallel()
+	f := newShareFixture(t)
+	app := filepath.Join(f.prefix, "app")
+	capped := fmt.Sprintf("delegate uid=%d user=dev modes=rw namespaces=proj-* %s\n", f.me.uid, f.prefix)
+	env, _, errb := f.env(0)
+	if code := runShareWith([]string{"delegate", "--user", "dev", "--modes", "rw", "--namespaces", "proj-*", f.prefix}, env); code != 0 {
+		t.Fatalf("delegate = %d (%s)", code, errb)
+	}
+	env, _, errb = f.env(int(f.me.uid))
+	if code := runShareWith([]string{"add", "--no-acl", app}, env); code != 0 {
+		t.Fatalf("delegated add = %d (%s)", code, errb)
+	}
+	env, _, errb = f.env(0)
+	if code := runShareWith([]string{"delegate", "--user", "dev", "--modes", "rw", f.prefix}, env); code != 1 ||
+		!strings.Contains(errb.String(), "--no-namespace-cap") {
+		t.Errorf("re-delegate without --namespaces = %d (%s), want 1 naming --no-namespace-cap", code, errb)
+	}
+	if !strings.Contains(string(f.stored), capped) {
+		t.Errorf("stored = %q, want the cap kept", f.stored)
+	}
+	env, _, _ = f.env(0)
+	if code := runShareWith([]string{"delegate", "--user", "dev", "--namespaces", "a", "--no-namespace-cap", f.prefix}, env); code != 2 {
+		t.Errorf("--namespaces with --no-namespace-cap = %d, want 2", code)
+	}
+	// Changing the cap to another one is explicit, and allowed.
+	env, _, errb = f.env(0)
+	if code := runShareWith([]string{"delegate", "--user", "dev", "--modes", "rw", "--namespaces", "proj-a", f.prefix}, env); code != 0 {
+		t.Errorf("re-delegate with another cap = %d (%s)", code, errb)
+	}
+	env, out, errb := f.env(0)
+	if code := runShareWith([]string{"delegate", "--user", "dev", "--modes", "rw", "--no-namespace-cap", f.prefix}, env); code != 0 {
+		t.Fatalf("re-delegate --no-namespace-cap = %d (%s)", code, errb)
+	}
+	if strings.Contains(string(f.stored), "namespaces=proj") {
+		t.Errorf("stored = %q, want the cap dropped", f.stored)
+	}
+	if !strings.Contains(out.String(), "rw "+app) || !strings.Contains(out.String(), "every namespace") {
+		t.Errorf("output = %q, want the widened line %s listed", out, app)
+	}
+	// A first delegation needs no flag to be uncapped.
+	g := newShareFixture(t)
+	env, _, errb = g.env(0)
+	if code := runShareWith([]string{"delegate", "--user", "dev", g.prefix}, env); code != 0 {
+		t.Errorf("first uncapped delegate = %d (%s)", code, errb)
 	}
 }

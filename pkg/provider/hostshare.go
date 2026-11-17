@@ -41,7 +41,7 @@ const (
 )
 
 // authorizeHostShares decides box's hostPath volumes against the node's
-// allowlist. A refusal is a *volumeRefusal (reason FailedHostShare) wrapping
+// allowlist, for the pod's namespace. A refusal is a *volumeRefusal (reason FailedHostShare) wrapping
 // both ErrVolumeSourceUnsupported and the hostshare sentinel, so CreatePod
 // records it and refuses the pod before the RPC. runtimed makes the same
 // decision from the same root-owned file when it compiles the pod's profile;
@@ -63,7 +63,9 @@ func (r *runtimedRuntime) authorizeHostShares(pod *corev1.Pod, box *runtimev1.Po
 			return hostShareRefusal(firstHostPathVolume(box), err)
 		}
 	}
-	if _, err := hostshare.Authorize(entries, box); err != nil {
+	// The pod's own namespace, from the API object: a share line naming
+	// namespaces admits the volume only for a pod in one of them.
+	if _, err := hostshare.Authorize(entries, pod.Namespace, box); err != nil {
 		return hostShareRefusal(refusedVolumeName(box, err), err)
 	}
 	return nil

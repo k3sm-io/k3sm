@@ -20,6 +20,7 @@ user then adds and removes shares under it without root.
 - The allowlist, its file format and its refusal rules.
 - Enforcement in the node daemon and in runtimed, from the same files, on every create.
 - Delegation: the root-owned record, the user's own file, and the checks that bind one to the other.
+- Namespace scope: a share line limited to named namespaces, and a delegation's cap on them.
 - The permissions `k3sm share` sets on a shared tree.
 
 Out of scope: per-Pod identities (every native Pod runs as `_k3sm`), revoking a share from a Pod
@@ -149,6 +150,51 @@ Revocation is the node file: removing the delegation line removes the only recor
 line of the user's file. `undelegate` also removes the user's directory and takes back the
 permissions their shares set.
 
+### Namespace scope
+
+A share line may end with `namespaces=<ns>[,<ns>...]`, each a namespace name (an RFC 1123 label) or
+a prefix pattern ending in one `*` (`yurei-p-*`; a bare `*` is refused). A line with no field is
+node-wide, so every file written before the field existed parses and behaves the same. An empty
+field, an empty or repeated name, or an invalid one fails the whole file: the line is never read as
+node-wide. `Authorize` takes the Pod's namespace and considers only the lines that admit it, so a
+namespace's narrower `ro` line narrows that namespace alone. Among them the most specific path
+wins; on the same path, the line naming the namespace most specifically (an exact name, then the
+longer pattern, then node-wide); and read-write only between lines equally specific, so a broader
+`rw` line never overrides a narrower `ro` one. The refusal names the
+Pod's own namespace and never another, nor whether a line for another namespace covers the path.
+
+One path may carry a line per namespace set, each with its own mode (`rw /c namespaces=yurei-system`
+beside `ro /c namespaces=yurei-*`). `yurei-system`, which both admit, is named exactly by the `rw`
+line and gets read-write; every other `yurei-` namespace gets read-only. `k3sm share add` replaces the path's
+line for the same set, and a node-wide line and a namespaced one replace each other.
+
+A delegation line may carry the same field, before the prefix, as a cap:
+
+```
+delegate uid=501 user=dev modes=rw namespaces=yurei-p-*,yurei-system /Users/dev/Code
+```
+
+Under a cap, `CheckDelegated` also requires each namespace a user line names to be within it (an
+exact name equals a capped name or starts with a capped pattern's prefix; a pattern's prefix starts
+with a capped pattern's prefix), and `LoadEffective` gives a line that names none the cap. A line
+outside the cap is dropped with its reason, as an out-of-prefix line is. An uncapped delegation
+lets the user name any namespaces, or none.
+
+The scope lives in the same root-owned file as the paths, not in a cluster object, so the trust
+model is unchanged: the node admin decides it on the node, and neither a Pod nor the API server can
+widen it. Each node enforces its own file.
+
+The provider passes the Pod object's namespace; runtimed passes the request's, the only one it has.
+
+A pattern admits every namespace anyone with namespace-create rights can make with that prefix, so
+it scopes only where namespace creation is operator-controlled; the prefix should end at a hyphen.
+Re-running `delegate` without `--namespaces` on a capped delegation is refused unless
+`--no-namespace-cap` is given, because the user's lines that took the cap would widen to every
+namespace; k3sm then lists them. A binary older than the field reads a file that carries it as
+invalid and shares nothing (fail closed), so every node is upgraded before the field is used. The
+`_k3sm` ACL a share sets is keyed by path only; the per-Pod profile enforces the namespace and the
+mode. Precedence between a root line and a delegated line is unchanged: they are one list.
+
 ### Permissions
 
 The Seatbelt profile is the boundary; file permissions are the other half, because `_k3sm` is not the
@@ -238,6 +284,15 @@ grant, so a Pod author cannot probe which accounts the node has.
 ## Residual risks
 
 - A Pod that is running keeps a share after it is removed, until the Pod is recreated.
+- `ro` rests on the Pod's Seatbelt profile alone (`allow file-read*` with `deny file-write*` on the
+  share). The `_k3sm` ACL a share sets is per path and grants write, so any `_k3sm` process the
+  profile does not confine (runtimed, a Pod with a profile bug, a Pod created through the socket
+  with another namespace's `rw` line) can write a `ro` share.
+- runtimed decides a namespaced line from the namespace in the CreatePod request. The node daemon
+  decides it from the Pod object first, but a Pod that sends its own request to runtimed's socket
+  can name any namespace and reach any namespace's shares. Namespace scope therefore narrows what
+  the cluster can schedule onto a share; it does not separate Pods on one node from each other,
+  which every share already reaches when mounted (one node is one trust domain).
 - The Pod fields in runtimed's `host share granted` log line come from the request; the path, mode,
   entry and delegated uid are the node's own decision.
 - A hard link that already exists inside a share reaches its target.
