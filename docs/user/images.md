@@ -504,6 +504,124 @@ An unreachable registry is a `start` line with `"reachable": false`, then `end`,
 exits 0, as with `-o json`. After an `error` line the command exits non-zero. Image lines arrive in
 completion order; sort them yourself.
 
+## Shared Base Images
+
+There is no public supply of `darwin/arm64` runtimes, so projects build their own interpreters and
+servers (CPython, PostgreSQL, Node.js) from source. When several projects on one cluster need the
+same runtime, build it once and keep it in the cluster registry under one shared name instead of
+pushing a copy per project. This section is that convention. k3sm does not build or ship these
+images; the projects that need them do.
+
+### Where They Live
+
+```
+registry-k3sm:6450/base/<runtime>:<upstream version>-<content hash>
+```
+
+- **`base/`** is the shared prefix. A project's own images stay under its own name
+  (`registry-k3sm:6450/<project>/...`), so nothing a project pushes collides with a base image.
+- **`<runtime>`** is the upstream project's name in lowercase: `cpython`, `postgres`, `node`.
+- **`<upstream version>`** is the upstream release, exactly as upstream writes it: `3.13.1`, `17.2`,
+  `22.12.0`.
+- **`<content hash>`** is the first 12 hex digits of a sha256 over the build's inputs: the upstream
+  source archive's sha256, every patch applied, and the build recipe. The same inputs give the same
+  tag on any Mac, and a different patch set gives a different tag, so two builds of `17.2` with
+  different patches never share a name.
+
+For example, `registry-k3sm:6450/base/postgres:17.2-3f9a0c1d7b2e`.
+
+These images stay in the cluster registry. Never push a base image to a public registry. Anyone who
+can reach the cluster registry can pull from it (see [Pulling](registry.md#pulling)), so keep
+credentials and project data out of base images as well.
+
+### A Tag Is Written Once
+
+A base tag names one set of inputs, so it never moves. Before you push, check whether the tag is
+already there, and use it if it is:
+
+```sh
+k3sm image inspect registry-k3sm:6450/base/postgres:17.2-3f9a0c1d7b2e && echo "already there"
+```
+
+Build to a layout and push only when the tag is absent. `k3sm build` records its tag without asking,
+so build with `--no-record`:
+
+```sh
+k3sm build --tag registry-k3sm:6450/base/postgres:17.2-3f9a0c1d7b2e --no-record \
+  --format oci --output ./postgres-layout .
+k3sm image push ./postgres-layout registry-k3sm:6450/base/postgres:17.2-3f9a0c1d7b2e
+```
+
+Keep the tag for as long as any project pins the image. `k3sm image prune` deletes untagged
+manifests, including one a Pod names by digest, and a tagged one is safe from it.
+
+### Required Labels
+
+Every base image carries these labels in its config. Write them with `LABEL` in the Dockerfile:
+
+| Label | Value |
+|---|---|
+| `org.opencontainers.image.title` | the `<runtime>` name |
+| `org.opencontainers.image.version` | the upstream version |
+| `org.opencontainers.image.source` | the URL of the upstream source archive |
+| `io.k3sm.base.source-sha256` | the sha256 of that archive |
+| `io.k3sm.base.patches` | each patch as `<file name>@sha256:<digest>`, comma-separated, or `none` |
+| `io.k3sm.base.content-hash` | the `<content hash>` in the tag |
+
+`k3sm image inspect -o json` prints the config, so a consumer can read what an image was built
+from before it pins one.
+
+### What a Native Base Image Must Be
+
+The platform is `darwin/arm64` and nothing else. `k3sm build` stamps it. The image must also follow
+the rules every native image follows today:
+
+- **`FROM scratch`.** Nothing comes from the host. Every Mach-O in the image links only against
+  `/usr/lib` and `/System`, and names its other libraries inside the image relative to itself
+  (`@loader_path/...`). `otool -L` lists what each one links against.
+- **Signed ad hoc, after the last edit.** Rewriting an install name invalidates the signature, and
+  an arm64 Mac does not run an unsigned Mach-O, so re-sign every Mach-O last with
+  `codesign -f -s - <file>`. Use no signing identity: a base image never carries a Developer ID or
+  any other key.
+- **The entrypoint is a regular Mach-O file inside the image.** k3sm signs a pulled image's
+  entrypoint inside the image's own tree, so it refuses a symlink there (name
+  `/python/bin/python3.13`, not `python3`) and a `/bin/sh` the image does not carry.
+- **The runtime finds its own files relative to its executable.** An absolute path that names a file
+  inside the image (`PYTHONPATH=/app`, `/python/lib/...`) resolves on the host, not in the image,
+  for a native process. Absolute paths of volume mounts do resolve. Build the runtime relocatable:
+  a CPython that computes its prefix from its own executable, and a `.pth` file relative to the
+  interpreter rather than an absolute `PYTHONPATH`.
+
+### Using One
+
+Pin a base image by **digest**, never by tag alone. Read the digest once:
+
+```sh
+k3sm image inspect registry-k3sm:6450/base/postgres:17.2-3f9a0c1d7b2e
+```
+
+Then build on it. `FROM` is fetched by `k3sm build` on the Mac, which does not resolve
+`registry-k3sm`. On the server, write the registry's loopback name, `localhost:6450`, which is the
+same registry:
+
+```dockerfile
+FROM localhost:6450/base/postgres@sha256:<digest>
+COPY launcher /postgres/bin/launcher
+ENTRYPOINT ["/postgres/bin/launcher"]
+```
+
+A Pod that runs a base image directly names it the in-cluster way:
+
+```yaml
+containers:
+  - name: pg
+    image: registry-k3sm:6450/base/postgres@sha256:<digest>
+```
+
+A digest pins exactly those bytes, so a rebuilt base reaches a project only when the project moves
+its pin. A base image with a security fix gets a new content hash and tag; each project moves its
+pin when it is ready.
+
 ## Next
 
 - [Building images](builder.md), building a Dockerfile that runs commands, on the cluster.
