@@ -172,6 +172,83 @@ each of its lines against the delegation again, and admits a line only when all 
 A line that fails is not admitted, and `k3sm share list` shows it under "not admitted" with the
 reason. Editing the file by hand therefore admits nothing `k3sm share add` would refuse.
 
+### Limiting a Share to Namespaces
+
+By default a share admits a Pod in any namespace. `--namespace` limits it to Pods in the namespaces
+you name, and can be repeated:
+
+```sh
+sudo k3sm share add --namespace build /Volumes/datasets
+k3sm share add --namespace yurei-p-app /Users/you/Code/app
+k3sm share add --namespace team-a --namespace 'team-b-*' /Users/you/Code/shared
+```
+
+Each value is a namespace name, or a prefix pattern ending in one `*`: `team-b-*` admits every
+namespace whose name starts with `team-b-`. A bare `*` is refused; leave `--namespace` out for every
+namespace. In the file a limited share is one line with a `namespaces=` field:
+
+```text
+<mode> <path> [namespaces=<ns>,<ns>,...]
+rw /Users/you/Code/app namespaces=yurei-p-app
+ro /Volumes/datasets namespaces=build,team-b-*
+rw /opt/scratch
+```
+
+A line with no `namespaces=` field admits every namespace, as every line did before the field
+existed, so an existing list reads and behaves the same. A `namespaces=` field that is empty,
+repeats a name, or holds anything but a namespace name or a prefix pattern makes the whole file
+invalid, and nothing in that file is shared, so a typo never leaves a share open to every namespace.
+
+When a Pod mounts a `hostPath`, the node looks only at the lines that admit the Pod's namespace, and
+the usual rules then apply among those: the most specific path decides, and read-write wins between
+two lines for the same path. A line for other namespaces is as if it were not there, so a
+`--read-only` line for one namespace narrows that namespace only. A Pod in a namespace no line
+admits is refused with a `FailedHostShare` Event that names the Pod's own namespace. The Event never
+says which namespaces a share does admit.
+
+A share for every namespace keeps admitting every namespace, whatever narrower lines exist beside
+it. To narrow a share, replace it: `k3sm share add` of a path that is already listed replaces its
+line, so add it again with the namespaces it keeps. `k3sm share list` shows each line with its
+namespaces.
+
+The node admin can also cap the namespaces a delegated user's shares may name:
+
+```sh
+sudo k3sm share delegate --user you --namespaces 'yurei-system,yurei-p-*' /Users/you/Code
+```
+
+The delegation line in the root-owned file then reads
+`delegate uid=<uid> user=you modes=<modes> namespaces=yurei-p-*,yurei-system /Users/you/Code`.
+Under a cap, each namespace a user's share names must be within it: a name must equal a capped name
+or start with a capped pattern's prefix, and a pattern must be at least as narrow as a capped
+pattern (`yurei-p-app-*` is within `yurei-p-*`, `yurei-*` is not). A share the user adds with no
+`--namespace` takes the cap. A line outside the cap is not admitted and shows under "not admitted"
+in `k3sm share list`. A delegation with no `--namespaces` lets the user choose any namespaces, or
+none.
+
+Each node reads its own `/Library/k3sm.host-shares`, so each node enforces its own lines. Give every
+node that may run the Pod the same lines.
+
+#### Per-Project Shares (Yureisha)
+
+Yureisha runs its controller in `yurei-system` and each project in its own namespace. Shared as one
+read-write line for every namespace, `/Users/you/Code` lets any project's Pod write every repository.
+Instead, give the whole tree to `yurei-system` alone, and each project namespace its own
+repositories and any extra paths it needs:
+
+```sh
+sudo k3sm share delegate --user you --namespaces 'yurei-system,yurei-p-*' /Users/you/Code   # once
+k3sm share add --namespace yurei-system /Users/you/Code   # replaces the line for every namespace
+k3sm share add --namespace yurei-p-app /Users/you/Code/app
+k3sm share add --namespace yurei-p-site /Users/you/Code/site
+k3sm share add --read-only --namespace yurei-p-site /Users/you/Code/design-tokens
+```
+
+A Pod in `yurei-p-app` can then mount `/Users/you/Code/app` and nothing else under
+`/Users/you/Code`, and a Pod in `yurei-system` can mount the whole tree. If `/Users/you/Code` was
+added by the node admin rather than under the delegation, replace it with
+`sudo k3sm share add --namespace yurei-system /Users/you/Code`.
+
 A Pod mounts a share with a `hostPath` volume whose `mountPath` equals `hostPath.path`, with no
 `subPath`, and with `readOnly: true` when the share is read-only:
 
@@ -220,7 +297,9 @@ a Pod that runs git in a share sets `safe.directory` for it, for example with th
 variables `GIT_CONFIG_COUNT=1`, `GIT_CONFIG_KEY_0=safe.directory` and `GIT_CONFIG_VALUE_0=<path>`.
 
 **What a share is.** Every native Pod on a node runs as the same user, so a share is reachable by
-every Pod that mounts it, and by nothing else. Share only what you would let any workload you
+every Pod that mounts it, in every namespace its line admits, and by nothing else. A namespace limit
+decides which Pods the cluster can give a share to; it is not a wall between Pods on one node,
+because a native Pod can reach the node's runtime directly and name another namespace there. Share only what you would let any workload you
 schedule on this node read and, for a read-write share, change. `vm` Pods cannot mount host shares.
 
 A read-write share of a repository lets a Pod change what you later run there yourself: git hooks

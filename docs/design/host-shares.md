@@ -20,6 +20,7 @@ user then adds and removes shares under it without root.
 - The allowlist, its file format and its refusal rules.
 - Enforcement in the node daemon and in runtimed, from the same files, on every create.
 - Delegation: the root-owned record, the user's own file, and the checks that bind one to the other.
+- Namespace scope: a share line limited to named namespaces, and a delegation's cap on them.
 - The permissions `k3sm share` sets on a shared tree.
 
 Out of scope: per-Pod identities (every native Pod runs as `_k3sm`), revoking a share from a Pod
@@ -149,6 +150,35 @@ Revocation is the node file: removing the delegation line removes the only recor
 line of the user's file. `undelegate` also removes the user's directory and takes back the
 permissions their shares set.
 
+### Namespace scope
+
+A share line may end with `namespaces=<ns>[,<ns>...]`, each a namespace name (an RFC 1123 label) or
+a prefix pattern ending in one `*` (`yurei-p-*`; a bare `*` is refused). A line with no field is
+node-wide, so every file written before the field existed parses and behaves the same. An empty
+field, an empty or repeated name, or an invalid one fails the whole file: the line is never read as
+node-wide. `Authorize` takes the Pod's namespace and considers only the lines that admit it; the
+most-specific-wins and rw/ro rules then run among those, so a namespace's narrower `ro` line narrows
+that namespace alone, and a node-wide line still admits every namespace. The refusal names the
+Pod's own namespace and never another, nor whether a line for another namespace covers the path.
+
+A delegation line may carry the same field, before the prefix, as a cap:
+
+```
+delegate uid=501 user=dev modes=rw namespaces=yurei-p-*,yurei-system /Users/dev/Code
+```
+
+Under a cap, `CheckDelegated` also requires each namespace a user line names to be within it (an
+exact name equals a capped name or starts with a capped pattern's prefix; a pattern's prefix starts
+with a capped pattern's prefix), and `LoadEffective` gives a line that names none the cap. A line
+outside the cap is dropped with its reason, as an out-of-prefix line is. An uncapped delegation
+lets the user name any namespaces, or none.
+
+The scope lives in the same root-owned file as the paths, not in a cluster object, so the trust
+model is unchanged: the node admin decides it on the node, and neither a Pod nor the API server can
+widen it. Each node enforces its own file.
+
+The provider passes the Pod object's namespace; runtimed passes the request's, the only one it has.
+
 ### Permissions
 
 The Seatbelt profile is the boundary; file permissions are the other half, because `_k3sm` is not the
@@ -238,6 +268,11 @@ grant, so a Pod author cannot probe which accounts the node has.
 ## Residual risks
 
 - A Pod that is running keeps a share after it is removed, until the Pod is recreated.
+- runtimed decides a namespaced line from the namespace in the CreatePod request. The node daemon
+  decides it from the Pod object first, but a Pod that sends its own request to runtimed's socket
+  can name any namespace and reach any namespace's shares. Namespace scope therefore narrows what
+  the cluster can schedule onto a share; it does not separate Pods on one node from each other,
+  which every share already reaches when mounted (one node is one trust domain).
 - The Pod fields in runtimed's `host share granted` log line come from the request; the path, mode,
   entry and delegated uid are the node's own decision.
 - A hard link that already exists inside a share reaches its target.
