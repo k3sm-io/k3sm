@@ -200,3 +200,57 @@ func TestCreatePodHostShareNamespace(t *testing.T) {
 		})
 	}
 }
+
+// TestCreatePodHostShareNamespaceSamePath pins one path on two lines: rw for
+// yurei-system and ro for every yurei-* namespace. A project pod mounts it
+// read-only and is refused read-write; yurei-system mounts it read-write; a
+// default pod is refused.
+func TestCreatePodHostShareNamespaceSamePath(t *testing.T) {
+	t.Parallel()
+	code, err := os.MkdirTemp("/private/tmp", "k3sm-hsnsp-")
+	if err != nil {
+		t.Skip(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(code) })
+	entries := []hostshare.Entry{
+		{Mode: hostshare.ModeReadWrite, Path: code, Namespaces: []string{"yurei-system"}},
+		{Mode: hostshare.ModeReadOnly, Path: code, Namespaces: []string{"yurei-*"}},
+	}
+	for _, tc := range []struct {
+		name, ns string
+		ro, ok   bool
+	}{
+		{"project_ro", "yurei-foo", true, true},
+		{"project_rw_refused", "yurei-foo", false, false},
+		{"system_rw", "yurei-system", false, true},
+		{"default_refused", "default", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			rec := record.NewFakeRecorder(16)
+			f := newFakeRuntimeServer()
+			r := newRuntimedWith(f, RuntimedConfig{
+				NodeName: "n", NodeIP: "192.168.1.10", Root: t.TempDir(), PodLogsDir: t.TempDir(), Recorder: rec,
+				HostSharesFile: "/node/host-shares",
+			}, nil, nil)
+			r.loadHostShares = func(string) ([]hostshare.Entry, error) { return entries, nil }
+			pod := hostSharePod(code, code, tc.ro)
+			pod.Namespace = tc.ns
+			err := r.CreatePod(context.Background(), pod)
+			events := pendingEvents(rec.Events)
+			if tc.ok {
+				if err != nil {
+					t.Fatalf("CreatePod = %v, want admitted", err)
+				}
+				if !strings.Contains(strings.Join(events, "|"), reasonHostShareGranted) {
+					t.Errorf("events %q lack HostShareGranted", events)
+				}
+				return
+			}
+			if !errors.Is(err, hostshare.ErrNotShared) {
+				t.Fatalf("CreatePod = %v, want ErrNotShared", err)
+			}
+			assertOneRefusalEvent(t, events, reasonFailedHostShare, "code")
+		})
+	}
+}
