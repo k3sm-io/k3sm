@@ -18,7 +18,9 @@ package provider
 
 import (
 	"context"
+	"fmt"
 	"slices"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -47,6 +49,10 @@ func TestResolveContainerEnvExpandsDependentVars(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{Namespace: "prod", Name: "cfg"},
 			Data:       map[string]string{"DB_HOST": "pg", "RAW": "$(DB_HOST)"},
 		},
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "prod", Name: "creds"},
+			Data:       map[string][]byte{"PASSWORD": []byte("s3cr3t")},
+		},
 	)
 	c := &runtimev1.Container{
 		Name:    "c0",
@@ -57,6 +63,8 @@ func TestResolveContainerEnvExpandsDependentVars(t *testing.T) {
 			{Name: "ADDR", Value: "$(MY_IP):8080"},
 			{Name: "URL", Value: "http://$(ADDR)/v1"},
 			{Name: "DSN", Value: "postgres://$(DB_HOST)/app"},
+			{Name: "PGPASS", ValueFrom: &runtimev1.EnvVarSource{SecretKeyRef: &runtimev1.SecretKeySelector{Name: "creds", Key: "PASSWORD"}}},
+			{Name: "PGURL", Value: "postgres://app:$(PGPASS)@$(DB_HOST)/app"},
 			{Name: "EARLY", Value: "$(LATE)-x"},
 			{Name: "LATE", Value: "late"},
 			{Name: "ESCAPED", Value: "$$(MY_IP)"},
@@ -87,6 +95,7 @@ func TestResolveContainerEnvExpandsDependentVars(t *testing.T) {
 		{"ADDR", "10.42.0.9:8080", "a literal referencing an earlier downward-API var"},
 		{"URL", "http://10.42.0.9:8080/v1", "a chain: the earlier value is already expanded"},
 		{"DSN", "postgres://pg/app", "a reference to an envFrom key"},
+		{"PGURL", "postgres://app:s3cr3t@pg/app", "a reference to a secretKeyRef var"},
 		{"EARLY", "$(LATE)-x", "a forward reference stays verbatim"},
 		{"ESCAPED", "$(MY_IP)", "$$ is a literal $, so the reference is not expanded"},
 		{"UNDEFINED", "$(NOPE)", "an undefined reference stays verbatim"},
@@ -110,5 +119,38 @@ func TestResolveContainerEnvExpandsDependentVars(t *testing.T) {
 	}
 	if want := []string{"/app/serve", "--listen=10.42.0.9:8080"}; !slices.Equal(spec.Argv, want) {
 		t.Errorf("argv = %q, want %q", spec.Argv, want)
+	}
+}
+
+// TestResolveContainerEnvCapsExpansion pins the bound on expansion: a chain in
+// which every value references the one before twice doubles at each step, and
+// the provider refuses it, naming the variable, once the container's env would
+// pass maxContainerEnvBytes, instead of building it. A value that does not grow
+// is never refused, however large the env already is.
+func TestResolveContainerEnvCapsExpansion(t *testing.T) {
+	env := []*runtimev1.EnvVar{{Name: "A0", Value: strings.Repeat("x", 1024)}}
+	for i := 1; i <= 40; i++ {
+		ref := fmt.Sprintf("$(A%d)", i-1)
+		env = append(env, &runtimev1.EnvVar{Name: fmt.Sprintf("A%d", i), Value: ref + ref})
+	}
+	c := &runtimev1.Container{Name: "c0", Env: env}
+	box := &runtimev1.PodBox{Namespace: "prod", Name: "api", Containers: []*runtimev1.Container{c}}
+	err := resolvePodBoxEnv(context.Background(), box, podFacts{}, nil)
+	if err == nil || !strings.Contains(err.Error(), "env A10:") {
+		t.Fatalf("resolvePodBoxEnv error = %v, want the cap refusing A10 (1 KiB doubled ten times is past 1 MiB)", err)
+	}
+
+	// Already past the cap with literals alone, a value that expands to no more
+	// than its own length still resolves, as it did before expansion existed.
+	big := &runtimev1.Container{Name: "c1", Env: []*runtimev1.EnvVar{
+		{Name: "BIG", Value: strings.Repeat("y", maxContainerEnvBytes)},
+		{Name: "PRICE", Value: "$$5"},
+	}}
+	box = &runtimev1.PodBox{Namespace: "prod", Name: "api", Containers: []*runtimev1.Container{big}}
+	if err := resolvePodBoxEnv(context.Background(), box, podFacts{}, nil); err != nil {
+		t.Fatalf("resolvePodBoxEnv with a non-growing value: %v", err)
+	}
+	if got := big.GetEnv()[1].GetValue(); got != "$5" {
+		t.Errorf("PRICE = %q, want %q", got, "$5")
 	}
 }

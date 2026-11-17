@@ -151,8 +151,10 @@ func resolveContainerEnv(ctx context.Context, c *runtimev1.Container, ns string,
 		if skip {
 			continue
 		}
-		if e.GetValueFrom() == nil {
-			val = image.ExpandVars(val, envSoFar(ordered))
+		if e.GetValueFrom() == nil && strings.Contains(val, "$") {
+			if val, err = expandEnvValue(e.GetName(), val, ordered); err != nil {
+				return err
+			}
 		}
 		upsert(e.GetName(), val)
 	}
@@ -162,25 +164,46 @@ func resolveContainerEnv(ctx context.Context, c *runtimev1.Container, ns string,
 	return nil
 }
 
-// envSoFar is the lookup an env value's $(VAR) references resolve against: every
-// variable already in the container's env when the value is reached, which is
-// the kubelet's "dependent environment variables" rule. That is the namespace
-// service links, the master service, the envFrom keys, and the explicit env
-// vars declared EARLIER in the list (a later declaration of a name is not yet
-// visible, so a forward reference stays verbatim). Values that came from
-// valueFrom or envFrom are never expanded themselves, as upstream; only a
-// literal value is. The grammar is runtimed's image.ExpandVars, the same copy
-// command and args go through, and since runtimed reads this already-expanded
-// env, command and args see the expanded values.
+// maxContainerEnvBytes caps what $(VAR) expansion may grow one container's
+// env to. It is macOS's kern.argmax, the most argv and envp together that one
+// exec takes, so an env past it could never start anyway; the cap only moves
+// that failure to pod creation, where it names the variable, and keeps an
+// amplifying chain (each value referencing the one before twice) from asking
+// the node daemon for gigabytes first.
+const maxContainerEnvBytes = 1 << 20
+
+// expandEnvValue expands the $(VAR) references in one literal env value by the
+// kubelet's "dependent environment variables" rule: against every variable
+// already in the container's env when the value is reached. That is the
+// namespace service links, the master service, the envFrom keys, and the
+// explicit env vars declared EARLIER in the list (a later declaration of a name
+// is not yet visible, so a forward reference stays verbatim). Values that came
+// from valueFrom or envFrom are never expanded themselves, as upstream; only a
+// literal value is, and the caller calls this only for one containing "$". The
+// grammar is runtimed's image.ExpandVarsLimit, the same copy command and args
+// go through, and since runtimed reads this already-expanded env, command and
+// args see the expanded values.
 //
-// It rebuilds the map per value rather than keeping one beside upsert, because
-// only a value containing "$" consults it and pod env lists are short.
-func envSoFar(ordered []*runtimev1.EnvVar) map[string]string {
-	m := make(map[string]string, len(ordered))
+// Expansion must run once per value: a second pass would turn the "$(X)" that
+// "$$(X)" produced into X's value. It does, because resolvePodBoxEnv runs only
+// in buildBox, on a box freshly translated from the pod.
+//
+// The result may not take the container's env past maxContainerEnvBytes, unless
+// it is no longer than the literal it came from: a value that does not grow
+// never fails here, so a pod that started before expansion existed still does.
+func expandEnvValue(name, val string, ordered []*runtimev1.EnvVar) (string, error) {
+	lookup := make(map[string]string, len(ordered))
+	used := 0
 	for _, e := range ordered {
-		m[e.GetName()] = e.GetValue()
+		lookup[e.GetName()] = e.GetValue()
+		used += len(e.GetName()) + len(e.GetValue()) + 2 // "=" and the NUL
 	}
-	return m
+	limit := max(maxContainerEnvBytes-used-len(name)-2, len(val))
+	out, ok := image.ExpandVarsLimit(val, lookup, limit)
+	if !ok {
+		return "", fmt.Errorf("env %s: expanding its $(VAR) references takes the container's environment past %d bytes", name, maxContainerEnvBytes)
+	}
+	return out, nil
 }
 
 // expandEnvFrom expands a whole ConfigMap/Secret into env vars (sorted keys, with
