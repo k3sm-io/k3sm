@@ -320,6 +320,29 @@ rootless pod expecting an absolute mount path sees the unmounted host path inste
 ladder that depends on absolute volume mounts (e.g. the MLX acceptance gate's cache PVC) is a
 root-tier run. Rootless stops at mount resolution.
 
+### Absolute Paths Into the Image Resolve on the Host
+
+A native Pod has no chroot, so an absolute path that names a file in the **image** (not a volume
+mount) is a host path: `PYTHONPATH=/app`, `/python/lib/...` or `--config /etc/app.toml` reads the
+Mac's `/app`, not the image's. So does the image's `WORKDIR`: an image with `WORKDIR /app` runs in the
+Mac's `/app`. Only the container's volume-mount prefixes are rebased (above). The image's own
+entrypoint is the exception: k3sm resolves `ENTRYPOINT` and `command[0]` inside the image.
+
+Every container of a native Pod that runs a pulled image gets the image root in
+**`K3SM_IMAGE_ROOT`**: the host directory k3sm materializes the Pod's images in. It is the Pod's data
+volume, shared by every container of the Pod, and the working directory when neither the container
+nor the image sets one. Build absolute image paths from it, for example `"$K3SM_IMAGE_ROOT/app"` in a
+launcher script or `os.environ["K3SM_IMAGE_ROOT"]` in code, or use paths relative to the executable
+(a Python `.pth` file next to `site-packages`, `@loader_path` install names). The runtime sets the
+value, and a value in the Pod spec is replaced. A host-binary container gets none: `image: native`,
+or an image that is a host path and sets no `command` or `args`.
+
+Kubernetes `$(VAR)` references cannot name it. `$(VAR)` in `command` and `args` is expanded before
+the runtime adds the variable, so `$(K3SM_IMAGE_ROOT)/app/run` stays as written, and `env` values are
+not expanded at all. Read the variable at run time instead, through a shell or the program itself.
+`K3SM_IMAGE_ROOT` is a location, not isolation. Seatbelt confines the Pod at host paths, and the
+`vm` RuntimeClass is the place for real filesystem isolation.
+
 ### Unsupported Volume Kinds Are Refused When Mounted
 
 `hostPath` is **not modeled on the `vm` path**, and on the native path only for a host share the
