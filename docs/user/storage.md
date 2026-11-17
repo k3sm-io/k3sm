@@ -185,7 +185,11 @@ k3sm share add --namespace team-a --namespace 'team-b-*' /Users/you/Code/shared
 
 Each value is a namespace name, or a prefix pattern ending in one `*`: `team-b-*` admits every
 namespace whose name starts with `team-b-`. A bare `*` is refused; leave `--namespace` out for every
-namespace. In the file a limited share is one line with a `namespaces=` field:
+namespace.
+
+A pattern admits any namespace anyone can create with that prefix, now or later. Scope a share by a
+pattern only where creating namespaces is controlled by you, the cluster operator, and end the
+prefix at a hyphen (`yurei-*`, not `yurei*`, which would also admit a namespace named `yureish`). In the file a limited share is one line with a `namespaces=` field:
 
 ```text
 <mode> <path> [namespaces=<ns>,<ns>,...]
@@ -199,10 +203,18 @@ existed, so an existing list reads and behaves the same. A `namespaces=` field t
 repeats a name, or holds anything but a namespace name or a prefix pattern makes the whole file
 invalid, and nothing in that file is shared, so a typo never leaves a share open to every namespace.
 
-When a Pod mounts a `hostPath`, the node looks only at the lines that admit the Pod's namespace, and
-the usual rules then apply among those: the most specific path decides, and read-write wins between
-two lines for the same path. A line for other namespaces is as if it were not there, so a
-`--read-only` line for one namespace narrows that namespace only. A Pod in a namespace no line
+When a Pod mounts a `hostPath`, the node looks only at the lines that admit the Pod's namespace. A
+line for other namespaces is as if it were not there, so a `--read-only` line for one namespace
+narrows that namespace only. Among the lines that admit the Pod, in this order:
+
+1. the most specific path decides;
+2. on the same path, the line that names the Pod's namespace most specifically decides: an exact
+   name, then a pattern (the longer prefix first), then a line for every namespace;
+3. only between lines equally specific does read-write win.
+
+So a narrower line always beats a broader one, whatever its mode: `ro /c namespaces=team-x` beside
+`rw /c namespaces=team-*` gives `team-x` read-only, and `ro /c namespaces=guest-*` beside a `rw /c`
+for every namespace gives every `guest-` namespace read-only. A Pod in a namespace no line
 admits is refused with a `FailedHostShare` Event that names the Pod's own namespace. The Event never
 says which namespaces a share does admit.
 
@@ -214,13 +226,13 @@ rw /Users/you/Code namespaces=yurei-system
 ro /Users/you/Code namespaces=yurei-*
 ```
 
-When more than one line admits a Pod, the same rules decide as for any two lines: the more specific
-path wins, and on the same path read-write wins. `yurei-system` matches `yurei-*` as well, so above
-it gets read-write; every other `yurei-` namespace gets read-only, and its read-write mount is
-refused.
+`yurei-system` matches `yurei-*` as well, but the first line names it exactly, so it gets read-write;
+every other `yurei-` namespace matches only the pattern and gets read-only, and its read-write mount
+is refused.
 
-A share for every namespace keeps admitting every namespace, whatever narrower lines exist beside
-it. To narrow a share, replace it. `k3sm share add` of a path that is already listed replaces the
+A share for every namespace keeps admitting every namespace that no narrower line for its path
+names, so a namespace you leave out of every line still gets it. To narrow a share to named
+namespaces, replace it. `k3sm share add` of a path that is already listed replaces the
 path's line for the same namespaces, and a line for every namespace and a namespaced line replace
 each other, so adding the path with `--namespace` narrows it. Lines for other namespace sets stay.
 `k3sm share remove <path>` removes every line for the path; with `--namespace` it removes only the
@@ -241,8 +253,22 @@ pattern (`yurei-app-*` is within `yurei-*`, `yu*` is not). A share the user adds
 in `k3sm share list`. A delegation with no `--namespaces` lets the user choose any namespaces, or
 none.
 
+Running `sudo k3sm share delegate` again for the same user and prefix replaces the delegation.
+With `--namespaces` it sets the new cap. Without it, a capped delegation is refused, because the
+user's shares that name no namespace would then admit every namespace; pass `--no-namespace-cap` to
+drop the cap on purpose, and k3sm lists each share that widens.
+
 Each node reads its own `/Library/k3sm.host-shares`, so each node enforces its own lines. Give every
 node that may run the Pod the same lines.
+
+Upgrade every node before you add a `namespaces=` field. A k3sm release older than the field reads
+a file that has one as invalid and shares nothing from it, so a node not yet upgraded refuses those
+Pods (fails closed) rather than sharing more.
+
+The namespace and the mode are enforced by the Pod's sandbox profile, per Pod. The file permissions
+`k3sm share add` sets for `_k3sm` (below) are per path: a path that is read-write for one namespace
+gets the read-write entry, and a read-only line for another namespace relies on the profile, not on
+the permissions, to stay read-only.
 
 #### Per-Project Shares (Yureisha)
 

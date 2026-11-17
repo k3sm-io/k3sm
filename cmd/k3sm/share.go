@@ -70,9 +70,13 @@ namespace). A path may have one line per namespace set, with its own mode:
 rw for yurei-system and ro for yurei-* is two lines. Adding a path again
 replaces its line for the same namespaces; a line for every namespace and a
 namespaced line replace each other, so to narrow a share add it again with
-the namespaces it keeps. Where two lines for one path both admit a pod, the
-more specific path decides and, on the same path, rw wins. Each node reads its
-own list.
+the namespaces it keeps. Where several lines admit a pod, the more specific
+path decides; on one path, the line naming the namespace most specifically (an
+exact name, then the longer pattern, then every namespace); and rw only
+between lines equally specific. A pattern admits any namespace anyone can
+create with that prefix: end it at a hyphen, and use one only where you
+control namespace creation. Each node reads its own list; a release older than
+--namespace shares nothing from a file that uses it.
 
 Who may add a share. Root, with sudo, anywhere the rules below allow; the list
 is ` + hostshare.DefaultFile + `, owned by root and writable by root alone. Or a

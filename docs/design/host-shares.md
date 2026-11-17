@@ -156,15 +156,16 @@ A share line may end with `namespaces=<ns>[,<ns>...]`, each a namespace name (an
 a prefix pattern ending in one `*` (`yurei-p-*`; a bare `*` is refused). A line with no field is
 node-wide, so every file written before the field existed parses and behaves the same. An empty
 field, an empty or repeated name, or an invalid one fails the whole file: the line is never read as
-node-wide. `Authorize` takes the Pod's namespace and considers only the lines that admit it; the
-most-specific-wins and rw/ro rules then run among those, so a namespace's narrower `ro` line narrows
-that namespace alone, and a node-wide line still admits every namespace. The refusal names the
+node-wide. `Authorize` takes the Pod's namespace and considers only the lines that admit it, so a
+namespace's narrower `ro` line narrows that namespace alone. Among them the most specific path
+wins; on the same path, the line naming the namespace most specifically (an exact name, then the
+longer pattern, then node-wide); and read-write only between lines equally specific, so a broader
+`rw` line never overrides a narrower `ro` one. The refusal names the
 Pod's own namespace and never another, nor whether a line for another namespace covers the path.
 
 One path may carry a line per namespace set, each with its own mode (`rw /c namespaces=yurei-system`
-beside `ro /c namespaces=yurei-*`). Where several lines admit one Pod, the existing precedence
-decides with no new rule: the more specific path, then read-write on the same path, so
-`yurei-system`, which both lines above admit, gets read-write. `k3sm share add` replaces the path's
+beside `ro /c namespaces=yurei-*`). `yurei-system`, which both admit, is named exactly by the `rw`
+line and gets read-write; every other `yurei-` namespace gets read-only. `k3sm share add` replaces the path's
 line for the same set, and a node-wide line and a namespaced one replace each other.
 
 A delegation line may carry the same field, before the prefix, as a cap:
@@ -184,6 +185,15 @@ model is unchanged: the node admin decides it on the node, and neither a Pod nor
 widen it. Each node enforces its own file.
 
 The provider passes the Pod object's namespace; runtimed passes the request's, the only one it has.
+
+A pattern admits every namespace anyone with namespace-create rights can make with that prefix, so
+it scopes only where namespace creation is operator-controlled; the prefix should end at a hyphen.
+Re-running `delegate` without `--namespaces` on a capped delegation is refused unless
+`--no-namespace-cap` is given, because the user's lines that took the cap would widen to every
+namespace; k3sm then lists them. A binary older than the field reads a file that carries it as
+invalid and shares nothing (fail closed), so every node is upgraded before the field is used. The
+`_k3sm` ACL a share sets is keyed by path only; the per-Pod profile enforces the namespace and the
+mode. Precedence between a root line and a delegated line is unchanged: they are one list.
 
 ### Permissions
 
