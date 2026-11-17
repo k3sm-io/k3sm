@@ -161,6 +161,12 @@ most-specific-wins and rw/ro rules then run among those, so a namespace's narrow
 that namespace alone, and a node-wide line still admits every namespace. The refusal names the
 Pod's own namespace and never another, nor whether a line for another namespace covers the path.
 
+One path may carry a line per namespace set, each with its own mode (`rw /c namespaces=yurei-system`
+beside `ro /c namespaces=yurei-*`). Where several lines admit one Pod, the existing precedence
+decides with no new rule: the more specific path, then read-write on the same path, so
+`yurei-system`, which both lines above admit, gets read-write. `k3sm share add` replaces the path's
+line for the same set, and a node-wide line and a namespaced one replace each other.
+
 A delegation line may carry the same field, before the prefix, as a cap:
 
 ```

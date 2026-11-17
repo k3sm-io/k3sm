@@ -179,7 +179,7 @@ you name, and can be repeated:
 
 ```sh
 sudo k3sm share add --namespace build /Volumes/datasets
-k3sm share add --namespace yurei-p-app /Users/you/Code/app
+k3sm share add --namespace yurei-app /Users/you/Code/app
 k3sm share add --namespace team-a --namespace 'team-b-*' /Users/you/Code/shared
 ```
 
@@ -189,7 +189,7 @@ namespace. In the file a limited share is one line with a `namespaces=` field:
 
 ```text
 <mode> <path> [namespaces=<ns>,<ns>,...]
-rw /Users/you/Code/app namespaces=yurei-p-app
+rw /Users/you/Code/app namespaces=yurei-app
 ro /Volumes/datasets namespaces=build,team-b-*
 rw /opt/scratch
 ```
@@ -206,22 +206,37 @@ two lines for the same path. A line for other namespaces is as if it were not th
 admits is refused with a `FailedHostShare` Event that names the Pod's own namespace. The Event never
 says which namespaces a share does admit.
 
+One path may have a line per namespace set, each with its own mode, so a tree can be read-write
+for one namespace and read-only for others:
+
+```text
+rw /Users/you/Code namespaces=yurei-system
+ro /Users/you/Code namespaces=yurei-*
+```
+
+When more than one line admits a Pod, the same rules decide as for any two lines: the more specific
+path wins, and on the same path read-write wins. `yurei-system` matches `yurei-*` as well, so above
+it gets read-write; every other `yurei-` namespace gets read-only, and its read-write mount is
+refused.
+
 A share for every namespace keeps admitting every namespace, whatever narrower lines exist beside
-it. To narrow a share, replace it: `k3sm share add` of a path that is already listed replaces its
-line, so add it again with the namespaces it keeps. `k3sm share list` shows each line with its
-namespaces.
+it. To narrow a share, replace it. `k3sm share add` of a path that is already listed replaces the
+path's line for the same namespaces, and a line for every namespace and a namespaced line replace
+each other, so adding the path with `--namespace` narrows it. Lines for other namespace sets stay.
+`k3sm share remove <path>` removes every line for the path; with `--namespace` it removes only the
+line for exactly those namespaces. `k3sm share list` shows each line with its namespaces.
 
 The node admin can also cap the namespaces a delegated user's shares may name:
 
 ```sh
-sudo k3sm share delegate --user you --namespaces 'yurei-system,yurei-p-*' /Users/you/Code
+sudo k3sm share delegate --user you --namespaces 'yurei-*' /Users/you/Code
 ```
 
 The delegation line in the root-owned file then reads
-`delegate uid=<uid> user=you modes=<modes> namespaces=yurei-p-*,yurei-system /Users/you/Code`.
+`delegate uid=<uid> user=you modes=<modes> namespaces=yurei-* /Users/you/Code`.
 Under a cap, each namespace a user's share names must be within it: a name must equal a capped name
 or start with a capped pattern's prefix, and a pattern must be at least as narrow as a capped
-pattern (`yurei-p-app-*` is within `yurei-p-*`, `yurei-*` is not). A share the user adds with no
+pattern (`yurei-app-*` is within `yurei-*`, `yu*` is not). A share the user adds with no
 `--namespace` takes the cap. A line outside the cap is not admitted and shows under "not admitted"
 in `k3sm share list`. A delegation with no `--namespaces` lets the user choose any namespaces, or
 none.
@@ -231,23 +246,34 @@ node that may run the Pod the same lines.
 
 #### Per-Project Shares (Yureisha)
 
-Yureisha runs its controller in `yurei-system` and each project in its own namespace. Shared as one
-read-write line for every namespace, `/Users/you/Code` lets any project's Pod write every repository.
-Instead, give the whole tree to `yurei-system` alone, and each project namespace its own
-repositories and any extra paths it needs:
+Yureisha runs its controller in `yurei-system` and each project in its own namespace,
+`yurei-<project>`. Shared as one read-write line for every namespace, `/Users/you/Code` lets any
+project's Pod write every repository. Instead, keep the code root read-write for `yurei-system`,
+give every project namespace the root read-only, and give each project its own repositories
+read-write:
 
 ```sh
-sudo k3sm share delegate --user you --namespaces 'yurei-system,yurei-p-*' /Users/you/Code   # once
-k3sm share add --namespace yurei-system /Users/you/Code   # replaces the line for every namespace
-k3sm share add --namespace yurei-p-app /Users/you/Code/app
-k3sm share add --namespace yurei-p-site /Users/you/Code/site
-k3sm share add --read-only --namespace yurei-p-site /Users/you/Code/design-tokens
+sudo k3sm share delegate --user you --modes rw,ro,socket --namespaces 'yurei-*' /Users/you/Code   # once
+k3sm share add --namespace yurei-system /Users/you/Code             # replaces the line for every namespace
+k3sm share add --read-only --namespace 'yurei-*' /Users/you/Code
+k3sm share add --namespace yurei-app /Users/you/Code/app
+k3sm share add --namespace yurei-site /Users/you/Code/site
 ```
 
-A Pod in `yurei-p-app` can then mount `/Users/you/Code/app` and nothing else under
-`/Users/you/Code`, and a Pod in `yurei-system` can mount the whole tree. If `/Users/you/Code` was
-added by the node admin rather than under the delegation, replace it with
-`sudo k3sm share add --namespace yurei-system /Users/you/Code`.
+Your list then holds:
+
+```text
+rw /Users/you/Code namespaces=yurei-system
+ro /Users/you/Code namespaces=yurei-*
+rw /Users/you/Code/app namespaces=yurei-app
+rw /Users/you/Code/site namespaces=yurei-site
+```
+
+A Pod in `yurei-app` can mount `/Users/you/Code/app` read-write, and `/Users/you/Code` or any other
+repository under it only read-only. A Pod in `yurei-system` can mount the whole tree read-write. A
+Pod in any namespace outside `yurei-*`, such as `default`, can mount none of it. If
+`/Users/you/Code` was added by the node admin rather than under the delegation, make the first two
+lines with `sudo k3sm share add` instead.
 
 A Pod mounts a share with a `hostPath` volume whose `mountPath` equals `hostPath.path`, with no
 `subPath`, and with `readOnly: true` when the share is read-only:
