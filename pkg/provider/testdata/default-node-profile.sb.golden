@@ -44,6 +44,7 @@
   (require-all
     (regex #"^/dev/ttys[0-9][0-9][0-9]+$")
     (extension "com.apple.sandbox.pty")))
+(deny file-ioctl (ioctl-command TIOCSTI) (ioctl-command TIOCCONS))
 ;; network: ALLOWED — unfiltered outbound+bind+inbound under (deny default).
 ;; macOS 26 Seatbelt accepts only localhost/* hosts in network filters;
 ;; per-IP scoping (VIP egress, per-pod-IP bind) does NOT compile.

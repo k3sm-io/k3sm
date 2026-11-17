@@ -188,8 +188,12 @@ permissions would let one Pod open another's terminal; the profile is what refus
 to hold once the Mac has reused it.
 
 - `/dev/tty` opens the caller's own controlling terminal, as on Linux, so pagers and password
-  prompts that read the terminal directly work, in a Pod's own terminal and in `kubectl exec -it`. A
-  process with no controlling terminal gets `ENXIO`.
+  prompts that read the terminal directly work, in a Pod's own terminal and in `kubectl exec -it`.
+  Every container and every `kubectl exec` session starts in a new session with no terminal, even
+  when the node daemon was started from a Terminal window, so a process with no terminal of its own
+  gets `ENXIO`.
+- The `TIOCSTI` and `TIOCCONS` requests (pushing input into a terminal, taking over console output)
+  are refused, also for a Pod that runs as root.
 - Nothing else under `/dev` is opened up. The profile does not let a Pod list `/dev`, so
   `ttyname(3)`, the `tty` command and Python's `os.ttyname` fail with `ERANGE`; `ptsname(3)` names a
   terminal the Pod allocated.
