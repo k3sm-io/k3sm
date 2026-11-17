@@ -284,6 +284,10 @@ grant, so a Pod author cannot probe which accounts the node has.
 ## Residual risks
 
 - A Pod that is running keeps a share after it is removed, until the Pod is recreated.
+- `ro` rests on the Pod's Seatbelt profile alone (`allow file-read*` with `deny file-write*` on the
+  share). The `_k3sm` ACL a share sets is per path and grants write, so any `_k3sm` process the
+  profile does not confine (runtimed, a Pod with a profile bug, a Pod created through the socket
+  with another namespace's `rw` line) can write a `ro` share.
 - runtimed decides a namespaced line from the namespace in the CreatePod request. The node daemon
   decides it from the Pod object first, but a Pod that sends its own request to runtimed's socket
   can name any namespace and reach any namespace's shares. Namespace scope therefore narrows what

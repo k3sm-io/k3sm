@@ -203,6 +203,12 @@ existed, so an existing list reads and behaves the same. A `namespaces=` field t
 repeats a name, or holds anything but a namespace name or a prefix pattern makes the whole file
 invalid, and nothing in that file is shared, so a typo never leaves a share open to every namespace.
 
+Namespace scope decides what the cluster can schedule onto a share. It is not isolation between
+Pods on one node: every native Pod on a node runs as the same user and can reach the node's
+runtime, so a Pod that is already compromised can ask for another namespace's shares. Keep
+untrusted workloads off a node with shares they must not reach, or run them under the `vm`
+RuntimeClass.
+
 When a Pod mounts a `hostPath`, the node looks only at the lines that admit the Pod's namespace. A
 line for other namespaces is as if it were not there, so a `--read-only` line for one namespace
 narrows that namespace only. Among the lines that admit the Pod, in this order:
