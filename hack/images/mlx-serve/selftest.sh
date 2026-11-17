@@ -54,6 +54,10 @@
 #   * build.sh --from-stage packages a stage made elsewhere with no uv, and
 #     refuses a stage from other pins, without its stamp or interpreter, with a
 #     drifted entrypoint module, or with a file the packaging user cannot read.
+#   * stage-job.sh fetch reads the stage as the runtime user, through a reader
+#     pod that mounts the claim read-only and carries no credential, into the
+#     operator's cache, where --from-stage packages it; a failed stream keeps
+#     the earlier copy, and the reader is deleted every time.
 #
 # Usage: hack/images/mlx-serve/selftest.sh
 #   --staged makes rung 9a (the served-name alias and the engine source on the
@@ -68,6 +72,7 @@
 #   --case serve.model.routes runs only that case: k3sm_serve's refusal of the
 #   embedding and audio model routes, on fakes and, when a staged tree is present,
 #   on the real engine.
+#   --self-test is the default run, named: every check above, hermetic.
 #   Any other argument is refused with exit 2.
 # Exit: 0 all checks pass, 1 otherwise, 2 on a usage error.
 set -uo pipefail
@@ -78,6 +83,7 @@ CASE=""
 while [ $# -gt 0 ]; do
 	case "$1" in
 		--staged) STAGED_REQUIRED=1 ;;
+		--self-test) ;;
 		--strict-self-test)
 			if [ -n "${K3SM_MLX_SELFTEST_ONLY:-}" ]; then
 				echo "selftest: --strict-self-test inside its own child run (recursion refused)" >&2
@@ -92,7 +98,7 @@ while [ $# -gt 0 ]; do
 			CASE="$2"
 			shift ;;
 		*)
-			echo "selftest: unknown argument '$1' (only --staged, --strict-self-test and --case)" >&2
+			echo "selftest: unknown argument '$1' (only --self-test, --staged, --strict-self-test and --case)" >&2
 			exit 2 ;;
 	esac
 	shift
@@ -3077,14 +3083,155 @@ mkstage
 refused "exclusive  --from-stage with --stage-only is" "opposite halves" --from-stage "$PV/stage" --stage-only
 refused "nostage  --from-stage with --stage is" "drop --stage" --from-stage "$PV/stage" --stage "$PV/stage"
 
+# ---- 12 — stage-job.sh fetch (the stage, read as the runtime user) ----------
+# The storage tree is the runtime user's alone (0700), so the operator never
+# reads the stage in place: fetch runs a reader pod that mounts the claim
+# read-only and streams the stage out over kubectl exec. What is proven here is
+# that hand-off, against a fake kubectl whose exec runs the tar on a fake stage:
+# the reader pod's shape, the copy and its stamp in the operator's cache, a
+# --from-stage package of that copy, the earlier copy kept on a failed stream,
+# and the reader pod deleted every time.
+RR="$WORK/reader.yaml"
+if ! out="$("$STAGEJOB" render-reader 2>&1)" && grep -q 'render-reader needs --node' <<<"$out"; then
+	ladder ok "12.nonode  render-reader refuses to run without --node"
+else
+	ladder no "12.nonode  render-reader refuses to run without --node"
+fi
+"$STAGEJOB" render-reader --node "$GOLD_NODE" > "$RR" 2>/dev/null || true
+if [ "$(grep -E '^kind: ' "$RR" | awk '{print $2}' | tr '\n' ' ')" = "Pod " ] &&
+	grep -q '^  automountServiceAccountToken: false$' "$RR" &&
+	grep -q '^  enableServiceLinks: false$' "$RR" &&
+	! grep -qiE 'secret|serviceAccountName|imagePullSecrets|hostNetwork|privileged|runAsUser' "$RR" &&
+	[ "$(grep -c '^ *readOnly: true$' "$RR")" -eq 2 ] &&
+	grep -q '^        claimName: mlx-serve-stage$' "$RR" &&
+	grep -q '^      image: native$' "$RR" &&
+	grep -q '^      command: \["/bin/sleep", "900"\]$' "$RR"; then
+	ladder ok "12.reader  the reader is one native pod, claim mounted read-only, no credential, it only waits"
+else
+	ladder no "12.reader  the reader is one native pod, claim mounted read-only, no credential, it only waits"
+fi
+if grep -q "^    kubernetes.io/hostname: $GOLD_NODE$" "$RR" && grep -q '^    kubernetes.io/os: darwin$' "$RR" &&
+	[ "$(grep -c '^    - key: ' "$RR")" -eq 1 ] && grep -q '^    - key: k3sm.io/provider$' "$RR" &&
+	! grep -q 'nodeName' "$RR"; then
+	ladder ok "12.place  placed by nodeSelector on the stage's node, tolerating only the provider taint"
+else
+	ladder no "12.place  placed by nodeSelector on the stage's node, tolerating only the provider taint"
+fi
+
+FAKEKUBECTL="$WORK/fake-kubectl"
+cat > "$FAKEKUBECTL" <<'FAKE'
+#!/bin/bash
+# Answers the calls stage-job.sh fetch makes; exec runs the tar on $FAKE_PV.
+printf '%s\n' "$*" >> "$FAKE_KLOG"
+args=" $* "
+case "$args" in
+	*" get pvc "*) [ -n "${FAKE_UNBOUND:-}" ] || echo "pv-stage" ;;
+	*" get pv pv-stage "*nodeAffinity*) echo "k3sm-golden" ;;
+	*" get pv pv-stage "*local.path*) echo "/var/lib/k3sm/storage/mlx-serve-build/mlx-serve-stage" ;;
+	*" apply -f "*) while [ $# -gt 0 ]; do [ "$1" = "-f" ] && cp "$2" "$FAKE_APPLIED"; shift; done ;;
+	*" wait "*) ;;
+	*" get job "*) printf '%s' "${FAKE_ACTIVE:-}" ;;
+	*" exec "*" /bin/test -f ./stage/stage.stamp "*)
+		[ -z "${FAKE_NOSTAGE:-}" ] ;;
+	*" exec "*)
+		[ -z "${FAKE_EXEC_FAIL:-}" ] || { printf 'partial'; exit 1; }
+		[ -z "${FAKE_STREAM:-}" ] || exec cat "$FAKE_STREAM"
+		while [ $# -gt 0 ]; do [ "$1" = "--" ] && { shift; break; }; shift; done
+		[ "$*" = "/usr/bin/tar -C ./stage -cf - stage stage.stamp" ] || { echo "unexpected exec: $*" >&2; exit 9; }
+		exec /usr/bin/tar -C "$FAKE_PV" -cf - stage stage.stamp ;;
+	*" delete pod "*) ;;
+	*) echo "fake-kubectl: unexpected: $*" >&2; exit 9 ;;
+esac
+FAKE
+chmod +x "$FAKEKUBECTL"
+OPCACHE="$WORK/opcache"
+fetchcase() {
+	: > "$WORK/klog"; rm -f "$WORK/applied.yaml"
+	FAKE_KLOG="$WORK/klog" FAKE_APPLIED="$WORK/applied.yaml" FAKE_PV="$PV" KUBECTL="$FAKEKUBECTL" \
+		K3SM_MLX_WORK="$OPCACHE" "$STAGEJOB" fetch 2>&1
+}
+deleted_last() { [ "$(grep -c ' delete pod mlx-serve-stage-reader ' "$WORK/klog")" -ge 2 ] && tail -1 "$WORK/klog" | grep -q ' delete pod mlx-serve-stage-reader '; }
+
+mkstage
+out="$(fetchcase)"; rc=$?
+if [ "$rc" -eq 0 ] && [ -x "$OPCACHE/stage/bin/python3.12" ] && cmp -s "$PV/stage.stamp" "$OPCACHE/stage.stamp" &&
+	diff -r "$PV/stage" "$OPCACHE/stage" >/dev/null &&
+	cmp -s "$WORK/applied.yaml" <("$STAGEJOB" render-reader --node k3sm-golden) && deleted_last &&
+	[ -z "$(find "$OPCACHE" -maxdepth 1 -name '.stage-fetch.*')" ]; then
+	ladder ok "12.fetch  fetch copies the stage and its stamp into the operator's cache, through the reader on the volume's node, and deletes it"
+else
+	ladder no "12.fetch  fetch copies the stage and its stamp into the operator's cache, through the reader on the volume's node, and deletes it (exit $rc)"
+	printf '%s\n' "$out" | tail -5
+fi
+out="$(fromstage --from-stage "$OPCACHE/stage")"; rc=$?
+if [ "$rc" -eq 0 ] && [ "$(tail -1 "$WORK/fake-argv" 2>/dev/null)" = "$OPCACHE/stage" ]; then
+	ladder ok "12.package  build.sh --from-stage packages the fetched copy as the operator"
+else
+	ladder no "12.package  build.sh --from-stage packages the fetched copy as the operator (exit $rc)"
+	printf '%s\n' "$out" | tail -5
+fi
+before="$(cat "$OPCACHE/stage.stamp")"
+FAKE_EXEC_FAIL=1 fetchcase >/dev/null; rc=$?
+if [ "$rc" -ne 0 ] && [ "$(cat "$OPCACHE/stage.stamp")" = "$before" ] && [ -x "$OPCACHE/stage/bin/python3.12" ] &&
+	deleted_last && [ -z "$(find "$OPCACHE" -maxdepth 1 -name '.stage-fetch.*')" ]; then
+	ladder ok "12.keep  a failed stream fails the fetch, keeps the earlier copy, and still deletes the reader (exit $rc)"
+else
+	ladder no "12.keep  a failed stream fails the fetch, keeps the earlier copy, and still deletes the reader (exit $rc)"
+fi
+FAKE_ACTIVE=1 fetchcase >/dev/null; rc=$?
+if [ "$rc" -ne 0 ] && [ ! -f "$WORK/applied.yaml" ]; then
+	ladder ok "12.running  fetch refuses while the stage Job is still running (exit $rc)"
+else
+	ladder no "12.running  fetch refuses while the stage Job is still running (exit $rc)"
+fi
+FAKE_NOSTAGE=1 fetchcase > "$WORK/nostage.out"; rc=$?
+if [ "$rc" -ne 0 ] && grep -q "pod's root" "$WORK/nostage.out" && deleted_last; then
+	ladder ok "12.cwd  a reader that does not see ./stage fails by name, and is deleted (exit $rc)"
+else
+	ladder no "12.cwd  a reader that does not see ./stage fails by name, and is deleted (exit $rc)"
+fi
+# Hostile streams: a stage that is a symlink, and a member that climbs out.
+HOSTILE="$WORK/hostile"; rm -rf "$HOSTILE"; mkdir -p "$HOSTILE/a"
+ln -s /etc "$HOSTILE/a/stage"; : > "$HOSTILE/a/stage.stamp"
+/usr/bin/tar -C "$HOSTILE/a" -cf "$HOSTILE/link.tar" stage stage.stamp
+mkdir -p "$HOSTILE/b/stage"; : > "$HOSTILE/b/stage.stamp"; : > "$HOSTILE/escape"
+( cd "$HOSTILE/b" && /usr/bin/tar -cf "$HOSTILE/climb.tar" stage stage.stamp ../escape 2>/dev/null )
+before="$(cat "$OPCACHE/stage.stamp")"
+for h in link climb; do
+	rm -f "$WORK/escape"
+	FAKE_STREAM="$HOSTILE/$h.tar" fetchcase >/dev/null; rc=$?
+	if [ "$rc" -ne 0 ] && [ "$(cat "$OPCACHE/stage.stamp")" = "$before" ] && [ -x "$OPCACHE/stage/bin/python3.12" ] &&
+		[ ! -e "$OPCACHE/escape" ] && [ ! -L "$OPCACHE/stage" ]; then
+		ladder ok "12.hostile.$h  a hostile stream is refused and the earlier copy kept (exit $rc)"
+	else
+		ladder no "12.hostile.$h  a hostile stream is refused and the earlier copy kept (exit $rc)"
+	fi
+done
+# --dest never replaces a directory that is not an earlier fetch.
+mkdir -p "$WORK/notastage"; : > "$WORK/notastage/keep"
+FAKE_KLOG="$WORK/klog" FAKE_APPLIED="$WORK/applied.yaml" FAKE_PV="$PV" KUBECTL="$FAKEKUBECTL" \
+	"$STAGEJOB" fetch --dest "$WORK/notastage" >/dev/null 2>&1; rc=$?
+FAKE_KLOG="$WORK/klog" KUBECTL="$FAKEKUBECTL" "$STAGEJOB" fetch --dest "$HOME" >/dev/null 2>&1; rc2=$?
+if [ "$rc" -ne 0 ] && [ -f "$WORK/notastage/keep" ] && [ "$rc2" -ne 0 ] && [ -d "$HOME" ]; then
+	ladder ok "12.dest  --dest refuses a directory that is not an earlier fetch, and your home"
+else
+	ladder no "12.dest  --dest refuses a directory that is not an earlier fetch, and your home (exit $rc, $rc2)"
+fi
+FAKE_UNBOUND=1 fetchcase >/dev/null; rc=$?
+if [ "$rc" -ne 0 ] && [ ! -f "$WORK/applied.yaml" ]; then
+	ladder ok "12.unbound  fetch refuses an unbound claim before creating anything (exit $rc)"
+else
+	ladder no "12.unbound  fetch refuses an unbound claim before creating anything (exit $rc)"
+fi
+
 # ---- summary ----------------------------------------------------------------
 echo "----------------------------------------"
 echo "mlx-serve selftest: $PASS passed, $FAIL failed, $SKIP skipped"
 cat <<'EOF'
 
 Not covered here — this needs a Mac with uv, a k3sm binary and the network:
-  * the stage Job on a cluster (egress, the pod sandbox, the volume) and the
-    host packaging its volume with --from-stage;
+  * the stage Job on a cluster (egress, the pod sandbox, the volume), fetch
+    over a real kubectl exec, and the host packaging the copy with --from-stage;
   * staging the tree (uv python install + uv pip install --require-hashes),
     and with it the interpreter-URL pin assertion;
   * `k3sm build --no-record --format oci` over the real 1.3 GB context, as an
