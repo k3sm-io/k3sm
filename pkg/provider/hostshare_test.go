@@ -19,6 +19,7 @@ package provider
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -119,6 +120,83 @@ func TestCreatePodHostShare(t *testing.T) {
 				t.Errorf("CreatePod RPC calls = %d, want 0", creates)
 			}
 			assertOneRefusalEvent(t, pendingEvents(rec.Events), reasonFailedHostShare, "code")
+		})
+	}
+}
+
+// TestCreatePodHostShareNamespace pins the provider's half of a namespaced
+// share: a line naming namespaces reaches the runtime only from a pod in one
+// of them; a pod in any other namespace is refused before the RPC with one
+// FailedHostShare Event that names its own namespace and no other; and a line
+// naming none still admits every namespace.
+func TestCreatePodHostShareNamespace(t *testing.T) {
+	t.Parallel()
+	base, err := os.MkdirTemp("/private/tmp", "k3sm-hsns-")
+	if err != nil {
+		t.Skip(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(base) })
+	scoped, open := filepath.Join(base, "scoped"), filepath.Join(base, "open")
+	for _, d := range []string{scoped, open} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries := []hostshare.Entry{
+		{Mode: hostshare.ModeReadWrite, Path: scoped, Namespaces: []string{"yurei-system", "yurei-p-*"}},
+		{Mode: hostshare.ModeReadWrite, Path: open},
+	}
+	run := func(t *testing.T, ns, path string) (int, []string, error) {
+		t.Helper()
+		rec := record.NewFakeRecorder(16)
+		f := newFakeRuntimeServer()
+		r := newRuntimedWith(f, RuntimedConfig{
+			NodeName: "n", NodeIP: "192.168.1.10", Root: t.TempDir(), PodLogsDir: t.TempDir(), Recorder: rec,
+			HostSharesFile: "/node/host-shares",
+		}, nil, nil)
+		r.loadHostShares = func(string) ([]hostshare.Entry, error) { return entries, nil }
+		pod := hostSharePod(path, path, false)
+		pod.Namespace = ns
+		err := r.CreatePod(context.Background(), pod)
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		return f.createCalls, pendingEvents(rec.Events), err
+	}
+	for _, tc := range []struct{ ns, path string }{
+		{"yurei-system", scoped},
+		{"yurei-p-app", scoped},
+		{"default", open},
+		{"yurei-p-app", open},
+	} {
+		t.Run("granted/"+tc.ns+"/"+filepath.Base(tc.path), func(t *testing.T) {
+			t.Parallel()
+			creates, events, err := run(t, tc.ns, tc.path)
+			if err != nil || creates != 1 {
+				t.Fatalf("CreatePod = %v (RPC calls %d), want the share admitted", err, creates)
+			}
+			if !strings.Contains(strings.Join(events, "|"), reasonHostShareGranted) {
+				t.Errorf("events %q lack HostShareGranted", events)
+			}
+		})
+	}
+	for _, ns := range []string{"default", "yurei-q-app", "yurei-systemx"} {
+		t.Run("refused/"+ns, func(t *testing.T) {
+			t.Parallel()
+			creates, events, err := run(t, ns, scoped)
+			if !errors.Is(err, hostshare.ErrNotShared) || !errors.Is(err, ErrVolumeSourceUnsupported) {
+				t.Fatalf("CreatePod = %v, want ErrNotShared and ErrVolumeSourceUnsupported", err)
+			}
+			if creates != 0 {
+				t.Errorf("CreatePod RPC calls = %d, want 0", creates)
+			}
+			assertOneRefusalEvent(t, events, reasonFailedHostShare, "code")
+			ev := strings.Join(events, "|")
+			if !strings.Contains(ev, fmt.Sprintf("namespace %q", ns)) {
+				t.Errorf("event %q does not name the pod's namespace %q", ev, ns)
+			}
+			if strings.Contains(ev, "yurei-p-*") || strings.Contains(ev, `"yurei-system"`) {
+				t.Errorf("event %q reveals the namespaces the share admits", ev)
+			}
 		})
 	}
 }

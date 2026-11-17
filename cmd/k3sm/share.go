@@ -651,8 +651,9 @@ func shareUndelegate(env shareEnv, f shareFlags, arg string) int {
 		return fail(err)
 	}
 	rc := 0
-	for e, uid := range before.Owners {
-		if uid != acct.uid || slices.Contains(after.Entries, e) {
+	for _, e := range before.Entries {
+		uid, ok := before.Owner(e)
+		if !ok || uid != acct.uid || slices.ContainsFunc(after.Entries, func(x hostshare.Entry) bool { return x.String() == e.String() }) {
 			continue
 		}
 		if _, err := os.Lstat(e.Path); err != nil {
@@ -708,7 +709,7 @@ func shareList(env shareEnv) int {
 		names[d.UID] = d.User
 	}
 	for _, e := range eff.Entries {
-		if uid, ok := eff.Owners[e]; ok {
+		if uid, ok := eff.Owner(e); ok {
 			fmt.Fprintf(env.stdout, "%s\t(added by %s, uid %d, under a delegation)\n", e, names[uid], uid)
 		} else {
 			fmt.Fprintf(env.stdout, "%s\t(root)\n", e)

@@ -119,7 +119,7 @@ func (f *shareFixture) effective(string) (hostshare.Effective, error) {
 	if err != nil {
 		return hostshare.Effective{}, err
 	}
-	eff := hostshare.Effective{Entries: nf.Entries, Delegations: nf.Delegations, Owners: map[hostshare.Entry]uint32{}}
+	eff := hostshare.Effective{Entries: nf.Entries, Delegations: nf.Delegations, Owners: map[string]uint32{}}
 	for _, d := range nf.Delegations {
 		entries, err := f.readUser("", d.UID)
 		if err != nil {
@@ -131,7 +131,8 @@ func (f *shareFixture) effective(string) (hostshare.Effective, error) {
 				eff.Dropped = append(eff.Dropped, hostshare.Dropped{UID: d.UID, Entry: e, Reason: err.Error()})
 				continue
 			}
-			eff.Owners[e] = d.UID
+			e = d.Scope(e)
+			eff.Owners[e.String()] = d.UID
 			eff.Entries = append(eff.Entries, e)
 		}
 	}
@@ -285,7 +286,7 @@ func TestShareDelegation(t *testing.T) {
 	if code := runShareWith([]string{"add", app}, env); code != 0 {
 		t.Fatalf("delegated add = %d (%s)", code, errb)
 	}
-	if got, _ := f.readUser("", f.me.uid); len(got) != 1 || got[0] != (hostshare.Entry{Mode: hostshare.ModeReadWrite, Path: app}) {
+	if got, _ := f.readUser("", f.me.uid); len(got) != 1 || got[0].String() != (hostshare.Entry{Mode: hostshare.ModeReadWrite, Path: app}).String() {
 		t.Errorf("user file = %v, want rw %s", got, app)
 	}
 	if !strings.Contains(string(f.stored), "delegate") || strings.Contains(string(f.stored), "rw "+app) {
