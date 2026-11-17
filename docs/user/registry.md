@@ -767,4 +767,6 @@ the space.
 - [Images](images.md) is the full image reference: `k3sm build`, `image load`/`import`/`push`, and
   the deliberate differences from the `docker` verb of the same name.
 - [What runs](what-runs.md) traces the path from a Dockerfile to a running Pod.
+- [Shared base images](images.md#shared-base-images) is the convention for runtimes several projects
+  share in this registry, under `registry-k3sm:6450/base/`.
 - [Linux images](vm-runtimeclass.md) covers the guest path.
