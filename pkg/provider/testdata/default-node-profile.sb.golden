@@ -34,6 +34,17 @@
 ;; data volume is re-allowed below, after the protected denies.
 (allow file-write*
   (literal "/dev/null"))
+;; pty: allocate pseudo-terminals of the pod's own; a slave only with the
+;; sandbox's per-instance pty extension; /dev/tty is the caller's own ctty.
+(allow pseudo-tty)
+(allow file-read* file-write* file-ioctl
+  (literal "/dev/ptmx")
+  (literal "/dev/tty"))
+(allow file-read* file-write* file-ioctl
+  (require-all
+    (regex #"^/dev/ttys[0-9][0-9][0-9]+$")
+    (extension "com.apple.sandbox.pty")))
+(deny file-ioctl (ioctl-command TIOCSTI) (ioctl-command TIOCCONS))
 ;; network: ALLOWED — unfiltered outbound+bind+inbound under (deny default).
 ;; macOS 26 Seatbelt accepts only localhost/* hosts in network filters;
 ;; per-IP scoping (VIP egress, per-pod-IP bind) does NOT compile.
