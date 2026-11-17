@@ -386,3 +386,86 @@ func TestShareUndelegateDeletedAccount(t *testing.T) {
 		t.Errorf("undelegate did not say which uid it used: %s", errb)
 	}
 }
+
+// TestShareNamespace pins the CLI half of namespaced shares: root records a
+// share line for named namespaces (and node-wide without --namespace), an
+// invalid or repeated name records nothing, list shows the namespaces, root
+// caps a delegation, and the delegated user's add is held to the cap (an
+// add naming none takes it).
+func TestShareNamespace(t *testing.T) {
+	t.Parallel()
+	f := newShareFixture(t)
+	app := filepath.Join(f.prefix, "app")
+	other := filepath.Join(f.base, "Other")
+
+	env, out, errb := f.env(0)
+	if code := runShareWith([]string{"add", "--no-acl", "--namespace", "yurei-system", "--namespace", "yurei-p-*", other}, env); code != 0 {
+		t.Fatalf("add --namespace = %d (%s)", code, errb)
+	}
+	if !strings.Contains(string(f.stored), "rw "+other+" namespaces=yurei-p-*,yurei-system\n") {
+		t.Errorf("stored = %q, want the namespaced line", f.stored)
+	}
+	if !strings.Contains(out.String(), "yurei-p-*,yurei-system") {
+		t.Errorf("add output = %q, want the namespaces named", out)
+	}
+	for _, args := range [][]string{
+		{"add", "--no-acl", "--namespace", "Bad", other},
+		{"add", "--no-acl", "--namespace", "a", "--namespace", "a", other},
+		{"add", "--no-acl", "--namespace", "*", other},
+		{"add", "--no-acl", "--namespace", "", other},
+	} {
+		before := string(f.stored)
+		env, _, _ = f.env(0)
+		if code := runShareWith(args, env); code == 0 {
+			t.Errorf("share %v = 0, want a refusal", args)
+		}
+		if string(f.stored) != before {
+			t.Errorf("share %v changed the node file to %q", args, f.stored)
+		}
+	}
+	env, out, _ = f.env(501)
+	if code := runShareWith([]string{"list"}, env); code != 0 || !strings.Contains(out.String(), "rw "+other+" namespaces=yurei-p-*,yurei-system\t(root)") {
+		t.Errorf("list = %d %q, want the namespaces shown", code, out)
+	}
+
+	// A capped delegation.
+	env, out, errb = f.env(0)
+	if code := runShareWith([]string{"delegate", "--user", "dev", "--modes", "rw", "--namespaces", "proj-*", f.prefix}, env); code != 0 {
+		t.Fatalf("delegate --namespaces = %d (%s)", code, errb)
+	}
+	if !strings.Contains(string(f.stored), fmt.Sprintf("delegate uid=%d user=dev modes=rw namespaces=proj-* %s\n", f.me.uid, f.prefix)) {
+		t.Errorf("stored = %q, want the capped delegate line", f.stored)
+	}
+	if !strings.Contains(out.String(), "proj-*") {
+		t.Errorf("delegate output = %q, want the cap named", out)
+	}
+	env, _, _ = f.env(0)
+	if code := runShareWith([]string{"delegate", "--user", "dev", "--namespaces", "proj-*,,x", f.prefix}, env); code == 0 {
+		t.Error("delegate with a malformed --namespaces = 0, want a refusal")
+	}
+
+	user := func() (shareEnv, *bytes.Buffer, *bytes.Buffer) { return f.env(int(f.me.uid)) }
+	env, _, errb = user()
+	if code := runShareWith([]string{"add", "--no-acl", "--namespace", "other", app}, env); code != 1 || !strings.Contains(errb.String(), "namespace") {
+		t.Errorf("delegated add outside the cap = %d (%s), want 1 naming the namespace", code, errb)
+	}
+	env, _, errb = user()
+	if code := runShareWith([]string{"add", "--no-acl", "--namespace", "proj-a", app}, env); code != 0 {
+		t.Fatalf("delegated add within the cap = %d (%s)", code, errb)
+	}
+	if got, _ := f.readUser("", f.me.uid); len(got) != 1 || got[0].String() != "rw "+app+" namespaces=proj-a" {
+		t.Errorf("user file = %v, want rw %s namespaces=proj-a", got, app)
+	}
+	// No --namespace under a capped delegation: the line takes the cap.
+	env, out, errb = user()
+	if code := runShareWith([]string{"add", "--no-acl", app}, env); code != 0 {
+		t.Fatalf("delegated add with no namespace = %d (%s)", code, errb)
+	}
+	if !strings.Contains(out.String(), "proj-*") {
+		t.Errorf("add output = %q, want the inherited cap named", out)
+	}
+	env, out, _ = user()
+	if code := runShareWith([]string{"list"}, env); code != 0 || !strings.Contains(out.String(), "rw "+app+" namespaces=proj-*\t(added by dev") {
+		t.Errorf("list = %d %q, want the delegated line with the inherited cap", code, out)
+	}
+}

@@ -38,14 +38,18 @@ import (
 // shareUsage is `k3sm share --help`. It is the command's own help, so it
 // names the files the node reads.
 const shareUsage = `Usage:
-  k3sm share add [--read-only|--socket] [--no-acl] <path>
+  k3sm share add [--read-only|--socket] [--no-acl] [--namespace <ns>]... <path>
                                         share a directory read-write (or
-                                        read-only, or one Unix socket)
+                                        read-only, or one Unix socket), with
+                                        pods in every namespace or only in
+                                        the named ones
   k3sm share remove [--no-acl] <path>   stop sharing a path
   k3sm share list                       print the shares and delegations (also: ls)
-  sudo k3sm share delegate --user <name> [--modes rw,ro,socket] <prefix>
+  sudo k3sm share delegate --user <name> [--modes rw,ro,socket]
+                          [--namespaces <ns>,...] <prefix>
                                         let <name> add shares under <prefix>
-                                        without sudo
+                                        without sudo, for the named
+                                        namespaces only when given
   sudo k3sm share undelegate --user <name> [<prefix>]
                                         take a delegation back, and with it
                                         the shares <name> made under it
@@ -55,6 +59,15 @@ pods have no mount namespace, so a share is visible only at its own path: the
 pod mounts it with mountPath equal to hostPath.path, and no subPath. Without a
 share, a hostPath volume is refused (FailedHostShare on the pod).
 
+Which pods. With no --namespace a share admits pods in every namespace. Each
+--namespace <ns> limits it to pods in that namespace; <ns> is a namespace name
+or a prefix pattern ending in one '*' (yurei-p-* is every namespace starting
+yurei-p-). A pod in any other namespace is refused (FailedHostShare naming its
+namespace). Adding a path again replaces its line, so to narrow a share add it
+again with the namespaces it keeps. A share for every namespace still admits
+every namespace whatever narrower lines exist, so narrowing one means replacing
+it. Each node reads its own list.
+
 Who may add a share. Root, with sudo, anywhere the rules below allow; the list
 is ` + hostshare.DefaultFile + `, owned by root and writable by root alone. Or a
 user root delegated a prefix to: that user runs 'k3sm share add' with no sudo
@@ -62,7 +75,9 @@ for paths under the prefix, and their list lives in a file they own,
 ` + hostshare.DefaultFile + `.d/<uid>/host-shares. The node re-checks every line
 of that file on every pod create against the root-owned delegation: inside the
 prefix, no symlink anywhere in the path, every directory from the prefix down
-owned by that user. Editing the file by hand admits nothing more.
+owned by that user, and within the delegation's --namespaces when it has them
+(a share the user adds with no --namespace then takes the delegation's
+namespaces). Editing the file by hand admits nothing more.
 
 The list is read when a pod is created, so a change applies to pods created
 after it; a pod that is running keeps what it was given until it is recreated,
@@ -180,6 +195,9 @@ func runShare(args []string, stdout, stderr io.Writer) int {
 type shareFlags struct {
 	readOnly, socket, noACL bool
 	user, modes             string
+	// namespaces are add's --namespace values; limit is delegate's
+	// --namespaces cap.
+	namespaces, limit []string
 }
 
 func runShareWith(args []string, env shareEnv) int {
@@ -207,12 +225,24 @@ func runShareWith(args []string, env shareEnv) int {
 		fs.BoolVar(&f.readOnly, "read-only", false, "share the directory read-only")
 		fs.BoolVar(&f.socket, "socket", false, "share one Unix socket")
 		fs.BoolVar(&f.noACL, "no-acl", false, "leave file permissions alone")
+		fs.Func("namespace", "admit pods in this namespace or prefix pattern (yurei-p-*) only; repeat for more", func(v string) error {
+			f.namespaces = append(f.namespaces, v)
+			return nil
+		})
 	case "remove":
 		fs.BoolVar(&f.noACL, "no-acl", false, "leave file permissions alone")
 	case "delegate", "undelegate":
 		fs.StringVar(&f.user, "user", "", "the account the prefix is delegated to")
 		if verb == "delegate" {
 			fs.StringVar(&f.modes, "modes", "rw,ro,socket", "the share modes the user may add")
+			fs.Func("namespaces", "the namespaces (names or prefix patterns, comma-separated) the user's shares may admit", func(v string) error {
+				nss, err := hostshare.ParseNamespaceList(v)
+				if err != nil {
+					return err
+				}
+				f.limit = nss
+				return nil
+			})
 		}
 	}
 	if err := fs.Parse(rest); err != nil {
@@ -273,7 +303,7 @@ func (s *sharer) add(arg string) int {
 	if err != nil {
 		return s.fail("add", err)
 	}
-	e := hostshare.Entry{Mode: mode, Path: path}
+	e := hostshare.Entry{Mode: mode, Path: path, Namespaces: s.f.namespaces}
 	if err := hostshare.ValidateEntry(e); err != nil {
 		return s.fail("add", err)
 	}
@@ -294,7 +324,7 @@ func (s *sharer) add(arg string) int {
 		if err := s.env.write(s.env.file, hostshare.FormatFile(nf)); err != nil {
 			return s.fail("add", err)
 		}
-		fmt.Fprintf(s.env.stdout, "shared %s (%s)\n", path, mode)
+		fmt.Fprintf(s.env.stdout, "shared %s (%s) with %s\n", path, mode, namespacesPhrase(e.Namespaces))
 		if owner, err = ownerOf(path); err != nil {
 			return s.fail("add", err)
 		}
@@ -334,7 +364,8 @@ func (s *sharer) add(arg string) int {
 		if err := s.env.write(hostshare.UserFile(s.env.file, owner), hostshare.FormatUser(entries)); err != nil {
 			return s.fail("add", err)
 		}
-		fmt.Fprintf(s.env.stdout, "shared %s (%s), delegated under %s; listed in %s\n", path, mode, by.Prefix, hostshare.UserFile(s.env.file, owner))
+		fmt.Fprintf(s.env.stdout, "shared %s (%s) with %s, delegated under %s; listed in %s\n",
+			path, mode, namespacesPhrase(by.Scope(e).Namespaces), by.Prefix, hostshare.UserFile(s.env.file, owner))
 	}
 	if s.f.noACL {
 		fmt.Fprintln(s.env.stdout, "acl: not changed (--no-acl); pods run as _k3sm and need permission to reach the path")
@@ -574,7 +605,7 @@ func shareDelegate(env shareEnv, f shareFlags, arg string) int {
 	if !hostshare.FoldsCase(prefix) {
 		return fail(fmt.Errorf("%s is on a case-sensitive volume, which the node does not share", prefix))
 	}
-	d := hostshare.Delegation{UID: acct.uid, User: acct.name, Modes: modes, Prefix: prefix}
+	d := hostshare.Delegation{UID: acct.uid, User: acct.name, Modes: modes, Prefix: prefix, Namespaces: f.limit}
 	if err := hostshare.ValidateDelegation(d); err != nil {
 		return fail(err)
 	}
@@ -599,7 +630,7 @@ func shareDelegate(env shareEnv, f shareFlags, arg string) int {
 	if err := env.write(env.file, hostshare.FormatFile(nf)); err != nil {
 		return fail(err)
 	}
-	fmt.Fprintf(env.stdout, "delegated %s to %s (uid %d) for %s\n", prefix, acct.name, acct.uid, f.modes)
+	fmt.Fprintf(env.stdout, "delegated %s to %s (uid %d) for %s, shares admitting %s\n", prefix, acct.name, acct.uid, f.modes, namespacesPhrase(f.limit))
 	fmt.Fprintf(env.stdout, "%s now runs 'k3sm share add <path>' (no sudo) for paths under %s; their list is %s\n",
 		acct.name, prefix, hostshare.UserFile(env.file, acct.uid))
 	return 0
@@ -727,6 +758,17 @@ func shareList(env shareEnv) int {
 		fmt.Fprintf(env.stdout, "not admitted (uid %d): %s: %s\n", d.UID, what, d.Reason)
 	}
 	return 0
+}
+
+// namespacesPhrase says which pods a share line, or a delegation's cap,
+// admits.
+func namespacesPhrase(nss []string) string {
+	if len(nss) == 0 {
+		return "pods in every namespace"
+	}
+	s := slices.Clone(nss)
+	slices.Sort(s)
+	return "pods in namespaces " + strings.Join(s, ",")
 }
 
 func delegationsFor(f hostshare.File, uid uint32) []hostshare.Delegation {
