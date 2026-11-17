@@ -34,7 +34,7 @@ import (
 
 var (
 	provider = corev1.Taint{Key: "k3sm.io/provider", Effect: corev1.TaintEffectNoSchedule}
-	operator = corev1.Taint{Key: "stockkitty.io/estate-off", Effect: corev1.TaintEffectNoSchedule}
+	operator = corev1.Taint{Key: "example.com/estate-off", Effect: corev1.TaintEffectNoSchedule}
 	ours     = corev1.Taint{Key: TaintKey, Effect: corev1.TaintEffectPreferNoSchedule}
 	// foreign carries our key with another effect: written by someone else.
 	foreign = corev1.Taint{Key: TaintKey, Effect: corev1.TaintEffectNoSchedule}

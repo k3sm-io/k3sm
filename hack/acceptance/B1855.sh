@@ -28,8 +28,8 @@
 # missing, fewer than two Ready nodes): not a pass.
 #
 # Usage:
-#   K3SM_LAB=1 hack/acceptance/B1855.sh --lab --wait k3sm-mikostudio busy
-#   K3SM_LAB=1 hack/acceptance/B1855.sh --lab --place 6 --expect-on k3sm-mikobook
+#   K3SM_LAB=1 hack/acceptance/B1855.sh --lab --wait mac-a busy
+#   K3SM_LAB=1 hack/acceptance/B1855.sh --lab --place 6 --expect-on mac-b
 #   K3SM_LAB=1 hack/acceptance/B1855.sh --lab --place 6 --expect-spread
 #   hack/acceptance/B1855.sh --plan
 # Env: KUBECTL (default kubectl), B1855_CONTEXT (a kubeconfig context, default the
