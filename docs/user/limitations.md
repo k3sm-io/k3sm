@@ -175,6 +175,33 @@ the same user with no PID namespace, and the other surfaces that user can reach 
 way (see "No Per-Pod uid Isolation" above). Untrusted work belongs on the **`vm` RuntimeClass** (see
 [`vm` RuntimeClass](vm-runtimeclass.md)).
 
+### A Native Pod Can Open Its Own Terminals, and Only Those
+
+A process in a native Pod can allocate pseudo-terminals with `posix_openpt`, `openpty` or Python's
+`pty` module, make one its controlling terminal, and run a full-screen program (an editor, a pager, a
+coding agent's terminal UI) on it. The Seatbelt profile allows `/dev/ptmx`, and allows a slave
+`/dev/ttysNNN` only to the Pod that allocated it: macOS tags each new terminal for the sandbox that
+created it, and the tag does not outlive the terminal. Pods run as the same user, so the file
+permissions would let one Pod open another's terminal; the profile is what refuses it. A Pod gets
+`EPERM` opening another Pod's terminal, a terminal of the Mac's own (Terminal windows, SSH sessions,
+`/dev/console`), the legacy BSD terminals `/dev/ttys0` to `/dev/ttysf`, or a terminal number it used
+to hold once the Mac has reused it.
+
+- `/dev/tty` opens the caller's own controlling terminal, as on Linux, so pagers and password
+  prompts that read the terminal directly work, in a Pod's own terminal and in `kubectl exec -it`. A
+  process with no controlling terminal gets `ENXIO`.
+- Nothing else under `/dev` is opened up. The profile does not let a Pod list `/dev`, so
+  `ttyname(3)`, the `tty` command and Python's `os.ttyname` fail with `ERANGE`; `ptsname(3)` names a
+  terminal the Pod allocated.
+- The host's terminal pool (`kern.tty.ptmx_max`, 511 by default) is **shared by every Pod and the
+  Mac's own sessions**, with no per-Pod cap, so a Pod that leaks terminals can leave none for its
+  neighbours or for a new Terminal window.
+- Programs that are setuid (`top`, `ps`) do not run in a native Pod at all, on a terminal or not.
+- `kubectl exec -t` is unchanged: the node daemon still allocates that terminal outside the sandbox
+  and hands it in.
+- Upgrading the node to a release with this grant changes every running Pod's profile, so the daemon
+  recreates those Pods instead of re-attaching them, and they come back with the grant.
+
 ### SwiftPM Builds in a Pod, `xcodebuild` Builds Do Not
 
 A Pod compiles. `clang` and `swiftc` build C, Objective-C and Swift against an installed SDK into the

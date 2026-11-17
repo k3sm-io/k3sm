@@ -19,6 +19,11 @@ pin, its date, and the tarball's sha256.
   whose own builds held every core still looked empty to the scheduler and kept getting new Pods.
   Pinned Pods and DaemonSets are unaffected and nothing is evicted. See
   [Limitations](docs/user/limitations.md).
+- A process in a native Pod can allocate its own pseudo-terminals (`posix_openpt`, `openpty`,
+  Python's `pty`), make one its controlling terminal and open `/dev/tty`, so terminal UIs and
+  terminal multiplexers run inside a Pod. A Pod can open only the terminals it allocated, never
+  another Pod's or the Mac's. Running Pods are recreated on upgrade to pick up the grant. See
+  [A Native Pod Can Open Its Own Terminals](docs/user/limitations.md#a-native-pod-can-open-its-own-terminals-and-only-those).
 - A native Pod can publish a volume to one host account with an inline CSI volume of driver
   `expose.k3sm.io` (`volumeAttributes.user`, and `access: read` or `read-write`). The node admin
   grants it per account and namespace with `sudo k3sm expose allow --user <name> --namespace <ns>`,
