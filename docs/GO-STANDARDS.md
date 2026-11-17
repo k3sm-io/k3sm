@@ -130,7 +130,9 @@ The gate looks for `$(go env GOPATH)/bin/staticcheck-<version>` first, then `sta
 then `$(go env GOPATH)/bin/staticcheck`, and uses the first that reports exactly the pin. The
 versioned name lets two pins be installed side by side while the repos move from one to the other:
 `GOBIN=<tmp> go install` the pinned release, then move `<tmp>/staticcheck` to
-`$(go env GOPATH)/bin/staticcheck-<version>`.
+`$(go env GOPATH)/bin/staticcheck-<version>`. These tools run in a k3sm pod: the install lines here
+are the pinned builds inside the pod, never an install on the host Mac (containers only, see
+`CONTRIBUTING.md`).
 govulncheck is pinned the same way, at `golang.org/x/vuln/cmd/govulncheck@v1.9.0`, in each repo's
 `GOVULNCHECK_VERSION`.
 - **Scope**: `-tests=false` checks non-test code only. Each repo's `hack/ci.sh` says why at the stage.

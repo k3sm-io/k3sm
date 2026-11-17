@@ -1028,7 +1028,7 @@ GO
 
 	if ! pin="$(gv_pin)"; then bad "children vuln scan: no pin in hack/ci.sh"; return 0; fi
 	if ! gv="$(gv_find "$pin")"; then
-		bad "children vuln scan: govulncheck $pin is needed for the scan cases (go install golang.org/x/vuln/cmd/govulncheck@$pin)"
+		bad "children vuln scan: govulncheck $pin is needed for the scan cases (runs in a k3sm pod, never installed on the host (containers only, CONTRIBUTING.md); the pinned build in the pod: go install golang.org/x/vuln/cmd/govulncheck@$pin)"
 		return 0
 	fi
 	# scan <allow-text> <db-dir> <binary>: run the scan, set o (output) and rc.

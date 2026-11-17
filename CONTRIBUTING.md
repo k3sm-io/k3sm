@@ -11,7 +11,20 @@ k3sm is a multi-repository project. Most repositories are Go modules (`apis`,
 `runtimed`, `darwin-net`, `k3sm`); the macOS app and the Swift SDK are Swift
 packages, and the C++ SDK is a CMake project. Every repository has a `hack/ci.sh`
 that is its commit gate. Run it before opening a pull request. The Swift and C++
-gates run `shellcheck` over their `hack/` scripts and fail when it is not installed.
+gates run `shellcheck` over their `hack/` scripts and fail when it is not available.
+
+### No CI on GitHub, and containers only
+
+There are no GitHub Actions workflows in any k3sm repository, ever, and Actions stays
+disabled; all gates run locally in k3sm pods, through Yureisha CI (the `yureisha/ci`
+commit status) or the repository's own gate script (`hack/ci.sh`). A pull request that
+adds a file under `.github/workflows/` is not merged.
+
+For supply-chain safety the gate tools run in containers, not on your host: do not
+`brew install`, `go install`, `cargo install` or `pip install` a tool onto the host Mac
+to satisfy a gate. A tool the gate needs runs in a k3sm pod with the tool pinned to an
+exact version and checksum. The gates name each pinned tool and version when it is
+missing.
 
 ### Go repositories
 
@@ -20,7 +33,8 @@ The Go gate runs `gofmt -l`, `go vet`, `go build`, `go test` (`go test -race` in
 a `go mod tidy` no-diff check, `hack/verify-deps.sh`, and `govulncheck`, and it compiles
 any integration-tagged tests without running them. Each Go
 repository documents its commands in `docs/GO-STANDARDS.md`. Two tools are pinned,
-and the gate fails when either is missing or is any other version:
+and the gate fails when either is missing or is any other version. Each runs in a k3sm
+pod, where the pinned build is:
 
     go install honnef.co/go/tools/cmd/staticcheck@2026.2.1
     go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
@@ -51,7 +65,8 @@ git commit -s -m "your message"
 
 The sign-off certifies that you wrote the patch, or otherwise have the right to
 submit it under the project's license. It is required on **every** commit; a PR
-with unsigned commits will not be merged.
+with unsigned commits will not be merged. Each repository's `hack/ci.sh` checks the
+sign-off on every commit your branch adds.
 
 ## Commit messages and pull requests
 
