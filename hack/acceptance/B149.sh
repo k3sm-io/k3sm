@@ -387,7 +387,7 @@ if command -v shellcheck >/dev/null 2>&1; then
 	shellcheck -s bash "$SELF" || sc=no
 	ladder "$sc" "b149.8  shellcheck clean over hack/lab-vm.sh + hack/acceptance/B149.sh"
 else
-	echo "NOTE  shellcheck not installed — lint deferred (brew install shellcheck); every assertion above still enforced"
+	echo "NOTE  shellcheck not installed — lint deferred (shellcheck runs in a k3sm pod, never installed on the host); every assertion above still enforced"
 fi
 
 echo "----------------------------------------"

@@ -294,7 +294,7 @@ if [ -n "$go_pkgs" ]; then
 	# not run and still print green is the failure class the go-list guard above
 	# exists to stop.
 	sc_gopath="$(go env GOPATH)"
-	sc_hint="go install honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION}; or, beside another pin: GOBIN=<tmp> go install honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION} && mv <tmp>/staticcheck ${sc_gopath}/bin/staticcheck-${STATICCHECK_VERSION}"
+	sc_hint="runs in a k3sm pod, never installed on the host (containers only, CONTRIBUTING.md); the pinned build in the pod: go install honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION}; or, beside another pin: GOBIN=<tmp> go install honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION} && mv <tmp>/staticcheck ${sc_gopath}/bin/staticcheck-${STATICCHECK_VERSION}"
 	sc=""
 	sc_seen=""
 	sc_prev=""
@@ -361,6 +361,32 @@ if grep -qx "module k3sm.io/k3sm" go.mod 2>/dev/null; then
 	hack/verify-deps.sh --self-test
 	echo "==> [k3sm] verify-deps"
 	hack/verify-deps.sh
+fi
+
+# DCO sign-off (there is no CI on GitHub: this stage is the check). Every commit this
+# branch adds over origin/main must carry a Signed-off-by line whose email is the
+# author's, matched as a FIXED string (an ERE breaks on id+user@users.noreply addresses).
+# A lone clone without origin/main skips, saying so; a synced main checks nothing.
+echo "==> [k3sm] DCO sign-off (commits not on origin/main)"
+dco_signed() { # <author-email> <message>: exit 0 iff a Signed-off-by line names the email
+	printf '%s\n' "$2" | grep -iE '^Signed-off-by: ' | grep -qiF "<$1>"
+}
+dco_signed 'a+b@users.noreply.github.com' 'x
+
+Signed-off-by: A <a+b@users.noreply.github.com>' || { echo "FAIL: [k3sm] DCO self-test: a signed commit was rejected"; exit 1; }
+! dco_signed 'a@example.com' 'x
+
+Co-authored-by: A <a@example.com>' || { echo "FAIL: [k3sm] DCO self-test: an unsigned commit passed"; exit 1; }
+if git rev-parse --verify -q origin/main >/dev/null 2>&1; then
+	dco_bad=0
+	for sha in $(git rev-list --no-merges origin/main..HEAD); do
+		dco_signed "$(git show -s --format='%ae' "$sha")" "$(git show -s --format='%B' "$sha")" \
+			|| { echo "    UNSIGNED: $(git show -s --format='%h %s' "$sha")"; dco_bad=1; }
+	done
+	[ "$dco_bad" = 0 ] || { echo "FAIL: [k3sm] sign off the commits above: git commit -s (see CONTRIBUTING.md)"; exit 1; }
+	echo "    sign-off OK ($(git rev-list --no-merges --count origin/main..HEAD) new commit(s))"
+else
+	echo "    SKIP: no origin/main ref in this clone, nothing to compare against"
 fi
 
 echo "OK: k3sm ci green"

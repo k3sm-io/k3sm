@@ -24,6 +24,6 @@ None.
 ## Checklist
 
 - [ ] Commits are signed off: `git commit -s` (see [CONTRIBUTING](../CONTRIBUTING.md) / [DCO](../DCO))
-- [ ] `hack/ci.sh` passes locally (this repository's gate: build, tests, license headers, and its linters)
+- [ ] `hack/ci.sh` passes locally (this repository's gate: build, tests, license headers, its linters and the sign-off check; there is no CI on GitHub)
 - [ ] Tests added or updated for the change
 - [ ] Docs updated if behavior changed

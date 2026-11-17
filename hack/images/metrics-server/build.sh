@@ -203,7 +203,7 @@ govulncheck_pinned() {
 		ver="$("$c" -version 2>/dev/null | sed -n 's/^Scanner: govulncheck@//p' | sed -n 1p)" || ver=""
 		[ "$ver" = "$want" ] && { echo "$c"; return 0; }
 	done
-	die "govulncheck $want is required (go install golang.org/x/vuln/cmd/govulncheck@$want)"
+	die "govulncheck $want is required (runs in a k3sm pod, never installed on the host (containers only, CONTRIBUTING.md); the pinned build in the pod: go install golang.org/x/vuln/cmd/govulncheck@$want)"
 }
 
 # vuln_problems <govulncheck exit> <govulncheck text> <accepted list>: exit 0 is
