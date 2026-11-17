@@ -533,3 +533,55 @@ func TestShareNamespaceSamePath(t *testing.T) {
 		t.Errorf("after a node-wide add: %q, want %q", got, want)
 	}
 }
+
+// TestShareDelegateNamespaceCapDrop pins that re-running delegate without
+// --namespaces never silently uncaps a capped delegation: it is refused
+// unless --no-namespace-cap is given, and then the user's lines that widen
+// to every namespace are listed.
+func TestShareDelegateNamespaceCapDrop(t *testing.T) {
+	t.Parallel()
+	f := newShareFixture(t)
+	app := filepath.Join(f.prefix, "app")
+	capped := fmt.Sprintf("delegate uid=%d user=dev modes=rw namespaces=proj-* %s\n", f.me.uid, f.prefix)
+	env, _, errb := f.env(0)
+	if code := runShareWith([]string{"delegate", "--user", "dev", "--modes", "rw", "--namespaces", "proj-*", f.prefix}, env); code != 0 {
+		t.Fatalf("delegate = %d (%s)", code, errb)
+	}
+	env, _, errb = f.env(int(f.me.uid))
+	if code := runShareWith([]string{"add", "--no-acl", app}, env); code != 0 {
+		t.Fatalf("delegated add = %d (%s)", code, errb)
+	}
+	env, _, errb = f.env(0)
+	if code := runShareWith([]string{"delegate", "--user", "dev", "--modes", "rw", f.prefix}, env); code != 1 ||
+		!strings.Contains(errb.String(), "--no-namespace-cap") {
+		t.Errorf("re-delegate without --namespaces = %d (%s), want 1 naming --no-namespace-cap", code, errb)
+	}
+	if !strings.Contains(string(f.stored), capped) {
+		t.Errorf("stored = %q, want the cap kept", f.stored)
+	}
+	env, _, _ = f.env(0)
+	if code := runShareWith([]string{"delegate", "--user", "dev", "--namespaces", "a", "--no-namespace-cap", f.prefix}, env); code != 2 {
+		t.Errorf("--namespaces with --no-namespace-cap = %d, want 2", code)
+	}
+	// Changing the cap to another one is explicit, and allowed.
+	env, _, errb = f.env(0)
+	if code := runShareWith([]string{"delegate", "--user", "dev", "--modes", "rw", "--namespaces", "proj-a", f.prefix}, env); code != 0 {
+		t.Errorf("re-delegate with another cap = %d (%s)", code, errb)
+	}
+	env, out, errb := f.env(0)
+	if code := runShareWith([]string{"delegate", "--user", "dev", "--modes", "rw", "--no-namespace-cap", f.prefix}, env); code != 0 {
+		t.Fatalf("re-delegate --no-namespace-cap = %d (%s)", code, errb)
+	}
+	if strings.Contains(string(f.stored), "namespaces=proj") {
+		t.Errorf("stored = %q, want the cap dropped", f.stored)
+	}
+	if !strings.Contains(out.String(), "rw "+app) || !strings.Contains(out.String(), "every namespace") {
+		t.Errorf("output = %q, want the widened line %s listed", out, app)
+	}
+	// A first delegation needs no flag to be uncapped.
+	g := newShareFixture(t)
+	env, _, errb = g.env(0)
+	if code := runShareWith([]string{"delegate", "--user", "dev", g.prefix}, env); code != 0 {
+		t.Errorf("first uncapped delegate = %d (%s)", code, errb)
+	}
+}

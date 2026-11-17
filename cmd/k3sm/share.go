@@ -49,7 +49,7 @@ const shareUsage = `Usage:
                                         given)
   k3sm share list                       print the shares and delegations (also: ls)
   sudo k3sm share delegate --user <name> [--modes rw,ro,socket]
-                          [--namespaces <ns>,...] <prefix>
+                          [--namespaces <ns>,...|--no-namespace-cap] <prefix>
                                         let <name> add shares under <prefix>
                                         without sudo, for the named
                                         namespaces only when given
@@ -204,6 +204,8 @@ type shareFlags struct {
 	// namespaces are add's --namespace values; limit is delegate's
 	// --namespaces cap.
 	namespaces, limit []string
+	// noCap is delegate's --no-namespace-cap: drop an existing cap.
+	noCap bool
 }
 
 func runShareWith(args []string, env shareEnv) int {
@@ -253,6 +255,7 @@ func runShareWith(args []string, env shareEnv) int {
 				f.limit = nss
 				return nil
 			})
+			fs.BoolVar(&f.noCap, "no-namespace-cap", false, "drop the namespace cap an existing delegation of the prefix has")
 		}
 	}
 	if err := fs.Parse(rest); err != nil {
@@ -261,6 +264,9 @@ func runShareWith(args []string, env shareEnv) int {
 	switch {
 	case verb == "undelegate" && fs.NArg() > 1, verb != "undelegate" && fs.NArg() != 1:
 		fmt.Fprintf(env.stderr, "k3sm share %s: want exactly one path\n", verb)
+		return 2
+	case f.noCap && f.limit != nil:
+		fmt.Fprintln(env.stderr, "k3sm share delegate: --namespaces and --no-namespace-cap do not combine")
 		return 2
 	case f.readOnly && f.socket:
 		fmt.Fprintln(env.stderr, "k3sm share add: --read-only and --socket do not combine")
@@ -630,6 +636,20 @@ func shareDelegate(env shareEnv, f shareFlags, arg string) int {
 	if err != nil {
 		return fail(err)
 	}
+	// Re-delegating without --namespaces would uncap a capped delegation, and
+	// the user's lines that name no namespace (which took the cap) would
+	// then admit every namespace. That takes an explicit flag.
+	uncapping := false
+	for _, x := range nf.Delegations {
+		if x.UID == d.UID && x.Prefix == d.Prefix && len(x.Namespaces) > 0 && len(d.Namespaces) == 0 {
+			if !f.noCap {
+				return fail(fmt.Errorf("the delegation of %s to %s is capped to namespaces %s; re-run with --namespaces to keep or change the cap, "+
+					"or with --no-namespace-cap to drop it (the user's shares that name no namespace then admit every namespace)",
+					prefix, acct.name, strings.Join(x.Namespaces, ",")))
+			}
+			uncapping = true
+		}
+	}
 	nf.Delegations = slices.DeleteFunc(nf.Delegations, func(x hostshare.Delegation) bool {
 		return x.UID == d.UID && x.Prefix == d.Prefix
 	})
@@ -643,6 +663,23 @@ func shareDelegate(env shareEnv, f shareFlags, arg string) int {
 	fmt.Fprintf(env.stdout, "delegated %s to %s (uid %d) for %s, shares admitting %s\n", prefix, acct.name, acct.uid, f.modes, namespacesPhrase(f.limit))
 	fmt.Fprintf(env.stdout, "%s now runs 'k3sm share add <path>' (no sudo) for paths under %s; their list is %s\n",
 		acct.name, prefix, hostshare.UserFile(env.file, acct.uid))
+	if uncapping {
+		entries, err := env.readUser(env.file, acct.uid)
+		if err != nil {
+			fmt.Fprintf(env.stderr, "k3sm share delegate: warning: the cap is dropped, but %s could not be read to list what widens: %v\n", hostshare.UserFile(env.file, acct.uid), err)
+			return 1
+		}
+		n := 0
+		for _, e := range entries {
+			if len(e.Namespaces) == 0 && hostshare.AtOrUnder(e.Path, prefix) {
+				fmt.Fprintf(env.stdout, "cap dropped: %s now admits pods in every namespace\n", e)
+				n++
+			}
+		}
+		if n == 0 {
+			fmt.Fprintln(env.stdout, "cap dropped: none of the user's shares under the prefix widens (each names its namespaces)")
+		}
+	}
 	return 0
 }
 
