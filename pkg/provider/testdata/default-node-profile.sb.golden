@@ -75,6 +75,7 @@
 ;;     operator, unpacked, snapshots, ingest, guest-artifacts,
 ;;     artifact-partial, artifacts, vmboot-failures
 ;;   exposures root: expose
+;;   shared volume temp dir: .TemporaryItems
 (deny file-read* file-write*
   (subpath "/Users"))
 (deny file-read* file-write*
@@ -121,6 +122,8 @@
   (subpath "/private/var/lib/k3sm/artifacts")
   (subpath "/var/lib/k3sm/vmboot-failures")
   (subpath "/private/var/lib/k3sm/vmboot-failures")
+  (subpath "/var/lib/k3sm/.TemporaryItems")
+  (subpath "/private/var/lib/k3sm/.TemporaryItems")
   (subpath "/var/log/pods")
   (subpath "/private/var/log/pods")
   (subpath "/var/log/containers")
