@@ -300,8 +300,6 @@ xcodebuild -project App.xcodeproj -scheme App -configuration Debug \
 
 What this does not cover:
 
-- **Pseudo-terminals.** `openpty` fails with `Operation not permitted`, so a test that runs a
-  program on a terminal fails in the Pod.
 - **File-system event streams.** A Pod reaches no `fseventsd`, so `FSEvents` watchers never fire.
 - **The developer tools in `/usr/bin`** (`/usr/bin/git`, `/usr/bin/clang` and the rest) are
   Apple's trampolines, platform binaries that keep the shared temp directory. They work, but print
