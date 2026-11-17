@@ -62,13 +62,20 @@ const (
 // condition (an older node, or one that has not measured a rate yet) is not
 // busy.
 func Busy(n *corev1.Node) bool {
+	c := condition(n)
+	return c != nil && c.Status == corev1.ConditionTrue
+}
+
+// Reported reports whether n publishes a HostCPUBusy condition at all.
+func Reported(n *corev1.Node) bool { return condition(n) != nil }
+
+func condition(n *corev1.Node) *corev1.NodeCondition {
 	for i := range n.Status.Conditions {
-		c := &n.Status.Conditions[i]
-		if c.Type == ConditionHostCPUBusy {
-			return c.Status == corev1.ConditionTrue
+		if n.Status.Conditions[i].Type == ConditionHostCPUBusy {
+			return &n.Status.Conditions[i]
 		}
 	}
-	return false
+	return nil
 }
 
 // DesiredTaints returns n's taints with the TaintKey taint present when want is
@@ -94,7 +101,9 @@ func DesiredTaints(n *corev1.Node, want bool) ([]corev1.Taint, bool) {
 	return out, !slices.EqualFunc(out, n.Spec.Taints, func(a, b corev1.Taint) bool { return a.MatchTaint(&b) })
 }
 
-// isOurs reports whether t is the taint this package manages.
+// isOurs reports whether t is the taint this package manages: our key and
+// effect with no value. A taint on our key with a value was written by someone
+// else and is left alone.
 func isOurs(t corev1.Taint) bool {
-	return t.Key == TaintKey && t.Effect == corev1.TaintEffectPreferNoSchedule
+	return t.Key == TaintKey && t.Effect == corev1.TaintEffectPreferNoSchedule && t.Value == ""
 }

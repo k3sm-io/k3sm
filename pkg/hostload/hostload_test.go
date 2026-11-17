@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"reflect"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -37,6 +38,8 @@ var (
 	ours     = corev1.Taint{Key: TaintKey, Effect: corev1.TaintEffectPreferNoSchedule}
 	// foreign carries our key with another effect: written by someone else.
 	foreign = corev1.Taint{Key: TaintKey, Effect: corev1.TaintEffectNoSchedule}
+	// valued carries our key and effect with a value: also someone else's.
+	valued = corev1.Taint{Key: TaintKey, Value: "x", Effect: corev1.TaintEffectPreferNoSchedule}
 )
 
 func node(name string, cond *corev1.ConditionStatus, taints ...corev1.Taint) *corev1.Node {
@@ -86,6 +89,7 @@ func TestDesiredTaints(t *testing.T) {
 		{"duplicate of ours collapses", []corev1.Taint{ours, provider, ours}, true, []corev1.Taint{ours, provider}, true},
 		{"our key with another effect is never touched", []corev1.Taint{foreign}, false, []corev1.Taint{foreign}, false},
 		{"our key with another effect stays beside ours", []corev1.Taint{foreign}, true, []corev1.Taint{foreign, ours}, true},
+		{"our key and effect with a value is someone else's", []corev1.Taint{valued}, false, []corev1.Taint{valued}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			n := node("n", nil, tc.in...)
@@ -124,36 +128,49 @@ func countPatches(cs *fake.Clientset) int {
 	return n
 }
 
-// TestReconcileTaintsExactlyTheBusyNodes is the B1855 unit gate: a busy node
-// gains the PreferNoSchedule taint, a calm or silent one loses it, every other
-// taint survives, and a second pass writes nothing.
-func TestReconcileTaintsExactlyTheBusyNodes(t *testing.T) {
-	cs := fake.NewClientset(
-		node("busy", status(corev1.ConditionTrue), provider, operator),
-		node("calm", status(corev1.ConditionFalse), provider, ours),
-		node("silent", nil, provider, ours),
-		node("settled", status(corev1.ConditionTrue), provider, ours),
-	)
+// fakeClock is the Reconciler's injected clock.
+type fakeClock struct{ t time.Time }
+
+func (c *fakeClock) now() time.Time { return c.t }
+
+func newTestReconciler(t *testing.T, cs *fake.Clientset) (*Reconciler, *fakeClock) {
+	t.Helper()
 	r, err := New(Config{Client: cs, Log: quiet()})
 	if err != nil {
 		t.Fatal(err)
 	}
+	c := &fakeClock{t: time.Date(2026, 11, 16, 9, 0, 0, 0, time.UTC)}
+	r.now = c.now
+	return r, c
+}
+
+// TestReconcileTaintsExactlyTheBusyNodes is the B1855 unit gate: a busy node
+// gains the PreferNoSchedule taint, a calm one loses it, every other taint
+// survives, and a second pass writes nothing.
+func TestReconcileTaintsExactlyTheBusyNodes(t *testing.T) {
+	cs := fake.NewClientset(
+		node("busy", status(corev1.ConditionTrue), provider, operator),
+		node("calm", status(corev1.ConditionFalse), provider, ours),
+		node("settled", status(corev1.ConditionTrue), provider, ours),
+		node("old", nil, provider),
+	)
+	r, _ := newTestReconciler(t, cs)
 	if err := r.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
 	want := map[string][]corev1.Taint{
 		"busy":    {provider, operator, ours},
 		"calm":    {provider},
-		"silent":  {provider},
 		"settled": {provider, ours},
+		"old":     {provider},
 	}
 	for name, w := range want {
 		if got := taintsOf(t, cs, name); !reflect.DeepEqual(got, w) {
 			t.Errorf("%s taints = %v, want %v", name, got, w)
 		}
 	}
-	if got := countPatches(cs); got != 3 {
-		t.Errorf("first pass patched %d nodes, want 3 (settled is already right)", got)
+	if got := countPatches(cs); got != 2 {
+		t.Errorf("first pass patched %d nodes, want 2 (settled and old are already right)", got)
 	}
 	cs.ClearActions()
 	if err := r.Reconcile(context.Background()); err != nil {
@@ -161,6 +178,34 @@ func TestReconcileTaintsExactlyTheBusyNodes(t *testing.T) {
 	}
 	if got := countPatches(cs); got != 0 {
 		t.Errorf("second pass patched %d nodes, want 0", got)
+	}
+}
+
+// TestReconcileKeepsTheTaintThroughAShortSilence: a tainted node that stops
+// publishing the condition (its daemon restarted) keeps the taint for
+// AbsentGrace, and loses it after; a condition that comes back resets the wait.
+func TestReconcileKeepsTheTaintThroughAShortSilence(t *testing.T) {
+	cs := fake.NewClientset(node("silent", nil, provider, ours))
+	r, clock := newTestReconciler(t, cs)
+	pass := func() {
+		t.Helper()
+		if err := r.Reconcile(context.Background()); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+	}
+	pass()
+	clock.t = clock.t.Add(AbsentGrace - time.Second)
+	pass()
+	if got := taintsOf(t, cs, "silent"); !reflect.DeepEqual(got, []corev1.Taint{provider, ours}) {
+		t.Fatalf("inside the grace taints = %v, want ours kept", got)
+	}
+	clock.t = clock.t.Add(2 * time.Second)
+	pass()
+	if got := taintsOf(t, cs, "silent"); !reflect.DeepEqual(got, []corev1.Taint{provider}) {
+		t.Fatalf("after the grace taints = %v, want ours removed", got)
+	}
+	if len(r.absentSince) != 0 {
+		t.Fatalf("absentSince kept %v after the taint left", r.absentSince)
 	}
 }
 
@@ -172,6 +217,7 @@ func TestReconcileWriteIsGuardedByResourceVersion(t *testing.T) {
 	// The list returns the node at resourceVersion 7; before the patch lands an
 	// operator taints the node, moving it to 8.
 	cs.PrependReactor("list", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) {
+		cs.ReactionChain = cs.ReactionChain[1:] // answer one list only
 		stale := node("busy", status(corev1.ConditionTrue), provider)
 		live := node("busy", status(corev1.ConditionTrue), provider, operator)
 		live.ResourceVersion = "8"

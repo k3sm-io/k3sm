@@ -48,6 +48,14 @@ const (
 	// by a moment; a rate over that would be noise, so it is skipped and the
 	// previous verdict stands.
 	hostCPUMinWindow = 10 * time.Second
+	// hostCPUMaxWindow is the longest window that yields a rate. A longer gap
+	// (the Mac slept, the loop stalled) starts a new window without moving the
+	// average, so a wake does not erase what the average knew.
+	hostCPUMaxWindow = 5 * time.Minute
+	// hostCPUStaleAfter is how long after the last good reading the condition
+	// is still published. Past it (the CPU read keeps failing) the node
+	// publishes no condition rather than a verdict it can no longer measure.
+	hostCPUStaleAfter = 3 * time.Minute
 )
 
 // hostCPUBusyTracker turns cumulative host CPU readings into the smoothed
@@ -87,6 +95,10 @@ func (t *hostCPUBusyTracker) observe(at time.Time, busyNanos uint64) {
 	if dt < hostCPUMinWindow {
 		return
 	}
+	if dt > hostCPUMaxWindow {
+		t.lastAt, t.lastNanos = at, busyNanos
+		return
+	}
 	util := float64(busyNanos-t.lastNanos) / (float64(dt.Nanoseconds()) * t.cores)
 	util = min(max(util, 0), 1)
 	t.lastAt, t.lastNanos = at, busyNanos
@@ -107,10 +119,11 @@ func (t *hostCPUBusyTracker) observe(at time.Time, busyNanos uint64) {
 }
 
 // condition returns the HostCPUBusy condition at now, or nil before the first
-// rate: an absent condition is the truthful "not measured", and the server
-// treats it as calm. LastTransitionTime is left for reconcileTransitions.
+// rate and once the last good reading is older than hostCPUStaleAfter: an
+// absent condition is the truthful "not measured", and the server clears the
+// taint after its grace. LastTransitionTime is left for reconcileTransitions.
 func (t *hostCPUBusyTracker) condition(now metav1.Time) *corev1.NodeCondition {
-	if t == nil || !t.rated {
+	if t == nil || !t.rated || now.Sub(t.lastAt) > hostCPUStaleAfter {
 		return nil
 	}
 	pct := int(math.Round(t.avg * 100))

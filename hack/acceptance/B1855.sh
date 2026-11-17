@@ -12,8 +12,10 @@
 #       PreferNoSchedule taint (busy), or publishes it False or not at all and
 #       carries no such taint (calm). The driver makes a Mac busy with its own
 #       CPU burner; this script burns nothing.
-#   --place N [--expect-on NODE | --expect-spread]   create a namespace and a
-#       Deployment of N unpinned replicas (image native, /bin/sleep, a 10m CPU
+#   --place N [--expect-on NODE | --expect-spread]   create a namespace and N
+#       independent one-replica Deployments (each its own selector, so no
+#       topology-spread default ties them together: the shape of the singletons
+#       that pile onto one node), unpinned (image native, /bin/sleep, a 10m CPU
 #       request, the provider toleration and nothing else, no nodeName and no
 #       nodeSelector but kubernetes.io/os), wait until every replica is scheduled,
 #       print the replicas per node and the taints at that moment, then delete
@@ -133,22 +135,25 @@ place_leg() {
 	trap cleanup EXIT
 	tol="$(lab_tolerations_json NoSchedule)"
 	kc create namespace "$NS" >/dev/null
-	kc -n "$NS" apply -f - >/dev/null <<EOF
+	local i
+	for i in $(seq 1 "$n"); do
+		kc -n "$NS" apply -f - >/dev/null <<EOF
 {"apiVersion": "apps/v1", "kind": "Deployment",
- "metadata": {"name": "spread", "labels": {"app": "b1855-spread"}},
- "spec": {"replicas": $n, "selector": {"matchLabels": {"app": "b1855-spread"}},
-  "template": {"metadata": {"labels": {"app": "b1855-spread"}},
+ "metadata": {"name": "solo-$i", "labels": {"b1855": "lab"}},
+ "spec": {"replicas": 1, "selector": {"matchLabels": {"app": "b1855-solo-$i"}},
+  "template": {"metadata": {"labels": {"app": "b1855-solo-$i", "b1855": "lab"}},
    "spec": {"nodeSelector": {"kubernetes.io/os": "darwin"},
     "tolerations": [$tol],
     "terminationGracePeriodSeconds": 1,
     "containers": [{"name": "c", "image": "native", "command": ["/bin/sleep", "3600"],
      "resources": {"requests": {"cpu": "10m", "memory": "16Mi"}}}]}}}}
 EOF
-	say "placed Deployment $NS/spread with $n replicas"
+	done
+	say "placed $n independent one-replica Deployments in $NS"
 	taints_line
 	deadline=$(($(date +%s) + 180))
 	while :; do
-		sched="$(kc -n "$NS" get pods -l app=b1855-spread -o jsonpath='{range .items[*]}{.spec.nodeName}{"\n"}{end}' | grep -c . || true)"
+		sched="$(kc -n "$NS" get pods -l b1855=lab -o jsonpath='{range .items[*]}{.spec.nodeName}{"\n"}{end}' | grep -c . || true)"
 		[ "$sched" -ge "$n" ] && break
 		if [ "$(date +%s)" -ge "$deadline" ]; then
 			say "FAIL only $sched of $n replicas scheduled within 180s"
@@ -158,7 +163,7 @@ EOF
 		sleep 3
 	done
 	kc -n "$NS" get pods -o wide
-	dist="$(kc -n "$NS" get pods -l app=b1855-spread -o jsonpath='{range .items[*]}{.spec.nodeName}{"\n"}{end}' | sort | uniq -c | awk '{print $2"="$1}' | tr '\n' ' ')"
+	dist="$(kc -n "$NS" get pods -l b1855=lab -o jsonpath='{range .items[*]}{.spec.nodeName}{"\n"}{end}' | sort | uniq -c | awk '{print $2"="$1}' | tr '\n' ' ')"
 	say "distribution: $dist"
 	case "$expect" in
 	on)

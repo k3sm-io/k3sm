@@ -130,6 +130,20 @@ func TestHostCPUBusyTrackerHysteresis(t *testing.T) {
 	})
 }
 
+// TestHostCPUBusyTrackerGoesSilentWhenStale: once the last good reading is
+// older than hostCPUStaleAfter, no condition is published (and the server then
+// clears the taint), rather than a verdict that can no longer be measured.
+func TestHostCPUBusyTrackerGoesSilentWhenStale(t *testing.T) {
+	f := newCPUFeed(4)
+	f.minute(1.0)
+	if f.t.condition(metav1.NewTime(f.at.Add(hostCPUStaleAfter))) == nil {
+		t.Fatal("condition dropped at the stale bound, want it kept up to it")
+	}
+	if c := f.t.condition(metav1.NewTime(f.at.Add(hostCPUStaleAfter + time.Second))); c != nil {
+		t.Fatalf("stale condition = %+v, want none", c)
+	}
+}
+
 func TestHostCPUBusyTrackerIgnoresBadWindows(t *testing.T) {
 	f := newCPUFeed(4)
 	f.minute(0.9)
@@ -145,6 +159,13 @@ func TestHostCPUBusyTrackerIgnoresBadWindows(t *testing.T) {
 	f.t.observe(f.at, f.nanos)
 	if f.t.avg != before || f.status() != corev1.ConditionTrue {
 		t.Fatalf("a reseed moved the verdict: avg %v status %q", f.t.avg, f.status())
+	}
+	// A window longer than hostCPUMaxWindow (the Mac slept) reseeds without
+	// moving the average, even though the CPU was idle all along.
+	f.at = f.at.Add(time.Hour)
+	f.t.observe(f.at, f.nanos)
+	if f.t.avg != before || f.status() != corev1.ConditionTrue {
+		t.Fatalf("a long window moved the verdict: avg %v status %q", f.t.avg, f.status())
 	}
 	// Utilization over 100% (a clock skew) is clamped.
 	f.at = f.at.Add(time.Minute)
