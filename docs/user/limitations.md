@@ -294,8 +294,19 @@ xcodebuild -project App.xcodeproj -scheme App -configuration Debug \
   either; a build step that needs a system service, such as some asset or Interface Builder
   compilers, fails in the Pod and is worth reporting.
 
+- SwiftPM resolves a package's dependencies in the Pod with Xcode's own `git`: the grant reads its
+  configuration and helpers. A dependency over `https` that needs credentials fails, since the Pod
+  reaches no keychain.
+
 What this does not cover:
 
+- **Pseudo-terminals.** `openpty` fails with `Operation not permitted`, so a test that runs a
+  program on a terminal fails in the Pod.
+- **File-system event streams.** A Pod reaches no `fseventsd`, so `FSEvents` watchers never fire.
+- **The developer tools in `/usr/bin`** (`/usr/bin/git`, `/usr/bin/clang` and the rest) are
+  Apple's trampolines, platform binaries that keep the shared temp directory. They work, but print
+  `couldn't create cache file` on every run. Call the tool from `$DEVELOPER_DIR/usr/bin` (first on
+  `PATH`) instead.
 - **A node whose Xcode lives elsewhere** (`Xcode-beta.app`, a versioned name). It gets no
   `xcodebuild` copy, and `xcodebuild` in its Pods still fails as before. `swift build` is unaffected.
 - **Platform and hardened-runtime binaries** outside the shadow set ignore the variable, so they
