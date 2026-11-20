@@ -198,7 +198,10 @@ The data volume is removed with the Pod, so every new Pod builds cold. To keep b
 - A Job fits this model: it builds once, exits 0, and publishes when it is cleaned up
   (`ttlSecondsAfterFinished`, or `kubectl delete job`).
 
-Measured on <node>: cold X s, warm Y s for the Yureisha app (Debug, no source change).
+Not yet measured in a Pod. In a host simulation of the Pod profile on a Mac Studio (the Pod's
+Seatbelt profile applied with `sandbox-exec`, Xcode 27.1), a cold Debug build of the Yureisha app,
+with its SwiftPM packages, macros and asset catalog, took 78 s. The warm figure and the in-Pod
+figures are added once they are measured on a node.
 
 ## Signing and Entitlements
 
