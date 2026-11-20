@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -31,17 +32,39 @@ import (
 	"k3sm.io/runtimed/pkg/shadowset"
 )
 
-// TestShadowCopiesCarryRelink pins that the one Relink entry of runtimed's
-// list reaches the installer: the xcodebuild copy, cloned out of Xcode.app.
-func TestShadowCopiesCarryRelink(t *testing.T) {
+// relinkedCopies lists the Relink copies of runtimed's list, in its order.
+func relinkedCopies() []string {
 	var relinked []string
 	for _, c := range shadow.Copies() {
 		if c.Relink {
 			relinked = append(relinked, c.Name)
 		}
 	}
-	if len(relinked) != 1 || relinked[0] != "xcodebuild" {
-		t.Fatalf("Relink copies = %v, want [xcodebuild]", relinked)
+	return relinked
+}
+
+// TestShadowCopiesCarryRelink pins that runtimed's Relink entries reach the
+// installer, the xcodebuild copy cloned out of Xcode.app among them, and that
+// every one of them is sourced from the default Xcode's developer dir, the
+// only place the relink resolves a toolchain install_name_tool from.
+func TestShadowCopiesCarryRelink(t *testing.T) {
+	relinked := relinkedCopies()
+	found := false
+	for _, n := range relinked {
+		if n == "xcodebuild" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("Relink copies = %v, want xcodebuild among them", relinked)
+	}
+	for _, c := range shadow.Copies() {
+		if !c.Relink {
+			continue
+		}
+		if _, ok := developerDirOf(filepath.Dir(c.Source)); !ok {
+			t.Errorf("Relink copy %s is sourced from %s, outside a developer dir", c.Name, c.Source)
+		}
 	}
 }
 
@@ -157,12 +180,21 @@ func TestShadowSetSkipsANonAppleSignedRelink(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode the written manifest: %v", err)
 	}
-	if len(m.Skipped) != 1 || m.Skipped[0].Name != "xcodebuild" {
-		t.Fatalf("Skipped = %+v, want the xcodebuild copy", m.Skipped)
+	want := relinkedCopies()
+	var got []string
+	for _, s := range m.Skipped {
+		got = append(got, s.Name)
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("Skipped = %v, want every Relink copy %v", got, want)
+	}
+	skipped := map[string]bool{}
+	for _, n := range want {
+		skipped[n] = true
 	}
 	for _, s := range m.Sources {
-		if s.Name == "xcodebuild" {
-			t.Fatal("a skipped copy is listed as a source")
+		if skipped[s.Name] {
+			t.Fatalf("a skipped copy (%s) is listed as a source", s.Name)
 		}
 	}
 	if missing, _ := shadow.Missing(m, func(string) bool { return true }); len(missing) != 0 {
