@@ -191,7 +191,9 @@ put it under a volume's mount path such as `/work`. k3sm rewrites mount paths fo
 processes, the build database then opens a path that differs from the one it recorded, and the
 build fails with `unable to attach DB`.
 
-The data volume is removed with the Pod, so every new Pod builds cold. To keep builds warm, add
+The data volume is removed with the Pod, so every new Pod builds cold. The build cache is opt-in:
+a Pod without the annotation below neither reads nor writes one. It is also unbounded for now,
+with no size limit and no eviction, so decide which Pods may use it. To keep builds warm, add
 `k3sm.io/xcode-cache: "<key>"` beside the toolchain annotation. The key is lower case and matches
 `^[a-z0-9][a-z0-9._-]{0,62}$`; name it after the project and configuration, such as `app-debug`.
 
