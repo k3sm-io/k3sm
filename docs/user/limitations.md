@@ -173,10 +173,10 @@ container signal each other freely; the native path is narrower:
   `launchd`. The node daemon recognises a Pod's processes by the sandbox policy they inherited, and
   stops them on delete and on recreate. At its own start, the daemon also stops such leftovers from
   an earlier run of a Pod that still exists, so a process you meant to outlive its Pod will not.
-- One case is not reached: a process that put a further sandbox on itself that denies the Pod's
-  own directory (a nested `sandbox-exec`, as some command-line agents use) is not recognised, and a
-  `setsid` descendant of it can outlive the Pod. Stop such processes from inside the Pod before
-  it exits.
+- One case may not be reached, and has not been measured: a process that put a further sandbox on
+  itself that denies the Pod's own directory (a nested `sandbox-exec`, as some command-line agents
+  use) may not be recognised, and a `setsid` descendant of it could then outlive the Pod. Stop
+  such processes from inside the Pod before it exits.
 
 This filters only who a Pod can signal. Pods on one node still share one trust domain: they run as
 the same user with no PID namespace, and the other surfaces that user can reach are not filtered this
