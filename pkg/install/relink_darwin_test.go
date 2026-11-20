@@ -100,3 +100,59 @@ func TestRelinkedXcodebuildCopyRuns(t *testing.T) {
 		t.Fatalf("VerifySignature: %v", err)
 	}
 }
+
+// TestRelinkedAssetCatalogCopiesRun is the asset-catalog half of the relink gate:
+// actool and ibtoold, copied side by side the way the installer makes them
+// (clone, RelinkRpaths, AdHocSign), answer actool --version with its plist. The
+// actool launcher finds ibtoold beside itself, so the pair works only together,
+// and the ibtoold copy loads the bundle's frameworks only once relinked. Both
+// copies drop the library-validation flag that made the originals refuse the
+// path-rebase shim.
+func TestRelinkedAssetCatalogCopiesRun(t *testing.T) {
+	var actool, ibtoold *shadow.Copy
+	for _, c := range shadow.Copies() {
+		c := c
+		switch c.Name {
+		case "actool":
+			actool = &c
+		case "ibtoold":
+			ibtoold = &c
+		}
+	}
+	if actool == nil || ibtoold == nil {
+		t.Skip("SKIP: runtimed's list has no actool/ibtoold copies")
+	}
+	for _, c := range []*shadow.Copy{actool, ibtoold} {
+		if _, err := os.Stat(c.Source); err != nil {
+			t.Skipf("SKIP: no %s on this host: %v", c.Source, err)
+		}
+	}
+	sys := darwinSystem{}
+	dir := t.TempDir()
+	for _, c := range []*shadow.Copy{actool, ibtoold} {
+		b, err := os.ReadFile(c.Source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dst := filepath.Join(dir, c.Name)
+		if err := os.WriteFile(dst, b, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := sys.RelinkRpaths(dst, filepath.Dir(c.Source)); err != nil {
+			t.Fatalf("RelinkRpaths %s: %v", c.Name, err)
+		}
+		if err := sys.AdHocSign(dst); err != nil {
+			t.Fatalf("AdHocSign %s: %v", c.Name, err)
+		}
+		if _, err := sys.VerifyShadowCopy(dst); err != nil {
+			t.Fatalf("VerifyShadowCopy %s: %v", c.Name, err)
+		}
+	}
+	dev, _ := developerDirOf(filepath.Dir(actool.Source))
+	cmd := exec.Command(filepath.Join(dir, "actool"), "--version")
+	cmd.Env = append(os.Environ(), "DEVELOPER_DIR="+dev)
+	out, err := cmd.CombinedOutput()
+	if err != nil || strings.Contains(string(out), "Could not locate ibtoold") || !strings.Contains(string(out), "<plist") {
+		t.Fatalf("the actool copy beside the ibtoold copy: %v: %s", err, out)
+	}
+}
