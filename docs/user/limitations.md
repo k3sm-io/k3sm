@@ -171,8 +171,9 @@ container signal each other freely; the native path is narrower:
   affect it: teardown still reaches the group.
 - Pod teardown also reaches a process that left the group or session (`setsid`) and was adopted by
   `launchd`. The node daemon recognises a Pod's processes by the sandbox policy they inherited, and
-  stops them on delete and on recreate. At its own start, the daemon also stops such leftovers from
-  an earlier run of a Pod that still exists, so a process you meant to outlive its Pod will not.
+  stops them on delete and on recreate. At its own start, the daemon also stops such leftovers of
+  every Pod it knew before and did not re-attach, whether or not the Pod still exists, so a process
+  you meant to outlive its Pod will not.
 - One case may not be reached, and has not been measured: a process that put a further sandbox on
   itself that denies the Pod's own directory (a nested `sandbox-exec`, as some command-line agents
   use) may not be recognised, and a `setsid` descendant of it could then outlive the Pod. Stop

@@ -39,7 +39,7 @@ selected, the grant takes effect and k3sm sets up the Pod for Xcode:
 | `CFFIXED_USER_HOME` | the Pod's effective `HOME` | Xcode ignores `$HOME` and asks the user database, which names `/var/lib/k3sm`, a directory no Pod can write |
 | `USER`, `LOGNAME` | the Pod's user name | XcodeGen stops with `Couldn't find current username` without them |
 | `PATH` | `$DEVELOPER_DIR/usr/bin:$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin`, only when no `PATH` is set | Puts Xcode's own tools ahead of the `/usr/bin` trampolines |
-| `~/.gitconfig` | a `safe.directory` entry for each of the Pod's volume mounts | Git refuses a repository another user owns, such as a host-shared checkout |
+| `~/.gitconfig` | `safe.directory = *`, written once into the Pod's home | Git refuses a repository another user owns, such as a host-shared checkout |
 | `xcodebuild` arguments | `-IDEPackageSupportDisableManifestSandbox=YES`, `-IDEPackageSupportDisablePluginExecutionSandbox=YES` and the build setting `SWIFTC_DISABLE_SANDBOX=YES` | SwiftPM manifests, package plug-ins and Swift macros each start a sandbox of their own, and macOS refuses a sandbox inside the Pod's |
 
 Each variable is set only when the image and the Pod spec do not set it already; a value you set
@@ -47,12 +47,21 @@ wins. The `xcodebuild` arguments are added when a Pod runs Xcode's `xcodebuild`
 (`$DEVELOPER_DIR/usr/bin/xcodebuild`, or plain `xcodebuild` on the default `PATH`) and k3sm swaps in
 its copy. Calling the copy directly, `/Library/k3sm/shadow/xcodebuild`, adds nothing. The build
 setting is left out of the tool modes that take none (`-create-xcframework`, `-exportArchive`,
-`-exportLocalizations`, `-importLocalizations`), and a value you pass wins.
+`-exportLocalizations`, `-importLocalizations`, `-exportNotarizedApp`), and a value you pass wins.
+
+`safe.directory = *` turns git's ownership check off for the Pod's git, in every repository the Pod
+can reach. A repository's own configuration then takes effect there, including hooks and settings
+such as `core.fsmonitor` that run a command. Mount only checkouts you trust into a build Pod, or
+replace `~/.gitconfig` in the Pod with the paths you mean.
 
 Turning the nested sandboxes off means a dependency's manifest, package plug-ins and macros run
 with the Pod's own reach, the same as `swift build --disable-sandbox`: whatever the Pod can read,
 write or reach on the network, they can too. They are still confined by the Pod's sandbox, which is
-why k3sm turns them off rather than failing every package build. To keep a nested sandbox on, pass
+why k3sm turns them off rather than failing every package build. This holds for every `xcodebuild`
+run in a Pod with the annotation, so treat the Pod as the boundary: dependency code can use the
+Pod's network, write its data volume and any writable volume or host share it mounts, and write the
+build cache the Pod publishes (below). Pin dependencies, and do not give a Pod that builds
+packages you do not trust a writable share or a cache key that trusted builds use. To keep a nested sandbox on, pass
 `-IDEPackageSupportDisableManifestSandbox=NO`, `-IDEPackageSupportDisablePluginExecutionSandbox=NO`
 or `SWIFTC_DISABLE_SANDBOX=NO` yourself; inside a Pod that step then fails with the
 `sandbox_apply` error below. A preference file cannot change any of this in a Pod, because a Pod
@@ -197,6 +206,12 @@ The data volume is removed with the Pod, so every new Pod builds cold. To keep b
   builds finish, the later one wins.
 - A Job fits this model: it builds once, exits 0, and publishes when it is cleaned up
   (`ttlSecondsAfterFinished`, or `kubectl delete job`).
+- One namespace and key is one trust domain over time. Any Pod that may carry the annotation in
+  that namespace, and exits 0, decides what the next build with that key starts from, including
+  compiled modules and fetched packages. Builds of different trust, such as a fork's pull request
+  and a release, need different keys or namespaces.
+- Nothing evicts a cache and there is no size limit. A snapshot stays until an operator removes
+  `xcode-cache/<namespace>/<key>` under the node's state directory (`/var/lib/k3sm` by default).
 
 Not yet measured in a Pod. In a host simulation of the Pod profile on a Mac Studio (the Pod's
 Seatbelt profile applied with `sandbox-exec`, Xcode 27.1), a cold Debug build of the Yureisha app,
@@ -242,7 +257,7 @@ instead, which logs a warning and falls back to Apple's binary; the Pod's
 | `You don't have permission to save the file` (Cocoa error 513) or `EXDEV` on an atomic save | The write was staged in a volume's shared `.TemporaryItems`: the file is on another disk, or a restricted tool lost the shim | Keep the build in the data volume; on an old node, run `sudo k3sm install` for the `actool` and `ibtool` copies |
 | `Failed to write ICNS data for app icon` | `actool` running without its copy | Run `sudo k3sm install` |
 | `unable to attach DB` | DerivedData under a rewritten mount path such as `/work` | Use the default DerivedData or a path under `$K3SM_ROOTFS` |
-| `fatal: detected dubious ownership in repository` | The repository is owned by another user, such as a host-shared checkout | Upgrade the node (it trusts the Pod's mounts), or `git -c safe.directory='*' …` |
+| `fatal: detected dubious ownership in repository` | The repository is owned by another user, such as a host-shared checkout | Upgrade the node (the Pod's `~/.gitconfig` then sets `safe.directory = *`), or `git -c safe.directory='*' …` |
 | `could not read Username for 'https://…'`, or the keychain helper failing | A private dependency needs credentials, and a Pod has no keychain | Use a public URL, vendor the package, or fetch it outside the Pod |
 | `sandbox-exec: sandbox_apply: Operation not permitted` while resolving packages | SwiftPM's nested manifest sandbox | Upgrade the node; for an old one, pass `-IDEPackageSupportDisableManifestSandbox=YES -IDEPackageSupportDisablePluginExecutionSandbox=YES` |
 | `swift-plugin-server produced malformed response` on a macro | The compiler's nested macro sandbox | Upgrade the node; for an old one, pass `SWIFTC_DISABLE_SANDBOX=YES` |

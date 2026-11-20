@@ -24,6 +24,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -139,19 +140,34 @@ var xcodebuildCopyProblem = func(ctx context.Context, shadowDir, developerDir st
 	defer cancel()
 	return diagnoseXcodebuildCopy(shadowDir, developerDir, xcodebuildCopyHost{
 		readFile: os.ReadFile,
-		exists: func(p string) bool {
-			fi, err := os.Stat(p)
-			return err == nil && fi.Mode().IsRegular()
-		},
-		cdhash: func(p string) (string, error) { return shadow.CDHash(ctx, p) },
+		usable:   copyIsTrusted,
+		present:  func(p string) bool { _, err := os.Stat(p); return err == nil },
+		cdhash:   func(p string) (string, error) { return shadow.CDHash(ctx, p) },
 	})
 }
 
 // xcodebuildCopyHost is what diagnoseXcodebuildCopy reads of the host.
 type xcodebuildCopyHost struct {
 	readFile func(string) ([]byte, error)
-	exists   func(string) bool
-	cdhash   func(string) (string, error)
+	// usable reports whether a copy is a file the runtime will run: see
+	// copyIsTrusted.
+	usable func(string) bool
+	// present reports whether a copy's source binary exists on this host.
+	present func(string) bool
+	cdhash  func(string) (string, error)
+}
+
+// copyIsTrusted reports whether p is a copy runtimed's shadow check accepts: a
+// regular file, not a link, owned by root, and writable by nobody else. A copy
+// that fails this is refused at exec, so reporting it as present would hide
+// the very failure the preflight announces.
+func copyIsTrusted(p string) bool {
+	fi, err := os.Lstat(p)
+	if err != nil || !fi.Mode().IsRegular() || fi.Mode().Perm()&0o022 != 0 {
+		return false
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	return ok && st.Uid == 0
 }
 
 // xcodeCopy is one shadow copy an Xcode build in a pod relies on.
@@ -218,8 +234,8 @@ func diagnoseOneCopy(shadowDir string, c xcodeCopy, m shadow.Manifest, h xcodebu
 		if s.Name != c.name {
 			continue
 		}
-		if !h.exists(filepath.Join(shadowDir, c.name)) {
-			return fmt.Sprintf("the shadow binary set %s has no %s copy", shadowDir, c.name)
+		if !h.usable(filepath.Join(shadowDir, c.name)) {
+			return fmt.Sprintf("the shadow binary set %s has no usable %s copy (it is missing, or is not a root-owned file only root can write)", shadowDir, c.name)
 		}
 		live, err := h.cdhash(s.Path)
 		if err != nil {
@@ -228,6 +244,11 @@ func diagnoseOneCopy(shadowDir string, c xcodeCopy, m shadow.Manifest, h xcodebu
 		if live != s.CDHash {
 			return fmt.Sprintf("%s changed since its copy was made (an Xcode or macOS update), so the copy is stale", s.Path)
 		}
+		return ""
+	}
+	// An Xcode that does not ship this tool has nothing to copy, and
+	// `sudo k3sm install` could not fix it: say nothing.
+	if !h.present(c.source) {
 		return ""
 	}
 	return fmt.Sprintf("the shadow binary set has no %s copy", c.name)

@@ -20,6 +20,8 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -91,7 +93,8 @@ func TestDiagnoseXcodebuildCopy(t *testing.T) {
 	// source whose live hash moved; live "" makes every hash unreadable.
 	host := func(missing string, mf []byte, stale, live string) xcodebuildCopyHost {
 		return xcodebuildCopyHost{
-			exists: func(p string) bool { return strings.HasPrefix(p, dir+"/") && p != dir+"/"+missing },
+			usable:  func(p string) bool { return strings.HasPrefix(p, dir+"/") && p != dir+"/"+missing },
+			present: func(string) bool { return true },
 			readFile: func(p string) ([]byte, error) {
 				if mf == nil || p != dir+"/"+shadow.ManifestName {
 					return nil, fs.ErrNotExist
@@ -119,7 +122,12 @@ func TestDiagnoseXcodebuildCopy(t *testing.T) {
 		{"stale after an Xcode update", dir, xcode, host("", good, shadowset.XcodebuildSource, "aa"), "changed since its copy was made"},
 		{"stale actool", dir, xcode, host("", good, actool, "aa"), actool + " changed"},
 		{"no shadow set", "", xcode, host("", good, "", "aa"), "no shadow binary set"},
-		{"copy file gone", dir, xcode, host("xcodebuild", good, "", "aa"), "has no xcodebuild copy"},
+		{"copy file gone or untrusted", dir, xcode, host("xcodebuild", good, "", "aa"), "has no usable xcodebuild copy"},
+		{"an Xcode without ibtoold has nothing to copy", dir, xcode, func() xcodebuildCopyHost {
+			h := host("", manifest(shadow.Manifest{Sources: without("ibtoold")}), "", "aa")
+			h.present = func(p string) bool { return filepath.Base(p) != "ibtoold" }
+			return h
+		}(), ""},
 		{"no manifest", dir, xcode, host("", nil, "", "aa"), "manifest could not be read"},
 		{"install skipped xcodebuild", dir, xcode, host("", manifest(shadow.Manifest{Sources: without("xcodebuild"), Skipped: []shadow.Skipped{{Name: "xcodebuild", Path: shadowset.XcodebuildSource, Reason: "Xcode is writable by a non-admin"}}}), "", "aa"), "skipped the xcodebuild copy: Xcode is writable"},
 		{"node installed before the ibtoold copy existed", dir, xcode, host("", manifest(shadow.Manifest{Sources: without("ibtoold")}), "", "aa"), "has no ibtoold copy"},
@@ -195,6 +203,37 @@ func TestXcodebuildCopyUnavailableEvent(t *testing.T) {
 			want := "Warning " + reasonXcodebuildCopyUnavailable + " " + msgXcodebuildCopyUnavailable(tc.problem)
 			if got != want {
 				t.Fatalf("Event = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// TestCopyIsTrusted: only a regular file owned by root that nobody else can
+// write counts as a copy. A test cannot make a root-owned file, so the positive
+// case reads one the system ships.
+func TestCopyIsTrusted(t *testing.T) {
+	dir := t.TempDir()
+	mine := filepath.Join(dir, "copy")
+	if err := os.WriteFile(mine, []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink("/bin/ls", link); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, path string
+		want       bool
+	}{
+		{"a root-owned system binary", "/bin/ls", true},
+		{"a file the test user owns", mine, os.Geteuid() == 0},
+		{"a link to a root-owned binary", link, false},
+		{"a directory", dir, false},
+		{"nothing there", filepath.Join(dir, "absent"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := copyIsTrusted(tc.path); got != tc.want {
+				t.Errorf("copyIsTrusted(%s) = %v, want %v", tc.path, got, tc.want)
 			}
 		})
 	}
