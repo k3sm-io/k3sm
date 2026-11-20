@@ -369,6 +369,10 @@ var stateTree = func() []stateLevel {
 		// failed vm boots: daemon-private, 0700 as the runtime makes them.
 		{StateLevel(sandbox.ArtifactPartialSubdir), svc(serviceTreePrivateMode)},
 		{StateLevel(sandbox.VMBootFailureSubdir), svc(serviceTreePrivateMode)},
+		// The Xcode build cache (k3sm.io/xcode-cache): every namespace's build
+		// products, read and written by the daemon alone and denied to every
+		// pod, which only ever gets a private clone in its own data volume.
+		{StateLevel(sandbox.XcodeCacheSubdir), svc(serviceTreePrivateMode)},
 		// The read-only artifact views root (ArtifactViewsMode).
 		{StateLevel(sandbox.ArtifactViewsSubdir), svc(ArtifactViewsMode)},
 		// The image cache's private staging dir for blobs cloned from the
