@@ -151,6 +151,14 @@ const (
 	// finds, while the only other trace is a node-daemon line written at startup,
 	// possibly days before this pod was scheduled.
 	reasonXcodeToolchainUngranted = "XcodeToolchainUngranted"
+	// reasonXcodebuildCopyUnavailable is recorded when a pod's toolchain grant
+	// took effect but one of the node's re-signed Xcode tool copies (xcodebuild,
+	// xcrun, actool, ibtool, ibtoold) is missing, stale after an update, or was
+	// never made (warnXcodebuildCopyUnavailable).
+	// No upstream analogue; the pod is NOT refused, because clang, swiftc and
+	// swift build do not need the copy, but an xcodebuild run in it would not
+	// finish, and nothing else on the pod says why.
+	reasonXcodebuildCopyUnavailable = "XcodebuildCopyUnavailable"
 	// reasonShimInactive is recorded when runtimed reports, through the
 	// k3sm.io/shim-inactive pod condition, that a container's main process was
 	// exec'd as a restricted binary (a platform binary, CS_RESTRICT, or the
@@ -542,6 +550,15 @@ func msgXcodeToolchainUngranted(developerDir string) string {
 		"toolchain grant accepts — it grants a full Xcode developer directory, and a Command Line "+
 		"Tools root needs no grant because a pod already reads that tree. %s",
 		runtimev1.AnnotationXcodeToolchain, developerDir, remedy)
+}
+
+// msgXcodebuildCopyUnavailable is the XcodebuildCopyUnavailable-event message.
+// problem is diagnoseXcodebuildCopy's sentence: authored by the node from its
+// own paths and manifest, never by the pod, so it is safe to carry.
+func msgXcodebuildCopyUnavailable(problem string) string {
+	return "Pod has the Xcode toolchain, but an xcodebuild build cannot run in it: " + problem +
+		". Run `sudo k3sm install` on this node (again after every Xcode update); " +
+		"clang, swiftc and swift build are unaffected."
 }
 
 // containerEvent is a lifecycle Event about ONE container of a pod. The kubelet

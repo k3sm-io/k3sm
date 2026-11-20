@@ -185,6 +185,9 @@ type runtimedRuntime struct {
 	// no toolchain — the annotation then grants nothing, which the constructor
 	// logged when it looked.
 	developerDir string
+	// shadowBinDir is the node's shadow binary set (RuntimedConfig.ShadowBinDir),
+	// read by warnXcodebuildCopyUnavailable. Empty when the node has none.
+	shadowBinDir string
 
 	// resolver supplies ConfigMap/Secret data for the env resolution the
 	// provider performs before sending the box to runtimed (runtimed reads only
@@ -1072,6 +1075,7 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 		// tests share, for the same reason as the deny-set above: a node fact the
 		// pod path must never re-derive per pod.
 		developerDir:   resolveDeveloperDir(log),
+		shadowBinDir:   cfg.ShadowBinDir,
 		resolver:       resolver,
 		refs:           refsOf(resolver),
 		network:        cfg.Network,
@@ -2406,6 +2410,8 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 		// A pod that asked for the developer toolchain and got none still runs; say so
 		// on the pod, once, at create. Degrade-not-fail, unlike the preflight above.
 		r.warnXcodeToolchainUngranted(ctx, pod, box)
+		// And one that got it, on a node whose xcodebuild copy cannot serve it.
+		r.warnXcodebuildCopyUnavailable(ctx, pod, box)
 		// Likewise a None pod running on fewer nameservers than it listed.
 		r.warnDNSConfigPartial(ctx, pod)
 	}
