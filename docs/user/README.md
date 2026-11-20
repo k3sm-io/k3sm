@@ -49,21 +49,24 @@ run on hardware, that is an added caveat: nobody has exercised it on real Macs y
     server's `linux/arm64` images in per-Pod micro-VMs and talks to it from a native client.
 19. [Interconnects](interconnects.md) covers a Thunderbolt cable between Macs as an opt-in network
     for Pods that ask for it, the MLX ranks of a sharded model above all.
-20. [Limitations](limitations.md) lists the gaps.
-21. [Conformance profile](../conformance-profile.md) is the self-assessment of what k3sm targets and why it
+20. [Building with Xcode](xcode.md) covers `xcodebuild`, XcodeGen and SwiftPM in a Pod: the
+    `k3sm.io/xcode-toolchain` annotation, warm builds with `k3sm.io/xcode-cache`, and a
+    troubleshooting table.
+21. [Limitations](limitations.md) lists the gaps.
+22. [Conformance profile](../conformance-profile.md) is the self-assessment of what k3sm targets and why it
     is not a CNCF `[Conformance]` pass.
-22. [Troubleshooting](troubleshooting.md) covers the node's own daemon logs, common failures, and
+23. [Troubleshooting](troubleshooting.md) covers the node's own daemon logs, common failures, and
     recovery.
-23. [Status JSON](status-json.md) is the contract for `k3sm status -o json` and the cheap
+24. [Status JSON](status-json.md) is the contract for `k3sm status -o json` and the cheap
     `k3sm status daemons -o json` probe: fields, enums, versioning and exit codes.
-24. [Container logs](logs.md) covers where a Pod's output is written, `kubectl logs` and its
+25. [Container logs](logs.md) covers where a Pod's output is written, `kubectl logs` and its
     options, rotation, and how to ship logs off a node.
-25. [Stopping and starting](stop-start.md) covers `k3sm stop`, `start` and `restart`, what a stop does
+26. [Stopping and starting](stop-start.md) covers `k3sm stop`, `start` and `restart`, what a stop does
     to pods and the cluster, and how a stop survives a reboot.
-26. [Building images](builder.md) covers `k3sm build` and the in-cluster build engine.
-27. [Helm charts](helm.md) covers installing releases with the `HelmChart` object.
-28. [FAQ](faq.md) gives short answers to the common questions.
-29. [Privacy](privacy.md) lists what the k3sm app's update check sends and what it still reveals.
+27. [Building images](builder.md) covers `k3sm build` and the in-cluster build engine.
+28. [Helm charts](helm.md) covers installing releases with the `HelmChart` object.
+29. [FAQ](faq.md) gives short answers to the common questions.
+30. [Privacy](privacy.md) lists what the k3sm app's update check sends and what it still reveals.
 
 ## Before You Build Anything Real
 

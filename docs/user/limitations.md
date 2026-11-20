@@ -256,30 +256,43 @@ own data volume, where it does not exist. Foundation then stages the write besid
 Pod's data volume, and the rename stays on one volume.
 
 `xcodebuild` builds a project, a workspace or a package in a Pod that carries the
-`k3sm.io/xcode-toolchain` annotation, on a node whose Xcode is `/Applications/Xcode.app`:
+`k3sm.io/xcode-toolchain` annotation, on a node whose Xcode is `/Applications/Xcode.app`.
+[Building with Xcode in k3sm Pods](xcode.md) is the how-to: a working Pod and Job, caching,
+and a troubleshooting table. The annotation sets the Pod up for Xcode by itself:
 
 ```sh
-export PATH="$DEVELOPER_DIR/usr/bin:$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin:$PATH"
-xcodebuild -project App.xcodeproj -scheme App -configuration Debug \
-  -derivedDataPath "$PWD/DerivedData" CODE_SIGN_IDENTITY=- build
+xcodebuild -project App.xcodeproj -scheme App -configuration Debug CODE_SIGNING_ALLOWED=NO build
 ```
 
-- Put `$DEVELOPER_DIR/usr/bin` before `/usr/bin` on `PATH`, or name
+- k3sm gives the Pod a home in its data volume and points `HOME` and `CFFIXED_USER_HOME` at it,
+  so the default DerivedData, `~/Library/Developer/Xcode/DerivedData`, is writable. Xcode ignores
+  `$HOME`; `CFFIXED_USER_HOME` is the variable it honours. A `-derivedDataPath` of your own goes
+  under `$K3SM_ROOTFS`, never under a volume's mount path such as `/work`, which k3sm rewrites
+  and where the build database fails with `unable to attach DB`.
+- When the container sets no `PATH`, k3sm sets one with `$DEVELOPER_DIR/usr/bin` first. If you
+  set your own, put `$DEVELOPER_DIR/usr/bin` before `/usr/bin`, or name
   `$DEVELOPER_DIR/usr/bin/xcodebuild`. `/usr/bin/xcodebuild` is the system's developer-tool
-  trampoline, a platform binary, and through it `xcodebuild` starts without k3sm's copy and fails as before.
-
-- Keep `-derivedDataPath` in the Pod's data volume. The default, `~/Library/Developer/Xcode/DerivedData`,
-  is under the node user's home, which a Pod cannot write.
+  trampoline, a platform binary, and through it `xcodebuild` starts without k3sm's copy.
+- SwiftPM works inside `xcodebuild` with no flags of yours. Manifests, package plug-ins and Swift
+  macros each start a nested sandbox, which macOS refuses inside the Pod's, so k3sm's copy of
+  `xcodebuild` is started with `-IDEPackageSupportDisableManifestSandbox=YES`,
+  `-IDEPackageSupportDisablePluginExecutionSandbox=YES` and `SWIFTC_DISABLE_SANDBOX=YES`. A
+  dependency's manifest, plug-ins and macros then run with the Pod's own reach, the same as
+  `swift build --disable-sandbox`, still inside the Pod's sandbox. Passing any of them as `NO`
+  yourself wins.
 - Sign ad hoc (`CODE_SIGN_IDENTITY=-`, or `CODE_SIGN_STYLE = Manual` with an identity of `-` in the
   project). A Developer ID or Apple Development identity needs the keychain (below).
 - Simulators, devices, `xcodebuild test` against a destination other than `platform=macOS`, and
   anything that talks to a running Xcode are not available: the Pod reaches none of the services they
   use.
-- `xcodebuild` and `xcrun` run as k3sm's re-signed copies. Apple signs `xcodebuild` with private
-  entitlements and ships `xcrun` as a platform binary, and macOS ignores `DIRHELPER_USER_DIR_SUFFIX`
-  and the path-rebase shim for both. `sudo k3sm install` copies each into the node's shadow
+- `xcodebuild`, `xcrun`, `actool`, `ibtool` and `ibtoold` run as k3sm's re-signed copies. Apple
+  signs `xcodebuild` with private entitlements, ships `xcrun` as a platform binary, and signs the
+  asset and Interface Builder compilers with library validation, and macOS ignores
+  `DIRHELPER_USER_DIR_SUFFIX` and the path-rebase shim for all of them. `sudo k3sm install` copies each into the node's shadow
   directory, re-signs it ad hoc without the entitlements, and k3sm runs the copy wherever a Pod
-  execs `/usr/bin/xcrun` or Xcode's own `xcodebuild`. The copies use the
+  execs `/usr/bin/xcrun` or Xcode's own tool. A shell or tool that execs Xcode's `xcodebuild`,
+  `actool`, `ibtool` or `ibtoold` on a node with no usable copy fails at once with a message
+  naming `sudo k3sm install`. The copies use the
   Pod's own temp and cache directories, so `xcrun` caches its lookups instead of starting
   `xcodebuild` for each one. A copy has no entitlements and no hardened runtime, so it honours
   `DYLD_*` variables from the Pod's environment; that runs code inside the Pod's own sandbox and
@@ -291,8 +304,8 @@ xcodebuild -project App.xcodeproj -scheme App -configuration Debug \
 - The read grant for Xcode now includes `Contents/PlugIns`, the IDE plug-ins a build loads, without
   their helper apps, app extensions and XPC services. The profile grants no Mach service and no
   launchd job. The builds k3sm measured (a macOS app target and Swift packages) finish without
-  either; a build step that needs a system service, such as some asset or Interface Builder
-  compilers, fails in the Pod and is worth reporting.
+  either. Asset catalogs and app icons compile through the `actool` and `ibtoold` copies. A build
+  step that needs a system service fails in the Pod and is worth reporting.
 
 - SwiftPM resolves a package's dependencies in the Pod with Xcode's own `git`: the grant reads its
   configuration and helpers. A dependency over `https` that needs credentials fails, since the Pod
