@@ -56,7 +56,12 @@ limitations under the License.
 //     one (group, resource, verb) per line so a reviewer reads the grant rather
 //     than the rules. TestFleetOperatorRBACPinned requires the two to agree, and
 //     names the properties of the grant that were decided when it was read: no
-//     wildcard, and the exact verbs it holds on Secrets.
+//     wildcard, and the exact verbs it holds on Secrets. It also names, as
+//     they were reviewed, the exact verbs on ServiceAccounts and on roles and
+//     bindings at both scopes, that no rule carries escalate, bind or
+//     impersonate, and that the role holds nothing on serviceaccounts/token.
+//     The grant's workload and admission-webhook verbs are not named; the
+//     list holds those.
 //
 // The grant is pinned because installing the chart is what confers it, and a
 // grant nobody read is a grant nobody decided. The pin does not make the grant
