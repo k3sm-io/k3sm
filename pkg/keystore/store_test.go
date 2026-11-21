@@ -539,6 +539,47 @@ func TestDeletePlantedNonDirectory(t *testing.T) {
 	}
 }
 
+// TestConfigRefused: a zero service uid, an empty Dir or an empty MasterDir
+// makes every operation fail closed, before anything is created.
+func TestConfigRefused(t *testing.T) {
+	ctx := context.Background()
+	for name, edit := range map[string]func(c *Config){
+		"zero uid":           func(c *Config) { c.UID = 0 },
+		"empty Dir":          func(c *Config) { c.Dir = "" },
+		"empty MasterDir":    func(c *Config) { c.MasterDir = "" },
+		"nothing set at all": func(c *Config) { *c = Config{} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			server := filepath.Join(t.TempDir(), "server")
+			if err := os.Mkdir(server, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			cfg := Config{
+				Dir:       filepath.Join(server, "keystore"),
+				MasterDir: filepath.Join(server, "cred", "keystore-master"),
+				UID:       uint32(os.Getuid()),
+				GID:       uint32(os.Getgid()),
+			}
+			edit(&cfg)
+			s := New(cfg)
+			ops := map[string]error{}
+			_, ops["Put"] = s.Put(ctx, "a", KindOpaque, []byte("a"))
+			_, _, ops["Current"] = s.Current(ctx, "a")
+			_, _, ops["Get"] = s.Get(ctx, "a", 1)
+			_, ops["List"] = s.List(ctx)
+			ops["Delete"] = s.Delete(ctx, "a")
+			for op, err := range ops {
+				if !errors.Is(err, errInvalidConfig) {
+					t.Errorf("%s: %v, want errInvalidConfig", op, err)
+				}
+			}
+			if names, _ := os.ReadDir(server); len(names) != 0 {
+				t.Fatalf("created %v", names)
+			}
+		})
+	}
+}
+
 // TestReadErrorIsNotCorrupt: a file that cannot be read for want of
 // permission is reported as that, not as ErrCorrupt, whose fix (restore from
 // backup) would be the wrong one.

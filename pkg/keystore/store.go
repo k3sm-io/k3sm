@@ -55,7 +55,9 @@ var (
 	// more than a crashed Put leaves. Put never writes that before the pointer,
 	// so it is damage, or an interrupted Delete: List reports it, Put refuses
 	// it, and Delete clears it.
-	errNoPointer = fmt.Errorf("%w: the current pointer is missing and the directory holds more than an interrupted put leaves", ErrCorrupt)
+	// errInvalidConfig reports a Config every operation refuses.
+	errInvalidConfig = errors.New("invalid keystore config")
+	errNoPointer     = fmt.Errorf("%w: the current pointer is missing and the directory holds more than an interrupted put leaves", ErrCorrupt)
 )
 
 // Config locates a FileStore and names the user it belongs to.
@@ -68,6 +70,9 @@ type Config struct {
 	// UID and GID are the service user's. Every file and directory the store
 	// creates is handed to them, and the entries' directory, cred/, the master
 	// directory and the master file must be owned by UID.
+	//
+	// A UID of 0, an empty Dir or an empty MasterDir makes every operation
+	// fail.
 	UID, GID uint32
 }
 
@@ -107,7 +112,8 @@ type FileStore struct {
 	euid func() int
 }
 
-// New returns the FileStore cfg describes. It touches nothing on disk.
+// New returns the FileStore cfg describes. It touches nothing on disk, and it
+// does not judge cfg: every operation does that first (see checkConfig).
 func New(cfg Config) *FileStore {
 	return &FileStore{
 		dir:       cfg.Dir,
@@ -126,6 +132,22 @@ func New(cfg Config) *FileStore {
 	}
 }
 
+// checkConfig refuses a store every operation must fail closed on: a zero
+// service uid, which would hand the service user's files to root and accept
+// root-owned ones, or an empty Dir or MasterDir, which would resolve against
+// the working directory.
+func (s *FileStore) checkConfig() error {
+	switch {
+	case s.uid == 0:
+		return fmt.Errorf("%w: the service user's UID is 0", errInvalidConfig)
+	case s.dir == "":
+		return fmt.Errorf("%w: Dir is empty", errInvalidConfig)
+	case s.masterDir == "":
+		return fmt.Errorf("%w: MasterDir is empty", errInvalidConfig)
+	}
+	return nil
+}
+
 // Put creates name at version 1 holding value, minting the master on the
 // keystore's first Put. The entry is written generation, then version 1, then
 // the current pointer; an entry directory without a pointer is an interrupted
@@ -139,6 +161,9 @@ func (s *FileStore) Put(ctx context.Context, name string, kind Kind, value []byt
 }
 
 func (s *FileStore) put(ctx context.Context, name string, kind Kind, value []byte) (Version, error) {
+	if err := s.checkConfig(); err != nil {
+		return Version{}, err
+	}
 	if err := checkName(name); err != nil {
 		return Version{}, err
 	}
@@ -275,6 +300,9 @@ func (s *FileStore) Get(ctx context.Context, name string, version uint64) (Versi
 // directory, entry directory or current pointer is ErrNotFound.
 func (s *FileStore) read(ctx context.Context, name string, fn func(*entry, keys) error) error {
 	err := func() error {
+		if err := s.checkConfig(); err != nil {
+			return err
+		}
 		if err := checkName(name); err != nil {
 			return err
 		}
@@ -316,6 +344,9 @@ func (s *FileStore) List(ctx context.Context) ([]Entry, error) {
 }
 
 func (s *FileStore) list(ctx context.Context) ([]Entry, error) {
+	if err := s.checkConfig(); err != nil {
+		return nil, err
+	}
 	root, done, err := s.openLocked(ctx, false, false)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
@@ -394,6 +425,9 @@ func (s *FileStore) Delete(ctx context.Context, name string) error {
 }
 
 func (s *FileStore) delete(ctx context.Context, name string) error {
+	if err := s.checkConfig(); err != nil {
+		return err
+	}
 	if err := checkName(name); err != nil {
 		return err
 	}
