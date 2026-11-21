@@ -20,7 +20,6 @@ import (
 	"context"
 	"errors"
 	"net"
-	"sync"
 	"syscall"
 	"time"
 )
@@ -71,30 +70,16 @@ func readCauseOf(err error) readCause {
 
 // upstreamWarnLimiter decides, per cause, whether a failure to reach the
 // local registry is the one warning of its interval. The gate keeps one for
-// reads and one for writes.
+// reads and one for writes. Each cause has its own warnGate, the same gate
+// the relay's limit listener uses.
 type upstreamWarnLimiter struct {
-	// mu guards byCause. It is held only to read and update it: the caller
-	// logs after allow returns, with mu released.
-	mu      sync.Mutex
-	byCause [numCauses]struct {
-		last       time.Time // when the cause last warned
-		suppressed int       // failures since then that did not
-		warned     bool      // whether the cause has warned at all
-	}
+	byCause [numCauses]warnGate
 }
 
 // allow reports whether a failure of cause c at now is to be a warning, and
 // if so how many failures of c were suppressed since the last one. It does
 // not log.
 func (l *upstreamWarnLimiter) allow(now time.Time, c readCause) (warn bool, suppressed int) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	s := &l.byCause[c]
-	if s.warned && now.Sub(s.last) < gateReadWarnInterval {
-		s.suppressed++
-		return false, 0
-	}
-	suppressed = s.suppressed
-	s.last, s.suppressed, s.warned = now, 0, true
-	return true, suppressed
+	suppressed, warn = l.byCause[c].allow(now, gateReadWarnInterval)
+	return warn, suppressed
 }
