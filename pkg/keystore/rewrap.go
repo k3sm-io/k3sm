@@ -40,8 +40,15 @@ const newSuffix = ".new"
 // Rewrap re-seals every record (every committed version and the current
 // pointer of every entry) under newMaster, then swaps the master to it.
 // newMaster must be 32 bytes: empty is ErrMasterMissing, any other length a
-// plain error. A resumed Rewrap reuses the master.next an interrupted one
-// wrote, when it agrees with its fingerprint, and ignores newMaster.
+// plain error.
+//
+// It never adopts a key it was not given without saying so. A master.next an
+// interrupted Rewrap (or anyone else) left, under which no record is live
+// yet, is discarded with every .new, and newMaster goes live. Once some record
+// is live under it, or its swap over the master is half done, discarding it
+// would orphan that record, so Rewrap completes it instead and returns
+// ErrRewrapResumed: the master is then that key, and Rewrap must run again to
+// retire it.
 //
 // It refuses, writing nothing, while the name reserved for user scopes exists
 // in the entries' directory (ErrScopeUnsupported), while the floor cannot be
@@ -106,14 +113,17 @@ func (s *FileStore) rewrap(ctx context.Context, newMaster []byte) error {
 	}
 	defer func() { _ = mroot.Close() }() // every write below is fsynced
 	// A crash between the two master renames left the swap half done: this
-	// run completes it, and with it the interrupted Rewrap, so it mints no
-	// second key.
-	if done, err := s.finishSwap(mroot); err != nil || done {
+	// run completes it, and with it the interrupted Rewrap, and says so.
+	done, err := s.finishSwap(mroot)
+	if err != nil {
 		return err
 	}
 	k, err := s.loadMaster()
 	if err != nil {
 		return err
+	}
+	if done {
+		return resumed(k, newMaster)
 	}
 	// Like every root verb, it raises the floor first. Rewrap records nothing
 	// new in it, so a floor too full to raise does not stop it.
@@ -124,11 +134,7 @@ func (s *FileStore) rewrap(ctx context.Context, newMaster []byte) error {
 	}
 	old := k
 	old.next = nil
-	next, err := s.prepareNext(ctx, root, mroot, fl, old, newMaster)
-	if err != nil {
-		return err
-	}
-	plan, err := rewrapPlan(ctx, root, fl, old, &next)
+	next, plan, resuming, err := s.prepareNext(ctx, root, mroot, fl, old, newMaster)
 	if err != nil {
 		return err
 	}
@@ -138,7 +144,26 @@ func (s *FileStore) rewrap(ctx context.Context, newMaster []byte) error {
 	if err := s.commitNew(ctx, root, fl, plan, old, next); err != nil {
 		return err
 	}
-	return s.swapMaster(mroot, next)
+	if err := s.swapMaster(mroot, next); err != nil {
+		return err
+	}
+	if resuming {
+		return resumed(next, newMaster)
+	}
+	return nil
+}
+
+// resumed is ErrRewrapResumed, unless the key a resumed Rewrap completed, now
+// the master, is newMaster after all.
+func resumed(live keys, newMaster []byte) error {
+	k, err := deriveKeys(newMaster, live.scope)
+	if err != nil {
+		return err
+	}
+	if hmac.Equal(k.seal, live.seal) {
+		return nil
+	}
+	return ErrRewrapResumed
 }
 
 // refuseUserScopes is ErrScopeUnsupported when the name reserved for user
@@ -155,9 +180,14 @@ func refuseUserScopes(root *os.Root) error {
 	return nil
 }
 
-// prepareNext is step 2: it returns the keys of master.next, writing it from
-// newMaster first unless an interrupted Rewrap left one that agrees with its
-// fingerprint, which it reuses so a resumed Rewrap mints no second key.
+// prepareNext is step 2. It returns the keys every record is to be sealed
+// under, the plan of every entry (see rewrapPlan), and whether those keys are
+// an interrupted Rewrap's that it resumes rather than newMaster's.
+//
+// A master.next that agrees with its fingerprint is resumed only when some
+// record is already live under it: discarding it would orphan that record.
+// Otherwise nothing is committed to it, whoever wrote it, so it is discarded
+// with every .new (discardNext) and newMaster is written in its place.
 //
 // A master.next that does not agree (or a master.next.sha256 left without
 // one) is discarded only when no .new file exists anywhere and every record
@@ -167,15 +197,28 @@ func refuseUserScopes(root *os.Root) error {
 // second condition goes beyond the .new check alone: after step 4 renamed
 // every .new in, none is left, but the records are under master.next.
 //
-// With nothing to reuse, every record must open under the live master before
+// With nothing to resume, every record must open under the live master before
 // master.next is written, so a Rewrap over an entry that does not open writes
 // nothing.
-func (s *FileStore) prepareNext(ctx context.Context, root, mroot *os.Root, fl floor, old keys, newMaster []byte) (keys, error) {
+func (s *FileStore) prepareNext(ctx context.Context, root, mroot *os.Root, fl floor, old keys, newMaster []byte) (keys, []planned, bool, error) {
 	raw, err := s.readNext(mroot)
 	if err == nil {
 		k, derr := deriveKeys(raw, s.scope)
 		clear(raw)
-		return k, derr
+		if derr != nil {
+			return keys{}, nil, false, derr
+		}
+		plan, committed, perr := rewrapPlan(ctx, root, fl, old, &k)
+		if perr != nil {
+			return keys{}, nil, false, perr
+		}
+		if committed {
+			return k, plan, true, nil
+		}
+		if err := s.discardNext(ctx, root, mroot); err != nil {
+			return keys{}, nil, false, err
+		}
+		err = fs.ErrNotExist
 	}
 	bad := !errors.Is(err, fs.ErrNotExist)
 	if !bad {
@@ -183,54 +226,88 @@ func (s *FileStore) prepareNext(ctx context.Context, root, mroot *os.Root, fl fl
 		if lerr == nil {
 			bad, err = true, fmt.Errorf("%s is present without %s", masterNextFingerprintName, masterNextName)
 		} else if !errors.Is(lerr, fs.ErrNotExist) {
-			return keys{}, lerr
+			return keys{}, nil, false, lerr
 		}
 	}
 	found, ferr := anyNew(ctx, root)
 	if ferr != nil {
-		return keys{}, ferr
+		return keys{}, nil, false, ferr
 	}
 	if found {
-		return keys{}, fmt.Errorf("%w: %s is missing or does not match its fingerprint, and records were already re-sealed under it: restore the master directory and keystore/ from one matched backup (%w)", ErrMasterUntrusted, masterNextName, err)
+		return keys{}, nil, false, fmt.Errorf("%w: %s is missing or does not match its fingerprint, and records were already re-sealed under it: restore the master directory and keystore/ from one matched backup (%w)", ErrMasterUntrusted, masterNextName, err)
 	}
-	if _, perr := rewrapPlan(ctx, root, fl, old, nil); perr != nil {
+	plan, _, perr := rewrapPlan(ctx, root, fl, old, nil)
+	if perr != nil {
 		if bad {
-			return keys{}, fmt.Errorf("%w: %s does not match its fingerprint, and a record does not open under the live master, so it may be sealed under %s: restore the master directory and keystore/ from one matched backup (%w; %w)", ErrMasterUntrusted, masterNextName, masterNextName, err, perr)
+			return keys{}, nil, false, fmt.Errorf("%w: %s does not match its fingerprint, and a record does not open under the live master, so it may be sealed under %s: restore the master directory and keystore/ from one matched backup (%w; %w)", ErrMasterUntrusted, masterNextName, masterNextName, err, perr)
 		}
-		return keys{}, perr
+		return keys{}, nil, false, perr
 	}
 	next, err := deriveKeys(newMaster, s.scope)
 	if err != nil {
-		return keys{}, err
+		return keys{}, nil, false, err
 	}
 	if hmac.Equal(next.seal, old.seal) {
-		return keys{}, errors.New("the new master is the live one")
+		return keys{}, nil, false, errors.New("the new master is the live one")
 	}
 	// The stale fingerprint goes first, so an interruption never leaves one
 	// that vouches for a key that was not written; the rename of master.next
 	// replaces a stale one.
 	if err := mroot.Remove(masterNextFingerprintName); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return keys{}, fmt.Errorf("remove the stale %s: %w", masterNextFingerprintName, err)
+		return keys{}, nil, false, fmt.Errorf("remove the stale %s: %w", masterNextFingerprintName, err)
 	}
 	if err := s.writeFile(mroot, masterNextName, newMaster); err != nil {
-		return keys{}, err
+		return keys{}, nil, false, err
 	}
 	if err := s.writeFile(mroot, masterNextFingerprintName, []byte(masterFingerprint(newMaster))); err != nil {
-		return keys{}, err
+		return keys{}, nil, false, err
 	}
-	return next, nil
+	return next, plan, false, nil
 }
 
-// anyNew reports whether any entry directory holds a .new file: whether step 3
-// of some Rewrap had started.
-func anyNew(ctx context.Context, root *os.Root) (bool, error) {
+// discardNext removes a master.next under which nothing is committed: every
+// .new first, then its fingerprint, then master.next itself, each directory
+// fsynced. An interruption leaves either a master.next that agrees, with
+// fewer .new files and still nothing committed, or one with no fingerprint
+// and no .new, which the next run discards as one that does not agree.
+func (s *FileStore) discardNext(ctx context.Context, root, mroot *os.Root) error {
+	err := eachEntryDir(ctx, root, func(e *entry, files []string) error {
+		removed := false
+		for _, f := range files {
+			if !strings.HasSuffix(f, newSuffix) {
+				continue
+			}
+			if err := e.root.Remove(f); err != nil {
+				return err
+			}
+			removed = true
+		}
+		if !removed {
+			return nil
+		}
+		return syncDir(e.root)
+	})
+	if err != nil {
+		return err
+	}
+	for _, n := range []string{masterNextFingerprintName, masterNextName} {
+		if err := mroot.Remove(n); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("discard %s: %w", n, err)
+		}
+	}
+	return syncDir(mroot)
+}
+
+// eachEntryDir calls fn with every entry directory in root and its names. A
+// name that is not an entry name, gone, or not a directory is skipped.
+func eachEntryDir(ctx context.Context, root *os.Root, fn func(e *entry, files []string) error) error {
 	names, err := readDirNames(root, maxDirNames)
 	if err != nil {
-		return false, err
+		return err
 	}
 	for i, name := range names {
 		if err := loopCtx(ctx, i); err != nil {
-			return false, err
+			return err
 		}
 		if checkName(name) != nil {
 			continue
@@ -240,20 +317,33 @@ func anyNew(ctx context.Context, root *os.Root) (bool, error) {
 			continue // gone, or not a directory: it holds nothing
 		}
 		if err != nil {
-			return false, err
+			return err
 		}
 		files, err := readDirNames(e.root, maxDirNames)
+		if err == nil {
+			err = fn(e, files)
+		}
 		e.close()
 		if err != nil {
-			return false, err
-		}
-		for _, f := range files {
-			if strings.HasSuffix(f, newSuffix) {
-				return true, nil
-			}
+			return err
 		}
 	}
-	return false, nil
+	return nil
+}
+
+// anyNew reports whether any entry directory holds a .new file: whether step 3
+// of some Rewrap had started.
+func anyNew(ctx context.Context, root *os.Root) (bool, error) {
+	found := false
+	err := eachEntryDir(ctx, root, func(_ *entry, files []string) error {
+		for _, f := range files {
+			if strings.HasSuffix(f, newSuffix) {
+				found = true
+			}
+		}
+		return nil
+	})
+	return found, err
 }
 
 // planned is one entry a Rewrap re-seals: its name and the version its
@@ -265,58 +355,77 @@ type planned struct {
 
 // rewrapPlan lists, sorted by name, every entry with the version its pointer
 // names, and refuses unless every one of their records opens under old or,
-// when next is set, under next. A directory that is not an entry (an
-// interrupted Put) is left out; one that List would report with Err refuses
-// the Rewrap, which would otherwise leave it sealed under a master that no
-// longer exists.
-func rewrapPlan(ctx context.Context, root *os.Root, fl floor, old keys, next *keys) ([]planned, error) {
+// when next is set, under next. It also reports whether any record opens only
+// under next: whether a commit under next had begun. A directory that is not
+// an entry (an interrupted Put) is left out; one that List would report with
+// Err refuses the Rewrap, which would otherwise leave it sealed under a master
+// that no longer exists.
+func rewrapPlan(ctx context.Context, root *os.Root, fl floor, old keys, next *keys) ([]planned, bool, error) {
 	names, err := readDirNames(root, maxDirNames)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	sort.Strings(names)
-	both := old
-	both.next = next
-	var out []planned
+	var (
+		out       []planned
+		committed bool
+	)
 	for i, name := range names {
 		if err := loopCtx(ctx, i); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if checkName(name) != nil {
 			continue
 		}
-		cur, err := planEntry(ctx, root, name, fl, both)
+		cur, underNext, err := planEntry(ctx, root, name, fl, old, next)
 		if errors.Is(err, ErrNotFound) {
 			continue
 		}
 		if err != nil {
-			return nil, fmt.Errorf("entry %q does not open, and a rewrap would leave it sealed under a master that no longer exists: remove it with rm, or restore it, first: %w", name, err)
+			return nil, false, fmt.Errorf("entry %q does not open, and a rewrap would leave it sealed under a master that no longer exists: remove it with rm, or restore it, first: %w", name, err)
 		}
+		committed = committed || underNext
 		out = append(out, planned{name, cur})
 	}
-	return out, nil
+	return out, committed, nil
 }
 
-// planEntry opens name's pointer and every version it covers under k.
-func planEntry(ctx context.Context, root *os.Root, name string, fl floor, k keys) (uint64, error) {
+// planEntry opens name's pointer and every version it covers, each under old
+// or, failing that and with next set, under next, and reports whether any
+// opened only under next.
+func planEntry(ctx context.Context, root *os.Root, name string, fl floor, old keys, next *keys) (uint64, bool, error) {
 	e, err := openEntry(root, name, fl)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	defer e.close()
-	cur, _, err := e.pointer(k)
-	if err != nil {
-		return 0, err
+	both := old
+	both.next = next
+	underNext := false
+	// either runs open under old, then under both keys when that does not
+	// authenticate, noting a record that opened only then.
+	either := func(open func(keys) error) error {
+		err := open(old)
+		if err != nil && next != nil && errors.Is(err, ErrCorrupt) {
+			if err = open(both); err == nil {
+				underNext = true
+			}
+		}
+		return err
+	}
+	var cur uint64
+	if err := either(func(k keys) (err error) { cur, _, err = e.pointer(k); return err }); err != nil {
+		return 0, false, err
 	}
 	for n := uint64(1); n <= cur; n++ {
 		if err := loopCtx(ctx, int(n)); err != nil {
-			return 0, err
+			return 0, false, err
 		}
-		if _, _, err := e.version(k, n); err != nil {
-			return 0, fmt.Errorf("version %d: %w", n, err)
+		if err := either(func(k keys) error { _, _, err := e.version(k, n); return err }); err != nil {
+			return 0, false, fmt.Errorf("version %d: %w", n, err)
 		}
 	}
-	return cur, nil
+	return cur, underNext, nil
 }
 
 // eachRecord calls fn for every record of an entry whose pointer names cur:

@@ -334,16 +334,21 @@ func TestRewrapCrashAtEveryStep(t *testing.T) {
 			s.step = func(string) error { return nil }
 			checkRewrapValues(t, s, vals)
 
-			if err := s.Rewrap(ctx, rewrapKey(2)); err != nil {
+			// Until a record is renamed in under the first key, nothing is
+			// committed to it: the rerun discards it and goes live with its own
+			// key. From the first rename to the first master rename, the rerun
+			// completes the first key and says so. After the second master
+			// rename the first Rewrap had completed, and the rerun is a new one.
+			err := s.Rewrap(ctx, rewrapKey(2))
+			key := rewrapKey(2)
+			if i >= 7 && i < len(steps)-1 {
+				key = rewrapKey(1)
+				if !errors.Is(err, ErrRewrapResumed) {
+					t.Fatalf("Rewrap rerun after a commit began: %v, want ErrRewrapResumed", err)
+				}
+				checkUnderKey(t, server, key)
+			} else if err != nil {
 				t.Fatalf("Rewrap rerun: %v", err)
-			}
-			// Before master.next.sha256 is written there is no agreed key to
-			// resume with, so the rerun mints its own; after the second master
-			// rename the first Rewrap had completed, and the rerun is a new
-			// one. In between it resumes with the first key.
-			key := rewrapKey(1)
-			if i < 2 || i == len(steps)-1 {
-				key = rewrapKey(2)
 			}
 			checkMasterIs(t, server, key)
 			checkRewrapValues(t, s, vals)
@@ -458,8 +463,22 @@ func TestRewrapMasterRenameCompleted(t *testing.T) {
 	}
 	t.Run("the next rewrap", func(t *testing.T) {
 		s, server, vals := interrupted(t)
+		if err := s.Rewrap(ctx, rewrapKey(2)); !errors.Is(err, ErrRewrapResumed) {
+			t.Fatalf("Rewrap rerun: %v, want ErrRewrapResumed", err)
+		}
+		checkMasterIs(t, server, rewrapKey(1))
+		checkRewrapValues(t, s, vals)
+		// Run again, as the refusal says, it retires the resumed key.
 		if err := s.Rewrap(ctx, rewrapKey(2)); err != nil {
-			t.Fatalf("Rewrap rerun: %v", err)
+			t.Fatalf("Rewrap after the resume: %v", err)
+		}
+		checkMasterIs(t, server, rewrapKey(2))
+		checkRewrapValues(t, s, vals)
+	})
+	t.Run("the next rewrap, with the resumed key", func(t *testing.T) {
+		s, server, vals := interrupted(t)
+		if err := s.Rewrap(ctx, rewrapKey(1)); err != nil {
+			t.Fatalf("Rewrap rerun with the key it resumes: %v, want nil", err)
 		}
 		checkMasterIs(t, server, rewrapKey(1))
 		checkRewrapValues(t, s, vals)
@@ -476,6 +495,88 @@ func TestRewrapMasterRenameCompleted(t *testing.T) {
 		mustRotate(t, s, "b", "three")
 		vals["b"] = append(vals["b"], []byte("three"))
 		checkMasterIs(t, server, rewrapKey(1))
+		checkRewrapValues(t, s, vals)
+	})
+}
+
+// checkUnderKey checks every record under server opens under key alone.
+func checkUnderKey(t *testing.T, server string, key []byte) {
+	t.Helper()
+	k := mustDeriveKeys(t, key, scopeSystem)
+	for p := range recordNonces(t, server) {
+		b, err := os.ReadFile(filepath.Join(server, "keystore", p))
+		if err != nil {
+			t.Fatal(err)
+		}
+		r, err := parseRecord(b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := r.open(k.seal, k.scope); err != nil {
+			t.Errorf("%s does not open under %x: %v", p, key[:1], err)
+		}
+	}
+}
+
+// plantNext writes key as master.next, with the fingerprint that agrees
+// with it, as a process that can write the master directory could.
+func plantNext(t *testing.T, server string, key []byte) {
+	t.Helper()
+	writeFile(t, masterPath(server, masterNextName), string(key))
+	writeFile(t, masterPath(server, masterNextFingerprintName), masterFingerprint(key))
+}
+
+// TestRewrapKeyReuse: Rewrap never adopts a key it was not given without
+// saying so. A master.next under which nothing is committed yet, planted or
+// left by a crash before any record was renamed in, is discarded with every
+// .new, and the caller's key goes live. Once some record is live under
+// master.next, Rewrap completes that key, since discarding it would orphan
+// the record, and returns ErrRewrapResumed; every record then opens under the
+// resumed key.
+func TestRewrapKeyReuse(t *testing.T) {
+	ctx := context.Background()
+	t.Run("a planted master.next with nothing committed is discarded", func(t *testing.T) {
+		s, server := newTestStore(t)
+		vals := seedRewrap(t, s)
+		plantNext(t, server, rewrapKey(9))
+		if err := s.Rewrap(ctx, rewrapKey(1)); err != nil {
+			t.Fatalf("Rewrap: %v", err)
+		}
+		checkMasterIs(t, server, rewrapKey(1))
+		checkUnderKey(t, server, rewrapKey(1))
+		checkRewrapValues(t, s, vals)
+	})
+	t.Run("a crash before any rename leaves nothing committed", func(t *testing.T) {
+		s, server := newTestStore(t)
+		vals := seedRewrap(t, s)
+		s.step = failAtCall(6) // the last .new write: every .new but one written
+		if err := s.Rewrap(ctx, rewrapKey(1)); err == nil {
+			t.Fatal("Rewrap succeeded through a crash")
+		}
+		s.step = func(string) error { return nil }
+		if n := newFiles(t, server); len(n) == 0 {
+			t.Fatal("the crash left no .new file")
+		}
+		if err := s.Rewrap(ctx, rewrapKey(2)); err != nil {
+			t.Fatalf("Rewrap rerun: %v", err)
+		}
+		checkMasterIs(t, server, rewrapKey(2))
+		checkUnderKey(t, server, rewrapKey(2))
+		checkRewrapValues(t, s, vals)
+	})
+	t.Run("a resume after a partial commit is reported", func(t *testing.T) {
+		s, server := newTestStore(t)
+		vals := seedRewrap(t, s)
+		s.step = failAt("rename a/v1")
+		if err := s.Rewrap(ctx, rewrapKey(1)); err == nil {
+			t.Fatal("Rewrap succeeded through a crash")
+		}
+		s.step = func(string) error { return nil }
+		if err := s.Rewrap(ctx, rewrapKey(2)); !errors.Is(err, ErrRewrapResumed) {
+			t.Fatalf("Rewrap rerun: %v, want ErrRewrapResumed", err)
+		}
+		checkMasterIs(t, server, rewrapKey(1))
+		checkUnderKey(t, server, rewrapKey(1))
 		checkRewrapValues(t, s, vals)
 	})
 }

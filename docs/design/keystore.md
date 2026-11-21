@@ -534,8 +534,14 @@ master files, to move in two phases:
    library caller is a plain error, not a sentinel, since no caller can act on it
    differently, and an empty argument is `ErrMasterMissing`).
 2. Write `master.next`, fsync, then `master.next.sha256`, fsync, then fsync the directory.
-   If a `master.next` already exists and agrees with its fingerprint, **reuse it** so a
-   resumed Rewrap does not mint a second key. If it exists and does not agree, the two cases
+   If a `master.next` already exists and agrees with its fingerprint, Rewrap never adopts it
+   silently. **Nothing committed yet** (no record or pointer is live under it; at most `.new`
+   files exist): it is discarded, with its fingerprint and every `.new`, and the caller's key
+   is written in its place, so a planted key never goes live. **A commit or swap already
+   started** (some record is live under it, or the swap below is half done): discarding it
+   would orphan that record, so Rewrap completes it, then returns `ErrRewrapResumed`, whose
+   message says an earlier rewrap was completed with a key other than the one supplied and
+   that rewrap must run again to retire it. If it exists and does not agree, the two cases
    are told apart by whether any `.new` file exists anywhere. With none (step 3 only starts
    after step 2 is durable), the crash was inside step 2: discard it and mint again. **With
    any `.new` file present, refuse with `ErrMasterUntrusted`**: step 3 had started, so
@@ -586,8 +592,8 @@ the conservative way:
   sealed under.
 - *Completing the swap.* Every verb that takes the exclusive lock (Put, Rotate, Delete,
   `RaiseFloor`, Rewrap) finishes the second rename first; readers trust the master and write
-  nothing. A Rewrap that finishes it has completed the interrupted one and stops, minting no
-  second key. The reader's fallback key is `master.next` only when it agrees with its
+  nothing. A Rewrap that finishes it has completed the interrupted one and stops with
+  `ErrRewrapResumed` (step 2), unless the key it completed is the one it was given. The reader's fallback key is `master.next` only when it agrees with its
   fingerprint, and an opaque fingerprint read under it uses the master's fingerprint key.
 - *The floor.* Rewrap raises it at its start like every root verb, but a floor too full to
   raise does not stop it, since Rewrap records nothing new; pointers are re-sealed at their

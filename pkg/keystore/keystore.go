@@ -176,4 +176,10 @@ var (
 	// build cannot re-wrap user scopes, so re-wrapping the master under them
 	// would leave them unreadable; Rewrap writes nothing.
 	ErrScopeUnsupported = errors.New("the keystore holds user scopes, which this build of k3sm cannot re-wrap: nothing was changed; upgrade k3sm, then run rewrap again")
+	// ErrRewrapResumed reports that Rewrap found an earlier, interrupted
+	// rewrap whose new key was already live for some record, completed it
+	// under that key rather than the one supplied, and stopped. The master is
+	// now that earlier key, which the caller did not choose, so Rewrap must be
+	// run again to retire it.
+	ErrRewrapResumed = errors.New("an earlier interrupted rewrap was completed, with a key other than the one supplied: run rewrap again to retire that key")
 )
