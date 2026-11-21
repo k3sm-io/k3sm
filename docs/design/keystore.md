@@ -91,7 +91,7 @@ are denied to every Pod by runtimed's data-root denies, which today cover `serve
 every `keystore-*` name in the data root and the whole `keystore-run/` tree; the data-root
 denies are used, not `DaemonTreeSubdirs`, because a node's Pod root can differ from its data
 root. Both files are root 0644, so a local login user can still read them (residual 11). Whether a Pod can read Phase A's two data-root files
-before that change is `[K0 leg 4: pending]`; the denies land either way. And the user scope
+before that change was not measured: the files did not exist on the rig (K0 amendment 2026-11-21); the denies land either way. And the user scope
 adds an ownership boundary on the store and its API, not a confidentiality boundary between
 Pods ("Threat model for the user scope").
 
@@ -976,7 +976,7 @@ tagged first, and the user-scope store's change bumps k3sm's requirement on `k3s
 that tag and says so.
 
 Facts only a spike on the lab rig can settle are marked `[K0 leg N: pending]` where they
-apply; "Facts pending the rig spike" lists them. A marker is replaced by a dated amendment to
+apply; "Facts from the rig spike" lists them. A marker is replaced by a dated amendment to
 this document that quotes the measured result.
 
 ### Decisions the maintainer ruled
@@ -1158,7 +1158,7 @@ GeneratedUID**.
 - **The lookup has a deadline.** It goes through the GeneratedUID-lookup seam with a deadline
   of 2 seconds; a timeout or an error fails closed with `ErrScopeOwnerUnknown`, and nothing in
   that scope opens. Whether the GeneratedUID is stable across a server restart, and how long
-  the cold lookup takes (which sets the deadline), is `[K0 leg 3: pending]`.
+  the cold lookup takes (which sets the deadline), is (measured, K0 amendment 2026-11-21: about 1.4 ms cold, 2.8 ms worst of 20).
   `mbr_uid_to_uuid` joins k3sm's SPI symbol canary (U7).
 - **A missing scope is not an absent entry.** When `.user/<uid>/` or its `scope.key` is
   missing, the store answers the new sentinel `ErrScopeAbsent`, which is not definitive: the
@@ -1221,8 +1221,8 @@ service user can only add to.
      `mmap` of the file, `fcntl(F_PUNCHHOLE)`, `link()` to a new name, `fclonefileat` then a
      swap, a `renamex_np` swap (`RENAME_SWAP`) through the parent, `exchangedata`, `unlink` or
      `rename` through the parent, or a second open with `O_TRUNC`; and if `chmod` by the owner
-     widens nothing `[K0 leg 1: pending]`. The kernel securelevel (`sysctl kern.securelevel`)
-     and whether root can clear the flag at it are recorded too `[K0 leg 1: pending]`.
+     widens nothing (measured, K0 amendment 2026-11-21). The kernel securelevel (`sysctl kern.securelevel`)
+     and whether root can clear the flag at it are recorded too (measured, K0 amendment 2026-11-21).
 
      The spike measures the list once; a standing integration row keeps measuring it. U50 runs
      every entry of the defeat list against the flagged files as the service user, through the
@@ -1442,7 +1442,7 @@ source, in a `*_darwin.go` file; it is a deliberate leaf copy of about 40 lines,
 two existing copies (in darwin-net's `pkg/netd` and runtimed's `pkg/sandbox`) are unexported
 in their repos and `apis` cannot import `x/sys`, and the file cites both. That
 `LOCAL_PEERCRED` reports a non-root login uid on the server side, for a socket in a service-user
-0755 directory under the root-owned data root, is `[K0 leg 2: pending]`.
+0755 directory under the root-owned data root, is measured (K0 amendment 2026-11-21).
 
 **Eligible peers** are uids of 501 and above that are not the service uid. Refused before any
 frame is read: uid 0 (root uses the direct-file verbs, as in Phase A), the service uid (every
@@ -1454,7 +1454,7 @@ data root, then reads the server's uid off the connected descriptor (`LOCAL_PEER
 client side). **The connected-descriptor peer uid is the authority in both directions**: a
 value is never written to a socket whose peer is not the service user, whatever the path
 checks said (U36). That `LOCAL_PEERCRED` reports the service uid on the client side
-is `[K0 leg 2: pending]`.
+is measured (K0 amendment 2026-11-21).
 
 **The client pins the server, not just its uid.** Any service-user process could bind
 `keys.sock` while the listener is down (during maintenance, a restart or its backoff), since
@@ -1490,7 +1490,7 @@ socket before both checks pass (U69, E24).
 - This pins the server for the client; it does not pin the client for the server, which stays
   unpinned by ruling (residual 1). That `LOCAL_PEERTOKEN` is readable on the client side and
   that `SecCodeCopyGuestWithAttributes` resolves a service-user process from a login user's
-  process is `[K0 leg 2: pending]`.
+  process is `[K0 leg 2: pending]` (not in the 2026-11-21 spike; K7a measures it).
 - *The uid alone cannot tell the server from a Pod.* On the rig the server ran as euid 250
   (`_k3sm`), and a native Pod's process also ran as uid 250, the peer euid it showed at
   `keys.sock` (the K0 spike's evidence of
@@ -1629,8 +1629,8 @@ the first layer.**
    2026-11-21, `status.txt`, leg 4), so
    runtimed's sandbox change is a hard prerequisite of the listener change, not an ordering
    preference. That a Pod with these denies cannot `connect(2)` to the socket or read any of these
-   paths, and whether a Pod can read Phase A's two data-root files before them, is `[K0 leg 4:
-   pending]`.
+   paths is `[K0 leg 4: pending]` (the K5 rig leg); without them a Pod reached the socket
+   (K0 amendment 2026-11-21), and Phase A's two files were absent, so their reach today is unmeasured.
 2. **Pod uid refusal, the second layer.** Native Pods run as the service user, below 501. The
    sandbox change adds a second layer: runtimed refuses any resolved Pod process uid of 501 or
    above, and uid 0 without a drop when the daemon runs as root, both when it resolves the
@@ -1653,7 +1653,7 @@ the first layer.**
    With that refusal in place, a Pod that got past Seatbelt would connect under a uid the
    socket's peer check refuses. Until the rig
    spike measures which uid a native Pod's processes run as, and whether any Pod spec field or
-   runtimed path can make it 501 or above (`[K0 leg 5: pending]`), this design does not claim
+   runtimed path can make it 501 or above (`[K0 leg 5: pending]`; a default Pod ran as uid 250, K0 amendment 2026-11-21), this design does not claim
    that a Pod is refused by peer uid; it claims the refusal the sandbox change adds. Row U15 is
    held for a second path if the spike finds one.
 
@@ -2143,19 +2143,24 @@ on a worker node or across several servers; a hash chain on the audit log; un-sh
 a Pod already read; a hardware-backed master; a `k3sm status` field or app change (the `doctor`
 rows are not a contract).
 
-### Facts pending the rig spike
+### Facts from the rig spike
 
-A script-only spike on the rig's server measures these before any code depends on them. A
-spike never counts as proof; its result is quoted here as a dated amendment, which also picks
+A script-only spike on the rig's server measured these before any code depends on them. A
+spike never counts as proof. Its result is quoted here as a dated amendment, which also picks
 the floor variant.
 
-| marker | the fact | where it applies |
-|---|---|---|
-| `[K0 leg 1: pending]` | `sappnd` on an APFS data volume as the service user: append works, and the whole defeat list fails; owner `chmod` widens nothing; the kernel securelevel and whether root can clear the flag at it; whether a rename over an `sappnd` target needs the clear first | "The user-scope floor" (the variant and the maintenance verbs) |
-| `[K0 leg 2: pending]` | `LOCAL_PEERCRED` both ways, for a socket in a service-user 0755 directory under the root-owned data root and a login uid over SSH: the login uid on the server side, the service uid on the client side; and on the client side, that `LOCAL_PEERTOKEN` is readable and `SecCodeCopyGuestWithAttributes` with that token resolves the service-user server's code and cdhash | "The socket" (peer identity, the client's checks) |
-| `[K0 leg 3: pending]` | `mbr_uid_to_uuid` returns a stable 16-byte GeneratedUID across a server restart, and its cold latency, which sets the deadline (what it returns for a uid with no record is measured: the synthesized form, status 0, `leg3b-unresolved-uid.txt` in the K0 evidence) | "Key hierarchy" (the GeneratedUID binding) |
-| `[K0 leg 4: pending]` | a Pod with the data-root denies cannot `connect(2)` to the socket or read `keystore-run/` or any `keystore-*` file; and, without them, whether a Pod can read Phase A's two data-root files today | "Pod denies", "Threat model" |
-| `[K0 leg 5: pending]` | which uid a native Pod's processes run as, and whether any Pod spec field or runtimed path can make it 501 or above | "Pod denies" (layer 2, row U15) |
+**K0 amendment, 2026-11-21.** The spike ran on the rig's server (macOS 27, APFS data volume,
+`kern.securelevel` 0) from a recorded build, as root, and cleaned up after itself. Evidence:
+the K0 spike's evidence of 2026-11-21 (`status.txt`, `leg1.txt` to `leg4-*.txt`,
+`leg3b-unresolved-uid.txt`).
+
+| leg | the fact | result | where it applies |
+|---|---|---|---|
+| 1 | `sappnd` on an APFS data volume as the service user: append works, the whole defeat list fails, owner `chmod` widens nothing; the securelevel, whether root can clear the flag, whether a rename over an `sappnd` target needs the clear first | **Measured.** Append works. All 12 defeat attempts fail with EPERM and leave the inode intact: truncate, ftruncate, open-truncate, `pwrite` at offset 0, `F_PUNCHHOLE`, `link`, `fclonefileat` then rename over, rename over, rename away, unlink, `chflags nosappnd`, and `chmod`. At securelevel 0 root can clear the flag. Root's rename over a flagged target fails with EPERM, so maintenance clears the old file's flag before the rename. **The flag variant is chosen**; the floor helper variant is not built. | "The user-scope floor" |
+| 2 | `LOCAL_PEERCRED` both ways, a login uid over SSH; `LOCAL_PEERTOKEN` and the code lookup on the client side | **`LOCAL_PEERCRED` measured both ways**: the server saw root (euid 0) and the login user (euid 501), and each client saw the server as the service user (euid 250). **Pending:** `LOCAL_PEERTOKEN` and resolving the server's code and cdhash from it were not in the spike; K7a measures them before the client's server pin is built, and the pin's rows (U69, E24) stay pending until then. | "The socket" |
+| 3 | `mbr_uid_to_uuid` is stable across a server restart; its cold latency; what it returns for a uid with no record | **Measured.** The GeneratedUID equals `dscl`'s and is stable across processes. Cold first lookup about 1.4 ms, worst of 20 cold processes 2.8 ms, warm median 0.17 ms, so a 250 ms deadline has wide margin. A uid with no record returns the synthesized form `FFFFEEEE-DDDD-CCCC-BBBB-AAAA<uid hex>` with status 0, and so does root; the synthesized-prefix rule is required. | "Key hierarchy" |
+| 4 | a Pod with the data-root denies cannot reach the socket or any `keystore-*` path; without them, what a Pod reaches today | **Without the denies, measured:** a native Pod on the server connected to `keys.sock` (two accepts), so the denies are a hard prerequisite of any keystore file or socket (K5 before K8). Phase A's two data-root files did not exist on the rig, so their readability today is unmeasured. **Pending:** the Pod with the denies is the K5 rig leg (E10). | "Pod denies", "Threat model" |
+| 5 | which uid a native Pod's processes run as; whether a Pod spec field or runtimed path can make it 501 or above | **Measured for a default Pod:** uid 250 (the service user), below 501, and the socket saw peer euid 250. **Pending:** the spec-field and runtimed-path half (`runAsUser` and the other fields) is K5's row U15. Pods and the server share uid 250, which is why the client pins the server by more than its uid. | "Pod denies" (layer 2, row U15) |
 
 Two facts are open but are not spike legs: whether the admission policy sees the impersonated
 user in `request.userInfo.username` (U40 and E3), and whether the rig runs with
