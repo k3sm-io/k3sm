@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # The keystore's acceptance gate: docs/design/keystore.md § "Acceptance gate",
-# rows G1 to G22, the user-scope rows U1 to U63 (U15 and U39 are unused) and
+# rows G1 to G22, the user-scope rows U1 to U65 (U15 and U39 are unused) and
 # the rig legs E1 to E23. Every row is listed, on exactly one line. A row runs
 # the tests that deliver it and passes only if each named test ran and passed
 # in its own package; a row whose change has not landed yet prints PENDING,
@@ -33,7 +33,7 @@
 #   --delivery      the system delivery: G18 to G20.
 #   --sandbox       the pod denies and the shared path names: U16, U17, U49.
 #   --api           the KeyDelivery API types: U18, U19.
-#   --scope         user scopes: U6 to U11, U47, U58.
+#   --scope         user scopes: U6 to U11, U47, U58, U64.
 #   --scope-store   the user-scope store: U12 to U14, U63.
 #   --files         the append-only files: U20 to U25, U50, U52, U60, U61.
 #   --socket        the socket listener: U26 to U31, U46, U48, U54.
@@ -41,7 +41,7 @@
 #   --exec          the non-root CLI and exec: U36 to U38.
 #   --kd-author     KeyDelivery authoring: U40, U41.
 #   --kd-reconcile  the KeyDelivery reconciler: U42, U43, U59.
-#   --kd-lifecycle  the KeyDelivery lifecycle: U44, U53, U55, U56, U62.
+#   --kd-lifecycle  the KeyDelivery lifecycle: U44, U53, U55, U56, U62, U65.
 #   --grammar       the entry grammar in apis: U57.
 #   --docs          the user docs: no row yet, so it exits 3.
 # A unit mode runs only its rows and only their tests, with the same exit
@@ -91,6 +91,7 @@ EXPECTED_ROWS="$EXPECTED_ROWS U21 U22 U23 U24 U25 U26 U27 U28 U29 U30 U31 U32 U3
 EXPECTED_ROWS="$EXPECTED_ROWS U36 U37 U38 U40 U41 U42 U43 U44 U45 U46 U47 U48"
 EXPECTED_ROWS="$EXPECTED_ROWS U49 U50 U51 U52 U53 U54 U55 U56 U57"
 EXPECTED_ROWS="$EXPECTED_ROWS U58 U59 U60 U61 U62 U63"
+EXPECTED_ROWS="$EXPECTED_ROWS U64 U65"
 # >>> ADD NEW U ROWS (U64 upward) HERE <<<
 EXPECTED_ROWS="$EXPECTED_ROWS E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 E13 E14 E15 E16 E17 E18 E19 E20"
 EXPECTED_ROWS="$EXPECTED_ROWS E21 E22 E23"
@@ -119,7 +120,7 @@ mode_rows() {
 	delivery) echo "G18 G19 G20" ;;
 	sandbox) echo "U16 U17 U49" ;;
 	api) echo "U18 U19" ;;
-	scope) echo "U6 U7 U8 U9 U10 U11 U47 U58" ;;
+	scope) echo "U6 U7 U8 U9 U10 U11 U47 U58 U64" ;;
 	scope-store) echo "U12 U13 U14 U63" ;;
 	files) echo "U20 U21 U22 U23 U24 U25 U50 U52 U60 U61" ;;
 	socket) echo "U26 U27 U28 U29 U30 U31 U46 U48 U54" ;;
@@ -127,7 +128,7 @@ mode_rows() {
 	exec) echo "U36 U37 U38" ;;
 	kd-author) echo "U40 U41" ;;
 	kd-reconcile) echo "U42 U43 U59" ;;
-	kd-lifecycle) echo "U44 U53 U55 U56 U62" ;;
+	kd-lifecycle) echo "U44 U53 U55 U56 U62 U65" ;;
 	grammar) echo "U57" ;;
 	*) echo "" ;;
 	esac
@@ -388,7 +389,7 @@ pend U53 "every reconciler Secret write and delete, and every record withdrawal,
 	k3sm/pkg/keystore/reconcile::TestEveryReconcilerWriteAndDeleteAudited
 pend U54 "a pre-frame refusal writes a refused line with the peer uid, rate-limited per uid with a dropped-count summary (socket listener)" \
 	k3sm/pkg/keystore/socket::TestPreFrameRefusalsAudited TestPreFrameRefusalLinesRateLimited
-pend U55 "a transient lookup, SAR or apiserver error leaves the Secret, the record entry and the finalizer, sets Authorized=Unknown with reason Indeterminate, and retries with backoff; a SAR with allowed=false and no evaluation error is a definitive denial whatever denied says, and an evaluation error or a failed call is Indeterminate; no sweep before readyz and the RBAC informers sync; a denial deletes only on two consecutive sweeps; only the allow-list of definitive outcomes deletes (ErrNotFound and ErrScopeOwnerChanged among them), and every other sentinel is Indeterminate (KeyDelivery lifecycle)" \
+pend U55 "a transient lookup, SAR or apiserver error leaves the Secret, the record entry and the finalizer, sets Authorized=Unknown with reason Indeterminate, and retries with backoff; a SAR with allowed=false and no evaluation error is a definitive denial whatever denied says, and an evaluation error or a failed call is Indeterminate; no sweep before readyz and the RBAC informers sync; every deleting outcome deletes only on two consecutive sweeps; only the allow-list of definitive outcomes deletes (ErrNotFound in a scope that opened and ErrScopeOwnerChanged among them), and every other sentinel, ErrScopeAbsent included, is Indeterminate (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestTransientErrorLeavesSecretSetsUnknown TestSAREvaluationErrorIsIndeterminate TestSARAllowedFalseWithoutErrorIsDenial TestNoSweepBeforeReady TestDenialNeedsTwoSweeps TestScopeOwnerChangedDeletes TestEverySentinelBesidesNotFoundAndOwnerChangedIsIndeterminate
 pend U56 "a delivery record with an unknown format version is refused by the store and read by the reconciler as Indeterminate, never as a denial (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore::TestDeliveryRecordUnknownVersionRefused k3sm/pkg/keystore/reconcile::TestUnknownRecordVersionIsIndeterminate
@@ -406,6 +407,10 @@ pend U62 "reconciler lines are charged to the delivery's owner uid: a deliver-wr
 	k3sm/pkg/keystore/reconcile::TestReconcilerLinesChargedToOwner TestDeliverWritePastShareIsIndeterminate TestDeliverDeleteNeverRefusedForShare
 pend U63 "entries live under .user/<uid>/entries/: entries named deliveries and scope.key are ordinary and touch neither scope file (user-scope store)" \
 	k3sm/pkg/keystore::TestEntriesNamedDeliveriesAndScopeKeyAreOrdinary
+pend U64 "a missing .user/<uid>/ or scope.key answers ErrScopeAbsent, never ErrNotFound; a read on a uid with no scope creates no directory and mints no K_u; the first mutating op does (user scopes)" \
+	k3sm/pkg/keystore::TestReadDoesNotMintScope TestMissingScopeIsScopeAbsent
+pend U65 "ErrScopeAbsent is Indeterminate and deletes nothing; every allow-list outcome, not only a SAR denial, deletes only on two consecutive sweeps; single-server is re-checked from a fresh List before every sweep (KeyDelivery lifecycle)" \
+	k3sm/pkg/keystore/reconcile::TestAbsentScopeIsIndeterminate TestEveryDeletingOutcomeNeedsTwoSweeps TestSingleServerRecheckedBeforeEverySweep
 # >>> ADD NEW U ROWS (U64 upward) HERE, and add each to EXPECTED_ROWS and to mode_rows <<<
 
 leg E1 "files" "preconditions: secrets encryption on; one server; keystore-run/ and both logs present, service-user 0600, SF_APPEND set; the doctor user-scope row on; keystore.sh --check exits 0 on the build" "the append-only files"
