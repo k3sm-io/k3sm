@@ -1963,6 +1963,7 @@ it may change and that a conversion is owed if it does.
   | `DeletePending` | `SecretRetained` | `True` | `Authorized` is `False` and the Secret this object owns is due for deletion but still exists: the delete call failed, or the owner's reconciler allowance is exhausted |
   | `Unowned` | `SecretRetained` | `True` | `Authorized` is `False` with `NotRecorded` for a UID never recorded, and a labelled Secret names this UID: it is not this object's to delete, and it stays |
   | `Indeterminate` | `SecretRetained` | `True` | `Authorized` is `Unknown` and a labelled Secret that is this object's recorded target stays, at its last version |
+| `LabelRemoved` | `SecretRetained` | `True` | a Secret stands at this object's recorded target (namespace and name) without the label or without an owner annotation naming this UID: it is never overwritten or deleted |
 | `OwnerUnresolvable` | `SecretRetained` | `True` | the entry owner's uid has no directory record (the lookup answers a synthesized GeneratedUID), and a labelled Secret that is this object's recorded target stays |
   | `NoneRetained` | `SecretRetained` | `False` | no labelled Secret of this object stays while `Authorized` is `Unknown` or `False`; and whenever `Authorized` is `True` |
 
@@ -1981,7 +1982,7 @@ it may change and that a conversion is owed if it does.
   When a deletion is due and the Secret still exists, `SecretRetained` is `True` with reason
   `DeletePending` until it is gone, so a kept Secret is never silent (U43). The rule is
   general: `SecretRetained` is `True` whenever a labelled Secret stays while `Authorized` is
-  `Unknown` or `False`, with `Indeterminate`, `OwnerUnresolvable`, `DeletePending` or `Unowned` saying why, and
+  `Unknown` or `False`, with `Indeterminate`, `OwnerUnresolvable`, `LabelRemoved`, `DeletePending` or `Unowned` saying why, and
   `False` only when no such Secret stays or `Authorized` is `True` (U78).
 
   While `Authorized` is `False`, `Ready` is `False` with the single reason `NotAuthorized`, and
@@ -2301,6 +2302,14 @@ can set both; the sealed record is what neither that writer nor an admin can for
   UID check alone would then delete that Secret as the owner's. The target check refuses it:
   the Secret is not the recorded target, so neither the orphan sweep nor a lost-authority
   delete touches it, and it is left alone (U44).
+- **A stripped label is reported, never acted on.** A Secret at a recorded target whose label
+  or owner annotation was removed no longer passes the ownership test, and the reconciler
+  cannot tell that from a Secret someone else put at that name. So it never overwrites or
+  deletes it, under any outcome, the object's deletion and `rm-scope` included. The
+  KeyDelivery gets `SecretRetained=True` with reason `LabelRemoved`, and `doctor` names the
+  Secret's namespace and name and the KeyDelivery, so root or the namespace's admin can judge
+  it (U103). Whoever could strip the label holds update on that Secret and could already copy
+  its value (residual 16).
 - **A forgery is not charged to the victim.** Such a Secret is not the owner's act, so the
   reconciler charges nothing to the owner uid's log share for it and writes no `deliver-delete`
   in the owner's name. It writes one `refused` line, `via` `reconciler`, naming the Secret's
@@ -2643,6 +2652,10 @@ the uid throughout.
     including values stored since. The only remedy in this release is the documented one: after
     a suspected master exposure each user re-puts their values with new credentials, and
     `rewrap` warns whenever user scopes exist.
+16. A delivered Secret whose label or owner annotation someone removed is left in place
+    (`LabelRemoved`), so it is not deleted when the delivery is revoked. This adds no reach:
+    the principal that could edit the Secret's metadata holds update on it and could already
+    read and copy its value.
 
 ### What the user scope does not do
 
@@ -2854,6 +2867,7 @@ record below.
 | U100 | a departed account with an unreused uid is reported, not acted on: `doctor` lists every scope whose uid has no directory record (a synthesized GeneratedUID) with its delivery count; each of that scope's deliveries gets `SecretRetained=True` with reason `OwnerUnresolvable`, and no Secret is deleted (seam: GeneratedUID lookup) | `k3sm/cmd/k3sm::TestDoctorListsUnresolvableScopes`, `k3sm/pkg/keystore/reconcile::TestOwnerUnresolvableRetainedCondition` | pending: the KeyDelivery reconciler (lifecycle) |
 | U101 | `rewrap` prints a warning whenever `.user/` exists, before it starts and when it finishes, saying Rewrap does not re-key `K_u` and naming the procedure: each user re-puts their values after a suspected master exposure; with no `.user/` it prints none (seam: euid source) | `k3sm/cmd/k3sm::TestRewrapWarnsWhenUserScopesExist` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
 | U102 | the sealed record stores the last delivered version per delivery, raised after the Secret write succeeds; the repair-versus-owner classifier uses only that recorded version: a Secret whose version annotation is rewritten and a KeyDelivery whose `status.deliveredVersion` is rewritten each leave the charge unchanged, a repair stays on the reconciler budget and an owner's new version stays charged to the owner | `k3sm/pkg/keystore/reconcile::TestChargingIgnoresTamperedVersionAnnotationAndStatus` | pending: the KeyDelivery reconciler (lifecycle) |
+| U103 | a Secret at a recorded target whose label or owner annotation was removed is never overwritten or deleted, under a revocation, the object's deletion and `rm-scope` alike; the KeyDelivery gets `SecretRetained=True` with reason `LabelRemoved`, and `doctor` names the Secret and the KeyDelivery | `k3sm/pkg/keystore/reconcile::TestStrippedLabelReportedNotDeleted` | pending: the KeyDelivery reconciler (lifecycle) |
 
 ### Rig legs
 

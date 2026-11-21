@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # The keystore's acceptance gate: docs/design/keystore.md § "Acceptance gate",
-# rows G1 to G22, the user-scope rows U1 to U102 (U15 and U39 are unused) and
+# rows G1 to G22, the user-scope rows U1 to U103 (U15 and U39 are unused) and
 # the rig legs E1 to E25. Every row is listed, on exactly one line. A row runs
 # the tests that deliver it and passes only if each named test ran and passed
 # in its own package; a row whose change has not landed yet prints PENDING,
@@ -43,7 +43,7 @@
 #   --kd-author     KeyDelivery authoring: U40, U41, U74, U76, U87, U94.
 #   --kd-reconcile  the KeyDelivery reconciler: U42, U43, U59, U73, U78, U81.
 #   --kd-lifecycle  the KeyDelivery lifecycle: U44, U53, U55, U56, U62, U65,
-#                   U72, U75, U77, U79, U83, U85, U86, U89, U93, U95, U96, U98, U100, U102.
+#                   U72, U75, U77, U79, U83, U85, U86, U89, U93, U95, U96, U98, U100, U102, U103.
 #   --grammar       the entry grammar in apis: U57.
 #   --docs          the user docs: no row yet, so it exits 3.
 # A unit mode runs only its rows and only their tests, with the same exit
@@ -114,6 +114,7 @@ EXPECTED_ROWS="$EXPECTED_ROWS U99"
 EXPECTED_ROWS="$EXPECTED_ROWS U100"
 EXPECTED_ROWS="$EXPECTED_ROWS U101"
 EXPECTED_ROWS="$EXPECTED_ROWS U102"
+EXPECTED_ROWS="$EXPECTED_ROWS U103"
 # >>> ADD NEW U ROWS (U64 upward) HERE <<<
 EXPECTED_ROWS="$EXPECTED_ROWS E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 E13 E14 E15 E16 E17 E18 E19 E20"
 EXPECTED_ROWS="$EXPECTED_ROWS E21 E22 E23 E24 E25"
@@ -150,7 +151,7 @@ mode_rows() {
 	exec) echo "U36 U37 U38 U69 U92" ;;
 	kd-author) echo "U40 U41 U74 U76 U87 U94" ;;
 	kd-reconcile) echo "U42 U43 U59 U73 U78 U81" ;;
-	kd-lifecycle) echo "U44 U53 U55 U56 U62 U65 U72 U75 U77 U79 U83 U85 U86 U89 U93 U95 U96 U98 U100 U102" ;;
+	kd-lifecycle) echo "U44 U53 U55 U56 U62 U65 U72 U75 U77 U79 U83 U85 U86 U89 U93 U95 U96 U98 U100 U102 U103" ;;
 	grammar) echo "U57" ;;
 	*) echo "" ;;
 	esac
@@ -588,6 +589,8 @@ pend U101 "rewrap prints a warning whenever .user/ exists, before it starts and 
 	k3sm/cmd/k3sm::TestRewrapWarnsWhenUserScopesExist
 pend U102 "the sealed record stores the last delivered version per delivery, raised after the Secret write succeeds; the repair-versus-owner classifier uses only that recorded version: a rewritten version annotation and a rewritten status.deliveredVersion each leave the charge unchanged (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestChargingIgnoresTamperedVersionAnnotationAndStatus
+pend U103 "a Secret at a recorded target whose label or owner annotation was removed is never overwritten or deleted, under a revocation, the object's deletion and rm-scope alike; the KeyDelivery gets SecretRetained=True with reason LabelRemoved, and doctor names the Secret and the KeyDelivery (KeyDelivery lifecycle)" \
+	k3sm/pkg/keystore/reconcile::TestStrippedLabelReportedNotDeleted
 # >>> ADD NEW U ROWS (U64 upward) HERE, and add each to EXPECTED_ROWS and to mode_rows <<<
 
 leg E1 "files" "preconditions: secrets encryption on; one server; keystore-run/ and both logs present, service-user 0600, SF_APPEND set; the doctor user-scope row on; keystore.sh --check exits 0 on the build" "the append-only files"
@@ -778,6 +781,8 @@ U101|does not re-key K_u
 U101|each user re-puts their values after a suspected master exposure
 U102|last delivered version per delivery
 U102|uses only that recorded version
+U103|never overwritten or deleted
+U103|LabelRemoved
 U97|rm then put"
 
 # --listed: the row-presence lint.
