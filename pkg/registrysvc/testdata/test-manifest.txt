@@ -98,6 +98,8 @@ TestRelayCutIsLogged added a connection a relay deadline cuts is logged once
 TestRelayCutLogEndsWithTheResponse added a write timeout after the response ends is not logged as a relay cut
 TestRelayEarlyAnswerWhileBodyIsSent added an answer before the upload body is sent does not race the body reads
 TestRelayLimitsArePerSource kept the relay and cluster publication do not touch the child
+TestRelayLogsLimitWarningsToItsLogger added the relay hands its logger to the limit listener, naming the listening address
+TestRelayLogsWhenFullOrOverShare added a full relay and a source refused at its share are each logged at most once a minute
 TestRelayReadAfterCloseArmsNoDeadline added a body read after close leaves no read deadline on the connection
 TestRelayServesTLSOnly kept the relay and cluster publication do not touch the child
 TestRelayServesTheGate kept the push gate is unchanged

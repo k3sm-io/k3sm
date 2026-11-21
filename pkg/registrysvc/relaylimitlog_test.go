@@ -22,28 +22,10 @@ import (
 	"log/slog"
 	"net"
 	"strings"
-	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 )
-
-// warnClock is a clock a test moves by hand.
-type warnClock struct {
-	mu sync.Mutex
-	t  time.Time
-}
-
-func (c *warnClock) now() time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.t
-}
-
-func (c *warnClock) advance(d time.Duration) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.t = c.t.Add(d)
-}
 
 // warnings returns the attributes of every Warn record whose message
 // contains substr.
@@ -69,245 +51,245 @@ const (
 	fullMsg      = "at its connection limit"
 	overShareMsg = "holds its share"
 	testWarnGap  = time.Minute
+	// limitPeer and limitPeerB are two client addresses on the cluster network.
+	limitPeer  = "100.64.1.1"
+	limitPeerB = "100.64.2.1"
 )
 
-// TestRelayLogsWhenFullOrOverShare is the gate for the relay listener's two
-// warnings: the relay at its connection limit, so a new pull waits, and a
-// source refused at its share. Each logs once for the first event, nothing
-// for another inside the interval, and again, with the count it dropped,
-// after the interval.
-func TestRelayLogsWhenFullOrOverShare(t *testing.T) {
-	// listen starts a limit listener with the given caps, a recorded log and
-	// a hand-moved clock, and an accept loop that hands out what it accepts.
-	listen := func(t *testing.T, total, perSource int) (*limitListener, *recordedLog, *warnClock, chan net.Conn) {
-		t.Helper()
-		front, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatalf("listen: %v", err)
-		}
-		rec := &recordedLog{}
-		clk := &warnClock{t: time.Unix(1_700_000_000, 0)}
-		ll := newLimitListener(front, total, perSource)
-		ll.log = slog.New(rec)
-		ll.now = clk.now
-		ll.warnEvery = testWarnGap
-		t.Cleanup(func() { _ = ll.Close() })
-		accepted := make(chan net.Conn, 8)
-		go func() {
-			for {
-				c, err := ll.Accept()
-				if err != nil {
-					return
-				}
-				accepted <- c
+// limitLogFixture is a limit listener over a srcListener, with a recorded log
+// and an accept loop that hands out what it accepts. It is built inside a
+// synctest bubble, so its warning interval runs on the bubble's clock.
+type limitLogFixture struct {
+	ll       *limitListener
+	front    *srcListener
+	rec      *recordedLog
+	accepted chan net.Conn
+}
+
+func newLimitLogFixture(t *testing.T, total, perSource int) *limitLogFixture {
+	t.Helper()
+	f := &limitLogFixture{front: newSrcListener(), rec: &recordedLog{}, accepted: make(chan net.Conn, 8)}
+	f.ll = newLimitListener(f.front, total, perSource)
+	f.ll.log = slog.New(f.rec)
+	f.ll.warnEvery = testWarnGap
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			c, err := f.ll.Accept()
+			if err != nil {
+				return
 			}
-		}()
-		return ll, rec, clk, accepted
-	}
-	dial := func(t *testing.T, ll *limitListener) net.Conn {
-		t.Helper()
-		c, err := net.Dial("tcp", ll.Addr().String())
-		if err != nil {
-			t.Fatalf("dial: %v", err)
+			f.accepted <- c
 		}
-		t.Cleanup(func() { _ = c.Close() })
+	}()
+	t.Cleanup(func() {
+		_ = f.ll.Close()
+		<-done
+		for {
+			select {
+			case c := <-f.accepted:
+				_ = c.Close()
+			default:
+				return
+			}
+		}
+	})
+	return f
+}
+
+// dial opens a connection from src and lets the accept loop act on it.
+func (f *limitLogFixture) dial(t *testing.T, src string) net.Conn {
+	t.Helper()
+	c, err := f.front.dial(src, time.Second)
+	if err != nil {
+		t.Fatalf("dial from %s: %v", src, err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	synctest.Wait()
+	return c
+}
+
+// take returns the connection the accept loop has handed out.
+func (f *limitLogFixture) take(t *testing.T) net.Conn {
+	t.Helper()
+	synctest.Wait()
+	select {
+	case c := <-f.accepted:
 		return c
+	default:
+		t.Fatal("no connection accepted")
+		return nil
 	}
-	take := func(t *testing.T, accepted chan net.Conn) net.Conn {
-		t.Helper()
-		select {
-		case c := <-accepted:
-			return c
-		case <-time.After(5 * time.Second):
-			t.Fatal("no connection accepted")
-			return nil
-		}
-	}
-	// waitFor polls until cond holds.
-	waitFor := func(t *testing.T, what string, cond func() bool) {
-		t.Helper()
-		deadline := time.Now().Add(5 * time.Second)
-		for !cond() {
-			if time.Now().After(deadline) {
-				t.Fatalf("timed out waiting for %s", what)
-			}
-			time.Sleep(5 * time.Millisecond)
-		}
-	}
-	suppressed := func(g *warnGate) int {
-		g.mu.Lock()
-		defer g.mu.Unlock()
-		return g.suppressed
-	}
+}
 
+// refused dials from src and requires the listener to close the connection
+// at once, as it does for a source already at its share.
+func (f *limitLogFixture) refused(t *testing.T, src string) {
+	t.Helper()
+	c := f.dial(t, src)
+	_ = c.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := io.ReadAll(c); err != nil {
+		t.Fatalf("read the refused connection: %v", err)
+	}
+	synctest.Wait()
+}
+
+func (f *limitLogFixture) suppressed(g *warnGate) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.suppressed
+}
+
+// TestRelayLogsWhenFullOrOverShare is the gate for the relay listener's two
+// warnings: the relay at its connection limit, so a further connection waits,
+// and a source refused at its share. Each logs once for the first event,
+// nothing for another inside the interval, and again, with the count it
+// dropped, after the interval. The interval is timed on a synctest clock.
+func TestRelayLogsWhenFullOrOverShare(t *testing.T) {
 	t.Run("a full relay", func(t *testing.T) {
-		ll, rec, clk, accepted := listen(t, 1, 4)
-		dial(t, ll)
-		first := take(t, accepted)
-		// The accept loop's next Accept finds the only slot held.
-		waitFor(t, "the full warning", func() bool { return len(rec.warnings(fullMsg)) == 1 })
-		got := rec.warnings(fullMsg)[0]
-		if got["addr"] != ll.Addr().String() || got["limit"] != "1" || got["suppressed"] != "0" {
-			t.Errorf("full warning = %v, want addr=%s limit=1 suppressed=0", got, ll.Addr())
-		}
+		synctest.Test(t, func(t *testing.T) {
+			f := newLimitLogFixture(t, 1, 4)
+			f.dial(t, limitPeer)
+			first := f.take(t)
+			// The accept loop's next Accept finds the only slot held.
+			got := f.rec.warnings(fullMsg)
+			if len(got) != 1 {
+				t.Fatalf("full warnings = %d with the only slot held, want 1", len(got))
+			}
+			if got[0]["addr"] != f.ll.Addr().String() || got[0]["limit"] != "1" || got[0]["suppressed"] != "0" {
+				t.Errorf("full warning = %v, want addr=%s limit=1 suppressed=0", got[0], f.ll.Addr())
+			}
 
-		// A second wait inside the interval logs nothing.
-		_ = first.Close()
-		dial(t, ll)
-		second := take(t, accepted)
-		waitFor(t, "the second wait to be counted", func() bool { return suppressed(&ll.full) == 1 })
-		if n := len(rec.warnings(fullMsg)); n != 1 {
-			t.Fatalf("full warnings = %d inside the interval, want 1", n)
-		}
+			// A second wait inside the interval logs nothing.
+			_ = first.Close()
+			f.dial(t, limitPeer)
+			second := f.take(t)
+			if n := f.suppressed(&f.ll.full); n != 1 {
+				t.Fatalf("suppressed = %d after a second wait, want 1", n)
+			}
+			if n := len(f.rec.warnings(fullMsg)); n != 1 {
+				t.Fatalf("full warnings = %d inside the interval, want 1", n)
+			}
 
-		// After the interval the next wait logs again, with what it dropped.
-		clk.advance(testWarnGap)
-		_ = second.Close()
-		dial(t, ll)
-		third := take(t, accepted)
-		defer third.Close()
-		waitFor(t, "the full warning after the interval", func() bool { return len(rec.warnings(fullMsg)) == 2 })
-		if got := rec.warnings(fullMsg)[1]; got["addr"] != ll.Addr().String() || got["suppressed"] != "1" {
-			t.Errorf("full warning after the interval = %v, want addr=%s suppressed=1", got, ll.Addr())
-		}
-		if n := len(rec.warnings(overShareMsg)); n != 0 {
-			t.Errorf("share warnings = %d, want none", n)
-		}
+			// After the interval the next wait logs again, with what it dropped.
+			advance(t, testWarnGap)
+			_ = second.Close()
+			f.dial(t, limitPeer)
+			third := f.take(t)
+			defer third.Close()
+			got = f.rec.warnings(fullMsg)
+			if len(got) != 2 {
+				t.Fatalf("full warnings = %d after the interval, want 2", len(got))
+			}
+			if got[1]["addr"] != f.ll.Addr().String() || got[1]["suppressed"] != "1" {
+				t.Errorf("full warning after the interval = %v, want addr=%s suppressed=1", got[1], f.ll.Addr())
+			}
+			if n := len(f.rec.warnings(overShareMsg)); n != 0 {
+				t.Errorf("share warnings = %d, want none", n)
+			}
+		})
 	})
 
 	t.Run("a source over its share", func(t *testing.T) {
-		ll, rec, clk, accepted := listen(t, 4, 1)
-		dial(t, ll)
-		held := take(t, accepted)
-		defer held.Close()
-		// refused dials once more from the same address and waits for the
-		// listener to close the connection. The listener logs only after
-		// closing it and releasing the slot, so callers wait for the line.
-		refused := func(t *testing.T) {
-			t.Helper()
-			c := dial(t, ll)
-			_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
-			if _, err := io.ReadAll(c); err != nil {
-				t.Fatalf("read the refused connection: %v", err)
+		synctest.Test(t, func(t *testing.T) {
+			f := newLimitLogFixture(t, 4, 1)
+			f.dial(t, limitPeer)
+			held := f.take(t)
+			defer held.Close()
+
+			f.refused(t, limitPeer)
+			got := f.rec.warnings(overShareMsg)
+			if len(got) != 1 {
+				t.Fatalf("share warnings = %d after a refusal, want 1", len(got))
 			}
-		}
+			if got[0]["addr"] != f.ll.Addr().String() || got[0]["source"] != limitPeer || got[0]["share"] != "1" || got[0]["suppressed"] != "0" {
+				t.Errorf("share warning = %v, want addr=%s source=%s share=1 suppressed=0", got[0], f.ll.Addr(), limitPeer)
+			}
 
-		refused(t)
-		waitFor(t, "the share warning", func() bool { return len(rec.warnings(overShareMsg)) == 1 })
-		got := rec.warnings(overShareMsg)
-		if got[0]["addr"] != ll.Addr().String() || got[0]["source"] != "127.0.0.1" || got[0]["share"] != "1" || got[0]["suppressed"] != "0" {
-			t.Errorf("share warning = %v, want addr=%s source=127.0.0.1 share=1 suppressed=0", got[0], ll.Addr())
-		}
+			f.refused(t, limitPeer)
+			if n := f.suppressed(&f.ll.overShare); n != 1 {
+				t.Fatalf("suppressed = %d after a second refusal, want 1", n)
+			}
+			if n := len(f.rec.warnings(overShareMsg)); n != 1 {
+				t.Fatalf("share warnings = %d inside the interval, want 1", n)
+			}
 
-		refused(t)
-		waitFor(t, "the second refusal to be counted", func() bool { return suppressed(&ll.overShare) == 1 })
-		if n := len(rec.warnings(overShareMsg)); n != 1 {
-			t.Fatalf("share warnings = %d inside the interval, want 1", n)
-		}
-
-		clk.advance(testWarnGap)
-		refused(t)
-		waitFor(t, "the share warning after the interval", func() bool { return len(rec.warnings(overShareMsg)) == 2 })
-		got = rec.warnings(overShareMsg)
-		if got[1]["addr"] != ll.Addr().String() || got[1]["suppressed"] != "1" {
-			t.Errorf("share warning after the interval = %v, want addr=%s suppressed=1", got[1], ll.Addr())
-		}
-		if n := len(rec.warnings(fullMsg)); n != 0 {
-			t.Errorf("full warnings = %d, want none", n)
-		}
+			advance(t, testWarnGap)
+			f.refused(t, limitPeer)
+			got = f.rec.warnings(overShareMsg)
+			if len(got) != 2 {
+				t.Fatalf("share warnings = %d after the interval, want 2", len(got))
+			}
+			if got[1]["addr"] != f.ll.Addr().String() || got[1]["suppressed"] != "1" {
+				t.Errorf("share warning after the interval = %v, want addr=%s suppressed=1", got[1], f.ll.Addr())
+			}
+			if n := len(f.rec.warnings(fullMsg)); n != 0 {
+				t.Errorf("full warnings = %d, want none", n)
+			}
+		})
 	})
 
 	t.Run("three drops inside the interval", func(t *testing.T) {
-		ll, rec, clk, accepted := listen(t, 4, 1)
-		dial(t, ll)
-		held := take(t, accepted)
-		defer held.Close()
-		refused := func(t *testing.T) {
-			t.Helper()
-			c := dial(t, ll)
-			_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
-			if _, err := io.ReadAll(c); err != nil {
-				t.Fatalf("read the refused connection: %v", err)
+		synctest.Test(t, func(t *testing.T) {
+			f := newLimitLogFixture(t, 4, 1)
+			f.dial(t, limitPeer)
+			held := f.take(t)
+			defer held.Close()
+
+			f.refused(t, limitPeer)
+			for range 3 {
+				f.refused(t, limitPeer)
 			}
-		}
+			if n := f.suppressed(&f.ll.overShare); n != 3 {
+				t.Fatalf("suppressed = %d after three refusals, want 3", n)
+			}
+			if n := len(f.rec.warnings(overShareMsg)); n != 1 {
+				t.Fatalf("share warnings = %d inside the interval, want 1", n)
+			}
 
-		refused(t)
-		waitFor(t, "the share warning", func() bool { return len(rec.warnings(overShareMsg)) == 1 })
-		for range 3 {
-			refused(t)
-		}
-		waitFor(t, "three refusals to be counted", func() bool { return suppressed(&ll.overShare) == 3 })
-		if n := len(rec.warnings(overShareMsg)); n != 1 {
-			t.Fatalf("share warnings = %d inside the interval, want 1", n)
-		}
+			// The next line after the interval carries the three it dropped.
+			advance(t, testWarnGap)
+			f.refused(t, limitPeer)
+			got := f.rec.warnings(overShareMsg)
+			if len(got) != 2 || got[1]["suppressed"] != "3" {
+				t.Fatalf("share warnings after the interval = %v, want a second with suppressed=3", got)
+			}
 
-		// The next line after the interval carries the three it dropped.
-		clk.advance(testWarnGap)
-		refused(t)
-		waitFor(t, "the share warning after the interval", func() bool { return len(rec.warnings(overShareMsg)) == 2 })
-		if got := rec.warnings(overShareMsg)[1]; got["suppressed"] != "3" {
-			t.Errorf("share warning after the interval = %v, want suppressed=3", got)
-		}
-
-		// The one after another interval, with nothing dropped, carries 0.
-		clk.advance(testWarnGap)
-		refused(t)
-		waitFor(t, "the share warning after another interval", func() bool { return len(rec.warnings(overShareMsg)) == 3 })
-		if got := rec.warnings(overShareMsg)[2]; got["suppressed"] != "0" {
-			t.Errorf("share warning after another interval = %v, want suppressed=0", got)
-		}
+			// The one after another interval, with nothing dropped, carries 0.
+			advance(t, testWarnGap)
+			f.refused(t, limitPeer)
+			got = f.rec.warnings(overShareMsg)
+			if len(got) != 3 || got[2]["suppressed"] != "0" {
+				t.Fatalf("share warnings after another interval = %v, want a third with suppressed=0", got)
+			}
+		})
 	})
 
 	t.Run("a share refusal inside a full warning's interval still logs", func(t *testing.T) {
-		// Two sources fill the listener, which a loopback socket cannot do,
-		// so this row dials over a listener that names each source.
-		front := newSrcListener()
-		rec := &recordedLog{}
-		clk := &warnClock{t: time.Unix(1_700_000_000, 0)}
-		ll := newLimitListener(front, 2, 1)
-		ll.log = slog.New(rec)
-		ll.now = clk.now
-		ll.warnEvery = testWarnGap
-		t.Cleanup(func() { _ = ll.Close() })
-		accepted := make(chan net.Conn, 8)
-		go func() {
-			for {
-				c, err := ll.Accept()
-				if err != nil {
-					return
-				}
-				accepted <- c
+		synctest.Test(t, func(t *testing.T) {
+			f := newLimitLogFixture(t, 2, 1)
+			f.dial(t, limitPeer)
+			heldA := f.take(t)
+			defer heldA.Close()
+			f.dial(t, limitPeerB)
+			heldB := f.take(t)
+			if n := len(f.rec.warnings(fullMsg)); n != 1 {
+				t.Fatalf("full warnings = %d with both slots held, want 1", n)
 			}
-		}()
-		srcDial := func(t *testing.T, src string) net.Conn {
-			t.Helper()
-			c, err := front.dial(src, 5*time.Second)
-			if err != nil {
-				t.Fatalf("dial from %s: %v", src, err)
+
+			// A slot frees and peer A, already at its share, dials again, with
+			// the clock still inside the full warning's interval.
+			_ = heldB.Close()
+			f.refused(t, limitPeer)
+			got := f.rec.warnings(overShareMsg)
+			if len(got) != 1 || got[0]["source"] != limitPeer || got[0]["suppressed"] != "0" {
+				t.Errorf("share warnings = %v, want one with source=%s suppressed=0", got, limitPeer)
 			}
-			t.Cleanup(func() { _ = c.Close() })
-			return c
-		}
-		const peerA, peerB = "100.64.1.1", "100.64.2.1"
-
-		srcDial(t, peerA)
-		heldA := take(t, accepted)
-		defer heldA.Close()
-		srcDial(t, peerB)
-		heldB := take(t, accepted)
-		waitFor(t, "the full warning", func() bool { return len(rec.warnings(fullMsg)) == 1 })
-
-		// A slot frees and peer A, already at its share, dials again, with the
-		// clock still inside the full warning's interval.
-		_ = heldB.Close()
-		srcDial(t, peerA)
-		waitFor(t, "the share warning", func() bool { return len(rec.warnings(overShareMsg)) == 1 })
-		if got := rec.warnings(overShareMsg)[0]; got["source"] != peerA || got["suppressed"] != "0" {
-			t.Errorf("share warning = %v, want source=%s suppressed=0", got, peerA)
-		}
-		if n := len(rec.warnings(fullMsg)); n != 1 {
-			t.Errorf("full warnings = %d, want 1", n)
-		}
+			if n := len(f.rec.warnings(fullMsg)); n != 1 {
+				t.Errorf("full warnings = %d, want 1", n)
+			}
+		})
 	})
 }
 
@@ -316,72 +298,72 @@ func TestRelayLogsWhenFullOrOverShare(t *testing.T) {
 // the limit listener, so a full relay and a refused source reach the logger
 // the relay was built with, naming the address the relay listens on.
 func TestRelayLogsLimitWarningsToItsLogger(t *testing.T) {
-	// serve builds a relay over the production seams with a recorded logger
-	// and the given connection caps, and serves it on a loopback listener.
-	serve := func(t *testing.T, total, perSource int) (*recordedLog, string) {
+	// serve builds a relay with a recorded logger and the given connection
+	// caps, and serves it by its own accept on a srcListener.
+	serve := func(t *testing.T, total, perSource int) (*recordedLog, *srcListener) {
 		t.Helper()
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatalf("listen: %v", err)
-		}
+		front := newSrcListener()
 		rec := &recordedLog{}
-		r := newRelay(portOf(t, ln.Addr()), portOf(t, ln.Addr()), nil, slog.New(rec), GateAuth{}, gateCred)
+		r := newRelay(fakeRegistryPort, fakeRegistryPort, nil, slog.New(rec), GateAuth{}, gateCred)
 		r.limits.maxConns = total
 		r.limits.maxConnsPerSource = perSource
 		ctx, cancel := context.WithCancel(t.Context())
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			_ = r.accept(ctx, ln)
+			_ = r.accept(ctx, front)
 		}()
 		t.Cleanup(func() {
 			cancel()
 			<-done
-			_ = ln.Close()
+			_ = front.Close()
 		})
-		return rec, ln.Addr().String()
+		return rec, front
 	}
-	dial := func(t *testing.T, addr string) net.Conn {
+	dial := func(t *testing.T, front *srcListener, src string) net.Conn {
 		t.Helper()
-		c, err := net.Dial("tcp", addr)
+		c, err := front.dial(src, time.Second)
 		if err != nil {
-			t.Fatalf("dial: %v", err)
+			t.Fatalf("dial from %s: %v", src, err)
 		}
 		t.Cleanup(func() { _ = c.Close() })
+		synctest.Wait()
 		return c
 	}
-	waitFor := func(t *testing.T, rec *recordedLog, msg string) map[string]string {
+	first := func(t *testing.T, rec *recordedLog, msg string) map[string]string {
 		t.Helper()
-		deadline := time.Now().Add(5 * time.Second)
-		for {
-			if got := rec.warnings(msg); len(got) > 0 {
-				return got[0]
-			}
-			if time.Now().After(deadline) {
-				t.Fatalf("no %q warning reached the relay's logger", msg)
-			}
-			time.Sleep(5 * time.Millisecond)
+		got := rec.warnings(msg)
+		if len(got) == 0 {
+			t.Fatalf("no %q warning reached the relay's logger", msg)
 		}
+		return got[0]
 	}
 
 	t.Run("a source over its share", func(t *testing.T) {
-		rec, addr := serve(t, 4, 1)
-		dial(t, addr)
-		c := dial(t, addr)
-		_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
-		if _, err := io.ReadAll(c); err != nil {
-			t.Fatalf("read the refused connection: %v", err)
-		}
-		if got := waitFor(t, rec, overShareMsg); got["addr"] != addr || got["source"] != "127.0.0.1" || got["share"] != "1" {
-			t.Errorf("share warning = %v, want addr=%s source=127.0.0.1 share=1", got, addr)
-		}
+		synctest.Test(t, func(t *testing.T) {
+			rec, front := serve(t, 4, 1)
+			dial(t, front, limitPeer)
+			c := dial(t, front, limitPeer)
+			_ = c.SetReadDeadline(time.Now().Add(time.Second))
+			if _, err := io.ReadAll(c); err != nil {
+				t.Fatalf("read the refused connection: %v", err)
+			}
+			synctest.Wait()
+			addr := front.Addr().String()
+			if got := first(t, rec, overShareMsg); got["addr"] != addr || got["source"] != limitPeer || got["share"] != "1" {
+				t.Errorf("share warning = %v, want addr=%s source=%s share=1", got, addr, limitPeer)
+			}
+		})
 	})
 
 	t.Run("a full relay", func(t *testing.T) {
-		rec, addr := serve(t, 1, 1)
-		dial(t, addr)
-		if got := waitFor(t, rec, fullMsg); got["addr"] != addr || got["limit"] != "1" {
-			t.Errorf("full warning = %v, want addr=%s limit=1", got, addr)
-		}
+		synctest.Test(t, func(t *testing.T) {
+			rec, front := serve(t, 1, 1)
+			dial(t, front, limitPeer)
+			addr := front.Addr().String()
+			if got := first(t, rec, fullMsg); got["addr"] != addr || got["limit"] != "1" {
+				t.Errorf("full warning = %v, want addr=%s limit=1", got, addr)
+			}
+		})
 	})
 }
