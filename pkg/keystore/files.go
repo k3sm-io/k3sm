@@ -24,6 +24,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -216,11 +217,11 @@ func (s *FileStore) checkOwned(fi fs.FileInfo, want fs.FileMode) error {
 // file, and never one at a wider mode or another owner. A crash before the
 // rename leaves the temporary file, which no reader opens.
 func (s *FileStore) writeFile(root *os.Root, name string, data []byte) error {
-	var suffix [8]byte
+	var suffix [tempSuffixSize]byte
 	if err := s.readRandom(suffix[:]); err != nil {
 		return fmt.Errorf("name a temporary file: %w", err)
 	}
-	tmp := "." + name + "." + hex.EncodeToString(suffix[:]) + ".tmp"
+	tmp := tempName(name, suffix)
 	f, err := root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, fileMode)
 	if err != nil {
 		return fmt.Errorf("create %s: %w", tmp, err)
@@ -252,6 +253,34 @@ func (s *FileStore) writeFile(root *os.Root, name string, data []byte) error {
 	}
 	renamed = true
 	return syncDir(root)
+}
+
+// tempSuffixSize is the size of the random part of a temporary file's name.
+const tempSuffixSize = 8
+
+// tempName is the name writeFile gives the temporary file for name:
+// ".<name>.<hex suffix>.tmp".
+func tempName(name string, suffix [tempSuffixSize]byte) string {
+	return "." + name + "." + hex.EncodeToString(suffix[:]) + ".tmp"
+}
+
+// isTempName reports whether n is the name tempName gives a temporary file
+// for name: the suffix exactly 2*tempSuffixSize lowercase hex digits.
+func isTempName(n, name string) bool {
+	rest, ok := strings.CutPrefix(n, "."+name+".")
+	if !ok {
+		return false
+	}
+	hexPart, ok := strings.CutSuffix(rest, ".tmp")
+	if !ok || len(hexPart) != 2*tempSuffixSize {
+		return false
+	}
+	for i := 0; i < len(hexPart); i++ {
+		if c := hexPart[i]; !('0' <= c && c <= '9' || 'a' <= c && c <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // syncDir fsyncs root's directory, making a rename or removal in it durable.

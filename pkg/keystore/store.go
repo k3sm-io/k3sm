@@ -28,7 +28,6 @@ import (
 	"os"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
 )
 
@@ -472,9 +471,14 @@ func openEntryDir(root *os.Root, name string) (*entry, error) {
 }
 
 // interruptedPut reports whether dir holds only what a crashed Put leaves
-// before its pointer: nothing, generation, or generation and v1, plus temporary
-// files, which no reader opens. Put writes generation before v1, so v1 without
-// generation cannot come from a crash.
+// before its pointer: nothing, generation, or generation and v1, plus
+// temporary files, which no reader opens. Put writes generation before v1, so
+// v1 without generation cannot come from a crash.
+//
+// A temporary file is a regular file named as writeFile names one for a file
+// Put writes (see putTemp); a directory, a symlink or any other dot name is
+// not one, so it makes the directory damage rather than vanish with the next
+// Put's discard.
 func interruptedPut(dir *os.Root) (bool, error) {
 	names, err := readDirNames(dir, maxDirNames)
 	if err != nil {
@@ -487,12 +491,25 @@ func interruptedPut(dir *os.Root) (bool, error) {
 			generation = true
 		case n == versionName(1):
 			v1 = true
-		case strings.HasPrefix(n, ".") && strings.HasSuffix(n, ".tmp"):
+		case putTemp(n):
+			fi, err := dir.Lstat(n)
+			if err != nil {
+				return false, err
+			}
+			if !fi.Mode().IsRegular() {
+				return false, nil
+			}
 		default:
 			return false, nil
 		}
 	}
 	return generation || !v1, nil
+}
+
+// putTemp reports whether n is the name of a temporary file writeFile makes
+// while a Put writes an entry: for generation, v1 or current.
+func putTemp(n string) bool {
+	return isTempName(n, generationName) || isTempName(n, versionName(1)) || isTempName(n, currentName)
 }
 
 // openEntryDirRaw opens name's directory without asking for a current pointer.

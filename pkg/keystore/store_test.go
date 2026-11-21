@@ -844,7 +844,7 @@ func TestEntryWithNoPointer(t *testing.T) {
 		"generation and v1": func(string) {},
 		"generation only":   func(dir string) { remove(t, filepath.Join(dir, "v1")) },
 		"a leftover temporary file": func(dir string) {
-			writeFile(t, filepath.Join(dir, "."+currentName+".0123abcd.tmp"), "half a write")
+			writeFile(t, filepath.Join(dir, "."+currentName+".0123456789abcdef.tmp"), "half a write")
 		},
 	} {
 		t.Run("interrupted put: "+name, func(t *testing.T) {
@@ -880,6 +880,21 @@ func TestEntryWithNoPointer(t *testing.T) {
 		"v2 without v1": func(dir string) {
 			copyFile(t, filepath.Join(dir, "v1"), filepath.Join(dir, "v2"))
 			remove(t, filepath.Join(dir, "v1"))
+		},
+		// Only a regular file of the exact shape writeFile creates is a
+		// temporary file.
+		"a directory named like a temporary file": func(dir string) {
+			if err := os.Mkdir(filepath.Join(dir, "."+currentName+".0123456789abcdef.tmp"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"a symlink named like a temporary file": func(dir string) {
+			if err := os.Symlink("v1", filepath.Join(dir, "."+currentName+".0123456789abcdef.tmp")); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"a dot file that is not the writer's shape": func(dir string) {
+			writeFile(t, filepath.Join(dir, ".x.tmp"), "x")
 		},
 	} {
 		t.Run("damage: "+name, func(t *testing.T) {
