@@ -13,26 +13,89 @@
 # least one is pending. Phase A is complete when --check exits 0.
 #
 # --check runs every row. --rewrap runs only Rewrap's rows, G3, G12, G13, G14
-# and U5, and only their tests, with the same exit status.
+# and U5, and only their tests, with the same exit status. Neither calls sudo.
+#
+# --root runs row R1 alone: the package's tests as root, in the deployment's
+# shape (root runs the verbs and owns the data root, the service user owns the
+# store; the tests take the service user from K3SM_KEYSTORE_TEST_UID and
+# K3SM_KEYSTORE_TEST_GID, or the local user _k3sm). It builds the test binary
+# as the invoking user and runs only that binary under sudo -n. It passes when
+# no test failed and the binary exited 0. Exit status: 0 pass; 1 fail; 3 sudo
+# -n is unavailable (run sudo -v first, or run as a user sudo lets run it).
 #
 # G1 diffs go.mod and go.sum against KEYSTORE_BASE (default: the merge base
 # with origin/main).
 #
-# Usage: hack/acceptance/keystore.sh --check|--rewrap
+# Usage: hack/acceptance/keystore.sh --check|--rewrap|--root
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 K3SM_ROOT="$(cd "$HERE/../.." && pwd)"
 
-usage() { echo "usage: $0 --check|--rewrap" >&2; exit 2; }
+usage() { echo "usage: $0 --check|--rewrap|--root" >&2; exit 2; }
 [ $# -eq 1 ] || usage
 case "$1" in
 --check) mode=check ;;
 --rewrap) mode=rewrap ;;
+--root) mode=root ;;
 *) usage ;;
 esac
 
 cd "$K3SM_ROOT"
 export CGO_ENABLED=1
+
+# run_root is --root: row R1. Only the test binary runs under sudo; the build,
+# the counting and the cleanup run as the invoking user. It is called where set
+# -e does not apply, so every step checks its own status.
+root_tmp=""
+run_root() {
+	local t out rc=0 n m f
+	t="$(mktemp -d "${TMPDIR:-/tmp}/keystore-root.XXXXXX")" || { echo "R1 FAIL as root: mktemp -d failed"; return 1; }
+	root_tmp="$t"
+	# The store refuses an unclean DataRoot, and macOS's TMPDIR ends in a
+	# slash, so the tests' temp dirs are under the canonical path.
+	t="$(cd "$t" && pwd -P)" || { echo "R1 FAIL as root: cannot resolve $root_tmp"; return 1; }
+	trap 'rm -rf "$root_tmp" 2>/dev/null || echo "keystore: could not remove $root_tmp (a root-owned leftover)" >&2' EXIT
+	if ! out="$(go test -race -c -o "$t/keystore.test" ./pkg/keystore/ 2>&1)"; then
+		printf '%s\n' "$out"
+		echo "R1 FAIL as root: the test binary did not build"
+		return 1
+	fi
+	# The committed fuzz corpus is read from ./testdata, beside the binary.
+	if ! cp -R pkg/keystore/testdata "$t/testdata" || ! mkdir "$t/tmp"; then
+		echo "R1 FAIL as root: could not lay out $t"
+		return 1
+	fi
+	if ! command -v sudo >/dev/null 2>&1; then
+		echo "R1 PENDING as root: sudo is not on PATH"
+		return 3
+	fi
+	# sudo resets the environment, so the service user's ids are passed on.
+	local ids=()
+	if [ -n "${K3SM_KEYSTORE_TEST_UID+set}" ]; then ids+=("K3SM_KEYSTORE_TEST_UID=$K3SM_KEYSTORE_TEST_UID"); fi
+	if [ -n "${K3SM_KEYSTORE_TEST_GID+set}" ]; then ids+=("K3SM_KEYSTORE_TEST_GID=$K3SM_KEYSTORE_TEST_GID"); fi
+	out="$(cd "$t" && sudo -n env TMPDIR="$t/tmp" ${ids[@]+"${ids[@]}"} ./keystore.test -test.count=1 -test.v 2>&1)" || rc=$?
+	# sudo -n that cannot run the binary prints only its own refusal.
+	if [ "$rc" -ne 0 ] && ! grep -q -- '^=== RUN' <<<"$out" && grep -q '^sudo: ' <<<"$out"; then
+		printf '%s\n' "$out"
+		echo "R1 PENDING as root: sudo -n is unavailable"
+		return 3
+	fi
+	n="$(grep -c -- '^--- PASS: ' <<<"$out" || true)"
+	m="$(grep -c -- '^--- SKIP: ' <<<"$out" || true)"
+	f="$(grep -c -- '--- FAIL: ' <<<"$out" || true)"
+	if [ "$rc" -eq 0 ] && [ "$f" -eq 0 ]; then
+		echo "R1 PASS as root: $n tests passed, $m skipped"
+		return 0
+	fi
+	printf '%s\n' "$out" | grep -E -- '^ *(--- FAIL|FAIL|panic:)|_test\.go:[0-9]+:' || true
+	echo "R1 FAIL as root: $n tests passed, $m skipped"
+	return 1
+}
+if [ "$mode" = root ]; then
+	rc=0
+	run_root || rc=$?
+	exit "$rc"
+fi
 
 # The tests Rewrap's rows name; --rewrap runs only these.
 rewrap_tests="TestSealNonceIsFresh TestRewrapChangesEveryNonce TestRewrapCrashAtEveryStep TestRewrapMasterRenameCompleted"
