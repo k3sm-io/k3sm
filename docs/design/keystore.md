@@ -412,8 +412,12 @@ That is a pointer lost to damage or to an interrupted Delete, with sealed record
 disk. `List` returns it with `Err` set, wrapping `ErrCorrupt`, and `rm` removes the directory
 and its floor entry, since `rm` reads nothing inside an entry. Put of that name answers
 `ErrExists` and touches nothing, so no Put silently deletes versions an operator can still
-see. One case cannot be told apart: a one-version entry that lost `current` is `generation`
-and `v1`, the same as an incomplete Put, so the next Put discards it without saying so. The
+see. One case cannot be told apart by its shape: a one-version entry that lost `current` is `generation`
+and `v1`, the same as an incomplete Put, so the next Put discards it without saying so. Put
+over an entry whose `current` was lost thus discards that entry's sealed `v1`; what tells a
+lost pointer from a crashed Put is the pointer floor that lands with Rotate ("Pointer
+sequence and floor"), since Put records the floor entry only after `current`, so a crashed
+Put has none for the name and an entry that lost its pointer does. The
 loss is that one version, and the restore procedure under "Backup and snapshots" is what
 recovers it.
 
