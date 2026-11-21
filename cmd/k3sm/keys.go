@@ -323,7 +323,8 @@ func runKeysWith(ctx context.Context, args []string, env keysEnv) int {
 // readValue reads a value from --in: a file, or "-" for stdin. A terminal on
 // stdin is refused, because a value typed there is echoed and kept in
 // scrollback. It reads at most one byte over the store's cap, so an
-// oversized input is refused without reading it all.
+// oversized input is refused without reading it all, into one buffer the
+// caller clears.
 func (v *keysVerb) readValue(in string) ([]byte, error) {
 	var r io.Reader
 	switch in {
@@ -342,16 +343,20 @@ func (v *keysVerb) readValue(in string) ([]byte, error) {
 		defer func() { _ = f.Close() }() // read-only
 		r = f
 	}
-	b, err := io.ReadAll(io.LimitReader(r, keystore.MaxValueSize+1))
-	if err != nil {
-		clear(b)
+	// One buffer, allocated before the read and never grown, so the value
+	// has no copy elsewhere on the heap and the caller's clear covers it.
+	buf := make([]byte, keystore.MaxValueSize+1)
+	n, err := io.ReadFull(r, buf)
+	switch {
+	case err == nil:
+		clear(buf)
+		return nil, fmt.Errorf("the value is over the %d-byte limit", keystore.MaxValueSize)
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+		return buf[:n], nil
+	default:
+		clear(buf)
 		return nil, fmt.Errorf("read the value: %w", err)
 	}
-	if len(b) > keystore.MaxValueSize {
-		clear(b)
-		return nil, fmt.Errorf("the value is over the %d-byte limit", keystore.MaxValueSize)
-	}
-	return b, nil
 }
 
 func keysPut(ctx context.Context, args []string, env keysEnv) int {

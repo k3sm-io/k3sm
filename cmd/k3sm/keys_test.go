@@ -34,6 +34,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"testing/iotest"
 
 	"k3sm.io/k3sm/pkg/keystore"
 )
@@ -615,6 +616,33 @@ func TestKeysRefusals(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestKeysReadValueOneBuffer: readValue reads into one buffer of the cap plus
+// one byte, allocated before the read, so the value it returns is that buffer
+// and clearing it clears every copy; a reader that returns a byte at a time
+// is read in full, and one over the cap is refused.
+func TestKeysReadValueOneBuffer(t *testing.T) {
+	read := func(r io.Reader) ([]byte, error) {
+		var stderr bytes.Buffer
+		env := keysEnv{stdin: r, stdinTTY: func() bool { return false }, stderr: &stderr}
+		return newKeysVerb("put", env).readValue("-")
+	}
+	want := bytes.Repeat([]byte("v"), 3000)
+	b, err := read(iotest.OneByteReader(bytes.NewReader(want)))
+	if err != nil || !bytes.Equal(b, want) {
+		t.Fatalf("readValue = %d bytes, %v; want the %d bytes", len(b), err, len(want))
+	}
+	if cap(b) != keystore.MaxValueSize+1 {
+		t.Fatalf("the value's buffer has cap %d, want the one preallocated buffer of %d", cap(b), keystore.MaxValueSize+1)
+	}
+	over := bytes.Repeat([]byte("v"), keystore.MaxValueSize+1)
+	if b, err := read(bytes.NewReader(over)); err == nil || b != nil {
+		t.Fatalf("readValue over the cap = %d bytes, %v; want a refusal", len(b), err)
+	}
+	if _, err := read(iotest.ErrReader(errors.New("boom"))); err == nil {
+		t.Fatal("readValue hid a read error")
+	}
 }
 
 func TestKeysStoreConfigFromLayout(t *testing.T) {
