@@ -61,7 +61,9 @@ interrupted rewrap instead of yours (run it again with a new key).
 A value never comes from the command line. Anything there is visible to every local user through
 `ps` and is saved in your shell history. `put` and `rotate` read the value from:
 
-- `--in FILE`: a file. Keep it readable by root only, and delete it once the value is stored.
+- `--in FILE`: a regular file. A symlink, FIFO or directory is refused. Keep the file readable
+  by root only, and delete it once the value is stored; a file group or others can read draws a
+  warning.
 - `--in -`: standard input, which is also the default. The value must be piped in:
 
   ```

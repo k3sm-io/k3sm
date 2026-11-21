@@ -336,9 +336,9 @@ func (v *keysVerb) readValue(in string) ([]byte, error) {
 		}
 		r = v.env.stdin
 	default:
-		f, err := os.Open(in)
+		f, err := v.openValueFile(in)
 		if err != nil {
-			return nil, fmt.Errorf("open --in: %w", err)
+			return nil, err
 		}
 		defer func() { _ = f.Close() }() // read-only
 		r = f
@@ -357,6 +357,30 @@ func (v *keysVerb) readValue(in string) ([]byte, error) {
 		clear(buf)
 		return nil, fmt.Errorf("read the value: %w", err)
 	}
+}
+
+// openValueFile opens --in FILE for reading: a regular file, reached without
+// following a symlink, and opened non-blocking so a FIFO is refused rather
+// than waited on. A file group or others can read is used, with a warning:
+// the value is already exposed there.
+func (v *keysVerb) openValueFile(path string) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open --in: %w", err)
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		_ = f.Close() // read-only
+		return nil, fmt.Errorf("stat --in: %w", err)
+	}
+	if !fi.Mode().IsRegular() {
+		_ = f.Close() // read-only
+		return nil, fmt.Errorf("--in %s is not a regular file", path)
+	}
+	if fi.Mode().Perm()&0o044 != 0 {
+		fmt.Fprintf(v.env.stderr, "k3sm keys %s: warning: %s is mode %04o, readable by group or others: keep a value file readable by root only, and delete it once stored\n", v.name, path, fi.Mode().Perm())
+	}
+	return f, nil
 }
 
 func keysPut(ctx context.Context, args []string, env keysEnv) int {

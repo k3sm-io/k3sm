@@ -645,6 +645,69 @@ func TestKeysReadValueOneBuffer(t *testing.T) {
 	}
 }
 
+// TestKeysInFileChecks: --in FILE reads only a regular file, reached without
+// following a symlink and without blocking on a FIFO, and warns when group or
+// others can read it.
+func TestKeysInFileChecks(t *testing.T) {
+	for name, mk := range map[string]func(t *testing.T, p string){
+		"directory": func(t *testing.T, p string) {
+			if err := os.Mkdir(p, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"fifo": func(t *testing.T, p string) {
+			if err := syscall.Mkfifo(p, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"symlink": func(t *testing.T, p string) {
+			target := p + ".target"
+			if err := os.WriteFile(target, []byte("v"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, p); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run("refuses a "+name, func(t *testing.T) {
+			h := newKeysHarness(t)
+			p := filepath.Join(t.TempDir(), "value")
+			mk(t, p)
+			h.calls = nil
+			h.mustRun(1, "put", "system/a", "--in", p)
+			if slices.Contains(h.calls, "Put") {
+				t.Fatal("put ran")
+			}
+		})
+	}
+	t.Run("warns on a group-readable file", func(t *testing.T) {
+		h := newKeysHarness(t)
+		p := filepath.Join(t.TempDir(), "value")
+		if err := os.WriteFile(p, []byte("v"), 0o640); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(p, 0o640); err != nil {
+			t.Fatal(err)
+		}
+		h.mustRun(0, "put", "system/a", "--in", p)
+		if !strings.Contains(h.stderr.String(), "group or others") {
+			t.Errorf("stderr %q does not warn", h.stderr.String())
+		}
+	})
+	t.Run("no warning on a root-only file", func(t *testing.T) {
+		h := newKeysHarness(t)
+		p := filepath.Join(t.TempDir(), "value")
+		if err := os.WriteFile(p, []byte("v"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		h.mustRun(0, "put", "system/a", "--in", p)
+		if h.stderr.Len() != 0 {
+			t.Errorf("stderr %q, want nothing", h.stderr.String())
+		}
+	})
+}
+
 func TestKeysStoreConfigFromLayout(t *testing.T) {
 	h := newKeysHarness(t)
 	h.mustRun(0, "list")
