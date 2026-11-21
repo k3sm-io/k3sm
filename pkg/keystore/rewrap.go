@@ -17,6 +17,7 @@ limitations under the License.
 package keystore
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"errors"
@@ -484,7 +485,9 @@ func (s *FileStore) sealNew(ctx context.Context, root *os.Root, fl floor, plan [
 }
 
 // commitNew is step 4: once every record is under next or has its .new,
-// each .new, which must open under next as the record it replaces, is renamed
+// each .new, which must open under next as the record it replaces and hold
+// its plaintext, kind and created time (else ErrCorrupt, and it is not
+// renamed), is renamed
 // over its record, the pointer last in each entry, and the entry's directory
 // fsynced. A .new beside a record already under next is removed. A record
 // that opens under neither stops the Rewrap before the master is swapped.
@@ -498,10 +501,17 @@ func (s *FileStore) commitNew(ctx context.Context, root *os.Root, fl floor, plan
 			return err
 		}
 		err = eachRecord(ctx, p.cur, func(file string, pointer bool, version uint64) error {
-			_, _, err := e.openRecord(old, file, pointer, version)
+			r, pt, err := e.openRecord(old, file, pointer, version)
 			if err == nil {
-				if _, _, err := e.openRecord(next, file+newSuffix, pointer, version); err != nil {
+				defer clear(pt)
+				nr, npt, err := e.openRecord(next, file+newSuffix, pointer, version)
+				if err != nil {
 					return err
+				}
+				same := nr.kind == r.kind && nr.created == r.created && bytes.Equal(npt, pt)
+				clear(npt)
+				if !same {
+					return fmt.Errorf("%w: %s%s does not hold the record it replaces", ErrCorrupt, file, newSuffix)
 				}
 				if err := e.root.Rename(file+newSuffix, file); err != nil {
 					return err
@@ -534,8 +544,10 @@ func (s *FileStore) commitNew(ctx context.Context, root *os.Root, fl floor, plan
 // master.next.sha256 over master.sha256, each rename fsynced. Content goes
 // first: after a crash between the two, master holds the new key and matches
 // master.next.sha256, which readMaster trusts and finishSwap completes.
-// master.next is read again first, so the key the records were sealed under
-// is the one that becomes the master.
+// master.next is read again first, and master read back after its rename,
+// so the key the records were sealed under is the one that becomes the
+// master; otherwise it stops with ErrMasterUntrusted before the fingerprint
+// rename.
 func (s *FileStore) swapMaster(mroot *os.Root, next keys) error {
 	raw, err := s.readNext(mroot)
 	if err != nil {
@@ -556,9 +568,32 @@ func (s *FileStore) swapMaster(mroot *os.Root, next keys) error {
 		if err := syncDir(mroot); err != nil {
 			return err
 		}
+		if r[1] == masterName {
+			if err := s.checkMasterIs(mroot, next); err != nil {
+				return err
+			}
+		}
 		if err := s.step("rename " + r[0]); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// checkMasterIs refuses, as ErrMasterUntrusted, a master file that is not the
+// key k was derived from.
+func (s *FileStore) checkMasterIs(mroot *os.Root, k keys) error {
+	raw, err := s.readKeyFile(mroot, masterName)
+	if err != nil {
+		return fmt.Errorf("%w: read the master back after its rename: %w", ErrMasterUntrusted, err)
+	}
+	got, err := deriveKeys(raw, s.scope)
+	clear(raw)
+	if err != nil {
+		return err
+	}
+	if !hmac.Equal(got.seal, k.seal) {
+		return fmt.Errorf("%w: %s changed during the swap", ErrMasterUntrusted, masterName)
 	}
 	return nil
 }

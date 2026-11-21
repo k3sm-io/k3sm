@@ -20,6 +20,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -636,4 +638,112 @@ func TestRewrapRefusesStalePointer(t *testing.T) {
 		t.Fatalf("Rewrap over a copied-back pointer: %v, want the floor's refusal", err)
 	}
 	checkTreeUnchanged(t, snap, treeSnapshot(t, filepath.Dir(server)))
+}
+
+// sealUnder seals value as version version of entry name under key, with the
+// entry's generation and the kind and created time of the record at file:
+// a record that belongs exactly where file is, under key, holding value.
+func sealUnder(t *testing.T, server, name, file string, key, value []byte) []byte {
+	t.Helper()
+	b, err := os.ReadFile(entryPath(server, name, file))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := parseRecord(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := os.ReadFile(entryPath(server, name, generationName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gen [generationSize]byte
+	if _, err := hex.Decode(gen[:], g[:2*generationSize]); err != nil {
+		t.Fatal(err)
+	}
+	k := mustDeriveKeys(t, key, scopeSystem)
+	out := record{kind: r.kind, name: name, version: r.version, generation: gen, created: r.created}
+	if err := out.seal(k.seal, k.scope, value, rand.Reader); err != nil {
+		t.Fatal(err)
+	}
+	return out.marshal()
+}
+
+// TestRewrapVerifiesCommit: what step 4 renames in and step 5 swaps in is
+// checked first. A .new must open under the new key and hold the very record
+// it replaces, or the Rewrap stops with ErrCorrupt and leaves the record; and
+// the master must be the key the records were sealed under both before its
+// rename (master.next read again) and after it (master read back), or the
+// Rewrap stops with ErrMasterUntrusted.
+func TestRewrapVerifiesCommit(t *testing.T) {
+	ctx := context.Background()
+	t.Run("a .new holding another value is refused", func(t *testing.T) {
+		s, server := newTestStore(t)
+		vals := seedRewrap(t, s)
+		before, err := os.ReadFile(entryPath(server, "b", "v1"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Once step 4 has begun, b/v1.new is replaced by a record that opens
+		// under the new key, in b/v1's place, holding another value.
+		s.step = func(name string) error {
+			if name == "rename a/v1" {
+				writeFile(t, entryPath(server, "b", "v1"+newSuffix), string(sealUnder(t, server, "b", "v1", rewrapKey(1), []byte("forged"))))
+			}
+			return nil
+		}
+		if err := s.Rewrap(ctx, rewrapKey(1)); !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("Rewrap over a .new holding another value: %v, want ErrCorrupt", err)
+		}
+		s.step = func(string) error { return nil }
+		if now, _ := os.ReadFile(entryPath(server, "b", "v1")); !bytes.Equal(now, before) {
+			t.Fatal("b/v1 was replaced by the forged .new")
+		}
+		checkRewrapValues(t, s, vals)
+	})
+	t.Run("master.next replaced before the swap is refused", func(t *testing.T) {
+		s, server := newTestStore(t)
+		seedRewrap(t, s)
+		old, err := os.ReadFile(masterPath(server, masterName))
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.step = func(name string) error {
+			if name == "rename b/current" {
+				plantNext(t, server, rewrapKey(9))
+			}
+			return nil
+		}
+		if err := s.Rewrap(ctx, rewrapKey(1)); !errors.Is(err, ErrMasterUntrusted) {
+			t.Fatalf("Rewrap with master.next replaced: %v, want ErrMasterUntrusted", err)
+		}
+		if now, _ := os.ReadFile(masterPath(server, masterName)); !bytes.Equal(now, old) {
+			t.Fatalf("master = %x, want the old master left in place", now)
+		}
+	})
+	t.Run("a master replaced after its rename is refused", func(t *testing.T) {
+		s, server := newTestStore(t)
+		seedRewrap(t, s)
+		// The fsync after the first master rename stands in for a swap of
+		// master between that rename and the read back.
+		swapped := false
+		setSyncDir(t, func(root *os.Root) error {
+			if !swapped && filepath.Base(root.Name()) == "keystore-master" {
+				if b, _ := os.ReadFile(masterPath(server, masterName)); bytes.Equal(b, rewrapKey(1)) {
+					writeFile(t, masterPath(server, masterName), string(rewrapKey(9)))
+					swapped = true
+				}
+			}
+			return fsyncDir(root)
+		})
+		if err := s.Rewrap(ctx, rewrapKey(1)); !errors.Is(err, ErrMasterUntrusted) {
+			t.Fatalf("Rewrap with master replaced after its rename: %v, want ErrMasterUntrusted", err)
+		}
+		if !swapped {
+			t.Fatal("the master was never swapped")
+		}
+		if _, err := os.Lstat(masterPath(server, masterNextFingerprintName)); err != nil {
+			t.Fatalf("the fingerprint was renamed over a master that is not the new key: %v", err)
+		}
+	})
 }

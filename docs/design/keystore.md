@@ -588,8 +588,10 @@ the conservative way:
   renamed every `.new` in, none is left, but the records are under `master.next`. Otherwise it
   is `ErrMasterUntrusted`. A `.new` file with no `master.next` is refused the same way.
 - *Before each rename* in step 4 the `.new` must open under the new key as the record it
-  replaces, and before step 5 `master.next` is read again and must be the key the records were
-  sealed under.
+  replaces and hold the same plaintext, kind and `created` as that record opened under the live
+  key; otherwise it is `ErrCorrupt` and is not renamed. Before step 5 `master.next` is read
+  again, and after its rename `master` is read back; each must be the key the records were
+  sealed under, or the Rewrap stops with `ErrMasterUntrusted` before the fingerprint rename.
 - *Completing the swap.* Every verb that takes the exclusive lock (Put, Rotate, Delete,
   `RaiseFloor`, Rewrap) finishes the second rename first; readers trust the master and write
   nothing. A Rewrap that finishes it has completed the interrupted one and stops with
