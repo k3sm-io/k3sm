@@ -35,18 +35,27 @@ var (
 	floorOwnerCopies = map[string]bool{"floorUID": true, "floorGID": true}
 )
 
+// keystoreImportPath is the package whose Config and FileStore the guard
+// follows through import names and type aliases.
+const keystoreImportPath = "k3sm.io/k3sm/pkg/keystore"
+
 // TestFloorOwnerUnsetOutsideTests is G6's guard on the floor's owner: no
 // file of the module but a _test.go file sets Config.FloorUID or FloorGID,
 // in a keyed or unkeyed composite literal, an assignment, a range clause,
 // an increment or by taking its address; and nothing but New in store.go
-// sets FileStore's floorUID or floorGID. Their declarations and checkConfig
-// only declare and read them, which this does not count.
+// sets FileStore's floorUID or floorGID, keyed or unkeyed. A literal's type
+// is followed through the name keystore is imported under and through type
+// aliases declared anywhere in its package. Their declarations and
+// checkConfig only declare and read them, which this does not count.
 func TestFloorOwnerUnsetOutsideTests(t *testing.T) {
 	root := moduleRoot(t)
-	idx := configFloorIndex(t, filepath.Join(root, "pkg", "keystore", "store.go"))
+	facts := newGuardFacts(t, filepath.Join(root, "pkg", "keystore", "store.go"))
 	fset := token.NewFileSet()
-	files := 0
-	var sets []string
+	type parsed struct {
+		f   *ast.File
+		rel string
+	}
+	var files []parsed
 	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -64,31 +73,55 @@ func TestFloorOwnerUnsetOutsideTests(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		files++
 		rel, err := filepath.Rel(root, p)
 		if err != nil {
 			return err
 		}
-		for _, pos := range floorOwnerSets(f, filepath.ToSlash(rel), idx) {
-			sets = append(sets, fset.Position(pos).String())
-		}
+		files = append(files, parsed{f, filepath.ToSlash(rel)})
 		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if files < 100 {
-		t.Fatalf("walked %d non-test files under %s: not the module", files, root)
+	if len(files) < 100 {
+		t.Fatalf("walked %d non-test files under %s: not the module", len(files), root)
+	}
+	// Aliases first, since one file may alias the type another uses.
+	for _, p := range files {
+		facts.addAliases(p.f, p.rel)
+	}
+	var sets []string
+	for _, p := range files {
+		for _, pos := range facts.floorOwnerSets(p.f, p.rel) {
+			sets = append(sets, fset.Position(pos).String())
+		}
 	}
 	if len(sets) > 0 {
 		t.Fatalf("the floor's owner is set outside a _test.go file (or FileStore's copy outside New), so a production store could trust a floor root does not own:\n%s", strings.Join(sets, "\n"))
 	}
 }
 
-// configFloorIndex is the position, from 0, of the first floor owner field
-// among Config's fields as declared in path: an unkeyed Config literal with
-// more elements than that sets it.
-func configFloorIndex(t *testing.T, path string) int {
+// guardFacts is what the guard knows of the keystore package: where the
+// owner fields sit in Config and FileStore, for unkeyed literals, and the
+// type aliases of either, by package directory.
+type guardFacts struct {
+	configIdx, storeIdx int
+	aliases             map[string]map[string]string // dir -> alias -> "Config" or "FileStore"
+}
+
+func newGuardFacts(t *testing.T, storeGo string) *guardFacts {
+	t.Helper()
+	return &guardFacts{
+		configIdx: fieldIndex(t, storeGo, "Config", floorOwnerFields),
+		storeIdx:  fieldIndex(t, storeGo, "FileStore", floorOwnerCopies),
+		aliases:   map[string]map[string]string{},
+	}
+}
+
+// fieldIndex is the position, from 0, of the first of fields among the
+// struct typeName's fields as declared in path: an unkeyed literal with more
+// elements than that sets it.
+func fieldIndex(t *testing.T, path, typeName string, fields map[string]bool) int {
 	t.Helper()
 	f, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.SkipObjectResolution)
 	if err != nil {
@@ -97,7 +130,7 @@ func configFloorIndex(t *testing.T, path string) int {
 	idx := -1
 	ast.Inspect(f, func(n ast.Node) bool {
 		ts, ok := n.(*ast.TypeSpec)
-		if !ok || ts.Name.Name != "Config" {
+		if !ok || ts.Name.Name != typeName {
 			return true
 		}
 		st, ok := ts.Type.(*ast.StructType)
@@ -110,7 +143,7 @@ func configFloorIndex(t *testing.T, path string) int {
 				i++ // an embedded field
 			}
 			for _, nm := range fl.Names {
-				if floorOwnerFields[nm.Name] && idx < 0 {
+				if fields[nm.Name] && idx < 0 {
 					idx = i
 				}
 				i++
@@ -119,15 +152,99 @@ func configFloorIndex(t *testing.T, path string) int {
 		return false
 	})
 	if idx < 0 {
-		t.Fatalf("no Config with a floor owner field in %s", path)
+		t.Fatalf("no %s with a floor owner field in %s", typeName, path)
 	}
 	return idx
 }
 
+// fileScope is how a file can name the keystore package's types: the names
+// it imports the package under, whether it is that package or dot-imports
+// it, and its package's aliases.
+type fileScope struct {
+	names   map[string]bool
+	bare    bool
+	aliases map[string]string
+}
+
+func (g *guardFacts) scope(f *ast.File, rel string) fileScope {
+	dir := pathDir(rel)
+	sc := fileScope{names: map[string]bool{}, bare: dir == "pkg/keystore" && f.Name.Name == "keystore", aliases: g.aliases[dir]}
+	for _, im := range f.Imports {
+		if strings.Trim(im.Path.Value, `"`) != keystoreImportPath {
+			continue
+		}
+		switch {
+		case im.Name == nil:
+			sc.names["keystore"] = true
+		case im.Name.Name == ".":
+			sc.bare = true
+		case im.Name.Name != "_":
+			sc.names[im.Name.Name] = true
+		}
+	}
+	return sc
+}
+
+func pathDir(rel string) string {
+	if i := strings.LastIndex(rel, "/"); i >= 0 {
+		return rel[:i]
+	}
+	return "."
+}
+
+// keystoreType is "Config" or "FileStore" when e names that type of the
+// keystore package in sc, else "".
+func (sc fileScope) keystoreType(e ast.Expr) string {
+	switch x := e.(type) {
+	case *ast.ParenExpr:
+		return sc.keystoreType(x.X)
+	case *ast.Ident:
+		if sc.bare && (x.Name == "Config" || x.Name == "FileStore") {
+			return x.Name
+		}
+		return sc.aliases[x.Name]
+	case *ast.SelectorExpr:
+		if id, ok := x.X.(*ast.Ident); ok && sc.names[id.Name] && (x.Sel.Name == "Config" || x.Sel.Name == "FileStore") {
+			return x.Sel.Name
+		}
+	}
+	return ""
+}
+
+// addAliases records f's type aliases of Config or FileStore for its
+// package, an alias of an alias included.
+func (g *guardFacts) addAliases(f *ast.File, rel string) {
+	dir := pathDir(rel)
+	for changed := true; changed; {
+		changed = false
+		sc := g.scope(f, rel)
+		ast.Inspect(f, func(n ast.Node) bool {
+			ts, ok := n.(*ast.TypeSpec)
+			if !ok || !ts.Assign.IsValid() {
+				return true
+			}
+			if k := sc.keystoreType(ts.Type); k != "" && g.aliases[dir][ts.Name.Name] != k {
+				if g.aliases[dir] == nil {
+					g.aliases[dir] = map[string]string{}
+				}
+				g.aliases[dir][ts.Name.Name] = k
+				changed = true
+			}
+			return true
+		})
+	}
+}
+
 // TestFloorOwnerSets: the walk counts every way to set the fields, and not
-// a read; FileStore's copies count outside New in store.go only.
+// a read; FileStore's copies count outside New in store.go only; a
+// literal's type is followed through import names and aliases.
 func TestFloorOwnerSets(t *testing.T) {
-	const idx = 5 // Config{Dir, MasterDir, UID, GID, DataRoot, FloorUID, FloorGID}
+	facts := newGuardFacts(t, "store.go")
+	const imp = "import \"" + keystoreImportPath + "\"\n"
+	const impAs = "import ks \"" + keystoreImportPath + "\"\n"
+	unkeyedConfig := "{" + strings.Repeat("0, ", facts.configIdx+1) + "}"
+	shortConfig := "{" + strings.Repeat("0, ", facts.configIdx) + "}"
+	unkeyedStore := "{" + strings.Repeat("0, ", facts.storeIdx+1) + "}"
 	for _, tc := range []struct {
 		file, src string
 		want      int
@@ -139,9 +256,18 @@ func TestFloorOwnerSets(t *testing.T) {
 		{"x.go", "func f(c *Config) *int { return &c.FloorGID }", 1},
 		{"x.go", "func f(c *Config) { for c.FloorUID = range 3 {} }", 1},
 		{"x.go", "func f(c *Config) { for _, c.FloorGID = range []int{1} {} }", 1},
-		{"x.go", `var c = Config{"/a", "/b", 1, 1, "/c", 7, 7}`, 1},
-		{"x.go", `var c = keystore.Config{"/a", "/b", 1, 1, "/c", 7, 7}`, 1},
-		{"x.go", `var c = Config{"/a", "/b", 1, 1, "/c"}`, 0},
+		{"pkg/keystore/x.go", "var c = Config" + unkeyedConfig, 1},
+		{"pkg/keystore/x.go", "var c = Config" + shortConfig, 0},
+		{"x.go", imp + "var c = keystore.Config" + unkeyedConfig, 1},
+		{"x.go", impAs + "var c = ks.Config" + unkeyedConfig, 1},
+		{"x.go", impAs + "var c = keystore.Config" + unkeyedConfig, 0},
+		{"x.go", "var c = Config" + unkeyedConfig, 0}, // another package's Config
+		{"x.go", impAs + "type C = ks.Config\nvar c = C" + unkeyedConfig, 1},
+		{"x.go", impAs + "type C = ks.Config\ntype D = C\nvar c = D" + unkeyedConfig, 1},
+		{"x.go", impAs + "type C ks.Config\nvar c = C" + unkeyedConfig, 0}, // a defined type, not the store's
+		{"pkg/keystore/x.go", "var s = FileStore" + unkeyedStore, 1},
+		{"pkg/keystore/store.go", "func New(cfg Config) *FileStore { return &FileStore" + unkeyedStore + " }", 0},
+		{"x.go", impAs + "type S = ks.FileStore\nvar s = S" + unkeyedStore, 1},
 		{"x.go", "func f(s *FileStore) { s.floorUID = 1 }", 1},
 		{"pkg/keystore/store.go", "func g(s *FileStore) { s.floorGID = 1 }", 1},
 		{"pkg/keystore/store.go", "func New(cfg Config) *FileStore { return &FileStore{floorUID: cfg.FloorUID} }", 0},
@@ -151,20 +277,27 @@ func TestFloorOwnerSets(t *testing.T) {
 		{"x.go", "func f(c *Config) bool { return c.FloorGID < 0 }", 0},
 		{"x.go", "type Config struct{ FloorUID, FloorGID int }", 0},
 	} {
-		f, err := parser.ParseFile(token.NewFileSet(), "x.go", "package x\n"+tc.src, parser.SkipObjectResolution)
-		if err != nil {
-			t.Fatal(err)
+		pkg := "x"
+		if pathDir(tc.file) == "pkg/keystore" {
+			pkg = "keystore"
 		}
-		if got := len(floorOwnerSets(f, tc.file, idx)); got != tc.want {
+		f, err := parser.ParseFile(token.NewFileSet(), tc.file, "package "+pkg+"\n"+tc.src, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.src, err)
+		}
+		g := &guardFacts{configIdx: facts.configIdx, storeIdx: facts.storeIdx, aliases: map[string]map[string]string{}}
+		g.addAliases(f, tc.file)
+		if got := len(g.floorOwnerSets(f, tc.file)); got != tc.want {
 			t.Errorf("%s in %s: %d sets, want %d", tc.src, tc.file, got, tc.want)
 		}
 	}
 }
 
 // floorOwnerSets returns where f, at rel (slash-separated, from the module
-// root), sets a floor owner field: Config's anywhere, given floorIdx (see
-// configFloorIndex), and FileStore's copies anywhere but New in store.go.
-func floorOwnerSets(f *ast.File, rel string, floorIdx int) []token.Pos {
+// root), sets a floor owner field: Config's anywhere, and FileStore's copies
+// anywhere but New in store.go, keyed or unkeyed.
+func (g *guardFacts) floorOwnerSets(f *ast.File, rel string) []token.Pos {
+	sc := g.scope(f, rel)
 	var out []token.Pos
 	inspect := func(root ast.Node, copiesAllowed bool) {
 		owner := func(e ast.Expr) bool {
@@ -184,8 +317,17 @@ func floorOwnerSets(f *ast.File, rel string, floorIdx int) []token.Pos {
 						out = append(out, kv.Pos())
 					}
 				}
-				if !keyed && isConfigType(x.Type) && len(x.Elts) > floorIdx {
-					out = append(out, x.Pos())
+				if !keyed {
+					switch sc.keystoreType(x.Type) {
+					case "Config":
+						if len(x.Elts) > g.configIdx {
+							out = append(out, x.Pos())
+						}
+					case "FileStore":
+						if !copiesAllowed && len(x.Elts) > g.storeIdx {
+							out = append(out, x.Pos())
+						}
+					}
 				}
 			case *ast.AssignStmt:
 				for _, l := range x.Lhs {
@@ -217,19 +359,6 @@ func floorOwnerSets(f *ast.File, rel string, floorIdx int) []token.Pos {
 		inspect(d, constructor)
 	}
 	return out
-}
-
-// isConfigType reports whether a composite literal's type is the store's
-// Config: Config, or keystore.Config.
-func isConfigType(e ast.Expr) bool {
-	switch x := e.(type) {
-	case *ast.Ident:
-		return x.Name == "Config"
-	case *ast.SelectorExpr:
-		id, ok := x.X.(*ast.Ident)
-		return ok && id.Name == "keystore" && x.Sel.Name == "Config"
-	}
-	return false
 }
 
 // isOwnerSel reports whether e, parentheses removed, selects a field named
