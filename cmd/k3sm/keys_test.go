@@ -1320,6 +1320,29 @@ func TestKeysDocsSayWhatTheVerbsDo(t *testing.T) {
 	}
 }
 
+// TestKeysWriteKeyOutFailureReturnsNoHandle: every failure of writeKeyOut
+// returns no keyOutFile, so no caller can delete through a closed root.
+func TestKeysWriteKeyOutFailureReturnsNoHandle(t *testing.T) {
+	key := bytes.Repeat([]byte{1}, 32)
+	for _, step := range []string{"chmod", "write", "sync"} {
+		p := filepath.Join(t.TempDir(), "new-master")
+		out, err := writeKeyOut(p, key, func(s string) error {
+			if s == step {
+				return fmt.Errorf("injected %s failure", s)
+			}
+			return nil
+		})
+		if err == nil || out != nil {
+			t.Fatalf("writeKeyOut failing at %s = %v, %v; want an error and no handle", step, out, err)
+		}
+	}
+	for _, p := range []string{"relative", "/nonexistent/new-master"} {
+		if out, err := writeKeyOut(p, key, nil); err == nil || out != nil {
+			t.Fatalf("writeKeyOut(%q) = %v, %v; want an error and no handle", p, out, err)
+		}
+	}
+}
+
 // keysHalfRewrapStore stands in for a rewrap interrupted after it renamed
 // some records in, whose master.next was then replaced or removed, the
 // scenario of pkg/keystore's TestRewrapRecoversReplacedNext. Its Rewrap runs

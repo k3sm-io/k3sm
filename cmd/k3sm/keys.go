@@ -797,6 +797,8 @@ func writeKeyOut(path string, key []byte, step func(string) error) (out *keyOutF
 	}
 	defer func() {
 		if err != nil {
+			// No handle to a closed root, whatever a return above passed.
+			out = nil
 			_ = root.Close() // synced below when a file is written
 		}
 	}()
