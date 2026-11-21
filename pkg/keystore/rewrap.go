@@ -156,7 +156,10 @@ func (s *FileStore) rewrap(ctx context.Context, newMaster []byte, p *rewrapProgr
 	done, err := s.finishSwap(mroot)
 	if err != nil {
 		// done with an error: the swap moved, then its sync or step failed.
-		p.resuming = done
+		if done {
+			p.resuming = true
+			return fmt.Errorf("%w (%w)", err, ErrRewrapSwapUnsynced)
+		}
 		return err
 	}
 	k, err := s.loadMaster()

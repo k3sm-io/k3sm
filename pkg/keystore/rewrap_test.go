@@ -1307,6 +1307,11 @@ func TestRewrapResumeFailed(t *testing.T) {
 			if !errors.Is(err, ErrRewrapResumeFailed) || errors.Is(err, ErrRewrapNotStarted) {
 				t.Fatalf("Rewrap failing a resume at %s = %v, want ErrRewrapResumeFailed and not ErrRewrapNotStarted", tc.resume, err)
 			}
+			// Only a failure after the swap's last rename has completed the
+			// earlier rewrap.
+			if swap := tc.resume == "rename "+masterNextFingerprintName; errors.Is(err, ErrRewrapSwapUnsynced) != swap {
+				t.Fatalf("Rewrap failing a resume at %s = %v; ErrRewrapSwapUnsynced matches %v, want %v", tc.resume, err, !swap, swap)
+			}
 			// The earlier key finishes it: a rerun with it completes the
 			// rewrap, or, when the failed step came after the last rename,
 			// finds that key already live.

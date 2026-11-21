@@ -140,7 +140,11 @@ If `rewrap` instead fails while finishing that earlier rewrap, it says:
 an earlier interrupted rewrap was advanced and did not finish; keep the earlier rewrap's key file; finish with: sudo k3sm keys rewrap --key-in <that earlier file>
 ```
 
-The earlier rewrap's key file is the one to finish with. `rewrap` keeps this run's `FILE` too;
+If what failed was the last step of that earlier rewrap, after its master key was already
+swapped in, it says instead "the earlier rewrap's master swap completed but did not sync; run sudo
+k3sm keys rewrap --key-out FILE again": that rewrap is done, and a new one retires its key.
+
+Otherwise, the earlier rewrap's key file is the one to finish with. `rewrap` keeps this run's `FILE` too;
 it was never used, so delete it once the earlier rewrap is finished.
 
 If `rewrap` refuses because `keystore/.user` exists, this build cannot re-seal what that path

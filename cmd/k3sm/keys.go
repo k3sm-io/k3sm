@@ -1006,18 +1006,34 @@ func keyFlag(out *keyOutFile) string {
 // failed partway, so the earlier key file finishes it.
 const keysResumeFailed = "an earlier interrupted rewrap was advanced and did not finish; keep the earlier rewrap's key file; finish with: sudo k3sm keys rewrap --key-in <that earlier file>"
 
+// keysSwapUnsynced is what rewrap says after keystore.ErrRewrapSwapUnsynced:
+// the earlier rewrap's swap went through, so a new rewrap retires its key.
+const keysSwapUnsynced = "the earlier rewrap's master swap completed but did not sync; run sudo k3sm keys rewrap --key-out FILE again"
+
 // keyFileAfterFailure decides, after a rewrap that did not succeed, what
 // becomes of the key file, and says so. A file this run wrote (--key-out) is
 // deleted only when the error is keystore.ErrRewrapNotStarted, which the
 // store returns only before it writes anything under the key; after any
 // other error a resume may need the file, so it is kept. After
 // keystore.ErrRewrapResumeFailed the file is kept too, and the operator is
-// sent to the earlier rewrap's key file. A --key-in file (out nil) is the
+// sent to the earlier rewrap's key file, unless keystore.ErrRewrapSwapUnsynced
+// says that rewrap completed: the unused file is deleted, and the operator
+// runs a new rewrap. A --key-in file (out nil) is the
 // operator's and is never deleted. The delete goes through out, the
 // directory handle writeKeyOut checked, never through the path again. It
 // names the flag, never the path.
 func keyFileAfterFailure(err error, out *keyOutFile, resumed bool) string {
 	wrote := out != nil
+	if errors.Is(err, keystore.ErrRewrapSwapUnsynced) {
+		// The earlier rewrap is complete; this run's key was never used.
+		if !wrote {
+			return keysSwapUnsynced
+		}
+		if rerr := out.remove(); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
+			return fmt.Sprintf("%s\nthis run's key was never used; delete the --key-out file by hand: %v", keysSwapUnsynced, pathFailure("remove", "--key-out", rerr))
+		}
+		return keysSwapUnsynced + "\nthis run's key was never used, so the --key-out file was deleted"
+	}
 	if errors.Is(err, keystore.ErrRewrapResumeFailed) {
 		if wrote {
 			return keysResumeFailed + "\nthis run's --key-out file was kept"
