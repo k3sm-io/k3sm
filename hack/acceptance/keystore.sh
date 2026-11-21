@@ -62,7 +62,7 @@ pend() { wanted "$1" || return 0; row "$1" PENDING "$2"; pending=$((pending + 1)
 # run is not a pass.
 run=()
 if [ "$mode" = rewrap ]; then run=(-run "^($(tr ' ' '|' <<<"$rewrap_tests"))\$"); fi
-out="$(go test -race -count=1 -v "${run[@]}" ./pkg/keystore/ 2>&1)" && pkg_ok=1 || pkg_ok=0
+out="$(go test -race -count=1 -v ${run[@]+"${run[@]}"} ./pkg/keystore/ 2>&1)" && pkg_ok=1 || pkg_ok=0
 ran() {
 	local t
 	for t in "$@"; do
