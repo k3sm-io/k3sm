@@ -1162,10 +1162,22 @@ GeneratedUID**.
   `mbr_uid_to_uuid` joins k3sm's SPI symbol canary (U7).
 - **A missing scope is not an absent entry.** When `.user/<uid>/` or its `scope.key` is
   missing, the store answers the new sentinel `ErrScopeAbsent`, which is not definitive: the
-  reconciler reads it as `Indeterminate`, never as a deletion. `ErrNotFound` is answered only
-  for an entry missing from a scope that exists and whose `scope.key` opened. A scope that a
+  reconciler reads it as `Indeterminate`, never as a deletion. A scope that a
   restore left out, a volume not yet mounted or a directory moved aside therefore deletes no
   Secret (U64, U65).
+- **An incomplete scope is not an empty one.** Inside a scope whose `scope.key` opens, a
+  missing `entries/` directory or a missing `deliveries` record is also `ErrScopeAbsent`, and so
+  also `Indeterminate`. The mint writes both, `entries/` and an empty `deliveries` record sealed
+  under the new `K_u`, before it writes `scope.key`, so a scope whose `scope.key` opens has both
+  unless something removed one; a restore that kept `scope.key` and lost `entries/` or
+  `deliveries` must not read as "every entry gone" or "every delivery withdrawn". `ErrNotFound`
+  holds only when `entries/` exists and opened and the entry's directory is absent from it.
+- **The principle holds at every level of the layout.** Only the absence of the last thing
+  looked up, an entry directory inside an `entries/` that opened, or a UID inside a
+  `deliveries` record that opened and authenticated, is a definitive absence. A missing
+  container at any level above it (`.user/`, `.user/<uid>/`, `scope.key`, `entries/`, the
+  `deliveries` record) is `ErrScopeAbsent`, and every failure to open or read one is another
+  error; none of them is `ErrNotFound` (U64).
 - **A read never mints a scope.** `K_u` and the `.user/<uid>/` directory are created by the
   first mutating operation on the scope (`put`, `rotate` or `deliver`), under the store lock.
   A read (`list`, `read-for-exec`, `deliveries`, or any read by the reconciler) on a uid with
@@ -1854,9 +1866,10 @@ when two consecutive sweeps see one ("Every deleting outcome counts only twice i
 list is closed:
 
 1. the store's typed `ErrNotFound` for the entry (`errors.Is(err, keystore.ErrNotFound)`),
-   which the store answers only for an entry missing from a scope that exists and opened;
+   which the store answers only for an entry missing from an `entries/` directory that exists
+   and opened, in a scope whose `scope.key` opened;
 2. a withdrawn record entry for the KeyDelivery's UID, read from a `deliveries` record that
-   opened and authenticated;
+   exists, opened and authenticated;
 3. a digest mismatch: the digest recomputed from the live object differs from the one in a
    record that opened and authenticated;
 4. a definitive SubjectAccessReview denial, as defined above, on two consecutive sweeps;
@@ -1866,7 +1879,8 @@ list is closed:
    synthesized compatibility UUID is `ErrScopeOwnerUnknown`, which is `Indeterminate`.
 
 **Every other outcome is `Indeterminate`**, whatever it is: `ErrScopeAbsent` (a missing
-`.user/<uid>/` or `scope.key`), `ErrCorrupt` (the floor refusal
+`.user/<uid>/` or `scope.key`, or, in a scope whose `scope.key` opened, a missing `entries/`
+directory or `deliveries` record), `ErrCorrupt` (the floor refusal
 included, which wraps it), `ErrMasterMissing`, `ErrScopeUnsupported`, `ErrBusy`, `ErrLogFull`,
 `ErrScopeOwnerUnknown` (the GeneratedUID lookup past its deadline), a
 cancelled or expired ctx, the store's refusal to read while an audit append fails (U32), a
@@ -1881,8 +1895,9 @@ failure and stays `Indeterminate`. A UID absent from a readable record is `NotRe
 but it is not on the list, so it deletes nothing.
 
 **Absence is told apart from an unreadable store only by `ErrNotFound`.** The store answers
-`ErrNotFound` only after it opened the scope and read the entry's directory and found no entry;
-a missing scope is `ErrScopeAbsent`, and every failure to open or read the store is another
+`ErrNotFound` only after it opened the scope and its `entries/` directory and found no entry
+there; a missing scope, a missing `entries/` and a missing `deliveries` record are
+`ErrScopeAbsent`, and every failure to open or read the store is another
 error, and so `Indeterminate`. The
 reconciler never infers absence from an empty result, a missing file or an error's text.
 
@@ -1952,7 +1967,9 @@ fails is an error, not a denial (U44, U72, E11, E14).
 middle step withdraws the record entry. When the owner's scope cannot be opened because the
 owner changed (`ErrScopeOwnerChanged`), or root removed it with `rm-scope` (the scope is
 absent), there is no record left to withdraw from, so the step counts as done and the
-finalizer drops, after the Secret is gone. A transient failure (`ErrScopeOwnerUnknown`,
+finalizer drops, after the Secret is gone. A scope whose `scope.key` opens but whose
+`entries/` or `deliveries` is missing is damage, not removal, and keeps the finalizer. A
+transient failure (`ErrScopeOwnerUnknown`,
 `ErrBusy`, any other error) keeps the finalizer and retries. This is lifecycle, not authority:
 the object is already being deleted, so treating an absent scope as withdrawn here deletes
 nothing that the object's deletion did not already (U75). This differs on purpose from Phase A's root-file delivery, which never deletes (G20): a
@@ -2321,7 +2338,7 @@ each stated in the change that makes it. U15 is held for a K0 amendment and U39 
 | U61 | seam guard: `pkg/install`'s `TestMain` installs a panicking stub on its euid source and file-attribute writer | `k3sm/pkg/install::TestRealPrimitivesUnreachable` | pending: the append-only files |
 | U62 | reconciler lines are charged to the delivery's owner uid: a `deliver-write` past the owner's share is refused and read as `Indeterminate`, the Secret keeping its last version; a `deliver-delete`, and the `deliver-write` and floor line of a withdrawal, are charged but never refused for the share, and past it draw on the revocation reserve | `k3sm/pkg/keystore/reconcile::TestReconcilerLinesChargedToOwner`, `TestDeliverWritePastShareIsIndeterminate`, `TestDeliverDeleteNeverRefusedForShare` | pending: the KeyDelivery reconciler (lifecycle) |
 | U63 | entries live under `.user/<uid>/entries/`: entries named `deliveries` and `scope.key` are ordinary, `put`, `rotate`, `list` and `rm` work on them, and neither touches the scope's `deliveries` record or `scope.key` | `k3sm/pkg/keystore::TestEntriesNamedDeliveriesAndScopeKeyAreOrdinary` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
-| U64 | a missing `.user/<uid>/` or `scope.key` answers `ErrScopeAbsent`, never `ErrNotFound`; `ErrNotFound` only for an entry missing from a scope that exists and opened; a read (`list`, `read-for-exec`, `deliveries`, a reconciler read) on a uid with no scope creates no directory and mints no `K_u`; the first mutating operation does | `k3sm/pkg/keystore::TestReadDoesNotMintScope`, `TestMissingScopeIsScopeAbsent` | pending: the user-scope store |
+| U64 | a missing `.user/<uid>/` or `scope.key` answers `ErrScopeAbsent`, never `ErrNotFound`; inside a scope whose `scope.key` opens, a missing `entries/` directory or a missing `deliveries` record is `ErrScopeAbsent` too; `ErrNotFound` only for an entry missing from an `entries/` that exists and opened; a read (`list`, `read-for-exec`, `deliveries`, a reconciler read) on a uid with no scope creates no directory and mints no `K_u`; the first mutating operation does, writing `entries/` and an empty `deliveries` record before `scope.key` | `k3sm/pkg/keystore::TestReadDoesNotMintScope`, `TestMissingScopeIsScopeAbsent`, `TestMissingEntriesDirIsScopeAbsent`, `TestMissingDeliveriesRecordIsScopeAbsent` | pending: the user-scope store |
 | U65 | the reconciler reads `ErrScopeAbsent` as `Indeterminate` and deletes nothing; every outcome on the allow-list, not only a SAR denial, deletes only on two consecutive sweeps for the same generation; the single-server check is re-run from a fresh List before every sweep, and a second server or a failed List runs no sweep | `k3sm/pkg/keystore/reconcile::TestAbsentScopeIsIndeterminate`, `TestEveryDeletingOutcomeNeedsTwoSweeps`, `TestSingleServerRecheckedBeforeEverySweep` | pending: the KeyDelivery reconciler (lifecycle) |
 | U66 | the GeneratedUID lookup recognises the synthesized compatibility form (prefix `FFFFEEEE-DDDD-CCCC-BBBB-AAAA`) and answers `ErrScopeOwnerUnknown`, never a changed owner, and no mint binds it; `ErrScopeOwnerChanged` only when a real, non-synthesized GeneratedUID differs from the bound one (seam: GeneratedUID lookup) | `k3sm/pkg/keystore::TestSynthesizedGeneratedUIDIsUnknown` | pending: the user-scope store |
 | U67 | the revocation class (`withdraw`, `rm`, `rotate`, the withdrawal's floor line, the reconciler's `deliver-delete` and `deliver-write` of a withdrawal) is charged to the share while it has room and past it bypasses the share and the hard cap, drawing on the 4 MiB revocation reserve; only the reserve's exhaustion refuses it; a no-op `rm`, `withdraw` or `rotate` is charged like any line and refused past the share; the socket's members stop with 3 MiB of the reserve left, which the reconciler's members may use | `k3sm/pkg/keystore/socket::TestRevocationBypassesShareUsesReserve`, `TestNoOpRevocationChargedToShare`, `TestReserveKeepsReconcilerPart` | pending: the socket operations |

@@ -498,8 +498,8 @@ pend U62 "reconciler lines are charged to the delivery's owner uid: a deliver-wr
 	k3sm/pkg/keystore/reconcile::TestReconcilerLinesChargedToOwner TestDeliverWritePastShareIsIndeterminate TestDeliverDeleteNeverRefusedForShare
 pend U63 "entries live under .user/<uid>/entries/: entries named deliveries and scope.key are ordinary and touch neither scope file (user-scope store)" \
 	k3sm/pkg/keystore::TestEntriesNamedDeliveriesAndScopeKeyAreOrdinary
-pend U64 "a missing .user/<uid>/ or scope.key answers ErrScopeAbsent, never ErrNotFound; a read on a uid with no scope creates no directory and mints no K_u; the first mutating op does (user scopes)" \
-	k3sm/pkg/keystore::TestReadDoesNotMintScope TestMissingScopeIsScopeAbsent
+pend U64 "a missing .user/<uid>/ or scope.key answers ErrScopeAbsent, never ErrNotFound; inside a scope whose scope.key opens, a missing entries/ directory or a missing deliveries record is ErrScopeAbsent too; ErrNotFound only for an entry missing from an entries/ that exists and opened; a read on a uid with no scope creates no directory and mints no K_u; the first mutating op does (user scopes)" \
+	k3sm/pkg/keystore::TestReadDoesNotMintScope TestMissingScopeIsScopeAbsent TestMissingEntriesDirIsScopeAbsent TestMissingDeliveriesRecordIsScopeAbsent
 pend U65 "ErrScopeAbsent is Indeterminate and deletes nothing; every allow-list outcome, not only a SAR denial, deletes only on two consecutive sweeps; single-server is re-checked from a fresh List before every sweep (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestAbsentScopeIsIndeterminate TestEveryDeletingOutcomeNeedsTwoSweeps TestSingleServerRecheckedBeforeEverySweep
 pend U66 "a synthesized GeneratedUID (prefix FFFFEEEE-DDDD-CCCC-BBBB-AAAA) is ErrScopeOwnerUnknown and never bound; ErrScopeOwnerChanged only for a real GeneratedUID that differs (user scopes)" \
@@ -638,6 +638,7 @@ U51|ErrLogFull
 U55|two consecutive sweeps
 U55|ErrScopeAbsent
 U64|ErrScopeAbsent
+U64|a missing entries/ directory or a missing deliveries record is ErrScopeAbsent too
 U66|FFFFEEEE-DDDD-CCCC-BBBB-AAAA
 U67|4 MiB revocation reserve
 U68|O_EXCL
