@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # The keystore's acceptance gate: docs/design/keystore.md § "Acceptance gate",
-# rows G1 to G22, the user-scope rows U1 to U83 (U15 and U39 are unused) and
+# rows G1 to G22, the user-scope rows U1 to U84 (U15 and U39 are unused) and
 # the rig legs E1 to E25. Every row is listed, on exactly one line. A row runs
 # the tests that deliver it and passes only if each named test ran and passed
 # in its own package; a row whose change has not landed yet prints PENDING,
@@ -38,7 +38,7 @@
 #   --files         the append-only files: U20 to U25, U50, U52, U60, U61, U68,
 #                   U80, and in the helper variant only U70, U71.
 #   --socket        the socket listener: U26 to U31, U46, U48, U54, U82.
-#   --socket-ops    the socket operations: U32 to U35, U45, U51, U67.
+#   --socket-ops    the socket operations: U32 to U35, U45, U51, U67, U84.
 #   --exec          the non-root CLI and exec: U36 to U38, U69.
 #   --kd-author     KeyDelivery authoring: U40, U41, U74, U76.
 #   --kd-reconcile  the KeyDelivery reconciler: U42, U43, U59, U73, U78, U81.
@@ -107,7 +107,7 @@ EXPECTED_ROWS="$EXPECTED_ROWS U49 U50 U51 U52 U53 U54 U55 U56 U57"
 EXPECTED_ROWS="$EXPECTED_ROWS U58 U59 U60 U61 U62 U63"
 EXPECTED_ROWS="$EXPECTED_ROWS U64 U65 U66 U67 U68 U69 U70 U71"
 EXPECTED_ROWS="$EXPECTED_ROWS U72 U73 U74 U75 U76"
-EXPECTED_ROWS="$EXPECTED_ROWS U77 U78 U79 U80 U81 U82 U83"
+EXPECTED_ROWS="$EXPECTED_ROWS U77 U78 U79 U80 U81 U82 U83 U84"
 # >>> ADD NEW U ROWS (U64 upward) HERE <<<
 EXPECTED_ROWS="$EXPECTED_ROWS E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 E13 E14 E15 E16 E17 E18 E19 E20"
 EXPECTED_ROWS="$EXPECTED_ROWS E21 E22 E23 E24 E25"
@@ -140,7 +140,7 @@ mode_rows() {
 	scope-store) echo "U12 U13 U14 U63" ;;
 	files) echo "U20 U21 U22 U23 U24 U25 U50 U52 U60 U61 U68 U70 U71 U80" ;;
 	socket) echo "U26 U27 U28 U29 U30 U31 U46 U48 U54 U82" ;;
-	socket-ops) echo "U32 U33 U34 U35 U45 U51 U67" ;;
+	socket-ops) echo "U32 U33 U34 U35 U45 U51 U67 U84" ;;
 	exec) echo "U36 U37 U38 U69" ;;
 	kd-author) echo "U40 U41 U74 U76" ;;
 	kd-reconcile) echo "U42 U43 U59 U73 U78 U81" ;;
@@ -421,7 +421,7 @@ pend U22 "floor --rebuild and audit --rotate mark and stage under keystore- name
 	k3sm/pkg/keystore/socket::TestMaintenanceReopensLogsAndResetsShares
 pend U23 "every audited operation writes one v:1 line; no line carries a value or its length; readers ignore unknown fields (append-only files)" \
 	TestAuditLineNeverCarriesValue TestAuditReaderIgnoresUnknownFields
-pend U24 "soft cap shows in doctor; past the hard cap every mutating user op is ErrLogFull, except the revocation class, which draws on its uid's revocation allowance; a line over 1 KiB is refused (append-only files)" \
+pend U24 "soft cap shows in doctor; past the hard cap every mutating user op is ErrLogFull, except the revocation class, which draws on its uid's revocation budgets; a line over 1 KiB is refused (append-only files)" \
 	TestLogHardCapRefusesMutations TestAuditLineBoundedAtOneKiB
 pend U25 "backup and restore round trip: a restored tree with cleared flags is refused until floor --rebuild, then opens; the rebuild writes a line for every entry directory holding a generation file, sequence 0 without an authenticated pointer, so a damaged entry stays ErrCorrupt and never becomes ErrNotFound; rig leg E17 (append-only files)" \
 	TestBackupRestoreRoundTripRebuild TestRebuildKeepsDamagedEntryCorrupt
@@ -498,7 +498,7 @@ pend U60 "seam guard: cmd/k3sm's TestMain stubs each of its seams: clock, uid re
 	k3sm/cmd/k3sm::TestRealPrimitivesUnreachable
 pend U61 "seam guard: pkg/install's TestMain stubs its euid source and file-attribute writer (append-only files)" \
 	k3sm/pkg/install::TestRealPrimitivesUnreachable
-pend U62 "reconciler lines are charged to the delivery's owner uid: a deliver-write of a new version past the share is Indeterminate unless it is the rotation write that follows a rotate; a deliver-delete, a withdrawal's lines and the rotation write are never refused for the share and past it draw on the owner's revocation allowance (KeyDelivery lifecycle)" \
+pend U62 "reconciler lines are charged to the delivery's owner uid: a deliver-write of a new version past the share is Indeterminate unless it is the rotation write that follows a rotate; a deliver-delete, a withdrawal's lines and the rotation write are never refused for the share and past it draw on the owner's 256 KiB reconciler allowance, never on its socket margin (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestReconcilerLinesChargedToOwner TestDeliverWritePastShareIsIndeterminate TestDeliverDeleteNeverRefusedForShare
 pend U63 "entries live under .user/<uid>/entries/: entries named deliveries and scope.key are ordinary and touch neither scope file (user-scope store)" \
 	k3sm/pkg/keystore::TestEntriesNamedDeliveriesAndScopeKeyAreOrdinary
@@ -508,8 +508,9 @@ pend U65 "ErrScopeAbsent is Indeterminate and deletes nothing; every allow-list 
 	k3sm/pkg/keystore/reconcile::TestAbsentScopeIsIndeterminate TestEveryDeletingOutcomeNeedsTwoSweeps TestSingleServerRecheckedBeforeEverySweep
 pend U66 "a synthesized GeneratedUID (prefix FFFFEEEE-DDDD-CCCC-BBBB-AAAA) is ErrScopeOwnerUnknown and never bound; ErrScopeOwnerChanged only for a real GeneratedUID that differs (user scopes)" \
 	k3sm/pkg/keystore::TestSynthesizedGeneratedUIDIsUnknown
-pend U67 "the revocation class (withdraw, rm, rotate, the withdrawal's floor line, the reconciler's deliver-delete, its deliver-write of a withdrawal and its rotation write) bypasses the share past it and draws on its uid's own 256 KiB revocation allowance per log above the hard cap, refused only when that uid's allowance runs out, so one uid's revocations are never refused because of another uid; a no-op revocation is charged to the share; within a uid's allowance the reconciler's 4 KiB per live delivery is kept (socket operations)" \
-	k3sm/pkg/keystore/socket::TestRevocationBypassesShareUsesReserve TestNoOpRevocationChargedToShare TestReserveKeepsReconcilerPart TestRevocationAllowanceIsPerUID
+pend U67 "the revocation class (withdraw, rm, rotate, the withdrawal's floor line, the reconciler's deliver-delete, its deliver-write of a withdrawal and its rotation write) bypasses the share past it and draws on its uid's own budgets per log above the hard cap: a 256 KiB reconciler allowance and a separate 64 KiB socket margin; neither budget can draw on the other; refused only when the budget it draws on runs out, so one uid's revocations are never refused because of another uid; a no-op revocation is charged to the share; a log passes the hard cap by at most 320 KiB per user scope (socket operations)" \
+	k3sm/pkg/keystore/socket::TestRevocationBypassesShareUsesReserve TestNoOpRevocationChargedToShare TestReserveKeepsReconcilerPart TestRevocationAllowanceIsPerUID \
+	TestSocketMarginSeparateFromReconcilerAllowance
 rootpend U68 "root-run: the maintenance verbs refuse a symlink or swapped file planted at the marker, a staging name or the old log; creates are O_EXCL|O_NOFOLLOW through one data-root descriptor, fchown before renameat and fchflags on the held descriptor after it, never renaming a flagged file or over one; no log byte changes on a refusal (append-only files)" \
 	k3sm/cmd/k3sm::TestMaintenanceRefusesPlantedSymlinkAndSwap
 pend U69 "the client pins the server: the peer's audit token (LOCAL_PEERTOKEN) must resolve to the cdhash of the installed /Library/k3sm/k3sm, or nothing is written; another service-user binary, a reused pid, a lookup error and an old server after an upgrade are refused (non-root CLI and exec)" \
@@ -532,7 +533,7 @@ pend U77 "rm-scope revokes first: under the exclusive store lock it reads the se
 	k3sm/cmd/k3sm::TestRmScopeDeletesDeliveredSecretsFirst TestRmScopeRefusesWithoutAPI TestRmScopeOrphanSecretsListsAndLeaves
 pend U78 "SecretRetained is True whenever a labelled Secret stays while Authorized is Unknown or False: under Unknown with reason Indeterminate; NoneRetained only when none stays or Authorized is True (KeyDelivery reconciler)" \
 	k3sm/pkg/keystore/reconcile::TestSecretRetainedTrueUnderUnknown
-pend U79 "the rotation write that follows a rotate is in the revocation class: past the owner's share it draws on the owner's revocation allowance, once per live delivery per log; the reconciler's need for one uid, 64 deliveries x 4 lines x 1 KiB, is 256 KiB, the whole allowance (KeyDelivery lifecycle)" \
+pend U79 "the rotation write that follows a rotate is in the revocation class: past the owner's share it draws on the owner's reconciler allowance, once per live delivery per log; the reconciler's need for one uid, 64 deliveries x 4 lines x 1 KiB, is 256 KiB, the whole allowance (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestRotationWriteUsesReserve
 rootpend U80 "root-run: rm-scope and floor --rebuild walk .user/<uid>/ by descriptor with openat, unlinkat and O_NOFOLLOW, refuse a planted symlink, FIFO or other non-regular file, read with a bounded size, re-check SameFile after each open and never follow a swapped directory (append-only files)" \
 	k3sm/cmd/k3sm::TestRootWalksRefusePlantedNames
@@ -542,6 +543,8 @@ pend U82 "eligible peer uids are 501 to 2147483647: nobody (4294967294) and ever
 	k3sm/pkg/keystore/socket::TestPeerUIDRangeRefusesNobodyAndHighUIDs
 pend U83 "the reconciler checks the user-scope floor log: a missing or unflagged floor log is Indeterminate for writes, so no deliver-write runs until floor --rebuild, and nothing is deleted (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestReconcilerHoldsWritesWithoutFloor
+pend U84 "when a log's size is past the hard cap, doctor shows a Warn with the overshoot in bytes and the rotate or rebuild hint, and none at or below it; the overshoot is at most 320 KiB per user scope (socket operations)" \
+	k3sm/cmd/k3sm::TestDoctorWarnsOnLogOvershoot
 # >>> ADD NEW U ROWS (U64 upward) HERE, and add each to EXPECTED_ROWS and to mode_rows <<<
 
 leg E1 "files" "preconditions: secrets encryption on; one server; keystore-run/ and both logs present, service-user 0600, SF_APPEND set; the doctor user-scope row on; keystore.sh --check exits 0 on the build" "the append-only files"
@@ -658,7 +661,11 @@ U55|ErrScopeAbsent
 U64|ErrScopeAbsent
 U64|a missing entries/ directory or a missing deliveries record is ErrScopeAbsent too
 U66|FFFFEEEE-DDDD-CCCC-BBBB-AAAA
-U67|256 KiB revocation allowance per log
+U67|256 KiB reconciler allowance
+U67|64 KiB socket margin
+U67|neither budget can draw on the other
+U67|at most 320 KiB per user scope
+U84|overshoot
 U67|one uid's revocations are never refused because of another uid
 U73|an indeterminate sweep keeps the claim
 U25|a damaged entry stays ErrCorrupt
