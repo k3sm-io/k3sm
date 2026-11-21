@@ -264,6 +264,14 @@ generation that is not 32 lower-case hex digits, a sequence of 0, a name `put` w
 or data after the object is `ErrCorrupt`, with the floor's own message (remove the file as
 root and let a root-run verb rebuild it) rather than the restore-from-backup default.
 
+The file is bounded at 4 MiB, on read and on write. A floor write whose result would be
+larger is refused before anything is written, so the floor on disk is always one that
+reads. Put and Rotate check for room before they write the entry, so a full floor refuses
+them with nothing changed. A root-run verb's raise leaves out an entry that does not fit
+(that entry's floor stays behind its pointer, which readers accept), refuses a keystore
+with more entries than the file can hold, and Delete still runs over a full floor, since
+it is how room is made.
+
 A reader that opens `current` refuses it, as `ErrCorrupt` with the message below, unless
 **both** hold: the pointer's generation equals the floor's generation for that name, and the
 pointer's sequence is at least the floor's. So an older `current` that still authenticates

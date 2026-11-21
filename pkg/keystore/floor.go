@@ -26,6 +26,7 @@ import (
 	"io/fs"
 	"os"
 	"sort"
+	"strconv"
 	"syscall"
 )
 
@@ -43,10 +44,17 @@ const (
 	floorFileMode fs.FileMode = 0o644
 	// floorFormat is the floor file's format version.
 	floorFormat = 1
-	// maxFloorSize bounds a floor read. An entry costs under 400 bytes (a
-	// 253-byte name, a 32-character generation and a sequence), so this holds
-	// some ten thousand entries.
+	// maxFloorSize bounds a floor read, and every floor write refuses a
+	// result over it (errFloorFull), so a written floor always reads back. An
+	// entry costs under 400 bytes (a 253-byte name, a 32-character generation
+	// and a sequence), so this holds some ten thousand entries.
 	maxFloorSize = 4 << 20
+	// minFloorEntrySize is the fewest bytes an entry adds to the floor file:
+	// a one-character name at sequence 1, and the comma before it.
+	minFloorEntrySize = len(`,"a":{"generation":"`) + 2*generationSize + len(`","seq":1}`)
+	// maxFloorEntries is the most entries a floor file under maxFloorSize can
+	// hold. A keystore with more cannot have them all recorded.
+	maxFloorEntries = maxFloorSize / minFloorEntrySize
 )
 
 var (
@@ -60,6 +68,10 @@ var (
 	// errFloorMalformed refuses a floor file that does not parse, or that is
 	// not the system scope's. It matches ErrCorrupt, with its own advice.
 	errFloorMalformed error = &floorMalformedError{}
+	// errFloorFull refuses a floor write whose result would be larger than
+	// maxFloorSize, before anything is written, so the floor on disk stays
+	// the last one that fit and still reads.
+	errFloorFull = fmt.Errorf("the keystore floor is full: recording this change would make keystore-floor.json larger than %d bytes; delete entries that are no longer used to make room", maxFloorSize)
 )
 
 // floor is the recorded floor, by entry name. A nil floor is an absent file:
@@ -102,6 +114,47 @@ func marshalFloor(fl floor) ([]byte, error) {
 		return nil, err
 	}
 	return append(b, '\n'), nil
+}
+
+// size is the length of fl's encoding by marshalFloor, computed without
+// encoding it: an entry's name is a checkName name and its generation hex, so
+// neither is escaped.
+func (fl floor) size() int {
+	n := len(`{"version":`) + len(strconv.Itoa(floorFormat)) + len(`,"scope":"`) + len(scopeSystem) + len(`","entries":{}}`) + 1
+	for name, e := range fl {
+		n += floorEntrySize(name, e)
+	}
+	if len(fl) > 0 {
+		n += len(fl) - 1 // the commas between entries
+	}
+	return n
+}
+
+// floorEntrySize is the length of name's entry e in the floor's encoding,
+// without the comma that separates it from the one before.
+func floorEntrySize(name string, e floorEntry) int {
+	return len(`"":{"generation":"`) + len(name) + len(e.Generation) + len(`","seq":}`) + len(strconv.FormatUint(e.Seq, 10))
+}
+
+// grow is how many bytes recording e for name would add to fl's encoding.
+func (fl floor) grow(name string, e floorEntry) int {
+	if old, ok := fl[name]; ok {
+		return floorEntrySize(name, e) - floorEntrySize(name, old)
+	}
+	if len(fl) == 0 {
+		return floorEntrySize(name, e)
+	}
+	return floorEntrySize(name, e) + 1
+}
+
+// room refuses, as errFloorFull, recording e for name when the floor would
+// then be larger than maxFloorSize. A verb asks it before it writes anything,
+// so a full floor refuses the verb rather than a write after its entry files.
+func (fl floor) room(name string, e floorEntry) error {
+	if n := fl.size() + fl.grow(name, e); n > maxFloorSize {
+		return fmt.Errorf("%w (%d bytes)", errFloorFull, n)
+	}
+	return nil
 }
 
 // staleError refuses a current pointer the floor rules out. It matches
@@ -428,6 +481,9 @@ func (l *floorLock) update(op func(floor) bool) (floor, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(b) > maxFloorSize {
+		return nil, fmt.Errorf("%w (%d bytes)", errFloorFull, len(b))
+	}
 	if err := l.s.writeFileAs(l.root, floorName, b, l.s.floorUID, l.s.floorGID, floorFileMode); err != nil {
 		return nil, err
 	}
@@ -450,6 +506,11 @@ func (l *floorLock) unlock() {
 // also how an absent floor file is rebuilt. An entry whose pointer does not
 // open, or that the floor already rules out, is left as it is: the verb that
 // reads it reports it. The caller holds the exclusive lock and l.
+//
+// The floor never grows past maxFloorSize: a keystore with more entries than
+// a floor can hold is refused (errFloorFull) before any is raised, and a raise
+// that would take the floor over the size is left out, so that entry's floor
+// stays where it was, behind its pointer, which readers accept.
 func (s *FileStore) syncFloor(entries *os.Root, l *floorLock, fl floor, k keys) (floor, error) {
 	names, err := readDirNames(entries, maxDirNames)
 	if err != nil {
@@ -476,12 +537,30 @@ func (s *FileStore) syncFloor(entries *os.Root, l *floorLock, fl floor, k keys) 
 			found = append(found, raised{name, e.generation, seq})
 		}
 	}
+	if len(found) > maxFloorEntries {
+		return nil, fmt.Errorf("%w: the keystore holds %d entries, and the floor can hold at most %d", errFloorFull, len(found), maxFloorEntries)
+	}
 	return l.update(func(fl floor) bool {
 		changed := false
+		size := fl.size()
 		for _, r := range found {
-			if fl.raise(r.name, r.gen, r.seq) {
-				changed = true
+			old, had := fl[r.name]
+			if !fl.raise(r.name, r.gen, r.seq) {
+				continue
 			}
+			raised := fl[r.name]
+			if had {
+				fl[r.name] = old
+			} else {
+				delete(fl, r.name)
+			}
+			grow := fl.grow(r.name, raised)
+			if size+grow > maxFloorSize {
+				continue // left where it was: see above
+			}
+			fl[r.name] = raised
+			size += grow
+			changed = true
 		}
 		return changed
 	})

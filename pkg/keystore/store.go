@@ -229,6 +229,12 @@ func (s *FileStore) put(ctx context.Context, name string, kind Kind, value []byt
 	if fl, err = s.syncFloor(root, fdir, fl, k); err != nil {
 		return Version{}, err
 	}
+	// A floor with no room for the new entry refuses the Put before its
+	// directory is made. The generation is not minted yet; every one encodes
+	// to the same length.
+	if err := fl.room(name, floorEntry{Generation: hex.EncodeToString(make([]byte, generationSize)), Seq: 1}); err != nil {
+		return Version{}, err
+	}
 	e, err := s.createEntry(root, name, fl)
 	if err != nil {
 		return Version{}, err
@@ -529,9 +535,14 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	}
 	defer fdir.unlock()
 	// Delete must work without the master, so the other entries' floors are
-	// raised only when it opens.
+	// raised only when it opens. A keystore with more entries than the floor
+	// holds is not raised, but Delete still runs: it is how room is made.
 	if k, kerr := s.loadMaster(); kerr == nil {
-		if fl, err = s.syncFloor(root, fdir, fl, k); err != nil {
+		synced, err := s.syncFloor(root, fdir, fl, k)
+		switch {
+		case err == nil:
+			fl = synced
+		case !errors.Is(err, errFloorFull):
 			return err
 		}
 	}
@@ -665,6 +676,11 @@ func (s *FileStore) rotate(ctx context.Context, name string, value []byte) (Vers
 	}
 	if cur >= maxVersion || seq == math.MaxUint64 {
 		return Version{}, fmt.Errorf("%w: the pointer is at the last version or sequence", ErrCorrupt)
+	}
+	// A floor with no room for the next sequence refuses the Rotate before
+	// anything is written.
+	if err := fl.room(name, floorEntry{Generation: hex.EncodeToString(e.generation[:]), Seq: seq + 1}); err != nil {
+		return Version{}, err
 	}
 	if err := discardOrphans(e, cur); err != nil {
 		return Version{}, err
