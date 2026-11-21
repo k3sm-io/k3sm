@@ -537,3 +537,32 @@ func TestFloorCheck(t *testing.T) {
 		t.Errorf("raise lowered, crossed a generation or did not raise: %+v", fl)
 	}
 }
+
+// TestCommittedBeforeDecodesGeneration: the floor and the generation file are
+// compared as generation bytes, not as text, so a generation file in
+// upper-case hex, which every reader decodes to the same generation, is still
+// the entry the floor records: one that lost its pointer, not an interrupted
+// Put to discard.
+func TestCommittedBeforeDecodesGeneration(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	mustPut(t, s, "a", KindOpaque, []byte("a"))
+	b, err := os.ReadFile(entryPath(server, "a", generationName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	upper := strings.ToUpper(string(b))
+	if upper == string(b) {
+		t.Fatalf("generation %q has no letter to upper-case; the test needs one", b)
+	}
+	writeFile(t, entryPath(server, "a", generationName), upper)
+	mustCurrent(t, s, "a", "a")
+
+	remove(t, entryPath(server, "a", currentName))
+	if _, _, err := s.Current(ctx, "a"); !errors.Is(err, errLostPointer) {
+		t.Fatalf("Current with the pointer gone: %v, want the lost-pointer refusal", err)
+	}
+	if _, err := s.Put(ctx, "a", KindOpaque, []byte("b")); !errors.Is(err, ErrExists) {
+		t.Fatalf("Put over the lost pointer: %v, want ErrExists", err)
+	}
+}

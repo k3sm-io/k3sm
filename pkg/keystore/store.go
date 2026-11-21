@@ -17,6 +17,7 @@ limitations under the License.
 package keystore
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
@@ -819,23 +820,27 @@ func openEntryDir(root *os.Root, name string, fl floor) (*entry, error) {
 // pointer, so a recorded generation means this entry committed a pointer. A
 // directory with no generation file never did. A generation file that does
 // not read while the floor records the name is damage: a crashed Put writes
-// that file whole, by rename.
+// that file whole, by rename. The two are compared as generation bytes, as
+// every reader decodes them, not as text.
 func committedBefore(dir *os.Root, name string, fl floor) (bool, error) {
 	f, ok := fl[name]
 	if !ok {
 		return false, nil
 	}
-	b, _, err := readFile(dir, generationName, generationFileSize)
-	if errors.Is(err, fs.ErrNotExist) {
+	gen, err := readGeneration(dir)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
 		return false, nil
-	}
-	if errors.Is(err, errBadFile) || (err == nil && (len(b) != generationFileSize || b[len(b)-1] != '\n')) {
+	case errors.Is(err, errBadFile):
 		return false, fmt.Errorf("%w: the generation file does not read", errDamagedShape)
+	case err != nil:
+		return false, err
 	}
+	recorded, err := hex.DecodeString(f.Generation)
 	if err != nil {
-		return false, readError(generationName, err)
+		return false, fmt.Errorf("%w: entry %q", errFloorMalformed, name)
 	}
-	return string(b[:len(b)-1]) == f.Generation, nil
+	return bytes.Equal(recorded, gen[:]), nil
 }
 
 // interruptedPut reports whether dir holds only what a crashed Put leaves
