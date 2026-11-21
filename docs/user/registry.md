@@ -146,7 +146,8 @@ headers only, not the time a transfer takes once the registry has started to ans
 
 The cluster reaches the registry through the registry relay, a front that listens on the
 server's cluster network address and on its guest network's gateway address, terminates TLS, and
-passes reads through to the registry. It also checks every write. (The listener on
+hands each request to the push gate, which passes reads through to the registry and checks every
+write. (The listener on
 `127.0.0.1:6451` for the server's own Mac is built from the same code, so the limits below apply
 to it too and its warnings name that address.) A pull through it is cut if the transfer makes no
 progress for 5 minutes, and so is a push body sent through it. A slow transfer that keeps moving
