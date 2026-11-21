@@ -1056,7 +1056,7 @@ const keysResumeFailed = "an earlier interrupted rewrap was advanced and did not
 
 // keysSwapUnsynced is what rewrap says after keystore.ErrRewrapSwapUnsynced:
 // the earlier rewrap's swap went through, so a new rewrap retires its key.
-const keysSwapUnsynced = "the earlier rewrap's master swap completed but did not sync; run sudo k3sm keys rewrap --key-out FILE again"
+const keysSwapUnsynced = "the earlier rewrap's master swap completed but did not sync; run sudo k3sm keys rewrap --key-out FILE again; the earlier rewrap's key file is now a copy of the live master; delete it after this rewrap succeeds"
 
 // keyFileAfterFailure decides, after a rewrap that did not succeed, what
 // becomes of the key file, and says so. A file this run wrote (--key-out) is

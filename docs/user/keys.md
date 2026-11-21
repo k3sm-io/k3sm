@@ -143,8 +143,14 @@ an earlier interrupted rewrap was advanced and did not finish; keep the earlier 
 ```
 
 If what failed was the last step of that earlier rewrap, after its master key was already
-swapped in, it says instead "the earlier rewrap's master swap completed but did not sync; run sudo
-k3sm keys rewrap --key-out FILE again": that rewrap is done, and a new one retires its key.
+swapped in, it says instead:
+
+```
+the earlier rewrap's master swap completed but did not sync; run sudo k3sm keys rewrap --key-out FILE again; the earlier rewrap's key file is now a copy of the live master; delete it after this rewrap succeeds
+```
+
+That rewrap is done, and a new one retires its key. Until then the earlier rewrap's key file is a
+second copy of the live master key: delete it once the new rewrap succeeds.
 
 Otherwise, the earlier rewrap's key file is the one to finish with. `rewrap` keeps this run's `FILE` too;
 it was never used, so delete it once the earlier rewrap is finished.

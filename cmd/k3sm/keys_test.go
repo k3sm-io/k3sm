@@ -1355,7 +1355,7 @@ func TestKeysRewrapSwapUnsynced(t *testing.T) {
 			h.wrap = func(s keysStore) keysStore { return keysSwapUnsyncedStore{keysStore: s, err: err} }
 			p := filepath.Join(t.TempDir(), "new-master")
 			h.mustRun(1, "rewrap", "--key-out", p)
-			want := "the earlier rewrap's master swap completed but did not sync; run sudo k3sm keys rewrap --key-out FILE again"
+			want := "the earlier rewrap's master swap completed but did not sync; run sudo k3sm keys rewrap --key-out FILE again; the earlier rewrap's key file is now a copy of the live master; delete it after this rewrap succeeds"
 			if !strings.Contains(h.stderr.String(), want) || strings.Contains(h.stderr.String(), "--key-in") {
 				t.Errorf("stderr %q does not say %q, or offers --key-in", h.stderr.String(), want)
 			}
@@ -1379,6 +1379,7 @@ func TestKeysDocsSayWhatTheVerbsDo(t *testing.T) {
 	doc := strings.Join(strings.Fields(string(b)), " ")
 	for _, want := range []string{
 		keysResumeFailed,
+		keysSwapUnsynced,
 		"It writes the raw bytes, so a value holding terminal escape sequences is interpreted by the terminal.",
 		"Never delegate the `keys` verbs through `sudoers`: `put --in` and `show --reveal` read any file root can read",
 		"After a successful rewrap, `FILE` is a second copy of the live master key: delete it, or move it to offline storage, and never keep it beside a backup of the entries.",
