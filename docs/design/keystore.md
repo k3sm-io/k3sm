@@ -2031,6 +2031,18 @@ person holds the uid, so it deletes beside `ErrNotFound`. `ErrScopeOwnerUnknown`
 failure and stays `Indeterminate`. A UID absent from a readable record is `NotRecorded` and gets no Secret written,
 but it is not on the list, so it deletes nothing.
 
+**An owner change still finds its targets.** Deleting under `ErrScopeOwnerChanged` needs the
+record's targets, and the scope no longer opens through the normal path. So on
+`ErrScopeOwnerChanged` the reconciler opens that scope's `scope.key` under `W` without the
+GeneratedUID check (the bound value is the record's own generation field, "Record encoding"),
+and through it reads only the `deliveries` record, which must still authenticate. That read is
+used for one thing: finding each recorded target, recorded or withdrawn, to delete under the
+target-matching rule ("Ownership at deletion rests on the record"). It never delivers, never
+rotates, never writes the record and never opens an entry, so the old owner's values reach no
+one. A record that does not open or authenticate is `Indeterminate`, and nothing is deleted.
+`rm-scope` reads the record the same way, so an owner change is never a reason for
+`--orphan-secrets` (U55, U77).
+
 **The reconciler checks the floor too.** Before any `deliver-write` it checks the user-scope
 floor log through the store's flag check, the one the listener uses (U21). A missing or
 unflagged `keystore-user-floor.log` is `Indeterminate` for writes: without the floor a
@@ -2146,10 +2158,12 @@ target; an unlabelled or foreign Secret is never touched, and a Get that
 fails is an error, not a denial (U44, U72, E11, E14).
 
 **An unopenable or removed scope counts as withdrawn for the finalizer.** The finalizer's
-middle step withdraws the record entry. When the owner's scope cannot be opened because the
-owner changed (`ErrScopeOwnerChanged`), or root removed it with `rm-scope` (the scope is
-absent), there is no record left to withdraw from, so the step counts as done and the
-finalizer drops, after the Secret is gone. A scope whose `scope.key` opens but whose
+middle step withdraws the record entry. When the owner changed (`ErrScopeOwnerChanged`), the
+record is read without the GeneratedUID check only to find the Secret to delete ("An owner
+change still finds its targets") and is never written, so the withdraw step counts as done
+and the finalizer drops after that Secret is gone. When root removed the scope with
+`rm-scope` (the scope is absent), there is no record left to withdraw from, and the step
+counts as done the same way. A scope whose `scope.key` opens but whose
 `entries/` or `deliveries` is missing is damage, not removal, and keeps the finalizer. A
 transient failure (`ErrScopeOwnerUnknown`,
 `ErrBusy`, any other error) keeps the finalizer and retries. This is lifecycle, not authority:
@@ -2177,7 +2191,9 @@ and runs in this order:
 If the API server is unreachable, `rm-scope` refuses and changes nothing: it removes no
 Secret and no file. If a delete fails part-way, it stops before step 3, so a rerun finds the
 record intact and resumes. If the record cannot be opened (missing, corrupt, or sealed under a
-`scope.key` that does not open), `rm-scope` refuses unless `--orphan-secrets` is given. With
+`scope.key` that does not open under `W`), `rm-scope` refuses unless `--orphan-secrets` is
+given. An owner change is not such a case: step 1 reads the record without the GeneratedUID
+check, as the reconciler does on `ErrScopeOwnerChanged`, and deletes by its targets. With
 that flag it lists every Secret labelled for KeyDelivery whose owner annotation names an
 entry of this scope, deletes none of them, leaves them for root to judge, and then removes the
 scope; it still refuses when the API server is unreachable, since it cannot list (U77). The
@@ -2560,7 +2576,7 @@ each stated in the change that makes it. U15 is held for a K0 amendment and U39 
 | U52 | every root verb writes one audit line with `via` `root` once the log exists, and none before it | `k3sm/cmd/k3sm::TestEveryRootVerbWritesAuditLine` | pending: the append-only files |
 | U53 | every reconciler Secret write and delete, and every record withdrawal, writes one audit line with `via` `reconciler`, except drift repairs, coalesced to one line per delivery per 10 minutes (U86) | `k3sm/pkg/keystore/reconcile::TestEveryReconcilerWriteAndDeleteAudited` | pending: the KeyDelivery reconciler (lifecycle) |
 | U54 | a pre-frame refusal (uid 0, the service uid, a uid below 501) writes a `refused` line with the peer uid, rate-limited per uid with a dropped-count summary | `k3sm/pkg/keystore/socket::TestPreFrameRefusalsAudited`, `TestPreFrameRefusalLinesRateLimited` | pending: the socket listener |
-| U55 | a transient lookup, SAR or apiserver error leaves the Secret and sets Unknown: a failed SAR call, an API server error, `ErrScopeOwnerUnknown`, `ErrBusy` and `ErrLogFull` each leave the Secret, the record entry and the finalizer, set `Authorized=Unknown` with reason `Indeterminate`, and retry with backoff; a SAR answer is a definitive denial when the call succeeded, `allowed=false` and `evaluationError` is empty, whatever `denied` says (the RBAC authorizer refuses with no opinion, reported as `allowed=false`), and each other answer is `Indeterminate`; no sweep runs before `readyz` and the RBAC informers' sync; every deleting outcome, not only a denial, deletes only when two consecutive sweeps see it for the same generation; only the allow-list (`ErrNotFound` for an entry missing from a scope that opened, `ErrScopeOwnerChanged`, a withdrawn record, a digest mismatch on a readable record, a definitive SAR denial) deletes, and a table over every store sentinel (`ErrScopeAbsent`, `ErrCorrupt`, the floor refusal, `ErrMasterMissing`, `ErrScopeUnsupported`, `ErrBusy`, `ErrLogFull`, `ErrScopeOwnerUnknown`), a cancelled ctx, the audit read refusal, an unknown record version and an unlisted error finds each `Indeterminate` | `k3sm/pkg/keystore/reconcile::TestTransientErrorLeavesSecretSetsUnknown`, `TestSAREvaluationErrorIsIndeterminate`, `TestSARAllowedFalseWithoutErrorIsDenial`, `TestNoSweepBeforeReady`, `TestDenialNeedsTwoSweeps`, `TestScopeOwnerChangedDeletes`, `TestEverySentinelBesidesNotFoundAndOwnerChangedIsIndeterminate` | pending: the KeyDelivery reconciler (lifecycle) |
+| U55 | a transient lookup, SAR or apiserver error leaves the Secret and sets Unknown: a failed SAR call, an API server error, `ErrScopeOwnerUnknown`, `ErrBusy` and `ErrLogFull` each leave the Secret, the record entry and the finalizer, set `Authorized=Unknown` with reason `Indeterminate`, and retry with backoff; a SAR answer is a definitive denial when the call succeeded, `allowed=false` and `evaluationError` is empty, whatever `denied` says (the RBAC authorizer refuses with no opinion, reported as `allowed=false`), and each other answer is `Indeterminate`; no sweep runs before `readyz` and the RBAC informers' sync; every deleting outcome, not only a denial, deletes only when two consecutive sweeps see it for the same generation; only the allow-list (`ErrNotFound` for an entry missing from a scope that opened, `ErrScopeOwnerChanged`, a withdrawn record, a digest mismatch on a readable record, a definitive SAR denial) deletes, and a table over every store sentinel (`ErrScopeAbsent`, `ErrCorrupt`, the floor refusal, `ErrMasterMissing`, `ErrScopeUnsupported`, `ErrBusy`, `ErrLogFull`, `ErrScopeOwnerUnknown`), a cancelled ctx, the audit read refusal, an unknown record version and an unlisted error finds each `Indeterminate`; against the real store, on `ErrScopeOwnerChanged` the reconciler reads the `deliveries` record under `W` without the GeneratedUID check only to find recorded targets, deletes them by the target-matching rule, and never delivers, rotates or opens an entry | `k3sm/pkg/keystore/reconcile::TestTransientErrorLeavesSecretSetsUnknown`, `TestSAREvaluationErrorIsIndeterminate`, `TestSARAllowedFalseWithoutErrorIsDenial`, `TestNoSweepBeforeReady`, `TestDenialNeedsTwoSweeps`, `TestScopeOwnerChangedDeletes`, `TestEverySentinelBesidesNotFoundAndOwnerChangedIsIndeterminate`, `TestScopeOwnerChangedDeletesAgainstRealStore` | pending: the KeyDelivery reconciler (lifecycle) |
 | U56 | a delivery record with an unknown format version is refused by the store and read by the reconciler as `Indeterminate`, never as a denial: no Secret is deleted | `k3sm/pkg/keystore::TestDeliveryRecordUnknownVersionRefused`, `k3sm/pkg/keystore/reconcile::TestUnknownRecordVersionIsIndeterminate` | pending: the KeyDelivery reconciler (lifecycle) |
 | U57 | `apis/keystore/entry` imports only the standard library, exports the pattern, the `maxLength` and the parse, and holds the shared vector table, which it passes | `apis/keystore/entry::TestGrammarVectors`, `TestImportsStdlibOnly` | pending: the entry grammar in `apis` |
 | U58 | seam guard, repo level: the seam-bearing packages are a closed list (`pkg/keystore`, `pkg/keystore/socket`, `pkg/keystore/reconcile`, `cmd/k3sm`, `pkg/install`); each listed package has its `TestMain` stub install and its `TestRealPrimitivesUnreachable`, a missing guard fails, and a package outside the list that declares a seam fails; fakes restore through `t.Cleanup` | `k3sm/pkg/keystore::TestEverySeamPackageHasAGuard` | pending: the user-scope store, its list extended by each change that adds a seam package |

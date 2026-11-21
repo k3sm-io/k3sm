@@ -485,8 +485,9 @@ pend U53 "every reconciler Secret write and delete, and every record withdrawal,
 	k3sm/pkg/keystore/reconcile::TestEveryReconcilerWriteAndDeleteAudited
 pend U54 "a pre-frame refusal writes a refused line with the peer uid, rate-limited per uid with a dropped-count summary (socket listener)" \
 	k3sm/pkg/keystore/socket::TestPreFrameRefusalsAudited TestPreFrameRefusalLinesRateLimited
-pend U55 "a transient lookup, SAR or apiserver error leaves the Secret, the record entry and the finalizer, sets Authorized=Unknown with reason Indeterminate, and retries with backoff; a SAR with allowed=false and no evaluation error is a definitive denial whatever denied says, and an evaluation error or a failed call is Indeterminate; no sweep before readyz and the RBAC informers sync; every deleting outcome deletes only on two consecutive sweeps; only the allow-list of definitive outcomes deletes (ErrNotFound in a scope that opened and ErrScopeOwnerChanged among them), and every other sentinel, ErrScopeAbsent included, is Indeterminate (KeyDelivery lifecycle)" \
-	k3sm/pkg/keystore/reconcile::TestTransientErrorLeavesSecretSetsUnknown TestSAREvaluationErrorIsIndeterminate TestSARAllowedFalseWithoutErrorIsDenial TestNoSweepBeforeReady TestDenialNeedsTwoSweeps TestScopeOwnerChangedDeletes TestEverySentinelBesidesNotFoundAndOwnerChangedIsIndeterminate
+pend U55 "a transient lookup, SAR or apiserver error leaves the Secret, the record entry and the finalizer, sets Authorized=Unknown with reason Indeterminate, and retries with backoff; a SAR with allowed=false and no evaluation error is a definitive denial whatever denied says, and an evaluation error or a failed call is Indeterminate; no sweep before readyz and the RBAC informers sync; every deleting outcome deletes only on two consecutive sweeps; only the allow-list of definitive outcomes deletes (ErrNotFound in a scope that opened and ErrScopeOwnerChanged among them), and every other sentinel, ErrScopeAbsent included, is Indeterminate; against the real store, on ErrScopeOwnerChanged the reconciler reads the deliveries record under W without the GeneratedUID check only to find recorded targets, deletes them by the target-matching rule, and never delivers, rotates or opens an entry (KeyDelivery lifecycle)" \
+	k3sm/pkg/keystore/reconcile::TestTransientErrorLeavesSecretSetsUnknown TestSAREvaluationErrorIsIndeterminate TestSARAllowedFalseWithoutErrorIsDenial TestNoSweepBeforeReady TestDenialNeedsTwoSweeps TestScopeOwnerChangedDeletes TestEverySentinelBesidesNotFoundAndOwnerChangedIsIndeterminate \
+	TestScopeOwnerChangedDeletesAgainstRealStore
 pend U56 "a delivery record with an unknown format version is refused by the store and read by the reconciler as Indeterminate, never as a denial (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore::TestDeliveryRecordUnknownVersionRefused k3sm/pkg/keystore/reconcile::TestUnknownRecordVersionIsIndeterminate
 pend U57 "the entry grammar package imports only the standard library, exports the pattern, the maxLength and the parse, and passes the shared vector table (entry grammar)" \
@@ -704,7 +705,9 @@ U86|stays charged to the owner
 U87|oldObject.spec.requestedBy
 U87|a finalizer edit is an UPDATE
 U87|on a DELETE object is null
-E23|refused at admission"
+E23|refused at admission
+U55|without the GeneratedUID check only to find recorded targets
+U55|never delivers, rotates or opens an entry"
 
 # --listed: the row-presence lint.
 if [ "$mode" = listed ]; then
