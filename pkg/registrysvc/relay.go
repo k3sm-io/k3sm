@@ -100,8 +100,12 @@ const (
 	// relayReadHeaderTimeout, relayMaxHeaderBytes, relayIdleTimeout and
 	// relayMaxConns bound what one client can hold of a relay address before
 	// the gate has decided anything, and relaylimit.go divides relayMaxConns
-	// into per-source shares. There is no read or write timeout: a blob is as
-	// large as an image layer and streams for as long as it takes.
+	// into per-source shares. There is no flat read or write timeout: a blob is
+	// as large as an image layer and streams for as long as it takes. Streaming
+	// is bounded by progress, not total time: the limiter gives every write of
+	// a response and every read of a request body its own deadline
+	// (relayWriteProgress, relayReadProgress), so a peer that stops reading or
+	// sending loses its connection and frees its slot.
 	relayReadHeaderTimeout = 10 * time.Second
 	relayMaxHeaderBytes    = 16 << 10
 	relayIdleTimeout       = 90 * time.Second
@@ -247,6 +251,7 @@ func newRelay(port, upstream int, binds []netip.Addr, log *slog.Logger, auth Gat
 		},
 	}
 	r.limiter = newSourceLimiter(newGate(gateConfig{Upstream: r.target(), Auth: auth, Credential: cred, Logger: log}), r.limits, time.Now)
+	r.limiter.log = log
 	r.handler = r.limiter
 	return r
 }
@@ -419,6 +424,7 @@ func (r *Relay) accept(ctx context.Context, ln net.Listener) error {
 		IdleTimeout:       relayIdleTimeout,
 		ErrorLog:          slog.NewLogLogger(r.log.Handler(), slog.LevelDebug),
 		ConnContext:       r.limiter.ConnContext,
+		ConnState:         r.limiter.ConnState,
 	}
 	stop := make(chan struct{})
 	defer close(stop)
@@ -498,11 +504,37 @@ func (l *limitListener) Close() error {
 	return l.Listener.Close()
 }
 
-// limitConn frees its slot exactly once, on Close.
+// limitConn frees its slot exactly once, on Close, and reports a write the
+// relay's own deadline cut to cut, which the limiter's ConnContext sets before
+// the connection is served.
 type limitConn struct {
 	net.Conn
 	once    sync.Once
 	release func()
+	cut     *cutWatch
+}
+
+// Write is the connection's Write. Every response byte, the server's final
+// flush included, reaches the peer here.
+func (c *limitConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	if err != nil {
+		c.cut.wrote(err)
+	}
+	return n, err
+}
+
+// SetWriteDeadline and SetDeadline tell the cut watch when a write deadline
+// other than the relay's is set, such as the one the TLS close alert sets for
+// itself, so a write that times out under it is not logged as the relay's cut.
+func (c *limitConn) SetWriteDeadline(t time.Time) error {
+	c.cut.writeDeadlineSet(t)
+	return c.Conn.SetWriteDeadline(t)
+}
+
+func (c *limitConn) SetDeadline(t time.Time) error {
+	c.cut.writeDeadlineSet(t)
+	return c.Conn.SetDeadline(t)
 }
 
 func (c *limitConn) Close() error {
