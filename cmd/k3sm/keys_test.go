@@ -35,7 +35,6 @@ import (
 	"syscall"
 	"testing"
 	"testing/iotest"
-	"time"
 
 	"k3sm.io/k3sm/pkg/keystore"
 )
@@ -1639,24 +1638,11 @@ func TestKeysReadKeyInRefusals(t *testing.T) {
 		t.Run("refuses a "+name, func(t *testing.T) {
 			p := filepath.Join(t.TempDir(), "saved")
 			tc.make(t, p)
-			// A blocking open of a FIFO with no writer never returns: the read
-			// runs aside, bounded, and a writer is opened to release it.
-			done := make(chan error, 1)
-			go func() {
-				b, err := readKeyIn(p)
-				clear(b)
-				done <- err
-			}()
-			var err error
-			select {
-			case err = <-done:
-			case <-time.After(10 * time.Second):
-				if w, werr := os.OpenFile(p, os.O_WRONLY|syscall.O_NONBLOCK, 0); werr == nil {
-					_ = w.Close() // only releases the blocked open
-				}
-				<-done
-				t.Fatal("readKeyIn blocked opening the key file")
-			}
+			// readKeyIn opens non-blocking, so a FIFO with no writer is refused
+			// at once; were that to regress, the open would block until go
+			// test's own timeout.
+			b, err := readKeyIn(p)
+			clear(b)
 			if err == nil || !strings.Contains(err.Error(), tc.say) {
 				t.Fatalf("readKeyIn = %v, want a refusal saying %q", err, tc.say)
 			}
