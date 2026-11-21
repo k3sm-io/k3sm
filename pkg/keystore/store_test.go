@@ -564,6 +564,29 @@ func TestDeletePlantedNonDirectory(t *testing.T) {
 	}
 }
 
+// TestDeleteDirectoryAtCurrent: a non-empty directory planted at an entry's
+// current is removed with the entry, not left to fail every retried Delete.
+func TestDeleteDirectoryAtCurrent(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	mustPut(t, s, "a", KindOpaque, []byte("a"))
+	cur := filepath.Join(server, "keystore", "a", currentName)
+	remove(t, cur)
+	if err := os.Mkdir(cur, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(cur, "x"), "planted")
+	if err := s.Delete(ctx, "a"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(server, "keystore", "a")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("entry directory after Delete: %v, want it gone", err)
+	}
+	if _, _, err := s.Current(ctx, "a"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Current after Delete: %v, want ErrNotFound", err)
+	}
+}
+
 // TestConfigRefused: a zero service uid, an empty Dir or an empty MasterDir
 // makes every operation fail closed, before anything is created.
 func TestConfigRefused(t *testing.T) {

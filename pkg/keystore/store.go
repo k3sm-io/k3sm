@@ -415,8 +415,9 @@ func listEntry(e *entry, k keys) Entry {
 // called again, removes it and answers ErrNotFound, and so does the next Put
 // of the name. One holding more is damage that List reports, and Delete,
 // called again, clears it. Delete reads nothing inside the
-// entry, so it removes one List reports as corrupt. A symlink or any other
-// non-directory at the name is unlinked without being followed.
+// entry, so it removes one List reports as corrupt, whatever is planted at
+// its current. A symlink or any other non-directory at the name is unlinked
+// without being followed.
 func (s *FileStore) Delete(ctx context.Context, name string) error {
 	if err := s.delete(ctx, name); err != nil {
 		return fmt.Errorf("delete %s: %w", name, err)
@@ -467,7 +468,10 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	}
 	if !damaged {
 		defer e.close()
-		if err := e.root.Remove(currentName); err != nil {
+		// RemoveAll, not Remove: anything may be planted at current, and a
+		// non-empty directory there would fail Remove on every retry.
+		// RemoveAll removes a symlink itself, never what it names.
+		if err := e.root.RemoveAll(currentName); err != nil {
 			return err
 		}
 		if err := syncDir(e.root); err != nil {
