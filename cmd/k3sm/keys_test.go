@@ -792,7 +792,9 @@ type keysResumedStore struct {
 
 func (s *keysResumedStore) Rewrap(_ context.Context, newMaster []byte) error {
 	s.key = slices.Clone(newMaster)
-	return fmt.Errorf("rewrap: %w", keystore.ErrRewrapResumed)
+	// As the store's own: a resume of another key sealed nothing under this
+	// one (pkg/keystore's TestRewrapNotStarted).
+	return fmt.Errorf("rewrap: %w (%w)", keystore.ErrRewrapResumed, keystore.ErrRewrapNotStarted)
 }
 
 func TestKeysRewrap(t *testing.T) {
@@ -1065,6 +1067,101 @@ func TestKeysRewrapKeyOutFile(t *testing.T) {
 			t.Fatalf("master %x, want the saved key %x", h.masterFile(), got)
 		}
 	})
+}
+
+// keysHalfRewrapStore stands in for a rewrap interrupted after it renamed
+// some records in, whose master.next was then replaced or removed, the
+// scenario of pkg/keystore's TestRewrapRecoversReplacedNext. Its Rewrap runs
+// the real Rewrap to the end, then puts back the old master pair and the
+// pre-rewrap files of entry b, so entry a is sealed under the new key, b
+// under the old, and the master directory holds no master.next unless
+// replace plants another key's agreeing pair. It then fails with a
+// mid-run error, as the store's does. The crash points are pkg/keystore's
+// step seam, which no test outside that package reaches.
+type keysHalfRewrapStore struct {
+	keysStore
+	h       *keysHarness
+	replace []byte
+}
+
+func (s keysHalfRewrapStore) Rewrap(ctx context.Context, newMaster []byte) error {
+	h := s.h
+	mdir := filepath.Join(h.work, "cred", "keystore-master")
+	old := map[string][]byte{}
+	for _, n := range []string{"master", "master.sha256"} {
+		b, err := os.ReadFile(filepath.Join(mdir, n))
+		if err != nil {
+			h.t.Fatal(err)
+		}
+		old[n] = b
+	}
+	b := filepath.Join(h.t.TempDir(), "b")
+	copyTree(h.t, filepath.Join(h.keystoreDir(), "b"), b)
+	if err := s.keysStore.Rewrap(ctx, newMaster); err != nil {
+		h.t.Fatalf("the real rewrap: %v", err)
+	}
+	for n, v := range old {
+		if err := os.WriteFile(filepath.Join(mdir, n), v, 0o600); err != nil {
+			h.t.Fatal(err)
+		}
+	}
+	if err := os.RemoveAll(filepath.Join(h.keystoreDir(), "b")); err != nil {
+		h.t.Fatal(err)
+	}
+	copyTree(h.t, b, filepath.Join(h.keystoreDir(), "b"))
+	if s.replace != nil {
+		h.stageInterruptedRewrap(s.replace)
+	}
+	return fmt.Errorf("rewrap: %w: master.next changed during the rewrap", keystore.ErrMasterUntrusted)
+}
+
+// TestKeysRewrapKeyInRecoversReplacedNext: a --key-out rewrap interrupted
+// after some records moved under its key, with master.next then removed or
+// replaced by another key's agreeing pair, keeps its key file ("a resume
+// may need this file"), and --key-in with that file finishes it through the
+// CLI, although master.next.sha256 no longer names the key. Another key is
+// still refused, with nothing changed.
+func TestKeysRewrapKeyInRecoversReplacedNext(t *testing.T) {
+	for name, replace := range map[string][]byte{
+		"master.next removed":  nil,
+		"master.next replaced": bytes.Repeat([]byte{0x99}, 32),
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newKeysHarness(t)
+			h.put("system/a", []byte("a-value"))
+			h.put("system/b", []byte("b-value"))
+			before := h.masterFile()
+			h.wrap = func(s keysStore) keysStore { return keysHalfRewrapStore{keysStore: s, h: h, replace: replace} }
+			p := filepath.Join(t.TempDir(), "new-master")
+			h.mustRun(1, "rewrap", "--key-out", p)
+			saved, err := os.ReadFile(p)
+			if err != nil || len(saved) != 32 {
+				t.Fatalf("the key file after a mid-run failure: %x, %v", saved, err)
+			}
+			if !strings.Contains(h.stderr.String(), "a resume may need this file") {
+				t.Errorf("stderr %q does not say a resume may need the file", h.stderr.String())
+			}
+			if !bytes.Equal(h.masterFile(), before) {
+				t.Fatal("the staging did not restore the old master")
+			}
+			h.wrap = nil
+			h.calls = nil
+			h.mustRun(1, "rewrap", "--key-in", writeKeyFile(t, bytes.Repeat([]byte{0x4d}, 32)))
+			if slices.Contains(h.calls, "Rewrap") || !strings.Contains(h.stderr.String(), "nothing was changed") {
+				t.Fatalf("another key was not refused with nothing changed: calls %v, stderr %q", h.calls, h.stderr.String())
+			}
+			h.mustRun(0, "rewrap", "--key-in", p)
+			if !bytes.Equal(h.masterFile(), saved) {
+				t.Fatalf("master %x, want the saved key %x", h.masterFile(), saved)
+			}
+			if got := h.value("a", 1); string(got) != "a-value" {
+				t.Fatalf("a = %q", got)
+			}
+			if got := h.value("b", 1); string(got) != "b-value" {
+				t.Fatalf("b = %q", got)
+			}
+		})
+	}
 }
 
 // stageInterruptedRewrap leaves the master directory as a rewrap to key

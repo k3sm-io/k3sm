@@ -67,9 +67,10 @@ const keysUsage = `Usage:
         key k3sm mints to FILE (a new file, mode 0600, in a directory only
         root can write, never a synced or Time Machine path) before anything
         changes; keep it until rewrap reports success, then delete it. A
-        rewrap that fails with nothing recorded under the key deletes it. --key-in FILE only
-        finishes an interrupted rewrap, with the key its --key-out saved: a
-        key whose SHA-256 the interrupted rewrap did not record is refused
+        rewrap that fails before sealing anything under the key deletes it.
+        --key-in FILE only finishes an interrupted rewrap, with the key its
+        --key-out saved: the recorded master.next.sha256, or a key some
+        record already opens under; any other key is refused
 
 Names are scope-qualified: system/<name>, where <name> is 1 to 253 bytes of
 dot-separated labels of lowercase letters, digits and '-'. This build
@@ -114,12 +115,13 @@ const (
 const keysMasterSize = 32
 
 // keysStore is the slice of keystore.FileStore the keys verbs use: the Store
-// contract, the floor raise the read verbs make at their start, and the
-// record of an interrupted rewrap that rewrap --key-in is checked against.
+// contract, the floor raise the read verbs make at their start, and the two
+// checks rewrap --key-in makes against an interrupted rewrap.
 type keysStore interface {
 	keystore.Store
 	RaiseFloor(ctx context.Context) error
 	InterruptedRewrap(ctx context.Context) (fingerprint [sha256.Size]byte, ok bool, err error)
+	RecordsSealedUnder(ctx context.Context, key []byte) (bool, error)
 }
 
 // keysEnv is what the keys verbs touch, so a test can fake it.
@@ -794,22 +796,32 @@ func readKeyIn(path string) ([]byte, error) {
 	return b, nil
 }
 
-// checkKeyInRecorded refuses a --key-in key unless the store records an
-// interrupted rewrap under it: --key-in finishes a rewrap k3sm started with a
-// key it minted, and never makes an operator's key the master.
+// checkKeyInRecorded refuses a --key-in key unless an interrupted rewrap
+// used it: its SHA-256 is the recorded master.next.sha256, or some record
+// already opens under it and not under the live master (a rewrap whose
+// master.next was replaced or removed). --key-in finishes a rewrap k3sm
+// started with a key it minted, and never makes an operator's key the
+// master: no record opens under a key no rewrap sealed with.
 func checkKeyInRecorded(ctx context.Context, s keysStore, key []byte) error {
 	recorded, ok, err := s.InterruptedRewrap(ctx)
 	if err != nil {
 		return err
 	}
+	sum := sha256.Sum256(key)
+	if ok && subtle.ConstantTimeCompare(sum[:], recorded[:]) == 1 {
+		return nil
+	}
+	sealed, err := s.RecordsSealedUnder(ctx, key)
+	if err != nil {
+		return err
+	}
+	if sealed {
+		return nil
+	}
 	if !ok {
 		return errors.New("no interrupted rewrap is recorded, and --key-in only finishes one: to change the master key, run sudo k3sm keys rewrap --key-out FILE")
 	}
-	sum := sha256.Sum256(key)
-	if subtle.ConstantTimeCompare(sum[:], recorded[:]) != 1 {
-		return errors.New("the key file is not the key the interrupted rewrap recorded: pass the file its --key-out wrote")
-	}
-	return nil
+	return errors.New("the key file is not the key the interrupted rewrap used: pass the file its --key-out wrote")
 }
 
 func keysRewrap(ctx context.Context, args []string, env keysEnv) int {
@@ -871,33 +883,25 @@ func keysRewrap(ctx context.Context, args []string, env keysEnv) int {
 	if resumed {
 		code, next = keysResumed, "\nrun rewrap again with a new key: sudo k3sm keys rewrap --key-out <new file>."
 	}
-	return v.failf(code, "%v%s\n%s", err, next, keyFileAfterFailure(ctx, s, key, keyPath, *keyOut != "", resumed))
+	return v.failf(code, "%v%s\n%s", err, next, keyFileAfterFailure(err, keyPath, *keyOut != "", resumed))
 }
 
 // keyFileAfterFailure decides, after a rewrap that did not succeed, what
-// becomes of the key file, and says so. The file is kept only while the store
-// records an interrupted rewrap under its key, which is when --key-in can
-// finish that rewrap; a file this run wrote (--key-out) that no rewrap
-// recorded is deleted, since nothing is sealed under its key. A --key-in file
-// is the operator's and is never deleted.
-func keyFileAfterFailure(ctx context.Context, s keysStore, key []byte, keyPath string, wrote, resumed bool) string {
-	recorded, ok, err := s.InterruptedRewrap(ctx)
-	if err != nil {
-		return fmt.Sprintf("keep %s: whether a rewrap is recorded under it could not be checked (%v)", keyPath, err)
+// becomes of the key file, and says so. A file this run wrote (--key-out) is
+// deleted only when the error is keystore.ErrRewrapNotStarted, which the
+// store returns only before it writes anything under the key; after any
+// other error a resume may need the file, so it is kept. A --key-in file is
+// the operator's and is never deleted.
+func keyFileAfterFailure(err error, keyPath string, wrote, resumed bool) string {
+	if !wrote || !errors.Is(err, keystore.ErrRewrapNotStarted) {
+		return fmt.Sprintf("keep %s: a resume may need this file; finish with the same key: sudo k3sm keys rewrap --key-in %s", keyPath, keyPath)
 	}
-	sum := sha256.Sum256(key)
-	if ok && subtle.ConstantTimeCompare(sum[:], recorded[:]) == 1 {
-		return fmt.Sprintf("keep %s: a resume is possible, so finish with the same key: sudo k3sm keys rewrap --key-in %s", keyPath, keyPath)
-	}
-	if !wrote {
-		return fmt.Sprintf("no rewrap is recorded under the key in %s, so --key-in cannot use it", keyPath)
-	}
-	what := "nothing was changed: no rewrap is recorded under the new key"
+	what := "nothing was changed: nothing was sealed under the new key"
 	if resumed {
 		what = "the key this run drew was never used"
 	}
-	if err := os.Remove(keyPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Sprintf("%s; delete %s by hand: %v", what, keyPath, err)
+	if rerr := os.Remove(keyPath); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
+		return fmt.Sprintf("%s; delete %s by hand: %v", what, keyPath, rerr)
 	}
 	return fmt.Sprintf("%s, so %s was deleted", what, keyPath)
 }
