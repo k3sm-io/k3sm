@@ -21,13 +21,22 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"slices"
 
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
+
+	"k3sm.io/k3sm/pkg/registrysvc"
 )
 
 // errTagRepoint reports that `k3sm image tag` was asked to move an existing tag
 // onto a different manifest without --force.
 var errTagRepoint = errors.New("the tag already names another manifest")
+
+// errTagMoved reports that `k3sm image untag --digest` found the tag re-pointed
+// between its read and its conditional delete, so the registry removed nothing.
+var errTagMoved = errors.New("the tag no longer names that digest")
 
 // imageTag adds a tag to a manifest the cluster registry already holds.
 //
@@ -125,7 +134,9 @@ func imageTag(ctx context.Context, o imageOptions, out io.Writer) error {
 //
 // It is deliberately not idempotent-by-silence: an absent tag is an error,
 // because the operator asked to remove a specific name. --digest refuses the
-// removal unless the tag still names that manifest.
+// removal unless the tag still names that manifest: it is checked before the
+// DELETE and sent with it as If-Match, so the registry refuses, with 412
+// (errTagMoved), a tag a push re-pointed in between.
 //
 // It needs the server's per-boot credential: the push gate never forwards a
 // delete, so a builder token cannot remove a tag (registryDeleteAccess).
@@ -152,7 +163,18 @@ func imageUntag(ctx context.Context, o imageOptions, out io.Writer) error {
 	if o.digest != "" && desc.Digest.String() != o.digest {
 		return fmt.Errorf("untag %s: it names %s, not %s; nothing was removed", c.flat, desc.Digest, o.digest)
 	}
+	if o.digest != "" {
+		// The comparison above is advisory; the registry makes the delete
+		// itself conditional on the tag still naming the digest, under its
+		// repository lock, so a push that re-points the tag after the HEAD
+		// keeps its tag. registryDeleteAccess's transport is
+		// boundRequests(nil) (credentialAccess); this wraps that one.
+		opts = append(slices.Clone(opts), remote.WithTransport(registrysvc.IfMatchTransport(boundRequests(nil), `"`+desc.Digest.String()+`"`)))
+	}
 	if err := remote.Delete(c.remote, opts...); err != nil {
+		if terr, ok := errors.AsType[*transport.Error](err); ok && o.digest != "" && terr.StatusCode == http.StatusPreconditionFailed {
+			return fmt.Errorf("untag %s: %w; nothing was removed", c.flat, errTagMoved)
+		}
 		return registryError("untag "+c.flat.String(), err)
 	}
 	fmt.Fprintf(out, "untagged %s\n  digest:   %s\n", c.flat, desc.Digest)

@@ -316,7 +316,7 @@ k3sm image pull ghcr.io/org/app:v1            # warm this node's cache ahead of 
 | verb | what it does |
 |---|---|
 | `tag <reference\|digest> <new-tag>` | Adds a tag to a manifest the registry already holds. It sends the same manifest bytes under the new tag, so the new tag names the same digest; a source in another repository is copied across with its blobs. The source is a tag, a `<repository>@<digest>`, or a bare digest, which is looked up in the new tag's repository. `--platform` tags one platform's manifest of a multi-platform index. A new tag that already names another manifest is refused unless you pass `--force`; `build`, `load` and `import` overwrite their own tag without asking. |
-| `untag <tag>` | Deletes one tag. `--digest` refuses the removal unless the tag still names that digest. A tag names a whole index, so `untag` takes no `--platform`. |
+| `untag <tag>` | Deletes one tag. `--digest` refuses the removal unless the tag still names that digest; the cluster registry makes this check as it deletes, so a tag a push re-points in the meantime stays and `untag` reports an error. The error reads `untag <tag>: the tag no longer names that digest; nothing was removed`. Only a cluster registry from the first release after v0.2.3 onward enforces that condition. A registry from before that release either does not enforce it (v0.2.3 and earlier), so only the check made just before the delete applies and a tag re-pointed after that check is removed anyway, or refuses the removal even though the tag has not moved (a development build from between releases). The CLI does not detect or warn about this, and in both cases the fix is to upgrade the node that serves the registry. A tag names a whole index, so `untag` takes no `--platform`. |
 | `inspect <tag\|repository@digest>` | Reads the manifest and config from the registry and reports the digest, the platform, the creation time, entrypoint/cmd, user, working directory and each layer's size. An index lists its platforms; `--platform` inspects one of them. `-o json` prints the registry's manifest and config documents for scripting. Read-only. |
 | `save <tag\|repository@digest> -o <file.tar>` | Exports the image as a tarred OCI image layout, the `docker save` analog and the exact inverse of `import`: the layout names the image `registry-k3sm:6450/<repository>:<tag>`, so importing the archive records it under the same name. An index is saved whole unless `--platform` picks one platform. The archive is written beside the target and renamed into place when complete, so a failed save leaves no file behind. |
 | `pull <reference>` | Fetches the reference into this node's cache through the daemon's own puller, the same code path a Pod's pull takes, so every blob is re-hashed against its digest before it is recorded. Prints the digest it resolved to. `--platform os/arch[/variant]` picks which manifest of a multi-platform index to fetch; `--policy always\|if-not-present\|never` carries the ordinary Kubernetes pull-policy meanings. |
@@ -378,11 +378,30 @@ anywhere.
 The `-o json` document has three keys. `dryRun` is true without `--force`. `registry` holds
 `name`, `skipped` (set only on a node without a registry), `manifests` (each with `repository`,
 `digest`, `mediaType` and `size`, deleted or to be deleted), `kept` (the untagged manifests kept,
-each with its `reason`), and, when present, `unreadable` repositories, `failed` deletions and
-the `sweep` a forced prune ran (`repositories`, `blobs`, `bytes`, and any `stopped`, `failed` or
-`reviewing` repositories and `error`).
+each with its `reason`), and, when present, `unreadable` repositories, `failed` deletions,
+`interrupted` and the `unattempted` manifests (not attempted, or cut off by the cancellation) of an
+interrupted prune, and the `sweep` a forced prune ran (`repositories`, `blobs`, `bytes`, and any
+`stopped`, `failed` or `reviewing` repositories and `error`).
 `cache` holds `blobs`, `reclaimedBytes` and `kept` (counts by reason). The command exits non-zero
-when any deletion fails, after printing the report.
+when any deletion fails or the prune is interrupted, after printing the report.
+
+A forced prune that is cancelled, by Ctrl+C, by SIGTERM or by `--timeout` expiring, stops before its
+next deletion. The deletions already made stand, and `manifests` then holds only the ones the
+registry confirmed. The registry's garbage collection (the sweep) still reclaims those within a time
+limit: a note on stderr says how many and how long. The report marks the prune `interrupted` and
+lists under `unattempted`, not under `failed`, every planned manifest the prune did not attempt and
+every deletion it could not confirm because the cancellation cut it off. Listing here means the
+prune did not confirm the deletion, not that the manifest still exists. A deletion the registry
+refused is listed under `failed`, even when the refusal came at the moment of the cancellation. The
+prune is still marked `interrupted`, so an interrupted prune can list failures. If the registry
+refuses the last planned deletion just as the cancellation arrives, `unattempted` is empty, that
+manifest is under `failed`, and the note on stderr says no planned manifest was left unattempted. A
+deletion the cancellation cut off in flight may still have been completed by the registry, so a
+manifest under `unattempted` may already be gone. Those manifests are not swept by this run; a later
+prune or the registry's scheduled garbage collection reclaims them. The table on stdout keeps its
+usual lines; the interruption is reported on stderr, and the command exits non-zero after printing
+the report. It is safe to run the prune again: it plans from the registry's current state, so a
+manifest that is already gone is simply not listed and the rest are deleted.
 
 ## Pushing to a Registry: `k3sm image push`
 
