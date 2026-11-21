@@ -202,5 +202,5 @@ var (
 	// earlier rewrap's: the master is that rewrap's key, a new Rewrap retires
 	// it, and no key file finishes anything. Alone, it was this call's own:
 	// the master is the key supplied, which the caller must keep.
-	ErrRewrapSwapUnsynced = errors.New("the earlier rewrap's master swap completed but did not sync")
+	ErrRewrapSwapUnsynced = errors.New("the master swap completed but did not sync")
 )

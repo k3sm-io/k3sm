@@ -1347,6 +1347,10 @@ func TestRewrapOwnSwapUnsynced(t *testing.T) {
 	if !errors.Is(err, ErrRewrapSwapUnsynced) || errors.Is(err, ErrRewrapResumeFailed) || errors.Is(err, ErrRewrapNotStarted) {
 		t.Fatalf("Rewrap failing after its own swap = %v, want ErrRewrapSwapUnsynced alone", err)
 	}
+	// The marker's text fits this run's own swap too.
+	if strings.Contains(err.Error(), "earlier") {
+		t.Fatalf("Rewrap failing after its own swap = %v: names an earlier rewrap", err)
+	}
 	checkMasterIs(t, server, rewrapKey(1))
 	checkUnderKey(t, server, rewrapKey(1))
 	// A crash before the second rename is not a completed swap.

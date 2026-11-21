@@ -1380,6 +1380,10 @@ func TestKeysRewrapOwnSwapUnsynced(t *testing.T) {
 	if !strings.Contains(h.stderr.String(), want) || strings.Contains(h.stderr.String(), "--key-in") {
 		t.Errorf("stderr %q does not say %q, or offers --key-in", h.stderr.String(), want)
 	}
+	// No line speaks of an earlier rewrap, which this run's own swap is not.
+	if strings.Contains(h.stderr.String(), "earlier") {
+		t.Errorf("stderr %q names an earlier rewrap", h.stderr.String())
+	}
 	if got, rerr := os.ReadFile(p); rerr != nil || len(got) != 32 {
 		t.Fatalf("the key file after this run's own swap: %x, %v; want it kept", got, rerr)
 	}
