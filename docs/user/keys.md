@@ -42,7 +42,9 @@ name.
   (DNS-1123 subdomain); it is not echoed". An invalid flag value is refused the same way: the
   message names the flag, never the value. That holds for the path flags too (`--in`,
   `--key-in`, `--key-out`, `--work-dir`): their errors and warnings name the flag and the reason,
-  such as "open --in: no such file or directory (the path is not echoed)", never the path.
+  such as "open --in: no such file or directory (the path is not echoed)", never the path. An
+  error from the keystore itself shows the paths under `--work-dir` as `<work-dir>`,
+  `<master-dir>` and `<data-root>`.
 
 ## The Verbs
 

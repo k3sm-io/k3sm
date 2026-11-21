@@ -31,6 +31,7 @@ import (
 	"os/signal"
 	"os/user"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -189,6 +190,9 @@ type keysVerb struct {
 	env     keysEnv
 	// badFlag is the defined flag whose value the last parse refused.
 	badFlag string
+	// roots are the work dir, MasterDir and DataRoot store derived from
+	// --work-dir, in scrubPaths' order; failf scrubs them from every message.
+	roots []string
 }
 
 // keysFlagValue wraps a defined flag's value so parse learns which flag
@@ -265,8 +269,10 @@ func (v *keysVerb) flagError(err error) {
 	}
 }
 
+// failf prints a refusal. It is the one choke point for store errors: the
+// message is scrubbed of the store's roots (scrubPaths) before it is printed.
 func (v *keysVerb) failf(code int, format string, a ...any) int {
-	fmt.Fprintf(v.env.stderr, "k3sm keys %s: %s\n", v.name, fmt.Sprintf(format, a...))
+	fmt.Fprintf(v.env.stderr, "k3sm keys %s: %s\n", v.name, scrubText(fmt.Sprintf(format, a...), v.roots...))
 	return code
 }
 
@@ -285,17 +291,54 @@ func (v *keysVerb) store() (keysStore, error) {
 	if !filepath.IsAbs(work) {
 		return nil, errors.New("--work-dir is not an absolute path (the value given is not echoed)")
 	}
+	cfg := keystore.Config{
+		Dir:       filepath.Join(work, keystoreSubdir),
+		MasterDir: filepath.Join(executor.CredDir(work), keystoreMasterSubdir),
+		DataRoot:  executor.RuntimeRoot(work),
+	}
+	v.roots = []string{work, cfg.MasterDir, cfg.DataRoot}
 	uid, gid, err := v.env.serviceIDs()
 	if err != nil {
 		return nil, err
 	}
-	return v.env.open(keystore.Config{
-		Dir:       filepath.Join(work, keystoreSubdir),
-		MasterDir: filepath.Join(executor.CredDir(work), keystoreMasterSubdir),
-		UID:       uid,
-		GID:       gid,
-		DataRoot:  executor.RuntimeRoot(work),
-	}), nil
+	cfg.UID, cfg.GID = uid, gid
+	return v.env.open(cfg), nil
+}
+
+// scrubTokens name scrubPaths' roots, by position.
+var scrubTokens = []string{"<work-dir>", "<master-dir>", "<data-root>"}
+
+// scrubPaths is err's text with every occurrence of each root, and of its
+// resolved and /private-prefixed forms, replaced by its token: roots[0] the
+// work dir (<work-dir>), roots[1] MasterDir (<master-dir>), roots[2]
+// DataRoot (<data-root>). The store's errors name the paths it opened, all
+// under --work-dir, which may be a value typed in the wrong place. Longer
+// paths are replaced first, so a path inside another keeps its own token;
+// "/" is never replaced.
+func scrubPaths(err error, roots ...string) string {
+	return scrubText(err.Error(), roots...)
+}
+
+func scrubText(msg string, roots ...string) string {
+	type sub struct{ from, to string }
+	var subs []sub
+	for i, r := range roots {
+		if i >= len(scrubTokens) || r == "" || r == "/" {
+			continue
+		}
+		forms := []string{r, "/private" + r}
+		if real, err := filepath.EvalSymlinks(r); err == nil {
+			forms = append(forms, real)
+		}
+		for _, f := range forms {
+			subs = append(subs, sub{f, scrubTokens[i]})
+		}
+	}
+	slices.SortStableFunc(subs, func(a, b sub) int { return len(b.from) - len(a.from) })
+	for _, x := range subs {
+		msg = strings.ReplaceAll(msg, x.from, x.to)
+	}
+	return msg
 }
 
 // errUserScope refuses a user/... name: the grammar exists, this build does
@@ -619,6 +662,9 @@ func keysList(ctx context.Context, args []string, env keysEnv) int {
 	code := keysOK
 	for _, e := range entries {
 		r := keysEntryStatus(e)
+		// The row's error is a store error printed on stdout: scrubbed as
+		// failf scrubs.
+		r.Error = scrubText(r.Error, v.roots...)
 		if r.Status != "ok" {
 			code = keysRefused
 		}

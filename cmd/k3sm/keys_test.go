@@ -643,6 +643,8 @@ func TestKeysRefusals(t *testing.T) {
 		want      int
 		say       string
 		never     string
+		// reaches is set for a row refused by the store itself.
+		reaches bool
 	}{
 		{name: "put not root", args: []string{"put", "system/a", "--in", "-"}, euid: 501, stdin: "v", want: 1, say: "sudo"},
 		{name: "list not root", args: []string{"list"}, euid: 501, want: 1, say: "sudo"},
@@ -672,6 +674,9 @@ func TestKeysRefusals(t *testing.T) {
 		{name: "in path not echoed", args: []string{"put", "system/x", "--in", "Hunter2"}, want: 1, say: "open --in: no such file or directory (the path is not echoed)", never: "Hunter2"},
 		{name: "key-in path not echoed", args: []string{"rewrap", "--key-in", "/tmp/Hunter2"}, want: 1, say: "open --key-in: no such file or directory (the path is not echoed)", never: "Hunter2"},
 		{name: "key-out path not echoed", args: []string{"rewrap", "--key-out", "/nonexistent/Hunter2"}, want: 1, say: "--key-out: no such file or directory (the path is not echoed)", never: "Hunter2"},
+		{name: "work dir in a list store error", args: []string{"list", "--work-dir", "/Hunter2/server"}, want: 1, say: "<data-root>", never: "Hunter2", reaches: true},
+		{name: "work dir in a put store error", args: []string{"put", "system/x", "--work-dir", "/Hunter2/server"}, stdin: "v", want: 1, say: "<data-root>", never: "Hunter2", reaches: true},
+		{name: "work dir beside a refused key-out", args: []string{"rewrap", "--key-out", "/tmp/k", "--work-dir", "/Hunter2/server"}, want: 1, say: "--key-out", never: "Hunter2"},
 		{name: "unknown verb not echoed", args: []string{"Hunter2"}, want: 2, say: "unknown subcommand (not echoed); see k3sm keys --help", never: "Hunter2"},
 		{name: "relative work dir not echoed", args: []string{"list", "--work-dir", "Hunter2"}, want: 1, say: "--work-dir", never: "Hunter2"},
 	} {
@@ -694,13 +699,24 @@ func TestKeysRefusals(t *testing.T) {
 				t.Errorf("output carries a stored value: %q", out)
 			}
 			for _, c := range h.calls {
-				if c != "RaiseFloor" && c != "Current" && c != "Get" {
+				if !tc.reaches && c != "RaiseFloor" && c != "Current" && c != "Get" {
 					t.Errorf("refused verb reached the store: %v", h.calls)
 					break
 				}
 			}
 		})
 	}
+	t.Run("work dir in a rewrap store error", func(t *testing.T) {
+		h := newKeysHarness(t)
+		p := filepath.Join(t.TempDir(), "k")
+		h.mustRun(1, "rewrap", "--key-out", p, "--work-dir", "/Hunter2/server")
+		if !slices.Contains(h.calls, "Rewrap") {
+			t.Fatalf("rewrap did not reach the store: %v", h.calls)
+		}
+		if out := h.stdout.String() + h.stderr.String(); strings.Contains(out, "Hunter2") || !strings.Contains(out, "<") {
+			t.Errorf("output echoes the work dir, or names no scrubbed root: %q", out)
+		}
+	})
 	t.Run("absent entry names the validated name only", func(t *testing.T) {
 		h := newKeysHarness(t)
 		h.put("system/held", []byte("held-secret"))
@@ -740,6 +756,32 @@ func TestKeysRefusals(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestKeysScrubPaths: scrubPaths replaces each root, its /private form and
+// its resolved form with the root's token, a path inside another root with
+// its own, and never "/".
+func TestKeysScrubPaths(t *testing.T) {
+	work := "/Hunter2/server"
+	master := work + "/cred/keystore-master"
+	data := "/Hunter2"
+	err := fmt.Errorf("open %s/master: x; open %s/keystore/a: y; open /private%s/keystore-floor.json: z; open /etc/hosts", master, work, data)
+	got := scrubPaths(err, work, master, data)
+	want := "open <master-dir>/master: x; open <work-dir>/keystore/a: y; open <data-root>/keystore-floor.json: z; open /etc/hosts"
+	if got != want {
+		t.Fatalf("scrubPaths = %q, want %q", got, want)
+	}
+	if got := scrubPaths(errors.New("open /a/b"), "/a", "/a/m", "/"); got != "open <work-dir>/b" {
+		t.Fatalf("scrubPaths with a / data root = %q", got)
+	}
+	dir := t.TempDir()
+	real, rerr := filepath.EvalSymlinks(dir)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if got := scrubPaths(fmt.Errorf("open %s/x", real), dir); got != "open <work-dir>/x" {
+		t.Fatalf("scrubPaths of the resolved path = %q", got)
+	}
 }
 
 // TestKeysReadValueOneBuffer: readValue reads into one buffer of the cap plus
