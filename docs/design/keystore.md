@@ -1137,7 +1137,8 @@ GeneratedUID**.
   reads the uid's live GeneratedUID with `mbr_uid_to_uuid` and refuses with
   `ErrScopeOwnerChanged` when it differs from the record's generation. A deleted account whose
   uid is reused opens nothing of the old account's. Root removes such a scope with `sudo k3sm
-  keys rm-scope user/<uid> --yes`.
+  keys rm-scope user/<uid> --yes`, which revokes the scope's deliveries before it removes
+  anything ("`rm-scope` revokes first").
 - **A synthesized GeneratedUID is no answer.** For a uid with no directory record the
   membership API can return a compatibility UUID it makes up from the uid: the fixed prefix
   `FFFFEEEE-DDDD-CCCC-BBBB-AAAA` followed by the uid in hex. The lookup recognises that
@@ -1728,7 +1729,8 @@ it may change and that a conversion is owed if it does.
   | `UserScopeOff` | `Ready` | `False` | more than one server is registered |
   | `DeletePending` | `SecretRetained` | `True` | `Authorized` is `False` and the Secret this object owns is due for deletion but still exists: the delete call failed, or the revocation reserve is exhausted |
   | `Unowned` | `SecretRetained` | `True` | `Authorized` is `False` with `NotRecorded` for a UID never recorded, and a labelled Secret names this UID: it is not this object's to delete, and it stays |
-  | `NoneRetained` | `SecretRetained` | `False` | no Secret is kept under `Authorized=False`; set whenever `Authorized` is not `False` too |
+  | `Indeterminate` | `SecretRetained` | `True` | `Authorized` is `Unknown` and a labelled Secret that is this object's recorded target stays, at its last version |
+  | `NoneRetained` | `SecretRetained` | `False` | no labelled Secret of this object stays while `Authorized` is `Unknown` or `False`; and whenever `Authorized` is `True` |
 
   **What each `Authorized=False` reason does to the Secret.** Every reason is tied to one
   action, and the status says which:
@@ -1743,13 +1745,17 @@ it may change and that a conversion is owed if it does.
   - `NotAuthorized`: **deleted** (on two consecutive sweeps).
 
   When a deletion is due and the Secret still exists, `SecretRetained` is `True` with reason
-  `DeletePending` until it is gone, so a kept Secret is never silent (U43).
+  `DeletePending` until it is gone, so a kept Secret is never silent (U43). The rule is
+  general: `SecretRetained` is `True` whenever a labelled Secret stays while `Authorized` is
+  `Unknown` or `False`, with `Indeterminate`, `DeletePending` or `Unowned` saying why, and
+  `False` only when no such Secret stays or `Authorized` is `True` (U78).
 
   While `Authorized` is `False`, `Ready` is `False` with the single reason `NotAuthorized`, and
   its message carries the `Authorized` reason (`EntryUnavailable`, `NotRecorded` or
   `NotAuthorized`), so `Ready` has one reason for every authority failure. While `Authorized`
   is `Unknown`, `Ready` is `Unknown` with reason `Pending`; nothing was changed, so the Secret,
-  if any, keeps its last version. **A tolerant
+  if any, keeps its last version, and `SecretRetained` is `True` with reason `Indeterminate`
+  while it does. **A tolerant
   reader:** a consumer treats a reason it does not know as a generic failure of the condition
   that carries it, so a reason added later breaks no reader.
 
@@ -1974,6 +1980,31 @@ transient failure (`ErrScopeOwnerUnknown`,
 the object is already being deleted, so treating an absent scope as withdrawn here deletes
 nothing that the object's deletion did not already (U75). This differs on purpose from Phase A's root-file delivery, which never deletes (G20): a
 revocation that leaves a long-lived token in place is not a revocation.
+
+**`rm-scope` revokes first.** Removing a scope must not leave its delivered Secrets in place
+with no record left to find them by. `sudo k3sm keys rm-scope user/<uid> --yes` holds the store
+lock exclusively for its whole run, so no reconciler write from that scope lands in between,
+and runs in this order:
+
+1. **Read the sealed `deliveries` record, if it opens.** Root opens `scope.key` under `W`
+   without the GeneratedUID check, since removing an owner-changed scope is the verb's main
+   use and the record's targets are what it needs; the record must still authenticate.
+2. **Delete every recorded delivery's Secret** through the admin client the reconciler uses,
+   with the target-matching rule of "Ownership at deletion rests on the record": for each UID
+   in the record, recorded or withdrawn, only the Secret whose namespace and name are that
+   UID's recorded target, carrying the label and an owner annotation naming that UID and the
+   recorded entry. A Secret already gone counts as done; any other Secret is left alone. Each
+   delete writes a `deliver-delete` line, `via` `root`, charged to no uid.
+3. **Then remove the scope.**
+
+If the API server is unreachable, `rm-scope` refuses and changes nothing: it removes no
+Secret and no file. If a delete fails part-way, it stops before step 3, so a rerun finds the
+record intact and resumes. If the record cannot be opened (missing, corrupt, or sealed under a
+`scope.key` that does not open), `rm-scope` refuses unless `--orphan-secrets` is given. With
+that flag it lists every Secret labelled for KeyDelivery whose owner annotation names an
+entry of this scope, deletes none of them, leaves them for root to judge, and then removes the
+scope; it still refuses when the API server is unreachable, since it cannot list (U77). The
+KeyDeliveries that named the scope then drop their finalizers as for a removed scope (U75).
 
 **Revocation is rotation.** Deleting the Secret does not un-share a value a Pod already read.
 The docs and the CLI say so (residual 8).
@@ -2351,6 +2382,8 @@ each stated in the change that makes it. U15 is held for a K0 amendment and U39 
 | U74 | `withdraw` by namespace and name deletes the caller's own unrecorded object after checking `requestedBy` against the peer uid, impersonating that principal with a UID precondition; an object of another uid answers `not-found` and is left | `k3sm/pkg/keystore/socket::TestWithdrawRemovesOwnUnrecordedObject` | pending: KeyDelivery authoring |
 | U75 | the finalizer's withdraw step counts a scope that cannot be opened because the owner changed, or that `rm-scope` removed, as withdrawn and drops the finalizer after the Secret is gone; `ErrScopeOwnerUnknown` and other errors keep it | `k3sm/pkg/keystore/reconcile::TestFinalizerDropsWhenScopeUnopenable` | pending: the KeyDelivery reconciler (lifecycle) |
 | U76 | k3sm's CA refuses a CN `k3sm:local:*` and an Organization `k3sm:local-users` in every issuing path, in `issueLeaf`, so `IssueClient`, both CSR signers and the join exchange's CSR approvals are covered; the controller-manager runs with no cluster-signing key | `k3sm/pkg/certs::TestReservedLocalPrincipalsRefusedInCSR`, `TestReservedLocalPrincipalsRefusedEveryIssuer`; `k3sm/pkg/executor::TestControllerManagerHasNoClusterSigningKey` | pending: KeyDelivery authoring |
+| U77 | `rm-scope` revokes first: under the exclusive store lock it reads the sealed `deliveries` record, deletes each recorded delivery's Secret through the reconciler's admin client by the target-matching rule (namespace, name, label, owner annotation and recorded entry), and only then removes the scope; with the API server unreachable it refuses and changes nothing, no Secret and no file (seams: euid source) | `k3sm/cmd/k3sm::TestRmScopeDeletesDeliveredSecretsFirst`, `TestRmScopeRefusesWithoutAPI` | pending: the KeyDelivery reconciler (lifecycle) |
+| U78 | `SecretRetained` is `True` whenever a labelled Secret stays while `Authorized` is `Unknown` or `False`: under `Unknown` with reason `Indeterminate`, the Secret at its last version; `NoneRetained` only when none stays or `Authorized` is `True` | `k3sm/pkg/keystore/reconcile::TestSecretRetainedTrueUnderUnknown` | pending: the KeyDelivery reconciler (authority) |
 
 ### Rig legs
 

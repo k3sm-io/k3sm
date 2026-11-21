@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # The keystore's acceptance gate: docs/design/keystore.md § "Acceptance gate",
-# rows G1 to G22, the user-scope rows U1 to U76 (U15 and U39 are unused) and
+# rows G1 to G22, the user-scope rows U1 to U78 (U15 and U39 are unused) and
 # the rig legs E1 to E25. Every row is listed, on exactly one line. A row runs
 # the tests that deliver it and passes only if each named test ran and passed
 # in its own package; a row whose change has not landed yet prints PENDING,
@@ -41,9 +41,9 @@
 #   --socket-ops    the socket operations: U32 to U35, U45, U51, U67.
 #   --exec          the non-root CLI and exec: U36 to U38, U69.
 #   --kd-author     KeyDelivery authoring: U40, U41, U74, U76.
-#   --kd-reconcile  the KeyDelivery reconciler: U42, U43, U59, U73.
+#   --kd-reconcile  the KeyDelivery reconciler: U42, U43, U59, U73, U78.
 #   --kd-lifecycle  the KeyDelivery lifecycle: U44, U53, U55, U56, U62, U65,
-#                   U72, U75.
+#                   U72, U75, U77.
 #   --grammar       the entry grammar in apis: U57.
 #   --docs          the user docs: no row yet, so it exits 3.
 # A unit mode runs only its rows and only their tests, with the same exit
@@ -105,6 +105,7 @@ EXPECTED_ROWS="$EXPECTED_ROWS U49 U50 U51 U52 U53 U54 U55 U56 U57"
 EXPECTED_ROWS="$EXPECTED_ROWS U58 U59 U60 U61 U62 U63"
 EXPECTED_ROWS="$EXPECTED_ROWS U64 U65 U66 U67 U68 U69 U70 U71"
 EXPECTED_ROWS="$EXPECTED_ROWS U72 U73 U74 U75 U76"
+EXPECTED_ROWS="$EXPECTED_ROWS U77 U78"
 # >>> ADD NEW U ROWS (U64 upward) HERE <<<
 EXPECTED_ROWS="$EXPECTED_ROWS E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 E13 E14 E15 E16 E17 E18 E19 E20"
 EXPECTED_ROWS="$EXPECTED_ROWS E21 E22 E23 E24 E25"
@@ -140,8 +141,8 @@ mode_rows() {
 	socket-ops) echo "U32 U33 U34 U35 U45 U51 U67" ;;
 	exec) echo "U36 U37 U38 U69" ;;
 	kd-author) echo "U40 U41 U74 U76" ;;
-	kd-reconcile) echo "U42 U43 U59 U73" ;;
-	kd-lifecycle) echo "U44 U53 U55 U56 U62 U65 U72 U75" ;;
+	kd-reconcile) echo "U42 U43 U59 U73 U78" ;;
+	kd-lifecycle) echo "U44 U53 U55 U56 U62 U65 U72 U75 U77" ;;
 	grammar) echo "U57" ;;
 	*) echo "" ;;
 	esac
@@ -524,6 +525,10 @@ pend U75 "the finalizer counts a scope unopenable for an owner change, or remove
 	k3sm/pkg/keystore/reconcile::TestFinalizerDropsWhenScopeUnopenable
 pend U76 "k3sm's CA refuses CN k3sm:local:* and O k3sm:local-users in issueLeaf, so every issuer and CSR path; the controller-manager has no cluster-signing key (KeyDelivery authoring)" \
 	k3sm/pkg/certs::TestReservedLocalPrincipalsRefusedInCSR TestReservedLocalPrincipalsRefusedEveryIssuer k3sm/pkg/executor::TestControllerManagerHasNoClusterSigningKey
+pend U77 "rm-scope revokes first: under the exclusive store lock it reads the sealed deliveries record, deletes each recorded delivery's Secret by the target-matching rule, and only then removes the scope; with the API server unreachable it refuses and changes nothing (KeyDelivery lifecycle)" \
+	k3sm/cmd/k3sm::TestRmScopeDeletesDeliveredSecretsFirst TestRmScopeRefusesWithoutAPI
+pend U78 "SecretRetained is True whenever a labelled Secret stays while Authorized is Unknown or False: under Unknown with reason Indeterminate; NoneRetained only when none stays or Authorized is True (KeyDelivery reconciler)" \
+	k3sm/pkg/keystore/reconcile::TestSecretRetainedTrueUnderUnknown
 # >>> ADD NEW U ROWS (U64 upward) HERE, and add each to EXPECTED_ROWS and to mode_rows <<<
 
 leg E1 "files" "preconditions: secrets encryption on; one server; keystore-run/ and both logs present, service-user 0600, SF_APPEND set; the doctor user-scope row on; keystore.sh --check exits 0 on the build" "the append-only files"
@@ -641,6 +646,8 @@ U64|ErrScopeAbsent
 U64|a missing entries/ directory or a missing deliveries record is ErrScopeAbsent too
 U66|FFFFEEEE-DDDD-CCCC-BBBB-AAAA
 U67|4 MiB revocation reserve
+U77|only then removes the scope
+U77|refuses and changes nothing
 U68|O_EXCL
 U69|LOCAL_PEERTOKEN
 U69|cdhash
