@@ -457,7 +457,7 @@ func (v *keysVerb) readValue(in string) ([]byte, error) {
 		return buf[:n], nil
 	default:
 		clear(buf)
-		return nil, fmt.Errorf("read the value: %w", err)
+		return nil, pathFailure("read", "--in", err)
 	}
 }
 

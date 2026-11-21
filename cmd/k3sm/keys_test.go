@@ -811,6 +811,22 @@ func TestKeysReadValueOneBuffer(t *testing.T) {
 	}
 }
 
+// TestKeysReadValueErrorNotEchoed: a read error from --in is reported as
+// the flag and the errno class, never the path a wrapped fs.PathError
+// carries.
+func TestKeysReadValueErrorNotEchoed(t *testing.T) {
+	var stderr bytes.Buffer
+	env := keysEnv{
+		stdin:    iotest.ErrReader(&fs.PathError{Op: "read", Path: "/Hunter2/value", Err: syscall.EIO}),
+		stdinTTY: func() bool { return false },
+		stderr:   &stderr,
+	}
+	_, err := newKeysVerb("put", env).readValue("-")
+	if err == nil || strings.Contains(err.Error(), "Hunter2") || !strings.Contains(err.Error(), "read --in: input/output error (the path is not echoed)") {
+		t.Fatalf("readValue = %v, want the flag and the errno class without the path", err)
+	}
+}
+
 // TestKeysInFileChecks: --in FILE reads only a regular file, reached without
 // following a symlink and without blocking on a FIFO, and warns when group or
 // others can read or write it, or another user than root owns it.
