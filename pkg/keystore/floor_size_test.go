@@ -200,3 +200,66 @@ func TestFloorFull(t *testing.T) {
 		mustPut(t, s, "n", KindOpaque, []byte("x"))
 	})
 }
+
+// TestFloorPutExactBound: a Put whose floor lands exactly on maxFloorSize
+// succeeds, and the size the room check computes is the length of the floor
+// written. A Put one byte over is refused with nothing written.
+func TestFloorPutExactBound(t *testing.T) {
+	ctx := context.Background()
+	const name = "edge"
+	// The floor entry a Put of name writes: sequence 1, a real generation.
+	e := floorEntry{Generation: strings.Repeat("00", generationSize), Seq: 1}
+	// The filler makes the floor non-empty, so the entry adds its comma too.
+	add := floorEntrySize(name, e) + 1
+
+	t.Run("lands exactly on the bound", func(t *testing.T) {
+		t.Parallel()
+		s, server := newTestStore(t)
+		fillFloor(t, server, nil, maxFloorSize-add)
+		fl := floorOf(t, server)
+		// What room computes for the result of this Put.
+		want := fl.size() + fl.grow(name, e)
+		if want != maxFloorSize {
+			t.Fatalf("room's size = %d, want exactly %d", want, maxFloorSize)
+		}
+		if err := fl.room(name, e); err != nil {
+			t.Fatalf("room refused a floor that lands on the bound: %v", err)
+		}
+		if _, err := s.Put(ctx, name, KindOpaque, []byte("x")); err != nil {
+			t.Fatalf("Put landing on maxFloorSize: %v", err)
+		}
+		got := floorOf(t, server)
+		b, err := marshalFloor(got)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(b) != want || len(b) != maxFloorSize {
+			t.Fatalf("written floor is %d bytes, room computed %d, want %d", len(b), want, maxFloorSize)
+		}
+		if disk, err := os.ReadFile(floorPath(server)); err != nil || len(disk) != len(b) {
+			t.Fatalf("floor file is %d bytes (%v), want %d", len(disk), err, len(b))
+		}
+		mustCurrent(t, s, name, "x")
+	})
+	t.Run("one byte over is refused", func(t *testing.T) {
+		t.Parallel()
+		s, server := newTestStore(t)
+		fillFloor(t, server, nil, maxFloorSize-add+1)
+		before, err := os.ReadFile(floorPath(server))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := floorOf(t, server).room(name, e); !errors.Is(err, errFloorFull) || !strings.Contains(err.Error(), fmt.Sprintf("(%d bytes)", maxFloorSize+1)) {
+			t.Fatalf("room one byte over: %v, want errFloorFull at %d bytes", err, maxFloorSize+1)
+		}
+		if _, err := s.Put(ctx, name, KindOpaque, []byte("x")); !errors.Is(err, errFloorFull) {
+			t.Fatalf("Put one byte over: %v, want errFloorFull", err)
+		}
+		if _, err := os.Lstat(filepath.Join(server, "keystore", name)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("the refused Put left its entry directory: %v", err)
+		}
+		if after, err := os.ReadFile(floorPath(server)); err != nil || !bytes.Equal(after, before) {
+			t.Fatalf("the floor changed (%d bytes, %v), want the %d bytes it held", len(after), err, len(before))
+		}
+	})
+}
