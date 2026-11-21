@@ -330,7 +330,11 @@ func (s *FileStore) adoptSupplied(ctx context.Context, root, mroot *os.Root, fl 
 func (s *FileStore) writeNext(mroot *os.Root, key []byte) error {
 	// The stale fingerprint goes first, so an interruption never leaves one
 	// that vouches for a key that was not written; the rename of master.next
-	// replaces a stale one.
+	// replaces a stale one. This is defence in depth: without it, a crash
+	// between the two writes would leave master.next beside a fingerprint it
+	// does not match, which the next run already treats as a master.next that
+	// does not agree. Removing it first means no fingerprint ever names a key
+	// other than the one written beside it.
 	if err := mroot.Remove(masterNextFingerprintName); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("remove the stale %s: %w", masterNextFingerprintName, err)
 	}

@@ -542,7 +542,12 @@ master files, to move in two phases:
    started** (some record is live under it, or the swap below is half done): discarding it
    would orphan that record, so Rewrap completes it, then returns `ErrRewrapResumed`, whose
    message says an earlier rewrap was completed with a key other than the one supplied and
-   that rewrap must run again to retire it. If it exists and does not agree, the two cases
+   that rewrap must run again to retire it. The "committed under `master.next`" signal can be
+   forged by the service user, who owns the entry and master directories: it can plant a
+   `master.next` with its fingerprint and seal a record under it. A forged commit is
+   therefore completed and reported with `ErrRewrapResumed`, never silently. This adds
+   nothing the service user could not already do. A caller must treat `ErrRewrapResumed` as
+   a failure that needs a second Rewrap; the CLI will exit non-zero on it. If it exists and does not agree, the two cases
    are told apart by whether any `.new` file exists anywhere. With none (step 3 only starts
    after step 2 is durable), the crash was inside step 2: discard it and mint again. **With
    any `.new` file present, refuse with `ErrMasterUntrusted`**: step 3 had started, so
@@ -593,6 +598,19 @@ the conservative way:
   key; otherwise it is `ErrCorrupt` and is not renamed. Before step 5 `master.next` is read
   again, and after its rename `master` is read back; each must be the key the records were
   sealed under, or the Rewrap stops with `ErrMasterUntrusted` before the fingerprint rename.
+- *A `.user` created during the run* is caught by one more check, right before step 5: the
+  Rewrap stops with `ErrScopeUnsupported`, the master not swapped and `master.next` still
+  agreeing, every record readable, and a rerun with the same key completes it once `.user`
+  is gone.
+- *Recovery for a stuck `master.next`.* If the service user replaces or removes
+  `master.next` mid-run, after some record has moved, those records are sealed under the
+  caller's new key, which then exists only as the caller's input; the next run's step 2
+  refuses (`ErrMasterUntrusted`, or `ErrCorrupt` naming the entry that opens under neither
+  key). The operator reruns Rewrap with the same new key: when every record opens under
+  the live master or that key, and some only under that key, Rewrap writes `master.next`
+  and its fingerprint again from it and completes. A record under any third key still
+  refuses it, and a rerun with any other key is refused, writing nothing. A caller
+  therefore keeps the new key until Rewrap returns without error.
 - *Completing the swap.* Every verb that takes the exclusive lock (Put, Rotate, Delete,
   `RaiseFloor`, Rewrap) finishes the second rename first; readers trust the master and write
   nothing. A Rewrap that finishes it has completed the interrupted one and stops with
@@ -617,8 +635,18 @@ the conservative way:
 - *Passes.* Four, each a walk over every entry: the floor raise, which opens each pointer;
   the plan, which opens every record under the old key or the new; the seal, which opens each
   record still under the old key and writes its `.new`; and the commit, which opens each such
-  record and its `.new` again and renames. A discarded `master.next` adds a listing pass over
-  the entry directories, and so does the `.new` check when `master.next` is bad.
+  record and its `.new` again and renames. Every Rewrap that does not resume also runs the
+  `.new` check, a listing pass over the entry directories. A discarded `master.next` adds a
+  full plan pass, which opens every record under the old key or `master.next`, and a listing
+  pass that removes its `.new` files. The recovery for a stuck `master.next` (above) adds one
+  more plan pass, and only to a run step 2 refuses.
+- *Nonces.* Every seal draws a random 96-bit nonce, and NIST SP 800-38D limits one key to
+  2^32 (4,294,967,296) seals with random 96-bit nonces. At the bounds above, a keystore holds
+  67,650 × 65,537 = 4,433,578,050 records (about 4.4e9), all of which one Rewrap seals under
+  the new key, so the theoretical maximum exceeds that limit, before counting the seals Put
+  and Rotate add under the same key. Real keystores are many orders of magnitude below it:
+  1,000 entries of 100 versions each are 101,000 records, about 2^17, some 15 doublings
+  short of 2^32.
 - *Locks.* The whole run holds the exclusive `.lock` and the data-root lock, and checks `ctx`
   every 64 names or versions in each pass, so a cancelled context stops it soon after; what it
   wrote by then is a state a rerun completes or discards.
