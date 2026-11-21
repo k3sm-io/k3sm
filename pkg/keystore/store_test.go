@@ -829,6 +829,55 @@ func TestLockExcludes(t *testing.T) {
 	})
 }
 
+// TestFirstRunRaceIsRetryable: a new entries' directory that holds only the
+// lock file is what a concurrent first operation leaves, which took the lock
+// in it between this one's mkdir and its check. That is refused, and not
+// handed over, but as errConcurrentCreate, which says to try again, not as
+// ErrCorrupt, whose fix (restore from backup) would be the wrong one, and the
+// retried Put succeeds. Anything more in the directory is still ErrCorrupt.
+func TestFirstRunRaceIsRetryable(t *testing.T) {
+	ctx := context.Background()
+	for _, tt := range []struct {
+		name  string
+		files []string
+		want  error
+	}{
+		{"only the lock file", []string{lockName}, errConcurrentCreate},
+		{"the lock file and more", []string{lockName, "v1"}, ErrCorrupt},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s, server := newTestStore(t)
+			ks := filepath.Join(server, "keystore")
+			s.dirMade = func(name string) {
+				if name != "keystore" {
+					return
+				}
+				for _, f := range tt.files {
+					writeFile(t, filepath.Join(ks, f), "")
+				}
+			}
+			var chowned []string
+			s.chown = func(f *os.File, uid, gid int) error { chowned = append(chowned, f.Name()); return nil }
+			_, err := s.Put(ctx, "a", KindOpaque, []byte("a"))
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("Put: %v, want %v", err, tt.want)
+			}
+			if len(chowned) != 0 {
+				t.Fatalf("chowned %v", chowned)
+			}
+			if tt.want != errConcurrentCreate {
+				return
+			}
+			if errors.Is(err, ErrCorrupt) || strings.Contains(err.Error(), "backup") {
+				t.Fatalf("Put: %v, want no ErrCorrupt and no backup advice", err)
+			}
+			s.dirMade = func(string) {}
+			s.chown = (*os.File).Chown
+			mustPut(t, s, "a", KindOpaque, []byte("a"))
+		})
+	}
+}
+
 // TestConcurrentOperations runs writers and readers together under -race;
 // the lock serialises them and every write lands.
 //
