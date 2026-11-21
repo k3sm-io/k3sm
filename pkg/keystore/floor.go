@@ -18,6 +18,7 @@ package keystore
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -111,11 +112,11 @@ func (fl floor) check(name string, gen [generationSize]byte, seq uint64) error {
 	return nil
 }
 
-// raise records seq for name at generation gen when the floor has no entry
-// for name or holds a lower sequence of the same generation, and reports
-// whether it changed anything. A floor of another generation is left alone:
-// readers refuse that pointer, and only a Put, which mints a new generation,
-// replaces it (set).
+// raise is Raise applied to fl: it records seq for name at generation gen
+// when the floor has no entry for name or holds a lower sequence of the same
+// generation (the maximum of the two), and reports whether it changed
+// anything. A floor of another generation is left alone: readers refuse that
+// pointer, and only a Put, which mints a new generation, replaces it (set).
 func (fl floor) raise(name string, gen [generationSize]byte, seq uint64) bool {
 	g := hex.EncodeToString(gen[:])
 	f, ok := fl[name]
@@ -126,9 +127,28 @@ func (fl floor) raise(name string, gen [generationSize]byte, seq uint64) bool {
 	return true
 }
 
-// set records seq for name at generation gen, whatever was recorded before.
-func (fl floor) set(name string, gen [generationSize]byte, seq uint64) {
-	fl[name] = floorEntry{Generation: hex.EncodeToString(gen[:]), Seq: seq}
+// set is Put applied to fl: it records sequence 1 for name at generation
+// gen when the floor has no entry for name or one of another generation, and
+// reports whether it changed anything. The entry of the same generation is
+// left alone: it can only be higher, raised since.
+func (fl floor) set(name string, gen [generationSize]byte) bool {
+	g := hex.EncodeToString(gen[:])
+	if f, ok := fl[name]; ok && f.Generation == g {
+		return false
+	}
+	fl[name] = floorEntry{Generation: g, Seq: 1}
+	return true
+}
+
+// remove is Delete applied to fl: it removes name's entry when it records
+// generation gen, and reports whether it changed anything. An entry of
+// another generation belongs to a Put after the Delete, and stays.
+func (fl floor) remove(name string, gen [generationSize]byte) bool {
+	if f, ok := fl[name]; !ok || f.Generation != hex.EncodeToString(gen[:]) {
+		return false
+	}
+	delete(fl, name)
+	return true
 }
 
 // openFloor opens the data root and reads the floor in it, both judged on
@@ -235,18 +255,105 @@ func parseFloor(b []byte) (floor, error) {
 	return f.Entries, nil
 }
 
-// writeFloor replaces the floor file in dir with fl, root-owned at
-// floorFileMode, through the same temporary-file-and-rename as every other
-// write.
-func (s *FileStore) writeFloor(dir *os.Root, fl floor) error {
-	if fl == nil {
+// floorLock is the data root held under its own flock, which every floor
+// write takes: dir is the data root opened O_NOFOLLOW|O_DIRECTORY and
+// flocked, locked its info, and root the os.Root the floor is read and
+// written through, checked to be the same directory.
+//
+// Lock order: a verb takes the store's .lock (openLocked) first and the
+// data-root lock second, and releases them in reverse; readers take only
+// .lock. The data-root lock defends the floor against a writer under a
+// swapped .lock, which .lock does not serialize with.
+type floorLock struct {
+	s      *FileStore
+	dir    *os.File
+	locked fs.FileInfo
+	root   *os.Root
+}
+
+// lockFloor takes the data-root lock, waiting at most lockWait or until ctx
+// is done, and reads the floor under it. The data root is opened without
+// following a symlink, and judged on that descriptor: owned by root
+// (floorUID) and not group- or other-writable. The caller holds .lock, and
+// releases the returned lock with unlock.
+func (s *FileStore) lockFloor(ctx context.Context) (*floorLock, floor, error) {
+	if s.dataRoot == "" {
+		return nil, nil, errors.New("the keystore floor needs the data root, and none is configured")
+	}
+	dir, err := os.OpenFile(s.dataRoot, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_DIRECTORY, 0)
+	if errors.Is(err, syscall.ELOOP) || errors.Is(err, syscall.ENOTDIR) {
+		return nil, nil, fmt.Errorf("%w: %s is not a directory: %w", errFloorUntrusted, s.dataRoot, err)
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("the keystore floor: %w", err)
+	}
+	l := &floorLock{s: s, dir: dir}
+	if l.locked, err = dir.Stat(); err != nil {
+		l.unlock()
+		return nil, nil, fmt.Errorf("the keystore floor: %w", err)
+	}
+	if err := s.floorOwned(l.locked); err != nil {
+		l.unlock()
+		return nil, nil, fmt.Errorf("%w: %s: %w", errFloorUntrusted, s.dataRoot, err)
+	}
+	if err := s.flockWait(ctx, dir, syscall.LOCK_EX); err != nil {
+		l.unlock()
+		return nil, nil, fmt.Errorf("the keystore floor: %w", err)
+	}
+	if l.root, err = os.OpenRoot(s.dataRoot); err != nil {
+		l.unlock()
+		return nil, nil, fmt.Errorf("the keystore floor: %w", err)
+	}
+	fl, err := l.read()
+	if err != nil {
+		l.unlock()
+		return nil, nil, err
+	}
+	return l, fl, nil
+}
+
+// read reads the floor through l.root, refused unless l.root is still the
+// directory the lock is held on.
+func (l *floorLock) read() (floor, error) {
+	return l.s.readFloor(l.root, l.locked)
+}
+
+// update re-reads the floor under the lock, applies op to what it read, and
+// writes the result if op reports a change, returning the floor as it now
+// is. The lock is held through the rename and the directory fsync. op sees
+// a non-nil floor; an absent file it leaves unchanged stays absent.
+func (l *floorLock) update(op func(floor) bool) (floor, error) {
+	fl, err := l.read()
+	if err != nil {
+		return nil, err
+	}
+	absent := fl == nil
+	if absent {
 		fl = floor{}
+	}
+	if !op(fl) {
+		if absent {
+			return nil, nil
+		}
+		return fl, nil
 	}
 	b, err := json.Marshal(floorFile{Version: floorFormat, Entries: fl})
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return s.writeFileAs(dir, floorName, append(b, '\n'), s.floorUID, s.floorGID, floorFileMode)
+	if err := l.s.writeFileAs(l.root, floorName, append(b, '\n'), l.s.floorUID, l.s.floorGID, floorFileMode); err != nil {
+		return nil, err
+	}
+	return fl, nil
+}
+
+// unlock releases the data-root lock and closes what lockFloor opened.
+func (l *floorLock) unlock() {
+	if l.root != nil {
+		_ = l.root.Close() // writes are fsynced by update
+	}
+	_ = syscall.Flock(int(l.dir.Fd()), syscall.LOCK_UN) // the close below releases it regardless
+	_ = l.dir.Close()
 }
 
 // syncFloor is how every root-run verb begins: it raises each entry's floor
@@ -255,18 +362,19 @@ func (s *FileStore) writeFloor(dir *os.Root, fl floor) error {
 // pointer flip and its floor write leaves (the floor one behind), and it is
 // also how an absent floor file is rebuilt. An entry whose pointer does not
 // open, or that the floor already rules out, is left as it is: the verb that
-// reads it reports it. The caller holds the exclusive lock.
-func (s *FileStore) syncFloor(entries, dir *os.Root, fl floor, k keys) (floor, error) {
+// reads it reports it. The caller holds the exclusive lock and l.
+func (s *FileStore) syncFloor(entries *os.Root, l *floorLock, fl floor, k keys) (floor, error) {
 	names, err := readDirNames(entries, maxDirNames)
 	if err != nil {
 		return nil, err
 	}
 	sort.Strings(names)
-	absent := fl == nil
-	if absent {
-		fl = floor{}
+	type raised struct {
+		name string
+		gen  [generationSize]byte
+		seq  uint64
 	}
-	changed := false
+	var found []raised
 	for _, name := range names {
 		if checkName(name) != nil {
 			continue
@@ -277,14 +385,17 @@ func (s *FileStore) syncFloor(entries, dir *os.Root, fl floor, k keys) (floor, e
 		}
 		_, seq, err := e.pointer(k)
 		e.close()
-		if err == nil && fl.raise(name, e.generation, seq) {
-			changed = true
+		if err == nil {
+			found = append(found, raised{name, e.generation, seq})
 		}
 	}
-	if changed {
-		if err := s.writeFloor(dir, fl); err != nil {
-			return nil, err
+	return l.update(func(fl floor) bool {
+		changed := false
+		for _, r := range found {
+			if fl.raise(r.name, r.gen, r.seq) {
+				changed = true
+			}
 		}
-	}
-	return fl, nil
+		return changed
+	})
 }

@@ -498,31 +498,37 @@ func (s *FileStore) lock(ctx context.Context, root *os.Root, exclusive bool) (fu
 	if exclusive {
 		how = syscall.LOCK_EX
 	}
-	deadline := time.Now().Add(s.lockWait)
-	for {
-		err := syscall.Flock(int(f.Fd()), how|syscall.LOCK_NB)
-		if err == nil {
-			break
-		}
-		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EINTR) {
-			_ = f.Close() // abandoned; nothing to flush
-			return nil, fmt.Errorf("lock the keystore: %w", err)
-		}
-		if time.Now().After(deadline) {
-			_ = f.Close() // abandoned; nothing to flush
-			return nil, errLockTimeout
-		}
-		select {
-		case <-ctx.Done():
-			_ = f.Close() // abandoned; nothing to flush
-			return nil, ctx.Err()
-		case <-time.After(10 * time.Millisecond):
-		}
+	if err := s.flockWait(ctx, f, how); err != nil {
+		_ = f.Close() // abandoned; nothing to flush
+		return nil, err
 	}
 	return func() {
 		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN) // the close below releases it regardless
 		_ = f.Close()
 	}, nil
+}
+
+// flockWait takes flock how on f, waiting at most s.lockWait (then
+// errLockTimeout), or until ctx is done (then ctx's error).
+func (s *FileStore) flockWait(ctx context.Context, f *os.File, how int) error {
+	deadline := time.Now().Add(s.lockWait)
+	for {
+		err := syscall.Flock(int(f.Fd()), how|syscall.LOCK_NB)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EINTR) {
+			return fmt.Errorf("lock %s: %w", f.Name(), err)
+		}
+		if time.Now().After(deadline) {
+			return errLockTimeout
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 }
 
 // readRandom fills b from the store's entropy source.

@@ -195,13 +195,13 @@ func (s *FileStore) put(ctx context.Context, name string, kind Kind, value []byt
 		return Version{}, err
 	}
 	defer done()
-	// The floor is judged before anything is written, a master minted
-	// included.
-	fdir, fl, err := s.openFloor()
+	// The floor is judged and locked before anything is written, a master
+	// minted included.
+	fdir, fl, err := s.lockFloor(ctx)
 	if err != nil {
 		return Version{}, err
 	}
-	defer func() { _ = fdir.Close() }() // writes are fsynced by writeFloor
+	defer fdir.unlock()
 	k, err := s.masterForPut(root)
 	if err != nil {
 		return Version{}, err
@@ -220,11 +220,7 @@ func (s *FileStore) put(ctx context.Context, name string, kind Kind, value []byt
 	}
 	// A new generation replaces whatever an interrupted Delete left recorded
 	// for the name.
-	if fl == nil {
-		fl = floor{}
-	}
-	fl.set(name, e.generation, 1)
-	if err := s.writeFloor(fdir, fl); err != nil {
+	if _, err := fdir.update(func(fl floor) bool { return fl.set(name, e.generation) }); err != nil {
 		return Version{}, fmt.Errorf("the entry is stored, but recording its floor failed (the next keys verb records it): %w", err)
 	}
 	return v, nil
@@ -502,11 +498,11 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 		return err
 	}
 	defer done()
-	fdir, fl, err := s.openFloor()
+	fdir, fl, err := s.lockFloor(ctx)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = fdir.Close() }() // writes are fsynced by writeFloor
+	defer fdir.unlock()
 	// Delete must work without the master, so the other entries' floors are
 	// raised only when it opens.
 	if k, kerr := s.loadMaster(); kerr == nil {
@@ -522,6 +518,16 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 			return err
 		}
 		return syncDir(root)
+	}
+	// The generation is read before anything is removed: the floor entry is
+	// removed only if it records this one. A directory whose generation does
+	// not read leaves the floor as it is, for the next Put of the name.
+	gen, genErr := [generationSize]byte{}, error(nil)
+	if raw, err := openEntryDirRaw(root, name); err == nil {
+		gen, genErr = readGeneration(raw.root)
+		raw.close()
+	} else {
+		genErr = err
 	}
 	e, err := openEntryDir(root, name, fl)
 	damaged := errors.Is(err, errNoPointer)
@@ -559,11 +565,11 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	if err := syncDir(root); err != nil {
 		return err
 	}
-	if _, ok := fl[name]; !ok {
+	if genErr != nil {
 		return nil
 	}
-	delete(fl, name)
-	return s.writeFloor(fdir, fl)
+	_, err = fdir.update(func(fl floor) bool { return fl.remove(name, gen) })
+	return err
 }
 
 // Rotate seals value as the next version of name, of the kind name already
@@ -595,11 +601,11 @@ func (s *FileStore) rotate(ctx context.Context, name string, value []byte) (Vers
 		return Version{}, err
 	}
 	defer done()
-	fdir, fl, err := s.openFloor()
+	fdir, fl, err := s.lockFloor(ctx)
 	if err != nil {
 		return Version{}, err
 	}
-	defer func() { _ = fdir.Close() }() // writes are fsynced by writeFloor
+	defer fdir.unlock()
 	e, err := openEntry(root, name, fl)
 	if err != nil {
 		return Version{}, err
@@ -648,8 +654,7 @@ func (s *FileStore) rotate(ctx context.Context, name string, value []byte) (Vers
 	if err := s.writeFile(e.root, currentName, ptr.marshal()); err != nil {
 		return Version{}, err
 	}
-	fl.raise(name, e.generation, seq+1)
-	if err := s.writeFloor(fdir, fl); err != nil {
+	if _, err := fdir.update(func(fl floor) bool { return fl.raise(name, e.generation, seq+1) }); err != nil {
 		return Version{}, fmt.Errorf("version %d is current, but recording its floor failed (the next keys verb records it): %w", next, err)
 	}
 	return versionOf(rec, value, k.fingerprint), nil
@@ -719,11 +724,11 @@ func (s *FileStore) raiseFloor(ctx context.Context) error {
 		return err
 	}
 	defer done()
-	fdir, fl, err := s.openFloor()
+	fdir, fl, err := s.lockFloor(ctx)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = fdir.Close() }() // writes are fsynced by writeFloor
+	defer fdir.unlock()
 	k, err := s.loadMaster()
 	if errors.Is(err, ErrMasterMissing) {
 		return nil
@@ -748,20 +753,30 @@ func openEntry(root *os.Root, name string, fl floor) (*entry, error) {
 	if err != nil {
 		return nil, err
 	}
-	b, _, err := readFile(e.root, generationName, generationFileSize)
+	if e.generation, err = readGeneration(e.root); err != nil {
+		e.close()
+		return nil, err
+	}
+	return e, nil
+}
+
+// readGeneration reads and decodes dir's generation file. A missing file or
+// one of the wrong shape is ErrCorrupt (see readError).
+func readGeneration(dir *os.Root) ([generationSize]byte, error) {
+	var gen [generationSize]byte
+	b, _, err := readFile(dir, generationName, generationFileSize)
 	if err == nil && (len(b) != generationFileSize || b[len(b)-1] != '\n') {
 		err = fmt.Errorf("%w: malformed", errBadFile)
 	}
 	if err == nil {
-		if _, herr := hex.Decode(e.generation[:], b[:len(b)-1]); herr != nil {
+		if _, herr := hex.Decode(gen[:], b[:len(b)-1]); herr != nil {
 			err = fmt.Errorf("%w: %w", errBadFile, herr)
 		}
 	}
 	if err != nil {
-		e.close()
-		return nil, readError(generationName, err)
+		return gen, readError(generationName, err)
 	}
-	return e, nil
+	return gen, nil
 }
 
 // openEntryDir opens name's directory. A missing directory is ErrNotFound, and

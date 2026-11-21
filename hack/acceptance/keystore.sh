@@ -75,7 +75,8 @@ check G4 "Delete then Put does not reopen the old v1" TestDeleteThenPutRefusesRe
 check G5 "a copied-back current is refused against the floor, with its own message; nothing recorded for the name accepts it" \
 	TestFloorRefusesCopiedBackPointer TestFloorCheck
 check G6 "the floor and the data root are root-owned and not shared, judged on the descriptor" TestFloorTrust
-check G7 "the floor is raised by every mutating verb and the start of every root verb; one behind is accepted" TestFloorRaised
+check G7 "the floor is raised by every mutating verb and the start of every root verb; one behind is accepted; each write re-reads it under the data-root lock, with a bounded wait" \
+	TestFloorRaised TestFloorWriteRereads TestFloorLockBoundedWait
 check G8 "Rotate flips the pointer last; a crash before the flip leaves the old version current" \
 	TestRotateCrashAtEveryStep TestRotate
 check G9 "a Rotate retry discards the orphan and seals the value it was given" TestRotateRetryDiscardsOrphan TestParseVersionName
