@@ -502,7 +502,9 @@ serializes Rewrap, Rotate and Put against each other and against the reconciler'
   under a swapped `.lock` writing the floor; it does not stop racing entry files under a
   swapped `.lock`. The data root is root:wheel 0755, so any local process able to open it,
   not only the service user, can take this lock and hold it. A root verb that writes the
-  floor then fails with the lock timeout after the bounded wait. That is a denial of
+  floor then fails with the lock timeout after the bounded wait; while the lock is held,
+  Delete and Rotate fail too, so a compromised secret cannot be removed or replaced until
+  the holder lets go. That is a denial of
   service against the root write verbs and nothing more: holding the lock writes nothing,
   so the floor, the entries and the readers (which do not take it) lose no integrity.
 - An entry directory with no `current` is an incomplete Put only in the one shape a crashed

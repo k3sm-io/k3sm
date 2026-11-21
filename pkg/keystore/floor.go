@@ -367,7 +367,9 @@ func parseFloor(b []byte) (floor, error) {
 //
 // The data root is root:wheel 0755, so any local process that can open it,
 // not only the service user, can flock it and hold the lock. A verb that
-// writes the floor then fails with errLockTimeout after the bounded wait: a
+// writes the floor then fails with errLockTimeout after the bounded wait;
+// while the lock is held, Delete and Rotate fail too, so a compromised secret
+// cannot be removed or replaced until the holder lets go: a
 // denial of service against root's write verbs, with no loss of integrity,
 // since holding the lock writes nothing and readers do not take it.
 type floorLock struct {
