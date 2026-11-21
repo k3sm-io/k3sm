@@ -378,11 +378,30 @@ anywhere.
 The `-o json` document has three keys. `dryRun` is true without `--force`. `registry` holds
 `name`, `skipped` (set only on a node without a registry), `manifests` (each with `repository`,
 `digest`, `mediaType` and `size`, deleted or to be deleted), `kept` (the untagged manifests kept,
-each with its `reason`), and, when present, `unreadable` repositories, `failed` deletions and
-the `sweep` a forced prune ran (`repositories`, `blobs`, `bytes`, and any `stopped`, `failed` or
-`reviewing` repositories and `error`).
+each with its `reason`), and, when present, `unreadable` repositories, `failed` deletions,
+`interrupted` and the `unattempted` manifests (not attempted, or cut off by the cancellation) of an
+interrupted prune, and the `sweep` a forced prune ran (`repositories`, `blobs`, `bytes`, and any
+`stopped`, `failed` or `reviewing` repositories and `error`).
 `cache` holds `blobs`, `reclaimedBytes` and `kept` (counts by reason). The command exits non-zero
-when any deletion fails, after printing the report.
+when any deletion fails or the prune is interrupted, after printing the report.
+
+A forced prune that is cancelled, by Ctrl+C, by SIGTERM or by `--timeout` expiring, stops before its
+next deletion. The deletions already made stand, and `manifests` then holds only the ones the
+registry confirmed. The registry's garbage collection (the sweep) still reclaims those within a time
+limit: a note on stderr says how many and how long. The report marks the prune `interrupted` and
+lists under `unattempted`, not under `failed`, every planned manifest the prune did not attempt and
+every deletion it could not confirm because the cancellation cut it off. Listing here means the
+prune did not confirm the deletion, not that the manifest still exists. A deletion the registry
+refused is listed under `failed`, even when the refusal came at the moment of the cancellation. The
+prune is still marked `interrupted`, so an interrupted prune can list failures. If the registry
+refuses the last planned deletion just as the cancellation arrives, `unattempted` is empty, that
+manifest is under `failed`, and the note on stderr says no planned manifest was left unattempted. A
+deletion the cancellation cut off in flight may still have been completed by the registry, so a
+manifest under `unattempted` may already be gone. Those manifests are not swept by this run; a later
+prune or the registry's scheduled garbage collection reclaims them. The table on stdout keeps its
+usual lines; the interruption is reported on stderr, and the command exits non-zero after printing
+the report. It is safe to run the prune again: it plans from the registry's current state, so a
+manifest that is already gone is simply not listed and the rest are deleted.
 
 ## Pushing to a Registry: `k3sm image push`
 

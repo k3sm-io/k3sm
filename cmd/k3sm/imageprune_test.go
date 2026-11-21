@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -36,6 +37,7 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
 	"github.com/opencontainers/go-digest"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
@@ -272,6 +274,13 @@ type pruneJSON struct {
 			Size       int64  `json:"size"`
 			Error      string `json:"error"`
 		} `json:"failed"`
+		Interrupted bool `json:"interrupted"`
+		Unattempted []struct {
+			Repository string `json:"repository"`
+			Digest     string `json:"digest"`
+			MediaType  string `json:"mediaType"`
+			Size       int64  `json:"size"`
+		} `json:"unattempted"`
 		Sweep *struct {
 			Repositories []string `json:"repositories"`
 			Manifests    int      `json:"manifests"`
@@ -895,5 +904,308 @@ func TestImagePruneReportsRecheckSkips(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestImagePruneForceStopsOnCancel proves a forced prune whose context is
+// cancelled (Ctrl+C) stops deleting at once: the manifests it had not reached
+// are reported as unattempted, not as failed deletions, the report says it was
+// interrupted, the deletions it made are still swept under a context the
+// cancellation does not reach, and the command returns the cancellation after
+// the report. The deleter cancels the context on its first call, as a Ctrl+C
+// during the first DELETE would, and that DELETE succeeds.
+func TestImagePruneForceStopsOnCancel(t *testing.T) {
+	for _, output := range []string{"json", "table"} {
+		t.Run(output, func(t *testing.T) {
+			workDir := t.TempDir()
+			reg := serveFakePruneRegistry(t, workDir)
+			f := buildPruneFixture(t, workDir)
+			sock := serveFakeImages(t, &fakeImagesDaemon{pruneResp: &runtimev1.PruneImagesResponse{}})
+			args := []string{"--socket", sock, "--work-dir", workDir, "prune", "--force"}
+			if output == "json" {
+				args = append(args, "-o", "json")
+			}
+			var stderr bytes.Buffer
+			opts, err := parseImageArgs(args, &stderr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var calls int
+			del := func(ctx context.Context, rf name.Digest, state string, auth authn.Authenticator) error {
+				calls++
+				cancel()
+				return reg.delete(ctx, rf, state, auth)
+			}
+			var sweepCtxErr error
+			collect := func(ctx context.Context, authority string, deleted []registrysvc.StoredManifest, cred registrysvc.Credential) (registrysvc.CollectResult, error) {
+				sweepCtxErr = ctx.Err()
+				return reg.collect(ctx, authority, deleted, cred)
+			}
+			var out bytes.Buffer
+			err = imageCommandWith(ctx, opts, &out, dialRuntimed, del, collect)
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("err = %v; want the cancellation", err)
+			}
+			if errors.Is(err, errPruneIncomplete) {
+				t.Errorf("err = %v; an unattempted delete is not a failed one", err)
+			}
+			if calls != 1 {
+				t.Errorf("deleter called %d times; want 1, nothing after the cancel", calls)
+			}
+			wantCollect := registrysvc.LoopbackAuthority(fakePruneRegistryPort) + " k3sm [app]"
+			if strings.Join(reg.collects, ";") != wantCollect {
+				t.Errorf("collects %v; want one sweep of the confirmed delete, %q", reg.collects, wantCollect)
+			}
+			if sweepCtxErr != nil {
+				t.Errorf("the sweep ran under a done context: %v", sweepCtxErr)
+			}
+			// The notes go to stderr, the sweep's before the sweep runs.
+			wantNotes := "prune interrupted: sweeping the 1 deleted manifest(s) for up to " + pruneSweepGrace.String() + "\n" +
+				"prune interrupted: 2 planned manifest(s) not attempted or not confirmed; run prune again to delete them\n"
+			if stderr.String() != wantNotes {
+				t.Errorf("stderr = %q\nwant     %q", stderr.String(), wantNotes)
+			}
+
+			if output == "table" {
+				for _, w := range []string{
+					"  deleted app@" + f.overwritten + " (untagged)\n",
+					"  deleted 1 untagged manifest(s);",
+				} {
+					if !strings.Contains(out.String(), w) {
+						t.Errorf("table missing %q:\n%s", w, out.String())
+					}
+				}
+				if strings.Contains(out.String(), "could not delete") {
+					t.Errorf("table reports a failed deletion:\n%s", out.String())
+				}
+				// The app reads this table strictly and refuses any line it does
+				// not know, so an interrupted run's stdout carries only the line
+				// shapes the report always had.
+				known := []string{
+					"registry ", "  skipped: ", "  deleted ", "  would delete ", "  could not delete ",
+					"  swept ", "  sweep stopped by the mass-delete brake, nothing freed: ",
+					"  not yet reviewed by the registry's garbage collection, only reported on: ",
+					"  sweep failed, nothing freed: ", "  sweep: ", "  kept untagged:", "    ",
+					"  unreadable, left alone: ", "node cache:", "  nothing to reclaim: ", "  kept:", "(dry run",
+				}
+				for _, line := range strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n") {
+					if !slices.ContainsFunc(known, func(p string) bool { return strings.HasPrefix(line, p) }) {
+						t.Errorf("stdout carries a line the report never had: %q", line)
+					}
+				}
+				return
+			}
+			doc := decodePrune(t, out.String())
+			if len(doc.Registry.Failed) != 0 {
+				t.Errorf("report failed = %+v; want none", doc.Registry.Failed)
+			}
+			if got := manifestList(doc); strings.Join(got, ",") != "app@"+f.overwritten {
+				t.Errorf("report manifests = %v; want only app@%s", got, f.overwritten)
+			}
+			if !doc.Registry.Interrupted {
+				t.Errorf("report interrupted = false")
+			}
+			var unattempted []string
+			for _, m := range doc.Registry.Unattempted {
+				unattempted = append(unattempted, m.Repository+"@"+m.Digest)
+			}
+			if want := []string{"multi@" + f.oldIndex, "multi@" + f.oldLeaf}; strings.Join(unattempted, ",") != strings.Join(want, ",") {
+				t.Errorf("report unattempted = %v; want %v", unattempted, want)
+			}
+		})
+	}
+}
+
+// TestImagePruneForceClassifiesAnErrorAtCancel proves the DELETE that returns
+// an error while the context is done is filed by what the error is: a registry
+// refusal is a failed deletion even when a cancellation coincides with it, and
+// only the context's own error, cancellation or deadline, leaves the manifest
+// unattempted. Either way the manifests not yet reached are unattempted, and a
+// refusal on the last planned manifest still reports the run as interrupted.
+func TestImagePruneForceClassifiesAnErrorAtCancel(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		ctx        func() (context.Context, context.CancelFunc)
+		del        func(ctx context.Context, cancel context.CancelFunc) error
+		at         int // the 1-based DELETE that runs del; the earlier ones delete
+		wantFailed bool
+		wantCause  error
+	}{{
+		name: "registry refusal",
+		ctx:  func() (context.Context, context.CancelFunc) { return context.WithCancel(context.Background()) },
+		del: func(_ context.Context, cancel context.CancelFunc) error {
+			cancel()
+			return &transport.Error{StatusCode: http.StatusInternalServerError}
+		},
+		wantFailed: true,
+		wantCause:  context.Canceled,
+	}, {
+		name: "registry refusal of the last planned manifest",
+		ctx:  func() (context.Context, context.CancelFunc) { return context.WithCancel(context.Background()) },
+		del: func(_ context.Context, cancel context.CancelFunc) error {
+			cancel()
+			return &transport.Error{StatusCode: http.StatusInternalServerError}
+		},
+		at:         3,
+		wantFailed: true,
+		wantCause:  context.Canceled,
+	}, {
+		name: "cancellation",
+		ctx:  func() (context.Context, context.CancelFunc) { return context.WithCancel(context.Background()) },
+		del: func(ctx context.Context, cancel context.CancelFunc) error {
+			cancel()
+			return fmt.Errorf("DELETE: %w", ctx.Err())
+		},
+		wantCause: context.Canceled,
+	}, {
+		name: "cancellation as a url.Error",
+		ctx:  func() (context.Context, context.CancelFunc) { return context.WithCancel(context.Background()) },
+		del: func(_ context.Context, cancel context.CancelFunc) error {
+			cancel()
+			return &url.Error{Op: "Delete", URL: "https://registry.invalid/v2/app/manifests/x", Err: context.Canceled}
+		},
+		wantCause: context.Canceled,
+	}, {
+		name: "deadline",
+		// The deadline is simulated: the context reports DeadlineExceeded
+		// once the deleter expires it, so no wall-clock deadline can pass
+		// during the plan on a slow machine, and the context ends by its
+		// deadline, not by a cancel.
+		ctx: func() (context.Context, context.CancelFunc) {
+			e := newExpiringCtx(context.Background())
+			return e, e.expire
+		},
+		del: func(ctx context.Context, expire context.CancelFunc) error {
+			expire()
+			return fmt.Errorf("DELETE: %w", ctx.Err())
+		},
+		wantCause: context.DeadlineExceeded,
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			workDir := t.TempDir()
+			reg := serveFakePruneRegistry(t, workDir)
+			f := buildPruneFixture(t, workDir)
+			sock := serveFakeImages(t, &fakeImagesDaemon{pruneResp: &runtimev1.PruneImagesResponse{}})
+			var warn bytes.Buffer
+			opts, err := parseImageArgs([]string{"--socket", sock, "--work-dir", workDir, "prune", "--force", "-o", "json"}, &warn)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := tc.ctx()
+			defer cancel()
+			at := max(tc.at, 1)
+			var calls int
+			del := func(ctx context.Context, rf name.Digest, state string, auth authn.Authenticator) error {
+				calls++
+				if calls < at {
+					return reg.delete(ctx, rf, state, auth)
+				}
+				return tc.del(ctx, cancel)
+			}
+			var out bytes.Buffer
+			err = imageCommandWith(ctx, opts, &out, dialRuntimed, del, reg.collect)
+			if calls == 0 {
+				t.Fatalf("deleter never called: the context was done before the first DELETE (err = %v)", err)
+			}
+			if calls != at {
+				t.Fatalf("deleter called %d times; want %d, nothing after the context is done", calls, at)
+			}
+			if !errors.Is(err, tc.wantCause) {
+				t.Errorf("err = %v; want %v", err, tc.wantCause)
+			}
+			if got := errors.Is(err, errPruneIncomplete); got != tc.wantFailed {
+				t.Errorf("err = %v; errors.Is(errPruneIncomplete) = %t, want %t", err, got, tc.wantFailed)
+			}
+			doc := decodePrune(t, out.String())
+			if !doc.Registry.Interrupted {
+				t.Errorf("report interrupted = false")
+			}
+			var failed []string
+			for _, m := range doc.Registry.Failed {
+				failed = append(failed, m.Repository+"@"+m.Digest)
+			}
+			var unattempted []string
+			for _, m := range doc.Registry.Unattempted {
+				unattempted = append(unattempted, m.Repository+"@"+m.Digest)
+			}
+			planned := []string{"app@" + f.overwritten, "multi@" + f.oldIndex, "multi@" + f.oldLeaf}
+			wantManifests := planned[:at-1]
+			wantFailed, wantUnattempted := []string(nil), planned[at-1:]
+			if tc.wantFailed {
+				wantFailed, wantUnattempted = planned[at-1:at], planned[at:]
+			}
+			if strings.Join(failed, ",") != strings.Join(wantFailed, ",") {
+				t.Errorf("report failed = %v; want %v", failed, wantFailed)
+			}
+			if strings.Join(unattempted, ",") != strings.Join(wantUnattempted, ",") {
+				t.Errorf("report unattempted = %v; want %v", unattempted, wantUnattempted)
+			}
+			if got := manifestList(doc); strings.Join(got, ",") != strings.Join(wantManifests, ",") {
+				t.Errorf("report manifests = %v; want %v", got, wantManifests)
+			}
+			if strings.Contains(out.String(), "prune interrupted") {
+				t.Errorf("stdout carries the stderr note:\n%s", out.String())
+			}
+			if len(wantUnattempted) == 0 {
+				// Cut short at the last planned deletion: nothing is left
+				// unattempted, and neither the note nor the error counts zero.
+				if len(doc.Registry.Unattempted) != 0 {
+					t.Errorf("report unattempted = %v; want none", doc.Registry.Unattempted)
+				}
+				for _, bad := range []string{"0 planned", "0 not attempted"} {
+					if strings.Contains(warn.String(), bad) {
+						t.Errorf("stderr note = %q; want no %q", warn.String(), bad)
+					}
+					if err != nil && strings.Contains(err.Error(), bad) {
+						t.Errorf("err = %v; want no %q", err, bad)
+					}
+				}
+				if !strings.Contains(warn.String(), "prune interrupted after its last planned deletion") {
+					t.Errorf("stderr note = %q; want the last-deletion note", warn.String())
+				}
+			}
+		})
+	}
+}
+
+// TestImagePruneForceContinuesPastAServerError proves one deletion the
+// registry answers with a server error does not stop the rest: it is listed
+// under failed, the other two are deleted, and the command exits non-zero.
+func TestImagePruneForceContinuesPastAServerError(t *testing.T) {
+	workDir := t.TempDir()
+	reg := serveFakePruneRegistry(t, workDir)
+	f := buildPruneFixture(t, workDir)
+	sock := serveFakeImages(t, &fakeImagesDaemon{pruneResp: &runtimev1.PruneImagesResponse{}})
+	opts, err := parseImageArgs([]string{"--socket", sock, "--work-dir", workDir, "prune", "--force", "-o", "json"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls int
+	del := func(ctx context.Context, rf name.Digest, state string, auth authn.Authenticator) error {
+		calls++
+		if calls == 2 {
+			return errors.New("unexpected status code 503 Service Unavailable")
+		}
+		return reg.delete(ctx, rf, state, auth)
+	}
+	var out bytes.Buffer
+	err = imageCommandWith(t.Context(), opts, &out, dialRuntimed, del, reg.collect)
+	if !errors.Is(err, errPruneIncomplete) {
+		t.Fatalf("err = %v; want errPruneIncomplete", err)
+	}
+	if calls != 3 {
+		t.Errorf("deleter called %d times; want all 3", calls)
+	}
+	doc := decodePrune(t, out.String())
+	if len(doc.Registry.Failed) != 1 || doc.Registry.Failed[0].Digest != f.oldIndex {
+		t.Errorf("failed = %+v; want the one 503", doc.Registry.Failed)
+	}
+	if want := []string{"app@" + f.overwritten, "multi@" + f.oldLeaf}; strings.Join(manifestList(doc), ",") != strings.Join(want, ",") {
+		t.Errorf("manifests = %v; want %v", manifestList(doc), want)
+	}
+	if doc.Registry.Interrupted || len(doc.Registry.Unattempted) != 0 {
+		t.Errorf("a server error read as an interruption: %+v", doc.Registry)
 	}
 }
