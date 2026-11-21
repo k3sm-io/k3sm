@@ -1415,6 +1415,42 @@ value is never written to a socket whose peer is not the service user, whatever 
 checks said (U36). That `LOCAL_PEERCRED` reports the service uid on the client side
 is `[K0 leg 2: pending]`.
 
+**The client pins the server, not just its uid.** Any service-user process could bind
+`keys.sock` while the listener is down (during maintenance, a restart or its backoff), since
+`keystore-run/` is the service user's. So after the uid check the client reads the peer's
+audit token off the connected descriptor (`getsockopt(SOL_LOCAL, LOCAL_PEERTOKEN)`), asks the
+Security framework for the code of that process (`SecCodeCopyGuestWithAttributes` with the
+audit token) and its cdhash, and refuses unless it equals the cdhash of the installed binary,
+`/Library/k3sm/k3sm`, read from that file (a static code object). Nothing is written to the
+socket before both checks pass (U69, E24).
+
+- *Why this pins the server.* The server's launchd job, `io.k3sm.server`, execs exactly the
+  installed binary as the service user: `ServerPlist` (`pkg/install/plist.go:218`) puts
+  `cfg.installedBinary()` first (`:221`) in `ProgramArguments`, which is `InstallDir/k3sm`
+  (`pkg/install/install.go:1784`), and sets `UserName` to the service user
+  (`pkg/install/plist.go:237`). The install directory is root:wheel 0755
+  (`DefaultInstallDir`, `pkg/install/install.go:95` to `:97`), so the service user cannot replace the
+  file whose cdhash the client reads. A service-user process that is not that binary fails
+  the pin.
+- *Why the audit token, not `LOCAL_PEERPID`.* The token carries the pid version, so a pid
+  reused after the peer exited does not pass for it; a bare pid read at connect time can be
+  recycled before the client looks it up.
+- *Why not a root-written pid file.* The server runs as the service user under launchd with
+  `KeepAlive` (`pkg/install/plist.go:240`) and launchd restarts it with a new pid;
+  no root process of k3sm sees each restart, so no root writer could keep a
+  `keystore-server.pid` current, and a pid file the server wrote itself would be the service
+  user's, which is the writer the pin must not trust.
+- *Development builds.* An ad-hoc signature still carries a cdhash, so the pin works for a
+  development build installed with `sudo k3sm install`. k3sm already reads cdhashes, for the
+  shadow-binary check (`pkg/install/shadow_darwin.go:190`, `pkg/shadow`).
+- *Upgrade skew.* Between an upgrade's install and the server's restart, the running server
+  is the old binary, so its cdhash differs from the installed file's; the client refuses and
+  prints "the server is not running the installed build; restart it" (U69).
+- This pins the server for the client; it does not pin the client for the server, which stays
+  unpinned by ruling (residual 1). That `LOCAL_PEERTOKEN` is readable on the client side and
+  that `SecCodeCopyGuestWithAttributes` resolves a service-user process from a login user's
+  process is `[K0 leg 2: pending]`.
+
 **Protocol `k3sm-keys/1`.** Internal, not a public API; the public interface is the `k3sm
 keys` CLI, which other programs call as a subprocess with the value on stdin. The CLI's human
 output is not stable and may change in any release; `-o json` and the exit codes are the stable
@@ -1443,8 +1479,9 @@ surface, and the app consumes only those.
   `scope-owner-changed`, `scope-owner-unknown`, `user-scope-off`, `rate-limited`, `refused`,
   `unsupported-version`, `unknown-op`, `internal`. A client maps any code it does not know to a
   generic failure that prints the code (U38).
-- CLI and server are one binary, so version skew exists only between an upgrade's symlink flip
-  and the server's restart; the CLI then prints "the server is an older build; restart it" and
+- CLI and server are one binary, so version skew exists only between an upgrade's install
+  and the server's restart; the server pin refuses that window first ("The client pins the
+  server"), and the CLI prints "the server is not running the installed build; restart it" and
   exits 1.
 
 **Bounds.** 16 concurrent connections, at most 2 per uid among them; 10 seconds per request;
@@ -1525,7 +1562,15 @@ the first layer.**
    that leaf, never `pkg/sandbox`, so the store takes on none of the sandbox's dependencies
    (U49). k3sm's `baseSocketDenies` derives the `keys.sock` path from the leaf and adds a
    `(deny network-outbound (remote unix-socket …))` for it, so there is one spelling (U46,
-   E10). That a Pod with these denies cannot `connect(2)` to the socket or read any of these
+   E10).
+
+   **The denies cover writes, not only reads and connects.** The data-root denies are on every
+   file operation (`file*`: reads, writes, create, unlink, rename, link and attribute changes),
+   and on `network-bind` of a unix socket under `keystore-run/`, so a Pod can neither plant a
+   name nor bind a socket where the server's is. U16 asserts, for every variant, that the
+   rendered profile refuses a write, a create, an unlink, a rename and a `network-bind` on
+   `keystore-run/`, on `keys.sock` and on every `keystore-*` name, beside the read and connect
+   cases; E10 attempts each on the rig and expects `EPERM`. That a Pod with these denies cannot `connect(2)` to the socket or read any of these
    paths, and whether a Pod can read Phase A's two data-root files before them, is `[K0 leg 4:
    pending]`.
 2. **Pod uid refusal, the second layer.** Native Pods run as the service user, below 501. The
@@ -1850,7 +1895,7 @@ adds a seam package adds it to the list in the same change.
 | `pkg/keystore` | clock, uid resolver, chflags flag source, GeneratedUID lookup | U47 |
 | `pkg/keystore/socket` | clock, peer-credential source (server side), chflags flag source | U48 |
 | `pkg/keystore/reconcile` | clock (sweep interval, backoff, the two-sweep count) | U59 |
-| `cmd/k3sm` | clock, uid resolver, peer-credential source (client side), exec, euid source, file-attribute writer (the maintenance verbs) | U60 |
+| `cmd/k3sm` | clock, uid resolver, peer-credential source (client side), server code identity, exec, euid source, file-attribute writer (the maintenance verbs) | U60 |
 | `pkg/install` | euid source, file-attribute writer | U61 |
 | `pkg/policy` | none: its tests evaluate the policy's CEL in process and reach no host primitive | none |
 
@@ -1862,6 +1907,7 @@ adds a seam package adds it to the list in the same change.
 | chflags flag source | `fstat` `st_flags & SF_APPEND` on the two logs, and `chflags` in the maintenance verbs | a flag set or clear per file | a panicking stub |
 | GeneratedUID lookup | `mbr_uid_to_uuid`, with its deadline | a fixed GeneratedUID, a changed one, an error, or a lookup past the deadline | a panicking stub |
 | audit sink | the append to `keystore-audit.log` | an in-memory log, and one whose append fails | none: it writes a file under the test's own directory, not a host primitive |
+| server code identity | `LOCAL_PEERTOKEN` on the client's connected descriptor, `SecCodeCopyGuestWithAttributes` and the cdhash of the installed binary | a peer cdhash and an installed cdhash, equal or not, or a lookup error | a panicking stub |
 | exec | `syscall.Exec` in `k3sm keys exec` | a recorder of the path, argv and environment it was given, which returns instead of replacing the process (U37) | a panicking stub |
 | euid source | `os.Geteuid`, behind the root check of every root verb, `install` and the maintenance verbs | any euid, so the refusal of a non-root caller and the root path are both unit-tested | a panicking stub |
 | file-attribute writer | `chown`, `chmod` and `chflags` (`sappnd` set and cleared) in `install` and in `floor --rebuild` and `audit --rotate` | a recorder of each call in order, and one that fails a chosen call, which is how the crash order is unit-tested (U21, U22) | a panicking stub |
@@ -1981,7 +2027,7 @@ the floor variant.
 | marker | the fact | where it applies |
 |---|---|---|
 | `[K0 leg 1: pending]` | `sappnd` on an APFS data volume as the service user: append works, and the whole defeat list fails; owner `chmod` widens nothing; the kernel securelevel and whether root can clear the flag at it; whether a rename over an `sappnd` target needs the clear first | "The user-scope floor" (the variant and the maintenance verbs) |
-| `[K0 leg 2: pending]` | `LOCAL_PEERCRED` both ways, for a socket in a service-user 0755 directory under the root-owned data root and a login uid over SSH: the login uid on the server side, the service uid on the client side | "The socket" (peer identity, the client's checks) |
+| `[K0 leg 2: pending]` | `LOCAL_PEERCRED` both ways, for a socket in a service-user 0755 directory under the root-owned data root and a login uid over SSH: the login uid on the server side, the service uid on the client side; and on the client side, that `LOCAL_PEERTOKEN` is readable and `SecCodeCopyGuestWithAttributes` with that token resolves the service-user server's code and cdhash | "The socket" (peer identity, the client's checks) |
 | `[K0 leg 3: pending]` | `mbr_uid_to_uuid` returns a stable 16-byte GeneratedUID across a server restart, and its cold latency, which sets the deadline; and what it returns for a uid with no directory record (the synthesized `FFFFEEEE-DDDD-CCCC-BBBB-AAAA` form, an error, or something else) | "Key hierarchy" (the GeneratedUID binding) |
 | `[K0 leg 4: pending]` | a Pod with the data-root denies cannot `connect(2)` to the socket or read `keystore-run/` or any `keystore-*` file; and, without them, whether a Pod can read Phase A's two data-root files today | "Pod denies", "Threat model" |
 | `[K0 leg 5: pending]` | which uid a native Pod's processes run as, and whether any Pod spec field or runtimed path can make it 501 or above | "Pod denies" (layer 2, row U15) |
@@ -2073,7 +2119,7 @@ each stated in the change that makes it. U15 is held for a K0 amendment and U39 
 | U13 | quotas: the 257th entry and the byte budget answer `ErrQuota`; the 65th live delivery answers `ErrQuota` to `deliver`; `rm` and `withdraw` still work | `k3sm/pkg/keystore::TestUserScopeQuota`, `TestDeliveryRecordQuota` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
 | U14 | the delivery record stores UID and target digest; add, look up and withdraw round-trip under the floor; the plaintext starts with the format version byte and the digest with the `k3sm-keystore-delivery-target/v1` label | `k3sm/pkg/keystore::TestDeliveryRecordDigestRoundTrip`, `TestDeliveryRecordVersionByteAndDigestLabel` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
 | U15 | (reserved for the K0 amendment if leg 5 finds a second Pod-uid path) | none | pending: K0 amendment |
-| U16 | every Pod profile variant (native, vm, container-vm, xcode, expose-paths, a custom Pod root distinct from the data root) denies every `keystore-*` name in the data root and the `keystore-run/` tree; the keystore names are in `DataRootDenyTrees` and so in `protectedPrefixes`; `ReadOnlyPaths`, `ExposePaths` or a hostPath naming the data root or a keystore path is refused; an empty `Posture.DataRoot` refuses to render; a vm or container-vm guest gets no data-root share; over the whole rendered profile of every variant, including a Pod root equal to the data root and a Pod root that is a parent of it, no emitted allow matches any keystore path; the denies are written under the canonical `/private/var/lib/k3sm` and the `keystore-` prefix deny is a regex rule | `runtimed/pkg/sandbox::TestDataRootDeniesKeystorePathsEveryProfile`, `TestNoEmittedAllowCoversKeystorePath`, `TestDataRootDeniesCanonicalPathAndPrefixRegex`, `TestProtectedPrefixesRefuseKeystoreReallow`, `TestEmptyDataRootFailsClosed`, `TestVMGuestGetsNoDataRootShare`; rig leg E10 | pending: runtimed's sandbox change |
+| U16 | every Pod profile variant (native, vm, container-vm, xcode, expose-paths, a custom Pod root distinct from the data root) denies every `keystore-*` name in the data root and the `keystore-run/` tree; the keystore names are in `DataRootDenyTrees` and so in `protectedPrefixes`; `ReadOnlyPaths`, `ExposePaths` or a hostPath naming the data root or a keystore path is refused; an empty `Posture.DataRoot` refuses to render; a vm or container-vm guest gets no data-root share; over the whole rendered profile of every variant, including a Pod root equal to the data root and a Pod root that is a parent of it, no emitted allow matches any keystore path; the denies are written under the canonical `/private/var/lib/k3sm` and the `keystore-` prefix deny is a regex rule; beside the read and connect cases, a file write, create, unlink and rename and a `network-bind` on `keystore-run/`, on `keys.sock` and on every `keystore-*` name are each refused | `runtimed/pkg/sandbox::TestDataRootDeniesKeystorePathsEveryProfile`, `TestNoEmittedAllowCoversKeystorePath`, `TestDataRootDeniesCanonicalPathAndPrefixRegex`, `TestProtectedPrefixesRefuseKeystoreReallow`, `TestEmptyDataRootFailsClosed`, `TestVMGuestGetsNoDataRootShare`, `TestKeystoreDenyCoversWritesAndBind`; rig leg E10 | pending: runtimed's sandbox change |
 | U17 | runtimed refuses a resolved Pod process uid of 501 or above, and uid 0 without a drop on a root daemon, at credential resolution and again at spawn; the check is on the final effective uid after any drop (`cred.UID` with a drop, the daemon's euid without one), so a gid-only drop that leaves uid 0 is refused | `runtimed/pkg/runtime::TestResolveCredentialRefusesLoginRangeUID`, `TestResolveCredentialRefusesRootWithoutDrop`; `runtimed/pkg/supervisor::TestSpawnRefusesLoginRangeUID`, `TestSpawnRefusesRootUIDWithoutDrop`, `TestSpawnChecksFinalEffectiveUID`; rig legs E21, E22 | pending: runtimed's sandbox change |
 | U18 | CRD: `entry`, `secretName`, `dataKey`, `requestedBy` required (`dataKey` defaults to `value`) and immutable by CEL transition rules; `requestedBy` matches its pattern and, for a user entry, equals `k3sm:local:` plus the entry's uid; `conditions` is `listType=map` keyed by `type`; status subresource on; reasons listed; a `system/…` entry is refused | `apis/config/crd::TestKeyDeliveryCRDMatchesTheGoTypes`, `TestKeyDeliveryImmutableFields`, `TestKeyDeliveryRequiredFields`, `TestKeyDeliveryRequestedByMatchesEntryUID`, `TestKeyDeliveryConditionsListMap`, `TestKeyDeliveryRefusesSystemEntry` | pending: the `KeyDelivery` API |
 | U19 | the CRD pattern, its `maxLength` of 269, the uid range rule and the 253-byte name-length rule pass the shared entry-grammar vectors, `user/1/` and `system/` each with a 254-byte name refused | `apis/config/crd::TestEntryGrammarVectors` | pending: the `KeyDelivery` API |
@@ -2117,7 +2163,7 @@ each stated in the change that makes it. U15 is held for a K0 amendment and U39 
 | U57 | `apis/keystore/entry` imports only the standard library, exports the pattern, the `maxLength` and the parse, and holds the shared vector table, which it passes | `apis/keystore/entry::TestGrammarVectors`, `TestImportsStdlibOnly` | pending: the entry grammar in `apis` |
 | U58 | seam guard, repo level: the seam-bearing packages are a closed list (`pkg/keystore`, `pkg/keystore/socket`, `pkg/keystore/reconcile`, `cmd/k3sm`, `pkg/install`); each listed package has its `TestMain` stub install and its `TestRealPrimitivesUnreachable`, a missing guard fails, and a package outside the list that declares a seam fails; fakes restore through `t.Cleanup` | `k3sm/pkg/keystore::TestEverySeamPackageHasAGuard` | pending: the user-scope store, its list extended by each change that adds a seam package |
 | U59 | seam guard: `pkg/keystore/reconcile`'s `TestMain` installs a panicking stub on its clock seam | `k3sm/pkg/keystore/reconcile::TestRealPrimitivesUnreachable` | pending: the KeyDelivery reconciler (authority) |
-| U60 | seam guard: `cmd/k3sm`'s `TestMain` installs a panicking stub on each of its seams (clock, uid resolver, client-side peer-credential source, exec, euid source, file-attribute writer) | `k3sm/cmd/k3sm::TestRealPrimitivesUnreachable` | pending: the append-only files, extended by the non-root CLI and `exec` |
+| U60 | seam guard: `cmd/k3sm`'s `TestMain` installs a panicking stub on each of its seams (clock, uid resolver, client-side peer-credential source, server code identity, exec, euid source, file-attribute writer) | `k3sm/cmd/k3sm::TestRealPrimitivesUnreachable` | pending: the append-only files, extended by the non-root CLI and `exec` |
 | U61 | seam guard: `pkg/install`'s `TestMain` installs a panicking stub on its euid source and file-attribute writer | `k3sm/pkg/install::TestRealPrimitivesUnreachable` | pending: the append-only files |
 | U62 | reconciler lines are charged to the delivery's owner uid: a `deliver-write` past the owner's share is refused and read as `Indeterminate`, the Secret keeping its last version; a `deliver-delete`, and the `deliver-write` and floor line of a withdrawal, are charged but never refused for the share, and past it draw on the revocation reserve | `k3sm/pkg/keystore/reconcile::TestReconcilerLinesChargedToOwner`, `TestDeliverWritePastShareIsIndeterminate`, `TestDeliverDeleteNeverRefusedForShare` | pending: the KeyDelivery reconciler (lifecycle) |
 | U63 | entries live under `.user/<uid>/entries/`: entries named `deliveries` and `scope.key` are ordinary, `put`, `rotate`, `list` and `rm` work on them, and neither touches the scope's `deliveries` record or `scope.key` | `k3sm/pkg/keystore::TestEntriesNamedDeliveriesAndScopeKeyAreOrdinary` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
@@ -2126,6 +2172,7 @@ each stated in the change that makes it. U15 is held for a K0 amendment and U39 
 | U66 | the GeneratedUID lookup recognises the synthesized compatibility form (prefix `FFFFEEEE-DDDD-CCCC-BBBB-AAAA`) and answers `ErrScopeOwnerUnknown`, never a changed owner, and no mint binds it; `ErrScopeOwnerChanged` only when a real, non-synthesized GeneratedUID differs from the bound one (seam: GeneratedUID lookup) | `k3sm/pkg/keystore::TestSynthesizedGeneratedUIDIsUnknown` | pending: the user-scope store |
 | U67 | the revocation class (`withdraw`, `rm`, `rotate`, the withdrawal's floor line, the reconciler's `deliver-delete` and `deliver-write` of a withdrawal) is charged to the share while it has room and past it bypasses the share and the hard cap, drawing on the 4 MiB revocation reserve; only the reserve's exhaustion refuses it; a no-op `rm`, `withdraw` or `rotate` is charged like any line and refused past the share; the socket's members stop with 3 MiB of the reserve left, which the reconciler's members may use | `k3sm/pkg/keystore/socket::TestRevocationBypassesShareUsesReserve`, `TestNoOpRevocationChargedToShare`, `TestReserveKeepsReconcilerPart` | pending: the socket operations |
 | U68 | root never acts by path where the service user can write: run as root (a root-run row, `--root`), the maintenance verbs refuse a symlink or a swapped file planted at the marker, either staging name or the old log, create through one data-root descriptor with `O_CREAT\|O_EXCL\|O_NOFOLLOW`, `fchown` and `fchflags` on the descriptor before the `renameat`, and leave every byte of both logs unchanged on a refusal | `k3sm/cmd/k3sm::TestMaintenanceRefusesPlantedSymlinkAndSwap` (integration, root-run) | pending: the append-only files |
+| U69 | the client pins the server: it reads the peer's audit token (`LOCAL_PEERTOKEN`) and refuses, writing nothing, unless the peer's cdhash equals the cdhash of the installed `/Library/k3sm/k3sm`; a service-user peer that is another binary, a reused pid, a code lookup error and an old server after an upgrade (which prints the restart message) are each refused (seams: peer-credential source, client side; server code identity) | `k3sm/cmd/k3sm::TestClientPinsServerByInstalledCDHash`, `TestClientRefusesServiceUIDPeerOfOtherCode`, `TestClientRefusesReusedPeerPID`, `TestClientCDHashMismatchNamesRestart` | pending: the non-root CLI and `exec` |
 
 ### Rig legs
 
@@ -2152,7 +2199,7 @@ E20 attended.
 | E7 | admin copies E3's KeyDelivery YAML into `ks-e2e-2` (where the user also has the role) | `Authorized=False`, reason `NotRecorded`, no Secret: the UID is not in the user's record | no (U42) | the KeyDelivery reconciler (authority): a Secret appears in `ks-e2e-2` |
 | E8 | admin strips the CRD's transition rules (a test patch, restored at the end) and edits E3's `spec.secretName` | `Authorized=False`, `NotRecorded` (digest mismatch); the original Secret deleted; no Secret under the new name | yes | the target digest: a Secret appears under the new name |
 | E9 | `sudo cp` saves `current`, the user rotates, `sudo cp` puts the old `current` back; then the same for a `system/` entry | user `list` and `sudo k3sm keys list` each mark the entry `corrupt` with the floor message; `floor --rebuild` is not run | no (U20) | the append-only files: the old value is served |
-| E10 | a native Pod (pinned by `nodeName`, darwin selector) tries `connect(2)` to `keys.sock` and to read `server/keystore`, `keystore-run/`, both logs and Phase A's two files; then a vm Pod on the same node tries to reach `keys.sock` and the data root from the guest | EPERM for each from the native Pod; the guest has no path to the data root and cannot reach the socket | no (U16) | runtimed's sandbox change: the Phase A files read (the red result K0 leg 4 records) |
+| E10 | a native Pod (pinned by `nodeName`, darwin selector) tries `connect(2)` to `keys.sock` and to read `server/keystore`, `keystore-run/`, both logs and Phase A's two files, then a file write, a create, an unlink and a rename on `keystore-run/`, `keys.sock` and every `keystore-*` file, and a `network-bind` of a unix socket in `keystore-run/`; then a vm Pod on the same node tries to reach `keys.sock` and the data root from the guest | EPERM for each from the native Pod; the guest has no path to the data root and cannot reach the socket | no (U16) | runtimed's sandbox change: the Phase A files read (the red result K0 leg 4 records) |
 | E11 | admin removes the user's RoleBinding in `ks-e2e` | within two sweeps the Secret is deleted (a denial counts only when two consecutive sweeps see it); `Authorized=False`, `NotAuthorized` | no (U44) | the KeyDelivery reconciler (lifecycle): the Secret stays |
 | E12 | root scope: `sudo k3sm keys put system/e2e-sys`, `sudo k3sm keys deliver system/e2e-sys --namespace ks-e2e`; then the user, with no sudo, tries `k3sm keys deliver`, `list` and `exec` on `system/e2e-sys` | root's Secret is delivered and stays (G20); each of the user's attempts answers `not found` and nothing reaches `ks-e2e-2`: the user cannot read or deliver the system entry. The leg does not claim the user cannot discover the name, which Phase A's 0644 files show (residual 11) | partly (U45): the root delivery is rig-only | root delivery: root delivery missing; the socket operations: a non-root user can name a system entry |
 | E13 | a ServiceAccount token creates a KeyDelivery | refused at admission | no (U40) | KeyDelivery authoring: the object is created |
@@ -2166,6 +2213,7 @@ E20 attended.
 | E21 | a native Pod with `securityContext.runAsUser: 501` | refused at spawn: the container never starts, and its status carries the uid refusal | no (U17) | runtimed's sandbox change: the Pod runs as uid 501 |
 | E22 | a native Pod with `securityContext.runAsUser: 0` | refused at spawn: the container never starts as root, and its status carries the uid refusal | no (U17) | runtimed's sandbox change: the Pod runs as uid 0 |
 | E23 | against the real authorizer: an admin binds, for `k3sm:local:<uid>` in `ks-e2e-3`, `k3sm:keystore-delivery-author` and a Role with `create` on `secrets` and `update` and `delete` on `secrets` with `resourceNames: [e2e-named]`; the user delivers `user/<uid>/e2e-token` as `e2e-named`, then as `e2e-other` | `e2e-named`: `Ready`, `Delivered`; `e2e-other`: `Authorized=False`, `NotAuthorized`, no Secret: the reconciler allows exactly what the API server allows the user | yes | the KeyDelivery reconciler (authority): `e2e-other` is delivered, or `e2e-named` is refused |
+| E24 | with the listener stopped by the maintenance marker, the operator runs, as the service user (`sudo -u _k3sm`), a program that is not k3sm bound at `keystore-run/keys.sock`; the user runs `k3sm keys list` and `k3sm keys put user/<me>/e2e-pin` | the CLI refuses each before writing a frame, naming the server pin; the stand-in receives no bytes past the connect; after the marker goes, the real server is accepted | yes | the server pin (U69): the CLI talks to the stand-in |
 
 ## Open questions
 

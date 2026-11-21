@@ -3,8 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # The keystore's acceptance gate: docs/design/keystore.md § "Acceptance gate",
-# rows G1 to G22, the user-scope rows U1 to U68 (U15 and U39 are unused) and
-# the rig legs E1 to E23. Every row is listed, on exactly one line. A row runs
+# rows G1 to G22, the user-scope rows U1 to U69 (U15 and U39 are unused) and
+# the rig legs E1 to E24. Every row is listed, on exactly one line. A row runs
 # the tests that deliver it and passes only if each named test ran and passed
 # in its own package; a row whose change has not landed yet prints PENDING,
 # never PASS. A row delivered in part prints PENDING when its delivered part
@@ -38,7 +38,7 @@
 #   --files         the append-only files: U20 to U25, U50, U52, U60, U61, U68.
 #   --socket        the socket listener: U26 to U31, U46, U48, U54.
 #   --socket-ops    the socket operations: U32 to U35, U45, U51, U67.
-#   --exec          the non-root CLI and exec: U36 to U38.
+#   --exec          the non-root CLI and exec: U36 to U38, U69.
 #   --kd-author     KeyDelivery authoring: U40, U41.
 #   --kd-reconcile  the KeyDelivery reconciler: U42, U43, U59.
 #   --kd-lifecycle  the KeyDelivery lifecycle: U44, U53, U55, U56, U62, U65.
@@ -47,7 +47,7 @@
 # A unit mode runs only its rows and only their tests, with the same exit
 # status: it exits 0 only when every row it names passes.
 #
-# --lab runs the rig legs E1 to E23, and nothing else, as an explicit, recorded
+# --lab runs the rig legs E1 to E24, and nothing else, as an explicit, recorded
 # step. --<unit mode> --lab runs that mode's unit rows and then only the legs
 # mapped to that mode (the leg's last feature to land, see the leg table); a
 # leg mapped to no mode runs only under plain --lab. Each leg's description
@@ -98,10 +98,10 @@ EXPECTED_ROWS="$EXPECTED_ROWS U21 U22 U23 U24 U25 U26 U27 U28 U29 U30 U31 U32 U3
 EXPECTED_ROWS="$EXPECTED_ROWS U36 U37 U38 U40 U41 U42 U43 U44 U45 U46 U47 U48"
 EXPECTED_ROWS="$EXPECTED_ROWS U49 U50 U51 U52 U53 U54 U55 U56 U57"
 EXPECTED_ROWS="$EXPECTED_ROWS U58 U59 U60 U61 U62 U63"
-EXPECTED_ROWS="$EXPECTED_ROWS U64 U65 U66 U67 U68"
+EXPECTED_ROWS="$EXPECTED_ROWS U64 U65 U66 U67 U68 U69"
 # >>> ADD NEW U ROWS (U64 upward) HERE <<<
 EXPECTED_ROWS="$EXPECTED_ROWS E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 E13 E14 E15 E16 E17 E18 E19 E20"
-EXPECTED_ROWS="$EXPECTED_ROWS E21 E22 E23"
+EXPECTED_ROWS="$EXPECTED_ROWS E21 E22 E23 E24"
 # >>> ADD NEW E LEGS (E24 upward) HERE <<<
 
 MODES="check rewrap verbs delivery sandbox api scope scope-store files socket socket-ops exec"
@@ -132,7 +132,7 @@ mode_rows() {
 	files) echo "U20 U21 U22 U23 U24 U25 U50 U52 U60 U61 U68" ;;
 	socket) echo "U26 U27 U28 U29 U30 U31 U46 U48 U54" ;;
 	socket-ops) echo "U32 U33 U34 U35 U45 U51 U67" ;;
-	exec) echo "U36 U37 U38" ;;
+	exec) echo "U36 U37 U38 U69" ;;
 	kd-author) echo "U40 U41" ;;
 	kd-reconcile) echo "U42 U43 U59" ;;
 	kd-lifecycle) echo "U44 U53 U55 U56 U62 U65" ;;
@@ -394,8 +394,8 @@ pend U13 "quotas: the 257th entry and the byte budget answer ErrQuota, and so do
 	TestUserScopeQuota TestDeliveryRecordQuota
 pend U14 "the delivery record stores UID and target digest; add, look up and withdraw round-trip under the floor (user-scope store)" \
 	TestDeliveryRecordDigestRoundTrip TestDeliveryRecordVersionByteAndDigestLabel
-pend U16 "every pod profile variant (native, vm, container-vm, xcode, expose-paths, a custom pod root distinct from the data root) denies every keystore path, each deny after every allow; a hostPath or expose path onto the data root is refused; an empty data root fails closed; over the whole rendered profile, a pod root equal to or a parent of the data root included, no emitted allow matches a keystore path; canonical /private/var/lib/k3sm denies and a regex keystore- prefix deny; rig leg E10 (sandbox denies)" \
-	runtimed/pkg/sandbox::TestDataRootDeniesKeystorePathsEveryProfile TestNoEmittedAllowCoversKeystorePath TestDataRootDeniesCanonicalPathAndPrefixRegex TestProtectedPrefixesRefuseKeystoreReallow TestEmptyDataRootFailsClosed TestVMGuestGetsNoDataRootShare
+pend U16 "every pod profile variant (native, vm, container-vm, xcode, expose-paths, a custom pod root distinct from the data root) denies every keystore path, each deny after every allow; a hostPath or expose path onto the data root is refused; an empty data root fails closed; over the whole rendered profile, a pod root equal to or a parent of the data root included, no emitted allow matches a keystore path; canonical /private/var/lib/k3sm denies and a regex keystore- prefix deny; a write, create, unlink, rename and network-bind on keystore-run/, keys.sock and every keystore-* name are refused; rig leg E10 (sandbox denies)" \
+	runtimed/pkg/sandbox::TestDataRootDeniesKeystorePathsEveryProfile TestNoEmittedAllowCoversKeystorePath TestDataRootDeniesCanonicalPathAndPrefixRegex TestProtectedPrefixesRefuseKeystoreReallow TestEmptyDataRootFailsClosed TestVMGuestGetsNoDataRootShare TestKeystoreDenyCoversWritesAndBind
 pend U17 "runtimed refuses a pod process uid of 501 or above, and uid 0 without a drop, at credential resolution and at spawn, on the final effective uid after any drop; rig legs E21, E22 (sandbox denies)" \
 	runtimed/pkg/runtime::TestResolveCredentialRefusesLoginRangeUID TestResolveCredentialRefusesRootWithoutDrop \
 	runtimed/pkg/supervisor::TestSpawnRefusesLoginRangeUID TestSpawnRefusesRootUIDWithoutDrop TestSpawnChecksFinalEffectiveUID
@@ -484,7 +484,7 @@ pend U58 "seam guard, repo level: every package on the closed seam-package list 
 	k3sm/pkg/keystore::TestEverySeamPackageHasAGuard
 pend U59 "seam guard: pkg/keystore/reconcile's TestMain stubs its clock seam (KeyDelivery reconciler)" \
 	k3sm/pkg/keystore/reconcile::TestRealPrimitivesUnreachable
-pend U60 "seam guard: cmd/k3sm's TestMain stubs each of its seams: clock, uid resolver, client-side peer credentials, exec, euid source, file-attribute writer (append-only files)" \
+pend U60 "seam guard: cmd/k3sm's TestMain stubs each of its seams: clock, uid resolver, client-side peer credentials, server code identity, exec, euid source, file-attribute writer (append-only files)" \
 	k3sm/cmd/k3sm::TestRealPrimitivesUnreachable
 pend U61 "seam guard: pkg/install's TestMain stubs its euid source and file-attribute writer (append-only files)" \
 	k3sm/pkg/install::TestRealPrimitivesUnreachable
@@ -502,6 +502,8 @@ pend U67 "the revocation class (withdraw, rm, rotate, the withdrawal's floor lin
 	k3sm/pkg/keystore/socket::TestRevocationBypassesShareUsesReserve TestNoOpRevocationChargedToShare TestReserveKeepsReconcilerPart
 rootpend U68 "root-run: the maintenance verbs refuse a symlink or swapped file planted at the marker, a staging name or the old log; creates are O_EXCL|O_NOFOLLOW through one data-root descriptor, fchown and fchflags on the descriptor before renameat; no log byte changes on a refusal (append-only files)" \
 	k3sm/cmd/k3sm::TestMaintenanceRefusesPlantedSymlinkAndSwap
+pend U69 "the client pins the server: the peer's audit token (LOCAL_PEERTOKEN) must resolve to the cdhash of the installed /Library/k3sm/k3sm, or nothing is written; another service-user binary, a reused pid, a lookup error and an old server after an upgrade are refused (non-root CLI and exec)" \
+	k3sm/cmd/k3sm::TestClientPinsServerByInstalledCDHash TestClientRefusesServiceUIDPeerOfOtherCode TestClientRefusesReusedPeerPID TestClientCDHashMismatchNamesRestart
 # >>> ADD NEW U ROWS (U64 upward) HERE, and add each to EXPECTED_ROWS and to mode_rows <<<
 
 leg E1 "files" "preconditions: secrets encryption on; one server; keystore-run/ and both logs present, service-user 0600, SF_APPEND set; the doctor user-scope row on; keystore.sh --check exits 0 on the build" "the append-only files"
@@ -513,7 +515,7 @@ leg E6 "socket-ops" "as the one login user: list, exec, rotate, rm and deliver o
 leg E7 "kd-reconcile" "an admin copies E3's KeyDelivery into ks-e2e-2, where the user also has the role: Authorized=False, reason NotRecorded, no Secret" "the KeyDelivery reconciler"
 leg E8 "kd-reconcile" "an admin strips the CRD's transition rules (restored at the end) and edits E3's spec.secretName: Authorized=False, NotRecorded (digest mismatch); the original Secret deleted; no Secret under the new name" "the target digest"
 leg E9 "files" "sudo cp saves current, the user rotates, sudo cp puts the old current back, then the same for a system/ entry: both lists mark the entry corrupt with the floor message" "the append-only files"
-leg E10 "sandbox" "a pod pinned to the darwin node tries connect(2) to keys.sock and to read server/keystore, keystore-run/, both logs and Phase A's two files: EPERM for each" "runtimed's sandbox change"
+leg E10 "sandbox" "a pod pinned to the darwin node tries connect(2) to keys.sock and to read server/keystore, keystore-run/, both logs and Phase A's two files, then a write, create, unlink, rename and network-bind on keystore-run/, keys.sock and every keystore-* file: EPERM for each" "runtimed's sandbox change"
 leg E11 "kd-lifecycle" "an admin removes the user's RoleBinding in ks-e2e: within two sweeps the Secret is deleted; Authorized=False, NotAuthorized" "the KeyDelivery reconciler (lifecycle)"
 leg E12 "socket-ops" "root puts and delivers system/e2e-sys; then the user, with no sudo, tries deliver, list and exec on it: root's Secret is delivered and stays; each of the user's attempts answers not found and nothing reaches ks-e2e-2" "root delivery; the socket operations"
 leg E13 "kd-author" "a ServiceAccount token creates a KeyDelivery: refused at admission" "KeyDelivery authoring"
@@ -527,6 +529,7 @@ leg E20 "files" "reboot of the server node, operator-attended (--attended reboot
 leg E21 "sandbox" "a native pod with runAsUser 501 is refused at spawn: the container never starts, and its status carries the uid refusal" "runtimed's sandbox change"
 leg E22 "sandbox" "a native pod with runAsUser 0 is refused at spawn: the container never starts as root, and its status carries the uid refusal" "runtimed's sandbox change"
 leg E23 "kd-reconcile" "against the real authorizer, a role with create on secrets and update and delete on one named secret: delivery as that name is Ready, Delivered; delivery as another name is Authorized=False, NotAuthorized, with no Secret" "the KeyDelivery reconciler"
+leg E24 "exec" "with the listener stopped by the maintenance marker, a non-k3sm program run as the service user binds keys.sock; the user's k3sm keys list and put refuse before any frame, naming the server pin; the real server is accepted afterwards" "the server pin"
 # >>> ADD NEW E LEGS (E24 upward) HERE, with the unit mode that delivers the last feature <<<
 
 nrows=${#R_ID[@]}
