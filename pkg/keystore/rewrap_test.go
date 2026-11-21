@@ -808,3 +808,36 @@ func TestRewrapGuards(t *testing.T) {
 		}
 	})
 }
+
+// TestRewrapRefusesLiveMasterFirst: a new master equal to the live one is
+// refused before any write: the floor is not raised, even when it is behind,
+// and an uncommitted master.next is not discarded.
+func TestRewrapRefusesLiveMasterFirst(t *testing.T) {
+	s, server := newTestStore(t)
+	seedRewrap(t, s)
+	live, err := os.ReadFile(masterPath(server, masterName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// a's floor entry is dropped, so a raise would record it again.
+	fl := floorOf(t, server)
+	delete(fl, "a")
+	putFloorFile(t, server, fl)
+	floorBefore, err := os.ReadFile(floorPath(server))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plantNext(t, server, rewrapKey(9))
+	if err := s.Rewrap(context.Background(), live); err == nil || !strings.Contains(err.Error(), "the new master is the live one") {
+		t.Fatalf("Rewrap to the live master: %v, want its refusal", err)
+	}
+	if after, err := os.ReadFile(floorPath(server)); err != nil || !bytes.Equal(after, floorBefore) {
+		t.Fatalf("the floor changed (%v): %s, want %s", err, after, floorBefore)
+	}
+	if got, err := os.ReadFile(masterPath(server, masterNextName)); err != nil || !bytes.Equal(got, rewrapKey(9)) {
+		t.Fatalf("master.next = %x, %v; want the planted key left in place", got, err)
+	}
+	if _, err := os.Lstat(masterPath(server, masterNextFingerprintName)); err != nil {
+		t.Fatalf("master.next.sha256 was removed: %v", err)
+	}
+}

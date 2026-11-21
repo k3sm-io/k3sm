@@ -127,6 +127,11 @@ func (s *FileStore) rewrap(ctx context.Context, newMaster []byte) error {
 	if done {
 		return resumed(k, newMaster)
 	}
+	// A new master equal to the live one is refused here, before the floor
+	// raise and before any master.next is discarded, so it writes nothing.
+	if err := refuseLive(k, newMaster); err != nil {
+		return err
+	}
 	// Like every root verb, it raises the floor first. Rewrap records nothing
 	// new in it, so a floor too full to raise does not stop it.
 	if synced, err := s.syncFloor(ctx, root, fdir, fl, k); err == nil {
@@ -166,6 +171,18 @@ func resumed(live keys, newMaster []byte) error {
 		return nil
 	}
 	return ErrRewrapResumed
+}
+
+// refuseLive refuses a newMaster that is the live master k.
+func refuseLive(k keys, newMaster []byte) error {
+	nk, err := deriveKeys(newMaster, k.scope)
+	if err != nil {
+		return err
+	}
+	if hmac.Equal(nk.seal, k.seal) {
+		return errors.New("the new master is the live one")
+	}
+	return nil
 }
 
 // refuseUserScopes is ErrScopeUnsupported when the name reserved for user
@@ -248,9 +265,6 @@ func (s *FileStore) prepareNext(ctx context.Context, root, mroot *os.Root, fl fl
 	next, err := deriveKeys(newMaster, s.scope)
 	if err != nil {
 		return keys{}, nil, false, err
-	}
-	if hmac.Equal(next.seal, old.seal) {
-		return keys{}, nil, false, errors.New("the new master is the live one")
 	}
 	// The stale fingerprint goes first, so an interruption never leaves one
 	// that vouches for a key that was not written; the rename of master.next
