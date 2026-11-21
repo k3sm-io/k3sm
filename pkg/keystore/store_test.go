@@ -605,9 +605,18 @@ func TestLockBoundedWait(t *testing.T) {
 
 // TestConcurrentOperations runs writers and readers together under -race;
 // the lock serialises them and every write lands.
+//
+// The entries' directory is made first: it is created before the lock can be
+// taken, and a new directory must be empty before it is handed over, so two
+// first operations racing to create it, running as the service user as the
+// tests do, can find each other's lock file in it. Root creating it is not
+// exposed: another process cannot open it until it is handed over.
 func TestConcurrentOperations(t *testing.T) {
 	ctx := context.Background()
-	s, _ := newTestStore(t)
+	s, server := newTestStore(t)
+	if err := s.mkdirOwned(filepath.Join(server, "keystore")); err != nil {
+		t.Fatal(err)
+	}
 	const n = 8
 	var wg sync.WaitGroup
 	errs := make(chan error, 3*n)
@@ -1106,6 +1115,93 @@ func TestCreateEntryRefusesSwappedDirectory(t *testing.T) {
 	if after := dirContents(t, filepath.Join(ks, "a")); !maps.Equal(after, before) {
 		t.Fatalf("the other entry changed: %q, was %q", after, before)
 	}
+}
+
+// TestMkdirRefusesSwappedDirectory: a directory rename-swapped into the name
+// between a mkdir and the open that checks it, or one not owned by the euid
+// that made it, is refused as ErrCorrupt before anything is chowned, and the
+// directory found there is left as it was. It covers the entries' directory,
+// made by path through mkdirOwned, and an entry directory, made by mkdirAt.
+func TestMkdirRefusesSwappedDirectory(t *testing.T) {
+	ctx := context.Background()
+	for _, target := range []string{"keystore", "b"} {
+		for _, tt := range []struct {
+			name    string
+			files   []string
+			symlink bool
+		}{
+			{"a non-empty directory", []string{"v1"}, false},
+			{"an empty directory", nil, false},
+			{"a symlink to a directory", []string{"v1"}, true},
+		} {
+			t.Run(target+": "+tt.name, func(t *testing.T) {
+				s, server := newTestStore(t)
+				at := filepath.Join(server, "keystore")
+				if target != "keystore" {
+					mustPut(t, s, "a", KindOpaque, []byte("a"))
+					at = filepath.Join(at, target)
+				}
+				// The decoy is a directory at 0755 beside the store.
+				decoy := filepath.Join(filepath.Dir(server), "decoy")
+				if err := os.Mkdir(decoy, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				chmod(t, decoy, 0o755)
+				for _, f := range tt.files {
+					writeFile(t, filepath.Join(decoy, f), "decoy "+f)
+				}
+				before := dirContents(t, decoy)
+				from, real := decoy, at // what is renamed in, and where the decoy ends up
+				if tt.symlink {
+					from, real = decoy+".link", decoy
+					if err := os.Symlink(decoy, from); err != nil {
+						t.Fatal(err)
+					}
+				}
+				s.dirMade = func(name string) {
+					if name != target {
+						return
+					}
+					if err := os.Remove(at); err != nil {
+						t.Error(err)
+					}
+					if err := os.Rename(from, at); err != nil {
+						t.Error(err)
+					}
+				}
+				var chowned []string
+				s.chown = func(f *os.File, uid, gid int) error { chowned = append(chowned, f.Name()); return nil }
+
+				if _, err := s.Put(ctx, "b", KindOpaque, []byte("b")); !errors.Is(err, ErrCorrupt) {
+					t.Fatalf("Put over a directory swapped in after its mkdir: %v, want ErrCorrupt", err)
+				}
+				if len(chowned) != 0 {
+					t.Fatalf("chowned %v", chowned)
+				}
+				if after := dirContents(t, real); !maps.Equal(after, before) {
+					t.Fatalf("the swapped-in directory changed: %q, was %q", after, before)
+				}
+				if fi, err := os.Stat(real); err != nil || fi.Mode().Perm() != 0o755 {
+					t.Fatalf("the swapped-in directory = %v %v, want its mode 0755 untouched", fi, err)
+				}
+			})
+		}
+	}
+	t.Run("a directory not owned by its creator", func(t *testing.T) {
+		s, server := newTestStore(t)
+		s.euid = func() int { return os.Geteuid() + 1 }
+		var chowned []string
+		s.chown = func(f *os.File, uid, gid int) error { chowned = append(chowned, f.Name()); return nil }
+		if _, err := s.Put(ctx, "a", KindOpaque, []byte("a")); !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("Put: %v, want ErrCorrupt", err)
+		}
+		if len(chowned) != 0 {
+			t.Fatalf("chowned %v", chowned)
+		}
+		if _, err := os.Stat(filepath.Join(server, "cred")); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("the refused Put went on to create cred/: %v", err)
+		}
+	})
 }
 
 // dirContents maps each name in dir to its content.

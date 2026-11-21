@@ -99,6 +99,12 @@ type FileStore struct {
 	// entryMade is called between a new entry directory's mkdir and its open,
 	// where a test swaps the directory.
 	entryMade func(name string)
+	// dirMade is called inside mkdirAt, between the mkdir and the open that
+	// checks it, where a test swaps the directory.
+	dirMade func(name string)
+	// euid is the effective uid that creates the store's directories, which
+	// a new directory must be owned by before it is handed over.
+	euid func() int
 }
 
 // New returns the FileStore cfg describes. It touches nothing on disk.
@@ -115,6 +121,8 @@ func New(cfg Config) *FileStore {
 		lockWait:  lockTimeout,
 		step:      func(string) error { return nil },
 		entryMade: func(string) {},
+		dirMade:   func(string) {},
+		euid:      os.Geteuid,
 	}
 }
 

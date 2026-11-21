@@ -24,6 +24,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -139,46 +140,92 @@ func (s *FileStore) checkRoot(root *os.Root, named fs.FileInfo) error {
 }
 
 // mkdirOwned creates the directory at path at dirMode, handed to the service
-// user. An existing directory is left as it is for the caller's check.
+// user, with mkdirAt through a root opened on its parent, never by its full
+// path. An existing directory is left as it is for the caller's check. The
+// parent is opened by path: it is the server work dir, which the openDir note
+// above covers.
 //
 // A crash, or a failed chown, between the Mkdir and the handover leaves the
 // directory owned by root, which the caller's check then refuses on every
 // retry; the refusal names the owner, and a chown to the service user
 // recovers it.
 func (s *FileStore) mkdirOwned(path string) error {
-	err := os.Mkdir(path, dirMode)
+	parent, err := os.OpenRoot(filepath.Dir(path))
+	if err != nil {
+		return fmt.Errorf("open the parent of %s: %w", path, err)
+	}
+	defer func() { _ = parent.Close() }() // the mkdir is all it is for
+	_, err = s.mkdirAt(parent, filepath.Base(path))
 	if errors.Is(err, fs.ErrExist) {
 		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("create %s: %w", path, err)
 	}
-	// Owner and mode go on a descriptor opened with O_NOFOLLOW, never by
-	// name, so a symlink swapped in after the Mkdir is not followed.
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		return fmt.Errorf("open %s: %w", path, err)
-	}
-	defer func() { _ = f.Close() }() // read-only; nothing to flush
-	return s.own(f, dirMode)
+	return nil
 }
 
-// mkdirAt creates the directory name inside root, handed to the service user,
-// and returns its info, taken on the descriptor the ownership went on, for a
-// caller that opens it again to check it reached the same directory.
-func (s *FileStore) mkdirAt(root *os.Root, name string) (fs.FileInfo, error) {
-	if err := root.Mkdir(name, dirMode); err != nil {
+// mkdirAt creates the directory name inside parent (mkdirat, so no symlink in
+// a path redirects it), hands it to the service user, and returns its info,
+// for a caller that opens it again to check it reached the same directory.
+//
+// Before the handover it opens the name without following a symlink and
+// requires, on that descriptor, the directory the mkdir made (its identity is
+// taken right after the mkdir), owned by the euid that made it, and empty.
+// Anything else is a directory swapped in between, which may be another
+// entry or one the service user prepared, so it is refused as ErrCorrupt and
+// nothing is chowned or chmodded. An existing name is an error matching
+// fs.ErrExist.
+func (s *FileStore) mkdirAt(parent *os.Root, name string) (fs.FileInfo, error) {
+	if err := parent.Mkdir(name, dirMode); err != nil {
 		return nil, err
 	}
-	f, fi, err := openNoFollow(root, name, os.O_RDONLY|syscall.O_DIRECTORY, 0)
+	made, err := parent.Lstat(name)
 	if err != nil {
+		return nil, fmt.Errorf("stat the new directory %s: %w", name, err)
+	}
+	s.dirMade(name)
+	f, opened, err := openNoFollow(parent, name, os.O_RDONLY|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		// A name that no longer holds the directory the mkdir made (a symlink,
+		// which os.Root may refuse as escaping, or anything else swapped in)
+		// is the swap this guards against, not an I/O failure.
+		if now, lerr := parent.Lstat(name); errors.Is(err, errBadFile) || lerr != nil || !os.SameFile(made, now) {
+			return nil, fmt.Errorf("%w: the new directory %s was replaced after its mkdir: %w", ErrCorrupt, name, err)
+		}
 		return nil, fmt.Errorf("open %s: %w", name, err)
 	}
 	defer func() { _ = f.Close() }() // read-only; nothing to flush
+	if err := s.checkNewDir(f, made, opened); err != nil {
+		return nil, fmt.Errorf("%w: the new directory %s %w", ErrCorrupt, name, err)
+	}
 	if err := s.own(f, dirMode); err != nil {
 		return nil, err
 	}
-	return fi, nil
+	return opened, nil
+}
+
+// checkNewDir checks the directory open on f is the one mkdirAt made: the
+// same file as made, a directory, owned by the euid that made it, and empty.
+func (s *FileStore) checkNewDir(f *os.File, made, opened fs.FileInfo) error {
+	if !made.IsDir() || !opened.IsDir() || !os.SameFile(made, opened) {
+		return errors.New("was replaced after its mkdir")
+	}
+	st, ok := opened.Sys().(*syscall.Stat_t)
+	if !ok || st == nil {
+		return errors.New("has no known owner")
+	}
+	if euid := s.euid(); int64(st.Uid) != int64(euid) {
+		return fmt.Errorf("is owned by uid %d, not by its creator, uid %d", st.Uid, euid)
+	}
+	names, err := f.Readdirnames(1)
+	if len(names) > 0 {
+		return errors.New("is not empty")
+	}
+	if err != nil && !errors.Is(err, io.EOF) {
+		return fmt.Errorf("could not be listed: %w", err)
+	}
+	return nil
 }
 
 // own applies the service user's ownership and mode to an open file or
