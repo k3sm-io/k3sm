@@ -43,8 +43,9 @@ const newSuffix = ".new"
 // plain error. A resumed Rewrap reuses the master.next an interrupted one
 // wrote, when it agrees with its fingerprint, and ignores newMaster.
 //
-// It refuses, writing nothing, while the floor cannot be written, and while
-// any entry does not open: an entry List reports with Err
+// It refuses, writing nothing, while the name reserved for user scopes exists
+// in the entries' directory (ErrScopeUnsupported), while the floor cannot be
+// written, and while any entry does not open: an entry List reports with Err
 // would otherwise be left sealed under a master that no longer exists, so it
 // is removed (rm) or restored first. An interrupted Put is not an entry and is
 // not re-sealed; the next Put of its name discards it. A version above the one
@@ -78,11 +79,19 @@ func (s *FileStore) rewrap(ctx context.Context, newMaster []byte) error {
 		return err
 	}
 	defer func() { _ = root.Close() }() // every write below is fsynced
+	// Checked before the lock too, whose first acquisition creates .lock, so
+	// the refusal writes nothing at all; and again under it.
+	if err := refuseUserScopes(root); err != nil {
+		return err
+	}
 	unlock, err := s.lock(ctx, root, true)
 	if err != nil {
 		return err
 	}
 	defer unlock()
+	if err := refuseUserScopes(root); err != nil {
+		return err
+	}
 	fdir, fl, err := s.lockFloor(ctx)
 	if err != nil {
 		return err
@@ -130,6 +139,20 @@ func (s *FileStore) rewrap(ctx context.Context, newMaster []byte) error {
 		return err
 	}
 	return s.swapMaster(mroot, next)
+}
+
+// refuseUserScopes is ErrScopeUnsupported when the name reserved for user
+// scopes exists in the entries' directory, whatever its type: a symlink is not
+// followed, and a dangling one counts.
+func refuseUserScopes(root *os.Root) error {
+	_, err := root.Lstat(userScopesName)
+	if err == nil {
+		return ErrScopeUnsupported
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("check for %s: %w", userScopesName, err)
+	}
+	return nil
 }
 
 // prepareNext is step 2: it returns the keys of master.next, writing it from

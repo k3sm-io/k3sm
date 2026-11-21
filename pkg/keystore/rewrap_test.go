@@ -479,3 +479,38 @@ func TestRewrapMasterRenameCompleted(t *testing.T) {
 		checkRewrapValues(t, s, vals)
 	})
 }
+
+// TestRewrapRefusesWhileUserScopesExist: the entries' directory name reserved
+// for user scopes, whatever its type, makes Rewrap refuse with
+// ErrScopeUnsupported, saying to upgrade, and write nothing.
+func TestRewrapRefusesWhileUserScopesExist(t *testing.T) {
+	for name, plant := range map[string]func(t *testing.T, p string){
+		"directory": func(t *testing.T, p string) {
+			if err := os.Mkdir(p, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"file": func(t *testing.T, p string) { writeFile(t, p, "") },
+		"symlink": func(t *testing.T, p string) {
+			if err := os.Symlink("nowhere", p); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, server := newTestStore(t)
+			vals := seedRewrap(t, s)
+			plant(t, filepath.Join(server, "keystore", userScopesName))
+			snap := treeSnapshot(t, filepath.Dir(server))
+			err := s.Rewrap(context.Background(), rewrapKey(1))
+			if !errors.Is(err, ErrScopeUnsupported) {
+				t.Fatalf("Rewrap with %s present: %v, want ErrScopeUnsupported", userScopesName, err)
+			}
+			if !strings.Contains(err.Error(), "upgrade k3sm") {
+				t.Fatalf("Rewrap refusal %q does not say to upgrade k3sm", err)
+			}
+			checkTreeUnchanged(t, snap, treeSnapshot(t, filepath.Dir(server)))
+			checkRewrapValues(t, s, vals)
+		})
+	}
+}

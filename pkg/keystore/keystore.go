@@ -126,7 +126,9 @@ type Store interface {
 	Delete(ctx context.Context, name string) error
 	// Rewrap re-seals every stored version and current pointer under a new
 	// master key, then retires the old one. It is resumable: a crash at any
-	// step leaves every record readable, and the next call completes it.
+	// step leaves every record readable, and the next call completes it. It
+	// refuses with ErrScopeUnsupported, changing nothing, while user scopes
+	// exist.
 	Rewrap(ctx context.Context, newMaster []byte) error
 }
 
@@ -169,4 +171,9 @@ var (
 	// is missing), or its directory, or cred/ above it, is a symlink, not the
 	// service user's, or open to group or others.
 	ErrMasterUntrusted = errors.New("the keystore master key is not trusted: the master file must be a regular file of 32 bytes, mode 0600, owned by the service user, and match its recorded fingerprint, in a directory (and cred/ above it) owned by the service user and closed to group and others")
+	// ErrScopeUnsupported is Rewrap's refusal while the name reserved for
+	// user scopes exists in the entries' directory, whatever its type. This
+	// build cannot re-wrap user scopes, so re-wrapping the master under them
+	// would leave them unreadable; Rewrap writes nothing.
+	ErrScopeUnsupported = errors.New("the keystore holds user scopes, which this build of k3sm cannot re-wrap: nothing was changed; upgrade k3sm, then run rewrap again")
 )
