@@ -61,9 +61,9 @@ func TestInstallRecordsLANAccess(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			f := &fakeSystem{}
+			f := newFakeSystem(t)
 			record := filepath.Join(t.TempDir(), "io.k3sm.network.json")
-			cfg := Config{BinarySource: "/tmp/k3sm", TargetUser: "alice", NetworkRecord: record, LAN: tc.lan}
+			cfg := Config{InstallDir: testInstallDir(t), BinarySource: "/tmp/k3sm", TargetUser: "alice", NetworkRecord: record, LAN: tc.lan}
 			if tc.setup != nil {
 				tc.setup(f, cfg.withDefaults())
 			}

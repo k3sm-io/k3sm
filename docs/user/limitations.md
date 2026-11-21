@@ -73,6 +73,52 @@ Pods run as **uid 0**. They are still Seatbelt-confined, and no installed cluste
 (the LaunchDaemon runs as `_k3sm`). Do not run untrusted workloads on `--datapath`; it is a
 disposable dev tier, and `k3sm dev up --datapath` says the same thing in its banner.
 
+### `fsGroup` Does Not Reach Every File in a Native Pod
+
+A native Pod with `securityContext.fsGroup` gets its data volume walked once, when the Pod is created: each
+directory and file gets the group, the owner's permissions copied to the group, and directories get setgid.
+The node daemon does this in a tree the Pod's own processes can rearrange, so it changes only what it can
+open and identify, and leaves the rest with the group and mode it had:
+
+- **Files with more than one hard link.** The other link could be a file outside the Pod, and the daemon
+  cannot tell. Image layers ship hard links (several names for one program), so those files keep their
+  group and mode.
+- **Sockets and device nodes.** A socket cannot be opened, and opening a device can act on it.
+- **Directories on another device** (a mount point inside the volume), and everything below them.
+- **Files the daemon cannot read**, which only happens when the node runs unprivileged.
+- **Entries another user owns.** Only entries owned by a user the Pod's containers run as, or by the node
+  daemon, are changed. On a node whose daemon runs as root and whose Pod drops to another user, a
+  root-owned entry gets only its mode changed, and only if it already carries the Pod's `fsGroup`. Every
+  entry the daemon creates in the Pod's tree carries it, because the tree's top directory is given the
+  group before anything is placed in it. A root-owned file renamed in from a share keeps its group and
+  mode, unless it already carried that group.
+
+Setuid and setgid files are changed, but they lose those bits first: the daemon clears setuid and setgid,
+then gives the file the group and copies the owner's permissions to the group, as for any other file. A
+setuid program in the volume therefore no longer runs as its owner, and if the owner could write it, so can
+the group. Secret, ConfigMap and projected volumes inside the tree are walked the same way, so on a node
+whose daemon runs as root their files become group-writable to every container in the Pod, not group
+read-only as kubelet makes them.
+
+A symlink gets the group on the link itself, and the walk does not follow it, so a PersistentVolumeClaim's
+data, which is mounted through a link, does not get the group either.
+
+What was left alone is written to the node daemon's log when the Pod is created, with a count for each
+reason and a few example paths. It is not on the Pod as an Event. If a container that runs as a non-root
+user with an `fsGroup` cannot read a file it expected to, check that log line first, and give the file its
+group and mode in the image or in an init step.
+
+The walk also has limits, since the tree is the Pod's to shape: 1024 directory levels and about eight
+million entries. A volume past either fails the Pod's creation with an `fsGroup` set.
+
+The `fsGroup` itself must be a group ID no account or group on the node uses, from 1000 up, unless the node
+admits that ID. Group membership on macOS is a privilege for most of the groups below 1000 (`staff`,
+`admin`, `everyone`, `_developer` and others), and a Pod is made a member of its `fsGroup`. A Pod with any
+other `fsGroup` fails to be created. Today the admission policy only admits an `fsGroup` equal to the node's
+own uid, which is below 1000, so on a default node no Pod with an `fsGroup` can be created at all. Pods
+sharing one uid, which is every Pod on a default node, are one trust domain: the `fsGroup` walk cannot keep
+one of them out of another's files.
+
 ### Keychain Reads Return Nothing, and Report Success
 
 A Pod reaching the keychain gets an **empty result with a zero exit status**, not an error. The
@@ -118,6 +164,42 @@ names. The runtime moves a workload's own names under that prefix, so programs n
 - Untrusted or multi-tenant work belongs on the **`vm` RuntimeClass**, where the Linux guest has its
   own IPC namespace (see [`vm` RuntimeClass](vm-runtimeclass.md)).
 
+### System V IPC Is Not Available in a Native Pod
+
+A native Pod cannot use System V shared memory, semaphores or message queues. `shmget`, `semget` and
+`msgget` fail with `ENOSYS` ("function not implemented"), the error a kernel built without System V
+IPC gives, so a program that can fall back does, and one that cannot fails at once with a clear
+message. macOS keeps these objects in one table for the whole host, keyed by numbers any process can
+guess, and the sandbox has no way to give each Pod its own part of it. Every Pod also runs as the same
+OS user (see "No Per-Pod uid Isolation" above), so allowing System V IPC would let one Pod read and
+write another Pod's shared memory.
+
+- **Stock PostgreSQL does not run natively.** It creates a small System V shared-memory segment at
+  every start, and on macOS it uses System V semaphores by default. It stops with `could not create
+  shared memory segment: Function not implemented`. Run it on the `vm` RuntimeClass, or use a build
+  that avoids System V IPC entirely: `PREFERRED_SEMAPHORES=NAMED_POSIX` replaces the semaphores, but
+  the start-up segment needs a source change.
+- The refusal comes from the library k3sm injects into native processes. A process that does not
+  load it (a platform binary, a container that sets its own `DYLD_INSERT_LIBRARIES`, or a program
+  that makes the system call directly instead of through the C library) can still create an object,
+  but the sandbox refuses every use of it, its removal included. Until something removes it, it
+  counts against the host's limit, which is small for shared memory (`kern.sysv.shmmni`, 32
+  segments), so a Pod that creates objects in a loop can exhaust it for every process on the Mac.
+- An installed node removes such shared-memory segments and semaphore sets itself. About every
+  minute it deletes one that the k3sm service account both owns and created, that was never used,
+  that no process is waiting on, that has stood unchanged for two minutes and, for a segment, whose
+  creator is not a live process outside a Pod. Any other process running as the service account
+  loses an object it leaves in that state. An object created without read permission for its owner
+  (mode `0000` or `0200`) cannot be inspected, so the node leaves it alone; remove it with `ipcrm`.
+- The node never removes a message queue, because nothing records who made one or who is waiting on
+  it. It logs each unused queue the service account owns once, and you remove it with `ipcrm -q
+  <id>` after checking that nothing uses it.
+- A node whose daemon runs as root or as a person (`k3sm dev`) removes nothing, because there the
+  Pods' objects cannot be told apart from yours. On such a node a leaked object stays until you
+  remove it with `ipcrm`.
+- POSIX shared memory (`shm_open`) stays denied, as above. POSIX named semaphores and anonymous
+  shared `mmap` work.
+
 ### A Native Pod Signals Its Own Process Group
 
 A process in a native Pod can signal its own children and every process in its own process group, so
@@ -133,26 +215,192 @@ container signal each other freely; the native path is narrower:
   stayed in the Pod's process group.
 - Pod teardown signals the Pod's process group from outside the sandbox, so this limit does not
   affect it: teardown still reaches the group.
+- Pod teardown also reaches a process that left the group or session (`setsid`) and was adopted by
+  `launchd`. The node daemon recognises a Pod's processes by the sandbox policy they inherited, and
+  stops them on delete and on recreate. At its own start, the daemon also stops such leftovers of
+  every Pod it knew before and did not re-attach, whether or not the Pod still exists, so a process
+  you meant to outlive its Pod will not.
+- One case may not be reached, and has not been measured: a process that put a further sandbox on
+  itself that denies the Pod's own directory (a nested `sandbox-exec`, as some command-line agents
+  use) may not be recognised, and a `setsid` descendant of it could then outlive the Pod. Stop
+  such processes from inside the Pod before it exits.
 
 This filters only who a Pod can signal. Pods on one node still share one trust domain: they run as
 the same user with no PID namespace, and the other surfaces that user can reach are not filtered this
 way (see "No Per-Pod uid Isolation" above). Untrusted work belongs on the **`vm` RuntimeClass** (see
 [`vm` RuntimeClass](vm-runtimeclass.md)).
 
-### Signing Names Files by Relative Path, and SwiftPM Cannot Finish
+### A Native Pod Can Open Its Own Terminals, and Only Those
+
+A process in a native Pod can allocate pseudo-terminals with `posix_openpt`, `openpty` or Python's
+`pty` module, make one its controlling terminal, and run a full-screen program (an editor, a pager, a
+coding agent's terminal UI) on it. The Seatbelt profile allows `/dev/ptmx`, and allows a slave
+`/dev/ttysNNN` only to the Pod that allocated it: macOS tags each new terminal for the sandbox that
+created it, and the tag does not outlive the terminal. Pods run as the same user, so the file
+permissions would let one Pod open another's terminal; the profile is what refuses it. A Pod gets
+`EPERM` opening another Pod's terminal, a terminal of the Mac's own (Terminal windows, SSH sessions,
+`/dev/console`), the legacy BSD terminals `/dev/ttys0` to `/dev/ttysf`, or a terminal number it used
+to hold once the Mac has reused it.
+
+- `/dev/tty` opens the caller's own controlling terminal, as on Linux, so pagers and password
+  prompts that read the terminal directly work, in a Pod's own terminal and in `kubectl exec -it`.
+  Every container and every `kubectl exec` session starts in a new session with no terminal, even
+  when the node daemon was started from a Terminal window, so a process with no terminal of its own
+  gets `ENXIO`.
+- The `TIOCSTI` and `TIOCCONS` requests (pushing input into a terminal, taking over console output)
+  are refused, also for a Pod that runs as root.
+- Nothing else under `/dev` is opened up. The profile does not let a Pod list `/dev`, so
+  `ttyname(3)`, the `tty` command and Python's `os.ttyname` fail with `ERANGE`; `ptsname(3)` names a
+  terminal the Pod allocated.
+- The host's terminal pool (`kern.tty.ptmx_max`, 511 by default) is **shared by every Pod and the
+  Mac's own sessions**, with no per-Pod cap, so a Pod that leaks terminals can leave none for its
+  neighbours or for a new Terminal window.
+- Programs that are setuid (`top`, `ps`) do not run in a native Pod at all, on a terminal or not.
+- `kubectl exec -t` is unchanged: the node daemon still allocates that terminal outside the sandbox
+  and hands it in.
+- Upgrading the node to a release with this grant changes every running Pod's profile, so the daemon
+  recreates those Pods instead of re-attaching them, and they come back with the grant.
+
+### SwiftPM and `xcodebuild` Builds in a Pod
 
 A Pod compiles. `clang` and `swiftc` build C, Objective-C and Swift against an installed SDK into the
-Pod's own data volume, and the binary they produce runs. Ad-hoc signing works as well. `codesign -s -`
-succeeds when the file is named by a **relative** path.
+Pod's own data volume, and the binary they produce runs. Ad-hoc signing works as well:
+`codesign -f -s -` succeeds on a file named by a relative or an absolute path.
 
-Naming that same file by an **absolute** path is refused with `Operation not permitted`. That is what
-stops SwiftPM. `swift build` re-signs its product by absolute path as its final step, so the build
-does not complete inside a Pod even though every compile and link before it succeeded.
+`swift build` and `swift test` complete in a Pod with the default build system (Swift Build), on
+a node running a release that gives each Pod its own replacement directory (below):
 
-One message on the way is not a failure, and it is worth recognising. Apple's toolchain resolves its
-`xcrun` lookup cache through `confstr(_CS_DARWIN_USER_TEMP_DIR)`, which **ignores `TMPDIR`** and names
-a path under `/var/folders` that the profile does not grant. Invocations therefore print
-`couldn't create cache file … Operation not permitted` on **stderr** and then succeed on stdout. The
+```sh
+export PATH="$DEVELOPER_DIR/usr/bin:$PATH"     # Command Line Tools
+# or, under the k3sm.io/xcode-toolchain annotation:
+export PATH="$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin:$PATH"
+swift build --disable-sandbox
+swift test --disable-sandbox
+```
+
+- `--disable-sandbox` is required. SwiftPM runs its compiler and its manifest under a Seatbelt
+  profile of its own, and macOS refuses a nested sandbox inside the Pod's.
+- The toolchain's own `bin` must come before `/usr/bin` on `PATH`, or `swift-build` and
+  `swift-test` must be named by absolute path. `/usr/bin/swift` is Apple's `xcrun` shim, a platform
+  binary, and starting the build through it loses what keeps Swift Build's link step in the Pod's
+  own temp directory (below). Through the shim the link stops with `couldNotFindTmpDir`.
+
+Why it works. Foundation, `swift-driver` and clang find their temp and cache directories through
+`confstr(_CS_DARWIN_USER_TEMP_DIR)` and `confstr(_CS_DARWIN_USER_CACHE_DIR)`, which **ignore
+`TMPDIR`** and name the `_k3sm` user's directories under `/var/folders`. Every Pod on the node runs as
+that user, so those directories are shared, and the profile does not grant them. Instead k3sm gives
+each Pod its own pair. It sets `DIRHELPER_USER_DIR_SUFFIX` in every container and `kubectl exec`
+session, which makes `confstr` name `<temp dir>/k3sm.<pod uid>` and `<cache dir>/k3sm.<pod uid>`, and
+makes those two paths links into the Pod's data volume (`tmp/darwin-user-temp` and
+`tmp/darwin-user-cache`). The profile lets the Pod resolve its own two links and nothing else in the
+shared directories, so everything written through them lands in the Pod's data volume and is
+removed with the Pod. Swift Build runs its link step with almost no environment, so the path-rebase
+shim carries the variable into child processes that dropped it. The variable is set by k3sm; a
+value in the Pod spec is replaced.
+
+The temp directories are not the only shared place. On a node, `/var/lib/k3sm` is its own APFS
+volume, and for a file on a volume other than the temp directory's, Foundation stages an atomic
+write (`Data.write(options: .atomic)`, `FileManager.url(for: .itemReplacementDirectory)`, and so
+SwiftPM's own manifest and build-description writes) in
+`<volume root>/.TemporaryItems/folders.<uid>`. That directory is one per user, so every Pod on the
+node would share it. Earlier releases did not grant it, and `swift build` in a Pod on a node stopped
+with `You don't have permission to save the file` (Cocoa error 513) although this page said it
+worked. The profile now denies that directory outright, and the path-rebase shim, which k3sm loads
+in every container once it has read the volume's mount point at start, points the path at the Pod's
+own data volume, where it does not exist. Foundation then stages the write beside the file, in the
+Pod's data volume, and the rename stays on one volume.
+
+`xcodebuild` builds a project, a workspace or a package in a Pod that carries the
+`k3sm.io/xcode-toolchain` annotation, on a node whose Xcode is `/Applications/Xcode.app`.
+[Building with Xcode in k3sm Pods](xcode.md) is the how-to: a working Pod and Job, caching,
+and a troubleshooting table. The annotation sets the Pod up for Xcode by itself:
+
+```sh
+xcodebuild -project App.xcodeproj -scheme App -configuration Debug CODE_SIGNING_ALLOWED=NO build
+```
+
+- k3sm gives the Pod a home in its data volume and points `HOME` and `CFFIXED_USER_HOME` at it,
+  so the default DerivedData, `~/Library/Developer/Xcode/DerivedData`, is writable. Xcode ignores
+  `$HOME`; `CFFIXED_USER_HOME` is the variable it honours. A `-derivedDataPath` of your own goes
+  under `$K3SM_ROOTFS`, never under a volume's mount path such as `/work`, which k3sm rewrites
+  and where the build database fails with `unable to attach DB`.
+- When the container sets no `PATH`, k3sm sets one with `$DEVELOPER_DIR/usr/bin` first. If you
+  set your own, put `$DEVELOPER_DIR/usr/bin` before `/usr/bin`, or name
+  `$DEVELOPER_DIR/usr/bin/xcodebuild`. `/usr/bin/xcodebuild` is the system's developer-tool
+  trampoline, a platform binary, and through it `xcodebuild` starts without k3sm's copy.
+- SwiftPM works inside `xcodebuild` with no flags of yours. Manifests, package plug-ins and Swift
+  macros each start a nested sandbox, which macOS refuses inside the Pod's, so k3sm's copy of
+  `xcodebuild` is started with `-IDEPackageSupportDisableManifestSandbox=YES`,
+  `-IDEPackageSupportDisablePluginExecutionSandbox=YES` and `SWIFTC_DISABLE_SANDBOX=YES`. A
+  dependency's manifest, plug-ins and macros then run with the Pod's own reach, the same as
+  `swift build --disable-sandbox`, still inside the Pod's sandbox. Passing any of them as `NO`
+  yourself wins.
+- Sign ad hoc (`CODE_SIGN_IDENTITY=-`, or `CODE_SIGN_STYLE = Manual` with an identity of `-` in the
+  project). A Developer ID or Apple Development identity needs the keychain (below).
+- Simulators, devices, `xcodebuild test` against a destination other than `platform=macOS`, and
+  anything that talks to a running Xcode are not available: the Pod reaches none of the services they
+  use.
+- `xcodebuild`, `xcrun`, `actool`, `ibtool` and `ibtoold` run as k3sm's re-signed copies. Apple
+  signs `xcodebuild` with private entitlements, ships `xcrun` as a platform binary, and signs the
+  asset and Interface Builder compilers with library validation, and macOS ignores
+  `DIRHELPER_USER_DIR_SUFFIX` and the path-rebase shim for all of them. `sudo k3sm install` copies each into the node's shadow
+  directory, re-signs it ad hoc without the entitlements, and k3sm runs the copy wherever a Pod
+  execs `/usr/bin/xcrun` or Xcode's own tool. A shell or tool that execs Xcode's `xcodebuild`,
+  `actool`, `ibtool` or `ibtoold` on a node with no usable copy fails at once with a message
+  naming `sudo k3sm install`. The copies use the
+  Pod's own temp and cache directories, so `xcrun` caches its lookups instead of starting
+  `xcodebuild` for each one. A copy has no entitlements and no hardened runtime, so it honours
+  `DYLD_*` variables from the Pod's environment; that runs code inside the Pod's own sandbox and
+  gains it nothing. `sudo k3sm install` makes the `xcodebuild` copy only when Xcode and every
+  directory above it are owned by root and writable by no one but root and the admin group (which
+  can already install software), and only from a binary Apple signed. After an Xcode update, run
+  `sudo k3sm install` again: `k3sm status` reports the copy as drifted until you do, and a copy
+  older than the Xcode it loads its frameworks from may fail to start.
+- The read grant for Xcode now includes `Contents/PlugIns`, the IDE plug-ins a build loads, without
+  their helper apps, app extensions and XPC services. The profile grants no Mach service and no
+  launchd job. The builds k3sm measured (a macOS app target and Swift packages) finish without
+  either. Asset catalogs and app icons compile through the `actool` and `ibtoold` copies. A build
+  step that needs a system service fails in the Pod and is worth reporting.
+
+- SwiftPM resolves a package's dependencies in the Pod with Xcode's own `git`: the grant reads its
+  configuration and helpers. A dependency over `https` that needs credentials fails, since the Pod
+  reaches no keychain.
+
+What this does not cover:
+
+- **File-system event streams.** A Pod reaches no `fseventsd`, so `FSEvents` watchers never fire.
+- **The developer tools in `/usr/bin`** (`/usr/bin/git`, `/usr/bin/clang` and the rest) are
+  Apple's trampolines, platform binaries that keep the shared temp directory. They work, but print
+  `couldn't create cache file` on every run. Call the tool from `$DEVELOPER_DIR/usr/bin` (first on
+  `PATH`) instead.
+- **A node whose Xcode lives elsewhere** (`Xcode-beta.app`, a versioned name). It gets no
+  `xcodebuild` copy, and `xcodebuild` in its Pods still fails as before. `swift build` is unaffected.
+- **Platform and hardened-runtime binaries** outside the shadow set ignore the variable, so they
+  keep the shared directory and fail with `Operation not permitted` when they write there, as before. They do not load the
+  path-rebase shim either, so an atomic Foundation write they make into the Pod's data volume fails
+  the same way. So does a container that sets its own `DYLD_INSERT_LIBRARIES`, which k3sm then
+  leaves without the shim.
+- **A volume on another disk.** A persistent volume or host path on a volume other than the node's
+  `/var/lib/k3sm` stages its atomic writes in that volume's own `.TemporaryItems`, which k3sm neither
+  redirects nor grants, so those writes fail with `Operation not permitted`.
+- **A container that runs as another uid** (`runAsUser`) gets that user's directories, where k3sm
+  makes no links.
+- **A link the OS removes while a process runs.** macOS empties the temp directory at boot. k3sm
+  makes the links again before every container start and every `kubectl exec`, not while a process
+  is running.
+- **Isolation between Pods.** The directories are per Pod, but every Pod still runs as the same user
+  (see "No Per-Pod uid Isolation" above).
+
+A native container whose image and Pod spec set no `PATH` starts with none, and `swift build` then
+fails at its last step with `unable to spawn process 'codesign'`. Set `PATH` in the container's
+`env`, with `/usr/bin` and `/bin` after the toolchain's `bin`, for example
+`/Library/Developer/CommandLineTools/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin`.
+
+One message on the way is not a failure, and it is worth recognising. On a node installed before
+k3sm shipped its `xcrun` copy, or one without Xcode, `xcrun` resolves its lookup cache in the shared
+`/var/folders` tree, which the profile does not grant. Invocations then print
+`couldn't create cache file … Operation not permitted` on **stderr** and succeed on stdout, slowly,
+because nothing is cached. The
 clang module cache resolves the same way, and that one would have broken compilation, so k3sm gives
 every Pod its own by pointing `CLANG_MODULE_CACHE_PATH` into the Pod's data volume, for every Pod,
 with no annotation required.
@@ -274,9 +522,33 @@ rootless pod expecting an absolute mount path sees the unmounted host path inste
 ladder that depends on absolute volume mounts (e.g. the MLX acceptance gate's cache PVC) is a
 root-tier run. Rootless stops at mount resolution.
 
+### Absolute Paths Into the Image Resolve on the Host
+
+A native Pod has no chroot, so an absolute path that names a file in the **image** (not a volume
+mount) is a host path: `PYTHONPATH=/app`, `/python/lib/...` or `--config /etc/app.toml` reads the
+Mac's `/app`, not the image's. So does the image's `WORKDIR`: an image with `WORKDIR /app` runs in the
+Mac's `/app`. Only the container's volume-mount prefixes are rebased (above). The image's own
+entrypoint is the exception: k3sm resolves `ENTRYPOINT` and `command[0]` inside the image.
+
+Every container of a native Pod that runs a pulled image gets the image root in
+**`K3SM_IMAGE_ROOT`**: the host directory k3sm materializes the Pod's images in. It is the Pod's data
+volume, shared by every container of the Pod, and the working directory when neither the container
+nor the image sets one. Build absolute image paths from it, for example `"$K3SM_IMAGE_ROOT/app"` in a
+launcher script or `os.environ["K3SM_IMAGE_ROOT"]` in code, or use paths relative to the executable
+(a Python `.pth` file next to `site-packages`, `@loader_path` install names). The runtime sets the
+value, and a value in the Pod spec is replaced. A host-binary container gets none: `image: native`,
+or an image that is a host path and sets no `command` or `args`.
+
+Kubernetes `$(VAR)` references cannot name it. `$(VAR)` in `command` and `args` is expanded before
+the runtime adds the variable, so `$(K3SM_IMAGE_ROOT)/app/run` stays as written, and `env` values are
+not expanded at all. Read the variable at run time instead, through a shell or the program itself.
+`K3SM_IMAGE_ROOT` is a location, not isolation. Seatbelt confines the Pod at host paths, and the
+`vm` RuntimeClass is the place for real filesystem isolation.
+
 ### Unsupported Volume Kinds Are Refused When Mounted
 
-`hostPath` is **not modeled on any runtime path**, native or `vm`. Neither are `nfs`, `csi`, generic
+`hostPath` is **not modeled on the `vm` path**, and on the native path only for a host share the
+node admin listed (see [Host Shares](storage.md#host-shares-for-native-pods)). Neither are `nfs`, `csi`, generic
 `ephemeral` volumes, `gitRepo` or the other in-tree network and cloud-disk kinds. A native Pod is a
 Darwin process with no mount namespace, so k3sm has nothing to bind such a volume into. Admission
 does not stop these Pods: k3sm ships PodSecurity `enforce = privileged`, so a `hostPath` Pod is
@@ -288,7 +560,9 @@ the volume.
 - If nothing mounts it, the volume is ignored and the Pod runs as if it were not declared. No Event
   reports it, because nothing in the Pod can reach the volume.
 
-Use a PVC instead of a `hostPath`.
+Use a PVC instead of a `hostPath`, or, for a native Pod that has to work on a host directory in
+place, ask the node admin for a host share. A native Pod that mounts a `hostPath` the node does not
+share is refused at creation with a Warning Event whose reason is `FailedHostShare`.
 
 An `image` volume is supported, and its reference must name the cluster registry
 (`registry-k3sm:6450/<repository>`). A mounted `image` volume that names any other registry is
@@ -445,6 +719,28 @@ Today at `main`, per port class:
     freed. That behaviour is inherited rather than introduced here, and it is the same leak the old
     shared wildcard had.
 
+  A Pod reaches its own listeners on `127.0.0.1`. Loopback is one address range shared by every Pod
+  and the host, so it cannot be given to each Pod. Instead, the same shim moves a Pod's dial to
+  `127.0.0.0/8` or `::1` onto the Pod's own address when, and only when, the Pod has a socket of the
+  same kind (TCP or UDP) bound to that address and port. So an app, a sidecar or an exec probe that
+  dials `localhost:<port>` reaches the Pod's own server, as it would in a Linux Pod. The rules:
+
+  - When the Pod holds the port, its own listener wins, even if a host service also listens on
+    `127.0.0.1` at the same port. "Holds" means that some socket is bound to the Pod's address and
+    port, and the shim cannot tell whose it is. Same-node Pods share one OS user, so another Pod
+    that binds this Pod's address receives the dials this moves (see "No Per-Pod uid Isolation"
+    above). Untrusted neighbours belong on the `vm` RuntimeClass.
+  - A moved dial arrives from the Pod's address, not from `127.0.0.1`.
+  - When the Pod does not hold the port, the dial goes to the host's loopback exactly as before.
+    The change never makes a host loopback service reachable that was not, and the sandbox's
+    per-port denies still apply to the moved dial.
+  - A Pod listener bound explicitly to `127.0.0.1` is still reached through loopback, and ports
+    below 1024 are left alone, because the bind rewrite never moved them.
+  - `connect()` and `sendto()` are covered. `sendmsg()` is not, and a UDP client that sends with
+    `sendto()` and checks the reply's source address sees the Pod's address instead of `127.0.0.1`.
+  - A process without the shim keeps the old behaviour: a platform or statically linked binary, or a
+    container that sets its own `DYLD_INSERT_LIBRARIES`.
+
   An Apple platform binary run inside a native pod (for example `/usr/bin/nc`, or the system `python3`
   or `ruby`) ignores `DYLD_INSERT_LIBRARIES`, so the per-pod bind shim never loads and a listener it opens
   binds every address on the node rather than the pod's own. Because every native pod shares the node's
@@ -480,7 +776,9 @@ Today at `main`, per port class:
   is off cannot keep it from starting later. A `type: LoadBalancer`
   Service declaring one of those ports is **rejected at `kubectl apply`** with a message naming the
   port, and every node additionally refuses to bind it. Plain NodePort Services are unaffected,
-  because the apiserver allocates their `nodePort` out of that very range. Ordinary duplicate
+  because the apiserver allocates their `nodePort` out of that very range. A Service that pins its
+  own `nodePort` should pick it from the static band, `30000-30085`; see
+  [Fixed NodePorts](install.md#fixed-nodeports). Ordinary duplicate
   LoadBalancer ports are **not** arbitrated. Two Services on `8080` that land on the same node are
   first-come there, and the loser is left out of its status on that node (a `HostNotBound` Warning
   Event names the node). Node pools can keep them apart; see [Multi-node](multi-node.md#node-pools).
@@ -612,12 +910,22 @@ bind/connect discipline that gives a Pod its own source address and port space. 
   FQDNs and `<svc>.<ns>.svc` through the node resolver. Use fully qualified names, or a compiled
   binary as the entrypoint. The same holds for a platform binary outside the re-signed set that a
   Pod's shell script spawns, as described under volume mounts above.
-- **`dnsPolicy: Default` and `dnsPolicy: None` inject nothing**, so those Pods use the host resolver,
-  which now answers cluster-shaped names (`*.svc`, `*.<domain>`) from the node resolver entry. For
-  `None`, k3sm does not read the Pod's `dnsConfig` at all: its `nameservers`, `searches` and
-  `options` are ignored, and the Pod resolves through the host. The `getaddrinfo` shim can serve a
-  `None` Pod's IPv4 nameservers exclusively (up to three) and apply its `ndots`, but the provider
-  does not pass that configuration to it yet.
+- **`dnsPolicy: Default` injects nothing**, so the Pod uses the host resolver, which answers
+  cluster-shaped names (`*.svc`, `*.<domain>`) from the node resolver entry.
+- **`dnsPolicy: None` is honored.** The Pod resolves only through its own `dnsConfig.nameservers`,
+  with its own `searches` and `ndots`, natively and in a `vm` guest, and never falls back to the
+  host resolver, with these exceptions and limits:
+  - Numeric addresses, `localhost` and `*.localhost` resolve without a nameserver.
+  - Only IPv4 nameservers are used. IPv6 ones are skipped and the Pod gets a `DNSConfigPartial`
+    Warning Event. A Pod whose nameservers are all IPv6 does not start: its containers wait in
+    `CreateContainerConfigError`.
+  - Up to three nameservers and 8 search domains are used; upstream allows 32 search domains. The
+    rest are dropped with a `DNSConfigForming` Warning Event naming them.
+  - `ndots: 0` is read as `ndots: 1`, with a `DNSConfigForming` Warning Event.
+  - Options other than `ndots` reach a `vm` guest's `/etc/resolv.conf` only.
+  - A process that loses the shim (above) resolves through the host.
+  - After a downgrade to a release without this, a `None` Pod resolves through the host until it
+    is recreated.
 - **Under `ClusterFirst`, `dnsConfig` is merged additively**, so extra `searches` are appended and
   `ndots` is overridden. Not yet honored are `dnsConfig.nameservers`, an explicit `ndots: 0`, and
   options other than `ndots`.
@@ -809,6 +1117,20 @@ always agree.
   The rungs are held in memory: after a node-daemon restart the first sample starts with no hold,
   and swap growth reads unset until a second sample exists. The rung values for swap growth and
   swap-volume free space are provisional.
+- **`HostCPUBusy` steers new Pods away from a busy Mac.** The scheduler scores a node by the CPU
+  its Pods request, so a Mac whose own apps and builds hold every core still looks empty to it. The
+  node measures the whole Mac's CPU, Pods and every other process, averaged over about two minutes,
+  and reports `HostCPUBusy=True` from 75% until the average falls below 50%. While it is True the
+  server puts the `k3sm.io/host-cpu-busy:PreferNoSchedule` taint on the node, and takes it off when
+  the condition clears. The taint only lowers the node's score: a Pod still lands there when it is
+  pinned to that node, is a DaemonSet Pod, tolerates the taint, or has no other node to go to.
+  The lowering is large: it outweighs the resource and spreading scores, so while one Mac is busy
+  the unpinned Pods created then, replicas of one Deployment included, all go to the other Macs.
+  Nothing running is moved or evicted. A node that reports no condition (its daemon has just
+  restarted, its CPU reading keeps failing, or it runs a release without this condition) keeps a
+  taint it already had for 3 minutes, then loses it. After a rollback of the servers to a release
+  without this change nothing removes the taint; remove it with
+  `kubectl taint node <node> k3sm.io/host-cpu-busy:PreferNoSchedule-`.
 - **One Pod per round.** After each eviction k3sm waits for that Pod to stop and for a fresh
   sample, and evicts again only if pressure is not falling. After 3 evictions in 5 minutes it stops
   for the rest of that pressure episode, logs an error, and records an `EvictionCascadeHalted`
@@ -1109,6 +1431,32 @@ hard-coded protected prefix with no allowlist knob, and none will be added (clos
 PVC under that default root is therefore refused with `ErrProtectedPath`. The remedy is `--pod-root`,
 which relocates the runtimed on-disk root off `/Users`. `--work-dir` alone only moves control-plane
 state (kine DB, certs, kubeconfig) and does not change the pods root.
+
+### `--work-dir` Must End in `server` or `agent`
+
+A server's `--work-dir` must be a directory named `server`, and an agent's a directory named
+`agent`: `--work-dir <data root>/server` or `--work-dir <data root>/agent`, for example
+`/data/k3sm/server`. The parent directory is the data root. Pods run under a sandbox that denies
+`<data root>/server` and `<data root>/agent`, and that deny is what keeps a pod out of the
+datastore, the cluster CA keys, the registry store and the node credentials. A work dir under any
+other name, such as `/data/k3sm/srv`, would sit outside the deny, so `k3sm server` and
+`k3sm agent` refuse to start with it and the error names the path to use instead. An existing work dir must also be a real directory, not a symlink, with exactly that name on disk, so `Server` is refused behind `--work-dir .../server`. Symlinks higher in the path, such as macOS's `/var`, are fine. The defaults
+and every layout `k3sm install` and `k3sm dev` create already follow this rule. To move an
+existing work dir, stop the daemon, rename the directory to `server` (or `agent`) under the same
+parent, and start it again with the new path.
+
+### Node State the Sandbox Does Not Deny
+
+The sandbox denies pods the `server` and `agent` directories of their own node's data root. Two
+cases fall outside that deny:
+
+- **`k3sm node`.** The standalone node has no work dir and names no state directory to the sandbox.
+  The files it is given, such as its `--kubeconfig`, are covered only by the sandbox's fixed denies,
+  such as `/Users`, and by their own file permissions.
+- **A second role on the same Mac.** A node's pods are denied only their own node's data root. A
+  second `k3sm server` or `k3sm agent` on the same Mac with another data root is not among the paths
+  they are denied, and the same holds the other way round. Its state is then kept from them only by
+  the sandbox's default deny and its file permissions.
 
 ### Single-Node Datastore Consistency
 

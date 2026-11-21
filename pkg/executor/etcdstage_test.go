@@ -97,8 +97,8 @@ func TestEtcdBuildEnvNoCgoOutOfModule(t *testing.T) {
 		!slices.Contains(got.Args, "-buildvcs=false") || !slices.Contains(got.Args, "-mod=readonly") {
 		t.Errorf("build argv = %q, want `go build -trimpath -buildvcs=false -mod=readonly ...`", got.Args)
 	}
-	if b, err := os.ReadFile(filepath.Join(bd, EtcdMarkerName)); err != nil || string(b) != "v3.6.15 nocgo\n" {
-		t.Errorf("etcd marker = %q (%v), want %q", b, err, "v3.6.15 nocgo\n")
+	if b, err := os.ReadFile(filepath.Join(bd, EtcdMarkerName)); err != nil || string(b) != "v3.6.16 nocgo\n" {
+		t.Errorf("etcd marker = %q (%v), want %q", b, err, "v3.6.16 nocgo\n")
 	}
 	if b, _ := os.ReadFile(filepath.Join(bd, "etcd")); string(b) != "pretend-etcd" {
 		t.Errorf("staged etcd = %q, want the built bytes", b)

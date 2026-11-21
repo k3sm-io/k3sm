@@ -133,7 +133,7 @@ func TestInstallEnablesADisabledService(t *testing.T) {
 					t.Fatalf("Install: %v", err)
 				}
 				f.calls = nil
-				if err := Uninstall(context.Background(), f, installCfg()); err != nil {
+				if err := Uninstall(context.Background(), f, installCfg(t)); err != nil {
 					t.Fatalf("Uninstall: %v", err)
 				}
 				if len(recorded(f.calls, "Bootout:")) == 0 {
@@ -150,9 +150,9 @@ func TestInstallEnablesADisabledService(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			shrinkRestartBudgets(t)
-			f := reinstallFake()
+			f := reinstallFake(t)
 			tc.setup(f)
-			tc.check(t, f, Install(context.Background(), f, installCfg()))
+			tc.check(t, f, Install(context.Background(), f, installCfg(t)))
 		})
 	}
 }

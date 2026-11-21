@@ -67,6 +67,18 @@ type registryPruneResult struct {
 	Unreadable []string `json:"unreadable,omitempty"`
 	// Failed are deletions the registry refused, under --force.
 	Failed []failedManifest `json:"failed,omitempty"`
+	// Interrupted says a forced prune was cancelled (Ctrl+C) before it had
+	// attempted every planned deletion, or while its last planned deletion was
+	// in flight; in that last case Unattempted may be empty. What it deleted
+	// stands and is swept.
+	Interrupted bool `json:"interrupted,omitempty"`
+	// Unattempted are the planned manifests an interrupted prune did not
+	// attempt or could not confirm: those it never sent a DELETE for, and one
+	// whose DELETE the cancellation cut off in flight. The registry may have
+	// applied that one; it is listed here, not under Manifests, and this run
+	// does not sweep it, so a later prune or the registry's scheduled
+	// collection reclaims it. None of them is a failure.
+	Unattempted []registrysvc.StoredManifest `json:"unattempted,omitempty"`
 	// Sweep is the garbage-collection sweep of the repositories a forced
 	// prune deleted from, and what it freed. It is absent from a dry run and
 	// from a forced prune that deleted nothing.
@@ -111,6 +123,11 @@ var collectPruned prunedCollector = func(ctx context.Context, authority string, 
 // errPruneIncomplete reports that some registry deletions failed. Everything
 // else the prune did stands, and the report lists what failed.
 var errPruneIncomplete = errors.New("some untagged manifests were not deleted")
+
+// pruneSweepGrace bounds the sweep an interrupted forced prune still asks for,
+// under a context the cancellation does not reach: the deletions it made
+// stand, and a short sweep of them should not be what Ctrl+C gives up.
+const pruneSweepGrace = 15 * time.Second
 
 // imagePrune prunes the cluster registry's untagged manifests and evicts
 // this node's cache, dry run unless --force.
@@ -175,10 +192,24 @@ func imagePrune(ctx context.Context, client runtimev1.ImagesClient, o imageOptio
 	} else {
 		renderPrune(out, report)
 	}
-	if failed > 0 {
-		return fmt.Errorf("prune %s: %w (%d failed; see the report)", flatRegistryHost, errPruneIncomplete, failed)
+	var errs []error
+	if report.Registry.Interrupted {
+		// The note goes to stderr: the table on stdout is a contract with the
+		// app, which refuses any line it does not know.
+		// A run cancelled at its last planned deletion leaves nothing
+		// unattempted; its note and error say so rather than count zero.
+		if n := len(report.Registry.Unattempted); n > 0 {
+			fmt.Fprintf(pruneWarn(o), "prune interrupted: %d planned manifest(s) not attempted or not confirmed; run prune again to delete them\n", n)
+			errs = append(errs, fmt.Errorf("prune %s interrupted (%d not attempted; see the report): %w", flatRegistryHost, n, context.Cause(ctx)))
+		} else {
+			fmt.Fprintln(pruneWarn(o), "prune interrupted after its last planned deletion: no planned manifest was left unattempted")
+			errs = append(errs, fmt.Errorf("prune %s interrupted at its last planned deletion (see the report): %w", flatRegistryHost, context.Cause(ctx)))
+		}
 	}
-	return nil
+	if failed > 0 {
+		errs = append(errs, fmt.Errorf("prune %s: %w (%d failed; see the report)", flatRegistryHost, errPruneIncomplete, failed))
+	}
+	return errors.Join(errs...)
 }
 
 // pruneCredential reads this node's push credential. A node with none, or a
@@ -203,6 +234,12 @@ func pruneCredential(workDir string) (registrysvc.Credential, string, error) {
 // pruneRegistry plans each repository and, under --force, deletes its
 // untagged manifests and then has the registry sweep the repositories it
 // deleted from. It returns how many deletions failed.
+//
+// A cancelled ctx (Ctrl+C) stops the deletions before the next DELETE: the
+// planned manifests not yet attempted, the remaining repositories' included,
+// are recorded as unattempted and the result as interrupted, never as failed,
+// and the deletions made are still swept under a short context the
+// cancellation does not reach.
 //
 // The registry's delete by digest drops every row with that digest, tags
 // included, so a tag pushed onto a planned manifest after the plan was read
@@ -234,10 +271,15 @@ func pruneRegistry(ctx context.Context, o imageOptions, cred registrysvc.Credent
 		plan := registrysvc.PlanRepository(o.workDir, repo, now)
 		res.Kept = append(res.Kept, plan.Kept...)
 		res.Unreadable = append(res.Unreadable, plan.Unreadable...)
-		for _, m := range plan.Delete {
+		for i, m := range plan.Delete {
 			if !o.force {
 				res.Manifests = append(res.Manifests, m)
 				continue
+			}
+			if ctx.Err() != nil {
+				res.Interrupted = true
+				res.Unattempted = append(res.Unattempted, plan.Delete[i:]...)
+				break
 			}
 			reason, state := registrysvc.Recheck(o.workDir, m, now)
 			if reason != "" {
@@ -257,22 +299,53 @@ func pruneRegistry(ctx context.Context, o imageOptions, cred registrysvc.Credent
 				res.Kept = append(res.Kept, registrysvc.KeptManifest{StoredManifest: m, Reason: registrysvc.KeepChangedSincePlan})
 				continue
 			}
+			if err != nil && ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+				// The cancellation or deadline cut this DELETE off: the registry
+				// did not refuse it, and a later prune plans it again if it is
+				// still there. A refusal that merely coincides with the
+				// cancellation is not the context's error and is filed as failed.
+				res.Interrupted = true
+				res.Unattempted = append(res.Unattempted, m)
+				continue
+			}
 			if err != nil {
 				res.Failed = append(res.Failed, failedManifest{StoredManifest: m, Error: err.Error()})
 				failed++
+				if ctx.Err() != nil {
+					// A refusal that coincides with the cancellation stays failed,
+					// but the run was still cut short: say so even when this was
+					// the last planned manifest and no later check runs.
+					res.Interrupted = true
+				}
 				continue
 			}
 			res.Manifests = append(res.Manifests, m)
 		}
 	}
 	if o.force && len(res.Manifests) > 0 {
-		sweep, err := collect(ctx, authority, res.Manifests, cred)
+		sweepCtx := ctx
+		if ctx.Err() != nil {
+			var cancel context.CancelFunc
+			sweepCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), pruneSweepGrace)
+			defer cancel()
+			fmt.Fprintf(pruneWarn(o), "prune interrupted: sweeping the %d deleted manifest(s) for up to %s\n", len(res.Manifests), pruneSweepGrace)
+		}
+		sweep, err := collect(sweepCtx, authority, res.Manifests, cred)
 		if err != nil {
 			sweep.Error = err.Error()
 		}
 		res.Sweep = &sweep
 	}
 	return failed, nil
+}
+
+// pruneWarn is where prune writes a note that is not part of its report:
+// stderr from the CLI, nowhere when no writer was set.
+func pruneWarn(o imageOptions) io.Writer {
+	if o.warn == nil {
+		return io.Discard
+	}
+	return o.warn
 }
 
 // renderPrune renders a prune report as the operator's table.

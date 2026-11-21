@@ -130,6 +130,8 @@ func newNodeStatusHarness(t *testing.T, node *corev1.Node) *nodeStatusHarness {
 	p.sample = h.sample
 	p.now = h.nowFn
 	p.publish = h.publishFn
+	// Hermetic: no host CPU read. A test that wants HostCPUBusy installs its own.
+	p.sampleCPU = func() (uint64, error) { return 0, errNoHostCPUInTests }
 	h.p = p
 	return h
 }

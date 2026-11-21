@@ -24,6 +24,8 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -47,6 +49,14 @@ const (
 	lockName = ".lock"
 	// lockTimeout bounds every wait for the lock.
 	lockTimeout = 10 * time.Second
+	// maxDirNames bounds how many names a listing of one directory accepts.
+	// Any process running as the service user can fill a store directory, and
+	// the store lists one while holding the lock, so past the bound the listing
+	// fails rather than grow without one. It is twice maxVersion, so an entry
+	// directory at the version limit, with its own files, still lists.
+	maxDirNames = 2 * maxVersion
+	// dirBatch is how many names one read of a directory returns.
+	dirBatch = 256
 )
 
 var (
@@ -92,7 +102,7 @@ func (s *FileStore) openDir(path string, create bool) (*os.Root, error) {
 // mkdirAt, so the open never leaves parent.
 func (s *FileStore) openSubdir(parent *os.Root, name string, create bool) (*os.Root, error) {
 	if create {
-		if err := s.mkdirAt(parent, name); err != nil && !errors.Is(err, fs.ErrExist) {
+		if _, err := s.mkdirAt(parent, name); err != nil && !errors.Is(err, fs.ErrExist) {
 			return nil, err
 		}
 	}
@@ -130,41 +140,102 @@ func (s *FileStore) checkRoot(root *os.Root, named fs.FileInfo) error {
 }
 
 // mkdirOwned creates the directory at path at dirMode, handed to the service
-// user. An existing directory is left as it is for the caller's check.
+// user, with mkdirAt through a root opened on its parent, never by its full
+// path. An existing directory is left as it is for the caller's check. The
+// parent is opened by path: it is the server work dir, which the openDir note
+// above covers.
 //
 // A crash, or a failed chown, between the Mkdir and the handover leaves the
 // directory owned by root, which the caller's check then refuses on every
 // retry; the refusal names the owner, and a chown to the service user
 // recovers it.
 func (s *FileStore) mkdirOwned(path string) error {
-	err := os.Mkdir(path, dirMode)
+	parent, err := os.OpenRoot(filepath.Dir(path))
+	if err != nil {
+		return fmt.Errorf("open the parent of %s: %w", path, err)
+	}
+	defer func() { _ = parent.Close() }() // the mkdir is all it is for
+	_, err = s.mkdirAt(parent, filepath.Base(path))
 	if errors.Is(err, fs.ErrExist) {
 		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("create %s: %w", path, err)
 	}
-	// Owner and mode go on a descriptor opened with O_NOFOLLOW, never by
-	// name, so a symlink swapped in after the Mkdir is not followed.
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		return fmt.Errorf("open %s: %w", path, err)
-	}
-	defer func() { _ = f.Close() }() // read-only; nothing to flush
-	return s.own(f, dirMode)
+	return nil
 }
 
-// mkdirAt creates the directory name inside root, handed to the service user.
-func (s *FileStore) mkdirAt(root *os.Root, name string) error {
-	if err := root.Mkdir(name, dirMode); err != nil {
-		return err
+// mkdirAt creates the directory name inside parent (mkdirat, so no symlink in
+// a path redirects it), hands it to the service user, and returns its info,
+// for a caller that opens it again to check it reached the same directory.
+//
+// Before the handover it opens the name without following a symlink and
+// requires, on that descriptor, the directory the mkdir made (its identity is
+// taken right after the mkdir), owned by the euid that made it, and empty.
+// Anything else is a directory swapped in between, which may be another
+// entry or one the service user prepared, so it is refused as ErrCorrupt and
+// nothing is chowned or chmodded. An existing name is an error matching
+// fs.ErrExist. Once handed over, parent is fsynced, so the new name is
+// durable.
+func (s *FileStore) mkdirAt(parent *os.Root, name string) (fs.FileInfo, error) {
+	if err := parent.Mkdir(name, dirMode); err != nil {
+		return nil, err
 	}
-	f, _, err := openNoFollow(root, name, os.O_RDONLY|syscall.O_DIRECTORY, 0)
+	made, err := parent.Lstat(name)
 	if err != nil {
-		return fmt.Errorf("open %s: %w", name, err)
+		return nil, fmt.Errorf("stat the new directory %s: %w", name, err)
+	}
+	s.dirMade(name)
+	f, opened, err := openNoFollow(parent, name, os.O_RDONLY|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		// A name that no longer holds the directory the mkdir made (a symlink,
+		// which os.Root may refuse as escaping, or anything else swapped in)
+		// is the swap this guards against, not an I/O failure.
+		if now, lerr := parent.Lstat(name); errors.Is(err, errBadFile) || lerr != nil || !os.SameFile(made, now) {
+			return nil, fmt.Errorf("%w: the new directory %s was replaced after its mkdir: %w", ErrCorrupt, name, err)
+		}
+		return nil, fmt.Errorf("open %s: %w", name, err)
 	}
 	defer func() { _ = f.Close() }() // read-only; nothing to flush
-	return s.own(f, dirMode)
+	if err := s.checkNewDir(f, made, opened); err != nil {
+		return nil, fmt.Errorf("%w: the new directory %s %w", ErrCorrupt, name, err)
+	}
+	if err := s.own(f, dirMode); err != nil {
+		return nil, err
+	}
+	// The new name is made durable before anything is written under it: a
+	// power loss could otherwise keep entries while losing the master
+	// directory, which is ErrMasterMissing for good.
+	if err := syncDir(parent); err != nil {
+		return nil, err
+	}
+	if err := s.step("mkdir " + name); err != nil {
+		return nil, err
+	}
+	return opened, nil
+}
+
+// checkNewDir checks the directory open on f is the one mkdirAt made: the
+// same file as made, a directory, owned by the euid that made it, and empty.
+func (s *FileStore) checkNewDir(f *os.File, made, opened fs.FileInfo) error {
+	if !made.IsDir() || !opened.IsDir() || !os.SameFile(made, opened) {
+		return errors.New("was replaced after its mkdir")
+	}
+	st, ok := opened.Sys().(*syscall.Stat_t)
+	if !ok || st == nil {
+		return errors.New("has no known owner")
+	}
+	if euid := s.euid(); int64(st.Uid) != int64(euid) {
+		return fmt.Errorf("is owned by uid %d, not by its creator, uid %d", st.Uid, euid)
+	}
+	names, err := f.Readdirnames(1)
+	if len(names) > 0 {
+		return errors.New("is not empty")
+	}
+	if err != nil && !errors.Is(err, io.EOF) {
+		return fmt.Errorf("could not be listed: %w", err)
+	}
+	return nil
 }
 
 // own applies the service user's ownership and mode to an open file or
@@ -214,11 +285,11 @@ func (s *FileStore) writeFile(root *os.Root, name string, data []byte) error {
 // writeFileAs is writeFile with the owner and mode given, for the one file
 // the store keeps outside the service user's tree: the root-owned floor.
 func (s *FileStore) writeFileAs(root *os.Root, name string, data []byte, uid, gid uint32, mode fs.FileMode) error {
-	var suffix [8]byte
+	var suffix [tempSuffixSize]byte
 	if err := s.readRandom(suffix[:]); err != nil {
 		return fmt.Errorf("name a temporary file: %w", err)
 	}
-	tmp := "." + name + "." + hex.EncodeToString(suffix[:]) + ".tmp"
+	tmp := tempName(name, suffix)
 	f, err := root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, fileMode)
 	if err != nil {
 		return fmt.Errorf("create %s: %w", tmp, err)
@@ -250,6 +321,34 @@ func (s *FileStore) writeFileAs(root *os.Root, name string, data []byte, uid, gi
 	}
 	renamed = true
 	return syncDir(root)
+}
+
+// tempSuffixSize is the size of the random part of a temporary file's name.
+const tempSuffixSize = 8
+
+// tempName is the name writeFile gives the temporary file for name:
+// ".<name>.<hex suffix>.tmp".
+func tempName(name string, suffix [tempSuffixSize]byte) string {
+	return "." + name + "." + hex.EncodeToString(suffix[:]) + ".tmp"
+}
+
+// isTempName reports whether n is the name tempName gives a temporary file
+// for name: the suffix exactly 2*tempSuffixSize lowercase hex digits.
+func isTempName(n, name string) bool {
+	rest, ok := strings.CutPrefix(n, "."+name+".")
+	if !ok {
+		return false
+	}
+	hexPart, ok := strings.CutSuffix(rest, ".tmp")
+	if !ok || len(hexPart) != 2*tempSuffixSize {
+		return false
+	}
+	for i := 0; i < len(hexPart); i++ {
+		if c := hexPart[i]; !('0' <= c && c <= '9' || 'a' <= c && c <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // syncDir fsyncs root's directory, making a rename or removal in it durable.
@@ -328,14 +427,28 @@ func readFile(root *os.Root, name string, max int64) ([]byte, fs.FileInfo, error
 	return b, fi, nil
 }
 
-// readDirNames lists the names in root's directory.
-func readDirNames(root *os.Root) ([]string, error) {
+// readDirNames lists the names in root's directory, read dirBatch at a time,
+// and fails closed once the directory holds more than max.
+func readDirNames(root *os.Root, max int) ([]string, error) {
 	d, err := root.Open(".")
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = d.Close() }() // read-only; nothing to flush
-	return d.Readdirnames(-1)
+	var names []string
+	for {
+		batch, err := d.Readdirnames(dirBatch)
+		names = append(names, batch...)
+		if len(names) > max {
+			return nil, fmt.Errorf("%s holds over %d names", root.Name(), max)
+		}
+		if errors.Is(err, io.EOF) {
+			return names, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
 }
 
 // openLocked opens the entries' directory, creating it with create set, and

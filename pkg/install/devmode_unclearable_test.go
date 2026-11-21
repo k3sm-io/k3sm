@@ -93,15 +93,15 @@ func TestDeveloperModeMarkerUnclearableRevertsTheSwap(t *testing.T) {
 	}
 
 	t.Run("an upgrade reverts the swap and restarts nothing on the new tree", func(t *testing.T) {
-		f := &fakeSystem{}
-		if err := Install(context.Background(), f, stageCfg()); err != nil {
+		f := newFakeSystem(t)
+		if err := Install(context.Background(), f, stageCfg(t)); err != nil {
 			t.Fatalf("first Install: %v", err)
 		}
 		putUnclearableMarker(t, f, EntryRegular)
 		stuck(f)
 		f.putLoaded(NetdLabel, ServerLabel)
 		f.calls = nil
-		cfg := stageCfg()
+		cfg := stageCfg(t)
 		cfg.DeveloperMode = DeveloperModeOff
 		err := Install(context.Background(), f, cfg)
 		if err == nil {
@@ -134,10 +134,10 @@ func TestDeveloperModeMarkerUnclearableRevertsTheSwap(t *testing.T) {
 	})
 
 	t.Run("a first install stops before anything is wired or restarted", func(t *testing.T) {
-		f := &fakeSystem{owners: map[string]OwnedEntry{}}
+		f := (&fakeSystem{owners: map[string]OwnedEntry{}}).rootedIn(t)
 		putUnclearableMarker(t, f, EntryRegular)
 		stuck(f)
-		cfg := stageCfg()
+		cfg := stageCfg(t)
 		cfg.DeveloperMode = DeveloperModeOff
 		err := Install(context.Background(), f, cfg)
 		if err == nil {
@@ -211,10 +211,10 @@ func TestDeveloperModeMarkerUnclearableEdgeCases(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			f := &fakeSystem{owners: map[string]OwnedEntry{}}
+			f := (&fakeSystem{owners: map[string]OwnedEntry{}}).rootedIn(t)
 			putUnclearableMarker(t, f, tc.kind)
 			f.removeEntryErrs = map[string]error{DeveloperModeMarkerPath: errors.New("EPERM")}
-			cfg := stageCfg()
+			cfg := stageCfg(t)
 			cfg.DeveloperMode = DeveloperModeOff
 			if err := Install(context.Background(), tc.sys(f), cfg); err != nil {
 				t.Fatalf("Install = %v, want success with the marker reading invalid", err)

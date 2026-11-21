@@ -48,10 +48,23 @@ type kineSourcePatch struct {
 // kinePatches is the source half of the patch set the kine child is built with; the
 // other half is childreq.Raises, the module requirements raised in the copied tree's
 // go.mod (p2 added golang.org/x/net v0.60.0 to p1's source patch, p3 added
-// github.com/klauspost/compress v1.20.2). kineBuildVariant
-// names the whole set: any change to either changes that variant, so every staged
-// kine re-stages. TestKinePatchSetIsMarked enforces that, against an append-only
-// history of digests.
+// github.com/klauspost/compress v1.20.2, p4 added the compact-commit-returns-error
+// source patch, p5 added compact-rollback-logs-error, p6 is p4 with x/net raised
+// to v0.62.0 together with the golang.org/x/crypto, x/sys, x/term, x/text and
+// x/sync it requires). kineBuildVariant names the whole set: any change to either
+// changes that variant, so every staged kine re-stages. TestKinePatchSetIsMarked
+// enforces that, against an append-only history of digests.
+//
+// p6's source patches are p4's. p5 also replaced compact()'s deferred
+// t.MustRollback() with a closure that only logged a failed rollback. That was
+// reverted: a ROLLBACK that fails with anything but sql.ErrTxDone can return its
+// connection to the pool still inside the transaction and holding the WAL write
+// lock (database/sql discards a
+// connection only on driver.ErrBadConn, and modernc.org/sqlite's tx.Rollback never
+// returns it), and nothing later detects that reliably. Exiting there, as upstream's
+// MustRollback does (pkg/drivers/generic/tx.go:50-56), lets kine restart with a clean
+// pool. A failed commit is unaffected: its rollback returns sql.ErrTxDone, which
+// MustRollback ignores. TestKineCompactRollbackFailureDiscardsConn pins both halves.
 //
 // migrate-scan-in-order: generic.(*Generic).Migrate issues BOTH of its COUNT(*)
 // queries before scanning either, then returns after the first Scan (the legacy
@@ -96,6 +109,27 @@ var kinePatches = []kineSourcePatch{{
 
 	if err := d.queryRow(ctx, query.New("SELECT COUNT(*) FROM kine", "?", false, "")).Scan(&count); err != nil || count != 0 {
 		return
+	}
+`,
+}, {
+	// compact-commit-returns-error: sqllog.(*SQLLog).compact ends in t.MustCommit(),
+	// which is logrus.Fatalf on any commit error. Under heavy host load the compaction
+	// tx outlives its context, database/sql rolls it back, the commit fails, and kine
+	// exits 1, which tears down the whole control plane. The fix returns the error
+	// instead; compactIter already logs "Compact failed" and retries on the next
+	// interval, and the deferred t.MustRollback() tolerates sql.ErrTxDone, which a
+	// rolled-back tx returns. Upstream: unfixed at v0.17.2 through v0.17.5.
+	name: "compact-commit-returns-error",
+	file: "pkg/logstructured/sqllog/sql.go",
+	old: `	// Commit the transaction if we make it all the way through deleting without any
+	// errors. The deferred rollback becomes a no-op if the transaction is committed.
+	t.MustCommit()
+`,
+	new: `	// Commit the transaction if we make it all the way through deleting without any
+	// errors. The deferred rollback becomes a no-op if the transaction is committed.
+	// A failed commit is returned, not fatal: the caller logs it and retries.
+	if err := t.Commit(); err != nil {
+		return 0, 0, fmt.Errorf("failed to commit compaction: %w", err)
 	}
 `,
 }}
@@ -185,14 +219,14 @@ func kineBuildArgs(version, out string) []string {
 		"-o", out, "."}
 }
 
-// kinePatchSetID is the patch-set suffix of kineBuildVariant ("p3" of "nocgo+p3").
+// kinePatchSetID is the patch-set suffix of kineBuildVariant ("p4" of "nocgo+p4").
 func kinePatchSetID() string {
 	_, id, _ := strings.Cut(kineBuildVariant, "+")
 	return id
 }
 
 // kineStampedVersion is the version a patched kine build reports: the upstream pin
-// plus the patch set, "v0.17.2+p3" (the bare pin with no patch set). `kine --version`
+// plus the patch set, "v0.17.2+p4" (the bare pin with no patch set). `kine --version`
 // prints it.
 func kineStampedVersion(version string) string {
 	if id := kinePatchSetID(); id != "" {

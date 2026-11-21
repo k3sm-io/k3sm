@@ -1,0 +1,8 @@
+{
+  "description": "A package with no test files reports skip and no tests: nothing ran, nothing failed, no results.",
+  "edited": [],
+  "tests": {},
+  "tier": "affected",
+  "today": "2026-10-30",
+  "verdict": "red"
+}

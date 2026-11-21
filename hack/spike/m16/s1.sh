@@ -58,7 +58,7 @@ export PATH="$CARGO_HOME/bin:$PREFIX/bin:$PATH"
 
 # ---- s1.1 the toolchain, pinned --------------------------------------------------
 for t in cmake protoc git curl; do
-  command -v "$t" >/dev/null || { verdict FAIL "s1.1 toolchain  $t is not on the lab host (brew install cmake protobuf)"; exit 0; }
+  command -v "$t" >/dev/null || { verdict FAIL "s1.1 toolchain  $t is not on the lab host (cmake and protobuf run in a k3sm pod, never installed on the host)"; exit 0; }
 done
 command -v uv >/dev/null || spike_install_uv || { verdict FAIL "s1.1 toolchain  the pinned uv did not install"; exit 0; }
 if ! command -v rustup >/dev/null; then

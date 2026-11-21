@@ -196,6 +196,12 @@ type Config struct {
 	// connection, so a later connection the kernel gives the same port starts
 	// clean.
 	ConnClosed func(remoteAddr string)
+	// Quota is a byte quota per artifactType (a manifest's artifactType, else
+	// its config media type): a manifest PUT that would take its type's usage
+	// past it is refused with 403 DENIED. Usage is the distinct layer blobs the
+	// type's stored manifests name, each counted once at its stored size. Each
+	// value must be positive and name a type; nil or empty limits nothing.
+	Quota map[string]int64
 	// Now is the clock (time.Now when nil).
 	Now func() time.Time
 }
@@ -223,6 +229,8 @@ type Server struct {
 	now           func() time.Time
 	sessions      *sessions
 	principal     func(*http.Request) string
+	// quota is the per-artifactType quota, nil when none is configured.
+	quota *quota
 	// spaceMu guards spaceHeld, the bytes in-flight upload bodies have
 	// reserved and not yet delivered to the store, and spaceHeldBy, the part
 	// of it each named principal holds.
@@ -258,6 +266,9 @@ type Server struct {
 	// manifestChecked, when set, runs between a manifest PUT's first blob
 	// check and the index write (a seam for tests that race a sweep).
 	manifestChecked func()
+	// quotaRead, when set, runs between a quota rebuild's read of the store
+	// and its install (a seam for tests that write while it reads).
+	quotaRead func()
 	// manifestRead, when set, runs between a manifest HEAD's read and its
 	// touch (a seam for tests that reap the manifest in between).
 	manifestRead func()
@@ -282,7 +293,12 @@ func New(cfg Config) (*Server, error) {
 	if cfg.GCGrace <= 0 {
 		return nil, fmt.Errorf("registry api: gc grace %s must be positive (the collector's gc.Options.Grace)", cfg.GCGrace)
 	}
+	q, err := newQuota(cfg.Quota)
+	if err != nil {
+		return nil, err
+	}
 	s := &Server{
+		quota:         q,
 		st:            cfg.Store,
 		log:           logger(cfg.Logger),
 		authorize:     cfg.Authorize,

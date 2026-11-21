@@ -10,7 +10,7 @@
 #   hack/spike/run.sh down                  # stop all spike processes
 #   hack/spike/run.sh kubectl get pods -A   # run kubectl against the spike cluster
 #
-# Requires: macOS 26+ arm64, Go (brew install go), Xcode CLT (clang), gh, curl, openssl.
+# Requires: macOS 26+ arm64, Go (the documented host toolchain; nothing new is installed on the host), Xcode CLT (clang), gh, curl, openssl.
 set -euo pipefail
 
 KUBE_PINNED_VERSION=v1.36.2                      # latest darwin-arm64 on kwok-ci/k8s; the pins below are for it

@@ -161,7 +161,8 @@ The full user documentation lives in this repository, starting at
 [docs/user/README.md](docs/user/README.md). It covers installation, concepts, kubectl access,
 images and the build engine, storage, upgrades, certificates, backup and restore, stopping and
 starting a node, multi-node and high-availability setups, Linux images under `vm`, MLX serving,
-and the current limitations. [CHANGELOG.md](CHANGELOG.md) lists what each release changed.
+and the current limitations. To build Mac apps with `xcodebuild` in a Pod, read
+[Building with Xcode in k3sm Pods](docs/user/xcode.md). [CHANGELOG.md](CHANGELOG.md) lists what each release changed.
 
 ## Contributing
 

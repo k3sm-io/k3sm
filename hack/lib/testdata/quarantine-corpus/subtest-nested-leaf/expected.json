@@ -1,0 +1,12 @@
+{
+  "description": "A listed leaf two levels down; both unlisted ancestors fail only through it.",
+  "edited": [],
+  "tests": {
+    "k3sm.io/apis/net/v1::TestTop": "excused",
+    "k3sm.io/apis/net/v1::TestTop/mid": "excused",
+    "k3sm.io/apis/net/v1::TestTop/mid/leaf": "excused"
+  },
+  "tier": "affected",
+  "today": "2026-10-30",
+  "verdict": "excused"
+}

@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -35,8 +36,10 @@ var helperBins = map[string]string{}
 // conformanceHelpers are the helper binaries built from e2e/testdata/cmd. They are
 // stdlib-only native Mach-O binaries (the workload's "image" in k3sm's native
 // model), built once and ad-hoc-signed so they exec under the default-deny
-// Seatbelt profile.
-var conformanceHelpers = []string{"hello-http", "conftool", "b411-echo"}
+// Seatbelt profile. The list must name every subdirectory of testdata/cmd, since
+// hack/lib/conformance-stage.sh stages them all to the worker
+// (TestConformanceHelpersMatchTestdata enforces it).
+var conformanceHelpers = []string{"hello-http", "conftool", "b411-echo", "pullprobe"}
 
 // helperBin returns the absolute path of a built conformance helper, skipping the
 // test when TestMain did not build it (no $KUBECONFIG → the compile-smoke, where
@@ -102,4 +105,37 @@ func buildHelperBins() error {
 		helperBins[name] = out
 	}
 	return nil
+}
+
+// TestConformanceHelpersMatchTestdata fails when conformanceHelpers and the
+// subdirectories of testdata/cmd differ. hack/lib/conformance-stage.sh stages
+// every subdirectory to the worker, so a helper TestMain does not build makes
+// hack/lab/m3.sh fail with "helper not built". Needs no cluster.
+func TestConformanceHelpersMatchTestdata(t *testing.T) {
+	entries, err := os.ReadDir(filepath.Join("testdata", "cmd"))
+	if err != nil {
+		t.Fatalf("read testdata/cmd: %v", err)
+	}
+	var dirs []string
+	for _, e := range entries {
+		if e.IsDir() {
+			dirs = append(dirs, e.Name())
+		}
+	}
+	slices.Sort(dirs)
+	want := slices.Sorted(slices.Values(conformanceHelpers))
+	var missing, extra []string
+	for _, d := range dirs {
+		if !slices.Contains(want, d) {
+			missing = append(missing, d)
+		}
+	}
+	for _, h := range want {
+		if !slices.Contains(dirs, h) {
+			extra = append(extra, h)
+		}
+	}
+	if len(missing)+len(extra) > 0 {
+		t.Fatalf("conformanceHelpers differs from testdata/cmd: in testdata/cmd but not built by TestMain: %v; built by TestMain but no testdata/cmd directory: %v", missing, extra)
+	}
 }

@@ -9,7 +9,7 @@
 # Unit-tier by construction: the HTTP server binds 127.0.0.1:0 only (hermetic,
 # no external egress), no real privilege is exercised (sudo is a PATH stub),
 # and fixtures are built from scratch per run. shellcheck is HARD-REQUIRED —
-# a missing tool is a FAIL (brew install shellcheck), never a silent skip.
+# a missing tool is a FAIL (shellcheck runs in a k3sm pod, never installed on the host; see CONTRIBUTING.md), never a silent skip.
 #
 # Usage: hack/acceptance/B137.sh
 set -euo pipefail
@@ -38,7 +38,7 @@ fi
 
 # b137.1 — shellcheck-clean. Tool absence is a HARD FAIL (no fail-open skip).
 if ! command -v shellcheck >/dev/null 2>&1; then
-	ladder no "b137.1  shellcheck clean (shellcheck NOT INSTALLED — brew install shellcheck)"
+	ladder no "b137.1  shellcheck clean (shellcheck NOT ON THIS HOST — it runs in a k3sm pod, never installed on the host)"
 elif shellcheck -s sh "$SCRIPT"; then
 	ladder ok "b137.1  shellcheck -s sh clean"
 else

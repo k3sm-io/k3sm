@@ -1,0 +1,10 @@
+{
+  "description": "Generated (testdata/gen): go test -count=3 runs TestFlake three times under one id; only the second run fails. A failure is sticky per test id, so the passes on either side of it never turn the test green and the unlisted failure reds.",
+  "edited": [],
+  "tests": {
+    "k3sm.io/apis/net/v1::TestFlake": "failed"
+  },
+  "tier": "affected",
+  "today": "2026-10-30",
+  "verdict": "red"
+}

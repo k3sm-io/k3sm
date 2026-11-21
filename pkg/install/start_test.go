@@ -102,8 +102,10 @@ func TestInstallHonoursUserStop(t *testing.T) {
 		if err := Install(ctx, f, cfg); err != nil {
 			t.Fatalf("Install --start: %v", err)
 		}
+		// The start precondition flushes the range the netd plist recorded
+		// before the reinstall rewrote it to the default.
 		before(t, f.calls,
-			"FlushLo0Aliases:100.64.0.0/10,"+stopTestServiceCIDR, // the start precondition
+			"FlushLo0Aliases:100.64.0.0/10,"+stopTestServiceCIDR,
 			"Enable:"+NetdLabel, "Bootstrap:"+NetdLabel,
 			"Enable:"+ServerLabel, "Bootstrap:"+ServerLabel,
 			"RemoveStopMarker", // only once the daemons are up
@@ -123,7 +125,7 @@ func TestInstallHonoursUserStop(t *testing.T) {
 		if err := Stop(ctx, f, cfg, ActorUser, "test"); err != nil {
 			t.Fatalf("Stop: %v", err)
 		}
-		if err := Uninstall(ctx, f, Config{Logger: cfg.Logger}); err != nil {
+		if err := Uninstall(ctx, f, Config{Logger: cfg.Logger, InstallDir: cfg.InstallDir}); err != nil {
 			t.Fatalf("Uninstall: %v", err)
 		}
 		for _, l := range []string{ServerLabel, NetdLabel} {
@@ -140,7 +142,7 @@ func TestInstallHonoursUserStop(t *testing.T) {
 		f, cfg, _ := stoppableNode(t)
 		f.disabled = map[string]bool{NetdLabel: true} // the operator's own disable
 		f.calls = nil
-		if err := Uninstall(ctx, f, Config{Logger: cfg.Logger}); err != nil {
+		if err := Uninstall(ctx, f, Config{Logger: cfg.Logger, InstallDir: cfg.InstallDir}); err != nil {
 			t.Fatalf("Uninstall: %v", err)
 		}
 		if got := enableOrBootstrap(f.calls); len(got) != 0 {
@@ -272,5 +274,32 @@ func TestStillCordonedMarkerIsStable(t *testing.T) {
 	}
 	if got, want := StartCutoff(), StartTimeBound()+LifecycleMargin; got != want {
 		t.Errorf("StartCutoff = %s, want %s", got, want)
+	}
+}
+
+// TestStartFlushesTheRangeTheOldPlistRecorded is the B1403 gate: install
+// --start over a node whose netd plist records a non-default Service range
+// (the stop fixture's, as an earlier release that took --service-cidr wrote
+// it) flushes that range's lo0 aliases, not the default the reinstall renders
+// into the new plist. The flush scope is read before the plist is rewritten.
+func TestStartFlushesTheRangeTheOldPlistRecorded(t *testing.T) {
+	f, cfg, _ := stoppableNode(t)
+	if err := Stop(context.Background(), f, cfg, ActorUser, "test"); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	f.calls = nil
+	cfg.Start = true
+	if err := Install(context.Background(), f, cfg); err != nil {
+		t.Fatalf("Install --start: %v", err)
+	}
+	var flushes []string
+	for _, c := range f.calls {
+		if strings.HasPrefix(c, "FlushLo0Aliases:") {
+			flushes = append(flushes, c)
+		}
+	}
+	want := []string{"FlushLo0Aliases:100.64.0.0/10," + stopTestServiceCIDR}
+	if !slices.Equal(flushes, want) {
+		t.Errorf("install --start flushed %q, want %q: the range the old netd plist recorded", flushes, want)
 	}
 }

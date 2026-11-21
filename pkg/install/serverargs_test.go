@@ -33,6 +33,7 @@ func testConfig(t *testing.T) Config {
 	t.Helper()
 	dir := t.TempDir()
 	return Config{
+		InstallDir:       testInstallDir(t),
 		BinarySource:     "/tmp/k3sm",
 		TargetUser:       "alice",
 		DataRoot:         filepath.Join(dir, "data"),
@@ -85,7 +86,7 @@ func tokenOf(t *testing.T, f *fakeSystem, cfg Config) string {
 // single-node on loopback. An in-place reinstall was unaffected, which is why
 // this survived every reinstall test.
 func TestUninstallThenInstallPreservesServerArgs(t *testing.T) {
-	f := &fakeSystem{}
+	f := newFakeSystem(t)
 	// A scratch data root: the record lives inside it, and nothing here may
 	// touch the running Mac's /var/lib/k3sm.
 	cfg := testConfig(t)
@@ -150,7 +151,7 @@ func TestServerArgsRecordSources(t *testing.T) {
 	recordPath := func(cfg Config) string { return cfg.withDefaults().ServerArgsRecord }
 
 	t.Run("the plist wins over the record, and the record is rewritten from it", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		cfg := testConfig(t)
 		// A stale record from an earlier configuration, and a plist the operator
 		// has since edited. The plist is what launchd actually runs.
@@ -176,7 +177,7 @@ func TestServerArgsRecordSources(t *testing.T) {
 	})
 
 	t.Run("an unreadable plist names the record and the arguments it holds", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		cfg := testConfig(t)
 		putServerArgsRecord(t, f, recordPath(cfg), "--mesh-ip", "100.64.0.1")
 		f.putFile(cfg.withDefaults().plistPath(ServerLabel), []byte("<plist><dict></dict></plist>"))
@@ -193,7 +194,7 @@ func TestServerArgsRecordSources(t *testing.T) {
 	})
 
 	t.Run("a record from a newer k3sm fails the install and names its path", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		cfg := testConfig(t)
 		f.putFile(recordPath(cfg), []byte(`{"version":99,"args":["--mesh-ip","100.64.0.1"]}`))
 
@@ -207,7 +208,7 @@ func TestServerArgsRecordSources(t *testing.T) {
 	})
 
 	t.Run("a record that is not json fails the install and names its path", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		cfg := testConfig(t)
 		f.putFile(recordPath(cfg), []byte("{ this is not json"))
 
@@ -230,7 +231,7 @@ func TestInstallWarnsWhenNothingIsCarriedOverAUsedDataRoot(t *testing.T) {
 	warnKey := "no operator-supplied server arguments"
 
 	t.Run("a used data root with neither source warns and names both flags", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		var log bytes.Buffer
 		cfg := testConfig(t)
 		cfg.Logger = testLogger(&log)
@@ -252,7 +253,7 @@ func TestInstallWarnsWhenNothingIsCarriedOverAUsedDataRoot(t *testing.T) {
 	})
 
 	t.Run("a first install on an empty data root says nothing", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		var log bytes.Buffer
 		cfg := testConfig(t)
 		cfg.Logger = testLogger(&log)
@@ -266,7 +267,7 @@ func TestInstallWarnsWhenNothingIsCarriedOverAUsedDataRoot(t *testing.T) {
 	})
 
 	t.Run("a record present on a used data root says nothing", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		var log bytes.Buffer
 		cfg := testConfig(t)
 		cfg.Logger = testLogger(&log)
@@ -403,7 +404,7 @@ func TestServerArgsAreCarriedVerbatimAndPrintedRedacted(t *testing.T) {
 		secret   = "s3cret"
 	)
 	var log bytes.Buffer
-	f := &fakeSystem{}
+	f := newFakeSystem(t)
 	cfg := testConfig(t)
 	cfg.Logger = testLogger(&log)
 
@@ -457,7 +458,7 @@ func TestServerArgsAreCarriedVerbatimAndPrintedRedacted(t *testing.T) {
 	})
 
 	t.Run("masked in the unparsable-plist error", func(t *testing.T) {
-		g := &fakeSystem{}
+		g := newFakeSystem(t)
 		gcfg := testConfig(t)
 		putServerArgsRecord(t, g, gcfg.withDefaults().ServerArgsRecord, flagName, url)
 		g.putFile(gcfg.withDefaults().plistPath(ServerLabel), []byte("<plist><dict></dict></plist>"))

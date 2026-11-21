@@ -1,0 +1,10 @@
+{
+  "description": "Two entries separated by a lone FS (0x1c) character. Only LF delimits registry lines, so this is one malformed line: red.",
+  "edited": [],
+  "tests": {
+    "k3sm.io/apis/net/v1::TestA": "passed"
+  },
+  "tier": "affected",
+  "today": "2026-10-30",
+  "verdict": "red"
+}

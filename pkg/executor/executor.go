@@ -303,7 +303,7 @@ const (
 	// (pkg/executor/etcdchild). It must equal the wrapper's go.mod.txt require; a bump
 	// is `hack/etcd-wrapper.sh regen <version>` plus this line, in one commit. 3.6 is
 	// the line the pinned kube-apiserver and k3sm's own etcd client are on.
-	DefaultEtcdVersion = "v3.6.15"
+	DefaultEtcdVersion = "v3.6.16"
 	// DefaultAPIServerPort avoids Docker Desktop's :6443.
 	DefaultAPIServerPort = 6444
 	// DefaultKinePort is the kine etcd-shim listen port. In the etcd posture the etcd

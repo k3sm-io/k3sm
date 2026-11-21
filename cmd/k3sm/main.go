@@ -30,7 +30,7 @@ const usage = `k3sm %s — Kubernetes for macOS, natively
 
 Usage: k3sm <command> [flags]
 
-Commands ("server", "agent", "node", "netd", "install", "uninstall", "stop", "start", "restart", "network", "datavol", "token", "certificate", "snapshot", "secrets-encrypt", "interconnect", "build", "builder", "image", "model", "registry", "kubectl", "kubeconfig", "status", "alerts", "update", "doctor", "dev" are implemented):
+Commands ("server", "agent", "node", "netd", "install", "uninstall", "stop", "start", "restart", "network", "share", "expose", "datavol", "token", "certificate", "snapshot", "secrets-encrypt", "interconnect", "build", "builder", "image", "model", "registry", "kubectl", "kubeconfig", "status", "alerts", "update", "doctor", "dev" are implemented):
   server      run the control plane + a node on this Mac (--mesh-ip enables multi-node join)
   agent       join this Mac to an existing cluster as a worker node
   node        run a Virtual Kubelet node here (HostProcess or runtimed runtime)
@@ -46,13 +46,17 @@ Commands ("server", "agent", "node", "netd", "install", "uninstall", "stop", "st
               --start also starts a stopped node)
   network     LAN access for this node's NodePort, LoadBalancer and ingress
               listeners (network lan on|off|status; on/off run as root via sudo)
+  share       the host paths native pods may mount with a hostPath volume
+              (share add|remove|list; add/remove run as root via sudo)
+  expose      the host accounts native pods may publish a volume to
+              (expose allow|revoke|list; allow/revoke run as root via sudo)
   datavol     the APFS volume the data root lives on (datavol mount|status|delete)
   token       mint cluster join tokens (token create)
   certificate re-issue the control-plane leaf certs over the existing CA (certificate rotate)
   build       build an image from a Dockerfile (COPY-only natively; RUN via the build engine)
   builder     manage the in-cluster buildkitd engine (builder up|down|delete|status|buildx)
   image       ingest, publish and reclaim this node's images (image load|import|push|pull|tag|untag|inspect|save|prune|ls|df|migrate)
-  model       store models in the cluster registry as ModelPack OCI artifacts (model push|rm)
+  model       store models in the cluster registry as ModelPack OCI artifacts (model push|import|rm)
   registry    mint the cluster registry's push token for any OCI tool, through your kubeconfig (registry token|login)
   kubectl     run the bundled kubectl against this cluster (KUBECONFIG preset)
   kubeconfig  print the admin kubeconfig, or --write/merge it into ~/.kube/config
@@ -131,6 +135,14 @@ func main() {
 		}
 	case "network":
 		if code := runNetwork(os.Args[2:], os.Stdout, os.Stderr); code != 0 {
+			os.Exit(code)
+		}
+	case "share":
+		if code := runShare(os.Args[2:], os.Stdout, os.Stderr); code != 0 {
+			os.Exit(code)
+		}
+	case "expose":
+		if code := runExpose(os.Args[2:], os.Stdout, os.Stderr); code != 0 {
 			os.Exit(code)
 		}
 	case netdRemoveMeshVerb:

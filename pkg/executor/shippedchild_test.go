@@ -518,9 +518,9 @@ func TestShippedStampReaders(t *testing.T) {
 	}
 	const kineInfo = "go\tgo1.27.2\npath\tgithub.com/k3s-io/kine\nmod\tgithub.com/k3s-io/kine\t(devel)\t\nbuild\t-trimpath=true\nbuild\tCGO_ENABLED=0\nbuild\tGOOS=darwin\n"
 	const etcdInfo = "go\tgo1.27.2\npath\tk3sm.io/etcd-child\nmod\tk3sm.io/etcd-child\t(devel)\t\n" +
-		"dep\tgo.etcd.io/etcd/server/v3\tv3.6.15\th1:x=\nbuild\tCGO_ENABLED=0\n"
-	const etcdutlInfo = "go\tgo1.27.2\npath\tgo.etcd.io/etcd/etcdutl/v3\nmod\tgo.etcd.io/etcd/etcdutl/v3\tv3.6.15\th1:y=\n" +
-		"dep\tgo.etcd.io/etcd/server/v3\tv3.6.15\th1:x=\nbuild\tCGO_ENABLED=0\n"
+		"dep\tgo.etcd.io/etcd/server/v3\tv3.6.16\th1:x=\nbuild\tCGO_ENABLED=0\n"
+	const etcdutlInfo = "go\tgo1.27.2\npath\tgo.etcd.io/etcd/etcdutl/v3\nmod\tgo.etcd.io/etcd/etcdutl/v3\tv3.6.16\th1:y=\n" +
+		"dep\tgo.etcd.io/etcd/server/v3\tv3.6.16\th1:x=\nbuild\tCGO_ENABLED=0\n"
 
 	t.Run("kine", func(t *testing.T) {
 		v, variant, err := kineStampOf(parse(t, kineInfo), kineStampedVersion(DefaultKineVersion))
@@ -558,7 +558,7 @@ func TestShippedStampReaders(t *testing.T) {
 		if _, _, err := etcdStampOf(parse(t, replaced), etcdWrapperModule, etcdServerModule); err == nil {
 			t.Error("a replaced etcd server module was accepted")
 		}
-		missing := strings.Replace(etcdInfo, "dep\tgo.etcd.io/etcd/server/v3\tv3.6.15\th1:x=\n", "", 1)
+		missing := strings.Replace(etcdInfo, "dep\tgo.etcd.io/etcd/server/v3\tv3.6.16\th1:x=\n", "", 1)
 		if _, _, err := etcdStampOf(parse(t, missing), etcdWrapperModule, etcdServerModule); err == nil {
 			t.Error("build info without the etcd server module was accepted")
 		}

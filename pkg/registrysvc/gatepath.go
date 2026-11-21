@@ -64,6 +64,11 @@ const (
 	opUploadStatus
 	// opManifestPut is PUT /v2/<name>/manifests/<reference>.
 	opManifestPut
+	// opCount is the number of operations, not an operation: classify never
+	// produces it. It must stay last; TestGateProxyForEveryOperation walks
+	// every value below it.
+	//lint:ignore U1000 the sentinel bounds gateOp; only the test that walks every operation reads it
+	opCount
 )
 
 // String names the operation for the audit line.

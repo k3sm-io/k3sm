@@ -17,6 +17,7 @@ limitations under the License.
 package registrysvc
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -28,6 +29,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"k3sm.io/k3sm/pkg/ociregistry/api"
 )
 
 // The PUSH GATE: the HTTP handler every relay address serves. Reads pass
@@ -55,6 +58,49 @@ const (
 	codeUnavailable  = "UNAVAILABLE"
 )
 
+// gateUpstreamHeaderTimeout bounds how long the gate waits for the loopback
+// registry's response headers once a request, body included, has been written
+// (http.Transport.ResponseHeaderTimeout starts its clock only then, so a blob
+// streaming for minutes is not cut off). A registry that accepted the
+// connection and has not answered in this long is wedged: the client gets a
+// 502, which frees the gate's connection and goroutine instead of holding them
+// until the client gives up.
+// It holds reads, upload status and every other request the registry answers
+// from what it already has; 30s rather than the dial's 1s leaves room for a
+// busy disk. A manifest PUT and the blob upload requests wait on work the
+// registry does before it answers, and have their own bounds: see
+// gateManifestHeaderTimeout and gateUploadHeaderTimeout.
+const gateUpstreamHeaderTimeout = 30 * time.Second
+
+// gateManifestHeaderTimeout is the response-header bound of a manifest PUT.
+// The registry answers one only after it holds the repository's lock, which a
+// collection sweep of that repository holds for the whole sweep, and after it
+// links every blob the manifest names, which can re-hash a large blob from
+// disk; a healthy push can wait well past 30s on its last request.
+// Invariant: it is CollectTimeout plus gateManifestCollectMargin. A sweep
+// holds the lock for up to CollectTimeout, and a PUT queued behind a full
+// sweep still has to link and re-hash its blobs after it gets the lock, so a
+// bound of exactly CollectTimeout would cut a healthy PUT; the margin is the
+// room for that work. Past the bound a registry still doing it is taken to be
+// hung, so the PUT is cut there with a 502. The relation is in code so tuning
+// CollectTimeout moves the bound with it; TestGateManifestBoundCoversCollect
+// holds the invariant.
+const gateManifestHeaderTimeout = CollectTimeout + gateManifestCollectMargin
+
+// gateManifestCollectMargin is how long past CollectTimeout a manifest PUT
+// may wait for headers: the link and re-hash work it does after waiting out a
+// full collection sweep for the repository's lock.
+const gateManifestCollectMargin = 5 * time.Minute
+
+// gateUploadHeaderTimeout is the response-header bound of a blob upload
+// request (the POST that starts or mounts, a PATCH, the final PUT). The
+// registry commits an upload before it writes a header, and a commit whose
+// streamed hash does not cover the session re-hashes the file from disk, so a
+// healthy commit of a large layer can take far longer than 30s. The registry
+// bounds such a request itself by api.DefaultUploadTimeout (the serve child
+// does not override it), and the gate uses that same bound.
+const gateUploadHeaderTimeout = api.DefaultUploadTimeout
+
 // gate is the push gate's handler.
 type gate struct {
 	upstream string // the loopback registry, host:port
@@ -65,8 +111,20 @@ type gate struct {
 	// cred is the registry credential writes are forwarded with. Empty means
 	// writes are 503, like a missing auth.
 	cred Credential
+	// bodyProgress is how long a forwarded response body may go without a
+	// byte from the registry before the gate cuts it.
+	bodyProgress time.Duration
 
-	read, write *httputil.ReverseProxy
+	// read forwards reads and write every authorized write not named below,
+	// both over a transport with the upstream response-header bound; manifest
+	// forwards manifest PUTs over one with the manifest bound, and upload blob
+	// upload requests over one with the upload bound. proxyFor picks one.
+	read, write, manifest, upload *httputil.ReverseProxy
+
+	// readWarn and writeWarn limit readError's and writeError's warnings to
+	// one per interval per cause each, on the clock now (gateConfig.Now).
+	readWarn, writeWarn upstreamWarnLimiter
+	now                 func() time.Time
 }
 
 // gateConfig configures a gate.
@@ -77,9 +135,30 @@ type gateConfig struct {
 	Logger     *slog.Logger
 	// Now is the clock the caches read; nil means time.Now.
 	Now func() time.Time
-	// Transport is the round tripper to the upstream; nil means a loopback
-	// transport.
+	// Transport is the round tripper to the upstream, for every request; nil
+	// means three loopback transports, one per response-header bound.
 	Transport http.RoundTripper
+	// UpstreamHeaderTimeout bounds how long the loopback transport waits for
+	// the registry's response headers to a read, an upload status or any
+	// other request not named below; zero means gateUpstreamHeaderTimeout.
+	// Ignored when Transport is set.
+	UpstreamHeaderTimeout time.Duration
+	// ManifestHeaderTimeout is that bound for a manifest PUT; zero means
+	// gateManifestHeaderTimeout. Ignored when Transport is set.
+	ManifestHeaderTimeout time.Duration
+	// UploadHeaderTimeout is that bound for a blob upload request (start or
+	// mount, chunk, finish); zero means gateUploadHeaderTimeout. Ignored when
+	// Transport is set.
+	UploadHeaderTimeout time.Duration
+	// dial, when set, replaces the loopback transports' dialer, so a test
+	// can hand them an in-memory connection; they keep their response-header
+	// bounds. nil means a net.Dialer bounded by relayDialTimeout. Ignored
+	// when Transport is set.
+	dial func(ctx context.Context, network, addr string) (net.Conn, error)
+	// UpstreamBodyProgress bounds how long a registry response body, once its
+	// headers have arrived, may go without a byte before the gate cuts it;
+	// zero means gateUpstreamBodyProgress. It applies with any Transport.
+	UpstreamBodyProgress time.Duration
 }
 
 // newGate builds a gate.
@@ -90,17 +169,25 @@ func newGate(cfg gateConfig) *gate {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
-	if cfg.Transport == nil {
-		d := &net.Dialer{Timeout: relayDialTimeout}
-		cfg.Transport = &http.Transport{
-			DialContext:           d.DialContext,
-			DisableCompression:    true,
-			MaxIdleConnsPerHost:   32,
-			IdleConnTimeout:       90 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-		}
+	if cfg.UpstreamHeaderTimeout <= 0 {
+		cfg.UpstreamHeaderTimeout = gateUpstreamHeaderTimeout
 	}
-	g := &gate{upstream: cfg.Upstream, log: cfg.Logger, cred: cfg.Credential}
+	if cfg.ManifestHeaderTimeout <= 0 {
+		cfg.ManifestHeaderTimeout = gateManifestHeaderTimeout
+	}
+	if cfg.UploadHeaderTimeout <= 0 {
+		cfg.UploadHeaderTimeout = gateUploadHeaderTimeout
+	}
+	if cfg.UpstreamBodyProgress <= 0 {
+		cfg.UpstreamBodyProgress = gateUpstreamBodyProgress
+	}
+	manifestTransport, uploadTransport := cfg.Transport, cfg.Transport
+	if cfg.Transport == nil {
+		cfg.Transport = loopbackTransport(cfg.UpstreamHeaderTimeout, cfg.dial)
+		manifestTransport = loopbackTransport(cfg.ManifestHeaderTimeout, cfg.dial)
+		uploadTransport = loopbackTransport(cfg.UploadHeaderTimeout, cfg.dial)
+	}
+	g := &gate{upstream: cfg.Upstream, log: cfg.Logger, cred: cfg.Credential, now: cfg.Now, bodyProgress: cfg.UpstreamBodyProgress}
 	if cfg.Auth.complete() {
 		g.auth = newAuthorizer(cfg.Auth, cfg.Now)
 	}
@@ -121,7 +208,61 @@ func newGate(cfg gateConfig) *gate {
 		ErrorHandler:   g.writeError,
 		ErrorLog:       errLog,
 	}
+	g.manifest = &httputil.ReverseProxy{
+		Rewrite:        func(pr *httputil.ProxyRequest) { g.rewrite(pr, true) },
+		FlushInterval:  -1,
+		Transport:      manifestTransport,
+		ModifyResponse: g.modifyResponse,
+		ErrorHandler:   g.writeError,
+		ErrorLog:       errLog,
+	}
+	g.upload = &httputil.ReverseProxy{
+		Rewrite:        func(pr *httputil.ProxyRequest) { g.rewrite(pr, true) },
+		FlushInterval:  -1,
+		Transport:      uploadTransport,
+		ModifyResponse: g.modifyResponse,
+		ErrorHandler:   g.writeError,
+		ErrorLog:       errLog,
+	}
 	return g
+}
+
+// proxyFor is the reverse proxy a request of class op is forwarded through,
+// and so the response-header bound it is held to: a read anonymously, a
+// manifest PUT and the blob upload requests over their own transports, an
+// upload status as an authorized write over the upstream one. opInvalid and
+// opRefused are never forwarded; they fall to the default.
+// TestGateProxyForEveryOperation fails for an operation with no case here.
+func (g *gate) proxyFor(op gateOp) *httputil.ReverseProxy {
+	switch op {
+	case opRead:
+		return g.read
+	case opManifestPut:
+		return g.manifest
+	case opUploadStart, opUploadChunk, opUploadFinish:
+		return g.upload
+	case opUploadStatus:
+		return g.write
+	default:
+		return g.write
+	}
+}
+
+// loopbackTransport is the transport to the loopback registry, waiting at
+// most headerTimeout for response headers once a request is written. It dials
+// with dial, or with a net.Dialer bounded by relayDialTimeout when dial is nil.
+func loopbackTransport(headerTimeout time.Duration, dial func(ctx context.Context, network, addr string) (net.Conn, error)) *http.Transport {
+	if dial == nil {
+		dial = (&net.Dialer{Timeout: relayDialTimeout}).DialContext
+	}
+	return &http.Transport{
+		DialContext:           dial,
+		DisableCompression:    true,
+		MaxIdleConnsPerHost:   32,
+		IdleConnTimeout:       90 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: headerTimeout,
+	}
 }
 
 // rewrite points the outbound request at the loopback registry. Every client
@@ -142,9 +283,11 @@ func (g *gate) rewrite(pr *httputil.ProxyRequest, attach bool) {
 	}
 }
 
-// modifyResponse keeps the registry's session cookies inside this process and
+// modifyResponse keeps the registry's session cookies inside this process,
 // turns an absolute Location naming the loopback upstream into a path, so a
-// client keeps talking to the gate.
+// client keeps talking to the gate, and puts the response body under the
+// progress bound, so a registry that stops sending mid-body loses the
+// connection one window later instead of holding it until the client gives up.
 func (g *gate) modifyResponse(resp *http.Response) error {
 	resp.Header.Del("Set-Cookie")
 	if loc := resp.Header.Get("Location"); loc != "" {
@@ -153,14 +296,34 @@ func (g *gate) modifyResponse(resp *http.Response) error {
 			resp.Header.Set("Location", u.String())
 		}
 	}
+	if watchesBody(resp) {
+		var method, path string
+		if resp.Request != nil {
+			method, path = resp.Request.Method, resp.Request.URL.Path
+		}
+		// since_headers is the time since the body was wrapped, not
+		// since the last byte arrived. The line is per cut and not behind a
+		// warnGate, like the relay's own cut line: each needs a full window of
+		// silence on one response, and the relay's connection cap bounds how
+		// many responses can be open at once.
+		resp.Body = newProgressBody(resp.Body, g.bodyProgress, func(passed int64, elapsed time.Duration) {
+			g.log.Warn("ingest registry gate cut a local registry response that stopped sending",
+				"target", g.upstream, "method", method, "path", path, "window", g.bodyProgress,
+				"bytes", passed, "since_headers", elapsed)
+		})
+	}
 	return nil
 }
 
 // readError ends a read whose upstream could not be reached by closing the
 // connection without a response: what the raw relay did, and what a peer's
-// puller already reads as "this mirror does not have it".
+// puller already reads as "this mirror does not have it". A read the client
+// itself abandoned is no fault of the registry and is logged at Debug.
+// Any other failure warns at most once per gateReadWarnInterval for its cause,
+// without the request (a down registry fails every pull alike), counting the
+// failures suppressed since the last warning; those are logged at Debug.
 func (g *gate) readError(w http.ResponseWriter, r *http.Request, err error) {
-	g.log.Debug("ingest registry gate could not reach the local registry", "target", g.upstream, "err", err)
+	g.logUpstreamError(r, &g.readWarn, "ingest registry gate could not reach the local registry", err)
 	if hj, ok := w.(http.Hijacker); ok {
 		if c, _, herr := hj.Hijack(); herr == nil {
 			_ = c.Close()
@@ -170,10 +333,39 @@ func (g *gate) readError(w http.ResponseWriter, r *http.Request, err error) {
 	w.WriteHeader(http.StatusBadGateway)
 }
 
-// writeError answers an authorized write the registry did not take.
+// writeError answers an authorized write the registry did not take with a
+// 502. It logs like readError, on a limiter of its own: a write the client
+// itself abandoned is a Debug, and any other failure warns at most once per
+// gateReadWarnInterval for its cause, without the request.
 func (g *gate) writeError(w http.ResponseWriter, r *http.Request, err error) {
-	g.log.Warn("ingest registry gate could not forward an authorized write", "target", g.upstream, "err", err)
+	g.logUpstreamError(r, &g.writeWarn, "ingest registry gate could not forward an authorized write", err)
 	ociError(w, r, http.StatusBadGateway, codeUnavailable, "the node's registry is not answering")
+}
+
+// logUpstreamError logs a request's failure to reach the local registry. A
+// client's cancellation is a Debug naming the method and path, outside the
+// limiter l. Any other failure is a Warn naming the target, cause and error,
+// and the count of failures suppressed since the last one when there were
+// any, if l allows it; otherwise a Debug naming the method and path.
+func (g *gate) logUpstreamError(r *http.Request, l *upstreamWarnLimiter, msg string, err error) {
+	if errors.Is(err, context.Canceled) {
+		g.log.Log(r.Context(), slog.LevelDebug, msg,
+			"target", g.upstream, "method", r.Method, "path", r.URL.Path, "err", err)
+		return
+	}
+	cause := readCauseOf(err)
+	warn, suppressed := l.allow(g.now(), cause)
+	switch {
+	case !warn:
+		g.log.Log(r.Context(), slog.LevelDebug, msg,
+			"target", g.upstream, "method", r.Method, "path", r.URL.Path, "cause", cause.String(), "err", err)
+	case suppressed > 0:
+		g.log.Log(r.Context(), slog.LevelWarn, msg,
+			"target", g.upstream, "cause", cause.String(), "err", err, "suppressed", suppressed)
+	default:
+		g.log.Log(r.Context(), slog.LevelWarn, msg,
+			"target", g.upstream, "cause", cause.String(), "err", err)
+	}
 }
 
 // ServeHTTP is the gate. It is mounted directly on the server, never behind a
@@ -188,7 +380,7 @@ func (g *gate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	route := classify(r.Method, rawPath, rawQuery)
 	switch {
 	case route.op == opRead:
-		g.read.ServeHTTP(w, r)
+		g.proxyFor(opRead).ServeHTTP(w, r)
 		return
 	case route.op == opRefused:
 		g.audit(r, route, pushIdentity{}, "refused", http.StatusMethodNotAllowed)
@@ -284,7 +476,7 @@ func (g *gate) authorizeWrite(w http.ResponseWriter, r *http.Request, route gate
 	g.audit(r, route, id, "allowed", 0)
 	out := r.Clone(r.Context())
 	out.URL.Path, out.URL.RawPath, out.URL.RawQuery = route.path, "", route.query
-	g.write.ServeHTTP(w, out)
+	g.proxyFor(route.op).ServeHTTP(w, out)
 }
 
 // refuseUnavailable answers an apiserver that could not, or was not allowed

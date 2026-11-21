@@ -64,7 +64,7 @@ func TestAgentInstallPreflightsTheJoinEndpoint(t *testing.T) {
 	// of them answers, so the preflight tries them in order and proceeds.
 	t.Run("the first address refuses and the second answers, so the install proceeds", func(t *testing.T) {
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		seedJoinedAgent(t, f)
 		cfg := agentCfg(t)
 		f.putJoinAddrs(cfg.JoinServer, "203.0.113.9", "192.168.1.24")
@@ -100,7 +100,7 @@ func TestAgentInstallPreflightsTheJoinEndpoint(t *testing.T) {
 	// operator must be told every address tried and what to do about it.
 	t.Run("no address answers, so nothing is written and every one is named", func(t *testing.T) {
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		seedJoinedAgent(t, f)
 		cfg := agentCfg(t)
 		f.putJoinAddrs(cfg.JoinServer, "203.0.113.9", "192.168.1.24")
@@ -132,7 +132,7 @@ func TestAgentInstallPreflightsTheJoinEndpoint(t *testing.T) {
 	// SUCCEED and be wrong, which is why this is refused before the tree exists.
 	t.Run("the endpoint answers for a different cluster, so the install is refused", func(t *testing.T) {
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		seedJoinedAgent(t, f)
 		cfg := agentCfg(t)
 		other := mintNodeCredential(t, t.TempDir())
@@ -168,7 +168,7 @@ func TestAgentInstallPreflightsTheJoinEndpoint(t *testing.T) {
 	// worker install, which must pass without an operator saying anything.
 	t.Run("the endpoint serves the cluster the token pins, so the install proceeds", func(t *testing.T) {
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		seedJoinedAgent(t, f)
 		cfg := agentCfg(t)
 
@@ -196,7 +196,7 @@ func TestAgentInstallPreflightsTheJoinEndpoint(t *testing.T) {
 	// complete.
 	t.Run("only the first four addresses are dialled, and the refusal says how many were not", func(t *testing.T) {
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		seedJoinedAgent(t, f)
 		cfg := agentCfg(t)
 		all := []string{"198.51.100.1", "198.51.100.2", "198.51.100.3", "198.51.100.4", "198.51.100.5", "198.51.100.6"}
@@ -237,7 +237,7 @@ func TestAgentInstallPreflightsTheJoinEndpoint(t *testing.T) {
 	// nothing compared those bytes to anything.
 	t.Run("a token file swapped after the preflight does not change what is staged", func(t *testing.T) {
 		shrinkRestartBudgets(t)
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		validated := seedJoinedAgent(t, f)
 		cfg := agentCfg(t)
 		// Another cluster's token, dropped in the moment the preflight has read
@@ -276,8 +276,8 @@ func TestAgentInstallPreflightsTheJoinEndpoint(t *testing.T) {
 	// (e) A control plane joins nothing, so it asks nothing: a server install on
 	// a Mac with no network at all must still install.
 	t.Run("a server install runs no join preflight", func(t *testing.T) {
-		f := &fakeSystem{}
-		if err := Install(context.Background(), f, Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"}); err != nil {
+		f := newFakeSystem(t)
+		if err := Install(context.Background(), f, Config{InstallDir: testInstallDir(t), BinarySource: "/tmp/k3sm", TargetUser: "alice"}); err != nil {
 			t.Fatalf("Install: %v", err)
 		}
 		for _, c := range f.calls {

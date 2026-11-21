@@ -87,13 +87,26 @@ func TestApply(t *testing.T) {
 	}
 }
 
-// TestRaises pins the raise set: x/net at XNetVersion and compress at
-// CompressVersion, each with both hashes present.
+// TestRaises pins the raise set: x/net at XNetVersion, compress at
+// CompressVersion, and the modules x/net XNetVersion needs above kine's tag at
+// their constants, each with both hashes present.
 func TestRaises(t *testing.T) {
-	if len(Raises) != 2 ||
-		Raises[0].Path != "golang.org/x/net" || Raises[0].Version != XNetVersion ||
-		Raises[1].Path != "github.com/klauspost/compress" || Raises[1].Version != CompressVersion {
-		t.Fatalf("Raises = %+v, want golang.org/x/net at %s and github.com/klauspost/compress at %s", Raises, XNetVersion, CompressVersion)
+	want := []struct{ path, version string }{
+		{"golang.org/x/net", XNetVersion},
+		{"golang.org/x/crypto", XCryptoVersion},
+		{"golang.org/x/sys", XSysVersion},
+		{"golang.org/x/term", XTermVersion},
+		{"golang.org/x/text", XTextVersion},
+		{"golang.org/x/sync", XSyncVersion},
+		{"github.com/klauspost/compress", CompressVersion},
+	}
+	if len(Raises) != len(want) {
+		t.Fatalf("Raises = %+v, want %d raises: %+v", Raises, len(want), want)
+	}
+	for i, w := range want {
+		if Raises[i].Path != w.path || Raises[i].Version != w.version {
+			t.Errorf("Raises[%d] = %s %s, want %s %s", i, Raises[i].Path, Raises[i].Version, w.path, w.version)
+		}
 	}
 	for _, r := range Raises {
 		if !strings.HasPrefix(r.Sum, "h1:") || !strings.HasPrefix(r.GoModSum, "h1:") {

@@ -257,7 +257,7 @@ func (s *FileStore) writeFloor(dir *os.Root, fl floor) error {
 // open, or that the floor already rules out, is left as it is: the verb that
 // reads it reports it. The caller holds the exclusive lock.
 func (s *FileStore) syncFloor(entries, dir *os.Root, fl floor, k keys) (floor, error) {
-	names, err := readDirNames(entries)
+	names, err := readDirNames(entries, maxDirNames)
 	if err != nil {
 		return nil, err
 	}

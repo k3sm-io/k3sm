@@ -136,6 +136,116 @@ registry can read the images this cluster runs, and only a user holding a builde
 [Pushing With Other Tools](#pushing-with-other-tools)), or a Pod the cluster's RBAC allows to push (see [Pushing From Inside a Pod](#pushing-from-inside-a-pod)),
 can put a new one there.
 
+A pull is a read, so it is timed differently from a push. If the registry behind the gate sends no
+response headers within 30 seconds, the gate closes the connection without an error status, or
+answers 502 where it cannot take over the connection, and logs the warning
+`ingest registry gate could not reach the local registry`. A pull the client itself gave up on is
+not logged as a warning. A node's runtime reads a closed connection as this registry not having the
+image and moves on to its next source, if it has one. The 30 seconds covers the registry's response
+headers only, not the time a transfer takes once the registry has started to answer. If the
+registry starts an answer and the gate then waits 5 minutes for its next byte, the gate cuts the
+connection and logs a warning. A slow answer that keeps moving is never cut, and time the gate spends
+sending to a slow client does not count.
+
+The cluster reaches the registry through the registry relay, a front that listens on the
+server's cluster network address and on its guest network's gateway address, terminates TLS, and
+hands each request to the push gate, which passes reads through to the registry and checks every
+write. (The listener on `127.0.0.1:6451` for the server's own Mac is built from the same code, so
+the limits below apply to it too and its warnings name that address.) A pull through it is cut if the transfer makes no
+progress for 5 minutes, and so is a push body sent through it. A slow transfer that keeps moving
+is not cut mid-layer, because a node cannot resume a cut layer and would download it again from
+the start. Separately, the relay does not keep a connection open for ever. Once a connection is
+more than 10 minutes old, or has carried 100 requests, the relay closes it after the response in
+progress finishes. A response is never cut short for this. The relay serves 256 connections at
+once on each address it listens on, and one client address may hold 64 of them. A pull that
+arrives through the registry's Service address counts as coming from the node it came from, so
+that node's Pods share its 64. A connection past that client's share is closed at once, and when
+all 256 are held a further connection waits, with no error, until one frees.
+
+While a connection waits like that, the relay applies a rate floor of 8 KiB/s to the pulls it
+holds. The rate is the bytes of a response sent to the client, divided by the time spent waiting
+for the client to take them, averaged over the last 5 to 10 minutes of the response. Time spent
+waiting on the registry behind the relay does not count, so a slow registry never makes a client
+look slow. At most once every 5 minutes on each address, the relay cuts the slowest pull below the
+floor, and the node pulling it downloads that layer again. The cut takes effect when the write in
+progress to that client returns, so a client that has stopped reading altogether is freed by the
+5 minute cut above instead. A connection younger than 5 minutes, or a response that has sent less
+than 2.4 MB, is never cut this way, and neither is a connection between two responses. While a
+slot is free, no pull is cut for being slow, whatever its rate or however long it pauses. A pull
+over the cluster network at 64 KiB/s is eight times the floor. The rate counts bytes once the
+Mac's network stack has taken them, so a client that slows down can stay above the floor for up
+to about 15 minutes of its response. A waiting connection whose client has already given up still
+counts as waiting until a slot frees. One cut every 5 minutes frees slots slowly when many clients
+are below the floor. The floor and its window are fixed in this release; changing them takes a new
+build.
+
+The relay writes these cases to the server log as warnings. Search the server log for these
+messages. `ingest registry relay is at its connection limit` means all 256 are held, and
+`ingest registry relay refused a connection` means a client already held its 64. Each of those
+names the address it listens on and is logged at most once a minute for that address.
+`ingest registry relay cut a stalled connection` means the 5 minute cut closed a connection, and
+it is logged once for each connection cut. `ingest registry relay cut its slowest connection`
+means the rate floor cut a pull for a waiting connection. It names the client, the bytes and the
+time the rate was measured over, and is logged at most once a minute for that address. The
+refused-connection line names the first client
+refused in that minute, which may not be the only one. These lines show that the limits were
+reached. A client that keeps its connections above the floor still holds its share, and clients
+on several addresses can still hold all 256 between them.
+
+## Models
+
+`k3sm model push <dir> <name>[:tag]` stores a model directory in the registry as a
+[ModelPack](https://github.com/modelpack/model-spec) artifact under `registry-k3sm:6450/models/<name>`,
+one uncompressed layer per file, and `k3sm model rm <name>[:tag]` removes the tag. Run
+`k3sm model --help` for the files push refuses.
+
+`k3sm model ls` lists every tag under `models/` whose manifest is a ModelPack artifact:
+
+```sh
+k3sm model ls             # a table
+k3sm model ls -o json     # the same, as a versioned document
+```
+
+```text
+NAME      FORMAT       QUANT   PARAMS  SIZE     FILES  SHARDS  DIGEST
+llama:v1  safetensors  4bit    -       4.2 GiB  9      2       sha256:54f859a80552
+qwen:q4   gguf         Q4_K_M  7B      4.4 GiB  2      1       sha256:fd6616d87d32
+```
+
+The listing reads each model's manifest and its small config document, never the model's files, and
+over your own credentials, as `k3sm image ls` does. **SHARDS** is the number of weight files: 1 for a
+single file, N for a split safetensors or GGUF set. **QUANT** and **PARAMS** are copied from the
+model's own `config.json` when it is pushed, and only when it records them: a string `quantization`,
+the Hugging Face `quantization_config.quant_method`, or MLX's `quantization.bits` (shown as `4bit`),
+and a string `paramSize`. A value is kept only when it is at most 64 characters of letters, digits and
+`. _ + -`. A `config.json` larger than 1 MiB, or one that is not a JSON object, gives no metadata and
+the push still succeeds. A model whose MLX quantization was pushed by an earlier k3sm shows `-` until it
+is pushed again.
+
+`-o json` writes:
+
+```json
+{
+  "schemaVersion": 1,
+  "registry": { "name": "registry-k3sm:6450", "reachable": true },
+  "models": [
+    {
+      "name": "qwen", "repository": "models/qwen", "tag": "q4",
+      "reference": "registry-k3sm:6450/models/qwen:q4", "digest": "sha256:fd66...",
+      "format": "gguf", "sizeBytes": 4718592000, "files": 2, "shards": 1,
+      "quantization": "Q4_K_M", "paramSize": "7B"
+    }
+  ]
+}
+```
+
+Every key on a model is always present, `""` or `0` when the model does not record it. A model whose
+manifest or config cannot be read is still listed, with an `error` key (present only then) and no
+metadata. A registry that does not answer gives `"reachable": false`, an `error` on `registry`, an
+empty `models` list, and exit status 0. A listing walks at most 10000 tags; one that stops there
+adds `"truncated": true` (absent otherwise) and ends the table with a line saying so. New keys may be added under the same `schemaVersion`; an
+existing key never changes meaning.
+
 ## One Store for the Cluster
 
 The registry runs on the **server**. With several servers, the first server, the one the others
@@ -334,7 +444,7 @@ A refused push says why, in an OCI error body. Every status a push can get:
 | `403` | The caller is authenticated but refused: the token is not a ServiceAccount's, the namespace has not opted in (no label, or a label value other than the namespace's own name; the message gives the `kubectl label` command that fixes it), the repository is outside the prefix, or RBAC denies the push. |
 | `405` | A delete, or any other write shape the registry never takes from a Pod. |
 | `429` | Token checks are rate-limited, and each client address has its own share of connections, requests and pushes, so one busy client slows itself rather than every other caller; wait for the `Retry-After` interval and retry. |
-| `502` | The registry behind the gate is unreachable. |
+| `502` | The registry behind the gate is unreachable, or it did not answer in time. The gate waits for the registry's response headers for up to 15 minutes on a manifest push, up to 2 hours on a blob upload request (start, chunk or finish), and 30 seconds on an upload status check. A manifest push can wait up to 15 minutes because the registry can make it wait behind a garbage-collection sweep of the repository and then link and re-check its layers, so a push that is slow is not necessarily stuck. A 502 means the registry did not answer within that time: retry the push, and if it keeps failing, look in the server log for the warning `ingest registry gate could not forward an authorized write`, which is logged for each of the three cases above. The bounds apply to the registry's response headers only, not to the time a transfer takes once the registry has started to answer. A client with a shorter timeout gives up before the gate does. |
 | `503` | The cluster API is unreachable, or the gate has no identity to ask it with. Retry. |
 
 ## Pushing With Other Tools
@@ -462,10 +572,12 @@ user can log in and push from a worker with no other grant.
 The in-cluster name does not resolve on a Mac, and k3sm does not make it resolve. A tool running on
 a Mac that is not the server can reach the registry through a NodePort instead. It is off by
 default. Turn it on with `--registry-node-port` on the server, choosing a port in the NodePort range
-(30000 to 32767), and restart the server:
+(30000 to 32767), and restart the server. Pick it from the static band, `30000-30085`, which the
+apiserver gives to a Service without a `nodePort` only once the rest of the range is full (see
+[Fixed NodePorts](install.md#fixed-nodeports)):
 
 ```sh
-k3sm server --registry-node-port 30650
+k3sm server --registry-node-port 30050
 ```
 
 On an installed server, add the flag to the server daemon's arguments; every later install carries
@@ -475,7 +587,7 @@ The `registry-k3sm` Service then becomes a NodePort Service, and the registry an
 on every node:
 
 ```
-<node-address>:30650
+<node-address>:30050
 ```
 
 It is the same registry behind the same front. It serves HTTPS under the cluster CA, a plain-HTTP
@@ -486,7 +598,7 @@ Mac with no mesh and no Linux guests no Service is published, so there is no Nod
 Dial the **server** by its name:
 
 ```
-https://<server hostname>:30650
+https://<server hostname>:30050
 ```
 
 With the NodePort on, the registry's certificate also names the server as another Mac knows it: the
@@ -496,7 +608,7 @@ cluster CA then verifies the registry with no extra flags. Take the CA from the 
 
 ```sh
 kubectl get configmap kube-root-ca.crt -n default -o jsonpath='{.data.ca\.crt}' > k3sm-ca.crt
-curl --cacert k3sm-ca.crt https://<name>.local:30650/v2/_catalog
+curl --cacert k3sm-ca.crt https://<name>.local:30050/v2/_catalog
 ```
 
 The server's InternalIP is its mesh address on a mesh server, so a bare LAN address is not in the
@@ -548,6 +660,42 @@ The first sweep that meets a repository only reports. The server log lists what 
 sweep can read it and the half-repository brake lets it through, and one in that state does not
 hold back any other. Each sweep ends with a `registry gc: sweep finished` line that counts the
 repositories stopped and failed and carries the error.
+
+### Quotas
+
+A server can cap the bytes one artifact type takes in the registry. Give `k3sm server` one
+`--registry-quota <artifactType>=<bytes>` per type, for example:
+
+```
+k3sm server --registry-quota application/vnd.cncf.model.manifest.v1+json=500000000000
+```
+
+A manifest's type is its `artifactType`, or its config media type when it has none, so an
+ordinary image counts as `application/vnd.oci.image.config.v1+json`. Types without a quota are not
+limited, and there are no quotas by default. The server writes the quotas into
+`<work-dir>/registry-state/serve.json` at each start, so a change takes effect when the server
+restarts.
+
+A type's usage is the size of the distinct layers its stored manifests name, across every
+repository. A layer that two manifests share, in one repository or several, counts once, and the
+size is the stored blob's, not the size the manifest claims. A push of a manifest that would take
+its type past the quota is refused with `403 DENIED`, the message
+`the push would exceed the registry's storage quota for its artifact type`, and a detail naming the
+type and the quota in bytes. The refused manifest is not stored; its blobs stay until garbage
+collection takes them. Pushing a manifest the registry already holds under another tag costs
+nothing.
+
+The quota is cooperative accounting, not isolation. It is kept per artifact type across the whole
+store, never per repository, namespace or user, and the type is whatever the pushing client
+declares in its manifest. A client that labels a push with another type is charged to that type,
+and one that pushes blobs without a manifest is charged nothing. Use it to keep one kind of
+content from crowding out the rest, not to keep tenants apart. What keeps the registry from filling
+the disk is the free-space check: uploads are refused with `507` once the volume falls below the
+registry's free-space floor, whatever the quotas say.
+
+To make room, delete tags or digests of that type. A digest delete gives its layers back at once.
+A tag delete leaves the manifest stored by digest until garbage collection removes it, and the
+room comes back after that sweep.
 
 ### Restoring a Backup of the Registry
 
@@ -677,4 +825,6 @@ the space.
 - [Images](images.md) is the full image reference: `k3sm build`, `image load`/`import`/`push`, and
   the deliberate differences from the `docker` verb of the same name.
 - [What runs](what-runs.md) traces the path from a Dockerfile to a running Pod.
+- [Shared base images](images.md#shared-base-images) is the convention for runtimes several projects
+  share in this registry, under `registry-k3sm:6450/base/`.
 - [Linux images](vm-runtimeclass.md) covers the guest path.

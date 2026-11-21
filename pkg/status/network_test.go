@@ -25,6 +25,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"k3sm.io/k3sm/pkg/install"
 )
@@ -288,4 +289,49 @@ func networkOf(n *Network) any {
 		return nil
 	}
 	return *n
+}
+
+// TestStatusNetworkTimedLAN pins the status view of `lan on --for`: while the
+// window is open the block reads on with its expiry, and once the expiry has
+// passed it reads off with no expiry, as the node daemon serves it.
+func TestStatusNetworkTimedLAN(t *testing.T) {
+	t.Parallel()
+	now := goldenTime
+	timed := func(exp time.Time) func() (install.NetworkRecord, bool, error) {
+		return func() (install.NetworkRecord, bool, error) {
+			return install.NetworkRecord{Version: install.NetworkRecordVersionExpiry, LAN: install.LANOn, ExpiresAt: &exp}, true, nil
+		}
+	}
+	cases := []struct {
+		name    string
+		exp     time.Time
+		wantLAN string
+		wantExp bool
+	}{
+		{"window open", now.Add(10 * time.Minute), "on", true},
+		{"window lapsed", now.Add(-time.Minute), "off", false},
+		{"expiry exactly now", now, "off", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := contractServer(t, "launchctl_netd_running.txt", "launchctl_netd_running.txt", heartbeatingKube(goldenTime), nil)
+			c.Network = timed(tc.exp)
+			c.Now = func() time.Time { return now }
+			r := c.Collect(context.Background())
+			if r.Network == nil {
+				t.Fatal("no network block")
+			}
+			if r.Network.LAN != tc.wantLAN {
+				t.Fatalf("lan = %q, want %q", r.Network.LAN, tc.wantLAN)
+			}
+			if got := r.Network.ExpiresAt != nil; got != tc.wantExp {
+				t.Fatalf("expiresAt present = %v, want %v", got, tc.wantExp)
+			}
+			line := networkLine(r)
+			if tc.wantExp != strings.Contains(line, " until ") {
+				t.Fatalf("human line %q: want until=%v", line, tc.wantExp)
+			}
+		})
+	}
 }

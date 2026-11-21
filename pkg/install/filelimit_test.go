@@ -50,7 +50,7 @@ func TestServerFileLimitDeploymentUX(t *testing.T) {
 		cfg   func(t *testing.T) Config
 		seed  func(t *testing.T, f *fakeSystem)
 	}{
-		{name: "server", label: ServerLabel, cfg: func(*testing.T) Config { return installCfg() }, seed: func(*testing.T, *fakeSystem) {}},
+		{name: "server", label: ServerLabel, cfg: func(*testing.T) Config { return installCfg(t) }, seed: func(*testing.T, *fakeSystem) {}},
 		{name: "agent", label: AgentLabel, cfg: agentCfg, seed: func(t *testing.T, f *fakeSystem) { seedJoinedAgent(t, f) }},
 	}
 	install := func(t *testing.T, f *fakeSystem, cfg Config, level slog.Level) string {
@@ -88,7 +88,7 @@ func TestServerFileLimitDeploymentUX(t *testing.T) {
 				{name: "probe error is skipped at DEBUG", probeErr: errors.New("sysctl: boom")},
 			} {
 				t.Run(tc.name, func(t *testing.T) {
-					f := &fakeSystem{maxFilesPerProc: tc.kmax, maxFilesPerProcErr: tc.probeErr}
+					f := (&fakeSystem{maxFilesPerProc: tc.kmax, maxFilesPerProcErr: tc.probeErr}).rootedIn(t)
 					role.seed(t, f)
 					log := install(t, f, role.cfg(t), slog.LevelDebug)
 					if got := capWarned(log); got != tc.wantWarn {
@@ -137,7 +137,7 @@ func TestServerFileLimitDeploymentUX(t *testing.T) {
 				{name: "malformed limit on disk: no notice, no failure", onDisk: strings.Replace(stock, limitXML, "<integer>lots</integer>", 1)},
 			} {
 				t.Run(tc.name, func(t *testing.T) {
-					f := &fakeSystem{}
+					f := newFakeSystem(t)
 					role.seed(t, f)
 					cfg := role.cfg(t)
 					if tc.onDisk != "" {
@@ -175,9 +175,9 @@ func TestServerFileLimitDeploymentUX(t *testing.T) {
 	// such an error, so the file-limit check is exercised directly: it must
 	// neither report a change nor fail.
 	t.Run("unreadable installed plist: no notice, no failure", func(t *testing.T) {
-		cfg := installCfg().withDefaults()
+		cfg := installCfg(t).withDefaults()
 		path := cfg.plistPath(ServerLabel)
-		f := &fakeSystem{readErrs: map[string]error{path: errors.New("read: input/output error")}}
+		f := (&fakeSystem{readErrs: map[string]error{path: errors.New("read: input/output error")}}).rootedIn(t)
 		var buf bytes.Buffer
 		log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 		if n, ok := checkFileLimit(f, log, ServerLabel, path, ServerPlist(cfg)); ok {

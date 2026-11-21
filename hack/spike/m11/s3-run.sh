@@ -167,7 +167,7 @@ s3_preflight() {
   local missing=0
   command -v ar    >/dev/null || { echo "S3 PREFLIGHT FAIL: ar not found";    missing=1; }
   command -v tar   >/dev/null || { echo "S3 PREFLIGHT FAIL: tar not found";   missing=1; }
-  command -v zstd  >/dev/null || { echo "S3 PREFLIGHT FAIL: zstd not found (brew install zstd)"; missing=1; }
+  command -v zstd  >/dev/null || { echo "S3 PREFLIGHT FAIL: zstd not found (zstd runs in a k3sm pod, never installed on the host)"; missing=1; }
   command -v gzip  >/dev/null || { echo "S3 PREFLIGHT FAIL: gzip not found";  missing=1; }
   [ "$missing" -eq 0 ] || return 1
   echo "s3 preflight ok"

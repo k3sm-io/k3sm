@@ -144,6 +144,14 @@ func (c Collector) shadowShellsRow() (Row, bool) {
 	}
 	row.State, row.Severity = StateOK, SeverityOK
 	row.Detail = fmt.Sprintf("%d re-signed host binaries match their sources", len(m.Sources))
+	if len(m.Skipped) > 0 {
+		var names []string
+		for _, s := range m.Skipped {
+			names = append(names, s.Path)
+		}
+		row.Detail += fmt.Sprintf("; not copied because the source is not root-owned and Apple-signed (pods run the host binary): %s",
+			strings.Join(names, ", "))
+	}
 	row.Remedy = ""
 	return row, true
 }

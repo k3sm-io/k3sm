@@ -3,9 +3,11 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # The keystore's acceptance gate: docs/design/keystore.md § "Acceptance gate",
-# rows G1 to G22. Every row is listed. A row runs the tests that deliver it
-# and passes only if each named test ran and passed; a row whose pull request
-# has not landed yet prints PENDING, never PASS.
+# rows G1 to G22. Every row is listed, on exactly one line. A row runs the
+# tests that deliver it and passes only if each named test ran and passed; a
+# row whose pull request has not landed yet prints PENDING, never PASS. A row
+# delivered in part prints PENDING when its delivered part passes, and FAIL
+# when it does not.
 #
 # Exit status: 0 every row passed; 1 a row failed; 3 no row failed but at
 # least one is pending. Phase A is complete when this exits 0.
@@ -44,18 +46,31 @@ check() { # row, description, tests...
 	shift 2
 	if [ "$pkg_ok" = 1 ] && ran "$@"; then pass "$id" "$desc"; else fail "$id" "$desc"; fi
 }
+partial() { # row, description of the delivered part, of the pending part, tests...
+	local id="$1" done_desc="$2" todo="$3"
+	shift 3
+	if [ "$pkg_ok" = 1 ] && ran "$@"; then
+		pend "$id" "$done_desc: checked; pending: $todo"
+	else
+		fail "$id" "$done_desc: failed; pending: $todo"
+	fi
+}
 
-if ! base="${KEYSTORE_BASE:-$(git merge-base HEAD origin/main 2>/dev/null)}" || [ -z "$base" ]; then
-	fail G1 "no base to diff go.mod and go.sum against: fetch origin/main or set KEYSTORE_BASE"
+# A failing merge-base must not end the run under set -e, so its status is
+# discarded and an empty base is the failure; a base that is not a commit is
+# the same failure, never a diff that reads as a change.
+base="${KEYSTORE_BASE:-}"
+if [ -z "$base" ]; then base="$(git merge-base HEAD origin/main 2>/dev/null || true)"; fi
+if [ -z "$base" ] || ! git rev-parse -q --verify "$base^{commit}" >/dev/null 2>&1; then
+	fail G1 "no base to diff go.mod and go.sum against: fetch origin/main or set KEYSTORE_BASE to a commit"
 elif git diff --quiet "$base" -- go.mod go.sum; then
 	pass G1 "go.mod and go.sum unchanged since $(git rev-parse --short "$base")"
 else
 	fail G1 "go.mod or go.sum changed since $(git rev-parse --short "$base")"
 fi
-check G2 "AAD is length-prefixed and binds format, kind, name, version, generation" \
-	TestAADLayout TestAADBindsEveryField TestRecordMovedBetweenEntries
-check G3 "every seal draws a fresh nonce (library)" TestSealNonceIsFresh
-pend G3 "Rewrap changes every nonce (PR 3: Rewrap)"
+check G2 "AAD is length-prefixed and binds format, scope, kind, name, version, generation" \
+	TestAADLayout TestAADBindsEveryField TestRecordMovedBetweenEntries TestScopeBindsRecords
+partial G3 "every seal draws a fresh nonce (library)" "Rewrap changes every nonce (PR 3: Rewrap)" TestSealNonceIsFresh
 check G4 "Delete then Put does not reopen the old v1" TestDeleteThenPutRefusesReplayedRecord
 check G5 "a copied-back current is refused against the floor, with its own message; nothing recorded for the name accepts it" \
 	TestFloorRefusesCopiedBackPointer TestFloorCheck
@@ -68,17 +83,20 @@ check G10 "the master is minted only by the first put, never over entries" TestM
 check G11 "the master is judged on the open descriptor" TestMasterTrust
 pend G12 "Rewrap resumes after a crash at every step (PR 3)"
 pend G13 "a crash between the master renames is completed (PR 3)"
-check G14 "one lock with a bounded wait, and no read that blocks" TestLockBoundedWait TestConcurrentOperations TestFIFORefused
+partial G14 "one lock with a bounded wait that excludes, and no read that blocks (library: Put, Delete and the reads)" \
+	"Rotate and Rewrap take the same lock (PR 2: Rotate, PR 3: Rewrap)" \
+	TestLockBoundedWait TestLockExcludes TestConcurrentOperations TestFIFORefused
 check G15 "files a root verb writes are the service user's, at the layout's modes, inside the store" \
 	TestOwnership TestCredSymlinkRefused TestRefusesSymlinks
-check G16 "List marks an unreadable entry with Err, and Delete still removes it; an entry directory with no current is an interrupted put only in the shape a crashed Put leaves (library)" \
+partial G16 "List marks an unreadable entry with Err, and Delete still removes it; an entry directory with no current is an interrupted put only in the shape a crashed Put leaves, and Delete removes it too (library)" \
+	"list exits 1 on a corrupt entry (PR 4: k3sm keys)" \
 	TestListMarksCorruptEntry TestDeleteCorruptEntry TestEntryWithNoPointer
-pend G16 "list exits 1 on a corrupt entry (PR 4: k3sm keys)"
 pend G17 "show prints a value only with --reveal, byte-exact (PR 4)"
 pend G18 "delivery refused while encryption is off (PR 5)"
 pend G19 "the delivery declaration is root-owned (PR 5)"
 pend G20 "the reconciler touches only its labelled Secrets (PR 5)"
 pend G21 "the rollback recipe is a byte-exact round trip (PR 4)"
+# hack/ci.sh does not run this script, so G22 cannot recurse into it.
 if hack/ci.sh >/dev/null 2>&1; then pass G22 "hack/ci.sh is green"; else fail G22 "hack/ci.sh is not green (rerun it for the reason)"; fi
 
 if [ "$pkg_ok" != 1 ]; then

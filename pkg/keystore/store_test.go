@@ -26,12 +26,14 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -84,9 +86,12 @@ func TestPutCurrentGet(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			put := mustPut(t, s, tt.name, tt.kind, tt.value)
-			want := Version{Name: tt.name, Version: 1, Kind: tt.kind, Created: time.Unix(now.Unix(), 0), Fingerprint: put.Fingerprint}
+			want := Version{Name: tt.name, Version: 1, Kind: tt.kind, Created: time.Unix(now.Unix(), 0).UTC(), Fingerprint: put.Fingerprint}
 			if put != want || put.Fingerprint == "" {
 				t.Fatalf("Put = %+v, want %+v", put, want)
+			}
+			if loc := put.Created.Location(); loc != time.UTC {
+				t.Fatalf("Put Created is in %v, want UTC", loc)
 			}
 			cur, val, err := s.Current(ctx, tt.name)
 			if err != nil || cur != put || !bytes.Equal(val, tt.value) {
@@ -95,6 +100,9 @@ func TestPutCurrentGet(t *testing.T) {
 			got, val, err := s.Get(ctx, tt.name, 1)
 			if err != nil || got != put || !bytes.Equal(val, tt.value) {
 				t.Fatalf("Get 1 = %+v %q %v", got, val, err)
+			}
+			if loc := got.Created.Location(); loc != time.UTC {
+				t.Fatalf("Get Created is in %v, want UTC", loc)
 			}
 			for _, v := range []uint64{0, 2} {
 				if _, _, err := s.Get(ctx, tt.name, v); !errors.Is(err, ErrVersionNotFound) {
@@ -273,6 +281,31 @@ func TestMasterMint(t *testing.T) {
 		}
 		if _, err := os.Lstat(master(server)); !errors.Is(err, fs.ErrNotExist) {
 			t.Fatal("a master was minted over existing entries")
+		}
+	})
+
+	t.Run("never over existing entries when the fingerprint is missing", func(t *testing.T) {
+		s, server := newTestStore(t)
+		mustPut(t, s, "a", KindOpaque, []byte("a"))
+		before, err := os.ReadFile(master(server))
+		if err != nil {
+			t.Fatal(err)
+		}
+		fp := filepath.Join(filepath.Dir(master(server)), masterFingerprintName)
+		remove(t, fp)
+		// A sound master without its fingerprint is minted over only with
+		// keystore/ empty; with an entry it is ErrMasterUntrusted.
+		if _, err := s.Put(ctx, "b", KindOpaque, []byte("b")); !errors.Is(err, ErrMasterUntrusted) || !errors.Is(err, errFingerprintMissing) {
+			t.Fatalf("Put with entries and no fingerprint: %v, want ErrMasterUntrusted (fingerprint missing)", err)
+		}
+		if after, _ := os.ReadFile(master(server)); !bytes.Equal(after, before) {
+			t.Fatal("a master was minted over existing entries")
+		}
+		if _, err := os.Lstat(fp); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("the refused Put wrote a fingerprint: %v", err)
+		}
+		if _, err := os.Lstat(filepath.Join(server, "keystore", "b")); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("the refused Put created its entry: %v", err)
 		}
 	})
 
@@ -497,6 +530,90 @@ func TestDeleteCorruptEntry(t *testing.T) {
 	}
 }
 
+// TestDeletePlantedNonDirectory: a symlink or a regular file planted at an
+// entry name is removed by Delete, unlinked without being followed, so the
+// entry a symlink names is untouched.
+func TestDeletePlantedNonDirectory(t *testing.T) {
+	ctx := context.Background()
+	for name, plant := range map[string]func(t *testing.T, p string){
+		"symlink to another entry": func(t *testing.T, p string) {
+			if err := os.Symlink("a", p); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"regular file": func(t *testing.T, p string) { writeFile(t, p, "planted") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, server := newTestStore(t)
+			mustPut(t, s, "a", KindOpaque, []byte("a"))
+			ks := filepath.Join(server, "keystore")
+			before := dirContents(t, filepath.Join(ks, "a"))
+			p := filepath.Join(ks, "b")
+			plant(t, p)
+			if got, err := s.List(ctx); err != nil || len(got) != 2 || !errors.Is(got[1].Err, ErrCorrupt) {
+				t.Fatalf("List = %+v %v, want b marked ErrCorrupt", got, err)
+			}
+			if err := s.Delete(ctx, "b"); err != nil {
+				t.Fatalf("Delete: %v", err)
+			}
+			if _, err := os.Lstat(p); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("after Delete: %v, want the name gone", err)
+			}
+			if after := dirContents(t, filepath.Join(ks, "a")); !maps.Equal(after, before) {
+				t.Fatalf("Delete changed the entry a symlink named: %q, was %q", after, before)
+			}
+			if _, val, err := s.Current(ctx, "a"); err != nil || string(val) != "a" {
+				t.Fatalf("Current a = %q %v", val, err)
+			}
+		})
+	}
+}
+
+// TestConfigRefused: a zero service uid, an empty Dir, MasterDir or DataRoot
+// makes every operation fail closed, before anything is created.
+func TestConfigRefused(t *testing.T) {
+	ctx := context.Background()
+	for name, edit := range map[string]func(c *Config){
+		"zero uid":           func(c *Config) { c.UID = 0 },
+		"empty Dir":          func(c *Config) { c.Dir = "" },
+		"empty MasterDir":    func(c *Config) { c.MasterDir = "" },
+		"empty DataRoot":     func(c *Config) { c.DataRoot = "" },
+		"nothing set at all": func(c *Config) { *c = Config{} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			server := filepath.Join(t.TempDir(), "server")
+			if err := os.Mkdir(server, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			cfg := Config{
+				Dir:       filepath.Join(server, "keystore"),
+				MasterDir: filepath.Join(server, "cred", "keystore-master"),
+				UID:       uint32(os.Getuid()),
+				GID:       uint32(os.Getgid()),
+				DataRoot:  filepath.Dir(server),
+			}
+			edit(&cfg)
+			s := New(cfg)
+			ops := map[string]error{}
+			_, ops["Put"] = s.Put(ctx, "a", KindOpaque, []byte("a"))
+			_, _, ops["Current"] = s.Current(ctx, "a")
+			_, _, ops["Get"] = s.Get(ctx, "a", 1)
+			_, ops["List"] = s.List(ctx)
+			ops["Delete"] = s.Delete(ctx, "a")
+			_, ops["Rotate"] = s.Rotate(ctx, "a", []byte("b"))
+			ops["RaiseFloor"] = s.RaiseFloor(ctx)
+			for op, err := range ops {
+				if !errors.Is(err, errInvalidConfig) {
+					t.Errorf("%s: %v, want errInvalidConfig", op, err)
+				}
+			}
+			if names, _ := os.ReadDir(server); len(names) != 0 {
+				t.Fatalf("created %v", names)
+			}
+		})
+	}
+}
+
 // TestReadErrorIsNotCorrupt: a file that cannot be read for want of
 // permission is reported as that, not as ErrCorrupt, whose fix (restore from
 // backup) would be the wrong one.
@@ -521,13 +638,24 @@ func TestReadErrorIsNotCorrupt(t *testing.T) {
 }
 
 // TestLockBoundedWait is gate row G14: a held lock gives a timeout error
-// within the bound, never a hang, and a cancelled context ends the wait.
+// after the bound, never a hang, and a cancelled context ends the wait.
+//
+// Each case runs in a testing/synctest bubble, whose clock moves only while
+// every goroutine in it is blocked, so the store waits its production bound
+// (lockTimeout) in bubble time, at once, and no assertion reads the wall
+// clock. A wait that never ended would show as the bubble's deadlock panic or
+// the test binary's timeout.
 func TestLockBoundedWait(t *testing.T) {
-	ctx := context.Background()
-	s, server := newTestStore(t)
-	mustPut(t, s, "a", KindOpaque, []byte("a"))
-	s.lockWait = 200 * time.Millisecond
-	hold := func(t *testing.T, how int) {
+	setup := func(t *testing.T) (*FileStore, string) {
+		t.Helper()
+		s, server := newTestStore(t)
+		mustPut(t, s, "a", KindOpaque, []byte("a"))
+		if s.lockWait != lockTimeout {
+			t.Fatalf("lockWait = %v, want the production bound %v", s.lockWait, lockTimeout)
+		}
+		return s, server
+	}
+	hold := func(t *testing.T, server string, how int) {
 		t.Helper()
 		f, err := os.OpenFile(filepath.Join(server, "keystore", lockName), os.O_RDWR, 0)
 		if err != nil {
@@ -538,45 +666,155 @@ func TestLockBoundedWait(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	bounded := func(t *testing.T, op string, fn func() error) {
+	// bounded checks fn gives errLockTimeout once the bound has passed, and
+	// not before, in bubble time.
+	bounded := func(t *testing.T, s *FileStore, op string, fn func() error) {
 		t.Helper()
 		start := time.Now()
 		err := fn()
-		if took := time.Since(start); !errors.Is(err, errLockTimeout) || took < s.lockWait || took > 5*s.lockWait {
-			t.Fatalf("%s under a held lock: %v after %v, want errLockTimeout after about %v", op, err, took, s.lockWait)
+		if took := time.Since(start); !errors.Is(err, errLockTimeout) || took < s.lockWait || took > s.lockWait+time.Second {
+			t.Fatalf("%s under a held lock: %v after %v of bubble time, want errLockTimeout after %v", op, err, took, s.lockWait)
 		}
 	}
 
 	t.Run("exclusive holder blocks reads and writes", func(t *testing.T) {
-		hold(t, syscall.LOCK_EX)
-		bounded(t, "Put", func() error { _, err := s.Put(ctx, "b", KindOpaque, []byte("b")); return err })
-		bounded(t, "Current", func() error { _, _, err := s.Current(ctx, "a"); return err })
-		bounded(t, "List", func() error { _, err := s.List(ctx); return err })
-		bounded(t, "Delete", func() error { return s.Delete(ctx, "a") })
+		synctest.Test(t, func(t *testing.T) {
+			ctx := t.Context()
+			s, server := setup(t)
+			hold(t, server, syscall.LOCK_EX)
+			bounded(t, s, "Put", func() error { _, err := s.Put(ctx, "b", KindOpaque, []byte("b")); return err })
+			bounded(t, s, "Current", func() error { _, _, err := s.Current(ctx, "a"); return err })
+			bounded(t, s, "List", func() error { _, err := s.List(ctx); return err })
+			bounded(t, s, "Delete", func() error { return s.Delete(ctx, "a") })
+		})
 	})
 	t.Run("shared holder blocks only writes", func(t *testing.T) {
-		hold(t, syscall.LOCK_SH)
-		bounded(t, "Put", func() error { _, err := s.Put(ctx, "b", KindOpaque, []byte("b")); return err })
-		if _, _, err := s.Current(ctx, "a"); err != nil {
-			t.Fatalf("Current under a shared lock: %v", err)
-		}
+		synctest.Test(t, func(t *testing.T) {
+			ctx := t.Context()
+			s, server := setup(t)
+			hold(t, server, syscall.LOCK_SH)
+			bounded(t, s, "Put", func() error { _, err := s.Put(ctx, "b", KindOpaque, []byte("b")); return err })
+			if _, _, err := s.Current(ctx, "a"); err != nil {
+				t.Fatalf("Current under a shared lock: %v", err)
+			}
+		})
 	})
 	t.Run("a cancelled context ends the wait", func(t *testing.T) {
-		hold(t, syscall.LOCK_EX)
-		s.lockWait = time.Minute
-		cctx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
-		defer cancel()
-		if _, err := s.Put(cctx, "b", KindOpaque, []byte("b")); !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("Put: %v, want the context's error", err)
+		synctest.Test(t, func(t *testing.T) {
+			s, server := setup(t)
+			hold(t, server, syscall.LOCK_EX)
+			s.lockWait = time.Minute
+			cctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+			defer cancel()
+			start := time.Now()
+			if _, err := s.Put(cctx, "b", KindOpaque, []byte("b")); !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("Put: %v, want the context's error", err)
+			}
+			if took := time.Since(start); took >= s.lockWait {
+				t.Fatalf("Put waited %v of bubble time, want the context's 50ms, not the lock bound", took)
+			}
+		})
+	})
+}
+
+// TestDirectoryOwnerRefused: the store's directories must be owned by the
+// service uid. A store whose uid differs from the owner, as a chown that did
+// not take leaves (the chown seam does nothing), refuses the directory rather
+// than use it, on a read and on a first Put.
+func TestDirectoryOwnerRefused(t *testing.T) {
+	ctx := context.Background()
+	other := uint32(os.Getuid()) + 1
+	noChown := func(*os.File, int, int) error { return nil }
+
+	s, _ := newTestStore(t)
+	mustPut(t, s, "a", KindOpaque, []byte("a"))
+	foreign := New(Config{Dir: s.dir, MasterDir: s.masterDir, UID: other, GID: s.gid, DataRoot: s.dataRoot})
+	foreign.floorUID, foreign.floorGID = s.floorUID, s.floorGID
+	foreign.chown = noChown
+	want := fmt.Sprintf("owned by uid %d, want %d", os.Getuid(), other)
+	if _, _, err := foreign.Current(ctx, "a"); err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("Current: %v, want a refusal %q", err, want)
+	}
+	if _, err := foreign.List(ctx); err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("List: %v, want a refusal %q", err, want)
+	}
+
+	fresh, freshServer := newTestStore(t)
+	fresh.uid = other
+	fresh.chown = noChown
+	if _, err := fresh.Put(ctx, "a", KindOpaque, []byte("a")); err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("first Put: %v, want a refusal %q", err, want)
+	}
+	if _, err := os.Lstat(filepath.Join(freshServer, "cred")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the refused Put went on to create cred/: %v", err)
+	}
+}
+
+// TestLockExcludes is part of gate row G14: two operations that overlap
+// do not interleave. A Put is held at its v1 write, inside the exclusive
+// lock; a Current started then waits, in a synctest bubble's time, for as long
+// as the Put holds it, and reads the committed entry once the Put releases.
+func TestLockExcludes(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := t.Context()
+		s, _ := newTestStore(t)
+		mustPut(t, s, "seed", KindOpaque, []byte("seed"))
+		entered, release := make(chan struct{}), make(chan struct{})
+		s.step = func(name string) error {
+			if name == "write v1" {
+				close(entered)
+				<-release
+			}
+			return nil
+		}
+		putDone := make(chan error, 1)
+		go func() {
+			_, err := s.Put(ctx, "a", KindOpaque, []byte("a"))
+			putDone <- err
+		}()
+		<-entered
+
+		type read struct {
+			val []byte
+			err error
+		}
+		readDone := make(chan read, 1)
+		go func() {
+			_, val, err := s.Current(ctx, "a")
+			readDone <- read{val, err}
+		}()
+		time.Sleep(s.lockWait / 2) // bubble time: the reader retries throughout
+		synctest.Wait()
+		select {
+		case r := <-readDone:
+			t.Fatalf("Current ran while the Put held the lock: %q %v", r.val, r.err)
+		default:
+		}
+
+		close(release)
+		if err := <-putDone; err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+		if r := <-readDone; r.err != nil || string(r.val) != "a" {
+			t.Fatalf("Current after the Put released = %q %v, want the committed value", r.val, r.err)
 		}
 	})
 }
 
 // TestConcurrentOperations runs writers and readers together under -race;
 // the lock serialises them and every write lands.
+//
+// The entries' directory is made first: it is created before the lock can be
+// taken, and a new directory must be empty before it is handed over, so two
+// first operations racing to create it, running as the service user as the
+// tests do, can find each other's lock file in it. Root creating it is not
+// exposed: another process cannot open it until it is handed over.
 func TestConcurrentOperations(t *testing.T) {
 	ctx := context.Background()
-	s, _ := newTestStore(t)
+	s, server := newTestStore(t)
+	if err := s.mkdirOwned(filepath.Join(server, "keystore")); err != nil {
+		t.Fatal(err)
+	}
 	const n = 8
 	var wg sync.WaitGroup
 	errs := make(chan error, 3*n)
@@ -719,6 +957,140 @@ func TestListMarksCorruptEntry(t *testing.T) {
 	}
 }
 
+// TestPointerVersionBound: a pointer that authenticates but names a version
+// past maxVersion is ErrCorrupt on its own entry, never an allocation sized by
+// it, and List still returns the healthy entries.
+func TestPointerVersionBound(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	mustPut(t, s, "aa", KindOpaque, []byte("a"))
+	mustPut(t, s, "bb", KindOpaque, []byte("b"))
+	k, err := s.loadMaster()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(server, "keystore", "bb")
+	gen, err := os.ReadFile(filepath.Join(dir, generationName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ptr := record{kind: kindPointer, name: "bb", created: 1}
+	if _, err := hex.Decode(ptr.generation[:], bytes.TrimSpace(gen)); err != nil {
+		t.Fatal(err)
+	}
+	if err := ptr.seal(k.seal, k.scope, pointerPlaintext(1<<62, 1), rand.Reader); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(dir, currentName), string(ptr.marshal()))
+
+	got, err := s.List(ctx)
+	if err != nil || len(got) != 2 {
+		t.Fatalf("List = %+v %v, want both entries", got, err)
+	}
+	if e := got[0]; e.Name != "aa" || e.Err != nil || e.Current.Version != 1 {
+		t.Fatalf("healthy entry = %+v", e)
+	}
+	if e := got[1]; e.Name != "bb" || !errors.Is(e.Err, ErrCorrupt) || e.Versions != nil {
+		t.Fatalf("entry with a pointer past maxVersion = %+v, want only Err (ErrCorrupt)", e)
+	}
+	if _, _, err := s.Current(ctx, "bb"); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("Current: %v, want ErrCorrupt", err)
+	}
+	if _, _, err := s.Get(ctx, "bb", 1); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("Get 1: %v, want ErrCorrupt", err)
+	}
+}
+
+// TestReadDirNamesBound: a directory is listed in batches, whole up to the
+// limit, and one holding more names than the limit fails closed.
+func TestReadDirNamesBound(t *testing.T) {
+	dir := t.TempDir()
+	const n = 2*dirBatch + 3 // past two batch boundaries
+	for i := range n {
+		writeFile(t, filepath.Join(dir, fmt.Sprintf("f%d", i)), "")
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	if names, err := readDirNames(root, n); err != nil || len(names) != n {
+		t.Fatalf("readDirNames at the limit = %d names, %v; want %d", len(names), err, n)
+	}
+	for _, max := range []int{n - 1, dirBatch, 1} {
+		if names, err := readDirNames(root, max); err == nil || names != nil {
+			t.Fatalf("readDirNames with %d names over a limit of %d = %d names, %v; want an error", n, max, len(names), err)
+		}
+	}
+}
+
+// TestScopeBindsRecords: a record sealed by the system store does not open
+// in a store of another scope over the same files and master, and a store
+// whose scope checkScope refuses fails closed, creating nothing.
+func TestScopeBindsRecords(t *testing.T) {
+	ctx := context.Background()
+	s, _ := newTestStore(t)
+	mustPut(t, s, "a", KindOpaque, []byte("a"))
+	// The test-only seam: a second store over the same directories, under a
+	// scope New does not construct.
+	u501 := New(Config{Dir: s.dir, MasterDir: s.masterDir, UID: s.uid, GID: s.gid, DataRoot: s.dataRoot})
+	u501.floorUID, u501.floorGID = s.floorUID, s.floorGID
+	u501.scope = "user/501"
+	if _, _, err := u501.Current(ctx, "a"); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("Current under user/501: %v, want ErrCorrupt", err)
+	}
+	if got, err := u501.List(ctx); err != nil || len(got) != 1 || !errors.Is(got[0].Err, ErrCorrupt) {
+		t.Fatalf("List under user/501 = %+v %v, want the entry marked ErrCorrupt", got, err)
+	}
+	if _, val, err := s.Current(ctx, "a"); err != nil || string(val) != "a" {
+		t.Fatalf("Current under system = %q %v", val, err)
+	}
+
+	bad, badServer := newTestStore(t)
+	bad.scope = "user"
+	if _, err := bad.Put(ctx, "a", KindOpaque, []byte("a")); !errors.Is(err, errInvalidScope) {
+		t.Fatalf("Put under an invalid scope: %v, want errInvalidScope", err)
+	}
+	if _, err := os.Lstat(filepath.Join(badServer, "cred")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("a Put under an invalid scope created cred/: %v", err)
+	}
+}
+
+// TestMintCountsReservedUserName: ".user" in the entries' directory, the name
+// reserved for user scopes, counts as an entry for the first-Put mint guard,
+// whatever its type, so a Put with the master missing returns ErrMasterMissing
+// and mints nothing.
+func TestMintCountsReservedUserName(t *testing.T) {
+	for name, plant := range map[string]func(t *testing.T, p string){
+		"directory": func(t *testing.T, p string) {
+			if err := os.Mkdir(p, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"file": func(t *testing.T, p string) { writeFile(t, p, "") },
+		"symlink": func(t *testing.T, p string) {
+			if err := os.Symlink("nowhere", p); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, server := newTestStore(t)
+			ks := filepath.Join(server, "keystore")
+			if err := os.Mkdir(ks, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			plant(t, filepath.Join(ks, userScopesName))
+			if _, err := s.Put(context.Background(), "a", KindOpaque, []byte("a")); !errors.Is(err, ErrMasterMissing) {
+				t.Fatalf("Put with only %s present: %v, want ErrMasterMissing", userScopesName, err)
+			}
+			if _, err := os.Lstat(filepath.Join(server, "cred", "keystore-master", masterName)); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("the Put minted a master: %v", err)
+			}
+		})
+	}
+}
+
 // TestEntryWithNoPointer: a directory with no current pointer is an
 // interrupted Put only when it holds generation and at most v1 (temporary
 // files aside). Anything more is damage: List reports it, Put refuses it and
@@ -759,12 +1131,12 @@ func TestEntryWithNoPointer(t *testing.T) {
 		"generation only":   func(dir string) { remove(t, filepath.Join(dir, "v1")); unrecorded(dir) },
 		"empty":             func(dir string) { remove(t, filepath.Join(dir, "v1")); remove(t, filepath.Join(dir, generationName)) },
 		"a leftover temporary file": func(dir string) {
-			writeFile(t, filepath.Join(dir, "."+currentName+".0123abcd.tmp"), "half a write")
+			writeFile(t, filepath.Join(dir, "."+currentName+".0123456789abcdef.tmp"), "half a write")
 			unrecorded(dir)
 		},
 		"generation and a temporary file, as a crash while writing v1 leaves": func(dir string) {
 			remove(t, filepath.Join(dir, "v1"))
-			writeFile(t, filepath.Join(dir, ".v1.0123abcd.tmp"), "half a write")
+			writeFile(t, filepath.Join(dir, ".v1.0123456789abcdef.tmp"), "half a write")
 			unrecorded(dir)
 		},
 		// Without a floor file the two cannot be told apart, and the rule
@@ -790,12 +1162,13 @@ func TestEntryWithNoPointer(t *testing.T) {
 			if _, _, err := s.Get(ctx, "a", 1); !errors.Is(err, ErrNotFound) {
 				t.Fatalf("Get: %v, want ErrNotFound", err)
 			}
-			before := files(t, dir)
+			// Delete answers ErrNotFound, since there is no entry, and still
+			// removes the directory, which may hold a sealed v1.
 			if err := s.Delete(ctx, "a"); !errors.Is(err, ErrNotFound) {
 				t.Fatalf("Delete: %v, want ErrNotFound", err)
 			}
-			if after := files(t, dir); after != before {
-				t.Fatalf("Delete changed the directory: %s, was %s", after, before)
+			if _, err := os.Lstat(dir); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("directory after Delete: %v, want it gone", err)
 			}
 			mustPut(t, s, "a", KindOpaque, []byte("new"))
 			if _, val, err := s.Current(ctx, "a"); err != nil || string(val) != "new" {
@@ -818,7 +1191,22 @@ func TestEntryWithNoPointer(t *testing.T) {
 		"lost pointer, generation and v1": func(string) {},
 		"lost pointer, generation only":   func(dir string) { remove(t, filepath.Join(dir, "v1")) },
 		"lost pointer, renamed to a temporary name": func(dir string) {
-			writeFile(t, filepath.Join(dir, "."+currentName+".0123abcd.tmp"), "the old pointer")
+			writeFile(t, filepath.Join(dir, "."+currentName+".0123456789abcdef.tmp"), "the old pointer")
+		},
+		// Only a regular file of the exact shape writeFile creates is a
+		// temporary file.
+		"a directory named like a temporary file": func(dir string) {
+			if err := os.Mkdir(filepath.Join(dir, "."+currentName+".0123456789abcdef.tmp"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"a symlink named like a temporary file": func(dir string) {
+			if err := os.Symlink("v1", filepath.Join(dir, "."+currentName+".0123456789abcdef.tmp")); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"a dot file that is not the writer's shape": func(dir string) {
+			writeFile(t, filepath.Join(dir, ".x.tmp"), "x")
 		},
 	} {
 		t.Run("damage: "+name, func(t *testing.T) {
@@ -866,23 +1254,54 @@ func TestPutCrashAtEveryStep(t *testing.T) {
 		s.step = func(name string) error { steps = append(steps, name); return nil }
 		mustPut(t, s, "k", KindOpaque, []byte("x"))
 	}
-	want := "write master,write master.sha256,write generation,write v1,write current,write keystore-floor.json"
+	// Each directory's step comes after its parent is fsynced, so the master
+	// directory is durable before the master is written into it, and the
+	// entry directory before its files.
+	want := "mkdir keystore,mkdir cred,mkdir keystore-master,write master,write master.sha256,mkdir k,write generation,write v1,write current,write keystore-floor.json"
 	if strings.Join(steps, ",") != want {
 		t.Fatalf("Put steps = %v, want %s", steps, want)
 	}
+	// What a reader sees after a crash at each step. The entry is never there
+	// before its pointer is, and Current opens the entry before the master,
+	// so every step reads as ErrNotFound and none as ErrMasterMissing.
+	afterCrash := map[string]error{
+		"mkdir keystore":        ErrNotFound,
+		"mkdir cred":            ErrNotFound,
+		"mkdir keystore-master": ErrNotFound,
+		"write master":          ErrNotFound,
+		"write master.sha256":   ErrNotFound,
+		"mkdir k":               ErrNotFound,
+		"write generation":      ErrNotFound,
+		"write v1":              ErrNotFound,
+		"write current":         ErrNotFound,
+	}
+	others := []error{ErrMasterMissing, ErrMasterUntrusted, ErrCorrupt, ErrExists}
 	for _, step := range steps {
 		if step == "write "+floorName {
 			continue // after the pointer: the entry is committed (TestFloorRaised)
 		}
 		t.Run(step, func(t *testing.T) {
+			want, ok := afterCrash[step]
+			if !ok {
+				t.Fatalf("no expected error for step %q", step)
+			}
 			s, _ := newTestStore(t)
 			s.step = failAt(step)
-			if _, err := s.Put(ctx, "k", KindOpaque, []byte("first")); err == nil {
-				t.Fatal("Put succeeded through a crash")
+			if _, err := s.Put(ctx, "k", KindOpaque, []byte("first")); err == nil || !strings.Contains(err.Error(), "injected crash at "+step) {
+				t.Fatalf("Put through a crash at %s: %v, want the injected crash", step, err)
 			}
 			s.step = func(string) error { return nil }
-			if _, _, err := s.Current(ctx, "k"); !errors.Is(err, ErrNotFound) && !errors.Is(err, ErrMasterMissing) {
-				t.Fatalf("Current after the crash: %v, want ErrNotFound", err)
+			_, _, err := s.Current(ctx, "k")
+			if !errors.Is(err, want) {
+				t.Fatalf("Current after the crash: %v, want %v", err, want)
+			}
+			for _, other := range others {
+				if errors.Is(err, other) {
+					t.Fatalf("Current after the crash: %v, which is also %v", err, other)
+				}
+			}
+			if got, err := s.List(ctx); err != nil || len(got) != 0 {
+				t.Fatalf("List after the crash = %+v %v, want no entry", got, err)
 			}
 			mustPut(t, s, "k", KindOpaque, []byte("retried"))
 			if _, val, err := s.Current(ctx, "k"); err != nil || string(val) != "retried" {
@@ -908,8 +1327,15 @@ func TestPutCrashAtEveryStep(t *testing.T) {
 		if _, err := s.Put(ctx, "k", KindOpaque, []byte("again")); !errors.Is(err, ErrExists) {
 			t.Fatalf("Put over an interrupted Delete: %v, want ErrExists", err)
 		}
+		// The retried rm removes the generation and sealed v1 the crash left.
 		if err := s.Delete(ctx, "k"); err != nil {
 			t.Fatalf("retried Delete: %v", err)
+		}
+		if err := s.Delete(ctx, "k"); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("Delete after the retried Delete: %v, want ErrNotFound", err)
+		}
+		if _, err := os.Lstat(filepath.Join(s.dir, "k")); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("entry directory after the retried Delete: %v, want it gone", err)
 		}
 		mustPut(t, s, "k", KindOpaque, []byte("again"))
 	})
@@ -946,6 +1372,136 @@ func TestRefusesSymlinks(t *testing.T) {
 			t.Fatalf("Current through a symlinked entry: %v, want ErrCorrupt", err)
 		}
 	})
+}
+
+// TestCreateEntryRefusesSwappedDirectory: a new entry directory replaced by a
+// symlink to another entry between its mkdir and its open is refused, and
+// nothing is written through it into the other entry.
+func TestCreateEntryRefusesSwappedDirectory(t *testing.T) {
+	s, server := newTestStore(t)
+	mustPut(t, s, "a", KindOpaque, []byte("a"))
+	ks := filepath.Join(server, "keystore")
+	before := dirContents(t, filepath.Join(ks, "a"))
+	s.entryMade = func(name string) {
+		p := filepath.Join(ks, name)
+		if err := os.Remove(p); err != nil {
+			t.Error(err)
+		}
+		if err := os.Symlink("a", p); err != nil {
+			t.Error(err)
+		}
+	}
+	if _, err := s.Put(context.Background(), "b", KindOpaque, []byte("b")); err == nil {
+		t.Fatal("Put wrote into a directory swapped in after its mkdir")
+	}
+	if after := dirContents(t, filepath.Join(ks, "a")); !maps.Equal(after, before) {
+		t.Fatalf("the other entry changed: %q, was %q", after, before)
+	}
+}
+
+// TestMkdirRefusesSwappedDirectory: a directory rename-swapped into the name
+// between a mkdir and the open that checks it, or one not owned by the euid
+// that made it, is refused as ErrCorrupt before anything is chowned, and the
+// directory found there is left as it was. It covers the entries' directory,
+// made by path through mkdirOwned, and an entry directory, made by mkdirAt.
+func TestMkdirRefusesSwappedDirectory(t *testing.T) {
+	ctx := context.Background()
+	for _, target := range []string{"keystore", "b"} {
+		for _, tt := range []struct {
+			name    string
+			files   []string
+			symlink bool
+		}{
+			{"a non-empty directory", []string{"v1"}, false},
+			{"an empty directory", nil, false},
+			{"a symlink to a directory", []string{"v1"}, true},
+		} {
+			t.Run(target+": "+tt.name, func(t *testing.T) {
+				s, server := newTestStore(t)
+				at := filepath.Join(server, "keystore")
+				if target != "keystore" {
+					mustPut(t, s, "a", KindOpaque, []byte("a"))
+					at = filepath.Join(at, target)
+				}
+				// The decoy is a directory at 0755 beside the store.
+				decoy := filepath.Join(filepath.Dir(server), "decoy")
+				if err := os.Mkdir(decoy, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				chmod(t, decoy, 0o755)
+				for _, f := range tt.files {
+					writeFile(t, filepath.Join(decoy, f), "decoy "+f)
+				}
+				before := dirContents(t, decoy)
+				from, real := decoy, at // what is renamed in, and where the decoy ends up
+				if tt.symlink {
+					from, real = decoy+".link", decoy
+					if err := os.Symlink(decoy, from); err != nil {
+						t.Fatal(err)
+					}
+				}
+				s.dirMade = func(name string) {
+					if name != target {
+						return
+					}
+					if err := os.Remove(at); err != nil {
+						t.Error(err)
+					}
+					if err := os.Rename(from, at); err != nil {
+						t.Error(err)
+					}
+				}
+				var chowned []string
+				s.chown = func(f *os.File, uid, gid int) error { chowned = append(chowned, f.Name()); return nil }
+
+				if _, err := s.Put(ctx, "b", KindOpaque, []byte("b")); !errors.Is(err, ErrCorrupt) {
+					t.Fatalf("Put over a directory swapped in after its mkdir: %v, want ErrCorrupt", err)
+				}
+				if len(chowned) != 0 {
+					t.Fatalf("chowned %v", chowned)
+				}
+				if after := dirContents(t, real); !maps.Equal(after, before) {
+					t.Fatalf("the swapped-in directory changed: %q, was %q", after, before)
+				}
+				if fi, err := os.Stat(real); err != nil || fi.Mode().Perm() != 0o755 {
+					t.Fatalf("the swapped-in directory = %v %v, want its mode 0755 untouched", fi, err)
+				}
+			})
+		}
+	}
+	t.Run("a directory not owned by its creator", func(t *testing.T) {
+		s, server := newTestStore(t)
+		s.euid = func() int { return os.Geteuid() + 1 }
+		var chowned []string
+		s.chown = func(f *os.File, uid, gid int) error { chowned = append(chowned, f.Name()); return nil }
+		if _, err := s.Put(ctx, "a", KindOpaque, []byte("a")); !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("Put: %v, want ErrCorrupt", err)
+		}
+		if len(chowned) != 0 {
+			t.Fatalf("chowned %v", chowned)
+		}
+		if _, err := os.Stat(filepath.Join(server, "cred")); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("the refused Put went on to create cred/: %v", err)
+		}
+	})
+}
+
+// dirContents maps each name in dir to its content.
+func dirContents(t *testing.T, dir string) map[string]string {
+	t.Helper()
+	des, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]string{}
+	for _, de := range des {
+		b, err := os.ReadFile(filepath.Join(dir, de.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		out[de.Name()] = string(b)
+	}
+	return out
 }
 
 func failAt(step string) func(string) error {

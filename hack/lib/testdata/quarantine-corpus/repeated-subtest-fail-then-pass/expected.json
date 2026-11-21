@@ -1,0 +1,12 @@
+{
+  "description": "Generated (testdata/gen): go test -count=2; the listed parallel subtest TestParent/a fails with its signature on the first run and passes on the second, with the real PAUSE and CONT lines. Both the leaf's and the unlisted parent's failures are sticky, the parent's own output is framing only, so both are excused.",
+  "edited": [],
+  "tests": {
+    "k3sm.io/apis/net/v1::TestParent": "excused",
+    "k3sm.io/apis/net/v1::TestParent/a": "excused",
+    "k3sm.io/apis/net/v1::TestParent/b": "passed"
+  },
+  "tier": "affected",
+  "today": "2026-10-30",
+  "verdict": "excused"
+}

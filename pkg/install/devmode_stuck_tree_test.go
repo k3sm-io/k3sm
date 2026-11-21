@@ -66,17 +66,17 @@ func stuckMarker(t *testing.T, f *fakeSystem) {
 // `k3sm install --developer-mode off`, which runs the removal that failed.
 func TestDeveloperModeStuckMarkerLeavesNoSignedTree(t *testing.T) {
 	shrinkRestartBudgets(t)
-	offCfg := func() Config {
-		cfg := stageCfg()
+	offCfg := func(t testing.TB) Config {
+		cfg := stageCfg(t)
 		cfg.DeveloperMode = DeveloperModeOff
 		return cfg
 	}
-	live, staging := DefaultInstallDir, DefaultInstallDir+installSwapSuffix
 
 	t.Run("a first install moves the new tree out of the install root", func(t *testing.T) {
-		f := &fakeSystem{owners: map[string]OwnedEntry{}}
+		live, staging := offCfg(t).withDefaults().InstallDir, offCfg(t).withDefaults().swapDir()
+		f := (&fakeSystem{owners: map[string]OwnedEntry{}}).rootedIn(t)
 		stuckMarker(t, f)
-		err := Install(context.Background(), f, offCfg())
+		err := Install(context.Background(), f, offCfg(t))
 		if err == nil {
 			t.Fatal("Install succeeded beside a marker that still reads on")
 		}
@@ -97,9 +97,10 @@ func TestDeveloperModeStuckMarkerLeavesNoSignedTree(t *testing.T) {
 	})
 
 	t.Run("a first install whose move aside fails says the tree is still there", func(t *testing.T) {
-		f := &fakeSystem{owners: map[string]OwnedEntry{}}
+		live := offCfg(t).withDefaults().InstallDir
+		f := (&fakeSystem{owners: map[string]OwnedEntry{}}).rootedIn(t)
 		stuckMarker(t, f)
-		err := Install(context.Background(), &failingSwap{fakeSystem: f, n: 1}, offCfg())
+		err := Install(context.Background(), &failingSwap{fakeSystem: f, n: 1}, offCfg(t))
 		if err == nil {
 			t.Fatal("Install succeeded beside a marker that still reads on")
 		}
@@ -111,14 +112,14 @@ func TestDeveloperModeStuckMarkerLeavesNoSignedTree(t *testing.T) {
 	})
 
 	t.Run("a failed rollback says developer mode is still on", func(t *testing.T) {
-		f := &fakeSystem{}
-		if err := Install(context.Background(), f, stageCfg()); err != nil {
+		f := newFakeSystem(t)
+		if err := Install(context.Background(), f, stageCfg(t)); err != nil {
 			t.Fatalf("first Install: %v", err)
 		}
 		stuckMarker(t, f)
 		f.putLoaded(NetdLabel, ServerLabel)
 		f.calls = nil
-		err := Install(context.Background(), &failingSwap{fakeSystem: f, n: 1}, offCfg())
+		err := Install(context.Background(), &failingSwap{fakeSystem: f, n: 1}, offCfg(t))
 		if err == nil {
 			t.Fatal("Install succeeded beside a marker that still reads on")
 		}
@@ -150,11 +151,11 @@ func TestDeveloperModeStuckMarkerLeavesNoSignedTree(t *testing.T) {
 // both reported.
 func TestInstallReportsUnreadableMarkerBesideKubeconfigError(t *testing.T) {
 	shrinkRestartBudgets(t)
-	f := &fakeSystem{owners: map[string]OwnedEntry{}}
+	f := (&fakeSystem{owners: map[string]OwnedEntry{}}).rootedIn(t)
 	putUnclearableMarker(t, f, EntryRegular)
 	f.readModeErrs = map[string]error{DeveloperModeMarkerPath: errors.New("EIO reading the marker")}
 	f.kubeconfigErr = errors.New("home directory is read-only")
-	cfg := stageCfg()
+	cfg := stageCfg(t)
 	cfg.DeveloperMode = DeveloperModeOff
 	err := Install(context.Background(), f, cfg)
 	if err == nil {
@@ -176,13 +177,13 @@ func TestInstallReportsUnreadableMarkerBesideKubeconfigError(t *testing.T) {
 // and the error says the tree is still beside the marker.
 func TestDeveloperModeStuckMarkerWithdrawIsOneWay(t *testing.T) {
 	shrinkRestartBudgets(t)
-	live, staging := DefaultInstallDir, DefaultInstallDir+installSwapSuffix
+	live, staging := stageCfg(t).withDefaults().InstallDir, stageCfg(t).withDefaults().swapDir()
 	planted := staging + "/planted"
-	f := &fakeSystem{owners: map[string]OwnedEntry{}}
+	f := (&fakeSystem{owners: map[string]OwnedEntry{}}).rootedIn(t)
 	stuckMarker(t, f)
 	f.calls = nil
 	occupy := &occupyAfterPublish{fakeSystem: f, path: planted}
-	cfg := stageCfg()
+	cfg := stageCfg(t)
 	cfg.DeveloperMode = DeveloperModeOff
 	err := Install(context.Background(), occupy, cfg)
 	if err == nil {
