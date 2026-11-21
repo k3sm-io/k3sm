@@ -339,7 +339,7 @@ func checkValue(kind Kind, value []byte) error {
 			}
 			return nil
 		default:
-			return fmt.Errorf("an Ed25519 key is %d or %d bytes, not %d", ed25519.SeedSize, ed25519.PrivateKeySize, len(value))
+			return fmt.Errorf("an Ed25519 key is %d or %d bytes, and this value is neither", ed25519.SeedSize, ed25519.PrivateKeySize)
 		}
 	case KindOpaque:
 		if len(value) == 0 {

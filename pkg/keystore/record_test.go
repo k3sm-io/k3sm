@@ -24,6 +24,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"testing/iotest"
@@ -299,6 +300,14 @@ func TestCheckValue(t *testing.T) {
 				t.Fatalf("checkValue = %v, want ok=%v", err, tt.ok)
 			}
 		})
+	}
+	// The length of a refused Ed25519 value is part of the secret's shape,
+	// so the refusal names the two valid sizes and not the value's.
+	for _, n := range []int{31, 40, 65} {
+		err := checkValue(KindEd25519, make([]byte, n))
+		if err == nil || strings.Contains(err.Error(), strconv.Itoa(n)) {
+			t.Errorf("checkValue of %d bytes = %v, want a refusal that does not give the length", n, err)
+		}
 	}
 }
 
