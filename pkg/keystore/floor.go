@@ -99,7 +99,7 @@ type floorFile struct {
 type floorMalformedError struct{}
 
 func (*floorMalformedError) Error() string {
-	return "the keystore floor does not parse: remove keystore-floor.json as root, then run any sudo k3sm keys verb to rebuild it from the current pointers"
+	return "the keystore floor does not parse. Removing keystore-floor.json turns replay protection off until a root keys verb rebuilds it, and the rebuild records whatever pointers are under keystore/ as current, an older copy put back included: remove it as root only once those pointers are known to be current, then run any sudo k3sm keys verb to rebuild it"
 }
 
 func (*floorMalformedError) Unwrap() error { return ErrCorrupt }

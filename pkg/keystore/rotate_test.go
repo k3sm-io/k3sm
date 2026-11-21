@@ -662,3 +662,26 @@ func TestFloorScope(t *testing.T) {
 		mustCurrent(t, s, "k", "v")
 	})
 }
+
+// TestFloorMalformedAdvice: a floor that does not parse is refused with
+// advice that says what removing it costs, never a bare "delete the file":
+// with no floor the stale-pointer check is off, and the rebuild trusts
+// whatever pointers are there.
+func TestFloorMalformedAdvice(t *testing.T) {
+	s, server := newTestStore(t)
+	mustPut(t, s, "k", KindOpaque, []byte("v"))
+	writeFile(t, floorPath(server), "{")
+	_, _, err := s.Current(context.Background(), "k")
+	if !errors.Is(err, errFloorMalformed) {
+		t.Fatalf("Current over a malformed floor: %v, want errFloorMalformed", err)
+	}
+	msg := err.Error()
+	for _, want := range []string{"turns replay protection off", "known to be current", "rebuild"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("malformed-floor advice %q does not say %q", msg, want)
+		}
+	}
+	if strings.Contains(msg, "restore it from backup") {
+		t.Errorf("malformed-floor advice %q carries ErrCorrupt's advice to restore from backup", msg)
+	}
+}

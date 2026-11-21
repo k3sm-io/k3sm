@@ -261,8 +261,11 @@ highest sequence it has committed for each entry, in `keystore-floor.json`:
 belongs to the system store. The file is parsed strictly: a missing or other `scope`, a
 `version` other than 1, any field the format does not have (at the top or in an entry), a
 generation that is not 32 lower-case hex digits, a sequence of 0, a name `put` would refuse,
-or data after the object is `ErrCorrupt`, with the floor's own message (remove the file as
-root and let a root-run verb rebuild it) rather than the restore-from-backup default.
+or data after the object is `ErrCorrupt`, with the floor's own message rather than the
+restore-from-backup default. That message says what removing the file costs: replay
+protection is off until a root-run verb rebuilds the floor, and the rebuild records
+whatever pointers are under `keystore/` as current, so the file is removed as root only
+once those pointers are known to be current.
 
 The file is bounded at 4 MiB, on read and on write. A floor write whose result would be
 larger is refused before anything is written, so the floor on disk is always one that
