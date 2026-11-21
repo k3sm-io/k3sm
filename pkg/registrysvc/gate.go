@@ -147,6 +147,11 @@ type gateConfig struct {
 	// mount, chunk, finish); zero means gateUploadHeaderTimeout. Ignored when
 	// Transport is set.
 	UploadHeaderTimeout time.Duration
+	// dial, when set, replaces the loopback transports' dialer, so a test
+	// can hand them an in-memory connection; they keep their response-header
+	// bounds. nil means a net.Dialer bounded by relayDialTimeout. Ignored
+	// when Transport is set.
+	dial func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 // newGate builds a gate.
@@ -168,9 +173,9 @@ func newGate(cfg gateConfig) *gate {
 	}
 	manifestTransport, uploadTransport := cfg.Transport, cfg.Transport
 	if cfg.Transport == nil {
-		cfg.Transport = loopbackTransport(cfg.UpstreamHeaderTimeout)
-		manifestTransport = loopbackTransport(cfg.ManifestHeaderTimeout)
-		uploadTransport = loopbackTransport(cfg.UploadHeaderTimeout)
+		cfg.Transport = loopbackTransport(cfg.UpstreamHeaderTimeout, cfg.dial)
+		manifestTransport = loopbackTransport(cfg.ManifestHeaderTimeout, cfg.dial)
+		uploadTransport = loopbackTransport(cfg.UploadHeaderTimeout, cfg.dial)
 	}
 	g := &gate{upstream: cfg.Upstream, log: cfg.Logger, cred: cfg.Credential, now: cfg.Now}
 	if cfg.Auth.complete() {
@@ -234,11 +239,14 @@ func (g *gate) proxyFor(op gateOp) *httputil.ReverseProxy {
 }
 
 // loopbackTransport is the transport to the loopback registry, waiting at
-// most headerTimeout for response headers once a request is written.
-func loopbackTransport(headerTimeout time.Duration) *http.Transport {
-	d := &net.Dialer{Timeout: relayDialTimeout}
+// most headerTimeout for response headers once a request is written. It dials
+// with dial, or with a net.Dialer bounded by relayDialTimeout when dial is nil.
+func loopbackTransport(headerTimeout time.Duration, dial func(ctx context.Context, network, addr string) (net.Conn, error)) *http.Transport {
+	if dial == nil {
+		dial = (&net.Dialer{Timeout: relayDialTimeout}).DialContext
+	}
 	return &http.Transport{
-		DialContext:           d.DialContext,
+		DialContext:           dial,
 		DisableCompression:    true,
 		MaxIdleConnsPerHost:   32,
 		IdleConnTimeout:       90 * time.Second,
