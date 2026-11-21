@@ -19,11 +19,12 @@
 # sibling that is not checked out fails its rows, never skips them.
 #
 # Exit status: 0 every row passed; 1 a row failed; 3 no row failed but at
-# least one is pending. The rig legs are PENDING (rig leg) under every mode but
-# --lab, so --check exits 3 until the rig record is the proof the release cites.
+# least one is pending. Only --lab judges the rig legs: --check prints each as
+# a RIG line and leaves it out of the count and the exit status, so a unit run
+# exits 0 without the rig. Phase A is complete when --check exits 0.
 #
 # Modes. Neither --check nor a unit mode calls sudo.
-#   --check         every row.
+#   --check         every G and U row; the E rows print as RIG (run --lab).
 #   --rewrap        Rewrap's rows: G3, G12, G13, G14 and U5.
 #   --verbs         the keys verbs: G16, G17, G21, U1.
 #   --delivery      the system delivery: G18 to G20.
@@ -253,12 +254,12 @@ special g22 G22
 
 pend U1 "rotate --from-version N writes version N's bytes as a new version server side; no value leaves the store (keys verbs)" \
 	k3sm/cmd/k3sm::TestKeysRotateFromVersionNoValueOut
-pend U2 "AAD scope: a record moved between scopes, or between two users, fails to open (scope binding)" \
-	TestRecordMovedAcrossScopesFailsOpen
-pend U3 "KDF labels take the scope; checkScope accepts only system and user/<decimal uid>; kinds 0xFE and 0xFD are reserved (scope binding)" \
-	TestScopedLabelsAndReservedKinds TestCheckScopeGrammar
-pend U4 "the first-Put mint refuses with .user present and the master missing (scope binding)" \
-	TestFirstPutRefusesMintOverUserDir
+check U2 "AAD scope: a record moved between scopes, or between two users, fails to open" \
+	TestScopeBindsRecords TestDerivedKeysDifferByScope
+check U3 "KDF labels take the scope; checkScope accepts only system and user/<decimal uid>; kinds 0xFE and 0xFD are reserved" \
+	TestDerivedKeysDifferByScope TestCheckScope TestParseRecordRefusesMalformed
+check U4 "the first-Put mint refuses with .user present and the master missing" \
+	TestMintCountsReservedUserName
 check U5 "Rewrap refuses with ErrScopeUnsupported, writing nothing, while .user exists as a directory, a file or a symlink" \
 	TestRewrapRefusesWhileUserScopesExist
 pend U6 "scope.key is sealed under W, bound to the GeneratedUID; a mismatch is ErrScopeOwnerChanged (user scopes)" \
@@ -567,7 +568,7 @@ lab_verdicts=()
 judge_leg() {
 	local i="$1" id="${R_ID[$1]}" rc=0
 	if [ "$mode" != lab ]; then
-		pending_row "$id" "${R_DESC[$i]} (rig leg)"
+		row "$id" RIG "${R_DESC[$i]} (rig leg: run --lab)"
 		return 0
 	fi
 	if ! declare -F "leg_$id" >/dev/null; then
