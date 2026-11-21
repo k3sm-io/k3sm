@@ -260,6 +260,23 @@ type keys struct {
 	scope       string
 	seal        []byte
 	fingerprint []byte
+	// next is the keys of master.next, when a Rewrap that crashed left one
+	// that agrees with its fingerprint: a record its step 4 already moved
+	// opens under them (see open). Nil otherwise, and always nil on the keys
+	// a record is sealed under.
+	next *keys
+}
+
+// open authenticates and decrypts r under k, and, when that fails to
+// authenticate and k.next is set, once more under k.next: the reader's rule
+// for the state a crashed Rewrap leaves (docs/design/keystore.md § "Rewrap").
+// The lock keeps a live reader from ever seeing a Rewrap in progress.
+func (k keys) open(r *record) ([]byte, error) {
+	pt, err := r.open(k.seal, k.scope)
+	if err != nil && k.next != nil && errors.Is(err, ErrCorrupt) {
+		return r.open(k.next.seal, k.next.scope)
+	}
+	return pt, err
 }
 
 // deriveKeys derives scope's seal and fingerprint keys from master. It does

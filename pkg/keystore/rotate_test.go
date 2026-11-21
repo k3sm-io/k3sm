@@ -324,7 +324,7 @@ func TestFloorTrust(t *testing.T) {
 			}
 			return f.Chown(uid, gid)
 		}
-		s.floorUID, s.floorGID = uint32(os.Getuid()), uint32(os.Getgid())
+		s.floorUID, s.floorGID = floorIDs()
 		mustPut(t, s, "k", KindOpaque, []byte("v"))
 		fi, err := os.Lstat(floorPath(server))
 		if err != nil {

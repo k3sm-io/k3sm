@@ -46,20 +46,6 @@ type fakeVersion struct {
 
 var _ Store = (*fakeStore)(nil)
 
-// deliveredStore is the part of Store that FileStore implements today: every
-// method but Rewrap, which lands in a later pull request and replaces this
-// interface and the assertion below with var _ Store = (*FileStore)(nil).
-type deliveredStore interface {
-	Put(ctx context.Context, name string, kind Kind, value []byte) (Version, error)
-	Current(ctx context.Context, name string) (Version, []byte, error)
-	Get(ctx context.Context, name string, version uint64) (Version, []byte, error)
-	List(ctx context.Context) ([]Entry, error)
-	Delete(ctx context.Context, name string) error
-	Rotate(ctx context.Context, name string, value []byte) (Version, error)
-}
-
-var _ deliveredStore = (*FileStore)(nil)
-
 func newFakeStore() *fakeStore {
 	return &fakeStore{
 		now:     time.Date(2026, 10, 17, 0, 0, 0, 0, time.UTC),
@@ -318,7 +304,7 @@ func TestKindString(t *testing.T) {
 }
 
 func TestSentinelsAreDistinct(t *testing.T) {
-	all := []error{ErrInvalidName, ErrExists, ErrCorrupt, ErrNotFound, ErrVersionNotFound, ErrEncryptionOff, ErrMasterMissing, ErrMasterUntrusted}
+	all := []error{ErrInvalidName, ErrExists, ErrCorrupt, ErrNotFound, ErrVersionNotFound, ErrEncryptionOff, ErrMasterMissing, ErrMasterUntrusted, ErrScopeUnsupported, ErrRewrapResumed}
 	for i, a := range all {
 		for j, b := range all {
 			if i != j && errors.Is(a, b) {

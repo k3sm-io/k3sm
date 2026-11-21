@@ -124,8 +124,11 @@ type Store interface {
 	// Delete removes the entry name and every one of its versions, or
 	// returns ErrNotFound.
 	Delete(ctx context.Context, name string) error
-	// Rewrap re-seals every stored version under a new master key, so the
-	// old master key can be retired.
+	// Rewrap re-seals every stored version and current pointer under a new
+	// master key, then retires the old one. It is resumable: a crash at any
+	// step leaves every record readable, and the next call completes it. It
+	// refuses with ErrScopeUnsupported, changing nothing, while user scopes
+	// exist.
 	Rewrap(ctx context.Context, newMaster []byte) error
 }
 
@@ -168,4 +171,16 @@ var (
 	// is missing), or its directory, or cred/ above it, is a symlink, not the
 	// service user's, or open to group or others.
 	ErrMasterUntrusted = errors.New("the keystore master key is not trusted: the master file must be a regular file of 32 bytes, mode 0600, owned by the service user, and match its recorded fingerprint, in a directory (and cred/ above it) owned by the service user and closed to group and others")
+	// ErrScopeUnsupported is Rewrap's refusal while the name reserved for
+	// user scopes exists in the entries' directory, whatever its type. This
+	// build cannot re-wrap user scopes, so re-wrapping the master under them
+	// would leave them unreadable; Rewrap writes nothing. A .user that is not
+	// a user scope (a stray file or link) is root's to remove.
+	ErrScopeUnsupported = errors.New("the keystore holds user scopes at the reserved path keystore/.user, which this build of k3sm cannot re-wrap: the master was not swapped and every record still opens; upgrade k3sm, then run rewrap again. If keystore/.user is not a user scope, root must remove it before rewrap can run")
+	// ErrRewrapResumed reports that Rewrap found an earlier, interrupted
+	// rewrap whose new key was already live for some record, completed it
+	// under that key rather than the one supplied, and stopped. The master is
+	// now that earlier key, which the caller did not choose, so Rewrap must be
+	// run again to retire it.
+	ErrRewrapResumed = errors.New("an earlier interrupted rewrap was completed, with a key other than the one supplied: run rewrap again to retire that key")
 )
