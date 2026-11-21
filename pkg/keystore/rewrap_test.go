@@ -1334,6 +1334,30 @@ func TestRewrapResumeFailed(t *testing.T) {
 	})
 }
 
+// TestRewrapOwnSwapUnsynced: a Rewrap whose own master swap goes through
+// and then fails (the sync or step after the second rename) matches
+// ErrRewrapSwapUnsynced alone, never ErrRewrapResumeFailed or
+// ErrRewrapNotStarted, and the master is the key it was given.
+func TestRewrapOwnSwapUnsynced(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	seedRewrap(t, s)
+	s.step = failAt("rename " + masterNextFingerprintName)
+	err := s.Rewrap(ctx, rewrapKey(1))
+	if !errors.Is(err, ErrRewrapSwapUnsynced) || errors.Is(err, ErrRewrapResumeFailed) || errors.Is(err, ErrRewrapNotStarted) {
+		t.Fatalf("Rewrap failing after its own swap = %v, want ErrRewrapSwapUnsynced alone", err)
+	}
+	checkMasterIs(t, server, rewrapKey(1))
+	checkUnderKey(t, server, rewrapKey(1))
+	// A crash before the second rename is not a completed swap.
+	s2, _ := newTestStore(t)
+	seedRewrap(t, s2)
+	s2.step = failAt("rename " + masterNextName)
+	if err := s2.Rewrap(ctx, rewrapKey(1)); err == nil || errors.Is(err, ErrRewrapSwapUnsynced) {
+		t.Fatalf("Rewrap failing between the master renames = %v, want an error that is not ErrRewrapSwapUnsynced", err)
+	}
+}
+
 // TestRecordsSealedUnder: RecordsSealedUnder reports a key that some
 // committed record opens under, beside the live master, which is how a
 // Rewrap whose master.next was replaced or removed is recognised, and

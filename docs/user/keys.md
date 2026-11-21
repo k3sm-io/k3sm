@@ -129,6 +129,11 @@ finish with the same key:
 sudo k3sm keys rewrap --key-in FILE
 ```
 
+If the failure came after the master key was already swapped to the new key, `rewrap` says "the
+master swap completed but did not sync; this run's key file is now a copy of the live master: keep
+it until a later rewrap succeeds, then delete it." The rewrap is done; keep `FILE` as that message
+says.
+
 `--key-in` is for that recovery only. It accepts the key the interrupted rewrap recorded, or one
 that some entry is already sealed under, and refuses any other, so it never makes a key you made
 yourself the master key.

@@ -1057,6 +1057,11 @@ const keysResumeFailed = "an earlier interrupted rewrap was advanced and did not
 // the earlier rewrap's swap went through, so a new rewrap retires its key.
 const keysSwapUnsynced = "the earlier rewrap's master swap completed but did not sync; run sudo k3sm keys rewrap --key-out FILE again; the earlier rewrap's key file is now a copy of the live master; delete it after this rewrap succeeds"
 
+// keysOwnSwapUnsynced is what rewrap says after keystore.ErrRewrapSwapUnsynced
+// on its own swap: the key file is kept, as the live master's only copy
+// outside the store.
+const keysOwnSwapUnsynced = "the master swap completed but did not sync; this run's key file is now a copy of the live master: keep it until a later rewrap succeeds, then delete it."
+
 // keyFileAfterFailure decides, after a rewrap that did not succeed, what
 // becomes of the key file, and says so. A file this run wrote (--key-out) is
 // deleted only when the error is keystore.ErrRewrapNotStarted, which the
@@ -1065,12 +1070,17 @@ const keysSwapUnsynced = "the earlier rewrap's master swap completed but did not
 // keystore.ErrRewrapResumeFailed the file is kept too, and the operator is
 // sent to the earlier rewrap's key file, unless keystore.ErrRewrapSwapUnsynced
 // says that rewrap completed: the unused file is deleted, and the operator
-// runs a new rewrap. A --key-in file (out nil) is the
+// runs a new rewrap. keystore.ErrRewrapSwapUnsynced alone is this run's own
+// swap, complete: the file is the live master's copy and is kept. A --key-in file (out nil) is the
 // operator's and is never deleted. The delete goes through out, the
 // directory handle writeKeyOut checked, never through the path again. It
 // names the flag, never the path.
 func keyFileAfterFailure(err error, out *keyOutFile, resumed bool) string {
 	wrote := out != nil
+	if errors.Is(err, keystore.ErrRewrapSwapUnsynced) && !errors.Is(err, keystore.ErrRewrapResumeFailed) {
+		// This run's own swap went through: its key is the live master.
+		return keysOwnSwapUnsynced
+	}
 	if errors.Is(err, keystore.ErrRewrapSwapUnsynced) {
 		// The earlier rewrap is complete; this run's key was never used.
 		if !wrote {

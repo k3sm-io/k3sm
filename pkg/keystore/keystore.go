@@ -196,10 +196,11 @@ var (
 	// nothing was sealed under the key supplied: the earlier rewrap's key is
 	// what finishes it, and the caller keeps every key file it holds.
 	ErrRewrapResumeFailed = errors.New("an earlier interrupted rewrap was advanced and did not finish")
-	// ErrRewrapSwapUnsynced marks, beside ErrRewrapResumeFailed, the one
-	// resume failure after which the earlier rewrap is complete: the half-done
-	// master swap was renamed through, and the directory sync (or a later
-	// step) failed. The master is the earlier rewrap's key; a new Rewrap
-	// retires it, and no key file finishes anything.
+	// ErrRewrapSwapUnsynced marks a Rewrap error after the master swap was
+	// renamed through and the directory sync (or a later step) failed, so the
+	// rewrap is complete. Beside ErrRewrapResumeFailed, the swap was an
+	// earlier rewrap's: the master is that rewrap's key, a new Rewrap retires
+	// it, and no key file finishes anything. Alone, it was this call's own:
+	// the master is the key supplied, which the caller must keep.
 	ErrRewrapSwapUnsynced = errors.New("the earlier rewrap's master swap completed but did not sync")
 )

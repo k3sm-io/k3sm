@@ -1366,6 +1366,25 @@ func TestKeysRewrapSwapUnsynced(t *testing.T) {
 	}
 }
 
+// TestKeysRewrapOwnSwapUnsynced: when this run's own master swap went
+// through but did not sync, the --key-out file holds the live master, so
+// rewrap keeps it and says so, with no --key-in hint.
+func TestKeysRewrapOwnSwapUnsynced(t *testing.T) {
+	h := newKeysHarness(t)
+	h.put("system/a", []byte("a-value"))
+	err := fmt.Errorf("rewrap: injected crash at rename master.next.sha256 (%w)", keystore.ErrRewrapSwapUnsynced)
+	h.wrap = func(s keysStore) keysStore { return keysSwapUnsyncedStore{keysStore: s, err: err} }
+	p := filepath.Join(t.TempDir(), "new-master")
+	h.mustRun(1, "rewrap", "--key-out", p)
+	want := "the master swap completed but did not sync; this run's key file is now a copy of the live master: keep it until a later rewrap succeeds, then delete it."
+	if !strings.Contains(h.stderr.String(), want) || strings.Contains(h.stderr.String(), "--key-in") {
+		t.Errorf("stderr %q does not say %q, or offers --key-in", h.stderr.String(), want)
+	}
+	if got, rerr := os.ReadFile(p); rerr != nil || len(got) != 32 {
+		t.Fatalf("the key file after this run's own swap: %x, %v; want it kept", got, rerr)
+	}
+}
+
 // TestKeysDocsSayWhatTheVerbsDo: docs/user/keys.md carries the resume
 // message rewrap prints, word for word, and the three cautions the verbs
 // cannot enforce: raw bytes from show --reveal, no sudoers delegation, and

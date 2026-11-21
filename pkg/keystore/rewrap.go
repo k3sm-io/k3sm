@@ -220,9 +220,10 @@ func (s *FileStore) rewrap(ctx context.Context, newMaster []byte, p *rewrapProgr
 		return fmt.Errorf("records were re-sealed under %s, but the master was not swapped: %w", masterNextName, err)
 	}
 	if swapped, err := s.swapMaster(mroot, next); err != nil {
-		// A resumed rewrap whose swap went through and then failed (its last
-		// sync or step) is complete under the earlier key.
-		if swapped && p.resuming {
+		// A swap that went through and then failed (its last sync or step)
+		// left the rewrap complete: under the earlier key on a resume, under
+		// newMaster otherwise.
+		if swapped {
 			return fmt.Errorf("%w (%w)", err, ErrRewrapSwapUnsynced)
 		}
 		return err
