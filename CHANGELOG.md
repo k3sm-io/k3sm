@@ -203,6 +203,14 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
   holding its share there. The limits and the warnings are per listening address: each warning names
   that address and logs at most once a minute for it, with a count of the lines it dropped in
   between. See [Pulling](docs/user/registry.md#pulling).
+- The registry relay applies a rate floor of 8 KiB/s, averaged over 5 minutes, while every
+  connection on one of its listening addresses is held and a further connection waits. At most
+  once every 5 minutes on that address it cuts the slowest pull below the floor, so a client that
+  reads a little at a time can no longer hold a slot for good while others wait. Only time spent
+  waiting on the client counts; a connection younger than 5 minutes or a response under 2.4 MB is
+  never cut, and nothing is cut while a slot is free. The cut is logged as a warning. The floor
+  and its window are fixed values that a later release may change. See
+  [Pulling](docs/user/registry.md#pulling).
 
 ### Changed
 

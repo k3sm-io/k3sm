@@ -111,6 +111,10 @@ type relayLimits struct {
 	maxConnAge                  time.Duration
 	writeProgress, readProgress time.Duration
 	tableMax                    int
+	// rateFloor, in bytes a second, and rateWindow are the rate floor
+	// (relayrate.go); zero in either disables it.
+	rateFloor  float64
+	rateWindow time.Duration
 }
 
 // defaultRelayLimits are the limits every shipped relay applies.
@@ -128,6 +132,8 @@ var defaultRelayLimits = relayLimits{
 	writeProgress:      relayWriteProgress,
 	readProgress:       relayReadProgress,
 	tableMax:           relaySourceTableMax,
+	rateFloor:          relayRateFloor,
+	rateWindow:         relayRateWindow,
 }
 
 // sourceOf returns the remote IP address of a, the key every per-source limit
@@ -160,6 +166,9 @@ type relayConn struct {
 	opened   time.Time
 	requests int
 	cut      *cutWatch
+	// meter is the connection's rate meter, set with cut; nil when the rate
+	// floor is off.
+	meter *rateMeter
 	// unbounded is set once the connection is logged as served without a
 	// progress bound, so the line is written once per connection. The server
 	// handles one request at a time on a connection, so no lock guards it.
@@ -294,24 +303,27 @@ func newSourceLimiter(next http.Handler, lim relayLimits, now func() time.Time) 
 	return &sourceLimiter{next: next, lim: lim, now: now, sources: map[string]*sourceBuckets{}}
 }
 
-// cutWatchOf returns the cut watch of a connection the relay's listener
-// accepted, under its TLS layer if any, or nil.
-func cutWatchOf(c net.Conn) *cutWatch {
+// limitConnOf returns the connection the relay's listener accepted under c's
+// TLS layer, if any, or nil.
+func limitConnOf(c net.Conn) *limitConn {
 	if t, ok := c.(interface{ NetConn() net.Conn }); ok {
 		c = t.NetConn()
 	}
-	if lc, ok := c.(*limitConn); ok {
-		return lc.cut
-	}
-	return nil
+	lc, _ := c.(*limitConn)
+	return lc
 }
 
 // ConnState is the http.Server's ConnState. A connection going idle has
 // written its response in full, so the relay's write deadline no longer stands
-// for a response in progress and is dropped from the cut watch.
+// for a response in progress and is dropped from the cut watch, and the rate
+// floor stops measuring it until its next response.
 func (s *sourceLimiter) ConnState(c net.Conn, st http.ConnState) {
-	if st == http.StateIdle {
-		cutWatchOf(c).armWrite("", time.Time{})
+	if st != http.StateIdle {
+		return
+	}
+	if lc := limitConnOf(c); lc != nil {
+		lc.cut.armWrite("", time.Time{})
+		lc.meter.end()
 	}
 }
 
@@ -327,6 +339,7 @@ func (s *sourceLimiter) ConnContext(ctx context.Context, c net.Conn) context.Con
 	if lc, ok := under.(*limitConn); ok {
 		rc.cut = &cutWatch{log: s.log, remote: c.RemoteAddr().String(), writeProgress: s.lim.writeProgress, readProgress: s.lim.readProgress}
 		lc.cut = rc.cut
+		rc.meter = lc.meter
 	}
 	return context.WithValue(ctx, relayConnKey{}, rc)
 }
@@ -386,6 +399,9 @@ func (s *sourceLimiter) bindProgress(w http.ResponseWriter, r *http.Request) (ht
 	conn, _ := r.Context().Value(relayConnKey{}).(*relayConn)
 	if conn != nil {
 		cut = conn.cut
+		// A response is in flight from here until the connection goes idle,
+		// and the rate floor measures it for that long.
+		conn.meter.begin()
 	}
 	rc := http.NewResponseController(w)
 	cut.armWrite("", time.Time{})
