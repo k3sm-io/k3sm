@@ -510,7 +510,8 @@ func (l *floorLock) unlock() {
 	_ = l.dir.Close()
 }
 
-// syncFloor is how every root-run verb begins: it raises each entry's floor
+// syncFloor is how Put, Rotate and RaiseFloor begin, and Delete when the
+// master opens (with none, Delete raises nothing): it raises each entry's floor
 // to the sequence of its authenticated current pointer and writes the floor
 // file if that changed anything. That closes the window a crash between a
 // pointer flip and its floor write leaves (the floor one behind), and it is

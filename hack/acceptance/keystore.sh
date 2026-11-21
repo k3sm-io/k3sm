@@ -76,7 +76,8 @@ check G5 "a copied-back current is refused against the floor, with its own messa
 	TestFloorRefusesCopiedBackPointer TestFloorCheck
 check G6 "the floor and the data root are root-owned and not shared, judged on the descriptor; the floor is the system scope's, parsed strictly; a caller that cannot write it changes nothing" \
 	TestFloorTrust TestFloorScope FuzzParseFloor TestFloorNotWritableChangesNothing
-check G7 "the floor is raised by every mutating verb and the start of every root verb; one behind is accepted; each write re-reads it under the data-root lock, with a bounded wait" \
+partial G7 "the floor is raised by Put, Rotate, RaiseFloor and Delete when the master opens; one behind is accepted; each write re-reads it under the data-root lock, with a bounded wait (library)" \
+	"list/show call RaiseFloor (PR 4: k3sm keys)" \
 	TestFloorRaised TestFloorWriteRereads TestFloorLockBoundedWait
 check G8 "Rotate flips the pointer last; a crash before the flip leaves the old version current" \
 	TestRotateCrashAtEveryStep TestRotate

@@ -338,8 +338,13 @@ left to a later change.
 
 A crash after the pointer flip but before the floor write leaves the floor one behind the
 pointer, which the rule above accepts (pointer at or above floor). So that the lag does not
-become a window, **every root-run verb begins by raising each entry's floor to its
-authenticated pointer's sequence**, under the lock. A floor entry for a name with no
+become a window, **Put, Rotate and `RaiseFloor` begin by raising each entry's floor to its
+authenticated pointer's sequence**, under the lock, and so does Delete when the master
+opens. Delete must work without the master, and with none it raises nothing: it changes
+only its own entry's floor. The read verbs (`k3sm keys list` and `show`) take no lock that
+writes, so they raise the floor by calling `RaiseFloor` at their start; until the CLI that
+does so lands, a floor that lags its pointer is raised by the next write verb or
+`RaiseFloor`, and readers meanwhile accept the lag. A floor entry for a name with no
 directory (a crash during Delete) is harmless and is overwritten by a later Put.
 
 **The residual against a process that can read the master.** The pointer's authentication
@@ -816,7 +821,7 @@ last pull request lands and no row is pending.
 | G4 | Delete then Put of the same name does not reopen the old `v1` | unit: replay the old file onto the new entry, expect `ErrCorrupt` |
 | G5 | A previously valid `current` copied back over the current one is refused, with a message that names the floor and does not tell the operator to restore from backup; a floor file with no entry for the name, or no floor file, accepts an authenticating pointer | unit: Rotate, restore the earlier `current`, expect `ErrCorrupt` whose text names the floor and omits "restore it from backup"; one case each for the missing entry and the missing file |
 | G6 | The floor is root-owned and checked on the opened descriptor; a floor that is group- or other-writable, a symlink, or not root-owned is refused. The floor file names the `system` scope and is parsed strictly, and a verb that cannot write it changes nothing | unit with a fake FS for each case; a missing, other or unknown-field scope; a fuzz target over the parser with committed seeds; a read-only data root on a first Put |
-| G7 | The floor is raised by every mutating verb and by the start of every root verb, and a floor one behind the pointer is accepted. Each floor write re-reads the floor under the data-root lock and applies only its own change, and a held data-root lock times out within the bound | unit: crash after the flip, before the floor write; a floor moved on during a Rotate or a Delete keeps its newer entries; a held data-root lock on a real `flock` |
+| G7 | The floor is raised by every mutating verb (Delete only when the master opens) and by the start of every root verb (`list` and `show` through `RaiseFloor`), and a floor one behind the pointer is accepted. Each floor write re-reads the floor under the data-root lock and applies only its own change, and a held data-root lock times out within the bound | unit: crash after the flip, before the floor write; a floor moved on during a Rotate or a Delete keeps its newer entries; a held data-root lock on a real `flock` |
 | G8 | Rotate flips the pointer last; a crash at each of its steps leaves the old version current | unit: fault injection between each step |
 | G9 | A Rotate retry discards an orphaned next version and seals the value it was given | unit: orphan with value A, retry with value B, expect B |
 | G10 | The master is minted only by the first `put`, never over existing entries, and never by an operator-supplied value | unit: absent master with entries is `ErrMasterMissing`; no verb accepts a key |
