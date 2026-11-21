@@ -1318,6 +1318,16 @@ service user can only add to.
   flag check would refuse the file anyway (U21), and rerunning the verb finishes the steps.
   The verb removes the marker last (U22). Rebuild is
   the user-scope twin of Phase A's "remove `keystore-floor.json`, then run any root verb".
+- **The server reopens after maintenance.** The server's append descriptors still name the
+  old files after a maintenance verb renames them, and its per-uid counts describe the old
+  contents. So when the marker is gone, before the listener restarts and before any server
+  append, the server takes the store lock exclusively, reopens its audit and floor append
+  descriptors through the data-root descriptor (`O_APPEND|O_NOFOLLOW`, each judged by `fstat`
+  as the canonical, flagged file), recounts every uid's share from the new files, and only then
+  releases the lock. An append that waited for the lock, the reconciler's included, lands in
+  the new file and is charged against the recounted share: after `audit --rotate` every uid's
+  audit share is 0, and after `floor --rebuild` every uid's floor share is 0, since rebuild's
+  lines are root's and charged to no uid (U22).
 - **Size caps.** Each log has a soft cap (`keystore.logSoftCap`, default 64 MiB) and a hard cap
   (`keystore.logHardCap`, default 256 MiB). Past the soft cap `doctor` shows the size and the
   rotate hint; past the hard cap the server refuses every mutating user operation with
@@ -1478,9 +1488,13 @@ in their repos and `apis` cannot import `x/sys`, and the file cites both. That
 `LOCAL_PEERCRED` reports a non-root login uid on the server side, for a socket in a service-user
 0755 directory under the root-owned data root, is measured (K0 amendment 2026-11-21).
 
-**Eligible peers** are uids of 501 and above that are not the service uid. Refused before any
+**Eligible peers** are uids from 501 to 2147483647 that are not the service uid. Refused before any
 frame is read: uid 0 (root uses the direct-file verbs, as in Phase A), the service uid (every
-native Pod shares it) and every uid below 501 (system accounts) (U26, E6).
+native Pod shares it), every uid below 501 (system accounts) (U26, E6), and every uid at
+2^31 (2147483648) or above, `nobody` (4294967294) among them, which is no login user and
+which a signed 32-bit reading of the uid would turn negative (U82). The store mints no scope
+for a uid outside that range either. The entry grammar still parses a uid as a uint32, so
+such a name is well formed and simply has no scope.
 
 **The client's checks are advisory.** The CLI opens the socket through an `os.Root` on the
 data root, checks by realpath that `keystore-run/` is the service user's under the root-owned
@@ -1528,7 +1542,7 @@ socket before both checks pass (U69, E24).
   process running `/Library/k3sm/k3sm` would carry the installed cdhash and the server's uid.
   What keeps such a process from standing in for the server is U16's `network-bind` deny on
   `keystore-run/`: a Pod cannot bind `keys.sock`, whatever binary it runs. That deny is the
-  pin's load-bearing dependency, and E24 checks it with the real installed binary exec'd
+  dependency the pin rests on, and E24 checks it with the real installed binary exec'd
   inside a Pod.
 - This pins the server for the client; it does not pin the client for the server, which stays
   unpinned by ruling (residual 1). That `LOCAL_PEERTOKEN` is readable on the client side and
@@ -1579,6 +1593,8 @@ surface, and the app consumes only those.
   exits 1.
 
 **Bounds.** 16 concurrent connections, at most 2 per uid among them; 10 seconds per request;
+an idle timeout of 30 seconds after `HELLO` and between requests, so a connection that sends no
+next request frame within 30 seconds is closed and frees its slot;
 5 mutating operations a second per uid; `list` and `deliveries` rate-limited per uid like
 mutations, at 5 a second; `read-for-exec` at most 30 a minute per uid, each audited as
 `exec-read` (U28, U34, U51). Reads are limited too because each one writes an audit line; that
@@ -1930,7 +1946,8 @@ list is closed:
 `.user/<uid>/` or `scope.key`, or, in a scope whose `scope.key` opened, a missing `entries/`
 directory or `deliveries` record), `ErrCorrupt` (the floor refusal
 included, which wraps it), `ErrMasterMissing`, `ErrScopeUnsupported`, `ErrBusy`, `ErrLogFull`,
-`ErrScopeOwnerUnknown` (the GeneratedUID lookup past its deadline), a
+`ErrScopeOwnerUnknown` (the GeneratedUID lookup past its deadline), a missing or unflagged
+user-scope floor log (for a write, "The reconciler checks the floor too"), a
 cancelled or expired ctx, the store's refusal to read while an audit append fails (U32), a
 delivery record whose version it does not know, a SubjectAccessReview call that fails or an
 answer that is not a definitive denial, a denial seen on one sweep only, any other API server
@@ -1941,6 +1958,13 @@ old owner's credential must not stay delivered in pods after the account is gone
 person holds the uid, so it deletes beside `ErrNotFound`. `ErrScopeOwnerUnknown` is a lookup
 failure and stays `Indeterminate`. A UID absent from a readable record is `NotRecorded` and gets no Secret written,
 but it is not on the list, so it deletes nothing.
+
+**The reconciler checks the floor too.** Before any `deliver-write` it checks the user-scope
+floor log through the store's flag check, the one the listener uses (U21). A missing or
+unflagged `keystore-user-floor.log` is `Indeterminate` for writes: without the floor a
+copied-back `current` would read as current, so no `deliver-write` runs until `floor
+--rebuild` leaves a flagged log, and, being `Indeterminate`, it deletes nothing either; the
+Secrets keep their last versions (U83).
 
 **Absence is told apart from an unreadable store only by `ErrNotFound`.** The store answers
 `ErrNotFound` only after it opened the scope and its `entries/` directory and found no entry
@@ -2372,16 +2396,17 @@ under "Rig legs". The gate runs each row's named tests in the repo the row names
 `runtimed/…`, `apis/…`, package paths relative to the module), and fails a row whose named
 test is absent or skipped. Each change runs the rows it delivers in its own gate mode, and the
 rig rows as an explicit, recorded step. Every row below is pending until the change named in
-its last column lands; a pending row fails its mode. G1 holds for the Phase A changes; the user
+its last column lands; a pending row fails its mode. A row whose change has landed says
+`checked`, or `partial` with the part still pending. G1 holds for the Phase A changes; the user
 scope's only module changes are k3sm's requirements on its own `apis` and `runtimed` modules,
 each stated in the change that makes it. U15 is held for a K0 amendment and U39 is unused.
 
 | # | Requirement | Validated by | Status |
 |---|---|---|---|
 | U1 | `rotate --from-version N` writes version N's bytes as a new version server side; no value leaves the store | `k3sm/cmd/k3sm::TestKeysRotateFromVersionNoValueOut` | pending: the `k3sm keys` verbs |
-| U2 | AAD scope: a record moved between scopes, or between two users, fails to open | `k3sm/pkg/keystore::TestRecordMovedAcrossScopesFailsOpen` | pending: the core store's scope binding |
-| U3 | KDF labels take the scope; `checkScope` accepts only `system` and `user/<decimal uid>`; kinds 0xFE and 0xFD are reserved | `k3sm/pkg/keystore::TestScopedLabelsAndReservedKinds`, `TestCheckScopeGrammar` | pending: the core store's scope binding |
-| U4 | the first-Put mint refuses with `.user` present and the master missing | `k3sm/pkg/keystore::TestFirstPutRefusesMintOverUserDir` | pending: the core store's scope binding |
+| U2 | AAD scope: a record moved between scopes fails to open, and two users derive different keys; a record opened as another user is refused | `k3sm/pkg/keystore::TestScopeBindsRecords`, `TestDerivedKeysDifferByScope` | partial: the first two checked (the core store's scope binding); pending: a record opened as another user is refused (the user-scope store) |
+| U3 | KDF labels take the scope; `checkScope` accepts only `system` and `user/<decimal uid>`; kinds 0xFE and 0xFD are reserved | `k3sm/pkg/keystore::TestDerivedKeysDifferByScope`, `TestCheckScope`, `TestParseRecordRefusesMalformed` | checked: the core store's scope binding |
+| U4 | the first-Put mint refuses with `.user` present and the master missing | `k3sm/pkg/keystore::TestMintCountsReservedUserName` | checked: the core store's scope binding |
 | U5 | Rewrap refuses with `ErrScopeUnsupported` while `.user` exists (replaced by U12 when scope keys are re-wrapped) | `k3sm/pkg/keystore::TestRewrapRefusesWhileUserScopesExist` | pending: Rewrap |
 | U6 | `scope.key` is sealed under `W`, bound to the GeneratedUID; a mismatch is `ErrScopeOwnerChanged` | `k3sm/pkg/keystore::TestScopeKeyGeneratedUIDMismatch` | pending: the user-scope store |
 | U7 | the GeneratedUID lookup past its deadline or in error fails closed; `mbr_uid_to_uuid` is in the symbol canary (seams: GeneratedUID lookup, clock) | `k3sm/pkg/keystore::TestGeneratedUIDLookupDeadlineFailsClosed`; `k3sm/internal/hostacl::TestMbrUIDToUUIDSymbolCanary` (integration) | pending: the user-scope store |
@@ -2399,13 +2424,13 @@ each stated in the change that makes it. U15 is held for a K0 amendment and U39 
 | U19 | the CRD pattern, its `maxLength` of 269, the uid range rule and the 253-byte name-length rule pass the shared entry-grammar vectors, `user/1/` and `system/` each with a 254-byte name refused | `apis/config/crd::TestEntryGrammarVectors` | pending: the `KeyDelivery` API |
 | U20 | a user-scope `current` copied back is refused against the floor log, with Phase A's floor message | `k3sm/pkg/keystore::TestUserFloorRefusesCopiedBackCurrent`; rig leg E9 | pending: the append-only files |
 | U21 | install creates both logs service-user-owned 0600 and flagged; the listener refuses to start when a flag is clear (seams: chflags flag source, file-attribute writer, euid source) | `k3sm/pkg/install::TestKeystoreAppendOnlyFilesAtInstall`, `k3sm/pkg/keystore::TestFlagCheckRefusesUnflagged`; rig leg E1 | pending: the append-only files |
-| U22 | `floor --rebuild` and `audit --rotate` write the marker `keystore-maintenance` and stage `keystore-user-floor.log.new` and `keystore-audit.log.new` in the root-owned data root, stop the listener, hold the lock, write the new file before touching the old, clear the old file's flag before any rename, and flag the new file on its held descriptor after the rename; a crash at each step leaves the marker, so the listener stays down until a rerun leaves a flagged file; every audit and floor append, the reconciler's and the pre-frame lines included, takes the store lock that maintenance holds exclusively, so a reconciler append during an `audit --rotate` waits and lands in the new log (seams: file-attribute writer, euid source) | `k3sm/cmd/k3sm::TestKeysFloorRebuildCrashOrder`, `TestKeysAuditRotateCrashOrder`, `k3sm/pkg/keystore/reconcile::TestReconcilerAppendWaitsForAuditRotate`; rig leg E17 | pending: the append-only files |
+| U22 | `floor --rebuild` and `audit --rotate` write the marker `keystore-maintenance` and stage `keystore-user-floor.log.new` and `keystore-audit.log.new` in the root-owned data root, stop the listener, hold the lock, write the new file before touching the old, clear the old file's flag before any rename, and flag the new file on its held descriptor after the rename; a crash at each step leaves the marker, so the listener stays down until a rerun leaves a flagged file; every audit and floor append, the reconciler's and the pre-frame lines included, takes the store lock that maintenance holds exclusively, so a reconciler append during an `audit --rotate` waits and lands in the new log; after maintenance, under the exclusive lock, the server reopens its audit and floor append descriptors and recounts the per-uid shares before releasing it, and the counts reset (seams: file-attribute writer, euid source) | `k3sm/cmd/k3sm::TestKeysFloorRebuildCrashOrder`, `TestKeysAuditRotateCrashOrder`, `k3sm/pkg/keystore/reconcile::TestReconcilerAppendWaitsForAuditRotate`, `k3sm/pkg/keystore/socket::TestMaintenanceReopensLogsAndResetsShares`; rig leg E17 | pending: the append-only files |
 | U23 | every audited operation writes one `v:1` line; no line carries a value or its length; readers ignore unknown fields | `k3sm/pkg/keystore::TestAuditLineNeverCarriesValue`, `TestAuditReaderIgnoresUnknownFields` | pending: the append-only files |
 | U24 | soft cap shows in `doctor`; past the hard cap every mutating user op is `ErrLogFull`, except the revocation class, which draws on the reserve; a line over 1 KiB is refused | `k3sm/pkg/keystore::TestLogHardCapRefusesMutations`, `TestAuditLineBoundedAtOneKiB` | pending: the append-only files |
 | U25 | backup and restore round trip: a restored tree with cleared flags is refused until `floor --rebuild`, then opens; the rebuild writes a line for every entry directory holding a `generation` file, an authenticated pointer's sequence or, with none, sequence 0, so a damaged entry stays `ErrCorrupt` and never becomes `ErrNotFound` | `k3sm/pkg/keystore::TestBackupRestoreRoundTripRebuild`, `TestRebuildKeepsDamagedEntryCorrupt`; rig leg E17 | pending: the append-only files |
 | U26 | peers uid 0, the service uid and uid < 501 are refused before any frame is read (seam: peer-credential source) | `k3sm/pkg/keystore/socket::TestPeerEligibility` | pending: the socket listener |
 | U27 | framing: an oversize frame, unknown type, a sub-length past the frame length or missing `HELLO` closes; `HELLO` past the 10-second bound closes; an unknown header field is ignored; `HELLO` picks the highest common version and the reply carries it and the server's frame cap; no common version sends `unsupported-version` then closes; an unknown `op` answers `unknown-op` and keeps the connection; the frame cap covers the largest value, header and framing | `k3sm/pkg/keystore/socket::FuzzFrameReader` (committed seeds), `TestFramingBounds`, `TestSubLengthsWithinFrame`, `TestHelloReadDeadline`, `TestUnknownHeaderFieldsIgnored`, `TestHelloVersionRange`, `TestHelloReplyCarriesVersionAndMaxFrame`, `TestHelloNoOverlapSendsUnsupportedVersion`, `TestUnknownOpKeepsConnection`, `TestFrameCapCoversMaxValue` | pending: the socket listener |
-| U28 | 16 connections in all, 2 per uid; a request past 10 s is cut | `k3sm/pkg/keystore/socket::TestConnectionCapsPerUID`, `TestRequestTimeout` (`testing/synctest`) | pending: the socket listener |
+| U28 | 16 connections in all, 2 per uid; a request past 10 s is cut; a connection idle 30 s after `HELLO` or between requests is closed | `k3sm/pkg/keystore/socket::TestConnectionCapsPerUID`, `TestRequestTimeout`, `TestIdleTimeoutAfterHelloAndBetweenRequests` (`testing/synctest`) | pending: the socket listener |
 | U29 | a listener panic is recovered and restarted; the apiserver is untouched; a stale socket is unlinked only if a service-user socket; a lock wait past 2 s fails the request (seam: clock) | `k3sm/pkg/keystore/socket::TestListenerRecoversPanic`, `TestStaleSocketUnlinkChecksOwner`, `TestBoundedLockWait` | pending: the socket listener |
 | U30 | with two servers registered, the listener does not start and `doctor` says why | `k3sm/pkg/keystore/socket::TestUserScopeRefusedWithTwoServers` | pending: the socket listener |
 | U31 | a missing or unflagged file logs the install Warn at start and on each retry; `doctor` reports user scope off (seams: chflags flag source, clock) | `k3sm/pkg/keystore/socket::TestListenerWarnsOnEveryRetry`, `k3sm/cmd/k3sm::TestDoctorKeystoreUserScopeRow` | pending: the socket listener |
@@ -2459,6 +2484,8 @@ each stated in the change that makes it. U15 is held for a K0 amendment and U39 
 | U79 | the rotation write, the `deliver-write` that follows a `rotate`, is in the revocation class: past the owner's share it draws on the reserve, once per live delivery per log, and reaches the Secret; a further rotation write for that delivery past the share is `Indeterminate`; the reconciler's part of the reserve, 64 deliveries × 4 lines × 1 KiB per uid for 16 uids, is 4 MiB | `k3sm/pkg/keystore/reconcile::TestRotationWriteUsesReserve` | pending: the KeyDelivery reconciler (lifecycle) |
 | U80 | root walks service-user trees by descriptor: run as root (a root-run row, `--root`), `rm-scope` and `floor --rebuild` walk `.user/<uid>/` with `openat` and `unlinkat` and `O_NOFOLLOW`, refuse a planted symlink, FIFO or other non-regular file and a directory where the layout has none, read with a bounded size, re-check `SameFile` after each open and never follow a swapped directory | `k3sm/cmd/k3sm::TestRootWalksRefusePlantedNames` (integration, root-run) | pending: the append-only files |
 | U81 | a KeyDelivery never touches a Phase A Secret: the user-scope label value is the constant `keydelivery` and the entry is in the annotation `k3sm.io/keystore-entry`; a target that is present and not claimed by a KeyDelivery, unlabelled or delivered by Phase A, is `SecretExists` and is never overwritten or deleted; the Phase A reconciler leaves alone a Secret carrying `k3sm.io/keystore-entry` | `k3sm/pkg/keystore/reconcile::TestKeyDeliveryNeverTouchesPhaseASecret` | pending: the KeyDelivery reconciler (authority) |
+| U82 | eligible peer uids are 501 to 2147483647: `nobody` (4294967294), 2147483648 and every uid at 2^31 or above are refused before any frame, with a `refused` line, as uid 500 is; 501 and 2147483647 are admitted; no scope is minted outside the range (seam: peer-credential source) | `k3sm/pkg/keystore/socket::TestPeerUIDRangeRefusesNobodyAndHighUIDs` | pending: the socket listener |
+| U83 | the reconciler checks the user-scope floor log: a missing or unflagged floor log is `Indeterminate` for writes, so no `deliver-write` runs until `floor --rebuild`, and nothing is deleted (the store's flag check, faked at the reconciler's store interface) | `k3sm/pkg/keystore/reconcile::TestReconcilerHoldsWritesWithoutFloor` | pending: the KeyDelivery reconciler (lifecycle) |
 
 ### Rig legs
 

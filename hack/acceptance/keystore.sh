@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # The keystore's acceptance gate: docs/design/keystore.md § "Acceptance gate",
-# rows G1 to G22, the user-scope rows U1 to U81 (U15 and U39 are unused) and
+# rows G1 to G22, the user-scope rows U1 to U83 (U15 and U39 are unused) and
 # the rig legs E1 to E25. Every row is listed, on exactly one line. A row runs
 # the tests that deliver it and passes only if each named test ran and passed
 # in its own package; a row whose change has not landed yet prints PENDING,
@@ -37,13 +37,13 @@
 #   --scope-store   the user-scope store: U12 to U14, U63.
 #   --files         the append-only files: U20 to U25, U50, U52, U60, U61, U68,
 #                   U80, and in the helper variant only U70, U71.
-#   --socket        the socket listener: U26 to U31, U46, U48, U54.
+#   --socket        the socket listener: U26 to U31, U46, U48, U54, U82.
 #   --socket-ops    the socket operations: U32 to U35, U45, U51, U67.
 #   --exec          the non-root CLI and exec: U36 to U38, U69.
 #   --kd-author     KeyDelivery authoring: U40, U41, U74, U76.
 #   --kd-reconcile  the KeyDelivery reconciler: U42, U43, U59, U73, U78, U81.
 #   --kd-lifecycle  the KeyDelivery lifecycle: U44, U53, U55, U56, U62, U65,
-#                   U72, U75, U77, U79.
+#                   U72, U75, U77, U79, U83.
 #   --grammar       the entry grammar in apis: U57.
 #   --docs          the user docs: no row yet, so it exits 3.
 # A unit mode runs only its rows and only their tests, with the same exit
@@ -68,7 +68,9 @@
 # fails a row that is checked. Row L1 holds the security-relevant claims in
 # CLAIMS below against the design: each phrase must appear in that row's line
 # of the design's gate table and in this script's description of the row, and
-# a phrase missing from either fails L1. Exit status: 0 every row present and
+# a phrase missing from either fails L1. L1 also holds the test names: for each
+# U row, the Test and Fuzz names in the design table's "Validated by" column
+# must be exactly the names this script's row runs. Exit status: 0 every row present and
 # every named test exists; 3 every row present, some named tests do not exist yet; 1 a row
 # is missing or a checked row's test is missing.
 #
@@ -105,7 +107,7 @@ EXPECTED_ROWS="$EXPECTED_ROWS U49 U50 U51 U52 U53 U54 U55 U56 U57"
 EXPECTED_ROWS="$EXPECTED_ROWS U58 U59 U60 U61 U62 U63"
 EXPECTED_ROWS="$EXPECTED_ROWS U64 U65 U66 U67 U68 U69 U70 U71"
 EXPECTED_ROWS="$EXPECTED_ROWS U72 U73 U74 U75 U76"
-EXPECTED_ROWS="$EXPECTED_ROWS U77 U78 U79 U80 U81"
+EXPECTED_ROWS="$EXPECTED_ROWS U77 U78 U79 U80 U81 U82 U83"
 # >>> ADD NEW U ROWS (U64 upward) HERE <<<
 EXPECTED_ROWS="$EXPECTED_ROWS E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 E13 E14 E15 E16 E17 E18 E19 E20"
 EXPECTED_ROWS="$EXPECTED_ROWS E21 E22 E23 E24 E25"
@@ -137,12 +139,12 @@ mode_rows() {
 	scope) echo "U6 U7 U8 U9 U10 U11 U47 U58 U64 U66" ;;
 	scope-store) echo "U12 U13 U14 U63" ;;
 	files) echo "U20 U21 U22 U23 U24 U25 U50 U52 U60 U61 U68 U70 U71 U80" ;;
-	socket) echo "U26 U27 U28 U29 U30 U31 U46 U48 U54" ;;
+	socket) echo "U26 U27 U28 U29 U30 U31 U46 U48 U54 U82" ;;
 	socket-ops) echo "U32 U33 U34 U35 U45 U51 U67" ;;
 	exec) echo "U36 U37 U38 U69" ;;
 	kd-author) echo "U40 U41 U74 U76" ;;
 	kd-reconcile) echo "U42 U43 U59 U73 U78 U81" ;;
-	kd-lifecycle) echo "U44 U53 U55 U56 U62 U65 U72 U75 U77 U79" ;;
+	kd-lifecycle) echo "U44 U53 U55 U56 U62 U65 U72 U75 U77 U79 U83" ;;
 	grammar) echo "U57" ;;
 	*) echo "" ;;
 	esac
@@ -414,8 +416,9 @@ pend U20 "a user-scope current copied back is refused against the floor log, wit
 	TestUserFloorRefusesCopiedBackCurrent
 pend U21 "install creates both logs service-user-owned 0600 and flagged; the listener refuses to start when a flag is clear; rig leg E1 (append-only files)" \
 	k3sm/pkg/install::TestKeystoreAppendOnlyFilesAtInstall k3sm/pkg/keystore::TestFlagCheckRefusesUnflagged
-pend U22 "floor --rebuild and audit --rotate mark and stage under keystore- names in the root-owned data root, stop the listener, hold the lock, write the new file before touching the old, clear the old flag before any rename, flag the new file after the rename; a crash at each step leaves the marker, and a rerun leaves a flagged file; every audit and floor append takes the store lock, so a reconciler append during audit --rotate waits; rig leg E17 (append-only files)" \
-	k3sm/cmd/k3sm::TestKeysFloorRebuildCrashOrder TestKeysAuditRotateCrashOrder k3sm/pkg/keystore/reconcile::TestReconcilerAppendWaitsForAuditRotate
+pend U22 "floor --rebuild and audit --rotate mark and stage under keystore- names in the root-owned data root, stop the listener, hold the lock, write the new file before touching the old, clear the old flag before any rename, flag the new file after the rename; a crash at each step leaves the marker, and a rerun leaves a flagged file; every audit and floor append takes the store lock, so a reconciler append during audit --rotate waits; after maintenance, under the exclusive lock, the server reopens its audit and floor append descriptors and recounts the per-uid shares before releasing it, and the counts reset; rig leg E17 (append-only files)" \
+	k3sm/cmd/k3sm::TestKeysFloorRebuildCrashOrder TestKeysAuditRotateCrashOrder k3sm/pkg/keystore/reconcile::TestReconcilerAppendWaitsForAuditRotate \
+	k3sm/pkg/keystore/socket::TestMaintenanceReopensLogsAndResetsShares
 pend U23 "every audited operation writes one v:1 line; no line carries a value or its length; readers ignore unknown fields (append-only files)" \
 	TestAuditLineNeverCarriesValue TestAuditReaderIgnoresUnknownFields
 pend U24 "soft cap shows in doctor; past the hard cap every mutating user op is ErrLogFull, except the revocation class, which draws on the reserve; a line over 1 KiB is refused (append-only files)" \
@@ -426,8 +429,8 @@ pend U26 "peers uid 0, the service uid and uid < 501 are refused before any fram
 	k3sm/pkg/keystore/socket::TestPeerEligibility
 pend U27 "framing: an oversize frame, unknown type or missing HELLO closes; an unknown header field is ignored; HELLO picks the highest common version (socket listener)" \
 	k3sm/pkg/keystore/socket::FuzzFrameReader TestFramingBounds TestSubLengthsWithinFrame TestHelloReadDeadline TestUnknownHeaderFieldsIgnored TestHelloVersionRange TestHelloReplyCarriesVersionAndMaxFrame TestHelloNoOverlapSendsUnsupportedVersion TestUnknownOpKeepsConnection TestFrameCapCoversMaxValue
-pend U28 "16 connections in all, 2 per uid; a request past 10 s is cut (socket listener)" \
-	k3sm/pkg/keystore/socket::TestConnectionCapsPerUID TestRequestTimeout
+pend U28 "16 connections in all, 2 per uid; a request past 10 s is cut; a connection idle 30 s after HELLO or between requests is closed (socket listener)" \
+	k3sm/pkg/keystore/socket::TestConnectionCapsPerUID TestRequestTimeout TestIdleTimeoutAfterHelloAndBetweenRequests
 pend U29 "a listener panic is recovered and restarted; the apiserver is untouched; a stale socket is unlinked only if a service-user socket; a lock wait past 2 s fails the request (socket listener)" \
 	k3sm/pkg/keystore/socket::TestListenerRecoversPanic TestStaleSocketUnlinkChecksOwner TestBoundedLockWait
 pend U30 "with two servers registered, the listener does not start and doctor says why (socket listener)" \
@@ -535,6 +538,10 @@ rootpend U80 "root-run: rm-scope and floor --rebuild walk .user/<uid>/ by descri
 	k3sm/cmd/k3sm::TestRootWalksRefusePlantedNames
 pend U81 "a KeyDelivery never touches a Phase A Secret: the label value is the constant keydelivery and the entry is in the annotation k3sm.io/keystore-entry; a target present and not claimed by a KeyDelivery is SecretExists, never overwritten or deleted (KeyDelivery reconciler)" \
 	k3sm/pkg/keystore/reconcile::TestKeyDeliveryNeverTouchesPhaseASecret
+pend U82 "eligible peer uids are 501 to 2147483647: nobody (4294967294) and every uid at 2^31 or above are refused before any frame, with a refused line; 501 and 2147483647 are admitted; no scope is minted outside the range (socket listener)" \
+	k3sm/pkg/keystore/socket::TestPeerUIDRangeRefusesNobodyAndHighUIDs
+pend U83 "the reconciler checks the user-scope floor log: a missing or unflagged floor log is Indeterminate for writes, so no deliver-write runs until floor --rebuild, and nothing is deleted (KeyDelivery lifecycle)" \
+	k3sm/pkg/keystore/reconcile::TestReconcilerHoldsWritesWithoutFloor
 # >>> ADD NEW U ROWS (U64 upward) HERE, and add each to EXPECTED_ROWS and to mode_rows <<<
 
 leg E1 "files" "preconditions: secrets encryption on; one server; keystore-run/ and both logs present, service-user 0600, SF_APPEND set; the doctor user-scope row on; keystore.sh --check exits 0 on the build" "the append-only files"
@@ -664,6 +671,9 @@ U69|cdhash
 U72|orphan-cascade
 U76|k3sm:local-users
 E3|built-in edit ClusterRole
+U82|2147483647
+U82|nobody (4294967294)
+U83|Indeterminate for writes
 E10|vm Pod
 E10|network-bind
 E10|EPERM
@@ -759,10 +769,29 @@ if [ "$mode" = listed ]; then
 		case "$drow" in *"$phrase"*) ;; *) drift="$drift; $cid design lacks \"$phrase\"" ;; esac
 		case "$sdesc" in *"$phrase"*) ;; *) drift="$drift; $cid script lacks \"$phrase\"" ;; esac
 	done <<<"$CLAIMS"
+	# The test names: the design's "Validated by" column (its third; an escaped
+	# \| inside a cell is not a column break) against the names the row runs.
+	nnamed=0
+	for cid in $EXPECTED_ROWS; do
+		case "$cid" in U*) ;; *) continue ;; esac
+		k="$(row_index "$cid")"
+		[ -n "$k" ] || continue
+		drow="$(grep -E -- "^\| $cid \| " "$doc" | head -n 1 || true)"
+		if [ -z "$drow" ]; then
+			drift="$drift; $cid has no row in the design's table"
+			continue
+		fi
+		dnames="$(printf '%s\n' "$drow" | sed 's/\\|/ /g' | awk -F'|' '{print $4}' | grep -o -E '(Test|Fuzz)[A-Za-z0-9_]+' | sort -u | tr '\n' ' ' || true)"
+		snames="$(for spec in ${R_TESTS[$k]}; do echo "${spec#*::}"; done | sort -u | tr '\n' ' ')"
+		nnamed=$((nnamed + 1))
+		if [ "$dnames" != "$snames" ]; then
+			drift="$drift; $cid test names differ: design [${dnames% }], script [${snames% }]"
+		fi
+	done
 	if [ -n "$drift" ]; then
-		fail L1 "security claims drifted from the design's table:${drift#;}"
+		fail L1 "the design's table and this script drifted:${drift#;}"
 	else
-		row L1 LISTED "$nclaims security claims match the design's table and this script"
+		row L1 LISTED "$nclaims security claims and $nnamed rows' test names match the design's table and this script"
 	fi
 	if [ "$failed" -gt 0 ]; then echo "keystore --listed: FAIL ($failed) (not proof)"; exit 1; fi
 	if [ "$pend_missing" -gt 0 ]; then
