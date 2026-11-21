@@ -279,6 +279,31 @@ func TestMasterMint(t *testing.T) {
 		}
 	})
 
+	t.Run("never over existing entries when the fingerprint is missing", func(t *testing.T) {
+		s, server := newTestStore(t)
+		mustPut(t, s, "a", KindOpaque, []byte("a"))
+		before, err := os.ReadFile(master(server))
+		if err != nil {
+			t.Fatal(err)
+		}
+		fp := filepath.Join(filepath.Dir(master(server)), masterFingerprintName)
+		remove(t, fp)
+		// A sound master without its fingerprint is minted over only with
+		// keystore/ empty; with an entry it is ErrMasterUntrusted.
+		if _, err := s.Put(ctx, "b", KindOpaque, []byte("b")); !errors.Is(err, ErrMasterUntrusted) || !errors.Is(err, errFingerprintMissing) {
+			t.Fatalf("Put with entries and no fingerprint: %v, want ErrMasterUntrusted (fingerprint missing)", err)
+		}
+		if after, _ := os.ReadFile(master(server)); !bytes.Equal(after, before) {
+			t.Fatal("a master was minted over existing entries")
+		}
+		if _, err := os.Lstat(fp); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("the refused Put wrote a fingerprint: %v", err)
+		}
+		if _, err := os.Lstat(filepath.Join(server, "keystore", "b")); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("the refused Put created its entry: %v", err)
+		}
+	})
+
 	t.Run("an interrupted mint is minted again", func(t *testing.T) {
 		s, server := newTestStore(t)
 		s.step = failAt("write " + masterFingerprintName)
@@ -680,6 +705,89 @@ func TestLockBoundedWait(t *testing.T) {
 				t.Fatalf("Put waited %v of bubble time, want the context's 50ms, not the lock bound", took)
 			}
 		})
+	})
+}
+
+// TestDirectoryOwnerRefused: the store's directories must be owned by the
+// service uid. A store whose uid differs from the owner, as a chown that did
+// not take leaves (the chown seam does nothing), refuses the directory rather
+// than use it, on a read and on a first Put.
+func TestDirectoryOwnerRefused(t *testing.T) {
+	ctx := context.Background()
+	other := uint32(os.Getuid()) + 1
+	noChown := func(*os.File, int, int) error { return nil }
+
+	s, _ := newTestStore(t)
+	mustPut(t, s, "a", KindOpaque, []byte("a"))
+	foreign := New(Config{Dir: s.dir, MasterDir: s.masterDir, UID: other, GID: s.gid})
+	foreign.chown = noChown
+	want := fmt.Sprintf("owned by uid %d, want %d", os.Getuid(), other)
+	if _, _, err := foreign.Current(ctx, "a"); err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("Current: %v, want a refusal %q", err, want)
+	}
+	if _, err := foreign.List(ctx); err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("List: %v, want a refusal %q", err, want)
+	}
+
+	fresh, freshServer := newTestStore(t)
+	fresh.uid = other
+	fresh.chown = noChown
+	if _, err := fresh.Put(ctx, "a", KindOpaque, []byte("a")); err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("first Put: %v, want a refusal %q", err, want)
+	}
+	if _, err := os.Lstat(filepath.Join(freshServer, "cred")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the refused Put went on to create cred/: %v", err)
+	}
+}
+
+// TestLockExcludes is part of gate row G14: two operations that overlap
+// do not interleave. A Put is held at its v1 write, inside the exclusive
+// lock; a Current started then waits, in a synctest bubble's time, for as long
+// as the Put holds it, and reads the committed entry once the Put releases.
+func TestLockExcludes(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := t.Context()
+		s, _ := newTestStore(t)
+		mustPut(t, s, "seed", KindOpaque, []byte("seed"))
+		entered, release := make(chan struct{}), make(chan struct{})
+		s.step = func(name string) error {
+			if name == "write v1" {
+				close(entered)
+				<-release
+			}
+			return nil
+		}
+		putDone := make(chan error, 1)
+		go func() {
+			_, err := s.Put(ctx, "a", KindOpaque, []byte("a"))
+			putDone <- err
+		}()
+		<-entered
+
+		type read struct {
+			val []byte
+			err error
+		}
+		readDone := make(chan read, 1)
+		go func() {
+			_, val, err := s.Current(ctx, "a")
+			readDone <- read{val, err}
+		}()
+		time.Sleep(s.lockWait / 2) // bubble time: the reader retries throughout
+		synctest.Wait()
+		select {
+		case r := <-readDone:
+			t.Fatalf("Current ran while the Put held the lock: %q %v", r.val, r.err)
+		default:
+		}
+
+		close(release)
+		if err := <-putDone; err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+		if r := <-readDone; r.err != nil || string(r.val) != "a" {
+			t.Fatalf("Current after the Put released = %q %v, want the committed value", r.val, r.err)
+		}
 	})
 }
 
@@ -1111,16 +1219,44 @@ func TestPutCrashAtEveryStep(t *testing.T) {
 	if strings.Join(steps, ",") != want {
 		t.Fatalf("Put steps = %v, want %s", steps, want)
 	}
+	// What a reader sees after a crash at each step. The entry is never there
+	// before its pointer is, and Current opens the entry before the master,
+	// so every step reads as ErrNotFound and none as ErrMasterMissing.
+	afterCrash := map[string]error{
+		"mkdir keystore":        ErrNotFound,
+		"mkdir cred":            ErrNotFound,
+		"mkdir keystore-master": ErrNotFound,
+		"write master":          ErrNotFound,
+		"write master.sha256":   ErrNotFound,
+		"mkdir k":               ErrNotFound,
+		"write generation":      ErrNotFound,
+		"write v1":              ErrNotFound,
+		"write current":         ErrNotFound,
+	}
+	others := []error{ErrMasterMissing, ErrMasterUntrusted, ErrCorrupt, ErrExists}
 	for _, step := range steps {
 		t.Run(step, func(t *testing.T) {
+			want, ok := afterCrash[step]
+			if !ok {
+				t.Fatalf("no expected error for step %q", step)
+			}
 			s, _ := newTestStore(t)
 			s.step = failAt(step)
-			if _, err := s.Put(ctx, "k", KindOpaque, []byte("first")); err == nil {
-				t.Fatal("Put succeeded through a crash")
+			if _, err := s.Put(ctx, "k", KindOpaque, []byte("first")); err == nil || !strings.Contains(err.Error(), "injected crash at "+step) {
+				t.Fatalf("Put through a crash at %s: %v, want the injected crash", step, err)
 			}
 			s.step = func(string) error { return nil }
-			if _, _, err := s.Current(ctx, "k"); !errors.Is(err, ErrNotFound) && !errors.Is(err, ErrMasterMissing) {
-				t.Fatalf("Current after the crash: %v, want ErrNotFound", err)
+			_, _, err := s.Current(ctx, "k")
+			if !errors.Is(err, want) {
+				t.Fatalf("Current after the crash: %v, want %v", err, want)
+			}
+			for _, other := range others {
+				if errors.Is(err, other) {
+					t.Fatalf("Current after the crash: %v, which is also %v", err, other)
+				}
+			}
+			if got, err := s.List(ctx); err != nil || len(got) != 0 {
+				t.Fatalf("List after the crash = %+v %v, want no entry", got, err)
 			}
 			mustPut(t, s, "k", KindOpaque, []byte("retried"))
 			if _, val, err := s.Current(ctx, "k"); err != nil || string(val) != "retried" {
