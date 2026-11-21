@@ -565,30 +565,60 @@ func keysShow(ctx context.Context, args []string, env keysEnv) int {
 	if err := s.RaiseFloor(ctx); err != nil {
 		return v.failf(keysRefused, "%v", err)
 	}
-	var ver keystore.Version
+	if !*reveal {
+		ver, err := showMetadata(ctx, s, name, *version)
+		if err != nil {
+			return v.failf(keysRefused, "%v", err)
+		}
+		fmt.Fprintf(env.stdout, "name:        %s\n", qualify(name))
+		fmt.Fprintf(env.stdout, "kind:        %s\n", ver.Kind)
+		fmt.Fprintf(env.stdout, "version:     %d\n", ver.Version)
+		fmt.Fprintf(env.stdout, "created:     %s\n", ver.Created.UTC().Format(time.RFC3339))
+		fmt.Fprintf(env.stdout, "fingerprint: %s\n", ver.Fingerprint)
+		return keysOK
+	}
 	var value []byte
 	if *version != 0 {
-		ver, value, err = s.Get(ctx, name, *version)
+		_, value, err = s.Get(ctx, name, *version)
 	} else {
-		ver, value, err = s.Current(ctx, name)
+		_, value, err = s.Current(ctx, name)
 	}
 	defer clear(value)
 	if err != nil {
 		return v.failf(keysRefused, "%v", err)
 	}
-	if *reveal {
-		if _, err := env.stdout.Write(value); err != nil {
-			return v.failf(keysRefused, "write: %v", err)
-		}
-		return keysOK
+	if _, err := env.stdout.Write(value); err != nil {
+		return v.failf(keysRefused, "write: %v", err)
 	}
-	fmt.Fprintf(env.stdout, "name:        %s\n", qualify(name))
-	fmt.Fprintf(env.stdout, "kind:        %s\n", ver.Kind)
-	fmt.Fprintf(env.stdout, "version:     %d\n", ver.Version)
-	fmt.Fprintf(env.stdout, "created:     %s\n", ver.Created.UTC().Format(time.RFC3339))
-	fmt.Fprintf(env.stdout, "fingerprint: %s\n", ver.Fingerprint)
-	fmt.Fprintf(env.stdout, "size:        %d bytes\n", len(value))
 	return keysOK
+}
+
+// showMetadata is one version's metadata, taken from List so the verb never
+// holds the value: version 0 is the current one. An entry List reports with
+// Err is refused with that error.
+func showMetadata(ctx context.Context, s keysStore, name string, version uint64) (keystore.Version, error) {
+	entries, err := s.List(ctx)
+	if err != nil {
+		return keystore.Version{}, err
+	}
+	for _, e := range entries {
+		if e.Name != name {
+			continue
+		}
+		if e.Err != nil {
+			return keystore.Version{}, fmt.Errorf("%s: %w", name, e.Err)
+		}
+		if version == 0 {
+			return e.Current, nil
+		}
+		for _, ver := range e.Versions {
+			if ver.Version == version {
+				return ver, nil
+			}
+		}
+		return keystore.Version{}, fmt.Errorf("%s: version %d: %w", name, version, keystore.ErrVersionNotFound)
+	}
+	return keystore.Version{}, fmt.Errorf("%s: %w", name, keystore.ErrNotFound)
 }
 
 func keysRm(ctx context.Context, args []string, env keysEnv) int {

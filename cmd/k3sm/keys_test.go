@@ -403,6 +403,46 @@ func TestKeysShowRevealByteExact(t *testing.T) {
 	}
 }
 
+// TestKeysShowMetadataOnly: show without --reveal never asks the store for a
+// value (no Current, no Get: the metadata comes from List) and prints no
+// size, for the current version and for an older one.
+func TestKeysShowMetadataOnly(t *testing.T) {
+	h := newKeysHarness(t)
+	h.put("system/k", []byte("first-value"))
+	h.stdin = bytes.NewReader([]byte("second-value-longer"))
+	h.mustRun(0, "rotate", "system/k", "--in", "-")
+	for _, tc := range []struct {
+		args    []string
+		version string
+	}{
+		{[]string{"show", "system/k"}, "version:     2"},
+		{[]string{"show", "system/k", "--version", "1"}, "version:     1"},
+	} {
+		h.calls = nil
+		h.mustRun(0, tc.args...)
+		if slices.Contains(h.calls, "Current") || slices.Contains(h.calls, "Get") {
+			t.Errorf("%v calls %v: it fetched the value", tc.args, h.calls)
+		}
+		if i, j := slices.Index(h.calls, "RaiseFloor"), slices.Index(h.calls, "List"); i < 0 || i > j {
+			t.Errorf("%v calls %v: RaiseFloor must come before List", tc.args, h.calls)
+		}
+		out := h.stdout.String()
+		if strings.Contains(out, "size") || strings.Contains(out, "bytes") {
+			t.Errorf("%v printed the value's size:\n%s", tc.args, out)
+		}
+		if !strings.Contains(out, tc.version) || !strings.Contains(out, "fingerprint: ") {
+			t.Errorf("%v metadata lacks %q or the fingerprint:\n%s", tc.args, tc.version, out)
+		}
+	}
+	h.mustRun(1, "show", "system/k", "--version", "3")
+	h.mustRun(1, "show", "system/absent")
+	h.damageRecord("k", "v1")
+	h.mustRun(1, "show", "system/k", "--version", "2")
+	if !strings.Contains(h.stderr.String(), "does not authenticate") {
+		t.Errorf("show of a corrupt entry: stderr %q lacks the store's reason", h.stderr.String())
+	}
+}
+
 // copyTree copies the directories and regular files under src to dst,
 // keeping each one's owner and mode, as `ditto` does in the restore recipe
 // (docs/user/keys.md). Anything else under src fails the test.
