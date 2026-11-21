@@ -415,3 +415,22 @@ func mustDeriveKeys(t *testing.T, master []byte, scope string) keys {
 	}
 	return k
 }
+
+// TestCheckNameExported: CheckName applies the store's name grammar and, unlike the
+// store's refusals, never carries the name it refused.
+func TestCheckNameExported(t *testing.T) {
+	for _, ok := range []string{"a", "api-token", "a.b-c.d9", strings.Repeat("a", 63)} {
+		if err := CheckName(ok); err != nil {
+			t.Errorf("CheckName(%q) = %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"", "Hunter2", "hunter2+x=", ".hunter2", "hunter2-", "hunter2..x", strings.Repeat("h", 254)} {
+		err := CheckName(bad)
+		if !errors.Is(err, ErrInvalidName) {
+			t.Errorf("CheckName(%q) = %v, want ErrInvalidName", bad, err)
+		}
+		if bad != "" && err != nil && strings.Contains(err.Error(), bad) {
+			t.Errorf("CheckName(%q) echoes the name: %v", bad, err)
+		}
+	}
+}

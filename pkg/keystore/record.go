@@ -374,6 +374,18 @@ func checkName(name string) error {
 	return nil
 }
 
+// CheckName reports whether name is a valid entry name, the grammar every
+// method of the store applies: a Kubernetes DNS-1123 subdomain (see
+// ErrInvalidName). Unlike the store's own refusals, its error never carries
+// name, so a caller may show it for an argument that could be a value typed
+// where the name belongs.
+func CheckName(name string) error {
+	if checkName(name) != nil {
+		return ErrInvalidName
+	}
+	return nil
+}
+
 // dnsLabel reports whether label is non-empty, lowercase letters, digits and
 // '-', and begins and ends with a letter or digit. Its length bound is the
 // caller's.

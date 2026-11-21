@@ -600,6 +600,11 @@ func TestKeysRefusals(t *testing.T) {
 		{name: "bare name", args: []string{"put", "signer-hunter2", "--in", "-"}, stdin: "v", want: 2, say: "system/<name>", never: "hunter2"},
 		{name: "unknown scope not echoed", args: []string{"show", "team/hunter2"}, want: 2, say: "system/<name>", never: "hunter2"},
 		{name: "nested name not echoed", args: []string{"show", "system/a/hunter2"}, want: 2, say: "system/<name>", never: "hunter2"},
+		{name: "malformed name not echoed", args: []string{"show", "system/Hunter2+x="}, want: 2, say: "the entry name is not valid (DNS-1123 subdomain); it is not echoed", never: "Hunter2"},
+		{name: "kind value not echoed", args: []string{"put", "system/a", "--kind", "Hunter2"}, stdin: "v", want: 2, say: "--kind", never: "Hunter2"},
+		{name: "output value not echoed", args: []string{"list", "-o", "Hunter2"}, want: 2, say: "-o", never: "Hunter2"},
+		{name: "flag package value not echoed", args: []string{"show", "system/a", "--version", "Hunter2"}, want: 2, say: "--version", never: "Hunter2"},
+		{name: "unknown flag not echoed", args: []string{"show", "system/a", "--Hunter2"}, want: 2, say: "not defined", never: "Hunter2"},
 		{name: "user scope", args: []string{"show", "user/501/signer"}, want: 1, say: "user scopes are not supported by this build"},
 		{name: "unknown scope", args: []string{"show", "team/signer"}, want: 2, say: "system/<name>"},
 		{name: "empty system name", args: []string{"show", "system/"}, want: 2, say: "system/<name>"},
@@ -638,6 +643,14 @@ func TestKeysRefusals(t *testing.T) {
 			}
 		})
 	}
+	t.Run("absent entry names the validated name only", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/held", []byte("held-secret"))
+		h.mustRun(1, "show", "system/absent")
+		if want := "k3sm keys show: system/absent: keystore entry not found\n"; h.stderr.String() != want {
+			t.Fatalf("stderr %q, want %q", h.stderr.String(), want)
+		}
+	})
 	t.Run("reveal to a tty with yes", func(t *testing.T) {
 		h := newKeysHarness(t)
 		h.put("system/held", []byte("held-secret"))

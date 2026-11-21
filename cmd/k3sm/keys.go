@@ -187,12 +187,39 @@ type keysVerb struct {
 	fs      *flag.FlagSet
 	workDir *string
 	env     keysEnv
+	// badFlag is the defined flag whose value the last parse refused.
+	badFlag string
+}
+
+// keysFlagValue wraps a defined flag's value so parse learns which flag
+// refused its value, without reading the flag package's message, which
+// quotes the value.
+type keysFlagValue struct {
+	flag.Value
+	name string
+	bad  *string
+}
+
+func (f keysFlagValue) Set(s string) error {
+	err := f.Value.Set(s)
+	if err != nil {
+		*f.bad = f.name
+	}
+	return err
+}
+
+// IsBoolFlag keeps a wrapped bool flag usable without a value.
+func (f keysFlagValue) IsBoolFlag() bool {
+	b, ok := f.Value.(interface{ IsBoolFlag() bool })
+	return ok && b.IsBoolFlag()
 }
 
 func newKeysVerb(name string, env keysEnv) *keysVerb {
 	fs := flag.NewFlagSet("keys "+name, flag.ContinueOnError)
-	fs.SetOutput(env.stderr)
-	fs.Usage = func() { fmt.Fprint(env.stderr, keysUsage) }
+	// The flag package's own messages quote the argument it refused, which
+	// may be a value typed in the wrong place: parse prints its own.
+	fs.SetOutput(io.Discard)
+	fs.Usage = func() {}
 	return &keysVerb{
 		name:    name,
 		fs:      fs,
@@ -202,11 +229,19 @@ func newKeysVerb(name string, env keysEnv) *keysVerb {
 }
 
 // parse parses args with flags before, between or after the positional
-// arguments (`show system/x --reveal`), and returns the positionals.
+// arguments (`show system/x --reveal`), and returns the positionals. A
+// refusal is printed here, as a fixed line that names a defined flag at most
+// and never echoes an argument.
 func (v *keysVerb) parse(args []string) ([]string, error) {
+	v.fs.VisitAll(func(f *flag.Flag) {
+		if _, ok := f.Value.(keysFlagValue); !ok {
+			f.Value = keysFlagValue{Value: f.Value, name: f.Name, bad: &v.badFlag}
+		}
+	})
 	var pos []string
 	for {
 		if err := v.fs.Parse(args); err != nil {
+			v.flagError(err)
 			return nil, err
 		}
 		args = v.fs.Args()
@@ -215,6 +250,18 @@ func (v *keysVerb) parse(args []string) ([]string, error) {
 		}
 		pos = append(pos, args[0])
 		args = args[1:]
+	}
+}
+
+// flagError prints a parse refusal: the usage for -h, else a fixed line.
+func (v *keysVerb) flagError(err error) {
+	switch {
+	case errors.Is(err, flag.ErrHelp):
+		fmt.Fprint(v.env.stderr, keysUsage)
+	case v.badFlag != "":
+		v.failf(keysBadUsage, "the value of --%s is not valid (it is not echoed); see k3sm keys --help", v.badFlag)
+	default:
+		v.failf(keysBadUsage, "a flag is not defined for this verb or is missing its value (it is not echoed); see k3sm keys --help")
 	}
 }
 
@@ -255,10 +302,16 @@ func (v *keysVerb) store() (keysStore, error) {
 // not serve it.
 var errUserScope = errors.New("user scopes are not supported by this build: use a system/<name> entry")
 
+// errBadEntryName refuses a system/<name> whose name is not the store's
+// grammar (keystore.CheckName), without echoing it.
+var errBadEntryName = errors.New("the entry name is not valid (DNS-1123 subdomain); it is not echoed")
+
 // parseKeyName turns a scope-qualified name into the store's entry name. It
-// returns errUserScope for user/..., and a usage error for anything else that
+// returns errUserScope for user/..., errBadEntryName for a system/<name>
+// whose name the store would refuse, and a usage error for anything else that
 // is not system/<name>. A refused argument is never echoed: it may be a value
-// typed where the name belongs. The entry name itself is the store's to judge.
+// typed where the name belongs. A name it returns is valid, so it may be
+// printed.
 func parseKeyName(q string) (string, error) {
 	scope, name, ok := strings.Cut(q, "/")
 	switch {
@@ -268,6 +321,9 @@ func parseKeyName(q string) (string, error) {
 		return "", errUserScope
 	case scope != "system" || name == "" || strings.Contains(name, "/"):
 		return "", errors.New("the argument is not a scope-qualified entry name: use system/<name>")
+	}
+	if keystore.CheckName(name) != nil {
+		return "", errBadEntryName
 	}
 	return name, nil
 }
@@ -404,7 +460,7 @@ func keysPut(ctx context.Context, args []string, env keysEnv) int {
 	case "ed25519":
 		kind = keystore.KindEd25519
 	default:
-		return v.failf(keysBadUsage, "--kind %q: want opaque or ed25519", *kindFlag)
+		return v.failf(keysBadUsage, "--kind: want opaque or ed25519 (the value given is not echoed)")
 	}
 	if code := v.requireRoot(); code != keysOK {
 		return code
@@ -521,7 +577,7 @@ func keysList(ctx context.Context, args []string, env keysEnv) int {
 		return v.failf(keysBadUsage, "takes no arguments")
 	}
 	if *output != "table" && *output != "json" {
-		return v.failf(keysBadUsage, "-o %q: want table or json", *output)
+		return v.failf(keysBadUsage, "-o: want table or json (the value given is not echoed)")
 	}
 	if code := v.requireRoot(); code != keysOK {
 		return code
@@ -627,7 +683,8 @@ func keysShow(ctx context.Context, args []string, env keysEnv) int {
 
 // showMetadata is one version's metadata, taken from List so the verb never
 // holds the value: version 0 is the current one. An entry List reports with
-// Err is refused with that error.
+// Err is refused with that error. name is one parseKeyName validated, the
+// only argument text its errors carry.
 func showMetadata(ctx context.Context, s keysStore, name string, version uint64) (keystore.Version, error) {
 	entries, err := s.List(ctx)
 	if err != nil {
@@ -650,7 +707,7 @@ func showMetadata(ctx context.Context, s keysStore, name string, version uint64)
 		}
 		return keystore.Version{}, fmt.Errorf("%s: version %d: %w", name, version, keystore.ErrVersionNotFound)
 	}
-	return keystore.Version{}, fmt.Errorf("%s: %w", name, keystore.ErrNotFound)
+	return keystore.Version{}, fmt.Errorf("%s: %w", qualify(name), keystore.ErrNotFound)
 }
 
 func keysRm(ctx context.Context, args []string, env keysEnv) int {
