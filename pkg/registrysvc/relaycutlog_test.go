@@ -169,3 +169,16 @@ func TestRelayCutIsLogged(t *testing.T) {
 		})
 	})
 }
+
+func TestRelayGateBodyWindowFollowsRelayLimits(t *testing.T) {
+	lim := defaultRelayLimits
+	lim.writeProgress = defaultRelayLimits.writeProgress + 7*time.Second
+	r := newRelayWithLimits(0, 0, nil, quietLogger(), GateAuth{}, Credential{}, lim)
+	g, ok := r.limiter.next.(*gate)
+	if !ok {
+		t.Fatalf("limiter next is %T, want *gate", r.limiter.next)
+	}
+	if g.bodyProgress != lim.writeProgress {
+		t.Errorf("gate body window = %v, want the relay's write progress %v", g.bodyProgress, r.limits.writeProgress)
+	}
+}

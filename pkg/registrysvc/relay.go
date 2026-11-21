@@ -228,6 +228,12 @@ func NewRelay(cfg RelayConfig) (*Relay, error) {
 // port is the port every bind listens on and upstream the registry's loopback
 // port the gate forwards to.
 func newRelay(port, upstream int, binds []netip.Addr, log *slog.Logger, auth GateAuth, cred Credential) *Relay {
+	return newRelayWithLimits(port, upstream, binds, log, auth, cred, defaultRelayLimits)
+}
+
+// newRelayWithLimits is newRelay with the limits as a parameter, so a test can
+// prove the gate is built from the relay's limits.
+func newRelayWithLimits(port, upstream int, binds []netip.Addr, log *slog.Logger, auth GateAuth, cred Credential, limits relayLimits) *Relay {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -236,7 +242,7 @@ func newRelay(port, upstream int, binds []netip.Addr, log *slog.Logger, auth Gat
 		upstream: upstream,
 		binds:    binds,
 		log:      log,
-		limits:   defaultRelayLimits,
+		limits:   limits,
 		// The relay binds a mesh address and the vm NAT gateway, which local pods
 		// reach over lo0, so every accepted connection's TCP segment size is
 		// clamped. The gate's upstream dial is not: it targets the registry's
@@ -250,7 +256,7 @@ func newRelay(port, upstream int, binds []netip.Addr, log *slog.Logger, auth Gat
 			return tcpseg.WrapListener(ln), nil
 		},
 	}
-	r.limiter = newSourceLimiter(newGate(gateConfig{Upstream: r.target(), Auth: auth, Credential: cred, Logger: log}), r.limits, time.Now)
+	r.limiter = newSourceLimiter(newGate(gateConfig{Upstream: r.target(), Auth: auth, Credential: cred, Logger: log, UpstreamBodyProgress: r.limits.writeProgress}), r.limits, time.Now)
 	r.limiter.log = log
 	r.handler = r.limiter
 	return r
