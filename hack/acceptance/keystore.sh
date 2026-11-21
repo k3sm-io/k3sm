@@ -43,7 +43,7 @@
 #   --kd-author     KeyDelivery authoring: U40, U41, U74, U76.
 #   --kd-reconcile  the KeyDelivery reconciler: U42, U43, U59, U73, U78, U81.
 #   --kd-lifecycle  the KeyDelivery lifecycle: U44, U53, U55, U56, U62, U65,
-#                   U72, U75, U77, U79, U83.
+#                   U72, U75, U77, U79, U83, U85.
 #   --grammar       the entry grammar in apis: U57.
 #   --docs          the user docs: no row yet, so it exits 3.
 # A unit mode runs only its rows and only their tests, with the same exit
@@ -108,6 +108,7 @@ EXPECTED_ROWS="$EXPECTED_ROWS U58 U59 U60 U61 U62 U63"
 EXPECTED_ROWS="$EXPECTED_ROWS U64 U65 U66 U67 U68 U69 U70 U71"
 EXPECTED_ROWS="$EXPECTED_ROWS U72 U73 U74 U75 U76"
 EXPECTED_ROWS="$EXPECTED_ROWS U77 U78 U79 U80 U81 U82 U83 U84"
+EXPECTED_ROWS="$EXPECTED_ROWS U85"
 # >>> ADD NEW U ROWS (U64 upward) HERE <<<
 EXPECTED_ROWS="$EXPECTED_ROWS E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 E13 E14 E15 E16 E17 E18 E19 E20"
 EXPECTED_ROWS="$EXPECTED_ROWS E21 E22 E23 E24 E25"
@@ -144,7 +145,7 @@ mode_rows() {
 	exec) echo "U36 U37 U38 U69" ;;
 	kd-author) echo "U40 U41 U74 U76" ;;
 	kd-reconcile) echo "U42 U43 U59 U73 U78 U81" ;;
-	kd-lifecycle) echo "U44 U53 U55 U56 U62 U65 U72 U75 U77 U79 U83" ;;
+	kd-lifecycle) echo "U44 U53 U55 U56 U62 U65 U72 U75 U77 U79 U83 U85" ;;
 	grammar) echo "U57" ;;
 	*) echo "" ;;
 	esac
@@ -461,7 +462,7 @@ pend U42 "an unrecorded UID, a digest mismatch, or a failed name-scoped SAR (cre
 	TestEncryptionOffRefusesKeyDelivery TestSARCarriesImpersonatedUserAndGroups TestGroupBoundGrantHonouredConsistently
 pend U43 "reasons are the closed set; absent and not yours both read EntryUnavailable; a pre-existing Secret not claimed by a KeyDelivery (unlabelled, or Phase A's) is SecretExists; a second declaration is SecretClaimed; observedGeneration tracks; Ready=False carries NotAuthorized for any authority failure; Ready=Unknown, Pending initially and while Authorized is Unknown; each Authorized=False reason is tied to deleting or retaining the Secret, and a kept Secret sets SecretRetained=True (KeyDelivery reconciler)" \
 	k3sm/pkg/keystore/reconcile::TestConditionReasonsClosedSet TestReasonConditionTable TestOneDeclarationPerSecret TestReadyFalseCarriesNotAuthorized TestReadyUnknownPending TestAuthorizedFalseReasonActionMap TestSecretRetainedWhenKept
-pend U44 "losing authority deletes exactly the owned Secret; the crash order is Secret, record, finalizer at every interruption point; ownership is the label, the owner annotation and that UID in the sealed record, not the ownerReference; the Secret's namespace and name must equal the record's target for that UID, and the record's entry must match the owner annotation; the orphan sweep removes a labelled Secret only when its owner annotation names a UID the sealed record holds, it is that UID's recorded target, and that object is gone or withdrawn, never on the label and owner annotation alone, never an unlabelled or foreign one; a forged label and a real UID on another Secret are left alone, charged to no share, one refused line under the reconciler (KeyDelivery lifecycle)" \
+pend U44 "losing authority deletes exactly the owned Secret; the crash order is Secret, record, finalizer at every interruption point; ownership is the label, the owner annotation and that UID in the sealed record, not the ownerReference; the Secret's namespace and name must equal the record's target for that UID, and the record's entry must match the owner annotation; the orphan sweep removes a labelled Secret only when its owner annotation names a UID the sealed record holds, it is that UID's recorded target, and that object is gone or withdrawn, never on the label and owner annotation alone, never an unlabelled or foreign one; a forged label and a real UID on another Secret are left alone, charged to no share, one refused line under the reconciler, against the reconciler budget (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestLostAuthorityDeletesOnlyOwnedSecret TestFinalizerCrashOrder TestOrphanSweep TestForgedOwnerAnnotationOnOtherSecretIsLeftAlone
 pend U45 "cross-user refusal with a fake peer-credential seam: a peer with uid B asks for list, read-for-exec, rotate, rm and deliver of uid A's entries, and for any system/... name; every call is ErrNotFound with text identical to an absent entry of B's own, and the refused audit lines carry uid B (socket operations)" \
 	k3sm/pkg/keystore/socket::TestCrossUserRefusedFakePeerCred TestNonRootCannotNameSystemEntries
@@ -508,7 +509,7 @@ pend U65 "ErrScopeAbsent is Indeterminate and deletes nothing; every allow-list 
 	k3sm/pkg/keystore/reconcile::TestAbsentScopeIsIndeterminate TestEveryDeletingOutcomeNeedsTwoSweeps TestSingleServerRecheckedBeforeEverySweep
 pend U66 "a synthesized GeneratedUID (prefix FFFFEEEE-DDDD-CCCC-BBBB-AAAA) is ErrScopeOwnerUnknown and never bound; ErrScopeOwnerChanged only for a real GeneratedUID that differs (user scopes)" \
 	k3sm/pkg/keystore::TestSynthesizedGeneratedUIDIsUnknown
-pend U67 "the revocation class (withdraw, rm, rotate, the withdrawal's floor line, the reconciler's deliver-delete, its deliver-write of a withdrawal and its rotation write) bypasses the share past it and draws on its uid's own budgets per log above the hard cap: a 256 KiB reconciler allowance and a separate 64 KiB socket margin; neither budget can draw on the other; refused only when the budget it draws on runs out, so one uid's revocations are never refused because of another uid; a no-op revocation is charged to the share; a log passes the hard cap by at most 320 KiB per user scope (socket operations)" \
+pend U67 "the revocation class (withdraw, rm, rotate, the withdrawal's floor line, the reconciler's deliver-delete, its deliver-write of a withdrawal and its rotation write) bypasses the share past it and draws on its uid's own budgets per log above the hard cap: a 256 KiB reconciler allowance and a separate 64 KiB socket margin; neither budget can draw on the other; refused only when the budget it draws on runs out, so one uid's revocations are never refused because of another uid; a no-op revocation is charged to the share; a log passes the hard cap by at most 320 KiB per user scope, plus the 1 MiB reconciler budget (socket operations)" \
 	k3sm/pkg/keystore/socket::TestRevocationBypassesShareUsesReserve TestNoOpRevocationChargedToShare TestReserveKeepsReconcilerPart TestRevocationAllowanceIsPerUID \
 	TestSocketMarginSeparateFromReconcilerAllowance
 rootpend U68 "root-run: the maintenance verbs refuse a symlink or swapped file planted at the marker, a staging name or the old log; creates are O_EXCL|O_NOFOLLOW through one data-root descriptor, fchown before renameat and fchflags on the held descriptor after it, never renaming a flagged file or over one; no log byte changes on a refusal (append-only files)" \
@@ -543,8 +544,10 @@ pend U82 "eligible peer uids are 501 to 2147483647: nobody (4294967294) and ever
 	k3sm/pkg/keystore/socket::TestPeerUIDRangeRefusesNobodyAndHighUIDs
 pend U83 "the reconciler checks the user-scope floor log: a missing or unflagged floor log is Indeterminate for writes, so no deliver-write runs until floor --rebuild, and nothing is deleted (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestReconcilerHoldsWritesWithoutFloor
-pend U84 "when a log's size is past the hard cap, doctor shows a Warn with the overshoot in bytes and the rotate or rebuild hint, and none at or below it; the overshoot is at most 320 KiB per user scope (socket operations)" \
+pend U84 "when a log's size is past the hard cap, doctor shows a Warn with the overshoot in bytes and the rotate or rebuild hint, and none at or below it; the overshoot is at most 320 KiB per user scope, plus the 1 MiB reconciler budget (socket operations)" \
 	k3sm/cmd/k3sm::TestDoctorWarnsOnLogOvershoot
+pend U85 "a reconciler line charged to no uid (a forged-Secret refused line, a drift repair, their summaries) draws on the reconciler budget, 1 MiB per log, separate from every uid and excluded from the hard-cap test; forged Secrets are counted in a bounded LRU of 1024 (namespace, name) pairs with no per-resourceVersion set, new pairs' lines at most 10 a minute and at most one summary refused line a minute carrying the dropped count; past the budget the lines are dropped and counted and doctor warns; N forged updates leave every uid able to read and mutate (KeyDelivery lifecycle)" \
+	k3sm/pkg/keystore/reconcile::TestForgedSecretFloodLeavesEveryUIDServed TestUnchargedLinesHaveOwnBudget
 # >>> ADD NEW U ROWS (U64 upward) HERE, and add each to EXPECTED_ROWS and to mode_rows <<<
 
 leg E1 "files" "preconditions: secrets encryption on; one server; keystore-run/ and both logs present, service-user 0600, SF_APPEND set; the doctor user-scope row on; keystore.sh --check exits 0 on the build" "the append-only files"
@@ -685,7 +688,12 @@ U83|Indeterminate for writes
 E10|vm Pod
 E10|network-bind
 E10|EPERM
-E24|EPERM"
+E24|EPERM
+U85|reconciler budget, 1 MiB per log
+U85|excluded from the hard-cap test
+U85|bounded LRU of 1024
+U85|every uid able to read and mutate
+U67|plus the 1 MiB reconciler budget"
 
 # --listed: the row-presence lint.
 if [ "$mode" = listed ]; then
