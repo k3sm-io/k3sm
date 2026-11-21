@@ -1137,6 +1137,18 @@ GeneratedUID**.
   `ErrScopeOwnerChanged` when it differs from the record's generation. A deleted account whose
   uid is reused opens nothing of the old account's. Root removes such a scope with `sudo k3sm
   keys rm-scope user/<uid> --yes`.
+- **A synthesized GeneratedUID is no answer.** For a uid with no directory record the
+  membership API can return a compatibility UUID it makes up from the uid: the fixed prefix
+  `FFFFEEEE-DDDD-CCCC-BBBB-AAAA` followed by the uid in hex. The lookup recognises that
+  prefix and answers `ErrScopeOwnerUnknown`, never a GeneratedUID: a directory service that is
+  slow or not yet up at boot must not read as a changed owner (U66). The store never binds a
+  synthesized value either: a mutating operation that would mint `K_u` refuses with
+  `ErrScopeOwnerUnknown` instead. What the lookup returns for a uid with no record (that
+  synthesized form, an error, or something else) is `[K0 leg 3: pending]`.
+- **`ErrScopeOwnerChanged` is definitive only on a real answer.** It is answered only when the
+  lookup returns a real, non-synthesized GeneratedUID that differs from the bound one. As a
+  deleting outcome it deletes only on two consecutive sweeps ("Every deleting outcome counts
+  only twice in a row"), like every other.
 - **The lookup has a deadline.** It goes through the GeneratedUID-lookup seam with a deadline
   of 2 seconds; a timeout or an error fails closed with `ErrScopeOwnerUnknown`, and nothing in
   that scope opens. Whether the GeneratedUID is stable across a server restart, and how long
@@ -1659,7 +1671,9 @@ list is closed:
    record that opened and authenticated;
 4. a definitive SubjectAccessReview denial, as defined above, on two consecutive sweeps;
 5. the store's typed `ErrScopeOwnerChanged` (`errors.Is(err, keystore.ErrScopeOwnerChanged)`):
-   the account is deleted or its uid reused, as the GeneratedUID binding shows.
+   the account is deleted or its uid reused, as the GeneratedUID binding shows: the lookup
+   returned a real, non-synthesized GeneratedUID that differs from the bound one. A
+   synthesized compatibility UUID is `ErrScopeOwnerUnknown`, which is `Indeterminate`.
 
 **Every other outcome is `Indeterminate`**, whatever it is: `ErrScopeAbsent` (a missing
 `.user/<uid>/` or `scope.key`), `ErrCorrupt` (the floor refusal
@@ -1907,7 +1921,7 @@ the floor variant.
 |---|---|---|
 | `[K0 leg 1: pending]` | `sappnd` on an APFS data volume as the service user: append works, and the whole defeat list fails; owner `chmod` widens nothing; the kernel securelevel and whether root can clear the flag at it; whether a rename over an `sappnd` target needs the clear first | "The user-scope floor" (the variant and the maintenance verbs) |
 | `[K0 leg 2: pending]` | `LOCAL_PEERCRED` both ways, for a socket in a service-user 0755 directory under the root-owned data root and a login uid over SSH: the login uid on the server side, the service uid on the client side | "The socket" (peer identity, the client's checks) |
-| `[K0 leg 3: pending]` | `mbr_uid_to_uuid` returns a stable 16-byte GeneratedUID across a server restart, and its cold latency, which sets the deadline | "Key hierarchy" (the GeneratedUID binding) |
+| `[K0 leg 3: pending]` | `mbr_uid_to_uuid` returns a stable 16-byte GeneratedUID across a server restart, and its cold latency, which sets the deadline; and what it returns for a uid with no directory record (the synthesized `FFFFEEEE-DDDD-CCCC-BBBB-AAAA` form, an error, or something else) | "Key hierarchy" (the GeneratedUID binding) |
 | `[K0 leg 4: pending]` | a Pod with the data-root denies cannot `connect(2)` to the socket or read `keystore-run/` or any `keystore-*` file; and, without them, whether a Pod can read Phase A's two data-root files today | "Pod denies", "Threat model" |
 | `[K0 leg 5: pending]` | which uid a native Pod's processes run as, and whether any Pod spec field or runtimed path can make it 501 or above | "Pod denies" (layer 2, row U15) |
 
@@ -2048,6 +2062,7 @@ each stated in the change that makes it. U15 is held for a K0 amendment and U39 
 | U63 | entries live under `.user/<uid>/entries/`: entries named `deliveries` and `scope.key` are ordinary, `put`, `rotate`, `list` and `rm` work on them, and neither touches the scope's `deliveries` record or `scope.key` | `k3sm/pkg/keystore::TestEntriesNamedDeliveriesAndScopeKeyAreOrdinary` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
 | U64 | a missing `.user/<uid>/` or `scope.key` answers `ErrScopeAbsent`, never `ErrNotFound`; `ErrNotFound` only for an entry missing from a scope that exists and opened; a read (`list`, `read-for-exec`, `deliveries`, a reconciler read) on a uid with no scope creates no directory and mints no `K_u`; the first mutating operation does | `k3sm/pkg/keystore::TestReadDoesNotMintScope`, `TestMissingScopeIsScopeAbsent` | pending: the user-scope store |
 | U65 | the reconciler reads `ErrScopeAbsent` as `Indeterminate` and deletes nothing; every outcome on the allow-list, not only a SAR denial, deletes only on two consecutive sweeps for the same generation; the single-server check is re-run from a fresh List before every sweep, and a second server or a failed List runs no sweep | `k3sm/pkg/keystore/reconcile::TestAbsentScopeIsIndeterminate`, `TestEveryDeletingOutcomeNeedsTwoSweeps`, `TestSingleServerRecheckedBeforeEverySweep` | pending: the KeyDelivery reconciler (lifecycle) |
+| U66 | the GeneratedUID lookup recognises the synthesized compatibility form (prefix `FFFFEEEE-DDDD-CCCC-BBBB-AAAA`) and answers `ErrScopeOwnerUnknown`, never a changed owner, and no mint binds it; `ErrScopeOwnerChanged` only when a real, non-synthesized GeneratedUID differs from the bound one (seam: GeneratedUID lookup) | `k3sm/pkg/keystore::TestSynthesizedGeneratedUIDIsUnknown` | pending: the user-scope store |
 
 ### Rig legs
 
