@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # The keystore's acceptance gate: docs/design/keystore.md § "Acceptance gate",
-# rows G1 to G22, the user-scope rows U1 to U45 (U15 and U39 are unused) and
+# rows G1 to G22, the user-scope rows U1 to U48 (U15 and U39 are unused) and
 # the rig legs E1 to E20. Every row is listed, on exactly one line. A row runs
 # the tests that deliver it and passes only if each named test ran and passed
 # in its own package; a row whose change has not landed yet prints PENDING,
@@ -13,10 +13,13 @@
 # A row names its tests as <repo>/<package>::<Test>, a bare name taking the
 # package before it (the first defaults to k3sm/pkg/keystore). The repo is k3sm
 # itself or a sibling checkout beside it: ../apis, ../runtimed, ../darwin-net.
-# Each package runs once, under -race, verbose; a named test counts only if its
-# "--- PASS:" line appears in that package's output. A sibling runs through the
-# go.work beside the k3sm root when that file exists; k3sm runs as it is. A
-# sibling that is not checked out fails its rows, never skips them.
+# Each package runs once, verbose; a named test counts only if its "--- PASS:"
+# line appears in that package's output. Rows in runtimed and k3sm run with
+# CGO_ENABLED=1 and under -race; rows in ../apis and ../darwin-net run with
+# CGO_ENABLED=0 and so without -race (-race needs cgo on darwin), and the run
+# prints that it did. CGO is set per package run, never exported. A sibling runs
+# through the go.work beside the k3sm root when that file exists; k3sm runs as
+# it is. A sibling that is not checked out fails its rows, never skips them.
 #
 # Exit status: 0 every row passed; 1 a row failed; 3 no row failed but at
 # least one is pending. Only --lab judges the rig legs: --check prints each as
@@ -30,10 +33,10 @@
 #   --delivery      the system delivery: G18 to G20.
 #   --sandbox       the pod denies: U16, U17.
 #   --api           the KeyDelivery API types: U18, U19.
-#   --scope         user scopes: U6 to U11.
+#   --scope         user scopes: U6 to U11, U47.
 #   --scope-store   the user-scope store: U12 to U14.
 #   --files         the append-only files: U20 to U25.
-#   --socket        the socket listener: U17, U26 to U31.
+#   --socket        the socket listener: U26 to U31, U46, U48.
 #   --socket-ops    the socket operations: U32 to U35, U45.
 #   --exec          the non-root CLI and exec: U36 to U38.
 #   --kd-author     KeyDelivery authoring: U40, U41.
@@ -44,16 +47,24 @@
 # status: it exits 0 only when every row it names passes.
 #
 # --lab runs the rig legs E1 to E20, and nothing else, as an explicit, recorded
-# step. It refuses (exit 2) unless K3SM_LAB=1 and K3SM_LAB_EVIDENCE names an
-# existing directory. It writes a record file into that directory: the date,
-# the head sha, the evidence directory and each leg's verdict. A leg with no
-# implementation is PENDING.
+# step. --<unit mode> --lab runs that mode's unit rows and then only the legs
+# mapped to that mode (the leg's last feature to land, see the leg table); a
+# leg mapped to no mode runs only under plain --lab. Each leg's description
+# ends "(fails without: <feature>)". It refuses (exit 2) unless K3SM_LAB=1 and
+# K3SM_LAB_EVIDENCE names an existing directory. It writes a record file into
+# that directory: the date, the mode, the head sha and dirty flag of k3sm and of
+# each sibling checkout, the evidence directory, each leg's verdict and the
+# final exit status. A leg with no implementation is PENDING.
 #
 # --listed is a row-presence lint, not proof. It checks that every U and E row
-# in EXPECTED_ROWS below exists here, and that every test a row names is a func
-# in its package's _test.go files, by grep. A test that does not exist yet is
-# MISSING (pending row), which is not a failure while its row is pending; it
-# fails a row that is checked. Exit status: 0 every row present; 1 otherwise.
+# in EXPECTED_ROWS below exists here, and that every test a row names exists,
+# found with go test -list in its package (the same CGO and GOWORK rules as a
+# run; grep of the _test.go files only when go test -list cannot build the
+# package, marked "(grep fallback)" on that row). A test that does not exist yet
+# is MISSING (pending row), which is not a failure while its row is pending; it
+# fails a row that is checked. Exit status: 0 every row present and every named
+# test exists; 3 every row present, some named tests do not exist yet; 1 a row
+# is missing or a checked row's test is missing.
 #
 # --root runs row R1 alone: the package's tests as root, in the deployment's
 # shape (root runs the verbs and owns the data root, the service user owns the
@@ -67,7 +78,7 @@
 # with origin/main). KEYSTORE_SKIP_G22=1 marks G22 PENDING instead of running
 # hack/ci.sh, for a run inside a sandbox that cannot run it.
 #
-# Usage: hack/acceptance/keystore.sh --check|--<unit mode>|--lab|--listed|--root
+# Usage: hack/acceptance/keystore.sh --check|--<unit mode> [--lab]|--lab|--listed|--root
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 K3SM_ROOT="$(cd "$HERE/../.." && pwd)"
@@ -76,17 +87,20 @@ K3SM_ROOT="$(cd "$HERE/../.." && pwd)"
 # The design doc is the human reference; this list is what the lint reads.
 EXPECTED_ROWS="U1 U2 U3 U4 U5 U6 U7 U8 U9 U10 U11 U12 U13 U14 U16 U17 U18 U19 U20"
 EXPECTED_ROWS="$EXPECTED_ROWS U21 U22 U23 U24 U25 U26 U27 U28 U29 U30 U31 U32 U33 U34 U35"
-EXPECTED_ROWS="$EXPECTED_ROWS U36 U37 U38 U40 U41 U42 U43 U44 U45"
+EXPECTED_ROWS="$EXPECTED_ROWS U36 U37 U38 U40 U41 U42 U43 U44 U45 U46 U47 U48"
+# >>> ADD NEW U ROWS (U49 upward) HERE <<<
 EXPECTED_ROWS="$EXPECTED_ROWS E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 E13 E14 E15 E16 E17 E18 E19 E20"
+# >>> ADD NEW E LEGS (E21 upward) HERE <<<
 
 MODES="check rewrap verbs delivery sandbox api scope scope-store files socket socket-ops exec"
 MODES="$MODES kd-author kd-reconcile kd-lifecycle docs lab listed root"
 
 usage() {
 	echo "usage: $0 --check|--rewrap|--verbs|--delivery|--sandbox|--api|--scope|--scope-store|--files|--socket|--socket-ops|--exec|--kd-author|--kd-reconcile|--kd-lifecycle|--docs|--lab|--listed|--root" >&2
+	echo "       $0 --<unit mode> --lab   (a unit mode's rows, then only its rig legs)" >&2
 	exit 2
 }
-[ $# -eq 1 ] || usage
+[ $# -ge 1 ] && [ $# -le 2 ] || usage
 mode=""
 for m in $MODES; do
 	if [ "$1" = "--$m" ]; then mode="$m"; fi
@@ -101,10 +115,10 @@ mode_rows() {
 	delivery) echo "G18 G19 G20" ;;
 	sandbox) echo "U16 U17" ;;
 	api) echo "U18 U19" ;;
-	scope) echo "U6 U7 U8 U9 U10 U11" ;;
+	scope) echo "U6 U7 U8 U9 U10 U11 U47" ;;
 	scope-store) echo "U12 U13 U14" ;;
 	files) echo "U20 U21 U22 U23 U24 U25" ;;
-	socket) echo "U17 U26 U27 U28 U29 U30 U31" ;;
+	socket) echo "U26 U27 U28 U29 U30 U31 U46 U48" ;;
 	socket-ops) echo "U32 U33 U34 U35 U45" ;;
 	exec) echo "U36 U37 U38" ;;
 	kd-author) echo "U40 U41" ;;
@@ -114,7 +128,16 @@ mode_rows() {
 	esac
 }
 
-if [ "$mode" = lab ]; then
+# lab is 1 when the rig legs run: plain --lab, or a unit mode followed by --lab.
+lab=0
+if [ "$mode" = lab ]; then lab=1; fi
+if [ $# -eq 2 ]; then
+	[ "$2" = --lab ] || usage
+	[ -n "$(mode_rows "$mode")" ] || usage
+	lab=1
+fi
+
+if [ "$lab" = 1 ]; then
 	if [ "${K3SM_LAB:-}" != 1 ]; then
 		echo "keystore: --lab is the recorded rig step; it runs only with K3SM_LAB=1" >&2
 		exit 2
@@ -126,7 +149,6 @@ if [ "$mode" = lab ]; then
 fi
 
 cd "$K3SM_ROOT"
-export CGO_ENABLED=1
 
 # run_root is --root: row R1. Only the test binary runs under sudo; the build,
 # the counting and the cleanup run as the invoking user. It is called where set
@@ -140,7 +162,7 @@ run_root() {
 	# slash, so the tests' temp dirs are under the canonical path.
 	t="$(cd "$t" && pwd -P)" || { echo "R1 FAIL as root: cannot resolve $root_tmp"; return 1; }
 	trap 'rm -rf "$root_tmp" 2>/dev/null || echo "keystore: could not remove $root_tmp (a root-owned leftover)" >&2' EXIT
-	if ! out="$(go test -race -c -o "$t/keystore.test" ./pkg/keystore/ 2>&1)"; then
+	if ! out="$(CGO_ENABLED=1 go test -race -c -o "$t/keystore.test" ./pkg/keystore/ 2>&1)"; then
 		printf '%s\n' "$out"
 		echo "R1 FAIL as root: the test binary did not build"
 		return 1
@@ -209,7 +231,8 @@ add() {
 check() { local id="$1" desc="$2"; shift 2; add check "$id" "$desc" "" "$@"; }   # row, description, tests...
 partial() { local id="$1" d="$2" t="$3"; shift 3; add partial "$id" "$d" "$t" "$@"; } # row, delivered part, pending part, tests...
 pend() { local id="$1" desc="$2"; shift 2; add pend "$id" "$desc" "" "$@"; }    # row, description (its change), tests...
-leg() { add leg "$1" "$2" ""; }                                                  # rig leg, description
+# rig leg, the unit mode that delivers its last feature ("" for none), description, fails-without feature
+leg() { add leg "$1" "$3 (fails without: $4)" "$2"; }
 special() { add "$1" "$2" "" ""; }                                               # G1 or G22, judged inline
 
 special g1 G1
@@ -282,8 +305,8 @@ pend U14 "the delivery record stores UID and target digest; add, look up and wit
 	TestDeliveryRecordDigestRoundTrip
 pend U16 "every pod profile variant (native, vm, container-vm, xcode, expose-paths, a custom pod root distinct from the data root) denies every keystore path, each deny after every allow; rig leg E10 (sandbox denies)" \
 	runtimed/pkg/sandbox::TestDataRootDeniesKeystorePathsEveryProfile
-pend U17 "runtimed refuses a pod process uid >= 501 (or proves no path to one); baseSocketDenies derives keys.sock from runtimed's names (sandbox denies; socket listener)" \
-	runtimed/pkg/supervisor::TestSpawnRefusesLoginRangeUID k3sm/pkg/provider::TestBaseSocketDeniesKeystoreSocket
+pend U17 "runtimed refuses a pod process uid >= 501 (or proves no path to one) (sandbox denies)" \
+	runtimed/pkg/supervisor::TestSpawnRefusesLoginRangeUID
 pend U18 "CRD: entry, secretName, dataKey, requestedBy immutable by CEL transition rules; status subresource on; reasons listed (KeyDelivery API)" \
 	apis/config/crd::TestKeyDeliveryCRDMatchesTheGoTypes TestKeyDeliveryImmutableFields
 pend U19 "the CRD pattern passes the shared entry-grammar vectors (KeyDelivery API)" \
@@ -340,27 +363,36 @@ pend U44 "losing authority deletes exactly the owned Secret; the crash order is 
 	k3sm/pkg/keystore/reconcile::TestLostAuthorityDeletesOnlyOwnedSecret TestFinalizerCrashOrder TestOrphanSweep
 pend U45 "cross-user refusal with a fake peer-credential seam: a peer with uid B asks for list, read-for-exec, rotate, rm and deliver of uid A's entries, and for any system/... name; every call is ErrNotFound with text identical to an absent entry of B's own, and the refused audit lines carry uid B (socket operations)" \
 	k3sm/pkg/keystore/socket::TestCrossUserRefusedFakePeerCred TestNonRootCannotNameSystemEntries
+pend U46 "baseSocketDenies derives keys.sock from runtimed's names (socket listener)" \
+	k3sm/pkg/provider::TestBaseSocketDeniesKeystoreSocket
+pend U47 "seam guard: the real primitives the keystore's tests replace are unreachable from a test build (user scopes)" \
+	k3sm/pkg/keystore::TestRealPrimitivesUnreachable
+pend U48 "seam guard: the real primitives the socket listener's tests replace are unreachable from a test build (socket listener)" \
+	k3sm/pkg/keystore/socket::TestRealPrimitivesUnreachable
 
-leg E1 "preconditions: secrets encryption on; one server; keystore-run/ and both logs present, service-user 0600, SF_APPEND set; the doctor user-scope row on; keystore.sh --check exits 0 on the build"
-leg E2 "the user, no sudo, puts user/<me>/e2e-token (short-name form): exit 0; the CLI prints the resolved user/<uid>; k3sm keys list shows it; the audit log has a put line with no value"
-leg E3 "an admin binds k3sm:keystore-delivery-author for k3sm:local:<uid> in ks-e2e and the user delivers the entry to Secret e2e-token: KeyDelivery Ready, reason Delivered, observedGeneration current; requestedBy is k3sm:local:<uid>; a pod mounting the Secret reads exactly the stored bytes"
-leg E4 "the user rotates (rotate --in -), then rotate --from-version 1: the pod's mounted file moves to v2, then to v1's bytes as v3, within one sweep each"
-leg E5 "k3sm keys exec user/<uid>/e2e-token --env TOKEN -- /usr/bin/env: the child sees TOKEN; the CLI wrote nothing else; ps during the run shows no value in argv; one exec-read audit line"
-leg E6 "as the one login user: list, exec, rotate, rm and deliver of an unused other uid's entry and of system/e2e-sys, then a connect as root and as the service user: not found each time, text identical to an absent entry of the user's own, refused audit lines carry the user's uid; root and the service user are refused at accept"
-leg E7 "an admin copies E3's KeyDelivery into ks-e2e-2, where the user also has the role: Authorized=False, reason NotRecorded, no Secret"
-leg E8 "an admin strips the CRD's transition rules (restored at the end) and edits E3's spec.secretName: Authorized=False, NotRecorded (digest mismatch); the original Secret deleted; no Secret under the new name"
-leg E9 "sudo cp saves current, the user rotates, sudo cp puts the old current back, then the same for a system/ entry: both lists mark the entry corrupt with the floor message"
-leg E10 "a pod pinned to the darwin node tries connect(2) to keys.sock and to read server/keystore, keystore-run/, both logs and Phase A's two files: EPERM for each"
-leg E11 "an admin removes the user's RoleBinding in ks-e2e: within one sweep the Secret is deleted; Authorized=False, NotAuthorized"
-leg E12 "root puts and delivers system/e2e-sys; then the user, with no sudo, tries deliver, list and exec on it: root's Secret is delivered and stays; each of the user's attempts answers not found and nothing reaches ks-e2e-2"
-leg E13 "a ServiceAccount token creates a KeyDelivery: refused at admission"
-leg E14 "k3sm keys undeliver on E3's object, then kubectl delete of a second one: each Secret deleted before its object goes; the hint printed; no orphan Secret after one sweep"
-leg E15 "upgrade from the previous release's install tree, then sudo k3sm install: system scope intact; user scope comes on after the install, off with the Warn and doctor row before it"
-leg E16 "rollback to the previous release, then forward again: the old build runs with the keystore files unused; after rolling forward the user's entries, records and Secrets are intact and re-adopted"
-leg E17 "backup and restore round trip with cp, then floor --rebuild and audit --rotate: before the rebuild the listener refuses (flags clear); after it every entry opens and both logs are flagged"
-leg E18 "an old worker on the previous release joins this server: worker Ready; pods there mount delivered Secrets; no keystore listener or reconciler on the worker"
-leg E19 "launchctl kickstart -k of the server while a client is connected mid-request: a clean error, not a hang; the listener back within its backoff; kine and the apiserver back; no partial record"
-leg E20 "reboot of the server node, operator-attended (--attended reboot): after boot the flags are still set, the listener starts, E2's entry opens, E3's Secret is still current"
+# >>> ADD NEW U ROWS (U49 upward) HERE, and add each to EXPECTED_ROWS and to mode_rows <<<
+
+leg E1 "files" "preconditions: secrets encryption on; one server; keystore-run/ and both logs present, service-user 0600, SF_APPEND set; the doctor user-scope row on; keystore.sh --check exits 0 on the build" "the append-only files"
+leg E2 "socket-ops" "the user, no sudo, puts user/<me>/e2e-token (short-name form): exit 0; the CLI prints the resolved user/<uid>; k3sm keys list shows it; the audit log has a put line with no value" "the socket operations"
+leg E3 "kd-reconcile" "an admin binds k3sm:keystore-delivery-author for k3sm:local:<uid> in ks-e2e and the user delivers the entry to Secret e2e-token: KeyDelivery Ready, reason Delivered, observedGeneration current; requestedBy is k3sm:local:<uid>; a pod mounting the Secret reads exactly the stored bytes" "the KeyDelivery reconciler"
+leg E4 "verbs" "the user rotates (rotate --in -), then rotate --from-version 1: the pod's mounted file moves to v2, then to v1's bytes as v3, within one sweep each" "the k3sm keys verbs"
+leg E5 "exec" "k3sm keys exec user/<uid>/e2e-token --env TOKEN -- /usr/bin/env: the child sees TOKEN; the CLI wrote nothing else; ps during the run shows no value in argv; one exec-read audit line" "the non-root CLI and exec"
+leg E6 "socket-ops" "as the one login user: list, exec, rotate, rm and deliver of an unused other uid's entry and of system/e2e-sys, then a connect as root and as the service user: not found each time, text identical to an absent entry of the user's own, refused audit lines carry the user's uid; root and the service user are refused at accept" "the socket operations; the socket listener"
+leg E7 "kd-reconcile" "an admin copies E3's KeyDelivery into ks-e2e-2, where the user also has the role: Authorized=False, reason NotRecorded, no Secret" "the KeyDelivery reconciler"
+leg E8 "kd-reconcile" "an admin strips the CRD's transition rules (restored at the end) and edits E3's spec.secretName: Authorized=False, NotRecorded (digest mismatch); the original Secret deleted; no Secret under the new name" "the target digest"
+leg E9 "files" "sudo cp saves current, the user rotates, sudo cp puts the old current back, then the same for a system/ entry: both lists mark the entry corrupt with the floor message" "the append-only files"
+leg E10 "sandbox" "a pod pinned to the darwin node tries connect(2) to keys.sock and to read server/keystore, keystore-run/, both logs and Phase A's two files: EPERM for each" "runtimed's sandbox change"
+leg E11 "kd-lifecycle" "an admin removes the user's RoleBinding in ks-e2e: within one sweep the Secret is deleted; Authorized=False, NotAuthorized" "the KeyDelivery reconciler (lifecycle)"
+leg E12 "socket-ops" "root puts and delivers system/e2e-sys; then the user, with no sudo, tries deliver, list and exec on it: root's Secret is delivered and stays; each of the user's attempts answers not found and nothing reaches ks-e2e-2" "root delivery; the socket operations"
+leg E13 "kd-author" "a ServiceAccount token creates a KeyDelivery: refused at admission" "KeyDelivery authoring"
+leg E14 "kd-lifecycle" "k3sm keys undeliver on E3's object, then kubectl delete of a second one: each Secret deleted before its object goes; the hint printed; no orphan Secret after one sweep" "the KeyDelivery reconciler (lifecycle)"
+leg E15 "" "upgrade from the previous release's install tree, then sudo k3sm install: system scope intact; user scope comes on after the install, off with the Warn and doctor row before it" "upgrade visibility"
+leg E16 "" "rollback to the previous release, then forward again: the old build runs with the keystore files unused; after rolling forward the user's entries, records and Secrets are intact and re-adopted" "the rollback guard"
+leg E17 "files" "backup and restore round trip with cp, then floor --rebuild and audit --rotate: before the rebuild the listener refuses (flags clear); after it every entry opens and both logs are flagged" "the flag check"
+leg E18 "socket" "an old worker on the previous release joins this server: worker Ready; pods there mount delivered Secrets; no keystore listener or reconciler on the worker" "server-only listener"
+leg E19 "socket" "launchctl kickstart -k of the server while a client is connected mid-request: a clean error, not a hang; the listener back within its backoff; kine and the apiserver back; no partial record" "the listener lifecycle"
+leg E20 "files" "reboot of the server node, operator-attended (--attended reboot): after boot the flags are still set, the listener starts, E2's entry opens, E3's Secret is still current" "the flag check"
+# >>> ADD NEW E LEGS (E21 upward) HERE, with the unit mode that delivers the last feature <<<
 
 nrows=${#R_ID[@]}
 
@@ -388,8 +420,36 @@ pkg_rel() {
 	esac
 }
 
+# nocgo reports whether package $1 runs with CGO_ENABLED=0, and so without
+# -race: the repos that import no cgo-backed code.
+nocgo() {
+	case "${1%%/*}" in
+	apis | darwin-net) return 0 ;;
+	esac
+	return 1
+}
+work=""
+if [ -f "$(dirname "$K3SM_ROOT")/go.work" ]; then work="$(dirname "$K3SM_ROOT")/go.work"; fi
+# gotest pkg args... runs go test in package pkg's repo, CGO and GOWORK set for
+# this run only: -race under cgo, none without; k3sm runs as it is, a sibling
+# through the go.work beside the root when there is one.
+gotest() {
+	local pkg="$1" dir cgo=1 race=-race
+	shift
+	dir="$(repo_dir "$pkg")"
+	if nocgo "$pkg"; then cgo=0 race=""; fi
+	if [ "$dir" = "$K3SM_ROOT" ]; then
+		(cd "$dir" && CGO_ENABLED="$cgo" go test ${race:+"$race"} "$@")
+	elif [ -n "$work" ]; then
+		(cd "$dir" && CGO_ENABLED="$cgo" GOWORK="$work" go test ${race:+"$race"} "$@")
+	else
+		(cd "$dir" && CGO_ENABLED="$cgo" go test ${race:+"$race"} "$@")
+	fi
+}
+
 failed=0
 pending=0
+pend_missing=0
 row() { printf '%-4s %-8s %s\n' "$1" "$2" "$3"; }
 pass() { row "$1" PASS "$2"; }
 fail() { row "$1" FAIL "$2"; failed=$((failed + 1)); }
@@ -398,6 +458,36 @@ pending_row() { row "$1" PENDING "$2"; pending=$((pending + 1)); }
 # --listed: the row-presence lint.
 if [ "$mode" = listed ]; then
 	echo "keystore --listed: a row-presence lint, not proof: no test runs"
+	list_dir="$(mktemp -d "${TMPDIR:-/tmp}/keystore-list.XXXXXX")"
+	trap 'rm -rf "$list_dir"' EXIT
+	# L_PKG and L_HOW are parallel: how package L_PKG's tests were found, in
+	# the file $list_dir/<n>.list: go (go test -list), grep, or none (no checkout).
+	L_PKG=()
+	L_HOW=()
+	# list_pkg sets LK to the index of package $1's test list, making it on
+	# first use (not in a subshell: the arrays must persist).
+	LK=0
+	list_pkg() {
+		local k=0 dir how n
+		while [ "$k" -lt "${#L_PKG[@]}" ]; do
+			if [ "${L_PKG[$k]}" = "$1" ]; then LK=$k; return 0; fi
+			k=$((k + 1))
+		done
+		n=${#L_PKG[@]}
+		dir="$(repo_dir "$1")/$(pkg_rel "$1")"
+		: >"$list_dir/$n.list"
+		if [ ! -d "$dir" ]; then
+			how=none
+		elif gotest "$1" -list '.*' "$(pkg_rel "$1")" >"$list_dir/$n.list" 2>/dev/null; then
+			how=go
+		else
+			how="grep"
+			grep -h -o -E '^func (Test|Fuzz|Benchmark|Example)[A-Za-z0-9_]*' "$dir"*_test.go 2>/dev/null | sed 's/^func //' >"$list_dir/$n.list" || true
+		fi
+		L_PKG+=("$1")
+		L_HOW+=("$how")
+		LK=$n
+	}
 	for id in $EXPECTED_ROWS; do
 		if [ -z "$(row_index "$id")" ]; then fail "$id" "in the design's gate table, not in this script"; fi
 	done
@@ -414,10 +504,13 @@ if [ "$mode" = listed ]; then
 		esac
 		missing=""
 		found=0
+		fb=""
 		for spec in ${R_TESTS[$i]}; do
 			pkg="${spec%%::*}" t="${spec#*::}"
-			dir="$(repo_dir "$pkg")/$(pkg_rel "$pkg")"
-			if [ -d "$dir" ] && grep -q -E "^func $t\(" "$dir"*_test.go 2>/dev/null; then
+			list_pkg "$pkg"
+			k=$LK
+			if [ "${L_HOW[$k]}" = grep ]; then fb=" (grep fallback)"; fi
+			if grep -q -x -- "$t" "$list_dir/$k.list"; then
 				found=$((found + 1))
 			else
 				missing="$missing $t ($pkg)"
@@ -429,25 +522,43 @@ if [ "$mode" = listed ]; then
 			*) row "$id" LISTED "no named test" ;;
 			esac
 		elif [ -z "$missing" ]; then
-			row "$id" LISTED "$found named test(s) found"
+			row "$id" LISTED "$found named test(s) found$fb"
 		elif [ "${R_KIND[$i]}" = pend ]; then
-			row "$id" "MISSING (pending row)" "${missing# }"
+			row "$id" "MISSING (pending row)" "${missing# }$fb"
+			pend_missing=$((pend_missing + 1))
 		else
-			fail "$id" "named test(s) not found:$missing"
+			fail "$id" "named test(s) not found:$missing$fb"
 		fi
 		i=$((i + 1))
 	done
 	if [ "$failed" -gt 0 ]; then echo "keystore --listed: FAIL ($failed) (not proof)"; exit 1; fi
-	echo "keystore --listed: every row present (not proof)"
+	if [ "$pend_missing" -gt 0 ]; then
+		echo "keystore --listed: every row present, $pend_missing pending row(s) name tests that do not exist yet (not proof)"
+		exit 3
+	fi
+	echo "keystore --listed: every row present, every named test exists (not proof)"
 	exit 0
 fi
 
 # wanted reports whether row $1 runs in this mode.
+# A leg's unit mode is in R_TODO; under a unit mode with --lab only the legs
+# mapped to that mode run.
 wanted() {
-	case "$mode" in
-	check) return 0 ;;
-	lab) case "$1" in E*) return 0 ;; esac; return 1 ;;
+	local k
+	case "$1" in
+	E*)
+		if [ "$lab" = 1 ]; then
+			if [ "$mode" = lab ]; then return 0; fi
+			k="$(row_index "$1")"
+			if [ -n "$k" ] && [ "${R_TODO[$k]}" = "$mode" ]; then return 0; fi
+			return 1
+		fi
+		if [ "$mode" = check ]; then return 0; fi
+		return 1
+		;;
 	esac
+	if [ "$mode" = check ]; then return 0; fi
+	if [ "$mode" = lab ]; then return 1; fi
 	case " $(mode_rows "$mode") " in *" $1 "*) return 0 ;; esac
 	return 1
 }
@@ -487,16 +598,15 @@ while [ "$i" -lt "$nrows" ]; do
 	i=$((i + 1))
 done
 
-work=""
-if [ -f "$(dirname "$K3SM_ROOT")/go.work" ]; then work="$(dirname "$K3SM_ROOT")/go.work"; fi
 out_dir=""
 if [ "${#P_PKG[@]}" -gt 0 ]; then
 	out_dir="$(mktemp -d "${TMPDIR:-/tmp}/keystore-gate.XXXXXX")"
 	trap 'rm -rf "$out_dir"' EXIT
 fi
 # One run of each package's tests (under --check, the whole package; under a
-# unit mode, the mode's tests only), under -race, verbose so each named test
-# can be checked: a test that does not run is not a pass.
+# unit mode, the mode's tests only), verbose so each named test can be checked:
+# a test that does not run is not a pass. Under -race unless the package runs
+# with CGO_ENABLED=0, which the run says.
 j=0
 while [ "$j" -lt "${#P_PKG[@]}" ]; do
 	pkg="${P_PKG[$j]}"
@@ -507,12 +617,9 @@ while [ "$j" -lt "${#P_PKG[@]}" ]; do
 	rc=0
 	if [ ! -d "$dir" ]; then
 		rc=absent
-	elif [ "$dir" = "$K3SM_ROOT" ]; then
-		go test -race -count=1 -v ${run[@]+"${run[@]}"} "$(pkg_rel "$pkg")" >"$out_dir/$j.out" 2>&1 || rc=$?
-	elif [ -n "$work" ]; then
-		(cd "$dir" && GOWORK="$work" go test -race -count=1 -v ${run[@]+"${run[@]}"} "$(pkg_rel "$pkg")") >"$out_dir/$j.out" 2>&1 || rc=$?
 	else
-		(cd "$dir" && go test -race -count=1 -v ${run[@]+"${run[@]}"} "$(pkg_rel "$pkg")") >"$out_dir/$j.out" 2>&1 || rc=$?
+		if nocgo "$pkg"; then echo "keystore: $pkg: CGO_ENABLED=0, run without -race"; fi
+		gotest "$pkg" -count=1 -v ${run[@]+"${run[@]}"} "$(pkg_rel "$pkg")" >"$out_dir/$j.out" 2>&1 || rc=$?
 	fi
 	P_RC[j]="$rc"
 	j=$((j + 1))
@@ -567,7 +674,7 @@ judge_g22() {
 lab_verdicts=()
 judge_leg() {
 	local i="$1" id="${R_ID[$1]}" rc=0
-	if [ "$mode" != lab ]; then
+	if [ "$lab" != 1 ]; then
 		row "$id" RIG "${R_DESC[$i]} (rig leg: run --lab)"
 		return 0
 	fi
@@ -626,17 +733,44 @@ while [ "$j" -lt "${#P_PKG[@]}" ]; do
 	j=$((j + 1))
 done
 
-if [ "$mode" = lab ]; then
+# The final status is decided before the lab record, so the record carries it.
+final=0
+if [ "$failed" -gt 0 ]; then
+	final=1
+	msg="keystore: FAIL ($failed failed, $pending pending)"
+elif [ "$pending" -gt 0 ]; then
+	final=3
+	msg="keystore: PENDING ($pending pending, none failed)"
+else
+	msg="keystore: PASS"
+fi
+
+# sibling_state prints "<sha> clean|dirty" for the checkout at $1, or "absent".
+sibling_state() {
+	local sha dirty=clean
+	if ! sha="$(git -C "$1" rev-parse HEAD 2>/dev/null)"; then echo absent; return 0; fi
+	if [ -n "$(git -C "$1" status --porcelain 2>/dev/null)" ]; then dirty=dirty; fi
+	echo "$sha $dirty"
+}
+
+if [ "$lab" = 1 ]; then
 	record="$K3SM_LAB_EVIDENCE/keystore-lab-$(date -u +%Y%m%dT%H%M%SZ).txt"
+	lab_mode="lab"
+	if [ "$mode" != lab ]; then lab_mode="$mode --lab"; fi
 	{
 		echo "date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+		echo "mode: $lab_mode"
 		echo "head: $(git rev-parse HEAD)"
+		echo "k3sm: $(sibling_state "$K3SM_ROOT")"
+		for r in apis runtimed darwin-net; do
+			echo "$r: $(sibling_state "$(dirname "$K3SM_ROOT")/$r")"
+		done
 		echo "evidence: $K3SM_LAB_EVIDENCE"
 		for v in ${lab_verdicts[@]+"${lab_verdicts[@]}"}; do echo "$v"; done
+		echo "exit: $final"
 	} >"$record"
 	echo "keystore: lab record $record"
 fi
 
-if [ "$failed" -gt 0 ]; then echo "keystore: FAIL ($failed failed, $pending pending)"; exit 1; fi
-if [ "$pending" -gt 0 ]; then echo "keystore: PENDING ($pending pending, none failed)"; exit 3; fi
-echo "keystore: PASS"
+echo "$msg"
+exit "$final"
