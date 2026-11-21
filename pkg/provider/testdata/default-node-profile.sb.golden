@@ -84,7 +84,8 @@
 ;;   reap stores: podreap, vmreap
 ;;   daemon trees: server, agent, run, blobs, status, sbpl, index,
 ;;     operator, unpacked, snapshots, ingest, guest-artifacts,
-;;     artifact-partial, artifacts, vmboot-failures, xcode-cache
+;;     artifact-partial, image-partial, artifacts, vmboot-failures,
+;;     xcode-cache
 ;;   exposures root: expose
 ;;   shared volume temp dir: .TemporaryItems
 (deny file-read* file-write*
@@ -129,6 +130,8 @@
   (subpath "/private/var/lib/k3sm/guest-artifacts")
   (subpath "/var/lib/k3sm/artifact-partial")
   (subpath "/private/var/lib/k3sm/artifact-partial")
+  (subpath "/var/lib/k3sm/image-partial")
+  (subpath "/private/var/lib/k3sm/image-partial")
   (subpath "/var/lib/k3sm/artifacts")
   (subpath "/private/var/lib/k3sm/artifacts")
   (subpath "/var/lib/k3sm/vmboot-failures")
