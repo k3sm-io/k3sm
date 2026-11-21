@@ -1254,12 +1254,19 @@ service user can only add to.
   cap: a configured share above `logHardCap / 16` is refused at server start, so no fewer than
   16 uids can fill a log. The server counts each uid's bytes per log from the log at start and
   on every append.
-  - *What is charged.* A line is charged to the uid it acts for: a socket operation's to the
-    peer uid, and a reconciler `deliver-write` or `deliver-delete` line, and the floor line of a
-    record withdrawal, to the delivery's owner uid. Lines written for root verbs are charged to
-    no uid.
-  - *A share refusal is one uid's alone.* A uid past its share has its own mutations refused
-    with `ErrLogFull`; every other uid is unaffected and keeps its own share. That refusal
+  - *What is charged.* Every line counts against the share of the uid it acts for, reads
+    included: a socket operation's line (`list`, `read-for-exec` and `deliveries` as much as
+    `put`) and its floor line to the peer uid, a `refused` line to the peer uid it names, and a
+    reconciler `deliver-write` or `deliver-delete` line, and the floor line of a record
+    withdrawal, to the delivery's owner uid. Lines written for root verbs are charged to no
+    uid.
+  - *Past the share, reads are refused too.* A uid past its share has its own mutations and
+    its own reads refused with `ErrLogFull` (code `log-full`) before any line is written, so
+    no read is a way around the share. Its `refused` lines and their summaries are not written
+    either: the server counts that uid's dropped lines in memory, `doctor` shows the count,
+    and root's next `audit --rotate` writes it as one line charged to no uid.
+  - *A share refusal is one uid's alone.* Every other uid is unaffected: its mutations and
+    reads draw on its own share, which no other uid's lines are charged to (U51). That refusal
     happens before any append and is not a failed append, so it never counts as the global
     append failure that refuses every uid's reads ("The audit log", fail closed); only an append
     that the file system refuses, or the hard cap, does.
@@ -1398,8 +1405,9 @@ surface, and the app consumes only those.
 **Bounds.** 16 concurrent connections, at most 2 per uid among them; 10 seconds per request;
 5 mutating operations a second per uid; `list` and `deliveries` rate-limited per uid like
 mutations, at 5 a second; `read-for-exec` at most 30 a minute per uid, each audited as
-`exec-read` (U28, U34, U51). Reads are limited too because each one writes an audit line, so
-an unlimited read would be a way around the per-uid log share.
+`exec-read` (U28, U34, U51). Reads are limited too because each one writes an audit line; that
+line is charged to the uid's log share like a mutation's, and past the share the read is
+refused ("Per-uid fairness").
 
 **Operations.** `put`, `rotate` (a value, or `from_version`), `list` (own scope only), `rm`,
 `read-for-exec` (own entry only), `deliver` and `withdraw` ("KeyDelivery"), and `deliveries`
@@ -1886,8 +1894,10 @@ the uid throughout.
    Pod-readable Secret on the node, exactly as Phase A says. Direct mounts (Phase B) would
    remove the kine copy, not the Pod reach.
 5. A local user can spend the server's CPU, up to 16 MiB of disk within quota, two
-   connections, and its own share of each shared log. Past that share only its own mutations
-   are refused with `ErrLogFull`; it cannot fill a log for other users.
+   connections, and its own share of each shared log, which every line it causes is charged
+   to, reads included. Past that share its own mutations and reads are refused with
+   `ErrLogFull`; it cannot fill a log for other users, and it cannot refuse another uid's
+   mutations or reads, which draw on that uid's own share.
 6. A user account deleted and recreated under the same uid loses its old scope, by design
    (U6), and root must clear it.
 7. The peer uid is the effective uid at connect time, so a setuid program the user runs acts as
@@ -2047,7 +2057,7 @@ each stated in the change that makes it. U15 is held for a K0 amendment and U39 
 | U48 | seam guard: `pkg/keystore/socket`'s `TestMain` installs a panicking stub on each of its seams, so no unit test reaches a real primitive | `k3sm/pkg/keystore/socket::TestRealPrimitivesUnreachable` | pending: the socket listener |
 | U49 | `runtimed/pkg/keystorepaths` builds with `CGO_ENABLED=0` and imports only the standard library; `k3sm/pkg/keystore` imports that leaf and never `runtimed/pkg/sandbox` | `runtimed/pkg/keystorepaths::TestLeafImportsStdlibOnly`; `k3sm/pkg/keystore::TestKeystoreImportsNoSandbox` | pending: runtimed's sandbox change, the append-only files |
 | U50 | the defeat list, run as the service user against both flagged logs (integration, root-run in the gate's `--root` mode, flag variant): `chflags nosappnd`, `O_TRUNC`, `ftruncate`, `pwrite` at an offset, a shared writable `mmap` write, `F_PUNCHHOLE`, `link()`, `fclonefileat` then a swap, a `renamex_np` swap through the parent, `exchangedata`, `unlink` and `rename` through the parent, a second open with `O_TRUNC`, and owner `chmod`; each fails, the bytes and the flag are unchanged, and an `O_APPEND` write still succeeds | `k3sm/pkg/keystore::TestAppendOnlyDefeatListAsServiceUser` | pending: the append-only files |
-| U51 | per-uid log fairness: the share is a fixed byte count, 16 MiB by default, and a share above 1/16 of the hard cap is refused at start; a uid past its share has its own mutations refused with `ErrLogFull` while another uid's succeed, and that refusal is never the global append failure that refuses every uid's reads; `list` and `deliveries` are rate-limited per uid | `k3sm/pkg/keystore/socket::TestLogSharePerUIDRefusesOnlyThatUID`, `TestLogShareAtMostOneSixteenthOfHardCap`, `TestShareRefusalIsNotGlobalAppendFailure`, `TestReadRateLimitPerUID` | pending: the socket operations |
+| U51 | per-uid log fairness: the share is a fixed byte count, 16 MiB by default, and a share above 1/16 of the hard cap is refused at start; every line is charged to the uid it acts for, reads (`list`, `read-for-exec`, `deliveries`) included; a uid past its share has its own mutations and reads refused with `ErrLogFull` (`log-full`) while another uid's succeed, and that refusal is never the global append failure that refuses every uid's reads; a uid past its share cannot affect another uid's mutations, reads or revocations; `list` and `deliveries` are rate-limited per uid | `k3sm/pkg/keystore/socket::TestLogSharePerUIDRefusesOnlyThatUID`, `TestLogShareAtMostOneSixteenthOfHardCap`, `TestShareRefusalIsNotGlobalAppendFailure`, `TestReadRateLimitPerUID`, `TestReadsChargedToShare`, `TestShareExhaustionIsolatedPerUID` | pending: the socket operations |
 | U52 | every root verb writes one audit line with `via` `root` once the log exists, and none before it | `k3sm/cmd/k3sm::TestEveryRootVerbWritesAuditLine` | pending: the append-only files |
 | U53 | every reconciler Secret write and delete, and every record withdrawal, writes one audit line with `via` `reconciler` | `k3sm/pkg/keystore/reconcile::TestEveryReconcilerWriteAndDeleteAudited` | pending: the KeyDelivery reconciler (lifecycle) |
 | U54 | a pre-frame refusal (uid 0, the service uid, a uid below 501) writes a `refused` line with the peer uid, rate-limited per uid with a dropped-count summary | `k3sm/pkg/keystore/socket::TestPreFrameRefusalsAudited`, `TestPreFrameRefusalLinesRateLimited` | pending: the socket listener |

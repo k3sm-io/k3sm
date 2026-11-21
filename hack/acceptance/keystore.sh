@@ -381,8 +381,8 @@ pend U49 "the shared keystore path names build with CGO_ENABLED=0 and import onl
 	runtimed/pkg/keystorepaths::TestLeafImportsStdlibOnly k3sm/pkg/keystore::TestKeystoreImportsNoSandbox
 pend U50 "the defeat list run as the service user against both flagged logs, root-run in --root mode: each defeat fails, bytes and flag unchanged, O_APPEND still succeeds (append-only files)" \
 	k3sm/pkg/keystore::TestAppendOnlyDefeatListAsServiceUser
-pend U51 "per-uid log fairness: the share is a fixed byte count, at most 1/16 of the hard cap; a uid past its share is refused with ErrLogFull while another uid's succeed, never as the global append failure; list and deliveries are rate-limited per uid (socket operations)" \
-	k3sm/pkg/keystore/socket::TestLogSharePerUIDRefusesOnlyThatUID TestLogShareAtMostOneSixteenthOfHardCap TestShareRefusalIsNotGlobalAppendFailure TestReadRateLimitPerUID
+pend U51 "per-uid log fairness: the share is a fixed byte count, at most 1/16 of the hard cap; every line, reads included, is charged to its uid; a uid past its share has its mutations and reads refused with ErrLogFull while another uid's succeed, never as the global append failure; it cannot affect another uid's mutations or revocations; list and deliveries are rate-limited per uid (socket operations)" \
+	k3sm/pkg/keystore/socket::TestLogSharePerUIDRefusesOnlyThatUID TestLogShareAtMostOneSixteenthOfHardCap TestShareRefusalIsNotGlobalAppendFailure TestReadRateLimitPerUID TestReadsChargedToShare TestShareExhaustionIsolatedPerUID
 pend U52 "every root verb writes one audit line with via root once the log exists, and none before it (append-only files)" \
 	k3sm/cmd/k3sm::TestEveryRootVerbWritesAuditLine
 pend U53 "every reconciler Secret write and delete, and every record withdrawal, writes one audit line with via reconciler (KeyDelivery lifecycle)" \
