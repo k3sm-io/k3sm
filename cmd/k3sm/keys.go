@@ -610,14 +610,16 @@ type keysListEntry struct {
 	Error  string `json:"error,omitempty"`
 }
 
-func keysEntryStatus(e keystore.Entry) keysListEntry {
+// keysEntryStatus is e's list row. Its error is a store error printed on
+// stdout, so it is scrubbed of roots (scrubPaths) here, where it is built.
+func keysEntryStatus(e keystore.Entry, roots ...string) keysListEntry {
 	out := keysListEntry{Name: qualify(e.Name), Status: "ok"}
 	if e.Err != nil {
 		out.Status = "error"
 		if errors.Is(e.Err, keystore.ErrCorrupt) {
 			out.Status = "corrupt"
 		}
-		out.Error = e.Err.Error()
+		out.Error = scrubPaths(e.Err, roots...)
 		return out
 	}
 	out.Kind = e.Current.Kind.String()
@@ -658,12 +660,7 @@ func keysList(ctx context.Context, args []string, env keysEnv) int {
 	rows := make([]keysListEntry, 0, len(entries))
 	code := keysOK
 	for _, e := range entries {
-		r := keysEntryStatus(e)
-		// The row's error is a store error printed on stdout: scrubbed as
-		// failf scrubs.
-		if e.Err != nil {
-			r.Error = scrubPaths(e.Err, v.roots...)
-		}
+		r := keysEntryStatus(e, v.roots...)
 		if r.Status != "ok" {
 			code = keysRefused
 		}

@@ -783,6 +783,17 @@ func TestKeysScrubPaths(t *testing.T) {
 	}
 }
 
+// TestKeysEntryStatusScrubs: a list row is scrubbed of the store's roots
+// where it is built.
+func TestKeysEntryStatusScrubs(t *testing.T) {
+	work := "/Hunter2/server"
+	e := keystore.Entry{Name: "a", Err: fmt.Errorf("open %s/keystore/a/v1: %w", work, keystore.ErrCorrupt)}
+	r := keysEntryStatus(e, work, work+"/cred/keystore-master", "/Hunter2")
+	if r.Status != "corrupt" || strings.Contains(r.Error, "Hunter2") || !strings.Contains(r.Error, "<work-dir>/keystore/a/v1") {
+		t.Fatalf("keysEntryStatus = %+v, want a corrupt row with the work dir scrubbed", r)
+	}
+}
+
 // TestKeysReadValueOneBuffer: readValue reads into one buffer of the cap plus
 // one byte, allocated before the read, so the value it returns is that buffer
 // and clearing it clears every copy; a reader that returns a byte at a time
