@@ -347,7 +347,11 @@ func isTempName(n, name string) bool {
 }
 
 // syncDir fsyncs root's directory, making a rename or removal in it durable.
-func syncDir(root *os.Root) error {
+// It is a variable so a test can observe and fail each fsync.
+var syncDir = fsyncDir
+
+// fsyncDir is syncDir's implementation.
+func fsyncDir(root *os.Root) error {
 	d, err := root.Open(".")
 	if err != nil {
 		return err

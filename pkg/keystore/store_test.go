@@ -29,6 +29,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -1239,6 +1240,87 @@ func TestEntryWithNoPointer(t *testing.T) {
 	}
 }
 
+// TestMkdirSyncsParent: every directory a Put creates has its parent fsynced
+// before its own step, so a power loss cannot keep what is written under it
+// while losing its name; and a failed parent fsync fails the Put there, with
+// that directory's step never reached and nothing written after it.
+func TestMkdirSyncsParent(t *testing.T) {
+	ctx := context.Background()
+	// parentOf maps each directory a first Put creates to its parent.
+	parentOf := map[string]string{"keystore": "server", "cred": "server", "keystore-master": "cred", "k": "keystore"}
+	t.Run("order", func(t *testing.T) {
+		var events []string
+		setSyncDir(t, func(root *os.Root) error {
+			events = append(events, "fsync "+filepath.Base(root.Name()))
+			return fsyncDir(root)
+		})
+		s, _ := newTestStore(t)
+		s.step = func(name string) error { events = append(events, name); return nil }
+		mustPut(t, s, "k", KindOpaque, []byte("x"))
+		seen := 0
+		for i, ev := range events {
+			dir, ok := strings.CutPrefix(ev, "mkdir ")
+			if !ok {
+				continue
+			}
+			seen++
+			if want := "fsync " + parentOf[dir]; i == 0 || events[i-1] != want {
+				t.Errorf("%s not directly after %s: %v", ev, want, events)
+			}
+		}
+		if seen != len(parentOf) {
+			t.Fatalf("saw %d mkdir steps, want %d: %v", seen, len(parentOf), events)
+		}
+	})
+	// Each case fails the nth fsync of the parent, the one that precedes dir.
+	for _, tc := range []struct {
+		dir string
+		nth int
+	}{{"keystore", 1}, {"cred", 2}, {"keystore-master", 1}, {"k", 1}} {
+		t.Run("fail before "+tc.dir, func(t *testing.T) {
+			parent := parentOf[tc.dir]
+			n := 0
+			setSyncDir(t, func(root *os.Root) error {
+				if filepath.Base(root.Name()) == parent {
+					if n++; n == tc.nth {
+						return errors.New("injected fsync failure")
+					}
+				}
+				return fsyncDir(root)
+			})
+			s, _ := newTestStore(t)
+			var steps []string
+			s.step = func(name string) error { steps = append(steps, name); return nil }
+			v, err := s.Put(ctx, "k", KindOpaque, []byte("x"))
+			if err == nil || !strings.Contains(err.Error(), "injected fsync failure") || v != (Version{}) {
+				t.Fatalf("Put = %+v %v, want the injected fsync failure and no version", v, err)
+			}
+			if slices.Contains(steps, "mkdir "+tc.dir) {
+				t.Fatalf("steps %v reached mkdir %s past its failed parent fsync", steps, tc.dir)
+			}
+			if slices.Contains(steps, "write current") {
+				t.Fatalf("steps %v went on to write the pointer", steps)
+			}
+			setSyncDir(t, fsyncDir)
+			if _, _, err := s.Current(ctx, "k"); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("Current after the failed Put: %v, want ErrNotFound", err)
+			}
+			if got, err := s.List(ctx); err != nil || len(got) != 0 {
+				t.Fatalf("List after the failed Put = %+v %v, want no entry", got, err)
+			}
+			mustPut(t, s, "k", KindOpaque, []byte("retried"))
+		})
+	}
+}
+
+// setSyncDir replaces the syncDir seam for the rest of t.
+func setSyncDir(t *testing.T, fn func(*os.Root) error) {
+	t.Helper()
+	old := syncDir
+	syncDir = fn
+	t.Cleanup(func() { syncDir = old })
+}
+
 // TestPutCrashAtEveryStep injects a crash at each durable step of a Put, then
 // checks the name is not an entry and a retried Put stores the retried value.
 func TestPutCrashAtEveryStep(t *testing.T) {
@@ -1249,9 +1331,9 @@ func TestPutCrashAtEveryStep(t *testing.T) {
 		s.step = func(name string) error { steps = append(steps, name); return nil }
 		mustPut(t, s, "k", KindOpaque, []byte("x"))
 	}
-	// Each directory's step comes after its parent is fsynced, so the master
-	// directory is durable before the master is written into it, and the
-	// entry directory before its files.
+	// The steps come in this order, each directory's mkdir before anything
+	// written into it; that each parent is fsynced before its directory's
+	// step is TestMkdirSyncsParent's to check.
 	want := "mkdir keystore,mkdir cred,mkdir keystore-master,write master,write master.sha256,mkdir k,write generation,write v1,write current"
 	if strings.Join(steps, ",") != want {
 		t.Fatalf("Put steps = %v, want %s", steps, want)
