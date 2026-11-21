@@ -84,8 +84,8 @@ The fixed decisions:
   credential directory, `/var/lib/k3sm/server/cred/keystore-master/` (the maintainer's
   ruling).
 - Each version is sealed with AES-256-GCM. The additional data is a length-prefixed
-  encoding of (record-format version, kind, name, version, generation), never a bare
-  concatenation.
+  encoding of six fields (record-format version, scope, kind, name, version, generation),
+  never a bare concatenation; the scope is supplied by the opening store (see "Scope").
 - The nonce is 96 bits from crypto/rand, fresh on every seal including Rewrap, never
   derived from the name or the version.
 - The current pointer flips last on rotation. It is written to a temporary file and
@@ -136,6 +136,7 @@ The fixed decisions:
         master.next.sha256
     keystore/                           0700, service user, a SIBLING of cred/
       .lock                             0600, the one lock file (see "Concurrency")
+      .user                             reserved for user scopes, not yet created (see "Scope")
       <name>/                           one directory per entry; created by Put with a bare
                                         Mkdir (never MkdirAll), so existence and creation
                                         are one atomic check
@@ -215,14 +216,17 @@ string to parse, so it has no parse failure to defend against. It is **unauthent
 display metadata**: it is not in the additional data, and a record whose `created` was
 edited still opens.
 
-**Associated data** is five fields:
+**Associated data** is six fields:
 
 ```
-AAD = LP(record-format-version) ‖ LP(kind) ‖ LP(name) ‖ LP(version, 8B BE) ‖ LP(generation, 16B)
+AAD = LP(record-format-version) ‖ LP(scope) ‖ LP(kind) ‖ LP(name) ‖ LP(version, 8B BE) ‖ LP(generation, 16B)
 ```
 
 `LP(x)` is a 4-byte big-endian length followed by `x`, so no field's bytes can be shifted
-into its neighbor. `created` is intentionally **not** in the AAD: it is display metadata,
+into its neighbor. The scope (see "Scope") is **supplied by the opening store, never read
+from the file**: it is not in the record's bytes, the header and offsets above do not change
+for it, and the store binds it from its own identity, as it checks the name against the
+directory the file lives in. `created` is intentionally **not** in the AAD: it is display metadata,
 and binding it would turn an honest clock difference (a restored backup, a changed system
 clock) into an authentication failure indistinguishable from real tampering of the value.
 
@@ -296,7 +300,7 @@ The write order on a change is: the record, then the pointer, then the floor.
 - **Put:** write `generation`, `v1`, `current` (sequence 1), then set the floor entry.
 - **Rotate:** write the new version file, flip `current` (sequence + 1), then raise the
   floor to that sequence.
-- **Delete:** remove the entry directory, then remove the floor entry.
+- **Delete:** remove `current`, then the entry directory, then remove the floor entry.
 
 A crash after the pointer flip but before the floor write leaves the floor one behind the
 pointer, which the rule above accepts (pointer at or above floor). So that the lag does not
@@ -326,11 +330,15 @@ and the threat model does not defend against root. A deliberate restore of an ol
 Ed25519: `hex(sha256(publicKey))` — a plain digest is fine since a public key is not
 secret, mirroring `EncryptionKeyFingerprint` in `pkg/executor/secretsencryption.go`.
 Opaque: `hex(HMAC-SHA256(fpKey, value))` truncated to 16 bytes, where
-`fpKey = HMAC-SHA256(master, "k3sm-keystore-fingerprint-v1")` — a fixed-label HMAC under
-the master, computed once per master rather than per entry. The key that seals records is
-derived the same way, `sealKey = HMAC-SHA256(master, "k3sm-keystore-seal-v1")`, so the
-master keys only HMAC under fixed labels and is never used both as a raw AES-GCM key on
-one path and an HMAC key on another.
+`fpKey = HMAC-SHA256(master, "k3sm-keystore-fingerprint-v1" ‖ 0x00 ‖ scope)` — a fixed-label
+HMAC under the master, with the label including the scope, computed once per master and
+scope rather than per entry. The key that seals records is derived the same way,
+`sealKey = HMAC-SHA256(master, "k3sm-keystore-seal-v1" ‖ 0x00 ‖ scope)`, so the master keys
+only HMAC under fixed labels and is never used both as a raw AES-GCM key on one path and an
+HMAC key on another. A scope holds no zero byte, so no two (label, scope) pairs give one
+input, and one master gives each scope its own keys. The `system` scope derives from the
+master directly, as here; a user scope will later seal under its own scope key, wrapped by
+the master, which is a separate design.
 
 **Where it is stored: nowhere.** It is computed when a version is read, from the decrypted
 value. `list` therefore opens each version once; that is one small AES-GCM open per version
@@ -338,6 +346,27 @@ value. `list` therefore opens each version once; that is one small AES-GCM open 
 **It changes across a Rewrap** for opaque entries, because its key derives from the master;
 an Ed25519 fingerprint does not. A fingerprint copied into a runbook goes stale after a
 Rewrap, and the verb says so when it finishes.
+
+### Scope
+
+Every record is sealed under a scope, bound into its associated data and its key labels.
+Phase A writes only `system`, the scope of the node's own store. The grammar is `system`, or
+the scope string `user/<uid>`, where `<uid>` is the user's decimal macOS uid: digits only, no
+leading zero unless it is `0`, and fitting in a uint32, so each uid has exactly one scope
+string. It is the uid and never the short name, because renaming a macOS account keeps the
+uid, and a scope bound to the short name would make every record of a renamed user fail to
+open. The store refuses any other scope before it seals, opens or derives anything. Entry
+names cannot contain `/`, so the qualified names `system/<name>` and `user/<uid>/<name>` are
+unambiguous: there is no shadowing between scopes and no search order.
+
+Two kind bytes are reserved for user scope: `0xFE`, a wrapped scope key, and `0xFD`, a sealed
+per-user delivery list. No record carries either yet, and a reader refuses them, like every
+kind byte not in "Record encoding", as `ErrCorrupt`. The entries'-directory name `.user` is
+reserved for user scopes too, and nothing creates it yet. The first-Put mint counts it as an
+entry, whatever its type, so a missing master with only `.user` present is
+`ErrMasterMissing`, never a new master. A user scope's store, its own key wrapped by the master, its
+non-root API, RBAC, delivery and on-disk location are a later design; the scope is in the
+format now so that adding one needs no format change.
 
 ### Master file trust
 
@@ -375,15 +404,20 @@ against the shape: a crash while writing `v1` leaves `generation` and a half-wri
 and that is an incomplete Put, not damage, or one crash would strand the name. So an empty
 directory, `generation` alone, and `generation` and `v1`, each with or without temporary
 files, are incomplete Puts, and only those shapes. `v1` without `generation` is damage, since
-Put cannot leave it. An incomplete Put is not an entry: `List` does not return it, `Current`, `Get` and `Delete` answer `ErrNotFound`, and the
-next Put of the name discards it and starts over. A directory with no `current` that holds
+Put cannot leave it. An incomplete Put is not an entry: `List` does not return it, `Current`, `Get` and `Delete` answer `ErrNotFound`
+(Delete removes it too, since a Delete that crashed after removing `current` leaves `generation` and a sealed
+`v1`), and the next Put of the name discards it and starts over. A directory with no `current` that holds
 any other file cannot be an incomplete Put, because Put writes nothing else before `current`.
 That is a pointer lost to damage or to an interrupted Delete, with sealed records still on
 disk. `List` returns it with `Err` set, wrapping `ErrCorrupt`, and `rm` removes the directory
 and its floor entry, since `rm` reads nothing inside an entry. Put of that name answers
 `ErrExists` and touches nothing, so no Put silently deletes versions an operator can still
-see. One case cannot be told apart: a one-version entry that lost `current` is `generation`
-and `v1`, the same as an incomplete Put, so the next Put discards it without saying so. The
+see. One case cannot be told apart by its shape: a one-version entry that lost `current` is `generation`
+and `v1`, the same as an incomplete Put, so the next Put discards it without saying so. Put
+over an entry whose `current` was lost thus discards that entry's sealed `v1`; what tells a
+lost pointer from a crashed Put is the pointer floor that lands with Rotate ("Pointer
+sequence and floor"), since Put records the floor entry only after `current`, so a crashed
+Put has none for the name and an entry that lost its pointer does. The
 loss is that one version, and the restore procedure under "Backup and snapshots" is what
 recovers it.
 
@@ -708,7 +742,7 @@ last pull request lands and no row is pending.
 | # | Requirement | Validated by |
 |---|---|---|
 | G1 | Standard library only: `go.mod` and `go.sum` unchanged by the implementation | the gate diffs both against the base |
-| G2 | The AAD is length-prefixed and covers format, kind, name, version, generation; a record moved to another name, version or generation fails to open | unit: swap each field, expect `ErrCorrupt` |
+| G2 | The AAD is length-prefixed and covers format, scope, kind, name, version, generation; a record moved to another scope, name, version or generation fails to open | unit: swap each field, expect `ErrCorrupt` |
 | G3 | Every seal draws a fresh 96-bit nonce, including Rewrap | unit: two seals of one plaintext differ; Rewrap changes every nonce |
 | G4 | Delete then Put of the same name does not reopen the old `v1` | unit: replay the old file onto the new entry, expect `ErrCorrupt` |
 | G5 | A previously valid `current` copied back over the current one is refused, with a message that names the floor and does not tell the operator to restore from backup; a floor file with no entry for the name, or no floor file, accepts an authenticating pointer | unit: Rotate, restore the earlier `current`, expect `ErrCorrupt` whose text names the floor and omits "restore it from backup"; one case each for the missing entry and the missing file |
@@ -722,7 +756,7 @@ last pull request lands and no row is pending.
 | G13 | A crash between the two master renames leaves a master that passes its trust check, and the next verb completes the swap | unit: stop after the first rename |
 | G14 | One lock serializes Rewrap, Rotate, Put and reads, with a bounded wait | unit: a held lock gives a timeout error within the bound, not a hang |
 | G15 | Files a root-run verb writes under `server/` are owned by the service user at the layout's modes | unit with a fake owner seam |
-| G16 | `list` returns every entry, marks an unreadable one with `Err`, and exits 1. A directory holding nothing, `generation`, or `generation` and `v1`, with or without leftover `.tmp` files, is an incomplete Put: not listed, `ErrNotFound` from `Current`, `Get` and `Delete`, discarded by the next Put. A directory with no `current` and any other file (`v1` without `generation` included) is damage: listed with `Err` wrapping `ErrCorrupt`, removed by `rm` with its floor entry, and `ErrExists` from Put with every file left in place | unit: both shapes, an empty directory, a `generation`-and-`.tmp` directory standing in for a crash while writing `v1`, a `v1`-without-`generation` directory, a `v1`-only directory standing in for the one-version entry that lost `current`, and a `v1`-and-`v2` directory with `current` removed; a CLI exit-code test for `list` and `rm` |
+| G16 | `list` returns every entry, marks an unreadable one with `Err`, and exits 1. A directory holding nothing, `generation`, or `generation` and `v1`, with or without leftover `.tmp` files, is an incomplete Put: not listed, `ErrNotFound` from `Current`, `Get` and `Delete` (Delete removes it too), discarded by the next Put. A directory with no `current` and any other file (`v1` without `generation` included) is damage: listed with `Err` wrapping `ErrCorrupt`, removed by `rm` with its floor entry, and `ErrExists` from Put with every file left in place | unit: both shapes, an empty directory, a `generation`-and-`.tmp` directory standing in for a crash while writing `v1`, a `v1`-without-`generation` directory, a `v1`-only directory standing in for the one-version entry that lost `current`, and a `v1`-and-`v2` directory with `current` removed; a CLI exit-code test for `list` and `rm` |
 | G17 | `show` prints a value only with `--reveal`, and then writes exactly the stored bytes with no trailing newline; no verb takes a value as an argument | CLI test over the usage strings; a `--reveal` test comparing stdout to the stored bytes for an opaque value and for 32- and 64-byte Ed25519 values |
 | G18 | Delivery is refused while encryption is off unless the override flag was set at server start; a delivered target stays when the override is removed | unit over the reconciler with a fake client |
 | G19 | The delivery declaration is root-owned and not shared-writable, and is refused otherwise | unit, the same cases as the manifest directory |

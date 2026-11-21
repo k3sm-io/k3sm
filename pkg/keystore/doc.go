@@ -20,9 +20,13 @@ limitations under the License.
 //
 // # Status
 //
-// This package is a scaffold. The implementation is contributed under issue
-// k3sm#731 against the design in docs/design/keystore.md, and the contract in
-// keystore.go is a sketch that design review may still change.
+// The implementation is contributed under issue k3sm#731 against the design in
+// docs/design/keystore.md, as a series of pull requests. FileStore is the core
+// store: Put, Current, Get, List and Delete, the record encoding, the master
+// key and its checks, the store lock and the ownership of what a root-run verb
+// writes. Rotate with the pointer floor, and Rewrap, arrive in the next two
+// pull requests; until then FileStore does not satisfy Store. No command uses
+// the package yet.
 //
 // # Scope (Phase A)
 //
