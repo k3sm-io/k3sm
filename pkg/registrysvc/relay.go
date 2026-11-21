@@ -416,7 +416,8 @@ func (r *Relay) retry(ctx context.Context, attempt int, stage, addr string, err 
 }
 
 // accept serves the push gate over ln, over TLS, at most relayMaxConns
-// connections at a time and at most relayMaxConnsPerSource from one address. It returns nil on a clean stop (ctx cancelled or the listener closed)
+// connections at a time and at most relayMaxConnsPerSource from one address,
+// with the rate floor applied while a connection waits for a slot. It returns nil on a clean stop (ctx cancelled or the listener closed)
 // so serve can tell "we are shutting down" from "this listener broke".
 //
 // One http.Server per address, with the gate mounted directly as its handler.
@@ -443,6 +444,7 @@ func (r *Relay) accept(ctx context.Context, ln net.Listener) error {
 	}()
 	ll := newLimitListener(ln, r.limits.maxConns, r.limits.maxConnsPerSource)
 	ll.log = r.log
+	ll.rate.floor, ll.rate.window = r.limits.rateFloor, r.limits.rateWindow
 	var served net.Listener = ll
 	if r.tls != nil {
 		// TLS wraps the connection cap, not the reverse: the *tls.Conn the
@@ -460,11 +462,13 @@ func (r *Relay) accept(ctx context.Context, ln net.Listener) error {
 // limitListener caps the connections a listener has open at once, in total
 // and per remote address. Accept blocks while the total cap is reached, so
 // clients holding connections open cost other clients a wait, never this
-// process its file descriptors. A connection from an address already at its
-// share is closed on accept instead: queueing it would make every other
-// address wait behind it. Both are logged as warnings naming the listener's
-// address, each at most once per warnEvery for this listener, so a flood of
-// either cannot flood the log.
+// process more than one file descriptor past the cap: the one connection it
+// has accepted and holds while it waits for a slot. A connection from an
+// address already at its share is closed on accept instead: queueing it would
+// make every other address wait behind it. Both are logged as warnings naming
+// the listener's address, each at most once per warnEvery for this listener,
+// so a flood of either cannot flood the log. While a connection waits, the
+// rate floor may cut the slowest held connection (relayrate.go).
 type limitListener struct {
 	net.Listener
 	sem       chan struct{}
@@ -479,6 +483,11 @@ type limitListener struct {
 	warnEvery time.Duration
 	full      warnGate // the relay at its connection limit
 	overShare warnGate // a source refused at its share
+	slowCut   warnGate // a connection cut below the rate floor
+
+	// rate is the rate floor (relayrate.go): the live connections and the
+	// last cut. A zero floor or window disables it.
+	rate rateFloor
 }
 
 func newLimitListener(ln net.Listener, total, perSource int) *limitListener {
@@ -494,35 +503,104 @@ func newLimitListener(ln net.Listener, total, perSource int) *limitListener {
 }
 
 // Accept waits for a free slot, then accepts a connection from an address
-// under its share.
+// under its share. When every slot is held it accepts the next connection
+// first and then waits for a slot for it, so it knows a connection is waiting,
+// and while it waits it applies the rate floor: at most once a window it cuts
+// the slowest connection below the floor to free a slot. A connection from an
+// address at its share is closed at once on either path.
 func (l *limitListener) Accept() (net.Conn, error) {
 	for {
 		select {
 		case l.sem <- struct{}{}:
-		default:
-			l.warnFull()
-			select {
-			case l.sem <- struct{}{}:
-			case <-l.done:
-				return nil, net.ErrClosed
+			c, err := l.Listener.Accept()
+			if err != nil {
+				<-l.sem
+				return nil, err
 			}
+			src := sourceOf(c.RemoteAddr())
+			if !l.open.take(src, l.perSource) {
+				_ = c.Close()
+				<-l.sem
+				// Logged after the slot is released, so a slow log handler
+				// never holds one.
+				l.warnOverShare(src)
+				continue
+			}
+			return l.track(c, src), nil
+		default:
 		}
+		l.warnFull()
 		c, err := l.Listener.Accept()
 		if err != nil {
-			<-l.sem
 			return nil, err
 		}
 		src := sourceOf(c.RemoteAddr())
 		if !l.open.take(src, l.perSource) {
 			_ = c.Close()
-			<-l.sem
-			// Logged after the slot is released, so a slow log handler never
-			// holds one.
 			l.warnOverShare(src)
 			continue
 		}
-		return &limitConn{Conn: c, release: func() { l.open.give(src); <-l.sem }}, nil
+		if err := l.waitSlot(); err != nil {
+			_ = c.Close()
+			l.open.give(src)
+			return nil, err
+		}
+		return l.track(c, src), nil
 	}
+}
+
+// track wraps c, which holds a slot and src's share, as a limitConn the rate
+// floor measures.
+func (l *limitListener) track(c net.Conn, src string) *limitConn {
+	lc := &limitConn{Conn: c}
+	if l.rate.enabled() {
+		lc.meter = newRateMeter(l.now, l.rate.window)
+		l.rate.add(lc)
+	}
+	lc.release = func() {
+		l.rate.remove(lc)
+		l.open.give(src)
+		<-l.sem
+	}
+	lc.src = src
+	return lc
+}
+
+// waitSlot waits for a free slot for a connection already accepted, cutting
+// the slowest connection below the rate floor when one is due, or returns
+// net.ErrClosed when the listener closes first.
+func (l *limitListener) waitSlot() error {
+	var tick <-chan time.Time
+	if l.rate.enabled() {
+		t := time.NewTicker(max(l.rate.window/relayRateChecks, time.Millisecond))
+		defer t.Stop()
+		tick = t.C
+	}
+	for {
+		l.cutSlowest()
+		select {
+		case l.sem <- struct{}{}:
+			return nil
+		case <-l.done:
+			return net.ErrClosed
+		case <-tick:
+		}
+	}
+}
+
+// cutSlowest cuts the connection the rate floor picks, if any, and logs it.
+func (l *limitListener) cutSlowest() {
+	if !l.rate.enabled() {
+		return
+	}
+	c, s, ok := l.rate.pick(l.now())
+	if !ok {
+		return
+	}
+	if c.meter.markCut() {
+		_ = c.Close()
+	}
+	l.warnSlowCut(c, s)
 }
 
 // warnFull logs that every slot is held, so the listener accepts no further
@@ -552,6 +630,20 @@ func (l *limitListener) warnOverShare(src string) {
 	}
 }
 
+// warnSlowCut logs a connection cut below the rate floor: the listener's
+// address, the source, the bytes and the time spent writing them that the rate
+// was measured over, and the floor.
+func (l *limitListener) warnSlowCut(c *limitConn, s rateSample) {
+	if l.log == nil {
+		return
+	}
+	if dropped, ok := l.slowCut.allow(l.now(), l.warnEvery); ok {
+		l.log.Warn("ingest registry relay cut its slowest connection for a waiting one: the peer read below the rate floor",
+			"addr", l.Addr().String(), "source", c.src, "remote", c.RemoteAddr().String(),
+			"bytes", s.bytes, "elapsed", s.wait, "floor", int64(l.rate.floor), "window", l.rate.window, "suppressed", dropped)
+	}
+}
+
 // Close closes the listener and wakes an Accept waiting for a slot.
 func (l *limitListener) Close() error {
 	l.closeOnce.Do(func() { close(l.done) })
@@ -566,14 +658,26 @@ type limitConn struct {
 	once    sync.Once
 	release func()
 	cut     *cutWatch
+	// meter measures the connection's response rate for the rate floor; nil
+	// when the floor is off. src is the source address it was counted under.
+	meter *rateMeter
+	src   string
 }
 
 // Write is the connection's Write. Every response byte, the server's final
-// flush included, reaches the peer here.
+// flush included, reaches the peer here, so the time spent here is the time
+// spent waiting on the peer, and the rate floor measures it here. A connection
+// the rate floor cut while this write was in progress is closed once it
+// returns.
 func (c *limitConn) Write(b []byte) (int, error) {
+	c.meter.startWrite()
 	n, err := c.Conn.Write(b)
+	cut := c.meter.endWrite(n)
 	if err != nil {
 		c.cut.wrote(err)
+	}
+	if cut {
+		_ = c.Close()
 	}
 	return n, err
 }

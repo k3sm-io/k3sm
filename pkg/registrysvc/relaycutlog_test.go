@@ -70,9 +70,14 @@ func (l *recordedLog) cuts() []map[string]string {
 // The gate is left out: the line under test is the limiter's, not the gate's.
 func newCutLogFixture(t *testing.T, drip <-chan struct{}) (*relayLimitFixture, *recordedLog) {
 	t.Helper()
+	return newCutLogFixtureWith(t, stallLimits(), stallRegistry(drip))
+}
+
+// newCutLogFixtureWith is newCutLogFixture with the relay's limits set to lim
+// and reg as the registry.
+func newCutLogFixtureWith(t *testing.T, lim relayLimits, reg http.Handler) (*relayLimitFixture, *recordedLog) {
+	t.Helper()
 	rec := &recordedLog{}
-	lim := stallLimits()
-	reg := stallRegistry(drip)
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			if _, err := io.Copy(io.Discard, r.Body); err != nil {
