@@ -319,7 +319,7 @@ k3sm image pull ghcr.io/org/app:v1            # warm this node's cache ahead of 
 | `untag <tag>` | Deletes one tag. `--digest` refuses the removal unless the tag still names that digest; the cluster registry makes this check as it deletes, so a tag a push re-points in the meantime stays and `untag` reports an error. The error reads `untag <tag>: the tag no longer names that digest; nothing was removed`. Only a cluster registry from the first release after v0.2.3 onward enforces that condition. A registry from before that release either does not enforce it (v0.2.3 and earlier), so only the check made just before the delete applies and a tag re-pointed after that check is removed anyway, or refuses the removal even though the tag has not moved (a development build from between releases). The CLI does not detect or warn about this, and in both cases the fix is to upgrade the node that serves the registry. A tag names a whole index, so `untag` takes no `--platform`. |
 | `inspect <tag\|repository@digest>` | Reads the manifest and config from the registry and reports the digest, the platform, the creation time, entrypoint/cmd, user, working directory and each layer's size. An index lists its platforms; `--platform` inspects one of them. `-o json` prints the registry's manifest and config documents for scripting. Read-only. |
 | `save <tag\|repository@digest> -o <file.tar>` | Exports the image as a tarred OCI image layout, the `docker save` analog and the exact inverse of `import`: the layout names the image `registry-k3sm:6450/<repository>:<tag>`, so importing the archive records it under the same name. An index is saved whole unless `--platform` picks one platform. The archive is written beside the target and renamed into place when complete, so a failed save leaves no file behind. |
-| `pull <reference>` | Fetches the reference into this node's cache through the daemon's own puller, the same code path a Pod's pull takes, so every blob is re-hashed against its digest before it is recorded. Prints the digest it resolved to. `--platform os/arch[/variant]` picks which manifest of a multi-platform index to fetch; `--policy always\|if-not-present\|never` carries the ordinary Kubernetes pull-policy meanings. |
+| `pull <reference>` | Fetches the reference into this node's cache through the daemon's own puller, the same code path a Pod's pull takes, so every blob is re-hashed against its digest before it is recorded. Prints the digest it resolved to. `--platform os/arch[/variant]` picks which manifest of a multi-platform index to fetch; `--policy always\|if-not-present\|never` carries the ordinary Kubernetes pull-policy meanings. The pull reserves its declared layer bytes first and is refused when they cannot fit (see [A Pull Reserves Its Space](#a-pull-reserves-its-space)). |
 
 Untag removes a name, not bytes, and it is not a retraction. The manifest and its layers stay
 readable by digest to anyone who can reach the registry until `k3sm image prune` or the registry's
@@ -402,6 +402,34 @@ prune or the registry's scheduled garbage collection reclaims them. The table on
 usual lines; the interruption is reported on stderr, and the command exits non-zero after printing
 the report. It is safe to run the prune again: it plans from the registry's current state, so a
 manifest that is already gone is simply not listed and the rest are deleted.
+
+### A Pull Reserves Its Space
+
+A pull of an image, whether a Pod's or `k3sm image pull`'s, and a pull of an `image` volume reserve the
+layer bytes the manifest declares before the first layer is requested. The claim has to fit with the
+store's free-space floor kept free, and with the bytes other pulls in flight already hold.
+
+When free space alone is short, the node plans one prune pass as a dry run, which lists what the
+pass would delete and deletes nothing. A claim that fits free space plus that plan runs the one real
+pass and then fetches. A claim that does not fit is refused before any layer is requested, and nothing
+is evicted. A manifest cannot empty the unreferenced cache by declaring more than reclaim could free.
+
+| the claim | result | RPC code |
+|---|---|---|
+| Above the volume's capacity once the floor is added | refused, no prune pass of either kind | `FailedPrecondition` |
+| Above capacity once the bytes held by other pulls are added | refused, no prune pass | `ResourceExhausted` |
+| Above free space plus what the dry run would free | refused, nothing evicted | `ResourceExhausted` |
+| Within free space plus what the dry run would free | one real pass, then the fetch | none |
+
+The first row is a verdict on the manifest, whose declared sizes cannot fit this volume, so retrying
+does not help. The other refusals are a shortfall on the node: free up space and pull again.
+
+Two limits remain:
+
+- Sizes are logical bytes. A claim that fits the estimate still evicts once, and can then fail if the
+  volume is still short. Under APFS clonefile the estimate counts more than the pass frees.
+- A plan that fails, including a pull cancelled while the plan runs, is refused as `ResourceExhausted`,
+  with the cause in the message.
 
 ## Pushing to a Registry: `k3sm image push`
 
