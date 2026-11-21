@@ -131,8 +131,9 @@ func newKeysHarness(t *testing.T) *keysHarness {
 	}
 }
 
-// run runs `k3sm keys <args> --work-dir <work>` and returns the exit code.
-// The buffers hold that run's output only.
+// run runs `k3sm keys <args> --work-dir <work>` and returns the exit code;
+// args that name --work-dir themselves keep theirs. The buffers hold that
+// run's output only.
 func (h *keysHarness) run(args ...string) int {
 	h.t.Helper()
 	h.stdout.Reset()
@@ -161,7 +162,7 @@ func (h *keysHarness) run(args ...string) int {
 		stdout:     &h.stdout,
 		stderr:     &h.stderr,
 	}
-	if len(args) > 0 && !strings.HasPrefix(args[0], "-") && args[0] != "help" {
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") && args[0] != "help" && !slices.Contains(args, "--work-dir") {
 		args = append(slices.Clone(args), "--work-dir", h.work)
 	}
 	return runKeysWith(context.Background(), args, env)
@@ -668,6 +669,8 @@ func TestKeysRefusals(t *testing.T) {
 		{name: "reveal to a tty", args: []string{"show", "system/held", "--reveal"}, stdoutTTY: true, want: 1, say: "--yes"},
 		{name: "rm without yes", args: []string{"rm", "system/held"}, want: 2, say: "--yes"},
 		{name: "unknown verb", args: []string{"frob"}, want: 2, say: "unknown"},
+		{name: "unknown verb not echoed", args: []string{"Hunter2"}, want: 2, say: "unknown subcommand (not echoed); see k3sm keys --help", never: "Hunter2"},
+		{name: "relative work dir not echoed", args: []string{"list", "--work-dir", "Hunter2"}, want: 1, say: "--work-dir", never: "Hunter2"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newKeysHarness(t)

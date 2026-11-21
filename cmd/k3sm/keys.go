@@ -283,7 +283,7 @@ func (v *keysVerb) requireRoot() int {
 func (v *keysVerb) store() (keysStore, error) {
 	work := filepath.Clean(*v.workDir)
 	if !filepath.IsAbs(work) {
-		return nil, fmt.Errorf("--work-dir %q is not an absolute path", *v.workDir)
+		return nil, errors.New("--work-dir is not an absolute path (the value given is not echoed)")
 	}
 	uid, gid, err := v.env.serviceIDs()
 	if err != nil {
@@ -373,7 +373,8 @@ func runKeysWith(ctx context.Context, args []string, env keysEnv) int {
 	case "rewrap":
 		return keysRewrap(ctx, rest, env)
 	default:
-		fmt.Fprintf(env.stderr, "k3sm keys: unknown subcommand %q (want: put, list, show, rotate, rm, rewrap)\n", verb)
+		// The argument is not echoed: it may be a value typed in the wrong place.
+		fmt.Fprintln(env.stderr, "k3sm keys: unknown subcommand (not echoed); see k3sm keys --help")
 		return keysBadUsage
 	}
 }
