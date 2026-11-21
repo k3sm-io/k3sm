@@ -12,6 +12,13 @@ pin, its date, and the tarball's sha256.
 
 ### Added
 
+- `sudo k3sm keys put|list|show|rotate|rm|rewrap` keeps key material on a server, encrypted at
+  rest under a master key k3sm creates. Names are scope-qualified (`system/<name>`); a value is read
+  only from `--in FILE` or a pipe, never from the command line; `rotate --from-version N` rolls back
+  by storing version N's bytes as a new version without printing them; `list` exits 1 if any entry
+  is corrupt; `show --reveal` prints the stored bytes exactly; and `rewrap` saves its new master key
+  to a root-only file you name before it changes anything. See [Keys](docs/user/keys.md). Thanks
+  to @zxdev for the keystore design and the store it uses.
 - New unpinned Pods prefer a node whose Mac is not CPU-busy. Each node reports a `HostCPUBusy`
   condition from the whole Mac's CPU, Pods and every other process, averaged over about two minutes
   (True from 75%, cleared below 50%), and the server puts the
