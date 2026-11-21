@@ -69,7 +69,7 @@ func stallingUpstream(t *testing.T) func(ctx context.Context, network, addr stri
 
 // upstreamGate is the fixture's gate over the default loopback transports and
 // their production response-header bounds, pointed at upstream and dialling
-// with dial (nil means a real dialer).
+// with dial.
 func upstreamGate(t *testing.T, upstream string, dial func(ctx context.Context, network, addr string) (net.Conn, error)) *memListener {
 	t.Helper()
 	f := newGateFixture(t)
@@ -262,14 +262,12 @@ func TestGateProxyForEveryOperation(t *testing.T) {
 
 // TestGateWriteErrorIs502WhenUpstreamIsDown: a loopback registry that is not
 // listening costs an authorized write a 502 UNAVAILABLE, not a hung request.
+// The dial is refused the way a closed loopback port refuses it.
 func TestGateWriteErrorIs502WhenUpstreamIsDown(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
+	refused := func(context.Context, string, string) (net.Conn, error) {
+		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}
 	}
-	closed := ln.Addr().String()
-	_ = ln.Close()
-	front := upstreamGate(t, closed, nil)
+	front := upstreamGate(t, "registry.loopback:5000", refused)
 	r := rawDo(t, front, "PUT", "/v2/team/app/manifests/V1.0",
 		map[string]string{"Authorization": basic(tokTeam)}, "{}")
 	assertUnavailable502(t, r)
