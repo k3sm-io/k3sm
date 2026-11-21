@@ -293,6 +293,13 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
   user's group, so a user could hard-link a node file into a read-write host share where a Pod
   could rewrite it. An existing node tightens at its next install or netd helper start. See
   [Install](docs/user/install.md).
+- `k3sm image untag --digest` no longer removes a tag that a push re-points between its check and
+  its delete. The delete is now conditional at the cluster registry, which deletes a tag only while
+  it still names that digest, and a tag that moved is reported as an error with nothing removed. A
+  cluster registry from this release onward enforces it. v0.2.3 and earlier ignore the
+  condition, so a tag re-pointed between the check and the delete is still removed, and a
+  development build from between releases refuses the removal even though the tag has not moved.
+  Upgrading the cluster is the fix in both cases.
 - A server whose control plane does not report healthy in time while the Mac is heavily loaded no
   longer parks on the crash-loop breaker after five attempts. It backs off instead, from 30 seconds
   doubling up to 10 minutes, `k3sm status` shows when the next attempt starts and that an attempt

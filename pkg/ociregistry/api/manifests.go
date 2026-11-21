@@ -508,7 +508,10 @@ var errPreconditionFailed = errorf(http.StatusPreconditionFailed, codeDenied, "t
 // entity tag is store.IndexState of its index.json rows, compared under the
 // repository lock that the delete itself holds, so no write lands between the
 // comparison and the delete. A state that no longer holds is a 412 and deletes
-// nothing. A request without If-Match is unconditional. Presence is any
+// nothing. A DELETE by tag also matches the tag's own entity tag, the quoted
+// manifest digest GET and HEAD of the tag send, read from the same locked
+// rows, so a client that read the tag can delete it only while it still names
+// what was read. A request without If-Match is unconditional. Presence is any
 // If-Match field line, so a request whose If-Match lines are empty or hold no
 // well-formed tag is a 412, never unconditional (RFC 9110 section 13.1.1).
 //
@@ -529,7 +532,7 @@ func (s *Server) deleteManifest(w http.ResponseWriter, r *http.Request, n ref.Na
 	}
 	ifMatch := r.Header.Values("If-Match")
 	conditional := len(ifMatch) > 0
-	precondition := func(rows []ispec.Descriptor) error {
+	precondition := func(rows []ispec.Descriptor, also ...string) error {
 		if !conditional {
 			return nil
 		}
@@ -537,13 +540,18 @@ func (s *Server) deleteManifest(w http.ResponseWriter, r *http.Request, n ref.Na
 		if err != nil {
 			return err
 		}
-		if !matchesEntityTag(ifMatch, state) {
+		if !matchesEntityTag(ifMatch, append([]string{state}, also...)...) {
 			return errPreconditionFailed
 		}
 		return nil
 	}
 	if rf.Tag != "" {
-		err = s.st.DeleteTagChecked(r.Context(), n, rf.Tag, precondition, func(row ispec.Descriptor) (bool, error) {
+		// A tag's own entity tag, the one GET and HEAD of it send, is its
+		// manifest digest; it matches too, read from the same locked rows.
+		tagged := func(rows []ispec.Descriptor) error {
+			return precondition(rows, tagDigest(rows, rf.Tag)...)
+		}
+		err = s.st.DeleteTagChecked(r.Context(), n, rf.Tag, tagged, func(row ispec.Descriptor) (bool, error) {
 			return s.keepsUntaggedRow(n, row)
 		})
 	} else {
@@ -585,6 +593,16 @@ func (s *Server) keepsUntaggedRow(n ref.Name, row ispec.Descriptor) (bool, error
 	}
 }
 
+// tagDigest is the manifest digest the row tagging tag names, as the one
+// entity tag a tag DELETE also matches; none when no row tags it.
+func tagDigest(rows []ispec.Descriptor, tag string) []string {
+	i := slices.IndexFunc(rows, func(r ispec.Descriptor) bool { return r.Annotations[ispec.AnnotationRefName] == tag })
+	if i < 0 {
+		return nil
+	}
+	return []string{rows[i].Digest.String()}
+}
+
 // digestTagged reports whether a row of rows tags d.
 func digestTagged(rows []ispec.Descriptor, d digest.Digest) bool {
 	return slices.ContainsFunc(rows, func(r ispec.Descriptor) bool {
@@ -592,15 +610,16 @@ func digestTagged(rows []ispec.Descriptor, d digest.Digest) bool {
 	})
 }
 
-// matchesEntityTag reports whether the If-Match field values match state:
-// "*" matches any current state, and a quoted strong entity tag matches when
-// its value is state (RFC 9110 section 13.1.1, strong comparison). The values
+// matchesEntityTag reports whether the If-Match field values match one of
+// states: "*" matches any current state, and a quoted strong entity tag
+// matches when its value is one of states (RFC 9110 section 13.1.1, strong
+// comparison). The values
 // are one comma-separated list across every field line, and a quoted tag is
 // read to its closing quote, so a comma inside it does not split it. A weak
 // tag never matches. A field that is empty, or holds any member that is not
 // "*" or an entity tag, matches nothing, so a malformed condition fails
 // rather than deletes.
-func matchesEntityTag(values []string, state string) bool {
+func matchesEntityTag(values []string, states ...string) bool {
 	matched, members := false, 0
 	for _, v := range values {
 		for i := 0; i < len(v); {
@@ -622,7 +641,7 @@ func matchesEntityTag(values []string, state string) bool {
 				}
 				tag := v[i+1 : i+1+end]
 				i += end + 2
-				if !weak && tag == state {
+				if !weak && tag != "" && slices.Contains(states, tag) {
 					matched = true
 				}
 			default:
