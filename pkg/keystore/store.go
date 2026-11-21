@@ -26,8 +26,10 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -71,8 +73,9 @@ type Config struct {
 	// creates is handed to them, and the entries' directory, cred/, the master
 	// directory and the master file must be owned by UID.
 	//
-	// A UID of 0, an empty Dir or an empty MasterDir makes every operation
-	// fail.
+	// A UID of 0, a Dir or MasterDir that is not absolute or not equal to
+	// its own filepath.Clean, or a MasterDir equal to or inside Dir makes
+	// every operation fail.
 	UID, GID uint32
 }
 
@@ -134,8 +137,11 @@ func New(cfg Config) *FileStore {
 
 // checkConfig refuses a store every operation must fail closed on: a zero
 // service uid, which would hand the service user's files to root and accept
-// root-owned ones, or an empty Dir or MasterDir, which would resolve against
-// the working directory.
+// root-owned ones; a Dir or MasterDir that is empty or relative, which would
+// resolve against the working directory, or not equal to its own
+// filepath.Clean, whose last component (a trailing slash, a "..") would not be
+// the directory the store opens it as; or a MasterDir equal to or inside Dir,
+// which would put the master among the entries and in every backup of them.
 func (s *FileStore) checkConfig() error {
 	switch {
 	case s.uid == 0:
@@ -144,6 +150,17 @@ func (s *FileStore) checkConfig() error {
 		return fmt.Errorf("%w: Dir is empty", errInvalidConfig)
 	case s.masterDir == "":
 		return fmt.Errorf("%w: MasterDir is empty", errInvalidConfig)
+	}
+	for _, p := range []struct{ field, path string }{{"Dir", s.dir}, {"MasterDir", s.masterDir}} {
+		if !filepath.IsAbs(p.path) {
+			return fmt.Errorf("%w: %s %q is not absolute", errInvalidConfig, p.field, p.path)
+		}
+		if c := filepath.Clean(p.path); c != p.path {
+			return fmt.Errorf("%w: %s %q is not clean (%q)", errInvalidConfig, p.field, p.path, c)
+		}
+	}
+	if rel, err := filepath.Rel(s.dir, s.masterDir); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("%w: MasterDir %q is Dir %q or inside it", errInvalidConfig, s.masterDir, s.dir)
 	}
 	return nil
 }

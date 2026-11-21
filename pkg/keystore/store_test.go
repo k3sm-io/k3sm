@@ -587,21 +587,31 @@ func TestDeleteDirectoryAtCurrent(t *testing.T) {
 	}
 }
 
-// TestConfigRefused: a zero service uid, an empty Dir or an empty MasterDir
-// makes every operation fail closed, before anything is created.
+// TestConfigRefused: a zero service uid, an empty, relative or unclean Dir or
+// MasterDir, or a MasterDir at or inside Dir makes every operation fail
+// closed, before anything is created.
 func TestConfigRefused(t *testing.T) {
 	ctx := context.Background()
 	for name, edit := range map[string]func(c *Config){
-		"zero uid":           func(c *Config) { c.UID = 0 },
-		"empty Dir":          func(c *Config) { c.Dir = "" },
-		"empty MasterDir":    func(c *Config) { c.MasterDir = "" },
-		"nothing set at all": func(c *Config) { *c = Config{} },
+		"zero uid":                 func(c *Config) { c.UID = 0 },
+		"empty Dir":                func(c *Config) { c.Dir = "" },
+		"empty MasterDir":          func(c *Config) { c.MasterDir = "" },
+		"nothing set at all":       func(c *Config) { *c = Config{} },
+		"Dir with a trailing /":    func(c *Config) { c.Dir += "/" },
+		"relative MasterDir":       func(c *Config) { c.MasterDir = filepath.Join("cred", "keystore-master") },
+		"MasterDir inside Dir":     func(c *Config) { c.MasterDir = filepath.Join(c.Dir, "keystore-master") },
+		"MasterDir equal to Dir":   func(c *Config) { c.MasterDir = c.Dir },
+		"relative Dir":             func(c *Config) { c.Dir = "keystore" },
+		"MasterDir with a dot-dot": func(c *Config) { c.MasterDir = filepath.Join(c.Dir, "..") + "/../server/cred/keystore-master" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			server := filepath.Join(t.TempDir(), "server")
 			if err := os.Mkdir(server, 0o700); err != nil {
 				t.Fatal(err)
 			}
+			// A relative path resolves inside server, where the check below
+			// would see anything it created.
+			t.Chdir(server)
 			cfg := Config{
 				Dir:       filepath.Join(server, "keystore"),
 				MasterDir: filepath.Join(server, "cred", "keystore-master"),
