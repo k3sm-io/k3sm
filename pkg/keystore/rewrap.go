@@ -50,7 +50,8 @@ const newSuffix = ".new"
 // is live under it, or its swap over the master is half done, discarding it
 // would orphan that record, so Rewrap completes it instead and returns
 // ErrRewrapResumed: the master is then that key, and Rewrap must run again to
-// retire it.
+// retire it. A Rewrap whose master.next was replaced or removed after some
+// record moved under its key is completed by a rerun with that same key.
 //
 // It refuses, writing nothing, while the name reserved for user scopes exists
 // in the entries' directory (ErrScopeUnsupported), while the floor cannot be
@@ -142,6 +143,15 @@ func (s *FileStore) rewrap(ctx context.Context, newMaster []byte) error {
 	old := k
 	old.next = nil
 	next, plan, resuming, err := s.prepareNext(ctx, root, mroot, fl, old, newMaster)
+	if errors.Is(err, ErrCorrupt) || errors.Is(err, ErrMasterUntrusted) {
+		k, p, ok, aerr := s.adoptSupplied(ctx, root, mroot, fl, old, newMaster)
+		if aerr != nil {
+			return aerr
+		}
+		if ok {
+			next, plan, resuming, err = k, p, false, nil
+		}
+	}
 	if err != nil {
 		return err
 	}
@@ -280,16 +290,7 @@ func (s *FileStore) prepareNext(ctx context.Context, root, mroot *os.Root, fl fl
 		}
 		return keys{}, nil, false, perr
 	}
-	// The stale fingerprint goes first, so an interruption never leaves one
-	// that vouches for a key that was not written; the rename of master.next
-	// replaces a stale one.
-	if err := mroot.Remove(masterNextFingerprintName); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return keys{}, nil, false, fmt.Errorf("remove the stale %s: %w", masterNextFingerprintName, err)
-	}
-	if err := s.writeFile(mroot, masterNextName, newMaster); err != nil {
-		return keys{}, nil, false, err
-	}
-	if err := s.writeFile(mroot, masterNextFingerprintName, []byte(masterFingerprint(newMaster))); err != nil {
+	if err := s.writeNext(mroot, newMaster); err != nil {
 		return keys{}, nil, false, err
 	}
 	next, err := deriveKeys(newMaster, s.scope)
@@ -297,6 +298,46 @@ func (s *FileStore) prepareNext(ctx context.Context, root, mroot *os.Root, fl fl
 		return keys{}, nil, false, err
 	}
 	return next, plan, false, nil
+}
+
+// adoptSupplied is the recovery for records already sealed under newMaster
+// itself, which a master.next replaced or removed during a Rewrap (by the
+// service user, who owns the master directory) leaves behind: the caller's
+// key then exists only as the caller's input, and prepareNext refuses. When
+// every record opens under old or newMaster, and some only under newMaster,
+// master.next and its fingerprint are written again from newMaster and it
+// returns the keys to resume under, ok set. Otherwise it writes nothing and
+// reports !ok, and the caller keeps prepareNext's refusal. A record under any
+// third key fails the plan, so this never orphans one.
+func (s *FileStore) adoptSupplied(ctx context.Context, root, mroot *os.Root, fl floor, old keys, newMaster []byte) (keys, []planned, bool, error) {
+	k, err := deriveKeys(newMaster, s.scope)
+	if err != nil {
+		return keys{}, nil, false, err
+	}
+	plan, committed, err := rewrapPlan(ctx, root, fl, old, &k)
+	if err != nil || !committed {
+		k.wipe()
+		return keys{}, nil, false, nil
+	}
+	if err := s.writeNext(mroot, newMaster); err != nil {
+		k.wipe()
+		return keys{}, nil, false, err
+	}
+	return k, plan, true, nil
+}
+
+// writeNext writes key as master.next, then its fingerprint.
+func (s *FileStore) writeNext(mroot *os.Root, key []byte) error {
+	// The stale fingerprint goes first, so an interruption never leaves one
+	// that vouches for a key that was not written; the rename of master.next
+	// replaces a stale one.
+	if err := mroot.Remove(masterNextFingerprintName); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("remove the stale %s: %w", masterNextFingerprintName, err)
+	}
+	if err := s.writeFile(mroot, masterNextName, key); err != nil {
+		return err
+	}
+	return s.writeFile(mroot, masterNextFingerprintName, []byte(masterFingerprint(key)))
 }
 
 // discardNext removes a master.next under which nothing is committed: every

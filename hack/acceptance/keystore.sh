@@ -39,7 +39,7 @@ rewrap_tests="TestSealNonceIsFresh TestRewrapChangesEveryNonce TestRewrapCrashAt
 rewrap_tests="$rewrap_tests TestLockBoundedWait TestLockExcludes TestConcurrentOperations TestFIFORefused TestReadDirNamesBound"
 rewrap_tests="$rewrap_tests TestRewrapRefusesWhileUserScopesExist"
 rewrap_tests="$rewrap_tests TestRewrapKeyReuse TestRewrapRefusesStalePointer TestRewrapVerifiesCommit TestRewrapGuards"
-rewrap_tests="$rewrap_tests TestRewrapRefusesLiveMasterFirst TestRewrapUserScopesBeforeSwap"
+rewrap_tests="$rewrap_tests TestRewrapRefusesLiveMasterFirst TestRewrapUserScopesBeforeSwap TestRewrapRecoversReplacedNext"
 
 # wanted reports whether row $1 runs in this mode.
 wanted() {
@@ -116,7 +116,7 @@ check G10 "the master is minted only by the first put, never over entries" TestM
 check G11 "the master is judged on the open descriptor" TestMasterTrust
 check G12 "Rewrap resumes after a crash at every step, old key then new, nothing unreadable; a bad master.next is discarded only with no .new file" \
 	TestRewrapCrashAtEveryStep TestRewrapKeyReuse TestRewrapRefusesStalePointer TestRewrapVerifiesCommit TestRewrapGuards \
-	TestRewrapRefusesLiveMasterFirst TestRewrapUserScopesBeforeSwap
+	TestRewrapRefusesLiveMasterFirst TestRewrapUserScopesBeforeSwap TestRewrapRecoversReplacedNext
 check G13 "a crash between the master renames leaves a trusted master, and the next verb completes the swap" \
 	TestRewrapMasterRenameCompleted
 check G14 "one lock with a bounded wait serializes Rewrap, Rotate, Put, Delete and the reads, and no read blocks" \

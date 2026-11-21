@@ -884,3 +884,57 @@ func TestRewrapUserScopesBeforeSwap(t *testing.T) {
 	checkUnderKey(t, server, rewrapKey(1))
 	checkRewrapValues(t, s, vals)
 }
+
+// TestRewrapRecoversReplacedNext: when master.next is replaced or removed
+// while a Rewrap runs, the records already moved are sealed under the
+// caller's key, which no file holds any more. A rerun with that same key
+// finds every record opens under the live master or that key, writes
+// master.next back from it and completes the Rewrap. A rerun with any other
+// key is refused.
+func TestRewrapRecoversReplacedNext(t *testing.T) {
+	ctx := context.Background()
+	for name, tc := range map[string]struct {
+		at     string // the step the replacement happens after
+		damage func(t *testing.T, server string)
+	}{
+		"replaced by an agreeing pair after every record moved": {"rename b/current", func(t *testing.T, server string) { plantNext(t, server, rewrapKey(9)) }},
+		"replaced by an agreeing pair after one record moved":   {"rename a/v1", func(t *testing.T, server string) { plantNext(t, server, rewrapKey(9)) }},
+		"replaced by one its fingerprint does not match": {"rename a/v1", func(t *testing.T, server string) {
+			writeFile(t, masterPath(server, masterNextName), string(rewrapKey(9)))
+		}},
+		"removed with its fingerprint": {"rename b/v2", func(t *testing.T, server string) {
+			for _, n := range []string{masterNextName, masterNextFingerprintName} {
+				if err := os.Remove(masterPath(server, n)); err != nil {
+					t.Error(err)
+				}
+			}
+		}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, server := newTestStore(t)
+			vals := seedRewrap(t, s)
+			s.step = func(name string) error {
+				if name == tc.at {
+					tc.damage(t, server)
+					return fmt.Errorf("injected crash at %s", name)
+				}
+				return nil
+			}
+			if err := s.Rewrap(ctx, rewrapKey(1)); err == nil {
+				t.Fatal("Rewrap succeeded through a replaced master.next")
+			}
+			s.step = func(string) error { return nil }
+			snap := treeSnapshot(t, filepath.Dir(server))
+			if err := s.Rewrap(ctx, rewrapKey(2)); err == nil {
+				t.Fatal("Rewrap rerun with another key succeeded")
+			}
+			checkTreeUnchanged(t, snap, treeSnapshot(t, filepath.Dir(server)))
+			if err := s.Rewrap(ctx, rewrapKey(1)); err != nil {
+				t.Fatalf("Rewrap rerun with the same key: %v", err)
+			}
+			checkMasterIs(t, server, rewrapKey(1))
+			checkUnderKey(t, server, rewrapKey(1))
+			checkRewrapValues(t, s, vals)
+		})
+	}
+}
