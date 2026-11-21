@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # The keystore's acceptance gate: docs/design/keystore.md § "Acceptance gate",
-# rows G1 to G22, the user-scope rows U1 to U66 (U15 and U39 are unused) and
+# rows G1 to G22, the user-scope rows U1 to U67 (U15 and U39 are unused) and
 # the rig legs E1 to E23. Every row is listed, on exactly one line. A row runs
 # the tests that deliver it and passes only if each named test ran and passed
 # in its own package; a row whose change has not landed yet prints PENDING,
@@ -37,7 +37,7 @@
 #   --scope-store   the user-scope store: U12 to U14, U63.
 #   --files         the append-only files: U20 to U25, U50, U52, U60, U61.
 #   --socket        the socket listener: U26 to U31, U46, U48, U54.
-#   --socket-ops    the socket operations: U32 to U35, U45, U51.
+#   --socket-ops    the socket operations: U32 to U35, U45, U51, U67.
 #   --exec          the non-root CLI and exec: U36 to U38.
 #   --kd-author     KeyDelivery authoring: U40, U41.
 #   --kd-reconcile  the KeyDelivery reconciler: U42, U43, U59.
@@ -91,7 +91,7 @@ EXPECTED_ROWS="$EXPECTED_ROWS U21 U22 U23 U24 U25 U26 U27 U28 U29 U30 U31 U32 U3
 EXPECTED_ROWS="$EXPECTED_ROWS U36 U37 U38 U40 U41 U42 U43 U44 U45 U46 U47 U48"
 EXPECTED_ROWS="$EXPECTED_ROWS U49 U50 U51 U52 U53 U54 U55 U56 U57"
 EXPECTED_ROWS="$EXPECTED_ROWS U58 U59 U60 U61 U62 U63"
-EXPECTED_ROWS="$EXPECTED_ROWS U64 U65 U66"
+EXPECTED_ROWS="$EXPECTED_ROWS U64 U65 U66 U67"
 # >>> ADD NEW U ROWS (U64 upward) HERE <<<
 EXPECTED_ROWS="$EXPECTED_ROWS E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 E13 E14 E15 E16 E17 E18 E19 E20"
 EXPECTED_ROWS="$EXPECTED_ROWS E21 E22 E23"
@@ -124,7 +124,7 @@ mode_rows() {
 	scope-store) echo "U12 U13 U14 U63" ;;
 	files) echo "U20 U21 U22 U23 U24 U25 U50 U52 U60 U61" ;;
 	socket) echo "U26 U27 U28 U29 U30 U31 U46 U48 U54" ;;
-	socket-ops) echo "U32 U33 U34 U35 U45 U51" ;;
+	socket-ops) echo "U32 U33 U34 U35 U45 U51 U67" ;;
 	exec) echo "U36 U37 U38" ;;
 	kd-author) echo "U40 U41" ;;
 	kd-reconcile) echo "U42 U43 U59" ;;
@@ -305,8 +305,8 @@ pend U11 "the Go resolver and Phase A's checkName pass the shared entry-grammar 
 	TestEntryGrammarVectorsResolver TestEntryGrammarVectorsCheckName TestCheckScopeRefusesUserZero TestAllDigitSegmentIsAlwaysUID TestKeystoreIsKubernetesFree
 pend U12 "master Rewrap re-wraps every scope.key and leaves user records byte-identical; resumable at every step, by fault injection as G12 (user-scope store)" \
 	TestRewrapRewrapsScopeKeysResumable
-pend U13 "quotas: the 257th entry and the byte budget answer ErrQuota; rm still works (user-scope store)" \
-	TestUserScopeQuota
+pend U13 "quotas: the 257th entry and the byte budget answer ErrQuota, and so does the 65th live delivery; rm and withdraw still work (user-scope store)" \
+	TestUserScopeQuota TestDeliveryRecordQuota
 pend U14 "the delivery record stores UID and target digest; add, look up and withdraw round-trip under the floor (user-scope store)" \
 	TestDeliveryRecordDigestRoundTrip TestDeliveryRecordVersionByteAndDigestLabel
 pend U16 "every pod profile variant (native, vm, container-vm, xcode, expose-paths, a custom pod root distinct from the data root) denies every keystore path, each deny after every allow; a hostPath or expose path onto the data root is refused; an empty data root fails closed; over the whole rendered profile, a pod root equal to or a parent of the data root included, no emitted allow matches a keystore path; canonical /private/var/lib/k3sm denies and a regex keystore- prefix deny; rig leg E10 (sandbox denies)" \
@@ -326,8 +326,8 @@ pend U22 "floor --rebuild and audit --rotate stop the listener, hold the lock, f
 	k3sm/cmd/k3sm::TestKeysFloorRebuildCrashOrder TestKeysAuditRotateCrashOrder
 pend U23 "every audited operation writes one v:1 line; no line carries a value or its length; readers ignore unknown fields (append-only files)" \
 	TestAuditLineNeverCarriesValue TestAuditReaderIgnoresUnknownFields
-pend U24 "soft cap shows in doctor; past the hard cap every mutating user op is ErrLogFull (append-only files)" \
-	TestLogHardCapRefusesMutations
+pend U24 "soft cap shows in doctor; past the hard cap every mutating user op is ErrLogFull, except the revocation class, which draws on the reserve; a line over 1 KiB is refused (append-only files)" \
+	TestLogHardCapRefusesMutations TestAuditLineBoundedAtOneKiB
 pend U25 "backup and restore round trip: a restored tree with cleared flags is refused until floor --rebuild, then opens; rig leg E17 (append-only files)" \
 	TestBackupRestoreRoundTripRebuild
 pend U26 "peers uid 0, the service uid and uid < 501 are refused before any frame is read (socket listener)" \
@@ -403,7 +403,7 @@ pend U60 "seam guard: cmd/k3sm's TestMain stubs each of its seams: clock, uid re
 	k3sm/cmd/k3sm::TestRealPrimitivesUnreachable
 pend U61 "seam guard: pkg/install's TestMain stubs its euid source and file-attribute writer (append-only files)" \
 	k3sm/pkg/install::TestRealPrimitivesUnreachable
-pend U62 "reconciler lines are charged to the delivery's owner uid: a deliver-write past the share is Indeterminate, a deliver-delete is never refused for the share (KeyDelivery lifecycle)" \
+pend U62 "reconciler lines are charged to the delivery's owner uid: a deliver-write past the share is Indeterminate, a deliver-delete and a withdrawal's lines are never refused for the share and past it draw on the reserve (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestReconcilerLinesChargedToOwner TestDeliverWritePastShareIsIndeterminate TestDeliverDeleteNeverRefusedForShare
 pend U63 "entries live under .user/<uid>/entries/: entries named deliveries and scope.key are ordinary and touch neither scope file (user-scope store)" \
 	k3sm/pkg/keystore::TestEntriesNamedDeliveriesAndScopeKeyAreOrdinary
@@ -413,6 +413,8 @@ pend U65 "ErrScopeAbsent is Indeterminate and deletes nothing; every allow-list 
 	k3sm/pkg/keystore/reconcile::TestAbsentScopeIsIndeterminate TestEveryDeletingOutcomeNeedsTwoSweeps TestSingleServerRecheckedBeforeEverySweep
 pend U66 "a synthesized GeneratedUID (prefix FFFFEEEE-DDDD-CCCC-BBBB-AAAA) is ErrScopeOwnerUnknown and never bound; ErrScopeOwnerChanged only for a real GeneratedUID that differs (user scopes)" \
 	k3sm/pkg/keystore::TestSynthesizedGeneratedUIDIsUnknown
+pend U67 "the revocation class (withdraw, rm, rotate, the withdrawal's floor line, the reconciler's deliver-delete and deliver-write of a withdrawal) bypasses the share past it and draws on the 4 MiB reserve above the hard cap, refused only when the reserve is exhausted; a no-op revocation is charged to the share; the reconciler's 3 MiB of the reserve is kept (socket operations)" \
+	k3sm/pkg/keystore/socket::TestRevocationBypassesShareUsesReserve TestNoOpRevocationChargedToShare TestReserveKeepsReconcilerPart
 # >>> ADD NEW U ROWS (U64 upward) HERE, and add each to EXPECTED_ROWS and to mode_rows <<<
 
 leg E1 "files" "preconditions: secrets encryption on; one server; keystore-run/ and both logs present, service-user 0600, SF_APPEND set; the doctor user-scope row on; keystore.sh --check exits 0 on the build" "the append-only files"

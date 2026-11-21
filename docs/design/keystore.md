@@ -1182,8 +1182,10 @@ user's records) is not part of this design.
 
 ### Quotas
 
-Each user scope holds at most 256 entries and 16 MiB of sealed records. Over either, `put`
-and `rotate` answer `ErrQuota`; `rm` still works (U13). Phase A's unbounded retention stays
+Each user scope holds at most 256 entries, 16 MiB of sealed records and 64 live entries in its
+`deliveries` record. Over the first two, `put` and `rotate` answer `ErrQuota`; over the third,
+`deliver` does; `rm` and `withdraw` still work (U13). The delivery bound is what bounds the
+reconciler's part of the revocation reserve ("The user-scope floor", per-uid fairness). Phase A's unbounded retention stays
 for the system scope.
 
 ### The user-scope floor
@@ -1247,7 +1249,10 @@ service user can only add to.
 - **Size caps.** Each log has a soft cap (`keystore.logSoftCap`, default 64 MiB) and a hard cap
   (`keystore.logHardCap`, default 256 MiB). Past the soft cap `doctor` shows the size and the
   rotate hint; past the hard cap the server refuses every mutating user operation with
-  `ErrLogFull` until root rotates or rebuilds (U24).
+  `ErrLogFull` until root rotates or rebuilds, except the revocation class below, which draws
+  on the revocation reserve above the hard cap (U24, U67). A line is at most 1 KiB: every
+  field is bounded (names, namespaces, sentinels), and the server refuses to write a longer
+  one.
 - **Per-uid fairness.** The logs are shared, so one user must not be able to fill them for
   everyone. Each uid gets a budget in each log, a fixed byte count: `keystore.logUIDShare`,
   default 16 MiB, which is 1/16 of the default hard cap. The share is at most 1/16 of the hard
@@ -1270,11 +1275,32 @@ service user can only add to.
     happens before any append and is not a failed append, so it never counts as the global
     append failure that refuses every uid's reads ("The audit log", fail closed); only an append
     that the file system refuses, or the hard cap, does.
-  - *The reconciler past an owner's share.* A `deliver-write` past the owner's share is refused
-    and the reconciler reads that as `Indeterminate`, so the Secret keeps its last version. A
-    `deliver-delete` line is charged but never refused for the share, only for the hard cap, so
-    a user cannot keep a revoked Secret in place by filling its own share.
-  - The hard cap above still bounds the whole log (U51, U62).
+  - *The reconciler past an owner's share.* A `deliver-write` of a new version past the
+    owner's share is refused and the reconciler reads that as `Indeterminate`, so the Secret
+    keeps its last version.
+  - *The revocation class is never blocked by the share.* Its members are the socket's
+    `withdraw`, `rm` and `rotate`, the floor line of a record withdrawal, and the reconciler's
+    `deliver-delete` and its `deliver-write` of a withdrawal. Their lines are charged to the
+    uid's share while it has room; past the share they bypass it and draw on the **revocation
+    reserve**, a margin above the hard cap: `keystore.logRevocationReserve`, default 4 MiB, so
+    a log's ceiling is the hard cap plus 4 MiB. Only the reserve's exhaustion refuses them, with
+    `ErrLogFull`; neither the share nor the hard cap does. A user therefore cannot keep a
+    revoked Secret in place, or keep a value it means to revoke, by filling its share (U67).
+  - *Only a line that revokes is in the class.* An `rm`, `withdraw` or `rotate` that names an
+    entry or object that does not exist changes nothing, so it is charged like any other line
+    and refused past the share.
+  - *The reconciler keeps its part of the reserve.* The socket's members draw on the reserve
+    only while more than 3 MiB of it is left; the reconciler's members may use all of it. The
+    reconciler's draw is bounded: past its share a uid can make no new `deliver`, so the
+    reconciler's revocation lines charged to the reserve for one uid are those of the at most
+    64 deliveries live when it crossed its share, three lines each of at most 1 KiB, 192 KiB.
+    No more than 16 uids can be past their shares at once (each share is at least a sixteenth
+    of the hard cap), so the worst case is 3 MiB, and every reconciler revocation finds room.
+    The socket's 1 MiB is shared by the uids past their shares; a uid that exhausts it, for
+    instance by rotating without end, refuses only the socket revocations of uids that are
+    themselves past their own shares: a uid within its share revokes from its share, and
+    `doctor` shows the reserve's use (residual 5).
+  - The hard cap and the reserve bound the whole log (U51, U62, U67).
 - **Backup and restore.** The flag does not survive `cp`, rsync or Time Machine, so a restore
   always ends with `floor --rebuild`, and `audit --rotate` re-flags the audit log. Until then
   the listener refuses to start (U25, E17).
@@ -1896,8 +1922,13 @@ the uid throughout.
 5. A local user can spend the server's CPU, up to 16 MiB of disk within quota, two
    connections, and its own share of each shared log, which every line it causes is charged
    to, reads included. Past that share its own mutations and reads are refused with
-   `ErrLogFull`; it cannot fill a log for other users, and it cannot refuse another uid's
-   mutations or reads, which draw on that uid's own share.
+   `ErrLogFull`, except its revocations (`withdraw`, `rm`, `rotate` and the reconciler's
+   deletions), which draw on the revocation reserve above the hard cap. It cannot fill a log
+   for other users, it cannot refuse another uid's mutations or reads, which draw on that
+   uid's own share, and it cannot refuse the reconciler's revocations, whose part of the
+   reserve is kept for them. What it can exhaust is the socket's 1 MiB of the reserve, and
+   that refuses only the socket revocations of another uid that is itself past its own share,
+   until root rotates the log.
 6. A user account deleted and recreated under the same uid loses its old scope, by design
    (U6), and root must clear it.
 7. The peer uid is the effective uid at connect time, so a setuid program the user runs acts as
@@ -2019,7 +2050,7 @@ each stated in the change that makes it. U15 is held for a K0 amendment and U39 
 | U10 | `user/<other>/…` is `ErrNotFound`, same text as an absent entry; a short name resolves to the uid and is printed | `k3sm/pkg/keystore::TestOtherUserIsNotFound`, `TestShortNameResolvesToUID` | pending: the user-scope store |
 | U11 | the Go resolver takes the grammar from `apis/keystore/entry` and passes the shared entry-grammar vectors; `checkScope` refuses `user/0`; an all-digit second segment resolves as a uid even when an account of that name exists; `pkg/keystore` imports no Kubernetes package; Phase A's `checkName`, as a fourth consumer, gives every valid-scope vector's verdict on its name part | `k3sm/pkg/keystore::TestEntryGrammarVectorsResolver`, `TestEntryGrammarVectorsCheckName`, `TestCheckScopeRefusesUserZero`, `TestAllDigitSegmentIsAlwaysUID`, `TestKeystoreIsKubernetesFree` | pending: the user-scope store |
 | U12 | master Rewrap re-wraps every `scope.key` and leaves user records byte-identical; resumable at every step | `k3sm/pkg/keystore::TestRewrapRewrapsScopeKeysResumable` (fault injection, as G12) | pending: user-scope quotas, scope-key Rewrap and the delivery record |
-| U13 | quotas: the 257th entry and the byte budget answer `ErrQuota`; `rm` still works | `k3sm/pkg/keystore::TestUserScopeQuota` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
+| U13 | quotas: the 257th entry and the byte budget answer `ErrQuota`; the 65th live delivery answers `ErrQuota` to `deliver`; `rm` and `withdraw` still work | `k3sm/pkg/keystore::TestUserScopeQuota`, `TestDeliveryRecordQuota` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
 | U14 | the delivery record stores UID and target digest; add, look up and withdraw round-trip under the floor; the plaintext starts with the format version byte and the digest with the `k3sm-keystore-delivery-target/v1` label | `k3sm/pkg/keystore::TestDeliveryRecordDigestRoundTrip`, `TestDeliveryRecordVersionByteAndDigestLabel` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
 | U15 | (reserved for the K0 amendment if leg 5 finds a second Pod-uid path) | none | pending: K0 amendment |
 | U16 | every Pod profile variant (native, vm, container-vm, xcode, expose-paths, a custom Pod root distinct from the data root) denies every `keystore-*` name in the data root and the `keystore-run/` tree; the keystore names are in `DataRootDenyTrees` and so in `protectedPrefixes`; `ReadOnlyPaths`, `ExposePaths` or a hostPath naming the data root or a keystore path is refused; an empty `Posture.DataRoot` refuses to render; a vm or container-vm guest gets no data-root share; over the whole rendered profile of every variant, including a Pod root equal to the data root and a Pod root that is a parent of it, no emitted allow matches any keystore path; the denies are written under the canonical `/private/var/lib/k3sm` and the `keystore-` prefix deny is a regex rule | `runtimed/pkg/sandbox::TestDataRootDeniesKeystorePathsEveryProfile`, `TestNoEmittedAllowCoversKeystorePath`, `TestDataRootDeniesCanonicalPathAndPrefixRegex`, `TestProtectedPrefixesRefuseKeystoreReallow`, `TestEmptyDataRootFailsClosed`, `TestVMGuestGetsNoDataRootShare`; rig leg E10 | pending: runtimed's sandbox change |
@@ -2030,7 +2061,7 @@ each stated in the change that makes it. U15 is held for a K0 amendment and U39 
 | U21 | install creates both logs service-user-owned 0600 and flagged; the listener refuses to start when a flag is clear (seams: chflags flag source, file-attribute writer, euid source) | `k3sm/pkg/install::TestKeystoreAppendOnlyFilesAtInstall`, `k3sm/pkg/keystore::TestFlagCheckRefusesUnflagged`; rig leg E1 | pending: the append-only files |
 | U22 | `floor --rebuild` and `audit --rotate` stop the listener, hold the lock, flag the new file before touching the old; a crash at each step leaves a flagged file (seams: file-attribute writer, euid source) | `k3sm/cmd/k3sm::TestKeysFloorRebuildCrashOrder`, `TestKeysAuditRotateCrashOrder`; rig leg E17 | pending: the append-only files |
 | U23 | every audited operation writes one `v:1` line; no line carries a value or its length; readers ignore unknown fields | `k3sm/pkg/keystore::TestAuditLineNeverCarriesValue`, `TestAuditReaderIgnoresUnknownFields` | pending: the append-only files |
-| U24 | soft cap shows in `doctor`; past the hard cap every mutating user op is `ErrLogFull` | `k3sm/pkg/keystore::TestLogHardCapRefusesMutations` | pending: the append-only files |
+| U24 | soft cap shows in `doctor`; past the hard cap every mutating user op is `ErrLogFull`, except the revocation class, which draws on the reserve; a line over 1 KiB is refused | `k3sm/pkg/keystore::TestLogHardCapRefusesMutations`, `TestAuditLineBoundedAtOneKiB` | pending: the append-only files |
 | U25 | backup and restore round trip: a restored tree with cleared flags is refused until `floor --rebuild`, then opens | `k3sm/pkg/keystore::TestBackupRestoreRoundTripRebuild`; rig leg E17 | pending: the append-only files |
 | U26 | peers uid 0, the service uid and uid < 501 are refused before any frame is read (seam: peer-credential source) | `k3sm/pkg/keystore/socket::TestPeerEligibility` | pending: the socket listener |
 | U27 | framing: an oversize frame, unknown type, a sub-length past the frame length or missing `HELLO` closes; `HELLO` past the 10-second bound closes; an unknown header field is ignored; `HELLO` picks the highest common version and the reply carries it and the server's frame cap; no common version sends `unsupported-version` then closes; an unknown `op` answers `unknown-op` and keeps the connection; the frame cap covers the largest value, header and framing | `k3sm/pkg/keystore/socket::FuzzFrameReader` (committed seeds), `TestFramingBounds`, `TestSubLengthsWithinFrame`, `TestHelloReadDeadline`, `TestUnknownHeaderFieldsIgnored`, `TestHelloVersionRange`, `TestHelloReplyCarriesVersionAndMaxFrame`, `TestHelloNoOverlapSendsUnsupportedVersion`, `TestUnknownOpKeepsConnection`, `TestFrameCapCoversMaxValue` | pending: the socket listener |
@@ -2068,11 +2099,12 @@ each stated in the change that makes it. U15 is held for a K0 amendment and U39 
 | U59 | seam guard: `pkg/keystore/reconcile`'s `TestMain` installs a panicking stub on its clock seam | `k3sm/pkg/keystore/reconcile::TestRealPrimitivesUnreachable` | pending: the KeyDelivery reconciler (authority) |
 | U60 | seam guard: `cmd/k3sm`'s `TestMain` installs a panicking stub on each of its seams (clock, uid resolver, client-side peer-credential source, exec, euid source, file-attribute writer) | `k3sm/cmd/k3sm::TestRealPrimitivesUnreachable` | pending: the append-only files, extended by the non-root CLI and `exec` |
 | U61 | seam guard: `pkg/install`'s `TestMain` installs a panicking stub on its euid source and file-attribute writer | `k3sm/pkg/install::TestRealPrimitivesUnreachable` | pending: the append-only files |
-| U62 | reconciler lines are charged to the delivery's owner uid: a `deliver-write` past the owner's share is refused and read as `Indeterminate`, the Secret keeping its last version; a `deliver-delete` is charged but never refused for the share | `k3sm/pkg/keystore/reconcile::TestReconcilerLinesChargedToOwner`, `TestDeliverWritePastShareIsIndeterminate`, `TestDeliverDeleteNeverRefusedForShare` | pending: the KeyDelivery reconciler (lifecycle) |
+| U62 | reconciler lines are charged to the delivery's owner uid: a `deliver-write` past the owner's share is refused and read as `Indeterminate`, the Secret keeping its last version; a `deliver-delete`, and the `deliver-write` and floor line of a withdrawal, are charged but never refused for the share, and past it draw on the revocation reserve | `k3sm/pkg/keystore/reconcile::TestReconcilerLinesChargedToOwner`, `TestDeliverWritePastShareIsIndeterminate`, `TestDeliverDeleteNeverRefusedForShare` | pending: the KeyDelivery reconciler (lifecycle) |
 | U63 | entries live under `.user/<uid>/entries/`: entries named `deliveries` and `scope.key` are ordinary, `put`, `rotate`, `list` and `rm` work on them, and neither touches the scope's `deliveries` record or `scope.key` | `k3sm/pkg/keystore::TestEntriesNamedDeliveriesAndScopeKeyAreOrdinary` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
 | U64 | a missing `.user/<uid>/` or `scope.key` answers `ErrScopeAbsent`, never `ErrNotFound`; `ErrNotFound` only for an entry missing from a scope that exists and opened; a read (`list`, `read-for-exec`, `deliveries`, a reconciler read) on a uid with no scope creates no directory and mints no `K_u`; the first mutating operation does | `k3sm/pkg/keystore::TestReadDoesNotMintScope`, `TestMissingScopeIsScopeAbsent` | pending: the user-scope store |
 | U65 | the reconciler reads `ErrScopeAbsent` as `Indeterminate` and deletes nothing; every outcome on the allow-list, not only a SAR denial, deletes only on two consecutive sweeps for the same generation; the single-server check is re-run from a fresh List before every sweep, and a second server or a failed List runs no sweep | `k3sm/pkg/keystore/reconcile::TestAbsentScopeIsIndeterminate`, `TestEveryDeletingOutcomeNeedsTwoSweeps`, `TestSingleServerRecheckedBeforeEverySweep` | pending: the KeyDelivery reconciler (lifecycle) |
 | U66 | the GeneratedUID lookup recognises the synthesized compatibility form (prefix `FFFFEEEE-DDDD-CCCC-BBBB-AAAA`) and answers `ErrScopeOwnerUnknown`, never a changed owner, and no mint binds it; `ErrScopeOwnerChanged` only when a real, non-synthesized GeneratedUID differs from the bound one (seam: GeneratedUID lookup) | `k3sm/pkg/keystore::TestSynthesizedGeneratedUIDIsUnknown` | pending: the user-scope store |
+| U67 | the revocation class (`withdraw`, `rm`, `rotate`, the withdrawal's floor line, the reconciler's `deliver-delete` and `deliver-write` of a withdrawal) is charged to the share while it has room and past it bypasses the share and the hard cap, drawing on the 4 MiB revocation reserve; only the reserve's exhaustion refuses it; a no-op `rm`, `withdraw` or `rotate` is charged like any line and refused past the share; the socket's members stop with 3 MiB of the reserve left, which the reconciler's members may use | `k3sm/pkg/keystore/socket::TestRevocationBypassesShareUsesReserve`, `TestNoOpRevocationChargedToShare`, `TestReserveKeepsReconcilerPart` | pending: the socket operations |
 
 ### Rig legs
 
