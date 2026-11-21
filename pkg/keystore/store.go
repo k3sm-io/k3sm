@@ -192,9 +192,6 @@ func (s *FileStore) createEntry(root *os.Root, name string) (*entry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create the entry directory: %w", err)
 	}
-	if err := syncDir(root); err != nil {
-		return nil, err
-	}
 	s.entryMade(name)
 	sub, err := root.OpenRoot(name)
 	if err != nil {

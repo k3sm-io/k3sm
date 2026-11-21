@@ -1023,7 +1023,10 @@ func TestPutCrashAtEveryStep(t *testing.T) {
 		s.step = func(name string) error { steps = append(steps, name); return nil }
 		mustPut(t, s, "k", KindOpaque, []byte("x"))
 	}
-	want := "write master,write master.sha256,write generation,write v1,write current"
+	// Each directory's step comes after its parent is fsynced, so the master
+	// directory is durable before the master is written into it, and the
+	// entry directory before its files.
+	want := "mkdir keystore,mkdir cred,mkdir keystore-master,write master,write master.sha256,mkdir k,write generation,write v1,write current"
 	if strings.Join(steps, ",") != want {
 		t.Fatalf("Put steps = %v, want %s", steps, want)
 	}

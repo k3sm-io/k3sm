@@ -175,7 +175,8 @@ func (s *FileStore) mkdirOwned(path string) error {
 // Anything else is a directory swapped in between, which may be another
 // entry or one the service user prepared, so it is refused as ErrCorrupt and
 // nothing is chowned or chmodded. An existing name is an error matching
-// fs.ErrExist.
+// fs.ErrExist. Once handed over, parent is fsynced, so the new name is
+// durable.
 func (s *FileStore) mkdirAt(parent *os.Root, name string) (fs.FileInfo, error) {
 	if err := parent.Mkdir(name, dirMode); err != nil {
 		return nil, err
@@ -200,6 +201,15 @@ func (s *FileStore) mkdirAt(parent *os.Root, name string) (fs.FileInfo, error) {
 		return nil, fmt.Errorf("%w: the new directory %s %w", ErrCorrupt, name, err)
 	}
 	if err := s.own(f, dirMode); err != nil {
+		return nil, err
+	}
+	// The new name is made durable before anything is written under it: a
+	// power loss could otherwise keep entries while losing the master
+	// directory, which is ErrMasterMissing for good.
+	if err := syncDir(parent); err != nil {
+		return nil, err
+	}
+	if err := s.step("mkdir " + name); err != nil {
 		return nil, err
 	}
 	return opened, nil
