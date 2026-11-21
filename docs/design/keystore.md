@@ -424,6 +424,10 @@ open. The store refuses any other scope before it seals, opens or derives anythi
 names cannot contain `/`, so the qualified names `system/<name>` and `user/<uid>/<name>` are
 unambiguous: there is no shadowing between scopes and no search order.
 
+Amended by the user scope: the shared entry grammar ("User scope", "Scope strings and names")
+makes `user/0` invalid, since root has no user scope, so a uid is 1 to 4294967295. The
+user-scope store narrows `checkScope` to match (U11).
+
 Two kind bytes are reserved for user scope: `0xFE`, a wrapped scope key, and `0xFD`, a sealed
 per-user delivery list. No record carries either yet, and a reader refuses them, like every
 kind byte not in "Record encoding", as `ErrCorrupt`. The entries'-directory name `.user` is
@@ -956,7 +960,10 @@ the socket listener; the socket operations; the non-root CLI and `exec`; KeyDeli
 authoring; the KeyDelivery reconciler (authority, then lifecycle); and the user docs. Two
 leaves come from other repos: runtimed's sandbox change (the Pod denies) and the
 `KeyDelivery` API in `apis`. The sandbox change merges before the append-only files change
-creates any keystore file, and the API is tagged before KeyDelivery authoring opens.
+creates any keystore file, and the API is tagged before KeyDelivery authoring opens. The
+user-scope store depends on the entry grammar package, `apis/keystore/entry`, so that package is
+tagged first, and the user-scope store's change bumps k3sm's requirement on `k3sm.io/apis` to
+that tag and says so.
 
 Facts only a spike on the lab rig can settle are marked `[K0 leg N: pending]` where they
 apply; "Facts pending the rig spike" lists them. A marker is replaced by a dated amendment to
@@ -999,15 +1006,49 @@ The scope strings are `system` and `user/<uid>`, with `<uid>` the decimal macOS 
   `user/<other>/…` name answers `ErrNotFound`, worded identically to an absent entry, so the
   answer is no oracle for another user's names. System entry names are not hidden this way:
   Phase A's two data-root files name them (residual 11).
+- **A uid is decimal**, with no leading zero, from 1 to 4294967295. `user/0` is invalid: root
+  has no user scope. An all-digit second segment is always a uid, never a short name, even
+  when an account of that name exists, so `user/1000/x` names uid 1000 on every input path.
+- **`user/<uid>` names do not carry across Macs.** The same person usually has a different uid
+  on another Mac, so a qualified name copied to another machine names another account's scope,
+  or none. A script that moves between Macs uses the short-name input form, which each Mac
+  resolves for itself.
 
-**The entry grammar lives once**, as the OpenAPI `pattern` on `spec.entry` in the `apis` CRD:
+**The entry grammar lives once**, in a Kubernetes-free leaf package in `apis`,
+`apis/keystore/entry`, which imports only the standard library. It exports the pattern, the
+length bound and the parse:
 
 ```
-^(system|user/(0|[1-9][0-9]{0,9}))/[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$
+^(system|user/[1-9][0-9]{0,9})/[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$
 ```
 
-The admission policy's CEL cites the same string, the Go resolver uses the exported constant,
-and one shared vector table in `apis` tests all three (U11, U19, U40).
+The pattern bounds the uid's digits; the range (at most 4294967295) is a CEL rule beside it,
+`!self.startsWith('user/') || int(self.split('/')[1]) <= 4294967295`, and the Go parse reads
+the uid as a uint32. `spec.entry` has `maxLength` 79, the longest valid entry
+(`user/4294967295/` and a 63-byte name), which also bounds the CEL rules' cost. The CRD pattern,
+the admission policy's CEL and the Go resolver all take the grammar from that package, and one
+shared vector table in it tests all three (U11, U19, U40, U57). "Valid" means valid as an API
+entry; the CLI's short-name resolution runs before the grammar sees a name. The table holds at
+least:
+
+| input | valid | why |
+|---|---|---|
+| `system/signer-key` | yes | |
+| `user/501/claude-a` | yes | |
+| `user/1/a` | yes | the smallest uid |
+| `user/4294967295/a` | yes | the largest uid |
+| `user/4294967295/` and a 63-byte name | yes | 79 bytes, the `maxLength` |
+| `user/4294967295/` and a 64-byte name | no | a name label is at most 63 bytes |
+| `user/0/a` | no | uid 0 has no user scope |
+| `user/4294967296/a` | no | past a uint32 |
+| `user/0501/a` | no | a leading zero |
+| `user/+501/a` | no | not decimal digits |
+| `user/alice/a` | no | a short name is CLI input only, resolved before it reaches the API |
+| `user/1000/a` (CLI input, an account named `1000` exists) | yes, as uid 1000 | an all-digit segment is always a uid |
+| `user/501` | no | no name |
+| `user/501/a/b` | no | a `/` in the name |
+| `system/Signer` | no | upper case |
+| `other/a` | no | an unknown scope |
 
 ### On-disk layout
 
@@ -1255,18 +1296,33 @@ checks said (U36). That `LOCAL_PEERCRED` reports the service uid on the client s
 is `[K0 leg 2: pending]`.
 
 **Protocol `k3sm-keys/1`.** Internal, not a public API; the public interface is the `k3sm
-keys` CLI, which other programs call as a subprocess with the value on stdin.
+keys` CLI, which other programs call as a subprocess with the value on stdin. The CLI's human
+output is not stable and may change in any release; `-o json` and the exit codes are the stable
+surface, and the app consumes only those.
 
 - A frame is a 4-byte big-endian length (at most 128 KiB), a 1-byte type, a length-prefixed
-  JSON header (at most 8 KiB, never a value) and an optional length-prefixed binary value.
+  JSON header (at most 8 KiB, never a value) and an optional length-prefixed binary value. Each
+  prefix is 4 bytes, big-endian. Each sub-length must be at most the frame length, checked
+  before anything is allocated; a frame that breaks this closes the connection.
+- **The frame cap follows the value cap.** The largest frame a request needs is the store's
+  maximum value, 65,536 bytes (64 KiB), plus the 8,192-byte header cap, plus 9 bytes of type
+  and prefixes: 73,737 bytes. The cap of 131,072 bytes (128 KiB) leaves 57,335 bytes of
+  headroom, so a later header field needs no protocol change. A change to the store's value
+  cap changes the frame cap in the same change, and a test holds the inequality (U27).
 - **Strict frames, tolerant headers.** An oversize frame, an unknown frame type or a missing
   `HELLO` closes the connection; unknown header fields are ignored (U27).
-- The first frame is `HELLO {"proto":"k3sm-keys","min":1,"max":1}`. The server picks the
-  highest common version or closes.
+- The first frame is `HELLO {"proto":"k3sm-keys","min":1,"max":1}`. The server waits at most
+  the 10-second request bound from accept for a complete `HELLO`, then closes. It replies
+  `HELLO {"proto":"k3sm-keys","version":1,"max_frame":131072}`: the highest common version and
+  its own frame cap, which the client never exceeds. With no common version it sends an error
+  reply with code `unsupported-version` and then closes, so the client can say why.
+- **An unknown `op`** in a well-formed request is answered with the code `unknown-op`, and the
+  connection stays open, so a newer client can fall back on an older server without
+  reconnecting.
 - Error codes are a reserved closed set: `not-found`, `quota`, `busy`, `log-full`,
   `scope-owner-changed`, `scope-owner-unknown`, `user-scope-off`, `rate-limited`, `refused`,
-  `internal`. A client maps any code it does not know to a generic failure that prints the
-  code (U38).
+  `unsupported-version`, `unknown-op`, `internal`. A client maps any code it does not know to a
+  generic failure that prints the code (U38).
 - CLI and server are one binary, so version skew exists only between an upgrade's symlink flip
   and the server's restart; the CLI then prints "the server is an older build; restart it" and
   exits 1.
@@ -1534,7 +1590,8 @@ limitations page says so. Replicating the keystore across servers is a later des
 - Each consumer declares the small interface it needs at its own site. The socket server's has
   no reveal, show or rewrap method; the reconciler's reads a value only for a delivery it has
   authorised.
-- The entry grammar lives once, in `apis`.
+- The entry grammar lives once, in `apis/keystore/entry`, which imports only the standard
+  library.
 
 **The named seams.** Each replaces one real primitive, and the primitive is banned at unit
 tier: a unit test that reaches one fails. Integration and rig tests use the real one.
@@ -1738,7 +1795,7 @@ each stated in the change that makes it. U15 is held for a K0 amendment and U39 
 | U8 | a scope's records open only under its `K_u`; a copied `.user/<uid>/` without the master opens nothing | `k3sm/pkg/keystore::TestScopeCopyWithoutMasterOpensNothing` | pending: the user-scope store |
 | U9 | per-scope fingerprints differ for equal values in two scopes | `k3sm/pkg/keystore::TestFingerprintsDifferAcrossScopes` | pending: the user-scope store |
 | U10 | `user/<other>/…` is `ErrNotFound`, same text as an absent entry; a short name resolves to the uid and is printed | `k3sm/pkg/keystore::TestOtherUserIsNotFound`, `TestShortNameResolvesToUID` | pending: the user-scope store |
-| U11 | the Go resolver passes the shared entry-grammar vectors; `pkg/keystore` imports no Kubernetes package | `k3sm/pkg/keystore::TestEntryGrammarVectorsResolver`, `TestKeystoreIsKubernetesFree` | pending: the user-scope store |
+| U11 | the Go resolver takes the grammar from `apis/keystore/entry` and passes the shared entry-grammar vectors; `checkScope` refuses `user/0`; an all-digit second segment resolves as a uid even when an account of that name exists; `pkg/keystore` imports no Kubernetes package | `k3sm/pkg/keystore::TestEntryGrammarVectorsResolver`, `TestCheckScopeRefusesUserZero`, `TestAllDigitSegmentIsAlwaysUID`, `TestKeystoreIsKubernetesFree` | pending: the user-scope store |
 | U12 | master Rewrap re-wraps every `scope.key` and leaves user records byte-identical; resumable at every step | `k3sm/pkg/keystore::TestRewrapRewrapsScopeKeysResumable` (fault injection, as G12) | pending: user-scope quotas, scope-key Rewrap and the delivery record |
 | U13 | quotas: the 257th entry and the byte budget answer `ErrQuota`; `rm` still works | `k3sm/pkg/keystore::TestUserScopeQuota` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
 | U14 | the delivery record stores UID and target digest; add, look up and withdraw round-trip under the floor; the plaintext starts with the format version byte and the digest with the `k3sm-keystore-delivery-target/v1` label | `k3sm/pkg/keystore::TestDeliveryRecordDigestRoundTrip`, `TestDeliveryRecordVersionByteAndDigestLabel` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
@@ -1746,7 +1803,7 @@ each stated in the change that makes it. U15 is held for a K0 amendment and U39 
 | U16 | every Pod profile variant (native, vm, container-vm, xcode, expose-paths, a custom Pod root distinct from the data root) denies every `keystore-*` name in the data root and the `keystore-run/` tree; the keystore names are in `DataRootDenyTrees` and so in `protectedPrefixes`; `ReadOnlyPaths`, `ExposePaths` or a hostPath naming the data root or a keystore path is refused; an empty `Posture.DataRoot` refuses to render; a vm or container-vm guest gets no data-root share | `runtimed/pkg/sandbox::TestDataRootDeniesKeystorePathsEveryProfile`, `TestProtectedPrefixesRefuseKeystoreReallow`, `TestEmptyDataRootFailsClosed`, `TestVMGuestGetsNoDataRootShare`; rig leg E10 | pending: runtimed's sandbox change |
 | U17 | runtimed refuses a resolved Pod process uid of 501 or above, and uid 0 without a drop on a root daemon, at credential resolution and again at spawn | `runtimed/pkg/runtime::TestResolveCredentialRefusesLoginRangeUID`, `TestResolveCredentialRefusesRootWithoutDrop`; `runtimed/pkg/supervisor::TestSpawnRefusesLoginRangeUID`, `TestSpawnRefusesRootUIDWithoutDrop`; rig legs E21, E22 | pending: runtimed's sandbox change |
 | U18 | CRD: `entry`, `secretName`, `dataKey`, `requestedBy` required (`dataKey` defaults to `value`) and immutable by CEL transition rules; `requestedBy` matches its pattern and, for a user entry, equals `k3sm:local:` plus the entry's uid; `conditions` is `listType=map` keyed by `type`; status subresource on; reasons listed | `apis/config/crd::TestKeyDeliveryCRDMatchesTheGoTypes`, `TestKeyDeliveryImmutableFields`, `TestKeyDeliveryRequiredFields`, `TestKeyDeliveryRequestedByMatchesEntryUID`, `TestKeyDeliveryConditionsListMap` | pending: the `KeyDelivery` API |
-| U19 | the CRD pattern passes the shared entry-grammar vectors | `apis/config/crd::TestEntryGrammarVectors` | pending: the `KeyDelivery` API |
+| U19 | the CRD pattern, its `maxLength` of 79 and the uid range rule pass the shared entry-grammar vectors | `apis/config/crd::TestEntryGrammarVectors` | pending: the `KeyDelivery` API |
 | U20 | a user-scope `current` copied back is refused against the floor log, with Phase A's floor message | `k3sm/pkg/keystore::TestUserFloorRefusesCopiedBackCurrent`; rig leg E9 | pending: the append-only files |
 | U21 | install creates both logs service-user-owned 0600 and flagged; the listener refuses to start when a flag is clear | `k3sm/pkg/install::TestKeystoreAppendOnlyFilesAtInstall`, `k3sm/pkg/keystore::TestFlagCheckRefusesUnflagged`; rig leg E1 | pending: the append-only files |
 | U22 | `floor --rebuild` and `audit --rotate` stop the listener, hold the lock, flag the new file before touching the old; a crash at each step leaves a flagged file | `k3sm/cmd/k3sm::TestKeysFloorRebuildCrashOrder`, `TestKeysAuditRotateCrashOrder`; rig leg E17 | pending: the append-only files |
@@ -1754,7 +1811,7 @@ each stated in the change that makes it. U15 is held for a K0 amendment and U39 
 | U24 | soft cap shows in `doctor`; past the hard cap every mutating user op is `ErrLogFull` | `k3sm/pkg/keystore::TestLogHardCapRefusesMutations` | pending: the append-only files |
 | U25 | backup and restore round trip: a restored tree with cleared flags is refused until `floor --rebuild`, then opens | `k3sm/pkg/keystore::TestBackupRestoreRoundTripRebuild`; rig leg E17 | pending: the append-only files |
 | U26 | peers uid 0, the service uid and uid < 501 are refused before any frame is read | `k3sm/pkg/keystore/socket::TestPeerEligibility` | pending: the socket listener |
-| U27 | framing: an oversize frame, unknown type or missing `HELLO` closes; an unknown header field is ignored; `HELLO` picks the highest common version | `k3sm/pkg/keystore/socket::FuzzFrameReader` (committed seeds), `TestFramingBounds`, `TestUnknownHeaderFieldsIgnored`, `TestHelloVersionRange` | pending: the socket listener |
+| U27 | framing: an oversize frame, unknown type, a sub-length past the frame length or missing `HELLO` closes; `HELLO` past the 10-second bound closes; an unknown header field is ignored; `HELLO` picks the highest common version and the reply carries it and the server's frame cap; no common version sends `unsupported-version` then closes; an unknown `op` answers `unknown-op` and keeps the connection; the frame cap covers the largest value, header and framing | `k3sm/pkg/keystore/socket::FuzzFrameReader` (committed seeds), `TestFramingBounds`, `TestSubLengthsWithinFrame`, `TestHelloReadDeadline`, `TestUnknownHeaderFieldsIgnored`, `TestHelloVersionRange`, `TestHelloReplyCarriesVersionAndMaxFrame`, `TestHelloNoOverlapSendsUnsupportedVersion`, `TestUnknownOpKeepsConnection`, `TestFrameCapCoversMaxValue` | pending: the socket listener |
 | U28 | 16 connections in all, 2 per uid; a request past 10 s is cut | `k3sm/pkg/keystore/socket::TestConnectionCapsPerUID`, `TestRequestTimeout` (`testing/synctest`) | pending: the socket listener |
 | U29 | a listener panic is recovered and restarted; the apiserver is untouched; a stale socket is unlinked only if a service-user socket; a lock wait past 2 s fails the request | `k3sm/pkg/keystore/socket::TestListenerRecoversPanic`, `TestStaleSocketUnlinkChecksOwner`, `TestBoundedLockWait` | pending: the socket listener |
 | U30 | with two servers registered, the listener does not start and `doctor` says why | `k3sm/pkg/keystore/socket::TestUserScopeRefusedWithTwoServers` | pending: the socket listener |
@@ -1782,6 +1839,7 @@ each stated in the change that makes it. U15 is held for a K0 amendment and U39 
 | U54 | a pre-frame refusal (uid 0, the service uid, a uid below 501) writes a `refused` line with the peer uid, rate-limited per uid with a dropped-count summary | `k3sm/pkg/keystore/socket::TestPreFrameRefusalsAudited`, `TestPreFrameRefusalLinesRateLimited` | pending: the socket listener |
 | U55 | a transient lookup, SAR or apiserver error leaves the Secret and sets Unknown: a failed SAR call, an API server error, `ErrScopeOwnerUnknown`, `ErrBusy` and `ErrLogFull` each leave the Secret, the record entry and the finalizer, set `Authorized=Unknown` with reason `Indeterminate`, and retry with backoff | `k3sm/pkg/keystore/reconcile::TestTransientErrorLeavesSecretSetsUnknown` | pending: the KeyDelivery reconciler (lifecycle) |
 | U56 | a delivery record with an unknown format version is refused by the store and read by the reconciler as `Indeterminate`, never as a denial: no Secret is deleted | `k3sm/pkg/keystore::TestDeliveryRecordUnknownVersionRefused`, `k3sm/pkg/keystore/reconcile::TestUnknownRecordVersionIsIndeterminate` | pending: the KeyDelivery reconciler (lifecycle) |
+| U57 | `apis/keystore/entry` imports only the standard library, exports the pattern, the `maxLength` and the parse, and holds the shared vector table, which it passes | `apis/keystore/entry::TestGrammarVectors`, `TestImportsStdlibOnly` | pending: the entry grammar in `apis` |
 
 ### Rig legs
 
