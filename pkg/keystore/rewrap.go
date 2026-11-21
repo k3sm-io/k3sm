@@ -145,6 +145,7 @@ func (s *FileStore) rewrap(ctx context.Context, newMaster []byte) error {
 	if err != nil {
 		return err
 	}
+	defer next.wipe()
 	if err := s.sealNew(ctx, root, fl, plan, old, next); err != nil {
 		return err
 	}
@@ -180,12 +181,20 @@ func resumed(live keys, newMaster []byte) error {
 	return ErrRewrapResumed
 }
 
+// wipe clears the key material k derived, once nothing will seal or open
+// under it again.
+func (k *keys) wipe() {
+	clear(k.seal)
+	clear(k.fingerprint)
+}
+
 // refuseLive refuses a newMaster that is the live master k.
 func refuseLive(k keys, newMaster []byte) error {
 	nk, err := deriveKeys(newMaster, k.scope)
 	if err != nil {
 		return err
 	}
+	defer nk.wipe()
 	if hmac.Equal(nk.seal, k.seal) {
 		return errors.New("the new master is the live one")
 	}
@@ -236,11 +245,13 @@ func (s *FileStore) prepareNext(ctx context.Context, root, mroot *os.Root, fl fl
 		}
 		plan, committed, perr := rewrapPlan(ctx, root, fl, old, &k)
 		if perr != nil {
+			k.wipe()
 			return keys{}, nil, false, perr
 		}
 		if committed {
 			return k, plan, true, nil
 		}
+		k.wipe()
 		if err := s.discardNext(ctx, root, mroot); err != nil {
 			return keys{}, nil, false, err
 		}
@@ -269,10 +280,6 @@ func (s *FileStore) prepareNext(ctx context.Context, root, mroot *os.Root, fl fl
 		}
 		return keys{}, nil, false, perr
 	}
-	next, err := deriveKeys(newMaster, s.scope)
-	if err != nil {
-		return keys{}, nil, false, err
-	}
 	// The stale fingerprint goes first, so an interruption never leaves one
 	// that vouches for a key that was not written; the rename of master.next
 	// replaces a stale one.
@@ -283,6 +290,10 @@ func (s *FileStore) prepareNext(ctx context.Context, root, mroot *os.Root, fl fl
 		return keys{}, nil, false, err
 	}
 	if err := s.writeFile(mroot, masterNextFingerprintName, []byte(masterFingerprint(newMaster))); err != nil {
+		return keys{}, nil, false, err
+	}
+	next, err := deriveKeys(newMaster, s.scope)
+	if err != nil {
 		return keys{}, nil, false, err
 	}
 	return next, plan, false, nil
@@ -447,7 +458,11 @@ func planEntry(ctx context.Context, root *os.Root, name string, fl floor, old ke
 		if err := loopCtx(ctx, int(n)); err != nil {
 			return 0, false, err
 		}
-		if err := either(func(k keys) error { _, _, err := e.version(k, n); return err }); err != nil {
+		if err := either(func(k keys) error {
+			_, pt, err := e.version(k, n)
+			defer clear(pt)
+			return err
+		}); err != nil {
 			return 0, false, fmt.Errorf("version %d: %w", n, err)
 		}
 	}
@@ -488,7 +503,8 @@ func (s *FileStore) sealNew(ctx context.Context, root *os.Root, fl floor, plan [
 				if !errors.Is(err, ErrCorrupt) {
 					return err
 				}
-				_, _, err = e.openRecord(next, file, pointer, version)
+				_, npt, err := e.openRecord(next, file, pointer, version)
+				defer clear(npt)
 				return err
 			}
 			defer clear(pt)
@@ -543,7 +559,9 @@ func (s *FileStore) commitNew(ctx context.Context, root *os.Root, fl floor, plan
 			if !errors.Is(err, ErrCorrupt) {
 				return err
 			}
-			if _, _, err := e.openRecord(next, file, pointer, version); err != nil {
+			_, npt, err := e.openRecord(next, file, pointer, version)
+			defer clear(npt)
+			if err != nil {
 				return err
 			}
 			if err := e.root.Remove(file + newSuffix); err != nil && !errors.Is(err, fs.ErrNotExist) {
