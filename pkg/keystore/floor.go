@@ -107,6 +107,12 @@ func marshalFloor(fl floor) ([]byte, error) {
 // staleError refuses a current pointer the floor rules out. It matches
 // ErrCorrupt but carries its own text, because ErrCorrupt's advice to restore
 // from backup is the opposite of the fix: an older copy is what produced it.
+//
+// The generation case is refused only once a Put after the Delete has
+// recorded a new generation for the name. A completed Delete removes the
+// name's floor entry, so an older copy of the deleted entry put back before
+// any new Put has nothing to be refused against and is accepted
+// (docs/design/keystore.md § "Pointer sequence and floor").
 type staleError struct {
 	name       string
 	seq, floor uint64
@@ -116,7 +122,7 @@ type staleError struct {
 func (e *staleError) Error() string {
 	what := fmt.Sprintf("the current pointer (sequence %d) is older than the recorded floor (sequence %d); an older copy of this entry was put back", e.seq, e.floor)
 	if e.generation {
-		what = "the current pointer belongs to another generation of this entry than the recorded floor; an older copy of a deleted entry was put back, or a delete and the put after it were both interrupted"
+		what = "the current pointer belongs to another generation of this entry than the recorded floor; an older copy of a deleted entry was put back after a newer put of the name, or a delete and the put after it were both interrupted"
 	}
 	return fmt.Sprintf("keystore entry %q: %s. Do not restore from backup. If that was deliberate, follow \"Restoring an older keystore/\" in docs/user/backup-restore.md", e.name, what)
 }

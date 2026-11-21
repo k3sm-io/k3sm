@@ -208,10 +208,54 @@ func TestFloorRefusesCopiedBackPointer(t *testing.T) {
 			t.Fatal(err)
 		}
 		var stale *staleError
-		if _, _, err := s.Current(ctx, "k"); !errors.As(err, &stale) || !stale.generation {
+		_, _, err := s.Current(ctx, "k")
+		if !errors.As(err, &stale) || !stale.generation {
 			t.Fatalf("Current over an old generation: %v, want the floor's generation refusal", err)
 		}
+		// The refusal names the case it covers: a put-back after a newer Put,
+		// never a deleted entry put back in general, which is accepted
+		// (TestDeletedEntryPutBack).
+		if msg := err.Error(); !strings.Contains(msg, "after a newer put of the name") {
+			t.Errorf("generation refusal %q does not say the put-back followed a newer put", msg)
+		}
 	})
+}
+
+// TestDeletedEntryPutBack pins the residual docs/design/keystore.md §
+// "Pointer sequence and floor" accepts for this phase: a completed Delete
+// removes the name's floor entry, so an old copy of the deleted entry put
+// back before any new Put of the name has nothing to be refused against. It
+// opens, and the next root verb records its generation and sequence.
+func TestDeletedEntryPutBack(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	mustPut(t, s, "k", KindOpaque, []byte("one"))
+	mustRotate(t, s, "k", "two")
+	old := filepath.Join(server, "old-entry")
+	if err := os.Mkdir(old, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{generationName, "v1", "v2", currentName} {
+		copyFile(t, entryPath(server, "k", f), filepath.Join(old, f))
+	}
+	recorded := floorOf(t, server)["k"]
+	if err := s.Delete(ctx, "k"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := floorOf(t, server)["k"]; ok {
+		t.Fatal("the Delete left the name's floor entry")
+	}
+	if err := os.Rename(old, filepath.Join(server, "keystore", "k")); err != nil {
+		t.Fatal(err)
+	}
+	mustCurrent(t, s, "k", "two")
+	if err := s.RaiseFloor(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := floorOf(t, server)["k"]; got != recorded {
+		t.Fatalf("floor after RaiseFloor = %+v, want the put-back entry's %+v", got, recorded)
+	}
+	mustCurrent(t, s, "k", "two")
 }
 
 // TestFloorTrust is G6: the floor, and the data root holding it, are judged

@@ -312,6 +312,17 @@ first Put mints no master.
   floor to that sequence.
 - **Delete:** remove `current`, then the entry directory, then the floor entry.
 
+**A deleted entry put back is accepted in this phase.** A completed Delete removes the
+name's floor entry, so nothing records that the name was deleted. An old copy of the deleted
+entry's directory, put back before any new Put of the name, therefore authenticates, is
+accepted by every reader, and is recorded by the next root verb's raise. The floor refuses
+such a copy (the generation refusal) only once a Put after the Delete has recorded a new
+generation for the name. This is accepted for this phase: putting a directory back under
+`keystore/` already takes a writer the floor does not defend against for an absent name,
+and the result is the entry as it stood before its Delete, not a forged value. Closing it
+needs a tombstone, a floor record that the name's last generation was deleted, which is
+left to a later change.
+
 A crash after the pointer flip but before the floor write leaves the floor one behind the
 pointer, which the rule above accepts (pointer at or above floor). So that the lag does not
 become a window, **every root-run verb begins by raising each entry's floor to its
