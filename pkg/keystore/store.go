@@ -76,7 +76,9 @@ type Config struct {
 // duration: exclusive to write, shared to read.
 //
 // Rotate and Rewrap land in later pull requests, so FileStore does not yet
-// satisfy Store.
+// satisfy Store: it implements every other Store method, which keystore_test.go
+// asserts, and the Rewrap pull request replaces that assertion with
+// var _ Store = (*FileStore)(nil).
 type FileStore struct {
 	dir       string
 	masterDir string
