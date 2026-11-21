@@ -1,5 +1,12 @@
 # k3sm — distribution & assembly
 
+@.claude/rules/native-builds.md
+
+Use the `yurei build` queue via the runtime's executable absolute `YUREI_BIN`; verify native pod placement.
+Preserve BypassGuard and every real human gate; this policy never widens credential, money, release or irreversible authority.
+
+All build and test examples below run through the approved native Darwin pod route; older host exceptions are superseded.
+
 Module **`k3sm.io/k3sm`** (≈ k3s): the single-binary distribution. `cmd/k3sm` (server | agent | node |
 install | token | kubectl | doctor | dev | build | image | …; `image` is
 load|import|push|pull|tag|untag|inspect|save|prune|ls|df, a client of runtimed's Images service — the
