@@ -57,9 +57,9 @@ var (
 	// more than a crashed Put leaves. Put never writes that before the pointer,
 	// so it is damage, or an interrupted Delete: List reports it, Put refuses
 	// it, and Delete clears it.
+	errNoPointer = fmt.Errorf("%w: the current pointer is missing and the directory holds more than an interrupted put leaves", ErrCorrupt)
 	// errInvalidConfig reports a Config every operation refuses.
 	errInvalidConfig = errors.New("invalid keystore config")
-	errNoPointer     = fmt.Errorf("%w: the current pointer is missing and the directory holds more than an interrupted put leaves", ErrCorrupt)
 )
 
 // Config locates a FileStore and names the user it belongs to.

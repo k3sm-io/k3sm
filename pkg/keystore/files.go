@@ -36,9 +36,10 @@ import (
 // directories the service user owns, and a process running as that user could
 // otherwise turn a name into a symlink and point root's write elsewhere. The
 // two directories opened by path (the entries' directory and cred/) sit in the
-// server work dir, whose own entry the service user cannot replace (the data
-// root is root:wheel 0755), so only their last component needs the check
-// openDir makes.
+// server work dir, server/. The service user owns server/, so it can replace
+// either name with a symlink, which is the last component openDir checks; it
+// cannot replace server/ itself, whose entry is in the data root, root:wheel
+// 0755, so nothing above that last component needs the check.
 
 const (
 	// dirMode is the mode of every directory the store creates.
