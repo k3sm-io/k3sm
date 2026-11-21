@@ -606,6 +606,26 @@ the conservative way:
   acquisition creates `.lock`, and again under it); no entries directory (nothing to
   rewrap); no master (`ErrMasterMissing`); and a new master equal to the live one.
 
+**Cost.** Rewrap is bounded, and it is slow on a large keystore by design:
+
+- *Entries.* Put refuses an entry the floor has no room for, and a floor holds at most
+  67,650 entries (4 MiB over the smallest entry's 62 bytes). Every directory listing fails
+  closed past 131,072 names (`maxDirNames`), whatever put them there.
+- *Versions.* A pointer names at most version 65,536 (`maxVersion`), so an entry has at most
+  65,537 records, each a value of at most 64 KiB.
+- *Passes.* Four, each a walk over every entry: the floor raise, which opens each pointer;
+  the plan, which opens every record under the old key or the new; the seal, which opens each
+  record still under the old key and writes its `.new`; and the commit, which opens each such
+  record and its `.new` again and renames. A discarded `master.next` adds a listing pass over
+  the entry directories, and so does the `.new` check when `master.next` is bad.
+- *Locks.* The whole run holds the exclusive `.lock` and the data-root lock, and checks `ctx`
+  every 64 names or versions in each pass, so a cancelled context stops it soon after; what it
+  wrote by then is a state a rerun completes or discards.
+- *Others wait.* While a long Rewrap runs, every writer, and every reader, since a reader's
+  shared lock waits on the exclusive one, times out after the lock's bounded wait (10
+  seconds) with the lock-timeout error, and tries again; the delivery reconciler does so on
+  its next sweep.
+
 **Consequence for backups.** The old master does not survive step 5, so an entry backup
 taken before a Rewrap can no longer be opened with the live master. See "Backup and
 snapshots": entry and master backups are a matched pair, and a Rewrap starts a new pair.
