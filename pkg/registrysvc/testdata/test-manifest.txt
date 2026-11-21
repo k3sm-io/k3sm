@@ -46,9 +46,11 @@ TestGateManifestBoundCoversCollect added the manifest PUT bound is the collect b
 TestGateLeavesBlobUploadsOutOfTheHeaderBound added a blob upload commit is held to the registry's upload bound
 TestGateProxyForEveryOperation added every gate operation is pinned to a proxy class
 TestGateReadErrorLogsCancellationAtDebug added a read the client cancelled is not a warning
+TestGateReadErrorWarnsOncePerIntervalPerCause added a failed read warns once a minute per cause
 TestGateRefusesLongLivedBuilderToken kept the push gate is unchanged
 TestGateWriteErrorIs502WhenUpstreamIsDown added an authorized write to a closed upstream is a 502
 TestGateWriteErrorLogsCancellationAtDebug added a write the client cancelled is not a warning
+TestGateWriteErrorWarnsOncePerInterval added a failed authorized write warns once a minute per cause
 TestGenerateCredential kept the credential files are unchanged
 TestHostingDocument kept the relay and cluster publication do not touch the child
 TestIsOrphanedChild added new with the child switch
