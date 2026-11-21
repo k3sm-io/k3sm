@@ -56,6 +56,10 @@ Targets **darwin/arm64, macOS 26+**. Go **1.26 or later** (each `go.mod` declare
   (golden files where useful).
 - `go test ./...` must pass, and `go test -race ./...` too; the `k3sm` gate runs `-race`. No network or real privilege in unit tests — fake at
   seams (interfaces). Integration/e2e tests are build-tagged and live separately.
+- Unit tests are hermetic. A test never times with the wall clock: it uses an injected clock (a
+  small `clock` interface at the consumer, per §Interfaces) or `testing/synctest`, whose bubble
+  makes `time.Sleep`, timers and `time.Now` virtual. Listeners bind `127.0.0.1:0` and read the port
+  back. No test depends on another test's side effects or on the order tests run in.
 - A root check in an integration-tagged test goes through `k3smtest.SkipUnless(t, k3smtest.Root)`
   (`k3sm.io/apis`), never a hand-rolled `os.Geteuid()` gate; `darwin-net`'s gate fails on a raw
   `Geteuid` there.
@@ -126,7 +130,9 @@ The gate looks for `$(go env GOPATH)/bin/staticcheck-<version>` first, then `sta
 then `$(go env GOPATH)/bin/staticcheck`, and uses the first that reports exactly the pin. The
 versioned name lets two pins be installed side by side while the repos move from one to the other:
 `GOBIN=<tmp> go install` the pinned release, then move `<tmp>/staticcheck` to
-`$(go env GOPATH)/bin/staticcheck-<version>`.
+`$(go env GOPATH)/bin/staticcheck-<version>`. These tools run in a k3sm pod: the install lines here
+are the pinned builds inside the pod, never an install on the host Mac (containers only, see
+`CONTRIBUTING.md`).
 govulncheck is pinned the same way, at `golang.org/x/vuln/cmd/govulncheck@v1.9.0`, in each repo's
 `GOVULNCHECK_VERSION`.
 - **Scope**: `-tests=false` checks non-test code only. Each repo's `hack/ci.sh` says why at the stage.

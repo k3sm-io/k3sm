@@ -170,6 +170,9 @@ type serverOptions struct {
 	// registry-k3sm Service is also exposed on, so a tool off the cluster
 	// reaches the registry at <any node>:<port>. 0, the default, exposes none.
 	registryNodePort int
+	// registryQuota is --registry-quota, repeatable: the registry's byte quota
+	// per artifactType, enforced at manifest push.
+	registryQuota registrysvc.QuotaFlag
 }
 
 // executorConfig renders the control-plane Config these flags describe. It is
@@ -431,6 +434,7 @@ func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	// Service whose backend is still the relay, so the push gate answers there:
 	// reads are anonymous to anyone who can reach a node, writes need a token.
 	fs.IntVar(&opts.registryNodePort, "registry-node-port", 0, "also expose the cluster's registry on this `port` in the NodePort range "+ports.NodePortRange()+", so a tool on a Mac reaches it at <any node>:<port> over HTTPS under the cluster CA. Reads there are anonymous to anyone who can reach a node; pushes need a token from k3sm registry token. 0, the default, exposes none")
+	fs.Var(&opts.registryQuota, registrysvc.QuotaFlagName, "a byte quota for one artifact type in the cluster's registry, as `<artifactType>=<bytes>`; repeat it per type. A push that would take the type's stored layers past it is refused. None by default")
 	fs.StringVar(&opts.clusterIP, "dns-vip", "10.43.0.10", "cluster DNS VIP the per-node resolver binds and pods resolve against")
 	fs.StringVar(&opts.domain, "cluster-domain", dns.DefaultClusterDomain, "cluster DNS domain")
 	fs.StringVar(&opts.network, "network", hostnet.NetworkAuto, "host-network backend: auto (root→direct, unprivileged→netd helper +probe) | none (control-plane-only, no datapath/probe) | direct (force lo0, root) | helper (force netd helper)")
@@ -850,6 +854,7 @@ func serverNodeOptions(plan serverPlan, restCfg *rest.Config, nodeAddressing nod
 		budgetDir:   budgetDirFor(opts.workDir),
 		statusDir:   status.Dir(opts.workDir),
 		dataRoot:    executor.RuntimeRoot(opts.workDir),
+		stateDir:    opts.workDir,
 		// The recorded release base, which the update watcher's pin admits.
 		updateReleaseBase: opts.updateReleaseBase,
 		// The server's own cluster CA: the update signer it mints chains to it.
@@ -898,6 +903,12 @@ func serverNodeOptions(plan serverPlan, restCfg *rest.Config, nodeAddressing nod
 		// The cluster's one registry name, fetched from this server's own
 		// registry on loopback; zero when it runs none.
 		flatRegistry: w.registryPuller.Flat,
+		// The verified guest boot pair goes to this server's own registry,
+		// where a worker fetches it by the pin's digests. nil with no registry.
+		onGuestArtifacts: w.registryPuller.PublishGuest,
+		// The store that registry serves, on this machine: the runtime clones
+		// a blob it already holds instead of fetching it. Empty when it runs none.
+		registryStoreRoot: w.registryPuller.StoreRoot,
 		// The loopback ports this server's datastore listens on (deniedLocalPorts:
 		// the --kine-port value that reaches executor.Config.KinePort, plus the etcd
 		// metrics port in the etcd posture), so every pod's SBPL denies connect() to

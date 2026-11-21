@@ -44,6 +44,12 @@ import (
 // its new addresses inside it, or the apply fails and nothing changes.
 const lanApplyTimeout = 20 * time.Second
 
+// lanExpiryTick is how often the node daemon checks whether a LAN access
+// expiry (`k3sm network lan on --for`) has passed. It is a coarse tick rather
+// than a timer at the expiry because Go timers do not advance while the Mac
+// sleeps: a tick after wake sees the wall clock past the expiry and reverts.
+const lanExpiryTick = 30 * time.Second
+
 // lanSets is what the LAN switch resolves to for the listener families: the
 // NodePort address set (nil is the wildcard) and the set the LoadBalancer and
 // ingress listeners bind.
@@ -71,7 +77,10 @@ type lanStep struct {
 
 // lanSwitch is the node daemon's half of `k3sm network lan`: it holds the LAN
 // state in force, the families it moves, and applies the recorded value on
-// SIGHUP as ONE all-or-nothing change across the families.
+// SIGHUP as ONE all-or-nothing change across the families. On every tick it
+// also re-applies the record when the record's effective state (an expiry
+// having passed) differs from the state in force; it never rewrites the
+// record, which only root can.
 //
 // Locking discipline: mu guards every field below it and is held for a whole
 // apply and for a family's attach, so a family can never be built on one
@@ -83,10 +92,21 @@ type lanSwitch struct {
 	readRecord  install.NetworkRecordReader
 	writeFile   func(path string, data []byte) error
 	hostAddrs   func() ([]netip.Addr, error)
-	log         *slog.Logger
+	// now is the clock an expiry is judged against; nil is time.Now.
+	now func() time.Time
+	// tick starts the expiry tick and returns its channel and its stop; nil
+	// is no tick.
+	tick func() (<-chan time.Time, func())
+	log  *slog.Logger
 
-	mu       sync.Mutex
-	lan      install.LAN
+	mu  sync.Mutex
+	lan install.LAN
+	// lapsed is the serial of a timed record this daemon has already seen
+	// past its expiry. That record stays off even if the wall clock later
+	// steps back before the expiry, so a clock correction cannot reopen an
+	// expired window. Guarded by mu, except in load, which runs before any
+	// concurrent use.
+	lapsed   string
 	serial   string
 	spec     string
 	node     netip.Addr
@@ -105,7 +125,12 @@ func newLANSwitch(recordPath, appliedPath string, log *slog.Logger) *lanSwitch {
 		readRecord:  install.ReadNetworkRecordFile,
 		writeFile:   func(path string, data []byte) error { return atomicfile.Replace(path, data, 0o644) },
 		hostAddrs:   nodePortHostAddrs,
-		log:         log,
+		now:         time.Now,
+		tick: func() (<-chan time.Time, func()) {
+			t := time.NewTicker(lanExpiryTick)
+			return t.C, t.Stop
+		},
+		log: log,
 	}
 	s.load()
 	return s
@@ -119,7 +144,28 @@ func (s *lanSwitch) load() {
 		s.lan = install.LANOff
 		return
 	}
-	s.lan, s.serial = rec.LAN, rec.Serial
+	s.lan, s.serial = s.effective(rec), rec.Serial
+}
+
+// effective is the LAN access a record grants now, latching a timed record
+// off once this daemon has seen it lapse (see lapsed).
+func (s *lanSwitch) effective(rec install.NetworkRecord) install.LAN {
+	now := s.clock()
+	if rec.Lapsed(now) {
+		s.lapsed = rec.Serial
+	}
+	if rec.ExpiresAt != nil && rec.Serial != "" && rec.Serial == s.lapsed {
+		return install.LANOff
+	}
+	return rec.Effective(now)
+}
+
+// clock is the switch's time now.
+func (s *lanSwitch) clock() time.Time {
+	if s.now == nil {
+		return time.Now()
+	}
+	return s.now()
 }
 
 // resolve turns lan into the families' address sets, against this Mac's
@@ -200,9 +246,10 @@ func (s *lanSwitch) apply(ctx context.Context) error {
 		s.report(rec.Serial, err)
 		return err
 	}
-	sets, err := s.resolve(rec.LAN)
+	lan := s.effective(rec)
+	sets, err := s.resolve(lan)
 	if err != nil {
-		err = fmt.Errorf("resolve LAN access %s: %w", rec.LAN, err)
+		err = fmt.Errorf("resolve LAN access %s: %w", lan, err)
 		s.report(rec.Serial, err)
 		return err
 	}
@@ -230,11 +277,11 @@ func (s *lanSwitch) apply(ctx context.Context) error {
 		}
 	}
 	if len(failed) > 0 {
-		err := fmt.Errorf("LAN access %s was applied only in part (the listener families may now disagree): %w", rec.LAN, errors.Join(failed...))
+		err := fmt.Errorf("LAN access %s was applied only in part (the listener families may now disagree): %w", lan, errors.Join(failed...))
 		s.report(rec.Serial, err)
 		return err
 	}
-	s.lan, s.serial = rec.LAN, rec.Serial
+	s.lan, s.serial = lan, rec.Serial
 	s.report(rec.Serial, nil)
 	return nil
 }
@@ -243,7 +290,7 @@ func (s *lanSwitch) apply(ctx context.Context) error {
 // record acted on, plus err when the record could not be applied. A write
 // failure is logged; the CLI then falls back to a restart.
 func (s *lanSwitch) report(serial string, err error) {
-	a := install.NetworkApplied{LAN: s.lan, Serial: serial, At: time.Now().UTC()}
+	a := install.NetworkApplied{LAN: s.lan, Serial: serial, At: s.clock().UTC()}
 	if err != nil {
 		a.Error = err.Error()
 	}
@@ -257,12 +304,22 @@ func (s *lanSwitch) report(serial string, err error) {
 	}
 }
 
-// watch applies the record on every signal from hup until ctx ends.
+// watch applies the record on every signal from hup, and runs an expiry
+// check (expireTick) on every tick, until ctx ends.
 func (s *lanSwitch) watch(ctx context.Context, hup <-chan os.Signal) {
+	var tick <-chan time.Time
+	if s.tick != nil {
+		c, stop := s.tick()
+		defer stop()
+		tick = c
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-tick:
+			_, _ = s.expireTick(ctx) // it logs its own outcome
+			continue
 		case <-hup:
 		}
 		actx, cancel := context.WithTimeout(ctx, lanApplyTimeout)
@@ -274,6 +331,38 @@ func (s *lanSwitch) watch(ctx context.Context, hup <-chan os.Signal) {
 		}
 		s.log.Info("LAN access applied", "lan", string(s.state()))
 	}
+}
+
+// expireTick is one expiry check: when the record's effective state now
+// differs from the state in force (an expiry has passed), it applies the
+// record. applied reports whether it tried. A failed apply is logged at
+// Error, reported in the applied file by apply, and retried on the next
+// tick, since the state in force still differs. An unreadable record is left
+// to the next SIGHUP.
+func (s *lanSwitch) expireTick(ctx context.Context) (applied bool, err error) {
+	if !s.expiryDue() {
+		return false, nil
+	}
+	actx, cancel := context.WithTimeout(ctx, lanApplyTimeout)
+	defer cancel()
+	if err := s.apply(actx); err != nil {
+		s.log.Error("LAN access expired but could not be turned off; retrying on the next check", "err", err)
+		return true, err
+	}
+	s.log.Info("LAN access re-applied on its expiry check", "lan", string(s.state()))
+	return true, nil
+}
+
+// expiryDue reports whether the record's effective state now differs from
+// the state in force.
+func (s *lanSwitch) expiryDue() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, _, err := install.ReadNetworkRecord(s.readRecord, s.recordPath)
+	if err != nil {
+		return false
+	}
+	return s.effective(rec) != s.lan
 }
 
 // state returns the LAN state in force.

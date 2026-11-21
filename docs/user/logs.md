@@ -149,9 +149,10 @@ is there: the pod, namespace and container names are in each symlink's filename,
 the standard CRI format every shipper already parses.
 
 An **in-cluster** shipper, the DaemonSet that mounts `/var/log` as a `hostPath` and is the usual
-pattern on Linux, is not possible. Native Pods have no `hostPath` volumes at all: a native Pod is a
-Darwin process under a Seatbelt profile, and that profile denies the log tree along with the rest of
-the host filesystem, so a Pod cannot read another Pod's output. That denial is the reason the
+pattern on Linux, is not possible. A native Pod is a Darwin process under a Seatbelt profile, and
+that profile denies the log tree along with the rest of the host filesystem, so a Pod cannot read
+another Pod's output. A host share cannot open it either: k3sm refuses a share of `/var` or any k3sm
+tree. That denial is the reason the
 in-cluster pattern does not work, and it is the same reason the host-level one is the right shape
 here.
 

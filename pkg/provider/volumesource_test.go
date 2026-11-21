@@ -94,7 +94,7 @@ func TestToPodBoxMapsImageVolume(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			pod := volumePod("img", imageVolume("model", tc.reference, tc.policy), true)
-			box, err := toPodBox(pod, "10.42.0.5", "192.168.1.10", t.TempDir(), "", testClusterRegistry, netv1.DNSConfig{}, nil)
+			box, err := toPodBox(pod, "10.42.0.5", "192.168.1.10", t.TempDir(), "", testClusterRegistry, netv1.DNSConfig{}, "", nil)
 			if err != nil {
 				t.Fatalf("toPodBox: %v", err)
 			}
@@ -120,7 +120,7 @@ func TestToPodBoxMapsImageVolume(t *testing.T) {
 	t.Run("unmounted_is_skipped", func(t *testing.T) {
 		t.Parallel()
 		pod := volumePod("img", imageVolume("model", testClusterRegistry+"/models/qwen3:v1", corev1.PullIfNotPresent), false)
-		box, err := toPodBox(pod, "10.42.0.5", "192.168.1.10", t.TempDir(), "", testClusterRegistry, netv1.DNSConfig{}, nil)
+		box, err := toPodBox(pod, "10.42.0.5", "192.168.1.10", t.TempDir(), "", testClusterRegistry, netv1.DNSConfig{}, "", nil)
 		if err != nil {
 			t.Fatalf("toPodBox: %v", err)
 		}
@@ -166,7 +166,7 @@ func TestToPodBoxRefusesForeignImageVolume(t *testing.T) {
 		t.Run("toPodBox/"+tc.name, func(t *testing.T) {
 			t.Parallel()
 			pod := volumePod("img", imageVolume("model", tc.reference, corev1.PullIfNotPresent), true)
-			box, err := toPodBox(pod, "10.42.0.5", "192.168.1.10", t.TempDir(), "", tc.cluster, netv1.DNSConfig{}, nil)
+			box, err := toPodBox(pod, "10.42.0.5", "192.168.1.10", t.TempDir(), "", tc.cluster, netv1.DNSConfig{}, "", nil)
 			if !errors.Is(err, ErrImageVolumeRegistry) {
 				t.Fatalf("toPodBox = (%v, %v), want an error wrapping ErrImageVolumeRegistry", box.GetVolumes(), err)
 			}
@@ -181,7 +181,7 @@ func TestToPodBoxRefusesForeignImageVolume(t *testing.T) {
 		t.Run("toPodBox/unmounted_dropped/"+tc.name, func(t *testing.T) {
 			t.Parallel()
 			pod := volumePod("img", imageVolume("model", tc.reference, corev1.PullIfNotPresent), false)
-			box, err := toPodBox(pod, "10.42.0.5", "192.168.1.10", t.TempDir(), "", tc.cluster, netv1.DNSConfig{}, nil)
+			box, err := toPodBox(pod, "10.42.0.5", "192.168.1.10", t.TempDir(), "", tc.cluster, netv1.DNSConfig{}, "", nil)
 			if err != nil {
 				t.Fatalf("toPodBox = %v, want an unmounted image volume dropped and the pod not refused", err)
 			}
@@ -304,18 +304,40 @@ func TestToPodBoxRefusesMountedUnmodeledVolume(t *testing.T) {
 		vol      corev1.Volume
 		wantKind string
 	}{
-		{"hostPath", vol("logs", corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/var/log"}}), "hostPath"},
 		{"nfs", vol("share", corev1.VolumeSource{NFS: &corev1.NFSVolumeSource{Server: "nfs.example", Path: "/export"}}), "nfs"},
 		{"csi", vol("csi", corev1.VolumeSource{CSI: &corev1.CSIVolumeSource{Driver: "d"}}), "csi"},
 		{"ephemeral", vol("scratch", corev1.VolumeSource{Ephemeral: &corev1.EphemeralVolumeSource{}}), "ephemeral"},
 		{"gitRepo", vol("src", corev1.VolumeSource{GitRepo: &corev1.GitRepoVolumeSource{Repository: "https://example.com/r.git"}}), "gitRepo"},
 		{"no_source", vol("empty", corev1.VolumeSource{}), volumeKindNone},
 	}
+	hostPathVol := vol("logs", corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/var/log"}})
+	// hostPath is carried as shape for a native pod (the node's allowlist
+	// decides it after translation, see TestCreatePodHostShare*) and stays an
+	// unmodeled source on every other RuntimeClass.
+	t.Run("mounted/hostPath/native_is_carried", func(t *testing.T) {
+		t.Parallel()
+		box, err := toPodBox(volumePod("v", hostPathVol, true), "10.42.0.5", "192.168.1.10", t.TempDir(), "", testClusterRegistry, netv1.DNSConfig{}, "", nil)
+		if err != nil {
+			t.Fatalf("toPodBox = %v, want the hostPath shape carried for a native pod", err)
+		}
+		if v := boxVolume(box, "logs"); v == nil || v.GetHostPath().GetPath() != "/var/log" {
+			t.Errorf("box volume = %v, want hostPath /var/log", v)
+		}
+	})
+	t.Run("mounted/hostPath/vm_is_refused", func(t *testing.T) {
+		t.Parallel()
+		pod := volumePod("v", hostPathVol, true)
+		rc := runtimeclass.Name
+		pod.Spec.RuntimeClassName = &rc
+		if _, err := toPodBox(pod, "10.42.0.5", "192.168.1.10", t.TempDir(), "", testClusterRegistry, netv1.DNSConfig{}, "", nil); !errors.Is(err, ErrVolumeSourceUnsupported) {
+			t.Fatalf("toPodBox = %v, want ErrVolumeSourceUnsupported", err)
+		}
+	})
 	for _, tc := range refused {
 		t.Run("mounted/"+tc.name, func(t *testing.T) {
 			t.Parallel()
 			pod := volumePod("v", tc.vol, true)
-			_, err := toPodBox(pod, "10.42.0.5", "192.168.1.10", t.TempDir(), "", testClusterRegistry, netv1.DNSConfig{}, nil)
+			_, err := toPodBox(pod, "10.42.0.5", "192.168.1.10", t.TempDir(), "", testClusterRegistry, netv1.DNSConfig{}, "", nil)
 			if !errors.Is(err, ErrVolumeSourceUnsupported) {
 				t.Fatalf("toPodBox = %v, want an error wrapping ErrVolumeSourceUnsupported", err)
 			}
@@ -330,7 +352,7 @@ func TestToPodBoxRefusesMountedUnmodeledVolume(t *testing.T) {
 		t.Run("unmounted_still_dropped/"+tc.name, func(t *testing.T) {
 			t.Parallel()
 			pod := volumePod("v", tc.vol, false)
-			box, err := toPodBox(pod, "10.42.0.5", "192.168.1.10", t.TempDir(), "", testClusterRegistry, netv1.DNSConfig{}, nil)
+			box, err := toPodBox(pod, "10.42.0.5", "192.168.1.10", t.TempDir(), "", testClusterRegistry, netv1.DNSConfig{}, "", nil)
 			if err != nil {
 				t.Fatalf("toPodBox = %v, want an unmounted %s volume to keep running as it does today", err, tc.name)
 			}
@@ -344,8 +366,8 @@ func TestToPodBoxRefusesMountedUnmodeledVolume(t *testing.T) {
 	t.Run("mounted_by_init_container", func(t *testing.T) {
 		t.Parallel()
 		pod := volumePod("v", refused[0].vol, false)
-		pod.Spec.InitContainers = []corev1.Container{{Name: "i0", Image: "registry/web:1", VolumeMounts: []corev1.VolumeMount{{Name: "logs", MountPath: "/logs"}}}}
-		if _, err := toPodBox(pod, "10.42.0.5", "192.168.1.10", t.TempDir(), "", testClusterRegistry, netv1.DNSConfig{}, nil); !errors.Is(err, ErrVolumeSourceUnsupported) {
+		pod.Spec.InitContainers = []corev1.Container{{Name: "i0", Image: "registry/web:1", VolumeMounts: []corev1.VolumeMount{{Name: refused[0].vol.Name, MountPath: "/logs"}}}}
+		if _, err := toPodBox(pod, "10.42.0.5", "192.168.1.10", t.TempDir(), "", testClusterRegistry, netv1.DNSConfig{}, "", nil); !errors.Is(err, ErrVolumeSourceUnsupported) {
 			t.Fatalf("toPodBox = %v, want ErrVolumeSourceUnsupported", err)
 		}
 	})
@@ -364,7 +386,7 @@ func TestToPodBoxRefusesMountedUnmodeledVolume(t *testing.T) {
 				src.Image.Reference = testClusterRegistry + "/models/qwen3:v1"
 			}
 			pod := volumePod("v", vol("v0", src), true)
-			box, err := toPodBox(pod, "10.42.0.5", "192.168.1.10", t.TempDir(), "", testClusterRegistry, netv1.DNSConfig{}, nil)
+			box, err := toPodBox(pod, "10.42.0.5", "192.168.1.10", t.TempDir(), "", testClusterRegistry, netv1.DNSConfig{}, "", nil)
 			switch {
 			case err == nil && boxVolume(box, "v0") != nil:
 			case errors.Is(err, ErrVolumeSourceUnsupported):
@@ -378,7 +400,7 @@ func TestToPodBoxRefusesMountedUnmodeledVolume(t *testing.T) {
 		}
 	})
 
-	for _, be := range []struct{ name, runtimeClass string }{{"native", ""}, {"vm", runtimeclass.Name}} {
+	for _, be := range []struct{ name, runtimeClass, reason string }{{"native", "", reasonFailedHostShare}, {"vm", runtimeclass.Name, reasonFailedVolumeSource}} {
 		t.Run("CreatePod/"+be.name, func(t *testing.T) {
 			t.Parallel()
 			f := &platformFake{fakeRuntimeServer: newFakeRuntimeServer(), info: capabilityInfo(NodeCapabilities{VMBackend: true})}
@@ -386,7 +408,7 @@ func TestToPodBoxRefusesMountedUnmodeledVolume(t *testing.T) {
 			r := newRuntimedWith(f, RuntimedConfig{
 				NodeName: "n", NodeIP: "192.168.1.10", Root: t.TempDir(), PodLogsDir: t.TempDir(), Recorder: rec,
 			}, nil, nil)
-			pod := volumePod("v", refused[0].vol, true)
+			pod := volumePod("v", hostPathVol, true)
 			if be.runtimeClass != "" {
 				rc := be.runtimeClass
 				pod.Spec.RuntimeClassName = &rc
@@ -402,7 +424,7 @@ func TestToPodBoxRefusesMountedUnmodeledVolume(t *testing.T) {
 				t.Error("a refused pod was tracked; it must leave no bookkeeping behind")
 			}
 			events := pendingEvents(rec.Events)
-			assertOneRefusalEvent(t, events, reasonFailedVolumeSource, "logs")
+			assertOneRefusalEvent(t, events, be.reason, "logs")
 			if !strings.Contains(strings.Join(events, "|"), "hostPath") {
 				t.Errorf("events %q do not name the kind hostPath", events)
 			}

@@ -212,7 +212,7 @@ install if you were in the middle of one.
 
 The data root itself, `/var/lib/k3sm`, belongs to root (`root:wheel`, mode `0755`), the same way
 k3s keeps its data dir. The directories the daemons write under it (`run`, `server`, `agent`,
-`pods`, `storage`, the image store) belong to the unprivileged `_k3sm` service user, and the
+`pods`, `storage`, the image store) belong to the unprivileged `_k3sm` service user, mode `0700`, and the
 node's mesh keys live in `/var/lib/k3sm/keys`, which only root can read or change. If the root is
 owned by anyone else, `k3sm status` reports the data root as `wrong-owner` with the uid it found.
 A root owned by `_k3sm` is the layout older releases left behind. Restarting the netd helper
@@ -616,6 +616,18 @@ When a control-plane component crashes again and again, or the control plane fai
 several times in a row, the server daemon parks itself: it stays running so launchd does not keep
 restarting it, but it serves nothing. `k3sm status` reports the server row as `crash-loop` with the
 time the breaker tripped.
+
+A control plane that is still alive but does not report healthy in time while the Mac is heavily
+loaded is not counted toward the breaker. The server waits before its next attempt instead, from 30
+seconds doubling up to 10 minutes, and `k3sm status` shows when the next attempt starts; it parks
+only after eight such attempts in a row. The server counts the Mac as heavily loaded only when both
+the one-minute and the five-minute load averages are high, and it writes the load it read into the
+crash-loop record.
+
+Each component's previous log is kept beside the current one as `<component>.log.1`. While failures
+are on record, `<component>.log.1` holds the log of the first failed start and is not replaced, and
+the most recent failed start is kept as `<component>.log.2` (its last 4 MiB when it is larger). The
+next start after a healthy bring-up replaces them. `k3sm uninstall` removes these kept logs.
 
 A server that was killed outright leaves its control-plane processes running. Its next start stops
 the ones it left behind before starting its own, so they do not count toward the breaker; a process

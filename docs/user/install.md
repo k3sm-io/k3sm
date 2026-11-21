@@ -59,6 +59,13 @@ and one residual limitation remains (no per-pod uid isolation).
   on both roles (see [Upgrade](upgrade.md#on-each-node)).
 - An empty auto-deploy manifest directory, **`/var/lib/k3sm/manifests`**, owned by `root:wheel`,
   mode `0755` (see below).
+- The directories the daemons write under `/var/lib/k3sm` (`pods`, `storage`, the image store in
+  `blobs`, `unpacked` and `snapshots`, `guest-artifacts`, and the service account's own `.kube`),
+  owned by `_k3sm`, mode `0700`. The group is `staff`, but it grants nothing: every ordinary
+  account is in `staff`, and a directory it could search is one whose files it could hard-link
+  elsewhere. Only `status` (`0755`, records any account may read) and the runtime's `artifacts`
+  views root (`0711`) are open to other accounts. Installing over an older release, or restarting
+  the netd helper, tightens directories an older release left at `0750`.
 
 ## Auto-Deploy Manifests
 
@@ -336,6 +343,7 @@ answer on the networks this Mac is attached to:
 ```sh
 sudo k3sm network lan off      # only this Mac and the cluster mesh
 sudo k3sm network lan on       # every network this Mac is on
+sudo k3sm network lan on --for 30m   # on for 30 minutes, then off by itself
 k3sm network lan status        # the setting, what it covers, what it does not
 ```
 
@@ -343,6 +351,11 @@ With LAN access off, those listeners bind `127.0.0.1` and the node's own address
 once joined, its pod-range address on a single node), so other nodes reach them over the mesh and
 nothing on your Wi-Fi or Ethernet does. With it on, they bind every interface.
 
+- `--for <duration>` (for example `30m` or `2h`, more than zero and at most `24h`) turns LAN access
+  on until that time, after which the node daemon turns it off by itself. It checks about every 30
+  seconds, so the change lands within that after the expiry, or soon after the Mac wakes if it slept
+  through it. A later `lan on` without `--for`, or `lan off`, replaces it. `k3sm network lan status`
+  shows "on until <time> (in 12m)" while it is in force and says when it expired after.
 - New installs start with LAN access off. An existing install keeps LAN access on across an upgrade,
   so nothing it serves stops answering. `sudo k3sm install --lan on` or `--lan off` sets it at
   install time.
@@ -356,6 +369,18 @@ nothing on your Wi-Fi or Ethernet does. With it on, they bind every interface.
 - `k3sm network lan status` and `k3sm status` show the recorded setting and, run as root, the state
   the node daemon reports serving, and say when the two differ. With no setting recorded they say
   that LAN access is on because nothing is recorded.
+- Run as root, `k3sm network lan status` also lists what LAN access does not move: every TCP
+  listening socket and bound UDP socket on this Mac whose address is not loopback, not in the
+  cluster pod and mesh range, not in the Service range and not on the vm NAT segment. A pod on the
+  host network, or a pod process that binds an explicit address, can listen on your Wi-Fi this way
+  even with LAN access off. The sockets of the node daemon, of the root network helper `k3sm netd`,
+  and of their child processes (chosen by process id, never by name), such as the join port `9345`
+  on a server and the wireguard port `51820`, are listed under
+  "k3sm control-plane ports (not moved by LAN access):". Everything else, macOS services such as
+  AirPlay included, is listed under "Listening on a LAN-reachable address (not moved by LAN
+  access):", each with its pid, command, protocol and address. As a user it says the check needs
+  root. If `lsof` fails, or prints anything the check does not recognise, it prints one line saying
+  the check failed instead of a list.
 - The record must be a regular file owned by root and writable by no one else. Anything else is
   treated as unusable, and the node daemon serves LAN access off until it is set again.
 - On a stopped node the setting is recorded and applies at `sudo k3sm start`.
@@ -411,6 +436,63 @@ reserved ports and the other networking caveats.
   Surrounding spaces are ignored. `sudo k3sm install --nodeport-addresses ""` (or a value of only
   spaces) returns to every interface.
 - `k3sm server` and `k3sm agent` take the same flag directly.
+
+### Fixed NodePorts
+
+A Service that leaves `nodePort` unset gets one from the apiserver, anywhere in `30000-32767`. A
+Service that must answer on a port you can write down (a URL in a config file, a health check, a
+bookmark) sets `nodePort` itself. Fixed nodePorts belong in the **static band**, the bottom
+**86 ports, `30000-30085`**:
+
+```yaml
+spec:
+  type: NodePort
+  ports:
+    - port: 8080
+      nodePort: 30048   # in 30000-30085
+```
+
+The apiserver keeps automatic allocation out of that band. It takes the size of the range divided
+by 32, at least 16 and at most 128, and reserves that many ports at the bottom (KEP-3668, which
+every Kubernetes release since 1.29 applies, including the one k3sm ships). For k3sm's 2768 ports
+that is 86. A Service without a `nodePort` is given a port from `30086-32767`, and from the
+band only once that upper part is full. A fixed port above `30085` is still accepted, but nothing
+keeps it for you: if a Service without a `nodePort` was given that port before yours is applied (on a
+rebuilt cluster, or after someone else's install), your Service is refused.
+
+The convention has three parts:
+
+- A Service whose port is published somewhere sets `nodePort` in `30000-30085`.
+- Every other Service leaves `nodePort` unset.
+- k3sm takes nothing in the band itself. Its one fixed nodePort, the registry's opt-in
+  `--registry-node-port`, is yours to choose; pick it from the band too (see
+  [Reaching It From Another Mac](registry.md#reaching-it-from-another-mac)).
+
+Before choosing one, list the nodePorts already taken in the band. A LoadBalancer Service with
+`externalTrafficPolicy: Local` also holds a `healthCheckNodePort`, so the command lists those too:
+
+```sh
+kubectl get svc -A -o jsonpath='{range .items[*]}{range .spec.ports[*]}{.nodePort}{"\n"}{end}{.spec.healthCheckNodePort}{"\n"}{end}' \
+  | awk '$1 >= 30000 && $1 <= 30085' | sort -n
+```
+
+The apiserver is the source of truth. A nodePort is unique across the whole cluster, and every
+node listens on it, so a Service that asks for one already held is refused when you apply it:
+
+```
+spec.ports[0].nodePort: Invalid value: 30048: provided port is already allocated
+```
+
+The refusal is atomic, so two tools that both found a port free cannot both get it. A tool that picks ports should take a free one from the listing, apply, and on that error
+pick the next free one, rather than keep a list of its own. 86 ports is too few to pick by hashing a
+name without collisions, so allocate from the listing.
+
+The listing sees only Services, and the empty lines it prints for ports without a nodePort are
+dropped by the `awk` filter. A NodePort also needs the port on every Mac in the cluster: with LAN
+access on it binds the wildcard address, and a process of your own already listening on the same
+port can keep it from binding on that Mac (whether one does depends on the address and the address
+family it holds). Check a Mac with `lsof -nP -iTCP:30048 -sTCP:LISTEN`, which prints nothing when no
+process listens there, and pick another port if it prints anything.
 
 ## Uninstalling
 

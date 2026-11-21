@@ -58,7 +58,7 @@ var (
 	// networkRequired are the keys of the optional network object.
 	networkRequired = []string{"lan", "recorded", "covers", "alwaysOn"}
 	// networkOptional are the optional keys of the network object.
-	networkOptional = []string{"recordState", "applied", "appliedReadable"}
+	networkOptional = []string{"recordState", "expiresAt", "applied", "appliedReadable"}
 	// networkAppliedRequired / Optional are the keys of network.applied.
 	networkAppliedRequired = []string{"lan", "serial"}
 	networkAppliedOptional = []string{"error"}
@@ -358,6 +358,16 @@ func contractScenarios() map[string]contractScenario {
 				return install.NetworkRecord{}, true, fmt.Errorf("network record /Library/k3sm/network.json: %w: owned by uid 501, not root", install.ErrNetworkRecord)
 			}, func(install.Role) ([]byte, error) {
 				return []byte(`{"lan":"off","serial":"","error":"read the network record: network record unusable"}`), nil
+			})
+		}},
+		// A timed `lan on --for` whose window is still open: lan on with its
+		// expiresAt, and the daemon's applied report agreeing.
+		"network-timed": {verdict: VerdictRunning, collector: func(t *testing.T) Collector {
+			exp := goldenTime.Add(30 * time.Minute)
+			return contractNetwork(t, func() (install.NetworkRecord, bool, error) {
+				return install.NetworkRecord{Version: install.NetworkRecordVersionExpiry, LAN: install.LANOn, ExpiresAt: &exp, Serial: "9a1e3c7b5d2f4086"}, true, nil
+			}, func(install.Role) ([]byte, error) {
+				return []byte(`{"lan":"on","serial":"9a1e3c7b5d2f4086"}`), nil
 			})
 		}},
 		"network-applied-unreadable": {verdict: VerdictRunning, collector: func(t *testing.T) Collector {

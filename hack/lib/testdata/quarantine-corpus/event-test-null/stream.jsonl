@@ -1,0 +1,9 @@
+{"Action":"start","Package":"k3sm.io/apis/net/v1"}
+{"Action":"run","Package":"k3sm.io/apis/net/v1","Test":"TestA"}
+{"Action":"output","Package":"k3sm.io/apis/net/v1","Test":"TestA","Output":"=== RUN   TestA\n"}
+{"Action":"output","Package":"k3sm.io/apis/net/v1","Test":"TestA","Output":"--- PASS: TestA (0.00s)\n"}
+{"Action":"pass","Package":"k3sm.io/apis/net/v1","Test":"TestA","Elapsed":0}
+{"Action":"output","Package":"k3sm.io/apis/net/v1","Test":null,"Output":"note\n"}
+{"Action":"output","Package":"k3sm.io/apis/net/v1","Output":"PASS\n"}
+{"Action":"output","Package":"k3sm.io/apis/net/v1","Output":"ok  \tk3sm.io/apis/net/v1\t0.1s\n"}
+{"Action":"pass","Package":"k3sm.io/apis/net/v1","Elapsed":0.1}

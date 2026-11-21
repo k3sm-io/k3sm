@@ -73,9 +73,11 @@ k3sm points it at that revision's directory **inside the cache volume** instead:
   If the fetch fails and the revision is not already in the volume, the pod exits naming the revision
   and retries on restart; once it is in the volume, a restart without network serves it from there.
 
-`quantization` is rejected today, because the engine has no expression for it and serving a different
-variant than the one asked for would look like success. Name the quantized repository in `model`
-instead. `mlx-community/Qwen3-0.6B-4bit` already does.
+For a Hub model (`model`), `quantization` is rejected, because the engine has no expression for it and
+serving a different variant than the one asked for would look like success. Name the quantized
+repository in `model` instead. `mlx-community/Qwen3-0.6B-4bit` already does. For a model from the
+cluster registry (`artifact`), `quantization` selects one variant of the model instead; see
+[Variants of One Model](models.md#variants-of-one-model).
 
 ## 3. Watch It Become Ready
 

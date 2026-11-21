@@ -23,6 +23,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -37,6 +38,7 @@ import (
 
 	"k3sm.io/darwin-net/pkg/tcpseg"
 	"k3sm.io/k3sm/pkg/certs"
+	"k3sm.io/k3sm/pkg/defaults"
 	"k3sm.io/k3sm/pkg/ports"
 )
 
@@ -710,6 +712,8 @@ func (s *Supervised) bringUp(ctx context.Context) error {
 	if err := s.startAndAwaitListening(ctx, "controller-manager", s.startControllerManager, s.cfg.ControllerManagerPort); err != nil {
 		return err
 	}
+	// Healthy: the kept first-failure logs may be replaced from the next spawn on.
+	releaseComponentLogs(s.cfg.WorkDir)
 	return nil
 }
 
@@ -856,7 +860,9 @@ func apiServerArgs(cfg Config) []string {
 		authzMode = DefaultAuthorizationMode
 	}
 	args := append(apiServerDatastoreArgs(cfg),
-		"--service-cluster-ip-range", "10.43.0.0/16",
+		// The one cluster Service range, the same constant the installer renders
+		// into netd's --service-cidr (pkg/install refuses any other value).
+		"--service-cluster-ip-range", defaults.ServiceCIDR,
 		// Pin the NodePort range to the standard 30000-32767 (the kube-apiserver
 		// default). k3sm's userspace Service proxy binds *:NodePort directly and
 		// in-process as the unprivileged _k3sm user (NOT via the root netd helper,
@@ -1105,6 +1111,7 @@ func (s *Supervised) spawn(ctx context.Context, name string, args ...string) (*c
 func (s *Supervised) spawnEnv(ctx context.Context, name string, extraEnv []string, args ...string) (*component, error) {
 	bin := filepath.Join(binDir(s.cfg.WorkDir), name)
 	logPath := filepath.Join(s.cfg.WorkDir, name+".log")
+	rotateComponentLog(logPath, failureLive(s.cfg.WorkDir, time.Now()))
 	lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("create %s log: %w", name, err)
@@ -1179,12 +1186,167 @@ func (s *Supervised) spawnEnv(ctx context.Context, name string, extraEnv []strin
 	return c, nil
 }
 
+// Component log generations. <name>.log is the running child's log. <name>.log.1
+// is the previous run's, and while a failure streak is live it is the FIRST
+// failing run's: rotating on every spawn let the second restart overwrite the
+// one log that held the cause, which is the log an operator needs. The pin
+// marker <name>.log.1.pinned says .1 holds that first failure; while it exists
+// later spawns leave .1 alone and keep only the latest lap, tail-capped at
+// componentLogKeepMax, as <name>.log.2. A healthy bring-up removes the markers
+// (releaseComponentLogs), so the next spawn rotates into .1 again.
+const (
+	componentLogPinSuffix = ".1.pinned"
+	componentLogKeepMax   = 4 << 20
+)
+
+// componentLogNames are the children spawnEnv logs, for the uninstall sweep.
+var componentLogNames = []string{"kine", etcdComponent, "kube-apiserver", "kube-scheduler", "kube-controller-manager"}
+
+// ComponentLogKeptPaths lists the kept generations and pin markers in a
+// control-plane work dir — every file the rotation creates beside a live log —
+// so uninstall removes them. The live <name>.log files are not listed.
+func ComponentLogKeptPaths(workDir string) []string {
+	var out []string
+	for _, n := range componentLogNames {
+		p := filepath.Join(workDir, n+".log")
+		out = append(out, p+".1", p+componentLogPinSuffix, p+".2")
+	}
+	return out
+}
+
+// failureLive reports whether the crash record in workDir holds a failure the
+// next spawn's previous log may explain: a slow streak, a tripped breaker, or
+// any entry inside the window. An unreadable record is "no failure", which is
+// the rotation this replaced, so bookkeeping trouble cannot block a start.
+func failureLive(workDir string, now time.Time) bool {
+	r, err := ReadCrashRecord(CrashLoopPath(workDir))
+	if err != nil {
+		return false
+	}
+	r.Prune(now)
+	return r.SlowStreak > 0 || r.Tripped() || len(r.Crashes) > 0
+}
+
+// rotateComponentLog moves the previous run's log aside before the new start
+// truncates it. When failing (failureLive) and .1 is pinned, .1 is kept and the
+// log becomes <path>.2, tail-capped. Otherwise it becomes <path>.1, and when
+// failing it is the first failing run's log, so .1 is pinned. It renames rather than copies when
+// it can, so the kept file is the same 0600 inode; an empty or absent log is
+// not rotated, so an unlogged lap cannot push a useful one out. Errors are
+// ignored on purpose: losing a generation must never stop the component from
+// starting.
+func rotateComponentLog(path string, failing bool) {
+	pin := path + componentLogPinSuffix
+	if !failing {
+		// No live failure: the streak is over (cleared or aged out of the
+		// window), so the pin is stale whether or not a healthy bring-up saw
+		// it. Dropped before the empty-log return, so a lap that logged
+		// nothing cannot leave an old streak's pin for the next one.
+		_ = os.Remove(pin)
+	}
+	fi, err := os.Stat(path)
+	if err != nil || !fi.Mode().IsRegular() || fi.Size() == 0 {
+		return
+	}
+	if failing {
+		if _, err := os.Stat(pin); err == nil {
+			keepLogTail(path, path+".2", fi.Size(), componentLogKeepMax)
+			return
+		}
+		// Pin before the rename: a crash between the two leaves a pin over an
+		// older .1, which the next spawn with no live failure clears. The
+		// other order would let the next failing spawn overwrite the first
+		// failure's log. Without a pin the log is still kept for one lap.
+		if f, err := os.OpenFile(pin, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600); err == nil {
+			_ = f.Close()
+		}
+	}
+	if err := os.Rename(path, path+".1"); err != nil {
+		if failing {
+			_ = os.Remove(pin)
+		}
+		return
+	}
+	_ = os.Remove(path + ".2")
+}
+
+// keepLogTail moves src to dst, keeping at most max bytes from its end: a log
+// within the cap is renamed, a larger one has its tail copied to a 0600 temp
+// file renamed over dst. On a copy failure src is left for the caller's
+// truncation, which is the loss of one lap and nothing more.
+func keepLogTail(src, dst string, size, max int64) {
+	if size <= max {
+		_ = os.Rename(src, dst)
+		return
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return
+	}
+	defer in.Close()
+	tmp := dst + ".tmp"
+	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return
+	}
+	_, cerr := io.Copy(out, io.NewSectionReader(in, size-max, max))
+	if err := out.Close(); cerr == nil {
+		cerr = err
+	}
+	if cerr != nil || os.Rename(tmp, dst) != nil {
+		_ = os.Remove(tmp)
+		return
+	}
+	_ = os.Remove(src)
+}
+
+// releaseComponentLogs ends every pin in workDir after a healthy bring-up: the
+// first failure's log stays as .1 until the next spawn replaces it.
+func releaseComponentLogs(workDir string) {
+	for _, n := range componentLogNames {
+		_ = os.Remove(filepath.Join(workDir, n+".log"+componentLogPinSuffix))
+	}
+}
+
 // waitHealthz waits for the apiserver to report healthz ok, failing fast (with
 // the log tail) if the apiserver child exits first. The 90s healthTimeout is
 // unchanged — fail-fast only ever shortens the wedge, never lengthens it.
 func (s *Supervised) waitHealthz(ctx context.Context, api *component) error {
-	return awaitHealthy(ctx, api.name, api.exited, api.exitedNow, s.Ready, healthTimeout, 500*time.Millisecond, api.exitDetail)
+	err := awaitHealthy(ctx, api.name, api.exited, api.exitedNow, s.Ready, healthTimeout, 500*time.Millisecond, api.exitDetail)
+	var dl *healthDeadlineError
+	if errors.As(err, &dl) {
+		return &apiHealthTimeoutError{err: err}
+	}
+	return err
 }
+
+// ErrAPIServerHealthTimeout marks a bring-up whose apiserver stayed alive but
+// did not report healthz within healthTimeout: the one failure an overloaded
+// host produces on a control plane that is otherwise fine. A child that exited
+// first is never this error. cmd/k3sm matches it with errors.Is and, when the
+// host is under pressure at that moment, records the lap as
+// CrashOriginBringUpSlow instead of counting it toward the park.
+var ErrAPIServerHealthTimeout = errors.New("kube-apiserver health wait timed out")
+
+// healthDeadlineError is awaitHealthy's "not healthy within" result, typed so a
+// caller can tell the deadline apart from an exit or a cancellation without
+// matching the text. Its message is the one the wait always returned.
+type healthDeadlineError struct {
+	name    string
+	timeout time.Duration
+}
+
+func (e *healthDeadlineError) Error() string {
+	return fmt.Sprintf("%s not healthy within %s", e.name, e.timeout)
+}
+
+// apiHealthTimeoutError is the apiserver's deadline, matching
+// ErrAPIServerHealthTimeout under errors.Is with its message unchanged.
+type apiHealthTimeoutError struct{ err error }
+
+func (e *apiHealthTimeoutError) Error() string        { return e.err.Error() }
+func (e *apiHealthTimeoutError) Unwrap() error        { return e.err }
+func (e *apiHealthTimeoutError) Is(target error) bool { return target == ErrAPIServerHealthTimeout }
 
 // awaitHealthy is the bring-up wait: it polls ready() every poll until it
 // reports true, selecting against child-exit the whole time. It returns nil on
@@ -1228,7 +1390,7 @@ func awaitHealthy(ctx context.Context, name string, exited <-chan struct{}, exit
 					return ctx.Err()
 				}
 			}
-			return fmt.Errorf("%s not healthy within %s", name, timeout)
+			return &healthDeadlineError{name: name, timeout: timeout}
 		}
 		select {
 		case <-ctx.Done():

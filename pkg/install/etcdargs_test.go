@@ -59,7 +59,7 @@ func TestInstallEmbeddedEtcdServer(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("--cluster-init renders and records, and a plain reinstall carries it", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		cfg := testConfig(t)
 		first := cfg
 		first.ClusterInit, first.NodeIP, first.MeshIP = true, "192.0.2.10", "100.64.0.1"
@@ -98,7 +98,7 @@ func TestInstallEmbeddedEtcdServer(t *testing.T) {
 		// address was carried as --node-ip. Left on the argv it is the node's
 		// advertised address, aliased on lo0 at every start; the request must
 		// drop it, not carry it beside the --etcd-peer-ip it renders.
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		cfg := testConfig(t)
 		configureServerArgs(f, cfg, "--mesh-ip", "100.64.0.1", "--cluster-init", "--node-ip", "192.0.2.10")
 		req := cfg
@@ -130,7 +130,7 @@ func TestInstallEmbeddedEtcdServer(t *testing.T) {
 			},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
-				f := &fakeSystem{}
+				f := newFakeSystem(t)
 				cfg := testConfig(t)
 				configureServerArgs(f, cfg, tc.carried...)
 				err := Install(ctx, f, cfg)
@@ -150,7 +150,7 @@ func TestInstallEmbeddedEtcdServer(t *testing.T) {
 	})
 
 	t.Run("current-grammar HA arguments carry forward on a plain reinstall", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		cfg := testConfig(t)
 		want := []string{"--mesh-ip", "100.64.0.1", "--cluster-init", "--etcd-peer-ip", "192.0.2.10"}
 		configureServerArgs(f, cfg, want...)
@@ -163,7 +163,7 @@ func TestInstallEmbeddedEtcdServer(t *testing.T) {
 	})
 
 	t.Run("--server-join stages the server token and points the daemon at it", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		f.putFile(operatorTokenFile, []byte(theServerToken+"\n"))
 		cfg := testConfig(t)
 		join := cfg
@@ -204,7 +204,7 @@ func TestInstallEmbeddedEtcdServer(t *testing.T) {
 	})
 
 	t.Run("--server-join refuses a worker token before anything is written", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		f.putFile(operatorTokenFile, []byte(theJoinToken+"\n"))
 		cfg := testConfig(t)
 		cfg.ServerJoin, cfg.JoinServer, cfg.TokenFile, cfg.NodeIP = true, "192.0.2.10", operatorTokenFile, "192.0.2.20"
@@ -218,7 +218,7 @@ func TestInstallEmbeddedEtcdServer(t *testing.T) {
 	})
 
 	t.Run("--server-join over a carried --cluster-init with member data is refused", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		f.putFile(operatorTokenFile, []byte(theServerToken+"\n"))
 		cfg := testConfig(t)
 		init := cfg
@@ -245,7 +245,7 @@ func TestInstallEmbeddedEtcdServer(t *testing.T) {
 		}
 
 		// The symmetric request is refused the same way.
-		f2 := &fakeSystem{}
+		f2 := newFakeSystem(t)
 		f2.putFile(operatorTokenFile, []byte(theServerToken+"\n"))
 		cfg2 := testConfig(t)
 		join2 := cfg2
@@ -262,7 +262,7 @@ func TestInstallEmbeddedEtcdServer(t *testing.T) {
 	})
 
 	t.Run("with the member data removed, --server-join replaces the carried --cluster-init", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		f.putFile(operatorTokenFile, []byte(theServerToken+"\n"))
 		cfg := testConfig(t)
 		init := cfg
@@ -285,7 +285,7 @@ func TestInstallEmbeddedEtcdServer(t *testing.T) {
 	})
 
 	t.Run("an empty etcd dir holds no member and does not block the role change", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		f.putFile(operatorTokenFile, []byte(theServerToken+"\n"))
 		cfg := testConfig(t)
 		init := cfg
@@ -306,7 +306,7 @@ func TestInstallEmbeddedEtcdServer(t *testing.T) {
 	t.Run("the staged join token lives until uninstall or a role change", func(t *testing.T) {
 		joined := func(t *testing.T) (*fakeSystem, Config, string) {
 			t.Helper()
-			f := &fakeSystem{}
+			f := newFakeSystem(t)
 			f.putFile(operatorTokenFile, []byte(theServerToken+"\n"))
 			cfg := testConfig(t)
 			join := cfg
@@ -401,7 +401,7 @@ func TestInstallEmbeddedEtcdServer(t *testing.T) {
 			{"an agent asking for a role", func(c *Config) { c.Role, c.JoinServer, c.ClusterInit = RoleAgent, "192.0.2.11", true }, "--agent"},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
-				f := &fakeSystem{}
+				f := newFakeSystem(t)
 				cfg := testConfig(t)
 				tc.edit(&cfg)
 				err := Install(ctx, f, cfg)

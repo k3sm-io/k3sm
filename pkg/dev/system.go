@@ -123,6 +123,16 @@ func (l Liveness) String() string {
 // would make a reclaim act on an absence that was never observed.
 func (l Liveness) Exists() bool { return l != LivenessDead }
 
+// ifconfigPath is ifconfig by absolute path, so a dev command never runs
+// whatever a PATH entry names ifconfig.
+const ifconfigPath = "/sbin/ifconfig"
+
+// ifconfigCommand builds the ifconfig invocation. It is a var only so a test can
+// assert the argv without executing ifconfig.
+var ifconfigCommand = func(args ...string) *exec.Cmd {
+	return exec.Command(ifconfigPath, args...)
+}
+
 // realSystem is the production System over ifconfig/kill/net.Listen/flock.
 type realSystem struct{}
 
@@ -131,7 +141,7 @@ func NewSystem() System { return realSystem{} }
 
 // Lo0Aliases shells `ifconfig lo0` and parses its `inet <ip>` lines.
 func (realSystem) Lo0Aliases() ([]string, error) {
-	out, err := exec.Command("ifconfig", "lo0").Output()
+	out, err := ifconfigCommand("lo0").Output()
 	if err != nil {
 		return nil, fmt.Errorf("ifconfig lo0: %w", err)
 	}
@@ -157,7 +167,7 @@ func parseLo0Inet(out string) []string {
 
 // Lo0RemoveAlias runs `ifconfig lo0 -alias <ip>`.
 func (realSystem) Lo0RemoveAlias(ip string) error {
-	if out, err := exec.Command("ifconfig", "lo0", "-alias", ip).CombinedOutput(); err != nil {
+	if out, err := ifconfigCommand("lo0", "-alias", ip).CombinedOutput(); err != nil {
 		return fmt.Errorf("ifconfig lo0 -alias %s: %w (%s)", ip, err, strings.TrimSpace(string(out)))
 	}
 	return nil

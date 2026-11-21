@@ -1,4 +1,4 @@
-/fixture/helm-v4.3.1: go1.27.3
+/fixture/helm-v4.3.1: go1.27.4
 	path	helm.sh/helm/v4/cmd/helm
 	mod	helm.sh/helm/v4	v4.3.1	h1:UndCoLe9UPmNoL7IvWzaUXveL7T5t/ijoorEmgJdI9g=
 	dep	dario.cat/mergo	v1.0.1	h1:Ra4+bf83h2ztPIQYNP99R6m+Y7KfnARDfID+a+vLl4s=

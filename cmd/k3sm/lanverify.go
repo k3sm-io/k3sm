@@ -17,22 +17,16 @@ limitations under the License.
 package main
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"net/netip"
-	"os/exec"
 	"slices"
 	"strconv"
 	"strings"
 
-	"k3sm.io/darwin-net/pkg/podnet"
-
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/install"
-	"k3sm.io/k3sm/pkg/netserve"
 	"k3sm.io/k3sm/pkg/ports"
 )
 
@@ -46,8 +40,7 @@ var errLANMismatch = errors.New("the node daemon's listening sockets do not matc
 type lanSocketPolicy struct {
 	want install.LAN
 	// lanAddrs are this Mac's network-facing addresses: its interface
-	// addresses other than loopback, the cluster pod/mesh range and the vm
-	// NAT segment.
+	// addresses other than loopback and lanAliasPrefixes.
 	lanAddrs []netip.Addr
 	// alwaysOn are the ports allowed on every interface whatever the switch
 	// says (the worker join port on a server).
@@ -132,14 +125,16 @@ func addrsString(addrs []netip.Addr) string {
 }
 
 // lanFacingAddrs filters this Mac's interface addresses to the ones a LAN
-// peer can reach: not loopback, not the cluster pod and mesh range, not the vm
-// NAT segment.
+// peer can reach: not loopback, not inside lanAliasPrefixes (the cluster pod
+// and mesh range, the vm NAT segment). The Service range is deliberately not
+// excluded: it is operator-set, and a host whose LAN address falls inside it
+// must still have that address guarded by the off check.
 func lanFacingAddrs(host []netip.Addr) []netip.Addr {
-	vmnet, _ := netip.ParsePrefix(netserve.DefaultVMNetSubnet)
+	alias := lanAliasPrefixes()
 	var out []netip.Addr
 	for _, a := range host {
 		a = a.Unmap()
-		if !a.IsValid() || a.IsLoopback() || a.IsUnspecified() || podnet.ClusterPodCIDR.Contains(a) || (vmnet.IsValid() && vmnet.Contains(a)) {
+		if !a.IsValid() || a.IsLoopback() || a.IsUnspecified() || slices.ContainsFunc(alias, func(p netip.Prefix) bool { return p.Contains(a) }) {
 			continue
 		}
 		out = append(out, a)
@@ -183,49 +178,29 @@ func lanPolicyFor(want install.LAN, role install.Role, args []string, host []net
 }
 
 // lsofListeners is the production socket lister: the TCP listening sockets
-// of pid, read with lsof as root. lsof exiting 1 with no output means none.
+// of pid itself (not its children), read through the hardened runLsof.
 func lsofListeners(ctx context.Context, pid int) ([]netip.AddrPort, error) {
-	cmd := exec.CommandContext(ctx, "/usr/sbin/lsof", "-nP", "-a", "-p", strconv.Itoa(pid), "-iTCP", "-sTCP:LISTEN", "-Fn")
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
-	if err != nil {
-		var ee *exec.ExitError
-		if errors.As(err, &ee) && ee.ExitCode() == 1 && len(out) == 0 {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("lsof -p %d: %w: %s", pid, err, strings.TrimSpace(stderr.String()))
-	}
-	return parseLsofListeners(out)
+	return lsofListenersWith(ctx, execLsof, pid)
 }
 
-// parseLsofListeners parses lsof -F n output: one "n<host>:<port>" line per
-// socket, "*" being the wildcard.
-func parseLsofListeners(out []byte) ([]netip.AddrPort, error) {
-	var socks []netip.AddrPort
-	sc := bufio.NewScanner(bytes.NewReader(out))
-	for sc.Scan() {
-		line := sc.Text()
-		if !strings.HasPrefix(line, "n") {
-			continue
-		}
-		name := strings.TrimPrefix(line, "n")
-		i := strings.LastIndex(name, ":")
-		if i < 0 {
-			return nil, fmt.Errorf("lsof: unparseable socket name %q", name)
-		}
-		host, portStr := strings.Trim(name[:i], "[]"), name[i+1:]
-		port, err := strconv.ParseUint(portStr, 10, 16)
-		if err != nil {
-			return nil, fmt.Errorf("lsof: unparseable port in %q", name)
-		}
-		addr := netip.IPv4Unspecified()
-		if host != "*" {
-			if addr, err = netip.ParseAddr(host); err != nil {
-				return nil, fmt.Errorf("lsof: unparseable address in %q", name)
-			}
-		}
-		socks = append(socks, netip.AddrPortFrom(addr, uint16(port)))
+// lsofListenersWith reads pid's TCP listeners through run, per pid so a busy
+// Mac's whole table never meets the line cap, and parses them with the
+// fail-closed parseLsofSocketTable. A wildcard bind is the unspecified
+// address.
+func lsofListenersWith(ctx context.Context, run lsofExec, pid int) ([]netip.AddrPort, error) {
+	out, err := runLsofWith(ctx, run, "-nP", "-a", "-p", strconv.Itoa(pid), "-iTCP", "-sTCP:LISTEN", "-F", "pRcPn")
+	if err != nil {
+		return nil, fmt.Errorf("lsof -p %d: %w", pid, err)
 	}
-	return socks, sc.Err()
+	table, err := parseLsofSocketTable(out)
+	if err != nil {
+		return nil, fmt.Errorf("lsof -p %d: %w", pid, err)
+	}
+	var socks []netip.AddrPort
+	for _, s := range table {
+		if s.PID == pid && s.Protocol == "TCP" {
+			socks = append(socks, s.Local)
+		}
+	}
+	return socks, nil
 }

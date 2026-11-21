@@ -44,8 +44,9 @@ import (
 //	scope_is_non_test        the stage runs `-tests=false ./...`
 //
 // Behavioural subtests run the real, shipped ci.sh in the same symlink sandbox
-// the go-list guard tests use (see ci_guard_test.go), with a zzpkg fixture so the
-// Go block, and therefore the stage, is actually reached. The environment is
+// the go-list guard tests use (see ci_guard_test.go), with a zzpkg fixture (one
+// passing test, since the test stage reds a run with no results) so the Go block,
+// and therefore the stage, is actually reached. The environment is
 // replaced wholesale: PATH is a directory of links to only the tools ci.sh needs
 // (plus, per case, a fake staticcheck), GOPATH and GOMODCACHE are temp dirs that
 // are empty except, per case, a fake $GOPATH/bin/staticcheck-<pin>. No network and no real staticcheck are needed, and the result does not
@@ -224,8 +225,11 @@ func TestK3smCIGateRunsPinnedStaticcheck(t *testing.T) {
 			env := staticcheckSandboxEnv(t, pin, tc.versionLine, tc.versionedLine, tc.plainLine, marker)
 			extra := map[string]string{
 				"zzpkg/zz.go": licensed(t, script, "package zzpkg\n\n// Answer is here only so the package is non-empty.\nfunc Answer() int { return 42 }\n"),
+				// One passing test, so the test stage's stream holds a result:
+				// hack/lib/testresults.go reds a run in which no test ran.
+				"zzpkg/zz_test.go": licensed(t, script, "package zzpkg\n\nimport \"testing\"\n\nfunc TestAnswer(t *testing.T) {\n\tif Answer() != 42 {\n\t\tt.Fatal(\"Answer changed\")\n\t}\n}\n"),
 				// The test-sleep lint checks the allowlist against this tree,
-				// which has no tests; the real repo's entries would all be stale.
+				// which has no sleeping tests; the real repo's entries would all be stale.
 				"hack/test-sleeps.allow": "# count: 0\n",
 			}
 			out, ok := sandboxCIEnv(t, script, goModOK, extra, env)

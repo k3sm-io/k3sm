@@ -53,6 +53,7 @@ import (
 	"k3sm.io/k3sm/pkg/netserve"
 	"k3sm.io/k3sm/pkg/ports"
 	"k3sm.io/k3sm/pkg/update"
+	"k3sm.io/runtimed/pkg/sandbox"
 )
 
 // meshKeyRef is the file name (under both this node's work dir and the root-only
@@ -212,6 +213,14 @@ func runAgent(args []string) error {
 	if opts.server == "" {
 		return fmt.Errorf("--server is required")
 	}
+	// The work dir, normalised and checked before any use of it: the pod
+	// sandbox denies <data root>/agent only, so an agent work dir anywhere else
+	// would leave the node password and kubeconfig open to pods.
+	workDir, err := resolveWorkDirLayout(opts.workDir, sandbox.AgentSubdir)
+	if err != nil {
+		return err
+	}
+	opts.workDir = workDir
 	if err := checkNodePortAddresses(&opts.nodePortAddresses, opts.network); err != nil {
 		return err
 	}
@@ -231,7 +240,7 @@ func runAgent(args []string) error {
 
 	breaker := newCrashBreaker(opts.workDir, logger)
 	opts.lan = startDaemonLAN(ctx, opts.workDir, logger)
-	err := agentStart(ctx, opts, breaker, logger)
+	err = agentStart(ctx, opts, breaker, logger)
 	// The terminal paths record BEFORE they back off (agentTerminal), so an
 	// installer polling the record sees the reason within its own join budget
 	// rather than half a minute later; everything else — a node-password that
@@ -593,6 +602,9 @@ func agentStart(ctx context.Context, opts agentOptions, breaker *crashBreaker, l
 	// EndpointSlice says the server's relay listens, over TLS verified against
 	// the cluster CA this join pinned.
 	nodeOpts.flatRegistry = agentFlatRegistry(ctx, kubeconfigPath, res, logger)
+	// The guest boot pair comes from that registry too, where the server
+	// published it, never from the release host.
+	nodeOpts.guestFromClusterStore = true
 	return startNode(ctx, nodeOpts)
 }
 
@@ -811,6 +823,7 @@ func agentNodeOptions(opts agentOptions, res *bootstrap.JoinResult, kubeconfigPa
 		budgetDir:   budgetDirFor(opts.workDir),
 		statusDir:   agentStatusDir(opts.workDir),
 		dataRoot:    executor.RuntimeRoot(opts.workDir),
+		stateDir:    opts.workDir,
 		// The recorded release base, which the update watcher's pin admits.
 		updateReleaseBase: opts.updateReleaseBase,
 		// The cluster CA this worker's credential pins: an update's signer

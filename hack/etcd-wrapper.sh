@@ -58,13 +58,10 @@ mkwork() {
 # pinned etcd selects that version (or newer) on its own.
 #   go.opentelemetry.io/otel family v1.45.0: GO-2026-6505 (reached through the
 #   otlptrace exporter etcd's tracing setup initializes).
-#   golang.org/x/net v0.60.0: GO-2026-6611, GO-2026-6612, GO-2026-6617 (the
-#   http2 server and client both programs serve and dial through).
 #   github.com/klauspost/compress v1.20.2: GO-2026-6865 (the fse and huff0
 #   panic on two-block frames, reached through zstd from prometheus's promhttp,
 #   which the etcd server links; etcdutl links no compress package).
 OVERRIDES=(
-	golang.org/x/net@v0.60.0
 	go.opentelemetry.io/otel@v1.45.0
 	go.opentelemetry.io/otel/sdk@v1.45.0
 	go.opentelemetry.io/otel/trace@v1.45.0

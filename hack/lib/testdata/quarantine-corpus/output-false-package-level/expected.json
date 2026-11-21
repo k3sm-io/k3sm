@@ -1,0 +1,10 @@
+{
+  "description": "A package-level output event whose Output is false is malformed, not an empty string: red.",
+  "edited": [],
+  "tests": {
+    "k3sm.io/apis/net/v1::TestA": "passed"
+  },
+  "tier": "affected",
+  "today": "2026-10-30",
+  "verdict": "red"
+}

@@ -38,7 +38,7 @@ func TestLimitationsDocMatchesEgressDefault(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "plain", UID: types.UID("uid-plain")},
 			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "c0", Image: "registry/plain:latest"}}},
 		}
-		box, err := toPodBox(pod, "10.42.0.5", "10.42.0.5", t.TempDir(), "", "", netv1.DNSConfig{}, nil)
+		box, err := toPodBox(pod, "10.42.0.5", "10.42.0.5", t.TempDir(), "", "", netv1.DNSConfig{}, "", nil)
 		if err != nil {
 			t.Fatalf("toPodBox: %v", err)
 		}

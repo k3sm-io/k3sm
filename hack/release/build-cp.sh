@@ -149,7 +149,7 @@ google.golang.org/grpc v1.83.2 2026-08-25T15:47:16Z GO-2026-6348,GO-2026-6441,GO
 # neither raises nor pulls in (stale): an exemption is removed when it stops
 # being needed, never left to cover a later change. Each entry is reviewed like
 # the code it lets in.
-EXEMPT="golang.org/x/net v0.62.0 2026-11-10 GO-2026-6860 and GO-2026-6866 (golang.org/x/net/html) are reachable through html.Parse and html.Render in kube-apiserver, kube-scheduler, kube-controller-manager and kubectl; operator ruling of 2026-10-27 to ship the fix before its cooldown clears"
+EXEMPT=""
 
 # The modules the re-vendor is expected to drop from vendor/modules.txt, one per
 # line: <module> <vendored version> <the raise that drops it>. Any other removal
@@ -873,7 +873,7 @@ example.com/mod v1.2.3 $t0 GO-2026-0001" cache_key)"
 	if [ "$k1" != "$k2" ]; then ok "a raise list change moves the cache key"; else bad "the cache key ignores the raise list"; fi
 	if [ "$k1" != "$(PAYLOAD_GO_VERSION=go1.0.1 cache_key)" ]; then ok "a toolchain change moves the cache key"; else bad "the cache key ignores the toolchain"; fi
 	if [ "$k1" != "$(REMOVALS="" cache_key)" ]; then ok "a removal list change moves the cache key"; else bad "the cache key ignores the removal list"; fi
-	if [ "$k1" != "$(EXEMPT="" cache_key)" ]; then ok "an exemption list change moves the cache key"; else bad "the cache key ignores the exemption list"; fi
+	if [ "$k1" != "$(EXEMPT="example.com/mod v1.2.3 $tomorrow $ok_reason" cache_key)" ]; then ok "an exemption list change moves the cache key"; else bad "the cache key ignores the exemption list"; fi
 	if [ "$("$self" --print-raises)" = "$(printf '%s\n' "$RAISES" | awk '{print $1, $2}')" ] && [ "$("$self" --print-raises | wc -l | tr -d ' ')" = "$(printf '%s\n' "$RAISES" | wc -l | tr -d ' ')" ]; then ok "--print-raises prints each raise as <module> <version>"; else bad "--print-raises: $("$self" --print-raises)"; fi
 	if [ "$("$self" --print-raise-list-hash)" = "$(raise_list_hash)" ] && [ "$(raise_list_hash | cut -c1-16)" = "${k1##*-}" ]; then ok "--print-raise-list-hash is the hash the cache key abbreviates"; else bad "--print-raise-list-hash: $("$self" --print-raise-list-hash)"; fi
 

@@ -75,11 +75,11 @@ func TestInstallGatesOnVMHostEntitlement(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			f := &fakeSystem{}
+			f := newFakeSystem(t)
 			f.putEntitlement(src, tc.probe)
-			err := Install(context.Background(), f, Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"})
+			err := Install(context.Background(), f, Config{InstallDir: testInstallDir(t), BinarySource: "/tmp/k3sm", TargetUser: "alice"})
 
-			copied := slices.Contains(f.calls, "CopyToRootOwned:/Library/k3sm"+installSwapSuffix+"/"+VMHostName)
+			copied := slices.Contains(f.calls, "CopyToRootOwned:"+testInstallDir(t)+installSwapSuffix+"/"+VMHostName)
 			if !tc.refuse {
 				if err != nil {
 					t.Fatalf("Install: %v, want success", err)
@@ -145,9 +145,9 @@ func TestInstallVerifiesTheVMHostBeforeWritingTheRoot(t *testing.T) {
 	}
 
 	t.Run("an entitlement refusal writes nothing", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		f.putEntitlement(src, fmt.Errorf("signature grants no %s", VirtualizationEntitlement))
-		err := Install(context.Background(), f, Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"})
+		err := Install(context.Background(), f, Config{InstallDir: testInstallDir(t), BinarySource: "/tmp/k3sm", TargetUser: "alice"})
 		if err == nil {
 			t.Fatal("Install succeeded, want a refusal before anything is copied")
 		}
@@ -162,8 +162,8 @@ func TestInstallVerifiesTheVMHostBeforeWritingTheRoot(t *testing.T) {
 	})
 
 	t.Run("no override still installs", func(t *testing.T) {
-		f := &fakeSystem{}
-		if err := Install(context.Background(), f, Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"}); err != nil {
+		f := newFakeSystem(t)
+		if err := Install(context.Background(), f, Config{InstallDir: testInstallDir(t), BinarySource: "/tmp/k3sm", TargetUser: "alice"}); err != nil {
 			t.Fatalf("Install: %v", err)
 		}
 		if calls := copyCalls(f.calls); len(calls) == 0 {
@@ -172,18 +172,18 @@ func TestInstallVerifiesTheVMHostBeforeWritingTheRoot(t *testing.T) {
 	})
 
 	t.Run("a missing helper still installs", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		f.putEntitlement(src, fmt.Errorf("stat %s: %w", src, fs.ErrNotExist))
-		if err := Install(context.Background(), f, Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"}); err != nil {
+		if err := Install(context.Background(), f, Config{InstallDir: testInstallDir(t), BinarySource: "/tmp/k3sm", TargetUser: "alice"}); err != nil {
 			t.Fatalf("Install: %v, want success (a missing helper is not this gate's business)", err)
 		}
-		if !slices.Contains(f.calls, "CopyToRootOwned:/Library/k3sm"+installSwapSuffix+"/"+VMHostName) {
+		if !slices.Contains(f.calls, "CopyToRootOwned:"+testInstallDir(t)+installSwapSuffix+"/"+VMHostName) {
 			t.Errorf("the vmhost copy itself did not run; calls = %v", f.calls)
 		}
 	})
 
 	t.Run("a carried retired datastore flag refuses with zero copies", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		cfg := testConfig(t)
 
 		configureServerArgs(f, cfg, "--datastore-endpoint-file", "/var/lib/k3sm/server/datastore-endpoint")

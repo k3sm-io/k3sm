@@ -117,12 +117,12 @@ func TestInstallRetiresARecordedPodRangeTheSeedNoLongerNames(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			f := reinstallFake()
+			f := reinstallFake(t)
 			cfg := testConfig(t)
 			cfg.MeshIP = tc.flagMeshIP
 			if tc.worker {
 				cfg = agentCfg(t)
-				f = &fakeSystem{}
+				f = newFakeSystem(t)
 				f.putLoaded(NetdLabel, AgentLabel)
 				seedJoinedAgent(t, f)
 			}
@@ -173,7 +173,7 @@ func TestInstallRetiresARecordedPodRangeTheSeedNoLongerNames(t *testing.T) {
 		// macOS can refuse to delete an alias for good, so refusing the install here
 		// could never clear. The leftover is named, with its remedy.
 		var logs bytes.Buffer
-		f := reinstallFake()
+		f := reinstallFake(t)
 		f.failOn("FlushInterconnectAliases", errors.New("ifconfig bridge0 -alias: not in table"))
 		f.putFile(identity, []byte("100.64.2.0/24\n"))
 		cfg := testConfig(t)
@@ -193,7 +193,7 @@ func TestInstallRetiresARecordedPodRangeTheSeedNoLongerNames(t *testing.T) {
 	})
 
 	t.Run("a file that cannot be removed fails the install before the plist changes", func(t *testing.T) {
-		f := reinstallFake()
+		f := reinstallFake(t)
 		f.putFile(identity, []byte("100.64.2.0/24\n"))
 		cfg := testConfig(t)
 		cfg.MeshIP = "100.64.1.1"
@@ -209,7 +209,7 @@ func TestInstallRetiresARecordedPodRangeTheSeedNoLongerNames(t *testing.T) {
 	})
 
 	t.Run("a file that cannot be read fails the install rather than guess", func(t *testing.T) {
-		f := reinstallFake()
+		f := reinstallFake(t)
 		f.putFile(identity, []byte("100.64.2.0/24\n"))
 		f.putKind(identity, fakeSymlink)
 		cfg := testConfig(t)

@@ -27,8 +27,9 @@
 #       The helper names, read from the subdirectories of e2e/testdata/cmd.
 #       TestMain keeps its own literal list (conformanceHelpers in
 #       e2e/main_test.go), one entry per subdirectory; the two are kept in step
-#       by convention, and a name built by one but not the other fails loud
-#       here ("helper not built") rather than silently.
+#       by TestConformanceHelpersMatchTestdata (e2e/main_test.go), which fails
+#       when they differ. A name built by one but not the other would
+#       otherwise fail loud here ("helper not built").
 #
 # Resolution seams (the gates inject recording fakes through these, not PATH):
 #   K3SM_SSH_BIN   ssh client (default: ssh)

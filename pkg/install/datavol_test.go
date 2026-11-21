@@ -53,7 +53,7 @@ type datavolRig struct {
 func newDatavolRig(t *testing.T) *datavolRig {
 	t.Helper()
 	shrinkRestartBudgets(t)
-	root := t.TempDir()
+	root := testRoot(t)
 
 	// Per-test declaration paths. TestMain already points both away from the
 	// running Mac; these narrow them to this test, because EnsureFstabLine
@@ -63,7 +63,7 @@ func newDatavolRig(t *testing.T) *datavolRig {
 	dataroot.DefaultRecordPath = filepath.Join(root, "io.k3sm.datavol.json")
 	t.Cleanup(func() { dataroot.FstabPath, dataroot.DefaultRecordPath = fstabPath, recordPath })
 
-	sys := &fakeSystem{}
+	sys := newFakeSystem(t)
 	disk := datavoltest.New()
 	// A pinned UUID for whatever this test creates, so an assertion can name the
 	// mount of the DATA ROOT specifically -- a migration also mounts the same
@@ -323,7 +323,7 @@ func TestInstallWithDataVolumeSequencing(t *testing.T) {
 			t.Error("a recorded volume was re-created")
 		}
 
-		un := &fakeSystem{}
+		un := newFakeSystem(t)
 		uncfg := r.cfg
 		if err := Uninstall(context.Background(), un, uncfg); err != nil {
 			t.Fatalf("Uninstall: %v", err)

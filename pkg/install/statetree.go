@@ -21,6 +21,7 @@ import (
 	"io/fs"
 	"path/filepath"
 
+	"k3sm.io/runtimed/pkg/hostshare"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 	"k3sm.io/runtimed/pkg/sandbox"
 )
@@ -42,6 +43,18 @@ import (
 //	/var/lib/k3sm/manifests root:wheel 0755 (the operator's auto-deploy manifests)
 //	/var/lib/k3sm/<tree>   service user     (every tree an unprivileged daemon writes)
 //	/var/lib/k3sm/runtimed.lock service user 0600 (the embedded runtime's root lock)
+//
+// Every service-user tree is closed to every other account except the two
+// named exceptions, status (StatusDirMode, world-readable records by contract)
+// and the artifact views root (ArtifactViewsMode, the runtime requires 0711).
+// Every reader of the others is the owner uid: the daemons and every native pod
+// run as the service user, and root bypasses modes. The group bit is not an
+// access path and must not become one. The service user's primary group is
+// staff, which every login user shares, and link(2) needs only search on the
+// source's directories: a group-search bit on, say, the image store would let
+// any login user hard-link a blob or a PersistentVolume file into a read-write
+// host share (docs/user/storage.md), where a pod, running as the owner, could
+// then rewrite the node's copy.
 //
 // The lock file is the one entry directly in the root that is not a directory:
 // the runtime opens <root>/runtimed.RootLockName O_CREAT as the service user,
@@ -66,16 +79,28 @@ const (
 	StateRootGID  int         = 0
 )
 
-// ServiceTreeMode and ServiceTreeGID are the default ownership of a
-// service-user tree directly under the data root: group staff (the service
-// user's primary group), 0750. A tree whose owning code already decided a
-// tighter mode (the run dir, the two work dirs, the daemon-private stores)
-// carries that mode in the table instead.
+// ServiceTreeMode is the default mode of a service-user tree directly under the
+// data root (the pod and PersistentVolume parents, the image store and the
+// guest-artifact cache): 0700, the owner's alone. Every reader of these trees
+// is the owner uid (the daemons and every native pod run as the service user;
+// root bypasses modes), so no group or other bit is needed, and a group-search
+// bit must not be granted: it would let any staff member hard-link the node's
+// files into a host share (docs/user/storage.md), where a pod, running as the
+// owner, rewrites them. A tree whose owning code names its own mode (the run
+// dir, the work dirs, the daemon-private stores, and the two exceptions open to
+// other accounts, the status dir and the artifact views root) carries that
+// constant in the table instead.
+//
+// ServiceTreeGID is the group the service-user trees and files are created
+// with: staff, the service user's primary group. It is NOT an access control:
+// staff is every login user's group too, which is exactly why no service-user
+// row grants a group bit (TestServiceGroupIsNotAnAccessPath). It stays staff
+// only so a file keeps the group the service user would give it anyway.
 //
 // They are NOT the data root's ownership, which is StateRootMode/StateRootGID:
 // the root is root's, and only the trees under it are the service user's.
 const (
-	ServiceTreeMode fs.FileMode = 0o750
+	ServiceTreeMode fs.FileMode = 0o700
 	ServiceTreeGID  int         = 20
 )
 
@@ -89,9 +114,19 @@ const LibraryMode fs.FileMode = 0o700
 
 // serviceTreePrivateMode is the mode of the daemon-private stores the runtime
 // already creates 0700 (the image index, the operator record, the ingest
-// staging dir, the SBPL staging dir and the two reap stores). Pre-creating them
+// staging dir, the SBPL staging dir, the two reap stores, the artifact
+// download staging dir and the failed-boot console dir). Pre-creating them
 // at the same mode means the installer changes their owner and nothing else.
 const serviceTreePrivateMode fs.FileMode = 0o700
+
+// ArtifactViewsMode is the mode of the runtime's artifact views root
+// (sandbox.ArtifactViewsSubdir): traversable but not listable by anyone but
+// the service user, so a pod can reach the one view it is granted and cannot
+// list the others. The runtime creates the root at exactly this mode and
+// refuses one at any other mode or owner without repairing it, and netd
+// re-applies the table at every start, so this must equal the runtime's value:
+// 0700 here would refuse every pod that mounts a model image volume.
+const ArtifactViewsMode fs.FileMode = 0o711
 
 // ManifestDirMode is the auto-deploy manifest directory's mode: root:wheel
 // 0755. World-readable because nothing in it is secret by contract, and
@@ -212,6 +247,8 @@ const (
 	// StateLibrary is the service user's home-Library (<home>/Library): the
 	// data root is _k3sm's home, and macOS writes per-user state there.
 	StateLibrary StateLevel = "Library"
+	// StateKube is the service user's ~/.kube (KubeSubdir).
+	StateKube StateLevel = KubeSubdir
 	// StateStatus is the service user's world-readable status directory
 	// (StatusSubdir).
 	StateStatus StateLevel = StatusSubdir
@@ -219,7 +256,21 @@ const (
 	// daemon downloads a release archive into a fresh attempt directory here
 	// before handing it to the root helper (pkg/update.Watcher).
 	StateUpdates StateLevel = UpdatesSubdir
+	// StateExpose is the exposure root (ExposeSubdir): the pod-lifetime
+	// directories a pod publishes to one named host account.
+	StateExpose StateLevel = ExposeSubdir
 )
+
+// KubeSubdir is the service user's ~/.kube under the data root. The data root is
+// the service user's HOME (daemonEnv), so a kubectl-style client run as that
+// user writes ~/.kube/config (and a cache) here; left to the client, the
+// directory lands 0755. It is the owner's alone (KubeDirMode), like every other
+// service-user tree, so no other account can read a credential in it or link
+// to anything under it.
+const KubeSubdir = ".kube"
+
+// KubeDirMode is the service user's ~/.kube mode: the owner's alone.
+const KubeDirMode fs.FileMode = 0o700
 
 // UpdatesSubdir is the data-root subdirectory of the managed update
 // (StateUpdates).
@@ -228,6 +279,23 @@ const UpdatesSubdir = "updates"
 // UpdatesDirMode is the update root's mode: the service user's own, because a
 // downloaded archive is not for any other account to read or replace.
 const UpdatesDirMode fs.FileMode = 0o700
+
+// ExposeSubdir is the data-root subdirectory that holds every exposure
+// volume, <data root>/expose/<namespace>/<pod>/<volume> (StateExpose). It is
+// runtimed's hostshare.ExposeSubdir, spelled through it so the two cannot
+// name different leaves.
+const ExposeSubdir = hostshare.ExposeSubdir
+
+// ExposeDirMode and ExposeDirGID are the exposure root's mode and group:
+// the service user's, group wheel, 0711. The runtime (as the service user)
+// creates each namespace, pod and volume directory under it without root; a
+// host account granted an exposure can traverse to the name it is given but
+// cannot list who exposes what. Group wheel, not staff: no login account is
+// let in through the group.
+const (
+	ExposeDirMode fs.FileMode = 0o711
+	ExposeDirGID  int         = 0
+)
 
 // Path joins the level onto a data root.
 func (l StateLevel) Path(dataRoot string) string {
@@ -267,6 +335,9 @@ var stateTree = func() []stateLevel {
 		// the first time a framework running as that user asks for it; the
 		// home-Library convention is the user's own 0700.
 		{StateLibrary, svc(LibraryMode)},
+		// The service user's ~/.kube: HOME is the data root, so a client run
+		// as that user writes its kubeconfig here (KubeSubdir).
+		{StateKube, svc(KubeDirMode)},
 		// The records the server publishes for `k3sm status`, readable by any
 		// account (StatusSubdir).
 		{StateStatus, svc(StatusDirMode)},
@@ -274,9 +345,14 @@ var stateTree = func() []stateLevel {
 		{StateUpdates, svc(UpdatesDirMode)},
 		{StateLevel(sandbox.ServerSubdir), svc(ServerTokenDirMode)},
 		{StateLevel(agentWorkSubdir), svc(AgentTokenDirMode)},
-		// The per-pod rootfs parent and the PersistentVolume parent.
+		// The per-pod rootfs parent and the PersistentVolume parent. These and
+		// the four image and artifact trees below are the owner's alone
+		// (ServiceTreeMode): no login user may search them.
 		{StateLevel(podsSubdir), svc(ServiceTreeMode)},
 		{StateLevel(storageSubdir), svc(ServiceTreeMode)},
+		// The exposure root (ExposeDirMode, ExposeDirGID): traversable by a
+		// host account that knows a name, listable by the service user alone.
+		{StateExpose, StateOwnership{Principal: PrincipalServiceUser, GID: ExposeDirGID, Mode: ExposeDirMode}},
 		// The image store and the guest-artifact cache.
 		{StateLevel(sandbox.BlobsSubdir), svc(ServiceTreeMode)},
 		{StateLevel(sandbox.ImageUnpackedSubdir), svc(ServiceTreeMode)},
@@ -289,8 +365,27 @@ var stateTree = func() []stateLevel {
 		{StateLevel(sandbox.ProfileSubdir), svc(serviceTreePrivateMode)},
 		{StateLevel(sandbox.PodReapSubdir), svc(serviceTreePrivateMode)},
 		{StateLevel(sandbox.VMReapSubdir), svc(serviceTreePrivateMode)},
+		// The resumable artifact downloads, and the retained consoles of
+		// failed vm boots: daemon-private, 0700 as the runtime makes them.
+		{StateLevel(sandbox.ArtifactPartialSubdir), svc(serviceTreePrivateMode)},
+		{StateLevel(sandbox.VMBootFailureSubdir), svc(serviceTreePrivateMode)},
+		// The Xcode build cache (k3sm.io/xcode-cache): every namespace's build
+		// products, read and written by the daemon alone and denied to every
+		// pod, which only ever gets a private clone in its own data volume.
+		{StateLevel(sandbox.XcodeCacheSubdir), svc(serviceTreePrivateMode)},
+		// The read-only artifact views root (ArtifactViewsMode).
+		{StateLevel(sandbox.ArtifactViewsSubdir), svc(ArtifactViewsMode)},
+		// The image cache's private staging dir for blobs cloned from the
+		// node's registry store: daemon-private, 0700, which the runtime
+		// requires exactly and does not repair.
+		{StateLevel(imageLocalStageSubdir), svc(serviceTreePrivateMode)},
 	}
 }()
+
+// imageLocalStageSubdir is the image cache's clone staging dir under the cache
+// root, which is the data root on a stock install. It is runtimed's unexported
+// pkg/image localStageDir, spelled here because nothing exports it.
+const imageLocalStageSubdir = ".local-stage"
 
 // podsSubdir and storageSubdir are the runtime's per-pod rootfs parent and
 // PersistentVolume parent. runtimed spells both as literals rather than

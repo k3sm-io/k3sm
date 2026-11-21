@@ -1,0 +1,35 @@
+# hack/quarantine.txt -- the flake quarantine registry for this repository.
+#
+# hack/ci.sh reads this file on every run through hack/lib/testresults.go, which
+# validates it first: a line that does not parse reds every tier, so the registry
+# fails closed. One entry per line; `#` starts a comment (a whole line, or after
+# whitespace); blank lines are ignored. Values that hold spaces use shell-style
+# quotes:
+#
+#   <import path>::<TestName>[/<subtest>...]  sig="<failure signature>"  owner=<login or role>  filed=<YYYY-MM-DD>  deadline=<YYYY-MM-DD>  fix=<issue>  reason="<why>"
+#
+#   sig       a literal substring of the recorded failure output, at least 12
+#             characters; a failure is excused only when its output contains it.
+#             A sig that occurs in the test id, or in the harness's own
+#             `=== RUN` or `--- FAIL:` line for the test, is refused: it would
+#             match every failure of that test.
+#   owner, filed, deadline, fix, reason   all required; filed <= deadline.
+#
+# Every key is required, no key may repeat, no unknown key is accepted, and a test
+# id may appear once. At most 10 entries.
+#
+# Never quarantinable (such an entry is refused, which reds every tier): a test whose
+# signature is a race or sanitizer report, and a test on a trust surface (a package
+# under pkg/certs, pkg/bootstrap or pkg/rbac, the signature-policy image package, or a
+# test whose name names signature policy, cosign or RBAC).
+#
+# What an entry buys, in the fast tier only: a failure of the listed test, outside
+# the packages the change edits, whose output carries the signature and no race
+# report, is reported and does not red. An unlisted parent of a listed subtest is
+# excused only when every failing subtest below it is excused and its own output
+# holds nothing but the harness's RUN/FAIL framing. A race or sanitizer report in a
+# package's output outside any test reds, whatever is listed. The full tier reds on
+# every failure, and an entry past its deadline reds every tier.
+#
+# Example (not an entry):
+#   k3sm.io/k3sm/pkg/executor::TestDialLoopback  sig="dial tcp 127.0.0.1: connect: connection refused"  owner=maintainers  filed=2026-11-01  deadline=2026-12-01  fix=#123  reason="port reuse on a loaded host"

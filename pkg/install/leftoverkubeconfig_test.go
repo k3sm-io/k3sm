@@ -41,8 +41,8 @@ func TestAgentInstallRemovesOnlyTheLeftoverServerKubeconfig(t *testing.T) {
 		filepath.Join(work, "registry-state.json"),
 	}
 	shrinkRestartBudgets(t)
-	stage := func() *fakeSystem {
-		f := &fakeSystem{}
+	stage := func(t *testing.T) *fakeSystem {
+		f := newFakeSystem(t)
 		seedJoinedAgent(t, f)
 		f.putFile(leftover, []byte("admin"))
 		for _, p := range neighbours {
@@ -60,7 +60,7 @@ func TestAgentInstallRemovesOnlyTheLeftoverServerKubeconfig(t *testing.T) {
 	}
 
 	t.Run("agent install removes it", func(t *testing.T) {
-		f := stage()
+		f := stage(t)
 		if err := Install(context.Background(), f, agentCfg(t)); err != nil {
 			t.Fatalf("Install: %v", err)
 		}
@@ -73,15 +73,15 @@ func TestAgentInstallRemovesOnlyTheLeftoverServerKubeconfig(t *testing.T) {
 		}
 	})
 	t.Run("an agent install with nothing left over succeeds", func(t *testing.T) {
-		f := &fakeSystem{}
+		f := newFakeSystem(t)
 		seedJoinedAgent(t, f)
 		if err := Install(context.Background(), f, agentCfg(t)); err != nil {
 			t.Fatalf("Install: %v", err)
 		}
 	})
 	t.Run("a server install keeps its own", func(t *testing.T) {
-		f := stage()
-		if err := Install(context.Background(), f, Config{BinarySource: "/tmp/build/k3sm", TargetUser: "alice"}); err != nil {
+		f := stage(t)
+		if err := Install(context.Background(), f, Config{InstallDir: testInstallDir(t), BinarySource: "/tmp/build/k3sm", TargetUser: "alice"}); err != nil {
 			t.Fatalf("Install: %v", err)
 		}
 		if _, ok := f.files[leftover]; !ok {
@@ -89,7 +89,7 @@ func TestAgentInstallRemovesOnlyTheLeftoverServerKubeconfig(t *testing.T) {
 		}
 	})
 	t.Run("an agent uninstall keeps it", func(t *testing.T) {
-		f := stage()
+		f := stage(t)
 		if err := Uninstall(context.Background(), f, agentCfg(t)); err != nil {
 			t.Fatalf("Uninstall: %v", err)
 		}
@@ -99,7 +99,7 @@ func TestAgentInstallRemovesOnlyTheLeftoverServerKubeconfig(t *testing.T) {
 		keepsNeighbours(t, f)
 	})
 	t.Run("a failed install keeps it", func(t *testing.T) {
-		f := stage()
+		f := stage(t)
 		f.bootstrapAlways = map[string]error{AgentLabel: errors.New("refused")}
 		err := Install(context.Background(), f, agentCfg(t))
 		if err == nil || !strings.Contains(err.Error(), "refused") {
@@ -110,7 +110,7 @@ func TestAgentInstallRemovesOnlyTheLeftoverServerKubeconfig(t *testing.T) {
 		}
 	})
 	t.Run("a failed removal does not fail the install", func(t *testing.T) {
-		f := stage()
+		f := stage(t)
 		f.removeEntryErrs = map[string]error{leftover: errors.New("operation not permitted")}
 		if err := Install(context.Background(), f, agentCfg(t)); err != nil {
 			t.Fatalf("Install: %v", err)

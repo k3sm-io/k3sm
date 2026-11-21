@@ -75,8 +75,8 @@ func TestPodLogsDirsAreRootEquivalent(t *testing.T) {
 	})
 
 	t.Run("install creates both directories and uninstall removes both", func(t *testing.T) {
-		f := &fakeSystem{}
-		if err := Install(context.Background(), f, Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"}); err != nil {
+		f := newFakeSystem(t)
+		if err := Install(context.Background(), f, Config{InstallDir: testInstallDir(t), BinarySource: "/tmp/k3sm", TargetUser: "alice"}); err != nil {
 			t.Fatalf("Install: %v", err)
 		}
 		for _, dir := range []string{PodLogsDir, ContainerLogsDir} {
@@ -85,7 +85,7 @@ func TestPodLogsDirsAreRootEquivalent(t *testing.T) {
 			}
 		}
 
-		u := &fakeSystem{}
+		u := newFakeSystem(t)
 		if err := Uninstall(context.Background(), u, Config{}); err != nil {
 			t.Fatalf("Uninstall: %v", err)
 		}

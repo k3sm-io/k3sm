@@ -67,7 +67,7 @@ func TestRegistryNodePortFlag(t *testing.T) {
 			{[]string{"--registry-node-port", "40000"}, "outside the NodePort range"},
 			{[]string{"--registry-node-port", "30650", "--registry-port", "0"}, "--registry-port 0"},
 		} {
-			opts := parse(t, tc.args...)
+			opts := parse(t, append([]string{"--work-dir", tempServerWorkDir(t)}, tc.args...)...)
 			err := validateServerOptions(&opts, nil, logger)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Errorf("%v: err = %v, want one naming %q", tc.args, err, tc.want)

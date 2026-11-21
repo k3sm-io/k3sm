@@ -49,10 +49,6 @@ const (
 // manifest's layers, in order.
 const modelFSLayers = "layers"
 
-// maxConfigJSONBytes bounds the config.json read for the config's
-// quantization and paramSize. A model's config.json is a few KiB.
-const maxConfigJSONBytes = 1 << 20
-
 // Sentinel errors a caller can branch on with errors.Is. A path the
 // artifact/v1 rules refuse is reported with that package's sentinel.
 var (
@@ -66,8 +62,6 @@ var (
 	// ErrIncompleteSplit is a split weight set missing a split, or a split
 	// safetensors set missing its index.
 	ErrIncompleteSplit = errors.New("incomplete split weight set")
-	// ErrBadConfigJSON is a config.json that is not a bounded JSON object.
-	ErrBadConfigJSON = errors.New("config.json is not a JSON object of at most 1 MiB")
 	// ErrContentChanged is a file whose bytes no longer match the digest the
 	// manifest records for it.
 	ErrContentChanged = errors.New("file changed since the manifest was built")
@@ -117,8 +111,34 @@ type Artifact struct {
 	fsys fs.FS
 }
 
+// Option changes what Build and BuildFS write.
+type Option func(*buildOptions)
+
+type buildOptions struct {
+	annotations map[string]string
+}
+
+// WithSource records where the files came from on the manifest:
+// org.opencontainers.image.source is source and
+// org.opencontainers.image.revision is revision, each only when non-empty.
+// The annotations are part of the manifest, so the same files from the same
+// source and revision still make the same digest.
+func WithSource(source, revision string) Option {
+	return func(o *buildOptions) {
+		if o.annotations == nil {
+			o.annotations = map[string]string{}
+		}
+		if source != "" {
+			o.annotations[ispec.AnnotationSource] = source
+		}
+		if revision != "" {
+			o.annotations[ispec.AnnotationRevision] = revision
+		}
+	}
+}
+
 // Build builds the artifact for the model directory dir.
-func Build(ctx context.Context, dir string) (*Artifact, error) {
+func Build(ctx context.Context, dir string, opts ...Option) (*Artifact, error) {
 	st, err := os.Stat(dir)
 	if err != nil {
 		return nil, fmt.Errorf("model directory: %w", err)
@@ -126,7 +146,7 @@ func Build(ctx context.Context, dir string) (*Artifact, error) {
 	if !st.IsDir() {
 		return nil, fmt.Errorf("model directory %s is not a directory", dir)
 	}
-	a, err := BuildFS(ctx, os.DirFS(dir))
+	a, err := BuildFS(ctx, os.DirFS(dir), opts...)
 	if err != nil {
 		return nil, fmt.Errorf("model directory %s: %w", dir, err)
 	}
@@ -137,25 +157,33 @@ func Build(ctx context.Context, dir string) (*Artifact, error) {
 // the files, validates every path and the profile's rules on the names alone,
 // and only then reads: config.json for the config, and each file once to hash
 // it.
-func BuildFS(ctx context.Context, fsys fs.FS) (*Artifact, error) {
+func BuildFS(ctx context.Context, fsys fs.FS, opts ...Option) (*Artifact, error) {
+	var bo buildOptions
+	for _, o := range opts {
+		o(&bo)
+	}
 	paths, err := listFiles(fsys)
 	if err != nil {
 		return nil, err
 	}
-	if err := artifactv1.ValidatePathSet(paths); err != nil {
-		return nil, err
-	}
 	slices.Sort(paths)
-	format, err := checkProfile(paths)
+	format, err := CheckPaths(paths)
 	if err != nil {
 		return nil, err
 	}
-	fields := ConfigFields{Format: format}
+	fields := ConfigFields{}
 	if slices.Contains(paths, "config.json") {
-		if err := readModelConfig(fsys, &fields); err != nil {
+		f, err := openRegular(fsys, "config.json")
+		if err != nil {
+			return nil, err
+		}
+		fields, err = readModelConfig(f)
+		f.Close()
+		if err != nil {
 			return nil, err
 		}
 	}
+	fields.Format = format
 
 	a := &Artifact{fsys: fsys}
 	cfg := Config{Config: fields, ModelFS: ModelFS{Type: modelFSLayers, DiffIDs: []digest.Digest{}}}
@@ -190,6 +218,9 @@ func BuildFS(ctx context.Context, fsys fs.FS) (*Artifact, error) {
 		ArtifactType: artifactv1.ArtifactTypeModel,
 		Config:       a.ConfigDescriptor,
 		Layers:       make([]ispec.Descriptor, 0, len(a.Layers)),
+	}
+	if len(bo.annotations) > 0 {
+		m.Annotations = bo.annotations
 	}
 	for _, l := range a.Layers {
 		m.Layers = append(m.Layers, l.Descriptor)
@@ -232,6 +263,18 @@ func listFiles(fsys fs.FS) ([]string, error) {
 		return nil, err
 	}
 	return paths, nil
+}
+
+// CheckPaths applies every rule a model's file names must pass, on the names
+// alone: the artifact/v1 path rules (so a code or pickle file is refused by
+// name) and the profile's (one weight format, every split set complete). It
+// returns the weight format. Build runs it before reading any file; a caller
+// that lists files from elsewhere runs it before fetching any.
+func CheckPaths(paths []string) (string, error) {
+	if err := artifactv1.ValidatePathSet(paths); err != nil {
+		return "", err
+	}
+	return checkProfile(paths)
 }
 
 // splitPattern matches a split weight file: <prefix>-<i>-of-<n>.<ext>, five
@@ -306,52 +349,6 @@ func mediaTypeFor(p string) string {
 		}
 	}
 	return artifactv1.MediaTypeModelWeightConfig
-}
-
-// readModelConfig copies the quantization and parameter size from the
-// model's own config.json into fields: a string "quantization" (else the
-// Hugging Face quantization_config.quant_method) and a string "paramSize".
-func readModelConfig(fsys fs.FS, fields *ConfigFields) error {
-	f, err := fsys.Open("config.json")
-	if err != nil {
-		return fmt.Errorf("read config.json: %w", err)
-	}
-	defer f.Close()
-	b, err := io.ReadAll(io.LimitReader(f, maxConfigJSONBytes+1))
-	if err != nil {
-		return fmt.Errorf("read config.json: %w", err)
-	}
-	if len(b) > maxConfigJSONBytes {
-		return ErrBadConfigJSON
-	}
-	var raw struct {
-		Quantization       json.RawMessage `json:"quantization"`
-		QuantizationConfig json.RawMessage `json:"quantization_config"`
-		ParamSize          json.RawMessage `json:"paramSize"`
-	}
-	if err := json.Unmarshal(b, &raw); err != nil {
-		return fmt.Errorf("%w: %v", ErrBadConfigJSON, err)
-	}
-	fields.Quantization = jsonString(raw.Quantization)
-	if fields.Quantization == "" && len(raw.QuantizationConfig) > 0 {
-		var qc struct {
-			QuantMethod json.RawMessage `json:"quant_method"`
-		}
-		if json.Unmarshal(raw.QuantizationConfig, &qc) == nil {
-			fields.Quantization = jsonString(qc.QuantMethod)
-		}
-	}
-	fields.ParamSize = jsonString(raw.ParamSize)
-	return nil
-}
-
-// jsonString is raw decoded as a JSON string, or "" when it is not one.
-func jsonString(raw json.RawMessage) string {
-	var s string
-	if len(raw) == 0 || json.Unmarshal(raw, &s) != nil {
-		return ""
-	}
-	return s
 }
 
 // hashFile returns the digest and size of the regular file at p.

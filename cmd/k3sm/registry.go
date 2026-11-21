@@ -36,6 +36,7 @@ import (
 
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/nodecred"
+	"k3sm.io/k3sm/pkg/provider"
 	"k3sm.io/k3sm/pkg/registrysvc"
 )
 
@@ -96,6 +97,7 @@ func registryConfig(opts serverOptions, dataVolume string, logger *slog.Logger) 
 		Port:       opts.registryPort,
 		DataVolume: dataVolume,
 		Logger:     logger,
+		Quota:      opts.registryQuota,
 	}
 }
 
@@ -254,6 +256,14 @@ type registryPullerWiring struct {
 	// (clusterFlatRegistry), so the cluster keeps one image store. Zero on a node
 	// with no registry.
 	Flat flatRegistryEndpoint
+	// PublishGuest is handed this node's verified guest boot pair once it is
+	// ensured, and publishes it to this server's registry in the background
+	// (startGuestPublication). nil on a node with no registry.
+	PublishGuest func(provider.EnsuredGuestArtifacts)
+	// StoreRoot is the root of the store this registry serves, on this
+	// machine: runtimed's puller clones a blob it already holds instead of
+	// fetching it (store.LocalBlobSource). Empty on a node with no registry.
+	StoreRoot string
 }
 
 // startIngestRegistry brings the registry up, publishes the flat registry-k3sm
@@ -309,7 +319,7 @@ func startIngestRegistry(ctx context.Context, r ingestRegistry) (func(), registr
 	r.relay(auxCtx, &aux, serving)
 	r.loopbackGate(auxCtx, &aux)
 
-	wiring := registryPullerWiring{LocalHost: registrysvc.LoopbackAuthority(r.port), Flat: r.flatRegistry(ctx)}
+	wiring := registryPullerWiring{LocalHost: registrysvc.LoopbackAuthority(r.port), Flat: r.flatRegistry(ctx), StoreRoot: r.storeRoot()}
 
 	return func() {
 		stopAux()
@@ -328,6 +338,15 @@ func startIngestRegistry(ctx context.Context, r ingestRegistry) (func(), registr
 			logger.Error("ingest registry shutdown", "err", err)
 		}
 	}, wiring
+}
+
+// storeRoot is the root of the store the started registry serves from
+// (registrysvc.StateDir), or "" with no work dir.
+func (r ingestRegistry) storeRoot() string {
+	if r.workDir == "" {
+		return ""
+	}
+	return registrysvc.StateDir(r.workDir)
 }
 
 // flatRegistry is where this server's runtime fetches the flat name from. The

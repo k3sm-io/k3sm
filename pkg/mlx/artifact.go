@@ -147,8 +147,11 @@ func artifactVolume(m *mlxv1alpha1.MLXModel, opts Options) (*corev1.Volume, erro
 	if err != nil {
 		return nil, err
 	}
+	// With spec.quantization the reference names the variant index and the
+	// resolved digest is the manifest selected from it, so a digest
+	// reference is the index's digest, not the one rendered.
 	digest := m.Status.ResolvedArtifact
-	if !digestPattern.MatchString(digest) || (ref.Digest != "" && ref.Digest != digest) {
+	if !digestPattern.MatchString(digest) || (ref.Digest != "" && m.Spec.Quantization == "" && ref.Digest != digest) {
 		return nil, fmt.Errorf("%w: status.resolvedArtifact=%q", ErrArtifactUnresolved, digest)
 	}
 	return &corev1.Volume{
