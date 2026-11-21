@@ -92,7 +92,8 @@ func (l *srcListener) dial(src string, wait time.Duration) (net.Conn, error) {
 }
 
 // relayLimitFixture is a relay built by newRelay, served by its own accept on a
-// srcListener, in front of a socket fake registry and fake apiserver clients.
+// srcListener, in front of an in-memory fake registry and fake apiserver
+// clients.
 type relayLimitFixture struct {
 	registry *fakeRegistry
 	tokens   *fakeTokens
@@ -106,15 +107,16 @@ func newRelayLimitFixture(t *testing.T) *relayLimitFixture {
 
 // newRelayLimitFixtureWith is newRelayLimitFixture with the relay's limits set
 // to lim and, when registry is not nil, the fake registry serving through it.
+// The registry is served on a memListener and the gate dials it through its
+// dial seam, so no socket is opened and, inside a synctest bubble, every
+// connection the relay holds blocks on the bubble's clock.
 func newRelayLimitFixtureWith(t *testing.T, lim relayLimits, registry http.Handler) *relayLimitFixture {
 	t.Helper()
 	z := newFakeRegistry(t)
 	if registry != nil {
 		z.h = registry
 	}
-	zsrv := httptest.NewServer(z.h)
-	t.Cleanup(zsrv.Close)
-	zaddr := zsrv.Listener.Addr()
+	zl := serveMem(t, z.h)
 	f := &relayLimitFixture{
 		registry: z,
 		tokens:   &fakeTokens{statuses: map[string]authnv1.TokenReviewStatus{}},
@@ -127,9 +129,15 @@ func newRelayLimitFixtureWith(t *testing.T, lim relayLimits, registry http.Handl
 		}},
 		Namespaces: &fakeNamespaces{labels: map[string]map[string]string{"team": {PushLabel: "team"}}},
 	}
-	r := newRelay(portOf(t, zaddr), portOf(t, zaddr), nil, quietLogger(), auth, gateCred)
+	r := newRelay(fakeRegistryPort, fakeRegistryPort, nil, quietLogger(), auth, gateCred)
 	r.limits = lim
-	r.limiter = newSourceLimiter(r.limiter.next, lim, time.Now)
+	// The gate newRelay wires, with the same configuration, dialling the
+	// in-memory registry.
+	g := newGate(gateConfig{
+		Upstream: r.target(), Auth: auth, Credential: gateCred, Logger: quietLogger(),
+		dial: func(context.Context, string, string) (net.Conn, error) { return zl.dial() },
+	})
+	r.limiter = newSourceLimiter(g, lim, time.Now)
 	r.handler = r.limiter
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
@@ -144,6 +152,10 @@ func newRelayLimitFixtureWith(t *testing.T, lim relayLimits, registry http.Handl
 	})
 	return f
 }
+
+// fakeRegistryPort is the registry port the fixture's relay is configured
+// with. Nothing listens on it: the gate dials the in-memory registry.
+const fakeRegistryPort = 5000
 
 // do sends one request from src on a fresh connection.
 func (f *relayLimitFixture) do(t *testing.T, src, method, target string, headers map[string]string, body string) rawResponse {
