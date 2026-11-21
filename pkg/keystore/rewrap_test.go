@@ -1192,3 +1192,72 @@ func TestInterruptedRewrap(t *testing.T) {
 		})
 	}
 }
+
+// TestRewrapNotStarted: Rewrap marks with ErrRewrapNotStarted exactly the
+// errors it returns before it first writes master.next from the key it was
+// given: the early refusals and a resume of another key match it; a crash
+// after that write, at any later step, does not.
+func TestRewrapNotStarted(t *testing.T) {
+	ctx := context.Background()
+	before := map[string]func(t *testing.T) (*FileStore, []byte){
+		"no keystore": func(t *testing.T) (*FileStore, []byte) { s, _ := newTestStore(t); return s, rewrapKey(1) },
+		"short key": func(t *testing.T) (*FileStore, []byte) {
+			s, _ := newTestStore(t)
+			seedRewrap(t, s)
+			return s, rewrapKey(1)[:31]
+		},
+		"the live master": func(t *testing.T) (*FileStore, []byte) {
+			s, server := newTestStore(t)
+			seedRewrap(t, s)
+			live, err := os.ReadFile(masterPath(server, masterName))
+			if err != nil {
+				t.Fatal(err)
+			}
+			return s, live
+		},
+		"user scopes": func(t *testing.T) (*FileStore, []byte) {
+			s, server := newTestStore(t)
+			seedRewrap(t, s)
+			if err := os.Mkdir(filepath.Join(server, "keystore", userScopesName), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			return s, rewrapKey(1)
+		},
+		"an entry that does not open": func(t *testing.T) (*FileStore, []byte) {
+			s, server := newTestStore(t)
+			seedRewrap(t, s)
+			writeFile(t, filepath.Join(server, "keystore", "a", "v1"), "garbage")
+			return s, rewrapKey(1)
+		},
+		"a resume of another key": func(t *testing.T) (*FileStore, []byte) {
+			s, _ := newTestStore(t)
+			seedRewrap(t, s)
+			s.step = failAt("rename a/v1")
+			if err := s.Rewrap(ctx, rewrapKey(1)); err == nil {
+				t.Fatal("Rewrap succeeded through a crash")
+			}
+			s.step = func(string) error { return nil }
+			return s, rewrapKey(2)
+		},
+	}
+	for name, mk := range before {
+		t.Run(name, func(t *testing.T) {
+			s, key := mk(t)
+			if err := s.Rewrap(ctx, key); !errors.Is(err, ErrRewrapNotStarted) {
+				t.Fatalf("Rewrap = %v, want ErrRewrapNotStarted", err)
+			}
+		})
+	}
+	for _, at := range []string{"write " + masterNextName, "write v1.new", "rename a/v1", "rename " + masterNextName} {
+		t.Run("crash at "+at, func(t *testing.T) {
+			s, _ := newTestStore(t)
+			seedRewrap(t, s)
+			s.step = failAt(at)
+			err := s.Rewrap(ctx, rewrapKey(1))
+			if err == nil || errors.Is(err, ErrRewrapNotStarted) {
+				t.Fatalf("Rewrap = %v, want an error that is not ErrRewrapNotStarted", err)
+			}
+		})
+	}
+}
+

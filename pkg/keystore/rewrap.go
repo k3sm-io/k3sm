@@ -63,14 +63,28 @@ const newSuffix = ".new"
 // not re-sealed; the next Put of its name discards it. A version above the one
 // the pointer names, which a Rotate interrupted before its flip leaves, is not
 // committed and is not re-sealed either; the next Rotate discards it.
+//
+// Every error it returns before it first writes master.next from newMaster
+// also matches ErrRewrapNotStarted: nothing was then sealed under newMaster
+// by this call. That covers the config, size, floor-writable, lock, .user,
+// master and live-key refusals, an empty keystore, the floor raise, and a
+// plan refused because an entry does not open, as well as ErrRewrapResumed
+// (the run completed another key). An error after that write never matches
+// it, whatever its cause.
 func (s *FileStore) Rewrap(ctx context.Context, newMaster []byte) error {
-	if err := s.rewrap(ctx, newMaster); err != nil {
+	started := false
+	if err := s.rewrap(ctx, newMaster, &started); err != nil {
+		if !started {
+			return fmt.Errorf("rewrap: %w (%w)", err, ErrRewrapNotStarted)
+		}
 		return fmt.Errorf("rewrap: %w", err)
 	}
 	return nil
 }
 
-func (s *FileStore) rewrap(ctx context.Context, newMaster []byte) error {
+// rewrap is Rewrap. It sets *started just before it first writes master.next
+// from newMaster.
+func (s *FileStore) rewrap(ctx context.Context, newMaster []byte, started *bool) error {
 	if err := s.checkConfig(); err != nil {
 		return err
 	}
@@ -144,9 +158,9 @@ func (s *FileStore) rewrap(ctx context.Context, newMaster []byte) error {
 	}
 	old := k
 	old.next = nil
-	next, plan, resuming, err := s.prepareNext(ctx, root, mroot, fl, old, newMaster)
+	next, plan, resuming, err := s.prepareNext(ctx, root, mroot, fl, old, newMaster, started)
 	if errors.Is(err, ErrCorrupt) || errors.Is(err, ErrMasterUntrusted) {
-		k, p, ok, aerr := s.adoptSupplied(ctx, root, mroot, fl, old, newMaster)
+		k, p, ok, aerr := s.adoptSupplied(ctx, root, mroot, fl, old, newMaster, started)
 		if aerr != nil {
 			return aerr
 		}
@@ -307,7 +321,7 @@ func refuseUserScopes(root *os.Root) error {
 // With nothing to resume, every record must open under the live master before
 // master.next is written, so a Rewrap over an entry that does not open writes
 // nothing.
-func (s *FileStore) prepareNext(ctx context.Context, root, mroot *os.Root, fl floor, old keys, newMaster []byte) (keys, []planned, bool, error) {
+func (s *FileStore) prepareNext(ctx context.Context, root, mroot *os.Root, fl floor, old keys, newMaster []byte, started *bool) (keys, []planned, bool, error) {
 	raw, err := s.readNext(mroot)
 	if err == nil {
 		k, derr := deriveKeys(raw, s.scope)
@@ -352,6 +366,7 @@ func (s *FileStore) prepareNext(ctx context.Context, root, mroot *os.Root, fl fl
 		}
 		return keys{}, nil, false, perr
 	}
+	*started = true
 	if err := s.writeNext(mroot, newMaster); err != nil {
 		return keys{}, nil, false, err
 	}
@@ -371,7 +386,7 @@ func (s *FileStore) prepareNext(ctx context.Context, root, mroot *os.Root, fl fl
 // returns the keys to resume under, ok set. Otherwise it writes nothing and
 // reports !ok, and the caller keeps prepareNext's refusal. A record under any
 // third key fails the plan, so this never orphans one.
-func (s *FileStore) adoptSupplied(ctx context.Context, root, mroot *os.Root, fl floor, old keys, newMaster []byte) (keys, []planned, bool, error) {
+func (s *FileStore) adoptSupplied(ctx context.Context, root, mroot *os.Root, fl floor, old keys, newMaster []byte, started *bool) (keys, []planned, bool, error) {
 	k, err := deriveKeys(newMaster, s.scope)
 	if err != nil {
 		return keys{}, nil, false, err
@@ -388,6 +403,7 @@ func (s *FileStore) adoptSupplied(ctx context.Context, root, mroot *os.Root, fl 
 		k.wipe()
 		return keys{}, nil, false, nil
 	}
+	*started = true
 	if err := s.writeNext(mroot, newMaster); err != nil {
 		k.wipe()
 		return keys{}, nil, false, err

@@ -183,4 +183,10 @@ var (
 	// now that earlier key, which the caller did not choose, so Rewrap must be
 	// run again to retire it.
 	ErrRewrapResumed = errors.New("an earlier interrupted rewrap was completed, with a key other than the one supplied: run rewrap again to retire that key")
+	// ErrRewrapNotStarted marks an error Rewrap returned before it first
+	// wrote master.next from the key it was given, so nothing is sealed under
+	// that key by the call. A caller holding a key it minted for that call
+	// may discard it; after any other Rewrap error the key may be needed to
+	// finish.
+	ErrRewrapNotStarted = errors.New("nothing was sealed under the new master key")
 )
