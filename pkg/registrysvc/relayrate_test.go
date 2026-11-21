@@ -20,6 +20,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -321,4 +322,32 @@ func TestRelayRateFloorSparesAMeshPull(t *testing.T) {
 		}
 	}
 	t.Fatal("the 4 KiB/s pull was never picked")
+}
+
+// nopConn is a connection whose writes succeed at once, for the write path's
+// benchmark.
+type nopConn struct{ net.Conn }
+
+func (nopConn) Write(b []byte) (int, error) { return len(b), nil }
+
+// BenchmarkLimitConnWrite measures what the rate meter adds to each write of a
+// 16 KiB TLS record, against a connection with no meter.
+func BenchmarkLimitConnWrite(b *testing.B) {
+	rec := make([]byte, 16<<10)
+	for _, tc := range []struct {
+		name  string
+		meter *rateMeter
+	}{
+		{"no meter", nil},
+		{"meter", newRateMeter(time.Now, relayRateWindow)},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			c := &limitConn{Conn: nopConn{}, meter: tc.meter}
+			c.meter.begin()
+			b.SetBytes(int64(len(rec)))
+			for b.Loop() {
+				_, _ = c.Write(rec)
+			}
+		})
+	}
 }

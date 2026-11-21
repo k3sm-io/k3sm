@@ -167,11 +167,17 @@ holds. The rate is the bytes of a response sent to the client, divided by the ti
 for the client to take them, averaged over the last 5 to 10 minutes of the response. Time spent
 waiting on the registry behind the relay does not count, so a slow registry never makes a client
 look slow. At most once every 5 minutes on each address, the relay cuts the slowest pull below the
-floor, which frees its slot for the waiting connection, and the node pulling it downloads that
-layer again. A connection younger than 5 minutes, or a response that has sent less than 2.4 MB, is
-never cut this way, and neither is a connection between two responses. While a slot is free, no
-pull is cut for being slow, whatever its rate or however long it pauses. A pull over the cluster
-network at 64 KiB/s is eight times the floor.
+floor, and the node pulling it downloads that layer again. The cut takes effect when the write in
+progress to that client returns, so a client that has stopped reading altogether is freed by the
+5 minute cut above instead. A connection younger than 5 minutes, or a response that has sent less
+than 2.4 MB, is never cut this way, and neither is a connection between two responses. While a
+slot is free, no pull is cut for being slow, whatever its rate or however long it pauses. A pull
+over the cluster network at 64 KiB/s is eight times the floor. The rate counts bytes once the
+Mac's network stack has taken them, so a client that slows down can stay above the floor for up
+to about 15 minutes of its response. A waiting connection whose client has already given up still
+counts as waiting until a slot frees. One cut every 5 minutes frees slots slowly when many clients
+are below the floor. The floor and its window are fixed in this release; changing them takes a new
+build.
 
 The relay writes these cases to the server log as warnings. Search the server log for these
 messages. `ingest registry relay is at its connection limit` means all 256 are held, and
@@ -179,8 +185,9 @@ messages. `ingest registry relay is at its connection limit` means all 256 are h
 names the address it listens on and is logged at most once a minute for that address.
 `ingest registry relay cut a stalled connection` means the 5 minute cut closed a connection, and
 it is logged once for each connection cut. `ingest registry relay cut its slowest connection`
-means the rate floor cut a pull for a waiting connection; it names the client, the bytes and the
-time the rate was measured over, and is logged at most once a minute for that address. The refused-connection line names the first client
+means the rate floor cut a pull for a waiting connection. It names the client, the bytes and the
+time the rate was measured over, and is logged at most once a minute for that address. The
+refused-connection line names the first client
 refused in that minute, which may not be the only one. These lines show that the limits were
 reached. A client that keeps its connections above the floor still holds its share, and clients
 on several addresses can still hold all 256 between them.

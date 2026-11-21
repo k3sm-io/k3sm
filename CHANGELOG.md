@@ -208,7 +208,8 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
   once every 5 minutes on that address it cuts the slowest pull below the floor, so a client that
   reads a little at a time can no longer hold a slot for good while others wait. Only time spent
   waiting on the client counts; a connection younger than 5 minutes or a response under 2.4 MB is
-  never cut, and nothing is cut while a slot is free. The cut is logged as a warning. See
+  never cut, and nothing is cut while a slot is free. The cut is logged as a warning. The floor
+  and its window are fixed values that a later release may change. See
   [Pulling](docs/user/registry.md#pulling).
 
 ### Changed

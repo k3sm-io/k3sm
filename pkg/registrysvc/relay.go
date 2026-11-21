@@ -517,13 +517,8 @@ func (l *limitListener) Accept() (net.Conn, error) {
 				<-l.sem
 				return nil, err
 			}
-			src := sourceOf(c.RemoteAddr())
-			if !l.open.take(src, l.perSource) {
-				_ = c.Close()
-				<-l.sem
-				// Logged after the slot is released, so a slow log handler
-				// never holds one.
-				l.warnOverShare(src)
+			src, ok := l.admit(c, func() { <-l.sem })
+			if !ok {
 				continue
 			}
 			return l.track(c, src), nil
@@ -534,10 +529,8 @@ func (l *limitListener) Accept() (net.Conn, error) {
 		if err != nil {
 			return nil, err
 		}
-		src := sourceOf(c.RemoteAddr())
-		if !l.open.take(src, l.perSource) {
-			_ = c.Close()
-			l.warnOverShare(src)
+		src, ok := l.admit(c, nil)
+		if !ok {
 			continue
 		}
 		if err := l.waitSlot(); err != nil {
@@ -547,6 +540,23 @@ func (l *limitListener) Accept() (net.Conn, error) {
 		}
 		return l.track(c, src), nil
 	}
+}
+
+// admit counts c against its source's share and returns the source, or closes
+// c, calls free (the slot it holds, if any) and logs the refusal when the
+// source is at its share. The refusal is logged after free, so a slow log
+// handler never holds a slot.
+func (l *limitListener) admit(c net.Conn, free func()) (string, bool) {
+	src := sourceOf(c.RemoteAddr())
+	if l.open.take(src, l.perSource) {
+		return src, true
+	}
+	_ = c.Close()
+	if free != nil {
+		free()
+	}
+	l.warnOverShare(src)
+	return "", false
 }
 
 // track wraps c, which holds a slot and src's share, as a limitConn the rate

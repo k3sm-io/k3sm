@@ -46,7 +46,17 @@ import (
 //     one with the lowest rate below the floor. None is cut while every
 //     measured connection is above it. The cut closes the connection once the
 //     write in progress returns, or at once when none is, which frees its slot
-//     for the waiting connection.
+//     for the waiting connection. A peer that has stopped reading inside a
+//     write is therefore freed by the progress deadline, up to one more window.
+//
+// What it measures, and its limits. A write returns once the kernel has taken
+// its bytes, so up to a send buffer's worth is counted before the peer has read
+// it: a peer that stops reading looks faster than it is until the buffer's
+// share of the window ages out, and the first cut of a slow peer can come up to
+// about three windows after its response starts. The waiting connection is not
+// probed: one whose client has already left still counts as waiting until a
+// slot frees. One cut a window frees slots slowly against many slow sources;
+// the per-source share keeps one source to a quarter of the slots.
 const (
 	// relayRateFloor is the floor, in bytes a second: about one fifteenth of a
 	// 1 Mbit/s link. A mesh pull at 64 KiB/s is eight times it.
@@ -86,6 +96,8 @@ type rateMeter struct {
 	cut       bool // the listener cut this connection for its rate
 }
 
+// newRateMeter returns a meter for a connection opened at now(), averaging over
+// window.
 func newRateMeter(now func() time.Time, window time.Duration) *rateMeter {
 	return &rateMeter{now: now, window: window, opened: now()}
 }
@@ -198,6 +210,9 @@ func (m *rateMeter) sample(now time.Time, floor float64) (s rateSample, ok bool)
 // which is when no write is in progress. Otherwise the writer closes it when
 // its write returns.
 func (m *rateMeter) markCut() (closeNow bool) {
+	if m == nil {
+		return false
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.cut = true
@@ -213,7 +228,10 @@ func later(a, b time.Time) time.Time {
 }
 
 // rateFloor is a listener's floor state: its live connections and when it last
-// cut one. mu guards both.
+// cut one. mu guards both. Lock order: pick holds mu while it takes each
+// meter's mu, and no meter method takes mu, so the order is always rateFloor
+// then rateMeter. A connection is never closed with either held, because its
+// release takes mu (remove).
 type rateFloor struct {
 	floor  float64       // bytes a second; 0 disables the floor
 	window time.Duration // 0 disables the floor
