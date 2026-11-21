@@ -31,6 +31,9 @@ const (
 	// directory.
 	masterName            = "master"
 	masterFingerprintName = "master.sha256"
+	// userScopesName is the name in the entries' directory reserved for user
+	// scopes. Nothing creates it yet.
+	userScopesName = ".user"
 	// masterSize is the master key's size.
 	masterSize = 32
 	// fingerprintFileSize is the fingerprint file's size: hex SHA-256 and a
@@ -134,7 +137,7 @@ func (s *FileStore) readMaster(root *os.Root) (_ []byte, err error) {
 // masters.
 //
 // A master is minted only while the entries' directory holds no name an entry
-// could have, complete or not: with entries and no master, every entry would
+// could have, complete or not, and no userScopesName: with entries and no master, every entry would
 // be unreadable under a new one, so that is ErrMasterMissing, never a repair.
 // Without entries, two states are minted over, because an interrupted first
 // Put leaves them and nothing was sealed under them: no master file, and a
@@ -152,8 +155,10 @@ func (s *FileStore) masterForPut(entries *os.Root) (keys, error) {
 	if rerr != nil {
 		return keys{}, rerr
 	}
+	// The name reserved for user scopes counts whatever its type: records
+	// under it would be unreadable under a new master as well.
 	for _, n := range names {
-		if checkName(n) == nil {
+		if n == userScopesName || checkName(n) == nil {
 			return keys{}, err
 		}
 	}

@@ -85,7 +85,7 @@ func TestAADBindsEveryField(t *testing.T) {
 	}
 	t.Run("scope", func(t *testing.T) {
 		r := sealed
-		if _, err := r.open(testKey, "user/alice"); !errors.Is(err, ErrCorrupt) {
+		if _, err := r.open(testKey, "user/501"); !errors.Is(err, ErrCorrupt) {
 			t.Fatalf("open under another scope: %v, want ErrCorrupt", err)
 		}
 	})
@@ -184,6 +184,13 @@ func TestParseRecordRefusesMalformed(t *testing.T) {
 		{"ciphertext length past the file", ctLen(1)},
 		{"truncated", good[:len(good)-1]},
 		{"trailing byte", append(bytes.Clone(good), 0)},
+		// 0xFE and 0xFD are reserved for user scope and refused until then,
+		// like every kind byte no record carries today.
+		{"reserved kind 0xFE (a wrapped scope key)", kindByte(good, 0xFE)},
+		{"reserved kind 0xFD (a sealed per-user delivery list)", kindByte(good, 0xFD)},
+		{"kind 0", kindByte(good, 0)},
+		{"kind 3", kindByte(good, 3)},
+		{"kind 0xFC", kindByte(good, 0xFC)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -216,6 +223,13 @@ func FuzzParseRecord(f *testing.F) {
 			t.Fatalf("marshal(parse(b)) != b")
 		}
 	})
+}
+
+// kindByte returns a copy of the record file b with its kind byte set to k.
+func kindByte(b []byte, k byte) []byte {
+	b = bytes.Clone(b)
+	b[1] = k
+	return b
 }
 
 func TestCheckName(t *testing.T) {
@@ -325,12 +339,12 @@ func TestDerivedKeysAreSeparate(t *testing.T) {
 func TestDerivedKeysDifferByScope(t *testing.T) {
 	master := bytes.Repeat([]byte{9}, masterSize)
 	sys := mustDeriveKeys(t, master, scopeSystem)
-	alice := mustDeriveKeys(t, master, "user/alice")
-	bob := mustDeriveKeys(t, master, "user/bob")
-	if sys.scope != scopeSystem || alice.scope != "user/alice" {
-		t.Fatalf("keys carry scopes %q and %q", sys.scope, alice.scope)
+	u501 := mustDeriveKeys(t, master, "user/501")
+	u502 := mustDeriveKeys(t, master, "user/502")
+	if sys.scope != scopeSystem || u501.scope != "user/501" {
+		t.Fatalf("keys carry scopes %q and %q", sys.scope, u501.scope)
 	}
-	for _, pair := range [][2]keys{{sys, alice}, {sys, bob}, {alice, bob}} {
+	for _, pair := range [][2]keys{{sys, u501}, {sys, u502}, {u501, u502}} {
 		a, b := pair[0], pair[1]
 		if bytes.Equal(a.seal, b.seal) || bytes.Equal(a.fingerprint, b.fingerprint) || bytes.Equal(a.seal, b.fingerprint) {
 			t.Fatalf("scopes %q and %q share a derived key", a.scope, b.scope)
@@ -347,30 +361,32 @@ func TestCheckScope(t *testing.T) {
 		ok    bool
 	}{
 		{"system", true},
-		{"user/alice", true},
-		{"user/a", true},
+		{"user/501", true},
 		{"user/0", true},
-		{"user/a-b", true},
-		{"user/a--b", true},
-		{"user/" + strings.Repeat("a", maxLabelLen), true},
+		{"user/1", true},
+		{"user/4294967295", true}, // the largest uint32
 		{"", false},
 		{"System", false},
 		{"system/", false},
 		{"system ", false},
 		{"user", false},
 		{"user/", false},
-		{"user//alice", false},
-		{"user/alice/x", false},
-		{"user/Alice", false},
-		{"user/a.b", false},
-		{"user/-a", false},
-		{"user/a-", false},
-		{"user/a_b", false},
-		{"user/a\x00", false},
-		{"user/" + strings.Repeat("a", maxLabelLen+1), false},
-		{"users/alice", false},
-		{"/user/alice", false},
-		{"group/alice", false},
+		{"user/alice", false}, // a short name, which a rename changes
+		{"user/0501", false},  // a leading zero: one uid, one scope string
+		{"user/00", false},
+		{"user/4294967296", false}, // past uint32
+		{"user/99999999999999999999", false},
+		{"user/-1", false},
+		{"user/+1", false},
+		{"user/5 01", false},
+		{"user/501 ", false},
+		{"user/501/x", false},
+		{"user//501", false},
+		{"user/501\x00", false},
+		{"user/\u0665", false}, // a non-ASCII digit
+		{"users/501", false},
+		{"/user/501", false},
+		{"group/501", false},
 	} {
 		err := checkScope(tt.scope)
 		if tt.ok && err != nil {

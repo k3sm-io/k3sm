@@ -136,6 +136,7 @@ The fixed decisions:
         master.next.sha256
     keystore/                           0700, service user, a SIBLING of cred/
       .lock                             0600, the one lock file (see "Concurrency")
+      .user                             reserved for user scopes, not yet created (see "Scope")
       <name>/                           one directory per entry; created by Put with a bare
                                         Mkdir (never MkdirAll), so existence and creation
                                         are one atomic check
@@ -350,10 +351,20 @@ Rewrap, and the verb says so when it finishes.
 
 Every record is sealed under a scope, bound into its associated data and its key labels.
 Phase A writes only `system`, the scope of the node's own store. The grammar is `system`, or
-`user/` followed by a DNS-1123 label; the store refuses any other scope before it seals,
-opens or derives anything. Entry names cannot contain `/`, so the qualified names
-`system/<name>` and `user/<principal>/<name>` are unambiguous: there is no shadowing between
-scopes and no search order. A user scope's store, its own key wrapped by the master, its
+the scope string `user/<uid>`, where `<uid>` is the user's decimal macOS uid: digits only, no
+leading zero unless it is `0`, and fitting in a uint32, so each uid has exactly one scope
+string. It is the uid and never the short name, because renaming a macOS account keeps the
+uid, and a scope bound to the short name would make every record of a renamed user fail to
+open. The store refuses any other scope before it seals, opens or derives anything. Entry
+names cannot contain `/`, so the qualified names `system/<name>` and `user/<uid>/<name>` are
+unambiguous: there is no shadowing between scopes and no search order.
+
+Two kind bytes are reserved for user scope: `0xFE`, a wrapped scope key, and `0xFD`, a sealed
+per-user delivery list. No record carries either yet, and a reader refuses them, like every
+kind byte not in "Record encoding", as `ErrCorrupt`. The entries'-directory name `.user` is
+reserved for user scopes too, and nothing creates it yet. The first-Put mint counts it as an
+entry, whatever its type, so a missing master with only `.user` present is
+`ErrMasterMissing`, never a new master. A user scope's store, its own key wrapped by the master, its
 non-root API, RBAC, delivery and on-disk location are a later design; the scope is in the
 format now so that adding one needs no format change.
 

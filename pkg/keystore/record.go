@@ -28,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 )
 
@@ -45,6 +46,9 @@ const (
 	recordFormat = 1
 	// kindPointer is the kind byte of a current-pointer record. Version
 	// records carry a Kind (1 or 2).
+	// Kind bytes 0xFE (a wrapped scope key) and 0xFD (a sealed per-user
+	// delivery list) are reserved for user scopes. No record carries them yet,
+	// so parseRecord refuses them with every other unknown kind.
 	kindPointer = 0xFF
 	// headerSize is the size of a record's fixed fields: everything but the
 	// name and the ciphertext. See the offset table in the design.
@@ -81,27 +85,43 @@ const (
 const (
 	// scopeSystem is the scope of the node's own store.
 	scopeSystem = "system"
-	// userScopePrefix begins a user scope: "user/" and a DNS-1123 label.
+	// userScopePrefix begins a user scope: "user/" and the user's decimal
+	// macOS uid. The uid, never the short name: an account rename keeps the
+	// uid, and a scope bound to the name would make every record of a renamed
+	// user fail to open.
 	userScopePrefix = "user/"
-	// maxLabelLen bounds a DNS-1123 label.
-	maxLabelLen = 63
 )
 
 // errInvalidScope reports a scope checkScope refuses.
 var errInvalidScope = errors.New("invalid keystore scope")
 
-// checkScope accepts "system", or "user/" followed by a DNS-1123 label (1 to 63
-// lowercase letters, digits and '-', beginning and ending with a letter or
-// digit, as checkName requires of each of a name's labels), and refuses
-// anything else. A scope holds no zero byte, so scopedLabel is unambiguous.
+// checkScope accepts "system", or "user/" followed by a decimal uid: digits
+// only, no leading zero unless it is "0", and fitting in a uint32. It refuses
+// anything else, so each uid has exactly one scope string. A scope holds no
+// zero byte, so scopedLabel is unambiguous.
 func checkScope(scope string) error {
 	if scope == scopeSystem {
 		return nil
 	}
-	if p, ok := strings.CutPrefix(scope, userScopePrefix); ok && len(p) <= maxLabelLen && dnsLabel(p) {
+	if uid, ok := strings.CutPrefix(scope, userScopePrefix); ok && decimalUID(uid) {
 		return nil
 	}
 	return fmt.Errorf("%w: %q", errInvalidScope, scope)
+}
+
+// decimalUID reports whether s is a uint32 in canonical decimal: digits only,
+// and no leading zero unless s is "0".
+func decimalUID(s string) bool {
+	if s == "" || (s[0] == '0' && len(s) > 1) {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	_, err := strconv.ParseUint(s, 10, 32)
+	return err == nil
 }
 
 // record is one sealed file: a version record or the current pointer.
@@ -151,8 +171,10 @@ func (r *record) marshal() []byte {
 	return append(b, r.ciphertext...)
 }
 
-// parseRecord decodes a record file. It is strict: every length must agree
-// with the file's size exactly, and anything else is ErrCorrupt. It does not
+// parseRecord decodes a record file. It is strict: the kind must be one a
+// record carries today (the two Kinds or kindPointer; the reserved 0xFE and
+// 0xFD are refused), every length must agree with the file's size exactly, and
+// anything else is ErrCorrupt. It does not
 // check that the record belongs where it was found; openRecord does.
 func parseRecord(b []byte) (record, error) {
 	var r record
@@ -163,6 +185,11 @@ func parseRecord(b []byte) (record, error) {
 		return r, fmt.Errorf("%w: record format %d, want %d", ErrCorrupt, b[0], recordFormat)
 	}
 	r.kind = b[1]
+	switch r.kind {
+	case byte(KindEd25519), byte(KindOpaque), kindPointer:
+	default:
+		return r, fmt.Errorf("%w: unknown record kind %#02x", ErrCorrupt, r.kind)
+	}
 	n := int(binary.BigEndian.Uint16(b[2:4]))
 	if n == 0 || n > maxNameLen || len(b) < headerSize+n {
 		return r, fmt.Errorf("%w: name length %d", ErrCorrupt, n)

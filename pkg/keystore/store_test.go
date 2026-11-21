@@ -826,13 +826,13 @@ func TestScopeBindsRecords(t *testing.T) {
 	mustPut(t, s, "a", KindOpaque, []byte("a"))
 	// The test-only seam: a second store over the same directories, under a
 	// scope New does not construct.
-	alice := New(Config{Dir: s.dir, MasterDir: s.masterDir, UID: s.uid, GID: s.gid})
-	alice.scope = "user/alice"
-	if _, _, err := alice.Current(ctx, "a"); !errors.Is(err, ErrCorrupt) {
-		t.Fatalf("Current under user/alice: %v, want ErrCorrupt", err)
+	u501 := New(Config{Dir: s.dir, MasterDir: s.masterDir, UID: s.uid, GID: s.gid})
+	u501.scope = "user/501"
+	if _, _, err := u501.Current(ctx, "a"); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("Current under user/501: %v, want ErrCorrupt", err)
 	}
-	if got, err := alice.List(ctx); err != nil || len(got) != 1 || !errors.Is(got[0].Err, ErrCorrupt) {
-		t.Fatalf("List under user/alice = %+v %v, want the entry marked ErrCorrupt", got, err)
+	if got, err := u501.List(ctx); err != nil || len(got) != 1 || !errors.Is(got[0].Err, ErrCorrupt) {
+		t.Fatalf("List under user/501 = %+v %v, want the entry marked ErrCorrupt", got, err)
 	}
 	if _, val, err := s.Current(ctx, "a"); err != nil || string(val) != "a" {
 		t.Fatalf("Current under system = %q %v", val, err)
@@ -845,6 +845,41 @@ func TestScopeBindsRecords(t *testing.T) {
 	}
 	if _, err := os.Lstat(filepath.Join(badServer, "cred")); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("a Put under an invalid scope created cred/: %v", err)
+	}
+}
+
+// TestMintCountsReservedUserName: ".user" in the entries' directory, the name
+// reserved for user scopes, counts as an entry for the first-Put mint guard,
+// whatever its type, so a Put with the master missing returns ErrMasterMissing
+// and mints nothing.
+func TestMintCountsReservedUserName(t *testing.T) {
+	for name, plant := range map[string]func(t *testing.T, p string){
+		"directory": func(t *testing.T, p string) {
+			if err := os.Mkdir(p, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"file": func(t *testing.T, p string) { writeFile(t, p, "") },
+		"symlink": func(t *testing.T, p string) {
+			if err := os.Symlink("nowhere", p); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, server := newTestStore(t)
+			ks := filepath.Join(server, "keystore")
+			if err := os.Mkdir(ks, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			plant(t, filepath.Join(ks, userScopesName))
+			if _, err := s.Put(context.Background(), "a", KindOpaque, []byte("a")); !errors.Is(err, ErrMasterMissing) {
+				t.Fatalf("Put with only %s present: %v, want ErrMasterMissing", userScopesName, err)
+			}
+			if _, err := os.Lstat(filepath.Join(server, "cred", "keystore-master", masterName)); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("the Put minted a master: %v", err)
+			}
+		})
 	}
 }
 
