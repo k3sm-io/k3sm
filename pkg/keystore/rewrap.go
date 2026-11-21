@@ -219,7 +219,12 @@ func (s *FileStore) rewrap(ctx context.Context, newMaster []byte, p *rewrapProgr
 	if err := refuseUserScopes(root); err != nil {
 		return fmt.Errorf("records were re-sealed under %s, but the master was not swapped: %w", masterNextName, err)
 	}
-	if err := s.swapMaster(mroot, next); err != nil {
+	if swapped, err := s.swapMaster(mroot, next); err != nil {
+		// A resumed rewrap whose swap went through and then failed (its last
+		// sync or step) is complete under the earlier key.
+		if swapped && p.resuming {
+			return fmt.Errorf("%w (%w)", err, ErrRewrapSwapUnsynced)
+		}
 		return err
 	}
 	if resuming {
@@ -808,36 +813,41 @@ func (s *FileStore) commitNew(ctx context.Context, root *os.Root, fl floor, plan
 // so the key the records were sealed under is the one that becomes the
 // master; otherwise it stops with ErrMasterUntrusted before the fingerprint
 // rename.
-func (s *FileStore) swapMaster(mroot *os.Root, next keys) error {
+// It reports swapped once the second rename is made, with or without an
+// error after it.
+func (s *FileStore) swapMaster(mroot *os.Root, next keys) (swapped bool, err error) {
 	raw, err := s.readNext(mroot)
 	if err != nil {
-		return err
+		return false, err
 	}
 	k, err := deriveKeys(raw, s.scope)
 	clear(raw)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if !hmac.Equal(k.seal, next.seal) {
-		return fmt.Errorf("%w: %s changed during the rewrap", ErrMasterUntrusted, masterNextName)
+		return false, fmt.Errorf("%w: %s changed during the rewrap", ErrMasterUntrusted, masterNextName)
 	}
 	for _, r := range [][2]string{{masterNextName, masterName}, {masterNextFingerprintName, masterFingerprintName}} {
 		if err := mroot.Rename(r[0], r[1]); err != nil {
-			return err
+			return false, err
 		}
+		// After the second rename the swap is complete: a later error is
+		// reported with swapped set.
+		swapped = r[1] == masterFingerprintName
 		if err := syncDir(mroot); err != nil {
-			return err
+			return swapped, err
 		}
 		if r[1] == masterName {
 			if err := s.checkMasterIs(mroot, next); err != nil {
-				return err
+				return false, err
 			}
 		}
 		if err := s.step("rename " + r[0]); err != nil {
-			return err
+			return swapped, err
 		}
 	}
-	return nil
+	return true, nil
 }
 
 // checkMasterIs refuses, as ErrMasterUntrusted, a master file that is not the

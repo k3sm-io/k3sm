@@ -1329,29 +1329,41 @@ func TestKeysRewrapKeyOutDeletesThroughCheckedDir(t *testing.T) {
 	})
 }
 
-// keysSwapUnsyncedStore forces the resume failure finishSwap reports after
-// its rename (pkg/keystore's TestRewrapResumeFailed stages the real one).
-type keysSwapUnsyncedStore struct{ keysStore }
-
-func (keysSwapUnsyncedStore) Rewrap(context.Context, []byte) error {
-	return fmt.Errorf("rewrap: injected sync failure (%w) (%w)", keystore.ErrRewrapSwapUnsynced, keystore.ErrRewrapResumeFailed)
+// keysSwapUnsyncedStore forces a resume failure after the earlier rewrap's
+// master swap went through, in the shape the store returns it (err);
+// pkg/keystore's TestRewrapResumeFailed stages the real ones.
+type keysSwapUnsyncedStore struct {
+	keysStore
+	err error
 }
 
+func (s keysSwapUnsyncedStore) Rewrap(context.Context, []byte) error { return s.err }
+
 // TestKeysRewrapSwapUnsynced: when the failed resume is the earlier
-// rewrap's master swap, renamed through but not synced, rewrap says to run
-// a new rewrap, not to finish with --key-in, and deletes its unused file.
+// rewrap's master swap, renamed through but not synced, whether finishSwap
+// (a swap half done before this run) or the resumed plan's own swapMaster
+// failed, rewrap says to run a new rewrap, not to finish with --key-in, and
+// deletes its unused file.
 func TestKeysRewrapSwapUnsynced(t *testing.T) {
-	h := newKeysHarness(t)
-	h.put("system/a", []byte("a-value"))
-	h.wrap = func(s keysStore) keysStore { return keysSwapUnsyncedStore{s} }
-	p := filepath.Join(t.TempDir(), "new-master")
-	h.mustRun(1, "rewrap", "--key-out", p)
-	want := "the earlier rewrap's master swap completed but did not sync; run sudo k3sm keys rewrap --key-out FILE again"
-	if !strings.Contains(h.stderr.String(), want) || strings.Contains(h.stderr.String(), "--key-in") {
-		t.Errorf("stderr %q does not say %q, or offers --key-in", h.stderr.String(), want)
-	}
-	if _, err := os.Lstat(p); !errors.Is(err, fs.ErrNotExist) {
-		t.Errorf("the unused key file is kept: %v", err)
+	for name, err := range map[string]error{
+		"finishSwap": fmt.Errorf("rewrap: injected sync failure (%w) (%w)", keystore.ErrRewrapSwapUnsynced, keystore.ErrRewrapResumeFailed),
+		"swapMaster on a resumed plan": fmt.Errorf("rewrap: injected crash at rename master.next.sha256 (%w) (%w)",
+			keystore.ErrRewrapSwapUnsynced, keystore.ErrRewrapResumeFailed),
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newKeysHarness(t)
+			h.put("system/a", []byte("a-value"))
+			h.wrap = func(s keysStore) keysStore { return keysSwapUnsyncedStore{keysStore: s, err: err} }
+			p := filepath.Join(t.TempDir(), "new-master")
+			h.mustRun(1, "rewrap", "--key-out", p)
+			want := "the earlier rewrap's master swap completed but did not sync; run sudo k3sm keys rewrap --key-out FILE again"
+			if !strings.Contains(h.stderr.String(), want) || strings.Contains(h.stderr.String(), "--key-in") {
+				t.Errorf("stderr %q does not say %q, or offers --key-in", h.stderr.String(), want)
+			}
+			if _, err := os.Lstat(p); !errors.Is(err, fs.ErrNotExist) {
+				t.Errorf("the unused key file is kept: %v", err)
+			}
+		})
 	}
 }
 

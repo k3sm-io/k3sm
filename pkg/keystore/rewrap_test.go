@@ -1287,6 +1287,7 @@ func TestRewrapResumeFailed(t *testing.T) {
 		{"rename a/v1", "rename a/current"},
 		{"rename a/v1", "rename b/v2"},
 		{"rename a/v1", "rename " + masterNextName},
+		{"rename a/v1", "rename " + masterNextFingerprintName},
 		// The master swap is half done; the resume fails as it moves it on.
 		{"rename " + masterNextName, "rename " + masterNextFingerprintName},
 	} {
