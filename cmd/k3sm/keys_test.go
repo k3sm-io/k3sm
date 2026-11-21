@@ -35,6 +35,7 @@ import (
 	"syscall"
 	"testing"
 	"testing/iotest"
+	"time"
 
 	"k3sm.io/k3sm/pkg/keystore"
 )
@@ -1299,6 +1300,77 @@ func TestKeysRewrapKeyInRecoveryOnly(t *testing.T) {
 			t.Fatalf("after rewrap the entry holds %q", got)
 		}
 	})
+}
+
+// TestKeysReadKeyInRefusals: --key-in reads only a regular file of this
+// user's (root's), reached without following a symlink and without waiting
+// on a FIFO; each refusal says why, and the verb never reaches Rewrap.
+func TestKeysReadKeyInRefusals(t *testing.T) {
+	key := bytes.Repeat([]byte{0x3c}, 32)
+	for name, tc := range map[string]struct {
+		make func(t *testing.T, p string)
+		say  string
+	}{
+		"symlink": {func(t *testing.T, p string) {
+			if err := os.Symlink(writeKeyFile(t, key), p); err != nil {
+				t.Fatal(err)
+			}
+		}, "open the key file"},
+		"fifo": {func(t *testing.T, p string) {
+			if err := syscall.Mkfifo(p, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}, "not a regular file"},
+		"directory": {func(t *testing.T, p string) {
+			if err := os.Mkdir(p, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}, "not a regular file"},
+		"file another user owns": {func(t *testing.T, p string) {
+			// Only root can make a file another user owns; the root run of
+			// this binary covers it.
+			if !keysAsRoot() {
+				t.Skip("needs root to give the file to another user")
+			}
+			if err := os.WriteFile(p, key, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			keysGiveToService(t, p)
+		}, "not owned by this user"},
+	} {
+		t.Run("refuses a "+name, func(t *testing.T) {
+			p := filepath.Join(t.TempDir(), "saved")
+			tc.make(t, p)
+			// A blocking open of a FIFO with no writer never returns: the read
+			// runs aside, bounded, and a writer is opened to release it.
+			done := make(chan error, 1)
+			go func() {
+				b, err := readKeyIn(p)
+				clear(b)
+				done <- err
+			}()
+			var err error
+			select {
+			case err = <-done:
+			case <-time.After(10 * time.Second):
+				if w, werr := os.OpenFile(p, os.O_WRONLY|syscall.O_NONBLOCK, 0); werr == nil {
+					_ = w.Close() // only releases the blocked open
+				}
+				<-done
+				t.Fatal("readKeyIn blocked opening the key file")
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.say) {
+				t.Fatalf("readKeyIn = %v, want a refusal saying %q", err, tc.say)
+			}
+			h := newKeysHarness(t)
+			h.put("system/a", []byte("a-value"))
+			h.calls = nil
+			h.mustRun(1, "rewrap", "--key-in", p)
+			if slices.Contains(h.calls, "Rewrap") {
+				t.Fatal("rewrap ran with a refused key file")
+			}
+		})
+	}
 }
 
 // failReaderRand fails the test if the verb draws randomness.

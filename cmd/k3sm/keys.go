@@ -821,9 +821,10 @@ func checkKeyOutDir(root *os.Root, dir string) error {
 
 // readKeyIn reads a key saved by an earlier --key-out: a regular file, not a
 // symlink, owned by this process's user and closed to group and others,
-// holding exactly the master's 32 bytes.
+// holding exactly the master's 32 bytes. It opens non-blocking, as
+// openValueFile does, so a FIFO is refused rather than waited on.
 func readKeyIn(path string) ([]byte, error) {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, fmt.Errorf("open the key file: %w", err)
 	}
