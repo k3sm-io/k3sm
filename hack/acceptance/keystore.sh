@@ -209,7 +209,7 @@ check G15 "files a root verb writes are the service user's, at the layout's mode
 	TestOwnership TestCredSymlinkRefused TestRefusesSymlinks TestMkdirRefusesSwappedDirectory \
 	TestCreateEntryRefusesSwappedDirectory TestConfigRefused
 check G16 "List marks an unreadable entry with Err, and Delete still removes it; an entry directory with no current is an interrupted put only in the shape a crashed Put leaves and with its generation not in the floor, and Delete removes it too; list exits 1 on a corrupt entry" \
-	cmd:TestKeysListCorruptExitsOne TestListMarksCorruptEntry TestDeleteCorruptEntry TestEntryWithNoPointer TestCommittedBeforeDecodesGeneration \
+	cmd:TestKeysListCorruptExitsOne cmd:TestKeysRmCorruptEntry TestListMarksCorruptEntry TestDeleteCorruptEntry TestEntryWithNoPointer TestCommittedBeforeDecodesGeneration \
 	TestDeletePlantedNonDirectory TestDeleteDirectoryAtCurrent TestPointerVersionBound TestPutCrashAtEveryStep \
 	TestMkdirSyncsParent
 check G17 "show prints a value only with --reveal, byte-exact for an opaque value and 32- and 64-byte Ed25519 values; no verb takes a value as an argument" \

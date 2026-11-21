@@ -355,6 +355,57 @@ func TestKeysListCorruptExitsOne(t *testing.T) {
 	h.mustRun(2, "list", "-o", "yaml")
 }
 
+// keysFloorEntries returns the names the floor records, read from the file.
+func (h *keysHarness) keysFloorEntries() map[string]json.RawMessage {
+	h.t.Helper()
+	b, err := os.ReadFile(filepath.Join(filepath.Dir(h.work), "keystore-floor.json"))
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	var doc struct {
+		Entries map[string]json.RawMessage `json:"entries"`
+	}
+	if err := json.Unmarshal(b, &doc); err != nil {
+		h.t.Fatalf("the floor: %v\n%s", err, b)
+	}
+	return doc.Entries
+}
+
+// TestKeysRmCorruptEntry is G16's rm half through the CLI: an entry list
+// reports corrupt is removed by rm, with its floor entry, and the healthy
+// entry beside it is untouched.
+func TestKeysRmCorruptEntry(t *testing.T) {
+	h := newKeysHarness(t)
+	h.put("system/alpha", []byte("a"))
+	h.put("system/beta", []byte("b"))
+	if _, ok := h.keysFloorEntries()["beta"]; !ok {
+		t.Fatalf("the floor does not record beta: %v", h.keysFloorEntries())
+	}
+	h.damageRecord("beta", "current")
+	h.mustRun(1, "list")
+	if !strings.Contains(h.stdout.String(), "system/beta") || !strings.Contains(h.stdout.String(), "corrupt: ") {
+		t.Fatalf("list does not report beta corrupt:\n%s", h.stdout.String())
+	}
+	h.mustRun(0, "rm", "system/beta", "--yes")
+	if _, err := os.Lstat(filepath.Join(h.keystoreDir(), "beta")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the corrupt entry's directory after rm: %v", err)
+	}
+	floor := h.keysFloorEntries()
+	if _, ok := floor["beta"]; ok {
+		t.Fatalf("the floor still records beta after rm: %v", floor)
+	}
+	if _, ok := floor["alpha"]; !ok {
+		t.Fatalf("rm took alpha's floor entry: %v", floor)
+	}
+	h.mustRun(0, "list")
+	if strings.Contains(h.stdout.String(), "system/beta") || !strings.Contains(h.stdout.String(), "system/alpha") {
+		t.Fatalf("list after rm:\n%s", h.stdout.String())
+	}
+	if got := h.value("alpha", 1); string(got) != "a" {
+		t.Fatalf("alpha = %q", got)
+	}
+}
+
 func TestKeysShowRevealByteExact(t *testing.T) {
 	seed := bytes.Repeat([]byte{0x00, 0x0a, 0xff, 0x20}, 8)
 	for _, tc := range []struct {
