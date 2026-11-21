@@ -314,7 +314,8 @@ var scrubTokens = []string{"<work-dir>", "<master-dir>", "<data-root>"}
 // DataRoot (<data-root>). The store's errors name the paths it opened, all
 // under --work-dir, which may be a value typed in the wrong place. Longer
 // paths are replaced first, so a path inside another keeps its own token;
-// "/" is never replaced.
+// a root is replaced only at a path boundary (replaceAtPathBoundary); "/" is
+// never replaced.
 func scrubPaths(err error, roots ...string) string {
 	msg := err.Error()
 	type sub struct{ from, to string }
@@ -333,9 +334,39 @@ func scrubPaths(err error, roots ...string) string {
 	}
 	slices.SortStableFunc(subs, func(a, b sub) int { return len(b.from) - len(a.from) })
 	for _, x := range subs {
-		msg = strings.ReplaceAll(msg, x.from, x.to)
+		msg = replaceAtPathBoundary(msg, x.from, x.to)
 	}
 	return msg
+}
+
+// replaceAtPathBoundary replaces each from in msg that ends at a path
+// boundary: followed by '/', the end, or a character no path component
+// here holds. So a root /a/server is replaced in /a/server/x and in
+// "/a/server: ...", but not in /a/server2/x, a different path.
+func replaceAtPathBoundary(msg, from, to string) string {
+	var b strings.Builder
+	for {
+		i := strings.Index(msg, from)
+		if i < 0 {
+			b.WriteString(msg)
+			return b.String()
+		}
+		end := i + len(from)
+		if end == len(msg) || !pathByte(msg[end]) {
+			b.WriteString(msg[:i])
+			b.WriteString(to)
+		} else {
+			b.WriteString(msg[:end])
+		}
+		msg = msg[end:]
+	}
+}
+
+// pathByte reports whether c may continue a path component: a letter, a
+// digit, or one of ._-~+@, the characters file names here use; '/' ends a
+// component and so is a boundary.
+func pathByte(c byte) bool {
+	return 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9' || strings.IndexByte("._-~+@", c) >= 0
 }
 
 // errUserScope refuses a user/... name: the grammar exists, this build does

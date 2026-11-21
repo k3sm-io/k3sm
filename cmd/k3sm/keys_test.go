@@ -759,7 +759,7 @@ func TestKeysRefusals(t *testing.T) {
 
 // TestKeysScrubPaths: scrubPaths replaces each root, its /private form and
 // its resolved form with the root's token, a path inside another root with
-// its own, and never "/".
+// its own, only at a path boundary, and never "/".
 func TestKeysScrubPaths(t *testing.T) {
 	work := "/Hunter2/server"
 	master := work + "/cred/keystore-master"
@@ -769,6 +769,29 @@ func TestKeysScrubPaths(t *testing.T) {
 	want := "open <master-dir>/master: x; open <work-dir>/keystore/a: y; open <data-root>/keystore-floor.json: z; open /etc/hosts"
 	if got != want {
 		t.Fatalf("scrubPaths = %q, want %q", got, want)
+	}
+	for in, want := range map[string]string{
+		"open /var/lib/k3sm/server2/x":      "open /var/lib/k3sm/server2/x",
+		"open /var/lib/k3sm/server/x":       "open <work-dir>/x",
+		"open /var/lib/k3sm/server: denied": "open <work-dir>: denied",
+		"stat /var/lib/k3sm/server":         "stat <work-dir>",
+		`"/var/lib/k3sm/server"`:            `"<work-dir>"`,
+		"open /var/lib/k3sm/server.old/x":   "open /var/lib/k3sm/server.old/x",
+	} {
+		// The work dir alone: a sibling that shares its prefix is another path.
+		if got := scrubPaths(errors.New(in), "/var/lib/k3sm/server"); got != want {
+			t.Errorf("scrubPaths(%q) = %q, want %q", in, got, want)
+		}
+	}
+	for in, want := range map[string]string{
+		// The data root is a real parent of the sibling, so it is replaced.
+		"open /var/lib/k3sm/server2/x":        "open <data-root>/server2/x",
+		"open /var/lib/k3sm/keystore-floor.x": "open <data-root>/keystore-floor.x",
+		"open /var/lib/k3sm2/x":               "open /var/lib/k3sm2/x",
+	} {
+		if got := scrubPaths(errors.New(in), "/var/lib/k3sm/server", "/var/lib/k3sm/server/cred/keystore-master", "/var/lib/k3sm"); got != want {
+			t.Errorf("scrubPaths(%q) = %q, want %q", in, got, want)
+		}
 	}
 	if got := scrubPaths(errors.New("open /a/b"), "/a", "/a/m", "/"); got != "open <work-dir>/b" {
 		t.Fatalf("scrubPaths with a / data root = %q", got)
