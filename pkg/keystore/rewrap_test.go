@@ -1261,6 +1261,73 @@ func TestRewrapNotStarted(t *testing.T) {
 	}
 }
 
+// TestRewrapResumeFailed: a Rewrap that is completing an earlier rewrap
+// under that rewrap's key (one interrupted at rename a/v1, or between the
+// master renames), and fails once it has advanced it, matches
+// ErrRewrapResumeFailed and never ErrRewrapNotStarted, at each step of the
+// resume: the records it renamed in, and a half-done master swap it moved,
+// are the earlier key's, which a rerun with that key's file finishes.
+func TestRewrapResumeFailed(t *testing.T) {
+	ctx := context.Background()
+	// interrupted leaves a Rewrap to key 1 crashed at step at.
+	interrupted := func(t *testing.T, at string) (*FileStore, string) {
+		t.Helper()
+		s, server := newTestStore(t)
+		seedRewrap(t, s)
+		s.step = failAt(at)
+		if err := s.Rewrap(ctx, rewrapKey(1)); err == nil {
+			t.Fatal("Rewrap succeeded through a crash")
+		}
+		s.step = func(string) error { return nil }
+		return s, server
+	}
+	for _, tc := range []struct{ first, resume string }{
+		// a/v1 is live under key 1; the resume fails at its own steps.
+		{"rename a/v1", "write v1.new"},
+		{"rename a/v1", "rename a/current"},
+		{"rename a/v1", "rename b/v2"},
+		{"rename a/v1", "rename " + masterNextName},
+		// The master swap is half done; the resume fails as it moves it on.
+		{"rename " + masterNextName, "rename " + masterNextFingerprintName},
+	} {
+		t.Run(tc.first+" then "+tc.resume, func(t *testing.T) {
+			s, server := interrupted(t, tc.first)
+			var steps []string
+			s.step = func(name string) error {
+				steps = append(steps, name)
+				if name == tc.resume {
+					return fmt.Errorf("injected crash at %s", name)
+				}
+				return nil
+			}
+			err := s.Rewrap(ctx, rewrapKey(2))
+			if err == nil || !strings.Contains(err.Error(), "injected crash at "+tc.resume) {
+				t.Fatalf("the resume did not fail at %s (steps %v): %v", tc.resume, steps, err)
+			}
+			if !errors.Is(err, ErrRewrapResumeFailed) || errors.Is(err, ErrRewrapNotStarted) {
+				t.Fatalf("Rewrap failing a resume at %s = %v, want ErrRewrapResumeFailed and not ErrRewrapNotStarted", tc.resume, err)
+			}
+			// The earlier key finishes it: a rerun with it completes the
+			// rewrap, or, when the failed step came after the last rename,
+			// finds that key already live.
+			s.step = func(string) error { return nil }
+			if err := s.Rewrap(ctx, rewrapKey(1)); err != nil && !errors.Is(err, ErrRewrapNotStarted) {
+				t.Fatalf("Rewrap with the earlier key after the failed resume: %v", err)
+			}
+			checkMasterIs(t, server, rewrapKey(1))
+			checkUnderKey(t, server, rewrapKey(1))
+		})
+	}
+	t.Run("a resume with the caller's own key is not another key's", func(t *testing.T) {
+		s, _ := interrupted(t, "rename a/v1")
+		s.step = failAt("rename b/v1")
+		err := s.Rewrap(ctx, rewrapKey(1))
+		if err == nil || errors.Is(err, ErrRewrapResumeFailed) || errors.Is(err, ErrRewrapNotStarted) {
+			t.Fatalf("Rewrap resuming its own key, failing = %v, want neither marker", err)
+		}
+	})
+}
+
 // TestRecordsSealedUnder: RecordsSealedUnder reports a key that some
 // committed record opens under, beside the live master, which is how a
 // Rewrap whose master.next was replaced or removed is recognised, and

@@ -1069,6 +1069,38 @@ func TestKeysRewrapKeyOutFile(t *testing.T) {
 	})
 }
 
+// keysResumeFailedStore forces keystore.ErrRewrapResumeFailed from Rewrap:
+// the real store returns it only when a resume of an earlier rewrap fails
+// partway, a crash no seam outside pkg/keystore can stage (pkg/keystore's
+// TestRewrapResumeFailed covers the store's side).
+type keysResumeFailedStore struct{ keysStore }
+
+func (keysResumeFailedStore) Rewrap(context.Context, []byte) error {
+	return fmt.Errorf("rewrap: injected crash at rename a/current (%w)", keystore.ErrRewrapResumeFailed)
+}
+
+// TestKeysRewrapResumeFailedKeepsKeyFile: a rewrap that fails while it
+// completes an earlier interrupted rewrap keeps this run's --key-out file,
+// sends the operator to the earlier rewrap's key file, and never says
+// nothing was changed.
+func TestKeysRewrapResumeFailedKeepsKeyFile(t *testing.T) {
+	h := newKeysHarness(t)
+	h.put("system/a", []byte("a-value"))
+	h.wrap = func(s keysStore) keysStore { return keysResumeFailedStore{s} }
+	p := filepath.Join(t.TempDir(), "new-master")
+	h.mustRun(1, "rewrap", "--key-out", p)
+	want := "an earlier interrupted rewrap was advanced and did not finish; keep the earlier rewrap's key file; finish with: sudo k3sm keys rewrap --key-in <that earlier file>"
+	if !strings.Contains(h.stderr.String(), want) {
+		t.Errorf("stderr %q does not say %q", h.stderr.String(), want)
+	}
+	if strings.Contains(h.stderr.String(), "nothing was changed") {
+		t.Errorf("stderr %q says nothing was changed", h.stderr.String())
+	}
+	if got, err := os.ReadFile(p); err != nil || len(got) != 32 {
+		t.Fatalf("this run's key file after a failed resume: %x, %v; want it kept", got, err)
+	}
+}
+
 // keysHalfRewrapStore stands in for a rewrap interrupted after it renamed
 // some records in, whose master.next was then replaced or removed, the
 // scenario of pkg/keystore's TestRewrapRecoversReplacedNext. Its Rewrap runs

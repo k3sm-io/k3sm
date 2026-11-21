@@ -71,10 +71,18 @@ const newSuffix = ".new"
 // plan refused because an entry does not open, as well as ErrRewrapResumed
 // (the run completed another key). An error after that write never matches
 // it, whatever its cause.
+//
+// An error while it completes an earlier rewrap under that rewrap's key,
+// once it has advanced it (a record renamed in, or the master swap moved),
+// matches ErrRewrapResumeFailed instead, and never ErrRewrapNotStarted: the
+// earlier key, not newMaster, finishes it.
 func (s *FileStore) Rewrap(ctx context.Context, newMaster []byte) error {
-	started := false
-	if err := s.rewrap(ctx, newMaster, &started); err != nil {
-		if !started {
+	var p rewrapProgress
+	if err := s.rewrap(ctx, newMaster, &p); err != nil {
+		switch {
+		case p.resuming && !errors.Is(err, ErrRewrapResumed):
+			return fmt.Errorf("rewrap: %w (%w)", err, ErrRewrapResumeFailed)
+		case !p.started:
 			return fmt.Errorf("rewrap: %w (%w)", err, ErrRewrapNotStarted)
 		}
 		return fmt.Errorf("rewrap: %w", err)
@@ -82,9 +90,21 @@ func (s *FileStore) Rewrap(ctx context.Context, newMaster []byte) error {
 	return nil
 }
 
-// rewrap is Rewrap. It sets *started just before it first writes master.next
-// from newMaster.
-func (s *FileStore) rewrap(ctx context.Context, newMaster []byte, started *bool) error {
+// rewrapProgress is how far a Rewrap got, which decides the marker its error
+// carries.
+type rewrapProgress struct {
+	// started is set just before Rewrap first writes master.next from the key
+	// it was given, or resumes a rewrap under that same key.
+	started bool
+	// resuming is set once Rewrap is completing an earlier rewrap under
+	// another key: from the plan that resumes it, or from a half-done master
+	// swap it moved on.
+	resuming bool
+}
+
+// rewrap is Rewrap. It records its progress in p.
+func (s *FileStore) rewrap(ctx context.Context, newMaster []byte, p *rewrapProgress) error {
+	started := &p.started
 	if err := s.checkConfig(); err != nil {
 		return err
 	}
@@ -135,6 +155,8 @@ func (s *FileStore) rewrap(ctx context.Context, newMaster []byte, started *bool)
 	// run completes it, and with it the interrupted Rewrap, and says so.
 	done, err := s.finishSwap(mroot)
 	if err != nil {
+		// done with an error: the swap moved, then its sync or step failed.
+		p.resuming = done
 		return err
 	}
 	k, err := s.loadMaster()
@@ -172,6 +194,15 @@ func (s *FileStore) rewrap(ctx context.Context, newMaster []byte, started *bool)
 		return err
 	}
 	defer next.wipe()
+	if resuming {
+		// A master.next of newMaster's own is this caller's rewrap, resumed
+		// with its key; any other is an earlier rewrap's.
+		if resumed(next, newMaster) == nil {
+			*started = true
+		} else {
+			p.resuming = true
+		}
+	}
 	if err := s.sealNew(ctx, root, fl, plan, old, next); err != nil {
 		return err
 	}

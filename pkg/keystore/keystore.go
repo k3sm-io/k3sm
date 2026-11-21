@@ -189,4 +189,11 @@ var (
 	// may discard it; after any other Rewrap error the key may be needed to
 	// finish.
 	ErrRewrapNotStarted = errors.New("nothing was sealed under the new master key")
+	// ErrRewrapResumeFailed marks an error Rewrap returned while it was
+	// completing an earlier, interrupted rewrap under that rewrap's key, after
+	// it had advanced it: records may have moved under that key, or its
+	// master swap progressed. It never matches ErrRewrapNotStarted, though
+	// nothing was sealed under the key supplied: the earlier rewrap's key is
+	// what finishes it, and the caller keeps every key file it holds.
+	ErrRewrapResumeFailed = errors.New("an earlier interrupted rewrap was advanced and did not finish")
 )

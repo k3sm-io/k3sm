@@ -886,13 +886,26 @@ func keysRewrap(ctx context.Context, args []string, env keysEnv) int {
 	return v.failf(code, "%v%s\n%s", err, next, keyFileAfterFailure(err, keyPath, *keyOut != "", resumed))
 }
 
+// keysResumeFailed is what rewrap says after keystore.ErrRewrapResumeFailed:
+// the run was completing an earlier rewrap under that rewrap's key and
+// failed partway, so the earlier key file finishes it.
+const keysResumeFailed = "an earlier interrupted rewrap was advanced and did not finish; keep the earlier rewrap's key file; finish with: sudo k3sm keys rewrap --key-in <that earlier file>"
+
 // keyFileAfterFailure decides, after a rewrap that did not succeed, what
 // becomes of the key file, and says so. A file this run wrote (--key-out) is
 // deleted only when the error is keystore.ErrRewrapNotStarted, which the
 // store returns only before it writes anything under the key; after any
-// other error a resume may need the file, so it is kept. A --key-in file is
-// the operator's and is never deleted.
+// other error a resume may need the file, so it is kept. After
+// keystore.ErrRewrapResumeFailed the file is kept too, and the operator is
+// sent to the earlier rewrap's key file. A --key-in file is the operator's
+// and is never deleted.
 func keyFileAfterFailure(err error, keyPath string, wrote, resumed bool) string {
+	if errors.Is(err, keystore.ErrRewrapResumeFailed) {
+		if wrote {
+			return fmt.Sprintf("%s\nthis run's key file %s was kept", keysResumeFailed, keyPath)
+		}
+		return keysResumeFailed
+	}
 	if !wrote || !errors.Is(err, keystore.ErrRewrapNotStarted) {
 		return fmt.Sprintf("keep %s: a resume may need this file; finish with the same key: sudo k3sm keys rewrap --key-in %s", keyPath, keyPath)
 	}

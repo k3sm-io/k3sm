@@ -217,7 +217,7 @@ func matchFingerprint(root *os.Root, fpName string, key []byte) error {
 // finishSwap completes the master swap a Rewrap that crashed between its two
 // renames leaves: with no master.next, a master.next.sha256 that the master
 // matches is renamed over master.sha256, and the directory fsynced. It reports
-// whether it did. Any other state is left as it is: a master that does not
+// whether it did, and with an error, whether the rename was made. Any other state is left as it is: a master that does not
 // read is loadMaster's to report, and a master.next.sha256 the master does not
 // match is Rewrap's to judge. The caller holds the exclusive lock; a reader
 // only trusts such a master (readMaster) and writes nothing.
@@ -242,8 +242,9 @@ func (s *FileStore) finishSwap(root *os.Root) (bool, error) {
 	if err := root.Rename(masterNextFingerprintName, masterFingerprintName); err != nil {
 		return false, err
 	}
+	// From here the swap has moved: an error is reported with done set.
 	if err := syncDir(root); err != nil {
-		return false, err
+		return true, err
 	}
 	return true, s.step("rename " + masterNextFingerprintName)
 }
