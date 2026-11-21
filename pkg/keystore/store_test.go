@@ -806,7 +806,11 @@ func TestLockExcludes(t *testing.T) {
 			_, val, err := s.Current(ctx, "a")
 			readDone <- read{val, err}
 		}()
-		time.Sleep(s.lockWait / 2) // bubble time: the reader retries throughout
+		// Half the lock bound passes in bubble time, so the reader retries
+		// throughout it; synctest.Wait then returns once the reader is durably
+		// blocked in its next retry wait, and it must not have run.
+		held := time.NewTimer(s.lockWait / 2)
+		<-held.C
 		synctest.Wait()
 		select {
 		case r := <-readDone:
