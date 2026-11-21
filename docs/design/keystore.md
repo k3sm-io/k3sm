@@ -1358,40 +1358,84 @@ it may change and that a conversion is owed if it does.
 **Shape.**
 
 - `metadata.name` is free.
-- `spec.secretName` (required, the target Secret), `spec.entry` (scope-qualified, the entry
-  pattern above), `spec.dataKey` (default `value`) and `spec.requestedBy` (stamped) are all
-  immutable through CRD CEL transition rules (`self == oldSelf`), so the CRD is safe without
-  the admission policy (U18).
+- `spec.entry` (scope-qualified, the entry pattern above), `spec.secretName` (the target
+  Secret), `spec.dataKey` and `spec.requestedBy` are all required in the schema, except
+  `dataKey`, which defaults to `value`. `requestedBy` also carries the pattern
+  `^k3sm:local:[1-9][0-9]{0,9}$`. All four are immutable through CRD CEL transition rules
+  (`self == oldSelf`), so the CRD is safe without the admission policy (U18). They are
+  required or defaulted because a CEL transition rule does not run when the old value is
+  absent: an optional field left out at create could be set later, by an update, to any value,
+  and the immutability rule would never run. A field present from the first write is covered
+  for the object's whole life.
+- A CRD CEL cross-field rule on `spec` ties the requester to the entry's owner. For a user
+  entry, `requestedBy` must be `k3sm:local:` followed by the entry's uid:
+
+  ```
+  !self.entry.startsWith('user/') || self.requestedBy == 'k3sm:local:' + self.entry.split('/')[1]
+  ```
+
 - The status subresource is on: `observedGeneration`, `conditions` (`Authorized`, `Ready`) as
   the source of truth, and `deliveredVersion`; no value and no fingerprint of an opaque value.
-- Condition reasons are a closed set listed in the schema description: `Delivered`,
-  `EntryUnavailable`, `NotRecorded`, `NotAuthorized`, `SecretExists`, `SecretClaimed`,
-  `EncryptionOff`, `UserScopeOff`. "No such entry" and "not yours" share one reason,
-  `EntryUnavailable`, so status reveals nothing about existence; `NotRecorded` is reported
-  only after the entry's owner has matched `requestedBy`. `SecretExists` covers an unlabelled
-  Secret already holding the target name; `SecretClaimed` covers a second KeyDelivery naming a
-  Secret another one already owns: one declaration per target Secret, and the oldest object by
-  `creationTimestamp`, then name, wins (U43).
+  `conditions` is `listType=map` keyed by `type`, so each condition type appears once.
+- Condition reasons are a closed set listed in the schema description. "No such entry" and
+  "not yours" share one reason, `EntryUnavailable`, so status reveals nothing about existence;
+  `NotRecorded` is reported only after the entry's owner has matched `requestedBy`.
+  `SecretExists` covers an unlabelled Secret already holding the target name; `SecretClaimed`
+  covers a second KeyDelivery naming a Secret another one already owns: one declaration per
+  target Secret, and the oldest object by `creationTimestamp`, then name, wins (U43). Each
+  reason belongs to one condition type:
 
-**Admission is a shape check only.** A `ValidatingAdmissionPolicy` in `pkg/policy`, the shape
-of the existing ones, adds only what CRD CEL cannot see: on create, `spec.requestedBy ==
-request.userInfo.username`, and a requester under `system:serviceaccount:` is refused (U40,
-E13). That `request.userInfo.username` reports the impersonated user under impersonation is
-not yet checked; U40 and E3 check it. **Neither admission layer is the authority.** The
-authority is the sealed delivery record plus the reconciler-time SubjectAccessReviews below;
-`requestedBy` is informational.
+  | reason | condition | status | when |
+  |---|---|---|---|
+  | `Authorized` | `Authorized` | `True` | every check below passes |
+  | `EntryUnavailable` | `Authorized` | `False` | check 1 fails |
+  | `NotRecorded` | `Authorized` | `False` | check 2 fails |
+  | `NotAuthorized` | `Authorized` | `False` | a SubjectAccessReview in check 3 returns denied |
+  | `Indeterminate` | `Authorized` | `Unknown` | an error, not a denial ("A denial deletes; an error does not") |
+  | `Delivered` | `Ready` | `True` | the Secret holds the entry's current version |
+  | `SecretExists` | `Ready` | `False` | an unlabelled Secret holds the target name |
+  | `SecretClaimed` | `Ready` | `False` | an older KeyDelivery owns the target Secret |
+  | `EncryptionOff` | `Ready` | `False` | secrets encryption is off and the override is not set (G18) |
+  | `UserScopeOff` | `Ready` | `False` | more than one server is registered |
+
+  While `Authorized` is `False`, `Ready` is `False` with the same reason. While it is
+  `Unknown`, `Ready` keeps its last status and reason, since nothing was changed. **A tolerant
+  reader:** a consumer treats a reason it does not know as a generic failure of the condition
+  that carries it, so a reason added later breaks no reader.
+
+**Admission checks the requester; it is not the authority.** A `ValidatingAdmissionPolicy` in
+`pkg/policy`, the shape of the existing ones, adds only what CRD CEL cannot see: on create,
+`spec.requestedBy == request.userInfo.username`, and a requester under
+`system:serviceaccount:` is refused (U40, E13). Because `requestedBy` is required, held to the
+requester on create and immutable afterwards, the policy in effect stamps it on create: the
+only value an object can carry is its creator's name. That `request.userInfo.username` reports
+the impersonated user under impersonation is not yet checked; U40 and E3 check it. **Neither
+admission layer is the authority.** The authority is the sealed delivery record plus the
+reconciler-time SubjectAccessReviews below. `requestedBy` is stamped and checked by admission
+and by the CRD's cross-field rule, which is what lets the reconciler name it as the principal
+of those reviews, but it authorises nothing by itself.
 
 **Who creates one.** The owner, through the socket: `k3sm keys deliver user/<uid>/<name>
 --namespace NS --secret S [--data-key K]` (the short-name form is accepted).
 
-- The server creates the object with the admin client **impersonating `k3sm:local:<uid>`**
-  with the group `k3sm:local-users`. The admin client's impersonation is limited to users
-  `k3sm:local:*` and the group `k3sm:local-users`: a wrapper refuses any other
-  `Impersonate-User` or `Impersonate-Group` before the request leaves (U41). The API server's
-  own RBAC then decides whether that principal may create `keydeliveries` in `NS`.
+- The server creates the object with the admin client **impersonating exactly
+  `k3sm:local:<peer uid>`** with the group `k3sm:local-users`. The uid is the peer uid the
+  listener read with `LOCAL_PEERCRED` at accept, never a value from the request and never the
+  uid in the entry name, so a request naming another user's entry impersonates the peer, not
+  the entry's owner (and is answered `ErrNotFound` before any create). The admin client's
+  impersonation is limited to users `k3sm:local:*` and the group `k3sm:local-users`: a wrapper
+  refuses any other `Impersonate-User` or `Impersonate-Group`, and refuses to send
+  `Impersonate-Uid` or any `Impersonate-Extra-*` header, before the request leaves (U41). The
+  API server's own RBAC then decides whether that principal may create `keydeliveries` in
+  `NS`.
 - After the create, the server appends to the caller's sealed `deliveries` record (kind
   0xFD, under the user-scope floor) the object's `metadata.uid` and the **target digest**
-  `sha256(LP(entry) ‖ LP(namespace) ‖ LP(secretName) ‖ LP(dataKey))` (U14, U41).
+  `sha256("k3sm-keystore-delivery-target/v1" ‖ LP(entry) ‖ LP(namespace) ‖ LP(secretName) ‖
+  LP(dataKey))` (U14, U41).
+- **Version tags.** The digest carries that domain label, and the record's plaintext starts
+  with a format version byte (1). A reader that meets a record version it does not know refuses
+  it, and the reconciler treats that refusal as `Indeterminate`, never as a denial, so a format
+  change, read by a build that predates it, cannot delete a Secret (U56).
 - `withdraw` (CLI `k3sm keys undeliver`) deletes the object; the record entry is withdrawn by
   the reconciler after the Secret is gone. `undeliver` prints "a pod that read this value
   keeps it; rotate the entry to revoke it".
@@ -1404,14 +1448,32 @@ authority is the sealed delivery record plus the reconciler-time SubjectAccessRe
    (`k3sm:local:<uid>`) is its owner; otherwise `EntryUnavailable`.
 2. Its UID is in that uid's sealed `deliveries` record and the digest recomputed from the live
    object matches the recorded one; otherwise `NotRecorded`.
-3. Name-scoped SubjectAccessReviews for `requestedBy` pass for `create keydeliveries`
-   (`resourceNames` the object's name) and for `create`, `update` and `delete` on `secrets`
-   (`resourceNames` `spec.secretName`) in that namespace; otherwise `NotAuthorized`. The
-   secrets checks are required: without them, a principal allowed to declare deliveries
-   but not to write Secrets could plant or remove a Secret a workload expects to mount, under a
-   name of its choosing (U42).
+3. SubjectAccessReviews for `requestedBy` in that namespace pass for `create keydeliveries`
+   and `create secrets` with no resource name, and for `update` and `delete` on `secrets` with
+   `resourceNames` `spec.secretName`; otherwise `NotAuthorized`. The secrets checks are
+   required: without them, a principal allowed to declare deliveries but not to write Secrets
+   could plant or remove a Secret a workload expects to mount, under a name of its choosing
+   (U42).
+
+**Why create is checked without a name.** RBAC cannot match `resourceNames` on `create`: a
+create request carries no name for the authorizer to match, so a rule that lists
+`resourceNames` never allows a create. A review that named the object would pass such a rule
+where the real create fails, so the reconciler asks the question the API server would answer:
+create without a name, update and delete with the Secret's name. E23 checks this against the
+real authorizer.
 
 Encryption-off refusal (G18) applies unchanged, as `EncryptionOff`.
+
+**A denial deletes; an error does not.** The reconciler deletes a Secret only on a definitive
+denial: the RoleBinding removed (a SubjectAccessReview that returns denied), the entry removed,
+the record withdrawn, a digest mismatch, or the account gone (`ErrScopeOwnerChanged`). An error
+is not a denial: a SubjectAccessReview call that fails, any other API server error,
+`ErrScopeOwnerUnknown` (the GeneratedUID lookup past its deadline), `ErrBusy`, `ErrLogFull`,
+and a delivery record whose version it does not know. On an error the reconciler changes
+nothing (the Secret, the record entry and the finalizer stay as they are), sets `Authorized` to
+`Unknown` with reason `Indeterminate`, and retries with backoff (U55). Otherwise a short outage
+of the API server or of the directory service would delete every delivered Secret on the node,
+and a Pod restarted in that window would lose a credential its owner never withdrew.
 
 **Why the sealed record binds the whole target.** The installing user's own kubeconfig
 carries the admin context, and admin can impersonate anyone. Without a record only the service
@@ -1428,24 +1490,31 @@ KeyDelivery's UID, and an ownerReference to the KeyDelivery as the garbage-colle
 backstop.
 
 **Finalizer and lost authority.** The reconciler adds the finalizer
-`keystore.k3sm.io/delivery`. On deletion of the object, or when authority is lost (a
-RoleBinding removed, the entry removed, the record withdrawn, a digest mismatch), the
-reconciler deletes the Secret it owns (label, ownerReference and owner annotation all
-matching) and sets `Authorized=False`. The crash order is fixed: **delete the Secret, then
-withdraw the sealed record entry, then drop the finalizer**, so a crash at any point leaves a
-state the next sweep finishes. An **orphan sweep** deletes Secrets that carry the label and an
-owner annotation but have no live KeyDelivery, and never an unlabelled or foreign one (U44,
-E11, E14). This differs on purpose from Phase A's root-file delivery, which never deletes
-(G20): a revocation that leaves a long-lived token in place is not a revocation.
+`keystore.k3sm.io/delivery`. On deletion of the object, or when authority is lost (a definitive
+denial, above), the reconciler deletes the Secret it owns (label, ownerReference and owner
+annotation all matching) and sets `Authorized=False`. The crash order is fixed: **delete the
+Secret, then withdraw the sealed record entry, then drop the finalizer**, so a crash at any
+point leaves a state the next sweep finishes. An **orphan sweep** deletes a labelled Secret
+only if it carries the reconciler's ownerReference to a KeyDelivery UID that no longer exists
+(a Get of that object answers not found, or returns an object with another UID), or the sealed
+record names that KeyDelivery as withdrawn. The label and the owner annotation alone are not
+enough, since anyone who may write Secrets in the namespace can set both; an unlabelled or
+foreign Secret is never touched, and a Get that fails is an error, not a denial (U44, E11,
+E14). This differs on purpose from Phase A's root-file delivery, which never deletes (G20): a
+revocation that leaves a long-lived token in place is not a revocation.
 
 **Revocation is rotation.** Deleting the Secret does not un-share a value a Pod already read.
 The docs and the CLI say so (residual 8).
 
 **Identity.** The reconciler uses the admin client the server already holds for `pkg/addons`,
 as Phase A decided; the impersonated create is the only new use of it. A ClusterRole
-`k3sm:keystore-delivery-author` (keydeliveries create, get, list, delete; secrets create, get,
-update, delete) ships **unbound**; an admin binds it per user and namespace to
-`k3sm:local:<uid>`. No ServiceAccount is granted anything.
+`k3sm:keystore-delivery-author` ships **unbound**. It grants `create`, `update` and `delete` on
+`keydeliveries` only, and nothing on Secrets: the reconciler's admin client writes the Secret,
+never the user. An admin binds it per user and namespace to `k3sm:local:<uid>`. Because check 3
+asks whether the user may write the target Secret, an admin who lets a user deliver into a
+namespace also grants that: the built-in `edit` ClusterRole, or a Role with `create` on
+`secrets` and `update` and `delete` on `secrets` limited by `resourceNames` to the target names
+(E23). No ServiceAccount is granted anything.
 
 ### Single-server clusters only
 
@@ -1529,7 +1598,7 @@ the uid throughout.
 | the entry's owner (a login uid of 501 or above) | put, rotate (including from a version), list, rm and exec its own entries; declare deliveries where RBAC lets `k3sm:local:<uid>` write keydeliveries and that Secret | reveal a value through any verb but exec; touch another uid's scope or any system entry; see another user's names through any verb |
 | another login user | the same for its own scope | list, read, rotate, delete or deliver the owner's entries; learn their names |
 | a holder of the admin kubeconfig (by default the installing user) | delete any KeyDelivery, read any delivered Secret, bind RBAC | create a working delivery for someone else's entry (a replayed, copied or retargeted object fails the UID and digest check, a forged one has no sealed record); read an undelivered value |
-| the server's admin client | impersonate `k3sm:local:*` and `k3sm:local-users` for a create | impersonate any other user or group |
+| the server's admin client | impersonate exactly `k3sm:local:<peer uid>` and `k3sm:local-users` for a create | impersonate any other user or group, a uid taken from the request or the entry name, or send `Impersonate-Uid` or `Impersonate-Extra-*` |
 
 **Residuals, stated.**
 
@@ -1672,11 +1741,11 @@ each stated in the change that makes it. U15 is held for a K0 amendment and U39 
 | U11 | the Go resolver passes the shared entry-grammar vectors; `pkg/keystore` imports no Kubernetes package | `k3sm/pkg/keystore::TestEntryGrammarVectorsResolver`, `TestKeystoreIsKubernetesFree` | pending: the user-scope store |
 | U12 | master Rewrap re-wraps every `scope.key` and leaves user records byte-identical; resumable at every step | `k3sm/pkg/keystore::TestRewrapRewrapsScopeKeysResumable` (fault injection, as G12) | pending: user-scope quotas, scope-key Rewrap and the delivery record |
 | U13 | quotas: the 257th entry and the byte budget answer `ErrQuota`; `rm` still works | `k3sm/pkg/keystore::TestUserScopeQuota` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
-| U14 | the delivery record stores UID and target digest; add, look up and withdraw round-trip under the floor | `k3sm/pkg/keystore::TestDeliveryRecordDigestRoundTrip` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
+| U14 | the delivery record stores UID and target digest; add, look up and withdraw round-trip under the floor; the plaintext starts with the format version byte and the digest with the `k3sm-keystore-delivery-target/v1` label | `k3sm/pkg/keystore::TestDeliveryRecordDigestRoundTrip`, `TestDeliveryRecordVersionByteAndDigestLabel` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
 | U15 | (reserved for the K0 amendment if leg 5 finds a second Pod-uid path) | none | pending: K0 amendment |
 | U16 | every Pod profile variant (native, vm, container-vm, xcode, expose-paths, a custom Pod root distinct from the data root) denies every `keystore-*` name in the data root and the `keystore-run/` tree; the keystore names are in `DataRootDenyTrees` and so in `protectedPrefixes`; `ReadOnlyPaths`, `ExposePaths` or a hostPath naming the data root or a keystore path is refused; an empty `Posture.DataRoot` refuses to render; a vm or container-vm guest gets no data-root share | `runtimed/pkg/sandbox::TestDataRootDeniesKeystorePathsEveryProfile`, `TestProtectedPrefixesRefuseKeystoreReallow`, `TestEmptyDataRootFailsClosed`, `TestVMGuestGetsNoDataRootShare`; rig leg E10 | pending: runtimed's sandbox change |
 | U17 | runtimed refuses a resolved Pod process uid of 501 or above, and uid 0 without a drop on a root daemon, at credential resolution and again at spawn | `runtimed/pkg/runtime::TestResolveCredentialRefusesLoginRangeUID`, `TestResolveCredentialRefusesRootWithoutDrop`; `runtimed/pkg/supervisor::TestSpawnRefusesLoginRangeUID`, `TestSpawnRefusesRootUIDWithoutDrop`; rig legs E21, E22 | pending: runtimed's sandbox change |
-| U18 | CRD: `entry`, `secretName`, `dataKey`, `requestedBy` immutable by CEL transition rules; status subresource on; reasons listed | `apis/config/crd::TestKeyDeliveryCRDMatchesTheGoTypes`, `TestKeyDeliveryImmutableFields` | pending: the `KeyDelivery` API |
+| U18 | CRD: `entry`, `secretName`, `dataKey`, `requestedBy` required (`dataKey` defaults to `value`) and immutable by CEL transition rules; `requestedBy` matches its pattern and, for a user entry, equals `k3sm:local:` plus the entry's uid; `conditions` is `listType=map` keyed by `type`; status subresource on; reasons listed | `apis/config/crd::TestKeyDeliveryCRDMatchesTheGoTypes`, `TestKeyDeliveryImmutableFields`, `TestKeyDeliveryRequiredFields`, `TestKeyDeliveryRequestedByMatchesEntryUID`, `TestKeyDeliveryConditionsListMap` | pending: the `KeyDelivery` API |
 | U19 | the CRD pattern passes the shared entry-grammar vectors | `apis/config/crd::TestEntryGrammarVectors` | pending: the `KeyDelivery` API |
 | U20 | a user-scope `current` copied back is refused against the floor log, with Phase A's floor message | `k3sm/pkg/keystore::TestUserFloorRefusesCopiedBackCurrent`; rig leg E9 | pending: the append-only files |
 | U21 | install creates both logs service-user-owned 0600 and flagged; the listener refuses to start when a flag is clear | `k3sm/pkg/install::TestKeystoreAppendOnlyFilesAtInstall`, `k3sm/pkg/keystore::TestFlagCheckRefusesUnflagged`; rig leg E1 | pending: the append-only files |
@@ -1699,10 +1768,10 @@ each stated in the change that makes it. U15 is held for a K0 amendment and U39 
 | U38 | an unknown error code prints the code; a connect failure names `sudo k3sm install` | `k3sm/cmd/k3sm::TestUnknownErrorCodeFallback`, `TestConnectErrorNamesInstall` | pending: the non-root CLI and `exec` |
 | U39 | (unused: there are no system grants) | none | none |
 | U40 | the admission policy stamps `requestedBy` and refuses a ServiceAccount creator; its CEL passes the shared grammar vectors | `k3sm/pkg/policy::TestKeyDeliveryPolicyStampsRequestedBy`, `TestEntryGrammarVectorsCEL` | pending: KeyDelivery authoring |
-| U41 | `deliver` creates impersonating only `k3sm:local:<uid>` and `k3sm:local-users`, refusing any other impersonation; it writes the UID and digest; `withdraw` deletes the object; `undeliver` prints the hint | `k3sm/pkg/keystore/socket::TestDeliverImpersonatesUIDPrincipalOnly`, `TestDeliverWritesDigestRecord`, `k3sm/cmd/k3sm::TestUndeliverPrintsRotationHint` | pending: KeyDelivery authoring |
-| U42 | an unrecorded UID, a digest mismatch, or a failed name-scoped SAR (`create keydeliveries`; `create`, `update`, `delete` secrets with `resourceNames`) gets no Secret; encryption off refuses (G18 for KeyDelivery) | `k3sm/pkg/keystore/reconcile::TestUnrecordedOrRetargetedDeliveryGetsNoSecret`, `TestSARsAreNameScopedAndIncludeDelete`, `TestEncryptionOffRefusesKeyDelivery` | pending: the KeyDelivery reconciler (authority) |
-| U43 | reasons are the closed set; "absent" and "not yours" both read `EntryUnavailable`; a pre-existing unlabelled Secret is `SecretExists`; a second declaration is `SecretClaimed`; `observedGeneration` tracks | `k3sm/pkg/keystore/reconcile::TestConditionReasonsClosedSet`, `TestOneDeclarationPerSecret` | pending: the KeyDelivery reconciler (authority) |
-| U44 | losing authority deletes exactly the owned Secret; the crash order is Secret, record, finalizer at every interruption point; the orphan sweep removes labelled, owner-annotated Secrets with no live object and never an unlabelled or foreign one | `k3sm/pkg/keystore/reconcile::TestLostAuthorityDeletesOnlyOwnedSecret`, `TestFinalizerCrashOrder`, `TestOrphanSweep` | pending: the KeyDelivery reconciler (lifecycle) |
+| U41 | `deliver` creates impersonating only `k3sm:local:<uid>` and `k3sm:local-users`, refusing any other impersonation and never sending `Impersonate-Uid` or `Impersonate-Extra-*`; the impersonated uid equals the peer uid; a request naming another user's entry impersonates the peer, not the owner; it writes the UID and digest; `withdraw` deletes the object; `undeliver` prints the hint | `k3sm/pkg/keystore/socket::TestDeliverImpersonatesUIDPrincipalOnly`, `TestDeliverImpersonatesPeerUIDNotOwner`, `TestImpersonationSendsNoUidOrExtra`, `TestDeliverWritesDigestRecord`, `k3sm/cmd/k3sm::TestUndeliverPrintsRotationHint` | pending: KeyDelivery authoring |
+| U42 | an unrecorded UID, a digest mismatch, or a denied SAR gets no Secret; the SARs ask `create keydeliveries` and `create secrets` with no name, and `update` and `delete` secrets with `resourceNames` `spec.secretName`; encryption off refuses (G18 for KeyDelivery) | `k3sm/pkg/keystore/reconcile::TestUnrecordedOrRetargetedDeliveryGetsNoSecret`, `TestSARCreateUnnamedUpdateDeleteNamed`, `TestEncryptionOffRefusesKeyDelivery`; rig leg E23 | pending: the KeyDelivery reconciler (authority) |
+| U43 | reasons are the closed set, each on the condition type and status the reason table gives; "absent" and "not yours" both read `EntryUnavailable`; a pre-existing unlabelled Secret is `SecretExists`; a second declaration is `SecretClaimed`; `observedGeneration` tracks | `k3sm/pkg/keystore/reconcile::TestConditionReasonsClosedSet`, `TestReasonConditionTable`, `TestOneDeclarationPerSecret` | pending: the KeyDelivery reconciler (authority) |
+| U44 | losing authority (a definitive denial) deletes exactly the owned Secret; the crash order is Secret, record, finalizer at every interruption point; the orphan sweep removes a labelled Secret only when its ownerReference names a KeyDelivery UID that no longer exists or the sealed record names it withdrawn, and never one with the label and owner annotation alone, an unlabelled or a foreign one | `k3sm/pkg/keystore/reconcile::TestLostAuthorityDeletesOnlyOwnedSecret`, `TestFinalizerCrashOrder`, `TestOrphanSweep` | pending: the KeyDelivery reconciler (lifecycle) |
 | U45 | cross-user refusal with a fake peer-credential source: a peer with uid B asks for `list`, `read-for-exec`, `rotate`, `rm` and `deliver` of uid A's entries, and for any `system/…` name; every call is `ErrNotFound` with text identical to an absent entry of B's own, and the `refused` audit lines carry uid B | `k3sm/pkg/keystore/socket::TestCrossUserRefusedFakePeerCred`, `TestNonRootCannotNameSystemEntries` | pending: the socket operations |
 | U46 | `baseSocketDenies` derives the `keys.sock` path from `runtimed/pkg/keystorepaths` and denies `connect(2)` to it | `k3sm/pkg/provider::TestBaseSocketDeniesKeystoreSocket` | pending: the socket listener |
 | U49 | `runtimed/pkg/keystorepaths` builds with `CGO_ENABLED=0` and imports only the standard library; `k3sm/pkg/keystore` imports that leaf and never `runtimed/pkg/sandbox` | `runtimed/pkg/keystorepaths::TestLeafImportsStdlibOnly`; `k3sm/pkg/keystore::TestKeystoreImportsNoSandbox` | pending: runtimed's sandbox change, the append-only files |
@@ -1711,10 +1780,12 @@ each stated in the change that makes it. U15 is held for a K0 amendment and U39 
 | U52 | every root verb writes one audit line with `via` `root` once the log exists, and none before it | `k3sm/cmd/k3sm::TestEveryRootVerbWritesAuditLine` | pending: the append-only files |
 | U53 | every reconciler Secret write and delete, and every record withdrawal, writes one audit line with `via` `reconciler` | `k3sm/pkg/keystore/reconcile::TestEveryReconcilerWriteAndDeleteAudited` | pending: the KeyDelivery reconciler (lifecycle) |
 | U54 | a pre-frame refusal (uid 0, the service uid, a uid below 501) writes a `refused` line with the peer uid, rate-limited per uid with a dropped-count summary | `k3sm/pkg/keystore/socket::TestPreFrameRefusalsAudited`, `TestPreFrameRefusalLinesRateLimited` | pending: the socket listener |
+| U55 | a transient lookup, SAR or apiserver error leaves the Secret and sets Unknown: a failed SAR call, an API server error, `ErrScopeOwnerUnknown`, `ErrBusy` and `ErrLogFull` each leave the Secret, the record entry and the finalizer, set `Authorized=Unknown` with reason `Indeterminate`, and retry with backoff | `k3sm/pkg/keystore/reconcile::TestTransientErrorLeavesSecretSetsUnknown` | pending: the KeyDelivery reconciler (lifecycle) |
+| U56 | a delivery record with an unknown format version is refused by the store and read by the reconciler as `Indeterminate`, never as a denial: no Secret is deleted | `k3sm/pkg/keystore::TestDeliveryRecordUnknownVersionRefused`, `k3sm/pkg/keystore/reconcile::TestUnknownRecordVersionIsIndeterminate` | pending: the KeyDelivery reconciler (lifecycle) |
 
 ### Rig legs
 
-The end-to-end gate is `hack/acceptance/keystore-e2e.sh --lab` on the two-Mac lab rig, from a
+The end-to-end gate is `hack/acceptance/keystore.sh --lab` on the two-Mac lab rig, from a
 recorded build, with both nodes' `k3sm version` in the log, public surfaces only (`k3sm`,
 `kubectl`, a Pod), every test object deleted at the end and the rig left with both nodes
 Ready. The server is one Mac and the old worker the other. "The user" is the operator's own
@@ -1730,7 +1801,7 @@ E20 attended.
 |---|---|---|---|---|
 | E1 | preconditions | secrets encryption on; one server; `keystore-run/`, both logs present, service-user 0600, `SF_APPEND` set; `doctor` user-scope row on; `keystore.sh --check` exits 0 on the build | no (U21) | the append-only files: no files, `doctor` row off |
 | E2 | the user, no sudo: `printf … \| k3sm keys put user/<me>/e2e-token` (short-name form) | exit 0; the CLI prints the resolved `user/<uid>`; `k3sm keys list` shows it; the audit log has a `put` line with no value | yes | the socket operations: connect refused, error names `sudo k3sm install` |
-| E3 | an admin binds `k3sm:keystore-delivery-author` for `k3sm:local:<uid>` in `ks-e2e`; the user runs `k3sm keys deliver user/<uid>/e2e-token --namespace ks-e2e --secret e2e-token --data-key TOKEN` | `KeyDelivery` `Ready`, reason `Delivered`, `observedGeneration` current; the object's `requestedBy` is `k3sm:local:<uid>`; a Pod mounting Secret `e2e-token` reads exactly the stored bytes | yes | the KeyDelivery reconciler (authority): no Secret, no status |
+| E3 | an admin binds `k3sm:keystore-delivery-author` and the built-in `edit` ClusterRole for `k3sm:local:<uid>` in `ks-e2e`; the user runs `k3sm keys deliver user/<uid>/e2e-token --namespace ks-e2e --secret e2e-token --data-key TOKEN` | `KeyDelivery` `Ready`, reason `Delivered`, `observedGeneration` current; the object's `requestedBy` is `k3sm:local:<uid>`; a Pod mounting Secret `e2e-token` reads exactly the stored bytes | yes | the KeyDelivery reconciler (authority): no Secret, no status |
 | E4 | the user rotates (`rotate --in -`), then `rotate --from-version 1` | the Pod's mounted file moves to v2, then to v1's bytes as v3, within one sweep each | yes | the `k3sm keys` verbs: `--from-version` unknown flag |
 | E5 | `k3sm keys exec user/<uid>/e2e-token --env TOKEN -- /usr/bin/env` | the child sees `TOKEN`; the CLI wrote nothing else; `ps` during the run shows no value in argv; one `exec-read` audit line | no (U37) | the non-root CLI and `exec`: unknown verb |
 | E6 | as the operator's login user only: `list`, `exec`, `rotate`, `rm` and `deliver` of `user/<an unused other uid>/e2e-token` and of `system/e2e-sys`; then a connect to `keys.sock` as root and as the service user | `not found` each time for the names, text identical to an absent entry of the user's own, and `refused` audit lines attributed to the user's uid; root and the service user are refused at accept, before any frame | partly (U26, U45): the rig runs only what one real user can reach, the cross-user case is unit-tested | the socket operations: the other uid's or the system entry's ops are answered (U45 red); the socket listener: root or the service uid is served |
@@ -1738,7 +1809,7 @@ E20 attended.
 | E8 | admin strips the CRD's transition rules (a test patch, restored at the end) and edits E3's `spec.secretName` | `Authorized=False`, `NotRecorded` (digest mismatch); the original Secret deleted; no Secret under the new name | yes | the target digest: a Secret appears under the new name |
 | E9 | `sudo cp` saves `current`, the user rotates, `sudo cp` puts the old `current` back; then the same for a `system/` entry | user `list` and `sudo k3sm keys list` each mark the entry `corrupt` with the floor message; `floor --rebuild` is not run | no (U20) | the append-only files: the old value is served |
 | E10 | a native Pod (pinned by `nodeName`, darwin selector) tries `connect(2)` to `keys.sock` and to read `server/keystore`, `keystore-run/`, both logs and Phase A's two files; then a vm Pod on the same node tries to reach `keys.sock` and the data root from the guest | EPERM for each from the native Pod; the guest has no path to the data root and cannot reach the socket | no (U16) | runtimed's sandbox change: the Phase A files read (the red result K0 leg 4 records) |
-| E11 | admin removes the user's RoleBinding in `ks-e2e` | within one sweep the Secret is deleted; `Authorized=False`, `NotAuthorized` | no (U42) | the KeyDelivery reconciler (lifecycle): the Secret stays |
+| E11 | admin removes the user's RoleBinding in `ks-e2e` | within one sweep the Secret is deleted; `Authorized=False`, `NotAuthorized` | no (U44) | the KeyDelivery reconciler (lifecycle): the Secret stays |
 | E12 | root scope: `sudo k3sm keys put system/e2e-sys`, `sudo k3sm keys deliver system/e2e-sys --namespace ks-e2e`; then the user, with no sudo, tries `k3sm keys deliver`, `list` and `exec` on `system/e2e-sys` | root's Secret is delivered and stays (G20); each of the user's attempts answers `not found` and nothing reaches `ks-e2e-2`: the user cannot read or deliver the system entry. The leg does not claim the user cannot discover the name, which Phase A's 0644 files show (residual 11) | partly (U45): the root delivery is rig-only | root delivery: root delivery missing; the socket operations: a non-root user can name a system entry |
 | E13 | a ServiceAccount token creates a KeyDelivery | refused at admission | no (U40) | KeyDelivery authoring: the object is created |
 | E14 | `k3sm keys undeliver` on E3's object, then `kubectl delete` of a second one | each Secret deleted before its object goes; the hint printed; no orphan Secret after one sweep | no (U44) | the KeyDelivery reconciler (lifecycle): the object hangs or the Secret stays |
@@ -1750,6 +1821,7 @@ E20 attended.
 | E20 | **reboot of the server node**: an operator-attended leg (automation never reboots the rig), run by the operator with the script's `--attended reboot` step | after boot the flags are still set, the listener starts, E2's entry opens, E3's Secret is still current | yes | the flag check: a flag lost across a reboot |
 | E21 | a native Pod with `securityContext.runAsUser: 501` | refused at spawn: the container never starts, and its status carries the uid refusal | no (U17) | runtimed's sandbox change: the Pod runs as uid 501 |
 | E22 | a native Pod with `securityContext.runAsUser: 0` | refused at spawn: the container never starts as root, and its status carries the uid refusal | no (U17) | runtimed's sandbox change: the Pod runs as uid 0 |
+| E23 | against the real authorizer: an admin binds, for `k3sm:local:<uid>` in `ks-e2e-3`, `k3sm:keystore-delivery-author` and a Role with `create` on `secrets` and `update` and `delete` on `secrets` with `resourceNames: [e2e-named]`; the user delivers `user/<uid>/e2e-token` as `e2e-named`, then as `e2e-other` | `e2e-named`: `Ready`, `Delivered`; `e2e-other`: `Authorized=False`, `NotAuthorized`, no Secret: the reconciler allows exactly what the API server allows the user | yes | the KeyDelivery reconciler (authority): `e2e-other` is delivered, or `e2e-named` is refused |
 
 ## Open questions
 
