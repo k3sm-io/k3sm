@@ -405,7 +405,9 @@ per-user delivery list. No record carries either yet, and a reader refuses them,
 kind byte not in "Record encoding", as `ErrCorrupt`. The entries'-directory name `.user` is
 reserved for user scopes too, and nothing creates it yet. The first-Put mint counts it as an
 entry, whatever its type, so a missing master with only `.user` present is
-`ErrMasterMissing`, never a new master. A user scope's store, its own key wrapped by the master, its
+`ErrMasterMissing`, never a new master. Rewrap refuses with `ErrScopeUnsupported`, writing
+nothing, while `.user` exists, whatever its type: this build cannot re-wrap user scopes, and a
+master rewrapped under them would leave them unreadable. A user scope's store, its own key wrapped by the master, its
 non-root API, RBAC, delivery and on-disk location are a later design; the scope is in the
 format now so that adding one needs no format change.
 
@@ -563,6 +565,36 @@ fails to authenticate *and* `master.next` is present, retry once under that key.
 means a live reader never sees a Rewrap in progress; this fallback exists for the state a
 *crashed* Rewrap leaves behind. It stops being tried the moment step 5 removes
 `master.next`, so it never becomes a second key this keystore must support indefinitely.
+
+**Settled by the implementation.** The steps above leave some points open; each is settled
+the conservative way:
+
+- *What is re-sealed.* Every committed version (`v1` to the version `current` names) and
+  `current`, for every entry. A version above `current` (an interrupted Rotate's orphan) and
+  an interrupted Put are not entries that anything reads; they are left as they are, and the
+  next Rotate or Put discards them. `created` is kept.
+- *An entry that does not open* (one `list` reports with `Err`) refuses the Rewrap before
+  anything is written, since the swap would strand it under a master that no longer exists.
+  It is removed with `rm`, or restored, first.
+- *Discarding a bad `master.next`* (one that does not agree with its fingerprint, or a
+  `master.next.sha256` without it that the master does not match) also requires that every
+  record still opens under the live master, besides no `.new` file existing: after step 4 has
+  renamed every `.new` in, none is left, but the records are under `master.next`. Otherwise it
+  is `ErrMasterUntrusted`. A `.new` file with no `master.next` is refused the same way.
+- *Before each rename* in step 4 the `.new` must open under the new key as the record it
+  replaces, and before step 5 `master.next` is read again and must be the key the records were
+  sealed under.
+- *Completing the swap.* Every verb that takes the exclusive lock (Put, Rotate, Delete,
+  `RaiseFloor`, Rewrap) finishes the second rename first; readers trust the master and write
+  nothing. A Rewrap that finishes it has completed the interrupted one and stops, minting no
+  second key. The reader's fallback key is `master.next` only when it agrees with its
+  fingerprint, and an opaque fingerprint read under it uses the master's fingerprint key.
+- *The floor.* Rewrap raises it at its start like every root verb, but a floor too full to
+  raise does not stop it, since Rewrap records nothing new; pointers are re-sealed at their
+  sequence whatever the floor says, and readers judge them as before.
+- *Refusals before any write:* `.user` present (checked before the lock, whose first
+  acquisition creates `.lock`, and again under it); no entries directory (nothing to
+  rewrap); no master (`ErrMasterMissing`); and a new master equal to the live one.
 
 **Consequence for backups.** The old master does not survive step 5, so an entry backup
 taken before a Rewrap can no longer be opened with the live master. See "Backup and
