@@ -563,7 +563,7 @@ The two files under the data root are the deliberate exception: root:wheel. Amen
 user scope: every user-scope file is the service user's, under `keystore/.user/` and under
 the data root alike (the server writes them), so a root verb that creates one (`install`,
 `floor --rebuild`, `audit --rotate`, `rm-scope`) chowns it before it returns. The one
-root-owned addition is `keystore-run/maintenance`.
+root-owned addition is the maintenance marker, `keystore-maintenance` in the data root.
 
 ### Rewrap
 
@@ -1086,10 +1086,11 @@ Phase A's paths are unchanged. Added:
   keystore-user-floor.log               NEW: the user-scope floor, append-only
   keystore-audit.log                    NEW: the audit log, append-only
   keystore-audit.log.1                  NEW: the previous audit log after `audit --rotate`
+  keystore-maintenance                  NEW: root 0644, present only while a maintenance verb runs
+  keystore-user-floor.log.new           NEW: staging file of `floor --rebuild`, present only during it
+  keystore-audit.log.new                NEW: staging file of `audit --rotate`, present only during it
   keystore-run/                         NEW: service user 0755, the socket's directory, Pod-denied
     keys.sock                           srw-rw-rw-: access is decided by peer credentials
-    maintenance                         NEW: root 0644, present only while a maintenance verb runs
-    user-floor.new, audit.new           NEW: staging files of `floor --rebuild` and `audit --rotate`
   server/                               already Pod-denied
     cred/keystore-master/master …       Phase A, unchanged
     keystore/                           Phase A: 0700, service user
@@ -1232,15 +1233,32 @@ service user can only add to.
   SF_APPEND` on both logs at start and at every `doctor` run, through the chflags flag source,
   and refuses to start the listener if either flag is clear (U21).
 - **Root maintenance verbs.** `sudo k3sm keys floor --rebuild` (the restore procedure) and
-  `sudo k3sm keys audit --rotate` run as root only. Each writes `keystore-run/maintenance`,
-  waits for the listener to stop (it closes connections and unlinks `keys.sock` when it sees
-  the file), takes the store `.lock` exclusively, then **creates and flags the new file before
-  it touches the old one**. Rebuild writes `keystore-run/user-floor.new` from the
-  authenticated pointers, sets `sappnd`, clears the old file's flag and renames the new one
-  over it; rotate does the same through `keystore-run/audit.new`, renaming the old log to `.1`
-  and flagging it again. Staging files live inside `keystore-run/`, never loose in the data
-  root, so a staging name is denied by the `keystore-run/` tree deny whatever it is called
-  ("Pod denies"). A crash
+  `sudo k3sm keys audit --rotate` run as root only. Each writes the marker
+  `keystore-maintenance`, waits for the listener to stop (it closes connections and unlinks
+  `keys.sock` when it sees the marker), takes the store `.lock` exclusively, then **creates and
+  flags the new file before it touches the old one**. Rebuild writes
+  `keystore-user-floor.log.new` from the authenticated pointers, sets `sappnd`, clears the old
+  file's flag and renames the new one over it; rotate does the same through
+  `keystore-audit.log.new`, renaming the old log to `.1` and flagging it again.
+- **Root never acts by path where the service user can write.** `keystore-run/` is the
+  service user's, so a name root created there could be a symlink or a swapped file the
+  service user planted. The marker and both staging files therefore live in the root-owned
+  data root (root:wheel 0755), where only root creates names, under `keystore-`-prefixed names
+  that the Pod prefix deny covers ("Pod denies"). Every step goes through one descriptor on the
+  data root, opened `O_DIRECTORY|O_NOFOLLOW` and judged by `fstat` (root-owned, not group- or
+  other-writable) before use:
+  - each create is `openat` on that descriptor with `O_CREAT|O_EXCL|O_NOFOLLOW`, so an existing
+    name, a symlink included, is refused rather than followed or reused;
+  - `fchown` to the service user (flag variant) and `fchflags` to set `sappnd` go on the new
+    file's own descriptor, after its bytes are written and fsynced and before the rename;
+  - the old file is opened `O_NOFOLLOW` through the same descriptor and judged by `fstat` (a
+    regular file, the expected owner) before its flag is cleared with `fchflags` on that
+    descriptor; the rename is `renameat` relative to the data-root descriptor, never by path;
+  - a staging file left by a crash is opened `O_NOFOLLOW`, its flag cleared on its descriptor,
+    and unlinked with `unlinkat` before the create is retried with `O_EXCL`.
+
+  A planted symlink or a swapped file at any of these names refuses the verb and changes no
+  byte of either log (U68, run as root). A crash
   leaves either the old flagged file or the new flagged file at the canonical path. The only
   unflagged moment is the old file's, between its `chflags nosappnd` and the rename, under the
   exclusive lock with the listener stopped; whether a rename over an `sappnd` target needs that
@@ -1367,7 +1385,8 @@ a single-server cluster ("Single-server clusters only"), listens on
   service user; anything else at that path is refused with a Warn.
 - Each request waits for the store `.lock` at most 2 seconds; a timeout fails that request
   (`ErrBusy`), not the server.
-- While `keystore-run/maintenance` exists the listener stays down.
+- While the maintenance marker `keystore-maintenance` exists in the data root the listener
+  stays down.
 - **Upgrade visibility.** If the directory or either append-only file is absent, wrong or
   unflagged, the listener does not start: fail fast, no fallback. The server logs a Warn naming
   `sudo k3sm install` once at start and again on every listener retry; `k3sm doctor` shows
@@ -1461,9 +1480,10 @@ the first layer.**
 
 1. **Seatbelt.** The data-root denies cover two things, by prefix rather than by a list: every
    name in the data root that begins `keystore-` (today `keystore-floor.json`,
-   `keystore-delivery.json`, `keystore-user-floor.log`, `keystore-audit.log` and
-   `keystore-audit.log.1`), and the whole `keystore-run/` tree, which also holds the
-   maintenance verbs' staging files. A prefix means a keystore file a later change adds is
+   `keystore-delivery.json`, `keystore-user-floor.log`, `keystore-audit.log`,
+   `keystore-audit.log.1`, the maintenance marker `keystore-maintenance` and the staging files
+   `keystore-user-floor.log.new` and `keystore-audit.log.new`), and the whole `keystore-run/`
+   tree. A prefix means a keystore file a later change adds is
    denied without a runtimed change. The keystore names join `DataRootDenyTrees`, the list of
    data-root trees runtimed denies, which also feeds `protectedPrefixes`. Not
    `DaemonTreeSubdirs`, which is under the work dir and misses a node whose Pod root differs
@@ -2059,7 +2079,7 @@ each stated in the change that makes it. U15 is held for a K0 amendment and U39 
 | U19 | the CRD pattern, its `maxLength` of 269, the uid range rule and the 253-byte name-length rule pass the shared entry-grammar vectors, `user/1/` and `system/` each with a 254-byte name refused | `apis/config/crd::TestEntryGrammarVectors` | pending: the `KeyDelivery` API |
 | U20 | a user-scope `current` copied back is refused against the floor log, with Phase A's floor message | `k3sm/pkg/keystore::TestUserFloorRefusesCopiedBackCurrent`; rig leg E9 | pending: the append-only files |
 | U21 | install creates both logs service-user-owned 0600 and flagged; the listener refuses to start when a flag is clear (seams: chflags flag source, file-attribute writer, euid source) | `k3sm/pkg/install::TestKeystoreAppendOnlyFilesAtInstall`, `k3sm/pkg/keystore::TestFlagCheckRefusesUnflagged`; rig leg E1 | pending: the append-only files |
-| U22 | `floor --rebuild` and `audit --rotate` stop the listener, hold the lock, flag the new file before touching the old; a crash at each step leaves a flagged file (seams: file-attribute writer, euid source) | `k3sm/cmd/k3sm::TestKeysFloorRebuildCrashOrder`, `TestKeysAuditRotateCrashOrder`; rig leg E17 | pending: the append-only files |
+| U22 | `floor --rebuild` and `audit --rotate` write the marker `keystore-maintenance` and stage `keystore-user-floor.log.new` and `keystore-audit.log.new` in the root-owned data root, stop the listener, hold the lock, flag the new file on its descriptor before touching the old; a crash at each step leaves a flagged file (seams: file-attribute writer, euid source) | `k3sm/cmd/k3sm::TestKeysFloorRebuildCrashOrder`, `TestKeysAuditRotateCrashOrder`; rig leg E17 | pending: the append-only files |
 | U23 | every audited operation writes one `v:1` line; no line carries a value or its length; readers ignore unknown fields | `k3sm/pkg/keystore::TestAuditLineNeverCarriesValue`, `TestAuditReaderIgnoresUnknownFields` | pending: the append-only files |
 | U24 | soft cap shows in `doctor`; past the hard cap every mutating user op is `ErrLogFull`, except the revocation class, which draws on the reserve; a line over 1 KiB is refused | `k3sm/pkg/keystore::TestLogHardCapRefusesMutations`, `TestAuditLineBoundedAtOneKiB` | pending: the append-only files |
 | U25 | backup and restore round trip: a restored tree with cleared flags is refused until `floor --rebuild`, then opens | `k3sm/pkg/keystore::TestBackupRestoreRoundTripRebuild`; rig leg E17 | pending: the append-only files |
@@ -2105,6 +2125,7 @@ each stated in the change that makes it. U15 is held for a K0 amendment and U39 
 | U65 | the reconciler reads `ErrScopeAbsent` as `Indeterminate` and deletes nothing; every outcome on the allow-list, not only a SAR denial, deletes only on two consecutive sweeps for the same generation; the single-server check is re-run from a fresh List before every sweep, and a second server or a failed List runs no sweep | `k3sm/pkg/keystore/reconcile::TestAbsentScopeIsIndeterminate`, `TestEveryDeletingOutcomeNeedsTwoSweeps`, `TestSingleServerRecheckedBeforeEverySweep` | pending: the KeyDelivery reconciler (lifecycle) |
 | U66 | the GeneratedUID lookup recognises the synthesized compatibility form (prefix `FFFFEEEE-DDDD-CCCC-BBBB-AAAA`) and answers `ErrScopeOwnerUnknown`, never a changed owner, and no mint binds it; `ErrScopeOwnerChanged` only when a real, non-synthesized GeneratedUID differs from the bound one (seam: GeneratedUID lookup) | `k3sm/pkg/keystore::TestSynthesizedGeneratedUIDIsUnknown` | pending: the user-scope store |
 | U67 | the revocation class (`withdraw`, `rm`, `rotate`, the withdrawal's floor line, the reconciler's `deliver-delete` and `deliver-write` of a withdrawal) is charged to the share while it has room and past it bypasses the share and the hard cap, drawing on the 4 MiB revocation reserve; only the reserve's exhaustion refuses it; a no-op `rm`, `withdraw` or `rotate` is charged like any line and refused past the share; the socket's members stop with 3 MiB of the reserve left, which the reconciler's members may use | `k3sm/pkg/keystore/socket::TestRevocationBypassesShareUsesReserve`, `TestNoOpRevocationChargedToShare`, `TestReserveKeepsReconcilerPart` | pending: the socket operations |
+| U68 | root never acts by path where the service user can write: run as root (a root-run row, `--root`), the maintenance verbs refuse a symlink or a swapped file planted at the marker, either staging name or the old log, create through one data-root descriptor with `O_CREAT\|O_EXCL\|O_NOFOLLOW`, `fchown` and `fchflags` on the descriptor before the `renameat`, and leave every byte of both logs unchanged on a refusal | `k3sm/cmd/k3sm::TestMaintenanceRefusesPlantedSymlinkAndSwap` (integration, root-run) | pending: the append-only files |
 
 ### Rig legs
 

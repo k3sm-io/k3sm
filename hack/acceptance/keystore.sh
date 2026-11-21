@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # The keystore's acceptance gate: docs/design/keystore.md § "Acceptance gate",
-# rows G1 to G22, the user-scope rows U1 to U67 (U15 and U39 are unused) and
+# rows G1 to G22, the user-scope rows U1 to U68 (U15 and U39 are unused) and
 # the rig legs E1 to E23. Every row is listed, on exactly one line. A row runs
 # the tests that deliver it and passes only if each named test ran and passed
 # in its own package; a row whose change has not landed yet prints PENDING,
@@ -35,7 +35,7 @@
 #   --api           the KeyDelivery API types: U18, U19.
 #   --scope         user scopes: U6 to U11, U47, U58, U64, U66.
 #   --scope-store   the user-scope store: U12 to U14, U63.
-#   --files         the append-only files: U20 to U25, U50, U52, U60, U61.
+#   --files         the append-only files: U20 to U25, U50, U52, U60, U61, U68.
 #   --socket        the socket listener: U26 to U31, U46, U48, U54.
 #   --socket-ops    the socket operations: U32 to U35, U45, U51, U67.
 #   --exec          the non-root CLI and exec: U36 to U38.
@@ -67,13 +67,20 @@
 # test exists; 3 every row present, some named tests do not exist yet; 1 a row
 # is missing or a checked row's test is missing.
 #
-# --root runs row R1 alone: the package's tests as root, in the deployment's
+# --root runs row R1: the package's tests as root, in the deployment's
 # shape (root runs the verbs and owns the data root, the service user owns the
 # store; the tests take the service user from K3SM_KEYSTORE_TEST_UID and
 # K3SM_KEYSTORE_TEST_GID, or the local user _k3sm). It builds the test binary
 # as the invoking user and runs only that binary under sudo -n. It passes when
-# no test failed and the binary exited 0. Exit status: 0 pass; 1 fail; 3 sudo
-# -n is unavailable (run sudo -v first, or run as a user sudo lets run it).
+# no test failed and the binary exited 0. It then runs the root-run rows
+# (declared with rootpend or rootcheck): each by name, in its own k3sm
+# package's binary, built the same way and run the same way. A checked
+# root-run row passes only if each named test printed PASS: a SKIP fails it,
+# and so does a test that did not run. A pending one prints PENDING. Neither
+# --check nor a unit mode runs a root-run row: each prints it as ROOT and
+# leaves it out of the count, as pending. Exit status: 0 pass; 1 fail; 3 sudo
+# -n is unavailable (run sudo -v first, or run as a user sudo lets run it), or
+# nothing failed and a root-run row is pending.
 #
 # G1 diffs go.mod and go.sum against KEYSTORE_BASE (default: the merge base
 # with origin/main). KEYSTORE_SKIP_G22=1 marks G22 PENDING instead of running
@@ -91,7 +98,7 @@ EXPECTED_ROWS="$EXPECTED_ROWS U21 U22 U23 U24 U25 U26 U27 U28 U29 U30 U31 U32 U3
 EXPECTED_ROWS="$EXPECTED_ROWS U36 U37 U38 U40 U41 U42 U43 U44 U45 U46 U47 U48"
 EXPECTED_ROWS="$EXPECTED_ROWS U49 U50 U51 U52 U53 U54 U55 U56 U57"
 EXPECTED_ROWS="$EXPECTED_ROWS U58 U59 U60 U61 U62 U63"
-EXPECTED_ROWS="$EXPECTED_ROWS U64 U65 U66 U67"
+EXPECTED_ROWS="$EXPECTED_ROWS U64 U65 U66 U67 U68"
 # >>> ADD NEW U ROWS (U64 upward) HERE <<<
 EXPECTED_ROWS="$EXPECTED_ROWS E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 E13 E14 E15 E16 E17 E18 E19 E20"
 EXPECTED_ROWS="$EXPECTED_ROWS E21 E22 E23"
@@ -122,7 +129,7 @@ mode_rows() {
 	api) echo "U18 U19" ;;
 	scope) echo "U6 U7 U8 U9 U10 U11 U47 U58 U64 U66" ;;
 	scope-store) echo "U12 U13 U14 U63" ;;
-	files) echo "U20 U21 U22 U23 U24 U25 U50 U52 U60 U61" ;;
+	files) echo "U20 U21 U22 U23 U24 U25 U50 U52 U60 U61 U68" ;;
 	socket) echo "U26 U27 U28 U29 U30 U31 U46 U48 U54" ;;
 	socket-ops) echo "U32 U33 U34 U35 U45 U51 U67" ;;
 	exec) echo "U36 U37 U38" ;;
@@ -160,6 +167,8 @@ cd "$K3SM_ROOT"
 # the counting and the cleanup run as the invoking user. It is called where set
 # -e does not apply, so every step checks its own status.
 root_tmp=""
+root_t=""
+root_ids=()
 run_root() {
 	local t out rc=0 n m f
 	t="$(mktemp -d "${TMPDIR:-/tmp}/keystore-root.XXXXXX")" || { echo "R1 FAIL as root: mktemp -d failed"; return 1; }
@@ -167,6 +176,7 @@ run_root() {
 	# The store refuses an unclean DataRoot, and macOS's TMPDIR ends in a
 	# slash, so the tests' temp dirs are under the canonical path.
 	t="$(cd "$t" && pwd -P)" || { echo "R1 FAIL as root: cannot resolve $root_tmp"; return 1; }
+	root_t="$t"
 	trap 'rm -rf "$root_tmp" 2>/dev/null || echo "keystore: could not remove $root_tmp (a root-owned leftover)" >&2' EXIT
 	if ! out="$(CGO_ENABLED=1 go test -race -c -o "$t/keystore.test" ./pkg/keystore/ 2>&1)"; then
 		printf '%s\n' "$out"
@@ -183,10 +193,10 @@ run_root() {
 		return 3
 	fi
 	# sudo resets the environment, so the service user's ids are passed on.
-	local ids=()
-	if [ -n "${K3SM_KEYSTORE_TEST_UID+set}" ]; then ids+=("K3SM_KEYSTORE_TEST_UID=$K3SM_KEYSTORE_TEST_UID"); fi
-	if [ -n "${K3SM_KEYSTORE_TEST_GID+set}" ]; then ids+=("K3SM_KEYSTORE_TEST_GID=$K3SM_KEYSTORE_TEST_GID"); fi
-	out="$(cd "$t" && sudo -n env TMPDIR="$t/tmp" ${ids[@]+"${ids[@]}"} ./keystore.test -test.count=1 -test.v 2>&1)" || rc=$?
+	root_ids=()
+	if [ -n "${K3SM_KEYSTORE_TEST_UID+set}" ]; then root_ids+=("K3SM_KEYSTORE_TEST_UID=$K3SM_KEYSTORE_TEST_UID"); fi
+	if [ -n "${K3SM_KEYSTORE_TEST_GID+set}" ]; then root_ids+=("K3SM_KEYSTORE_TEST_GID=$K3SM_KEYSTORE_TEST_GID"); fi
+	out="$(cd "$t" && sudo -n env TMPDIR="$t/tmp" ${root_ids[@]+"${root_ids[@]}"} ./keystore.test -test.count=1 -test.v 2>&1)" || rc=$?
 	# sudo -n that cannot run the binary prints only its own refusal.
 	if [ "$rc" -ne 0 ] && ! grep -q -- '^=== RUN' <<<"$out" && grep -q '^sudo: ' <<<"$out"; then
 		printf '%s\n' "$out"
@@ -204,11 +214,83 @@ run_root() {
 	echo "R1 FAIL as root: $n tests passed, $m skipped"
 	return 1
 }
-if [ "$mode" = root ]; then
-	rc=0
+
+# root_build sets RB to a fresh directory under root_t holding package $1's
+# test binary, pkg.test, built as the invoking user, and its testdata.
+RB=""
+root_bin_n=0
+root_build() {
+	local rel d
+	case "$1" in
+	k3sm/*) ;;
+	*) echo "keystore: a root-run row runs k3sm packages only, not $1"; return 1 ;;
+	esac
+	rel="$(pkg_rel "$1")"
+	root_bin_n=$((root_bin_n + 1))
+	d="$root_t/b$root_bin_n"
+	mkdir -p "$d/tmp" || return 1
+	if ! CGO_ENABLED=1 go test -race -c -o "$d/pkg.test" "$rel" >"$d/build.out" 2>&1; then
+		cat "$d/build.out"
+		return 1
+	fi
+	[ -f "$d/pkg.test" ] || { echo "keystore: $1 has no test binary"; return 1; }
+	if [ -d "${rel}testdata" ]; then cp -R "${rel}testdata" "$d/testdata" || return 1; fi
+	RB="$d"
+}
+
+# judge_root_row runs root-run row $1's named tests by name under sudo -n, one
+# binary per package, and fails it unless each printed PASS: a SKIP fails.
+judge_root_row() {
+	local i="$1" id="${R_ID[$1]}" spec p pkgs="" names t out rc bad=0
+	for spec in ${R_TESTS[$i]}; do
+		case " $pkgs " in *" ${spec%%::*} "*) ;; *) pkgs="$pkgs ${spec%%::*}" ;; esac
+	done
+	for p in $pkgs; do
+		names=""
+		for spec in ${R_TESTS[$i]}; do
+			if [ "${spec%%::*}" = "$p" ]; then names="${names:+$names|}${spec#*::}"; fi
+		done
+		if ! root_build "$p"; then
+			echo "$id FAIL as root: the test binary of $p did not build"
+			return 1
+		fi
+		rc=0
+		out="$(cd "$RB" && sudo -n env TMPDIR="$RB/tmp" ${root_ids[@]+"${root_ids[@]}"} ./pkg.test -test.count=1 -test.v -test.run "^($names)\$" 2>&1)" || rc=$?
+		for t in ${names//|/ }; do
+			if grep -q -- "--- SKIP: $t " <<<"$out"; then
+				echo "$id FAIL as root: $t ($p) skipped, and a root-run row fails on SKIP"
+				bad=1
+			elif ! grep -q -- "--- PASS: $t " <<<"$out"; then
+				echo "$id FAIL as root: $t ($p) did not pass"
+				bad=1
+			fi
+		done
+		if [ "$rc" -ne 0 ]; then
+			printf '%s\n' "$out" | grep -E -- '^ *(--- FAIL|FAIL|panic:)|_test\.go:[0-9]+:' || true
+			bad=1
+		fi
+	done
+	if [ "$bad" -ne 0 ]; then return 1; fi
+	echo "$id PASS as root: ${R_DESC[$i]}"
+}
+
+# run_root_mode is --root: R1, then every root-run row.
+run_root_mode() {
+	local rc=0 i=0
 	run_root || rc=$?
-	exit "$rc"
-fi
+	if [ "$rc" -eq 3 ] || [ -z "$root_t" ]; then return "$rc"; fi
+	while [ "$i" -lt "$nrows" ]; do
+		case "${R_KIND[$i]}" in
+		rootpend)
+			echo "${R_ID[$i]} PENDING as root: ${R_DESC[$i]}"
+			if [ "$rc" -eq 0 ]; then rc=3; fi
+			;;
+		rootcheck) judge_root_row "$i" || rc=1 ;;
+		esac
+		i=$((i + 1))
+	done
+	return "$rc"
+}
 
 # The row table. Each row is declared here and judged after its packages ran,
 # in declaration order. The arrays are parallel, indexed by row; bash 3.2 has
@@ -240,6 +322,9 @@ pend() { local id="$1" desc="$2"; shift 2; add pend "$id" "$desc" "" "$@"; }    
 # rig leg, the unit mode that delivers its last feature ("" for none), description, fails-without feature
 leg() { add leg "$1" "$3 (fails without: $4)" "$2"; }
 special() { add "$1" "$2" "" ""; }                                               # G1 or G22, judged inline
+# root-run rows: --root runs them by name; --check prints them as ROOT, uncounted
+rootcheck() { local id="$1" desc="$2"; shift 2; add rootcheck "$id" "$desc" "" "$@"; } # row, description, tests...
+rootpend() { local id="$1" desc="$2"; shift 2; add rootpend "$id" "$desc" "" "$@"; }   # row, description (its change), tests...
 
 special g1 G1
 check G2 "AAD is length-prefixed and binds format, scope, kind, name, version, generation" \
@@ -322,7 +407,7 @@ pend U20 "a user-scope current copied back is refused against the floor log, wit
 	TestUserFloorRefusesCopiedBackCurrent
 pend U21 "install creates both logs service-user-owned 0600 and flagged; the listener refuses to start when a flag is clear; rig leg E1 (append-only files)" \
 	k3sm/pkg/install::TestKeystoreAppendOnlyFilesAtInstall k3sm/pkg/keystore::TestFlagCheckRefusesUnflagged
-pend U22 "floor --rebuild and audit --rotate stop the listener, hold the lock, flag the new file before touching the old; a crash at each step leaves a flagged file; rig leg E17 (append-only files)" \
+pend U22 "floor --rebuild and audit --rotate mark and stage under keystore- names in the root-owned data root, stop the listener, hold the lock, flag the new file before touching the old; a crash at each step leaves a flagged file; rig leg E17 (append-only files)" \
 	k3sm/cmd/k3sm::TestKeysFloorRebuildCrashOrder TestKeysAuditRotateCrashOrder
 pend U23 "every audited operation writes one v:1 line; no line carries a value or its length; readers ignore unknown fields (append-only files)" \
 	TestAuditLineNeverCarriesValue TestAuditReaderIgnoresUnknownFields
@@ -415,6 +500,8 @@ pend U66 "a synthesized GeneratedUID (prefix FFFFEEEE-DDDD-CCCC-BBBB-AAAA) is Er
 	k3sm/pkg/keystore::TestSynthesizedGeneratedUIDIsUnknown
 pend U67 "the revocation class (withdraw, rm, rotate, the withdrawal's floor line, the reconciler's deliver-delete and deliver-write of a withdrawal) bypasses the share past it and draws on the 4 MiB reserve above the hard cap, refused only when the reserve is exhausted; a no-op revocation is charged to the share; the reconciler's 3 MiB of the reserve is kept (socket operations)" \
 	k3sm/pkg/keystore/socket::TestRevocationBypassesShareUsesReserve TestNoOpRevocationChargedToShare TestReserveKeepsReconcilerPart
+rootpend U68 "root-run: the maintenance verbs refuse a symlink or swapped file planted at the marker, a staging name or the old log; creates are O_EXCL|O_NOFOLLOW through one data-root descriptor, fchown and fchflags on the descriptor before renameat; no log byte changes on a refusal (append-only files)" \
+	k3sm/cmd/k3sm::TestMaintenanceRefusesPlantedSymlinkAndSwap
 # >>> ADD NEW U ROWS (U64 upward) HERE, and add each to EXPECTED_ROWS and to mode_rows <<<
 
 leg E1 "files" "preconditions: secrets encryption on; one server; keystore-run/ and both logs present, service-user 0600, SF_APPEND set; the doctor user-scope row on; keystore.sh --check exits 0 on the build" "the append-only files"
@@ -467,6 +554,13 @@ pkg_rel() {
 	*) echo "./" ;;
 	esac
 }
+
+# --root: R1 and the root-run rows. It needs the row table and pkg_rel above.
+if [ "$mode" = root ]; then
+	rc=0
+	run_root_mode || rc=$?
+	exit "$rc"
+fi
 
 # nocgo reports whether package $1 runs with CGO_ENABLED=0, and so without
 # -race: the repos that import no cgo-backed code.
@@ -571,7 +665,7 @@ if [ "$mode" = listed ]; then
 			esac
 		elif [ -z "$missing" ]; then
 			row "$id" LISTED "$found named test(s) found$fb"
-		elif [ "${R_KIND[$i]}" = pend ]; then
+		elif [ "${R_KIND[$i]}" = pend ] || [ "${R_KIND[$i]}" = rootpend ]; then
 			row "$id" "MISSING (pending row)" "${missing# }$fb"
 			pend_missing=$((pend_missing + 1))
 		else
@@ -762,6 +856,7 @@ while [ "$i" -lt "$nrows" ]; do
 			fi
 			;;
 		pend) pending_row "$id" "${R_DESC[$i]}" ;;
+		rootpend | rootcheck) row "$id" ROOT "${R_DESC[$i]} (root-run row: --root runs it; pending here, not counted)" ;;
 		leg) judge_leg "$i" ;;
 		esac
 	fi
