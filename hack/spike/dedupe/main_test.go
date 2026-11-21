@@ -23,7 +23,7 @@ import (
 )
 
 // TestChunkersDetectShiftedContent proves the chunkers measure something: a
-// 1 KiB-aligned prefix of a buffer defeats fixed-size chunks, content-defined
+// 100-byte prefix on a buffer defeats fixed-size chunks, content-defined
 // chunks resync after it, and the pieces always reassemble the input.
 func TestChunkersDetectShiftedContent(t *testing.T) {
 	r := rand.New(rand.NewPCG(7, 7))
@@ -66,7 +66,8 @@ func TestChunkersDetectShiftedContent(t *testing.T) {
 
 // TestTensorMethodSeesUnchangedTensors proves the tensor method is not
 // vacuous: a LoRA fine-tune changes only q and v, so the tensor store adds
-// about their share of the file, while a quantization adds nearly everything.
+// about their share of the file, while a quantization adds nearly everything;
+// and the delta method recovers a small full fine-tune that exact methods miss.
 func TestTensorMethodSeesUnchangedTensors(t *testing.T) {
 	r := measure(smallShape)
 	find := func(container, a, b string) pairRow {
@@ -88,6 +89,13 @@ func TestTensorMethodSeesUnchangedTensors(t *testing.T) {
 		}
 		if lora.Added["file"] != 1 {
 			t.Errorf("%s lora file added %.3f, want 1", c, lora.Added["file"])
+		}
+		full := find(c, "base.bf16", "ft-full-0.001.bf16")
+		if full.Added["tensor"] < 0.99 || full.Added["tensor+xor-delta"] > 0.5 {
+			t.Errorf("%s small full fine-tune: tensor added %.3f (want ~1), xor-delta %.3f (want < 0.5)", c, full.Added["tensor"], full.Added["tensor+xor-delta"])
+		}
+		if lora.Added["tensor+xor-delta"] >= lora.Added["tensor"] {
+			t.Errorf("%s lora: xor-delta added %.3f, want below tensor's %.3f", c, lora.Added["tensor+xor-delta"], lora.Added["tensor"])
 		}
 		if q := find(c, "base.bf16", "base.q4_0"); q.Added["tensor"] < 0.95 {
 			t.Errorf("%s q4 tensor added %.3f, want ~1 across dtypes", c, q.Added["tensor"])

@@ -17,9 +17,8 @@
 # cluster, no privilege. The report states the limits of synthetic data.
 #
 # Usage: B1383.sh --measure [--evidence DIR]
-#   --evidence  where the report goes (created). Default: the workspace
-#               scratch ../k3sm-io.scratch/B1383-evidence-<date>/ when that
-#               directory exists beside the checkout, else a new temp dir.
+#   --evidence  where the report goes (created). Default: a new temp dir,
+#               printed on the last ladder line.
 # Exit 0 pass, 1 fail, 2 usage.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -35,14 +34,7 @@ case "${1:-}" in
 --evidence) [ $# -eq 2 ] || { echo "usage: $0 --measure [--evidence DIR]" >&2; exit 2; }; EVIDENCE="$2" ;;
 *) echo "usage: $0 --measure [--evidence DIR]" >&2; exit 2 ;;
 esac
-if [ -z "$EVIDENCE" ]; then
-	scratch="$(cd "$K3SM_ROOT/../.." && pwd)/k3sm-io.scratch"
-	if [ -d "$scratch" ]; then
-		EVIDENCE="$scratch/B1383-evidence-$(date +%F)"
-	else
-		EVIDENCE="$(mktemp -d)"
-	fi
-fi
+[ -n "$EVIDENCE" ] || EVIDENCE="$(mktemp -d)"
 
 PASS=0; FAIL=0
 ladder() {

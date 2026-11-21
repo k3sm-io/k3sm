@@ -278,6 +278,9 @@ func safetensorsLike(v variant) file {
 		off += len(t.Data)
 	}
 	h, _ := json.Marshal(hdr) // a map of strings and ints cannot fail to marshal
+	for len(h)%8 != 0 {
+		h = append(h, ' ') // the format pads its header to 8 bytes with spaces
+	}
 	var b bytes.Buffer
 	_ = binary.Write(&b, binary.LittleEndian, uint64(len(h)))
 	b.Write(h)
@@ -703,7 +706,12 @@ const limits = `
 - q8_0 and q4_0 use a bf16 block scale where llama.cpp uses f16; MLX's group-64 scale-and-bias layout is not
   modelled. Neither gives a quantization a byte in common with its base.
 - Tensor extents come from the generator, not from parsing headers.
-- One family at one size: the shares hold per tensor, so size moves the bytes, not the shares.
+- One family at one size. The exact tensor shares hold at any size; the chunker shares do not, because a
+  chunk that straddles a tensor edge is lost, and here a matrix (about 290 KB) is close to the 256 KiB chunk.
+  Real tensors of 10 to 100 MB lose proportionally less at their edges.
+- Fixed chunks match here only because the variants' headers pad to the same 8-byte length. A real
+  header whose padded length differs (offsets, dtypes, metadata) shifts every offset after it, and fixed
+  chunks then match nothing, as the framing row shows; CDC and tensors do not care.
 `
 
 func main() {
