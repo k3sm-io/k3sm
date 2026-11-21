@@ -300,6 +300,11 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
 
 ### Fixed
 
+- An image or artifact pull reserves its declared layer bytes before it fetches anything. A claim above
+  the volume's capacity, or above free space plus what one prune pass could free (planned as a dry run),
+  is refused with nothing evicted, as `FailedPrecondition` or `ResourceExhausted`. Before this, a manifest
+  declaring more than could ever be freed emptied the unreferenced cache on every attempt and then failed.
+  See [A Pull Reserves Its Space](docs/user/images.md#a-pull-reserves-its-space).
 - `k3sm install` and the netd helper keep the data root's image store, Pod trees, volumes and
   guest-artifact cache (`blobs`, `unpacked`, `snapshots`, `guest-artifacts`, `pods`, `storage`) and
   the service user's `.kube` at mode `0700`. They were `0750` with group `staff`, every login
