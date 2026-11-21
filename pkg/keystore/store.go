@@ -107,8 +107,8 @@ type FileStore struct {
 	// entryMade is called between a new entry directory's mkdir and its open,
 	// where a test swaps the directory.
 	entryMade func(name string)
-	// dirMade is called inside mkdirAt, between the mkdir and the open that
-	// checks it, where a test swaps the directory.
+	// dirMade is called inside mkdirAt, between the mkdir and the Lstat that
+	// takes the new directory's identity, where a test swaps the directory.
 	dirMade func(name string)
 	// euid is the effective uid that creates the store's directories, which
 	// a new directory must be owned by before it is handed over.

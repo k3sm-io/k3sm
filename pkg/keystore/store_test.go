@@ -1378,21 +1378,31 @@ func TestCreateEntryRefusesSwappedDirectory(t *testing.T) {
 }
 
 // TestMkdirRefusesSwappedDirectory: a directory rename-swapped into the name
-// between a mkdir and the open that checks it, or one not owned by the euid
-// that made it, is refused as ErrCorrupt before anything is chowned, and the
-// directory found there is left as it was. It covers the entries' directory,
-// made by path through mkdirOwned, and an entry directory, made by mkdirAt.
+// between a mkdir and the Lstat that takes its identity, or one not owned by
+// the euid that made it, is refused as ErrCorrupt before anything is chowned,
+// and the directory found there is left as it was. It covers the entries'
+// directory, made by path through mkdirOwned, and an entry directory, made by
+// mkdirAt.
+//
+// The swap comes before the Lstat, so the identity check sees the swapped-in
+// directory and each case is caught by one later check: the symlink by the
+// no-follow open, the same-owner non-empty directory by the emptiness check
+// alone, and the empty directory by the owner check alone. The test runs as
+// the one user that both creates and swaps, so for that case the euid seam
+// reports another creator once the swap is made, as root creating a directory
+// the service user swaps is.
 func TestMkdirRefusesSwappedDirectory(t *testing.T) {
 	ctx := context.Background()
 	for _, target := range []string{"keystore", "b"} {
 		for _, tt := range []struct {
-			name    string
-			files   []string
-			symlink bool
+			name       string
+			files      []string
+			symlink    bool
+			otherOwner bool
 		}{
-			{"a non-empty directory", []string{"v1"}, false},
-			{"an empty directory", nil, false},
-			{"a symlink to a directory", []string{"v1"}, true},
+			{"a same-owner non-empty directory", []string{"v1"}, false, false},
+			{"an empty directory owned by another user", nil, false, true},
+			{"a symlink to a directory", []string{"v1"}, true, false},
 		} {
 			t.Run(target+": "+tt.name, func(t *testing.T) {
 				s, server := newTestStore(t)
@@ -1418,6 +1428,13 @@ func TestMkdirRefusesSwappedDirectory(t *testing.T) {
 						t.Fatal(err)
 					}
 				}
+				swapped := false
+				s.euid = func() int {
+					if swapped && tt.otherOwner {
+						return os.Geteuid() + 1
+					}
+					return os.Geteuid()
+				}
 				s.dirMade = func(name string) {
 					if name != target {
 						return
@@ -1428,6 +1445,7 @@ func TestMkdirRefusesSwappedDirectory(t *testing.T) {
 					if err := os.Rename(from, at); err != nil {
 						t.Error(err)
 					}
+					swapped = true
 				}
 				var chowned []string
 				s.chown = func(f *os.File, uid, gid int) error { chowned = append(chowned, f.Name()); return nil }

@@ -170,22 +170,27 @@ func (s *FileStore) mkdirOwned(path string) error {
 // for a caller that opens it again to check it reached the same directory.
 //
 // Before the handover it opens the name without following a symlink and
-// requires, on that descriptor, the directory the mkdir made (its identity is
-// taken right after the mkdir), owned by the euid that made it, and empty.
-// Anything else is a directory swapped in between, which may be another
-// entry or one the service user prepared, so it is refused as ErrCorrupt and
-// nothing is chowned or chmodded. An existing name is an error matching
-// fs.ErrExist. Once handed over, parent is fsynced, so the new name is
-// durable.
+// requires, on that descriptor, a directory owned by the euid that made it,
+// empty, and the same file an Lstat of the name saw after the mkdir. That
+// Lstat is not atomic with the mkdir, so a directory swapped in before it is
+// the one it sees: the owner and emptiness checks are what refuse such a
+// directory, and the identity check refuses only a swap between the Lstat and
+// the open. A directory that fails any check may be another entry or one the
+// service user prepared, so it is refused as ErrCorrupt and nothing is chowned
+// or chmodded. An existing name is an error matching fs.ErrExist. Once handed
+// over, parent is fsynced, so the new name is durable.
 func (s *FileStore) mkdirAt(parent *os.Root, name string) (fs.FileInfo, error) {
 	if err := parent.Mkdir(name, dirMode); err != nil {
 		return nil, err
 	}
+	s.dirMade(name)
 	made, err := parent.Lstat(name)
 	if err != nil {
 		return nil, fmt.Errorf("stat the new directory %s: %w", name, err)
 	}
-	s.dirMade(name)
+	if !made.IsDir() {
+		return nil, fmt.Errorf("%w: the new directory %s was replaced after its mkdir (mode %s)", ErrCorrupt, name, made.Mode())
+	}
 	f, opened, err := openNoFollow(parent, name, os.O_RDONLY|syscall.O_DIRECTORY, 0)
 	if err != nil {
 		// A name that no longer holds the directory the mkdir made (a symlink,
@@ -215,8 +220,9 @@ func (s *FileStore) mkdirAt(parent *os.Root, name string) (fs.FileInfo, error) {
 	return opened, nil
 }
 
-// checkNewDir checks the directory open on f is the one mkdirAt made: the
-// same file as made, a directory, owned by the euid that made it, and empty.
+// checkNewDir checks the directory open on f is one mkdirAt may hand over:
+// the same file as made, a directory, owned by the euid that made it, and
+// empty.
 func (s *FileStore) checkNewDir(f *os.File, made, opened fs.FileInfo) error {
 	if !made.IsDir() || !opened.IsDir() || !os.SameFile(made, opened) {
 		return errors.New("was replaced after its mkdir")
