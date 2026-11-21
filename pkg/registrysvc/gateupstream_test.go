@@ -122,6 +122,14 @@ func assertUnavailable502(t *testing.T, r rawResponse) {
 	}
 }
 
+// advance moves a synctest bubble's clock forward by d, then waits for every
+// goroutine in the bubble to block. Inside the bubble this is virtual time.
+func advance(t *testing.T, d time.Duration) {
+	t.Helper()
+	<-time.NewTimer(d).C
+	synctest.Wait()
+}
+
 // TestGateAnswers502WhenTheUpstreamStalls: a loopback registry that reads a
 // manifest PUT and never answers costs the client a 502 UNAVAILABLE at the
 // manifest response-header bound, not a wait until the client gives up. The
@@ -140,8 +148,7 @@ func TestGateAnswers502WhenTheUpstreamStalls(t *testing.T) {
 		start := time.Now()
 		done := sendRaw(c, "PUT", req)
 
-		time.Sleep(bound - time.Nanosecond)
-		synctest.Wait()
+		advance(t, bound-time.Nanosecond)
 		select {
 		case r := <-done:
 			t.Fatalf("answered after %v, before the %v bound: %+v", time.Since(start), bound, r)
@@ -293,8 +300,7 @@ func TestGateLeavesBlobUploadsOutOfTheHeaderBound(t *testing.T) {
 			"Authorization: %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", digestA, basic(tokTeam))
 		done := sendRaw(c, "PUT", req)
 
-		time.Sleep(short + time.Second)
-		synctest.Wait()
+		advance(t, short+time.Second)
 		select {
 		case r := <-done:
 			t.Fatalf("answered after %v: %+v; want the upload still waiting on the registry", short+time.Second, r)
