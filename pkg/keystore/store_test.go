@@ -29,6 +29,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -569,22 +570,65 @@ func TestDeletePlantedNonDirectory(t *testing.T) {
 	}
 }
 
-// TestConfigRefused: a zero service uid, an empty Dir, MasterDir or DataRoot
-// makes every operation fail closed, before anything is created.
+// TestDeleteDirectoryAtCurrent: a non-empty directory planted at an entry's
+// current is removed with the entry, not left to fail every retried Delete,
+// and the entry's floor is removed with it, as a normal Delete removes it.
+func TestDeleteDirectoryAtCurrent(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	mustPut(t, s, "a", KindOpaque, []byte("a"))
+	cur := filepath.Join(server, "keystore", "a", currentName)
+	remove(t, cur)
+	if err := os.Mkdir(cur, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(cur, "x"), "planted")
+	if _, ok := floorOf(t, server)["a"]; !ok {
+		t.Fatal("no floor entry for a before Delete")
+	}
+	if err := s.Delete(ctx, "a"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if f, ok := floorOf(t, server)["a"]; ok {
+		t.Fatalf("floor entry for a after Delete = %+v, want it removed with the entry", f)
+	}
+	if _, err := os.Lstat(filepath.Join(server, "keystore", "a")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("entry directory after Delete: %v, want it gone", err)
+	}
+	if _, _, err := s.Current(ctx, "a"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Current after Delete: %v, want ErrNotFound", err)
+	}
+}
+
+// TestConfigRefused: a zero service uid, an empty, relative or unclean Dir,
+// MasterDir or DataRoot, or a MasterDir at or inside Dir makes every
+// operation fail closed, before anything is created.
 func TestConfigRefused(t *testing.T) {
 	ctx := context.Background()
 	for name, edit := range map[string]func(c *Config){
-		"zero uid":           func(c *Config) { c.UID = 0 },
-		"empty Dir":          func(c *Config) { c.Dir = "" },
-		"empty MasterDir":    func(c *Config) { c.MasterDir = "" },
-		"empty DataRoot":     func(c *Config) { c.DataRoot = "" },
-		"nothing set at all": func(c *Config) { *c = Config{} },
+		"zero uid":                   func(c *Config) { c.UID = 0 },
+		"empty Dir":                  func(c *Config) { c.Dir = "" },
+		"empty MasterDir":            func(c *Config) { c.MasterDir = "" },
+		"nothing set at all":         func(c *Config) { *c = Config{} },
+		"Dir with a trailing /":      func(c *Config) { c.Dir += "/" },
+		"relative MasterDir":         func(c *Config) { c.MasterDir = filepath.Join("cred", "keystore-master") },
+		"MasterDir inside Dir":       func(c *Config) { c.MasterDir = filepath.Join(c.Dir, "keystore-master") },
+		"MasterDir equal to Dir":     func(c *Config) { c.MasterDir = c.Dir },
+		"relative Dir":               func(c *Config) { c.Dir = "keystore" },
+		"MasterDir with a dot-dot":   func(c *Config) { c.MasterDir = filepath.Join(c.Dir, "..") + "/../server/cred/keystore-master" },
+		"empty DataRoot":             func(c *Config) { c.DataRoot = "" },
+		"relative DataRoot":          func(c *Config) { c.DataRoot = "data" },
+		"DataRoot with a trailing /": func(c *Config) { c.DataRoot += "/" },
+		"DataRoot with a dot-dot":    func(c *Config) { c.DataRoot = filepath.Join(c.Dir, "..", "..") + "/server/.." },
 	} {
 		t.Run(name, func(t *testing.T) {
 			server := filepath.Join(t.TempDir(), "server")
 			if err := os.Mkdir(server, 0o700); err != nil {
 				t.Fatal(err)
 			}
+			// A relative path resolves inside server, where the check below
+			// would see anything it created.
+			t.Chdir(server)
 			cfg := Config{
 				Dir:       filepath.Join(server, "keystore"),
 				MasterDir: filepath.Join(server, "cred", "keystore-master"),
@@ -783,7 +827,11 @@ func TestLockExcludes(t *testing.T) {
 			_, val, err := s.Current(ctx, "a")
 			readDone <- read{val, err}
 		}()
-		time.Sleep(s.lockWait / 2) // bubble time: the reader retries throughout
+		// Half the lock bound passes in bubble time, so the reader retries
+		// throughout it; synctest.Wait then returns once the reader is durably
+		// blocked in its next retry wait, and it must not have run.
+		held := time.NewTimer(s.lockWait / 2)
+		<-held.C
 		synctest.Wait()
 		select {
 		case r := <-readDone:
@@ -1244,6 +1292,87 @@ func TestEntryWithNoPointer(t *testing.T) {
 	}
 }
 
+// TestMkdirSyncsParent: every directory a Put creates has its parent fsynced
+// before its own step, so a power loss cannot keep what is written under it
+// while losing its name; and a failed parent fsync fails the Put there, with
+// that directory's step never reached and nothing written after it.
+func TestMkdirSyncsParent(t *testing.T) {
+	ctx := context.Background()
+	// parentOf maps each directory a first Put creates to its parent.
+	parentOf := map[string]string{"keystore": "server", "cred": "server", "keystore-master": "cred", "k": "keystore"}
+	t.Run("order", func(t *testing.T) {
+		var events []string
+		setSyncDir(t, func(root *os.Root) error {
+			events = append(events, "fsync "+filepath.Base(root.Name()))
+			return fsyncDir(root)
+		})
+		s, _ := newTestStore(t)
+		s.step = func(name string) error { events = append(events, name); return nil }
+		mustPut(t, s, "k", KindOpaque, []byte("x"))
+		seen := 0
+		for i, ev := range events {
+			dir, ok := strings.CutPrefix(ev, "mkdir ")
+			if !ok {
+				continue
+			}
+			seen++
+			if want := "fsync " + parentOf[dir]; i == 0 || events[i-1] != want {
+				t.Errorf("%s not directly after %s: %v", ev, want, events)
+			}
+		}
+		if seen != len(parentOf) {
+			t.Fatalf("saw %d mkdir steps, want %d: %v", seen, len(parentOf), events)
+		}
+	})
+	// Each case fails the nth fsync of the parent, the one that precedes dir.
+	for _, tc := range []struct {
+		dir string
+		nth int
+	}{{"keystore", 1}, {"cred", 2}, {"keystore-master", 1}, {"k", 1}} {
+		t.Run("fail before "+tc.dir, func(t *testing.T) {
+			parent := parentOf[tc.dir]
+			n := 0
+			setSyncDir(t, func(root *os.Root) error {
+				if filepath.Base(root.Name()) == parent {
+					if n++; n == tc.nth {
+						return errors.New("injected fsync failure")
+					}
+				}
+				return fsyncDir(root)
+			})
+			s, _ := newTestStore(t)
+			var steps []string
+			s.step = func(name string) error { steps = append(steps, name); return nil }
+			v, err := s.Put(ctx, "k", KindOpaque, []byte("x"))
+			if err == nil || !strings.Contains(err.Error(), "injected fsync failure") || v != (Version{}) {
+				t.Fatalf("Put = %+v %v, want the injected fsync failure and no version", v, err)
+			}
+			if slices.Contains(steps, "mkdir "+tc.dir) {
+				t.Fatalf("steps %v reached mkdir %s past its failed parent fsync", steps, tc.dir)
+			}
+			if slices.Contains(steps, "write current") {
+				t.Fatalf("steps %v went on to write the pointer", steps)
+			}
+			setSyncDir(t, fsyncDir)
+			if _, _, err := s.Current(ctx, "k"); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("Current after the failed Put: %v, want ErrNotFound", err)
+			}
+			if got, err := s.List(ctx); err != nil || len(got) != 0 {
+				t.Fatalf("List after the failed Put = %+v %v, want no entry", got, err)
+			}
+			mustPut(t, s, "k", KindOpaque, []byte("retried"))
+		})
+	}
+}
+
+// setSyncDir replaces the syncDir seam for the rest of t.
+func setSyncDir(t *testing.T, fn func(*os.Root) error) {
+	t.Helper()
+	old := syncDir
+	syncDir = fn
+	t.Cleanup(func() { syncDir = old })
+}
+
 // TestPutCrashAtEveryStep injects a crash at each durable step of a Put, then
 // checks the name is not an entry and a retried Put stores the retried value.
 func TestPutCrashAtEveryStep(t *testing.T) {
@@ -1254,9 +1383,9 @@ func TestPutCrashAtEveryStep(t *testing.T) {
 		s.step = func(name string) error { steps = append(steps, name); return nil }
 		mustPut(t, s, "k", KindOpaque, []byte("x"))
 	}
-	// Each directory's step comes after its parent is fsynced, so the master
-	// directory is durable before the master is written into it, and the
-	// entry directory before its files.
+	// The steps come in this order, each directory's mkdir before anything
+	// written into it; that each parent is fsynced before its directory's
+	// step is TestMkdirSyncsParent's to check.
 	want := "mkdir keystore,mkdir cred,mkdir keystore-master,write master,write master.sha256,mkdir k,write generation,write v1,write current,write keystore-floor.json"
 	if strings.Join(steps, ",") != want {
 		t.Fatalf("Put steps = %v, want %s", steps, want)
@@ -1400,21 +1529,31 @@ func TestCreateEntryRefusesSwappedDirectory(t *testing.T) {
 }
 
 // TestMkdirRefusesSwappedDirectory: a directory rename-swapped into the name
-// between a mkdir and the open that checks it, or one not owned by the euid
-// that made it, is refused as ErrCorrupt before anything is chowned, and the
-// directory found there is left as it was. It covers the entries' directory,
-// made by path through mkdirOwned, and an entry directory, made by mkdirAt.
+// between a mkdir and the Lstat that takes its identity, or one not owned by
+// the euid that made it, is refused as ErrCorrupt before anything is chowned,
+// and the directory found there is left as it was. It covers the entries'
+// directory, made by path through mkdirOwned, and an entry directory, made by
+// mkdirAt.
+//
+// The swap comes before the Lstat, so the identity check sees the swapped-in
+// directory and each case is caught by one later check: the symlink by the
+// no-follow open, the same-owner non-empty directory by the emptiness check
+// alone, and the empty directory by the owner check alone. The test runs as
+// the one user that both creates and swaps, so for that case the euid seam
+// reports another creator once the swap is made, as root creating a directory
+// the service user swaps is.
 func TestMkdirRefusesSwappedDirectory(t *testing.T) {
 	ctx := context.Background()
 	for _, target := range []string{"keystore", "b"} {
 		for _, tt := range []struct {
-			name    string
-			files   []string
-			symlink bool
+			name       string
+			files      []string
+			symlink    bool
+			otherOwner bool
 		}{
-			{"a non-empty directory", []string{"v1"}, false},
-			{"an empty directory", nil, false},
-			{"a symlink to a directory", []string{"v1"}, true},
+			{"a same-owner non-empty directory", []string{"v1"}, false, false},
+			{"an empty directory owned by another user", nil, false, true},
+			{"a symlink to a directory", []string{"v1"}, true, false},
 		} {
 			t.Run(target+": "+tt.name, func(t *testing.T) {
 				s, server := newTestStore(t)
@@ -1440,6 +1579,13 @@ func TestMkdirRefusesSwappedDirectory(t *testing.T) {
 						t.Fatal(err)
 					}
 				}
+				swapped := false
+				s.euid = func() int {
+					if swapped && tt.otherOwner {
+						return os.Geteuid() + 1
+					}
+					return os.Geteuid()
+				}
 				s.dirMade = func(name string) {
 					if name != target {
 						return
@@ -1450,6 +1596,7 @@ func TestMkdirRefusesSwappedDirectory(t *testing.T) {
 					if err := os.Rename(from, at); err != nil {
 						t.Error(err)
 					}
+					swapped = true
 				}
 				var chowned []string
 				s.chown = func(f *os.File, uid, gid int) error { chowned = append(chowned, f.Name()); return nil }

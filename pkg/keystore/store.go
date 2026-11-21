@@ -28,6 +28,7 @@ import (
 	"io/fs"
 	"math"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -80,7 +81,8 @@ type Config struct {
 	// creates is handed to them, and the entries' directory, cred/, the master
 	// directory and the master file must be owned by UID.
 	//
-	// A UID of 0, an empty Dir, an empty MasterDir or an empty DataRoot
+	// A UID of 0, a Dir, MasterDir or DataRoot that is not absolute or not
+	// equal to its own filepath.Clean, or a MasterDir equal to or inside Dir
 	// makes every operation fail.
 	UID, GID uint32
 	// DataRoot is the data root, /var/lib/k3sm, which holds the root-owned
@@ -121,8 +123,8 @@ type FileStore struct {
 	// entryMade is called between a new entry directory's mkdir and its open,
 	// where a test swaps the directory.
 	entryMade func(name string)
-	// dirMade is called inside mkdirAt, between the mkdir and the open that
-	// checks it, where a test swaps the directory.
+	// dirMade is called inside mkdirAt, between the mkdir and the Lstat that
+	// takes the new directory's identity, where a test swaps the directory.
 	dirMade func(name string)
 	// euid is the effective uid that creates the store's directories, which
 	// a new directory must be owned by before it is handed over.
@@ -152,8 +154,11 @@ func New(cfg Config) *FileStore {
 
 // checkConfig refuses a store every operation must fail closed on: a zero
 // service uid, which would hand the service user's files to root and accept
-// root-owned ones, or an empty Dir, MasterDir or DataRoot, which would
-// resolve against the working directory.
+// root-owned ones; a Dir, MasterDir or DataRoot that is empty or relative,
+// which would resolve against the working directory, or not equal to its own
+// filepath.Clean, whose last component (a trailing slash, a "..") would not be
+// the directory the store opens it as; or a MasterDir equal to or inside Dir,
+// which would put the master among the entries and in every backup of them.
 func (s *FileStore) checkConfig() error {
 	switch {
 	case s.uid == 0:
@@ -164,6 +169,17 @@ func (s *FileStore) checkConfig() error {
 		return fmt.Errorf("%w: MasterDir is empty", errInvalidConfig)
 	case s.dataRoot == "":
 		return fmt.Errorf("%w: DataRoot is empty", errInvalidConfig)
+	}
+	for _, p := range []struct{ field, path string }{{"Dir", s.dir}, {"MasterDir", s.masterDir}, {"DataRoot", s.dataRoot}} {
+		if !filepath.IsAbs(p.path) {
+			return fmt.Errorf("%w: %s %q is not absolute", errInvalidConfig, p.field, p.path)
+		}
+		if c := filepath.Clean(p.path); c != p.path {
+			return fmt.Errorf("%w: %s %q is not clean (%q)", errInvalidConfig, p.field, p.path, c)
+		}
+	}
+	if rel, err := filepath.Rel(s.dir, s.masterDir); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("%w: MasterDir %q is Dir %q or inside it", errInvalidConfig, s.masterDir, s.dir)
 	}
 	return nil
 }
@@ -472,8 +488,10 @@ func listEntry(e *entry, k keys, fl floor) Entry {
 // directory holding only generation and v1 is an interrupted Put instead,
 // which is not an entry: Delete, called again, removes it and answers
 // ErrNotFound, and so does the next Put of the name. Delete reads nothing
-// inside the entry, so it removes one List reports as corrupt. A symlink or
-// any other non-directory at the name is unlinked without being followed.
+// inside the entry but its generation, so it removes one List reports as
+// corrupt, whatever is planted at its current, and still removes the floor
+// entry that records its generation. A symlink or any other non-directory at
+// the name is unlinked without being followed.
 //
 // The floor is changed only for an entry it records: an interrupted Put's
 // generation is never recorded (or it would be a lost pointer), and a
@@ -556,7 +574,10 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	}
 	if !damaged {
 		defer e.close()
-		if err := e.root.Remove(currentName); err != nil {
+		// RemoveAll, not Remove: anything may be planted at current, and a
+		// non-empty directory there would fail Remove on every retry.
+		// RemoveAll removes a symlink itself, never what it names.
+		if err := e.root.RemoveAll(currentName); err != nil {
 			return err
 		}
 		if err := syncDir(e.root); err != nil {
