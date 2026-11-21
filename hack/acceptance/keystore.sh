@@ -83,8 +83,7 @@ pend G12 "Rewrap resumes after a crash at every step (PR 3)"
 pend G13 "a crash between the master renames is completed (PR 3)"
 partial G14 "one lock with a bounded wait that excludes, and no read that blocks (library: Put, Delete and the reads)" \
 	"Rotate and Rewrap take the same lock (PR 2: Rotate, PR 3: Rewrap)" \
-	TestLockBoundedWait TestLockExcludes TestConcurrentOperations TestFIFORefused TestReadDirNamesBound \
-	TestFirstRunRaceIsRetryable
+	TestLockBoundedWait TestLockExcludes TestConcurrentOperations TestFIFORefused TestReadDirNamesBound
 check G15 "files a root verb writes are the service user's, at the layout's modes, inside the store" \
 	TestOwnership TestCredSymlinkRefused TestRefusesSymlinks TestMkdirRefusesSwappedDirectory \
 	TestCreateEntryRefusesSwappedDirectory TestConfigRefused

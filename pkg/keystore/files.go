@@ -69,14 +69,6 @@ var (
 	// not a regular file, or over its size bound. A reader turns it into its
 	// own refusal; any other read error is an I/O failure and stays one.
 	errBadFile = errors.New("not a readable regular file")
-	// errConcurrentCreate reports a directory this operation just made that
-	// holds only the lock file: a concurrent first operation found it and
-	// took the lock in it between the mkdir and the check. It is refused, and
-	// not handed over, as any directory holding something is, but with an
-	// error that says to try again, as errLockTimeout does, rather than
-	// ErrCorrupt, whose advice (restore from backup) is wrong for a race. A
-	// retry finds the directory existing and checks it as an existing one.
-	errConcurrentCreate = errors.New("another keystore operation created the directory at the same time; try again")
 )
 
 // openDir opens the directory at path as a root and checks it (see
@@ -211,9 +203,7 @@ func (s *FileStore) mkdirAt(parent *os.Root, name string) (fs.FileInfo, error) {
 		return nil, fmt.Errorf("open %s: %w", name, err)
 	}
 	defer func() { _ = f.Close() }() // read-only; nothing to flush
-	if err := s.checkNewDir(f, made, opened); errors.Is(err, errConcurrentCreate) {
-		return nil, fmt.Errorf("the new directory %s: %w", name, err)
-	} else if err != nil {
+	if err := s.checkNewDir(f, made, opened); err != nil {
 		return nil, fmt.Errorf("%w: the new directory %s %w", ErrCorrupt, name, err)
 	}
 	if err := s.own(f, dirMode); err != nil {
@@ -233,8 +223,7 @@ func (s *FileStore) mkdirAt(parent *os.Root, name string) (fs.FileInfo, error) {
 
 // checkNewDir checks the directory open on f is one mkdirAt may hand over:
 // the same file as made, a directory, owned by the euid that made it, and
-// empty. A directory that passes every check but holds only the lock file is
-// errConcurrentCreate; anything else it holds fails as "is not empty".
+// empty.
 func (s *FileStore) checkNewDir(f *os.File, made, opened fs.FileInfo) error {
 	if !made.IsDir() || !opened.IsDir() || !os.SameFile(made, opened) {
 		return errors.New("was replaced after its mkdir")
@@ -246,19 +235,14 @@ func (s *FileStore) checkNewDir(f *os.File, made, opened fs.FileInfo) error {
 	if euid := s.euid(); int64(st.Uid) != int64(euid) {
 		return fmt.Errorf("is owned by uid %d, not by its creator, uid %d", st.Uid, euid)
 	}
-	// Two names are enough to tell the lock file alone from anything more.
-	names, err := f.Readdirnames(2)
+	names, err := f.Readdirnames(1)
+	if len(names) > 0 {
+		return errors.New("is not empty")
+	}
 	if err != nil && !errors.Is(err, io.EOF) {
 		return fmt.Errorf("could not be listed: %w", err)
 	}
-	switch {
-	case len(names) == 0:
-		return nil
-	case len(names) == 1 && names[0] == lockName:
-		return errConcurrentCreate
-	default:
-		return errors.New("is not empty")
-	}
+	return nil
 }
 
 // own applies the service user's ownership and mode to an open file or
