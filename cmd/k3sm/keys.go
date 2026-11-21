@@ -420,7 +420,9 @@ func (v *keysVerb) readValue(in string) ([]byte, error) {
 // openValueFile opens --in FILE for reading: a regular file, reached without
 // following a symlink, and opened non-blocking so a FIFO is refused rather
 // than waited on. A file group or others can read is used, with a warning:
-// the value is already exposed there.
+// the value is already exposed there. So is one group or others can write,
+// or that another user than this process's (root) owns, with a warning that
+// someone else could have chosen the value.
 func (v *keysVerb) openValueFile(path string) (*os.File, error) {
 	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
@@ -437,6 +439,12 @@ func (v *keysVerb) openValueFile(path string) (*os.File, error) {
 	}
 	if fi.Mode().Perm()&0o044 != 0 {
 		fmt.Fprintf(v.env.stderr, "k3sm keys %s: warning: %s is mode %04o, readable by group or others: keep a value file readable by root only, and delete it once stored\n", v.name, path, fi.Mode().Perm())
+	}
+	if fi.Mode().Perm()&0o022 != 0 {
+		fmt.Fprintf(v.env.stderr, "k3sm keys %s: warning: %s is mode %04o, writable by group or others, who could have chosen the value: keep a value file writable by root only\n", v.name, path, fi.Mode().Perm())
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); !ok || int64(st.Uid) != int64(os.Geteuid()) {
+		fmt.Fprintf(v.env.stderr, "k3sm keys %s: warning: %s is not owned by root, so its owner could have chosen the value: keep a value file owned by root\n", v.name, path)
 	}
 	return f, nil
 }

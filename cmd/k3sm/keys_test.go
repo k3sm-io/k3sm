@@ -765,7 +765,7 @@ func TestKeysReadValueOneBuffer(t *testing.T) {
 
 // TestKeysInFileChecks: --in FILE reads only a regular file, reached without
 // following a symlink and without blocking on a FIFO, and warns when group or
-// others can read it.
+// others can read or write it, or another user than root owns it.
 func TestKeysInFileChecks(t *testing.T) {
 	for name, mk := range map[string]func(t *testing.T, p string){
 		"directory": func(t *testing.T, p string) {
@@ -810,6 +810,39 @@ func TestKeysInFileChecks(t *testing.T) {
 		}
 		h.mustRun(0, "put", "system/a", "--in", p)
 		if !strings.Contains(h.stderr.String(), "group or others") {
+			t.Errorf("stderr %q does not warn", h.stderr.String())
+		}
+	})
+	for _, mode := range []fs.FileMode{0o620, 0o602} {
+		t.Run(fmt.Sprintf("warns on a file at %04o", mode), func(t *testing.T) {
+			h := newKeysHarness(t)
+			p := filepath.Join(t.TempDir(), "value")
+			if err := os.WriteFile(p, []byte("v"), mode); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(p, mode); err != nil {
+				t.Fatal(err)
+			}
+			h.mustRun(0, "put", "system/a", "--in", p)
+			if !strings.Contains(h.stderr.String(), "writable by group or others") {
+				t.Errorf("stderr %q does not warn", h.stderr.String())
+			}
+		})
+	}
+	t.Run("warns on a file another user owns", func(t *testing.T) {
+		// Only root can make a file another user owns; the root run of this
+		// binary covers it.
+		if !keysAsRoot() {
+			t.Skip("needs root to give the file to another user")
+		}
+		h := newKeysHarness(t)
+		p := filepath.Join(t.TempDir(), "value")
+		if err := os.WriteFile(p, []byte("v"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		keysGiveToService(t, p)
+		h.mustRun(0, "put", "system/a", "--in", p)
+		if !strings.Contains(h.stderr.String(), "not owned by root") {
 			t.Errorf("stderr %q does not warn", h.stderr.String())
 		}
 	})
