@@ -841,3 +841,46 @@ func TestRewrapRefusesLiveMasterFirst(t *testing.T) {
 		t.Fatalf("master.next.sha256 was removed: %v", err)
 	}
 }
+
+// TestRewrapUserScopesBeforeSwap: a .user created while a Rewrap runs stops
+// it before the master swap with ErrScopeUnsupported. The master is left as
+// it was, master.next is left agreeing, every record reads, and once .user is
+// gone a rerun with the same key completes the Rewrap.
+func TestRewrapUserScopesBeforeSwap(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	vals := seedRewrap(t, s)
+	old, err := os.ReadFile(masterPath(server, masterName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	user := filepath.Join(server, "keystore", userScopesName)
+	s.step = func(name string) error {
+		if name == "rename b/current" { // the last commit step
+			if err := os.Mkdir(user, 0o700); err != nil {
+				t.Error(err)
+			}
+		}
+		return nil
+	}
+	if err := s.Rewrap(ctx, rewrapKey(1)); !errors.Is(err, ErrScopeUnsupported) {
+		t.Fatalf("Rewrap with %s created before the swap: %v, want ErrScopeUnsupported", userScopesName, err)
+	}
+	s.step = func(string) error { return nil }
+	if now, _ := os.ReadFile(masterPath(server, masterName)); !bytes.Equal(now, old) {
+		t.Fatalf("master = %x, want the old master left in place", now)
+	}
+	if got, err := os.ReadFile(masterPath(server, masterNextName)); err != nil || !bytes.Equal(got, rewrapKey(1)) {
+		t.Fatalf("master.next = %x, %v; want the new key left for the rerun", got, err)
+	}
+	checkRewrapValues(t, s, vals)
+	if err := os.Remove(user); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rewrap(ctx, rewrapKey(1)); err != nil {
+		t.Fatalf("Rewrap rerun with the same key: %v", err)
+	}
+	checkMasterIs(t, server, rewrapKey(1))
+	checkUnderKey(t, server, rewrapKey(1))
+	checkRewrapValues(t, s, vals)
+}

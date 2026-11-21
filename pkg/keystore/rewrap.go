@@ -151,6 +151,13 @@ func (s *FileStore) rewrap(ctx context.Context, newMaster []byte) error {
 	if err := s.commitNew(ctx, root, fl, plan, old, next); err != nil {
 		return err
 	}
+	// .user is checked once more, last thing before the swap: one created
+	// during the run stops it here, with every record readable (under the
+	// master or master.next) and master.next agreeing, so a rerun with the
+	// same key completes it once .user is gone.
+	if err := refuseUserScopes(root); err != nil {
+		return fmt.Errorf("records were re-sealed under %s, but the master was not swapped: %w", masterNextName, err)
+	}
 	if err := s.swapMaster(mroot, next); err != nil {
 		return err
 	}
