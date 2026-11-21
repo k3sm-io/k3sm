@@ -206,7 +206,10 @@ install` ("User scope", "On-disk layout").
   everything under it. Phase A exposes it as a verb because the maintainer ruled the
   master is created and rotated only by root-run verbs. `Store.Rewrap` keeps taking the
   new key as an argument so tests can drive it; the verb is its only production caller and
-  always passes a freshly minted key.
+  always passes a key k3sm minted. As built, `rewrap --key-out FILE` mints the key and saves
+  it to FILE before anything changes, and `rewrap --key-in FILE` reads back only that saved
+  key, to finish an interrupted rewrap (the recovery under "Rewrap"); the key is still minted
+  by k3sm, never made by the operator.
 - **Who reads it.** The server process (the delivery reconciler), as the service user,
   through the same checked open as every other reader.
 
@@ -565,8 +568,9 @@ root-owned addition is `keystore-run/maintenance`.
 ### Rewrap
 
 Rewrap re-seals every record under a new master. It is `k3sm keys rewrap`, root-run: the
-verb mints a new 32-byte master from `crypto/rand`, takes the exclusive lock, and runs the
-steps below. "A crash leaves nothing unreadable" needs the *records*, not only the two
+verb mints a new 32-byte master from `crypto/rand` and saves it to the `--key-out` file (or,
+with `--key-in`, reads back a key an earlier `--key-out` saved), takes the exclusive lock, and
+runs the steps below. "A crash leaves nothing unreadable" needs the *records*, not only the two
 master files, to move in two phases:
 
 1. Validate `newMaster` is 32 bytes (the verb always passes one; a wrong length from a
@@ -700,63 +704,70 @@ snapshots": entry and master backups are a matched pair, and a Rewrap starts a n
 
 ## CLI (`k3sm keys`)
 
-The verbs `sudo k3sm keys put|list|show|rotate|rm|rewrap|deliver`, modeled on
-`cmd/k3sm/secretsencrypt.go`'s dispatch (a `flag.FlagSet` per verb, a fixed usage string,
-named exit codes). The verb for declaring a delivery target is the maintainer's ruling:
-beside the existing subcommands, as k3s does with `k3s secrets-encrypt`, so one place
-validates input and the store's layout stays private.
+The verbs are `sudo k3sm keys put|list|show|rotate|rm|rewrap`, with `deliver` for root
+delivery, modeled on `cmd/k3sm/secretsencrypt.go`'s dispatch (a `flag.FlagSet` per verb, a
+fixed usage string, named exit codes). The verb for declaring a delivery target is the
+maintainer's ruling: beside the existing subcommands, as k3s does with `k3s secrets-encrypt`,
+so one place validates input and the store's layout stays private.
 
-Amended by the user scope: names are scope-qualified from the verbs' first change. A root
-verb names `system/<name>` (`sudo k3sm keys put system/signer-key`); `<name>` below is that
-qualified form, and the part after `system/` keeps the entry-name rule above. The verbs
-change also adds `rotate --from-version N`. The non-root path, the root maintenance verbs
-and `k3sm keys exec` are under "User scope".
+Every entry a root verb names is scope-qualified: `system/<name>`, where `<name>` keeps the
+entry-name rule above (`sudo k3sm keys put system/signer-key`). A bare name is a usage error,
+and a `user/…` name is refused by the root verbs, which serve the system scope only. The
+non-root path, the root maintenance verbs and `k3sm keys exec` are under "User scope".
 
 ```
-put <name> [--kind ed25519|opaque] [--in FILE|-]
-      Create at version 1. Value from --in or stdin ("-", the default), never an
-      argument. --kind defaults to opaque; ed25519 is validated as a 32- or
-      64-byte key on the way in. Creates the master on first use.
+put system/<name> [--kind opaque|ed25519] [--in FILE|-]
+      Create at version 1. Value from --in FILE, or from stdin with "-" (the
+      default), never an argument. --kind defaults to opaque; ed25519 is
+      validated as a 32- or 64-byte key on the way in. Creates the master on
+      first use.
 
-list
-      One line per entry: name, kind, current version, created, fingerprint.
-      Values never printed. An entry that cannot be opened prints "corrupt" and
-      the command exits 1 after listing the rest.
+list [-o table|json]
+      One line per entry: name, kind, current version, created, fingerprint
+      and status. Values never printed. An entry that cannot be opened prints
+      "corrupt" and the command exits 1 after listing the rest.
 
-show <name> [--version N] [--reveal]
+show system/<name> [--version N] [--reveal [--yes]]
       Metadata only by default. With --reveal, stdout carries exactly the
       stored bytes and nothing else: no trailing newline, no encoding, no
       label; no metadata is printed in that mode, so a pipe sees only the
       value. An opaque value comes back at its stored length and an Ed25519
       value at exactly 32 or 64 bytes, which is what `rotate` accepts, so
-      `show --reveal` into `rotate --in -` is a byte-exact round trip. When
-      stdout is a terminal the verb still writes the raw bytes; it does not
-      add a newline for the operator's prompt.
+      `show --reveal` into `rotate --in -` is a byte-exact round trip. To a
+      terminal, --reveal writes the value only with --yes, and then still
+      adds no newline.
 
-rotate <name> [--in FILE|-] [--from-version N]
-      A new version from the same value source as put; flips current. Refuses
-      a name that does not exist. With --from-version N the new version holds
-      version N's bytes, copied inside the store: no value leaves it.
+rotate system/<name> [--in FILE|- | --from-version N]
+      A new version, made current. The value comes from the same source as
+      put, or with --from-version N it is a copy of version N's bytes, made
+      inside the store, so no value leaves it. --in and --from-version are
+      exclusive. Refuses a name that does not exist.
 
-rm <name> [--yes]
+rm system/<name> --yes
       Deletes every version. Irreversible; refuses without --yes.
 
-rewrap
-      Mint a new master and re-seal every record under it. Takes no key and no
-      value. Prints that entry backups taken earlier no longer open.
+rewrap --key-out FILE | --key-in FILE
+      Mint a new master and re-seal every record under it. --key-out writes
+      the freshly minted key to FILE, a new file at mode 0600, before
+      anything changes; keep it until rewrap reports success, then delete it.
+      --key-in FILE finishes an interrupted rewrap with the key an earlier
+      --key-out saved there. Takes no value. Prints that entry backups taken
+      earlier no longer open.
 
-deliver <name> --namespace NS [--secret NAME] [--data-key KEY] [--remove]
-      Declare (or, with --remove, withdraw) delivery of an existing entry as
-      a Secret. Refuses a name that does not exist. Warns when secrets
-      encryption is off on this data root.
+deliver system/<name> --namespace NS [--secret NAME] [--data-key KEY] [--remove]
+      Root delivery: declare (or, with --remove, withdraw) delivery of an
+      existing system entry as a Secret. Refuses a name that does not exist.
+      Warns when secrets encryption is off on this data root.
 ```
 
-Exit codes: 0 success, 1 refused (the sentinel's message), 2 bad usage — the same
-three-value shape `secrets-encrypt` uses. Every verb in this list requires root (the
-non-root path is under "User scope"). Value input is
-`--in FILE` or stdin only, never an argument — argv is visible to every local user via
-`ps` and lands in shell history. Opaque values are capped at 64 KiB; Ed25519 values are
-checked against the two valid lengths exactly at Put time.
+Exit codes: 0 success, 1 refused (the sentinel's message), 2 bad usage, the three-value shape
+`secrets-encrypt` uses, plus 3 for `rewrap` alone: it completed an earlier interrupted rewrap
+with a key other than the one supplied (`ErrRewrapResumed`), so it must run again. Every verb
+in this list requires root (the non-root path is under "User scope"). The human output is not
+stable; `list -o json` and the exit codes are the stable surface. Value input is `--in FILE` or
+stdin only, never an argument: argv is visible to every local user via `ps` and lands in shell
+history. Opaque values are capped at 64 KiB; Ed25519 values are checked against the two valid
+lengths exactly at Put time.
 
 ## Delivery reconciler
 
@@ -887,9 +898,8 @@ forward as a *new* version, never by pointing `current` backward at an existing 
 sudo k3sm keys show system/NAME --version N --reveal | sudo k3sm keys rotate system/NAME --in -
 ```
 
-The verbs change also adds `sudo k3sm keys rotate system/NAME --from-version N`, which
-writes the same new version without the value leaving the store (row U1); the pipe stays
-the recipe G21 checks.
+`sudo k3sm keys rotate system/NAME --from-version N` writes the same new version without the
+value leaving the store (row U1); the pipe stays the recipe G21 checks.
 
 A pipe, not a process substitution: `sudo` closes inherited descriptors, so a `<( … )`
 path would not open, and each side of the pipe runs its own `sudo`. The round trip is
