@@ -40,7 +40,7 @@
 #   --socket        the socket listener: U26 to U31, U46, U48, U54, U82.
 #   --socket-ops    the socket operations: U32 to U35, U45, U51, U67, U84.
 #   --exec          the non-root CLI and exec: U36 to U38, U69.
-#   --kd-author     KeyDelivery authoring: U40, U41, U74, U76.
+#   --kd-author     KeyDelivery authoring: U40, U41, U74, U76, U87.
 #   --kd-reconcile  the KeyDelivery reconciler: U42, U43, U59, U73, U78, U81.
 #   --kd-lifecycle  the KeyDelivery lifecycle: U44, U53, U55, U56, U62, U65,
 #                   U72, U75, U77, U79, U83, U85, U86.
@@ -108,7 +108,7 @@ EXPECTED_ROWS="$EXPECTED_ROWS U58 U59 U60 U61 U62 U63"
 EXPECTED_ROWS="$EXPECTED_ROWS U64 U65 U66 U67 U68 U69 U70 U71"
 EXPECTED_ROWS="$EXPECTED_ROWS U72 U73 U74 U75 U76"
 EXPECTED_ROWS="$EXPECTED_ROWS U77 U78 U79 U80 U81 U82 U83 U84"
-EXPECTED_ROWS="$EXPECTED_ROWS U85 U86"
+EXPECTED_ROWS="$EXPECTED_ROWS U85 U86 U87"
 # >>> ADD NEW U ROWS (U64 upward) HERE <<<
 EXPECTED_ROWS="$EXPECTED_ROWS E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 E13 E14 E15 E16 E17 E18 E19 E20"
 EXPECTED_ROWS="$EXPECTED_ROWS E21 E22 E23 E24 E25"
@@ -143,7 +143,7 @@ mode_rows() {
 	socket) echo "U26 U27 U28 U29 U30 U31 U46 U48 U54 U82" ;;
 	socket-ops) echo "U32 U33 U34 U35 U45 U51 U67 U84" ;;
 	exec) echo "U36 U37 U38 U69" ;;
-	kd-author) echo "U40 U41 U74 U76" ;;
+	kd-author) echo "U40 U41 U74 U76 U87" ;;
 	kd-reconcile) echo "U42 U43 U59 U73 U78 U81" ;;
 	kd-lifecycle) echo "U44 U53 U55 U56 U62 U65 U72 U75 U77 U79 U83 U85 U86" ;;
 	grammar) echo "U57" ;;
@@ -550,6 +550,8 @@ pend U85 "a reconciler line charged to no uid (a forged-Secret refused line, a d
 	k3sm/pkg/keystore/reconcile::TestForgedSecretFloodLeavesEveryUIDServed TestUnchargedLinesHaveOwnBudget
 pend U86 "a drift repair (the reconciler re-creating or repairing a delivered Secret that someone other than the reconciler edited or deleted, at the version already delivered) is reconciler-class: it draws on the reconciler budget and is never charged to the owner's share or budgets; repairs are coalesced to one audit line per delivery per 10 minutes with a count, and rate-limited per delivery with exponential backoff capped at 10 minutes; a write of a new version after the owner's own rotate or put stays charged to the owner (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestDriftRepairNotChargedToOwner
+pend U87 "the admission policy also matches UPDATE and DELETE of keydeliveries and admits one only when the requester equals oldObject.spec.requestedBy, is the k3sm server's identity, or is in system:masters (and, for DELETE only, the namespace controller's ServiceAccount); a finalizer edit is an UPDATE, so another author can neither delete the object nor strip its finalizer; the reconciler's and withdraw's own writes pass; on a DELETE object is null and only oldObject is read; failurePolicy is Fail; rig leg E23 (KeyDelivery authoring)" \
+	k3sm/pkg/policy::TestVAPRefusesDeleteByOtherAuthor TestVAPRefusesFinalizerStripByOtherAuthor
 # >>> ADD NEW U ROWS (U64 upward) HERE, and add each to EXPECTED_ROWS and to mode_rows <<<
 
 leg E1 "files" "preconditions: secrets encryption on; one server; keystore-run/ and both logs present, service-user 0600, SF_APPEND set; the doctor user-scope row on; keystore.sh --check exits 0 on the build" "the append-only files"
@@ -574,7 +576,7 @@ leg E19 "socket" "launchctl kickstart -k of the server while a client is connect
 leg E20 "files" "reboot of the server node, operator-attended (--attended reboot): after boot the flags are still set, the listener starts, E2's entry opens, E3's Secret is still current" "the flag check"
 leg E21 "sandbox" "a native pod with runAsUser 501 is refused at spawn: the container never starts, and its status carries the uid refusal" "runtimed's sandbox change"
 leg E22 "sandbox" "a native pod with runAsUser 0 is refused at spawn: the container never starts as root, and its status carries the uid refusal" "runtimed's sandbox change"
-leg E23 "kd-reconcile" "against the real authorizer, a role with create on secrets and update and delete on one named secret: delivery as that name is Ready, Delivered; delivery as another name is Authorized=False, NotAuthorized, with no Secret" "the KeyDelivery reconciler"
+leg E23 "kd-reconcile" "against the real authorizer, a role with create on secrets and update and delete on one named secret: delivery as that name is Ready, Delivered; delivery as another name is Authorized=False, NotAuthorized, with no Secret; then another principal (kubectl --as, with edit in the namespace) deletes the KeyDelivery and patches its finalizer away: each refused at admission, the object, its finalizer and the Secret stay" "the KeyDelivery reconciler; KeyDelivery authoring"
 leg E24 "exec" "with the listener stopped by the maintenance marker, a non-k3sm program run as the service user binds keys.sock; the user's k3sm keys list and put refuse before any frame, naming the server pin; then the real installed k3sm binary, exec'd inside a native pod, tries to bind keys.sock and gets EPERM; the real server is accepted afterwards" "the server pin; the pod bind deny"
 leg E25 "files" "helper variant only: a native pod tries connect(2) to the floor helper's socket, and the login user and a non-k3sm service-user program each send it an append: EPERM for the pod, both refused, no line appended" "the helper pin"
 # >>> ADD NEW E LEGS (E24 upward) HERE, with the unit mode that delivers the last feature <<<
@@ -698,7 +700,11 @@ U85|every uid able to read and mutate
 U67|plus the 1 MiB reconciler budget
 U86|never charged to the owner's share or budgets
 U86|exponential backoff capped at 10 minutes
-U86|stays charged to the owner"
+U86|stays charged to the owner
+U87|oldObject.spec.requestedBy
+U87|a finalizer edit is an UPDATE
+U87|on a DELETE object is null
+E23|refused at admission"
 
 # --listed: the row-presence lint.
 if [ "$mode" = listed ]; then

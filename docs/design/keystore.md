@@ -1865,6 +1865,42 @@ reconciler-time SubjectAccessReviews below. `requestedBy` is checked by admissio
 and by the CRD's cross-field rule, which is what lets the reconciler name it as the principal
 of those reviews, but it authorises nothing by itself.
 
+**Admission binds update and delete to the owner.** The same policy also matches UPDATE and
+DELETE of `keydeliveries` (the resource itself; `keydeliveries/status` is not matched, so status
+writes are not checked by it). It admits one only when the requester is the object's owner,
+`request.userInfo.username == oldObject.spec.requestedBy`, or is the k3sm server's identity
+(the admin client's user `admin`, `pkg/executor/setup.go:1349`), or carries the group
+`system:masters`. So another author who may edit or delete `keydeliveries` in the namespace
+can neither delete the object nor change it (U87, E23).
+
+- *A finalizer edit is an UPDATE.* Removing `keystore.k3sm.io/delivery` is an update of the
+  object's metadata, so another author cannot strip the finalizer to skip the Secret's
+  deletion either.
+- *The reconciler's and `withdraw`'s own writes still pass.* The reconciler adds and drops the
+  finalizer and deletes through the admin client, whose token maps to `system:masters`
+  (`pkg/executor/setup.go:1349`, `pkg/rbac/doc.go:31`); `withdraw` deletes impersonating
+  `k3sm:local:<peer uid>`, which is the object's `requestedBy`.
+- *The namespace controller may delete.* One more requester is admitted, for DELETE only:
+  `system:serviceaccount:kube-system:namespace-controller`. The controller-manager runs each
+  controller under its own ServiceAccount (`--use-service-account-credentials=true`,
+  `controllerManagerArgs`, `pkg/executor/supervised.go:1069`), and without this a namespace
+  holding a KeyDelivery could never finish deleting. The finalizer still holds each object
+  until the reconciler has deleted its Secret.
+- *The policy fails closed.* Its `failurePolicy` is `Fail`, unlike the advisory policies'
+  `Ignore` (`pkg/policy/admission.go:260`): an evaluation error must not admit a delete by
+  another author. That is why the expressions must never read `object` on a DELETE.
+
+**What the policy sees on a DELETE.** The API server runs validating admission for a DELETE with
+`object` null and `oldObject` set to the stored object. This is checked against the version
+k3sm pins, Kubernetes `v1.37.1` (`DefaultKubeVersion`, `pkg/executor/executor.go:278`) and
+`k8s.io/apiserver v0.37.1` (`go.mod:33`). There, `AdmissionToValidateObjectDeleteFunc` builds the
+admission attributes with a nil object and a copy of the old one
+(`k8s.io/apiserver@v0.37.1/pkg/registry/rest/delete.go:189` to `:192`), for a single DELETE and
+for each item of a DELETE collection (`pkg/endpoints/handlers/delete.go:169` and `:329`), and a
+nil object becomes CEL `null` (`pkg/admission/conversion.go:137`, read into `object` at
+`pkg/admission/plugin/cel/activation.go:70`). So the policy reads `object` only on a CREATE and
+`oldObject` on an UPDATE or a DELETE.
+
 **Who creates one.** The owner, through the socket: `k3sm keys deliver user/<uid>/<name>
 --namespace NS --secret S [--data-key K]` (the short-name form is accepted).
 
@@ -2556,6 +2592,7 @@ each stated in the change that makes it. U15 is held for a K0 amendment and U39 
 | U84 | when a log's size is past the hard cap, `doctor` shows a Warn with the overshoot in bytes and the `audit --rotate` or `floor --rebuild` hint, and none at or below it; the overshoot is at most 320 KiB per user scope, plus the 1 MiB reconciler budget | `k3sm/cmd/k3sm::TestDoctorWarnsOnLogOvershoot` | pending: the socket operations |
 | U85 | a reconciler line charged to no uid (a forged-Secret `refused` line, a drift repair, their summaries) draws on the reconciler budget, 1 MiB per log, separate from every uid and excluded from the hard-cap test; forged Secrets are counted in a bounded LRU of 1024 (namespace, name) pairs with no per-`resourceVersion` set, new pairs' lines at most 10 a minute and at most one summary `refused` line a minute carrying the dropped count; past the budget the lines are dropped and counted and `doctor` warns; N forged updates leave every uid able to read and mutate | `k3sm/pkg/keystore/reconcile::TestForgedSecretFloodLeavesEveryUIDServed`, `TestUnchargedLinesHaveOwnBudget` | pending: the KeyDelivery reconciler (lifecycle) |
 | U86 | a drift repair (the reconciler re-creating or repairing a delivered Secret that someone other than the reconciler edited or deleted, at the version already delivered) is reconciler-class: it draws on the reconciler budget and is never charged to the owner's share or budgets; repairs are coalesced to one audit line per delivery per 10 minutes with a count, and rate-limited per delivery with exponential backoff capped at 10 minutes; a write of a new version after the owner's own `rotate` or `put` stays charged to the owner | `k3sm/pkg/keystore/reconcile::TestDriftRepairNotChargedToOwner` | pending: the KeyDelivery reconciler (lifecycle) |
+| U87 | the admission policy also matches UPDATE and DELETE of `keydeliveries` and admits one only when the requester equals `oldObject.spec.requestedBy`, is the k3sm server's identity, or is in `system:masters` (and, for DELETE only, the namespace controller's ServiceAccount); a finalizer edit is an UPDATE, so another author can neither delete the object nor strip its finalizer; the reconciler's and `withdraw`'s own writes pass; on a DELETE `object` is null and only `oldObject` is read; `failurePolicy` is `Fail` | `k3sm/pkg/policy::TestVAPRefusesDeleteByOtherAuthor`, `TestVAPRefusesFinalizerStripByOtherAuthor`; rig leg E23 | pending: KeyDelivery authoring |
 
 ### Rig legs
 
@@ -2595,7 +2632,7 @@ E20 attended.
 | E20 | **reboot of the server node**: an operator-attended leg (automation never reboots the rig), run by the operator with the script's `--attended reboot` step | after boot the flags are still set, the listener starts, E2's entry opens, E3's Secret is still current | yes | the flag check: a flag lost across a reboot |
 | E21 | a native Pod with `securityContext.runAsUser: 501` | refused at spawn: the container never starts, and its status carries the uid refusal | no (U17) | runtimed's sandbox change: the Pod runs as uid 501 |
 | E22 | a native Pod with `securityContext.runAsUser: 0` | refused at spawn: the container never starts as root, and its status carries the uid refusal | no (U17) | runtimed's sandbox change: the Pod runs as uid 0 |
-| E23 | against the real authorizer: an admin binds, for `k3sm:local:<uid>` in `ks-e2e-3`, `k3sm:keystore-delivery-author` and a Role with `create` on `secrets` and `update` and `delete` on `secrets` with `resourceNames: [e2e-named]`; the user delivers `user/<uid>/e2e-token` as `e2e-named`, then as `e2e-other` | `e2e-named`: `Ready`, `Delivered`; `e2e-other`: `Authorized=False`, `NotAuthorized`, no Secret: the reconciler allows exactly what the API server allows the user | yes | the KeyDelivery reconciler (authority): `e2e-other` is delivered, or `e2e-named` is refused |
+| E23 | against the real authorizer: an admin binds, for `k3sm:local:<uid>` in `ks-e2e-3`, `k3sm:keystore-delivery-author` and a Role with `create` on `secrets` and `update` and `delete` on `secrets` with `resourceNames: [e2e-named]`; the user delivers `user/<uid>/e2e-token` as `e2e-named`, then as `e2e-other`; then an admin, impersonating another principal (`kubectl --as k3sm-e2e-other`, bound to the built-in `edit` ClusterRole in `ks-e2e-3`), deletes `e2e-named`'s KeyDelivery and, separately, patches its finalizer away | `e2e-named`: `Ready`, `Delivered`; `e2e-other`: `Authorized=False`, `NotAuthorized`, no Secret: the reconciler allows exactly what the API server allows the user; the other principal's delete and finalizer patch are each refused at admission, and the object, its finalizer and the Secret stay | yes | the KeyDelivery reconciler (authority): `e2e-other` is delivered, or `e2e-named` is refused; KeyDelivery authoring: another principal deletes the object or strips its finalizer |
 | E24 | with the listener stopped by the maintenance marker, the operator runs, as the service user (`sudo -u _k3sm`), a program that is not k3sm bound at `keystore-run/keys.sock`; the user runs `k3sm keys list` and `k3sm keys put user/<me>/e2e-pin`; then, with the listener still stopped and `keys.sock` unlinked, a native Pod execs the real installed `/Library/k3sm/k3sm` and that process tries to bind `keystore-run/keys.sock` | the CLI refuses each before writing a frame, naming the server pin; the stand-in receives no bytes past the connect; the bind from the Pod gets `EPERM` and no socket appears; after the marker goes, the real server is accepted | yes | the server pin (U69): the CLI talks to the stand-in; the Pod bind deny (U16): the installed binary in a Pod binds `keys.sock` |
 | E25 | (helper variant only) a native Pod tries `connect(2)` to the floor helper's socket, and the login user and a non-k3sm service-user program each send it an `append` | `EPERM` for the Pod; the helper refuses the user by uid and the program by the pin, and no line is appended | yes | the helper pin (U70): a line from an unpinned peer is appended |
 
