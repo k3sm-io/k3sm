@@ -711,10 +711,12 @@ func parseVersionName(n string) (uint64, bool) {
 // RaiseFloor raises every entry's floor to its current pointer's sequence
 // and writes keystore-floor.json if that changes it, which also rebuilds an
 // absent floor (the restore procedure in docs/design/keystore.md § "Backup
-// and snapshots"). Every root-run verb begins with it: Put, Rotate and Delete
-// call it themselves, and a verb that only reads (list, show) calls it first.
-// It takes the exclusive lock and runs as root. A keystore with no entries
-// directory or no master has nothing to raise.
+// and snapshots"). Put, Rotate and Delete raise it themselves at their start.
+// The read verbs (the CLI's list and show, in a later pull request) must call
+// RaiseFloor at their start to raise a floor that lags its pointers; until
+// they do, nothing raises it on read: Current, Get and List only check it. It
+// takes the exclusive lock and the floor's lock, and runs as root. A keystore
+// with no entries directory or no master has nothing to raise.
 func (s *FileStore) RaiseFloor(ctx context.Context) error {
 	if err := s.raiseFloor(ctx); err != nil {
 		return fmt.Errorf("raise the keystore floor: %w", err)

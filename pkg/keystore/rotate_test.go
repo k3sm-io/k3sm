@@ -351,6 +351,14 @@ func TestFloorRaised(t *testing.T) {
 		copyFile(t, filepath.Join(server, "seq2"), entryPath(server, "k", currentName))
 		mustCurrent(t, s, "k", "two")
 		copyFile(t, filepath.Join(server, "seq3"), entryPath(server, "k", currentName))
+		// Nothing raises the floor on read: a read verb calls RaiseFloor.
+		mustCurrent(t, s, "k", "three")
+		if _, err := s.List(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if f := floorOf(t, server)["k"]; f.Seq != 2 {
+			t.Fatalf("floor after Current and List = %+v, want sequence 2: reads do not raise it", f)
+		}
 		if err := s.RaiseFloor(ctx); err != nil {
 			t.Fatal(err)
 		}
