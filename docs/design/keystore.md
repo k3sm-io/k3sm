@@ -1099,7 +1099,7 @@ Phase A's paths are unchanged. Added:
       .user/                            NEW: 0700, service user (the reserved name)
         <uid>/                          NEW: 0700, service user, one per user who has stored anything
           scope.key                     sealed record, kind 0xFE: the user's scope key, wrapped
-          deliveries                    sealed record, kind 0xFD: per delivery, its UID, object name, target tuple and target digest
+          deliveries                    sealed record, kind 0xFD: per delivery, its UID, object name, target tuple, target digest and last delivered version
           entries/                      NEW: 0700, service user, the scope's entries and nothing else
             <name>/ generation v1 … current  same shape as a system entry, sealed under the scope key
 ```
@@ -1242,8 +1242,8 @@ deleted and their deliveries withdrawn, and the user declares them again with `d
 and holds at most 320 entries: 64 live entries plus 256 withdrawn tombstones. An entry is at
 most 1,280 bytes: the UID (36 bytes), the KeyDelivery's `metadata.name` (at most 253), the
 target tuple (`entry` at most 269 bytes, `namespace` 63, `secretName` 253, `dataKey` 253,
-`requestedBy` 21), the 32-byte digest, a state byte and seven 4-byte length prefixes, 1,209
-bytes in all. So the record's plaintext is at most 400 KiB plus a 16-byte header, and the
+`requestedBy` 21), the 32-byte digest, the last delivered version (8 bytes), a state byte and
+seven 4-byte length prefixes, 1,217 bytes in all. So the record's plaintext is at most 400 KiB plus a 16-byte header, and the
 store refuses to read or write a sealed record over 416 KiB.
 
 - *`deliver` is refused at the bound.* It adds an entry, and answers `quota` when the record
@@ -2265,6 +2265,15 @@ is re-created or repaired by the reconciler, but that write is not the owner's a
 - *What stays the owner's.* A write of a new version, after the owner's own `rotate` or `put`,
   is the owner's act and stays charged to the owner as above; only the write that restores the
   version already delivered is a repair (U86).
+- *Which version was delivered comes from the record.* The sealed `deliveries` record holds,
+  per delivery, the last version the reconciler delivered; the reconciler raises it, with the
+  record's floor line, after the Secret write succeeds. The classifier that tells a repair from
+  an owner's write compares the entry's current version with that recorded value only. It never
+  reads the Secret's version annotation or the KeyDelivery's `status.deliveredVersion`, since a
+  namespace writer can set the first and a status writer the second, and either would let them
+  move a repair onto the owner's share or an owner's write onto the reconciler budget. A crash
+  between the Secret write and the record write leaves the recorded version one behind, so the
+  next sweep's write is charged to the owner once more, which is the safe direction (U102).
 
 **A KeyDelivery never touches a Phase A Secret.** A Secret belongs to the KeyDelivery
 reconciler only when it carries the label value `keydelivery` and a `k3sm.io/keystore-entry`
@@ -2844,6 +2853,7 @@ record below.
 | U99 | under the store lock, before every audit or floor append, the server compares its descriptor's `(dev, ino)` with the canonical name's and reopens on a mismatch, recounting the per-uid shares from the new file; `audit --rotate` and `floor --rebuild` each complete while the server never saw the marker, and every later line lands in the new canonical file, none in an archive or an unlinked file (seam: chflags flag source) | `k3sm/pkg/keystore/socket::TestAppendReopensOnInodeMismatch` | pending: the append-only files |
 | U100 | a departed account with an unreused uid is reported, not acted on: `doctor` lists every scope whose uid has no directory record (a synthesized GeneratedUID) with its delivery count; each of that scope's deliveries gets `SecretRetained=True` with reason `OwnerUnresolvable`, and no Secret is deleted (seam: GeneratedUID lookup) | `k3sm/cmd/k3sm::TestDoctorListsUnresolvableScopes`, `k3sm/pkg/keystore/reconcile::TestOwnerUnresolvableRetainedCondition` | pending: the KeyDelivery reconciler (lifecycle) |
 | U101 | `rewrap` prints a warning whenever `.user/` exists, before it starts and when it finishes, saying Rewrap does not re-key `K_u` and naming the procedure: each user re-puts their values after a suspected master exposure; with no `.user/` it prints none (seam: euid source) | `k3sm/cmd/k3sm::TestRewrapWarnsWhenUserScopesExist` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
+| U102 | the sealed record stores the last delivered version per delivery, raised after the Secret write succeeds; the repair-versus-owner classifier uses only that recorded version: a Secret whose version annotation is rewritten and a KeyDelivery whose `status.deliveredVersion` is rewritten each leave the charge unchanged, a repair stays on the reconciler budget and an owner's new version stays charged to the owner | `k3sm/pkg/keystore/reconcile::TestChargingIgnoresTamperedVersionAnnotationAndStatus` | pending: the KeyDelivery reconciler (lifecycle) |
 
 ### Rig legs
 
