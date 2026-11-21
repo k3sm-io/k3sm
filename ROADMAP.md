@@ -184,7 +184,8 @@ v0.2.3 was released on 2026-10-29.
   the media engines become countable resources for video work. Node labels report the chip, the
   memory the GPU can use, and whether the Neural Engine and Apple's on-device model are available.
   This is a breaking change: `mlx.k3sm.io/gpu` and the `mlx.k3sm.io/*` node labels are retired, and
-  the release notes say how to move a hand-written Pod to the new names.
+  the release notes say how to move a hand-written Pod to the new names. Until they are retired, a
+  node advertises the new names beside the old ones (built, not yet released).
 
 - **The app finds its own new releases.** The k3sm app checks a release index signed with the
   project's Developer ID for a newer release of itself and of k3sm, says how far behind it is, and
@@ -225,30 +226,48 @@ v0.2.3 was released on 2026-10-29.
   the two bullets below would attach to: distributed inference is what a fleet would route
   across, and autoscaling is a planner sitting above one. `MLXModel` stays the one-object way to
   serve a single model.
-- **Direct links.** Macs cabled together over Thunderbolt find each other on the cable, and a new
-  Mac joins while the server's pairing window is open (a planned pairing step), optionally pinned to the
-  cluster it expects. Cluster traffic between two cabled Macs then takes the cable as a plain kernel
-  route, with the wireguard mesh kept for peers that have no cable and as the fallback when one is
-  pulled. That route is not encrypted, so the cable is treated as a trusted segment, and a per-link
-  switch sends a link back through the tunnel. On top of the link graph, an `MLXModel` can be
-  sharded across cabled Macs (the reserved `MLXModel.Distributed` seam, one rank per Mac) on MLX's
-  `ring` backend. The `jaccl` backend over RDMA follows where macOS exposes it, which today means
-  Thunderbolt 5 Macs on macOS 26.2 or later with RDMA enabled once in macOS Recovery.
-- **Auto-stop for the app.** An optional auto-stop takes the node down when the Mac joins a Wi-Fi
-  network you have not marked trusted; it is a convenience, not a security boundary.
+- **Direct links.** Macs cabled together over Thunderbolt find each other on the cable. On top of
+  the link graph, an `MLXModel` can be sharded across cabled Macs (the reserved
+  `MLXModel.Distributed` seam, one rank per Mac) on MLX's `ring` backend. The `jaccl` backend over
+  RDMA follows where macOS exposes it, which today means Thunderbolt 5 Macs on macOS 26.2 or later
+  with RDMA enabled once in macOS Recovery.
+- **Local-only on untrusted Wi-Fi.** An opt-in setting in the app switches LAN access off when the
+  Mac joins a new or open Wi-Fi network, and posts a notification with an Allow on this network
+  action that remembers the network. Workloads keep running for this Mac and the mesh. It is a
+  convenience, not a security boundary.
 - **A cooperative node budget.** Nodes already report a `SoftPressure` condition (built, not yet
   released): an early warning graded on a ladder of available memory, the memory compressor, swap
   growth, free space on the swap and data volumes, and free process IDs, which taints and evicts
-  nothing. Planned on top of it: a cluster-wide `NodeBudget` resource and a node-local page that
+  nothing. A node also publishes its budget on its own Node and in `k3sm status -o json`, and a
+  node under memory pressure refuses a new BestEffort Pod (both built, not yet released). Planned
+  on top of it: a cluster-wide `NodeBudget` resource and a node-local page that
   applications read through C++ and Swift client libraries, so batch work can slow down or be asked
   to stop gracefully before the node's hard eviction fires.
-- **A registry k3sm owns.** The cluster registry is a bundled third-party server run as a child
-  process. k3sm is writing its own OCI registry server over the same on-disk store, with the same
-  pushes, pulls, tags and cross-repository mounts, garbage collection that runs while pushes
-  continue, and an image prune that leaves alone anything a push changed in the meantime. A layer
-  pushed to several repositories is stored once, with or without a cross-repository mount, so moving
-  off the bundled server does not cost more disk. The pieces are built, apart from that dedupe; the
-  daemon does not run it yet.
+- **A registry k3sm owns.** In v0.2 the cluster registry is a bundled third-party server run as a
+  child process. The unreleased build replaces it with k3sm's own OCI registry server, served by
+  the `k3sm` binary itself over the same on-disk store, with the same pushes, pulls, tags and
+  cross-repository mounts, garbage collection that runs while pushes continue, and an image prune
+  that leaves alone anything a push changed in the meantime. A layer pushed to several repositories
+  is stored once, so moving off the bundled server does not cost more disk, and images already in
+  the registry stay where they are across the upgrade. It is built and not yet in a release.
+- **Models in the cluster registry.** `k3sm model push` stores a model once in the cluster
+  registry, one layer per weight file, with quantization variants under one name. `k3sm model
+  import hf://<org>/<repo>` imports a model repository from a public model hub at a pinned revision and verifies
+  every file, and `k3sm model ls` lists models with their size and quantization. A node can mount a
+  stored artifact read-only into a Pod, and the registry caps and reclaims artifact space by type.
+  These are built, not yet released. Planned on top: an `MLXModel` that serves a model from the
+  cluster store with the Pod's network egress off, and a sharded rank that fetches only the weight
+  files its shard needs.
+- **LAN access that expires and says what it exposes.** `sudo k3sm network lan on --for
+  <duration>` turns LAN access on for at most 24 hours, after which the node turns it off by
+  itself. `k3sm network lan status` lists the sockets a LAN peer can reach that LAN access does not
+  move: host-network pods, pod processes bound to an explicit address, macOS services, and the node
+  daemon's own control-plane ports. The app warns in its Network pane while LAN access is on.
+  Built, not yet released.
+- **Nodes that sleep say so.** A node holds a power assertion so a Mac on AC power does not
+  idle-sleep under its Pods. When the Mac sleeps anyway (on battery, or a forced sleep), the node
+  publishes a `Sleeping` condition and sleep and wake Events, so a node that goes NotReady while
+  asleep says why. Built, not yet released.
 - **A dedicated root updater.** Managed updates are unpacked today by the root network helper. The
   planned updater is a separate small root program that checks every binary against the project's
   Developer ID requirement and the cluster's signing certificate before it activates a version,

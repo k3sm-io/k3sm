@@ -133,7 +133,7 @@ func TestToPodBoxMapsEphemeralContainers(t *testing.T) {
 			debugContainer("dbg", ""),
 			debugContainer("tgt", "c0"),
 		}
-		box, err := toPodBox(pod, "10.0.0.5", "192.168.1.10", "/var/lib/k3sm/pods/uid-dbg", "", "", netv1.DNSConfig{}, nil)
+		box, err := toPodBox(pod, "10.0.0.5", "192.168.1.10", "/var/lib/k3sm/pods/uid-dbg", "", "", netv1.DNSConfig{}, "", nil)
 		if err != nil {
 			t.Fatalf("toPodBox: %v", err)
 		}
@@ -178,7 +178,7 @@ func TestToPodBoxMapsEphemeralContainers(t *testing.T) {
 		vm := "vm"
 		pod.Spec.RuntimeClassName = &vm
 		pod.Spec.EphemeralContainers = []corev1.EphemeralContainer{debugContainer("dbg", "")}
-		box, err := toPodBox(pod, "10.0.0.5", "10.0.0.5", "/var/lib/k3sm/pods/uid-vmdbg", "", "", netv1.DNSConfig{}, nil)
+		box, err := toPodBox(pod, "10.0.0.5", "10.0.0.5", "/var/lib/k3sm/pods/uid-vmdbg", "", "", netv1.DNSConfig{}, "", nil)
 		if err != nil {
 			t.Fatalf("toPodBox: %v", err)
 		}

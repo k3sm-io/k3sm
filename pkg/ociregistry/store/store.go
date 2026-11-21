@@ -292,8 +292,10 @@ func readRegular(p string, limit int64) ([]byte, error) {
 }
 
 // openRegular opens p with O_NOFOLLOW and refuses anything but a regular file.
+// The open is O_NONBLOCK so a FIFO planted at p cannot wait for a writer
+// before the regular-file check; the flag is cleared again on success.
 func openRegular(p string, flag int) (*os.File, error) {
-	f, err := os.OpenFile(p, flag|unix.O_NOFOLLOW|unix.O_CLOEXEC, fileMode)
+	f, err := os.OpenFile(p, flag|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, fileMode)
 	if err != nil {
 		if errors.Is(err, unix.ELOOP) {
 			return nil, fmt.Errorf("%w: %s", ref.ErrSymlink, p)
@@ -308,6 +310,10 @@ func openRegular(p string, flag int) (*os.File, error) {
 	if !fi.Mode().IsRegular() {
 		f.Close()
 		return nil, fmt.Errorf("%w: %s", ErrNotRegular, p)
+	}
+	if err := unix.SetNonblock(int(f.Fd()), false); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("clear O_NONBLOCK on %s: %w", p, err)
 	}
 	return f, nil
 }

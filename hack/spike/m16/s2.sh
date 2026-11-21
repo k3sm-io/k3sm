@@ -55,7 +55,7 @@ lab <<'EOF'
 set -uo pipefail
 spike_preflight
 W="$PREFIX/s2"; mkdir -p "$W"
-command -v helm >/dev/null || { verdict FAIL "s2.0 preflight  helm is not on the lab host (brew install helm)"; exit 0; }
+command -v helm >/dev/null || { verdict FAIL "s2.0 preflight  helm is not on the lab host (helm runs in a k3sm pod, never installed on the host)"; exit 0; }
 # kc() passes the lab host kubeconfig explicitly; helm reads KUBECONFIG, so the two
 # talk to the same cluster only if it is exported here.
 export KUBECONFIG="$KUBECONFIG_RIG"

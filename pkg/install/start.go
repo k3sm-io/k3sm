@@ -29,12 +29,24 @@ import (
 // --start was not given.
 var ErrUserStopped = errors.New("this node was stopped by the user")
 
+// userStopState is a stop marker as Install read it: the content, or the
+// error that made it unreadable (an unreadable marker still means stopped).
+// flush is the lo0 flush scope the start precondition of an install with
+// Start uses, read from the installed netd plist when the marker is read:
+// step 3b rewrites that plist, and the aliases on lo0 are the range the old
+// one recorded, not the one this install renders.
+type userStopState struct {
+	marker StopMarker
+	err    error
+	flush  flushPrefixes
+}
+
 // startPrecondition makes the host safe for a fresh netd after a stop: any
 // daemon an interrupted stop left loaded is booted out (so nothing re-adds
 // what the flush removes), an interrupted stop's workloads are torn down, and
-// the host network flush is re-run. What it cannot remove is logged; it never
-// refuses the start.
-func startPrecondition(ctx context.Context, sys System, cfg Config, d installedDaemons, m StopMarker, merr error) {
+// the host network flush is re-run over fp. What it cannot remove is logged;
+// it never refuses the start.
+func startPrecondition(ctx context.Context, sys System, cfg Config, d installedDaemons, m StopMarker, merr error, fp flushPrefixes) {
 	for _, label := range slices.Concat(d.node, []string{NetdLabel}) {
 		if label == NetdLabel && !d.netd {
 			continue
@@ -54,7 +66,7 @@ func startPrecondition(ctx context.Context, sys System, cfg Config, d installedD
 	if merr != nil || m.Phase != StopPhaseStopped {
 		left = teardownWorkloads(ctx, sys, cfg)
 	}
-	hostLeft, _ := flushHostNetwork(sys, cfg, recordedFlushPrefixes(sys, cfg), interconnectNodeIndex(sys))
+	hostLeft, _ := flushHostNetwork(sys, cfg, fp, interconnectNodeIndex(sys))
 	for _, item := range append(left, hostLeft...) {
 		cfg.Logger.Warn("start: the pre-start teardown left state behind; starting anyway", "what", item.Kind, "err", item.Err)
 	}
@@ -109,7 +121,7 @@ func Start(ctx context.Context, sys System, cfg Config, actor, reason string) er
 		if merr != nil {
 			cfg.Logger.Warn("the stop marker is unreadable; treating the node as stopped part-way", "err", merr)
 		}
-		startPrecondition(ctx, sys, cfg, d, marker, merr)
+		startPrecondition(ctx, sys, cfg, d, marker, merr, recordedFlushPrefixes(sys, cfg))
 		// The explicit override past the marker: the marker itself stays until
 		// the daemons are up, so a start that fails leaves the node reported
 		// as stopped, which is what it is.

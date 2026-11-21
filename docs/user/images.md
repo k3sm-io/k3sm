@@ -316,10 +316,10 @@ k3sm image pull ghcr.io/org/app:v1            # warm this node's cache ahead of 
 | verb | what it does |
 |---|---|
 | `tag <reference\|digest> <new-tag>` | Adds a tag to a manifest the registry already holds. It sends the same manifest bytes under the new tag, so the new tag names the same digest; a source in another repository is copied across with its blobs. The source is a tag, a `<repository>@<digest>`, or a bare digest, which is looked up in the new tag's repository. `--platform` tags one platform's manifest of a multi-platform index. A new tag that already names another manifest is refused unless you pass `--force`; `build`, `load` and `import` overwrite their own tag without asking. |
-| `untag <tag>` | Deletes one tag. `--digest` refuses the removal unless the tag still names that digest. A tag names a whole index, so `untag` takes no `--platform`. |
+| `untag <tag>` | Deletes one tag. `--digest` refuses the removal unless the tag still names that digest; the cluster registry makes this check as it deletes, so a tag a push re-points in the meantime stays and `untag` reports an error. The error reads `untag <tag>: the tag no longer names that digest; nothing was removed`. Only a cluster registry from the first release after v0.2.3 onward enforces that condition. A registry from before that release either does not enforce it (v0.2.3 and earlier), so only the check made just before the delete applies and a tag re-pointed after that check is removed anyway, or refuses the removal even though the tag has not moved (a development build from between releases). The CLI does not detect or warn about this, and in both cases the fix is to upgrade the node that serves the registry. A tag names a whole index, so `untag` takes no `--platform`. |
 | `inspect <tag\|repository@digest>` | Reads the manifest and config from the registry and reports the digest, the platform, the creation time, entrypoint/cmd, user, working directory and each layer's size. An index lists its platforms; `--platform` inspects one of them. `-o json` prints the registry's manifest and config documents for scripting. Read-only. |
 | `save <tag\|repository@digest> -o <file.tar>` | Exports the image as a tarred OCI image layout, the `docker save` analog and the exact inverse of `import`: the layout names the image `registry-k3sm:6450/<repository>:<tag>`, so importing the archive records it under the same name. An index is saved whole unless `--platform` picks one platform. The archive is written beside the target and renamed into place when complete, so a failed save leaves no file behind. |
-| `pull <reference>` | Fetches the reference into this node's cache through the daemon's own puller, the same code path a Pod's pull takes, so every blob is re-hashed against its digest before it is recorded. Prints the digest it resolved to. `--platform os/arch[/variant]` picks which manifest of a multi-platform index to fetch; `--policy always\|if-not-present\|never` carries the ordinary Kubernetes pull-policy meanings. |
+| `pull <reference>` | Fetches the reference into this node's cache through the daemon's own puller, the same code path a Pod's pull takes, so every blob is re-hashed against its digest before it is recorded. Prints the digest it resolved to. `--platform os/arch[/variant]` picks which manifest of a multi-platform index to fetch; `--policy always\|if-not-present\|never` carries the ordinary Kubernetes pull-policy meanings. The pull reserves its declared layer bytes first and is refused when they cannot fit (see [A Pull Reserves Its Space](#a-pull-reserves-its-space)). |
 
 Untag removes a name, not bytes, and it is not a retraction. The manifest and its layers stay
 readable by digest to anyone who can reach the registry until `k3sm image prune` or the registry's
@@ -378,11 +378,58 @@ anywhere.
 The `-o json` document has three keys. `dryRun` is true without `--force`. `registry` holds
 `name`, `skipped` (set only on a node without a registry), `manifests` (each with `repository`,
 `digest`, `mediaType` and `size`, deleted or to be deleted), `kept` (the untagged manifests kept,
-each with its `reason`), and, when present, `unreadable` repositories, `failed` deletions and
-the `sweep` a forced prune ran (`repositories`, `blobs`, `bytes`, and any `stopped`, `failed` or
-`reviewing` repositories and `error`).
+each with its `reason`), and, when present, `unreadable` repositories, `failed` deletions,
+`interrupted` and the `unattempted` manifests (not attempted, or cut off by the cancellation) of an
+interrupted prune, and the `sweep` a forced prune ran (`repositories`, `blobs`, `bytes`, and any
+`stopped`, `failed` or `reviewing` repositories and `error`).
 `cache` holds `blobs`, `reclaimedBytes` and `kept` (counts by reason). The command exits non-zero
-when any deletion fails, after printing the report.
+when any deletion fails or the prune is interrupted, after printing the report.
+
+A forced prune that is cancelled, by Ctrl+C, by SIGTERM or by `--timeout` expiring, stops before its
+next deletion. The deletions already made stand, and `manifests` then holds only the ones the
+registry confirmed. The registry's garbage collection (the sweep) still reclaims those within a time
+limit: a note on stderr says how many and how long. The report marks the prune `interrupted` and
+lists under `unattempted`, not under `failed`, every planned manifest the prune did not attempt and
+every deletion it could not confirm because the cancellation cut it off. Listing here means the
+prune did not confirm the deletion, not that the manifest still exists. A deletion the registry
+refused is listed under `failed`, even when the refusal came at the moment of the cancellation. The
+prune is still marked `interrupted`, so an interrupted prune can list failures. If the registry
+refuses the last planned deletion just as the cancellation arrives, `unattempted` is empty, that
+manifest is under `failed`, and the note on stderr says no planned manifest was left unattempted. A
+deletion the cancellation cut off in flight may still have been completed by the registry, so a
+manifest under `unattempted` may already be gone. Those manifests are not swept by this run; a later
+prune or the registry's scheduled garbage collection reclaims them. The table on stdout keeps its
+usual lines; the interruption is reported on stderr, and the command exits non-zero after printing
+the report. It is safe to run the prune again: it plans from the registry's current state, so a
+manifest that is already gone is simply not listed and the rest are deleted.
+
+### A Pull Reserves Its Space
+
+A pull of an image, whether a Pod's or `k3sm image pull`'s, and a pull of an `image` volume reserve the
+layer bytes the manifest declares before the first layer is requested. The claim has to fit with the
+store's free-space floor kept free, and with the bytes other pulls in flight already hold.
+
+When free space alone is short, the node plans one prune pass as a dry run, which lists what the
+pass would delete and deletes nothing. A claim that fits free space plus that plan runs the one real
+pass and then fetches. A claim that does not fit is refused before any layer is requested, and nothing
+is evicted. A manifest cannot empty the unreferenced cache by declaring more than reclaim could free.
+
+| the claim | result | RPC code |
+|---|---|---|
+| Above the volume's capacity once the floor is added | refused, no prune pass of either kind | `FailedPrecondition` |
+| Above capacity once the bytes held by other pulls are added | refused, no prune pass | `ResourceExhausted` |
+| Above free space plus what the dry run would free | refused, nothing evicted | `ResourceExhausted` |
+| Within free space plus what the dry run would free | one real pass, then the fetch | none |
+
+The first row is a verdict on the manifest, whose declared sizes cannot fit this volume, so retrying
+does not help. The other refusals are a shortfall on the node: free up space and pull again.
+
+Two limits remain:
+
+- Sizes are logical bytes. A claim that fits the estimate still evicts once, and can then fail if the
+  volume is still short. Under APFS clonefile the estimate counts more than the pass frees.
+- A plan that fails, including a pull cancelled while the plan runs, is refused as `ResourceExhausted`,
+  with the cause in the message.
 
 ## Pushing to a Registry: `k3sm image push`
 
@@ -503,6 +550,139 @@ can show progress and fill a list before a large registry has been read. Every l
 An unreachable registry is a `start` line with `"reachable": false`, then `end`, and the command
 exits 0, as with `-o json`. After an `error` line the command exits non-zero. Image lines arrive in
 completion order; sort them yourself.
+
+## Shared Base Images
+
+There is no public supply of `darwin/arm64` runtimes, so projects build their own interpreters and
+servers (CPython, PostgreSQL, Node.js) from source. When several projects on one cluster need the
+same runtime, build it once and keep it in the cluster registry under one shared name instead of
+pushing a copy per project. The convention below says how. k3sm does not build or ship these
+images; the projects that need them do.
+
+### Where They Live
+
+```
+registry-k3sm:6450/base/<runtime>:<upstream version>-<content hash>
+```
+
+- **`base/`** is the shared prefix, reserved for these images. A project's own images stay under
+  its own name (`registry-k3sm:6450/<project>/...`), and no project takes the name `base`.
+- **`<runtime>`** is the upstream project's name in lowercase: `cpython`, `postgres`, `node`.
+- **`<upstream version>`** is the upstream release, exactly as upstream writes it: `3.13.1`, `17.2`,
+  `22.12.0`.
+- **`<content hash>`** is the first 12 hex digits of a sha256 over the build's inputs: the upstream
+  source archive, every patch applied, and every file of the build recipe (the Dockerfile and the
+  scripts it runs). List them with `shasum -a 256`, sort the lines by file name, and hash that
+  listing:
+
+  ```sh
+  shasum -a 256 postgres-17.2.tar.bz2 patches/*.patch Dockerfile build.sh \
+    | sort -k2 | shasum -a 256 | cut -c1-12
+  ```
+
+  The same inputs give the same tag on any Mac, and a different patch set gives a different tag, so
+  two builds of `17.2` with different patches never share a name. The same tag does not promise the
+  same bytes: a rebuild from the same inputs can produce different binaries, which is why a tag is
+  written once (below) and consumers pin a digest.
+
+For example, `registry-k3sm:6450/base/postgres:17.2-3f9a0c1d7b2e`.
+
+These images stay in the cluster registry. Never push a base image to a public registry. Anyone who
+can reach the cluster registry can pull from it (see [Pulling](registry.md#pulling)), so keep
+credentials and project data out of base images as well.
+
+### A Tag Is Written Once
+
+A base tag names one set of inputs, so it never moves. Nothing in the registry enforces that: a
+push to an existing tag replaces it. It is a rule for whoever pushes. Before you push, check whether
+the tag is already there, and use it if it is:
+
+```sh
+k3sm image inspect registry-k3sm:6450/base/postgres:17.2-3f9a0c1d7b2e && echo "already there"
+```
+
+Build to a layout and push only when the tag is absent. `k3sm build` records its tag without asking,
+so build with `--no-record`:
+
+```sh
+k3sm build --tag registry-k3sm:6450/base/postgres:17.2-3f9a0c1d7b2e --no-record \
+  --format oci --output ./postgres-layout .
+k3sm image push ./postgres-layout registry-k3sm:6450/base/postgres:17.2-3f9a0c1d7b2e
+```
+
+Keep the tag for as long as any project pins the image. `k3sm image prune` deletes untagged
+manifests, including one a Pod names by digest, and a tagged one is safe from it.
+
+### Required Labels
+
+Every base image carries these labels in its config. Write them with `LABEL` in the Dockerfile:
+
+| Label | Value |
+|---|---|
+| `org.opencontainers.image.title` | the `<runtime>` name |
+| `org.opencontainers.image.version` | the upstream version |
+| `org.opencontainers.image.source` | the URL of the upstream source archive |
+| `io.k3sm.base.source-sha256` | the sha256 of that archive |
+| `io.k3sm.base.patches` | each patch as `<file name>@sha256:<digest>`, comma-separated, or `none` |
+| `io.k3sm.base.content-hash` | the `<content hash>` in the tag |
+
+`k3sm image inspect -o json` prints the config, so a consumer can read what an image was built
+from before it pins one.
+
+### What a Native Base Image Must Be
+
+The platform is `darwin/arm64` and nothing else. `k3sm build` stamps it. The runtime also requires
+the following of a pulled native image today:
+
+- **`FROM scratch`.** Nothing comes from the host. Every Mach-O in the image links only against
+  `/usr/lib` and `/System`, and names its other libraries inside the image relative to itself
+  (`@loader_path/...`). `otool -L` lists what each one links against.
+- **Signed ad hoc, after the last edit.** Rewriting an install name invalidates the signature, and
+  an arm64 Mac does not run an unsigned Mach-O, so re-sign every Mach-O as the last build step with
+  `codesign -f -s - <file>`. k3sm ad-hoc signs a pulled image's tree as well, but an image that is
+  already signed runs the same on every node. Use no signing identity: a base image never carries a
+  Developer ID or any other key.
+- **The entrypoint is a regular Mach-O file inside the image.** k3sm signs the entrypoint inside the
+  image's own tree, and refuses the pull with `sign target is not a regular file inside its root`
+  when the entrypoint is a symlink (name `/python/bin/python3.13`, not `python3`) or a `/bin/sh` the
+  image does not carry.
+- **The runtime finds its own files relative to its executable.** An absolute path that names a file
+  inside the image (`PYTHONPATH=/app`, `/python/lib/...`) resolves on the host, not in the image,
+  for a native process. Absolute paths of volume mounts do resolve. Build the runtime relocatable:
+  a CPython that computes its prefix from its own executable, and a `.pth` file relative to the
+  interpreter rather than an absolute `PYTHONPATH`.
+
+### Using One
+
+Pin a base image by **digest**, never by tag alone. Read the digest once:
+
+```sh
+k3sm image inspect registry-k3sm:6450/base/postgres:17.2-3f9a0c1d7b2e
+```
+
+Then build on it. `FROM` is fetched by `k3sm build` on the Mac it runs on, and no Mac resolves
+`registry-k3sm`. On the server, write the registry's loopback name, `localhost:<port>` (`6450` unless
+`--registry-port` changed it), which is the same registry. On another Mac, turn on the registry's
+NodePort and write `<server>:<node port>` (see
+[Reaching It From Another Mac](registry.md#reaching-it-from-another-mac)), or build on the server.
+
+```dockerfile
+FROM localhost:6450/base/postgres@sha256:<digest>
+COPY launcher /postgres/bin/launcher
+ENTRYPOINT ["/postgres/bin/launcher"]
+```
+
+A Pod that runs a base image directly names it the in-cluster way:
+
+```yaml
+containers:
+  - name: pg
+    image: registry-k3sm:6450/base/postgres@sha256:<digest>
+```
+
+A digest pins exactly those bytes, so a rebuilt base reaches a project only when the project moves
+its pin. A base image with a security fix gets a new content hash and tag; each project moves its
+pin when it is ready.
 
 ## Next
 

@@ -47,9 +47,11 @@ import (
 	"k3sm.io/darwin-net/pkg/podnet"
 	"k3sm.io/darwin-net/pkg/tcpseg"
 	"k3sm.io/k3sm/pkg/gpucapacity"
+	"k3sm.io/k3sm/pkg/ociregistry/store"
 	"k3sm.io/k3sm/pkg/provider/podlogs"
 	"k3sm.io/k3sm/pkg/provider/vkadapter"
 	"k3sm.io/k3sm/pkg/version"
+	"k3sm.io/runtimed/pkg/hostshare"
 	"k3sm.io/runtimed/pkg/image"
 	"k3sm.io/runtimed/pkg/mount"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
@@ -89,6 +91,26 @@ type runtimedRuntime struct {
 	// keeps it only to name the file in each pod's Seatbelt read allow alongside
 	// dyldShim (see stampShimReadPaths).
 	pathShim string
+	// hostSharesFile is the node's host-share allowlist
+	// (RuntimedConfig.HostSharesFile). buildBox decides a native pod's hostPath
+	// volumes against it before the RPC; runtimed decides them again from the
+	// same file.
+	hostSharesFile string
+	// loadHostShares reads hostSharesFile; nil is hostshare.Load. A test seam:
+	// the real loader accepts only a root-owned file.
+	loadHostShares func(string) ([]hostshare.Entry, error)
+	// exposeRoot is the data root runtimed keeps exposure volumes under
+	// (<exposeRoot>/expose/<namespace>/<pod>/<volume>), as exposeRootOf
+	// derives it.
+	exposeRoot string
+	// loadExposeGrants reads hostSharesFile's exposure grants; nil is
+	// hostshare.LoadEffective. lookupExposeUser resolves an account name to
+	// its uid (nil is os/user), and exposeAccountName a uid to its current
+	// name (nil is os/user). Test seams: the real loader accepts only a
+	// root-owned file, and the real lookups read the node's directory.
+	loadExposeGrants  func(string) ([]hostshare.ExposeGrant, error)
+	lookupExposeUser  func(name string) (uint32, error)
+	exposeAccountName hostshare.AccountName
 	// resolverVIP and clusterDomain are the cluster DNS inputs buildBox feeds
 	// dns.PodDNSConfig (per-pod namespace) to derive the K3SM_DNS_* env the DYLD
 	// getaddrinfo shim reads — so an in-pod unqualified Service lookup expands and
@@ -163,6 +185,9 @@ type runtimedRuntime struct {
 	// no toolchain — the annotation then grants nothing, which the constructor
 	// logged when it looked.
 	developerDir string
+	// shadowBinDir is the node's shadow binary set (RuntimedConfig.ShadowBinDir),
+	// read by warnXcodebuildCopyUnavailable. Empty when the node has none.
+	shadowBinDir string
 
 	// resolver supplies ConfigMap/Secret data for the env resolution the
 	// provider performs before sending the box to runtimed (runtimed reads only
@@ -531,6 +556,16 @@ type RuntimedConfig struct {
 	// runtime's own root. Otherwise NewRuntimed refuses a value the denies would not
 	// match (ErrDataRootNotCanonical).
 	DataRoot string
+	// StateDir is the role's real state directory, its --work-dir itself, which
+	// holds the CA keys, the kine database and the node password whatever its
+	// leaf. The DataRoot denies name only the server and agent children, so a work
+	// dir such as <data root>/cp is denied only through this value
+	// (runtime.Config.StateDir). Empty (the standalone `k3sm node`) renders no
+	// extra deny. The value is made absolute and cleaned. NewRuntimed refuses a
+	// value the deny would not match (ErrDataRootNotCanonical), except the
+	// runtime's own server or agent directory behind a symlink, whose resolved
+	// target is denied instead.
+	StateDir string
 	// DyldShim, when set, is the getaddrinfo DNS shim dylib injected into each
 	// pod via the PodBox annotation runtimed maps to DYLD_INSERT_LIBRARIES. The
 	// file is also added to every pod's Seatbelt read allow (stampShimReadPaths).
@@ -546,6 +581,10 @@ type RuntimedConfig struct {
 	// volume (no chroot). Empty leaves a pod's absolute mount path reaching the host.
 	// Like DyldShim, the file joins every pod's Seatbelt read allow.
 	PathShim string
+	// HostSharesFile is the node's host-share allowlist (hostshare.DefaultFile
+	// on an installed node): the host directories and sockets a native pod may
+	// mount with a hostPath volume, at their own path. Empty shares nothing.
+	HostSharesFile string
 	// ResolverVIP is the cluster DNS Service VIP (10.43.0.10) the per-pod Seatbelt
 	// egress allow-list is scoped to (threaded into runtimed's sandbox.Posture), so
 	// a confined pod's DNS reaches the node-local resolver. Empty leaves runtimed's
@@ -663,17 +702,37 @@ type RuntimedConfig struct {
 	// contract is runtimed/pkg/image's FlatRegistry; the zero value maps nothing,
 	// and runtimed refuses an invalid mapping at construction.
 	FlatRegistry image.FlatRegistry
+	// RegistryStoreRoot is the root of the registry store this node serves the
+	// cluster registry from, set only by a server whose registry started. The
+	// image puller then offers each blob to that store before fetching it
+	// (store.LocalBlobSource): a blob already there is cloned and re-hashed
+	// instead of copied over the network. "" (an agent, a standalone node, a
+	// server with no registry) fetches every blob, as before.
+	RegistryStoreRoot string
 	// GuestArtifacts is this node's ENSURED, digest-verified guest boot artifact
 	// set — the kernel, the initramfs and the cmdline a vm pod boots from.
 	// It is DATA, already materialised by GuestArtifactSource.Ensure before this
 	// config is built, never a directory this constructor would fetch into: daemon
-	// start is not a place to discover that a hundred megabytes are missing.
+	// start is not a place to discover that a hundred megabytes are missing. The
+	// one exception is GuestStore below, whose fetch needs the runtime this
+	// constructor builds.
 	//
 	// nil is the FAIL-CLOSED posture and the shipped one on any node whose ensure
 	// did not succeed (an unminted pin, no network, a digest mismatch). It leaves
 	// the vm backend's artifact locator unset, so CreateVM fails every vm pod with
 	// sandbox.ErrGuestArtifactsUnavailable while every native pod is untouched.
 	GuestArtifacts *EnsuredGuestArtifacts
+	// GuestStore makes this node a consumer of the cluster store for its guest
+	// boot artifacts (a worker): when it is non-nil and GuestArtifacts is nil,
+	// NewRuntimed ensures the pinned set from the cluster registry FlatRegistry
+	// names, AFTER runtimed.New (the store is the runtime's own), and installs it
+	// with Runtime.RefreshGuestArtifacts. The release host is never contacted on
+	// that path, not even when FlatRegistry maps nothing: the vm capability is
+	// then withheld with errGuestStoreUnavailable. A failure degrades exactly as
+	// GuestArtifacts nil does.
+	//
+	// nil leaves guest artifacts to GuestArtifacts.
+	GuestStore *GuestArtifactSource
 	// PodLogsDir is the root of the CRI container-log tree, the kubelet's
 	// --pod-logs-dir. Empty defaults to podlogs.DefaultPodLogsDir
 	// (/var/log/pods) — the same default and the same layout a kubelet uses, so
@@ -711,6 +770,14 @@ type RuntimedConfig struct {
 	rootLockWait time.Duration
 }
 
+// GuestFromClusterStore reports whether this node takes its guest boot
+// artifacts only from the cluster store (see GuestStore), so the caller must
+// not run its own release-host ensure. It holds with or without a cluster
+// registry mapped: a worker has no release-host fallback.
+func (c RuntimedConfig) GuestFromClusterStore() bool {
+	return c.GuestStore != nil
+}
+
 // NewRuntimed builds a runtimedRuntime, constructing the in-process runtime with
 // production defaults (real image puller/signer, the exec-shim Seatbelt backend,
 // posix_spawn/kqueue supervisor). It returns an error if the runtime cannot be
@@ -737,7 +804,7 @@ func NewRuntimed(ctx context.Context, cfg RuntimedConfig) (*runtimedRuntime, err
 		log.Error("refusing to start: pods could write the status records", "err", err)
 		return nil, fmt.Errorf("init runtimed: %w", err)
 	}
-	dataRoot, err := dataRootOf(cfg)
+	dataRoot, stateDir, err := dataRootOf(cfg)
 	if err != nil {
 		log.Error("refusing to start: the sandbox could not deny the control-plane state", "err", err)
 		return nil, fmt.Errorf("init runtimed: %w", err)
@@ -800,6 +867,9 @@ func NewRuntimed(ctx context.Context, cfg RuntimedConfig) (*runtimedRuntime, err
 	deps.RootLockWait = cfg.rootLockWait
 	deps.Credentials = creds
 	deps.Network = network
+	// The exposure ACL seam: runtimed sets an exposure directory's entries as
+	// its owner through this, and refuses every exposure without it.
+	deps.ExposeACL = exposeACL{}
 	// The cluster-mirror seam. Threaded as DATA, exactly like the resolver and the
 	// credential resolver above and for the same reason: runtimed never reads the
 	// apiserver, so the component that knows the cluster's peers is the one that
@@ -812,42 +882,26 @@ func NewRuntimed(ctx context.Context, cfg RuntimedConfig) (*runtimedRuntime, err
 	deps.ClusterRegistries = cfg.ClusterRegistries
 	deps.LocalRegistryHost = cfg.LocalRegistryHost
 	deps.FlatRegistry = cfg.FlatRegistry
-	rt, err := runtimed.New(runtimed.Config{
-		Root:           cfg.Root,
-		RuntimeVersion: version.Get().Version,
-		Logger:         log,
-		// Scope each pod's Seatbelt egress to the cluster DNS + API VIPs so a
-		// confined pod's DNS and in-pod client-go reach the node-local resolver /
-		// API VIP. runtimed threads these into its per-pod sandbox.Posture.
-		ResolverVIP:  cfg.ResolverVIP,
-		APIServerVIP: cfg.APIServerVIP,
-		// The container-log root, threaded so runtimed's Seatbelt profile denies
-		// every confined pod read AND write access to the tree its own output is
-		// written into. It is REQUIRED by runtimed and deliberately has no default
-		// there: a deny rendered for /var/log/pods on a node whose logs actually
-		// live under a `k3sm dev` instance directory protects nothing while
-		// reading like protection. Resolved here through the same expression the
-		// provider's own tree uses, so the denied path and the written path are
-		// one value.
-		PodLogsDir: podLogsDirOf(cfg),
-		// The status records' real location, denied beside <Root>/status. On a
-		// default node the two are one path and the profile does not change.
-		StatusRecordDir: statusRecordDir,
-		// The control-plane state's real location, denied beside <Root>/server
-		// and <Root>/agent. On a default node the two are one path and the profile
-		// does not change.
-		DataRoot:     dataRoot,
-		PathShimPath: cfg.PathShim,
-		ShadowBinDir: cfg.ShadowBinDir,
-	}, deps)
+	rt, err := runtimed.New(runtimedConfigOf(cfg, log, statusRecordDir, dataRoot, stateDir), deps)
 	if err != nil {
 		if errors.Is(err, sandbox.ErrInvalidStatusRecordDir) {
 			log.Error("refusing to start: pods could write the status records", "err", err)
 		}
-		if errors.Is(err, sandbox.ErrInvalidDataRoot) {
+		if errors.Is(err, sandbox.ErrInvalidDataRoot) || errors.Is(err, sandbox.ErrInvalidStateDir) {
 			log.Error("refusing to start: the sandbox could not deny the control-plane state", "err", err)
 		}
 		return nil, fmt.Errorf("init runtimed: %w", err)
+	}
+	// The worker-side guest ensure, HERE and not before runtimed.New: its store
+	// is the runtime's own artifact puller and blob cache, so the vm backend
+	// above was built without a locator and takes one late. It runs before
+	// newRuntimedWith so the VMArtifactsAvailable fact is settled before the
+	// provider exists, and before adoptNodePods so no pod is served first. Like
+	// the release-host ensure it cannot fail construction.
+	if cfg.GuestArtifacts == nil && cfg.GuestFromClusterStore() {
+		if ga, ok := cfg.GuestStore.ensureFromStore(ctx, cfg.Root, cfg.FlatRegistry.Host, rt, log); ok {
+			cfg.GuestArtifacts = &ga
+		}
 	}
 	r := newRuntimedWith(rt, cfg, resolver, log)
 	r.history = history
@@ -880,6 +934,59 @@ func NewRuntimed(ctx context.Context, cfg RuntimedConfig) (*runtimedRuntime, err
 	// the pod is created again.
 	r.adoptNodePods(ctx, rt)
 	return r, nil
+}
+
+// runtimedConfigOf is the runtimed.Config NewRuntimed builds the runtime with,
+// from cfg, its logger and the three directories NewRuntimed has already
+// validated.
+func runtimedConfigOf(cfg RuntimedConfig, log *slog.Logger, statusRecordDir, dataRoot, stateDir string) runtimed.Config {
+	return runtimed.Config{
+		Root:           cfg.Root,
+		RuntimeVersion: version.Get().Version,
+		Logger:         log,
+		// Scope each pod's Seatbelt egress to the cluster DNS + API VIPs so a
+		// confined pod's DNS and in-pod client-go reach the node-local resolver /
+		// API VIP. runtimed threads these into its per-pod sandbox.Posture.
+		ResolverVIP:  cfg.ResolverVIP,
+		APIServerVIP: cfg.APIServerVIP,
+		// The container-log root, threaded so runtimed's Seatbelt profile denies
+		// every confined pod read AND write access to the tree its own output is
+		// written into. It is REQUIRED by runtimed and deliberately has no default
+		// there: a deny rendered for /var/log/pods on a node whose logs actually
+		// live under a `k3sm dev` instance directory protects nothing while
+		// reading like protection. Resolved here through the same expression the
+		// provider's own tree uses, so the denied path and the written path are
+		// one value.
+		PodLogsDir: podLogsDirOf(cfg),
+		// The status records' real location, denied beside <Root>/status. On a
+		// default node the two are one path and the profile does not change.
+		StatusRecordDir: statusRecordDir,
+		// The control-plane state's real location, denied beside <Root>/server
+		// and <Root>/agent. On a default node the two are one path and the profile
+		// does not change.
+		DataRoot: dataRoot,
+		// The role's own work dir, denied whatever its leaf: a leaf other than
+		// server or agent is named by no DataRoot deny.
+		StateDir:     stateDir,
+		PathShimPath: cfg.PathShim,
+		ShadowBinDir: cfg.ShadowBinDir,
+		// The host-share allowlist runtimed decides hostPath volumes against,
+		// the same file buildBox reads.
+		HostSharesFile: cfg.HostSharesFile,
+		// The node's own registry store, offered to the puller blob by blob. Set
+		// on a server that runs the registry; nil everywhere else.
+		LocalBlobSource: localBlobSourceOf(cfg),
+	}
+}
+
+// localBlobSourceOf returns the registry store cfg names as a local blob
+// source, or nil (an untyped nil, so runtimed sees no source at all) when cfg
+// names none.
+func localBlobSourceOf(cfg RuntimedConfig) image.LocalBlobSource {
+	if cfg.RegistryStoreRoot == "" {
+		return nil
+	}
+	return store.NewLocalBlobSource(cfg.RegistryStoreRoot)
 }
 
 // refsOf returns the podRefManager resolver reads Secrets and ConfigMaps
@@ -952,6 +1059,8 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 		dyldShim:        cfg.DyldShim,
 		clusterRegistry: cfg.FlatRegistry.Host,
 		pathShim:        cfg.PathShim,
+		hostSharesFile:  cfg.HostSharesFile,
+		exposeRoot:      exposeRootOf(cfg),
 		resolverVIP:     cfg.ResolverVIP,
 		clusterDomain:   cfg.ClusterDomain,
 		apiServerVIP:    cfg.APIServerVIP,
@@ -966,6 +1075,7 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 		// tests share, for the same reason as the deny-set above: a node fact the
 		// pod path must never re-derive per pod.
 		developerDir:   resolveDeveloperDir(log),
+		shadowBinDir:   cfg.ShadowBinDir,
 		resolver:       resolver,
 		refs:           refsOf(resolver),
 		network:        cfg.Network,
@@ -1068,49 +1178,103 @@ func warnStatusDirEscapes(log *slog.Logger, own string) {
 		"status_dir", own, "resolved", resolved)
 }
 
-// ErrDataRootNotCanonical reports a data root, or its server or agent directory,
-// that exists under a path other than the one configured, a symlink or a spelling
+// ErrDataRootNotCanonical reports a data root, its server or agent directory, or
+// the role's state directory (RuntimedConfig.StateDir), that exists under a path other than the one configured, a symlink or a spelling
 // the macOS firmlinks do not explain. libsandbox matches resolved paths, so the
 // Seatbelt deny written from the configured string would match nothing, and
 // nothing would report it.
 var ErrDataRootNotCanonical = errors.New("data root is not its own resolved path")
 
-// dataRootOf returns the data root the Seatbelt denies are written from, or an
-// error when a deny could not match. A relative value (a relative --work-dir) is
-// made absolute, because that is where the state it names is written, and
-// runtime.New refuses a relative one.
+// dataRootOf returns the data root and the state directory the Seatbelt denies
+// are written from, or an error when a deny could not match. A relative value (a
+// relative --work-dir) is made absolute, because that is where the state it names
+// is written, and runtime.New refuses a relative one. The state directory is also
+// cleaned, so a spelling such as a trailing slash, "//" or "/./" that the role
+// accepts is not refused by runtime.New as unclean. One with a ".." element is
+// refused with sandbox.ErrInvalidStateDir before it is cleaned.
 //
 // A data root that is the runtime's own root returns in the runtime's spelling and
 // is not checked. The profile adds no deny for it, so there is no new deny that could
 // fail to match, and refusing a node that starts today would change a default node
-// for nothing.
-func dataRootOf(cfg RuntimedConfig) (string, error) {
+// for nothing. The state directory is checked on that path too
+// (ownRootStateDir).
+func dataRootOf(cfg RuntimedConfig) (dataRoot, stateDir string, err error) {
 	dir, err := absDenyDir(cfg.DataRoot, ErrDataRootNotCanonical)
 	if err != nil {
-		return "", err
+		return "", "", err
+	}
+	// Clean folds "link/.." lexically while the OS resolves it to the parent of the
+	// link's target, so the deny would name another directory: refuse it first.
+	if slices.Contains(strings.Split(cfg.StateDir, "/"), "..") {
+		return "", "", fmt.Errorf("%w: %q has a .. element", sandbox.ErrInvalidStateDir, cfg.StateDir)
+	}
+	stateDir, err = absDenyDir(cfg.StateDir, ErrDataRootNotCanonical)
+	if err != nil {
+		return "", "", err
+	}
+	if stateDir != "" {
+		stateDir = filepath.Clean(stateDir)
 	}
 	root := runtimeRoot(cfg.Root)
 	if dir != "" && withoutFirmlink(dir) == withoutFirmlink(root) {
-		return root, nil
+		stateDir, err = ownRootStateDir(root, stateDir)
+		if err != nil {
+			return "", "", err
+		}
+		return root, stateDir, nil
 	}
-	if err := checkDataRoot(dir); err != nil {
-		return "", err
+	if err := checkDataRoot(dir, stateDir); err != nil {
+		return "", "", err
 	}
-	return dir, nil
+	return dir, stateDir, nil
+}
+
+// ownRootStateDir returns the state directory to deny on a node whose data root is
+// the runtime's own root. Any leaf but that root's server or agent directory must
+// be its own resolved path, as under a custom pod root. One of those two is denied
+// by the profile in its configured spelling already, so a node whose work dir is
+// one, or sits, behind a symlink is not refused, because it starts today; the
+// resolved target is returned instead, so the state dir deny names the real files.
+// A target that cannot be resolved, or that runtime.New would refuse
+// (sandbox.ValidateStateDir), is refused with ErrDataRootNotCanonical.
+// The symlink is resolved once, at startup; a later retarget is not followed.
+func ownRootStateDir(root, stateDir string) (string, error) {
+	if stateDir == "" {
+		return "", nil
+	}
+	if !slices.ContainsFunc(sandbox.DataRootDenyTrees(root, ""), func(own string) bool {
+		return withoutFirmlink(stateDir) == withoutFirmlink(own)
+	}) {
+		return stateDir, checkResolvedDir(stateDir, ErrDataRootNotCanonical)
+	}
+	if _, err := os.Lstat(stateDir); errors.Is(err, fs.ErrNotExist) {
+		return stateDir, nil
+	}
+	resolved, err := filepath.EvalSymlinks(stateDir)
+	if err != nil {
+		return "", fmt.Errorf("%w: %q: %w", ErrDataRootNotCanonical, stateDir, err)
+	}
+	if withoutFirmlink(resolved) == withoutFirmlink(stateDir) {
+		return stateDir, nil
+	}
+	if err := sandbox.ValidateStateDir(resolved, root); err != nil {
+		return "", fmt.Errorf("%w: %q resolves to %q: %w", ErrDataRootNotCanonical, stateDir, resolved, err)
+	}
+	return resolved, nil
 }
 
 // checkDataRoot refuses a data root whose resolved path is not the configured
-// string, and one whose denied children are not, since either would leave a deny
-// matching nothing. The list is the one the profile renders.
-func checkDataRoot(dir string) error {
-	if dir == "" {
-		return nil
+// string, and one whose denied trees are not, since either would leave a deny
+// matching nothing. The trees are the ones the profile renders for the data root
+// and the state directory (sandbox.DataRootDenyTrees).
+func checkDataRoot(dir, stateDir string) error {
+	if dir != "" {
+		if err := checkResolvedDir(dir, ErrDataRootNotCanonical); err != nil {
+			return err
+		}
 	}
-	if err := checkResolvedDir(dir, ErrDataRootNotCanonical); err != nil {
-		return err
-	}
-	for _, sub := range sandbox.DataRootDenySubdirs() {
-		if err := checkResolvedDir(filepath.Join(dir, sub), ErrDataRootNotCanonical); err != nil {
+	for _, tree := range sandbox.DataRootDenyTrees(dir, stateDir) {
+		if err := checkResolvedDir(tree, ErrDataRootNotCanonical); err != nil {
 			return err
 		}
 	}
@@ -1837,6 +2001,16 @@ func (r *runtimedRuntime) setupGuestNetwork(ctx context.Context, pod *corev1.Pod
 	if err != nil || backend != runtimev1.SandboxBackend_SANDBOX_BACKEND_VM {
 		return sandbox.GuestNetworkConfig{}, nil
 	}
+	// A None pod whose config the guest cannot honor (no IPv4 nameserver: the
+	// guest's NAT segment is IPv4) is refused BEFORE an address is drawn, with the
+	// same *podDNSRefusal the native path returns, so both read as one
+	// CreateContainerConfigError and neither boots on a resolver the pod did not ask
+	// for.
+	if pod.Spec.DNSPolicy == corev1.DNSNone {
+		if _, err := podDNSNoneEnv(dnsCfg); err != nil {
+			return sandbox.GuestNetworkConfig{}, err
+		}
+	}
 	gn, err := r.network.SetupGuest(ctx, string(pod.UID), dnsCfg)
 	if err != nil {
 		return sandbox.GuestNetworkConfig{}, r.allocError(pod, err)
@@ -1844,15 +2018,21 @@ func (r *runtimedRuntime) setupGuestNetwork(ctx context.Context, pod *corev1.Pod
 	return gn, nil
 }
 
-// podDNSConfig derives one pod's cluster DNS config: the namespace-scoped cluster
-// base (dns.PodDNSConfig), additively merged with a ClusterFirst pod's
-// spec.dnsConfig (extra search domains appended+deduped, an ndots override).
-// The merge is GATED on the cluster-DNS policy — NOT left to injectClusterDNSEnv's
-// downstream gate — so the seam is structural: a None/Default pod gets the
-// UNMERGED base, so when a later change makes None inject its own config it cannot
-// inherit a cluster-base merge. dnsConfigOverride does the corev1→discrete-params extraction
-// (k3sm is the corev1-aware layer); dns.MergeDNSConfig can only ADD search/ndots,
-// never repoint the cluster server VIP.
+// podDNSConfig derives one pod's DNS config, branching three ways on its policy:
+//
+//   - cluster-first: the namespace-scoped cluster base (dns.PodDNSConfig),
+//     additively merged with the pod's spec.dnsConfig (extra search domains
+//     appended+deduped, an ndots override). dnsConfigOverride does the
+//     corev1→discrete-params extraction (k3sm is the corev1-aware layer);
+//     dns.MergeDNSConfig can only ADD search/ndots, never repoint the cluster
+//     server VIP.
+//   - None: the pod's own spec.dnsConfig, mapped whole by dnsPolicyNoneConfig. It
+//     takes nothing from the cluster base: no VIP, no domain, no search list.
+//   - Default (and any other value): the UNMERGED base, which injectPodDNSEnv
+//     does not inject; a vm guest still gets its resolv.conf from it.
+//
+// The branch is HERE, not left to injectPodDNSEnv's downstream gate, so the seam
+// is structural: a None pod can never inherit a cluster-base merge.
 //
 // It returns the config and the number of search domains the in-pod cap DROPPED,
 // and logs nothing: the create path calls it twice for a vm pod (podIP, to learn
@@ -1863,12 +2043,81 @@ func (r *runtimedRuntime) setupGuestNetwork(ctx context.Context, pod *corev1.Pod
 // /etc/resolv.conf and its containers' injected K3SM_DNS_* env are derived from
 // this value, and a second derivation is how the two would come to disagree.
 func (r *runtimedRuntime) podDNSConfig(pod *corev1.Pod) (netv1.DNSConfig, int) {
+	if pod.Spec.DNSPolicy == corev1.DNSNone {
+		// What the mapping altered is warnDNSConfigForming's to report, once, at
+		// create; this function is called on every translation.
+		cfg, _ := dnsPolicyNoneConfig(pod.Spec.DNSConfig)
+		return cfg, 0
+	}
 	dnsCfg := dns.PodDNSConfig(r.resolverVIP, r.clusterDomain, pod.Namespace)
 	if !clusterDNSPolicy(pod.Spec.DNSPolicy) || pod.Spec.DNSConfig == nil {
 		return dnsCfg, 0
 	}
 	searches, ndots := dnsConfigOverride(pod.Spec.DNSConfig)
 	return dns.MergeDNSConfig(dnsCfg, searches, ndots)
+}
+
+// dnsNoneRefusal returns the refusal of a dnsPolicy None pod the in-pod
+// resolver cannot honor (podDNSNoneEnv), or nil. It reads the pod's spec only, so
+// CreatePod decides it before anything is allocated for the pod.
+func (r *runtimedRuntime) dnsNoneRefusal(pod *corev1.Pod) *podDNSRefusal {
+	if pod.Spec.DNSPolicy != corev1.DNSNone {
+		return nil
+	}
+	dnsCfg, _ := r.podDNSConfig(pod)
+	var refusal *podDNSRefusal
+	if _, err := podDNSNoneEnv(dnsCfg); errors.As(err, &refusal) {
+		return refusal
+	}
+	return nil
+}
+
+// warnDNSConfigPartial records a DNSConfigPartial Warning Event when a dnsPolicy
+// None pod lists IPv6 nameservers beside IPv4 ones: the in-pod resolver (the
+// native shim, and the vm guest's IPv4 NAT segment) serves only the IPv4 subset,
+// so the pod runs on fewer nameservers than it asked for. The drop is not a
+// refusal (an all-IPv6 pod is refused instead, podDNSNoneEnv); the Event is the
+// only place it is visible. CreatePod calls it once, at create, as it does
+// warnXcodeToolchainUngranted: an update, a re-attach or a retry rebuilds the same
+// box from the same immutable dnsConfig and has nothing new to say.
+func (r *runtimedRuntime) warnDNSConfigPartial(ctx context.Context, pod *corev1.Pod) {
+	if pod.Spec.DNSPolicy != corev1.DNSNone {
+		return
+	}
+	dnsCfg, _ := r.podDNSConfig(pod)
+	_, err := dns.ConfigToEnvChecked(dnsCfg)
+	if !errors.Is(err, dns.ErrNameserversDropped) {
+		return
+	}
+	r.log.WarnContext(ctx, "dnsPolicy None pod lists IPv6 nameservers the in-pod resolver does not use",
+		"namespace", pod.Namespace, "name", pod.Name, "err", err)
+	r.recorder.Event(pod, corev1.EventTypeWarning, reasonDNSConfigPartial, msgDNSConfigPartial(err))
+}
+
+// warnDNSConfigForming records one DNSConfigForming Warning Event per alteration
+// dnsPolicyNoneConfig made to a dnsPolicy None pod's dnsConfig to fit it:
+// nameservers beyond the cap, search domains beyond the cap, and ndots 0 applied
+// as 1. The reason is the kubelet's for a DNS config it altered; CreatePod calls
+// it once, at create.
+func (r *runtimedRuntime) warnDNSConfigForming(ctx context.Context, pod *corev1.Pod) {
+	if pod.Spec.DNSPolicy != corev1.DNSNone {
+		return
+	}
+	_, forming := dnsPolicyNoneConfig(pod.Spec.DNSConfig)
+	var msgs []string
+	if len(forming.droppedNameservers) > 0 {
+		msgs = append(msgs, msgDNSNameserversCapped(forming.droppedNameservers))
+	}
+	if len(forming.droppedSearches) > 0 {
+		msgs = append(msgs, msgDNSSearchesCapped(forming.droppedSearches))
+	}
+	if forming.ndotsZero {
+		msgs = append(msgs, msgDNSNdotsZero)
+	}
+	for _, m := range msgs {
+		r.log.WarnContext(ctx, "dnsPolicy None pod dnsConfig altered", "namespace", pod.Namespace, "name", pod.Name, "detail", m)
+		r.recorder.Event(pod, corev1.EventTypeWarning, reasonDNSConfigForming, m)
+	}
 }
 
 // buildBox translates pod to a PodBox and resolves its env into LITERAL values —
@@ -1878,9 +2127,10 @@ func (r *runtimedRuntime) podDNSConfig(pod *corev1.Pod) (netv1.DNSConfig, int) {
 // podIP is the pod's already-resolved IP (see podIP — allocated BEFORE this
 // translation so the box and its resolved env carry the real /32).
 func (r *runtimedRuntime) buildBox(ctx context.Context, pod *corev1.Pod, podIP string) (*runtimev1.PodBox, error) {
-	// Per-pod cluster DNS config: the search list is namespace-scoped
-	// (<ns>.svc.<domain>, …) so an unqualified Service name in this pod's namespace
-	// resolves first. toPodBox injects it (DNSPolicy-gated) into the containers.
+	// Per-pod DNS config (podDNSConfig): for a cluster-first pod the search list is
+	// namespace-scoped (<ns>.svc.<domain>, …) so an unqualified Service name in this
+	// pod's namespace resolves first; a None pod's is its own. toPodBox
+	// injects it (DNSPolicy-gated) into the containers.
 	dnsCfg, dropped := r.podDNSConfig(pod)
 	if dropped > 0 {
 		// The pod's merged search list exceeded the in-pod cap (MaxSearchDomains, a
@@ -1899,8 +2149,17 @@ func (r *runtimedRuntime) buildBox(ctx context.Context, pod *corev1.Pod, podIP s
 	if _, err := r.setupGuestNetwork(ctx, pod, dnsCfg); err != nil {
 		return nil, err
 	}
-	box, err := toPodBox(pod, podIP, r.nodeIP, r.podRoot(string(pod.UID)), r.dyldShim, r.clusterRegistry, dnsCfg, r.log)
+	// The cluster DNS VIP is passed beside dnsCfg because a None config carries
+	// none, and the bind discipline's Service-CIDR scope must not depend on the
+	// pod's resolver (toPodBox).
+	box, err := toPodBox(pod, podIP, r.nodeIP, r.podRoot(string(pod.UID)), r.dyldShim, r.clusterRegistry, dnsCfg, r.resolverVIP, r.log)
 	if err != nil {
+		return nil, err
+	}
+	if err := r.authorizeHostShares(pod, box); err != nil {
+		return nil, err
+	}
+	if err := r.authorizeExposures(box); err != nil {
 		return nil, err
 	}
 	// Deny every pod the daemon control sockets: pods share the _k3sm uid with the
@@ -2088,28 +2347,40 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	// is gone, since Virtual Kubelet may send no DeletePod for such a pod;
 	// auto-releasing would also rip a live pod's alias away on an UpdatePod
 	// translate error).
-	podIP, err := r.podIP(ctx, pod)
-	if err != nil {
-		// Log here (not just return) so the failure reaches server.log — VK's own
-		// create-error log does not, so a pod stuck Pending is otherwise invisible.
-		r.log.Error("CreatePod: allocate podIP", "namespace", pod.Namespace, "name", pod.Name, "err", err)
-		return fmt.Errorf("create pod %s/%s: %w", pod.Namespace, pod.Name, err)
-	}
-	// The interconnect attach (k3sm.io/interconnects) runs once per pod, here
-	// at create and before translation, so the box carries its env. Under
-	// fallback none, or before this node's desired annotation is known, it holds
-	// the create; the slot of a held or refused create is freed with the /32 by
-	// releasePodNetwork.
-	if err := r.interconnect.attach(ctx, pod); err != nil {
-		r.log.Error("CreatePod: interconnect attach", "namespace", pod.Namespace, "name", pod.Name, "err", err)
-		return fmt.Errorf("create pod %s/%s: %w", pod.Namespace, pod.Name, err)
-	}
-	box, err := r.buildBox(ctx, pod, podIP)
-	if err != nil {
-		r.log.Error("CreatePod: translate/buildBox", "namespace", pod.Namespace, "name", pod.Name, "err", err)
-		r.recordPodHostnameRefusal(pod, err)
-		r.recordVolumeRefusal(pod, err)
-		return fmt.Errorf("translate pod %s/%s: %w", pod.Namespace, pod.Name, err)
+	//
+	// A dnsPolicy None pod the in-pod resolver cannot honor (podDNSRefusal) is
+	// decided from its spec alone, so it is decided FIRST, before an address is
+	// drawn or an interconnect slot attached: it holds nothing. It is not an error
+	// return either: it is PARKED below, once its track exists, as the kubelet's
+	// CreateContainerConfigError, and is never sent to the runtime.
+	dnsRefusal := r.dnsNoneRefusal(pod)
+	var podIP string
+	var box *runtimev1.PodBox
+	if dnsRefusal == nil {
+		var err error
+		podIP, err = r.podIP(ctx, pod)
+		if err != nil {
+			// Log here (not just return) so the failure reaches server.log — VK's own
+			// create-error log does not, so a pod stuck Pending is otherwise invisible.
+			r.log.Error("CreatePod: allocate podIP", "namespace", pod.Namespace, "name", pod.Name, "err", err)
+			return fmt.Errorf("create pod %s/%s: %w", pod.Namespace, pod.Name, err)
+		}
+		// The interconnect attach (k3sm.io/interconnects) runs once per pod, here
+		// at create and before translation, so the box carries its env. Under
+		// fallback none, or before this node's desired annotation is known, it holds
+		// the create; the slot of a held or refused create is freed with the /32 by
+		// releasePodNetwork.
+		if err := r.interconnect.attach(ctx, pod); err != nil {
+			r.log.Error("CreatePod: interconnect attach", "namespace", pod.Namespace, "name", pod.Name, "err", err)
+			return fmt.Errorf("create pod %s/%s: %w", pod.Namespace, pod.Name, err)
+		}
+		box, err = r.buildBox(ctx, pod, podIP)
+		if err != nil {
+			r.log.Error("CreatePod: translate/buildBox", "namespace", pod.Namespace, "name", pod.Name, "err", err)
+			r.recordPodHostnameRefusal(pod, err)
+			r.recordVolumeRefusal(pod, err)
+			return fmt.Errorf("translate pod %s/%s: %w", pod.Namespace, pod.Name, err)
+		}
 	}
 	// Refuse a pod this node cannot honestly run BEFORE the RPC, and before any
 	// bookkeeping — a pod refused here leaves no track and no prober, exactly as if
@@ -2118,18 +2389,35 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	//
 	// The emptyDir-medium and projected-source checks run first because they are
 	// pure spec inspection, while the platform check may cost a node-capability RPC.
-	if err := r.preflightEmptyDirMedium(pod, box); err != nil {
-		return err
+	// A DNS-refused pod has no box: it is parked below and never reaches the RPC,
+	// so only the spec-only preflight runs for it.
+	if box != nil {
+		if err := r.preflightEmptyDirMedium(pod, box); err != nil {
+			return err
+		}
 	}
 	if err := r.preflightProjectedSources(pod); err != nil {
 		return err
 	}
-	if err := r.preflightImagePlatform(ctx, pod, box); err != nil {
-		return err
+	if box != nil {
+		if err := r.preflightImagePlatform(ctx, pod, box); err != nil {
+			return err
+		}
+		// The node-admitted host shares, recorded on the pod once, at create: the
+		// cluster-side audit record beside runtimed's log line.
+		r.recordHostShareGrants(pod, box)
+		r.recordExposureGrants(pod, box)
+		// A pod that asked for the developer toolchain and got none still runs; say so
+		// on the pod, once, at create. Degrade-not-fail, unlike the preflight above.
+		r.warnXcodeToolchainUngranted(ctx, pod, box)
+		// And one that got it, on a node whose xcodebuild copy cannot serve it.
+		r.warnXcodebuildCopyUnavailable(ctx, pod, box)
+		// Likewise a None pod running on fewer nameservers than it listed.
+		r.warnDNSConfigPartial(ctx, pod)
 	}
-	// A pod that asked for the developer toolchain and got none still runs; say so
-	// on the pod, once, at create. Degrade-not-fail, unlike the preflight above.
-	r.warnXcodeToolchainUngranted(ctx, pod, box)
+	// A None pod whose dnsConfig was altered to fit (ndots 0, the search or
+	// nameserver caps) hears it once, at create, refused or not.
+	r.warnDNSConfigForming(ctx, pod)
 
 	// The GPU memory fit and the slot cap are sized BEFORE the lock, because the
 	// node's GPU facts and each held pod's phase cost an RPC and a blocking call
@@ -2238,6 +2526,17 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 		old.cancelRestarts()
 		old.cancelPulls()
 		old.cancelPostStart()
+	}
+
+	// A refused dnsPolicy None pod is kept, reported Pending with every container
+	// Waiting CreateContainerConfigError and the refusal's text, and re-derived once
+	// per resync (pullClassResync), as a runtimed CONTAINER_CONFIG refusal is. It
+	// never reaches the runtime, so it never starts on the host resolver.
+	if dnsRefusal != nil {
+		r.log.Warn("CreatePod: the pod's dnsPolicy None config cannot be honored; the pod is kept and not started",
+			"namespace", pod.Namespace, "name", pod.Name, "err", dnsRefusal.Unwrap())
+		r.parkDNSRefusal(pod, t, dnsRefusal)
+		return nil
 	}
 
 	// Announce the attempt before it is made: every container whose image the

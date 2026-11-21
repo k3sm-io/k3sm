@@ -1,0 +1,32 @@
+{
+  "description": "Generated (testdata/gen): go test -count=2; the listed TestParent/a fails with its signature and the unlisted TestParent then fails through t.Fail, which writes no output line. The parent failed on its own, so it should red; both copies read it as covered (the documented blind spot), see DISAGREEMENTS.md.",
+  "diverges": {
+    "go": {
+      "note": "parent-failnow-no-output: a parent failing through t.Fail with no output line reads as covered by its quarantined subtest",
+      "tests": {
+        "k3sm.io/apis/net/v1::TestParent": "excused",
+        "k3sm.io/apis/net/v1::TestParent/a": "excused",
+        "k3sm.io/apis/net/v1::TestParent/b": "passed"
+      },
+      "verdict": "excused"
+    },
+    "python": {
+      "note": "parent-failnow-no-output: a parent failing through t.Fail with no output line reads as covered by its quarantined subtest",
+      "tests": {
+        "k3sm.io/apis/net/v1::TestParent": "excused",
+        "k3sm.io/apis/net/v1::TestParent/a": "excused",
+        "k3sm.io/apis/net/v1::TestParent/b": "passed"
+      },
+      "verdict": "excused"
+    }
+  },
+  "edited": [],
+  "tests": {
+    "k3sm.io/apis/net/v1::TestParent": "failed",
+    "k3sm.io/apis/net/v1::TestParent/a": "excused",
+    "k3sm.io/apis/net/v1::TestParent/b": "passed"
+  },
+  "tier": "affected",
+  "today": "2026-10-30",
+  "verdict": "red"
+}

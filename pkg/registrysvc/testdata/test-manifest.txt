@@ -1,11 +1,13 @@
 # Every test in this package across the move of the registry child from zot to
 # `k3sm registry serve`: name, kept|rewritten|added|deleted, reason.
 # TestTestManifestIsComplete checks this file against the source.
+BenchmarkLimitConnWrite added the rate meter's cost on each relay write
 FuzzClassify rewritten the gate reads names through the shared validator
 FuzzGateAndServerAgree added the differential over arbitrary names and mount sources
 TestAdvertisement kept the relay and cluster publication do not touch the child
 TestApplyServeCredential added new with the child switch
 TestAwaitNeedsA200 added new with the child switch
+TestBindProgressLogsUnboundedConnection added a writer that cannot take a deadline is served and logged once per connection
 TestCheckDataVolume added new with the child switch
 TestChildCommand added new with the child switch
 TestClassify rewritten the gate reads names through the shared validator
@@ -40,7 +42,19 @@ TestFlatEndpointSlice kept the relay and cluster publication do not touch the ch
 TestFlatService kept the relay and cluster publication do not touch the child
 TestFlatServingSANs kept the relay and cluster publication do not touch the child
 TestGateAndServerAgree added new with the child switch
+TestGateAnswers502WhenTheUpstreamStalls added the gate's upstream has a response-header timeout
+TestGateCutsUpstreamStalledAfterHeaders added a registry that stops sending mid-body loses the connection one progress window later
+TestGateDefaultBodyProgress added a gate with no configured body window uses the relay progress window
+TestGateHeaderBoundByOperation added a manifest PUT is held to the collect bound plus a 5 minute margin, reads and upload status to 30s
+TestGateManifestBoundCoversCollect added the manifest PUT bound is the collect bound plus a 5 minute margin
+TestGateLeavesBlobUploadsOutOfTheHeaderBound added a blob upload commit is held to the registry's upload bound
+TestGateProxyForEveryOperation added every gate operation is pinned to a proxy class
+TestGateReadErrorLogsCancellationAtDebug added a read the client cancelled is not a warning
+TestGateReadErrorWarnsOncePerIntervalPerCause added a failed read warns once a minute per cause
 TestGateRefusesLongLivedBuilderToken kept the push gate is unchanged
+TestGateWriteErrorIs502WhenUpstreamIsDown added an authorized write to a closed upstream is a 502
+TestGateWriteErrorLogsCancellationAtDebug added a write the client cancelled is not a warning
+TestGateWriteErrorWarnsOncePerInterval added a failed authorized write warns once a minute per cause
 TestGenerateCredential kept the credential files are unchanged
 TestHostingDocument kept the relay and cluster publication do not touch the child
 TestIsOrphanedChild added new with the child switch
@@ -62,6 +76,9 @@ TestPayloadBinaries deleted the zot child left the build, and its staging with i
 TestPlanRepositoryFailsClosed kept prune works on the store, which is unchanged
 TestPreflightPortRefusesAHeldPort kept the behaviour it pins is unchanged by the child switch
 TestProcargsArgv kept the behaviour it pins is unchanged by the child switch
+TestProgressBodyCloseDuringRead added closing the body ends a blocked Read and never fires the stall callback
+TestProgressBodyFirstReadBlocks added a registry that sends no byte at all is cut after one window on the first Read
+TestProgressBodyTimesOnlyUpstreamReads added the gate's body progress clock runs only inside a Read on the registry, so a slow client is never cut
 TestProvisionWritesTheChildsConfig added new with the child switch
 TestPruneDeleteIsConditionalOnPlannedState kept prune works on the store, which is unchanged
 TestPruneForceCollectsThePrunedRepositories added a forced prune sweeps the repositories it deleted from
@@ -75,6 +92,7 @@ TestPushAuthorizesBuilderClusterWide kept the push gate is unchanged
 TestPushAuthorizesServiceAccountTokenUnderNamespacePrefix kept the push gate is unchanged
 TestPushGateAcceptsMountWithOrigin kept the push gate is unchanged
 TestPushPrefixHeldByOneNamespace kept the push gate is unchanged
+TestQuotaFlag added the --registry-quota grammar
 TestReadCredentialFailures kept the credential files are unchanged
 TestRecheckFailsClosed kept prune works on the store, which is unchanged
 TestRecheckReasonWording kept prune works on the store, which is unchanged
@@ -82,11 +100,23 @@ TestReclaimRechecksBeforeEachSignal added new with the child switch
 TestRecordKeepsTheServersFields added new with the child switch
 TestRegistryNodePortIsOptInAndGated kept the push gate is unchanged
 TestRegistryReadyFollowsNoRedirect added the readiness probe stays on the loopback address it was given
+TestRelayCutIsLogged added a connection a relay deadline cuts is logged once
+TestRelayGateBodyWindowFollowsRelayLimits added the relay hands its write-progress window to its gate so the two cannot drift
+TestRelayCutLogEndsWithTheResponse added a write timeout after the response ends is not logged as a relay cut
+TestRelayEarlyAnswerWhileBodyIsSent added an answer before the upload body is sent does not race the body reads
 TestRelayLimitsArePerSource kept the relay and cluster publication do not touch the child
+TestRelayLogsLimitWarningsToItsLogger added the relay hands its logger to the limit listener, naming the listening address
+TestRelayLogsWhenFullOrOverShare added a full relay and a source refused at its share are each logged at most once a minute
+TestRelayRateFloorCutsOnlyUnderContention added a full relay with a connection waiting cuts the slowest pull below the rate floor, and only it
+TestRelayRateFloorSparesAMeshPull added a 64 KiB/s pull is never picked at the production floor
+TestRelayRateFloorSparesAPausedPullWithAFreeSlot added a pull paused past a window is not cut while the relay has a free slot
+TestRelayReadAfterCloseArmsNoDeadline added a body read after close leaves no read deadline on the connection
 TestRelayServesTLSOnly kept the relay and cluster publication do not touch the child
 TestRelayServesTheGate kept the push gate is unchanged
 TestRelayServingSANsWithoutNodePort kept the relay and cluster publication do not touch the child
 TestRelaySkipsAnAbsentAddress kept the relay and cluster publication do not touch the child
+TestRelayStalledReaderFreesItsSlot added a relay connection is bounded by write and read progress, not total time
+TestRelayStalledUploadBodyFreesItsSlot added a relay connection is bounded by write and read progress, not total time
 TestRelayStopsOnContextCancel kept the relay and cluster publication do not touch the child
 TestRelayVerifiesAtTheNodePortAddress kept the relay and cluster publication do not touch the child
 TestRemoveAdvertisement kept the relay and cluster publication do not touch the child
@@ -100,6 +130,7 @@ TestRepositoriesFindsNestedLayoutsOnly kept prune works on the store, which is u
 TestRestartRebindsTheIngestPort rewritten reclaim now runs the same cases over the k3sm child argv as well as the zot argv
 TestServeAuthorizesAndReports added new with the child switch
 TestServeConfig rewritten renderServeConfig takes the server settings; the principal assertions are unchanged
+TestServeConfigRendersQuota added the quota is rendered into the serve config and checked
 TestServeConfigServerFields added new with the child switch
 TestServeConvergeCadence added new with the dedupe loop
 TestServeDropsRootBeforeTheStoreOpens added new with the child switch
@@ -111,6 +142,7 @@ TestServeRefusesBeforeTheStoreOpens added new with the child switch
 TestServeStateDirHardening kept the behaviour it pins is unchanged by the child switch
 TestServedRegistryRefusesAnonymousPush added new with the child switch
 TestServedRegistryRefusesEncodedPaths added new: a credentialed client past the gate gets the refusal
+TestServerPublishesGuestArtifacts added the server publishes its verified guest boot pair to its own registry
 TestServiceRecord kept the behaviour it pins is unchanged by the child switch
 TestServiceRecordSurvivesAnUnwritableWorkDir kept the behaviour it pins is unchanged by the child switch
 TestServiceRunsTheK3smRegistry added new with the child switch
@@ -131,6 +163,7 @@ TestVMNetGateway kept the push gate is unchanged
 TestValidateForServingRefusesNonLoopback added moved from the zot renderer
 TestWatchCommits added new with the dedupe loop
 TestWatchParent added new with the child switch
+TestWatchesBody added only a body with bytes to wait for, not HEAD, empty or a protocol switch, gets the progress clock
 TestWorkDirLayout kept the behaviour it pins is unchanged by the child switch
 TestWriteCredential kept the credential files are unchanged
 TestWriteCredentialGateUser kept the push gate is unchanged

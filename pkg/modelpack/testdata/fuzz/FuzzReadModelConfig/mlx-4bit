@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"model_type\":\"qwen2\",\"quantization\":{\"group_size\":64,\"bits\":4},\"quantization_config\":{\"group_size\":64,\"bits\":4}}")

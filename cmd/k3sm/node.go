@@ -51,6 +51,7 @@ import (
 	"k3sm.io/darwin-net/pkg/dns"
 	"k3sm.io/darwin-net/pkg/netd"
 	"k3sm.io/darwin-net/pkg/podnet"
+	"k3sm.io/runtimed/pkg/hostshare"
 	"k3sm.io/runtimed/pkg/image"
 
 	"k3sm.io/k3sm/pkg/bootstrap"
@@ -255,6 +256,18 @@ type nodeOptions struct {
 	// value (a standalone `k3sm node`, a server with no registry) maps nothing.
 	flatRegistry flatRegistryEndpoint
 
+	// guestFromClusterStore makes this node fetch its guest boot pair from the
+	// cluster registry flatRegistry names, never from the release host. `k3sm
+	// agent` sets it: its server publishes the pair there (onGuestArtifacts).
+	// With no cluster registry mapped there is no fallback: the vm capability
+	// is withheld and the reason logged.
+	guestFromClusterStore bool
+	// registryStoreRoot is the root of the registry store this machine serves,
+	// set by `k3sm server` when its registry started; the runtime's puller
+	// clones a blob already there instead of fetching it. Empty on an agent
+	// and a standalone `k3sm node`, which fetch every blob.
+	registryStoreRoot string
+
 	// deniedLocalPorts are loopback-only TCP ports every pod's SBPL denies
 	// connect() to — this node's EFFECTIVE kine (etcd shim) port, so a networked
 	// native pod sharing the node's _k3sm uid cannot dial the plaintext
@@ -279,6 +292,12 @@ type nodeOptions struct {
 	// paths keep their exact current shape. It is never called on the hostprocess
 	// runtime, which has no runtimed to ask.
 	attachRuntimeInfo func(operator.RuntimeInfoSource)
+
+	// onGuestArtifacts, when non-nil, is called ONCE with this node's guest boot
+	// pair after the runtimed path has ensured it. `k3sm server` sets it to
+	// publish the pair to its own registry, where workers fetch it; nothing
+	// else sets it. It is not called when the ensure failed.
+	onGuestArtifacts func(provider.EnsuredGuestArtifacts)
 
 	// onExitBegin, when non-nil, is called ONCE at the very start of this node's
 	// teardown — before the embedded runtime close, on both of startNode's exit
@@ -318,6 +337,11 @@ type nodeOptions struct {
 	// `k3sm server` and `k3sm agent` set it; empty (the standalone `k3sm node`)
 	// names none.
 	dataRoot string
+	// stateDir is the role's work dir itself, the real home of its control-plane
+	// state whatever its leaf, which the Seatbelt profile denies beside the data
+	// root's server and agent directories. `k3sm server` and `k3sm agent` set it;
+	// empty (the standalone `k3sm node`) names none.
+	stateDir string
 	// updateRoot is the managed update's directory under the data root
 	// (updateRootFor). `k3sm server` and `k3sm agent` set it; empty (the
 	// standalone `k3sm node`) runs no update watcher.
@@ -1556,8 +1580,21 @@ func buildProvider(ctx context.Context, opts nodeOptions, cs kubernetes.Interfac
 		// has, advertises VMArtifactsAvailable=false, and fails vm pods closed. Do
 		// NOT "harden" this into a startup error — it is the same rule the startup
 		// pod reap follows, and for the same reason.
-		if art, ok := (provider.GuestArtifactSource{}).Ensure(ctx, cfg.Root, slog.Default()); ok {
-			cfg.GuestArtifacts = &art
+		//
+		// A worker is the exception to "before": its pair comes only from the
+		// cluster store, which is the runtime's own, so NewRuntimed ensures it
+		// once the runtime exists (RuntimedConfig.GuestStore) under the same
+		// never-fail contract, and never from the release host.
+		if opts.guestFromClusterStore {
+			cfg.GuestStore = &provider.GuestArtifactSource{}
+		}
+		if !cfg.GuestFromClusterStore() {
+			if art, ok := (provider.GuestArtifactSource{}).Ensure(ctx, cfg.Root, slog.Default()); ok {
+				cfg.GuestArtifacts = &art
+				if opts.onGuestArtifacts != nil {
+					opts.onGuestArtifacts(art)
+				}
+			}
 		}
 		adapter, err := buildPodNetAdapter(opts)
 		if err != nil {
@@ -1808,8 +1845,9 @@ func budgetDirFor(workDir string) string {
 // opts.standalone (set ONLY by runNode) skips the empty-dnsVIP default-fill
 // below, leaving ResolverVIP "". dns.PodDNSConfig then builds a DNSConfig with an
 // empty ClusterDNSIP, which Validate() rejects — the SAME "dnsCfg not usable"
-// path injectClusterDNSEnv already documents (dns.ConfigToEnv returns nil, no
-// K3SM_DNS_* env is appended, the shim defers to the host resolver) — rather than
+// path pkg/provider's injectPodDNSEnv already documents for a cluster-first pod
+// (dns.ConfigToEnvChecked returns an error, no K3SM_DNS_* env is appended, the
+// shim defers to the host resolver) — rather than
 // inventing a second no-DNS fallback. server.go/agent.go never set opts.standalone,
 // so their nodeOptions are unaffected and keep injecting exactly as before.
 func runtimedConfig(opts nodeOptions, cs kubernetes.Interface) provider.RuntimedConfig {
@@ -1835,6 +1873,8 @@ func runtimedConfig(opts nodeOptions, cs kubernetes.Interface) provider.Runtimed
 		// The root of the control-plane state, so the denies name what the role
 		// writes when the pod root is somewhere else.
 		DataRoot: opts.dataRoot,
+		// The role's own work dir, so a leaf other than server or agent is denied.
+		StateDir: opts.stateDir,
 		// The persisted eviction, OOM and restart history, under the node's
 		// own work dir and outside every pod-readable tree.
 		BudgetDir: opts.budgetDir,
@@ -1849,9 +1889,12 @@ func runtimedConfig(opts nodeOptions, cs kubernetes.Interface) provider.Runtimed
 		PathShim: firstNonEmpty(opts.pathShim, resolvePathShim()),
 		// The shadow binary set `sudo k3sm install` makes beside the binary; a
 		// dev or from-source run has none and keeps the host binaries.
-		ShadowBinDir:  resolveShadowDir(),
-		ResolverVIP:   resolverVIP,
-		ClusterDomain: clusterDomain,
+		ShadowBinDir: resolveShadowDir(),
+		// The node admin's host-share allowlist (sudo k3sm share); a missing
+		// file shares nothing.
+		HostSharesFile: hostshare.DefaultFile,
+		ResolverVIP:    resolverVIP,
+		ClusterDomain:  clusterDomain,
 		// The container-log tree and its rotation policy — the kubelet's own
 		// defaults unless the operator said otherwise.
 		PodLogsDir:                  opts.logs.dir,
@@ -1890,6 +1933,8 @@ func runtimedConfig(opts nodeOptions, cs kubernetes.Interface) provider.Runtimed
 		LocalRegistryHost: opts.localRegistryHost,
 		// The cluster's one registry name, mapped to where this node reaches it.
 		FlatRegistry: opts.flatRegistry.mapping(),
+		// This server's own registry store, offered blob by blob before a fetch.
+		RegistryStoreRoot: opts.registryStoreRoot,
 		// Wire the process default logger so the runtimed provider is not SILENT: it
 		// otherwise falls back to a DiscardHandler, dropping pod-lifecycle + cluster-DNS
 		// wiring logs the operator needs (server.log had no provider lines at all).

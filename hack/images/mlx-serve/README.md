@@ -13,7 +13,7 @@ concern: `HF_HOME` points at `/models`, which the operator mounts.
 | | |
 |---|---|
 | engine | `vllm-mlx==0.5.0` (Apache-2.0), pinned in `requirements.in`; `mlx-lm==0.32.2` in `requirements.lock` |
-| interpreter | CPython 3.12.14, python-build-standalone, macos-aarch64 |
+| interpreter | CPython 3.12.15, python-build-standalone, macos-aarch64 |
 | entrypoint | `/bin/python3.12 -m k3sm_serve serve --continuous-batching --host 0.0.0.0 --port 8000` (the engine's own CLI, run in-process with the context guard below) |
 | args | the model — a repo id or a path under `/models` — supplied by the pod |
 | port | 8000; readiness at `GET /health`, which reports `model_loaded` |
@@ -294,10 +294,13 @@ host only packages the staged tree and pushes it, as the operator's own user:
 # 1. stage on the cluster, onto a local volume of the named node
 hack/images/mlx-serve/stage-job.sh apply --node <node>
 
-# 2. on that node, package the volume's stage (no uv, no network)
+# 2. copy the stage out, read as the runtime user, into your own cache
+hack/images/mlx-serve/stage-job.sh fetch
+
+# 3. package the copy (no uv, no network)
 CGO_ENABLED=1 go build -o /tmp/k3sm ./cmd/k3sm
 K3SM_BIN=/tmp/k3sm hack/images/mlx-serve/build.sh \
-    --from-stage "$(hack/images/mlx-serve/stage-job.sh path)"
+    --from-stage ~/.cache/k3sm/mlx-serve/stage
 ```
 
 `stage-job.sh render --node <node>` prints the manifests without applying them:
@@ -324,7 +327,19 @@ The node is chosen with a `nodeSelector`, so the scheduler places the pod and
 binds the claim (a `WaitForFirstConsumer` claim stays `Pending` under a
 `nodeName` pod). The staged tree lands at
 `/var/lib/k3sm/storage/<namespace>/<claim>/stage` on that node, owned by the
-runtime user and readable by the operator.
+runtime user. The operator cannot read it there: the storage tree is open to
+the runtime user alone (mode 0700), so that one Pod's volume is not readable by
+the other local accounts. `stage-job.sh fetch` reads the stage as the runtime
+user instead. It runs a short-lived native Pod on the stage's node
+(`mlx-serve-stage-reader`, printed by `stage-job.sh render-reader --node <node>`)
+that mounts the claim read-only, carries no credential and only waits. Then it
+streams the stage and its stamp out with `kubectl exec … tar` into
+`${K3SM_MLX_WORK:-~/.cache/k3sm/mlx-serve}/stage` (or `--dest <dir>`), and
+deletes the Pod. The copy replaces an earlier fetch only once the stream is
+complete, and never a directory that is not one. There is no root step, and the
+storage tree stays closed. The read-only mount is the manifest's intent, not a
+kernel guarantee: the runtime user owns the storage tree, and the Pod runs
+nothing but that one `tar`.
 
 `build.sh --from-stage` refuses a stage that was not made from the checkout's
 pins (it compares the stamp the stage step writes beside the tree), that lacks
@@ -452,7 +467,10 @@ mislabelled layer, on a blob that does not match its digest, and on a
 non-Mach-O entrypoint. It checks the stage Job `stage-job.sh` renders (the uv
 version and sha256, the lockfile digest, the files carried verbatim, no
 credential, the placement and toleration) and that its entry script stops on a
-digest mismatch before downloading anything, and it drives
+digest mismatch before downloading anything. It checks the reader Pod
+`stage-job.sh fetch` runs (read-only claim, no credential, the placement) and
+drives `fetch` against a fake `kubectl` through to a `--from-stage` package of
+the copy. It drives
 `build.sh --from-stage` against a fake stage and a fake `k3sm`, including every
 refusal. It also drives `k3sm_shard` with fake name resolution
 (no model, no GPU): the ring hostfile and the `jaccl` device matrix land in the
@@ -474,10 +492,10 @@ Change `requirements.in`, then regenerate in the same commit — on a Mac,
 **natively**:
 
 ```sh
-uv python install cpython-3.12.14-macos-aarch64-none
+uv python install cpython-3.12.15-macos-aarch64-none
 uv pip compile --generate-hashes --no-header \
     --exclude-newer "$(date -u -v-14d +%Y-%m-%dT00:00:00Z)" \
-    --python "${UV_PYTHON_INSTALL_DIR:-$HOME/.local/share/uv/python}/cpython-3.12.14-macos-aarch64-none/bin/python3.12" \
+    --python "${UV_PYTHON_INSTALL_DIR:-$HOME/.local/share/uv/python}/cpython-3.12.15-macos-aarch64-none/bin/python3.12" \
     requirements.in -o requirements.lock
 ```
 

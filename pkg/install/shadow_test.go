@@ -39,10 +39,19 @@ func shadowSetCalls(dir string, missing map[string]bool) []string {
 	read := map[string]bool{}
 	for _, c := range shadow.Copies() {
 		dst := dir + "/" + c.Name
+		if c.Relink {
+			out = append(out, "CheckTrustedSource:"+c.Source)
+			if missing[c.Source] {
+				continue
+			}
+		}
 		out = append(out, fmt.Sprintf("CloneToOwned:%s->%s:%d:%d:%#o", c.Source, dst,
 			shadowOwnership.uid, shadowOwnership.gid, shadowOwnership.mode))
 		if missing[c.Source] {
 			continue
+		}
+		if c.Relink {
+			out = append(out, "RelinkRpaths:"+dst+":"+filepath.Dir(c.Source))
 		}
 		out = append(out, "AdHocSign:"+dst, "VerifyShadowCopy:"+dst)
 		if !read[c.Source] {
@@ -71,20 +80,20 @@ func TestShadowSetIsMadeAtInstall(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			shrinkRestartBudgets(t)
-			f := &fakeSystem{}
+			f := newFakeSystem(t)
 			missing := map[string]bool{}
 			if tc.missing != "" {
 				f.missingPaths = map[string]bool{tc.missing: true}
 				missing[tc.missing] = true
 			}
 			var logs bytes.Buffer
-			cfg := serverCfg()
+			cfg := serverCfg(t)
 			cfg.Logger = slog.New(slog.NewTextHandler(&logs, nil))
 			if err := Install(context.Background(), f, cfg); err != nil {
 				t.Fatalf("Install: %v", err)
 			}
 
-			dir := "/Library/k3sm.swap/shadow"
+			dir := cfg.swapDir() + "/shadow"
 			want := []string{"EnsureRootDir:" + dir}
 			want = append(want, shadowSetCalls(dir, missing)...)
 			want = append(want, fmt.Sprintf("WriteRootOnlyFile:%s/%s:%#o", dir, shadow.ManifestName, 0o644))
@@ -108,7 +117,7 @@ func TestShadowSetIsMadeAtInstall(t *testing.T) {
 				t.Errorf("shadowOwnership = %+v, want root:wheel 0755", shadowOwnership)
 			}
 			// Staged, then published with the rest of the tree.
-			if idx(f.calls, want[len(want)-1]) > idx(f.calls, "SwapInstallRoot:/Library/k3sm.swap<->/Library/k3sm:rename") {
+			if idx(f.calls, want[len(want)-1]) > idx(f.calls, "SwapInstallRoot:"+cfg.swapDir()+"<->"+cfg.InstallDir+":rename") {
 				t.Errorf("the manifest was written after the publish")
 			}
 
@@ -143,13 +152,13 @@ func TestShadowSetIsMadeAtInstall(t *testing.T) {
 // pkg/status.)
 func TestShadowSetSharesTheOneList(t *testing.T) {
 	shrinkRestartBudgets(t)
-	f := &fakeSystem{}
-	cfg := serverCfg()
+	f := newFakeSystem(t)
+	cfg := serverCfg(t)
 	cfg.Logger = slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
 	if err := Install(context.Background(), f, cfg); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
-	const dir = "/Library/k3sm.swap/shadow"
+	dir := cfg.swapDir() + "/shadow"
 	var clones []string
 	for _, c := range recorded(f.calls, "CloneToOwned:") {
 		clones = append(clones, strings.SplitN(c, ":", 2)[0])
@@ -177,16 +186,16 @@ func TestShadowSetSharesTheOneList(t *testing.T) {
 // the property, before anything is published.
 func TestShadowCopyVerificationFailsTheInstall(t *testing.T) {
 	shrinkRestartBudgets(t)
-	const dir = "/Library/k3sm.swap/shadow"
+	cfg := serverCfg(t)
+	dir := cfg.swapDir() + "/shadow"
 	bad := fmt.Errorf("%w: signature carries entitlements", shadow.ErrUnsafeCopy)
-	f := &fakeSystem{verifyErrs: map[string]error{dir + "/tar": bad}}
-	cfg := serverCfg()
+	f := (&fakeSystem{verifyErrs: map[string]error{dir + "/tar": bad}}).rootedIn(t)
 	cfg.Logger = slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
 	err := Install(context.Background(), f, cfg)
 	if !errors.Is(err, shadow.ErrUnsafeCopy) || !strings.Contains(err.Error(), "tar") || !strings.Contains(err.Error(), "entitlements") {
 		t.Fatalf("Install err = %v, want the unsafe-copy error naming tar and the property", err)
 	}
-	if idx(f.calls, "SwapInstallRoot:/Library/k3sm.swap<->/Library/k3sm:rename") >= 0 {
+	if idx(f.calls, "SwapInstallRoot:"+cfg.swapDir()+"<->"+cfg.InstallDir+":rename") >= 0 {
 		t.Errorf("the tree was published after a failed verification")
 	}
 	if idx(f.calls, "WriteRootOnlyFile:"+dir+"/"+shadow.ManifestName+":0644") >= 0 {
@@ -201,8 +210,8 @@ func TestShadowSetBudget(t *testing.T) {
 	prev := shadowSetBudget
 	shadowSetBudget = -1
 	t.Cleanup(func() { shadowSetBudget = prev })
-	f := &fakeSystem{}
-	cfg := serverCfg()
+	f := newFakeSystem(t)
+	cfg := serverCfg(t)
 	cfg.Logger = slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
 	err := Install(context.Background(), f, cfg)
 	if err == nil || !strings.Contains(err.Error(), "took longer than") {

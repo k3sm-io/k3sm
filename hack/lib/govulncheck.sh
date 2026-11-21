@@ -51,7 +51,7 @@ gv_find() {
 		fi
 		seen="${seen}    $c reports ${v:-no version}"$'\n'
 	done
-	echo "govulncheck missing or wrong version: need $pin (go install golang.org/x/vuln/cmd/govulncheck@$pin)" >&2
+	echo "govulncheck missing or wrong version: need $pin (runs in a k3sm pod, never installed on the host (containers only, CONTRIBUTING.md); the pinned build in the pod: go install golang.org/x/vuln/cmd/govulncheck@$pin)" >&2
 	[ -z "$seen" ] || printf 'found:\n%s' "$seen" >&2
 	return 1
 }

@@ -36,6 +36,7 @@ import (
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/interconnect"
 	"k3sm.io/k3sm/pkg/registrysvc"
+	"k3sm.io/runtimed/pkg/sandbox"
 )
 
 // serverPKI is the mesh path's provisioned trust material; zero single-node.
@@ -105,6 +106,16 @@ func refuseServerTokenAsAdmin(opts serverOptions) error {
 // work-dir guards. It canonicalizes opts.nodeName and resolves opts.token in
 // place.
 func validateServerOptions(opts *serverOptions, workDirErr error, logger *slog.Logger) error {
+	// The work dir, normalised and checked before any other use of it: the pod
+	// sandbox denies <data root>/server only, so a server work dir anywhere else
+	// would leave the datastore, the CA keys and the registry store open to pods.
+	if opts.workDir != "" {
+		workDir, err := resolveWorkDirLayout(opts.workDir, sandbox.ServerSubdir)
+		if err != nil {
+			return err
+		}
+		opts.workDir = workDir
+	}
 	// The token, from the file the installed daemon is pointed at: the static
 	// admin token, or on an HA server-join the server-class JOIN token. Resolved
 	// BEFORE any state is touched, because a token file that is there and cannot
@@ -163,6 +174,9 @@ func validateServerOptions(opts *serverOptions, workDirErr error, logger *slog.L
 	}
 	if opts.registryNodePort != 0 && opts.registryPort == 0 {
 		return fmt.Errorf("--registry-node-port %d needs the registry, which --registry-port 0 turns off", opts.registryNodePort)
+	}
+	if len(opts.registryQuota) != 0 && opts.registryPort == 0 {
+		return errors.New("--registry-quota needs the registry, which --registry-port 0 turns off")
 	}
 	// The node name is checked ONCE, here, before anything keys on it: from this
 	// point opts.nodeName is canonical for the self-name guard, this node's own
@@ -731,6 +745,11 @@ func startControlPlane(ctx, stop context.Context, opts serverOptions, mode hostn
 	exec := executor.NewSupervised(plan.cfg)
 	// Before Start, so the exit handler can ask about any child it is told of.
 	probe.set(exec)
+	// A previous lap that timed out on an overloaded host backs this one off
+	// (executor.BringUpBackoff); server path only, the agent has its own pacing.
+	if err := breaker.awaitBringUpBackoff(ctx); err != nil {
+		return plan, nil, fmt.Errorf("start control plane: %w", err)
+	}
 	logger.Info("bringing up k3sm control plane", "work-dir", opts.workDir, "api-port", opts.apiPort)
 	if err := exec.Start(ctx); err != nil {
 		// This is the place a control plane that never came up gets counted.
@@ -750,5 +769,6 @@ func startControlPlane(ctx, stop context.Context, opts serverOptions, mode hostn
 		noteBringUpFailure(stop, breaker, logger, err)
 		return plan, nil, fmt.Errorf("start control plane: %w", err)
 	}
+	breaker.noteBringUpHealthy()
 	return plan, exec, nil
 }

@@ -511,6 +511,7 @@ type System interface {
 	// so the copy is neither a platform binary nor restricted and dyld keeps
 	// DYLD_INSERT_LIBRARIES in it.
 	AdHocSign(path string) error
+	shadowRelinker // RelinkRpaths and CheckTrustedSource (relink.go)
 	// CDHash reads path's code directory hash (codesign -dvvv).
 	CDHash(path string) (string, error)
 	// VerifyShadowCopy checks a made shadow copy (shadow.CheckCopyFile and
@@ -1247,7 +1248,7 @@ type Config struct {
 	LaunchDaemonDir string // /Library/LaunchDaemons
 	DataRoot        string // /var/lib/k3sm
 	NetdSocket      string // /var/lib/k3sm/run/netd.sock
-	ServiceCIDR     string // 10.43.0.0/16
+	ServiceCIDR     string // 10.43.0.0/16, the only value accepted (ValidateServiceCIDR)
 	APIServerPort   int    // 6444
 	// BinarySource is the k3sm binary to install (typically the running
 	// executable). Required.
@@ -1537,13 +1538,6 @@ type Config struct {
 	// restart step, where an install with Start runs the start precondition
 	// and removes it.
 	userStop *userStopState
-}
-
-// userStopState is a stop marker as Install read it: the content, or the
-// error that made it unreadable (an unreadable marker still means stopped).
-type userStopState struct {
-	marker StopMarker
-	err    error
 }
 
 func (c Config) withDefaults() Config {
@@ -1897,9 +1891,9 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 			return fmt.Errorf("install: %w", err)
 		}
 	}
-	// The HA request's own shape, from the Config alone: the same validator
-	// the CLI ran at parse time.
-	if err := ValidateHARequest(cfg); err != nil {
+	// The request's own shape, from the Config alone (validateShape): the
+	// same validators the CLI ran at parse time.
+	if err := validateShape(cfg); err != nil {
 		return fmt.Errorf("install: %w", err)
 	}
 	// An explicit --mesh-ip must name this server's own node pod range (see
@@ -2063,6 +2057,9 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	//     and step 4 honours it (see restartDaemons and publishedWiring).
 	if marker, present, merr := readStopMarker(sys, cfg); present {
 		cfg.userStop = &userStopState{marker: marker, err: merr}
+		if cfg.Start {
+			cfg.userStop.flush = recordedFlushPrefixes(sys, cfg)
+		}
 		if merr != nil {
 			cfg.Logger.Warn("the stop marker is unreadable; treating this node as stopped by the user", "err", merr)
 		}
@@ -2605,13 +2602,14 @@ func publishedWiring(ctx context.Context, sys System, cfg Config, m []artifact, 
 	//    On a node the user stopped, with --start, the start's precondition
 	//    runs first and the marker goes once the daemons are verified, exactly
 	//    as `k3sm start` does it; without --start restartDaemons leaves every
-	//    long-running label alone.
+	//    long-running label alone. The precondition flushes the range the
+	//    plist step 3b replaced recorded, read at step 0c.
 	if cfg.userStop != nil && cfg.Start {
 		d, err := readInstalledDaemons(sys, cfg)
 		if err != nil {
 			return fmt.Errorf("install: %w", err)
 		}
-		startPrecondition(ctx, sys, cfg, d, cfg.userStop.marker, cfg.userStop.err)
+		startPrecondition(ctx, sys, cfg, d, cfg.userStop.marker, cfg.userStop.err, cfg.userStop.flush)
 	}
 	fences, err := restartDaemons(ctx, sys, cfg, m)
 	if err != nil {
@@ -2763,6 +2761,9 @@ func uninstall(ctx context.Context, sys System, cfg Config, preflight func(m []a
 	// scope stands in: uninstall is the last chance to clear these aliases.
 	flush := recordedFlushPrefixes(sys, cfg)
 	if flush.err != nil {
+		if flush.refused != "" {
+			cfg.Logger.Warn("the installed netd plist records a refused Service range; the uninstall configuration's range is flushed instead", "source", flush.source, "refused", flush.refused, "err", flush.err)
+		}
 		flush = configFlushPrefixes(cfg)
 	}
 	for i := len(m) - 1; i >= 0; i-- {

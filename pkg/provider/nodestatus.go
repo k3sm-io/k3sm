@@ -164,6 +164,14 @@ type NodeStatusProvider struct {
 	// monitor owns the host sample (see the type doc).
 	monitor *pressureMonitor
 
+	// cpuBusy derives the HostCPUBusy condition (hostcpu.go); nil when the
+	// node advertises no CPU capacity. sampleCPU reads the cumulative busy CPU
+	// time; cpuFailing records that the last read failed, so a persistent
+	// failure (a CGO=0 build) warns once. All three are guarded by mu.
+	cpuBusy    *hostCPUBusyTracker
+	sampleCPU  func() (uint64, error)
+	cpuFailing bool
+
 	// sleep is the optional sleep reporter; kicks carries its requests for an
 	// immediate publication into Run, which closes the request's channel once
 	// the publication is handed over.
@@ -220,6 +228,9 @@ func NewNodeStatusProvider(cfg NodeStatusConfig) (*NodeStatusProvider, error) {
 		ready: newProbeGauge(1, defaultProbeFailureThreshold, outcomeSuccess),
 		sleep: cfg.Sleep,
 		kicks: make(chan chan struct{}),
+
+		cpuBusy:   newHostCPUBusyTracker(cfg.Node.Status.Capacity.Cpu().Value()),
+		sampleCPU: readHostCPUBusyNanos,
 	}
 	if p.sleep != nil {
 		p.sleep.publish = p.requestPublish
@@ -359,9 +370,31 @@ func (p *NodeStatusProvider) publishOnce(ctx context.Context) error {
 	p.startImageRefresh(ctx)
 	p.startProcessCountRefresh(ctx)
 	s.PodProcCount, s.PodProcReported = p.cachedProcessCount()
-	node := p.recompute(s, sampled, healthy, metav1.NewTime(p.now()))
+	now := p.now()
+	p.observeHostCPU(now)
+	node := p.recompute(s, sampled, healthy, metav1.NewTime(now))
 	node.Status.Images = p.cachedImages()
 	return p.publish(ctx, node)
+}
+
+// observeHostCPU takes one host CPU reading for the HostCPUBusy condition. A
+// failed read keeps the previous verdict; the first failure of a run warns.
+func (p *NodeStatusProvider) observeHostCPU(at time.Time) {
+	if p.cpuBusy == nil {
+		return
+	}
+	nanos, err := p.sampleCPU()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err != nil {
+		if !p.cpuFailing {
+			p.log.Warn("host cpu read failed; HostCPUBusy keeps its last verdict", "error", err)
+		}
+		p.cpuFailing = true
+		return
+	}
+	p.cpuFailing = false
+	p.cpuBusy.observe(at, nanos)
 }
 
 // nodeImagesListTimeout bounds one listing of the runtime's images. The
@@ -528,6 +561,9 @@ func (p *NodeStatusProvider) recompute(s hostStats, sampled, healthy bool, now m
 	raw = append(raw, readyCondition(p.ready.record(outcome), now))
 	if p.sleep != nil {
 		raw = append(raw, p.sleep.condition(now))
+	}
+	if c := p.cpuBusy.condition(now); c != nil {
+		raw = append(raw, *c)
 	}
 
 	next := reconcileTransitions(p.prev, raw, s)

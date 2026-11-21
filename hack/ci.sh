@@ -1,12 +1,127 @@
 #!/usr/bin/env bash
 # k3sm local CI — the standard CI / pre-commit gate (docs/GO-STANDARDS.md) in one
 # command. Run from anywhere.
+#
+#   hack/ci.sh [--tier fast|full] [--edited <file>]
+#              [--packages <file> [--base <sha>]] [--dry-run]
+#
+# --tier picks how the test stage applies hack/quarantine.txt: full (the default)
+# reds on every failing test; fast excuses a listed flake outside the packages the
+# change edits. --edited names a file with one edited import path per line.
+#
+# With no mode flag the gate is the full gate, unchanged. One explicit mode narrows
+# only the go vet and go test package sets; every other stage still runs:
+#   --packages <file>  read a k3sm-affected/v1 package list (the format the affected-set
+#                      selector writes; its grammar is restated in hack/lib/affected-mode.sh).
+#                      A missing, unreadable, malformed or unknown-version file, or an
+#                      @full line for k3sm, runs the full gate. A list holding no k3sm
+#                      package is red when the diff against --base (default: the merge
+#                      base with origin/main) holds a .go file, runs the full gate when it
+#                      holds any other non-doc file (the gate cannot map it to a package)
+#                      or the base does not resolve, and skips vet and test when only doc
+#                      files (*.md, docs/, LICENSE, NOTICE, DCO) changed.
+# --dry-run resolves the mode, prints the plan (mode, reason, vet and test sets) and
+# exits before any stage runs: 0 for a plan, 1 for a red verdict.
 set -euo pipefail
 cd "$(dirname "$0")/.."   # repo root
+
+usage() {
+	echo "usage: hack/ci.sh [--tier fast|full] [--edited <file>] [--packages <file> [--base <sha>]] [--dry-run]" >&2
+	exit 2
+}
+test_tier=full
+edited_file=""
+pkg_file="" pkg_file_set=0 diff_base="" dry_run=0
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--tier) [ $# -ge 2 ] || usage; test_tier="$2"; shift 2 ;;
+		--edited) [ $# -ge 2 ] || usage; edited_file="$2"; shift 2 ;;
+		--packages) [ $# -ge 2 ] || usage; pkg_file="$2"; pkg_file_set=1; shift 2 ;;
+		--base) [ $# -ge 2 ] && [ -n "$2" ] || usage; diff_base="$2"; shift 2 ;;
+		--dry-run) dry_run=1; shift ;;
+		*) usage ;;
+	esac
+done
+case "$test_tier" in fast|full) ;; *) echo "hack/ci.sh: --tier must be fast or full" >&2; exit 2 ;; esac
+if [ -n "$diff_base" ] && [ "$pkg_file_set" = 0 ]; then
+	echo "hack/ci.sh: --base goes with --packages" >&2; exit 2
+fi
+edited_pkgs=()
+if [ -n "$edited_file" ]; then
+	[ -r "$edited_file" ] || { echo "hack/ci.sh: --edited $edited_file is not readable" >&2; exit 2; }
+	while IFS= read -r p; do
+		case "$p" in ''|'#'*) continue ;; esac
+		edited_pkgs+=("$p")
+	done < "$edited_file"
+fi
 
 CGO=1   # k3sm is CGO_ENABLED=1 — it imports runtimed (cgo syscall shims). kine is a child process, not a dependency.
 STATICCHECK_VERSION=2026.2.2   # keep equal to the install pin in docs/GO-STANDARDS.md §Commit gates
 GOVULNCHECK_VERSION=v1.9.0   # the govulncheck the gate requires; keep equal across the k3sm repos (hack/lib/govulncheck.sh reads this line)
+
+ci_tmp="$(mktemp -d)"
+# Record this run in the gitignored .ci/last.json (read by the workspace hack/ci-last.sh), best effort,
+# never changing the exit status. A stage is the text of the last `echo "==> ..."` printed;
+# on a red run that stage is the one that failed. ci_cleanup is the cleanup the EXIT
+# handler runs first; a stage that owns a temp dir sets it instead of calling trap.
+ci_root=$PWD
+ci_cleanup=""
+ci_last_stage=""
+ci_note_stage() {
+	case ${1:-} in
+	"==> "*)
+		ci_last_stage=${1#"==> "}
+		ci_last_stage=${ci_last_stage#\[*\] } ;;
+	esac
+}
+# echo is wrapped (not a DEBUG trap) so PIPESTATUS survives for the stages that read it.
+echo() { ci_note_stage "${1:-}"; builtin echo "$@"; }
+ci_json_str() {
+	local s
+	s=$(printf '%s' "$1" | tr -d '[:cntrl:]')
+	s=${s//\\/\\\\}
+	printf '%s' "${s//\"/\\\"}"
+}
+ci_record_last() {
+	local rc=$1 result=green failed="" sha at tmpf
+	# Record only where .ci/ is gitignored: a fixture tree that runs this script (hack/verify-affected-modes.sh) must stay clean.
+	git -C "$ci_root" check-ignore -q .ci/last.json 2>/dev/null || return 0
+	if [ "$rc" != 0 ]; then
+		result=red
+		[ -z "$ci_last_stage" ] || failed="\"$(ci_json_str "$ci_last_stage")\""
+	elif [ "${dry_run:-0}" = 1 ]; then
+		result=skipped
+	fi
+	sha=$(git -C "$ci_root" rev-parse HEAD 2>/dev/null) || sha=""
+	at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+	mkdir -p "$ci_root/.ci" && tmpf=$(mktemp "$ci_root/.ci/last.XXXXXX") || return 0
+	printf '{"repo":"%s","sha":"%s","result":"%s","at":"%s","failed":[%s]}\n' \
+		"$(ci_json_str "$(basename "$ci_root")")" "$sha" "$result" "$at" "$failed" >"$tmpf"
+	mv -f "$tmpf" "$ci_root/.ci/last.json" || rm -f "$tmpf"
+}
+ci_done=0
+ci_on_exit() {
+	local rc=$1
+	if [ "$rc" = 0 ] && [ "$ci_done" != 1 ]; then
+		rc=1
+		echo "ci: stopped before the end of the script with status 0 (a set -u abort under bash 3.2?); treating it as red" >&2
+		[ -n "$ci_last_stage" ] || ci_last_stage=unknown
+	fi
+	if [ -n "$ci_cleanup" ]; then eval "$ci_cleanup" || true; fi
+	ci_record_last "$rc" || true
+	exit "$rc"
+}
+trap 'ci_on_exit $?' EXIT
+# shellcheck disable=SC2016 # the EXIT handler evals this string
+ci_cleanup='rm -rf "$ci_tmp"'
+
+# The --packages mode lives in hack/lib/affected-mode.sh, which defines read_packages
+# and resolve_gate_mode and carries the k3sm-affected/v1 grammar; these two are the
+# variables that make it this repository's.
+gate_repo=k3sm
+gate_module=k3sm.io/k3sm
+. hack/lib/affected-mode.sh
+resolve_gate_mode
 
 echo "==> [k3sm] gofmt"
 fmt=$(gofmt -l .) || true
@@ -61,8 +176,6 @@ fi
 # toolchain) is a HARD ERROR: the old `[ -n "$(go list ./... 2>/dev/null)" ]` could
 # not tell the two apart, so it silently skipped vet/build/test and still reported
 # green — a gate that cannot even enumerate its packages must go RED.
-ci_tmp="$(mktemp -d)"
-trap 'rm -rf "$ci_tmp"' EXIT
 golist_err="$ci_tmp/golist.err"
 if ! go_pkgs="$(CGO_ENABLED=$CGO go list ./... 2>"$golist_err")"; then
 	echo "FAIL: [k3sm] go list ./... failed — cannot enumerate packages; refusing to skip vet/build/test:" >&2
@@ -71,28 +184,52 @@ if ! go_pkgs="$(CGO_ENABLED=$CGO go list ./... 2>"$golist_err")"; then
 fi
 
 if [ -n "$go_pkgs" ]; then
-	echo "==> [k3sm] go vet";   CGO_ENABLED=$CGO go vet ./...
+	if [ ${#vet_set[@]} -gt 0 ]; then
+		echo "==> [k3sm] go vet";   CGO_ENABLED=$CGO go vet "${vet_set[@]}"
+	else
+		echo "==> [k3sm] go vet: skipped (no affected package)"
+	fi
 	echo "==> [k3sm] go build"; CGO_ENABLED=$CGO go build ./...
 	# -race, because docs/GO-STANDARDS.md promises it three times ("CI runs
 	# -race", "CI adds -race") and this gate did not deliver it. The A1 and A2
 	# audit passes both found races that the gate had let through; both were
 	# caught by running -race by hand, which is exactly the work a gate exists
 	# to stop repeating.
-	# The output is kept so that a red run ends with the failing tests, not only
-	# a long scroll.
-	echo "==> [k3sm] go test -race"
-	# Written to a file and then printed, not piped through tee: the
-	# gate runs under a minimal PATH (the staticcheck acceptance test) and
-	# the exit status comes straight from go test, not a pipeline.
-	test_rc=0
-	CGO_ENABLED=$CGO go test -race -count=1 ./... > "$ci_tmp/gotest.log" 2>&1 || test_rc=$?   # e2e/ is //go:build e2e — excluded here
-	cat "$ci_tmp/gotest.log"
-	if [ "$test_rc" -ne 0 ]; then
-		echo "==> [k3sm] go test FAILED; failing tests:" >&2
-		grep -E '^[[:space:]]*--- FAIL:|^FAIL[[:space:]]|^panic:' "$ci_tmp/gotest.log" >&2 || echo "    (no FAIL line; read the output above)" >&2
-		races="$(grep -c 'WARNING: DATA RACE' "$ci_tmp/gotest.log" || true)"
-		[ "$races" = 0 ] || echo "    data races reported: $races" >&2
-		exit 1
+	# The run is a go test -json stream piped through hack/lib/testresults.go,
+	# which validates hack/quarantine.txt and applies it for the tier. It echoes
+	# the output a plain go test prints and ends with the failing tests, so a red
+	# run ends with them, not only a long scroll. Its exit status says whether go
+	# test itself should have failed (0: no failure, 3: only registry-excused
+	# failures), so the two statuses are checked against each other: neither can
+	# turn the other green. The gate runs under a minimal PATH (the staticcheck
+	# acceptance test); the stage needs nothing beyond go and cat.
+	if [ ${#test_set[@]} -gt 0 ]; then
+		echo "==> [k3sm] go test -race (quarantine tier: $test_tier)"
+		CGO_ENABLED=$CGO go build -o "$ci_tmp/testresults" hack/lib/testresults.go
+		set +e
+		CGO_ENABLED=$CGO go test -race -count=1 -json "${test_set[@]}" 2>"$ci_tmp/gotest.err" \
+			| "$ci_tmp/testresults" -registry hack/quarantine.txt -tier "$test_tier" ${edited_pkgs[@]+"${edited_pkgs[@]}"}   # e2e/ is //go:build e2e — excluded here
+		st=("${PIPESTATUS[@]}")
+		set -e
+		go_rc="${st[0]}" tr_rc="${st[1]}"
+		if [ -s "$ci_tmp/gotest.err" ]; then
+			echo "==> [k3sm] go test stderr:" >&2
+			cat "$ci_tmp/gotest.err" >&2
+		fi
+		case "$go_rc:$tr_rc" in
+			0:0) ;;
+			1:3) echo "==> [k3sm] go test failed only on quarantined tests (see QUARANTINED above)" ;;
+			*:1) echo "==> [k3sm] test stage RED (go test exit $go_rc); the RED lines above say why" >&2; exit 1 ;;
+			*:0) echo "FAIL: [k3sm] go test exited $go_rc but its stream holds no failure; read the stderr above" >&2; exit 1 ;;
+			*) echo "FAIL: [k3sm] go test exit $go_rc and testresults exit $tr_rc disagree" >&2; exit 1 ;;
+		esac
+	else
+		echo "==> [k3sm] go test: skipped (no affected package)"
+		# The test stage is also where hack/quarantine.txt is validated: a malformed
+		# or expired entry reds every run. With no test to stream, the committed
+		# registry is checked by the test that runs hack/lib/testresults.go on it.
+		echo "==> [k3sm] quarantine registry (format, expiry)"
+		CGO_ENABLED=$CGO go test -count=1 -run '^TestCommittedRegistryIsValid$' ./hack/lib
 	fi
 
 	# The race witness: a planted race that go test -race must catch. If the
@@ -157,7 +294,7 @@ if [ -n "$go_pkgs" ]; then
 	# not run and still print green is the failure class the go-list guard above
 	# exists to stop.
 	sc_gopath="$(go env GOPATH)"
-	sc_hint="go install honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION}; or, beside another pin: GOBIN=<tmp> go install honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION} && mv <tmp>/staticcheck ${sc_gopath}/bin/staticcheck-${STATICCHECK_VERSION}"
+	sc_hint="runs in a k3sm pod, never installed on the host (containers only, CONTRIBUTING.md); the pinned build in the pod: go install honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION}; or, beside another pin: GOBIN=<tmp> go install honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION} && mv <tmp>/staticcheck ${sc_gopath}/bin/staticcheck-${STATICCHECK_VERSION}"
 	sc=""
 	sc_seen=""
 	sc_prev=""
@@ -226,4 +363,31 @@ if grep -qx "module k3sm.io/k3sm" go.mod 2>/dev/null; then
 	hack/verify-deps.sh
 fi
 
+# DCO sign-off (there is no CI on GitHub: this stage is the check). Every commit this
+# branch adds over origin/main must carry a Signed-off-by line whose email is the
+# author's, matched as a FIXED string (an ERE breaks on id+user@users.noreply addresses).
+# A lone clone without origin/main skips, saying so; a synced main checks nothing.
+echo "==> [k3sm] DCO sign-off (commits not on origin/main)"
+dco_signed() { # <author-email> <message>: exit 0 iff a Signed-off-by line names the email
+	printf '%s\n' "$2" | grep -iE '^Signed-off-by: ' | grep -qiF "<$1>"
+}
+dco_signed 'a+b@users.noreply.github.com' 'x
+
+Signed-off-by: A <a+b@users.noreply.github.com>' || { echo "FAIL: [k3sm] DCO self-test: a signed commit was rejected"; exit 1; }
+! dco_signed 'a@example.com' 'x
+
+Co-authored-by: A <a@example.com>' || { echo "FAIL: [k3sm] DCO self-test: an unsigned commit passed"; exit 1; }
+if git rev-parse --verify -q origin/main >/dev/null 2>&1; then
+	dco_bad=0
+	for sha in $(git rev-list --no-merges origin/main..HEAD); do
+		dco_signed "$(git show -s --format='%ae' "$sha")" "$(git show -s --format='%B' "$sha")" \
+			|| { echo "    UNSIGNED: $(git show -s --format='%h %s' "$sha")"; dco_bad=1; }
+	done
+	[ "$dco_bad" = 0 ] || { echo "FAIL: [k3sm] sign off the commits above: git commit -s (see CONTRIBUTING.md)"; exit 1; }
+	echo "    sign-off OK ($(git rev-list --no-merges --count origin/main..HEAD) new commit(s))"
+else
+	echo "    SKIP: no origin/main ref in this clone, nothing to compare against"
+fi
+
 echo "OK: k3sm ci green"
+ci_done=1

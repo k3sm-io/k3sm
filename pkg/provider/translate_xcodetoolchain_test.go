@@ -53,6 +53,9 @@ func withDeveloperDir(t *testing.T, dir string) {
 	t.Helper()
 	prev := lookupDeveloperDir
 	t.Cleanup(func() { lookupDeveloperDir = prev })
+	// The xcodebuild copy is a host fact too: a test stating the developer dir
+	// states a healthy copy unless it says otherwise (withXcodebuildCopy).
+	withXcodebuildCopy(t, "")
 	if dir == "" {
 		lookupDeveloperDir = func() (string, error) { return "", errNoUnitTestToolchain }
 		return

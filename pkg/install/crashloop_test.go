@@ -109,8 +109,8 @@ func TestVerifyDaemonsFailsWhenTheServerIsParked(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			shrinkRestartBudgets(t)
-			f := reinstallFake()
-			cfg := installCfg().withDefaults()
+			f := reinstallFake(t)
+			cfg := installCfg(t).withDefaults()
 			path := seedCrashRecord(t, f, cfg, tc.rec)
 
 			err := verifyDaemons(context.Background(), f, cfg, artifactManifest(cfg), bringUpWindow{fences: bootstrapFences{ServerLabel: installStart}})
@@ -164,8 +164,8 @@ func TestVerifyDaemonsPassesWithoutAFreshFailure(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			shrinkRestartBudgets(t)
-			f := reinstallFake()
-			cfg := installCfg().withDefaults()
+			f := reinstallFake(t)
+			cfg := installCfg(t).withDefaults()
 			tc.seed(t, f, cfg)
 			if err := verifyDaemons(context.Background(), f, cfg, artifactManifest(cfg), bringUpWindow{fences: bootstrapFences{ServerLabel: installStart}}); err != nil {
 				t.Fatalf("verifyDaemons: %v", err)
@@ -180,8 +180,8 @@ func TestVerifyDaemonsPassesWithoutAFreshFailure(t *testing.T) {
 // which is what a daemon failing during THIS install produces.
 func TestInstallFailsWhenTheServerIsNotComingUp(t *testing.T) {
 	shrinkRestartBudgets(t)
-	f := reinstallFake()
-	cfg := installCfg()
+	f := reinstallFake(t)
+	cfg := installCfg(t)
 	seedCrashRecord(t, f, cfg.withDefaults(), executor.CrashRecord{Crashes: []executor.Crash{{
 		At: time.Now().Add(time.Second), Origin: executor.CrashOriginBringUp, Component: "provision/kine",
 	}}})
@@ -203,8 +203,8 @@ func TestInstallFailsWhenTheServerIsNotComingUp(t *testing.T) {
 // is parked right now.
 func TestInstallFailsWhenTheServerIsParked(t *testing.T) {
 	shrinkRestartBudgets(t)
-	f := reinstallFake()
-	cfg := installCfg()
+	f := reinstallFake(t)
+	cfg := installCfg(t)
 	trippedAt := time.Now().Add(-time.Hour)
 	seedCrashRecord(t, f, cfg.withDefaults(), executor.CrashRecord{
 		Crashes: []executor.Crash{{
@@ -249,7 +249,7 @@ func TestBringUpWindowStartsAtTheDaemonBootstrap(t *testing.T) {
 		label     string
 		component string
 	}{
-		{"server", func(*testing.T) Config { return installCfg() }, ServerLabel, "kube-apiserver"},
+		{"server", func(*testing.T) Config { return installCfg(t) }, ServerLabel, "kube-apiserver"},
 		{"agent", func(t *testing.T) Config { return agentCfg(t) }, AgentLabel, "agent"},
 	}
 	rows := []struct {

@@ -100,8 +100,12 @@ const (
 	// relayReadHeaderTimeout, relayMaxHeaderBytes, relayIdleTimeout and
 	// relayMaxConns bound what one client can hold of a relay address before
 	// the gate has decided anything, and relaylimit.go divides relayMaxConns
-	// into per-source shares. There is no read or write timeout: a blob is as
-	// large as an image layer and streams for as long as it takes.
+	// into per-source shares. There is no flat read or write timeout: a blob is
+	// as large as an image layer and streams for as long as it takes. Streaming
+	// is bounded by progress, not total time: the limiter gives every write of
+	// a response and every read of a request body its own deadline
+	// (relayWriteProgress, relayReadProgress), so a peer that stops reading or
+	// sending loses its connection and frees its slot.
 	relayReadHeaderTimeout = 10 * time.Second
 	relayMaxHeaderBytes    = 16 << 10
 	relayIdleTimeout       = 90 * time.Second
@@ -224,6 +228,12 @@ func NewRelay(cfg RelayConfig) (*Relay, error) {
 // port is the port every bind listens on and upstream the registry's loopback
 // port the gate forwards to.
 func newRelay(port, upstream int, binds []netip.Addr, log *slog.Logger, auth GateAuth, cred Credential) *Relay {
+	return newRelayWithLimits(port, upstream, binds, log, auth, cred, defaultRelayLimits)
+}
+
+// newRelayWithLimits is newRelay with the limits as a parameter, so a test can
+// prove the gate is built from the relay's limits.
+func newRelayWithLimits(port, upstream int, binds []netip.Addr, log *slog.Logger, auth GateAuth, cred Credential, limits relayLimits) *Relay {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -232,7 +242,7 @@ func newRelay(port, upstream int, binds []netip.Addr, log *slog.Logger, auth Gat
 		upstream: upstream,
 		binds:    binds,
 		log:      log,
-		limits:   defaultRelayLimits,
+		limits:   limits,
 		// The relay binds a mesh address and the vm NAT gateway, which local pods
 		// reach over lo0, so every accepted connection's TCP segment size is
 		// clamped. The gate's upstream dial is not: it targets the registry's
@@ -246,7 +256,8 @@ func newRelay(port, upstream int, binds []netip.Addr, log *slog.Logger, auth Gat
 			return tcpseg.WrapListener(ln), nil
 		},
 	}
-	r.limiter = newSourceLimiter(newGate(gateConfig{Upstream: r.target(), Auth: auth, Credential: cred, Logger: log}), r.limits, time.Now)
+	r.limiter = newSourceLimiter(newGate(gateConfig{Upstream: r.target(), Auth: auth, Credential: cred, Logger: log, UpstreamBodyProgress: r.limits.writeProgress}), r.limits, time.Now)
+	r.limiter.log = log
 	r.handler = r.limiter
 	return r
 }
@@ -405,7 +416,8 @@ func (r *Relay) retry(ctx context.Context, attempt int, stage, addr string, err 
 }
 
 // accept serves the push gate over ln, over TLS, at most relayMaxConns
-// connections at a time and at most relayMaxConnsPerSource from one address. It returns nil on a clean stop (ctx cancelled or the listener closed)
+// connections at a time and at most relayMaxConnsPerSource from one address,
+// with the rate floor applied while a connection waits for a slot. It returns nil on a clean stop (ctx cancelled or the listener closed)
 // so serve can tell "we are shutting down" from "this listener broke".
 //
 // One http.Server per address, with the gate mounted directly as its handler.
@@ -419,6 +431,7 @@ func (r *Relay) accept(ctx context.Context, ln net.Listener) error {
 		IdleTimeout:       relayIdleTimeout,
 		ErrorLog:          slog.NewLogLogger(r.log.Handler(), slog.LevelDebug),
 		ConnContext:       r.limiter.ConnContext,
+		ConnState:         r.limiter.ConnState,
 	}
 	stop := make(chan struct{})
 	defer close(stop)
@@ -429,7 +442,10 @@ func (r *Relay) accept(ctx context.Context, ln net.Listener) error {
 		}
 		_ = srv.Close()
 	}()
-	var served net.Listener = newLimitListener(ln, r.limits.maxConns, r.limits.maxConnsPerSource)
+	ll := newLimitListener(ln, r.limits.maxConns, r.limits.maxConnsPerSource)
+	ll.log = r.log
+	ll.rate.floor, ll.rate.window = r.limits.rateFloor, r.limits.rateWindow
+	var served net.Listener = ll
 	if r.tls != nil {
 		// TLS wraps the connection cap, not the reverse: the *tls.Conn the
 		// server sees is what lets it answer a plain-HTTP request with 400,
@@ -446,9 +462,13 @@ func (r *Relay) accept(ctx context.Context, ln net.Listener) error {
 // limitListener caps the connections a listener has open at once, in total
 // and per remote address. Accept blocks while the total cap is reached, so
 // clients holding connections open cost other clients a wait, never this
-// process its file descriptors. A connection from an address already at its
-// share is closed on accept instead: queueing it would make every other
-// address wait behind it.
+// process more than one file descriptor past the cap: the one connection it
+// has accepted and holds while it waits for a slot. A connection from an
+// address already at its share is closed on accept instead: queueing it would
+// make every other address wait behind it. Both are logged as warnings naming
+// the listener's address, each at most once per warnEvery for this listener,
+// so a flood of either cannot flood the log. While a connection waits, the
+// rate floor may cut the slowest held connection (relayrate.go).
 type limitListener struct {
 	net.Listener
 	sem       chan struct{}
@@ -456,6 +476,18 @@ type limitListener struct {
 	open      sourceCounts
 	done      chan struct{}
 	closeOnce sync.Once
+
+	// log receives the full and over-share warnings. Nil logs nothing.
+	log       *slog.Logger
+	now       func() time.Time
+	warnEvery time.Duration
+	full      warnGate // the relay at its connection limit
+	overShare warnGate // a source refused at its share
+	slowCut   warnGate // a connection cut below the rate floor
+
+	// rate is the rate floor (relayrate.go): the live connections and the
+	// last cut. A zero floor or window disables it.
+	rate rateFloor
 }
 
 func newLimitListener(ln net.Listener, total, perSource int) *limitListener {
@@ -465,30 +497,160 @@ func newLimitListener(ln net.Listener, total, perSource int) *limitListener {
 		perSource: perSource,
 		open:      sourceCounts{n: map[string]int{}},
 		done:      make(chan struct{}),
+		now:       time.Now,
+		warnEvery: relayWarnEvery,
 	}
 }
 
 // Accept waits for a free slot, then accepts a connection from an address
-// under its share.
+// under its share. When every slot is held it accepts the next connection
+// first and then waits for a slot for it, so it knows a connection is waiting,
+// and while it waits it applies the rate floor: at most once a window it cuts
+// the slowest connection below the floor to free a slot. A connection from an
+// address at its share is closed at once on either path.
 func (l *limitListener) Accept() (net.Conn, error) {
 	for {
 		select {
 		case l.sem <- struct{}{}:
-		case <-l.done:
-			return nil, net.ErrClosed
+			c, err := l.Listener.Accept()
+			if err != nil {
+				<-l.sem
+				return nil, err
+			}
+			src, ok := l.admit(c, func() { <-l.sem })
+			if !ok {
+				continue
+			}
+			return l.track(c, src), nil
+		default:
 		}
+		l.warnFull()
 		c, err := l.Listener.Accept()
 		if err != nil {
-			<-l.sem
 			return nil, err
 		}
-		src := sourceOf(c.RemoteAddr())
-		if !l.open.take(src, l.perSource) {
-			_ = c.Close()
-			<-l.sem
+		src, ok := l.admit(c, nil)
+		if !ok {
 			continue
 		}
-		return &limitConn{Conn: c, release: func() { l.open.give(src); <-l.sem }}, nil
+		if err := l.waitSlot(); err != nil {
+			_ = c.Close()
+			l.open.give(src)
+			return nil, err
+		}
+		return l.track(c, src), nil
+	}
+}
+
+// admit counts c against its source's share and returns the source, or closes
+// c, calls free (the slot it holds, if any) and logs the refusal when the
+// source is at its share. The refusal is logged after free, so a slow log
+// handler never holds a slot.
+func (l *limitListener) admit(c net.Conn, free func()) (string, bool) {
+	src := sourceOf(c.RemoteAddr())
+	if l.open.take(src, l.perSource) {
+		return src, true
+	}
+	_ = c.Close()
+	if free != nil {
+		free()
+	}
+	l.warnOverShare(src)
+	return "", false
+}
+
+// track wraps c, which holds a slot and src's share, as a limitConn the rate
+// floor measures.
+func (l *limitListener) track(c net.Conn, src string) *limitConn {
+	lc := &limitConn{Conn: c}
+	if l.rate.enabled() {
+		lc.meter = newRateMeter(l.now, l.rate.window)
+		l.rate.add(lc)
+	}
+	lc.release = func() {
+		l.rate.remove(lc)
+		l.open.give(src)
+		<-l.sem
+	}
+	lc.src = src
+	return lc
+}
+
+// waitSlot waits for a free slot for a connection already accepted, cutting
+// the slowest connection below the rate floor when one is due, or returns
+// net.ErrClosed when the listener closes first.
+func (l *limitListener) waitSlot() error {
+	var tick <-chan time.Time
+	if l.rate.enabled() {
+		t := time.NewTicker(max(l.rate.window/relayRateChecks, time.Millisecond))
+		defer t.Stop()
+		tick = t.C
+	}
+	for {
+		l.cutSlowest()
+		select {
+		case l.sem <- struct{}{}:
+			return nil
+		case <-l.done:
+			return net.ErrClosed
+		case <-tick:
+		}
+	}
+}
+
+// cutSlowest cuts the connection the rate floor picks, if any, and logs it.
+func (l *limitListener) cutSlowest() {
+	if !l.rate.enabled() {
+		return
+	}
+	c, s, ok := l.rate.pick(l.now())
+	if !ok {
+		return
+	}
+	if c.meter.markCut() {
+		_ = c.Close()
+	}
+	l.warnSlowCut(c, s)
+}
+
+// warnFull logs that every slot is held, so the listener accepts no further
+// connection until one frees. It says nothing about whether a client is
+// waiting. addr is this listener's address: each bind address has its own
+// listener, limit and warnings.
+func (l *limitListener) warnFull() {
+	if l.log == nil {
+		return
+	}
+	if dropped, ok := l.full.allow(l.now(), l.warnEvery); ok {
+		l.log.Warn("ingest registry relay is at its connection limit: it accepts no further connection until one frees",
+			"addr", l.Addr().String(), "limit", cap(l.sem), "suppressed", dropped)
+	}
+}
+
+// warnOverShare logs that a connection from src was refused because src
+// already holds its share. src is the address alone, with no port; addr is
+// this listener's address.
+func (l *limitListener) warnOverShare(src string) {
+	if l.log == nil {
+		return
+	}
+	if dropped, ok := l.overShare.allow(l.now(), l.warnEvery); ok {
+		l.log.Warn("ingest registry relay refused a connection: the source already holds its share of connections",
+			"addr", l.Addr().String(), "source", src, "share", l.perSource, "suppressed", dropped)
+	}
+}
+
+// warnSlowCut logs a connection cut below the rate floor: the listener's
+// address, the source, the bytes and the time spent writing them that the rate
+// was measured over, and the floor.
+func (l *limitListener) warnSlowCut(c *limitConn, s rateSample) {
+	if l.log == nil {
+		return
+	}
+	if dropped, ok := l.slowCut.allow(l.now(), l.warnEvery); ok {
+		l.log.Warn("ingest registry relay cut its slowest connection for a waiting one: the peer read below the rate floor",
+			"addr", l.Addr().String(), "source", c.src, "remote", c.RemoteAddr().String(),
+			"bytes", s.bytes, "elapsed", s.wait, "floor", int64(l.rate.floor), "window", l.rate.window, "suppressed", dropped)
 	}
 }
 
@@ -498,11 +660,49 @@ func (l *limitListener) Close() error {
 	return l.Listener.Close()
 }
 
-// limitConn frees its slot exactly once, on Close.
+// limitConn frees its slot exactly once, on Close, and reports a write the
+// relay's own deadline cut to cut, which the limiter's ConnContext sets before
+// the connection is served.
 type limitConn struct {
 	net.Conn
 	once    sync.Once
 	release func()
+	cut     *cutWatch
+	// meter measures the connection's response rate for the rate floor; nil
+	// when the floor is off. src is the source address it was counted under.
+	meter *rateMeter
+	src   string
+}
+
+// Write is the connection's Write. Every response byte, the server's final
+// flush included, reaches the peer here, so the time spent here is the time
+// spent waiting on the peer, and the rate floor measures it here. A connection
+// the rate floor cut while this write was in progress is closed once it
+// returns.
+func (c *limitConn) Write(b []byte) (int, error) {
+	c.meter.startWrite()
+	n, err := c.Conn.Write(b)
+	cut := c.meter.endWrite(n)
+	if err != nil {
+		c.cut.wrote(err)
+	}
+	if cut {
+		_ = c.Close()
+	}
+	return n, err
+}
+
+// SetWriteDeadline and SetDeadline tell the cut watch when a write deadline
+// other than the relay's is set, such as the one the TLS close alert sets for
+// itself, so a write that times out under it is not logged as the relay's cut.
+func (c *limitConn) SetWriteDeadline(t time.Time) error {
+	c.cut.writeDeadlineSet(t)
+	return c.Conn.SetWriteDeadline(t)
+}
+
+func (c *limitConn) SetDeadline(t time.Time) error {
+	c.cut.writeDeadlineSet(t)
+	return c.Conn.SetDeadline(t)
 }
 
 func (c *limitConn) Close() error {

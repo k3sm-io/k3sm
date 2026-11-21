@@ -26,7 +26,10 @@ limitations under the License.
 // when a tag moves, the old digest's referrers are reaped with it once it is
 // past the grace. A referrer whose subject digest does not parse is kept;
 // blobs no kept manifest references; upload sessions not written within the
-// grace; and the layout of an empty repository. It also reaps, at any age,
+// grace; and the layout of an empty repository. A retention class
+// (Options.Retention) gives an artifact type a longer grace for its untagged
+// manifests; it only ever keeps more, and what it leaves to reap goes through
+// the brakes below as anything else does. It also reaps, at any age,
 // two kinds of leftovers a crash makes: an upload session whose inode a commit
 // linked into blobs/ before it could remove the session (a second link, which
 // the store's session check refuses, so a cancel cannot), and a .tmp-<uuid>

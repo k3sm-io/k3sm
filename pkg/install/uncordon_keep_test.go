@@ -113,8 +113,8 @@ func TestFailedUncordonKeepsTheInstallAndItsKubeconfig(t *testing.T) {
 	})
 
 	t.Run("the rollback beside a stuck developer-mode marker puts the token back too", func(t *testing.T) {
-		f := &fakeSystem{}
-		if err := Install(ctx, f, stageCfg()); err != nil {
+		f := newFakeSystem(t)
+		if err := Install(ctx, f, stageCfg(t)); err != nil {
 			t.Fatalf("first Install: %v", err)
 		}
 		before, _ := adminCredential(t, f)
@@ -122,7 +122,7 @@ func TestFailedUncordonKeepsTheInstallAndItsKubeconfig(t *testing.T) {
 		f.removeEntryErrs = map[string]error{DeveloperModeMarkerPath: errors.New("EPERM")}
 		f.chownErrs = map[string]error{DeveloperModeMarkerPath: errors.New("EPERM")}
 		f.putLoaded(NetdLabel, ServerLabel)
-		cfg := stageCfg()
+		cfg := stageCfg(t)
 		cfg.DeveloperMode = DeveloperModeOff
 
 		err := Install(ctx, f, cfg)

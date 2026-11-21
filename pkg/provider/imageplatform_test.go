@@ -61,7 +61,7 @@ func platformPod(annotation string) *corev1.Pod {
 // directly.
 func translatePlatformPod(t *testing.T, pod *corev1.Pod) (*runtimev1.PodBox, error) {
 	t.Helper()
-	return toPodBox(pod, "10.42.0.7", "192.168.1.10", t.TempDir(), "", "", netv1.DNSConfig{}, nil)
+	return toPodBox(pod, "10.42.0.7", "192.168.1.10", t.TempDir(), "", "", netv1.DNSConfig{}, "", nil)
 }
 
 // TestImagePlatformAnnotationStampsContainers pins the stamp: the

@@ -113,6 +113,9 @@ func TestFleetOperatorRBACPinned(t *testing.T) {
 	if role.Kind != "ClusterRole" || len(role.Rules) == 0 {
 		t.Fatalf("the record is not a ClusterRole with rules (kind %q, %d rules)", role.Kind, len(role.Rules))
 	}
+	// manage is full management of a resource; each resource named below holds
+	// exactly these verbs.
+	manage := []string{"create", "delete", "get", "list", "patch", "update", "watch"}
 
 	t.Run("record_names_the_pinned_chart", func(t *testing.T) {
 		t.Parallel()
@@ -156,18 +159,71 @@ func TestFleetOperatorRBACPinned(t *testing.T) {
 	// does not ship one, and this is the record of that decision.
 	t.Run("secrets_verbs_are_the_decided_set", func(t *testing.T) {
 		t.Parallel()
-		want := []string{"create", "delete", "get", "list", "patch", "update", "watch"}
-		var got []string
-		for _, rule := range role.Rules {
-			if slices.Contains(rule.APIGroups, "") && slices.Contains(rule.Resources, "secrets") {
-				got = append(got, rule.Verbs...)
-			}
-		}
-		slices.Sort(got)
-		if got = slices.Compact(got); !slices.Equal(got, want) {
-			t.Errorf("secrets verbs = %v, want %v", got, want)
+		if got := verbsOn(role, "", "secrets"); !slices.Equal(got, manage) {
+			t.Errorf("secrets verbs = %v, want %v", got, manage)
 		}
 	})
+
+	// The grants that, with the Secrets verbs, make this role an escalation
+	// set: it creates service accounts and writes roles and bindings at both
+	// scopes. Each is named so that a re-pin which changes one fails here by
+	// name, and not only as a line in the re-recorded list's diff.
+	for _, g := range []struct{ group, resource string }{
+		{"", "serviceaccounts"},
+		{rbacv1.GroupName, "clusterroles"},
+		{rbacv1.GroupName, "clusterrolebindings"},
+		{rbacv1.GroupName, "roles"},
+		{rbacv1.GroupName, "rolebindings"},
+	} {
+		t.Run(g.resource+"_verbs_are_the_reviewed_set", func(t *testing.T) {
+			t.Parallel()
+			if got := verbsOn(role, g.group, g.resource); !slices.Equal(got, manage) {
+				t.Errorf("%s verbs = %v, want %v", g.resource, got, manage)
+			}
+		})
+	}
+
+	// What bounds the role and binding management above: the API server refuses
+	// a role or a binding that confers more than its author holds, unless the
+	// author has escalate or bind. Impersonate would let the operator act as
+	// another identity outright. The role holds none of the three, so a role or
+	// a binding it writes confers nothing the operator lacks. That is all it
+	// bounds: the Secrets verbs and pod creation in the same grant reach other
+	// service accounts' tokens without writing either.
+	t.Run("no_escalate_bind_or_impersonate", func(t *testing.T) {
+		t.Parallel()
+		for i, rule := range role.Rules {
+			for _, verb := range []string{"escalate", "bind", "impersonate"} {
+				if slices.Contains(rule.Verbs, verb) {
+					t.Errorf("rule %d grants %s on %v %v", i, verb, rule.APIGroups, rule.Resources)
+				}
+			}
+		}
+	})
+
+	// A create on serviceaccounts/token mints a token for a service account
+	// directly. It is a resource name of its own, so the serviceaccounts subtest
+	// above does not see it, and the role holds nothing on it.
+	t.Run("no_serviceaccounts_token", func(t *testing.T) {
+		t.Parallel()
+		if got := verbsOn(role, "", "serviceaccounts/token"); len(got) > 0 {
+			t.Errorf("serviceaccounts/token verbs = %v, want none", got)
+		}
+	})
+}
+
+// verbsOn returns the sorted verbs of the rules that name the group and the
+// resource literally, each verb once; the core group is "". A wildcard rule is
+// not matched: no_wildcard_anywhere refuses those.
+func verbsOn(role rbacv1.ClusterRole, group, resource string) []string {
+	var verbs []string
+	for _, rule := range role.Rules {
+		if slices.Contains(rule.APIGroups, group) && slices.Contains(rule.Resources, resource) {
+			verbs = append(verbs, rule.Verbs...)
+		}
+	}
+	slices.Sort(verbs)
+	return slices.Compact(verbs)
 }
 
 // flatten renders a ClusterRole as sorted "group resource verb" lines, the

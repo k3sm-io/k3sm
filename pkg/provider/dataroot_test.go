@@ -50,7 +50,7 @@ func dataRootProfile(t *testing.T, workDir, dataRoot string) string {
 func TestDataRootOnADefaultNode(t *testing.T) {
 	t.Parallel()
 	root := runtimeRoot("")
-	got, err := dataRootOf(RuntimedConfig{DataRoot: install.DefaultDataRoot})
+	got, _, err := dataRootOf(RuntimedConfig{DataRoot: install.DefaultDataRoot})
 	if err != nil {
 		t.Fatalf("dataRootOf(%q) on the default path: %v", install.DefaultDataRoot, err)
 	}
@@ -66,7 +66,7 @@ func TestDataRootOnADefaultNode(t *testing.T) {
 // root moved, the data root's server and agent directories are still what is denied.
 func TestDataRootUnderACustomPodRoot(t *testing.T) {
 	t.Parallel()
-	got, err := dataRootOf(RuntimedConfig{Root: "/opt/k3sm-pods", DataRoot: install.DefaultDataRoot})
+	got, _, err := dataRootOf(RuntimedConfig{Root: "/opt/k3sm-pods", DataRoot: install.DefaultDataRoot})
 	if err != nil {
 		t.Fatalf("dataRootOf: %v", err)
 	}
@@ -143,7 +143,7 @@ func TestDataRootSymlinkCheckFollowsThePodRoot(t *testing.T) {
 	t.Run("a firmlink spelling of the runtime root takes the runtime's spelling", func(t *testing.T) {
 		const root, spelled = "/private/var/k3sm-data", "/var/k3sm-data"
 		for _, tc := range []struct{ root, dataRoot string }{{root, spelled}, {spelled, root}} {
-			got, err := dataRootOf(RuntimedConfig{Root: tc.root, DataRoot: tc.dataRoot})
+			got, _, err := dataRootOf(RuntimedConfig{Root: tc.root, DataRoot: tc.dataRoot})
 			if err != nil {
 				t.Fatalf("dataRootOf(%+v): %v", tc, err)
 			}
@@ -156,7 +156,7 @@ func TestDataRootSymlinkCheckFollowsThePodRoot(t *testing.T) {
 		}
 	})
 	t.Run("the default root is the runtime's own when Root is empty", func(t *testing.T) {
-		got, err := dataRootOf(RuntimedConfig{DataRoot: install.DefaultDataRoot})
+		got, _, err := dataRootOf(RuntimedConfig{DataRoot: install.DefaultDataRoot})
 		if err != nil {
 			t.Fatalf("dataRootOf: %v", err)
 		}
@@ -165,7 +165,7 @@ func TestDataRootSymlinkCheckFollowsThePodRoot(t *testing.T) {
 		}
 	})
 	t.Run("unset stays unset", func(t *testing.T) {
-		if got, err := dataRootOf(RuntimedConfig{Root: "/opt/k3sm-pods"}); err != nil || got != "" {
+		if got, _, err := dataRootOf(RuntimedConfig{Root: "/opt/k3sm-pods"}); err != nil || got != "" {
 			t.Errorf("dataRootOf = %q, %v; want empty", got, err)
 		}
 	})
@@ -173,7 +173,7 @@ func TestDataRootSymlinkCheckFollowsThePodRoot(t *testing.T) {
 
 func TestDataRootOfMakesARelativeValueAbsolute(t *testing.T) {
 	t.Parallel()
-	got, err := dataRootOf(RuntimedConfig{DataRoot: "relative-data-root"})
+	got, _, err := dataRootOf(RuntimedConfig{DataRoot: "relative-data-root"})
 	if err != nil {
 		t.Fatalf("dataRootOf: %v", err)
 	}
@@ -263,7 +263,7 @@ func TestCheckDataRoot(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			dir := tc.setup(t, resolvedTempDir(t))
-			err := checkDataRoot(dir)
+			err := checkDataRoot(dir, "")
 			if got := errors.Is(err, ErrDataRootNotCanonical); got != tc.refused {
 				t.Errorf("checkDataRoot(%q) = %v, refused = %v, want %v", dir, err, got, tc.refused)
 			}

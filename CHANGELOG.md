@@ -12,6 +12,63 @@ pin, its date, and the tarball's sha256.
 
 ### Added
 
+- New unpinned Pods prefer a node whose Mac is not CPU-busy. Each node reports a `HostCPUBusy`
+  condition from the whole Mac's CPU, Pods and every other process, averaged over about two minutes
+  (True from 75%, cleared below 50%), and the server puts the
+  `k3sm.io/host-cpu-busy:PreferNoSchedule` taint on a node while it is True. Before this, a Mac
+  whose own builds held every core still looked empty to the scheduler and kept getting new Pods.
+  Pinned Pods and DaemonSets are unaffected and nothing is evicted. See
+  [Limitations](docs/user/limitations.md).
+- A process in a native Pod can allocate its own pseudo-terminals (`posix_openpt`, `openpty`,
+  Python's `pty`), make one its controlling terminal and open `/dev/tty`, so terminal UIs and
+  terminal multiplexers run inside a Pod. A Pod can open only the terminals it allocated, never
+  another Pod's or the Mac's. Running Pods are recreated on upgrade to pick up the grant. See
+  [A Native Pod Can Open Its Own Terminals](docs/user/limitations.md#a-native-pod-can-open-its-own-terminals-and-only-those).
+- A native Pod can publish a volume to one host account with an inline CSI volume of driver
+  `expose.k3sm.io` (`volumeAttributes.user`, and `access: read` or `read-write`). The node admin
+  grants it per account and namespace with `sudo k3sm expose allow --user <name> --namespace <ns>`,
+  takes it back with `sudo k3sm expose revoke`, and lists grants with `k3sm expose list`. The volume
+  lives at `/var/lib/k3sm/expose/<namespace>/<pod>/<volume>` for the Pod's lifetime, reached by the
+  account through an access-control entry; refusals are `FailedExposure` Events. `k3sm install`
+  creates `/var/lib/k3sm/expose`. See
+  [Exposing a Pod volume to a host user](docs/user/storage.md#exposing-a-pod-volume-to-a-host-user).
+- `sudo k3sm network lan on --for <duration>` turns LAN access on for at most 24h, after which the
+  node daemon turns it off by itself. See [LAN access](docs/user/install.md#lan-access).
+- `sudo k3sm network lan status` lists the sockets on this Mac a LAN peer can reach that LAN access
+  does not move: host-network pods, pod processes that bind an explicit address, macOS services, and
+  the node daemon's own control-plane ports in a block of their own. See
+  [LAN access](docs/user/install.md#lan-access).
+- The server publishes the pinned guest kernel and initramfs it verified at start to its own cluster
+  registry as `k3sm-system/guest:<pin>` (artifactType `application/vnd.k3sm.guest.v1`, one raw layer
+  each, the layer digests the pin's). A re-publish uploads nothing already present and leaves a tag
+  that already names the manifest alone; a failed publish is logged and retried with backoff and never
+  delays the server's start. See [the `vm` RuntimeClass](docs/user/vm-runtimeclass.md#using-it).
+- On the server, an image pull now copies a layer the cluster registry already holds from the
+  registry's own store, as a copy-on-write clone on the same volume, instead of fetching it over the
+  network. The runtime re-hashes the clone and falls back to the normal pull when the store is on
+  another volume, does not hold the layer, or holds a copy whose bytes do not match. Agents fetch as
+  before. `k3sm install` creates the runtime's clone staging directory, `/var/lib/k3sm/.local-stage`.
+- `k3sm model ls [-o json]` lists the models in the cluster registry with their weight format,
+  quantization, parameter size, total size, file count and weight shard count, read from each model's
+  manifest and config without fetching its files. `k3sm model push` copies the quantization and
+  parameter size from the model's `config.json` when it records them, including MLX's
+  `quantization.bits`; a `config.json` over 1 MiB or not a JSON object gives no metadata, and the
+  push goes ahead. See [the cluster registry](docs/user/registry.md#models).
+- `k3sm model import hf://<org>/<repo>[@<revision>] [<name>[:tag]]` imports a Hugging Face model repository
+  into the cluster registry as a ModelPack artifact. The revision is resolved to its commit, every file is
+  fetched at that commit, and the manifest records the commit and the source. Each file is verified before
+  anything is pushed: an LFS file by the Hub's sha256 and a small file by its git blob id. A broken transfer
+  resumes with a range request. Importing the same commit again uploads nothing and gives the same digest.
+  Access is anonymous, so a gated repository is refused by name. `--sha256 <path>=<hex>` adds a hash you know
+  from elsewhere, and each fetched file prints the `--sha256` that pins it next time. The import refuses before
+downloading when the scratch volume cannot hold the model plus a reserve. Its `k3sm-hf-import-*` scratch
+directory is removed when the import ends or is interrupted, and a later import sweeps one a killed process
+left behind after 24 hours. See [Models in the cluster registry](docs/user/models.md). `k3sm model push` no longer
+  re-sends a manifest the tag already names. No RBAC changes.
+- A node under disk pressure evicts cached artifacts no pod or pin holds, least recently released first, before unreferenced images.
+- `k3sm server --registry-quota <artifactType>=<bytes>`, repeatable, caps the bytes one artifact type
+  takes in the cluster registry. A push that would pass it is refused with `403 DENIED`; a layer
+  shared between manifests counts once. See the Quotas section of `docs/user/registry.md`.
 - A node advertises the GPU under hardware names beside the `mlx.k3sm.io` ones, which do not change: the
   `k3sm.io/gpu` extended resource and the `k3sm.io/gpu.present` and `k3sm.io/gpu-memory-gb` labels on a
   node that can grant a pod the GPU, and the `k3sm.io/chip`, `k3sm.io/chip-family` and `k3sm.io/memory-gb`
@@ -141,10 +198,38 @@ pin, its date, and the tarball's sha256.
 - Uninstall names a vm helper still running from a k3sm version the install no longer keeps. It
   does not signal that helper, and the error gives its process ID and the command to stop it by
   hand, `sudo kill -TERM -<pid>`, to run if `ps -o pid,command -g <pid>` shows only processes of the path the error names.
+- The registry relay logs a warning when all of the connections on one of its listening addresses
+  are held, so it accepts no further connection there until one frees, and when it closes a connection from a client already
+  holding its share there. The limits and the warnings are per listening address: each warning names
+  that address and logs at most once a minute for it, with a count of the lines it dropped in
+  between. See [Pulling](docs/user/registry.md#pulling).
+- The registry relay applies a rate floor of 8 KiB/s, averaged over 5 minutes, while every
+  connection on one of its listening addresses is held and a further connection waits. At most
+  once every 5 minutes on that address it cuts the slowest pull below the floor, so a client that
+  reads a little at a time can no longer hold a slot for good while others wait. Only time spent
+  waiting on the client counts; a connection younger than 5 minutes or a response under 2.4 MB is
+  never cut, and nothing is cut while a slot is free. The cut is logged as a warning. The floor
+  and its window are fixed values that a later release may change. See
+  [Pulling](docs/user/registry.md#pulling).
 
 ### Changed
 
+- A Pod with `dnsPolicy: None` now resolves through its own `dnsConfig`: its IPv4 nameservers
+  (up to three), `searches` and `ndots`, natively and in a `vm` guest, with no fallback to the host
+  resolver. It used to resolve through the host and ignore its `dnsConfig`. IPv6 nameservers are
+  skipped with a `DNSConfigPartial` Warning Event, and a Pod whose nameservers are all IPv6 does not
+  start: its containers wait in `CreateContainerConfigError`. Nameservers beyond three, search
+  domains beyond 8 and `ndots: 0` (read as 1) are reported with a `DNSConfigForming` Warning Event.
+  Repeated nameservers are merged. See
+  [limitations](docs/user/limitations.md#dns-what-resolves-and-on-which-runtime-path).
+- `k3sm server` and `k3sm agent` refuse a `--work-dir` that is not named `server` or `agent`
+  respectively. Pods are denied `<data root>/server` and `<data root>/agent`, where the data root is
+  the work dir's parent, so a work dir under another name, such as `/data/k3sm/srv`, left the
+  datastore, the CA keys and the registry store open to pods. The error names the layout to use:
+  `--work-dir <data root>/server`. The defaults and installed layouts are unaffected. See
+  [limitations](docs/user/limitations.md#--work-dir-must-end-in-server-or-agent).
 - The bundled buildx moves from v0.38.0 to v0.38.1, a patch release. The pinned checksums move with it.
+- The bundled etcd and etcdutl move from v3.6.15 to v3.6.16, a patch release. The pinned checksums move with it.
 - `k3sm image prune --force` frees the layers of the untagged manifests it deleted at once, instead
   of leaving them for the registry's next scheduled garbage collection (every 6 hours). After it
   deletes at least one manifest it asks the registry, with the node's push credential, to sweep
@@ -195,6 +280,8 @@ pin, its date, and the tarball's sha256.
   its digest. A sharded `MLXModel` pod now checks at start that the engine's run body matches its pin,
   and the entrypoint exits with the engine's status.
 - The `mlx-serve` image's `mlx-lm` moves from 0.32.0 to 0.32.2. The next image tag carries it; no other package in the closure moves. Sharded ranks refuse chat requests whose images are not inline `data:` URLs, since mlx-lm 0.32.2 would otherwise fetch any `http(s)` image URL a client names.
+- The `mlx-serve` image's interpreter moves from the python-build-standalone 20260929 build of CPython 3.12.14 to the 20261013 build of CPython 3.12.15, the newest build the pinned uv 0.13.1 offers. The next image tag carries it; the package closure does not move.
+- The `mlx-serve` image is staged with uv 0.13.5 (was 0.13.1), and its interpreter moves to the python-build-standalone 20261021 build of CPython 3.12.15 (was 20261013), the build uv 0.13.5 offers. The next image tag carries it; the package closure does not move, and `requirements.lock` is regenerated with uv 0.13.5 at the next image build.
 - The embedded runtime takes an exclusive lock on its root (`runtimed.lock`). A second runtime
   started on a root already in use waits up to 15 seconds for the lock and is then refused,
   instead of running beside the first.
@@ -213,6 +300,86 @@ pin, its date, and the tarball's sha256.
 
 ### Fixed
 
+- An image or artifact pull reserves its declared layer bytes before it fetches anything. A claim above
+  the volume's capacity, or above free space plus what one prune pass could free (planned as a dry run),
+  is refused with nothing evicted, as `FailedPrecondition` or `ResourceExhausted`. Before this, a manifest
+  declaring more than could ever be freed emptied the unreferenced cache on every attempt and then failed.
+  See [A Pull Reserves Its Space](docs/user/images.md#a-pull-reserves-its-space).
+- `k3sm install` and the netd helper keep the data root's image store, Pod trees, volumes and
+  guest-artifact cache (`blobs`, `unpacked`, `snapshots`, `guest-artifacts`, `pods`, `storage`) and
+  the service user's `.kube` at mode `0700`. They were `0750` with group `staff`, every login
+  user's group, so a user could hard-link a node file into a read-write host share where a Pod
+  could rewrite it. An existing node tightens at its next install or netd helper start. See
+  [Install](docs/user/install.md).
+- `k3sm image untag --digest` no longer removes a tag that a push re-points between its check and
+  its delete. The delete is now conditional at the cluster registry, which deletes a tag only while
+  it still names that digest, and a tag that moved is reported as an error with nothing removed. A
+  cluster registry from this release onward enforces it. v0.2.3 and earlier ignore the
+  condition, so a tag re-pointed between the check and the delete is still removed, and a
+  development build from between releases refuses the removal even though the tag has not moved.
+  Upgrading the cluster is the fix in both cases.
+- `sudo k3sm image prune --force` now stops when it is cancelled (Ctrl+C, SIGTERM, or `--timeout`
+  expiring). `manifests` then holds only confirmed deletions, which the registry's garbage
+  collection (the sweep) still reclaims within a time limit. Manifests it had not reached are no
+  longer reported as failed deletions. The JSON report sets `interrupted` and lists them under
+  `unattempted`, along with deletions the cancellation cut off. A deletion the registry refused is
+  still listed under `failed`, and the prune is marked `interrupted` either way. A manifest listed
+  under `unattempted` was not confirmed deleted, but the registry may have completed a deletion
+  after the command gave up, so it may already be gone. Running the prune again is safe; a later
+  prune or the registry's scheduled garbage collection reclaims what remains. The interruption is
+  noted on stderr. The table keeps its usual lines, and the command exits non-zero. See [Reclaiming
+  Space](docs/user/images.md#reclaiming-space-k3sm-image-prune).
+- When a node's local registry accepts a connection but never answers, a manifest push through the
+  push gate now gets a 502 `UNAVAILABLE` after 15 minutes without response headers, instead of
+  waiting until the client gives up. Retry the push. A manifest push gets that long because the
+  registry can make it wait behind a garbage-collection sweep of the repository or a re-hash of a
+  large layer. Blob uploads get the same 502 after the registry's own 2-hour upload bound, because the
+  registry finishes committing a layer before it answers. A pull whose registry sends no response
+  headers within 30 seconds ends the same way it always ended when the registry could not be reached:
+  the gate closes the connection, and the puller tries its next mirror. A pull that cannot reach the
+  local registry is now logged.
+- The push gate warns at most once a minute per cause when pulls or authorized pushes cannot reach the local registry.
+- A peer that opens a blob GET on the registry relay and stops reading, or declares a request body
+  and never sends it, no longer holds one of the relay's limited connections for that client until
+  restart (this applies to the relay; the push gate's upload bound is separate). Each write of a response
+  and each read of a request body must make progress within 5 minutes, or the relay closes the
+  connection and frees the slot. A blob still streams for as long as it takes while it keeps moving:
+  there is no flat read or write timeout. A connection cut this way is logged as a warning. See
+  [Pulling](docs/user/registry.md#pulling).
+- A node's local registry that starts answering a request through the registry gate and then stops
+  sending mid-body no longer holds the gate's connection, and the relay slot behind it, until the
+  client gives up. If the gate waits 5 minutes for the next byte of the answer, it cuts the connection
+  and logs a warning. A slow answer that keeps moving is never cut, and time the gate spends sending
+  to a slow client does not count.
+- A server whose control plane does not report healthy in time while the Mac is heavily loaded no
+  longer parks on the crash-loop breaker after five attempts. It backs off instead, from 30 seconds
+  doubling up to 10 minutes, `k3sm status` shows when the next attempt starts and that an attempt
+  is running, and it parks only after eight slow attempts in a row. The Mac counts as heavily loaded
+  only when both its 1-minute and 5-minute load averages are at least 2 per core, and the crash-loop
+  record notes both. Each component's log from the first failed run is kept as
+  `<component>.log.1` until the control plane comes up healthy again, with the latest failed run's
+  log as `<component>.log.2`, so later restarts do not overwrite the first failure's cause.
+  `k3sm uninstall` removes the kept logs. See
+  [the crash-loop breaker](docs/user/troubleshooting.md#the-crash-loop-breaker-tripped).
+- A single-node server no longer stops its whole control plane when a datastore compaction runs out of
+  time under heavy load. kine used to exit when the compaction failed to commit; it now logs
+  `Compact failed` and retries on the next interval. Every node re-stages kine on upgrade.
+- A datastore compaction whose transaction fails to roll back exits kine again, because a failed
+  rollback can leave a database connection holding the write lock; the server restarts cleanly.
+- The sandbox now also denies pods the role's own work dir, by the path `k3sm server` or `k3sm agent`
+  was started with, beside the data root's `server` and `agent` directories. Pods created before the
+  upgrade keep their old profile until they are recreated. On the default paths, and in every layout
+  `k3sm server` and `k3sm agent` accept, the profile does not change. `k3sm node` and a second role on
+  the same Mac with another data root are not covered; see
+  [limitations](docs/user/limitations.md#node-state-the-sandbox-does-not-deny).
+- `sudo k3sm install --service-cidr` refuses any range other than the default `10.43.0.0/16`, before it
+  changes anything. The flag only ever reached netd: the apiserver, the cluster DNS address and the serving
+  certificates always use `10.43.0.0/16`, so another value left netd and the apiserver disagreeing about
+  which addresses are Service IPs.
+- A Pod with an `image` volume no longer fails with `mkdir /var/lib/k3sm/artifacts: permission denied`.
+  `k3sm install` now creates the runtime's artifact views and partial-download directories under the
+  data root for the service user, and the directory that keeps the console of a failed vm boot. A
+  reinstall over an existing node creates them too, and netd recreates them at start.
 - A Pod whose `image` volume the node cannot fetch for want of store space is now kept `Pending` with
   the waiting reason `ArtifactPullBackOff` and retried on the image pull back-off, where it used to fail
   at creation. A volume whose reference the runtime refuses as naming another registry is kept with
@@ -343,6 +510,7 @@ pin, its date, and the tarball's sha256.
 - A pod created under the name of one the node is still finishing a delete for now starts. It could be sent to update the old pod instead, and be left with an address nothing owned or fail for good.
 - A create the runtime refuses after a second create of the same pod took over no longer takes that pod's address and log directory while it runs.
 - A pod deleted while the runtime is still creating it no longer keeps running with no owner. The node deletes it again once the create lands, and keeps the pod's address until that delete has succeeded, so no new pod can be given it beside the running one. A create of a pod the node has already torn down is ignored.
+- The kine that k3sm builds now links `golang.org/x/net` v0.62.0, the version the control-plane binaries and the bundled helm already link, which fixes GO-2026-6860 and GO-2026-6866 in the HTML parser and renderer. It also links the newer `golang.org/x/crypto`, `x/sys`, `x/term`, `x/text` and `x/sync` that x/net version requires. Every node re-stages kine on upgrade.
 - `k3sm` and the etcd, kine and zot it builds now link `github.com/klauspost/compress` v1.20.2, which fixes GO-2026-6865, a panic on two-block frames. Every node re-stages kine and zot on upgrade.
 - Turning Spotlight indexing off for the data volume no longer waits indefinitely on `mdutil`. The
   `.metadata_never_index` marker is what excludes the volume and is written first, so the `mdutil`

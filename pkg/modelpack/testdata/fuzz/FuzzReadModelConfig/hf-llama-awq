@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"architectures\":[\"LlamaForCausalLM\"],\"hidden_size\":4096,\"model_type\":\"llama\",\"quantization_config\":{\"bits\":4,\"group_size\":128,\"quant_method\":\"awq\",\"version\":\"gemm\"},\"torch_dtype\":\"float16\"}")

@@ -90,7 +90,8 @@ var (
 	// run, and silently ignoring the caller would look like the selector took
 	// effect.
 	ErrGuardrailConflict = errors.New("spec.nodeSelector conflicts with a fixed guardrail selector")
-	// ErrQuantizationUnsupported is returned when spec.quantization is set. The
+	// ErrQuantizationUnsupported is returned when spec.quantization is set on
+	// a Hub model (with spec.artifact it selects the index entry instead). The
 	// measured engine surface has NO expression for it (see sizing.go), so the
 	// render can neither honour the field nor pass it on. Refusing is the same
 	// call the CRD already makes for spec.distributed: a field the operator set
@@ -394,7 +395,7 @@ func prepare(m *mlxv1alpha1.MLXModel, opts Options) (prepared, error) {
 	// What the engine is actually pointed at. It is resolved BEFORE anything is
 	// rendered because a spec whose pin cannot be expressed on the measured
 	// engine surface has no workload worth applying — see modelReference.
-	if m.Spec.Quantization != "" {
+	if m.Spec.Quantization != "" && m.Spec.Artifact == nil {
 		return prepared{}, renderErr(m, fmt.Errorf("%w: spec.quantization=%q", ErrQuantizationUnsupported, m.Spec.Quantization))
 	}
 	// An artifact model is never fetched from the Hub: any refusal here ends

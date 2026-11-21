@@ -297,7 +297,7 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 	fs.StringVar(&platformSpec, "platform", "", "os/arch[/variant] this verb acts on, e.g. darwin/arm64 (pull; tag, inspect, save: one platform of an index)")
 	fs.StringVar(&policySpec, "policy", "", "pull policy: always, if-not-present or never (pull only; default is the pull-through behaviour)")
 	fs.BoolVar(&o.noMirror, "no-mirror", false, "pull: do not copy a public image into the cluster registry")
-	fs.StringVar(&o.digest, "digest", "", "refuse the removal unless the name still resolves to this manifest digest (untag only)")
+	fs.StringVar(&o.digest, "digest", "", "refuse the removal unless the name still resolves to this manifest digest; the cluster registry checks it as it deletes, but a cluster registry running v0.2.3 or earlier does not, and against it a tag re-pointed after the first check is still removed (untag only)")
 	// One flag, several meanings, chosen by the subcommand — the spelling `docker`
 	// uses for both. It is validated per subcommand at parse time so `inspect -o
 	// out.tar` fails before anything is dialled.

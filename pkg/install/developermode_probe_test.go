@@ -94,8 +94,8 @@ func TestDeveloperModeInvalidMarkerNotRestoredOnRevert(t *testing.T) {
 		{name: "a file with an ACL", kind: EntryRegular, mode: 0o644, acl: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			f := &fakeSystem{}
-			if err := Install(context.Background(), f, stageCfg()); err != nil {
+			f := newFakeSystem(t)
+			if err := Install(context.Background(), f, stageCfg(t)); err != nil {
 				t.Fatalf("first Install: %v", err)
 			}
 			seedMarkerAncestors(f)
@@ -111,7 +111,7 @@ func TestDeveloperModeInvalidMarkerNotRestoredOnRevert(t *testing.T) {
 			// A bootstrap error that is not transient fails on the first
 			// attempt, so the revert runs without waiting on any budget.
 			f.putBootstrapAlways(NetdLabel, errors.New("Bootstrap failed: 125: Domain does not support specified action"))
-			cfg := stageCfg()
+			cfg := stageCfg(t)
 			cfg.Signer = fakeSigner{ids: map[string]string{"/tmp/k3sm": testTeamID}}
 			err := Install(context.Background(), f, cfg)
 			if err == nil || !strings.Contains(err.Error(), "rolled back to the previous install root") {
@@ -140,8 +140,8 @@ func TestDeveloperModeValidMarkerRestoredOnPlainInstallRevert(t *testing.T) {
 	const content = "developer mode enabled by k3sm install on 2026-10-31T00:00:00Z\n"
 	removeCall := "RemoveEntry:/Library:k3sm.developer-mode"
 	restoreCall := "WriteRootOnlyFile:" + DeveloperModeMarkerPath + ":0644"
-	f := &fakeSystem{}
-	if err := Install(context.Background(), f, stageCfg()); err != nil {
+	f := newFakeSystem(t)
+	if err := Install(context.Background(), f, stageCfg(t)); err != nil {
 		t.Fatalf("first Install: %v", err)
 	}
 	seedMarkerAncestors(f)
@@ -154,7 +154,7 @@ func TestDeveloperModeValidMarkerRestoredOnPlainInstallRevert(t *testing.T) {
 	// A bootstrap error that is not transient fails on the first attempt, so
 	// the revert runs without waiting on any budget.
 	f.putBootstrapAlways(NetdLabel, errors.New("Bootstrap failed: 125: Domain does not support specified action"))
-	cfg := stageCfg()
+	cfg := stageCfg(t)
 	cfg.Signer = fakeSigner{ids: map[string]string{"/tmp/k3sm": testTeamID}}
 	err := Install(context.Background(), f, cfg)
 	if err == nil || !strings.Contains(err.Error(), "rolled back to the previous install root") {
@@ -271,7 +271,7 @@ func (s *restoreWriteFails) WriteRootOnlyFile(path string, _ []byte, mode fs.Fil
 // validMarkerFake is a fake holding a valid marker, asserted to read on.
 func validMarkerFake(t *testing.T) *fakeSystem {
 	t.Helper()
-	f := &fakeSystem{owners: map[string]OwnedEntry{}, acls: map[string]bool{}}
+	f := (&fakeSystem{owners: map[string]OwnedEntry{}, acls: map[string]bool{}}).rootedIn(t)
 	seedMarkerAncestors(f)
 	f.owners[DeveloperModeMarkerPath] = OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: 0o644}
 	f.putFile(DeveloperModeMarkerPath, []byte("developer mode enabled by k3sm install on 2026-11-01T00:00:00Z\n"))

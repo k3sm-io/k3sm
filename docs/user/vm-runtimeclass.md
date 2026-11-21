@@ -68,6 +68,12 @@ no image manifest matches a runnable platform: want [linux/arm64/v8], image prov
 Pods without `runtimeClassName: vm` use the default native-process runtime and therefore share the
 `_k3sm` trust domain with other default Pods on the same node.
 
+The guest kernel and initramfs a `vm` Pod boots are pinned by sha256 in the k3sm binary. The server
+downloads them from the k3sm release at start, checks them against the pin, and publishes them to
+its own [cluster registry](registry.md) as `k3sm-system/guest:<pin>`, with the pinned digests as the
+layer digests. A publish that fails is logged and retried in the background, and never delays the
+server's start. A worker still downloads the pair from the release itself.
+
 ## Interactive Sessions
 
 A `vm` Pod answers the interactive `kubectl` verbs, and the guest gives every container a real

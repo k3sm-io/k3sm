@@ -32,10 +32,13 @@ import (
 	"k3sm.io/runtimed/pkg/sandbox"
 )
 
-// The stop scenario every lifecycle test starts from: a server installed with a
-// NON-default Service CIDR (so a flush of the default range would be visibly
-// wrong), one recorded pod process group alive, one vm pod's k3sm-vmhost helper
-// alive (spawned with a 5s grace), and this node's cluster identity on disk.
+// The stop scenario every lifecycle test starts from: a server whose installed
+// netd plist records a NON-default Service CIDR (so a flush of the default range
+// would be visibly wrong), one recorded pod process group alive, one vm pod's
+// k3sm-vmhost helper alive (spawned with a 5s grace), and this node's cluster
+// identity on disk. Install now refuses that --service-cidr, so the fixture
+// installs with the default and rewrites the plist the way an earlier release,
+// which took the flag, left it: the teardown flush reads the plist, not cfg.
 const (
 	stopTestServiceCIDR = "10.96.0.0/16"
 	stopTestPodPgid     = 501
@@ -49,23 +52,25 @@ const (
 func stoppableNode(t *testing.T) (*fakeSystem, Config, *bytes.Buffer) {
 	t.Helper()
 	shrinkRestartBudgets(t)
-	f := &fakeSystem{}
+	f := newFakeSystem(t)
 	// A pinned clock: the vm helper stop measures its waits from one start, so
 	// the asserted waits are exact only on a clock that does not move.
 	pinned := time.Unix(1_700_000_000, 0)
 	f.now = func() time.Time { return pinned }
 	var logs bytes.Buffer
 	cfg := Config{
-		BinarySource: "/tmp/k3sm", TargetUser: "alice", ServiceCIDR: stopTestServiceCIDR,
+		InstallDir:   testInstallDir(t),
+		BinarySource: "/tmp/k3sm", TargetUser: "alice",
 		Logger: slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	}
 	if err := Install(context.Background(), f, cfg); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
+	recordServiceCIDR(t, f, cfg, stopTestServiceCIDR)
 	f.podReap = []runtimed.PodReapRecord{{PodID: "web", Container: "app", Pgid: stopTestPodPgid, StartUnixNano: 11}}
 	f.podLeaders = map[int]int64{stopTestPodPgid: 11, stopTestVMPgid: 22}
 	f.life.vmhosts = []VMHostRecord{{Schema: 1, PodID: "linux", Pgid: stopTestVMPgid, StartUnixNano: 22, StopGraceNanos: int64(stopTestVMGrace)}}
-	f.life.procs = map[int]fakeProc{stopTestVMPgid: {exe: DefaultInstallDir + "/" + VMHostName, uid: fakeServiceUID}}
+	f.life.procs = map[int]fakeProc{stopTestVMPgid: {exe: cfg.InstallDir + "/" + VMHostName, uid: fakeServiceUID}}
 	f.putFile(netdsvc.NodeIdentityPath(MeshKeyDir), []byte("100.64.3.0/24\n"))
 	cfg.MarkNode = func(_ context.Context, stopped bool, actor, _ string) error {
 		f.calls = append(f.calls, fmt.Sprintf("MarkNode:%t:%s", stopped, actor))
@@ -77,6 +82,18 @@ func stoppableNode(t *testing.T) (*fakeSystem, Config, *bytes.Buffer) {
 	}
 	f.calls = nil
 	return f, cfg, &logs
+}
+
+// recordServiceCIDR rewrites the installed netd plist's --service-cidr to cidr,
+// the plist an earlier release that accepted a non-default flag wrote.
+func recordServiceCIDR(t *testing.T, f *fakeSystem, cfg Config, cidr string) {
+	t.Helper()
+	path := cfg.withDefaults().plistPath(NetdLabel)
+	from := []byte("<string>" + DefaultServiceCIDR + "</string>")
+	if !bytes.Contains(f.files[path], from) {
+		t.Fatalf("the installed netd plist %s carries no %s", path, from)
+	}
+	f.files[path] = bytes.ReplaceAll(f.files[path], from, []byte("<string>"+cidr+"</string>"))
 }
 
 // lifecycleCalls drops the read-only probes (launchd pid reads, file reads)
@@ -201,9 +218,12 @@ func TestStopTearsDownPodsAndKeepsPlists(t *testing.T) {
 	t.Run("a forged vm record is never signalled", func(t *testing.T) {
 		for name, proc := range map[string]fakeProc{
 			"wrong executable": {exe: "/usr/sbin/sshd", uid: fakeServiceUID},
-			"wrong uid":        {exe: DefaultInstallDir + "/" + VMHostName, uid: 0},
+			"wrong uid":        {uid: 0}, // the real helper path, filled in below
 		} {
 			f, cfg, _ := stoppableNode(t)
+			if proc.exe == "" {
+				proc.exe = cfg.InstallDir + "/" + VMHostName
+			}
 			f.life.procs[stopTestVMPgid] = proc
 			err := Stop(ctx, f, cfg, ActorUser, "test")
 			var serr *StopIncompleteError
@@ -302,7 +322,7 @@ func TestStopTearsDownPodsAndKeepsPlists(t *testing.T) {
 		{"a vm record names another executable", LeftoverVMHelpers,
 			func(f *fakeSystem) { f.life.procs[stopTestVMPgid] = fakeProc{exe: "/usr/sbin/sshd", uid: 0} },
 			func(f *fakeSystem) {
-				f.life.procs[stopTestVMPgid] = fakeProc{exe: DefaultInstallDir + "/" + VMHostName, uid: fakeServiceUID}
+				f.life.procs[stopTestVMPgid] = fakeProc{exe: f.installDir() + "/" + VMHostName, uid: fakeServiceUID}
 			}},
 		{"a vm record is untrusted", LeftoverVMHelpers,
 			func(f *fakeSystem) { f.life.vmRejected = []string{"666.json"} },

@@ -1,0 +1,12 @@
+{
+  "description": "A listed leaf TestParent/a fails with its signature. An unregistered TestParentX fails beside it, and its framing line also lands in TestParent's output. That line is not TestParent's own framing (a bare name prefix would take it for it), so TestParent is judged on its own lines, finds one, and fails; TestParentX fails too and the verdict is red.",
+  "edited": [],
+  "tests": {
+    "k3sm.io/apis/net/v1::TestParent": "failed",
+    "k3sm.io/apis/net/v1::TestParent/a": "excused",
+    "k3sm.io/apis/net/v1::TestParentX": "failed"
+  },
+  "tier": "affected",
+  "today": "2026-10-30",
+  "verdict": "red"
+}

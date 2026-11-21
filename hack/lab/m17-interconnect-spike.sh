@@ -747,7 +747,7 @@ measure_path() {
 }
 
 if [ "$(kv "$LI" HAS_iperf3)" != yes ] || [ "$(kv "$PI" HAS_iperf3)" != yes ]; then
-	record "figures: iperf3 is not installed on $([ "$(kv "$LI" HAS_iperf3)" != yes ] && echo "the local Mac ")$([ "$(kv "$PI" HAS_iperf3)" != yes ] && echo "the peer Mac")(brew install iperf3); no throughput figure was measured, and none is made up"
+	record "figures: iperf3 is not installed on $([ "$(kv "$LI" HAS_iperf3)" != yes ] && echo "the local Mac ")$([ "$(kv "$PI" HAS_iperf3)" != yes ] && echo "the peer Mac")(iperf3 runs in a k3sm pod, never installed on a lab host); no throughput figure was measured, and none is made up"
 	FIGURES_MISSING=1
 else
 	servers="$P_NODE:5311"
