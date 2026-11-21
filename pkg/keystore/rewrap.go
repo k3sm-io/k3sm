@@ -390,7 +390,8 @@ func rewrapPlan(ctx context.Context, root *os.Root, fl floor, old keys, next *ke
 	return out, committed, nil
 }
 
-// planEntry opens name's pointer and every version it covers, each under old
+// planEntry opens name's pointer, checked against the floor, and every
+// version it covers, each under old
 // or, failing that and with next set, under next, and reports whether any
 // opened only under next.
 func planEntry(ctx context.Context, root *os.Root, name string, fl floor, old keys, next *keys) (uint64, bool, error) {
@@ -414,7 +415,9 @@ func planEntry(ctx context.Context, root *os.Root, name string, fl floor, old ke
 		return err
 	}
 	var cur uint64
-	if err := either(func(k keys) (err error) { cur, _, err = e.pointer(k); return err }); err != nil {
+	// The pointer is the floor-checked one: a copied-back pointer readers
+	// refuse is refused here too, never re-sealed as it is.
+	if err := either(func(k keys) (err error) { cur, _, err = e.checkedPointer(k, fl); return err }); err != nil {
 		return 0, false, err
 	}
 	for n := uint64(1); n <= cur; n++ {

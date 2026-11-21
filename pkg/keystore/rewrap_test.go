@@ -615,3 +615,25 @@ func TestRewrapRefusesWhileUserScopesExist(t *testing.T) {
 		})
 	}
 }
+
+// TestRewrapRefusesStalePointer: Rewrap plans by the floor-checked pointer,
+// so a previously valid current copied back over the live one, which every
+// reader refuses, refuses the Rewrap before anything is written, like any
+// entry List reports with Err, rather than being re-sealed as it is.
+func TestRewrapRefusesStalePointer(t *testing.T) {
+	s, server := newTestStore(t)
+	mustPut(t, s, "a", KindOpaque, []byte("one"))
+	saved, err := os.ReadFile(entryPath(server, "a", currentName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustRotate(t, s, "a", "two")
+	writeFile(t, entryPath(server, "a", currentName), string(saved))
+	snap := treeSnapshot(t, filepath.Dir(server))
+	err = s.Rewrap(context.Background(), rewrapKey(1))
+	var stale *staleError
+	if !errors.As(err, &stale) || !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("Rewrap over a copied-back pointer: %v, want the floor's refusal", err)
+	}
+	checkTreeUnchanged(t, snap, treeSnapshot(t, filepath.Dir(server)))
+}

@@ -596,8 +596,10 @@ the conservative way:
   `ErrRewrapResumed` (step 2), unless the key it completed is the one it was given. The reader's fallback key is `master.next` only when it agrees with its
   fingerprint, and an opaque fingerprint read under it uses the master's fingerprint key.
 - *The floor.* Rewrap raises it at its start like every root verb, but a floor too full to
-  raise does not stop it, since Rewrap records nothing new; pointers are re-sealed at their
-  sequence whatever the floor says, and readers judge them as before.
+  raise does not stop it, since Rewrap records nothing new. It plans by the floor-checked
+  pointer, so a pointer the floor refuses (one copied back) refuses the Rewrap before anything
+  is written, like any entry `list` reports with `Err`; pointers it does re-seal keep their
+  sequence.
 - *Refusals before any write:* `.user` present (checked before the lock, whose first
   acquisition creates `.lock`, and again under it); no entries directory (nothing to
   rewrap); no master (`ErrMasterMissing`); and a new master equal to the live one.
