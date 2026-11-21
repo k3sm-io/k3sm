@@ -176,7 +176,7 @@ var (
 	// build cannot re-wrap user scopes, so re-wrapping the master under them
 	// would leave them unreadable; Rewrap writes nothing. A .user that is not
 	// a user scope (a stray file or link) is root's to remove.
-	ErrScopeUnsupported = errors.New("the keystore holds user scopes at the reserved path keystore/.user, which this build of k3sm cannot re-wrap: nothing was changed; upgrade k3sm, then run rewrap again. If keystore/.user is not a user scope, root must remove it before rewrap can run")
+	ErrScopeUnsupported = errors.New("the keystore holds user scopes at the reserved path keystore/.user, which this build of k3sm cannot re-wrap: the master was not swapped and every record still opens; upgrade k3sm, then run rewrap again. If keystore/.user is not a user scope, root must remove it before rewrap can run")
 	// ErrRewrapResumed reports that Rewrap found an earlier, interrupted
 	// rewrap whose new key was already live for some record, completed it
 	// under that key rather than the one supplied, and stopped. The master is
