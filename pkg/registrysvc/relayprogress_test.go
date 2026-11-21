@@ -39,53 +39,57 @@ import (
 // its body is fully sent, so the proxy's transport is still reading the body on
 // its own goroutine when the relay's handler returns and decides the read
 // deadline. Under -race, that decision and the transport's reads must not
-// race, and the connection must still serve the client's whole exchange.
+// race, and the connection must still serve the client's whole exchange. It
+// runs in a synctest bubble over in-memory connections.
 func TestRelayEarlyAnswerWhileBodyIsSent(t *testing.T) {
-	const peerA = "100.64.1.3"
-	registry := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			w.WriteHeader(http.StatusOK)
-			return
+	relayBubble(t, func(t *testing.T) {
+		const peerA = "100.64.1.3"
+		registry := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			// Answer at once, before reading the body: full duplex keeps the
+			// server from draining the body before the answer goes out.
+			rc := http.NewResponseController(w)
+			_ = rc.EnableFullDuplex()
+			w.WriteHeader(http.StatusAccepted)
+			_ = rc.Flush()
+		})
+		f := newRelayLimitFixtureWith(t, stallLimits(), registry)
+		f.tokens.statuses[tokTeam] = saStatus("team", "builder")
+		for i := range 20 {
+			if i > 0 {
+				// The server frees the per-source slot only when it closes
+				// its side of the previous round's connection.
+				f.awaitSlot(t, peerA, 3*stallWindow)
+			}
+			c := f.dial(t, peerA)
+			const total = 4 << 10
+			if _, err := fmt.Fprintf(c, "POST /v2/team/app/blobs/uploads/ HTTP/1.1\r\nHost: registry.test\r\nAuthorization: %s\r\nConnection: close\r\nContent-Length: %d\r\n\r\n", basic(tokTeam), total); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := c.Write(make([]byte, total/2)); err != nil {
+				t.Fatal(err)
+			}
+			resp, err := http.ReadResponse(bufio.NewReader(c), &http.Request{Method: http.MethodPost})
+			if err != nil {
+				t.Fatalf("round %d: early answer: %v", i, err)
+			}
+			if resp.StatusCode != http.StatusAccepted {
+				t.Fatalf("round %d: status = %d, want %d", i, resp.StatusCode, http.StatusAccepted)
+			}
+			// The rest of the body arrives after the answer, while the
+			// transport may still be reading it. It is sent before the
+			// answer is read to its end: the proxy ends the answer only once
+			// the transport has stopped reading the body.
+			_, _ = c.Write(make([]byte, total-total/2))
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			_ = c.Close()
 		}
-		// Answer at once, before reading the body: full duplex keeps the
-		// server from draining the body before the answer goes out.
-		rc := http.NewResponseController(w)
-		_ = rc.EnableFullDuplex()
-		w.WriteHeader(http.StatusAccepted)
-		_ = rc.Flush()
+		f.awaitSlot(t, peerA, 3*stallWindow)
 	})
-	f := newRelayLimitFixtureWith(t, stallLimits(), registry)
-	f.tokens.statuses[tokTeam] = saStatus("team", "builder")
-	for i := range 20 {
-		if i > 0 {
-			// The server frees the per-source slot only when it closes its
-			// side of the previous round's connection.
-			f.awaitSlot(t, peerA, 3*stallWindow+500*time.Millisecond)
-		}
-		c := f.dialTCP(t, peerA)
-		_ = c.SetDeadline(time.Now().Add(5 * time.Second))
-		const total = 4 << 10
-		if _, err := fmt.Fprintf(c, "POST /v2/team/app/blobs/uploads/ HTTP/1.1\r\nHost: registry.test\r\nAuthorization: %s\r\nConnection: close\r\nContent-Length: %d\r\n\r\n", basic(tokTeam), total); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := c.Write(make([]byte, total/2)); err != nil {
-			t.Fatal(err)
-		}
-		resp, err := http.ReadResponse(bufio.NewReader(c), &http.Request{Method: http.MethodPost})
-		if err != nil {
-			t.Fatalf("round %d: early answer: %v", i, err)
-		}
-		_, _ = io.Copy(io.Discard, resp.Body)
-		_ = resp.Body.Close()
-		if resp.StatusCode != http.StatusAccepted {
-			t.Fatalf("round %d: status = %d, want %d", i, resp.StatusCode, http.StatusAccepted)
-		}
-		// The rest of the body arrives after the answer, while the
-		// transport may still be reading it.
-		_, _ = c.Write(make([]byte, total-total/2))
-		_ = c.Close()
-	}
-	f.awaitSlot(t, peerA, 3*stallWindow+500*time.Millisecond)
 }
 
 // readDeadlineRecorder is a ResponseWriter that records every read deadline
@@ -223,36 +227,37 @@ func TestRelayCutLogEndsWithTheResponse(t *testing.T) {
 	const peerA = "100.64.1.4"
 
 	t.Run("a refusal after the response ended logs no cut", func(t *testing.T) {
-		f, rec := newCutLogFixture(t)
-		var fc *failingConn
-		c := f.dialTCPWith(t, peerA, func(c net.Conn) net.Conn {
-			fc = &failingConn{Conn: c}
-			return fc
+		relayBubble(t, func(t *testing.T) {
+			f, rec := newCutLogFixture(t, nil)
+			var fc *failingConn
+			c := f.dialWith(t, peerA, func(c net.Conn) net.Conn {
+				fc = &failingConn{Conn: c}
+				return fc
+			})
+			br := bufio.NewReader(c)
+			if _, err := fmt.Fprintf(c, "GET /v2/team/app/manifests/v1 HTTP/1.1\r\nHost: registry.test\r\n\r\n"); err != nil {
+				t.Fatal(err)
+			}
+			resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodGet})
+			if err != nil {
+				t.Fatalf("GET: %v", err)
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			// The response has ended. The server's refusal of the malformed
+			// next request is written outside any response the relay
+			// serves, and here it times out.
+			// net/http sets StateIdle on the serve goroutine before it reads
+			// the next request, so the refusal below always follows it.
+			fc.fail.Store(true)
+			if _, err := fmt.Fprintf(c, "NOT A REQUEST\r\n\r\n"); err != nil {
+				t.Fatal(err)
+			}
+			_, _ = io.Copy(io.Discard, br)
+			if cuts := rec.cuts(); len(cuts) != 0 {
+				t.Errorf("cut lines = %v, want none once the response has ended", cuts)
+			}
 		})
-		_ = c.SetDeadline(time.Now().Add(5 * time.Second))
-		br := bufio.NewReader(c)
-		if _, err := fmt.Fprintf(c, "GET /v2/team/app/manifests/v1 HTTP/1.1\r\nHost: registry.test\r\n\r\n"); err != nil {
-			t.Fatal(err)
-		}
-		resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodGet})
-		if err != nil {
-			t.Fatalf("GET: %v", err)
-		}
-		_, _ = io.Copy(io.Discard, resp.Body)
-		_ = resp.Body.Close()
-		// The response has ended. The server's refusal of the malformed
-		// next request is written outside any response the relay serves,
-		// and here it times out.
-		// net/http sets StateIdle on the serve goroutine before it reads
-		// the next request, so the refusal below always follows it.
-		fc.fail.Store(true)
-		if _, err := fmt.Fprintf(c, "NOT A REQUEST\r\n\r\n"); err != nil {
-			t.Fatal(err)
-		}
-		_, _ = io.Copy(io.Discard, br)
-		if cuts := rec.cuts(); len(cuts) != 0 {
-			t.Errorf("cut lines = %v, want none once the response has ended", cuts)
-		}
 	})
 
 	// bound wires a cut watch, a limitConn over a conn whose writes time

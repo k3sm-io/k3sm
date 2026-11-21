@@ -25,12 +25,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -46,16 +46,40 @@ var (
 // dripLen is the length of the blob the registry sends one byte at a time.
 const dripLen = 20
 
-// stallRegistry serves bigBlob as far more bytes than any socket buffers, and
-// dripBlob one byte per 100 ms.
-func stallRegistry() http.Handler {
+// dripGap is how long the test holds each dripped byte before reading it.
+const dripGap = 100 * time.Millisecond
+
+// bigLen is the length of bigBlob: far more than every buffer between the
+// registry and the peer holds, so a peer that stops reading stalls a write.
+const bigLen = 1 << 20
+
+// stallRegistry serves bigBlob and dripBlob. Each sends its headers at once
+// and then waits on drip before any body: one value releases all of bigBlob,
+// and each value releases one byte of dripBlob. Sending the headers first lets
+// the proxy's header flush, which shares a lock with its body writes, finish
+// before the first body write can block on a peer that is not reading; a
+// goroutine waiting on that lock would stop the bubble's clock.
+func stallRegistry(drip <-chan struct{}) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rc := http.NewResponseController(w)
+		next := func() bool {
+			select {
+			case <-drip:
+				return true
+			case <-r.Context().Done():
+				return false
+			}
+		}
 		switch r.URL.Path {
 		case bigBlob:
-			w.Header().Set("Content-Length", strconv.Itoa(256<<20))
+			w.Header().Set("Content-Length", strconv.Itoa(bigLen))
 			w.WriteHeader(http.StatusOK)
+			_ = rc.Flush()
+			if !next() {
+				return
+			}
 			chunk := make([]byte, 32<<10)
-			for range (256 << 20) / len(chunk) {
+			for range bigLen / len(chunk) {
 				if _, err := w.Write(chunk); err != nil {
 					return
 				}
@@ -63,13 +87,15 @@ func stallRegistry() http.Handler {
 		case dripBlob:
 			w.Header().Set("Content-Length", strconv.Itoa(dripLen))
 			w.WriteHeader(http.StatusOK)
-			rc := http.NewResponseController(w)
+			_ = rc.Flush()
 			for range dripLen {
+				if !next() {
+					return
+				}
 				if _, err := w.Write([]byte{'x'}); err != nil {
 					return
 				}
 				_ = rc.Flush()
-				time.Sleep(100 * time.Millisecond)
 			}
 		default:
 			w.WriteHeader(http.StatusOK)
@@ -77,35 +103,26 @@ func stallRegistry() http.Handler {
 	})
 }
 
-// dialTCP opens a real loopback TCP connection and hands its server end to the
-// relay as a connection from src, so the kernel's socket buffers sit between
-// the relay and the peer as they do in production.
-func (f *relayLimitFixture) dialTCP(t *testing.T, src string) net.Conn {
+// dial opens an in-memory connection and hands its server end to the relay as
+// a connection from src. A net.Pipe buffers nothing, so a peer that stops
+// reading blocks the relay's next write at once, and inside a synctest bubble
+// only the relay's own deadline, on the bubble's clock, can end that write.
+func (f *relayLimitFixture) dial(t *testing.T, src string) net.Conn {
 	t.Helper()
-	return f.dialTCPWith(t, src, func(c net.Conn) net.Conn { return c })
+	return f.dialWith(t, src, func(c net.Conn) net.Conn { return c })
 }
 
-// dialTCPWith is dialTCP with the relay's end of the connection passed through
-// wrap first, so the test owns the exact conn the relay sees.
-func (f *relayLimitFixture) dialTCPWith(t *testing.T, src string, wrap func(net.Conn) net.Conn) net.Conn {
+// dialWith is dial with the relay's end of the connection passed through wrap
+// first, so the test owns the exact conn the relay sees.
+func (f *relayLimitFixture) dialWith(t *testing.T, src string, wrap func(net.Conn) net.Conn) net.Conn {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	c, err := net.Dial("tcp", ln.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	s, err := ln.Accept()
-	if err != nil {
-		t.Fatal(err)
-	}
+	c, s := net.Pipe()
 	remote := net.TCPAddrFromAddrPort(netip.AddrPortFrom(netip.MustParseAddr(src), uint16(40000+srcPort.Add(1)%20000)))
+	bound := time.NewTimer(stallWindow)
+	defer bound.Stop()
 	select {
 	case f.front.conns <- srcConn{Conn: wrap(s), remote: remote}:
-	case <-time.After(3 * time.Second):
+	case <-bound.C:
 		t.Fatal("the relay did not accept the connection")
 	}
 	t.Cleanup(func() { _ = c.Close() })
@@ -113,13 +130,17 @@ func (f *relayLimitFixture) dialTCPWith(t *testing.T, src string, wrap func(net.
 }
 
 // tryGet sends one GET from src on a fresh connection and reports its status,
-// or the error that ended it.
+// or the error that ended it. A connection past the source's share is closed
+// by the relay on accept, which fails the write or the read. A served probe
+// closes its own end and waits for the bubble to settle, so the relay has
+// closed the probe's connection, and freed its slot, when tryGet returns. It
+// must run in a synctest bubble.
 func (f *relayLimitFixture) tryGet(t *testing.T, src, target string) (int, error) {
 	t.Helper()
-	c := f.dialTCP(t, src)
+	c := f.dial(t, src)
+	defer synctest.Wait()
 	defer c.Close()
-	_ = c.SetDeadline(time.Now().Add(time.Second))
-	if _, err := fmt.Fprintf(c, "GET %s HTTP/1.1\r\nHost: registry.test\r\nConnection: close\r\n\r\n", target); err != nil {
+	if _, err := fmt.Fprintf(c, "GET %s HTTP/1.1\r\nHost: registry.test\r\n\r\n", target); err != nil {
 		return 0, err
 	}
 	resp, err := http.ReadResponse(bufio.NewReader(c), &http.Request{Method: "GET"})
@@ -131,21 +152,116 @@ func (f *relayLimitFixture) tryGet(t *testing.T, src, target string) (int, error
 	return resp.StatusCode, nil
 }
 
-// awaitSlot polls a fresh GET from src until one is served, and fails the test
-// when none is within budget.
-func (f *relayLimitFixture) awaitSlot(t *testing.T, src string, budget time.Duration) {
+// slotStep is how far awaitSlot moves the bubble's clock between attempts.
+const slotStep = stallWindow / 10
+
+// awaitSlot tries a fresh GET from src, moving the bubble's clock a tenth of
+// a window between attempts, until one is served, and returns how long that
+// took on the bubble's clock. It fails the test once within has passed with
+// none served: the stalled connection still holds the source's only slot.
+func (f *relayLimitFixture) awaitSlot(t *testing.T, src string, within time.Duration) time.Duration {
 	t.Helper()
-	deadline := time.Now().Add(budget)
+	start := time.Now()
 	var last error
-	for time.Now().Before(deadline) {
+	for {
 		code, err := f.tryGet(t, src, "/v2/team/app/manifests/v1")
 		if err == nil && code == http.StatusOK {
-			return
+			return time.Since(start)
 		}
 		last = fmt.Errorf("status %d, err %v", code, err)
-		time.Sleep(50 * time.Millisecond)
+		if time.Since(start) >= within {
+			t.Fatalf("no second connection from %s served within %v of the stall (last: %v): the stalled connection still holds the source's only slot", src, within, last)
+		}
+		advance(t, slotStep)
 	}
-	t.Fatalf("no second connection from %s served within %v of the stall (last: %v): the stalled connection still holds the source's only slot", src, budget, last)
+}
+
+// assertSlotHeld fails the test when a second connection from src is served
+// while the first is stalled, which would leave the slot tests proving
+// nothing.
+func (f *relayLimitFixture) assertSlotHeld(t *testing.T, src string) {
+	t.Helper()
+	if code, err := f.tryGet(t, src, "/v2/team/app/manifests/v1"); err == nil && code == http.StatusOK {
+		t.Fatalf("a second connection from %s was served while the first is stalled: the source's share is not one connection", src)
+	}
+}
+
+// drainPeer reads c until it ends, in the background, as a peer that has stopped
+// sending but still reads would.
+func drainPeer(c net.Conn) { go func() { _, _ = io.Copy(io.Discard, c) }() }
+
+// stallGet sends a GET for bigBlob from src, reads its headers, releases the
+// body on drip, reads its first bytes, and then stops reading without
+// closing. It returns the connection and the reader holding what the peer has
+// buffered.
+func (f *relayLimitFixture) stallGet(t *testing.T, src string, drip chan<- struct{}) (net.Conn, *bufio.Reader) {
+	t.Helper()
+	c := f.dial(t, src)
+	if _, err := fmt.Fprintf(c, "GET %s HTTP/1.1\r\nHost: registry.test\r\n\r\n", bigBlob); err != nil {
+		t.Fatal(err)
+	}
+	br := bufio.NewReaderSize(c, 64)
+	resp, err := http.ReadResponse(br, &http.Request{Method: "GET"})
+	if err != nil {
+		t.Fatalf("stalled GET headers: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stalled GET = %d, want 200", resp.StatusCode)
+	}
+	synctest.Wait()
+	drip <- struct{}{}
+	if _, err := io.ReadFull(resp.Body, make([]byte, 16)); err != nil {
+		t.Fatalf("stalled GET first bytes: %v", err)
+	}
+	return c, br
+}
+
+// dripGet sends a GET for dripBlob from src, reads its headers, and reads the
+// body a byte at a time: the test releases each byte on drip, holds it
+// dripGap unread with the relay's write of it in progress, then reads it. It
+// returns the bytes read and how long that took on the bubble's clock.
+func (f *relayLimitFixture) dripGet(t *testing.T, src string, drip chan<- struct{}) (int, time.Duration) {
+	t.Helper()
+	c := f.dial(t, src)
+	if _, err := fmt.Fprintf(c, "GET %s HTTP/1.1\r\nHost: registry.test\r\nConnection: close\r\n\r\n", dripBlob); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	resp, err := http.ReadResponse(bufio.NewReader(c), &http.Request{Method: "GET"})
+	if err != nil {
+		t.Fatalf("slow GET headers: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("slow GET = %d, want 200", resp.StatusCode)
+	}
+	synctest.Wait()
+	got := 0
+	one := make([]byte, 1)
+	for range dripLen {
+		drip <- struct{}{}
+		advance(t, dripGap)
+		n, err := io.ReadFull(resp.Body, one)
+		got += n
+		if err != nil {
+			t.Fatalf("slow GET body after %d bytes: %v", got, err)
+		}
+	}
+	if n, err := resp.Body.Read(one); n != 0 || !errors.Is(err, io.EOF) {
+		t.Fatalf("slow GET after %d bytes = %d more, %v; want the end of the body", got, n, err)
+	}
+	return got, time.Since(start)
+}
+
+// relayBubble runs f in a synctest bubble. Its last cleanup, after every
+// fixture's, moves the bubble's clock past the pause net/http takes before it
+// closes a connection it answered with Connection: close, so that goroutine
+// ends inside the bubble rather than outliving the test.
+func relayBubble(t *testing.T, f func(t *testing.T)) {
+	t.Helper()
+	synctest.Test(t, func(t *testing.T) {
+		t.Cleanup(func() { advance(t, time.Second) })
+		f(t)
+	})
 }
 
 func stallLimits() relayLimits {
@@ -157,91 +273,60 @@ func stallLimits() relayLimits {
 	return lim
 }
 
-// TestRelayStalledReaderFreesItsSlot is the gate for B1564: a peer that opens a
-// blob GET and stops reading loses its connection, and its per-source slot,
-// within a few progress windows, while a peer that is slow but keeps reading
-// is served in full however long that takes.
+// TestRelayStalledReaderFreesItsSlot is the gate for a stalled relay
+// connection: a peer that opens a blob GET and stops reading loses its
+// connection, and its per-source slot, within a few progress windows, while a
+// peer that is slow but keeps reading is served in full however long that
+// takes. Every case runs in a synctest bubble over in-memory connections, so
+// the windows pass on the bubble's clock.
 func TestRelayStalledReaderFreesItsSlot(t *testing.T) {
 	const peerA = "100.64.1.1"
-	// Only the upper bound is widened: a larger budget cannot make a red test green, because a slot that never frees still fails.
-	budget := 10*stallWindow + 2*time.Second
+	within := 3 * stallWindow
 
 	t.Run("a stalled reader is cut and its slot freed", func(t *testing.T) {
-		f := newRelayLimitFixtureWith(t, stallLimits(), stallRegistry())
-		c := f.dialTCP(t, peerA)
-		_ = c.SetDeadline(time.Now().Add(5 * time.Second))
-		if _, err := fmt.Fprintf(c, "GET %s HTTP/1.1\r\nHost: registry.test\r\n\r\n", bigBlob); err != nil {
-			t.Fatal(err)
-		}
-		br := bufio.NewReaderSize(c, 64)
-		resp, err := http.ReadResponse(br, &http.Request{Method: "GET"})
-		if err != nil {
-			t.Fatalf("stalled GET headers: %v", err)
-		}
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("stalled GET = %d, want 200", resp.StatusCode)
-		}
-		if _, err := io.ReadFull(resp.Body, make([]byte, 16)); err != nil {
-			t.Fatalf("stalled GET first bytes: %v", err)
-		}
-		// Stop reading, without closing.
-		f.awaitSlot(t, peerA, budget)
-		// The stalled connection was closed by the relay: what the kernel
-		// buffered drains, then the stream ends rather than timing out.
-		_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
-		_, err = io.Copy(io.Discard, br)
-		var ne net.Error
-		if errors.As(err, &ne) && ne.Timeout() {
-			t.Errorf("stalled connection: drain timed out, want it closed by the relay")
-		}
+		relayBubble(t, func(t *testing.T) {
+			drip := make(chan struct{})
+			f := newRelayLimitFixtureWith(t, stallLimits(), stallRegistry(drip))
+			c, br := f.stallGet(t, peerA, drip)
+			// Stop reading, without closing.
+			f.assertSlotHeld(t, peerA)
+			f.awaitSlot(t, peerA, within)
+			// The stalled connection was closed by the relay: what the
+			// peer buffered drains, then the stream ends.
+			_, err := io.Copy(io.Discard, br)
+			if err != nil {
+				t.Errorf("stalled connection: drain = %v, want it closed by the relay", err)
+			}
+			_ = c.Close()
+		})
 	})
 
 	t.Run("slow but moving reader is not cut", func(t *testing.T) {
-		f := newRelayLimitFixtureWith(t, stallLimits(), stallRegistry())
-		c := f.dialTCP(t, peerA)
-		_ = c.SetDeadline(time.Now().Add(10 * time.Second))
-		if _, err := fmt.Fprintf(c, "GET %s HTTP/1.1\r\nHost: registry.test\r\nConnection: close\r\n\r\n", dripBlob); err != nil {
-			t.Fatal(err)
-		}
-		br := bufio.NewReader(c)
-		resp, err := http.ReadResponse(br, &http.Request{Method: "GET"})
-		if err != nil {
-			t.Fatalf("slow GET headers: %v", err)
-		}
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("slow GET = %d, want 200", resp.StatusCode)
-		}
-		start := time.Now()
-		got := 0
-		one := make([]byte, 1)
-		for {
-			n, err := resp.Body.Read(one)
-			got += n
-			if err != nil {
-				if !errors.Is(err, io.EOF) {
-					t.Fatalf("slow GET body after %d bytes: %v", got, err)
-				}
-				break
+		relayBubble(t, func(t *testing.T) {
+			drip := make(chan struct{})
+			f := newRelayLimitFixtureWith(t, stallLimits(), stallRegistry(drip))
+			got, el := f.dripGet(t, peerA, drip)
+			if got != dripLen {
+				t.Errorf("slow GET body = %d bytes, want %d", got, dripLen)
 			}
-			time.Sleep(100 * time.Millisecond)
-		}
-		if got != dripLen {
-			t.Errorf("slow GET body = %d bytes, want %d", got, dripLen)
-		}
-		if el := time.Since(start); el < 3*stallWindow {
-			t.Errorf("slow GET took %v, want longer than three windows for the test to mean anything", el)
-		}
+			if el < 3*stallWindow {
+				t.Errorf("slow GET took %v, want longer than three windows for the test to mean anything", el)
+			}
+		})
 	})
 
 	t.Run("a request body that never arrives is cut and its slot freed", func(t *testing.T) {
-		f := newRelayLimitFixtureWith(t, stallLimits(), stallRegistry())
-		c := f.dialTCP(t, peerA)
-		_ = c.SetDeadline(time.Now().Add(5 * time.Second))
-		if _, err := fmt.Fprintf(c, "POST /v2/team/app/blobs/uploads/ HTTP/1.1\r\nHost: registry.test\r\nContent-Length: 10\r\n\r\n"); err != nil {
-			t.Fatal(err)
-		}
-		// Send no body and never close.
-		f.awaitSlot(t, peerA, budget)
+		relayBubble(t, func(t *testing.T) {
+			f := newRelayLimitFixtureWith(t, stallLimits(), stallRegistry(nil))
+			c := f.dial(t, peerA)
+			if _, err := fmt.Fprintf(c, "POST /v2/team/app/blobs/uploads/ HTTP/1.1\r\nHost: registry.test\r\nContent-Length: 10\r\n\r\n"); err != nil {
+				t.Fatal(err)
+			}
+			// Send no body and never close; read whatever comes back.
+			drainPeer(c)
+			f.assertSlotHeld(t, peerA)
+			f.awaitSlot(t, peerA, within)
+		})
 	})
 
 	// The response is chunked because the gate's proxy flushes each body
@@ -249,62 +334,71 @@ func TestRelayStalledReaderFreesItsSlot(t *testing.T) {
 	// body is all out before done runs, and only the chunk terminator is left
 	// for the server's own final flush.
 	t.Run("the final flush is cut when the reader has stopped", func(t *testing.T) {
-		var g *gateConn
-		var returned atomic.Bool
-		var returnedAt time.Time
-		registry := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path != tailBlob {
-				w.WriteHeader(http.StatusOK)
-				return
+		relayBubble(t, func(t *testing.T) {
+			var g *gateConn
+			var returned atomic.Bool
+			var returnedAt time.Time
+			release := make(chan struct{})
+			registry := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != tailBlob {
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+				defer func() {
+					returnedAt = time.Now()
+					returned.Store(true)
+				}()
+				g.engage()
+				_, _ = w.Write(make([]byte, 1000))
+				_ = http.NewResponseController(w).Flush()
+				<-release
+			})
+			f := newRelayLimitFixtureWith(t, stallLimits(), registry)
+			c := f.dialWith(t, peerA, func(c net.Conn) net.Conn {
+				g = newGateConn(c)
+				return g
+			})
+			if _, err := fmt.Fprintf(c, "GET %s HTTP/1.1\r\nHost: registry.test\r\n\r\n", tailBlob); err != nil {
+				t.Fatal(err)
 			}
-			defer func() {
-				returnedAt = time.Now()
-				returned.Store(true)
-			}()
-			g.engage()
-			_, _ = w.Write(make([]byte, 1000))
-			_ = http.NewResponseController(w).Flush()
-			time.Sleep(stallWindow / 2)
+			br := bufio.NewReader(c)
+			resp, err := http.ReadResponse(br, &http.Request{Method: "GET"})
+			if err != nil {
+				t.Fatalf("tail GET headers: %v", err)
+			}
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("tail GET = %d, want 200", resp.StatusCode)
+			}
+			if _, err := io.ReadFull(resp.Body, make([]byte, 1000)); err != nil {
+				t.Fatalf("tail GET body: %v", err)
+			}
+			// The registry holds the response open half a window after its
+			// last write, then returns; the peer reads no more.
+			advance(t, stallWindow/2)
+			close(release)
+			var h gateHold
+			bound := time.NewTimer(within)
+			select {
+			case h = <-g.held:
+				bound.Stop()
+			case <-bound.C:
+				t.Fatal("the relay never wrote the chunk terminator")
+			}
+			if !returned.Load() {
+				t.Fatal("the relay wrote the chunk terminator before the registry's handler returned")
+			}
+			if h.deadline.IsZero() {
+				t.Fatal("the final flush ran with no write deadline: a peer that stops reading there holds its slot for good")
+			}
+			const eps = 50 * time.Millisecond
+			if want := returnedAt.Add(stallWindow - eps); h.deadline.Before(want) {
+				t.Errorf("the final flush's write deadline is %v, want no earlier than %v (handler return plus a window)", h.deadline, want)
+			}
+			f.awaitSlot(t, peerA, within)
+			if n, err := resp.Body.Read(make([]byte, 1)); n != 0 || errors.Is(err, io.EOF) || err == nil {
+				t.Errorf("tail GET after the body = %d bytes, %v; want the stream cut before the chunk terminator", n, err)
+			}
 		})
-		f := newRelayLimitFixtureWith(t, stallLimits(), registry)
-		c := f.dialTCPWith(t, peerA, func(c net.Conn) net.Conn {
-			g = newGateConn(c)
-			return g
-		})
-		_ = c.SetDeadline(time.Now().Add(5 * time.Second))
-		if _, err := fmt.Fprintf(c, "GET %s HTTP/1.1\r\nHost: registry.test\r\n\r\n", tailBlob); err != nil {
-			t.Fatal(err)
-		}
-		var h gateHold
-		select {
-		case h = <-g.held:
-		case <-time.After(5 * time.Second):
-			t.Fatal("the relay never wrote the response")
-		}
-		if !returned.Load() {
-			t.Fatal("the relay wrote the chunk terminator before the registry's handler returned")
-		}
-		if h.deadline.IsZero() {
-			t.Fatal("the final flush ran with no write deadline: a peer that stops reading there holds its slot for good")
-		}
-		const eps = 50 * time.Millisecond
-		if want := returnedAt.Add(stallWindow - eps); h.deadline.Before(want) {
-			t.Errorf("the final flush's write deadline is %v, want no earlier than %v (handler return plus a window)", h.deadline, want)
-		}
-		f.awaitSlot(t, peerA, budget)
-		resp, err := http.ReadResponse(bufio.NewReader(c), &http.Request{Method: "GET"})
-		if err != nil {
-			t.Fatalf("tail GET headers: %v", err)
-		}
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("tail GET = %d, want 200", resp.StatusCode)
-		}
-		if _, err := io.ReadFull(resp.Body, make([]byte, 1000)); err != nil {
-			t.Fatalf("tail GET body: %v", err)
-		}
-		if n, err := resp.Body.Read(make([]byte, 1)); n != 0 || errors.Is(err, io.EOF) || err == nil {
-			t.Errorf("tail GET after the body = %d bytes, %v; want the stream cut before the chunk terminator", n, err)
-		}
 	})
 
 	// The server flushes the response's buffered tail after the handler
@@ -338,11 +432,10 @@ func TestRelayStalledReaderFreesItsSlot(t *testing.T) {
 	})
 }
 
-// gateConn is the relay's end of a connection that, once engaged, holds the
-// chunk terminator's Write until the write deadline in force passes, as a peer
-// that has stopped reading would, and records what it saw. Every other Write
-// goes through. A 3 s safety release bounds
-// the hold when no deadline is set, so a regression fails instead of hanging.
+// gateConn is the relay's end of a connection that, once engaged, records the
+// write deadline in force when the chunk terminator is written and reports it
+// on held. The write itself goes through to the pipe, which blocks while the
+// peer is not reading, so only that deadline ends it.
 type gateConn struct {
 	net.Conn
 	mu       sync.Mutex
@@ -351,7 +444,7 @@ type gateConn struct {
 	held     chan gateHold
 }
 
-// gateHold is what gateConn saw at the Write it held.
+// gateHold is what gateConn saw at the chunk terminator's Write.
 type gateHold struct {
 	deadline time.Time
 }
@@ -373,22 +466,14 @@ func (g *gateConn) SetWriteDeadline(t time.Time) error {
 
 func (g *gateConn) Write(b []byte) (int, error) {
 	g.mu.Lock()
-	if !g.engaged || string(b) != "0\r\n\r\n" {
-		g.mu.Unlock()
-		return g.Conn.Write(b)
+	if g.engaged && string(b) == "0\r\n\r\n" {
+		select {
+		case g.held <- gateHold{deadline: g.deadline}:
+		default:
+		}
 	}
-	h := gateHold{deadline: g.deadline}
 	g.mu.Unlock()
-	select {
-	case g.held <- h:
-	default:
-	}
-	wait := 3 * time.Second
-	if !h.deadline.IsZero() {
-		wait = min(wait, time.Until(h.deadline))
-	}
-	time.Sleep(wait)
-	return 0, os.ErrDeadlineExceeded
+	return g.Conn.Write(b)
 }
 
 // deadlineRecorder is a ResponseWriter that records the write deadlines set on
