@@ -609,8 +609,10 @@ func TestRewrapRefusesWhileUserScopesExist(t *testing.T) {
 			if !errors.Is(err, ErrScopeUnsupported) {
 				t.Fatalf("Rewrap with %s present: %v, want ErrScopeUnsupported", userScopesName, err)
 			}
-			if !strings.Contains(err.Error(), "upgrade k3sm") {
-				t.Fatalf("Rewrap refusal %q does not say to upgrade k3sm", err)
+			for _, want := range []string{"upgrade k3sm", "keystore/" + userScopesName, "root must remove it", filepath.Join(server, "keystore", userScopesName)} {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("Rewrap refusal %q does not say %q", err, want)
+				}
 			}
 			checkTreeUnchanged(t, snap, treeSnapshot(t, filepath.Dir(server)))
 			checkRewrapValues(t, s, vals)

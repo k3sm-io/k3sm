@@ -407,7 +407,8 @@ reserved for user scopes too, and nothing creates it yet. The first-Put mint cou
 entry, whatever its type, so a missing master with only `.user` present is
 `ErrMasterMissing`, never a new master. Rewrap refuses with `ErrScopeUnsupported`, writing
 nothing, while `.user` exists, whatever its type: this build cannot re-wrap user scopes, and a
-master rewrapped under them would leave them unreadable. A user scope's store, its own key wrapped by the master, its
+master rewrapped under them would leave them unreadable. The refusal names the reserved path,
+and says that a `.user` that is not a user scope must be removed by root. A user scope's store, its own key wrapped by the master, its
 non-root API, RBAC, delivery and on-disk location are a later design; the scope is in the
 format now so that adding one needs no format change.
 

@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -173,7 +174,7 @@ func resumed(live keys, newMaster []byte) error {
 func refuseUserScopes(root *os.Root) error {
 	_, err := root.Lstat(userScopesName)
 	if err == nil {
-		return ErrScopeUnsupported
+		return fmt.Errorf("%w (%s)", ErrScopeUnsupported, filepath.Join(root.Name(), userScopesName))
 	}
 	if !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("check for %s: %w", userScopesName, err)
