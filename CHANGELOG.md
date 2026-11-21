@@ -293,10 +293,6 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
   user's group, so a user could hard-link a node file into a read-write host share where a Pod
   could rewrite it. An existing node tightens at its next install or netd helper start. See
   [Install](docs/user/install.md).
-- A push through a node's registry gate whose local registry accepts the connection but never
-  answers now gets a 502 `UNAVAILABLE` after 30 seconds without response headers, instead of
-  waiting until the client gives up, and the gate logs it at Warn. A pull that cannot reach the
-  local registry is now logged at Warn too, rather than only at Debug.
 - When a node's local registry accepts a connection but never answers, a manifest push through the
   push gate now gets a 502 `UNAVAILABLE` after 15 minutes without response headers, instead of
   waiting until the client gives up. Retry the push. A manifest push gets that long because the
