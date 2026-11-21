@@ -1133,6 +1133,21 @@ The `scope.key` record uses the Phase A encoding with AAD scope `user/<uid>`, na
 version equal to the key epoch (1), and **generation equal to the account's 16-byte
 GeneratedUID**.
 
+The `deliveries` record uses the same encoding with AAD scope `user/<uid>`, kind 0xFD, name
+`deliveries`, generation equal to the scope's bound GeneratedUID (the generation of its
+`scope.key`), and version equal to the record's **sequence**. Every write re-seals the whole
+record at the previous sequence plus 1; the empty record the mint writes is sequence 1.
+
+- *Its floor key.* The record's floor line is `(user/<uid>, .deliveries, generation, seq)`.
+  `.deliveries` is no valid entry name (a leading dot is an empty label), so the key never
+  collides with an entry named `deliveries` (U63).
+- *Write order.* The record, then its floor line, as for an entry's pointer ("The user-scope
+  floor"). A crash between the two leaves the floor one behind, which is accepted.
+- *Read.* A reader refuses a record whose sequence is below the floor's for its generation,
+  with the user-scope floor message, wrapping `ErrCorrupt`. So a copied-back older record,
+  which could still list a withdrawn UID as recorded, is refused, and the reconciler reads the
+  refusal as `Indeterminate` (U88).
+
 - **The GeneratedUID binding** closes a recycled uid. Before trusting `scope.key`, the store
   reads the uid's live GeneratedUID with `mbr_uid_to_uuid` and refuses with
   `ErrScopeOwnerChanged` when it differs from the record's generation. A deleted account whose
@@ -1279,6 +1294,20 @@ service user can only add to.
   `ErrCorrupt` and is never turned into `ErrNotFound`, which the reconciler would read as a
   deletion. A directory with no `generation` file is the shape a crashed put leaves before
   its first step and gets no line (U25).
+- **Rebuild never lowers.** Rebuild opens every scope under `.user/` before it writes the new
+  file's first line, and a line it cannot write is a floor it would lower:
+  - *An unopenable scope refuses the rebuild.* If any scope fails to open for a reason that is
+    not definitive (`ErrScopeOwnerUnknown`, a GeneratedUID lookup past its deadline, `ErrBusy`)
+    or for any other error but an owner change, rebuild refuses to finish and names the scope.
+    It refuses before it touches the old file, so it changes nothing: it unlinks its staging
+    file, leaves the old log as it was and removes the marker.
+  - *An owner-changed scope is still rebuilt.* On `ErrScopeOwnerChanged` rebuild reads the
+    scope's pointers and its `deliveries` record under `W` without the GeneratedUID check, as
+    the reconciler reads such a record ("An owner change still finds its targets"), and writes
+    their lines, so its floor is kept until root removes the scope.
+  - *The `deliveries` record gets its line.* For each scope rebuild writes the line for the key
+    `(user/<uid>, .deliveries, generation, seq)` with the record's authenticated sequence ("Key
+    hierarchy"), so a copied-back older record is refused after a rebuild as before it (U88).
 - **A flagged file is never renamed, and nothing is renamed over one.** The rig spike measured
   that root's rename over an `sappnd` target fails with `EPERM` and leaves it in place, and
   that the service user cannot rename a flagged file away either (`EPERM`); root can clear
@@ -2609,6 +2638,7 @@ each stated in the change that makes it. U15 is held for a K0 amendment and U39 
 | U85 | a reconciler line charged to no uid (a forged-Secret `refused` line, a drift repair, their summaries) draws on the reconciler budget, 1 MiB per log, separate from every uid and excluded from the hard-cap test; forged Secrets are counted in a bounded LRU of 1024 (namespace, name) pairs with no per-`resourceVersion` set, new pairs' lines at most 10 a minute and at most one summary `refused` line a minute carrying the dropped count; past the budget the lines are dropped and counted and `doctor` warns; N forged updates leave every uid able to read and mutate | `k3sm/pkg/keystore/reconcile::TestForgedSecretFloodLeavesEveryUIDServed`, `TestUnchargedLinesHaveOwnBudget` | pending: the KeyDelivery reconciler (lifecycle) |
 | U86 | a drift repair (the reconciler re-creating or repairing a delivered Secret that someone other than the reconciler edited or deleted, at the version already delivered) is reconciler-class: it draws on the reconciler budget and is never charged to the owner's share or budgets; repairs are coalesced to one audit line per delivery per 10 minutes with a count, and rate-limited per delivery with exponential backoff capped at 10 minutes; a write of a new version after the owner's own `rotate` or `put` stays charged to the owner | `k3sm/pkg/keystore/reconcile::TestDriftRepairNotChargedToOwner` | pending: the KeyDelivery reconciler (lifecycle) |
 | U87 | the admission policy also matches UPDATE and DELETE of `keydeliveries` and admits one only when the requester equals `oldObject.spec.requestedBy`, is the k3sm server's identity, or is in `system:masters` (and, for DELETE only, the namespace controller's ServiceAccount); a finalizer edit is an UPDATE, so another author can neither delete the object nor strip its finalizer; the reconciler's and `withdraw`'s own writes pass; on a DELETE `object` is null and only `oldObject` is read; `failurePolicy` is `Fail` | `k3sm/pkg/policy::TestVAPRefusesDeleteByOtherAuthor`, `TestVAPRefusesFinalizerStripByOtherAuthor`; rig leg E23 | pending: KeyDelivery authoring |
+| U88 | `floor --rebuild` never lowers: if any scope fails to open for a non-definitive reason (`ErrScopeOwnerUnknown`, a lookup past its deadline, `ErrBusy`) or any error but an owner change, it refuses to finish, names the scope and changes nothing; an owner-changed scope is rebuilt from its pointers read under `W` without the GeneratedUID check; the `deliveries` record's AAD is scope, kind 0xFD, name `deliveries`, generation and sequence, its floor key is `(user/<uid>, .deliveries, generation, seq)`, and the rebuild writes that key's line; a copied-back older `deliveries` record is refused against the floor, before and after a rebuild | `k3sm/cmd/k3sm::TestRebuildRefusesOnUnopenableScope`, `k3sm/pkg/keystore::TestCopiedBackDeliveriesRecordRefused` | pending: the append-only files |
 
 ### Rig legs
 

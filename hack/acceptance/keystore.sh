@@ -36,7 +36,7 @@
 #   --scope         user scopes: U6 to U11, U47, U58, U64, U66.
 #   --scope-store   the user-scope store: U12 to U14, U63.
 #   --files         the append-only files: U20 to U25, U50, U52, U60, U61, U68,
-#                   U80, and in the helper variant only U70, U71.
+#                   U80, U88, and in the helper variant only U70, U71.
 #   --socket        the socket listener: U26 to U31, U46, U48, U54, U82.
 #   --socket-ops    the socket operations: U32 to U35, U45, U51, U67, U84.
 #   --exec          the non-root CLI and exec: U36 to U38, U69.
@@ -108,7 +108,7 @@ EXPECTED_ROWS="$EXPECTED_ROWS U58 U59 U60 U61 U62 U63"
 EXPECTED_ROWS="$EXPECTED_ROWS U64 U65 U66 U67 U68 U69 U70 U71"
 EXPECTED_ROWS="$EXPECTED_ROWS U72 U73 U74 U75 U76"
 EXPECTED_ROWS="$EXPECTED_ROWS U77 U78 U79 U80 U81 U82 U83 U84"
-EXPECTED_ROWS="$EXPECTED_ROWS U85 U86 U87"
+EXPECTED_ROWS="$EXPECTED_ROWS U85 U86 U87 U88"
 # >>> ADD NEW U ROWS (U64 upward) HERE <<<
 EXPECTED_ROWS="$EXPECTED_ROWS E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 E13 E14 E15 E16 E17 E18 E19 E20"
 EXPECTED_ROWS="$EXPECTED_ROWS E21 E22 E23 E24 E25"
@@ -139,7 +139,7 @@ mode_rows() {
 	api) echo "U18 U19" ;;
 	scope) echo "U6 U7 U8 U9 U10 U11 U47 U58 U64 U66" ;;
 	scope-store) echo "U12 U13 U14 U63" ;;
-	files) echo "U20 U21 U22 U23 U24 U25 U50 U52 U60 U61 U68 U70 U71 U80" ;;
+	files) echo "U20 U21 U22 U23 U24 U25 U50 U52 U60 U61 U68 U70 U71 U80 U88" ;;
 	socket) echo "U26 U27 U28 U29 U30 U31 U46 U48 U54 U82" ;;
 	socket-ops) echo "U32 U33 U34 U35 U45 U51 U67 U84" ;;
 	exec) echo "U36 U37 U38 U69" ;;
@@ -553,6 +553,8 @@ pend U86 "a drift repair (the reconciler re-creating or repairing a delivered Se
 	k3sm/pkg/keystore/reconcile::TestDriftRepairNotChargedToOwner
 pend U87 "the admission policy also matches UPDATE and DELETE of keydeliveries and admits one only when the requester equals oldObject.spec.requestedBy, is the k3sm server's identity, or is in system:masters (and, for DELETE only, the namespace controller's ServiceAccount); a finalizer edit is an UPDATE, so another author can neither delete the object nor strip its finalizer; the reconciler's and withdraw's own writes pass; on a DELETE object is null and only oldObject is read; failurePolicy is Fail; rig leg E23 (KeyDelivery authoring)" \
 	k3sm/pkg/policy::TestVAPRefusesDeleteByOtherAuthor TestVAPRefusesFinalizerStripByOtherAuthor
+pend U88 "floor --rebuild never lowers: if any scope fails to open for a non-definitive reason (ErrScopeOwnerUnknown, a lookup past its deadline, ErrBusy) or any error but an owner change, it refuses to finish, names the scope and changes nothing; an owner-changed scope is rebuilt from its pointers read under W without the GeneratedUID check; the deliveries record's AAD is scope, kind 0xFD, name deliveries, generation and sequence, its floor key is (user/<uid>, .deliveries, generation, seq), and the rebuild writes that key's line; a copied-back older deliveries record is refused against the floor, before and after a rebuild (append-only files)" \
+	k3sm/cmd/k3sm::TestRebuildRefusesOnUnopenableScope k3sm/pkg/keystore::TestCopiedBackDeliveriesRecordRefused
 # >>> ADD NEW U ROWS (U64 upward) HERE, and add each to EXPECTED_ROWS and to mode_rows <<<
 
 leg E1 "files" "preconditions: secrets encryption on; one server; keystore-run/ and both logs present, service-user 0600, SF_APPEND set; the doctor user-scope row on; keystore.sh --check exits 0 on the build" "the append-only files"
@@ -707,7 +709,11 @@ U87|a finalizer edit is an UPDATE
 U87|on a DELETE object is null
 E23|refused at admission
 U55|without the GeneratedUID check only to find recorded targets
-U55|never delivers, rotates or opens an entry"
+U55|never delivers, rotates or opens an entry
+U88|never lowers
+U88|refuses to finish, names the scope and changes nothing
+U88|(user/<uid>, .deliveries, generation, seq)
+U88|a copied-back older deliveries record is refused"
 
 # --listed: the row-presence lint.
 if [ "$mode" = listed ]; then
