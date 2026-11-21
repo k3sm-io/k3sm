@@ -1213,8 +1213,16 @@ Rewrap's two-phase procedure with one class of record: each `scope.key`, re-seal
 new `W`. User records stay sealed under their `K_u`, byte for byte unchanged, and the run is
 resumable at every step as G12 requires (U12). Until that change, Rewrap refuses with
 `ErrScopeUnsupported` while a `.user` directory exists (U5), which is what keeps a rollback
-to an earlier build from orphaning user scopes. A per-user re-key (a new `K_u`, re-sealing that
-user's records) is not part of this design.
+to an earlier build from orphaning user scopes.
+
+**Rewrap does not re-key `K_u`.** It re-seals each `scope.key` under the new `W`, but the
+`K_u` inside is the same 32 bytes, and every user record stays sealed under it. So an old master
+together with an old copy of a `scope.key` still opens that user's records, old and new
+(residual 15). A per-user re-key (a new `K_u`, re-sealing that user's records) is a non-goal
+for this release. Because of that, `sudo k3sm keys rewrap` prints a warning whenever `.user/`
+exists, before it starts and again when it finishes: Rewrap does not protect the user scopes
+against an exposed master, and the documented procedure after a suspected master exposure is
+that each user re-puts their values, with new credentials from each value's issuer (U101).
 
 ### Quotas
 
@@ -2621,11 +2629,17 @@ the uid throughout.
     ClusterRoleBindings naming `k3sm:local:<uid>` stay and grant the new account what the old
     one had, until root removes them; `rm-scope` lists them and refuses while any exist,
     unless `--keep-bindings` is given.
+15. Rewrap does not re-key `K_u`. Someone who holds an old master and an old copy of a user's
+    `scope.key` (a backup, a disk image) can still open that user's records after a Rewrap,
+    including values stored since. The only remedy in this release is the documented one: after
+    a suspected master exposure each user re-puts their values with new credentials, and
+    `rewrap` warns whenever user scopes exist.
 
 ### What the user scope does not do
 
 Phase B direct mounts; a ServiceAccount rotate transport, deferred to a new endpoint with its
-own design; grants of system entries to non-root users; a per-user re-key of `K_u`; a per-user
+own design; grants of system entries to non-root users; a per-user re-key of `K_u` in this
+release (residual 15); a per-user
 kubeconfig or any Kubernetes identity for local users (the socket is the path); the user scope
 on a worker node or across several servers; a hash chain on the audit log; un-sharing a value
 a Pod already read; a hardware-backed master; a `k3sm status` field or app change (the `doctor`
@@ -2829,6 +2843,7 @@ record below.
 | U98 | the sealed `deliveries` record stores each delivery's KeyDelivery `metadata.name`; the orphan sweep checks the object with a live Get by that name sent to the API server, never an informer cache and never a List; not found, or another UID, deletes only on two consecutive observations at least 60 s apart, and any other answer in between resets the count; no sweep runs before the KeyDelivery and Secret informers sync | `k3sm/pkg/keystore/reconcile::TestOrphanSweepUsesLiveGetByName`, `TestOrphanSweepNeedsTwoObservations` | pending: the KeyDelivery reconciler (lifecycle) |
 | U99 | under the store lock, before every audit or floor append, the server compares its descriptor's `(dev, ino)` with the canonical name's and reopens on a mismatch, recounting the per-uid shares from the new file; `audit --rotate` and `floor --rebuild` each complete while the server never saw the marker, and every later line lands in the new canonical file, none in an archive or an unlinked file (seam: chflags flag source) | `k3sm/pkg/keystore/socket::TestAppendReopensOnInodeMismatch` | pending: the append-only files |
 | U100 | a departed account with an unreused uid is reported, not acted on: `doctor` lists every scope whose uid has no directory record (a synthesized GeneratedUID) with its delivery count; each of that scope's deliveries gets `SecretRetained=True` with reason `OwnerUnresolvable`, and no Secret is deleted (seam: GeneratedUID lookup) | `k3sm/cmd/k3sm::TestDoctorListsUnresolvableScopes`, `k3sm/pkg/keystore/reconcile::TestOwnerUnresolvableRetainedCondition` | pending: the KeyDelivery reconciler (lifecycle) |
+| U101 | `rewrap` prints a warning whenever `.user/` exists, before it starts and when it finishes, saying Rewrap does not re-key `K_u` and naming the procedure: each user re-puts their values after a suspected master exposure; with no `.user/` it prints none (seam: euid source) | `k3sm/cmd/k3sm::TestRewrapWarnsWhenUserScopesExist` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
 
 ### Rig legs
 

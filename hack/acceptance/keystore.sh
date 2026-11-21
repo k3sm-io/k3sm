@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # The keystore's acceptance gate: docs/design/keystore.md § "Acceptance gate",
-# rows G1 to G22, the user-scope rows U1 to U100 (U15 and U39 are unused) and
+# rows G1 to G22, the user-scope rows U1 to U101 (U15 and U39 are unused) and
 # the rig legs E1 to E25. Every row is listed, on exactly one line. A row runs
 # the tests that deliver it and passes only if each named test ran and passed
 # in its own package; a row whose change has not landed yet prints PENDING,
@@ -34,7 +34,7 @@
 #   --sandbox       the pod denies and the shared path names: U16, U17, U49.
 #   --api           the KeyDelivery API types: U18, U19.
 #   --scope         user scopes: U6 to U11, U47, U58, U64, U66.
-#   --scope-store   the user-scope store: U12 to U14, U63, U97.
+#   --scope-store   the user-scope store: U12 to U14, U63, U97, U101.
 #   --files         the append-only files: U20 to U25, U50, U52, U60, U61, U68,
 #                   U80, U88, U90, U91, U99, and in the helper variant only U70, U71.
 #   --socket        the socket listener: U26 to U31, U46, U48, U54, U82.
@@ -112,6 +112,7 @@ EXPECTED_ROWS="$EXPECTED_ROWS U85 U86 U87 U88 U89 U90 U91 U92 U93 U94 U95 U96 U9
 EXPECTED_ROWS="$EXPECTED_ROWS U98"
 EXPECTED_ROWS="$EXPECTED_ROWS U99"
 EXPECTED_ROWS="$EXPECTED_ROWS U100"
+EXPECTED_ROWS="$EXPECTED_ROWS U101"
 # >>> ADD NEW U ROWS (U64 upward) HERE <<<
 EXPECTED_ROWS="$EXPECTED_ROWS E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 E13 E14 E15 E16 E17 E18 E19 E20"
 EXPECTED_ROWS="$EXPECTED_ROWS E21 E22 E23 E24 E25"
@@ -141,7 +142,7 @@ mode_rows() {
 	sandbox) echo "U16 U17 U49" ;;
 	api) echo "U18 U19" ;;
 	scope) echo "U6 U7 U8 U9 U10 U11 U47 U58 U64 U66" ;;
-	scope-store) echo "U12 U13 U14 U63 U97" ;;
+	scope-store) echo "U12 U13 U14 U63 U97 U101" ;;
 	files) echo "U20 U21 U22 U23 U24 U25 U50 U52 U60 U61 U68 U70 U71 U80 U88 U90 U91 U99" ;;
 	socket) echo "U26 U27 U28 U29 U30 U31 U46 U48 U54 U82" ;;
 	socket-ops) echo "U32 U33 U34 U35 U45 U51 U67 U84" ;;
@@ -582,6 +583,8 @@ pend U99 "under the store lock, before every audit or floor append, the server c
 	k3sm/pkg/keystore/socket::TestAppendReopensOnInodeMismatch
 pend U100 "a departed account with an unreused uid is reported, not acted on: doctor lists every scope whose uid has no directory record (a synthesized GeneratedUID); each of that scope's deliveries gets SecretRetained=True with reason OwnerUnresolvable, and no Secret is deleted (KeyDelivery lifecycle)" \
 	k3sm/cmd/k3sm::TestDoctorListsUnresolvableScopes k3sm/pkg/keystore/reconcile::TestOwnerUnresolvableRetainedCondition
+pend U101 "rewrap prints a warning whenever .user/ exists, before it starts and when it finishes, saying Rewrap does not re-key K_u and naming the procedure: each user re-puts their values after a suspected master exposure; with no .user/ it prints none (user-scope quotas, scope-key Rewrap and the delivery record)" \
+	k3sm/cmd/k3sm::TestRewrapWarnsWhenUserScopesExist
 # >>> ADD NEW U ROWS (U64 upward) HERE, and add each to EXPECTED_ROWS and to mode_rows <<<
 
 leg E1 "files" "preconditions: secrets encryption on; one server; keystore-run/ and both logs present, service-user 0600, SF_APPEND set; the doctor user-scope row on; keystore.sh --check exits 0 on the build" "the append-only files"
@@ -768,6 +771,8 @@ U99|never saw the marker
 U100|no directory record
 U100|OwnerUnresolvable
 U100|no Secret is deleted
+U101|does not re-key K_u
+U101|each user re-puts their values after a suspected master exposure
 U97|rm then put"
 
 # --listed: the row-presence lint.
