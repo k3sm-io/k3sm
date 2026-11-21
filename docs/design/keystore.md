@@ -73,9 +73,11 @@ rotated by one command with a rollback path instead of an unrecoverable manual e
 One consequence shapes the design. Ownership is not a barrier between a Pod and the
 service user's files, because they share a uid. What keeps a confined native Pod out of
 `<work dir>/server` is runtimed's Seatbelt profile, which denies it read and write there
-(`DaemonTreeSubdirs` in runtimed's `pkg/sandbox`, rendered after every allow so not even a
-caller-supplied extra path overrides it). That is a profile rule, not a permission, and it
-names the default work dir. So a record's integrity against a writer that cannot read the
+(`DaemonTreeSubdirs` in runtimed's `pkg/sandbox`). The denies are emitted first and narrow
+re-allows follow them, so the order alone protects nothing; what keeps a caller-supplied extra
+path from re-opening the tree is the profile's path validator, which refuses any such path
+under a protected prefix ("User scope", "Pod denies"). That is a profile rule, not a
+permission, and it names the default work dir. So a record's integrity against a writer that cannot read the
 master (a stale restore, a stray file copy) rests on an authenticated record, and the one
 fact that must hold even against a writer that can only touch the service user's files lives
 where only root can write it. Neither is a defence against a process that runs as the
@@ -84,10 +86,11 @@ entry, and what it can additionally forge is stated under "Pointer sequence and 
 
 Two later facts amend this paragraph. The keystore's files directly under the data root
 (Phase A's `keystore-floor.json` and `keystore-delivery.json`, and the user scope's files)
-are denied to every Pod by runtimed's data-root deny list, `DataRootDenySubdirs`, which today
-names `server` and `agent` and is widened to name files by the sandbox change that comes with
-the user scope; the data-root list is used, not `DaemonTreeSubdirs`, because a node's Pod
-root can differ from its data root. Whether a Pod can read Phase A's two data-root files
+are denied to every Pod by runtimed's data-root denies, which today cover `server` and `agent`
+(`DataRootDenySubdirs`) and which the sandbox change that comes with the user scope widens to
+every `keystore-*` name in the data root and the whole `keystore-run/` tree; the data-root
+denies are used, not `DaemonTreeSubdirs`, because a node's Pod root can differ from its data
+root. Both files are root 0644, so a local login user can still read them (residual 11). Whether a Pod can read Phase A's two data-root files
 before that change is `[K0 leg 4: pending]`; the denies land either way. And the user scope
 adds an ownership boundary on the store and its API, not a confidentiality boundary between
 Pods ("Threat model for the user scope").
@@ -976,7 +979,7 @@ this document that quotes the measured result.
   here opens, reserves or stubs that endpoint.
 - **A thread and a milestone.** The keystore is tracked as its own end-to-end thread, whose
   outcome is "a person stores a credential without sudo and only their namespaces' Pods
-  receive it". The end-to-end rig gate (E1 to E20) is its tracer and the only proof of that
+  receive it". The end-to-end rig gate (the legs under "Rig legs") is its tracer and the only proof of that
   outcome; every other change supports it. The work is milestone M20.
 
 ### Scope strings and names
@@ -994,7 +997,8 @@ The scope strings are `system` and `user/<uid>`, with `<uid>` the decimal macOS 
   user/501`), so a script sees what it bound to.
 - A non-root caller may name only its own uid's entries. A `system/…` name or any other
   `user/<other>/…` name answers `ErrNotFound`, worded identically to an absent entry, so the
-  answer is no oracle for another user's names.
+  answer is no oracle for another user's names. System entry names are not hidden this way:
+  Phase A's two data-root files name them (residual 11).
 
 **The entry grammar lives once**, as the OpenAPI `pattern` on `spec.entry` in the `apis` CRD:
 
@@ -1019,6 +1023,7 @@ Phase A's paths are unchanged. Added:
   keystore-run/                         NEW: service user 0755, the socket's directory, Pod-denied
     keys.sock                           srw-rw-rw-: access is decided by peer credentials
     maintenance                         NEW: root 0644, present only while a maintenance verb runs
+    user-floor.new, audit.new           NEW: staging files of `floor --rebuild` and `audit --rotate`
   server/                               already Pod-denied
     cred/keystore-master/master …       Phase A, unchanged
     keystore/                           Phase A: 0700, service user
@@ -1124,9 +1129,12 @@ service user can only add to.
   `sudo k3sm keys audit --rotate` run as root only. Each writes `keystore-run/maintenance`,
   waits for the listener to stop (it closes connections and unlinks `keys.sock` when it sees
   the file), takes the store `.lock` exclusively, then **creates and flags the new file before
-  it touches the old one**. Rebuild writes `keystore-user-floor.log.new` from the
+  it touches the old one**. Rebuild writes `keystore-run/user-floor.new` from the
   authenticated pointers, sets `sappnd`, clears the old file's flag and renames the new one
-  over it; rotate does the same, renaming the old log to `.1` and flagging it again. A crash
+  over it; rotate does the same through `keystore-run/audit.new`, renaming the old log to `.1`
+  and flagging it again. Staging files live inside `keystore-run/`, never loose in the data
+  root, so a staging name is denied by the `keystore-run/` tree deny whatever it is called
+  ("Pod denies"). A crash
   leaves either the old flagged file or the new flagged file at the canonical path. The only
   unflagged moment is the old file's, between its `chflags nosappnd` and the rename, under the
   exclusive lock with the listener stopped; whether a rename over an `sappnd` target needs that
@@ -1262,22 +1270,51 @@ user's `list` shows only its own scope (U45, E12).
 Pods cannot reach the socket or the keystore's files, in two layers. **The peer check is never
 the first layer.**
 
-1. **Seatbelt.** Every `keystore-*` path under the data root (`keystore-run/`,
-   `keystore-floor.json`, `keystore-delivery.json`, `keystore-user-floor.log`,
-   `keystore-audit.log`, `keystore-audit.log.1`) joins runtimed's data-root deny list,
-   `DataRootDenySubdirs`, widened to name files as well as directories, and rendered after
-   every allow. Not `DaemonTreeSubdirs`, which is under the work dir and misses a node whose
-   Pod root differs from its data root. runtimed owns the names as exported constants; k3sm
-   imports them, and k3sm's `baseSocketDenies` derives the `keys.sock` path from them and adds
-   a `(deny network-outbound (remote unix-socket …))` for it after every network allow, so
-   there is one spelling (U16, U17, E10). That a Pod with these denies cannot `connect(2)` to
-   the socket or read any of these paths, and whether a Pod can read Phase A's two data-root
-   files before them, is `[K0 leg 4: pending]`.
-2. **Peer refusal.** Native Pods run as the service user, below 501, so a Pod that got through
-   is refused at accept anyway. The sandbox change proves runtimed cannot start a Pod process
-   under a uid of 501 or above, or adds that refusal, with a test (U17). Which uid a native
-   Pod's processes run as, and whether any Pod spec field or runtimed path can make it 501 or
-   above, is `[K0 leg 5: pending]`; row U15 is held for a second path if one is found.
+1. **Seatbelt.** The data-root denies cover two things, by prefix rather than by a list: every
+   name in the data root that begins `keystore-` (today `keystore-floor.json`,
+   `keystore-delivery.json`, `keystore-user-floor.log`, `keystore-audit.log` and
+   `keystore-audit.log.1`), and the whole `keystore-run/` tree, which also holds the
+   maintenance verbs' staging files. A prefix means a keystore file a later change adds is
+   denied without a runtimed change. The keystore names join `DataRootDenyTrees`, the list of
+   data-root trees runtimed denies, which also feeds `protectedPrefixes`. Not
+   `DaemonTreeSubdirs`, which is under the work dir and misses a node whose Pod root differs
+   from its data root.
+
+   **What protects the keystore is the validator, not the order.** The profile emits the
+   data-root denies first, and narrow re-allows follow for the Pod volume, exposed paths,
+   `ReadOnlyPaths` and views; in Seatbelt a later allow wins over an earlier deny for the paths
+   it matches, so the order alone protects nothing. The protection is that the protected-prefix
+   validator (`validateExtraPaths` and `validateExposePaths`, over `protectedPrefixes`) refuses
+   any caller-supplied re-allow under the data root or a keystore name, so no re-allow can
+   reach a keystore path, and the Pod is refused rather than started with one. A
+   `ReadOnlyPaths` entry, an `ExposePaths` entry or a hostPath naming the data root or a
+   keystore path is refused (U16).
+
+   **An empty `Posture.DataRoot` fails closed.** runtimed refuses to render a Pod profile
+   without one, so a posture that lost its data root cannot produce a profile with no data-root
+   denies (U16).
+
+   **vm and container-vm Pods.** The guest is given no share of the data root, so nothing in
+   the guest names the socket or a keystore file (U16, E10).
+
+   **One home for the names.** runtimed owns the keystore path names as exported constants in
+   a cgo-free leaf package, `runtimed/pkg/keystorepaths`, which imports only the standard
+   library. `pkg/sandbox` and k3sm's provider import it; k3sm's `pkg/keystore` imports only
+   that leaf, never `pkg/sandbox`, so the store takes on none of the sandbox's dependencies
+   (U49). k3sm's `baseSocketDenies` derives the `keys.sock` path from the leaf and adds a
+   `(deny network-outbound (remote unix-socket …))` for it, so there is one spelling (U46,
+   E10). That a Pod with these denies cannot `connect(2)` to the socket or read any of these
+   paths, and whether a Pod can read Phase A's two data-root files before them, is `[K0 leg 4:
+   pending]`.
+2. **Pod uid refusal, the second layer.** Native Pods run as the service user, below 501. The
+   sandbox change adds a second layer: runtimed refuses any resolved Pod process uid of 501 or
+   above, and uid 0 without a drop when the daemon runs as root, both when it resolves the
+   credential and again at spawn (U17, E21, E22). With that refusal in place, a Pod that got
+   past Seatbelt would connect under a uid the socket's peer check refuses. Until the rig
+   spike measures which uid a native Pod's processes run as, and whether any Pod spec field or
+   runtimed path can make it 501 or above (`[K0 leg 5: pending]`), this design does not claim
+   that a Pod is refused by peer uid; it claims the refusal the sandbox change adds. Row U15 is
+   held for a second path if the spike finds one.
 
 ### KeyDelivery
 
@@ -1457,7 +1494,7 @@ the uid throughout.
 |---|---|---|
 | root | everything: every scope's values (through `M`), the floors, the audit log; the only principal that delivers or reads a system entry | (not defended against) |
 | the service user (the server, runtimed, kine, the control plane, and any of its processes outside Seatbelt) | read `M` and every `K_u`, hence every value; append to the floor log and the audit log, including forged audit lines | lower the user floor, truncate or delete audit lines, write the system floor |
-| a native Pod (the service uid, under Seatbelt) | read a Secret delivered into a namespace it may read, like any Secret | reach `keys.sock`, `keystore-run/`, `server/`, the logs or Phase A's files (Seatbelt first); a Pod that got through is refused by peer uid |
+| a native Pod (the service uid, under Seatbelt) | read a Secret delivered into a namespace it may read, like any Secret | reach `keys.sock`, `keystore-run/`, `server/`, the logs or Phase A's files (Seatbelt first); run under a uid of 501 or above, or as root without a drop, which is the second layer the sandbox change adds ("Pod denies") |
 | the entry's owner (a login uid of 501 or above) | put, rotate (including from a version), list, rm and exec its own entries; declare deliveries where RBAC lets `k3sm:local:<uid>` write keydeliveries and that Secret | reveal a value through any verb but exec; touch another uid's scope or any system entry; see another user's names through any verb |
 | another login user | the same for its own scope | list, read, rotate, delete or deliver the owner's entries; learn their names |
 | a holder of the admin kubeconfig (by default the installing user) | delete any KeyDelivery, read any delivered Secret, bind RBAC | create a working delivery for someone else's entry (a replayed, copied or retargeted object fails the UID and digest check, a forged one has no sealed record); read an undelivered value |
@@ -1489,6 +1526,11 @@ the uid throughout.
    value keeps it.
 9. The service user can append forged audit lines; the log proves nothing against that writer.
 10. The user scope is off on a cluster with more than one server.
+11. Phase A's `keystore-floor.json` and `keystore-delivery.json` are root 0644, so a local
+    login user can read the system entries' names, and the declared delivery targets. This is
+    accepted: the service user must read the floor, and neither file holds a value. Pods are
+    covered by the data-root denies ("Pod denies"). What a login user cannot do with a system
+    entry is read or deliver it (E12).
 
 ### What the user scope does not do
 
@@ -1574,8 +1616,8 @@ to this document, reviewed like any other.
 
 ### User-scope rows
 
-The user scope adds rows U1 to U45 (unit tier unless the row says otherwise) and the rig legs
-E1 to E20. The gate runs each row's named tests in the repo the row names (`k3sm/…`,
+The user scope adds the U rows below (unit tier unless the row says otherwise) and the rig legs
+under "Rig legs". The gate runs each row's named tests in the repo the row names (`k3sm/…`,
 `runtimed/…`, `apis/…`, package paths relative to the module), and fails a row whose named
 test is absent or skipped. Each change runs the rows it delivers in its own gate mode, and the
 rig rows as an explicit, recorded step. Every row below is pending until the change named in
@@ -1600,8 +1642,8 @@ each stated in the change that makes it. U15 is held for a K0 amendment and U39 
 | U13 | quotas: the 257th entry and the byte budget answer `ErrQuota`; `rm` still works | `k3sm/pkg/keystore::TestUserScopeQuota` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
 | U14 | the delivery record stores UID and target digest; add, look up and withdraw round-trip under the floor | `k3sm/pkg/keystore::TestDeliveryRecordDigestRoundTrip` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
 | U15 | (reserved for the K0 amendment if leg 5 finds a second Pod-uid path) | none | pending: K0 amendment |
-| U16 | every Pod profile variant (native, vm, container-vm, xcode, expose-paths, a custom Pod root distinct from the data root) denies every keystore path, each deny after every allow | `runtimed/pkg/sandbox::TestDataRootDeniesKeystorePathsEveryProfile`; rig leg E10 | pending: runtimed's sandbox change |
-| U17 | runtimed refuses a Pod process uid of 501 or above (or proves no path to one); `baseSocketDenies` derives `keys.sock` from runtimed's names | `runtimed/pkg/supervisor::TestSpawnRefusesLoginRangeUID`; `k3sm/pkg/provider::TestBaseSocketDeniesKeystoreSocket` (the socket listener) | pending: runtimed's sandbox change, the socket listener |
+| U16 | every Pod profile variant (native, vm, container-vm, xcode, expose-paths, a custom Pod root distinct from the data root) denies every `keystore-*` name in the data root and the `keystore-run/` tree; the keystore names are in `DataRootDenyTrees` and so in `protectedPrefixes`; `ReadOnlyPaths`, `ExposePaths` or a hostPath naming the data root or a keystore path is refused; an empty `Posture.DataRoot` refuses to render; a vm or container-vm guest gets no data-root share | `runtimed/pkg/sandbox::TestDataRootDeniesKeystorePathsEveryProfile`, `TestProtectedPrefixesRefuseKeystoreReallow`, `TestEmptyDataRootFailsClosed`, `TestVMGuestGetsNoDataRootShare`; rig leg E10 | pending: runtimed's sandbox change |
+| U17 | runtimed refuses a resolved Pod process uid of 501 or above, and uid 0 without a drop on a root daemon, at credential resolution and again at spawn | `runtimed/pkg/runtime::TestResolveCredentialRefusesLoginRangeUID`, `TestResolveCredentialRefusesRootWithoutDrop`; `runtimed/pkg/supervisor::TestSpawnRefusesLoginRangeUID`, `TestSpawnRefusesRootUIDWithoutDrop`; rig legs E21, E22 | pending: runtimed's sandbox change |
 | U18 | CRD: `entry`, `secretName`, `dataKey`, `requestedBy` immutable by CEL transition rules; status subresource on; reasons listed | `apis/config/crd::TestKeyDeliveryCRDMatchesTheGoTypes`, `TestKeyDeliveryImmutableFields` | pending: the `KeyDelivery` API |
 | U19 | the CRD pattern passes the shared entry-grammar vectors | `apis/config/crd::TestEntryGrammarVectors` | pending: the `KeyDelivery` API |
 | U20 | a user-scope `current` copied back is refused against the floor log, with Phase A's floor message | `k3sm/pkg/keystore::TestUserFloorRefusesCopiedBackCurrent`; rig leg E9 | pending: the append-only files |
@@ -1630,6 +1672,8 @@ each stated in the change that makes it. U15 is held for a K0 amendment and U39 
 | U43 | reasons are the closed set; "absent" and "not yours" both read `EntryUnavailable`; a pre-existing unlabelled Secret is `SecretExists`; a second declaration is `SecretClaimed`; `observedGeneration` tracks | `k3sm/pkg/keystore/reconcile::TestConditionReasonsClosedSet`, `TestOneDeclarationPerSecret` | pending: the KeyDelivery reconciler (authority) |
 | U44 | losing authority deletes exactly the owned Secret; the crash order is Secret, record, finalizer at every interruption point; the orphan sweep removes labelled, owner-annotated Secrets with no live object and never an unlabelled or foreign one | `k3sm/pkg/keystore/reconcile::TestLostAuthorityDeletesOnlyOwnedSecret`, `TestFinalizerCrashOrder`, `TestOrphanSweep` | pending: the KeyDelivery reconciler (lifecycle) |
 | U45 | cross-user refusal with a fake peer-credential source: a peer with uid B asks for `list`, `read-for-exec`, `rotate`, `rm` and `deliver` of uid A's entries, and for any `system/…` name; every call is `ErrNotFound` with text identical to an absent entry of B's own, and the `refused` audit lines carry uid B | `k3sm/pkg/keystore/socket::TestCrossUserRefusedFakePeerCred`, `TestNonRootCannotNameSystemEntries` | pending: the socket operations |
+| U46 | `baseSocketDenies` derives the `keys.sock` path from `runtimed/pkg/keystorepaths` and denies `connect(2)` to it | `k3sm/pkg/provider::TestBaseSocketDeniesKeystoreSocket` | pending: the socket listener |
+| U49 | `runtimed/pkg/keystorepaths` builds with `CGO_ENABLED=0` and imports only the standard library; `k3sm/pkg/keystore` imports that leaf and never `runtimed/pkg/sandbox` | `runtimed/pkg/keystorepaths::TestLeafImportsStdlibOnly`; `k3sm/pkg/keystore::TestKeystoreImportsNoSandbox` | pending: runtimed's sandbox change, the append-only files |
 
 ### Rig legs
 
@@ -1656,9 +1700,9 @@ E20 attended.
 | E7 | admin copies E3's KeyDelivery YAML into `ks-e2e-2` (where the user also has the role) | `Authorized=False`, reason `NotRecorded`, no Secret: the UID is not in the user's record | no (U42) | the KeyDelivery reconciler (authority): a Secret appears in `ks-e2e-2` |
 | E8 | admin strips the CRD's transition rules (a test patch, restored at the end) and edits E3's `spec.secretName` | `Authorized=False`, `NotRecorded` (digest mismatch); the original Secret deleted; no Secret under the new name | yes | the target digest: a Secret appears under the new name |
 | E9 | `sudo cp` saves `current`, the user rotates, `sudo cp` puts the old `current` back; then the same for a `system/` entry | user `list` and `sudo k3sm keys list` each mark the entry `corrupt` with the floor message; `floor --rebuild` is not run | no (U20) | the append-only files: the old value is served |
-| E10 | a Pod (pinned by `nodeName`, darwin selector) tries `connect(2)` to `keys.sock` and to read `server/keystore`, `keystore-run/`, both logs and Phase A's two files | EPERM for each | no (U16) | runtimed's sandbox change: the Phase A files read (the red result K0 leg 4 records) |
+| E10 | a native Pod (pinned by `nodeName`, darwin selector) tries `connect(2)` to `keys.sock` and to read `server/keystore`, `keystore-run/`, both logs and Phase A's two files; then a vm Pod on the same node tries to reach `keys.sock` and the data root from the guest | EPERM for each from the native Pod; the guest has no path to the data root and cannot reach the socket | no (U16) | runtimed's sandbox change: the Phase A files read (the red result K0 leg 4 records) |
 | E11 | admin removes the user's RoleBinding in `ks-e2e` | within one sweep the Secret is deleted; `Authorized=False`, `NotAuthorized` | no (U42) | the KeyDelivery reconciler (lifecycle): the Secret stays |
-| E12 | root scope: `sudo k3sm keys put system/e2e-sys`, `sudo k3sm keys deliver system/e2e-sys --namespace ks-e2e`; then the user, with no sudo, tries `k3sm keys deliver`, `list` and `exec` on `system/e2e-sys` | root's Secret is delivered and stays (G20); each of the user's attempts answers `not found` and nothing reaches `ks-e2e-2` | partly (U45): the root delivery is rig-only | root delivery: root delivery missing; the socket operations: a non-root user can name a system entry |
+| E12 | root scope: `sudo k3sm keys put system/e2e-sys`, `sudo k3sm keys deliver system/e2e-sys --namespace ks-e2e`; then the user, with no sudo, tries `k3sm keys deliver`, `list` and `exec` on `system/e2e-sys` | root's Secret is delivered and stays (G20); each of the user's attempts answers `not found` and nothing reaches `ks-e2e-2`: the user cannot read or deliver the system entry. The leg does not claim the user cannot discover the name, which Phase A's 0644 files show (residual 11) | partly (U45): the root delivery is rig-only | root delivery: root delivery missing; the socket operations: a non-root user can name a system entry |
 | E13 | a ServiceAccount token creates a KeyDelivery | refused at admission | no (U40) | KeyDelivery authoring: the object is created |
 | E14 | `k3sm keys undeliver` on E3's object, then `kubectl delete` of a second one | each Secret deleted before its object goes; the hint printed; no orphan Secret after one sweep | no (U44) | the KeyDelivery reconciler (lifecycle): the object hangs or the Secret stays |
 | E15 | **upgrade** from the previous release's install tree (its signed build installed, then this build over it, then `sudo k3sm install`) | system scope intact; user scope comes on after the install, off with the Warn and `doctor` row before it | yes | upgrade visibility: user scope silently off |
@@ -1667,6 +1711,8 @@ E20 attended.
 | E18 | an **old worker**: the second Mac on the previous release joins this server | worker Ready; Pods there mount delivered Secrets; no keystore listener or reconciler on the worker | yes | server-only listener: a listener on an agent node |
 | E19 | `sudo launchctl kickstart -k system/io.k3sm.server` while a client is connected mid-request | the client gets a clean error, not a hang; the listener is back within its backoff; kine and the apiserver come back; no partial record | yes | the listener lifecycle: the client hangs or the store holds a torn write |
 | E20 | **reboot of the server node**: an operator-attended leg (automation never reboots the rig), run by the operator with the script's `--attended reboot` step | after boot the flags are still set, the listener starts, E2's entry opens, E3's Secret is still current | yes | the flag check: a flag lost across a reboot |
+| E21 | a native Pod with `securityContext.runAsUser: 501` | refused at spawn: the container never starts, and its status carries the uid refusal | no (U17) | runtimed's sandbox change: the Pod runs as uid 501 |
+| E22 | a native Pod with `securityContext.runAsUser: 0` | refused at spawn: the container never starts as root, and its status carries the uid refusal | no (U17) | runtimed's sandbox change: the Pod runs as uid 0 |
 
 ## Open questions
 
