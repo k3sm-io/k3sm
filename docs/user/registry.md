@@ -147,9 +147,8 @@ headers only, not the time a transfer takes once the registry has started to ans
 The cluster reaches the registry through the registry relay, a front that listens on the
 server's cluster network address and on its guest network's gateway address, terminates TLS, and
 hands each request to the push gate, which passes reads through to the registry and checks every
-write. (The listener on
-`127.0.0.1:6451` for the server's own Mac is built from the same code, so the limits below apply
-to it too and its warnings name that address.) A pull through it is cut if the transfer makes no
+write. (The listener on `127.0.0.1:6451` for the server's own Mac is built from the same code, so
+the limits below apply to it too and its warnings name that address.) A pull through it is cut if the transfer makes no
 progress for 5 minutes, and so is a push body sent through it. A slow transfer that keeps moving
 is not cut mid-layer, because a node cannot resume a cut layer and would download it again from
 the start. Separately, the relay does not keep a connection open for ever. Once a connection is
@@ -165,7 +164,10 @@ messages. `ingest registry relay is at its connection limit` means all 256 are h
 `ingest registry relay refused a connection` means a client already held its 64. Each of those
 names the address it listens on and is logged at most once a minute for that address.
 `ingest registry relay cut a stalled connection` means the 5 minute cut closed a connection, and
-it is logged once for each connection cut.
+it is logged once for each connection cut. The refused-connection line names the first client
+refused in that minute, which may not be the only one. These lines show that the limits were
+reached; they do not stop a client that keeps its connections moving from holding its share, and
+clients on several addresses can still hold all 256 between them.
 
 ## Models
 

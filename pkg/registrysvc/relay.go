@@ -519,15 +519,16 @@ func (l *limitListener) Accept() (net.Conn, error) {
 	}
 }
 
-// warnFull logs that every slot is held, so a further connection waits for
-// one. addr is this listener's address: each bind address has its own
+// warnFull logs that every slot is held, so the listener accepts no further
+// connection until one frees. It says nothing about whether a client is
+// waiting. addr is this listener's address: each bind address has its own
 // listener, limit and warnings.
 func (l *limitListener) warnFull() {
 	if l.log == nil {
 		return
 	}
 	if dropped, ok := l.full.allow(l.now(), l.warnEvery); ok {
-		l.log.Warn("ingest registry relay is at its connection limit: further connections wait until one frees",
+		l.log.Warn("ingest registry relay is at its connection limit: it accepts no further connection until one frees",
 			"addr", l.Addr().String(), "limit", cap(l.sem), "suppressed", dropped)
 	}
 }
