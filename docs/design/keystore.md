@@ -1955,6 +1955,7 @@ it may change and that a conversion is owed if it does.
   | `DeletePending` | `SecretRetained` | `True` | `Authorized` is `False` and the Secret this object owns is due for deletion but still exists: the delete call failed, or the owner's reconciler allowance is exhausted |
   | `Unowned` | `SecretRetained` | `True` | `Authorized` is `False` with `NotRecorded` for a UID never recorded, and a labelled Secret names this UID: it is not this object's to delete, and it stays |
   | `Indeterminate` | `SecretRetained` | `True` | `Authorized` is `Unknown` and a labelled Secret that is this object's recorded target stays, at its last version |
+| `OwnerUnresolvable` | `SecretRetained` | `True` | the entry owner's uid has no directory record (the lookup answers a synthesized GeneratedUID), and a labelled Secret that is this object's recorded target stays |
   | `NoneRetained` | `SecretRetained` | `False` | no labelled Secret of this object stays while `Authorized` is `Unknown` or `False`; and whenever `Authorized` is `True` |
 
   **What each `Authorized=False` reason does to the Secret.** Every reason is tied to one
@@ -1972,7 +1973,7 @@ it may change and that a conversion is owed if it does.
   When a deletion is due and the Secret still exists, `SecretRetained` is `True` with reason
   `DeletePending` until it is gone, so a kept Secret is never silent (U43). The rule is
   general: `SecretRetained` is `True` whenever a labelled Secret stays while `Authorized` is
-  `Unknown` or `False`, with `Indeterminate`, `DeletePending` or `Unowned` saying why, and
+  `Unknown` or `False`, with `Indeterminate`, `OwnerUnresolvable`, `DeletePending` or `Unowned` saying why, and
   `False` only when no such Secret stays or `Authorized` is `True` (U78).
 
   While `Authorized` is `False`, `Ready` is `False` with the single reason `NotAuthorized`, and
@@ -2166,10 +2167,14 @@ delivery record whose version it does not know, a SubjectAccessReview call that 
 answer that is not a definitive denial, a denial seen on one sweep only, any other API server
 error, and any error this list does not name, including one a later change adds. The rule is
 written as an allow-list so that a new sentinel is safe by default: it deletes nothing until a
-change adds it here. `ErrScopeOwnerChanged` is a definitive outcome, not a read failure: the
-old owner's credential must not stay delivered in pods after the account is gone or a new
-person holds the uid, so it deletes beside `ErrNotFound`. `ErrScopeOwnerUnknown` is a lookup
-failure and stays `Indeterminate`. A UID absent from a readable record is `NotRecorded` and gets no Secret written,
+change adds it here. `ErrScopeOwnerChanged` is a definitive outcome, not a read failure: a
+new person holds the uid, and the old owner's credential must not stay delivered to them, so it
+deletes beside `ErrNotFound`. That removal is automatic only for uid reuse. A departed account
+whose uid is not reused has no directory record, so the lookup answers a synthesized value,
+which is `ErrScopeOwnerUnknown` and stays `Indeterminate`: the reconciler cannot tell it from a
+directory service that is not up yet. Such a scope is reported, not acted on: `doctor` lists
+it, each of its deliveries gets `SecretRetained=True` with reason `OwnerUnresolvable`, and its
+removal is left to root ("A departed account is left to root"). A UID absent from a readable record is `NotRecorded` and gets no Secret written,
 but it is not on the list, so it deletes nothing.
 
 **An owner change still finds its targets.** Deleting under `ErrScopeOwnerChanged` needs the
@@ -2385,6 +2390,14 @@ never acts by path where the service user can write"):
   object the parent's listing named, and never follows a directory that was swapped between
   the listing and the open (U80, run as root).
 
+**A departed account is left to root.** When an account is removed and its uid is not given
+to anyone, its scope does not open (`ErrScopeOwnerUnknown`) and nothing is deleted
+automatically. `doctor` lists every scope under `.user/` whose uid has no directory record (the
+lookup answers a synthesized GeneratedUID), with the number of its deliveries, and the
+reconciler sets `SecretRetained=True` with reason `OwnerUnresolvable` on each of them. The user
+docs say that root, when it removes an account, runs `sudo k3sm keys rm-scope user/<uid> --yes`
+for it, which revokes the scope's deliveries first (U100).
+
 **Revocation is rotation.** Deleting the Secret does not un-share a value a Pod already read.
 The docs and the CLI say so (residual 8).
 
@@ -2579,7 +2592,10 @@ the uid throughout.
    host's eligible local accounts, and `doctor` warns when it is non-zero. A namespace writer
    who plants forged Secrets spends only the reconciler budget, never a uid's share.
 6. A user account deleted and recreated under the same uid loses its old scope, by design
-   (U6), and root must clear it.
+   (U6), and root must clear it. A user account deleted with its uid not reused keeps its
+   delivered Secrets until root runs `rm-scope`: the reconciler cannot tell a missing
+   directory record from a directory service that is not up, so it reports the scope
+   (`doctor`, `OwnerUnresolvable`) and deletes nothing.
 7. The peer uid is the effective uid at connect time, so a setuid program the user runs acts as
    that program's owner.
 8. **Revocation is rotation**: removing a delivery deletes the Secret, but a Pod that read the
@@ -2812,6 +2828,7 @@ record below.
 | U97 | when `rotate` answers `ErrQuota`, `rm` then `put` recovers: `rm` frees every version and `put` stores the value as version 1 of a new generation; the `quota` error names that recovery | `k3sm/pkg/keystore::TestRotateQuotaRecoveredByRmThenPut` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
 | U98 | the sealed `deliveries` record stores each delivery's KeyDelivery `metadata.name`; the orphan sweep checks the object with a live Get by that name sent to the API server, never an informer cache and never a List; not found, or another UID, deletes only on two consecutive observations at least 60 s apart, and any other answer in between resets the count; no sweep runs before the KeyDelivery and Secret informers sync | `k3sm/pkg/keystore/reconcile::TestOrphanSweepUsesLiveGetByName`, `TestOrphanSweepNeedsTwoObservations` | pending: the KeyDelivery reconciler (lifecycle) |
 | U99 | under the store lock, before every audit or floor append, the server compares its descriptor's `(dev, ino)` with the canonical name's and reopens on a mismatch, recounting the per-uid shares from the new file; `audit --rotate` and `floor --rebuild` each complete while the server never saw the marker, and every later line lands in the new canonical file, none in an archive or an unlinked file (seam: chflags flag source) | `k3sm/pkg/keystore/socket::TestAppendReopensOnInodeMismatch` | pending: the append-only files |
+| U100 | a departed account with an unreused uid is reported, not acted on: `doctor` lists every scope whose uid has no directory record (a synthesized GeneratedUID) with its delivery count; each of that scope's deliveries gets `SecretRetained=True` with reason `OwnerUnresolvable`, and no Secret is deleted (seam: GeneratedUID lookup) | `k3sm/cmd/k3sm::TestDoctorListsUnresolvableScopes`, `k3sm/pkg/keystore/reconcile::TestOwnerUnresolvableRetainedCondition` | pending: the KeyDelivery reconciler (lifecycle) |
 
 ### Rig legs
 

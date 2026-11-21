@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # The keystore's acceptance gate: docs/design/keystore.md § "Acceptance gate",
-# rows G1 to G22, the user-scope rows U1 to U99 (U15 and U39 are unused) and
+# rows G1 to G22, the user-scope rows U1 to U100 (U15 and U39 are unused) and
 # the rig legs E1 to E25. Every row is listed, on exactly one line. A row runs
 # the tests that deliver it and passes only if each named test ran and passed
 # in its own package; a row whose change has not landed yet prints PENDING,
@@ -43,7 +43,7 @@
 #   --kd-author     KeyDelivery authoring: U40, U41, U74, U76, U87, U94.
 #   --kd-reconcile  the KeyDelivery reconciler: U42, U43, U59, U73, U78, U81.
 #   --kd-lifecycle  the KeyDelivery lifecycle: U44, U53, U55, U56, U62, U65,
-#                   U72, U75, U77, U79, U83, U85, U86, U89, U93, U95, U96, U98.
+#                   U72, U75, U77, U79, U83, U85, U86, U89, U93, U95, U96, U98, U100.
 #   --grammar       the entry grammar in apis: U57.
 #   --docs          the user docs: no row yet, so it exits 3.
 # A unit mode runs only its rows and only their tests, with the same exit
@@ -111,6 +111,7 @@ EXPECTED_ROWS="$EXPECTED_ROWS U77 U78 U79 U80 U81 U82 U83 U84"
 EXPECTED_ROWS="$EXPECTED_ROWS U85 U86 U87 U88 U89 U90 U91 U92 U93 U94 U95 U96 U97"
 EXPECTED_ROWS="$EXPECTED_ROWS U98"
 EXPECTED_ROWS="$EXPECTED_ROWS U99"
+EXPECTED_ROWS="$EXPECTED_ROWS U100"
 # >>> ADD NEW U ROWS (U64 upward) HERE <<<
 EXPECTED_ROWS="$EXPECTED_ROWS E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 E13 E14 E15 E16 E17 E18 E19 E20"
 EXPECTED_ROWS="$EXPECTED_ROWS E21 E22 E23 E24 E25"
@@ -147,7 +148,7 @@ mode_rows() {
 	exec) echo "U36 U37 U38 U69 U92" ;;
 	kd-author) echo "U40 U41 U74 U76 U87 U94" ;;
 	kd-reconcile) echo "U42 U43 U59 U73 U78 U81" ;;
-	kd-lifecycle) echo "U44 U53 U55 U56 U62 U65 U72 U75 U77 U79 U83 U85 U86 U89 U93 U95 U96 U98" ;;
+	kd-lifecycle) echo "U44 U53 U55 U56 U62 U65 U72 U75 U77 U79 U83 U85 U86 U89 U93 U95 U96 U98 U100" ;;
 	grammar) echo "U57" ;;
 	*) echo "" ;;
 	esac
@@ -579,6 +580,8 @@ pend U98 "the sealed deliveries record stores each delivery's KeyDelivery metada
 	k3sm/pkg/keystore/reconcile::TestOrphanSweepUsesLiveGetByName TestOrphanSweepNeedsTwoObservations
 pend U99 "under the store lock, before every audit or floor append, the server compares its descriptor's (dev, ino) with the canonical name's and reopens on a mismatch, recounting the shares; audit --rotate and floor --rebuild each complete while the server never saw the marker, and every later line lands in the new canonical file (append-only files)" \
 	k3sm/pkg/keystore/socket::TestAppendReopensOnInodeMismatch
+pend U100 "a departed account with an unreused uid is reported, not acted on: doctor lists every scope whose uid has no directory record (a synthesized GeneratedUID); each of that scope's deliveries gets SecretRetained=True with reason OwnerUnresolvable, and no Secret is deleted (KeyDelivery lifecycle)" \
+	k3sm/cmd/k3sm::TestDoctorListsUnresolvableScopes k3sm/pkg/keystore/reconcile::TestOwnerUnresolvableRetainedCondition
 # >>> ADD NEW U ROWS (U64 upward) HERE, and add each to EXPECTED_ROWS and to mode_rows <<<
 
 leg E1 "files" "preconditions: secrets encryption on; one server; keystore-run/ and both logs present, service-user 0600, SF_APPEND set; the doctor user-scope row on; keystore.sh --check exits 0 on the build" "the append-only files"
@@ -762,6 +765,9 @@ U98|two consecutive observations at least 60 s apart
 U99|before every audit or floor append
 U99|reopens on a mismatch
 U99|never saw the marker
+U100|no directory record
+U100|OwnerUnresolvable
+U100|no Secret is deleted
 U97|rm then put"
 
 # --listed: the row-presence lint.
