@@ -295,7 +295,10 @@ descriptor with O_NOFOLLOW): refused unless root-owned and not group/other-writa
 mutating verb is already root-run, so no write path loses anything by this; the service
 user, which only reads, never needed to write it.
 
-The write order on a change is: the record, then the pointer, then the floor.
+The write order on a change is: the record, then the pointer, then the floor. Before any of
+it, a verb that changes the keystore checks that it can write the floor and takes the floor's
+lock (see "Concurrency"), so a caller that cannot write the floor changes nothing, and a
+first Put mints no master.
 
 - **Put:** write `generation`, `v1`, `current` (sequence 1), then set the floor entry.
 - **Rotate:** write the new version file, flip `current` (sequence + 1), then raise the

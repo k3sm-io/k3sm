@@ -191,13 +191,16 @@ func (s *FileStore) put(ctx context.Context, name string, kind Kind, value []byt
 	if err := checkValue(kind, value); err != nil {
 		return Version{}, err
 	}
+	// The floor is judged writable before anything is created, and locked
+	// before anything is written, a master minted included.
+	if err := s.checkFloorWritable(); err != nil {
+		return Version{}, err
+	}
 	root, done, err := s.openLocked(ctx, true, true)
 	if err != nil {
 		return Version{}, err
 	}
 	defer done()
-	// The floor is judged and locked before anything is written, a master
-	// minted included.
 	fdir, fl, err := s.lockFloor(ctx)
 	if err != nil {
 		return Version{}, err
@@ -491,6 +494,9 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	if err := checkName(name); err != nil {
 		return err
 	}
+	if err := s.checkFloorWritable(); err != nil {
+		return err
+	}
 	root, done, err := s.openLocked(ctx, false, true)
 	if errors.Is(err, fs.ErrNotExist) {
 		return ErrNotFound
@@ -592,6 +598,9 @@ func (s *FileStore) rotate(ctx context.Context, name string, value []byte) (Vers
 		return Version{}, err
 	}
 	if err := checkName(name); err != nil {
+		return Version{}, err
+	}
+	if err := s.checkFloorWritable(); err != nil {
 		return Version{}, err
 	}
 	root, done, err := s.openLocked(ctx, false, true)
@@ -715,6 +724,9 @@ func (s *FileStore) RaiseFloor(ctx context.Context) error {
 
 func (s *FileStore) raiseFloor(ctx context.Context) error {
 	if err := s.checkConfig(); err != nil {
+		return err
+	}
+	if err := s.checkFloorWritable(); err != nil {
 		return err
 	}
 	root, done, err := s.openLocked(ctx, false, true)

@@ -54,6 +54,9 @@ var (
 	// service user could have written. It is about every entry, so it fails the
 	// whole call.
 	errFloorUntrusted = errors.New("the keystore floor is not trusted: keystore-floor.json must be a regular file, and it and the data root holding it must be owned by root and not group- or other-writable")
+	// errFloorNotWritable refuses a verb that changes the keystore when this
+	// process cannot write the floor, before it changes anything.
+	errFloorNotWritable = errors.New("the keystore floor cannot be written by this process: a keys verb that changes the keystore runs as root")
 	// errFloorMalformed refuses a floor file that does not parse.
 	errFloorMalformed = errors.New("the keystore floor does not parse: remove keystore-floor.json as root, then run any sudo k3sm keys verb to rebuild it from the current pointers")
 )
@@ -271,12 +274,11 @@ type floorLock struct {
 	root   *os.Root
 }
 
-// lockFloor takes the data-root lock, waiting at most lockWait or until ctx
-// is done, and reads the floor under it. The data root is opened without
-// following a symlink, and judged on that descriptor: owned by root
-// (floorUID) and not group- or other-writable. The caller holds .lock, and
-// releases the returned lock with unlock.
-func (s *FileStore) lockFloor(ctx context.Context) (*floorLock, floor, error) {
+// openDataRoot opens the data root without following a symlink and judges
+// it on that descriptor: owned by root (floorUID), not group- or
+// other-writable, and writable by this process, which a verb that changes
+// the keystore must be before it changes anything (errFloorNotWritable).
+func (s *FileStore) openDataRoot() (*os.File, fs.FileInfo, error) {
 	if s.dataRoot == "" {
 		return nil, nil, errors.New("the keystore floor needs the data root, and none is configured")
 	}
@@ -287,15 +289,60 @@ func (s *FileStore) lockFloor(ctx context.Context) (*floorLock, floor, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("the keystore floor: %w", err)
 	}
-	l := &floorLock{s: s, dir: dir}
-	if l.locked, err = dir.Stat(); err != nil {
-		l.unlock()
-		return nil, nil, fmt.Errorf("the keystore floor: %w", err)
+	fi, err := dir.Stat()
+	if err == nil {
+		if oerr := s.floorOwned(fi); oerr != nil {
+			err = fmt.Errorf("%w: %s: %w", errFloorUntrusted, s.dataRoot, oerr)
+		}
 	}
-	if err := s.floorOwned(l.locked); err != nil {
-		l.unlock()
-		return nil, nil, fmt.Errorf("%w: %s: %w", errFloorUntrusted, s.dataRoot, err)
+	if err == nil {
+		err = s.floorWritable(fi)
 	}
+	if err != nil {
+		_ = dir.Close() // abandoned; nothing was written
+		return nil, nil, err
+	}
+	return dir, fi, nil
+}
+
+// floorWritable refuses fi, the data root, unless this process can create
+// and rename files in it: as root, or as its owner with the owner's write
+// bit. floorOwned already refuses group and other write, so no one else can.
+// It asks the process's own euid, not the euid seam, which stands for the
+// creator of the store's directories.
+func (s *FileStore) floorWritable(fi fs.FileInfo) error {
+	euid := os.Geteuid()
+	if euid == 0 {
+		return nil
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok || st == nil || int64(st.Uid) != int64(euid) || fi.Mode().Perm()&0o200 == 0 {
+		return fmt.Errorf("%w: %s is mode %04o, and this process is uid %d", errFloorNotWritable, s.dataRoot, fi.Mode().Perm(), euid)
+	}
+	return nil
+}
+
+// checkFloorWritable is openDataRoot's checks alone, which every verb that
+// changes the keystore makes first, before it takes .lock (which creates the
+// entries' directory on a first Put).
+func (s *FileStore) checkFloorWritable() error {
+	dir, _, err := s.openDataRoot()
+	if err != nil {
+		return err
+	}
+	return dir.Close()
+}
+
+// lockFloor takes the data-root lock, waiting at most lockWait or until ctx
+// is done, and reads the floor under it. The data root is opened and judged
+// by openDataRoot. The caller holds .lock, and releases the returned lock
+// with unlock.
+func (s *FileStore) lockFloor(ctx context.Context) (*floorLock, floor, error) {
+	dir, fi, err := s.openDataRoot()
+	if err != nil {
+		return nil, nil, err
+	}
+	l := &floorLock{s: s, dir: dir, locked: fi}
 	if err := s.flockWait(ctx, dir, syscall.LOCK_EX); err != nil {
 		l.unlock()
 		return nil, nil, fmt.Errorf("the keystore floor: %w", err)

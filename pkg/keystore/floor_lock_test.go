@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -181,5 +182,57 @@ func TestFloorLockBoundedWait(t *testing.T) {
 				t.Fatalf("Rotate waited %v of bubble time, want the context's 50ms", took)
 			}
 		})
+	})
+}
+
+// TestFloorNotWritableChangesNothing: a verb that cannot write the floor
+// finds out before it changes anything, so it leaves no master, no entry
+// directory and no half-written version behind.
+func TestFloorNotWritableChangesNothing(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes a mode-0555 directory")
+	}
+	ctx := context.Background()
+	readOnly := func(t *testing.T, s *FileStore) {
+		t.Helper()
+		if err := os.Chmod(s.dataRoot, 0o555); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(s.dataRoot, 0o755) })
+	}
+
+	t.Run("first Put", func(t *testing.T) {
+		s, server := newTestStore(t)
+		readOnly(t, s)
+		if _, err := s.Put(ctx, "a", KindOpaque, []byte("a")); !errors.Is(err, errFloorNotWritable) {
+			t.Fatalf("Put: %v, want errFloorNotWritable", err)
+		}
+		if names, _ := os.ReadDir(server); len(names) != 0 {
+			t.Fatalf("the refused Put created %v (a master or the entries' directory)", names)
+		}
+	})
+
+	t.Run("Put, Rotate and Delete over an entry", func(t *testing.T) {
+		s, server := newTestStore(t)
+		mustPut(t, s, "a", KindOpaque, []byte("a"))
+		before := dirContents(t, filepath.Join(server, "keystore", "a"))
+		readOnly(t, s)
+		for op, fn := range map[string]func() error{
+			"Put":        func() error { _, err := s.Put(ctx, "b", KindOpaque, []byte("b")); return err },
+			"Rotate":     func() error { _, err := s.Rotate(ctx, "a", []byte("b")); return err },
+			"Delete":     func() error { return s.Delete(ctx, "a") },
+			"RaiseFloor": func() error { return s.RaiseFloor(ctx) },
+		} {
+			if err := fn(); !errors.Is(err, errFloorNotWritable) {
+				t.Fatalf("%s: %v, want errFloorNotWritable", op, err)
+			}
+		}
+		if after := dirContents(t, filepath.Join(server, "keystore", "a")); !maps.Equal(after, before) {
+			t.Fatalf("the refused verbs changed the entry: %q, was %q", after, before)
+		}
+		if _, err := os.Lstat(filepath.Join(server, "keystore", "b")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("the refused Put left b: %v", err)
+		}
+		mustCurrent(t, s, "a", "a")
 	})
 }
