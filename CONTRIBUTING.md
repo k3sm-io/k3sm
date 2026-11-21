@@ -36,7 +36,7 @@ repository documents its commands in `docs/GO-STANDARDS.md`. Two tools are pinne
 and the gate fails when either is missing or is any other version. Each runs in a k3sm
 pod, where the pinned build is:
 
-    go install honnef.co/go/tools/cmd/staticcheck@2026.2.1
+    go install honnef.co/go/tools/cmd/staticcheck@2026.2.2
     go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
 
 `hack/verify-deps.sh` needs network access to proxy.golang.org and api.osv.dev;
