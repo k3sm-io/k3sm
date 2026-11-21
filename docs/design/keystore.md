@@ -84,8 +84,8 @@ The fixed decisions:
   credential directory, `/var/lib/k3sm/server/cred/keystore-master/` (the maintainer's
   ruling).
 - Each version is sealed with AES-256-GCM. The additional data is a length-prefixed
-  encoding of (record-format version, kind, name, version, generation), never a bare
-  concatenation.
+  encoding of six fields (record-format version, scope, kind, name, version, generation),
+  never a bare concatenation; the scope is supplied by the opening store (see "Scope").
 - The nonce is 96 bits from crypto/rand, fresh on every seal including Rewrap, never
   derived from the name or the version.
 - The current pointer flips last on rotation. It is written to a temporary file and
