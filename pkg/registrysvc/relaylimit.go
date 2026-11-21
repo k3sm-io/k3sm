@@ -93,6 +93,10 @@ const (
 	// drops its idle entries and, if still full, starts over: the cost is a
 	// fresh bucket for every address, never a refusal.
 	relaySourceTableMax = 4096
+	// relayWarnEvery is the least time between two of the listener's warnings
+	// of one kind (the relay full, a source refused at its share), so a flood
+	// of either costs one line a minute.
+	relayWarnEvery = time.Minute
 )
 
 // relayLimits are the per-source limits a relay applies. Production uses
@@ -653,6 +657,29 @@ func (c *sourceCounts) give(src string) {
 		return
 	}
 	c.n[src]--
+}
+
+// warnGate lets one log line of a kind through per interval and counts the
+// lines it drops in between.
+type warnGate struct {
+	mu         sync.Mutex // guards the fields below
+	logged     bool
+	last       time.Time
+	suppressed int
+}
+
+// allow reports whether a line may be logged at now, every being the least
+// time between two lines, and how many lines were dropped since the last one.
+func (g *warnGate) allow(now time.Time, every time.Duration) (dropped int, ok bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.logged && now.Sub(g.last) < every {
+		g.suppressed++
+		return 0, false
+	}
+	dropped = g.suppressed
+	g.logged, g.last, g.suppressed = true, now, 0
+	return dropped, true
 }
 
 // retryAfterSeconds renders d as a whole-second Retry-After value, at least 1.

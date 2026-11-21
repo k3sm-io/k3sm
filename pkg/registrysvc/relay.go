@@ -435,7 +435,9 @@ func (r *Relay) accept(ctx context.Context, ln net.Listener) error {
 		}
 		_ = srv.Close()
 	}()
-	var served net.Listener = newLimitListener(ln, r.limits.maxConns, r.limits.maxConnsPerSource)
+	ll := newLimitListener(ln, r.limits.maxConns, r.limits.maxConnsPerSource)
+	ll.log = r.log
+	var served net.Listener = ll
 	if r.tls != nil {
 		// TLS wraps the connection cap, not the reverse: the *tls.Conn the
 		// server sees is what lets it answer a plain-HTTP request with 400,
@@ -454,7 +456,9 @@ func (r *Relay) accept(ctx context.Context, ln net.Listener) error {
 // clients holding connections open cost other clients a wait, never this
 // process its file descriptors. A connection from an address already at its
 // share is closed on accept instead: queueing it would make every other
-// address wait behind it.
+// address wait behind it. Both are logged as warnings naming the listener's
+// address, each at most once per warnEvery for this listener, so a flood of
+// either cannot flood the log.
 type limitListener struct {
 	net.Listener
 	sem       chan struct{}
@@ -462,6 +466,13 @@ type limitListener struct {
 	open      sourceCounts
 	done      chan struct{}
 	closeOnce sync.Once
+
+	// log receives the full and over-share warnings. Nil logs nothing.
+	log       *slog.Logger
+	now       func() time.Time
+	warnEvery time.Duration
+	full      warnGate // the relay at its connection limit
+	overShare warnGate // a source refused at its share
 }
 
 func newLimitListener(ln net.Listener, total, perSource int) *limitListener {
@@ -471,6 +482,8 @@ func newLimitListener(ln net.Listener, total, perSource int) *limitListener {
 		perSource: perSource,
 		open:      sourceCounts{n: map[string]int{}},
 		done:      make(chan struct{}),
+		now:       time.Now,
+		warnEvery: relayWarnEvery,
 	}
 }
 
@@ -480,8 +493,13 @@ func (l *limitListener) Accept() (net.Conn, error) {
 	for {
 		select {
 		case l.sem <- struct{}{}:
-		case <-l.done:
-			return nil, net.ErrClosed
+		default:
+			l.warnFull()
+			select {
+			case l.sem <- struct{}{}:
+			case <-l.done:
+				return nil, net.ErrClosed
+			}
 		}
 		c, err := l.Listener.Accept()
 		if err != nil {
@@ -492,9 +510,39 @@ func (l *limitListener) Accept() (net.Conn, error) {
 		if !l.open.take(src, l.perSource) {
 			_ = c.Close()
 			<-l.sem
+			// Logged after the slot is released, so a slow log handler never
+			// holds one.
+			l.warnOverShare(src)
 			continue
 		}
 		return &limitConn{Conn: c, release: func() { l.open.give(src); <-l.sem }}, nil
+	}
+}
+
+// warnFull logs that every slot is held, so the listener accepts no further
+// connection until one frees. It says nothing about whether a client is
+// waiting. addr is this listener's address: each bind address has its own
+// listener, limit and warnings.
+func (l *limitListener) warnFull() {
+	if l.log == nil {
+		return
+	}
+	if dropped, ok := l.full.allow(l.now(), l.warnEvery); ok {
+		l.log.Warn("ingest registry relay is at its connection limit: it accepts no further connection until one frees",
+			"addr", l.Addr().String(), "limit", cap(l.sem), "suppressed", dropped)
+	}
+}
+
+// warnOverShare logs that a connection from src was refused because src
+// already holds its share. src is the address alone, with no port; addr is
+// this listener's address.
+func (l *limitListener) warnOverShare(src string) {
+	if l.log == nil {
+		return
+	}
+	if dropped, ok := l.overShare.allow(l.now(), l.warnEvery); ok {
+		l.log.Warn("ingest registry relay refused a connection: the source already holds its share of connections",
+			"addr", l.Addr().String(), "source", src, "share", l.perSource, "suppressed", dropped)
 	}
 }
 

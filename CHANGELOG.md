@@ -198,6 +198,11 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
 - Uninstall names a vm helper still running from a k3sm version the install no longer keeps. It
   does not signal that helper, and the error gives its process ID and the command to stop it by
   hand, `sudo kill -TERM -<pid>`, to run if `ps -o pid,command -g <pid>` shows only processes of the path the error names.
+- The registry relay logs a warning when all of the connections on one of its listening addresses
+  are held, so it accepts no further connection there until one frees, and when it closes a connection from a client already
+  holding its share there. The limits and the warnings are per listening address: each warning names
+  that address and logs at most once a minute for it, with a count of the lines it dropped in
+  between. See [Pulling](docs/user/registry.md#pulling).
 
 ### Changed
 
@@ -326,7 +331,8 @@ left behind after 24 hours. See [Models in the cluster registry](docs/user/model
   restart (this applies to the relay; the push gate's upload bound is separate). Each write of a response
   and each read of a request body must make progress within 5 minutes, or the relay closes the
   connection and frees the slot. A blob still streams for as long as it takes while it keeps moving:
-  there is no flat read or write timeout. A connection cut this way is logged as a warning.
+  there is no flat read or write timeout. A connection cut this way is logged as a warning. See
+  [Pulling](docs/user/registry.md#pulling).
 - A server whose control plane does not report healthy in time while the Mac is heavily loaded no
   longer parks on the crash-loop breaker after five attempts. It backs off instead, from 30 seconds
   doubling up to 10 minutes, `k3sm status` shows when the next attempt starts and that an attempt
