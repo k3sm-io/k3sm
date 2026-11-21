@@ -74,7 +74,8 @@ partial G3 "every seal draws a fresh nonce (library)" "Rewrap changes every nonc
 check G4 "Delete then Put does not reopen the old v1" TestDeleteThenPutRefusesReplayedRecord
 check G5 "a copied-back current is refused against the floor, with its own message; nothing recorded for the name accepts it" \
 	TestFloorRefusesCopiedBackPointer TestFloorCheck
-check G6 "the floor and the data root are root-owned and not shared, judged on the descriptor" TestFloorTrust
+check G6 "the floor and the data root are root-owned and not shared, judged on the descriptor; the floor is the system scope's, parsed strictly; a caller that cannot write it changes nothing" \
+	TestFloorTrust TestFloorScope FuzzParseFloor TestFloorNotWritableChangesNothing
 check G7 "the floor is raised by every mutating verb and the start of every root verb; one behind is accepted; each write re-reads it under the data-root lock, with a bounded wait" \
 	TestFloorRaised TestFloorWriteRereads TestFloorLockBoundedWait
 check G8 "Rotate flips the pointer last; a crash before the flip leaves the old version current" \
@@ -89,9 +90,9 @@ partial G14 "one lock with a bounded wait that excludes, and no read that blocks
 	TestLockBoundedWait TestLockExcludes TestConcurrentOperations TestFIFORefused
 check G15 "files a root verb writes are the service user's, at the layout's modes, inside the store" \
 	TestOwnership TestCredSymlinkRefused TestRefusesSymlinks
-partial G16 "List marks an unreadable entry with Err, and Delete still removes it; an entry directory with no current is an interrupted put only in the shape a crashed Put leaves, and Delete removes it too (library)" \
+partial G16 "List marks an unreadable entry with Err, and Delete still removes it; an entry directory with no current is an interrupted put only in the shape a crashed Put leaves and with its generation not in the floor, and Delete removes it too (library)" \
 	"list exits 1 on a corrupt entry (PR 4: k3sm keys)" \
-	TestListMarksCorruptEntry TestDeleteCorruptEntry TestEntryWithNoPointer
+	TestListMarksCorruptEntry TestDeleteCorruptEntry TestEntryWithNoPointer TestCommittedBeforeDecodesGeneration
 pend G17 "show prints a value only with --reveal, byte-exact (PR 4)"
 pend G18 "delivery refused while encryption is off (PR 5)"
 pend G19 "the delivery declaration is root-owned (PR 5)"
