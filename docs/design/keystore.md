@@ -296,7 +296,7 @@ The write order on a change is: the record, then the pointer, then the floor.
 - **Put:** write `generation`, `v1`, `current` (sequence 1), then set the floor entry.
 - **Rotate:** write the new version file, flip `current` (sequence + 1), then raise the
   floor to that sequence.
-- **Delete:** remove the entry directory, then remove the floor entry.
+- **Delete:** remove `current`, then the entry directory, then remove the floor entry.
 
 A crash after the pointer flip but before the floor write leaves the floor one behind the
 pointer, which the rule above accepts (pointer at or above floor). So that the lag does not
