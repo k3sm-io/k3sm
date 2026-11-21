@@ -19,6 +19,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,193 +27,79 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
-	"strconv"
 	"strings"
+	"syscall"
 	"testing"
-	"time"
 
 	"k3sm.io/k3sm/pkg/keystore"
 )
 
-// fakeKeys is a keysStore kept as plain files under one directory, so a test
-// can copy and restore the tree the way an operator backs up keystore/. It
-// stores values in the clear: it stands in for the store's API, not its
-// sealing, which pkg/keystore tests.
-type fakeKeys struct {
-	root      string
-	calls     []string
-	rewrapErr error
-	rewrapKey []byte
+// keysRecorder passes every call to the store it wraps, the real
+// *keystore.FileStore, and records the method's name, so a test can check
+// which calls a verb made and in what order.
+type keysRecorder struct {
+	keysStore
+	calls *[]string
 }
 
-var _ keysStore = (*fakeKeys)(nil)
+func (r keysRecorder) note(m string) { *r.calls = append(*r.calls, m) }
 
-var fakeCreated = time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
-
-func (f *fakeKeys) entry(name string) string { return filepath.Join(f.root, name) }
-
-func (f *fakeKeys) checkName(name string) error {
-	if name == "" || strings.ContainsRune(name, '/') || name != strings.ToLower(name) || strings.HasPrefix(name, ".") {
-		return keystore.ErrInvalidName
-	}
-	return nil
+func (r keysRecorder) Put(ctx context.Context, name string, kind keystore.Kind, value []byte) (keystore.Version, error) {
+	r.note("Put")
+	return r.keysStore.Put(ctx, name, kind, value)
 }
 
-func (f *fakeKeys) write(name string, n uint64, kind keystore.Kind, value []byte) error {
-	d := f.entry(name)
-	if err := os.WriteFile(filepath.Join(d, "v"+strconv.FormatUint(n, 10)), value, 0o600); err != nil {
-		return err
-	}
-	if err := os.WriteFile(filepath.Join(d, "kind"), []byte(strconv.Itoa(int(kind))), 0o600); err != nil {
-		return err
-	}
-	return os.WriteFile(filepath.Join(d, "current"), []byte(strconv.FormatUint(n, 10)), 0o600)
+func (r keysRecorder) Current(ctx context.Context, name string) (keystore.Version, []byte, error) {
+	r.note("Current")
+	return r.keysStore.Current(ctx, name)
 }
 
-func (f *fakeKeys) Put(_ context.Context, name string, kind keystore.Kind, value []byte) (keystore.Version, error) {
-	f.calls = append(f.calls, "Put")
-	if err := f.checkName(name); err != nil {
-		return keystore.Version{}, err
-	}
-	if err := os.MkdirAll(f.root, 0o700); err != nil {
-		return keystore.Version{}, err
-	}
-	if err := os.Mkdir(f.entry(name), 0o700); errors.Is(err, fs.ErrExist) {
-		return keystore.Version{}, keystore.ErrExists
-	} else if err != nil {
-		return keystore.Version{}, err
-	}
-	if err := f.write(name, 1, kind, value); err != nil {
-		return keystore.Version{}, err
-	}
-	return f.version(name, 1, kind, value), nil
+func (r keysRecorder) Get(ctx context.Context, name string, n uint64) (keystore.Version, []byte, error) {
+	r.note("Get")
+	return r.keysStore.Get(ctx, name, n)
 }
 
-func (f *fakeKeys) version(name string, n uint64, kind keystore.Kind, value []byte) keystore.Version {
-	return keystore.Version{Name: name, Version: n, Kind: kind, Created: fakeCreated, Fingerprint: fmt.Sprintf("fp%d-%d", n, len(value))}
+func (r keysRecorder) List(ctx context.Context) ([]keystore.Entry, error) {
+	r.note("List")
+	return r.keysStore.List(ctx)
 }
 
-func (f *fakeKeys) current(name string) (uint64, keystore.Kind, error) {
-	d := f.entry(name)
-	if _, err := os.Stat(d); errors.Is(err, fs.ErrNotExist) {
-		return 0, 0, keystore.ErrNotFound
-	}
-	if _, err := os.Stat(filepath.Join(d, "damaged")); err == nil {
-		return 0, 0, fmt.Errorf("%w: test damage", keystore.ErrCorrupt)
-	}
-	b, err := os.ReadFile(filepath.Join(d, "current"))
-	if err != nil {
-		return 0, 0, err
-	}
-	n, err := strconv.ParseUint(string(b), 10, 64)
-	if err != nil {
-		return 0, 0, err
-	}
-	k, err := os.ReadFile(filepath.Join(d, "kind"))
-	if err != nil {
-		return 0, 0, err
-	}
-	kind, err := strconv.Atoi(string(k))
-	return n, keystore.Kind(kind), err
+func (r keysRecorder) Rotate(ctx context.Context, name string, value []byte) (keystore.Version, error) {
+	r.note("Rotate")
+	return r.keysStore.Rotate(ctx, name, value)
 }
 
-func (f *fakeKeys) Current(ctx context.Context, name string) (keystore.Version, []byte, error) {
-	f.calls = append(f.calls, "Current")
-	n, _, err := f.current(name)
-	if err != nil {
-		return keystore.Version{}, nil, err
-	}
-	return f.get(name, n)
+func (r keysRecorder) Delete(ctx context.Context, name string) error {
+	r.note("Delete")
+	return r.keysStore.Delete(ctx, name)
 }
 
-func (f *fakeKeys) get(name string, n uint64) (keystore.Version, []byte, error) {
-	cur, kind, err := f.current(name)
-	if err != nil {
-		return keystore.Version{}, nil, err
-	}
-	if n == 0 || n > cur {
-		return keystore.Version{}, nil, keystore.ErrVersionNotFound
-	}
-	v, err := os.ReadFile(filepath.Join(f.entry(name), "v"+strconv.FormatUint(n, 10)))
-	if err != nil {
-		return keystore.Version{}, nil, err
-	}
-	return f.version(name, n, kind, v), v, nil
+func (r keysRecorder) Rewrap(ctx context.Context, newMaster []byte) error {
+	r.note("Rewrap")
+	return r.keysStore.Rewrap(ctx, newMaster)
 }
 
-func (f *fakeKeys) Get(_ context.Context, name string, n uint64) (keystore.Version, []byte, error) {
-	f.calls = append(f.calls, "Get")
-	return f.get(name, n)
+func (r keysRecorder) RaiseFloor(ctx context.Context) error {
+	r.note("RaiseFloor")
+	return r.keysStore.RaiseFloor(ctx)
 }
 
-func (f *fakeKeys) List(context.Context) ([]keystore.Entry, error) {
-	f.calls = append(f.calls, "List")
-	des, err := os.ReadDir(f.root)
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	var out []keystore.Entry
-	for _, de := range des {
-		cur, _, err := f.current(de.Name())
-		if err != nil {
-			out = append(out, keystore.Entry{Name: de.Name(), Err: err})
-			continue
-		}
-		e := keystore.Entry{Name: de.Name()}
-		for n := uint64(1); n <= cur; n++ {
-			v, _, err := f.get(de.Name(), n)
-			if err != nil {
-				return nil, err
-			}
-			e.Versions = append(e.Versions, v)
-		}
-		e.Current = e.Versions[len(e.Versions)-1]
-		out = append(out, e)
-	}
-	return out, nil
-}
-
-func (f *fakeKeys) Rotate(_ context.Context, name string, value []byte) (keystore.Version, error) {
-	f.calls = append(f.calls, "Rotate")
-	cur, kind, err := f.current(name)
-	if err != nil {
-		return keystore.Version{}, err
-	}
-	if err := f.write(name, cur+1, kind, value); err != nil {
-		return keystore.Version{}, err
-	}
-	return f.version(name, cur+1, kind, value), nil
-}
-
-func (f *fakeKeys) Delete(_ context.Context, name string) error {
-	f.calls = append(f.calls, "Delete")
-	if _, err := os.Stat(f.entry(name)); errors.Is(err, fs.ErrNotExist) {
-		return keystore.ErrNotFound
-	}
-	return os.RemoveAll(f.entry(name))
-}
-
-func (f *fakeKeys) Rewrap(_ context.Context, newMaster []byte) error {
-	f.calls = append(f.calls, "Rewrap")
-	f.rewrapKey = slices.Clone(newMaster)
-	return f.rewrapErr
-}
-
-func (f *fakeKeys) RaiseFloor(context.Context) error {
-	f.calls = append(f.calls, "RaiseFloor")
-	return nil
-}
-
-// keysHarness runs the keys verbs against a fakeKeys under a temp work dir.
+// keysHarness runs the keys verbs against the real *keystore.FileStore over
+// a t.TempDir() data root, laid out as pkg/keystore's tests lay it out: the
+// data root and the floor owned by keysFloorIDs, the server work dir inside
+// it handed to the service user (keysServiceIDs).
 type keysHarness struct {
-	t         *testing.T
-	work      string
-	store     *fakeKeys
-	cfg       keystore.Config
+	t    *testing.T
+	work string
+	// cfg is the Config the verb built from the install layout; storeCfg is
+	// the one the store was opened with, cfg with the test's floor owner.
+	cfg, storeCfg keystore.Config
+	// wrap, when set, replaces the store the verbs get; nil is the real
+	// store. Each test that sets it says why the real store will not do.
+	wrap      func(keysStore) keysStore
+	calls     []string
 	euid      int
 	stdin     io.Reader
 	stdinTTY  bool
@@ -224,11 +111,15 @@ type keysHarness struct {
 
 func newKeysHarness(t *testing.T) *keysHarness {
 	t.Helper()
+	keysServiceIDs(t) // a root run without a service user skips here
 	work := filepath.Join(t.TempDir(), "server")
+	if err := os.Mkdir(work, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	keysGiveToService(t, work)
 	return &keysHarness{
 		t:     t,
 		work:  work,
-		store: &fakeKeys{root: filepath.Join(work, "keystore")},
 		stdin: strings.NewReader(""),
 		rand:  bytes.NewReader(bytes.Repeat([]byte{0xA5}, 64)),
 	}
@@ -240,12 +131,21 @@ func (h *keysHarness) run(args ...string) int {
 	h.t.Helper()
 	h.stdout.Reset()
 	h.stderr.Reset()
+	uid, gid := keysServiceIDs(h.t)
 	env := keysEnv{
 		euid:       func() int { return h.euid },
-		serviceIDs: func() (uint32, uint32, error) { return uint32(os.Getuid()), uint32(os.Getgid()), nil },
+		serviceIDs: func() (uint32, uint32, error) { return uid, gid, nil },
 		open: func(cfg keystore.Config) keysStore {
 			h.cfg = cfg
-			return h.store
+			// Non-root, a test cannot create a root-owned file, so the test
+			// user stands in for root as the floor's owner.
+			h.storeCfg = cfg
+			h.storeCfg.FloorUID, h.storeCfg.FloorGID = keysFloorIDs()
+			var s keysStore = keystore.New(h.storeCfg)
+			if h.wrap != nil {
+				s = h.wrap(s)
+			}
+			return keysRecorder{keysStore: s, calls: &h.calls}
 		},
 		stdin:     h.stdin,
 		stdinTTY:  func() bool { return h.stdinTTY },
@@ -273,13 +173,56 @@ func (h *keysHarness) put(name string, value []byte) {
 	h.mustRun(0, "put", name, "--in", "-")
 }
 
+// keystoreDir is the entries' directory the verbs use.
+func (h *keysHarness) keystoreDir() string { return filepath.Join(h.work, "keystore") }
+
+// value reads version n of name back through a second real store over the
+// same files, not through the verbs.
 func (h *keysHarness) value(name string, n uint64) []byte {
 	h.t.Helper()
-	_, v, err := h.store.get(name, n)
+	if h.storeCfg.Dir == "" {
+		h.t.Fatal("no verb has opened the store yet")
+	}
+	_, v, err := keystore.New(h.storeCfg).Get(context.Background(), name, n)
 	if err != nil {
-		h.t.Fatalf("read %s v%d from the fake store: %v", name, n, err)
+		h.t.Fatalf("read %s v%d from the store: %v", name, n, err)
 	}
 	return v
+}
+
+// masterFile returns the master key file's bytes.
+func (h *keysHarness) masterFile() []byte {
+	h.t.Helper()
+	b, err := os.ReadFile(filepath.Join(h.work, "cred", "keystore-master", "master"))
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return b
+}
+
+// damageRecord flips the last byte of one record file of an entry, as a disk
+// error or an edit would, keeping its owner and mode.
+func (h *keysHarness) damageRecord(name, file string) {
+	h.t.Helper()
+	p := filepath.Join(h.keystoreDir(), name, file)
+	b, err := os.ReadFile(p)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	if len(b) == 0 {
+		h.t.Fatalf("%s is empty", p)
+	}
+	b[len(b)-1] ^= 0xff
+	f, err := os.OpenFile(p, os.O_WRONLY, 0)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	if _, err := f.WriteAt(b, 0); err != nil {
+		h.t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		h.t.Fatal(err)
+	}
 }
 
 // failReader fails the test if anything reads it: a verb that must not read
@@ -304,6 +247,9 @@ func TestKeysRotateFromVersionNoValueOut(t *testing.T) {
 	if got := h.value("signer", 3); !bytes.Equal(got, v1) {
 		t.Fatalf("version 3 = %q, want version 1's bytes %q", got, v1)
 	}
+	if got := h.value("signer", 2); !bytes.Equal(got, v2) {
+		t.Fatalf("version 2 = %q, want %q", got, v2)
+	}
 	out := h.stdout.String() + h.stderr.String()
 	for _, secret := range [][]byte{v1, bytes.TrimSpace(v1), v2} {
 		if strings.Contains(out, string(secret)) {
@@ -312,6 +258,19 @@ func TestKeysRotateFromVersionNoValueOut(t *testing.T) {
 	}
 	if !strings.Contains(h.stdout.String(), "version 3") {
 		t.Errorf("rotate --from-version output %q does not name the new version", h.stdout.String())
+	}
+	h.mustRun(0, "list", "-o", "json")
+	var doc struct {
+		Entries []struct {
+			Version  uint64 `json:"version"`
+			Versions int    `json:"versions"`
+		} `json:"entries"`
+	}
+	if err := json.Unmarshal(h.stdout.Bytes(), &doc); err != nil {
+		t.Fatalf("list -o json: %v\n%s", err, h.stdout.String())
+	}
+	if len(doc.Entries) != 1 || doc.Entries[0].Version != 3 || doc.Entries[0].Versions != 3 {
+		t.Fatalf("list after rotate --from-version = %+v, want version 3 of 3", doc.Entries)
 	}
 
 	for _, tc := range []struct {
@@ -331,26 +290,26 @@ func TestKeysRotateFromVersionNoValueOut(t *testing.T) {
 	}
 }
 
+// rfc3339UTC matches the created column: second precision, in UTC.
+var rfc3339UTC = regexp.MustCompile(`\b\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\b`)
+
 func TestKeysListCorruptExitsOne(t *testing.T) {
 	h := newKeysHarness(t)
 	h.put("system/alpha", []byte("a"))
 	h.put("system/beta", []byte("b"))
 	h.mustRun(0, "list")
-	if !strings.Contains(h.stdout.String(), "system/alpha") || !strings.Contains(h.stdout.String(), "2026-03-04T05:06:07Z") {
+	if !strings.Contains(h.stdout.String(), "system/alpha") || !rfc3339UTC.MatchString(h.stdout.String()) {
 		t.Fatalf("list output lacks the name or the UTC created time:\n%s", h.stdout.String())
 	}
 
-	if err := os.WriteFile(filepath.Join(h.store.entry("beta"), "damaged"), nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	h.store.calls = nil
+	h.damageRecord("beta", "v1")
+	h.calls = nil
 	h.mustRun(1, "list")
-	if i, j := slices.Index(h.store.calls, "RaiseFloor"), slices.Index(h.store.calls, "List"); i < 0 || i > j {
-		t.Errorf("list calls %v: RaiseFloor must come before List", h.store.calls)
+	if i, j := slices.Index(h.calls, "RaiseFloor"), slices.Index(h.calls, "List"); i < 0 || i > j {
+		t.Errorf("list calls %v: RaiseFloor must come before List", h.calls)
 	}
-	lines := strings.Split(h.stdout.String(), "\n")
 	var alpha, beta string
-	for _, l := range lines {
+	for _, l := range strings.Split(h.stdout.String(), "\n") {
 		switch {
 		case strings.HasPrefix(l, "system/alpha"):
 			alpha = l
@@ -361,8 +320,12 @@ func TestKeysListCorruptExitsOne(t *testing.T) {
 	if !strings.Contains(alpha, " ok") {
 		t.Errorf("healthy entry line %q is not ok", alpha)
 	}
-	if !strings.Contains(beta, "corrupt") || !strings.Contains(beta, "test damage") {
-		t.Errorf("damaged entry line %q lacks corrupt and the store's message", beta)
+	_, _, storeErr := keystore.New(h.storeCfg).Current(context.Background(), "beta")
+	if !errors.Is(storeErr, keystore.ErrCorrupt) {
+		t.Fatalf("the damaged entry opens: %v, want ErrCorrupt", storeErr)
+	}
+	if !strings.Contains(beta, "corrupt: ") || !strings.Contains(beta, "version 1: ") || !strings.Contains(beta, "does not authenticate") {
+		t.Errorf("damaged entry line %q lacks corrupt and the store's message naming the record", beta)
 	}
 
 	h.mustRun(1, "list", "-o", "json")
@@ -378,8 +341,8 @@ func TestKeysListCorruptExitsOne(t *testing.T) {
 	if err := json.Unmarshal(h.stdout.Bytes(), &doc); err != nil {
 		t.Fatalf("list -o json: %v\n%s", err, h.stdout.String())
 	}
-	if len(doc.Entries) != 2 || doc.Entries[0].Status != "ok" || doc.Entries[0].Version != 1 || doc.Entries[0].Created != "2026-03-04T05:06:07Z" ||
-		doc.Entries[1].Status != "corrupt" || !strings.Contains(doc.Entries[1].Error, "test damage") {
+	if len(doc.Entries) != 2 || doc.Entries[0].Status != "ok" || doc.Entries[0].Version != 1 || !rfc3339UTC.MatchString(doc.Entries[0].Created) ||
+		doc.Entries[1].Name != "system/beta" || doc.Entries[1].Status != "corrupt" || !strings.Contains(doc.Entries[1].Error, "does not authenticate") {
 		t.Fatalf("list -o json = %+v", doc.Entries)
 	}
 	h.mustRun(2, "list", "-o", "yaml")
@@ -389,42 +352,55 @@ func TestKeysShowRevealByteExact(t *testing.T) {
 	seed := bytes.Repeat([]byte{0x00, 0x0a, 0xff, 0x20}, 8)
 	for _, tc := range []struct {
 		name  string
+		kind  string
 		value []byte
+		next  []byte
 	}{
-		{"opaque with trailing newline", []byte("token\n")},
-		{"opaque binary", []byte{0x00, 0x01, '\r', '\n', 0xfe}},
-		{"ed25519 seed 32 bytes", seed},
-		{"ed25519 expanded 64 bytes", append(slices.Clone(seed), seed...)},
+		{"opaque with trailing newline", "opaque", []byte("token\n"), []byte("other")},
+		{"opaque binary", "opaque", []byte{0x00, 0x01, '\r', '\n', 0xfe}, []byte("other")},
+		{"ed25519 seed 32 bytes", "ed25519", seed, bytes.Repeat([]byte{0x7e}, ed25519.SeedSize)},
+		{"ed25519 expanded 64 bytes", "ed25519", ed25519.NewKeyFromSeed(seed), ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0x7e}, ed25519.SeedSize))},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newKeysHarness(t)
-			h.put("system/k", tc.value)
-			h.store.calls = nil
+			h.stdin = bytes.NewReader(tc.value)
+			h.mustRun(0, "put", "system/k", "--kind", tc.kind, "--in", "-")
+			rec, err := os.ReadFile(filepath.Join(h.keystoreDir(), "k", "v1"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bytes.Contains(rec, tc.value) {
+				t.Fatalf("the record on disk holds the value in the clear: %x", rec)
+			}
+			h.calls = nil
 			h.mustRun(0, "show", "system/k", "--reveal")
 			if !bytes.Equal(h.stdout.Bytes(), tc.value) {
 				t.Fatalf("show --reveal wrote %q, want exactly %q", h.stdout.Bytes(), tc.value)
 			}
-			if i, j := slices.Index(h.store.calls, "RaiseFloor"), slices.Index(h.store.calls, "Current"); i < 0 || i > j {
-				t.Errorf("show calls %v: RaiseFloor must come before Current", h.store.calls)
+			if i, j := slices.Index(h.calls, "RaiseFloor"), slices.Index(h.calls, "Current"); i < 0 || i > j {
+				t.Errorf("show calls %v: RaiseFloor must come before Current", h.calls)
 			}
-			h.stdin = bytes.NewReader([]byte("other"))
+			h.stdin = bytes.NewReader(tc.next)
 			h.mustRun(0, "rotate", "system/k", "--in", "-")
 			h.mustRun(0, "show", "system/k", "--version", "1", "--reveal")
 			if !bytes.Equal(h.stdout.Bytes(), tc.value) {
 				t.Fatalf("show --version 1 --reveal wrote %q, want exactly %q", h.stdout.Bytes(), tc.value)
 			}
 			h.mustRun(0, "show", "system/k")
-			if bytes.Contains(h.stdout.Bytes(), tc.value) || bytes.Contains(h.stdout.Bytes(), []byte("other")) {
+			if bytes.Contains(h.stdout.Bytes(), tc.value) || bytes.Contains(h.stdout.Bytes(), tc.next) {
 				t.Fatalf("show without --reveal printed the value:\n%s", h.stdout.String())
 			}
-			if !strings.Contains(h.stdout.String(), "system/k") || !strings.Contains(h.stdout.String(), "2") {
-				t.Fatalf("show metadata lacks the name or version:\n%s", h.stdout.String())
+			if !strings.Contains(h.stdout.String(), "system/k") || !strings.Contains(h.stdout.String(), "version:     2") ||
+				!strings.Contains(h.stdout.String(), "kind:        "+tc.kind) {
+				t.Fatalf("show metadata lacks the name, version or kind:\n%s", h.stdout.String())
 			}
 		})
 	}
 }
 
-// copyTree copies the regular files and directories under src to dst.
+// copyTree copies the directories and regular files under src to dst,
+// keeping each one's owner and mode, as `ditto` does in the restore recipe
+// (docs/user/keys.md). Anything else under src fails the test.
 func copyTree(t *testing.T, src, dst string) {
 	t.Helper()
 	err := filepath.WalkDir(src, func(p string, d fs.DirEntry, err error) error {
@@ -435,15 +411,35 @@ func copyTree(t *testing.T, src, dst string) {
 		if err != nil {
 			return err
 		}
-		to := filepath.Join(dst, rel)
-		if d.IsDir() {
-			return os.MkdirAll(to, 0o700)
-		}
-		b, err := os.ReadFile(p)
+		fi, err := os.Lstat(p)
 		if err != nil {
 			return err
 		}
-		return os.WriteFile(to, b, 0o600)
+		st, ok := fi.Sys().(*syscall.Stat_t)
+		if !ok {
+			return fmt.Errorf("%s: no owner", p)
+		}
+		to := filepath.Join(dst, rel)
+		switch {
+		case fi.IsDir():
+			if err := os.Mkdir(to, 0o700); err != nil {
+				return err
+			}
+		case fi.Mode().IsRegular():
+			b, err := os.ReadFile(p)
+			if err != nil {
+				return err
+			}
+			if err := os.WriteFile(to, b, 0o600); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("%s is %v, not a directory or a regular file", p, fi.Mode().Type())
+		}
+		if err := os.Chmod(to, fi.Mode().Perm()); err != nil {
+			return err
+		}
+		return os.Lchown(to, int(st.Uid), int(st.Gid))
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -456,13 +452,14 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 		value := []byte("rollback\x00value\n")
 		h.put("system/rb", value)
 		backup := filepath.Join(t.TempDir(), "keystore")
-		copyTree(t, h.store.root, backup)
+		copyTree(t, h.keystoreDir(), backup)
 		h.mustRun(0, "rm", "system/rb", "--yes")
 		h.mustRun(1, "show", "system/rb", "--reveal")
-		if err := os.RemoveAll(h.store.root); err != nil {
+		if err := os.RemoveAll(h.keystoreDir()); err != nil {
 			t.Fatal(err)
 		}
-		copyTree(t, backup, h.store.root)
+		copyTree(t, backup, h.keystoreDir())
+		h.mustRun(0, "list")
 		h.mustRun(0, "show", "system/rb", "--reveal")
 		if !bytes.Equal(h.stdout.Bytes(), value) {
 			t.Fatalf("restored value = %q, want %q", h.stdout.Bytes(), value)
@@ -517,7 +514,7 @@ func TestKeysRefusals(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newKeysHarness(t)
 			h.put("system/held", []byte("held-secret"))
-			h.store.calls = nil
+			h.calls = nil
 			h.euid = tc.euid
 			h.stdin = strings.NewReader(tc.stdin)
 			h.stdinTTY, h.stdoutTTY = tc.stdinTTY, tc.stdoutTTY
@@ -532,9 +529,9 @@ func TestKeysRefusals(t *testing.T) {
 			if strings.Contains(out, "held-secret") {
 				t.Errorf("output carries a stored value: %q", out)
 			}
-			for _, c := range h.store.calls {
+			for _, c := range h.calls {
 				if c != "RaiseFloor" && c != "Current" && c != "Get" {
-					t.Errorf("refused verb reached the store: %v", h.store.calls)
+					t.Errorf("refused verb reached the store: %v", h.calls)
 					break
 				}
 			}
@@ -576,30 +573,51 @@ func TestKeysRefusals(t *testing.T) {
 func TestKeysStoreConfigFromLayout(t *testing.T) {
 	h := newKeysHarness(t)
 	h.mustRun(0, "list")
+	uid, gid := keysServiceIDs(t)
+	// The install layout's config leaves the floor's owner at root, 0:0.
 	want := keystore.Config{
 		Dir:       filepath.Join(h.work, "keystore"),
 		MasterDir: filepath.Join(h.work, "cred", "keystore-master"),
-		UID:       uint32(os.Getuid()),
-		GID:       uint32(os.Getgid()),
+		UID:       uid,
+		GID:       gid,
 		DataRoot:  filepath.Dir(h.work),
 	}
 	if h.cfg != want {
 		t.Fatalf("store config = %+v, want %+v", h.cfg, want)
 	}
+	if h.cfg.FloorUID != 0 || h.cfg.FloorGID != 0 {
+		t.Fatalf("store config names the floor owner %d:%d, want 0:0 (root)", h.cfg.FloorUID, h.cfg.FloorGID)
+	}
+}
+
+// keysResumedStore forces ErrRewrapResumed from Rewrap and records the key it
+// was given; every other call goes to the real store. The real store returns
+// ErrRewrapResumed only after an earlier rewrap crashed with some record live
+// under its key, a crash no seam outside pkg/keystore can stage.
+type keysResumedStore struct {
+	keysStore
+	key []byte
+}
+
+func (s *keysResumedStore) Rewrap(_ context.Context, newMaster []byte) error {
+	s.key = slices.Clone(newMaster)
+	return fmt.Errorf("rewrap: %w", keystore.ErrRewrapResumed)
 }
 
 func TestKeysRewrap(t *testing.T) {
 	key := bytes.Repeat([]byte{0xA5}, 32)
 	t.Run("key-out written 0600 before rewrap", func(t *testing.T) {
 		h := newKeysHarness(t)
+		h.put("system/a", []byte("a-value"))
+		before := h.masterFile()
 		p := filepath.Join(t.TempDir(), "new-master")
 		h.mustRun(0, "rewrap", "--key-out", p)
 		got, err := os.ReadFile(p)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !bytes.Equal(got, key) || !bytes.Equal(h.store.rewrapKey, key) {
-			t.Fatalf("key file %x, rewrap key %x, want both %x", got, h.store.rewrapKey, key)
+		if !bytes.Equal(got, key) || !bytes.Equal(h.masterFile(), key) || bytes.Equal(before, key) {
+			t.Fatalf("key file %x, master now %x (was %x), want both %x", got, h.masterFile(), before, key)
 		}
 		fi, err := os.Lstat(p)
 		if err != nil {
@@ -614,6 +632,9 @@ func TestKeysRewrap(t *testing.T) {
 		}
 		if !strings.Contains(out, "delete") || !strings.Contains(out, p) {
 			t.Errorf("rewrap output %q does not tell the operator to delete %s", out, p)
+		}
+		if got := h.value("a", 1); string(got) != "a-value" {
+			t.Fatalf("after rewrap the entry holds %q", got)
 		}
 	})
 	for _, tc := range []struct {
@@ -633,10 +654,12 @@ func TestKeysRewrap(t *testing.T) {
 	} {
 		t.Run("key-out refuses "+tc.name, func(t *testing.T) {
 			h := newKeysHarness(t)
+			h.put("system/a", []byte("a-value"))
+			before := h.masterFile()
 			p := filepath.Join(t.TempDir(), "new-master")
 			tc.make(t, p)
 			h.mustRun(1, "rewrap", "--key-out", p)
-			if slices.Contains(h.store.calls, "Rewrap") {
+			if slices.Contains(h.calls, "Rewrap") || !bytes.Equal(h.masterFile(), before) {
 				t.Fatal("rewrap ran over an existing key file")
 			}
 			if _, err := os.Stat(filepath.Join(filepath.Dir(p), "target")); !errors.Is(err, fs.ErrNotExist) {
@@ -644,31 +667,61 @@ func TestKeysRewrap(t *testing.T) {
 			}
 		})
 	}
+	t.Run("resumed", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/a", []byte("a-value"))
+		// The one forced store error: see keysResumedStore.
+		resumed := &keysResumedStore{}
+		h.wrap = func(s keysStore) keysStore { resumed.keysStore = s; return resumed }
+		p := filepath.Join(t.TempDir(), "new-master")
+		h.mustRun(3, "rewrap", "--key-out", p)
+		if !bytes.Equal(resumed.key, key) {
+			t.Fatalf("rewrap key %x, want %x", resumed.key, key)
+		}
+		if !strings.Contains(h.stderr.String(), "new key") {
+			t.Errorf("stderr %q does not say %q", h.stderr.String(), "new key")
+		}
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("the key file is gone after a resumed rewrap: %v", err)
+		}
+	})
 	for _, tc := range []struct {
-		name string
-		err  error
-		want int
-		say  string
+		name   string
+		damage func(t *testing.T, h *keysHarness)
+		want   error
+		say    string
 	}{
-		{"resumed", fmt.Errorf("rewrap: %w", keystore.ErrRewrapResumed), 3, "new key"},
-		{"scope unsupported", fmt.Errorf("rewrap: %w", keystore.ErrScopeUnsupported), 1, "keystore/.user"},
-		{"other failure", errors.New("disk on fire"), 1, "--key-in"},
+		{"scope unsupported", func(t *testing.T, h *keysHarness) {
+			if err := os.Mkdir(filepath.Join(h.keystoreDir(), ".user"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}, keystore.ErrScopeUnsupported, "keystore/.user"},
+		{"an entry that does not open", func(t *testing.T, h *keysHarness) { h.damageRecord("a", "v1") }, keystore.ErrCorrupt, "--key-in"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newKeysHarness(t)
-			h.store.rewrapErr = tc.err
+			h.put("system/a", []byte("a-value"))
+			before := h.masterFile()
+			tc.damage(t, h)
+			if err := keystore.New(h.storeCfg).Rewrap(context.Background(), bytes.Repeat([]byte{1}, 32)); !errors.Is(err, tc.want) {
+				t.Fatalf("the store's own Rewrap: %v, want %v", err, tc.want)
+			}
 			p := filepath.Join(t.TempDir(), "new-master")
-			h.mustRun(tc.want, "rewrap", "--key-out", p)
+			h.mustRun(1, "rewrap", "--key-out", p)
 			if !strings.Contains(h.stderr.String(), tc.say) {
 				t.Errorf("stderr %q does not say %q", h.stderr.String(), tc.say)
 			}
 			if _, err := os.Stat(p); err != nil {
 				t.Errorf("the key file is gone after a failed rewrap: %v", err)
 			}
+			if !bytes.Equal(h.masterFile(), before) {
+				t.Error("a refused rewrap swapped the master")
+			}
 		})
 	}
 	t.Run("key-in reuses a saved key", func(t *testing.T) {
 		h := newKeysHarness(t)
+		h.put("system/a", []byte("a-value"))
 		saved := bytes.Repeat([]byte{0x3c}, 32)
 		p := filepath.Join(t.TempDir(), "saved")
 		if err := os.WriteFile(p, saved, 0o600); err != nil {
@@ -676,8 +729,11 @@ func TestKeysRewrap(t *testing.T) {
 		}
 		h.rand = failReaderRand{t}
 		h.mustRun(0, "rewrap", "--key-in", p)
-		if !bytes.Equal(h.store.rewrapKey, saved) {
-			t.Fatalf("rewrap key %x, want the saved %x", h.store.rewrapKey, saved)
+		if !bytes.Equal(h.masterFile(), saved) {
+			t.Fatalf("master %x, want the saved %x", h.masterFile(), saved)
+		}
+		if got := h.value("a", 1); string(got) != "a-value" {
+			t.Fatalf("after rewrap the entry holds %q", got)
 		}
 	})
 	for _, tc := range []struct {
@@ -699,7 +755,7 @@ func TestKeysRewrap(t *testing.T) {
 				t.Fatal(err)
 			}
 			h.mustRun(1, "rewrap", "--key-in", p)
-			if slices.Contains(h.store.calls, "Rewrap") {
+			if slices.Contains(h.calls, "Rewrap") {
 				t.Fatal("rewrap ran with a refused key file")
 			}
 		})
