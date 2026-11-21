@@ -1,0 +1,734 @@
+/*
+Copyright The k3sm Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package main
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"os/signal"
+	"os/user"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
+	"text/tabwriter"
+	"time"
+
+	"k3sm.io/k3sm/pkg/executor"
+	"k3sm.io/k3sm/pkg/install"
+	"k3sm.io/k3sm/pkg/keystore"
+	"k3sm.io/k3sm/pkg/status"
+)
+
+// keysUsage is `k3sm keys --help`.
+const keysUsage = `Usage:
+  sudo k3sm keys put system/<name> [--kind opaque|ed25519] [--in FILE|-]
+        create the entry at version 1; the value is read from FILE, or from
+        stdin with "-" (the default), never from an argument
+  sudo k3sm keys list [-o table|json]
+        one line per entry: name, kind, current version, created (UTC),
+        fingerprint and status (ok, or corrupt with the reason); exits 1 if
+        any entry is corrupt
+  sudo k3sm keys show system/<name> [--version N] [--reveal [--yes]]
+        print an entry's metadata; with --reveal, print only the stored
+        value, byte for byte, with no newline added (to a terminal, only
+        with --yes)
+  sudo k3sm keys rotate system/<name> [--in FILE|- | --from-version N]
+        store a new version and make it current: a value read as put reads
+        it, or with --from-version a copy of version N's bytes, made inside
+        k3sm so the value is never printed
+  sudo k3sm keys rm system/<name> --yes
+        delete the entry and every version; irreversible
+  sudo k3sm keys rewrap --key-out FILE | --key-in FILE
+        re-seal every entry under a new master key. --key-out writes a fresh
+        key to FILE (a new file, mode 0600) before anything changes; keep it
+        until rewrap reports success, then delete it. --key-in FILE finishes
+        an interrupted rewrap with the key saved there
+
+Names are scope-qualified: system/<name>, where <name> is 1 to 253 bytes of
+dot-separated labels of lowercase letters, digits and '-'. This build
+supports the system scope only.
+
+A value never comes from the command line, where every local user could read
+it with ps. Pipe it in, or keep it in a file only root can read:
+
+  sudo k3sm keys put system/api-token --in /path/to/token
+  issue-token-command | sudo k3sm keys put system/api-token --in -
+
+Every verb runs as root. Values are capped at 64 KiB.
+
+Flags:
+  --work-dir <dir>  the server work dir (default ` + executor.DefaultWorkDir + `); the
+                    data root is its parent
+
+Exit codes: 0 done; 1 refused or failed; 2 usage; 3 rewrap completed an
+earlier interrupted rewrap instead (run it again with a new key).
+`
+
+// Exit codes of `k3sm keys`.
+const (
+	keysOK       = 0
+	keysRefused  = 1
+	keysBadUsage = 2
+	// keysResumed is rewrap's ErrRewrapResumed: it finished an earlier
+	// rewrap under a key the operator did not supply, so it must run again.
+	keysResumed = 3
+)
+
+// The keystore's two directories in the server work dir. pkg/keystore's
+// Config documents them as <work dir>/keystore and
+// <work dir>/cred/keystore-master; the cred dir comes from executor.CredDir,
+// the same helper the secrets-encryption pair uses.
+const (
+	keystoreSubdir       = "keystore"
+	keystoreMasterSubdir = "keystore-master"
+)
+
+// keysMasterSize is the master key's length, which Rewrap requires.
+const keysMasterSize = 32
+
+// keysStore is the slice of keystore.FileStore the keys verbs use: the Store
+// contract and the floor raise the read verbs make at their start.
+type keysStore interface {
+	keystore.Store
+	RaiseFloor(ctx context.Context) error
+}
+
+// keysEnv is what the keys verbs touch, so a test can fake it.
+type keysEnv struct {
+	euid func() int
+	// serviceIDs resolves the service user the store's files belong to.
+	serviceIDs func() (uid, gid uint32, err error)
+	open       func(cfg keystore.Config) keysStore
+	stdin      io.Reader
+	stdinTTY   func() bool
+	stdoutTTY  func() bool
+	// rand is where rewrap draws a new master key.
+	rand   io.Reader
+	stdout io.Writer
+	stderr io.Writer
+}
+
+func defaultKeysEnv(stdout, stderr io.Writer) keysEnv {
+	return keysEnv{
+		euid:       os.Geteuid,
+		serviceIDs: lookupServiceIDs,
+		open:       func(cfg keystore.Config) keysStore { return keystore.New(cfg) },
+		stdin:      os.Stdin,
+		stdinTTY:   func() bool { return status.IsTerminal(os.Stdin) },
+		stdoutTTY:  func() bool { return status.IsTerminal(os.Stdout) },
+		rand:       rand.Reader,
+		stdout:     stdout,
+		stderr:     stderr,
+	}
+}
+
+// lookupServiceIDs resolves the installed service user's uid and gid.
+func lookupServiceIDs() (uid, gid uint32, err error) {
+	u, err := user.Lookup(install.DefaultServiceUser)
+	if err != nil {
+		return 0, 0, fmt.Errorf("look up the service user %s (is k3sm installed?): %w", install.DefaultServiceUser, err)
+	}
+	id, err := strconv.ParseUint(u.Uid, 10, 32)
+	if err != nil {
+		return 0, 0, fmt.Errorf("uid of %s: %w", install.DefaultServiceUser, err)
+	}
+	g, err := strconv.ParseUint(u.Gid, 10, 32)
+	if err != nil {
+		return 0, 0, fmt.Errorf("gid of %s: %w", install.DefaultServiceUser, err)
+	}
+	return uint32(id), uint32(g), nil
+}
+
+func runKeys(args []string, stdout, stderr io.Writer) int {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return runKeysWith(ctx, args, defaultKeysEnv(stdout, stderr))
+}
+
+// keysVerb is one parsed verb: its flag set, its positional arguments, and
+// the work dir every verb takes.
+type keysVerb struct {
+	name    string
+	fs      *flag.FlagSet
+	workDir *string
+	env     keysEnv
+}
+
+func newKeysVerb(name string, env keysEnv) *keysVerb {
+	fs := flag.NewFlagSet("keys "+name, flag.ContinueOnError)
+	fs.SetOutput(env.stderr)
+	fs.Usage = func() { fmt.Fprint(env.stderr, keysUsage) }
+	return &keysVerb{
+		name:    name,
+		fs:      fs,
+		workDir: fs.String("work-dir", executor.DefaultWorkDir, "the server work dir; the data root is its parent"),
+		env:     env,
+	}
+}
+
+// parse parses args with flags before, between or after the positional
+// arguments (`show system/x --reveal`), and returns the positionals.
+func (v *keysVerb) parse(args []string) ([]string, error) {
+	var pos []string
+	for {
+		if err := v.fs.Parse(args); err != nil {
+			return nil, err
+		}
+		args = v.fs.Args()
+		if len(args) == 0 {
+			return pos, nil
+		}
+		pos = append(pos, args[0])
+		args = args[1:]
+	}
+}
+
+func (v *keysVerb) failf(code int, format string, a ...any) int {
+	fmt.Fprintf(v.env.stderr, "k3sm keys %s: %s\n", v.name, fmt.Sprintf(format, a...))
+	return code
+}
+
+// requireRoot refuses unless the verb runs as root: the master and entries
+// belong to the service user, and the floor beside them to root.
+func (v *keysVerb) requireRoot() int {
+	if v.env.euid() == 0 {
+		return keysOK
+	}
+	return v.failf(keysRefused, "run as root (sudo k3sm keys %s ...): the keystore belongs to the service user and its floor to root", v.name)
+}
+
+// store opens the store the install layout places under the work dir.
+func (v *keysVerb) store() (keysStore, error) {
+	work := filepath.Clean(*v.workDir)
+	if !filepath.IsAbs(work) {
+		return nil, fmt.Errorf("--work-dir %q is not an absolute path", *v.workDir)
+	}
+	uid, gid, err := v.env.serviceIDs()
+	if err != nil {
+		return nil, err
+	}
+	return v.env.open(keystore.Config{
+		Dir:       filepath.Join(work, keystoreSubdir),
+		MasterDir: filepath.Join(executor.CredDir(work), keystoreMasterSubdir),
+		UID:       uid,
+		GID:       gid,
+		DataRoot:  executor.RuntimeRoot(work),
+	}), nil
+}
+
+// errUserScope refuses a user/... name: the grammar exists, this build does
+// not serve it.
+var errUserScope = errors.New("user scopes are not supported by this build: use a system/<name> entry")
+
+// parseKeyName turns a scope-qualified name into the store's entry name. It
+// returns errUserScope for user/..., and a usage error for anything else that
+// is not system/<name>. The entry name itself is the store's to judge.
+func parseKeyName(q string) (string, error) {
+	scope, name, ok := strings.Cut(q, "/")
+	switch {
+	case !ok:
+		return "", fmt.Errorf("entry names are scope-qualified: use system/%s", q)
+	case scope == "user":
+		return "", errUserScope
+	case scope != "system" || name == "" || strings.Contains(name, "/"):
+		return "", fmt.Errorf("%q is not a scope-qualified entry name: use system/<name>", q)
+	}
+	return name, nil
+}
+
+// qualify is the display form of a system entry name.
+func qualify(name string) string { return "system/" + name }
+
+// nameArg takes the one positional a named verb accepts. A second positional
+// is refused without echoing it: it may be a value typed where --in belongs.
+func (v *keysVerb) nameArg(pos []string) (string, int) {
+	switch {
+	case len(pos) == 0:
+		return "", v.failf(keysBadUsage, "missing the entry name (system/<name>)")
+	case len(pos) > 1:
+		return "", v.failf(keysBadUsage, "takes one entry name and no value argument: a value on the command line is visible to every local user; pass it with --in FILE, or --in - on stdin")
+	}
+	name, err := parseKeyName(pos[0])
+	if errors.Is(err, errUserScope) {
+		return "", v.failf(keysRefused, "%v", err)
+	}
+	if err != nil {
+		return "", v.failf(keysBadUsage, "%v", err)
+	}
+	return name, keysOK
+}
+
+func runKeysWith(ctx context.Context, args []string, env keysEnv) int {
+	if len(args) == 0 {
+		fmt.Fprint(env.stderr, keysUsage)
+		return keysBadUsage
+	}
+	verb, rest := args[0], args[1:]
+	switch verb {
+	case "-h", "--help", "help":
+		fmt.Fprint(env.stdout, keysUsage)
+		return keysOK
+	case "put":
+		return keysPut(ctx, rest, env)
+	case "list", "ls":
+		return keysList(ctx, rest, env)
+	case "show":
+		return keysShow(ctx, rest, env)
+	case "rotate":
+		return keysRotate(ctx, rest, env)
+	case "rm":
+		return keysRm(ctx, rest, env)
+	case "rewrap":
+		return keysRewrap(ctx, rest, env)
+	default:
+		fmt.Fprintf(env.stderr, "k3sm keys: unknown subcommand %q (want: put, list, show, rotate, rm, rewrap)\n", verb)
+		return keysBadUsage
+	}
+}
+
+// readValue reads a value from --in: a file, or "-" for stdin. A terminal on
+// stdin is refused, because a value typed there is echoed and kept in
+// scrollback. It reads at most one byte over the store's cap, so an
+// oversized input is refused without reading it all.
+func (v *keysVerb) readValue(in string) ([]byte, error) {
+	var r io.Reader
+	switch in {
+	case "":
+		return nil, errors.New("--in is empty: pass --in FILE, or --in - to read stdin")
+	case "-":
+		if v.env.stdinTTY() {
+			return nil, errors.New("stdin is a terminal: pipe the value in (... | sudo k3sm keys " + v.name + " system/<name> --in -), or pass --in FILE")
+		}
+		r = v.env.stdin
+	default:
+		f, err := os.Open(in)
+		if err != nil {
+			return nil, fmt.Errorf("open --in: %w", err)
+		}
+		defer func() { _ = f.Close() }() // read-only
+		r = f
+	}
+	b, err := io.ReadAll(io.LimitReader(r, keystore.MaxValueSize+1))
+	if err != nil {
+		clear(b)
+		return nil, fmt.Errorf("read the value: %w", err)
+	}
+	if len(b) > keystore.MaxValueSize {
+		clear(b)
+		return nil, fmt.Errorf("the value is over the %d-byte limit", keystore.MaxValueSize)
+	}
+	return b, nil
+}
+
+func keysPut(ctx context.Context, args []string, env keysEnv) int {
+	v := newKeysVerb("put", env)
+	kindFlag := v.fs.String("kind", "opaque", "opaque or ed25519 (a 32-byte seed or a 64-byte private key)")
+	in := v.fs.String("in", "-", "read the value from this file, or from stdin with -")
+	pos, err := v.parse(args)
+	if err != nil {
+		return keysBadUsage
+	}
+	name, code := v.nameArg(pos)
+	if code != keysOK {
+		return code
+	}
+	var kind keystore.Kind
+	switch *kindFlag {
+	case "opaque":
+		kind = keystore.KindOpaque
+	case "ed25519":
+		kind = keystore.KindEd25519
+	default:
+		return v.failf(keysBadUsage, "--kind %q: want opaque or ed25519", *kindFlag)
+	}
+	if code := v.requireRoot(); code != keysOK {
+		return code
+	}
+	s, err := v.store()
+	if err != nil {
+		return v.failf(keysRefused, "%v", err)
+	}
+	value, err := v.readValue(*in)
+	if err != nil {
+		return v.failf(keysRefused, "%v", err)
+	}
+	defer clear(value)
+	ver, err := s.Put(ctx, name, kind, value)
+	if err != nil {
+		return v.failf(keysRefused, "%v", err)
+	}
+	fmt.Fprintf(env.stdout, "created %s at version %d (%s, fingerprint %s)\n", qualify(name), ver.Version, ver.Kind, ver.Fingerprint)
+	return keysOK
+}
+
+func keysRotate(ctx context.Context, args []string, env keysEnv) int {
+	v := newKeysVerb("rotate", env)
+	in := v.fs.String("in", "-", "read the value from this file, or from stdin with -")
+	from := v.fs.Uint64("from-version", 0, "store a copy of this version's bytes as the new version")
+	pos, err := v.parse(args)
+	if err != nil {
+		return keysBadUsage
+	}
+	name, code := v.nameArg(pos)
+	if code != keysOK {
+		return code
+	}
+	var inSet, fromSet bool
+	v.fs.Visit(func(f *flag.Flag) {
+		inSet = inSet || f.Name == "in"
+		fromSet = fromSet || f.Name == "from-version"
+	})
+	switch {
+	case inSet && fromSet:
+		return v.failf(keysBadUsage, "--in and --from-version are exclusive: the new value comes from one of them")
+	case fromSet && *from == 0:
+		return v.failf(keysBadUsage, "--from-version: versions start at 1")
+	}
+	if code := v.requireRoot(); code != keysOK {
+		return code
+	}
+	s, err := v.store()
+	if err != nil {
+		return v.failf(keysRefused, "%v", err)
+	}
+	var value []byte
+	if fromSet {
+		_, value, err = s.Get(ctx, name, *from)
+	} else {
+		value, err = v.readValue(*in)
+	}
+	defer clear(value)
+	if err != nil {
+		return v.failf(keysRefused, "%v", err)
+	}
+	ver, err := s.Rotate(ctx, name, value)
+	if err != nil {
+		return v.failf(keysRefused, "%v", err)
+	}
+	if fromSet {
+		fmt.Fprintf(env.stdout, "rotated %s to version %d, a copy of version %d (fingerprint %s)\n", qualify(name), ver.Version, *from, ver.Fingerprint)
+		return keysOK
+	}
+	fmt.Fprintf(env.stdout, "rotated %s to version %d (fingerprint %s)\n", qualify(name), ver.Version, ver.Fingerprint)
+	return keysOK
+}
+
+// keysListEntry is one entry of `keys list -o json`.
+type keysListEntry struct {
+	Name        string `json:"name"`
+	Kind        string `json:"kind,omitempty"`
+	Version     uint64 `json:"version,omitempty"`
+	Versions    int    `json:"versions,omitempty"`
+	Created     string `json:"created,omitempty"`
+	Fingerprint string `json:"fingerprint,omitempty"`
+	// Status is ok, corrupt (the entry fails to open as stored), or error
+	// (it could not be read, for want of permission or an I/O error).
+	Status string `json:"status"`
+	Error  string `json:"error,omitempty"`
+}
+
+func keysEntryStatus(e keystore.Entry) keysListEntry {
+	out := keysListEntry{Name: qualify(e.Name), Status: "ok"}
+	if e.Err != nil {
+		out.Status = "error"
+		if errors.Is(e.Err, keystore.ErrCorrupt) {
+			out.Status = "corrupt"
+		}
+		out.Error = e.Err.Error()
+		return out
+	}
+	out.Kind = e.Current.Kind.String()
+	out.Version = e.Current.Version
+	out.Versions = len(e.Versions)
+	out.Created = e.Current.Created.UTC().Format(time.RFC3339)
+	out.Fingerprint = e.Current.Fingerprint
+	return out
+}
+
+func keysList(ctx context.Context, args []string, env keysEnv) int {
+	v := newKeysVerb("list", env)
+	output := v.fs.String("o", "table", "output format: table or json")
+	pos, err := v.parse(args)
+	if err != nil {
+		return keysBadUsage
+	}
+	if len(pos) > 0 {
+		return v.failf(keysBadUsage, "takes no arguments")
+	}
+	if *output != "table" && *output != "json" {
+		return v.failf(keysBadUsage, "-o %q: want table or json", *output)
+	}
+	if code := v.requireRoot(); code != keysOK {
+		return code
+	}
+	s, err := v.store()
+	if err != nil {
+		return v.failf(keysRefused, "%v", err)
+	}
+	if err := s.RaiseFloor(ctx); err != nil {
+		return v.failf(keysRefused, "%v", err)
+	}
+	entries, err := s.List(ctx)
+	if err != nil {
+		return v.failf(keysRefused, "%v", err)
+	}
+	rows := make([]keysListEntry, 0, len(entries))
+	code := keysOK
+	for _, e := range entries {
+		r := keysEntryStatus(e)
+		if r.Status != "ok" {
+			code = keysRefused
+		}
+		rows = append(rows, r)
+	}
+	if *output == "json" {
+		b, err := json.MarshalIndent(struct {
+			Entries []keysListEntry `json:"entries"`
+		}{rows}, "", "  ")
+		if err != nil {
+			return v.failf(keysRefused, "encode: %v", err)
+		}
+		fmt.Fprintf(env.stdout, "%s\n", b)
+		return code
+	}
+	tw := tabwriter.NewWriter(env.stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "NAME\tKIND\tVERSION\tCREATED\tFINGERPRINT\tSTATUS")
+	for _, r := range rows {
+		if r.Status != "ok" {
+			fmt.Fprintf(tw, "%s\t-\t-\t-\t-\t%s: %s\n", r.Name, r.Status, r.Error)
+			continue
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%s\tok\n", r.Name, r.Kind, r.Version, r.Created, r.Fingerprint)
+	}
+	if err := tw.Flush(); err != nil {
+		return v.failf(keysRefused, "write: %v", err)
+	}
+	return code
+}
+
+func keysShow(ctx context.Context, args []string, env keysEnv) int {
+	v := newKeysVerb("show", env)
+	version := v.fs.Uint64("version", 0, "show this version instead of the current one")
+	reveal := v.fs.Bool("reveal", false, "print only the stored value, byte for byte")
+	yes := v.fs.Bool("yes", false, "with --reveal, print the value even to a terminal")
+	pos, err := v.parse(args)
+	if err != nil {
+		return keysBadUsage
+	}
+	name, code := v.nameArg(pos)
+	if code != keysOK {
+		return code
+	}
+	if code := v.requireRoot(); code != keysOK {
+		return code
+	}
+	if *reveal && !*yes && env.stdoutTTY() {
+		return v.failf(keysRefused, "stdout is a terminal, where --reveal would leave the value on screen and in scrollback: pipe it, or pass --yes")
+	}
+	s, err := v.store()
+	if err != nil {
+		return v.failf(keysRefused, "%v", err)
+	}
+	if err := s.RaiseFloor(ctx); err != nil {
+		return v.failf(keysRefused, "%v", err)
+	}
+	var ver keystore.Version
+	var value []byte
+	if *version != 0 {
+		ver, value, err = s.Get(ctx, name, *version)
+	} else {
+		ver, value, err = s.Current(ctx, name)
+	}
+	defer clear(value)
+	if err != nil {
+		return v.failf(keysRefused, "%v", err)
+	}
+	if *reveal {
+		if _, err := env.stdout.Write(value); err != nil {
+			return v.failf(keysRefused, "write: %v", err)
+		}
+		return keysOK
+	}
+	fmt.Fprintf(env.stdout, "name:        %s\n", qualify(name))
+	fmt.Fprintf(env.stdout, "kind:        %s\n", ver.Kind)
+	fmt.Fprintf(env.stdout, "version:     %d\n", ver.Version)
+	fmt.Fprintf(env.stdout, "created:     %s\n", ver.Created.UTC().Format(time.RFC3339))
+	fmt.Fprintf(env.stdout, "fingerprint: %s\n", ver.Fingerprint)
+	fmt.Fprintf(env.stdout, "size:        %d bytes\n", len(value))
+	return keysOK
+}
+
+func keysRm(ctx context.Context, args []string, env keysEnv) int {
+	v := newKeysVerb("rm", env)
+	yes := v.fs.Bool("yes", false, "confirm: delete every version of the entry")
+	pos, err := v.parse(args)
+	if err != nil {
+		return keysBadUsage
+	}
+	name, code := v.nameArg(pos)
+	if code != keysOK {
+		return code
+	}
+	if !*yes {
+		return v.failf(keysBadUsage, "deleting %s removes every version and cannot be undone: pass --yes", qualify(name))
+	}
+	if code := v.requireRoot(); code != keysOK {
+		return code
+	}
+	s, err := v.store()
+	if err != nil {
+		return v.failf(keysRefused, "%v", err)
+	}
+	if err := s.Delete(ctx, name); err != nil {
+		return v.failf(keysRefused, "%v", err)
+	}
+	fmt.Fprintf(env.stdout, "deleted %s\n", qualify(name))
+	return keysOK
+}
+
+// writeKeyOut creates path as a new root-only file holding key: O_EXCL, so an
+// existing file or symlink there is refused rather than overwritten or
+// followed, mode 0600, and fsynced with its directory before rewrap uses it.
+func writeKeyOut(path string, key []byte) (err error) {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return fmt.Errorf("create the key file: %w", err)
+	}
+	defer func() {
+		if cerr := f.Close(); err == nil && cerr != nil {
+			err = fmt.Errorf("close the key file: %w", cerr)
+		}
+	}()
+	if err := f.Chmod(0o600); err != nil {
+		return fmt.Errorf("chmod the key file: %w", err)
+	}
+	if _, err := f.Write(key); err != nil {
+		return fmt.Errorf("write the key file: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("sync the key file: %w", err)
+	}
+	d, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return fmt.Errorf("open the key file's directory: %w", err)
+	}
+	defer func() { _ = d.Close() }() // read-only; synced below
+	if err := d.Sync(); err != nil {
+		return fmt.Errorf("sync the key file's directory: %w", err)
+	}
+	return nil
+}
+
+// readKeyIn reads a key saved by an earlier --key-out: a regular file, not a
+// symlink, owned by this process's user and closed to group and others,
+// holding exactly the master's 32 bytes.
+func readKeyIn(path string) ([]byte, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open the key file: %w", err)
+	}
+	defer func() { _ = f.Close() }() // read-only
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat the key file: %w", err)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	switch {
+	case !fi.Mode().IsRegular():
+		return nil, fmt.Errorf("the key file %s is not a regular file", path)
+	case !ok || int64(st.Uid) != int64(os.Geteuid()):
+		return nil, fmt.Errorf("the key file %s is not owned by this user (root)", path)
+	case fi.Mode().Perm()&0o077 != 0:
+		return nil, fmt.Errorf("the key file %s is mode %04o: it must be closed to group and others (0600)", path, fi.Mode().Perm())
+	}
+	b, err := io.ReadAll(io.LimitReader(f, keysMasterSize+1))
+	if err != nil {
+		clear(b)
+		return nil, fmt.Errorf("read the key file: %w", err)
+	}
+	if len(b) != keysMasterSize {
+		clear(b)
+		return nil, fmt.Errorf("the key file %s holds %d bytes, not a %d-byte key", path, len(b), keysMasterSize)
+	}
+	return b, nil
+}
+
+func keysRewrap(ctx context.Context, args []string, env keysEnv) int {
+	v := newKeysVerb("rewrap", env)
+	keyOut := v.fs.String("key-out", "", "write the new master key to this new file (mode 0600) before re-sealing")
+	keyIn := v.fs.String("key-in", "", "use the key saved in this file by an earlier --key-out")
+	pos, err := v.parse(args)
+	if err != nil {
+		return keysBadUsage
+	}
+	switch {
+	case len(pos) > 0:
+		return v.failf(keysBadUsage, "takes no arguments")
+	case (*keyOut == "") == (*keyIn == ""):
+		return v.failf(keysBadUsage, "pass exactly one of --key-out FILE (a fresh key, saved there first) or --key-in FILE (a key saved by an earlier rewrap)")
+	}
+	if code := v.requireRoot(); code != keysOK {
+		return code
+	}
+	s, err := v.store()
+	if err != nil {
+		return v.failf(keysRefused, "%v", err)
+	}
+	keyPath := *keyIn
+	var key []byte
+	if keyPath != "" {
+		key, err = readKeyIn(keyPath)
+		if err != nil {
+			return v.failf(keysRefused, "%v", err)
+		}
+	} else {
+		keyPath = *keyOut
+		key = make([]byte, keysMasterSize)
+		if _, err := io.ReadFull(env.rand, key); err != nil {
+			clear(key)
+			return v.failf(keysRefused, "draw a new master key: %v", err)
+		}
+		if err := writeKeyOut(keyPath, key); err != nil {
+			clear(key)
+			return v.failf(keysRefused, "%v; nothing was changed", err)
+		}
+		fmt.Fprintf(env.stderr, "k3sm keys rewrap: saved the new master key to %s (mode 0600). Keep this file until rewrap reports success, then delete it.\n", keyPath)
+	}
+	defer clear(key)
+	err = s.Rewrap(ctx, key)
+	switch {
+	case err == nil:
+		fmt.Fprintf(env.stdout, "rewrap complete: every entry is sealed under the new master key.\n"+
+			"Now delete %s.\n"+
+			"Backups of the keystore taken before this rewrap no longer open: back up the entries and the master key again.\n"+
+			"Fingerprints of opaque entries have changed.\n", keyPath)
+		return keysOK
+	case errors.Is(err, keystore.ErrRewrapResumed):
+		return v.failf(keysResumed, "%v\nrun rewrap again with a new key: sudo k3sm keys rewrap --key-out <new file>. Keep %s until a rewrap reports success.", err, keyPath)
+	case errors.Is(err, keystore.ErrScopeUnsupported):
+		return v.failf(keysRefused, "%v", err)
+	default:
+		return v.failf(keysRefused, "%v\nkeep %s: if any entry was re-sealed, finish with the same key: sudo k3sm keys rewrap --key-in %s", err, keyPath, keyPath)
+	}
+}
