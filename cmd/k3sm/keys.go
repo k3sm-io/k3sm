@@ -272,7 +272,7 @@ func (v *keysVerb) flagError(err error) {
 // failf prints a refusal. It is the one choke point for store errors: the
 // message is scrubbed of the store's roots (scrubPaths) before it is printed.
 func (v *keysVerb) failf(code int, format string, a ...any) int {
-	fmt.Fprintf(v.env.stderr, "k3sm keys %s: %s\n", v.name, scrubText(fmt.Sprintf(format, a...), v.roots...))
+	fmt.Fprintf(v.env.stderr, "k3sm keys %s: %s\n", v.name, scrubPaths(fmt.Errorf(format, a...), v.roots...))
 	return code
 }
 
@@ -316,10 +316,7 @@ var scrubTokens = []string{"<work-dir>", "<master-dir>", "<data-root>"}
 // paths are replaced first, so a path inside another keeps its own token;
 // "/" is never replaced.
 func scrubPaths(err error, roots ...string) string {
-	return scrubText(err.Error(), roots...)
-}
-
-func scrubText(msg string, roots ...string) string {
+	msg := err.Error()
 	type sub struct{ from, to string }
 	var subs []sub
 	for i, r := range roots {
@@ -664,7 +661,9 @@ func keysList(ctx context.Context, args []string, env keysEnv) int {
 		r := keysEntryStatus(e)
 		// The row's error is a store error printed on stdout: scrubbed as
 		// failf scrubs.
-		r.Error = scrubText(r.Error, v.roots...)
+		if e.Err != nil {
+			r.Error = scrubPaths(e.Err, v.roots...)
+		}
 		if r.Status != "ok" {
 			code = keysRefused
 		}
