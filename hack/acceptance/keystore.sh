@@ -254,7 +254,7 @@ special g22 G22
 
 pend U1 "rotate --from-version N writes version N's bytes as a new version server side; no value leaves the store (keys verbs)" \
 	k3sm/cmd/k3sm::TestKeysRotateFromVersionNoValueOut
-check U2 "AAD scope: a record moved between scopes, or between two users, fails to open" \
+partial U2 "AAD scope: a record moved between scopes fails to open, and two users derive different keys" "a record opened as another user is refused (user scopes)" \
 	TestScopeBindsRecords TestDerivedKeysDifferByScope
 check U3 "KDF labels take the scope; checkScope accepts only system and user/<decimal uid>; kinds 0xFE and 0xFD are reserved" \
 	TestDerivedKeysDifferByScope TestCheckScope TestParseRecordRefusesMalformed
