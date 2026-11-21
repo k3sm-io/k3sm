@@ -3,8 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # The keystore's acceptance gate: docs/design/keystore.md § "Acceptance gate",
-# rows G1 to G22, the user-scope rows U1 to U69 (U15 and U39 are unused) and
-# the rig legs E1 to E24. Every row is listed, on exactly one line. A row runs
+# rows G1 to G22, the user-scope rows U1 to U71 (U15 and U39 are unused) and
+# the rig legs E1 to E25. Every row is listed, on exactly one line. A row runs
 # the tests that deliver it and passes only if each named test ran and passed
 # in its own package; a row whose change has not landed yet prints PENDING,
 # never PASS. A row delivered in part prints PENDING when its delivered part
@@ -35,7 +35,8 @@
 #   --api           the KeyDelivery API types: U18, U19.
 #   --scope         user scopes: U6 to U11, U47, U58, U64, U66.
 #   --scope-store   the user-scope store: U12 to U14, U63.
-#   --files         the append-only files: U20 to U25, U50, U52, U60, U61, U68.
+#   --files         the append-only files: U20 to U25, U50, U52, U60, U61, U68,
+#                   and in the helper variant only U70, U71.
 #   --socket        the socket listener: U26 to U31, U46, U48, U54.
 #   --socket-ops    the socket operations: U32 to U35, U45, U51, U67.
 #   --exec          the non-root CLI and exec: U36 to U38, U69.
@@ -47,7 +48,7 @@
 # A unit mode runs only its rows and only their tests, with the same exit
 # status: it exits 0 only when every row it names passes.
 #
-# --lab runs the rig legs E1 to E24, and nothing else, as an explicit, recorded
+# --lab runs the rig legs E1 to E25, and nothing else, as an explicit, recorded
 # step. --<unit mode> --lab runs that mode's unit rows and then only the legs
 # mapped to that mode (the leg's last feature to land, see the leg table); a
 # leg mapped to no mode runs only under plain --lab. Each leg's description
@@ -98,10 +99,10 @@ EXPECTED_ROWS="$EXPECTED_ROWS U21 U22 U23 U24 U25 U26 U27 U28 U29 U30 U31 U32 U3
 EXPECTED_ROWS="$EXPECTED_ROWS U36 U37 U38 U40 U41 U42 U43 U44 U45 U46 U47 U48"
 EXPECTED_ROWS="$EXPECTED_ROWS U49 U50 U51 U52 U53 U54 U55 U56 U57"
 EXPECTED_ROWS="$EXPECTED_ROWS U58 U59 U60 U61 U62 U63"
-EXPECTED_ROWS="$EXPECTED_ROWS U64 U65 U66 U67 U68 U69"
+EXPECTED_ROWS="$EXPECTED_ROWS U64 U65 U66 U67 U68 U69 U70 U71"
 # >>> ADD NEW U ROWS (U64 upward) HERE <<<
 EXPECTED_ROWS="$EXPECTED_ROWS E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 E13 E14 E15 E16 E17 E18 E19 E20"
-EXPECTED_ROWS="$EXPECTED_ROWS E21 E22 E23 E24"
+EXPECTED_ROWS="$EXPECTED_ROWS E21 E22 E23 E24 E25"
 # >>> ADD NEW E LEGS (E24 upward) HERE <<<
 
 MODES="check rewrap verbs delivery sandbox api scope scope-store files socket socket-ops exec"
@@ -129,7 +130,7 @@ mode_rows() {
 	api) echo "U18 U19" ;;
 	scope) echo "U6 U7 U8 U9 U10 U11 U47 U58 U64 U66" ;;
 	scope-store) echo "U12 U13 U14 U63" ;;
-	files) echo "U20 U21 U22 U23 U24 U25 U50 U52 U60 U61 U68" ;;
+	files) echo "U20 U21 U22 U23 U24 U25 U50 U52 U60 U61 U68 U70 U71" ;;
 	socket) echo "U26 U27 U28 U29 U30 U31 U46 U48 U54" ;;
 	socket-ops) echo "U32 U33 U34 U35 U45 U51 U67" ;;
 	exec) echo "U36 U37 U38 U69" ;;
@@ -504,6 +505,10 @@ rootpend U68 "root-run: the maintenance verbs refuse a symlink or swapped file p
 	k3sm/cmd/k3sm::TestMaintenanceRefusesPlantedSymlinkAndSwap
 pend U69 "the client pins the server: the peer's audit token (LOCAL_PEERTOKEN) must resolve to the cdhash of the installed /Library/k3sm/k3sm, or nothing is written; another service-user binary, a reused pid, a lookup error and an old server after an upgrade are refused (non-root CLI and exec)" \
 	k3sm/cmd/k3sm::TestClientPinsServerByInstalledCDHash TestClientRefusesServiceUIDPeerOfOtherCode TestClientRefusesReusedPeerPID TestClientCDHashMismatchNamesRestart
+pend U70 "helper variant only: the floor helper admits only a service-uid peer whose audit token resolves to the installed binary's cdhash, the server pins the helper as root and that binary, and only append and read are served (K0 amendment, helper variant only)" \
+	k3sm/pkg/keystore/floorhelper::TestFloorHelperPeerPinned TestFloorHelperRefusesOtherRequests
+pend U71 "helper variant only: every pod profile variant denies the floor helper's socket for connect, bind and every file operation (K0 amendment, helper variant only)" \
+	runtimed/pkg/sandbox::TestFloorHelperSocketPodDenied
 # >>> ADD NEW U ROWS (U64 upward) HERE, and add each to EXPECTED_ROWS and to mode_rows <<<
 
 leg E1 "files" "preconditions: secrets encryption on; one server; keystore-run/ and both logs present, service-user 0600, SF_APPEND set; the doctor user-scope row on; keystore.sh --check exits 0 on the build" "the append-only files"
@@ -530,6 +535,7 @@ leg E21 "sandbox" "a native pod with runAsUser 501 is refused at spawn: the cont
 leg E22 "sandbox" "a native pod with runAsUser 0 is refused at spawn: the container never starts as root, and its status carries the uid refusal" "runtimed's sandbox change"
 leg E23 "kd-reconcile" "against the real authorizer, a role with create on secrets and update and delete on one named secret: delivery as that name is Ready, Delivered; delivery as another name is Authorized=False, NotAuthorized, with no Secret" "the KeyDelivery reconciler"
 leg E24 "exec" "with the listener stopped by the maintenance marker, a non-k3sm program run as the service user binds keys.sock; the user's k3sm keys list and put refuse before any frame, naming the server pin; the real server is accepted afterwards" "the server pin"
+leg E25 "files" "helper variant only: a native pod tries connect(2) to the floor helper's socket, and the login user and a non-k3sm service-user program each send it an append: EPERM for the pod, both refused, no line appended" "the helper pin"
 # >>> ADD NEW E LEGS (E24 upward) HERE, with the unit mode that delivers the last feature <<<
 
 nrows=${#R_ID[@]}

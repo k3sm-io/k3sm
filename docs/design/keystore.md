@@ -1229,6 +1229,17 @@ service user can only add to.
      `k3sm-netd` pattern owns both logs as root, mode 0600, and appends lines on the server's
      request over a root-owned socket that admits only the service uid, refusing every request
      but `append` and `read`.
+
+     **Binding on the helper variant.** If K0 picks the helper, the K0 amendment must add four
+     things before the change that builds the user-scope floor is built: (a) the helper's
+     socket path; (b) its Pod deny, through the same `keystore-` prefix or `keystore-run/`
+     tree deny if the path is under one, else a deny of its own in runtimed's leaf; (c) a peer
+     check beyond the uid, with the same pinning as the client's ("The client pins the
+     server"): the helper reads the peer's audit token and admits only a peer whose cdhash is
+     the installed binary's, running as the service uid, and the server pins the helper the
+     same way, as root and the installed binary; and (d) its own U and E rows. The pending
+     rows U70, U71 and E25 hold their places; they apply only in the helper variant, and the
+     amendment names their tests or drops them if K0 picks the flag.
 - **The flag is checked, not assumed** (flag variant). The server reads `st_flags &
   SF_APPEND` on both logs at start and at every `doctor` run, through the chflags flag source,
   and refuses to start the listener if either flag is clear (U21).
@@ -2173,6 +2184,8 @@ each stated in the change that makes it. U15 is held for a K0 amendment and U39 
 | U67 | the revocation class (`withdraw`, `rm`, `rotate`, the withdrawal's floor line, the reconciler's `deliver-delete` and `deliver-write` of a withdrawal) is charged to the share while it has room and past it bypasses the share and the hard cap, drawing on the 4 MiB revocation reserve; only the reserve's exhaustion refuses it; a no-op `rm`, `withdraw` or `rotate` is charged like any line and refused past the share; the socket's members stop with 3 MiB of the reserve left, which the reconciler's members may use | `k3sm/pkg/keystore/socket::TestRevocationBypassesShareUsesReserve`, `TestNoOpRevocationChargedToShare`, `TestReserveKeepsReconcilerPart` | pending: the socket operations |
 | U68 | root never acts by path where the service user can write: run as root (a root-run row, `--root`), the maintenance verbs refuse a symlink or a swapped file planted at the marker, either staging name or the old log, create through one data-root descriptor with `O_CREAT\|O_EXCL\|O_NOFOLLOW`, `fchown` and `fchflags` on the descriptor before the `renameat`, and leave every byte of both logs unchanged on a refusal | `k3sm/cmd/k3sm::TestMaintenanceRefusesPlantedSymlinkAndSwap` (integration, root-run) | pending: the append-only files |
 | U69 | the client pins the server: it reads the peer's audit token (`LOCAL_PEERTOKEN`) and refuses, writing nothing, unless the peer's cdhash equals the cdhash of the installed `/Library/k3sm/k3sm`; a service-user peer that is another binary, a reused pid, a code lookup error and an old server after an upgrade (which prints the restart message) are each refused (seams: peer-credential source, client side; server code identity) | `k3sm/cmd/k3sm::TestClientPinsServerByInstalledCDHash`, `TestClientRefusesServiceUIDPeerOfOtherCode`, `TestClientRefusesReusedPeerPID`, `TestClientCDHashMismatchNamesRestart` | pending: the non-root CLI and `exec` |
+| U70 | (helper variant only) the floor helper admits only a peer that runs as the service uid and whose audit token resolves to the installed binary's cdhash, and the server admits only a helper that runs as root and is that binary; it refuses every request but `append` and `read` | `k3sm/pkg/keystore/floorhelper::TestFloorHelperPeerPinned`, `TestFloorHelperRefusesOtherRequests` | pending: the K0 amendment (helper variant only) |
+| U71 | (helper variant only) every Pod profile variant denies the helper's socket path, for connect, bind and every file operation | `runtimed/pkg/sandbox::TestFloorHelperSocketPodDenied` | pending: the K0 amendment (helper variant only) |
 
 ### Rig legs
 
@@ -2214,6 +2227,7 @@ E20 attended.
 | E22 | a native Pod with `securityContext.runAsUser: 0` | refused at spawn: the container never starts as root, and its status carries the uid refusal | no (U17) | runtimed's sandbox change: the Pod runs as uid 0 |
 | E23 | against the real authorizer: an admin binds, for `k3sm:local:<uid>` in `ks-e2e-3`, `k3sm:keystore-delivery-author` and a Role with `create` on `secrets` and `update` and `delete` on `secrets` with `resourceNames: [e2e-named]`; the user delivers `user/<uid>/e2e-token` as `e2e-named`, then as `e2e-other` | `e2e-named`: `Ready`, `Delivered`; `e2e-other`: `Authorized=False`, `NotAuthorized`, no Secret: the reconciler allows exactly what the API server allows the user | yes | the KeyDelivery reconciler (authority): `e2e-other` is delivered, or `e2e-named` is refused |
 | E24 | with the listener stopped by the maintenance marker, the operator runs, as the service user (`sudo -u _k3sm`), a program that is not k3sm bound at `keystore-run/keys.sock`; the user runs `k3sm keys list` and `k3sm keys put user/<me>/e2e-pin` | the CLI refuses each before writing a frame, naming the server pin; the stand-in receives no bytes past the connect; after the marker goes, the real server is accepted | yes | the server pin (U69): the CLI talks to the stand-in |
+| E25 | (helper variant only) a native Pod tries `connect(2)` to the floor helper's socket, and the login user and a non-k3sm service-user program each send it an `append` | `EPERM` for the Pod; the helper refuses the user by uid and the program by the pin, and no line is appended | yes | the helper pin (U70): a line from an unpinned peer is appended |
 
 ## Open questions
 
