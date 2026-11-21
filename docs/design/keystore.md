@@ -468,9 +468,12 @@ serializes Rewrap, Rotate and Put against each other and against the reconciler'
   start of a verb raise a sequence of the same generation, Put sets sequence 1 for a new
   generation, Delete removes the entry only if it records the deleted generation), holding
   the lock through the rename and the directory fsync. This lock defends against a writer
-  under a swapped `.lock` writing the floor; it does not stop the service user holding the
-  lock (a denial of service, already accepted above) or racing entry files under a swapped
-  `.lock`.
+  under a swapped `.lock` writing the floor; it does not stop racing entry files under a
+  swapped `.lock`. The data root is root:wheel 0755, so any local process able to open it,
+  not only the service user, can take this lock and hold it. A root verb that writes the
+  floor then fails with the lock timeout after the bounded wait. That is a denial of
+  service against the root write verbs and nothing more: holding the lock writes nothing,
+  so the floor, the entries and the readers (which do not take it) lose no integrity.
 - An entry directory with no `current` is an incomplete Put only in the one shape a crashed
   Put can leave, ignoring leftover `.tmp` files, and only when the floor does not record its
   generation; any other directory with no `current` is damage. "An entry directory with no
