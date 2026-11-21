@@ -107,6 +107,7 @@ rewrap_tests="$rewrap_tests TestRewrapKeyReuse TestRewrapRefusesStalePointer Tes
 rewrap_tests="$rewrap_tests TestRewrapRefusesLiveMasterFirst TestRewrapUserScopesBeforeSwap TestRewrapRecoversReplacedNext"
 rewrap_tests="$rewrap_tests TestRewrapRemovesStaleNew TestRewrapOverFullFloor TestRewrapCommitChecksMetadata TestRewrapUserScopesUnderLock"
 rewrap_tests="$rewrap_tests TestFinishSwapLeavesUnmatchedFingerprint"
+rewrap_tests="$rewrap_tests TestInterruptedRewrap TestRecordsSealedUnder TestRewrapNotStarted"
 
 # wanted reports whether row $1 runs in this mode.
 wanted() {
@@ -192,12 +193,14 @@ check G7 "the floor is raised by Put, Rotate, RaiseFloor and Delete when the mas
 check G8 "Rotate flips the pointer last; a crash before the flip leaves the old version current" \
 	TestRotateCrashAtEveryStep TestRotate
 check G9 "a Rotate retry discards the orphan and seals the value it was given" TestRotateRetryDiscardsOrphan TestParseVersionName
-check G10 "the master is minted only by the first put, never over entries" TestMasterMint TestMintCountsReservedUserName
+check G10 "the master is minted only by the first put, never over entries; rewrap --key-in accepts only a key an interrupted rewrap recorded or sealed records under" \
+	TestMasterMint TestMintCountsReservedUserName cmd:TestKeysRewrapKeyInRecoveryOnly cmd:TestKeysRewrapKeyInRecoversReplacedNext
 check G11 "the master is judged on the open descriptor" TestMasterTrust
 check G12 "Rewrap resumes after a crash at every step, old key then new, nothing unreadable; a bad master.next is discarded only with no .new file" \
 	TestRewrapCrashAtEveryStep TestRewrapKeyReuse TestRewrapRefusesStalePointer TestRewrapVerifiesCommit TestRewrapGuards \
 	TestRewrapRefusesLiveMasterFirst TestRewrapUserScopesBeforeSwap TestRewrapRecoversReplacedNext \
-	TestRewrapRemovesStaleNew TestRewrapOverFullFloor TestRewrapCommitChecksMetadata TestRewrapUserScopesUnderLock
+	TestRewrapRemovesStaleNew TestRewrapOverFullFloor TestRewrapCommitChecksMetadata TestRewrapUserScopesUnderLock \
+	TestInterruptedRewrap TestRecordsSealedUnder TestRewrapNotStarted
 check G13 "a crash between the master renames leaves a trusted master, and the next verb completes the swap" \
 	TestRewrapMasterRenameCompleted TestFinishSwapLeavesUnmatchedFingerprint
 check G14 "one lock with a bounded wait serializes Rewrap, Rotate, Put, Delete and the reads, and no read blocks" \
