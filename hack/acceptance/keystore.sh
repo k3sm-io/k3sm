@@ -84,7 +84,7 @@ pend G13 "a crash between the master renames is completed (PR 3)"
 check G14 "one lock with a bounded wait, and no read that blocks" TestLockBoundedWait TestConcurrentOperations TestFIFORefused
 check G15 "files a root verb writes are the service user's, at the layout's modes, inside the store" \
 	TestOwnership TestCredSymlinkRefused TestRefusesSymlinks
-partial G16 "List marks an unreadable entry with Err, and Delete still removes it; an entry directory with no current is an interrupted put only in the shape a crashed Put leaves (library)" \
+partial G16 "List marks an unreadable entry with Err, and Delete still removes it; an entry directory with no current is an interrupted put only in the shape a crashed Put leaves, and Delete removes it too (library)" \
 	"list exits 1 on a corrupt entry (PR 4: k3sm keys)" \
 	TestListMarksCorruptEntry TestDeleteCorruptEntry TestEntryWithNoPointer
 pend G17 "show prints a value only with --reveal, byte-exact (PR 4)"

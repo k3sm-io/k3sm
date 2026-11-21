@@ -978,12 +978,13 @@ func TestEntryWithNoPointer(t *testing.T) {
 			if _, _, err := s.Get(ctx, "a", 1); !errors.Is(err, ErrNotFound) {
 				t.Fatalf("Get: %v, want ErrNotFound", err)
 			}
-			before := files(t, dir)
+			// Delete answers ErrNotFound, since there is no entry, and still
+			// removes the directory, which may hold a sealed v1.
 			if err := s.Delete(ctx, "a"); !errors.Is(err, ErrNotFound) {
 				t.Fatalf("Delete: %v, want ErrNotFound", err)
 			}
-			if after := files(t, dir); after != before {
-				t.Fatalf("Delete changed the directory: %s, was %s", after, before)
+			if _, err := os.Lstat(dir); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("directory after Delete: %v, want it gone", err)
 			}
 			mustPut(t, s, "a", KindOpaque, []byte("new"))
 			if _, val, err := s.Current(ctx, "a"); err != nil || string(val) != "new" {
@@ -1096,6 +1097,13 @@ func TestPutCrashAtEveryStep(t *testing.T) {
 		s.step = func(string) error { return nil }
 		if _, _, err := s.Current(ctx, "k"); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("Current after an interrupted Delete: %v, want ErrNotFound", err)
+		}
+		// The retried rm removes the generation and sealed v1 the crash left.
+		if err := s.Delete(ctx, "k"); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("retried Delete: %v, want ErrNotFound", err)
+		}
+		if _, err := os.Lstat(filepath.Join(s.dir, "k")); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("entry directory after the retried Delete: %v, want it gone", err)
 		}
 		mustPut(t, s, "k", KindOpaque, []byte("again"))
 	})

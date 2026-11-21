@@ -380,9 +380,10 @@ func listEntry(e *entry, k keys) Entry {
 
 // Delete removes name and every version of it. The pointer is removed first,
 // so an interrupted Delete leaves a directory with no pointer. One holding only
-// generation and v1 is an interrupted Put, which is not an entry and is
-// discarded by the next Put of the name; one holding more is damage that List
-// reports, and Delete, called again, clears it. Delete reads nothing inside the
+// generation and v1 is an interrupted Put, which is not an entry: Delete,
+// called again, removes it and answers ErrNotFound, and so does the next Put
+// of the name. One holding more is damage that List reports, and Delete,
+// called again, clears it. Delete reads nothing inside the
 // entry, so it removes one List reports as corrupt. A symlink or any other
 // non-directory at the name is unlinked without being followed.
 func (s *FileStore) Delete(ctx context.Context, name string) error {
@@ -415,6 +416,18 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	}
 	e, err := openEntryDir(root, name)
 	damaged := errors.Is(err, errNoPointer)
+	if errors.Is(err, errInterruptedPut) {
+		// Not an entry, so the answer is ErrNotFound, but the directory may
+		// hold a sealed v1 (a Delete that crashed after removing the pointer
+		// leaves one), so it is removed first.
+		if err := root.RemoveAll(name); err != nil {
+			return err
+		}
+		if err := syncDir(root); err != nil {
+			return err
+		}
+		return ErrNotFound
+	}
 	if err != nil && !damaged {
 		return err
 	}
