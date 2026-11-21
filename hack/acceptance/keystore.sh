@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # The keystore's acceptance gate: docs/design/keystore.md § "Acceptance gate",
-# rows G1 to G22, the user-scope rows U1 to U113 (U15 and U39 are unused) and
+# rows G1 to G22, the user-scope rows U1 to U116 (U15 and U39 are unused) and
 # the rig legs E1 to E25. Every row is listed, on exactly one line. A row runs
 # the tests that deliver it and passes only if each named test ran and passed
 # in its own package; a row whose change has not landed yet prints PENDING,
@@ -31,7 +31,7 @@
 #   --rewrap        Rewrap's rows: G3, G12, G13, G14 and U5.
 #   --verbs         the keys verbs: G16, G17, G21, U1.
 #   --delivery      the system delivery: G18 to G20.
-#   --sandbox       the pod denies and the shared path names: U16, U17, U49.
+#   --sandbox       the pod denies and the shared path names: U16, U17, U49, U116.
 #   --api           the KeyDelivery API types: U18, U19.
 #   --scope         user scopes: U6 to U11, U47, U58, U64, U66, U108.
 #   --scope-store   the user-scope store: U12 to U14, U63, U97, U101.
@@ -43,7 +43,7 @@
 #   --kd-author     KeyDelivery authoring: U40, U41, U74, U76, U87, U94.
 #   --kd-reconcile  the KeyDelivery reconciler: U42, U43, U59, U73, U78, U81, U111.
 #   --kd-lifecycle  the KeyDelivery lifecycle: U44, U53, U55, U56, U62, U65,
-#                   U72, U75, U77, U79, U83, U85, U86, U89, U93, U95, U96, U98, U100, U102, U103, U106, U107, U109, U110.
+#                   U72, U75, U77, U79, U83, U85, U86, U89, U93, U95, U96, U98, U100, U102, U103, U106, U107, U109, U110, U114, U115.
 #   --grammar       the entry grammar in apis: U57.
 #   --docs          the user docs: no row yet, so it exits 3.
 # A unit mode runs only its rows and only their tests, with the same exit
@@ -125,6 +125,9 @@ EXPECTED_ROWS="$EXPECTED_ROWS U110"
 EXPECTED_ROWS="$EXPECTED_ROWS U111"
 EXPECTED_ROWS="$EXPECTED_ROWS U112"
 EXPECTED_ROWS="$EXPECTED_ROWS U113"
+EXPECTED_ROWS="$EXPECTED_ROWS U114"
+EXPECTED_ROWS="$EXPECTED_ROWS U115"
+EXPECTED_ROWS="$EXPECTED_ROWS U116"
 # >>> ADD NEW U ROWS (U64 upward) HERE <<<
 EXPECTED_ROWS="$EXPECTED_ROWS E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 E13 E14 E15 E16 E17 E18 E19 E20"
 EXPECTED_ROWS="$EXPECTED_ROWS E21 E22 E23 E24 E25"
@@ -151,7 +154,7 @@ mode_rows() {
 	rewrap) echo "G3 G12 G13 G14 U5" ;;
 	verbs) echo "G16 G17 G21 U1" ;;
 	delivery) echo "G18 G19 G20" ;;
-	sandbox) echo "U16 U17 U49" ;;
+	sandbox) echo "U16 U17 U49 U116" ;;
 	api) echo "U18 U19" ;;
 	scope) echo "U6 U7 U8 U9 U10 U11 U47 U58 U64 U66 U108" ;;
 	scope-store) echo "U12 U13 U14 U63 U97 U101" ;;
@@ -161,7 +164,7 @@ mode_rows() {
 	exec) echo "U36 U37 U38 U69 U92" ;;
 	kd-author) echo "U40 U41 U74 U76 U87 U94" ;;
 	kd-reconcile) echo "U42 U43 U59 U73 U78 U81 U111" ;;
-	kd-lifecycle) echo "U44 U53 U55 U56 U62 U65 U72 U75 U77 U79 U83 U85 U86 U89 U93 U95 U96 U98 U100 U102 U103 U106 U107 U109 U110" ;;
+	kd-lifecycle) echo "U44 U53 U55 U56 U62 U65 U72 U75 U77 U79 U83 U85 U86 U89 U93 U95 U96 U98 U100 U102 U103 U106 U107 U109 U110 U114 U115" ;;
 	grammar) echo "U57" ;;
 	*) echo "" ;;
 	esac
@@ -446,7 +449,7 @@ pend U26 "peers uid 0, the service uid and uid < 501 are refused before any fram
 	k3sm/pkg/keystore/socket::TestPeerEligibility
 pend U27 "framing: an oversize frame, unknown type or missing HELLO closes; an unknown header field is ignored; HELLO picks the highest common version (socket listener)" \
 	k3sm/pkg/keystore/socket::FuzzFrameReader TestFramingBounds TestSubLengthsWithinFrame TestHelloReadDeadline TestUnknownHeaderFieldsIgnored TestHelloVersionRange TestHelloReplyCarriesVersionAndMaxFrame TestHelloNoOverlapSendsUnsupportedVersion TestUnknownOpKeepsConnection TestFrameCapCoversMaxValue
-pend U28 "16 connections in all, 2 per uid; a request past 10 s is cut; a connection idle 30 s after HELLO or between requests is closed (socket listener)" \
+pend U28 "64 connections in all, 2 per uid; a request past 10 s is cut; a connection idle 30 s after HELLO or between requests is closed (socket listener)" \
 	k3sm/pkg/keystore/socket::TestConnectionCapsPerUID TestRequestTimeout TestIdleTimeoutAfterHelloAndBetweenRequests
 pend U29 "a listener panic is recovered and restarted; the apiserver is untouched; a stale socket is unlinked only if a service-user socket; a lock wait past 2 s fails the request (socket listener)" \
 	k3sm/pkg/keystore/socket::TestListenerRecoversPanic TestStaleSocketUnlinkChecksOwner TestBoundedLockWait
@@ -499,7 +502,7 @@ pend U52 "every root verb writes one audit line with via root once the log exist
 	k3sm/cmd/k3sm::TestEveryRootVerbWritesAuditLine
 pend U53 "every reconciler Secret write and delete, and every record withdrawal, writes one audit line with via reconciler, except drift repairs, coalesced to one line per delivery per 10 minutes (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestEveryReconcilerWriteAndDeleteAudited
-pend U54 "a pre-frame refusal writes a refused line with the peer uid, rate-limited per uid with a dropped-count summary (socket listener)" \
+pend U54 "a pre-frame refusal writes a refused line with the peer uid, rate-limited per uid, drawing on the reconciler budget with its once-a-minute dropped-count summary (socket listener)" \
 	k3sm/pkg/keystore/socket::TestPreFrameRefusalsAudited TestPreFrameRefusalLinesRateLimited
 pend U55 "a transient lookup, SAR or apiserver error leaves the Secret, the record entry and the finalizer, sets Authorized=Unknown with reason Indeterminate, and retries with backoff; a SAR with allowed=false and no evaluation error is a definitive denial whatever denied says, and an evaluation error or a failed call is Indeterminate; no sweep before readyz and the RBAC, KeyDelivery and Secret informers sync; every deleting outcome deletes only on two consecutive sweeps; only the allow-list of definitive outcomes deletes (ErrNotFound in a scope that opened and ErrScopeOwnerChanged among them), and every other sentinel, ErrScopeAbsent included, is Indeterminate; against the real store, on ErrScopeOwnerChanged the reconciler reads the deliveries record under W without the GeneratedUID check only to find recorded targets, deletes them by the target-matching rule, and never delivers, rotates or opens an entry (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestTransientErrorLeavesSecretSetsUnknown TestSAREvaluationErrorIsIndeterminate TestSARAllowedFalseWithoutErrorIsDenial TestNoSweepBeforeReady TestDenialNeedsTwoSweeps TestScopeOwnerChangedDeletes TestEverySentinelBesidesNotFoundAndOwnerChangedIsIndeterminate \
@@ -531,8 +534,8 @@ pend U67 "the revocation class (withdraw, rm, rotate, the withdrawal's floor lin
 	TestSocketMarginSeparateFromReconcilerAllowance
 rootpend U68 "root-run: the maintenance verbs refuse a symlink or swapped file planted at the marker, a staging name or the old log; creates are O_EXCL|O_NOFOLLOW through one data-root descriptor, fchflags on the held descriptor after renameat and fchown to the service user only after the flag, never renaming a flagged file or over one; no log byte changes on a refusal (append-only files)" \
 	k3sm/cmd/k3sm::TestMaintenanceRefusesPlantedSymlinkAndSwap
-pend U69 "the client pins the server: the peer's audit token (LOCAL_PEERTOKEN) must resolve to the cdhash of the installed /Library/k3sm/k3sm, or nothing is written; another service-user binary, a reused pid, a lookup error and an old server after an upgrade are refused (non-root CLI and exec)" \
-	k3sm/cmd/k3sm::TestClientPinsServerByInstalledCDHash TestClientRefusesServiceUIDPeerOfOtherCode TestClientRefusesReusedPeerPID TestClientCDHashMismatchNamesRestart
+pend U69 "the client pins the server: the peer's audit token (LOCAL_PEERTOKEN) must resolve to the cdhash of the installed /Library/k3sm/k3sm, or nothing is written; another service-user binary, a reused pid, a lookup error, an old server after an upgrade and a listener inherited or passed to another process are refused (non-root CLI and exec)" \
+	k3sm/cmd/k3sm::TestClientPinsServerByInstalledCDHash TestClientRefusesServiceUIDPeerOfOtherCode TestClientRefusesReusedPeerPID TestClientCDHashMismatchNamesRestart TestClientPinWithInheritedOrPassedListener
 pend U70 "helper variant only: the floor helper admits only a service-uid peer whose audit token resolves to the installed binary's cdhash, the server pins the helper as root and that binary, and only append and read are served (K0 amendment, helper variant only)" \
 	k3sm/pkg/keystore/floorhelper::TestFloorHelperPeerPinned TestFloorHelperRefusesOtherRequests
 pend U71 "helper variant only: every pod profile variant denies the floor helper's socket for connect, bind and every file operation (K0 amendment, helper variant only)" \
@@ -621,6 +624,12 @@ pend U112 "the order is commit, then append, then reply: an append that fails af
 	k3sm/pkg/keystore/socket::TestAuditFailureAfterCommitRepliesCommittedAuditFailed k3sm/cmd/k3sm::TestDoctorCountsUnauditedOps
 pend U113 "the listener refuses to start unless the server's effective uid is the service uid: a rootless k3sm server runs no listener, and the server log and doctor say user scope needs the installed server (socket listener)" \
 	k3sm/pkg/keystore/socket::TestListenerRefusesUnlessServiceUID
+pend U114 "rm-scope writes keystore-removed-scopes.json in the data root, root-owned, through the data-root descriptor rules, before it removes the scope; only a scope listed there counts as removed for the finalizer, and a plain ErrScopeAbsent stays non-definitive and keeps the finalizer (KeyDelivery lifecycle)" \
+	k3sm/cmd/k3sm::TestRmScopeRecordsRemovedScope k3sm/pkg/keystore/reconcile::TestOnlyRecordedRemovalCountsAsWithdrawn
+pend U115 "rm-scope names each blocking binding, a RoleBinding with its namespace; --remove-bindings deletes each listed binding through the admin client before anything else changes, and a failed delete stops the verb (KeyDelivery lifecycle)" \
+	k3sm/cmd/k3sm::TestRmScopeNamesBindingsAndRemovesThem
+pend U116 "the Pod uid refusal applies to native Pods only: a vm Pod with runAsUser: 1000 is allowed, since a guest uid has no host meaning, while a native Pod with the same drop target is refused (sandbox change)" \
+	runtimed/pkg/runtime::TestVMPodGuestUIDNotRefused
 # >>> ADD NEW U ROWS (U64 upward) HERE, and add each to EXPECTED_ROWS and to mode_rows <<<
 
 leg E1 "files" "preconditions: secrets encryption on; one server; keystore-sock/ root:wheel 0755 with keys.sock from launchd, and both logs present, service-user 0600, SF_APPEND set; the doctor user-scope row on; keystore.sh --check exits 0 on the build" "the append-only files"
@@ -834,6 +843,10 @@ U113|unless the server's effective uid is the service uid
 U113|user scope needs the installed server
 U17|explicit drop target of 501 or above
 U17|an inherited uid
+U114|keystore-removed-scopes.json
+U114|a plain ErrScopeAbsent stays non-definitive
+U115|--remove-bindings deletes each listed binding through the admin client
+U116|a vm Pod with runAsUser: 1000 is allowed
 U97|rm then put"
 
 # --listed: the row-presence lint.
