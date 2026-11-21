@@ -34,7 +34,7 @@ and `-`, each starting and ending with a letter or digit, the same rule as a Kub
 name.
 
 - A name without a scope, such as `signer-key`, is refused, and the message shows the
-  `system/signer-key` form to use.
+  `system/<name>` form to use. It does not repeat what you typed, in case that was a value.
 - A `user/...` name is refused with "user scopes are not supported by this build".
 
 ## The Verbs

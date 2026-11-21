@@ -255,16 +255,17 @@ var errUserScope = errors.New("user scopes are not supported by this build: use 
 
 // parseKeyName turns a scope-qualified name into the store's entry name. It
 // returns errUserScope for user/..., and a usage error for anything else that
-// is not system/<name>. The entry name itself is the store's to judge.
+// is not system/<name>. A refused argument is never echoed: it may be a value
+// typed where the name belongs. The entry name itself is the store's to judge.
 func parseKeyName(q string) (string, error) {
 	scope, name, ok := strings.Cut(q, "/")
 	switch {
 	case !ok:
-		return "", fmt.Errorf("entry names are scope-qualified: use system/%s", q)
+		return "", errors.New("entry names are scope-qualified: use system/<name>")
 	case scope == "user":
 		return "", errUserScope
 	case scope != "system" || name == "" || strings.Contains(name, "/"):
-		return "", fmt.Errorf("%q is not a scope-qualified entry name: use system/<name>", q)
+		return "", errors.New("the argument is not a scope-qualified entry name: use system/<name>")
 	}
 	return name, nil
 }
