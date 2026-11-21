@@ -301,12 +301,15 @@ func (g *gate) modifyResponse(resp *http.Response) error {
 		if resp.Request != nil {
 			method, path = resp.Request.Method, resp.Request.URL.Path
 		}
-		// The callback's elapsed is the time since the body was wrapped, not
-		// since the last byte arrived.
+		// since_headers is the time since the body was wrapped, not
+		// since the last byte arrived. The line is per cut and not behind a
+		// warnGate, like the relay's own cut line: each needs a full window of
+		// silence on one response, and the relay's connection cap bounds how
+		// many responses can be open at once.
 		resp.Body = newProgressBody(resp.Body, g.bodyProgress, func(passed int64, elapsed time.Duration) {
 			g.log.Warn("ingest registry gate cut a local registry response that stopped sending",
 				"target", g.upstream, "method", method, "path", path, "window", g.bodyProgress,
-				"bytes", passed, "elapsed", elapsed)
+				"bytes", passed, "since_headers", elapsed)
 		})
 	}
 	return nil

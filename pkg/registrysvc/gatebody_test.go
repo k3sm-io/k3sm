@@ -179,7 +179,7 @@ func TestGateCutsUpstreamStalledAfterHeaders(t *testing.T) {
 				}
 				var cut struct {
 					Bytes   *int64         `json:"bytes"`
-					Elapsed *time.Duration `json:"elapsed"`
+					Elapsed *time.Duration `json:"since_headers"`
 				}
 				for line := range strings.Lines(logs.String()) {
 					if strings.Contains(line, cutMsg) {
