@@ -272,7 +272,9 @@ once those pointers are known to be current.
 The file is bounded at 4 MiB, on read and on write. A floor write whose result would be
 larger is refused before anything is written, so the floor on disk is always one that
 reads. Put and Rotate check for room before they write the entry, so a full floor refuses
-them with nothing changed. A root-run verb's raise leaves out an entry that does not fit
+them with no entry or pointer file written. Other entries' floor records may already have
+been raised by the floor sync that runs first; that is safe, because a raise only raises.
+A root-run verb's raise leaves out an entry that does not fit
 (that entry's floor stays behind its pointer, which readers accept), refuses a keystore
 with more entries than the file can hold, and Delete still runs over a full floor, since
 it is how room is made.
