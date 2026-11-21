@@ -73,6 +73,52 @@ Pods run as **uid 0**. They are still Seatbelt-confined, and no installed cluste
 (the LaunchDaemon runs as `_k3sm`). Do not run untrusted workloads on `--datapath`; it is a
 disposable dev tier, and `k3sm dev up --datapath` says the same thing in its banner.
 
+### `fsGroup` Does Not Reach Every File in a Native Pod
+
+A native Pod with `securityContext.fsGroup` gets its data volume walked once, when the Pod is created: each
+directory and file gets the group, the owner's permissions copied to the group, and directories get setgid.
+The node daemon does this in a tree the Pod's own processes can rearrange, so it changes only what it can
+open and identify, and leaves the rest with the group and mode it had:
+
+- **Files with more than one hard link.** The other link could be a file outside the Pod, and the daemon
+  cannot tell. Image layers ship hard links (several names for one program), so those files keep their
+  group and mode.
+- **Sockets and device nodes.** A socket cannot be opened, and opening a device can act on it.
+- **Directories on another device** (a mount point inside the volume), and everything below them.
+- **Files the daemon cannot read**, which only happens when the node runs unprivileged.
+- **Entries another user owns.** Only entries owned by a user the Pod's containers run as, or by the node
+  daemon, are changed. On a node whose daemon runs as root and whose Pod drops to another user, a
+  root-owned entry gets only its mode changed, and only if it already carries the Pod's `fsGroup`. Every
+  entry the daemon creates in the Pod's tree carries it, because the tree's top directory is given the
+  group before anything is placed in it. A root-owned file renamed in from a share keeps its group and
+  mode, unless it already carried that group.
+
+Setuid and setgid files are changed, but they lose those bits first: the daemon clears setuid and setgid,
+then gives the file the group and copies the owner's permissions to the group, as for any other file. A
+setuid program in the volume therefore no longer runs as its owner, and if the owner could write it, so can
+the group. Secret, ConfigMap and projected volumes inside the tree are walked the same way, so on a node
+whose daemon runs as root their files become group-writable to every container in the Pod, not group
+read-only as kubelet makes them.
+
+A symlink gets the group on the link itself, and the walk does not follow it, so a PersistentVolumeClaim's
+data, which is mounted through a link, does not get the group either.
+
+What was left alone is written to the node daemon's log when the Pod is created, with a count for each
+reason and a few example paths. It is not on the Pod as an Event. If a container that runs as a non-root
+user with an `fsGroup` cannot read a file it expected to, check that log line first, and give the file its
+group and mode in the image or in an init step.
+
+The walk also has limits, since the tree is the Pod's to shape: 1024 directory levels and about eight
+million entries. A volume past either fails the Pod's creation with an `fsGroup` set.
+
+The `fsGroup` itself must be a group ID no account or group on the node uses, from 1000 up, unless the node
+admits that ID. Group membership on macOS is a privilege for most of the groups below 1000 (`staff`,
+`admin`, `everyone`, `_developer` and others), and a Pod is made a member of its `fsGroup`. A Pod with any
+other `fsGroup` fails to be created. Today the admission policy only admits an `fsGroup` equal to the node's
+own uid, which is below 1000, so on a default node no Pod with an `fsGroup` can be created at all. Pods
+sharing one uid, which is every Pod on a default node, are one trust domain: the `fsGroup` walk cannot keep
+one of them out of another's files.
+
 ### Keychain Reads Return Nothing, and Report Success
 
 A Pod reaching the keychain gets an **empty result with a zero exit status**, not an error. The
