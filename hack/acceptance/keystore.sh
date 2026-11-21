@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # The keystore's acceptance gate: docs/design/keystore.md § "Acceptance gate",
-# rows G1 to G22, the user-scope rows U1 to U78 (U15 and U39 are unused) and
+# rows G1 to G22, the user-scope rows U1 to U81 (U15 and U39 are unused) and
 # the rig legs E1 to E25. Every row is listed, on exactly one line. A row runs
 # the tests that deliver it and passes only if each named test ran and passed
 # in its own package; a row whose change has not landed yet prints PENDING,
@@ -36,14 +36,14 @@
 #   --scope         user scopes: U6 to U11, U47, U58, U64, U66.
 #   --scope-store   the user-scope store: U12 to U14, U63.
 #   --files         the append-only files: U20 to U25, U50, U52, U60, U61, U68,
-#                   and in the helper variant only U70, U71.
+#                   U80, and in the helper variant only U70, U71.
 #   --socket        the socket listener: U26 to U31, U46, U48, U54.
 #   --socket-ops    the socket operations: U32 to U35, U45, U51, U67.
 #   --exec          the non-root CLI and exec: U36 to U38, U69.
 #   --kd-author     KeyDelivery authoring: U40, U41, U74, U76.
-#   --kd-reconcile  the KeyDelivery reconciler: U42, U43, U59, U73, U78.
+#   --kd-reconcile  the KeyDelivery reconciler: U42, U43, U59, U73, U78, U81.
 #   --kd-lifecycle  the KeyDelivery lifecycle: U44, U53, U55, U56, U62, U65,
-#                   U72, U75, U77.
+#                   U72, U75, U77, U79.
 #   --grammar       the entry grammar in apis: U57.
 #   --docs          the user docs: no row yet, so it exits 3.
 # A unit mode runs only its rows and only their tests, with the same exit
@@ -105,7 +105,7 @@ EXPECTED_ROWS="$EXPECTED_ROWS U49 U50 U51 U52 U53 U54 U55 U56 U57"
 EXPECTED_ROWS="$EXPECTED_ROWS U58 U59 U60 U61 U62 U63"
 EXPECTED_ROWS="$EXPECTED_ROWS U64 U65 U66 U67 U68 U69 U70 U71"
 EXPECTED_ROWS="$EXPECTED_ROWS U72 U73 U74 U75 U76"
-EXPECTED_ROWS="$EXPECTED_ROWS U77 U78"
+EXPECTED_ROWS="$EXPECTED_ROWS U77 U78 U79 U80 U81"
 # >>> ADD NEW U ROWS (U64 upward) HERE <<<
 EXPECTED_ROWS="$EXPECTED_ROWS E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 E13 E14 E15 E16 E17 E18 E19 E20"
 EXPECTED_ROWS="$EXPECTED_ROWS E21 E22 E23 E24 E25"
@@ -136,13 +136,13 @@ mode_rows() {
 	api) echo "U18 U19" ;;
 	scope) echo "U6 U7 U8 U9 U10 U11 U47 U58 U64 U66" ;;
 	scope-store) echo "U12 U13 U14 U63" ;;
-	files) echo "U20 U21 U22 U23 U24 U25 U50 U52 U60 U61 U68 U70 U71" ;;
+	files) echo "U20 U21 U22 U23 U24 U25 U50 U52 U60 U61 U68 U70 U71 U80" ;;
 	socket) echo "U26 U27 U28 U29 U30 U31 U46 U48 U54" ;;
 	socket-ops) echo "U32 U33 U34 U35 U45 U51 U67" ;;
 	exec) echo "U36 U37 U38 U69" ;;
 	kd-author) echo "U40 U41 U74 U76" ;;
-	kd-reconcile) echo "U42 U43 U59 U73 U78" ;;
-	kd-lifecycle) echo "U44 U53 U55 U56 U62 U65 U72 U75 U77" ;;
+	kd-reconcile) echo "U42 U43 U59 U73 U78 U81" ;;
+	kd-lifecycle) echo "U44 U53 U55 U56 U62 U65 U72 U75 U77 U79" ;;
 	grammar) echo "U57" ;;
 	*) echo "" ;;
 	esac
@@ -420,8 +420,8 @@ pend U23 "every audited operation writes one v:1 line; no line carries a value o
 	TestAuditLineNeverCarriesValue TestAuditReaderIgnoresUnknownFields
 pend U24 "soft cap shows in doctor; past the hard cap every mutating user op is ErrLogFull, except the revocation class, which draws on the reserve; a line over 1 KiB is refused (append-only files)" \
 	TestLogHardCapRefusesMutations TestAuditLineBoundedAtOneKiB
-pend U25 "backup and restore round trip: a restored tree with cleared flags is refused until floor --rebuild, then opens; rig leg E17 (append-only files)" \
-	TestBackupRestoreRoundTripRebuild
+pend U25 "backup and restore round trip: a restored tree with cleared flags is refused until floor --rebuild, then opens; the rebuild writes a line for every entry directory holding a generation file, sequence 0 without an authenticated pointer, so a damaged entry stays ErrCorrupt and never becomes ErrNotFound; rig leg E17 (append-only files)" \
+	TestBackupRestoreRoundTripRebuild TestRebuildKeepsDamagedEntryCorrupt
 pend U26 "peers uid 0, the service uid and uid < 501 are refused before any frame is read (socket listener)" \
 	k3sm/pkg/keystore/socket::TestPeerEligibility
 pend U27 "framing: an oversize frame, unknown type or missing HELLO closes; an unknown header field is ignored; HELLO picks the highest common version (socket listener)" \
@@ -456,7 +456,7 @@ pend U41 "deliver creates impersonating only k3sm:local:<uid> and k3sm:local-use
 pend U42 "an unrecorded UID, a digest mismatch, or a failed name-scoped SAR (create keydeliveries; create, update, delete secrets with resourceNames) gets no Secret; encryption off refuses, G18 for KeyDelivery; each SAR carries the impersonated create's user and groups, so a group-bound grant is honoured consistently (KeyDelivery reconciler)" \
 	k3sm/pkg/keystore/reconcile::TestUnrecordedOrRetargetedDeliveryGetsNoSecret TestSARCreateUnnamedUpdateDeleteNamed \
 	TestEncryptionOffRefusesKeyDelivery TestSARCarriesImpersonatedUserAndGroups TestGroupBoundGrantHonouredConsistently
-pend U43 "reasons are the closed set; absent and not yours both read EntryUnavailable; a pre-existing unlabelled Secret is SecretExists; a second declaration is SecretClaimed; observedGeneration tracks; Ready=False carries NotAuthorized for any authority failure; Ready=Unknown, Pending initially and while Authorized is Unknown; each Authorized=False reason is tied to deleting or retaining the Secret, and a kept Secret sets SecretRetained=True (KeyDelivery reconciler)" \
+pend U43 "reasons are the closed set; absent and not yours both read EntryUnavailable; a pre-existing Secret not claimed by a KeyDelivery (unlabelled, or Phase A's) is SecretExists; a second declaration is SecretClaimed; observedGeneration tracks; Ready=False carries NotAuthorized for any authority failure; Ready=Unknown, Pending initially and while Authorized is Unknown; each Authorized=False reason is tied to deleting or retaining the Secret, and a kept Secret sets SecretRetained=True (KeyDelivery reconciler)" \
 	k3sm/pkg/keystore/reconcile::TestConditionReasonsClosedSet TestReasonConditionTable TestOneDeclarationPerSecret TestReadyFalseCarriesNotAuthorized TestReadyUnknownPending TestAuthorizedFalseReasonActionMap TestSecretRetainedWhenKept
 pend U44 "losing authority deletes exactly the owned Secret; the crash order is Secret, record, finalizer at every interruption point; ownership is the label, the owner annotation and that UID in the sealed record, not the ownerReference; the Secret's namespace and name must equal the record's target for that UID, and the record's entry must match the owner annotation; the orphan sweep removes a labelled Secret only when its owner annotation names a UID the sealed record holds, it is that UID's recorded target, and that object is gone or withdrawn, never on the label and owner annotation alone, never an unlabelled or foreign one; a forged label and a real UID on another Secret are left alone, charged to no share, one refused line under the reconciler (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestLostAuthorityDeletesOnlyOwnedSecret TestFinalizerCrashOrder TestOrphanSweep TestForgedOwnerAnnotationOnOtherSecretIsLeftAlone
@@ -495,7 +495,7 @@ pend U60 "seam guard: cmd/k3sm's TestMain stubs each of its seams: clock, uid re
 	k3sm/cmd/k3sm::TestRealPrimitivesUnreachable
 pend U61 "seam guard: pkg/install's TestMain stubs its euid source and file-attribute writer (append-only files)" \
 	k3sm/pkg/install::TestRealPrimitivesUnreachable
-pend U62 "reconciler lines are charged to the delivery's owner uid: a deliver-write past the share is Indeterminate, a deliver-delete and a withdrawal's lines are never refused for the share and past it draw on the reserve (KeyDelivery lifecycle)" \
+pend U62 "reconciler lines are charged to the delivery's owner uid: a deliver-write of a new version past the share is Indeterminate unless it is the rotation write that follows a rotate; a deliver-delete, a withdrawal's lines and the rotation write are never refused for the share and past it draw on the reserve (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestReconcilerLinesChargedToOwner TestDeliverWritePastShareIsIndeterminate TestDeliverDeleteNeverRefusedForShare
 pend U63 "entries live under .user/<uid>/entries/: entries named deliveries and scope.key are ordinary and touch neither scope file (user-scope store)" \
 	k3sm/pkg/keystore::TestEntriesNamedDeliveriesAndScopeKeyAreOrdinary
@@ -505,7 +505,7 @@ pend U65 "ErrScopeAbsent is Indeterminate and deletes nothing; every allow-list 
 	k3sm/pkg/keystore/reconcile::TestAbsentScopeIsIndeterminate TestEveryDeletingOutcomeNeedsTwoSweeps TestSingleServerRecheckedBeforeEverySweep
 pend U66 "a synthesized GeneratedUID (prefix FFFFEEEE-DDDD-CCCC-BBBB-AAAA) is ErrScopeOwnerUnknown and never bound; ErrScopeOwnerChanged only for a real GeneratedUID that differs (user scopes)" \
 	k3sm/pkg/keystore::TestSynthesizedGeneratedUIDIsUnknown
-pend U67 "the revocation class (withdraw, rm, rotate, the withdrawal's floor line, the reconciler's deliver-delete and deliver-write of a withdrawal) bypasses the share past it and draws on the 4 MiB revocation reserve above the hard cap, refused only when the reserve is exhausted; a no-op revocation is charged to the share; the reconciler's 3 MiB of the reserve is kept (socket operations)" \
+pend U67 "the revocation class (withdraw, rm, rotate, the withdrawal's floor line, the reconciler's deliver-delete, its deliver-write of a withdrawal and its rotation write) bypasses the share past it and draws on the 5 MiB revocation reserve above the hard cap, refused only when the reserve is exhausted; a no-op revocation is charged to the share; the reconciler's 4 MiB of the reserve is kept (socket operations)" \
 	k3sm/pkg/keystore/socket::TestRevocationBypassesShareUsesReserve TestNoOpRevocationChargedToShare TestReserveKeepsReconcilerPart
 rootpend U68 "root-run: the maintenance verbs refuse a symlink or swapped file planted at the marker, a staging name or the old log; creates are O_EXCL|O_NOFOLLOW through one data-root descriptor, fchown before renameat and fchflags on the held descriptor after it, never renaming a flagged file or over one; no log byte changes on a refusal (append-only files)" \
 	k3sm/cmd/k3sm::TestMaintenanceRefusesPlantedSymlinkAndSwap
@@ -517,8 +517,8 @@ pend U71 "helper variant only: every pod profile variant denies the floor helper
 	runtimed/pkg/sandbox::TestFloorHelperSocketPodDenied
 pend U72 "an orphan-cascade delete of a KeyDelivery, its Secret's ownerReference stripped, still deletes the Secret, found by label, owner annotation and the sealed record's UID (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestOrphanCascadeStillDeletesSecret
-pend U73 "only an honoured, recorded KeyDelivery can claim a target for SecretClaimed; an older unrecorded object claims nothing (KeyDelivery reconciler)" \
-	k3sm/pkg/keystore/reconcile::TestUnrecordedObjectDoesNotClaimTarget
+pend U73 "only an honoured, recorded KeyDelivery can claim a target for SecretClaimed; an older unrecorded object claims nothing; precedence follows the last honoured owner, which keeps the claim until a definitive deleting outcome, and an indeterminate sweep keeps the claim (KeyDelivery reconciler)" \
+	k3sm/pkg/keystore/reconcile::TestUnrecordedObjectDoesNotClaimTarget TestIndeterminateOwnerKeepsClaim
 pend U74 "withdraw by namespace and name deletes the caller's own unrecorded object after checking requestedBy against the peer uid, with a UID precondition; another uid's object is not-found (KeyDelivery authoring)" \
 	k3sm/pkg/keystore/socket::TestWithdrawRemovesOwnUnrecordedObject
 pend U75 "the finalizer counts a scope unopenable for an owner change, or removed by rm-scope, as withdrawn and drops after the Secret is gone; a transient error keeps it (KeyDelivery lifecycle)" \
@@ -529,6 +529,12 @@ pend U77 "rm-scope revokes first: under the exclusive store lock it reads the se
 	k3sm/cmd/k3sm::TestRmScopeDeletesDeliveredSecretsFirst TestRmScopeRefusesWithoutAPI
 pend U78 "SecretRetained is True whenever a labelled Secret stays while Authorized is Unknown or False: under Unknown with reason Indeterminate; NoneRetained only when none stays or Authorized is True (KeyDelivery reconciler)" \
 	k3sm/pkg/keystore/reconcile::TestSecretRetainedTrueUnderUnknown
+pend U79 "the rotation write that follows a rotate is in the revocation class: past the owner's share it draws on the reserve, once per live delivery per log; the reconciler's part, 64 deliveries x 4 lines x 1 KiB for 16 uids, is 4 MiB (KeyDelivery lifecycle)" \
+	k3sm/pkg/keystore/reconcile::TestRotationWriteUsesReserve
+rootpend U80 "root-run: rm-scope and floor --rebuild walk .user/<uid>/ by descriptor with openat, unlinkat and O_NOFOLLOW, refuse a planted symlink, FIFO or other non-regular file, read with a bounded size, re-check SameFile after each open and never follow a swapped directory (append-only files)" \
+	k3sm/cmd/k3sm::TestRootWalksRefusePlantedNames
+pend U81 "a KeyDelivery never touches a Phase A Secret: the label value is the constant keydelivery and the entry is in the annotation k3sm.io/keystore-entry; a target present and not claimed by a KeyDelivery is SecretExists, never overwritten or deleted (KeyDelivery reconciler)" \
+	k3sm/pkg/keystore/reconcile::TestKeyDeliveryNeverTouchesPhaseASecret
 # >>> ADD NEW U ROWS (U64 upward) HERE, and add each to EXPECTED_ROWS and to mode_rows <<<
 
 leg E1 "files" "preconditions: secrets encryption on; one server; keystore-run/ and both logs present, service-user 0600, SF_APPEND set; the doctor user-scope row on; keystore.sh --check exits 0 on the build" "the append-only files"
@@ -554,7 +560,7 @@ leg E20 "files" "reboot of the server node, operator-attended (--attended reboot
 leg E21 "sandbox" "a native pod with runAsUser 501 is refused at spawn: the container never starts, and its status carries the uid refusal" "runtimed's sandbox change"
 leg E22 "sandbox" "a native pod with runAsUser 0 is refused at spawn: the container never starts as root, and its status carries the uid refusal" "runtimed's sandbox change"
 leg E23 "kd-reconcile" "against the real authorizer, a role with create on secrets and update and delete on one named secret: delivery as that name is Ready, Delivered; delivery as another name is Authorized=False, NotAuthorized, with no Secret" "the KeyDelivery reconciler"
-leg E24 "exec" "with the listener stopped by the maintenance marker, a non-k3sm program run as the service user binds keys.sock; the user's k3sm keys list and put refuse before any frame, naming the server pin; the real server is accepted afterwards" "the server pin"
+leg E24 "exec" "with the listener stopped by the maintenance marker, a non-k3sm program run as the service user binds keys.sock; the user's k3sm keys list and put refuse before any frame, naming the server pin; then the real installed k3sm binary, exec'd inside a native pod, tries to bind keys.sock and gets EPERM; the real server is accepted afterwards" "the server pin; the pod bind deny"
 leg E25 "files" "helper variant only: a native pod tries connect(2) to the floor helper's socket, and the login user and a non-k3sm service-user program each send it an append: EPERM for the pod, both refused, no line appended" "the helper pin"
 # >>> ADD NEW E LEGS (E24 upward) HERE, with the unit mode that delivers the last feature <<<
 
@@ -645,7 +651,11 @@ U55|ErrScopeAbsent
 U64|ErrScopeAbsent
 U64|a missing entries/ directory or a missing deliveries record is ErrScopeAbsent too
 U66|FFFFEEEE-DDDD-CCCC-BBBB-AAAA
-U67|4 MiB revocation reserve
+U67|5 MiB revocation reserve
+U73|an indeterminate sweep keeps the claim
+U25|a damaged entry stays ErrCorrupt
+U81|keydelivery
+U81|k3sm.io/keystore-entry
 U77|only then removes the scope
 U77|refuses and changes nothing
 U68|O_EXCL
@@ -656,7 +666,8 @@ U76|k3sm:local-users
 E3|built-in edit ClusterRole
 E10|vm Pod
 E10|network-bind
-E10|EPERM"
+E10|EPERM
+E24|EPERM"
 
 # --listed: the row-presence lint.
 if [ "$mode" = listed ]; then
