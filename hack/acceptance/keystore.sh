@@ -77,18 +77,21 @@ pend G6 "the floor is root-owned and checked on the descriptor (PR 2)"
 pend G7 "the floor is raised by every root verb (PR 2)"
 pend G8 "Rotate flips the pointer last under fault injection (PR 2)"
 pend G9 "a Rotate retry discards the orphan (PR 2)"
-check G10 "the master is minted only by the first put, never over entries" TestMasterMint
+check G10 "the master is minted only by the first put, never over entries" TestMasterMint TestMintCountsReservedUserName
 check G11 "the master is judged on the open descriptor" TestMasterTrust
 pend G12 "Rewrap resumes after a crash at every step (PR 3)"
 pend G13 "a crash between the master renames is completed (PR 3)"
 partial G14 "one lock with a bounded wait that excludes, and no read that blocks (library: Put, Delete and the reads)" \
 	"Rotate and Rewrap take the same lock (PR 2: Rotate, PR 3: Rewrap)" \
-	TestLockBoundedWait TestLockExcludes TestConcurrentOperations TestFIFORefused
+	TestLockBoundedWait TestLockExcludes TestConcurrentOperations TestFIFORefused TestReadDirNamesBound \
+	TestFirstRunRaceIsRetryable
 check G15 "files a root verb writes are the service user's, at the layout's modes, inside the store" \
-	TestOwnership TestCredSymlinkRefused TestRefusesSymlinks
+	TestOwnership TestCredSymlinkRefused TestRefusesSymlinks TestMkdirRefusesSwappedDirectory \
+	TestCreateEntryRefusesSwappedDirectory TestConfigRefused
 partial G16 "List marks an unreadable entry with Err, and Delete still removes it; an entry directory with no current is an interrupted put only in the shape a crashed Put leaves, and Delete removes it too (library)" \
 	"list exits 1 on a corrupt entry (PR 4: k3sm keys)" \
-	TestListMarksCorruptEntry TestDeleteCorruptEntry TestEntryWithNoPointer
+	TestListMarksCorruptEntry TestDeleteCorruptEntry TestEntryWithNoPointer TestDeletePlantedNonDirectory \
+	TestDeleteDirectoryAtCurrent TestPointerVersionBound TestPutCrashAtEveryStep TestMkdirSyncsParent
 pend G17 "show prints a value only with --reveal, byte-exact (PR 4)"
 pend G18 "delivery refused while encryption is off (PR 5)"
 pend G19 "the delivery declaration is root-owned (PR 5)"
