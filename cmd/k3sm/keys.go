@@ -19,6 +19,8 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -62,8 +64,9 @@ const keysUsage = `Usage:
   sudo k3sm keys rewrap --key-out FILE | --key-in FILE
         re-seal every entry under a new master key. --key-out writes a fresh
         key to FILE (a new file, mode 0600) before anything changes; keep it
-        until rewrap reports success, then delete it. --key-in FILE finishes
-        an interrupted rewrap with the key saved there
+        until rewrap reports success, then delete it. --key-in FILE only
+        finishes an interrupted rewrap, with the key its --key-out saved: a
+        key whose SHA-256 the interrupted rewrap did not record is refused
 
 Names are scope-qualified: system/<name>, where <name> is 1 to 253 bytes of
 dot-separated labels of lowercase letters, digits and '-'. This build
@@ -108,10 +111,12 @@ const (
 const keysMasterSize = 32
 
 // keysStore is the slice of keystore.FileStore the keys verbs use: the Store
-// contract and the floor raise the read verbs make at their start.
+// contract, the floor raise the read verbs make at their start, and the
+// record of an interrupted rewrap that rewrap --key-in is checked against.
 type keysStore interface {
 	keystore.Store
 	RaiseFloor(ctx context.Context) error
+	InterruptedRewrap(ctx context.Context) (fingerprint [sha256.Size]byte, ok bool, err error)
 }
 
 // keysEnv is what the keys verbs touch, so a test can fake it.
@@ -674,10 +679,28 @@ func readKeyIn(path string) ([]byte, error) {
 	return b, nil
 }
 
+// checkKeyInRecorded refuses a --key-in key unless the store records an
+// interrupted rewrap under it: --key-in finishes a rewrap k3sm started with a
+// key it minted, and never makes an operator's key the master.
+func checkKeyInRecorded(ctx context.Context, s keysStore, key []byte) error {
+	recorded, ok, err := s.InterruptedRewrap(ctx)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errors.New("no interrupted rewrap is recorded, and --key-in only finishes one: to change the master key, run sudo k3sm keys rewrap --key-out FILE")
+	}
+	sum := sha256.Sum256(key)
+	if subtle.ConstantTimeCompare(sum[:], recorded[:]) != 1 {
+		return errors.New("the key file is not the key the interrupted rewrap recorded: pass the file its --key-out wrote")
+	}
+	return nil
+}
+
 func keysRewrap(ctx context.Context, args []string, env keysEnv) int {
 	v := newKeysVerb("rewrap", env)
 	keyOut := v.fs.String("key-out", "", "write the new master key to this new file (mode 0600) before re-sealing")
-	keyIn := v.fs.String("key-in", "", "use the key saved in this file by an earlier --key-out")
+	keyIn := v.fs.String("key-in", "", "finish an interrupted rewrap with the key its --key-out saved in this file")
 	pos, err := v.parse(args)
 	if err != nil {
 		return keysBadUsage
@@ -701,6 +724,10 @@ func keysRewrap(ctx context.Context, args []string, env keysEnv) int {
 		key, err = readKeyIn(keyPath)
 		if err != nil {
 			return v.failf(keysRefused, "%v", err)
+		}
+		if err := checkKeyInRecorded(ctx, s, key); err != nil {
+			clear(key)
+			return v.failf(keysRefused, "%v; nothing was changed", err)
 		}
 	} else {
 		keyPath = *keyOut

@@ -20,6 +20,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -719,23 +721,6 @@ func TestKeysRewrap(t *testing.T) {
 			}
 		})
 	}
-	t.Run("key-in reuses a saved key", func(t *testing.T) {
-		h := newKeysHarness(t)
-		h.put("system/a", []byte("a-value"))
-		saved := bytes.Repeat([]byte{0x3c}, 32)
-		p := filepath.Join(t.TempDir(), "saved")
-		if err := os.WriteFile(p, saved, 0o600); err != nil {
-			t.Fatal(err)
-		}
-		h.rand = failReaderRand{t}
-		h.mustRun(0, "rewrap", "--key-in", p)
-		if !bytes.Equal(h.masterFile(), saved) {
-			t.Fatalf("master %x, want the saved %x", h.masterFile(), saved)
-		}
-		if got := h.value("a", 1); string(got) != "a-value" {
-			t.Fatalf("after rewrap the entry holds %q", got)
-		}
-	})
 	for _, tc := range []struct {
 		name  string
 		value []byte
@@ -773,6 +758,98 @@ func TestKeysRewrap(t *testing.T) {
 			h.mustRun(2, tc.args...)
 		})
 	}
+}
+
+// stageInterruptedRewrap leaves the master directory as a rewrap to key
+// crashed right after writing master.next and its fingerprint leaves it: the
+// pair the store's own Rewrap writes, owned by the service user, mode 0600.
+func (h *keysHarness) stageInterruptedRewrap(key []byte) {
+	h.t.Helper()
+	dir := filepath.Join(h.work, "cred", "keystore-master")
+	sum := sha256.Sum256(key)
+	for name, b := range map[string][]byte{
+		"master.next":        key,
+		"master.next.sha256": []byte(hex.EncodeToString(sum[:]) + "\n"),
+	} {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, b, 0o600); err != nil {
+			h.t.Fatal(err)
+		}
+		keysGiveToService(h.t, p)
+	}
+}
+
+// writeKeyFile writes key to a new 0600 file, as an earlier --key-out did.
+func writeKeyFile(t *testing.T, key []byte) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "saved")
+	if err := os.WriteFile(p, key, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// TestKeysRewrapKeyInRecoveryOnly: --key-in only finishes an interrupted
+// rewrap, with the key whose SHA-256 that rewrap recorded. On a keystore
+// with no rewrap pending it refuses any key, the live master's included, and
+// the master stays byte-identical; with one pending it refuses another key
+// and completes with the recorded one.
+func TestKeysRewrapKeyInRecoveryOnly(t *testing.T) {
+	recorded := bytes.Repeat([]byte{0x3c}, 32)
+	other := bytes.Repeat([]byte{0x4d}, 32)
+	for name, key := range map[string]func(h *keysHarness) []byte{
+		"an operator-made key": func(*keysHarness) []byte { return other },
+		"the live master":      func(h *keysHarness) []byte { return h.masterFile() },
+	} {
+		t.Run("clean keystore refuses "+name, func(t *testing.T) {
+			h := newKeysHarness(t)
+			h.put("system/a", []byte("a-value"))
+			before := h.masterFile()
+			h.calls = nil
+			h.rand = failReaderRand{t}
+			h.mustRun(1, "rewrap", "--key-in", writeKeyFile(t, key(h)))
+			if slices.Contains(h.calls, "Rewrap") {
+				t.Fatal("rewrap ran with a key no interrupted rewrap recorded")
+			}
+			if !bytes.Equal(h.masterFile(), before) {
+				t.Fatal("the master changed")
+			}
+			if !strings.Contains(h.stderr.String(), "--key-out") {
+				t.Errorf("stderr %q does not point at --key-out", h.stderr.String())
+			}
+		})
+	}
+	t.Run("interrupted rewrap refuses another key", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/a", []byte("a-value"))
+		before := h.masterFile()
+		h.stageInterruptedRewrap(recorded)
+		h.calls = nil
+		h.mustRun(1, "rewrap", "--key-in", writeKeyFile(t, other))
+		if slices.Contains(h.calls, "Rewrap") {
+			t.Fatal("rewrap ran with a key the interrupted rewrap did not record")
+		}
+		if !bytes.Equal(h.masterFile(), before) {
+			t.Fatal("the master changed")
+		}
+		next, err := os.ReadFile(filepath.Join(h.work, "cred", "keystore-master", "master.next"))
+		if err != nil || !bytes.Equal(next, recorded) {
+			t.Fatalf("master.next = %x, %v; want the recorded key left in place", next, err)
+		}
+	})
+	t.Run("interrupted rewrap completes with the recorded key", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/a", []byte("a-value"))
+		h.stageInterruptedRewrap(recorded)
+		h.rand = failReaderRand{t}
+		h.mustRun(0, "rewrap", "--key-in", writeKeyFile(t, recorded))
+		if !bytes.Equal(h.masterFile(), recorded) {
+			t.Fatalf("master %x, want the recorded %x", h.masterFile(), recorded)
+		}
+		if got := h.value("a", 1); string(got) != "a-value" {
+			t.Fatalf("after rewrap the entry holds %q", got)
+		}
+	})
 }
 
 // failReaderRand fails the test if the verb draws randomness.
