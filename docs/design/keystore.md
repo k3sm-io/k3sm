@@ -1029,13 +1029,14 @@ The scope strings are `system` and `user/<uid>`, with `<uid>` the decimal macOS 
 length bound and the parse:
 
 ```
-^(system|user/[1-9][0-9]{0,9})/[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$
+^(system|user/[1-9][0-9]{0,9})/[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
 ```
 
 The pattern bounds the uid's digits; the range (at most 4294967295) is a CEL rule beside it,
 `!self.startsWith('user/') || int(self.split('/')[1]) <= 4294967295`, and the Go parse reads
-the uid as a uint32. `spec.entry` has `maxLength` 79, the longest valid entry
-(`user/4294967295/` and a 63-byte name), which also bounds the CEL rules' cost. The CRD pattern,
+the uid as a uint32. `spec.entry` has `maxLength` 269, the longest valid entry
+(`user/4294967295/` and a 253-byte name: `len("user/")` + 10 + 1 + Phase A's `maxNameLen` of 253),
+which also bounds the CEL rules' cost. The CRD pattern,
 the admission policy's CEL and the Go resolver all take the grammar from that package, and one
 shared vector table in it tests all three (U11, U19, U40, U57). "Valid" means valid as an API
 entry; the CLI's short-name resolution runs before the grammar sees a name. The table holds at
@@ -1047,8 +1048,11 @@ least:
 | `user/501/claude-a` | yes | |
 | `user/1/a` | yes | the smallest uid |
 | `user/4294967295/a` | yes | the largest uid |
-| `user/4294967295/` and a 63-byte name | yes | 79 bytes, the `maxLength` |
-| `user/4294967295/` and a 64-byte name | no | a name label is at most 63 bytes |
+| `user/501/registry.example-token` | yes | a dotted name, as Phase A's `checkName` accepts |
+| `user/4294967295/` and a 253-byte name | yes | 269 bytes, the `maxLength` |
+| `user/4294967295/` and a 254-byte name | no | one over Phase A's name bound |
+| `user/501/a..b`, `user/501/.a`, `user/501/a.` | no | an empty label |
+| `system/a/b` | no | a `/` inside the name |
 | `user/0/a` | no | uid 0 has no user scope |
 | `user/4294967296/a` | no | past a uint32 |
 | `user/0501/a` | no | a leading zero |
@@ -1821,7 +1825,7 @@ each stated in the change that makes it. U15 is held for a K0 amendment and U39 
 | U16 | every Pod profile variant (native, vm, container-vm, xcode, expose-paths, a custom Pod root distinct from the data root) denies every `keystore-*` name in the data root and the `keystore-run/` tree; the keystore names are in `DataRootDenyTrees` and so in `protectedPrefixes`; `ReadOnlyPaths`, `ExposePaths` or a hostPath naming the data root or a keystore path is refused; an empty `Posture.DataRoot` refuses to render; a vm or container-vm guest gets no data-root share | `runtimed/pkg/sandbox::TestDataRootDeniesKeystorePathsEveryProfile`, `TestProtectedPrefixesRefuseKeystoreReallow`, `TestEmptyDataRootFailsClosed`, `TestVMGuestGetsNoDataRootShare`; rig leg E10 | pending: runtimed's sandbox change |
 | U17 | runtimed refuses a resolved Pod process uid of 501 or above, and uid 0 without a drop on a root daemon, at credential resolution and again at spawn | `runtimed/pkg/runtime::TestResolveCredentialRefusesLoginRangeUID`, `TestResolveCredentialRefusesRootWithoutDrop`; `runtimed/pkg/supervisor::TestSpawnRefusesLoginRangeUID`, `TestSpawnRefusesRootUIDWithoutDrop`; rig legs E21, E22 | pending: runtimed's sandbox change |
 | U18 | CRD: `entry`, `secretName`, `dataKey`, `requestedBy` required (`dataKey` defaults to `value`) and immutable by CEL transition rules; `requestedBy` matches its pattern and, for a user entry, equals `k3sm:local:` plus the entry's uid; `conditions` is `listType=map` keyed by `type`; status subresource on; reasons listed | `apis/config/crd::TestKeyDeliveryCRDMatchesTheGoTypes`, `TestKeyDeliveryImmutableFields`, `TestKeyDeliveryRequiredFields`, `TestKeyDeliveryRequestedByMatchesEntryUID`, `TestKeyDeliveryConditionsListMap` | pending: the `KeyDelivery` API |
-| U19 | the CRD pattern, its `maxLength` of 79 and the uid range rule pass the shared entry-grammar vectors | `apis/config/crd::TestEntryGrammarVectors` | pending: the `KeyDelivery` API |
+| U19 | the CRD pattern, its `maxLength` of 269 and the uid range rule pass the shared entry-grammar vectors | `apis/config/crd::TestEntryGrammarVectors` | pending: the `KeyDelivery` API |
 | U20 | a user-scope `current` copied back is refused against the floor log, with Phase A's floor message | `k3sm/pkg/keystore::TestUserFloorRefusesCopiedBackCurrent`; rig leg E9 | pending: the append-only files |
 | U21 | install creates both logs service-user-owned 0600 and flagged; the listener refuses to start when a flag is clear (seam: chflags flag source) | `k3sm/pkg/install::TestKeystoreAppendOnlyFilesAtInstall`, `k3sm/pkg/keystore::TestFlagCheckRefusesUnflagged`; rig leg E1 | pending: the append-only files |
 | U22 | `floor --rebuild` and `audit --rotate` stop the listener, hold the lock, flag the new file before touching the old; a crash at each step leaves a flagged file | `k3sm/cmd/k3sm::TestKeysFloorRebuildCrashOrder`, `TestKeysAuditRotateCrashOrder`; rig leg E17 | pending: the append-only files |
