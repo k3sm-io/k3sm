@@ -1460,7 +1460,7 @@ it may change and that a conversion is owed if it does.
   | `Authorized` | `Authorized` | `True` | every check below passes |
   | `EntryUnavailable` | `Authorized` | `False` | check 1 fails |
   | `NotRecorded` | `Authorized` | `False` | check 2 fails |
-  | `NotAuthorized` | `Authorized` | `False` | a SubjectAccessReview in check 3 returns denied |
+  | `NotAuthorized` | `Authorized` | `False` | a SubjectAccessReview in check 3 returns a definitive denial on two consecutive sweeps |
   | `Indeterminate` | `Authorized` | `Unknown` | an error, not a denial ("A denial deletes; an error does not") |
   | `Delivered` | `Ready` | `True` | the Secret holds the entry's current version |
   | `SecretExists` | `Ready` | `False` | an unlabelled Secret holds the target name |
@@ -1534,10 +1534,28 @@ real authorizer.
 
 Encryption-off refusal (G18) applies unchanged, as `EncryptionOff`.
 
+**What a definitive SubjectAccessReview denial is.** A review's answer is a definitive denial
+only when all three hold: `status.allowed` is `false`, `status.evaluationError` is empty, and
+the answer is not the no-opinion shape, `status.denied` `false` with an empty `status.reason`.
+Every other answer is `Indeterminate`: an allow is an allow, an evaluation error says the
+authorizer could not decide, and no opinion says no authorizer decided. Two more conditions
+guard a denial before it deletes anything:
+
+- **No sweep before the API server is ready.** The reconciler runs no sweep until the API
+  server's `readyz` answers ready and its own RBAC informers (Roles, RoleBindings,
+  ClusterRoles, ClusterRoleBindings) report synced. An authorizer that has not loaded its rules
+  can deny what it would allow a moment later.
+- **A denial counts only twice in a row.** A definitive denial for one KeyDelivery deletes
+  nothing on the sweep that first sees it. It deletes only when the next sweep sees a
+  definitive denial for the same object and the same `metadata.generation` again; any other
+  answer in between resets the count. Until then `Authorized` is `Unknown` with reason
+  `Indeterminate`.
+
 **A denial deletes; an error does not.** The reconciler deletes a Secret only on a definitive
-denial: the RoleBinding removed (a SubjectAccessReview that returns denied), the entry removed,
+denial: the RoleBinding removed (a definitive SubjectAccessReview denial, above), the entry removed,
 the record withdrawn, a digest mismatch, or the account gone (`ErrScopeOwnerChanged`). An error
-is not a denial: a SubjectAccessReview call that fails, any other API server error,
+is not a denial: a SubjectAccessReview call that fails, a review answered with an evaluation
+error or with no opinion, a denial seen on one sweep only, any other API server error,
 `ErrScopeOwnerUnknown` (the GeneratedUID lookup past its deadline), `ErrBusy`, `ErrLogFull`,
 and a delivery record whose version it does not know. On an error the reconciler changes
 nothing (the Secret, the record entry and the finalizer stay as they are), sets `Authorized` to
@@ -1861,7 +1879,7 @@ each stated in the change that makes it. U15 is held for a K0 amendment and U39 
 | U52 | every root verb writes one audit line with `via` `root` once the log exists, and none before it | `k3sm/cmd/k3sm::TestEveryRootVerbWritesAuditLine` | pending: the append-only files |
 | U53 | every reconciler Secret write and delete, and every record withdrawal, writes one audit line with `via` `reconciler` | `k3sm/pkg/keystore/reconcile::TestEveryReconcilerWriteAndDeleteAudited` | pending: the KeyDelivery reconciler (lifecycle) |
 | U54 | a pre-frame refusal (uid 0, the service uid, a uid below 501) writes a `refused` line with the peer uid, rate-limited per uid with a dropped-count summary | `k3sm/pkg/keystore/socket::TestPreFrameRefusalsAudited`, `TestPreFrameRefusalLinesRateLimited` | pending: the socket listener |
-| U55 | a transient lookup, SAR or apiserver error leaves the Secret and sets Unknown: a failed SAR call, an API server error, `ErrScopeOwnerUnknown`, `ErrBusy` and `ErrLogFull` each leave the Secret, the record entry and the finalizer, set `Authorized=Unknown` with reason `Indeterminate`, and retry with backoff | `k3sm/pkg/keystore/reconcile::TestTransientErrorLeavesSecretSetsUnknown` | pending: the KeyDelivery reconciler (lifecycle) |
+| U55 | a transient lookup, SAR or apiserver error leaves the Secret and sets Unknown: a failed SAR call, an API server error, `ErrScopeOwnerUnknown`, `ErrBusy` and `ErrLogFull` each leave the Secret, the record entry and the finalizer, set `Authorized=Unknown` with reason `Indeterminate`, and retry with backoff; a SAR answer is a definitive denial only with `allowed=false`, an empty `evaluationError` and not the no-opinion shape (`denied=false`, empty `reason`), and each other answer is `Indeterminate`; no sweep runs before `readyz` and the RBAC informers' sync; a definitive denial deletes only when two consecutive sweeps see it for the same generation | `k3sm/pkg/keystore/reconcile::TestTransientErrorLeavesSecretSetsUnknown`, `TestSARNoOpinionOrEvaluationErrorIsIndeterminate`, `TestNoSweepBeforeReady`, `TestDenialNeedsTwoSweeps` | pending: the KeyDelivery reconciler (lifecycle) |
 | U56 | a delivery record with an unknown format version is refused by the store and read by the reconciler as `Indeterminate`, never as a denial: no Secret is deleted | `k3sm/pkg/keystore::TestDeliveryRecordUnknownVersionRefused`, `k3sm/pkg/keystore/reconcile::TestUnknownRecordVersionIsIndeterminate` | pending: the KeyDelivery reconciler (lifecycle) |
 | U57 | `apis/keystore/entry` imports only the standard library, exports the pattern, the `maxLength` and the parse, and holds the shared vector table, which it passes | `apis/keystore/entry::TestGrammarVectors`, `TestImportsStdlibOnly` | pending: the entry grammar in `apis` |
 
@@ -1891,7 +1909,7 @@ E20 attended.
 | E8 | admin strips the CRD's transition rules (a test patch, restored at the end) and edits E3's `spec.secretName` | `Authorized=False`, `NotRecorded` (digest mismatch); the original Secret deleted; no Secret under the new name | yes | the target digest: a Secret appears under the new name |
 | E9 | `sudo cp` saves `current`, the user rotates, `sudo cp` puts the old `current` back; then the same for a `system/` entry | user `list` and `sudo k3sm keys list` each mark the entry `corrupt` with the floor message; `floor --rebuild` is not run | no (U20) | the append-only files: the old value is served |
 | E10 | a native Pod (pinned by `nodeName`, darwin selector) tries `connect(2)` to `keys.sock` and to read `server/keystore`, `keystore-run/`, both logs and Phase A's two files; then a vm Pod on the same node tries to reach `keys.sock` and the data root from the guest | EPERM for each from the native Pod; the guest has no path to the data root and cannot reach the socket | no (U16) | runtimed's sandbox change: the Phase A files read (the red result K0 leg 4 records) |
-| E11 | admin removes the user's RoleBinding in `ks-e2e` | within one sweep the Secret is deleted; `Authorized=False`, `NotAuthorized` | no (U44) | the KeyDelivery reconciler (lifecycle): the Secret stays |
+| E11 | admin removes the user's RoleBinding in `ks-e2e` | within two sweeps the Secret is deleted (a denial counts only when two consecutive sweeps see it); `Authorized=False`, `NotAuthorized` | no (U44) | the KeyDelivery reconciler (lifecycle): the Secret stays |
 | E12 | root scope: `sudo k3sm keys put system/e2e-sys`, `sudo k3sm keys deliver system/e2e-sys --namespace ks-e2e`; then the user, with no sudo, tries `k3sm keys deliver`, `list` and `exec` on `system/e2e-sys` | root's Secret is delivered and stays (G20); each of the user's attempts answers `not found` and nothing reaches `ks-e2e-2`: the user cannot read or deliver the system entry. The leg does not claim the user cannot discover the name, which Phase A's 0644 files show (residual 11) | partly (U45): the root delivery is rig-only | root delivery: root delivery missing; the socket operations: a non-root user can name a system entry |
 | E13 | a ServiceAccount token creates a KeyDelivery | refused at admission | no (U40) | KeyDelivery authoring: the object is created |
 | E14 | `k3sm keys undeliver` on E3's object, then `kubectl delete` of a second one | each Secret deleted before its object goes; the hint printed; no orphan Secret after one sweep | no (U44) | the KeyDelivery reconciler (lifecycle): the object hangs or the Secret stays |
