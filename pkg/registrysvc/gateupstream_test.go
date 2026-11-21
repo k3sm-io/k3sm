@@ -17,6 +17,7 @@ limitations under the License.
 package registrysvc
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -33,60 +34,81 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"k3sm.io/k3sm/pkg/ociregistry/api"
 )
 
-// stallingUpstream accepts connections on loopback and never answers them.
-func stallingUpstream(t *testing.T) string {
+// stallingUpstream is a loopback registry in memory: each dial is a net.Pipe
+// whose far end reads every request and never answers. Inside a synctest
+// bubble its connections block durably, so the transports' response-header
+// bounds fire on the bubble's clock.
+func stallingUpstream(t *testing.T) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
 	var (
 		mu    sync.Mutex
 		conns []net.Conn
 	)
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			mu.Lock()
-			conns = append(conns, c)
-			mu.Unlock()
-		}
-	}()
 	t.Cleanup(func() {
-		_ = ln.Close()
 		mu.Lock()
 		defer mu.Unlock()
 		for _, c := range conns {
 			_ = c.Close()
 		}
 	})
-	return ln.Addr().String()
+	return func(context.Context, string, string) (net.Conn, error) {
+		c, s := net.Pipe()
+		mu.Lock()
+		conns = append(conns, s)
+		mu.Unlock()
+		go func() { _, _ = io.Copy(io.Discard, s) }()
+		return c, nil
+	}
 }
 
-// upstreamGate is the fixture's gate over the default loopback transports,
-// pointed at upstream, with headerTimeout as the bound of every request but a
-// blob upload's.
-func upstreamGate(t *testing.T, upstream string, headerTimeout time.Duration) *memListener {
+// upstreamGate is the fixture's gate over the default loopback transports and
+// their production response-header bounds, pointed at upstream and dialling
+// with dial (nil means a real dialer).
+func upstreamGate(t *testing.T, upstream string, dial func(ctx context.Context, network, addr string) (net.Conn, error)) *memListener {
 	t.Helper()
 	f := newGateFixture(t)
 	g := newGate(gateConfig{
-		Upstream:              upstream,
-		Auth:                  GateAuth{Tokens: f.tokens, Access: f.access, Namespaces: f.namespaces},
-		Credential:            gateCred,
-		Logger:                quietLogger(),
-		Now:                   f.clock.now,
-		UpstreamHeaderTimeout: headerTimeout,
-		ManifestHeaderTimeout: headerTimeout,
+		Upstream:   upstream,
+		Auth:       GateAuth{Tokens: f.tokens, Access: f.access, Namespaces: f.namespaces},
+		Credential: gateCred,
+		Logger:     quietLogger(),
+		Now:        f.clock.now,
+		dial:       dial,
 	})
 	return serveMem(t, g)
+}
+
+// rawResult is a response read off a connection, or the error reading it.
+type rawResult struct {
+	resp rawResponse
+	err  error
+}
+
+// sendRaw writes req on c and reads the response in the background, with no
+// deadline of its own; the result arrives on the returned channel.
+func sendRaw(c net.Conn, method, req string) <-chan rawResult {
+	out := make(chan rawResult, 1)
+	go func() {
+		if _, err := io.WriteString(c, req); err != nil {
+			out <- rawResult{err: fmt.Errorf("write: %w", err)}
+			return
+		}
+		resp, err := http.ReadResponse(bufio.NewReader(c), &http.Request{Method: method})
+		if err != nil {
+			out <- rawResult{err: fmt.Errorf("read response: %w", err)}
+			return
+		}
+		defer resp.Body.Close()
+		b, err := io.ReadAll(resp.Body)
+		out <- rawResult{resp: rawResponse{status: resp.StatusCode, header: resp.Header, body: string(b)}, err: err}
+	}()
+	return out
 }
 
 // assertUnavailable502 checks an authorized write answered 502 UNAVAILABLE.
@@ -100,19 +122,41 @@ func assertUnavailable502(t *testing.T, r rawResponse) {
 	}
 }
 
-// TestGateAnswers502WhenTheUpstreamStalls: a loopback registry that accepts a
-// connection and never answers costs an authorized manifest PUT a 502 within
-// its response-header bound, not a wait until the client gives up.
+// TestGateAnswers502WhenTheUpstreamStalls: a loopback registry that reads a
+// manifest PUT and never answers costs the client a 502 UNAVAILABLE at the
+// manifest response-header bound, not a wait until the client gives up. The
+// bound is the production one, timed on a synctest clock.
 func TestGateAnswers502WhenTheUpstreamStalls(t *testing.T) {
-	const bound = 200 * time.Millisecond
-	front := upstreamGate(t, stallingUpstream(t), bound)
-	start := time.Now()
-	r := rawDo(t, front, "PUT", "/v2/team/app/manifests/V1.0",
-		map[string]string{"Authorization": basic(tokTeam)}, "{}")
-	if took := time.Since(start); took > bound+3*time.Second {
-		t.Errorf("the 502 took %v, want about the %v bound", took, bound)
-	}
-	assertUnavailable502(t, r)
+	synctest.Test(t, func(t *testing.T) {
+		const bound = gateManifestHeaderTimeout
+		front := upstreamGate(t, "registry.loopback:5000", stallingUpstream(t))
+		c, err := front.dial()
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer c.Close()
+		req := "PUT /v2/team/app/manifests/V1.0 HTTP/1.1\r\nHost: registry.test\r\n" +
+			"Authorization: " + basic(tokTeam) + "\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+		start := time.Now()
+		done := sendRaw(c, "PUT", req)
+
+		time.Sleep(bound - time.Nanosecond)
+		synctest.Wait()
+		select {
+		case r := <-done:
+			t.Fatalf("answered after %v, before the %v bound: %+v", time.Since(start), bound, r)
+		default:
+		}
+
+		r := <-done
+		if took := time.Since(start); took < bound || took > bound+time.Second {
+			t.Errorf("the 502 came after %v, want at the %v bound", took, bound)
+		}
+		if r.err != nil {
+			t.Fatalf("%v", r.err)
+		}
+		assertUnavailable502(t, r.resp)
+	})
 }
 
 // TestGateHeaderBoundByOperation: each class of request is forwarded over the
@@ -225,35 +269,40 @@ func TestGateWriteErrorIs502WhenUpstreamIsDown(t *testing.T) {
 	}
 	closed := ln.Addr().String()
 	_ = ln.Close()
-	front := upstreamGate(t, closed, 0)
+	front := upstreamGate(t, closed, nil)
 	r := rawDo(t, front, "PUT", "/v2/team/app/manifests/V1.0",
 		map[string]string{"Authorization": basic(tokTeam)}, "{}")
 	assertUnavailable502(t, r)
 }
 
 // TestGateLeavesBlobUploadsOutOfTheHeaderBound: the registry commits a blob
-// upload before it writes a header, so a final blob PUT is held to the
-// upload bound, not the short one; past the short bound it is still waiting.
+// upload before it writes a header, so a final blob PUT is held to the upload
+// bound, not the shorter ones; just past the longest of those, the manifest
+// bound, it is still waiting on the registry, timed on a synctest clock.
 func TestGateLeavesBlobUploadsOutOfTheHeaderBound(t *testing.T) {
-	const bound = 200 * time.Millisecond
-	front := upstreamGate(t, stallingUpstream(t), bound)
-	c, err := front.dial()
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer c.Close()
-	req := fmt.Sprintf("PUT /v2/team/app/blobs/uploads/abc-123?digest=%s HTTP/1.1\r\nHost: registry.test\r\n"+
-		"Authorization: %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", digestA, basic(tokTeam))
-	if _, err := io.WriteString(c, req); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	_ = c.SetReadDeadline(time.Now().Add(5 * bound))
-	buf := make([]byte, 1)
-	n, err := c.Read(buf)
-	var ne net.Error
-	if !errors.As(err, &ne) || !ne.Timeout() {
-		t.Fatalf("read after %v = %d bytes, %v; want the upload still waiting on the registry", 5*bound, n, err)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		short := max(gateUpstreamHeaderTimeout, gateManifestHeaderTimeout)
+		if short+time.Second >= gateUploadHeaderTimeout {
+			t.Fatalf("upload bound %v is not past the short bounds %v", gateUploadHeaderTimeout, short)
+		}
+		front := upstreamGate(t, "registry.loopback:5000", stallingUpstream(t))
+		c, err := front.dial()
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer c.Close()
+		req := fmt.Sprintf("PUT /v2/team/app/blobs/uploads/abc-123?digest=%s HTTP/1.1\r\nHost: registry.test\r\n"+
+			"Authorization: %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", digestA, basic(tokTeam))
+		done := sendRaw(c, "PUT", req)
+
+		time.Sleep(short + time.Second)
+		synctest.Wait()
+		select {
+		case r := <-done:
+			t.Fatalf("answered after %v: %+v; want the upload still waiting on the registry", short+time.Second, r)
+		default:
+		}
+	})
 }
 
 // TestGateReadErrorLogsCancellationAtDebug: a read that cannot reach the
