@@ -1461,7 +1461,7 @@ it may change and that a conversion is owed if it does.
   | `EntryUnavailable` | `Authorized` | `False` | check 1 fails |
   | `NotRecorded` | `Authorized` | `False` | check 2 fails |
   | `NotAuthorized` | `Authorized` | `False` | a SubjectAccessReview in check 3 returns a definitive denial on two consecutive sweeps |
-  | `Indeterminate` | `Authorized` | `Unknown` | an error, not a denial ("A denial deletes; an error does not") |
+  | `Indeterminate` | `Authorized` | `Unknown` | any outcome not on the allow-list of definitive outcomes ("A denial deletes; an error does not") |
   | `Delivered` | `Ready` | `True` | the Secret holds the entry's current version |
   | `SecretExists` | `Ready` | `False` | an unlabelled Secret holds the target name |
   | `SecretClaimed` | `Ready` | `False` | an older KeyDelivery owns the target Secret |
@@ -1551,17 +1551,41 @@ guard a denial before it deletes anything:
   answer in between resets the count. Until then `Authorized` is `Unknown` with reason
   `Indeterminate`.
 
-**A denial deletes; an error does not.** The reconciler deletes a Secret only on a definitive
-denial: the RoleBinding removed (a definitive SubjectAccessReview denial, above), the entry removed,
-the record withdrawn, a digest mismatch, or the account gone (`ErrScopeOwnerChanged`). An error
-is not a denial: a SubjectAccessReview call that fails, a review answered with an evaluation
-error or with no opinion, a denial seen on one sweep only, any other API server error,
-`ErrScopeOwnerUnknown` (the GeneratedUID lookup past its deadline), `ErrBusy`, `ErrLogFull`,
-and a delivery record whose version it does not know. On an error the reconciler changes
-nothing (the Secret, the record entry and the finalizer stay as they are), sets `Authorized` to
-`Unknown` with reason `Indeterminate`, and retries with backoff (U55). Otherwise a short outage
-of the API server or of the directory service would delete every delivered Secret on the node,
-and a Pod restarted in that window would lose a credential its owner never withdrew.
+**A denial deletes; an error does not.** The reconciler deletes a Secret, or withdraws a
+record entry, only on an outcome from an explicit allow-list of definitive outcomes. The list
+is closed:
+
+1. the store's typed `ErrNotFound` for the entry (`errors.Is(err, keystore.ErrNotFound)`);
+2. a withdrawn record entry for the KeyDelivery's UID, read from a `deliveries` record that
+   opened and authenticated;
+3. a digest mismatch: the digest recomputed from the live object differs from the one in a
+   record that opened and authenticated;
+4. a definitive SubjectAccessReview denial, as defined above, on two consecutive sweeps.
+
+**Every other outcome is `Indeterminate`**, whatever it is: `ErrCorrupt` (the floor refusal
+included, which wraps it), `ErrMasterMissing`, `ErrScopeUnsupported`, `ErrBusy`, `ErrLogFull`,
+`ErrScopeOwnerUnknown` (the GeneratedUID lookup past its deadline), `ErrScopeOwnerChanged`, a
+cancelled or expired ctx, the store's refusal to read while an audit append fails (U32), a
+delivery record whose version it does not know, a SubjectAccessReview call that fails or an
+answer that is not a definitive denial, a denial seen on one sweep only, any other API server
+error, and any error this list does not name, including one a later change adds. The rule is
+written as an allow-list so that a new sentinel is safe by default: it deletes nothing until a
+change adds it here. `ErrScopeOwnerChanged` is on the safe side too: the Secret of a deleted
+account stays until root's `rm-scope` removes the scope, after which the entry answers
+`ErrNotFound`. A UID absent from a readable record is `NotRecorded` and gets no Secret written,
+but it is not on the list, so it deletes nothing.
+
+**Absence is told apart from an unreadable store only by `ErrNotFound`.** The store answers
+`ErrNotFound` only after it opened the scope and read the entry's directory and found no entry;
+every failure to open or read the store is another error, and so `Indeterminate`. The
+reconciler never infers absence from an empty result, a missing file or an error's text.
+
+On an `Indeterminate` outcome the reconciler changes nothing (the Secret, the record entry and
+the finalizer stay as they are), sets `Authorized` to `Unknown` with reason `Indeterminate`,
+and retries with backoff (U55). Otherwise a short outage of the API server or of the directory
+service would delete every delivered Secret on the node, and a Pod restarted in that window
+would lose a credential its owner never withdrew. The object's deletion and the orphan sweep
+below are lifecycle, not authority, and keep their own triggers.
 
 **Why the sealed record binds the whole target.** The installing user's own kubeconfig
 carries the admin context, and admin can impersonate anyone. Without a record only the service
@@ -1579,7 +1603,7 @@ backstop.
 
 **Finalizer and lost authority.** The reconciler adds the finalizer
 `keystore.k3sm.io/delivery`. On deletion of the object, or when authority is lost (a definitive
-denial, above), the reconciler deletes the Secret it owns (label, ownerReference and owner
+denial, an outcome on the allow-list above), the reconciler deletes the Secret it owns (label, ownerReference and owner
 annotation all matching) and sets `Authorized=False`. The crash order is fixed: **delete the
 Secret, then withdraw the sealed record entry, then drop the finalizer**, so a crash at any
 point leaves a state the next sweep finishes. An **orphan sweep** deletes a labelled Secret
@@ -1879,7 +1903,7 @@ each stated in the change that makes it. U15 is held for a K0 amendment and U39 
 | U52 | every root verb writes one audit line with `via` `root` once the log exists, and none before it | `k3sm/cmd/k3sm::TestEveryRootVerbWritesAuditLine` | pending: the append-only files |
 | U53 | every reconciler Secret write and delete, and every record withdrawal, writes one audit line with `via` `reconciler` | `k3sm/pkg/keystore/reconcile::TestEveryReconcilerWriteAndDeleteAudited` | pending: the KeyDelivery reconciler (lifecycle) |
 | U54 | a pre-frame refusal (uid 0, the service uid, a uid below 501) writes a `refused` line with the peer uid, rate-limited per uid with a dropped-count summary | `k3sm/pkg/keystore/socket::TestPreFrameRefusalsAudited`, `TestPreFrameRefusalLinesRateLimited` | pending: the socket listener |
-| U55 | a transient lookup, SAR or apiserver error leaves the Secret and sets Unknown: a failed SAR call, an API server error, `ErrScopeOwnerUnknown`, `ErrBusy` and `ErrLogFull` each leave the Secret, the record entry and the finalizer, set `Authorized=Unknown` with reason `Indeterminate`, and retry with backoff; a SAR answer is a definitive denial only with `allowed=false`, an empty `evaluationError` and not the no-opinion shape (`denied=false`, empty `reason`), and each other answer is `Indeterminate`; no sweep runs before `readyz` and the RBAC informers' sync; a definitive denial deletes only when two consecutive sweeps see it for the same generation | `k3sm/pkg/keystore/reconcile::TestTransientErrorLeavesSecretSetsUnknown`, `TestSARNoOpinionOrEvaluationErrorIsIndeterminate`, `TestNoSweepBeforeReady`, `TestDenialNeedsTwoSweeps` | pending: the KeyDelivery reconciler (lifecycle) |
+| U55 | a transient lookup, SAR or apiserver error leaves the Secret and sets Unknown: a failed SAR call, an API server error, `ErrScopeOwnerUnknown`, `ErrBusy` and `ErrLogFull` each leave the Secret, the record entry and the finalizer, set `Authorized=Unknown` with reason `Indeterminate`, and retry with backoff; a SAR answer is a definitive denial only with `allowed=false`, an empty `evaluationError` and not the no-opinion shape (`denied=false`, empty `reason`), and each other answer is `Indeterminate`; no sweep runs before `readyz` and the RBAC informers' sync; a definitive denial deletes only when two consecutive sweeps see it for the same generation; only the allow-list (`ErrNotFound` for the entry, a withdrawn record, a digest mismatch on a readable record, a definitive SAR denial) deletes, and a table over every store sentinel (`ErrCorrupt`, the floor refusal, `ErrMasterMissing`, `ErrScopeUnsupported`, `ErrBusy`, `ErrLogFull`, `ErrScopeOwnerUnknown`, `ErrScopeOwnerChanged`), a cancelled ctx, the audit read refusal, an unknown record version and an unlisted error finds each `Indeterminate` | `k3sm/pkg/keystore/reconcile::TestTransientErrorLeavesSecretSetsUnknown`, `TestSARNoOpinionOrEvaluationErrorIsIndeterminate`, `TestNoSweepBeforeReady`, `TestDenialNeedsTwoSweeps`, `TestEverySentinelBesidesNotFoundIsIndeterminate` | pending: the KeyDelivery reconciler (lifecycle) |
 | U56 | a delivery record with an unknown format version is refused by the store and read by the reconciler as `Indeterminate`, never as a denial: no Secret is deleted | `k3sm/pkg/keystore::TestDeliveryRecordUnknownVersionRefused`, `k3sm/pkg/keystore/reconcile::TestUnknownRecordVersionIsIndeterminate` | pending: the KeyDelivery reconciler (lifecycle) |
 | U57 | `apis/keystore/entry` imports only the standard library, exports the pattern, the `maxLength` and the parse, and holds the shared vector table, which it passes | `apis/keystore/entry::TestGrammarVectors`, `TestImportsStdlibOnly` | pending: the entry grammar in `apis` |
 

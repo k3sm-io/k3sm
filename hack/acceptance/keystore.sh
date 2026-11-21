@@ -387,8 +387,8 @@ pend U53 "every reconciler Secret write and delete, and every record withdrawal,
 	k3sm/pkg/keystore/reconcile::TestEveryReconcilerWriteAndDeleteAudited
 pend U54 "a pre-frame refusal writes a refused line with the peer uid, rate-limited per uid with a dropped-count summary (socket listener)" \
 	k3sm/pkg/keystore/socket::TestPreFrameRefusalsAudited TestPreFrameRefusalLinesRateLimited
-pend U55 "a transient lookup, SAR or apiserver error leaves the Secret, the record entry and the finalizer, sets Authorized=Unknown with reason Indeterminate, and retries with backoff; a SAR with no opinion or an evaluation error is Indeterminate; no sweep before readyz and the RBAC informers sync; a denial deletes only on two consecutive sweeps (KeyDelivery lifecycle)" \
-	k3sm/pkg/keystore/reconcile::TestTransientErrorLeavesSecretSetsUnknown TestSARNoOpinionOrEvaluationErrorIsIndeterminate TestNoSweepBeforeReady TestDenialNeedsTwoSweeps
+pend U55 "a transient lookup, SAR or apiserver error leaves the Secret, the record entry and the finalizer, sets Authorized=Unknown with reason Indeterminate, and retries with backoff; a SAR with no opinion or an evaluation error is Indeterminate; no sweep before readyz and the RBAC informers sync; a denial deletes only on two consecutive sweeps; only the allow-list of definitive outcomes deletes, and every sentinel besides ErrNotFound is Indeterminate (KeyDelivery lifecycle)" \
+	k3sm/pkg/keystore/reconcile::TestTransientErrorLeavesSecretSetsUnknown TestSARNoOpinionOrEvaluationErrorIsIndeterminate TestNoSweepBeforeReady TestDenialNeedsTwoSweeps TestEverySentinelBesidesNotFoundIsIndeterminate
 pend U56 "a delivery record with an unknown format version is refused by the store and read by the reconciler as Indeterminate, never as a denial (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore::TestDeliveryRecordUnknownVersionRefused k3sm/pkg/keystore/reconcile::TestUnknownRecordVersionIsIndeterminate
 pend U57 "the entry grammar package imports only the standard library, exports the pattern, the maxLength and the parse, and passes the shared vector table (entry grammar)" \
