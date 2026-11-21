@@ -78,7 +78,9 @@ func (s *FileStore) loadMaster() (keys, error) {
 	if err != nil {
 		return keys{}, err
 	}
-	return deriveKeys(master), nil
+	k := deriveKeys(master)
+	clear(master) // only the derived keys are kept
+	return k, nil
 }
 
 // readMaster reads the master file and checks it, on the descriptor the bytes
@@ -86,8 +88,18 @@ func (s *FileStore) loadMaster() (keys, error) {
 // store's uid, mode 0600, 32 bytes, and matching the fingerprint file. The
 // fingerprint detects a wrong file, not tampering: whoever can replace the
 // master can replace its fingerprint too.
-func (s *FileStore) readMaster(root *os.Root) ([]byte, error) {
-	master, fi, err := readFile(root, masterName, masterSize)
+//
+// On a refusal the bytes read are cleared before it returns; on success the
+// caller clears them once it has derived the keys.
+func (s *FileStore) readMaster(root *os.Root) (_ []byte, err error) {
+	// The deferred clear reads raw, not the result, which a refusal's return
+	// sets to nil before deferred calls run.
+	raw, fi, err := readFile(root, masterName, masterSize)
+	defer func() {
+		if err != nil {
+			clear(raw)
+		}
+	}()
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, ErrMasterMissing
 	}
@@ -100,8 +112,8 @@ func (s *FileStore) readMaster(root *os.Root) ([]byte, error) {
 	if fi.Mode().Perm() != fileMode {
 		return nil, fmt.Errorf("%w: mode %04o, want %04o", ErrMasterUntrusted, fi.Mode().Perm(), fileMode)
 	}
-	if len(master) != masterSize {
-		return nil, fmt.Errorf("%w: %d bytes, want %d", ErrMasterUntrusted, len(master), masterSize)
+	if len(raw) != masterSize {
+		return nil, fmt.Errorf("%w: %d bytes, want %d", ErrMasterUntrusted, len(raw), masterSize)
 	}
 	recorded, _, err := readFile(root, masterFingerprintName, fingerprintFileSize)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -110,10 +122,10 @@ func (s *FileStore) readMaster(root *os.Root) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: the fingerprint file: %w", ErrMasterUntrusted, err)
 	}
-	if string(recorded) != masterFingerprint(master) {
+	if string(recorded) != masterFingerprint(raw) {
 		return nil, fmt.Errorf("%w: it does not match %s", ErrMasterUntrusted, masterFingerprintName)
 	}
-	return master, nil
+	return raw, nil
 }
 
 // masterForPut returns the keys a Put seals under, minting the master if this
@@ -159,6 +171,7 @@ func (s *FileStore) mintMaster() (keys, error) {
 	}
 	defer func() { _ = root.Close() }() // writes are fsynced by writeFile
 	master := make([]byte, masterSize)
+	defer clear(master) // only the derived keys outlive the mint
 	if err := s.readRandom(master); err != nil {
 		return keys{}, fmt.Errorf("mint the keystore master: %w", err)
 	}

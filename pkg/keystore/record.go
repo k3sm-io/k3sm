@@ -194,7 +194,9 @@ type keys struct {
 	fingerprint []byte
 }
 
-// deriveKeys derives the seal and fingerprint keys from master.
+// deriveKeys derives the seal and fingerprint keys from master. It does not
+// keep master, and a caller clears it once the keys are derived, so the raw
+// master is held no longer than the derivation needs.
 func deriveKeys(master []byte) keys {
 	return keys{
 		seal:        hmacSHA256(master, []byte(sealKeyLabel)),

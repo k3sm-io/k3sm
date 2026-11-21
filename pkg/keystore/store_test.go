@@ -81,9 +81,12 @@ func TestPutCurrentGet(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			put := mustPut(t, s, tt.name, tt.kind, tt.value)
-			want := Version{Name: tt.name, Version: 1, Kind: tt.kind, Created: time.Unix(now.Unix(), 0), Fingerprint: put.Fingerprint}
+			want := Version{Name: tt.name, Version: 1, Kind: tt.kind, Created: time.Unix(now.Unix(), 0).UTC(), Fingerprint: put.Fingerprint}
 			if put != want || put.Fingerprint == "" {
 				t.Fatalf("Put = %+v, want %+v", put, want)
+			}
+			if loc := put.Created.Location(); loc != time.UTC {
+				t.Fatalf("Put Created is in %v, want UTC", loc)
 			}
 			cur, val, err := s.Current(ctx, tt.name)
 			if err != nil || cur != put || !bytes.Equal(val, tt.value) {
@@ -92,6 +95,9 @@ func TestPutCurrentGet(t *testing.T) {
 			got, val, err := s.Get(ctx, tt.name, 1)
 			if err != nil || got != put || !bytes.Equal(val, tt.value) {
 				t.Fatalf("Get 1 = %+v %q %v", got, val, err)
+			}
+			if loc := got.Created.Location(); loc != time.UTC {
+				t.Fatalf("Get Created is in %v, want UTC", loc)
 			}
 			for _, v := range []uint64{0, 2} {
 				if _, _, err := s.Get(ctx, tt.name, v); !errors.Is(err, ErrVersionNotFound) {

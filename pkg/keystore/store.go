@@ -624,7 +624,7 @@ func versionOf(r record, value, fpKey []byte) Version {
 		Name:        r.name,
 		Version:     r.version,
 		Kind:        kind,
-		Created:     time.Unix(r.created, 0),
+		Created:     time.Unix(r.created, 0).UTC(),
 		Fingerprint: fingerprint(kind, value, fpKey),
 	}
 }
