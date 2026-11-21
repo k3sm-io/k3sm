@@ -439,6 +439,14 @@ Single-node datastore reads are **consistent-LIST**. Under heavy churn, **watch 
 possible and its **soak** validation is still pending. Factor that into recovery expectations; see
 [Limitations](limitations.md).
 
+## Restoring an older keystore/
+
+The keystore that `k3sm keys` manages is not in datastore snapshots and is backed up on its own.
+A restored `keystore/` older than the live one is refused until root removes
+`/var/lib/k3sm/keystore-floor.json`. The steps are in
+[Keys: Restoring an older keystore/](keys.md#restoring-an-older-keystore), and how to save and
+restore the keystore files is in [Keys: Backing up and restoring](keys.md#backing-up-and-restoring).
+
 ## Next
 
 - [Upgrade](upgrade.md) covers what happens to the datastore across a version move.
