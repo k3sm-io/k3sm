@@ -759,6 +759,29 @@ func TestPointerVersionBound(t *testing.T) {
 	}
 }
 
+// TestReadDirNamesBound: a directory is listed in batches, whole up to the
+// limit, and one holding more names than the limit fails closed.
+func TestReadDirNamesBound(t *testing.T) {
+	dir := t.TempDir()
+	const n = 2*dirBatch + 3 // past two batch boundaries
+	for i := range n {
+		writeFile(t, filepath.Join(dir, fmt.Sprintf("f%d", i)), "")
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	if names, err := readDirNames(root, n); err != nil || len(names) != n {
+		t.Fatalf("readDirNames at the limit = %d names, %v; want %d", len(names), err, n)
+	}
+	for _, max := range []int{n - 1, dirBatch, 1} {
+		if names, err := readDirNames(root, max); err == nil || names != nil {
+			t.Fatalf("readDirNames with %d names over a limit of %d = %d names, %v; want an error", n, max, len(names), err)
+		}
+	}
+}
+
 // TestEntryWithNoPointer: a directory with no current pointer is an
 // interrupted Put only when it holds generation and at most v1 (temporary
 // files aside). Anything more is damage: List reports it, Put refuses it and

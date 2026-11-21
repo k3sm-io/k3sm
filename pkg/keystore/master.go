@@ -136,7 +136,7 @@ func (s *FileStore) masterForPut(entries *os.Root) (keys, error) {
 	if !errors.Is(err, ErrMasterMissing) && !errors.Is(err, errFingerprintMissing) {
 		return keys{}, err
 	}
-	names, rerr := readDirNames(entries)
+	names, rerr := readDirNames(entries, maxDirNames)
 	if rerr != nil {
 		return keys{}, rerr
 	}

@@ -47,6 +47,14 @@ const (
 	lockName = ".lock"
 	// lockTimeout bounds every wait for the lock.
 	lockTimeout = 10 * time.Second
+	// maxDirNames bounds how many names a listing of one directory accepts.
+	// Any process running as the service user can fill a store directory, and
+	// the store lists one while holding the lock, so past the bound the listing
+	// fails rather than grow without one. It is twice maxVersion, so an entry
+	// directory at the version limit, with its own files, still lists.
+	maxDirNames = 2 * maxVersion
+	// dirBatch is how many names one read of a directory returns.
+	dirBatch = 256
 )
 
 var (
@@ -322,14 +330,28 @@ func readFile(root *os.Root, name string, max int64) ([]byte, fs.FileInfo, error
 	return b, fi, nil
 }
 
-// readDirNames lists the names in root's directory.
-func readDirNames(root *os.Root) ([]string, error) {
+// readDirNames lists the names in root's directory, read dirBatch at a time,
+// and fails closed once the directory holds more than max.
+func readDirNames(root *os.Root, max int) ([]string, error) {
 	d, err := root.Open(".")
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = d.Close() }() // read-only; nothing to flush
-	return d.Readdirnames(-1)
+	var names []string
+	for {
+		batch, err := d.Readdirnames(dirBatch)
+		names = append(names, batch...)
+		if len(names) > max {
+			return nil, fmt.Errorf("%s holds over %d names", root.Name(), max)
+		}
+		if errors.Is(err, io.EOF) {
+			return names, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
 }
 
 // openLocked opens the entries' directory, creating it with create set, and

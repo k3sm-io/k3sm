@@ -42,7 +42,8 @@ const (
 	// pointer authenticates, but whoever holds the master can seal any value,
 	// and List sizes its result by it and opens every version up to it, so a
 	// pointer above the bound is ErrCorrupt rather than an allocation or a walk
-	// it chooses. 65536 versions is far beyond any rotation cadence.
+	// it chooses. 65536 versions is far beyond any rotation cadence, and an
+	// entry directory at the bound still lists under maxDirNames.
 	maxVersion = 1 << 16
 )
 
@@ -312,7 +313,7 @@ func (s *FileStore) list(ctx context.Context) ([]Entry, error) {
 		return nil, err
 	}
 	defer done()
-	names, err := readDirNames(root)
+	names, err := readDirNames(root, maxDirNames)
 	if err != nil {
 		return nil, err
 	}
@@ -475,7 +476,7 @@ func openEntryDir(root *os.Root, name string) (*entry, error) {
 // files, which no reader opens. Put writes generation before v1, so v1 without
 // generation cannot come from a crash.
 func interruptedPut(dir *os.Root) (bool, error) {
-	names, err := readDirNames(dir)
+	names, err := readDirNames(dir, maxDirNames)
 	if err != nil {
 		return false, err
 	}
