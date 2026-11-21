@@ -315,6 +315,13 @@ func (s *FileStore) adoptSupplied(ctx context.Context, root, mroot *os.Root, fl 
 		return keys{}, nil, false, err
 	}
 	plan, committed, err := rewrapPlan(ctx, root, fl, old, &k)
+	if err != nil && !errors.Is(err, ErrCorrupt) {
+		// Not "a record does not open": a cancelled ctx, an I/O error or a
+		// listing bound. Report it as itself, never as the refusal that
+		// tells the operator to restore from a backup.
+		k.wipe()
+		return keys{}, nil, false, err
+	}
 	if err != nil || !committed {
 		k.wipe()
 		return keys{}, nil, false, nil
