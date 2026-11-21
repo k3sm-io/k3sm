@@ -5,7 +5,9 @@ token, an HMAC key two of your Pods share. Each entry has a name and a history o
 every version is encrypted at rest. You can list the entries, rotate one to a new value, roll it
 back, and delete it, all without the value ever appearing on a command line.
 
-Every verb runs as root, on the server that holds the keystore.
+Every verb runs as root, on the server that holds the keystore. Never delegate the `keys` verbs
+through `sudoers`: `put --in` and `show --reveal` read any file root can read, so a user allowed
+to run them can read any root-readable file.
 
 ## What It Protects, and What It Does Not
 
@@ -36,6 +38,9 @@ name.
 - A name without a scope, such as `signer-key`, is refused, and the message shows the
   `system/<name>` form to use. It does not repeat what you typed, in case that was a value.
 - A `user/...` name is refused with "user scopes are not supported by this build".
+- A `system/` name that breaks the rule above is refused with "the entry name is not valid
+  (DNS-1123 subdomain); it is not echoed". An invalid flag value is refused the same way: the
+  message names the flag, never the value.
 
 ## The Verbs
 
@@ -44,7 +49,7 @@ name.
 | `sudo k3sm keys put system/NAME --in FILE` | Creates the entry at version 1. `--kind ed25519` stores an Ed25519 private key (a 32-byte seed or the 64-byte expanded key) and checks it; the default kind is `opaque`, any bytes. The first `put` on a server creates the master key. |
 | `sudo k3sm keys list` | One line per entry: name, kind, current version, when it was created (UTC), fingerprint and status. Status is `ok`, or `corrupt` with the reason. `-o json` prints the same as JSON. Exits 1 if any entry is not `ok`, after listing every entry. |
 | `sudo k3sm keys show system/NAME` | Prints the entry's metadata, never its value. `--version N` shows an older version. |
-| `sudo k3sm keys show system/NAME --reveal` | Prints the stored value and nothing else: no label, no newline added. To a terminal it also needs `--yes`, so a value does not land on screen and in scrollback by accident. |
+| `sudo k3sm keys show system/NAME --reveal` | Prints the stored value and nothing else: no label, no newline added. To a terminal it also needs `--yes`, so a value does not land on screen and in scrollback by accident. It writes the raw bytes, so a value holding terminal escape sequences is interpreted by the terminal. |
 | `sudo k3sm keys rotate system/NAME --in FILE` | Stores a new version and makes it current. Earlier versions are kept. |
 | `sudo k3sm keys rotate system/NAME --from-version N` | Stores a copy of version N as a new version. The copy is made inside k3sm and the value is never printed. This is the rollback. |
 | `sudo k3sm keys rm system/NAME --yes` | Deletes the entry and every version. This cannot be undone, so it needs `--yes`. It also removes an entry `list` reports as corrupt. |
@@ -61,9 +66,9 @@ interrupted rewrap instead of yours (run it again with a new key).
 A value never comes from the command line. Anything there is visible to every local user through
 `ps` and is saved in your shell history. `put` and `rotate` read the value from:
 
-- `--in FILE`: a regular file. A symlink, FIFO or directory is refused. Keep the file readable
-  by root only, and delete it once the value is stored; a file group or others can read draws a
-  warning.
+- `--in FILE`: a regular file. A symlink, FIFO or directory is refused. Keep the file owned by
+  root and readable and writable by root only, and delete it once the value is stored. A file
+  group or others can read or write, or that another user owns, draws a warning.
 - `--in -`: standard input, which is also the default. The value must be piped in:
 
   ```
@@ -106,7 +111,11 @@ verb refuses a directory that is not root's or that group or others can write. K
 of any synced folder (iCloud Drive, Dropbox and the like) and out of Time Machine's reach, since a
 copy there outlives the rewrap.
 
-Keep that file until `rewrap` reports success, then delete it. If `rewrap` is refused before it
+`FILE` must be an absolute path; a relative one is refused with "give an absolute path".
+
+Keep that file until `rewrap` reports success, then delete it. After a successful rewrap, `FILE`
+is a second copy of the live master key: delete it, or move it to offline storage, and never keep
+it beside a backup of the entries. If `rewrap` is refused before it
 seals anything under the new key, it deletes the file itself and says nothing was changed. If it
 is interrupted or fails partway, some entries may already be sealed under the new key, and that
 file is the only copy of it. `rewrap` then keeps the file, says a resume may need it, and you
@@ -122,6 +131,15 @@ yourself the master key.
 
 If `rewrap` exits 3, it found an earlier rewrap that had been interrupted, finished that one with
 its key, and stopped. Run `rewrap --key-out` again with a new file.
+
+If `rewrap` instead fails while finishing that earlier rewrap, it says:
+
+```
+an earlier interrupted rewrap was advanced and did not finish; keep the earlier rewrap's key file; finish with: sudo k3sm keys rewrap --key-in <that earlier file>
+```
+
+The earlier rewrap's key file is the one to finish with. `rewrap` keeps this run's `FILE` too;
+it was never used, so delete it once the earlier rewrap is finished.
 
 If `rewrap` refuses because `keystore/.user` exists, this build cannot re-seal what that path
 holds. The message names the path. Nothing was changed.

@@ -1264,6 +1264,29 @@ func TestKeysRewrapKeyOutDeletesThroughCheckedDir(t *testing.T) {
 	})
 }
 
+// TestKeysDocsSayWhatTheVerbsDo: docs/user/keys.md carries the resume
+// message rewrap prints, word for word, and the three cautions the verbs
+// cannot enforce: raw bytes from show --reveal, no sudoers delegation, and
+// the --key-out file after a successful rewrap.
+func TestKeysDocsSayWhatTheVerbsDo(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("..", "..", "docs", "user", "keys.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The doc wraps prose, so it is compared with whitespace collapsed.
+	doc := strings.Join(strings.Fields(string(b)), " ")
+	for _, want := range []string{
+		keysResumeFailed,
+		"It writes the raw bytes, so a value holding terminal escape sequences is interpreted by the terminal.",
+		"Never delegate the `keys` verbs through `sudoers`: `put --in` and `show --reveal` read any file root can read",
+		"After a successful rewrap, `FILE` is a second copy of the live master key: delete it, or move it to offline storage, and never keep it beside a backup of the entries.",
+	} {
+		if !strings.Contains(doc, want) {
+			t.Errorf("docs/user/keys.md does not say %q", want)
+		}
+	}
+}
+
 // keysHalfRewrapStore stands in for a rewrap interrupted after it renamed
 // some records in, whose master.next was then replaced or removed, the
 // scenario of pkg/keystore's TestRewrapRecoversReplacedNext. Its Rewrap runs
