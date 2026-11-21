@@ -126,6 +126,10 @@ type FileStore struct {
 	// dirMade is called inside mkdirAt, between the mkdir and the Lstat that
 	// takes the new directory's identity, where a test swaps the directory.
 	dirMade func(name string)
+	// dataRootLocked is called in lockFloor between the data root's flock and
+	// the OpenRoot the floor is read through, where a test swaps the data
+	// root.
+	dataRootLocked func()
 	// euid is the effective uid that creates the store's directories, which
 	// a new directory must be owned by before it is handed over.
 	euid func() int
@@ -135,20 +139,21 @@ type FileStore struct {
 // does not judge cfg: every operation does that first (see checkConfig).
 func New(cfg Config) *FileStore {
 	return &FileStore{
-		dir:       cfg.Dir,
-		masterDir: cfg.MasterDir,
-		dataRoot:  cfg.DataRoot,
-		uid:       cfg.UID,
-		gid:       cfg.GID,
-		scope:     scopeSystem,
-		rand:      rand.Reader,
-		now:       time.Now,
-		chown:     (*os.File).Chown,
-		lockWait:  lockTimeout,
-		step:      func(string) error { return nil },
-		entryMade: func(string) {},
-		dirMade:   func(string) {},
-		euid:      os.Geteuid,
+		dir:            cfg.Dir,
+		masterDir:      cfg.MasterDir,
+		dataRoot:       cfg.DataRoot,
+		uid:            cfg.UID,
+		gid:            cfg.GID,
+		scope:          scopeSystem,
+		rand:           rand.Reader,
+		now:            time.Now,
+		chown:          (*os.File).Chown,
+		lockWait:       lockTimeout,
+		step:           func(string) error { return nil },
+		entryMade:      func(string) {},
+		dirMade:        func(string) {},
+		dataRootLocked: func() {},
+		euid:           os.Geteuid,
 	}
 }
 

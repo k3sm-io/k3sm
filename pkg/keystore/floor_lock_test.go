@@ -235,3 +235,67 @@ func TestFloorNotWritableChangesNothing(t *testing.T) {
 		mustCurrent(t, s, "a", "a")
 	})
 }
+
+// TestDataRootSwapRefused: the data root a floor-writing verb locks is
+// opened without following a symlink, and the directory the floor is then
+// read and written through must be the one it locked, so neither a symlink
+// at the data root nor a directory swapped in after the flock is written.
+func TestDataRootSwapRefused(t *testing.T) {
+	ctx := context.Background()
+	t.Run("a symlink", func(t *testing.T) {
+		s, server := newTestStore(t)
+		mustPut(t, s, "k", KindOpaque, []byte("one"))
+		before := floorOf(t, server)
+		link := filepath.Join(t.TempDir(), "data")
+		if err := os.Symlink(s.dataRoot, link); err != nil {
+			t.Fatal(err)
+		}
+		s.dataRoot = link
+		for op, fn := range map[string]func() error{
+			"Put":        func() error { _, err := s.Put(ctx, "b", KindOpaque, []byte("b")); return err },
+			"Rotate":     func() error { _, err := s.Rotate(ctx, "k", []byte("two")); return err },
+			"Delete":     func() error { return s.Delete(ctx, "k") },
+			"RaiseFloor": func() error { return s.RaiseFloor(ctx) },
+		} {
+			if err := fn(); !errors.Is(err, errFloorUntrusted) {
+				t.Errorf("%s through a symlinked data root: %v, want errFloorUntrusted", op, err)
+			}
+		}
+		if after := floorOf(t, server); !maps.Equal(after, before) {
+			t.Fatalf("floor after the refused verbs = %+v, was %+v", after, before)
+		}
+	})
+	t.Run("swapped between the flock and the open", func(t *testing.T) {
+		s, _ := newTestStore(t)
+		// A data root apart from the server tree, so that swapping it moves
+		// only the floor.
+		s.dataRoot = filepath.Join(t.TempDir(), "data")
+		if err := os.Mkdir(s.dataRoot, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		mustPut(t, s, "k", KindOpaque, []byte("one"))
+		swapped := false
+		s.dataRootLocked = func() {
+			if swapped {
+				return
+			}
+			swapped = true
+			if err := os.Rename(s.dataRoot, s.dataRoot+".locked"); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(s.dataRoot, 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := s.Rotate(ctx, "k", []byte("two")); !errors.Is(err, errFloorUntrusted) {
+			t.Fatalf("Rotate over a data root swapped after its flock: %v, want errFloorUntrusted", err)
+		}
+		if !swapped {
+			t.Fatal("the data root was never swapped")
+		}
+		if _, err := os.Lstat(filepath.Join(s.dataRoot, floorName)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("the refused Rotate wrote a floor into the swapped-in directory: %v", err)
+		}
+		mustCurrent(t, s, "k", "one")
+	})
+}

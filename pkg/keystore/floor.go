@@ -450,6 +450,7 @@ func (s *FileStore) lockFloor(ctx context.Context) (*floorLock, floor, error) {
 		l.unlock()
 		return nil, nil, fmt.Errorf("the keystore floor: %w", err)
 	}
+	s.dataRootLocked()
 	if l.root, err = os.OpenRoot(s.dataRoot); err != nil {
 		l.unlock()
 		return nil, nil, fmt.Errorf("the keystore floor: %w", err)
