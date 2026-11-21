@@ -421,7 +421,7 @@ pend U22 "floor --rebuild and audit --rotate mark and stage under keystore- name
 	k3sm/pkg/keystore/socket::TestMaintenanceReopensLogsAndResetsShares
 pend U23 "every audited operation writes one v:1 line; no line carries a value or its length; readers ignore unknown fields (append-only files)" \
 	TestAuditLineNeverCarriesValue TestAuditReaderIgnoresUnknownFields
-pend U24 "soft cap shows in doctor; past the hard cap every mutating user op is ErrLogFull, except the revocation class, which draws on the reserve; a line over 1 KiB is refused (append-only files)" \
+pend U24 "soft cap shows in doctor; past the hard cap every mutating user op is ErrLogFull, except the revocation class, which draws on its uid's revocation allowance; a line over 1 KiB is refused (append-only files)" \
 	TestLogHardCapRefusesMutations TestAuditLineBoundedAtOneKiB
 pend U25 "backup and restore round trip: a restored tree with cleared flags is refused until floor --rebuild, then opens; the rebuild writes a line for every entry directory holding a generation file, sequence 0 without an authenticated pointer, so a damaged entry stays ErrCorrupt and never becomes ErrNotFound; rig leg E17 (append-only files)" \
 	TestBackupRestoreRoundTripRebuild TestRebuildKeepsDamagedEntryCorrupt
@@ -498,7 +498,7 @@ pend U60 "seam guard: cmd/k3sm's TestMain stubs each of its seams: clock, uid re
 	k3sm/cmd/k3sm::TestRealPrimitivesUnreachable
 pend U61 "seam guard: pkg/install's TestMain stubs its euid source and file-attribute writer (append-only files)" \
 	k3sm/pkg/install::TestRealPrimitivesUnreachable
-pend U62 "reconciler lines are charged to the delivery's owner uid: a deliver-write of a new version past the share is Indeterminate unless it is the rotation write that follows a rotate; a deliver-delete, a withdrawal's lines and the rotation write are never refused for the share and past it draw on the reserve (KeyDelivery lifecycle)" \
+pend U62 "reconciler lines are charged to the delivery's owner uid: a deliver-write of a new version past the share is Indeterminate unless it is the rotation write that follows a rotate; a deliver-delete, a withdrawal's lines and the rotation write are never refused for the share and past it draw on the owner's revocation allowance (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestReconcilerLinesChargedToOwner TestDeliverWritePastShareIsIndeterminate TestDeliverDeleteNeverRefusedForShare
 pend U63 "entries live under .user/<uid>/entries/: entries named deliveries and scope.key are ordinary and touch neither scope file (user-scope store)" \
 	k3sm/pkg/keystore::TestEntriesNamedDeliveriesAndScopeKeyAreOrdinary
@@ -508,8 +508,8 @@ pend U65 "ErrScopeAbsent is Indeterminate and deletes nothing; every allow-list 
 	k3sm/pkg/keystore/reconcile::TestAbsentScopeIsIndeterminate TestEveryDeletingOutcomeNeedsTwoSweeps TestSingleServerRecheckedBeforeEverySweep
 pend U66 "a synthesized GeneratedUID (prefix FFFFEEEE-DDDD-CCCC-BBBB-AAAA) is ErrScopeOwnerUnknown and never bound; ErrScopeOwnerChanged only for a real GeneratedUID that differs (user scopes)" \
 	k3sm/pkg/keystore::TestSynthesizedGeneratedUIDIsUnknown
-pend U67 "the revocation class (withdraw, rm, rotate, the withdrawal's floor line, the reconciler's deliver-delete, its deliver-write of a withdrawal and its rotation write) bypasses the share past it and draws on the 5 MiB revocation reserve above the hard cap, refused only when the reserve is exhausted; a no-op revocation is charged to the share; the reconciler's 4 MiB of the reserve is kept (socket operations)" \
-	k3sm/pkg/keystore/socket::TestRevocationBypassesShareUsesReserve TestNoOpRevocationChargedToShare TestReserveKeepsReconcilerPart
+pend U67 "the revocation class (withdraw, rm, rotate, the withdrawal's floor line, the reconciler's deliver-delete, its deliver-write of a withdrawal and its rotation write) bypasses the share past it and draws on its uid's own 256 KiB revocation allowance per log above the hard cap, refused only when that uid's allowance runs out, so one uid's revocations are never refused because of another uid; a no-op revocation is charged to the share; within a uid's allowance the reconciler's 4 KiB per live delivery is kept (socket operations)" \
+	k3sm/pkg/keystore/socket::TestRevocationBypassesShareUsesReserve TestNoOpRevocationChargedToShare TestReserveKeepsReconcilerPart TestRevocationAllowanceIsPerUID
 rootpend U68 "root-run: the maintenance verbs refuse a symlink or swapped file planted at the marker, a staging name or the old log; creates are O_EXCL|O_NOFOLLOW through one data-root descriptor, fchown before renameat and fchflags on the held descriptor after it, never renaming a flagged file or over one; no log byte changes on a refusal (append-only files)" \
 	k3sm/cmd/k3sm::TestMaintenanceRefusesPlantedSymlinkAndSwap
 pend U69 "the client pins the server: the peer's audit token (LOCAL_PEERTOKEN) must resolve to the cdhash of the installed /Library/k3sm/k3sm, or nothing is written; another service-user binary, a reused pid, a lookup error and an old server after an upgrade are refused (non-root CLI and exec)" \
@@ -528,11 +528,11 @@ pend U75 "the finalizer counts a scope unopenable for an owner change, or remove
 	k3sm/pkg/keystore/reconcile::TestFinalizerDropsWhenScopeUnopenable
 pend U76 "k3sm's CA refuses CN k3sm:local:* and O k3sm:local-users in issueLeaf, so every issuer and CSR path; the controller-manager has no cluster-signing key (KeyDelivery authoring)" \
 	k3sm/pkg/certs::TestReservedLocalPrincipalsRefusedInCSR TestReservedLocalPrincipalsRefusedEveryIssuer k3sm/pkg/executor::TestControllerManagerHasNoClusterSigningKey
-pend U77 "rm-scope revokes first: under the exclusive store lock it reads the sealed deliveries record, deletes each recorded delivery's Secret by the target-matching rule, and only then removes the scope; with the API server unreachable it refuses and changes nothing (KeyDelivery lifecycle)" \
-	k3sm/cmd/k3sm::TestRmScopeDeletesDeliveredSecretsFirst TestRmScopeRefusesWithoutAPI
+pend U77 "rm-scope revokes first: under the exclusive store lock it reads the sealed deliveries record, deletes each recorded delivery's Secret by the target-matching rule, and only then removes the scope; with the API server unreachable it refuses and changes nothing; with the record unopenable it refuses unless --orphan-secrets, which lists and leaves the labelled Secrets (KeyDelivery lifecycle)" \
+	k3sm/cmd/k3sm::TestRmScopeDeletesDeliveredSecretsFirst TestRmScopeRefusesWithoutAPI TestRmScopeOrphanSecretsListsAndLeaves
 pend U78 "SecretRetained is True whenever a labelled Secret stays while Authorized is Unknown or False: under Unknown with reason Indeterminate; NoneRetained only when none stays or Authorized is True (KeyDelivery reconciler)" \
 	k3sm/pkg/keystore/reconcile::TestSecretRetainedTrueUnderUnknown
-pend U79 "the rotation write that follows a rotate is in the revocation class: past the owner's share it draws on the reserve, once per live delivery per log; the reconciler's part, 64 deliveries x 4 lines x 1 KiB for 16 uids, is 4 MiB (KeyDelivery lifecycle)" \
+pend U79 "the rotation write that follows a rotate is in the revocation class: past the owner's share it draws on the owner's revocation allowance, once per live delivery per log; the reconciler's need for one uid, 64 deliveries x 4 lines x 1 KiB, is 256 KiB, the whole allowance (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestRotationWriteUsesReserve
 rootpend U80 "root-run: rm-scope and floor --rebuild walk .user/<uid>/ by descriptor with openat, unlinkat and O_NOFOLLOW, refuse a planted symlink, FIFO or other non-regular file, read with a bounded size, re-check SameFile after each open and never follow a swapped directory (append-only files)" \
 	k3sm/cmd/k3sm::TestRootWalksRefusePlantedNames
@@ -658,7 +658,8 @@ U55|ErrScopeAbsent
 U64|ErrScopeAbsent
 U64|a missing entries/ directory or a missing deliveries record is ErrScopeAbsent too
 U66|FFFFEEEE-DDDD-CCCC-BBBB-AAAA
-U67|5 MiB revocation reserve
+U67|256 KiB revocation allowance per log
+U67|one uid's revocations are never refused because of another uid
 U73|an indeterminate sweep keeps the claim
 U25|a damaged entry stays ErrCorrupt
 U81|keydelivery
