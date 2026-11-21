@@ -1348,7 +1348,8 @@ service user can only add to.
     included: a socket operation's line (`list`, `read-for-exec` and `deliveries` as much as
     `put`) and its floor line to the peer uid, a `refused` line to the peer uid it names, and a
     reconciler `deliver-write` or `deliver-delete` line, and the floor line of a record
-    withdrawal, to the delivery's owner uid. Lines written for root verbs are charged to no
+    withdrawal, to the delivery's owner uid, except a drift repair ("Repairs are not charged to
+    the owner"), which acts for no uid. Lines written for root verbs are charged to no
     uid. A reconciler line that no uid is charged for draws on the reconciler budget below.
   - *The reconciler budget.* The reconciler's lines that act for no uid draw on one
     **reconciler budget** of 1 MiB per log, separate from every uid's share and budgets and
@@ -2032,6 +2033,25 @@ as the garbage-collection backstop. The label value is a constant because Phase 
 value is an entry name, and `user/<uid>/<name>` is not a valid label value (a label value
 allows no `/`), so the entry goes in the annotation.
 
+**Repairs are not charged to the owner.** A delivered Secret that someone other than the
+reconciler edited or deleted (drift: the Secret is gone, or its data or annotations differ from
+what the reconciler last wrote, while the entry's current version is the one already delivered)
+is re-created or repaired by the reconciler, but that write is not the owner's act:
+
+- *Reconciler-class.* A repair write draws on the reconciler budget ("The user-scope floor",
+  per-uid fairness), never on the owner's share or revocation budgets, so a namespace writer who
+  edits or deletes the Secret over and over cannot spend the owner's share.
+- *Coalesced and rate-limited.* Repairs of one delivery write at most one audit line per 10
+  minutes, a `deliver-write` with `"repair":true` and the count of repairs since the last such
+  line. Repairs of one delivery are themselves rate-limited, with exponential backoff from one
+  sweep period, doubling on each repair, capped at 10 minutes and reset once the Secret has
+  stayed as written for 10 minutes. Once the reconciler budget is spent, a repair still runs
+  (a writer must not be able to hold a substituted value in place by exhausting it), its line is
+  dropped and counted, and `doctor` warns.
+- *What stays the owner's.* A write of a new version, after the owner's own `rotate` or `put`,
+  is the owner's act and stays charged to the owner as above; only the write that restores the
+  version already delivered is a repair (U86).
+
 **A KeyDelivery never touches a Phase A Secret.** A Secret belongs to the KeyDelivery
 reconciler only when it carries the label value `keydelivery` and a `k3sm.io/keystore-entry`
 annotation naming a `user/` entry. A Phase A Secret carries no `k3sm.io/keystore-entry`, so
@@ -2502,7 +2522,7 @@ each stated in the change that makes it. U15 is held for a K0 amendment and U39 
 | U50 | the defeat list, run as the service user against both flagged logs (integration, a root-run row: `--root` runs it by name and fails it on SKIP, and `--check` prints it uncounted, as pending; flag variant): `chflags nosappnd`, `O_TRUNC`, `ftruncate`, `pwrite` at an offset, a shared writable `mmap` write, `F_PUNCHHOLE`, `link()`, `fclonefileat` then a swap, a `renamex_np` swap through the parent, `exchangedata`, `unlink` and `rename` through the parent, a second open with `O_TRUNC`, and owner `chmod`; each fails, the bytes and the flag are unchanged, and an `O_APPEND` write still succeeds | `k3sm/pkg/keystore::TestAppendOnlyDefeatListAsServiceUser` | pending: the append-only files |
 | U51 | per-uid log fairness: the share is a fixed byte count, 16 MiB by default, and a share above 1/16 of the hard cap is refused at start; every line is charged to the uid it acts for, reads (`list`, `read-for-exec`, `deliveries`) included; a uid past its share has its own mutations and reads refused with `ErrLogFull` (`log-full`) while another uid's succeed, and that refusal is never the global append failure that refuses every uid's reads; a uid past its share cannot affect another uid's mutations, reads or revocations; `list` and `deliveries` are rate-limited per uid | `k3sm/pkg/keystore/socket::TestLogSharePerUIDRefusesOnlyThatUID`, `TestLogShareAtMostOneSixteenthOfHardCap`, `TestShareRefusalIsNotGlobalAppendFailure`, `TestReadRateLimitPerUID`, `TestReadsChargedToShare`, `TestShareExhaustionIsolatedPerUID` | pending: the socket operations |
 | U52 | every root verb writes one audit line with `via` `root` once the log exists, and none before it | `k3sm/cmd/k3sm::TestEveryRootVerbWritesAuditLine` | pending: the append-only files |
-| U53 | every reconciler Secret write and delete, and every record withdrawal, writes one audit line with `via` `reconciler` | `k3sm/pkg/keystore/reconcile::TestEveryReconcilerWriteAndDeleteAudited` | pending: the KeyDelivery reconciler (lifecycle) |
+| U53 | every reconciler Secret write and delete, and every record withdrawal, writes one audit line with `via` `reconciler`, except drift repairs, coalesced to one line per delivery per 10 minutes (U86) | `k3sm/pkg/keystore/reconcile::TestEveryReconcilerWriteAndDeleteAudited` | pending: the KeyDelivery reconciler (lifecycle) |
 | U54 | a pre-frame refusal (uid 0, the service uid, a uid below 501) writes a `refused` line with the peer uid, rate-limited per uid with a dropped-count summary | `k3sm/pkg/keystore/socket::TestPreFrameRefusalsAudited`, `TestPreFrameRefusalLinesRateLimited` | pending: the socket listener |
 | U55 | a transient lookup, SAR or apiserver error leaves the Secret and sets Unknown: a failed SAR call, an API server error, `ErrScopeOwnerUnknown`, `ErrBusy` and `ErrLogFull` each leave the Secret, the record entry and the finalizer, set `Authorized=Unknown` with reason `Indeterminate`, and retry with backoff; a SAR answer is a definitive denial when the call succeeded, `allowed=false` and `evaluationError` is empty, whatever `denied` says (the RBAC authorizer refuses with no opinion, reported as `allowed=false`), and each other answer is `Indeterminate`; no sweep runs before `readyz` and the RBAC informers' sync; every deleting outcome, not only a denial, deletes only when two consecutive sweeps see it for the same generation; only the allow-list (`ErrNotFound` for an entry missing from a scope that opened, `ErrScopeOwnerChanged`, a withdrawn record, a digest mismatch on a readable record, a definitive SAR denial) deletes, and a table over every store sentinel (`ErrScopeAbsent`, `ErrCorrupt`, the floor refusal, `ErrMasterMissing`, `ErrScopeUnsupported`, `ErrBusy`, `ErrLogFull`, `ErrScopeOwnerUnknown`), a cancelled ctx, the audit read refusal, an unknown record version and an unlisted error finds each `Indeterminate` | `k3sm/pkg/keystore/reconcile::TestTransientErrorLeavesSecretSetsUnknown`, `TestSAREvaluationErrorIsIndeterminate`, `TestSARAllowedFalseWithoutErrorIsDenial`, `TestNoSweepBeforeReady`, `TestDenialNeedsTwoSweeps`, `TestScopeOwnerChangedDeletes`, `TestEverySentinelBesidesNotFoundAndOwnerChangedIsIndeterminate` | pending: the KeyDelivery reconciler (lifecycle) |
 | U56 | a delivery record with an unknown format version is refused by the store and read by the reconciler as `Indeterminate`, never as a denial: no Secret is deleted | `k3sm/pkg/keystore::TestDeliveryRecordUnknownVersionRefused`, `k3sm/pkg/keystore/reconcile::TestUnknownRecordVersionIsIndeterminate` | pending: the KeyDelivery reconciler (lifecycle) |
@@ -2535,6 +2555,7 @@ each stated in the change that makes it. U15 is held for a K0 amendment and U39 
 | U83 | the reconciler checks the user-scope floor log: a missing or unflagged floor log is `Indeterminate` for writes, so no `deliver-write` runs until `floor --rebuild`, and nothing is deleted (the store's flag check, faked at the reconciler's store interface) | `k3sm/pkg/keystore/reconcile::TestReconcilerHoldsWritesWithoutFloor` | pending: the KeyDelivery reconciler (lifecycle) |
 | U84 | when a log's size is past the hard cap, `doctor` shows a Warn with the overshoot in bytes and the `audit --rotate` or `floor --rebuild` hint, and none at or below it; the overshoot is at most 320 KiB per user scope, plus the 1 MiB reconciler budget | `k3sm/cmd/k3sm::TestDoctorWarnsOnLogOvershoot` | pending: the socket operations |
 | U85 | a reconciler line charged to no uid (a forged-Secret `refused` line, a drift repair, their summaries) draws on the reconciler budget, 1 MiB per log, separate from every uid and excluded from the hard-cap test; forged Secrets are counted in a bounded LRU of 1024 (namespace, name) pairs with no per-`resourceVersion` set, new pairs' lines at most 10 a minute and at most one summary `refused` line a minute carrying the dropped count; past the budget the lines are dropped and counted and `doctor` warns; N forged updates leave every uid able to read and mutate | `k3sm/pkg/keystore/reconcile::TestForgedSecretFloodLeavesEveryUIDServed`, `TestUnchargedLinesHaveOwnBudget` | pending: the KeyDelivery reconciler (lifecycle) |
+| U86 | a drift repair (the reconciler re-creating or repairing a delivered Secret that someone other than the reconciler edited or deleted, at the version already delivered) is reconciler-class: it draws on the reconciler budget and is never charged to the owner's share or budgets; repairs are coalesced to one audit line per delivery per 10 minutes with a count, and rate-limited per delivery with exponential backoff capped at 10 minutes; a write of a new version after the owner's own `rotate` or `put` stays charged to the owner | `k3sm/pkg/keystore/reconcile::TestDriftRepairNotChargedToOwner` | pending: the KeyDelivery reconciler (lifecycle) |
 
 ### Rig legs
 
