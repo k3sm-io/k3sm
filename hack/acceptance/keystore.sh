@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # The keystore's acceptance gate: docs/design/keystore.md § "Acceptance gate",
-# rows G1 to G22, the user-scope rows U1 to U98 (U15 and U39 are unused) and
+# rows G1 to G22, the user-scope rows U1 to U99 (U15 and U39 are unused) and
 # the rig legs E1 to E25. Every row is listed, on exactly one line. A row runs
 # the tests that deliver it and passes only if each named test ran and passed
 # in its own package; a row whose change has not landed yet prints PENDING,
@@ -36,7 +36,7 @@
 #   --scope         user scopes: U6 to U11, U47, U58, U64, U66.
 #   --scope-store   the user-scope store: U12 to U14, U63, U97.
 #   --files         the append-only files: U20 to U25, U50, U52, U60, U61, U68,
-#                   U80, U88, U90, U91, and in the helper variant only U70, U71.
+#                   U80, U88, U90, U91, U99, and in the helper variant only U70, U71.
 #   --socket        the socket listener: U26 to U31, U46, U48, U54, U82.
 #   --socket-ops    the socket operations: U32 to U35, U45, U51, U67, U84.
 #   --exec          the non-root CLI and exec: U36 to U38, U69, U92.
@@ -110,6 +110,7 @@ EXPECTED_ROWS="$EXPECTED_ROWS U72 U73 U74 U75 U76"
 EXPECTED_ROWS="$EXPECTED_ROWS U77 U78 U79 U80 U81 U82 U83 U84"
 EXPECTED_ROWS="$EXPECTED_ROWS U85 U86 U87 U88 U89 U90 U91 U92 U93 U94 U95 U96 U97"
 EXPECTED_ROWS="$EXPECTED_ROWS U98"
+EXPECTED_ROWS="$EXPECTED_ROWS U99"
 # >>> ADD NEW U ROWS (U64 upward) HERE <<<
 EXPECTED_ROWS="$EXPECTED_ROWS E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 E13 E14 E15 E16 E17 E18 E19 E20"
 EXPECTED_ROWS="$EXPECTED_ROWS E21 E22 E23 E24 E25"
@@ -140,7 +141,7 @@ mode_rows() {
 	api) echo "U18 U19" ;;
 	scope) echo "U6 U7 U8 U9 U10 U11 U47 U58 U64 U66" ;;
 	scope-store) echo "U12 U13 U14 U63 U97" ;;
-	files) echo "U20 U21 U22 U23 U24 U25 U50 U52 U60 U61 U68 U70 U71 U80 U88 U90 U91" ;;
+	files) echo "U20 U21 U22 U23 U24 U25 U50 U52 U60 U61 U68 U70 U71 U80 U88 U90 U91 U99" ;;
 	socket) echo "U26 U27 U28 U29 U30 U31 U46 U48 U54 U82" ;;
 	socket-ops) echo "U32 U33 U34 U35 U45 U51 U67 U84" ;;
 	exec) echo "U36 U37 U38 U69 U92" ;;
@@ -576,6 +577,8 @@ pend U97 "when rotate answers ErrQuota, rm then put recovers: rm frees every ver
 	k3sm/pkg/keystore::TestRotateQuotaRecoveredByRmThenPut
 pend U98 "the sealed deliveries record stores each delivery's KeyDelivery metadata.name; the orphan sweep checks the object with a live Get by that name sent to the API server, never an informer cache and never a List; not found, or another UID, deletes only on two consecutive observations at least 60 s apart, any other answer resetting the count; no sweep before the KeyDelivery and Secret informers sync (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestOrphanSweepUsesLiveGetByName TestOrphanSweepNeedsTwoObservations
+pend U99 "under the store lock, before every audit or floor append, the server compares its descriptor's (dev, ino) with the canonical name's and reopens on a mismatch, recounting the shares; audit --rotate and floor --rebuild each complete while the server never saw the marker, and every later line lands in the new canonical file (append-only files)" \
+	k3sm/pkg/keystore/socket::TestAppendReopensOnInodeMismatch
 # >>> ADD NEW U ROWS (U64 upward) HERE, and add each to EXPECTED_ROWS and to mode_rows <<<
 
 leg E1 "files" "preconditions: secrets encryption on; one server; keystore-run/ and both logs present, service-user 0600, SF_APPEND set; the doctor user-scope row on; keystore.sh --check exits 0 on the build" "the append-only files"
@@ -756,6 +759,9 @@ U86|a substituted data under an intact version annotation is drift
 U98|live Get by that name
 U98|never an informer cache and never a List
 U98|two consecutive observations at least 60 s apart
+U99|before every audit or floor append
+U99|reopens on a mismatch
+U99|never saw the marker
 U97|rm then put"
 
 # --listed: the row-presence lint.

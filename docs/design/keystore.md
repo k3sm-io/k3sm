@@ -1415,6 +1415,14 @@ service user can only add to.
   the new file and is charged against the recounted share: after `audit --rotate` every uid's
   audit share is 0, and after `floor --rebuild` every uid's floor share is 0, since rebuild's
   lines are root's and charged to no uid (U22).
+- **Every append checks that its descriptor is still the canonical file.** The marker is a
+  signal, and a server can miss it: it can be stopped, slow or between checks for the whole
+  maintenance run. So under the store lock, before every audit or floor append, the server
+  compares its descriptor's `(dev, ino)` from `fstat` with the canonical name's, read with
+  `fstatat` on the data-root descriptor and `AT_SYMLINK_NOFOLLOW`. On a mismatch it reopens the
+  file as above, judges the new descriptor, and recounts every uid's share from the new file
+  before it appends. A server that never saw the marker therefore never writes into a renamed
+  archive or an unlinked file, and its counts follow the file it writes to (U99).
 - **Size caps.** Each log has a soft cap (`keystore.logSoftCap`, default 64 MiB) and a hard cap
   (`keystore.logHardCap`, default 256 MiB). Past the soft cap `doctor` shows the size and the
   rotate hint; past the hard cap the server refuses every mutating user operation with
@@ -2803,6 +2811,7 @@ record below.
 | U96 | the `deliveries` record is exempt from the 64 KiB value cap and bounded at 64 live entries plus 256 withdrawn tombstones, 1,280 bytes an entry, 416 KiB sealed; at the bound `deliver` answers `quota` and a withdrawal still succeeds, in place; a tombstone is pruned only after its Secret is seen gone (Get not found) on two sweeps at least 60 s apart | `k3sm/pkg/keystore/reconcile::TestDeliveriesRecordBoundAndPrune`, `TestRevocationNeverRefusedAtRecordBound` | pending: the KeyDelivery reconciler (lifecycle) |
 | U97 | when `rotate` answers `ErrQuota`, `rm` then `put` recovers: `rm` frees every version and `put` stores the value as version 1 of a new generation; the `quota` error names that recovery | `k3sm/pkg/keystore::TestRotateQuotaRecoveredByRmThenPut` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
 | U98 | the sealed `deliveries` record stores each delivery's KeyDelivery `metadata.name`; the orphan sweep checks the object with a live Get by that name sent to the API server, never an informer cache and never a List; not found, or another UID, deletes only on two consecutive observations at least 60 s apart, and any other answer in between resets the count; no sweep runs before the KeyDelivery and Secret informers sync | `k3sm/pkg/keystore/reconcile::TestOrphanSweepUsesLiveGetByName`, `TestOrphanSweepNeedsTwoObservations` | pending: the KeyDelivery reconciler (lifecycle) |
+| U99 | under the store lock, before every audit or floor append, the server compares its descriptor's `(dev, ino)` with the canonical name's and reopens on a mismatch, recounting the per-uid shares from the new file; `audit --rotate` and `floor --rebuild` each complete while the server never saw the marker, and every later line lands in the new canonical file, none in an archive or an unlinked file (seam: chflags flag source) | `k3sm/pkg/keystore/socket::TestAppendReopensOnInodeMismatch` | pending: the append-only files |
 
 ### Rig legs
 
