@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"errors"
 	"net/http"
 	"os"
 	"strings"
@@ -105,8 +106,8 @@ func TestImageUntagDigestGuardHoldsAgainstConcurrentRepoint(t *testing.T) {
 	}
 	if err == nil {
 		t.Errorf("untag --digest of a tag re-pointed after the comparison succeeded:\n%s", out)
-	} else if !strings.Contains(err.Error(), "nothing was removed") {
-		t.Errorf("untag error = %v, want it to say nothing was removed", err)
+	} else if !errors.Is(err, errTagMoved) {
+		t.Errorf("untag error = %v, want the registry's conditional delete to refuse it (errTagMoved)", err)
 	}
 	desc, err := remote.Head(ref, direct...)
 	if err != nil {
