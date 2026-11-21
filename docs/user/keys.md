@@ -40,7 +40,9 @@ name.
 - A `user/...` name is refused with "user scopes are not supported by this build".
 - A `system/` name that breaks the rule above is refused with "the entry name is not valid
   (DNS-1123 subdomain); it is not echoed". An invalid flag value is refused the same way: the
-  message names the flag, never the value.
+  message names the flag, never the value. That holds for the path flags too (`--in`,
+  `--key-in`, `--key-out`, `--work-dir`): their errors and warnings name the flag and the reason,
+  such as "open --in: no such file or directory (the path is not echoed)", never the path.
 
 ## The Verbs
 

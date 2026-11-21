@@ -669,6 +669,9 @@ func TestKeysRefusals(t *testing.T) {
 		{name: "reveal to a tty", args: []string{"show", "system/held", "--reveal"}, stdoutTTY: true, want: 1, say: "--yes"},
 		{name: "rm without yes", args: []string{"rm", "system/held"}, want: 2, say: "--yes"},
 		{name: "unknown verb", args: []string{"frob"}, want: 2, say: "unknown"},
+		{name: "in path not echoed", args: []string{"put", "system/x", "--in", "Hunter2"}, want: 1, say: "open --in: no such file or directory (the path is not echoed)", never: "Hunter2"},
+		{name: "key-in path not echoed", args: []string{"rewrap", "--key-in", "/tmp/Hunter2"}, want: 1, say: "open --key-in: no such file or directory (the path is not echoed)", never: "Hunter2"},
+		{name: "key-out path not echoed", args: []string{"rewrap", "--key-out", "/nonexistent/Hunter2"}, want: 1, say: "--key-out: no such file or directory (the path is not echoed)", never: "Hunter2"},
 		{name: "unknown verb not echoed", args: []string{"Hunter2"}, want: 2, say: "unknown subcommand (not echoed); see k3sm keys --help", never: "Hunter2"},
 		{name: "relative work dir not echoed", args: []string{"list", "--work-dir", "Hunter2"}, want: 1, say: "--work-dir", never: "Hunter2"},
 	} {
@@ -924,8 +927,8 @@ func TestKeysRewrap(t *testing.T) {
 		if strings.Contains(out, fmt.Sprintf("%x", key)) || strings.Contains(out, string(key)) {
 			t.Fatalf("rewrap printed the key: %q", out)
 		}
-		if !strings.Contains(out, "delete") || !strings.Contains(out, p) {
-			t.Errorf("rewrap output %q does not tell the operator to delete %s", out, p)
+		if !strings.Contains(out, "Now delete the --key-out file") || strings.Contains(out, p) {
+			t.Errorf("rewrap output %q does not tell the operator to delete the --key-out file, or names its path", out)
 		}
 		if got := h.value("a", 1); string(got) != "a-value" {
 			t.Fatalf("after rewrap the entry holds %q", got)
@@ -1158,8 +1161,9 @@ func TestKeysRewrapKeyOutFile(t *testing.T) {
 		if err != nil || len(got) != 32 {
 			t.Fatalf("the key file after a crash that recorded its key: %x, %v", got, err)
 		}
-		if !strings.Contains(h.stderr.String(), "rewrap --key-in "+p) || strings.Contains(h.stderr.String(), "nothing was changed") {
-			t.Errorf("stderr %q does not say to finish with --key-in %s", h.stderr.String(), p)
+		if !strings.Contains(h.stderr.String(), "keep the --key-out file") || !strings.Contains(h.stderr.String(), "rewrap --key-in <that file>") ||
+			strings.Contains(h.stderr.String(), p) || strings.Contains(h.stderr.String(), "nothing was changed") {
+			t.Errorf("stderr %q does not say to keep the --key-out file and finish with --key-in, or names its path", h.stderr.String())
 		}
 		// And that file finishes it.
 		h.wrap = nil
@@ -1490,7 +1494,7 @@ func TestKeysReadKeyInRefusals(t *testing.T) {
 			if err := os.Symlink(writeKeyFile(t, key), p); err != nil {
 				t.Fatal(err)
 			}
-		}, "open the key file"},
+		}, "open --key-in: too many levels of symbolic links"},
 		"fifo": {func(t *testing.T, p string) {
 			if err := syscall.Mkfifo(p, 0o600); err != nil {
 				t.Fatal(err)

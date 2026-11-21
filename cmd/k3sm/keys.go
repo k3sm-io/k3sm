@@ -418,6 +418,19 @@ func (v *keysVerb) readValue(in string) ([]byte, error) {
 	}
 }
 
+// pathFailure is an error about a path flag's file that never carries the
+// path: a value typed where the path belongs would otherwise be printed.
+// It names the operation and the flag, and the errno's text when there is
+// one; err is not wrapped, since an fs.PathError in it holds the path.
+func pathFailure(op, flagName string, err error) error {
+	class := "it failed"
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		class = errno.Error()
+	}
+	return fmt.Errorf("%s %s: %s (the path is not echoed)", op, flagName, class)
+}
+
 // openValueFile opens --in FILE for reading: a regular file, reached without
 // following a symlink, and opened non-blocking so a FIFO is refused rather
 // than waited on. A file group or others can read is used, with a warning:
@@ -427,25 +440,25 @@ func (v *keysVerb) readValue(in string) ([]byte, error) {
 func (v *keysVerb) openValueFile(path string) (*os.File, error) {
 	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
-		return nil, fmt.Errorf("open --in: %w", err)
+		return nil, pathFailure("open", "--in", err)
 	}
 	fi, err := f.Stat()
 	if err != nil {
 		_ = f.Close() // read-only
-		return nil, fmt.Errorf("stat --in: %w", err)
+		return nil, pathFailure("stat", "--in", err)
 	}
 	if !fi.Mode().IsRegular() {
 		_ = f.Close() // read-only
-		return nil, fmt.Errorf("--in %s is not a regular file", path)
+		return nil, errors.New("--in is not a regular file")
 	}
 	if fi.Mode().Perm()&0o044 != 0 {
-		fmt.Fprintf(v.env.stderr, "k3sm keys %s: warning: %s is mode %04o, readable by group or others: keep a value file readable by root only, and delete it once stored\n", v.name, path, fi.Mode().Perm())
+		fmt.Fprintf(v.env.stderr, "k3sm keys %s: warning: the --in file is mode %04o, readable by group or others: keep a value file readable by root only, and delete it once stored\n", v.name, fi.Mode().Perm())
 	}
 	if fi.Mode().Perm()&0o022 != 0 {
-		fmt.Fprintf(v.env.stderr, "k3sm keys %s: warning: %s is mode %04o, writable by group or others, who could have chosen the value: keep a value file writable by root only\n", v.name, path, fi.Mode().Perm())
+		fmt.Fprintf(v.env.stderr, "k3sm keys %s: warning: the --in file is mode %04o, writable by group or others, who could have chosen the value: keep a value file writable by root only\n", v.name, fi.Mode().Perm())
 	}
 	if st, ok := fi.Sys().(*syscall.Stat_t); !ok || int64(st.Uid) != int64(os.Geteuid()) {
-		fmt.Fprintf(v.env.stderr, "k3sm keys %s: warning: %s is not owned by root, so its owner could have chosen the value: keep a value file owned by root\n", v.name, path)
+		fmt.Fprintf(v.env.stderr, "k3sm keys %s: warning: the --in file is not owned by root, so its owner could have chosen the value: keep a value file owned by root\n", v.name)
 	}
 	return f, nil
 }
@@ -780,72 +793,72 @@ func writeKeyOut(path string, key []byte, step func(string) error) (out *keyOutF
 	dir, base := filepath.Dir(path), filepath.Base(path)
 	root, err := os.OpenRoot(dir)
 	if err != nil {
-		return nil, fmt.Errorf("open the key file's directory: %w", err)
+		return nil, pathFailure("open the directory of", "--key-out", err)
 	}
 	defer func() {
 		if err != nil {
 			_ = root.Close() // synced below when a file is written
 		}
 	}()
-	if err := checkKeyOutDir(root, dir); err != nil {
+	if err := checkKeyOutDir(root); err != nil {
 		return nil, err
 	}
 	f, err := root.OpenFile(base, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
-		return nil, fmt.Errorf("create the key file: %w", err)
+		return nil, pathFailure("create", "--key-out", err)
 	}
 	defer func() {
 		if cerr := f.Close(); err == nil && cerr != nil {
-			err = fmt.Errorf("close the key file: %w", cerr)
+			err = pathFailure("close", "--key-out", cerr)
 		}
 		if err != nil {
 			if rerr := root.Remove(base); rerr != nil {
-				err = fmt.Errorf("%w; and removing the partial key file failed, delete %s by hand: %w", err, path, rerr)
+				err = fmt.Errorf("%w; and removing the partial key file failed, delete the --key-out file by hand: %w", err, pathFailure("remove", "--key-out", rerr))
 			}
 		}
 	}()
 	if err := f.Chmod(0o600); err != nil {
-		return nil, fmt.Errorf("chmod the key file: %w", err)
+		return nil, pathFailure("chmod", "--key-out", err)
 	}
 	if err := step("chmod"); err != nil {
 		return nil, err
 	}
 	if _, err := f.Write(key); err != nil {
-		return nil, fmt.Errorf("write the key file: %w", err)
+		return nil, pathFailure("write", "--key-out", err)
 	}
 	if err := step("write"); err != nil {
 		return nil, err
 	}
 	if err := f.Sync(); err != nil {
-		return nil, fmt.Errorf("sync the key file: %w", err)
+		return nil, pathFailure("sync", "--key-out", err)
 	}
 	if err := step("sync"); err != nil {
 		return nil, err
 	}
 	d, err := root.Open(".")
 	if err != nil {
-		return nil, fmt.Errorf("open the key file's directory: %w", err)
+		return nil, pathFailure("open the directory of", "--key-out", err)
 	}
 	defer func() { _ = d.Close() }() // read-only; synced below
 	if err := d.Sync(); err != nil {
-		return nil, fmt.Errorf("sync the key file's directory: %w", err)
+		return nil, pathFailure("sync the directory of", "--key-out", err)
 	}
 	return &keyOutFile{root: root, base: base}, nil
 }
 
 // checkKeyOutDir refuses a --key-out directory that is not owned by the
 // running user (root) or that group or others can write.
-func checkKeyOutDir(root *os.Root, dir string) error {
+func checkKeyOutDir(root *os.Root) error {
 	fi, err := root.Stat(".")
 	if err != nil {
-		return fmt.Errorf("stat the key file's directory: %w", err)
+		return pathFailure("stat the directory of", "--key-out", err)
 	}
 	st, ok := fi.Sys().(*syscall.Stat_t)
 	switch {
 	case !ok || int64(st.Uid) != int64(os.Geteuid()):
-		return fmt.Errorf("the key file's directory %s is not owned by this user (root): name a directory only root can write", dir)
+		return errors.New("the --key-out file's directory is not owned by this user (root): name a directory only root can write")
 	case fi.Mode().Perm()&0o022 != 0:
-		return fmt.Errorf("the key file's directory %s is mode %04o, writable by group or others: name a directory only root can write", dir, fi.Mode().Perm())
+		return fmt.Errorf("the --key-out file's directory is mode %04o, writable by group or others: name a directory only root can write", fi.Mode().Perm())
 	}
 	return nil
 }
@@ -857,30 +870,30 @@ func checkKeyOutDir(root *os.Root, dir string) error {
 func readKeyIn(path string) ([]byte, error) {
 	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
-		return nil, fmt.Errorf("open the key file: %w", err)
+		return nil, pathFailure("open", "--key-in", err)
 	}
 	defer func() { _ = f.Close() }() // read-only
 	fi, err := f.Stat()
 	if err != nil {
-		return nil, fmt.Errorf("stat the key file: %w", err)
+		return nil, pathFailure("stat", "--key-in", err)
 	}
 	st, ok := fi.Sys().(*syscall.Stat_t)
 	switch {
 	case !fi.Mode().IsRegular():
-		return nil, fmt.Errorf("the key file %s is not a regular file", path)
+		return nil, errors.New("--key-in is not a regular file")
 	case !ok || int64(st.Uid) != int64(os.Geteuid()):
-		return nil, fmt.Errorf("the key file %s is not owned by this user (root)", path)
+		return nil, errors.New("the --key-in file is not owned by this user (root)")
 	case fi.Mode().Perm()&0o077 != 0:
-		return nil, fmt.Errorf("the key file %s is mode %04o: it must be closed to group and others (0600)", path, fi.Mode().Perm())
+		return nil, fmt.Errorf("the --key-in file is mode %04o: it must be closed to group and others (0600)", fi.Mode().Perm())
 	}
 	b, err := io.ReadAll(io.LimitReader(f, keysMasterSize+1))
 	if err != nil {
 		clear(b)
-		return nil, fmt.Errorf("read the key file: %w", err)
+		return nil, pathFailure("read", "--key-in", err)
 	}
 	if len(b) != keysMasterSize {
 		clear(b)
-		return nil, fmt.Errorf("the key file %s holds %d bytes, not a %d-byte key", path, len(b), keysMasterSize)
+		return nil, fmt.Errorf("the --key-in file holds %d bytes, not a %d-byte key", len(b), keysMasterSize)
 	}
 	return b, nil
 }
@@ -959,15 +972,15 @@ func keysRewrap(ctx context.Context, args []string, env keysEnv) int {
 			return v.failf(keysRefused, "%v; nothing was changed", err)
 		}
 		defer out.close()
-		fmt.Fprintf(env.stderr, "k3sm keys rewrap: saved the new master key to %s (mode 0600). Keep this file until rewrap reports success, then delete it.\n", keyPath)
+		fmt.Fprintln(env.stderr, "k3sm keys rewrap: saved the new master key to the --key-out file (mode 0600). Keep this file until rewrap reports success, then delete it.")
 	}
 	defer clear(key)
 	err = s.Rewrap(ctx, key)
 	if err == nil {
 		fmt.Fprintf(env.stdout, "rewrap complete: every entry is sealed under the new master key.\n"+
-			"Now delete %s.\n"+
+			"Now delete the %s file.\n"+
 			"Backups of the keystore taken before this rewrap no longer open: back up the entries and the master key again.\n"+
-			"Fingerprints of opaque entries have changed.\n", keyPath)
+			"Fingerprints of opaque entries have changed.\n", keyFlag(out))
 		return keysOK
 	}
 	resumed := errors.Is(err, keystore.ErrRewrapResumed)
@@ -975,7 +988,17 @@ func keysRewrap(ctx context.Context, args []string, env keysEnv) int {
 	if resumed {
 		code, next = keysResumed, "\nrun rewrap again with a new key: sudo k3sm keys rewrap --key-out <new file>."
 	}
-	return v.failf(code, "%v%s\n%s", err, next, keyFileAfterFailure(err, keyPath, out, resumed))
+	return v.failf(code, "%v%s\n%s", err, next, keyFileAfterFailure(err, out, resumed))
+}
+
+// keyFlag names the flag the run's key file came from: --key-out when this
+// run wrote it (out set), else --key-in. Messages name the flag, never the
+// path, which may be a value typed in the wrong place.
+func keyFlag(out *keyOutFile) string {
+	if out != nil {
+		return "--key-out"
+	}
+	return "--key-in"
 }
 
 // keysResumeFailed is what rewrap says after keystore.ErrRewrapResumeFailed:
@@ -991,24 +1014,25 @@ const keysResumeFailed = "an earlier interrupted rewrap was advanced and did not
 // keystore.ErrRewrapResumeFailed the file is kept too, and the operator is
 // sent to the earlier rewrap's key file. A --key-in file (out nil) is the
 // operator's and is never deleted. The delete goes through out, the
-// directory handle writeKeyOut checked, never through keyPath again.
-func keyFileAfterFailure(err error, keyPath string, out *keyOutFile, resumed bool) string {
+// directory handle writeKeyOut checked, never through the path again. It
+// names the flag, never the path.
+func keyFileAfterFailure(err error, out *keyOutFile, resumed bool) string {
 	wrote := out != nil
 	if errors.Is(err, keystore.ErrRewrapResumeFailed) {
 		if wrote {
-			return fmt.Sprintf("%s\nthis run's key file %s was kept", keysResumeFailed, keyPath)
+			return keysResumeFailed + "\nthis run's --key-out file was kept"
 		}
 		return keysResumeFailed
 	}
 	if !wrote || !errors.Is(err, keystore.ErrRewrapNotStarted) {
-		return fmt.Sprintf("keep %s: a resume may need this file; finish with the same key: sudo k3sm keys rewrap --key-in %s", keyPath, keyPath)
+		return fmt.Sprintf("keep the %s file: a resume may need this file; finish with the same key: sudo k3sm keys rewrap --key-in <that file>", keyFlag(out))
 	}
 	what := "nothing was changed: nothing was sealed under the new key"
 	if resumed {
 		what = "the key this run drew was never used"
 	}
 	if rerr := out.remove(); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
-		return fmt.Sprintf("%s; delete %s by hand: %v", what, keyPath, rerr)
+		return fmt.Sprintf("%s; delete the --key-out file by hand: %v", what, pathFailure("remove", "--key-out", rerr))
 	}
-	return fmt.Sprintf("%s, so %s was deleted", what, keyPath)
+	return fmt.Sprintf("%s, so the --key-out file was deleted", what)
 }
