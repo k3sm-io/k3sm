@@ -107,8 +107,10 @@ type keysHarness struct {
 	stdinTTY  bool
 	stdoutTTY bool
 	rand      io.Reader
-	stdout    bytes.Buffer
-	stderr    bytes.Buffer
+	// keyOutStep, when set, is the verb's keyOutStep seam.
+	keyOutStep func(string) error
+	stdout     bytes.Buffer
+	stderr     bytes.Buffer
 }
 
 func newKeysHarness(t *testing.T) *keysHarness {
@@ -149,12 +151,13 @@ func (h *keysHarness) run(args ...string) int {
 			}
 			return keysRecorder{keysStore: s, calls: &h.calls}
 		},
-		stdin:     h.stdin,
-		stdinTTY:  func() bool { return h.stdinTTY },
-		stdoutTTY: func() bool { return h.stdoutTTY },
-		rand:      h.rand,
-		stdout:    &h.stdout,
-		stderr:    &h.stderr,
+		stdin:      h.stdin,
+		stdinTTY:   func() bool { return h.stdinTTY },
+		stdoutTTY:  func() bool { return h.stdoutTTY },
+		rand:       h.rand,
+		keyOutStep: h.keyOutStep,
+		stdout:     &h.stdout,
+		stderr:     &h.stderr,
 	}
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") && args[0] != "help" {
 		args = append(slices.Clone(args), "--work-dir", h.work)
@@ -680,11 +683,13 @@ func TestKeysRewrap(t *testing.T) {
 		if !bytes.Equal(resumed.key, key) {
 			t.Fatalf("rewrap key %x, want %x", resumed.key, key)
 		}
-		if !strings.Contains(h.stderr.String(), "new key") {
-			t.Errorf("stderr %q does not say %q", h.stderr.String(), "new key")
+		if !strings.Contains(h.stderr.String(), "new key") || !strings.Contains(h.stderr.String(), "deleted") {
+			t.Errorf("stderr %q does not say to run again with a new key and that the unused one was deleted", h.stderr.String())
 		}
-		if _, err := os.Stat(p); err != nil {
-			t.Errorf("the key file is gone after a resumed rewrap: %v", err)
+		// No rewrap is recorded under the key this run drew, so no resume
+		// can use it.
+		if _, err := os.Lstat(p); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("the unused key file is kept after a resumed rewrap: %v", err)
 		}
 	})
 	for _, tc := range []struct {
@@ -698,7 +703,7 @@ func TestKeysRewrap(t *testing.T) {
 				t.Fatal(err)
 			}
 		}, keystore.ErrScopeUnsupported, "keystore/.user"},
-		{"an entry that does not open", func(t *testing.T, h *keysHarness) { h.damageRecord("a", "v1") }, keystore.ErrCorrupt, "--key-in"},
+		{"an entry that does not open", func(t *testing.T, h *keysHarness) { h.damageRecord("a", "v1") }, keystore.ErrCorrupt, "rm"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newKeysHarness(t)
@@ -713,8 +718,11 @@ func TestKeysRewrap(t *testing.T) {
 			if !strings.Contains(h.stderr.String(), tc.say) {
 				t.Errorf("stderr %q does not say %q", h.stderr.String(), tc.say)
 			}
-			if _, err := os.Stat(p); err != nil {
-				t.Errorf("the key file is gone after a failed rewrap: %v", err)
+			if !strings.Contains(h.stderr.String(), "nothing was changed") || strings.Contains(h.stderr.String(), "--key-in") {
+				t.Errorf("stderr %q does not say nothing was changed, or offers --key-in", h.stderr.String())
+			}
+			if _, err := os.Lstat(p); !errors.Is(err, fs.ErrNotExist) {
+				t.Errorf("the key file is kept after a rewrap that recorded nothing under it: %v", err)
 			}
 			if !bytes.Equal(h.masterFile(), before) {
 				t.Error("a refused rewrap swapped the master")
@@ -758,6 +766,119 @@ func TestKeysRewrap(t *testing.T) {
 			h.mustRun(2, tc.args...)
 		})
 	}
+}
+
+// keysCrashedRewrapStore stands in for a Rewrap that crashed after it
+// recorded its key: Rewrap leaves the master directory as that crash does
+// (stageInterruptedRewrap) and fails. The store's own crash points are
+// pkg/keystore's step seam, which no test outside that package reaches.
+type keysCrashedRewrapStore struct {
+	keysStore
+	h *keysHarness
+}
+
+func (s keysCrashedRewrapStore) Rewrap(_ context.Context, newMaster []byte) error {
+	s.h.stageInterruptedRewrap(newMaster)
+	return errors.New("rewrap: injected crash after master.next.sha256")
+}
+
+// TestKeysRewrapKeyOutFile: --key-out writes the new key only into a
+// directory owned by root (the running user) and closed to group and others
+// for writing; a write, sync or chmod that fails removes the partial file;
+// and after a failed rewrap the file is kept only while the store records an
+// interrupted rewrap under that key, which is when --key-in can finish it.
+func TestKeysRewrapKeyOutFile(t *testing.T) {
+	for _, mode := range []fs.FileMode{0o770, 0o707, 0o730} {
+		t.Run(fmt.Sprintf("refuses a parent dir at %04o", mode), func(t *testing.T) {
+			h := newKeysHarness(t)
+			h.put("system/a", []byte("a-value"))
+			before := h.masterFile()
+			dir := t.TempDir()
+			if err := os.Chmod(dir, mode); err != nil {
+				t.Fatal(err)
+			}
+			p := filepath.Join(dir, "new-master")
+			h.calls = nil
+			h.mustRun(1, "rewrap", "--key-out", p)
+			if _, err := os.Lstat(p); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("the key file was written into a shared directory: %v", err)
+			}
+			if slices.Contains(h.calls, "Rewrap") || !bytes.Equal(h.masterFile(), before) {
+				t.Fatal("rewrap ran")
+			}
+			if !strings.Contains(h.stderr.String(), "group or others") {
+				t.Errorf("stderr %q does not name the directory's mode", h.stderr.String())
+			}
+		})
+	}
+	t.Run("refuses a parent dir another user owns", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/a", []byte("a-value"))
+		// Non-root, / is root's, not the running user's; as root, a
+		// directory handed to the service user stands in.
+		dir := "/"
+		if keysAsRoot() {
+			dir = t.TempDir()
+			keysGiveToService(t, dir)
+		}
+		p := filepath.Join(dir, "k3sm-keys-test-new-master")
+		h.calls = nil
+		h.mustRun(1, "rewrap", "--key-out", p)
+		if _, err := os.Lstat(p); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("the key file was written: %v", err)
+		}
+		if slices.Contains(h.calls, "Rewrap") {
+			t.Fatal("rewrap ran")
+		}
+		if !strings.Contains(h.stderr.String(), "owned by") {
+			t.Errorf("stderr %q does not name the owner", h.stderr.String())
+		}
+	})
+	for _, step := range []string{"chmod", "write", "sync"} {
+		t.Run("removes the partial file when "+step+" fails", func(t *testing.T) {
+			h := newKeysHarness(t)
+			h.put("system/a", []byte("a-value"))
+			before := h.masterFile()
+			h.keyOutStep = func(s string) error {
+				if s == step {
+					return fmt.Errorf("injected %s failure", s)
+				}
+				return nil
+			}
+			p := filepath.Join(t.TempDir(), "new-master")
+			h.calls = nil
+			h.mustRun(1, "rewrap", "--key-out", p)
+			if _, err := os.Lstat(p); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("the partial key file is left: %v", err)
+			}
+			if slices.Contains(h.calls, "Rewrap") || !bytes.Equal(h.masterFile(), before) {
+				t.Fatal("rewrap ran")
+			}
+			if !strings.Contains(h.stderr.String(), "nothing was changed") {
+				t.Errorf("stderr %q does not say nothing was changed", h.stderr.String())
+			}
+		})
+	}
+	t.Run("keeps the file when a resume is possible", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/a", []byte("a-value"))
+		h.wrap = func(s keysStore) keysStore { return keysCrashedRewrapStore{keysStore: s, h: h} }
+		p := filepath.Join(t.TempDir(), "new-master")
+		h.mustRun(1, "rewrap", "--key-out", p)
+		got, err := os.ReadFile(p)
+		if err != nil || len(got) != 32 {
+			t.Fatalf("the key file after a crash that recorded its key: %x, %v", got, err)
+		}
+		if !strings.Contains(h.stderr.String(), "rewrap --key-in "+p) || strings.Contains(h.stderr.String(), "nothing was changed") {
+			t.Errorf("stderr %q does not say to finish with --key-in %s", h.stderr.String(), p)
+		}
+		// And that file finishes it.
+		h.wrap = nil
+		h.mustRun(0, "rewrap", "--key-in", p)
+		if !bytes.Equal(h.masterFile(), got) {
+			t.Fatalf("master %x, want the saved key %x", h.masterFile(), got)
+		}
+	})
 }
 
 // stageInterruptedRewrap leaves the master directory as a rewrap to key

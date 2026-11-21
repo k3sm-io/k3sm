@@ -26,6 +26,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/signal"
 	"os/user"
@@ -62,9 +63,11 @@ const keysUsage = `Usage:
   sudo k3sm keys rm system/<name> --yes
         delete the entry and every version; irreversible
   sudo k3sm keys rewrap --key-out FILE | --key-in FILE
-        re-seal every entry under a new master key. --key-out writes a fresh
-        key to FILE (a new file, mode 0600) before anything changes; keep it
-        until rewrap reports success, then delete it. --key-in FILE only
+        re-seal every entry under a new master key. --key-out writes the new
+        key k3sm mints to FILE (a new file, mode 0600, in a directory only
+        root can write, never a synced or Time Machine path) before anything
+        changes; keep it until rewrap reports success, then delete it. A
+        rewrap that fails with nothing recorded under the key deletes it. --key-in FILE only
         finishes an interrupted rewrap, with the key its --key-out saved: a
         key whose SHA-256 the interrupted rewrap did not record is refused
 
@@ -129,9 +132,13 @@ type keysEnv struct {
 	stdinTTY   func() bool
 	stdoutTTY  func() bool
 	// rand is where rewrap draws a new master key.
-	rand   io.Reader
-	stdout io.Writer
-	stderr io.Writer
+	rand io.Reader
+	// keyOutStep, when set, is called after each step of writing the
+	// --key-out file ("chmod", "write", "sync"); a non-nil return fails the
+	// write there, as the failing call would. Production leaves it nil.
+	keyOutStep func(step string) error
+	stdout     io.Writer
+	stderr     io.Writer
 }
 
 func defaultKeysEnv(stdout, stderr io.Writer) keysEnv {
@@ -615,8 +622,25 @@ func keysRm(ctx context.Context, args []string, env keysEnv) int {
 // writeKeyOut creates path as a new root-only file holding key: O_EXCL, so an
 // existing file or symlink there is refused rather than overwritten or
 // followed, mode 0600, and fsynced with its directory before rewrap uses it.
-func writeKeyOut(path string, key []byte) (err error) {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+// The directory must be owned by root (the running user, which requireRoot
+// made root) and closed to group and others for writing, judged on the
+// descriptor the file is created through, so no other user can swap or
+// unlink the file. A failure after the file is created removes it, so a
+// refusal never leaves a partial key behind.
+func writeKeyOut(path string, key []byte, step func(string) error) (err error) {
+	if step == nil {
+		step = func(string) error { return nil }
+	}
+	dir, base := filepath.Dir(path), filepath.Base(path)
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return fmt.Errorf("open the key file's directory: %w", err)
+	}
+	defer func() { _ = root.Close() }() // synced below when a file is written
+	if err := checkKeyOutDir(root, dir); err != nil {
+		return err
+	}
+	f, err := root.OpenFile(base, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return fmt.Errorf("create the key file: %w", err)
 	}
@@ -624,23 +648,54 @@ func writeKeyOut(path string, key []byte) (err error) {
 		if cerr := f.Close(); err == nil && cerr != nil {
 			err = fmt.Errorf("close the key file: %w", cerr)
 		}
+		if err != nil {
+			if rerr := root.Remove(base); rerr != nil {
+				err = fmt.Errorf("%w; and removing the partial key file failed, delete %s by hand: %w", err, path, rerr)
+			}
+		}
 	}()
 	if err := f.Chmod(0o600); err != nil {
 		return fmt.Errorf("chmod the key file: %w", err)
 	}
+	if err := step("chmod"); err != nil {
+		return err
+	}
 	if _, err := f.Write(key); err != nil {
 		return fmt.Errorf("write the key file: %w", err)
+	}
+	if err := step("write"); err != nil {
+		return err
 	}
 	if err := f.Sync(); err != nil {
 		return fmt.Errorf("sync the key file: %w", err)
 	}
-	d, err := os.Open(filepath.Dir(path))
+	if err := step("sync"); err != nil {
+		return err
+	}
+	d, err := root.Open(".")
 	if err != nil {
 		return fmt.Errorf("open the key file's directory: %w", err)
 	}
 	defer func() { _ = d.Close() }() // read-only; synced below
 	if err := d.Sync(); err != nil {
 		return fmt.Errorf("sync the key file's directory: %w", err)
+	}
+	return nil
+}
+
+// checkKeyOutDir refuses a --key-out directory that is not owned by the
+// running user (root) or that group or others can write.
+func checkKeyOutDir(root *os.Root, dir string) error {
+	fi, err := root.Stat(".")
+	if err != nil {
+		return fmt.Errorf("stat the key file's directory: %w", err)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	switch {
+	case !ok || int64(st.Uid) != int64(os.Geteuid()):
+		return fmt.Errorf("the key file's directory %s is not owned by this user (root): name a directory only root can write", dir)
+	case fi.Mode().Perm()&0o022 != 0:
+		return fmt.Errorf("the key file's directory %s is mode %04o, writable by group or others: name a directory only root can write", dir, fi.Mode().Perm())
 	}
 	return nil
 }
@@ -736,7 +791,7 @@ func keysRewrap(ctx context.Context, args []string, env keysEnv) int {
 			clear(key)
 			return v.failf(keysRefused, "draw a new master key: %v", err)
 		}
-		if err := writeKeyOut(keyPath, key); err != nil {
+		if err := writeKeyOut(keyPath, key, env.keyOutStep); err != nil {
 			clear(key)
 			return v.failf(keysRefused, "%v; nothing was changed", err)
 		}
@@ -744,18 +799,45 @@ func keysRewrap(ctx context.Context, args []string, env keysEnv) int {
 	}
 	defer clear(key)
 	err = s.Rewrap(ctx, key)
-	switch {
-	case err == nil:
+	if err == nil {
 		fmt.Fprintf(env.stdout, "rewrap complete: every entry is sealed under the new master key.\n"+
 			"Now delete %s.\n"+
 			"Backups of the keystore taken before this rewrap no longer open: back up the entries and the master key again.\n"+
 			"Fingerprints of opaque entries have changed.\n", keyPath)
 		return keysOK
-	case errors.Is(err, keystore.ErrRewrapResumed):
-		return v.failf(keysResumed, "%v\nrun rewrap again with a new key: sudo k3sm keys rewrap --key-out <new file>. Keep %s until a rewrap reports success.", err, keyPath)
-	case errors.Is(err, keystore.ErrScopeUnsupported):
-		return v.failf(keysRefused, "%v", err)
-	default:
-		return v.failf(keysRefused, "%v\nkeep %s: if any entry was re-sealed, finish with the same key: sudo k3sm keys rewrap --key-in %s", err, keyPath, keyPath)
 	}
+	resumed := errors.Is(err, keystore.ErrRewrapResumed)
+	code, next := keysRefused, ""
+	if resumed {
+		code, next = keysResumed, "\nrun rewrap again with a new key: sudo k3sm keys rewrap --key-out <new file>."
+	}
+	return v.failf(code, "%v%s\n%s", err, next, keyFileAfterFailure(ctx, s, key, keyPath, *keyOut != "", resumed))
+}
+
+// keyFileAfterFailure decides, after a rewrap that did not succeed, what
+// becomes of the key file, and says so. The file is kept only while the store
+// records an interrupted rewrap under its key, which is when --key-in can
+// finish that rewrap; a file this run wrote (--key-out) that no rewrap
+// recorded is deleted, since nothing is sealed under its key. A --key-in file
+// is the operator's and is never deleted.
+func keyFileAfterFailure(ctx context.Context, s keysStore, key []byte, keyPath string, wrote, resumed bool) string {
+	recorded, ok, err := s.InterruptedRewrap(ctx)
+	if err != nil {
+		return fmt.Sprintf("keep %s: whether a rewrap is recorded under it could not be checked (%v)", keyPath, err)
+	}
+	sum := sha256.Sum256(key)
+	if ok && subtle.ConstantTimeCompare(sum[:], recorded[:]) == 1 {
+		return fmt.Sprintf("keep %s: a resume is possible, so finish with the same key: sudo k3sm keys rewrap --key-in %s", keyPath, keyPath)
+	}
+	if !wrote {
+		return fmt.Sprintf("no rewrap is recorded under the key in %s, so --key-in cannot use it", keyPath)
+	}
+	what := "nothing was changed: no rewrap is recorded under the new key"
+	if resumed {
+		what = "the key this run drew was never used"
+	}
+	if err := os.Remove(keyPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Sprintf("%s; delete %s by hand: %v", what, keyPath, err)
+	}
+	return fmt.Sprintf("%s, so %s was deleted", what, keyPath)
 }
