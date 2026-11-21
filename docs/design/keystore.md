@@ -1610,11 +1610,14 @@ real authorizer.
 Encryption-off refusal (G18) applies unchanged, as `EncryptionOff`.
 
 **What a definitive SubjectAccessReview denial is.** A review's answer is a definitive denial
-only when all three hold: `status.allowed` is `false`, `status.evaluationError` is empty, and
-the answer is not the no-opinion shape, `status.denied` `false` with an empty `status.reason`.
-Every other answer is `Indeterminate`: an allow is an allow, an evaluation error says the
-authorizer could not decide, and no opinion says no authorizer decided. Two more conditions
-guard a denial before it deletes anything:
+only when the call succeeded, `status.allowed` is `false` and `status.evaluationError` is
+empty, whatever `status.denied` says. The API server returns the union verdict of its
+authorizer chain, and the RBAC authorizer never sets `denied`: it refuses by returning no
+opinion, which the chain reports as `allowed=false`. Reading `denied=false` as "no opinion"
+would mean that under the default `Node,RBAC` chain a removed RoleBinding never deletes a
+Secret. Every other answer is `Indeterminate`: a failed call, a non-empty `evaluationError`
+(the authorizer could not decide), and any response before the readiness gate below. Two more
+conditions guard a denial before it deletes anything:
 
 - **No sweep before the API server is ready.** The reconciler runs no sweep until the API
   server's `readyz` answers ready and its own RBAC informers (Roles, RoleBindings,
@@ -1635,19 +1638,22 @@ is closed:
    opened and authenticated;
 3. a digest mismatch: the digest recomputed from the live object differs from the one in a
    record that opened and authenticated;
-4. a definitive SubjectAccessReview denial, as defined above, on two consecutive sweeps.
+4. a definitive SubjectAccessReview denial, as defined above, on two consecutive sweeps;
+5. the store's typed `ErrScopeOwnerChanged` (`errors.Is(err, keystore.ErrScopeOwnerChanged)`):
+   the account is deleted or its uid reused, as the GeneratedUID binding shows.
 
 **Every other outcome is `Indeterminate`**, whatever it is: `ErrCorrupt` (the floor refusal
 included, which wraps it), `ErrMasterMissing`, `ErrScopeUnsupported`, `ErrBusy`, `ErrLogFull`,
-`ErrScopeOwnerUnknown` (the GeneratedUID lookup past its deadline), `ErrScopeOwnerChanged`, a
+`ErrScopeOwnerUnknown` (the GeneratedUID lookup past its deadline), a
 cancelled or expired ctx, the store's refusal to read while an audit append fails (U32), a
 delivery record whose version it does not know, a SubjectAccessReview call that fails or an
 answer that is not a definitive denial, a denial seen on one sweep only, any other API server
 error, and any error this list does not name, including one a later change adds. The rule is
 written as an allow-list so that a new sentinel is safe by default: it deletes nothing until a
-change adds it here. `ErrScopeOwnerChanged` is on the safe side too: the Secret of a deleted
-account stays until root's `rm-scope` removes the scope, after which the entry answers
-`ErrNotFound`. A UID absent from a readable record is `NotRecorded` and gets no Secret written,
+change adds it here. `ErrScopeOwnerChanged` is a definitive outcome, not a read failure: the
+old owner's credential must not stay delivered in pods after the account is gone or a new
+person holds the uid, so it deletes beside `ErrNotFound`. `ErrScopeOwnerUnknown` is a lookup
+failure and stays `Indeterminate`. A UID absent from a readable record is `NotRecorded` and gets no Secret written,
 but it is not on the list, so it deletes nothing.
 
 **Absence is told apart from an unreadable store only by `ErrNotFound`.** The store answers
@@ -2010,7 +2016,7 @@ each stated in the change that makes it. U15 is held for a K0 amendment and U39 
 | U52 | every root verb writes one audit line with `via` `root` once the log exists, and none before it | `k3sm/cmd/k3sm::TestEveryRootVerbWritesAuditLine` | pending: the append-only files |
 | U53 | every reconciler Secret write and delete, and every record withdrawal, writes one audit line with `via` `reconciler` | `k3sm/pkg/keystore/reconcile::TestEveryReconcilerWriteAndDeleteAudited` | pending: the KeyDelivery reconciler (lifecycle) |
 | U54 | a pre-frame refusal (uid 0, the service uid, a uid below 501) writes a `refused` line with the peer uid, rate-limited per uid with a dropped-count summary | `k3sm/pkg/keystore/socket::TestPreFrameRefusalsAudited`, `TestPreFrameRefusalLinesRateLimited` | pending: the socket listener |
-| U55 | a transient lookup, SAR or apiserver error leaves the Secret and sets Unknown: a failed SAR call, an API server error, `ErrScopeOwnerUnknown`, `ErrBusy` and `ErrLogFull` each leave the Secret, the record entry and the finalizer, set `Authorized=Unknown` with reason `Indeterminate`, and retry with backoff; a SAR answer is a definitive denial only with `allowed=false`, an empty `evaluationError` and not the no-opinion shape (`denied=false`, empty `reason`), and each other answer is `Indeterminate`; no sweep runs before `readyz` and the RBAC informers' sync; a definitive denial deletes only when two consecutive sweeps see it for the same generation; only the allow-list (`ErrNotFound` for the entry, a withdrawn record, a digest mismatch on a readable record, a definitive SAR denial) deletes, and a table over every store sentinel (`ErrCorrupt`, the floor refusal, `ErrMasterMissing`, `ErrScopeUnsupported`, `ErrBusy`, `ErrLogFull`, `ErrScopeOwnerUnknown`, `ErrScopeOwnerChanged`), a cancelled ctx, the audit read refusal, an unknown record version and an unlisted error finds each `Indeterminate` | `k3sm/pkg/keystore/reconcile::TestTransientErrorLeavesSecretSetsUnknown`, `TestSARNoOpinionOrEvaluationErrorIsIndeterminate`, `TestNoSweepBeforeReady`, `TestDenialNeedsTwoSweeps`, `TestEverySentinelBesidesNotFoundIsIndeterminate` | pending: the KeyDelivery reconciler (lifecycle) |
+| U55 | a transient lookup, SAR or apiserver error leaves the Secret and sets Unknown: a failed SAR call, an API server error, `ErrScopeOwnerUnknown`, `ErrBusy` and `ErrLogFull` each leave the Secret, the record entry and the finalizer, set `Authorized=Unknown` with reason `Indeterminate`, and retry with backoff; a SAR answer is a definitive denial when the call succeeded, `allowed=false` and `evaluationError` is empty, whatever `denied` says (the RBAC authorizer refuses with no opinion, reported as `allowed=false`), and each other answer is `Indeterminate`; no sweep runs before `readyz` and the RBAC informers' sync; a definitive denial deletes only when two consecutive sweeps see it for the same generation; only the allow-list (`ErrNotFound` for the entry, `ErrScopeOwnerChanged`, a withdrawn record, a digest mismatch on a readable record, a definitive SAR denial) deletes, and a table over every store sentinel (`ErrCorrupt`, the floor refusal, `ErrMasterMissing`, `ErrScopeUnsupported`, `ErrBusy`, `ErrLogFull`, `ErrScopeOwnerUnknown`), a cancelled ctx, the audit read refusal, an unknown record version and an unlisted error finds each `Indeterminate` | `k3sm/pkg/keystore/reconcile::TestTransientErrorLeavesSecretSetsUnknown`, `TestSAREvaluationErrorIsIndeterminate`, `TestSARAllowedFalseWithoutErrorIsDenial`, `TestNoSweepBeforeReady`, `TestDenialNeedsTwoSweeps`, `TestScopeOwnerChangedDeletes`, `TestEverySentinelBesidesNotFoundAndOwnerChangedIsIndeterminate` | pending: the KeyDelivery reconciler (lifecycle) |
 | U56 | a delivery record with an unknown format version is refused by the store and read by the reconciler as `Indeterminate`, never as a denial: no Secret is deleted | `k3sm/pkg/keystore::TestDeliveryRecordUnknownVersionRefused`, `k3sm/pkg/keystore/reconcile::TestUnknownRecordVersionIsIndeterminate` | pending: the KeyDelivery reconciler (lifecycle) |
 | U57 | `apis/keystore/entry` imports only the standard library, exports the pattern, the `maxLength` and the parse, and holds the shared vector table, which it passes | `apis/keystore/entry::TestGrammarVectors`, `TestImportsStdlibOnly` | pending: the entry grammar in `apis` |
 | U58 | seam guard, repo level: the seam-bearing packages are a closed list (`pkg/keystore`, `pkg/keystore/socket`, `pkg/keystore/reconcile`, `cmd/k3sm`, `pkg/install`); each listed package has its `TestMain` stub install and its `TestRealPrimitivesUnreachable`, a missing guard fails, and a package outside the list that declares a seam fails; fakes restore through `t.Cleanup` | `k3sm/pkg/keystore::TestEverySeamPackageHasAGuard` | pending: the user-scope store, its list extended by each change that adds a seam package |
