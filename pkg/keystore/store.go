@@ -89,8 +89,8 @@ type Config struct {
 	// pointer floor, keystore-floor.json.
 	DataRoot string
 	// FloorUID and FloorGID name the owner of the data root and the floor.
-	// Production leaves them 0 (root); only tests set them, as a non-root
-	// test cannot make a root-owned file.
+	// They are for tests only: production leaves them 0 (root), and only a
+	// non-root test, which cannot make a root-owned file, sets them.
 	//
 	// A negative value, or a nonzero one in a process whose effective uid is
 	// 0, makes every operation fail: root's floor belongs to root.
