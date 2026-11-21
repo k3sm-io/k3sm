@@ -101,13 +101,23 @@ k3sm never prints the key. Before it changes anything, it writes the new key to 
 not exist yet: it is created new, readable by root only (mode 0600), and an existing file or link
 at that path is refused.
 
-Keep that file until `rewrap` reports success, then delete it. If `rewrap` is interrupted or fails
-partway, some entries may already be sealed under the new key, and that file is the only copy of
-it. Finish with the same key:
+Name a file in a directory only root can write, such as a new `sudo mkdir -m 700` directory. The
+verb refuses a directory that is not root's or that group or others can write. Keep the file out
+of any synced folder (iCloud Drive, Dropbox and the like) and out of Time Machine's reach, since a
+copy there outlives the rewrap.
+
+Keep that file until `rewrap` reports success, then delete it. If `rewrap` fails before anything is
+recorded under the new key, it deletes the file itself and says nothing was changed. If it is
+interrupted or fails partway, some entries may already be sealed under the new key, and that file
+is the only copy of it. `rewrap` then keeps the file, says a resume is possible, and you finish
+with the same key:
 
 ```
 sudo k3sm keys rewrap --key-in FILE
 ```
+
+`--key-in` is for that recovery only. It refuses any key whose fingerprint is not the one the
+interrupted rewrap recorded, so it never makes a key you made yourself the master key.
 
 If `rewrap` exits 3, it found an earlier rewrap that had been interrupted, finished that one with
 its key, and stopped. Run `rewrap --key-out` again with a new file.
@@ -133,6 +143,9 @@ leaks does not come with the key that opens it. They are still a matched pair: e
 with the master key that was current when they were saved, so take both again after every
 `rewrap`.
 
+Your datastore backups copy `/var/lib/k3sm/server/cred`, which holds the master key directory too.
+Exclude `cred/keystore-master/` from them, and back the master key up on its own, as below.
+
 To save, while no `k3sm keys` verb is running (`ditto` keeps owners and modes):
 
 ```
@@ -141,16 +154,25 @@ sudo ditto /var/lib/k3sm/server/cred/keystore-master /other/place/keystore-maste
 sudo cp -p /var/lib/k3sm/keystore-floor.json /path/to/backup/
 ```
 
-To restore the same backup, for example after deleting an entry by mistake:
+To restore the same backup, for example after deleting an entry by mistake, move the live copy
+aside rather than deleting it, so a bad restore can be undone:
 
 ```
-sudo rm -rf /var/lib/k3sm/server/keystore
+sudo k3sm stop
+sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/server/keystore.pre-restore
 sudo ditto /path/to/backup/keystore /var/lib/k3sm/server/keystore
+sudo k3sm start
 sudo k3sm keys list
 ```
 
+Only when `list` shows every entry `ok`, delete the copy you moved aside:
+
+```
+sudo rm -rf /var/lib/k3sm/server/keystore.pre-restore
+```
+
 The values come back byte for byte: `show --reveal` prints exactly what it printed before. Restore
-the master key the same way if it was lost too.
+the master key the same way, from its own backup, if it was lost too.
 
 ### Restoring an older keystore/
 
@@ -159,12 +181,14 @@ If you restore a backup that is older than the live keystore, for example from b
 doing its job: it cannot tell your restore from someone putting an old copy back. If the restore
 is deliberate:
 
-1. Restore `keystore/` and the master key that matches it.
-2. Stop the server: `sudo k3sm stop`.
+1. Stop the server: `sudo k3sm stop`.
+2. Move the live `keystore/` aside, as above, and restore `keystore/` and the master key that
+   matches it.
 3. Remove root's record: `sudo rm /var/lib/k3sm/keystore-floor.json`.
 4. Run any keys verb, such as `sudo k3sm keys list`. It writes the record again from the restored
    entries.
 5. Start the server: `sudo k3sm start`.
+6. Once `sudo k3sm keys list` shows every entry `ok`, delete the copy you moved aside.
 
 Only remove the record when you know the restored entries are the ones you want current, since
 the next keys verb accepts them as the newest.

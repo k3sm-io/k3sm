@@ -19,6 +19,11 @@ If the cluster was installed with secrets encryption, back up `/var/lib/k3sm/ser
 every backup and snapshot: neither contains the key, and without it the Secrets are unreadable. See
 [Secrets Encryption at Rest](install.md#secrets-encryption-at-rest).
 
+`cred/` also holds `cred/keystore-master/`, the master key of the keystore that `k3sm keys`
+manages. Exclude `cred/keystore-master/` from your datastore backups and back the master key up
+separately, away from the entries it opens; see
+[Keys: Backing up and restoring](keys.md#backing-up-and-restoring).
+
 ## Taking a Backup with `k3sm snapshot save`
 
 ```sh
@@ -441,7 +446,10 @@ possible and its **soak** validation is still pending. Factor that into recovery
 
 ## Restoring an older keystore/
 
-The keystore that `k3sm keys` manages is not in datastore snapshots and is backed up on its own.
+The keystore that `k3sm keys` manages is not in datastore snapshots and is backed up on its own,
+with its master key kept apart from the entries. A restore stops the server, moves the live
+`keystore/` aside rather than deleting it, puts the backup in place with `ditto`, starts the
+server, and checks `sudo k3sm keys list` before the moved-aside copy is deleted.
 A restored `keystore/` older than the live one is refused until root removes
 `/var/lib/k3sm/keystore-floor.json`. The steps are in
 [Keys: Restoring an older keystore/](keys.md#restoring-an-older-keystore), and how to save and
