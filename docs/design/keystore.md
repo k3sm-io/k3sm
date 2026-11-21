@@ -1099,7 +1099,7 @@ Phase A's paths are unchanged. Added:
       .user/                            NEW: 0700, service user (the reserved name)
         <uid>/                          NEW: 0700, service user, one per user who has stored anything
           scope.key                     sealed record, kind 0xFE: the user's scope key, wrapped
-          deliveries                    sealed record, kind 0xFD: per delivery, its UID, target tuple and target digest
+          deliveries                    sealed record, kind 0xFD: per delivery, its UID, object name, target tuple and target digest
           entries/                      NEW: 0700, service user, the scope's entries and nothing else
             <name>/ generation v1 … current  same shape as a system entry, sealed under the scope key
 ```
@@ -1232,10 +1232,11 @@ deleted and their deliveries withdrawn, and the user declares them again with `d
 
 **The `deliveries` record has its own bound.** It is exempt from the store's 64 KiB value cap
 and holds at most 320 entries: 64 live entries plus 256 withdrawn tombstones. An entry is at
-most 1 KiB: the UID (36 bytes), the target tuple (`entry` at most 269 bytes, `namespace` 63,
-`secretName` 253, `dataKey` 253, `requestedBy` 21), the 32-byte digest, a state byte and six
-4-byte length prefixes, 952 bytes in all. So the record's plaintext is at most 320 KiB plus a
-16-byte header, and the store refuses to read or write a sealed record over 336 KiB.
+most 1,280 bytes: the UID (36 bytes), the KeyDelivery's `metadata.name` (at most 253), the
+target tuple (`entry` at most 269 bytes, `namespace` 63, `secretName` 253, `dataKey` 253,
+`requestedBy` 21), the 32-byte digest, a state byte and seven 4-byte length prefixes, 1,209
+bytes in all. So the record's plaintext is at most 400 KiB plus a 16-byte header, and the
+store refuses to read or write a sealed record over 416 KiB.
 
 - *`deliver` is refused at the bound.* It adds an entry, and answers `quota` when the record
   has 64 live entries or 320 in all.
@@ -2037,7 +2038,7 @@ nil object becomes CEL `null` (`pkg/admission/conversion.go:137`, read into `obj
   API server's own RBAC then decides whether that principal may create `keydeliveries` in
   `NS`.
 - After the create, the server appends to the caller's sealed `deliveries` record (kind
-  0xFD, under the user-scope floor) the object's `metadata.uid`, the full **target tuple**
+  0xFD, under the user-scope floor) the object's `metadata.uid` and `metadata.name`, the full **target tuple**
   (`entry`, `namespace`, `secretName`, `dataKey`, `requestedBy`), all under the record's seal,
   and the **target digest**
   `sha256("k3sm-keystore-delivery-target/v1" ‖ LP(entry) ‖ LP(namespace) ‖ LP(secretName) ‖
@@ -2106,9 +2107,10 @@ Secret. Every other answer is `Indeterminate`: a failed call, a non-empty `evalu
 conditions guard a denial before it deletes anything:
 
 - **No sweep before the API server is ready.** The reconciler runs no sweep until the API
-  server's `readyz` answers ready and its own RBAC informers (Roles, RoleBindings,
-  ClusterRoles, ClusterRoleBindings) report synced. An authorizer that has not loaded its rules
-  can deny what it would allow a moment later.
+  server's `readyz` answers ready and its own informers report synced: the RBAC ones (Roles,
+  RoleBindings, ClusterRoles, ClusterRoleBindings) and the KeyDelivery and Secret informers. An
+  authorizer that has not loaded its rules can deny what it would allow a moment later, and an
+  informer that has not synced can show an object missing that exists.
 - **Every deleting outcome counts only twice in a row.** This holds for every outcome on the
   allow-list below, not only for a denial. A deleting outcome for one KeyDelivery deletes
   nothing on the sweep that first sees it. It deletes only when the next sweep again sees a
@@ -2300,6 +2302,16 @@ the record are not enough, and neither is a recorded UID on a Secret that is not
 target; an unlabelled or foreign Secret is never touched, and a Get that
 fails is an error, not a denial (U44, U72, E11, E14).
 
+- *The sweep asks the API server, by name.* The record stores each delivery's KeyDelivery
+  `metadata.name` beside its UID, so the sweep's existence check is a live Get of
+  `keydeliveries/<recorded name>` in the recorded namespace, sent to the API server. It never
+  reads an informer cache and never infers absence from a List: a cache that has not caught up,
+  or a List that was cut short, would show a live object as gone.
+- *Gone is a deleting outcome like any other.* A Get that answers not found, or returns an
+  object with another UID, counts only on two consecutive observations at least 60 s apart
+  ("Deleting observations are spaced in time"); any other answer in between resets the count
+  (U98).
+
 **An unopenable or removed scope counts as withdrawn for the finalizer.** The finalizer's
 middle step withdraws the record entry. When the owner changed (`ErrScopeOwnerChanged`), the
 record is read without the GeneratedUID check only to find the Secret to delete ("An owner
@@ -2358,7 +2370,7 @@ never acts by path where the service user can write"):
 - a symlink, a FIFO, a socket, a device or any non-regular file is refused, and so is a
   directory anywhere but where the layout puts one (`.user/`, `.user/<uid>/`, `entries/`,
   `entries/<name>/`); the verb stops and changes nothing further;
-- every read is bounded: a record at the store's maximum record size (336 KiB for the
+- every read is bounded: a record at the store's maximum record size (416 KiB for the
   `deliveries` record, "Quotas"), a `generation` file at
   its fixed size, a directory listing at the store's entry bound; a longer file is refused;
 - after each open the verb re-checks with `fstat` and `SameFile` that the descriptor is the
@@ -2747,7 +2759,7 @@ record below.
 | U52 | every root verb writes one audit line with `via` `root` once the log exists, and none before it | `k3sm/cmd/k3sm::TestEveryRootVerbWritesAuditLine` | pending: the append-only files |
 | U53 | every reconciler Secret write and delete, and every record withdrawal, writes one audit line with `via` `reconciler`, except drift repairs, coalesced to one line per delivery per 10 minutes (U86) | `k3sm/pkg/keystore/reconcile::TestEveryReconcilerWriteAndDeleteAudited` | pending: the KeyDelivery reconciler (lifecycle) |
 | U54 | a pre-frame refusal (uid 0, the service uid, a uid below 501) writes a `refused` line with the peer uid, rate-limited per uid with a dropped-count summary | `k3sm/pkg/keystore/socket::TestPreFrameRefusalsAudited`, `TestPreFrameRefusalLinesRateLimited` | pending: the socket listener |
-| U55 | a transient lookup, SAR or apiserver error leaves the Secret and sets Unknown: a failed SAR call, an API server error, `ErrScopeOwnerUnknown`, `ErrBusy` and `ErrLogFull` each leave the Secret, the record entry and the finalizer, set `Authorized=Unknown` with reason `Indeterminate`, and retry with backoff; a SAR answer is a definitive denial when the call succeeded, `allowed=false` and `evaluationError` is empty, whatever `denied` says (the RBAC authorizer refuses with no opinion, reported as `allowed=false`), and each other answer is `Indeterminate`; no sweep runs before `readyz` and the RBAC informers' sync; every deleting outcome, not only a denial, deletes only when two consecutive sweeps see it for the same generation; only the allow-list (`ErrNotFound` for an entry missing from a scope that opened, `ErrScopeOwnerChanged`, a withdrawn record, a digest mismatch on a readable record, a definitive SAR denial) deletes, and a table over every store sentinel (`ErrScopeAbsent`, `ErrCorrupt`, the floor refusal, `ErrMasterMissing`, `ErrScopeUnsupported`, `ErrBusy`, `ErrLogFull`, `ErrScopeOwnerUnknown`), a cancelled ctx, the audit read refusal, an unknown record version and an unlisted error finds each `Indeterminate`; against the real store, on `ErrScopeOwnerChanged` the reconciler reads the `deliveries` record under `W` without the GeneratedUID check only to find recorded targets, deletes them by the target-matching rule, and never delivers, rotates or opens an entry | `k3sm/pkg/keystore/reconcile::TestTransientErrorLeavesSecretSetsUnknown`, `TestSAREvaluationErrorIsIndeterminate`, `TestSARAllowedFalseWithoutErrorIsDenial`, `TestNoSweepBeforeReady`, `TestDenialNeedsTwoSweeps`, `TestScopeOwnerChangedDeletes`, `TestEverySentinelBesidesNotFoundAndOwnerChangedIsIndeterminate`, `TestScopeOwnerChangedDeletesAgainstRealStore` | pending: the KeyDelivery reconciler (lifecycle) |
+| U55 | a transient lookup, SAR or apiserver error leaves the Secret and sets Unknown: a failed SAR call, an API server error, `ErrScopeOwnerUnknown`, `ErrBusy` and `ErrLogFull` each leave the Secret, the record entry and the finalizer, set `Authorized=Unknown` with reason `Indeterminate`, and retry with backoff; a SAR answer is a definitive denial when the call succeeded, `allowed=false` and `evaluationError` is empty, whatever `denied` says (the RBAC authorizer refuses with no opinion, reported as `allowed=false`), and each other answer is `Indeterminate`; no sweep runs before `readyz` and the sync of the RBAC, KeyDelivery and Secret informers; every deleting outcome, not only a denial, deletes only when two consecutive sweeps see it for the same generation; only the allow-list (`ErrNotFound` for an entry missing from a scope that opened, `ErrScopeOwnerChanged`, a withdrawn record, a digest mismatch on a readable record, a definitive SAR denial) deletes, and a table over every store sentinel (`ErrScopeAbsent`, `ErrCorrupt`, the floor refusal, `ErrMasterMissing`, `ErrScopeUnsupported`, `ErrBusy`, `ErrLogFull`, `ErrScopeOwnerUnknown`), a cancelled ctx, the audit read refusal, an unknown record version and an unlisted error finds each `Indeterminate`; against the real store, on `ErrScopeOwnerChanged` the reconciler reads the `deliveries` record under `W` without the GeneratedUID check only to find recorded targets, deletes them by the target-matching rule, and never delivers, rotates or opens an entry | `k3sm/pkg/keystore/reconcile::TestTransientErrorLeavesSecretSetsUnknown`, `TestSAREvaluationErrorIsIndeterminate`, `TestSARAllowedFalseWithoutErrorIsDenial`, `TestNoSweepBeforeReady`, `TestDenialNeedsTwoSweeps`, `TestScopeOwnerChangedDeletes`, `TestEverySentinelBesidesNotFoundAndOwnerChangedIsIndeterminate`, `TestScopeOwnerChangedDeletesAgainstRealStore` | pending: the KeyDelivery reconciler (lifecycle) |
 | U56 | a delivery record with an unknown format version is refused by the store and read by the reconciler as `Indeterminate`, never as a denial: no Secret is deleted | `k3sm/pkg/keystore::TestDeliveryRecordUnknownVersionRefused`, `k3sm/pkg/keystore/reconcile::TestUnknownRecordVersionIsIndeterminate` | pending: the KeyDelivery reconciler (lifecycle) |
 | U57 | `apis/keystore/entry` imports only the standard library, exports the pattern, the `maxLength` and the parse, and holds the shared vector table, which it passes | `apis/keystore/entry::TestGrammarVectors`, `TestImportsStdlibOnly` | pending: the entry grammar in `apis` |
 | U58 | seam guard, repo level: the seam-bearing packages are a closed list (`pkg/keystore`, `pkg/keystore/socket`, `pkg/keystore/reconcile`, `cmd/k3sm`, `pkg/install`); each listed package has its `TestMain` stub install and its `TestRealPrimitivesUnreachable`, a missing guard fails, and a package outside the list that declares a seam fails; fakes restore through `t.Cleanup` | `k3sm/pkg/keystore::TestEverySeamPackageHasAGuard` | pending: the user-scope store, its list extended by each change that adds a seam package |
@@ -2788,8 +2800,9 @@ record below.
 | U93 | the sweep period is 30 s by default; two consecutive deleting observations count only when at least 60 s apart on the clock seam, however many sweeps run between them | `k3sm/pkg/keystore/reconcile::TestDeletingObservationsSpacedOnClock` | pending: the KeyDelivery reconciler (lifecycle) |
 | U94 | `withdraw` opens the caller's scope and so runs the GeneratedUID check: a reused uid with a changed GeneratedUID gets `scope-owner-changed` and deletes nothing (seams: GeneratedUID lookup, peer-credential source) | `k3sm/pkg/keystore/socket::TestWithdrawChecksGeneratedUID` | pending: KeyDelivery authoring |
 | U95 | `rm-scope` lists every RoleBinding and ClusterRoleBinding with the subject `k3sm:local:<uid>` and refuses, changing nothing, unless none exist or `--keep-bindings` is given | `k3sm/cmd/k3sm::TestRmScopeRefusesWithBindings` | pending: the KeyDelivery reconciler (lifecycle) |
-| U96 | the `deliveries` record is exempt from the 64 KiB value cap and bounded at 64 live entries plus 256 withdrawn tombstones, 1 KiB an entry, 336 KiB sealed; at the bound `deliver` answers `quota` and a withdrawal still succeeds, in place; a tombstone is pruned only after its Secret is seen gone (Get not found) on two sweeps at least 60 s apart | `k3sm/pkg/keystore/reconcile::TestDeliveriesRecordBoundAndPrune`, `TestRevocationNeverRefusedAtRecordBound` | pending: the KeyDelivery reconciler (lifecycle) |
+| U96 | the `deliveries` record is exempt from the 64 KiB value cap and bounded at 64 live entries plus 256 withdrawn tombstones, 1,280 bytes an entry, 416 KiB sealed; at the bound `deliver` answers `quota` and a withdrawal still succeeds, in place; a tombstone is pruned only after its Secret is seen gone (Get not found) on two sweeps at least 60 s apart | `k3sm/pkg/keystore/reconcile::TestDeliveriesRecordBoundAndPrune`, `TestRevocationNeverRefusedAtRecordBound` | pending: the KeyDelivery reconciler (lifecycle) |
 | U97 | when `rotate` answers `ErrQuota`, `rm` then `put` recovers: `rm` frees every version and `put` stores the value as version 1 of a new generation; the `quota` error names that recovery | `k3sm/pkg/keystore::TestRotateQuotaRecoveredByRmThenPut` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
+| U98 | the sealed `deliveries` record stores each delivery's KeyDelivery `metadata.name`; the orphan sweep checks the object with a live Get by that name sent to the API server, never an informer cache and never a List; not found, or another UID, deletes only on two consecutive observations at least 60 s apart, and any other answer in between resets the count; no sweep runs before the KeyDelivery and Secret informers sync | `k3sm/pkg/keystore/reconcile::TestOrphanSweepUsesLiveGetByName`, `TestOrphanSweepNeedsTwoObservations` | pending: the KeyDelivery reconciler (lifecycle) |
 
 ### Rig legs
 
