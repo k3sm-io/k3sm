@@ -35,10 +35,10 @@ import (
 // This file is the record layer: the binary encoding of a sealed record, the
 // associated data that binds it to its place, and the seal and open under
 // AES-256-GCM. docs/design/keystore.md § "Record encoding" is its
-// specification. Seal, Open and the length-prefixed field encoding are ported
-// from internal/seal/seal.go in github.com/netstar-labs/keystore (Apache-2.0),
-// with that package's KDF-parameter associated data replaced by the six
-// fields below.
+// specification. Seal, Open and the length-prefixed field encoding are adapted
+// from the author's own internal/seal/seal.go in
+// github.com/netstar-labs/keystore (Apache-2.0), with that package's
+// KDF-parameter associated data replaced by the six fields below.
 
 const (
 	// recordFormat is the record-format version every record carries in its
