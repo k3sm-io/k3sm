@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # The keystore's acceptance gate: docs/design/keystore.md § "Acceptance gate",
-# rows G1 to G22, the user-scope rows U1 to U112 (U15 and U39 are unused) and
+# rows G1 to G22, the user-scope rows U1 to U113 (U15 and U39 are unused) and
 # the rig legs E1 to E25. Every row is listed, on exactly one line. A row runs
 # the tests that deliver it and passes only if each named test ran and passed
 # in its own package; a row whose change has not landed yet prints PENDING,
@@ -37,7 +37,7 @@
 #   --scope-store   the user-scope store: U12 to U14, U63, U97, U101.
 #   --files         the append-only files: U20 to U25, U50, U52, U60, U61, U68,
 #                   U80, U88, U90, U91, U99, U105, and in the helper variant only U70, U71.
-#   --socket        the socket listener: U26 to U31, U46, U48, U54, U82, U104.
+#   --socket        the socket listener: U26 to U31, U46, U48, U54, U82, U104, U113.
 #   --socket-ops    the socket operations: U32 to U35, U45, U51, U67, U84, U112.
 #   --exec          the non-root CLI and exec: U36 to U38, U69, U92.
 #   --kd-author     KeyDelivery authoring: U40, U41, U74, U76, U87, U94.
@@ -124,6 +124,7 @@ EXPECTED_ROWS="$EXPECTED_ROWS U109"
 EXPECTED_ROWS="$EXPECTED_ROWS U110"
 EXPECTED_ROWS="$EXPECTED_ROWS U111"
 EXPECTED_ROWS="$EXPECTED_ROWS U112"
+EXPECTED_ROWS="$EXPECTED_ROWS U113"
 # >>> ADD NEW U ROWS (U64 upward) HERE <<<
 EXPECTED_ROWS="$EXPECTED_ROWS E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 E13 E14 E15 E16 E17 E18 E19 E20"
 EXPECTED_ROWS="$EXPECTED_ROWS E21 E22 E23 E24 E25"
@@ -155,7 +156,7 @@ mode_rows() {
 	scope) echo "U6 U7 U8 U9 U10 U11 U47 U58 U64 U66 U108" ;;
 	scope-store) echo "U12 U13 U14 U63 U97 U101" ;;
 	files) echo "U20 U21 U22 U23 U24 U25 U50 U52 U60 U61 U68 U70 U71 U80 U88 U90 U91 U99 U105" ;;
-	socket) echo "U26 U27 U28 U29 U30 U31 U46 U48 U54 U82 U104" ;;
+	socket) echo "U26 U27 U28 U29 U30 U31 U46 U48 U54 U82 U104 U113" ;;
 	socket-ops) echo "U32 U33 U34 U35 U45 U51 U67 U84 U112" ;;
 	exec) echo "U36 U37 U38 U69 U92" ;;
 	kd-author) echo "U40 U41 U74 U76 U87 U94" ;;
@@ -421,9 +422,9 @@ pend U14 "the delivery record stores UID, the full target tuple under its seal, 
 	TestDeliveryRecordDigestRoundTrip TestDeliveryRecordVersionByteAndDigestLabel TestDeliveryDigestCoversRequestedBy
 pend U16 "every pod profile variant (native, vm, container-vm, xcode, expose-paths, wasm, the profile an exec-session process runs under, a custom pod root distinct from the data root) denies every keystore path, the keystore-sock/ tree included, the protected-prefix validator refusing any re-allow onto one, since the order of denies and allows protects nothing; a hostPath or expose path onto the data root is refused; an empty data root fails closed; over the whole rendered profile, a pod root equal to or a parent of the data root included, no emitted allow matches a keystore path; canonical /private/var/lib/k3sm denies and a regex keystore- prefix deny; a write, create, unlink, rename and network-bind on keystore-sock/, keys.sock and every keystore-* name are refused; each also through /System/Volumes/Data/private/var/lib/k3sm and the data volume's mount path; rig leg E10 (sandbox denies)" \
 	runtimed/pkg/sandbox::TestDataRootDeniesKeystorePathsEveryProfile TestNoEmittedAllowCoversKeystorePath TestDataRootDeniesCanonicalPathAndPrefixRegex TestProtectedPrefixesRefuseKeystoreReallow TestEmptyDataRootFailsClosed TestVMGuestGetsNoDataRootShare TestKeystoreDenyCoversWritesAndBind TestKeystoreDeniesCoverPathAliases
-pend U17 "runtimed refuses a pod process uid of 501 or above, and uid 0 without a drop, at credential resolution and at spawn, on the final effective uid after any drop; rig legs E21, E22 (sandbox denies)" \
-	runtimed/pkg/runtime::TestResolveCredentialRefusesLoginRangeUID TestResolveCredentialRefusesRootWithoutDrop \
-	runtimed/pkg/supervisor::TestSpawnRefusesLoginRangeUID TestSpawnRefusesRootUIDWithoutDrop TestSpawnChecksFinalEffectiveUID
+pend U17 "runtimed refuses an explicit drop target of 501 or above, at credential resolution and at spawn, through Credential.CheckPodUID (owed until it lands in runtimed); an inherited uid (no drop: the service uid, a rootless server's login uid or root on a root daemon) is allowed; rig legs E21, E22 (sandbox denies)" \
+	runtimed/pkg/runtime::TestResolveCredentialRefusesLoginRangeUID TestResolveCredentialAllowsInheritedUID \
+	runtimed/pkg/supervisor::TestSpawnRefusesLoginRangeUID TestSpawnAllowsInheritedUID
 pend U18 "CRD: entry, secretName, dataKey, requestedBy immutable by CEL transition rules; status subresource on; reasons listed; a system/ entry is refused (KeyDelivery API)" \
 	apis/config/crd::TestKeyDeliveryCRDMatchesTheGoTypes TestKeyDeliveryImmutableFields TestKeyDeliveryRequiredFields TestKeyDeliveryRequestedByMatchesEntryUID TestKeyDeliveryConditionsListMap TestKeyDeliveryRefusesSystemEntry
 pend U19 "the CRD pattern, its maxLength, the uid range rule and the 253-byte name-length rule pass the shared entry-grammar vectors (KeyDelivery API)" \
@@ -481,7 +482,7 @@ pend U44 "losing authority deletes exactly the owned Secret; the crash order is 
 	k3sm/pkg/keystore/reconcile::TestLostAuthorityDeletesOnlyOwnedSecret TestFinalizerCrashOrder TestOrphanSweep TestForgedOwnerAnnotationOnOtherSecretIsLeftAlone
 pend U45 "cross-user refusal with a fake peer-credential seam: a peer with uid B asks for list, read-for-exec, rotate, rm, deliver, withdraw and deliveries of uid A's entries and objects, and for any system/... name; every call is ErrNotFound with text identical to an absent entry of B's own, and the refused audit lines carry uid B (socket operations)" \
 	k3sm/pkg/keystore/socket::TestCrossUserRefusedFakePeerCred TestNonRootCannotNameSystemEntries
-pend U46 "baseSocketDenies derives keys.sock from runtimed's names (socket listener)" \
+pend U46 "baseSocketDenies derives keys.sock from runtimed's keystorepaths.KeystoreSocketPath(dataRoot), <dataRoot>/keystore-sock/keys.sock (socket listener)" \
 	k3sm/pkg/provider::TestBaseSocketDeniesKeystoreSocket
 pend U47 "seam guard: the real primitives the keystore's tests replace are unreachable from a test build (user scopes)" \
 	k3sm/pkg/keystore::TestRealPrimitivesUnreachable
@@ -618,6 +619,8 @@ pend U111 "the owner annotation never decides precedence: a Secret whose owner a
 	k3sm/pkg/keystore/reconcile::TestAnnotationRewriteCannotTakeOverTarget
 pend U112 "the order is commit, then append, then reply: an append that fails after the commit answers ok with the warning committed; audit failed, the server then refuses user mutations except the revocation class, and doctor counts the unaudited operations (socket operations)" \
 	k3sm/pkg/keystore/socket::TestAuditFailureAfterCommitRepliesCommittedAuditFailed k3sm/cmd/k3sm::TestDoctorCountsUnauditedOps
+pend U113 "the listener refuses to start unless the server's effective uid is the service uid: a rootless k3sm server runs no listener, and the server log and doctor say user scope needs the installed server (socket listener)" \
+	k3sm/pkg/keystore/socket::TestListenerRefusesUnlessServiceUID
 # >>> ADD NEW U ROWS (U64 upward) HERE, and add each to EXPECTED_ROWS and to mode_rows <<<
 
 leg E1 "files" "preconditions: secrets encryption on; one server; keystore-sock/ root:wheel 0755 with keys.sock from launchd, and both logs present, service-user 0600, SF_APPEND set; the doctor user-scope row on; keystore.sh --check exits 0 on the build" "the append-only files"
@@ -641,7 +644,7 @@ leg E18 "socket" "an old worker on the previous release joins this server: worke
 leg E19 "socket" "launchctl kickstart -k of the server while a client is connected mid-request: a clean error, not a hang; the listener back within its backoff; kine and the apiserver back; no partial record" "the listener lifecycle"
 leg E20 "files" "reboot of the server node, operator-attended (--attended reboot): after boot the flags are still set, the listener starts, E2's entry opens, E3's Secret is still current" "the flag check"
 leg E21 "sandbox" "a native pod with runAsUser 501 is refused at spawn: the container never starts, and its status carries the uid refusal" "runtimed's sandbox change"
-leg E22 "sandbox" "a native pod with runAsUser 0 is refused at spawn: the container never starts as root, and its status carries the uid refusal" "runtimed's sandbox change"
+leg E22 "socket" "a native pod with runAsUser 0 on a root runtimed runs (no drop, an inherited uid is allowed); a root connect to keys.sock is refused before any frame" "none: a guard that the uid refusal does not reach an inherited uid"
 leg E23 "kd-reconcile" "against the real authorizer, a role with create on secrets and update and delete on one named secret: delivery as that name is Ready, Delivered; delivery as another name is Authorized=False, NotAuthorized, with no Secret; then another principal (kubectl --as, with edit in the namespace) deletes the KeyDelivery and patches its finalizer away: each refused at admission, the object, its finalizer and the Secret stay" "the KeyDelivery reconciler; KeyDelivery authoring"
 leg E24 "exec" "with the server running, a non-k3sm program run as the service user tries to unlink keystore-sock/keys.sock and bind that path: EACCES for each, keys.sock still launchd's; with the listener stopped by the maintenance marker, the real installed k3sm binary, exec'd inside a native pod, tries the same bind and gets EPERM; in the deny-plus-pin fallback only, the service-user program binds keys.sock and the user's k3sm keys list and put refuse before any frame, naming the server pin; the real server is accepted afterwards" "the root-owned socket directory; the server pin; the pod bind deny"
 leg E25 "files" "helper variant only: a native pod tries connect(2) to the floor helper's socket, and the login user and a non-k3sm service-user program each send it an append: EPERM for the pod, both refused, no line appended" "the helper pin"
@@ -827,6 +830,10 @@ U111|the owner annotation never decides precedence
 U111|an Indeterminate object counts as honoured
 U112|commit, then append, then reply
 U112|committed; audit failed
+U113|unless the server's effective uid is the service uid
+U113|user scope needs the installed server
+U17|explicit drop target of 501 or above
+U17|an inherited uid
 U97|rm then put"
 
 # --listed: the row-presence lint.
