@@ -747,3 +747,62 @@ func TestRewrapVerifiesCommit(t *testing.T) {
 		}
 	})
 }
+
+// TestRewrapGuards pins guards that a rewrap would otherwise pass without:
+// each case fails if its guard is removed. The re-read of master.next before
+// the swap is pinned by TestRewrapVerifiesCommit.
+func TestRewrapGuards(t *testing.T) {
+	ctx := context.Background()
+	t.Run("a .new that does not open under the new key is not committed", func(t *testing.T) {
+		s, server := newTestStore(t)
+		vals := seedRewrap(t, s)
+		before, err := os.ReadFile(entryPath(server, "b", "v1"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.step = func(name string) error {
+			if name == "rename a/v1" {
+				flipLastByte(t, entryPath(server, "b", "v1"+newSuffix))
+			}
+			return nil
+		}
+		if err := s.Rewrap(ctx, rewrapKey(1)); !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("Rewrap over a .new that does not open: %v, want ErrCorrupt", err)
+		}
+		s.step = func(string) error { return nil }
+		if now, _ := os.ReadFile(entryPath(server, "b", "v1")); !bytes.Equal(now, before) {
+			t.Fatal("b/v1 was replaced by a .new that does not open")
+		}
+		checkRewrapValues(t, s, vals)
+	})
+	t.Run("user scopes on a store with no lock file yet create nothing", func(t *testing.T) {
+		s, server := newTestStore(t)
+		if err := os.Mkdir(filepath.Join(server, "keystore"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(filepath.Join(server, "keystore", userScopesName), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		snap := treeSnapshot(t, filepath.Dir(server))
+		if err := s.Rewrap(ctx, rewrapKey(1)); !errors.Is(err, ErrScopeUnsupported) {
+			t.Fatalf("Rewrap: %v, want ErrScopeUnsupported", err)
+		}
+		checkTreeUnchanged(t, snap, treeSnapshot(t, filepath.Dir(server)))
+	})
+	t.Run("a master.next its fingerprint does not match is no fallback key", func(t *testing.T) {
+		s, server := newTestStore(t)
+		seedRewrap(t, s)
+		s.step = failAt("rename a/v1") // a/v1 is live under master.next
+		if err := s.Rewrap(ctx, rewrapKey(1)); err == nil {
+			t.Fatal("Rewrap succeeded through a crash")
+		}
+		s.step = func(string) error { return nil }
+		if _, _, err := s.Get(ctx, "a", 1); err != nil {
+			t.Fatalf("Get a 1 under the agreeing master.next: %v", err)
+		}
+		writeFile(t, masterPath(server, masterNextFingerprintName), masterFingerprint(rewrapKey(9)))
+		if _, _, err := s.Get(ctx, "a", 1); !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("Get a 1 with master.next unvouched for: %v, want ErrCorrupt", err)
+		}
+	})
+}
