@@ -157,7 +157,8 @@ spec:
 
 To build a checkout that lives on the Mac instead, share it with a `hostPath` volume. The node's
 host-share allowlist must name the path first (`sudo k3sm share`), and a share is read-only, so
-clone it into the data volume before you build: `git clone /Users/me/src/app "$K3SM_ROOTFS/app"`.
+clone it into the data volume before you build: `git clone /src/app "$K3SM_ROOTFS/app"`, where
+`/src/app` is the volume's `mountPath`.
 
 ## XcodeGen and SwiftPM
 
