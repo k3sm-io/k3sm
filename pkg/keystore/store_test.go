@@ -683,7 +683,7 @@ func TestReadErrorIsNotCorrupt(t *testing.T) {
 
 // TestLockBoundedWait is gate row G14: a held lock gives a timeout error
 // after the bound, never a hang, and a cancelled context ends the wait, for
-// every verb that takes it, Rotate included.
+// every verb that takes it, Rotate and Rewrap included.
 //
 // Each case runs in a testing/synctest bubble, whose clock moves only while
 // every goroutine in it is blocked, so the store waits its production bound
@@ -732,6 +732,7 @@ func TestLockBoundedWait(t *testing.T) {
 			bounded(t, s, "List", func() error { _, err := s.List(ctx); return err })
 			bounded(t, s, "Delete", func() error { return s.Delete(ctx, "a") })
 			bounded(t, s, "Rotate", func() error { _, err := s.Rotate(ctx, "a", []byte("b")); return err })
+			bounded(t, s, "Rewrap", func() error { return s.Rewrap(ctx, rewrapKey(1)) })
 		})
 	})
 	t.Run("shared holder blocks only writes", func(t *testing.T) {
@@ -741,6 +742,7 @@ func TestLockBoundedWait(t *testing.T) {
 			hold(t, server, syscall.LOCK_SH)
 			bounded(t, s, "Put", func() error { _, err := s.Put(ctx, "b", KindOpaque, []byte("b")); return err })
 			bounded(t, s, "Rotate", func() error { _, err := s.Rotate(ctx, "a", []byte("b")); return err })
+			bounded(t, s, "Rewrap", func() error { return s.Rewrap(ctx, rewrapKey(1)) })
 			if _, _, err := s.Current(ctx, "a"); err != nil {
 				t.Fatalf("Current under a shared lock: %v", err)
 			}
@@ -754,6 +756,7 @@ func TestLockBoundedWait(t *testing.T) {
 			for op, fn := range map[string]func(ctx context.Context) error{
 				"Put":    func(ctx context.Context) error { _, err := s.Put(ctx, "b", KindOpaque, []byte("b")); return err },
 				"Rotate": func(ctx context.Context) error { _, err := s.Rotate(ctx, "a", []byte("b")); return err },
+				"Rewrap": func(ctx context.Context) error { return s.Rewrap(ctx, rewrapKey(1)) },
 			} {
 				cctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 				start := time.Now()

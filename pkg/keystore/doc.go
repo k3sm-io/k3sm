@@ -24,10 +24,10 @@ limitations under the License.
 // docs/design/keystore.md, as a series of pull requests. FileStore is the core
 // store: Put, Current, Get, List and Delete, the record encoding, the master
 // key and its checks, the store lock and the ownership of what a root-run verb
-// writes, and Rotate with the pointer sequence and the root-owned floor that
-// refuses an older pointer copied back. Rewrap arrives in the next pull
-// request; until then FileStore does not satisfy Store. No command uses the
-// package yet.
+// writes, Rotate with the pointer sequence and the root-owned floor that
+// refuses an older pointer copied back, and Rewrap, which re-seals every
+// record under a new master in two resumable phases. FileStore satisfies
+// Store. No command uses the package yet.
 //
 // # Scope (Phase A)
 //

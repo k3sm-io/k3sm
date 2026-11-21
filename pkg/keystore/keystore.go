@@ -124,8 +124,9 @@ type Store interface {
 	// Delete removes the entry name and every one of its versions, or
 	// returns ErrNotFound.
 	Delete(ctx context.Context, name string) error
-	// Rewrap re-seals every stored version under a new master key, so the
-	// old master key can be retired.
+	// Rewrap re-seals every stored version and current pointer under a new
+	// master key, then retires the old one. It is resumable: a crash at any
+	// step leaves every record readable, and the next call completes it.
 	Rewrap(ctx context.Context, newMaster []byte) error
 }
 

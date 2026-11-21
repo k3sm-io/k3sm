@@ -93,11 +93,6 @@ type Config struct {
 // FileStore is the keystore on disk, laid out as docs/design/keystore.md §
 // "On-disk layout" gives. Every method takes the store-wide lock for its
 // duration: exclusive to write, shared to read.
-//
-// Rewrap lands in a later pull request, so FileStore does not yet satisfy
-// Store: it implements every other Store method, which keystore_test.go
-// asserts, and the Rewrap pull request replaces that assertion with
-// var _ Store = (*FileStore)(nil).
 type FileStore struct {
 	dir       string
 	masterDir string
@@ -134,6 +129,8 @@ type FileStore struct {
 	// a new directory must be owned by before it is handed over.
 	euid func() int
 }
+
+var _ Store = (*FileStore)(nil)
 
 // New returns the FileStore cfg describes. It touches nothing on disk, and it
 // does not judge cfg: every operation does that first (see checkConfig).
@@ -542,7 +539,7 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	// Delete must work without the master, so the other entries' floors are
 	// raised only when it opens. A keystore with more entries than the floor
 	// holds is not raised, but Delete still runs: it is how room is made.
-	if k, kerr := s.loadMaster(); kerr == nil {
+	if k, kerr := s.loadMasterLocked(); kerr == nil {
 		synced, err := s.syncFloor(ctx, root, fdir, fl, k)
 		switch {
 		case err == nil:
@@ -658,7 +655,7 @@ func (s *FileStore) rotate(ctx context.Context, name string, value []byte) (Vers
 		return Version{}, err
 	}
 	defer e.close()
-	k, err := s.loadMaster()
+	k, err := s.loadMasterLocked()
 	if err != nil {
 		return Version{}, err
 	}
@@ -797,7 +794,7 @@ func (s *FileStore) raiseFloor(ctx context.Context) error {
 		return err
 	}
 	defer fdir.unlock()
-	k, err := s.loadMaster()
+	k, err := s.loadMasterLocked()
 	if errors.Is(err, ErrMasterMissing) {
 		return nil
 	}
@@ -1010,7 +1007,7 @@ func (e *entry) openRecord(k keys, name string, pointer bool, version uint64) (r
 	if !kindOK || r.name != e.name || r.version != version || r.generation != e.generation {
 		return record{}, nil, fmt.Errorf("%w: %s does not belong to this entry", ErrCorrupt, name)
 	}
-	pt, err := r.open(k.seal, k.scope)
+	pt, err := k.open(&r)
 	if err != nil {
 		return record{}, nil, err
 	}
