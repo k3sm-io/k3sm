@@ -422,7 +422,7 @@ is evicted. A manifest cannot empty the unreferenced cache by declaring more tha
 | Within free space plus what the dry run would free | one real pass, then the fetch | none |
 
 The first row is a verdict on the manifest, whose declared sizes cannot fit this volume, so retrying
-does not help. The other refusals are a shortfall on the node: free space and pull again.
+does not help. The other refusals are a shortfall on the node: free up space and pull again.
 
 Two limits remain:
 
