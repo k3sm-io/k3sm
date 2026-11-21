@@ -1493,7 +1493,8 @@ That wait is the store `.lock`
     bounded but not isolated ("The audit log", lock modes and fairness). That refusal
     happens before any append and is not a failed append, so it never counts as the global
     append failure that refuses every uid's reads ("The audit log", fail closed); only an append
-    that the file system refuses, or the hard cap, does.
+    that the file system refuses, or the hard cap, does. That global failure is shared: a full
+    disk refuses every uid's mutations and reads alike, and only revocations go ahead.
   - *The reconciler past an owner's share.* A `deliver-write` of a new version past the
     owner's share is refused and the reconciler reads that as `Indeterminate`, so the Secret
     keeps its last version. The one exception is the `deliver-write` that follows a `rotate`
@@ -1602,9 +1603,11 @@ refused before its first frame:
   a stream of reads cannot starve a mutation.
   - *A hold-time bound.* An exclusive hold by the server does at most 50 ms of work per
     operation; larger work (a sweep, a scope's many deliveries) is chunked into separate holds,
-    and no hold spans a call to the API server. The root verbs that hold the lock for their
-    whole run (`rm-scope`, `floor --rebuild`, `audit --rotate`, Rewrap) are outside the bound.
-    The bound is owed as a measurement in K7a.
+    and no hold spans a call to the API server or a directory lookup. The GeneratedUID lookup
+    runs before the lock is taken, with its own 250 ms deadline, and its answer is cached for
+    that hold, so a slow directory service never stretches a hold. The root verbs that hold the
+    lock for their whole run (`rm-scope`, `floor --rebuild`, `audit --rotate`, Rewrap) are
+    outside the bound. The bound is asserted on a fake clock (U108) and measured in K7a.
   - *Revocations retry.* A reconciler revocation (a `deliver-delete`, a withdrawal, a rotation
     write) that gets `ErrBusy` retries within the same sweep, up to 3 times with jittered
     waits, before the result is `Indeterminate` (U89).
@@ -1614,9 +1617,19 @@ refused before its first frame:
     the lock exclusively for at most 250 ms in any second. Many uids together can push another
     uid's wait past the 2-second bound, which is `busy`, never a refusal for the share and
     never a deletion.
-- **Fail closed.** The line is written before the reply. If an append fails, mutating
-  operations are refused, and so are the reads (`list`, `read-for-exec`, `deliveries`), until
-  an append succeeds (U32).
+- **Order: commit, then append, then reply.** A socket operation commits its change to the
+  store, then appends its audit line, then replies. If the append fails after the commit, the
+  change stands and the reply says so: `ok` with the warning `committed; audit failed`, which
+  the CLI prints. The server counts every such unaudited operation in memory, and `doctor`
+  shows the count (U112).
+- **Fail closed, except for revocations.** While appends fail (a full disk, an I/O error), the
+  server refuses user mutations and reads (`list`, `read-for-exec`, `deliveries`) until an
+  append succeeds (U32). The revocation class is the exception: a socket `withdraw`, `rm` or
+  `rotate` and the reconciler's revocation deletes still go ahead, their lines dropped and
+  counted in memory, and `doctor` shows the count. A full disk must not keep a revoked
+  credential delivered (U109). The user docs recommend, without requiring, a data volume with
+  an APFS reserve (`diskutil apfs addVolume … -reserve`), so that other writers on the Mac
+  cannot fill the keystore's disk.
 - **Coverage.** Three sources write lines besides the socket's operations, so no act on the
   keystore goes unrecorded:
   - *every root verb* (`put`, `rotate`, `rm`, `rewrap`, `deliver`, `floor --rebuild`, `audit
@@ -2005,6 +2018,7 @@ it may change and that a conversion is owed if it does.
   | `Unowned` | `SecretRetained` | `True` | `Authorized` is `False` with `NotRecorded` for a UID never recorded, and a labelled Secret names this UID: it is not this object's to delete, and it stays |
   | `Indeterminate` | `SecretRetained` | `True` | `Authorized` is `Unknown` and a labelled Secret that is this object's recorded target stays, at its last version |
 | `LabelRemoved` | `SecretRetained` | `True` | a Secret stands at this object's recorded target (namespace and name) without the label or without an owner annotation naming this UID: it is never overwritten or deleted |
+| `UserScopeOff` | `SecretRetained` | `True` | more than one server is registered and a labelled Secret that is this object's recorded target stays; it must be deleted by hand |
 | `OwnerUnresolvable` | `SecretRetained` | `True` | the entry owner's uid has no directory record (the lookup answers a synthesized GeneratedUID), and a labelled Secret that is this object's recorded target stays |
   | `NoneRetained` | `SecretRetained` | `False` | no labelled Secret of this object stays while `Authorized` is `Unknown` or `False`; and whenever `Authorized` is `True` |
 
@@ -2023,7 +2037,7 @@ it may change and that a conversion is owed if it does.
   When a deletion is due and the Secret still exists, `SecretRetained` is `True` with reason
   `DeletePending` until it is gone, so a kept Secret is never silent (U43). The rule is
   general: `SecretRetained` is `True` whenever a labelled Secret stays while `Authorized` is
-  `Unknown` or `False`, with `Indeterminate`, `OwnerUnresolvable`, `LabelRemoved`, `DeletePending` or `Unowned` saying why, and
+  `Unknown` or `False`, with `Indeterminate`, `UserScopeOff`, `OwnerUnresolvable`, `LabelRemoved`, `DeletePending` or `Unowned` saying why, and
   `False` only when no such Secret stays or `Authorized` is `True` (U78).
 
   While `Authorized` is `False`, `Ready` is `False` with the single reason `NotAuthorized`, and
@@ -2181,7 +2195,9 @@ conditions guard a denial before it deletes anything:
   when the second is at least 60 s after the first, by the reconciler's clock seam; a deleting
   outcome seen sooner is not a second observation and leaves the first one standing. So a fault
   that lasts less than a minute, a directory service rebinding or a burst of watch events,
-  cannot delete a Secret however many sweeps it spans (U93).
+  cannot delete a Secret however many sweeps it spans (U93). The observation state lives only
+  in the reconciler's memory: a restart resets it, which delays a deletion by a further pair
+  of observations and never speeds one up.
 - **Single-server is re-checked before every sweep.** Before each sweep the reconciler lists
   the nodes with the `node-role.kubernetes.io/control-plane` label afresh, not from a cache.
   With more than one, the sweep does not run and KeyDeliveries get `UserScopeOff`; when the
@@ -2243,12 +2259,20 @@ one. A record that does not open or authenticate is `Indeterminate`, and nothing
 floor log through the store's flag check, the one the listener uses (U21). A missing or
 unflagged `keystore-user-floor.log` is `Indeterminate` for writes: without the floor a
 copied-back `current` would read as current, so no `deliver-write` runs until `floor
---rebuild` leaves a flagged log, and the Secrets keep their last versions. The floor holds
-writes only: **deleting a Secret never depends on the floor check**. A deletion is decided by
-the allow-list above and the two spaced observations, neither of which reads a pointer the
-floor guards, so a missing or unflagged floor never delays or blocks a `deliver-delete`. The
-record withdrawal that follows it writes the `deliveries` record and its floor line, so it
-waits for the floor, and the finalizer stays until then (U83).
+--rebuild` leaves a flagged log, and the Secrets keep their last versions. Deletes split by
+what drives them:
+
+- *An absence-driven delete waits for the floor.* A delete driven by `ErrNotFound` is
+  `Indeterminate` while the user floor is missing or unflagged. Without the floor a restored
+  older tree that lacks an entry reads as an absent entry, since the floor line is what marks a
+  missing entry as damage rather than removal, so absence is not definitive then.
+- *A revocation-driven delete goes ahead.* A delete driven by a withdrawn record entry, a
+  digest mismatch, a definitive SubjectAccessReview denial or an owner change
+  (`ErrScopeOwnerChanged`) never depends on the floor check: each is decided by the allow-list
+  above and the two spaced observations, and none reads a pointer the floor guards.
+
+The record withdrawal that follows a delete writes the `deliveries` record and its floor line,
+so it waits for the floor, and the finalizer stays until then (U83, U107).
 
 **Absence is told apart from an unreadable store only by `ErrNotFound`.** The store answers
 `ErrNotFound` only after it opened the scope and its `entries/` directory and found no entry
@@ -2440,8 +2464,13 @@ scope; it still refuses when the API server is unreachable, since it cannot list
 KeyDeliveries that named the scope then drop their finalizers as for a removed scope (U75).
 
 **Root walks service-user trees by descriptor.** `.user/<uid>/` is the service user's, so
-every name in it may be a symlink, a FIFO or a directory swapped mid-walk. `rm-scope` and
-`floor --rebuild` therefore walk it the way the maintenance verbs walk the data root ("Root
+every name in it may be a symlink, a FIFO or a directory swapped mid-walk. Every root path that
+reads or changes a keystore tree therefore walks it by descriptor: `rm-scope`, `floor
+--rebuild`, `sudo k3sm install` over an existing tree (which judges and keeps what it finds),
+`uninstall --purge` (which clears the logs' flags and removes the trees) and `doctor` (which
+reads sizes, flags and scopes). The purge already walks the data root off one descriptor with a
+device and inode check (`purgeTree`, `pkg/install/install_darwin.go:2542`); the keystore trees
+follow the rules below on every one of these paths (U80, U105, run as root). Each walks it the way the maintenance verbs walk the data root ("Root
 never acts by path where the service user can write"):
 
 - each step is `openat` relative to the parent's descriptor with `O_NOFOLLOW` (and
@@ -2455,7 +2484,12 @@ never acts by path where the service user can write"):
   its fixed size, a directory listing at the store's entry bound; a longer file is refused;
 - after each open the verb re-checks with `fstat` and `SameFile` that the descriptor is the
   object the parent's listing named, and never follows a directory that was swapped between
-  the listing and the open (U80, run as root).
+  the listing and the open (U80, U105, run as root).
+
+**Every root verb refuses a non-root caller.** `rm-scope`, `floor --rebuild`, `audit
+--rotate`, `rewrap` and `deliver system/…` check the effective uid through the euid source
+before they open anything, and a non-root caller is refused with the same message and exit
+code for each, changing nothing; one table test runs every verb through that seam (U106).
 
 **A departed account is left to root.** When an account is removed and its uid is not given
 to anyone, its scope does not open (`ErrScopeOwnerUnknown`) and nothing is deleted
@@ -2511,7 +2545,13 @@ Each server would hold its own keystore, so the user scope is supported only on 
 with exactly one server. When the apiserver lists more than one node with the
 `node-role.kubernetes.io/control-plane` label, the server does not start the listener,
 `doctor` reports "keystore user scope: off (more than one server registered)", and
-KeyDeliveries get `UserScopeOff` (U30). The system scope keeps Phase A's behaviour. The
+KeyDeliveries get `UserScopeOff` (U30). The check is not only at start: the single-server
+check the reconciler runs before every sweep also gates the listener, so when a second server
+registers at runtime the listener stops, closing its connections, and each KeyDelivery gets
+`Ready=False` and `SecretRetained=True`, both with reason `UserScopeOff`. The Secrets already
+delivered stay, at their last versions, and nothing rotates or deletes them; `doctor` and the
+user docs say so and that they must be deleted by hand if the user scope is not brought back
+(U110). The system scope keeps Phase A's behaviour. The
 limitations page says so. Replicating the keystore across servers is a later design.
 
 ### Package layout and seams
@@ -2652,7 +2692,10 @@ the uid throughout.
    cannot get another uid's mutations, reads or revocations refused, since those draw on that
    uid's own share and budgets. It can delay them through the shared store lock, by at most
    250 ms of exclusive hold in any second per uid, and enough uids together can make another
-   uid's operation `busy` (a revocation retries 3 times first). It cannot refuse the reconciler's revocations of its own Secrets either, since its
+   uid's operation `busy` (a revocation retries 3 times first). The isolation is of log
+   shares, not of the disk: when the file system itself refuses an append (a full disk), every
+   uid's mutations and reads are refused alike, and only revocations go ahead, unaudited and
+   counted. It cannot refuse the reconciler's revocations of its own Secrets either, since its
    socket revocations never draw on the reconciler allowance. What it can exhaust is its own
    socket margin, by rotating past its share; that refuses only its own further socket
    revocations, until root rotates the log. Each scope can push a log past the hard cap by at
@@ -2731,6 +2774,14 @@ the K0 spike's evidence of 2026-11-21 (`status.txt`, `leg1.txt` to `leg4-*.txt`,
 | 3 | `mbr_uid_to_uuid` is stable across a server restart; its cold latency; what it returns for a uid with no record | **Measured.** The GeneratedUID equals `dscl`'s and is stable across processes. Cold first lookup about 1.4 ms, worst of 20 cold processes 2.8 ms, warm median 0.17 ms, so a 250 ms deadline has wide margin. A uid with no record returns the synthesized form `FFFFEEEE-DDDD-CCCC-BBBB-AAAA<uid hex>` with status 0, and so does root; the synthesized-prefix rule is required. | "Key hierarchy" |
 | 4 | a Pod with the data-root denies cannot reach the socket or any `keystore-*` path; without them, what a Pod reaches today | **Without the denies, measured:** a native Pod on the server connected to `keys.sock` (two accepts), so the denies are a hard prerequisite of any keystore file or socket (K5 before K8). Phase A's two data-root files did not exist on the rig, so their readability today is unmeasured. **Pending:** the Pod with the denies is the K5 rig leg (E10). | "Pod denies", "Threat model" |
 | 5 | which uid a native Pod's processes run as; whether a Pod spec field or runtimed path can make it 501 or above | **Measured for a default Pod:** uid 250 (the service user), below 501, and the socket saw peer euid 250. **Pending:** the spec-field and runtimed-path half (`runAsUser` and the other fields) is K5's row U15. Pods and the server share uid 250, which is why the client pins the server by more than its uid. | "Pod denies" (layer 2, row U15) |
+
+**Owed to K7a.** K7a is the measurement run before the changes that depend on it, recorded
+as a dated amendment like K0's. It measures: `LOCAL_PEERTOKEN` and the code lookup from it on
+the client side (leg 2's pending half); root's `fchown` of a file it has just flagged `sappnd`;
+the 50 ms exclusive hold bound ("The audit log", lock modes); and whether launchd activates a
+`Sockets` socket for a job with `UserName` set, root-owned in a root-owned directory, with the
+server receiving it through `launch_activate_socket` ("The socket's directory is root's"). If
+that last one fails, the deny-plus-pin fallback ships.
 
 Two facts are open but are not spike legs: whether the admission policy sees the impersonated
 user in `request.userInfo.username` (U40 and E3), and whether the rig runs with
