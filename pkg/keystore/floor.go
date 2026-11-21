@@ -57,8 +57,9 @@ var (
 	// errFloorNotWritable refuses a verb that changes the keystore when this
 	// process cannot write the floor, before it changes anything.
 	errFloorNotWritable = errors.New("the keystore floor cannot be written by this process: a keys verb that changes the keystore runs as root")
-	// errFloorMalformed refuses a floor file that does not parse.
-	errFloorMalformed = errors.New("the keystore floor does not parse: remove keystore-floor.json as root, then run any sudo k3sm keys verb to rebuild it from the current pointers")
+	// errFloorMalformed refuses a floor file that does not parse, or that is
+	// not the system scope's. It matches ErrCorrupt, with its own advice.
+	errFloorMalformed error = &floorMalformedError{}
 )
 
 // floor is the recorded floor, by entry name. A nil floor is an absent file:
@@ -73,10 +74,34 @@ type floorEntry struct {
 	Seq uint64 `json:"seq"`
 }
 
-// floorFile is the floor's encoding.
+// floorFile is the floor's encoding. Scope names the scope whose entries it
+// records, always scopeSystem: the floor is the system store's.
 type floorFile struct {
-	Version int   `json:"version"`
-	Entries floor `json:"entries"`
+	Version int    `json:"version"`
+	Scope   string `json:"scope"`
+	Entries floor  `json:"entries"`
+}
+
+// floorMalformedError is errFloorMalformed's type. It matches ErrCorrupt
+// but carries its own text, because the fix is not a restore from backup.
+type floorMalformedError struct{}
+
+func (*floorMalformedError) Error() string {
+	return "the keystore floor does not parse: remove keystore-floor.json as root, then run any sudo k3sm keys verb to rebuild it from the current pointers"
+}
+
+func (*floorMalformedError) Unwrap() error { return ErrCorrupt }
+
+// marshalFloor encodes fl as the floor file, newline-terminated.
+func marshalFloor(fl floor) ([]byte, error) {
+	if fl == nil {
+		fl = floor{}
+	}
+	b, err := json.Marshal(floorFile{Version: floorFormat, Scope: scopeSystem, Entries: fl})
+	if err != nil {
+		return nil, err
+	}
+	return append(b, '\n'), nil
 }
 
 // staleError refuses a current pointer the floor rules out. It matches
@@ -246,6 +271,9 @@ func parseFloor(b []byte) (floor, error) {
 	if f.Version != floorFormat {
 		return nil, fmt.Errorf("%w: format version %d, want %d", errFloorMalformed, f.Version, floorFormat)
 	}
+	if f.Scope != scopeSystem {
+		return nil, fmt.Errorf("%w: scope %q, want %q", errFloorMalformed, f.Scope, scopeSystem)
+	}
 	if f.Entries == nil {
 		f.Entries = floor{}
 	}
@@ -384,11 +412,11 @@ func (l *floorLock) update(op func(floor) bool) (floor, error) {
 		}
 		return fl, nil
 	}
-	b, err := json.Marshal(floorFile{Version: floorFormat, Entries: fl})
+	b, err := marshalFloor(fl)
 	if err != nil {
 		return nil, err
 	}
-	if err := l.s.writeFileAs(l.root, floorName, append(b, '\n'), l.s.floorUID, l.s.floorGID, floorFileMode); err != nil {
+	if err := l.s.writeFileAs(l.root, floorName, b, l.s.floorUID, l.s.floorGID, floorFileMode); err != nil {
 		return nil, err
 	}
 	return fl, nil

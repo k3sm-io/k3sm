@@ -18,7 +18,6 @@ package keystore
 
 import (
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"maps"
 	"testing"
@@ -27,7 +26,8 @@ import (
 // FuzzParseFloor drives the floor file's decoder. The floor is root-owned,
 // but it is the one file under the data root the keystore parses, and a
 // restore or a stray copy can put any bytes there, so the decoder must refuse
-// anything a root verb would not have written, as errFloorMalformed, and
+// anything a root verb would not have written, as errFloorMalformed (which
+// matches ErrCorrupt), and
 // never panic. What it accepts must be a floor every check can rely on, and
 // must encode back to the same floor. The seeds are committed under
 // testdata/fuzz/FuzzParseFloor.
@@ -35,8 +35,8 @@ func FuzzParseFloor(f *testing.F) {
 	f.Fuzz(func(t *testing.T, b []byte) {
 		fl, err := parseFloor(b)
 		if err != nil {
-			if !errors.Is(err, errFloorMalformed) {
-				t.Fatalf("parseFloor error %v is not errFloorMalformed", err)
+			if !errors.Is(err, errFloorMalformed) || !errors.Is(err, ErrCorrupt) {
+				t.Fatalf("parseFloor error %v is not errFloorMalformed and ErrCorrupt", err)
 			}
 			if fl != nil {
 				t.Fatalf("parseFloor returned %v with its error", fl)
@@ -58,7 +58,7 @@ func FuzzParseFloor(f *testing.F) {
 				t.Fatalf("accepted sequence 0 for %q", name)
 			}
 		}
-		again, err := json.Marshal(floorFile{Version: floorFormat, Entries: fl})
+		again, err := marshalFloor(fl)
 		if err != nil {
 			t.Fatal(err)
 		}

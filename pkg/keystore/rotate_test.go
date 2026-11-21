@@ -22,6 +22,7 @@ import (
 	"crypto/ed25519"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -174,7 +175,7 @@ func TestFloorRefusesCopiedBackPointer(t *testing.T) {
 	})
 	t.Run("accepted with no floor entry for the name", func(t *testing.T) {
 		s, server := setup(t)
-		writeFile(t, floorPath(server), `{"version":1,"entries":{}}`)
+		writeFile(t, floorPath(server), `{"version":1,"scope":"system","entries":{}}`)
 		mustCurrent(t, s, "k", "one")
 	})
 	t.Run("accepted with no floor file", func(t *testing.T) {
@@ -239,13 +240,13 @@ func TestFloorTrust(t *testing.T) {
 		}, errFloorUntrusted},
 		{"malformed", func(t *testing.T, _ *FileStore, server string) { writeFile(t, floorPath(server), "{") }, errFloorMalformed},
 		{"an unknown field", func(t *testing.T, _ *FileStore, server string) {
-			writeFile(t, floorPath(server), `{"version":1,"entries":{},"extra":1}`)
+			writeFile(t, floorPath(server), `{"version":1,"scope":"system","entries":{},"extra":1}`)
 		}, errFloorMalformed},
 		{"another format", func(t *testing.T, _ *FileStore, server string) {
-			writeFile(t, floorPath(server), `{"version":2,"entries":{}}`)
+			writeFile(t, floorPath(server), `{"version":2,"scope":"system","entries":{}}`)
 		}, errFloorMalformed},
 		{"a bad generation", func(t *testing.T, _ *FileStore, server string) {
-			writeFile(t, floorPath(server), `{"version":1,"entries":{"k":{"generation":"zz","seq":1}}}`)
+			writeFile(t, floorPath(server), `{"version":1,"scope":"system","entries":{"k":{"generation":"zz","seq":1}}}`)
 		}, errFloorMalformed},
 	}
 	for _, c := range cases {
@@ -573,4 +574,47 @@ func TestCommittedBeforeDecodesGeneration(t *testing.T) {
 	if _, err := s.Put(ctx, "a", KindOpaque, []byte("b")); !errors.Is(err, ErrExists) {
 		t.Fatalf("Put over the lost pointer: %v, want ErrExists", err)
 	}
+}
+
+// TestFloorScope: the floor file names the scope it belongs to, "system",
+// and is parsed strictly: a missing or other scope, or any field the format
+// does not have, is ErrCorrupt (errFloorMalformed), for the reads and the
+// write verbs alike.
+func TestFloorScope(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	mustPut(t, s, "k", KindOpaque, []byte("v"))
+	b, err := os.ReadFile(floorPath(server))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"scope":"system"`) {
+		t.Fatalf("the floor file %s does not name the system scope", b)
+	}
+	fl := floorOf(t, server)
+	k := fmt.Sprintf(`"entries":{"k":{"generation":%q,"seq":1}}`, fl["k"].Generation)
+	for name, body := range map[string]string{
+		"a missing scope":        `{"version":1,` + k + `}`,
+		"a user scope":           `{"version":1,"scope":"user/501",` + k + `}`,
+		"an empty scope":         `{"version":1,"scope":"",` + k + `}`,
+		"an unknown field":       `{"version":1,"scope":"system",` + k + `,"extra":1}`,
+		"an unknown entry field": `{"version":1,"scope":"system","entries":{"k":{"generation":"` + fl["k"].Generation + `","seq":1,"x":1}}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			writeFile(t, floorPath(server), body)
+			if _, _, err := s.Current(ctx, "k"); !errors.Is(err, ErrCorrupt) || !errors.Is(err, errFloorMalformed) {
+				t.Errorf("Current: %v, want ErrCorrupt (errFloorMalformed)", err)
+			}
+			if _, err := s.List(ctx); !errors.Is(err, ErrCorrupt) {
+				t.Errorf("List: %v, want ErrCorrupt", err)
+			}
+			if _, err := s.Rotate(ctx, "k", []byte("w")); !errors.Is(err, ErrCorrupt) {
+				t.Errorf("Rotate: %v, want ErrCorrupt", err)
+			}
+		})
+	}
+	t.Run("the system scope", func(t *testing.T) {
+		writeFile(t, floorPath(server), `{"version":1,"scope":"system",`+k+`}`)
+		mustCurrent(t, s, "k", "v")
+	})
 }

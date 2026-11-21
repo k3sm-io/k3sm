@@ -18,7 +18,6 @@ package keystore
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"maps"
 	"os"
@@ -38,12 +37,12 @@ import (
 // .lock, which the data-root lock is there to stop.
 func putFloorFile(t *testing.T, server string, fl floor) {
 	t.Helper()
-	b, err := json.Marshal(floorFile{Version: floorFormat, Entries: fl})
+	b, err := marshalFloor(fl)
 	if err != nil {
 		t.Fatal(err)
 	}
 	tmp := floorPath(server) + ".test"
-	if err := os.WriteFile(tmp, append(b, '\n'), floorFileMode); err != nil {
+	if err := os.WriteFile(tmp, b, floorFileMode); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Rename(tmp, floorPath(server)); err != nil {

@@ -1111,7 +1111,7 @@ func TestEntryWithNoPointer(t *testing.T) {
 		return s, dir
 	}
 	unrecorded := func(dir string) {
-		writeFile(t, filepath.Join(filepath.Dir(filepath.Dir(filepath.Dir(dir))), floorName), `{"version":1,"entries":{}}`)
+		writeFile(t, filepath.Join(filepath.Dir(filepath.Dir(filepath.Dir(dir))), floorName), `{"version":1,"scope":"system","entries":{}}`)
 	}
 	files := func(t *testing.T, dir string) string {
 		t.Helper()
@@ -1148,7 +1148,7 @@ func TestEntryWithNoPointer(t *testing.T) {
 		// for the name before the Put that crashed here.
 		"a floor of another generation": func(dir string) {
 			writeFile(t, filepath.Join(filepath.Dir(filepath.Dir(filepath.Dir(dir))), floorName),
-				`{"version":1,"entries":{"a":{"generation":"00000000000000000000000000000000","seq":3}}}`)
+				`{"version":1,"scope":"system","entries":{"a":{"generation":"00000000000000000000000000000000","seq":3}}}`)
 		},
 	} {
 		t.Run("interrupted put: "+name, func(t *testing.T) {

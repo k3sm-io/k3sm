@@ -254,8 +254,15 @@ previous value plus 1, and Rewrap re-seals it unchanged. The store also **record
 highest sequence it has committed for each entry, in `keystore-floor.json`:
 
 ```json
-{"version": 1, "entries": {"signer-key": {"generation": "<hex>", "seq": 7}}}
+{"version": 1, "scope": "system", "entries": {"signer-key": {"generation": "<hex>", "seq": 7}}}
 ```
+
+`scope` names the scope whose entries the floor records, and is always `system`: the floor
+belongs to the system store. The file is parsed strictly: a missing or other `scope`, a
+`version` other than 1, any field the format does not have (at the top or in an entry), a
+generation that is not 32 lower-case hex digits, a sequence of 0, a name `put` would refuse,
+or data after the object is `ErrCorrupt`, with the floor's own message (remove the file as
+root and let a root-run verb rebuild it) rather than the restore-from-backup default.
 
 A reader that opens `current` refuses it, as `ErrCorrupt` with the message below, unless
 **both** hold: the pointer's generation equals the floor's generation for that name, and the

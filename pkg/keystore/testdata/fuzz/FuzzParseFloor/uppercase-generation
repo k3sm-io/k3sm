@@ -1,2 +1,2 @@
 go test fuzz v1
-[]byte("{\"version\":1,\"entries\":{\"a\":{\"generation\":\"0123456789ABCDEF0123456789ABCDEF\",\"seq\":1}}}")
+[]byte("{\"version\":1,\"scope\":\"system\",\"entries\":{\"a\":{\"generation\":\"0123456789ABCDEF0123456789ABCDEF\",\"seq\":1}}}")
