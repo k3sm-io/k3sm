@@ -134,7 +134,7 @@ The fixed decisions:
   entry is keyed (an HMAC under a key derived from the master) or truncated, never a plain
   hash of the value, so List output is not a guessing oracle for a low-entropy value.
 - An Ed25519 value is the 32-byte seed or the 64-byte expanded private key, and is
-  validated on Put.
+  checked on Put.
 
 ### On-disk layout
 
@@ -326,7 +326,7 @@ of the fix: an older backup is exactly what produced it. A floor refusal wraps `
 put back. Do not restore from backup. If that was deliberate, follow "Restoring an older
 keystore/" in docs/user/backup-restore.md`.
 
-**Where the floor lives is the load-bearing choice.** A floor kept in the service user's
+**Where the floor lives is the deciding choice.** A floor kept in the service user's
 tree would be one more file that any process running as the service user can copy back, and
 the check would only be as strong as that process's patience. `keystore-floor.json` is
 therefore root:wheel 0644 directly under the data root. The data root is root:wheel 0755
@@ -1567,7 +1567,7 @@ last pull request lands and no row is pending.
 | G19 | The delivery declaration is root-owned and not shared-writable, and is refused otherwise | unit, the same cases as the manifest directory |
 | G20 | The reconciler only Gets, creates and updates its labelled `Opaque` Secrets, and leaves an unlabelled or foreign Secret alone | unit over a fake client that records every call |
 | G21 | The rollback recipe in this document runs as written and is a byte-exact round trip | a script test that pipes `show --reveal` into `rotate --in -`, then compares the new current version's value byte for byte (`cmp`) with version N's, for an opaque entry and an Ed25519 entry |
-| G22 | `hack/ci.sh` is green | the gate runs it |
+| G22 | `hack/ci.sh` passes | the gate runs it |
 
 Phase A is complete when the gate passes with no row pending. A row can be reworded or dropped only by a change
 to this document, reviewed like any other.
