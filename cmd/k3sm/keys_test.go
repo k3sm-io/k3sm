@@ -492,6 +492,11 @@ func copyTree(t *testing.T, src, dst string) {
 	}
 }
 
+// TestKeysRollbackRoundTrip is G21's CLI test: the rollback recipes in
+// docs/user/keys.md run as written. A restore of a saved keystore/ brings an
+// entry back, and `show --version N --reveal` piped into `rotate --in -`
+// stores a version whose value equals version N's byte for byte
+// (bytes.Equal, the comparison cmp makes), for an opaque and an Ed25519 entry.
 func TestKeysRollbackRoundTrip(t *testing.T) {
 	t.Run("save rm restore", func(t *testing.T) {
 		h := newKeysHarness(t)
@@ -501,7 +506,9 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 		copyTree(t, h.keystoreDir(), backup)
 		h.mustRun(0, "rm", "system/rb", "--yes")
 		h.mustRun(1, "show", "system/rb", "--reveal")
-		if err := os.RemoveAll(h.keystoreDir()); err != nil {
+		// The recipe moves the live copy aside, never deletes it first.
+		aside := h.keystoreDir() + ".pre-restore"
+		if err := os.Rename(h.keystoreDir(), aside); err != nil {
 			t.Fatal(err)
 		}
 		copyTree(t, backup, h.keystoreDir())
@@ -510,20 +517,66 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 		if !bytes.Equal(h.stdout.Bytes(), value) {
 			t.Fatalf("restored value = %q, want %q", h.stdout.Bytes(), value)
 		}
-	})
-	t.Run("show reveal piped into rotate", func(t *testing.T) {
-		h := newKeysHarness(t)
-		v1 := []byte("first\n")
-		h.put("system/rb", v1)
-		h.stdin = bytes.NewReader([]byte("second"))
-		h.mustRun(0, "rotate", "system/rb", "--in", "-")
-		h.mustRun(0, "show", "system/rb", "--version", "1", "--reveal")
-		h.stdin = bytes.NewReader(slices.Clone(h.stdout.Bytes()))
-		h.mustRun(0, "rotate", "system/rb", "--in", "-")
-		if got := h.value("rb", 3); !bytes.Equal(got, v1) {
-			t.Fatalf("version 3 = %q, want %q", got, v1)
+		if err := os.RemoveAll(aside); err != nil {
+			t.Fatal(err)
 		}
 	})
+	seed := bytes.Repeat([]byte{0x00, 0x0a, 0xff, 0x20}, 8)
+	for _, tc := range []struct {
+		kind          string
+		first, second []byte
+	}{
+		{"opaque", []byte("first\n"), []byte("second")},
+		{"ed25519", ed25519.NewKeyFromSeed(seed), bytes.Repeat([]byte{0x7e}, ed25519.SeedSize)},
+	} {
+		t.Run("show reveal piped into rotate, "+tc.kind, func(t *testing.T) {
+			h := newKeysHarness(t)
+			h.stdin = bytes.NewReader(tc.first)
+			h.mustRun(0, "put", "system/rb", "--kind", tc.kind, "--in", "-")
+			h.stdin = bytes.NewReader(tc.second)
+			h.mustRun(0, "rotate", "system/rb", "--in", "-")
+			h.mustRun(0, "show", "system/rb", "--version", "1", "--reveal")
+			h.stdin = bytes.NewReader(slices.Clone(h.stdout.Bytes()))
+			h.mustRun(0, "rotate", "system/rb", "--in", "-")
+			v1, v3 := h.value("rb", 1), h.value("rb", 3)
+			if !bytes.Equal(v3, v1) || !bytes.Equal(v1, tc.first) {
+				t.Fatalf("version 3 = %x, version 1 = %x, want both exactly %x", v3, v1, tc.first)
+			}
+		})
+	}
+}
+
+// TestKeysReadVerbsRaiseFloor is G7's CLI half: list, show and show --reveal
+// raise the floor before they read. With root's record removed, as the
+// restore procedure removes it, each one writes it again, and calls
+// RaiseFloor before the read.
+func TestKeysReadVerbsRaiseFloor(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		read string
+	}{
+		{[]string{"list"}, "List"},
+		{[]string{"show", "system/f"}, "List"},
+		{[]string{"show", "system/f", "--reveal"}, "Current"},
+		{[]string{"show", "system/f", "--version", "1", "--reveal"}, "Get"},
+	} {
+		t.Run(strings.Join(tc.args, " "), func(t *testing.T) {
+			h := newKeysHarness(t)
+			h.put("system/f", []byte("floor-value"))
+			floor := filepath.Join(filepath.Dir(h.work), "keystore-floor.json")
+			if err := os.Remove(floor); err != nil {
+				t.Fatalf("put left no floor to remove: %v", err)
+			}
+			h.calls = nil
+			h.mustRun(0, tc.args...)
+			if _, err := os.Lstat(floor); err != nil {
+				t.Fatalf("%v did not write the floor again: %v", tc.args, err)
+			}
+			if i, j := slices.Index(h.calls, "RaiseFloor"), slices.Index(h.calls, tc.read); i < 0 || j < 0 || i > j {
+				t.Errorf("%v calls %v: RaiseFloor must come before %s", tc.args, h.calls, tc.read)
+			}
+		})
+	}
 }
 
 func TestKeysRefusals(t *testing.T) {
