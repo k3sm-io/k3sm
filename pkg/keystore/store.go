@@ -231,7 +231,7 @@ func (s *FileStore) put(ctx context.Context, name string, kind Kind, value []byt
 	if err != nil {
 		return Version{}, err
 	}
-	if fl, err = s.syncFloor(root, fdir, fl, k); err != nil {
+	if fl, err = s.syncFloor(ctx, root, fdir, fl, k); err != nil {
 		return Version{}, err
 	}
 	// A floor with no room for the new entry refuses the Put before its
@@ -543,7 +543,7 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	// raised only when it opens. A keystore with more entries than the floor
 	// holds is not raised, but Delete still runs: it is how room is made.
 	if k, kerr := s.loadMaster(); kerr == nil {
-		synced, err := s.syncFloor(root, fdir, fl, k)
+		synced, err := s.syncFloor(ctx, root, fdir, fl, k)
 		switch {
 		case err == nil:
 			fl = synced
@@ -662,7 +662,7 @@ func (s *FileStore) rotate(ctx context.Context, name string, value []byte) (Vers
 	if err != nil {
 		return Version{}, err
 	}
-	if fl, err = s.syncFloor(root, fdir, fl, k); err != nil {
+	if fl, err = s.syncFloor(ctx, root, fdir, fl, k); err != nil {
 		return Version{}, err
 	}
 	cur, seq, err := e.checkedPointer(k, fl)
@@ -687,7 +687,7 @@ func (s *FileStore) rotate(ctx context.Context, name string, value []byte) (Vers
 	if err := fl.room(name, floorEntry{Generation: hex.EncodeToString(e.generation[:]), Seq: seq + 1}); err != nil {
 		return Version{}, err
 	}
-	if err := discardOrphans(e, cur); err != nil {
+	if err := discardOrphans(ctx, e, cur); err != nil {
 		return Version{}, err
 	}
 	next := cur + 1
@@ -714,20 +714,25 @@ func (s *FileStore) rotate(ctx context.Context, name string, value []byte) (Vers
 
 // discardOrphans removes every version file of e numbered above cur: what a
 // Rotate interrupted before its pointer flip leaves. Each holds the value the
-// interrupted attempt carried, so none is ever promoted.
+// interrupted attempt carried, so none is ever promoted. It stops with ctx's
+// error when ctx is done (see loopCtx); what it removed stays removed, and the
+// next Rotate removes the rest.
 //
 // While the floor lags its pointer (a Rotate whose floor write failed), an
 // older pointer copied back passes the floor check, and the version the live
 // pointer named is then discarded here as an orphan. docs/design/keystore.md
 // § "Rotation and rollback" accepts that window: a crash before the flip
 // leaves the same state, and its orphan must be discarded.
-func discardOrphans(e *entry, cur uint64) error {
+func discardOrphans(ctx context.Context, e *entry, cur uint64) error {
 	names, err := readDirNames(e.root, maxDirNames)
 	if err != nil {
 		return err
 	}
 	removed := false
-	for _, n := range names {
+	for i, n := range names {
+		if err := loopCtx(ctx, i); err != nil {
+			return err
+		}
 		v, ok := parseVersionName(n)
 		if !ok || v <= cur {
 			continue
@@ -799,7 +804,7 @@ func (s *FileStore) raiseFloor(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.syncFloor(root, fdir, fl, k)
+	_, err = s.syncFloor(ctx, root, fdir, fl, k)
 	return err
 }
 

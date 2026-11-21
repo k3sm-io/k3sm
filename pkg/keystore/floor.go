@@ -510,6 +510,20 @@ func (l *floorLock) unlock() {
 	_ = l.dir.Close()
 }
 
+// loopEvery is how many iterations a loop over a directory's names (up to
+// maxDirNames of them) runs between checks of its context.
+const loopEvery = 64
+
+// loopCtx is ctx's error at every loopEvery-th iteration i, the first
+// included, so a loop that opens or removes a file per name stops soon after
+// its context is done.
+func loopCtx(ctx context.Context, i int) error {
+	if i%loopEvery != 0 {
+		return nil
+	}
+	return ctx.Err()
+}
+
 // syncFloor is how Put, Rotate and RaiseFloor begin, and Delete when the
 // master opens (with none, Delete raises nothing): it raises each entry's floor
 // to the sequence of its authenticated current pointer and writes the floor
@@ -519,11 +533,13 @@ func (l *floorLock) unlock() {
 // open, or that the floor already rules out, is left as it is: the verb that
 // reads it reports it. The caller holds the exclusive lock and l.
 //
+// It stops with ctx's error, writing nothing, when ctx is done (see loopCtx).
+//
 // The floor never grows past maxFloorSize: a keystore with more entries than
 // a floor can hold is refused (errFloorFull) before any is raised, and a raise
 // that would take the floor over the size is left out, so that entry's floor
 // stays where it was, behind its pointer, which readers accept.
-func (s *FileStore) syncFloor(entries *os.Root, l *floorLock, fl floor, k keys) (floor, error) {
+func (s *FileStore) syncFloor(ctx context.Context, entries *os.Root, l *floorLock, fl floor, k keys) (floor, error) {
 	names, err := readDirNames(entries, maxDirNames)
 	if err != nil {
 		return nil, err
@@ -535,7 +551,10 @@ func (s *FileStore) syncFloor(entries *os.Root, l *floorLock, fl floor, k keys) 
 		seq  uint64
 	}
 	var found []raised
-	for _, name := range names {
+	for i, name := range names {
+		if err := loopCtx(ctx, i); err != nil {
+			return nil, err
+		}
 		if checkName(name) != nil {
 			continue
 		}

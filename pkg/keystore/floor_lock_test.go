@@ -19,6 +19,7 @@ package keystore
 import (
 	"context"
 	"errors"
+	"fmt"
 	"maps"
 	"os"
 	"path/filepath"
@@ -298,4 +299,65 @@ func TestDataRootSwapRefused(t *testing.T) {
 		}
 		mustCurrent(t, s, "k", "one")
 	})
+}
+
+// TestLoopsStopOnContext: syncFloor and discardOrphans, which open or remove
+// a file per name in a directory of up to maxDirNames names, stop with the
+// context's error once it is done, and syncFloor then writes nothing.
+func TestLoopsStopOnContext(t *testing.T) {
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	s, server := newTestStore(t)
+	// loopCtx checks at the first iteration, so two entries are enough.
+	for i := range 2 {
+		mustPut(t, s, fmt.Sprintf("k%d", i), KindOpaque, []byte("v"))
+	}
+	mustRotate(t, s, "k0", "two")
+	// k0's floor one behind its pointer, so syncFloor has a raise to write.
+	fl := floorOf(t, server)
+	lagging := fl["k0"]
+	lagging.Seq = 1
+	fl["k0"] = lagging
+	putFloorFile(t, server, fl)
+	// An orphan above k0's current version, for discardOrphans to remove.
+	orphan := entryPath(server, "k0", versionName(3))
+	copyFile(t, entryPath(server, "k0", versionName(2)), orphan)
+
+	root, done, err := s.openLocked(context.Background(), false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer done()
+	l, read, err := s.lockFloor(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.unlock()
+	k, err := s.loadMaster()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.syncFloor(cancelled, root, l, read, k); !errors.Is(err, context.Canceled) {
+		t.Fatalf("syncFloor under a cancelled context: %v, want context.Canceled", err)
+	}
+	if got := floorOf(t, server)["k0"]; got != lagging {
+		t.Fatalf("the stopped syncFloor wrote k0's floor %+v, want %+v left", got, lagging)
+	}
+	e, err := openEntry(root, "k0", read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.close()
+	if err := discardOrphans(cancelled, e, 2); !errors.Is(err, context.Canceled) {
+		t.Fatalf("discardOrphans under a cancelled context: %v, want context.Canceled", err)
+	}
+	if _, err := os.Lstat(orphan); err != nil {
+		t.Fatalf("the stopped discardOrphans removed the orphan: %v", err)
+	}
+	if err := discardOrphans(context.Background(), e, 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(orphan); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("discardOrphans left the orphan: %v", err)
+	}
 }
