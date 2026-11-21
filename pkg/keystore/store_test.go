@@ -715,6 +715,50 @@ func TestListMarksCorruptEntry(t *testing.T) {
 	}
 }
 
+// TestPointerVersionBound: a pointer that authenticates but names a version
+// past maxVersion is ErrCorrupt on its own entry, never an allocation sized by
+// it, and List still returns the healthy entries.
+func TestPointerVersionBound(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	mustPut(t, s, "aa", KindOpaque, []byte("a"))
+	mustPut(t, s, "bb", KindOpaque, []byte("b"))
+	k, err := s.loadMaster()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(server, "keystore", "bb")
+	gen, err := os.ReadFile(filepath.Join(dir, generationName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ptr := record{kind: kindPointer, name: "bb", created: 1}
+	if _, err := hex.Decode(ptr.generation[:], bytes.TrimSpace(gen)); err != nil {
+		t.Fatal(err)
+	}
+	if err := ptr.seal(k.seal, pointerPlaintext(1<<62, 1), rand.Reader); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(dir, currentName), string(ptr.marshal()))
+
+	got, err := s.List(ctx)
+	if err != nil || len(got) != 2 {
+		t.Fatalf("List = %+v %v, want both entries", got, err)
+	}
+	if e := got[0]; e.Name != "aa" || e.Err != nil || e.Current.Version != 1 {
+		t.Fatalf("healthy entry = %+v", e)
+	}
+	if e := got[1]; e.Name != "bb" || !errors.Is(e.Err, ErrCorrupt) || e.Versions != nil {
+		t.Fatalf("entry with a pointer past maxVersion = %+v, want only Err (ErrCorrupt)", e)
+	}
+	if _, _, err := s.Current(ctx, "bb"); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("Current: %v, want ErrCorrupt", err)
+	}
+	if _, _, err := s.Get(ctx, "bb", 1); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("Get 1: %v, want ErrCorrupt", err)
+	}
+}
+
 // TestEntryWithNoPointer: a directory with no current pointer is an
 // interrupted Put only when it holds generation and at most v1 (temporary
 // files aside). Anything more is damage: List reports it, Put refuses it and

@@ -38,6 +38,12 @@ const (
 	currentName    = "current"
 	// generationFileSize is the generation file's size: hex and a newline.
 	generationFileSize = 2*generationSize + 1
+	// maxVersion is the highest version a current pointer may name. The
+	// pointer authenticates, but whoever holds the master can seal any value,
+	// and List sizes its result by it and opens every version up to it, so a
+	// pointer above the bound is ErrCorrupt rather than an allocation or a walk
+	// it chooses. 65536 versions is far beyond any rotation cadence.
+	maxVersion = 1 << 16
 )
 
 var (
@@ -553,7 +559,9 @@ func (e *entry) openRecord(k keys, name string, pointer bool, version uint64) (r
 	return r, pt, nil
 }
 
-// pointer opens e's current pointer and returns the version it names.
+// pointer opens e's current pointer and returns the version it names, at
+// most maxVersion. It is the one decoder of a pointer, so every reader gets
+// the bound.
 //
 // The pointer's sequence is read but not yet checked against a recorded
 // floor; that check lands with Rotate (docs/design/keystore.md § "Pointer
@@ -569,6 +577,9 @@ func (e *entry) pointer(k keys) (uint64, error) {
 	v := binary.BigEndian.Uint64(pt[:8])
 	if v == 0 {
 		return 0, fmt.Errorf("%w: the pointer names version 0", ErrCorrupt)
+	}
+	if v > maxVersion {
+		return 0, fmt.Errorf("%w: the pointer names version %d, over the %d-version limit", ErrCorrupt, v, maxVersion)
 	}
 	return v, nil
 }
