@@ -40,6 +40,8 @@ rewrap_tests="$rewrap_tests TestLockBoundedWait TestLockExcludes TestConcurrentO
 rewrap_tests="$rewrap_tests TestRewrapRefusesWhileUserScopesExist"
 rewrap_tests="$rewrap_tests TestRewrapKeyReuse TestRewrapRefusesStalePointer TestRewrapVerifiesCommit TestRewrapGuards"
 rewrap_tests="$rewrap_tests TestRewrapRefusesLiveMasterFirst TestRewrapUserScopesBeforeSwap TestRewrapRecoversReplacedNext"
+rewrap_tests="$rewrap_tests TestRewrapRemovesStaleNew TestRewrapOverFullFloor TestRewrapCommitChecksMetadata TestRewrapUserScopesUnderLock"
+rewrap_tests="$rewrap_tests TestFinishSwapLeavesUnmatchedFingerprint"
 
 # wanted reports whether row $1 runs in this mode.
 wanted() {
@@ -116,9 +118,10 @@ check G10 "the master is minted only by the first put, never over entries" TestM
 check G11 "the master is judged on the open descriptor" TestMasterTrust
 check G12 "Rewrap resumes after a crash at every step, old key then new, nothing unreadable; a bad master.next is discarded only with no .new file" \
 	TestRewrapCrashAtEveryStep TestRewrapKeyReuse TestRewrapRefusesStalePointer TestRewrapVerifiesCommit TestRewrapGuards \
-	TestRewrapRefusesLiveMasterFirst TestRewrapUserScopesBeforeSwap TestRewrapRecoversReplacedNext
+	TestRewrapRefusesLiveMasterFirst TestRewrapUserScopesBeforeSwap TestRewrapRecoversReplacedNext \
+	TestRewrapRemovesStaleNew TestRewrapOverFullFloor TestRewrapCommitChecksMetadata TestRewrapUserScopesUnderLock
 check G13 "a crash between the master renames leaves a trusted master, and the next verb completes the swap" \
-	TestRewrapMasterRenameCompleted
+	TestRewrapMasterRenameCompleted TestFinishSwapLeavesUnmatchedFingerprint
 check G14 "one lock with a bounded wait serializes Rewrap, Rotate, Put, Delete and the reads, and no read blocks" \
 	TestLockBoundedWait TestLockExcludes TestConcurrentOperations TestFIFORefused TestReadDirNamesBound
 check G15 "files a root verb writes are the service user's, at the layout's modes, inside the store" \

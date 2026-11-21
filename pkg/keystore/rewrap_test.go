@@ -647,6 +647,13 @@ func TestRewrapRefusesStalePointer(t *testing.T) {
 // a record that belongs exactly where file is, under key, holding value.
 func sealUnder(t *testing.T, server, name, file string, key, value []byte) []byte {
 	t.Helper()
+	return sealEdited(t, server, name, file, key, value, func(*record) {})
+}
+
+// sealEdited is sealUnder with edit applied to the record before it is
+// sealed.
+func sealEdited(t *testing.T, server, name, file string, key, value []byte, edit func(*record)) []byte {
+	t.Helper()
 	b, err := os.ReadFile(entryPath(server, name, file))
 	if err != nil {
 		t.Fatal(err)
@@ -665,6 +672,7 @@ func sealUnder(t *testing.T, server, name, file string, key, value []byte) []byt
 	}
 	k := mustDeriveKeys(t, key, scopeSystem)
 	out := record{kind: r.kind, name: name, version: r.version, generation: gen, created: r.created}
+	edit(&out)
 	if err := out.seal(k.seal, k.scope, value, rand.Reader); err != nil {
 		t.Fatal(err)
 	}
@@ -937,4 +945,160 @@ func TestRewrapRecoversReplacedNext(t *testing.T) {
 			checkRewrapValues(t, s, vals)
 		})
 	}
+}
+
+// TestFinishSwapLeavesUnmatchedFingerprint is G13's other half: a
+// master.next.sha256 left with no master.next that the master does not match
+// is no half-done swap. finishSwap declines it, so it is never renamed over
+// master.sha256; a verb that takes the exclusive lock runs on the master as
+// it was, and the fingerprint is left for Rewrap to judge.
+func TestFinishSwapLeavesUnmatchedFingerprint(t *testing.T) {
+	s, server := newTestStore(t)
+	vals := seedRewrap(t, s)
+	oldFP, err := os.ReadFile(masterPath(server, masterFingerprintName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, masterPath(server, masterNextFingerprintName), masterFingerprint(rewrapKey(9)))
+	mroot, err := s.openMasterDir(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done, err := s.finishSwap(mroot)
+	_ = mroot.Close()
+	if done || err != nil {
+		t.Fatalf("finishSwap over a fingerprint the master does not match = %t, %v; want false, nil", done, err)
+	}
+	mustPut(t, s, "c", KindOpaque, []byte("c"))
+	vals["c"] = [][]byte{[]byte("c")}
+	if got, _ := os.ReadFile(masterPath(server, masterFingerprintName)); !bytes.Equal(got, oldFP) {
+		t.Fatalf("master.sha256 = %q, want the old fingerprint %q", got, oldFP)
+	}
+	if got, _ := os.ReadFile(masterPath(server, masterNextFingerprintName)); string(got) != masterFingerprint(rewrapKey(9)) {
+		t.Fatalf("master.next.sha256 = %q, want it left as it was", got)
+	}
+	checkRewrapValues(t, s, vals)
+}
+
+// TestRewrapRemovesStaleNew: a .new beside a record already under the new
+// key is removed by the commit, so a resumed Rewrap leaves none, and the next
+// Rewrap, which would refuse over a .new with no master.next, runs.
+func TestRewrapRemovesStaleNew(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	vals := seedRewrap(t, s)
+	s.step = failAt("rename a/v1") // a/v1 is live under master.next
+	if err := s.Rewrap(ctx, rewrapKey(1)); err == nil {
+		t.Fatal("Rewrap succeeded through a crash")
+	}
+	s.step = func(string) error { return nil }
+	copyFile(t, entryPath(server, "a", "v1"), entryPath(server, "a", "v1"+newSuffix))
+	if err := s.Rewrap(ctx, rewrapKey(2)); !errors.Is(err, ErrRewrapResumed) {
+		t.Fatalf("Rewrap rerun: %v, want ErrRewrapResumed", err)
+	}
+	if n := newFiles(t, server); len(n) > 0 {
+		t.Fatalf(".new files left behind: %v", n)
+	}
+	if err := s.Rewrap(ctx, rewrapKey(2)); err != nil {
+		t.Fatalf("Rewrap after the resume: %v", err)
+	}
+	checkMasterIs(t, server, rewrapKey(2))
+	checkRewrapValues(t, s, vals)
+}
+
+// TestRewrapOverFullFloor: Rewrap records nothing new in the floor, so a
+// floor with no room to raise the entries it holds does not stop it, and the
+// floor is left as it was.
+func TestRewrapOverFullFloor(t *testing.T) {
+	s, server := newTestStore(t)
+	vals := seedRewrap(t, s)
+	// Neither entry is recorded, and the floor has no room to record one.
+	fillFloor(t, server, nil, maxFloorSize-minFloorEntrySize+1)
+	before, err := os.ReadFile(floorPath(server))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rewrap(context.Background(), rewrapKey(1)); err != nil {
+		t.Fatalf("Rewrap over a full floor: %v", err)
+	}
+	if after, err := os.ReadFile(floorPath(server)); err != nil || !bytes.Equal(after, before) {
+		t.Fatalf("the floor changed (%d bytes, %v), want the %d bytes it held", len(after), err, len(before))
+	}
+	checkMasterIs(t, server, rewrapKey(1))
+	checkRewrapValues(t, s, vals)
+}
+
+// TestRewrapCommitChecksMetadata: a .new that opens under the new key and
+// holds the plaintext of the record it replaces is still refused with
+// ErrCorrupt, and not renamed, when its created time or its kind differs.
+func TestRewrapCommitChecksMetadata(t *testing.T) {
+	for name, edit := range map[string]func(*record){
+		"another created time": func(r *record) { r.created++ },
+		"another kind":         func(r *record) { r.kind = byte(KindEd25519) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, server := newTestStore(t)
+			vals := seedRewrap(t, s)
+			before, err := os.ReadFile(entryPath(server, "b", "v1"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			// b/v1 is opaque, holding "one": the forgery holds "one" too.
+			s.step = func(name string) error {
+				if name == "rename a/v1" {
+					writeFile(t, entryPath(server, "b", "v1"+newSuffix), string(sealEdited(t, server, "b", "v1", rewrapKey(1), []byte("one"), edit)))
+				}
+				return nil
+			}
+			if err := s.Rewrap(context.Background(), rewrapKey(1)); !errors.Is(err, ErrCorrupt) {
+				t.Fatalf("Rewrap over a .new with %s: %v, want ErrCorrupt", name, err)
+			}
+			s.step = func(string) error { return nil }
+			if now, _ := os.ReadFile(entryPath(server, "b", "v1")); !bytes.Equal(now, before) {
+				t.Fatalf("b/v1 was replaced by a .new with %s", name)
+			}
+			checkRewrapValues(t, s, vals)
+		})
+	}
+}
+
+// TestRewrapUserScopesUnderLock: a .user created after the check before the
+// lock, while the lock is taken, is refused by the check under it with
+// ErrScopeUnsupported, and nothing is written but the lock file whose
+// creation stands in for that window.
+func TestRewrapUserScopesUnderLock(t *testing.T) {
+	s, server := newTestStore(t)
+	vals := seedRewrap(t, s)
+	lock := filepath.Join(server, "keystore", lockName)
+	user := filepath.Join(server, "keystore", userScopesName)
+	// With no lock file, taking the lock creates it and chowns it.
+	if err := os.Remove(lock); err != nil {
+		t.Fatal(err)
+	}
+	chown, made := s.chown, false
+	s.chown = func(f *os.File, uid, gid int) error {
+		if !made && filepath.Base(f.Name()) == lockName {
+			made = true
+			if err := os.Mkdir(user, 0o700); err != nil {
+				return err
+			}
+		}
+		return chown(f, uid, gid)
+	}
+	snap := treeSnapshot(t, filepath.Dir(server))
+	if err := s.Rewrap(context.Background(), rewrapKey(1)); !errors.Is(err, ErrScopeUnsupported) {
+		t.Fatalf("Rewrap with %s created under the lock: %v, want ErrScopeUnsupported", userScopesName, err)
+	}
+	if !made {
+		t.Fatal("the lock file was not created, so .user was not planted")
+	}
+	after := treeSnapshot(t, filepath.Dir(server))
+	delete(after, lock)
+	delete(after, user)
+	checkTreeUnchanged(t, snap, after)
+	s.chown = chown
+	if err := os.Remove(user); err != nil {
+		t.Fatal(err)
+	}
+	checkRewrapValues(t, s, vals)
 }
