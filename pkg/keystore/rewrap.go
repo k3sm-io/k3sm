@@ -20,6 +20,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -176,6 +178,66 @@ func (s *FileStore) rewrap(ctx context.Context, newMaster []byte) error {
 		return resumed(next, newMaster)
 	}
 	return nil
+}
+
+// InterruptedRewrap reports the fingerprint, SHA-256 of the key, that an
+// interrupted Rewrap recorded in master.next.sha256, with ok set, or ok unset
+// when no Rewrap left one: no entries' directory, no master directory, or no
+// master.next.sha256. It reads under the shared lock and writes nothing. A
+// fingerprint file that is not the service user's, not mode 0600 or does not
+// parse is ErrMasterUntrusted.
+//
+// The record is the only evidence of which key a crashed Rewrap was sealing
+// under, so a caller that would hand Rewrap a key it did not mint itself
+// checks that key against it first: a key no Rewrap recorded is no recovery.
+func (s *FileStore) InterruptedRewrap(ctx context.Context) (fingerprint [sha256.Size]byte, ok bool, err error) {
+	fp, ok, err := s.interruptedRewrap(ctx)
+	if err != nil {
+		return fp, false, fmt.Errorf("check for an interrupted rewrap: %w", err)
+	}
+	return fp, ok, nil
+}
+
+func (s *FileStore) interruptedRewrap(ctx context.Context) ([sha256.Size]byte, bool, error) {
+	var fp [sha256.Size]byte
+	if err := s.checkConfig(); err != nil {
+		return fp, false, err
+	}
+	_, done, err := s.openLocked(ctx, false, false)
+	if errors.Is(err, fs.ErrNotExist) {
+		return fp, false, nil
+	}
+	if err != nil {
+		return fp, false, err
+	}
+	defer done()
+	mroot, err := s.openMasterDir(false)
+	if errors.Is(err, fs.ErrNotExist) {
+		return fp, false, nil
+	}
+	if err != nil {
+		return fp, false, fmt.Errorf("%w: %w", ErrMasterUntrusted, err)
+	}
+	defer func() { _ = mroot.Close() }() // read-only; nothing to flush
+	recorded, fi, err := readFile(mroot, masterNextFingerprintName, fingerprintFileSize)
+	if errors.Is(err, fs.ErrNotExist) {
+		return fp, false, nil
+	}
+	if err != nil {
+		return fp, false, fmt.Errorf("%w: %s: %w", ErrMasterUntrusted, masterNextFingerprintName, err)
+	}
+	if err := s.checkOwned(fi, fileMode); err != nil {
+		return fp, false, fmt.Errorf("%w: %s: %w", ErrMasterUntrusted, masterNextFingerprintName, err)
+	}
+	if fi.Mode().Perm() != fileMode {
+		return fp, false, fmt.Errorf("%w: %s: mode %04o, want %04o", ErrMasterUntrusted, masterNextFingerprintName, fi.Mode().Perm(), fileMode)
+	}
+	hexFP, nl := strings.CutSuffix(string(recorded), "\n")
+	n, derr := hex.Decode(fp[:], []byte(hexFP))
+	if !nl || derr != nil || n != sha256.Size || len(hexFP) != hex.EncodedLen(sha256.Size) {
+		return [sha256.Size]byte{}, false, fmt.Errorf("%w: %s is not a hex SHA-256 and a newline", ErrMasterUntrusted, masterNextFingerprintName)
+	}
+	return fp, true, nil
 }
 
 // resumed is ErrRewrapResumed, unless the key a resumed Rewrap completed, now

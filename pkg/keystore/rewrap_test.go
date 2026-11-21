@@ -21,6 +21,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -1102,4 +1103,92 @@ func TestRewrapUserScopesUnderLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	checkRewrapValues(t, s, vals)
+}
+
+// TestInterruptedRewrap: InterruptedRewrap reports the fingerprint a crashed
+// Rewrap recorded, SHA-256 of its key, from a crash after master.next.sha256
+// lands through one between the two master renames, and nothing for a store
+// with no Rewrap pending. A fingerprint file it cannot trust is
+// ErrMasterUntrusted. It writes nothing.
+func TestInterruptedRewrap(t *testing.T) {
+	ctx := context.Background()
+	want := sha256.Sum256(rewrapKey(1))
+	crashed := func(t *testing.T, at string) (*FileStore, string) {
+		t.Helper()
+		s, server := newTestStore(t)
+		seedRewrap(t, s)
+		s.step = failAt(at)
+		if err := s.Rewrap(ctx, rewrapKey(1)); err == nil {
+			t.Fatal("Rewrap succeeded through a crash")
+		}
+		s.step = func(string) error { return nil }
+		return s, server
+	}
+	for _, at := range []string{
+		"write v1.new",
+		"rename a/v1",
+		"rename b/current",
+		"rename " + masterNextName,
+	} {
+		t.Run("crash at "+at, func(t *testing.T) {
+			s, server := crashed(t, at)
+			snap := treeSnapshot(t, filepath.Dir(server))
+			fp, ok, err := s.InterruptedRewrap(ctx)
+			if err != nil || !ok || fp != want {
+				t.Fatalf("InterruptedRewrap = %x, %v, %v; want %x, true, nil", fp, ok, err, want)
+			}
+			checkTreeUnchanged(t, snap, treeSnapshot(t, filepath.Dir(server)))
+		})
+	}
+	none := map[string]func(t *testing.T) *FileStore{
+		"no keystore": func(t *testing.T) *FileStore { s, _ := newTestStore(t); return s },
+		"entries, no rewrap": func(t *testing.T) *FileStore {
+			s, _ := newTestStore(t)
+			seedRewrap(t, s)
+			return s
+		},
+		"a completed rewrap": func(t *testing.T) *FileStore {
+			s, _ := newTestStore(t)
+			seedRewrap(t, s)
+			if err := s.Rewrap(ctx, rewrapKey(1)); err != nil {
+				t.Fatal(err)
+			}
+			return s
+		},
+		"a crash before master.next.sha256 lands": func(t *testing.T) *FileStore {
+			s, _ := crashed(t, "write "+masterNextFingerprintName)
+			return s
+		},
+	}
+	for name, mk := range none {
+		t.Run(name, func(t *testing.T) {
+			fp, ok, err := mk(t).InterruptedRewrap(ctx)
+			if err != nil || ok || fp != ([sha256.Size]byte{}) {
+				t.Fatalf("InterruptedRewrap = %x, %v, %v; want zero, false, nil", fp, ok, err)
+			}
+		})
+	}
+	for name, damage := range map[string]func(t *testing.T, p string){
+		"not hex": func(t *testing.T, p string) {
+			writeFile(t, p, strings.Repeat("z", 2*sha256.Size)+"\n")
+		},
+		"no newline": func(t *testing.T, p string) {
+			writeFile(t, p, hex.EncodeToString(want[:])+"0")
+		},
+		"group readable": func(t *testing.T, p string) {
+			if err := os.Chmod(p, 0o640); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run("refuses "+name, func(t *testing.T) {
+			s, server := crashed(t, "write v1.new")
+			p := masterPath(server, masterNextFingerprintName)
+			damage(t, p)
+			giveToService(t, p)
+			if _, ok, err := s.InterruptedRewrap(ctx); !errors.Is(err, ErrMasterUntrusted) || ok {
+				t.Fatalf("InterruptedRewrap: ok %v, %v; want ErrMasterUntrusted", ok, err)
+			}
+		})
+	}
 }
