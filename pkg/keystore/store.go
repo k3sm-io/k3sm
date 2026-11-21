@@ -383,7 +383,8 @@ func listEntry(e *entry, k keys) Entry {
 // generation and v1 is an interrupted Put, which is not an entry and is
 // discarded by the next Put of the name; one holding more is damage that List
 // reports, and Delete, called again, clears it. Delete reads nothing inside the
-// entry, so it removes one List reports as corrupt.
+// entry, so it removes one List reports as corrupt. A symlink or any other
+// non-directory at the name is unlinked without being followed.
 func (s *FileStore) Delete(ctx context.Context, name string) error {
 	if err := s.delete(ctx, name); err != nil {
 		return fmt.Errorf("delete %s: %w", name, err)
@@ -403,6 +404,15 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 		return err
 	}
 	defer done()
+	// Anything but a directory at the name was planted there, since Put makes
+	// only directories: it is unlinked, and a symlink is removed itself,
+	// never followed.
+	if fi, err := root.Lstat(name); err == nil && !fi.IsDir() {
+		if err := root.Remove(name); err != nil {
+			return err
+		}
+		return syncDir(root)
+	}
 	e, err := openEntryDir(root, name)
 	damaged := errors.Is(err, errNoPointer)
 	if err != nil && !damaged {

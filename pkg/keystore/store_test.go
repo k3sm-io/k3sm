@@ -500,6 +500,45 @@ func TestDeleteCorruptEntry(t *testing.T) {
 	}
 }
 
+// TestDeletePlantedNonDirectory: a symlink or a regular file planted at an
+// entry name is removed by Delete, unlinked without being followed, so the
+// entry a symlink names is untouched.
+func TestDeletePlantedNonDirectory(t *testing.T) {
+	ctx := context.Background()
+	for name, plant := range map[string]func(t *testing.T, p string){
+		"symlink to another entry": func(t *testing.T, p string) {
+			if err := os.Symlink("a", p); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"regular file": func(t *testing.T, p string) { writeFile(t, p, "planted") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, server := newTestStore(t)
+			mustPut(t, s, "a", KindOpaque, []byte("a"))
+			ks := filepath.Join(server, "keystore")
+			before := dirContents(t, filepath.Join(ks, "a"))
+			p := filepath.Join(ks, "b")
+			plant(t, p)
+			if got, err := s.List(ctx); err != nil || len(got) != 2 || !errors.Is(got[1].Err, ErrCorrupt) {
+				t.Fatalf("List = %+v %v, want b marked ErrCorrupt", got, err)
+			}
+			if err := s.Delete(ctx, "b"); err != nil {
+				t.Fatalf("Delete: %v", err)
+			}
+			if _, err := os.Lstat(p); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("after Delete: %v, want the name gone", err)
+			}
+			if after := dirContents(t, filepath.Join(ks, "a")); !maps.Equal(after, before) {
+				t.Fatalf("Delete changed the entry a symlink named: %q, was %q", after, before)
+			}
+			if _, val, err := s.Current(ctx, "a"); err != nil || string(val) != "a" {
+				t.Fatalf("Current a = %q %v", val, err)
+			}
+		})
+	}
+}
+
 // TestReadErrorIsNotCorrupt: a file that cannot be read for want of
 // permission is reported as that, not as ErrCorrupt, whose fix (restore from
 // backup) would be the wrong one.
