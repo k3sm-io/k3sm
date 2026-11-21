@@ -316,7 +316,10 @@ func (s *FileStore) floorOwned(fi fs.FileInfo) error {
 }
 
 // parseFloor decodes a floor file, refusing anything a root verb would not
-// have written.
+// have written. encoding/json matches a field name in any case and keeps the
+// last of a duplicate key, so what it decodes is encoded again and must be
+// the bytes it read, with or without marshalFloor's trailing newline: one
+// encoding per floor, and no file with two answers for one field.
 func parseFloor(b []byte) (floor, error) {
 	dec := json.NewDecoder(bytes.NewReader(b))
 	dec.DisallowUnknownFields()
@@ -341,6 +344,13 @@ func parseFloor(b []byte) (floor, error) {
 		if checkName(name) != nil || err != nil || len(g) != generationSize || hex.EncodeToString(g) != e.Generation || e.Seq == 0 {
 			return nil, fmt.Errorf("%w: entry %q", errFloorMalformed, name)
 		}
+	}
+	canon, err := marshalFloor(f.Entries)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", errFloorMalformed, err)
+	}
+	if !bytes.Equal(b, canon) && !bytes.Equal(b, canon[:len(canon)-1]) {
+		return nil, fmt.Errorf("%w: not in the form a keys verb writes (a duplicate or differently cased key, reordered fields or extra whitespace)", errFloorMalformed)
 	}
 	return f.Entries, nil
 }
