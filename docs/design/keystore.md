@@ -1112,12 +1112,21 @@ service user can only add to.
      mode 0600, with the BSD system append-only flag (`chflags sappnd`), which only root can
      clear. The service user can append lines; it cannot truncate, overwrite, rename or unlink
      the file, and the data root above it is root's, so it cannot replace it. This variant
-     stands only if, on an APFS data volume, the service user can `O_APPEND` and cannot clear
-     the flag or defeat it with `O_TRUNC`, `ftruncate`, a `pwrite` at an offset,
-     `fcntl(F_PUNCHHOLE)`, `link()` to a new name, `fclonefileat` then a swap, `unlink` or
+     stands only if, on an APFS data volume, the service user can `O_APPEND` and cannot
+     defeat the flag with any entry of **the defeat list**: `chflags nosappnd` by the service
+     user, `O_TRUNC`, `ftruncate`, a `pwrite` at an offset, a write through a shared writable
+     `mmap` of the file, `fcntl(F_PUNCHHOLE)`, `link()` to a new name, `fclonefileat` then a
+     swap, a `renamex_np` swap (`RENAME_SWAP`) through the parent, `exchangedata`, `unlink` or
      `rename` through the parent, or a second open with `O_TRUNC`; and if `chmod` by the owner
      widens nothing `[K0 leg 1: pending]`. The kernel securelevel (`sysctl kern.securelevel`)
      and whether root can clear the flag at it are recorded too `[K0 leg 1: pending]`.
+
+     The spike measures the list once; a standing integration row keeps measuring it. U50 runs
+     every entry of the defeat list against the flagged files as the service user, through the
+     same root-run mechanism as the gate's existing `--root` mode (the test binary is built as
+     the invoking user and only it runs under `sudo -n`, dropping to the service user for each
+     attempt), and fails if any attempt changes a byte already written or the flag. A macOS
+     update that opens a new hole then turns the gate red rather than the floor quietly weak.
   2. *The floor helper.* If any of those checks fails, a small root launchd daemon on the
      `k3sm-netd` pattern owns both logs as root, mode 0600, and appends lines on the server's
      request over a root-owned socket that admits only the service uid, refusing every request
@@ -1144,6 +1153,12 @@ service user can only add to.
   (`keystore.logHardCap`, default 256 MiB). Past the soft cap `doctor` shows the size and the
   rotate hint; past the hard cap the server refuses every mutating user operation with
   `ErrLogFull` until root rotates or rebuilds (U24).
+- **Per-uid fairness.** The logs are shared, so one user must not be able to fill them for
+  everyone. Each uid gets a budget in each log, a fixed share of that log's hard cap. The
+  server counts each uid's bytes per log from the log at start and on every append. A uid past
+  its share has its own mutations refused with `ErrLogFull`; every other uid is unaffected and
+  keeps its own share. The hard cap above still bounds the whole log. Lines written for root
+  verbs and for the reconciler are not charged to any uid (U51).
 - **Backup and restore.** The flag does not survive `cp`, rsync or Time Machine, so a restore
   always ends with `floor --rebuild`, and `audit --rotate` re-flags the audit log. Until then
   the listener refuses to start (U25, E17).
@@ -1156,14 +1171,15 @@ service user can only add to.
 ### The audit log
 
 `keystore-audit.log` is JSON Lines, append-only like the user-scope floor, with one line per
-call through the socket, per root verb and per reconciler write or deletion:
+call through the socket, per root verb, per reconciler write or deletion, and per connection
+refused before its first frame:
 
 ```json
 {"v":1,"ts":"<RFC3339Nano>","op":"put","via":"socket","caller":{"uid":501,"user":"alice","pid":4242},"scope":"user/501","name":"claude-a","version":3,"fingerprint":"<per-scope fingerprint or empty>","namespace":"<ns or empty>","result":"ok"}
 ```
 
 - **Fields.** `op` and `result` are open sets (today `put`, `rotate`, `rm`, `list`,
-  `exec-read`, `deliver`, `withdraw`, `rewrap`, `floor-rebuild`, `audit-rotate`,
+  `show`, `exec-read`, `deliver`, `withdraw`, `rewrap`, `rm-scope`, `floor-rebuild`, `audit-rotate`,
   `deliver-write`, `deliver-delete`, `refused`; and `ok` or a sentinel name). `via` is
   `socket`, `root` or `reconciler`. `caller.user` is display-only beside the uid, and `pid` is
   advisory. Readers ignore unknown fields, and `v` bumps only on a breaking change (U23). The
@@ -1174,8 +1190,21 @@ call through the socket, per root verb and per reconciler write or deletion:
 - **Fail closed.** The line is written before the reply. If an append fails, mutating
   operations are refused, and so are the reads (`list`, `read-for-exec`, `deliveries`), until
   an append succeeds (U32).
+- **Coverage.** Three sources write lines besides the socket's operations, so no act on the
+  keystore goes unrecorded:
+  - *every root verb* (`put`, `rotate`, `rm`, `rewrap`, `deliver`, `floor --rebuild`, `audit
+    --rotate`, `rm-scope`, and the reads `list` and `show`), with `via` `root`, once
+    `sudo k3sm install` has created the log; before that the system scope works as in Phase A
+    and writes no line (U52);
+  - *every reconciler write and delete* of a Secret and every withdrawal of a sealed record
+    entry, with `via` `reconciler` and the KeyDelivery's namespace and UID (U53);
+  - *each pre-frame refusal*: a connection from uid 0, from the service uid or from a uid
+    below 501 is refused before any frame is read, and the refusal writes a `refused` line
+    carrying the peer uid (U54).
 - **`refused` lines are rate-limited per uid**, at most 10 a minute, with one summary line
   giving the count dropped, so a hostile local user cannot fill the log with refusals (U33).
+  Pre-frame refusals are rate-limited the same way, per peer uid, with their own dropped-count
+  summary (U54).
 - **What it claims.** The log is append-only against truncation and deletion by the service
   user. A service-user process outside Seatbelt can append forged lines, because it shares the
   trust domain with the master; a hash chain would not stop that writer, so there is none.
@@ -1243,8 +1272,10 @@ keys` CLI, which other programs call as a subprocess with the value on stdin.
   exits 1.
 
 **Bounds.** 16 concurrent connections, at most 2 per uid among them; 10 seconds per request;
-5 mutating operations a second per uid; `read-for-exec` at most 30 a minute per uid, each
-audited as `exec-read` (U28, U34).
+5 mutating operations a second per uid; `list` and `deliveries` rate-limited per uid like
+mutations, at 5 a second; `read-for-exec` at most 30 a minute per uid, each audited as
+`exec-read` (U28, U34, U51). Reads are limited too because each one writes an audit line, so
+an unlimited read would be a way around the per-uid log share.
 
 **Operations.** `put`, `rotate` (a value, or `from_version`), `list` (own scope only), `rm`,
 `read-for-exec` (own entry only), `deliver` and `withdraw` ("KeyDelivery"), and `deliveries`
@@ -1516,8 +1547,9 @@ the uid throughout.
 4. A delivered value is in kine (encrypted only with `--secrets-encryption`) and in every
    Pod-readable Secret on the node, exactly as Phase A says. Direct mounts (Phase B) would
    remove the kine copy, not the Pod reach.
-5. A local user can spend the server's CPU, up to 16 MiB of disk within quota, and two
-   connections.
+5. A local user can spend the server's CPU, up to 16 MiB of disk within quota, two
+   connections, and its own share of each shared log. Past that share only its own mutations
+   are refused with `ErrLogFull`; it cannot fill a log for other users.
 6. A user account deleted and recreated under the same uid loses its old scope, by design
    (U6), and root must clear it.
 7. The peer uid is the effective uid at connect time, so a setuid program the user runs acts as
@@ -1674,6 +1706,11 @@ each stated in the change that makes it. U15 is held for a K0 amendment and U39 
 | U45 | cross-user refusal with a fake peer-credential source: a peer with uid B asks for `list`, `read-for-exec`, `rotate`, `rm` and `deliver` of uid A's entries, and for any `system/…` name; every call is `ErrNotFound` with text identical to an absent entry of B's own, and the `refused` audit lines carry uid B | `k3sm/pkg/keystore/socket::TestCrossUserRefusedFakePeerCred`, `TestNonRootCannotNameSystemEntries` | pending: the socket operations |
 | U46 | `baseSocketDenies` derives the `keys.sock` path from `runtimed/pkg/keystorepaths` and denies `connect(2)` to it | `k3sm/pkg/provider::TestBaseSocketDeniesKeystoreSocket` | pending: the socket listener |
 | U49 | `runtimed/pkg/keystorepaths` builds with `CGO_ENABLED=0` and imports only the standard library; `k3sm/pkg/keystore` imports that leaf and never `runtimed/pkg/sandbox` | `runtimed/pkg/keystorepaths::TestLeafImportsStdlibOnly`; `k3sm/pkg/keystore::TestKeystoreImportsNoSandbox` | pending: runtimed's sandbox change, the append-only files |
+| U50 | the defeat list, run as the service user against both flagged logs (integration, root-run in the gate's `--root` mode, flag variant): `chflags nosappnd`, `O_TRUNC`, `ftruncate`, `pwrite` at an offset, a shared writable `mmap` write, `F_PUNCHHOLE`, `link()`, `fclonefileat` then a swap, a `renamex_np` swap through the parent, `exchangedata`, `unlink` and `rename` through the parent, a second open with `O_TRUNC`, and owner `chmod`; each fails, the bytes and the flag are unchanged, and an `O_APPEND` write still succeeds | `k3sm/pkg/keystore::TestAppendOnlyDefeatListAsServiceUser` | pending: the append-only files |
+| U51 | per-uid log fairness: a uid past its share of a log's hard cap has its own mutations refused with `ErrLogFull` while another uid's succeed; `list` and `deliveries` are rate-limited per uid | `k3sm/pkg/keystore/socket::TestLogSharePerUIDRefusesOnlyThatUID`, `TestReadRateLimitPerUID` | pending: the socket operations |
+| U52 | every root verb writes one audit line with `via` `root` once the log exists, and none before it | `k3sm/cmd/k3sm::TestEveryRootVerbWritesAuditLine` | pending: the append-only files |
+| U53 | every reconciler Secret write and delete, and every record withdrawal, writes one audit line with `via` `reconciler` | `k3sm/pkg/keystore/reconcile::TestEveryReconcilerWriteAndDeleteAudited` | pending: the KeyDelivery reconciler (lifecycle) |
+| U54 | a pre-frame refusal (uid 0, the service uid, a uid below 501) writes a `refused` line with the peer uid, rate-limited per uid with a dropped-count summary | `k3sm/pkg/keystore/socket::TestPreFrameRefusalsAudited`, `TestPreFrameRefusalLinesRateLimited` | pending: the socket listener |
 
 ### Rig legs
 
