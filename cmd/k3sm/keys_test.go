@@ -1115,6 +1115,71 @@ func TestKeysRewrapResumeFailedKeepsKeyFile(t *testing.T) {
 	}
 }
 
+// keysSwapDirStore stands in for a directory swapped under a running
+// rewrap: its Rewrap moves the --key-out file's directory aside, puts a new
+// directory holding a decoy at the old path, and fails as the store does
+// before it seals anything, so the verb deletes its key file.
+type keysSwapDirStore struct {
+	keysStore
+	dir string
+}
+
+func (s keysSwapDirStore) Rewrap(context.Context, []byte) error {
+	if err := os.Rename(s.dir, s.dir+".moved"); err != nil {
+		return err
+	}
+	if err := os.Mkdir(s.dir, 0o700); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(s.dir, "new-master"), []byte("decoy"), 0o600); err != nil {
+		return err
+	}
+	return fmt.Errorf("rewrap: injected refusal (%w)", keystore.ErrRewrapNotStarted)
+}
+
+// TestKeysRewrapKeyOutDeletesThroughCheckedDir: after a rewrap that sealed
+// nothing, the --key-out file is deleted through the directory handle that
+// was checked when it was written, so a directory swapped in at its path
+// loses nothing; and a relative --key-out is refused before anything is
+// written.
+func TestKeysRewrapKeyOutDeletesThroughCheckedDir(t *testing.T) {
+	t.Run("deletes through the checked directory", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/a", []byte("a-value"))
+		dir := filepath.Join(t.TempDir(), "keys")
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		h.wrap = func(s keysStore) keysStore { return keysSwapDirStore{keysStore: s, dir: dir} }
+		h.mustRun(1, "rewrap", "--key-out", filepath.Join(dir, "new-master"))
+		if got, err := os.ReadFile(filepath.Join(dir, "new-master")); err != nil || string(got) != "decoy" {
+			t.Fatalf("the file swapped in at the key file's path: %q, %v; want it untouched", got, err)
+		}
+		if _, err := os.Lstat(filepath.Join(dir+".moved", "new-master")); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("the key file written in the checked directory was not deleted: %v", err)
+		}
+		if !strings.Contains(h.stderr.String(), "was deleted") {
+			t.Errorf("stderr %q does not say the key file was deleted", h.stderr.String())
+		}
+	})
+	t.Run("refuses a relative path", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/a", []byte("a-value"))
+		before := h.masterFile()
+		h.calls = nil
+		h.mustRun(1, "rewrap", "--key-out", "new-master")
+		if !strings.Contains(h.stderr.String(), "give an absolute path") {
+			t.Errorf("stderr %q does not say to give an absolute path", h.stderr.String())
+		}
+		if slices.Contains(h.calls, "Rewrap") || !bytes.Equal(h.masterFile(), before) {
+			t.Fatal("rewrap ran")
+		}
+		if _, err := os.Lstat("new-master"); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("a key file was written in the working directory: %v", err)
+		}
+	})
+}
+
 // keysHalfRewrapStore stands in for a rewrap interrupted after it renamed
 // some records in, whose master.next was then replaced or removed, the
 // scenario of pkg/keystore's TestRewrapRecoversReplacedNext. Its Rewrap runs

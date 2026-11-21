@@ -738,30 +738,52 @@ func keysRm(ctx context.Context, args []string, env keysEnv) int {
 	return keysOK
 }
 
+// keyOutFile is a key file writeKeyOut wrote, held through the directory
+// handle it checked, so a later delete removes that file and no other that
+// came to have its path.
+type keyOutFile struct {
+	root *os.Root
+	base string
+}
+
+// remove deletes the key file through the checked directory.
+func (k *keyOutFile) remove() error { return k.root.Remove(k.base) }
+
+// close releases the directory handle; the file stays.
+func (k *keyOutFile) close() { _ = k.root.Close() } // read-only handle; writes were synced
+
 // writeKeyOut creates path as a new root-only file holding key: O_EXCL, so an
 // existing file or symlink there is refused rather than overwritten or
 // followed, mode 0600, and fsynced with its directory before rewrap uses it.
-// The directory must be owned by root (the running user, which requireRoot
-// made root) and closed to group and others for writing, judged on the
-// descriptor the file is created through, so no other user can swap or
-// unlink the file. A failure after the file is created removes it, so a
-// refusal never leaves a partial key behind.
-func writeKeyOut(path string, key []byte, step func(string) error) (err error) {
+// path must be absolute. The directory must be owned by root (the running
+// user, which requireRoot made root) and closed to group and others for
+// writing, judged on the descriptor the file is created through, so no other
+// user can swap or unlink the file. A failure after the file is created
+// removes it, so a refusal never leaves a partial key behind. On success the
+// caller holds that descriptor in the returned keyOutFile and closes it.
+func writeKeyOut(path string, key []byte, step func(string) error) (out *keyOutFile, err error) {
 	if step == nil {
 		step = func(string) error { return nil }
+	}
+	if !filepath.IsAbs(path) {
+		return nil, errors.New("--key-out is a relative path: give an absolute path")
 	}
 	dir, base := filepath.Dir(path), filepath.Base(path)
 	root, err := os.OpenRoot(dir)
 	if err != nil {
-		return fmt.Errorf("open the key file's directory: %w", err)
+		return nil, fmt.Errorf("open the key file's directory: %w", err)
 	}
-	defer func() { _ = root.Close() }() // synced below when a file is written
+	defer func() {
+		if err != nil {
+			_ = root.Close() // synced below when a file is written
+		}
+	}()
 	if err := checkKeyOutDir(root, dir); err != nil {
-		return err
+		return nil, err
 	}
 	f, err := root.OpenFile(base, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
-		return fmt.Errorf("create the key file: %w", err)
+		return nil, fmt.Errorf("create the key file: %w", err)
 	}
 	defer func() {
 		if cerr := f.Close(); err == nil && cerr != nil {
@@ -774,32 +796,32 @@ func writeKeyOut(path string, key []byte, step func(string) error) (err error) {
 		}
 	}()
 	if err := f.Chmod(0o600); err != nil {
-		return fmt.Errorf("chmod the key file: %w", err)
+		return nil, fmt.Errorf("chmod the key file: %w", err)
 	}
 	if err := step("chmod"); err != nil {
-		return err
+		return nil, err
 	}
 	if _, err := f.Write(key); err != nil {
-		return fmt.Errorf("write the key file: %w", err)
+		return nil, fmt.Errorf("write the key file: %w", err)
 	}
 	if err := step("write"); err != nil {
-		return err
+		return nil, err
 	}
 	if err := f.Sync(); err != nil {
-		return fmt.Errorf("sync the key file: %w", err)
+		return nil, fmt.Errorf("sync the key file: %w", err)
 	}
 	if err := step("sync"); err != nil {
-		return err
+		return nil, err
 	}
 	d, err := root.Open(".")
 	if err != nil {
-		return fmt.Errorf("open the key file's directory: %w", err)
+		return nil, fmt.Errorf("open the key file's directory: %w", err)
 	}
 	defer func() { _ = d.Close() }() // read-only; synced below
 	if err := d.Sync(); err != nil {
-		return fmt.Errorf("sync the key file's directory: %w", err)
+		return nil, fmt.Errorf("sync the key file's directory: %w", err)
 	}
-	return nil
+	return &keyOutFile{root: root, base: base}, nil
 }
 
 // checkKeyOutDir refuses a --key-out directory that is not owned by the
@@ -905,6 +927,7 @@ func keysRewrap(ctx context.Context, args []string, env keysEnv) int {
 	}
 	keyPath := *keyIn
 	var key []byte
+	var out *keyOutFile
 	if keyPath != "" {
 		key, err = readKeyIn(keyPath)
 		if err != nil {
@@ -921,10 +944,12 @@ func keysRewrap(ctx context.Context, args []string, env keysEnv) int {
 			clear(key)
 			return v.failf(keysRefused, "draw a new master key: %v", err)
 		}
-		if err := writeKeyOut(keyPath, key, env.keyOutStep); err != nil {
+		out, err = writeKeyOut(keyPath, key, env.keyOutStep)
+		if err != nil {
 			clear(key)
 			return v.failf(keysRefused, "%v; nothing was changed", err)
 		}
+		defer out.close()
 		fmt.Fprintf(env.stderr, "k3sm keys rewrap: saved the new master key to %s (mode 0600). Keep this file until rewrap reports success, then delete it.\n", keyPath)
 	}
 	defer clear(key)
@@ -941,7 +966,7 @@ func keysRewrap(ctx context.Context, args []string, env keysEnv) int {
 	if resumed {
 		code, next = keysResumed, "\nrun rewrap again with a new key: sudo k3sm keys rewrap --key-out <new file>."
 	}
-	return v.failf(code, "%v%s\n%s", err, next, keyFileAfterFailure(err, keyPath, *keyOut != "", resumed))
+	return v.failf(code, "%v%s\n%s", err, next, keyFileAfterFailure(err, keyPath, out, resumed))
 }
 
 // keysResumeFailed is what rewrap says after keystore.ErrRewrapResumeFailed:
@@ -955,9 +980,11 @@ const keysResumeFailed = "an earlier interrupted rewrap was advanced and did not
 // store returns only before it writes anything under the key; after any
 // other error a resume may need the file, so it is kept. After
 // keystore.ErrRewrapResumeFailed the file is kept too, and the operator is
-// sent to the earlier rewrap's key file. A --key-in file is the operator's
-// and is never deleted.
-func keyFileAfterFailure(err error, keyPath string, wrote, resumed bool) string {
+// sent to the earlier rewrap's key file. A --key-in file (out nil) is the
+// operator's and is never deleted. The delete goes through out, the
+// directory handle writeKeyOut checked, never through keyPath again.
+func keyFileAfterFailure(err error, keyPath string, out *keyOutFile, resumed bool) string {
+	wrote := out != nil
 	if errors.Is(err, keystore.ErrRewrapResumeFailed) {
 		if wrote {
 			return fmt.Sprintf("%s\nthis run's key file %s was kept", keysResumeFailed, keyPath)
@@ -971,7 +998,7 @@ func keyFileAfterFailure(err error, keyPath string, wrote, resumed bool) string 
 	if resumed {
 		what = "the key this run drew was never used"
 	}
-	if rerr := os.Remove(keyPath); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
+	if rerr := out.remove(); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
 		return fmt.Sprintf("%s; delete %s by hand: %v", what, keyPath, rerr)
 	}
 	return fmt.Sprintf("%s, so %s was deleted", what, keyPath)
