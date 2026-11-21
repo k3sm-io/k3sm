@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # The keystore's acceptance gate: docs/design/keystore.md § "Acceptance gate",
-# rows G1 to G22, the user-scope rows U1 to U57 (U15 and U39 are unused) and
+# rows G1 to G22, the user-scope rows U1 to U63 (U15 and U39 are unused) and
 # the rig legs E1 to E23. Every row is listed, on exactly one line. A row runs
 # the tests that deliver it and passes only if each named test ran and passed
 # in its own package; a row whose change has not landed yet prints PENDING,
@@ -33,15 +33,15 @@
 #   --delivery      the system delivery: G18 to G20.
 #   --sandbox       the pod denies and the shared path names: U16, U17, U49.
 #   --api           the KeyDelivery API types: U18, U19.
-#   --scope         user scopes: U6 to U11, U47.
-#   --scope-store   the user-scope store: U12 to U14.
-#   --files         the append-only files: U20 to U25, U50, U52.
+#   --scope         user scopes: U6 to U11, U47, U58.
+#   --scope-store   the user-scope store: U12 to U14, U63.
+#   --files         the append-only files: U20 to U25, U50, U52, U60, U61.
 #   --socket        the socket listener: U26 to U31, U46, U48, U54.
 #   --socket-ops    the socket operations: U32 to U35, U45, U51.
 #   --exec          the non-root CLI and exec: U36 to U38.
 #   --kd-author     KeyDelivery authoring: U40, U41.
-#   --kd-reconcile  the KeyDelivery reconciler: U42, U43.
-#   --kd-lifecycle  the KeyDelivery lifecycle: U44, U53, U55, U56.
+#   --kd-reconcile  the KeyDelivery reconciler: U42, U43, U59.
+#   --kd-lifecycle  the KeyDelivery lifecycle: U44, U53, U55, U56, U62.
 #   --grammar       the entry grammar in apis: U57.
 #   --docs          the user docs: no row yet, so it exits 3.
 # A unit mode runs only its rows and only their tests, with the same exit
@@ -90,7 +90,8 @@ EXPECTED_ROWS="U1 U2 U3 U4 U5 U6 U7 U8 U9 U10 U11 U12 U13 U14 U16 U17 U18 U19 U2
 EXPECTED_ROWS="$EXPECTED_ROWS U21 U22 U23 U24 U25 U26 U27 U28 U29 U30 U31 U32 U33 U34 U35"
 EXPECTED_ROWS="$EXPECTED_ROWS U36 U37 U38 U40 U41 U42 U43 U44 U45 U46 U47 U48"
 EXPECTED_ROWS="$EXPECTED_ROWS U49 U50 U51 U52 U53 U54 U55 U56 U57"
-# >>> ADD NEW U ROWS (U58 upward) HERE <<<
+EXPECTED_ROWS="$EXPECTED_ROWS U58 U59 U60 U61 U62 U63"
+# >>> ADD NEW U ROWS (U64 upward) HERE <<<
 EXPECTED_ROWS="$EXPECTED_ROWS E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 E13 E14 E15 E16 E17 E18 E19 E20"
 EXPECTED_ROWS="$EXPECTED_ROWS E21 E22 E23"
 # >>> ADD NEW E LEGS (E24 upward) HERE <<<
@@ -118,15 +119,15 @@ mode_rows() {
 	delivery) echo "G18 G19 G20" ;;
 	sandbox) echo "U16 U17 U49" ;;
 	api) echo "U18 U19" ;;
-	scope) echo "U6 U7 U8 U9 U10 U11 U47" ;;
-	scope-store) echo "U12 U13 U14" ;;
-	files) echo "U20 U21 U22 U23 U24 U25 U50 U52" ;;
+	scope) echo "U6 U7 U8 U9 U10 U11 U47 U58" ;;
+	scope-store) echo "U12 U13 U14 U63" ;;
+	files) echo "U20 U21 U22 U23 U24 U25 U50 U52 U60 U61" ;;
 	socket) echo "U26 U27 U28 U29 U30 U31 U46 U48 U54" ;;
 	socket-ops) echo "U32 U33 U34 U35 U45 U51" ;;
 	exec) echo "U36 U37 U38" ;;
 	kd-author) echo "U40 U41" ;;
-	kd-reconcile) echo "U42 U43" ;;
-	kd-lifecycle) echo "U44 U53 U55 U56" ;;
+	kd-reconcile) echo "U42 U43 U59" ;;
+	kd-lifecycle) echo "U44 U53 U55 U56 U62" ;;
 	grammar) echo "U57" ;;
 	*) echo "" ;;
 	esac
@@ -299,22 +300,22 @@ pend U9 "per-scope fingerprints differ for equal values in two scopes (user scop
 	TestFingerprintsDifferAcrossScopes
 pend U10 "user/<other>/... is ErrNotFound, same text as an absent entry; a short name resolves to the uid and is printed (user scopes)" \
 	TestOtherUserIsNotFound TestShortNameResolvesToUID
-pend U11 "the Go resolver passes the shared entry-grammar vectors; pkg/keystore imports no Kubernetes package (user scopes)" \
-	TestEntryGrammarVectorsResolver TestCheckScopeRefusesUserZero TestAllDigitSegmentIsAlwaysUID TestKeystoreIsKubernetesFree
+pend U11 "the Go resolver and Phase A's checkName pass the shared entry-grammar vectors; pkg/keystore imports no Kubernetes package (user scopes)" \
+	TestEntryGrammarVectorsResolver TestEntryGrammarVectorsCheckName TestCheckScopeRefusesUserZero TestAllDigitSegmentIsAlwaysUID TestKeystoreIsKubernetesFree
 pend U12 "master Rewrap re-wraps every scope.key and leaves user records byte-identical; resumable at every step, by fault injection as G12 (user-scope store)" \
 	TestRewrapRewrapsScopeKeysResumable
 pend U13 "quotas: the 257th entry and the byte budget answer ErrQuota; rm still works (user-scope store)" \
 	TestUserScopeQuota
 pend U14 "the delivery record stores UID and target digest; add, look up and withdraw round-trip under the floor (user-scope store)" \
 	TestDeliveryRecordDigestRoundTrip TestDeliveryRecordVersionByteAndDigestLabel
-pend U16 "every pod profile variant (native, vm, container-vm, xcode, expose-paths, a custom pod root distinct from the data root) denies every keystore path, each deny after every allow; a hostPath or expose path onto the data root is refused; an empty data root fails closed; rig leg E10 (sandbox denies)" \
-	runtimed/pkg/sandbox::TestDataRootDeniesKeystorePathsEveryProfile TestProtectedPrefixesRefuseKeystoreReallow TestEmptyDataRootFailsClosed TestVMGuestGetsNoDataRootShare
-pend U17 "runtimed refuses a pod process uid of 501 or above, and uid 0 without a drop, at credential resolution and at spawn; rig legs E21, E22 (sandbox denies)" \
+pend U16 "every pod profile variant (native, vm, container-vm, xcode, expose-paths, a custom pod root distinct from the data root) denies every keystore path, each deny after every allow; a hostPath or expose path onto the data root is refused; an empty data root fails closed; over the whole rendered profile, a pod root equal to or a parent of the data root included, no emitted allow matches a keystore path; canonical /private/var/lib/k3sm denies and a regex keystore- prefix deny; rig leg E10 (sandbox denies)" \
+	runtimed/pkg/sandbox::TestDataRootDeniesKeystorePathsEveryProfile TestNoEmittedAllowCoversKeystorePath TestDataRootDeniesCanonicalPathAndPrefixRegex TestProtectedPrefixesRefuseKeystoreReallow TestEmptyDataRootFailsClosed TestVMGuestGetsNoDataRootShare
+pend U17 "runtimed refuses a pod process uid of 501 or above, and uid 0 without a drop, at credential resolution and at spawn, on the final effective uid after any drop; rig legs E21, E22 (sandbox denies)" \
 	runtimed/pkg/runtime::TestResolveCredentialRefusesLoginRangeUID TestResolveCredentialRefusesRootWithoutDrop \
-	runtimed/pkg/supervisor::TestSpawnRefusesLoginRangeUID TestSpawnRefusesRootUIDWithoutDrop
-pend U18 "CRD: entry, secretName, dataKey, requestedBy immutable by CEL transition rules; status subresource on; reasons listed (KeyDelivery API)" \
-	apis/config/crd::TestKeyDeliveryCRDMatchesTheGoTypes TestKeyDeliveryImmutableFields TestKeyDeliveryRequiredFields TestKeyDeliveryRequestedByMatchesEntryUID TestKeyDeliveryConditionsListMap
-pend U19 "the CRD pattern, its maxLength and the uid range rule pass the shared entry-grammar vectors (KeyDelivery API)" \
+	runtimed/pkg/supervisor::TestSpawnRefusesLoginRangeUID TestSpawnRefusesRootUIDWithoutDrop TestSpawnChecksFinalEffectiveUID
+pend U18 "CRD: entry, secretName, dataKey, requestedBy immutable by CEL transition rules; status subresource on; reasons listed; a system/ entry is refused (KeyDelivery API)" \
+	apis/config/crd::TestKeyDeliveryCRDMatchesTheGoTypes TestKeyDeliveryImmutableFields TestKeyDeliveryRequiredFields TestKeyDeliveryRequestedByMatchesEntryUID TestKeyDeliveryConditionsListMap TestKeyDeliveryRefusesSystemEntry
+pend U19 "the CRD pattern, its maxLength, the uid range rule and the 253-byte name-length rule pass the shared entry-grammar vectors (KeyDelivery API)" \
 	apis/config/crd::TestEntryGrammarVectors
 pend U20 "a user-scope current copied back is refused against the floor log, with Phase A's floor message; rig leg E9 (append-only files)" \
 	TestUserFloorRefusesCopiedBackCurrent
@@ -354,16 +355,16 @@ pend U37 "exec sets the variable only in the child; nothing on stdout, nothing o
 	k3sm/cmd/k3sm::TestKeysExecEnvOnlyInChild TestNoNonRootVerbWritesValue
 pend U38 "an unknown error code prints the code; a connect failure names sudo k3sm install (non-root CLI and exec)" \
 	k3sm/cmd/k3sm::TestUnknownErrorCodeFallback TestConnectErrorNamesInstall
-pend U40 "the VAP stamps requestedBy and refuses a ServiceAccount creator; its CEL passes the shared grammar vectors (KeyDelivery authoring)" \
-	k3sm/pkg/policy::TestKeyDeliveryPolicyStampsRequestedBy TestEntryGrammarVectorsCEL
+pend U40 "the VAP checks requestedBy against the requester and refuses a ServiceAccount creator; its CEL passes the shared grammar vectors (KeyDelivery authoring)" \
+	k3sm/pkg/policy::TestKeyDeliveryPolicyChecksRequestedBy TestEntryGrammarVectorsCEL
 pend U41 "deliver creates impersonating only k3sm:local:<uid> and k3sm:local-users, refusing any other impersonation; it writes the UID and digest; withdraw deletes the object; undeliver prints the hint (KeyDelivery authoring)" \
 	k3sm/pkg/keystore/socket::TestDeliverImpersonatesUIDPrincipalOnly TestDeliverImpersonatesPeerUIDNotOwner TestImpersonationSendsNoUidOrExtra TestDeliverWritesDigestRecord \
 	k3sm/cmd/k3sm::TestUndeliverPrintsRotationHint
-pend U42 "an unrecorded UID, a digest mismatch, or a failed name-scoped SAR (create keydeliveries; create, update, delete secrets with resourceNames) gets no Secret; encryption off refuses, G18 for KeyDelivery (KeyDelivery reconciler)" \
+pend U42 "an unrecorded UID, a digest mismatch, or a failed name-scoped SAR (create keydeliveries; create, update, delete secrets with resourceNames) gets no Secret; encryption off refuses, G18 for KeyDelivery; each SAR carries the impersonated create's user and groups, so a group-bound grant is honoured consistently (KeyDelivery reconciler)" \
 	k3sm/pkg/keystore/reconcile::TestUnrecordedOrRetargetedDeliveryGetsNoSecret TestSARCreateUnnamedUpdateDeleteNamed \
-	TestEncryptionOffRefusesKeyDelivery
-pend U43 "reasons are the closed set; absent and not yours both read EntryUnavailable; a pre-existing unlabelled Secret is SecretExists; a second declaration is SecretClaimed; observedGeneration tracks (KeyDelivery reconciler)" \
-	k3sm/pkg/keystore/reconcile::TestConditionReasonsClosedSet TestReasonConditionTable TestOneDeclarationPerSecret
+	TestEncryptionOffRefusesKeyDelivery TestSARCarriesImpersonatedUserAndGroups TestGroupBoundGrantHonouredConsistently
+pend U43 "reasons are the closed set; absent and not yours both read EntryUnavailable; a pre-existing unlabelled Secret is SecretExists; a second declaration is SecretClaimed; observedGeneration tracks; Ready=False carries NotAuthorized for any authority failure; Ready=Unknown, Pending initially and while Authorized is Unknown (KeyDelivery reconciler)" \
+	k3sm/pkg/keystore/reconcile::TestConditionReasonsClosedSet TestReasonConditionTable TestOneDeclarationPerSecret TestReadyFalseCarriesNotAuthorized TestReadyUnknownPending
 pend U44 "losing authority deletes exactly the owned Secret; the crash order is Secret, record, finalizer at every interruption point; the orphan sweep removes labelled, owner-annotated Secrets with no live object and never an unlabelled or foreign one (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestLostAuthorityDeletesOnlyOwnedSecret TestFinalizerCrashOrder TestOrphanSweep
 pend U45 "cross-user refusal with a fake peer-credential seam: a peer with uid B asks for list, read-for-exec, rotate, rm and deliver of uid A's entries, and for any system/... name; every call is ErrNotFound with text identical to an absent entry of B's own, and the refused audit lines carry uid B (socket operations)" \
@@ -379,8 +380,8 @@ pend U49 "the shared keystore path names build with CGO_ENABLED=0 and import onl
 	runtimed/pkg/keystorepaths::TestLeafImportsStdlibOnly k3sm/pkg/keystore::TestKeystoreImportsNoSandbox
 pend U50 "the defeat list run as the service user against both flagged logs, root-run in --root mode: each defeat fails, bytes and flag unchanged, O_APPEND still succeeds (append-only files)" \
 	k3sm/pkg/keystore::TestAppendOnlyDefeatListAsServiceUser
-pend U51 "per-uid log fairness: a uid past its share of a log's cap is refused with ErrLogFull while another uid's succeed; list and deliveries are rate-limited per uid (socket operations)" \
-	k3sm/pkg/keystore/socket::TestLogSharePerUIDRefusesOnlyThatUID TestReadRateLimitPerUID
+pend U51 "per-uid log fairness: the share is a fixed byte count, at most 1/16 of the hard cap; a uid past its share is refused with ErrLogFull while another uid's succeed, never as the global append failure; list and deliveries are rate-limited per uid (socket operations)" \
+	k3sm/pkg/keystore/socket::TestLogSharePerUIDRefusesOnlyThatUID TestLogShareAtMostOneSixteenthOfHardCap TestShareRefusalIsNotGlobalAppendFailure TestReadRateLimitPerUID
 pend U52 "every root verb writes one audit line with via root once the log exists, and none before it (append-only files)" \
 	k3sm/cmd/k3sm::TestEveryRootVerbWritesAuditLine
 pend U53 "every reconciler Secret write and delete, and every record withdrawal, writes one audit line with via reconciler (KeyDelivery lifecycle)" \
@@ -393,7 +394,19 @@ pend U56 "a delivery record with an unknown format version is refused by the sto
 	k3sm/pkg/keystore::TestDeliveryRecordUnknownVersionRefused k3sm/pkg/keystore/reconcile::TestUnknownRecordVersionIsIndeterminate
 pend U57 "the entry grammar package imports only the standard library, exports the pattern, the maxLength and the parse, and passes the shared vector table (entry grammar)" \
 	apis/keystore/entry::TestGrammarVectors TestImportsStdlibOnly
-# >>> ADD NEW U ROWS (U58 upward) HERE, and add each to EXPECTED_ROWS and to mode_rows <<<
+pend U58 "seam guard, repo level: every package on the closed seam-package list has its TestMain stubs and its TestRealPrimitivesUnreachable, and no package off the list declares a seam (user scopes)" \
+	k3sm/pkg/keystore::TestEverySeamPackageHasAGuard
+pend U59 "seam guard: pkg/keystore/reconcile's TestMain stubs its clock seam (KeyDelivery reconciler)" \
+	k3sm/pkg/keystore/reconcile::TestRealPrimitivesUnreachable
+pend U60 "seam guard: cmd/k3sm's TestMain stubs each of its seams: clock, uid resolver, client-side peer credentials, exec, euid source, file-attribute writer (append-only files)" \
+	k3sm/cmd/k3sm::TestRealPrimitivesUnreachable
+pend U61 "seam guard: pkg/install's TestMain stubs its euid source and file-attribute writer (append-only files)" \
+	k3sm/pkg/install::TestRealPrimitivesUnreachable
+pend U62 "reconciler lines are charged to the delivery's owner uid: a deliver-write past the share is Indeterminate, a deliver-delete is never refused for the share (KeyDelivery lifecycle)" \
+	k3sm/pkg/keystore/reconcile::TestReconcilerLinesChargedToOwner TestDeliverWritePastShareIsIndeterminate TestDeliverDeleteNeverRefusedForShare
+pend U63 "entries live under .user/<uid>/entries/: entries named deliveries and scope.key are ordinary and touch neither scope file (user-scope store)" \
+	k3sm/pkg/keystore::TestEntriesNamedDeliveriesAndScopeKeyAreOrdinary
+# >>> ADD NEW U ROWS (U64 upward) HERE, and add each to EXPECTED_ROWS and to mode_rows <<<
 
 leg E1 "files" "preconditions: secrets encryption on; one server; keystore-run/ and both logs present, service-user 0600, SF_APPEND set; the doctor user-scope row on; keystore.sh --check exits 0 on the build" "the append-only files"
 leg E2 "socket-ops" "the user, no sudo, puts user/<me>/e2e-token (short-name form): exit 0; the CLI prints the resolved user/<uid>; k3sm keys list shows it; the audit log has a put line with no value" "the socket operations"

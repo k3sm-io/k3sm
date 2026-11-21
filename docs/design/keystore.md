@@ -1034,11 +1034,19 @@ length bound and the parse:
 
 The pattern bounds the uid's digits; the range (at most 4294967295) is a CEL rule beside it,
 `!self.startsWith('user/') || int(self.split('/')[1]) <= 4294967295`, and the Go parse reads
-the uid as a uint32. `spec.entry` has `maxLength` 269, the longest valid entry
+the uid as a uint32. The name part has its own bound, a second CEL rule,
+`size(self.split('/')[size(self.split('/')) - 1]) <= 253`: the pattern allows no `/` in the
+name, so the last segment is the name, and the pattern allows only ASCII, so CEL's `size` in
+code points equals the byte count. The `maxLength` alone does not bound the name: `system/` or
+`user/1/` and a 254-byte name is under 269 bytes. On a KeyDelivery a third CRD CEL rule,
+`!self.startsWith('system/')`, refuses a system entry, since a system entry reaches a namespace
+only through root's `deliver` ("KeyDelivery"). `spec.entry` has `maxLength` 269, the longest valid entry
 (`user/4294967295/` and a 253-byte name: `len("user/")` + 10 + 1 + Phase A's `maxNameLen` of 253),
 which also bounds the CEL rules' cost. The CRD pattern,
 the admission policy's CEL and the Go resolver all take the grammar from that package, and one
-shared vector table in it tests all three (U11, U19, U40, U57). "Valid" means valid as an API
+shared vector table in it tests all three (U11, U19, U40, U57). Phase A's `checkName` is a
+fourth consumer: it reads the name part of every vector whose scope part is valid and must give
+the vector's verdict (U11). "Valid" means valid as an API
 entry; the CLI's short-name resolution runs before the grammar sees a name. The table holds at
 least:
 
@@ -1051,6 +1059,9 @@ least:
 | `user/501/registry.example-token` | yes | a dotted name, as Phase A's `checkName` accepts |
 | `user/4294967295/` and a 253-byte name | yes | 269 bytes, the `maxLength` |
 | `user/4294967295/` and a 254-byte name | no | one over Phase A's name bound |
+| `user/1/` and a 254-byte name | no | under the `maxLength`, refused by the name-length rule |
+| `system/` and a 254-byte name | no | under the `maxLength`, refused by the name-length rule |
+| `user/501/deliveries`, `user/501/scope.key` | yes | ordinary names: entries live under `entries/`, apart from the scope's own files |
 | `user/501/a..b`, `user/501/.a`, `user/501/a.` | no | an empty label |
 | `system/a/b` | no | a `/` inside the name |
 | `user/0/a` | no | uid 0 has no user scope |
@@ -1088,8 +1099,14 @@ Phase A's paths are unchanged. Added:
         <uid>/                          NEW: 0700, service user, one per user who has stored anything
           scope.key                     sealed record, kind 0xFE: the user's scope key, wrapped
           deliveries                    sealed record, kind 0xFD: per delivery, its UID and target digest
-          <name>/ generation v1 … current  same shape as a system entry, sealed under the scope key
+          entries/                      NEW: 0700, service user, the scope's entries and nothing else
+            <name>/ generation v1 … current  same shape as a system entry, sealed under the scope key
 ```
+
+A user's entries live under `.user/<uid>/entries/<name>/`, apart from the scope's own files
+`scope.key` and `deliveries`. Both are valid entry names (`scope.key` is a dotted name), so with
+entries beside them a user who stored an entry named `deliveries` or `scope.key` would collide
+with the scope's record; under `entries/` they are ordinary names (U63).
 
 The owner and mode of the two logs depend on the floor variant ("The user-scope floor"): with
 the append-only flag they are the service user's, mode 0600, flagged `sappnd`; with the floor
@@ -1209,11 +1226,25 @@ service user can only add to.
   rotate hint; past the hard cap the server refuses every mutating user operation with
   `ErrLogFull` until root rotates or rebuilds (U24).
 - **Per-uid fairness.** The logs are shared, so one user must not be able to fill them for
-  everyone. Each uid gets a budget in each log, a fixed share of that log's hard cap. The
-  server counts each uid's bytes per log from the log at start and on every append. A uid past
-  its share has its own mutations refused with `ErrLogFull`; every other uid is unaffected and
-  keeps its own share. The hard cap above still bounds the whole log. Lines written for root
-  verbs and for the reconciler are not charged to any uid (U51).
+  everyone. Each uid gets a budget in each log, a fixed byte count: `keystore.logUIDShare`,
+  default 16 MiB, which is 1/16 of the default hard cap. The share is at most 1/16 of the hard
+  cap: a configured share above `logHardCap / 16` is refused at server start, so no fewer than
+  16 uids can fill a log. The server counts each uid's bytes per log from the log at start and
+  on every append.
+  - *What is charged.* A line is charged to the uid it acts for: a socket operation's to the
+    peer uid, and a reconciler `deliver-write` or `deliver-delete` line, and the floor line of a
+    record withdrawal, to the delivery's owner uid. Lines written for root verbs are charged to
+    no uid.
+  - *A share refusal is one uid's alone.* A uid past its share has its own mutations refused
+    with `ErrLogFull`; every other uid is unaffected and keeps its own share. That refusal
+    happens before any append and is not a failed append, so it never counts as the global
+    append failure that refuses every uid's reads ("The audit log", fail closed); only an append
+    that the file system refuses, or the hard cap, does.
+  - *The reconciler past an owner's share.* A `deliver-write` past the owner's share is refused
+    and the reconciler reads that as `Indeterminate`, so the Secret keeps its last version. A
+    `deliver-delete` line is charged but never refused for the share, only for the hard cap, so
+    a user cannot keep a revoked Secret in place by filling its own share.
+  - The hard cap above still bounds the whole log (U51, U62).
 - **Backup and restore.** The flag does not survive `cp`, rsync or Time Machine, so a restore
   always ends with `floor --rebuild`, and `audit --rotate` re-flags the audit log. Until then
   the listener refuses to start (U25, E17).
@@ -1391,6 +1422,19 @@ the first layer.**
    `ReadOnlyPaths` entry, an `ExposePaths` entry or a hostPath naming the data root or a
    keystore path is refused (U16).
 
+   **The test reads the whole profile.** U16 does not check that the denies are present; it
+   asserts over the whole rendered profile, for every variant, that no emitted allow rule, of
+   any operation and any filter (literal, subpath, prefix or regex), matches any keystore path.
+   Two variants are where an allow is most likely to slip in: a Pod root equal to the data root,
+   and a Pod root that is a parent of the data root; each is a case of its own. Two facts of the
+   rendering are stated so the test checks them:
+
+   - the data-root deny paths are written in the canonical form, `/private/var/lib/k3sm`, since
+     Seatbelt matches the resolved path and `/var` is a symlink to `/private/var`; a deny
+     written under `/var/lib/k3sm` would match nothing;
+   - the `keystore-` prefix deny is a regex rule, `(regex #"^/private/var/lib/k3sm/keystore-")`
+     with the data root quoted, because a `subpath` names one directory, not a name prefix.
+
    **An empty `Posture.DataRoot` fails closed.** runtimed refuses to render a Pod profile
    without one, so a posture that lost its data root cannot produce a profile with no data-root
    denies (U16).
@@ -1410,8 +1454,24 @@ the first layer.**
 2. **Pod uid refusal, the second layer.** Native Pods run as the service user, below 501. The
    sandbox change adds a second layer: runtimed refuses any resolved Pod process uid of 501 or
    above, and uid 0 without a drop when the daemon runs as root, both when it resolves the
-   credential and again at spawn (U17, E21, E22). With that refusal in place, a Pod that got
-   past Seatbelt would connect under a uid the socket's peer check refuses. Until the rig
+   credential and again at spawn (U17, E21, E22).
+
+   **The check is on the final effective uid.** What runtimed does today, read at runtimed
+   `b311adc`: `resolveCredential` (`pkg/runtime/security.go:40`) takes the uid from the
+   container's `securityContext.runAsUser`, then the Pod's, then `PodBox.uid`, the first that
+   is not 0 (`security.go:44`), so **the drop target is Pod-influenced, not fixed**. It sets
+   `Drop` when that uid or the gid is not 0 (`security.go:60`). The exec-shim runs
+   `RunLaunchSequence` (`internal/execshim/launch_darwin.go:223`), which refuses a drop on a
+   non-root daemon with `ErrDropRequiresRoot` (`pkg/supervisor/privdrop.go:78`, called at
+   `:281`) and otherwise calls `setuid(cred.UID)` (`privdrop.go:304`) before the sandbox and
+   the exec. No uid range is checked anywhere on that path today. The refusal therefore tests
+   the uid the Pod process holds after the drop: `cred.UID` when `Drop` is set, and the
+   daemon's own euid when it is not. A gid-only request on a root daemon (`runAsUser` unset,
+   `runAsGroup` set) sets `Drop` with `UID` 0, so its process stays root after the drop; the
+   check sees uid 0 and refuses it: a drop that leaves uid 0 counts as no drop.
+
+   With that refusal in place, a Pod that got past Seatbelt would connect under a uid the
+   socket's peer check refuses. Until the rig
    spike measures which uid a native Pod's processes run as, and whether any Pod spec field or
    runtimed path can make it 501 or above (`[K0 leg 5: pending]`), this design does not claim
    that a Pod is refused by peer uid; it claims the refusal the sandbox change adds. Row U15 is
@@ -1452,8 +1512,9 @@ it may change and that a conversion is owed if it does.
   `NotRecorded` is reported only after the entry's owner has matched `requestedBy`.
   `SecretExists` covers an unlabelled Secret already holding the target name; `SecretClaimed`
   covers a second KeyDelivery naming a Secret another one already owns: one declaration per
-  target Secret, and the oldest object by `creationTimestamp`, then name, wins (U43). Each
-  reason belongs to one condition type:
+  target Secret, and the oldest object by `creationTimestamp`, then name, wins (U43). The set
+  is closed per condition: a condition carries only the reasons its own rows below give, with
+  the status those rows give.
 
   | reason | condition | status | when |
   |---|---|---|---|
@@ -1462,14 +1523,19 @@ it may change and that a conversion is owed if it does.
   | `NotRecorded` | `Authorized` | `False` | check 2 fails |
   | `NotAuthorized` | `Authorized` | `False` | a SubjectAccessReview in check 3 returns a definitive denial on two consecutive sweeps |
   | `Indeterminate` | `Authorized` | `Unknown` | any outcome not on the allow-list of definitive outcomes ("A denial deletes; an error does not") |
+  | `Pending` | `Ready` | `Unknown` | the initial state, before the first sweep decides; and while `Authorized` is `Unknown` |
   | `Delivered` | `Ready` | `True` | the Secret holds the entry's current version |
+  | `NotAuthorized` | `Ready` | `False` | `Authorized` is `False`, for any of its reasons; the message names that reason |
   | `SecretExists` | `Ready` | `False` | an unlabelled Secret holds the target name |
   | `SecretClaimed` | `Ready` | `False` | an older KeyDelivery owns the target Secret |
   | `EncryptionOff` | `Ready` | `False` | secrets encryption is off and the override is not set (G18) |
   | `UserScopeOff` | `Ready` | `False` | more than one server is registered |
 
-  While `Authorized` is `False`, `Ready` is `False` with the same reason. While it is
-  `Unknown`, `Ready` keeps its last status and reason, since nothing was changed. **A tolerant
+  While `Authorized` is `False`, `Ready` is `False` with the single reason `NotAuthorized`, and
+  its message carries the `Authorized` reason (`EntryUnavailable`, `NotRecorded` or
+  `NotAuthorized`), so `Ready` has one reason for every authority failure. While `Authorized`
+  is `Unknown`, `Ready` is `Unknown` with reason `Pending`; nothing was changed, so the Secret,
+  if any, keeps its last version. **A tolerant
   reader:** a consumer treats a reason it does not know as a generic failure of the condition
   that carries it, so a reason added later breaks no reader.
 
@@ -1477,11 +1543,11 @@ it may change and that a conversion is owed if it does.
 `pkg/policy`, the shape of the existing ones, adds only what CRD CEL cannot see: on create,
 `spec.requestedBy == request.userInfo.username`, and a requester under
 `system:serviceaccount:` is refused (U40, E13). Because `requestedBy` is required, held to the
-requester on create and immutable afterwards, the policy in effect stamps it on create: the
+requester on create and immutable afterwards, the policy's check on create is enough: the
 only value an object can carry is its creator's name. That `request.userInfo.username` reports
 the impersonated user under impersonation is not yet checked; U40 and E3 check it. **Neither
 admission layer is the authority.** The authority is the sealed delivery record plus the
-reconciler-time SubjectAccessReviews below. `requestedBy` is stamped and checked by admission
+reconciler-time SubjectAccessReviews below. `requestedBy` is checked by admission
 and by the CRD's cross-field rule, which is what lets the reconciler name it as the principal
 of those reviews, but it authorises nothing by itself.
 
@@ -1524,6 +1590,15 @@ of those reviews, but it authorises nothing by itself.
    required: without them, a principal allowed to declare deliveries but not to write Secrets
    could plant or remove a Secret a workload expects to mount, under a name of its choosing
    (U42).
+
+**The reviews ask about the principal the create used.** Each SubjectAccessReview carries
+`spec.user` `k3sm:local:<uid>` and `spec.groups` equal to the groups the impersonated create
+carried: `k3sm:local-users`, and `system:authenticated`, which the API server adds to an
+impersonated user. So a grant bound to the group `k3sm:local-users` is honoured consistently:
+the create passes on it and every sweep's reviews pass on it, and removing that binding is a
+definitive denial like removing a user binding (U42). The docs recommend binding the user
+`k3sm:local:<uid>`, not the group: a group binding lets every login user on the Mac deliver into
+that namespace.
 
 **Why create is checked without a name.** RBAC cannot match `resourceNames` on `create`: a
 create request carries no name for the authorizer to match, so a rule that lists
@@ -1628,6 +1703,12 @@ namespace also grants that: the built-in `edit` ClusterRole, or a Role with `cre
 `secrets` and `update` and `delete` on `secrets` limited by `resourceNames` to the target names
 (E23). No ServiceAccount is granted anything.
 
+**The `k3sm:local:*` usernames are reserved** for the server's impersonation. A client
+certificate whose CN is `k3sm:local:<anything>`, or whose organisation is `k3sm:local-users`,
+must not be issued: its holder would be that local user to RBAC, to the admission policy and to
+the reconciler's reviews, without the peer-credential check that ties the name to a uid on the
+Mac. The user docs say so beside the RBAC example.
+
 ### Single-server clusters only
 
 Each server would hold its own keystore, so the user scope is supported only on a cluster
@@ -1655,10 +1736,28 @@ with a seam has a `TestMain` that, before any test runs, sets every seam the pac
 stub that panics, naming the primitive, if called: the GeneratedUID lookup, `LOCAL_PEERCRED`,
 the chflags flag read, `getpwnam`, and the clock where the package reads one. Each test then
 injects the fake it needs. A unit test that forgets to inject one panics instead of reaching
-the host. One guard row per package proves the stubs are in place: `TestRealPrimitivesUnreachable`
-calls each seam without injecting a fake and expects each panic (U47 for `pkg/keystore`, U48 for
-`pkg/keystore/socket`). Integration and rig tests use the real primitive; an integration test
-calls it directly, never through a seam the stub holds, and its row says integration.
+the host. A test injects a fake through a helper that saves the seam's current value and
+restores it with `t.Cleanup`, so no fake outlives its test and no test sees another's. One guard
+row per package proves the stubs are in place: `TestRealPrimitivesUnreachable` calls each seam
+without injecting a fake and expects each panic. Integration and rig tests use the real
+primitive; an integration test calls it directly, never through a seam the stub holds, and its
+row says integration.
+
+**Which packages carry seams, and their guards.** The seam-bearing packages are a closed list,
+and a repo-level guard holds it: `k3sm/pkg/keystore::TestEverySeamPackageHasAGuard` (U58) names
+each package below, parses its test files, and fails when one lacks the `TestMain` stub install
+or its `TestRealPrimitivesUnreachable`; it also fails when a package outside the list declares
+a seam (a package-level variable of a function type whose name ends in `Seam`). Each change that
+adds a seam package adds it to the list in the same change.
+
+| package | its seams | guard row |
+|---|---|---|
+| `pkg/keystore` | clock, uid resolver, chflags flag source, GeneratedUID lookup | U47 |
+| `pkg/keystore/socket` | clock, peer-credential source (server side), chflags flag source | U48 |
+| `pkg/keystore/reconcile` | clock (sweep interval, backoff, the two-sweep count) | U59 |
+| `cmd/k3sm` | clock, uid resolver, peer-credential source (client side), exec, euid source, file-attribute writer (the maintenance verbs) | U60 |
+| `pkg/install` | euid source, file-attribute writer | U61 |
+| `pkg/policy` | none: its tests evaluate the policy's CEL in process and reach no host primitive | none |
 
 | seam | the real primitive it replaces | what the unit fake gives | what `TestMain` installs |
 |---|---|---|---|
@@ -1668,6 +1767,14 @@ calls it directly, never through a seam the stub holds, and its row says integra
 | chflags flag source | `fstat` `st_flags & SF_APPEND` on the two logs, and `chflags` in the maintenance verbs | a flag set or clear per file | a panicking stub |
 | GeneratedUID lookup | `mbr_uid_to_uuid`, with its deadline | a fixed GeneratedUID, a changed one, an error, or a lookup past the deadline | a panicking stub |
 | audit sink | the append to `keystore-audit.log` | an in-memory log, and one whose append fails | none: it writes a file under the test's own directory, not a host primitive |
+| exec | `syscall.Exec` in `k3sm keys exec` | a recorder of the path, argv and environment it was given, which returns instead of replacing the process (U37) | a panicking stub |
+| euid source | `os.Geteuid`, behind the root check of every root verb, `install` and the maintenance verbs | any euid, so the refusal of a non-root caller and the root path are both unit-tested | a panicking stub |
+| file-attribute writer | `chown`, `chmod` and `chflags` (`sappnd` set and cleared) in `install` and in `floor --rebuild` and `audit --rotate` | a recorder of each call in order, and one that fails a chosen call, which is how the crash order is unit-tested (U21, U22) | a panicking stub |
+
+What each new seam does not cover is integration-tier only: that the real `syscall.Exec`
+replaces the process with the value in the child's environment alone is E5; that the real
+`chown`, `chmod` and `chflags` leave the modes and flags this design names is U50 (root-run)
+and E1, E17 and E20 on the rig; the real euid is the root path every `--root` row (R1) runs.
 
 ### Deployment and rollback
 
@@ -1819,7 +1926,7 @@ last pull request lands and no row is pending.
 | G7 | The floor is raised by every mutating verb (Delete only when the master opens) and by the start of every root verb (`list` and `show` through `RaiseFloor`), and a floor one behind the pointer is accepted. Each floor write re-reads the floor under the data-root lock and applies only its own change, and a held data-root lock times out within the bound | unit: crash after the flip, before the floor write; a floor moved on during a Rotate or a Delete keeps its newer entries; a held data-root lock on a real `flock` |
 | G8 | Rotate flips the pointer last; a crash at each of its steps leaves the old version current | unit: fault injection between each step |
 | G9 | A Rotate retry discards an orphaned next version and seals the value it was given | unit: orphan with value A, retry with value B, expect B |
-| G10 | The master is minted only by the first `put`, never over existing entries, and never by an operator-supplied value | unit: absent master with entries is `ErrMasterMissing`; no verb accepts a key |
+| G10 | The master is minted only by the first `put`, never over existing entries, and never by an operator-supplied value | unit: absent master with entries is `ErrMasterMissing`; no verb accepts an operator-made key; `rewrap --key-in` only re-reads a key whose SHA-256 equals the fingerprint k3sm recorded when `--key-out` saved it |
 | G11 | The master is opened with O_NOFOLLOW and judged by fstat on the open descriptor; wrong mode, owner or fingerprint is `ErrMasterUntrusted` | unit: one case each |
 | G12 | Rewrap resumes after a crash at every step, trying the old then the new key, and leaves no record readable by neither; a `master.next` that disagrees with its fingerprint is discarded only when no `.new` file exists, and refused with `ErrMasterUntrusted` otherwise | unit: fault injection at each of steps 2 to 5, then rerun; a corrupted `master.next` with and without a `.new` file |
 | G13 | A crash between the two master renames leaves a master that passes its trust check, and the next verb completes the swap | unit: stop after the first rename |
@@ -1859,18 +1966,18 @@ each stated in the change that makes it. U15 is held for a K0 amendment and U39 
 | U8 | a scope's records open only under its `K_u`; a copied `.user/<uid>/` without the master opens nothing | `k3sm/pkg/keystore::TestScopeCopyWithoutMasterOpensNothing` | pending: the user-scope store |
 | U9 | per-scope fingerprints differ for equal values in two scopes | `k3sm/pkg/keystore::TestFingerprintsDifferAcrossScopes` | pending: the user-scope store |
 | U10 | `user/<other>/…` is `ErrNotFound`, same text as an absent entry; a short name resolves to the uid and is printed | `k3sm/pkg/keystore::TestOtherUserIsNotFound`, `TestShortNameResolvesToUID` | pending: the user-scope store |
-| U11 | the Go resolver takes the grammar from `apis/keystore/entry` and passes the shared entry-grammar vectors; `checkScope` refuses `user/0`; an all-digit second segment resolves as a uid even when an account of that name exists; `pkg/keystore` imports no Kubernetes package | `k3sm/pkg/keystore::TestEntryGrammarVectorsResolver`, `TestCheckScopeRefusesUserZero`, `TestAllDigitSegmentIsAlwaysUID`, `TestKeystoreIsKubernetesFree` | pending: the user-scope store |
+| U11 | the Go resolver takes the grammar from `apis/keystore/entry` and passes the shared entry-grammar vectors; `checkScope` refuses `user/0`; an all-digit second segment resolves as a uid even when an account of that name exists; `pkg/keystore` imports no Kubernetes package; Phase A's `checkName`, as a fourth consumer, gives every valid-scope vector's verdict on its name part | `k3sm/pkg/keystore::TestEntryGrammarVectorsResolver`, `TestEntryGrammarVectorsCheckName`, `TestCheckScopeRefusesUserZero`, `TestAllDigitSegmentIsAlwaysUID`, `TestKeystoreIsKubernetesFree` | pending: the user-scope store |
 | U12 | master Rewrap re-wraps every `scope.key` and leaves user records byte-identical; resumable at every step | `k3sm/pkg/keystore::TestRewrapRewrapsScopeKeysResumable` (fault injection, as G12) | pending: user-scope quotas, scope-key Rewrap and the delivery record |
 | U13 | quotas: the 257th entry and the byte budget answer `ErrQuota`; `rm` still works | `k3sm/pkg/keystore::TestUserScopeQuota` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
 | U14 | the delivery record stores UID and target digest; add, look up and withdraw round-trip under the floor; the plaintext starts with the format version byte and the digest with the `k3sm-keystore-delivery-target/v1` label | `k3sm/pkg/keystore::TestDeliveryRecordDigestRoundTrip`, `TestDeliveryRecordVersionByteAndDigestLabel` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
 | U15 | (reserved for the K0 amendment if leg 5 finds a second Pod-uid path) | none | pending: K0 amendment |
-| U16 | every Pod profile variant (native, vm, container-vm, xcode, expose-paths, a custom Pod root distinct from the data root) denies every `keystore-*` name in the data root and the `keystore-run/` tree; the keystore names are in `DataRootDenyTrees` and so in `protectedPrefixes`; `ReadOnlyPaths`, `ExposePaths` or a hostPath naming the data root or a keystore path is refused; an empty `Posture.DataRoot` refuses to render; a vm or container-vm guest gets no data-root share | `runtimed/pkg/sandbox::TestDataRootDeniesKeystorePathsEveryProfile`, `TestProtectedPrefixesRefuseKeystoreReallow`, `TestEmptyDataRootFailsClosed`, `TestVMGuestGetsNoDataRootShare`; rig leg E10 | pending: runtimed's sandbox change |
-| U17 | runtimed refuses a resolved Pod process uid of 501 or above, and uid 0 without a drop on a root daemon, at credential resolution and again at spawn | `runtimed/pkg/runtime::TestResolveCredentialRefusesLoginRangeUID`, `TestResolveCredentialRefusesRootWithoutDrop`; `runtimed/pkg/supervisor::TestSpawnRefusesLoginRangeUID`, `TestSpawnRefusesRootUIDWithoutDrop`; rig legs E21, E22 | pending: runtimed's sandbox change |
-| U18 | CRD: `entry`, `secretName`, `dataKey`, `requestedBy` required (`dataKey` defaults to `value`) and immutable by CEL transition rules; `requestedBy` matches its pattern and, for a user entry, equals `k3sm:local:` plus the entry's uid; `conditions` is `listType=map` keyed by `type`; status subresource on; reasons listed | `apis/config/crd::TestKeyDeliveryCRDMatchesTheGoTypes`, `TestKeyDeliveryImmutableFields`, `TestKeyDeliveryRequiredFields`, `TestKeyDeliveryRequestedByMatchesEntryUID`, `TestKeyDeliveryConditionsListMap` | pending: the `KeyDelivery` API |
-| U19 | the CRD pattern, its `maxLength` of 269 and the uid range rule pass the shared entry-grammar vectors | `apis/config/crd::TestEntryGrammarVectors` | pending: the `KeyDelivery` API |
+| U16 | every Pod profile variant (native, vm, container-vm, xcode, expose-paths, a custom Pod root distinct from the data root) denies every `keystore-*` name in the data root and the `keystore-run/` tree; the keystore names are in `DataRootDenyTrees` and so in `protectedPrefixes`; `ReadOnlyPaths`, `ExposePaths` or a hostPath naming the data root or a keystore path is refused; an empty `Posture.DataRoot` refuses to render; a vm or container-vm guest gets no data-root share; over the whole rendered profile of every variant, including a Pod root equal to the data root and a Pod root that is a parent of it, no emitted allow matches any keystore path; the denies are written under the canonical `/private/var/lib/k3sm` and the `keystore-` prefix deny is a regex rule | `runtimed/pkg/sandbox::TestDataRootDeniesKeystorePathsEveryProfile`, `TestNoEmittedAllowCoversKeystorePath`, `TestDataRootDeniesCanonicalPathAndPrefixRegex`, `TestProtectedPrefixesRefuseKeystoreReallow`, `TestEmptyDataRootFailsClosed`, `TestVMGuestGetsNoDataRootShare`; rig leg E10 | pending: runtimed's sandbox change |
+| U17 | runtimed refuses a resolved Pod process uid of 501 or above, and uid 0 without a drop on a root daemon, at credential resolution and again at spawn; the check is on the final effective uid after any drop (`cred.UID` with a drop, the daemon's euid without one), so a gid-only drop that leaves uid 0 is refused | `runtimed/pkg/runtime::TestResolveCredentialRefusesLoginRangeUID`, `TestResolveCredentialRefusesRootWithoutDrop`; `runtimed/pkg/supervisor::TestSpawnRefusesLoginRangeUID`, `TestSpawnRefusesRootUIDWithoutDrop`, `TestSpawnChecksFinalEffectiveUID`; rig legs E21, E22 | pending: runtimed's sandbox change |
+| U18 | CRD: `entry`, `secretName`, `dataKey`, `requestedBy` required (`dataKey` defaults to `value`) and immutable by CEL transition rules; `requestedBy` matches its pattern and, for a user entry, equals `k3sm:local:` plus the entry's uid; `conditions` is `listType=map` keyed by `type`; status subresource on; reasons listed; a `system/…` entry is refused | `apis/config/crd::TestKeyDeliveryCRDMatchesTheGoTypes`, `TestKeyDeliveryImmutableFields`, `TestKeyDeliveryRequiredFields`, `TestKeyDeliveryRequestedByMatchesEntryUID`, `TestKeyDeliveryConditionsListMap`, `TestKeyDeliveryRefusesSystemEntry` | pending: the `KeyDelivery` API |
+| U19 | the CRD pattern, its `maxLength` of 269, the uid range rule and the 253-byte name-length rule pass the shared entry-grammar vectors, `user/1/` and `system/` each with a 254-byte name refused | `apis/config/crd::TestEntryGrammarVectors` | pending: the `KeyDelivery` API |
 | U20 | a user-scope `current` copied back is refused against the floor log, with Phase A's floor message | `k3sm/pkg/keystore::TestUserFloorRefusesCopiedBackCurrent`; rig leg E9 | pending: the append-only files |
-| U21 | install creates both logs service-user-owned 0600 and flagged; the listener refuses to start when a flag is clear (seam: chflags flag source) | `k3sm/pkg/install::TestKeystoreAppendOnlyFilesAtInstall`, `k3sm/pkg/keystore::TestFlagCheckRefusesUnflagged`; rig leg E1 | pending: the append-only files |
-| U22 | `floor --rebuild` and `audit --rotate` stop the listener, hold the lock, flag the new file before touching the old; a crash at each step leaves a flagged file | `k3sm/cmd/k3sm::TestKeysFloorRebuildCrashOrder`, `TestKeysAuditRotateCrashOrder`; rig leg E17 | pending: the append-only files |
+| U21 | install creates both logs service-user-owned 0600 and flagged; the listener refuses to start when a flag is clear (seams: chflags flag source, file-attribute writer, euid source) | `k3sm/pkg/install::TestKeystoreAppendOnlyFilesAtInstall`, `k3sm/pkg/keystore::TestFlagCheckRefusesUnflagged`; rig leg E1 | pending: the append-only files |
+| U22 | `floor --rebuild` and `audit --rotate` stop the listener, hold the lock, flag the new file before touching the old; a crash at each step leaves a flagged file (seams: file-attribute writer, euid source) | `k3sm/cmd/k3sm::TestKeysFloorRebuildCrashOrder`, `TestKeysAuditRotateCrashOrder`; rig leg E17 | pending: the append-only files |
 | U23 | every audited operation writes one `v:1` line; no line carries a value or its length; readers ignore unknown fields | `k3sm/pkg/keystore::TestAuditLineNeverCarriesValue`, `TestAuditReaderIgnoresUnknownFields` | pending: the append-only files |
 | U24 | soft cap shows in `doctor`; past the hard cap every mutating user op is `ErrLogFull` | `k3sm/pkg/keystore::TestLogHardCapRefusesMutations` | pending: the append-only files |
 | U25 | backup and restore round trip: a restored tree with cleared flags is refused until `floor --rebuild`, then opens | `k3sm/pkg/keystore::TestBackupRestoreRoundTripRebuild`; rig leg E17 | pending: the append-only files |
@@ -1888,10 +1995,10 @@ each stated in the change that makes it. U15 is held for a K0 amendment and U39 
 | U37 | `exec` sets the variable only in the child; nothing on stdout, nothing on disk; the value never enters argv; no non-root verb writes a value to stdout | `k3sm/cmd/k3sm::TestKeysExecEnvOnlyInChild`, `TestNoNonRootVerbWritesValue` | pending: the non-root CLI and `exec` |
 | U38 | an unknown error code prints the code; a connect failure names `sudo k3sm install` | `k3sm/cmd/k3sm::TestUnknownErrorCodeFallback`, `TestConnectErrorNamesInstall` | pending: the non-root CLI and `exec` |
 | U39 | (unused: there are no system grants) | none | none |
-| U40 | the admission policy stamps `requestedBy` and refuses a ServiceAccount creator; its CEL passes the shared grammar vectors | `k3sm/pkg/policy::TestKeyDeliveryPolicyStampsRequestedBy`, `TestEntryGrammarVectorsCEL` | pending: KeyDelivery authoring |
+| U40 | the admission policy checks `requestedBy` against the requester and refuses a ServiceAccount creator; its CEL passes the shared grammar vectors | `k3sm/pkg/policy::TestKeyDeliveryPolicyChecksRequestedBy`, `TestEntryGrammarVectorsCEL` | pending: KeyDelivery authoring |
 | U41 | `deliver` creates impersonating only `k3sm:local:<uid>` and `k3sm:local-users`, refusing any other impersonation and never sending `Impersonate-Uid` or `Impersonate-Extra-*`; the impersonated uid equals the peer uid; a request naming another user's entry impersonates the peer, not the owner; it writes the UID and digest; `withdraw` deletes the object; `undeliver` prints the hint | `k3sm/pkg/keystore/socket::TestDeliverImpersonatesUIDPrincipalOnly`, `TestDeliverImpersonatesPeerUIDNotOwner`, `TestImpersonationSendsNoUidOrExtra`, `TestDeliverWritesDigestRecord`, `k3sm/cmd/k3sm::TestUndeliverPrintsRotationHint` | pending: KeyDelivery authoring |
-| U42 | an unrecorded UID, a digest mismatch, or a denied SAR gets no Secret; the SARs ask `create keydeliveries` and `create secrets` with no name, and `update` and `delete` secrets with `resourceNames` `spec.secretName`; encryption off refuses (G18 for KeyDelivery) | `k3sm/pkg/keystore/reconcile::TestUnrecordedOrRetargetedDeliveryGetsNoSecret`, `TestSARCreateUnnamedUpdateDeleteNamed`, `TestEncryptionOffRefusesKeyDelivery`; rig leg E23 | pending: the KeyDelivery reconciler (authority) |
-| U43 | reasons are the closed set, each on the condition type and status the reason table gives; "absent" and "not yours" both read `EntryUnavailable`; a pre-existing unlabelled Secret is `SecretExists`; a second declaration is `SecretClaimed`; `observedGeneration` tracks | `k3sm/pkg/keystore/reconcile::TestConditionReasonsClosedSet`, `TestReasonConditionTable`, `TestOneDeclarationPerSecret` | pending: the KeyDelivery reconciler (authority) |
+| U42 | an unrecorded UID, a digest mismatch, or a denied SAR gets no Secret; the SARs ask `create keydeliveries` and `create secrets` with no name, and `update` and `delete` secrets with `resourceNames` `spec.secretName`; encryption off refuses (G18 for KeyDelivery); each SAR carries the user `k3sm:local:<uid>` and the groups the impersonated create carried, so a grant bound to `k3sm:local-users` passes the create and every sweep alike | `k3sm/pkg/keystore/reconcile::TestUnrecordedOrRetargetedDeliveryGetsNoSecret`, `TestSARCreateUnnamedUpdateDeleteNamed`, `TestSARCarriesImpersonatedUserAndGroups`, `TestGroupBoundGrantHonouredConsistently`, `TestEncryptionOffRefusesKeyDelivery`; rig leg E23 | pending: the KeyDelivery reconciler (authority) |
+| U43 | reasons are the closed set, each on the condition type and status the reason table gives; "absent" and "not yours" both read `EntryUnavailable`; a pre-existing unlabelled Secret is `SecretExists`; a second declaration is `SecretClaimed`; `observedGeneration` tracks; `Ready=False` for any authority failure carries the one reason `NotAuthorized` with the `Authorized` reason in its message; `Ready` is `Unknown`, `Pending` before the first sweep and while `Authorized` is `Unknown` | `k3sm/pkg/keystore/reconcile::TestConditionReasonsClosedSet`, `TestReasonConditionTable`, `TestOneDeclarationPerSecret`, `TestReadyFalseCarriesNotAuthorized`, `TestReadyUnknownPending` | pending: the KeyDelivery reconciler (authority) |
 | U44 | losing authority (a definitive denial) deletes exactly the owned Secret; the crash order is Secret, record, finalizer at every interruption point; the orphan sweep removes a labelled Secret only when its ownerReference names a KeyDelivery UID that no longer exists or the sealed record names it withdrawn, and never one with the label and owner annotation alone, an unlabelled or a foreign one | `k3sm/pkg/keystore/reconcile::TestLostAuthorityDeletesOnlyOwnedSecret`, `TestFinalizerCrashOrder`, `TestOrphanSweep` | pending: the KeyDelivery reconciler (lifecycle) |
 | U45 | cross-user refusal with a fake peer-credential source: a peer with uid B asks for `list`, `read-for-exec`, `rotate`, `rm` and `deliver` of uid A's entries, and for any `system/…` name; every call is `ErrNotFound` with text identical to an absent entry of B's own, and the `refused` audit lines carry uid B | `k3sm/pkg/keystore/socket::TestCrossUserRefusedFakePeerCred`, `TestNonRootCannotNameSystemEntries` | pending: the socket operations |
 | U46 | `baseSocketDenies` derives the `keys.sock` path from `runtimed/pkg/keystorepaths` and denies `connect(2)` to it | `k3sm/pkg/provider::TestBaseSocketDeniesKeystoreSocket` | pending: the socket listener |
@@ -1899,13 +2006,19 @@ each stated in the change that makes it. U15 is held for a K0 amendment and U39 
 | U48 | seam guard: `pkg/keystore/socket`'s `TestMain` installs a panicking stub on each of its seams, so no unit test reaches a real primitive | `k3sm/pkg/keystore/socket::TestRealPrimitivesUnreachable` | pending: the socket listener |
 | U49 | `runtimed/pkg/keystorepaths` builds with `CGO_ENABLED=0` and imports only the standard library; `k3sm/pkg/keystore` imports that leaf and never `runtimed/pkg/sandbox` | `runtimed/pkg/keystorepaths::TestLeafImportsStdlibOnly`; `k3sm/pkg/keystore::TestKeystoreImportsNoSandbox` | pending: runtimed's sandbox change, the append-only files |
 | U50 | the defeat list, run as the service user against both flagged logs (integration, root-run in the gate's `--root` mode, flag variant): `chflags nosappnd`, `O_TRUNC`, `ftruncate`, `pwrite` at an offset, a shared writable `mmap` write, `F_PUNCHHOLE`, `link()`, `fclonefileat` then a swap, a `renamex_np` swap through the parent, `exchangedata`, `unlink` and `rename` through the parent, a second open with `O_TRUNC`, and owner `chmod`; each fails, the bytes and the flag are unchanged, and an `O_APPEND` write still succeeds | `k3sm/pkg/keystore::TestAppendOnlyDefeatListAsServiceUser` | pending: the append-only files |
-| U51 | per-uid log fairness: a uid past its share of a log's hard cap has its own mutations refused with `ErrLogFull` while another uid's succeed; `list` and `deliveries` are rate-limited per uid | `k3sm/pkg/keystore/socket::TestLogSharePerUIDRefusesOnlyThatUID`, `TestReadRateLimitPerUID` | pending: the socket operations |
+| U51 | per-uid log fairness: the share is a fixed byte count, 16 MiB by default, and a share above 1/16 of the hard cap is refused at start; a uid past its share has its own mutations refused with `ErrLogFull` while another uid's succeed, and that refusal is never the global append failure that refuses every uid's reads; `list` and `deliveries` are rate-limited per uid | `k3sm/pkg/keystore/socket::TestLogSharePerUIDRefusesOnlyThatUID`, `TestLogShareAtMostOneSixteenthOfHardCap`, `TestShareRefusalIsNotGlobalAppendFailure`, `TestReadRateLimitPerUID` | pending: the socket operations |
 | U52 | every root verb writes one audit line with `via` `root` once the log exists, and none before it | `k3sm/cmd/k3sm::TestEveryRootVerbWritesAuditLine` | pending: the append-only files |
 | U53 | every reconciler Secret write and delete, and every record withdrawal, writes one audit line with `via` `reconciler` | `k3sm/pkg/keystore/reconcile::TestEveryReconcilerWriteAndDeleteAudited` | pending: the KeyDelivery reconciler (lifecycle) |
 | U54 | a pre-frame refusal (uid 0, the service uid, a uid below 501) writes a `refused` line with the peer uid, rate-limited per uid with a dropped-count summary | `k3sm/pkg/keystore/socket::TestPreFrameRefusalsAudited`, `TestPreFrameRefusalLinesRateLimited` | pending: the socket listener |
 | U55 | a transient lookup, SAR or apiserver error leaves the Secret and sets Unknown: a failed SAR call, an API server error, `ErrScopeOwnerUnknown`, `ErrBusy` and `ErrLogFull` each leave the Secret, the record entry and the finalizer, set `Authorized=Unknown` with reason `Indeterminate`, and retry with backoff; a SAR answer is a definitive denial only with `allowed=false`, an empty `evaluationError` and not the no-opinion shape (`denied=false`, empty `reason`), and each other answer is `Indeterminate`; no sweep runs before `readyz` and the RBAC informers' sync; a definitive denial deletes only when two consecutive sweeps see it for the same generation; only the allow-list (`ErrNotFound` for the entry, a withdrawn record, a digest mismatch on a readable record, a definitive SAR denial) deletes, and a table over every store sentinel (`ErrCorrupt`, the floor refusal, `ErrMasterMissing`, `ErrScopeUnsupported`, `ErrBusy`, `ErrLogFull`, `ErrScopeOwnerUnknown`, `ErrScopeOwnerChanged`), a cancelled ctx, the audit read refusal, an unknown record version and an unlisted error finds each `Indeterminate` | `k3sm/pkg/keystore/reconcile::TestTransientErrorLeavesSecretSetsUnknown`, `TestSARNoOpinionOrEvaluationErrorIsIndeterminate`, `TestNoSweepBeforeReady`, `TestDenialNeedsTwoSweeps`, `TestEverySentinelBesidesNotFoundIsIndeterminate` | pending: the KeyDelivery reconciler (lifecycle) |
 | U56 | a delivery record with an unknown format version is refused by the store and read by the reconciler as `Indeterminate`, never as a denial: no Secret is deleted | `k3sm/pkg/keystore::TestDeliveryRecordUnknownVersionRefused`, `k3sm/pkg/keystore/reconcile::TestUnknownRecordVersionIsIndeterminate` | pending: the KeyDelivery reconciler (lifecycle) |
 | U57 | `apis/keystore/entry` imports only the standard library, exports the pattern, the `maxLength` and the parse, and holds the shared vector table, which it passes | `apis/keystore/entry::TestGrammarVectors`, `TestImportsStdlibOnly` | pending: the entry grammar in `apis` |
+| U58 | seam guard, repo level: the seam-bearing packages are a closed list (`pkg/keystore`, `pkg/keystore/socket`, `pkg/keystore/reconcile`, `cmd/k3sm`, `pkg/install`); each listed package has its `TestMain` stub install and its `TestRealPrimitivesUnreachable`, a missing guard fails, and a package outside the list that declares a seam fails; fakes restore through `t.Cleanup` | `k3sm/pkg/keystore::TestEverySeamPackageHasAGuard` | pending: the user-scope store, its list extended by each change that adds a seam package |
+| U59 | seam guard: `pkg/keystore/reconcile`'s `TestMain` installs a panicking stub on its clock seam | `k3sm/pkg/keystore/reconcile::TestRealPrimitivesUnreachable` | pending: the KeyDelivery reconciler (authority) |
+| U60 | seam guard: `cmd/k3sm`'s `TestMain` installs a panicking stub on each of its seams (clock, uid resolver, client-side peer-credential source, exec, euid source, file-attribute writer) | `k3sm/cmd/k3sm::TestRealPrimitivesUnreachable` | pending: the append-only files, extended by the non-root CLI and `exec` |
+| U61 | seam guard: `pkg/install`'s `TestMain` installs a panicking stub on its euid source and file-attribute writer | `k3sm/pkg/install::TestRealPrimitivesUnreachable` | pending: the append-only files |
+| U62 | reconciler lines are charged to the delivery's owner uid: a `deliver-write` past the owner's share is refused and read as `Indeterminate`, the Secret keeping its last version; a `deliver-delete` is charged but never refused for the share | `k3sm/pkg/keystore/reconcile::TestReconcilerLinesChargedToOwner`, `TestDeliverWritePastShareIsIndeterminate`, `TestDeliverDeleteNeverRefusedForShare` | pending: the KeyDelivery reconciler (lifecycle) |
+| U63 | entries live under `.user/<uid>/entries/`: entries named `deliveries` and `scope.key` are ordinary, `put`, `rotate`, `list` and `rm` work on them, and neither touches the scope's `deliveries` record or `scope.key` | `k3sm/pkg/keystore::TestEntriesNamedDeliveriesAndScopeKeyAreOrdinary` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
 
 ### Rig legs
 
@@ -1981,6 +2094,18 @@ Settled in this revision:
   byte-exact round trip, checked by G21.
 - A floor refusal has its own message, wrapping `ErrCorrupt`; a floor with no entry for the
   name accepts an authenticating pointer.
+
+The review of the user scope asked three questions, answered here:
+
+1. Is a Pod's drop target fixed, or can the Pod choose it? The Pod chooses it: runtimed takes
+   the uid from the container's or the Pod's `runAsUser`, then `PodBox.uid`. So the uid
+   refusal checks the final effective uid after any drop ("Pod denies", layer 2; U17).
+2. Is a grant bound to the group `k3sm:local-users` honoured the same way at create and at
+   every sweep? Yes: the reviews carry the impersonated create's user and groups, and the docs
+   recommend binding the user, not the group ("The reviews ask about the principal the create
+   used"; U42).
+3. Can `rewrap --key-in` adopt a key the operator made? It must not: `--key-in` only re-reads
+   a key whose SHA-256 equals the fingerprint k3sm recorded when `--key-out` saved it (G10).
 
 Owed by the implementation: `hack/acceptance/keystore.sh`, specified above. There are no
 open questions.
