@@ -710,6 +710,12 @@ func (s *FileStore) rotate(ctx context.Context, name string, value []byte) (Vers
 // discardOrphans removes every version file of e numbered above cur: what a
 // Rotate interrupted before its pointer flip leaves. Each holds the value the
 // interrupted attempt carried, so none is ever promoted.
+//
+// While the floor lags its pointer (a Rotate whose floor write failed), an
+// older pointer copied back passes the floor check, and the version the live
+// pointer named is then discarded here as an orphan. docs/design/keystore.md
+// § "Rotation and rollback" accepts that window: a crash before the flip
+// leaves the same state, and its orphan must be discarded.
 func discardOrphans(e *entry, cur uint64) error {
 	names, err := readDirNames(e.root, maxDirNames)
 	if err != nil {

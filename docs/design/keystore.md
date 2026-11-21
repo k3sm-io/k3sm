@@ -706,6 +706,18 @@ would publish a value the retry did not supply. The same applies to any version 
 numbered above the one `current` names. Seeing the orphan and removing it happens under
 the exclusive lock.
 
+**Accepted window: a discard while the floor lags.** If a Rotate flips `current` and then
+fails to write the floor, the floor is one behind the pointer until the next root-run verb
+raises it. If, inside that window, a writer that cannot read the master copies the previous
+`current` back, the floor check passes it (its sequence equals the floor's), and the next
+Rotate takes the newer version, which the live pointer named, for an orphan and discards
+it before sealing its own value. Nothing forged is ever accepted, but the newer version is
+lost. This needs a failed floor write and a swap before any root verb runs, and it is
+accepted for this phase. No cheap guard tells it apart: a Rotate that crashed before its
+flip leaves the same state (a version above `current` that authenticates, a pointer at the
+floor's sequence, and no newer pointer anywhere, since the swap's rename replaces it), and
+that orphan must be discarded.
+
 **Retention:** every version is kept indefinitely in Phase A; nothing deletes a single old
 version short of `rm` of the whole entry. Settled in this document: the simplest correct
 answer, left for a later phase to bound once real usage shows it matters.
