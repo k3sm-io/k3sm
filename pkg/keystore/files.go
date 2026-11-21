@@ -249,8 +249,13 @@ func (s *FileStore) checkNewDir(f *os.File, made, opened fs.FileInfo) error {
 // directory. A non-root process giving a file to its own uid and group is a
 // no-op chown.
 func (s *FileStore) own(f *os.File, mode fs.FileMode) error {
-	if err := s.chown(f, int(s.uid), int(s.gid)); err != nil {
-		return fmt.Errorf("chown %s to %d:%d: %w", f.Name(), s.uid, s.gid, err)
+	return s.ownAs(f, s.uid, s.gid, mode)
+}
+
+// ownAs is own with the owner given.
+func (s *FileStore) ownAs(f *os.File, uid, gid uint32, mode fs.FileMode) error {
+	if err := s.chown(f, int(uid), int(gid)); err != nil {
+		return fmt.Errorf("chown %s to %d:%d: %w", f.Name(), uid, gid, err)
 	}
 	if err := f.Chmod(mode); err != nil {
 		return fmt.Errorf("chmod %s %#o: %w", f.Name(), mode, err)
@@ -281,6 +286,12 @@ func (s *FileStore) checkOwned(fi fs.FileInfo, want fs.FileMode) error {
 // file, and never one at a wider mode or another owner. A crash before the
 // rename leaves the temporary file, which no reader opens.
 func (s *FileStore) writeFile(root *os.Root, name string, data []byte) error {
+	return s.writeFileAs(root, name, data, s.uid, s.gid, fileMode)
+}
+
+// writeFileAs is writeFile with the owner and mode given, for the one file
+// the store keeps outside the service user's tree: the root-owned floor.
+func (s *FileStore) writeFileAs(root *os.Root, name string, data []byte, uid, gid uint32, mode fs.FileMode) error {
 	var suffix [tempSuffixSize]byte
 	if err := s.readRandom(suffix[:]); err != nil {
 		return fmt.Errorf("name a temporary file: %w", err)
@@ -296,7 +307,7 @@ func (s *FileStore) writeFile(root *os.Root, name string, data []byte) error {
 			_ = root.Remove(tmp) // best effort: a leftover temporary file is ignored by every reader
 		}
 	}()
-	err = s.own(f, fileMode)
+	err = s.ownAs(f, uid, gid, mode)
 	if err == nil {
 		_, err = f.Write(data)
 	}
@@ -498,31 +509,37 @@ func (s *FileStore) lock(ctx context.Context, root *os.Root, exclusive bool) (fu
 	if exclusive {
 		how = syscall.LOCK_EX
 	}
-	deadline := time.Now().Add(s.lockWait)
-	for {
-		err := syscall.Flock(int(f.Fd()), how|syscall.LOCK_NB)
-		if err == nil {
-			break
-		}
-		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EINTR) {
-			_ = f.Close() // abandoned; nothing to flush
-			return nil, fmt.Errorf("lock the keystore: %w", err)
-		}
-		if time.Now().After(deadline) {
-			_ = f.Close() // abandoned; nothing to flush
-			return nil, errLockTimeout
-		}
-		select {
-		case <-ctx.Done():
-			_ = f.Close() // abandoned; nothing to flush
-			return nil, ctx.Err()
-		case <-time.After(10 * time.Millisecond):
-		}
+	if err := s.flockWait(ctx, f, how); err != nil {
+		_ = f.Close() // abandoned; nothing to flush
+		return nil, err
 	}
 	return func() {
 		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN) // the close below releases it regardless
 		_ = f.Close()
 	}, nil
+}
+
+// flockWait takes flock how on f, waiting at most s.lockWait (then
+// errLockTimeout), or until ctx is done (then ctx's error).
+func (s *FileStore) flockWait(ctx context.Context, f *os.File, how int) error {
+	deadline := time.Now().Add(s.lockWait)
+	for {
+		err := syscall.Flock(int(f.Fd()), how|syscall.LOCK_NB)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EINTR) {
+			return fmt.Errorf("lock %s: %w", f.Name(), err)
+		}
+		if time.Now().After(deadline) {
+			return errLockTimeout
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 }
 
 // readRandom fills b from the store's entropy source.

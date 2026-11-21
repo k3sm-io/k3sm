@@ -137,7 +137,7 @@ func FuzzReadGeneration(f *testing.F) {
 			t.Fatal(err)
 		}
 		defer func() { _ = root.Close() }()
-		e, err := openEntry(root, "a")
+		e, err := openEntry(root, "a", nil)
 		var want [generationSize]byte
 		ok := len(b) == generationFileSize && b[len(b)-1] == '\n'
 		if ok {

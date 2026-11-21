@@ -84,13 +84,14 @@ type Entry struct {
 	Versions []Version
 	// Err is non-nil exactly when the entry could not be opened: its generation
 	// file, its current pointer or any version the pointer covers is missing,
-	// fails authentication or does not parse, or the pointer is older than the
-	// recorded floor (once Rotate brings the floor). A directory with no current
-	// pointer is an entry with an Err when it holds any record file besides
-	// generation and v1; one holding only those, and temporary files, is an
-	// interrupted Put, which is not an entry and is not listed. Current and Versions are zero then. List reports
-	// such an entry here, not as an error for the whole call, so one bad entry
-	// does not hide the healthy ones.
+	// fails authentication or does not parse, or the floor rules the pointer
+	// out (an older sequence, or another generation). A directory with no current
+	// pointer is an interrupted Put, which is not an entry and is not listed,
+	// only when it holds nothing, generation, or generation and v1 (plus
+	// temporary files) and the floor does not record its generation; any other
+	// such directory is an entry with an Err. Current and Versions are zero
+	// then. List reports such an entry here, not as an error for the whole
+	// call, so one bad entry does not hide the healthy ones.
 	Err error
 }
 
@@ -114,8 +115,8 @@ type Store interface {
 	// An entry that cannot be opened is still returned, with Entry.Err set. The
 	// call itself fails only for a problem that is not about one entry: the
 	// master key missing or untrusted, the entries' directory untrusted or
-	// unreadable, or the store lock not acquired (in time, or before ctx is
-	// done).
+	// unreadable, the recorded floor untrusted or malformed, or the store lock
+	// not acquired (in time, or before ctx is done).
 	List(ctx context.Context) ([]Entry, error)
 	// Rotate writes value as the next version of name and then flips the
 	// current pointer to it, returning the new version, or ErrNotFound.

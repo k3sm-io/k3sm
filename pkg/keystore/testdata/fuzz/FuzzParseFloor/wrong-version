@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"version\":2,\"scope\":\"system\",\"entries\":{}}")

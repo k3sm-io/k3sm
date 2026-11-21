@@ -254,8 +254,30 @@ previous value plus 1, and Rewrap re-seals it unchanged. The store also **record
 highest sequence it has committed for each entry, in `keystore-floor.json`:
 
 ```json
-{"version": 1, "entries": {"signer-key": {"generation": "<hex>", "seq": 7}}}
+{"version": 1, "scope": "system", "entries": {"signer-key": {"generation": "<hex>", "seq": 7}}}
 ```
+
+`scope` names the scope whose entries the floor records, and is always `system`: the floor
+belongs to the system store. The file is parsed strictly: a missing or other `scope`, a
+`version` other than 1, any field the format does not have (at the top or in an entry), a
+generation that is not 32 lower-case hex digits, a sequence of 0, a name `put` would refuse,
+data after the object, or any byte that differs from the one encoding a root-run verb
+writes (compact, fields in order, entries sorted, an optional final newline; so a
+duplicate key or a differently cased one is refused, never resolved) is `ErrCorrupt`, with the floor's own message rather than the
+restore-from-backup default. That message says what removing the file costs: replay
+protection is off until a root-run verb rebuilds the floor, and the rebuild records
+whatever pointers are under `keystore/` as current, so the file is removed as root only
+once those pointers are known to be current.
+
+The file is bounded at 4 MiB, on read and on write. A floor write whose result would be
+larger is refused before anything is written, so the floor on disk is always one that
+reads. Put and Rotate check for room before they write the entry, so a full floor refuses
+them with no entry or pointer file written. Other entries' floor records may already have
+been raised by the floor sync that runs first; that is safe, because a raise only raises.
+A root-run verb's raise leaves out an entry that does not fit
+(that entry's floor stays behind its pointer, which readers accept), refuses a keystore
+with more entries than the file can hold, and Delete still runs over a full floor, since
+it is how room is made.
 
 A reader that opens `current` refuses it, as `ErrCorrupt` with the message below, unless
 **both** hold: the pointer's generation equals the floor's generation for that name, and the
@@ -295,17 +317,36 @@ descriptor with O_NOFOLLOW): refused unless root-owned and not group/other-writa
 mutating verb is already root-run, so no write path loses anything by this; the service
 user, which only reads, never needed to write it.
 
-The write order on a change is: the record, then the pointer, then the floor.
+The write order on a change is: the record, then the pointer, then the floor. Before any of
+it, a verb that changes the keystore checks that it can write the floor and takes the floor's
+lock (see "Concurrency"), so a caller that cannot write the floor changes nothing, and a
+first Put mints no master.
 
 - **Put:** write `generation`, `v1`, `current` (sequence 1), then set the floor entry.
 - **Rotate:** write the new version file, flip `current` (sequence + 1), then raise the
   floor to that sequence.
-- **Delete:** remove `current`, then the entry directory, then remove the floor entry.
+- **Delete:** remove `current`, then the entry directory, then the floor entry.
+
+**A deleted entry put back is accepted in this phase.** A completed Delete removes the
+name's floor entry, so nothing records that the name was deleted. An old copy of the deleted
+entry's directory, put back before any new Put of the name, therefore authenticates, is
+accepted by every reader, and is recorded by the next root verb's raise. The floor refuses
+such a copy (the generation refusal) only once a Put after the Delete has recorded a new
+generation for the name. This is accepted for this phase: putting a directory back under
+`keystore/` already takes a writer the floor does not defend against for an absent name,
+and the result is the entry as it stood before its Delete, not a forged value. Closing it
+needs a tombstone, a floor record that the name's last generation was deleted, which is
+left to a later change.
 
 A crash after the pointer flip but before the floor write leaves the floor one behind the
 pointer, which the rule above accepts (pointer at or above floor). So that the lag does not
-become a window, **every root-run verb begins by raising each entry's floor to its
-authenticated pointer's sequence**, under the lock. A floor entry for a name with no
+become a window, **Put, Rotate and `RaiseFloor` begin by raising each entry's floor to its
+authenticated pointer's sequence**, under the lock, and so does Delete when the master
+opens. Delete must work without the master, and with none it raises nothing: it changes
+only its own entry's floor. The read verbs (`k3sm keys list` and `show`) take no lock that
+writes, so they raise the floor by calling `RaiseFloor` at their start; until the CLI that
+does so lands, a floor that lags its pointer is raised by the next write verb or
+`RaiseFloor`, and readers meanwhile accept the lag. A floor entry for a name with no
 directory (a crash during Delete) is harmless and is overwritten by a later Put.
 
 **The residual against a process that can read the master.** The pointer's authentication
@@ -412,14 +453,24 @@ That is a pointer lost to damage or to an interrupted Delete, with sealed record
 disk. `List` returns it with `Err` set, wrapping `ErrCorrupt`, and `rm` removes the directory
 and its floor entry, since `rm` reads nothing inside an entry. Put of that name answers
 `ErrExists` and touches nothing, so no Put silently deletes versions an operator can still
-see. One case cannot be told apart by its shape: a one-version entry that lost `current` is `generation`
-and `v1`, the same as an incomplete Put, so the next Put discards it without saying so. Put
-over an entry whose `current` was lost thus discards that entry's sealed `v1`; what tells a
-lost pointer from a crashed Put is the pointer floor that lands with Rotate ("Pointer
-sequence and floor"), since Put records the floor entry only after `current`, so a crashed
-Put has none for the name and an entry that lost its pointer does. The
-loss is that one version, and the restore procedure under "Backup and snapshots" is what
-recovers it.
+see.
+
+**The floor tells a lost pointer from a crashed Put.** By shape alone, a one-version entry
+that lost `current` is `generation` and `v1`, the same as an incomplete Put. But Put records
+the floor only after its pointer, so a directory in an incomplete-Put shape whose generation
+file matches the generation the floor records for its name **did** commit a pointer, and is
+damage, not an incomplete Put: `list` returns it with `Err`, `rm` clears it, and Put answers
+`ErrExists`. The same holds for an interrupted Delete, which removes `current` first and the
+floor entry last, so a retried `rm` clears what the first one left. A floor entry of another
+generation (a Delete interrupted before its floor write, then a Put that crashed) and an empty
+directory (no generation to compare) do not count. A `generation` file that does not read
+while the floor records the name is damage, since a crashed Put writes that file whole. Only
+with no floor file, or no floor entry for the name (a Put that crashed after its pointer and
+before its floor write, which has `current` and so is not this case), do the two stay
+indistinguishable. Then a one-version entry that lost `current` costs its sealed `v1`: `Get`
+and `rm` answer not found, the sealed record stays on disk, and the next Put of the name
+discards it without saying so. The restore procedure under "Backup and snapshots" recovers
+it.
 
 The reason is what an operator running `list` needs: the truth about every entry,
 including which one is wrong, not a refusal that hides the healthy ones. A consumer that
@@ -441,9 +492,24 @@ serializes Rewrap, Rotate and Put against each other and against the reconciler'
 - Each file write is still temp-and-rename, so a process that dies releases the lock and
   leaves a state the next operation can finish or discard. The lock is for serialization,
   not for crash safety.
+- Every verb that writes the floor also takes `flock(2)` on the data root directory itself,
+  opened `O_NOFOLLOW|O_DIRECTORY` and judged root-owned and not shared on that descriptor,
+  after `keystore/.lock` and with the same bounded wait. Under it each verb re-reads
+  `keystore-floor.json` and applies only its own change to what it read (Rotate and the
+  start of a verb raise a sequence of the same generation, Put sets sequence 1 for a new
+  generation, Delete removes the entry only if it records the deleted generation), holding
+  the lock through the rename and the directory fsync. This lock defends against a writer
+  under a swapped `.lock` writing the floor; it does not stop racing entry files under a
+  swapped `.lock`. The data root is root:wheel 0755, so any local process able to open it,
+  not only the service user, can take this lock and hold it. A root verb that writes the
+  floor then fails with the lock timeout after the bounded wait; while the lock is held,
+  Delete and Rotate fail too, so a compromised secret cannot be removed or replaced until
+  the holder lets go. That is a denial of
+  service against the root write verbs and nothing more: holding the lock writes nothing,
+  so the floor, the entries and the readers (which do not take it) lose no integrity.
 - An entry directory with no `current` is an incomplete Put only in the one shape a crashed
-  Put can leave, ignoring leftover `.tmp` files; any other directory with no `current` is
-  damage. "An entry directory with no
+  Put can leave, ignoring leftover `.tmp` files, and only when the floor does not record its
+  generation; any other directory with no `current` is damage. "An entry directory with no
   `current`" under "List, when one entry is corrupt" is the rule, and Put discards only the
   first shape, so one crash does not leave a name that can never be reused.
 
@@ -651,6 +717,18 @@ would publish a value the retry did not supply. The same applies to any version 
 numbered above the one `current` names. Seeing the orphan and removing it happens under
 the exclusive lock.
 
+**Accepted window: a discard while the floor lags.** If a Rotate flips `current` and then
+fails to write the floor, the floor is one behind the pointer until the next root-run verb
+raises it. If, inside that window, a writer that cannot read the master copies the previous
+`current` back, the floor check passes it (its sequence equals the floor's), and the next
+Rotate takes the newer version, which the live pointer named, for an orphan and discards
+it before sealing its own value. Nothing forged is ever accepted, but the newer version is
+lost. This needs a failed floor write and a swap before any root verb runs, and it is
+accepted for this phase. No cheap guard tells it apart: a Rotate that crashed before its
+flip leaves the same state (a version above `current` that authenticates, a pointer at the
+floor's sequence, and no newer pointer anywhere, since the swap's rename replaces it), and
+that orphan must be discarded.
+
 **Retention:** every version is kept indefinitely in Phase A; nothing deletes a single old
 version short of `rm` of the whole entry. Settled in this document: the simplest correct
 answer, left for a later phase to bound once real usage shows it matters.
@@ -746,8 +824,8 @@ last pull request lands and no row is pending.
 | G3 | Every seal draws a fresh 96-bit nonce, including Rewrap | unit: two seals of one plaintext differ; Rewrap changes every nonce |
 | G4 | Delete then Put of the same name does not reopen the old `v1` | unit: replay the old file onto the new entry, expect `ErrCorrupt` |
 | G5 | A previously valid `current` copied back over the current one is refused, with a message that names the floor and does not tell the operator to restore from backup; a floor file with no entry for the name, or no floor file, accepts an authenticating pointer | unit: Rotate, restore the earlier `current`, expect `ErrCorrupt` whose text names the floor and omits "restore it from backup"; one case each for the missing entry and the missing file |
-| G6 | The floor is root-owned and checked on the opened descriptor; a floor that is group- or other-writable, a symlink, or not root-owned is refused | unit with a fake FS for each case |
-| G7 | The floor is raised by every mutating verb and by the start of every root verb, and a floor one behind the pointer is accepted | unit: crash after the flip, before the floor write |
+| G6 | The floor is root-owned and checked on the opened descriptor; a floor that is group- or other-writable, a symlink, or not root-owned is refused. The floor file names the `system` scope and is parsed strictly, and a verb that cannot write it changes nothing | unit with a fake FS for each case; a missing, other or unknown-field scope; a fuzz target over the parser with committed seeds; a read-only data root on a first Put |
+| G7 | The floor is raised by every mutating verb (Delete only when the master opens) and by the start of every root verb (`list` and `show` through `RaiseFloor`), and a floor one behind the pointer is accepted. Each floor write re-reads the floor under the data-root lock and applies only its own change, and a held data-root lock times out within the bound | unit: crash after the flip, before the floor write; a floor moved on during a Rotate or a Delete keeps its newer entries; a held data-root lock on a real `flock` |
 | G8 | Rotate flips the pointer last; a crash at each of its steps leaves the old version current | unit: fault injection between each step |
 | G9 | A Rotate retry discards an orphaned next version and seals the value it was given | unit: orphan with value A, retry with value B, expect B |
 | G10 | The master is minted only by the first `put`, never over existing entries, and never by an operator-supplied value | unit: absent master with entries is `ErrMasterMissing`; no verb accepts a key |
@@ -756,7 +834,7 @@ last pull request lands and no row is pending.
 | G13 | A crash between the two master renames leaves a master that passes its trust check, and the next verb completes the swap | unit: stop after the first rename |
 | G14 | One lock serializes Rewrap, Rotate, Put and reads, with a bounded wait | unit: a held lock gives a timeout error within the bound, not a hang |
 | G15 | Files a root-run verb writes under `server/` are owned by the service user at the layout's modes | unit with a fake owner seam |
-| G16 | `list` returns every entry, marks an unreadable one with `Err`, and exits 1. A directory holding nothing, `generation`, or `generation` and `v1`, with or without leftover `.tmp` files, is an incomplete Put: not listed, `ErrNotFound` from `Current`, `Get` and `Delete` (Delete removes it too), discarded by the next Put. A directory with no `current` and any other file (`v1` without `generation` included) is damage: listed with `Err` wrapping `ErrCorrupt`, removed by `rm` with its floor entry, and `ErrExists` from Put with every file left in place | unit: both shapes, an empty directory, a `generation`-and-`.tmp` directory standing in for a crash while writing `v1`, a `v1`-without-`generation` directory, a `v1`-only directory standing in for the one-version entry that lost `current`, and a `v1`-and-`v2` directory with `current` removed; a CLI exit-code test for `list` and `rm` |
+| G16 | `list` returns every entry, marks an unreadable one with `Err`, and exits 1. A directory holding nothing, `generation`, or `generation` and `v1`, with or without leftover `.tmp` files, is an incomplete Put unless the floor records its generation: not listed, `ErrNotFound` from `Current`, `Get` and `Delete` (Delete removes it too, and leaves the floor alone), discarded by the next Put. A directory with no `current` and any other file (`v1` without `generation` included), or in one of those shapes with its generation recorded in the floor, is damage: listed with `Err` wrapping `ErrCorrupt`, removed by `rm` with its floor entry when that records the directory's generation, and `ErrExists` from Put with every file left in place | unit: each incomplete-Put shape with no floor entry, an empty directory, a `generation`-and-`.tmp` directory standing in for a crash while writing `v1`, no floor file, a floor of another generation; damage: `v1` without `generation`, `v2` without `v1`, a `v1`-and-`v2` directory with `current` removed, and the one-version entry that lost `current` (`generation` and `v1`, or `current` renamed to a temporary name) with its generation in the floor; a retried `rm` after an interrupted one; a CLI exit-code test for `list` and `rm` |
 | G17 | `show` prints a value only with `--reveal`, and then writes exactly the stored bytes with no trailing newline; no verb takes a value as an argument | CLI test over the usage strings; a `--reveal` test comparing stdout to the stored bytes for an opaque value and for 32- and 64-byte Ed25519 values |
 | G18 | Delivery is refused while encryption is off unless the override flag was set at server start; a delivered target stays when the override is removed | unit over the reconciler with a fake client |
 | G19 | The delivery declaration is root-owned and not shared-writable, and is refused otherwise | unit, the same cases as the manifest directory |

@@ -72,25 +72,31 @@ check G2 "AAD is length-prefixed and binds format, scope, kind, name, version, g
 	TestAADLayout TestAADBindsEveryField TestRecordMovedBetweenEntries TestScopeBindsRecords
 partial G3 "every seal draws a fresh nonce (library)" "Rewrap changes every nonce (PR 3: Rewrap)" TestSealNonceIsFresh
 check G4 "Delete then Put does not reopen the old v1" TestDeleteThenPutRefusesReplayedRecord
-pend G5 "a copied-back current is refused against the floor (PR 2)"
-pend G6 "the floor is root-owned and checked on the descriptor (PR 2)"
-pend G7 "the floor is raised by every root verb (PR 2)"
-pend G8 "Rotate flips the pointer last under fault injection (PR 2)"
-pend G9 "a Rotate retry discards the orphan (PR 2)"
+check G5 "a copied-back current is refused against the floor, with its own message; nothing recorded for the name accepts it" \
+	TestFloorRefusesCopiedBackPointer TestFloorCheck
+check G6 "the floor and the data root are root-owned and not shared, judged on the descriptor; the floor is the system scope's, parsed strictly; a caller that cannot write it changes nothing" \
+	TestFloorTrust TestFloorScope FuzzParseFloor TestFloorNotWritableChangesNothing
+partial G7 "the floor is raised by Put, Rotate, RaiseFloor and Delete when the master opens; one behind is accepted; each write re-reads it under the data-root lock, with a bounded wait (library)" \
+	"list/show call RaiseFloor (PR 4: k3sm keys)" \
+	TestFloorRaised TestFloorWriteRereads TestFloorLockBoundedWait
+check G8 "Rotate flips the pointer last; a crash before the flip leaves the old version current" \
+	TestRotateCrashAtEveryStep TestRotate
+check G9 "a Rotate retry discards the orphan and seals the value it was given" TestRotateRetryDiscardsOrphan TestParseVersionName
 check G10 "the master is minted only by the first put, never over entries" TestMasterMint TestMintCountsReservedUserName
 check G11 "the master is judged on the open descriptor" TestMasterTrust
 pend G12 "Rewrap resumes after a crash at every step (PR 3)"
 pend G13 "a crash between the master renames is completed (PR 3)"
-partial G14 "one lock with a bounded wait that excludes, and no read that blocks (library: Put, Delete and the reads)" \
-	"Rotate and Rewrap take the same lock (PR 2: Rotate, PR 3: Rewrap)" \
+partial G14 "one lock with a bounded wait that excludes, and no read that blocks (library: Put, Rotate, Delete and the reads)" \
+	"Rewrap takes the same lock (PR 3: Rewrap)" \
 	TestLockBoundedWait TestLockExcludes TestConcurrentOperations TestFIFORefused TestReadDirNamesBound
 check G15 "files a root verb writes are the service user's, at the layout's modes, inside the store" \
 	TestOwnership TestCredSymlinkRefused TestRefusesSymlinks TestMkdirRefusesSwappedDirectory \
 	TestCreateEntryRefusesSwappedDirectory TestConfigRefused
-partial G16 "List marks an unreadable entry with Err, and Delete still removes it; an entry directory with no current is an interrupted put only in the shape a crashed Put leaves, and Delete removes it too (library)" \
+partial G16 "List marks an unreadable entry with Err, and Delete still removes it; an entry directory with no current is an interrupted put only in the shape a crashed Put leaves and with its generation not in the floor, and Delete removes it too (library)" \
 	"list exits 1 on a corrupt entry (PR 4: k3sm keys)" \
-	TestListMarksCorruptEntry TestDeleteCorruptEntry TestEntryWithNoPointer TestDeletePlantedNonDirectory \
-	TestDeleteDirectoryAtCurrent TestPointerVersionBound TestPutCrashAtEveryStep TestMkdirSyncsParent
+	TestListMarksCorruptEntry TestDeleteCorruptEntry TestEntryWithNoPointer TestCommittedBeforeDecodesGeneration \
+	TestDeletePlantedNonDirectory TestDeleteDirectoryAtCurrent TestPointerVersionBound TestPutCrashAtEveryStep \
+	TestMkdirSyncsParent
 pend G17 "show prints a value only with --reveal, byte-exact (PR 4)"
 pend G18 "delivery refused while encryption is off (PR 5)"
 pend G19 "the delivery declaration is root-owned (PR 5)"

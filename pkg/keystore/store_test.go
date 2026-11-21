@@ -42,7 +42,8 @@ import (
 // test user, with the work dir path for tests that inspect the files.
 func newTestStore(t *testing.T) (*FileStore, string) {
 	t.Helper()
-	server := filepath.Join(t.TempDir(), "server")
+	data := t.TempDir()
+	server := filepath.Join(data, "server")
 	if err := os.Mkdir(server, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +52,11 @@ func newTestStore(t *testing.T) (*FileStore, string) {
 		MasterDir: filepath.Join(server, "cred", "keystore-master"),
 		UID:       uint32(os.Getuid()),
 		GID:       uint32(os.Getgid()),
+		DataRoot:  data,
 	})
+	// A test cannot create a root-owned file, so the test user stands in for
+	// root as the floor's owner.
+	s.floorUID, s.floorGID = uint32(os.Getuid()), uint32(os.Getgid())
 	return s, server
 }
 
@@ -566,7 +571,8 @@ func TestDeletePlantedNonDirectory(t *testing.T) {
 }
 
 // TestDeleteDirectoryAtCurrent: a non-empty directory planted at an entry's
-// current is removed with the entry, not left to fail every retried Delete.
+// current is removed with the entry, not left to fail every retried Delete,
+// and the entry's floor is removed with it, as a normal Delete removes it.
 func TestDeleteDirectoryAtCurrent(t *testing.T) {
 	ctx := context.Background()
 	s, server := newTestStore(t)
@@ -577,8 +583,14 @@ func TestDeleteDirectoryAtCurrent(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeFile(t, filepath.Join(cur, "x"), "planted")
+	if _, ok := floorOf(t, server)["a"]; !ok {
+		t.Fatal("no floor entry for a before Delete")
+	}
 	if err := s.Delete(ctx, "a"); err != nil {
 		t.Fatalf("Delete: %v", err)
+	}
+	if f, ok := floorOf(t, server)["a"]; ok {
+		t.Fatalf("floor entry for a after Delete = %+v, want it removed with the entry", f)
 	}
 	if _, err := os.Lstat(filepath.Join(server, "keystore", "a")); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("entry directory after Delete: %v, want it gone", err)
@@ -588,22 +600,26 @@ func TestDeleteDirectoryAtCurrent(t *testing.T) {
 	}
 }
 
-// TestConfigRefused: a zero service uid, an empty, relative or unclean Dir or
-// MasterDir, or a MasterDir at or inside Dir makes every operation fail
-// closed, before anything is created.
+// TestConfigRefused: a zero service uid, an empty, relative or unclean Dir,
+// MasterDir or DataRoot, or a MasterDir at or inside Dir makes every
+// operation fail closed, before anything is created.
 func TestConfigRefused(t *testing.T) {
 	ctx := context.Background()
 	for name, edit := range map[string]func(c *Config){
-		"zero uid":                 func(c *Config) { c.UID = 0 },
-		"empty Dir":                func(c *Config) { c.Dir = "" },
-		"empty MasterDir":          func(c *Config) { c.MasterDir = "" },
-		"nothing set at all":       func(c *Config) { *c = Config{} },
-		"Dir with a trailing /":    func(c *Config) { c.Dir += "/" },
-		"relative MasterDir":       func(c *Config) { c.MasterDir = filepath.Join("cred", "keystore-master") },
-		"MasterDir inside Dir":     func(c *Config) { c.MasterDir = filepath.Join(c.Dir, "keystore-master") },
-		"MasterDir equal to Dir":   func(c *Config) { c.MasterDir = c.Dir },
-		"relative Dir":             func(c *Config) { c.Dir = "keystore" },
-		"MasterDir with a dot-dot": func(c *Config) { c.MasterDir = filepath.Join(c.Dir, "..") + "/../server/cred/keystore-master" },
+		"zero uid":                   func(c *Config) { c.UID = 0 },
+		"empty Dir":                  func(c *Config) { c.Dir = "" },
+		"empty MasterDir":            func(c *Config) { c.MasterDir = "" },
+		"nothing set at all":         func(c *Config) { *c = Config{} },
+		"Dir with a trailing /":      func(c *Config) { c.Dir += "/" },
+		"relative MasterDir":         func(c *Config) { c.MasterDir = filepath.Join("cred", "keystore-master") },
+		"MasterDir inside Dir":       func(c *Config) { c.MasterDir = filepath.Join(c.Dir, "keystore-master") },
+		"MasterDir equal to Dir":     func(c *Config) { c.MasterDir = c.Dir },
+		"relative Dir":               func(c *Config) { c.Dir = "keystore" },
+		"MasterDir with a dot-dot":   func(c *Config) { c.MasterDir = filepath.Join(c.Dir, "..") + "/../server/cred/keystore-master" },
+		"empty DataRoot":             func(c *Config) { c.DataRoot = "" },
+		"relative DataRoot":          func(c *Config) { c.DataRoot = "data" },
+		"DataRoot with a trailing /": func(c *Config) { c.DataRoot += "/" },
+		"DataRoot with a dot-dot":    func(c *Config) { c.DataRoot = filepath.Join(c.Dir, "..", "..") + "/server/.." },
 	} {
 		t.Run(name, func(t *testing.T) {
 			server := filepath.Join(t.TempDir(), "server")
@@ -618,6 +634,7 @@ func TestConfigRefused(t *testing.T) {
 				MasterDir: filepath.Join(server, "cred", "keystore-master"),
 				UID:       uint32(os.Getuid()),
 				GID:       uint32(os.Getgid()),
+				DataRoot:  filepath.Dir(server),
 			}
 			edit(&cfg)
 			s := New(cfg)
@@ -627,6 +644,8 @@ func TestConfigRefused(t *testing.T) {
 			_, _, ops["Get"] = s.Get(ctx, "a", 1)
 			_, ops["List"] = s.List(ctx)
 			ops["Delete"] = s.Delete(ctx, "a")
+			_, ops["Rotate"] = s.Rotate(ctx, "a", []byte("b"))
+			ops["RaiseFloor"] = s.RaiseFloor(ctx)
 			for op, err := range ops {
 				if !errors.Is(err, errInvalidConfig) {
 					t.Errorf("%s: %v, want errInvalidConfig", op, err)
@@ -663,7 +682,8 @@ func TestReadErrorIsNotCorrupt(t *testing.T) {
 }
 
 // TestLockBoundedWait is gate row G14: a held lock gives a timeout error
-// after the bound, never a hang, and a cancelled context ends the wait.
+// after the bound, never a hang, and a cancelled context ends the wait, for
+// every verb that takes it, Rotate included.
 //
 // Each case runs in a testing/synctest bubble, whose clock moves only while
 // every goroutine in it is blocked, so the store waits its production bound
@@ -711,6 +731,7 @@ func TestLockBoundedWait(t *testing.T) {
 			bounded(t, s, "Current", func() error { _, _, err := s.Current(ctx, "a"); return err })
 			bounded(t, s, "List", func() error { _, err := s.List(ctx); return err })
 			bounded(t, s, "Delete", func() error { return s.Delete(ctx, "a") })
+			bounded(t, s, "Rotate", func() error { _, err := s.Rotate(ctx, "a", []byte("b")); return err })
 		})
 	})
 	t.Run("shared holder blocks only writes", func(t *testing.T) {
@@ -719,6 +740,7 @@ func TestLockBoundedWait(t *testing.T) {
 			s, server := setup(t)
 			hold(t, server, syscall.LOCK_SH)
 			bounded(t, s, "Put", func() error { _, err := s.Put(ctx, "b", KindOpaque, []byte("b")); return err })
+			bounded(t, s, "Rotate", func() error { _, err := s.Rotate(ctx, "a", []byte("b")); return err })
 			if _, _, err := s.Current(ctx, "a"); err != nil {
 				t.Fatalf("Current under a shared lock: %v", err)
 			}
@@ -729,14 +751,21 @@ func TestLockBoundedWait(t *testing.T) {
 			s, server := setup(t)
 			hold(t, server, syscall.LOCK_EX)
 			s.lockWait = time.Minute
-			cctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
-			defer cancel()
-			start := time.Now()
-			if _, err := s.Put(cctx, "b", KindOpaque, []byte("b")); !errors.Is(err, context.DeadlineExceeded) {
-				t.Fatalf("Put: %v, want the context's error", err)
-			}
-			if took := time.Since(start); took >= s.lockWait {
-				t.Fatalf("Put waited %v of bubble time, want the context's 50ms, not the lock bound", took)
+			for op, fn := range map[string]func(ctx context.Context) error{
+				"Put":    func(ctx context.Context) error { _, err := s.Put(ctx, "b", KindOpaque, []byte("b")); return err },
+				"Rotate": func(ctx context.Context) error { _, err := s.Rotate(ctx, "a", []byte("b")); return err },
+			} {
+				cctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+				start := time.Now()
+				err := fn(cctx)
+				took := time.Since(start)
+				cancel()
+				if !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("%s: %v, want the context's error", op, err)
+				}
+				if took >= s.lockWait {
+					t.Fatalf("%s waited %v of bubble time, want the context's 50ms, not the lock bound", op, took)
+				}
 			}
 		})
 	})
@@ -753,7 +782,8 @@ func TestDirectoryOwnerRefused(t *testing.T) {
 
 	s, _ := newTestStore(t)
 	mustPut(t, s, "a", KindOpaque, []byte("a"))
-	foreign := New(Config{Dir: s.dir, MasterDir: s.masterDir, UID: other, GID: s.gid})
+	foreign := New(Config{Dir: s.dir, MasterDir: s.masterDir, UID: other, GID: s.gid, DataRoot: s.dataRoot})
+	foreign.floorUID, foreign.floorGID = s.floorUID, s.floorGID
 	foreign.chown = noChown
 	want := fmt.Sprintf("owned by uid %d, want %d", os.Getuid(), other)
 	if _, _, err := foreign.Current(ctx, "a"); err == nil || !strings.Contains(err.Error(), want) {
@@ -1061,7 +1091,8 @@ func TestScopeBindsRecords(t *testing.T) {
 	mustPut(t, s, "a", KindOpaque, []byte("a"))
 	// The test-only seam: a second store over the same directories, under a
 	// scope New does not construct.
-	u501 := New(Config{Dir: s.dir, MasterDir: s.masterDir, UID: s.uid, GID: s.gid})
+	u501 := New(Config{Dir: s.dir, MasterDir: s.masterDir, UID: s.uid, GID: s.gid, DataRoot: s.dataRoot})
+	u501.floorUID, u501.floorGID = s.floorUID, s.floorGID
 	u501.scope = "user/501"
 	if _, _, err := u501.Current(ctx, "a"); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("Current under user/501: %v, want ErrCorrupt", err)
@@ -1125,6 +1156,9 @@ func TestMintCountsReservedUserName(t *testing.T) {
 func TestEntryWithNoPointer(t *testing.T) {
 	ctx := context.Background()
 	// setup stores "a" and then leaves its directory in the shape under test.
+	// A Put that crashed before its pointer never recorded a floor, so the
+	// interrupted-put cases also take "a" out of the floor; the cases where a
+	// committed entry lost its pointer keep it.
 	setup := func(t *testing.T, shape func(dir string)) (*FileStore, string) {
 		t.Helper()
 		s, server := newTestStore(t)
@@ -1133,6 +1167,9 @@ func TestEntryWithNoPointer(t *testing.T) {
 		remove(t, filepath.Join(dir, currentName))
 		shape(dir)
 		return s, dir
+	}
+	unrecorded := func(dir string) {
+		writeFile(t, filepath.Join(filepath.Dir(filepath.Dir(filepath.Dir(dir))), floorName), `{"version":1,"scope":"system","entries":{}}`)
 	}
 	files := func(t *testing.T, dir string) string {
 		t.Helper()
@@ -1148,10 +1185,28 @@ func TestEntryWithNoPointer(t *testing.T) {
 	}
 
 	for name, shape := range map[string]func(dir string){
-		"generation and v1": func(string) {},
-		"generation only":   func(dir string) { remove(t, filepath.Join(dir, "v1")) },
+		"generation and v1": unrecorded,
+		"generation only":   func(dir string) { remove(t, filepath.Join(dir, "v1")); unrecorded(dir) },
+		"empty":             func(dir string) { remove(t, filepath.Join(dir, "v1")); remove(t, filepath.Join(dir, generationName)) },
 		"a leftover temporary file": func(dir string) {
 			writeFile(t, filepath.Join(dir, "."+currentName+".0123456789abcdef.tmp"), "half a write")
+			unrecorded(dir)
+		},
+		"generation and a temporary file, as a crash while writing v1 leaves": func(dir string) {
+			remove(t, filepath.Join(dir, "v1"))
+			writeFile(t, filepath.Join(dir, ".v1.0123456789abcdef.tmp"), "half a write")
+			unrecorded(dir)
+		},
+		// Without a floor file the two cannot be told apart, and the rule
+		// falls back to the shape.
+		"no floor file": func(dir string) {
+			remove(t, filepath.Join(filepath.Dir(filepath.Dir(filepath.Dir(dir))), floorName))
+		},
+		// A floor of another generation is what an interrupted Delete leaves
+		// for the name before the Put that crashed here.
+		"a floor of another generation": func(dir string) {
+			writeFile(t, filepath.Join(filepath.Dir(filepath.Dir(filepath.Dir(dir))), floorName),
+				`{"version":1,"scope":"system","entries":{"a":{"generation":"00000000000000000000000000000000","seq":3}}}`)
 		},
 	} {
 		t.Run("interrupted put: "+name, func(t *testing.T) {
@@ -1188,6 +1243,13 @@ func TestEntryWithNoPointer(t *testing.T) {
 		"v2 without v1": func(dir string) {
 			copyFile(t, filepath.Join(dir, "v1"), filepath.Join(dir, "v2"))
 			remove(t, filepath.Join(dir, "v1"))
+		},
+		// The floor records this generation, so the pointer was committed:
+		// the one-version entry that lost it is told apart from a crashed Put.
+		"lost pointer, generation and v1": func(string) {},
+		"lost pointer, generation only":   func(dir string) { remove(t, filepath.Join(dir, "v1")) },
+		"lost pointer, renamed to a temporary name": func(dir string) {
+			writeFile(t, filepath.Join(dir, "."+currentName+".0123456789abcdef.tmp"), "the old pointer")
 		},
 		// Only a regular file of the exact shape writeFile creates is a
 		// temporary file.
@@ -1334,7 +1396,7 @@ func TestPutCrashAtEveryStep(t *testing.T) {
 	// The steps come in this order, each directory's mkdir before anything
 	// written into it; that each parent is fsynced before its directory's
 	// step is TestMkdirSyncsParent's to check.
-	want := "mkdir keystore,mkdir cred,mkdir keystore-master,write master,write master.sha256,mkdir k,write generation,write v1,write current"
+	want := "mkdir keystore,mkdir cred,mkdir keystore-master,write master,write master.sha256,mkdir k,write generation,write v1,write current,write keystore-floor.json"
 	if strings.Join(steps, ",") != want {
 		t.Fatalf("Put steps = %v, want %s", steps, want)
 	}
@@ -1354,6 +1416,9 @@ func TestPutCrashAtEveryStep(t *testing.T) {
 	}
 	others := []error{ErrMasterMissing, ErrMasterUntrusted, ErrCorrupt, ErrExists}
 	for _, step := range steps {
+		if step == "write "+floorName {
+			continue // after the pointer: the entry is committed (TestFloorRaised)
+		}
 		t.Run(step, func(t *testing.T) {
 			want, ok := afterCrash[step]
 			if !ok {
@@ -1391,12 +1456,22 @@ func TestPutCrashAtEveryStep(t *testing.T) {
 			t.Fatal("Delete succeeded through a crash")
 		}
 		s.step = func(string) error { return nil }
-		if _, _, err := s.Current(ctx, "k"); !errors.Is(err, ErrNotFound) {
-			t.Fatalf("Current after an interrupted Delete: %v, want ErrNotFound", err)
+		// The floor still records the entry, so what the interrupted Delete
+		// left is a committed entry without its pointer, which a retried
+		// Delete clears, not a crashed Put that would hide the sealed v1 from
+		// rm until the next Put.
+		if _, _, err := s.Current(ctx, "k"); !errors.Is(err, errLostPointer) {
+			t.Fatalf("Current after an interrupted Delete: %v, want the lost-pointer refusal", err)
+		}
+		if _, err := s.Put(ctx, "k", KindOpaque, []byte("again")); !errors.Is(err, ErrExists) {
+			t.Fatalf("Put over an interrupted Delete: %v, want ErrExists", err)
 		}
 		// The retried rm removes the generation and sealed v1 the crash left.
+		if err := s.Delete(ctx, "k"); err != nil {
+			t.Fatalf("retried Delete: %v", err)
+		}
 		if err := s.Delete(ctx, "k"); !errors.Is(err, ErrNotFound) {
-			t.Fatalf("retried Delete: %v, want ErrNotFound", err)
+			t.Fatalf("Delete after the retried Delete: %v, want ErrNotFound", err)
 		}
 		if _, err := os.Lstat(filepath.Join(s.dir, "k")); !errors.Is(err, fs.ErrNotExist) {
 			t.Fatalf("entry directory after the retried Delete: %v, want it gone", err)

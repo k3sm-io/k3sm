@@ -17,6 +17,7 @@ limitations under the License.
 package keystore
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
@@ -25,6 +26,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -53,11 +55,17 @@ var (
 	// holds only what a crashed Put leaves: generation and at most v1. It is not
 	// an entry, so it matches ErrNotFound, and only a Put touches it.
 	errInterruptedPut = fmt.Errorf("%w: an interrupted put left a directory with no current pointer", ErrNotFound)
-	// errNoPointer is an entry directory with no current pointer that holds
-	// more than a crashed Put leaves. Put never writes that before the pointer,
-	// so it is damage, or an interrupted Delete: List reports it, Put refuses
-	// it, and Delete clears it.
-	errNoPointer = fmt.Errorf("%w: the current pointer is missing and the directory holds more than an interrupted put leaves", ErrCorrupt)
+	// errNoPointer is an entry directory with no current pointer that is not
+	// an interrupted Put: damage, or an interrupted Delete. List reports it,
+	// Put refuses it, and Delete clears it. It is one of the two below.
+	errNoPointer = fmt.Errorf("%w: the current pointer is missing", ErrCorrupt)
+	// errDamagedShape is errNoPointer for a directory that holds more than a
+	// crashed Put leaves: Put never writes that before the pointer.
+	errDamagedShape = fmt.Errorf("%w, and the directory holds more than an interrupted put leaves", errNoPointer)
+	// errLostPointer is errNoPointer for a directory in the shape a crashed Put
+	// leaves whose generation the floor records: Put records the floor only
+	// after its pointer, so this entry's pointer was committed and then lost.
+	errLostPointer = fmt.Errorf("%w, although the floor records that this entry committed one", errNoPointer)
 	// errInvalidConfig reports a Config every operation refuses.
 	errInvalidConfig = errors.New("invalid keystore config")
 )
@@ -73,23 +81,27 @@ type Config struct {
 	// creates is handed to them, and the entries' directory, cred/, the master
 	// directory and the master file must be owned by UID.
 	//
-	// A UID of 0, a Dir or MasterDir that is not absolute or not equal to
-	// its own filepath.Clean, or a MasterDir equal to or inside Dir makes
-	// every operation fail.
+	// A UID of 0, a Dir, MasterDir or DataRoot that is not absolute or not
+	// equal to its own filepath.Clean, or a MasterDir equal to or inside Dir
+	// makes every operation fail.
 	UID, GID uint32
+	// DataRoot is the data root, /var/lib/k3sm, which holds the root-owned
+	// pointer floor, keystore-floor.json.
+	DataRoot string
 }
 
 // FileStore is the keystore on disk, laid out as docs/design/keystore.md §
 // "On-disk layout" gives. Every method takes the store-wide lock for its
 // duration: exclusive to write, shared to read.
 //
-// Rotate and Rewrap land in later pull requests, so FileStore does not yet
-// satisfy Store: it implements every other Store method, which keystore_test.go
+// Rewrap lands in a later pull request, so FileStore does not yet satisfy
+// Store: it implements every other Store method, which keystore_test.go
 // asserts, and the Rewrap pull request replaces that assertion with
 // var _ Store = (*FileStore)(nil).
 type FileStore struct {
 	dir       string
 	masterDir string
+	dataRoot  string
 	uid, gid  uint32
 	// scope is the scope every record is sealed and opened under, supplied
 	// from the store's identity and never read from a file. New sets
@@ -104,12 +116,20 @@ type FileStore struct {
 	// step is called at each durable step of a write; a non-nil return aborts
 	// the write there, as a crash would.
 	step func(name string) error
+	// floorUID and floorGID own the floor and the data root: root in
+	// production, the test user in tests, which cannot create a root-owned
+	// file.
+	floorUID, floorGID uint32
 	// entryMade is called between a new entry directory's mkdir and its open,
 	// where a test swaps the directory.
 	entryMade func(name string)
 	// dirMade is called inside mkdirAt, between the mkdir and the Lstat that
 	// takes the new directory's identity, where a test swaps the directory.
 	dirMade func(name string)
+	// dataRootLocked is called in lockFloor between the data root's flock and
+	// the OpenRoot the floor is read through, where a test swaps the data
+	// root.
+	dataRootLocked func()
 	// euid is the effective uid that creates the store's directories, which
 	// a new directory must be owned by before it is handed over.
 	euid func() int
@@ -119,26 +139,28 @@ type FileStore struct {
 // does not judge cfg: every operation does that first (see checkConfig).
 func New(cfg Config) *FileStore {
 	return &FileStore{
-		dir:       cfg.Dir,
-		masterDir: cfg.MasterDir,
-		uid:       cfg.UID,
-		gid:       cfg.GID,
-		scope:     scopeSystem,
-		rand:      rand.Reader,
-		now:       time.Now,
-		chown:     (*os.File).Chown,
-		lockWait:  lockTimeout,
-		step:      func(string) error { return nil },
-		entryMade: func(string) {},
-		dirMade:   func(string) {},
-		euid:      os.Geteuid,
+		dir:            cfg.Dir,
+		masterDir:      cfg.MasterDir,
+		dataRoot:       cfg.DataRoot,
+		uid:            cfg.UID,
+		gid:            cfg.GID,
+		scope:          scopeSystem,
+		rand:           rand.Reader,
+		now:            time.Now,
+		chown:          (*os.File).Chown,
+		lockWait:       lockTimeout,
+		step:           func(string) error { return nil },
+		entryMade:      func(string) {},
+		dirMade:        func(string) {},
+		dataRootLocked: func() {},
+		euid:           os.Geteuid,
 	}
 }
 
 // checkConfig refuses a store every operation must fail closed on: a zero
 // service uid, which would hand the service user's files to root and accept
-// root-owned ones; a Dir or MasterDir that is empty or relative, which would
-// resolve against the working directory, or not equal to its own
+// root-owned ones; a Dir, MasterDir or DataRoot that is empty or relative,
+// which would resolve against the working directory, or not equal to its own
 // filepath.Clean, whose last component (a trailing slash, a "..") would not be
 // the directory the store opens it as; or a MasterDir equal to or inside Dir,
 // which would put the master among the entries and in every backup of them.
@@ -150,8 +172,10 @@ func (s *FileStore) checkConfig() error {
 		return fmt.Errorf("%w: Dir is empty", errInvalidConfig)
 	case s.masterDir == "":
 		return fmt.Errorf("%w: MasterDir is empty", errInvalidConfig)
+	case s.dataRoot == "":
+		return fmt.Errorf("%w: DataRoot is empty", errInvalidConfig)
 	}
-	for _, p := range []struct{ field, path string }{{"Dir", s.dir}, {"MasterDir", s.masterDir}} {
+	for _, p := range []struct{ field, path string }{{"Dir", s.dir}, {"MasterDir", s.masterDir}, {"DataRoot", s.dataRoot}} {
 		if !filepath.IsAbs(p.path) {
 			return fmt.Errorf("%w: %s %q is not absolute", errInvalidConfig, p.field, p.path)
 		}
@@ -167,8 +191,9 @@ func (s *FileStore) checkConfig() error {
 
 // Put creates name at version 1 holding value, minting the master on the
 // keystore's first Put. The entry is written generation, then version 1, then
-// the current pointer; an entry directory without a pointer is an interrupted
-// Put, which the next Put of that name discards.
+// the current pointer, then its floor; an entry directory without a pointer
+// in the shape a crashed Put leaves, whose generation the floor does not
+// record, is an interrupted Put, which the next Put of that name discards.
 func (s *FileStore) Put(ctx context.Context, name string, kind Kind, value []byte) (Version, error) {
 	v, err := s.put(ctx, name, kind, value)
 	if err != nil {
@@ -187,21 +212,49 @@ func (s *FileStore) put(ctx context.Context, name string, kind Kind, value []byt
 	if err := checkValue(kind, value); err != nil {
 		return Version{}, err
 	}
+	// The floor is judged writable before anything is created, and locked
+	// before anything is written, a master minted included.
+	if err := s.checkFloorWritable(); err != nil {
+		return Version{}, err
+	}
 	root, done, err := s.openLocked(ctx, true, true)
 	if err != nil {
 		return Version{}, err
 	}
 	defer done()
+	fdir, fl, err := s.lockFloor(ctx)
+	if err != nil {
+		return Version{}, err
+	}
+	defer fdir.unlock()
 	k, err := s.masterForPut(root)
 	if err != nil {
 		return Version{}, err
 	}
-	e, err := s.createEntry(root, name)
+	if fl, err = s.syncFloor(ctx, root, fdir, fl, k); err != nil {
+		return Version{}, err
+	}
+	// A floor with no room for the new entry refuses the Put before its
+	// directory is made. The generation is not minted yet; every one encodes
+	// to the same length.
+	if err := fl.room(name, floorEntry{Generation: hex.EncodeToString(make([]byte, generationSize)), Seq: 1}); err != nil {
+		return Version{}, err
+	}
+	e, err := s.createEntry(root, name, fl)
 	if err != nil {
 		return Version{}, err
 	}
 	defer e.close()
-	return s.writeEntry(e, k, kind, value)
+	v, err := s.writeEntry(e, k, kind, value)
+	if err != nil {
+		return Version{}, err
+	}
+	// A new generation replaces whatever an interrupted Delete left recorded
+	// for the name.
+	if _, err := fdir.update(func(fl floor) bool { return fl.set(name, e.generation) }); err != nil {
+		return Version{}, fmt.Errorf("the entry is stored, but recording its floor failed (the next keys verb records it): %w", err)
+	}
+	return v, nil
 }
 
 // createEntry makes name's directory with a fresh generation. A directory
@@ -213,10 +266,10 @@ func (s *FileStore) put(ctx context.Context, name string, kind Kind, value []byt
 // symlink that stays inside root, so the opened directory must be the one the
 // mkdir made: a name swapped in between would otherwise have the new entry's
 // generation written over another entry's.
-func (s *FileStore) createEntry(root *os.Root, name string) (*entry, error) {
+func (s *FileStore) createEntry(root *os.Root, name string, fl floor) (*entry, error) {
 	made, err := s.mkdirAt(root, name)
 	if errors.Is(err, fs.ErrExist) {
-		old, oerr := openEntryDir(root, name)
+		old, oerr := openEntryDir(root, name, fl)
 		switch {
 		case oerr == nil:
 			old.close()
@@ -281,8 +334,8 @@ func (s *FileStore) Current(ctx context.Context, name string) (Version, []byte, 
 		v   Version
 		val []byte
 	)
-	err := s.read(ctx, name, func(e *entry, k keys) error {
-		cur, err := e.pointer(k)
+	err := s.read(ctx, name, func(e *entry, k keys, fl floor) error {
+		cur, _, err := e.checkedPointer(k, fl)
 		if err != nil {
 			return err
 		}
@@ -299,8 +352,8 @@ func (s *FileStore) Get(ctx context.Context, name string, version uint64) (Versi
 		v   Version
 		val []byte
 	)
-	err := s.read(ctx, name, func(e *entry, k keys) error {
-		cur, err := e.pointer(k)
+	err := s.read(ctx, name, func(e *entry, k keys, fl floor) error {
+		cur, _, err := e.checkedPointer(k, fl)
 		if err != nil {
 			return err
 		}
@@ -313,9 +366,10 @@ func (s *FileStore) Get(ctx context.Context, name string, version uint64) (Versi
 	return v, val, err
 }
 
-// read runs fn on name's entry under the shared lock. A missing entries'
-// directory, entry directory or current pointer is ErrNotFound.
-func (s *FileStore) read(ctx context.Context, name string, fn func(*entry, keys) error) error {
+// read runs fn on name's entry under the shared lock, with the recorded
+// floor. A missing entries' directory or entry directory, or an interrupted
+// Put, is ErrNotFound.
+func (s *FileStore) read(ctx context.Context, name string, fn func(*entry, keys, floor) error) error {
 	err := func() error {
 		if err := s.checkConfig(); err != nil {
 			return err
@@ -331,7 +385,12 @@ func (s *FileStore) read(ctx context.Context, name string, fn func(*entry, keys)
 			return err
 		}
 		defer done()
-		e, err := openEntry(root, name)
+		fdir, fl, err := s.openFloor()
+		if err != nil {
+			return err
+		}
+		_ = fdir.Close() // read-only; nothing to flush
+		e, err := openEntry(root, name, fl)
 		if err != nil {
 			return err
 		}
@@ -340,7 +399,7 @@ func (s *FileStore) read(ctx context.Context, name string, fn func(*entry, keys)
 		if err != nil {
 			return err
 		}
-		return fn(e, k)
+		return fn(e, k, fl)
 	}()
 	if err != nil {
 		return fmt.Errorf("%s: %w", name, err)
@@ -372,6 +431,13 @@ func (s *FileStore) list(ctx context.Context) ([]Entry, error) {
 		return nil, err
 	}
 	defer done()
+	// The floor decides what is an entry, and a floor that cannot be trusted
+	// is about every entry, so it fails the whole call.
+	fdir, fl, err := s.openFloor()
+	if err != nil {
+		return nil, err
+	}
+	_ = fdir.Close() // read-only; nothing to flush
 	names, err := readDirNames(root, maxDirNames)
 	if err != nil {
 		return nil, err
@@ -385,7 +451,7 @@ func (s *FileStore) list(ctx context.Context) ([]Entry, error) {
 		if checkName(name) != nil {
 			continue
 		}
-		e, err := openEntry(root, name)
+		e, err := openEntry(root, name, fl)
 		if errors.Is(err, ErrNotFound) {
 			continue
 		}
@@ -401,16 +467,16 @@ func (s *FileStore) list(ctx context.Context) ([]Entry, error) {
 				return nil, err
 			}
 		}
-		out = append(out, listEntry(e, k))
+		out = append(out, listEntry(e, k, fl))
 		e.close()
 	}
 	return out, nil
 }
 
-// listEntry opens every committed version of e for List. Any failure is the
-// entry's Err.
-func listEntry(e *entry, k keys) Entry {
-	cur, err := e.pointer(k)
+// listEntry opens every committed version of e for List. Any failure, a
+// pointer the floor rules out included, is the entry's Err.
+func listEntry(e *entry, k keys, fl floor) Entry {
+	cur, _, err := e.checkedPointer(k, fl)
 	if err != nil {
 		return Entry{Name: e.name, Err: err}
 	}
@@ -426,15 +492,23 @@ func listEntry(e *entry, k keys) Entry {
 	return out
 }
 
-// Delete removes name and every version of it. The pointer is removed first,
-// so an interrupted Delete leaves a directory with no pointer. One holding only
-// generation and v1 is an interrupted Put, which is not an entry: Delete,
-// called again, removes it and answers ErrNotFound, and so does the next Put
-// of the name. One holding more is damage that List reports, and Delete,
-// called again, clears it. Delete reads nothing inside the
-// entry, so it removes one List reports as corrupt, whatever is planted at
-// its current. A symlink or any other non-directory at the name is unlinked
-// without being followed.
+// Delete removes name and every version of it. The pointer is removed first
+// and the entry's floor last, so an interrupted Delete leaves a directory with
+// no pointer whose generation the floor still records: damage that List
+// reports and Delete, called again, clears. With no floor file to say so, a
+// directory holding only generation and v1 is an interrupted Put instead,
+// which is not an entry: Delete, called again, removes it and answers
+// ErrNotFound, and so does the next Put of the name. Delete reads nothing
+// inside the entry but its generation, so it removes one List reports as
+// corrupt, whatever is planted at its current, and still removes the floor
+// entry that records its generation. A symlink or any other non-directory at
+// the name is unlinked without being followed.
+//
+// The floor is changed only for an entry it records: an interrupted Put's
+// generation is never recorded (or it would be a lost pointer), and a
+// non-directory has none, so removing either leaves the floor alone. A crash
+// after the directory is gone leaves a floor for a name with no entry, which
+// the next Put of the name replaces.
 func (s *FileStore) Delete(ctx context.Context, name string) error {
 	if err := s.delete(ctx, name); err != nil {
 		return fmt.Errorf("delete %s: %w", name, err)
@@ -449,6 +523,9 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	if err := checkName(name); err != nil {
 		return err
 	}
+	if err := s.checkFloorWritable(); err != nil {
+		return err
+	}
 	root, done, err := s.openLocked(ctx, false, true)
 	if errors.Is(err, fs.ErrNotExist) {
 		return ErrNotFound
@@ -457,6 +534,23 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 		return err
 	}
 	defer done()
+	fdir, fl, err := s.lockFloor(ctx)
+	if err != nil {
+		return err
+	}
+	defer fdir.unlock()
+	// Delete must work without the master, so the other entries' floors are
+	// raised only when it opens. A keystore with more entries than the floor
+	// holds is not raised, but Delete still runs: it is how room is made.
+	if k, kerr := s.loadMaster(); kerr == nil {
+		synced, err := s.syncFloor(ctx, root, fdir, fl, k)
+		switch {
+		case err == nil:
+			fl = synced
+		case !errors.Is(err, errFloorFull):
+			return err
+		}
+	}
 	// Anything but a directory at the name was planted there, since Put makes
 	// only directories: it is unlinked, and a symlink is removed itself,
 	// never followed.
@@ -466,12 +560,23 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 		}
 		return syncDir(root)
 	}
-	e, err := openEntryDir(root, name)
+	// The generation is read before anything is removed: the floor entry is
+	// removed only if it records this one. A directory whose generation does
+	// not read leaves the floor as it is, for the next Put of the name.
+	gen, genErr := [generationSize]byte{}, error(nil)
+	if raw, err := openEntryDirRaw(root, name); err == nil {
+		gen, genErr = readGeneration(raw.root)
+		raw.close()
+	} else {
+		genErr = err
+	}
+	e, err := openEntryDir(root, name, fl)
 	damaged := errors.Is(err, errNoPointer)
 	if errors.Is(err, errInterruptedPut) {
 		// Not an entry, so the answer is ErrNotFound, but the directory may
-		// hold a sealed v1 (a Delete that crashed after removing the pointer
-		// leaves one), so it is removed first.
+		// hold a sealed v1 (a Delete that crashed after removing the pointer,
+		// with no floor file to record the entry, leaves one), so it is
+		// removed first.
 		if err := root.RemoveAll(name); err != nil {
 			return err
 		}
@@ -501,7 +606,206 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	if err := root.RemoveAll(name); err != nil {
 		return err
 	}
-	return syncDir(root)
+	if err := syncDir(root); err != nil {
+		return err
+	}
+	if genErr != nil {
+		return nil
+	}
+	_, err = fdir.update(func(fl floor) bool { return fl.remove(name, gen) })
+	return err
+}
+
+// Rotate seals value as the next version of name, of the kind name already
+// has, then flips the current pointer to it at the next sequence, then raises
+// the floor: docs/design/keystore.md § "Rotation and rollback". A crash
+// before the flip leaves the old version current and an unreferenced next
+// version, which the next Rotate discards before sealing the value it was
+// given; it never promotes it.
+func (s *FileStore) Rotate(ctx context.Context, name string, value []byte) (Version, error) {
+	v, err := s.rotate(ctx, name, value)
+	if err != nil {
+		return Version{}, fmt.Errorf("rotate %s: %w", name, err)
+	}
+	return v, nil
+}
+
+func (s *FileStore) rotate(ctx context.Context, name string, value []byte) (Version, error) {
+	if err := s.checkConfig(); err != nil {
+		return Version{}, err
+	}
+	if err := checkName(name); err != nil {
+		return Version{}, err
+	}
+	if err := s.checkFloorWritable(); err != nil {
+		return Version{}, err
+	}
+	root, done, err := s.openLocked(ctx, false, true)
+	if errors.Is(err, fs.ErrNotExist) {
+		return Version{}, ErrNotFound
+	}
+	if err != nil {
+		return Version{}, err
+	}
+	defer done()
+	fdir, fl, err := s.lockFloor(ctx)
+	if err != nil {
+		return Version{}, err
+	}
+	defer fdir.unlock()
+	e, err := openEntry(root, name, fl)
+	if err != nil {
+		return Version{}, err
+	}
+	defer e.close()
+	k, err := s.loadMaster()
+	if err != nil {
+		return Version{}, err
+	}
+	if fl, err = s.syncFloor(ctx, root, fdir, fl, k); err != nil {
+		return Version{}, err
+	}
+	cur, seq, err := e.checkedPointer(k, fl)
+	if err != nil {
+		return Version{}, err
+	}
+	// The current version is opened, not only named: the new version takes
+	// its kind, and a Rotate over a current version that does not open would
+	// hide the damage behind a new one.
+	old, _, err := e.version(k, cur)
+	if err != nil {
+		return Version{}, err
+	}
+	if err := checkValue(old.Kind, value); err != nil {
+		return Version{}, err
+	}
+	if cur >= maxVersion || seq == math.MaxUint64 {
+		return Version{}, fmt.Errorf("%w: the pointer is at the last version or sequence", ErrCorrupt)
+	}
+	// A floor with no room for the next sequence refuses the Rotate before
+	// anything is written.
+	if err := fl.room(name, floorEntry{Generation: hex.EncodeToString(e.generation[:]), Seq: seq + 1}); err != nil {
+		return Version{}, err
+	}
+	if err := discardOrphans(ctx, e, cur); err != nil {
+		return Version{}, err
+	}
+	next := cur + 1
+	created := s.now().Unix()
+	rec := record{kind: byte(old.Kind), name: name, version: next, generation: e.generation, created: created}
+	if err := rec.seal(k.seal, k.scope, value, s.rand); err != nil {
+		return Version{}, err
+	}
+	if err := s.writeFile(e.root, versionName(next), rec.marshal()); err != nil {
+		return Version{}, err
+	}
+	ptr := record{kind: kindPointer, name: name, generation: e.generation, created: created}
+	if err := ptr.seal(k.seal, k.scope, pointerPlaintext(next, seq+1), s.rand); err != nil {
+		return Version{}, err
+	}
+	if err := s.writeFile(e.root, currentName, ptr.marshal()); err != nil {
+		return Version{}, err
+	}
+	if _, err := fdir.update(func(fl floor) bool { return fl.raise(name, e.generation, seq+1) }); err != nil {
+		return Version{}, fmt.Errorf("version %d is current, but recording its floor failed (the next keys verb records it): %w", next, err)
+	}
+	return versionOf(rec, value, k.fingerprint), nil
+}
+
+// discardOrphans removes every version file of e numbered above cur: what a
+// Rotate interrupted before its pointer flip leaves. Each holds the value the
+// interrupted attempt carried, so none is ever promoted. It stops with ctx's
+// error when ctx is done (see loopCtx); what it removed stays removed, and the
+// next Rotate removes the rest.
+//
+// While the floor lags its pointer (a Rotate whose floor write failed), an
+// older pointer copied back passes the floor check, and the version the live
+// pointer named is then discarded here as an orphan. docs/design/keystore.md
+// § "Rotation and rollback" accepts that window: a crash before the flip
+// leaves the same state, and its orphan must be discarded.
+func discardOrphans(ctx context.Context, e *entry, cur uint64) error {
+	names, err := readDirNames(e.root, maxDirNames)
+	if err != nil {
+		return err
+	}
+	removed := false
+	for i, n := range names {
+		if err := loopCtx(ctx, i); err != nil {
+			return err
+		}
+		v, ok := parseVersionName(n)
+		if !ok || v <= cur {
+			continue
+		}
+		if err := e.root.Remove(n); err != nil {
+			return fmt.Errorf("discard the orphaned %s: %w", n, err)
+		}
+		removed = true
+	}
+	if !removed {
+		return nil
+	}
+	return syncDir(e.root)
+}
+
+// parseVersionName returns the version a version file name names, if it is
+// one: "v" and a version number in its canonical form.
+func parseVersionName(n string) (uint64, bool) {
+	if !strings.HasPrefix(n, "v") {
+		return 0, false
+	}
+	v, err := strconv.ParseUint(n[1:], 10, 64)
+	if err != nil || v == 0 || versionName(v) != n {
+		return 0, false
+	}
+	return v, true
+}
+
+// RaiseFloor raises every entry's floor to its current pointer's sequence
+// and writes keystore-floor.json if that changes it, which also rebuilds an
+// absent floor (the restore procedure in docs/design/keystore.md § "Backup
+// and snapshots"). Put, Rotate and Delete raise it themselves at their start.
+// The read verbs (the CLI's list and show, in a later pull request) must call
+// RaiseFloor at their start to raise a floor that lags its pointers; until
+// they do, nothing raises it on read: Current, Get and List only check it. It
+// takes the exclusive lock and the floor's lock, and runs as root. A keystore
+// with no entries directory or no master has nothing to raise.
+func (s *FileStore) RaiseFloor(ctx context.Context) error {
+	if err := s.raiseFloor(ctx); err != nil {
+		return fmt.Errorf("raise the keystore floor: %w", err)
+	}
+	return nil
+}
+
+func (s *FileStore) raiseFloor(ctx context.Context) error {
+	if err := s.checkConfig(); err != nil {
+		return err
+	}
+	if err := s.checkFloorWritable(); err != nil {
+		return err
+	}
+	root, done, err := s.openLocked(ctx, false, true)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer done()
+	fdir, fl, err := s.lockFloor(ctx)
+	if err != nil {
+		return err
+	}
+	defer fdir.unlock()
+	k, err := s.loadMaster()
+	if errors.Is(err, ErrMasterMissing) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	_, err = s.syncFloor(ctx, root, fdir, fl, k)
+	return err
 }
 
 // entry is one open entry directory and its generation.
@@ -512,32 +816,44 @@ type entry struct {
 }
 
 // openEntry opens name's directory and reads its generation.
-func openEntry(root *os.Root, name string) (*entry, error) {
-	e, err := openEntryDir(root, name)
+func openEntry(root *os.Root, name string, fl floor) (*entry, error) {
+	e, err := openEntryDir(root, name, fl)
 	if err != nil {
 		return nil, err
 	}
-	b, _, err := readFile(e.root, generationName, generationFileSize)
-	if err == nil && (len(b) != generationFileSize || b[len(b)-1] != '\n') {
-		err = fmt.Errorf("%w: malformed", errBadFile)
-	}
-	if err == nil {
-		if _, herr := hex.Decode(e.generation[:], b[:len(b)-1]); herr != nil {
-			err = fmt.Errorf("%w: %w", errBadFile, herr)
-		}
-	}
-	if err != nil {
+	if e.generation, err = readGeneration(e.root); err != nil {
 		e.close()
-		return nil, readError(generationName, err)
+		return nil, err
 	}
 	return e, nil
 }
 
-// openEntryDir opens name's directory. A missing directory is ErrNotFound, a
-// real directory without a current pointer is errInterruptedPut or errNoPointer
-// as interruptedPut tells them apart, and one that is not a real directory is
-// ErrCorrupt.
-func openEntryDir(root *os.Root, name string) (*entry, error) {
+// readGeneration reads and decodes dir's generation file. A missing file or
+// one of the wrong shape is ErrCorrupt (see readError).
+func readGeneration(dir *os.Root) ([generationSize]byte, error) {
+	var gen [generationSize]byte
+	b, _, err := readFile(dir, generationName, generationFileSize)
+	if err == nil && (len(b) != generationFileSize || b[len(b)-1] != '\n') {
+		err = fmt.Errorf("%w: malformed", errBadFile)
+	}
+	if err == nil {
+		if _, herr := hex.Decode(gen[:], b[:len(b)-1]); herr != nil {
+			err = fmt.Errorf("%w: %w", errBadFile, herr)
+		}
+	}
+	if err != nil {
+		return gen, readError(generationName, err)
+	}
+	return gen, nil
+}
+
+// openEntryDir opens name's directory. A missing directory is ErrNotFound, and
+// one that is not a real directory is ErrCorrupt. A real directory without a
+// current pointer is errInterruptedPut or errNoPointer: interruptedPut tells
+// them apart by shape, and committedBefore by the floor, since a directory in
+// the shape a crashed Put leaves whose generation the floor records once had
+// a committed pointer.
+func openEntryDir(root *os.Root, name string, fl floor) (*entry, error) {
 	e, err := openEntryDirRaw(root, name)
 	if err != nil {
 		return nil, err
@@ -548,16 +864,50 @@ func openEntryDir(root *os.Root, name string) (*entry, error) {
 			return nil, err
 		}
 		interrupted, ierr := interruptedPut(e.root)
-		e.close()
-		if ierr != nil {
-			return nil, ierr
+		committed := false
+		if ierr == nil && interrupted {
+			committed, ierr = committedBefore(e.root, name, fl)
 		}
-		if interrupted {
+		e.close()
+		switch {
+		case ierr != nil:
+			return nil, ierr
+		case committed:
+			return nil, errLostPointer
+		case interrupted:
 			return nil, errInterruptedPut
 		}
-		return nil, errNoPointer
+		return nil, errDamagedShape
 	}
 	return e, nil
+}
+
+// committedBefore reports whether the floor records, for name, the
+// generation in dir's generation file. Put records the floor only after its
+// pointer, so a recorded generation means this entry committed a pointer. A
+// directory with no generation file never did. A generation file that does
+// not read while the floor records the name is damage: a crashed Put writes
+// that file whole, by rename. The two are compared as generation bytes, as
+// every reader decodes them, not as text.
+func committedBefore(dir *os.Root, name string, fl floor) (bool, error) {
+	f, ok := fl[name]
+	if !ok {
+		return false, nil
+	}
+	gen, err := readGeneration(dir)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return false, nil
+	case errors.Is(err, errBadFile):
+		return false, fmt.Errorf("%w: the generation file does not read", errDamagedShape)
+	case err != nil:
+		return false, err
+	}
+	recorded, err := hex.DecodeString(f.Generation)
+	if err != nil {
+		return false, fmt.Errorf("%w: entry %q", errFloorMalformed, name)
+	}
+	return bytes.Equal(recorded, gen[:]), nil
 }
 
 // interruptedPut reports whether dir holds only what a crashed Put leaves
@@ -668,28 +1018,40 @@ func (e *entry) openRecord(k keys, name string, pointer bool, version uint64) (r
 }
 
 // pointer opens e's current pointer and returns the version it names, at
-// most maxVersion. It is the one decoder of a pointer, so every reader gets
-// the bound.
-//
-// The pointer's sequence is read but not yet checked against a recorded
-// floor; that check lands with Rotate (docs/design/keystore.md § "Pointer
-// sequence and floor").
-func (e *entry) pointer(k keys) (uint64, error) {
+// most maxVersion, and its sequence, without consulting the floor
+// (checkedPointer does). It is the one decoder of a pointer, so every reader
+// gets the bound.
+func (e *entry) pointer(k keys) (version, seq uint64, err error) {
 	_, pt, err := e.openRecord(k, currentName, true, 0)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	if len(pt) != pointerSize {
-		return 0, fmt.Errorf("%w: the pointer is %d bytes", ErrCorrupt, len(pt))
+		return 0, 0, fmt.Errorf("%w: the pointer is %d bytes", ErrCorrupt, len(pt))
 	}
-	v := binary.BigEndian.Uint64(pt[:8])
-	if v == 0 {
-		return 0, fmt.Errorf("%w: the pointer names version 0", ErrCorrupt)
+	version = binary.BigEndian.Uint64(pt[:8])
+	seq = binary.BigEndian.Uint64(pt[8:])
+	if version == 0 || seq == 0 {
+		return 0, 0, fmt.Errorf("%w: the pointer names version %d at sequence %d", ErrCorrupt, version, seq)
 	}
-	if v > maxVersion {
-		return 0, fmt.Errorf("%w: the pointer names version %d, over the %d-version limit", ErrCorrupt, v, maxVersion)
+	if version > maxVersion {
+		return 0, 0, fmt.Errorf("%w: the pointer names version %d, over the %d-version limit", ErrCorrupt, version, maxVersion)
 	}
-	return v, nil
+	return version, seq, nil
+}
+
+// checkedPointer is pointer, refused (a staleError, matching ErrCorrupt)
+// when the floor rules it out (docs/design/keystore.md § "Pointer sequence
+// and floor").
+func (e *entry) checkedPointer(k keys, fl floor) (version, seq uint64, err error) {
+	version, seq, err = e.pointer(k)
+	if err != nil {
+		return 0, 0, err
+	}
+	if err := fl.check(e.name, e.generation, seq); err != nil {
+		return 0, 0, err
+	}
+	return version, seq, nil
 }
 
 // version opens version n of e.
