@@ -2686,7 +2686,7 @@ scope's only module changes are k3sm's requirements on its own `apis` and `runti
 each stated in the change that makes it. U15 is held for a K0 amendment and U39 is unused.
 
 **When the user scope is complete.** Every U row passes under `--check` with none pending;
-`--root` passes with no SKIP, every root-run row included; and the fails-before rule holds:
+`--root` passes with no SKIP, every root-run row included; and every U row was red first:
 each U row's tests are shown red on a build without that row's feature, and the red run is
 recorded when the change that delivers the row is built, beside the rig legs' fails-without
 record below.
