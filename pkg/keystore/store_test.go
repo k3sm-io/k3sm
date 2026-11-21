@@ -771,7 +771,7 @@ func TestPointerVersionBound(t *testing.T) {
 	if _, err := hex.Decode(ptr.generation[:], bytes.TrimSpace(gen)); err != nil {
 		t.Fatal(err)
 	}
-	if err := ptr.seal(k.seal, pointerPlaintext(1<<62, 1), rand.Reader); err != nil {
+	if err := ptr.seal(k.seal, k.scope, pointerPlaintext(1<<62, 1), rand.Reader); err != nil {
 		t.Fatal(err)
 	}
 	writeFile(t, filepath.Join(dir, currentName), string(ptr.marshal()))
@@ -814,6 +814,37 @@ func TestReadDirNamesBound(t *testing.T) {
 		if names, err := readDirNames(root, max); err == nil || names != nil {
 			t.Fatalf("readDirNames with %d names over a limit of %d = %d names, %v; want an error", n, max, len(names), err)
 		}
+	}
+}
+
+// TestScopeBindsRecords: a record sealed by the system store does not open
+// in a store of another scope over the same files and master, and a store
+// whose scope checkScope refuses fails closed, creating nothing.
+func TestScopeBindsRecords(t *testing.T) {
+	ctx := context.Background()
+	s, _ := newTestStore(t)
+	mustPut(t, s, "a", KindOpaque, []byte("a"))
+	// The test-only seam: a second store over the same directories, under a
+	// scope New does not construct.
+	alice := New(Config{Dir: s.dir, MasterDir: s.masterDir, UID: s.uid, GID: s.gid})
+	alice.scope = "user/alice"
+	if _, _, err := alice.Current(ctx, "a"); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("Current under user/alice: %v, want ErrCorrupt", err)
+	}
+	if got, err := alice.List(ctx); err != nil || len(got) != 1 || !errors.Is(got[0].Err, ErrCorrupt) {
+		t.Fatalf("List under user/alice = %+v %v, want the entry marked ErrCorrupt", got, err)
+	}
+	if _, val, err := s.Current(ctx, "a"); err != nil || string(val) != "a" {
+		t.Fatalf("Current under system = %q %v", val, err)
+	}
+
+	bad, badServer := newTestStore(t)
+	bad.scope = "user"
+	if _, err := bad.Put(ctx, "a", KindOpaque, []byte("a")); !errors.Is(err, errInvalidScope) {
+		t.Fatalf("Put under an invalid scope: %v, want errInvalidScope", err)
+	}
+	if _, err := os.Lstat(filepath.Join(badServer, "cred")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("a Put under an invalid scope created cred/: %v", err)
 	}
 }
 

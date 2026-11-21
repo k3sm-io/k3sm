@@ -43,21 +43,22 @@ func testRecord() record {
 func TestAADLayout(t *testing.T) {
 	r := testRecord()
 	want := "00000001" + "01" + // LP(record format 1)
+		"00000006" + hex.EncodeToString([]byte("system")) + // LP(scope, supplied by the store)
 		"00000001" + "02" + // LP(kind: opaque)
 		"0000000a" + hex.EncodeToString([]byte("signer-key")) + // LP(name)
 		"00000008" + "0000000000000007" + // LP(version, 8 bytes BE)
 		"00000010" + strings.Repeat("a5", generationSize) // LP(generation, 16 bytes)
-	if got := hex.EncodeToString(r.aad()); got != want {
+	if got := hex.EncodeToString(r.aad(scopeSystem)); got != want {
 		t.Fatalf("aad =\n%s\nwant\n%s", got, want)
 	}
 }
 
-// TestAADBindsEveryField is gate row G2: a record moved to another kind, name,
-// version or generation fails to open, and so does one whose format byte
-// changed.
+// TestAADBindsEveryField is gate row G2: a record moved to another scope,
+// kind, name, version or generation fails to open, and so does one whose
+// format byte changed.
 func TestAADBindsEveryField(t *testing.T) {
 	sealed := testRecord()
-	if err := sealed.seal(testKey, []byte("value"), rand.Reader); err != nil {
+	if err := sealed.seal(testKey, scopeSystem, []byte("value"), rand.Reader); err != nil {
 		t.Fatalf("seal: %v", err)
 	}
 	tests := []struct {
@@ -73,15 +74,21 @@ func TestAADBindsEveryField(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			r := sealed
 			r.ciphertext = bytes.Clone(sealed.ciphertext)
-			if _, err := r.open(testKey); err != nil {
+			if _, err := r.open(testKey, scopeSystem); err != nil {
 				t.Fatalf("unmodified open: %v", err)
 			}
 			tt.mutate(&r)
-			if _, err := r.open(testKey); !errors.Is(err, ErrCorrupt) {
+			if _, err := r.open(testKey, scopeSystem); !errors.Is(err, ErrCorrupt) {
 				t.Fatalf("open after changing the %s: %v, want ErrCorrupt", tt.name, err)
 			}
 		})
 	}
+	t.Run("scope", func(t *testing.T) {
+		r := sealed
+		if _, err := r.open(testKey, "user/alice"); !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("open under another scope: %v, want ErrCorrupt", err)
+		}
+	})
 	t.Run("format", func(t *testing.T) {
 		b := sealed.marshal()
 		b[0] = recordFormat + 1
@@ -92,7 +99,7 @@ func TestAADBindsEveryField(t *testing.T) {
 	t.Run("created is not bound", func(t *testing.T) {
 		r := sealed
 		r.created++
-		if _, err := r.open(testKey); err != nil {
+		if _, err := r.open(testKey, scopeSystem); err != nil {
 			t.Fatalf("open after changing created: %v, want success (created is display metadata)", err)
 		}
 	})
@@ -104,10 +111,10 @@ func TestAADBindsEveryField(t *testing.T) {
 // nonce. The Rewrap half lands with Rewrap.
 func TestSealNonceIsFresh(t *testing.T) {
 	a, b := testRecord(), testRecord()
-	if err := a.seal(testKey, []byte("same"), rand.Reader); err != nil {
+	if err := a.seal(testKey, scopeSystem, []byte("same"), rand.Reader); err != nil {
 		t.Fatalf("seal a: %v", err)
 	}
-	if err := b.seal(testKey, []byte("same"), rand.Reader); err != nil {
+	if err := b.seal(testKey, scopeSystem, []byte("same"), rand.Reader); err != nil {
 		t.Fatalf("seal b: %v", err)
 	}
 	if a.nonce == b.nonce || bytes.Equal(a.ciphertext, b.ciphertext) {
@@ -116,7 +123,7 @@ func TestSealNonceIsFresh(t *testing.T) {
 
 	c := testRecord()
 	want := bytes.Repeat([]byte{0x5c}, nonceSize)
-	if err := c.seal(testKey, []byte("same"), bytes.NewReader(want)); err != nil {
+	if err := c.seal(testKey, scopeSystem, []byte("same"), bytes.NewReader(want)); err != nil {
 		t.Fatalf("seal c: %v", err)
 	}
 	if !bytes.Equal(c.nonce[:], want) {
@@ -124,21 +131,21 @@ func TestSealNonceIsFresh(t *testing.T) {
 	}
 
 	d := testRecord()
-	if err := d.seal(testKey, []byte("same"), iotest.ErrReader(errors.New("no entropy"))); err == nil {
+	if err := d.seal(testKey, scopeSystem, []byte("same"), iotest.ErrReader(errors.New("no entropy"))); err == nil {
 		t.Fatal("seal with a failing entropy source succeeded")
 	}
 }
 
 func TestRecordRoundTrip(t *testing.T) {
 	r := testRecord()
-	if err := r.seal(testKey, []byte("value"), rand.Reader); err != nil {
+	if err := r.seal(testKey, scopeSystem, []byte("value"), rand.Reader); err != nil {
 		t.Fatalf("seal: %v", err)
 	}
 	got, err := parseRecord(r.marshal())
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	pt, err := got.open(testKey)
+	pt, err := got.open(testKey, scopeSystem)
 	if err != nil || string(pt) != "value" {
 		t.Fatalf("open = %q %v", pt, err)
 	}
@@ -149,7 +156,7 @@ func TestRecordRoundTrip(t *testing.T) {
 
 func TestParseRecordRefusesMalformed(t *testing.T) {
 	r := testRecord()
-	if err := r.seal(testKey, []byte("value"), rand.Reader); err != nil {
+	if err := r.seal(testKey, scopeSystem, []byte("value"), rand.Reader); err != nil {
 		t.Fatalf("seal: %v", err)
 	}
 	good := r.marshal()
@@ -191,7 +198,7 @@ func TestParseRecordRefusesMalformed(t *testing.T) {
 // the same bytes, so there is one encoding of each record.
 func FuzzParseRecord(f *testing.F) {
 	r := testRecord()
-	if err := r.seal(testKey, []byte("value"), rand.Reader); err != nil {
+	if err := r.seal(testKey, scopeSystem, []byte("value"), rand.Reader); err != nil {
 		f.Fatalf("seal: %v", err)
 	}
 	f.Add(r.marshal())
@@ -285,8 +292,8 @@ func TestFingerprint(t *testing.T) {
 	seed := bytes.Repeat([]byte{7}, ed25519.SeedSize)
 	pub := ed25519.NewKeyFromSeed(seed).Public().(ed25519.PublicKey)
 	sum := sha256.Sum256(pub)
-	k1 := deriveKeys(bytes.Repeat([]byte{1}, masterSize))
-	k2 := deriveKeys(bytes.Repeat([]byte{2}, masterSize))
+	k1 := mustDeriveKeys(t, bytes.Repeat([]byte{1}, masterSize), scopeSystem)
+	k2 := mustDeriveKeys(t, bytes.Repeat([]byte{2}, masterSize), scopeSystem)
 
 	if got := fingerprint(KindEd25519, seed, k1.fingerprint); got != hex.EncodeToString(sum[:]) {
 		t.Fatalf("ed25519 fingerprint = %s, want sha256 of the public key", got)
@@ -307,8 +314,79 @@ func TestFingerprint(t *testing.T) {
 
 func TestDerivedKeysAreSeparate(t *testing.T) {
 	master := bytes.Repeat([]byte{9}, masterSize)
-	k := deriveKeys(master)
+	k := mustDeriveKeys(t, master, scopeSystem)
 	if bytes.Equal(k.seal, master) || bytes.Equal(k.fingerprint, master) || bytes.Equal(k.seal, k.fingerprint) {
 		t.Fatal("a derived key equals the master or the other derived key")
 	}
+}
+
+// TestDerivedKeysDifferByScope: one master gives each scope its own seal and
+// fingerprint keys, and a scope checkScope refuses gives none.
+func TestDerivedKeysDifferByScope(t *testing.T) {
+	master := bytes.Repeat([]byte{9}, masterSize)
+	sys := mustDeriveKeys(t, master, scopeSystem)
+	alice := mustDeriveKeys(t, master, "user/alice")
+	bob := mustDeriveKeys(t, master, "user/bob")
+	if sys.scope != scopeSystem || alice.scope != "user/alice" {
+		t.Fatalf("keys carry scopes %q and %q", sys.scope, alice.scope)
+	}
+	for _, pair := range [][2]keys{{sys, alice}, {sys, bob}, {alice, bob}} {
+		a, b := pair[0], pair[1]
+		if bytes.Equal(a.seal, b.seal) || bytes.Equal(a.fingerprint, b.fingerprint) || bytes.Equal(a.seal, b.fingerprint) {
+			t.Fatalf("scopes %q and %q share a derived key", a.scope, b.scope)
+		}
+	}
+	if _, err := deriveKeys(master, "user"); !errors.Is(err, errInvalidScope) {
+		t.Fatalf("deriveKeys under an invalid scope: %v, want errInvalidScope", err)
+	}
+}
+
+func TestCheckScope(t *testing.T) {
+	for _, tt := range []struct {
+		scope string
+		ok    bool
+	}{
+		{"system", true},
+		{"user/alice", true},
+		{"user/a", true},
+		{"user/0", true},
+		{"user/a-b", true},
+		{"user/a--b", true},
+		{"user/" + strings.Repeat("a", maxLabelLen), true},
+		{"", false},
+		{"System", false},
+		{"system/", false},
+		{"system ", false},
+		{"user", false},
+		{"user/", false},
+		{"user//alice", false},
+		{"user/alice/x", false},
+		{"user/Alice", false},
+		{"user/a.b", false},
+		{"user/-a", false},
+		{"user/a-", false},
+		{"user/a_b", false},
+		{"user/a\x00", false},
+		{"user/" + strings.Repeat("a", maxLabelLen+1), false},
+		{"users/alice", false},
+		{"/user/alice", false},
+		{"group/alice", false},
+	} {
+		err := checkScope(tt.scope)
+		if tt.ok && err != nil {
+			t.Errorf("checkScope(%q) = %v, want nil", tt.scope, err)
+		}
+		if !tt.ok && !errors.Is(err, errInvalidScope) {
+			t.Errorf("checkScope(%q) = %v, want errInvalidScope", tt.scope, err)
+		}
+	}
+}
+
+func mustDeriveKeys(t *testing.T, master []byte, scope string) keys {
+	t.Helper()
+	k, err := deriveKeys(master, scope)
+	if err != nil {
+		t.Fatalf("deriveKeys %q: %v", scope, err)
+	}
+	return k
 }

@@ -78,9 +78,9 @@ func (s *FileStore) loadMaster() (keys, error) {
 	if err != nil {
 		return keys{}, err
 	}
-	k := deriveKeys(master)
+	k, err := deriveKeys(master, s.scope)
 	clear(master) // only the derived keys are kept
-	return k, nil
+	return k, err
 }
 
 // readMaster reads the master file and checks it, on the descriptor the bytes
@@ -165,6 +165,11 @@ func (s *FileStore) masterForPut(entries *os.Root) (keys, error) {
 // fingerprint, so an interruption leaves no fingerprint, never one that
 // vouches for a key that was not written.
 func (s *FileStore) mintMaster() (keys, error) {
+	// A scope the keys could not be derived under is refused before anything
+	// is created for it.
+	if err := checkScope(s.scope); err != nil {
+		return keys{}, err
+	}
 	root, err := s.openMasterDir(true)
 	if err != nil {
 		return keys{}, fmt.Errorf("%w: %w", ErrMasterUntrusted, err)
@@ -184,5 +189,5 @@ func (s *FileStore) mintMaster() (keys, error) {
 	if err := s.writeFile(root, masterFingerprintName, []byte(masterFingerprint(master))); err != nil {
 		return keys{}, err
 	}
-	return deriveKeys(master), nil
+	return deriveKeys(master, s.scope)
 }

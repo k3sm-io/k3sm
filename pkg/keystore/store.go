@@ -83,6 +83,10 @@ type FileStore struct {
 	dir       string
 	masterDir string
 	uid, gid  uint32
+	// scope is the scope every record is sealed and opened under, supplied
+	// from the store's identity and never read from a file. New sets
+	// scopeSystem, the only scope Phase A constructs.
+	scope string
 
 	// The seams below are fixed by New; tests replace them.
 	rand     io.Reader
@@ -104,6 +108,7 @@ func New(cfg Config) *FileStore {
 		masterDir: cfg.MasterDir,
 		uid:       cfg.UID,
 		gid:       cfg.GID,
+		scope:     scopeSystem,
 		rand:      rand.Reader,
 		now:       time.Now,
 		chown:     (*os.File).Chown,
@@ -207,14 +212,14 @@ func (s *FileStore) createEntry(root *os.Root, name string) (*entry, error) {
 func (s *FileStore) writeEntry(e *entry, k keys, kind Kind, value []byte) (Version, error) {
 	created := s.now().Unix()
 	rec := record{kind: byte(kind), name: e.name, version: 1, generation: e.generation, created: created}
-	if err := rec.seal(k.seal, value, s.rand); err != nil {
+	if err := rec.seal(k.seal, k.scope, value, s.rand); err != nil {
 		return Version{}, err
 	}
 	if err := s.writeFile(e.root, versionName(1), rec.marshal()); err != nil {
 		return Version{}, err
 	}
 	ptr := record{kind: kindPointer, name: e.name, generation: e.generation, created: created}
-	if err := ptr.seal(k.seal, pointerPlaintext(1, 1), s.rand); err != nil {
+	if err := ptr.seal(k.seal, k.scope, pointerPlaintext(1, 1), s.rand); err != nil {
 		return Version{}, err
 	}
 	if err := s.writeFile(e.root, currentName, ptr.marshal()); err != nil {
@@ -572,7 +577,7 @@ func (e *entry) openRecord(k keys, name string, pointer bool, version uint64) (r
 	if !kindOK || r.name != e.name || r.version != version || r.generation != e.generation {
 		return record{}, nil, fmt.Errorf("%w: %s does not belong to this entry", ErrCorrupt, name)
 	}
-	pt, err := r.open(k.seal)
+	pt, err := r.open(k.seal, k.scope)
 	if err != nil {
 		return record{}, nil, err
 	}

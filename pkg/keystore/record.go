@@ -36,7 +36,7 @@ import (
 // AES-256-GCM. docs/design/keystore.md § "Record encoding" is its
 // specification. Seal, Open and the length-prefixed field encoding are ported
 // from internal/seal/seal.go in github.com/netstar-labs/keystore (Apache-2.0),
-// with that package's KDF-parameter associated data replaced by the five
+// with that package's KDF-parameter associated data replaced by the six
 // fields below.
 
 const (
@@ -67,12 +67,42 @@ const (
 )
 
 // Labels of the two keys derived from the master. The master itself keys only
-// HMAC-SHA256 under these fixed labels, never AES directly, so no key is used
-// by two different primitives.
+// HMAC-SHA256 under these fixed labels, each followed by a zero byte and the
+// scope (see scopedLabel), never AES directly, so no key is used by two
+// different primitives and no two scopes share a key.
 const (
 	sealKeyLabel        = "k3sm-keystore-seal-v1"
 	fingerprintKeyLabel = "k3sm-keystore-fingerprint-v1"
 )
+
+// Scopes. A store seals and opens every record under one scope, supplied from
+// its own identity and never read from a file: docs/design/keystore.md §
+// "Scope". Phase A constructs only scopeSystem.
+const (
+	// scopeSystem is the scope of the node's own store.
+	scopeSystem = "system"
+	// userScopePrefix begins a user scope: "user/" and a DNS-1123 label.
+	userScopePrefix = "user/"
+	// maxLabelLen bounds a DNS-1123 label.
+	maxLabelLen = 63
+)
+
+// errInvalidScope reports a scope checkScope refuses.
+var errInvalidScope = errors.New("invalid keystore scope")
+
+// checkScope accepts "system", or "user/" followed by a DNS-1123 label (1 to 63
+// lowercase letters, digits and '-', beginning and ending with a letter or
+// digit, as checkName requires of each of a name's labels), and refuses
+// anything else. A scope holds no zero byte, so scopedLabel is unambiguous.
+func checkScope(scope string) error {
+	if scope == scopeSystem {
+		return nil
+	}
+	if p, ok := strings.CutPrefix(scope, userScopePrefix); ok && len(p) <= maxLabelLen && dnsLabel(p) {
+		return nil
+	}
+	return fmt.Errorf("%w: %q", errInvalidScope, scope)
+}
 
 // record is one sealed file: a version record or the current pointer.
 type record struct {
@@ -87,16 +117,19 @@ type record struct {
 	ciphertext []byte
 }
 
-// aad is the associated data: the record format, kind, name, version and
-// generation, each length-prefixed (a 4-byte big-endian length, then the
-// bytes) so no field's bytes can be shifted into its neighbour.
-func (r *record) aad() []byte {
-	b := make([]byte, 0, 5*4+1+1+len(r.name)+8+generationSize)
+// aad is the associated data: the record format, scope, kind, name, version
+// and generation, each length-prefixed (a 4-byte big-endian length, then the
+// bytes) so no field's bytes can be shifted into its neighbour. The scope is
+// not in the record's bytes: the opening store supplies it, as openRecord
+// checks the name against the entry's directory.
+func (r *record) aad(scope string) []byte {
+	b := make([]byte, 0, 6*4+1+len(scope)+1+len(r.name)+8+generationSize)
 	field := func(v []byte) {
 		b = binary.BigEndian.AppendUint32(b, uint32(len(v)))
 		b = append(b, v...)
 	}
 	field([]byte{recordFormat})
+	field([]byte(scope))
 	field([]byte{r.kind})
 	field([]byte(r.name))
 	field(binary.BigEndian.AppendUint64(nil, r.version))
@@ -148,9 +181,12 @@ func parseRecord(b []byte) (record, error) {
 	return r, nil
 }
 
-// seal encrypts plaintext into r under key with a fresh nonce from random. A
-// failed read of random is an error, never a reused or zero nonce.
-func (r *record) seal(key, plaintext []byte, random io.Reader) error {
+// seal encrypts plaintext into r under key and scope with a fresh nonce from
+// random. A failed read of random is an error, never a reused or zero nonce.
+func (r *record) seal(key []byte, scope string, plaintext []byte, random io.Reader) error {
+	if err := checkScope(scope); err != nil {
+		return err
+	}
 	gcm, err := newGCM(key)
 	if err != nil {
 		return err
@@ -158,19 +194,22 @@ func (r *record) seal(key, plaintext []byte, random io.Reader) error {
 	if _, err := io.ReadFull(random, r.nonce[:]); err != nil {
 		return fmt.Errorf("read a nonce: %w", err)
 	}
-	r.ciphertext = gcm.Seal(nil, r.nonce[:], plaintext, r.aad())
+	r.ciphertext = gcm.Seal(nil, r.nonce[:], plaintext, r.aad(scope))
 	return nil
 }
 
-// open authenticates and decrypts r under key. Any mismatch of key, nonce,
-// ciphertext or associated data is ErrCorrupt; the cases are deliberately not
-// told apart.
-func (r *record) open(key []byte) ([]byte, error) {
+// open authenticates and decrypts r under key and scope. Any mismatch of key,
+// nonce, ciphertext or associated data is ErrCorrupt; the cases are
+// deliberately not told apart.
+func (r *record) open(key []byte, scope string) ([]byte, error) {
+	if err := checkScope(scope); err != nil {
+		return nil, err
+	}
 	gcm, err := newGCM(key)
 	if err != nil {
 		return nil, err
 	}
-	pt, err := gcm.Open(nil, r.nonce[:], r.ciphertext, r.aad())
+	pt, err := gcm.Open(nil, r.nonce[:], r.ciphertext, r.aad(scope))
 	if err != nil {
 		return nil, fmt.Errorf("%w: the record does not authenticate", ErrCorrupt)
 	}
@@ -188,20 +227,38 @@ func newGCM(key []byte) (cipher.AEAD, error) {
 	return cipher.NewGCM(block)
 }
 
-// keys are the two keys derived from one master.
+// keys are the two keys derived from one master for one scope, and that
+// scope, which every seal and open under them passes.
 type keys struct {
+	scope       string
 	seal        []byte
 	fingerprint []byte
 }
 
-// deriveKeys derives the seal and fingerprint keys from master. It does not
-// keep master, and a caller clears it once the keys are derived, so the raw
-// master is held no longer than the derivation needs.
-func deriveKeys(master []byte) keys {
-	return keys{
-		seal:        hmacSHA256(master, []byte(sealKeyLabel)),
-		fingerprint: hmacSHA256(master, []byte(fingerprintKeyLabel)),
+// deriveKeys derives scope's seal and fingerprint keys from master. It does
+// not keep master, and a caller clears it once the keys are derived, so the
+// raw master is held no longer than the derivation needs.
+//
+// The system scope derives from the master directly, as here. A user scope
+// will later seal under its own scope key, wrapped by the master, which is a
+// separate design; the scope in each label already keeps the scopes' keys
+// apart under one master.
+func deriveKeys(master []byte, scope string) (keys, error) {
+	if err := checkScope(scope); err != nil {
+		return keys{}, err
 	}
+	return keys{
+		scope:       scope,
+		seal:        hmacSHA256(master, scopedLabel(sealKeyLabel, scope)),
+		fingerprint: hmacSHA256(master, scopedLabel(fingerprintKeyLabel, scope)),
+	}, nil
+}
+
+// scopedLabel is a derivation label for scope: the label, a zero byte, then
+// the scope. Neither holds a zero byte, so no two pairs give one label.
+func scopedLabel(label, scope string) []byte {
+	b := append([]byte(label), 0)
+	return append(b, scope...)
 }
 
 func hmacSHA256(key, msg []byte) []byte {
@@ -266,16 +323,26 @@ func checkName(name string) error {
 		return fmt.Errorf("%w: %q", ErrInvalidName, name)
 	}
 	for _, label := range strings.Split(name, ".") {
-		if label == "" || !alnum(label[0]) || !alnum(label[len(label)-1]) {
+		if !dnsLabel(label) {
 			return fmt.Errorf("%w: %q", ErrInvalidName, name)
-		}
-		for i := 1; i < len(label)-1; i++ {
-			if c := label[i]; !alnum(c) && c != '-' {
-				return fmt.Errorf("%w: %q", ErrInvalidName, name)
-			}
 		}
 	}
 	return nil
+}
+
+// dnsLabel reports whether label is non-empty, lowercase letters, digits and
+// '-', and begins and ends with a letter or digit. Its length bound is the
+// caller's.
+func dnsLabel(label string) bool {
+	if label == "" || !alnum(label[0]) || !alnum(label[len(label)-1]) {
+		return false
+	}
+	for i := 1; i < len(label)-1; i++ {
+		if c := label[i]; !alnum(c) && c != '-' {
+			return false
+		}
+	}
+	return true
 }
 
 func alnum(c byte) bool { return 'a' <= c && c <= 'z' || '0' <= c && c <= '9' }

@@ -68,8 +68,8 @@ elif git diff --quiet "$base" -- go.mod go.sum; then
 else
 	fail G1 "go.mod or go.sum changed since $(git rev-parse --short "$base")"
 fi
-check G2 "AAD is length-prefixed and binds format, kind, name, version, generation" \
-	TestAADLayout TestAADBindsEveryField TestRecordMovedBetweenEntries
+check G2 "AAD is length-prefixed and binds format, scope, kind, name, version, generation" \
+	TestAADLayout TestAADBindsEveryField TestRecordMovedBetweenEntries TestScopeBindsRecords
 partial G3 "every seal draws a fresh nonce (library)" "Rewrap changes every nonce (PR 3: Rewrap)" TestSealNonceIsFresh
 check G4 "Delete then Put does not reopen the old v1" TestDeleteThenPutRefusesReplayedRecord
 pend G5 "a copied-back current is refused against the floor (PR 2)"

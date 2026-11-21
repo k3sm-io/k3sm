@@ -215,14 +215,17 @@ string to parse, so it has no parse failure to defend against. It is **unauthent
 display metadata**: it is not in the additional data, and a record whose `created` was
 edited still opens.
 
-**Associated data** is five fields:
+**Associated data** is six fields:
 
 ```
-AAD = LP(record-format-version) ‖ LP(kind) ‖ LP(name) ‖ LP(version, 8B BE) ‖ LP(generation, 16B)
+AAD = LP(record-format-version) ‖ LP(scope) ‖ LP(kind) ‖ LP(name) ‖ LP(version, 8B BE) ‖ LP(generation, 16B)
 ```
 
 `LP(x)` is a 4-byte big-endian length followed by `x`, so no field's bytes can be shifted
-into its neighbor. `created` is intentionally **not** in the AAD: it is display metadata,
+into its neighbor. The scope (see "Scope") is **supplied by the opening store, never read
+from the file**: it is not in the record's bytes, the header and offsets above do not change
+for it, and the store binds it from its own identity, as it checks the name against the
+directory the file lives in. `created` is intentionally **not** in the AAD: it is display metadata,
 and binding it would turn an honest clock difference (a restored backup, a changed system
 clock) into an authentication failure indistinguishable from real tampering of the value.
 
@@ -326,11 +329,15 @@ and the threat model does not defend against root. A deliberate restore of an ol
 Ed25519: `hex(sha256(publicKey))` — a plain digest is fine since a public key is not
 secret, mirroring `EncryptionKeyFingerprint` in `pkg/executor/secretsencryption.go`.
 Opaque: `hex(HMAC-SHA256(fpKey, value))` truncated to 16 bytes, where
-`fpKey = HMAC-SHA256(master, "k3sm-keystore-fingerprint-v1")` — a fixed-label HMAC under
-the master, computed once per master rather than per entry. The key that seals records is
-derived the same way, `sealKey = HMAC-SHA256(master, "k3sm-keystore-seal-v1")`, so the
-master keys only HMAC under fixed labels and is never used both as a raw AES-GCM key on
-one path and an HMAC key on another.
+`fpKey = HMAC-SHA256(master, "k3sm-keystore-fingerprint-v1" ‖ 0x00 ‖ scope)` — a fixed-label
+HMAC under the master, with the label including the scope, computed once per master and
+scope rather than per entry. The key that seals records is derived the same way,
+`sealKey = HMAC-SHA256(master, "k3sm-keystore-seal-v1" ‖ 0x00 ‖ scope)`, so the master keys
+only HMAC under fixed labels and is never used both as a raw AES-GCM key on one path and an
+HMAC key on another. A scope holds no zero byte, so no two (label, scope) pairs give one
+input, and one master gives each scope its own keys. The `system` scope derives from the
+master directly, as here; a user scope will later seal under its own scope key, wrapped by
+the master, which is a separate design.
 
 **Where it is stored: nowhere.** It is computed when a version is read, from the decrypted
 value. `list` therefore opens each version once; that is one small AES-GCM open per version
@@ -338,6 +345,17 @@ value. `list` therefore opens each version once; that is one small AES-GCM open 
 **It changes across a Rewrap** for opaque entries, because its key derives from the master;
 an Ed25519 fingerprint does not. A fingerprint copied into a runbook goes stale after a
 Rewrap, and the verb says so when it finishes.
+
+### Scope
+
+Every record is sealed under a scope, bound into its associated data and its key labels.
+Phase A writes only `system`, the scope of the node's own store. The grammar is `system`, or
+`user/` followed by a DNS-1123 label; the store refuses any other scope before it seals,
+opens or derives anything. Entry names cannot contain `/`, so the qualified names
+`system/<name>` and `user/<principal>/<name>` are unambiguous: there is no shadowing between
+scopes and no search order. A user scope's store, its own key wrapped by the master, its
+non-root API, RBAC, delivery and on-disk location are a later design; the scope is in the
+format now so that adding one needs no format change.
 
 ### Master file trust
 
@@ -708,7 +726,7 @@ last pull request lands and no row is pending.
 | # | Requirement | Validated by |
 |---|---|---|
 | G1 | Standard library only: `go.mod` and `go.sum` unchanged by the implementation | the gate diffs both against the base |
-| G2 | The AAD is length-prefixed and covers format, kind, name, version, generation; a record moved to another name, version or generation fails to open | unit: swap each field, expect `ErrCorrupt` |
+| G2 | The AAD is length-prefixed and covers format, scope, kind, name, version, generation; a record moved to another scope, name, version or generation fails to open | unit: swap each field, expect `ErrCorrupt` |
 | G3 | Every seal draws a fresh 96-bit nonce, including Rewrap | unit: two seals of one plaintext differ; Rewrap changes every nonce |
 | G4 | Delete then Put of the same name does not reopen the old `v1` | unit: replay the old file onto the new entry, expect `ErrCorrupt` |
 | G5 | A previously valid `current` copied back over the current one is refused, with a message that names the floor and does not tell the operator to restore from backup; a floor file with no entry for the name, or no floor file, accepts an authenticating pointer | unit: Rotate, restore the earlier `current`, expect `ErrCorrupt` whose text names the floor and omits "restore it from backup"; one case each for the missing entry and the missing file |
