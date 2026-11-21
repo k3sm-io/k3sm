@@ -67,6 +67,7 @@ const (
 	// opCount is the number of operations, not an operation: classify never
 	// produces it. It must stay last; TestGateProxyForEveryOperation walks
 	// every value below it.
+	//lint:ignore U1000 the sentinel bounds gateOp; only the test that walks every operation reads it
 	opCount
 )
 
