@@ -8,7 +8,10 @@ directory and the pointer rollback. The third revision answers the re-review of 
 the threat-model sentence and the forged-pointer residual, the byte-exact `--reveal` round
 trip and G21, and the six smaller points (the `master.next` mismatch case, the floor with
 no entry for a name, the floor's own refusal text, the override procedure on an existing
-cluster, the `ReadRegularFile` path, and the pull request description).
+cluster, the `ReadRegularFile` path, and the pull request description). The fourth revision
+adds "User scope": keys a login user stores without `sudo`, the local socket that serves
+them, the `KeyDelivery` API, and their gate rows. Where a user-scope fact changes a Phase A
+section, that section says so and names the change that brings it.
 
 One point worth stating up front because it resolves an apparent tension elsewhere: this
 design needs no operator passphrase and no KDF. The master key is a file k3sm mints from
@@ -47,6 +50,11 @@ that declares a delivery target) and the delivery reconciler. Nothing in Phase A
 Out of scope here: keys that never enter the datastore (Phase B) and KMS v2 envelope
 encryption of the datastore (Phase C). Each is a separate issue after Phase A lands.
 
+The user scope ("User scope") is layered on a finished Phase A and is specified separately.
+It does change `k3sm install` (a socket directory and two append-only logs), adds a local
+socket and adds a CRD; the statements in this section and in "Non-goals" hold for Phase A
+and the system scope.
+
 ## Threat model
 
 This statement is fixed. One node is one trust domain, and every native Pod runs as the
@@ -73,6 +81,16 @@ fact that must hold even against a writer that can only touch the service user's
 where only root can write it. Neither is a defence against a process that runs as the
 service user outside that profile and reads the master: that process can already read every
 entry, and what it can additionally forge is stated under "Pointer sequence and floor".
+
+Two later facts amend this paragraph. The keystore's files directly under the data root
+(Phase A's `keystore-floor.json` and `keystore-delivery.json`, and the user scope's files)
+are denied to every Pod by runtimed's data-root deny list, `DataRootDenySubdirs`, which today
+names `server` and `agent` and is widened to name files by the sandbox change that comes with
+the user scope; the data-root list is used, not `DaemonTreeSubdirs`, because a node's Pod
+root can differ from its data root. Whether a Pod can read Phase A's two data-root files
+before that change is `[K0 leg 4: pending]`; the denies land either way. And the user scope
+adds an ownership boundary on the store and its API, not a confidentiality boundary between
+Pods ("Threat model for the user scope").
 
 ## Storage format and master key
 
@@ -136,7 +154,8 @@ The fixed decisions:
         master.next.sha256
     keystore/                           0700, service user, a SIBLING of cred/
       .lock                             0600, the one lock file (see "Concurrency")
-      .user                             reserved for user scopes, not yet created (see "Scope")
+      .user                             reserved for user scopes (see "Scope"); created by the
+                                        user-scope store, laid out under "User scope"
       <name>/                           one directory per entry; created by Put with a bare
                                         Mkdir (never MkdirAll), so existence and creation
                                         are one atomic check
@@ -162,7 +181,9 @@ directory is opened as an `os.Root` and checked (a real directory, the service u
 closed to group and others), and `keystore-master/` is opened relative to `cred/`, never
 by its full path, because the service user owns `server/` and could replace `cred/` with a
 symlink. The two root-owned files under the data root are the exception to "owned by the
-service user": they exist because a Pod must not be able to write them.
+service user": they exist because a Pod must not be able to write them. The user scope adds
+service-user-owned files and a directory under the data root, created by `sudo k3sm
+install` ("User scope", "On-disk layout").
 
 ### Master key lifecycle
 
@@ -378,8 +399,8 @@ scope rather than per entry. The key that seals records is derived the same way,
 only HMAC under fixed labels and is never used both as a raw AES-GCM key on one path and an
 HMAC key on another. A scope holds no zero byte, so no two (label, scope) pairs give one
 input, and one master gives each scope its own keys. The `system` scope derives from the
-master directly, as here; a user scope will later seal under its own scope key, wrapped by
-the master, which is a separate design.
+master directly, as here; a user scope seals under its own scope key, wrapped by the
+master, as "User scope", "Key hierarchy" specifies.
 
 **Where it is stored: nowhere.** It is computed when a version is read, from the decrypted
 value. `list` therefore opens each version once; that is one small AES-GCM open per version
@@ -409,8 +430,14 @@ entry, whatever its type, so a missing master with only `.user` present is
 nothing, while `.user` exists, whatever its type: this build cannot re-wrap user scopes, and a
 master rewrapped under them would leave them unreadable. The refusal names the reserved path,
 and says that a `.user` that is not a user scope must be removed by root. A user scope's store, its own key wrapped by the master, its
-non-root API, RBAC, delivery and on-disk location are a later design; the scope is in the
-format now so that adding one needs no format change.
+non-root API, RBAC, delivery and on-disk location are specified under "User scope"; the
+scope is in the format now so that adding one needs no format change.
+
+Amended by the user scope: the user-scope store writes kind `0xFE` records (`scope.key`)
+and creates `.user`; the change that adds the sealed delivery record writes kind `0xFD`.
+The same change that adds the delivery record re-wraps scope keys in Rewrap and lifts the
+`ErrScopeUnsupported` refusal; every build before it keeps the refusal, so a rollback to one
+cannot rewrap the master out from under user scopes ("User scope", "Rewrap of scope keys").
 
 ### Master file trust
 
@@ -522,7 +549,11 @@ Every verb requires root, because the master and the entries belong to the servi
 Every file or directory a verb creates under `server/` is chowned to the service user
 before the verb returns, at the modes in the layout. A file left owned by root would fail
 the service user's own read, and a read as the service user is what the reconciler does.
-The two files under the data root are the deliberate exception: root:wheel.
+The two files under the data root are the deliberate exception: root:wheel. Amended by the
+user scope: every user-scope file is the service user's, under `keystore/.user/` and under
+the data root alike (the server writes them), so a root verb that creates one (`install`,
+`floor --rebuild`, `audit --rotate`, `rm-scope`) chowns it before it returns. The one
+root-owned addition is `keystore-run/maintenance`.
 
 ### Rewrap
 
@@ -601,7 +632,8 @@ the conservative way:
 - *A `.user` created during the run* is caught by one more check, right before step 5: the
   Rewrap stops with `ErrScopeUnsupported`, the master not swapped and `master.next` still
   agreeing, every record readable, and a rerun with the same key completes it once `.user`
-  is gone.
+  is gone. This refusal, and the `.user` refusal in the list below, are lifted by the change
+  that re-wraps scope keys ("User scope", "Rewrap of scope keys").
 - *Recovery for a stuck `master.next`.* If the service user replaces or removes
   `master.next` mid-run, after some record has moved, those records are sealed under the
   caller's new key, which then exists only as the caller's input; the next run's step 2
@@ -667,6 +699,12 @@ named exit codes). The verb for declaring a delivery target is the maintainer's 
 beside the existing subcommands, as k3s does with `k3s secrets-encrypt`, so one place
 validates input and the store's layout stays private.
 
+Amended by the user scope: names are scope-qualified from the verbs' first change. A root
+verb names `system/<name>` (`sudo k3sm keys put system/signer-key`); `<name>` below is that
+qualified form, and the part after `system/` keeps the entry-name rule above. The verbs
+change also adds `rotate --from-version N`. The non-root path, the root maintenance verbs
+and `k3sm keys exec` are under "User scope".
+
 ```
 put <name> [--kind ed25519|opaque] [--in FILE|-]
       Create at version 1. Value from --in or stdin ("-", the default), never an
@@ -688,9 +726,10 @@ show <name> [--version N] [--reveal]
       stdout is a terminal the verb still writes the raw bytes; it does not
       add a newline for the operator's prompt.
 
-rotate <name> [--in FILE|-]
+rotate <name> [--in FILE|-] [--from-version N]
       A new version from the same value source as put; flips current. Refuses
-      a name that does not exist.
+      a name that does not exist. With --from-version N the new version holds
+      version N's bytes, copied inside the store: no value leaves it.
 
 rm <name> [--yes]
       Deletes every version. Irreversible; refuses without --yes.
@@ -706,7 +745,8 @@ deliver <name> --namespace NS [--secret NAME] [--data-key KEY] [--remove]
 ```
 
 Exit codes: 0 success, 1 refused (the sentinel's message), 2 bad usage — the same
-three-value shape `secrets-encrypt` uses. Every verb requires root. Value input is
+three-value shape `secrets-encrypt` uses. Every verb in this list requires root (the
+non-root path is under "User scope"). Value input is
 `--in FILE` or stdin only, never an argument — argv is visible to every local user via
 `ps` and lands in shell history. Opaque values are capped at 64 KiB; Ed25519 values are
 checked against the two valid lengths exactly at Put time.
@@ -723,11 +763,14 @@ root:wheel 0644, atomically (temp-and-rename), and nothing else writes it:
 
 ```json
 {"version": 1, "targets": [
-  {"name": "signer-key", "namespace": "payments", "secretName": "signer-key", "dataKey": "private.key"}
+  {"entry": "system/signer-key", "namespace": "payments", "secretName": "signer-key", "dataKey": "private.key"}
 ]}
 ```
 
-`secretName` defaults to the entry name and `dataKey` to `value`. The file is root-owned
+`entry` is the scope-qualified name (amended by the user scope's naming rule: the file only
+ever names `system/` entries, since a user entry reaches a namespace only through a
+`KeyDelivery`). `secretName` defaults to the entry name without its `system/` prefix and
+`dataKey` to `value`. The file is root-owned
 and outside the service user's tree for the reason the manifest directory is
 (`pkg/install/statetree.go`'s `ManifestDirMode`): the declaration decides which namespace
 the admin client writes a Secret into, so a file any process running as the service user
@@ -745,7 +788,10 @@ Secret per declared target, labelled as below, and nothing else — no list, no 
 other kind, no Secret it does not own. The set of principals who can cause a write stays
 {root on the node} because only root can edit the declaration. A bounded ServiceAccount in
 the manner of `kube-system/k3sm-manifests` would need a new Role granting Secret write,
-which widens what the control plane can do; Phase A does not add one.
+which widens what the control plane can do; Phase A does not add one. This paragraph holds
+for the root-file delivery. The user scope's `KeyDelivery` reconciler is separate and
+differs on purpose: it deletes the Secrets it owns when authority is lost, and an unbound
+ClusterRole ships for admins to bind ("User scope", "KeyDelivery").
 
 **Ed25519 encoding in the Secret:** the stored seed or expanded key, base64 under
 `dataKey` exactly as Kubernetes already base64-encodes every Secret `data` value — no PEM
@@ -831,8 +877,12 @@ on the next sweep after a Rotate.
 forward as a *new* version, never by pointing `current` backward at an existing version:
 
 ```
-sudo k3sm keys show NAME --version N --reveal | sudo k3sm keys rotate NAME --in -
+sudo k3sm keys show system/NAME --version N --reveal | sudo k3sm keys rotate system/NAME --in -
 ```
+
+The verbs change also adds `sudo k3sm keys rotate system/NAME --from-version N`, which
+writes the same new version without the value leaving the store (row U1); the pipe stays
+the recipe G21 checks.
 
 A pipe, not a process substitution: `sudo` closes inherited descriptors, so a `<( … )`
 path would not open, and each side of the pipe runs its own `sudo`. The round trip is
@@ -883,6 +933,590 @@ and the matching master, stop the server, `rm /var/lib/k3sm/keystore-floor.json`
 then run any root verb (`sudo k3sm keys list`), which rebuilds the floor from the restored
 pointers.
 
+Amended by the user scope's append-only files: the matched set also includes `keystore/.user/`,
+`keystore-user-floor.log` and `keystore-audit.log`. The append-only flag does not survive
+`cp`, rsync or Time Machine, so every restore ends with `sudo k3sm keys floor --rebuild`, and
+`sudo k3sm keys audit --rotate` re-flags the audit log ("User scope", "The user-scope floor").
+
+## User scope
+
+Status: design, not built. Phase A stores and delivers keys the machine owns, with `sudo` for
+every act. The user scope lets a person on the Mac store and renew their own credential
+without `sudo`, deliver it only into namespaces they may write, and keep it from other people
+on the Mac. It layers on a finished Phase A and never reshapes a Phase A record: the scope is
+already in every record's associated data and key labels ("Scope"), so nothing here needs a
+record-format bump.
+
+The work lands as a series of changes, each named below by what it adds: the user-scope
+store; user-scope quotas, scope-key Rewrap and the delivery record; the append-only files;
+the socket listener; the socket operations; the non-root CLI and `exec`; KeyDelivery
+authoring; the KeyDelivery reconciler (authority, then lifecycle); and the user docs. Two
+leaves come from other repos: runtimed's sandbox change (the Pod denies) and the
+`KeyDelivery` API in `apis`. The sandbox change merges before the append-only files change
+creates any keystore file, and the API is tagged before KeyDelivery authoring opens.
+
+Facts only a spike on the lab rig can settle are marked `[K0 leg N: pending]` where they
+apply; "Facts pending the rig spike" lists them. A marker is replaced by a dated amendment to
+this document that quotes the measured result.
+
+### Decisions the maintainer ruled
+
+- **One real login user on the rig.** The rig acceptance runs as the operator's own login
+  user, the only real login user on the rig; no second account is created. Cross-user refusal,
+  one real user refused another user's entries, is shown by unit tests with a fake
+  peer-credential source (U45), not on the rig.
+- **No system grants.** There is no grant of a system entry to a non-root user, for delivery
+  or for exec: no `keys grant` or `keys revoke` verb, no grants file, no grant check. System
+  entries are delivered and read by root only.
+- **Any same-uid process may use the socket.** The caller's code identity is not pinned; any
+  process running as the owner's uid can ask for the owner's values (residual 1).
+- **The ServiceAccount rotate grant is deferred.** A delegable per-entry rotate grant for a
+  ServiceAccount is not built in this release. When it is, it is built through a new
+  Pod-reachable endpoint with its own design, since a Pod cannot reach the socket. Nothing
+  here opens, reserves or stubs that endpoint.
+- **A thread and a milestone.** The keystore is tracked as its own end-to-end thread, whose
+  outcome is "a person stores a credential without sudo and only their namespaces' Pods
+  receive it". The end-to-end rig gate (E1 to E20) is its tracer and the only proof of that
+  outcome; every other change supports it. The work is milestone M20.
+
+### Scope strings and names
+
+The scope strings are `system` and `user/<uid>`, with `<uid>` the decimal macOS uid as
+"Scope" defines it. The API takes scope-qualified names only:
+
+- `system/<name>` and `user/<uid>/<name>`, where `<name>` keeps Phase A's entry-name rule.
+  There is no bare name, no search order and no shadowing.
+- Every qualified name in the store, the audit log, `KeyDelivery.spec.entry` and the API is
+  `user/<uid>/<name>`. The short name is display-only: the CLI shows it, and the audit line
+  carries it beside the uid.
+- As input only, the CLI also accepts `user/<shortname>/<name>`. It resolves the short name
+  through the uid resolver (`getpwnam`) and prints the result (`resolved user/alice to
+  user/501`), so a script sees what it bound to.
+- A non-root caller may name only its own uid's entries. A `system/…` name or any other
+  `user/<other>/…` name answers `ErrNotFound`, worded identically to an absent entry, so the
+  answer is no oracle for another user's names.
+
+**The entry grammar lives once**, as the OpenAPI `pattern` on `spec.entry` in the `apis` CRD:
+
+```
+^(system|user/(0|[1-9][0-9]{0,9}))/[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$
+```
+
+The admission policy's CEL cites the same string, the Go resolver uses the exported constant,
+and one shared vector table in `apis` tests all three (U11, U19, U40).
+
+### On-disk layout
+
+Phase A's paths are unchanged. Added:
+
+```
+/var/lib/k3sm/                          data root, root:wheel 0755
+  keystore-floor.json                   Phase A: root 0644, system floor; now Pod-denied
+  keystore-delivery.json                Phase A: root 0644, root-declared deliveries; now Pod-denied
+  keystore-user-floor.log               NEW: the user-scope floor, append-only
+  keystore-audit.log                    NEW: the audit log, append-only
+  keystore-audit.log.1                  NEW: the previous audit log after `audit --rotate`
+  keystore-run/                         NEW: service user 0755, the socket's directory, Pod-denied
+    keys.sock                           srw-rw-rw-: access is decided by peer credentials
+    maintenance                         NEW: root 0644, present only while a maintenance verb runs
+  server/                               already Pod-denied
+    cred/keystore-master/master …       Phase A, unchanged
+    keystore/                           Phase A: 0700, service user
+      .lock                             Phase A: the one store lock, also taken by user-scope operations
+      <name>/ generation v1 … current   Phase A: system entries, unchanged
+      .user/                            NEW: 0700, service user (the reserved name)
+        <uid>/                          NEW: 0700, service user, one per user who has stored anything
+          scope.key                     sealed record, kind 0xFE: the user's scope key, wrapped
+          deliveries                    sealed record, kind 0xFD: per delivery, its UID and target digest
+          <name>/ generation v1 … current  same shape as a system entry, sealed under the scope key
+```
+
+The owner and mode of the two logs depend on the floor variant ("The user-scope floor"): with
+the append-only flag they are the service user's, mode 0600, flagged `sappnd`; with the floor
+helper they are root's, mode 0600. K0 picks; dated amendment.
+
+`.user` is a dot name, so a Phase A build's `List` skips it, and every build before the
+scope-key Rewrap refuses Rewrap while it exists. The run directory is not reused for the
+socket: it is 0700 (`RunDirMode`), so a login user cannot reach a socket there, and the mesh
+key directory already holds the name `keys`, hence `keystore-run`.
+
+### Key hierarchy
+
+| key | made by | stored | derived or wrapped by | used for |
+|---|---|---|---|---|
+| master `M` | the first root `put` (Phase A) | `cred/keystore-master/master` | none | HMAC only, under fixed labels |
+| system seal and fingerprint keys | derived | nowhere | `HMAC(M, label ‖ 0x00 ‖ "system")` | system records |
+| scope-wrap key `W` | derived | nowhere | `HMAC(M, "k3sm-keystore-scope-wrap-v1")` | sealing each `scope.key` |
+| scope key `K_u` | the first operation on that user's scope, 32 bytes from `crypto/rand` | `.user/<uid>/scope.key`, a kind-0xFE record sealed under `W` | none | HMAC only |
+| user seal and fingerprint keys | derived | nowhere | `HMAC(K_u, label ‖ 0x00 ‖ "user/<uid>")` | that user's records and their opaque fingerprints |
+| delivery-record key | derived | nowhere | `HMAC(K_u, "k3sm-keystore-deliveries-v1" ‖ 0x00 ‖ "user/<uid>")` | the `deliveries` record |
+
+The `scope.key` record uses the Phase A encoding with AAD scope `user/<uid>`, name `scope`,
+version equal to the key epoch (1), and **generation equal to the account's 16-byte
+GeneratedUID**.
+
+- **The GeneratedUID binding** closes a recycled uid. Before trusting `scope.key`, the store
+  reads the uid's live GeneratedUID with `mbr_uid_to_uuid` and refuses with
+  `ErrScopeOwnerChanged` when it differs from the record's generation. A deleted account whose
+  uid is reused opens nothing of the old account's. Root removes such a scope with `sudo k3sm
+  keys rm-scope user/<uid> --yes`.
+- **The lookup has a deadline.** It goes through the GeneratedUID-lookup seam with a deadline
+  of 2 seconds; a timeout or an error fails closed with `ErrScopeOwnerUnknown`, and nothing in
+  that scope opens. Whether the GeneratedUID is stable across a server restart, and how long
+  the cold lookup takes (which sets the deadline), is `[K0 leg 3: pending]`.
+  `mbr_uid_to_uuid` joins k3sm's SPI symbol canary (U7).
+- **Fingerprints are per scope**, so equal values in two users' scopes have different
+  fingerprints, and `list` is no equality oracle across users (U9).
+- **Who can hold which key.** Root and the service user can read `M`, hence `W`, hence every
+  `K_u`: "a process that holds the master has the keystore" stands. A copy of `.user/<uid>/`
+  without the master opens nothing, and neither does a copy of one user's records with its
+  `scope.key` (U8).
+
+**Rewrap of scope keys.** The change that adds quotas and the delivery record extends
+Rewrap's two-phase procedure with one class of record: each `scope.key`, re-sealed under the
+new `W`. User records stay sealed under their `K_u`, byte for byte unchanged, and the run is
+resumable at every step as G12 requires (U12). Until that change, Rewrap refuses with
+`ErrScopeUnsupported` while a `.user` directory exists (U5), which is what keeps a rollback
+to an earlier build from orphaning user scopes. A per-user re-key (a new `K_u`, re-sealing that
+user's records) is not part of this design.
+
+### Quotas
+
+Each user scope holds at most 256 entries and 16 MiB of sealed records. Over either, `put`
+and `rotate` answer `ErrQuota`; `rm` still works (U13). Phase A's unbounded retention stays
+for the system scope.
+
+### The user-scope floor
+
+Phase A's floor is root-owned and written only by root verbs ("Pointer sequence and floor").
+User-scope writes run in the server process as the service user, which cannot write a
+root-owned file, and a floor in the service user's tree would reopen the copied-back pointer
+residual the maintainer did not accept. So the user-scope floor is an append-only log the
+service user can only add to.
+
+- **Lines.** The log holds `(scope, name, generation, seq)` lines. A reader takes, per
+  `(scope, name)`, the highest `seq` among the lines whose generation matches the entry's, so
+  the floor can only rise. A copied-back older `current` is refused with Phase A's floor
+  message, wrapping `ErrCorrupt` (U20).
+- **Write order.** Phase A's: the record, the pointer, then the floor line. A crash between
+  the last two leaves the floor one behind, which the rule accepts, and the next user-scope
+  write to that entry appends the line.
+- **Two variants; K0 picks; dated amendment.** Which one is built depends on a measured
+  platform fact, not on a preference:
+  1. *The append-only flag.* `sudo k3sm install` creates the log owned by the service user,
+     mode 0600, with the BSD system append-only flag (`chflags sappnd`), which only root can
+     clear. The service user can append lines; it cannot truncate, overwrite, rename or unlink
+     the file, and the data root above it is root's, so it cannot replace it. This variant
+     stands only if, on an APFS data volume, the service user can `O_APPEND` and cannot clear
+     the flag or defeat it with `O_TRUNC`, `ftruncate`, a `pwrite` at an offset,
+     `fcntl(F_PUNCHHOLE)`, `link()` to a new name, `fclonefileat` then a swap, `unlink` or
+     `rename` through the parent, or a second open with `O_TRUNC`; and if `chmod` by the owner
+     widens nothing `[K0 leg 1: pending]`. The kernel securelevel (`sysctl kern.securelevel`)
+     and whether root can clear the flag at it are recorded too `[K0 leg 1: pending]`.
+  2. *The floor helper.* If any of those checks fails, a small root launchd daemon on the
+     `k3sm-netd` pattern owns both logs as root, mode 0600, and appends lines on the server's
+     request over a root-owned socket that admits only the service uid, refusing every request
+     but `append` and `read`.
+- **The flag is checked, not assumed** (flag variant). The server reads `st_flags &
+  SF_APPEND` on both logs at start and at every `doctor` run, through the chflags flag source,
+  and refuses to start the listener if either flag is clear (U21).
+- **Root maintenance verbs.** `sudo k3sm keys floor --rebuild` (the restore procedure) and
+  `sudo k3sm keys audit --rotate` run as root only. Each writes `keystore-run/maintenance`,
+  waits for the listener to stop (it closes connections and unlinks `keys.sock` when it sees
+  the file), takes the store `.lock` exclusively, then **creates and flags the new file before
+  it touches the old one**. Rebuild writes `keystore-user-floor.log.new` from the
+  authenticated pointers, sets `sappnd`, clears the old file's flag and renames the new one
+  over it; rotate does the same, renaming the old log to `.1` and flagging it again. A crash
+  leaves either the old flagged file or the new flagged file at the canonical path. The only
+  unflagged moment is the old file's, between its `chflags nosappnd` and the rename, under the
+  exclusive lock with the listener stopped; whether a rename over an `sappnd` target needs that
+  clear at all is `[K0 leg 1: pending]`. The verb removes `maintenance` last (U22). Rebuild is
+  the user-scope twin of Phase A's "remove `keystore-floor.json`, then run any root verb".
+- **Size caps.** Each log has a soft cap (`keystore.logSoftCap`, default 64 MiB) and a hard cap
+  (`keystore.logHardCap`, default 256 MiB). Past the soft cap `doctor` shows the size and the
+  rotate hint; past the hard cap the server refuses every mutating user operation with
+  `ErrLogFull` until root rotates or rebuilds (U24).
+- **Backup and restore.** The flag does not survive `cp`, rsync or Time Machine, so a restore
+  always ends with `floor --rebuild`, and `audit --rotate` re-flags the audit log. Until then
+  the listener refuses to start (U25, E17).
+- **What it does not stop.** A process running as the service user can append a huge `seq`
+  and make an entry unreadable, a denial of service the same-user model already permits, since
+  that process can delete the entries outright; and it can read the master and forge, as Phase
+  A says. What the log refuses is what Phase A's floor refuses: a pointer put back by a writer
+  that cannot read the master.
+
+### The audit log
+
+`keystore-audit.log` is JSON Lines, append-only like the user-scope floor, with one line per
+call through the socket, per root verb and per reconciler write or deletion:
+
+```json
+{"v":1,"ts":"<RFC3339Nano>","op":"put","via":"socket","caller":{"uid":501,"user":"alice","pid":4242},"scope":"user/501","name":"claude-a","version":3,"fingerprint":"<per-scope fingerprint or empty>","namespace":"<ns or empty>","result":"ok"}
+```
+
+- **Fields.** `op` and `result` are open sets (today `put`, `rotate`, `rm`, `list`,
+  `exec-read`, `deliver`, `withdraw`, `rewrap`, `floor-rebuild`, `audit-rotate`,
+  `deliver-write`, `deliver-delete`, `refused`; and `ok` or a sentinel name). `via` is
+  `socket`, `root` or `reconciler`. `caller.user` is display-only beside the uid, and `pid` is
+  advisory. Readers ignore unknown fields, and `v` bumps only on a breaking change (U23). The
+  user docs specify the format.
+- **Never a value, never a value length.** Mode 0600 because entry names are private to their
+  owner; readable by root and the service user only. Every line also goes to the server log at
+  Info, without `fingerprint`.
+- **Fail closed.** The line is written before the reply. If an append fails, mutating
+  operations are refused, and so are the reads (`list`, `read-for-exec`, `deliveries`), until
+  an append succeeds (U32).
+- **`refused` lines are rate-limited per uid**, at most 10 a minute, with one summary line
+  giving the count dropped, so a hostile local user cannot fill the log with refusals (U33).
+- **What it claims.** The log is append-only against truncation and deletion by the service
+  user. A service-user process outside Seatbelt can append forged lines, because it shares the
+  trust domain with the master; a hash chain would not stop that writer, so there is none.
+- `audit --rotate` moves the log aside under the maintenance procedure above.
+
+### The socket
+
+**Listener.** The k3sm server process, as the service user, on server nodes only, and only on
+a single-server cluster ("Single-server clusters only"), listens on
+`/var/lib/k3sm/keystore-run/keys.sock`. A worker node runs no listener (E18).
+
+**Lifecycle.**
+
+- The listener runs in a supervised goroutine with `recover`. A panic or accept error is
+  logged, the socket closed and the listener restarted with backoff from 1 second to 5
+  minutes. **A listener failure never takes down the apiserver or kine** (U29).
+- At start it unlinks a stale `keys.sock` only after an `lstat` shows a socket owned by the
+  service user; anything else at that path is refused with a Warn.
+- Each request waits for the store `.lock` at most 2 seconds; a timeout fails that request
+  (`ErrBusy`), not the server.
+- While `keystore-run/maintenance` exists the listener stays down.
+- **Upgrade visibility.** If the directory or either append-only file is absent, wrong or
+  unflagged, the listener does not start: fail fast, no fallback. The server logs a Warn naming
+  `sudo k3sm install` once at start and again on every listener retry; `k3sm doctor` shows
+  "keystore user scope: off (<reason>); run `sudo k3sm install`"; and the CLI's connect error
+  names `sudo k3sm install` (U31, U38, E15).
+
+**Peer identity.** At accept, `getsockopt(SOL_LOCAL, LOCAL_PEERCRED)` on the connected
+descriptor gives the peer's **effective uid at connect time**, and that is the authority. A
+setuid binary that connects therefore acts as its effective uid (residual 7). `LOCAL_PEERPID`
+is read for the audit line only and is advisory. The read sits behind the peer-credential
+source, in a `*_darwin.go` file; it is a deliberate leaf copy of about 40 lines, because the
+two existing copies (in darwin-net's `pkg/netd` and runtimed's `pkg/sandbox`) are unexported
+in their repos and `apis` cannot import `x/sys`, and the file cites both. That
+`LOCAL_PEERCRED` reports a non-root login uid on the server side, for a socket in a service-user
+0755 directory under the root-owned data root, is `[K0 leg 2: pending]`.
+
+**Eligible peers** are uids of 501 and above that are not the service uid. Refused before any
+frame is read: uid 0 (root uses the direct-file verbs, as in Phase A), the service uid (every
+native Pod shares it) and every uid below 501 (system accounts) (U26, E6).
+
+**The client's checks are advisory.** The CLI opens the socket through an `os.Root` on the
+data root, checks by realpath that `keystore-run/` is the service user's under the root-owned
+data root, then reads the server's uid off the connected descriptor (`LOCAL_PEERCRED` from the
+client side). **The connected-descriptor peer uid is the authority in both directions**: a
+value is never written to a socket whose peer is not the service user, whatever the path
+checks said (U36). That `LOCAL_PEERCRED` reports the service uid on the client side
+is `[K0 leg 2: pending]`.
+
+**Protocol `k3sm-keys/1`.** Internal, not a public API; the public interface is the `k3sm
+keys` CLI, which other programs call as a subprocess with the value on stdin.
+
+- A frame is a 4-byte big-endian length (at most 128 KiB), a 1-byte type, a length-prefixed
+  JSON header (at most 8 KiB, never a value) and an optional length-prefixed binary value.
+- **Strict frames, tolerant headers.** An oversize frame, an unknown frame type or a missing
+  `HELLO` closes the connection; unknown header fields are ignored (U27).
+- The first frame is `HELLO {"proto":"k3sm-keys","min":1,"max":1}`. The server picks the
+  highest common version or closes.
+- Error codes are a reserved closed set: `not-found`, `quota`, `busy`, `log-full`,
+  `scope-owner-changed`, `scope-owner-unknown`, `user-scope-off`, `rate-limited`, `refused`,
+  `internal`. A client maps any code it does not know to a generic failure that prints the
+  code (U38).
+- CLI and server are one binary, so version skew exists only between an upgrade's symlink flip
+  and the server's restart; the CLI then prints "the server is an older build; restart it" and
+  exits 1.
+
+**Bounds.** 16 concurrent connections, at most 2 per uid among them; 10 seconds per request;
+5 mutating operations a second per uid; `read-for-exec` at most 30 a minute per uid, each
+audited as `exec-read` (U28, U34).
+
+**Operations.** `put`, `rotate` (a value, or `from_version`), `list` (own scope only), `rm`,
+`read-for-exec` (own entry only), `deliver` and `withdraw` ("KeyDelivery"), and `deliveries`
+(the caller's own declarations and their status). There is no `show --reveal` for a non-root
+user: a user's own value is reachable through exec injection only. The socket server's
+interface onto the store has no reveal, show or rewrap method (U35).
+
+**`k3sm keys exec`.** `k3sm keys exec user/<uid>/<name> --env VAR -- CMD …` reads the value
+with `read-for-exec` and `syscall.Exec`s the command with the variable set in the child only:
+nothing on stdout, nothing on disk, the value never in argv (U37, E5). It is unconfined: the
+child runs with the calling user's own reach, outside any Pod boundary, and the user docs say
+so.
+
+### No system grants
+
+A non-root user may name only its own uid's entries. System entries are delivered only by
+root, with `sudo k3sm keys deliver system/…` and the root-owned declaration file ("Delivery
+reconciler"), and are read by root only, so `exec` reads only the caller's own entries and a
+user's `list` shows only its own scope (U45, E12).
+
+### Pod denies
+
+Pods cannot reach the socket or the keystore's files, in two layers. **The peer check is never
+the first layer.**
+
+1. **Seatbelt.** Every `keystore-*` path under the data root (`keystore-run/`,
+   `keystore-floor.json`, `keystore-delivery.json`, `keystore-user-floor.log`,
+   `keystore-audit.log`, `keystore-audit.log.1`) joins runtimed's data-root deny list,
+   `DataRootDenySubdirs`, widened to name files as well as directories, and rendered after
+   every allow. Not `DaemonTreeSubdirs`, which is under the work dir and misses a node whose
+   Pod root differs from its data root. runtimed owns the names as exported constants; k3sm
+   imports them, and k3sm's `baseSocketDenies` derives the `keys.sock` path from them and adds
+   a `(deny network-outbound (remote unix-socket …))` for it after every network allow, so
+   there is one spelling (U16, U17, E10). That a Pod with these denies cannot `connect(2)` to
+   the socket or read any of these paths, and whether a Pod can read Phase A's two data-root
+   files before them, is `[K0 leg 4: pending]`.
+2. **Peer refusal.** Native Pods run as the service user, below 501, so a Pod that got through
+   is refused at accept anyway. The sandbox change proves runtimed cannot start a Pod process
+   under a uid of 501 or above, or adds that refusal, with a test (U17). Which uid a native
+   Pod's processes run as, and whether any Pod spec field or runtimed path can make it 501 or
+   above, is `[K0 leg 5: pending]`; row U15 is held for a second path if one is found.
+
+### KeyDelivery
+
+A namespaced declaration, `KeyDelivery` in `keystore.k3sm.io/v1alpha1`, delivers a user
+entry into a namespace as a Secret. It borrows ExternalSecret's explicit target and policy
+fields (a named target Secret, a data key), not its code, since reusing ExternalSecret would
+add a dependency and a provider model k3sm does not have. The CRD is alpha: the user docs say
+it may change and that a conversion is owed if it does.
+
+**Shape.**
+
+- `metadata.name` is free.
+- `spec.secretName` (required, the target Secret), `spec.entry` (scope-qualified, the entry
+  pattern above), `spec.dataKey` (default `value`) and `spec.requestedBy` (stamped) are all
+  immutable through CRD CEL transition rules (`self == oldSelf`), so the CRD is safe without
+  the admission policy (U18).
+- The status subresource is on: `observedGeneration`, `conditions` (`Authorized`, `Ready`) as
+  the source of truth, and `deliveredVersion`; no value and no fingerprint of an opaque value.
+- Condition reasons are a closed set listed in the schema description: `Delivered`,
+  `EntryUnavailable`, `NotRecorded`, `NotAuthorized`, `SecretExists`, `SecretClaimed`,
+  `EncryptionOff`, `UserScopeOff`. "No such entry" and "not yours" share one reason,
+  `EntryUnavailable`, so status reveals nothing about existence; `NotRecorded` is reported
+  only after the entry's owner has matched `requestedBy`. `SecretExists` covers an unlabelled
+  Secret already holding the target name; `SecretClaimed` covers a second KeyDelivery naming a
+  Secret another one already owns: one declaration per target Secret, and the oldest object by
+  `creationTimestamp`, then name, wins (U43).
+
+**Admission is a shape check only.** A `ValidatingAdmissionPolicy` in `pkg/policy`, the shape
+of the existing ones, adds only what CRD CEL cannot see: on create, `spec.requestedBy ==
+request.userInfo.username`, and a requester under `system:serviceaccount:` is refused (U40,
+E13). That `request.userInfo.username` reports the impersonated user under impersonation is
+not yet checked; U40 and E3 check it. **Neither admission layer is the authority.** The
+authority is the sealed delivery record plus the reconciler-time SubjectAccessReviews below;
+`requestedBy` is informational.
+
+**Who creates one.** The owner, through the socket: `k3sm keys deliver user/<uid>/<name>
+--namespace NS --secret S [--data-key K]` (the short-name form is accepted).
+
+- The server creates the object with the admin client **impersonating `k3sm:local:<uid>`**
+  with the group `k3sm:local-users`. The admin client's impersonation is limited to users
+  `k3sm:local:*` and the group `k3sm:local-users`: a wrapper refuses any other
+  `Impersonate-User` or `Impersonate-Group` before the request leaves (U41). The API server's
+  own RBAC then decides whether that principal may create `keydeliveries` in `NS`.
+- After the create, the server appends to the caller's sealed `deliveries` record (kind
+  0xFD, under the user-scope floor) the object's `metadata.uid` and the **target digest**
+  `sha256(LP(entry) ‖ LP(namespace) ‖ LP(secretName) ‖ LP(dataKey))` (U14, U41).
+- `withdraw` (CLI `k3sm keys undeliver`) deletes the object; the record entry is withdrawn by
+  the reconciler after the Secret is gone. `undeliver` prints "a pod that read this value
+  keeps it; rotate the entry to revoke it".
+- Only an entry in the caller's own `user/<uid>` scope can be declared. A system entry reaches
+  a namespace only through root's `deliver system/…`, never through a KeyDelivery.
+
+**The reconciler honours a KeyDelivery only when all of these hold, re-checked every sweep:**
+
+1. The entry exists, is a `user/<uid>` entry (a `system/…` entry never is), and `requestedBy`
+   (`k3sm:local:<uid>`) is its owner; otherwise `EntryUnavailable`.
+2. Its UID is in that uid's sealed `deliveries` record and the digest recomputed from the live
+   object matches the recorded one; otherwise `NotRecorded`.
+3. Name-scoped SubjectAccessReviews for `requestedBy` pass for `create keydeliveries`
+   (`resourceNames` the object's name) and for `create`, `update` and `delete` on `secrets`
+   (`resourceNames` `spec.secretName`) in that namespace; otherwise `NotAuthorized`. The
+   secrets checks are required: without them, a principal allowed to declare deliveries
+   but not to write Secrets could plant or remove a Secret a workload expects to mount, under a
+   name of its choosing (U42).
+
+Encryption-off refusal (G18) applies unchanged, as `EncryptionOff`.
+
+**Why the sealed record binds the whole target.** The installing user's own kubeconfig
+carries the admin context, and admin can impersonate anyone. Without a record only the service
+user and root can write, that holder could create, copy or replay a KeyDelivery for any user's
+entry. A UID alone is not enough: an object whose spec is changed under its UID (a CRD edited
+to drop the transition rules) would keep it. With the UID and the digest, a copied or replayed
+object has a UID the owner never recorded, a retargeted one fails the digest, and a forged one
+has no record: each is refused (E7, E8). Admin can still delete any KeyDelivery and read any
+delivered Secret, as today.
+
+**Writes.** One labelled `Opaque` Secret per honoured object, with Phase A's label
+`k3sm.io/keystore-delivery` and version annotation, an owner annotation naming the
+KeyDelivery's UID, and an ownerReference to the KeyDelivery as the garbage-collection
+backstop.
+
+**Finalizer and lost authority.** The reconciler adds the finalizer
+`keystore.k3sm.io/delivery`. On deletion of the object, or when authority is lost (a
+RoleBinding removed, the entry removed, the record withdrawn, a digest mismatch), the
+reconciler deletes the Secret it owns (label, ownerReference and owner annotation all
+matching) and sets `Authorized=False`. The crash order is fixed: **delete the Secret, then
+withdraw the sealed record entry, then drop the finalizer**, so a crash at any point leaves a
+state the next sweep finishes. An **orphan sweep** deletes Secrets that carry the label and an
+owner annotation but have no live KeyDelivery, and never an unlabelled or foreign one (U44,
+E11, E14). This differs on purpose from Phase A's root-file delivery, which never deletes
+(G20): a revocation that leaves a long-lived token in place is not a revocation.
+
+**Revocation is rotation.** Deleting the Secret does not un-share a value a Pod already read.
+The docs and the CLI say so (residual 8).
+
+**Identity.** The reconciler uses the admin client the server already holds for `pkg/addons`,
+as Phase A decided; the impersonated create is the only new use of it. A ClusterRole
+`k3sm:keystore-delivery-author` (keydeliveries create, get, list, delete; secrets create, get,
+update, delete) ships **unbound**; an admin binds it per user and namespace to
+`k3sm:local:<uid>`. No ServiceAccount is granted anything.
+
+### Single-server clusters only
+
+Each server would hold its own keystore, so the user scope is supported only on a cluster
+with exactly one server. When the apiserver lists more than one node with the
+`node-role.kubernetes.io/control-plane` label, the server does not start the listener,
+`doctor` reports "keystore user scope: off (more than one server registered)", and
+KeyDeliveries get `UserScopeOff` (U30). The system scope keeps Phase A's behaviour. The
+limitations page says so. Replicating the keystore across servers is a later design.
+
+### Package layout and seams
+
+- `pkg/keystore` stays Kubernetes-free: it imports no client-go package, and a `go list -deps`
+  test asserts it (U11).
+- The socket server is `pkg/keystore/socket` and the KeyDelivery reconciler
+  `pkg/keystore/reconcile`, siblings that import `pkg/keystore`, never the reverse.
+- Each consumer declares the small interface it needs at its own site. The socket server's has
+  no reveal, show or rewrap method; the reconciler's reads a value only for a delivery it has
+  authorised.
+- The entry grammar lives once, in `apis`.
+
+**The named seams.** Each replaces one real primitive, and the primitive is banned at unit
+tier: a unit test that reaches one fails. Integration and rig tests use the real one.
+
+| seam | the real primitive it replaces | what the unit fake gives |
+|---|---|---|
+| clock | `time.Now`, timers and tickers (rate limits, request timeout, listener backoff, lock waits) | a controlled clock, or `testing/synctest` |
+| uid resolver | `getpwnam` and `getpwuid` | a fixed name-to-uid table |
+| peer-credential source | `getsockopt(SOL_LOCAL, LOCAL_PEERCRED)` and `LOCAL_PEERPID` on the connected descriptor, both sides | any uid and pid per connection, which is how cross-user refusal is tested (U45) |
+| chflags flag source | `fstat` `st_flags & SF_APPEND` on the two logs, and `chflags` in the maintenance verbs | a flag set or clear per file |
+| GeneratedUID lookup | `mbr_uid_to_uuid`, with its deadline | a fixed GeneratedUID, a changed one, an error, or a lookup past the deadline |
+| audit sink | the append to `keystore-audit.log` | an in-memory log, and one whose append fails |
+
+### Deployment and rollback
+
+The user scope ships in one step, with no flag and no phased rollout: a new feature, an additive CRD (a new kind), a single-node
+daemon behaviour change and an install-tree change. The keystore is not in kine, so there is
+no datastore migration. The skew window:
+
+| state | effect |
+|---|---|
+| server new, worker old | workers run no keystore code; delivered Secrets mount like any Secret (E18) |
+| server rolled back to the release before M20 | that release has **no keystore at all**: the keystore files are left unused, the CRD stays installed, no reconciler runs; delivered Secrets stay and nothing rotates them; KeyDeliveries are inert and, carrying the finalizer, cannot finish deleting until it is stripped (E16) |
+| server rolled back to a build with Phase A but before the scope-key Rewrap | user scopes are ignored (dot name) and its Rewrap refuses while `.user` exists, so the master cannot be rewrapped out from under them |
+| CLI new, server old (between the symlink flip and the restart) | `HELLO` finds no common version; the CLI says restart the server |
+| more than one server registered | the user scope stays off, with a `doctor` row and `UserScopeOff` |
+
+**Before deploying:** the cluster runs with `--secrets-encryption`, or delivery is refused
+(G18); the cluster has one server, or the user scope stays off; and `sudo k3sm install` runs
+after the upgrade, since it creates `keystore-run/` and the two append-only files. Without it
+the user scope stays off, the server Warns at start and on every retry, `doctor` says why and
+the CLI's error names the command; the system scope works.
+
+**Rollback** is revert, rebuild and reinstall the previous binary. The release before M20 has
+no keystore, so a downgrade leaves every keystore file unused rather than misread. Three
+cautions for the runbook:
+
+1. The append-only files cannot be removed by an older binary's `uninstall --purge`, so run
+   `sudo chflags nosappnd /var/lib/k3sm/keystore-*.log*` before purging with one. This
+   release's `uninstall --purge` clears the flags first.
+2. Secrets delivered from KeyDeliveries are left in place, not deleted, because the old binary
+   runs no reconciler; revoking means rotating the source.
+3. KeyDeliveries keep the `keystore.k3sm.io/delivery` finalizer, so before deleting one under
+   an old binary, delete its Secret and strip the finalizer with `kubectl patch keydelivery
+   <name> -n <ns> --type merge -p '{"metadata":{"finalizers":null}}'`.
+
+Rolling forward again re-adopts every object: the orphan sweep and the digest check run on the
+first sweep (E16).
+
+### Threat model for the user scope
+
+Phase A's statement stands unchanged. The user scope adds an **authorization and ownership
+boundary on the store and its API**, not a confidentiality boundary between Pods. Identity is
+the uid throughout.
+
+| principal | can | cannot |
+|---|---|---|
+| root | everything: every scope's values (through `M`), the floors, the audit log; the only principal that delivers or reads a system entry | (not defended against) |
+| the service user (the server, runtimed, kine, the control plane, and any of its processes outside Seatbelt) | read `M` and every `K_u`, hence every value; append to the floor log and the audit log, including forged audit lines | lower the user floor, truncate or delete audit lines, write the system floor |
+| a native Pod (the service uid, under Seatbelt) | read a Secret delivered into a namespace it may read, like any Secret | reach `keys.sock`, `keystore-run/`, `server/`, the logs or Phase A's files (Seatbelt first); a Pod that got through is refused by peer uid |
+| the entry's owner (a login uid of 501 or above) | put, rotate (including from a version), list, rm and exec its own entries; declare deliveries where RBAC lets `k3sm:local:<uid>` write keydeliveries and that Secret | reveal a value through any verb but exec; touch another uid's scope or any system entry; see another user's names through any verb |
+| another login user | the same for its own scope | list, read, rotate, delete or deliver the owner's entries; learn their names |
+| a holder of the admin kubeconfig (by default the installing user) | delete any KeyDelivery, read any delivered Secret, bind RBAC | create a working delivery for someone else's entry (a replayed, copied or retargeted object fails the UID and digest check, a forged one has no sealed record); read an undelivered value |
+| the server's admin client | impersonate `k3sm:local:*` and `k3sm:local-users` for a create | impersonate any other user or group |
+
+**Residuals, stated.**
+
+1. Any process running as the owner's uid can ask the socket for the owner's values through
+   `read-for-exec`: a malicious package the user installs can read every value in that user's
+   scope, within the exec-read cap. Pinning the caller's code identity (`LOCAL_PEERTOKEN` with
+   a code-signing requirement) would narrow it to the signed `k3sm` binary, but development
+   builds are ad-hoc signed and the value would still reach the child. It is not pinned, by
+   ruling; the limitations page says so.
+2. The child's environment is readable by the same uid and by root (`ps -E`); `exec` is
+   unconfined, with the user's own reach.
+3. A KeyDelivery object, including the entry's name, is visible to anyone who may read
+   keydeliveries in that namespace: names are hidden from other users on the Mac, not from the
+   namespace's readers.
+4. A delivered value is in kine (encrypted only with `--secrets-encryption`) and in every
+   Pod-readable Secret on the node, exactly as Phase A says. Direct mounts (Phase B) would
+   remove the kine copy, not the Pod reach.
+5. A local user can spend the server's CPU, up to 16 MiB of disk within quota, and two
+   connections.
+6. A user account deleted and recreated under the same uid loses its old scope, by design
+   (U6), and root must clear it.
+7. The peer uid is the effective uid at connect time, so a setuid program the user runs acts as
+   that program's owner.
+8. **Revocation is rotation**: removing a delivery deletes the Secret, but a Pod that read the
+   value keeps it.
+9. The service user can append forged audit lines; the log proves nothing against that writer.
+10. The user scope is off on a cluster with more than one server.
+
+### What the user scope does not do
+
+Phase B direct mounts; a ServiceAccount rotate transport, deferred to a new endpoint with its
+own design; grants of system entries to non-root users; a per-user re-key of `K_u`; a per-user
+kubeconfig or any Kubernetes identity for local users (the socket is the path); the user scope
+on a worker node or across several servers; a hash chain on the audit log; un-sharing a value
+a Pod already read; a hardware-backed master; a `k3sm status` field or app change (the `doctor`
+rows are not a contract).
+
+### Facts pending the rig spike
+
+A script-only spike on the rig's server measures these before any code depends on them. A
+spike never counts as proof; its result is quoted here as a dated amendment, which also picks
+the floor variant.
+
+| marker | the fact | where it applies |
+|---|---|---|
+| `[K0 leg 1: pending]` | `sappnd` on an APFS data volume as the service user: append works, and the whole defeat list fails; owner `chmod` widens nothing; the kernel securelevel and whether root can clear the flag at it; whether a rename over an `sappnd` target needs the clear first | "The user-scope floor" (the variant and the maintenance verbs) |
+| `[K0 leg 2: pending]` | `LOCAL_PEERCRED` both ways, for a socket in a service-user 0755 directory under the root-owned data root and a login uid over SSH: the login uid on the server side, the service uid on the client side | "The socket" (peer identity, the client's checks) |
+| `[K0 leg 3: pending]` | `mbr_uid_to_uuid` returns a stable 16-byte GeneratedUID across a server restart, and its cold latency, which sets the deadline | "Key hierarchy" (the GeneratedUID binding) |
+| `[K0 leg 4: pending]` | a Pod with the data-root denies cannot `connect(2)` to the socket or read `keystore-run/` or any `keystore-*` file; and, without them, whether a Pod can read Phase A's two data-root files today | "Pod denies", "Threat model" |
+| `[K0 leg 5: pending]` | which uid a native Pod's processes run as, and whether any Pod spec field or runtimed path can make it 501 or above | "Pod denies" (layer 2, row U15) |
+
+Two facts are open but are not spike legs: whether the admission policy sees the impersonated
+user in `request.userInfo.username` (U40 and E3), and whether the rig runs with
+`--secrets-encryption` (E1).
+
 ## Non-goals
 
 Beyond Phases B and C: isolating one native Pod's delivered Secret from another; protecting
@@ -890,7 +1524,9 @@ key material from root on the host; a KMS- or HSM-backed master (the master is a
 protected the same way the existing `secretbox` key is — a hardware-backed master is a
 later proposal, as issue 731 already notes for the existing key); a network service or new
 IPC surface; bounded version retention or a point-in-time rollback verb in Phase A;
-changes to `k3sm install`; importing existing Secrets.
+changes to `k3sm install`; importing existing Secrets. These are Phase A's non-goals. The
+user scope adds a local unix socket and changes `k3sm install`, and lists its own exclusions
+under "What the user scope does not do".
 
 ## Acceptance gate
 
@@ -935,6 +1571,102 @@ last pull request lands and no row is pending.
 
 Phase A is complete when the gate passes with no row pending. A row can be reworded or dropped only by a change
 to this document, reviewed like any other.
+
+### User-scope rows
+
+The user scope adds rows U1 to U45 (unit tier unless the row says otherwise) and the rig legs
+E1 to E20. The gate runs each row's named tests in the repo the row names (`k3sm/…`,
+`runtimed/…`, `apis/…`, package paths relative to the module), and fails a row whose named
+test is absent or skipped. Each change runs the rows it delivers in its own gate mode, and the
+rig rows as an explicit, recorded step. Every row below is pending until the change named in
+its last column lands; a pending row fails its mode. G1 holds for the Phase A changes; the user
+scope's only module changes are k3sm's requirements on its own `apis` and `runtimed` modules,
+each stated in the change that makes it. U15 is held for a K0 amendment and U39 is unused.
+
+| # | Requirement | Validated by | Status |
+|---|---|---|---|
+| U1 | `rotate --from-version N` writes version N's bytes as a new version server side; no value leaves the store | `k3sm/cmd/k3sm::TestKeysRotateFromVersionNoValueOut` | pending: the `k3sm keys` verbs |
+| U2 | AAD scope: a record moved between scopes, or between two users, fails to open | `k3sm/pkg/keystore::TestRecordMovedAcrossScopesFailsOpen` | pending: the core store's scope binding |
+| U3 | KDF labels take the scope; `checkScope` accepts only `system` and `user/<decimal uid>`; kinds 0xFE and 0xFD are reserved | `k3sm/pkg/keystore::TestScopedLabelsAndReservedKinds`, `TestCheckScopeGrammar` | pending: the core store's scope binding |
+| U4 | the first-Put mint refuses with `.user` present and the master missing | `k3sm/pkg/keystore::TestFirstPutRefusesMintOverUserDir` | pending: the core store's scope binding |
+| U5 | Rewrap refuses with `ErrScopeUnsupported` while `.user` exists (replaced by U12 when scope keys are re-wrapped) | `k3sm/pkg/keystore::TestRewrapRefusesWhileUserScopesExist` | pending: Rewrap |
+| U6 | `scope.key` is sealed under `W`, bound to the GeneratedUID; a mismatch is `ErrScopeOwnerChanged` | `k3sm/pkg/keystore::TestScopeKeyGeneratedUIDMismatch` | pending: the user-scope store |
+| U7 | the GeneratedUID lookup past its deadline or in error fails closed; `mbr_uid_to_uuid` is in the symbol canary | `k3sm/pkg/keystore::TestGeneratedUIDLookupDeadlineFailsClosed`; `k3sm/internal/hostacl::TestMbrUIDToUUIDSymbolCanary` (integration) | pending: the user-scope store |
+| U8 | a scope's records open only under its `K_u`; a copied `.user/<uid>/` without the master opens nothing | `k3sm/pkg/keystore::TestScopeCopyWithoutMasterOpensNothing` | pending: the user-scope store |
+| U9 | per-scope fingerprints differ for equal values in two scopes | `k3sm/pkg/keystore::TestFingerprintsDifferAcrossScopes` | pending: the user-scope store |
+| U10 | `user/<other>/…` is `ErrNotFound`, same text as an absent entry; a short name resolves to the uid and is printed | `k3sm/pkg/keystore::TestOtherUserIsNotFound`, `TestShortNameResolvesToUID` | pending: the user-scope store |
+| U11 | the Go resolver passes the shared entry-grammar vectors; `pkg/keystore` imports no Kubernetes package | `k3sm/pkg/keystore::TestEntryGrammarVectorsResolver`, `TestKeystoreIsKubernetesFree` | pending: the user-scope store |
+| U12 | master Rewrap re-wraps every `scope.key` and leaves user records byte-identical; resumable at every step | `k3sm/pkg/keystore::TestRewrapRewrapsScopeKeysResumable` (fault injection, as G12) | pending: user-scope quotas, scope-key Rewrap and the delivery record |
+| U13 | quotas: the 257th entry and the byte budget answer `ErrQuota`; `rm` still works | `k3sm/pkg/keystore::TestUserScopeQuota` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
+| U14 | the delivery record stores UID and target digest; add, look up and withdraw round-trip under the floor | `k3sm/pkg/keystore::TestDeliveryRecordDigestRoundTrip` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
+| U15 | (reserved for the K0 amendment if leg 5 finds a second Pod-uid path) | none | pending: K0 amendment |
+| U16 | every Pod profile variant (native, vm, container-vm, xcode, expose-paths, a custom Pod root distinct from the data root) denies every keystore path, each deny after every allow | `runtimed/pkg/sandbox::TestDataRootDeniesKeystorePathsEveryProfile`; rig leg E10 | pending: runtimed's sandbox change |
+| U17 | runtimed refuses a Pod process uid of 501 or above (or proves no path to one); `baseSocketDenies` derives `keys.sock` from runtimed's names | `runtimed/pkg/supervisor::TestSpawnRefusesLoginRangeUID`; `k3sm/pkg/provider::TestBaseSocketDeniesKeystoreSocket` (the socket listener) | pending: runtimed's sandbox change, the socket listener |
+| U18 | CRD: `entry`, `secretName`, `dataKey`, `requestedBy` immutable by CEL transition rules; status subresource on; reasons listed | `apis/config/crd::TestKeyDeliveryCRDMatchesTheGoTypes`, `TestKeyDeliveryImmutableFields` | pending: the `KeyDelivery` API |
+| U19 | the CRD pattern passes the shared entry-grammar vectors | `apis/config/crd::TestEntryGrammarVectors` | pending: the `KeyDelivery` API |
+| U20 | a user-scope `current` copied back is refused against the floor log, with Phase A's floor message | `k3sm/pkg/keystore::TestUserFloorRefusesCopiedBackCurrent`; rig leg E9 | pending: the append-only files |
+| U21 | install creates both logs service-user-owned 0600 and flagged; the listener refuses to start when a flag is clear | `k3sm/pkg/install::TestKeystoreAppendOnlyFilesAtInstall`, `k3sm/pkg/keystore::TestFlagCheckRefusesUnflagged`; rig leg E1 | pending: the append-only files |
+| U22 | `floor --rebuild` and `audit --rotate` stop the listener, hold the lock, flag the new file before touching the old; a crash at each step leaves a flagged file | `k3sm/cmd/k3sm::TestKeysFloorRebuildCrashOrder`, `TestKeysAuditRotateCrashOrder`; rig leg E17 | pending: the append-only files |
+| U23 | every audited operation writes one `v:1` line; no line carries a value or its length; readers ignore unknown fields | `k3sm/pkg/keystore::TestAuditLineNeverCarriesValue`, `TestAuditReaderIgnoresUnknownFields` | pending: the append-only files |
+| U24 | soft cap shows in `doctor`; past the hard cap every mutating user op is `ErrLogFull` | `k3sm/pkg/keystore::TestLogHardCapRefusesMutations` | pending: the append-only files |
+| U25 | backup and restore round trip: a restored tree with cleared flags is refused until `floor --rebuild`, then opens | `k3sm/pkg/keystore::TestBackupRestoreRoundTripRebuild`; rig leg E17 | pending: the append-only files |
+| U26 | peers uid 0, the service uid and uid < 501 are refused before any frame is read | `k3sm/pkg/keystore/socket::TestPeerEligibility` | pending: the socket listener |
+| U27 | framing: an oversize frame, unknown type or missing `HELLO` closes; an unknown header field is ignored; `HELLO` picks the highest common version | `k3sm/pkg/keystore/socket::FuzzFrameReader` (committed seeds), `TestFramingBounds`, `TestUnknownHeaderFieldsIgnored`, `TestHelloVersionRange` | pending: the socket listener |
+| U28 | 16 connections in all, 2 per uid; a request past 10 s is cut | `k3sm/pkg/keystore/socket::TestConnectionCapsPerUID`, `TestRequestTimeout` (`testing/synctest`) | pending: the socket listener |
+| U29 | a listener panic is recovered and restarted; the apiserver is untouched; a stale socket is unlinked only if a service-user socket; a lock wait past 2 s fails the request | `k3sm/pkg/keystore/socket::TestListenerRecoversPanic`, `TestStaleSocketUnlinkChecksOwner`, `TestBoundedLockWait` | pending: the socket listener |
+| U30 | with two servers registered, the listener does not start and `doctor` says why | `k3sm/pkg/keystore/socket::TestUserScopeRefusedWithTwoServers` | pending: the socket listener |
+| U31 | a missing or unflagged file logs the install Warn at start and on each retry; `doctor` reports user scope off | `k3sm/pkg/keystore/socket::TestListenerWarnsOnEveryRetry`, `k3sm/cmd/k3sm::TestDoctorKeystoreUserScopeRow` | pending: the socket listener |
+| U32 | the audit line is written before the reply; a failed append refuses mutating ops and reads | `k3sm/pkg/keystore/socket::TestAuditBeforeReply`, `TestAuditFailureRefusesOps` | pending: the socket operations |
+| U33 | `refused` lines are rate-limited per uid with a summary of the dropped count | `k3sm/pkg/keystore/socket::TestRefusedLinesRateLimited` | pending: the socket operations |
+| U34 | 5 mutating ops a second per uid; 30 `read-for-exec` a minute per uid, each audited `exec-read` | `k3sm/pkg/keystore/socket::TestMutationRateLimit`, `TestExecReadCapPerUID` | pending: the socket operations |
+| U35 | the socket server's store interface has no reveal, show or rewrap method | `k3sm/pkg/keystore/socket::TestStoreInterfaceHasNoRevealMethod` | pending: the socket operations |
+| U36 | the client refuses a socket whose connected peer uid is not the owner of `keystore-run/`, whatever the path checks said | `k3sm/cmd/k3sm::TestClientRefusesForeignServerUID` | pending: the non-root CLI and `exec` |
+| U37 | `exec` sets the variable only in the child; nothing on stdout, nothing on disk; the value never enters argv; no non-root verb writes a value to stdout | `k3sm/cmd/k3sm::TestKeysExecEnvOnlyInChild`, `TestNoNonRootVerbWritesValue` | pending: the non-root CLI and `exec` |
+| U38 | an unknown error code prints the code; a connect failure names `sudo k3sm install` | `k3sm/cmd/k3sm::TestUnknownErrorCodeFallback`, `TestConnectErrorNamesInstall` | pending: the non-root CLI and `exec` |
+| U39 | (unused: there are no system grants) | none | none |
+| U40 | the admission policy stamps `requestedBy` and refuses a ServiceAccount creator; its CEL passes the shared grammar vectors | `k3sm/pkg/policy::TestKeyDeliveryPolicyStampsRequestedBy`, `TestEntryGrammarVectorsCEL` | pending: KeyDelivery authoring |
+| U41 | `deliver` creates impersonating only `k3sm:local:<uid>` and `k3sm:local-users`, refusing any other impersonation; it writes the UID and digest; `withdraw` deletes the object; `undeliver` prints the hint | `k3sm/pkg/keystore/socket::TestDeliverImpersonatesUIDPrincipalOnly`, `TestDeliverWritesDigestRecord`, `k3sm/cmd/k3sm::TestUndeliverPrintsRotationHint` | pending: KeyDelivery authoring |
+| U42 | an unrecorded UID, a digest mismatch, or a failed name-scoped SAR (`create keydeliveries`; `create`, `update`, `delete` secrets with `resourceNames`) gets no Secret; encryption off refuses (G18 for KeyDelivery) | `k3sm/pkg/keystore/reconcile::TestUnrecordedOrRetargetedDeliveryGetsNoSecret`, `TestSARsAreNameScopedAndIncludeDelete`, `TestEncryptionOffRefusesKeyDelivery` | pending: the KeyDelivery reconciler (authority) |
+| U43 | reasons are the closed set; "absent" and "not yours" both read `EntryUnavailable`; a pre-existing unlabelled Secret is `SecretExists`; a second declaration is `SecretClaimed`; `observedGeneration` tracks | `k3sm/pkg/keystore/reconcile::TestConditionReasonsClosedSet`, `TestOneDeclarationPerSecret` | pending: the KeyDelivery reconciler (authority) |
+| U44 | losing authority deletes exactly the owned Secret; the crash order is Secret, record, finalizer at every interruption point; the orphan sweep removes labelled, owner-annotated Secrets with no live object and never an unlabelled or foreign one | `k3sm/pkg/keystore/reconcile::TestLostAuthorityDeletesOnlyOwnedSecret`, `TestFinalizerCrashOrder`, `TestOrphanSweep` | pending: the KeyDelivery reconciler (lifecycle) |
+| U45 | cross-user refusal with a fake peer-credential source: a peer with uid B asks for `list`, `read-for-exec`, `rotate`, `rm` and `deliver` of uid A's entries, and for any `system/…` name; every call is `ErrNotFound` with text identical to an absent entry of B's own, and the `refused` audit lines carry uid B | `k3sm/pkg/keystore/socket::TestCrossUserRefusedFakePeerCred`, `TestNonRootCannotNameSystemEntries` | pending: the socket operations |
+
+### Rig legs
+
+The end-to-end gate is `hack/acceptance/keystore-e2e.sh --lab` on the two-Mac lab rig, from a
+recorded build, with both nodes' `k3sm version` in the log, public surfaces only (`k3sm`,
+`kubectl`, a Pod), every test object deleted at the end and the rig left with both nodes
+Ready. The server is one Mac and the old worker the other. "The user" is the operator's own
+login user over SSH, the only real login user on the rig; no second account is created, and
+the cross-user refusal is covered by U45, not on the rig. **Rig-only** says whether a unit row
+also covers the property or only the rig can show it. **Fails without** names what the leg
+shows on a build lacking the feature; every leg must go red there, and the gate runs each leg
+once against the previous release's build to record that red. Every leg is pending until the
+end-to-end rig gate lands. The user scope is complete only when every leg passes on the rig,
+E20 attended.
+
+| leg | what | expected | rig-only | fails without |
+|---|---|---|---|---|
+| E1 | preconditions | secrets encryption on; one server; `keystore-run/`, both logs present, service-user 0600, `SF_APPEND` set; `doctor` user-scope row on; `keystore.sh --check` exits 0 on the build | no (U21) | the append-only files: no files, `doctor` row off |
+| E2 | the user, no sudo: `printf … \| k3sm keys put user/<me>/e2e-token` (short-name form) | exit 0; the CLI prints the resolved `user/<uid>`; `k3sm keys list` shows it; the audit log has a `put` line with no value | yes | the socket operations: connect refused, error names `sudo k3sm install` |
+| E3 | an admin binds `k3sm:keystore-delivery-author` for `k3sm:local:<uid>` in `ks-e2e`; the user runs `k3sm keys deliver user/<uid>/e2e-token --namespace ks-e2e --secret e2e-token --data-key TOKEN` | `KeyDelivery` `Ready`, reason `Delivered`, `observedGeneration` current; the object's `requestedBy` is `k3sm:local:<uid>`; a Pod mounting Secret `e2e-token` reads exactly the stored bytes | yes | the KeyDelivery reconciler (authority): no Secret, no status |
+| E4 | the user rotates (`rotate --in -`), then `rotate --from-version 1` | the Pod's mounted file moves to v2, then to v1's bytes as v3, within one sweep each | yes | the `k3sm keys` verbs: `--from-version` unknown flag |
+| E5 | `k3sm keys exec user/<uid>/e2e-token --env TOKEN -- /usr/bin/env` | the child sees `TOKEN`; the CLI wrote nothing else; `ps` during the run shows no value in argv; one `exec-read` audit line | no (U37) | the non-root CLI and `exec`: unknown verb |
+| E6 | as the operator's login user only: `list`, `exec`, `rotate`, `rm` and `deliver` of `user/<an unused other uid>/e2e-token` and of `system/e2e-sys`; then a connect to `keys.sock` as root and as the service user | `not found` each time for the names, text identical to an absent entry of the user's own, and `refused` audit lines attributed to the user's uid; root and the service user are refused at accept, before any frame | partly (U26, U45): the rig runs only what one real user can reach, the cross-user case is unit-tested | the socket operations: the other uid's or the system entry's ops are answered (U45 red); the socket listener: root or the service uid is served |
+| E7 | admin copies E3's KeyDelivery YAML into `ks-e2e-2` (where the user also has the role) | `Authorized=False`, reason `NotRecorded`, no Secret: the UID is not in the user's record | no (U42) | the KeyDelivery reconciler (authority): a Secret appears in `ks-e2e-2` |
+| E8 | admin strips the CRD's transition rules (a test patch, restored at the end) and edits E3's `spec.secretName` | `Authorized=False`, `NotRecorded` (digest mismatch); the original Secret deleted; no Secret under the new name | yes | the target digest: a Secret appears under the new name |
+| E9 | `sudo cp` saves `current`, the user rotates, `sudo cp` puts the old `current` back; then the same for a `system/` entry | user `list` and `sudo k3sm keys list` each mark the entry `corrupt` with the floor message; `floor --rebuild` is not run | no (U20) | the append-only files: the old value is served |
+| E10 | a Pod (pinned by `nodeName`, darwin selector) tries `connect(2)` to `keys.sock` and to read `server/keystore`, `keystore-run/`, both logs and Phase A's two files | EPERM for each | no (U16) | runtimed's sandbox change: the Phase A files read (the red result K0 leg 4 records) |
+| E11 | admin removes the user's RoleBinding in `ks-e2e` | within one sweep the Secret is deleted; `Authorized=False`, `NotAuthorized` | no (U42) | the KeyDelivery reconciler (lifecycle): the Secret stays |
+| E12 | root scope: `sudo k3sm keys put system/e2e-sys`, `sudo k3sm keys deliver system/e2e-sys --namespace ks-e2e`; then the user, with no sudo, tries `k3sm keys deliver`, `list` and `exec` on `system/e2e-sys` | root's Secret is delivered and stays (G20); each of the user's attempts answers `not found` and nothing reaches `ks-e2e-2` | partly (U45): the root delivery is rig-only | root delivery: root delivery missing; the socket operations: a non-root user can name a system entry |
+| E13 | a ServiceAccount token creates a KeyDelivery | refused at admission | no (U40) | KeyDelivery authoring: the object is created |
+| E14 | `k3sm keys undeliver` on E3's object, then `kubectl delete` of a second one | each Secret deleted before its object goes; the hint printed; no orphan Secret after one sweep | no (U44) | the KeyDelivery reconciler (lifecycle): the object hangs or the Secret stays |
+| E15 | **upgrade** from the previous release's install tree (its signed build installed, then this build over it, then `sudo k3sm install`) | system scope intact; user scope comes on after the install, off with the Warn and `doctor` row before it | yes | upgrade visibility: user scope silently off |
+| E16 | **rollback** to the previous release, then forward again | the old build runs with the keystore files unused; after rolling forward the user's entries, records and Secrets are intact and re-adopted | yes | the rollback guard: entries unreadable after the round trip |
+| E17 | **backup and restore** round trip: copy the data root's keystore set aside with `cp`, remove it, copy it back, then `floor --rebuild` and `audit --rotate` | before the rebuild the listener refuses (flags clear); after it every entry opens and both logs are flagged | no (U25) | the flag check: the listener runs on unflagged logs |
+| E18 | an **old worker**: the second Mac on the previous release joins this server | worker Ready; Pods there mount delivered Secrets; no keystore listener or reconciler on the worker | yes | server-only listener: a listener on an agent node |
+| E19 | `sudo launchctl kickstart -k system/io.k3sm.server` while a client is connected mid-request | the client gets a clean error, not a hang; the listener is back within its backoff; kine and the apiserver come back; no partial record | yes | the listener lifecycle: the client hangs or the store holds a torn write |
+| E20 | **reboot of the server node**: an operator-attended leg (automation never reboots the rig), run by the operator with the script's `--attended reboot` step | after boot the flags are still set, the listener starts, E2's entry opens, E3's Secret is still current | yes | the flag check: a flag lost across a reboot |
 
 ## Open questions
 
