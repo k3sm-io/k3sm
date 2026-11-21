@@ -106,18 +106,19 @@ verb refuses a directory that is not root's or that group or others can write. K
 of any synced folder (iCloud Drive, Dropbox and the like) and out of Time Machine's reach, since a
 copy there outlives the rewrap.
 
-Keep that file until `rewrap` reports success, then delete it. If `rewrap` fails before anything is
-recorded under the new key, it deletes the file itself and says nothing was changed. If it is
-interrupted or fails partway, some entries may already be sealed under the new key, and that file
-is the only copy of it. `rewrap` then keeps the file, says a resume is possible, and you finish
-with the same key:
+Keep that file until `rewrap` reports success, then delete it. If `rewrap` is refused before it
+seals anything under the new key, it deletes the file itself and says nothing was changed. If it
+is interrupted or fails partway, some entries may already be sealed under the new key, and that
+file is the only copy of it. `rewrap` then keeps the file, says a resume may need it, and you
+finish with the same key:
 
 ```
 sudo k3sm keys rewrap --key-in FILE
 ```
 
-`--key-in` is for that recovery only. It refuses any key whose fingerprint is not the one the
-interrupted rewrap recorded, so it never makes a key you made yourself the master key.
+`--key-in` is for that recovery only. It accepts the key the interrupted rewrap recorded, or one
+that some entry is already sealed under, and refuses any other, so it never makes a key you made
+yourself the master key.
 
 If `rewrap` exits 3, it found an earlier rewrap that had been interrupted, finished that one with
 its key, and stopped. Run `rewrap --key-out` again with a new file.

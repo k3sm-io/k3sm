@@ -169,8 +169,8 @@ service user": they exist because a Pod must not be able to write them.
 - **Who mints it.** Only k3sm, from `crypto/rand`, 32 bytes. An operator never supplies a
   master key, to any verb, and no verb accepts an operator-made key. `rewrap --key-out FILE`
   saves the key k3sm minted so a crashed rewrap can be finished; `rewrap --key-in FILE`
-  only re-reads such a key, and refuses one whose SHA-256 is not the `master.next.sha256`
-  an interrupted rewrap recorded.
+  only re-reads such a key: its SHA-256 is the `master.next.sha256` an interrupted rewrap
+  recorded, or some record already opens under it and not under the live master.
 - **When it is created.** By the first root-run `k3sm keys put` that finds no master and
   an empty or absent `keystore/`. The one other state a put mints over, still only with
   `keystore/` empty, is the one an interrupted mint leaves: a master that passes every
@@ -701,10 +701,11 @@ rm <name> [--yes]
 rewrap --key-out FILE | --key-in FILE
       Mint a new master and re-seal every record under it. --key-out FILE
       first saves the minted key to FILE, a new 0600 file in a root-only
-      directory, for crash recovery; the file is deleted when the rewrap
-      fails with nothing recorded under the key. --key-in FILE only finishes
-      an interrupted rewrap: it re-reads a key whose SHA-256 matches the
-      recorded master.next.sha256 and refuses any other. Takes no value.
+      directory, for crash recovery; the file is deleted only when the rewrap
+      fails before sealing anything under the key. --key-in FILE only
+      finishes an interrupted rewrap: it re-reads a key whose SHA-256 matches
+      the recorded master.next.sha256, or that some record already opens
+      under, and refuses any other. Takes no value.
       Prints that entry backups taken earlier no longer open.
 
 deliver <name> --namespace NS [--secret NAME] [--data-key KEY] [--remove]
@@ -927,7 +928,7 @@ last pull request lands and no row is pending.
 | G7 | The floor is raised by every mutating verb (Delete only when the master opens) and by the start of every root verb (`list` and `show` through `RaiseFloor`), and a floor one behind the pointer is accepted. Each floor write re-reads the floor under the data-root lock and applies only its own change, and a held data-root lock times out within the bound | unit: crash after the flip, before the floor write; a floor moved on during a Rotate or a Delete keeps its newer entries; a held data-root lock on a real `flock` |
 | G8 | Rotate flips the pointer last; a crash at each of its steps leaves the old version current | unit: fault injection between each step |
 | G9 | A Rotate retry discards an orphaned next version and seals the value it was given | unit: orphan with value A, retry with value B, expect B |
-| G10 | The master is minted only by the first `put`, never over existing entries, and never by an operator-supplied value | unit: absent master with entries is `ErrMasterMissing`; no verb accepts an operator-made key: `rewrap --key-in` refuses a key whose SHA-256 is not the recorded `master.next.sha256` |
+| G10 | The master is minted only by the first `put`, never over existing entries, and never by an operator-supplied value | unit: absent master with entries is `ErrMasterMissing`; no verb accepts an operator-made key: `rewrap --key-in` refuses a key that is neither the recorded `master.next.sha256` nor one some record already opens under |
 | G11 | The master is opened with O_NOFOLLOW and judged by fstat on the open descriptor; wrong mode, owner or fingerprint is `ErrMasterUntrusted` | unit: one case each |
 | G12 | Rewrap resumes after a crash at every step, trying the old then the new key, and leaves no record readable by neither; a `master.next` that disagrees with its fingerprint is discarded only when no `.new` file exists, and refused with `ErrMasterUntrusted` otherwise | unit: fault injection at each of steps 2 to 5, then rerun; a corrupted `master.next` with and without a `.new` file |
 | G13 | A crash between the two master renames leaves a master that passes its trust check, and the next verb completes the swap | unit: stop after the first rename |
