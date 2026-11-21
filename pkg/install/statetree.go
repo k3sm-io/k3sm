@@ -369,6 +369,9 @@ var stateTree = func() []stateLevel {
 		// failed vm boots: daemon-private, 0700 as the runtime makes them.
 		{StateLevel(sandbox.ArtifactPartialSubdir), svc(serviceTreePrivateMode)},
 		{StateLevel(sandbox.VMBootFailureSubdir), svc(serviceTreePrivateMode)},
+		// The resumable image-layer downloads: daemon-private, 0700, which the
+		// partial store requires and does not repair.
+		{StateLevel(sandbox.ImagePartialSubdir), svc(serviceTreePrivateMode)},
 		// The Xcode build cache (k3sm.io/xcode-cache): every namespace's build
 		// products, read and written by the daemon alone and denied to every
 		// pod, which only ever gets a private clone in its own data volume.

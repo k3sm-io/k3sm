@@ -849,6 +849,7 @@ func TestStateTreeRuntimeTreeModes(t *testing.T) {
 	}{
 		{sandbox.ArtifactViewsSubdir, 0o711},
 		{sandbox.ArtifactPartialSubdir, 0o700},
+		{sandbox.ImagePartialSubdir, 0o700},
 		{sandbox.VMBootFailureSubdir, 0o700},
 		{".local-stage", 0o700},
 	} {
