@@ -1261,3 +1261,71 @@ func TestRewrapNotStarted(t *testing.T) {
 	}
 }
 
+// TestRecordsSealedUnder: RecordsSealedUnder reports a key that some
+// committed record opens under, beside the live master, which is how a
+// Rewrap whose master.next was replaced or removed is recognised, and
+// reports no other key: not one never used, not the live master, not the
+// key of a Rewrap that renamed nothing in. It writes nothing.
+func TestRecordsSealedUnder(t *testing.T) {
+	ctx := context.Background()
+	crashed := func(t *testing.T, at string, damage func(server string)) (*FileStore, string) {
+		t.Helper()
+		s, server := newTestStore(t)
+		seedRewrap(t, s)
+		s.step = func(name string) error {
+			if name == at {
+				damage(server)
+				return fmt.Errorf("injected crash at %s", name)
+			}
+			return nil
+		}
+		if err := s.Rewrap(ctx, rewrapKey(1)); err == nil {
+			t.Fatal("Rewrap succeeded through a crash")
+		}
+		s.step = func(string) error { return nil }
+		return s, server
+	}
+	removeNext := func(server string) {
+		for _, n := range []string{masterNextName, masterNextFingerprintName} {
+			if err := os.Remove(masterPath(server, n)); err != nil {
+				t.Error(err)
+			}
+		}
+	}
+	for name, tc := range map[string]struct {
+		at     string
+		damage func(server string)
+		key    []byte
+		want   bool
+	}{
+		"removed after one record moved":   {"rename a/v1", removeNext, rewrapKey(1), true},
+		"removed after every record moved": {"rename b/current", removeNext, rewrapKey(1), true},
+		"replaced after one record moved":  {"rename a/v1", func(server string) { plantNext(t, server, rewrapKey(9)) }, rewrapKey(1), true},
+		"another key":                      {"rename a/v1", removeNext, rewrapKey(2), false},
+		"the planted key":                  {"rename a/v1", func(server string) { plantNext(t, server, rewrapKey(9)) }, rewrapKey(9), false},
+		"nothing renamed in yet":           {"write v1.new", removeNext, rewrapKey(1), false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, server := crashed(t, tc.at, tc.damage)
+			snap := treeSnapshot(t, filepath.Dir(server))
+			got, err := s.RecordsSealedUnder(ctx, tc.key)
+			if err != nil || got != tc.want {
+				t.Fatalf("RecordsSealedUnder = %v, %v; want %v", got, err, tc.want)
+			}
+			checkTreeUnchanged(t, snap, treeSnapshot(t, filepath.Dir(server)))
+		})
+	}
+	t.Run("a clean keystore and the live master", func(t *testing.T) {
+		s, server := newTestStore(t)
+		seedRewrap(t, s)
+		live, err := os.ReadFile(masterPath(server, masterName))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, key := range [][]byte{rewrapKey(1), live} {
+			if got, err := s.RecordsSealedUnder(ctx, key); err != nil || got {
+				t.Fatalf("RecordsSealedUnder(%x) = %v, %v; want false", key[:1], got, err)
+			}
+		}
+	})
+}

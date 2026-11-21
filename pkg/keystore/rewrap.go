@@ -254,6 +254,62 @@ func (s *FileStore) interruptedRewrap(ctx context.Context) ([sha256.Size]byte, b
 	return fp, true, nil
 }
 
+// RecordsSealedUnder reports whether the keystore holds records a Rewrap to
+// key already committed: every record opens under the live master or under
+// key, and at least one only under key. That is the state a Rewrap leaves
+// when it is interrupted after renaming records in and its master.next is
+// then replaced or removed, and Rewrap(key) completes it. A key no Rewrap
+// sealed under, the live master included, reports false. It reads under the
+// shared lock and writes nothing.
+func (s *FileStore) RecordsSealedUnder(ctx context.Context, key []byte) (bool, error) {
+	ok, err := s.recordsSealedUnder(ctx, key)
+	if err != nil {
+		return false, fmt.Errorf("check for records sealed under the key: %w", err)
+	}
+	return ok, nil
+}
+
+func (s *FileStore) recordsSealedUnder(ctx context.Context, key []byte) (bool, error) {
+	if err := s.checkConfig(); err != nil {
+		return false, err
+	}
+	if len(key) != masterSize {
+		return false, fmt.Errorf("the key is %d bytes, want %d", len(key), masterSize)
+	}
+	root, done, err := s.openLocked(ctx, false, false)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer done()
+	fdir, fl, err := s.openFloor()
+	if err != nil {
+		return false, err
+	}
+	_ = fdir.Close() // read-only; nothing to flush
+	old, err := s.loadMaster()
+	if err != nil {
+		return false, err
+	}
+	old.next = nil
+	k, err := deriveKeys(key, s.scope)
+	if err != nil {
+		return false, err
+	}
+	defer k.wipe()
+	_, committed, err := rewrapPlan(ctx, root, fl, old, &k)
+	if errors.Is(err, ErrCorrupt) {
+		// Some record opens under neither key: not a Rewrap to key.
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return committed, nil
+}
+
 // resumed is ErrRewrapResumed, unless the key a resumed Rewrap completed, now
 // the master, is newMaster after all.
 func resumed(live keys, newMaster []byte) error {
