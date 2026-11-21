@@ -793,6 +793,7 @@ func TestRewrapGuards(t *testing.T) {
 		if err := os.Mkdir(filepath.Join(server, "keystore", userScopesName), 0o700); err != nil {
 			t.Fatal(err)
 		}
+		giveToService(t, filepath.Join(server, "keystore"), filepath.Join(server, "keystore", userScopesName))
 		snap := treeSnapshot(t, filepath.Dir(server))
 		if err := s.Rewrap(ctx, rewrapKey(1)); !errors.Is(err, ErrScopeUnsupported) {
 			t.Fatalf("Rewrap: %v, want ErrScopeUnsupported", err)

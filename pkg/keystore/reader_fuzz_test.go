@@ -34,8 +34,9 @@ import (
 // fuzzMasterStore returns a store whose readMaster can be called on the
 // returned root, and the directory the root is open on.
 func fuzzMasterStore(f *testing.F) (*FileStore, string) {
+	uid, gid := serviceIDs(f)
 	dir := f.TempDir()
-	return &FileStore{uid: uint32(os.Getuid()), gid: uint32(os.Getgid())}, dir
+	return &FileStore{uid: uid, gid: gid}, dir
 }
 
 // readMasterPair writes master and fp as the master pair in dir and reads
@@ -50,6 +51,7 @@ func readMasterPair(t *testing.T, s *FileStore, dir string, master, fp []byte) (
 		if err := os.Chmod(p, fileMode); err != nil {
 			t.Fatal(err)
 		}
+		giveToService(t, p)
 	}
 	root, err := os.OpenRoot(dir)
 	if err != nil {

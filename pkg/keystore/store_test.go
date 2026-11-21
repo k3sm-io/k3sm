@@ -39,24 +39,27 @@ import (
 )
 
 // newTestStore returns a FileStore over a fresh server work dir, owned by the
-// test user, with the work dir path for tests that inspect the files.
+// service user (serviceIDs), in a data root owned by the floor's owner
+// (floorIDs), with the work dir path for tests that inspect the files.
 func newTestStore(t *testing.T) (*FileStore, string) {
 	t.Helper()
+	uid, gid := serviceIDs(t)
 	data := t.TempDir()
 	server := filepath.Join(data, "server")
 	if err := os.Mkdir(server, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	giveToService(t, server)
 	s := New(Config{
 		Dir:       filepath.Join(server, "keystore"),
 		MasterDir: filepath.Join(server, "cred", "keystore-master"),
-		UID:       uint32(os.Getuid()),
-		GID:       uint32(os.Getgid()),
+		UID:       uid,
+		GID:       gid,
 		DataRoot:  data,
 	})
-	// A test cannot create a root-owned file, so the test user stands in for
-	// root as the floor's owner.
-	s.floorUID, s.floorGID = uint32(os.Getuid()), uint32(os.Getgid())
+	// Non-root, a test cannot create a root-owned file, so the test user
+	// stands in for root as the floor's owner.
+	s.floorUID, s.floorGID = floorIDs()
 	return s, server
 }
 
@@ -622,18 +625,20 @@ func TestConfigRefused(t *testing.T) {
 		"DataRoot with a dot-dot":    func(c *Config) { c.DataRoot = filepath.Join(c.Dir, "..", "..") + "/server/.." },
 	} {
 		t.Run(name, func(t *testing.T) {
+			uid, gid := serviceIDs(t)
 			server := filepath.Join(t.TempDir(), "server")
 			if err := os.Mkdir(server, 0o700); err != nil {
 				t.Fatal(err)
 			}
+			giveToService(t, server)
 			// A relative path resolves inside server, where the check below
 			// would see anything it created.
 			t.Chdir(server)
 			cfg := Config{
 				Dir:       filepath.Join(server, "keystore"),
 				MasterDir: filepath.Join(server, "cred", "keystore-master"),
-				UID:       uint32(os.Getuid()),
-				GID:       uint32(os.Getgid()),
+				UID:       uid,
+				GID:       gid,
 				DataRoot:  filepath.Dir(server),
 			}
 			edit(&cfg)
@@ -780,7 +785,7 @@ func TestLockBoundedWait(t *testing.T) {
 // than use it, on a read and on a first Put.
 func TestDirectoryOwnerRefused(t *testing.T) {
 	ctx := context.Background()
-	other := uint32(os.Getuid()) + 1
+	other := otherUID(t)
 	noChown := func(*os.File, int, int) error { return nil }
 
 	s, _ := newTestStore(t)
@@ -788,7 +793,9 @@ func TestDirectoryOwnerRefused(t *testing.T) {
 	foreign := New(Config{Dir: s.dir, MasterDir: s.masterDir, UID: other, GID: s.gid, DataRoot: s.dataRoot})
 	foreign.floorUID, foreign.floorGID = s.floorUID, s.floorGID
 	foreign.chown = noChown
-	want := fmt.Sprintf("owned by uid %d, want %d", os.Getuid(), other)
+	// The existing directories were handed to the service user; the fresh
+	// store's first directory stays its creator's, the running user's.
+	want := fmt.Sprintf("owned by uid %d, want %d", s.uid, other)
 	if _, _, err := foreign.Current(ctx, "a"); err == nil || !strings.Contains(err.Error(), want) {
 		t.Fatalf("Current: %v, want a refusal %q", err, want)
 	}
@@ -799,6 +806,7 @@ func TestDirectoryOwnerRefused(t *testing.T) {
 	fresh, freshServer := newTestStore(t)
 	fresh.uid = other
 	fresh.chown = noChown
+	want = fmt.Sprintf("owned by uid %d, want %d", os.Geteuid(), other)
 	if _, err := fresh.Put(ctx, "a", KindOpaque, []byte("a")); err == nil || !strings.Contains(err.Error(), want) {
 		t.Fatalf("first Put: %v, want a refusal %q", err, want)
 	}
@@ -915,8 +923,14 @@ func TestOwnership(t *testing.T) {
 		owned []os.FileInfo
 	)
 	s.chown = func(f *os.File, uid, gid int) error {
-		if uid != int(s.uid) || gid != int(s.gid) {
-			return fmt.Errorf("chown to %d:%d, want %d:%d", uid, gid, s.uid, s.gid)
+		// The floor, in the data root, is the one file handed to its own
+		// owner, root (floorIDs) rather than the service user.
+		wantUID, wantGID := s.uid, s.gid
+		if strings.Contains(filepath.Base(f.Name()), floorName) {
+			wantUID, wantGID = s.floorUID, s.floorGID
+		}
+		if uid != int(wantUID) || gid != int(wantGID) {
+			return fmt.Errorf("chown to %d:%d, want %d:%d", uid, gid, wantUID, wantGID)
 		}
 		fi, err := f.Stat()
 		if err != nil {
@@ -1142,6 +1156,7 @@ func TestMintCountsReservedUserName(t *testing.T) {
 				t.Fatal(err)
 			}
 			plant(t, filepath.Join(ks, userScopesName))
+			giveToService(t, ks, filepath.Join(ks, userScopesName))
 			if _, err := s.Put(context.Background(), "a", KindOpaque, []byte("a")); !errors.Is(err, ErrMasterMissing) {
 				t.Fatalf("Put with only %s present: %v, want ErrMasterMissing", userScopesName, err)
 			}
