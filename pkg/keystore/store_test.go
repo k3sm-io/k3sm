@@ -682,7 +682,8 @@ func TestReadErrorIsNotCorrupt(t *testing.T) {
 }
 
 // TestLockBoundedWait is gate row G14: a held lock gives a timeout error
-// after the bound, never a hang, and a cancelled context ends the wait.
+// after the bound, never a hang, and a cancelled context ends the wait, for
+// every verb that takes it, Rotate included.
 //
 // Each case runs in a testing/synctest bubble, whose clock moves only while
 // every goroutine in it is blocked, so the store waits its production bound
@@ -730,6 +731,7 @@ func TestLockBoundedWait(t *testing.T) {
 			bounded(t, s, "Current", func() error { _, _, err := s.Current(ctx, "a"); return err })
 			bounded(t, s, "List", func() error { _, err := s.List(ctx); return err })
 			bounded(t, s, "Delete", func() error { return s.Delete(ctx, "a") })
+			bounded(t, s, "Rotate", func() error { _, err := s.Rotate(ctx, "a", []byte("b")); return err })
 		})
 	})
 	t.Run("shared holder blocks only writes", func(t *testing.T) {
@@ -738,6 +740,7 @@ func TestLockBoundedWait(t *testing.T) {
 			s, server := setup(t)
 			hold(t, server, syscall.LOCK_SH)
 			bounded(t, s, "Put", func() error { _, err := s.Put(ctx, "b", KindOpaque, []byte("b")); return err })
+			bounded(t, s, "Rotate", func() error { _, err := s.Rotate(ctx, "a", []byte("b")); return err })
 			if _, _, err := s.Current(ctx, "a"); err != nil {
 				t.Fatalf("Current under a shared lock: %v", err)
 			}
@@ -748,14 +751,21 @@ func TestLockBoundedWait(t *testing.T) {
 			s, server := setup(t)
 			hold(t, server, syscall.LOCK_EX)
 			s.lockWait = time.Minute
-			cctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
-			defer cancel()
-			start := time.Now()
-			if _, err := s.Put(cctx, "b", KindOpaque, []byte("b")); !errors.Is(err, context.DeadlineExceeded) {
-				t.Fatalf("Put: %v, want the context's error", err)
-			}
-			if took := time.Since(start); took >= s.lockWait {
-				t.Fatalf("Put waited %v of bubble time, want the context's 50ms, not the lock bound", took)
+			for op, fn := range map[string]func(ctx context.Context) error{
+				"Put":    func(ctx context.Context) error { _, err := s.Put(ctx, "b", KindOpaque, []byte("b")); return err },
+				"Rotate": func(ctx context.Context) error { _, err := s.Rotate(ctx, "a", []byte("b")); return err },
+			} {
+				cctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+				start := time.Now()
+				err := fn(cctx)
+				took := time.Since(start)
+				cancel()
+				if !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("%s: %v, want the context's error", op, err)
+				}
+				if took >= s.lockWait {
+					t.Fatalf("%s waited %v of bubble time, want the context's 50ms, not the lock bound", op, took)
+				}
 			}
 		})
 	})
