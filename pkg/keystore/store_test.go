@@ -50,16 +50,18 @@ func newTestStore(t *testing.T) (*FileStore, string) {
 		t.Fatal(err)
 	}
 	giveToService(t, server)
+	// Non-root, a test cannot create a root-owned file, so the test user
+	// stands in for root as the floor's owner.
+	floorUID, floorGID := floorIDs()
 	s := New(Config{
 		Dir:       filepath.Join(server, "keystore"),
 		MasterDir: filepath.Join(server, "cred", "keystore-master"),
 		UID:       uid,
 		GID:       gid,
 		DataRoot:  data,
+		FloorUID:  floorUID,
+		FloorGID:  floorGID,
 	})
-	// Non-root, a test cannot create a root-owned file, so the test user
-	// stands in for root as the floor's owner.
-	s.floorUID, s.floorGID = floorIDs()
 	return s, server
 }
 
@@ -603,13 +605,15 @@ func TestDeleteDirectoryAtCurrent(t *testing.T) {
 	}
 }
 
-// TestConfigRefused: a zero service uid, an empty, relative or unclean Dir,
-// MasterDir or DataRoot, or a MasterDir at or inside Dir makes every
-// operation fail closed, before anything is created.
+// TestConfigRefused: a zero service uid, a negative FloorUID or FloorGID, an
+// empty, relative or unclean Dir, MasterDir or DataRoot, or a MasterDir at or
+// inside Dir makes every operation fail closed, before anything is created.
 func TestConfigRefused(t *testing.T) {
 	ctx := context.Background()
 	for name, edit := range map[string]func(c *Config){
 		"zero uid":                   func(c *Config) { c.UID = 0 },
+		"negative FloorUID":          func(c *Config) { c.FloorUID = -1 },
+		"negative FloorGID":          func(c *Config) { c.FloorGID = -1 },
 		"empty Dir":                  func(c *Config) { c.Dir = "" },
 		"empty MasterDir":            func(c *Config) { c.MasterDir = "" },
 		"nothing set at all":         func(c *Config) { *c = Config{} },
@@ -658,6 +662,63 @@ func TestConfigRefused(t *testing.T) {
 			}
 			if names, _ := os.ReadDir(server); len(names) != 0 {
 				t.Fatalf("created %v", names)
+			}
+		})
+	}
+}
+
+// TestConfigRootFloorRefused: a process whose effective uid is 0, through the
+// euid seam, refuses a store whose floor owner is not root, before anything
+// is created; a non-root process accepts any non-negative owner, which is how
+// a non-root test names itself.
+func TestConfigRootFloorRefused(t *testing.T) {
+	ctx := context.Background()
+	for _, tt := range []struct {
+		name               string
+		euid               int
+		floorUID, floorGID int
+		refused            bool
+	}{
+		{"root with a non-root floor uid", 0, 501, 0, true},
+		{"root with a non-root floor gid", 0, 0, 20, true},
+		{"root with a root floor", 0, 0, 0, false},
+		{"non-root naming another owner", 501, 502, 20, false},
+		{"non-root naming root", 501, 0, 0, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			server := filepath.Join(t.TempDir(), "server")
+			s := New(Config{
+				Dir:       filepath.Join(server, "keystore"),
+				MasterDir: filepath.Join(server, "cred", "keystore-master"),
+				UID:       501,
+				GID:       20,
+				DataRoot:  filepath.Dir(server),
+				FloorUID:  tt.floorUID,
+				FloorGID:  tt.floorGID,
+			})
+			s.euid = func() int { return tt.euid }
+			err := s.checkConfig()
+			if got := errors.Is(err, errInvalidConfig); got != tt.refused {
+				t.Fatalf("checkConfig: %v, want refused %v", err, tt.refused)
+			}
+			if !tt.refused {
+				return
+			}
+			ops := map[string]error{}
+			_, ops["Put"] = s.Put(ctx, "a", KindOpaque, []byte("a"))
+			_, _, ops["Current"] = s.Current(ctx, "a")
+			_, ops["List"] = s.List(ctx)
+			ops["Delete"] = s.Delete(ctx, "a")
+			_, ops["Rotate"] = s.Rotate(ctx, "a", []byte("b"))
+			ops["RaiseFloor"] = s.RaiseFloor(ctx)
+			ops["Rewrap"] = s.Rewrap(ctx, make([]byte, 32))
+			for op, err := range ops {
+				if !errors.Is(err, errInvalidConfig) || !strings.Contains(err.Error(), "must be root") {
+					t.Errorf("%s: %v, want errInvalidConfig naming root's floor", op, err)
+				}
+			}
+			if _, err := os.Stat(server); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("the refused store created %s: %v", server, err)
 			}
 		})
 	}
@@ -790,8 +851,7 @@ func TestDirectoryOwnerRefused(t *testing.T) {
 
 	s, _ := newTestStore(t)
 	mustPut(t, s, "a", KindOpaque, []byte("a"))
-	foreign := New(Config{Dir: s.dir, MasterDir: s.masterDir, UID: other, GID: s.gid, DataRoot: s.dataRoot})
-	foreign.floorUID, foreign.floorGID = s.floorUID, s.floorGID
+	foreign := New(Config{Dir: s.dir, MasterDir: s.masterDir, UID: other, GID: s.gid, DataRoot: s.dataRoot, FloorUID: s.floorUID, FloorGID: s.floorGID})
 	foreign.chown = noChown
 	// The existing directories were handed to the service user; the fresh
 	// store's first directory stays its creator's, the running user's.
@@ -925,7 +985,7 @@ func TestOwnership(t *testing.T) {
 	s.chown = func(f *os.File, uid, gid int) error {
 		// The floor, in the data root, is the one file handed to its own
 		// owner, root (floorIDs) rather than the service user.
-		wantUID, wantGID := s.uid, s.gid
+		wantUID, wantGID := int(s.uid), int(s.gid)
 		if strings.Contains(filepath.Base(f.Name()), floorName) {
 			wantUID, wantGID = s.floorUID, s.floorGID
 		}
@@ -1108,8 +1168,7 @@ func TestScopeBindsRecords(t *testing.T) {
 	mustPut(t, s, "a", KindOpaque, []byte("a"))
 	// The test-only seam: a second store over the same directories, under a
 	// scope New does not construct.
-	u501 := New(Config{Dir: s.dir, MasterDir: s.masterDir, UID: s.uid, GID: s.gid, DataRoot: s.dataRoot})
-	u501.floorUID, u501.floorGID = s.floorUID, s.floorGID
+	u501 := New(Config{Dir: s.dir, MasterDir: s.masterDir, UID: s.uid, GID: s.gid, DataRoot: s.dataRoot, FloorUID: s.floorUID, FloorGID: s.floorGID})
 	u501.scope = "user/501"
 	if _, _, err := u501.Current(ctx, "a"); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("Current under user/501: %v, want ErrCorrupt", err)

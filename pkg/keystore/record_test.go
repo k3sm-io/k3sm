@@ -24,6 +24,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"testing/iotest"
@@ -300,6 +301,14 @@ func TestCheckValue(t *testing.T) {
 			}
 		})
 	}
+	// The length of a refused Ed25519 value is part of the secret's shape,
+	// so the refusal names the two valid sizes and not the value's.
+	for _, n := range []int{31, 40, 65} {
+		err := checkValue(KindEd25519, make([]byte, n))
+		if err == nil || strings.Contains(err.Error(), strconv.Itoa(n)) {
+			t.Errorf("checkValue of %d bytes = %v, want a refusal that does not give the length", n, err)
+		}
+	}
 }
 
 func TestFingerprint(t *testing.T) {
@@ -405,4 +414,23 @@ func mustDeriveKeys(t *testing.T, master []byte, scope string) keys {
 		t.Fatalf("deriveKeys %q: %v", scope, err)
 	}
 	return k
+}
+
+// TestCheckNameExported: CheckName applies the store's name grammar and, unlike the
+// store's refusals, never carries the name it refused.
+func TestCheckNameExported(t *testing.T) {
+	for _, ok := range []string{"a", "api-token", "a.b-c.d9", strings.Repeat("a", 63)} {
+		if err := CheckName(ok); err != nil {
+			t.Errorf("CheckName(%q) = %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"", "Hunter2", "hunter2+x=", ".hunter2", "hunter2-", "hunter2..x", strings.Repeat("h", 254)} {
+		err := CheckName(bad)
+		if !errors.Is(err, ErrInvalidName) {
+			t.Errorf("CheckName(%q) = %v, want ErrInvalidName", bad, err)
+		}
+		if bad != "" && err != nil && strings.Contains(err.Error(), bad) {
+			t.Errorf("CheckName(%q) echoes the name: %v", bad, err)
+		}
+	}
 }
