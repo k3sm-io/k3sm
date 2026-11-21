@@ -92,7 +92,7 @@ func (s *FileStore) openDir(path string, create bool) (*os.Root, error) {
 // mkdirAt, so the open never leaves parent.
 func (s *FileStore) openSubdir(parent *os.Root, name string, create bool) (*os.Root, error) {
 	if create {
-		if err := s.mkdirAt(parent, name); err != nil && !errors.Is(err, fs.ErrExist) {
+		if _, err := s.mkdirAt(parent, name); err != nil && !errors.Is(err, fs.ErrExist) {
 			return nil, err
 		}
 	}
@@ -154,17 +154,22 @@ func (s *FileStore) mkdirOwned(path string) error {
 	return s.own(f, dirMode)
 }
 
-// mkdirAt creates the directory name inside root, handed to the service user.
-func (s *FileStore) mkdirAt(root *os.Root, name string) error {
+// mkdirAt creates the directory name inside root, handed to the service user,
+// and returns its info, taken on the descriptor the ownership went on, for a
+// caller that opens it again to check it reached the same directory.
+func (s *FileStore) mkdirAt(root *os.Root, name string) (fs.FileInfo, error) {
 	if err := root.Mkdir(name, dirMode); err != nil {
-		return err
+		return nil, err
 	}
-	f, _, err := openNoFollow(root, name, os.O_RDONLY|syscall.O_DIRECTORY, 0)
+	f, fi, err := openNoFollow(root, name, os.O_RDONLY|syscall.O_DIRECTORY, 0)
 	if err != nil {
-		return fmt.Errorf("open %s: %w", name, err)
+		return nil, fmt.Errorf("open %s: %w", name, err)
 	}
 	defer func() { _ = f.Close() }() // read-only; nothing to flush
-	return s.own(f, dirMode)
+	if err := s.own(f, dirMode); err != nil {
+		return nil, err
+	}
+	return fi, nil
 }
 
 // own applies the service user's ownership and mode to an open file or

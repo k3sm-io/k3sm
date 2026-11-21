@@ -84,6 +84,9 @@ type FileStore struct {
 	// step is called at each durable step of a write; a non-nil return aborts
 	// the write there, as a crash would.
 	step func(name string) error
+	// entryMade is called between a new entry directory's mkdir and its open,
+	// where a test swaps the directory.
+	entryMade func(name string)
 }
 
 // New returns the FileStore cfg describes. It touches nothing on disk.
@@ -98,6 +101,7 @@ func New(cfg Config) *FileStore {
 		chown:     (*os.File).Chown,
 		lockWait:  lockTimeout,
 		step:      func(string) error { return nil },
+		entryMade: func(string) {},
 	}
 }
 
@@ -141,8 +145,13 @@ func (s *FileStore) put(ctx context.Context, name string, kind Kind, value []byt
 // with a current pointer is ErrExists, and so is one without a pointer that
 // holds more than an interrupted Put leaves, which is damage for rm to clear
 // and is left untouched. An interrupted Put is discarded first.
+//
+// The directory is opened again after its mkdir, and OpenRoot follows a
+// symlink that stays inside root, so the opened directory must be the one the
+// mkdir made: a name swapped in between would otherwise have the new entry's
+// generation written over another entry's.
 func (s *FileStore) createEntry(root *os.Root, name string) (*entry, error) {
-	err := s.mkdirAt(root, name)
+	made, err := s.mkdirAt(root, name)
 	if errors.Is(err, fs.ErrExist) {
 		old, oerr := openEntryDir(root, name)
 		switch {
@@ -157,7 +166,7 @@ func (s *FileStore) createEntry(root *os.Root, name string) (*entry, error) {
 		if err := root.RemoveAll(name); err != nil {
 			return nil, fmt.Errorf("discard an interrupted put: %w", err)
 		}
-		err = s.mkdirAt(root, name)
+		made, err = s.mkdirAt(root, name)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("create the entry directory: %w", err)
@@ -165,11 +174,16 @@ func (s *FileStore) createEntry(root *os.Root, name string) (*entry, error) {
 	if err := syncDir(root); err != nil {
 		return nil, err
 	}
+	s.entryMade(name)
 	sub, err := root.OpenRoot(name)
 	if err != nil {
 		return nil, err
 	}
 	e := &entry{root: sub, name: name}
+	if opened, err := sub.Stat("."); err != nil || !os.SameFile(made, opened) {
+		e.close()
+		return nil, fmt.Errorf("%w: the new entry directory was replaced before it was opened", ErrCorrupt)
+	}
 	if err := s.readRandom(e.generation[:]); err != nil {
 		e.close()
 		return nil, err

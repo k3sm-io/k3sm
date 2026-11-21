@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -897,6 +898,49 @@ func TestRefusesSymlinks(t *testing.T) {
 			t.Fatalf("Current through a symlinked entry: %v, want ErrCorrupt", err)
 		}
 	})
+}
+
+// TestCreateEntryRefusesSwappedDirectory: a new entry directory replaced by a
+// symlink to another entry between its mkdir and its open is refused, and
+// nothing is written through it into the other entry.
+func TestCreateEntryRefusesSwappedDirectory(t *testing.T) {
+	s, server := newTestStore(t)
+	mustPut(t, s, "a", KindOpaque, []byte("a"))
+	ks := filepath.Join(server, "keystore")
+	before := dirContents(t, filepath.Join(ks, "a"))
+	s.entryMade = func(name string) {
+		p := filepath.Join(ks, name)
+		if err := os.Remove(p); err != nil {
+			t.Error(err)
+		}
+		if err := os.Symlink("a", p); err != nil {
+			t.Error(err)
+		}
+	}
+	if _, err := s.Put(context.Background(), "b", KindOpaque, []byte("b")); err == nil {
+		t.Fatal("Put wrote into a directory swapped in after its mkdir")
+	}
+	if after := dirContents(t, filepath.Join(ks, "a")); !maps.Equal(after, before) {
+		t.Fatalf("the other entry changed: %q, was %q", after, before)
+	}
+}
+
+// dirContents maps each name in dir to its content.
+func dirContents(t *testing.T, dir string) map[string]string {
+	t.Helper()
+	des, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]string{}
+	for _, de := range des {
+		b, err := os.ReadFile(filepath.Join(dir, de.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		out[de.Name()] = string(b)
+	}
+	return out
 }
 
 func failAt(step string) func(string) error {
