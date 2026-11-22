@@ -394,7 +394,7 @@ type mergeLoss struct {
 func mergeLoses(live, merged floor, capDropped []pruned) mergeLoss {
 	guarded := live.guardEra()
 	lost := func(p pruned) bool {
-		return !live[p.name].buries(p.generation) || guarded[floorBurial{p.name, p.generation}]
+		return !live[p.name].buries(p.generation) || guarded[floorBurial(p)]
 	}
 	var l mergeLoss
 	names, capNames := map[string]bool{}, map[string]bool{}
