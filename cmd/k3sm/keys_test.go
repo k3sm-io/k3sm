@@ -2544,8 +2544,13 @@ func TestKeysEvictionExitsCommitted(t *testing.T) {
 		}
 		plantBurials(t, aside, "k", 1000, keysPerNameCap)
 		stageKeystore(t, h)
-		if code := h.run("floor", "merge"); code != keysCommitted {
-			t.Fatalf("floor merge that drops a burial: exit %d, stderr %q; want %d", code, h.stderr.String(), keysCommitted)
+		// Any drop refuses without --accept-drops, the restored floor's
+		// own burial included.
+		if code := h.run("floor", "merge"); code != keysRefused {
+			t.Fatalf("floor merge that drops a burial: exit %d, stderr %q; want %d", code, h.stderr.String(), keysRefused)
+		}
+		if code := h.run("floor", "merge", "--accept-drops"); code != keysCommitted {
+			t.Fatalf("floor merge --accept-drops that drops a burial: exit %d, stderr %q; want %d", code, h.stderr.String(), keysCommitted)
 		}
 		if got := h.stdout.String(); !strings.Contains(got, "dropped 1\n") || !strings.Contains(got, "dropped system/k:") {
 			t.Fatalf("floor merge printed %q, want the drop reported", got)
