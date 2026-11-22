@@ -2481,8 +2481,8 @@ func TestKeysEvictionExitsCommitted(t *testing.T) {
 
 // TestKeysPendingMergeGuard (U192): while the restore's
 // keystore-floor.json.pre-restore is in the data root, put and rotate
-// refuse, naming keys floor merge, list and show still read, with a
-// warning on stderr, and rm still deletes; floor merge renames it to
+// refuse, naming keys floor merge, and list, show and rm still run, with a
+// warning on stderr; floor merge renames it to
 // keystore-floor.json.merged-<unix>, and the verbs work again.
 func TestKeysPendingMergeGuard(t *testing.T) {
 	h := newKeysHarness(t)
@@ -2511,6 +2511,9 @@ func TestKeysPendingMergeGuard(t *testing.T) {
 		t.Fatalf("show with a merge pending: stderr %q; want the warning", h.stderr.String())
 	}
 	h.mustRun(0, "rm", "system/j", "--yes")
+	if !strings.Contains(h.stderr.String(), "warning: a restore is unfinished") {
+		t.Fatalf("rm with a merge pending: stderr %q; want the warning", h.stderr.String())
+	}
 	h.mustRun(0, "floor", "merge", recipeFloor(h)+".pre-restore", "--keep", "system/k")
 	matches, err := filepath.Glob(recipeFloor(h) + ".merged-*")
 	if err != nil || len(matches) != 1 {

@@ -936,6 +936,9 @@ func keysRm(ctx context.Context, args []string, env keysEnv) int {
 	if err != nil {
 		return v.failf(keysRefused, "%v", err)
 	}
+	// rm runs while a restore is unfinished, so it can make room for a
+	// merge refused because the floor is full; it warns as list and show do.
+	v.warnMergePending(s)
 	code = keysOK
 	if err := s.Delete(ctx, name); err != nil {
 		// A Delete whose floor write evicted tombstones exits
