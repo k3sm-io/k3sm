@@ -547,6 +547,12 @@ type logState struct {
 	tornKind      taintKind
 	tornKey       floorKey
 	tornAt        int64
+	// unrecovered marks a whole line with a bad checksum that no unique
+	// single-bit correction recovers, and unrecoveredAt the start of the
+	// latest (userfloor_taint.go): every generation of every key is
+	// refused while it counts.
+	unrecovered   bool
+	unrecoveredAt int64
 }
 
 // damaged is the count of damaged lines: those skipped, and a last line
@@ -1429,7 +1435,8 @@ func (f *fileFloorLog) check() error { return f.read(func(*logState) {}) }
 // floor is the floor's word on scope, name and gen. A tainted key
 // (userfloor_taint.go), the delivery record's included, is errFloorDegraded
 // for every generation, known or not: the skipped line could have been its
-// tombstone or a higher live line. While the floor holds unattributable
+// tombstone or a higher live line. So is every key while the floor holds an
+// unrecovered flip that counts. While the floor holds unattributable
 // damage that counts, an entry generation it has no line for is
 // errFloorDegraded too; the delivery record has no tombstone, so its
 // unknown generations are not. A known, untainted generation is served over
@@ -1445,7 +1452,7 @@ func (f *fileFloorLog) floor(scope, name string, gen [generationSize]byte) (uint
 		buried = state.buried[k]
 		switch {
 		case buried:
-		case state.tainted(k):
+		case state.tainted(k), f.unrecovered(state):
 			refusing = true
 		case !known && name != deliveriesFloorName && f.unattributable(state):
 			refusing = true
@@ -1467,12 +1474,13 @@ func (f *fileFloorLog) floor(scope, name string, gen [generationSize]byte) (uint
 }
 
 // liveRefused reports whether a live line for k is refused: k is tainted,
-// or the floor holds unattributable damage that counts and no line for k.
+// the floor holds an unrecovered flip that counts, or it holds
+// unattributable damage that counts and no line for k.
 func (f *fileFloorLog) liveRefused(k floorKey) (bool, error) {
 	var refused bool
 	err := f.read(func(state *logState) {
 		_, known := state.maxSeq[k]
-		refused = state.tainted(k) || (!known && f.unattributable(state))
+		refused = state.tainted(k) || f.unrecovered(state) || (!known && f.unattributable(state))
 	})
 	return refused, err
 }

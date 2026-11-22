@@ -30,15 +30,17 @@ import (
 // back to the same bytes. The seeds are committed under testdata/fuzz/FuzzParseFloorLine.
 //
 // The checksum's property: every byte string either parses, with a
-// checksum that matches its body, or is classified (classifyFloorDamage,
-// never a panic); and every truncation and every single-byte flip of a
-// line that parses never parses, and taints its key or counts as
-// unattributable.
+// checksum that matches its body, or is classified (classifyFloorDamage)
+// and searched for a correction (correctFloorFlip), never a panic; every
+// truncation of a line that parses never parses, and taints its key or
+// counts as unattributable; and every single-bit flip of it never parses
+// and is corrected back to its own key, which it taints.
 func FuzzParseFloorLine(f *testing.F) {
 	f.Fuzz(func(t *testing.T, b []byte) {
 		r, err := parseFloorLine(b)
 		if err != nil {
 			kind, _ := classifyFloorDamage(b)
+			_, _ = correctFloorFlip(b)
 			if kind < taintName || kind > taintNameFlip {
 				t.Fatalf("%q: classified as %d, no taint kind", b, kind)
 			}
@@ -48,14 +50,17 @@ func FuzzParseFloorLine(f *testing.F) {
 			t.Fatalf("accepted %q, whose checksum does not match %q", b, body)
 		}
 		for n := range len(b) {
-			checkDamagedLine(t, b[:n], r.key)
+			checkTornLine(t, b[:n], r.key)
 		}
 		for i := range b {
-			p := append([]byte(nil), b...)
-			p[i] ^= 0x01
-			checkDamagedLine(t, p, r.key)
-			p[i] ^= 0x01 ^ 0x20
-			checkDamagedLine(t, p, r.key)
+			for bit := range 8 {
+				p := append([]byte(nil), b...)
+				p[i] ^= 1 << bit
+				checkDamagedLine(t, p, r.key)
+				if got, ok := correctFloorFlip(p); !ok || got != r.key {
+					t.Fatalf("%q: corrected to %+v, %v, want %+v", p, got, ok, r.key)
+				}
+			}
 		}
 		if len(b)+1 > maxLogLine {
 			t.Fatalf("accepted a %d-byte line", len(b))

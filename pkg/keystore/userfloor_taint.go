@@ -226,11 +226,117 @@ func namePrefixOK(p string) bool {
 // taint set's overflow, or, for a line no key can be read from, as
 // unattributable damage at off.
 func (s *logState) taintLine(off int64, line []byte) {
+	if k, ok := correctFloorFlip(line); ok {
+		s.taintKey(off, taintGen, k)
+	} else if wholeFloorLine(line) {
+		// A whole line flipped beyond one bit: it could have been any
+		// key's tombstone, the known generations' included.
+		s.unattributable(off)
+		if !s.unrecovered || off > s.unrecoveredAt {
+			s.unrecovered, s.unrecoveredAt = true, off
+		}
+	}
 	kind, k := classifyFloorDamage(line)
 	if kind == taintNameFlip {
 		s.unattributable(off)
 		kind = taintName
 	}
+	s.taintKey(off, kind, k)
+}
+
+// wholeFloorLine reports whether line, a damaged floor line without its
+// newline, cannot be a tear: it ends in a field shaped like a checksum (8
+// lowercase hex digits) after four separators, or five, one flipped in. A
+// tear only shortens a line, and every shorter prefix of a line with that
+// last field has fewer separators.
+func wholeFloorLine(line []byte) bool {
+	n := bytes.Count(line, []byte{' '})
+	if n != 4 && n != 5 {
+		return false
+	}
+	_, canonical, _ := splitFloorCRC(line)
+	return canonical
+}
+
+// correctFloorFlip returns the key of the one line in the grammar that a
+// single-bit flip of line, a damaged floor line without its newline, came
+// from, and false when there is none or more than one. CRC-32C detects and
+// locates every single-bit error in a line this short, so a whole line with
+// one bit flipped has exactly one correction: a flip that restores a
+// separator, removes a separator flipped in, or restores a byte of a field,
+// the checksum's own digits included. A flip inside the body is found
+// through the checksum's syndrome, so the search is linear in the line.
+func correctFloorFlip(line []byte) (floorKey, bool) {
+	if len(line)+1 > maxLogLine {
+		return floorKey{}, false
+	}
+	var (
+		found floorKey
+		n     int
+	)
+	p := append([]byte(nil), line...)
+	try := func(i int, mask byte) {
+		p[i] ^= mask
+		if r, err := parseFloorLine(p); err == nil {
+			found = r.key
+			n++
+		}
+		p[i] ^= mask
+	}
+	switch bytes.Count(line, []byte{' '}) {
+	case 3:
+		// A separator flipped away: the one bit that makes it a space.
+		for i, c := range line {
+			if m := c ^ ' '; m&(m-1) == 0 {
+				try(i, m)
+			}
+		}
+	case 5:
+		// A separator flipped in: any bit of any space.
+		for i, c := range line {
+			if c == ' ' {
+				for b := range 8 {
+					try(i, 1<<b)
+				}
+			}
+		}
+	case 4:
+		sp := bytes.LastIndexByte(line, ' ')
+		for i := sp + 1; i < len(line); i++ {
+			for b := range 8 {
+				if line[i]^1<<b != ' ' {
+					try(i, 1<<b)
+				}
+			}
+		}
+		body, canonical, _ := splitFloorCRC(line)
+		if !canonical {
+			break
+		}
+		var stored uint32
+		for _, c := range line[sp+1:] {
+			stored = stored<<4 | uint32(unhex(c))
+		}
+		// A flip of bit b of body[i] changes the checksum by the table's
+		// entry for 1<<b carried through the len(body)-1-i bytes after it.
+		syndrome := floorCRC(body) ^ stored
+		for b := range 8 {
+			d := floorCRCTable[1<<b]
+			for i := len(body) - 1; i >= 0; i-- {
+				if d == syndrome && body[i]^1<<b != ' ' {
+					try(i, 1<<b)
+				}
+				d = floorCRCTable[byte(d)] ^ d>>8
+			}
+		}
+	}
+	return found, n == 1
+}
+
+// taintKey records a taint of kind on k, from the damaged line at off: into
+// the taint set, or, past its cap, as the taint set's overflow, or, for a
+// line no key can be read from, as unattributable damage at off.
+func (s *logState) taintKey(off int64, kind taintKind, k floorKey) {
 	switch kind {
 	case taintName:
 		nk := nameKey{k.scope, k.name}

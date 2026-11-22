@@ -329,9 +329,22 @@ func (s *FileStore) writeFileAt(dfd int, name string, data []byte, uid, gid uint
 // holds f.log.mu.
 func (f *fileFloorLog) unattributable(state *logState) bool {
 	at, ok := state.unattributedAt()
-	if !ok {
-		return false
-	}
+	return ok && f.counts(state, at)
+}
+
+// unrecovered reports whether the floor holds an unrecovered flip that
+// counts (logState.unrecovered), which refuses every generation of every
+// key, known or not: one that starts at or past an acknowledgement's
+// watermark for this file, or any, with none. The root acknowledgement
+// lifts it as it lifts other unattributable damage. The caller holds
+// f.log.mu.
+func (f *fileFloorLog) unrecovered(state *logState) bool {
+	return state.unrecovered && f.counts(state, state.unrecoveredAt)
+}
+
+// counts reports whether damage that starts at at counts: at or past an
+// acknowledgement's watermark for this file, or any, with none.
+func (f *fileFloorLog) counts(state *logState, at int64) bool {
 	a, ok := f.log.s.readFloorAck()
 	if !ok || a.ino != state.ino || a.birth != state.birth {
 		return true

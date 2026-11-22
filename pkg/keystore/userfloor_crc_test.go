@@ -76,27 +76,32 @@ func TestFloorLineCarriesChecksum(t *testing.T) {
 }
 
 // Every truncation and every single-bit flip of every valid line never
-// parses, and is classified so that it taints its own key or counts as
-// unattributable damage: a closed tear never reads as a lower sequence.
+// parses. A truncation is classified so that it taints its own key or
+// counts as unattributable: a closed tear never reads as a lower sequence.
+// A flip is corrected to its own line, so it taints its own key, whatever
+// field the bit was in.
 func TestEveryTruncationAndFlipNeverParses(t *testing.T) {
 	for _, c := range crcTestLines(t) {
 		body := c.line[:len(c.line)-1]
 		for n := 1; n < len(body); n++ {
-			checkDamagedLine(t, body[:n], c.key)
+			checkTornLine(t, body[:n], c.key)
 		}
 		for i := range body {
 			for bit := range 8 {
 				p := append([]byte(nil), body...)
 				p[i] ^= 1 << bit
 				checkDamagedLine(t, p, c.key)
+				if got, ok := correctFloorFlip(p); !ok || got != c.key {
+					t.Fatalf("%q: corrected to %+v, %v, want %+v", p, got, ok, c.key)
+				}
 			}
 		}
 	}
 }
 
-// checkDamagedLine fails unless p does not parse and, recorded as a
-// skipped line, taints k or counts as unattributable.
-func checkDamagedLine(t *testing.T, p []byte, k floorKey) {
+// checkTornLine fails unless p does not parse and, recorded as a skipped
+// line, taints k or counts as unattributable.
+func checkTornLine(t *testing.T, p []byte, k floorKey) {
 	t.Helper()
 	if r, err := parseFloorLine(p); err == nil {
 		t.Fatalf("%q parses, as %+v", p, r)
@@ -106,6 +111,50 @@ func checkDamagedLine(t *testing.T, p []byte, k floorKey) {
 	if _, unattrib := st.unattributedAt(); !unattrib && !st.tainted(k) {
 		kind, got := classifyFloorDamage(p)
 		t.Fatalf("%q: classified %v %+v, which neither taints %+v nor is unattributable", p, kind, got, k)
+	}
+}
+
+// checkDamagedLine fails unless p, a whole line flipped in place, does not
+// parse and, recorded as a skipped line, taints k or sets the floor-wide
+// unrecovered flip: unattributable damage alone would let the floor serve
+// a generation a flipped tombstone of k buried.
+func checkDamagedLine(t *testing.T, p []byte, k floorKey) {
+	t.Helper()
+	if r, err := parseFloorLine(p); err == nil {
+		t.Fatalf("%q parses, as %+v", p, r)
+	}
+	var st logState
+	st.taintLine(0, p)
+	if !st.unrecovered && !st.tainted(k) {
+		kind, got := classifyFloorDamage(p)
+		t.Fatalf("%q: classified %v %+v, which neither taints %+v nor is an unrecovered flip", p, kind, got, k)
+	}
+}
+
+// A whole line flipped in more than one bit has no unique single-bit
+// correction: it sets the unrecovered flip, which refuses every known
+// generation and its live line.
+func TestUnrecoveredFlipRefusesKnownGenerations(t *testing.T) {
+	s, server, _ := fileLogScope(t)
+	ff := s.userFloor.(*fileFloorLog)
+	gen := entryGeneration(t, server, "token")
+	tomb, err := tombLine("user/1002", "gone", guid(0x31))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tomb[len("user/100")] ^= 0x01
+	tomb[len("user/1002 go")] ^= 0x01
+	var st logState
+	st.taintLine(0, tomb[:len(tomb)-1])
+	if !st.unrecovered {
+		t.Fatalf("%q: no unrecovered flip", tomb)
+	}
+	appendLogBytes(t, s, userFloorLogName, append([]byte{'\n'}, tomb...))
+	if _, err := ff.floor("user/1001", "token", gen); !errors.Is(err, errFloorDegraded) {
+		t.Fatalf("a known generation past an unrecovered flip: %v, want errFloorDegraded", err)
+	}
+	if refused, err := ff.liveRefused(floorKey{"user/1001", "token", gen}); err != nil || !refused {
+		t.Fatalf("a known generation's live line past an unrecovered flip: %v, %v, want refused", refused, err)
 	}
 }
 
