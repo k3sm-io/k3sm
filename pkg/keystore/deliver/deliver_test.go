@@ -34,12 +34,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	k8stesting "k8s.io/client-go/testing"
 
 	"k3sm.io/k3sm/pkg/addons"
@@ -160,7 +163,7 @@ func (h *harness) own(t *testing.T, objs ...*corev1.Secret) {
 	for _, o := range objs {
 		st.Set(o.Namespace, o.Name, string(o.UID))
 	}
-	if err := WriteState(filepath.Join(h.dir, StateFileName), st, func(*os.File) error { return nil }); err != nil {
+	if err := WriteState(filepath.Join(h.dir, StateFileName), st, testCheck, func(*os.File) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -701,7 +704,7 @@ func TestWriteAtomic(t *testing.T) {
 	path := filepath.Join(dir, FileName)
 	var chowned string
 	d := Declaration{Version: SchemaVersion, Targets: []Target{{Name: "a", Namespace: "p"}}}
-	if err := Write(path, d, func(f *os.File) error { chowned = f.Name(); return nil }); err != nil {
+	if err := Write(path, d, testCheck, func(f *os.File) error { chowned = f.Name(); return nil }); err != nil {
 		t.Fatal(err)
 	}
 	fi, err := os.Lstat(path)
@@ -714,7 +717,7 @@ func TestWriteAtomic(t *testing.T) {
 	if filepath.Dir(chowned) != dir || chowned == path {
 		t.Fatalf("chown saw %q, want a temp file beside the declaration", chowned)
 	}
-	if err := Write(path, d, func(*os.File) error { return errors.New("EPERM") }); err == nil {
+	if err := Write(path, d, testCheck, func(*os.File) error { return errors.New("EPERM") }); err == nil {
 		t.Fatal("a failed chown did not fail the write")
 	}
 	names, err := os.ReadDir(dir)
@@ -1099,5 +1102,172 @@ func TestReconcilerLogsNoValue(t *testing.T) {
 				t.Fatalf("the log carries a stored value (%q)\n%s", form, logs)
 			}
 		}
+	}
+}
+
+// hangingClient is a clientset whose Secret Gets in namespace hung block
+// until their context is done, as a wedged apiserver call would.
+type hangingClient struct {
+	kubernetes.Interface
+	hung string
+}
+
+func (c hangingClient) CoreV1() typedcorev1.CoreV1Interface {
+	return hangingCore{c.Interface.CoreV1(), c.hung}
+}
+
+type hangingCore struct {
+	typedcorev1.CoreV1Interface
+	hung string
+}
+
+func (c hangingCore) Secrets(ns string) typedcorev1.SecretInterface {
+	return hangingSecrets{c.CoreV1Interface.Secrets(ns), ns == c.hung}
+}
+
+type hangingSecrets struct {
+	typedcorev1.SecretInterface
+	hang bool
+}
+
+func (s hangingSecrets) Get(ctx context.Context, name string, opts metav1.GetOptions) (*corev1.Secret, error) {
+	if s.hang {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return s.SecretInterface.Get(ctx, name, opts)
+}
+
+// TestReconcilerTargetTimeout: a target whose apiserver call hangs is given
+// up at its own deadline, and the next target is still delivered in the same
+// sweep (G20).
+func TestReconcilerTargetTimeout(t *testing.T) {
+	h := newHarness(t, true, false)
+	h.store.set("api-token", 1, []byte("tok"))
+	h.declare(t, Target{Name: "api-token", Namespace: "hung"}, Target{Name: "api-token", Namespace: "payments"})
+	h.r.client = hangingClient{h.client, "hung"}
+	h.r.targetTimeout = time.Millisecond
+	h.r.Sweep(context.Background())
+	if got := string(h.secret(t, "payments", "api-token").Data[DefaultDataKey]); got != "tok" {
+		t.Fatalf("the target after a hung one was not delivered: %q", got)
+	}
+	if !strings.Contains(h.logs.String(), "cannot read the Secret") || !strings.Contains(h.logs.String(), "deadline exceeded") {
+		t.Fatalf("the hung call is not logged as timed out\n%s", h.logs.String())
+	}
+}
+
+// TestNewTargetTimeout: production gives each target ten seconds.
+func TestNewTargetTimeout(t *testing.T) {
+	if got := New(Config{}).targetTimeout; got != 10*time.Second {
+		t.Fatalf("target timeout %v, want 10s", got)
+	}
+}
+
+// TestWatchLogsErrors: an fsnotify error is logged at Warn, and events for
+// the declaration still go through.
+func TestWatchLogsErrors(t *testing.T) {
+	events := make(chan fsnotify.Event)
+	errs := make(chan error)
+	out := make(chan struct{}, 1)
+	logs := &syncBuffer{}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		forwardEvents(events, errs, FileName, out, slog.New(slog.NewTextHandler(logs, nil)))
+	}()
+	errs <- errors.New("queue overflow")
+	events <- fsnotify.Event{Name: filepath.Join("/x", FileName)}
+	<-out
+	close(events)
+	<-done
+	if !strings.Contains(logs.String(), `level=WARN`) || !strings.Contains(logs.String(), "queue overflow") {
+		t.Fatalf("the watch error is not logged at Warn\n%s", logs.String())
+	}
+}
+
+// TestDataRootDirectoryChecked: Read, Write and Lock refuse a data root that
+// is group- or other-writable, not root's (the production check), or a
+// symlink, judged on the directory's own descriptor (G19).
+func TestDataRootDirectoryChecked(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T) (dir string, check FileCheck)
+	}{
+		{"group-writable", func(t *testing.T) (string, FileCheck) {
+			dir := t.TempDir()
+			if err := os.Chmod(dir, 0o775); err != nil {
+				t.Fatal(err)
+			}
+			return dir, testCheck
+		}},
+		{"other-writable", func(t *testing.T) (string, FileCheck) {
+			dir := t.TempDir()
+			if err := os.Chmod(dir, 0o757); err != nil {
+				t.Fatal(err)
+			}
+			return dir, testCheck
+		}},
+		{"not root's", func(t *testing.T) (string, FileCheck) {
+			dir := t.TempDir()
+			if os.Geteuid() == 0 {
+				if err := os.Chown(dir, 1, 1); err != nil {
+					t.Fatal(err)
+				}
+			}
+			return dir, RootCheck
+		}},
+		{"symlink", func(t *testing.T) (string, FileCheck) {
+			parent := t.TempDir()
+			real := filepath.Join(parent, "real")
+			if err := os.Mkdir(real, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			link := filepath.Join(parent, "link")
+			if err := os.Symlink(real, link); err != nil {
+				t.Fatal(err)
+			}
+			return link, testCheck
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir, check := tc.setup(t)
+			path := filepath.Join(dir, FileName)
+			// A declaration the file check itself accepts, so only the
+			// directory can be what is refused.
+			if err := os.WriteFile(path, []byte(`{"version":1,"targets":[]}`), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			fileCheck := func(fs.FileInfo) error { return nil }
+			if _, _, _, err := Read(path, OpenNoFollow, dirOnly(check, fileCheck)); !errors.Is(err, ErrRefused) {
+				t.Errorf("Read: %v, want ErrRefused", err)
+			}
+			if _, err := ReadState(filepath.Join(dir, StateFileName), OpenNoFollow, dirOnly(check, fileCheck)); !errors.Is(err, ErrRefused) {
+				t.Errorf("ReadState: %v, want ErrRefused", err)
+			}
+			noChown := func(*os.File) error { return nil }
+			if err := Write(path, Declaration{Version: SchemaVersion}, check, noChown); !errors.Is(err, ErrRefused) {
+				t.Errorf("Write: %v, want ErrRefused", err)
+			}
+			if err := WriteState(filepath.Join(dir, StateFileName), State{}, check, noChown); !errors.Is(err, ErrRefused) {
+				t.Errorf("WriteState: %v, want ErrRefused", err)
+			}
+			if unlock, err := Lock(context.Background(), filepath.Join(dir, LockName), check, nil); !errors.Is(err, ErrRefused) {
+				if unlock != nil {
+					unlock()
+				}
+				t.Errorf("Lock: %v, want ErrRefused", err)
+			}
+		})
+	}
+}
+
+// dirOnly applies dir to a directory and file to anything else, so a test
+// can refuse the directory while accepting the file in it.
+func dirOnly(dir, file FileCheck) FileCheck {
+	return func(fi fs.FileInfo) error {
+		if fi.IsDir() {
+			return dir(fi)
+		}
+		return file(fi)
 	}
 }

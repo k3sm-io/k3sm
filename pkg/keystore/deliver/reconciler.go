@@ -62,6 +62,10 @@ const FingerprintAnnotation = "k3sm.io/keystore-fingerprint"
 // Secrets while secrets encryption is off.
 const AllowPlaintextFlag = "allow-plaintext-secrets-delivery"
 
+// targetTimeout bounds one target's calls, so a hung apiserver call cannot
+// stall the sweep for every target after it.
+const targetTimeout = 10 * time.Second
+
 // changeDebounce coalesces a burst of filesystem events (the CLI's
 // write-rename, an editor's write-rename-chmod) into one sweep.
 const changeDebounce = 500 * time.Millisecond
@@ -111,6 +115,8 @@ type Reconciler struct {
 	// chown hands a new state file to its owner (production: ChownRoot).
 	chown    func(f *os.File) error
 	interval time.Duration
+	// targetTimeout bounds each target's apiserver and store calls.
+	targetTimeout time.Duration
 	// newTicker returns the periodic sweep's channel and its stop.
 	newTicker func(d time.Duration) (<-chan time.Time, func())
 	// after is the debounce timer.
@@ -149,12 +155,15 @@ func New(cfg Config) *Reconciler {
 		check:          RootCheck,
 		chown:          ChownRoot,
 		interval:       addons.ManifestSweepInterval,
+		targetTimeout:  targetTimeout,
 		newTicker: func(d time.Duration) (<-chan time.Time, func()) {
 			t := time.NewTicker(d)
 			return t.C, t.Stop
 		},
-		after:       time.After,
-		watch:       watchFile,
+		after: time.After,
+		watch: func(dir, name string) (<-chan struct{}, func(), error) {
+			return watchFile(dir, name, logger)
+		},
 		targetState: map[string]string{},
 	}
 }
@@ -197,7 +206,7 @@ func (r *Reconciler) Run(ctx context.Context) {
 // watchFile watches dir with fsnotify and forwards an event that names name.
 // The declaration is replaced by rename, so the directory is watched, not the
 // file. The forwarding goroutine ends when the returned close is called.
-func watchFile(dir, name string) (<-chan struct{}, func(), error) {
+func watchFile(dir, name string, logger *slog.Logger) (<-chan struct{}, func(), error) {
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, nil, err
@@ -210,31 +219,39 @@ func watchFile(dir, name string) (<-chan struct{}, func(), error) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		defer close(out)
-		for {
-			select {
-			case ev, ok := <-w.Events:
-				if !ok {
-					return
-				}
-				if filepath.Base(ev.Name) != name {
-					continue
-				}
-				select {
-				case out <- struct{}{}:
-				default: // a change is already pending; the debounce coalesces it
-				}
-			case _, ok := <-w.Errors:
-				if !ok {
-					return
-				}
-			}
-		}
+		forwardEvents(w.Events, w.Errors, name, out, logger)
 	}()
 	return out, func() {
 		_ = w.Close() // closes Events and Errors, which ends the goroutine
 		<-done
 	}, nil
+}
+
+// forwardEvents sends on out (without blocking) for each event naming name,
+// until events or errs is closed.
+func forwardEvents(events <-chan fsnotify.Event, errs <-chan error, name string, out chan<- struct{}, logger *slog.Logger) {
+	defer close(out)
+	for {
+		select {
+		case ev, ok := <-events:
+			if !ok {
+				return
+			}
+			if filepath.Base(ev.Name) != name {
+				continue
+			}
+			select {
+			case out <- struct{}{}:
+			default: // a change is already pending; the debounce coalesces it
+			}
+		case err, ok := <-errs:
+			if !ok {
+				return
+			}
+			// The periodic sweep still runs; a lost event only delays a change.
+			logger.Warn("keystore delivery: filesystem watch error; a change may wait for the periodic sweep", "err", err)
+		}
+	}
 }
 
 // Sweep reads the declaration once and converges every target in it.
@@ -290,7 +307,7 @@ func (r *Reconciler) Sweep(ctx context.Context) {
 		}
 	}
 	if sw.state.Retain(func(ns, name string) bool { return declared[stateKey(ns, name)] }) {
-		if err := WriteState(r.statePath, sw.state, r.chown); err != nil {
+		if err := WriteState(r.statePath, sw.state, r.check, r.chown); err != nil {
 			r.logger.Warn("keystore delivery: cannot drop withdrawn targets from the state file; will retry", "file", r.statePath, "err", err)
 		}
 	}
@@ -324,6 +341,8 @@ func (r *Reconciler) note(t Target, state string, level slog.Level, msg string, 
 // (present, with the UID this server recorded when it created it, at another
 // value), or leave it alone (any other Secret, labelled or not).
 func (r *Reconciler) converge(ctx context.Context, sw *sweep, t Target) {
+	ctx, cancel := context.WithTimeout(ctx, r.targetTimeout)
+	defer cancel()
 	if !delivers(r.encryptionOn, r.allowPlaintext) {
 		r.note(t, "refused:encryption-off", slog.LevelWarn,
 			"target refused; start the server with --"+AllowPlaintextFlag+" to deliver anyway",
@@ -426,7 +445,7 @@ func (r *Reconciler) notOurs(sw *sweep, t Target, cur *corev1.Secret) string {
 // could not then be recorded, and again after the create with the new UID.
 func (r *Reconciler) create(ctx context.Context, sw *sweep, t Target, ver keystore.Version, want string, value []byte) {
 	if !sw.recorded {
-		if err := WriteState(r.statePath, sw.state, r.chown); err != nil {
+		if err := WriteState(r.statePath, sw.state, r.check, r.chown); err != nil {
 			r.note(t, "error:state:"+err.Error(), slog.LevelWarn, "cannot write the state file, so the Secret is not created; will retry", "file", r.statePath, "err", err)
 			return
 		}
@@ -453,7 +472,7 @@ func (r *Reconciler) create(ctx context.Context, sw *sweep, t Target, ver keysto
 		return
 	}
 	sw.state.Set(t.Namespace, t.Secret(), string(created.UID))
-	if err := WriteState(r.statePath, sw.state, r.chown); err != nil {
+	if err := WriteState(r.statePath, sw.state, r.check, r.chown); err != nil {
 		r.note(t, "error:record:"+err.Error(), slog.LevelError, "created the Secret but cannot record it, so later sweeps leave it alone; delete it to have it created again", "file", r.statePath, "err", err)
 		return
 	}

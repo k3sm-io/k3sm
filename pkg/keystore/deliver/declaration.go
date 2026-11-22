@@ -236,6 +236,11 @@ func Read(path string, open Opener, check FileCheck) (d Declaration, fi fs.FileI
 // descriptor with check: a regular file, passing check, at most MaxFileBytes.
 // A missing file is exists false and no error.
 func readChecked(path string, open Opener, check FileCheck) (data []byte, fi fs.FileInfo, exists bool, err error) {
+	if err := checkDir(filepath.Dir(path), check); errors.Is(err, fs.ErrNotExist) {
+		return nil, nil, false, nil
+	} else if err != nil {
+		return nil, nil, true, err
+	}
 	f, err := open(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil, false, nil
@@ -275,17 +280,20 @@ func readChecked(path string, open Opener, check FileCheck) (data []byte, fi fs.
 // written and fsynced, renamed over path, and the directory fsynced. The
 // rename replaces a symlink at path rather than following it. The temp file
 // is removed on every error return.
-func Write(path string, d Declaration, chown func(f *os.File) error) error {
+func Write(path string, d Declaration, check FileCheck, chown func(f *os.File) error) error {
 	data, err := d.Marshal()
 	if err != nil {
 		return fmt.Errorf("encode the declaration: %w", err)
 	}
-	return writeAtomic(path, data, FileMode, chown)
+	return writeAtomic(path, data, FileMode, check, chown)
 }
 
 // writeAtomic installs data at path with mode, as Write describes.
-func writeAtomic(path string, data []byte, mode os.FileMode, chown func(f *os.File) error) (err error) {
+func writeAtomic(path string, data []byte, mode os.FileMode, check FileCheck, chown func(f *os.File) error) (err error) {
 	dir := filepath.Dir(path)
+	if err := checkDir(dir, check); err != nil {
+		return err
+	}
 	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-")
 	if err != nil {
 		return fmt.Errorf("create a temp file: %w", err)
@@ -309,6 +317,34 @@ func writeAtomic(path string, data []byte, mode os.FileMode, chown func(f *os.Fi
 	defer func() { _ = d2.Close() }() // read-only; synced below
 	if err := d2.Sync(); err != nil {
 		return fmt.Errorf("sync the directory: %w", err)
+	}
+	return nil
+}
+
+// checkDir judges the data root at dir, which holds the declaration, the
+// state file and the lock: opened O_NOFOLLOW|O_DIRECTORY, so a symlink is
+// refused, and judged with check on that descriptor (production: owned by
+// root and not group- or other-writable), so no one but root can swap a file
+// in it. It is the keystore floor's data-root check (pkg/keystore), without
+// the floor's flock. A missing directory is returned as fs.ErrNotExist.
+func checkDir(dir string, check FileCheck) error {
+	d, err := os.OpenFile(dir, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_DIRECTORY, 0)
+	if errors.Is(err, syscall.ELOOP) || errors.Is(err, syscall.ENOTDIR) {
+		return fmt.Errorf("%w: the data root is not a directory (a symlink?)", ErrRefused)
+	}
+	if err != nil {
+		return fmt.Errorf("open the data root: %w", err)
+	}
+	defer func() { _ = d.Close() }() // read-only
+	fi, err := d.Stat()
+	if err != nil {
+		return fmt.Errorf("stat the data root: %w", err)
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("%w: the data root is not a directory", ErrRefused)
+	}
+	if err := check(fi); err != nil {
+		return fmt.Errorf("%w: the data root: %w", ErrRefused, err)
 	}
 	return nil
 }

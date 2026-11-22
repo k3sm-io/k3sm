@@ -152,7 +152,7 @@ func keysDeliver(ctx context.Context, args []string, env keysEnv) int {
 	if len(d.Targets) > keydeliver.MaxTargets {
 		return v.failf(keysRefused, "the declaration already holds %d targets, the limit", keydeliver.MaxTargets)
 	}
-	if err := keydeliver.Write(path, d, env.deliveryChown); err != nil {
+	if err := keydeliver.Write(path, d, env.deliveryCheck, env.deliveryChown); err != nil {
 		return v.failf(keysRefused, "write the delivery declaration: %v", err)
 	}
 	verb := "declared"
@@ -202,7 +202,7 @@ func keysUndeliver(ctx context.Context, args []string, env keysEnv) int {
 		// checked as a name.
 		return v.failf(keysRefused, "no delivery of %s is declared in that namespace", qualify(name))
 	}
-	if err := keydeliver.Write(path, d, env.deliveryChown); err != nil {
+	if err := keydeliver.Write(path, d, env.deliveryCheck, env.deliveryChown); err != nil {
 		return v.failf(keysRefused, "write the delivery declaration: %v", err)
 	}
 	fmt.Fprintf(env.stdout, "withdrew %d delivery target(s) of %s in namespace %s; %s\n", n, qualify(name), *ns, keysUndeliverHint)

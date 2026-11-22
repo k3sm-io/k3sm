@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"syscall"
 	"time"
 )
@@ -53,10 +54,14 @@ func DefaultLockBusy() <-chan time.Time { return time.After(lockRetryWait) }
 // refused, and judged with check on the opened descriptor (production:
 // RootCheck) before it is locked. A held lock is retried lockAttempts times,
 // waiting on busy (nil is DefaultLockBusy) between attempts, or until ctx is
-// done. The returned function releases it.
+// done. The data root holding it is judged first, as Read and Write judge
+// it. The returned function releases it.
 func Lock(ctx context.Context, path string, check FileCheck, busy func() <-chan time.Time) (unlock func(), err error) {
 	if busy == nil {
 		busy = DefaultLockBusy
+	}
+	if err := checkDir(filepath.Dir(path), check); err != nil {
+		return nil, err
 	}
 	f, err := os.OpenFile(path, os.O_RDONLY|os.O_CREATE|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, lockMode)
 	if errors.Is(err, syscall.ELOOP) {

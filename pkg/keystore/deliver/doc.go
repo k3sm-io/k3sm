@@ -62,7 +62,11 @@ limitations under the License.
 //
 // It never lists, never deletes and touches no other kind, so withdrawing a
 // target (`k3sm keys undeliver`) leaves its Secret in place. A per-target
-// failure is logged and the sweep moves on. It sweeps on start, on a
+// failure is logged and the sweep moves on; each target's calls have their
+// own ten-second deadline, so one hung call cannot stall the rest. The data
+// root holding the declaration, the state file and the lock is itself judged
+// on its descriptor (O_NOFOLLOW|O_DIRECTORY, root's, not shared-writable)
+// before any of them is read or written. It sweeps on start, on a
 // debounced change to the declaration, and every addons.ManifestSweepInterval.
 //
 // # Encryption

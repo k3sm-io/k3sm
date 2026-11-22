@@ -151,10 +151,10 @@ func ReadState(path string, open Opener, check FileCheck) (State, error) {
 
 // WriteState installs s at path, mode StateFileMode, atomically, as Write
 // installs a declaration.
-func WriteState(path string, s State, chown func(f *os.File) error) error {
+func WriteState(path string, s State, check FileCheck, chown func(f *os.File) error) error {
 	data, err := s.Marshal()
 	if err != nil {
 		return fmt.Errorf("encode the delivery state: %w", err)
 	}
-	return writeAtomic(path, data, StateFileMode, chown)
+	return writeAtomic(path, data, StateFileMode, check, chown)
 }

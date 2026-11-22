@@ -249,17 +249,18 @@ check G18 "delivery is refused while encryption is off, before any apiserver cal
 	deliver:TestDeliveryRefusedWhileEncryptionOff deliver:TestDeliveryOverrideAllowsPlaintext deliver:TestDeliveredTargetStaysWhenOverrideRemoved \
 	cmd:TestKeysDeliveryServerFlag cmd:TestKeysDeliveryServerConfig cmd:TestKeysDeliverEncryptionOffNote \
 	cmd:TestKeysDeliveryServerGate
-check G19 "the delivery declaration is root-owned and not group- or other-writable, opened O_NOFOLLOW and judged on the descriptor, size- and count-capped and parsed strictly; anything else is refused whole, by the reconciler and by the verbs; the verbs serialize on a root-owned lock file judged the same way" \
+check G19 "the delivery declaration is root-owned and not group- or other-writable, opened O_NOFOLLOW and judged on the descriptor, size- and count-capped and parsed strictly; anything else is refused whole, by the reconciler and by the verbs; the verbs serialize on a root-owned lock file judged the same way; the data root holding them is root's and not shared-writable, judged on its descriptor" \
 	deliver:TestDeclarationRootOwned deliver:TestDeclarationOpenedWithNoFollow cmd:TestKeysDeliverRefusals \
 	deliver:TestLockRefusesUntrustedFile deliver:TestLockBoundedWait cmd:TestKeysDeliverWritersSerialize \
-	deliver:TestNewDefaultsBindRoot cmd:TestKeysEnvDefaultsBindRoot
+	deliver:TestNewDefaultsBindRoot cmd:TestKeysEnvDefaultsBindRoot deliver:TestDataRootDirectoryChecked
 check G20 "the reconciler only gets, creates and updates the Opaque Secrets it created, proven by the UID it recorded, not the label: an unlabelled, foreign, pre-created or recreated Secret is untouched, and no list or delete is ever made; rm of a declared entry warns that its Secret keeps the value; no stored value reaches the log or the verbs' output" \
 	deliver:TestReconcilerTouchesOnlyLabelledSecrets deliver:TestReconcilerRedeliversOnRotation \
 	deliver:TestReconcilerSkipsLabelledNonOpaque deliver:TestReconcilerContinuesAfterTargetFailure \
 	deliver:TestReconcilerRedeliversAfterRmPut deliver:TestReconcilerReappliesChangedDataKey \
 	deliver:TestReconcilerNeverWritesTenantPrecreated deliver:TestReconcilerDoesNotAdoptRecreated \
 	deliver:TestReconcilerRecordsCreatedUID deliver:TestReconcilerReappliesDrift deliver:TestReconcilerImmutableOwned \
-	cmd:TestKeysRmWarnsDeclared deliver:TestReconcilerLogsNoValue cmd:TestKeysDeliveryPrintsNoValue
+	cmd:TestKeysRmWarnsDeclared deliver:TestReconcilerLogsNoValue cmd:TestKeysDeliveryPrintsNoValue \
+	deliver:TestReconcilerTargetTimeout deliver:TestNewTargetTimeout deliver:TestWatchLogsErrors
 check G21 "the rollback recipe is a byte-exact round trip: show --reveal into rotate --in -, the new version compared with version N byte for byte (bytes.Equal, as cmp), opaque and Ed25519" \
 	cmd:TestKeysRollbackRoundTrip
 # hack/ci.sh does not run this script, so G22 cannot recurse into it.
