@@ -1196,9 +1196,12 @@ below carries them over.
 not a symlink, owned by root and not group- or other-writable, at most 4 MiB, in a directory
 judged on its descriptor as the data root is: owned by root and not group- or other-writable,
 so no other user can swap the file in) and parses it
-with the same strict parser, then, under `keystore-lock` and then `keystore/.lock`, adds every
+with the same strict parser, then, under `keystore-lock` alone, adds every
 burial it records that the restored floor lacks, oldest first, each at the next delete
-sequence, so the merged burials keep their order. So a key created after the backup and
+sequence, so the merged burials keep their order. It writes only the root-owned floor and
+nothing under `keystore/`, so it never takes `keystore/.lock`, which the service user can hold
+or replace to stop it; readers need none against it, since the floor is replaced by an atomic
+rename. So a key created after the backup and
 revoked before the restore stays refused, and so does every generation buried under a name
 after the backup, which re-running `rm` could never record. A generation the moved-aside
 floor buries and the restored floor holds live is buried too, its live record cleared: the

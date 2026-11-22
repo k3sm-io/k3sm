@@ -20,7 +20,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -67,8 +66,8 @@ type MergeReport struct {
 // "Pointer sequence and floor", "Restoring with the saved floor"). The file
 // is read as the floor is, judged on its descriptor (a regular file owned by
 // root and not group- or other-writable, under maxFloorSize) and parsed by
-// parseFloor. Under keystore-lock and then keystore/.lock (§ Concurrency) it
-// adds each burial the live floor lacks, in the order the file buried them.
+// parseFloor. Under keystore-lock alone (§ Concurrency; it writes nothing
+// under keystore/, so it never takes keystore/.lock) it adds each burial the live floor lacks, in the order the file buried them.
 // A generation the live floor holds live is buried too (BuriedLive): it was
 // deleted after the backup, so the merge fails closed, unless keep names
 // the entry, whose restored generation then stays live (Kept). Each live
@@ -108,15 +107,10 @@ func (s *FileStore) mergeFloor(ctx context.Context, path string, keep []string) 
 		return r, err
 	}
 	defer fdir.unlock()
-	_, done, err := s.openLocked(ctx, false, true)
-	switch {
-	case errors.Is(err, fs.ErrNotExist):
-		// No entries directory, so no .lock to take.
-	case err != nil:
-		return r, err
-	default:
-		defer done()
-	}
+	// Only keystore-lock: the merge writes the root-owned floor and nothing
+	// under keystore/, so it takes no keystore/.lock, which the service user
+	// can hold or replace to stop it. Readers need no .lock against it
+	// either: the floor is replaced by an atomic rename.
 	var capDropped []pruned
 	_, dropped, err := fdir.updatePruned(func(fl floor) bool {
 		r, capDropped = fl.merge(from, kept)
