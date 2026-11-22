@@ -98,10 +98,10 @@ func (st *mergeStaging) close() {
 
 // openStaging opens pre-restore.d through l.root, the data root the lock
 // judged: a real directory, never followed, owned by root (floorUID) and
-// granting nothing to group or others. The recipe's ditto keeps the backup's
-// owner inside it, so the directory's own mode is what keeps the service
-// user out of both trees, and a mode that let it search pre-restore.d would
-// let it write into the staged tree. An absent pre-restore.d is no staging.
+// granting nothing to group or others, by its mode or an extended ACL. The
+// recipe's ditto keeps the backup's owner inside it, so the directory's own
+// permissions are what keep the service user out of both trees, and any
+// that let it search pre-restore.d would let it write into the staged tree. An absent pre-restore.d is no staging.
 // It also opens the directory the store's Dir is in and records whether
 // anything is at Dir.
 func (s *FileStore) openStaging(l *floorLock) (st *mergeStaging, err error) {
@@ -151,6 +151,14 @@ func (s *FileStore) openStaging(l *floorLock) (st *mergeStaging, err error) {
 	}
 	if perm := opened.Mode().Perm(); perm&0o077 != 0 {
 		return st, fmt.Errorf("%w: %s is mode %04o: it must grant nothing to group or others (sudo mkdir -m 0700)", errFloorUntrusted, preRestoreDirName, perm)
+	}
+	// An ACL entry grants past the mode, so one on pre-restore.d could let
+	// the service user into the staged tree; it is read on the descriptor.
+	switch acl, err := hasExtendedACL(int(st.dirF.Fd())); {
+	case err != nil:
+		return st, fmt.Errorf("%s: %w", preRestoreDirName, err)
+	case acl:
+		return st, fmt.Errorf("%w: %s has an extended ACL, which can grant past its mode: it must grant nothing to anyone but root (sudo chmod -N %s removes it)", errFloorUntrusted, preRestoreDirName, preRestoreDirName)
 	}
 	switch fi, err := st.dir.Lstat(stagedTreeName); {
 	case errors.Is(err, fs.ErrNotExist):

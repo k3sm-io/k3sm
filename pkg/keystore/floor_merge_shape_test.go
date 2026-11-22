@@ -423,3 +423,30 @@ func TestParseRetired(t *testing.T) {
 		}
 	}
 }
+
+// TestOpenStagingRefusesACL (U192): pre-restore.d with an extended ACL is
+// refused, dry run included, nothing written: its mode is what keeps the
+// service user out of the staged tree, and an ACL entry grants past it.
+func TestOpenStagingRefusesACL(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Log("extended ACLs are read on darwin only")
+		return
+	}
+	s, server := newTestStore(t)
+	stageRecipe(t, s, server, 0)
+	if out, err := exec.Command("/bin/chmod", "+a", "everyone allow list,search", stagePath(s)).CombinedOutput(); err != nil {
+		t.Fatalf("chmod +a: %v: %s", err, out)
+	}
+	before, err := os.ReadFile(floorPath(server))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, dry := range []bool{true, false} {
+		if _, err := s.MergeFloor(context.Background(), MergeOptions{DryRun: dry}); !errors.Is(err, errFloorUntrusted) || !strings.Contains(err.Error(), "extended ACL") {
+			t.Fatalf("MergeFloor (dry run %v) with an ACL on pre-restore.d: %v, want it refused naming the ACL", dry, err)
+		}
+	}
+	if after, _ := os.ReadFile(floorPath(server)); !bytes.Equal(after, before) {
+		t.Fatal("live floor changed by the refused merge")
+	}
+}
