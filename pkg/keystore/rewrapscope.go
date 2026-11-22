@@ -140,9 +140,11 @@ func checkScopeKeyNew(dir *os.Root, uid string) error {
 
 // checkScopesPlanned re-walks .user after the commit and refuses, as
 // ErrCorrupt, unless the scopes with a scope.key are exactly those plan
-// re-sealed: a scope that appeared or went missing during the run would
-// be left under a master about to be retired.
-func (s *FileStore) checkScopesPlanned(ctx context.Context, root *os.Root, plan []planned) error {
+// re-sealed, each re-opening under next's W: a scope that appeared or went
+// missing during the run, or a scope.key swapped back to an old copy or
+// damaged after its commit, would be left under a master about to be
+// retired.
+func (s *FileStore) checkScopesPlanned(ctx context.Context, root *os.Root, plan []planned, next keys) error {
 	want := map[string]bool{}
 	for _, p := range plan {
 		if p.scope != "" {
@@ -157,6 +159,18 @@ func (s *FileStore) checkScopesPlanned(ctx context.Context, root *os.Root, plan 
 			return err
 		}
 		got[uid] = true
+		if !want[uid] {
+			return nil // refused below, as a scope this rewrap did not plan
+		}
+		r, err := s.readScopeKeyRecord(dir)
+		var pt []byte
+		if err == nil {
+			pt, err = r.open(next.wrap, userScopePrefix+uid)
+			clear(pt)
+		}
+		if err != nil {
+			return fmt.Errorf("%w: the scope key of user/%s does not open under the new master after its commit, so the old master is kept. Run rewrap again, which re-seals a scope key still under the old master; one that opens under neither is damage: restore keystore/%s/%s/%s from a backup or, as root, remove keystore/%s/%s/, then run rewrap again: %w", ErrCorrupt, uid, userScopesName, uid, scopeKeyName, userScopesName, uid, err)
+		}
 		return nil
 	})
 	if err != nil {

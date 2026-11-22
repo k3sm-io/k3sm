@@ -99,3 +99,44 @@ func TestRewrapRefusesDamagedScopeTree(t *testing.T) {
 		}
 	})
 }
+
+// Rewrap re-opens every planned scope.key under the new master's W before
+// it retires the old one: a scope.key swapped back to its old copy, or
+// corrupted, after its commit refuses the swap, and the old master stays.
+func TestRewrapVerifiesScopeKeysBeforeSwap(t *testing.T) {
+	ctx := context.Background()
+	for _, tt := range []struct {
+		name  string
+		after func(old []byte) []byte
+	}{
+		{"swapped back to the old copy", func(old []byte) []byte { return old }},
+		{"corrupted", func(old []byte) []byte {
+			b := bytes.Clone(old)
+			b[len(b)-1] ^= 0xff
+			return b
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s, server, _, _ := seedScopeRewrap(t)
+			master := mustMaster(t, server)
+			key := filepath.Join(scopeDir(server, "1001"), scopeKeyName)
+			old, err := os.ReadFile(key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.step = func(name string) error {
+				if name == "rename "+userScopesName+"/1001/"+scopeKeyName {
+					return os.WriteFile(key, tt.after(old), 0o600)
+				}
+				return nil
+			}
+			err = s.Rewrap(ctx, rewrapKey(1))
+			if !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "does not open under the new master") {
+				t.Fatalf("Rewrap with scope.key %s after its commit: %v, want ErrCorrupt", tt.name, err)
+			}
+			if !bytes.Equal(mustMaster(t, server), master) {
+				t.Fatal("the master was swapped past a scope.key that does not open under it")
+			}
+		})
+	}
+}

@@ -1319,7 +1319,10 @@ test enforces (`TestUserScopeIsUnexported`), so no build ever shipped a scope wi
 `scope.key` does not open, a scope directory or `.user` is not one the store trusts, a
 `scope.key.new` is not a file Rewrap wrote, or `.user` lists past its name bound: re-wrapping
 past it would leave that scope sealed under a master that no longer exists. The refusal is
-`ErrCorrupt` and names the scope. The recovery is root's: restore the scope from a backup, or,
+`ErrCorrupt` and names the scope. After committing every `scope.key`, and before it swaps
+the master, Rewrap re-opens each planned `scope.key` under the new `W`; one swapped back to an
+old copy or damaged since its commit refuses the swap, so the old master is not retired under
+it. The recovery is root's: restore the scope from a backup, or,
 until `rm-scope` lands, remove that scope's directory `.user/<uid>/` by hand (its owner loses
 its values and re-puts them), then run `rewrap` again.
 
