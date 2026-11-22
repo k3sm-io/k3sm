@@ -182,6 +182,9 @@ func FuzzLogSyncDifferential(f *testing.F) {
 				if !maps.Equal(got.pastCap, want.pastCap) {
 					t.Fatalf("%s: incremental past-cap charges %v, from scratch %v", where, got.pastCap, want.pastCap)
 				}
+				if !maps.Equal(got.uidKeys, want.uidKeys) {
+					t.Fatalf("%s: incremental per-uid key counts %v, from scratch %v", where, got.uidKeys, want.uidKeys)
+				}
 				size := int64(len(*lg.inc.buf))
 				for uid := uint32(1001); uid <= 1003; uid++ {
 					ge, we := lg.inc.l.revokeRoom(got, size, uid, maxLogLine), lg.inc.l.revokeRoom(want, size, uid, maxLogLine)
