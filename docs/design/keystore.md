@@ -1526,6 +1526,10 @@ service user can only add to.
   (U24). The residual window is an `ENOSPC` or `EIO` between
   that preflight and the write, or a crash mid-write: either can leave partial bytes the flag
   makes unremovable, and a last line with no newline is damage (no lenient trailing-line rule).
+  Stated plainly: the 4 KiB revocation slack is a heuristic, not a reservation; another writer
+  on the volume can take that space between the `fstatfs` and the `write(2)`, and an `ENOSPC`
+  mid-write then leaves a torn floor tail, damage only root's `floor --rebuild` repairs, and
+  until it runs every user-scope grant, read and `rm` is refused. That residual is accepted.
   So no append merges into a torn line: before it writes, under the lock, the server `pread`s
   the byte at `size-1` on the descriptor it appends through. In the floor a non-empty file
   whose last byte is not a newline refuses the append with a named error naming
@@ -1724,8 +1728,15 @@ That wait is the store `.lock`
   as the tolerant audit reader drops any line it cannot read; in the floor it is damage. In `pkg/keystore` the caps are `Config.LogSoftCap` and `Config.LogHardCap`, and the
   user scope's own revocations past the hard cap (an `rm` or a `withdraw` that revokes) draw on
   the socket margin, `Config.LogRevocationBudget`, counted per uid from the lines that start at
-  or past the hard cap; the reconciler allowance and the per-uid shares arrive with the
-  reconciler and the socket (U51, U67). `FileStore.LogSizes` gives the sizes and caps to the
+  or past the hard cap; only a revocation's line draws on it, and any other line found past
+  the hard cap at append time is refused, never charged to the budget. The reconciler
+  allowance and the per-uid shares arrive with the reconciler and the socket (U51, U67).
+  **The user scope must not be exported, to the socket or any other caller outside
+  `pkg/keystore`, before the per-uid shares (U51) are built:** until then one uid can fill
+  either log to the hard cap for everyone. `TestUserScopeIsUnexported` holds that gate. The
+  `ErrLogFull` texts name the log and which bound was met (the hard cap, the key bound, the
+  reader's bound or the caller's revocation budget), never a size, a key count, a cap or a
+  uid: they reach the socket, and the figures are root's, through `doctor` (`LogSizes`). `FileStore.LogSizes` gives the sizes and caps to the
   `doctor` row. **The reader is bounded**, since the service user can append to either log
   without limit: a log larger than the hard cap plus 1024 uids' revocation budgets plus 1 MiB
   (321 MiB at the defaults) is damage, and so is a floor holding more distinct

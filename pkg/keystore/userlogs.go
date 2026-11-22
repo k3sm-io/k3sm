@@ -648,7 +648,7 @@ func (l *appendLog) room(uid uint32, revoke bool) error {
 		return nil
 	}
 	if !revoke {
-		return fmt.Errorf("%w (%s is %d bytes, its hard cap %d)", ErrLogFull, l.name, st.Size, l.s.logHardCap)
+		return fmt.Errorf("%w (%s is past its hard cap)", ErrLogFull, l.name)
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -677,7 +677,7 @@ func (l *appendLog) keyRoom(f *os.File, st unix.Stat_t) error {
 		return nil
 	}
 	if bound := l.keyBound(); state.keys+grantKeys > bound {
-		return fmt.Errorf("%w (%s holds %d distinct keys, its key bound %d)", ErrLogFull, l.name, state.keys, bound)
+		return fmt.Errorf("%w (%s is at its key bound)", ErrLogFull, l.name)
 	}
 	return nil
 }
@@ -688,10 +688,10 @@ func (l *appendLog) keyRoom(f *os.File, st unix.Stat_t) error {
 // both judge through it.
 func (l *appendLog) revokeRoom(state *logState, size int64, uid uint32, n int64) error {
 	if size+n > l.s.logReadBound() {
-		return fmt.Errorf("%w (%s is %d bytes, the reader's bound %d)", ErrLogFull, l.name, size, l.s.logReadBound())
+		return fmt.Errorf("%w (%s is at the reader's bound)", ErrLogFull, l.name)
 	}
 	if state.pastCap[uid]+n > l.s.logRevokeBudget {
-		return fmt.Errorf("%w (uid %d has spent its %d-byte revocation budget in %s)", ErrLogFull, uid, l.s.logRevokeBudget, l.name)
+		return fmt.Errorf("%w (the caller's revocation budget in %s is spent)", ErrLogFull, l.name)
 	}
 	return nil
 }
@@ -733,7 +733,7 @@ func (l *appendLog) appendLine(uid uint32, line []byte, budget, revoke bool) err
 	}
 	if bound := l.s.logReadBound(); st.Size+int64(len(out)) > bound {
 		// Never make the damage the reader refuses.
-		return fmt.Errorf("%w (%s is %d bytes, the reader's bound %d)", ErrLogFull, l.name, st.Size, bound)
+		return fmt.Errorf("%w (%s is at the reader's bound)", ErrLogFull, l.name)
 	}
 	var state *logState
 	read := func() error {
@@ -753,7 +753,7 @@ func (l *appendLog) appendLine(uid uint32, line []byte, budget, revoke bool) err
 	}
 	if st.Size >= l.s.logHardCap {
 		if !budget || uid == 0 {
-			return fmt.Errorf("%w (%s is %d bytes, its hard cap %d)", ErrLogFull, l.name, st.Size, l.s.logHardCap)
+			return fmt.Errorf("%w (%s is past its hard cap)", ErrLogFull, l.name)
 		}
 		if err := read(); err != nil {
 			return err
@@ -773,7 +773,7 @@ func (l *appendLog) appendLine(uid uint32, line []byte, budget, revoke bool) err
 			return fmt.Errorf("%s: %w", l.name, err)
 		}
 		if bound := l.keyBound(); adds && state.keys >= bound {
-			return fmt.Errorf("%w (%s holds %d distinct keys, its key bound %d)", ErrLogFull, l.name, state.keys, bound)
+			return fmt.Errorf("%w (%s is at its key bound)", ErrLogFull, l.name)
 		}
 	}
 	if err := l.preflight(f, len(out), revoke); err != nil {
@@ -956,10 +956,11 @@ func (f *fileFloorLog) append(scope, name string, gen [generationSize]byte, seq 
 	if err != nil {
 		return err
 	}
-	// Past the hard cap only a revocation's floor line, or the last line of
-	// an operation admitted below it, is reached: every other operation was
-	// refused before its first write (FileStore.admit).
-	return f.log.appendLine(scopeUID(scope), line, true, revoke)
+	// Past the hard cap only a revocation's floor line draws on the uid's
+	// revocation budget: any other line is refused there, and a grant checks
+	// before its first write that its lines start below the cap
+	// (floorGrantRoom).
+	return f.log.appendLine(scopeUID(scope), line, revoke, revoke)
 }
 
 func (f *fileFloorLog) bury(scope, name string, gen [generationSize]byte) error {
