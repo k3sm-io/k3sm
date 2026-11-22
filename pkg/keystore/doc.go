@@ -27,7 +27,8 @@ limitations under the License.
 // writes, Rotate with the pointer sequence and the root-owned floor that
 // refuses an older pointer copied back, and Rewrap, which re-seals every
 // record under a new master in two resumable phases. FileStore satisfies
-// Store. No command uses the package yet.
+// Store. The `k3sm keys` verbs (cmd/k3sm) drive it, and the delivery
+// reconciler (pkg/keystore/deliver) reads it in the server.
 //
 // # Scope (Phase A)
 //
@@ -37,13 +38,13 @@ limitations under the License.
 //     bytes;
 //   - encryption at rest, rotation, listing, deletion, and re-wrapping every
 //     entry under a new master key;
-//   - the operator verbs `sudo k3sm keys put|list|show|rotate|rm|rewrap|deliver`
-//     (planned, not yet present), which will never print a value unless asked
-//     with --reveal;
-//   - a control-plane reconciler, in the style of pkg/addons, that writes one
-//     labelled Secret per declared target, refuses delivery while secrets
-//     encryption is off unless the operator overrides that explicitly, and
-//     modifies only Secrets it created.
+//   - the operator verbs `sudo k3sm keys
+//     put|list|show|rotate|rm|rewrap|deliver|undeliver`, which never print a
+//     value unless asked with --reveal;
+//   - a control-plane reconciler (pkg/keystore/deliver), in the style of
+//     pkg/addons, that writes one labelled Secret per declared target,
+//     refuses delivery while secrets encryption is off unless the operator
+//     overrides that explicitly, and modifies only Secrets it created.
 //
 // Keys that never enter the datastore (Phase B) and KMS v2 envelope encryption
 // of the datastore (Phase C) are separate, later work and are out of scope here.
