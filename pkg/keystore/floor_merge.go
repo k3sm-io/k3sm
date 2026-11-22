@@ -83,6 +83,10 @@ type MergeReport struct {
 	// the restored floor does not record gets the moved-aside live record,
 	// at its sequence, fenced one past it (fenceMark).
 	Kept []string
+	// Recorded names, sorted, each of Kept the restored floor held no live
+	// record of, whose moved-aside live generation the merge recorded: an
+	// entry the backup does not hold, not a revoked one brought back.
+	Recorded []string
 	// Retired names, sorted, each entry whose moved-aside live generation
 	// the merge buried: each one the restored floor does not hold live,
 	// under another generation or not at all. Choosing the backup retired
@@ -319,14 +323,14 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 	sort.Strings(r.Dropped)
 	logPruned(capDropped)
 	for _, name := range unverified {
-		slog.Warn("keystore floor: the restored pointer of this entry did not authenticate under the master, so the merge left its recorded sequence as the restored floor holds it; a restored pointer above that is refused until a Rotate", "name", name)
+		slog.Warn("keystore floor: the restored pointer of this entry did not authenticate under the master, so the merge left its recorded sequence as the restored floor holds it: a pointer below it is refused, one at it is accepted, and one above it is accepted unless the merge fenced the entry, when one above it and at or below the fence is refused until a Rotate seals above the fence", "name", name)
 	}
 	for _, name := range r.overRaise {
-		slog.Warn("keystore floor: the restored pointer of this entry is more than one sequence above the restored floor's record, more than a crash leaves, so the merge did not raise the record to it; that pointer is refused until a Rotate", "name", name)
+		slog.Warn("keystore floor: the restored pointer of this entry is more than one sequence above the restored floor's record, more than a crash leaves, so the merge did not raise the record to it: that pointer is refused while it is at or below the fence the merge set, until a Rotate seals above the fence, and accepted above it; the record's own sequence stays accepted", "name", name)
 	}
 	r.Unverified = unionNames(unverified, r.Unverified)
 	for _, name := range r.BuriedLive {
-		slog.Warn("keystore floor: the moved-aside floor records the restored generation of this entry as deleted, so the merge buried it and the restored entry is refused; rm removes its directory", "name", name)
+		slog.Warn("keystore floor: the moved-aside floor records the restored generation of this entry as deleted, so the merge buried it and the restored entry is refused; rm removes its directory, and in an undo --keep brings back a version the first merge retired", "name", name)
 	}
 	if err := s.moveStaged(st); err != nil {
 		return r, fmt.Errorf("%w: the merge is written, but the restored keystore/ is still staged in pre-restore.d/restored: %w; run the same merge again, which writes nothing more and moves it into place", errCommitted, err)
@@ -747,7 +751,7 @@ func (fl floor) mergeFenced(from floor, keep map[string]bool, ptrs, aside map[st
 		}
 		fl[name] = f
 	}
-	kept, buriedLive, fenced, overRaise := map[string]bool{}, map[string]bool{}, map[string]bool{}, map[string]bool{}
+	kept, buriedLive, fenced, overRaise, recorded := map[string]bool{}, map[string]bool{}, map[string]bool{}, map[string]bool{}, map[string]bool{}
 	for _, a := range all {
 		f := fl[a.name]
 		switch {
@@ -791,7 +795,7 @@ func (fl floor) mergeFenced(from floor, keep map[string]bool, ptrs, aside map[st
 			if keep[name] && f.Seq == a.Seq && f.HighWater == hw {
 				// The record a keep of a name the restored floor did not
 				// record wrote (below): a rerun keeps it again.
-				kept[name] = true
+				kept[name], recorded[name] = true, true
 				continue
 			}
 			if hw > f.Seq && hw > f.HighWater {
@@ -814,14 +818,14 @@ func (fl floor) mergeFenced(from floor, keep map[string]bool, ptrs, aside map[st
 				f.HighWater = hw
 			}
 			fl[name] = f
-			kept[name] = true
+			kept[name], recorded[name] = true, true
 			r.recorded++
 			continue
 		}
 		add(name, a.Generation)
 		r.Retired = append(r.Retired, name)
 	}
-	r.BuriedLive, r.Kept, r.Fenced = sortedNames(buriedLive), sortedNames(kept), sortedNames(fenced)
+	r.BuriedLive, r.Kept, r.Fenced, r.Recorded = sortedNames(buriedLive), sortedNames(kept), sortedNames(fenced), sortedNames(recorded)
 	r.Unverified, r.overRaise = sortedNames(overRaise), sortedNames(overRaise)
 	if len(guarded) > 0 {
 		fl.renumber()
