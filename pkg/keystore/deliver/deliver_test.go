@@ -1471,3 +1471,48 @@ func TestMissingDeclarationKeepsRecords(t *testing.T) {
 		})
 	}
 }
+
+// TestReconcilerRepointsOwnedSecret: root re-points ns/S from system/A to
+// system/B with deliver; the Secret the server created keeps its UID, so it
+// is updated to B's value and relabelled for B (G20).
+func TestReconcilerRepointsOwnedSecret(t *testing.T) {
+	h := newHarness(t, true, false)
+	h.store.set("alpha", 1, []byte("alpha-value"))
+	h.store.set("beta", 1, []byte("beta-value"))
+	h.declare(t, Target{Entry: "system/alpha", Namespace: "payments", SecretName: "shared"})
+	ctx := context.Background()
+	h.r.Sweep(ctx)
+	h.declare(t, Target{Entry: "system/beta", Namespace: "payments", SecretName: "shared"})
+	h.r.Sweep(ctx)
+	s := h.secret(t, "payments", "shared")
+	if string(s.Data[DefaultDataKey]) != "beta-value" || s.Labels[LabelKey] != "beta" {
+		t.Fatalf("re-pointed Secret holds %q labelled %q, want beta's value and label", s.Data[DefaultDataKey], s.Labels[LabelKey])
+	}
+}
+
+// TestReconcilerRelabelledOwnedSecret: a tenant removes or changes the label
+// on a Secret the server created; its UID still matches, so the label is put
+// back and the next rotation lands (G20).
+func TestReconcilerRelabelledOwnedSecret(t *testing.T) {
+	for _, labels := range []map[string]string{nil, {LabelKey: "someone-else"}} {
+		h := newHarness(t, true, false)
+		h.store.set("api-token", 1, []byte("one"))
+		h.declare(t, Target{Entry: "system/api-token", Namespace: "payments"})
+		ctx := context.Background()
+		h.r.Sweep(ctx)
+		s := h.secret(t, "payments", "api-token")
+		s.Labels = labels
+		if _, err := h.client.CoreV1().Secrets("payments").Update(ctx, s, metav1.UpdateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		h.r.Sweep(ctx)
+		if got := h.secret(t, "payments", "api-token").Labels[LabelKey]; got != "api-token" {
+			t.Fatalf("labels %v: the label was not put back: %q", labels, got)
+		}
+		h.store.set("api-token", 2, []byte("two"))
+		h.r.Sweep(ctx)
+		if got := string(h.secret(t, "payments", "api-token").Data[DefaultDataKey]); got != "two" {
+			t.Fatalf("labels %v: the rotation did not land: %q", labels, got)
+		}
+	}
+}

@@ -45,16 +45,17 @@ limitations under the License.
 //     with no PEM), and records the UID the apiserver gave it in the state
 //     file (StateFileName, 0600, in the server's work dir and owned by the
 //     server's euid; see StateFileName for why that owner adds no trust);
-//   - present, labelled for this entry and with the recorded UID: updates it
-//     only when its VersionAnnotation or FingerprintAnnotation differs from
+//   - present with the recorded UID, whatever its label says (a missing or
+//     other label is put back): updates it when its label is not this
+//     entry's, or its VersionAnnotation or FingerprintAnnotation differs from
 //     Store.Current's version or fingerprint, or its data is not exactly the
 //     declared key holding the stored bytes (compared in constant time, so a
 //     hand edit with the annotations left intact is re-applied and logged,
 //     without the value). An immutable one cannot be updated: it is left
 //     as it is and logged at Warn once per state change, for the operator to
 //     delete;
-//   - anything else (no label, another entry's label, no recorded UID, or a
-//     UID other than the recorded one): leaves it alone and logs why. The
+//   - anything else (no recorded UID, or a UID other than the recorded one,
+//     whatever its label): leaves it alone and logs why. The
 //     label is forgeable by anyone who can write Secrets in the namespace;
 //     the UID a create returned is not, and a recreated Secret gets a new one.
 //

@@ -193,9 +193,9 @@ delivered as the stored 32-byte seed or 64-byte key, with no PEM wrapping. The e
 - **Only its own Secrets.** The server labels each Secret it creates
   `k3sm.io/keystore-delivery: <entry>`, and records the Secret's UID in
   `/var/lib/k3sm/server/keystore-delivery-state.json` (owned by the server's user, mode 0600).
-  It only ever updates a Secret that carries that label for that entry and has the recorded UID.
-  Anyone who can write Secrets in the namespace can set the label, so the label alone does not
-  count: a Secret of that name that someone else created first, or that was deleted and created
+  It only ever updates a Secret that has the recorded UID, and puts the label back if someone
+  removed or changed it. Anyone who can write Secrets in the namespace can set the label, so the
+  label alone does not count: a Secret of that name that someone else created first, or that was deleted and created
   again, is "not created by this server". The server leaves it alone and logs why: delete it, or
   pick another `--secret`. The server never lists Secrets and never deletes one.
 - **Withdrawing.** `undeliver` removes every delivery of the entry into that namespace from the

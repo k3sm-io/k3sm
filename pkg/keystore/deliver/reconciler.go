@@ -401,7 +401,8 @@ func (r *Reconciler) converge(ctx context.Context, sw *sweep, t Target) {
 		return
 	}
 	stamped, current := upToDate(cur, want, ver.Fingerprint, t.Key(), value)
-	if current {
+	labelled := cur.Labels[LabelKey] == t.Name()
+	if current && labelled {
 		r.note(t, "ok:"+want, slog.LevelInfo, "delivered", "version", ver.Version, "plaintext", !r.encryptionOn)
 		return
 	}
@@ -411,7 +412,7 @@ func (r *Reconciler) converge(ctx context.Context, sw *sweep, t Target) {
 			"version", ver.Version)
 		return
 	}
-	if stamped {
+	if stamped && !current {
 		// Its stamps say current and its content does not: someone edited
 		// it. Logged every time, since each edit is its own event; the value
 		// is never logged.
@@ -440,23 +441,27 @@ func (r *Reconciler) converge(ctx context.Context, sw *sweep, t Target) {
 }
 
 // notOurs is why cur is not a Secret this server created for t, or "" when it
-// is: labelled for t's entry, and with the UID recorded when it was created.
-// The label alone proves nothing, since a namespace writer can set it.
+// is: it carries the UID recorded when this server created it. The UID alone
+// decides. The label proves nothing either way: a namespace writer can set it
+// on their own Secret, or remove or change it on ours; an owned Secret whose
+// label is missing or names another entry (a tenant's edit, or root
+// re-pointing the Secret at another entry) is updated and relabelled.
 func (r *Reconciler) notOurs(sw *sweep, t Target, cur *corev1.Secret) string {
+	uid := sw.state.UID(t.Namespace, t.Secret())
+	if uid != "" && uid == string(cur.UID) {
+		return ""
+	}
 	owner, ok := cur.Labels[LabelKey]
 	switch {
 	case !ok:
-		return "it has no " + LabelKey + " label"
+		return "it has no " + LabelKey + " label and no recorded UID matches it"
 	case owner != t.Name():
-		return "its " + LabelKey + " label names another entry"
-	}
-	switch uid := sw.state.UID(t.Namespace, t.Secret()); {
+		return "its " + LabelKey + " label names another entry and no recorded UID matches it"
 	case uid == "":
 		return "no UID is recorded for it, so it was created by someone else"
-	case uid != string(cur.UID):
+	default:
 		return "its UID is not the one recorded when this server created it, so it was recreated by someone else"
 	}
-	return ""
 }
 
 // create creates t's Secret and records its UID. The state file is written

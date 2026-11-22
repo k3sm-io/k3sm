@@ -842,10 +842,12 @@ can write any Secret without forging the file, and pods running as that uid are 
 Seatbelt (the `keystore-` prefix puts it under the runtime's pod deny for `keystore-*` names in
 the work dir). A service-user-owned parent can only rename or delete the file, which is
 denial, never forgery: the reconciler then cannot prove it created the Secret and skips it,
-failing closed. Ownership is checked by reading the existing Secret first: present, labelled for this entry name **and** carrying
-the recorded UID → update; anything else (no label, another entry's label, no recorded
-UID, a different UID because the Secret was deleted and recreated) → "not created by this
-server", left alone, skipped with a logged reason, never written into. An update writes
+failing closed. Ownership is checked by reading the existing Secret first: present and
+carrying the recorded UID → update, relabelling it if its label is missing or names another
+entry (a tenant's edit, or root re-pointing the Secret at another entry with `deliver`), since
+the UID alone decides; anything else (no recorded UID, or a different UID because the Secret
+was deleted and recreated, whatever its label says) → "not created by this server", left
+alone, skipped with a logged reason, never written into. An update writes
 only `data`, `type`, the label and the two annotations, and strips any `immutable` flag on
 its own object. A target that leaves a declaration that exists and parses loses its state
 entry, so declaring it again does not adopt the old Secret; an absent declaration (the file or
