@@ -354,6 +354,9 @@ type appendLog struct {
 	// freeSpace, when set, replaces logFreeSpace: the test seam for the
 	// free-space preflight.
 	freeSpace func(fd int) (uint64, error)
+	// reserve, when set, replaces reserveLogBlocks: the test seam for the
+	// block reservation an append makes before its write.
+	reserve func(f *os.File, n int64) error
 	// maxKeys, when not 0, replaces maxFloorKeys: the test seam for the
 	// key bound.
 	maxKeys int
@@ -980,11 +983,17 @@ func (l *appendLog) appendLineSlack(uid uint32, line []byte, budget, revoke, sla
 	if err := l.preflight(f, len(out), slack); err != nil {
 		return err
 	}
-	// One write(2) of the whole line. An ENOSPC or EIO between the
-	// preflight and the write, or a crash mid-write, can still leave a
-	// torn tail the flag keeps: damage in the floor, which floor --rebuild
-	// repairs (docs/design/keystore.md § "The user-scope floor"), and a
-	// dropped line in the audit log once the next append closes it.
+	// Reserve the line's blocks on this descriptor before the write, so a
+	// disk filler racing the preflight cannot make the write short: a
+	// refused reservation writes nothing.
+	if err := l.reserveBlocks(f, int64(len(out))); err != nil {
+		return err
+	}
+	// One write(2) of the whole line, into reserved blocks. An EIO, or a
+	// crash mid-write, can still leave a torn tail the flag keeps: damage
+	// in the floor, which only a restore repairs (docs/design/keystore.md §
+	// "The user-scope floor"), and a dropped line in the audit log once the
+	// next append closes it.
 	_, err = f.Write(out)
 	if err == nil {
 		err = f.Sync()
@@ -1034,6 +1043,31 @@ func (l *appendLog) preflight(f *os.File, n int, revoke bool) error {
 		return fmt.Errorf("%w (%s)", errLogNoSpace, l.name)
 	}
 	return nil
+}
+
+// reserveBlocks reserves n bytes, rounded up to whole blocks, on f's
+// descriptor before an append writes them, and refuses as errLogNoSpace
+// when the file system will not give them.
+func (l *appendLog) reserveBlocks(f *os.File, n int64) error {
+	reserve := l.reserve
+	if reserve == nil {
+		reserve = reserveLogBlocks
+	}
+	if err := reserve(f, reserveSize(n)); err != nil {
+		return fmt.Errorf("%w (%s): reserve: %w", errLogNoSpace, l.name, err)
+	}
+	return nil
+}
+
+// logBlock is the block an append's reservation is rounded up to, the
+// APFS allocation block.
+const logBlock = 4 << 10
+
+// reserveSize is n rounded up to whole logBlock blocks: the most new blocks
+// an append of n bytes can take past the file's physical end, which
+// F_PEOFPOSMODE allocates from.
+func reserveSize(n int64) int64 {
+	return (n + logBlock - 1) / logBlock * logBlock
 }
 
 // logFreeSpace is the bytes free to an unprivileged writer on the file
