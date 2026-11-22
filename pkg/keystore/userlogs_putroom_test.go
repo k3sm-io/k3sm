@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -96,4 +97,31 @@ func TestDeliverRefusedFirstBelowFloorMargin(t *testing.T) {
 		t.Fatalf("deliver below the floor's free-space margin: %v, want errLogNoSpace before any write", err)
 	}
 	checkTreeUnchanged(t, snap, treeSnapshot(t, server))
+}
+
+// A put that mints its scope judges the room for both its floor lines once,
+// before the mint's ok audit line, and never again after it: here the
+// volume fills once the mint's floor line lands, which a second check
+// would refuse after the ok line. The put commits, and the audit log holds
+// its one ok line and no refusal.
+func TestPutMintJudgesFloorRoomOnce(t *testing.T) {
+	s, _, _ := fileLogScope(t)
+	floorPath := filepath.Join(s.dataRoot, userFloorLogName)
+	before := int64(len(readLog(t, s, userFloorLogName)))
+	s.userFloor.(*fileFloorLog).log.freeSpace = func(int) (uint64, error) {
+		fi, err := os.Stat(floorPath)
+		if err != nil || fi.Size() > before {
+			return logFreeMargin, nil
+		}
+		return 1 << 30, nil
+	}
+	u2 := userScope(t, s, 1002)
+	audit := len(readLog(t, s, auditLogName))
+	if _, err := u2.Put(context.Background(), "user/1002/token", KindOpaque, []byte("v")); err != nil {
+		t.Fatalf("a minting put with room judged before its ok line: %v", err)
+	}
+	added := string(readLog(t, s, auditLogName)[audit:])
+	if strings.Count(added, "\n") != 1 || !strings.Contains(added, "ok") {
+		t.Fatalf("the put's audit lines %q, want its one ok line", added)
+	}
 }

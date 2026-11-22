@@ -211,11 +211,15 @@ func (u *UserScope) put(ctx context.Context, name string, kind Kind, value []byt
 		return Version{}, err
 	}
 	uk, entries, err := u.openScope(root, func() (keys, error) { return k, nil })
+	roomJudged := false
 	if errors.Is(err, errNoScopeKey) {
-		// The mint appends the delivery record's floor line first.
+		// The mint appends the delivery record's floor line first. This one
+		// check covers the name's line too, so none follows the mint's ok
+		// audit line: a refusal after it would be audited after an ok.
 		if err := u.s.floorGrantRoom(u.scope, []string{deliveriesFloorName, name}, entryWriteBytes(name, value)); err != nil {
 			return Version{}, err
 		}
+		roomJudged = true
 		uk, entries, err = u.mint(root, k.wrap, grant)
 	}
 	if err != nil {
@@ -227,8 +231,10 @@ func (u *UserScope) put(ctx context.Context, name string, kind Kind, value []byt
 	}
 	// Refuse, before the grant's first write, a put whose floor line would
 	// be refused after its commit.
-	if err := u.s.floorGrantRoom(u.scope, []string{name}, entryWriteBytes(name, value)); err != nil {
-		return Version{}, err
+	if !roomJudged {
+		if err := u.s.floorGrantRoom(u.scope, []string{name}, entryWriteBytes(name, value)); err != nil {
+			return Version{}, err
+		}
 	}
 	base, err := u.deliveriesBytes(root)
 	if err != nil {
