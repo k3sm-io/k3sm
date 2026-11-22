@@ -424,3 +424,40 @@ func TestFieldTablesSortedByTag(t *testing.T) {
 		}
 	}
 }
+
+// TestDecodeRefusalClearsClones is the zeroing rule's Decode half: a Decode
+// refused after it copied fields out clears those copies, which the caller
+// never sees, before it returns.
+func TestDecodeRefusalClearsClones(t *testing.T) {
+	good, err := Encode(credential.KindOAuth, Envelope{
+		Credential: Credential{
+			AccessToken:     []byte("ACCESSmarker"),
+			AccessExpiresAt: time.Unix(1_800_000_000, 0),
+			AccessIssuedAt:  time.Unix(1_799_990_000, 0),
+			RefreshOwner:    "local",
+		},
+		RefreshToken: []byte("REFRESHmarker"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var seen []Envelope
+	decodeRefused = func(e *Envelope) { seen = append(seen, *e) }
+	t.Cleanup(func() { decodeRefused = func(*Envelope) {} })
+	// A truncated field header after every field: refused once all are set.
+	if _, err := Decode(credential.KindOAuth, append(bytes.Clone(good), 0x40)); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("Decode of a trailing truncated header: %v, want ErrCorrupt", err)
+	}
+	if len(seen) != 1 {
+		t.Fatalf("decodeRefused called %d times, want 1", len(seen))
+	}
+	e := seen[0]
+	for name, b := range map[string][]byte{"accessToken": e.Credential.AccessToken, "refreshToken": e.RefreshToken} {
+		if len(b) == 0 {
+			t.Fatalf("the refused Decode had not copied %s", name)
+		}
+		if !bytes.Equal(b, make([]byte, len(b))) {
+			t.Fatalf("the refused Decode left its copy of %s: %q", name, b)
+		}
+	}
+}

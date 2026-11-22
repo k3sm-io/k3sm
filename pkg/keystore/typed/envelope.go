@@ -320,10 +320,24 @@ func Encode(kind credential.Kind, e Envelope) ([]byte, error) {
 	return b, nil
 }
 
+// decodeRefused is called with the partly decoded envelope of a refused
+// Decode, before its clones are cleared, where a test records them.
+var decodeRefused = func(*Envelope) {}
+
+// wipe clears every secret field of e in place: RefreshToken, Value, Seed
+// and AccessToken.
+func (e *Envelope) wipe() {
+	clear(e.RefreshToken)
+	clear(e.Credential.Value)
+	clear(e.Credential.Seed)
+	clear(e.Credential.AccessToken)
+}
+
 // Decode parses the envelope b of kind. It accepts exactly what Encode
 // writes: anything else is ErrCorrupt, except an envelope version other than
 // EnvelopeVersion, which is ErrKindUnsupported. Its errors carry tag numbers,
-// lengths and field names, never the envelope's bytes.
+// lengths and field names, never the envelope's bytes. A refusal clears the
+// field values it had already copied out of b.
 func Decode(kind credential.Kind, b []byte) (Envelope, error) {
 	var e Envelope
 	fs, ok := fields[kind]
@@ -339,38 +353,45 @@ func Decode(kind credential.Kind, b []byte) (Envelope, error) {
 	if b[0] != EnvelopeVersion {
 		return e, fmt.Errorf("%w: envelope version %d, this build reads %d", ErrKindUnsupported, b[0], EnvelopeVersion)
 	}
+	// A refusal after a field was set clears the clones made so far: they
+	// may hold a secret and the caller never sees them.
+	refuse := func(err error) (Envelope, error) {
+		decodeRefused(&e)
+		e.wipe()
+		return Envelope{}, err
+	}
 	rest := b[1:]
 	next := 0 // the index in fs of the first field not yet passed
 	for len(rest) > 0 {
 		if len(rest) < 3 {
-			return Envelope{}, fmt.Errorf("%w: a field header is truncated", ErrCorrupt)
+			return refuse(fmt.Errorf("%w: a field header is truncated", ErrCorrupt))
 		}
 		tag, n := rest[0], int(binary.BigEndian.Uint16(rest[1:3]))
 		if len(rest)-3 < n {
-			return Envelope{}, fmt.Errorf("%w: tag %#02x claims %d bytes past the end", ErrCorrupt, tag, n)
+			return refuse(fmt.Errorf("%w: tag %#02x claims %d bytes past the end", ErrCorrupt, tag, n))
 		}
 		v := rest[3 : 3+n]
 		rest = rest[3+n:]
 		i := next
 		for i < len(fs) && fs[i].tag < tag {
 			if !fs[i].optional {
-				return Envelope{}, fmt.Errorf("%w: kind %s is missing %s", ErrCorrupt, kind, fs[i].name)
+				return refuse(fmt.Errorf("%w: kind %s is missing %s", ErrCorrupt, kind, fs[i].name))
 			}
 			i++
 		}
 		if i == len(fs) || fs[i].tag != tag {
-			return Envelope{}, fmt.Errorf("%w: tag %#02x is unknown, repeated or out of order for kind %s", ErrCorrupt, tag, kind)
+			return refuse(fmt.Errorf("%w: tag %#02x is unknown, repeated or out of order for kind %s", ErrCorrupt, tag, kind))
 		}
 		f := &fs[i]
 		if err := f.check(v); err != nil {
-			return Envelope{}, fmt.Errorf("%w: %w", ErrCorrupt, err)
+			return refuse(fmt.Errorf("%w: %w", ErrCorrupt, err))
 		}
 		f.set(&e, v)
 		next = i + 1
 	}
 	for ; next < len(fs); next++ {
 		if !fs[next].optional {
-			return Envelope{}, fmt.Errorf("%w: kind %s is missing %s", ErrCorrupt, kind, fs[next].name)
+			return refuse(fmt.Errorf("%w: kind %s is missing %s", ErrCorrupt, kind, fs[next].name))
 		}
 	}
 	return e, nil
