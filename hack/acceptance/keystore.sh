@@ -547,16 +547,16 @@ pend U18 "CRD: entry, secretName, items, requestedBy required with no default an
 	apis/config/crd::TestKeyDeliveryCRDMatchesTheGoTypes TestKeyDeliveryImmutableFields TestKeyDeliveryRequiredFields TestKeyDeliveryRequestedByMatchesEntryUID TestKeyDeliveryConditionsListMap TestKeyDeliveryRefusesSystemEntry
 pend U19 "the CRD pattern, its maxLength, the uid range rule and the 253-byte name-length rule pass the shared entry-grammar vectors (KeyDelivery API)" \
 	apis/config/crd::TestEntryGrammarVectors
-pend U20 "a user-scope current copied back is refused against the floor log, with the user-scope floor message, which names floor --rebuild, not removing keystore-floor.json; rig leg E9 (append-only files)" \
-	TestUserFloorRefusesCopiedBackCurrent
+check U20 "a user-scope current copied back is refused against the floor log, with the user-scope floor message, which names floor --rebuild, not removing keystore-floor.json; an absent floor lets a withdraw go ahead, a malformed one refuses it with ErrCorrupt naming floor --rebuild; rig leg E9" \
+	TestUserFloorRefusesCopiedBackCurrent TestWithdrawAbsentFloorProceeds TestWithdrawMalformedFloorRefused FuzzParseFloorLine
 pend U21 "install creates both logs service-user-owned 0600 and flagged; the listener refuses to start when a flag is clear or a log is not the service user's; rig leg E1 (append-only files)" \
 	k3sm/pkg/install::TestKeystoreAppendOnlyFilesAtInstall k3sm/pkg/keystore::TestFlagCheckRefusesUnflagged
 pend U22 "floor --rebuild and audit --rotate mark and stage under keystore- names in the root-owned data root, stop the listener, hold the lock, write the new file before touching the old, clear the old flag before any rename, flag the new file after the rename; a crash at each step leaves the marker, and a rerun leaves a flagged file; every audit and floor append takes the store lock, so a reconciler append during audit --rotate waits; after maintenance, under the exclusive lock, the server reopens its audit and floor append descriptors and recounts the per-uid shares before releasing it, and the counts reset; rig leg E17 (append-only files, socket listener, KeyDelivery lifecycle)" \
 	k3sm/cmd/k3sm::TestKeysFloorRebuildCrashOrder TestKeysAuditRotateCrashOrder k3sm/pkg/keystore/reconcile::TestReconcilerAppendWaitsForAuditRotate \
 	k3sm/pkg/keystore/socket::TestMaintenanceReopensLogsAndResetsShares
-pend U23 "every audited operation writes one v:1 line; no line carries a value or its length; readers ignore unknown fields (append-only files)" \
-	TestAuditLineNeverCarriesValue TestAuditReaderIgnoresUnknownFields
-pend U24 "soft cap shows in doctor; past the hard cap every mutating user op is ErrLogFull, except the revocation class, which draws on its uid's revocation budgets; a line over 1 KiB is refused (append-only files)" \
+check U23 "every audited operation writes one v:1 line; no line carries a value or its length; readers ignore unknown fields" \
+	TestAuditLineNeverCarriesValue TestAuditReaderIgnoresUnknownFields FuzzParseAuditLine
+check U24 "the logs' sizes and soft cap are exposed for doctor (LogSizes); past the hard cap every mutating user op is ErrLogFull, except the revocation class, which draws on its uid's revocation budget; a line over 1 KiB is refused" \
 	TestLogHardCapRefusesMutations TestAuditLineBoundedAtOneKiB
 pend U25 "backup and restore round trip: a restored tree with cleared flags is refused until floor --rebuild, then opens; the rebuild writes a line for every entry directory holding a generation file, sequence 0 without an authenticated pointer, so a damaged entry stays ErrCorrupt and never becomes ErrNotFound; rig leg E17 (append-only files)" \
 	TestBackupRestoreRoundTripRebuild TestRebuildKeepsDamagedEntryCorrupt
