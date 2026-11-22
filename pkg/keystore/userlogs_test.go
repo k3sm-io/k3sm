@@ -203,7 +203,7 @@ func TestWithdrawMalformedFloorRefused(t *testing.T) {
 		}},
 		{"past its size bound", func(t *testing.T, s *FileStore) {
 			size := int64(len(readLog(t, s, userFloorLogName)))
-			s.logSoftCap, s.logHardCap, s.logRevokeBudget = 1, 1, 2*maxLogLine
+			s.logSoftCap, s.logHardCap, s.logRevokeBudget = 1, 1, minLogRevokeBudget
 			line, err := floorLine("user/1001", "pad", guid(9), 1)
 			if err != nil {
 				t.Fatal(err)

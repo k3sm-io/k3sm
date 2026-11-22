@@ -99,9 +99,10 @@ type Config struct {
 	// LogSoftCap and LogHardCap are each append-only log's soft and hard
 	// caps in bytes (keystore.logSoftCap, keystore.logHardCap), and
 	// LogRevocationBudget each uid's bytes per log for the revocation class
-	// past the hard cap. Zero is the default: 64 MiB, 256 MiB and 64 KiB. A
-	// negative value, or a soft cap over the hard cap, makes every
-	// operation fail.
+	// past the hard cap. Zero is the default: 64 MiB, 256 MiB and 704 KiB
+	// (defaultLogRevocationBytes). A negative value, a soft cap over the
+	// hard cap, or a budget under one worst-case burial plus its audit line
+	// (minLogRevokeBudget), makes every operation fail.
 	LogSoftCap, LogHardCap, LogRevocationBudget int64
 }
 
@@ -232,10 +233,11 @@ func (s *FileStore) checkConfig() error {
 		return fmt.Errorf("%w: DataRoot is empty", errInvalidConfig)
 	case s.logSoftCap < 0 || s.logHardCap < 0 || s.logRevokeBudget < 0:
 		return fmt.Errorf("%w: a log cap or budget is negative", errInvalidConfig)
-	case s.logRevokeBudget < 2*maxLogLine:
-		// A budget under two whole lines refuses a revocation's line and
-		// its audit line, so it would silently disable revocation.
-		return fmt.Errorf("%w: LogRevocationBudget %d is under two log lines, %d", errInvalidConfig, s.logRevokeBudget, 2*maxLogLine)
+	case s.logRevokeBudget < minLogRevokeBudget:
+		// A budget under one worst-case burial plus its audit line refuses
+		// an rm's tombstones or its audit line, so it would silently
+		// disable revocation.
+		return fmt.Errorf("%w: LogRevocationBudget %d is under one worst-case burial plus its audit line, %d", errInvalidConfig, s.logRevokeBudget, int64(minLogRevokeBudget))
 	case s.logSoftCap > s.logHardCap:
 		return fmt.Errorf("%w: LogSoftCap %d is over LogHardCap %d", errInvalidConfig, s.logSoftCap, s.logHardCap)
 	case s.logHardCap > maxLogHardCap || s.logRevokeBudget > maxLogRevokeBudget:

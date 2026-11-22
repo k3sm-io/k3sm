@@ -74,14 +74,14 @@ func TestLogFullTextNamesNoNumbers(t *testing.T) {
 	t.Run("revocation budget", func(t *testing.T) {
 		s, server, u := fileLogScope(t)
 		s.logSoftCap, s.logHardCap = 1, 1
-		s.logRevokeBudget = 2 * maxLogLine
+		s.logRevokeBudget = minLogRevokeBudget
 		// Spend uid 1001's budget with lines past the hard cap that add no
 		// key.
 		line, err := floorLine("user/1001", "token", entryGeneration(t, server, "token"), 1)
 		if err != nil {
 			t.Fatal(err)
 		}
-		appendLogBytes(t, s, userFloorLogName, bytes.Repeat(line, 2*maxLogLine/len(line)+1))
+		appendLogBytes(t, s, userFloorLogName, bytes.Repeat(line, minLogRevokeBudget/len(line)+1))
 		check(t, u.Delete(ctx, "user/1001/token"))
 	})
 }

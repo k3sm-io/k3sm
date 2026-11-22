@@ -78,13 +78,33 @@ const (
 	// cap (the socket margin of "Per-uid fairness").
 	defaultLogSoftCap = 64 << 20
 	defaultLogHardCap = 256 << 20
-	// defaultLogRevocationBytes holds one scope's full revocation: each of
-	// maxScopeEntries entries rm'd under the longest scope
-	// (user/2147483647) and a 253-byte name, a 306-byte floor tombstone
-	// and an rm audit line of at most 384 bytes (the longest result and a
-	// full RFC3339Nano timestamp), 256 × (306 + 384) = 176,640 bytes,
-	// rounded up to 192 KiB (TestDefaultRevocationBudgetHoldsFullRevocation).
-	defaultLogRevocationBytes = 192 << 10
+	// maxBurialTombstones is the most tombstones one rm's burial writes for
+	// an entry with one live floor generation, as the server writes it: the
+	// floor's live generation, the one the pointer authenticates, and
+	// maxTreeGenerations named by the tree alone.
+	maxBurialTombstones = 2 + maxTreeGenerations
+	// maxTombLineBytes and maxRmAuditLineBytes are the longest tombstone and
+	// rm audit line: the longest scope (user/2147483647), a 253-byte name,
+	// the longest result and a full RFC3339Nano timestamp
+	// (TestCheckConfigRevocationBudgetFloor).
+	maxTombLineBytes    = 306
+	maxRmAuditLineBytes = 384
+	// minLogRevokeBudget is the least revocation budget checkConfig accepts:
+	// one worst-case burial plus its audit line, 6 × 306 + 384 = 2,220
+	// bytes, which is over two whole lines (2,048).
+	minLogRevokeBudget = maxBurialTombstones*maxTombLineBytes + maxRmAuditLineBytes
+	// defaultLogRevocationBytes holds one scope's full revocation, under the
+	// longest scope and a 253-byte name: each of maxScopeEntries entries
+	// rm'd, a burial of maxBurialTombstones 306-byte tombstones and a
+	// 384-byte audit line, 256 × (6 × 306 + 384) = 568,320 bytes; and
+	// maxDeliveries withdraws, each an 82-byte floor line and a withdraw
+	// audit line of at most 250 bytes, 320 × (82 + 250) = 106,240 bytes;
+	// 674,560 bytes in all, rounded up to 704 KiB (720,896). With it
+	// logReadBound at the default caps is 256 MiB + 1024 × 704 KiB + 1 MiB
+	// = 961 MiB, and at the configuration's upper bounds 2^40 + 1024 × 2^30
+	// + 2^20, which cannot overflow
+	// (TestDefaultRevocationBudgetHoldsFullRevocation).
+	defaultLogRevocationBytes = 704 << 10
 
 	// The reader's bounds (docs/design/keystore.md § "Size caps"). A log
 	// is read whole, and the service user can append to it without limit,
@@ -100,9 +120,11 @@ const (
 	// reader's worst case at this ceiling plus the revocation headroom
 	// (278,528 keys), read from scratch on an M1 Ultra: 253-byte names and
 	// the longest scope, about 128 MiB of heap and 0.41 s
-	// (BenchmarkFloorReadLongNames); the most lines the size bound held at
-	// a 64 KiB revocation budget, about 7.3M, about 69 MiB and 3.9 s
-	// (BenchmarkFloorReadLineCount), about 5.5 s scaled to today's 10.2M. At
+	// (BenchmarkFloorReadLongNames); the most lines the size bound held
+	// under the former 64 KiB revocation budget, about 7.3M, about 69 MiB
+	// and 3.9 s (BenchmarkFloorReadLineCount), about 11.7 s scaled to the
+	// 21.9M lines of 46 bytes today's 961 MiB bound holds (not
+	// re-measured). At
 	// 1<<20 the long-name case held about 494 MiB, so the ceiling was
 	// lowered to stay under 200 MiB (docs/design/keystore.md § "Size caps").
 	maxFloorKeysCeiling = 1 << 18

@@ -40,7 +40,7 @@ func TestCheckLogBoundsRefusesShrunkCaps(t *testing.T) {
 	}
 	appendLogBytes(t, s, userFloorLogName, bytes.Repeat(line, (4<<20)/len(line)))
 	size := int64(len(readLog(t, s, userFloorLogName)))
-	s.logSoftCap, s.logHardCap, s.logRevokeBudget = 1, 1, 2*maxLogLine
+	s.logSoftCap, s.logHardCap, s.logRevokeBudget = 1, 1, minLogRevokeBudget
 	_, err = s.CheckLogBounds(ctx)
 	if !errors.Is(err, errInvalidConfig) || !errors.Is(err, errLogBoundsBelowLog) {
 		t.Fatalf("store open with caps below the floor's size: %v, want errLogBoundsBelowLog", err)

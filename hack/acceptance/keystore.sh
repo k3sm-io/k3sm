@@ -645,7 +645,7 @@ pend U65 "ErrScopeAbsent is Indeterminate and deletes nothing; every allow-list 
 	k3sm/pkg/keystore/reconcile::TestAbsentScopeIsIndeterminate TestEveryDeletingOutcomeNeedsTwoSweeps TestSingleServerRecheckedBeforeEverySweep
 pend U66 "a synthesized GeneratedUID (prefix FFFFEEEE-DDDD-CCCC-BBBB-AAAA) is ErrScopeOwnerUnknown and never bound; ErrScopeOwnerChanged only for a real GeneratedUID that differs (user scopes)" \
 	k3sm/pkg/keystore::TestSynthesizedGeneratedUIDIsUnknown
-pend U67 "the revocation class (withdraw, rm, rotate, the withdrawal's floor line, the reconciler's deliver-delete, its deliver-write of a withdrawal and its rotation write) bypasses the share past it and draws on its uid's own budgets per log above the hard cap: a 256 KiB reconciler allowance and a separate 192 KiB socket margin; neither budget can draw on the other; refused only when the budget it draws on runs out, so one uid's revocations are never refused because of another uid; a no-op revocation is charged to the share; a log passes the hard cap by at most 320 KiB per user scope, plus the 1 MiB reconciler budget (socket operations)" \
+pend U67 "the revocation class (withdraw, rm, rotate, the withdrawal's floor line, the reconciler's deliver-delete, its deliver-write of a withdrawal and its rotation write) bypasses the share past it and draws on its uid's own budgets per log above the hard cap: a 256 KiB reconciler allowance and a separate 704 KiB socket margin; neither budget can draw on the other; refused only when the budget it draws on runs out, so one uid's revocations are never refused because of another uid; a no-op revocation is charged to the share; a log passes the hard cap by at most 320 KiB per user scope, plus the 1 MiB reconciler budget (socket operations)" \
 	k3sm/pkg/keystore/socket::TestRevocationBypassesShareUsesReserve TestNoOpRevocationChargedToShare TestReserveKeepsReconcilerPart TestRevocationAllowanceIsPerUID \
 	TestSocketMarginSeparateFromReconcilerAllowance
 rootpend U68 "root-run: the maintenance verbs refuse a symlink or swapped file planted at the marker, a staging name or the old log; creates are O_EXCL|O_NOFOLLOW through one data-root descriptor, fchflags on the held descriptor after renameat and fchown to the service user only after the flag, never renaming a flagged file or over one; no log byte changes on a refusal (append-only files)" \
@@ -1023,7 +1023,7 @@ U64|ErrScopeAbsent
 U64|a missing entries/ directory or a missing deliveries record is ErrScopeAbsent too
 U66|FFFFEEEE-DDDD-CCCC-BBBB-AAAA
 U67|256 KiB reconciler allowance
-U67|192 KiB socket margin
+U67|704 KiB socket margin
 U67|neither budget can draw on the other
 U67|at most 320 KiB per user scope
 U84|overshoot

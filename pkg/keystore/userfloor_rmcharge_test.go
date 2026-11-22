@@ -61,7 +61,7 @@ func TestUserRmChargesEveryTombstone(t *testing.T) {
 	}
 	before := readLog(t, s, userFloorLogName)
 	s.logSoftCap, s.logHardCap = int64(len(before)), int64(len(before))
-	s.logRevokeBudget = 2 * maxLogLine
+	s.logRevokeBudget = minLogRevokeBudget
 	err := u.Delete(context.Background(), "user/1001/token")
 	if !errors.Is(err, ErrLogFull) || errors.Is(err, errCommitted) {
 		t.Fatalf("rm with budget for fewer tombstones than it needs: %v, want ErrLogFull before any", err)

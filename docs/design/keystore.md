@@ -1921,14 +1921,14 @@ That wait is the store `.lock`
   `FileStore.LogSizes` gives the sizes and caps to the
   `doctor` row. **The reader is bounded**, since the service user can append to either log
   without limit: a log larger than the hard cap plus 1024 uids' revocation budgets plus 1 MiB
-  (449 MiB at the defaults) is damage (`logReadBound`; the configuration is bounded from
+  (961 MiB at the defaults) is damage (`logReadBound`; the configuration is bounded from
   above, a hard cap of at most 2^40 bytes and a revocation budget of at most 2^30, refused
   at `checkConfig` past either, so the sum cannot overflow). *`logReadBound` grows with the
   budgets still to land.* Today it holds the hard cap, `maxRevokeUIDs` (1024) uids'
-  revocation budgets and the 1 MiB margin. When the socket's 192 KiB margin and the
+  revocation budgets and the 1 MiB margin. When the socket's 704 KiB margin and the
   reconciler's 256 KiB per-uid allowance and 1 MiB budget land ("Per-uid fairness"), each
   is a line class written past the hard cap, so the bound becomes the hard cap plus 1024 ×
-  (192 KiB + 256 KiB) plus the 1 MiB reconciler budget plus the 1 MiB margin: the most the
+  (704 KiB + 256 KiB) plus the 1 MiB reconciler budget plus the 1 MiB margin: the most the
   server itself can write past the hard cap, 1024 uids at both their budgets and the
   reconciler at its own, with the margin above it, so no log the server wrote reads as
   damage. Each budget's change raises the bound in the same change. A floor holding more distinct
@@ -1943,8 +1943,8 @@ That wait is the store `.lock`
   (86 MiB of lines), holds about 128 MiB of heap and takes about 0.41 s
   (`BenchmarkFloorReadLongNames`); the time worst case, the most lines the size bound holds
   (measured at about 7.3 million, 321 MiB, under the former 64 KiB revocation budget), holds
-  about 69 MiB and takes about 3.9 s (`BenchmarkFloorReadLineCount`); at today's 449 MiB
-  bound, about 10.2 million lines, the time scales to about 5.5 s (not re-measured), and the
+  about 69 MiB and takes about 3.9 s (`BenchmarkFloorReadLineCount`); at today's 961 MiB
+  bound, about 21.9 million lines of 46 bytes, the time scales to about 11.7 s (not re-measured), and the
   heap, bounded by the key ceiling, does not grow; 262,144 keys of the shortest lines hold about 64 MiB and
   take about 0.23 s (`BenchmarkFloorReadAtKeyBound`). At a ceiling of 2^20 the long-name case
   held about 494 MiB, over the 200 MiB the reader is allowed, so the ceiling was lowered. The
@@ -2023,15 +2023,20 @@ That wait is the store `.lock`
     - the **reconciler allowance**, 256 KiB, used only by the reconciler's revocation lines for
       that uid's deliveries (`deliver-delete`, the withdrawal's `deliver-write` and floor line,
       the rotation write);
-    - the **socket margin**, 192 KiB (`defaultLogRevocationBytes`), used only by that uid's
+    - the **socket margin**, 704 KiB (`defaultLogRevocationBytes`), used only by that uid's
       own socket `withdraw`, `rm` and `rotate` lines and their floor lines. It holds one
-      scope's full revocation: each of its 256 entries `rm`'d under the longest scope
-      (`user/2147483647`) and a 253-byte name is a 306-byte floor tombstone and an `rm` audit
-      line of at most 384 bytes (the longest result, a full RFC3339Nano timestamp), so
-      256 × (306 + 384) = 176,640 bytes, rounded up to 192 KiB. With it `logReadBound` at the
-      default caps is 256 MiB + 1024 × 192 KiB + 1 MiB = 449 MiB, and at the configuration's
-      upper bounds still 2^40 + 1024 × 2^30 + 2^20, which cannot overflow. A configured
-      budget under two whole lines (2 KiB) is refused at `checkConfig`, and one a uid's
+      scope's full revocation under the longest scope (`user/2147483647`) and a 253-byte name.
+      Each of its 256 entries `rm`'d is a burial of at most 6 tombstones (the floor's live
+      generation, the one the pointer authenticates, and the 4 the tree alone may name,
+      `maxBurialTombstones`) of 306 bytes and an `rm` audit line of at most 384 bytes (the
+      longest result, a full RFC3339Nano timestamp): 256 × (6 × 306 + 384) = 568,320 bytes.
+      Each of its 320 deliveries withdrawn (`maxDeliveries`) is an 82-byte floor line and a
+      `withdraw` audit line of at most 250 bytes: 320 × (82 + 250) = 106,240 bytes. In all
+      674,560 bytes, rounded up to 704 KiB (720,896). With it `logReadBound` at the default
+      caps is 256 MiB + 1024 × 704 KiB + 1 MiB = 961 MiB, and at the configuration's upper
+      bounds still 2^40 + 1024 × 2^30 + 2^20, which cannot overflow. A configured budget under
+      one worst-case burial plus its audit line, 6 × 306 + 384 = 2,220 bytes
+      (`minLogRevokeBudget`), is refused at `checkConfig`, and one a uid's
       lines past the hard cap have spent in either log, leaving it less than one whole line
       (1 KiB), is refused at store open by `CheckLogBounds` (`errLogRevokeBudgetSpent`), naming the remedy: configure the caps the
       log was written under, or restore the caps and rotate the audit log, the rotate verb
@@ -2071,13 +2076,13 @@ That wait is the store `.lock`
     share`. The CLI prints that warning line and exits 0, so the user knows the Pods still hold
     the old value (U92).
   - *The socket margin keeps a user able to revoke.* A uid past its share, even with 64 live
-    deliveries, still has its 192 KiB socket margin for `withdraw`, `rm` and `rotate`, about 96
+    deliveries, still has its 704 KiB socket margin for `withdraw`, `rm` and `rotate`, about 352
     of them at two lines of at most 1 KiB each (the operation's line and its floor line). A uid
     that spends its margin, for instance by rotating without end, refuses only its own further
     socket revocations, until root rotates the log.
   - *How far a log can pass the hard cap.* Only revocation lines are written past the hard
     cap, and each uid's are bounded by its two budgets, so a log can grow past the hard cap by
-    at most 320 KiB (256 KiB plus 64 KiB) times the number of user scopes, plus the 1 MiB
+    at most 960 KiB (256 KiB plus 704 KiB) times the number of user scopes, plus the 1 MiB
     reconciler budget, whose lines the hard cap does not test either. User scopes are
     bounded by the host's eligible local accounts: a scope is minted only for an eligible uid
     (501 to 2147483647) with a real, non-synthesized GeneratedUID ("Key hierarchy", "Eligible
@@ -3428,7 +3433,7 @@ the uid throughout.
    to, reads included. Past that share its own mutations and reads are refused with
    `ErrLogFull`, except its revocations (`withdraw`, `rm`, `rotate`, and the reconciler's
    deletions and first rotation write per delivery), which draw on its own revocation budgets
-   above the hard cap: a 192 KiB socket margin for its own revocations and a 256 KiB reconciler
+   above the hard cap: a 704 KiB socket margin for its own revocations and a 256 KiB reconciler
    allowance for the reconciler's. It cannot fill a log for other users, and its log lines
    cannot get another uid's mutations, reads or revocations refused, since those draw on that
    uid's own share and budgets. It can delay them through the shared store lock, by at most
@@ -4589,7 +4594,7 @@ carried by the unit rows.
 | U64 | a missing `.user/<uid>/` or `scope.key` answers `ErrScopeAbsent`, never `ErrNotFound`; inside a scope whose `scope.key` opens, a missing `entries/` directory or a missing `deliveries` record is `ErrScopeAbsent` too; `ErrNotFound` only for an entry missing from an `entries/` that exists and opened; a read (`list`, `read-for-exec`, `deliveries`, a reconciler read) on a uid with no scope creates no directory and mints no `K_u`; the first mutating operation does, writing `entries/` and an empty `deliveries` record before `scope.key` | `k3sm/pkg/keystore::TestReadDoesNotMintScope`, `TestMissingScopeIsScopeAbsent`, `TestMissingEntriesDirIsScopeAbsent`, `TestMissingDeliveriesRecordIsScopeAbsent` | pending: the user-scope store |
 | U65 | the reconciler reads `ErrScopeAbsent` as `Indeterminate` and deletes nothing; every outcome on the allow-list, not only a SAR denial, deletes only on two consecutive sweeps for the same generation; the single-server check is re-run from a fresh List before every sweep, and a second server or a failed List runs no sweep | `k3sm/pkg/keystore/reconcile::TestAbsentScopeIsIndeterminate`, `TestEveryDeletingOutcomeNeedsTwoSweeps`, `TestSingleServerRecheckedBeforeEverySweep` | pending: the KeyDelivery reconciler (lifecycle) |
 | U66 | the GeneratedUID lookup recognises the synthesized compatibility form (prefix `FFFFEEEE-DDDD-CCCC-BBBB-AAAA`) and answers `ErrScopeOwnerUnknown`, never a changed owner, and no mint binds it; `ErrScopeOwnerChanged` only when a real, non-synthesized GeneratedUID differs from the bound one (seam: GeneratedUID lookup) | `k3sm/pkg/keystore::TestSynthesizedGeneratedUIDIsUnknown` | pending: the user-scope store |
-| U67 | the revocation class (`withdraw`, `rm`, `rotate`, the withdrawal's floor line, the reconciler's `deliver-delete`, its `deliver-write` of a withdrawal and its rotation write) is charged to the share while it has room and past it bypasses the share and the hard cap, drawing on its uid's own budgets per log, counted per uid from the log: a 256 KiB reconciler allowance for the reconciler's lines and a separate 192 KiB socket margin for the uid's own `withdraw`, `rm` and `rotate` and their floor lines; neither budget can draw on the other; only the budget a line draws on running out refuses it, so one uid's revocations are never refused because of another uid: uid A uses up its budgets and uid B's revocation still succeeds; a uid with 64 live deliveries past its share still revokes from its socket margin, and spending that margin leaves the reconciler allowance whole; a no-op `rm`, `withdraw` or `rotate` is charged like any line and refused past the share; a log passes the hard cap by at most 320 KiB per user scope, plus the 1 MiB reconciler budget | `k3sm/pkg/keystore/socket::TestRevocationBypassesShareUsesReserve`, `TestNoOpRevocationChargedToShare`, `TestReserveKeepsReconcilerPart`, `TestRevocationAllowanceIsPerUID`, `TestSocketMarginSeparateFromReconcilerAllowance` | pending: the socket operations |
+| U67 | the revocation class (`withdraw`, `rm`, `rotate`, the withdrawal's floor line, the reconciler's `deliver-delete`, its `deliver-write` of a withdrawal and its rotation write) is charged to the share while it has room and past it bypasses the share and the hard cap, drawing on its uid's own budgets per log, counted per uid from the log: a 256 KiB reconciler allowance for the reconciler's lines and a separate 704 KiB socket margin for the uid's own `withdraw`, `rm` and `rotate` and their floor lines; neither budget can draw on the other; only the budget a line draws on running out refuses it, so one uid's revocations are never refused because of another uid: uid A uses up its budgets and uid B's revocation still succeeds; a uid with 64 live deliveries past its share still revokes from its socket margin, and spending that margin leaves the reconciler allowance whole; a no-op `rm`, `withdraw` or `rotate` is charged like any line and refused past the share; a log passes the hard cap by at most 320 KiB per user scope, plus the 1 MiB reconciler budget | `k3sm/pkg/keystore/socket::TestRevocationBypassesShareUsesReserve`, `TestNoOpRevocationChargedToShare`, `TestReserveKeepsReconcilerPart`, `TestRevocationAllowanceIsPerUID`, `TestSocketMarginSeparateFromReconcilerAllowance` | pending: the socket operations |
 | U68 | root never acts by path where the service user can write: run as root (a root-run row, `--root`), the maintenance verbs refuse a symlink or a swapped file planted at the marker, either staging name or the old log, create through one data-root descriptor with `O_CREAT\|O_EXCL\|O_NOFOLLOW`, `fchflags` on the held descriptor after the `renameat` and `fchown` to the service user on it only after the flag, never renaming a flagged file or over one, and leave every byte of both logs unchanged on a refusal | `k3sm/cmd/k3sm::TestMaintenanceRefusesPlantedSymlinkAndSwap` (integration, root-run) | pending: the append-only files |
 | U69 | the client pins the server: it reads the peer's audit token (`LOCAL_PEERTOKEN`) and refuses, writing nothing, unless the peer's cdhash equals the cdhash of the installed `/Library/k3sm/k3sm`; a service-user peer that is another binary, a reused pid, a code lookup error, an old server after an upgrade (which prints the restart message) and a listener inherited or passed to another process are each refused (seams: peer-credential source, client side; server code identity) | `k3sm/cmd/k3sm::TestClientPinsServerByInstalledCDHash`, `TestClientRefusesServiceUIDPeerOfOtherCode`, `TestClientRefusesReusedPeerPID`, `TestClientCDHashMismatchNamesRestart`, `TestClientPinWithInheritedOrPassedListener` | pending: the non-root CLI and `exec` |
 | U70 | (helper variant only) the floor helper admits only a peer that runs as the service uid and whose audit token resolves to the installed binary's cdhash, and the server admits only a helper that runs as root and is that binary; it refuses every request but `append` and `read` | `k3sm/pkg/keystore/floorhelper::TestFloorHelperPeerPinned`, `TestFloorHelperRefusesOtherRequests` | pending: the K0 amendment (helper variant only) |

@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -51,47 +52,77 @@ func TestCheckLogBoundsRefusesSpentRevocationBudget(t *testing.T) {
 	}
 }
 
-// The revocation budget holds at least two whole lines.
+// The revocation budget holds at least one worst-case burial plus its audit
+// line: maxBurialTombstones tombstones under the longest scope and name,
+// and the longest rm audit line.
 func TestCheckConfigRevocationBudgetFloor(t *testing.T) {
-	s, _ := newTestStore(t)
-	s.logRevokeBudget = 2*maxLogLine - 1
-	if err := s.checkConfig(); !errors.Is(err, errInvalidConfig) {
-		t.Fatalf("checkConfig with a budget under two lines: %v, want errInvalidConfig", err)
+	tomb, rm, _, _ := worstRevocationLines(t)
+	floor := int64(maxBurialTombstones*tomb + rm)
+	if minLogRevokeBudget < floor || minLogRevokeBudget < 2*maxLogLine {
+		t.Fatalf("minLogRevokeBudget %d is under one worst-case burial plus its audit line, %d", int64(minLogRevokeBudget), floor)
 	}
-	s.logRevokeBudget = 2 * maxLogLine
+	s, _ := newTestStore(t)
+	s.logRevokeBudget = minLogRevokeBudget - 1
+	if err := s.checkConfig(); !errors.Is(err, errInvalidConfig) {
+		t.Fatalf("checkConfig with a budget under one burial: %v, want errInvalidConfig", err)
+	}
+	s.logRevokeBudget = minLogRevokeBudget
 	if err := s.checkConfig(); err != nil {
-		t.Fatalf("checkConfig with a budget of two lines: %v", err)
+		t.Fatalf("checkConfig with a budget of one burial: %v", err)
 	}
 }
 
-// The default budget holds one scope's full revocation: every entry rm'd
-// under the longest scope and name, each a floor tombstone and an audit
-// line; and logReadBound stays overflow-free at the caps' bounds with it.
-func TestDefaultRevocationBudgetHoldsFullRevocation(t *testing.T) {
+// worstRevocationLines is the longest line of each revocation: an rm's
+// tombstone and audit line under the longest scope and a 253-byte name,
+// and a withdraw's floor line and audit line, at the longest result and a
+// full RFC3339Nano timestamp.
+func worstRevocationLines(t *testing.T) (tomb, rmAudit, withdrawFloor, withdrawAudit int) {
+	t.Helper()
 	scope := userScopeOf(maxScopeUID)
 	name := strings.Repeat("a", maxNameLen)
-	tomb, err := tombLine(scope, name, [generationSize]byte{})
+	tl, err := tombLine(scope, name, [generationSize]byte{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	worst := 0
+	fl, err := floorLine(scope, deliveriesFloorName, [generationSize]byte{}, math.MaxUint64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := time.Date(2026, 12, 31, 23, 59, 59, 999999999, time.UTC)
 	for _, result := range []string{"ok", "committed", "scope-absent", "not-found", "log-full", "corrupt", "error"} {
-		al, err := marshalAuditLine(auditLine{op: "rm", scope: scope, name: name, result: result}, time.Date(2026, 12, 31, 23, 59, 59, 999999999, time.UTC))
+		al, err := marshalAuditLine(auditLine{op: "rm", scope: scope, name: name, result: result}, ts)
 		if err != nil {
 			t.Fatal(err)
 		}
-		worst = max(worst, len(al))
+		rmAudit = max(rmAudit, len(al))
+		wl, err := marshalAuditLine(auditLine{op: "withdraw", scope: scope, namespace: strings.Repeat("n", 63), delivery: "00000000-0000-0000-0000-000000000000", result: result}, ts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		withdrawAudit = max(withdrawAudit, len(wl))
 	}
-	need := int64(maxScopeEntries * (len(tomb) + worst))
+	return len(tl), rmAudit, len(fl), withdrawAudit
+}
+
+// The default budget holds one scope's full revocation: every entry rm'd
+// under the longest scope and name, each a burial of maxBurialTombstones
+// tombstones and an audit line, and maxDeliveries withdraws, each a floor
+// line and an audit line; and logReadBound stays overflow-free at the
+// caps' bounds with it.
+func TestDefaultRevocationBudgetHoldsFullRevocation(t *testing.T) {
+	tomb, rm, wFloor, wAudit := worstRevocationLines(t)
+	need := int64(maxScopeEntries*(maxBurialTombstones*tomb+rm) + maxDeliveries*(wFloor+wAudit))
 	if defaultLogRevocationBytes < need {
 		t.Fatalf("defaultLogRevocationBytes %d is under one scope's full revocation, %d", int64(defaultLogRevocationBytes), need)
 	}
-	if defaultLogRevocationBytes > maxLogRevokeBudget || defaultLogRevocationBytes < 2*maxLogLine {
+	if defaultLogRevocationBytes > maxLogRevokeBudget || defaultLogRevocationBytes < minLogRevokeBudget {
 		t.Fatalf("defaultLogRevocationBytes %d is outside its bounds", int64(defaultLogRevocationBytes))
 	}
 	s, _ := newTestStore(t)
-	s.logHardCap, s.logRevokeBudget = maxLogHardCap, defaultLogRevocationBytes
-	if b := s.logReadBound(); b <= s.logHardCap || b < 0 {
-		t.Fatalf("logReadBound() = %d, overflowed", b)
+	for _, budget := range []int64{defaultLogRevocationBytes, maxLogRevokeBudget} {
+		s.logHardCap, s.logRevokeBudget = maxLogHardCap, budget
+		if b := s.logReadBound(); b <= s.logHardCap || b < 0 {
+			t.Fatalf("logReadBound() = %d at budget %d, overflowed", b, budget)
+		}
 	}
 }

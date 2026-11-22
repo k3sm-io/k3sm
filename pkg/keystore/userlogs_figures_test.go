@@ -49,7 +49,7 @@ func TestLogErrorsNameNoFigures(t *testing.T) {
 		}
 		appendLogBytes(t, s, userFloorLogName, bytes.Repeat(line, (4<<20)/len(line)))
 		size := len(readLog(t, s, userFloorLogName))
-		s.logSoftCap, s.logHardCap, s.logRevokeBudget = 1, 1, 2*maxLogLine
+		s.logSoftCap, s.logHardCap, s.logRevokeBudget = 1, 1, minLogRevokeBudget
 		_, _, err = u.Current(ctx, "user/1001/token")
 		if !errors.Is(err, errFloorLogMalformed) || strings.Contains(err.Error(), strconv.Itoa(size)) || strings.Contains(err.Error(), strconv.FormatInt(s.logReadBound(), 10)) {
 			t.Fatalf("current over a floor past the reader's bound: %v, want it refused naming no size", err)
