@@ -901,6 +901,18 @@ func (u *UserScope) withdrawBody(root *os.Root, uid string) (string, bool, error
 			}
 			return ns, true, u.s.userFloor.append(u.scope, deliveriesFloorName, o.gen, seq, true)
 		}
+		if errors.Is(rd.unverified, errFloorDegraded) {
+			// The floor's damage could name the record, so a line above
+			// what its whole lines hold may be lost, and this copy may be
+			// older than it: any delivery live here could have been
+			// withdrawn by it. Resealing one live would undo that withdraw,
+			// so every delivery is sealed withdrawn (a withdraw keeps none
+			// live), above both the record's and the floor's sequence.
+			seq = max(seq, rd.floor)
+			for j := range ds {
+				ds[j].withdrawn = true
+			}
+		}
 		if seq == math.MaxUint64 {
 			return ns, false, errDeliveriesLastSeq
 		}
