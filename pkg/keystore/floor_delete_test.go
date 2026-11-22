@@ -80,6 +80,11 @@ func TestDeleteBuriesPastPlantedNames(t *testing.T) {
 	if testing.Short() {
 		t.Skip("plants over maxDirNames files")
 	}
+	if raceEnabled {
+		// Single-goroutine file creation, which the race detector only
+		// slows; the plain run covers it.
+		t.Skip("plants over maxDirNames files; run without -race")
+	}
 	ctx := context.Background()
 	s, server := newTestStore(t)
 	mustPut(t, s, "k", KindOpaque, []byte("one"))
