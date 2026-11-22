@@ -2720,7 +2720,8 @@ func TestKeysFloorMergeTakesNoFile(t *testing.T) {
 // since the backup because the per-name cap binds is refused (exit 1),
 // naming the cap and --accept-drops; an rm under the guard is kept, and
 // --accept-drops writes the merge, prints each burial dropped, exits 4 and
-// clears the guard.
+// clears the guard. --dry-run exits as the real run would: 1, and 4 with
+// --accept-drops.
 func TestKeysFloorMergeAcceptDrops(t *testing.T) {
 	h := newKeysHarness(t)
 	h.put("system/k", []byte("v"))
@@ -2738,6 +2739,13 @@ func TestKeysFloorMergeAcceptDrops(t *testing.T) {
 	stageKeystore(t, h)
 	if code := h.run("floor", "merge"); code != keysRefused || !strings.Contains(h.stderr.String(), "per-name cap") || !strings.Contains(h.stderr.String(), "--accept-drops") {
 		t.Fatalf("floor merge at the per-name cap: exit %d, stderr %q; want %d naming the cap and --accept-drops", code, h.stderr.String(), keysRefused)
+	}
+	// A dry run exits with the code the real run would.
+	if code := h.run("floor", "merge", "--dry-run"); code != keysRefused || !strings.Contains(h.stdout.String(), "dropped system/k:") {
+		t.Fatalf("floor merge --dry-run at the per-name cap: exit %d, stdout %q; want %d with the drop reported", code, h.stdout.String(), keysRefused)
+	}
+	if code := h.run("floor", "merge", "--dry-run", "--accept-drops"); code != keysCommitted || !strings.Contains(h.stdout.String(), "dropped system/k:") {
+		t.Fatalf("floor merge --dry-run --accept-drops: exit %d, stdout %q, stderr %q; want %d, as the real run", code, h.stdout.String(), h.stderr.String(), keysCommitted)
 	}
 	if code := h.run("floor", "merge", "--accept-drops"); code != keysCommitted {
 		t.Fatalf("floor merge --accept-drops: exit %d, stderr %q; want %d", code, h.stderr.String(), keysCommitted)

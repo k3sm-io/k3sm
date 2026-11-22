@@ -1062,8 +1062,12 @@ func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 		fmt.Fprintf(env.stdout, "dropped %s: a deleted generation dropped to keep the floor within its caps; a copy of it put back is accepted\n", qualify(name))
 	}
 	if *dryRun {
+		// The code the real run would exit with.
 		if err != nil {
 			return v.failf(keysRefused, "%v", err)
+		}
+		if len(r.Dropped) > 0 {
+			return v.failf(keysCommitted, "dry run: the merge would drop %d deleted generation(s) to keep the floor within its caps", len(r.Dropped))
 		}
 		return keysOK
 	}
