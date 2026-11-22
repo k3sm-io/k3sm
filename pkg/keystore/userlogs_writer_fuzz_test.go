@@ -117,9 +117,14 @@ func FuzzLogWriter(f *testing.F) {
 			case 0, 1:
 				_ = fl.append(scope, name, gen, uint64(1+d.next()%9), d.next()%2 == 0)
 			case 2:
-				if name != deliveriesFloorName {
-					_ = fl.bury(scope, name, gen)
+				if name == deliveriesFloorName {
+					break
 				}
+				if d.next()%4 != 0 {
+					_ = fl.bury(scope, name, gen)
+					break
+				}
+				writerFuzzTornBurial(t, s, fl, maxKeys, scope, name)
 			case 3:
 				_ = al.append(auditLine{op: "rm", scope: scope, name: name, result: "ok", revoke: d.next()%2 == 0})
 			case 4:
@@ -169,7 +174,70 @@ func FuzzLogWriter(f *testing.F) {
 				if lg.floor && want.keys > maxKeys {
 					t.Fatalf("%s: %d keys past the bound %d", where, want.keys, maxKeys)
 				}
+				for u, n := range want.pastCap {
+					if n > s.logRevokeBudget {
+						t.Fatalf("%s: uid %d charged %d bytes past the hard cap, over its revocation budget %d", where, u, n, s.logRevokeBudget)
+					}
+				}
 			}
 		}
 	})
+}
+
+// writerFuzzTornBurial tears a three-tombstone burial for (scope, name) at
+// every byte, cut 0 to its whole length, over the floor as it stands: at
+// each cut the writer's cached reading agrees with one from scratch, and a
+// cut inside a tombstone that reaches into the scope's digits leaves that
+// tombstone's key tainted or buried. The floor is put back as it was.
+func writerFuzzTornBurial(t *testing.T, s *FileStore, fl *fileFloorLog, maxKeys int, scope, name string) {
+	t.Helper()
+	base := readLog(t, s, userFloorLogName)
+	burial := []byte{'\n'}
+	var starts []int
+	for g := range 3 {
+		line, err := tombLine(scope, name, guid(byte(g)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		starts = append(starts, len(burial))
+		burial = append(burial, line...)
+	}
+	for cut := 0; cut <= len(burial); cut++ {
+		b := append(append([]byte(nil), base...), burial[:cut]...)
+		rewriteLog(t, s, userFloorLogName, b, false)
+		want := writerFuzzFresh(t, s, true, maxKeys)
+		got := writerFuzzSync(t, fl.log)
+		where := fmt.Sprintf("torn burial of %s %s at %d", scope, name, cut)
+		if want.bad != nil || got.bad != nil {
+			// Foreign tombstones past the key bound, which the writer never
+			// writes: only the verdict's class is the same.
+			if diffClass(got.bad) != diffClass(want.bad) {
+				t.Fatalf("%s: cached verdict %v, from scratch %v", where, got.bad, want.bad)
+			}
+			continue
+		}
+		if diffClass(got.bad) != diffClass(want.bad) || got.off != want.off || got.keys != want.keys || got.damaged() != want.damaged() {
+			t.Fatalf("%s: cached verdict %v at %d with %d keys and %d damaged, from scratch %v at %d with %d and %d", where, got.bad, got.off, got.keys, got.damaged(), want.bad, want.off, want.keys, want.damaged())
+		}
+		if !maps.Equal(got.maxSeq, want.maxSeq) || !maps.Equal(got.buried, want.buried) || !maps.Equal(got.pastCap, want.pastCap) {
+			t.Fatalf("%s: cached state differs from a reading from scratch", where)
+		}
+		if len(want.taintNames)+len(want.taintGens)+len(want.taintPrefixes) >= maxTaintKeys {
+			continue
+		}
+		for i, at := range starts {
+			end := len(burial)
+			if i+1 < len(starts) {
+				end = starts[i+1]
+			}
+			if cut-at < len("user/1") || cut >= end {
+				continue
+			}
+			k := floorKey{scope, name, guid(byte(i))}
+			if !want.tainted(k) && !want.buried[k] {
+				t.Fatalf("%s: tombstone %d torn at %d bytes leaves %+v neither tainted nor buried", where, i, cut-at, k)
+			}
+		}
+	}
+	rewriteLog(t, s, userFloorLogName, base, false)
 }
