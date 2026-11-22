@@ -85,7 +85,9 @@
 # shape (root runs the verbs and owns the data root, the service user owns the
 # store; the tests take the service user from K3SM_KEYSTORE_TEST_UID and
 # K3SM_KEYSTORE_TEST_GID, or the local user _k3sm). It builds the test binary
-# as the invoking user and runs only that binary under sudo -n. It passes when
+# as the invoking user and runs only that binary under sudo -n, from the
+# package's source directory as go test does, so the tests that read the
+# source tree find it; root builds nothing. It passes when
 # no test failed and the binary exited 0. It then runs the root-run rows
 # (declared with rootpend or rootcheck): each by name, in its own k3sm
 # package's binary, built the same way and run the same way. A checked
@@ -221,8 +223,7 @@ run_root() {
 		echo "R1 FAIL as root: the test binary did not build"
 		return 1
 	fi
-	# The committed fuzz corpus is read from ./testdata, beside the binary.
-	if ! cp -R pkg/keystore/testdata "$t/testdata" || ! mkdir "$t/tmp"; then
+	if ! mkdir "$t/tmp"; then
 		echo "R1 FAIL as root: could not lay out $t"
 		return 1
 	fi
@@ -234,7 +235,10 @@ run_root() {
 	root_ids=()
 	if [ -n "${K3SM_KEYSTORE_TEST_UID+set}" ]; then root_ids+=("K3SM_KEYSTORE_TEST_UID=$K3SM_KEYSTORE_TEST_UID"); fi
 	if [ -n "${K3SM_KEYSTORE_TEST_GID+set}" ]; then root_ids+=("K3SM_KEYSTORE_TEST_GID=$K3SM_KEYSTORE_TEST_GID"); fi
-	out="$(cd "$t" && sudo -n env TMPDIR="$t/tmp" ${root_ids[@]+"${root_ids[@]}"} ./keystore.test -test.count=1 -test.v 2>&1)" || rc=$?
+	# The binary runs in the package's source directory, as go test runs it,
+	# so the tests that read the source tree (and the committed fuzz corpus
+	# in ./testdata) find it. Root only runs the binary built above.
+	out="$(cd "$K3SM_ROOT/pkg/keystore" && sudo -n env TMPDIR="$t/tmp" ${root_ids[@]+"${root_ids[@]}"} "$t/keystore.test" -test.count=1 -test.v 2>&1)" || rc=$?
 	# sudo -n that cannot run the binary prints only its own refusal.
 	if [ "$rc" -ne 0 ] && ! grep -q -- '^=== RUN' <<<"$out" && grep -q '^sudo: ' <<<"$out"; then
 		printf '%s\n' "$out"
@@ -254,8 +258,10 @@ run_root() {
 }
 
 # root_build sets RB to a fresh directory under root_t holding package $1's
-# test binary, pkg.test, built as the invoking user, and its testdata.
+# test binary, pkg.test, built as the invoking user, and RS to that
+# package's source directory, where the binary runs, as go test runs it.
 RB=""
+RS=""
 root_bin_n=0
 root_build() {
 	local rel d
@@ -272,8 +278,8 @@ root_build() {
 		return 1
 	fi
 	[ -f "$d/pkg.test" ] || { echo "keystore: $1 has no test binary"; return 1; }
-	if [ -d "${rel}testdata" ]; then cp -R "${rel}testdata" "$d/testdata" || return 1; fi
 	RB="$d"
+	RS="$K3SM_ROOT/${rel#./}"
 }
 
 # judge_root_row runs root-run row $1's named tests by name under sudo -n, one
@@ -293,7 +299,7 @@ judge_root_row() {
 			return 1
 		fi
 		rc=0
-		out="$(cd "$RB" && sudo -n env TMPDIR="$RB/tmp" ${root_ids[@]+"${root_ids[@]}"} ./pkg.test -test.count=1 -test.v -test.run "^($names)\$" 2>&1)" || rc=$?
+		out="$(cd "$RS" && sudo -n env TMPDIR="$RB/tmp" ${root_ids[@]+"${root_ids[@]}"} "$RB/pkg.test" -test.count=1 -test.v -test.run "^($names)\$" 2>&1)" || rc=$?
 		for t in ${names//|/ }; do
 			if grep -q -- "--- SKIP: $t " <<<"$out"; then
 				echo "$id FAIL as root: $t ($p) skipped, and a root-run row fails on SKIP"
