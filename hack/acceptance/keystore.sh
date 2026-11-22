@@ -256,7 +256,7 @@ check G20 "the reconciler only gets, creates and updates the Opaque Secrets it c
 	deliver:TestReconcilerSkipsLabelledNonOpaque deliver:TestReconcilerContinuesAfterTargetFailure \
 	deliver:TestReconcilerRedeliversAfterRmPut deliver:TestReconcilerReappliesChangedDataKey \
 	deliver:TestReconcilerNeverWritesTenantPrecreated deliver:TestReconcilerDoesNotAdoptRecreated \
-	deliver:TestReconcilerRecordsCreatedUID
+	deliver:TestReconcilerRecordsCreatedUID deliver:TestReconcilerReappliesDrift deliver:TestReconcilerImmutableOwned
 check G21 "the rollback recipe is a byte-exact round trip: show --reveal into rotate --in -, the new version compared with version N byte for byte (bytes.Equal, as cmp), opaque and Ed25519" \
 	cmd:TestKeysRollbackRoundTrip
 # hack/ci.sh does not run this script, so G22 cannot recurse into it.

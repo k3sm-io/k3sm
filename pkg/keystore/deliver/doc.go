@@ -46,7 +46,11 @@ limitations under the License.
 //   - present, labelled for this entry and with the recorded UID: updates it
 //     only when its VersionAnnotation or FingerprintAnnotation differs from
 //     Store.Current's version or fingerprint, or its data is not exactly the
-//     declared key;
+//     declared key holding the stored bytes (compared in constant time, so a
+//     hand edit with the annotations left intact is re-applied and logged,
+//     without the value). An immutable one cannot be updated: it is left
+//     as it is and logged at Warn once per state change, for the operator to
+//     delete;
 //   - anything else (no label, another entry's label, no recorded UID, or a
 //     UID other than the recorded one): leaves it alone and logs why. The
 //     label is forgeable by anyone who can write Secrets in the namespace;

@@ -185,6 +185,11 @@ data key `value` unless you pass `--data-key`. An `ed25519` entry is delivered a
 
 - **Rotation reaches the Secret.** After a `rotate`, the server updates the Secret within a
   minute. The Secret's `k3sm.io/keystore-version` annotation says which version it holds.
+- **Edits are undone.** The server compares the Secret's data with the stored value, so a hand
+  edit is put back within a minute, and logged without the value.
+- **An immutable Secret is stuck.** If someone sets `immutable: true` on a Secret the server
+  delivered, the server cannot update it, and logs a warning each time that changes. Delete the
+  Secret with kubectl; the server creates it again. The server never deletes it for you.
 - **Only its own Secrets.** The server labels each Secret it creates
   `k3sm.io/keystore-delivery: <entry>`, and records the Secret's UID in
   `/var/lib/k3sm/keystore-delivery-state.json` (owned by root, mode 0600). It only ever updates a

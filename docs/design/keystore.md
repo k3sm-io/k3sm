@@ -785,11 +785,15 @@ and a create happens only after the state file was written successfully in that 
 **Re-delivery on rotation:** the sweep compares the target's current version and
 fingerprint (`Store.Current`'s `Version.Version` and `Version.Fingerprint`) against the
 Secret's own `k3sm.io/keystore-version` and `k3sm.io/keystore-fingerprint` annotations, and
-checks that `data` holds exactly the declared `dataKey`; any mismatch re-applies `data` and
+checks that `data` holds exactly the declared `dataKey` and that its bytes are the stored
+value (`subtle.ConstantTimeCompare`, so an edit of `data` that leaves the annotations intact is
+drift: re-applied and logged, without the value); any mismatch re-applies `data` and
 both annotations — content-derived, like the embedded reconciler's own checksum-skip. The
 version alone is not enough: an entry deleted and put back starts at version 1 again with a
 new value, and `pkg/keystore` exposes no generation, so the value's fingerprint is what
-tells the two apart. A changed `dataKey` re-applies too, and the stale key leaves `data`.
+tells the two apart. A changed `dataKey` re-applies too, and the stale key leaves `data`. An `immutable` Secret
+the reconciler owns cannot be updated; it is logged at Warn once per state change, for the
+operator to delete, and Phase A never deletes it.
 
 **Refusal while secrets encryption is off.** Delivery is refused by default; the override
 is explicit, as the maintainer answered on the issue. Two facts the first revision got

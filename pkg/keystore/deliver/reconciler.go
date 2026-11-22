@@ -18,6 +18,7 @@ package deliver
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -361,9 +362,23 @@ func (r *Reconciler) converge(ctx context.Context, sw *sweep, t Target) {
 		r.create(ctx, sw, t, ver, want, value)
 		return
 	}
-	if upToDate(cur, want, ver.Fingerprint, t.Key()) {
+	stamped, current := upToDate(cur, want, ver.Fingerprint, t.Key(), value)
+	if current {
 		r.note(t, "ok:"+want, slog.LevelInfo, "delivered", "version", ver.Version, "plaintext", !r.encryptionOn)
 		return
+	}
+	if cur.Immutable != nil && *cur.Immutable {
+		r.note(t, "immutable:"+want+":"+ver.Fingerprint, slog.LevelWarn,
+			"Secret is immutable, so it cannot be re-delivered; delete it and the next sweep creates it again",
+			"version", ver.Version)
+		return
+	}
+	if stamped {
+		// Its stamps say current and its content does not: someone edited
+		// it. Logged every time, since each edit is its own event; the value
+		// is never logged.
+		r.logger.Warn("keystore delivery: Secret drifted from the stored value; re-applying",
+			"entry", "system/"+t.Name, "namespace", t.Namespace, "secret", t.Secret(), "version", ver.Version)
 	}
 	next := cur.DeepCopy()
 	if next.Annotations == nil {
@@ -445,16 +460,21 @@ func (r *Reconciler) create(ctx context.Context, sw *sweep, t Target, ver keysto
 	r.note(t, "ok:"+want, slog.LevelInfo, "delivered", "version", ver.Version, "plaintext", !r.encryptionOn)
 }
 
-// upToDate reports whether a Secret labelled for the entry already holds the
-// current value under exactly the declared data key: its version and
-// fingerprint annotations match, and data has that one key and no other, so
-// a changed --data-key re-applies and drops the stale key.
-func upToDate(cur *corev1.Secret, version, fingerprint, key string) bool {
+// upToDate reports whether a Secret this server owns holds the current
+// value: stamped when its version and fingerprint annotations match, and
+// current when, as well, data holds exactly the declared key and no other
+// (so a changed --data-key re-applies and drops the stale key) and that key's
+// bytes are the stored value. The bytes are compared in constant time; the
+// annotations alone would leave a hand edit of data in place.
+func upToDate(cur *corev1.Secret, version, fingerprint, key string, value []byte) (stamped, current bool) {
 	if cur.Annotations[VersionAnnotation] != version || cur.Annotations[FingerprintAnnotation] != fingerprint {
-		return false
+		return false, false
 	}
-	_, ok := cur.Data[key]
-	return ok && len(cur.Data) == 1 && len(cur.StringData) == 0
+	got, ok := cur.Data[key]
+	if !ok || len(cur.Data) != 1 || len(cur.StringData) != 0 {
+		return true, false
+	}
+	return true, subtle.ConstantTimeCompare(got, value) == 1
 }
 
 // statSignature is the identity of a declaration state that was refused: a

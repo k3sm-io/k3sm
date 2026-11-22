@@ -930,3 +930,63 @@ func TestReconcilerRecordsCreatedUID(t *testing.T) {
 		t.Fatalf("the withdrawn target's UID is still recorded (%v):\n%s", err, b)
 	}
 }
+
+// TestReconcilerReappliesDrift: a Secret whose data was edited with the
+// annotations left as they were is re-applied, and the drift is logged
+// without the value (G20).
+func TestReconcilerReappliesDrift(t *testing.T) {
+	h := newHarness(t, true, false)
+	h.store.set("api-token", 1, []byte("the-stored-value"))
+	h.declare(t, Target{Name: "api-token", Namespace: "payments"})
+	ctx := context.Background()
+	h.r.Sweep(ctx)
+	edited := h.secret(t, "payments", "api-token")
+	edited.Data[DefaultDataKey] = []byte("edited-by-hand")
+	if _, err := h.client.CoreV1().Secrets("payments").Update(ctx, edited, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	h.r.Sweep(ctx)
+	if got := string(h.secret(t, "payments", "api-token").Data[DefaultDataKey]); got != "the-stored-value" {
+		t.Fatalf("drifted data was not re-applied: %q", got)
+	}
+	logs := h.logs.String()
+	if !strings.Contains(logs, "drift") {
+		t.Fatalf("the drift is not logged\n%s", logs)
+	}
+	for _, v := range []string{"the-stored-value", "edited-by-hand"} {
+		if strings.Contains(logs, v) {
+			t.Fatalf("the log carries a value %q\n%s", v, logs)
+		}
+	}
+}
+
+// TestReconcilerImmutableOwned: an immutable Secret the reconciler owns
+// cannot be updated, so it is not, and the reason is logged at Warn once per
+// state change, telling the operator to delete it (G20).
+func TestReconcilerImmutableOwned(t *testing.T) {
+	h := newHarness(t, true, false)
+	h.store.set("api-token", 1, []byte("one"))
+	h.declare(t, Target{Name: "api-token", Namespace: "payments"})
+	ctx := context.Background()
+	h.r.Sweep(ctx)
+	s := h.secret(t, "payments", "api-token")
+	yes := true
+	s.Immutable = &yes
+	if _, err := h.client.CoreV1().Secrets("payments").Update(ctx, s, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	h.client.ClearActions()
+	h.store.set("api-token", 2, []byte("two"))
+	h.r.Sweep(ctx)
+	h.r.Sweep(ctx)
+	if n := h.updates(); n != 0 {
+		t.Fatalf("an immutable Secret drew %d updates: %v", n, h.verbs())
+	}
+	logs := h.logs.String()
+	if n := strings.Count(logs, `level=WARN msg="keystore delivery: Secret is immutable`); n != 1 {
+		t.Fatalf("logged the immutable Secret %d times over two sweeps, want once at Warn\n%s", n, logs)
+	}
+	if !strings.Contains(logs, "delete it") {
+		t.Fatalf("the warning does not tell the operator to delete it\n%s", logs)
+	}
+}
