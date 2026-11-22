@@ -172,6 +172,8 @@ func FuzzLogSyncDifferential(f *testing.F) {
 		maxKeys := 1 + d.next()%8
 		var floorBuf, auditBuf []byte
 		incFloor, incAudit := newDiffLog(s, true, maxKeys, &floorBuf), newDiffLog(s, false, maxKeys, &auditBuf)
+		probe := append([]byte(nil), d.b...)
+		defer diffPrefixTaints(t, s, maxKeys, &floorBuf, &diffInput{probe})
 		for i, batch := range diffStream(d) {
 			for _, it := range batch {
 				floorBuf = append(floorBuf, it.floor...)
@@ -203,6 +205,21 @@ func FuzzLogSyncDifferential(f *testing.F) {
 					t.Fatalf("%s: incremental per-uid key counts %v, from scratch %v", where, got.uidKeys, want.uidKeys)
 				}
 				if lg.inc.l.whole {
+					// The taint set is deterministic: the incremental reader
+					// and one from scratch taint the same keys and mark the
+					// same unattributable damage.
+					ga, gok := got.unattributedAt()
+					wa, wok := want.unattributedAt()
+					if !maps.Equal(got.taintNames, want.taintNames) || !maps.Equal(got.taintGens, want.taintGens) || ga != wa || gok != wok {
+						t.Fatalf("%s: incremental taint %v %v unattributable %v@%d, from scratch %v %v %v@%d", where, got.taintNames, got.taintGens, gok, ga, want.taintNames, want.taintGens, wok, wa)
+					}
+					for _, k := range diffKeys() {
+						if got.tainted(k) != want.tainted(k) {
+							t.Fatalf("%s: %+v tainted %v incrementally, %v from scratch", where, k, got.tainted(k), want.tainted(k))
+						}
+					}
+				}
+				if lg.inc.l.whole {
 					// Empty lines, an append's leading newlines, are benign:
 					// the floor without them reads the same.
 					bare := stripEmptyLines(*lg.inc.buf)
@@ -224,4 +241,56 @@ func FuzzLogSyncDifferential(f *testing.F) {
 			}
 		}
 	})
+}
+
+// diffKeys is every key diffStream's floor lines can name.
+func diffKeys() []floorKey {
+	var out []floorKey
+	for uid := 1001; uid <= 1003; uid++ {
+		for _, name := range []string{"k0", "k1", "k2", "k3", deliveriesFloorName} {
+			for g := range 3 {
+				out = append(out, floorKey{fmt.Sprintf("user/%d", uid), name, guid(byte(g))})
+			}
+		}
+	}
+	return out
+}
+
+// diffPrefixTaints checks, after the stream, that a prefix of a valid line
+// for a key K, drawn from d, taints K once it holds K's scope and name and
+// their spaces, whether it is the floor's torn last line or a line an append
+// closed: as K's name while its generation is partial, as K once it is whole.
+func diffPrefixTaints(t *testing.T, s *FileStore, maxKeys int, buf *[]byte, d *diffInput) {
+	t.Helper()
+	if t.Failed() {
+		return
+	}
+	k := diffKeys()[d.next()%len(diffKeys())]
+	var line []byte
+	if d.next()%2 == 0 && k.name != deliveriesFloorName {
+		line = fmt.Appendf(nil, "%s %s %x rm", k.scope, k.name, k.gen[:])
+	} else {
+		line = fmt.Appendf(nil, "%s %s %x %d", k.scope, k.name, k.gen[:], 1+d.next()*977)
+	}
+	head := len(k.scope) + 1 + len(k.name) + 1
+	n := head + d.next()%(len(line)-head)
+	for _, closed := range []bool{false, true} {
+		b := append(append(append([]byte(nil), *buf...), '\n'), line[:n]...)
+		if closed {
+			if _, err := parseFloorLine(line[:n]); err == nil {
+				continue // a closed prefix that is itself a whole line is no damage
+			}
+			b = append(b, '\n')
+		}
+		st := newDiffLog(s, true, maxKeys, &b).sync(t)
+		if st.bad != nil {
+			return
+		}
+		if !st.nameTainted(k.scope, k.name) && !st.tainted(k) {
+			t.Fatalf("the prefix %q (closed %v) of a line for %+v does not taint it", line[:n], closed, k)
+		}
+		if n >= head+2*generationSize && !st.tainted(k) {
+			t.Fatalf("the prefix %q (closed %v) with a whole generation does not taint %+v", line[:n], closed, k)
+		}
+	}
 }

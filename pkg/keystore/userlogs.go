@@ -455,6 +455,9 @@ type appendLog struct {
 	// mu guards state: reads under the shared store lock run together.
 	mu    sync.Mutex
 	state logState
+	// servedWarned is the floor files a known generation was served over
+	// damage in, each logged at Warn once (warnServedOverDamage); under mu.
+	servedWarned map[fileID]bool
 }
 
 // logState is what has been read of one file.
@@ -515,6 +518,19 @@ type logState struct {
 	// keeps that size, and reading resumes at off, the torn line's start,
 	// once an append closes it.
 	tornSize int64
+	// The floor's taint (userfloor_taint.go): taintNames and taintGens are
+	// the keys skipped lines could have named, taintBytes what they are
+	// charged against the cap; unattrib and unattribAt mark unattributable
+	// damage and the start of the latest; tornKind, tornKey and tornAt are
+	// the torn last line's, in force while tornSize is.
+	taintNames map[nameKey]bool
+	taintGens  map[floorKey]bool
+	taintBytes int
+	unattrib   bool
+	unattribAt int64
+	tornKind   taintKind
+	tornKey    floorKey
+	tornAt     int64
 }
 
 // damaged is the count of damaged lines: those skipped, and a last line
@@ -792,6 +808,9 @@ func (l *appendLog) syncRead(f *os.File, st unix.Stat_t) (*logState, error) {
 				s.badAt = off
 			}
 			s.off, s.tornSize = off, st.Size
+			if l.whole {
+				s.tornTaint(off, line)
+			}
 			return s, nil
 		}
 		if errors.Is(err, errLogLineTooLong) {
@@ -804,12 +823,14 @@ func (l *appendLog) syncRead(f *os.File, st unix.Stat_t) (*logState, error) {
 					s.badAt = off
 				}
 				s.off, s.tornSize = off, st.Size
+				s.tornKind, s.tornAt = taintUnattributable, off
 				return s, nil
 			case serr != nil:
 				s.off = off
 				return nil, l.unreadable(off, serr)
 			}
 			s.skip(off)
+			s.unattributable(off)
 			off += n
 			continue
 		}
@@ -826,8 +847,12 @@ func (l *appendLog) syncRead(f *os.File, st unix.Stat_t) (*logState, error) {
 		}
 		if perr != nil {
 			// A line that does not parse is skipped and changes nothing:
-			// lineUID refuses before it records anything.
+			// lineUID refuses before it records anything. On the floor
+			// it taints what it could have named.
 			s.skip(off)
+			if l.whole {
+				s.taintLine(off, line[:len(line)-1])
+			}
 			uid = 0
 		}
 		if off >= s.hardCap && uid != 0 {
@@ -868,7 +893,7 @@ func readLogLine(r *bufio.Reader) ([]byte, error) {
 		case errors.Is(err, bufio.ErrBufferFull):
 			continue
 		case errors.Is(err, io.EOF) && len(line) > 0:
-			return nil, errLogTorn
+			return line, errLogTorn
 		default:
 			return line, err
 		}
@@ -1357,30 +1382,64 @@ func (f *fileFloorLog) read(fn func(*logState)) error {
 
 func (f *fileFloorLog) check() error { return f.read(func(*logState) {}) }
 
-// floor is the floor's word on scope, name and gen. While the floor holds
-// damage, an entry generation it has no line for is errFloorDegraded: the
-// skipped line could have been its tombstone. The delivery record has no
-// tombstone, so its reads are unchanged.
+// floor is the floor's word on scope, name and gen. A tainted key
+// (userfloor_taint.go), the delivery record's included, is errFloorDegraded
+// for every generation, known or not: the skipped line could have been its
+// tombstone or a higher live line. While the floor holds unattributable
+// damage that counts, an entry generation it has no line for is
+// errFloorDegraded too; the delivery record has no tombstone, so its
+// unknown generations are not. A known, untainted generation is served over
+// damage, logged at Warn once per damaged file.
 func (f *fileFloorLog) floor(scope, name string, gen [generationSize]byte) (uint64, error) {
 	var (
-		seq           uint64
-		known, buried bool
-		damaged       int
+		seq                     uint64
+		known, buried, refusing bool
 	)
 	k := floorKey{scope, name, gen}
 	if err := f.read(func(state *logState) {
 		seq, known = state.maxSeq[k]
-		buried, damaged = state.buried[k], state.damaged()
+		buried = state.buried[k]
+		switch {
+		case buried:
+		case state.tainted(k):
+			refusing = true
+		case !known && name != deliveriesFloorName && f.unattributable(state):
+			refusing = true
+		case state.damaged() > 0:
+			f.log.warnServedOverDamage(state)
+		}
 	}); err != nil {
 		return 0, err
 	}
 	if buried {
 		return 0, errFloorBuried
 	}
-	if !known && damaged > 0 && name != deliveriesFloorName {
+	if refusing {
 		return 0, errFloorDegraded
 	}
 	return seq, nil
+}
+
+// liveRefused reports whether a live line for k is refused: k is tainted,
+// or the floor holds unattributable damage that counts and no line for k.
+func (f *fileFloorLog) liveRefused(k floorKey) (bool, error) {
+	var refused bool
+	err := f.read(func(state *logState) {
+		_, known := state.maxSeq[k]
+		refused = state.tainted(k) || (!known && f.unattributable(state))
+	})
+	return refused, err
+}
+
+// grantRefused reports whether a put's or a deliver's line for k is
+// refused: k is tainted, or the floor holds unattributable damage that
+// counts.
+func (f *fileFloorLog) grantRefused(k floorKey) (bool, error) {
+	var refused bool
+	err := f.read(func(state *logState) {
+		refused = state.tainted(k) || f.unattributable(state)
+	})
+	return refused, err
 }
 
 // damaged is the floor's count of damaged lines.
@@ -1417,13 +1476,14 @@ func (f *fileFloorLog) append(scope, name string, gen [generationSize]byte, seq 
 	if err != nil {
 		return err
 	}
-	// While the floor holds damage, only a withdraw's line, the delivery
-	// record's in the revocation class, is written: an entry's live line
-	// or a grant's could stand where a skipped tombstone was.
+	// A withdraw's line, the delivery record's in the revocation class, is
+	// always written. Any other is refused for a tainted key, or while
+	// unattributable damage counts: an entry's live line or a grant's
+	// could stand where a skipped tombstone was.
 	if name != deliveriesFloorName || !revoke {
-		if n, err := f.damaged(); err != nil {
+		if refused, err := f.grantRefused(floorKey{scope, name, gen}); err != nil {
 			return err
-		} else if n > 0 {
+		} else if refused {
 			return errFloorDegraded
 		}
 	}
@@ -1585,7 +1645,14 @@ func (s *FileStore) admit(uid uint32, revoke bool) error {
 // margin and the slack both between this check and the append. Only the
 // file-backed floor is held.
 func (s *FileStore) floorGrantRoom(scope string, names []string, write int64) error {
-	return s.floorGrantRoomKeys(scope, names, write, nil)
+	return s.floorGrantRoomKeys(scope, names, write, nil, func(st *logState) bool {
+		for _, n := range names {
+			if st.nameTainted(scope, n) {
+				return true
+			}
+		}
+		return false
+	})
 }
 
 // floorDeliverRoom is floorGrantRoom for a deliver's one floor line, the
@@ -1597,13 +1664,14 @@ func (s *FileStore) floorDeliverRoom(scope string, gen [generationSize]byte) err
 			return 0
 		}
 		return 1
-	})
+	}, func(st *logState) bool { return st.tainted(k) })
 }
 
 // floorGrantRoomKeys is floorGrantRoom with newKeys, when set, counting the
 // keys the lines add from what the floor holds; nil counts each line as a
-// new key.
-func (s *FileStore) floorGrantRoomKeys(scope string, names []string, write int64, newKeys func(*logState) int) error {
+// new key. tainted reports whether a line's key is tainted, which refuses
+// the grant as errFloorDegraded, as unattributable damage that counts does.
+func (s *FileStore) floorGrantRoomKeys(scope string, names []string, write int64, newKeys func(*logState) int, tainted func(*logState) bool) error {
 	ff, ok := s.userFloor.(*fileFloorLog)
 	if !ok {
 		return nil
@@ -1635,7 +1703,7 @@ func (s *FileStore) floorGrantRoomKeys(scope string, names []string, write int64
 	if state.bad != nil {
 		return fmt.Errorf("%w (%v)", errFloorLogMalformed, state.bad)
 	}
-	if state.damaged() > 0 {
+	if tainted(state) || ff.unattributable(state) {
 		// The grant's floor line would be refused after its commit.
 		return errFloorDegraded
 	}

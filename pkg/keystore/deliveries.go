@@ -923,9 +923,11 @@ func (u *UserScope) catchUpDeliveries(gen [generationSize]byte, rd deliveriesRea
 		return false
 	}
 	if ff, ok := u.s.userFloor.(*fileFloorLog); ok {
-		// A catch-up writes no live line while the floor holds damage.
-		if n, err := ff.damaged(); err != nil || n > 0 {
-			slog.Warn("the user-scope floor holds damage, so the delivery record's catch-up line is not written", "scope", u.scope, "err", err)
+		// A catch-up writes no live line for a tainted key, nor for a
+		// generation the floor has no line for while unattributable damage
+		// counts.
+		if refused, err := ff.liveRefused(floorKey{u.scope, deliveriesFloorName, gen}); err != nil || refused {
+			slog.Warn("the user-scope floor holds damage that could name the delivery record, so its catch-up line is not written", "scope", u.scope, "err", err)
 			return false
 		}
 	}
@@ -1216,7 +1218,10 @@ func (u *UserScope) grantLocked(ctx context.Context, g *grantAudit, fn func(*ope
 	if errors.Is(err, errNoScopeKey) {
 		// The mint and then fn each append a floor line for the delivery
 		// record: one new key, preflighted before the mint's first write.
-		if err := u.s.floorGrantRoomKeys(u.scope, []string{deliveriesFloorName, deliveriesFloorName}, 0, func(*logState) int { return 1 }); err != nil {
+		if err := u.s.floorGrantRoomKeys(u.scope, []string{deliveriesFloorName, deliveriesFloorName}, 0, func(*logState) int { return 1 }, func(st *logState) bool {
+			// The mint's floor read refuses a tainted generation itself.
+			return st.nameTainted(u.scope, deliveriesFloorName)
+		}); err != nil {
 			return err
 		}
 		_, entries, err = u.mint(root, k.wrap, grant)

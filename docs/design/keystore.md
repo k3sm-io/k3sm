@@ -1510,15 +1510,25 @@ service user can only add to.
   server logs at Warn when first seen. Skipping never removes a tombstone already read, and
   a forged valid line is the accepted same-uid model, but **a skipped line can be a
   tombstone**: a line the reader cannot parse may be the one that buried a generation. So
-  damage puts the floor in a degraded, fail-closed mode for live lines
-  (`errFloorDegraded`, which names `CheckLogBounds` and `doctor`): while the damage count
-  is above 0, no live entry line is written, neither a grant's (`put`, `deliver`, refused
-  before the first write) nor any catch-up line (`catchUpEntry`, and the delivery record's
-  catch-up, each counted and logged at Warn); an entry generation the floor holds no line
-  for is not trusted, so `current` of it is refused; and the start step refuses to start
-  over a refused live catch-up line. `rm` and `withdraw` still work: a tombstone and a
-  withdraw's delivery-record line can only revoke. Only root's `doctor` (and, once it
-  exists, `floor --rebuild`) clears the mode (`TestFloorDamageDegradesLiveLines`). Only a floor past the reader's bounds (larger than its size bound, or holding
+  damage is classified, and scoped where it can be (**damage and taint**,
+  `userfloor_taint.go`): a skipped line, the torn last line included, whose leading fields
+  parse strictly as `<scope> <name> ` (each followed by its space) and whose rest is a
+  prefix of a lowercase-hex generation **taints** `(scope, name)`; a rest that is a whole
+  32-digit generation, then nothing, or a space and nothing, `r` or `rm`, or a canonical
+  decimal prefix of at most 20 digits, taints `(scope, name, generation)` only. The delivery
+  record's name is taintable like any other, so a torn `withdraw` line taints the delivery
+  record. A tainted key is refused for every generation, known or not (`errFloorDegraded`):
+  `current` of it, a `put` or `deliver` line for it, and any catch-up line for it. Anything
+  else, a scope or name that does not parse, a rest that is the prefix of no line, or a line
+  over 1 KiB, is **unattributable** and keeps the floor-wide fail-closed rule: no `put` or
+  `deliver` line is written (refused before the first write), no catch-up line for a
+  generation the floor holds no line for, and `current` of such an entry generation is
+  refused. The taint set is capped at 64 entries or 64 KiB; a taint past the cap counts as
+  unattributable damage. A known, untainted generation is served over damage, logged at
+  Warn once per process for each damaged file. `rm` and `withdraw` still work: a tombstone
+  and a withdraw's delivery-record line can only revoke (`TestTornBurialTaintsOnlyItsKey`,
+  `TestTornWithdrawLineTaintsDeliveryRecord`,
+  `TestUnattributableDamageKeepsFloorWideRefusal`, `TestFloorDamageDegradesLiveLines`). Only a floor past the reader's bounds (larger than its size bound, or holding
   more keys than its key bound), which the server never writes, is damage that refuses with
   `ErrCorrupt` naming the matched-set restore, which brings back every entry deleted since the
   backup, and `doctor` (the rebuild verb is not yet available): every grant and read, and a
