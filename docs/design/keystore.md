@@ -3326,8 +3326,14 @@ The record kinds as merged are `KindUnknown = 0` (never written), `KindEd25519 =
   ascending, no duplicates, every required tag present, the per-kind set closed.
 - Bounds: token value at most 16 KiB, access token 32 KiB, refresh token 8 KiB, comment 255
   printable ASCII bytes, `tokenType` 32 bytes of `[A-Za-z]`, `refreshOwner` 70 bytes in the
-  refresh-owner grammar. Times are Unix seconds, int64 big-endian. The whole envelope fits
+  refresh-owner grammar. Times are Unix seconds, int64 big-endian, from the Unix epoch to
+  9999-12-31T23:59:59Z (the range RFC 3339 renders). The whole envelope fits
   `MaxValueSize` (64 KiB).
+- **One encoding per envelope.** Every byte-string field is at least 1 byte; an optional field
+  (`comment`, `refreshExpiresAt`, `tokenType`) is absent rather than empty, and an absent
+  `tokenType` means `Bearer` without being written. So decode then encode is the identity, which
+  `FuzzEnvelopeParse` asserts. Any envelope version byte other than 1, 0 included, is
+  `ErrKindUnsupported`.
 - **`issuedAt` and `accessIssuedAt` are sealed**, stamped from the server's clock seam at `put`,
   `rotate` or refresh. The `Expiring` threshold and the refresh schedule use them, never the
   record's `created` header, which stays unauthenticated display metadata: a party who can write
@@ -3625,7 +3631,11 @@ Two observers; the server holds the durable record.
 - **Library.** OpenSSH key parsing and marshalling use `golang.org/x/crypto/ssh`
   (`ParseRawPrivateKey`, `MarshalPrivateKey`, `MarshalAuthorizedKey`, `FingerprintSHA256`) in
   `pkg/keystore/typed`. `golang.org/x/crypto` is already a direct dependency of k3sm. It parses
-  untrusted input, which stays on the maintained library.
+  untrusted input, which stays on the maintained library, behind k3sm's own limits: at most
+  4 KiB of input, exactly one `OPENSSH PRIVATE KEY` PEM block with no headers and nothing but
+  whitespace around it, an ed25519 key whose private half matches its seed, and one fixed
+  refusal message that quotes no input byte. `FuzzSSHImport` covers it, with seeds in
+  `testdata/fuzz/FuzzSSHImport/`. The key's own comment is not kept; `--comment` sets it.
 - **Tests do not compare the library with itself.** `TestSSHFingerprintMatchesOpenSSH` checks
   against a committed `ssh-keygen -l -E sha256` output for a committed key (U148).
 
@@ -4242,20 +4252,20 @@ carried by the unit rows.
 | U138 | `--listed` fails on a duplicated U or E id: in the script's rows, its expected-row list, one mode's row list, or the design's gate and leg tables | `hack/acceptance/keystore.sh --listed` (its duplicate-id lint, `lint_unique_ids`) | pending: the typed-credential design |
 | U139 | `items` required, no default, 1 to 8, unique keys, the key pattern with `.` and a `..` prefix refused, both `maxLength`s, immutable as a map (a reorder accepted, a change refused), CEL cost within budget; no `dataKey` | `apis/config/crd::TestKeyDeliveryItemsSchema`, `TestItemKeyMatchesIsConfigMapKey`, `TestKeyDeliveryHasNoDataKey`, `TestItemsReorderAcceptedChangeRefused`, `TestItemsCELCostWithinBudget` | pending: the typed KeyDelivery API |
 | U140 | the `field` enum equals the credential table's union; a KeyDelivery naming `refreshToken` is refused by the schema; rig leg E31 | `apis/config/crd::TestFieldEnumEqualsCredentialTable`, `TestSchemaRefusesRefreshTokenField` | pending: the typed KeyDelivery API |
-| U141 | the credential leaf: kind names, field table vectors, no refresh field, the item type, the refresh-owner vectors, closed validity, Event and `refresh_state` sets, the metadata keys; stdlib only | `apis/keystore/credential::TestFieldTableVectors`, `TestNoRefreshField`, `TestRefreshOwnerGrammarVectors`, `TestNameSetsClosed`, `TestImportsStdlibOnly` | pending: the typed KeyDelivery API |
+| U141 | the credential leaf: kind names, field table vectors, no refresh field, the item type, the refresh-owner vectors, closed validity, Event and `refresh_state` sets, the metadata keys; stdlib only | `apis/keystore/credential::TestFieldTableVectors`, `TestNoRefreshField`, `TestRefreshOwnerGrammarVectors`, `TestNameSetsClosed`, `TestImportsStdlibOnly` | checked: the credential names in apis |
 | U142 | the CRD descriptions list the `CredentialValid` reasons and `ProjectionInvalid`, say `Ready` means delivered and that Valid, Expiring and RefreshFailing share True; every condition has `observedGeneration` | `apis/config/crd::TestKeyDeliveryReasonDescriptions`, `TestConditionsCarryObservedGeneration` | pending: the typed KeyDelivery API |
-| U143 | the envelope matches committed per-kind golden vectors; unknown tag, duplicate, disorder, missing field or out-of-bound field is `ErrCorrupt`; the fuzz invariants hold | `k3sm/pkg/keystore/typed::TestEnvelopeGoldenVectors`, `TestEnvelopeRejectsUnknownTagDuplicateAndOrder`, `FuzzEnvelopeParse` | pending: the typed store |
+| U143 | the envelope matches committed per-kind golden vectors; unknown tag, duplicate, disorder, missing field or out-of-bound field is `ErrCorrupt`; the fuzz invariants hold | `k3sm/pkg/keystore/typed::TestEnvelopeGoldenVectors`, `TestEnvelopeRejectsUnknownTagDuplicateAndOrder`, `FuzzEnvelopeParse` | checked: the typed envelope |
 | U144 | token and oauth require a sealed `issuedAt`/`accessIssuedAt` stamped from the clock seam; editing the `created` header changes no typed time | `k3sm/pkg/keystore::TestTypedIssuedAtStampedAndSealed`, `TestCreatedHeaderEditChangesNoTypedTime` | pending: the typed store |
-| U145 | a relabelled typed record fails to open; kind-byte table: 6 to 0xFC and an unknown envelope version are `ErrKindUnsupported`, 0xFD and 0xFE `ErrCorrupt`; `list` shows `unsupported` | `k3sm/pkg/keystore::TestTypedKindRelabelFailsOpen`, `TestKindByteTable` | pending: the typed store |
+| U145 | a relabelled typed record fails to open; kind-byte table: 6 to 0xFC and an unknown envelope version are `ErrKindUnsupported`, 0xFD and 0xFE `ErrCorrupt`; `list` shows `unsupported` | `k3sm/pkg/keystore::TestTypedKindRelabelFailsOpen`, `TestKindByteTable` | partial: the relabel refusal and the kind-byte table checked (the typed envelope); pending: `list` shows `unsupported` (the typed store) |
 | U146 | `rotate` and `put` over an existing entry cannot change its kind (`ErrKindMismatch`) | `k3sm/pkg/keystore::TestRotateAndPutCannotChangeKind` | pending: the typed store |
 | U147 | token needs `expiresAt`; oauth needs access token, access expiry, refresh token and an owner in the grammar | `k3sm/pkg/keystore::TestTypedPutValidation` | pending: the typed store |
-| U148 | SSH generate uses the random seam; import accepts unencrypted OpenSSH ed25519 only; the fingerprint equals a committed `ssh-keygen -l` vector | `k3sm/pkg/keystore/typed::TestSSHGenerateAndImport`, `TestSSHFingerprintMatchesOpenSSH` | pending: the typed store |
+| U148 | SSH generate uses the random seam; import accepts unencrypted OpenSSH ed25519 only; the fingerprint equals a committed `ssh-keygen -l` vector | `k3sm/pkg/keystore/typed::TestSSHGenerateAndImport`, `TestSSHFingerprintMatchesOpenSSH` | checked: the typed envelope |
 | U149 | write-only, structurally: a planted refresh token appears in no result of any exported method or consumer interface, raw, base64 or URL-encoded; `Get` returns a `typed.Credential` for kinds 3 to 5; only `refresh` (and the installing `pkg/keystore`) imports `internal/refreshopen` | `k3sm/pkg/keystore::TestPlantedRefreshTokenNeverReturned`, `TestGetReturnsRedactedCredential`, `TestRefreshOpenerImportGraph` | pending: the typed store |
 | U150 | `RotateIf` refuses a stale version | `k3sm/pkg/keystore::TestRotateIfStaleVersionRefused` | pending: the typed store |
 | U151 | oauth keeps current and one previous; the low-water mark is in the sealed pointer (24 bytes only after a prune, 16 means `low = 1`); crash-safe at every step, prune included (the prune cases of the crash test) | `k3sm/pkg/keystore::TestOAuthPruneKeepsTwo`, `TestPointerLowWaterMark`, `TestRotateCrashAtEveryStep` | pending: the typed store |
 | U152 | a pruned oauth entry: List shows it healthy, Rewrap re-seals `low..current`, Delete removes leftovers, a gap inside the range is damage, a copied-back pointer is caught | `k3sm/pkg/keystore::TestListPrunedOAuthEntryNotCorrupt`, `TestRewrapHandlesPrunedOAuth`, `TestDeletePrunedOAuthEntry`, `TestGapInsideCommittedRangeIsCorrupt`, `TestCopyBackAcrossPruneCaught` | pending: the typed store |
 | U153 | `--from-version` is refused for oauth | `k3sm/pkg/keystore::TestFromVersionRefusedForOAuth` | pending: the typed store |
-| U154 | every `Fuzz*` target in the keystore packages has a non-empty committed seed directory | `k3sm/pkg/keystore::TestEveryFuzzTargetHasSeeds` | pending: the typed store |
+| U154 | every `Fuzz*` target in the keystore packages has a non-empty committed seed directory | `k3sm/pkg/keystore::TestEveryFuzzTargetHasSeeds` | checked: the typed envelope |
 | U155 | HELLO lists capabilities; mutating ops refuse an unknown header (`unknown-header`), non-mutating ops tolerate it; the CLI refuses a typed request to a daemon without the capability | `k3sm/pkg/keystore/socket::TestHelloListsCapabilities`, `TestMutatingOpRefusesUnknownHeader`, `TestNonMutatingOpToleratesUnknownHeader`, `k3sm/cmd/k3sm::TestCLIRefusesTypedAgainstOldDaemon` | pending: the typed verbs |
 | U156 | an oauth put takes an RFC 6749 response, stamps times from the clock, drops `id_token` and unknown fields; an `error` response is refused printing only the code | `k3sm/pkg/keystore/socket::TestPutOAuthTokenResponse`, `TestTokenResponseWithErrorRefused`, `FuzzTokenResponseParse` | pending: the typed verbs |
 | U157 | `generate` returns only the public key; `pubkey` prints only the public line | `k3sm/pkg/keystore/socket::TestGenerateReturnsPublicKeyOnly`, `k3sm/cmd/k3sm::TestKeysPubkeyPrintsOnlyPublicKey` | pending: the typed verbs |

@@ -788,21 +788,21 @@ pend U139 "items required, no default, 1 to 8, unique keys, the key pattern with
 	apis/config/crd::TestKeyDeliveryItemsSchema TestItemKeyMatchesIsConfigMapKey TestKeyDeliveryHasNoDataKey TestItemsReorderAcceptedChangeRefused TestItemsCELCostWithinBudget
 pend U140 "the field enum equals the credential table's union; a KeyDelivery naming refreshToken is refused by the schema; rig leg E31 (the typed KeyDelivery API)" \
 	apis/config/crd::TestFieldEnumEqualsCredentialTable TestSchemaRefusesRefreshTokenField
-pend U141 "the credential leaf: kind names, field table vectors, no refresh field, the item type, the refresh-owner vectors, closed validity, Event and refresh_state sets, the metadata keys; stdlib only (the typed KeyDelivery API)" \
+check U141 "the credential leaf: kind names, field table vectors, no refresh field, the item type, the refresh-owner vectors, closed validity, Event and refresh_state sets, the metadata keys; stdlib only" \
 	apis/keystore/credential::TestFieldTableVectors TestNoRefreshField TestRefreshOwnerGrammarVectors TestNameSetsClosed TestImportsStdlibOnly
 pend U142 "the CRD descriptions list the CredentialValid reasons and ProjectionInvalid, say Ready means delivered and that Valid, Expiring and RefreshFailing share True; every condition has observedGeneration (the typed KeyDelivery API)" \
 	apis/config/crd::TestKeyDeliveryReasonDescriptions TestConditionsCarryObservedGeneration
-pend U143 "the envelope matches committed per-kind golden vectors; unknown tag, duplicate, disorder, missing field or out-of-bound field is ErrCorrupt; the fuzz invariants hold (the typed store)" \
+check U143 "the envelope matches committed per-kind golden vectors; unknown tag, duplicate, disorder, missing field or out-of-bound field is ErrCorrupt; the fuzz invariants hold" \
 	k3sm/pkg/keystore/typed::TestEnvelopeGoldenVectors TestEnvelopeRejectsUnknownTagDuplicateAndOrder FuzzEnvelopeParse
 pend U144 "token and oauth require a sealed issuedAt/accessIssuedAt stamped from the clock seam; editing the created header changes no typed time (the typed store)" \
 	k3sm/pkg/keystore::TestTypedIssuedAtStampedAndSealed TestCreatedHeaderEditChangesNoTypedTime
-pend U145 "a relabelled typed record fails to open; kind-byte table: 6 to 0xFC and an unknown envelope version are ErrKindUnsupported, 0xFD and 0xFE ErrCorrupt; list shows unsupported (the typed store)" \
+partial U145 "a relabelled typed record fails to open; kind-byte table: 6 to 0xFC and an unknown envelope version are ErrKindUnsupported, 0xFD and 0xFE ErrCorrupt" "list shows unsupported (the typed store)" \
 	k3sm/pkg/keystore::TestTypedKindRelabelFailsOpen TestKindByteTable
 pend U146 "rotate and put over an existing entry cannot change its kind (ErrKindMismatch) (the typed store)" \
 	k3sm/pkg/keystore::TestRotateAndPutCannotChangeKind
 pend U147 "token needs expiresAt; oauth needs access token, access expiry, refresh token and an owner in the grammar (the typed store)" \
 	k3sm/pkg/keystore::TestTypedPutValidation
-pend U148 "SSH generate uses the random seam; import accepts unencrypted OpenSSH ed25519 only; the fingerprint equals a committed ssh-keygen -l vector (the typed store)" \
+check U148 "SSH generate uses the random seam; import accepts unencrypted OpenSSH ed25519 only; the fingerprint equals a committed ssh-keygen -l vector" \
 	k3sm/pkg/keystore/typed::TestSSHGenerateAndImport TestSSHFingerprintMatchesOpenSSH
 pend U149 "write-only, structurally: a planted refresh token appears in no result of any exported method or consumer interface, raw, base64 or URL-encoded; Get returns a typed.Credential for kinds 3 to 5; only refresh (and the installing pkg/keystore) imports internal/refreshopen (the typed store)" \
 	k3sm/pkg/keystore::TestPlantedRefreshTokenNeverReturned TestGetReturnsRedactedCredential TestRefreshOpenerImportGraph
@@ -814,7 +814,7 @@ pend U152 "a pruned oauth entry: List shows it healthy, Rewrap re-seals low..cur
 	k3sm/pkg/keystore::TestListPrunedOAuthEntryNotCorrupt TestRewrapHandlesPrunedOAuth TestDeletePrunedOAuthEntry TestGapInsideCommittedRangeIsCorrupt TestCopyBackAcrossPruneCaught
 pend U153 "--from-version is refused for oauth (the typed store)" \
 	k3sm/pkg/keystore::TestFromVersionRefusedForOAuth
-pend U154 "every Fuzz* target in the keystore packages has a non-empty committed seed directory (the typed store)" \
+check U154 "every Fuzz* target in the keystore packages has a non-empty committed seed directory" \
 	k3sm/pkg/keystore::TestEveryFuzzTargetHasSeeds
 pend U155 "HELLO lists capabilities; mutating ops refuse an unknown header (unknown-header), non-mutating ops tolerate it; the CLI refuses a typed request to a daemon without the capability (the typed verbs)" \
 	k3sm/pkg/keystore/socket::TestHelloListsCapabilities TestMutatingOpRefusesUnknownHeader TestNonMutatingOpToleratesUnknownHeader k3sm/cmd/k3sm::TestCLIRefusesTypedAgainstOldDaemon

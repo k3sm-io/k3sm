@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHXUU6OvzfxAm5R1a4iII3hYe+YAG/W+ABKVa7CU9r0E k3sm-typed-test\n")

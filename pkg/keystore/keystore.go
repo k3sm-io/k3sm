@@ -20,6 +20,8 @@ import (
 	"context"
 	"errors"
 	"time"
+
+	"k3sm.io/k3sm/pkg/keystore/typed"
 )
 
 // This file is the keystore's contract: the Store interface, its types and its
@@ -155,6 +157,13 @@ var (
 	ErrCorrupt = errors.New("keystore record is corrupt: it failed authentication or does not parse, so it was tampered with, moved or truncated; restore it from backup")
 	// ErrNotFound reports that no entry has the requested name.
 	ErrNotFound = errors.New("keystore entry not found")
+	// ErrKindUnsupported is returned for a record this build cannot read: a
+	// kind byte from 6 to 0xFC, or a typed envelope version it does not
+	// know. It was written by a newer k3sm, so it is not wrapped in
+	// ErrCorrupt, whose remedy is a restore from backup; the remedy is an
+	// upgrade. It is typed.ErrKindUnsupported, so the envelope decoder's
+	// refusal matches it unmapped.
+	ErrKindUnsupported = typed.ErrKindUnsupported
 	// ErrVersionNotFound reports that the entry exists but holds no such
 	// version.
 	ErrVersionNotFound = errors.New("keystore entry version not found")

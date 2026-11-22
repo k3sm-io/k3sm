@@ -190,8 +190,8 @@ func TestParseRecordRefusesMalformed(t *testing.T) {
 		{"reserved kind 0xFE (a wrapped scope key)", kindByte(good, 0xFE)},
 		{"reserved kind 0xFD (a sealed per-user delivery list)", kindByte(good, 0xFD)},
 		{"kind 0", kindByte(good, 0)},
-		{"kind 3", kindByte(good, 3)},
-		{"kind 0xFC", kindByte(good, 0xFC)},
+		// Kinds 3 to 5 are the typed kinds and 6 to 0xFC are
+		// ErrKindUnsupported: TestKindByteTable holds both.
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -215,8 +215,8 @@ func FuzzParseRecord(f *testing.F) {
 	f.Fuzz(func(t *testing.T, b []byte) {
 		got, err := parseRecord(b)
 		if err != nil {
-			if !errors.Is(err, ErrCorrupt) {
-				t.Fatalf("parse error %v is not ErrCorrupt", err)
+			if !errors.Is(err, ErrCorrupt) && !errors.Is(err, ErrKindUnsupported) {
+				t.Fatalf("parse error %v is neither ErrCorrupt nor ErrKindUnsupported", err)
 			}
 			return
 		}

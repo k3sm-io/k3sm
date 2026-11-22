@@ -51,6 +51,19 @@ const (
 	// record, is accepted only by parseDeliveriesRecord (deliveries.go).
 	kindPointer  = 0xFF
 	kindScopeKey = 0xFE
+	// kindToken, kindSSH and kindOAuth are the typed kinds, whose sealed
+	// plaintext is a typed envelope (pkg/keystore/typed). parseRecord
+	// accepts them, so the AAD's kind field is what refuses a relabelled
+	// one; no store verb writes or returns them yet, and openRecord still
+	// refuses them as not belonging to an entry.
+	kindToken = 3
+	kindSSH   = 4
+	kindOAuth = 5
+	// kindFirstUnassigned and kindLastUnassigned bound the kind bytes no
+	// build has given a meaning yet: a record carrying one was written by a
+	// newer k3sm, so it is ErrKindUnsupported, not ErrCorrupt.
+	kindFirstUnassigned = 6
+	kindLastUnassigned  = 0xFC
 	// headerSize is the size of a record's fixed fields: everything but the
 	// name and the ciphertext. See the offset table in the design.
 	headerSize = 52
@@ -177,13 +190,23 @@ func (r *record) marshal() []byte {
 }
 
 // parseRecord decodes a record file. It is strict: the kind must be one a
-// record carries today (the two Kinds or kindPointer; 0xFE and 0xFD, which
-// only their own parsers accept, are refused), every length must agree with the file's size exactly, and
-// anything else is ErrCorrupt. It does not
-// check that the record belongs where it was found; openRecord does.
+// record carries today (the two Kinds, the three typed kinds or kindPointer;
+// 0xFE and 0xFD, which only their own parsers accept, are refused), every
+// length must agree with the file's size exactly, and anything else is
+// ErrCorrupt, except an unassigned kind byte (6 to 0xFC), which is
+// ErrKindUnsupported (docs/design/keystore.md § "Unknown kinds, ownership
+// and rollback"). It does not check that the record belongs where it was
+// found; openRecord does.
 func parseRecord(b []byte) (record, error) {
+	if len(b) >= 2 && b[0] == recordFormat && b[1] >= kindFirstUnassigned && b[1] <= kindLastUnassigned {
+		return record{}, fmt.Errorf("%w: record kind %#02x", ErrKindUnsupported, b[1])
+	}
 	return parseRecordOf(b, func(kind byte) bool {
-		return kind == byte(KindEd25519) || kind == byte(KindOpaque) || kind == kindPointer
+		switch kind {
+		case byte(KindEd25519), byte(KindOpaque), kindToken, kindSSH, kindOAuth, kindPointer:
+			return true
+		}
+		return false
 	})
 }
 
