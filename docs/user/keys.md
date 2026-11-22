@@ -276,13 +276,15 @@ sudo ditto /var/lib/k3sm/server/cred/keystore-master /other/place/keystore-maste
 sudo cp -p /var/lib/k3sm/keystore-floor.json /path/to/backup/
 ```
 
-To restore the same backup, for example after deleting an entry by mistake, move the live copy
-aside rather than deleting it, so a bad restore can be undone, and put back the
-`keystore-floor.json` you saved with that backup, as root:
+To restore the same backup, for example after deleting an entry by mistake, move the live
+`keystore/` and the live `keystore-floor.json` aside rather than deleting or overwriting them, so
+a bad restore can be undone, and put back the `keystore-floor.json` you saved with that backup,
+as root:
 
 ```
 sudo k3sm stop
 sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/server/keystore.pre-restore
+sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore
 sudo ditto /path/to/backup/keystore /var/lib/k3sm/server/keystore
 sudo cp -p /path/to/backup/keystore-floor.json /var/lib/k3sm/keystore-floor.json
 sudo k3sm start
@@ -295,11 +297,25 @@ the floor records it as deleted, because the check cannot tell your restore from
 putting a deleted key back. The floor file saved with the backup still lists the entry as live,
 so restoring it with `keystore/` brings the entry back.
 
-Only when `list` shows every entry `ok`, delete the copy you moved aside:
+A restore puts back the whole keystore as it was when you saved it, not one entry:
+
+- Every `rotate` since the backup is undone. Each entry's current version is the one it had
+  then.
+- Every entry you deleted since the backup comes back, and root's record of those deletions is
+  gone. A key you deleted to revoke it is live again: delete it again with `rm`.
+
+Keep the saved `keystore-floor.json` in a location only root can write and read, such as a
+directory owned by root with mode 0700. The floor decides which entries are live, so a floor
+someone else could replace would let them mark a revoked entry live again.
+
+Only when `list` shows every entry `ok`, delete the copies you moved aside:
 
 ```
 sudo rm -rf /var/lib/k3sm/server/keystore.pre-restore
+sudo rm /var/lib/k3sm/keystore-floor.json.pre-restore
 ```
+
+To undo the restore instead, stop the server and move both copies back over what you restored.
 
 The values come back byte for byte: `show --reveal` prints exactly what it printed before. Restore
 the master key the same way, from its own backup, if it was lost too.
@@ -321,4 +337,5 @@ is deliberate:
 6. Once `sudo k3sm keys list` shows every entry `ok`, delete the copy you moved aside.
 
 Only remove the record when you know the restored entries are the ones you want current, since
-the next keys verb accepts them as the newest.
+the next keys verb accepts them as the newest. Removing it also discards every deletion it
+recorded: a copy of a deleted entry put back later is no longer refused.

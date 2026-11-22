@@ -560,7 +560,8 @@ func copyTree(t *testing.T, src, dst string) {
 func TestKeysRollbackRoundTrip(t *testing.T) {
 	// saveRmRestore saves keystore/ and the floor, rm's the entry, then
 	// restores keystore/ as the recipe does, with the saved floor when
-	// withFloor is set, and returns the entry's value and the moved-aside copy.
+	// withFloor is set (the live floor moved aside first, never overwritten),
+	// and returns the entry's value and the moved-aside copy.
 	saveRmRestore := func(t *testing.T, h *keysHarness, withFloor bool) ([]byte, string) {
 		t.Helper()
 		value := []byte("rollback\x00value\n")
@@ -581,12 +582,12 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 		}
 		copyTree(t, backup, h.keystoreDir())
 		if withFloor {
-			// The floor saved with the backup goes back too, as root.
-			tmp := floor + ".restore"
-			if err := os.WriteFile(tmp, savedFloor, 0o644); err != nil {
+			// The live floor is moved aside, as root, so the restore can be
+			// undone, and the floor saved with the backup is put in its place.
+			if err := os.Rename(floor, floor+".pre-restore"); err != nil {
 				t.Fatal(err)
 			}
-			if err := os.Rename(tmp, floor); err != nil {
+			if err := os.WriteFile(floor, savedFloor, 0o644); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -595,13 +596,20 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 	t.Run("save rm restore", func(t *testing.T) {
 		h := newKeysHarness(t)
 		value, aside := saveRmRestore(t, h, true)
+		floor := filepath.Join(filepath.Dir(h.work), "keystore-floor.json")
+		// The moved-aside floor is the live one, tombstone and all.
+		if b, err := os.ReadFile(floor + ".pre-restore"); err != nil || !strings.Contains(string(b), `"tombstones":{"rb":`) {
+			t.Fatalf("moved-aside floor = %s, %v; want the live floor with rb's tombstone", b, err)
+		}
 		h.mustRun(0, "list")
 		h.mustRun(0, "show", "system/rb", "--reveal")
 		if !bytes.Equal(h.stdout.Bytes(), value) {
 			t.Fatalf("restored value = %q, want %q", h.stdout.Bytes(), value)
 		}
-		if err := os.RemoveAll(aside); err != nil {
-			t.Fatal(err)
+		for _, p := range []string{aside, floor + ".pre-restore"} {
+			if err := os.RemoveAll(p); err != nil {
+				t.Fatal(err)
+			}
 		}
 	})
 	// Without its floor, the restored entry is the deleted one put back, and
