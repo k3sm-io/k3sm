@@ -925,10 +925,14 @@ func keysRm(ctx context.Context, args []string, env keysEnv) int {
 	}
 	code = keysOK
 	if err := s.Delete(ctx, name); err != nil {
-		// A Delete whose floor write evicted tombstones deleted the entry,
-		// its tree left behind included: it is reported as done, and exits
-		// keysCommitted.
+		// A Delete whose floor write evicted tombstones exits
+		// keysCommitted; it is reported as done when it deleted the entry,
+		// its tree left behind included (keystore.DeleteDone), and not when
+		// only a floor raise before it wrote (ErrNotFound, say).
 		if code = v.evictedCode(err); code == keysRefused {
+			return code
+		}
+		if !keystore.DeleteDone(err) {
 			return code
 		}
 	}

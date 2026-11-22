@@ -335,3 +335,29 @@ func TestMergePending(t *testing.T) {
 		t.Fatalf("MergePending after the merge: %v", err)
 	}
 }
+
+// TestDeleteNotFoundReportsEviction (U192): a Delete of a name with nothing
+// recorded and nothing under it still raises the other entries' floors
+// first, and a raise whose write prunes a burial is committed: the answer is
+// ErrNotFound, reported with the eviction as committed, and as not deleted
+// (DeleteDone).
+func TestDeleteNotFoundReportsEviction(t *testing.T) {
+	ctx := context.Background()
+	setSmallFloorLimits(t)
+	s, server := newTestStore(t)
+	mustPut(t, s, "k", KindOpaque, []byte("one"))
+	for i := 2; i <= 10; i++ {
+		mustRotate(t, s, "k", fmt.Sprintf("v%d", i))
+	}
+	// The floor one behind the pointer: the raise to 10 grows it a byte.
+	live := floorOf(t, server)["k"]
+	live.Seq = 9
+	fillFloor(t, server, floor{"k": live, "old": buriedEntry(strings.Repeat("cd", generationSize), 1)}, floorSizeLimit)
+	err := s.Delete(ctx, "absent")
+	if !errors.Is(err, ErrNotFound) || !errors.Is(err, ErrTombstoneEvicted) || !Committed(err) || DeleteDone(err) {
+		t.Fatalf("Delete of an absent name over a pruning raise: %v, want a committed ErrTombstoneEvicted with ErrNotFound, not done", err)
+	}
+	if fl := floorOf(t, server); fl["k"].Seq != 10 {
+		t.Fatalf("floor k = %+v, want seq 10", fl["k"])
+	}
+}

@@ -618,7 +618,7 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 		return err
 	}
 	if err := s.step("bury " + name); err != nil {
-		return err
+		return evicted(fdir, nil, err)
 	}
 	var gs []string
 	// capDropped is every burial a bury in this Delete dropped at the
@@ -629,7 +629,7 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 		return len(gs) > 0
 	})
 	if err != nil {
-		return err
+		return evicted(fdir, nil, err)
 	}
 	capDropped = append(capDropped, dropped...)
 	logBuried(name, gs, dropped, after)
@@ -637,7 +637,7 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	if errors.Is(err, fs.ErrNotExist) {
 		// No entries directory: nothing to remove.
 		if len(gs) == 0 {
-			return ErrNotFound
+			return evicted(fdir, capDropped, ErrNotFound)
 		}
 		slog.Warn("keystore: the entry directory was already gone; its deletion is recorded in the floor", "name", name)
 		return evicted(fdir, capDropped, nil)
@@ -705,7 +705,8 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	}
 	if !present {
 		if !buried {
-			return ErrNotFound
+			// A raise above may have written, and pruned.
+			return evicted(fdir, capDropped, ErrNotFound)
 		}
 		slog.Warn("keystore: the entry directory was already gone; its deletion is recorded in the floor", "name", name)
 		return evicted(fdir, capDropped, nil)
@@ -720,7 +721,7 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	if interrupted && !buried {
 		// Not an entry, and nothing recorded for it: the answer is
 		// ErrNotFound, though its directory is removed.
-		return ErrNotFound
+		return evicted(fdir, capDropped, ErrNotFound)
 	}
 	if buried && interrupted {
 		slog.Warn("keystore: the entry directory was already gone; its deletion is recorded in the floor", "name", name)
@@ -753,11 +754,13 @@ func (e alreadyDeleted) Unwrap() error { return e.error }
 // dropped, its own or any other name's. Each dropped burial loses its
 // refusal: a copy of that deleted entry put back is accepted again. So when
 // any was dropped the verb fails with ErrTombstoneEvicted, naming the
-// count, though its change is made: alone, or joined to an err that says the
-// entry is already deleted (alreadyDeleted: a Delete whose tree removal
-// failed after its burial), it is reported as committed (errCommitted);
-// joined to any other err, it is not. Put, Rotate and RaiseFloor report
-// their floor writes' prunes through it too.
+// count, reported as committed (errCommitted): the write that dropped it is
+// made, whatever err says. Joined to an err that does not say the entry is
+// already deleted (alreadyDeleted: a Delete whose tree removal failed after
+// its burial), the entry is not deleted (notDeleted, DeleteDone). Every
+// return of Delete goes through it, ErrNotFound included, since a raise
+// before it may have written. Put, Rotate and RaiseFloor report their floor
+// writes' prunes through it too.
 func evicted(l *floorLock, capDropped []pruned, err error) error {
 	n := len(capDropped) + len(l.dropped)
 	if n == 0 {
@@ -769,7 +772,25 @@ func evicted(l *floorLock, capDropped []pruned, err error) error {
 	if errors.As(err, new(alreadyDeleted)) {
 		return fmt.Errorf("%w: %w: %d tombstone(s) evicted; and: %w", errCommitted, ErrTombstoneEvicted, n, err)
 	}
-	return fmt.Errorf("%w: %d tombstone(s) evicted; and: %w", ErrTombstoneEvicted, n, err)
+	return fmt.Errorf("%w: %w: %d tombstone(s) evicted by a floor write that is made; and: %w", errCommitted, ErrTombstoneEvicted, n, notDeleted{err})
+}
+
+// notDeleted marks the error of a Delete that did not delete its entry,
+// joined to a committed eviction (evicted).
+type notDeleted struct{ error }
+
+func (e notDeleted) Unwrap() error { return e.error }
+
+// DeleteDone reports whether the Delete that returned err deleted the entry:
+// err is nil, or a committed ErrTombstoneEvicted alone or with an error
+// saying the entry is already deleted and its tree not removed. A committed
+// eviction joined to any other error (ErrNotFound after a raise that
+// pruned, say) is a floor write made by a Delete that deleted nothing.
+func DeleteDone(err error) bool {
+	if err == nil {
+		return true
+	}
+	return Committed(err) && errors.Is(err, ErrTombstoneEvicted) && !errors.As(err, new(notDeleted))
 }
 
 // warnUnrecorded logs, at Warn, a Delete that buries nothing of a directory
