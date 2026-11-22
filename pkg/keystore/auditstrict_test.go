@@ -52,7 +52,7 @@ func TestAuditLineChargedStrictly(t *testing.T) {
 	s.logSoftCap, s.logHardCap = size, size
 	appendLogBytes(t, s, auditLogName, []byte(`{"v":1,"op":"rm","scope":"user/1001","result":"ok"}`+"\n"))
 	appendLogBytes(t, s, auditLogName, []byte(`{"v":1,"op":"rm","scope":"user/1001","scope":"user/1002","result":"ok"}`+"\n"))
-	if n, err := s.CheckLogBounds(context.Background()); err != nil || n != 1 {
+	if n, _, err := s.CheckLogBounds(context.Background()); err != nil || n != 1 {
 		t.Fatalf("CheckLogBounds over a duplicate-key audit line: %d, %v, want 1, nil", n, err)
 	}
 }

@@ -1605,9 +1605,8 @@ func (s *FileStore) floorGrantRoomKeys(scope string, names []string, write int64
 // reader's bounds sit below what an existing log already holds: under it the
 // log would read as damage and refuse every user-scope operation.
 // errLogRevokeBudgetSpent is a configuration under which a uid's lines past
-// the hard cap already spend its revocation budget, so its next revocation
-// would be refused, or has less than one whole line of it left: root-only,
-// refused at store open.
+// the hard cap already exceed its revocation budget, which the writer never
+// produces, so the caps were lowered: root-only, refused at store open.
 var errLogRevokeBudgetSpent = errors.New("the configured log caps leave a uid's revocation budget already spent past the hard cap, so its revocations would be refused; configure the caps the log was written under, or restore the caps and rotate the audit log (the audit rotation verb is not yet available: until it is, restore the log from a backup and run sudo k3sm doctor)")
 
 var errLogBoundsBelowLog = errors.New("the configured log caps put the reader's bounds below what an existing append-only log already holds, so it would read as damage; configure the caps the log was written under, or " + restoreRemedy)
@@ -1616,23 +1615,28 @@ var errLogBoundsBelowLog = errors.New("the configured log caps put the reader's 
 // configuration whose reader's bounds sit below what an existing log
 // already holds: a log larger than logReadBound, or a floor with more keys
 // than the reader's key bound; and, as errLogRevokeBudgetSpent, one under
-// which a uid's lines past the hard cap in either log leave less than one
-// whole line (maxLogLine) of its revocation budget, which would silently
-// refuse its revocations. It fails closed: a file-backed log that is
-// missing, untrusted or unflagged, one that cannot be read, or one whose
-// state is damage that refuses it whole, is an error, so the start step
-// (startUserScopes) does not start the user scope. Bounded damage, lines
-// the reader skips, is no error: damage is their count across both logs.
-// It is the server's store-open check, and its error, which names the
-// current figures, is root's alone: it never reaches the socket.
-func (s *FileStore) CheckLogBounds(ctx context.Context) (damage int, err error) {
+// which a uid's lines past the hard cap in either log exceed its revocation
+// budget, which the writer never produces, so only lowered caps make it. A
+// uid with under one whole line (maxLogLine) of its budget left is no
+// refusal: the writer reaches it honestly, and only that uid's revocations
+// are refused, at run time, as ever. Each such uid is logged at Warn and
+// counted in spent (distinct uids across both logs). It fails closed: a
+// file-backed log that is missing, untrusted or unflagged, one that cannot
+// be read, or one whose state is damage that refuses it whole, is an error,
+// so the start step (startUserScopes) does not start the user scope.
+// Bounded damage, lines the reader skips, is no error: damage is their
+// count across both logs. It is the server's store-open check, and its
+// error, which names the current figures, is root's alone: it never
+// reaches the socket.
+func (s *FileStore) CheckLogBounds(ctx context.Context) (damage, spent int, err error) {
 	if err := ctx.Err(); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	if err := s.checkConfig(); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	bound := s.logReadBound()
+	spentUIDs := map[uint32]bool{}
 	for _, l := range []any{s.userFloor, s.auditSink} {
 		var log *appendLog
 		switch v := l.(type) {
@@ -1646,7 +1650,7 @@ func (s *FileStore) CheckLogBounds(ctx context.Context) (damage int, err error) 
 		f, st, err := log.open(unix.O_RDONLY)
 		if err != nil {
 			log.forgetUnflagged(err, false)
-			return 0, err
+			return 0, 0, err
 		}
 		n, err := func() (int, error) {
 			defer func() { _ = f.Close() }() // read-only
@@ -1660,8 +1664,16 @@ func (s *FileStore) CheckLogBounds(ctx context.Context) (damage int, err error) 
 				return 0, err
 			}
 			for uid, n := range state.pastCap {
-				if uid != 0 && n+maxLogLine > s.logRevokeBudget {
-					return 0, fmt.Errorf("%w: %w (uid %d has %d bytes past the hard cap in %s, leaving under one line of its budget of %d)", errInvalidConfig, errLogRevokeBudgetSpent, uid, n, log.name, s.logRevokeBudget)
+				if uid == 0 {
+					continue
+				}
+				if n > s.logRevokeBudget {
+					return 0, fmt.Errorf("%w: %w (uid %d has %d bytes past the hard cap in %s, over its budget of %d)", errInvalidConfig, errLogRevokeBudgetSpent, uid, n, log.name, s.logRevokeBudget)
+				}
+				if n+maxLogLine > s.logRevokeBudget {
+					// Root's figures, in the server's log only.
+					slog.Warn("a uid's revocation budget past the hard cap has under one line left; its revocations are refused until the audit log is rotated", "log", log.name, "uid", uid, "bytes", n, "budget", s.logRevokeBudget)
+					spentUIDs[uid] = true
 				}
 			}
 			if log.addsKey != nil {
@@ -1676,9 +1688,9 @@ func (s *FileStore) CheckLogBounds(ctx context.Context) (damage int, err error) 
 			return state.damaged(), nil
 		}()
 		if err != nil {
-			return 0, err
+			return 0, 0, err
 		}
 		damage += n
 	}
-	return damage, nil
+	return damage, len(spentUIDs), nil
 }

@@ -944,12 +944,15 @@ func (s *FileStore) startUserScopes(ctx context.Context) error {
 	if s.userScopesStarted == nil {
 		return fmt.Errorf("%w: the store was not made by New", errInvalidConfig)
 	}
-	damage, err := s.CheckLogBounds(ctx)
+	damage, spent, err := s.CheckLogBounds(ctx)
 	if err != nil {
 		return err
 	}
 	if damage > 0 {
 		slog.Warn("the keystore append-only logs hold damaged lines, which are skipped", "damaged", damage)
+	}
+	if spent > 0 {
+		slog.Warn("uids have spent their revocation budgets past the hard cap; only their revocations are refused", "uids", spent)
 	}
 	scopeErrs, err := s.catchUpUser(ctx)
 	if err != nil {

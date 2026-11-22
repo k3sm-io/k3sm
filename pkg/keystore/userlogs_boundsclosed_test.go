@@ -61,7 +61,7 @@ func TestCheckLogBoundsFailsClosed(t *testing.T) {
 			ctx := context.Background()
 			s, _, _ := fileLogScope(t)
 			tc.inject(t, s)
-			if _, err := s.CheckLogBounds(ctx); err == nil {
+			if _, _, err := s.CheckLogBounds(ctx); err == nil {
 				t.Fatal("CheckLogBounds passed a log it could not judge")
 			}
 			s.userScopesStarted.Store(false)
@@ -80,18 +80,19 @@ func TestCheckLogBoundsFailsClosed(t *testing.T) {
 func TestCheckLogBoundsReportsDamage(t *testing.T) {
 	ctx := context.Background()
 	s, _, _ := fileLogScope(t)
-	if n, err := s.CheckLogBounds(ctx); err != nil || n != 0 {
+	if n, _, err := s.CheckLogBounds(ctx); err != nil || n != 0 {
 		t.Fatalf("CheckLogBounds on clean logs: %d, %v, want 0, nil", n, err)
 	}
 	appendLogBytes(t, s, userFloorLogName, []byte("not a floor line\n"))
 	appendLogBytes(t, s, userFloorLogName, []byte("nor this\n"))
-	if n, err := s.CheckLogBounds(ctx); err != nil || n != 2 {
+	if n, _, err := s.CheckLogBounds(ctx); err != nil || n != 2 {
 		t.Fatalf("CheckLogBounds over two damaged lines: %d, %v, want 2, nil", n, err)
 	}
 }
 
 // A uid whose revocation budget has less than one whole line left is
-// spent: CheckLogBounds refuses it, not only one over its budget.
+// counted, not refused: only one over its budget, which only lowered caps
+// make, refuses the store open.
 func TestCheckLogBoundsRefusesAtSpent(t *testing.T) {
 	ctx := context.Background()
 	s, _, _ := fileLogScope(t)
@@ -103,11 +104,16 @@ func TestCheckLogBoundsRefusesAtSpent(t *testing.T) {
 	}
 	k := int(s.logRevokeBudget-maxLogLine) / len(line)
 	appendLogBytes(t, s, auditLogName, bytes.Repeat(line, k))
-	if _, err := s.CheckLogBounds(ctx); err != nil {
-		t.Fatalf("store open with a whole line of budget left: %v", err)
+	if _, spent, err := s.CheckLogBounds(ctx); err != nil || spent != 0 {
+		t.Fatalf("store open with a whole line of budget left: %d, %v", spent, err)
 	}
 	appendLogBytes(t, s, auditLogName, line)
-	if _, err := s.CheckLogBounds(ctx); !errors.Is(err, errLogRevokeBudgetSpent) {
-		t.Fatalf("store open with under one line of budget left: %v, want errLogRevokeBudgetSpent", err)
+	if _, spent, err := s.CheckLogBounds(ctx); err != nil || spent != 1 {
+		t.Fatalf("store open with under one line of budget left: %d, %v; want 1 spent uid, no error", spent, err)
+	}
+	over := int(s.logRevokeBudget)/len(line) + 1 - k - 1
+	appendLogBytes(t, s, auditLogName, bytes.Repeat(line, over))
+	if _, _, err := s.CheckLogBounds(ctx); !errors.Is(err, errLogRevokeBudgetSpent) {
+		t.Fatalf("store open with a uid over its budget: %v, want errLogRevokeBudgetSpent", err)
 	}
 }

@@ -26,9 +26,10 @@ import (
 	"time"
 )
 
-// A configuration under which a uid's revocation budget is already spent
-// past the hard cap would silently disable that uid's revocations: it is
-// refused at store open, naming the remedy.
+// A configuration under which a uid's lines past the hard cap exceed its
+// revocation budget, which the writer never produces, means the caps were
+// lowered: it is refused at store open, naming the remedy. Under one line of
+// budget left is no refusal: it is counted, per uid.
 func TestCheckLogBoundsRefusesSpentRevocationBudget(t *testing.T) {
 	ctx := context.Background()
 	s, _, _ := fileLogScope(t)
@@ -39,13 +40,13 @@ func TestCheckLogBoundsRefusesSpentRevocationBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 	appendLogBytes(t, s, auditLogName, bytes.Repeat(line, 3*maxLogLine/len(line)))
-	if _, err := s.CheckLogBounds(ctx); err != nil {
-		t.Fatalf("store open with the budget not yet spent: %v", err)
+	if _, spent, err := s.CheckLogBounds(ctx); err != nil || spent != 0 {
+		t.Fatalf("store open with the budget not yet spent: %d, %v", spent, err)
 	}
 	appendLogBytes(t, s, auditLogName, bytes.Repeat(line, maxLogLine/len(line)+2))
-	_, err = s.CheckLogBounds(ctx)
+	_, _, err = s.CheckLogBounds(ctx)
 	if !errors.Is(err, errInvalidConfig) || !errors.Is(err, errLogRevokeBudgetSpent) {
-		t.Fatalf("store open with a uid past its revocation budget: %v, want errLogRevokeBudgetSpent", err)
+		t.Fatalf("store open with a uid over its revocation budget: %v, want errLogRevokeBudgetSpent", err)
 	}
 	if !strings.Contains(err.Error(), "sudo k3sm doctor") || !strings.Contains(err.Error(), "caps") {
 		t.Fatalf("the refusal %q does not name the remedy", err)
