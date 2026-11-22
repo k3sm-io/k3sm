@@ -2672,3 +2672,34 @@ func TestKeysFloorMergeAcceptDrops(t *testing.T) {
 	}
 	h.mustRun(1, "show", "system/k")
 }
+
+// TestKeysFloorMergeDryRun (U192): floor merge --dry-run prints the full
+// report the merge would make, writes nothing and renames nothing, so the
+// guard stays; the merge run after it writes that report.
+func TestKeysFloorMergeDryRun(t *testing.T) {
+	h := newKeysHarness(t)
+	h.put("system/k", []byte("v"))
+	b := saveRecipeBackup(t, h, filepath.Join(t.TempDir(), "keystore-floor-backup"), "2026-11-22")
+	h.mustRun(0, "rm", "system/k", "--yes")
+	if _, err := restoreRecipeBackup(t, h, b, true); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	before, err := os.ReadFile(recipeFloor(h))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.mustRun(0, "floor", "merge", "--dry-run")
+	if out := h.stdout.String(); !strings.Contains(out, "dry run: nothing written\n") || !strings.Contains(out, "buried live 1\n") || !strings.Contains(out, "buried live system/k:") {
+		t.Fatalf("floor merge --dry-run printed %q, want the full report", out)
+	}
+	if after, _ := os.ReadFile(recipeFloor(h)); string(after) != string(before) {
+		t.Fatalf("floor after --dry-run changed: %s", after)
+	}
+	if _, err := os.Lstat(recipeFloor(h) + ".pre-restore"); err != nil {
+		t.Fatalf("the guard file after --dry-run: %v, want it in place", err)
+	}
+	h.mustRun(0, "floor", "merge")
+	if out := h.stdout.String(); !strings.Contains(out, "buried live system/k:") {
+		t.Fatalf("floor merge after --dry-run printed %q, want k buried live", out)
+	}
+}

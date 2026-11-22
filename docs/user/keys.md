@@ -373,7 +373,8 @@ sudo k3sm keys floor merge --keep system/<name>
 ```
 
 Decide before you run the merge: once it has deleted an entry again, running it once more with
-`--keep` does not bring that entry back. The merge also deletes each version that was current in
+`--keep` does not bring that entry back. To see what it would do first, add `--dry-run`: it
+prints the same report and changes nothing. The merge also deletes each version that was current in
 the floor you moved aside but is not the restored one, such as an entry you put again after
 deleting it since the backup: by restoring the backup you chose its version, so a copy of the
 newer one put back is refused. `--keep` keeps only the restored version: an entry you deleted and

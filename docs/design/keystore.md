@@ -1286,7 +1286,8 @@ before the merge is recorded. A successful merge renames its input to
 `keystore-floor.json.merged-<unix>` beside it, through the data root descriptor the lock
 judged (never over an existing file, and only if the name is still the file it read), which
 clears the guard. A rename that fails after the write is reported as committed: the verb prints
-the full report and exits 4. A rerun is safe: the input is read again under `keystore-lock`, and
+the full report and exits 5 ("merge written, input not renamed: rerun to clear the guard"), which
+wins over 4 (a burial dropped); the report still lists every drop. A rerun is safe: the input is read again under `keystore-lock`, and
 the merge first runs on a copy of the live floor. When every burial and fence the input records
 is already there, it writes nothing, only renames the input, and reports `already merged`. A guard file that is
 the data root's live floor by inode is refused outright
@@ -1327,7 +1328,9 @@ floor's size does, it names `keys rm`, which frees a live record. When the tombs
 the per-name cap binds, `rm` cannot help, since each deletion records one more, so it names the
 budget, or the cap and its names, and `--accept-drops` (`MergeOptions.AcceptDrops`), which writes
 the merge anyway: the write prunes oldest first, as every floor write does, reports and prints
-each burial dropped, exits 4 and renames the input, so the guard has an exit
+each burial dropped, exits 4 and renames the input, so the guard has an exit. `--dry-run`
+(`MergeOptions.DryRun`) stops after the merge on a copy and prints that report, drops included,
+writing and renaming nothing (`TestKeysFloorMergeDryRun`)
 (`TestGuardEraTombstoneBudget`, `TestGuardEraBurialPerNameCap`, `TestPendingMergeDeleteMakesRoom`,
 `TestKeysFloorMergeAcceptDrops`). A
 fence is a mark on a live record, which no prune removes. The verb prints `merged N`,

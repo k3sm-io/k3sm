@@ -119,6 +119,17 @@ func TestGuardEraTombstoneBudget(t *testing.T) {
 	}
 	otherGen := floorOf(t, server)["other"].burials()[0].Generation
 	refused("after an rm under the guard")
+	before := floorOf(t, server)
+	dry, err := s.MergeFloor(ctx, MergeOptions{AcceptDrops: true, DryRun: true})
+	if err != nil || len(dry.Dropped) == 0 {
+		t.Fatalf("MergeFloor --accept-drops --dry-run = %+v, %v; want the drops reported", dry, err)
+	}
+	if dry, err := s.MergeFloor(ctx, MergeOptions{DryRun: true}); !errors.Is(err, errFloorFull) || len(dry.Dropped) == 0 {
+		t.Fatalf("MergeFloor --dry-run = %+v, %v; want the drops reported with the refusal", dry, err)
+	}
+	if !floorsEqual(floorOf(t, server), before) || s.MergePending() == nil {
+		t.Fatal("a dry run wrote the floor or cleared the guard")
+	}
 	r, err := s.MergeFloor(ctx, MergeOptions{AcceptDrops: true})
 	if err != nil || len(r.Dropped) == 0 {
 		t.Fatalf("MergeFloor --accept-drops = %+v, %v; want it written with drops reported", r, err)
@@ -126,6 +137,9 @@ func TestGuardEraTombstoneBudget(t *testing.T) {
 	fl := floorOf(t, server)
 	if !fl["k"].buries(gen) || !fl["other"].buries(otherGen) {
 		t.Fatalf("after --accept-drops k = %+v, other = %+v; want both guard-era burials kept", fl["k"], fl["other"])
+	}
+	if !slices.Equal(r.Dropped, dry.Dropped) {
+		t.Fatalf("dropped %v, want what the dry run reported, %v", r.Dropped, dry.Dropped)
 	}
 	for _, name := range r.Dropped {
 		if !strings.HasPrefix(name, "gone-") {

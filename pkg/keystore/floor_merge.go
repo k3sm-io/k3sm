@@ -136,6 +136,11 @@ type MergeOptions struct {
 	// the write prunes oldest first as every floor write does, and each
 	// burial dropped is reported (Dropped).
 	AcceptDrops bool
+	// DryRun makes the merge on a copy only and returns its report: what
+	// it would merge, keep, retire, fence and drop. It writes nothing and
+	// renames nothing, and a merge that would be refused is refused with
+	// that report.
+	DryRun bool
 }
 
 // MergeFloor merges every burial the data root's
@@ -173,7 +178,7 @@ type MergeOptions struct {
 func (s *FileStore) MergeFloor(ctx context.Context, opts MergeOptions) (MergeReport, error) {
 	r, err := s.mergeFloor(ctx, opts)
 	if err != nil {
-		if Committed(err) {
+		if Committed(err) || opts.DryRun {
 			return r, fmt.Errorf("merge the floor: %w", err)
 		}
 		return MergeReport{}, fmt.Errorf("merge the floor: %w", err)
@@ -234,6 +239,9 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 	}
 	if !pr.changes() {
 		pr.AlreadyMerged, pr.Unverified = true, unionNames(unverified, pr.Unverified)
+		if opts.DryRun {
+			return pr, nil
+		}
 		if err := s.renameMerged(in); err != nil {
 			return MergeReport{}, err
 		}
@@ -247,7 +255,19 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 	// input left where it is, so the guard stays.
 	// A guard-era burial (rm run under the guard) is never dropped either,
 	// unless opts.AcceptDrops says so: the exit when rm cannot make room.
-	if l := mergeLoses(live, probe, probeDropped); len(l.names) > 0 && !opts.AcceptDrops {
+	l := mergeLoses(live, probe, probeDropped)
+	if opts.DryRun {
+		pr.Unverified = unionNames(unverified, pr.Unverified)
+		for _, p := range append(slices.Clone(probeDropped), maps.Clone(probe).prune()...) {
+			pr.Dropped = append(pr.Dropped, p.name)
+		}
+		sort.Strings(pr.Dropped)
+		if len(l.names) > 0 && !opts.AcceptDrops {
+			return pr, l.err()
+		}
+		return pr, nil
+	}
+	if len(l.names) > 0 && !opts.AcceptDrops {
 		return r, l.err()
 	}
 	// The guard file must still be the file read: one replaced since is
