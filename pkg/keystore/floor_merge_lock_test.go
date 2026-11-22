@@ -293,9 +293,14 @@ func TestMergeFloorCommittedRerun(t *testing.T) {
 	path := writeAsideFloor(t, server, floor{"gone": {Buried: []burial{{Generation: mgen(1), Deleted: 1}}}})
 	at := time.Unix(1795370000, 0)
 	s.now = func() time.Time { return at }
-	taken := floorPath(server) + ".merged-1795370000"
-	if err := os.WriteFile(taken, []byte("earlier\n"), 0o644); err != nil {
-		t.Fatal(err)
+	// Every name renameMerged tries is taken.
+	var taken []string
+	for i := range maxMergedTries {
+		p := fmt.Sprintf("%s.merged-%d", floorPath(server), at.Unix()+int64(i))
+		if err := os.WriteFile(p, []byte("earlier\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		taken = append(taken, p)
 	}
 	r, err := mergeStaged(t, s, ctx, MergeOptions{})
 	if !Committed(err) || r.Merged != 1 {
@@ -311,6 +316,12 @@ func TestMergeFloorCommittedRerun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := os.Lstat(filepath.Join(filepath.Dir(server), retiredPendingName)); err != nil {
+		t.Fatalf("the retired record after the failed rename: %v, want it pending", err)
+	}
+	for _, p := range taken {
+		remove(t, p)
+	}
 	at = at.Add(time.Second)
 	r, err = mergeStaged(t, s, ctx, MergeOptions{})
 	if err != nil || !r.AlreadyMerged || r.Merged != 0 || r.AlreadyPresent != 1 {
@@ -321,6 +332,9 @@ func TestMergeFloorCommittedRerun(t *testing.T) {
 	}
 	if _, err := os.Lstat(path); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("the input after the rerun: %v, want it renamed", err)
+	}
+	if _, err := os.Lstat(fmt.Sprintf("%s.merged-%d.retired", floorPath(server), at.Unix())); err != nil {
+		t.Fatalf("the retired record after the rerun: %v, want it renamed with the input", err)
 	}
 	mustPut(t, s, "n", KindOpaque, []byte("v"))
 

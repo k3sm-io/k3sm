@@ -73,7 +73,7 @@ const keysUsage = `Usage:
         --key-in FILE only finishes an interrupted rewrap, with the key its
         --key-out saved: the recorded master.next.sha256, or a key some
         record already opens under; any other key is refused
-  sudo k3sm keys floor merge [--keep system/<name>]... [--accept-drops] [--dry-run]
+  sudo k3sm keys floor merge [--keep system/<name>]... [--accept-drops] [--dry-run] [--undo]
         after a restore, before k3sm start: merge every deleted generation
         the floor you moved aside to keystore-floor.json.pre-restore in the
         data root records (the only file it reads) into the restored floor, so keys revoked since the backup stay
@@ -988,7 +988,7 @@ func (k *keepFlag) Set(q string) error {
 }
 
 // keysFloor is "k3sm keys floor merge [--keep system/<name>]...
-// [--accept-drops] [--dry-run]": it
+// [--accept-drops] [--dry-run] [--undo]": it
 // merges the deleted generations the data root's moved-aside floor,
 // keystore-floor.json.pre-restore, records into the live floor a restore put back (keystore.FileStore.MergeFloor),
 // keeping live the restored generation of each entry --keep names, and
@@ -1015,7 +1015,7 @@ func (k *keepFlag) Set(q string) error {
 // unverified; --dry-run exits as the merge itself would.
 func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 	if len(args) == 0 || args[0] != "merge" {
-		fmt.Fprintln(env.stderr, "k3sm keys floor: want: sudo k3sm keys floor merge [--keep system/<name>]... [--accept-drops] [--dry-run]")
+		fmt.Fprintln(env.stderr, "k3sm keys floor: want: sudo k3sm keys floor merge [--keep system/<name>]... [--accept-drops] [--dry-run] [--undo]")
 		return keysBadUsage
 	}
 	v := newKeysVerb("floor merge", env)
@@ -1023,6 +1023,7 @@ func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 	v.fs.Var(&keep, "keep", "keep this entry's restored version live (system/<name>; repeatable)")
 	acceptDrops := v.fs.Bool("accept-drops", false, "write a merge that has to drop deletions since the backup to fit the floor, printing each one")
 	dryRun := v.fs.Bool("dry-run", false, "print the report the merge would make; write and rename nothing")
+	undo := v.fs.Bool("undo", false, "the reverse merge of an undo: report the versions the restore retired apart from the entries deleted since")
 	pos, err := v.parse(args[1:])
 	if err != nil {
 		return keysBadUsage
@@ -1037,7 +1038,7 @@ func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 	if err != nil {
 		return v.failf(keysRefused, "%v", err)
 	}
-	r, err := s.MergeFloor(ctx, keystore.MergeOptions{Keep: keep, AcceptDrops: *acceptDrops, DryRun: *dryRun})
+	r, err := s.MergeFloor(ctx, keystore.MergeOptions{Keep: keep, AcceptDrops: *acceptDrops, DryRun: *dryRun, Undo: *undo})
 	// A dry run refused for the drops it would make prints that report
 	// first.
 	if err != nil && !keystore.Committed(err) && (!*dryRun || len(r.Dropped) == 0) {
@@ -1051,9 +1052,14 @@ func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 	}
 	fmt.Fprintf(env.stdout, "merged %d\nalready present %d\nburied live %d\nkept %d\nretired %d\ndropped %d\nfenced %d\n", r.Merged, r.AlreadyPresent, len(r.BuriedLive), len(r.Kept), len(r.Retired), len(r.Dropped), len(r.Fenced))
 	for _, name := range r.BuriedLive {
-		// The floors cannot tell an undo from a restore: in an undo a
-		// buried-live entry may be one the undo brings back.
-		fmt.Fprintf(env.stdout, "buried live %s: the floor moved aside records this version as deleted, so the merge buries it and removes its restored files\n", qualify(name))
+		switch {
+		case slices.Contains(r.RetiredByRestore, name):
+			fmt.Fprintf(env.stdout, "buried live %s: retired by the restore: pass --keep %s to bring it back; without it the merge buries it and removes its files\n", qualify(name), qualify(name))
+		case slices.Contains(r.DeletedSinceRestore, name):
+			fmt.Fprintf(env.stdout, "buried live %s: deleted since the restore: stays deleted, and the merge removes its files\n", qualify(name))
+		default:
+			fmt.Fprintf(env.stdout, "buried live %s: the floor moved aside records this version as deleted, so the merge buries it and removes its restored files\n", qualify(name))
+		}
 	}
 	revoked := 0
 	for _, name := range r.Kept {

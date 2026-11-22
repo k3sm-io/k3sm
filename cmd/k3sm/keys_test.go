@@ -807,6 +807,26 @@ func recursiveChange(line string) bool {
 // --reveal` piped into `rotate --in -` stores a version whose value equals
 // version N's byte for byte (bytes.Equal, the comparison cmp makes), for an
 // opaque and an Ed25519 entry.
+// mergedFloors is the one renamed merge input beside floor,
+// keystore-floor.json.merged-<unix>, its retired record not counted.
+func mergedFloors(t *testing.T, floor string) []string {
+	t.Helper()
+	all, err := filepath.Glob(floor + ".merged-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var merged []string
+	for _, p := range all {
+		if !strings.HasSuffix(p, ".retired") {
+			merged = append(merged, p)
+		}
+	}
+	if len(merged) != 1 {
+		t.Fatalf("the merged floor: %v; want one", merged)
+	}
+	return merged
+}
+
 func TestKeysRollbackRoundTrip(t *testing.T) {
 	// saveRmRestore saves keystore/ and the floor, rm's the entry, then
 	// restores keystore/ as the recipe does, with the saved floor when
@@ -858,8 +878,8 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 			"sudo mv /var/lib/k3sm/keystore-floor.json.pre-restore /var/lib/k3sm/keystore-floor.json.undo || exit 1",
 			"sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1",
 			"sudo mv /var/lib/k3sm/keystore-floor.json.undo /var/lib/k3sm/keystore-floor.json || exit 1",
-			"sudo k3sm keys floor merge --dry-run",
-			"sudo k3sm keys floor merge",
+			"sudo k3sm keys floor merge --undo --dry-run",
+			"sudo k3sm keys floor merge --undo",
 			"sudo rm -rf /var/lib/k3sm/pre-restore.d",
 			"sudo k3sm start",
 		}
@@ -928,8 +948,9 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 		}
 	})
 	// A key deleted to revoke it since the backup is deleted again by the
-	// merge, which buries the restored generation and reports it as buried
-	// live; rm removes its directory, and it stays deleted.
+	// merge, which buries the restored generation, reports it as buried
+	// live and removes its restored directory, so no rm is needed and it
+	// stays deleted.
 	t.Run("save rm restore, the revoked key buried by the merge", func(t *testing.T) {
 		h := newKeysHarness(t)
 		saveRmRestore(t, h, true)
@@ -937,8 +958,9 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 		if got := h.stdout.String(); !strings.Contains(got, "merged 1\nalready present 0\nburied live 1\nkept 0\nretired 0\ndropped 0\n") || !strings.Contains(got, "buried live system/rb:") {
 			t.Fatalf("floor merge printed %q, want rb buried live", got)
 		}
-		refusedDeleted(t, h, "system/rb")
-		h.mustRun(0, "rm", "system/rb", "--yes")
+		if _, err := os.Lstat(filepath.Join(h.keystoreDir(), "rb")); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("rb's directory after the merge: %v, want it removed", err)
+		}
 		h.mustRun(1, "show", "system/rb", "--reveal")
 		if h.stdout.Len() != 0 {
 			t.Fatalf("show printed %q for the key buried by the merge", h.stdout.Bytes())
@@ -1016,7 +1038,10 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 		}
 		h.mustRun(0, "floor", "merge")
 		merged := h.stdout.String()
-		h.mustRun(0, "rm", "system/n", "--yes")
+		// The merge buried G1 live and removed its restored directory.
+		if _, err := os.Lstat(filepath.Join(h.keystoreDir(), "n")); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("n's directory after the merge: %v, want it removed", err)
+		}
 		copyTree(t, g2, filepath.Join(h.keystoreDir(), "n"))
 		refusedDeleted(t, h, "system/n")
 		if !strings.Contains(merged, "retired 1\n") || !strings.Contains(merged, "\nretired system/n:") {
@@ -1168,10 +1193,7 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 		h.mustRun(keysCommitted, "floor", "merge", "--keep", "system/rb")
 		h.mustRun(0, "rm", "system/other", "--yes")
 		floor := recipeFloor(h)
-		merged, err := filepath.Glob(floor + ".merged-*")
-		if err != nil || len(merged) != 1 {
-			t.Fatalf("the merged floor: %v, %v; want one", merged, err)
-		}
+		merged := mergedFloors(t, floor)
 		staged := filepath.Join(recipePreRestore(h), "restored")
 		if _, err := os.Lstat(staged); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("test ! -e %s: %v", staged, err)
@@ -1187,13 +1209,15 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		h.mustRun(0, "floor", "merge", "--dry-run")
-		if out := h.stdout.String(); !strings.Contains(out, "buried live system/other:") {
-			t.Fatalf("the reverse merge --dry-run printed %q, want other buried live", out)
+		h.mustRun(0, "floor", "merge", "--undo", "--dry-run")
+		if out := h.stdout.String(); !strings.Contains(out, "buried live system/other: deleted since the restore") {
+			t.Fatalf("the reverse merge --dry-run printed %q, want other buried live, deleted since the restore", out)
 		}
-		h.mustRun(0, "floor", "merge")
-		refusedDeleted(t, h, "system/other")
-		h.mustRun(0, "rm", "system/other", "--yes")
+		h.mustRun(0, "floor", "merge", "--undo")
+		if _, err := os.Lstat(filepath.Join(h.keystoreDir(), "other")); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("other's directory after the reverse merge: %v, want it removed", err)
+		}
+		h.mustRun(1, "show", "system/other", "--reveal")
 		// The merge moved the staged tree into place; the restored tree is
 		// left in pre-restore.d as keystore, and rm -rf removes it.
 		if _, err := os.Lstat(staged); !errors.Is(err, os.ErrNotExist) {
@@ -1210,6 +1234,68 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 		if b, err := os.ReadFile(floor); err != nil || !strings.Contains(string(b), `"rb":[{"generation"`) || !strings.Contains(string(b), `"other":[{"generation"`) {
 			t.Fatalf("floor after the undo = %s, %v; want the live floor with rb's tombstone and other's from after the restore", b, err)
 		}
+	})
+	// The reverse merge with --undo reads the retired record the restore's
+	// merge left: late, put after the backup and retired by the restore, is
+	// reported apart from other, deleted since the restore; --keep brings
+	// late back and is refused on other; and with no record --undo refuses.
+	t.Run("undo reports what the restore retired apart from later deletions", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/other", []byte("o"))
+		b := saveRecipeBackup(t, h, filepath.Join(t.TempDir(), "keystore-floor-backup"), "2026-11-22")
+		h.put("system/late", []byte("l"))
+		aside, err := restoreRecipeBackup(t, h, b, true)
+		if err != nil {
+			t.Fatalf("restore: %v", err)
+		}
+		h.mustRun(0, "floor", "merge")
+		if out := h.stdout.String(); !strings.Contains(out, "retired system/late:") {
+			t.Fatalf("the restore's merge printed %q, want late retired", out)
+		}
+		h.mustRun(0, "rm", "system/other", "--yes")
+		floor := recipeFloor(h)
+		merged := mergedFloors(t, floor)
+		staged := filepath.Join(recipePreRestore(h), "restored")
+		for _, mv := range [][2]string{
+			{aside, staged},
+			{h.keystoreDir(), aside},
+			{merged[0], floor + ".undo"},
+			{floor, floor + ".pre-restore"},
+			{floor + ".undo", floor},
+		} {
+			if err := os.Rename(mv[0], mv[1]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		record := merged[0] + ".retired"
+		if err := os.Rename(record, record+".aside"); err != nil {
+			t.Fatal(err)
+		}
+		h.mustRun(keysRefused, "floor", "merge", "--undo", "--dry-run")
+		if !strings.Contains(h.stderr.String(), "there is none") {
+			t.Fatalf("--undo with no retired record: stderr %q, want it refused for the missing record", h.stderr.String())
+		}
+		if err := os.Rename(record+".aside", record); err != nil {
+			t.Fatal(err)
+		}
+		h.mustRun(0, "floor", "merge", "--undo", "--dry-run")
+		out := h.stdout.String()
+		if !strings.Contains(out, "buried live system/late: retired by the restore: pass --keep system/late") || !strings.Contains(out, "buried live system/other: deleted since the restore: stays deleted") {
+			t.Fatalf("the reverse merge --dry-run printed %q, want late retired by the restore and other deleted since, apart", out)
+		}
+		h.mustRun(keysRefused, "floor", "merge", "--undo", "--keep", "system/other")
+		if !strings.Contains(h.stderr.String(), "deleted since the restore") {
+			t.Fatalf("--keep on other: stderr %q, want it refused as deleted since the restore", h.stderr.String())
+		}
+		h.mustRun(keysCommitted, "floor", "merge", "--undo", "--keep", "system/late")
+		h.mustRun(0, "show", "system/late", "--reveal")
+		if got := h.stdout.String(); got != "l" {
+			t.Fatalf("late after the undo = %q, want l", got)
+		}
+		if _, err := os.Lstat(filepath.Join(h.keystoreDir(), "other")); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("other's directory after the reverse merge: %v, want it removed", err)
+		}
+		h.mustRun(1, "show", "system/other", "--reveal")
 	})
 	// Without its floor, the restored entry is the deleted one put back, and
 	// the floor's tombstone refuses it.
@@ -2597,9 +2683,9 @@ func TestKeysPendingMergeGuard(t *testing.T) {
 		t.Fatalf("rm with a merge pending: stderr %q; want the warning", h.stderr.String())
 	}
 	h.mustRun(keysCommitted, "floor", "merge", "--keep", "system/k")
-	matches, err := filepath.Glob(recipeFloor(h) + ".merged-*")
-	if err != nil || len(matches) != 1 {
-		t.Fatalf("renamed merge input = %v, %v; want one keystore-floor.json.merged-<unix>", matches, err)
+	merged := mergedFloors(t, recipeFloor(h))
+	if _, err := os.Lstat(merged[0] + ".retired"); err != nil {
+		t.Fatalf("the merge's retired record: %v, want it beside the renamed input", err)
 	}
 	if _, err := os.Lstat(recipeFloor(h) + ".pre-restore"); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("keystore-floor.json.pre-restore after the merge: %v, want it renamed", err)

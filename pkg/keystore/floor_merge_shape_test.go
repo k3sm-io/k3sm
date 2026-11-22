@@ -398,3 +398,28 @@ func TestFloorMergeRemovesBuriedLiveStaged(t *testing.T) {
 		})
 	}
 }
+
+// TestParseRetired (U192): the retired record parses only in the one
+// encoding a merge writes.
+func TestParseRetired(t *testing.T) {
+	good, err := marshalRetired(retiredRecord{Retired: []string{"a", "b"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec, err := parseRetired(good); err != nil || len(rec.Retired) != 2 || len(rec.BuriedLive) != 0 {
+		t.Fatalf("parseRetired(%s) = %+v, %v; want a and b retired", good, rec, err)
+	}
+	for _, bad := range []string{
+		`{"retired":["b","a"],"buriedLive":[]}` + "\n",
+		`{"retired":["a","a"],"buriedLive":[]}` + "\n",
+		`{"retired":["Bad"],"buriedLive":[]}` + "\n",
+		`{"retired":[],"buriedLive":[],"x":1}` + "\n",
+		`{"retired":[],"buriedLive":[]}`,
+		`{"buriedLive":[],"retired":[]}` + "\n",
+		`{"retired":[],"buriedLive":[]}{}` + "\n",
+	} {
+		if _, err := parseRetired([]byte(bad)); !errors.Is(err, ErrCorrupt) {
+			t.Errorf("parseRetired(%q): %v, want ErrCorrupt", bad, err)
+		}
+	}
+}

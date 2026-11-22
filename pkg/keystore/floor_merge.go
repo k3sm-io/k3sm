@@ -111,6 +111,13 @@ type MergeReport struct {
 	// floor held before the merge: a merge that would drop one it adds is
 	// refused.
 	Dropped []string
+	// RetiredByRestore and DeletedSinceRestore split BuriedLive in an undo
+	// (MergeOptions.Undo), by the retired record the restore's merge left:
+	// the names it retired, which --keep brings back, and the others,
+	// deleted since the restore, which stay deleted. Both are nil in a
+	// merge that is no undo.
+	RetiredByRestore    []string
+	DeletedSinceRestore []string
 	// AlreadyMerged is set when the live floor already held every burial
 	// and fence the input records: the merge wrote nothing and only renamed
 	// the input, as a rerun after a failed rename does.
@@ -145,6 +152,11 @@ type MergeOptions struct {
 	// renames nothing, and a merge that would be refused is refused with
 	// that report.
 	DryRun bool
+	// Undo marks the reverse merge of an undo: it reads the newest retired
+	// record the restore's merge left (readRetired), refusing when there is
+	// none, reports the buried-live names it retired apart from those
+	// deleted since (classifyUndo), and refuses a keep of one deleted since.
+	Undo bool
 }
 
 // MergeFloor merges every burial the data root's
@@ -222,6 +234,12 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 	if named, err := fdir.root.Lstat(floorName); err == nil && os.SameFile(named, in.info) {
 		return r, errMergeLiveFloor
 	}
+	var undo retiredRecord
+	if opts.Undo {
+		if undo, err = s.readRetired(fdir); err != nil {
+			return r, err
+		}
+	}
 	if err := s.step("merge read"); err != nil {
 		return r, err
 	}
@@ -255,6 +273,11 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 	pr := plan.r
 	if unmatched := unmatchedKeep(kept, pr.Kept); len(unmatched) > 0 {
 		return MergeReport{}, fmt.Errorf("--keep names %s, which the merge would not delete: it keeps an entry only when the floor moved aside records its restored generation as deleted, or holds a newer generation of a name the restored floor does not record. Nothing is written; check the names and run the merge again without them", strings.Join(unmatched, ", "))
+	}
+	if opts.Undo {
+		if err := classifyUndo(&pr, undo); err != nil {
+			return MergeReport{}, err
+		}
 	}
 	if !pr.changes() {
 		pr.AlreadyMerged, pr.Unverified, pr.Dropped = true, unionNames(unverified, pr.Unverified), nil
@@ -300,6 +323,12 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 	if err := in.same(); err != nil {
 		return r, err
 	}
+	// What the merge retires and buries live is recorded before the floor
+	// is written, under the pending name renameMerged renames with the
+	// input, so an undo can tell them apart from later deletions.
+	if err := s.writeRetiredPending(fdir, pr); err != nil {
+		return r, fmt.Errorf("write %s: %w; nothing is merged, run the merge again", retiredPendingName, err)
+	}
 	// The staged tree is handed to the service user before the floor is
 	// written: a failure here leaves nothing written.
 	if err := s.chownStaged(st); err != nil {
@@ -338,6 +367,9 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 		slog.Warn("keystore floor: the restored pointer of this entry is more than one sequence above the restored floor's record, more than a crash leaves, so the merge did not raise the record to it: that pointer is refused while it is at or below the fence the merge set, until a Rotate seals above the fence, and accepted above it; the record's own sequence stays accepted", "name", name)
 	}
 	r.Unverified = unionNames(unverified, r.Unverified)
+	if opts.Undo {
+		_ = classifyUndo(&r, undo) // its refusal was decided on the plan
+	}
 	for _, name := range r.BuriedLive {
 		slog.Warn("keystore floor: the moved-aside floor records the restored generation of this entry as deleted, so the merge buried it and removed its restored directory; in an undo --keep brings back a version the first merge retired", "name", name)
 	}
@@ -559,22 +591,52 @@ var errMergeLiveFloor = errors.New("keystore-floor.json.pre-restore is the live 
 // live floor is absent.
 var errGuardNoFloor = errors.New("a restore is unfinished (keystore-floor.json.pre-restore is in the data root) and the live floor is absent: install the saved keystore-floor.json first, with install -o root -g wheel -m 0644 as docs/user/keys.md describes; nothing is deleted until then")
 
+// maxMergedTries bounds how many seconds renameMerged tries past now for a
+// free keystore-floor.json.merged-<unix>.
+const maxMergedTries = 8
+
 // errNoGuard refuses a merge when the data root holds no
 // keystore-floor.json.pre-restore: no restore is unfinished.
 var errNoGuard = errors.New("there is nothing to merge: keystore-floor.json.pre-restore, the floor the restore recipe moves aside, is not in the data root. The merge reads only that file; move the live floor aside under that name as docs/user/keys.md describes")
 
 // renameMerged renames the merged input in, through the data root the lock
 // judged, to keystore-floor.json.merged-<unix>, which clears the guard
-// (errMergePending) and records which file was merged. The name must still
-// be the file read, and the new name must not exist: a file there is never
-// replaced.
+// (errMergePending) and records which file was merged, and the pending
+// retired record, when there is one, to the same name with .retired. The name must still
+// be the file read, and a name taken is never replaced: the first second
+// from now with both names free is used.
 func (s *FileStore) renameMerged(in *mergeInput) error {
 	if err := in.same(); err != nil {
 		return err
 	}
-	to := fmt.Sprintf("%s.merged-%d", floorName, s.now().Unix())
-	if _, err := in.dir.Lstat(to); !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("%s already exists", to)
+	// The first second from now with neither name taken, so a merge made
+	// in the same second as an earlier one (an undo right after its
+	// restore) still sorts after it; a name taken is never replaced.
+	var to string
+	for at, tries := s.now().Unix(), 0; ; at, tries = at+1, tries+1 {
+		if tries == maxMergedTries {
+			return fmt.Errorf("%s%d and the %d seconds after it are all taken", mergedPrefix, at-maxMergedTries, maxMergedTries)
+		}
+		to = fmt.Sprintf("%s%d", mergedPrefix, at)
+		free := true
+		for _, n := range []string{to, to + retiredSuffix} {
+			if _, err := in.dir.Lstat(n); !errors.Is(err, fs.ErrNotExist) {
+				free = false
+			}
+		}
+		if free {
+			break
+		}
+	}
+	// The retired record goes first: renamed after the input, a failure
+	// would leave it pending with no guard left to rerun the merge on.
+	switch _, err := in.dir.Lstat(retiredPendingName); {
+	case err == nil:
+		if err := in.dir.Rename(retiredPendingName, to+retiredSuffix); err != nil {
+			return err
+		}
+	case !errors.Is(err, fs.ErrNotExist):
+		return err
 	}
 	if err := in.dir.Rename(in.base, to); err != nil {
 		return err

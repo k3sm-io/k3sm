@@ -329,7 +329,12 @@ needs no ownership change. Never run `chown -R` or `chmod -R` as root over the m
 `keystore/`. The service user wrote that tree, and a hard link it placed there would make root
 change a file somewhere else. `ditto` copies the backup into `pre-restore.d/restored`, beside
 the moved-aside copy, not into `server/`: the merge below moves it into place and hands it to the
-service user itself, one file at a time, never following a link. Leave
+service user itself, one file at a time, never following a link. It first checks the whole copy
+and refuses it, changing nothing, if it holds anything the keystore does not write: a name the
+keystore does not use, a link, a FIFO or socket, a file with a second hard link, a setuid, setgid
+or sticky bit, an ACL or a file flag, a file larger than its kind can be, or a file owned by
+anyone but the service user (or the unknown owner a volume that ignores ownership reports). A
+file owned by root is refused too. The message names the path inside the copy. Leave
 `/var/lib/k3sm/server/keystore` absent; the merge refuses if anything is there. Every line ends in
 `|| exit 1`, so the first one that fails stops the steps (and closes the shell), and no later
 line moves a copy into or over one that is set aside:
@@ -405,7 +410,8 @@ system/<name>` and each one whose pre-restore version it retired as `retired sys
 moved-aside version` for an entry the backup does not hold. It warns on stderr about each
 revoked entry it keeps, since keeping it brings back a key that may have been deleted to revoke
 it. A `--keep` name the merge would not delete, such as a
-typo, makes it refuse and change nothing. Remove each deleted entry's files with `sudo k3sm keys rm system/<name> --yes`.
+typo, makes it refuse and change nothing. The merge removes the restored files of each entry it
+deletes again before it moves the copy into place, so you do not run `rm` for them.
 A line starting `dropped` names a deletion the floor could not keep: a copy of that entry put
 back is accepted. If the merge would drop any deletion to fit, even one the restored floor
 already held, it refuses with a message that the floor is full, changes nothing and leaves the
@@ -470,7 +476,10 @@ above. The floors swap places: the floor you moved aside
 goes back in place, and the restored floor becomes `keystore-floor.json.pre-restore`, so the
 merge runs in reverse and keeps every deletion you made after the restore. If you already ran
 the merge, the floor you moved aside is now `keystore-floor.json.merged-<time>`: use that name
-in the first floor `mv` instead.
+in the first floor `mv` instead. `--undo` tells the reverse merge to read the record the first
+merge left beside that file, `keystore-floor.json.merged-<time>.retired`, which lists what the
+first merge retired; leave that record in place. If you never ran the first merge there is no
+record and `--undo` refuses: run the two merge lines without `--undo`.
 
 ```
 sudo k3sm stop
@@ -480,8 +489,8 @@ sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/pre-restore.d/keystore || ex
 sudo mv /var/lib/k3sm/keystore-floor.json.pre-restore /var/lib/k3sm/keystore-floor.json.undo || exit 1
 sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1
 sudo mv /var/lib/k3sm/keystore-floor.json.undo /var/lib/k3sm/keystore-floor.json || exit 1
-sudo k3sm keys floor merge --dry-run
-sudo k3sm keys floor merge
+sudo k3sm keys floor merge --undo --dry-run
+sudo k3sm keys floor merge --undo
 sudo rm -rf /var/lib/k3sm/pre-restore.d
 sudo k3sm start
 ```
@@ -489,12 +498,12 @@ sudo k3sm start
 The last `rm -rf` removes the restored copy, which the steps above left in `pre-restore.d`.
 
 Read the `--dry-run` report before you run the merge. A `buried live` line names an entry that
-the restored floor records as deleted. That is either an entry you deleted after the restore,
-which stays deleted, or a version the first merge retired, which the reverse merge buries though
-it is live again in the keystore you moved back. Do not remove the second kind. Run the merge
-with `--keep system/<name>` for each of them instead, and run `--dry-run` with the same `--keep`
-flags first to check that no such line is left. Then remove the files of each entry you deleted
-after the restore with `sudo k3sm keys rm system/<name> --yes` before you start the server.
+the restored floor records as deleted, and says which kind it is. `retired by the restore` is a
+version the first merge retired, live again in the keystore you moved back: the reverse merge
+deletes it, files and all, unless you run the merge with `--keep system/<name>` for it, so name
+each one with `--keep` and run `--dry-run` with the same flags first to check that none is left.
+`deleted since the restore` is an entry you deleted after the restore: it stays deleted, the
+merge removes its files, and `--keep` on it is refused.
 
 The values come back byte for byte: `show --reveal` prints exactly what it printed before. Restore
 the master key the same way, from its own backup, if it was lost too.
