@@ -553,8 +553,9 @@ func copyTree(t *testing.T, src, dst string) {
 
 // TestKeysRollbackRoundTrip is G21's CLI test: the rollback recipes in
 // docs/user/keys.md run as written. A restore of a saved keystore/, with the
-// floor saved beside it, brings a deleted entry back, and without the floor it
-// is refused; and `show --version N --reveal` piped into `rotate --in -`
+// floor saved at the same moment into a directory only its owner can open,
+// brings a deleted entry back, and without the floor it is refused; the undo
+// steps, the restored copies renamed first, put the live state back; and `show --version N --reveal` piped into `rotate --in -`
 // stores a version whose value equals version N's byte for byte
 // (bytes.Equal, the comparison cmp makes), for an opaque and an Ed25519 entry.
 func TestKeysRollbackRoundTrip(t *testing.T) {
@@ -569,8 +570,18 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 		backup := filepath.Join(t.TempDir(), "keystore")
 		copyTree(t, h.keystoreDir(), backup)
 		floor := filepath.Join(filepath.Dir(h.work), "keystore-floor.json")
-		savedFloor, err := os.ReadFile(floor)
+		// The floor is saved in the same run, apart from keystore/, into a
+		// directory of mode 0700 (install -d -m 0700, then install -m 0644).
+		floorDir := filepath.Join(t.TempDir(), "keystore-floor-backup")
+		if err := os.Mkdir(floorDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		saved := filepath.Join(floorDir, "keystore-floor.json")
+		b, err := os.ReadFile(floor)
 		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(saved, b, 0o644); err != nil {
 			t.Fatal(err)
 		}
 		h.mustRun(0, "rm", "system/rb", "--yes")
@@ -587,7 +598,16 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 			if err := os.Rename(floor, floor+".pre-restore"); err != nil {
 				t.Fatal(err)
 			}
-			if err := os.WriteFile(floor, savedFloor, 0o644); err != nil {
+			b, err := os.ReadFile(saved)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// install -o root -g wheel -m 0644: the owner is this test's
+			// floor owner, and the mode is set whatever the umask.
+			if err := os.WriteFile(floor, b, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(floor, 0o644); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -610,6 +630,33 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 			if err := os.RemoveAll(p); err != nil {
 				t.Fatal(err)
 			}
+		}
+	})
+	// The undo steps: the restored keystore/ and floor are renamed out of
+	// the way first, since mv onto a directory that exists moves the source
+	// inside it, then the moved-aside copies go back, and the live state,
+	// rb deleted, is what the CLI sees.
+	t.Run("save rm restore, then undo", func(t *testing.T) {
+		h := newKeysHarness(t)
+		_, aside := saveRmRestore(t, h, true)
+		floor := filepath.Join(filepath.Dir(h.work), "keystore-floor.json")
+		for _, mv := range [][2]string{
+			{h.keystoreDir(), h.keystoreDir() + ".restored"},
+			{aside, h.keystoreDir()},
+			{floor, floor + ".restored"},
+			{floor + ".pre-restore", floor},
+		} {
+			if err := os.Rename(mv[0], mv[1]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := os.Lstat(filepath.Join(h.keystoreDir(), "keystore")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("undo nested a keystore/ inside the live one: %v", err)
+		}
+		h.mustRun(0, "list")
+		h.mustRun(1, "show", "system/rb", "--reveal")
+		if b, err := os.ReadFile(floor); err != nil || !strings.Contains(string(b), `"tombstones":{"rb":`) {
+			t.Fatalf("floor after the undo = %s, %v; want the live floor with rb's tombstone", b, err)
 		}
 	})
 	// Without its floor, the restored entry is the deleted one put back, and
