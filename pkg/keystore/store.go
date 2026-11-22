@@ -631,6 +631,9 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 		return lerr
 	}
 	present := lerr == nil
+	if present && fi.IsDir() && kerr != nil {
+		warnUnrecorded(root, name, fl)
+	}
 	var authentic *[generationSize]byte
 	if present && fi.IsDir() && kerr == nil {
 		if raw, err := openEntryDirRaw(root, name); err == nil {
@@ -685,6 +688,32 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 		slog.Warn("keystore: the entry directory was already gone; its deletion is recorded in the floor", "name", name)
 	}
 	return nil
+}
+
+// warnUnrecorded logs, at Warn, a master-less Delete of a directory with a
+// current pointer under a name the floor records nothing live for, whose
+// generation it does not already bury: without the master no pointer can
+// vouch for the directory's generation, so the Delete buries nothing, and a
+// copy of it put back later is accepted. Rerunning rm with the master
+// records it (docs/design/keystore.md § "Pointer sequence and floor",
+// "Deletion without the master").
+func warnUnrecorded(root *os.Root, name string, fl floor) {
+	f := fl[name]
+	if f.live() {
+		return
+	}
+	raw, err := openEntryDirRaw(root, name)
+	if err != nil {
+		return
+	}
+	defer raw.close()
+	if _, err := raw.root.Lstat(currentName); err != nil {
+		return
+	}
+	if gen, err := readGeneration(raw.root); err == nil && f.buries(hex.EncodeToString(gen[:])) {
+		return
+	}
+	slog.Warn("keystore: deleting an entry the floor has no record of without the master, so its generation is not recorded as deleted and a copy of it put back is accepted; to record it, put the entry back and rerun rm with the master", "name", name)
 }
 
 // removeEntry removes what stands under name, after the burial: a

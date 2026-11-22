@@ -171,3 +171,31 @@ func TestPerNameCapIsBackstop(t *testing.T) {
 		t.Fatalf("k holds %d burials, want 64", n)
 	}
 }
+
+// TestDeleteWithoutMasterWarnsUnrecorded (U192): a master-less Delete of a
+// directory with a current pointer under a name the floor records nothing
+// live for buries nothing, and logs at Warn that its generation is not
+// recorded, naming the remedy: rerun rm with the master. A master-less
+// Delete of a name the floor records live does not log it.
+func TestDeleteWithoutMasterWarnsUnrecorded(t *testing.T) {
+	ctx := context.Background()
+	const residual = "rerun rm with the master"
+	s, server := newTestStore(t)
+	mustPut(t, s, "k", KindOpaque, []byte("one"))
+	mustPut(t, s, "live", KindOpaque, []byte("one"))
+	remove(t, filepath.Join(server, "cred", "keystore-master", masterName))
+	buf := captureWarn(t)
+	if err := s.Delete(ctx, "live"); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(buf.String(), residual) {
+		t.Fatalf("a master-less Delete of a recorded name logged %q", buf)
+	}
+	putFloorFile(t, server, floor{})
+	if err := s.Delete(ctx, "k"); err != nil {
+		t.Fatal(err)
+	}
+	if got := buf.String(); !strings.Contains(got, "level=WARN") || !strings.Contains(got, residual) || !strings.Contains(got, "name=k") {
+		t.Fatalf("log of a master-less Delete with no record = %q, want a Warn naming k and %q", got, residual)
+	}
+}
