@@ -969,7 +969,7 @@ func (s *FileStore) startUserScopes(ctx context.Context) error {
 	if spent > 0 {
 		slog.Warn("uids have spent their revocation budgets past the hard cap; only their revocations are refused", "uids", spent)
 	}
-	quarantined, scopeErrs, err := s.catchUpUserScopes(ctx)
+	quarantined, scopeErrs, err := s.catchUpUser(ctx)
 	if err != nil {
 		return errors.Join(err, scopeErrs)
 	}
@@ -1015,15 +1015,10 @@ var errUserScopesNotStarted = errors.New("the user scope is not started: the ser
 // in scopeErrs, and the rest are still caught up; err is a catch-up that
 // could not run at all. A keystore with no directory or no user scope has
 // nothing to catch up.
-func (s *FileStore) catchUpUser(ctx context.Context) (scopeErrs, err error) {
-	_, scopeErrs, err = s.catchUpUserScopes(ctx)
-	return scopeErrs, err
-}
-
-// catchUpUserScopes is catchUpUser, which also returns the uids whose live
-// catch-up line the floor refused (errCatchUpRefused): the scopes the start
-// step quarantines.
-func (s *FileStore) catchUpUserScopes(ctx context.Context) (quarantined map[uint32]bool, scopeErrs, err error) {
+//
+// quarantined is the uids whose live catch-up line the floor refused
+// (errCatchUpRefused): the scopes the start step quarantines.
+func (s *FileStore) catchUpUser(ctx context.Context) (quarantined map[uint32]bool, scopeErrs, err error) {
 	quarantined = map[uint32]bool{}
 	if err := s.checkConfig(); err != nil {
 		return quarantined, nil, err

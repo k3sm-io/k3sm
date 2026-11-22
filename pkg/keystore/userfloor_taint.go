@@ -61,10 +61,9 @@ const (
 type taintKind uint8
 
 const (
-	taintNone taintKind = iota
 	// taintName is a line torn inside its generation: any generation of
 	// (scope, name).
-	taintName
+	taintName taintKind = iota + 1
 	// taintGen is a line whose generation is whole: (scope, name, gen).
 	taintGen
 	// taintUnattributable is a line no key can be read from.

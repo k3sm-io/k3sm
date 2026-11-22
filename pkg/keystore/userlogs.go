@@ -1444,13 +1444,6 @@ func (f *fileFloorLog) grantRefused(k floorKey) (bool, error) {
 	return refused, err
 }
 
-// damaged is the floor's count of damaged lines.
-func (f *fileFloorLog) damaged() (int, error) {
-	var n int
-	err := f.read(func(state *logState) { n = state.damaged() })
-	return n, err
-}
-
 func (f *fileFloorLog) liveGens(scope, name string) ([][generationSize]byte, error) {
 	var out [][generationSize]byte
 	err := f.read(func(state *logState) {

@@ -96,7 +96,7 @@ func TestFloorDamageDegradesLiveLines(t *testing.T) {
 	}
 	liveLines := func() int { return bytes.Count(readLog(t, s, userFloorLogName), live) }
 
-	scopeErrs, err := s.catchUpUser(ctx)
+	_, scopeErrs, err := s.catchUpUser(ctx)
 	if err != nil || !errors.Is(scopeErrs, errFloorDegraded) {
 		t.Fatalf("catchUpUser over a damaged floor: %v, %v; want errFloorDegraded", err, scopeErrs)
 	}

@@ -116,7 +116,7 @@ func TestCatchUpUserAtStartSurvivesRestart(t *testing.T) {
 	}
 	fl.freeSpace = nil
 	forgetDeliveriesSeen(s)
-	if scopeErrs, err := s.catchUpUser(ctx); err != nil || scopeErrs != nil {
+	if _, scopeErrs, err := s.catchUpUser(ctx); err != nil || scopeErrs != nil {
 		t.Fatalf("catchUpUser: %v, %v", err, scopeErrs)
 	}
 	putBackDeliveries(t, server, old)

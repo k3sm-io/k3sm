@@ -161,7 +161,7 @@ func (s *FileStore) ackFloorDamage(ctx context.Context) error {
 	if s.userScopesStarted == nil || !s.userScopesStarted.Load() {
 		return nil
 	}
-	quarantined, scopeErrs, err := s.catchUpUserScopes(ctx)
+	quarantined, scopeErrs, err := s.catchUpUser(ctx)
 	if err != nil {
 		return errors.Join(err, scopeErrs)
 	}
