@@ -136,19 +136,36 @@ func TestUserRmBuriesBeforeRemoval(t *testing.T) {
 	checkUserDeleted(t, "current", err)
 }
 
-// An absent floor does not stop an rm: revocation always succeeds, and the
-// tombstone that could not be written is reported as after a commit.
-func TestUserRmAbsentFloorProceeds(t *testing.T) {
+// An absent floor refuses an rm, which removes nothing: rm buries before
+// it removes, and a tree removed with no tombstone could be copied back and
+// served. Once the floor is back the rm goes ahead.
+func TestUserRmAbsentFloorRemovesNothing(t *testing.T) {
 	ctx := context.Background()
 	s, server, u := fileLogScope(t)
-	if err := os.Remove(filepath.Join(s.dataRoot, userFloorLogName)); err != nil {
+	floorPath := filepath.Join(s.dataRoot, userFloorLogName)
+	saved, err := os.ReadFile(floorPath)
+	if err != nil {
 		t.Fatal(err)
 	}
-	err := u.Delete(ctx, "user/1001/token")
-	if err != nil && !errors.Is(err, errCommitted) {
-		t.Fatalf("rm with no floor: %v, want it to go ahead", err)
+	if err := os.Remove(floorPath); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := os.Lstat(filepath.Join(scopeDir(server, "1001"), scopeEntriesName, "token")); !errors.Is(err, fs.ErrNotExist) {
+	dir := filepath.Join(scopeDir(server, "1001"), scopeEntriesName, "token")
+	err = u.Delete(ctx, "user/1001/token")
+	if err == nil || errors.Is(err, errCommitted) || !errors.Is(err, errLogMissing) {
+		t.Fatalf("rm with no floor: %v, want a refusal naming the missing floor", err)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, currentName)); err != nil {
+		t.Fatalf("the entry's pointer after a refused rm: %v, want it kept", err)
+	}
+	if err := os.WriteFile(floorPath, saved, logMode); err != nil {
+		t.Fatal(err)
+	}
+	giveToService(t, floorPath)
+	if err := u.Delete(ctx, "user/1001/token"); err != nil {
+		t.Fatalf("rm with the floor back: %v", err)
+	}
+	if _, err := os.Lstat(dir); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("the entry is still there: %v", err)
 	}
 }

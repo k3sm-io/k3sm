@@ -228,22 +228,25 @@ func TestWithdrawUnverifiedFloorSealsNothing(t *testing.T) {
 	}
 }
 
-// U20: an rm over a floor whose last line has no newline still removes the
-// tree, and reports the tombstone unwritten (errCommitted): the append reads
-// the tail first and refuses to merge the tombstone into the torn line. The
-// floor is unchanged, so the next read refuses it as damage, and a grant
-// over it is refused before any write.
-func TestRmOverTornFloorTailTombstoneUnwritten(t *testing.T) {
+// U20: an rm over a floor whose last line has no newline is refused and
+// removes nothing: it buries first, and a floor that cannot be read or take
+// the tombstone refuses it before any removal. The floor is unchanged, so
+// the next read refuses it as damage, and a grant over it is refused before
+// any write.
+func TestRmOverTornFloorTailRemovesNothing(t *testing.T) {
 	ctx := context.Background()
 	s, server, u := fileLogScope(t)
 	userPut(t, u, "user/1001/keep", "kept")
 	appendLogBytes(t, s, userFloorLogName, []byte("user/1001 tok"))
 	before := readLog(t, s, userFloorLogName)
+	tokenDir := filepath.Join(scopeDir(server, "1001"), scopeEntriesName, "token")
 	err := u.Delete(ctx, "user/1001/token")
-	if !errors.Is(err, errCommitted) || !errors.Is(err, errLogTornTail) || !strings.Contains(err.Error(), "tombstone unwritten") {
-		t.Fatalf("rm over a torn floor tail: %v, want errCommitted with the tombstone unwritten", err)
+	if err == nil || errors.Is(err, errCommitted) || !errors.Is(err, errFloorLogMalformed) || !strings.Contains(err.Error(), "nothing removed") {
+		t.Fatalf("rm over a torn floor tail: %v, want a refusal naming the malformed floor, with nothing removed", err)
 	}
-	checkEntryGone(t, server, "token")
+	if _, err := os.Lstat(filepath.Join(tokenDir, currentName)); err != nil {
+		t.Fatalf("the entry's pointer after a refused rm: %v, want it kept", err)
+	}
 	if !bytes.Equal(before, readLog(t, s, userFloorLogName)) {
 		t.Fatal("rm appended to a floor with a torn tail")
 	}

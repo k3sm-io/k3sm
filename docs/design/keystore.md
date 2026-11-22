@@ -1469,14 +1469,15 @@ service user can only add to.
   never deleted): `<scope> <name> <generation> rm`. **Absent is not
   malformed.** A floor that is absent or cannot be read (a clear flag, a wrong owner, an I/O
   error) refuses every grant and read, and lets a revocation go ahead as far as it seals
-  nothing: `rm` removes the tree, and a `withdraw` of a live delivery is refused with the
+  nothing: `rm` is refused before it removes anything, since it must bury first, and a `withdraw` of a live delivery is refused with the
   named error that says to delete the Secret anyway (see "Revocation always succeeds"). A read I/O error is
   that transient case, never damage: the reader does not keep it, and the next read tries the
   file again from the last whole line it read. A floor whose bytes do
   not parse, a last line with no newline included, is damage: it refuses with `ErrCorrupt`
   naming `floor --rebuild` every grant and read, and a revocation that re-seals a record (a
   `withdraw`), since that revocation would re-seal it checked against no floor (U20). An `rm`
-  re-seals nothing, so it goes ahead over a malformed floor as over an absent one.
+  over a floor that is absent, unreadable or malformed is refused before it removes anything
+  (see "Bury, or remove nothing" below).
 - **`rm` buries.** A user entry's floor line is always at sequence 1, so a sequence alone
   cannot refuse a tree copied back after an `rm`. So `rm` appends a tombstone for the entry's
   `(scope, name, generation)` under the exclusive lock, before it removes anything: bury
@@ -1484,26 +1485,38 @@ service user can only add to.
   file is not authenticated, and a tree-writer who cannot read the master can swap it to
   another valid value, so the entry reads as damage and the user runs `rm`. So `rm` trusts no
   one source: it buries every generation the floor holds a live line for under
-  `(scope, name)`, the `generation` file's value, and the generation in the current
-  pointer's header, parsed without a key. A source that does not read adds nothing (a tree a
-  crashed `put` left has no pointer). When the ones that read disagree, `rm` still buries
+  `(scope, name)`, the `generation` file's value, the generation in the current
+  pointer's header and the generation in each `v<N>` version record's header, the headers
+  parsed without a key. A source that does not read or parse adds nothing (a tree a
+  crashed `put` left has no pointer). The floor's live generations are taken first and
+  buried **whatever stands at the name**: a directory (with the tree's sources added); a
+  file or a symlink, which `rm` buries, then removes (the symlink itself, never what it
+  names) and reports as after a commit (`errCommitted`) naming the shape; or nothing, when
+  `rm` buries the live generations and succeeds, so an `rm` is idempotent and an `rm`
+  retried after a failed burial, once the tree is gone, still closes the window. An absent
+  name with no live generation is `ErrNotFound`. When the ones that read disagree, `rm` still buries
   them all and removes the tree, and reports the mismatch, naming each source's generation,
   as after a commit (`errCommitted`), so the operator learns the tree was altered (U20). `current` and
   `list` refuse a buried generation as deleted, wrapping `ErrCorrupt`, with a message whose
   normal action is "the entry was deleted; rm it and put it again" and which names root's
   `floor --rebuild` only as the last resort, for a deliberate restore. A later `put` of the
-  name mints a fresh generation, which no tombstone names. Revocation always succeeds: if the
-  floor is absent or cannot be read at `rm`, or no generation can be read from any of the
-  three sources, `rm` still removes the tree and reports the tombstone it could not write as after a commit. The
-  residual is that window: a tree removed without a tombstone and copied back later is served, since
-  nothing writes that generation again; the operator sees the `rm` reported with its tombstone unwritten (U20).
+  name mints a fresh generation, which no tombstone names. **Bury, or remove nothing.** If the
+  floor is absent, cannot be read, or does not take a tombstone (a torn tail, too little
+  free space, a write error), `rm` is refused with a named, retryable error before it removes
+  anything, so no tree is ever removed without its tombstone; the user retries once root has
+  repaired the floor. Here `rm` departs from "revocation always succeeds", as a `withdraw`
+  over an unverified floor already does: removing the tree anyway would open the window in
+  which a copy put back is served. Only when no generation reads from any source (the floor
+  holds none and the tree names none) does `rm` remove the tree with nothing to bury, and it
+  reports that as after a commit (U20).
 - **A torn tail.** Every append is one `write(2)` of one whole line, and before it the server
   reads the free space of the log's file system with `fstatfs` on the log's descriptor and
   refuses, with a named, retryable error and nothing written, when less than 1 MiB plus the
   line is free: a refusal, never damage. A revocation's line (`rm`'s tombstones, a revoking
   `withdraw`'s floor line, and their `revoke` audit lines) is exempt from that margin and keeps
   only a minimal check, the line plus 4 KiB, so a nearly full volume still records a
-  revocation; below that it is refused and the revocation is reported as after a commit. Nor
+  revocation; below that it is refused: a `withdraw` is reported as after a commit, and an
+  `rm`, which buries before it removes, is refused with nothing removed. Nor
   does the floor's key bound ever refuse a revocation's line for a key the floor already holds
   (U24). The residual window is an `ENOSPC` or `EIO` between
   that preflight and the write, or a crash mid-write: either can leave partial bytes the flag
@@ -1512,8 +1525,8 @@ service user can only add to.
   the byte at `size-1` on the descriptor it appends through. In the floor a non-empty file
   whose last byte is not a newline refuses the append with a named error naming
   `floor --rebuild`, and nothing is written: a grant is refused before its first write (its
-  floor check already refuses a torn floor), and an `rm` still removes the tree and reports
-  its tombstone unwritten (`errCommitted`), as for any floor that cannot take the line; the
+  floor check already refuses a torn floor), and an `rm` is refused before it removes
+  anything, as for any floor that cannot take the line; the
   floor stays torn, so the next read refuses it. In the audit log the append writes a newline
   first, in the same `write(2)`, so the torn bytes become a line of their own, which the
   tolerant audit reader drops and charges to no uid, and the new line parses (U23).
@@ -4237,7 +4250,7 @@ carried by the unit rows.
 | U17 | runtimed refuses a Pod identity it may not hold through `Credential.CheckPodIdentity` (`pkg/supervisor/privdrop.go`), not in `resolveCredential`: at `startContainer`, at `Exec` (an exec session), at the resident shim's `dropShim` and in `RunLaunchSequence`. A drop target uid is refused if it is 0, negative, 501 or above, or the service uid; groups are refused if they are 0, 20, 80, the privileged system groups (wheel, daemon, kmem, sys, tty, operator, procview, procmod, _developer), the service gid, negative or out of range, and a gid of 501 or above is refused unless it is an admitted `fsGroup`; a missing group defaults to `nobody`; a gid-only drop that leaves uid 0 is refused; an inherited uid with no drop (the daemon's own euid: the service uid, a rootless server's login uid or root on a root daemon) is allowed. The system gids (1, 2, 3, 4, 5, 8, 9, 204) are refused as the primary gid and as a supplemental gid (`runtimed/pkg/supervisor::TestRunLaunchSequenceRefusesPodGroups`, `runtimed/pkg/runtime::TestPodGroupsRefused`, `runtimed/pkg/supervisor::TestFSGroupGidAllowList`). A gid in 1..500 is refused for a Pod drop, as the primary or a supplemental group, when the host assigns it; an unassigned gid is allowed, and so is `nobody`; the never-list is always refused, a lookup error refuses, and an operator-admitted `fsGroup` the host assigns is still refused (`runtimed/pkg/supervisor::TestPodGroupsHostAssigned`). The service identity (the `_k3sm` lookup and the owners of the installed directories) is resolved again on every drop check (`runtimed/pkg/runtime::TestStartContainerResolvesTheServiceOwnerEachStart`), and a symlink at an installed path refuses every drop (`runtimed/pkg/runtime::TestSymlinkedWorkDirRefusesDrops`). When the account lookup returns not-found, a drop to the owner of the installed work dir or the keystore socket dir is refused (the installed service-uid fallback: `runtimed/pkg/supervisor::TestResolveServiceIdentityInstalledOwner`, `runtimed/pkg/runtime::TestServiceUIDFromInstalledDirs`). The live check is strict, a denial is an EPERM and planting is included (`runtimed/pkg/sandbox::TestKeystoreDeniesUnderSandboxExec`, `runtimed/pkg/sandbox::TestShimProfileKeepsTheKeystoreDeniesLast`) | `runtimed/pkg/runtime::TestStartContainerRefusesAPodIdentity`, `TestExecRefusesAPodIdentity`, `TestPodUIDInLoginRangeRefused`, `TestPodGroupsRefused`, `TestServiceUIDFromInstalledDirs`; `runtimed/internal/execshim::TestDropShim`; `runtimed/pkg/runtime::TestStartContainerResolvesTheServiceOwnerEachStart`, `TestSymlinkedWorkDirRefusesDrops`; `runtimed/pkg/supervisor::TestRunLaunchSequenceRefusesPodUID`, `TestRunLaunchSequenceRefusesPodGroups`, `TestFSGroupGidAllowList`, `TestResolveServiceIdentityInstalledOwner`, `TestPodGroupsHostAssigned`; `runtimed/pkg/sandbox::TestKeystoreDeniesUnderSandboxExec`, `TestShimProfileKeepsTheKeystoreDeniesLast`; rig legs E21, E22 | checked: runtimed's sandbox change |
 | U18 | CRD: `entry`, `secretName`, `items`, `requestedBy` required with no default and immutable by CEL transition rules (`items` as a map); `requestedBy` matches its pattern and, for a user entry, equals `k3sm:local:` plus the entry's uid; `conditions` is `listType=map` keyed by `type`; status subresource on; reasons listed; a `system/…` entry is refused | `apis/config/crd::TestKeyDeliveryCRDMatchesTheGoTypes`, `TestKeyDeliveryImmutableFields`, `TestKeyDeliveryRequiredFields`, `TestKeyDeliveryRequestedByMatchesEntryUID`, `TestKeyDeliveryConditionsListMap`, `TestKeyDeliveryRefusesSystemEntry` | pending: the `KeyDelivery` API |
 | U19 | the CRD pattern, its `maxLength` of 269, the uid range rule and the 253-byte name-length rule pass the shared entry-grammar vectors, `user/1/` and `system/` each with a 254-byte name refused | `apis/config/crd::TestEntryGrammarVectors` | pending: the `KeyDelivery` API |
-| U20 | a user entry tree copied back after `rm` is refused as deleted against the floor log's tombstone (real, not synthetic), a later `put` of the name is served, and an `rm` whose removal fails still leaves the entry refused; an `rm` buries every generation it can name (the floor's live ones, the `generation` file's and the pointer header's), so a swapped `generation` file does not let the original tree back, and it reports the mismatch after the commit; an absent floor lets an `rm` go ahead, a withdraw over a floor that is absent, unflagged or unreadable seals nothing and is refused naming the Secret's deletion, so a restored record is never re-sealed, an rm over a torn floor tail removes the tree and reports its tombstone unwritten, appending nothing, a malformed one refuses a withdraw with `ErrCorrupt` naming `floor --rebuild`, and a read I/O error is not damage; a grant over a floor that is absent, unflagged, unreadable or malformed is refused before its first write, with no `ok` line. A `current` below a floor line is refused with the user-scope floor message, which names `floor --rebuild`, not removing `keystore-floor.json`; until user rotate exists that half is proved against a synthetic later floor line, and becomes a real "older `current` than a later write" check with rotate | `k3sm/pkg/keystore::TestUserFloorRefusesCopyBackAfterRm`, `TestUserPutAfterRmServed`, `TestUserRmBuriesBeforeRemoval`, `TestUserRmAbsentFloorProceeds`, `TestUserRmSwappedGenerationStillBuries`, `TestUserFloorRefusesCopiedBackCurrent`, `TestWithdrawAbsentFloorProceeds`, `TestWithdrawUnverifiedFloorSealsNothing`, `TestRmOverTornFloorTailTombstoneUnwritten`, `TestWithdrawMalformedFloorRefused`, `TestFloorReadErrorIsNotDamage`, `TestGrantRefusesUntrustedFloorFirst`, `FuzzParseFloorLine`; rig leg E9 | checked: the append-only files (the store side) |
+| U20 | a user entry tree copied back after `rm` is refused as deleted against the floor log's tombstone (real, not synthetic), a later `put` of the name is served, and an `rm` whose removal fails still leaves the entry refused; an `rm` buries every generation it can name (the floor's live ones, the `generation` file's, the pointer header's and each `v<N>` record header's), so a swapped `generation` file, or a `generation` file and pointer both rewritten, does not let the original tree back, and it reports the mismatch after the commit; whatever stands at the name it buries the floor's live generations first: a file or a symlink there is buried, removed and reported after the commit, and an `rm` of an absent tree with live generations buries them and succeeds, so a retry after a failed burial closes the window; an absent floor refuses an `rm`, which removes nothing, a withdraw over a floor that is absent, unflagged or unreadable seals nothing and is refused naming the Secret's deletion, so a restored record is never re-sealed, an `rm` over a torn floor tail is refused, removing nothing and appending nothing, a malformed one refuses a withdraw with `ErrCorrupt` naming `floor --rebuild`, and a read I/O error is not damage; a grant over a floor that is absent, unflagged, unreadable or malformed is refused before its first write, with no `ok` line. A `current` below a floor line is refused with the user-scope floor message, which names `floor --rebuild`, not removing `keystore-floor.json`; until user rotate exists that half is proved against a synthetic later floor line, and becomes a real "older `current` than a later write" check with rotate | `k3sm/pkg/keystore::TestUserFloorRefusesCopyBackAfterRm`, `TestUserPutAfterRmServed`, `TestUserRmBuriesBeforeRemoval`, `TestUserRmAbsentFloorRemovesNothing`, `TestUserRmSwappedGenerationStillBuries`, `TestUserRmNonDirectoryBuries`, `TestUserRmRetryAfterTreeGoneBuries`, `TestUserRmBuriesVersionHeaderGeneration`, `TestUserFloorRefusesCopiedBackCurrent`, `TestWithdrawAbsentFloorProceeds`, `TestWithdrawUnverifiedFloorSealsNothing`, `TestRmOverTornFloorTailRemovesNothing`, `TestWithdrawMalformedFloorRefused`, `TestFloorReadErrorIsNotDamage`, `TestGrantRefusesUntrustedFloorFirst`, `FuzzParseFloorLine`; rig leg E9 | checked: the append-only files (the store side) |
 | U21 | install creates both logs service-user-owned 0600 and flagged; the listener refuses to start when a flag is clear or a log is not the service user's (seams: chflags flag source, file-attribute writer, euid source) | `k3sm/pkg/install::TestKeystoreAppendOnlyFilesAtInstall`, `k3sm/pkg/keystore::TestFlagCheckRefusesUnflagged`; rig leg E1 | pending: the append-only files |
 | U22 | `floor --rebuild` and `audit --rotate` write the marker `keystore-maintenance` and stage `keystore-user-floor.log.new` and `keystore-audit.log.new` in the root-owned data root, stop the listener, hold the lock, write the new file before touching the old, clear the old file's flag before any rename, and flag the new file on its held descriptor after the rename; a crash at each step leaves the marker, so the listener stays down until a rerun leaves a flagged file; every audit and floor append, the reconciler's and the pre-frame lines included, takes the store lock that maintenance holds exclusively, so a reconciler append during an `audit --rotate` waits and lands in the new log; after maintenance, under the exclusive lock, the server reopens its audit and floor append descriptors and recounts the per-uid shares before releasing it, and the counts reset (seams: file-attribute writer, euid source) | `k3sm/cmd/k3sm::TestKeysFloorRebuildCrashOrder`, `TestKeysAuditRotateCrashOrder`, `k3sm/pkg/keystore/reconcile::TestReconcilerAppendWaitsForAuditRotate`, `k3sm/pkg/keystore/socket::TestMaintenanceReopensLogsAndResetsShares`; rig leg E17 | pending: the append-only files, the socket listener and the KeyDelivery reconciler (lifecycle), run in the lifecycle's mode, the last to land |
 | U23 | every audited operation writes one `v:1` line; no line carries a value or its length; readers ignore unknown fields; an append after a torn tail writes a newline first, so the torn bytes are a dropped line of their own and the new line parses | `k3sm/pkg/keystore::TestAuditLineNeverCarriesValue`, `TestAuditReaderIgnoresUnknownFields`, `TestAuditTornTailAppendParses`, `FuzzParseAuditLine` | checked: the append-only files (the store side) |

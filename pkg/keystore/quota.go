@@ -192,48 +192,83 @@ func (u *UserScope) deleteBody(root *os.Root, name string) error {
 		return fmt.Errorf("%w: uid %d", ErrScopeOwnerChanged, u.uid)
 	}
 	fi, err := entries.Lstat(name)
-	if errors.Is(err, fs.ErrNotExist) {
-		// An rm that removes nothing is not in the revocation class.
+	absent := errors.Is(err, fs.ErrNotExist)
+	if err != nil && !absent {
+		return err
+	}
+	// The floor's live generations for the name, first and in every branch:
+	// whatever stands at the name, or nothing, rm buries them, so a retried
+	// rm closes the window one whose burial failed left open. A floor that
+	// cannot be read refuses the rm before anything is written or removed.
+	floorLive, err := u.s.userFloor.liveGens(u.scope, name)
+	if err != nil {
+		if aerr := u.s.admit(u.uid, false); aerr != nil {
+			return aerr
+		}
+		return fmt.Errorf("rm refused, nothing removed: read the user-scope floor's generations for the name: %w", err)
+	}
+	if absent && len(floorLive) == 0 {
+		// An rm that removes and buries nothing is not in the revocation class.
 		if err := u.s.admit(u.uid, false); err != nil {
 			return err
 		}
 		return ErrNotFound
 	}
-	if err != nil {
-		return err
-	}
 	if err := u.s.admit(u.uid, true); err != nil {
 		return err
 	}
-	var buryErr error
-	if fi.IsDir() {
-		// The tombstones first, under the lock and before any removal, so an
-		// rm that fails part way, and a copy of the tree put back after it,
-		// are refused as deleted (docs/design/keystore.md § "The user-scope
-		// floor"). The generation file is not authenticated, so rm buries
-		// every generation it can name: the floor's live ones for the name,
-		// the generation file's and the pointer header's. A floor that cannot
-		// take a line does not stop the revocation: it is reported as after a
-		// commit, as is a disagreement between the three.
-		e, err := openEntryDirRaw(entries, name)
-		if err != nil {
+	b := newBurial(name, floorLive)
+	if absent {
+		// No tree: only the floor's generations to bury, and nothing to
+		// remove. The rm is idempotent and retryable.
+		return b.bury(u)
+	}
+	if !fi.IsDir() {
+		// A file or a symlink at the name is no entry the store wrote: bury,
+		// then remove it (RemoveAll removes a symlink itself, never what it
+		// names), and report the shape after the commit.
+		if err := b.bury(u); err != nil {
 			return err
 		}
-		buryErr = u.buryAll(e, name)
-		// Then the pointer, so a crash leaves a directory the user scope
-		// reads as damage, never an older entry; RemoveAll removes a symlink
-		// itself, never what it names.
-		err = e.root.RemoveAll(currentName)
-		if err == nil {
-			err = syncDir(e.root)
+		if err := entries.RemoveAll(name); err != nil {
+			return err
 		}
+		if err := syncDir(entries); err != nil {
+			return err
+		}
+		return fmt.Errorf("%w, but the entry's name held %s, not a directory, so its tree was altered; rm buried the floor's live generations and removed it", errCommitted, shapeOf(fi))
+	}
+	// The tombstones first, under the lock and before any removal, so an rm
+	// that fails part way, and a copy of the tree put back after it, are
+	// refused as deleted (docs/design/keystore.md § "The user-scope floor").
+	// The generation file is not authenticated, so rm buries every
+	// generation it can name: the floor's live ones for the name, the
+	// generation file's, the pointer header's and each version record
+	// header's. A floor that does not take a line refuses the rm before
+	// anything is removed; a disagreement between the sources is reported
+	// after the commit.
+	e, err := openEntryDirRaw(entries, name)
+	if err != nil {
+		return err
+	}
+	b.addTree(e, name)
+	if err := b.bury(u); err != nil {
 		e.close()
-		if err != nil {
-			return err
-		}
-		if err := u.s.step("delete " + name); err != nil {
-			return err
-		}
+		return err
+	}
+	// Then the pointer, so a crash leaves a directory the user scope reads
+	// as damage, never an older entry; RemoveAll removes a symlink itself,
+	// never what it names.
+	err = e.root.RemoveAll(currentName)
+	if err == nil {
+		err = syncDir(e.root)
+	}
+	e.close()
+	if err != nil {
+		return err
+	}
+	if err := u.s.step("delete " + name); err != nil {
+		return err
 	}
 	if err := entries.RemoveAll(name); err != nil {
 		return err
@@ -241,72 +276,113 @@ func (u *UserScope) deleteBody(root *os.Root, name string) error {
 	if err := syncDir(entries); err != nil {
 		return err
 	}
-	if buryErr != nil {
-		return fmt.Errorf("%w, but %w", errCommitted, buryErr)
+	if rerr := b.report(); rerr != nil {
+		return fmt.Errorf("%w, but %w", errCommitted, rerr)
 	}
 	return nil
 }
 
-// buryAll buries, for rm, every generation of name it can find: those the
-// user-scope floor holds a live line for, the one e's generation file holds
-// and the one e's pointer header carries, parsed without a key. A source
-// that cannot be read adds nothing, since a tree a crashed Put left has no
-// pointer; one that reads and disagrees with another is reported, after
-// every generation is buried, as is a floor that did not take a line and an
-// entry with no generation to bury at all.
-func (u *UserScope) buryAll(e *entry, name string) error {
-	var (
-		gens    [][generationSize]byte
-		sources []string
-		errs    []error // the floor's: a tombstone unwritten
-	)
-	add := func(source string, g [generationSize]byte) {
-		sources = append(sources, fmt.Sprintf("%s %x", source, g[:]))
-		if !slices.Contains(gens, g) {
-			gens = append(gens, g)
+// shapeOf names what fi, which is not a directory, is.
+func shapeOf(fi fs.FileInfo) string {
+	switch {
+	case fi.Mode()&fs.ModeSymlink != 0:
+		return "a symlink"
+	case fi.Mode().IsRegular():
+		return "a file"
+	}
+	return "a special file"
+}
+
+// burial is the generations rm buries for one name, and the source that
+// named each.
+type burial struct {
+	name    string
+	gens    [][generationSize]byte
+	sources []string
+}
+
+func newBurial(name string, live [][generationSize]byte) *burial {
+	b := &burial{name: name}
+	for _, g := range live {
+		b.add("the floor", g)
+	}
+	return b
+}
+
+func (b *burial) add(source string, g [generationSize]byte) {
+	b.sources = append(b.sources, fmt.Sprintf("%s %x", source, g[:]))
+	if !slices.Contains(b.gens, g) {
+		b.gens = append(b.gens, g)
+	}
+}
+
+// addTree adds the generations e's tree names: its generation file's, its
+// pointer header's and each v<N> record header's, the headers parsed
+// without a key. A source that does not read or parse adds nothing, since a
+// tree a crashed Put left has no pointer.
+func (b *burial) addTree(e *entry, name string) {
+	if g, err := readGeneration(e.root); err == nil {
+		b.add("the generation file", g)
+	}
+	if g, ok := headerGeneration(e.root, currentName, name, true); ok {
+		b.add("the pointer header", g)
+	}
+	files, err := readDirNames(e.root, maxDirNames)
+	if err != nil {
+		return
+	}
+	var vs []uint64
+	for _, f := range files {
+		if n, ok := parseVersionName(f); ok {
+			vs = append(vs, n)
 		}
 	}
-	live, err := u.s.userFloor.liveGens(u.scope, name)
-	if err != nil {
-		errs = append(errs, fmt.Errorf("read the floor's generations: %w", err))
+	slices.Sort(vs)
+	for _, n := range vs {
+		if g, ok := headerGeneration(e.root, versionName(n), name, false); ok {
+			b.add(versionName(n)+"'s header", g)
+		}
 	}
-	for _, g := range live {
-		add("the floor", g)
-	}
-	if g, err := readGeneration(e.root); err == nil {
-		add("the generation file", g)
-	}
-	if g, ok := pointerHeaderGeneration(e.root, name); ok {
-		add("the pointer header", g)
-	}
-	if len(gens) == 0 {
-		errs = append(errs, errors.New("no generation to bury: the floor holds none for the name and neither the generation file nor the pointer header reads"))
-	}
-	for _, g := range gens {
-		if err := u.s.userFloor.bury(u.scope, name, g); err != nil {
+}
+
+// bury appends a tombstone for every generation, and refuses, before the
+// caller removes anything, when the floor did not take one: the rm is then
+// retryable, and the tree stays.
+func (b *burial) bury(u *UserScope) error {
+	var errs []error
+	for _, g := range b.gens {
+		if err := u.s.userFloor.bury(u.scope, b.name, g); err != nil {
 			errs = append(errs, err)
 		}
 	}
-	var out []error
 	if len(errs) > 0 {
-		out = append(out, fmt.Errorf("with its tombstone unwritten: the user-scope floor did not take it: %w", errors.Join(errs...)))
+		return fmt.Errorf("rm refused, nothing removed: the user-scope floor did not take its tombstone: %w", errors.Join(errs...))
 	}
-	if len(gens) > 1 {
-		out = append(out, fmt.Errorf("the entry's generations disagree (%s), so its tree was altered; rm buried every one it could write", strings.Join(sources, ", ")))
-	}
-	return errors.Join(out...)
+	return nil
 }
 
-// pointerHeaderGeneration is the generation in the header of dir's current
-// pointer, read without a key and so unauthenticated, when the file parses
-// as a pointer record of name.
-func pointerHeaderGeneration(dir *os.Root, name string) ([generationSize]byte, bool) {
-	b, _, err := readFile(dir, currentName, maxRecordSize)
+// report is what rm reports after its commit: generations that disagree,
+// since the tree was altered, or no generation to bury at all.
+func (b *burial) report() error {
+	switch {
+	case len(b.gens) == 0:
+		return errors.New("with its tombstone unwritten: no generation to bury: the floor holds none for the name and neither the generation file nor a record header reads")
+	case len(b.gens) > 1:
+		return fmt.Errorf("the entry's generations disagree (%s), so its tree was altered; rm buried every one", strings.Join(b.sources, ", "))
+	}
+	return nil
+}
+
+// headerGeneration is the generation in the header of dir's file, read
+// without a key and so unauthenticated, when the file parses as a record of
+// name: a pointer record when pointer is set, else a version record.
+func headerGeneration(dir *os.Root, file, name string, pointer bool) ([generationSize]byte, bool) {
+	b, _, err := readFile(dir, file, maxRecordSize)
 	if err != nil {
 		return [generationSize]byte{}, false
 	}
 	r, err := parseRecord(b)
-	if err != nil || r.kind != kindPointer || r.name != name {
+	if err != nil || (r.kind == kindPointer) != pointer || r.name != name {
 		return [generationSize]byte{}, false
 	}
 	return r.generation, true

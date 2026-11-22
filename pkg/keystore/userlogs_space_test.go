@@ -20,6 +20,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -82,17 +84,20 @@ func TestRevocationLinesSkipFreeMargin(t *testing.T) {
 	if _, err := u.Put(ctx, "user/1001/third", KindOpaque, []byte("v")); !errors.Is(err, errLogNoSpace) {
 		t.Fatalf("put below the margin: %v, want errLogNoSpace", err)
 	}
-	// Below the minimal check even a revocation's line is refused.
+	// Below the minimal check even a revocation's line is refused, and an
+	// rm, which buries before it removes, removes nothing.
 	avail = 64
 	snap := readLog(t, s, userFloorLogName)
 	err := u.Delete(ctx, "user/1001/other")
-	if !errors.Is(err, errCommitted) || !errors.Is(err, errLogNoSpace) {
-		t.Fatalf("rm with almost no space: %v, want the tombstone refused for space after the commit", err)
+	if err == nil || errors.Is(err, errCommitted) || !errors.Is(err, errLogNoSpace) {
+		t.Fatalf("rm with almost no space: %v, want it refused for space with nothing removed", err)
 	}
 	if !bytes.Equal(snap, readLog(t, s, userFloorLogName)) {
 		t.Fatal("a tombstone was appended with almost no space")
 	}
-	checkEntryGone(t, server, "other")
+	if _, err := os.Lstat(filepath.Join(scopeDir(server, "1001"), scopeEntriesName, "other", currentName)); err != nil {
+		t.Fatalf("the entry's pointer after a refused rm: %v, want it kept", err)
+	}
 }
 
 // A revocation's line for a key the floor already holds is never refused by
