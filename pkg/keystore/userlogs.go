@@ -129,8 +129,10 @@ const (
 	maxLogHardCap      = 1 << 40
 	maxLogRevokeBudget = 1 << 30
 	// revokeFreeSlack replaces logFreeMargin for a revocation's line: the
-	// minimal check, so a nearly full volume still records a revocation.
-	revokeFreeSlack = 4 << 10
+	// minimal check, so a nearly full volume still records a revocation. It
+	// is two 4 KiB blocks, as many as one line can newly touch when it
+	// straddles a block boundary, plus the longest line.
+	revokeFreeSlack = 2*(4<<10) + maxLogLine
 )
 
 // minFloorLine is the shortest line that adds a key to the floor: the

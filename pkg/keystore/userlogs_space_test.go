@@ -125,3 +125,23 @@ func TestRevocationLineAtKeyBound(t *testing.T) {
 		t.Fatalf("current after rm: %v", err)
 	}
 }
+
+// The revocation slack covers two 4 KiB blocks, as many as one line can
+// newly touch when it straddles a block boundary, plus the longest line: a
+// revocation's line is refused, with nothing removed, on a volume with two
+// blocks free.
+func TestRevokeFreeSlackCoversTwoBlocks(t *testing.T) {
+	if revokeFreeSlack < 2*(4<<10)+maxLogLine {
+		t.Fatalf("revokeFreeSlack is %d, want at least two 4 KiB blocks plus maxLogLine (%d)", revokeFreeSlack, 2*(4<<10)+maxLogLine)
+	}
+	ctx := context.Background()
+	s, server, u := fileLogScope(t)
+	s.userFloor.(*fileFloorLog).log.freeSpace = func(int) (uint64, error) { return 2 * (4 << 10), nil }
+	err := u.Delete(ctx, "user/1001/token")
+	if err == nil || errors.Is(err, errCommitted) || !errors.Is(err, errLogNoSpace) {
+		t.Fatalf("rm with two blocks free: %v, want it refused before any removal", err)
+	}
+	if _, err := os.Lstat(filepath.Join(scopeDir(server, "1001"), scopeEntriesName, "token", currentName)); err != nil {
+		t.Fatalf("the entry's pointer after the refused rm: %v", err)
+	}
+}

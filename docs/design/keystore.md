@@ -1576,7 +1576,8 @@ service user can only add to.
   refuses, with a named, retryable error and nothing written, when less than 1 MiB plus the
   line is free: a refusal, never damage. A revocation's line (`rm`'s tombstones, a revoking
   `withdraw`'s floor line, and their `revoke` audit lines) is exempt from that margin and keeps
-  only a minimal check, the line plus 4 KiB, so a nearly full volume still records a
+  only a minimal check, the line plus the revocation slack (two 4 KiB blocks plus the
+  1,024-byte longest line, 9 KiB), so a nearly full volume still records a
   revocation; below that it is refused: a `withdraw` is reported as after a commit, and an
   `rm`, which buries before it removes, is refused with nothing removed. Nor
   does the floor's key bound ever refuse a revocation's line for a key the floor already holds
@@ -1588,7 +1589,7 @@ service user can only add to.
   and nothing is written. This closes the disk-filler race: the free space the `fstatfs`
   saw can be taken by another writer before the write, but the reserved blocks cannot, so the
   `write(2)` that follows on the same descriptor never runs out of space part way, and an
-  `ENOSPC` can no longer leave a torn tail. The 4 KiB revocation slack stays a margin over
+  `ENOSPC` can no longer leave a torn tail. The 9 KiB revocation slack stays a margin over
   the reservation, not the guarantee. The residual is an `EIO` mid-write or a crash
   mid-write: either can still leave partial bytes the flag makes unremovable, and a last line
   with no newline is damage (no lenient trailing-line rule). A torn floor tail is then damage
@@ -1623,7 +1624,7 @@ service user can only add to.
   too, on the data root's volume. A `deliver` runs the same check before it seals anything, for
   its delivery record's line (and, when it mints the scope, the mint's line for the same key).
   Every floor line is appended after its change has committed, as that change's integrity
-  record, so the append itself is held only to the 4 KiB revocation slack, whatever its class
+  record, so the append itself is held only to the 9 KiB revocation slack, whatever its class
   (the key bound, the hard cap and the revocation budget still follow the class): a volume
   filled between the check and the append past the 1 MiB margin does not cost a committed
   `put` its line. So a committed `put` or `deliver` without its floor line is left only by a
