@@ -535,26 +535,22 @@ func (b *burial) addTree(e *entry, name string) {
 	}
 }
 
-// bury appends a tombstone for every generation. Everything the burial
-// needs is reserved before the first is written (reserveRevocation): a
-// refusal there, or a first tombstone the floor does not take, refuses the
-// rm with nothing written, retryable, and the tree stays. Once any
-// tombstone has landed the entry is revoked, so a later one that fails is
-// reported after the commit (errCommitted): the rm is audited as a
-// revocation, the tree stays, and a retry buries the rest.
+// bury appends a tombstone for every generation, the one the pointer
+// authenticates first. The file-backed floor takes them as one write
+// (buryAll): everything the burial needs is judged and reserved for the
+// whole buffer, and a refusal, or a write that fails or lands short,
+// refuses the rm with nothing committed, retryable, and the tree stays;
+// short bytes are a torn tail the reader skips. Any other floor takes them
+// one by one: a first tombstone it does not take refuses the rm with
+// nothing written, and once any has landed the entry is revoked, so a later
+// one that fails is reported after the commit (errCommitted): the rm is
+// audited as a revocation, the tree stays, and a retry buries the rest.
 func (b *burial) bury(u *UserScope) error {
 	if ff, ok := u.s.userFloor.(*fileFloorLog); ok {
-		var lines [][]byte
-		for _, g := range b.gens {
-			line, err := tombLine(u.scope, b.name, g)
-			if err != nil {
-				return err
-			}
-			lines = append(lines, line)
+		if err := ff.buryAll(u.scope, b.name, b.ordered()); err != nil {
+			return fmt.Errorf("rm refused, nothing removed: the user-scope floor did not take its tombstones: %w", err)
 		}
-		if err := ff.log.reserveRevocation(u.uid, lines); err != nil {
-			return fmt.Errorf("rm refused, nothing removed: %w", err)
-		}
+		return nil
 	}
 	landed := false
 	var errs []error
@@ -572,6 +568,21 @@ func (b *burial) bury(u *UserScope) error {
 		return fmt.Errorf("%w, but only in part: the user-scope floor took some of the entry's tombstones and not the rest, so the entry is refused as deleted and its tree stays; run rm again to bury the rest: %w", errCommitted, errors.Join(errs...))
 	}
 	return fmt.Errorf("rm refused, nothing removed: the user-scope floor did not take its tombstone: %w", errors.Join(errs...))
+}
+
+// ordered is gens with the generation the pointer authenticates first, so
+// the line a reader serves is the first a burial records.
+func (b *burial) ordered() [][generationSize]byte {
+	if b.authed == nil {
+		return b.gens
+	}
+	out := [][generationSize]byte{*b.authed}
+	for _, g := range b.gens {
+		if g != *b.authed {
+			out = append(out, g)
+		}
+	}
+	return out
 }
 
 // report is what rm reports after its commit: generations that disagree,

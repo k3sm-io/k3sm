@@ -399,6 +399,9 @@ type appendLog struct {
 	// reserve, when set, replaces reserveLogBlocks: the test seam for the
 	// block reservation an append makes before its write.
 	reserve func(f *os.File, n int64) error
+	// write, when set, replaces f.Write: the test seam for a short or
+	// failed append.
+	write func(f *os.File, b []byte) (int, error)
 	// maxKeys, when not 0, replaces maxFloorKeys: the test seam for the
 	// key bound.
 	maxKeys int
@@ -875,61 +878,6 @@ func (l *appendLog) room(uid uint32, revoke bool) error {
 	return l.revokeRoom(state, st.Size, uid, maxLogLine)
 }
 
-// reserveRevocation refuses, before the first of a revocation's lines
-// (rm's tombstones, each with its newline), lines the log would refuse part
-// way: bytes that would start past the hard cap without room in uid's
-// revocation budget or the reader's bound for all of them (ErrLogFull), the
-// keys the lines add past the key bound plus the revocation headroom
-// (ErrLogFull), and their bytes plus the audit line that follows them
-// (maxLogLine) plus revokeFreeSlack past the free space (errLogNoSpace).
-// So such an operation is refused before its first line rather than part
-// way. A log that cannot be opened or read is no answer
-// here, as in room: the first line's own append refuses it, with nothing
-// written.
-func (l *appendLog) reserveRevocation(uid uint32, lines [][]byte) error {
-	f, st, err := l.open(unix.O_RDONLY)
-	if err != nil {
-		l.forgetUnflagged(err, false)
-		return nil
-	}
-	defer func() { _ = f.Close() }() // read-only
-	var n int64
-	for _, line := range lines {
-		n += int64(len(line))
-	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	state, err := l.sync(f, st)
-	if err != nil || state.bad != nil {
-		return nil
-	}
-	if st.Size+n > l.s.logHardCap {
-		if err := l.revokeRoom(state, st.Size, uid, n); err != nil {
-			return err
-		}
-	}
-	if l.addsKey != nil {
-		keys := 0
-		for _, line := range lines {
-			adds, err := l.addsKey(state, line)
-			if err != nil {
-				return fmt.Errorf("%s: %w", l.name, err)
-			}
-			if adds {
-				keys++
-			}
-		}
-		if keys > 0 {
-			if err := l.addKeyRoom(state, uid, keys, true); err != nil {
-				return err
-			}
-		}
-	}
-	// The audit line the revocation appends after its lines lands on the
-	// same volume: its free space is reserved here too.
-	return l.preflight(f, int(n)+maxLogLine, true)
-}
-
 // grantKeys is the most keys one grant adds to the floor: a put that mints
 // its scope adds the delivery record's key and the entry's.
 const grantKeys = 2
@@ -1001,11 +949,26 @@ func (l *appendLog) appendLine(uid uint32, line []byte, budget, revoke bool) err
 // class: slack holds the line to revokeFreeSlack, as a committed change's
 // floor line is, whatever its class.
 func (l *appendLog) appendLineSlack(uid uint32, line []byte, budget, revoke, slack bool) error {
-	if len(line) > maxLogLine {
-		return fmt.Errorf("%w: refused a line for %s", errLogLineTooLong, l.name)
+	return l.appendLines(uid, [][]byte{line}, budget, revoke, slack, 0)
+}
+
+// appendLines appends lines, each ending in a newline, charged to uid, as
+// one buffer: one block reservation for the whole of it and one write(2) on
+// one descriptor, so the lines land whole or not at all, short of a crash or
+// an EIO, which leave a torn tail the reader skips. Its admission and key
+// checks are appendLine's, over every line: a line that starts at or past
+// the hard cap needs budget and room in uid's revocation budget, the keys
+// the lines add are judged together, and the free space must hold the
+// buffer plus extra bytes the caller appends after it (an rm's audit line).
+// An error means nothing was committed.
+func (l *appendLog) appendLines(uid uint32, lines [][]byte, budget, revoke, slack bool, extra int) error {
+	for _, line := range lines {
+		if len(line) > maxLogLine {
+			return fmt.Errorf("%w: refused a line for %s", errLogLineTooLong, l.name)
+		}
 	}
 	// Read-write, so the tail and, for the floor, the keys are read on the
-	// descriptor the line is appended through.
+	// descriptor the lines are appended through.
 	f, st, err := l.open(unix.O_RDWR | unix.O_APPEND)
 	if err != nil {
 		l.forgetUnflagged(err, false)
@@ -1018,11 +981,21 @@ func (l *appendLog) appendLineSlack(uid uint32, line []byte, budget, revoke, sla
 	if err != nil {
 		return err
 	}
-	out := line
+	var out []byte
 	if torn {
 		// The torn bytes become a line of their own, which the reader skips
-		// as damage, and line reads back whole.
-		out = append([]byte{'\n'}, line...)
+		// as damage, and the lines read back whole.
+		out = append(out, '\n')
+	}
+	lead := int64(len(out))
+	// charge is uid's bytes in lines that start at or past the hard cap,
+	// which the reader charges to its revocation budget.
+	var charge int64
+	for _, line := range lines {
+		if st.Size+int64(len(out)) >= l.s.logHardCap {
+			charge += int64(len(line))
+		}
+		out = append(out, line...)
 	}
 	if bound := l.s.logReadBound(); st.Size+int64(len(out)) > bound {
 		// Never make the damage the reader refuses.
@@ -1043,7 +1016,7 @@ func (l *appendLog) appendLineSlack(uid uint32, line []byte, budget, revoke, sla
 		}
 		return nil
 	}
-	if st.Size >= l.s.logHardCap {
+	if charge > 0 {
 		if !budget || uid == 0 {
 			return fmt.Errorf("%w (%s is past its hard cap)", ErrLogFull, l.name)
 		}
@@ -1051,8 +1024,8 @@ func (l *appendLog) appendLineSlack(uid uint32, line []byte, budget, revoke, sla
 			return err
 		}
 		// The newline closing a torn tail ends the torn line, which is
-		// charged to no uid; line is uid's.
-		if err := l.revokeRoom(state, st.Size+int64(len(out)-len(line)), uid, int64(len(line))); err != nil {
+		// charged to no uid; the lines are uid's.
+		if err := l.revokeRoom(state, st.Size+lead, uid, charge); err != nil {
 			return err
 		}
 	}
@@ -1060,31 +1033,44 @@ func (l *appendLog) appendLineSlack(uid uint32, line []byte, budget, revoke, sla
 		if err := read(); err != nil {
 			return err
 		}
-		adds, err := l.addsKey(state, line)
-		if err != nil {
-			return fmt.Errorf("%s: %w", l.name, err)
+		keys := 0
+		for _, line := range lines {
+			adds, err := l.addsKey(state, line)
+			if err != nil {
+				return fmt.Errorf("%s: %w", l.name, err)
+			}
+			if adds {
+				keys++
+			}
 		}
-		if adds {
-			if err := l.addKeyRoom(state, uid, 1, revoke); err != nil {
+		if keys > 0 {
+			if err := l.addKeyRoom(state, uid, keys, revoke); err != nil {
 				return err
 			}
 		}
 	}
-	if err := l.preflight(f, len(out), slack); err != nil {
+	if err := l.preflight(f, len(out)+extra, slack); err != nil {
 		return err
 	}
-	// Reserve the line's blocks on this descriptor before the write, so a
+	// Reserve the buffer's blocks on this descriptor before the write, so a
 	// disk filler racing the preflight cannot make the write short: a
 	// refused reservation writes nothing.
 	if err := l.reserveBlocks(f, int64(len(out))); err != nil {
 		return err
 	}
-	// One write(2) of the whole line, into reserved blocks. An EIO, or a
+	// One write(2) of the whole buffer, into reserved blocks. An EIO, or a
 	// crash mid-write, can still leave a torn tail the flag keeps: in
 	// either log a skipped, counted line once the next append closes it,
-	// which loses only what the torn line would have recorded
+	// which loses only what the torn bytes would have recorded
 	// (docs/design/keystore.md § "The user-scope floor").
-	_, err = f.Write(out)
+	write := l.write
+	if write == nil {
+		write = (*os.File).Write
+	}
+	n, err := write(f, out)
+	if err == nil && n < len(out) {
+		err = io.ErrShortWrite
+	}
 	if err == nil {
 		err = f.Sync()
 	}
@@ -1315,14 +1301,25 @@ func (f *fileFloorLog) append(scope, name string, gen [generationSize]byte, seq 
 }
 
 func (f *fileFloorLog) bury(scope, name string, gen [generationSize]byte) error {
-	line, err := tombLine(scope, name, gen)
-	if err != nil {
-		return err
+	return f.buryAll(scope, name, [][generationSize]byte{gen})
+}
+
+// buryAll appends the tombstones of scope, name and every one of gens, in
+// that order, as one write (appendLines): they land whole or not at all,
+// short of a crash. rm is in the revocation class: past the hard cap its
+// tombstones draw on the uid's revocation budget, the free-space margin does
+// not hold them, and the free space must also hold the rm's audit line,
+// which follows them (maxLogLine).
+func (f *fileFloorLog) buryAll(scope, name string, gens [][generationSize]byte) error {
+	lines := make([][]byte, 0, len(gens))
+	for _, g := range gens {
+		line, err := tombLine(scope, name, g)
+		if err != nil {
+			return err
+		}
+		lines = append(lines, line)
 	}
-	// rm is in the revocation class: past the hard cap its tombstone draws
-	// on the uid's revocation budget, and the free-space margin does not
-	// hold it.
-	return f.log.appendLine(scopeUID(scope), line, true, true)
+	return f.log.appendLines(scopeUID(scope), lines, true, true, true, maxLogLine)
 }
 
 // floorLine encodes one floor line: "<scope> <name> <generation> <seq>\n",
