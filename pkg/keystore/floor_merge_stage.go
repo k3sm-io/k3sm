@@ -36,6 +36,9 @@ const (
 	// preRestoreDirName is the root-only directory in the data root the
 	// restore recipe stages both keystore trees in.
 	preRestoreDirName = "pre-restore.d"
+	// plantedPrefix names what the merge moves aside from the store's Dir
+	// into pre-restore.d: planted-<unix>.
+	plantedPrefix = "planted-"
 	// stagedTreeName is the backup's keystore/, as the recipe's root ditto
 	// copied it into pre-restore.d; the merge moves it into place.
 	stagedTreeName = "restored"
@@ -68,10 +71,12 @@ type mergeStaging struct {
 	// staged is set when pre-restore.d/restored is present.
 	staged bool
 	// parent is the directory the store's Dir is in, and target its base
-	// name; targetExists is set when anything, a symlink included, is there.
+	// name; targetExists is set when anything, a symlink included, is
+	// there, and targetType names its file type.
 	parent       *os.File
 	target       string
 	targetExists bool
+	targetType   string
 }
 
 // close releases what openStaging opened.
@@ -109,7 +114,7 @@ func (s *FileStore) openStaging(l *floorLock) (st *mergeStaging, err error) {
 	var ts unix.Stat_t
 	switch err := unix.Fstatat(int(st.parent.Fd()), st.target, &ts, unix.AT_SYMLINK_NOFOLLOW); {
 	case err == nil:
-		st.targetExists = true
+		st.targetExists, st.targetType = true, statTypeName(ts.Mode)
 	case !errors.Is(err, syscall.ENOENT):
 		return st, fmt.Errorf("look for %s: %w", s.dir, err)
 	}
@@ -182,9 +187,65 @@ func (st *mergeStaging) tree(name string) (*os.Root, error) {
 }
 
 // errStagedTargetExists refuses the move of the staged tree onto a Dir that
-// holds anything.
+// came to hold something after the merge moved what was there aside: it is
+// only ever returned once the floor is written, so it names the rerun.
 func errStagedTargetExists(dir string) error {
-	return fmt.Errorf("%w: %s exists, a symlink counted, while the restored keystore/ is staged in pre-restore.d/restored: the restore recipe leaves it absent, and the merge moves the staged tree there itself, never through or over what is there. Nothing is written. Move %s aside (sudo mv %s %s.unexpected) and run the merge again", errFloorUntrusted, dir, dir, dir, dir)
+	return fmt.Errorf("%w: %s came to exist, a symlink counted, after the merge moved what was there aside: the merge moves the staged tree there itself, never through or over what is there, so the restored keystore/ is left staged. Run the same merge again, which moves it aside into pre-restore.d too", errFloorUntrusted, dir)
+}
+
+// statTypeName names the file type in mode, an lstat st_mode.
+func statTypeName(mode uint16) string {
+	switch mode & unix.S_IFMT {
+	case unix.S_IFDIR:
+		return "directory"
+	case unix.S_IFLNK:
+		return "symlink"
+	case unix.S_IFREG:
+		return "regular file"
+	case unix.S_IFIFO:
+		return "FIFO"
+	case unix.S_IFSOCK:
+		return "socket"
+	}
+	return "device"
+}
+
+// plantedName is the first pre-restore.d/planted-<unix>, from now, that is
+// free.
+func (s *FileStore) plantedName(st *mergeStaging) (string, error) {
+	at := s.now().Unix()
+	for tries := 0; tries < maxMergedTries; tries++ {
+		n := fmt.Sprintf("%s%d", plantedPrefix, at+int64(tries))
+		switch _, err := st.dir.Lstat(n); {
+		case errors.Is(err, fs.ErrNotExist):
+			return n, nil
+		case err != nil:
+			return "", err
+		}
+	}
+	return "", fmt.Errorf("%s/%s%d and the %d seconds after it are all taken", preRestoreDirName, plantedPrefix, at, maxMergedTries-1)
+}
+
+// moveTargetAside renames what is at the store's Dir, with the restored tree
+// staged, into pre-restore.d as name (plantedName), through the two directory
+// descriptors and never over anything there (renameExcl): pre-restore.d is
+// root-only, so the planted object is out of the service user's reach, and a
+// symlink is moved itself, never followed. Something gone from Dir since
+// openStaging looked is no error. Both directories are fsynced.
+func (s *FileStore) moveTargetAside(st *mergeStaging, name string) error {
+	switch err := renameExcl(int(st.parent.Fd()), st.target, int(st.dirF.Fd()), name); {
+	case errors.Is(err, syscall.ENOENT):
+		return nil
+	case err != nil:
+		return fmt.Errorf("move %s aside to %s/%s: %w", s.dir, preRestoreDirName, name, err)
+	}
+	slog.Warn("keystore floor: something was at the keystore directory while the restored keystore/ was staged, which the restore recipe leaves absent; the merge moved it aside into the root-only pre-restore.d", "dir", s.dir, "type", st.targetType, "to", filepath.Join(preRestoreDirName, name))
+	for _, d := range []*os.File{st.parent, st.dirF} {
+		if err := d.Sync(); err != nil {
+			return fmt.Errorf("fsync %s after moving %s aside: %w", d.Name(), s.dir, err)
+		}
+	}
+	return nil
 }
 
 // stagedKind is what a node of the staged tree is, by where it sits: the

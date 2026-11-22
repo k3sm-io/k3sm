@@ -1050,6 +1050,17 @@ func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 	if r.AlreadyMerged {
 		fmt.Fprintln(env.stdout, "already merged")
 	}
+	if r.MovedAside != "" {
+		// Something was planted where the recipe leaves nothing: a report
+		// line, and on stderr too.
+		dir, to := filepath.Join(v.roots[0], keystoreSubdir), filepath.Join(v.roots[2], "pre-restore.d", r.MovedAside)
+		verb, verbIt := "moved aside", "moved it aside"
+		if *dryRun {
+			verb, verbIt = "would move aside", "would move it aside"
+		}
+		fmt.Fprintf(env.stdout, "%s %s %s to %s: the restore recipe leaves it absent while the restored keystore/ is staged, so the merge moves it into the root-only pre-restore.d, out of the service user's reach, unread\n", verb, r.MovedAsideType, dir, to)
+		fmt.Fprintf(env.stderr, "k3sm keys floor merge: warning: %s was not absent while the restored keystore/ was staged: the merge %s, a %s, to %s; inspect it there\n", dir, verbIt, r.MovedAsideType, to)
+	}
 	fmt.Fprintf(env.stdout, "merged %d\nalready present %d\nburied live %d\nkept %d\nretired %d\ndropped %d\nfenced %d\n", r.Merged, r.AlreadyPresent, len(r.BuriedLive), len(r.Kept), len(r.Retired), len(r.Dropped), len(r.Fenced))
 	for _, name := range r.BuriedLive {
 		switch {

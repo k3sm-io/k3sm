@@ -335,7 +335,11 @@ keystore does not use, a link, a FIFO or socket, a file with a second hard link,
 or sticky bit, an ACL or a file flag, a file larger than its kind can be, or a file owned by
 anyone but the service user (or the unknown owner a volume that ignores ownership reports). A
 file owned by root is refused too. The message names the path inside the copy. Leave
-`/var/lib/k3sm/server/keystore` absent; the merge refuses if anything is there. Every line ends in
+`/var/lib/k3sm/server/keystore` absent. If anything is there when the merge runs, such as a
+directory or link the service user made, the merge moves it into `pre-restore.d` as
+`planted-<time>`, where only root can reach it, without reading it or following a link. It says
+so on stderr and in a `moved aside` line of its report, then goes on. With `--dry-run` it prints
+where it would move it and moves nothing. Every line ends in
 `|| exit 1`, so the first one that fails stops the steps (and closes the shell), and no later
 line moves a copy into or over one that is set aside:
 

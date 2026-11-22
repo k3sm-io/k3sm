@@ -118,6 +118,14 @@ type MergeReport struct {
 	// merge that is no undo.
 	RetiredByRestore    []string
 	DeletedSinceRestore []string
+	// MovedAside is the name in pre-restore.d (planted-<unix>) the merge
+	// renamed what it found at the store's Dir to, with the restored tree
+	// staged: the recipe leaves Dir absent, so whatever is there was
+	// planted. In a dry run it is the name the merge would use, and nothing
+	// is moved. MovedAsideType is that object's file type ("directory",
+	// "symlink", ...). Both are empty when Dir was absent.
+	MovedAside     string
+	MovedAsideType string
 	// AlreadyMerged is set when the live floor already held every burial
 	// and fence the input records: the merge wrote nothing and only renamed
 	// the input, as a rerun after a failed rename does.
@@ -252,8 +260,25 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 		return r, err
 	}
 	defer st.close()
+	// Something at the store's Dir while the tree is staged was planted:
+	// the recipe leaves Dir absent. The merge moves it aside into
+	// pre-restore.d before the tree moves in (moveTargetAside); a dry run
+	// only names where.
+	var planted string
 	if st.staged && st.targetExists {
-		return r, errStagedTargetExists(s.dir)
+		if planted, err = s.plantedName(st); err != nil {
+			return r, err
+		}
+	}
+	moveAside := func(r *MergeReport) error {
+		if planted == "" {
+			return nil
+		}
+		r.MovedAside, r.MovedAsideType = planted, st.targetType
+		if opts.DryRun {
+			return nil
+		}
+		return s.moveTargetAside(st, planted)
 	}
 	// The staged tree's shape is judged read-only before anything is read
 	// from it or planned, so a dry run refuses what the merge refuses.
@@ -282,11 +307,15 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 	if !pr.changes() {
 		pr.AlreadyMerged, pr.Unverified, pr.Dropped = true, unionNames(unverified, pr.Unverified), nil
 		if opts.DryRun {
+			_ = moveAside(&pr) // a dry run moves nothing
 			return pr, nil
 		}
 		if st.staged {
 			// A rerun after the tree's move failed: the floor is written,
 			// so finish the move.
+			if err := moveAside(&pr); err != nil {
+				return pr, fmt.Errorf("%w: the merge is written, but the restored keystore/ is still staged in pre-restore.d/restored: %w; run the same merge again", errCommitted, err)
+			}
 			if err := s.chownStaged(st); err != nil {
 				return pr, fmt.Errorf("%w: the merge is written, but the restored keystore/ is still staged in pre-restore.d/restored: %w; run the same merge again", errCommitted, err)
 			}
@@ -313,6 +342,7 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 	refused := plan.loss.refusal(opts.AcceptDrops)
 	if opts.DryRun {
 		pr.Unverified = unionNames(unverified, pr.Unverified)
+		_ = moveAside(&pr) // a dry run moves nothing
 		return pr, refused
 	}
 	if refused != nil {
@@ -322,6 +352,12 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 	// not merged.
 	if err := in.same(); err != nil {
 		return r, err
+	}
+	// What was planted at Dir goes aside before anything is written: a
+	// failure here leaves the floor unwritten.
+	var moved MergeReport
+	if err := moveAside(&moved); err != nil {
+		return r, fmt.Errorf("%w; nothing is merged, run the merge again", err)
 	}
 	// What the merge retires and buries live is recorded before the floor
 	// is written, under the pending name renameMerged renames with the
@@ -367,6 +403,7 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 		slog.Warn("keystore floor: the restored pointer of this entry is more than one sequence above the restored floor's record, more than a crash leaves, so the merge did not raise the record to it: that pointer is refused while it is at or below the fence the merge set, until a Rotate seals above the fence, and accepted above it; the record's own sequence stays accepted", "name", name)
 	}
 	r.Unverified = unionNames(unverified, r.Unverified)
+	r.MovedAside, r.MovedAsideType = moved.MovedAside, moved.MovedAsideType
 	if opts.Undo {
 		_ = classifyUndo(&r, undo) // its refusal was decided on the plan
 	}

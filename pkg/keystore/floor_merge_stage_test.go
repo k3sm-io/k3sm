@@ -133,23 +133,26 @@ func stageRecipe(t *testing.T, s *FileStore, server string, asideSeq uint64) str
 }
 
 // TestFloorMergeRefusesExistingTarget (U192): with the restored tree staged,
-// anything at the store's Dir refuses the merge, nothing written: a
-// pointer the service user planted there one past the restored record is
-// never read, and a symlink there is never written through.
+// anything at the store's Dir no longer refuses the merge: the merge renames
+// it aside into the root-only pre-restore.d as planted-<unix>, out of the
+// service user's reach, reports it, and goes on. A pointer the service user
+// planted there one past the restored record is never read, and a symlink
+// there is never written through. A dry run reports the move and makes none.
 func TestFloorMergeRefusesExistingTarget(t *testing.T) {
 	ctx := context.Background()
 	for _, tc := range []struct {
 		name  string
+		typ   fs.FileMode
 		plant func(t *testing.T, s *FileStore, late, elsewhere string)
 	}{
-		{"a planted pointer one past the restored record", func(t *testing.T, s *FileStore, late, _ string) {
+		{"a planted pointer one past the restored record", fs.ModeDir, func(t *testing.T, s *FileStore, late, _ string) {
 			if err := os.Mkdir(s.dir, 0o700); err != nil {
 				t.Fatal(err)
 			}
 			giveToService(t, s.dir)
 			copyEntryDir(t, late, filepath.Join(s.dir, "k"))
 		}},
-		{"a symlink", func(t *testing.T, s *FileStore, _, elsewhere string) {
+		{"a symlink", fs.ModeSymlink, func(t *testing.T, s *FileStore, _, elsewhere string) {
 			if err := os.Symlink(elsewhere, s.dir); err != nil {
 				t.Fatal(err)
 			}
@@ -164,23 +167,34 @@ func TestFloorMergeRefusesExistingTarget(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			for _, dry := range []bool{true, false} {
-				if _, err := s.MergeFloor(ctx, MergeOptions{DryRun: dry}); err == nil || !strings.Contains(err.Error(), "exists, a symlink counted") {
-					t.Fatalf("MergeFloor (dry run %v) with %s at Dir: %v, want it refused", dry, tc.name, err)
-				}
+			r, err := s.MergeFloor(ctx, MergeOptions{DryRun: true})
+			if err != nil || !strings.HasPrefix(r.MovedAside, plantedPrefix) {
+				t.Fatalf("dry run with %s at Dir: %+v, %v; want the move aside reported", tc.name, r, err)
+			}
+			if fi, err := os.Lstat(s.dir); err != nil || fi.Mode().Type() != tc.typ {
+				t.Fatalf("Dir after the dry run: %v, %v; want the planted object left", fi, err)
 			}
 			if after, err := os.ReadFile(floorPath(server)); err != nil || !bytes.Equal(after, before) {
-				t.Fatalf("live floor after the refused merge = %s, %v; want it unchanged", after, err)
+				t.Fatalf("live floor after the dry run = %s, %v; want it unchanged", after, err)
+			}
+			r, err = s.MergeFloor(ctx, MergeOptions{})
+			if err != nil || !strings.HasPrefix(r.MovedAside, plantedPrefix) || len(r.Fenced) != 1 {
+				t.Fatalf("MergeFloor with %s at Dir: %+v, %v; want it moved aside and k fenced", tc.name, r, err)
+			}
+			fi, err := os.Lstat(stagePath(s, r.MovedAside))
+			if err != nil || fi.Mode().Type() != tc.typ {
+				t.Fatalf("pre-restore.d/%s after the merge: %v, %v; want the planted object there", r.MovedAside, fi, err)
 			}
 			if names, err := os.ReadDir(elsewhere); err != nil || len(names) != 0 {
-				t.Fatalf("symlink target after the refused merge holds %v, %v; want nothing written through it", names, err)
+				t.Fatalf("symlink target after the merge holds %v, %v; want nothing written through it", names, err)
 			}
-			if _, err := os.Lstat(stagePath(s, stagedTreeName)); err != nil {
-				t.Fatalf("staged tree after the refused merge: %v, want it left staged", err)
+			if fi, err := os.Lstat(s.dir); err != nil || !fi.IsDir() {
+				t.Fatalf("Dir after the merge: %v, %v; want the restored tree moved in", fi, err)
 			}
-			if _, err := os.Lstat(floorPath(server) + ".pre-restore"); err != nil {
-				t.Fatalf("guard after the refused merge: %v, want it left", err)
+			if _, err := os.Lstat(floorPath(server) + ".pre-restore"); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("guard after the merge: %v, want it renamed", err)
 			}
+			mustCurrent(t, s, "k", "v1")
 		})
 	}
 }
