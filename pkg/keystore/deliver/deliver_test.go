@@ -1417,3 +1417,57 @@ func TestDeclarationEntryField(t *testing.T) {
 		t.Fatalf("defaults: secret %q key %q, want the name without system/ and %q", tg.Secret(), tg.Key(), DefaultDataKey)
 	}
 }
+
+// TestMissingDeclarationKeepsRecords: a declaration that is absent, as a
+// file or with its whole directory, withdraws nothing: the ownership records
+// survive and nothing is created or updated, and once the declaration is back
+// the next rotation still reaches the Secret. Only a declaration that exists
+// and parses without the target withdraws it (G20).
+func TestMissingDeclarationKeepsRecords(t *testing.T) {
+	for _, removeDir := range []bool{false, true} {
+		t.Run(fmt.Sprintf("removeDir=%v", removeDir), func(t *testing.T) {
+			h := newHarness(t, true, false)
+			declDir := filepath.Join(h.dir, "decl")
+			if err := os.Mkdir(declDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			h.path = filepath.Join(declDir, FileName)
+			h.r = h.reconciler(true, false)
+			h.store.set("api-token", 1, []byte("one"))
+			target := Target{Entry: "system/api-token", Namespace: "payments"}
+			h.declare(t, target)
+			ctx := context.Background()
+			h.r.Sweep(ctx)
+			uid := string(h.secret(t, "payments", "api-token").UID)
+
+			if removeDir {
+				if err := os.RemoveAll(declDir); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.Remove(h.path); err != nil {
+				t.Fatal(err)
+			}
+			h.client.ClearActions()
+			h.store.set("api-token", 2, []byte("two"))
+			h.r.Sweep(ctx)
+			for _, v := range h.verbs() {
+				if v != "get/secrets" {
+					t.Fatalf("an absent declaration drew %s", v)
+				}
+			}
+			st, err := ReadState(filepath.Join(h.dir, StateFileName), OpenNoFollow, StateDirCheck(uint32(os.Geteuid())), StateFileCheck(uint32(os.Geteuid())))
+			if err != nil || st.UID("payments", "api-token") != uid {
+				t.Fatalf("an absent declaration dropped the record (%q, %v), want %q", st.UID("payments", "api-token"), err, uid)
+			}
+
+			if err := os.MkdirAll(declDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			h.declare(t, target)
+			h.r.Sweep(ctx)
+			if got := string(h.secret(t, "payments", "api-token").Data[DefaultDataKey]); got != "two" {
+				t.Fatalf("after the declaration came back the rotation did not land: %q", got)
+			}
+		})
+	}
+}

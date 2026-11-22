@@ -59,8 +59,9 @@ limitations under the License.
 //     the UID a create returned is not, and a recreated Secret gets a new one.
 //
 // An update writes data, type, the label and the two annotations, and strips
-// any immutable flag. A target withdrawn from the declaration loses its state
-// record, so declaring it again leaves the old Secret alone.
+// any immutable flag. A target withdrawn from a declaration that exists and
+// parses loses its state record, so declaring it again leaves the old Secret
+// alone; an absent declaration withdraws nothing and keeps every record.
 //
 // It never lists, never deletes and touches no other kind, so withdrawing a
 // target (`k3sm keys undeliver`) leaves its Secret in place. A per-target

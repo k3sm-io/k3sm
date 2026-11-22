@@ -416,7 +416,7 @@ check G20 "the reconciler only gets, creates and updates the Opaque Secrets it c
 	TestReconcilerNeverWritesTenantPrecreated TestReconcilerDoesNotAdoptRecreated \
 	TestReconcilerRecordsCreatedUID TestReconcilerReappliesDrift TestReconcilerImmutableOwned \
 	TestReconcilerLogsNoValue TestReconcilerTargetTimeout TestNewTargetTimeout TestWatchLogsErrors \
-	TestStateStockInstallShape \
+	TestStateStockInstallShape TestMissingDeclarationKeepsRecords \
 	k3sm/cmd/k3sm::TestKeysRmWarnsDeclared TestKeysDeliveryPrintsNoValue
 check G21 "the rollback recipe is a byte-exact round trip: show --reveal into rotate --in -, the new version compared with version N byte for byte (bytes.Equal, as cmp), opaque and Ed25519" \
 	k3sm/cmd/k3sm::TestKeysRollbackRoundTrip

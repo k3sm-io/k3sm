@@ -287,7 +287,12 @@ func (r *Reconciler) Sweep(ctx context.Context) {
 	}
 	r.fileState = ""
 	if !exists {
-		r.logger.Debug("keystore delivery: no declaration; nothing to deliver", "file", r.path)
+		// An absent declaration (file or data root) is not a withdrawal:
+		// nothing is created or updated, and the ownership records are kept,
+		// so a declaration that comes back still reaches its Secrets. Only a
+		// declaration that exists and parses without a target withdraws it.
+		r.logger.Debug("keystore delivery: no declaration; nothing to deliver, records kept", "file", r.path)
+		return
 	}
 	// Ownership rests on the state file, so one that cannot be trusted
 	// delivers nothing: without it, no Secret is known to be ours.

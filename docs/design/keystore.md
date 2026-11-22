@@ -847,8 +847,9 @@ the recorded UID → update; anything else (no label, another entry's label, no 
 UID, a different UID because the Secret was deleted and recreated) → "not created by this
 server", left alone, skipped with a logged reason, never written into. An update writes
 only `data`, `type`, the label and the two annotations, and strips any `immutable` flag on
-its own object. A target that leaves the declaration loses its state entry, so declaring it
-again does not adopt the old Secret. A state file that fails its checks delivers nothing,
+its own object. A target that leaves a declaration that exists and parses loses its state
+entry, so declaring it again does not adopt the old Secret; an absent declaration (the file or
+the data root missing) withdraws nothing, keeps every record and changes no Secret. A state file that fails its checks delivers nothing,
 and a create happens only after the state file was written successfully in that sweep.
 
 **Re-delivery on rotation:** the sweep compares the target's current version and
