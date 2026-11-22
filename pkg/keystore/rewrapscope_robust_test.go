@@ -140,3 +140,59 @@ func TestRewrapVerifiesScopeKeysBeforeSwap(t *testing.T) {
 		})
 	}
 }
+
+// A directory under .user whose uid can never own a scope (below 501, the
+// service uid, above 2147483647) refuses Rewrap as a stray directory to
+// remove by hand; a damaged eligible scope names the real recovery.
+func TestRewrapRefusesStrayScopeDirs(t *testing.T) {
+	ctx := context.Background()
+	for _, name := range []string{"0", "500", "serviceuid", "2147483648", "4294967295"} {
+		t.Run(name, func(t *testing.T) {
+			s, server, _, _ := seedScopeRewrap(t)
+			if name == "serviceuid" {
+				name = strconv.FormatUint(uint64(s.uid), 10)
+			}
+			master := mustMaster(t, server)
+			if err := os.Mkdir(scopeDir(server, name), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			err := s.Rewrap(ctx, rewrapKey(1))
+			if !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "stray directory") || !strings.Contains(err.Error(), userScopesName+"/"+name) {
+				t.Fatalf("Rewrap over .user/%s: %v, want ErrCorrupt naming a stray directory", name, err)
+			}
+			if !bytes.Equal(mustMaster(t, server), master) {
+				t.Fatal("the master was swapped past a stray directory")
+			}
+			if err := os.Remove(scopeDir(server, name)); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Rewrap(ctx, rewrapKey(1)); err != nil {
+				t.Fatalf("Rewrap after the stray directory is removed: %v", err)
+			}
+		})
+	}
+	t.Run("a damaged eligible scope", func(t *testing.T) {
+		s, server, _, _ := seedScopeRewrap(t)
+		key := filepath.Join(scopeDir(server, "1001"), scopeKeyName)
+		b, err := os.ReadFile(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b[len(b)-1] ^= 0xff
+		if err := os.WriteFile(key, b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		err = s.Rewrap(ctx, rewrapKey(1))
+		if !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("Rewrap over a damaged scope.key: %v, want ErrCorrupt", err)
+		}
+		for _, want := range []string{"remove keystore/" + userScopesName + "/1001/", "rm-scope"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("refusal %q does not say %q", err, want)
+			}
+		}
+		if strings.Contains(err.Error(), "restore it first") {
+			t.Fatalf("refusal %q still says restore it first", err)
+		}
+	})
+}

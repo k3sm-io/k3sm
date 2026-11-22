@@ -24,6 +24,7 @@ import (
 	"io/fs"
 	"os"
 	"sort"
+	"strconv"
 	"syscall"
 )
 
@@ -76,7 +77,8 @@ func (s *FileStore) UserScopesExist(ctx context.Context) (bool, error) {
 // by its uid name, in sorted order. A missing .user is no scope; a .user, or
 // a scope directory, that is not a directory the store trusts is ErrCorrupt,
 // since a Rewrap past it could strand a scope.key under a master that no
-// longer exists. A name that is not a decimal uid is no scope.
+// longer exists. A name that is not a decimal uid is no scope; a decimal uid
+// that can never own one (eligibleUID) is a stray, ErrCorrupt.
 func (s *FileStore) eachScopeDir(ctx context.Context, root *os.Root, fn func(uid string, dir *os.Root) error) error {
 	users, err := s.openSubdir(root, userScopesName, false)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -95,8 +97,13 @@ func (s *FileStore) eachScopeDir(ctx context.Context, root *os.Root, fn func(uid
 		if err := loopCtx(ctx, i); err != nil {
 			return err
 		}
-		if n == "0" || !decimalUID(n) {
+		if !decimalUID(n) {
 			continue
+		}
+		// A uid that can never own a scope never had one minted: such a
+		// directory is a stray, never a scope to skip or re-wrap.
+		if id, _ := strconv.ParseUint(n, 10, 32); s.eligibleUID(uint32(id)) != nil {
+			return fmt.Errorf("%w: keystore/%s/%s is a stray directory: uid %s can never own a user scope (%v); root must remove it by hand, then run rewrap again", ErrCorrupt, userScopesName, n, n, errIneligibleUID)
 		}
 		// A scope listed and then missing is damage, never a scope to skip:
 		// skipping it could strand its scope.key under the old master.
@@ -224,7 +231,7 @@ func (s *FileStore) planScopes(ctx context.Context, root *os.Root, old keys, nex
 			committed = committed || underNext
 		}
 		if err != nil {
-			return fmt.Errorf("the scope key of user/%s does not open, and a rewrap would leave it sealed under a master that no longer exists: restore it first: %w", uid, err)
+			return fmt.Errorf("the scope key of user/%s does not open, and a rewrap would leave it sealed under a master that no longer exists. Root must restore keystore/%s/%s/ from a backup or, until rm-scope lands, remove keystore/%s/%s/ by hand (its owner re-puts their values), then run rewrap again: %w", uid, userScopesName, uid, userScopesName, uid, err)
 		}
 		out = append(out, planned{scope: uid})
 		return nil

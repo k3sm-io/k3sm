@@ -1317,7 +1317,9 @@ test enforces (`TestUserScopeIsUnexported`), so no build ever shipped a scope wi
 
 **One damaged scope blocks Rewrap.** Rewrap refuses, writing nothing, while any scope's
 `scope.key` does not open, a scope directory or `.user` is not one the store trusts, a
-`scope.key.new` is not a file Rewrap wrote, or `.user` lists past its name bound: re-wrapping
+`scope.key.new` is not a file Rewrap wrote, `.user` holds a stray directory named for a uid that
+can never own a scope (below 501, the service uid, or above 2147483647), which root removes by
+hand, or `.user` lists past its name bound: re-wrapping
 past it would leave that scope sealed under a master that no longer exists. The refusal is
 `ErrCorrupt` and names the scope. After committing every `scope.key`, and before it swaps
 the master, Rewrap re-opens each planned `scope.key` under the new `W`; one swapped back to an
