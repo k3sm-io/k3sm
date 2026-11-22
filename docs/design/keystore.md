@@ -1541,7 +1541,9 @@ service user can only add to.
   naming any generation (no live floor line, no `generation` file and no record header that
   reads) is refused before anything is removed, wrapping `ErrCorrupt`, naming the remedy:
   root's `floor --rebuild`, which records the entry's generation, then `rm` again, or removing
-  the entry's directory by hand. When the ones that read disagree, `rm` still buries
+  the entry's directory by hand. An entry directory with nothing sealed in it (no `current`
+  and no `v<N>` file, as a crash between the put's `mkdir` and its `generation` write
+  leaves) holds nothing a copy could be served from, so `rm` removes it instead. When the ones that read disagree, `rm` still buries
   them all and removes the tree, and reports the mismatch, naming each source's generation,
   as after a commit (`errCommitted`), so the operator learns the tree was altered (U20). `current` and
   `list` refuse a buried generation as deleted, wrapping `ErrCorrupt`, with a message whose

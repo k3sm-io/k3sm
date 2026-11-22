@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -68,8 +69,8 @@ func TestUserRmOpenFailureRefusedWithoutTombstone(t *testing.T) {
 }
 
 // An rm with no generation to bury (no live floor line, a generation file
-// that does not read and no record header that parses) refuses with the
-// named remedy and removes nothing.
+// that does not read and no record header that parses, though a record
+// file stands) refuses with the named remedy and removes nothing.
 func TestUserRmNoGenerationRefusesFirst(t *testing.T) {
 	ctx := context.Background()
 	s, u, dir, _ := rmShapeSetup(t)
@@ -82,10 +83,13 @@ func TestUserRmNoGenerationRefusesFirst(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(s.dataRoot, userFloorLogName), kept, logMode); err != nil {
 		t.Fatal(err)
 	}
-	for _, f := range []string{generationName, currentName, versionName(1)} {
+	for _, f := range []string{generationName, currentName} {
 		if err := os.Remove(filepath.Join(dir, f)); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, versionName(1)), []byte("not a record"), 0o600); err != nil {
+		t.Fatal(err)
 	}
 	err := u.Delete(ctx, "user/1001/token")
 	if !errors.Is(err, errRmNoGeneration) || errors.Is(err, errCommitted) {
@@ -96,5 +100,25 @@ func TestUserRmNoGenerationRefusesFirst(t *testing.T) {
 	}
 	if _, err := os.Lstat(dir); err != nil {
 		t.Fatalf("the tree was removed: %v", err)
+	}
+}
+
+// An entry directory with nothing sealed in it, which a crash between the
+// put's mkdir and its generation write leaves, holds nothing a copy put
+// back could be served from: rm removes it rather than refusing with
+// errRmNoGeneration.
+func TestUserRmRemovesUnsealedEntryDir(t *testing.T) {
+	ctx := context.Background()
+	_, server, u := fileLogScope(t)
+	dir := filepath.Join(scopeDir(server, "1001"), scopeEntriesName, "crashed")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	giveToService(t, dir)
+	if err := u.Delete(ctx, "user/1001/crashed"); err != nil {
+		t.Fatalf("rm of an entry directory with nothing sealed in it: %v, want it removed", err)
+	}
+	if _, err := os.Lstat(dir); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the directory is still there: %v", err)
 	}
 }

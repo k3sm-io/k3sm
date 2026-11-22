@@ -287,8 +287,19 @@ func (u *UserScope) deleteBody(root *os.Root, name string) error {
 	}
 	b.addTree(e, name)
 	if len(b.gens) == 0 {
+		sealed := holdsSealed(e.root)
 		e.close()
-		return errRmNoGeneration
+		if sealed {
+			return errRmNoGeneration
+		}
+		// Nothing sealed stands (a crash between the put's mkdir and its
+		// generation write): no copy of it could be served, so there is
+		// nothing to bury and it is removed.
+		err := entries.RemoveAll(name)
+		if err == nil {
+			err = syncDir(entries)
+		}
+		return err
 	}
 	if err := b.bury(u); err != nil {
 		e.close()
@@ -366,6 +377,21 @@ func (u *UserScope) openEntryForRm(entries *os.Root, name string) (*entry, error
 		}
 	}
 	return openEntryDirRaw(entries, name)
+}
+
+// holdsSealed reports whether dir may hold a sealed record: a current
+// pointer or a v<N> version file, or names it cannot list.
+func holdsSealed(dir *os.Root) bool {
+	names, err := readDirNames(dir, maxDirNames)
+	if err != nil {
+		return true
+	}
+	for _, n := range names {
+		if _, ok := parseVersionName(n); ok || n == currentName {
+			return true
+		}
+	}
+	return false
 }
 
 // shapeOf names what fi, which is not a directory, is.
