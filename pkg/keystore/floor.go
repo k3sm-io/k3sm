@@ -145,6 +145,13 @@ type floorEntry struct {
 	// Seq is the highest pointer sequence committed for the live entry, or 0
 	// with no live record.
 	Seq uint64
+	// HighWater is 0, or a sequence above Seq: the highest pointer sequence
+	// of this generation that a floor merge set aside, the moved-aside
+	// floor's own record of it when a restore put back an older copy. A
+	// pointer of the generation above Seq and at or below HighWater is a
+	// copy of that abandoned history and is refused (check); a Rotate seals
+	// its next sequence above HighWater, and the raise to it clears it.
+	HighWater uint64
 	// Buried holds the name's buried generations, oldest (lowest Deleted)
 	// first: at most maxBuriedPerName of them, and nil for none.
 	Buried []burial
@@ -202,6 +209,8 @@ func (e *floorEntry) dropOldest() {
 type liveEntry struct {
 	Generation string `json:"generation"`
 	Seq        uint64 `json:"seq"`
+	// HighWater is floorEntry.HighWater, left out when 0.
+	HighWater uint64 `json:"highwater,omitempty"`
 }
 
 // floorFile is the floor's encoding. Scope names the scope whose entries it
@@ -253,7 +262,7 @@ func marshalFloor(fl floor) ([]byte, error) {
 	f := floorFile{Version: floorFormat, Scope: scopeSystem, Entries: map[string]liveEntry{}}
 	for name, e := range fl {
 		if e.live() {
-			f.Entries[name] = liveEntry{Generation: e.Generation, Seq: e.Seq}
+			f.Entries[name] = liveEntry{Generation: e.Generation, Seq: e.Seq, HighWater: e.HighWater}
 		}
 		if bs := e.burials(); len(bs) > 0 {
 			if f.Tombstones == nil {
@@ -339,7 +348,11 @@ func tombstonesSize(names, sum int) int {
 // floorEntrySize is the length of name's live record e in the floor's
 // encoding, without the comma that separates it from the one before.
 func floorEntrySize(name string, e floorEntry) int {
-	return len(`"":{"generation":"`) + len(name) + len(e.Generation) + len(`","seq":}`) + len(strconv.FormatUint(e.Seq, 10))
+	n := len(`"":{"generation":"`) + len(name) + len(e.Generation) + len(`","seq":}`) + len(strconv.FormatUint(e.Seq, 10))
+	if e.HighWater != 0 {
+		n += len(`,"highwater":`) + len(strconv.FormatUint(e.HighWater, 10))
+	}
+	return n
 }
 
 // grow is how many bytes recording the live record e for name would add to
@@ -442,6 +455,11 @@ type staleError struct {
 	seq, floor uint64
 	generation bool
 	deleted    bool
+	// abandoned is set when seq is above the floor's and at or below its
+	// high-water mark (highWater): a copy of the history a restore set
+	// aside.
+	abandoned bool
+	highWater uint64
 	// liveOther is set with deleted when the floor also records a live
 	// entry of the name under another generation: that entry's directory
 	// is missing, and rm would delete it.
@@ -460,6 +478,8 @@ func (e *staleError) Error() string {
 		// deliberate case, and it revives every deletion since. Never
 		// removing the floor, which discards every burial.
 		return fmt.Sprintf("keystore entry %q: the entry directory belongs to a generation of this entry that the floor records as deleted; an older copy of a deleted entry was put back. If you did not put this directory back, remove it with sudo k3sm keys rm system/%s --yes: the floor stays as it is and keeps the entry deleted. Do not restore from backup. Only to bring the deleted entry back on purpose, restore that backup together with the keystore-floor.json saved with it, as \"Backing Up and Restoring\" in docs/user/keys.md describes; that brings back every key deleted since the backup, not only this one", e.name, e.name)
+	case e.abandoned:
+		return fmt.Sprintf("keystore entry %q: the current pointer (sequence %d) belongs to the history of this entry that a restore set aside: the floor merge recorded sequences above %d and up to %d as replaced by the restored copy, so this is a copy of the entry from before the restore. Put the restored copy of keystore/%s back if you still have it: that copy is accepted. Do not restore from backup", e.name, e.seq, e.floor, e.highWater, e.name)
 	case e.generation:
 		return fmt.Sprintf("keystore entry %q: the current pointer belongs to another generation of this entry than the recorded floor; an older copy of a deleted entry was put back after a newer put of the name, or a delete and the put after it were both interrupted. Put the directory of the generation the floor records back as keystore/%s if you still have it: that copy is accepted. Do not restore from backup. If the older copy was deliberate, follow \"Restoring an older keystore/\" in docs/user/backup-restore.md", e.name, e.name)
 	}
@@ -470,7 +490,9 @@ func (e *staleError) Unwrap() error { return ErrCorrupt }
 
 // check refuses a pointer of name at generation gen and sequence seq when
 // the floor buries gen for name, or records a live entry for name of another
-// generation or at a higher sequence.
+// generation or at a higher sequence. It also refuses seq above the live
+// record's sequence and at or below its high-water mark: a copy of the
+// history a floor merge set aside.
 func (fl floor) check(name string, gen [generationSize]byte, seq uint64) error {
 	if err := fl.buried(name, gen); err != nil {
 		return err
@@ -484,6 +506,9 @@ func (fl floor) check(name string, gen [generationSize]byte, seq uint64) error {
 	}
 	if seq < f.Seq {
 		return &staleError{name: name, seq: seq, floor: f.Seq}
+	}
+	if seq > f.Seq && seq <= f.HighWater {
+		return &staleError{name: name, seq: seq, floor: f.Seq, abandoned: true, highWater: f.HighWater}
 	}
 	return nil
 }
@@ -506,15 +531,17 @@ func (fl floor) buried(name string, gen [generationSize]byte) error {
 // same generation (the maximum of the two), and reports whether it changed
 // anything. A live record of another generation is left alone: readers
 // refuse that pointer, and only a Put, which mints a new generation,
-// replaces it (set). A buried gen is never raised: that is a deleted entry.
-// The name's burials are kept.
+// replaces it (set). A buried gen is never raised: that is a deleted entry,
+// and neither is a seq at or below the live record's high-water mark: that
+// is a copy of the history a floor merge set aside, which check refuses. A
+// raise above the mark clears it. The name's burials are kept.
 func (fl floor) raise(name string, gen [generationSize]byte, seq uint64) bool {
 	g := hex.EncodeToString(gen[:])
 	f := fl[name]
-	if f.buries(g) || (f.live() && (f.Generation != g || f.Seq >= seq)) {
+	if f.buries(g) || (f.live() && (f.Generation != g || f.Seq >= seq || seq <= f.HighWater)) {
 		return false
 	}
-	f.Generation, f.Seq = g, seq
+	f.Generation, f.Seq, f.HighWater = g, seq, 0
 	fl[name] = f
 	return true
 }
@@ -545,7 +572,7 @@ func (fl floor) set(name string, gen [generationSize]byte) (bool, string, []prun
 		}
 		f = fl[name]
 	}
-	f.Generation, f.Seq = g, 1
+	f.Generation, f.Seq, f.HighWater = g, 1, 0
 	fl[name] = f
 	return true, buried, dropped
 }
@@ -588,7 +615,7 @@ func (fl floor) bury(name string, dirGen *[generationSize]byte) ([]string, []pru
 		}
 		// Read after renumber, which rewrites the name's own burials in fl.
 		f = fl[name]
-		f.Generation, f.Seq = "", 0
+		f.Generation, f.Seq, f.HighWater = "", 0, 0
 		if dropped, ok := f.add(burial{Generation: g, Deleted: last + 1}); ok {
 			out = append(out, pruned{name: name, generation: dropped.Generation})
 		}
@@ -728,7 +755,8 @@ func (s *FileStore) floorOwned(fi fs.FileInfo) error {
 // encoding per floor, and no file with two answers for one field. A name's
 // burials must be oldest first with distinct delete sequences across the
 // floor, at most maxBuriedPerName of them, none of the live generation, none
-// above maxDeleteSeq, and all of them within maxTombstoneSize.
+// above maxDeleteSeq, and all of them within maxTombstoneSize. A live
+// record's highwater, written only when set, must be above its seq.
 func parseFloor(b []byte) (floor, error) {
 	dec := json.NewDecoder(bytes.NewReader(b))
 	dec.DisallowUnknownFields()
@@ -747,10 +775,10 @@ func parseFloor(b []byte) (floor, error) {
 	}
 	fl := floor{}
 	for name, e := range f.Entries {
-		if !floorGeneration(name, e.Generation) || e.Seq == 0 {
+		if !floorGeneration(name, e.Generation) || e.Seq == 0 || (e.HighWater != 0 && e.HighWater <= e.Seq) {
 			return nil, fmt.Errorf("%w: entry %q", errFloorMalformed, name)
 		}
-		fl[name] = floorEntry{Generation: e.Generation, Seq: e.Seq}
+		fl[name] = floorEntry{Generation: e.Generation, Seq: e.Seq, HighWater: e.HighWater}
 	}
 	seen := map[uint64]bool{}
 	for name, bs := range f.Tombstones {

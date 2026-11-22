@@ -317,11 +317,15 @@ restore was never finished or undone, and moving the live copies aside now would
 finish or undo that restore first, as below, and do not go on. `shasum` must print `OK`. If it
 does not, the saved floor has changed since you saved it: do not use it. Then move the live
 copies aside and put the backup in place. Each `test` line stops the steps (and closes the
-shell) if a copy is set aside after all, so `mv` never moves the live copy into or over it:
+shell) if a copy is set aside after all, so `mv` never moves the live copy into or over it. The
+`chown` and `chmod` lines make the moved-aside `keystore/` readable by root only, so nothing
+running as the service user can copy an entry from it back into the restored keystore:
 
 ```
 test ! -e /var/lib/k3sm/server/keystore.pre-restore || exit 1
 sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/server/keystore.pre-restore
+sudo chown -R root:wheel /var/lib/k3sm/server/keystore.pre-restore
+sudo chmod 700 /var/lib/k3sm/server/keystore.pre-restore
 test ! -e /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1
 sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore
 sudo ditto /path/to/backup/$B/keystore /var/lib/k3sm/server/keystore
@@ -350,10 +354,14 @@ Decide before you run the merge: once it has deleted an entry again, running it 
 `--keep` does not bring that entry back. The merge also deletes each version that was current in
 the floor you moved aside but is not the restored one, such as an entry you put again after
 deleting it since the backup: by restoring the backup you chose its version, so a copy of the
-newer one put back is refused. `--keep` exempts that entry too. The merge prints how many
+newer one put back is refused. `--keep` exempts that entry too. An entry you rotated since the
+backup is restored at its older version, and the merge records how far it had been rotated, so a
+copy of a newer version from before the restore is refused, before and after the next `rotate`
+(which numbers past it). The merge prints how many
 deletions it merged, how many the restored floor already had, how many restored entries it
 deleted again, how many it kept because `--keep` named them, how many moved-aside versions it
-retired, and how many it had to drop to stay within the floor's limits. It
+retired, how many it had to drop to stay within the floor's limits, and how many restored entries
+it fenced off from their newer pre-restore copies. It
 lists each entry it deleted again as `buried live system/<name>`, and each one it kept as `kept
 system/<name>`. Remove each deleted entry's files with `sudo k3sm keys rm system/<name> --yes`.
 A line starting `dropped` names a deletion the floor could not keep: a copy of that entry put
@@ -395,12 +403,14 @@ sudo rm /var/lib/k3sm/keystore-floor.json.pre-restore
 
 To undo the restore instead, stop the server, move what you restored out of the way, then move
 both copies back. Rename the restored `keystore/` first: `mv` onto a directory that exists moves
-the source inside it rather than replacing it.
+the source inside it rather than replacing it. The `chown` gives the moved-back `keystore/` to the
+service user again, which the restore took from it.
 
 ```
 sudo k3sm stop
 sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/server/keystore.restored
 sudo mv /var/lib/k3sm/server/keystore.pre-restore /var/lib/k3sm/server/keystore
+sudo chown -R _k3sm:_k3sm /var/lib/k3sm/server/keystore
 sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.restored
 sudo mv /var/lib/k3sm/keystore-floor.json.pre-restore /var/lib/k3sm/keystore-floor.json
 sudo k3sm start

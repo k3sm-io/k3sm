@@ -1213,10 +1213,22 @@ moved-aside live generation the restored floor neither holds live nor buries (it
 generation live, or none), the merge buries that generation after the merged burials and
 counts it as retired, unless `--keep` names the entry. Root retired it by choosing the backup:
 a name live as G1 at the backup, deleted and put again as G2, has G1 buried (the deletion) and
-G2 retired, so neither directory put back is accepted. The merge keeps every live record of
+G2 retired, so neither directory put back is accepted. When the restored floor holds the
+moved-aside live generation itself at a lower sequence (the entry rotated since the backup),
+the moved-aside history would otherwise outrank the restored one: a pre-restore copy at seq 9
+passes a floor at seq 5, and the next Rotate, sealing seq 6, would leave it passing. So the
+merge gives that live record a high-water mark, the moved-aside sequence (or the moved-aside
+record's own mark, if higher), written as an optional `"highwater":N` after `"seq"` in the
+entry and left out when 0, so the parser's canonical round trip and every earlier floor are
+unchanged; the parser refuses a mark at or below `seq`. Readers refuse a pointer of that
+generation above `seq` and at or below the mark, the raise never raises into it, and Rotate
+seals its next sequence at one above `max(seq, highwater)`; the raise to it clears the mark,
+and a Put of a new generation or a burial drops it. The verb counts these as `fenced N`.
+The recipe also makes the moved-aside `keystore.pre-restore` root-only (`chown -R root:wheel`,
+`chmod 700`) as it moves it, so the service user cannot copy an entry out of it. The merge keeps every live record of
 the restored floor not buried above. The write is pruned as every floor write is, the per-name cap
 included, and each burial dropped is logged at Warn and reported. The verb prints `merged N`,
-`already present N`, `buried live N`, `kept N`, `retired N` and `dropped N`, one per line, then `buried live
+`already present N`, `buried live N`, `kept N`, `retired N`, `dropped N` and `fenced N`, one per line, then `buried live
 system/<name>: ...` for each name whose live generation it buried (and whose directory `rm`
 removes), `kept system/<name>: ...` for each name kept and `dropped system/<name>: ...` for each
 burial dropped, and exits 0 once the merge is

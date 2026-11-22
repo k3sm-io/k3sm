@@ -246,7 +246,9 @@ func TestMergeFloorKeep(t *testing.T) {
 // TestFloorMergeRetiresAsideLive (U192): a live generation in the
 // moved-aside floor that the restored floor does not hold live, under
 // another generation or not at all, is buried (counted as retired), unless
-// keep names the entry; one the restored floor holds live is left alone.
+// keep names the entry; one the restored floor holds live at a lower
+// sequence is left live, with the moved-aside sequence as its high-water
+// mark (fenced), so the abandoned history above it is refused.
 func TestFloorMergeRetiresAsideLive(t *testing.T) {
 	restored := floor{
 		"other": {Generation: mgen(1), Seq: 1},
@@ -271,8 +273,8 @@ func TestFloorMergeRetiresAsideLive(t *testing.T) {
 	if e := restored["new"]; e.live() || !e.buries(mgen(4)) {
 		t.Errorf("new after the merge = %+v, want the aside's generation buried", e)
 	}
-	if e := restored["same"]; e.Generation != mgen(3) || len(e.burials()) != 0 {
-		t.Errorf("same after the merge = %+v, want it left alone", e)
+	if e := restored["same"]; e.Generation != mgen(3) || e.Seq != 1 || e.HighWater != 2 || len(e.burials()) != 0 || !slices.Equal(r.Fenced, []string{"same"}) {
+		t.Errorf("same after the merge = %+v (fenced %v), want it live at seq 1 with high-water 2, nothing buried", e, r.Fenced)
 	}
 	if e := restored["kept"]; e.Generation != mgen(5) || len(e.burials()) != 0 {
 		t.Errorf("kept after the merge = %+v, want it left alone", e)

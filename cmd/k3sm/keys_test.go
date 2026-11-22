@@ -765,6 +765,8 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 			"sudo shasum -a 256 -c /var/root/keystore-floor-backup/$B/keystore-floor.json.sha256",
 			"test ! -e /var/lib/k3sm/server/keystore.pre-restore || exit 1",
 			"sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/server/keystore.pre-restore",
+			"sudo chown -R root:wheel /var/lib/k3sm/server/keystore.pre-restore",
+			"sudo chmod 700 /var/lib/k3sm/server/keystore.pre-restore",
 			"test ! -e /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1",
 			"sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore",
 			"sudo install -o root -g wheel -m 0644 /var/root/keystore-floor-backup/$B/keystore-floor.json /var/lib/k3sm/keystore-floor.json",

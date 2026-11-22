@@ -48,6 +48,12 @@ type MergeReport struct {
 	// another generation or not at all. Choosing the backup retired it, so
 	// its directory put back is refused.
 	Retired int
+	// Fenced names, sorted, each entry whose generation the restored floor
+	// holds live at a lower sequence than the moved-aside floor did: the
+	// merge set the live record's high-water mark to the moved-aside
+	// sequence, so a copy of the abandoned history, which would otherwise
+	// outrank the restored entry, is refused until a Rotate seals above it.
+	Fenced []string
 	// Dropped names, sorted and with repeats, each burial the write dropped
 	// to stay within the floor's caps (the per-name cap and the tombstone
 	// budget): a copy of it put back is accepted again.
@@ -114,7 +120,7 @@ func (s *FileStore) mergeFloor(ctx context.Context, path string, keep []string) 
 	var capDropped []pruned
 	_, dropped, err := fdir.updatePruned(func(fl floor) bool {
 		r, capDropped = fl.merge(from, kept)
-		return r.Merged > 0 || r.Retired > 0
+		return r.Merged > 0 || r.Retired > 0 || len(r.Fenced) > 0
 	})
 	if err != nil {
 		return MergeReport{}, err
@@ -184,7 +190,9 @@ func (s *FileStore) readFloorAt(path string) (floor, error) {
 // cleared (BuriedLive), unless keep names the entry (Kept); fl's other live
 // records are kept. Then, by name, each live generation in from that fl
 // neither holds live nor buries is buried after them (Retired), unless keep
-// names the entry. At maxBuriedPerName, add drops the name's oldest,
+// names the entry. A live generation in from that fl holds live at a lower
+// sequence gets from's sequence as its high-water mark (Fenced). At
+// maxBuriedPerName, add drops the name's oldest,
 // returned. It does not prune: update does.
 func (fl floor) merge(from floor, keep map[string]bool) (MergeReport, []pruned) {
 	type at struct {
@@ -215,14 +223,14 @@ func (fl floor) merge(from floor, keep map[string]bool) (MergeReport, []pruned) 
 		// Read after renumber, which rewrites the name's own burials in fl.
 		f := fl[name]
 		if f.live() && f.Generation == g {
-			f.Generation, f.Seq = "", 0
+			f.Generation, f.Seq, f.HighWater = "", 0, 0
 		}
 		if dropped, ok := f.add(burial{Generation: g, Deleted: last}); ok {
 			out = append(out, pruned{name: name, generation: dropped.Generation})
 		}
 		fl[name] = f
 	}
-	kept, buriedLive := map[string]bool{}, map[string]bool{}
+	kept, buriedLive, fenced := map[string]bool{}, map[string]bool{}, map[string]bool{}
 	for _, a := range all {
 		f := fl[a.name]
 		switch {
@@ -247,7 +255,16 @@ func (fl floor) merge(from floor, keep map[string]bool) (MergeReport, []pruned) 
 	for _, name := range names {
 		a, f := from[name], fl[name]
 		switch {
-		case !a.live(), f.live() && f.Generation == a.Generation, f.buries(a.Generation):
+		case a.live() && f.live() && f.Generation == a.Generation:
+			// The same generation, restored at an older sequence: the
+			// moved-aside history above it must never outrank it.
+			if hw := max(a.Seq, a.HighWater); hw > f.Seq && hw > f.HighWater {
+				f.HighWater = hw
+				fl[name] = f
+				fenced[name] = true
+			}
+			continue
+		case !a.live(), f.buries(a.Generation):
 			continue
 		case keep[name]:
 			kept[name] = true
@@ -256,7 +273,7 @@ func (fl floor) merge(from floor, keep map[string]bool) (MergeReport, []pruned) 
 		add(name, a.Generation)
 		r.Retired++
 	}
-	r.BuriedLive, r.Kept = sortedNames(buriedLive), sortedNames(kept)
+	r.BuriedLive, r.Kept, r.Fenced = sortedNames(buriedLive), sortedNames(kept), sortedNames(fenced)
 	return r, out
 }
 

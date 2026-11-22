@@ -931,12 +931,16 @@ func (s *FileStore) rotate(ctx context.Context, name string, value []byte) (Vers
 	if err := checkValue(old.Kind, value); err != nil {
 		return Version{}, err
 	}
-	if cur >= maxVersion || seq == math.MaxUint64 {
+	// The next sequence is above the floor's high-water mark, when a floor
+	// merge set one: the history a restore set aside never outranks it.
+	base := max(seq, fl[name].HighWater)
+	if cur >= maxVersion || base == math.MaxUint64 {
 		return Version{}, fmt.Errorf("%w: the pointer is at the last version or sequence", ErrCorrupt)
 	}
+	nextSeq := base + 1
 	// A floor with no room for the next sequence refuses the Rotate before
 	// anything is written.
-	if err := fl.room(name, floorEntry{Generation: hex.EncodeToString(e.generation[:]), Seq: seq + 1}); err != nil {
+	if err := fl.room(name, floorEntry{Generation: hex.EncodeToString(e.generation[:]), Seq: nextSeq}); err != nil {
 		return Version{}, err
 	}
 	if err := discardOrphans(ctx, e, cur); err != nil {
@@ -952,13 +956,13 @@ func (s *FileStore) rotate(ctx context.Context, name string, value []byte) (Vers
 		return Version{}, err
 	}
 	ptr := record{kind: kindPointer, name: name, generation: e.generation, created: created}
-	if err := ptr.seal(k.seal, k.scope, pointerPlaintext(next, seq+1), s.rand); err != nil {
+	if err := ptr.seal(k.seal, k.scope, pointerPlaintext(next, nextSeq), s.rand); err != nil {
 		return Version{}, err
 	}
 	if err := s.writeFile(e.root, currentName, ptr.marshal()); err != nil {
 		return Version{}, err
 	}
-	if _, err := fdir.update(func(fl floor) bool { return fl.raise(name, e.generation, seq+1) }); err != nil {
+	if _, err := fdir.update(func(fl floor) bool { return fl.raise(name, e.generation, nextSeq) }); err != nil {
 		return Version{}, fmt.Errorf("version %d is current, but recording its floor failed (the next keys verb records it): %w", next, err)
 	}
 	return versionOf(rec, value, k.fingerprint), nil

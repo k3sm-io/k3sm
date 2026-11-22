@@ -192,14 +192,15 @@ func floorsEqual(a, b floor) bool { return maps.EqualFunc(a, b, entriesEqual) }
 // entriesEqual reports whether x and y are the same record: the same live
 // part and the same burials in the same order.
 func entriesEqual(x, y floorEntry) bool {
-	return x.Generation == y.Generation && x.Seq == y.Seq && slices.Equal(x.Buried, y.Buried)
+	return x.Generation == y.Generation && x.Seq == y.Seq && x.HighWater == y.HighWater && slices.Equal(x.Buried, y.Buried)
 }
 
 // checkFloorEntry fails t unless e, name's record, is one every check can
 // rely on: a live record (a canonical generation and a sequence) or none,
 // at least one burial when there is no live record, at most
 // buriedPerNameLimit burials of canonical generations, oldest first, none of
-// them the live generation and every delete sequence in 1 to maxDeleteSeq.
+// them the live generation and every delete sequence in 1 to maxDeleteSeq,
+// and a high-water mark only on a live record, above its sequence.
 func checkFloorEntry(t *testing.T, name string, e floorEntry) {
 	t.Helper()
 	canonical := func(g string) bool {
@@ -209,6 +210,9 @@ func checkFloorEntry(t *testing.T, name string, e floorEntry) {
 	bs := e.burials()
 	if e.live() != (e.Generation != "") || (e.live() && !canonical(e.Generation)) {
 		t.Fatalf("record %q has live part %q at sequence %d", name, e.Generation, e.Seq)
+	}
+	if e.HighWater != 0 && (!e.live() || e.HighWater <= e.Seq) {
+		t.Fatalf("record %q has high-water mark %d at sequence %d", name, e.HighWater, e.Seq)
 	}
 	if !e.live() && len(bs) == 0 {
 		t.Fatalf("record %q has sequence 0 and buries nothing", name)
