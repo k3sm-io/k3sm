@@ -133,6 +133,9 @@ type FileStore struct {
 	// entryMade is called between a new entry directory's mkdir and its open,
 	// where a test swaps the directory.
 	entryMade func(name string)
+	// entryOpen, when set, is called before rm opens an entry directory; a
+	// non-nil return fails the open, where a test makes it fail.
+	entryOpen func(name string) error
 	// dirMade is called inside mkdirAt, between the mkdir and the Lstat that
 	// takes the new directory's identity, where a test swaps the directory.
 	dirMade func(name string)

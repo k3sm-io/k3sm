@@ -226,7 +226,11 @@ func (u *UserScope) deleteBody(root *os.Root, name string) error {
 	if !fi.IsDir() {
 		// A file or a symlink at the name is no entry the store wrote: bury,
 		// then remove it (RemoveAll removes a symlink itself, never what it
-		// names), and report the shape after the commit.
+		// names), and report the shape after the commit. With no generation
+		// to bury it is refused, nothing removed.
+		if len(b.gens) == 0 {
+			return errRmNoGeneration
+		}
 		if err := b.bury(u); err != nil {
 			return err
 		}
@@ -247,11 +251,25 @@ func (u *UserScope) deleteBody(root *os.Root, name string) error {
 	// header's. A floor that does not take a line refuses the rm before
 	// anything is removed; a disagreement between the sources is reported
 	// after the commit.
-	e, err := openEntryDirRaw(entries, name)
+	e, err := u.openEntryForRm(entries, name)
 	if err != nil {
+		// The tree cannot be read for its generations: bury the floor's live
+		// ones first, so a copy put back is refused, then report the open's
+		// error with the tree left standing. A floor that does not take a
+		// tombstone refuses the rm.
+		if berr := b.bury(u); berr != nil {
+			return berr
+		}
+		if len(b.gens) > 0 {
+			return fmt.Errorf("%w, but the entry's directory could not be opened, so its tree stays; rm buried the floor's live generations: %w", errCommitted, err)
+		}
 		return err
 	}
 	b.addTree(e, name)
+	if len(b.gens) == 0 {
+		e.close()
+		return errRmNoGeneration
+	}
 	if err := b.bury(u); err != nil {
 		e.close()
 		return err
@@ -280,6 +298,24 @@ func (u *UserScope) deleteBody(root *os.Root, name string) error {
 		return fmt.Errorf("%w, but %w", errCommitted, rerr)
 	}
 	return nil
+}
+
+// errRmNoGeneration refuses an rm, before anything is removed, when no
+// source names a generation to bury: the floor holds none live for the
+// name, and neither the generation file nor a record header reads.
+// Removing the tree then would leave nothing to refuse a copy of it put
+// back.
+var errRmNoGeneration = fmt.Errorf("%w: rm refused, nothing removed: no generation to bury: the user-scope floor holds none live for the name and neither the generation file nor a record header reads; root can run sudo k3sm keys floor --rebuild, which records the entry's generation, then rm again, or remove the entry's directory by hand", ErrCorrupt)
+
+// openEntryForRm opens name's directory for an rm, through the entryOpen
+// seam when it is set.
+func (u *UserScope) openEntryForRm(entries *os.Root, name string) (*entry, error) {
+	if u.s.entryOpen != nil {
+		if err := u.s.entryOpen(name); err != nil {
+			return nil, err
+		}
+	}
+	return openEntryDirRaw(entries, name)
 }
 
 // shapeOf names what fi, which is not a directory, is.
@@ -362,12 +398,10 @@ func (b *burial) bury(u *UserScope) error {
 }
 
 // report is what rm reports after its commit: generations that disagree,
-// since the tree was altered, or no generation to bury at all.
+// since the tree was altered. An rm with no generation to bury never
+// commits (errRmNoGeneration).
 func (b *burial) report() error {
-	switch {
-	case len(b.gens) == 0:
-		return errors.New("with its tombstone unwritten: no generation to bury: the floor holds none for the name and neither the generation file nor a record header reads")
-	case len(b.gens) > 1:
+	if len(b.gens) > 1 {
 		return fmt.Errorf("the entry's generations disagree (%s), so its tree was altered; rm buried every one", strings.Join(b.sources, ", "))
 	}
 	return nil
