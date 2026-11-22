@@ -35,6 +35,13 @@ import (
 // holds an exclusive flock on it, and every root verb that writes the floor
 // still succeeds, since the floor lock is keystore-lock, which that user
 // cannot open at all. Non-root it skips; the root-run row fails on a SKIP.
+//
+// It proves only that a flock on the data-root directory no longer blocks a
+// root verb; TestDataRootFlockBlocksNoFloorWrite is the non-root control that
+// failed before the lock moved. The service user still owns keystore/.lock,
+// which every root write verb takes first, and can hold it to delay those
+// verbs by up to lockWait each: that accepted residual (docs/design/
+// keystore.md § "Concurrency") is out of this test's scope.
 func TestNonRootDataRootFlockBlocksNoRootVerb(t *testing.T) {
 	if !asRoot() {
 		t.Skip("root-run (U119): run as root through hack/acceptance/keystore.sh --root")
