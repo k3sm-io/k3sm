@@ -19,6 +19,7 @@ package keystore
 import (
 	"bytes"
 	"log/slog"
+	"strings"
 
 	"golang.org/x/sys/unix"
 )
@@ -34,12 +35,20 @@ import (
 //     generation of 32 lowercase hex digits, then nothing, or a space and
 //     nothing, "r" or "rm" (a tombstone's prefix), or a canonical decimal
 //     prefix of at most 20 digits (a live line's);
+//   - a taint on a name prefix, when the line is "<scope> <partial>": the
+//     scope parses with its space and partial, with no space, is a prefix of
+//     the delivery record's name or of a valid entry name; it covers every
+//     name of the scope that starts with partial;
+//   - a taint on a scope prefix, when the line, with no space, is "user/"
+//     and at least one digit, with no leading zero, and extends to a uid in
+//     range; it covers every scope whose canonical text starts with it;
 //   - unattributable damage, for anything else: a scope or name that does
-//     not parse or is not followed by its space, a rest that is the prefix of
-//     no line, or a line over maxLogLine.
+//     not parse and is no valid prefix, a scope prefix shorter than "user/"
+//     and a digit, a rest that is the prefix of no line, or a line over
+//     maxLogLine.
 //
-// A tainted key's every generation (a name taint) or the one generation (a
-// generation taint) is refused, whatever the floor knows of it: the skipped
+// A tainted key's every generation (a name or prefix taint) or the one
+// generation (a generation taint) is refused, whatever the floor knows of it: the skipped
 // line could have been its tombstone, or a live line above what the floor
 // holds. Unattributable damage keeps the floor-wide rule: no live line for
 // a generation the floor has no line for, and no put or deliver line. The
@@ -47,6 +56,8 @@ import (
 // taint past the cap is counted as unattributable damage instead.
 
 const (
+	// maxUIDDigits is the most digits of a user scope's uid.
+	maxUIDDigits = 10
 	// maxTaintKeys and maxTaintBytes cap the floor's taint set.
 	maxTaintKeys  = 64
 	maxTaintBytes = 64 << 10
@@ -68,6 +79,12 @@ const (
 	taintGen
 	// taintUnattributable is a line no key can be read from.
 	taintUnattributable
+	// taintNamePrefix is a line torn inside its name: every name of the
+	// scope that starts with the partial name.
+	taintNamePrefix
+	// taintScopePrefix is a line torn inside its scope: every scope whose
+	// canonical text starts with the partial scope.
+	taintScopePrefix
 )
 
 // classifyFloorDamage is the taint a damaged floor line, without its
@@ -80,6 +97,11 @@ func classifyFloorDamage(line []byte) (taintKind, floorKey) {
 	}
 	sp := bytes.IndexByte(line, ' ')
 	if sp < 0 {
+		// Torn inside its scope: every scope it is a prefix of.
+		if scopePrefixOK(line) {
+			k.scope = string(line)
+			return taintScopePrefix, k
+		}
 		return taintUnattributable, k
 	}
 	scope := string(line[:sp])
@@ -89,6 +111,11 @@ func classifyFloorDamage(line []byte) (taintKind, floorKey) {
 	rest := line[sp+1:]
 	sp = bytes.IndexByte(rest, ' ')
 	if sp < 0 {
+		// Torn inside its name: every name of the scope it is a prefix of.
+		if namePrefixOK(string(rest)) {
+			k.scope, k.name = scope, string(rest)
+			return taintNamePrefix, k
+		}
 		return taintUnattributable, k
 	}
 	name := string(rest[:sp])
@@ -127,6 +154,41 @@ func classifyFloorDamage(line []byte) (taintKind, floorKey) {
 	return taintUnattributable, floorKey{}
 }
 
+// scopePrefixOK reports whether p is the prefix, "user/" and at least one
+// digit, of the canonical text of some user scope: no leading zero, and a
+// uid in range among its extensions.
+func scopePrefixOK(p []byte) bool {
+	digits, ok := bytes.CutPrefix(p, []byte(userScopePrefix))
+	if !ok || len(digits) == 0 || digits[0] == '0' || len(digits) > maxUIDDigits {
+		return false
+	}
+	var lo uint64
+	for _, c := range digits {
+		if c < '0' || c > '9' {
+			return false
+		}
+		lo = lo*10 + uint64(c-'0')
+	}
+	// Each extension to l digits spans [lo*10^m, lo*10^m + 10^m - 1].
+	span := uint64(1)
+	for l := len(digits); l <= maxUIDDigits; l++ {
+		if lo+span-1 >= minScopeUID && lo <= maxScopeUID {
+			return true
+		}
+		lo, span = lo*10, span*10
+	}
+	return false
+}
+
+// namePrefixOK reports whether p is the prefix of the delivery record's
+// floor name or of some valid entry name.
+func namePrefixOK(p string) bool {
+	if strings.HasPrefix(deliveriesFloorName, p) {
+		return true
+	}
+	return checkName(p) == nil || (len(p) < maxNameLen && checkName(p+"a") == nil)
+}
+
 // canonicalSeqPrefix reports whether b, which is not empty, is a prefix of
 // a canonical decimal uint64: digits, no leading zero but a lone "0", at
 // most maxSeqDigits of them.
@@ -161,6 +223,19 @@ func (s *logState) taintLine(off int64, line []byte) {
 			s.taintNames = map[nameKey]bool{}
 		}
 		s.taintNames[nk] = true
+	case taintNamePrefix, taintScopePrefix:
+		pk := prefixTaint{kind, k.scope, k.name}
+		if s.taintPrefixes[pk] {
+			return
+		}
+		if !s.taintRoom(k) {
+			s.unattributable(off)
+			return
+		}
+		if s.taintPrefixes == nil {
+			s.taintPrefixes = map[prefixTaint]bool{}
+		}
+		s.taintPrefixes[pk] = true
 	case taintGen:
 		if s.taintGens[k] {
 			return
@@ -183,7 +258,7 @@ func (s *logState) taintLine(off int64, line []byte) {
 // taintRoom reports whether the taint set has room for one more entry
 // for k.
 func (s *logState) taintRoom(k floorKey) bool {
-	return len(s.taintNames)+len(s.taintGens) < maxTaintKeys &&
+	return len(s.taintNames)+len(s.taintGens)+len(s.taintPrefixes) < maxTaintKeys &&
 		s.taintBytes+len(k.scope)+len(k.name)+taintEntryOverhead <= maxTaintBytes
 }
 
@@ -210,12 +285,43 @@ func (s *logState) tainted(k floorKey) bool {
 }
 
 // nameTainted reports whether (scope, name) is tainted as a name, every
-// generation of it.
+// generation of it: by a name taint, or by a scope or name prefix that
+// covers it.
 func (s *logState) nameTainted(scope, name string) bool {
 	if s.taintNames[nameKey{scope, name}] {
 		return true
 	}
-	return s.tornSize != 0 && s.tornKind == taintName && s.tornKey.scope == scope && s.tornKey.name == name
+	for p := range s.taintPrefixes {
+		if p.covers(scope, name) {
+			return true
+		}
+	}
+	if s.tornSize == 0 {
+		return false
+	}
+	switch s.tornKind {
+	case taintName:
+		return s.tornKey.scope == scope && s.tornKey.name == name
+	case taintNamePrefix, taintScopePrefix:
+		return prefixTaint{s.tornKind, s.tornKey.scope, s.tornKey.name}.covers(scope, name)
+	}
+	return false
+}
+
+// prefixTaint is a line torn inside its scope or name: kind
+// taintScopePrefix with scope the partial scope, or taintNamePrefix with
+// scope whole and name the partial name.
+type prefixTaint struct {
+	kind        taintKind
+	scope, name string
+}
+
+// covers reports whether (scope, name) is a key p taints.
+func (p prefixTaint) covers(scope, name string) bool {
+	if p.kind == taintScopePrefix {
+		return strings.HasPrefix(scope, p.scope)
+	}
+	return scope == p.scope && strings.HasPrefix(name, p.name)
 }
 
 // unattributedAt reports the start of the latest unattributable damage,

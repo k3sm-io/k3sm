@@ -232,7 +232,8 @@ func TestWithdrawUnverifiedFloorSealsNothing(t *testing.T) {
 // U20: an rm over a floor whose last line has no newline buries and
 // removes: its burial writes a newline first, so the torn bytes are a line
 // of their own, which the reader skips as damage, and the tombstone reads
-// back whole. The next read and a grant over it are served.
+// back whole. The next read is served, and a grant of a name the torn
+// line's partial name does not cover.
 func TestRmOverTornFloorTailBuries(t *testing.T) {
 	ctx := context.Background()
 	s, server, u := fileLogScope(t)
@@ -262,8 +263,13 @@ func TestRmOverTornFloorTailBuries(t *testing.T) {
 	if _, _, err := u.Current(ctx, "user/1001/keep"); err != nil {
 		t.Fatalf("the next read over the closed torn line: %v", err)
 	}
-	if _, err := u.Put(ctx, "user/1001/other", KindOpaque, []byte("v")); !errors.Is(err, errFloorDegraded) {
-		t.Fatalf("a grant over the closed torn line: %v, want errFloorDegraded", err)
+	// The torn line is a tear inside its name: it taints the names that
+	// start with "tok", and no other.
+	if _, err := u.Put(ctx, "user/1001/token", KindOpaque, []byte("v")); !errors.Is(err, errFloorDegraded) {
+		t.Fatalf("a grant of a name the closed torn line's prefix covers: %v, want errFloorDegraded", err)
+	}
+	if _, err := u.Put(ctx, "user/1001/other", KindOpaque, []byte("v")); err != nil {
+		t.Fatalf("a grant of a name the closed torn line's prefix does not cover: %v", err)
 	}
 	if n := floorDamage(t, s); n != 1 {
 		t.Fatalf("%d damaged lines, want 1", n)

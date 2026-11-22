@@ -210,7 +210,7 @@ func FuzzLogSyncDifferential(f *testing.F) {
 					// same unattributable damage.
 					ga, gok := got.unattributedAt()
 					wa, wok := want.unattributedAt()
-					if !maps.Equal(got.taintNames, want.taintNames) || !maps.Equal(got.taintGens, want.taintGens) || ga != wa || gok != wok {
+					if !maps.Equal(got.taintNames, want.taintNames) || !maps.Equal(got.taintGens, want.taintGens) || !maps.Equal(got.taintPrefixes, want.taintPrefixes) || ga != wa || gok != wok {
 						t.Fatalf("%s: incremental taint %v %v unattributable %v@%d, from scratch %v %v %v@%d", where, got.taintNames, got.taintGens, gok, ga, want.taintNames, want.taintGens, wok, wa)
 					}
 					for _, k := range diffKeys() {
@@ -257,9 +257,12 @@ func diffKeys() []floorKey {
 }
 
 // diffPrefixTaints checks, after the stream, that a prefix of a valid line
-// for a key K, drawn from d, taints K once it holds K's scope and name and
-// their spaces, whether it is the floor's torn last line or a line an append
-// closed: as K's name while its generation is partial, as K once it is whole.
+// for a key K, drawn from d, taints K once it reaches into K's scope's
+// digits, whether it is the floor's torn last line or a line an append
+// closed: by a scope or name prefix while those are partial, as K's name
+// while its generation is partial, as K once it is whole. A taint set the
+// stream already filled to its cap is not judged: past it, the prefix is
+// unattributable.
 func diffPrefixTaints(t *testing.T, s *FileStore, maxKeys int, buf *[]byte, d *diffInput) {
 	t.Helper()
 	if t.Failed() {
@@ -273,7 +276,8 @@ func diffPrefixTaints(t *testing.T, s *FileStore, maxKeys int, buf *[]byte, d *d
 		line = fmt.Appendf(nil, "%s %s %x %d", k.scope, k.name, k.gen[:], 1+d.next()*977)
 	}
 	head := len(k.scope) + 1 + len(k.name) + 1
-	n := head + d.next()%(len(line)-head)
+	minScope := len("user/1")
+	n := minScope + d.next()%(len(line)-minScope)
 	for _, closed := range []bool{false, true} {
 		b := append(append(append([]byte(nil), *buf...), '\n'), line[:n]...)
 		if closed {
@@ -284,6 +288,9 @@ func diffPrefixTaints(t *testing.T, s *FileStore, maxKeys int, buf *[]byte, d *d
 		}
 		st := newDiffLog(s, true, maxKeys, &b).sync(t)
 		if st.bad != nil {
+			return
+		}
+		if len(st.taintNames)+len(st.taintGens)+len(st.taintPrefixes) >= maxTaintKeys {
 			return
 		}
 		if !st.nameTainted(k.scope, k.name) && !st.tainted(k) {

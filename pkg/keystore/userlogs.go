@@ -527,12 +527,15 @@ type logState struct {
 	// the torn last line's, in force while tornSize is.
 	taintNames map[nameKey]bool
 	taintGens  map[floorKey]bool
-	taintBytes int
-	unattrib   bool
-	unattribAt int64
-	tornKind   taintKind
-	tornKey    floorKey
-	tornAt     int64
+	// taintPrefixes are the scope and name prefixes lines torn inside
+	// their scope or name could have named.
+	taintPrefixes map[prefixTaint]bool
+	taintBytes    int
+	unattrib      bool
+	unattribAt    int64
+	tornKind      taintKind
+	tornKey       floorKey
+	tornAt        int64
 }
 
 // damaged is the count of damaged lines: those skipped, and a last line
