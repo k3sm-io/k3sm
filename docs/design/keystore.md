@@ -967,6 +967,14 @@ replaced. `sudo k3sm keys adopt system/NAME [--yes]` prints both sides from `Orp
 adopts with `--yes` or an interactive confirmation; without either, and without a terminal,
 it changes nothing.
 
+**An oauth read reports the orphan.** `CurrentCredential` and `GetCredential` of an oauth
+entry with a sealed version above its pointer refuse with `ErrOrphanVersion` rather than
+return the older pair: its refresh token may already be spent at the provider, and spending
+it again can make the provider revoke the grant. This is part of the refresher's contract:
+a refresher that gets `ErrOrphanVersion` stops refreshing the entry and leaves it to an
+operator's adopt; it never rotates around it (the rotation would be refused anyway). The
+other kinds have no single-use secret, so their reads are not refused.
+
 **A write reports its commit outcome without ambiguity.** The pointer's rename is the
 commit point, for a Put (`Put`, `PutCredential`, `GenerateSSH`) as for a rotation (`Rotate`,
 `RotateCredential`, `RotateIf`, `RotateFrom`). The pointer is renamed into place first and

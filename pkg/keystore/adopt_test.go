@@ -84,7 +84,8 @@ func sealedRefresh(t *testing.T, s *FileStore, name string, version uint64) stri
 
 // TestOAuthCrashOrphanAdopted is G9's recovery: an oauth rotation that
 // crashes between its version write and its pointer flip leaves the only
-// copy of the new pair above the pointer. A rotation refuses without unlinking it and says not to
+// copy of the new pair above the pointer. A read refuses with
+// ErrOrphanVersion, a rotation refuses without unlinking it and says not to
 // delete it, Orphan shows it beside the current version, and Adopt makes it
 // current under the retention rule, after which the new pair reads and the
 // next rotation proceeds from it.
@@ -98,6 +99,12 @@ func TestOAuthCrashOrphanAdopted(t *testing.T) {
 		return err
 	})
 
+	if _, _, err := s.CurrentCredential(ctx, "k"); !errors.Is(err, ErrOrphanVersion) {
+		t.Fatalf("CurrentCredential over the orphan: %v, want ErrOrphanVersion", err)
+	}
+	if _, _, err := s.GetCredential(ctx, "k", 2); !errors.Is(err, ErrOrphanVersion) {
+		t.Fatalf("GetCredential over the orphan: %v, want ErrOrphanVersion", err)
+	}
 	_, err := s.RotateCredential(ctx, "k", KindOAuth, oauthEnvelope("a4", "r4"))
 	if !errors.Is(err, ErrCorrupt) || !errors.Is(err, ErrOrphanVersion) {
 		t.Fatalf("RotateCredential over the orphan: %v, want ErrCorrupt and ErrOrphanVersion", err)

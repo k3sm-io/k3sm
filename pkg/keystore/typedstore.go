@@ -215,6 +215,13 @@ func (s *FileStore) RotateFrom(ctx context.Context, name string, from uint64) (V
 // CurrentCredential returns the version the current pointer of the typed
 // entry name names, with its typed.Credential: never an oauth refresh token.
 // An ed25519 or opaque entry is ErrKindMismatch.
+//
+// The refresher's contract: an oauth entry with a sealed version above its
+// current pointer (an orphan a crashed rotation left, holding the
+// provider's newer pair) is refused with ErrOrphanVersion, never read as the
+// older pair, because that pair's refresh token may already be spent at the
+// provider. A refresher that gets ErrOrphanVersion stops refreshing the
+// entry and leaves it to an operator's Adopt; it never rotates around it.
 func (s *FileStore) CurrentCredential(ctx context.Context, name string) (Version, typed.Credential, error) {
 	return s.credential(ctx, name, 0)
 }
@@ -256,6 +263,15 @@ func (s *FileStore) credential(ctx context.Context, name string, version uint64)
 		ck, ok := credentialKind(v.Kind)
 		if !ok {
 			return fmt.Errorf("%w: %s is %s, not a typed credential", ErrKindMismatch, name, v.Kind)
+		}
+		if v.Kind == KindOAuth {
+			above, err := sealedAbove(ctx, e, k, cur)
+			if err != nil {
+				return err
+			}
+			if len(above) > 0 {
+				return fmt.Errorf("%w: version %d is above the current version %d, so the current pair's refresh token may already be spent", ErrOrphanVersion, above[0], cur)
+			}
 		}
 		env, err := typed.Decode(ck, val)
 		if err != nil {
