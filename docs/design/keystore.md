@@ -932,9 +932,11 @@ a running server's flag, so it says "unless the server was started with the over
 ## Rotation and rollback
 
 **Crash-safe write order:** Rotate writes the new version file first (durable, not yet
-referenced), flips the current pointer, then raises the floor. A Rotate that fails before
-the flip leaves the old version current and removes the next-version file it wrote (best
-effort), so the retry seals fresh from the value it was given. **A version file above the
+referenced), flips the current pointer, then raises the floor. The version file is renamed
+into place and its directory fsynced as two steps, as the pointer is, so a failure at
+either, or anywhere else before the flip, leaves the old version current and removes the
+next-version file it wrote (best effort), and the retry seals fresh from the value it was
+given. Only a crash, or a failed removal, leaves that file behind. **A version file above the
 one `current` names is never reused**: it holds whatever value an interrupted attempt
 carried, and promoting it would publish a value the retry did not supply. Before it writes,
 a Rotate looks at every such file under the exclusive lock. One that does not open as this

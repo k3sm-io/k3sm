@@ -849,11 +849,20 @@ func (s *FileStore) rotate(ctx context.Context, name string, nextVal nextValue) 
 	if err := rec.seal(k.seal, k.scope, value, s.rand); err != nil {
 		return Version{}, err
 	}
-	if err := s.writeFile(e.root, versionName(next), rec.marshal()); err != nil {
+	// The version is renamed into place, then its directory synced, as
+	// commitPointer does, so that every failure after the rename and before
+	// the flip, the fsync's included, removes it below.
+	if err := s.renameInto(e.root, versionName(next), rec.marshal(), s.uid, s.gid, fileMode); err != nil {
 		return Version{}, err
 	}
+	err = s.step("sync " + versionName(next))
+	if err == nil {
+		err = syncDir(e.root)
+	}
 	ptr := record{kind: kindPointer, name: name, generation: e.generation, created: created}
-	err = ptr.seal(k.seal, k.scope, rangePlaintext(next, seq+1, newLow), s.rand)
+	if err == nil {
+		err = ptr.seal(k.seal, k.scope, rangePlaintext(next, seq+1, newLow), s.rand)
+	}
 	flipped := false
 	if err == nil {
 		flipped, err = s.commitPointer(e, ptr.marshal())
@@ -861,8 +870,8 @@ func (s *FileStore) rotate(ctx context.Context, name string, nextVal nextValue) 
 	if !flipped {
 		// Nothing committed: the version just written is removed, best
 		// effort, since the next Rotate refuses a sealed version above the
-		// pointer rather than discard it (discardOrphans). Only a crash
-		// leaves it.
+		// pointer rather than discard it (discardOrphans). Only a crash,
+		// or a failed removal here, leaves it.
 		if e.root.Remove(versionName(next)) == nil {
 			_ = syncDir(e.root) // best effort: a left version is refused, never promoted
 		}

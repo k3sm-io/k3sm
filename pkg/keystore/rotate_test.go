@@ -496,11 +496,11 @@ func TestRotateCrashAtEveryStep(t *testing.T) {
 		s.step = func(name string) error { steps = append(steps, name); return nil }
 		mustRotate(t, s, "k", "two")
 	}
-	want := "write v2,write current,sync current,write " + floorName
+	want := "write v2,sync v2,write current,sync current,write " + floorName
 	if strings.Join(steps, ",") != want {
 		t.Fatalf("Rotate steps = %v, want %s", steps, want)
 	}
-	for _, step := range steps[:2] { // the sync and the floor write come after the flip (TestCommitPointReported)
+	for _, step := range steps[:3] { // the pointer's sync and the floor write come after the flip (TestCommitPointReported)
 		t.Run(step, func(t *testing.T) {
 			s, server := newTestStore(t)
 			mustPut(t, s, "k", KindOpaque, []byte("one"))
@@ -539,7 +539,7 @@ func rotateCrashOAuthPrune(t *testing.T) {
 		s.step = func(name string) error { steps = append(steps, name); return nil }
 		mustRotateCredential(t, s, "k", KindOAuth, oauthEnvelope("a3", "r3"))
 	}
-	want := "write v3,write current,sync current,write " + floorName + ",prune k"
+	want := "write v3,sync v3,write current,sync current,write " + floorName + ",prune k"
 	if strings.Join(steps, ",") != want {
 		t.Fatalf("pruning Rotate steps = %v, want %s", steps, want)
 	}
@@ -553,7 +553,7 @@ func rotateCrashOAuthPrune(t *testing.T) {
 				t.Fatal("Rotate succeeded through a crash")
 			}
 			s.step = func(string) error { return nil }
-			flipped := i >= 2 // the pointer is written before the floor and the prune
+			flipped := i >= 3 // the pointer is written before the floor and the prune
 			wantCur, wantAccess, wantVersions := uint64(2), "a2", 2
 			if flipped {
 				wantCur, wantAccess = 3, "a3"
@@ -834,4 +834,28 @@ func TestRotateReportsCommitAfterFlip(t *testing.T) {
 			t.Fatalf("RotateFrom failing at the floor = %+v, %v; want version 4 and ErrCommitted", v, err)
 		}
 	})
+}
+
+// TestRotateVersionSyncFailureRemovesVersion is G9's cleanup half: a
+// rotation whose version file was renamed into place but whose directory
+// fsync failed, before the pointer flip, removes that version, so only a
+// crash leaves an orphan above the pointer.
+func TestRotateVersionSyncFailureRemovesVersion(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTypedStore(t)
+	mustPutCredential(t, s, "k", KindOAuth, oauthEnvelope("a1", "r1"))
+	s.step = failAt("sync v2")
+	if v, err := s.RotateCredential(ctx, "k", KindOAuth, oauthEnvelope("a2", "r2")); err == nil || v != (Version{}) {
+		t.Fatalf("RotateCredential failing at the version's fsync = %+v, %v; want a zero Version and an error", v, err)
+	}
+	s.step = func(string) error { return nil }
+	if _, err := os.Lstat(entryPath(server, "k", "v2")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the failed rotation left its v2: %v", err)
+	}
+	if v, c := mustCredential(t, s, "k"); v.Version != 1 || string(c.AccessToken) != "a1" {
+		t.Fatalf("current after the failure: version %d %q, want 1 a1", v.Version, c.AccessToken)
+	}
+	if v := mustRotateCredential(t, s, "k", KindOAuth, oauthEnvelope("a3", "r3")); v.Version != 2 {
+		t.Fatalf("the next rotation made version %d, want 2", v.Version)
+	}
 }
