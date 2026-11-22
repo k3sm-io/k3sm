@@ -25,7 +25,9 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
+	"strings"
 )
 
 // floorPreRestoreName is the live floor as the restore recipe moves it
@@ -91,7 +93,8 @@ type MergeReport struct {
 // is buried as well (Retired), unless keep names the entry and the live
 // floor holds no live record of it: keep keeps one generation, the
 // restored one, never a second, moved-aside one. keep holds
-// entry names, each checked as a name is. The write is pruned as every
+// entry names, each checked as a name is; a name the merge does not keep
+// (it matched nothing) refuses the merge, with nothing written. The write is pruned as every
 // floor write is, and each burial it drops is logged at Warn and reported.
 // Once the floor is written, the input is renamed to
 // keystore-floor.json.merged-<unix> beside it (renameMerged), which clears
@@ -141,12 +144,20 @@ func (s *FileStore) mergeFloor(ctx context.Context, path string, keep []string) 
 	// can hold or replace to stop it. Readers need no .lock against it
 	// either: the floor is replaced by an atomic rename.
 	var capDropped []pruned
+	var unmatched []string
 	_, dropped, err := fdir.updatePruned(func(fl floor) bool {
 		r, capDropped = fl.merge(from, kept)
+		unmatched = unmatchedKeep(kept, r.Kept)
+		if len(unmatched) > 0 {
+			return false // refused below; nothing written
+		}
 		return r.Merged > 0 || r.Retired > 0 || len(r.Fenced) > 0
 	})
 	if err != nil {
 		return MergeReport{}, err
+	}
+	if len(unmatched) > 0 {
+		return MergeReport{}, fmt.Errorf("--keep names %s, which the merge would not delete: it keeps an entry only when the floor moved aside records its restored generation as deleted, or holds a newer generation of a name the restored floor does not record. Nothing is written; check the names and run the merge again without them", strings.Join(unmatched, ", "))
 	}
 	for _, p := range append(capDropped, dropped...) {
 		r.Dropped = append(r.Dropped, p.name)
@@ -365,6 +376,19 @@ func (fl floor) merge(from floor, keep map[string]bool) (MergeReport, []pruned) 
 	}
 	r.BuriedLive, r.Kept, r.Fenced = sortedNames(buriedLive), sortedNames(kept), sortedNames(fenced)
 	return r, out
+}
+
+// unmatchedKeep is each name in keep that kept, the names the merge kept,
+// lacks, sorted: a keep name that matched nothing, most likely a typo.
+func unmatchedKeep(keep map[string]bool, kept []string) []string {
+	var out []string
+	for name := range keep {
+		if !slices.Contains(kept, name) {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // sortedNames is set's names, sorted, or nil for none.

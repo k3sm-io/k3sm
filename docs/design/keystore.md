@@ -480,7 +480,9 @@ buried set, oldest first:
   lock collects every burial its writes' prunes drop): the entry is deleted, its burial and its
   tree removal complete as usual, and the error is reported as committed, so `keys rm` prints
   the deletion and exits 4. A Delete whose own new burial the same write prunes also logs
-  that. `keys floor merge` exits 4 too when its report names a dropped burial. 1 MiB holds about 3,500 burials of the
+  that. `keys floor merge` exits 4 too when its report names a dropped burial. A `--keep` name
+  the merge keeps nothing for refuses it, with nothing written, and each kept name is warned
+  about on stderr as well as listed. 1 MiB holds about 3,500 burials of the
   longest names and about 16,000 of short ones.
 - *Deletion without the master.* Delete still works without the master. Burying the floor's
   live record needs only that record and the floor lock, never a key. Over a full floor Delete
@@ -943,10 +945,14 @@ undeliver system/<name> --namespace NS [--secret NAME]
 
 Exit codes: 0 success, 1 refused (the sentinel's message), 2 bad usage, the three-value shape
 `secrets-encrypt` uses, plus 3 for `rewrap` alone: it completed an earlier interrupted rewrap
-with a key other than the one supplied (`ErrRewrapResumed`), so it must run again. 4 is `rm` or `floor merge`
-done, but its floor write dropped a recorded deletion to stay within the floor's limits
-(`ErrTombstoneEvicted`, or a merge that reports a drop), so a copy of that deleted entry put
-back is accepted. Every verb
+with a key other than the one supplied (`ErrRewrapResumed`), so it must run again. 4 is `put`,
+`rotate`, `rm`, `list`, `show` (their floor raise) or `floor merge` done, but its floor write
+dropped a recorded deletion to stay within the floor's limits (a committed
+`ErrTombstoneEvicted`: `Committed` and `ErrTombstoneEvicted` both match; or a merge that reports
+a drop), so a copy of that deleted entry put back is accepted. Put, Rotate and RaiseFloor
+report their writes' prunes that way, as Delete does, and a Delete whose burial evicted one and
+whose tree removal then failed (the entry already deleted, its directory left behind) is
+committed too, so `rm` exits 4, not 1. Every verb
 in this list requires root (the non-root path is under "User scope"). The human output is not
 stable; `list -o json` and the exit codes are the stable surface. Value input is `--in FILE` or
 stdin only, never an argument: argv is visible to every local user via `ps` and lands in shell

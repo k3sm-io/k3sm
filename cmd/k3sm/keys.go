@@ -110,9 +110,10 @@ Flags:
                     data root is its parent
 
 Exit codes: 0 done; 1 refused or failed; 2 usage; 3 rewrap completed an
-earlier interrupted rewrap instead (run it again with a new key); 4 rm or
-floor merge is done, but the floor dropped a recorded deletion to stay within
-its limits, so a copy of that deleted entry put back is accepted.
+earlier interrupted rewrap instead (run it again with a new key); 4 the verb
+(put, rotate, rm, list, show or floor merge) is done, but the floor dropped a
+recorded deletion to stay within its limits, so a copy of that deleted entry
+put back is accepted.
 `
 
 // Exit codes of `k3sm keys`.
@@ -124,8 +125,10 @@ const (
 	// rewrap under a key the operator did not supply, so it must run again.
 	keysResumed = 3
 	// keysCommitted is a change that was made, but whose floor write
-	// dropped a recorded deletion to stay within the floor's limits: rm's
-	// keystore.ErrTombstoneEvicted, or a floor merge that reports a drop.
+	// dropped a recorded deletion to stay within the floor's limits: a
+	// committed keystore.ErrTombstoneEvicted from put, rotate, rm (its tree
+	// left behind included) or the floor raise list and show make, or a
+	// floor merge that reports a drop.
 	keysCommitted = 4
 )
 
@@ -320,6 +323,17 @@ func (v *keysVerb) flagError(err error) {
 func (v *keysVerb) failf(code int, format string, a ...any) int {
 	fmt.Fprintf(v.env.stderr, "k3sm keys %s: %s\n", v.name, scrubPaths(fmt.Errorf(format, a...), v.roots...))
 	return code
+}
+
+// evictedCode prints err and returns its exit code: keysCommitted for a
+// change made whose floor write evicted tombstones (keystore.Committed and
+// keystore.ErrTombstoneEvicted), which the verb then reports as done, and
+// keysRefused for anything else.
+func (v *keysVerb) evictedCode(err error) int {
+	if keystore.Committed(err) && errors.Is(err, keystore.ErrTombstoneEvicted) {
+		return v.failf(keysCommitted, "%v", err)
+	}
+	return v.failf(keysRefused, "%v", err)
 }
 
 // requireRoot refuses unless the verb runs as root: the master and entries
@@ -627,11 +641,14 @@ func keysPut(ctx context.Context, args []string, env keysEnv) int {
 	}
 	defer clear(value)
 	ver, err := s.Put(ctx, name, kind, value)
+	code = keysOK
 	if err != nil {
-		return v.failf(keysRefused, "%v", err)
+		if code = v.evictedCode(err); code == keysRefused {
+			return code
+		}
 	}
 	fmt.Fprintf(env.stdout, "created %s at version %d (%s, fingerprint %s)\n", qualify(name), ver.Version, ver.Kind, ver.Fingerprint)
-	return keysOK
+	return code
 }
 
 func keysRotate(ctx context.Context, args []string, env keysEnv) int {
@@ -675,15 +692,18 @@ func keysRotate(ctx context.Context, args []string, env keysEnv) int {
 		return v.failf(keysRefused, "%v", err)
 	}
 	ver, err := s.Rotate(ctx, name, value)
+	code = keysOK
 	if err != nil {
-		return v.failf(keysRefused, "%v", err)
+		if code = v.evictedCode(err); code == keysRefused {
+			return code
+		}
 	}
 	if fromSet {
 		fmt.Fprintf(env.stdout, "rotated %s to version %d, a copy of version %d (fingerprint %s)\n", qualify(name), ver.Version, *from, ver.Fingerprint)
-		return keysOK
+		return code
 	}
 	fmt.Fprintf(env.stdout, "rotated %s to version %d (fingerprint %s)\n", qualify(name), ver.Version, ver.Fingerprint)
-	return keysOK
+	return code
 }
 
 // keysListEntry is one entry of `keys list -o json`.
@@ -740,15 +760,18 @@ func keysList(ctx context.Context, args []string, env keysEnv) int {
 	if err != nil {
 		return v.failf(keysRefused, "%v", err)
 	}
+	raised := keysOK
 	if err := s.RaiseFloor(ctx); err != nil {
-		return v.failf(keysRefused, "%v", err)
+		if raised = v.evictedCode(err); raised == keysRefused {
+			return raised
+		}
 	}
 	entries, err := s.List(ctx)
 	if err != nil {
 		return v.failf(keysRefused, "%v", err)
 	}
 	rows := make([]keysListEntry, 0, len(entries))
-	code := keysOK
+	code := raised
 	for _, e := range entries {
 		r := keysEntryStatus(e, v.roots...)
 		if r.Status != "ok" {
@@ -804,8 +827,11 @@ func keysShow(ctx context.Context, args []string, env keysEnv) int {
 	if err != nil {
 		return v.failf(keysRefused, "%v", err)
 	}
+	raised := keysOK
 	if err := s.RaiseFloor(ctx); err != nil {
-		return v.failf(keysRefused, "%v", err)
+		if raised = v.evictedCode(err); raised == keysRefused {
+			return raised
+		}
 	}
 	if !*reveal {
 		ver, err := showMetadata(ctx, s, name, *version)
@@ -817,7 +843,7 @@ func keysShow(ctx context.Context, args []string, env keysEnv) int {
 		fmt.Fprintf(env.stdout, "version:     %d\n", ver.Version)
 		fmt.Fprintf(env.stdout, "created:     %s\n", ver.Created.UTC().Format(time.RFC3339))
 		fmt.Fprintf(env.stdout, "fingerprint: %s\n", ver.Fingerprint)
-		return keysOK
+		return raised
 	}
 	var value []byte
 	if *version != 0 {
@@ -832,7 +858,7 @@ func keysShow(ctx context.Context, args []string, env keysEnv) int {
 	if _, err := env.stdout.Write(value); err != nil {
 		return v.failf(keysRefused, "write: %v", err)
 	}
-	return keysOK
+	return raised
 }
 
 // showMetadata is one version's metadata, taken from List so the verb never
@@ -887,12 +913,12 @@ func keysRm(ctx context.Context, args []string, env keysEnv) int {
 	}
 	code = keysOK
 	if err := s.Delete(ctx, name); err != nil {
-		// A Delete whose floor write evicted tombstones deleted the entry:
-		// it is reported as done, and exits keysCommitted.
-		if !keystore.Committed(err) || !errors.Is(err, keystore.ErrTombstoneEvicted) {
-			return v.failf(keysRefused, "%v", err)
+		// A Delete whose floor write evicted tombstones deleted the entry,
+		// its tree left behind included: it is reported as done, and exits
+		// keysCommitted.
+		if code = v.evictedCode(err); code == keysRefused {
+			return code
 		}
-		code = v.failf(keysCommitted, "%v", err)
 	}
 	fmt.Fprintf(env.stdout, "deleted %s\n", qualify(name))
 	v.warnDeclared(name)
@@ -970,6 +996,8 @@ func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 	}
 	for _, name := range r.Kept {
 		fmt.Fprintf(env.stdout, "kept %s: deleted since the backup, and kept live as --keep asked\n", qualify(name))
+		// A downgrade of what the floor refuses, so on stderr too.
+		fmt.Fprintf(env.stderr, "k3sm keys floor merge: warning: %s is kept live as --keep asked, though the floor moved aside records it as deleted since the backup; if that deletion revoked the key, the revoked key is live again\n", qualify(name))
 	}
 	for _, name := range r.Dropped {
 		fmt.Fprintf(env.stdout, "dropped %s: a deleted generation dropped to keep the floor within its caps; a copy of it put back is accepted\n", qualify(name))

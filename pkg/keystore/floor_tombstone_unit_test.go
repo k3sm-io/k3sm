@@ -138,8 +138,10 @@ func tombstoneNeverRefusesPut(t *testing.T) {
 	gen := strings.Repeat("cd", generationSize)
 	keep := floor{"k": floorOf(t, server)["k"], "old": buriedEntry(gen, 1), "older": buriedEntry(gen, 2)}
 	fillFloor(t, server, keep, floorSizeLimit)
-	if _, err := s.Put(ctx, "new", KindOpaque, []byte("new")); err != nil {
-		t.Fatalf("Put over a floor full of tombstones: %v", err)
+	// The Put is made, and the tombstone its floor write pruned is reported
+	// as committed and evicted, the path rm's exit 4 takes.
+	if v, err := s.Put(ctx, "new", KindOpaque, []byte("new")); !Committed(err) || !errors.Is(err, ErrTombstoneEvicted) || v.Version != 1 {
+		t.Fatalf("Put over a floor full of tombstones = %+v, %v; want version 1 with a committed ErrTombstoneEvicted", v, err)
 	}
 	fl := floorOf(t, server)
 	if fl["new"].Seq != 1 {

@@ -216,9 +216,14 @@ func (s *FileStore) checkConfig() error {
 // the current pointer, then its floor; an entry directory without a pointer
 // in the shape a crashed Put leaves, whose generation the floor does not
 // record, is an interrupted Put, which the next Put of that name discards.
+// A Put whose floor writes drop a tombstone returns the version with a
+// committed ErrTombstoneEvicted (Committed).
 func (s *FileStore) Put(ctx context.Context, name string, kind Kind, value []byte) (Version, error) {
 	v, err := s.put(ctx, name, kind, value)
 	if err != nil {
+		if Committed(err) {
+			return v, fmt.Errorf("put %s: %w", name, err)
+		}
 		return Version{}, fmt.Errorf("put %s: %w", name, err)
 	}
 	return v, nil
@@ -291,7 +296,9 @@ func (s *FileStore) put(ctx context.Context, name string, kind Kind, value []byt
 		gs = []string{buried}
 	}
 	logBuried(name, gs, dropped, after)
-	return v, nil
+	// The entry is stored; a tombstone a floor write here dropped is
+	// reported with it (evicted), committed.
+	return v, evicted(fdir, dropped, nil)
 }
 
 // createEntry makes name's directory with a fresh generation. A directory
@@ -730,17 +737,27 @@ func treeNotRemoved(name string, buried []string, err error) error {
 	if len(buried) == 0 {
 		return err
 	}
-	return fmt.Errorf("the entry is already deleted: the floor records it as deleted and refuses any copy of it, but its directory was not removed; rerun rm system/%s once the keystore lock is free: %w", name, err)
+	return alreadyDeleted{fmt.Errorf("the entry is already deleted: the floor records it as deleted and refuses any copy of it, but its directory was not removed; rerun rm system/%s once the keystore lock is free: %w", name, err)}
 }
+
+// alreadyDeleted marks a Delete's error after its burial committed
+// (treeNotRemoved, leftBehind): the entry is deleted, so evicted reports
+// an eviction alongside it as committed.
+type alreadyDeleted struct{ error }
+
+func (e alreadyDeleted) Unwrap() error { return e.error }
 
 // evicted is the error of a Delete that would otherwise return err (nil
 // for success), given the burials its buries dropped at the per-name cap and
 // the floor lock it wrote under, which holds every burial its writes' prunes
 // dropped, its own or any other name's. Each dropped burial loses its
 // refusal: a copy of that deleted entry put back is accepted again. So when
-// any was dropped the Delete fails with ErrTombstoneEvicted, naming the
-// count, though the entry is deleted: alone, it is reported as committed
-// (errCommitted); with err, it is joined to it.
+// any was dropped the verb fails with ErrTombstoneEvicted, naming the
+// count, though its change is made: alone, or joined to an err that says the
+// entry is already deleted (alreadyDeleted: a Delete whose tree removal
+// failed after its burial), it is reported as committed (errCommitted);
+// joined to any other err, it is not. Put, Rotate and RaiseFloor report
+// their floor writes' prunes through it too.
 func evicted(l *floorLock, capDropped []pruned, err error) error {
 	n := len(capDropped) + len(l.dropped)
 	if n == 0 {
@@ -748,6 +765,9 @@ func evicted(l *floorLock, capDropped []pruned, err error) error {
 	}
 	if err == nil {
 		return fmt.Errorf("%w: %w: %d tombstone(s) evicted", errCommitted, ErrTombstoneEvicted, n)
+	}
+	if errors.As(err, new(alreadyDeleted)) {
+		return fmt.Errorf("%w: %w: %d tombstone(s) evicted; and: %w", errCommitted, ErrTombstoneEvicted, n, err)
 	}
 	return fmt.Errorf("%w: %d tombstone(s) evicted; and: %w", ErrTombstoneEvicted, n, err)
 }
@@ -857,7 +877,7 @@ func leftBehind(name string, after floor, err error) error {
 	if f := after[name]; f.live() || len(f.burials()) == 0 {
 		return err
 	}
-	return fmt.Errorf("the entry is already deleted: the floor records it as deleted and refuses any copy of it, but its directory could not be removed and is left behind; run rm again to remove it: %w", err)
+	return alreadyDeleted{fmt.Errorf("the entry is already deleted: the floor records it as deleted and refuses any copy of it, but its directory could not be removed and is left behind; run rm again to remove it: %w", err)}
 }
 
 // logBuried logs what a floor write that buried the generations buried for
@@ -879,10 +899,14 @@ func logBuried(name string, buried []string, dropped []pruned, after floor) {
 // the floor: docs/design/keystore.md § "Rotation and rollback". A crash
 // before the flip leaves the old version current and an unreferenced next
 // version, which the next Rotate discards before sealing the value it was
-// given; it never promotes it.
+// given; it never promotes it. A Rotate whose floor writes drop a tombstone
+// returns the version with a committed ErrTombstoneEvicted (Committed).
 func (s *FileStore) Rotate(ctx context.Context, name string, value []byte) (Version, error) {
 	v, err := s.rotate(ctx, name, value)
 	if err != nil {
+		if Committed(err) {
+			return v, fmt.Errorf("rotate %s: %w", name, err)
+		}
 		return Version{}, fmt.Errorf("rotate %s: %w", name, err)
 	}
 	return v, nil
@@ -974,7 +998,7 @@ func (s *FileStore) rotate(ctx context.Context, name string, value []byte) (Vers
 	if _, err := fdir.update(func(fl floor) bool { return fl.raise(name, e.generation, nextSeq) }); err != nil {
 		return Version{}, fmt.Errorf("version %d is current, but recording its floor failed (the next keys verb records it): %w", next, err)
 	}
-	return versionOf(rec, value, k.fingerprint), nil
+	return versionOf(rec, value, k.fingerprint), evicted(fdir, nil, nil)
 }
 
 // discardOrphans removes every version file of e numbered above cur: what a
@@ -1036,7 +1060,8 @@ func parseVersionName(n string) (uint64, bool) {
 // takes the exclusive lock and the floor's lock, and runs as root. A keystore
 // with no entries directory or no master has nothing to raise. While a
 // restore is unfinished (keystore-floor.json.pre-restore in the data root)
-// it raises nothing and logs that at Warn.
+// it raises nothing and logs that at Warn. A raise whose floor write drops
+// a tombstone is reported as a committed ErrTombstoneEvicted (Committed).
 func (s *FileStore) RaiseFloor(ctx context.Context) error {
 	if err := s.raiseFloor(ctx); err != nil {
 		return fmt.Errorf("raise the keystore floor: %w", err)
@@ -1079,8 +1104,10 @@ func (s *FileStore) raiseFloor(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.syncFloor(ctx, root, fdir, fl, k)
-	return err
+	if _, err := s.syncFloor(ctx, root, fdir, fl, k); err != nil {
+		return err
+	}
+	return evicted(fdir, nil, nil)
 }
 
 // entry is one open entry directory and its generation.

@@ -65,9 +65,11 @@ name.
 `/var/lib/k3sm/server`. The data root is its parent.
 
 Exit codes: 0 done, 1 refused or failed, 2 usage error, 3 `rewrap` finished an earlier
-interrupted rewrap instead of yours (run it again with a new key), 4 `rm` or `floor merge` is
-done, but the floor dropped a recorded deletion to stay within its limits, so a copy of that
-deleted entry put back is accepted. Delete entries you no longer use to make room.
+interrupted rewrap instead of yours (run it again with a new key), 4 `put`, `rotate`, `rm`,
+`list`, `show` or `floor merge` is done, but the floor dropped a recorded deletion to stay
+within its limits, so a copy of that deleted entry put back is accepted. An `rm` that exits 4
+deleted the entry even when it says its files were left behind. Delete entries you no longer
+use to make room.
 
 ## Giving a Value
 
@@ -373,7 +375,9 @@ deleted again, how many it kept because `--keep` named them, how many moved-asid
 retired, how many it had to drop to stay within the floor's limits, and how many restored entries
 it fenced off from their newer pre-restore copies. It
 lists each entry it deleted again as `buried live system/<name>`, and each one it kept as `kept
-system/<name>`. Remove each deleted entry's files with `sudo k3sm keys rm system/<name> --yes`.
+system/<name>`, and warns on stderr about each kept entry, since keeping it brings back a key
+that may have been deleted to revoke it. A `--keep` name the merge would not delete, such as a
+typo, makes it refuse and change nothing. Remove each deleted entry's files with `sudo k3sm keys rm system/<name> --yes`.
 A line starting `dropped` names a deletion the floor could not keep: a copy of that entry put
 back is accepted. Then start the server and check the entries:
 

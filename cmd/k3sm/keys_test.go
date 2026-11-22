@@ -831,9 +831,24 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 		h := newKeysHarness(t)
 		value, _ := saveRmRestore(t, h, true)
 		h.mustRun(2, "floor", "merge", recipeFloor(h)+".pre-restore", "--keep", "rb")
+		// A --keep name that matches nothing refuses the merge, nothing
+		// written, and the input stays for the merge run again.
+		before, err := os.ReadFile(recipeFloor(h))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if code := h.run("floor", "merge", recipeFloor(h)+".pre-restore", "--keep", "system/rb", "--keep", "system/typo"); code != keysRefused || !strings.Contains(h.stderr.String(), "typo") {
+			t.Fatalf("floor merge with an unmatched --keep: exit %d, stderr %q; want %d naming typo", code, h.stderr.String(), keysRefused)
+		}
+		if after, err := os.ReadFile(recipeFloor(h)); err != nil || !bytes.Equal(after, before) {
+			t.Fatalf("live floor after the refused merge = %s, %v; want it unchanged", after, err)
+		}
 		h.mustRun(0, "floor", "merge", recipeFloor(h)+".pre-restore", "--keep", "system/rb")
 		if got := h.stdout.String(); !strings.Contains(got, "merged 0\nalready present 0\nburied live 0\nkept 1\nretired 0\ndropped 0\n") || !strings.Contains(got, "kept system/rb:") {
 			t.Fatalf("floor merge --keep printed %q, want rb kept", got)
+		}
+		if got := h.stderr.String(); !strings.Contains(got, "warning: system/rb is kept live") {
+			t.Fatalf("floor merge --keep stderr %q, want the kept name warned about", got)
 		}
 		h.mustRun(0, "show", "system/rb", "--reveal")
 		if !bytes.Equal(h.stdout.Bytes(), value) {
@@ -2323,6 +2338,45 @@ func TestKeysEvictionExitsCommitted(t *testing.T) {
 			t.Fatalf("rm at the per-name cap printed %q, %q; want deleted and the eviction named", h.stdout.String(), h.stderr.String())
 		}
 		h.mustRun(1, "show", "system/k")
+	})
+	// rm whose burial evicts one and whose tree removal then fails (.lock
+	// replaced by a directory) deleted the entry: exit 4, not 1.
+	t.Run("rm with its tree left behind", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/k", []byte("v"))
+		plantBurials(t, recipeFloor(h), "k", 1000, keysPerNameCap)
+		lock := filepath.Join(h.keystoreDir(), ".lock")
+		if err := os.Remove(lock); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(lock, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if code := h.run("rm", "system/k", "--yes"); code != keysCommitted {
+			t.Fatalf("rm at the cap with its tree left behind: exit %d, stderr %q; want %d", code, h.stderr.String(), keysCommitted)
+		}
+		if !strings.Contains(h.stderr.String(), "already deleted") || !strings.Contains(h.stdout.String(), "deleted system/k") {
+			t.Fatalf("rm printed %q, %q; want deleted, and the tree left behind named", h.stdout.String(), h.stderr.String())
+		}
+	})
+	// put over a live record of another generation (a Delete interrupted
+	// before its floor write) at the per-name cap buries it and evicts the
+	// oldest: the entry is created, exit 4.
+	t.Run("put", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/k", []byte("v"))
+		plantBurials(t, recipeFloor(h), "k", 1000, keysPerNameCap)
+		if err := os.RemoveAll(filepath.Join(h.keystoreDir(), "k")); err != nil {
+			t.Fatal(err)
+		}
+		h.stdin = strings.NewReader("w")
+		if code := h.run("put", "system/k", "--in", "-"); code != keysCommitted {
+			t.Fatalf("put at the cap: exit %d, stderr %q; want %d", code, h.stderr.String(), keysCommitted)
+		}
+		if !strings.Contains(h.stdout.String(), "created system/k") || !strings.Contains(h.stderr.String(), "tombstone(s) evicted") {
+			t.Fatalf("put printed %q, %q; want created and the eviction named", h.stdout.String(), h.stderr.String())
+		}
+		h.mustRun(0, "show", "system/k", "--reveal")
 	})
 	t.Run("floor merge", func(t *testing.T) {
 		h := newKeysHarness(t)

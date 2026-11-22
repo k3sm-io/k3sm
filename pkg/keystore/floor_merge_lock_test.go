@@ -19,6 +19,7 @@ package keystore
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -158,4 +159,97 @@ func TestPendingMergeGuard(t *testing.T) {
 	}
 	mustPut(t, s, "n", KindOpaque, []byte("v"))
 	mustRotate(t, s, "k", "two")
+}
+
+// TestEvictionReportedCommitted (U192): every verb whose floor write evicts
+// a tombstone reports it as committed and ErrTombstoneEvicted: a Rotate and
+// a RaiseFloor whose write pruned one, and a Delete whose burial evicted one
+// and whose tree removal then failed (here on a .lock replaced by a
+// directory), which is deleted all the same.
+func TestEvictionReportedCommitted(t *testing.T) {
+	ctx := context.Background()
+	committedEvicted := func(t *testing.T, what string, err error) {
+		t.Helper()
+		if !Committed(err) || !errors.Is(err, ErrTombstoneEvicted) {
+			t.Fatalf("%s: %v, want a committed ErrTombstoneEvicted", what, err)
+		}
+	}
+	t.Run("Delete with its tree left behind", func(t *testing.T) {
+		setSeam(t, &buriedPerNameLimit, smallBuriedPerName)
+		s, server := newTestStore(t)
+		mustPut(t, s, "k", KindOpaque, []byte("one"))
+		e := floorOf(t, server)["k"]
+		for i := range smallBuriedPerName {
+			e.Buried = append(e.Buried, burial{Generation: mgen(100 + i), Deleted: uint64(i + 1)})
+		}
+		putFloorFile(t, server, floor{"k": e})
+		lock := filepath.Join(server, "keystore", lockName)
+		remove(t, lock)
+		if err := os.Mkdir(lock, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		err := s.Delete(ctx, "k")
+		committedEvicted(t, "Delete at the cap under a .lock directory", err)
+		if !strings.Contains(err.Error(), "already deleted") {
+			t.Fatalf("Delete: %v, want it to say the entry is already deleted", err)
+		}
+	})
+	for _, verb := range []string{"Rotate", "RaiseFloor"} {
+		t.Run(verb, func(t *testing.T) {
+			setSmallFloorLimits(t)
+			s, server := newTestStore(t)
+			mustPut(t, s, "k", KindOpaque, []byte("one"))
+			// Rotate from seq 9 to 10, one byte more, over a floor whose
+			// tombstones fill the rest, prunes the oldest.
+			for i := 2; i <= 9; i++ {
+				mustRotate(t, s, "k", fmt.Sprintf("v%d", i))
+			}
+			gen := strings.Repeat("cd", generationSize)
+			live := floorOf(t, server)["k"]
+			if verb == "RaiseFloor" {
+				// The floor one behind the pointer, as a crash before the
+				// floor write leaves it: the raise to 10 grows it a byte.
+				mustRotate(t, s, "k", "v10")
+				live.Seq = 9
+			}
+			fillFloor(t, server, floor{"k": live, "old": buriedEntry(gen, 1)}, floorSizeLimit)
+			var err error
+			if verb == "Rotate" {
+				var v Version
+				v, err = s.Rotate(ctx, "k", []byte("v10"))
+				if v.Version != 10 {
+					t.Errorf("Rotate over a full floor = %+v, want version 10", v)
+				}
+			} else {
+				err = s.RaiseFloor(ctx)
+			}
+			committedEvicted(t, verb+" over a floor full of tombstones", err)
+			if fl := floorOf(t, server); fl["k"].Seq != 10 {
+				t.Fatalf("floor k = %+v, want seq 10", fl["k"])
+			}
+		})
+	}
+}
+
+// TestMergeFloorRefusesUnmatchedKeep (U192): a keep name that matched
+// nothing, an entry the merge would not have buried, refuses the merge with
+// nothing written.
+func TestMergeFloorRefusesUnmatchedKeep(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	putFloorFile(t, server, floor{"a": {Generation: mgen(1), Seq: 1}})
+	path := writeAsideFloor(t, server, floor{"a": {Buried: []burial{{Generation: mgen(1), Deleted: 1}}}})
+	before, err := os.ReadFile(floorPath(server))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.MergeFloor(ctx, path, []string{"a", "typo"}); err == nil || !strings.Contains(err.Error(), "typo") {
+		t.Fatalf("MergeFloor keeping an unmatched name: %v, want a refusal naming it", err)
+	}
+	if after, _ := os.ReadFile(floorPath(server)); string(after) != string(before) {
+		t.Fatalf("floor after the refusal = %s, want %s", after, before)
+	}
+	if _, err := os.Lstat(path); err != nil {
+		t.Fatalf("the input after the refusal: %v, want it left in place", err)
+	}
 }
