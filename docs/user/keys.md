@@ -294,8 +294,9 @@ The floor decides which entries are live, so a floor someone else could replace 
 mark a revoked entry live again. Never keep the saved floor on a volume that ignores ownership,
 such as an external drive set to ignore ownership, or on a volume others can write, such as a
 network share. The SHA-256 that the last line records stays in root's directory on this Mac,
-and the restore checks it before it puts the floor back, so a floor changed since you saved it
-is never used. If this Mac is lost, its saved floors are lost with it: restore as in
+and the restore checks it before it puts the floor back, so a floor damaged since you saved it
+is never used. The SHA-256 catches corruption, not tampering: anyone who could replace the saved
+floor could replace its SHA-256 beside it, which is why the directory must be root's alone. If this Mac is lost, its saved floors are lost with it: restore as in
 "Restoring an older keystore/" below.
 
 To restore a backup, for example after deleting an entry by mistake, you move the live
@@ -315,11 +316,14 @@ sudo shasum -a 256 -c /var/root/keystore-floor-backup/$B/keystore-floor.json.sha
 restore was never finished or undone, and moving the live copies aside now would replace it:
 finish or undo that restore first, as below, and do not go on. `shasum` must print `OK`. If it
 does not, the saved floor has changed since you saved it: do not use it. Then move the live
-copies aside and put the backup in place:
+copies aside and put the backup in place. Each `test` line stops the steps (and closes the
+shell) if a copy is set aside after all, so `mv` never moves the live copy into or over it:
 
 ```
-sudo mv -n /var/lib/k3sm/server/keystore /var/lib/k3sm/server/keystore.pre-restore
-sudo mv -n /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore
+test ! -e /var/lib/k3sm/server/keystore.pre-restore || exit 1
+sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/server/keystore.pre-restore
+test ! -e /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1
+sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore
 sudo ditto /path/to/backup/$B/keystore /var/lib/k3sm/server/keystore
 sudo install -o root -g wheel -m 0644 /var/root/keystore-floor-backup/$B/keystore-floor.json /var/lib/k3sm/keystore-floor.json
 ```

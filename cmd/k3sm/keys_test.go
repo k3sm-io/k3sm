@@ -629,7 +629,8 @@ func checkRecipeSum(b recipeBackup) error {
 // anything moves, it refuses (an error, nothing changed) when a .pre-restore
 // copy of either is still set aside (the ls -d check) or, with the floor,
 // when the saved floor no longer matches its SHA-256 (shasum -c). The live
-// copies are moved aside, never overwritten (mv -n after the check).
+// copies are moved aside, never overwritten (each mv after its test ! -e
+// guard).
 func restoreRecipeBackup(t *testing.T, h *keysHarness, b recipeBackup, withFloor bool) (string, error) {
 	t.Helper()
 	floor := recipeFloor(h)
@@ -762,8 +763,10 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 			"sudo k3sm stop",
 			"sudo ls -d /var/lib/k3sm/server/keystore.pre-restore /var/lib/k3sm/keystore-floor.json.pre-restore",
 			"sudo shasum -a 256 -c /var/root/keystore-floor-backup/$B/keystore-floor.json.sha256",
-			"sudo mv -n /var/lib/k3sm/server/keystore /var/lib/k3sm/server/keystore.pre-restore",
-			"sudo mv -n /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore",
+			"test ! -e /var/lib/k3sm/server/keystore.pre-restore || exit 1",
+			"sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/server/keystore.pre-restore",
+			"test ! -e /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1",
+			"sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore",
 			"sudo install -o root -g wheel -m 0644 /var/root/keystore-floor-backup/$B/keystore-floor.json /var/lib/k3sm/keystore-floor.json",
 			"sudo k3sm keys floor merge /var/lib/k3sm/keystore-floor.json.pre-restore",
 			"sudo k3sm keys rm system/<name> --yes",
